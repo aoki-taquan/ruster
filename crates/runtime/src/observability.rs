@@ -610,6 +610,7 @@ pub struct ServiceOccupancy {
     pub nat44_tcp_mappings: TableOccupancy,
     pub nat44_tcp_sessions: TableOccupancy,
     pub nat44_tcp_external_inbound_sessions: TableOccupancy,
+    pub nat44_tcp_unsolicited_syn_holds: TableOccupancy,
     pub firewall_states: TableOccupancy,
     pub icmpv4_error_states: TableOccupancy,
 }
@@ -633,6 +634,7 @@ impl ServiceOccupancy {
             nat44_tcp_mappings: tcp.mappings,
             nat44_tcp_sessions: tcp.sessions,
             nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
+            nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
             firewall_states: firewall.occupancy(),
             icmpv4_error_states: icmpv4_errors.state_occupancy(),
         }
@@ -653,6 +655,7 @@ pub struct OccupancyTotals {
     pub nat44_tcp_mappings: ObservedTable,
     pub nat44_tcp_sessions: ObservedTable,
     pub nat44_tcp_external_inbound_sessions: ObservedTable,
+    pub nat44_tcp_unsolicited_syn_holds: ObservedTable,
     pub firewall_states: ObservedTable,
     pub icmpv4_error_states: ObservedTable,
 }
@@ -665,6 +668,7 @@ impl OccupancyTotals {
             nat44_tcp_mappings,
             nat44_tcp_sessions,
             nat44_tcp_external_inbound_sessions,
+            nat44_tcp_unsolicited_syn_holds,
             firewall_states,
             icmpv4_error_states,
         } = *occupancy;
@@ -675,6 +679,8 @@ impl OccupancyTotals {
         self.nat44_tcp_sessions.record(nat44_tcp_sessions);
         self.nat44_tcp_external_inbound_sessions
             .record(nat44_tcp_external_inbound_sessions);
+        self.nat44_tcp_unsolicited_syn_holds
+            .record(nat44_tcp_unsolicited_syn_holds);
         self.firewall_states.record(firewall_states);
         self.icmpv4_error_states.record(icmpv4_error_states);
     }
@@ -687,6 +693,7 @@ impl OccupancyTotals {
             nat44_tcp_mappings,
             nat44_tcp_sessions,
             nat44_tcp_external_inbound_sessions,
+            nat44_tcp_unsolicited_syn_holds,
             firewall_states,
             icmpv4_error_states,
         } = self;
@@ -697,6 +704,7 @@ impl OccupancyTotals {
         nat44_tcp_sessions.visit("occupancy.nat44_tcp_sessions", v);
         nat44_tcp_external_inbound_sessions
             .visit("occupancy.nat44_tcp_external_inbound_sessions", v);
+        nat44_tcp_unsolicited_syn_holds.visit("occupancy.nat44_tcp_unsolicited_syn_holds", v);
         firewall_states.visit("occupancy.firewall_states", v);
         icmpv4_error_states.visit("occupancy.icmpv4_error_states", v);
     }
@@ -1227,15 +1235,16 @@ impl ObservableFields for ServiceCounters {
         }}
         visit_counts! {v, "icmpv4_errors", self.icmpv4_errors, Icmpv4ErrorCounters {
             queued, queued_time_exceeded, queued_destination_unreachable,
-            queued_host_unreachable, pending, rate_limited, disabled_time_exceeded,
-            disabled_destination_unreachable, disabled_host_unreachable, state_full, action_full,
+            queued_host_unreachable, queued_port_unreachable, pending, rate_limited,
+            disabled_time_exceeded, disabled_destination_unreachable, disabled_host_unreachable,
+            disabled_port_unreachable, state_full, action_full,
             clock_regressions, source_not_unicast, source_is_local, destination_multicast,
             destination_limited_broadcast, destination_network_address,
             destination_directed_broadcast, ethernet_destination_group, noninitial_fragment,
             icmp_error_message, icmp_type_missing, reverse_route_miss, reverse_interface_miss,
             reverse_binding_miss, reverse_target_forbidden, reverse_neighbor_unresolved,
             dequeued, dequeued_time_exceeded, dequeued_destination_unreachable,
-            dequeued_host_unreachable,
+            dequeued_host_unreachable, dequeued_port_unreachable,
         }}
         visit_counts! {v, "nat44_udp", self.nat44_udp, Nat44UdpCounters {
             mappings_created, mappings_reused, mappings_expired, peers_created,
@@ -1250,7 +1259,10 @@ impl ObservableFields for ServiceCounters {
             mapping_full, session_full,
             port_exhausted, clock_regressions, config_mismatches, reconciliations,
             hairpin_translated, hairpin_inbound_refused, hairpin_disabled,
-            inbound_remote_quota_exceeded,
+            inbound_remote_quota_exceeded, unsolicited_syn_held, unsolicited_syn_refreshed,
+            unsolicited_syn_hold_full, unsolicited_syn_ineligible, unsolicited_syn_cancelled,
+            unsolicited_syn_superseded, unsolicited_syn_icmp_queued,
+            unsolicited_syn_icmp_suppressed,
         }}
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,

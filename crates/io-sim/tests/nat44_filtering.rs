@@ -808,11 +808,12 @@ fn endpoint_independent_filtering_keeps_the_external_to_internal_bypass_closed()
     assert_eq!(tcp_nat.counters().inbound_sessions_created, 0);
 }
 
-/// RFC 5382 REQ-4 with every responder bound: an unsolicited inbound SYN
-/// (no mapping, or refused by the filter) gets no TCP RST and no ICMP from
-/// the full NAT + firewall + ICMPv4 error worker, now or later (REQ-4 a
-/// silent drop), and an outbound SYN for the same connection afterwards
-/// still opens it.
+/// RFC 5382 REQ-4 a with every responder bound but no unsolicited-SYN hold
+/// storage: an unsolicited inbound SYN (no mapping, or refused by the
+/// filter) gets no TCP RST and no ICMP from the full NAT + firewall +
+/// ICMPv4 error worker, now or later (silent drop), and an outbound SYN for
+/// the same connection afterwards still opens it. The delayed ICMP Port
+/// Unreachable with hold storage is `nat44_unsolicited_syn.rs`.
 #[test]
 fn unsolicited_inbound_syn_is_silently_dropped_by_the_full_worker() {
     let (routes, interfaces, neighbors, bindings) = topology();

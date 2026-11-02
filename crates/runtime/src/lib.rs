@@ -2,13 +2,15 @@
 #![doc = "Allocation-free, bounded single-worker tick orchestration for ruster."]
 
 use ruster_core::{
-    dispatch_host_unreachable_failures, execute_one_arp_request, execute_one_icmpv4_error,
+    dispatch_host_unreachable_failures, dispatch_nat44_tcp_unsolicited_syns,
+    execute_one_arp_request, execute_one_icmpv4_error,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors, poll_resolution_timers,
     ArpRequestBuildError, BatchReport, ExecuteArpRequestError, ExecuteIcmpv4Error, FirewallConfig,
     FirewallRuntime, ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4TraceSink,
     GeneratedPacketIo, GeneratedTraceSink, Icmpv4ErrorBuildError, Icmpv4ErrorRuntime,
-    MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketIo,
-    PublicationQuiescence, PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
+    MonotonicMillis, Nat44TcpConfig, Nat44TcpRuntime, Nat44TcpUnsolicitedSynDispatchError,
+    Nat44UdpConfig, Nat44UdpRuntime, PacketIo, PublicationQuiescence,
+    PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
     ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
     ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink, TraceSink,
 };
@@ -945,7 +947,7 @@ where
     } = nat44_udp;
     let Nat44TcpServiceView {
         config: tcp_config,
-        runtime: nat44_tcp,
+        runtime: mut nat44_tcp,
     } = nat44_tcp;
     let FirewallServiceView {
         config: firewall_config,
@@ -963,7 +965,7 @@ where
                 &udp_config,
                 nat44_udp,
                 &tcp_config,
-                nat44_tcp,
+                nat44_tcp.as_deref_mut(),
                 &firewall_config,
                 firewall,
                 now,
@@ -1023,7 +1025,28 @@ where
             Ok(report) => PhaseReport::Completed(report),
             Err(error) => PhaseReport::Failed(error),
         };
+        // Unsolicited inbound TCP SYNs whose 6 s hold has passed (RFC 5382
+        // REQ-4) share this phase and its budget: both turn deferred
+        // failures into generated ICMPv4 errors before the generated
+        // phases run. The outcome is in the TCP NAT counters and trace.
+        let syn_clock_regressed = nat44_tcp.is_some_and(|nat44_tcp| {
+            matches!(
+                dispatch_nat44_tcp_unsolicited_syns(
+                    nat44_tcp,
+                    icmpv4_errors,
+                    resolution,
+                    &snapshot,
+                    now,
+                    budgets.failure_dispatch_scans,
+                    trace,
+                ),
+                Err(Nat44TcpUnsolicitedSynDispatchError::ClockRegression)
+            )
+        });
         trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::FailureDispatch));
+        if syn_clock_regressed && generated_skip.is_none() {
+            generated_skip = Some(TickPhaseSkip::ClockRegression);
+        }
         if matches!(
             report,
             PhaseReport::Failed(ResolutionFailureDispatchError::ClockRegression)

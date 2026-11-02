@@ -973,6 +973,7 @@ impl SimRun<'_> {
                 line.u64("mappings", t.mappings.into());
                 line.u64("sessions", t.sessions.into());
                 line.u64("port_owners", t.port_owners.into());
+                line.u64("unsolicited_syn_holds", t.unsolicited_syn_holds.into());
                 line.close();
             }
             None => line.null("nat44_tcp"),

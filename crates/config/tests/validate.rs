@@ -9,7 +9,7 @@ use ruster_config::{
 use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId,
     FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot,
-    Nat44TcpSessionSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
+    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
     ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
 };
 
@@ -100,6 +100,7 @@ icmpv4-errors = "disabled"
 [nat44.tcp.capacity]
 mappings = 3
 sessions = 5
+unsolicited-syn-holds = 7
 
 [firewall.policy]
 udp-idle-ttl-ms = 300000
@@ -263,6 +264,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 session_buckets: 8,
                 session_nodes: 5,
                 port_owners: 8,
+                unsolicited_syn_holds: 7,
             }),
             firewall_states: Some(6),
             required_bytes: shape.required_bytes,
@@ -287,6 +289,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 8 * size_of::<PortOwnerSlot>()
         // free-port bitmaps of the UDP and TCP port-owner indexes
         + 2 * port_free_bitmap_words(8) * size_of::<u64>()
+        + 7 * size_of::<Nat44TcpSynHoldSlot>()
         + 6 * size_of::<FirewallStateSlot>();
     assert_eq!(shape.required_bytes, expected);
 
@@ -946,6 +949,59 @@ fn nat44_hairpinning_maps_onto_core_policies_per_protocol() {
     assert_eq!(udp_off.with_hairpinning(true), udp);
     assert_eq!(tcp_off.with_hairpinning(true), tcp);
     assert_eq!(off.storage_shape(), defaults.storage_shape());
+}
+
+/// B3: the switch maps onto the core TCP policy without changing the
+/// storage shape; the hold capacity is a quote table (bounded by
+/// `max_quote_slots_per_table`) counted in `required_bytes`.
+#[test]
+fn nat44_unsolicited_syn_switch_and_holds_map_onto_core_and_storage() {
+    use ruster_config::ValidationCode;
+    use ruster_core::Nat44TcpPolicy;
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+
+    let on = validated(VALID);
+    let tcp_on = on.nat44().unwrap().tcp().unwrap().policy();
+    assert!(tcp_on.unsolicited_syn_icmp());
+    assert!(Nat44TcpPolicy::default().unsolicited_syn_icmp());
+    let off = validated(&VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1));
+    let tcp_off = off.nat44().unwrap().tcp().unwrap().policy();
+    assert!(!tcp_off.unsolicited_syn_icmp());
+    assert_eq!(tcp_off.with_unsolicited_syn_icmp(true), tcp_on);
+    assert_eq!(off.storage_shape(), on.storage_shape());
+
+    let holds = |value: u32| {
+        VALID.replacen(
+            "unsolicited-syn-holds = 7\n",
+            &format!("unsolicited-syn-holds = {value}\n"),
+            1,
+        )
+    };
+    let bytes = |value: u32| validated(&holds(value)).storage_shape().required_bytes;
+    assert_eq!(bytes(8) - bytes(7), size_of::<Nat44TcpSynHoldSlot>());
+    assert_eq!(
+        validated(&holds(0))
+            .storage_shape()
+            .nat44_tcp
+            .unwrap()
+            .unsolicited_syn_holds,
+        0
+    );
+    let limits = ValidationLimits {
+        max_slots_per_table: 1 << 16,
+        max_quote_slots_per_table: 8,
+        max_runtime_bytes: 1 << 30,
+    };
+    assert!(validated_with(&holds(8), limits).is_ok());
+    let refused = validated_with(&holds(9), limits)
+        .err()
+        .expect("over the quote limit");
+    assert_eq!(refused.code(), ValidationCode::CapacityLimitExceeded);
+    assert_eq!(
+        refused.path().segments(),
+        ["nat44", "tcp", "capacity", "unsolicited-syn-holds"]
+            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
+    );
 }
 
 #[test]

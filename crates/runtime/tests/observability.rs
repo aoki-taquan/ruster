@@ -351,6 +351,7 @@ fn service_occupancy_capture_copies_every_runtime_accessor() {
                 nat44_tcp_mappings: tcp.mappings,
                 nat44_tcp_sessions: tcp.sessions,
                 nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
+                nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
                 firewall_states: firewall.occupancy(),
                 icmpv4_error_states: icmpv4_errors.state_occupancy(),
             }
@@ -409,9 +410,9 @@ fn service_counters_render_in_fixed_order(
     );
     for (section, fields) in [
         ("resolution", 13),
-        ("icmpv4_errors", 31),
+        ("icmpv4_errors", 34),
         ("nat44_udp", 17),
-        ("nat44_tcp", 22),
+        ("nat44_tcp", 30),
         ("firewall", 13),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);

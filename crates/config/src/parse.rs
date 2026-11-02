@@ -128,6 +128,8 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "tx",
     "udp",
     "udp-idle-ttl-ms",
+    "unsolicited-syn-holds",
+    "unsolicited-syn-icmp",
     "via",
     "xdp-attach",
 ];

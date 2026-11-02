@@ -190,6 +190,14 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
             limit(new)
         ));
     }
+    if let Some(Delta { old, new }) = change.unsolicited_syn_icmp {
+        let switch = |enabled: bool| if enabled { "on" } else { "off" };
+        lines.push(format!(
+            "{kind} unsolicited-syn-icmp ~ {} -> {}",
+            switch(old),
+            switch(new)
+        ));
+    }
     if change.policy_changed {
         lines.push(format!("{kind} policy ~ changed"));
     }

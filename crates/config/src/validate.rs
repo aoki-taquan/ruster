@@ -9,10 +9,10 @@ use ruster_core::{
     Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
     Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
-    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
-    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -383,6 +383,9 @@ pub struct Nat44TcpStorageShapeV1 {
     pub session_buckets: u32,
     pub session_nodes: u32,
     pub port_owners: u32,
+    /// Slots of the unsolicited-SYN hold table (RFC 5382 REQ-4), each with
+    /// a quoted datagram.
+    pub unsolicited_syn_holds: u32,
 }
 
 /// Complete caller-owned runtime storage requested by one V1 candidate.
@@ -1314,6 +1317,7 @@ fn validate_v1(
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)
+                .with_unsolicited_syn_icmp(source.unsolicited_syn_icmp)
                 .with_inbound_sessions_per_remote(source.inbound_sessions_per_remote)
                 .map_err(|error| {
                     ValidationError::new(
@@ -2035,6 +2039,11 @@ fn build_storage_shape(
             // Session remote-address directory: same dimensions.
             add_directory_bytes(&mut bytes, shape.session_buckets, shape.session_nodes)?;
             add_port_owner_bytes(&mut bytes, shape.port_owners)?;
+            add_bytes::<Nat44TcpSynHoldSlot>(
+                &mut bytes,
+                shape.unsolicited_syn_holds,
+                path(&["nat44", "tcp", "capacity", "unsolicited-syn-holds"]),
+            )?;
             Ok(shape)
         })
         .transpose()?;
@@ -2101,6 +2110,11 @@ fn tcp_shape(
     let session_buckets = directory_buckets(capacity.sessions, limits, session_path)?;
     let port_owners = port_count(ports);
     check_slots(port_owners, limits, path(&["nat44", "realm", "ports"]))?;
+    check_quote_slots(
+        capacity.unsolicited_syn_holds,
+        limits,
+        path(&["nat44", "tcp", "capacity", "unsolicited-syn-holds"]),
+    )?;
     Ok(Nat44TcpStorageShapeV1 {
         mappings: capacity.mappings,
         sessions: capacity.sessions,
@@ -2109,6 +2123,7 @@ fn tcp_shape(
         session_buckets,
         session_nodes: capacity.sessions,
         port_owners,
+        unsolicited_syn_holds: capacity.unsolicited_syn_holds,
     })
 }
 

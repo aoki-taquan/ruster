@@ -159,6 +159,7 @@ pub struct Nat44TcpStoragePlan {
     session_buckets: u32,
     session_nodes: u32,
     port_owner_slots: u32,
+    unsolicited_syn_hold_slots: u32,
 }
 
 impl Nat44TcpStoragePlan {
@@ -181,7 +182,21 @@ impl Nat44TcpStoragePlan {
             session_buckets,
             session_nodes,
             port_owner_slots,
+            unsolicited_syn_hold_slots: 0,
         }
+    }
+
+    /// This plan with `slots` unsolicited-SYN hold slots (RFC 5382 REQ-4;
+    /// `0` from [`Self::new`]).
+    #[must_use]
+    pub const fn with_unsolicited_syn_hold_slots(mut self, slots: u32) -> Self {
+        self.unsolicited_syn_hold_slots = slots;
+        self
+    }
+
+    #[must_use]
+    pub const fn unsolicited_syn_hold_slots(self) -> u32 {
+        self.unsolicited_syn_hold_slots
     }
 
     #[must_use]

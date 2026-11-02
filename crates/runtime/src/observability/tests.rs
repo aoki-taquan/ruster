@@ -583,7 +583,7 @@ fn snapshot_rendering_is_stable_and_ordered() {
 }
 
 /// `samples` plus four fields for each of the seven tables.
-const OCCUPANCY_FIELDS: usize = 1 + 7 * 4;
+const OCCUPANCY_FIELDS: usize = 1 + 8 * 4;
 
 fn table(occupied: usize, high_water: usize, capacity: usize) -> TableOccupancy {
     TableOccupancy::new(occupied, high_water, capacity).unwrap()
@@ -672,6 +672,7 @@ fn occupancy_samples_keep_the_last_value_and_a_lifetime_peak() {
             "occupancy.nat44_tcp_mappings",
             "occupancy.nat44_tcp_sessions",
             "occupancy.nat44_tcp_external_inbound_sessions",
+            "occupancy.nat44_tcp_unsolicited_syn_holds",
             "occupancy.firewall_states",
             "occupancy.icmpv4_error_states",
         ]

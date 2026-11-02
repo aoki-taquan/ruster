@@ -1,0 +1,272 @@
+//! RFC 5382 REQ-4: delayed ICMP Port Unreachable for unsolicited inbound
+//! TCP SYNs.
+//!
+//! The packet path drops every unsolicited inbound initial SYN (no live
+//! mapping for its public port, or a filtering refusal) silently, as before,
+//! and may copy it into the TCP NAT runtime's bounded hold table
+//! ([`hold_unsolicited_syn`]). A translated outbound SYN for the same
+//! connection cancels the hold inside the NAT commit. The tick loop calls
+//! [`dispatch_nat44_tcp_unsolicited_syns`] after the resolution failure
+//! dispatch: each hold whose 6 s have passed is removed and answered at most
+//! once with a Port Unreachable through the generated-ICMPv4 queue and its
+//! per-egress limiter, unless the NAT would now admit a retransmission.
+
+use super::*;
+use crate::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS;
+
+/// What happened to one unsolicited inbound SYN or one matured hold
+/// (RFC 5382 REQ-4). Cancellation by a translated outbound SYN is counted in
+/// [`crate::Nat44TcpCounters::unsolicited_syn_cancelled`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Nat44TcpUnsolicitedSynDisposition {
+    /// The SYN was held until at least `deadline_ms`.
+    Held { public_port: u16, deadline_ms: u64 },
+    /// A retransmission of a held connection restarted its hold.
+    Refreshed { public_port: u16, deadline_ms: u64 },
+    /// The hold table (or the connection's keyed chain) was full or
+    /// inconsistent: the SYN is only dropped silently.
+    HoldFull { public_port: u16 },
+    /// No ICMP error may answer this SYN (source not a unicast host or not
+    /// routed back through the outside interface, or a link-layer group
+    /// destination): the SYN is only dropped silently.
+    Ineligible { public_port: u16 },
+    /// A matured hold whose connection the NAT would now admit: dropped
+    /// silently.
+    Superseded { public_port: u16 },
+    /// A matured hold was answered with a queued ICMP Port Unreachable.
+    IcmpQueued { public_port: u16, egress: IfId },
+    /// A matured hold queued no ICMP; `icmpv4` is the generated-ICMPv4
+    /// refusal when the queue or a reverse lookup refused it.
+    IcmpSuppressed {
+        public_port: u16,
+        icmpv4: Option<Icmpv4ErrorDisposition>,
+    },
+}
+
+/// Counts of one [`dispatch_nat44_tcp_unsolicited_syns`] call.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Nat44TcpUnsolicitedSynDispatchReport {
+    /// Holds removed because their hold time had passed.
+    pub matured: usize,
+    pub superseded: usize,
+    pub queued: usize,
+    pub suppressed: usize,
+    /// Holds still in the table after the call.
+    pub pending: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum Nat44TcpUnsolicitedSynDispatchError {
+    /// `now` is before the TCP NAT runtime's clock watermark.
+    ClockRegression,
+    /// The runtime's config does not belong to `snapshot`.
+    ConfigMismatch,
+    /// The hold table or the runtime state is inconsistent; nothing more was
+    /// dispatched.
+    Inconsistent,
+}
+
+/// Packet path: offers an unsolicited inbound initial SYN that the TCP NAT
+/// just refused (mapping miss or filtering refusal) to the hold table. The
+/// caller drops the SYN in every case.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn hold_unsolicited_syn<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ipv4: packet::ValidatedIpv4,
+    public_port: u16,
+    remote_port: u16,
+    config: &Nat44TcpConfig,
+    runtime: &mut Nat44TcpRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) {
+    if !runtime.holds_unsolicited_syns() {
+        return;
+    }
+    // RFC 1812 §4.3.2.7 suppression, as for every generated error, plus a
+    // reverse-path check: the remote must be routed back out of the outside
+    // interface, so a spoofed inside or unrouted source never turns the
+    // hold into an ICMP toward the inside realm or nowhere.
+    if !icmp_error_candidate_eligible(frame, snapshot, ipv4, None)
+        || !remote_routes_outside(snapshot, config, ipv4.source)
+    {
+        runtime.record_unsolicited_syn_ineligible();
+        trace.record(TraceEvent::Nat44TcpUnsolicitedSyn {
+            disposition: Nat44TcpUnsolicitedSynDisposition::Ineligible { public_port },
+        });
+        return;
+    }
+    let quote_end = ipv4.header_offset + ipv4.total_len;
+    let deadline_ms = now.0.saturating_add(NAT44_TCP_UNSOLICITED_SYN_HOLD_MS);
+    let Some(outcome) = runtime.hold_unsolicited_syn(
+        public_port,
+        ipv4.source,
+        remote_port,
+        frame[ipv4.header_offset + 1],
+        &frame[ipv4.header_offset..quote_end],
+        now.0,
+    ) else {
+        return;
+    };
+    let disposition = match outcome {
+        crate::nat44_syn_hold::SynHoldInsert::Held => Nat44TcpUnsolicitedSynDisposition::Held {
+            public_port,
+            deadline_ms,
+        },
+        crate::nat44_syn_hold::SynHoldInsert::Refreshed => {
+            Nat44TcpUnsolicitedSynDisposition::Refreshed {
+                public_port,
+                deadline_ms,
+            }
+        }
+        crate::nat44_syn_hold::SynHoldInsert::Full
+        | crate::nat44_syn_hold::SynHoldInsert::IndexCorrupt => {
+            Nat44TcpUnsolicitedSynDisposition::HoldFull { public_port }
+        }
+    };
+    trace.record(TraceEvent::Nat44TcpUnsolicitedSyn { disposition });
+}
+
+fn remote_routes_outside(
+    snapshot: &ForwardingSnapshot<'_>,
+    config: &Nat44TcpConfig,
+    remote: crate::Ipv4Address,
+) -> bool {
+    snapshot
+        .route_lookup(remote)
+        .is_some_and(|route| route.egress() == config.outside())
+}
+
+/// Tick loop: resolves at most `budget` unsolicited-SYN holds whose hold
+/// time ([`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]) has passed at `now`, oldest
+/// first. Each matured hold is removed and yields at most one ICMP
+/// Destination Unreachable, Port Unreachable (Type 3, Code 3) quoting the
+/// original SYN (RFC 5382 REQ-4), queued through `icmpv4_errors` and its
+/// per-egress limiter. It is dropped silently instead when the NAT would now
+/// admit a retransmission of the SYN (an outbound SYN for the connection was
+/// translated, or the filtering now admits the remote), when the remote is
+/// no longer an eligible, outside-routed unicast host, or when the limiter,
+/// the action queue, the reverse route, or the reverse neighbor refuses
+/// (an unresolved reverse neighbor queues only an ARP Request). A refused
+/// hold is not retried, so a hold never produces a second ICMP.
+///
+/// Work is O(`budget`): holds are kept in deadline order, so this never
+/// scans holds that have not matured. A runtime without held SYNs returns
+/// at once without touching its clock.
+///
+/// # Errors
+///
+/// [`Nat44TcpUnsolicitedSynDispatchError::ClockRegression`] when `now` is
+/// before the NAT runtime's watermark,
+/// [`Nat44TcpUnsolicitedSynDispatchError::ConfigMismatch`] when the runtime
+/// does not belong to `snapshot`, and
+/// [`Nat44TcpUnsolicitedSynDispatchError::Inconsistent`] when the hold
+/// table or NAT state is inconsistent.
+pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
+    nat44_tcp: &mut Nat44TcpRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    snapshot: &ForwardingSnapshot<'_>,
+    now: MonotonicMillis,
+    budget: usize,
+    trace: &mut T,
+) -> Result<Nat44TcpUnsolicitedSynDispatchReport, Nat44TcpUnsolicitedSynDispatchError> {
+    let mut report = Nat44TcpUnsolicitedSynDispatchReport {
+        pending: nat44_tcp.unsolicited_syn_holds(),
+        ..Nat44TcpUnsolicitedSynDispatchReport::default()
+    };
+    if report.pending == 0 || budget == 0 {
+        return Ok(report);
+    }
+    let config = nat44_tcp.config();
+    if !config.authority_matches(snapshot) {
+        nat44_tcp.record_config_mismatch();
+        return Err(Nat44TcpUnsolicitedSynDispatchError::ConfigMismatch);
+    }
+    match nat44_tcp.observe_now(now.0) {
+        Ok(()) => {}
+        Err(Nat44TcpPlanError::ClockRegression) => {
+            return Err(Nat44TcpUnsolicitedSynDispatchError::ClockRegression);
+        }
+        Err(_) => return Err(Nat44TcpUnsolicitedSynDispatchError::Inconsistent),
+    }
+    let mut resolution = Some((resolution, now));
+    for _ in 0..budget {
+        let hold = match nat44_tcp.pop_matured_unsolicited_syn(now.0) {
+            Ok(Some(hold)) => hold,
+            Ok(None) => break,
+            Err(_) => {
+                nat44_tcp.record_config_mismatch();
+                return Err(Nat44TcpUnsolicitedSynDispatchError::Inconsistent);
+            }
+        };
+        report.matured += 1;
+        let public_port = hold.key.public_port;
+        let disposition = match nat44_tcp.plan_inbound_read_only(
+            public_port,
+            hold.key.remote_address,
+            hold.key.remote_port,
+            true,
+            now.0,
+        ) {
+            Ok(_) => {
+                nat44_tcp.record_unsolicited_syn_superseded();
+                report.superseded += 1;
+                Nat44TcpUnsolicitedSynDisposition::Superseded { public_port }
+            }
+            Err(Nat44TcpPlanError::MappingMiss | Nat44TcpPlanError::SessionMiss) => {
+                let remote = hold.key.remote_address;
+                let icmpv4 = if !icmp_error_source_is_host(snapshot, remote)
+                    || snapshot.is_local_ipv4(remote)
+                    || !remote_routes_outside(snapshot, &config, remote)
+                {
+                    None
+                } else {
+                    Some(schedule_reverse_icmpv4_error(
+                        snapshot,
+                        remote,
+                        hold.original_tos,
+                        hold.quote(),
+                        Icmpv4ErrorKind::DestinationUnreachablePort,
+                        &mut resolution,
+                        icmpv4_errors,
+                        now,
+                        trace,
+                    ))
+                };
+                match icmpv4 {
+                    Some(Icmpv4ErrorDisposition::PortUnreachableQueued { egress, .. }) => {
+                        nat44_tcp.record_unsolicited_syn_icmp(true);
+                        report.queued += 1;
+                        Nat44TcpUnsolicitedSynDisposition::IcmpQueued {
+                            public_port,
+                            egress,
+                        }
+                    }
+                    icmpv4 => {
+                        nat44_tcp.record_unsolicited_syn_icmp(false);
+                        report.suppressed += 1;
+                        Nat44TcpUnsolicitedSynDisposition::IcmpSuppressed {
+                            public_port,
+                            icmpv4,
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                nat44_tcp.record_unsolicited_syn_icmp(false);
+                report.suppressed += 1;
+                Nat44TcpUnsolicitedSynDisposition::IcmpSuppressed {
+                    public_port,
+                    icmpv4: None,
+                }
+            }
+        };
+        trace.record(TraceEvent::Nat44TcpUnsolicitedSyn { disposition });
+    }
+    report.pending = nat44_tcp.unsolicited_syn_holds();
+    Ok(report)
+}

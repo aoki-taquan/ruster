@@ -17,19 +17,28 @@ pub enum Icmpv4ErrorKind {
     TimeExceededTtl,
     DestinationUnreachableNetwork,
     DestinationUnreachableHost,
+    /// Destination Unreachable, Port Unreachable (Type 3, Code 3): the
+    /// delayed answer of the TCP NAT to an unsolicited inbound SYN
+    /// (RFC 5382 REQ-4). Its on/off switch is the NAT's
+    /// [`crate::Nat44TcpPolicy::with_unsolicited_syn_icmp`]; it shares the
+    /// action queue and per-egress limiter with every other kind.
+    DestinationUnreachablePort,
 }
 
 impl Icmpv4ErrorKind {
     const fn icmp_type(self) -> u8 {
         match self {
             Self::TimeExceededTtl => 11,
-            Self::DestinationUnreachableNetwork | Self::DestinationUnreachableHost => 3,
+            Self::DestinationUnreachableNetwork
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachablePort => 3,
         }
     }
 
     const fn icmp_code(self) -> u8 {
         match self {
             Self::DestinationUnreachableHost => 1,
+            Self::DestinationUnreachablePort => 3,
             Self::TimeExceededTtl | Self::DestinationUnreachableNetwork => 0,
         }
     }
@@ -39,6 +48,7 @@ impl Icmpv4ErrorKind {
             Self::TimeExceededTtl => 1,
             Self::DestinationUnreachableNetwork => 1 << 1,
             Self::DestinationUnreachableHost => 1 << 2,
+            Self::DestinationUnreachablePort => 1 << 3,
         }
     }
 }
@@ -261,6 +271,10 @@ pub enum Icmpv4ErrorDisposition {
         egress: IfId,
         quote_len: usize,
     },
+    PortUnreachableQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
     Pending {
         egress: IfId,
     },
@@ -310,11 +324,13 @@ pub struct Icmpv4ErrorCounters {
     pub queued_time_exceeded: usize,
     pub queued_destination_unreachable: usize,
     pub queued_host_unreachable: usize,
+    pub queued_port_unreachable: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub disabled_time_exceeded: usize,
     pub disabled_destination_unreachable: usize,
     pub disabled_host_unreachable: usize,
+    pub disabled_port_unreachable: usize,
     pub state_full: usize,
     pub action_full: usize,
     pub clock_regressions: usize,
@@ -337,6 +353,7 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_time_exceeded: usize,
     pub dequeued_destination_unreachable: usize,
     pub dequeued_host_unreachable: usize,
+    pub dequeued_port_unreachable: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -591,6 +608,10 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.queued += 1;
                 self.counters.queued_host_unreachable += 1;
             }
+            Icmpv4ErrorDisposition::PortUnreachableQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_port_unreachable += 1;
+            }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
@@ -602,6 +623,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 }
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     self.counters.disabled_host_unreachable += 1;
+                }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    self.counters.disabled_port_unreachable += 1;
                 }
             },
             Icmpv4ErrorDisposition::StateFull => self.counters.state_full += 1,
@@ -750,6 +774,12 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                     quote_len: action.quote_len(),
                 }
             }
+            Icmpv4ErrorKind::DestinationUnreachablePort => {
+                Icmpv4ErrorDisposition::PortUnreachableQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
         };
         self.record_suppression(disposition)
     }
@@ -795,6 +825,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             }
             Icmpv4ErrorKind::DestinationUnreachableHost => {
                 self.counters.dequeued_host_unreachable += 1;
+            }
+            Icmpv4ErrorKind::DestinationUnreachablePort => {
+                self.counters.dequeued_port_unreachable += 1;
             }
         }
         if let Some(state) = self.states[..self.occupied_prefix]
@@ -849,9 +882,12 @@ pub enum GeneratedIcmpv4Trace {
     DestinationUnreachableBuildFailed(Icmpv4ErrorBuildError),
     HostUnreachableAllocationFailed(GeneratedAllocationError),
     HostUnreachableBuildFailed(Icmpv4ErrorBuildError),
+    PortUnreachableAllocationFailed(GeneratedAllocationError),
+    PortUnreachableBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
     DestinationUnreachableClockRegression,
     HostUnreachableClockRegression,
+    PortUnreachableClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
@@ -864,6 +900,10 @@ pub enum GeneratedIcmpv4Trace {
         egress: IfId,
         destination: Ipv4Address,
     },
+    PortUnreachableTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
     BatchCompleted {
         accepted: usize,
         rejected: usize,
@@ -873,6 +913,10 @@ pub enum GeneratedIcmpv4Trace {
         rejected: usize,
     },
     HostUnreachableBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    PortUnreachableBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -932,6 +976,9 @@ where
             Icmpv4ErrorKind::DestinationUnreachableHost => {
                 GeneratedIcmpv4Trace::HostUnreachableClockRegression
             }
+            Icmpv4ErrorKind::DestinationUnreachablePort => {
+                GeneratedIcmpv4Trace::PortUnreachableClockRegression
+            }
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -957,6 +1004,12 @@ where
                         destination: queued.action.destination_ip,
                     }
                 }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::PortUnreachableTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -970,6 +1023,9 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     GeneratedIcmpv4Trace::HostUnreachableAllocationFailed(error)
                 }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::PortUnreachableAllocationFailed(error)
+                }
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -982,6 +1038,9 @@ where
                 }
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     GeneratedIcmpv4Trace::HostUnreachableBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::PortUnreachableBuildFailed(error)
                 }
             };
             trace.record_generated_icmpv4(event);
@@ -1002,6 +1061,12 @@ where
         }
         Icmpv4ErrorKind::DestinationUnreachableHost => {
             GeneratedIcmpv4Trace::HostUnreachableBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::DestinationUnreachablePort => {
+            GeneratedIcmpv4Trace::PortUnreachableBatchCompleted {
                 accepted: completion.accepted,
                 rejected: completion.rejected,
             }

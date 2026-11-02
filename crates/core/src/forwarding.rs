@@ -18,12 +18,18 @@ use crate::{
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
 use lookup::{linear, ForwardingIndex};
 use nat44_icmpv4_inside::{decide_nat44_icmpv4_inside_error, is_nat44_icmpv4_inside_candidate};
+use unsolicited_syn::hold_unsolicited_syn;
+pub use unsolicited_syn::{
+    dispatch_nat44_tcp_unsolicited_syns, Nat44TcpUnsolicitedSynDispatchError,
+    Nat44TcpUnsolicitedSynDispatchReport, Nat44TcpUnsolicitedSynDisposition,
+};
 
 mod hairpin;
 mod lookup;
 #[cfg(test)]
 mod lookup_tests;
 mod nat44_icmpv4_inside;
+mod unsolicited_syn;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -1337,6 +1343,11 @@ pub enum TraceEvent {
     Nat44Icmpv4 {
         ingress: IfId,
         disposition: Nat44Icmpv4Disposition,
+    },
+    /// An unsolicited inbound TCP SYN was offered to the hold table, or a
+    /// matured hold was resolved (RFC 5382 REQ-4).
+    Nat44TcpUnsolicitedSyn {
+        disposition: Nat44TcpUnsolicitedSynDisposition,
     },
     Dropped {
         ingress: IfId,
@@ -4617,6 +4628,26 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
                 ingress,
                 disposition,
             });
+            // RFC 5382 REQ-4: the unsolicited SYN is dropped silently now;
+            // a copy may be held for a delayed ICMP Port Unreachable.
+            if initial_syn
+                && matches!(
+                    error,
+                    Nat44TcpPlanError::MappingMiss | Nat44TcpPlanError::SessionMiss
+                )
+            {
+                hold_unsolicited_syn(
+                    frame,
+                    snapshot,
+                    ipv4,
+                    tcp.destination_port,
+                    tcp.source_port,
+                    config,
+                    runtime,
+                    now,
+                    trace,
+                );
+            }
             return Err(reason);
         }
     };
@@ -5309,7 +5340,38 @@ fn decide_icmpv4_error<T: TraceSink>(
         }
     }
 
-    let Some(reverse_route) = snapshot.route_lookup(ipv4.source) else {
+    let quote_end = ipv4.header_offset + ipv4.total_len;
+    schedule_reverse_icmpv4_error(
+        snapshot,
+        ipv4.source,
+        frame[ipv4.header_offset + 1],
+        &frame[ipv4.header_offset..quote_end],
+        kind,
+        resolution,
+        runtime,
+        now,
+        trace,
+    )
+}
+
+/// Routes an ICMPv4 error of `kind` about `original_ipv4` back to its
+/// `original_source` and queues it: the reverse route, the egress binding,
+/// the reverse neighbor (static, then fresh dynamic; a miss queues only an
+/// ARP Request), then the generated-ICMPv4 limiter. The caller has already
+/// applied the RFC 1812 §4.3.2.7 suppression rules.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
+    snapshot: &ForwardingSnapshot<'_>,
+    original_source: crate::Ipv4Address,
+    original_tos: u8,
+    original_ipv4: &[u8],
+    kind: Icmpv4ErrorKind,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    runtime: &mut Icmpv4ErrorRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Icmpv4ErrorDisposition {
+    let Some(reverse_route) = snapshot.route_lookup(original_source) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseRouteMiss);
     };
     let reverse_egress = reverse_route.egress();
@@ -5323,7 +5385,7 @@ fn decide_icmpv4_error<T: TraceSink>(
             egress: reverse_egress,
         });
     };
-    let target = reverse_route.next_hop().unwrap_or(ipv4.source);
+    let target = reverse_route.next_hop().unwrap_or(original_source);
     if reverse_target_forbidden(snapshot, reverse_egress, target, binding.address) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseTargetForbidden {
             egress: reverse_egress,
@@ -5387,8 +5449,6 @@ fn decide_icmpv4_error<T: TraceSink>(
         );
     };
 
-    let quote_end = ipv4.header_offset + ipv4.total_len;
-    let original_ipv4 = &frame[ipv4.header_offset..quote_end];
     runtime.schedule(
         Icmpv4ErrorAction::new_with_kind(
             kind,
@@ -5396,8 +5456,8 @@ fn decide_icmpv4_error<T: TraceSink>(
             interface.mac,
             destination_mac,
             binding.address,
-            ipv4.source,
-            frame[ipv4.header_offset + 1],
+            original_source,
+            original_tos,
             snapshot.ipv4_origin.default_ttl(),
             original_ipv4,
         ),
