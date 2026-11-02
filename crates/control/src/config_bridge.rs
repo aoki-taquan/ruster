@@ -17,7 +17,7 @@ use ruster_config::{
     ValidatedConfigV1, ValidatedFirewallV1, ValidatedIcmpv4ErrorV1, ValidatedNat44TcpV1,
     ValidatedNat44UdpV1, ValidatedResolutionV1,
 };
-use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey};
+use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey};
 
 use crate::publication::{
     FirewallPublicationInput, FullServiceStorageShape, Icmpv4ErrorStorageShape,
@@ -83,7 +83,7 @@ pub enum KeySourceError {
     EntropyEndOfFile,
 }
 
-/// The three hash keys bound to one publication generation.
+/// The four hash keys bound to one publication generation.
 ///
 /// Formatting is redacted and the type is not `Clone`, so a key set is
 /// consumed by exactly one candidate build.
@@ -92,6 +92,7 @@ pub struct PublicationKeys {
     nat44_udp: Nat44UdpHashKey,
     nat44_tcp: Nat44TcpHashKey,
     firewall: FirewallHashKey,
+    resolution: ResolutionHashKey,
 }
 
 impl PublicationKeys {
@@ -100,12 +101,19 @@ impl PublicationKeys {
         nat44_udp: Nat44UdpHashKey,
         nat44_tcp: Nat44TcpHashKey,
         firewall: FirewallHashKey,
+        resolution: ResolutionHashKey,
     ) -> Self {
         Self {
             nat44_udp,
             nat44_tcp,
             firewall,
+            resolution,
         }
+    }
+
+    #[must_use]
+    pub const fn resolution(&self) -> ResolutionHashKey {
+        self.resolution
     }
 
     #[must_use]
@@ -171,8 +179,8 @@ pub trait PublicationKeySource {
 ///
 /// With `mix` the SplitMix64 output finalizer (a bijection on `u64`),
 /// `GAMMA = 0x9e37_79b9_7f4a_7c15`, and a fixed per-word domain tag `tag`
-/// (UDP first/second, TCP first/second, firewall first/second; six distinct
-/// constants), each key word is
+/// (UDP first/second, TCP first/second, firewall first/second, resolution
+/// first/second; eight distinct constants), each key word is
 ///
 /// ```text
 /// word = mix(seed ^ mix(generation.wrapping_mul(GAMMA) ^ tag))
@@ -216,6 +224,8 @@ const TAG_TCP_FIRST: u64 = 0x7275_7374_7463_7031;
 const TAG_TCP_SECOND: u64 = 0x7275_7374_7463_7032;
 const TAG_FIREWALL_FIRST: u64 = 0x7275_7374_6677_6b31;
 const TAG_FIREWALL_SECOND: u64 = 0x7275_7374_6677_6b32;
+const TAG_RESOLUTION_FIRST: u64 = 0x7275_7374_7273_6c31;
+const TAG_RESOLUTION_SECOND: u64 = 0x7275_7374_7273_6c32;
 
 const fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -245,7 +255,12 @@ impl PublicationKeySource for SimDeterministicKeySource {
             self.word(generation, TAG_FIREWALL_SECOND),
         )
         .map_err(|_| KeySourceError::AllZeroKey(RuntimeService::Firewall))?;
-        Ok(PublicationKeys::new(udp, tcp, firewall))
+        let resolution = ResolutionHashKey::new(
+            self.word(generation, TAG_RESOLUTION_FIRST),
+            self.word(generation, TAG_RESOLUTION_SECOND),
+        )
+        .map_err(|_| KeySourceError::AllZeroKey(RuntimeService::Resolution))?;
+        Ok(PublicationKeys::new(udp, tcp, firewall, resolution))
     }
 }
 
@@ -336,7 +351,8 @@ pub fn candidate_from_config<S: PublicationKeySource>(
         firewall.rules().into(),
         firewall.policy(),
         key_set.firewall,
-    ));
+    ))
+    .with_resolution_hash_key(key_set.resolution);
     ValidatedCandidate::new(plan).map_err(ConfigBridgeError::Candidate)
 }
 

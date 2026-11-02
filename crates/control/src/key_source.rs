@@ -7,8 +7,8 @@
 //! follow-up. The device is opened once, by
 //! [`OsRandomKeySource::open`], and must be the Linux `/dev/urandom` (1:9)
 //! or `/dev/random` (1:8) character device. Each
-//! publication draws 48 fresh bytes (two 64-bit words for each of the UDP
-//! NAT44, TCP NAT44, and firewall keys). Short reads are continued,
+//! publication draws 64 fresh bytes (two 64-bit words for each of the UDP
+//! NAT44, TCP NAT44, firewall, and resolution keys). Short reads are continued,
 //! `EINTR` is retried, and every other outcome is a typed, value-free
 //! [`KeySourceError`]. There is no fallback: a failed draw yields no key set
 //! and therefore no candidate.
@@ -37,7 +37,7 @@ use std::{
     path::Path,
 };
 
-use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey};
+use ruster_core::{FirewallHashKey, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey};
 
 use crate::{
     config_bridge::{KeySourceError, KeySourceKind, PublicationKeySource, PublicationKeys},
@@ -47,8 +47,8 @@ use crate::{
 /// The kernel CSPRNG device.
 const DEVICE: &str = "/dev/urandom";
 
-/// Bytes drawn per publication: three keys of two `u64` words each.
-const KEY_SET_BYTES: usize = 48;
+/// Bytes drawn per publication: four keys of two `u64` words each.
+const KEY_SET_BYTES: usize = 64;
 
 /// Linux `(major, minor)` numbers of the kernel CSPRNG devices:
 /// `/dev/urandom` (1:9) and `/dev/random` (1:8).
@@ -183,7 +183,9 @@ fn keys_from<R: Read>(entropy: &mut R) -> Result<PublicationKeys, KeySourceError
         .map_err(|_| KeySourceError::AllZeroKey(RuntimeService::Nat44Tcp))?;
     let firewall = FirewallHashKey::new(word(4), word(5))
         .map_err(|_| KeySourceError::AllZeroKey(RuntimeService::Firewall))?;
-    Ok(PublicationKeys::new(udp, tcp, firewall))
+    let resolution = ResolutionHashKey::new(word(6), word(7))
+        .map_err(|_| KeySourceError::AllZeroKey(RuntimeService::Resolution))?;
+    Ok(PublicationKeys::new(udp, tcp, firewall, resolution))
 }
 
 /// Fills `buffer` completely, continuing short reads and retrying `EINTR`.

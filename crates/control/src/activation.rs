@@ -461,7 +461,8 @@ impl From<SuccessorError> for ApplyError {
             | SuccessorError::GenerationNotIncreasing
             | SuccessorError::Nat44UdpHashKeyReused
             | SuccessorError::Nat44TcpHashKeyReused
-            | SuccessorError::FirewallHashKeyReused => Self::Successor(error),
+            | SuccessorError::FirewallHashKeyReused
+            | SuccessorError::ResolutionHashKeyReused => Self::Successor(error),
         }
     }
 }
@@ -694,12 +695,13 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             authority.nat44_tcp_hash_key(),
         )
         .map_err(ActivationError::Nat44Tcp)?;
-        let resolution = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+        let resolution = ResolutionRuntime::with_hash_key(
             authority.resolution_policy(),
             resolution_states,
             resolution_actions,
             dynamic_neighbors,
             failure_holds,
+            authority.resolution_hash_key(),
         );
         let icmpv4_errors = Icmpv4ErrorRuntime::new(
             authority.icmpv4_error_policy(),
@@ -819,6 +821,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             .runtimes
             .preflight(&self.candidate, &successor, &mut fault)?;
 
+        let resolution_hash_key = successor.authority().resolution_hash_key();
         // Commit point. Nothing below can fail: every permit commit is a
         // total core operation, the permits retain no borrow of `successor`,
         // and the boxed forwarding/firewall owners keep their addresses when
@@ -827,7 +830,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
         let report = ApplyReport {
             previous_generation: self.candidate.generation(),
             generation: successor.generation(),
-            resolution: resolution.commit(),
+            resolution: resolution.commit_with_hash_key(resolution_hash_key),
             icmpv4_errors: icmpv4_errors.commit(),
             nat44_udp: nat44_udp.commit(),
             nat44_tcp: nat44_tcp.commit(),

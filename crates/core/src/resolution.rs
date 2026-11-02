@@ -1,6 +1,13 @@
-use std::{marker::PhantomData, rc::Rc};
+use std::{cell::Cell, marker::PhantomData, rc::Rc};
 
 use crate::{
+    fixed_directory::{DirectoryHashDomain, DirectoryHashKey},
+    slot_index::{
+        bucket_of, chain_bucket, chain_head, chain_next, first_unused, key_bucket, link, set_used,
+        unlink, validate, validate_bits, walk, Chain, ChainNode, IndexCorrupt, UsedBits,
+        INDEX_NONE,
+    },
+    slot_list::{Linked, SlotLinks, SlotList},
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
     Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, IfId,
     Ipv4Address, MacAddress, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN, IPV4_ETHERTYPE,
@@ -112,6 +119,58 @@ pub struct ArpRequestAction {
     pub target_ip: Ipv4Address,
 }
 
+/// Longest key chain the state, dynamic-neighbor, and failure-hold forward
+/// indexes admit (H4b, PERF-001).
+///
+/// Each of those tables has one bucket per slot and a secret keyed SipHash,
+/// so a chain this long is astronomically unlikely by chance. An insert into
+/// a chain that already holds this many entries fails closed with the
+/// table's existing full result (`StateFull`, `CacheFull`, or
+/// `CapacityFull`) and a `*_probe_exhausted` count in
+/// [`ResolutionIndexCounters`]. Because inserts never grow a chain past this
+/// limit, every lookup in these tables visits at most this many slots.
+pub const RESOLUTION_INDEX_CHAIN_LIMIT: usize = 16;
+
+/// Secret key of the resolution runtime's hashed indexes.
+///
+/// The control plane must generate a fresh unpredictable key for every
+/// runtime construction and successful publication
+/// ([`ResolutionRuntime::with_hash_key`],
+/// [`ResolutionPublicationPermit::commit_with_hash_key`]).
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub struct ResolutionHashKey(DirectoryHashKey);
+
+impl std::fmt::Debug for ResolutionHashKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ResolutionHashKey([REDACTED])")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ResolutionHashKeyError {
+    AllZero,
+}
+
+impl ResolutionHashKey {
+    /// Constructs a control-plane supplied resolution index key.
+    pub const fn new(first: u64, second: u64) -> Result<Self, ResolutionHashKeyError> {
+        match DirectoryHashKey::new(first, second) {
+            Ok(key) => Ok(Self(key)),
+            Err(_) => Err(ResolutionHashKeyError::AllZero),
+        }
+    }
+}
+
+/// Public fixed key of the constructors that take no key (tests and benches).
+/// Chains stay capped at insert, so a known key can only make inserts fail
+/// closed, except in the uncapped reverse failure-hold index.
+const FIXED_HASH_KEY: DirectoryHashKey =
+    match DirectoryHashKey::new(0x7275_7374_6572_7273, 0x6c76_2d66_6978_6564) {
+        Ok(key) => key,
+        Err(_) => panic!("nonzero fixed key"),
+    };
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ResolutionKey {
     egress: IfId,
@@ -133,15 +192,29 @@ pub enum ResolutionPhase {
     Cooldown,
 }
 
+/// One slot of the ARP request queue.
+///
+/// Queued slots form a FIFO list; slot `i` also stores word `i` of the
+/// queue's free-slot bitmap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResolutionActionSlot(Option<QueuedAction>);
+pub struct ResolutionActionSlot {
+    queued: Option<QueuedAction>,
+    state: u32,
+    links: SlotLinks,
+    used_word: u64,
+}
 
 impl ResolutionActionSlot {
-    pub const EMPTY: Self = Self(None);
+    pub const EMPTY: Self = Self {
+        queued: None,
+        state: INDEX_NONE,
+        links: SlotLinks::UNLINKED,
+        used_word: 0,
+    };
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ResolutionStateSlot {
+struct StateEntry {
     key: ResolutionKey,
     action: ArpRequestAction,
     generation: u64,
@@ -154,8 +227,8 @@ pub struct ResolutionStateSlot {
     failure_notified: bool,
 }
 
-impl ResolutionStateSlot {
-    pub const EMPTY: Self = Self {
+impl StateEntry {
+    const EMPTY: Self = Self {
         key: ResolutionKey {
             egress: IfId(0),
             target: Ipv4Address::from_octets([0; 4]),
@@ -177,8 +250,37 @@ impl ResolutionStateSlot {
     };
 }
 
+/// One resolution state slot.
+///
+/// Besides the state, the slot is a node of the key chain (key: egress
+/// interface and target IPv4) and of the request-order list, and stores
+/// table word `i`: the head of key bucket `i` and word `i` of the
+/// reusable-slot bitmap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DynamicNeighborSlot {
+pub struct ResolutionStateSlot {
+    entry: StateEntry,
+    chain: ChainNode,
+    order: SlotLinks,
+    in_order: bool,
+    action_slot: u32,
+    bucket_head: u32,
+    used_word: u64,
+}
+
+impl ResolutionStateSlot {
+    pub const EMPTY: Self = Self {
+        entry: StateEntry::EMPTY,
+        chain: ChainNode::UNLINKED,
+        order: SlotLinks::UNLINKED,
+        in_order: false,
+        action_slot: INDEX_NONE,
+        bucket_head: INDEX_NONE,
+        used_word: 0,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DynamicEntry {
     interface: IfId,
     target: Ipv4Address,
     mac: MacAddress,
@@ -186,13 +288,39 @@ pub struct DynamicNeighborSlot {
     occupied: bool,
 }
 
-impl DynamicNeighborSlot {
-    pub const EMPTY: Self = Self {
+impl DynamicEntry {
+    const EMPTY: Self = Self {
         interface: IfId(0),
         target: Ipv4Address::from_octets([0; 4]),
         mac: MacAddress([0; 6]),
         refreshed_at: MonotonicMillis(0),
         occupied: false,
+    };
+}
+
+/// One dynamic ARP cache slot.
+///
+/// Besides the entry, the slot is a node of the key chain (key: interface
+/// and IPv4) and of the refresh-order list, and stores table word `i`: the
+/// head of key bucket `i` and word `i` of the reusable-slot bitmap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DynamicNeighborSlot {
+    entry: DynamicEntry,
+    chain: ChainNode,
+    lru: SlotLinks,
+    in_lru: bool,
+    bucket_head: u32,
+    used_word: u64,
+}
+
+impl DynamicNeighborSlot {
+    pub const EMPTY: Self = Self {
+        entry: DynamicEntry::EMPTY,
+        chain: ChainNode::UNLINKED,
+        lru: SlotLinks::UNLINKED,
+        in_lru: false,
+        bucket_head: INDEX_NONE,
+        used_word: 0,
     };
 }
 
@@ -235,6 +363,8 @@ pub enum ResolutionPublicationError {
     PendingStateCount,
     PendingFailureHoldCount,
     RuntimeEpochExhausted,
+    /// A key chain, reuse bitmap, or order list disagrees with the slots.
+    IndexCorrupt,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -309,6 +439,25 @@ pub struct ResolutionCounters {
     pub failures_expired: usize,
 }
 
+/// Fail-closed outcomes of the hashed indexes (H4b).
+///
+/// Each probe-exhausted insert is also counted by the table's existing full
+/// counter (`state_full`, `capture_full`) or reported as `CacheFull`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionIndexCounters {
+    /// New resolution states refused because their key chain already held
+    /// [`RESOLUTION_INDEX_CHAIN_LIMIT`] states.
+    pub state_probe_exhausted: usize,
+    /// Dynamic neighbors not learned for the same reason.
+    pub dynamic_probe_exhausted: usize,
+    /// Failure holds not captured for the same reason.
+    pub failure_hold_probe_exhausted: usize,
+    /// Index inconsistencies found on a packet path. Each one failed closed
+    /// (a full result, a miss, or a skipped update) instead of mutating
+    /// through the inconsistent part.
+    pub index_corrupt: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionGenerationToken {
     pub egress: IfId,
@@ -329,6 +478,12 @@ pub enum ResolutionFailureHoldPhase {
 /// This is deliberately separate from [`ResolutionStateSlot`]. It never owns
 /// an RX/TX lease and is not a packet queue: only validated metadata and at
 /// most 548 original IPv4 bytes are copied before the original RX is recycled.
+///
+/// Besides the hold, the slot is a node of the forward chain (key: forward
+/// egress and target) and, while waiting for reverse resolution, of the
+/// reverse chain (key: the reverse generation token), and stores table word
+/// `i`: the heads of both chains' bucket `i` and word `i` of the free-slot
+/// bitmap.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResolutionFailureHoldSlot {
     phase: ResolutionFailureHoldPhase,
@@ -343,6 +498,11 @@ pub struct ResolutionFailureHoldSlot {
     original_tos: u8,
     quote_len: u16,
     quote: [u8; ICMPV4_ERROR_MAX_QUOTE_LEN],
+    forward_chain: ChainNode,
+    reverse_chain: ChainNode,
+    forward_head: u32,
+    reverse_head: u32,
+    used_word: u64,
 }
 
 impl ResolutionFailureHoldSlot {
@@ -367,6 +527,11 @@ impl ResolutionFailureHoldSlot {
         original_tos: 0,
         quote_len: 0,
         quote: [0; ICMPV4_ERROR_MAX_QUOTE_LEN],
+        forward_chain: ChainNode::UNLINKED,
+        reverse_chain: ChainNode::UNLINKED,
+        forward_head: INDEX_NONE,
+        reverse_head: INDEX_NONE,
+        used_word: 0,
     };
 
     #[must_use]
@@ -387,6 +552,201 @@ impl ResolutionFailureHoldSlot {
     pub const fn quote_len(&self) -> usize {
         self.quote_len as usize
     }
+
+    /// Resets the hold to empty, keeping the table words stored here.
+    fn clear_entry(&mut self) {
+        let (forward_head, reverse_head, used_word) =
+            (self.forward_head, self.reverse_head, self.used_word);
+        *self = Self::EMPTY;
+        self.forward_head = forward_head;
+        self.reverse_head = reverse_head;
+        self.used_word = used_word;
+    }
+}
+
+struct StateChain;
+
+impl Chain for StateChain {
+    type Slot = ResolutionStateSlot;
+    fn node(slot: &Self::Slot) -> ChainNode {
+        slot.chain
+    }
+    fn node_mut(slot: &mut Self::Slot) -> &mut ChainNode {
+        &mut slot.chain
+    }
+    fn head(slot: &Self::Slot) -> u32 {
+        slot.bucket_head
+    }
+    fn head_mut(slot: &mut Self::Slot) -> &mut u32 {
+        &mut slot.bucket_head
+    }
+}
+
+struct StateBits;
+
+impl UsedBits for StateBits {
+    type Slot = ResolutionStateSlot;
+    fn word(slot: &Self::Slot) -> u64 {
+        slot.used_word
+    }
+    fn word_mut(slot: &mut Self::Slot) -> &mut u64 {
+        &mut slot.used_word
+    }
+}
+
+impl Linked for ResolutionStateSlot {
+    fn links(&self) -> SlotLinks {
+        self.order
+    }
+    fn links_mut(&mut self) -> &mut SlotLinks {
+        &mut self.order
+    }
+}
+
+struct ActionBits;
+
+impl UsedBits for ActionBits {
+    type Slot = ResolutionActionSlot;
+    fn word(slot: &Self::Slot) -> u64 {
+        slot.used_word
+    }
+    fn word_mut(slot: &mut Self::Slot) -> &mut u64 {
+        &mut slot.used_word
+    }
+}
+
+impl Linked for ResolutionActionSlot {
+    fn links(&self) -> SlotLinks {
+        self.links
+    }
+    fn links_mut(&mut self) -> &mut SlotLinks {
+        &mut self.links
+    }
+}
+
+struct DynamicChain;
+
+impl Chain for DynamicChain {
+    type Slot = DynamicNeighborSlot;
+    fn node(slot: &Self::Slot) -> ChainNode {
+        slot.chain
+    }
+    fn node_mut(slot: &mut Self::Slot) -> &mut ChainNode {
+        &mut slot.chain
+    }
+    fn head(slot: &Self::Slot) -> u32 {
+        slot.bucket_head
+    }
+    fn head_mut(slot: &mut Self::Slot) -> &mut u32 {
+        &mut slot.bucket_head
+    }
+}
+
+struct DynamicBits;
+
+impl UsedBits for DynamicBits {
+    type Slot = DynamicNeighborSlot;
+    fn word(slot: &Self::Slot) -> u64 {
+        slot.used_word
+    }
+    fn word_mut(slot: &mut Self::Slot) -> &mut u64 {
+        &mut slot.used_word
+    }
+}
+
+impl Linked for DynamicNeighborSlot {
+    fn links(&self) -> SlotLinks {
+        self.lru
+    }
+    fn links_mut(&mut self) -> &mut SlotLinks {
+        &mut self.lru
+    }
+}
+
+struct HoldForwardChain;
+
+impl Chain for HoldForwardChain {
+    type Slot = ResolutionFailureHoldSlot;
+    fn node(slot: &Self::Slot) -> ChainNode {
+        slot.forward_chain
+    }
+    fn node_mut(slot: &mut Self::Slot) -> &mut ChainNode {
+        &mut slot.forward_chain
+    }
+    fn head(slot: &Self::Slot) -> u32 {
+        slot.forward_head
+    }
+    fn head_mut(slot: &mut Self::Slot) -> &mut u32 {
+        &mut slot.forward_head
+    }
+}
+
+struct HoldReverseChain;
+
+impl Chain for HoldReverseChain {
+    type Slot = ResolutionFailureHoldSlot;
+    fn node(slot: &Self::Slot) -> ChainNode {
+        slot.reverse_chain
+    }
+    fn node_mut(slot: &mut Self::Slot) -> &mut ChainNode {
+        &mut slot.reverse_chain
+    }
+    fn head(slot: &Self::Slot) -> u32 {
+        slot.reverse_head
+    }
+    fn head_mut(slot: &mut Self::Slot) -> &mut u32 {
+        &mut slot.reverse_head
+    }
+}
+
+struct HoldBits;
+
+impl UsedBits for HoldBits {
+    type Slot = ResolutionFailureHoldSlot;
+    fn word(slot: &Self::Slot) -> u64 {
+        slot.used_word
+    }
+    fn word_mut(slot: &mut Self::Slot) -> &mut u64 {
+        &mut slot.used_word
+    }
+}
+
+const fn ipv4_word(address: Ipv4Address) -> u64 {
+    u32::from_be_bytes(address.octets()) as u64
+}
+
+const fn key_words(egress: IfId, target: Ipv4Address) -> [u64; 2] {
+    [egress.0 as u64, ipv4_word(target)]
+}
+
+const fn token_words(token: ResolutionGenerationToken) -> [u64; 3] {
+    [
+        token.egress.0 as u64,
+        ipv4_word(token.target),
+        token.generation,
+    ]
+}
+
+/// A state slot is used (not reusable) unless it is free or an elapsed
+/// cooldown. A cooldown is known to be elapsed once it left the request
+/// order list (see [`ResolutionRuntime::mature_states`]).
+const fn state_used(slot: &ResolutionStateSlot) -> bool {
+    slot.entry.occupied
+        && !(matches!(slot.entry.phase, ResolutionPhase::Cooldown) && !slot.in_order)
+}
+
+/// A dynamic neighbor slot is used unless it is free or expired. An entry is
+/// known to be expired once it left the refresh-order list.
+const fn dynamic_used(slot: &DynamicNeighborSlot) -> bool {
+    slot.entry.occupied && slot.in_lru
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KeyLookup {
+    bucket: usize,
+    found: Option<usize>,
+    /// Length of the whole chain when `found` is `None`.
+    chain_len: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -541,6 +901,11 @@ impl ResolutionTimerTraceSink for NoResolutionTimerTrace {
 
 /// Caller-backed worker-local resolution state.
 ///
+/// Every per-packet operation finds its state, dynamic neighbor, failure
+/// hold, or free slot through indexes embedded in the caller's slots (keyed
+/// chains, reusable-slot bitmaps, and time-ordered lists; H4b, PERF-001), so
+/// its cost does not grow with the table capacity.
+///
 /// ```compile_fail
 /// fn require_send<T: Send>() {}
 /// require_send::<ruster_core::ResolutionRuntime<'static>>();
@@ -556,8 +921,15 @@ pub struct ResolutionRuntime<'a> {
     actions: &'a mut [ResolutionActionSlot],
     dynamic_neighbors: &'a mut [DynamicNeighborSlot],
     failure_holds: &'a mut [ResolutionFailureHoldSlot],
-    head: usize,
-    len: usize,
+    hash_key: DirectoryHashKey,
+    /// Queued ARP request slots, oldest first.
+    action_queue: SlotList,
+    /// States with at least one committed request whose interval had not
+    /// elapsed when last checked, in commit (`requested_at`) order.
+    request_order: SlotList,
+    /// Dynamic neighbors not known to be expired, in refresh order.
+    dynamic_order: SlotList,
+    dynamic_count: usize,
     pending_state_count: usize,
     pending_failure_hold_count: usize,
     poll_cursor: usize,
@@ -566,6 +938,10 @@ pub struct ResolutionRuntime<'a> {
     publication_epoch: u128,
     counters: ResolutionCounters,
     failure_counters: ResolutionFailureCounters,
+    index_counters: ResolutionIndexCounters,
+    /// Index slots visited (chain nodes, list heads, bitmap words). Cost
+    /// tests read it; it never affects behavior.
+    visits: Cell<u64>,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -595,6 +971,8 @@ impl<'a> ResolutionRuntime<'a> {
         )
     }
 
+    /// Builds a runtime with a public fixed index key. Production code uses
+    /// [`Self::with_hash_key`].
     #[must_use]
     pub fn with_dynamic_neighbors_and_failure_holds(
         policy: ResolutionPolicy,
@@ -603,6 +981,58 @@ impl<'a> ResolutionRuntime<'a> {
         dynamic_neighbors: &'a mut [DynamicNeighborSlot],
         failure_holds: &'a mut [ResolutionFailureHoldSlot],
     ) -> Self {
+        Self::build(
+            policy,
+            states,
+            action_storage,
+            dynamic_neighbors,
+            failure_holds,
+            FIXED_HASH_KEY,
+        )
+    }
+
+    /// Builds a runtime whose hashed indexes use the secret `hash_key`.
+    ///
+    /// Every slice is cleared. Each table must have fewer than `u32::MAX`
+    /// slots.
+    #[must_use]
+    pub fn with_hash_key(
+        policy: ResolutionPolicy,
+        states: &'a mut [ResolutionStateSlot],
+        action_storage: &'a mut [ResolutionActionSlot],
+        dynamic_neighbors: &'a mut [DynamicNeighborSlot],
+        failure_holds: &'a mut [ResolutionFailureHoldSlot],
+        hash_key: ResolutionHashKey,
+    ) -> Self {
+        Self::build(
+            policy,
+            states,
+            action_storage,
+            dynamic_neighbors,
+            failure_holds,
+            hash_key.0,
+        )
+    }
+
+    fn build(
+        policy: ResolutionPolicy,
+        states: &'a mut [ResolutionStateSlot],
+        action_storage: &'a mut [ResolutionActionSlot],
+        dynamic_neighbors: &'a mut [DynamicNeighborSlot],
+        failure_holds: &'a mut [ResolutionFailureHoldSlot],
+        hash_key: DirectoryHashKey,
+    ) -> Self {
+        for len in [
+            states.len(),
+            action_storage.len(),
+            dynamic_neighbors.len(),
+            failure_holds.len(),
+        ] {
+            assert!(
+                u32::try_from(len).is_ok_and(|len| len != INDEX_NONE),
+                "resolution table capacity must be below u32::MAX"
+            );
+        }
         states.fill(ResolutionStateSlot::EMPTY);
         action_storage.fill(ResolutionActionSlot::EMPTY);
         dynamic_neighbors.fill(DynamicNeighborSlot::EMPTY);
@@ -613,8 +1043,11 @@ impl<'a> ResolutionRuntime<'a> {
             actions: action_storage,
             dynamic_neighbors,
             failure_holds,
-            head: 0,
-            len: 0,
+            hash_key,
+            action_queue: SlotList::EMPTY,
+            request_order: SlotList::EMPTY,
+            dynamic_order: SlotList::EMPTY,
+            dynamic_count: 0,
             pending_state_count: 0,
             pending_failure_hold_count: 0,
             poll_cursor: 0,
@@ -623,16 +1056,16 @@ impl<'a> ResolutionRuntime<'a> {
             publication_epoch: 1,
             counters: ResolutionCounters::default(),
             failure_counters: ResolutionFailureCounters::default(),
+            index_counters: ResolutionIndexCounters::default(),
+            visits: Cell::new(0),
             _worker_local: PhantomData,
         }
     }
 
+    /// Occupied dynamic neighbor slots, expired ones included, in O(1).
     #[must_use]
-    pub fn dynamic_neighbor_count(&self) -> usize {
-        self.dynamic_neighbors
-            .iter()
-            .filter(|slot| slot.occupied)
-            .count()
+    pub const fn dynamic_neighbor_count(&self) -> usize {
+        self.dynamic_count
     }
 
     #[must_use]
@@ -660,6 +1093,12 @@ impl<'a> ResolutionRuntime<'a> {
         self.failure_holds.len()
     }
 
+    /// Fail-closed outcomes of the hashed indexes.
+    #[must_use]
+    pub const fn index_counters(&self) -> ResolutionIndexCounters {
+        self.index_counters
+    }
+
     /// Returns whether this runtime is still in its exact constructor state.
     #[must_use]
     pub fn is_pristine(&self) -> bool {
@@ -678,8 +1117,10 @@ impl<'a> ResolutionRuntime<'a> {
                 .failure_holds
                 .iter()
                 .all(|slot| *slot == ResolutionFailureHoldSlot::EMPTY)
-            && self.head == 0
-            && self.len == 0
+            && self.action_queue == SlotList::EMPTY
+            && self.request_order == SlotList::EMPTY
+            && self.dynamic_order == SlotList::EMPTY
+            && self.dynamic_count == 0
             && self.pending_state_count == 0
             && self.pending_failure_hold_count == 0
             && self.poll_cursor == 0
@@ -688,9 +1129,11 @@ impl<'a> ResolutionRuntime<'a> {
             && self.publication_epoch == 1
             && self.counters == ResolutionCounters::default()
             && self.failure_counters == ResolutionFailureCounters::default()
+            && self.index_counters == ResolutionIndexCounters::default()
     }
 
-    /// Validates queue/accounting invariants and previews one publication.
+    /// Validates queue/accounting/index invariants and previews one
+    /// publication.
     ///
     /// Preflight never mutates runtime state. The returned permit retains the
     /// exact runtime exclusively until it is committed or dropped.
@@ -703,18 +1146,14 @@ impl<'a> ResolutionRuntime<'a> {
             .checked_add(1)
             .ok_or(ResolutionPublicationError::RuntimeEpochExhausted)?;
         let preview = ResolutionPublicationReport {
-            states_flushed: self.states.iter().filter(|state| state.occupied).count(),
-            actions_flushed: self.len,
-            dynamic_neighbors_flushed: self
-                .dynamic_neighbors
+            states_flushed: self
+                .states
                 .iter()
-                .filter(|slot| slot.occupied)
+                .filter(|state| state.entry.occupied)
                 .count(),
-            failure_holds_flushed: self
-                .failure_holds
-                .iter()
-                .filter(|hold| hold.phase != ResolutionFailureHoldPhase::Empty)
-                .count(),
+            actions_flushed: self.action_queue.len(),
+            dynamic_neighbors_flushed: self.dynamic_count,
+            failure_holds_flushed: self.pending_failure_hold_count,
         };
         Ok(ResolutionPublicationPermit {
             runtime: self,
@@ -730,46 +1169,35 @@ impl<'a> ResolutionRuntime<'a> {
     /// packet with that snapshot.
     pub fn reconcile_static(&mut self, neighbors: &[crate::Neighbor]) -> StaticReconcileReport {
         let mut report = StaticReconcileReport::default();
-        for slot in &mut *self.dynamic_neighbors {
-            if slot.occupied
-                && neighbors.iter().any(|neighbor| {
-                    neighbor.interface == slot.interface && neighbor.target == slot.target
-                })
-            {
-                *slot = DynamicNeighborSlot::EMPTY;
+        for neighbor in neighbors {
+            let key = ResolutionKey {
+                egress: neighbor.interface,
+                target: neighbor.target,
+            };
+            if let Some(index) = self.find_dynamic(key) {
+                self.remove_dynamic(index);
                 report.dynamic_removed += 1;
             }
         }
-        for index in 0..self.states.len() {
-            if self.states[index].occupied
-                && self.states[index].phase != ResolutionPhase::Cooldown
-                && neighbors.iter().any(|neighbor| {
-                    neighbor.interface == self.states[index].key.egress
-                        && neighbor.target == self.states[index].key.target
-                })
-            {
-                if self.states[index].attempts != 0 {
-                    report.cooldowns_retained += 1;
-                }
-                self.cancel_state_at(index);
-                report.states_removed += 1;
+        for neighbor in neighbors {
+            let key = ResolutionKey {
+                egress: neighbor.interface,
+                target: neighbor.target,
+            };
+            let Some(index) = self.find_state(key) else {
+                continue;
+            };
+            if self.states[index].entry.phase == ResolutionPhase::Cooldown {
+                continue;
             }
+            if self.states[index].entry.attempts != 0 {
+                report.cooldowns_retained += 1;
+            }
+            report.actions_removed += usize::from(self.cancel_state_at(index));
+            report.states_removed += 1;
         }
-        report.actions_removed = self.compact_actions(|action| {
-            neighbors.iter().any(|neighbor| {
-                neighbor.interface == action.egress && neighbor.target == action.target_ip
-            })
-        });
-        for index in 0..self.failure_holds.len() {
-            if self.failure_holds[index].phase != ResolutionFailureHoldPhase::Empty
-                && neighbors.iter().any(|neighbor| {
-                    neighbor.interface == self.failure_holds[index].forward.egress
-                        && neighbor.target == self.failure_holds[index].forward.target
-                })
-            {
-                self.clear_failure_hold(index);
-                self.failure_counters.cancelled += 1;
-            }
+        for neighbor in neighbors {
+            self.cancel_forward_holds(neighbor.interface, neighbor.target);
         }
         report
     }
@@ -788,26 +1216,33 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn validate_publication_invariants(&self) -> Result<(), ResolutionPublicationError> {
-        if self.len > self.actions.len() {
+        if self.action_queue.len() > self.actions.len() {
             return Err(ResolutionPublicationError::ActionQueueCapacity);
         }
-        if self.actions.is_empty() {
-            if self.head != 0 || self.len != 0 {
-                return Err(ResolutionPublicationError::ActionQueueHead);
-            }
-        } else if self.head >= self.actions.len() {
+        if self
+            .action_queue
+            .head()
+            .is_some_and(|head| head >= self.actions.len())
+        {
             return Err(ResolutionPublicationError::ActionQueueHead);
         }
-        for index in 0..self.actions.len() {
-            let distance = (index + self.actions.len() - self.head) % self.actions.len();
-            if self.actions[index].0.is_some() != (distance < self.len) {
-                return Err(ResolutionPublicationError::ActionQueueWindow);
-            }
+        let actions = &*self.actions;
+        let states = &*self.states;
+        let queue_valid = self.action_queue.validate(actions, |index| {
+            let slot = actions[index];
+            slot.queued.is_some()
+                && states.get(slot.state as usize).is_some_and(|state| {
+                    state.action_slot as usize == index && state.entry.occupied
+                })
+        });
+        let queued = actions.iter().filter(|slot| slot.queued.is_some()).count();
+        if !queue_valid || queued != self.action_queue.len() {
+            return Err(ResolutionPublicationError::ActionQueueWindow);
         }
         let pending_states = self
             .states
             .iter()
-            .filter(|state| state_is_pending(**state))
+            .filter(|state| state_is_pending(state.entry))
             .count();
         if pending_states != self.pending_state_count {
             return Err(ResolutionPublicationError::PendingStateCount);
@@ -820,7 +1255,126 @@ impl<'a> ResolutionRuntime<'a> {
         if pending_holds != self.pending_failure_hold_count {
             return Err(ResolutionPublicationError::PendingFailureHoldCount);
         }
+        if !self.indexes_valid() {
+            return Err(ResolutionPublicationError::IndexCorrupt);
+        }
         Ok(())
+    }
+
+    /// Checks every embedded index against the slots. O(capacity); control
+    /// path and tests only.
+    fn indexes_valid(&self) -> bool {
+        let states = &*self.states;
+        let actions = &*self.actions;
+        let dynamic = &*self.dynamic_neighbors;
+        let holds = &*self.failure_holds;
+        let state_bucket = |index: usize| {
+            let entry = states[index].entry;
+            entry.occupied.then(|| {
+                bucket_of(
+                    self.hash_key.hash_words(
+                        DirectoryHashDomain::ResolutionState,
+                        &key_words(entry.key.egress, entry.key.target),
+                    ),
+                    states.len(),
+                )
+            })
+        };
+        let mut last = 0;
+        let mut ordered = 0;
+        let order_valid = self.request_order.validate(states, |index| {
+            let slot = states[index];
+            let valid = slot.in_order
+                && slot.entry.occupied
+                && slot.entry.attempts != 0
+                && slot.entry.requested_at.0 >= last;
+            last = slot.entry.requested_at.0;
+            ordered += 1;
+            valid
+        });
+        let states_valid = validate::<StateChain>(states, state_bucket)
+            && validate_bits::<StateBits>(states, |index| state_used(&states[index]))
+            && order_valid
+            && states.iter().filter(|slot| slot.in_order).count() == ordered
+            && states.iter().enumerate().all(|(index, slot)| {
+                let queued = slot.entry.occupied
+                    && matches!(
+                        slot.entry.phase,
+                        ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued
+                    );
+                if slot.action_slot == INDEX_NONE {
+                    !queued
+                } else {
+                    queued
+                        && actions
+                            .get(slot.action_slot as usize)
+                            .is_some_and(|action| {
+                                action.state as usize == index
+                                    && action.queued.is_some_and(|queued| {
+                                        queued.generation == slot.entry.generation
+                                            && queued.action == slot.entry.action
+                                    })
+                            })
+                }
+            });
+        let actions_valid =
+            validate_bits::<ActionBits>(actions, |index| actions[index].queued.is_some());
+        let dynamic_bucket = |index: usize| {
+            let entry = dynamic[index].entry;
+            entry.occupied.then(|| {
+                bucket_of(
+                    self.hash_key.hash_words(
+                        DirectoryHashDomain::ResolutionDynamicNeighbor,
+                        &key_words(entry.interface, entry.target),
+                    ),
+                    dynamic.len(),
+                )
+            })
+        };
+        let mut last = 0;
+        let mut ordered = 0;
+        let lru_valid = self.dynamic_order.validate(dynamic, |index| {
+            let slot = dynamic[index];
+            let valid = slot.in_lru && slot.entry.occupied && slot.entry.refreshed_at.0 >= last;
+            last = slot.entry.refreshed_at.0;
+            ordered += 1;
+            valid
+        });
+        let dynamic_valid = validate::<DynamicChain>(dynamic, dynamic_bucket)
+            && validate_bits::<DynamicBits>(dynamic, |index| dynamic_used(&dynamic[index]))
+            && lru_valid
+            && dynamic.iter().filter(|slot| slot.in_lru).count() == ordered
+            && dynamic.iter().filter(|slot| slot.entry.occupied).count() == self.dynamic_count;
+        let forward_bucket = |index: usize| {
+            let hold = holds[index];
+            (hold.phase != ResolutionFailureHoldPhase::Empty).then(|| {
+                bucket_of(
+                    self.hash_key.hash_words(
+                        DirectoryHashDomain::ResolutionHoldForward,
+                        &key_words(hold.forward.egress, hold.forward.target),
+                    ),
+                    holds.len(),
+                )
+            })
+        };
+        let reverse_bucket = |index: usize| {
+            let hold = holds[index];
+            (hold.phase == ResolutionFailureHoldPhase::WaitingReverse).then(|| {
+                bucket_of(
+                    self.hash_key.hash_words(
+                        DirectoryHashDomain::ResolutionHoldReverse,
+                        &token_words(hold.reverse),
+                    ),
+                    holds.len(),
+                )
+            })
+        };
+        let holds_valid = validate::<HoldForwardChain>(holds, forward_bucket)
+            && validate::<HoldReverseChain>(holds, reverse_bucket)
+            && validate_bits::<HoldBits>(holds, |index| {
+                holds[index].phase != ResolutionFailureHoldPhase::Empty
+            });
+        states_valid && actions_valid && dynamic_valid && holds_valid
     }
 
     fn commit_publication(
@@ -828,18 +1382,18 @@ impl<'a> ResolutionRuntime<'a> {
         snapshot: &crate::ForwardingSnapshot<'_>,
     ) -> StaticReconcileReport {
         let mut report = StaticReconcileReport::default();
-        for slot in &mut *self.dynamic_neighbors {
-            if slot.occupied
-                && snapshot.neighbors.iter().any(|neighbor| {
-                    neighbor.interface == slot.interface && neighbor.target == slot.target
-                })
-            {
-                *slot = DynamicNeighborSlot::EMPTY;
+        for neighbor in snapshot.neighbors {
+            let key = ResolutionKey {
+                egress: neighbor.interface,
+                target: neighbor.target,
+            };
+            if let Some(index) = self.find_dynamic(key) {
+                self.remove_dynamic(index);
                 report.dynamic_removed = report.dynamic_removed.saturating_add(1);
             }
         }
         for index in 0..self.states.len() {
-            let state = self.states[index];
+            let state = self.states[index].entry;
             if !state_is_pending(state) {
                 continue;
             }
@@ -850,79 +1404,34 @@ impl<'a> ResolutionRuntime<'a> {
             if state.attempts != 0 {
                 report.cooldowns_retained = report.cooldowns_retained.saturating_add(1);
             }
-            if cancel_state(&mut self.states[index]) {
-                self.pending_state_count = self.pending_state_count.saturating_sub(1);
-            }
+            // A queued state owns exactly one queued action with the same
+            // ARP request, so the action has the state's authority.
+            let action_removed = usize::from(self.cancel_state_at(index));
             match authority {
                 crate::forwarding::ResolutionActionAuthority::StaticResolved => {
                     report.states_removed = report.states_removed.saturating_add(1);
+                    report.actions_removed = report.actions_removed.saturating_add(action_removed);
                 }
                 crate::forwarding::ResolutionActionAuthority::Invalid => {
                     report.invalid_states_removed = report.invalid_states_removed.saturating_add(1);
+                    report.invalid_actions_removed = report
+                        .invalid_actions_removed
+                        .saturating_add(action_removed);
                 }
                 crate::forwarding::ResolutionActionAuthority::Valid => {}
             }
         }
-        let (static_removed, invalid_removed) = self.compact_publication_actions(snapshot);
-        report.actions_removed = static_removed;
-        report.invalid_actions_removed = invalid_removed;
         for index in 0..self.failure_holds.len() {
             let hold = self.failure_holds[index];
             if hold.phase == ResolutionFailureHoldPhase::Empty
-                || publication_hold_valid(snapshot, hold)
+                || publication_hold_valid(snapshot, &hold)
             {
                 continue;
             }
-            self.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
-            self.pending_failure_hold_count = self.pending_failure_hold_count.saturating_sub(1);
+            self.clear_failure_hold(index);
             self.failure_counters.cancelled = self.failure_counters.cancelled.saturating_add(1);
         }
         report
-    }
-
-    fn compact_publication_actions(
-        &mut self,
-        snapshot: &crate::ForwardingSnapshot<'_>,
-    ) -> (usize, usize) {
-        if self.actions.is_empty() {
-            self.head = 0;
-            self.len = 0;
-            return (0, 0);
-        }
-        let capacity = self.actions.len();
-        let head = self.head % capacity;
-        let old_len = self.len.min(capacity);
-        let mut retained = 0usize;
-        let mut static_removed = 0usize;
-        let mut invalid_removed = 0usize;
-        for offset in 0..old_len {
-            let read_index = (head + offset) % capacity;
-            let Some(queued) = self.actions[read_index].0.take() else {
-                continue;
-            };
-            match snapshot.resolution_action_authority(queued.action) {
-                crate::forwarding::ResolutionActionAuthority::Valid => {
-                    let write_index = (head + retained) % capacity;
-                    self.actions[write_index].0 = Some(queued);
-                    retained = retained.saturating_add(1);
-                }
-                crate::forwarding::ResolutionActionAuthority::StaticResolved => {
-                    static_removed = static_removed.saturating_add(1);
-                }
-                crate::forwarding::ResolutionActionAuthority::Invalid => {
-                    invalid_removed = invalid_removed.saturating_add(1);
-                }
-            }
-        }
-        for index in 0..capacity {
-            let distance = (index + capacity - head) % capacity;
-            if distance >= retained {
-                self.actions[index] = ResolutionActionSlot::EMPTY;
-            }
-        }
-        self.head = if retained == 0 { 0 } else { head };
-        self.len = retained;
-        (static_removed, invalid_removed)
     }
 
     #[must_use]
@@ -942,7 +1451,7 @@ impl<'a> ResolutionRuntime<'a> {
 
     #[must_use]
     pub const fn pending_actions(&self) -> usize {
-        self.len
+        self.action_queue.len()
     }
 
     #[must_use]
@@ -954,26 +1463,203 @@ impl<'a> ResolutionRuntime<'a> {
     pub fn cooldown_count(&self) -> usize {
         self.states
             .iter()
-            .filter(|state| state.occupied && state.phase == ResolutionPhase::Cooldown)
+            .filter(|state| state.entry.occupied && state.entry.phase == ResolutionPhase::Cooldown)
             .count()
     }
 
     #[must_use]
     pub fn status(&self, egress: IfId, target: Ipv4Address) -> Option<ResolutionStatus> {
-        self.states
-            .iter()
-            .find(|state| {
-                state.occupied && state.key.egress == egress && state.key.target == target
-            })
-            .map(|state| ResolutionStatus {
-                phase: state.phase,
-                attempts: state.attempts,
-                accepted_attempts: state.accepted_attempts,
-                generation: state.generation,
-                requested_at: (state.attempts != 0).then_some(state.requested_at),
-                failed_at: (state.phase == ResolutionPhase::Failed).then_some(state.failed_at),
-                terminal_notified: state.failure_notified,
-            })
+        let index = self.find_state(ResolutionKey { egress, target })?;
+        let state = self.states[index].entry;
+        Some(ResolutionStatus {
+            phase: state.phase,
+            attempts: state.attempts,
+            accepted_attempts: state.accepted_attempts,
+            generation: state.generation,
+            requested_at: (state.attempts != 0).then_some(state.requested_at),
+            failed_at: (state.phase == ResolutionPhase::Failed).then_some(state.failed_at),
+            terminal_notified: state.failure_notified,
+        })
+    }
+
+    fn count_visits(&self, visits: usize) {
+        self.visits
+            .set(self.visits.get().wrapping_add(visits as u64));
+    }
+
+    /// Records an index inconsistency met while mutating; the caller has
+    /// already left the inconsistent part unchanged.
+    fn index_result(&mut self, result: Result<(), IndexCorrupt>) {
+        if result.is_err() {
+            debug_assert!(false, "resolution index corrupt");
+            self.index_counters.index_corrupt = self.index_counters.index_corrupt.saturating_add(1);
+        }
+    }
+
+    fn state_bucket(&self, key: ResolutionKey) -> Option<usize> {
+        key_bucket(
+            self.hash_key,
+            DirectoryHashDomain::ResolutionState,
+            &key_words(key.egress, key.target),
+            self.states.len(),
+        )
+    }
+
+    /// Looks `key` up among the occupied states (at most
+    /// [`RESOLUTION_INDEX_CHAIN_LIMIT`] slots). `Ok(None)` for an empty table.
+    fn lookup_state(&self, key: ResolutionKey) -> Result<Option<KeyLookup>, IndexCorrupt> {
+        let Some(bucket) = self.state_bucket(key) else {
+            return Ok(None);
+        };
+        let states = &*self.states;
+        let walked = walk::<StateChain>(states, bucket, RESOLUTION_INDEX_CHAIN_LIMIT, |index| {
+            let entry = states[index].entry;
+            entry.occupied && entry.key == key
+        });
+        let walked = walked?;
+        self.count_visits(walked.visited.max(1));
+        Ok(Some(KeyLookup {
+            bucket,
+            found: walked.found,
+            chain_len: walked.visited,
+        }))
+    }
+
+    /// The occupied state of `key`, or `None` (also when the index is
+    /// inconsistent: callers then behave as on a miss).
+    fn find_state(&self, key: ResolutionKey) -> Option<usize> {
+        self.lookup_state(key)
+            .ok()
+            .flatten()
+            .and_then(|lookup| lookup.found)
+    }
+
+    fn dynamic_bucket(&self, key: ResolutionKey) -> Option<usize> {
+        key_bucket(
+            self.hash_key,
+            DirectoryHashDomain::ResolutionDynamicNeighbor,
+            &key_words(key.egress, key.target),
+            self.dynamic_neighbors.len(),
+        )
+    }
+
+    fn lookup_dynamic_key(&self, key: ResolutionKey) -> Result<Option<KeyLookup>, IndexCorrupt> {
+        let Some(bucket) = self.dynamic_bucket(key) else {
+            return Ok(None);
+        };
+        let slots = &*self.dynamic_neighbors;
+        let walked = walk::<DynamicChain>(slots, bucket, RESOLUTION_INDEX_CHAIN_LIMIT, |index| {
+            let entry = slots[index].entry;
+            entry.occupied && entry.interface == key.egress && entry.target == key.target
+        })?;
+        self.count_visits(walked.visited.max(1));
+        Ok(Some(KeyLookup {
+            bucket,
+            found: walked.found,
+            chain_len: walked.visited,
+        }))
+    }
+
+    fn find_dynamic(&self, key: ResolutionKey) -> Option<usize> {
+        self.lookup_dynamic_key(key)
+            .ok()
+            .flatten()
+            .and_then(|lookup| lookup.found)
+    }
+
+    /// Length of a dynamic key chain, or `None` when it is inconsistent.
+    fn dynamic_chain_len(&self, bucket: usize) -> Option<usize> {
+        walk::<DynamicChain>(
+            self.dynamic_neighbors,
+            bucket,
+            RESOLUTION_INDEX_CHAIN_LIMIT,
+            |_| false,
+        )
+        .ok()
+        .map(|walked| {
+            self.count_visits(walked.visited);
+            walked.visited
+        })
+    }
+
+    fn forward_bucket(&self, egress: IfId, target: Ipv4Address) -> Option<usize> {
+        key_bucket(
+            self.hash_key,
+            DirectoryHashDomain::ResolutionHoldForward,
+            &key_words(egress, target),
+            self.failure_holds.len(),
+        )
+    }
+
+    fn reverse_bucket(&self, token: ResolutionGenerationToken) -> Option<usize> {
+        key_bucket(
+            self.hash_key,
+            DirectoryHashDomain::ResolutionHoldReverse,
+            &token_words(token),
+            self.failure_holds.len(),
+        )
+    }
+
+    /// Whether a live hold has forward token `token`, plus the length of the
+    /// forward chain of its key (complete only when not found).
+    fn forward_hold_exists(
+        &self,
+        token: ResolutionGenerationToken,
+    ) -> Result<(bool, usize), IndexCorrupt> {
+        let Some(bucket) = self.forward_bucket(token.egress, token.target) else {
+            return Ok((false, 0));
+        };
+        let holds = &*self.failure_holds;
+        let walked =
+            walk::<HoldForwardChain>(holds, bucket, RESOLUTION_INDEX_CHAIN_LIMIT, |index| {
+                holds[index].phase != ResolutionFailureHoldPhase::Empty
+                    && holds[index].forward == token
+            })?;
+        self.count_visits(walked.visited.max(1));
+        Ok((walked.found.is_some(), walked.visited))
+    }
+
+    /// Whether a hold waits for reverse resolution with token `token`.
+    fn reverse_hold_exists(&self, token: ResolutionGenerationToken) -> Result<bool, IndexCorrupt> {
+        let Some(bucket) = self.reverse_bucket(token) else {
+            return Ok(false);
+        };
+        let holds = &*self.failure_holds;
+        let walked = walk::<HoldReverseChain>(holds, bucket, holds.len(), |index| {
+            holds[index].phase == ResolutionFailureHoldPhase::WaitingReverse
+                && holds[index].reverse == token
+        })?;
+        self.count_visits(walked.visited.max(1));
+        Ok(walked.found.is_some())
+    }
+
+    /// Visits every hold of the forward chain of `(egress, target)` (all
+    /// generations) or of the reverse chain of a token, in chain order, and
+    /// lets `act` clear or change it. The successor is read before `act`, so
+    /// clearing the visited hold is safe. Stops at the slot count or at a
+    /// node of another bucket.
+    fn for_each_hold<C: Chain<Slot = ResolutionFailureHoldSlot>>(
+        &mut self,
+        bucket: usize,
+        mut act: impl FnMut(&mut Self, usize),
+    ) {
+        let mut current = chain_head::<C>(self.failure_holds, bucket);
+        let mut steps = 0;
+        while let Some(index) = current {
+            if steps == self.failure_holds.len() {
+                self.index_result(Err(IndexCorrupt));
+                return;
+            }
+            steps += 1;
+            self.count_visits(1);
+            let node = C::node(&self.failure_holds[index]);
+            if !node.is_linked() || chain_bucket(node) != Some(bucket) {
+                self.index_result(Err(IndexCorrupt));
+                return;
+            }
+            current = chain_next::<C>(self.failure_holds, index);
+            act(self, index);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -990,17 +1676,18 @@ impl<'a> ResolutionRuntime<'a> {
         original_tos: u8,
         original_ipv4: &[u8],
     ) -> ResolutionFailureCapture {
-        let Some(state) = self.states.iter().find(|state| {
-            state.occupied
-                && state.key.egress == egress
-                && state.key.target == target
-                && matches!(
+        let Some(state) = self
+            .find_state(ResolutionKey { egress, target })
+            .map(|index| self.states[index].entry)
+            .filter(|state| {
+                matches!(
                     state.phase,
                     ResolutionPhase::InitialQueued
                         | ResolutionPhase::Waiting
                         | ResolutionPhase::RetryQueued
                 )
-        }) else {
+            })
+        else {
             return ResolutionFailureCapture::Inactive;
         };
         let token = ResolutionGenerationToken {
@@ -1008,24 +1695,48 @@ impl<'a> ResolutionRuntime<'a> {
             target,
             generation: state.generation,
         };
-        if self
-            .failure_holds
-            .iter()
-            .any(|hold| hold.phase != ResolutionFailureHoldPhase::Empty && hold.forward == token)
-        {
-            return ResolutionFailureCapture::Existing(token);
-        }
-        let Some(index) = self
-            .failure_holds
-            .iter()
-            .position(|hold| hold.phase == ResolutionFailureHoldPhase::Empty)
-        else {
+        let chain_len = match self.forward_hold_exists(token) {
+            Ok((true, _)) => return ResolutionFailureCapture::Existing(token),
+            Ok((false, chain_len)) => chain_len,
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                self.failure_counters.capture_full += 1;
+                return ResolutionFailureCapture::CapacityFull;
+            }
+        };
+        let free = first_unused::<HoldBits>(self.failure_holds);
+        let index = match free {
+            Ok((Some(index), reads)) => {
+                self.count_visits(reads);
+                index
+            }
+            Ok((None, reads)) => {
+                self.count_visits(reads);
+                self.failure_counters.capture_full += 1;
+                return ResolutionFailureCapture::CapacityFull;
+            }
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                self.failure_counters.capture_full += 1;
+                return ResolutionFailureCapture::CapacityFull;
+            }
+        };
+        if chain_len >= RESOLUTION_INDEX_CHAIN_LIMIT {
+            self.index_counters.failure_hold_probe_exhausted = self
+                .index_counters
+                .failure_hold_probe_exhausted
+                .saturating_add(1);
             self.failure_counters.capture_full += 1;
             return ResolutionFailureCapture::CapacityFull;
-        };
+        }
+        let bucket = self
+            .forward_bucket(egress, target)
+            .expect("a free hold slot exists");
         let quote_len = original_ipv4.len().min(ICMPV4_ERROR_MAX_QUOTE_LEN);
         let slot = &mut self.failure_holds[index];
-        *slot = ResolutionFailureHoldSlot::EMPTY;
+        slot.clear_entry();
         slot.phase = ResolutionFailureHoldPhase::WaitingForward;
         slot.forward = token;
         slot.original_source = source;
@@ -1037,10 +1748,36 @@ impl<'a> ResolutionRuntime<'a> {
         slot.original_tos = original_tos;
         slot.quote_len = quote_len as u16;
         slot.quote[..quote_len].copy_from_slice(&original_ipv4[..quote_len]);
+        let linked = link::<HoldForwardChain>(self.failure_holds, index, bucket);
+        self.index_result(linked);
+        set_used::<HoldBits>(self.failure_holds, index, true);
         debug_assert!(self.pending_failure_hold_count < self.failure_holds.len());
         self.pending_failure_hold_count += 1;
         self.failure_counters.captured += 1;
         ResolutionFailureCapture::Captured(token)
+    }
+
+    /// Reserves the lowest free action slot, or reports why none can be used.
+    fn reserve_action_slot(&mut self) -> Option<usize> {
+        if self.action_queue.len() == self.actions.len() {
+            return None;
+        }
+        match first_unused::<ActionBits>(self.actions) {
+            Ok((found, reads)) => {
+                self.count_visits(reads);
+                debug_assert!(found.is_some(), "a non-full queue has a free slot");
+                if found.is_none() {
+                    self.index_counters.index_corrupt =
+                        self.index_counters.index_corrupt.saturating_add(1);
+                }
+                found
+            }
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                None
+            }
+        }
     }
 
     pub(crate) fn schedule(
@@ -1063,90 +1800,102 @@ impl<'a> ResolutionRuntime<'a> {
             egress: action.egress,
             target: action.target_ip,
         };
-        let existing = self
-            .states
-            .iter()
-            .position(|slot| slot.occupied && slot.key == key);
-        if let Some(index) = existing {
-            match self.states[index].phase {
+        let lookup = match self.lookup_state(key) {
+            Ok(lookup) => lookup,
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                self.counters.state_full += 1;
+                return ResolutionResult::StateFull;
+            }
+        };
+        if let Some(index) = lookup.and_then(|lookup| lookup.found) {
+            let state = self.states[index].entry;
+            match state.phase {
                 ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued => {
                     self.counters.suppressed += 1;
                     return ResolutionResult::Suppressed;
                 }
                 ResolutionPhase::Waiting => {
-                    if now.0 - self.states[index].requested_at.0 < self.policy.interval_ms {
+                    if now.0 - state.requested_at.0 < self.policy.interval_ms {
                         self.counters.suppressed += 1;
                         return ResolutionResult::Suppressed;
                     }
-                    if self.states[index].attempts >= self.policy.max_attempts {
+                    if state.attempts >= self.policy.max_attempts {
                         return self.mark_failed(index, now);
                     }
-                    if self.len == self.actions.len() {
+                    let Some(action_slot) = self.reserve_action_slot() else {
                         self.counters.action_full += 1;
                         return ResolutionResult::ActionFull;
-                    }
-                    self.states[index].action = action;
-                    return self.enqueue_retry(index);
+                    };
+                    self.states[index].entry.action = action;
+                    return self.enqueue_retry(index, action_slot);
                 }
                 ResolutionPhase::Failed => {
-                    if now.0 - self.states[index].failed_at.0 < self.policy.state_ttl_ms {
+                    if now.0 - state.failed_at.0 < self.policy.state_ttl_ms {
                         self.counters.failed_hits += 1;
                         return ResolutionResult::Failed;
                     }
-                    if self.len == self.actions.len() {
+                    let Some(action_slot) = self.reserve_action_slot() else {
                         self.counters.action_full += 1;
                         return ResolutionResult::ActionFull;
-                    }
-                    self.counters.failures_expired += 1;
-                    let expired = ResolutionGenerationToken {
-                        egress: self.states[index].key.egress,
-                        target: self.states[index].key.target,
-                        generation: self.states[index].generation,
                     };
-                    for hold_index in 0..self.failure_holds.len() {
-                        let hold = self.failure_holds[hold_index];
-                        if hold.phase != ResolutionFailureHoldPhase::Empty
-                            && (hold.forward == expired
-                                || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
-                                    && hold.reverse == expired))
-                        {
-                            self.clear_failure_hold(hold_index);
-                            self.failure_counters.cancelled += 1;
-                        }
-                    }
+                    self.counters.failures_expired += 1;
+                    self.cancel_holds_of_token(ResolutionGenerationToken {
+                        egress: state.key.egress,
+                        target: state.key.target,
+                        generation: state.generation,
+                    });
                     self.start_cycle(index, action);
-                    return self.enqueue_initial(index);
+                    return self.enqueue_initial(index, action_slot);
                 }
                 ResolutionPhase::Cooldown => {
-                    if now.0 - self.states[index].requested_at.0 < self.policy.interval_ms {
+                    if now.0 - state.requested_at.0 < self.policy.interval_ms {
                         self.counters.suppressed += 1;
                         return ResolutionResult::Suppressed;
                     }
-                    if self.len == self.actions.len() {
+                    let Some(action_slot) = self.reserve_action_slot() else {
                         self.counters.action_full += 1;
                         return ResolutionResult::ActionFull;
-                    }
+                    };
                     self.start_cycle(index, action);
-                    return self.enqueue_initial(index);
+                    return self.enqueue_initial(index, action_slot);
                 }
             }
         }
-        let reusable = self.states.iter().position(|slot| {
-            !slot.occupied
-                || (slot.phase == ResolutionPhase::Cooldown
-                    && now.0 - slot.requested_at.0 >= self.policy.interval_ms)
-        });
-        let Some(index) = reusable else {
+        // A new key takes the lowest slot that is free or an elapsed
+        // cooldown, exactly the slot a scan from slot 0 would take.
+        self.mature_states(now);
+        let reusable = match first_unused::<StateBits>(self.states) {
+            Ok((found, reads)) => {
+                self.count_visits(reads);
+                found
+            }
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                None
+            }
+        };
+        let (Some(index), Some(lookup)) = (reusable, lookup) else {
             self.counters.state_full += 1;
             return ResolutionResult::StateFull;
         };
-        if self.len == self.actions.len() {
+        let reused_in_chain = self.states[index].chain.is_linked()
+            && chain_bucket(self.states[index].chain) == Some(lookup.bucket);
+        if lookup.chain_len - usize::from(reused_in_chain) >= RESOLUTION_INDEX_CHAIN_LIMIT {
+            self.index_counters.state_probe_exhausted =
+                self.index_counters.state_probe_exhausted.saturating_add(1);
+            self.counters.state_full += 1;
+            return ResolutionResult::StateFull;
+        }
+        let Some(action_slot) = self.reserve_action_slot() else {
             self.counters.action_full += 1;
             return ResolutionResult::ActionFull;
-        }
+        };
         self.start_cycle(index, action);
-        debug_assert_eq!(self.states[index].key, key);
-        self.enqueue_initial(index)
+        debug_assert_eq!(self.states[index].entry.key, key);
+        self.enqueue_initial(index, action_slot)
     }
 
     pub(crate) fn lookup_dynamic(
@@ -1158,18 +1907,27 @@ impl<'a> ResolutionRuntime<'a> {
         if !self.observe_now(now) {
             return DynamicLookup::ClockRegression;
         }
-        let Some(slot) = self
-            .dynamic_neighbors
-            .iter_mut()
-            .find(|slot| slot.occupied && slot.interface == interface && slot.target == target)
-        else {
+        let key = ResolutionKey {
+            egress: interface,
+            target,
+        };
+        let found = match self.lookup_dynamic_key(key) {
+            Ok(lookup) => lookup.and_then(|lookup| lookup.found),
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                None
+            }
+        };
+        let Some(index) = found else {
             return DynamicLookup::Miss;
         };
-        if now.0 - slot.refreshed_at.0 >= self.policy.dynamic_neighbor_ttl_ms {
-            *slot = DynamicNeighborSlot::EMPTY;
+        let entry = self.dynamic_neighbors[index].entry;
+        if now.0 - entry.refreshed_at.0 >= self.policy.dynamic_neighbor_ttl_ms {
+            self.remove_dynamic(index);
             DynamicLookup::Miss
         } else {
-            DynamicLookup::Hit(slot.mac)
+            DynamicLookup::Hit(entry.mac)
         }
     }
 
@@ -1189,39 +1947,177 @@ impl<'a> ResolutionRuntime<'a> {
             self.reconcile_static_key(interface, sender);
             return ControlDisposition::StaticPreserved;
         }
-        if let Some(index) = self
-            .dynamic_neighbors
-            .iter()
-            .position(|slot| slot.occupied && slot.interface == interface && slot.target == sender)
-        {
-            if now.0 - self.dynamic_neighbors[index].refreshed_at.0
-                < self.policy.dynamic_neighbor_ttl_ms
-            {
-                self.dynamic_neighbors[index].mac = mac;
-                self.dynamic_neighbors[index].refreshed_at = now;
+        let key = ResolutionKey {
+            egress: interface,
+            target: sender,
+        };
+        let lookup = match self.lookup_dynamic_key(key) {
+            Ok(lookup) => lookup,
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                return if allow_insert {
+                    ControlDisposition::CacheFull
+                } else {
+                    ControlDisposition::Ignored
+                };
+            }
+        };
+        let mut chain_len = lookup.map_or(0, |lookup| lookup.chain_len);
+        if let Some(index) = lookup.and_then(|lookup| lookup.found) {
+            let entry = self.dynamic_neighbors[index].entry;
+            if now.0 - entry.refreshed_at.0 < self.policy.dynamic_neighbor_ttl_ms {
+                self.dynamic_neighbors[index].entry.mac = mac;
+                self.dynamic_neighbors[index].entry.refreshed_at = now;
+                self.touch_dynamic(index);
                 self.clear_resolution(interface, sender);
                 return ControlDisposition::Updated;
             }
-            self.dynamic_neighbors[index] = DynamicNeighborSlot::EMPTY;
+            self.remove_dynamic(index);
+            if allow_insert {
+                let bucket = lookup.expect("found in a nonempty table").bucket;
+                let Some(len) = self.dynamic_chain_len(bucket) else {
+                    self.index_counters.index_corrupt =
+                        self.index_counters.index_corrupt.saturating_add(1);
+                    return ControlDisposition::CacheFull;
+                };
+                chain_len = len;
+            }
         }
         if !allow_insert {
             return ControlDisposition::Ignored;
         }
-        let reusable = self.dynamic_neighbors.iter().position(|slot| {
-            !slot.occupied || now.0 - slot.refreshed_at.0 >= self.policy.dynamic_neighbor_ttl_ms
-        });
-        let Some(index) = reusable else {
+        // The lowest slot that is free or expired, as a scan would find.
+        self.mature_dynamic(now);
+        let reusable = match first_unused::<DynamicBits>(self.dynamic_neighbors) {
+            Ok((found, reads)) => {
+                self.count_visits(reads);
+                found
+            }
+            Err(IndexCorrupt) => {
+                self.index_counters.index_corrupt =
+                    self.index_counters.index_corrupt.saturating_add(1);
+                None
+            }
+        };
+        let (Some(index), Some(lookup)) = (reusable, lookup) else {
             return ControlDisposition::CacheFull;
         };
-        self.dynamic_neighbors[index] = DynamicNeighborSlot {
+        let reused_in_chain = self.dynamic_neighbors[index].chain.is_linked()
+            && chain_bucket(self.dynamic_neighbors[index].chain) == Some(lookup.bucket);
+        if chain_len - usize::from(reused_in_chain) >= RESOLUTION_INDEX_CHAIN_LIMIT {
+            self.index_counters.dynamic_probe_exhausted = self
+                .index_counters
+                .dynamic_probe_exhausted
+                .saturating_add(1);
+            return ControlDisposition::CacheFull;
+        }
+        if self.dynamic_neighbors[index].entry.occupied {
+            self.remove_dynamic(index);
+        }
+        self.dynamic_neighbors[index].entry = DynamicEntry {
             interface,
             target: sender,
             mac,
             refreshed_at: now,
             occupied: true,
         };
+        let linked = link::<DynamicChain>(self.dynamic_neighbors, index, lookup.bucket);
+        self.index_result(linked);
+        self.dynamic_count += 1;
+        self.touch_dynamic(index);
         self.clear_resolution(interface, sender);
         ControlDisposition::Inserted
+    }
+
+    /// Moves a just refreshed dynamic neighbor to the tail of the refresh
+    /// order. Refresh times are monotonic, so the order stays sorted.
+    fn touch_dynamic(&mut self, index: usize) {
+        if self.dynamic_neighbors[index].in_lru {
+            self.dynamic_order.unlink(self.dynamic_neighbors, index);
+        }
+        self.dynamic_order.push_back(self.dynamic_neighbors, index);
+        self.dynamic_neighbors[index].in_lru = true;
+        set_used::<DynamicBits>(self.dynamic_neighbors, index, true);
+    }
+
+    /// Takes every expired entry off the head of the refresh order and marks
+    /// its slot reusable. Each refresh enters the order once, so the work is
+    /// amortized O(1) per learned or refreshed entry.
+    fn mature_dynamic(&mut self, now: MonotonicMillis) {
+        while let Some(head) = self.dynamic_order.head() {
+            self.count_visits(1);
+            let refreshed_at = self.dynamic_neighbors[head].entry.refreshed_at;
+            if now.0.saturating_sub(refreshed_at.0) < self.policy.dynamic_neighbor_ttl_ms {
+                break;
+            }
+            self.dynamic_order.unlink(self.dynamic_neighbors, head);
+            self.dynamic_neighbors[head].in_lru = false;
+            set_used::<DynamicBits>(self.dynamic_neighbors, head, false);
+        }
+    }
+
+    fn remove_dynamic(&mut self, index: usize) {
+        debug_assert!(self.dynamic_neighbors[index].entry.occupied);
+        let unlinked = unlink::<DynamicChain>(self.dynamic_neighbors, index);
+        self.index_result(unlinked);
+        if self.dynamic_neighbors[index].in_lru {
+            self.dynamic_order.unlink(self.dynamic_neighbors, index);
+            self.dynamic_neighbors[index].in_lru = false;
+        }
+        self.dynamic_neighbors[index].entry = DynamicEntry::EMPTY;
+        set_used::<DynamicBits>(self.dynamic_neighbors, index, false);
+        self.dynamic_count -= 1;
+    }
+
+    /// Takes every state whose last request is at least one interval old off
+    /// the head of the request order. Such a state that is (or later
+    /// becomes) a cooldown is reusable. Each commit enters the order once,
+    /// so the work is amortized O(1) per committed ARP request.
+    fn mature_states(&mut self, now: MonotonicMillis) {
+        while let Some(head) = self.request_order.head() {
+            self.count_visits(1);
+            let requested_at = self.states[head].entry.requested_at;
+            if now.0.saturating_sub(requested_at.0) < self.policy.interval_ms {
+                break;
+            }
+            self.request_order.unlink(self.states, head);
+            self.states[head].in_order = false;
+            self.refresh_state_bit(head);
+        }
+    }
+
+    fn refresh_state_bit(&mut self, index: usize) {
+        let used = state_used(&self.states[index]);
+        set_used::<StateBits>(self.states, index, used);
+    }
+
+    /// Replaces the state entry of slot `index` and keeps the key chain, the
+    /// request order, and the reusable bitmap in step. The request time of
+    /// an entry that stays on the order list must not change here.
+    fn replace_state_entry(&mut self, index: usize, new: StateEntry) {
+        let old = self.states[index].entry;
+        let relink = old.occupied != new.occupied || (new.occupied && old.key != new.key);
+        if relink && old.occupied {
+            let unlinked = unlink::<StateChain>(self.states, index);
+            self.index_result(unlinked);
+        }
+        if relink && new.occupied {
+            let bucket = self.state_bucket(new.key).expect("nonempty state table");
+            let linked = link::<StateChain>(self.states, index, bucket);
+            self.index_result(linked);
+        }
+        debug_assert!(
+            !(self.states[index].in_order && new.occupied && new.attempts != 0)
+                || new.requested_at == old.requested_at,
+            "an entry staying on the request order keeps its request time"
+        );
+        if self.states[index].in_order && (!new.occupied || new.attempts == 0) {
+            self.request_order.unlink(self.states, index);
+            self.states[index].in_order = false;
+        }
+        self.states[index].entry = new;
+        self.refresh_state_bit(index);
     }
 
     fn observe_now(&mut self, now: MonotonicMillis) -> bool {
@@ -1238,61 +2134,62 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn clear_resolution(&mut self, interface: IfId, target: Ipv4Address) {
-        for index in 0..self.states.len() {
-            let state = self.states[index];
-            if state.occupied && state.key.egress == interface && state.key.target == target {
-                self.cancel_state_at(index);
-            }
+        if let Some(index) = self.find_state(ResolutionKey {
+            egress: interface,
+            target,
+        }) {
+            self.cancel_state_at(index);
         }
-        self.compact_actions(|action| action.egress == interface && action.target_ip == target);
         self.cancel_forward_holds(interface, target);
     }
 
     fn reconcile_static_key(&mut self, interface: IfId, target: Ipv4Address) {
-        for slot in &mut *self.dynamic_neighbors {
-            if slot.occupied && slot.interface == interface && slot.target == target {
-                *slot = DynamicNeighborSlot::EMPTY;
-            }
+        if let Some(index) = self.find_dynamic(ResolutionKey {
+            egress: interface,
+            target,
+        }) {
+            self.remove_dynamic(index);
         }
         self.clear_resolution(interface, target);
     }
 
-    fn compact_actions(&mut self, remove: impl Fn(ArpRequestAction) -> bool) -> usize {
-        self.compact_queued_actions(|queued| remove(queued.action))
+    /// Removes the queued action of state `index`, if any, keeping the order
+    /// of the other queued actions.
+    fn remove_queued_action(&mut self, index: usize) -> bool {
+        let slot = self.states[index].action_slot;
+        if slot == INDEX_NONE {
+            return false;
+        }
+        let slot = slot as usize;
+        self.states[index].action_slot = INDEX_NONE;
+        self.action_queue.unlink(self.actions, slot);
+        self.actions[slot].queued = None;
+        self.actions[slot].state = INDEX_NONE;
+        set_used::<ActionBits>(self.actions, slot, false);
+        true
     }
 
-    fn compact_queued_actions(&mut self, mut remove: impl FnMut(QueuedAction) -> bool) -> usize {
-        if self.actions.is_empty() {
-            return 0;
-        }
-        let old_len = self.len;
-        let mut retained = 0;
-        for read in 0..old_len {
-            let read_index = (self.head + read) % self.actions.len();
-            let Some(queued) = self.actions[read_index].0.take() else {
-                continue;
-            };
-            if remove(queued) {
-                continue;
-            }
-            let write_index = (self.head + retained) % self.actions.len();
-            self.actions[write_index].0 = Some(queued);
-            retained += 1;
-        }
-        self.len = retained;
-        old_len.saturating_sub(retained)
-    }
-
-    fn cancel_state_at(&mut self, index: usize) {
-        if cancel_state(&mut self.states[index]) {
+    /// Cancels state `index` (cooldown if it ever committed a request, else
+    /// free) together with its queued action. Returns whether an action was
+    /// removed.
+    fn cancel_state_at(&mut self, index: usize) -> bool {
+        let action_removed = self.remove_queued_action(index);
+        let old = self.states[index].entry;
+        let was_pending = state_is_pending(old);
+        self.replace_state_entry(index, cancelled_entry(old));
+        if was_pending {
             debug_assert!(self.pending_state_count != 0);
             self.pending_state_count -= 1;
         }
+        action_removed
     }
 
     fn vacate_state_at(&mut self, index: usize) {
-        let was_pending = state_is_pending(self.states[index]);
-        vacate_state(&mut self.states[index]);
+        debug_assert_eq!(self.states[index].action_slot, INDEX_NONE);
+        self.remove_queued_action(index);
+        let old = self.states[index].entry;
+        let was_pending = state_is_pending(old);
+        self.replace_state_entry(index, vacated_entry(old));
         if was_pending {
             debug_assert!(self.pending_state_count != 0);
             self.pending_state_count -= 1;
@@ -1304,103 +2201,167 @@ impl<'a> ResolutionRuntime<'a> {
             self.failure_holds[index].phase != ResolutionFailureHoldPhase::Empty,
             "only a live failure hold can be cleared"
         );
-        self.failure_holds[index] = ResolutionFailureHoldSlot::EMPTY;
+        let forward = unlink::<HoldForwardChain>(self.failure_holds, index);
+        self.index_result(forward);
+        let reverse = unlink::<HoldReverseChain>(self.failure_holds, index);
+        self.index_result(reverse);
+        self.failure_holds[index].clear_entry();
+        set_used::<HoldBits>(self.failure_holds, index, false);
         debug_assert!(self.pending_failure_hold_count != 0);
         self.pending_failure_hold_count -= 1;
     }
 
+    /// Moves hold `index` to waiting for reverse resolution `reverse`.
+    pub(crate) fn wait_reverse(&mut self, index: usize, reverse: ResolutionGenerationToken) {
+        let hold = self.failure_holds[index];
+        if hold.phase == ResolutionFailureHoldPhase::WaitingReverse
+            && hold.reverse == reverse
+            && hold.reverse_chain.is_linked()
+        {
+            return;
+        }
+        let unlinked = unlink::<HoldReverseChain>(self.failure_holds, index);
+        self.index_result(unlinked);
+        self.failure_holds[index].phase = ResolutionFailureHoldPhase::WaitingReverse;
+        self.failure_holds[index].reverse = reverse;
+        let bucket = self.reverse_bucket(reverse).expect("nonempty hold table");
+        let linked = link::<HoldReverseChain>(self.failure_holds, index, bucket);
+        self.index_result(linked);
+    }
+
+    /// Clears every live hold whose forward token, or whose reverse token
+    /// while waiting for reverse resolution, is `token`. Cost: the forward
+    /// chain of the key plus the reverse chain of the token; every hold
+    /// cleared was captured once.
+    fn cancel_holds_of_token(&mut self, token: ResolutionGenerationToken) {
+        if let Some(bucket) = self.forward_bucket(token.egress, token.target) {
+            self.for_each_hold::<HoldForwardChain>(bucket, |runtime, index| {
+                let hold = runtime.failure_holds[index];
+                if hold.phase != ResolutionFailureHoldPhase::Empty && hold.forward == token {
+                    runtime.clear_failure_hold(index);
+                    runtime.failure_counters.cancelled += 1;
+                }
+            });
+        }
+        if let Some(bucket) = self.reverse_bucket(token) {
+            self.for_each_hold::<HoldReverseChain>(bucket, |runtime, index| {
+                let hold = runtime.failure_holds[index];
+                if hold.phase == ResolutionFailureHoldPhase::WaitingReverse && hold.reverse == token
+                {
+                    runtime.clear_failure_hold(index);
+                    runtime.failure_counters.cancelled += 1;
+                }
+            });
+        }
+    }
+
     fn start_cycle(&mut self, index: usize, action: ArpRequestAction) {
-        let was_pending = state_is_pending(self.states[index]);
+        let was_pending = state_is_pending(self.states[index].entry);
         let generation = self.next_generation(
             action.egress,
             action.target_ip,
-            self.states[index].generation,
+            self.states[index].entry.generation,
         );
-        self.states[index] = ResolutionStateSlot {
-            key: ResolutionKey {
-                egress: action.egress,
-                target: action.target_ip,
+        self.replace_state_entry(
+            index,
+            StateEntry {
+                key: ResolutionKey {
+                    egress: action.egress,
+                    target: action.target_ip,
+                },
+                action,
+                generation,
+                attempts: 0,
+                accepted_attempts: 0,
+                requested_at: MonotonicMillis(0),
+                failed_at: MonotonicMillis(0),
+                occupied: true,
+                phase: ResolutionPhase::InitialQueued,
+                failure_notified: false,
             },
-            action,
-            generation,
-            attempts: 0,
-            accepted_attempts: 0,
-            requested_at: MonotonicMillis(0),
-            failed_at: MonotonicMillis(0),
-            occupied: true,
-            phase: ResolutionPhase::InitialQueued,
-            failure_notified: false,
-        };
+        );
         if !was_pending {
             debug_assert!(self.pending_state_count < self.states.len());
             self.pending_state_count += 1;
         }
     }
 
-    fn enqueue_initial(&mut self, index: usize) -> ResolutionResult {
-        debug_assert_eq!(self.states[index].attempts, 0);
-        debug_assert_eq!(self.states[index].phase, ResolutionPhase::InitialQueued);
-        self.enqueue_state_action(index);
+    fn enqueue_initial(&mut self, index: usize, action_slot: usize) -> ResolutionResult {
+        debug_assert_eq!(self.states[index].entry.attempts, 0);
+        debug_assert_eq!(
+            self.states[index].entry.phase,
+            ResolutionPhase::InitialQueued
+        );
+        self.enqueue_state_action(index, action_slot);
         self.counters.queued += 1;
         ResolutionResult::Queued
     }
 
-    fn enqueue_retry(&mut self, index: usize) -> ResolutionResult {
-        if self.len == self.actions.len() {
-            self.counters.action_full += 1;
-            return ResolutionResult::ActionFull;
-        }
-        self.states[index].phase = ResolutionPhase::RetryQueued;
-        self.enqueue_state_action(index);
+    fn enqueue_retry(&mut self, index: usize, action_slot: usize) -> ResolutionResult {
+        self.states[index].entry.phase = ResolutionPhase::RetryQueued;
+        self.enqueue_state_action(index, action_slot);
         self.counters.queued += 1;
         self.counters.retry_queued += 1;
         ResolutionResult::RetryQueued
     }
 
-    fn enqueue_state_action(&mut self, index: usize) {
-        debug_assert!(self.len < self.actions.len());
-        let action = self.states[index].action;
-        let generation = self.states[index].generation;
-        let tail = (self.head + self.len) % self.actions.len();
-        self.actions[tail].0 = Some(QueuedAction { action, generation });
-        self.len += 1;
+    fn enqueue_state_action(&mut self, index: usize, action_slot: usize) {
+        debug_assert!(self.action_queue.len() < self.actions.len());
+        debug_assert!(self.actions[action_slot].queued.is_none());
+        let entry = self.states[index].entry;
+        self.actions[action_slot].queued = Some(QueuedAction {
+            action: entry.action,
+            generation: entry.generation,
+        });
+        self.actions[action_slot].state = u32::try_from(index).expect("validated capacity");
+        set_used::<ActionBits>(self.actions, action_slot, true);
+        self.action_queue.push_back(self.actions, action_slot);
+        self.states[index].action_slot = u32::try_from(action_slot).expect("validated capacity");
     }
 
     fn mark_failed(&mut self, index: usize, now: MonotonicMillis) -> ResolutionResult {
-        debug_assert_eq!(self.states[index].phase, ResolutionPhase::Waiting);
-        debug_assert!(self.states[index].attempts >= self.policy.max_attempts);
-        self.states[index].phase = ResolutionPhase::Failed;
-        self.states[index].failed_at = now;
-        self.states[index].failure_notified = true;
+        debug_assert_eq!(self.states[index].entry.phase, ResolutionPhase::Waiting);
+        debug_assert!(self.states[index].entry.attempts >= self.policy.max_attempts);
+        self.states[index].entry.phase = ResolutionPhase::Failed;
+        self.states[index].entry.failed_at = now;
+        self.states[index].entry.failure_notified = true;
         self.counters.timed_out += 1;
+        let state = self.states[index].entry;
         let token = ResolutionGenerationToken {
-            egress: self.states[index].key.egress,
-            target: self.states[index].key.target,
-            generation: self.states[index].generation,
+            egress: state.key.egress,
+            target: state.key.target,
+            generation: state.generation,
         };
-        if self.states[index].accepted_attempts == 0 {
-            for hold_index in 0..self.failure_holds.len() {
-                let hold = self.failure_holds[hold_index];
+        let Some(bucket) = self.forward_bucket(token.egress, token.target) else {
+            return ResolutionResult::TimedOut;
+        };
+        if state.accepted_attempts == 0 {
+            self.for_each_hold::<HoldForwardChain>(bucket, |runtime, hold_index| {
+                let hold = runtime.failure_holds[hold_index];
                 if hold.phase == ResolutionFailureHoldPhase::WaitingForward && hold.forward == token
                 {
-                    self.clear_failure_hold(hold_index);
-                    self.failure_counters.no_accepted_arp_request += 1;
+                    runtime.clear_failure_hold(hold_index);
+                    runtime.failure_counters.no_accepted_arp_request += 1;
                 }
-            }
+            });
         } else {
-            for hold in &mut *self.failure_holds {
+            self.for_each_hold::<HoldForwardChain>(bucket, |runtime, hold_index| {
+                let hold = &mut runtime.failure_holds[hold_index];
                 if hold.phase == ResolutionFailureHoldPhase::WaitingForward && hold.forward == token
                 {
                     hold.phase = ResolutionFailureHoldPhase::TerminalReady;
-                    self.failure_counters.promoted += 1;
+                    runtime.failure_counters.promoted += 1;
                 }
-            }
+            });
         }
         ResolutionResult::TimedOut
     }
 
     fn front(&self) -> Option<QueuedAction> {
-        self.actions.get(self.head).and_then(|item| item.0)
+        self.action_queue
+            .head()
+            .and_then(|head| self.actions.get(head))
+            .and_then(|slot| slot.queued)
     }
 
     fn execution_time_valid(&mut self, now: MonotonicMillis) -> bool {
@@ -1408,61 +2369,93 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn committed(&mut self, queued: QueuedAction, now: MonotonicMillis) {
-        let item = self.actions[self.head]
-            .0
+        let head = self
+            .action_queue
+            .head()
+            .expect("committed action is queue front");
+        let item = self.actions[head]
+            .queued
             .take()
             .expect("committed action is queue front");
         debug_assert_eq!(item, queued);
-        self.head = (self.head + 1) % self.actions.len();
-        self.len -= 1;
-        self.counters.dequeued += 1;
-        if let Some(state) = self.states.iter_mut().find(|state| {
-            state.occupied
-                && state.key.egress == queued.action.egress
-                && state.key.target == queued.action.target_ip
-                && state.generation == queued.generation
-        }) {
-            debug_assert!(matches!(
-                state.phase,
-                ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued
-            ));
-            debug_assert!(state.attempts < self.policy.max_attempts);
-            state.attempts += 1;
-            state.phase = ResolutionPhase::Waiting;
-            state.requested_at = now;
-            self.counters.attempts_committed += 1;
+        let owner = self.actions[head].state as usize;
+        self.actions[head].state = INDEX_NONE;
+        self.action_queue.unlink(self.actions, head);
+        set_used::<ActionBits>(self.actions, head, false);
+        if self
+            .states
+            .get(owner)
+            .is_some_and(|state| state.action_slot as usize == head)
+        {
+            self.states[owner].action_slot = INDEX_NONE;
         }
+        self.counters.dequeued += 1;
+        let Some(index) = self
+            .find_state(ResolutionKey {
+                egress: queued.action.egress,
+                target: queued.action.target_ip,
+            })
+            .filter(|&index| self.states[index].entry.generation == queued.generation)
+        else {
+            return;
+        };
+        debug_assert!(matches!(
+            self.states[index].entry.phase,
+            ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued
+        ));
+        debug_assert!(self.states[index].entry.attempts < self.policy.max_attempts);
+        let entry = &mut self.states[index].entry;
+        entry.attempts += 1;
+        entry.phase = ResolutionPhase::Waiting;
+        entry.requested_at = now;
+        if self.states[index].in_order {
+            self.request_order.unlink(self.states, index);
+        }
+        self.request_order.push_back(self.states, index);
+        self.states[index].in_order = true;
+        self.refresh_state_bit(index);
+        self.counters.attempts_committed += 1;
     }
 
     fn accepted(&mut self, queued: QueuedAction, accepted: usize) {
         if accepted == 0 {
             return;
         }
-        if let Some(state) = self.states.iter_mut().find(|state| {
-            state.occupied
-                && state.key.egress == queued.action.egress
-                && state.key.target == queued.action.target_ip
-                && state.generation == queued.generation
-        }) {
+        if let Some(index) = self
+            .find_state(ResolutionKey {
+                egress: queued.action.egress,
+                target: queued.action.target_ip,
+            })
+            .filter(|&index| self.states[index].entry.generation == queued.generation)
+        {
+            let state = &mut self.states[index].entry;
             state.accepted_attempts = state.accepted_attempts.saturating_add(accepted as u16);
             self.counters.attempts_accepted += accepted;
         }
     }
 
-    fn next_generation(&self, egress: IfId, target: Ipv4Address, previous: u64) -> u64 {
+    /// Whether a live hold still carries `token`: as its forward token, or
+    /// as its reverse token while waiting for reverse resolution.
+    fn token_in_use(&mut self, token: ResolutionGenerationToken) -> bool {
+        let forward = self.forward_hold_exists(token).map(|(found, _)| found);
+        let reverse = self.reverse_hold_exists(token);
+        match (forward, reverse) {
+            (Ok(forward), Ok(reverse)) => forward || reverse,
+            _ => {
+                self.index_result(Err(IndexCorrupt));
+                false
+            }
+        }
+    }
+
+    fn next_generation(&mut self, egress: IfId, target: Ipv4Address, previous: u64) -> u64 {
         let mut candidate = previous.wrapping_add(1);
         for _ in 0..=self.failure_holds.len() {
-            let aliases = self.failure_holds.iter().any(|hold| {
-                hold.phase != ResolutionFailureHoldPhase::Empty
-                    && ((hold.forward.egress == egress
-                        && hold.forward.target == target
-                        && hold.forward.generation == candidate)
-                        || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
-                            && hold.reverse.egress == egress
-                            && hold.reverse.target == target
-                            && hold.reverse.generation == candidate))
-            });
-            if !aliases {
+            if !self.token_in_use(ResolutionGenerationToken {
+                egress,
+                target,
+                generation: candidate,
+            }) {
                 return candidate;
             }
             candidate = candidate.wrapping_add(1);
@@ -1471,14 +2464,38 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn cancel_forward_holds(&mut self, egress: IfId, target: Ipv4Address) {
-        for index in 0..self.failure_holds.len() {
-            let hold = self.failure_holds[index];
+        let Some(bucket) = self.forward_bucket(egress, target) else {
+            return;
+        };
+        self.for_each_hold::<HoldForwardChain>(bucket, |runtime, index| {
+            let hold = runtime.failure_holds[index];
             if hold.phase != ResolutionFailureHoldPhase::Empty
                 && hold.forward.egress == egress
                 && hold.forward.target == target
             {
-                self.clear_failure_hold(index);
-                self.failure_counters.cancelled += 1;
+                runtime.clear_failure_hold(index);
+                runtime.failure_counters.cancelled += 1;
+            }
+        });
+    }
+
+    /// Whether a hold is still waiting for forward resolution `token`.
+    fn waiting_forward_hold_exists(&mut self, token: ResolutionGenerationToken) -> bool {
+        let Some(bucket) = self.forward_bucket(token.egress, token.target) else {
+            return false;
+        };
+        let holds = &*self.failure_holds;
+        match walk::<HoldForwardChain>(holds, bucket, RESOLUTION_INDEX_CHAIN_LIMIT, |index| {
+            holds[index].phase == ResolutionFailureHoldPhase::WaitingForward
+                && holds[index].forward == token
+        }) {
+            Ok(walked) => {
+                self.count_visits(walked.visited.max(1));
+                walked.found.is_some()
+            }
+            Err(IndexCorrupt) => {
+                self.index_result(Err(IndexCorrupt));
+                false
             }
         }
     }
@@ -1503,27 +2520,24 @@ impl<'a> ResolutionRuntime<'a> {
             let index = self.poll_cursor;
             self.poll_cursor = (self.poll_cursor + 1) % self.states.len();
             report.scanned += 1;
-            if !self.states[index].occupied {
+            let state = self.states[index].entry;
+            if !state.occupied {
                 continue;
             }
-            match self.states[index].phase {
+            match state.phase {
                 ResolutionPhase::InitialQueued | ResolutionPhase::RetryQueued => {}
                 ResolutionPhase::Waiting => {
-                    if now.0 - self.states[index].requested_at.0 < self.policy.interval_ms {
+                    if now.0 - state.requested_at.0 < self.policy.interval_ms {
                         continue;
                     }
-                    if self.states[index].attempts >= self.policy.max_attempts {
-                        let state = self.states[index];
+                    if state.attempts >= self.policy.max_attempts {
                         let token = ResolutionGenerationToken {
                             egress: state.key.egress,
                             target: state.key.target,
                             generation: state.generation,
                         };
-                        let no_accepted_candidate = state.accepted_attempts == 0
-                            && self.failure_holds.iter().any(|hold| {
-                                hold.phase == ResolutionFailureHoldPhase::WaitingForward
-                                    && hold.forward == token
-                            });
+                        let no_accepted_candidate =
+                            state.accepted_attempts == 0 && self.waiting_forward_hold_exists(token);
                         self.mark_failed(index, now);
                         report.timed_out += 1;
                         trace.record_resolution_timer(ResolutionTimerTrace::TimedOut {
@@ -1542,8 +2556,17 @@ impl<'a> ResolutionRuntime<'a> {
                                 },
                             );
                         }
-                    } else if self.len == self.actions.len() {
-                        let state = self.states[index];
+                    } else if let Some(action_slot) = self.reserve_action_slot() {
+                        let result = self.enqueue_retry(index, action_slot);
+                        debug_assert_eq!(result, ResolutionResult::RetryQueued);
+                        report.retries_queued += 1;
+                        trace.record_resolution_timer(ResolutionTimerTrace::RetryQueued {
+                            egress: state.key.egress,
+                            target: state.key.target,
+                            attempts: state.attempts,
+                            generation: state.generation,
+                        });
+                    } else {
                         self.counters.action_full += 1;
                         report.action_full += 1;
                         report.deferred_due += 1;
@@ -1553,38 +2576,15 @@ impl<'a> ResolutionRuntime<'a> {
                             attempts: state.attempts,
                             generation: state.generation,
                         });
-                    } else {
-                        let state = self.states[index];
-                        let result = self.enqueue_retry(index);
-                        debug_assert_eq!(result, ResolutionResult::RetryQueued);
-                        report.retries_queued += 1;
-                        trace.record_resolution_timer(ResolutionTimerTrace::RetryQueued {
-                            egress: state.key.egress,
-                            target: state.key.target,
-                            attempts: state.attempts,
-                            generation: state.generation,
-                        });
                     }
                 }
                 ResolutionPhase::Failed => {
-                    if now.0 - self.states[index].failed_at.0 >= self.policy.state_ttl_ms {
-                        let state = self.states[index];
-                        let token = ResolutionGenerationToken {
+                    if now.0 - state.failed_at.0 >= self.policy.state_ttl_ms {
+                        self.cancel_holds_of_token(ResolutionGenerationToken {
                             egress: state.key.egress,
                             target: state.key.target,
                             generation: state.generation,
-                        };
-                        for hold_index in 0..self.failure_holds.len() {
-                            let hold = self.failure_holds[hold_index];
-                            if hold.phase != ResolutionFailureHoldPhase::Empty
-                                && (hold.forward == token
-                                    || (hold.phase == ResolutionFailureHoldPhase::WaitingReverse
-                                        && hold.reverse == token))
-                            {
-                                self.clear_failure_hold(hold_index);
-                                self.failure_counters.cancelled += 1;
-                            }
-                        }
+                        });
                         self.vacate_state_at(index);
                         self.counters.failures_expired += 1;
                         report.failures_expired += 1;
@@ -1603,36 +2603,81 @@ impl<'a> ResolutionRuntime<'a> {
     }
 }
 
+#[cfg(test)]
+impl ResolutionRuntime<'_> {
+    /// Installs a live hold through the indexes, as capture and dispatch
+    /// would.
+    pub(crate) fn install_hold_for_test(
+        &mut self,
+        index: usize,
+        phase: ResolutionFailureHoldPhase,
+        forward: ResolutionGenerationToken,
+        reverse: ResolutionGenerationToken,
+    ) {
+        assert_eq!(
+            self.failure_holds[index].phase,
+            ResolutionFailureHoldPhase::Empty
+        );
+        self.failure_holds[index].phase = ResolutionFailureHoldPhase::WaitingForward;
+        self.failure_holds[index].forward = forward;
+        let bucket = self.forward_bucket(forward.egress, forward.target).unwrap();
+        link::<HoldForwardChain>(self.failure_holds, index, bucket).unwrap();
+        set_used::<HoldBits>(self.failure_holds, index, true);
+        self.pending_failure_hold_count += 1;
+        if phase == ResolutionFailureHoldPhase::WaitingReverse {
+            self.wait_reverse(index, reverse);
+        } else {
+            self.failure_holds[index].phase = phase;
+        }
+    }
+
+    pub(crate) fn take_visits(&self) -> u64 {
+        self.visits.replace(0)
+    }
+}
+
 impl ResolutionPublicationPermit<'_, '_> {
     #[must_use]
     pub const fn preview(&self) -> ResolutionPublicationReport {
         self.preview
     }
 
-    /// Flushes all old publication authority without failure.
+    /// Flushes all old publication authority without failure, keeping the
+    /// index key.
     pub fn commit(self) -> ResolutionPublicationReport {
-        self.runtime.states.fill(ResolutionStateSlot::EMPTY);
-        self.runtime.actions.fill(ResolutionActionSlot::EMPTY);
-        self.runtime
-            .dynamic_neighbors
-            .fill(DynamicNeighborSlot::EMPTY);
-        self.runtime
-            .failure_holds
-            .fill(ResolutionFailureHoldSlot::EMPTY);
-        self.runtime.head = 0;
-        self.runtime.len = 0;
-        self.runtime.pending_state_count = 0;
-        self.runtime.pending_failure_hold_count = 0;
-        self.runtime.poll_cursor = 0;
-        self.runtime.failure_cursor = 0;
-        self.runtime.publication_epoch = self.next_runtime_epoch;
+        let key = self.runtime.hash_key;
+        self.commit_keyed(key)
+    }
+
+    /// Flushes all old publication authority without failure and switches
+    /// the hashed indexes to the fresh secret `hash_key`.
+    pub fn commit_with_hash_key(self, hash_key: ResolutionHashKey) -> ResolutionPublicationReport {
+        self.commit_keyed(hash_key.0)
+    }
+
+    fn commit_keyed(self, hash_key: DirectoryHashKey) -> ResolutionPublicationReport {
+        let runtime = self.runtime;
+        runtime.states.fill(ResolutionStateSlot::EMPTY);
+        runtime.actions.fill(ResolutionActionSlot::EMPTY);
+        runtime.dynamic_neighbors.fill(DynamicNeighborSlot::EMPTY);
+        runtime.failure_holds.fill(ResolutionFailureHoldSlot::EMPTY);
+        runtime.hash_key = hash_key;
+        runtime.action_queue = SlotList::EMPTY;
+        runtime.request_order = SlotList::EMPTY;
+        runtime.dynamic_order = SlotList::EMPTY;
+        runtime.dynamic_count = 0;
+        runtime.pending_state_count = 0;
+        runtime.pending_failure_hold_count = 0;
+        runtime.poll_cursor = 0;
+        runtime.failure_cursor = 0;
+        runtime.publication_epoch = self.next_runtime_epoch;
         self.preview
     }
 }
 
 fn publication_hold_valid(
     snapshot: &crate::ForwardingSnapshot<'_>,
-    hold: ResolutionFailureHoldSlot,
+    hold: &ResolutionFailureHoldSlot,
 ) -> bool {
     crate::route::lookup(snapshot.routes, hold.original_destination).is_some_and(|route| {
         route.egress() == hold.forward.egress
@@ -1654,34 +2699,31 @@ fn publication_hold_valid(
     )
 }
 
-const fn state_is_pending(state: ResolutionStateSlot) -> bool {
+const fn state_is_pending(state: StateEntry) -> bool {
     state.occupied && !matches!(state.phase, ResolutionPhase::Cooldown)
 }
 
-fn vacate_state(state: &mut ResolutionStateSlot) {
-    let generation = state.generation;
-    *state = ResolutionStateSlot::EMPTY;
-    state.generation = generation;
+/// A free state that keeps its generation counter.
+const fn vacated_entry(state: StateEntry) -> StateEntry {
+    let mut vacated = StateEntry::EMPTY;
+    vacated.generation = state.generation;
+    vacated
 }
 
-fn cancel_state(state: &mut ResolutionStateSlot) -> bool {
-    let was_pending = state_is_pending(*state);
+/// The entry a cancelled state becomes: free if it never committed a
+/// request, else a cooldown that remembers the last request time.
+const fn cancelled_entry(state: StateEntry) -> StateEntry {
     if state.attempts == 0 {
-        vacate_state(state);
-        return was_pending;
+        return vacated_entry(state);
     }
-    let key = state.key;
-    let generation = state.generation;
-    let attempts = state.attempts;
-    let requested_at = state.requested_at;
-    *state = ResolutionStateSlot::EMPTY;
-    state.key = key;
-    state.generation = generation;
-    state.attempts = attempts;
-    state.requested_at = requested_at;
-    state.occupied = true;
-    state.phase = ResolutionPhase::Cooldown;
-    was_pending
+    let mut cooldown = StateEntry::EMPTY;
+    cooldown.key = state.key;
+    cooldown.generation = state.generation;
+    cooldown.attempts = state.attempts;
+    cooldown.requested_at = state.requested_at;
+    cooldown.occupied = true;
+    cooldown.phase = ResolutionPhase::Cooldown;
+    cooldown
 }
 
 /// Advances bounded ARP retry/timeout state without performing packet I/O.
@@ -1743,8 +2785,7 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
                 reverse,
                 newly_scheduled,
             } => {
-                resolution.failure_holds[index].phase = ResolutionFailureHoldPhase::WaitingReverse;
-                resolution.failure_holds[index].reverse = reverse;
+                resolution.wait_reverse(index, reverse);
                 report.retained += 1;
                 if newly_scheduled {
                     resolution.failure_counters.reverse_arp_scheduled += 1;
@@ -2201,6 +3242,10 @@ fn build_arp_request(frame: &mut [u8], action: ArpRequestAction) {
 }
 
 #[cfg(test)]
+#[path = "resolution_index_tests.rs"]
+mod index_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ForwardingSnapshot, Interface, LocalIpv4Binding, Neighbor, Route};
@@ -2240,9 +3285,10 @@ mod tests {
                 .states
                 .iter()
                 .copied()
-                .filter(|state| state_is_pending(*state))
+                .filter(|state| state_is_pending(state.entry))
                 .count()
         );
+        assert!(runtime.indexes_valid(), "indexes match the slots");
         assert_eq!(
             runtime.pending_failure_holds(),
             runtime
@@ -2260,8 +3306,11 @@ mod tests {
         actions: Vec<ResolutionActionSlot>,
         dynamic_neighbors: Vec<DynamicNeighborSlot>,
         failure_holds: Vec<ResolutionFailureHoldSlot>,
-        head: usize,
-        len: usize,
+        action_queue: SlotList,
+        request_order: SlotList,
+        dynamic_order: SlotList,
+        dynamic_count: usize,
+        index_counters: ResolutionIndexCounters,
         pending_state_count: usize,
         pending_failure_hold_count: usize,
         poll_cursor: usize,
@@ -2279,8 +3328,11 @@ mod tests {
             actions: runtime.actions.to_vec(),
             dynamic_neighbors: runtime.dynamic_neighbors.to_vec(),
             failure_holds: runtime.failure_holds.to_vec(),
-            head: runtime.head,
-            len: runtime.len,
+            action_queue: runtime.action_queue,
+            request_order: runtime.request_order,
+            dynamic_order: runtime.dynamic_order,
+            dynamic_count: runtime.dynamic_count,
+            index_counters: runtime.index_counters,
             pending_state_count: runtime.pending_state_count,
             pending_failure_hold_count: runtime.pending_failure_hold_count,
             poll_cursor: runtime.poll_cursor,
@@ -2313,7 +3365,7 @@ mod tests {
         let mut states = [];
         let mut actions = [];
         let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
-        runtime.len = 1;
+        runtime.action_queue = SlotList::from_raw_for_test(INDEX_NONE, INDEX_NONE, 1);
         assert_publication_error_is_atomic(
             &mut runtime,
             ResolutionPublicationError::ActionQueueCapacity,
@@ -2322,7 +3374,7 @@ mod tests {
         let mut states = [];
         let mut actions = [ResolutionActionSlot::EMPTY; 1];
         let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
-        runtime.head = 1;
+        runtime.action_queue = SlotList::from_raw_for_test(1, 1, 1);
         assert_publication_error_is_atomic(
             &mut runtime,
             ResolutionPublicationError::ActionQueueHead,
@@ -2331,11 +3383,41 @@ mod tests {
         let mut states = [];
         let mut actions = [ResolutionActionSlot::EMPTY; 1];
         let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
-        runtime.len = 1;
+        runtime.action_queue = SlotList::from_raw_for_test(0, 0, 1);
         assert_publication_error_is_atomic(
             &mut runtime,
             ResolutionPublicationError::ActionQueueWindow,
         );
+
+        // A reusable-slot bit that disagrees with its state.
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [];
+        let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
+        runtime.states[0].used_word = 1;
+        assert_publication_error_is_atomic(&mut runtime, ResolutionPublicationError::IndexCorrupt);
+
+        // A dynamic neighbor that is not on its key chain.
+        let mut dynamic = [DynamicNeighborSlot::EMPTY; 2];
+        let mut runtime =
+            ResolutionRuntime::with_dynamic_neighbors(policy, &mut [], &mut [], &mut dynamic);
+        assert_eq!(
+            runtime.merge_dynamic(
+                WAN,
+                target(9),
+                MacAddress([2, 0, 0, 0, 0, 9]),
+                true,
+                false,
+                MonotonicMillis(0)
+            ),
+            ControlDisposition::Inserted
+        );
+        let linked = runtime.find_dynamic(ResolutionKey {
+            egress: WAN,
+            target: target(9),
+        });
+        let index = linked.unwrap();
+        runtime.dynamic_neighbors[index].entry.target = target(10);
+        assert_publication_error_is_atomic(&mut runtime, ResolutionPublicationError::IndexCorrupt);
 
         let mut states = [];
         let mut actions = [];
@@ -2406,17 +3488,34 @@ mod tests {
             .retries_queued,
             1
         );
-        assert_eq!(runtime.head, 1);
-        assert_eq!(runtime.len, 2);
-        runtime.dynamic_neighbors[0] = DynamicNeighborSlot {
-            interface: WAN,
-            target: target(9),
-            mac: MacAddress([2, 0, 0, 0, 0, 9]),
-            refreshed_at: MonotonicMillis(1_000),
-            occupied: true,
-        };
-        runtime.failure_holds[0].phase = ResolutionFailureHoldPhase::TerminalReady;
-        runtime.pending_failure_hold_count = 1;
+        assert_eq!(runtime.pending_actions(), 2);
+        assert_eq!(runtime.front().unwrap().action, action(3));
+        assert_eq!(
+            runtime.merge_dynamic(
+                WAN,
+                target(9),
+                MacAddress([2, 0, 0, 0, 0, 9]),
+                true,
+                false,
+                MonotonicMillis(1_000)
+            ),
+            ControlDisposition::Inserted
+        );
+        assert!(matches!(
+            runtime.capture_failure_candidate(
+                WAN,
+                target(2),
+                target(50),
+                target(2),
+                SOURCE_MAC,
+                SOURCE_IP,
+                Ipv4Address::from_octets([192, 0, 2, 0]),
+                24,
+                0,
+                &[0x45; 20],
+            ),
+            ResolutionFailureCapture::Captured(_)
+        ));
         runtime.counters.queued = usize::MAX;
         runtime.failure_counters.cancelled = usize::MAX;
 
@@ -2464,8 +3563,8 @@ mod tests {
             .all(|slot| *slot == ResolutionFailureHoldSlot::EMPTY));
         assert_eq!(
             (
-                runtime.head,
-                runtime.len,
+                runtime.action_queue.len(),
+                runtime.dynamic_count,
                 runtime.pending_state_count,
                 runtime.pending_failure_hold_count,
                 runtime.poll_cursor,
@@ -2501,7 +3600,7 @@ mod tests {
             &mut states,
             &mut actions,
         );
-        runtime.states[0].generation = 9;
+        runtime.states[0].entry.generation = 9;
         assert!(!runtime.is_pristine());
     }
 
@@ -2939,7 +4038,7 @@ mod tests {
         let mut states = [ResolutionStateSlot::EMPTY; 2];
         let mut actions = [ResolutionActionSlot::EMPTY; 1];
         let mut runtime = ResolutionRuntime::new(policy, &mut states, &mut actions);
-        runtime.states[0].generation = u64::MAX;
+        runtime.states[0].entry.generation = u64::MAX;
         assert_eq!(
             runtime.schedule(action(2), MonotonicMillis(0), false),
             ResolutionResult::Queued
@@ -2954,8 +4053,9 @@ mod tests {
         let authoritative = runtime
             .states
             .iter()
-            .find(|state| state.occupied && state.key.target == target(2))
+            .find(|state| state.entry.occupied && state.entry.key.target == target(2))
             .unwrap()
+            .entry
             .action;
         let mut changed = action(2);
         changed.source_mac = MacAddress([9; 6]);
@@ -2967,8 +4067,9 @@ mod tests {
             runtime
                 .states
                 .iter()
-                .find(|state| state.occupied && state.key.target == target(2))
+                .find(|state| state.entry.occupied && state.entry.key.target == target(2))
                 .unwrap()
+                .entry
                 .action,
             authoritative
         );
@@ -3401,13 +4502,21 @@ mod tests {
                 &mut [],
                 &mut holds,
             );
-            runtime.states[0].generation = u64::MAX;
-            runtime.failure_holds[0].phase = ResolutionFailureHoldPhase::TerminalReady;
-            runtime.failure_holds[0].forward = ResolutionGenerationToken {
-                egress: WAN,
-                target: target(2),
-                generation: 0,
-            };
+            runtime.states[0].entry.generation = u64::MAX;
+            runtime.install_hold_for_test(
+                0,
+                ResolutionFailureHoldPhase::TerminalReady,
+                ResolutionGenerationToken {
+                    egress: WAN,
+                    target: target(2),
+                    generation: 0,
+                },
+                ResolutionGenerationToken {
+                    egress: WAN,
+                    target: target(2),
+                    generation: 0,
+                },
+            );
             runtime.failure_holds[0].quote_len = 1;
             runtime.failure_holds[0].quote[0] = 0xa5;
             assert_eq!(

@@ -5,7 +5,7 @@ use ruster_core::{
     ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4OriginPolicy,
     LocalIpv4Binding, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy,
     Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor,
-    ResolutionPolicy, Route, ValidatedFirewallOwner, ValidatedForwardingOwner,
+    ResolutionHashKey, ResolutionPolicy, Route, ValidatedFirewallOwner, ValidatedForwardingOwner,
     ValidatedForwardingOwnerError,
 };
 
@@ -401,6 +401,7 @@ pub struct PublicationPlan {
     ipv4_origin: Ipv4OriginPolicy,
     resolution_policy: ResolutionPolicy,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
+    resolution_hash_key: Option<ResolutionHashKey>,
     nat44_udp: Option<Nat44UdpPublicationInput>,
     nat44_tcp: Option<Nat44TcpPublicationInput>,
     firewall: Option<FirewallPublicationInput>,
@@ -430,10 +431,20 @@ impl PublicationPlan {
             ipv4_origin,
             resolution_policy,
             icmpv4_error_policy,
+            resolution_hash_key: None,
             nat44_udp: None,
             nat44_tcp: None,
             firewall: None,
         }
+    }
+
+    /// Supplies the secret key of the resolution runtime's hashed indexes
+    /// (required; without it the candidate is
+    /// `MissingService(RuntimeService::Resolution)`).
+    #[must_use]
+    pub fn with_resolution_hash_key(mut self, hash_key: ResolutionHashKey) -> Self {
+        self.resolution_hash_key = Some(hash_key);
+        self
     }
 
     #[must_use]
@@ -514,6 +525,7 @@ pub struct ValidatedCandidate {
     generation: NonZeroU64,
     storage_shape: FullServiceStorageShape,
     resolution_policy: ResolutionPolicy,
+    resolution_hash_key: ResolutionHashKey,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
     /// Owned copy of the published interface identities (IfId and MAC),
     /// compared by successor validation. It borrows nothing.
@@ -538,10 +550,14 @@ impl ValidatedCandidate {
             ipv4_origin,
             resolution_policy,
             icmpv4_error_policy,
+            resolution_hash_key,
             nat44_udp,
             nat44_tcp,
             firewall,
         } = plan;
+        let resolution_hash_key = resolution_hash_key.ok_or(
+            PublicationCandidateError::MissingService(RuntimeService::Resolution),
+        )?;
         let nat44_udp = nat44_udp.ok_or(PublicationCandidateError::MissingService(
             RuntimeService::Nat44Udp,
         ))?;
@@ -601,6 +617,7 @@ impl ValidatedCandidate {
             generation,
             storage_shape,
             resolution_policy,
+            resolution_hash_key,
             icmpv4_error_policy,
             interfaces: interface_identities,
             nat44_udp: udp_config,
@@ -638,6 +655,7 @@ impl ValidatedCandidate {
             generation: self.generation,
             snapshot,
             resolution_policy: self.resolution_policy,
+            resolution_hash_key: self.resolution_hash_key,
             icmpv4_error_policy: self.icmpv4_error_policy,
             nat44_udp: self.nat44_udp,
             nat44_udp_hash_key: self.nat44_udp_hash_key,
@@ -663,6 +681,9 @@ impl ValidatedCandidate {
         }
         if candidate.firewall.config().hash_key() == self.firewall.config().hash_key() {
             return Err(SuccessorError::FirewallHashKeyReused);
+        }
+        if candidate.resolution_hash_key == self.resolution_hash_key {
+            return Err(SuccessorError::ResolutionHashKeyReused);
         }
         if candidate.storage_shape != self.storage_shape {
             return Err(SuccessorError::StorageShapeChanged);
@@ -745,6 +766,7 @@ pub struct ValidatedAuthority<'view> {
     generation: NonZeroU64,
     snapshot: ForwardingSnapshot<'view>,
     resolution_policy: ResolutionPolicy,
+    resolution_hash_key: ResolutionHashKey,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
     nat44_udp: Nat44UdpConfig,
     nat44_udp_hash_key: Nat44UdpHashKey,
@@ -772,6 +794,11 @@ impl<'view> ValidatedAuthority<'view> {
     #[must_use]
     pub const fn icmpv4_error_policy(&self) -> Icmpv4ErrorPolicy {
         self.icmpv4_error_policy
+    }
+
+    #[must_use]
+    pub const fn resolution_hash_key(&self) -> ResolutionHashKey {
+        self.resolution_hash_key
     }
 
     #[must_use]
@@ -808,6 +835,7 @@ pub enum SuccessorError {
     Nat44UdpHashKeyReused,
     Nat44TcpHashKeyReused,
     FirewallHashKeyReused,
+    ResolutionHashKeyReused,
     StorageShapeChanged,
     ResolutionPolicyChanged,
     Icmpv4ErrorPolicyChanged,
