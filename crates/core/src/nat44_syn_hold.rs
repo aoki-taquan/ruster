@@ -20,7 +20,8 @@
 //!   a new key (fail closed, as a full table).
 //! - **Deadline order.** Occupied slots form one FIFO list. A hold's
 //!   deadline is its capture time plus [`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]
-//!   and capture times never decrease (the runtime clock watermark), so the
+//!   and [`NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`]
+//!   ([`unsolicited_syn_deadline_ms`]), and capture times never decrease (the runtime clock watermark), so the
 //!   head always has the earliest deadline: maturity is a head check, not a
 //!   scan. Another SYN of a held key restarts the hold at the tail. A true
 //!   retransmission (same TCP sequence number) keeps the original quote; a
@@ -41,6 +42,53 @@ use crate::{
 /// answer it with ICMP Port Unreachable (RFC 5382 REQ-4: "at least 6
 /// seconds"). A hold is never released toward ICMP earlier.
 pub const NAT44_TCP_UNSOLICITED_SYN_HOLD_MS: u64 = 6_000;
+
+/// Clock-granularity margin added to every unsolicited-SYN hold deadline so
+/// that the ICMP never leaves earlier than
+/// [`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`] after the SYN's true arrival.
+///
+/// The capture time is the tick's clock reading `now` (whole milliseconds,
+/// truncated), taken before the tick's RX phase, while the matured hold is
+/// released only at a later tick whose reading is at or past the deadline
+/// and whose transmission follows that reading. So the release can precede
+/// "true arrival + hold" by at most the capture reading's lag behind the
+/// arrival:
+///
+/// - **Truncation**, below 1 ms: the reading is the floor of the
+///   millisecond, so a SYN that arrives 0.999 ms into millisecond `n` is
+///   recorded as `n`.
+/// - **Reading-to-RX gap**, bounded by 1 ms: a frame that lands in the
+///   ring between the reading and the RX phase is received with the
+///   earlier reading. `ruster run` keeps that gap free of slow work with
+///   one rule: the reading RX uses is taken after the last step that can
+///   block or take long. An idle iteration (no reload in flight, none
+///   requested) reads the clock once at the top and, until RX, only hands
+///   it to the backend, polls the signal flag and the reload worker
+///   without blocking, and runs the publication phase's steady disposition
+///   check: microseconds. An iteration that requested a reload or had one
+///   in flight (where the worker's answer, the live dry run, a warning, an
+///   abandon, and stderr writes happen) reads the clock again right
+///   before the tick. A tick that publishes a candidate (applied,
+///   rejected, or deferred), whose apply has no time bound, reads it again
+///   after the publication phase and before RX
+///   (`ruster_runtime::run_tick_reclocked`). Every extra reading only
+///   moves the tick clock forward. An idle pause (at most 1 ms) runs after
+///   the tick, before the next reading, so a frame that arrives while the
+///   loop sleeps is stamped later than its arrival, never earlier.
+///
+/// 1 ms + 1 ms = 2 ms. A later deadline only delays the ICMP (REQ-4 sets
+/// a minimum, not a maximum).
+pub const NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS: u64 = 2;
+
+/// The deadline of a hold captured at the tick reading `now_ms`:
+/// [`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`] plus
+/// [`NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`] after it (saturating). The
+/// hold matures at the first tick whose reading is at or past it.
+pub(crate) const fn unsolicited_syn_deadline_ms(now_ms: u64) -> u64 {
+    now_ms
+        .saturating_add(NAT44_TCP_UNSOLICITED_SYN_HOLD_MS)
+        .saturating_add(NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS)
+}
 
 /// Longest keyed chain of the unsolicited-SYN hold index. A new key whose
 /// chain already has this many holds is refused like a full table.
@@ -525,6 +573,17 @@ mod tests {
         bytes[0] = 0x45;
         bytes[24..28].copy_from_slice(&seq.to_be_bytes());
         bytes
+    }
+
+    /// The deadline is the 6 s REQ-4 minimum plus the 2 ms clock margin
+    /// after the capture reading, saturating at the end of the clock.
+    #[test]
+    fn deadline_adds_the_clock_margin_to_the_hold() {
+        assert_eq!(NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS, 2);
+        assert_eq!(unsolicited_syn_deadline_ms(0), 6_002);
+        assert_eq!(unsolicited_syn_deadline_ms(100), 6_102);
+        assert_eq!(unsolicited_syn_deadline_ms(u64::MAX - 6_001), u64::MAX);
+        assert_eq!(unsolicited_syn_deadline_ms(u64::MAX), u64::MAX);
     }
 
     #[test]

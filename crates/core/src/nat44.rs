@@ -15,8 +15,8 @@ use crate::{
         PreparedPortOwnerMoveTopology,
     },
     nat44_syn_hold::{
-        MaturedSynHold, SynHoldInsert, SynHoldKey, SynHoldTable, MAX_SYN_HOLD_SLOTS,
-        NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
+        unsolicited_syn_deadline_ms, MaturedSynHold, SynHoldInsert, SynHoldKey, SynHoldTable,
+        MAX_SYN_HOLD_SLOTS,
     },
     slot_list::{Linked, SlotLinks, SlotList, LINK_NONE},
     DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, Nat44TcpSynHoldSlot,
@@ -362,7 +362,7 @@ mod tcp_tests {
             }
             runtime.syn_holds.corrupt_fifo_head();
             assert!(runtime
-                .pop_matured_unsolicited_syn(NAT44_TCP_UNSOLICITED_SYN_HOLD_MS)
+                .pop_matured_unsolicited_syn(crate::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS)
                 .is_err());
             let counters = runtime.counters();
             assert_eq!(counters.unsolicited_syn_index_corrupt, 1);
@@ -5981,7 +5981,8 @@ impl Nat44TcpPolicy {
     /// An external initial SYN that finds no live mapping for its public
     /// port, or that the configured filtering refuses, is always dropped
     /// silently. With this switch on (the default, the RFC SHOULD) a copy of
-    /// it is held for at least [`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]; if an
+    /// it is held for at least [`crate::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]
+    /// (plus [`crate::NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`]); if an
     /// outbound SYN for the same connection is translated meanwhile the hold
     /// is dropped silently, otherwise the NAT answers with one ICMP Port
     /// Unreachable through the generated-ICMPv4 queue and its Port
@@ -8080,7 +8081,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                 remote_address,
                 remote_port,
             },
-            now_ms.saturating_add(NAT44_TCP_UNSOLICITED_SYN_HOLD_MS),
+            unsolicited_syn_deadline_ms(now_ms),
             original_tos,
             original_ipv4,
         );

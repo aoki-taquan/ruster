@@ -19,7 +19,7 @@
 
 use super::*;
 use crate::firewall::FirewallUnsolicitedSynPacket;
-use crate::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS;
+use crate::nat44_syn_hold::unsolicited_syn_deadline_ms;
 
 /// What happened to one unsolicited inbound SYN or one matured hold
 /// (RFC 5382 REQ-4). Cancellation by a translated outbound SYN is counted in
@@ -133,7 +133,7 @@ pub(super) fn hold_unsolicited_syn<T: TraceSink>(
         return;
     }
     let quote_end = ipv4.header_offset + ipv4.total_len;
-    let deadline_ms = now.0.saturating_add(NAT44_TCP_UNSOLICITED_SYN_HOLD_MS);
+    let deadline_ms = unsolicited_syn_deadline_ms(now.0);
     let Some(outcome) = runtime.hold_unsolicited_syn(
         public_port,
         ipv4.source,
@@ -213,7 +213,8 @@ fn remote_routes_outside(
 }
 
 /// Tick loop: resolves at most `budget` unsolicited-SYN holds whose hold
-/// time ([`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`]) has passed at `now`, oldest
+/// time ([`crate::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`] plus
+/// [`crate::NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`]) has passed at `now`, oldest
 /// first. Each matured hold is removed and yields at most one ICMP
 /// Destination Unreachable, Port Unreachable (Type 3, Code 3) quoting the
 /// held SYN (RFC 5382 REQ-4), queued through `icmpv4_errors` and its Port

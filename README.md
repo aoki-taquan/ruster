@@ -398,7 +398,7 @@ firewall判定より前に走るinbound SYNのNAT側workは、session capacity�
 unsolicited inbound TCP SYN（public portにlive mappingが無い、またはfilteringが拒否した外部initial
 SYN）はその場でbyte不変のsilent drop（`NAT44_TCP_MAPPING_MISS`/`NAT44_TCP_SESSION_MISS`）のまま、
 RFC 5382 §5 REQ-4（B3、owner決定「A」）に従い受信IPv4（最大548 bytes）をbounded hold tableへcopy
-します。受信から6秒（`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`）より前には決して応答せず、その間に同じ
+します。受信から6秒（`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`）より前には決して応答せず（loop clockのms切り捨てと読み取りからRXまでの遅れを覆う2 msのmargin `NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`を期限に足す）、その間に同じ
 connection（変換後source `P:p`、destinationがSYNのremote `R:r`）のoutbound SYNを変換したらholdを
 silent dropします（simultaneous open）。それ以外は満了後のtickで、NATがそのSYNの再送をまだ拒否する
 場合に限り、ICMP Destination Unreachable Port Unreachable（Type 3/Code 3）をholdしたSYNを引用して

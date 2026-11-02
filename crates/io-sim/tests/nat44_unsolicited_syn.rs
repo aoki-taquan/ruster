@@ -21,7 +21,7 @@ use ruster_core::{
     Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
     Neighbor, NoGeneratedIcmpv4Trace, NoTrace, ResolutionActionSlot, ResolutionPolicy,
     ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent, TraceSink,
-    NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
+    NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS, NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -39,7 +39,10 @@ const REMOTE2: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 30]);
 const GW: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
 const PORT: u16 = 40_000;
 const SYN: u8 = 0x02;
-const HOLD: u64 = NAT44_TCP_UNSOLICITED_SYN_HOLD_MS;
+/// Ticks after the capture tick at which a hold matures: the 6 s REQ-4
+/// minimum plus the clock-granularity margin (nothing at `HOLD - 1`, the
+/// ICMP at `HOLD`).
+const HOLD: u64 = NAT44_TCP_UNSOLICITED_SYN_HOLD_MS + NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS;
 const MODES: [Nat44Filtering; 3] = [
     Nat44Filtering::EndpointIndependent,
     Nat44Filtering::AddressDependent,
@@ -493,8 +496,9 @@ fn port_unreachable(remote: Ipv4Address, original: &[u8]) -> Vec<u8> {
 }
 
 /// Mapping miss and filter refusal in every filtering mode: silent at
-/// once, still silent 1 ms before the 6 s hold ends, then exactly one ICMP
-/// Port Unreachable quoting the original SYN; never a second one.
+/// once, still silent 1 ms before the hold (6 s plus the clock margin)
+/// ends, then exactly one ICMP Port Unreachable quoting the original SYN;
+/// never a second one.
 #[test]
 fn unsolicited_syn_gets_one_port_unreachable_after_six_seconds_and_not_before() {
     for filtering in MODES {
@@ -568,7 +572,7 @@ fn outbound_syn_for_the_connection_cancels_the_hold_and_opens_it() {
         let unsolicited = tcp(REMOTE1, PUBLIC, 443, PORT, SYN);
         world.packet(WAN, unsolicited.clone(), 0);
         world.expect_drop(DropReason::Nat44TcpMappingMiss, &unsolicited);
-        world.packet(LAN, tcp(HOST, REMOTE1, PORT, 443, SYN), 5_999);
+        world.packet(LAN, tcp(HOST, REMOTE1, PORT, 443, SYN), HOLD - 1);
         let outbound = world.expect_tx(WAN);
         assert_eq!(&outbound[34..36], &PORT.to_be_bytes());
         assert_eq!(world.counters().unsolicited_syn_cancelled, 1);
@@ -1136,7 +1140,9 @@ fn delayed_icmp_is_on_by_default_and_needs_caller_storage() {
             .unwrap()
             .unsolicited_syn_icmp()
     );
-    assert_eq!(HOLD, 6_000);
+    assert_eq!(NAT44_TCP_UNSOLICITED_SYN_HOLD_MS, 6_000);
+    assert_eq!(NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS, 2);
+    assert_eq!(HOLD, 6_002);
     let world = World::new(Setup {
         holds: 0,
         ..Setup::default()

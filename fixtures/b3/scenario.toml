@@ -40,8 +40,9 @@ tx = [
 ]
 
 # --- 2. Unsolicited SYN from S to a public port without a mapping: dropped
-# silently now, still nothing 1 ms before the 6 s hold ends, then exactly
-# one ICMP Port Unreachable quoting the SYN.
+# silently now, still nothing 1 ms before the hold ends (6 s plus the 2 ms
+# clock margin, NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS), then exactly one
+# ICMP Port Unreachable quoting the SYN.
 [[step]]
 kind = "inject"
 interface = "wan"
@@ -53,7 +54,7 @@ at-ms = 20
 
 [[step]]
 kind = "tick"
-at-ms = 6019
+at-ms = 6021
 
 [[step]]
 kind = "expect"
@@ -62,7 +63,7 @@ drops = [{ reason = "NEIGHBOR_UNRESOLVED", count = 1 }, { reason = "NAT44_TCP_MA
 
 [[step]]
 kind = "tick"
-at-ms = 6020
+at-ms = 6022
 
 [[step]]
 kind = "expect"
@@ -99,11 +100,11 @@ frame = { kind = "tcp", eth = { src = "02:00:00:00:00:10", dst = "02:00:00:00:00
 
 [[step]]
 kind = "tick"
-at-ms = 12999
+at-ms = 13001
 
 [[step]]
 kind = "tick"
-at-ms = 13000
+at-ms = 13002
 
 [[step]]
 kind = "inject"

@@ -1225,7 +1225,16 @@ echo "priv_run_icmp: generated_icmpv4.tx_accepted=$accepted, if1 generated commi
 # and reads every ICMPv4 message on a raw socket until the deadline. For
 # `icmp`, exactly one Type 3 Code 3 from 203.0.113.2 must quote the SYN as
 # sent (IPv4 addresses, TCP ports, sequence number), with valid checksums,
-# TTL 64 and TOS 0xc0, and arrive no earlier than 6 s after the SYN.
+# TTL 64 and TOS 0xc0, and arrive no earlier than 6 s after the SYN: the
+# delay is measured from the latest send-side reading (after sendto
+# returned, when the router has surely been handed the SYN), so it never
+# overstates the hold; the router keeps a 2 ms clock margin
+# (NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS) on top of the 6 s. Residual
+# risk on a heavily loaded host: if the router took the SYN from its RX ring
+# while this process was still descheduled inside sendto, a correct router
+# can be measured a little under 6 s here. The error is in the safe
+# direction (the check only ever fails, never passes, wrongly); a failure
+# also prints the delay from before the send for the diagnosis.
 UNSOLICITED_SYN='
 import os, socket, struct, sys, time
 
@@ -1250,12 +1259,13 @@ tcp = tcp[:16] + struct.pack("!H", 0xFFFF - fold(pseudo + tcp)) + tcp[18:]
 icmp_raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
 icmp_raw.settimeout(0.1)
 syn = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-# Read the clock before the send: the router may receive (and start its
-# hold) before sendto returns, so a later reading shortens the delay.
-sent = time.monotonic()
+# Both readings bracket the send; the strict check uses the later one
+# (sent), the earlier one (before) only bounds the listening window.
+before = time.monotonic()
 syn.sendto(tcp, ("203.0.113.2", 0))
+sent = time.monotonic()
 answers = []
-while time.monotonic() - sent < wait:
+while time.monotonic() - before < wait:
     try:
         pkt = icmp_raw.recv(4096)
     except socket.timeout:
@@ -1278,7 +1288,7 @@ if mode == "absent":
 check(len(answers) == 1, "%d answers within %s s" % (len(answers), sys.argv[4]))
 delay, pkt, icmp, quote, qihl = answers[0]
 ihl = (pkt[0] & 15) * 4
-check(delay >= 6.0, "answered after %.3f s, before the 6 s hold" % delay)
+check(delay >= 6.0, "answered %.4f s after sendto returned (%.4f s after the send started), before the 6 s hold" % (delay, delay + (sent - before)))
 check((icmp[0], icmp[1]) == (3, 3), "type/code %d/%d" % (icmp[0], icmp[1]))
 check(pkt[12:16] == router and pkt[16:20] == me, "outer addresses")
 check(pkt[9] == 1 and fold(pkt[:ihl]) == 0xFFFF, "outer protocol or header checksum")
@@ -1286,7 +1296,7 @@ check(pkt[8] == 64 and pkt[1] == 0xC0, "outer TTL %d TOS 0x%02x" % (pkt[8], pkt[
 check(fold(icmp) == 0xFFFF and icmp[4:8] == b"\0\0\0\0", "ICMP checksum or unused field")
 check(quote[16:20] == router and fold(quote[:qihl]) == 0xFFFF, "quoted IPv4 header")
 check(quote[qihl:qihl + 20] == tcp, "quoted TCP header differs from the SYN sent")
-print("type=3 code=3 from 203.0.113.2 ttl=64 tos=0xc0 after %.2f s (>= 6 s), quoting the SYN 203.0.113.1:%d -> 203.0.113.2:%d seq=%d" % (delay, sport, dport, seq))
+print("type=3 code=3 from 203.0.113.2 ttl=64 tos=0xc0 %.4f s after sendto returned (>= 6 s), quoting the SYN 203.0.113.1:%d -> 203.0.113.2:%d seq=%d" % (delay, sport, dport, seq))
 '
 
 unsolicited_syn_probe() {
