@@ -76,6 +76,7 @@ fn run_config_opens_regular_files_only() {
             parse_effective_uid(&std::fs::read_to_string("/proc/self/status").expect("status"))
                 .expect("euid");
         let canonical = std::fs::canonicalize(&fixture).expect("canonical");
+        let expected = super::check_no_symlinks(&fixture).and(expected);
         let expected = expected.and_then(|()| {
             canonical.ancestors().skip(1).try_for_each(|directory| {
                 let metadata = std::fs::metadata(directory).expect("directory");
@@ -100,4 +101,35 @@ fn run_config_opens_regular_files_only() {
         load_validated_regular(Path::new("/dev/null"), true),
         Err(LoadError::NotAFile)
     ));
+}
+
+/// Strict mode refuses a symbolic link anywhere in the path (here
+/// `/proc/self/root`); without strict mode the same
+/// path loads.
+#[cfg(target_os = "linux")]
+#[test]
+fn strict_mode_refuses_symlinks_in_the_path() {
+    use super::check_no_symlinks;
+    // `/proc/self/root` is a symbolic link to this process's root, so this
+    // names the fixture through a link.
+    let through_link = Path::new("/proc/self/root").join(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/m1/router-v1.toml")
+            .strip_prefix("/")
+            .expect("absolute"),
+    );
+
+    assert_eq!(check_no_symlinks(&through_link), Err("SYMLINK_IN_PATH"));
+    assert!(load_validated_regular(&through_link, false).is_ok());
+    assert!(matches!(
+        load_validated_regular(&through_link, true),
+        Err(LoadError::Insecure("SYMLINK_IN_PATH"))
+    ));
+    assert_eq!(check_no_symlinks(Path::new("/")), Ok(()));
+    assert_eq!(check_no_symlinks(Path::new("/proc")), Ok(()));
+    assert_eq!(
+        check_no_symlinks(Path::new("/nonexistent/router.toml")),
+        Err("OWNER_UNVERIFIABLE"),
+        "fails closed"
+    );
 }

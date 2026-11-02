@@ -28,7 +28,7 @@
 #             namespace warns and recovers with forwarding; then rb's MTU
 #             raised beyond the 2048-byte frame bound: exit 1 after drain,
 #             nothing left attached
-#   forwarding  ip_forward=1 in the router namespace is refused
+#   forwarding  ip_forward=1 in the router namespace is refused at startup
 #             (KERNEL_FORWARDING_ENABLED), accepted with a warning under
 #             --allow-kernel-forwarding
 #   removal   (last) `ip link del ra` inside the router namespace while
@@ -515,17 +515,35 @@ wait_ruster
 [ "$status" -eq 0 ] || fail "forwarding-allowed: exit status $status"
 assert_detached "the forwarding override run"
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
-# Turned on while running: fail closed within a link round.
+# Turned on while running: XDP still takes every frame, so a warning, no
+# exit (an exit would detach and expose the ports); recovered when off;
+# an exit while it is on warns about the detached ports.
 start_ruster forwarding-runtime "$work/router.toml"
 wait_ready forwarding-runtime || fail "forwarding-runtime: ruster exited during startup"
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=1
-wait_exit forwarding-runtime
+wait_line forwarding-runtime "warning: port=if1 health=KERNEL_FORWARDING_ENABLED"
+forward_once forwarding-runtime-on
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
-[ "$status" -eq 1 ] || fail "forwarding-runtime: exit status $status"
-grep -q "fatal: port=if1 health=KERNEL_FORWARDING_ENABLED" "$work/forwarding-runtime.err" ||
-    fail "forwarding-runtime: no KERNEL_FORWARDING_ENABLED"
-assert_detached "the run-time forwarding fail-closed exit"
-echo "priv_run_forwarding: kernel forwarding refused by default, accepted with the override, and fatal when turned on while running verified"
+wait_line forwarding-runtime "recovered: port=if1 health=KERNEL_FORWARDING_ENABLED"
+in_ns "$router" sysctl -qw net.ipv4.ip_forward=1
+tries=0
+while [ "$(grep -c "warning: port=if1 health=KERNEL_FORWARDING_ENABLED" "$work/forwarding-runtime.err")" -lt 2 ]; do
+    launcher_alive || fail "forwarding-runtime: exited while forwarding was on"
+    tries=$((tries + 1))
+    [ "$tries" -le 200 ] || fail "forwarding-runtime: no second warning"
+    sleep 0.05
+done
+signal_ruster TERM
+wait_ruster
+in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
+[ "$status" -eq 0 ] || fail "forwarding-runtime: exit status $status"
+grep -q "warning: kernel forwarding is enabled; detached ports may be forwarded by the kernel" \
+    "$work/forwarding-runtime.err" || fail "forwarding-runtime: no exit warning"
+if grep -q "fatal:" "$work/forwarding-runtime.err"; then
+    fail "forwarding-runtime: a fatal event"
+fi
+assert_detached "the run-time forwarding run"
+echo "priv_run_forwarding: kernel forwarding refused at startup, accepted with the override, and only warned (forwarding kept, recovered, exit warning) when turned on while running verified"
 
 # stuck: an undrained stdout must not keep the process alive.
 mkfifo "$work/stuck.fifo"

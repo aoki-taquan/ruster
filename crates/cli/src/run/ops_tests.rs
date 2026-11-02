@@ -405,21 +405,6 @@ fn an_applied_reload_without_its_report_is_not_kept_running() {
         .contains("stopped after an invariant violation code=APPLY_REPORT_MISSING"));
 }
 
-#[test]
-fn a_kernel_ipv4_address_on_a_port_while_running_fails_closed() {
-    let host = FakeHost::default();
-    host.state
-        .addresses
-        .borrow_mut()
-        .push_back((IfId(WAN), Ok(1)));
-    let outcome = fatal_run(&host, 1_000);
-    assert_fatal(&outcome, &host, "KERNEL_IPV4_ADDRESSES");
-    assert_eq!(
-        line_value(&outcome.out, "if2.watch.kernel_ipv4_addresses"),
-        Some("1")
-    );
-}
-
 /// The loop itself ends a run whose reload tick reports `Applied` without
 /// a matching commit report (exit 1), instead of continuing.
 #[test]
@@ -447,22 +432,79 @@ fn the_loop_ends_on_an_applied_reload_without_its_report() {
     host.assert_released();
 }
 
+/// Kernel forwarding or a port address appearing while attached warns and
+/// keeps forwarding through the router (a fatal exit would be what
+/// detaches XDP); an exit while it is still seen prints a warning line.
 #[test]
-fn kernel_forwarding_turned_on_while_running_fails_closed() {
+fn kernel_exposure_while_running_warns_and_is_reported_at_exit() {
+    let on = Forwarding {
+        global: true,
+        device: false,
+    };
+    for forwarding in [true, false] {
+        let host = FakeHost::default();
+        // Seen in every round until the stop.
+        for _ in 0..1_000 {
+            if forwarding {
+                host.state
+                    .forwarding
+                    .borrow_mut()
+                    .push_back((IfId(WAN), Ok(on)));
+            } else {
+                host.state
+                    .addresses
+                    .borrow_mut()
+                    .push_back((IfId(WAN), Ok(1)));
+            }
+        }
+        host.state
+            .inject_at
+            .borrow_mut()
+            .push_back((10, IfId(LAN), echo_request(1)));
+        let outcome = fatal_run(&host, 20);
+        assert_eq!(outcome.status, 0, "{}", outcome.err);
+        let (code, field, exit_line) = if forwarding {
+            (
+                "KERNEL_FORWARDING_ENABLED",
+                "if2.watch.kernel_forwarding",
+                "warning: kernel forwarding is enabled; detached ports may be forwarded by the kernel",
+            )
+        } else {
+            (
+                "KERNEL_IPV4_ADDRESSES",
+                "if2.watch.kernel_ipv4_addresses",
+                "warning: kernel IPv4 addresses are on a port",
+            )
+        };
+        for line in [
+            format!("warning: port=if2 health={code}"),
+            exit_line.to_owned(),
+        ] {
+            assert!(outcome.err.contains(&line), "{line}\n{}", outcome.err);
+        }
+        assert!(!outcome.err.contains("fatal:"), "{}", outcome.err);
+        assert!(outcome.err.contains("stopped by signal"));
+        let out = &outcome.out;
+        assert_eq!(line_value(out, "rx.tx_accepted"), Some("1"), "kept routing");
+        assert_eq!(line_value(out, "watch.state"), Some("warning"));
+        assert!(
+            matches!(line_value(out, field), Some("true" | "1")),
+            "{out}"
+        );
+        host.assert_released();
+    }
+    // Cleared before the stop: recovered, no exit warning.
     let host = FakeHost::default();
-    host.state.forwarding.borrow_mut().push_back((
-        IfId(WAN),
-        Ok(Forwarding {
-            global: true,
-            device: false,
-        }),
-    ));
-    let outcome = fatal_run(&host, 1_000);
-    assert_fatal(&outcome, &host, "KERNEL_FORWARDING_ENABLED");
-    assert_eq!(
-        line_value(&outcome.out, "if2.watch.kernel_forwarding"),
-        Some("true")
-    );
+    host.state
+        .forwarding
+        .borrow_mut()
+        .push_back((IfId(WAN), Ok(on)));
+    let outcome = fatal_run(&host, 20);
+    assert_eq!(outcome.status, 0);
+    assert!(outcome
+        .err
+        .contains("recovered: port=if2 health=KERNEL_FORWARDING_ENABLED"));
+    assert!(!outcome.err.contains("kernel forwarding is enabled"));
 }
 
 #[test]

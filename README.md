@@ -630,7 +630,9 @@ sudo kill -HUP <pid>                                               # configをre
   `--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`で変えられ、fatalを0にすると
   warningだけです（802.3x PAUSE floodのようにwireからTX stallを起こせる環境向け。既定がfatalなのは
   exit後もforwarding拒否とkernel L3拒否でfail closedだから）。同じroundでportにkernel IPv4
-  addressが現れたら`KERNEL_IPV4_ADDRESSES`でfatalです。
+  addressが現れたり（`RTM_GETADDR`）、kernel forwardingがonになったら（procfs）`KERNEL_IPV4_ADDRESSES`/
+  `KERNEL_FORWARDING_ENABLED`のwarningで動き続けます（attach中はkernelがframeを見ないので無害で、
+  fatalにするとdetachがbypassを作るため。次の起動は拒否、exit時に警告行）。
   link downはwarningと計数だけで動き続け、upで`recovered`になりowed kickが再開します。device削除
   （`DEVICE_REMOVED`）、startup MTU未満へのMTU低下（`MTU_DECREASED`）、frameに収まらないMTU
   （`MTU_ABOVE_FRAME`）、3回連続のlink query失敗はfatalです。fatalはdrain・detach・closeの後

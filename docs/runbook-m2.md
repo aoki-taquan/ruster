@@ -76,10 +76,13 @@ All commands assume a dedicated router host or network namespace. Replace
   `ruster run` runs as (`code=UNTRUSTED_OWNER`). Off by default; it is a
   flag, not a config key, because it guards the file itself. The config is
   always opened `O_NONBLOCK | O_NOCTTY` and must be a regular file. In strict
-  mode every directory from the file's (symlink-resolved) parent up to `/`
-  must also be owned by root or that user and not group/other writable,
-  except a root-owned sticky directory such as `/tmp`
-  (`code=UNTRUSTED_DIRECTORY|WRITABLE_DIRECTORY`).
+  mode the path must not contain a symbolic link in any component
+  (`code=SYMLINK_IN_PATH`), and every directory of the opened file (taken
+  from the open descriptor, `/proc/self/fd/N`, so it is the file actually
+  read) up to `/` must be owned by root or that user and not group/other
+  writable, except a root-owned sticky directory such as `/tmp`
+  (`code=UNTRUSTED_DIRECTORY|WRITABLE_DIRECTORY`); any error refuses
+  (`code=OWNER_UNVERIFIABLE`).
 
 ## 2. Cold start
 
@@ -280,9 +283,26 @@ Every second the router asks rtnetlink for each port's interface index
 | MTU above what a frame holds (`frame-size - 256 - headroom - 14`) | fatal `MTU_ABOVE_FRAME` |
 | MTU raised within that bound | warning `MTU_RAISED`; TX stays bounded by the startup MTU until a restart |
 | the rtnetlink query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after 3 failures in a row |
-| a kernel IPv4 address appears on a port (`ip addr add ... dev lan0`; one `RTM_GETADDR` dump in the same round) | fatal `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`), like the startup refusal; a failed dump counts as a failed query |
-| `net.ipv4.ip_forward` or `conf/<port>/forwarding` turns on (read from procfs in the same round) | fatal `KERNEL_FORWARDING_ENABLED` (`if<id>.watch.kernel_forwarding`), like the startup refusal; with `--allow-kernel-forwarding` a warning `KERNEL_FORWARDING` |
-| a forwarding sysctl becomes unreadable (for example the port device renamed) | a failed query (fatal `LINK_UNVERIFIABLE` after 3 in a row); with the override a warning |
+| a kernel IPv4 address appears on a port (`ip addr add ... dev lan0`; one `RTM_GETADDR` dump in the same round) | warning `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`, `watch.state=warning`), recovered when it is gone; the router keeps running (see below); a failed dump counts as a failed query |
+| `net.ipv4.ip_forward` or `conf/<port>/forwarding` turns on (read from procfs in the same round) | warning `KERNEL_FORWARDING_ENABLED` (`if<id>.watch.kernel_forwarding`), recovered when off; the router keeps running (see below) |
+| a forwarding sysctl becomes unreadable (for example the port device renamed) | a failed query (fatal `LINK_UNVERIFIABLE` after 3 in a row); with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` |
+
+Why forwarding and addresses only warn while running: while XDP is
+attached the kernel never sees a frame from a port (the program redirects
+or drops all of them), so turning `ip_forward` on or adding an address
+changes nothing for traffic. A fatal exit would detach XDP, and that is
+exactly what would let the kernel forward between the ports around the
+firewall and NAT; a supervised restart would then be refused at startup
+and leave the ports detached. So the router keeps routing, warns loudly,
+and the next startup refuses as before. Fix the namespace (`sysctl -w
+net.ipv4.ip_forward=0`, `ip addr flush dev <port>`) while it runs. If the
+last round still saw either when `ruster run` exits for any reason (signal
+or fatal), the shutdown prints `warning: kernel forwarding is enabled;
+detached ports may be forwarded by the kernel` or `warning: kernel IPv4
+addresses are on a port; detached ports may be answered and routed by the
+kernel`. The failed-query fatal (`LINK_UNVERIFIABLE`, also for unreadable
+forwarding sysctls and failed address dumps) still ends the run, and like
+every exit it detaches the ports.
 
 The link query, the address dump, and the forwarding read each count their
 own consecutive failures: one that keeps succeeding cannot hide another

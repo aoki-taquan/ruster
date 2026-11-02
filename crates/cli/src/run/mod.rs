@@ -592,6 +592,21 @@ where
         }
     );
     let shutdown = shutdown_drain(&mut datapath, clock, stop, settings.drain_deadline_ms);
+    // The ports are about to be detached: whatever the kernel would do
+    // with their frames now matters.
+    let (forwarding, addresses) = control.watch.kernel_exposure();
+    if forwarding {
+        let _ = writeln!(
+            err,
+            "ruster run: warning: kernel forwarding is enabled; detached ports may be forwarded by the kernel"
+        );
+    }
+    if addresses {
+        let _ = writeln!(
+            err,
+            "ruster run: warning: kernel IPv4 addresses are on a port; detached ports may be answered and routed by the kernel"
+        );
+    }
     let now = clock.now();
     let status = RunStatus {
         reload: control.reloader.counters(),

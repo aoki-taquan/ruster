@@ -42,9 +42,18 @@
 //! | MTU raised within the frame bound | warning `MTU_RAISED` (TX stays bounded by the startup MTU until a restart); recovered when it returns |
 //! | link down (`IFF_UP` or `IFF_LOWER_UP` clear) | warning `LINK_DOWN`, counted; the router keeps running and owed TX kicks resume when the link returns (recovered `LINK_DOWN`) |
 //! | the link query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after [`LINK_PROBE_FAILURES_FATAL`] failures in a row |
-//! | a kernel IPv4 address appears on the port (rtnetlink `RTM_GETADDR`, same round) | fatal `KERNEL_IPV4_ADDRESSES`, as the startup check refuses it; a failed address dump counts as a failed query |
-//! | `net.ipv4.ip_forward` or `conf/<dev>/forwarding` turns on (procfs, same round) | fatal `KERNEL_FORWARDING_ENABLED`, as at startup; with `--allow-kernel-forwarding` a warning `KERNEL_FORWARDING` |
-//! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with the override a warning |
+//! | a kernel IPv4 address appears on the port (rtnetlink `RTM_GETADDR`, same round) | warning `KERNEL_IPV4_ADDRESSES`, recovered when gone; not fatal (see below); a failed address dump counts as a failed query |
+//! | `net.ipv4.ip_forward` or `conf/<dev>/forwarding` turns on (procfs, same round) | warning `KERNEL_FORWARDING_ENABLED`, recovered when off; not fatal (see below) |
+//! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` |
+//!
+//! Kernel forwarding and port addresses found at run time only warn: while
+//! XDP is attached the kernel sees none of the ports' frames, so they change
+//! nothing, and a fatal exit would detach XDP, which is exactly what lets
+//! the kernel forward around the firewall (and the supervised restart
+//! would then refuse to start). The next startup still refuses both, and
+//! every exit prints a warning line if the last round saw either. The
+//! failed-query fatal (`LINK_UNVERIFIABLE`) remains: losing observability
+//! of the ports fails closed by stopping, which also detaches.
 //!
 //! The link query, the address dump, and the forwarding read each count
 //! their own consecutive failures, so one query that succeeds every round
@@ -167,9 +176,13 @@ pub enum Condition {
     LinkDown,
     MtuRaised,
     LinkProbe,
-    /// Kernel IPv4 forwarding is on (or unreadable) under
-    /// `--allow-kernel-forwarding`.
-    KernelForwarding,
+    /// Kernel IPv4 forwarding turned on while attached (startup refuses
+    /// it; at run time XDP still takes every frame, so only a warning).
+    KernelForwardingEnabled,
+    /// A kernel IPv4 address appeared on the port while attached.
+    KernelIpv4Addresses,
+    /// A forwarding sysctl is unreadable under `--allow-kernel-forwarding`.
+    ForwardingUnverifiable,
 }
 
 impl Condition {
@@ -181,7 +194,9 @@ impl Condition {
             Self::LinkDown => "LINK_DOWN",
             Self::MtuRaised => "MTU_RAISED",
             Self::LinkProbe => "LINK_PROBE",
-            Self::KernelForwarding => "KERNEL_FORWARDING",
+            Self::KernelForwardingEnabled => "KERNEL_FORWARDING_ENABLED",
+            Self::KernelIpv4Addresses => "KERNEL_IPV4_ADDRESSES",
+            Self::ForwardingUnverifiable => "FORWARDING_UNVERIFIABLE",
         }
     }
 }
@@ -195,8 +210,6 @@ pub enum Fatal {
     MtuDecreased,
     MtuAboveFrame,
     LinkUnverifiable,
-    KernelIpv4Addresses,
-    KernelForwardingEnabled,
 }
 
 impl Fatal {
@@ -208,8 +221,6 @@ impl Fatal {
             Self::MtuDecreased => "MTU_DECREASED",
             Self::MtuAboveFrame => "MTU_ABOVE_FRAME",
             Self::LinkUnverifiable => "LINK_UNVERIFIABLE",
-            Self::KernelIpv4Addresses => "KERNEL_IPV4_ADDRESSES",
-            Self::KernelForwardingEnabled => "KERNEL_FORWARDING_ENABLED",
         }
     }
 }
@@ -285,6 +296,8 @@ struct PortWatch {
     probe_failures: [u32; Query::COUNT],
     probe_warned: bool,
     forwarding_warned: bool,
+    forwarding_unreadable_warned: bool,
+    addresses_warned: bool,
     counters: PortHealth,
 }
 
@@ -379,6 +392,8 @@ impl Watch {
                     probe_failures: [0; Query::COUNT],
                     probe_warned: false,
                     forwarding_warned: false,
+                    forwarding_unreadable_warned: false,
+                    addresses_warned: false,
                     counters: PortHealth {
                         link_up: true,
                         mtu: target.mtu,
@@ -430,7 +445,24 @@ impl Watch {
                 || port.mtu_warned
                 || port.probe_warned
                 || port.forwarding_warned
+                || port.forwarding_unreadable_warned
+                || port.addresses_warned
         })
+    }
+
+    /// What the last link round saw on any port: kernel forwarding on, and
+    /// kernel IPv4 addresses on a port. Printed at every exit, because
+    /// once the ports are detached the kernel may act on them.
+    pub fn kernel_exposure(&self) -> (bool, bool) {
+        let forwarding = self
+            .ports
+            .iter()
+            .any(|port| port.counters.kernel_forwarding);
+        let addresses = self
+            .ports
+            .iter()
+            .any(|port| port.counters.kernel_ipv4_addresses != 0);
+        (forwarding, addresses)
     }
 
     /// Health fields of each port, in `IfId` order.
@@ -486,9 +518,9 @@ impl Watch {
     }
 
     /// Folds the kernel forwarding sysctls read for port `index` in this
-    /// round: on is fatal `KERNEL_FORWARDING_ENABLED` unless allowed (then
-    /// a warning); unreadable is a failed query unless allowed (then a
-    /// warning), as at startup.
+    /// round: on is a warning `KERNEL_FORWARDING_ENABLED` (not fatal while
+    /// attached); unreadable is a failed query unless allowed (then a
+    /// warning `FORWARDING_UNVERIFIABLE`), as at startup.
     pub fn on_forwarding(
         &mut self,
         index: usize,
@@ -656,19 +688,31 @@ impl PortWatch {
         }
     }
 
+    /// Kernel IPv4 addresses on the port while attached: a counted warning
+    /// that recovers when they are gone, never fatal. While XDP is
+    /// attached the kernel sees none of the port's frames, so an address
+    /// changes nothing until the router detaches, and exiting would be
+    /// exactly what detaches it. The next startup refuses it as before.
     fn addresses(&mut self, result: Result<u32, NetlinkError>, emit: &mut impl FnMut(WatchEvent)) {
         match result {
             Ok(count) => {
                 self.probe_ok(Query::Addresses, emit);
-                if count != 0 {
-                    self.counters.kernel_ipv4_addresses = count;
-                    self.fatal(Fatal::KernelIpv4Addresses, emit);
+                self.counters.kernel_ipv4_addresses = count;
+                if count != 0 && !self.addresses_warned {
+                    self.addresses_warned = true;
+                    self.warn(Condition::KernelIpv4Addresses, emit);
+                } else if count == 0 && std::mem::take(&mut self.addresses_warned) {
+                    self.recover(Condition::KernelIpv4Addresses, emit);
                 }
             }
             Err(_) => self.probe_failed(Query::Addresses, emit),
         }
     }
 
+    /// Kernel forwarding turned on while attached: a counted warning, not
+    /// fatal, for the same reason as [`Self::addresses`]. An unreadable
+    /// sysctl is a failed query (lost observability) unless
+    /// `--allow-kernel-forwarding`, which only warns, as at startup.
     fn forwarding(
         &mut self,
         result: Result<Forwarding, ()>,
@@ -678,23 +722,22 @@ impl PortWatch {
         match result {
             Ok(forwarding) => {
                 self.probe_ok(Query::Forwarding, emit);
+                if std::mem::take(&mut self.forwarding_unreadable_warned) {
+                    self.recover(Condition::ForwardingUnverifiable, emit);
+                }
                 let on = forwarding.global || forwarding.device;
                 self.counters.kernel_forwarding = on;
-                if on && !allowed {
-                    self.fatal(Fatal::KernelForwardingEnabled, emit);
-                } else if on && !self.forwarding_warned {
+                if on && !self.forwarding_warned {
                     self.forwarding_warned = true;
-                    self.warn(Condition::KernelForwarding, emit);
+                    self.warn(Condition::KernelForwardingEnabled, emit);
                 } else if !on && std::mem::take(&mut self.forwarding_warned) {
-                    self.recover(Condition::KernelForwarding, emit);
+                    self.recover(Condition::KernelForwardingEnabled, emit);
                 }
             }
-            // With the override an unreadable sysctl only warns, as at
-            // startup.
             Err(()) if allowed => {
-                if !self.forwarding_warned {
-                    self.forwarding_warned = true;
-                    self.warn(Condition::KernelForwarding, emit);
+                if !self.forwarding_unreadable_warned {
+                    self.forwarding_unreadable_warned = true;
+                    self.warn(Condition::ForwardingUnverifiable, emit);
                 }
             }
             Err(()) => self.probe_failed(Query::Forwarding, emit),

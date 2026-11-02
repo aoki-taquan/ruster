@@ -405,16 +405,29 @@ const OFF: Result<Forwarding, ()> = Ok(Forwarding {
     device: false,
 });
 
+/// While attached, a kernel address on a port changes nothing (XDP takes
+/// every frame), so it warns, is counted, and recovers; exiting would be
+/// what exposes it.
 #[test]
-fn kernel_addresses_on_a_port_are_fatal() {
+fn kernel_addresses_on_a_port_warn_while_attached() {
     let mut watch = fresh();
     assert!(round(&mut watch, up(1500), Ok(0), OFF).is_empty());
     assert_eq!(
         round(&mut watch, up(1500), Ok(2), OFF),
-        [fatal(Fatal::KernelIpv4Addresses)]
+        [warning(Condition::KernelIpv4Addresses)]
     );
+    assert!(round(&mut watch, up(1500), Ok(2), OFF).is_empty(), "once");
+    assert!(watch.warning());
+    assert_eq!(watch.kernel_exposure(), (false, true));
     let (_, health) = watch.health().next().expect("port");
     assert_eq!(health.kernel_ipv4_addresses, 2);
+    assert_eq!(health.warnings, 1);
+    assert_eq!(
+        round(&mut watch, up(1500), Ok(0), OFF),
+        [recovered(Condition::KernelIpv4Addresses)]
+    );
+    assert!(!watch.warning());
+    assert_eq!(watch.kernel_exposure(), (false, false));
 }
 
 /// A link query that succeeds every round must not reset the failure
@@ -460,36 +473,40 @@ fn an_address_dump_failing_every_round_is_fatal_despite_link_success() {
     );
 }
 
+/// Forwarding turned on while attached warns (with or without the
+/// override) and recovers; an unreadable sysctl is a failed query without
+/// the override and only a warning with it.
 #[test]
-fn kernel_forwarding_at_run_time_is_fatal_unless_allowed() {
+fn kernel_forwarding_at_run_time_warns_while_attached() {
     for (global, device) in [(true, false), (false, true), (true, true)] {
         let on = Ok(Forwarding { global, device });
-        let mut watch = watch();
-        assert_eq!(
-            round(&mut watch, up(1500), Ok(0), on),
-            [fatal(Fatal::KernelForwardingEnabled)]
-        );
-        // With the override: a warning, recovered when it is off again.
-        let mut allowed = watch_allowing();
-        assert_eq!(
-            round(&mut allowed, up(1500), Ok(0), on),
-            [warning(Condition::KernelForwarding)]
-        );
-        assert!(round(&mut allowed, up(1500), Ok(0), on).is_empty());
-        let (_, health) = allowed.health().next().expect("port");
-        assert!(health.kernel_forwarding);
-        assert_eq!(
-            round(&mut allowed, up(1500), Ok(0), OFF),
-            [recovered(Condition::KernelForwarding)]
-        );
+        for mut watch in [fresh(), watch_allowing()] {
+            assert_eq!(
+                round(&mut watch, up(1500), Ok(0), on),
+                [warning(Condition::KernelForwardingEnabled)]
+            );
+            assert!(round(&mut watch, up(1500), Ok(0), on).is_empty());
+            assert!(watch.warning());
+            assert_eq!(watch.kernel_exposure(), (true, false));
+            let (_, health) = watch.health().next().expect("port");
+            assert!(health.kernel_forwarding);
+            assert_eq!(
+                round(&mut watch, up(1500), Ok(0), OFF),
+                [recovered(Condition::KernelForwardingEnabled)]
+            );
+            assert!(!watch.warning());
+        }
     }
-    // With the override an unreadable sysctl only warns, never fatal.
     let mut allowed = watch_allowing();
     let mut events = Vec::new();
     for _ in 0..10 {
         events.extend(round(&mut allowed, up(1500), Ok(0), Err(())));
     }
-    assert_eq!(events, [warning(Condition::KernelForwarding)]);
+    assert_eq!(events, [warning(Condition::ForwardingUnverifiable)]);
+    assert_eq!(
+        round(&mut allowed, up(1500), Ok(0), OFF),
+        [recovered(Condition::ForwardingUnverifiable)]
+    );
 }
 
 fn fresh() -> Watch {
