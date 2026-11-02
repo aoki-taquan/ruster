@@ -2086,6 +2086,7 @@ mod tcp_tests {
                 last_activity_ms: 3,
                 expires_ms: 3 + NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
                 link: TcpMappingLink::default(),
+                host_expires_ms: 0,
             };
             let occupied_session = Nat44TcpSessionSlot {
                 occupied: true,
@@ -3045,9 +3046,10 @@ impl Nat44UdpPolicy {
     /// this is the number of external ports per internal host. Existing
     /// mappings, their refreshes, and new peers on them are unaffected.
     /// When the address holds `limit` mappings and the one that expires
-    /// first has expired, the new mapping reuses that mapping's slot and
-    /// public port instead, so expiry frees quota without a scan or a
-    /// timer. The default `0` is no limit (RFC 6888 asks only that a
+    /// first has expired, the new mapping takes over that mapping's slot
+    /// (its public port comes from the normal selection), so the host can
+    /// make a new mapping again as soon as one of its mappings expires,
+    /// with no scan or timer. The default `0` is no limit (RFC 6888 asks only that a
     /// limit be supported). A nonzero limit needs per-host storage
     /// ([`Nat44HostStorage`]); the runtime refuses to start or reconcile to
     /// one without it.
@@ -4643,26 +4645,37 @@ impl<'a> Nat44UdpRuntime<'a> {
             return Err(Nat44UdpPlanError::PeerFull);
         };
         let previous = exact_mapping.map(|(_, mapping)| mapping);
-        let port = if let Some(reclaimed) = quota_reclaim {
-            // At the per-host limit the host's own expired mapping gives up
-            // its public port; no other host's slot or port is touched.
-            self.select_port(self.mappings[reclaimed].public_port, now_ms)?
-                .filter(|selection| selection.displaced_mapping_index == Some(reclaimed))
-                .ok_or(Nat44UdpPlanError::IndexCorrupt)?
-        } else {
-            let Some(port) =
-                self.allocate_port(internal_address, internal_port, previous, now_ms)?
-            else {
-                return Err(Nat44UdpPlanError::PortExhausted);
-            };
-            port
+        let port = match (quota_reclaim, exact_mapping) {
+            // A returning endpoint whose own mapping was retired keeps that
+            // slot; the host's reclaimed mapping gives up its port.
+            (Some(reclaimed), Some(_)) => self.reclaimed_port(reclaimed)?,
+            // At the per-host limit the host's reclaimed slot gets a port by
+            // the normal selection (N2 steps 1, 3, 4; another host's expired
+            // mapping whose port it takes is retired), its own port if
+            // every other one is live.
+            (Some(reclaimed), None) => {
+                match self.allocate_port(internal_address, internal_port, None, now_ms)? {
+                    Some(port) => port,
+                    None => self.reclaimed_port(reclaimed)?,
+                }
+            }
+            (None, _) => {
+                let Some(port) =
+                    self.allocate_port(internal_address, internal_port, previous, now_ms)?
+                else {
+                    return Err(Nat44UdpPlanError::PortExhausted);
+                };
+                port
+            }
         };
         // A new endpoint that takes the port of an expired mapping (port
         // preservation or a keyed takeover probe) recreates that mapping's
         // slot rather than the list head's, so no other port is released
         // in expiry order for the next new mapping to take (N2, NAT44-020).
-        let mapping_index = match (exact_mapping, port.displaced_mapping_index) {
-            (None, Some(displaced)) => displaced,
+        // A quota reclaim keeps the reclaimed slot so the host's count
+        // stays exact.
+        let mapping_index = match (exact_mapping, quota_reclaim, port.displaced_mapping_index) {
+            (None, None, Some(displaced)) => displaced,
             _ => mapping_index,
         };
         // The commit recomputes the host slot from the same state; planning
@@ -4720,7 +4733,7 @@ impl<'a> Nat44UdpRuntime<'a> {
     /// whose host slot is `host` (N3, NAT44-092), O(1): `Ok(None)` when the
     /// mapping may be created as usual, `Ok(Some(slot))` when the address
     /// holds the limit and its longest-idle mapping `slot` has expired (the
-    /// new mapping reclaims that slot and its port), and
+    /// new mapping takes over that slot), and
     /// `HostQuotaExceeded` when it holds the limit of live mappings.
     ///
     /// Recreating the endpoint's own expired, still-counted mapping in place
@@ -4753,8 +4766,25 @@ impl<'a> Nat44UdpRuntime<'a> {
         Ok(Some(head))
     }
 
+    /// The port the reclaimed mapping in slot `reclaimed` owns, as a
+    /// selection that moves it (N3).
+    fn reclaimed_port(&self, reclaimed: usize) -> Result<Nat44UdpPortSelection, Nat44UdpPlanError> {
+        let port = self.mappings[reclaimed].public_port;
+        let owner = self
+            .port_owners
+            .owner(port)
+            .map_err(|_| Nat44UdpPlanError::IndexCorrupt)?
+            .filter(|owner| owner.state_index() == reclaimed)
+            .ok_or(Nat44UdpPlanError::IndexCorrupt)?;
+        Ok(Nat44UdpPortSelection {
+            port,
+            expected_owner: Some(owner),
+            displaced_mapping_index: Some(reclaimed),
+        })
+    }
+
     /// The host slot of a new mapping for `address` that overwrites mapping
-    /// slot `mapping_index` (N3), from the current state: the plan checks
+    /// slot `mapping_index` (N3) from the current state: the plan checks
     /// it, the revalidation checks it again, and the commit recomputes it
     /// before mutating anything, so all three agree.
     fn host_assignment(
@@ -4792,13 +4822,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         now_ms: u64,
         hairpin: bool,
     ) -> Result<(), Nat44UdpCommitError> {
-        let peer_source = self.revalidate_outbound_commit(plan, now_ms)?;
-        let host_assignment = if plan.mapping_created {
-            self.host_assignment(plan.mapping_index(), plan.mapping.internal_address)
-                .expect("revalidated host assignment")
-        } else {
-            None
-        };
+        let (peer_source, host_assignment) = self.revalidate_outbound_commit(plan, now_ms)?;
         let prepared = plan.prepared;
         if let Some(mutation) = prepared.mapping {
             self.apply_mapping_directory_mutation(mutation);
@@ -5280,12 +5304,14 @@ impl<'a> Nat44UdpRuntime<'a> {
     }
 
     /// Checks that `plan` still applies to exactly the current state and
-    /// returns where its new peer slot comes from, before anything mutates.
+    /// returns where its new peer slot comes from and the host slot of a
+    /// new mapping (N3), before anything mutates.
+    #[allow(clippy::type_complexity)]
     fn revalidate_outbound_commit(
         &self,
         plan: Nat44UdpOutboundPlan,
         now_ms: u64,
-    ) -> Result<Option<UdpPeerSource>, Nat44UdpCommitError> {
+    ) -> Result<(Option<UdpPeerSource>, Option<HostAssignment>), Nat44UdpCommitError> {
         if plan.expected_runtime_epoch != self.runtime_epoch {
             return Err(Nat44UdpCommitError::RuntimeEpochChanged);
         }
@@ -5319,19 +5345,20 @@ impl<'a> Nat44UdpRuntime<'a> {
         {
             return Err(Nat44UdpCommitError::IndexCorrupt);
         }
-        if plan.mapping_created
-            && self
-                .host_assignment(plan.mapping_index(), plan.mapping.internal_address)
-                .is_err()
-        {
-            return Err(Nat44UdpCommitError::IndexCorrupt);
-        }
-        plan.peer_index()
+        let host = if plan.mapping_created {
+            self.host_assignment(plan.mapping_index(), plan.mapping.internal_address)
+                .map_err(|_| Nat44UdpCommitError::IndexCorrupt)?
+        } else {
+            None
+        };
+        let peer_source = plan
+            .peer_index()
             .map(|index| {
                 self.planned_peer_source(index, now_ms)
                     .ok_or(Nat44UdpCommitError::IndexCorrupt)
             })
-            .transpose()
+            .transpose()?;
+        Ok((peer_source, host))
     }
 
     /// Takes peer slot `index` off its source; O(1).
@@ -6602,15 +6629,19 @@ impl Nat44TcpPolicy {
 
     /// Limits the mappings one internal IPv4 address may hold (N3,
     /// NAT44-092, RFC 6888 REQ-4): with a nonzero `limit`, a new mapping
-    /// for an internal address that already holds `limit` live mappings is
-    /// refused fail closed (`NAT44_TCP_HOST_QUOTA_EXCEEDED`) without
+    /// for an internal address that already holds `limit` mappings it keeps
+    /// alive is refused fail closed (`NAT44_TCP_HOST_QUOTA_EXCEEDED`) without
     /// evicting anything. Each counted mapping owns one public port, so
     /// this is the number of external ports per internal host. Existing
     /// mappings, their refreshes, and new sessions on them are unaffected.
-    /// When the address holds `limit` mappings and the one that expires
-    /// first has expired, the new mapping reuses that mapping's slot and
-    /// public port instead, so expiry frees quota without a scan or a
-    /// timer. The default `0` is no limit (RFC 6888 asks only that a
+    /// A TCP mapping counts as live for this limit only until its
+    /// host-driven expiry: segments the host sends on its own
+    /// outbound-initiated or established sessions refresh it, remote
+    /// activity alone does not, so a remote cannot keep a host at its
+    /// limit. When the address holds `limit` mappings and one is past its
+    /// host-driven expiry, the new mapping takes over that mapping's slot
+    /// (ending any sessions only remotes still kept alive; the public port
+    /// comes from the normal selection). The default `0` is no limit (RFC 6888 asks only that a
     /// limit be supported). A nonzero limit needs per-host storage
     /// ([`Nat44HostStorage`]); the runtime refuses to start or reconcile to
     /// one without it.
@@ -6882,6 +6913,13 @@ pub struct Nat44TcpMappingSlot {
     /// its sessions, and may even be live with none left.
     expires_ms: u64,
     link: TcpMappingLink,
+    /// Host-driven expiry (N3): like `expires_ms`, but advanced only by
+    /// segments the inside host sends on its own outbound-initiated
+    /// sessions or on established sessions, so inbound-only activity (a
+    /// remote that keeps sending SYNs to the public port) cannot keep the
+    /// mapping counting against the host's mapping quota. Never later than
+    /// `expires_ms`; it orders the host's quota lists.
+    host_expires_ms: u64,
 }
 
 impl Linked for Nat44TcpMappingSlot {
@@ -6921,6 +6959,7 @@ impl Default for Nat44TcpMappingSlot {
             last_activity_ms: 0,
             expires_ms: 0,
             link: TcpMappingLink::default(),
+            host_expires_ms: 0,
         }
     }
 }
@@ -8258,26 +8297,37 @@ impl<'a> Nat44TcpRuntime<'a> {
             return Err(Nat44TcpPlanError::SessionFull);
         };
         let previous = exact_mapping.map(|(_, mapping)| mapping);
-        let port = if let Some(reclaimed) = quota_reclaim {
-            // At the per-host limit the host's own expired mapping gives up
-            // its public port; no other host's slot or port is touched.
-            self.select_port(self.mappings[reclaimed].public_port, now_ms)?
-                .filter(|selection| selection.displaced_mapping_index == Some(reclaimed))
-                .ok_or(Nat44TcpPlanError::IndexCorrupt)?
-        } else {
-            let Some(port) =
-                self.allocate_port(internal_address, internal_port, previous, now_ms)?
-            else {
-                return Err(Nat44TcpPlanError::PortExhausted);
-            };
-            port
+        let port = match (quota_reclaim, exact_mapping) {
+            // A returning endpoint whose own mapping was retired keeps that
+            // slot; the host's reclaimed mapping gives up its port.
+            (Some(reclaimed), Some(_)) => self.reclaimed_port(reclaimed)?,
+            // At the per-host limit the host's reclaimed slot gets a port by
+            // the normal selection (N2 steps 1, 3, 4; another host's expired
+            // mapping whose port it takes is retired), its own port if
+            // every other one is live.
+            (Some(reclaimed), None) => {
+                match self.allocate_port(internal_address, internal_port, None, now_ms)? {
+                    Some(port) => port,
+                    None => self.reclaimed_port(reclaimed)?,
+                }
+            }
+            (None, _) => {
+                let Some(port) =
+                    self.allocate_port(internal_address, internal_port, previous, now_ms)?
+                else {
+                    return Err(Nat44TcpPlanError::PortExhausted);
+                };
+                port
+            }
         };
         // A new endpoint that takes the port of an expired mapping (port
         // preservation or a keyed takeover probe) recreates that mapping's
         // slot rather than the list head's, so no other port is released
         // in expiry order for the next new mapping to take (N2, NAT44-020).
-        let mapping_index = match (exact_mapping, port.displaced_mapping_index) {
-            (None, Some(displaced)) => displaced,
+        // A quota reclaim keeps the reclaimed slot so the host's count
+        // stays exact.
+        let mapping_index = match (exact_mapping, quota_reclaim, port.displaced_mapping_index) {
+            (None, None, Some(displaced)) => displaced,
             _ => mapping_index,
         };
         if self.next_generation == 0 || self.next_generation == u64::MAX {
@@ -8310,6 +8360,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             last_activity_ms: now_ms,
             expires_ms: 0,
             link: TcpMappingLink::default(),
+            host_expires_ms: 0,
         };
         let mut session = Nat44TcpSessionSlot::new_for(
             mapping_index,
@@ -8351,9 +8402,15 @@ impl<'a> Nat44TcpRuntime<'a> {
 
     /// The per-host quota check of a new mapping for the internal address
     /// whose host slot is `host` (N3, NAT44-092), O(1); see the UDP
-    /// runtime's. The host has one list per mapping activity list, each in
-    /// expiry order, so the host has an expired mapping exactly when one of
-    /// the two heads has expired; the one that expired first is reclaimed.
+    /// runtime's. TCP counts host-driven liveness
+    /// ([`Nat44TcpMappingSlot::host_expires_ms`]): the host has two lists
+    /// (established and transitory TTL), each in host-driven expiry order,
+    /// so the host has a mapping past its host-driven expiry exactly when
+    /// one of the two heads is; the one that passed first is reclaimed,
+    /// even if remotes still keep it live (its sessions end with it). A
+    /// returning endpoint whose own mapping was retired keeps that slot,
+    /// so the reclaimed mapping only gives up its port and must have
+    /// expired outright: a mapping is never retired while live.
     fn host_quota_reclaim(
         &self,
         exact_mapping: Option<(usize, Nat44TcpMappingSlot)>,
@@ -8370,19 +8427,40 @@ impl<'a> Nat44TcpRuntime<'a> {
         {
             return Ok(None);
         }
+        let retired_return = exact_mapping.is_some();
         let expired = (0..2)
             .filter_map(|list| self.hosts.head(host, list))
             .map(|head| (head, self.mappings[head]))
-            .filter(|(_, mapping)| !self.mapping_is_live(*mapping, now_ms))
-            .min_by_key(|(_, mapping)| mapping.expires_ms)
+            .filter(|(_, mapping)| {
+                !self.mapping_is_host_live(*mapping, now_ms)
+                    && !(retired_return && self.mapping_is_live(*mapping, now_ms))
+            })
+            .min_by_key(|(_, mapping)| mapping.host_expires_ms)
             .map(|(head, _)| head);
         expired
             .map(Some)
             .ok_or(Nat44TcpPlanError::HostQuotaExceeded)
     }
 
+    /// The port the reclaimed mapping in slot `reclaimed` owns, as a
+    /// selection that moves it (N3).
+    fn reclaimed_port(&self, reclaimed: usize) -> Result<Nat44TcpPortSelection, Nat44TcpPlanError> {
+        let port = self.mappings[reclaimed].public_port;
+        let owner = self
+            .port_owners
+            .owner(port)
+            .map_err(|_| Nat44TcpPlanError::IndexCorrupt)?
+            .filter(|owner| owner.state_index() == reclaimed)
+            .ok_or(Nat44TcpPlanError::IndexCorrupt)?;
+        Ok(Nat44TcpPortSelection {
+            port,
+            expected_owner: Some(owner),
+            displaced_mapping_index: Some(reclaimed),
+        })
+    }
+
     /// The host slot of a new mapping for `address` that overwrites mapping
-    /// slot `mapping_index` (N3), from the current state: the plan checks
+    /// slot `mapping_index` (N3) from the current state: the plan checks
     /// it, the revalidation checks it again, and the commit recomputes it
     /// before mutating anything, so all three agree.
     fn host_assignment(
@@ -8911,7 +8989,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                 plan.mapping_index(),
                 host_assignment,
                 plan.mapping.internal_address,
-                Self::host_list(plan.mapping.link.list),
+                self.host_list_at(plan.mapping.host_expires_ms, now_ms),
             );
         }
         self.write_session_slot(plan.session_index(), plan.session);
@@ -9199,9 +9277,16 @@ impl<'a> Nat44TcpRuntime<'a> {
             self.reuse_lists
                 .mapping_list_mut(list)
                 .push_back(self.mappings, index);
-            // A counted mapping follows its activity list on its host's
-            // lists (a new mapping is attached by the caller).
-            self.hosts.relist(index, Self::host_list(list));
+        }
+        // A counted mapping whose host-driven expiry changed moves to the
+        // tail of the host list of its new value (a new mapping is attached
+        // by the caller; its host link is empty here).
+        if before.occupied
+            && before.generation == mapping.generation
+            && before.host_expires_ms != mapping.host_expires_ms
+        {
+            let list = self.host_list_at(mapping.host_expires_ms, mapping.last_activity_ms);
+            self.hosts.relist(index, list);
         }
         self.mapping_occupancy
             .transition(before.occupied, mapping.occupied);
@@ -9300,20 +9385,52 @@ impl<'a> Nat44TcpRuntime<'a> {
             .ok_or(Nat44TcpPlanError::IndexCorrupt)?
             + u32::from(established);
         mapping.last_activity_ms = now_ms;
-        if established {
-            mapping.expires_ms = now_ms.saturating_add(policy.idle_ttl_ms);
-            mapping.link.list = TcpMappingList::Established;
-            return Ok(());
-        }
+        let established_expiry = now_ms.saturating_add(policy.idle_ttl_ms);
         let transitory = now_ms.saturating_add(policy.transitory_bound_ms());
-        let keep_established = mapping.established_sessions != 0
-            && mapping.link.list == TcpMappingList::Established
-            && mapping.expires_ms > transitory;
-        if !keep_established {
-            mapping.expires_ms = transitory;
-            mapping.link.list = TcpMappingList::Transitory;
+        if established {
+            mapping.expires_ms = established_expiry;
+            mapping.link.list = TcpMappingList::Established;
+        } else {
+            let keep_established = mapping.established_sessions != 0
+                && mapping.link.list == TcpMappingList::Established
+                && mapping.expires_ms > transitory;
+            if !keep_established {
+                mapping.expires_ms = transitory;
+                mapping.link.list = TcpMappingList::Transitory;
+            }
         }
+        // Host-driven expiry (N3): the same rule, applied only to segments
+        // the inside host sends on its own outbound-initiated sessions or
+        // on established ones. A value above `transitory` can only come
+        // from an established refresh (time is monotonic), so it plays the
+        // role of the established list. It is capped by `expires_ms`, so
+        // it never outlives the mapping, and every change sets it to `now`
+        // plus one of the two TTLs, keeping the host lists in order.
+        let host_driven =
+            direction == Nat44TcpDirection::Outbound && (!session.external_inbound || established);
+        if host_driven {
+            if established {
+                mapping.host_expires_ms = established_expiry;
+            } else if mapping.established_sessions == 0 || mapping.host_expires_ms <= transitory {
+                mapping.host_expires_ms = transitory;
+            }
+        }
+        mapping.host_expires_ms = mapping.host_expires_ms.min(mapping.expires_ms);
         Ok(())
+    }
+
+    /// The host list a TCP mapping with host-driven expiry `host_expires_ms`
+    /// set at `now_ms` belongs on (N3): the established-TTL list or the
+    /// transitory-TTL list, each in expiry order.
+    fn host_list_at(&self, host_expires_ms: u64, now_ms: u64) -> usize {
+        usize::from(host_expires_ms != now_ms.saturating_add(self.config.policy.idle_ttl_ms))
+    }
+
+    /// Whether `mapping` still counts as kept alive by its inside host
+    /// (N3): before its host-driven expiry. A live mapping may be past it
+    /// when only remotes kept it alive.
+    fn mapping_is_host_live(&self, mapping: Nat44TcpMappingSlot, now_ms: u64) -> bool {
+        mapping.occupied && now_ms >= mapping.last_activity_ms && now_ms < mapping.host_expires_ms
     }
 
     /// Release-build cross-check of a commit that reclaims an expired
@@ -10218,27 +10335,29 @@ impl<'a> Nat44TcpRuntime<'a> {
         if !self.reuse_lists_are_consistent() {
             return Err(Nat44TcpIndexInvariantError::ReuseLists);
         }
+        // The host-driven expiry never outlives the mapping (N3), and a
+        // counted mapping is on the host list of its host-driven expiry,
+        // in that order.
+        if self
+            .mappings
+            .iter()
+            .any(|mapping| mapping.occupied && mapping.host_expires_ms > mapping.expires_ms)
+        {
+            return Err(Nat44TcpIndexInvariantError::Hosts);
+        }
         if !self.hosts.validate(key, self.mappings.len(), |index| {
             let mapping = self.mappings[index];
             (mapping.occupied && mapping.port_owned).then(|| {
                 (
                     mapping.internal_address,
-                    Self::host_list(mapping.link.list),
-                    mapping.expires_ms,
+                    self.hosts.mapping_list(index).unwrap_or(usize::MAX),
+                    mapping.host_expires_ms,
                 )
             })
         }) {
             return Err(Nat44TcpIndexInvariantError::Hosts);
         }
         Ok(())
-    }
-
-    /// The host list that mirrors mapping activity list `list` (N3).
-    fn host_list(list: TcpMappingList) -> usize {
-        match list {
-            TcpMappingList::Transitory => 1,
-            TcpMappingList::Established | TcpMappingList::Retired | TcpMappingList::Free => 0,
-        }
     }
 
     /// Exact O(M + S) check of the reuse sets (validation only): the fresh
@@ -10751,6 +10870,7 @@ mod tests {
             last_activity_ms: 88,
             expires_ms: POISON_U64,
             link: TcpMappingLink::default(),
+            host_expires_ms: 0,
         };
         let mut tcp_mapping_hidden = tcp_mapping;
         tcp_mapping_hidden.generation -= 1;

@@ -209,6 +209,9 @@ pub(crate) struct HostTable<'a, const LISTS: usize> {
     empty: SlotList,
     #[cfg(test)]
     lookup_probes: std::cell::Cell<usize>,
+    /// Keyed lookups made (tests: none without accounting).
+    #[cfg(test)]
+    finds: std::cell::Cell<usize>,
 }
 
 impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
@@ -252,6 +255,8 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
             empty: SlotList::EMPTY,
             #[cfg(test)]
             lookup_probes: std::cell::Cell::new(0),
+            #[cfg(test)]
+            finds: std::cell::Cell::new(0),
         })
     }
 
@@ -292,6 +297,11 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
     /// The host slot of `address`, if it has one: one keyed directory
     /// lookup (none without accounting).
     pub(crate) fn find(&self, address: Ipv4Address) -> Result<Option<usize>, HostTableCorrupt> {
+        if !self.enabled() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        self.finds.set(self.finds.get() + 1);
         let probe = self
             .directory
             .lookup(self.domain, &Self::words(address), |index| {
@@ -326,6 +336,19 @@ impl<'a, const LISTS: usize> HostTable<'a, LISTS> {
     pub(crate) fn mapping_host(&self, index: usize) -> Option<usize> {
         let tag = self.links.get(index)?.tag;
         (tag != LINK_NONE).then_some(tag as usize / LISTS)
+    }
+
+    /// The host list mapping `index` is on, if it counts (validation).
+    #[cfg(test)]
+    pub(crate) fn mapping_list(&self, index: usize) -> Option<usize> {
+        let tag = self.links.get(index)?.tag;
+        (tag != LINK_NONE).then_some(tag as usize % LISTS)
+    }
+
+    /// Keyed host lookups made so far (tests).
+    #[cfg(test)]
+    pub(crate) fn finds(&self) -> usize {
+        self.finds.get()
     }
 
     /// The host slot that loses its last counted mapping when the mapping

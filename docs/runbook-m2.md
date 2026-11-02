@@ -1438,29 +1438,56 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   (counters `nat44_udp.host_quota_exceeded`,
   `nat44_tcp.host_quota_exceeded`); nothing is evicted, and its existing
   mappings, their new peers or sessions, and inbound traffic are
-  unaffected. It recovers by itself: once one of its mappings has expired
-  (UDP idle TTL; TCP the phase TTL of its last session, 4 minutes for a
-  closed or half-open connection), the next new mapping reuses that
-  mapping's slot and public port, never another host's. Sizing: the limit
-  counts public ports per host, so `pool size / expected inside hosts`
-  keeps every host able to get a port (for example 65535 / 64 hosts is
-  about 1024); a limit of a few hundred to a few thousand still serves
-  browsers, games, and P2P clients, while a host that opens tens of
-  thousands of flows is the one refused. Watch the counters: a steadily
-  rising count on a well-behaved host means the limit is too low.
-  Enabling it allocates per-host storage sized from `capacity.mappings`
-  (64 bytes per UDP mapping slot and 76 per TCP slot at a power-of-two
-  capacity, 9175040 bytes for both
-  at 65536 slots; it still fits the 64 MiB production bound), so changing
-  between `0` and a limit is restart-required (`STORAGE_SHAPE`); changing
-  one limit to another is reloadable (`ruster plan` shows
-  `nat44-udp mappings-per-host ~ 64 -> 128`; the apply flushes the NAT
-  state like every NAT change). Limits: the limit is per inside IPv4
-  address, so a host that can spoof source addresses on the LAN gets a
-  quota per spoofed address (there is no inside source-address
-  validation); keep untrusted hosts on a segment you can filter, and still
-  size the pool and the mapping capacity for the inside hosts. No ICMP is
-  sent for a refusal, and there is no per-host usage report (NAT44-096).
+  unaffected. For TCP, "live" here means kept alive by the host itself:
+  only segments the host sends on connections it opened, or on
+  established connections, refresh a mapping for the quota (with the same
+  phase TTLs as the mapping), so a remote that keeps sending SYNs to the
+  host's public ports cannot keep the host at its limit. It recovers by
+  itself: once one of its mappings has expired (UDP idle TTL; TCP the
+  phase TTL of the host's last segment, 4 minutes for a closed or
+  half-open connection), the next new mapping takes over that mapping's
+  slot, never another host's slot, and gets its public port by the normal
+  selection (preservation, keyed start, keyed takeover). A TCP mapping
+  that only remotes kept alive ends with its sessions when it is taken
+  over; an inside server that answers its inbound connections keeps its
+  mapping. Sizing: decide up front, because switching between `0` and a
+  limit needs a restart (it adds or drops per-host storage), while
+  changing one limit to another is a reload. The limit counts public
+  ports per host, so `pool size / expected inside hosts` keeps every host
+  able to get a port (for example 65535 / 64 hosts is about 1024); a limit
+  of a few hundred to a few thousand still serves browsers, games, and P2P
+  clients, while a host that opens tens of thousands of flows is the one
+  refused. If unsure, enable it with a generous value (for example 4096)
+  and lower it by reload. Watch the counters: a steadily rising count on a
+  well-behaved host means the limit is too low. Enabling it allocates
+  per-host storage sized from `capacity.mappings` (64 bytes per UDP
+  mapping slot and 76 per TCP slot at a power-of-two capacity, 9175040
+  bytes for both at 65536 slots; it still fits the 64 MiB production
+  bound), so changing between `0` and a limit is restart-required
+  (`STORAGE_SHAPE`); changing one limit to another is reloadable (`ruster
+  plan` shows `nat44-udp mappings-per-host ~ 64 -> 128`; the apply flushes
+  the NAT state like every NAT change). Limits:
+  - The quota covers mappings (public ports) only. Per-host UDP peers and
+    TCP sessions are not limited (RFC 6888 REQ-5 is deferred), so one host
+    can still fill the `peers` or `sessions` table with many remotes on
+    its few mappings, even with the quota on (NAT44-096). Size those
+    tables with headroom and use the firewall against untrusted hosts.
+  - The limit is per inside IPv4 address. The router's reverse-path check
+    accepts an inside source only if its address routes back out of the
+    inside interface, so spoofing is bounded to the inside-routed
+    prefixes, but there is no ARP or MAC binding: a LAN host can still use
+    any address in those prefixes and get a quota per address. Keep the
+    inside routes tight (the connected LAN prefix rather than a broad
+    route). A LAN host spoofing a chosen victim's address can also use up
+    that victim's quota and lock it out, which is the same residual.
+  - A returning TCP endpoint whose own mapping was taken over (retired)
+    while the host is at its limit can reuse only an outright expired
+    mapping of the host; while the host's only reclaimable mapping is
+    still kept live by a remote, that endpoint is refused (a mapping is
+    never retired while live). Other source ports of the host are not
+    affected.
+  - No ICMP is sent for a refusal, and there is no per-host usage report
+    (NAT44-096).
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)
   and more per packet). Use only release builds (`cargo build --release`)
   in production.

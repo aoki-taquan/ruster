@@ -723,7 +723,9 @@ fn host_at_its_mapping_limit_is_refused_while_another_host_is_served() {
     assert_eq!(&back.bytes[30..34], &HOST.octets());
 
     // A's mapping for 50001 was last refreshed at 0 and expires at the
-    // idle TTL; 50000 was refreshed at 3. From then on A has quota again.
+    // idle TTL; 50000 was refreshed at 3. From then on A has quota again:
+    // the new flow takes over the expired mapping's slot with a newly
+    // selected port, and the expired mapping's old port is gone.
     let ttl = Nat44UdpPolicy::default().idle_ttl_ms();
     io.inject(LAN, refused.clone());
     run(&mut io, &mut nat, ttl - 1);
@@ -732,8 +734,40 @@ fn host_at_its_mapping_limit_is_refused_while_another_host_is_served() {
     run(&mut io, &mut nat, ttl);
     let out = io.pop_tx().unwrap();
     assert_eq!(out.egress, WAN);
-    assert_eq!(public_port(&out.bytes), ports[1]);
+    let new_port = public_port(&out.bytes);
+    assert!((40_000..=40_063).contains(&new_port) && new_port != ports[0]);
     assert_eq!(nat.counters().host_quota_exceeded, 2);
+    let stale = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        53,
+        ports[1],
+        64,
+        0x4000,
+        &[3],
+        &[],
+        UdpChecksum::Valid,
+    );
+    if new_port != ports[1] {
+        io.inject(WAN, stale.clone());
+        run(&mut io, &mut nat, ttl);
+        assert_drop(&mut io, DropReason::Nat44UdpMappingMiss, &stale);
+    }
+    let reply = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        53,
+        new_port,
+        64,
+        0x4000,
+        &[4],
+        &[],
+        UdpChecksum::Valid,
+    );
+    io.inject(WAN, reply);
+    run(&mut io, &mut nat, ttl);
+    let back = io.pop_tx().unwrap();
+    assert_eq!(&back.bytes[36..38], &50_002_u16.to_be_bytes());
 }
 
 #[test]

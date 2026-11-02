@@ -1478,15 +1478,25 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
   作ります。上限なら、戻ってきたendpoint自身のexpired mappingがまだportを持つ場合はその場で
   再生成（countは不変）、それ以外はhost listの先頭（TCPは二つの先頭のうち先にexpiredした方）
   を見ます。liveならhostの全mappingがliveなので`NAT44_{UDP,TCP}_HOST_QUOTA_EXCEEDED`（stateを
-  何も変えずdrop、evictなし）。expiredならそのslotとpublic portを新mappingに使います（exact
-  mappingがretire済みならそのslotを再生成し、先頭のmappingはportを渡してretire）。他hostの
-  slotやport、keyed takeoverには触れないので、上限のhostはpool-fill steering（NAT44-092の
-  元の懸念）に使えません。
+  何も変えずdrop、evictなし）。expiredならそのslotを新mappingが再生成し、portは通常の選択
+  （N2の(1)、(3)、(4)。どれも無ければそのslotの旧port）で決めます。引き継いだslotの旧portは
+  解放され、他hostのexpired mappingのportを取ればそれはretireします（そのhostのcountが減る
+  だけ）。exact mappingがretire済みならそのslotを再生成し、先頭のmappingはportを渡して
+  retireします（その場合だけ旧portを引き継ぐ）。
+- **TCPのhost-driven liveness（review M1、NAT44-097）**: TCP mappingの`expires_ms`はinbound
+  segmentでも進むので、remoteがSYNを送り続けるとhostが全connectionを閉じてもmappingが
+  liveのままでした。quotaはmappingごとの`host_expires_ms`で数えます。hostが自分の開いた
+  sessionかestablished sessionで送るsegmentだけが`expires_ms`と同じ規則で進め、毎commitで
+  `expires_ms`にcapします（`host_expires_ms ≤ expires_ms`）。変わるときは常に`now + TTL`なので、
+  hostのTCP listはestablished TTLとtransitory TTLの2本でhost-driven expiry順です。上限では
+  そのexpiryを過ぎた先頭を引き継ぎ、remoteだけが保っていたsessionはgenerationの不一致で
+  終わります。liveなmappingは決してretireしないので、retire済みendpointが戻る場合だけは
+  outrightにexpiredなmappingが要ります。
 - **不変条件の骨子**: (I1) hostのcount = そのaddressのport所有mapping数（listの長さ）、各
   mappingは高々一つのlist上。(I2) count ≤ limit: commitはcountを高々+1しか増やさず、上限
   到達時は同じcommitで同じhostのmappingを一つ外す。limitの変更はapplyのflushを伴う。
-  (I3) 拒否 ⇔ hostのlive mapping数 ≥ limit: count = limitで先頭（expiryが最も早い）がlive
-  なら全てlive、expiredなら引き継げる。expiryはlazyでも、hostの全mappingがexpiredになった
+  (I3) 拒否 ⇔ hostのlive mapping数（TCPはhost-live）≥ limit: count = limitで先頭（expiryが
+  最も早い）がliveなら全てlive、expiredなら引き継げる。expiryはlazyでも、hostの全mappingがexpiredになった
   瞬間から次のmappingは通ります（timerもsweepも要らない）。
 - **host slotの確保**: host slotはmapping slotと同数あるので不足しません（countを持つhost数 ≤
   port所有mapping数 ≤ mapping slot数）。最後のmappingを失ったhostはdirectoryに残したまま
@@ -1500,10 +1510,12 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
   bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
   非zero同士の変更はreloadable（他のNAT変更と同じくapplyでNAT stateをflush）。planは
   `NatChange::mappings_per_host`のtyped deltaです。
-- **限界**: 上限はaddress単位なので、inside segmentでsource addressを詐称できるhostは詐称
-  addressごとに上限まで作れます（inside側のsource address検証は未実装）。RFC 6888 REQ-11の
+- **限界**（NAT44-096）: 上限はaddress単位です。reverse-path checkがinside sourceをinside-routed
+  prefixに限りますが、ARP/MACとの結び付けは無いので、LAN上のhostはそのprefix内の詐称address
+  ごとに上限まで作れ、victimのaddressを詐称してそのquotaを使い切ることもできます（inside routeは
+  狭く保つ）。hostごとのpeer/sessionは制限しません（RFC 6888 REQ-5）。RFC 6888 REQ-11の
   ICMP Host Unreachableは送らず（他のresource拒否と同じsilent drop）、hostごとの使用数の
-  観測も無い（NAT44-096）。
+  観測もありません。
 
 ### Resolution bounded indexes
 

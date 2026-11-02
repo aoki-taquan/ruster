@@ -112,7 +112,7 @@ fn udp_host_quota_refuses_at_the_limit_without_state_change() {
 
 /// Expiry frees quota with no manual action: one tick before the oldest
 /// mapping of the host expires a new mapping is refused; from its expiry
-/// the new mapping reclaims exactly that slot and public port, not the slot
+/// the new mapping reclaims exactly that slot (with a newly selected port), not the slot
 /// or port of another host's expired mapping (even an older one).
 #[test]
 fn udp_host_quota_recovers_by_reclaiming_the_hosts_own_expired_mapping() {
@@ -132,11 +132,12 @@ fn udp_host_quota_recovers_by_reclaiming_the_hosts_own_expired_mapping() {
         let reclaimed = outbound(&mut runtime, INTERNAL, 1_002, REMOTE1, 100 + TTL).unwrap();
         assert!(reclaimed.mapping_created && reclaimed.mapping_expired);
         assert_eq!(reclaimed.mapping_index(), oldest.mapping_index());
-        assert_eq!(reclaimed.public_port(), oldest.public_port());
-        assert_eq!(
-            reclaimed.displaced_port_mapping_index(),
-            Some(oldest.mapping_index())
-        );
+        // The port comes from the normal selection (N2), not the reclaimed
+        // mapping's: here the keyed search finds a free port, and the
+        // reclaimed mapping's old port is released.
+        assert_ne!(reclaimed.public_port(), oldest.public_port());
+        assert_eq!(reclaimed.displaced_port_mapping_index(), None);
+        assert_eq!(runtime.port_owners.owner(oldest.public_port()), Ok(None));
         // The other host's expired mapping keeps its slot and port.
         let untouched = runtime.mappings[other.mapping_index()];
         assert!(untouched.port_owned && untouched.internal_address == INTERNAL2);
@@ -326,6 +327,8 @@ fn udp_host_quota_flush_unlimited_and_storage_requirement() {
         .unwrap();
         outbound(&mut runtime, INTERNAL, 1_000, REMOTE1, 0).unwrap();
         assert_eq!(runtime.validate_indexes(), Ok(()));
+        // Without per-host storage (limit 0) no host lookup is made at all.
+        assert_eq!(runtime.hosts.finds(), 0);
         let limited = with_port_config(quota_policy(4), 40_000, 40_001, |limited| limited);
         assert_eq!(
             runtime
@@ -494,10 +497,14 @@ fn udp_host_quota_work_is_constant_in_a_full_65536_slot_table() {
         for host in (0..4_095).step_by(97) {
             flow_work(&mut runtime, host, TTL).unwrap();
         }
-        // Reclaiming probes the reclaimed port once; the host lookups are
-        // the plan's and the commit's (twice: revalidation and commit).
+        // Reclaiming selects a port the normal bounded way (every pool port
+        // is owned here, so keyed takeover probes); the host lookups are
+        // the plan's and the commit's.
         assert!(
-            worst[0] <= 4 && worst[1] <= 1 && worst[2] == 0 && worst[3] <= 6,
+            worst[0] <= 4
+                && worst[1] <= 2 + NAT44_PORT_TAKEOVER_PROBES
+                && worst[2] <= 34
+                && worst[3] <= 6,
             "work per new flow {worst:?}"
         );
         assert!(runtime.reuse_lists_are_consistent());
