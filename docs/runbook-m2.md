@@ -55,7 +55,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  36.45 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  51.08 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -187,7 +187,7 @@ what `run` accepts. `sim`, or no `[backend]`, gets the simulator's limits
 (`SIM_VALIDATION_LIMITS`), which is what `run-sim` accepts; `run-sim`
 itself is unchanged. `plan` checks each side with the limits of its own
 backend. A refusal exits 2 with a value-free line such as `stage=validate
-code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.dynamic-neighbors
+code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds
 limit=4096 actual=4097`, or with `stage=validate
 code=RUNTIME_STORAGE_BYTES_EXCEEDED limit=... actual=...` for the
 whole-document storage, which has no path.
@@ -913,10 +913,11 @@ What it proves, on the runner's kernel only:
   frames delivered and the counters adding up; `observer.state` and
   `watch.state` in the stats blocks.
   Added by H3 (marker `priv_run_limits`): a config with every runtime
-  table at its production limit (36.45 MiB of storage) accepted by
-  `validate`; `ruster run` starts it, forwards and translates, and exits 0
-  on SIGTERM; one more dynamic neighbor (4097) refused by `validate` and
-  `run` (exit 2) although accepted as a sim document.
+  table at its production limit (51.08 MiB of storage since H4b)
+  accepted by `validate`; `ruster run` starts it, forwards and
+  translates, and exits 0 on SIGTERM; one more failure hold (4097, a
+  quote table) refused by `validate` and `run` (exit 2) although
+  accepted as a sim document.
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 
