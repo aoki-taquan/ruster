@@ -127,7 +127,10 @@ impl Route {
     }
 }
 
-pub(crate) fn lookup(routes: &[Route], destination: Ipv4Address) -> Option<Route> {
+/// Linear reference longest-prefix match (`max_by_key` keeps the last of
+/// equal lengths). The packet path uses [`crate::ForwardingSnapshot`]'s
+/// owner index when one exists (PERF-002).
+pub(crate) fn lookup_linear(routes: &[Route], destination: Ipv4Address) -> Option<Route> {
     routes
         .iter()
         .copied()
@@ -158,11 +161,13 @@ mod tests {
             Route::new(ip([192, 0, 2, 9]), 32, IfId(2), None).unwrap(),
         ];
         assert_eq!(
-            lookup(&routes, ip([192, 0, 2, 9])).unwrap().egress(),
+            lookup_linear(&routes, ip([192, 0, 2, 9])).unwrap().egress(),
             IfId(2)
         );
         assert_eq!(
-            lookup(&routes, ip([192, 0, 2, 10])).unwrap().egress(),
+            lookup_linear(&routes, ip([192, 0, 2, 10]))
+                .unwrap()
+                .egress(),
             IfId(1)
         );
     }

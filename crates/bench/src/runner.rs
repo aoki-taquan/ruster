@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 
 use ruster_core::{
     forward_batch, internet_checksum, validate_ipv4_frame, ForwardingSnapshot, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, NoTrace, PacketIo, Route,
+    Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, NoTrace, PacketIo,
+    Route, ValidatedForwardingOwner,
 };
 
 use crate::{
@@ -181,8 +182,16 @@ fn run_plain_case(
         interface: LAN,
         address: Ipv4Address::from_octets([192, 0, 2, 1]),
     }];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
-        .expect("benchmark snapshot is valid");
+    // The production path: an owner with publication-time lookup indexes.
+    let owner = ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        neighbors.into(),
+        bindings.into(),
+        Ipv4OriginPolicy::default(),
+    )
+    .expect("benchmark snapshot is valid");
+    let snapshot = owner.snapshot();
 
     warm_plain(
         &mut backend,

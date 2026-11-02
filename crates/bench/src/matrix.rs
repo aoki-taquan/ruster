@@ -9,12 +9,12 @@ use ruster_core::{
     FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
     FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
     FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig, Nat44TcpHashKey,
-    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
+    Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig,
+    Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
     Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpIndexStorage,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
     PacketIo, PortOwnerSlot, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route,
+    ResolutionStateSlot, Route, ValidatedForwardingOwner,
 };
 
 use crate::backend::BenchBatch;
@@ -303,8 +303,16 @@ fn run_plain_control(
 ) -> Result<ResultRow, RunError> {
     let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
-        .expect("benchmark snapshot");
+    // The production path: an owner with publication-time lookup indexes.
+    let owner = ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        neighbors.into(),
+        bindings.into(),
+        Ipv4OriginPolicy::default(),
+    )
+    .expect("benchmark snapshot");
+    let snapshot = owner.snapshot();
     let template = timed_fixture(size, config.seed, case, false);
     let mut backend = BenchBackend::new(batch_size, case.direction.ingress(), &template);
     let row = {
@@ -461,8 +469,16 @@ fn run_nat_case(
 ) -> Result<ResultRow, RunError> {
     let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
-        .expect("benchmark snapshot");
+    // The production path: an owner with publication-time lookup indexes.
+    let owner = ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        neighbors.into(),
+        bindings.into(),
+        Ipv4OriginPolicy::default(),
+    )
+    .expect("benchmark snapshot");
+    let snapshot = owner.snapshot();
     let (udp_config, tcp_config) = nat_configs(&snapshot);
     let mut resolution_states: [ResolutionStateSlot; 0] = [];
     let mut resolution_actions: [ResolutionActionSlot; 0] = [];
@@ -606,8 +622,16 @@ fn run_firewall_case(
 ) -> Result<ResultRow, RunError> {
     let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
-        .expect("benchmark snapshot");
+    // The production path: an owner with publication-time lookup indexes.
+    let owner = ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        neighbors.into(),
+        bindings.into(),
+        Ipv4OriginPolicy::default(),
+    )
+    .expect("benchmark snapshot");
+    let snapshot = owner.snapshot();
     let rules = firewall_rules();
     let firewall_config = firewall_config(&snapshot, &rules);
     let mut firewall_states = [FirewallStateSlot::default(); 4];
@@ -701,8 +725,16 @@ fn run_combined_case(
 ) -> Result<ResultRow, RunError> {
     let config = execution.config;
     let (routes, interfaces, neighbors, bindings) = topology();
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings)
-        .expect("benchmark snapshot");
+    // The production path: an owner with publication-time lookup indexes.
+    let owner = ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        neighbors.into(),
+        bindings.into(),
+        Ipv4OriginPolicy::default(),
+    )
+    .expect("benchmark snapshot");
+    let snapshot = owner.snapshot();
     let (udp_config, tcp_config) = nat_configs(&snapshot);
     let rules = firewall_rules();
     let firewall_config = firewall_config(&snapshot, &rules);

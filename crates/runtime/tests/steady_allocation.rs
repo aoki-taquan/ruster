@@ -266,7 +266,7 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
 
     #[cfg(target_pointer_width = "64")]
     {
-        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 144);
+        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 88);
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
         assert_eq!(size_of::<Nat44TcpConfig>(), 112);

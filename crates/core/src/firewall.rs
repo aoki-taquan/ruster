@@ -448,20 +448,12 @@ pub fn validate_firewall_rules(
             return Err(FirewallConfigError::DuplicateRuleId);
         }
         if let FirewallInterface::Interface(interface) = rule.ingress {
-            if !snapshot
-                .interfaces
-                .iter()
-                .any(|candidate| candidate.id == interface)
-            {
+            if snapshot.interface(interface).is_none() {
                 return Err(FirewallConfigError::IngressInterfaceMissing);
             }
         }
         if let FirewallInterface::Interface(interface) = rule.egress {
-            if !snapshot
-                .interfaces
-                .iter()
-                .any(|candidate| candidate.id == interface)
-            {
+            if snapshot.interface(interface).is_none() {
                 return Err(FirewallConfigError::EgressInterfaceMissing);
             }
         }

@@ -1169,7 +1169,7 @@ impl<'a> RefRuntime<'a> {
 }
 
 fn publication_hold_valid(snapshot: &crate::ForwardingSnapshot<'_>, hold: RefHold) -> bool {
-    crate::route::lookup(snapshot.routes, hold.original_destination).is_some_and(|route| {
+    crate::route::lookup_linear(snapshot.routes, hold.original_destination).is_some_and(|route| {
         route.egress() == hold.forward.egress
             && route.next_hop().is_none()
             && hold.forward.target == hold.original_destination
@@ -1366,7 +1366,7 @@ fn dispatch_one_failure(
     }) {
         return FailureDispatch::AuthorityLost;
     }
-    let forward_route = crate::route::lookup(snapshot.routes, hold.original_destination);
+    let forward_route = crate::route::lookup_linear(snapshot.routes, hold.original_destination);
     if !forward_route.is_some_and(|route| {
         route.egress() == hold.forward.egress
             && route.next_hop().is_none()
@@ -1408,7 +1408,8 @@ fn dispatch_one_failure(
         return FailureDispatch::GenerationDisabled;
     }
 
-    let Some(reverse_route) = crate::route::lookup(snapshot.routes, hold.original_source) else {
+    let Some(reverse_route) = crate::route::lookup_linear(snapshot.routes, hold.original_source)
+    else {
         return FailureDispatch::AuthorityLost;
     };
     let reverse_egress = reverse_route.egress();
@@ -1560,10 +1561,12 @@ fn current_icmp_error_eligible(snapshot: &crate::ForwardingSnapshot<'_>, hold: R
             .local_ipv4
             .iter()
             .any(|binding| binding.address == hold.original_source)
-        && !crate::route::lookup(snapshot.routes, hold.original_source).is_some_and(|route| {
-            route.is_prefix_network_address(hold.original_source)
-                || route.is_prefix_directed_broadcast(hold.original_source)
-        })
+        && !crate::route::lookup_linear(snapshot.routes, hold.original_source).is_some_and(
+            |route| {
+                route.is_prefix_network_address(hold.original_source)
+                    || route.is_prefix_directed_broadcast(hold.original_source)
+            },
+        )
 }
 
 fn host_failure_target_forbidden(

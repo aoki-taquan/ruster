@@ -921,3 +921,148 @@ fn zero_capacity_and_runtime_recreation_are_safe() {
     );
     assert_eq!(rt.dynamic_neighbor_count(), 0);
 }
+
+/// ARP-031 scenario, run against both the linear (borrowed) and the
+/// indexed (owner) snapshot of the same tables.
+fn assert_off_link_senders_are_dropped(s: &ForwardingSnapshot<'_>) {
+    const OFF_LINK: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 7]);
+    const GATEWAY: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
+    const OTHER_LINK: Ipv4Address = Ipv4Address::from_octets([10, 9, 0, 5]);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 4];
+    let mut rt = runtime!(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        states,
+        actions,
+        cache
+    );
+    let before = rt.counters();
+    let mut io = SimIo::new();
+
+    // Off-link Request for our address, a gratuitous ARP, a Reply, and a
+    // sender on-link only on another interface: all dropped at a future
+    // time without learning, replying, or moving the clock.
+    for packet in [
+        arp(1, OFF_LINK, LOCAL, PEER_MAC, PEER_MAC),
+        arp(1, OFF_LINK, OFF_LINK, PEER_MAC, PEER_MAC),
+        arp(2, OFF_LINK, LOCAL, PEER_MAC, PEER_MAC),
+        arp(1, OTHER_LINK, LOCAL, PEER_MAC, PEER_MAC),
+    ] {
+        io.inject(IFACE, packet.clone());
+        let mut trace = VecTrace::default();
+        let report = run(&mut io, &mut rt, s, 5_000, 1, &mut trace);
+        assert_eq!(
+            (report.tx_requested, report.dropped, report.consumed),
+            (0, 1, 0)
+        );
+        let recycled = io.pop_recycled().unwrap();
+        assert_eq!(
+            recycled.cause,
+            RecycleCause::Forwarding(DropReason::ArpSenderNotOnLink)
+        );
+        assert_eq!(recycled.bytes, packet);
+        assert!(!trace
+            .events()
+            .iter()
+            .any(|event| matches!(event, TraceEvent::ArpControl { .. })));
+    }
+    assert_eq!(rt.counters(), before);
+    assert_eq!((rt.dynamic_neighbor_count(), rt.pending_actions()), (0, 0));
+
+    // On-link through the connected prefix: learned and answered at an
+    // earlier time (the drops did not advance the watermark).
+    io.inject(IFACE, arp(1, PEER, LOCAL, PEER_MAC, PEER_MAC));
+    let report = run(&mut io, &mut rt, s, 0, 1, &mut VecTrace::default());
+    assert_eq!((report.tx_requested, report.dropped), (1, 0));
+    assert_eq!(rt.dynamic_neighbor_count(), 1);
+    io.pop_tx().unwrap();
+
+    // A configured gateway outside every connected prefix is on-link too.
+    io.inject(IFACE, arp(2, GATEWAY, LOCAL, NEW_MAC, NEW_MAC));
+    let mut trace = VecTrace::default();
+    let report = run(&mut io, &mut rt, s, 0, 1, &mut trace);
+    assert_eq!((report.consumed, report.dropped), (1, 0));
+    assert_eq!(rt.dynamic_neighbor_count(), 2);
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::ArpControl {
+            disposition: ControlDisposition::Inserted,
+            ..
+        }
+    )));
+
+    // A static neighbor keeps its precedence even off-link, and the RFC
+    // 5227 probe (sender 0.0.0.0) is still answered.
+    io.inject(IFACE, arp(2, OFF_LINK_STATIC, LOCAL, NEW_MAC, NEW_MAC));
+    let mut trace = VecTrace::default();
+    let report = run(&mut io, &mut rt, s, 0, 1, &mut trace);
+    assert_eq!((report.consumed, report.dropped), (1, 0));
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::ArpControl {
+            disposition: ControlDisposition::StaticPreserved,
+            ..
+        }
+    )));
+    io.inject(
+        IFACE,
+        arp(1, Ipv4Address::from_octets([0; 4]), LOCAL, NEW_MAC, NEW_MAC),
+    );
+    let report = run(&mut io, &mut rt, s, 0, 1, &mut VecTrace::default());
+    assert_eq!((report.tx_requested, report.dropped), (1, 0));
+    assert_eq!(rt.dynamic_neighbor_count(), 2);
+}
+
+const OFF_LINK_STATIC: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 9]);
+
+#[test]
+fn off_link_arp_senders_are_dropped_without_learning_or_reply() {
+    const OTHER_IFACE: IfId = IfId(2);
+    let routes = [
+        Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, IFACE, None).unwrap(),
+        Route::new(
+            Ipv4Address::from_octets([0; 4]),
+            0,
+            IFACE,
+            Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+        )
+        .unwrap(),
+        Route::new(
+            Ipv4Address::from_octets([10, 9, 0, 0]),
+            16,
+            OTHER_IFACE,
+            None,
+        )
+        .unwrap(),
+    ];
+    let interfaces = [
+        Interface {
+            id: IFACE,
+            mac: LOCAL_MAC,
+        },
+        Interface {
+            id: OTHER_IFACE,
+            mac: MacAddress([2, 0, 0, 0, 0, 2]),
+        },
+    ];
+    let neighbors = [Neighbor {
+        interface: IFACE,
+        target: OFF_LINK_STATIC,
+        mac: PEER_MAC,
+    }];
+    let bindings = [LocalIpv4Binding {
+        interface: IFACE,
+        address: LOCAL,
+    }];
+    assert_off_link_senders_are_dropped(&snapshot(&routes, &interfaces, &neighbors, &bindings));
+    let owner = ruster_core::ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        neighbors.into(),
+        bindings.into(),
+        ruster_core::Ipv4OriginPolicy::default(),
+    )
+    .unwrap();
+    assert_off_link_senders_are_dropped(&owner.snapshot());
+}

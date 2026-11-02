@@ -5,7 +5,7 @@ use crate::nat44::{
 };
 use crate::resolution::DynamicLookup;
 use crate::{
-    packet, rfc1624_update, route, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
+    packet, rfc1624_update, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
     BatchCompletion, ConsumeReason, ControlDisposition, FirewallAction, FirewallAuditBuffer,
     FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
     FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
@@ -16,9 +16,13 @@ use crate::{
     ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
+use lookup::{linear, ForwardingIndex};
 use nat44_icmpv4_inside::{decide_nat44_icmpv4_inside_error, is_nat44_icmpv4_inside_candidate};
 
 mod hairpin;
+mod lookup;
+#[cfg(test)]
+mod lookup_tests;
 mod nat44_icmpv4_inside;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,6 +189,10 @@ pub enum DropReason {
     /// not come from the quoted destination host, the only node that
     /// generates it.
     Nat44Icmpv4EndHostSourceMismatch = 153,
+    /// An ARP packet's sender protocol address is not on the link of the
+    /// ingress interface: outside every direct route out of it and not one
+    /// of its configured gateways (ARP-031). Nothing is learned or answered.
+    ArpSenderNotOnLink = 154,
 }
 
 use DropReason::*;
@@ -192,7 +200,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 153] = [
+    pub const ALL: [Self; 154] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -346,6 +354,7 @@ impl DropReason {
         Nat44Icmpv4OuterDestinationMismatch,
         Nat44Icmpv4InsideSourceMismatch,
         Nat44Icmpv4EndHostSourceMismatch,
+        ArpSenderNotOnLink,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -516,6 +525,7 @@ impl DropReason {
             Nat44Icmpv4OuterDestinationMismatch => "NAT44_ICMPV4_OUTER_DESTINATION_MISMATCH",
             Nat44Icmpv4InsideSourceMismatch => "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH",
             Nat44Icmpv4EndHostSourceMismatch => "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH",
+            ArpSenderNotOnLink => "ARP_SENDER_NOT_ON_LINK",
         }
     }
 }
@@ -606,8 +616,11 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) neighbors: &'a [Neighbor],
     pub(crate) local_ipv4: &'a [LocalIpv4Binding],
     pub(crate) ipv4_origin: Ipv4OriginPolicy,
+    /// Publication-time lookup indexes over exactly these slices, present
+    /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
+    /// Without it every lookup uses the linear reference (PERF-002).
+    index: Option<&'a ForwardingIndex>,
     authority: u64,
-    identity: [usize; 8],
 }
 
 const VALIDATED_OWNER_AUTHORITY_BIT: u64 = 1 << 63;
@@ -627,8 +640,12 @@ impl std::fmt::Debug for ForwardingSnapshot<'_> {
 
 /// Immutable validated forwarding tables owned by the cold publication path.
 ///
-/// Construction consumes caller-allocated boxes and validates them once.
-/// [`Self::snapshot`] is then an infallible O(1) borrow scoped to this owner.
+/// Construction consumes caller-allocated boxes, validates them once, and
+/// builds the lookup indexes every packet path search uses (route LPM,
+/// interface, local address, static neighbor, connected boundary, gateway,
+/// and on-link sender; PERF-002). The indexes are snapshot memory owned
+/// here ([`Self::index_heap_bytes`]). [`Self::snapshot`] is then an
+/// infallible O(1) borrow scoped to this owner.
 ///
 /// ```compile_fail
 /// use ruster_core::{ForwardingSnapshot, ValidatedForwardingOwner};
@@ -643,6 +660,7 @@ pub struct ValidatedForwardingOwner {
     neighbors: Box<[Neighbor]>,
     local_ipv4: Box<[LocalIpv4Binding]>,
     ipv4_origin: Ipv4OriginPolicy,
+    index: ForwardingIndex,
     authority: u64,
 }
 
@@ -767,6 +785,7 @@ impl<'a> ForwardingSnapshot<'a> {
             neighbors,
             local_ipv4,
             ipv4_origin,
+            index: None,
             authority: calculate_snapshot_authority(
                 routes,
                 interfaces,
@@ -774,16 +793,6 @@ impl<'a> ForwardingSnapshot<'a> {
                 local_ipv4,
                 ipv4_origin,
             ),
-            identity: [
-                routes.as_ptr() as usize,
-                routes.len(),
-                interfaces.as_ptr() as usize,
-                interfaces.len(),
-                neighbors.as_ptr() as usize,
-                neighbors.len(),
-                local_ipv4.as_ptr() as usize,
-                local_ipv4.len(),
-            ],
         })
     }
 
@@ -791,8 +800,20 @@ impl<'a> ForwardingSnapshot<'a> {
         self.authority
     }
 
-    pub(crate) const fn identity(&self) -> [usize; 8] {
-        self.identity
+    /// The pointer and length of every table, read from the borrowed
+    /// slices themselves (O(1); not stored, which keeps the by-value
+    /// snapshot small enough for the index reference, RT-002).
+    pub(crate) fn identity(&self) -> [usize; 8] {
+        [
+            self.routes.as_ptr() as usize,
+            self.routes.len(),
+            self.interfaces.as_ptr() as usize,
+            self.interfaces.len(),
+            self.neighbors.as_ptr() as usize,
+            self.neighbors.len(),
+            self.local_ipv4.as_ptr() as usize,
+            self.local_ipv4.len(),
+        ]
     }
 
     pub(crate) const fn publication_nonce(&self) -> u64 {
@@ -803,22 +824,131 @@ impl<'a> ForwardingSnapshot<'a> {
         }
     }
 
+    /// Longest-prefix route for `destination` (bounded binary search over
+    /// the owner index; linear reference without one).
+    #[inline]
+    pub(crate) fn route_lookup(&self, destination: crate::Ipv4Address) -> Option<Route> {
+        match self.index {
+            Some(index) => index.route(destination).0.map(|slot| self.routes[slot]),
+            None => linear::route(self.routes, destination),
+        }
+    }
+
+    /// The interface with `id` (ids are unique after validation).
+    #[inline]
+    pub(crate) fn interface(&self, id: IfId) -> Option<&'a Interface> {
+        match self.index {
+            Some(index) => index.interface(id).0.map(|slot| &self.interfaces[slot]),
+            None => linear::interface(self.interfaces, id),
+        }
+    }
+
+    /// The local IPv4 binding of `interface` (at most one per interface).
+    #[inline]
+    pub(crate) fn local_binding_on(&self, interface: IfId) -> Option<&'a LocalIpv4Binding> {
+        match self.index {
+            Some(index) => index
+                .local_by_interface(interface)
+                .0
+                .map(|slot| &self.local_ipv4[slot]),
+            None => linear::local_by_interface(self.local_ipv4, interface),
+        }
+    }
+
+    /// The local IPv4 binding owning `address` on any interface (addresses
+    /// are unique after validation).
+    #[inline]
+    pub(crate) fn local_binding_for(
+        &self,
+        address: crate::Ipv4Address,
+    ) -> Option<&'a LocalIpv4Binding> {
+        match self.index {
+            Some(index) => index
+                .local_by_address(address)
+                .0
+                .map(|slot| &self.local_ipv4[slot]),
+            None => linear::local_by_address(self.local_ipv4, address),
+        }
+    }
+
+    /// Whether `address` is one of the router's own IPv4 addresses.
+    #[inline]
+    pub(crate) fn is_local_ipv4(&self, address: crate::Ipv4Address) -> bool {
+        self.local_binding_for(address).is_some()
+    }
+
+    /// Whether `address` is the local binding of `interface` itself.
+    #[inline]
+    pub(crate) fn is_local_ipv4_on(&self, interface: IfId, address: crate::Ipv4Address) -> bool {
+        self.local_binding_on(interface)
+            .is_some_and(|binding| binding.address == address)
+    }
+
+    /// The static neighbor for `(interface, target)`.
+    #[inline]
+    pub(crate) fn static_neighbor(
+        &self,
+        interface: IfId,
+        target: crate::Ipv4Address,
+    ) -> Option<&'a Neighbor> {
+        match self.index {
+            Some(index) => index
+                .static_neighbor(interface, target)
+                .0
+                .map(|slot| &self.neighbors[slot]),
+            None => linear::static_neighbor(self.neighbors, interface, target),
+        }
+    }
+
+    /// Whether `address` is the network or directed-broadcast address of
+    /// any connected route out of `interface` (not only the selected one).
+    #[inline]
+    pub(crate) fn is_connected_boundary(
+        &self,
+        interface: IfId,
+        address: crate::Ipv4Address,
+    ) -> bool {
+        match self.index {
+            Some(index) => index.connected_boundary(interface, address).0,
+            None => linear::connected_boundary(self.routes, interface, address),
+        }
+    }
+
+    /// Whether some route out of `interface` names `next_hop` as gateway.
+    #[inline]
+    pub(crate) fn is_gateway(&self, interface: IfId, next_hop: crate::Ipv4Address) -> bool {
+        match self.index {
+            Some(index) => index.gateway(interface, next_hop).0,
+            None => linear::gateway(self.routes, interface, next_hop),
+        }
+    }
+
+    /// Whether `sender` is on the link of `interface`: inside a direct
+    /// (no next hop) route out of it, or a configured gateway out of it.
+    /// These are exactly the targets the router itself may resolve on that
+    /// interface (ARP-031).
+    #[inline]
+    pub(crate) fn sender_on_link(&self, interface: IfId, sender: crate::Ipv4Address) -> bool {
+        match self.index {
+            Some(index) => index.sender_on_link(interface, sender).0,
+            None => linear::sender_on_link(self.routes, interface, sender),
+        }
+    }
+
     pub(crate) fn resolution_action_authority(
         &self,
         action: ArpRequestAction,
     ) -> ResolutionActionAuthority {
-        if self.neighbors.iter().any(|neighbor| {
-            neighbor.interface == action.egress && neighbor.target == action.target_ip
-        }) {
+        if self
+            .static_neighbor(action.egress, action.target_ip)
+            .is_some()
+        {
             return ResolutionActionAuthority::StaticResolved;
         }
         if !self
-            .interfaces
-            .iter()
-            .any(|interface| interface.id == action.egress && interface.mac == action.source_mac)
-            || !self.local_ipv4.iter().any(|binding| {
-                binding.interface == action.egress && binding.address == action.source_ip
-            })
+            .interface(action.egress)
+            .is_some_and(|interface| interface.mac == action.source_mac)
+            || !self.is_local_ipv4_on(action.egress, action.source_ip)
         {
             return ResolutionActionAuthority::Invalid;
         }
@@ -829,23 +959,14 @@ impl<'a> ForwardingSnapshot<'a> {
             || octets[0] == 127
             || octets[0] >= 224
             || octets == [255; 4]
-            || self
-                .local_ipv4
-                .iter()
-                .any(|binding| binding.address == target)
-            || self.routes.iter().any(|route| {
-                route.egress() == action.egress
-                    && (route.is_connected_network_address(target)
-                        || route.is_connected_directed_broadcast(target))
-            })
+            || self.is_local_ipv4(target)
+            || self.is_connected_boundary(action.egress, target)
         {
             return ResolutionActionAuthority::Invalid;
         }
-        let route_still_authorizes = self
-            .routes
-            .iter()
-            .any(|route| route.egress() == action.egress && route.next_hop() == Some(target))
-            || route::lookup(self.routes, target)
+        let route_still_authorizes = self.is_gateway(action.egress, target)
+            || self
+                .route_lookup(target)
                 .is_some_and(|route| route.egress() == action.egress && route.next_hop().is_none());
         if route_still_authorizes {
             ResolutionActionAuthority::Valid
@@ -874,12 +995,14 @@ impl ValidatedForwardingOwner {
         .map_err(ValidatedForwardingOwnerError::Snapshot)?;
         let authority = next_publication_nonce()
             .ok_or(ValidatedForwardingOwnerError::PublicationNonceExhausted)?;
+        let index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
         Ok(Self {
             routes,
             interfaces,
             neighbors,
             local_ipv4,
             ipv4_origin,
+            index,
             authority,
         })
     }
@@ -887,25 +1010,24 @@ impl ValidatedForwardingOwner {
     /// Borrows a coherent snapshot without validation, hashing, or allocation.
     #[must_use]
     pub fn snapshot(&self) -> ForwardingSnapshot<'_> {
-        let identity = [
-            self.routes.as_ptr() as usize,
-            self.routes.len(),
-            self.interfaces.as_ptr() as usize,
-            self.interfaces.len(),
-            self.neighbors.as_ptr() as usize,
-            self.neighbors.len(),
-            self.local_ipv4.as_ptr() as usize,
-            self.local_ipv4.len(),
-        ];
         ForwardingSnapshot {
             routes: &self.routes,
             interfaces: &self.interfaces,
             neighbors: &self.neighbors,
             local_ipv4: &self.local_ipv4,
             ipv4_origin: self.ipv4_origin,
+            index: Some(&self.index),
             authority: self.authority,
-            identity,
         }
+    }
+
+    /// Heap bytes of the publication-time lookup indexes (snapshot memory,
+    /// not runtime storage; freed with the owner). Bounded by the config
+    /// limits: about 230 KiB at 4096 routes, 4096 neighbors, 1024
+    /// addresses, and 256 interfaces.
+    #[must_use]
+    pub fn index_heap_bytes(&self) -> usize {
+        self.index.heap_bytes()
     }
 
     #[must_use]
@@ -2215,9 +2337,7 @@ fn validate_ethernet_ingress(
         return Ok(());
     }
     let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == ingress)
+        .interface(ingress)
         .ok_or(if ether_type == IPV4_ETHERTYPE {
             Ipv4IngressInterfaceUnknown
         } else {
@@ -2285,14 +2405,10 @@ fn validate_ipv4_ingress(
         240..=255 => return Err(Ipv4SourceClassE),
         _ => {}
     }
-    if snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.address == ipv4.source)
-    {
+    if snapshot.is_local_ipv4(ipv4.source) {
         return Err(Ipv4SourceLocalAddress);
     }
-    if let Some(selected) = route::lookup(snapshot.routes, ipv4.source) {
+    if let Some(selected) = snapshot.route_lookup(ipv4.source) {
         if selected.is_prefix_network_address(ipv4.source) {
             return Err(Ipv4SourceNetworkAddress);
         }
@@ -2352,14 +2468,11 @@ fn decide_ipv4<T: TraceSink>(
         destination: ipv4.destination,
     });
     validate_ipv4_ingress(snapshot, ipv4)?;
-    let local = snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.interface == ingress && binding.address == ipv4.destination);
+    let local = snapshot.is_local_ipv4_on(ingress, ipv4.destination);
     let selected_route = if local {
         None
     } else {
-        route::lookup(snapshot.routes, ipv4.destination)
+        snapshot.route_lookup(ipv4.destination)
     };
     if !local {
         validate_ipv4_forward_destination(ipv4, selected_route)?;
@@ -2730,15 +2843,8 @@ fn decide_ipv4<T: TraceSink>(
         return Err(Ipv4TtlExpired);
     }
     let target = route.next_hop().unwrap_or(ipv4.destination);
-    let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|item| item.id == route.egress())
-        .ok_or(InterfaceMiss)?;
-    let static_neighbor = snapshot
-        .neighbors
-        .iter()
-        .find(|item| item.interface == route.egress() && item.target == target);
+    let interface = snapshot.interface(route.egress()).ok_or(InterfaceMiss)?;
+    let static_neighbor = snapshot.static_neighbor(route.egress(), target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
     } else if let Some((runtime, now)) = resolution.as_mut() {
@@ -2753,11 +2859,7 @@ fn decide_ipv4<T: TraceSink>(
                 return Err(NeighborUnresolved);
             }
             DynamicLookup::Miss => {
-                if let Some(binding) = snapshot
-                    .local_ipv4
-                    .iter()
-                    .find(|binding| binding.interface == route.egress())
-                {
+                if let Some(binding) = snapshot.local_binding_on(route.egress()) {
                     let result = runtime.schedule(
                         ArpRequestAction {
                             egress: route.egress(),
@@ -2766,15 +2868,8 @@ fn decide_ipv4<T: TraceSink>(
                             target_ip: target,
                         },
                         *now,
-                        snapshot
-                            .local_ipv4
-                            .iter()
-                            .any(|binding| binding.address == target)
-                            || snapshot.routes.iter().any(|candidate| {
-                                candidate.egress() == route.egress()
-                                    && (candidate.is_connected_directed_broadcast(target)
-                                        || candidate.is_connected_network_address(target))
-                            }),
+                        snapshot.is_local_ipv4(target)
+                            || snapshot.is_connected_boundary(route.egress(), target),
                     );
                     trace.record(TraceEvent::NeighborResolution {
                         egress: route.egress(),
@@ -3004,10 +3099,7 @@ struct ParsedNat44Icmpv4Quote {
 /// including the NAT public address. Only hairpinned packets create NAT
 /// state with such a remote.
 fn quoted_remote_is_local(snapshot: &ForwardingSnapshot<'_>, remote: crate::Ipv4Address) -> bool {
-    snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.address == remote)
+    snapshot.is_local_ipv4(remote)
 }
 
 fn nat44_udp_icmpv4_lookup_reason(error: Nat44UdpPlanError) -> DropReason {
@@ -3127,16 +3219,8 @@ fn resolve_nat44_icmpv4_next_hop<T: TraceSink>(
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<(Interface, crate::MacAddress), DropReason> {
-    let interface = *snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == egress)
-        .ok_or(InterfaceMiss)?;
-    let destination_mac = if let Some(neighbor) = snapshot
-        .neighbors
-        .iter()
-        .find(|neighbor| neighbor.interface == egress && neighbor.target == target)
-    {
+    let interface = *snapshot.interface(egress).ok_or(InterfaceMiss)?;
+    let destination_mac = if let Some(neighbor) = snapshot.static_neighbor(egress, target) {
         neighbor.mac
     } else if let Some((runtime, resolution_now)) = resolution.as_mut() {
         match runtime.lookup_dynamic(egress, target, *resolution_now) {
@@ -3150,11 +3234,7 @@ fn resolve_nat44_icmpv4_next_hop<T: TraceSink>(
                 return Err(NeighborUnresolved);
             }
             DynamicLookup::Miss => {
-                if let Some(binding) = snapshot
-                    .local_ipv4
-                    .iter()
-                    .find(|binding| binding.interface == egress)
-                {
+                if let Some(binding) = snapshot.local_binding_on(egress) {
                     let result = runtime.schedule(
                         ArpRequestAction {
                             egress,
@@ -3163,15 +3243,8 @@ fn resolve_nat44_icmpv4_next_hop<T: TraceSink>(
                             target_ip: target,
                         },
                         *resolution_now,
-                        snapshot
-                            .local_ipv4
-                            .iter()
-                            .any(|binding| binding.address == target)
-                            || snapshot.routes.iter().any(|candidate| {
-                                candidate.egress() == egress
-                                    && (candidate.is_connected_directed_broadcast(target)
-                                        || candidate.is_connected_network_address(target))
-                            }),
+                        snapshot.is_local_ipv4(target)
+                            || snapshot.is_connected_boundary(egress, target),
                     );
                     trace.record(TraceEvent::NeighborResolution {
                         egress,
@@ -3211,12 +3284,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
 ) -> Result<PacketDecision, DropReason> {
     let quote = parse_nat44_icmpv4_error(frame, outer)
         .map_err(|reason| trace_nat44_icmpv4_drop(ingress, reason, trace))?;
-    if !icmp_error_source_is_host(snapshot, outer.source)
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == outer.source)
-    {
+    if !icmp_error_source_is_host(snapshot, outer.source) || snapshot.is_local_ipv4(outer.source) {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
     }
     if nat44_icmpv4_error_end_host_only(quote.icmp_type, quote.icmp_code)
@@ -3248,7 +3316,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             if ingress != config.outside() {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
             }
-            if route::lookup(snapshot.routes, outer.source)
+            if snapshot
+                .route_lookup(outer.source)
                 .is_none_or(|reverse| reverse.egress() != config.outside())
             {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
@@ -3301,7 +3370,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             if ingress != config.outside() {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
             }
-            if route::lookup(snapshot.routes, outer.source)
+            if snapshot
+                .route_lookup(outer.source)
                 .is_none_or(|reverse| reverse.egress() != config.outside())
             {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
@@ -3353,7 +3423,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
         inspect_nat44_icmpv4_related(runtime, firewall_audit, packet, false, ingress, now, trace)?;
     }
 
-    let route = route::lookup(snapshot.routes, internal_address).ok_or(RouteMiss)?;
+    let route = snapshot.route_lookup(internal_address).ok_or(RouteMiss)?;
     if route.egress() != inside {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongEgress, trace);
     }
@@ -4037,15 +4107,13 @@ fn decide_nat44_udp_outbound<T: TraceSink>(
         return nat44_udp_drop(ingress, Nat44UdpSourcePortZero, trace);
     }
     if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == ipv4.source)
+        || snapshot.is_local_ipv4(ipv4.source)
         || ipv4.source == config.public_address()
     {
         return nat44_udp_drop(ingress, Nat44UdpSourceForbidden, trace);
     }
-    if route::lookup(snapshot.routes, ipv4.source)
+    if snapshot
+        .route_lookup(ipv4.source)
         .is_none_or(|reverse| reverse.egress() != config.inside())
     {
         return nat44_udp_drop(ingress, Nat44UdpReverseAuthorityMismatch, trace);
@@ -4136,12 +4204,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         Ok(udp) => udp,
         Err(reason) => return nat44_udp_drop(ingress, reason, trace),
     };
-    if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == ipv4.source)
-    {
+    if !icmp_error_source_is_host(snapshot, ipv4.source) || snapshot.is_local_ipv4(ipv4.source) {
         return nat44_udp_drop(ingress, Nat44UdpSourceForbidden, trace);
     }
     let planned = if firewall_config.is_some() {
@@ -4166,7 +4229,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         }
     };
     let internal_address = plan.internal_address();
-    let Some(reverse_route) = route::lookup(snapshot.routes, internal_address) else {
+    let Some(reverse_route) = snapshot.route_lookup(internal_address) else {
         return nat44_udp_drop(ingress, Nat44UdpReverseAuthorityMismatch, trace);
     };
     if reverse_route.egress() != config.inside() {
@@ -4201,14 +4264,10 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
     let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == reverse_route.egress())
+        .interface(reverse_route.egress())
         .ok_or(InterfaceMiss)?;
-    let destination_mac = if let Some(neighbor) = snapshot
-        .neighbors
-        .iter()
-        .find(|neighbor| neighbor.interface == reverse_route.egress() && neighbor.target == target)
+    let destination_mac = if let Some(neighbor) =
+        snapshot.static_neighbor(reverse_route.egress(), target)
     {
         neighbor.mac
     } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
@@ -4218,11 +4277,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
                 return nat44_udp_drop(ingress, NeighborUnresolved, trace);
             }
             DynamicLookup::Miss => {
-                if let Some(binding) = snapshot
-                    .local_ipv4
-                    .iter()
-                    .find(|binding| binding.interface == reverse_route.egress())
-                {
+                if let Some(binding) = snapshot.local_binding_on(reverse_route.egress()) {
                     let result = resolution_runtime.schedule(
                         ArpRequestAction {
                             egress: reverse_route.egress(),
@@ -4316,15 +4371,13 @@ fn decide_nat44_tcp_outbound<T: TraceSink>(
         return nat44_tcp_drop(ingress, Nat44TcpSourcePortZero, trace);
     }
     if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == ipv4.source)
+        || snapshot.is_local_ipv4(ipv4.source)
         || ipv4.source == config.public_address()
     {
         return nat44_tcp_drop(ingress, Nat44TcpSourceForbidden, trace);
     }
-    if route::lookup(snapshot.routes, ipv4.source)
+    if snapshot
+        .route_lookup(ipv4.source)
         .is_none_or(|reverse| reverse.egress() != config.inside())
     {
         return nat44_tcp_drop(ingress, Nat44TcpReverseAuthorityMismatch, trace);
@@ -4421,12 +4474,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     if tcp.source_port == 0 {
         return nat44_tcp_drop(ingress, Nat44TcpSourcePortZero, trace);
     }
-    if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == ipv4.source)
-    {
+    if !icmp_error_source_is_host(snapshot, ipv4.source) || snapshot.is_local_ipv4(ipv4.source) {
         return nat44_tcp_drop(ingress, Nat44TcpSourceForbidden, trace);
     }
     // Same initial-SYN predicate as outbound: SYN=1 with ACK/RST/FIN=0.
@@ -4467,7 +4515,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
         }
     };
     let internal_address = plan.internal_address();
-    let Some(reverse_route) = route::lookup(snapshot.routes, internal_address) else {
+    let Some(reverse_route) = snapshot.route_lookup(internal_address) else {
         return nat44_tcp_drop(ingress, Nat44TcpReverseAuthorityMismatch, trace);
     };
     if reverse_route.egress() != config.inside() {
@@ -4502,14 +4550,10 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
     let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == reverse_route.egress())
+        .interface(reverse_route.egress())
         .ok_or(InterfaceMiss)?;
-    let destination_mac = if let Some(neighbor) = snapshot
-        .neighbors
-        .iter()
-        .find(|neighbor| neighbor.interface == reverse_route.egress() && neighbor.target == target)
+    let destination_mac = if let Some(neighbor) =
+        snapshot.static_neighbor(reverse_route.egress(), target)
     {
         neighbor.mac
     } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
@@ -4519,11 +4563,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
                 return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
             }
             DynamicLookup::Miss => {
-                if let Some(binding) = snapshot
-                    .local_ipv4
-                    .iter()
-                    .find(|binding| binding.interface == reverse_route.egress())
-                {
+                if let Some(binding) = snapshot.local_binding_on(reverse_route.egress()) {
                     let result = resolution_runtime.schedule(
                         ArpRequestAction {
                             egress: reverse_route.egress(),
@@ -5118,11 +5158,7 @@ fn decide_icmpv4_error<T: TraceSink>(
     if !icmp_error_source_is_host(snapshot, ipv4.source) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::SourceNotUnicast);
     }
-    if snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.address == ipv4.source)
-    {
+    if snapshot.is_local_ipv4(ipv4.source) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::SourceIsLocal);
     }
 
@@ -5167,24 +5203,16 @@ fn decide_icmpv4_error<T: TraceSink>(
         }
     }
 
-    let Some(reverse_route) = route::lookup(snapshot.routes, ipv4.source) else {
+    let Some(reverse_route) = snapshot.route_lookup(ipv4.source) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseRouteMiss);
     };
     let reverse_egress = reverse_route.egress();
-    let Some(interface) = snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == reverse_egress)
-    else {
+    let Some(interface) = snapshot.interface(reverse_egress) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseInterfaceMiss {
             egress: reverse_egress,
         });
     };
-    let Some(binding) = snapshot
-        .local_ipv4
-        .iter()
-        .find(|binding| binding.interface == reverse_egress)
-    else {
+    let Some(binding) = snapshot.local_binding_on(reverse_egress) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseBindingMiss {
             egress: reverse_egress,
         });
@@ -5197,10 +5225,7 @@ fn decide_icmpv4_error<T: TraceSink>(
         });
     }
 
-    let static_neighbor = snapshot
-        .neighbors
-        .iter()
-        .find(|neighbor| neighbor.interface == reverse_egress && neighbor.target == target);
+    let static_neighbor = snapshot.static_neighbor(reverse_egress, target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
     } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
@@ -5229,15 +5254,8 @@ fn decide_icmpv4_error<T: TraceSink>(
                         target_ip: target,
                     },
                     *resolution_now,
-                    snapshot
-                        .local_ipv4
-                        .iter()
-                        .any(|binding| binding.address == target)
-                        || snapshot.routes.iter().any(|candidate| {
-                            candidate.egress() == reverse_egress
-                                && (candidate.is_connected_directed_broadcast(target)
-                                    || candidate.is_connected_network_address(target))
-                        }),
+                    snapshot.is_local_ipv4(target)
+                        || snapshot.is_connected_boundary(reverse_egress, target),
                 );
                 trace.record(TraceEvent::NeighborResolution {
                     egress: reverse_egress,
@@ -5289,7 +5307,7 @@ fn icmp_error_source_is_host(
     octets[0] != 0
         && octets[0] != 127
         && octets[0] < 224
-        && !route::lookup(snapshot.routes, source).is_some_and(|selected| {
+        && !snapshot.route_lookup(source).is_some_and(|selected| {
             selected.is_prefix_network_address(source)
                 || selected.is_prefix_directed_broadcast(source)
         })
@@ -5301,12 +5319,7 @@ fn icmp_error_candidate_eligible(
     ipv4: packet::ValidatedIpv4,
     selected_destination_route: Option<Route>,
 ) -> bool {
-    if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == ipv4.source)
-    {
+    if !icmp_error_source_is_host(snapshot, ipv4.source) || snapshot.is_local_ipv4(ipv4.source) {
         return false;
     }
     let destination = ipv4.destination.octets();
@@ -5349,15 +5362,8 @@ fn reverse_target_forbidden(
         || octets[0] >= 224
         || octets == [255; 4]
         || target == local
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == target)
-        || snapshot.routes.iter().any(|route| {
-            route.egress() == egress
-                && (route.is_connected_directed_broadcast(target)
-                    || route.is_connected_network_address(target))
-        })
+        || snapshot.is_local_ipv4(target)
+        || snapshot.is_connected_boundary(egress, target)
 }
 
 fn decide_local_ipv4<T: TraceSink>(
@@ -5410,16 +5416,9 @@ fn decide_local_ipv4<T: TraceSink>(
         return Err(Icmpv4ChecksumInvalid);
     }
 
-    let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|item| item.id == ingress)
-        .ok_or(InterfaceMiss)?;
+    let interface = snapshot.interface(ingress).ok_or(InterfaceMiss)?;
     if !sender_is_host(snapshot, ingress, ipv4.source)
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.interface == ingress && binding.address == ipv4.source)
+        || snapshot.is_local_ipv4_on(ingress, ipv4.source)
     {
         return Err(Icmpv4SourceNotUnicast);
     }
@@ -5499,19 +5498,28 @@ fn decide_arp<T: TraceSink>(
     if sha[0] & 1 != 0 {
         return Err(ArpSenderHardwareMulticast);
     }
-    let target_local = snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.interface == ingress && binding.address == arp.target_protocol);
-    let sender_local = snapshot
-        .local_ipv4
-        .iter()
-        .any(|binding| binding.interface == ingress && binding.address == arp.sender_protocol);
+    let target_local = snapshot.is_local_ipv4_on(ingress, arp.target_protocol);
+    let sender_local = snapshot.is_local_ipv4_on(ingress, arp.sender_protocol);
     let sender_host = sender_is_host(snapshot, ingress, arp.sender_protocol);
     let static_key = snapshot
-        .neighbors
-        .iter()
-        .any(|neighbor| neighbor.interface == ingress && neighbor.target == arp.sender_protocol);
+        .static_neighbor(ingress, arp.sender_protocol)
+        .is_some();
+    // ARP-031: a sender the router could never resolve on this interface
+    // (outside every direct route out of it and not one of its gateways)
+    // is not a neighbor on this link. Learning it would only fill the
+    // dynamic cache, and the router has no route back over this link to
+    // answer it, so the packet is dropped before any state, clock, or
+    // reply. A configured static neighbor, our own address (a conflict),
+    // and the non-host senders (`sender_is_host` is false for the RFC 5227
+    // probe sender 0.0.0.0 and for connected network or broadcast
+    // addresses) keep their earlier dispositions.
+    if !static_key
+        && !sender_local
+        && sender_host
+        && !snapshot.sender_on_link(ingress, arp.sender_protocol)
+    {
+        return Err(ArpSenderNotOnLink);
+    }
     let has_runtime = resolution.is_some();
     let disposition = if let Some((runtime, now)) = resolution.as_mut() {
         if static_key {
@@ -5565,11 +5573,7 @@ fn decide_arp<T: TraceSink>(
     if arp.opcode == ArpOpcode::Reply || !target_local {
         return Ok(PacketDecision::ConsumeArp(disposition));
     }
-    let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|item| item.id == ingress)
-        .ok_or(InterfaceMiss)?;
+    let interface = snapshot.interface(ingress).ok_or(InterfaceMiss)?;
     if frame.get(0..packet::ARP_FRAME_LEN).is_none() {
         return Err(ArpPacketTruncated);
     }
@@ -5591,11 +5595,7 @@ fn sender_is_host(
     octets[0] != 0
         && octets[0] != 127
         && octets[0] < 224
-        && !snapshot.routes.iter().any(|route| {
-            route.egress() == ingress
-                && (route.is_connected_directed_broadcast(sender)
-                    || route.is_connected_network_address(sender))
-        })
+        && !snapshot.is_connected_boundary(ingress, sender)
 }
 
 fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), DropReason> {
@@ -6627,6 +6627,7 @@ mod tests {
             (151, "NAT44_ICMPV4_OUTER_DESTINATION_MISMATCH"),
             (152, "NAT44_ICMPV4_INSIDE_SOURCE_MISMATCH"),
             (153, "NAT44_ICMPV4_END_HOST_SOURCE_MISMATCH"),
+            (154, "ARP_SENDER_NOT_ON_LINK"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -6636,7 +6637,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(154), None);
+        assert_eq!(DropReason::from_code(155), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

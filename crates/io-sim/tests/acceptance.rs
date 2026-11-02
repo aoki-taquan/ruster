@@ -87,11 +87,16 @@ fn arp_frame(
     bytes
 }
 
+/// The connected route a configured LAN address always brings: it puts the
+/// ARP requesters on the link of `LAN` (ARP-031).
+static LAN_CONNECTED: std::sync::LazyLock<[Route; 1]> =
+    std::sync::LazyLock::new(|| [route([192, 0, 2, 0], 24, LAN, None)]);
+
 fn arp_snapshot<'a>(
     interfaces: &'a [Interface],
     bindings: &'a [LocalIpv4Binding],
 ) -> ForwardingSnapshot<'a> {
-    ForwardingSnapshot::new(&[], interfaces, &[], bindings).unwrap()
+    ForwardingSnapshot::new(&*LAN_CONNECTED, interfaces, &[], bindings).unwrap()
 }
 
 fn frame(ttl: u8, payload: &[u8]) -> Vec<u8> {
@@ -916,6 +921,32 @@ fn arp_foreign_sender_claiming_local_address_gets_normal_reply() {
 }
 
 #[test]
+fn arp_request_from_off_link_sender_is_dropped_without_reply() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings);
+    let mut io = SimIo::new();
+    let packet = arp_frame(
+        1,
+        DESTINATION,
+        LOCAL_IPV4,
+        REQUESTER_MAC,
+        REQUESTER_MAC,
+        [0; 6],
+        &[],
+    );
+    io.inject(LAN, packet.clone());
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!((report.tx_requested, report.dropped), (0, 1));
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(
+        recycled.cause,
+        RecycleCause::Forwarding(DropReason::ArpSenderNotOnLink)
+    );
+    assert_eq!(recycled.bytes, packet);
+}
+
+#[test]
 fn arp_profile_validation_drops_are_granular_and_atomic() {
     let interfaces = [local_interface()];
     let bindings = [local_binding()];
@@ -1077,7 +1108,7 @@ fn arp_trace_is_deterministic_and_tx_follows_commit() {
 
 #[test]
 fn mixed_ipv4_and_arp_batch_is_fifo_budgeted_and_deterministic() {
-    let routes = [gateway_route()];
+    let routes = [gateway_route(), LAN_CONNECTED[0]];
     let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
     let bindings = [local_binding()];

@@ -105,27 +105,15 @@ fn inside_forwarding<T: TraceSink>(
     trace: &mut T,
 ) -> Result<Ipv4RewriteDecision, DropReason> {
     let target = route.next_hop().unwrap_or(internal_address);
-    let interface = snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == route.egress())
-        .ok_or(InterfaceMiss)?;
-    let destination_mac = if let Some(neighbor) = snapshot
-        .neighbors
-        .iter()
-        .find(|neighbor| neighbor.interface == route.egress() && neighbor.target == target)
-    {
+    let interface = snapshot.interface(route.egress()).ok_or(InterfaceMiss)?;
+    let destination_mac = if let Some(neighbor) = snapshot.static_neighbor(route.egress(), target) {
         neighbor.mac
     } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
         match resolution_runtime.lookup_dynamic(route.egress(), target, *resolution_now) {
             DynamicLookup::Hit(mac) => mac,
             DynamicLookup::ClockRegression => return Err(NeighborUnresolved),
             DynamicLookup::Miss => {
-                if let Some(binding) = snapshot
-                    .local_ipv4
-                    .iter()
-                    .find(|binding| binding.interface == route.egress())
-                {
+                if let Some(binding) = snapshot.local_binding_on(route.egress()) {
                     let result = resolution_runtime.schedule(
                         ArpRequestAction {
                             egress: route.egress(),
@@ -176,10 +164,7 @@ fn sender_is_authorized(
     public_address: crate::Ipv4Address,
 ) -> bool {
     icmp_error_source_is_host(snapshot, source)
-        && !snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == source)
+        && !snapshot.is_local_ipv4(source)
         && source != public_address
 }
 
@@ -188,7 +173,9 @@ fn reverse_is_inside(
     source: crate::Ipv4Address,
     inside: IfId,
 ) -> bool {
-    route::lookup(snapshot.routes, source).is_some_and(|reverse| reverse.egress() == inside)
+    snapshot
+        .route_lookup(source)
+        .is_some_and(|reverse| reverse.egress() == inside)
 }
 
 /// Plans the firewall for one hairpin half with an explicit canonical
@@ -449,7 +436,7 @@ fn udp_hairpin_inbound_half<T: TraceSink>(
     };
     tuples.internal_address = inbound.internal_address();
     tuples.internal_port = inbound.internal_port();
-    let Some(route) = route::lookup(snapshot.routes, tuples.internal_address) else {
+    let Some(route) = snapshot.route_lookup(tuples.internal_address) else {
         return nat44_udp_drop(ingress, Nat44UdpReverseAuthorityMismatch, trace);
     };
     if route.egress() != config.inside() {
@@ -793,7 +780,7 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
     };
     tuples.internal_address = inbound.internal_address();
     tuples.internal_port = inbound.internal_port();
-    let Some(route) = route::lookup(snapshot.routes, tuples.internal_address) else {
+    let Some(route) = snapshot.route_lookup(tuples.internal_address) else {
         return nat44_tcp_drop(ingress, Nat44TcpReverseAuthorityMismatch, trace);
     };
     if route.egress() != config.inside() {

@@ -170,7 +170,8 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
     }
     // Local strict uRPF: the reporting host is reached through the inside.
-    if route::lookup(snapshot.routes, outer.source)
+    if snapshot
+        .route_lookup(outer.source)
         .is_none_or(|reverse| reverse.egress() != owner.inside)
     {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
@@ -205,7 +206,7 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     let internal = quote.destination_address;
     let on_path = outer.source == internal
         || (!nat44_icmpv4_error_end_host_only(quote.icmp_type, quote.icmp_code)
-            && route::lookup(snapshot.routes, internal).is_some_and(|route| {
+            && snapshot.route_lookup(internal).is_some_and(|route| {
                 route.egress() == owner.inside && route.next_hop() == Some(outer.source)
             }));
     if !on_path {
@@ -335,7 +336,7 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
             },
         ),
         (None, Some((sender_address, sender_port))) => {
-            let route = route::lookup(snapshot.routes, sender_address).ok_or(RouteMiss)?;
+            let route = snapshot.route_lookup(sender_address).ok_or(RouteMiss)?;
             if route.egress() != owner.inside {
                 return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongEgress, trace);
             }

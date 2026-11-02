@@ -269,13 +269,18 @@ fn snapshot<'a>(
 }
 
 fn topology() -> (
-    [Route; 1],
+    [Route; 2],
     [Interface; 2],
     [Neighbor; 1],
     [LocalIpv4Binding; 1],
 ) {
     (
-        [Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GATEWAY)).unwrap()],
+        [
+            Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GATEWAY)).unwrap(),
+            // The ARP peer is on the link of LAN (ARP-031). A host route
+            // adds no network or broadcast boundary to the IPv4 model.
+            Route::new(PEER_IP, 32, LAN, None).unwrap(),
+        ],
         [
             Interface {
                 id: LAN,

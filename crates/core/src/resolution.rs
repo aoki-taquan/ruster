@@ -2841,24 +2841,28 @@ fn publication_hold_valid(
     snapshot: &crate::ForwardingSnapshot<'_>,
     hold: &ResolutionFailureHoldSlot,
 ) -> bool {
-    crate::route::lookup(snapshot.routes, hold.original_destination).is_some_and(|route| {
-        route.egress() == hold.forward.egress
-            && route.next_hop().is_none()
-            && hold.forward.target == hold.original_destination
-            && route.prefix() == hold.forward_prefix
-            && route.prefix_len() == hold.forward_prefix_len
-    }) && snapshot.interfaces.iter().any(|interface| {
-        interface.id == hold.forward.egress && interface.mac == hold.forward_source_mac
-    }) && snapshot.local_ipv4.iter().any(|binding| {
-        binding.interface == hold.forward.egress && binding.address == hold.forward_source_ip
-    }) && !snapshot.neighbors.iter().any(|neighbor| {
-        neighbor.interface == hold.forward.egress && neighbor.target == hold.forward.target
-    }) && !host_failure_target_forbidden(
-        snapshot,
-        hold.forward.egress,
-        hold.forward.target,
-        hold.forward_source_ip,
-    )
+    snapshot
+        .route_lookup(hold.original_destination)
+        .is_some_and(|route| {
+            route.egress() == hold.forward.egress
+                && route.next_hop().is_none()
+                && hold.forward.target == hold.original_destination
+                && route.prefix() == hold.forward_prefix
+                && route.prefix_len() == hold.forward_prefix_len
+        })
+        && snapshot
+            .interface(hold.forward.egress)
+            .is_some_and(|interface| interface.mac == hold.forward_source_mac)
+        && snapshot.is_local_ipv4_on(hold.forward.egress, hold.forward_source_ip)
+        && snapshot
+            .static_neighbor(hold.forward.egress, hold.forward.target)
+            .is_none()
+        && !host_failure_target_forbidden(
+            snapshot,
+            hold.forward.egress,
+            hold.forward.target,
+            hold.forward_source_ip,
+        )
 }
 
 /// Every waiting-reverse hold is in exactly one group: a leader (on the
@@ -3109,25 +3113,27 @@ fn dispatch_one_failure(
     }) {
         return FailureDispatch::AuthorityLost;
     }
-    let forward_route = crate::route::lookup(snapshot.routes, hold.original_destination);
+    let forward_route = snapshot.route_lookup(hold.original_destination);
     if !forward_route.is_some_and(|route| {
         route.egress() == hold.forward.egress
             && route.next_hop().is_none()
             && hold.forward.target == hold.original_destination
             && route.prefix() == hold.forward_prefix
             && route.prefix_len() == hold.forward_prefix_len
-    }) || !snapshot.interfaces.iter().any(|interface| {
-        interface.id == hold.forward.egress && interface.mac == hold.forward_source_mac
-    }) || !snapshot.local_ipv4.iter().any(|binding| {
-        binding.interface == hold.forward.egress && binding.address == hold.forward_source_ip
-    }) || snapshot.neighbors.iter().any(|neighbor| {
-        neighbor.interface == hold.forward.egress && neighbor.target == hold.forward.target
-    }) || host_failure_target_forbidden(
-        snapshot,
-        hold.forward.egress,
-        hold.forward.target,
-        hold.forward_source_ip,
-    ) {
+    }) || !snapshot
+        .interface(hold.forward.egress)
+        .is_some_and(|interface| interface.mac == hold.forward_source_mac)
+        || !snapshot.is_local_ipv4_on(hold.forward.egress, hold.forward_source_ip)
+        || snapshot
+            .static_neighbor(hold.forward.egress, hold.forward.target)
+            .is_some()
+        || host_failure_target_forbidden(
+            snapshot,
+            hold.forward.egress,
+            hold.forward.target,
+            hold.forward_source_ip,
+        )
+    {
         return FailureDispatch::AuthorityLost;
     }
     match resolution.lookup_dynamic(hold.forward.egress, hold.forward.target, now) {
@@ -3151,22 +3157,14 @@ fn dispatch_one_failure(
         return FailureDispatch::GenerationDisabled;
     }
 
-    let Some(reverse_route) = crate::route::lookup(snapshot.routes, hold.original_source) else {
+    let Some(reverse_route) = snapshot.route_lookup(hold.original_source) else {
         return FailureDispatch::AuthorityLost;
     };
     let reverse_egress = reverse_route.egress();
-    let Some(interface) = snapshot
-        .interfaces
-        .iter()
-        .find(|interface| interface.id == reverse_egress)
-    else {
+    let Some(interface) = snapshot.interface(reverse_egress) else {
         return FailureDispatch::AuthorityLost;
     };
-    let Some(binding) = snapshot
-        .local_ipv4
-        .iter()
-        .find(|binding| binding.interface == reverse_egress)
-    else {
+    let Some(binding) = snapshot.local_binding_on(reverse_egress) else {
         return FailureDispatch::AuthorityLost;
     };
     let target = reverse_route.next_hop().unwrap_or(hold.original_source);
@@ -3186,11 +3184,7 @@ fn dispatch_one_failure(
         return FailureDispatch::SameFailedKey;
     }
 
-    let destination_mac = if let Some(neighbor) = snapshot
-        .neighbors
-        .iter()
-        .find(|neighbor| neighbor.interface == reverse_egress && neighbor.target == target)
-    {
+    let destination_mac = if let Some(neighbor) = snapshot.static_neighbor(reverse_egress, target) {
         neighbor.mac
     } else {
         match resolution.lookup_dynamic(reverse_egress, target, now) {
@@ -3302,14 +3296,13 @@ fn current_icmp_error_eligible(
     source[0] != 0
         && source[0] != 127
         && source[0] < 224
+        && !snapshot.is_local_ipv4(hold.original_source)
         && !snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == hold.original_source)
-        && !crate::route::lookup(snapshot.routes, hold.original_source).is_some_and(|route| {
-            route.is_prefix_network_address(hold.original_source)
-                || route.is_prefix_directed_broadcast(hold.original_source)
-        })
+            .route_lookup(hold.original_source)
+            .is_some_and(|route| {
+                route.is_prefix_network_address(hold.original_source)
+                    || route.is_prefix_directed_broadcast(hold.original_source)
+            })
 }
 
 fn host_failure_target_forbidden(
@@ -3324,15 +3317,8 @@ fn host_failure_target_forbidden(
         || octets[0] >= 224
         || octets == [255; 4]
         || target == local
-        || snapshot
-            .local_ipv4
-            .iter()
-            .any(|binding| binding.address == target)
-        || snapshot.routes.iter().any(|route| {
-            route.egress() == egress
-                && (route.is_connected_directed_broadcast(target)
-                    || route.is_connected_network_address(target))
-        })
+        || snapshot.is_local_ipv4(target)
+        || snapshot.is_connected_boundary(egress, target)
 }
 
 fn forbidden_target(target: Ipv4Address) -> bool {
