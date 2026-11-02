@@ -14,13 +14,22 @@
 //! connection to its previous phase (RFC 6146 TRANS state).
 //!
 //! The session records which flags each direction has sent: SYN, ACK, and
-//! FIN outbound (inside to outside) and inbound, and whether the last
-//! committed segment was a RST. The phase is a pure function of those bits
-//! ([`phase_of`]): a RST pending, or FIN in both directions, is closing;
-//! SYN and ACK in both directions is established (both RFC 7857's "Server
-//! SYN" and RFC 5382's "both endpoints have sent a packet with the ACK
-//! flag"); anything else is opening. A FIN in one direction only keeps the
-//! established (or opening) phase, as RFC 6146's V4/V6 FIN RCV states do.
+//! FIN outbound (inside to outside) and inbound, whether a RST is pending,
+//! and (only under [`Nat44TcpInboundRst::Corroborate`]) whether an inbound
+//! FIN still awaits outbound corroboration. The phase is a pure function of
+//! those bits ([`phase_of`]):
+//!
+//! - closing: a RST is pending, or FIN has been seen (and corroborated) in
+//!   both directions;
+//! - established: ACK seen in both directions and a SYN in at least one.
+//!   This is RFC 5382 §5's wording (the partially open phase ends when
+//!   "both endpoints have sent a packet with the ACK flag set"; a connection
+//!   starts with a SYN). It is deliberately weaker than RFC 7857 Figure 1's
+//!   "Server SYN": requiring a SYN from each side let an injected RST plus a
+//!   remote SYN (answered by a challenge ACK, RFC 5961 §4) leave an
+//!   established connection on the opening timer for good;
+//! - opening: anything else. A FIN in one direction keeps the phase, as RFC
+//!   6146's V4/V6 FIN RCV states do.
 //!
 //! No sequence numbers are tracked, so no segment is validated beyond the
 //! exact session 5-tuple the NAT already requires. That is why the phase
@@ -31,11 +40,11 @@
 /// RFC 5382 §5 phase of a TCP NAT session, which selects its idle timeout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Nat44TcpSessionPhase {
-    /// Partially open: SYN and ACK not yet seen in both directions. Uses
-    /// the opening (transitory) idle timeout.
+    /// Partially open: ACK not yet seen in both directions. Uses the
+    /// opening (transitory) idle timeout.
     Opening,
-    /// Established: SYN and ACK seen in both directions, FIN in at most one,
-    /// and no RST pending. Uses the established idle timeout.
+    /// Established: ACK seen in both directions after a SYN, FIN in at most
+    /// one, and no RST pending. Uses the established idle timeout.
     Established,
     /// Closing: FIN seen in both directions, or a RST was the last segment
     /// (RFC 7857 §2.2). Uses the closing (transitory) idle timeout.
@@ -52,6 +61,41 @@ impl Nat44TcpSessionPhase {
             Self::Opening => 0,
             Self::Established => 1,
             Self::Closing => 2,
+        }
+    }
+}
+
+/// What inbound (outside to inside) close signals and handshake ACKs do to
+/// a TCP NAT session's phase. Inbound segments can be spoofed off-path
+/// once the 5-tuple is guessed; the NAT does not track sequence numbers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub enum Nat44TcpInboundRst {
+    /// RFC 7857 §2.2 (the default): an inbound RST moves the session to the
+    /// closing timeout and an inbound FIN counts toward the closing phase,
+    /// exactly like outbound ones.
+    #[default]
+    Closing,
+    /// Local security policy: inbound segments alone never move a session
+    /// toward closing or into the established phase. An inbound RST is
+    /// translated but leaves the phase unchanged; an inbound FIN after an
+    /// outbound FIN closes only once an outbound FIN or RST corroborates
+    /// it; the outbound ACK that establishes a connection must be a segment
+    /// without SYN (so an inside SYN-ACK to a spoofed SYN, answered by a
+    /// blind spoofed ACK, stays opening). The cost: a connection the inside
+    /// host closes first, or an inbound-initiated connection on which the
+    /// inside host sends nothing after its SYN-ACK, keeps a longer (resp.
+    /// the opening) timeout.
+    Corroborate,
+}
+
+impl Nat44TcpInboundRst {
+    /// The declarative-config spelling (`inbound-rst = "..."`).
+    #[must_use]
+    pub const fn config_name(self) -> &'static str {
+        match self {
+            Self::Closing => "closing",
+            Self::Corroborate => "corroborate",
         }
     }
 }
@@ -77,6 +121,9 @@ pub(crate) struct Nat44TcpSegment {
 }
 
 impl Nat44TcpSegment {
+    /// A bare initial SYN (SYN=1, ACK/RST/FIN=0).
+    pub(crate) const INITIAL_SYN: Self = Self { flags: TCP_SYN };
+
     /// From the TCP header flags byte (offset 13).
     pub(crate) const fn from_flags(flags: u8) -> Self {
         Self { flags }
@@ -95,6 +142,7 @@ impl Nat44TcpSegment {
 
 /// Tests write segments as booleans: `true` is an initial SYN, `false` a
 /// bare ACK.
+#[cfg(test)]
 impl From<bool> for Nat44TcpSegment {
     fn from(initial_syn: bool) -> Self {
         Self::from_flags(if initial_syn { TCP_SYN } else { TCP_ACK })
@@ -109,18 +157,38 @@ pub(crate) const STATE_ACK_IN: u8 = 0x08;
 pub(crate) const STATE_FIN_OUT: u8 = 0x10;
 pub(crate) const STATE_FIN_IN: u8 = 0x20;
 pub(crate) const STATE_RESET: u8 = 0x40;
-const STATE_HANDSHAKE: u8 = STATE_SYN_OUT | STATE_SYN_IN | STATE_ACK_OUT | STATE_ACK_IN;
+/// Under [`Nat44TcpInboundRst::Corroborate`]: the inbound FIN arrived after
+/// the outbound one and no outbound FIN or RST has corroborated it yet.
+pub(crate) const STATE_FIN_IN_UNCONFIRMED: u8 = 0x80;
+const STATE_ACK_BOTH: u8 = STATE_ACK_OUT | STATE_ACK_IN;
+const STATE_SYN_ANY: u8 = STATE_SYN_OUT | STATE_SYN_IN;
 const STATE_FIN_BOTH: u8 = STATE_FIN_OUT | STATE_FIN_IN;
+
+/// FIN seen and corroborated in both directions.
+pub(crate) const fn fin_closed(state: u8) -> bool {
+    state & STATE_FIN_BOTH == STATE_FIN_BOTH && state & STATE_FIN_IN_UNCONFIRMED == 0
+}
 
 /// The phase a session state byte describes.
 pub(crate) const fn phase_of(state: u8) -> Nat44TcpSessionPhase {
-    if state & STATE_RESET != 0 || state & STATE_FIN_BOTH == STATE_FIN_BOTH {
+    if state & STATE_RESET != 0 || fin_closed(state) {
         Nat44TcpSessionPhase::Closing
-    } else if state & STATE_HANDSHAKE == STATE_HANDSHAKE {
+    } else if state & STATE_ACK_BOTH == STATE_ACK_BOTH && state & STATE_SYN_ANY != 0 {
         Nat44TcpSessionPhase::Established
     } else {
         Nat44TcpSessionPhase::Opening
     }
+}
+
+/// The state after one committed segment and whether it restarted the
+/// session as a new connection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Nat44TcpTransition {
+    pub(crate) state: u8,
+    /// The segment was an outbound initial SYN on a session closed by FIN
+    /// in both directions: the flags were cleared first (a new connection
+    /// on the same 5-tuple, created by the inside host).
+    pub(crate) restarted: bool,
 }
 
 /// The session state after `segment` from `direction` is committed on a
@@ -129,42 +197,71 @@ pub(crate) const fn phase_of(state: u8) -> Nat44TcpSessionPhase {
 /// - RST: sets the reset bit and nothing else (the closing timer; RFC 7857
 ///   §2.2, RFC 6146 ESTABLISHED/TRANS). Other flags on a RST segment are
 ///   ignored, so a RST never establishes or closes a connection by itself.
+///   A repeated RST keeps the reset bit and, as every committed segment,
+///   restarts the closing timer (RFC 6146 does not refresh TRANS on a RST;
+///   REQ-5 measures idle time, so a RST is activity). Under
+///   [`Nat44TcpInboundRst::Corroborate`] an inbound RST changes nothing.
 /// - Any other segment clears the reset bit (RFC 6146 TRANS: "If a packet
 ///   other than a RST packet is received ... The state is moved to
-///   ESTABLISHED"; here: back to the phase the flags describe).
-/// - An initial SYN on a session in the closing phase starts a new
-///   connection on the same 5-tuple (port reuse after TIME_WAIT, or a
-///   reconnect after a reset): the recorded flags are cleared first, so the
-///   new connection is opening, not stuck on the closing timer.
-/// - SYN, ACK, and FIN are recorded for the sending direction.
+///   ESTABLISHED"; here: back to the phase the flags describe, SYN
+///   included).
+/// - An outbound initial SYN on a session closed by FIN in both directions
+///   starts a new connection on the same 5-tuple (reopen from TIME-WAIT,
+///   RFC 1122 §4.2.2.13): the flags are cleared first. Inbound SYNs never
+///   restart a session: they can be spoofed.
+/// - SYN, ACK, and FIN are recorded for the sending direction (with the
+///   corroboration rules of [`Nat44TcpInboundRst::Corroborate`]).
 pub(crate) const fn next_state(
     state: u8,
     segment: Nat44TcpSegment,
     direction: Nat44TcpDirection,
-) -> u8 {
+    inbound_rst: Nat44TcpInboundRst,
+) -> Nat44TcpTransition {
+    let outbound = matches!(direction, Nat44TcpDirection::Outbound);
+    let corroborate = matches!(inbound_rst, Nat44TcpInboundRst::Corroborate);
     if segment.has(TCP_RST) {
-        return state | STATE_RESET;
-    }
-    let mut next =
-        if segment.is_initial_syn() && matches!(phase_of(state), Nat44TcpSessionPhase::Closing) {
-            0
+        let state = if outbound {
+            (state | STATE_RESET) & !STATE_FIN_IN_UNCONFIRMED
+        } else if corroborate {
+            state
         } else {
-            state & !STATE_RESET
+            state | STATE_RESET
         };
-    let (syn, ack, fin) = match direction {
-        Nat44TcpDirection::Outbound => (STATE_SYN_OUT, STATE_ACK_OUT, STATE_FIN_OUT),
-        Nat44TcpDirection::Inbound => (STATE_SYN_IN, STATE_ACK_IN, STATE_FIN_IN),
+        return Nat44TcpTransition {
+            state,
+            restarted: false,
+        };
+    }
+    let mut next = state & !STATE_RESET;
+    let restarted = outbound && segment.is_initial_syn() && fin_closed(next);
+    if restarted {
+        next = 0;
+    }
+    let (syn, ack, fin) = if outbound {
+        (STATE_SYN_OUT, STATE_ACK_OUT, STATE_FIN_OUT)
+    } else {
+        (STATE_SYN_IN, STATE_ACK_IN, STATE_FIN_IN)
     };
     if segment.has(TCP_SYN) {
         next |= syn;
     }
-    if segment.has(TCP_ACK) {
+    if segment.has(TCP_ACK) && !(corroborate && outbound && segment.has(TCP_SYN)) {
         next |= ack;
     }
     if segment.has(TCP_FIN) {
-        next |= fin;
+        if outbound {
+            next = (next | fin) & !STATE_FIN_IN_UNCONFIRMED;
+        } else if next & STATE_FIN_IN == 0 {
+            next |= fin;
+            if corroborate && next & STATE_FIN_OUT != 0 {
+                next |= STATE_FIN_IN_UNCONFIRMED;
+            }
+        }
     }
-    next
+    Nat44TcpTransition {
+        state: next,
+        restarted,
+    }
 }
 
 #[cfg(test)]
@@ -179,47 +276,80 @@ mod tests {
     const FIN_ACK: u8 = TCP_FIN | TCP_ACK;
     const RST: u8 = TCP_RST;
     const RST_ACK: u8 = TCP_RST | TCP_ACK;
+    const RFC: Nat44TcpInboundRst = Nat44TcpInboundRst::Closing;
+    const STRICT: Nat44TcpInboundRst = Nat44TcpInboundRst::Corroborate;
 
-    /// Replays segments on a new session and returns the phase after each.
-    fn phases(segments: &[(u8, Nat44TcpDirection)]) -> Vec<Nat44TcpSessionPhase> {
+    fn run(
+        policy: Nat44TcpInboundRst,
+        segments: &[(u8, Nat44TcpDirection)],
+    ) -> (Vec<Nat44TcpSessionPhase>, u8) {
         let mut state = 0;
-        segments
+        let phases = segments
             .iter()
             .map(|&(flags, direction)| {
-                state = next_state(state, Nat44TcpSegment::from_flags(flags), direction);
+                state =
+                    next_state(state, Nat44TcpSegment::from_flags(flags), direction, policy).state;
                 phase_of(state)
             })
-            .collect()
+            .collect();
+        (phases, state)
     }
 
+    /// Replays segments on a new session under the default (RFC) policy
+    /// and returns the phase after each.
+    fn phases(segments: &[(u8, Nat44TcpDirection)]) -> Vec<Nat44TcpSessionPhase> {
+        run(RFC, segments).0
+    }
+
+    const OPEN_OUT: [(u8, Nat44TcpDirection); 3] =
+        [(SYN, Outbound), (SYN_ACK, Inbound), (ACK, Outbound)];
+
     #[test]
-    fn three_way_handshake_establishes_on_the_final_ack_in_both_directions() {
-        // Outbound-initiated.
+    fn three_way_handshake_establishes_on_the_final_ack() {
+        for policy in [RFC, STRICT] {
+            assert_eq!(run(policy, &OPEN_OUT).0, [Opening, Opening, Established]);
+            // Simultaneous open (RFC 9293 figure 8) then data.
+            assert_eq!(
+                run(
+                    policy,
+                    &[
+                        (SYN, Outbound),
+                        (SYN, Inbound),
+                        (SYN_ACK, Outbound),
+                        (SYN_ACK, Inbound),
+                        (ACK, Outbound)
+                    ]
+                )
+                .0[4],
+                Established
+            );
+        }
+        // Inbound-initiated: under the RFC policy the inside SYN-ACK is the
+        // inside's ACK; under corroboration a later outbound ACK is needed.
+        let inbound = [
+            (SYN, Inbound),
+            (SYN_ACK, Outbound),
+            (ACK, Inbound),
+            (ACK, Outbound),
+        ];
         assert_eq!(
-            phases(&[(SYN, Outbound), (SYN_ACK, Inbound), (ACK, Outbound)]),
-            [Opening, Opening, Established]
+            phases(&inbound),
+            [Opening, Opening, Established, Established]
         );
-        // Inbound-initiated (an admitted external SYN).
         assert_eq!(
-            phases(&[(SYN, Inbound), (SYN_ACK, Outbound), (ACK, Inbound)]),
-            [Opening, Opening, Established]
-        );
-        // Simultaneous open (RFC 9293 §3.5 figure 8).
-        assert_eq!(
-            phases(&[
-                (SYN, Outbound),
-                (SYN, Inbound),
-                (SYN_ACK, Outbound),
-                (SYN_ACK, Inbound)
-            ]),
+            run(STRICT, &inbound).0,
             [Opening, Opening, Opening, Established]
         );
     }
 
     #[test]
-    fn a_spoofed_syn_answered_only_by_the_inside_stays_opening() {
-        // An off-path SYN, the inside SYN-ACK and its retransmissions: the
-        // remote never ACKs, so the session keeps the transitory timer.
+    fn established_needs_acks_both_ways_and_a_syn() {
+        // RFC 5382 §5: ACK from both endpoints after a SYN.
+        assert_eq!(
+            phases(&[(SYN, Outbound), (ACK, Inbound), (ACK, Outbound)]),
+            [Opening, Opening, Established]
+        );
+        // A spoofed SYN answered by the inside only stays opening.
         assert_eq!(
             phases(&[
                 (SYN, Inbound),
@@ -229,34 +359,45 @@ mod tests {
             ]),
             [Opening; 4]
         );
-        // Acks without SYNs in both directions never establish.
+        assert_eq!(phase_of(STATE_ACK_BOTH), Opening);
+        assert_eq!(phase_of(STATE_ACK_BOTH | STATE_SYN_IN), Established);
+        assert_eq!(phase_of(STATE_ACK_BOTH | STATE_SYN_OUT), Established);
+    }
+
+    /// The adaptive blind spoof: SYN, the inside SYN-ACK, a blind ACK, the
+    /// inside RST for the unacceptable ACK, another blind ACK. The RFC
+    /// policy cannot tell this from a real handshake; corroboration can.
+    #[test]
+    fn a_blind_spoofed_handshake_establishes_only_under_the_rfc_policy() {
+        let spoof = [
+            (SYN, Inbound),
+            (SYN_ACK, Outbound),
+            (ACK, Inbound),
+            (RST, Outbound),
+            (ACK, Inbound),
+        ];
+        assert_eq!(phases(&spoof)[4], Established);
         assert_eq!(
-            phases(&[(SYN, Outbound), (ACK, Inbound), (ACK, Outbound)]),
-            [Opening; 3]
+            run(STRICT, &spoof).0,
+            [Opening, Opening, Opening, Closing, Opening]
         );
     }
 
     #[test]
     fn fin_in_both_directions_closes_and_one_fin_keeps_the_phase() {
-        let open = [(SYN, Outbound), (SYN_ACK, Inbound), (ACK, Outbound)];
         for (first, second) in [(Outbound, Inbound), (Inbound, Outbound)] {
-            let mut segments = open.to_vec();
-            segments.extend([(FIN_ACK, first), (ACK, second), (ACK, second)]);
-            segments.extend([(FIN_ACK, second), (ACK, first), (ACK, second)]);
+            let mut segments = OPEN_OUT.to_vec();
+            segments.extend([
+                (FIN_ACK, first),
+                (ACK, second),
+                (FIN_ACK, second),
+                (ACK, first),
+            ]);
             assert_eq!(
                 phases(&segments)[2..],
-                [
-                    Established,
-                    Established,
-                    Established,
-                    Established,
-                    Closing,
-                    Closing,
-                    Closing
-                ]
+                [Established, Established, Established, Closing, Closing]
             );
         }
-        // A FIN during the handshake keeps it opening until both sides FIN.
         assert_eq!(
             phases(&[(SYN, Outbound), (FIN_ACK, Outbound), (FIN_ACK, Inbound)]),
             [Opening, Opening, Closing]
@@ -264,11 +405,38 @@ mod tests {
     }
 
     #[test]
+    fn corroboration_needs_an_outbound_fin_or_rst_after_an_inbound_fin() {
+        // Remote closes first: the inside FIN corroborates at once.
+        let mut remote_first = OPEN_OUT.to_vec();
+        remote_first.extend([(FIN_ACK, Inbound), (FIN_ACK, Outbound)]);
+        assert_eq!(run(STRICT, &remote_first).0[3..], [Established, Closing]);
+        // Inside closes first: the inbound FIN alone does not close...
+        let mut inside_first = OPEN_OUT.to_vec();
+        inside_first.extend([(FIN_ACK, Outbound), (FIN_ACK, Inbound), (ACK, Outbound)]);
+        let (phases_seen, state) = run(STRICT, &inside_first);
+        assert_eq!(phases_seen[3..], [Established, Established, Established]);
+        assert_ne!(state & STATE_FIN_IN_UNCONFIRMED, 0);
+        // ...until an outbound FIN (retransmission) or RST corroborates it.
+        for corroboration in [FIN_ACK, RST] {
+            let mut segments = inside_first.to_vec();
+            segments.push((corroboration, Outbound));
+            let (phases_seen, state) = run(STRICT, &segments);
+            assert_eq!(phases_seen[6], Closing);
+            assert_eq!(state & STATE_FIN_IN_UNCONFIRMED, 0);
+        }
+        // A retransmitted inbound FIN never re-arms the confirmation.
+        let mut retransmit = remote_first.to_vec();
+        retransmit.push((FIN_ACK, Inbound));
+        assert_eq!(run(STRICT, &retransmit).0[5], Closing);
+        // The RFC policy closes on the inbound FIN.
+        assert_eq!(phases(&inside_first)[4], Closing);
+    }
+
+    #[test]
     fn rst_moves_to_closing_and_a_later_segment_restores_the_phase() {
-        let open = [(SYN, Outbound), (SYN_ACK, Inbound), (ACK, Outbound)];
         for direction in [Outbound, Inbound] {
             for rst in [RST, RST_ACK, RST | TCP_FIN, RST | TCP_SYN] {
-                let mut segments = open.to_vec();
+                let mut segments = OPEN_OUT.to_vec();
                 segments.extend([(rst, direction), (rst, direction), (ACK, Inbound)]);
                 assert_eq!(
                     phases(&segments)[2..],
@@ -277,8 +445,14 @@ mod tests {
                 );
             }
         }
-        // A RST while opening also uses the closing timer and records no
-        // other flag: RST|ACK does not count as the handshake ACK.
+        // Corroborate: an inbound RST changes nothing, an outbound one closes.
+        let mut segments = OPEN_OUT.to_vec();
+        segments.extend([(RST, Inbound), (RST, Outbound), (ACK, Outbound)]);
+        assert_eq!(
+            run(STRICT, &segments).0[2..],
+            [Established, Established, Closing, Established]
+        );
+        // RST|ACK while opening: closing, and the ACK is not recorded.
         assert_eq!(
             phases(&[
                 (SYN, Outbound),
@@ -288,113 +462,124 @@ mod tests {
             ]),
             [Opening, Opening, Closing, Opening]
         );
-        // After FIN in both directions, a RST stays closing and a later ACK
-        // returns to closing (the FINs are still recorded).
-        assert_eq!(
-            phases(&[
-                (SYN, Outbound),
-                (SYN_ACK, Inbound),
-                (ACK, Outbound),
-                (FIN_ACK, Outbound),
-                (FIN_ACK, Inbound),
-                (RST, Inbound),
-                (ACK, Outbound)
-            ])[4..],
-            [Closing, Closing, Closing]
-        );
     }
 
+    /// Review M1: an injected RST and a remote SYN on an established
+    /// connection, answered by the inside challenge ACK (RFC 5961 §4), must
+    /// leave it established, not reset to opening.
     #[test]
-    fn an_initial_syn_restarts_only_a_closing_session() {
-        let closed = [
-            (SYN, Outbound),
-            (SYN_ACK, Inbound),
+    fn a_spoofed_rst_and_syn_never_downgrade_an_established_connection() {
+        let mut segments = OPEN_OUT.to_vec();
+        segments.extend([
+            (RST, Inbound),
+            (SYN, Inbound),
             (ACK, Outbound),
-            (FIN_ACK, Outbound),
-            (FIN_ACK, Inbound),
-        ];
-        for direction in [Outbound, Inbound] {
-            let mut segments = closed.to_vec();
-            segments.push((SYN, direction));
-            assert_eq!(phases(&segments)[5], Opening);
-            let mut state = 0;
-            for &(flags, dir) in &segments {
-                state = next_state(state, Nat44TcpSegment::from_flags(flags), dir);
-            }
-            let expected = match direction {
-                Outbound => STATE_SYN_OUT,
-                Inbound => STATE_SYN_IN,
-            };
-            assert_eq!(state, expected);
-        }
-        // After a reset too.
+            (ACK, Inbound),
+        ]);
         assert_eq!(
-            phases(&[
-                (SYN, Outbound),
-                (SYN_ACK, Inbound),
-                (ACK, Outbound),
-                (RST, Inbound),
-                (SYN, Outbound)
-            ])[3..],
-            [Closing, Opening]
-        );
-        // A SYN on an established session does not reset it.
-        assert_eq!(
-            phases(&[
-                (SYN, Outbound),
-                (SYN_ACK, Inbound),
-                (ACK, Outbound),
-                (SYN, Outbound)
-            ])[3],
-            Established
+            phases(&segments)[2..],
+            [Established, Closing, Established, Established, Established]
         );
     }
 
     #[test]
-    fn the_transition_is_total_and_phase_depends_only_on_the_bits() {
-        // Every state byte reachable from 0, every flags byte, both
-        // directions: the result keeps only defined bits, and a RST never
-        // clears a bit.
-        let defined = STATE_HANDSHAKE | STATE_FIN_BOTH | STATE_RESET;
-        let mut reachable = vec![0_u8];
-        let mut seen = [false; 256];
-        seen[0] = true;
-        while let Some(state) = reachable.pop() {
-            for flags in 0..=u8::MAX {
-                for direction in [Outbound, Inbound] {
-                    let next = next_state(state, Nat44TcpSegment::from_flags(flags), direction);
-                    assert_eq!(next & !defined, 0);
-                    if flags & TCP_RST != 0 {
-                        assert_eq!(next, state | STATE_RESET);
-                    } else {
-                        assert_eq!(next & STATE_RESET, 0);
-                    }
-                    if !seen[usize::from(next)] {
-                        seen[usize::from(next)] = true;
-                        reachable.push(next);
+    fn only_an_outbound_initial_syn_restarts_a_fin_closed_session() {
+        let mut closed = OPEN_OUT.to_vec();
+        closed.extend([(FIN_ACK, Outbound), (FIN_ACK, Inbound)]);
+        for policy in [RFC, STRICT] {
+            let mut segments = closed.to_vec();
+            segments.push((SYN, Outbound));
+            let mut state = 0;
+            let mut restarts = Vec::new();
+            for &(flags, direction) in &segments {
+                let transition =
+                    next_state(state, Nat44TcpSegment::from_flags(flags), direction, policy);
+                state = transition.state;
+                restarts.push(transition.restarted);
+            }
+            if policy == RFC {
+                assert_eq!(restarts, [false, false, false, false, false, true]);
+                assert_eq!(state, STATE_SYN_OUT);
+            } else {
+                // Inside closed first: the inbound FIN is unconfirmed, so
+                // the session is not closed and the SYN does not restart.
+                assert!(!restarts[5]);
+            }
+        }
+        // An inbound SYN never restarts (it can be spoofed).
+        let mut segments = closed.to_vec();
+        segments.push((SYN, Inbound));
+        assert_eq!(phases(&segments)[5], Closing);
+        // After a RST (not FIN), an outbound SYN recovers without a restart.
+        let mut segments = OPEN_OUT.to_vec();
+        segments.extend([(RST, Inbound), (SYN, Outbound)]);
+        let (phases_seen, state) = run(RFC, &segments);
+        assert_eq!(phases_seen[3..], [Closing, Established]);
+        assert_ne!(state & STATE_ACK_BOTH, 0);
+    }
+
+    #[test]
+    fn the_transition_is_total_and_rst_handling_holds_in_every_reachable_state() {
+        for policy in [RFC, STRICT] {
+            let mut reachable = vec![0_u8];
+            let mut seen = [false; 256];
+            seen[0] = true;
+            while let Some(state) = reachable.pop() {
+                for flags in 0..=u8::MAX {
+                    for direction in [Outbound, Inbound] {
+                        let segment = Nat44TcpSegment::from_flags(flags);
+                        let transition = next_state(state, segment, direction, policy);
+                        let next = transition.state;
+                        if flags & TCP_RST != 0 {
+                            // Never clears a flag; sets reset unless an
+                            // inbound RST under corroboration.
+                            assert_eq!(
+                                next & state & !STATE_FIN_IN_UNCONFIRMED,
+                                state & !STATE_FIN_IN_UNCONFIRMED
+                            );
+                            let expect_reset = direction == Outbound || policy == RFC;
+                            assert_eq!(
+                                next & STATE_RESET != 0,
+                                expect_reset || state & STATE_RESET != 0
+                            );
+                        } else {
+                            assert_eq!(next & STATE_RESET, 0);
+                        }
+                        // A restart is only an outbound initial SYN on a
+                        // FIN-closed session.
+                        assert_eq!(
+                            transition.restarted,
+                            direction == Outbound
+                                && segment.is_initial_syn()
+                                && fin_closed(state & !STATE_RESET)
+                        );
+                        // An established session never leaves the
+                        // established phase for opening without a restart.
+                        if phase_of(state & !STATE_RESET) == Established && !transition.restarted {
+                            assert_ne!(phase_of(next), Opening);
+                        }
+                        if policy == RFC {
+                            assert_eq!(next & STATE_FIN_IN_UNCONFIRMED, 0);
+                        }
+                        if !seen[usize::from(next)] {
+                            seen[usize::from(next)] = true;
+                            reachable.push(next);
+                        }
                     }
                 }
             }
-        }
-        assert_eq!(seen.iter().filter(|seen| **seen).count(), 128);
-        assert_eq!(phase_of(STATE_HANDSHAKE), Established);
-        assert_eq!(phase_of(STATE_HANDSHAKE | STATE_FIN_OUT), Established);
-        assert_eq!(phase_of(STATE_HANDSHAKE | STATE_FIN_IN), Established);
-        assert_eq!(phase_of(STATE_FIN_BOTH), Closing);
-        assert_eq!(phase_of(STATE_RESET), Closing);
-        for missing in [STATE_SYN_OUT, STATE_SYN_IN, STATE_ACK_OUT, STATE_ACK_IN] {
-            assert_eq!(phase_of(STATE_HANDSHAKE & !missing), Opening);
         }
     }
 
     #[test]
     fn booleans_map_to_initial_syn_and_bare_ack() {
         assert!(Nat44TcpSegment::from(true).is_initial_syn());
+        assert!(Nat44TcpSegment::INITIAL_SYN.is_initial_syn());
         assert!(!Nat44TcpSegment::from(false).is_initial_syn());
         for flags in [SYN_ACK, SYN | RST, SYN | TCP_FIN, ACK] {
             assert!(!Nat44TcpSegment::from_flags(flags).is_initial_syn());
         }
-        // ECE/CWR/URG/PSH do not change the initial-SYN predicate.
+        // ECE/CWR/PSH do not change the initial-SYN predicate.
         assert!(Nat44TcpSegment::from_flags(SYN | 0xc8).is_initial_syn());
     }
 }

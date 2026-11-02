@@ -806,6 +806,81 @@ fn plan_text_renders_the_tcp_inbound_limit_as_a_reloadable_typed_delta() {
     assert!(!stderr.contains("17"), "{stderr}");
 }
 
+/// N1: `inbound-rst` is a reloadable typed delta; the transitory timers
+/// are opaque policy; an unknown `inbound-rst` value is a value-free type
+/// error.
+#[test]
+fn plan_text_renders_the_tcp_inbound_rst_policy_and_timers() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let with = |name: &str, line: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "allocator-seed = \"2\"\n",
+                &format!("allocator-seed = \"2\"\n{line}\n"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let current = fixtures().join("router-v1.toml");
+    let strict = with("tcp-corroborate.toml", "inbound-rst = \"corroborate\"");
+    for (from, to, line) in [
+        (
+            &current,
+            &strict,
+            "  nat44-tcp inbound-rst ~ closing -> corroborate\n",
+        ),
+        (
+            &strict,
+            &current,
+            "  nat44-tcp inbound-rst ~ corroborate -> closing\n",
+        ),
+    ] {
+        let plan = ruster(&["plan".as_ref(), from.as_os_str(), to.as_os_str()]);
+        assert_eq!(status(&plan), 0);
+        let stdout = text(&plan.stdout);
+        assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+        assert!(stdout.contains(line), "{stdout}");
+        assert!(!stdout.contains("policy ~ changed"), "{stdout}");
+    }
+    let timer = with("tcp-closing.toml", "closing-idle-ttl-ms = 300000");
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), timer.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    let stdout = text(&plan.stdout);
+    assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+    assert!(
+        stdout.contains("  nat44-tcp policy ~ changed\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("300000"), "{stdout}");
+    for (name, line, path) in [
+        (
+            "tcp-bad-rst.toml",
+            "inbound-rst = \"drop\"",
+            "nat44.tcp.inbound-rst",
+        ),
+        (
+            "tcp-short.toml",
+            "opening-idle-ttl-ms = 239999",
+            "nat44.tcp.opening-idle-ttl-ms",
+        ),
+    ] {
+        let invalid = with(name, line);
+        let output = ruster(&["validate".as_ref(), invalid.as_os_str()]);
+        assert_eq!(status(&output), 2);
+        let stderr = text(&output.stderr);
+        assert!(stderr.contains(&format!("path={path}")), "{stderr}");
+        assert!(
+            !stderr.contains("drop") && !stderr.contains("239999"),
+            "{stderr}"
+        );
+    }
+}
+
 /// B3: the RFC 5382 REQ-4 switch is a reloadable typed delta, and the hold
 /// capacity is restart-required storage shape (value-free, like every
 /// capacity).

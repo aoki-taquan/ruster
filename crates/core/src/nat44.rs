@@ -19,7 +19,8 @@ use crate::{
         MAX_SYN_HOLD_SLOTS,
     },
     nat44_tcp_state::{
-        next_state, phase_of, Nat44TcpDirection, Nat44TcpSegment, Nat44TcpSessionPhase,
+        fin_closed, next_state, phase_of, Nat44TcpDirection, Nat44TcpInboundRst, Nat44TcpSegment,
+        Nat44TcpSessionPhase,
     },
     slot_list::{Linked, SlotLinks, SlotList, LINK_NONE},
     DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, Nat44TcpSynHoldSlot,
@@ -5864,6 +5865,7 @@ pub struct Nat44TcpPolicy {
     hairpinning: bool,
     inbound_sessions_per_remote: u8,
     unsolicited_syn_icmp: bool,
+    inbound_rst: Nat44TcpInboundRst,
 }
 
 impl std::fmt::Debug for Nat44TcpPolicy {
@@ -5882,6 +5884,7 @@ impl std::fmt::Debug for Nat44TcpPolicy {
                 &self.inbound_sessions_per_remote,
             )
             .field("unsolicited_syn_icmp", &self.unsolicited_syn_icmp)
+            .field("inbound_rst", &self.inbound_rst)
             .finish()
     }
 }
@@ -5930,6 +5933,7 @@ impl Nat44TcpPolicy {
             hairpinning: true,
             inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
             unsolicited_syn_icmp: true,
+            inbound_rst: Nat44TcpInboundRst::Closing,
         })
     }
 
@@ -6150,6 +6154,24 @@ impl Nat44TcpPolicy {
     pub const fn unsolicited_syn_icmp(self) -> bool {
         self.unsolicited_syn_icmp
     }
+
+    /// Selects what inbound RST and FIN segments (and the handshake ACK)
+    /// do to a session's phase. The default
+    /// [`Nat44TcpInboundRst::Closing`] is RFC 7857 §2.2;
+    /// [`Nat44TcpInboundRst::Corroborate`] is a local security policy
+    /// against spoofed inbound segments (the NAT tracks no sequence
+    /// numbers).
+    #[must_use]
+    pub const fn with_inbound_rst(mut self, inbound_rst: Nat44TcpInboundRst) -> Self {
+        self.inbound_rst = inbound_rst;
+        self
+    }
+
+    /// The inbound RST/FIN policy (default [`Nat44TcpInboundRst::Closing`]).
+    #[must_use]
+    pub const fn inbound_rst(self) -> Nat44TcpInboundRst {
+        self.inbound_rst
+    }
 }
 
 impl Default for Nat44TcpPolicy {
@@ -6164,6 +6186,7 @@ impl Default for Nat44TcpPolicy {
             hairpinning: true,
             inbound_sessions_per_remote: NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE,
             unsolicited_syn_icmp: true,
+            inbound_rst: Nat44TcpInboundRst::Closing,
         }
     }
 }
@@ -6395,10 +6418,13 @@ pub struct Nat44TcpMappingSlot {
     /// The mapping is live strictly before this time. Every commit sets it
     /// to `now + idle_ttl_ms` when the committed session is established;
     /// otherwise to `now` + the longer transitory TTL when no established
-    /// session remains, else to the larger of that and its current value.
-    /// It is therefore never earlier than any session's expiry (a session
-    /// of an expired mapping has expired), and the mapping expires with
-    /// its last session once no session is established.
+    /// session remains (`established_sessions == 0`; an established session
+    /// counts while its slot stays occupied, live or expired, until the slot
+    /// is reclaimed), else to the larger of that and its current value. It
+    /// is therefore never earlier than any session's expiry (a session of an
+    /// expired mapping has expired). Once no established session remains
+    /// the mapping expires with its last session; until then it can outlive
+    /// its sessions, and may even be live with none left.
     expires_ms: u64,
     link: TcpMappingLink,
 }
@@ -6918,7 +6944,6 @@ enum Nat44TcpIndexInvariantError {
     Port(PortOwnerSemanticError),
     DuplicateMappingKey,
     DuplicateSessionKey,
-    MappingWithoutCurrentSession,
     MappingSummaryMismatch,
     MappingExpiresBeforeSession,
     EstablishedCountMismatch,
@@ -7633,7 +7658,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                     Nat44TcpDirection::Outbound,
                     false,
                     now_ms,
-                );
+                )?;
                 return self.prepare_outbound_plan(
                     Nat44TcpOutboundPlan {
                         authority: self.plan_authority(now_ms, mapping_before, session_before),
@@ -7677,7 +7702,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                 Nat44TcpDirection::Outbound,
                 self.established_owner(session_before) == Some(mapping_index),
                 now_ms,
-            );
+            )?;
             return self.prepare_outbound_plan(
                 Nat44TcpOutboundPlan {
                     authority: self.plan_authority(now_ms, mapping_before, session_before),
@@ -7752,7 +7777,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             Nat44TcpDirection::Outbound,
             false,
             now_ms,
-        );
+        )?;
         self.prepare_outbound_plan(
             Nat44TcpOutboundPlan {
                 authority: self.plan_authority(now_ms, mapping_before, session_before),
@@ -7902,7 +7927,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                 Nat44TcpDirection::Inbound,
                 false,
                 now_ms,
-            );
+            )?;
             return Ok(Nat44TcpInboundPlan {
                 authority: self.plan_authority(now_ms, mapping_before, session_before),
                 mapping_index,
@@ -7955,7 +7980,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             Nat44TcpDirection::Inbound,
             self.established_owner(session_before) == Some(mapping_index),
             now_ms,
-        );
+        )?;
         let prepared = self.prepare_session_link(session_index, session)?;
         Ok(Nat44TcpInboundPlan {
             authority: self.plan_authority(now_ms, mapping_before, session_before),
@@ -8191,6 +8216,8 @@ impl<'a> Nat44TcpRuntime<'a> {
             || !self.session_link_matches(plan.prepared.session)
             || !self.mapping_target_matches_lists(plan.mapping_index())
             || !self.session_target_matches_lists(plan.session_index())
+            || (plan.session_created
+                && !self.released_count_matches(plan.session_index(), plan.mapping_index()))
         {
             return Err(Nat44TcpCommitError::StalePlan);
         }
@@ -8437,6 +8464,8 @@ impl<'a> Nat44TcpRuntime<'a> {
         if !self.session_link_matches(plan.prepared)
             || !self.mapping_target_matches_lists(plan.mapping_index)
             || !self.session_target_matches_lists(plan.session_index)
+            || (plan.session_created
+                && !self.released_count_matches(plan.session_index, plan.mapping_index))
         {
             return Err(Nat44TcpCommitError::StalePlan);
         }
@@ -8595,10 +8624,23 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// - otherwise, if the established-list expiry still lies beyond that,
     ///   it is kept (and the slot keeps its place); else as above.
     ///
-    /// So the mapping never expires before any of its sessions, which the
-    /// session reuse search relies on, and each activity list stays in
-    /// expiry order: a slot pushed to a tail gets `now` + the list's TTL,
-    /// the largest expiry on that list.
+    /// "No established session left" counts every occupied session slot of
+    /// this generation in the established phase, live or expired: an
+    /// expired established session keeps the mapping on its established
+    /// expiry until its slot is reclaimed. So the mapping never expires
+    /// before any of its sessions, which the session reuse search relies
+    /// on, and each activity list stays in expiry order: a slot pushed to a
+    /// tail gets `now` + the list's TTL, the largest expiry on that list.
+    ///
+    /// An outbound initial SYN that restarts a FIN-closed session starts an
+    /// outbound-initiated connection, so the session stops counting as
+    /// externally created.
+    ///
+    /// # Errors
+    ///
+    /// [`Nat44TcpPlanError::IndexCorrupt`] when the mapping's established
+    /// count is lower than the established sessions this commit releases
+    /// (bookkeeping drift; fail closed in release builds too).
     fn stamp_session(
         &self,
         mapping: &mut Nat44TcpMappingSlot,
@@ -8607,23 +8649,27 @@ impl<'a> Nat44TcpRuntime<'a> {
         direction: Nat44TcpDirection,
         released_own_established: bool,
         now_ms: u64,
-    ) {
+    ) -> Result<(), Nat44TcpPlanError> {
         let policy = self.config.policy;
         let was_established = session.phase() == Nat44TcpSessionPhase::Established;
-        session.state = next_state(session.state, segment, direction);
+        let transition = next_state(session.state, segment, direction, policy.inbound_rst);
+        session.state = transition.state;
+        if transition.restarted {
+            session.external_inbound = false;
+        }
         session.last_activity_ms = now_ms;
         let established = session.phase() == Nat44TcpSessionPhase::Established;
         let released = u32::from(was_established) + u32::from(released_own_established);
-        debug_assert!(mapping.established_sessions >= released);
         mapping.established_sessions = mapping
             .established_sessions
-            .saturating_sub(released)
-            .saturating_add(u32::from(established));
+            .checked_sub(released)
+            .ok_or(Nat44TcpPlanError::IndexCorrupt)?
+            + u32::from(established);
         mapping.last_activity_ms = now_ms;
         if established {
             mapping.expires_ms = now_ms.saturating_add(policy.idle_ttl_ms);
             mapping.link.list = TcpMappingList::Established;
-            return;
+            return Ok(());
         }
         let transitory = now_ms.saturating_add(policy.transitory_bound_ms());
         let keep_established = mapping.established_sessions != 0
@@ -8633,6 +8679,16 @@ impl<'a> Nat44TcpRuntime<'a> {
             mapping.expires_ms = transitory;
             mapping.link.list = TcpMappingList::Transitory;
         }
+        Ok(())
+    }
+
+    /// Release-build cross-check of a commit that reclaims an expired
+    /// established session of another mapping: that mapping's established
+    /// count must include it.
+    fn released_count_matches(&self, session_index: usize, mapping_index: usize) -> bool {
+        self.established_owner(self.sessions[session_index])
+            .filter(|owner| *owner != mapping_index)
+            .is_none_or(|owner| self.mappings[owner].established_sessions > 0)
     }
 
     /// The mapping slot whose established-session count includes
@@ -8694,14 +8750,10 @@ impl<'a> Nat44TcpRuntime<'a> {
                 self.counters.sessions_established.saturating_add(1);
         }
         let reset = crate::nat44_tcp_state::STATE_RESET;
-        let fin_both = crate::nat44_tcp_state::STATE_FIN_OUT | crate::nat44_tcp_state::STATE_FIN_IN;
         if session.state & reset != 0 && before_state & reset == 0 {
             self.counters.sessions_reset = self.counters.sessions_reset.saturating_add(1);
         }
-        if session.state & reset == 0
-            && session.state & fin_both == fin_both
-            && before_state & fin_both != fin_both
-        {
+        if session.state & reset == 0 && fin_closed(session.state) && !fin_closed(before_state) {
             self.counters.sessions_closed = self.counters.sessions_closed.saturating_add(1);
         }
     }
@@ -9500,16 +9552,14 @@ impl<'a> Nat44TcpRuntime<'a> {
             if established != mapping.established_sessions {
                 return Err(Nat44TcpIndexInvariantError::EstablishedCountMismatch);
             }
-            if self
-                .watermark_ms
-                .is_some_and(|now_ms| self.mapping_is_live(mapping, now_ms))
-            {
-                let Some(maximum) = maximum else {
-                    return Err(Nat44TcpIndexInvariantError::MappingWithoutCurrentSession);
-                };
-                if maximum != mapping.last_activity_ms {
-                    return Err(Nat44TcpIndexInvariantError::MappingSummaryMismatch);
-                }
+            // The mapping's activity is its latest commit, so no session of
+            // it is more recent. Since N1 a live mapping may have no session
+            // left (an expired established session kept it on the
+            // established expiry, or its sessions expired on a shorter
+            // phase TTL and were reclaimed), so neither equality nor the
+            // presence of a session is an invariant any more.
+            if maximum.is_some_and(|maximum| maximum > mapping.last_activity_ms) {
+                return Err(Nat44TcpIndexInvariantError::MappingSummaryMismatch);
             }
         }
         for (index, session) in self.sessions.iter().copied().enumerate() {
@@ -9798,13 +9848,14 @@ mod tests {
             "Nat44TcpPolicy { idle_ttl_ms: 7440000, opening_idle_ttl_ms: 240000, \
              closing_idle_ttl_ms: 240000, allocator_seed: [REDACTED], \
              icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
-             inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true }"
+             inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true, \
+             inbound_rst: Closing }"
         );
         assert_eq!(
             format!("{tcp_policy:#?}"),
             "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    opening_idle_ttl_ms: 240000,\n    closing_idle_ttl_ms: 240000,\n    allocator_seed: [REDACTED],\n    \
              icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n    \
-             inbound_sessions_per_remote: 0,\n    unsolicited_syn_icmp: true,\n}"
+             inbound_sessions_per_remote: 0,\n    unsolicited_syn_icmp: true,\n    inbound_rst: Closing,\n}"
         );
 
         with_config(udp_policy, |udp_config| {
@@ -9847,7 +9898,7 @@ mod tests {
                  Nat44TcpPolicy { idle_ttl_ms: 7440000, opening_idle_ttl_ms: 240000, \
                  closing_idle_ttl_ms: 240000, allocator_seed: [REDACTED], \
                  icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
-                 inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true }, authority: \
+                 inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true, inbound_rst: Closing }, authority: \
                  [REDACTED], snapshot_identity: \
                  [REDACTED] }"
             );
@@ -9870,7 +9921,7 @@ mod tests {
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
                  idle_ttl_ms: 7440000,\n        opening_idle_ttl_ms: 240000,\n        closing_idle_ttl_ms: 240000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
                  ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n        \
-                 inbound_sessions_per_remote: 0,\n        unsolicited_syn_icmp: true,\n    },\n    authority: \
+                 inbound_sessions_per_remote: 0,\n        unsolicited_syn_icmp: true,\n        inbound_rst: Closing,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
                  [REDACTED],\n}"
             );

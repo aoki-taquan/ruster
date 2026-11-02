@@ -449,6 +449,33 @@ fn tcp_transitory_idle_ttls_are_reloadable_policy_changes() {
     }
 }
 
+/// N1: `inbound-rst` is a reloadable typed TCP delta outside the opaque
+/// policy flag; spelling out the default is no change.
+#[test]
+fn tcp_inbound_rst_is_a_reloadable_typed_delta() {
+    use ruster_core::Nat44TcpInboundRst;
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    only(
+        &plan(&[(TCP, "allocator-seed = \"11\"\ninbound-rst = \"closing\"\n")]),
+        &[],
+    );
+    let strict = plan(&[(
+        TCP,
+        "allocator-seed = \"11\"\ninbound-rst = \"corroborate\"\n",
+    )]);
+    only(&strict, &["nat44_tcp"]);
+    assert_eq!(
+        strict.nat44_tcp().inbound_rst,
+        Some(Delta {
+            old: Nat44TcpInboundRst::Closing,
+            new: Nat44TcpInboundRst::Corroborate
+        })
+    );
+    assert!(!strict.nat44_tcp().policy_changed);
+    assert!(strict.restart_required().is_empty());
+    assert_eq!(strict.nat44_udp().inbound_rst, None);
+}
+
 /// B3: the RFC 5382 REQ-4 switch is a reloadable typed TCP delta outside
 /// the opaque policy flag; the hold capacity is storage shape.
 #[test]

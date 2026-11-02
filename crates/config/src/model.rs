@@ -253,6 +253,17 @@ pub enum Nat44FilteringV1 {
     AddressAndPortDependent,
 }
 
+/// `[nat44.tcp] inbound-rst`: `closing` (default, RFC 7857 §2.2) or
+/// `corroborate` (inbound RST/FIN and handshake ACKs need outbound
+/// corroboration).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Nat44TcpInboundRstV1 {
+    #[default]
+    Closing,
+    Corroborate,
+}
+
 /// Raw textual NAT allocator seed with redacted formatting.
 ///
 /// TOML integers are signed 64-bit values, so V1 uses text to preserve the
@@ -340,6 +351,10 @@ pub struct Nat44TcpV1 {
     /// REQ-4 a silent drop as the only policy.
     #[serde(default = "enabled")]
     pub unsolicited_syn_icmp: bool,
+    /// What inbound RST/FIN segments do to a session's phase; absent means
+    /// `closing` (RFC 7857 §2.2). `corroborate` is a local security policy.
+    #[serde(default)]
+    pub inbound_rst: Nat44TcpInboundRstV1,
     pub capacity: Nat44TcpCapacityV1,
 }
 

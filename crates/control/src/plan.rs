@@ -35,8 +35,8 @@ use ruster_config::{
 };
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    Nat44Filtering, Nat44TcpHashKey, Nat44UdpHashKey, Neighbor, PublicationQuiescence,
-    ResolutionHashKey, Route,
+    Nat44Filtering, Nat44TcpHashKey, Nat44TcpInboundRst, Nat44UdpHashKey, Neighbor,
+    PublicationQuiescence, ResolutionHashKey, Route,
 };
 
 use crate::{
@@ -138,9 +138,9 @@ pub struct NatPortRange {
 }
 
 /// Difference of one NAT44 protocol. The filtering behavior, the
-/// hairpinning switch, the TCP per-remote inbound session limit, and the TCP
-/// unsolicited-SYN ICMP switch are not secret and are reported as typed
-/// deltas. The rest of the policy (which
+/// hairpinning switch, the TCP per-remote inbound session limit, the TCP
+/// unsolicited-SYN ICMP switch, and the TCP inbound-RST policy are not
+/// secret and are reported as typed deltas. The rest of the policy (which
 /// includes the allocator seed) is never exposed, only whether it changed:
 /// `policy_changed` ignores changes of only those values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,6 +155,9 @@ pub struct NatChange {
     /// TCP only (always `None` for UDP): the RFC 5382 REQ-4 delayed ICMP
     /// Port Unreachable switch (`unsolicited-syn-icmp`).
     pub unsolicited_syn_icmp: Option<Delta<bool>>,
+    /// TCP only (always `None` for UDP): what inbound RST/FIN segments do
+    /// to a session's phase (`inbound-rst`).
+    pub inbound_rst: Option<Delta<Nat44TcpInboundRst>>,
     pub policy_changed: bool,
 }
 
@@ -167,6 +170,7 @@ impl NatChange {
             && self.hairpinning.is_none()
             && self.inbound_sessions_per_remote.is_none()
             && self.unsolicited_syn_icmp.is_none()
+            && self.inbound_rst.is_none()
             && !self.policy_changed
     }
 }
@@ -593,42 +597,52 @@ fn nat_change(
 ) -> NatChange {
     let (old_realm, old_ports) = nat_parts(old, protocol);
     let (new_realm, new_ports) = nat_parts(new, protocol);
-    // Filtering, hairpinning, the TCP inbound limit, and the TCP
-    // unsolicited-SYN ICMP switch are reported separately, so compare the
-    // rest of the policy with the new values substituted into the old one.
-    let (filtering, hairpinning, inbound_sessions_per_remote, unsolicited_syn_icmp, policy_changed) =
-        match protocol {
-            Protocol::Udp => {
-                let (old, new) = (old.udp.policy(), new.udp.policy());
-                (
-                    delta(old.filtering(), new.filtering()),
-                    delta(old.hairpinning(), new.hairpinning()),
-                    None,
-                    None,
-                    old.with_filtering(new.filtering())
-                        .with_hairpinning(new.hairpinning())
-                        != new,
-                )
-            }
-            Protocol::Tcp => {
-                let (old, new) = (old.tcp.policy(), new.tcp.policy());
-                (
-                    delta(old.filtering(), new.filtering()),
-                    delta(old.hairpinning(), new.hairpinning()),
-                    delta(
-                        old.inbound_sessions_per_remote(),
-                        new.inbound_sessions_per_remote(),
-                    ),
-                    delta(old.unsolicited_syn_icmp(), new.unsolicited_syn_icmp()),
-                    old.with_filtering(new.filtering())
-                        .with_hairpinning(new.hairpinning())
-                        .with_unsolicited_syn_icmp(new.unsolicited_syn_icmp())
-                        .with_inbound_sessions_per_remote(new.inbound_sessions_per_remote())
-                        .expect("a validated policy's limit is in range")
-                        != new,
-                )
-            }
-        };
+    // Filtering, hairpinning, the TCP inbound limit, the TCP unsolicited-SYN
+    // ICMP switch, and the TCP inbound-RST policy are reported separately, so
+    // compare the rest of the policy with the new values substituted into the
+    // old one.
+    let (
+        filtering,
+        hairpinning,
+        inbound_sessions_per_remote,
+        unsolicited_syn_icmp,
+        inbound_rst,
+        policy_changed,
+    ) = match protocol {
+        Protocol::Udp => {
+            let (old, new) = (old.udp.policy(), new.udp.policy());
+            (
+                delta(old.filtering(), new.filtering()),
+                delta(old.hairpinning(), new.hairpinning()),
+                None,
+                None,
+                None,
+                old.with_filtering(new.filtering())
+                    .with_hairpinning(new.hairpinning())
+                    != new,
+            )
+        }
+        Protocol::Tcp => {
+            let (old, new) = (old.tcp.policy(), new.tcp.policy());
+            (
+                delta(old.filtering(), new.filtering()),
+                delta(old.hairpinning(), new.hairpinning()),
+                delta(
+                    old.inbound_sessions_per_remote(),
+                    new.inbound_sessions_per_remote(),
+                ),
+                delta(old.unsolicited_syn_icmp(), new.unsolicited_syn_icmp()),
+                delta(old.inbound_rst(), new.inbound_rst()),
+                old.with_filtering(new.filtering())
+                    .with_hairpinning(new.hairpinning())
+                    .with_unsolicited_syn_icmp(new.unsolicited_syn_icmp())
+                    .with_inbound_rst(new.inbound_rst())
+                    .with_inbound_sessions_per_remote(new.inbound_sessions_per_remote())
+                    .expect("a validated policy's limit is in range")
+                    != new,
+            )
+        }
+    };
     NatChange {
         realm: delta(old_realm, new_realm),
         ports: delta(old_ports, new_ports),
@@ -636,6 +650,7 @@ fn nat_change(
         hairpinning,
         inbound_sessions_per_remote,
         unsolicited_syn_icmp,
+        inbound_rst,
         policy_changed,
     }
 }

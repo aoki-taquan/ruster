@@ -22,8 +22,8 @@ use ruster_io_xdp::native_profile::{
 
 use crate::{
     AfXdpModeV1, AfXdpPortV1, BackendKindV1, BackendV1, ConfigV1, ExistingXdpProgramV1,
-    FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1, Nat44Icmpv4ErrorsV1, SourcePath,
-    VersionedConfig, XdpAttachModeV1,
+    FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1, Nat44Icmpv4ErrorsV1,
+    Nat44TcpInboundRstV1, SourcePath, VersionedConfig, XdpAttachModeV1,
 };
 
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
@@ -1352,6 +1352,7 @@ fn validate_v1(
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)
                 .with_unsolicited_syn_icmp(source.unsolicited_syn_icmp)
+                .with_inbound_rst(map_inbound_rst(source.inbound_rst))
                 .with_inbound_sessions_per_remote(source.inbound_sessions_per_remote)
                 .map_err(|error| {
                     ValidationError::new(
@@ -2270,6 +2271,13 @@ const fn map_filtering(filtering: Nat44FilteringV1) -> Nat44Filtering {
         Nat44FilteringV1::EndpointIndependent => Nat44Filtering::EndpointIndependent,
         Nat44FilteringV1::AddressDependent => Nat44Filtering::AddressDependent,
         Nat44FilteringV1::AddressAndPortDependent => Nat44Filtering::AddressAndPortDependent,
+    }
+}
+
+const fn map_inbound_rst(policy: Nat44TcpInboundRstV1) -> ruster_core::Nat44TcpInboundRst {
+    match policy {
+        Nat44TcpInboundRstV1::Closing => ruster_core::Nat44TcpInboundRst::Closing,
+        Nat44TcpInboundRstV1::Corroborate => ruster_core::Nat44TcpInboundRst::Corroborate,
     }
 }
 

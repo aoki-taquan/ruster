@@ -102,7 +102,7 @@ pub use nat44_syn_hold::{
     Nat44TcpSynHoldSlot, NAT44_TCP_SYN_HOLD_CHAIN_LIMIT, NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS,
     NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
 };
-pub use nat44_tcp_state::Nat44TcpSessionPhase;
+pub use nat44_tcp_state::{Nat44TcpInboundRst, Nat44TcpSessionPhase};
 pub(crate) use observability::OccupancyCounter;
 pub use observability::{
     BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields, TableOccupancy,

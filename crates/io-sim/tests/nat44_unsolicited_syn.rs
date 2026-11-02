@@ -1219,6 +1219,26 @@ fn a_closed_connection_frees_its_session_and_port_after_the_closing_timeout() {
     assert_eq!(world.tcp.mappings()[0].public_port(), PORT);
 }
 
+/// Review M1 through the full worker: an injected RST and a remote SYN on
+/// an established connection, the inside challenge ACK, the remote ACK.
+/// The connection stays on the established timer (REQ-5): after more than
+/// 240 s idle it is still translated.
+#[test]
+fn a_spoofed_rst_and_syn_do_not_downgrade_an_established_connection() {
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.inbound(RST, 1_000);
+    world.inbound(SYN, 1_001);
+    world.out(PORT, ACK, 1_002);
+    world.inbound(ACK, 1_003);
+    assert_eq!(
+        world.tcp.sessions()[0].phase(),
+        ruster_core::Nat44TcpSessionPhase::Established
+    );
+    world.inbound(ACK, 1_003 + TRANSITORY + 1_000);
+    world.out(PORT, ACK, 1_003 + TRANSITORY + 1_000 + ESTABLISHED - 1);
+}
+
 /// RFC 7857 §2.2: a RST is translated and the session kept for the closing
 /// timeout; a later non-RST segment returns it to the established phase.
 /// An injected RST therefore never ends a session earlier than the closing

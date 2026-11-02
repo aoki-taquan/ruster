@@ -198,6 +198,13 @@ fn nat(lines: &mut Vec<String>, kind: &str, change: NatChange) {
             switch(new)
         ));
     }
+    if let Some(Delta { old, new }) = change.inbound_rst {
+        lines.push(format!(
+            "{kind} inbound-rst ~ {} -> {}",
+            old.config_name(),
+            new.config_name()
+        ));
+    }
     if change.policy_changed {
         lines.push(format!("{kind} policy ~ changed"));
     }

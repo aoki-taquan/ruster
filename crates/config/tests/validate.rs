@@ -1219,6 +1219,25 @@ fn nat44_tcp_transitory_idle_ttls_map_onto_the_core_policy() {
     }
 }
 
+/// N1: `inbound-rst` maps onto the core policy and does not change storage.
+#[test]
+fn nat44_tcp_inbound_rst_maps_onto_the_core_policy() {
+    use ruster_core::Nat44TcpInboundRst;
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let defaults = validated(VALID);
+    let policy = defaults.nat44().unwrap().tcp().unwrap().policy();
+    assert_eq!(policy.inbound_rst(), Nat44TcpInboundRst::Closing);
+    let strict =
+        validated(&VALID.replacen(TCP, &format!("{TCP}inbound-rst = \"corroborate\"\n"), 1));
+    let strict_policy = strict.nat44().unwrap().tcp().unwrap().policy();
+    assert_eq!(strict_policy.inbound_rst(), Nat44TcpInboundRst::Corroborate);
+    assert_eq!(
+        strict_policy.with_inbound_rst(Nat44TcpInboundRst::Closing),
+        policy
+    );
+    assert_eq!(strict.storage_shape(), defaults.storage_shape());
+}
+
 /// `[arp]` maps onto the core ARP policy: absent or empty is RFC 826 (no
 /// on-link condition on the sender), `require-on-link-sender = true` opts
 /// into ARP-031.

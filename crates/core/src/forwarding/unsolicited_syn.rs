@@ -289,7 +289,7 @@ pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
             public_port,
             hold.key.remote_address,
             hold.key.remote_port,
-            true,
+            crate::nat44_tcp_state::Nat44TcpSegment::INITIAL_SYN,
             now.0,
         ) {
             Ok(_) => {

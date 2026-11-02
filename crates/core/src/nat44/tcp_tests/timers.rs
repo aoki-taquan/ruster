@@ -485,10 +485,40 @@ fn hairpin_halves_track_both_sessions() {
 /// do not appear in it.
 #[test]
 fn mixed_phase_reuse_matches_a_full_scan_reference_under_seeded_churn() {
-    const FLAGS: [u8; 8] = [SYN, SYN, SYN_ACK, ACK, ACK, FIN_ACK, RST, RST_ACK];
-    let mut outcomes = [0_usize; 8];
-    for seed in 0..48_u64 {
-        let policy = timer_policy();
+    const FLAGS: [u8; 10] = [
+        SYN,
+        SYN,
+        SYN_ACK,
+        ACK,
+        ACK,
+        FIN_ACK,
+        FIN_ACK,
+        RST,
+        RST_ACK,
+        SYN | 0x01,
+    ];
+    // [0..8): plan outcomes; 8: a live mapping with no session of its
+    // generation left; 9: a live mapping more recent than all its sessions
+    // (both reachable since N1: review core L1; 8 must be reached here).
+    let mut outcomes = [0_usize; 10];
+    for seed in 0..96_u64 {
+        // Opening longer, shorter, or equal to closing; both inbound-RST
+        // policies.
+        let (opening, closing) =
+            [(OPENING, CLOSING), (CLOSING, OPENING), (240_000, 240_000)][(seed % 3) as usize];
+        let inbound_rst = if seed % 2 == 0 {
+            Nat44TcpInboundRst::Closing
+        } else {
+            Nat44TcpInboundRst::Corroborate
+        };
+        let policy = Nat44TcpPolicy::new(ESTABLISHED, seed)
+            .unwrap()
+            .with_opening_idle_ttl_ms(opening)
+            .unwrap()
+            .with_closing_idle_ttl_ms(closing)
+            .unwrap()
+            .with_filtering(Nat44Filtering::EndpointIndependent)
+            .with_inbound_rst(inbound_rst);
         with_config(policy, 40_000, 40_003, |config| {
             let mut mappings = vec![Nat44TcpMappingSlot::default(); 3 + 2 * (seed as usize % 2)];
             let mut sessions = vec![Nat44TcpSessionSlot::default(); 4 + seed as usize % 3];
@@ -505,7 +535,7 @@ fn mixed_phase_reuse_matches_a_full_scan_reference_under_seeded_churn() {
                     5..=7 => 1_000,
                     _ => 0,
                 };
-                let flags = FLAGS[(next_random(&mut rng) % 8) as usize];
+                let flags = FLAGS[(next_random(&mut rng) % 10) as usize];
                 let segment = seg(flags);
                 let remote = (
                     [REMOTE1, REMOTE2][(next_random(&mut rng) % 2) as usize],
@@ -602,11 +632,33 @@ fn mixed_phase_reuse_matches_a_full_scan_reference_under_seeded_churn() {
                     }
                 }
                 assert_eq!(runtime.validate_indexes(), Ok(()));
+                for (index, mapping) in runtime.mappings.iter().enumerate() {
+                    if !runtime.mapping_is_live(*mapping, now) {
+                        continue;
+                    }
+                    let latest = runtime
+                        .sessions
+                        .iter()
+                        .filter(|session| {
+                            session.occupied
+                                && session.mapping_index == index
+                                && session.mapping_generation == mapping.generation
+                        })
+                        .map(|session| session.last_activity_ms)
+                        .max();
+                    match latest {
+                        None => outcomes[8] += 1,
+                        Some(latest) if latest < mapping.last_activity_ms => outcomes[9] += 1,
+                        Some(_) => {}
+                    }
+                }
             }
         });
     }
     // Every outcome the reference distinguishes was exercised.
-    assert!(outcomes.iter().all(|count| *count > 0), "{outcomes:?}");
+    // Index 9 is rare in this churn; `a_mapping_may_outlive_every_session_while_on_its_established_expiry`
+    // reaches it deterministically.
+    assert!(outcomes[..9].iter().all(|count| *count > 0), "{outcomes:?}");
 }
 
 /// PERF-001 with the phase timers: a 65536-slot table with every public
@@ -721,5 +773,234 @@ fn new_flow_work_stays_constant_with_sessions_in_every_phase() {
             worst[0] <= 4 && worst[1] <= 3 && worst[2] <= 2 && worst[3] <= 34,
             "work per new flow {worst:?}"
         );
+    });
+}
+
+/// Review M1 regression: handshake, injected inbound RST, inbound SYN, the
+/// inside challenge ACK (RFC 5961 §4), the remote ACK. The connection must
+/// stay established (REQ-5 MUST: 2h4m), not fall back to the opening timer.
+#[test]
+fn a_spoofed_rst_and_syn_keep_an_established_connection_on_the_established_ttl() {
+    with_config(timer_policy(), 40_000, 40_000, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let (mapping, session) = handshake(&mut runtime, HOST, PEER, 0);
+        let port = runtime.mappings[mapping].public_port;
+        inbound(&mut runtime, port, PEER, RST, 1_000).unwrap();
+        inbound(&mut runtime, port, PEER, SYN, 1_001).unwrap();
+        out(&mut runtime, HOST, PEER, ACK, 1_002).unwrap();
+        inbound(&mut runtime, port, PEER, ACK, 1_003).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Established
+        );
+        // Idle well past every transitory timer: still translated.
+        for idle in [OPENING + 1, CLOSING + 1, ESTABLISHED - 1] {
+            assert_eq!(probe(&runtime, port, PEER, 1_003 + idle), Ok(()), "{idle}");
+        }
+        assert_eq!(
+            probe(&runtime, port, PEER, 1_003 + ESTABLISHED),
+            Err(Nat44TcpPlanError::MappingMiss)
+        );
+    });
+}
+
+/// Review core L1: a mapping kept on its established expiry by a closed
+/// session's earlier established commit outlives its sessions, which are
+/// reclaimed by other mappings; it is then live with no session left. The
+/// index check accepts that, and the mapping still answers inbound
+/// segments as a session miss until its expiry.
+#[test]
+fn a_mapping_may_outlive_every_session_while_on_its_established_expiry() {
+    with_config(timer_policy(), 40_000, 40_002, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 3];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let (a, _) = handshake(&mut runtime, HOST, PEER, 0);
+        let port = runtime.mappings[a].public_port;
+        handshake(&mut runtime, HOST, PEER2, 0);
+        // PEER2 closes at 1 s: its FIN out is an established commit, so A
+        // stays on its established expiry while PEER is established.
+        out(&mut runtime, HOST, PEER2, FIN_ACK, 1_000).unwrap();
+        inbound(&mut runtime, port, PEER2, FIN_ACK, 1_000).unwrap();
+        assert_eq!(runtime.mappings[a].expires_ms, 1_000 + ESTABLISHED);
+        // PEER2's closed session is reclaimed by another mapping, so A's
+        // latest session is older than A's activity.
+        handshake(&mut runtime, (INTERNAL2, 40_001), PEER, 1_000 + CLOSING);
+        let latest = runtime
+            .sessions
+            .iter()
+            .filter(|session| session.mapping_index == a)
+            .map(|session| session.last_activity_ms)
+            .max();
+        assert_eq!(latest, Some(0));
+        assert_eq!(runtime.mappings[a].last_activity_ms, 1_000);
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+        // PEER's established session expires and is reclaimed too.
+        out(&mut runtime, (INTERNAL2, 40_002), PEER, SYN, ESTABLISHED).unwrap();
+        assert!(runtime.mapping_is_live(runtime.mappings[a], ESTABLISHED));
+        assert!(!runtime
+            .sessions
+            .iter()
+            .any(|session| session.mapping_index == a
+                && session.mapping_generation == runtime.mappings[a].generation));
+        assert_eq!(runtime.mappings[a].established_sessions, 0);
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+        assert_eq!(
+            probe(&runtime, port, PEER, ESTABLISHED),
+            Err(Nat44TcpPlanError::SessionMiss)
+        );
+        assert_eq!(
+            probe(&runtime, port, PEER, 1_000 + ESTABLISHED),
+            Err(Nat44TcpPlanError::MappingMiss)
+        );
+    });
+}
+
+/// `inbound-rst = "corroborate"`: inbound RSTs leave the phase alone, an
+/// inbound FIN after the inside FIN waits for an outbound FIN or RST, and
+/// a blind spoofed handshake (SYN, inside SYN-ACK, ACK, inside RST, ACK)
+/// stays opening, so its quota slot is released after the opening timer.
+#[test]
+fn corroboration_ignores_inbound_close_signals_and_blind_handshakes() {
+    let policy = timer_policy().with_inbound_rst(Nat44TcpInboundRst::Corroborate);
+    with_config(policy, 40_000, 40_000, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let (mapping, session) = handshake(&mut runtime, HOST, PEER, 0);
+        let port = runtime.mappings[mapping].public_port;
+        inbound(&mut runtime, port, PEER, RST, 1_000).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Established
+        );
+        assert_eq!(runtime.counters().sessions_reset, 0);
+        out(&mut runtime, HOST, PEER, FIN_ACK, 2_000).unwrap();
+        inbound(&mut runtime, port, PEER, FIN_ACK, 2_001).unwrap();
+        out(&mut runtime, HOST, PEER, ACK, 2_002).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Established
+        );
+        out(&mut runtime, HOST, PEER, RST, 2_003).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Closing
+        );
+
+        // The blind spoof on an external session.
+        let spoofed = (REMOTE2, 7);
+        let at = 3_000;
+        let spoof = inbound(&mut runtime, port, spoofed, SYN, at).unwrap();
+        out(&mut runtime, HOST, spoofed, SYN_ACK, at).unwrap();
+        inbound(&mut runtime, port, spoofed, ACK, at).unwrap();
+        out(&mut runtime, HOST, spoofed, RST, at).unwrap();
+        inbound(&mut runtime, port, spoofed, ACK, at + 1).unwrap();
+        assert_eq!(
+            runtime.sessions[spoof].phase(),
+            Nat44TcpSessionPhase::Opening
+        );
+        assert!(!runtime.session_is_live(runtime.sessions[spoof], at + 1 + OPENING));
+    });
+    // The default (RFC 7857) policy cannot tell the same sequence from a
+    // real handshake: it is established (the NAT44-086 caveat).
+    with_config(timer_policy(), 40_000, 40_000, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let (mapping, _) = handshake(&mut runtime, HOST, PEER, 0);
+        let port = runtime.mappings[mapping].public_port;
+        let spoofed = (REMOTE2, 7);
+        let spoof = inbound(&mut runtime, port, spoofed, SYN, 1).unwrap();
+        out(&mut runtime, HOST, spoofed, SYN_ACK, 1).unwrap();
+        inbound(&mut runtime, port, spoofed, ACK, 1).unwrap();
+        out(&mut runtime, HOST, spoofed, RST, 1).unwrap();
+        inbound(&mut runtime, port, spoofed, ACK, 2).unwrap();
+        assert_eq!(
+            runtime.sessions[spoof].phase(),
+            Nat44TcpSessionPhase::Established
+        );
+    });
+}
+
+/// Review core nit: an outbound initial SYN that restarts a FIN-closed
+/// externally created session is an outbound-initiated connection, so the
+/// session leaves the per-remote quota count and the occupancy counter.
+#[test]
+fn an_outbound_restart_of_an_external_session_stops_counting_it() {
+    with_config(timer_policy(), 40_000, 40_000, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let (mapping, _) = handshake(&mut runtime, HOST, PEER, 0);
+        let port = runtime.mappings[mapping].public_port;
+        let remote = (REMOTE2, 9);
+        let session = inbound(&mut runtime, port, remote, SYN, 1).unwrap();
+        out(&mut runtime, HOST, remote, SYN_ACK, 1).unwrap();
+        inbound(&mut runtime, port, remote, ACK, 1).unwrap();
+        inbound(&mut runtime, port, remote, FIN_ACK, 2).unwrap();
+        out(&mut runtime, HOST, remote, FIN_ACK, 2).unwrap();
+        assert!(runtime.sessions[session].external_inbound);
+        assert_eq!(runtime.occupancy().external_inbound_sessions.occupied(), 1);
+        // An inbound SYN does not restart (it stays closing and external).
+        inbound(&mut runtime, port, remote, SYN, 3).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Closing
+        );
+        assert!(runtime.sessions[session].external_inbound);
+        // The inside host reopens the same 5-tuple.
+        out(&mut runtime, HOST, remote, SYN, 4).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Opening
+        );
+        assert!(!runtime.sessions[session].external_inbound);
+        assert_eq!(runtime.occupancy().external_inbound_sessions.occupied(), 0);
+    });
+}
+
+/// Review sec nit: a drifted established-session count fails closed in
+/// release builds too: a segment that would release more established
+/// sessions than the mapping counts is an index error, and a commit that
+/// reclaims another mapping's established session its count does not
+/// include is a stale plan. Nothing changes in either case.
+#[test]
+fn a_drifted_established_count_fails_closed() {
+    with_config(timer_policy(), 40_000, 40_001, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 2];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let (a, session) = handshake(&mut runtime, HOST, PEER, 0);
+        // A second, opening session keeps the mapping live past the first
+        // session's expiry.
+        out(&mut runtime, HOST, PEER2, SYN, ESTABLISHED - 1_000).unwrap();
+        runtime.mappings[a].established_sessions = 0;
+        let before = (runtime.mappings[a], runtime.sessions[session]);
+        // Closing the established session would release one.
+        assert_eq!(
+            runtime
+                .plan_outbound(
+                    HOST.0,
+                    HOST.1,
+                    PEER.0,
+                    PEER.1,
+                    seg(RST),
+                    ESTABLISHED - 1_000
+                )
+                .map(|_| ()),
+            Err(Nat44TcpPlanError::IndexCorrupt)
+        );
+        // Another mapping reclaiming the expired established session.
+        let plan = runtime
+            .plan_outbound(INTERNAL2, 40_001, PEER2.0, PEER2.1, seg(SYN), ESTABLISHED)
+            .unwrap();
+        assert_eq!(
+            runtime.prevalidate_outbound_commit(plan, ESTABLISHED),
+            Err(Nat44TcpCommitError::StalePlan)
+        );
+        assert_eq!((runtime.mappings[a], runtime.sessions[session]), before);
     });
 }

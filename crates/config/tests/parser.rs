@@ -805,6 +805,56 @@ fn nat44_tcp_inbound_sessions_per_remote_defaults_and_is_exact() {
     }
 }
 
+/// N1: `[nat44.tcp] inbound-rst` defaults to `closing`, accepts exactly
+/// `closing` and `corroborate`, and is TCP-only.
+#[test]
+fn nat44_tcp_inbound_rst_defaults_to_closing_and_is_exact() {
+    use ruster_config::Nat44TcpInboundRstV1;
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    assert_eq!(
+        config.nat44.unwrap().tcp.unwrap().inbound_rst,
+        Nat44TcpInboundRstV1::Closing
+    );
+    for (value, expected) in [
+        ("closing", Nat44TcpInboundRstV1::Closing),
+        ("corroborate", Nat44TcpInboundRstV1::Corroborate),
+    ] {
+        let source = VALID_V1.replacen(TCP, &format!("{TCP}inbound-rst = \"{value}\"\n"), 1);
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        assert_eq!(config.nat44.unwrap().tcp.unwrap().inbound_rst, expected);
+    }
+    for value in ["\"drop\"", "\"Closing\"", "true", "1"] {
+        let source = VALID_V1.replacen(TCP, &format!("{TCP}inbound-rst = {value}\n"), 1);
+        let diagnostic = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{value}");
+        assert_eq!(
+            diagnostic.path().segments(),
+            &[
+                PathSegment::Field("nat44".to_owned()),
+                PathSegment::Field("tcp".to_owned()),
+                PathSegment::Field("inbound-rst".to_owned()),
+            ],
+            "{value}"
+        );
+    }
+    let misplaced = parse(
+        VALID_V1
+            .replacen(
+                "icmpv4-errors = \"external-only\"\n",
+                "inbound-rst = \"closing\"\nicmpv4-errors = \"external-only\"\n",
+                1,
+            )
+            .as_bytes(),
+    )
+    .unwrap_err();
+    assert_eq!(misplaced.code(), DiagnosticCode::UnknownField);
+}
+
 /// N1 (RFC 5382 REQ-5, RFC 7857 §2.1): `[nat44.tcp] opening-idle-ttl-ms`
 /// and `closing-idle-ttl-ms` default to 240000 and are exact u64 TCP-only
 /// keys.
