@@ -277,8 +277,12 @@ fn topology() -> (
     (
         [
             Route::new(Ipv4Address::from_octets([0; 4]), 0, WAN, Some(GATEWAY)).unwrap(),
-            // The ARP peer is on the link of LAN (ARP-031). A host route
-            // adds no network or broadcast boundary to the IPv4 model.
+            // Purpose: ARP-031 drops ARP from senders that are not on the
+            // ingress link, and this topology has no LAN connected route
+            // (a real config always has one), so the ARP peer needs a direct
+            // route on LAN to keep being learned and answered. A `/32` host
+            // route is used instead of the `/24` so it adds no network or
+            // broadcast boundary and leaves the IPv4 model expectations unchanged.
             Route::new(PEER_IP, 32, LAN, None).unwrap(),
         ],
         [

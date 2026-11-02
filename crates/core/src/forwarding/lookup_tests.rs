@@ -558,3 +558,52 @@ fn unvalidated_duplicate_keys_resolve_to_the_first_like_find() {
     assert_eq!(index.local_by_address(ip(0x0a00_0001)).0, Some(0));
     assert_eq!(index.static_neighbor(IfId(4), ip(0x0a00_0002)).0, Some(0));
 }
+
+/// The largest index the config limits allow: 4096 non-adjacent direct
+/// routes (every route adds two LPM intervals, two connected boundaries,
+/// and its own on-link range), 4096 static neighbors, and 256 interfaces
+/// with one address each. About 262 KiB (snapshot memory; two owners
+/// coexist during a reload, about 524 KiB).
+#[test]
+fn index_heap_at_the_worst_config_shape_is_about_262_kib() {
+    let interfaces: Vec<Interface> = (0..256u16)
+        .map(|id| Interface {
+            id: IfId(id),
+            mac: MacAddress([2, 0, 0, 0, (id >> 8) as u8, id as u8]),
+        })
+        .collect();
+    // /24s spaced one /24 apart: no two ranges touch, nothing merges.
+    let routes: Vec<Route> = (0..4096u32)
+        .map(|index| {
+            Route::new(
+                ip(0x0a00_0000 | (index << 9)),
+                24,
+                IfId((index % 256) as u16),
+                None,
+            )
+            .unwrap()
+        })
+        .collect();
+    let neighbors: Vec<Neighbor> = (0..4096u32)
+        .map(|index| Neighbor {
+            interface: IfId((index % 256) as u16),
+            target: ip(0x0a00_0000 | (index << 9) | 2),
+            mac: MacAddress([2, 2, 0, 0, (index >> 8) as u8, index as u8]),
+        })
+        .collect();
+    let local_ipv4: Vec<LocalIpv4Binding> = (0..256u32)
+        .map(|index| LocalIpv4Binding {
+            interface: IfId(index as u16),
+            address: ip(0x0a00_0000 | (index << 9) | 1),
+        })
+        .collect();
+    let index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
+    let bytes = index.heap_bytes();
+    // 8193 LPM intervals x 8 + 8192 boundaries x 8 + 4096 on-link ranges
+    // x 16 + 4096 neighbors x 16 + 256 interfaces x 8 + 2 x 256 locals x 8.
+    assert_eq!(
+        bytes,
+        8193 * 8 + 8192 * 8 + 4096 * 16 + 4096 * 16 + 256 * 8 + 2 * 256 * 8
+    );
+    assert!(bytes <= 300 * 1024, "{bytes}");
+}

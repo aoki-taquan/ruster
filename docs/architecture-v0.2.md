@@ -426,7 +426,7 @@ MAC/refresh時刻やpending resolutionを変更しません。
   学習できる。
 - SPAはingressのon-linkでなければならない（ARP-031、H4c）: ingressから出るdirect route
   （next hopなし）のどれかに含まれるか、ingressから出るrouteのgateway next hopであること。
-  これはrouterがそのinterface上で自分でARP解決し得るtargetとちょうど一致し、それ以外の
+  この集合はrouterがそのinterface上で自分でARP解決し得るtargetをすべて含み、それ以外の
   SPAを学習してもforwardingが使うことはありません。条件を満たさないRequest、Reply、
   Announcementはstatic neighbor、local SPA、上記のnon-host SPA（probeの`0.0.0.0`を含む）の
   後で判定し、cache、pending、clock watermarkを変えず、replyも返さず
@@ -1307,7 +1307,8 @@ differential testのoracleです。
 
 memoryはsnapshot memory（runtime storageの`storage-bytes`には含めない）で、ownerと一緒に
 解放されます。上限config（4096 route、4096 neighbor、interfaceごとに一つのaddress、
-256 interface）で約186 KiB、reload中は旧generationの分と合わせて二つ分です
+256 interface）のworst shape（隣接しない4096 direct routeと4096 neighbor）で約262 KiB、
+reload中は旧generationの分と合わせて約524 KiBです
 （`ValidatedForwardingOwner::index_heap_bytes`）。publication costはO(n log n)の
 sortだけです。snapshotは`identity`（8 word）を保持せず借用sliceから都度作るので
 （O(1)）、index参照を足しても`ForwardingSnapshot`は144→88 bytesです（RT-002）。

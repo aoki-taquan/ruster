@@ -48,8 +48,8 @@ const NO_ROUTE: u32 = u32::MAX;
 
 /// Immutable lookup indexes for one validated forwarding owner.
 pub(crate) struct ForwardingIndex {
-    /// Sorted interval starts; `lpm_starts[0] == 0` whenever routes exist
-    /// or not, so every address falls in exactly one interval.
+    /// Sorted interval starts; `lpm_starts[0] == 0` always (with or without
+    /// routes), so every address falls in exactly one interval.
     lpm_starts: Box<[u32]>,
     /// Route index per interval, or [`NO_ROUTE`].
     lpm_routes: Box<[u32]>,

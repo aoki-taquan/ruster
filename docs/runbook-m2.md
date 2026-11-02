@@ -220,9 +220,10 @@ release build with 4096 `/24` routes one route lookup went from about
 8.8 µs (about 10.9 µs in the review that found it, at least 22 µs per
 forwarded packet, about 45 kpps per queue) to about 49 ns, and a
 static-neighbor plus local-address lookup takes about 67 ns. The indexes
-are snapshot memory, not runtime storage (not in `storage-bytes`): about
-186 KiB with every list at its limit, twice that while a reload holds
-the old and the new config. Building them is a sort, O(n log n), on the
+are snapshot memory, not runtime storage (not in `storage-bytes`): at
+most about 262 KiB (the worst shape is 4096 non-adjacent direct routes
+plus 4096 neighbors), about 524 KiB while a reload holds the old and the
+new config. Building them is a sort, O(n log n), on the
 reload path.
 
 | Table | Packet path, and what drives it | Work per packet | Release time per packet at 65536 (before H4b) | Recommended size |
@@ -841,7 +842,11 @@ CLI-034).
   learned nor answered, even a Request for the router's own address, so
   a LAN host can no longer fill the dynamic-neighbor cache with off-link
   addresses. A rising counter usually means a host with a wrong prefix
-  or address on that LAN.
+  or address on that LAN. If the link really carries another prefix, add
+  a direct `[[routes]]` entry without `via` for any additional on-link
+  prefix (out of that interface); its hosts are then on-link. There is
+  no switch to turn the check off; whether to add one is an open owner
+  question (ARP-031).
 - NAT44 slot reuse and port selection
   are O(1) per new flow since H4a (NAT44-035). What NAT44 still does in
   more than constant time: a keyed directory lookup walks its hash chain

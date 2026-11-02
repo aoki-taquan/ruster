@@ -925,7 +925,7 @@ impl<'a> ForwardingSnapshot<'a> {
 
     /// Whether `sender` is on the link of `interface`: inside a direct
     /// (no next hop) route out of it, or a configured gateway out of it.
-    /// These are exactly the targets the router itself may resolve on that
+    /// This set contains every target the router itself may resolve on that
     /// interface (ARP-031).
     #[inline]
     pub(crate) fn sender_on_link(&self, interface: IfId, sender: crate::Ipv4Address) -> bool {
@@ -1023,8 +1023,9 @@ impl ValidatedForwardingOwner {
 
     /// Heap bytes of the publication-time lookup indexes (snapshot memory,
     /// not runtime storage; freed with the owner). Bounded by the config
-    /// limits: about 230 KiB at 4096 routes, 4096 neighbors, 1024
-    /// addresses, and 256 interfaces.
+    /// limits: the worst shape (4096 non-adjacent direct routes, 4096
+    /// neighbors, 256 interfaces with one address each) is about 262 KiB,
+    /// about 524 KiB while a reload holds the old and the new owner.
     #[must_use]
     pub fn index_heap_bytes(&self) -> usize {
         self.index.heap_bytes()
