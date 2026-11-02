@@ -270,6 +270,7 @@ pub struct ApplyPlan {
     firewall_rule_order_changed: bool,
     firewall_policy_changed: bool,
     ipv4_origin_changed: bool,
+    arp_policy_changed: bool,
     nat44_udp: NatChange,
     nat44_tcp: NatChange,
     backend: BackendChange,
@@ -331,6 +332,7 @@ impl ApplyPlan {
             firewall_rule_order_changed: common_order_changed(old_rules, new_rules),
             firewall_policy_changed: old.firewall.policy() != new.firewall.policy(),
             ipv4_origin_changed: current.ipv4_origin() != next.ipv4_origin(),
+            arp_policy_changed: current.arp() != next.arp(),
             nat44_udp: nat_change(&old, &new, Protocol::Udp),
             nat44_tcp: nat_change(&old, &new, Protocol::Tcp),
             backend,
@@ -428,6 +430,14 @@ impl ApplyPlan {
     #[must_use]
     pub const fn ipv4_origin_changed(&self) -> bool {
         self.ipv4_origin_changed
+    }
+
+    /// Whether the `[arp]` receive policy changed. Reloadable: the policy
+    /// is part of the forwarding snapshot that every reload replaces, and
+    /// every reload flushes ARP learning anyway.
+    #[must_use]
+    pub const fn arp_policy_changed(&self) -> bool {
+        self.arp_policy_changed
     }
 
     #[must_use]

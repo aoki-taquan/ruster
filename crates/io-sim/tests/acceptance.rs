@@ -1,8 +1,8 @@
 use ruster_core::{
-    forward_batch, ipv4_header_checksum, validate_ipv4_frame, BatchCompletion, ConsumeReason,
-    DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
-    Neighbor, NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route, SlotCompletion,
-    SnapshotError, TraceEvent, ETHERNET_HEADER_LEN,
+    forward_batch, ipv4_header_checksum, validate_ipv4_frame, ArpPolicy, BatchCompletion,
+    ConsumeReason, DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+    MacAddress, Neighbor, NoTrace, PacketBatch, PacketIo, PacketLease, PacketSlot, Route,
+    SlotCompletion, SnapshotError, TraceEvent, ETHERNET_HEADER_LEN,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
@@ -920,11 +920,44 @@ fn arp_foreign_sender_claiming_local_address_gets_normal_reply() {
     assert_eq!(&reply.bytes[38..42], &LOCAL_IPV4);
 }
 
+/// RFC 826 default: the merge/reply algorithm places no condition on the
+/// sender's protocol address, so a Request from an off-link sender that
+/// targets the router is answered.
 #[test]
-fn arp_request_from_off_link_sender_is_dropped_without_reply() {
+fn arp_request_from_off_link_sender_is_answered_by_default() {
     let interfaces = [local_interface()];
     let bindings = [local_binding()];
     let snapshot = arp_snapshot(&interfaces, &bindings);
+    assert!(!snapshot.arp_policy().require_on_link_sender());
+    let mut io = SimIo::new();
+    io.inject(
+        LAN,
+        arp_frame(
+            1,
+            DESTINATION,
+            LOCAL_IPV4,
+            REQUESTER_MAC,
+            REQUESTER_MAC,
+            [0; 6],
+            &[],
+        ),
+    );
+    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    assert_eq!((report.tx_requested, report.dropped), (1, 0));
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(&reply.bytes[0..6], &REQUESTER_MAC);
+    assert_eq!(&reply.bytes[28..32], &LOCAL_IPV4);
+    assert_eq!(&reply.bytes[38..42], &DESTINATION);
+}
+
+/// ARP-031 opt-in: with `require-on-link-sender` the same Request is
+/// dropped without a reply.
+#[test]
+fn arp_request_from_off_link_sender_is_dropped_without_reply_when_required() {
+    let interfaces = [local_interface()];
+    let bindings = [local_binding()];
+    let snapshot = arp_snapshot(&interfaces, &bindings)
+        .with_arp_policy(ArpPolicy::RFC826.with_require_on_link_sender(true));
     let mut io = SimIo::new();
     let packet = arp_frame(
         1,

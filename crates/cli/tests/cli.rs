@@ -581,6 +581,53 @@ fn plan_classifies_icmpv4_switches_like_their_policy_tables() {
     );
 }
 
+/// The ARP-031 opt-in (`[arp] require-on-link-sender`) is a reloadable
+/// `arp` change; the RFC 826 default spelled out is no change.
+#[test]
+fn plan_prints_the_arp_policy_as_reloadable() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let with = |name: &str, value: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "[resolution.policy]",
+                &format!("[arp]\nrequire-on-link-sender = {value}\n\n[resolution.policy]"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let hardened = with("arp-on.toml", "true");
+    let explicit_default = with("arp-off.toml", "false");
+    assert_eq!(
+        status(&ruster(&["validate".as_ref(), hardened.as_os_str()])),
+        0
+    );
+
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), hardened.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!(
+            "plan: reloadable\nrestart-required: none\nchanges: 1\n  arp ~ changed\n{FLUSH_ALL}"
+        )
+    );
+    let plan = ruster(&[
+        "plan".as_ref(),
+        current.as_os_str(),
+        explicit_default.as_os_str(),
+    ]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{FLUSH_ALL}")
+    );
+}
+
 #[test]
 fn plan_prints_nat_filtering_as_a_reloadable_typed_delta() {
     let dir = scratch();

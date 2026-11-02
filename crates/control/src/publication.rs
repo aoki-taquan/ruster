@@ -1,7 +1,7 @@
 use std::num::NonZeroU64;
 
 use ruster_core::{
-    FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy, FirewallRule,
+    ArpPolicy, FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy, FirewallRule,
     ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4OriginPolicy,
     LocalIpv4Binding, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy,
     Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor,
@@ -399,6 +399,7 @@ pub struct PublicationPlan {
     neighbors: Box<[Neighbor]>,
     local_ipv4: Box<[LocalIpv4Binding]>,
     ipv4_origin: Ipv4OriginPolicy,
+    arp_policy: ArpPolicy,
     resolution_policy: ResolutionPolicy,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
     resolution_hash_key: Option<ResolutionHashKey>,
@@ -429,6 +430,7 @@ impl PublicationPlan {
             neighbors,
             local_ipv4,
             ipv4_origin,
+            arp_policy: ArpPolicy::RFC826,
             resolution_policy,
             icmpv4_error_policy,
             resolution_hash_key: None,
@@ -444,6 +446,14 @@ impl PublicationPlan {
     #[must_use]
     pub fn with_resolution_hash_key(mut self, hash_key: ResolutionHashKey) -> Self {
         self.resolution_hash_key = Some(hash_key);
+        self
+    }
+
+    /// Sets the ARP receive policy of the forwarding snapshot (default
+    /// [`ArpPolicy::RFC826`]).
+    #[must_use]
+    pub fn with_arp_policy(mut self, arp: ArpPolicy) -> Self {
+        self.arp_policy = arp;
         self
     }
 
@@ -548,6 +558,7 @@ impl ValidatedCandidate {
             neighbors,
             local_ipv4,
             ipv4_origin,
+            arp_policy,
             resolution_policy,
             icmpv4_error_policy,
             resolution_hash_key,
@@ -575,7 +586,8 @@ impl ValidatedCandidate {
         // addresses remain stable when the finished candidate is moved.
         let forwarding =
             ValidatedForwardingOwner::new(routes, interfaces, neighbors, local_ipv4, ipv4_origin)
-                .map_err(PublicationCandidateError::Forwarding)?;
+                .map_err(PublicationCandidateError::Forwarding)?
+                .with_arp_policy(arp_policy);
         let snapshot = forwarding.snapshot();
         let udp_config = Nat44UdpConfig::new(
             &snapshot,

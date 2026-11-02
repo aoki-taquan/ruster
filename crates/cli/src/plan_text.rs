@@ -279,6 +279,9 @@ pub fn render(plan: &ApplyPlan) -> String {
     if plan.ipv4_origin_changed() {
         lines.push("ipv4-origin ~ changed".to_owned());
     }
+    if plan.arp_policy_changed() {
+        lines.push("arp ~ changed".to_owned());
+    }
     nat(&mut lines, "nat44-udp", plan.nat44_udp());
     nat(&mut lines, "nat44-tcp", plan.nat44_tcp());
     backend(&mut lines, plan.backend());

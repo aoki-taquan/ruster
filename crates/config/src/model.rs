@@ -23,6 +23,8 @@ pub struct ConfigV1 {
     #[serde(default)]
     pub neighbors: Vec<NeighborV1>,
     pub ipv4_origin: Option<Ipv4OriginV1>,
+    /// ARP receive policy; absent means RFC 826 behavior.
+    pub arp: Option<ArpV1>,
     pub resolution: Option<ResolutionV1>,
     pub icmpv4_errors: Option<Icmpv4ErrorV1>,
     pub nat44: Option<Nat44V1>,
@@ -76,6 +78,20 @@ pub struct Ipv4OriginV1 {
 
 const fn enabled() -> bool {
     true
+}
+
+/// ARP receive policy (`[arp]`).
+///
+/// Every field defaults to RFC 826 behavior; hardening is opt-in.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ArpV1 {
+    /// ARP-031 hardening (default `false`, RFC 826): drop an ARP Request or
+    /// Reply whose sender is a host outside every direct route out of the
+    /// ingress interface and not one of its gateways, as
+    /// `ARP_SENDER_NOT_ON_LINK`, without learning or replying.
+    #[serde(default)]
+    pub require_on_link_sender: bool,
 }
 
 const fn default_inbound_sessions_per_remote() -> u8 {

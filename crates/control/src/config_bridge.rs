@@ -329,6 +329,7 @@ pub fn candidate_from_config<S: PublicationKeySource>(
         resolution.policy(),
         icmpv4_errors.policy(),
     )
+    .with_arp_policy(config.arp())
     .with_nat44_udp(Nat44UdpPublicationInput::new(
         udp.inside(),
         udp.outside(),
