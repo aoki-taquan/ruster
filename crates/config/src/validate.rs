@@ -168,6 +168,16 @@ pub enum ValidationCode {
     BackendGeneratedFramesZero,
     /// `frame-count` is below `fill + tx + generated-frames`.
     BackendFrameCountTooSmall,
+    /// `icmpv4-errors.capacity.states` is below the number of interfaces
+    /// plus one while the TCP NAT can send delayed Port Unreachable errors
+    /// (`unsolicited-syn-icmp` on and `unsolicited-syn-holds` above 0).
+    /// Limiter states are keyed by egress and class, and Port Unreachable
+    /// has its own class on the outside egress, so up to interfaces + 1
+    /// states can be in use at once. With fewer, a SYN flood could keep the
+    /// Port Unreachable state alive and leave another egress `StateFull`,
+    /// which would silently suppress its Time Exceeded and Destination
+    /// Unreachable errors.
+    Icmpv4ErrorStatesTooFewForPortUnreachable,
     /// One socket's UMEM exceeds [`MAX_AF_XDP_UMEM_BYTES_PER_PORT`].
     BackendUmemTooLarge,
     /// The UMEM of all sockets exceeds [`MAX_AF_XDP_UMEM_BYTES`].
@@ -247,6 +257,9 @@ impl ValidationCode {
             Self::BackendHeadroomTooLarge => "BACKEND_HEADROOM_TOO_LARGE",
             Self::BackendGeneratedFramesZero => "BACKEND_GENERATED_FRAMES_ZERO",
             Self::BackendFrameCountTooSmall => "BACKEND_FRAME_COUNT_TOO_SMALL",
+            Self::Icmpv4ErrorStatesTooFewForPortUnreachable => {
+                "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
+            }
             Self::BackendUmemTooLarge => "BACKEND_UMEM_TOO_LARGE",
             Self::BackendTotalUmemTooLarge => "BACKEND_TOTAL_UMEM_TOO_LARGE",
             Self::BackendNativeProfile => "BACKEND_NATIVE_PROFILE",
@@ -1345,6 +1358,21 @@ fn validate_v1(
                     path(&["nat44", "realm"]),
                 )
             })?;
+            // Delayed Port Unreachable (RFC 5382 REQ-4) uses its own
+            // limiter state on the outside egress besides the one per
+            // egress of the other kinds: require room for both so a SYN
+            // flood can never make another egress StateFull.
+            if let Some(icmp) = icmp_source {
+                let sends_port_unreachable =
+                    policy.unsolicited_syn_icmp() && source.capacity.unsolicited_syn_holds > 0;
+                let needed = core_interfaces.len() as u64 + 1;
+                if sends_port_unreachable && u64::from(icmp.capacity.states) < needed {
+                    return Err(ValidationError::new(
+                        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
+                        path(&["icmpv4-errors", "capacity", "states"]),
+                    ));
+                }
+            }
             tcp_capacity = Some(source.capacity);
             validated_tcp = Some((inside, outside, public_address, nat.realm.ports, policy));
         }

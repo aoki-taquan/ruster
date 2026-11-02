@@ -245,8 +245,8 @@ reload path.
 | resolution `states` (96 B) | `schedule` on a dynamic miss, failure capture, ARP learn (cancels the key's state) | one keyed chain of at most 16 slots, plus for a new key the lowest free or elapsed-cooldown slot (bitmap) and the head of the request-order list (amortized O(1) per committed request) | new target with the table full 0.34 µs (250 µs); ARP update of a pending target 0.78 µs (943 µs) | the number of next hops being resolved at once |
 | resolution `failure-holds` (656 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the reverse chain, which carries one leader per distinct waiting token (the other holds of a token hang off its leader, so thousands of holds behind one spoofed source cost other tokens nothing); clearing a token's holds visits each once, and each was captured once (amortized O(1)) | — | a few times `states` |
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
-| ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | one per egress interface in use, plus one for the WAN's Port Unreachable class; a few |
-| ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` |
+| ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | at least the number of interfaces plus one (the WAN's Port Unreachable class; `validate` requires it while delayed Port Unreachable is on) |
+| ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` (one queued error per state; fewer only means `action_full` refusals while the queue is full) |
 | NAT44 `mappings`/`peers`/`sessions` (64/48/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (the least recently refreshed, so the first to expire) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick (the same budget value as the resolution failure dispatch, applied separately, so the phase does up to twice that), never scanning unmatured ones; each matured hold walks the firewall rules once. An inconsistent table is flushed (`unsolicited_syn_index_corrupt`) | — | default 64. The Port Unreachable limiter sends at most 1 per second per egress by default, so a bigger table does not send more ICMP; it only holds more SYNs that the limiter will refuse. 0 frees the 37 KiB when the switch is off |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
@@ -948,8 +948,18 @@ other ICMPv4 errors: `[icmpv4-errors.policy]
 port-unreachable-interval-ms`, default 1000, a restart-required
 `ICMPV4_ERROR_POLICY` change. A SYN flood therefore never delays a Time
 Exceeded or a Net/Host Unreachable. It uses one more limiter state on the
-WAN egress, so keep `icmpv4-errors.capacity.states` at least one above the
-number of interfaces.
+WAN egress, so `validate` (and `run`, `plan`, and every reload) refuses
+`icmpv4-errors.capacity.states` below the number of interfaces plus one
+while `unsolicited-syn-icmp` is on and `unsolicited-syn-holds` is above 0:
+`stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE
+path=icmpv4-errors.capacity.states`. With fewer states, a SYN flood could
+keep the WAN Port Unreachable state busy (a state is reclaimed only after
+`state-ttl-ms` idle) and leave another egress `StateFull`, which silently
+suppresses its Time Exceeded and Net/Host Unreachable. Each state can have
+one error queued, so size `icmpv4-errors.capacity.actions` the same way:
+with fewer actions than states in use, a full queue refuses the extra
+errors as `action_full` until the generated phase drains it (within the
+same tick at the default budgets).
 
 Turning the switch off is a reloadable change (`plan` shows `nat44-tcp
 unsolicited-syn-icmp ~ on -> off`). Changing the capacity is

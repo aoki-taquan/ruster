@@ -71,7 +71,7 @@ interval-ms = 100
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 2
+states = 3
 actions = 3
 
 [nat44.realm]
@@ -244,7 +244,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 failure_holds: 5,
             }),
             icmpv4_errors: Some(ruster_config::Icmpv4ErrorStorageShapeV1 {
-                states: 2,
+                states: 3,
                 actions: 3,
             }),
             nat44_udp: Some(ruster_config::Nat44UdpStorageShapeV1 {
@@ -274,7 +274,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 3 * size_of::<ResolutionActionSlot>()
         + 4 * size_of::<DynamicNeighborSlot>()
         + 5 * size_of::<ResolutionFailureHoldSlot>()
-        + 2 * size_of::<Icmpv4ErrorStateSlot>()
+        + 3 * size_of::<Icmpv4ErrorStateSlot>()
         + 3 * size_of::<Icmpv4ErrorActionSlot>()
         + 3 * size_of::<Nat44UdpMappingSlot>()
         + 5 * size_of::<Nat44UdpPeerSlot>()
@@ -1052,6 +1052,48 @@ fn nat44_unsolicited_syn_switch_and_holds_map_onto_core_and_storage() {
         ["nat44", "tcp", "capacity", "unsolicited-syn-holds"]
             .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
     );
+}
+
+/// While the TCP NAT can send delayed Port Unreachable errors, the ICMPv4
+/// limiter needs one state per interface plus one for the Port Unreachable
+/// class on the outside egress; fewer is refused with a value-free code at
+/// the states path. With the switch off or no holds, any size is accepted.
+#[test]
+fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    // VALID has two interfaces.
+    let states = |source: &str, value: u32| {
+        source.replacen(
+            "[icmpv4-errors.capacity]\nstates = 3\n",
+            &format!("[icmpv4-errors.capacity]\nstates = {value}\n"),
+            1,
+        )
+    };
+    validated(&states(VALID, 3));
+    let refused = error(&states(VALID, 2));
+    assert_eq!(
+        refused.code(),
+        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
+    );
+    assert_eq!(
+        refused.code().code(),
+        "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
+    );
+    assert_eq!(
+        refused.path().segments(),
+        ["icmpv4-errors", "capacity", "states"]
+            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
+    );
+    assert_eq!((refused.limit(), refused.actual()), (None, None));
+    // No Port Unreachable can be sent: the interface count is enough.
+    let off = VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
+    validated(&states(&off, 2));
+    let no_holds = VALID.replacen(
+        "unsolicited-syn-holds = 7\n",
+        "unsolicited-syn-holds = 0\n",
+        1,
+    );
+    validated(&states(&no_holds, 2));
 }
 
 #[test]

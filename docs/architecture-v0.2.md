@@ -716,7 +716,12 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
   (egress, class)、`[icmpv4-errors.policy] port-unreachable-interval-ms`、default 1000 ms）なので、
   詐称source宛ては既定でegressあたり最大1 pps、SYN floodが他kindのlimiterを使い切らない。state
   slotは24 bytesのまま（classはpadding内）で、outside egressに1 state増える。idle stateのreclaimは
-  state TTLとclass intervalの両方の経過後。remote単位のfairnessはdeferred（NAT44-077）。
+  state TTLとclass intervalの両方の経過後。flood中のPort Unreachable stateがstate表を埋めて他egressが
+  `StateFull`（Time Exceeded/Net/Host Unreachableのsilent抑止）にならないよう、switch onかつ
+  hold容量>0のときvalidateは`icmpv4-errors.capacity.states >= interface数 + 1`を要求する
+  （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、値は
+  出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない。
+  1 slotをreserveする案はegressが3つ以上だと他egressを守れないため採らない。remote単位のfairnessはdeferred（NAT44-077）。
 - **Config/plan.** `[nat44.tcp] unsolicited-syn-icmp`（default true、`Nat44TcpPolicy`の一部、
   reloadable、`NatChange::unsolicited_syn_icmp`はtyped delta）と`[nat44.tcp.capacity]
   unsolicited-syn-holds`（default 64、quote tableとして`max_quote_slots_per_table`、本番4096、

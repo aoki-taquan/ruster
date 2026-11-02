@@ -358,6 +358,9 @@ unsolicited-syn-holds = 64       # 省略時64。quote table（本番上限4096�
 
 [icmpv4-errors.policy]
 port-unreachable-interval-ms = 1000  # 省略時1000。Port Unreachable専用limiter（egressごと）。restart-required
+
+[icmpv4-errors.capacity]
+states = 8   # delayed Port Unreachableがon（switch onかつholds > 0）ならinterface数 + 1以上が必須
 ```
 
 | `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |
