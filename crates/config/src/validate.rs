@@ -65,7 +65,7 @@ pub struct ValidationLimits {
 ///   with occupancy capped near 75%, so only its amortized expiry sweep is
 ///   linear. 2^16 also equals the largest NAT44 port pool (1..=65535).
 /// - `max_runtime_bytes` = 64 MiB, the simulator's value. Every table at its
-///   limit (with the widest port pool) needs 38224064 bytes (36.45 MiB)
+///   limit (with the widest port pool) needs 38813888 bytes (37.02 MiB)
 ///   with the current slot sizes, so the per-table limits bind and this
 ///   bound only fails closed if a slot type grows. The storage is ordinary
 ///   heap (not memlocked), allocated once at startup.
