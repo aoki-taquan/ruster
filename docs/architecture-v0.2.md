@@ -657,11 +657,49 @@ filterが拒否したpacketはbyte不変のsilent dropで、UDPは`NAT44_UDP_FIL
 `NAT44_TCP_SESSION_MISS`です。RFC 5382 REQ-4はunsolicited inbound SYNへ受信後少なくとも
 6秒は応答しないこと（MUST）と、その間にoutbound SYNを変換したら元のSYNをsilent dropすること
 （MUST）を求め、それ以外はICMP Port Unreachable（Type 3/Code 3）をSHOULDとし、応答がNATの
-security policyに反するならREQ-4 aでsilent dropをMUSTとします。このsliceはunsolicited SYNに
-TCP RSTもICMPも返さないため二つのMUSTを満たし、SHOULDのdelayed Port Unreachableは送りません。
-packet hold/replayをしない設計なので、REQ-4 aのsilent dropを現在の唯一のlocal policyとし、
-6秒以上のbounded quote hold、outbound SYNによるcancel、rate limit、operator switchを持つ
-delayed ICMPはdeferredです（requirements NAT44-038）。
+security policyに反するならREQ-4 aでsilent dropをMUSTとします。unsolicited SYNにはTCP RSTを
+返さず、packet自体は常にその場でsilent dropし、delayed ICMPは下の「TCP unsolicited SYN delayed
+ICMP」（B3）がpacketではなくquoteのcopyで行います。
+
+### TCP unsolicited SYN delayed ICMP（B3、RFC 5382 REQ-4）
+
+対象はoutside interfaceで受けた外部initial SYN（SYN=1、ACK/RST/FIN=0）のうち、public portに
+live mappingが無い（`MappingMiss`）かfilteringが拒否した（`SessionMiss`）ものだけです。hairpin
+のinbound half、per-remote quota超過、session table full、firewall拒否、non-SYNはholdしません。
+NAT planがfirewallより先に走るため、mapping miss/filter拒否はfirewall policyに関係なくholdされ
+（post-DNAT tupleが無い）、NATが許可しfirewallが拒否したSYNはfirewallのsilent dropのままです。
+
+- **Hold table.** `Nat44TcpRuntime::with_unsolicited_syn_holds`が受け取るcaller-backed slot
+  （`Nat44TcpSynHoldSlot`、x86_64で592 bytes: 受信IPv4最大548 bytesのquote、key、期限、chain/list
+  link）。keyは外から見たconnection `(public port p, remote R, remote port r)`で、keyごとに1つ。
+  indexはslotに埋め込んだkeyed SipHash chain（TCP NATのsecret hash key、reconcileでrotate、bucket数
+  =slot数、walk/insertは最大16 node、超過は満杯と同じfail closed）。占有slotはdeadline順FIFO、
+  空きはfree list（どちらもO(1)の`slot_list`）。packetはcloneせずquoteを既存slotへcopyするだけで
+  allocationしない。満杯はevictせずsilent drop（REQ-4 a）。
+- **Timer.** 期限は受信時刻 + `NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`（6000）。受信時刻はNAT clock
+  watermarkで単調なのでFIFO先頭が最早期限で、満了判定は先頭checkだけ。同じconnectionの再送SYNは
+  holdを増やさず、期限をその再送の受信+6秒に延ばして末尾へ移す（どの受信SYNにも6秒以内に応答
+  しない。quoteは最初のSYN）。
+- **Cancel.** outbound commitがsessionを作る（= initial SYNの変換）とき、変換後の`(public port,
+  remote, remote port)`でholdを引いてO(1)で消す（REQ-4 MUST、simultaneous open）。hairpinの
+  outbound halfはremoteが`P`でholdと一致し得ないため対象外。
+- **Dispatch.** `dispatch_nat44_tcp_unsolicited_syns`はtickのfailure-dispatch phaseでresolution
+  failure dispatchの後に`tick.failure-dispatch-scans`件まで満了holdを先頭から取り出す（未満了は
+  触らない、holdが無ければNAT clockにも触れない）。取り出したholdは必ずtableから消え、(1) 同じ
+  plan関数のread-only再判定でNATがそのSYNの再送を今なら受理する（live exact session、EIF/ADFの
+  許可）ならsilent retire（superseded）、(2) mapping miss/filter拒否のままなら、remoteのRFC 1812
+  §4.3.2.7適格性とoutside向けreverse routeを確かめ、他のgenerated errorと同じreverse route/
+  binding/neighbor（static→fresh dynamic、missはARPだけ）とper-egress limiterを通して
+  `Icmpv4ErrorKind::DestinationUnreachablePort`のactionを一つqueueする。limiterやqueueが拒否した
+  holdは再試行しない。生成はgenerated ICMPv4 phaseが同じtickで行う。
+- **Reflection/amplification.** capture時に§4.3.2.7の抑止に加え、sourceのreverse routeがNAT
+  outsideから出ることを要求する（WAN上の詐称inside sourceにICMPをinsideへ向けさせない）。ICMPは
+  1 holdに最大1つで、既定の100 ms per-egress limiterにより詐称source宛ては最大10 pps。remote単位の
+  fairnessはdeferred（NAT44-077）。
+- **Config/plan.** `[nat44.tcp] unsolicited-syn-icmp`（default true、`Nat44TcpPolicy`の一部、
+  reloadable、`NatChange::unsolicited_syn_icmp`はtyped delta）と`[nat44.tcp.capacity]
+  unsolicited-syn-holds`（default 64、quote tableとして`max_quote_slots_per_table`、本番4096、
+  storage shapeなのでrestart-required）。reconcile（全publication）はholdもflushする。
 
 REQ-5のtimerはmodeに依存しません。inbound開始のsessionもoutbound開始と同じ単一idle timer
 （default/minimum 2時間4分）を使うため、partially open phaseのtransitory idle-timeout下限

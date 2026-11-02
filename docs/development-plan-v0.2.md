@@ -460,7 +460,9 @@ M2に関するownerの発言は次だけである（2026-10-31〜11-01、session
 - B3 / NAT44-038: 「A」。unsolicited inbound TCP SYNへのdelayed ICMP Port Unreachable（RFC 5382 REQ-4）を
   実装する: bounded な≥6 sのhold、outbound SYNでcancel、それ以外はICMP 3/3、rate limit、operatorが
   offにできるswitch。coordinatorは既定onを提案し（RFC SHOULD）、ownerはその提案でAを選んだ。現在の
-  CLI-034 hardeningの後（順序はcoordinator既定）に行う。
+  CLI-034 hardeningの後（順序はcoordinator既定）に行う。実装済み: `[nat44.tcp] unsolicited-syn-icmp`
+  （default true、reloadable）と`[nat44.tcp.capacity] unsolicited-syn-holds`（default 64、本番上限4096）、
+  requirements NAT44-038、NAT44-069〜078、ICMP4-012K。
 - 2a: 「C」。multi-queueはdeferredのまま、M2aはportごとに1 queueのまま。X05のNIC選定と合わせて
   再検討する。coordinatorの将来設計の希望（queueごとのexternal port range + NIC ntuple steering +
   symmetric RSS）は決定ではない。

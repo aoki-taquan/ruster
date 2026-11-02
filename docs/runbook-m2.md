@@ -60,7 +60,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  51.11 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  53.42 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -207,9 +207,9 @@ whole-document storage, which has no path.
 
 | Limit | `run-sim` (and `validate` of `sim`) | `ruster run` (and `validate` of `af-xdp`) | Why |
 |---|---|---|---|
-| quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions` | 65536 | 4096 | each slot holds a quoted datagram (656 and 584 bytes), so the bound is memory: at 65536 these two alone would need 77.5 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
+| quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 584, and 592 bytes), so the bound is memory: at 65536 these three alone would need 114.5 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 51.11 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 53.42 MiB, so the per-table limits bind; the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -248,6 +248,7 @@ reload path.
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most one per egress interface in use (≤ 256) | — | at most one per egress interface is ever used; a few |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` |
 | NAT44 `mappings`/`peers`/`sessions` (64/48/64 B + directories) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (the least recently refreshed, so the first to expire) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
+| `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick, never scanning unmatured ones | — | default 64: about 6 s of the default ICMP limiter (10 errors per second per egress). A bigger table does not send more ICMP, it only holds more SYNs that the limiter will refuse |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
 
 The per-packet work on the runtime tables no longer depends on their
@@ -299,6 +300,7 @@ attacker must first fill the table, one packet per entry.
 | `nat44.udp.capacity.peers` | 48 + 28 directory | 4.75 MiB (65536) |
 | `nat44.tcp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
 | `nat44.tcp.capacity.sessions` | 64 + 2 x 28 directories | 7.5 MiB (65536) |
+| `nat44.tcp.capacity.unsolicited-syn-holds` (holds a quoted datagram) | 592 | 2.31 MiB (4096) |
 | NAT44 port owners (`nat44.realm.ports`, per pool port, UDP and TCP each) | 32, plus a free-port bitmap of 8 bytes per 64 ports and per 4096 ports | 2 MiB + 8320 bytes per protocol |
 | `firewall.capacity.states` | 56 | 3.5 MiB (65536) |
 
@@ -306,7 +308,8 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-53592256 bytes (51.11 MiB). H4a added 16 bytes per NAT44 mapping and
+56017088 bytes (53.42 MiB). B3 added the 4096 unsolicited-SYN holds
+(2.31 MiB; 53592256 bytes, 51.11 MiB, before). H4a added 16 bytes per NAT44 mapping and
 session slot (reuse-list links, 48 to 64 bytes with the 16-byte alignment)
 and the free-port bitmaps: 3 MiB more at the limits. H4b added the
 resolution indexes inside the slots (state 56 to 96 bytes, action 32 to
@@ -317,7 +320,7 @@ raised states, actions, dynamic neighbors, and ICMPv4 error states to
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (51.11 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (53.42 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -900,6 +903,26 @@ What to watch in operation: `observer.state=healthy`, `watch.state=ok`,
 `rings.tx`, and `kernel_tx_invalid_descs` (not a health condition yet,
 CLI-034).
 
+Unsolicited inbound TCP SYNs (B3, RFC 5382 REQ-4). A SYN from the WAN to a
+public port with no mapping (or one the NAT filtering refuses) is still
+dropped silently at once (`drop.NAT44_TCP_MAPPING_MISS` /
+`drop.NAT44_TCP_SESSION_MISS`). By default (`[nat44.tcp]
+unsolicited-syn-icmp = true`) the router also holds a copy for 6 s and then
+sends one ICMP Port Unreachable (Type 3, Code 3) to the sender, unless an
+inside host opened the same connection in the meantime. Watch
+`nat44_tcp.unsolicited_syn_held`, `_icmp_queued`, `_cancelled`
+(simultaneous opens), `_superseded`, `_icmp_suppressed` (refused by the
+shared ICMPv4 rate limiter: a SYN flood or scan), `_hold_full` (the table
+`[nat44.tcp.capacity] unsolicited-syn-holds`, default 64, was full: those
+SYNs were only dropped), `_ineligible`, and
+`occupancy.nat44_tcp_unsolicited_syn_holds`. Turning the switch off is a
+reloadable change (`plan` shows `nat44-tcp unsolicited-syn-icmp ~ on ->
+off`); changing the capacity is `STORAGE_SHAPE`. If port scans of the
+public address should see silence instead of Port Unreachable (with
+`endpoint-independent` filtering and a firewall that denies new inbound
+flows, silence vs. ICMP reveals which public ports have a mapping), turn it
+off.
+
 ## 12. Known limits
 
 - One AF_XDP socket and one RX/TX queue per port; no multi-queue or worker
@@ -1079,6 +1102,10 @@ What it proves, on the runner's kernel only:
   accepted with `--allow-kernel-forwarding`, and only warned while running;
   per-port `conf/<dev>/forwarding` refused (`scope=device`) and warned; an
   undrained stdout FIFO proven full before SIGTERM; SIGKILL and restart.
+  Added by B3: a raw TCP SYN from host B to an unmapped public port gets
+  exactly one ICMP Port Unreachable from 203.0.113.2, no earlier than 6 s
+  after the SYN, quoting it; after a reloadable SIGHUP to
+  `unsolicited-syn-icmp = false`, nothing within 9 s.
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one

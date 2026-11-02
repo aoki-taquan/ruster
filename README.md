@@ -21,7 +21,7 @@ E2EをCIで実行。coordinatorのscoping提案でowner決定ではない）は�
 [`docs/runbook-m2.md`](docs/runbook-m2.md)にあります。multi-queue、zero-copy、X05 hardware
 benchmark（M2b）はowner決定（2026-11-02）でdeferredです: multi-queueは2a「C」で当面portごとに1 queue
 （X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC/native/zero-copy未検証の
-riskはownerが受け入れ）。B3（delayed ICMP、NAT44-038）は「A」で、CLI-034 hardeningの後（順序はcoordinator既定）に実装します。
+riskはownerが受け入れ）。B3（delayed ICMP、NAT44-038）は「A」で、CLI-034 hardeningの後（順序はcoordinator既定）に実装しました（下のNAT44 TCP）。
 
 workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
 control-planeの`ruster-config`とsim専用の`ruster-sim-scenario`だけが、保守されている
@@ -350,6 +350,10 @@ filtering = "address-dependent"  # | "endpoint-independent" | "address-and-port-
 [nat44.tcp]
 filtering = "address-dependent"
 inbound-sessions-per-remote = 0  # 省略時0（無制限）。新規inboundを許可するなら8推奨、最大16（reloadable）
+unsolicited-syn-icmp = true      # 省略時true（RFC 5382 REQ-4 SHOULD）。false: silent dropだけ（reloadable）
+
+[nat44.tcp.capacity]
+unsolicited-syn-holds = 64       # 省略時64。quote table（本番上限4096、592 bytes/slot）。変更はrestart-required
 ```
 
 | `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |
@@ -383,6 +387,21 @@ filterを通ったSYNの全受理を求めないため、MUSTに反しないloca
 deferred、NAT44-058）。
 firewall判定より前に走るinbound SYNのNAT側workは、session capacityに
 よらず`NAT44_TCP_INBOUND_SLOT_PROBES`（16）slot/chain nodeまでに上限されます。
+
+unsolicited inbound TCP SYN（public portにlive mappingが無い、またはfilteringが拒否した外部initial
+SYN）はその場でbyte不変のsilent drop（`NAT44_TCP_MAPPING_MISS`/`NAT44_TCP_SESSION_MISS`）のまま、
+RFC 5382 §5 REQ-4（B3、owner決定「A」）に従い受信IPv4（最大548 bytes）をbounded hold tableへcopy
+します。受信から6秒（`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`）より前には決して応答せず、その間に同じ
+connection（変換後source `P:p`、destinationがSYNのremote `R:r`）のoutbound SYNを変換したらholdを
+silent dropします（simultaneous open）。それ以外は満了後のtickで、NATがそのSYNの再送をまだ拒否する
+場合に限り、ICMP Destination Unreachable Port Unreachable（Type 3/Code 3）を元SYNを引用して一つ
+だけ送ります。ICMPは他のgenerated ICMPv4と同じqueueとper-egress limiter（default 100 ms）を通り、
+limiterやreverse neighborが拒否したholdは再試行しません（1 SYNに最大1 ICMP、増幅なし）。同じ
+connectionの再送SYNはholdを増やさず期限を延ばします。sourceのreverse routeがoutside interfaceから
+出ない（詐称inside source等）SYN、hairpin、quota超過、firewall拒否はholdしません。表が満杯なら
+silent drop（REQ-4 a）です。`unsolicited-syn-icmp = false`または容量0ならREQ-4 aのsilent dropだけです。
+counterは`nat44_tcp.unsolicited_syn_*`、`icmpv4_errors.*_port_unreachable`、occupancyは
+`occupancy.nat44_tcp_unsolicited_syn_holds`。run_tick経由の例は`fixtures/b3/scenario.toml`。
 
 NAT44 hairpinning（RFC 4787 §6 REQ-9、RFC 5382 §7.2 REQ-8）はUDP/TCPともdefaultで有効です。
 inside host X1がpublic address `P`のlive mapping `P:x2'`（X2のmapping。X1自身でもよい）へ
@@ -562,8 +581,9 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   planなので`all`（apply時に全live stateをflush）で、実際のflush数は`run-sim`の`apply` eventに
   出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
   または`changed` flagとしてだけ出し、fieldごとの値は出しません。例外はsecretでないNAT
-  filtering、hairpinning、TCP inbound limitで、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`、
-  `nat44-udp hairpinning ~ on -> off`、`nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8`の
+  filtering、hairpinning、TCP inbound limit、TCP unsolicited-SYN ICMP switchで、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`、
+  `nat44-udp hairpinning ~ on -> off`、`nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8`、
+  `nat44-tcp unsolicited-syn-icmp ~ on -> off`の
   ように値を出し、`policy ~ changed`はそれ以外のNAT policy変更だけを表します。interface labelは
   `[A-Za-z0-9._-]`以外を`\xNN`でescapeします（configも同じcharsetと15 bytes上限を要求）。
   `--format jsonl`は未実装です。
@@ -670,13 +690,13 @@ sudo kill -HUP <pid>                                               # configをre
   `stage=permissions`で拒否します（configは`O_NONBLOCK|O_NOCTTY`でregular fileだけ）。既存のXDP programが
   あるdeviceは`stage=attach code=CREATE_LINK/EXISTING_PROGRAM`で拒否し、置換しません。
 - validation limit（H3、H4b）: configは起動時もreload時も本番limitで検証します。slotごとに
-  quoted datagramを持つ2 table（`resolution.capacity.failure-holds`と
-  `icmpv4-errors.capacity.actions`）はmemoryのため一つ4096 slotまで（`run-sim`は65536）、他の
+  quoted datagramを持つ3 table（`resolution.capacity.failure-holds`、
+  `icmpv4-errors.capacity.actions`、`nat44.tcp.capacity.unsolicited-syn-holds`）はmemoryのため一つ4096 slotまで（`run-sim`は65536）、他の
   table（resolution states/actions/dynamic-neighbors、ICMPv4 error states、NAT44とfirewallの
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは51.11 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは53.42 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
@@ -843,6 +863,7 @@ H6のprivilege drop（全phaseが既定のdropで動き、forward phaseで全thr
 全threadのuid/gidとsupplementary groupなしを確認した上でreload・link down/up・MTU fatalを行い、
 privileges phaseでdrop後のrootが他userの0700 directoryのconfigをreloadできない
 （`PERMISSION_DENIED`）こと、`--keep-privileges`ではcapabilityが残り同じreloadが通ることを確認）、
+B3のunsolicited_syn phase（host BのTCP SYNが未mappingのpublic portへ届くと6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らない）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの
