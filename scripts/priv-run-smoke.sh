@@ -81,7 +81,8 @@
 #             public port without a mapping: nothing for 6 s, then exactly
 #             one ICMP Destination Unreachable Port Unreachable (3/3) from
 #             203.0.113.2 quoting the SYN; after a reloadable SIGHUP to
-#             `unsolicited-syn-icmp = false`, nothing within 9 s
+#             `unsolicited-syn-icmp = false`, nothing within 9 s (run with
+#             --user/--group so the reload can read the work files)
 #   txfull    (gap fill) the WAN TX ring (128 entries; 256 generated frames
 #             so the ring, not the copy pool, is the bound) driven full:
 #             `ip link set rb down` in the router namespace makes every TX
@@ -1174,7 +1175,7 @@ phase_unsolicited_syn() {
     expect_plan syn-on syn-off reloadable none
     grep -qxF '  nat44-tcp unsolicited-syn-icmp ~ on -> off' "$work/plan-syn-on-syn-off.txt" ||
         fail "unsolicited_syn: plan does not show the switch: $(cat "$work/plan-syn-on-syn-off.txt")"
-    start_ruster syn "$work/syn.toml"
+    start_ruster syn "$work/syn.toml" --user "$smoke_uid" --group "$smoke_gid"
     wait_ready syn || fail "unsolicited_syn: ruster exited during startup"
     # Resolves host B on the router (the ICMP's reverse neighbor) and
     # creates the only TCP-free UDP mapping; 40003 has no TCP mapping.
