@@ -93,7 +93,8 @@ milestone状態: M0のP0 rowはすべてledger上implementedだが、M0の独立
 作っていない。M1は2026-11-01にcloseした。[`release-evidence/m1.md`](release-evidence/m1.md)の
 9 exit criterionはすべてmetで、closing SHAはそのevidenceをcloseへ更新したPRのsquash merge
 commitである。route撤去後の既存flowがsilentな点はtracked deviation（FW-025）として残り、
-NAT port pool size明確化とOBS-017/018延期のowner確認は任意でM1 closeを妨げない。
+NAT port pool size変更のrestart-required化とOBS-017/018のM2以降への延期は、ownerへ「異論がなければ
+進める」と提示し明示の回答がなかったcoordinator既定値で（owner決定ではない）、M1 closeを妨げない。
 
 M2（Operable AF_XDP static router）は**open**である。coordinatorのscoping提案（owner決定では
 ない）でM2をM2aとM2bに分け、M2a（`ruster run`の下のcopy-mode AF_XDP router、veth E2EをCIで実行。
@@ -336,7 +337,15 @@ exit criteria:
 - R16のparser/state/publication property suiteとbounded fuzz smokeが必須CIで成功する。
 - R17がbenchmark specificationをcommitし、そのspec SHAをM1 release evidenceへ固定する。
 
-#### M1 owner決定（2026-11-01決定）
+#### M1 owner決定（2026-10-31〜11-01）
+
+出典: 2026-10-31にownerがM1設計判断の質問（binary名、CLI引数、signal、scenario/出力形式、exit code等）へ
+「推奨案で一括決定」と回答した（同じ回答でbenchmark thresholdはimplementerが提案しPRでownerが承認、
+required checkはcoordinatorがAPIで追加を試みる、「1並列でお願い」）。その後の回答「基本的な判断基準として
+rfc準拠にしてください そうするとA,Bが判断できるでしょ セキュリティ観点でoffするべきと考えるものに関しても
+設定可能なようにしてください　あとベンチマークは一旦ok」で、route-miss判断はB（#284）、benchmark（#282）は
+承認となり、ownerは`R16A Bounded`をrequired checkへ手で追加した（「やった」）。下の項目のうち「coordinator
+既定値」と記したものはowner決定ではない。
 
 - binary: `crates/cli`（package `ruster-cli`、bin `ruster`）。arg parsingは手書きでclapは使わない。
 - signal: binary内の小さなprivate FFIでhandlerはstatic `AtomicBool`へstoreするだけ。新しい依存は追加しない。
@@ -351,7 +360,7 @@ exit criteria:
 - service: M1ではNAT44 UDP、NAT44 TCP、FWを全て必須とし、欠落はtyped rejectとする。
 - restart-required: storage shape、resolution/ICMP policy、interface IfId/MAC変更。
   route、neighbor、FW rule、NAT port/realmはreload可能。
-  - 補足（2026-11-01、実装による明確化。owner確認待ち）: NAT port poolのsize変更はstorage shapeを
+  - 補足（2026-11-01、実装による明確化。coordinator既定値（ownerへ「異論がなければ進める」と提示し、明示の回答はないが異論もなかった。owner決定ではない））: NAT port poolのsize変更はstorage shapeを
     変えるためrestart-required。同sizeのrange shiftとrealm変更はreload可能。
 - rollback: M1では旧config fileを新generationとして再applyすることを指す。
 - 補足（S5b review、2026-11-01 owner決定）: ownerは「基本的な判断基準としてRFC準拠」とし、
@@ -375,8 +384,8 @@ exit criteria:
     全reloadがfirewall flowをflushするため撤去前flowのstateは存在せず、route missだけ
     answerするとroute oracleになる（理由はarchitecture、ledger FW-025）。
 - R17の数値thresholdはimplementerがPRで提案し、ownerがそのPRで承認する。
-- NAT/FW占有のhigh-watermarkはM2へ延期する。
-  - 補足（S4実装による明確化。owner確認待ち）: R15/Operability minimumのresolution state、action
+- NAT/FW占有のhigh-watermarkはM2へ延期する（coordinator既定値（ownerへ「異論がなければ進める」と提示し、明示の回答はないが異論もなかった。owner決定ではない）。M2 S8で実装、OBS-015）。
+  - 補足（S4実装による明確化。同じくcoordinator既定値）: R15/Operability minimumのresolution state、action
     queue、firewall auditのhigh-watermarkも同じくcore accessorが必要なため未実装（ledger OBS-017）。
     RX/TX queue saturationはSimIoのpending RX/TX high-watermarkだけ実装し、native ringの
     RX/TX/FILL/COMPLETIONは各backendの`BackendStats`実装まで延期（OBS-018）。
@@ -430,7 +439,8 @@ exit criteria:
 
 #### M2の判断の記録（2026-11-02時点）
 
-ownerの発言として記録できるのは次だけである（2026-10-31〜11-01、session内。日付は概略）。
+M2に関するownerの発言は次だけである（2026-10-31〜11-01、session内。日付は概略。M1のowner決定は
+別節「M1 owner決定」）。
 
 - 「基本的な判断基準としてrfc準拠にしてください」（RFC準拠を基準とする）
 - 「セキュリティ観点でoffするべきと考えるものに関しても設定可能なようにしてください」
