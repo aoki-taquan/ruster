@@ -6,15 +6,11 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::time::Duration;
 
-use ruster_config::{
-    parse, validate, ValidatedAfXdpPortV1, ValidatedAfXdpV1, ValidatedConfig, ValidatedConfigV1,
-    XdpAttachModeV1,
-};
+use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, ValidatedConfigV1, XdpAttachModeV1};
 use ruster_control::{OsRandomKeySource, ProductionSequencer};
 use ruster_core::{IfId, MonotonicMillis};
 use ruster_io_sim::SimIo;
 use ruster_io_xdp_native::XdpIoError;
-use ruster_sim_scenario::SIM_VALIDATION_LIMITS;
 
 use ruster_core::PublicationQuiescenceDisposition;
 
@@ -64,10 +60,10 @@ generated-frames = 64
 fn config_with(extra: &str) -> ValidatedConfigV1 {
     let base = include_str!("../../../../fixtures/m1/router-v1.toml");
     let text = format!("{base}\n{extra}");
-    let parsed = parse(text.as_bytes()).expect("parse");
-    match validate(parsed, SIM_VALIDATION_LIMITS) {
-        Ok(ValidatedConfig::V1(config)) => config,
-        _ => panic!("valid config"),
+    // The loader of `ruster run`, with the limits it uses.
+    match crate::config_cmd::validate_bytes(text.as_bytes()) {
+        Ok(config) => config,
+        Err(error) => panic!("valid config: {}", error.render()),
     }
 }
 
@@ -1747,6 +1743,72 @@ fn token_table_is_pinned() {
         "NAT44_TCP"
     );
     let _: fn(&StorageAllocationError) -> String = |error| token(&error.service);
+}
+
+/// H3: every table at its production limit goes through the loader of
+/// `ruster run` and starts: the storage is allocated and the router runs
+/// generation 1.
+#[test]
+fn the_maximal_production_config_starts() {
+    use crate::limits_tests::{MAXIMAL, MAXIMAL_STORAGE_BYTES};
+    let config = match crate::config_cmd::validate_bytes(MAXIMAL.as_bytes()) {
+        Ok(config) => config,
+        Err(error) => panic!("production limits accept it: {}", error.render()),
+    };
+    let required = config.storage_shape().required_bytes;
+    assert_eq!(
+        u64::try_from(required).expect("fits"),
+        MAXIMAL_STORAGE_BYTES
+    );
+    let host = FakeHost::default();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let status = execute_with(
+        &host,
+        config,
+        FakeSource::default(),
+        settings(CheckPolicy::default(), 0),
+        &mut FakeClock {
+            step_us: 1_000,
+            ..FakeClock::default()
+        },
+        &FakeStop::after(FIRST_LOOP_CHECK + 1),
+        &mut out,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("utf-8");
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains(READY), "{err}");
+}
+
+/// H3: one slot above its production limit, for every table (4096 for the
+/// scanned resolution and ICMPv4 error tables, 65536 for NAT44 and the
+/// firewall), is refused by the loader of `ruster run` (startup and
+/// reload) with exit 2 and a value-free code and schema path, before any
+/// resource, also where the simulator's limits would accept it.
+#[test]
+fn run_refuses_each_table_one_slot_above_the_production_limit() {
+    use crate::limits_tests::{with_capacity, CAPACITY_FIELDS, MAXIMAL};
+    for (section, key, path, bound) in CAPACITY_FIELDS {
+        let limit = bound.production();
+        let text = with_capacity(MAXIMAL, section, key, limit + 1);
+        let Err(error) = crate::config_cmd::validate_bytes(text.as_bytes()) else {
+            panic!("{path} above the limit is refused");
+        };
+        let mut err = Vec::new();
+        assert_eq!(
+            crate::config_cmd::report_load(&mut err, "", &error),
+            EXIT_INVALID
+        );
+        assert_eq!(
+            String::from_utf8(err).expect("utf-8"),
+            format!(
+                "ruster: invalid config: stage=validate code=CAPACITY_LIMIT_EXCEEDED \
+                 path={path} limit={limit} actual={}\n",
+                limit + 1
+            )
+        );
+    }
 }
 
 #[path = "ops_tests.rs"]

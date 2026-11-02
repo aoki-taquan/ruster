@@ -20,6 +20,14 @@
 #             crosses the router (ARP reply from the router to A, ARP
 #             request from the router to B, NAT44 to 203.0.113.2, stateful
 #             firewall); SIGTERM; exit 0, no XDP left on ra/rb, final stats
+#   limits    (H3) a config with every runtime table at its production
+#             limit (resolution and ICMPv4 error tables 4096, NAT44 and
+#             firewall 65536, NAT44 pool 1-65535, 33.44 MiB of storage) is
+#             accepted by `validate`; one more dynamic neighbor (4097) is
+#             refused by `validate` and `ruster run` (exit 2) although the
+#             simulator's limits accept it as a sim document; `ruster run`
+#             starts the maximal config, forwards and translates, and exits
+#             0 on SIGTERM
 #   ops       (M2 S10b) on one running router: SIGHUP reload that turns the
 #             LAN->WAN UDP rule into deny (the datagram stops arriving) and
 #             back (it arrives again), generations 2 and 3, no restart; a
@@ -253,10 +261,14 @@ sudo -n ip -n "$host_b" link set pb up
 
 # The router-v1 fixture on ra/rb plus a copy-mode AF_XDP backend.
 write_config() {
-    # $1 output, $2 lan device, $3 wan queue, $4 fixture (router-v1),
-    # $5 wan generated frames (64)
+    # $1 output, $2 lan device, $3 wan queue, $4 fixture (router-v1; a
+    # name in fixtures/m1 or an absolute path), $5 wan generated frames (64)
+    case ${4:-router-v1} in
+    /*) fixture=$4 ;;
+    *) fixture="$root/fixtures/m1/${4:-router-v1}.toml" ;;
+    esac
     sed -e 's/device = "sim0"/device = "'"$2"'"/' -e 's/device = "sim1"/device = "rb"/' \
-        "$root/fixtures/m1/${4:-router-v1}.toml" >"$1"
+        "$fixture" >"$1"
     cat >>"$1" <<EOF
 
 [backend]
@@ -293,6 +305,16 @@ write_config "$work/router-v2.toml" ra 0 router-v2
 # a cross-port forward is copied into an egress generated frame, so with
 # more of those than TX entries the 128-entry TX ring is what fills.
 write_config "$work/txfull.toml" ra 0 router-v1 256
+# H3: every runtime table at its production limit (33.44 MiB of storage),
+# without the fixture's own backend; and one more dynamic neighbor (above
+# the production 4096, within the simulator's 65536), as af-xdp and as sim.
+sed -e '/^\[backend\]$/,$d' -e 's/device = "rusternodev0"/device = "sim0"/' \
+    -e 's/device = "rusternodev1"/device = "sim1"/' \
+    "$root/fixtures/limits/router-production-max.toml" >"$work/max-base.toml"
+write_config "$work/production-max.toml" ra 0 "$work/max-base.toml"
+sed 's/^dynamic-neighbors = 4096$/dynamic-neighbors = 4097/' "$work/production-max.toml" \
+    >"$work/production-above.toml"
+sed '/^\[backend\]$/,$d' "$work/production-above.toml" >"$work/sim-above.toml"
 # Invalid: a frame size AF_XDP does not support (validate exit 2).
 sed 's/frame-size = 2048/frame-size = 1000/' "$work/router.toml" >"$work/invalid.toml"
 
@@ -451,8 +473,12 @@ forward_once() {
     wait "$sender" || true
     [ "$status" -eq 0 ] || fail "$tag: host B never received the datagram"
     source=$(sed -n 2p "$work/recv-$tag.out")
+    # $2: the translated source ("address port") pattern; default the
+    # fixture's pool 40000-40015.
+    pattern=${2:-"203.0.113.2 400[0-1][0-9]"}
+    # shellcheck disable=SC2254 # $pattern is a pattern on purpose.
     case $source in
-    "203.0.113.2 400"[0-1][0-9]) ;;
+    $pattern) ;;
     *) fail "$tag: datagram not translated by NAT44 (source $source)" ;;
     esac
     echo "priv_run_$tag: host A -> host B forwarded and translated ($source) verified"
@@ -751,6 +777,37 @@ grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
     "$work/forward.err" || fail "forward: no shutdown summary"
 cat "$work/forward.err"
 echo "priv_run_shutdown: SIGTERM exit 0, XDP detached, final counters (rx.received=$received) verified"
+
+# limits (H3): every table at its production limit runs; one slot above a
+# scanned table is refused by validate and run, not by the sim limits.
+status=0
+"$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
+[ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
+grep -q " storage-bytes=35061696 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+    fail "limits: validate: $(cat "$work/validate-production-max.txt")"
+above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.dynamic-neighbors limit=4096 actual=4097"
+status=0
+"$binary_path" validate "$work/production-above.toml" >"$work/validate-production-above.txt" 2>&1 || status=$?
+[ "$status" -eq 2 ] || fail "limits: validate of 4097 dynamic neighbors exit status $status"
+grep -qxF "ruster: invalid config: $above_detail" "$work/validate-production-above.txt" ||
+    fail "limits: validate: $(cat "$work/validate-production-above.txt")"
+start_ruster limits-above "$work/production-above.toml"
+wait_ruster
+[ "$status" -eq 2 ] || fail "limits: run of 4097 dynamic neighbors exit status $status"
+grep -qxF "ruster: invalid config: $above_detail" "$work/limits-above.err" ||
+    fail "limits: run diagnostic: $(cat "$work/limits-above.err")"
+assert_detached "the refused limits config"
+status=0
+"$binary_path" validate "$work/sim-above.toml" >"$work/validate-sim-above.txt" 2>&1 || status=$?
+[ "$status" -eq 0 ] || fail "limits: sim validate exit status $status: $(cat "$work/validate-sim-above.txt")"
+start_ruster limits "$work/production-max.toml"
+wait_ready limits || fail "limits: ruster exited during startup: $(cat "$work/limits.err")"
+forward_once limits "203.0.113.2 [1-9]*"
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
+assert_detached "the limits phase"
+echo "priv_run_limits: every table at its production limit (storage 35061696 bytes) started, forwarded, and stopped with exit 0; 4097 dynamic neighbors refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).

@@ -42,6 +42,7 @@ const REMOTE: [u8; 4] = [203, 0, 113, 20];
 
 pub(crate) const LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 16,
+    max_scanned_slots_per_table: 1 << 16,
     max_runtime_bytes: 1 << 26,
 };
 

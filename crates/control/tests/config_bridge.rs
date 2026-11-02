@@ -140,6 +140,7 @@ last = 65535
 
 const LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 20,
+    max_scanned_slots_per_table: 1 << 20,
     max_runtime_bytes: 1 << 30,
 };
 
