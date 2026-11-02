@@ -1433,11 +1433,11 @@ RFC 6056 §4に従うべき（SHOULD）とし、RFC 6888 REQ-15はCGNのport割�
   NAPT。従来の挙動）。保存したportの予測不能性はhost自身のsource port選択と同じで、RFC 6056に
   従うhostはrandomizeします。予測可能なsource portを使うhostを抱える構成のためにprotocolごとの
   `[nat44.udp]`/`[nat44.tcp]` `port-preservation = false`（reloadable、`NatChange::port_preservation`
-  のtyped delta、applyはNAT stateをflush）で常にkeyed portにできます。(2)はどちらでも保ちます。
+  のtyped delta、applyはNAT stateをflush）で常にkeyed portにできます。(2)はどちらでも保ちます。`false`はhostのport選択を隠しますが、keyed startはkey generation内でendpointごとに固定なので、source port固定のendpoint（DNS resolverなど）のpublic portはflowごとに変わりません（resolverはRFC 5452どおり自分でrandomizeする）。preservation onではinside hostがport使用状況を知れ、他hostの直前にexpiredしたportを(1)で取れるので、信頼できないinside hostがある構成も`false`の理由です（(1)をowner無しportだけにする案はNAT44-093、hostごとのmapping上限はNAT44-092でdeferred）。
 - **(4) takeover**: domain `UdpPortTakeover`/`TcpPortTakeover`で（endpoint、mapping generation、
   時刻、probe番号）をhashした`NAT44_PORT_TAKEOVER_PROBES`（8）個のpool portをO(1)のowner確認で
   調べ、ownerがexpiredな最初のportを取ります。全てliveならexpiry順へfallbackします（expiredの
-  割合fでfallback確率(1-f)^8）。expiredなmappingのportを取る新しいendpoint（自分のexact
+  割合fでfallback確率はおよそ(1-f)^8で、probeの重複があるのでわずかに高い）。probeしたexpired ownerのうち最も古いものではなく最初のものを取ります（最も古いものを選ぶと予測可能なexpiry順へ寄る。代わりに直前にexpiredしたmappingのportが先に引き継がれ得る）。expiredなmappingのportを取る新しいendpoint（自分のexact
   mappingが無いとき）はそのmappingのslotを再生成します。list先頭のslotを使うと、その先頭が持つ
   portがexpiry順に解放されて次の新mappingの(3)に取られ、takeoverの半分がFIFOに戻るためです。
 - **cost**: planあたりowner確認はUDP最大12、TCP最大11、bitmap 34 words以下、keyed hash 1〜9回で、

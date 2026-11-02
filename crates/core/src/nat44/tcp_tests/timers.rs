@@ -1063,3 +1063,69 @@ fn a_drifted_established_count_fails_closed() {
         assert_eq!((runtime.mappings[a], runtime.sessions[session]), before);
     });
 }
+
+/// N2 (review core L2): a new endpoint takes an expired established
+/// mapping's port and, with it, that mapping's slot, while its session slot
+/// comes from another mapping's expired session. The old established
+/// session stays counted only against its own (now recreated) generation:
+/// reclaiming it later never touches the new mapping's established count.
+#[test]
+fn a_port_takeover_recreates_the_owner_slot_and_keeps_established_counts_exact() {
+    const C: (Ipv4Address, u16) = (INTERNAL2, 1_000);
+    const A: (Ipv4Address, u16) = (INTERNAL, 1_000);
+    const D: (Ipv4Address, u16) = (Ipv4Address::from_octets([10, 0, 0, 13]), 1_000);
+    with_config(timer_policy(), 40_000, 40_001, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 2];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 2];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        // C: opening only (expires at OPENING); A: established at 1 ms.
+        let (c, c_session) = out(&mut runtime, C, PEER, SYN, 0).unwrap();
+        let (a, a_session) = handshake(&mut runtime, A, PEER, 1);
+        assert_ne!(a, c);
+        assert_eq!(runtime.mappings[a].established_sessions, 1);
+        assert_eq!(runtime.mappings[c].established_sessions, 0);
+        let a_port = runtime.mappings[a].public_port;
+        let c_port = runtime.mappings[c].public_port;
+        assert_eq!(runtime.port_owners.first_unowned_port_from(0), None);
+
+        // Both expired. B's internal port is A's public port (step 1,
+        // preservation): B recreates A's slot, and the session slot is C's
+        // (the oldest expired session), not A's.
+        let now = 1 + ESTABLISHED;
+        let b_host = (Ipv4Address::from_octets([10, 0, 0, 12]), a_port);
+        let plan = runtime
+            .plan_outbound(b_host.0, b_host.1, PEER2.0, PEER2.1, seg(SYN), now)
+            .unwrap();
+        assert_eq!(plan.mapping.public_port, a_port);
+        assert_eq!(plan.mapping_index(), a);
+        assert_eq!(plan.displaced_port_mapping_index(), Some(a));
+        assert_eq!(plan.session_index(), c_session);
+        runtime.commit_outbound(plan, now).unwrap();
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+        assert_eq!(runtime.mappings[a].established_sessions, 0);
+        // C kept its port (no release in expiry order); A's old session is
+        // stale but still occupies its slot.
+        assert!(runtime.mappings[c].port_owned);
+        assert_eq!(runtime.mappings[c].public_port, c_port);
+        assert!(runtime.sessions[a_session].occupied);
+
+        // B completes its handshake: one established session on slot a.
+        inbound(&mut runtime, a_port, PEER2, SYN_ACK, now).unwrap();
+        out(&mut runtime, b_host, PEER2, ACK, now).unwrap();
+        assert_eq!(runtime.mappings[a].established_sessions, 1);
+
+        // D takes C's port and slot (the only expired owner) and reclaims
+        // A's old established session: B's count is untouched.
+        let (d, d_session) = out(&mut runtime, D, PEER, SYN, now).unwrap();
+        assert_eq!(d, c);
+        assert_eq!(d_session, a_session);
+        assert_eq!(runtime.mappings[d].public_port, c_port);
+        assert_eq!(runtime.mappings[a].established_sessions, 1);
+        assert_eq!(runtime.mappings[d].established_sessions, 0);
+        assert_eq!(runtime.counters().sessions_expired_established, 1);
+        assert_eq!(runtime.counters().sessions_expired_opening, 1);
+        assert_eq!(runtime.port_owners.first_unowned_port_from(0), None);
+        assert!(runtime.reuse_lists_are_consistent());
+        assert_eq!(runtime.validate_indexes(), Ok(()));
+    });
+}

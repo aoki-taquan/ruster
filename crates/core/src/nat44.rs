@@ -5762,7 +5762,7 @@ impl<'a> Nat44UdpRuntime<'a> {
     }
 
     /// Public port of a new mapping (NAT44-004, NAT44-068, NAT44-020), in
-    /// O(1):
+    /// bounded work (at most 12 owner checks and 34 bitmap words):
     ///
     /// 1. with port preservation on (the default), the internal port, if in
     ///    the pool and unowned or owned by an expired mapping;
@@ -5921,7 +5921,11 @@ impl PortSelectionKey {
     /// Pool port of takeover probe `probe` (step 4) for the mapping
     /// generation `generation` (distinct for every mapping a runtime
     /// creates between flushes) at `now_ms`, so which expired owner gives
-    /// up its port is not predictable without the key.
+    /// up its port is not predictable without the key. The generation
+    /// advances only when a plan commits, so a plan that is discarded (a
+    /// read-only plan, or one refused at commit) and rebuilt at the same
+    /// time probes the same ports; one rebuilt at a later time probes
+    /// others.
     fn takeover_port(
         self,
         internal_address: Ipv4Address,
@@ -9882,7 +9886,8 @@ impl<'a> Nat44TcpRuntime<'a> {
     }
 
     /// Public port of a new mapping (NAT44-004, NAT44-068, NAT44-020), in
-    /// O(1), by the steps of the UDP allocator with the TCP hash domains:
+    /// bounded work (at most 11 owner checks and 34 bitmap words), by the
+    /// steps of the UDP allocator with the TCP hash domains:
     ///
     /// 1. with port preservation on (the default), the internal port, if in
     ///    the pool and unowned or owned by an expired mapping;

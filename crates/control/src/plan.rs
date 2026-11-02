@@ -139,10 +139,11 @@ pub struct NatPortRange {
 
 /// Difference of one NAT44 protocol. The filtering behavior, the
 /// hairpinning switch, the port preservation switch, the TCP per-remote
-/// inbound session limit, the TCP unsolicited-SYN ICMP switch, and the TCP inbound-RST policy are not
-/// secret and are reported as typed deltas. The rest of the policy (which
-/// includes the allocator seed) is never exposed, only whether it changed:
-/// `policy_changed` ignores changes of only those values.
+/// inbound session limit, the TCP unsolicited-SYN ICMP switch, and the TCP
+/// inbound-RST policy are not secret and are reported as typed deltas. The
+/// rest of the policy (which includes the allocator seed) is never exposed,
+/// only whether it changed: `policy_changed` ignores changes of only those
+/// values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct NatChange {
