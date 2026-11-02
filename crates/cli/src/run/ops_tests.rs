@@ -1138,9 +1138,11 @@ fn unreadable_ipv6_while_running_is_fatal_unless_allowed() {
 /// IPv6 enabled with only link-local on a port is refused at startup
 /// (`KERNEL_IPV6_ENABLED`) unless `--allow-kernel-ipv6`; turning IPv6 on
 /// while running warns and is reported at exit; the IPv4 weak-host
-/// exposure only warns, at startup and while running.
+/// exposure is refused at startup (`KERNEL_IPV4_WEAK_HOST`, CLI-079)
+/// unless `--allow-ipv4-weak-host`, which warns, and only warns while
+/// running.
 #[test]
-fn ipv6_enabled_is_refused_and_weak_host_only_warns() {
+fn ipv6_enabled_and_weak_host_are_refused_at_startup_and_warn_while_running() {
     let host = FakeHost {
         ipv6: Some(Ipv6Facts::CLEAN),
         ..FakeHost::default()
@@ -1174,6 +1176,18 @@ fn ipv6_enabled_is_refused_and_weak_host_only_warns() {
         weak_host: true,
         ..FakeHost::default()
     };
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(outcome
+        .err
+        .contains("startup failed: stage=checks port=if1 code=KERNEL_IPV4_WEAK_HOST"));
+    host.assert_released();
+
+    // Accepted with the override: warned at startup and while running.
+    let host = FakeHost {
+        weak_host: true,
+        ..FakeHost::default()
+    };
     let enabled = Ipv6Sample {
         disabled: Ok(false),
         addresses: Ok(0),
@@ -1187,7 +1201,22 @@ fn ipv6_enabled_is_refused_and_weak_host_only_warns() {
             .borrow_mut()
             .push_back((IfId(LAN), Some(true)));
     }
-    let outcome = fatal_run(&host, 20);
+    let outcome = run_full(
+        &host,
+        settings(
+            CheckPolicy {
+                allow_ipv4_weak_host: true,
+                ..CheckPolicy::default()
+            },
+            0,
+        ),
+        FakeSource::default(),
+        &StopAfterTicks::new(&host, 20, &[]),
+        &mut FakeClock {
+            step_us: 1_000,
+            ..FakeClock::default()
+        },
+    );
     assert_eq!(outcome.status, 0, "{}", outcome.err);
     for line in [
         "warning: port=if1 IPV4_WEAK_HOST_EXPOSURE",
@@ -1208,6 +1237,36 @@ fn ipv6_enabled_is_refused_and_weak_host_only_warns() {
     assert_eq!(
         line_value(&outcome.out, "if1.watch.ipv4_weak_host"),
         Some("true")
+    );
+    host.assert_released();
+}
+
+/// CLI-079: without `--allow-ipv4-weak-host` a port whose effective
+/// `rp_filter` drops to 0 while running is still only a counted warning
+/// (a fatal exit would detach XDP and create the very exposure), and it
+/// recovers when `rp_filter` is set again.
+#[test]
+fn weak_host_appearing_while_running_warns_and_recovers_without_override() {
+    let host = FakeHost::default();
+    for _ in 0..3 {
+        host.state
+            .weak_host
+            .borrow_mut()
+            .push_back((IfId(LAN), Some(true)));
+    }
+    let outcome = fatal_run(&host, 20);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    for line in [
+        "warning: port=if1 health=IPV4_WEAK_HOST_EXPOSURE",
+        "recovered: port=if1 health=IPV4_WEAK_HOST_EXPOSURE",
+    ] {
+        assert!(outcome.err.contains(line), "{line}\n{}", outcome.err);
+    }
+    assert!(!outcome.err.contains("fatal:"), "{}", outcome.err);
+    assert!(
+        !outcome.err.contains("KERNEL_IPV4_WEAK_HOST"),
+        "{}",
+        outcome.err
     );
     host.assert_released();
 }

@@ -219,6 +219,19 @@ accepted ARP Requestを含むgenerationがfruitlessに終わった場合、bound
 ICMPv4 Destination Unreachable Type 3/Code 1を生成できます。元RXは直ちにrecycleされ、
 ARP成功時にも自動replayしません。gateway failureはCode 1対象外です。
 
+ARPのsender protocol addressには既定でon-link条件を課しません（RFC 826のmerge/reply
+algorithmどおり。ARP-032）。ingressのconnected/direct routeにもgatewayにも入らないsenderの
+ARPを学習も返答もせず`ARP_SENDER_NOT_ON_LINK`でdropするARP-031はopt-inのhardeningです
+（owner決定2026-11-02「rfc準きょで」: RFC挙動が既定でhardeningはopt-in、という読み方は
+coordinatorの解釈。H4c（#311）では無条件dropでした）。有効にするとLANのhostが他prefixの
+addressで動的cacheを埋められなくなる一方、linkを共有する別prefixのhost（secondary subnet）は
+direct `[[routes]]`（`via`なし）を足すまで解決されません。
+
+```toml
+[arp]                           # table/keyとも省略可能
+require-on-link-sender = false  # true: off-link senderのARPを ARP_SENDER_NOT_ON_LINK でdrop（reload可能）
+```
+
 nonlocal IPv4はoptions/local判定後にまずLPMします。routeが無ければ元packetをbyte不変の
 `RouteMiss`でdropし、eligibleならICMPv4 Destination Unreachable Type 3/Code 0をqueueします。
 routeがありTTL 0/1なら`Ipv4TtlExpired`とTime Exceeded Type 11/Code 0です。両kindは同じ
@@ -616,8 +629,13 @@ sudo kill -HUP <pid>                                               # configをre
   `KERNEL_FORWARDING_ENABLED scope=multicast`で拒否（`--allow-kernel-forwarding`でwarning）。
   addressの無いportで実効`rp_filter`（`all`とdeviceの大きい方）が0なら、detach中はportのMAC宛てに
   届いたhostの任意のIPv4 address宛てframeがlocalに配送されるので（`arp_ignore`はARP応答を止めるだけで
-  これは防がない）`IPV4_WEAK_HOST_EXPOSURE`のwarningだけを出します（拒否するかはowner判断待ち。
-  `net.ipv4.conf.all.rp_filter=1`（または2）と、助言として`arp_ignore=1`を推奨）。
+  これは防がない）、H5から起動を`KERNEL_IPV4_WEAK_HOST`（読めなければ`UNVERIFIABLE
+  probe=rp-filter`）で拒否します（owner決定2026-11-02「1.は拒否」、CLI-079）。
+  `--allow-ipv4-weak-host`は従来どおり`IPV4_WEAK_HOST_EXPOSURE`のwarningにします（detach中に
+  hostの全IPv4 serviceがportから届き得るriskを受け入れる宣言。他のoverrideでは受理しません）。
+  既存環境への影響: 新しいnetnsの既定は`rp_filter=0`なので、`net.ipv4.conf.all.rp_filter=1`
+  （または2）を設定する（または`--allow-ipv4-weak-host`）まで起動しません。助言として
+  `arp_ignore=1`も推奨。
   `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1（または読めない）なら既定で
   `KERNEL_FORWARDING_ENABLED`（`UNVERIFIABLE probe=forwarding`）で拒否します。router停止中・exit後・
   crash後にport間をfirewall/NAT抜きで運び得るのはkernel forwardingだからで、namespaceの他の

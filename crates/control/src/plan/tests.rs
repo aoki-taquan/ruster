@@ -58,6 +58,11 @@ pub(crate) const ECHO_REPLY_CHANGE: (&str, &str) = (
     "[resolution.policy]",
     "[ipv4-origin]\ndefault-ttl = 64\necho-reply = false\n\n[resolution.policy]",
 );
+/// The ARP-031 on-link sender opt-in lives in the reloadable `arp` policy.
+pub(crate) const ARP_ON_LINK_CHANGE: (&str, &str) = (
+    "[resolution.policy]",
+    "[arp]\nrequire-on-link-sender = true\n\n[resolution.policy]",
+);
 /// NAT filtering modes are reloadable (the storage shape does not depend on
 /// them); this edit loosens UDP and tightens TCP.
 pub(crate) const NAT_FILTERING_CHANGE: [(&str, &str); 2] = [
@@ -103,6 +108,7 @@ fn only(plan: &ApplyPlan, aspects: &[&str]) {
         ("firewall_order", plan.firewall_rule_order_changed()),
         ("firewall_policy", plan.firewall_policy_changed()),
         ("ipv4_origin", plan.ipv4_origin_changed()),
+        ("arp", plan.arp_policy_changed()),
         ("nat44_udp", !plan.nat44_udp().is_empty()),
         ("nat44_tcp", !plan.nat44_tcp().is_empty()),
         ("backend", !plan.backend().is_empty()),
@@ -449,6 +455,24 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
     // The Echo responder switch is a reloadable ipv4-origin change, and
     // spelling out every default switch is no change at all.
     only(&plan(&[ECHO_REPLY_CHANGE]), &["ipv4_origin"]);
+    // The ARP-031 opt-in is a reloadable arp change (in both directions),
+    // and spelling out the RFC 826 default is no change at all.
+    only(&plan(&[ARP_ON_LINK_CHANGE]), &["arp"]);
+    only(
+        &ApplyPlan::between(&config(&[ARP_ON_LINK_CHANGE]), &config(&[])).expect("plan"),
+        &["arp"],
+    );
+    only(
+        &plan(&[(
+            "[resolution.policy]",
+            "[arp]\nrequire-on-link-sender = false\n\n[resolution.policy]",
+        )]),
+        &[],
+    );
+    only(
+        &plan(&[("[resolution.policy]", "[arp]\n\n[resolution.policy]")]),
+        &[],
+    );
     only(
         &plan(&[
             (

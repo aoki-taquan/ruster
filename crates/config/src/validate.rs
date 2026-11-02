@@ -1,7 +1,7 @@
 use std::{fmt, mem::size_of, net::Ipv4Addr, num::ParseIntError};
 
 use ruster_core::{
-    port_free_bitmap_words, validate_firewall_rules, DirectoryBucket, DirectoryNode,
+    port_free_bitmap_words, validate_firewall_rules, ArpPolicy, DirectoryBucket, DirectoryNode,
     DynamicNeighborSlot, FirewallAction, FirewallConfigError, FirewallInterface,
     FirewallIpv4Prefix, FirewallIpv4PrefixError, FirewallPolicy, FirewallPolicyError,
     FirewallPortRange, FirewallPortRangeError, FirewallProtocol, FirewallRule, FirewallRuleId,
@@ -730,6 +730,7 @@ pub struct ValidatedConfigV1 {
     neighbors: Box<[Neighbor]>,
     local_ipv4: Box<[LocalIpv4Binding]>,
     ipv4_origin: Ipv4OriginPolicy,
+    arp: ArpPolicy,
     resolution: Option<ValidatedResolutionV1>,
     icmpv4_errors: Option<ValidatedIcmpv4ErrorV1>,
     nat44: Option<ValidatedNat44V1>,
@@ -768,6 +769,12 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn ipv4_origin(&self) -> Ipv4OriginPolicy {
         self.ipv4_origin
+    }
+
+    /// The `[arp]` receive policy ([`ArpPolicy::RFC826`] when absent).
+    #[must_use]
+    pub const fn arp(&self) -> ArpPolicy {
+        self.arp
     }
 
     #[must_use]
@@ -1140,6 +1147,8 @@ fn validate_v1(
             .with_echo_reply(source.echo_reply),
         None => Ipv4OriginPolicy::default(),
     };
+    let arp = ArpPolicy::RFC826
+        .with_require_on_link_sender(config.arp.unwrap_or_default().require_on_link_sender);
 
     interface_records.sort_by_key(|record| record.binding.id);
     local_ipv4_with_paths.sort_by_key(|(binding, _)| binding.interface);
@@ -1519,6 +1528,7 @@ fn validate_v1(
         neighbors,
         local_ipv4,
         ipv4_origin,
+        arp,
         resolution,
         icmpv4_errors,
         nat44,

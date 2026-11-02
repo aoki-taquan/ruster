@@ -804,3 +804,47 @@ fn nat44_tcp_inbound_sessions_per_remote_defaults_and_is_exact() {
         assert_eq!(misplaced.code(), DiagnosticCode::UnknownField, "{anchor}");
     }
 }
+
+/// `[arp]` is optional and RFC 826 by default; `require-on-link-sender`
+/// (ARP-031 hardening) is an exact boolean, and unknown keys are rejected.
+#[test]
+fn arp_policy_defaults_to_rfc826_and_is_exact() {
+    let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    assert_eq!(config.arp, None);
+    let with = |body: &str| {
+        VALID_V1.replacen(
+            "[resolution.policy]",
+            &format!("[arp]\n{body}\n[resolution.policy]"),
+            1,
+        )
+    };
+    let VersionedConfig::V1(config) = parse(with("").as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    assert_eq!(config.arp, Some(ruster_config::ArpV1::default()));
+    assert!(!config.arp.unwrap().require_on_link_sender);
+    let VersionedConfig::V1(config) =
+        parse(with("require-on-link-sender = true\n").as_bytes()).unwrap()
+    else {
+        panic!("schema version 1");
+    };
+    assert!(config.arp.unwrap().require_on_link_sender);
+
+    for (body, code) in [
+        ("require-on-link-sender = 1\n", DiagnosticCode::InvalidType),
+        (
+            "require-on-link-sender = \"yes\"\n",
+            DiagnosticCode::InvalidType,
+        ),
+        ("on-link = true\n", DiagnosticCode::UnknownField),
+    ] {
+        let diagnostic = parse(with(body).as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), code, "{body}");
+    }
+    assert!(parse(
+        with("require-on-link-sender = true\nrequire-on-link-sender = false\n").as_bytes()
+    )
+    .is_err());
+}

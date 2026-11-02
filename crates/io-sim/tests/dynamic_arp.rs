@@ -1,9 +1,9 @@
 use ruster_core::{
-    execute_one_arp_request, forward_batch_with_resolution, ipv4_header_checksum, BatchReport,
-    ConsumeReason, ControlDisposition, DropReason, DynamicNeighborSlot, ForwardingSnapshot, IfId,
-    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
-    NoGeneratedTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionPolicyError,
-    ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
+    execute_one_arp_request, forward_batch_with_resolution, ipv4_header_checksum, ArpPolicy,
+    BatchReport, ConsumeReason, ControlDisposition, DropReason, DynamicNeighborSlot,
+    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Neighbor, NoGeneratedTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
+    ResolutionPolicyError, ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
@@ -922,8 +922,9 @@ fn zero_capacity_and_runtime_recreation_are_safe() {
     assert_eq!(rt.dynamic_neighbor_count(), 0);
 }
 
-/// ARP-031 scenario, run against both the linear (borrowed) and the
-/// indexed (owner) snapshot of the same tables.
+/// ARP-031 opt-in scenario (`require-on-link-sender`), run against both
+/// the linear (borrowed) and the indexed (owner) snapshot of the same
+/// tables.
 fn assert_off_link_senders_are_dropped(s: &ForwardingSnapshot<'_>) {
     const OFF_LINK: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 7]);
     const GATEWAY: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 1]);
@@ -1016,46 +1017,138 @@ fn assert_off_link_senders_are_dropped(s: &ForwardingSnapshot<'_>) {
 
 const OFF_LINK_STATIC: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 9]);
 
-#[test]
-fn off_link_arp_senders_are_dropped_without_learning_or_reply() {
+/// RFC 826 default scenario: the merge/reply algorithm places no condition
+/// on the sender's protocol address, so off-link senders are learned (when
+/// the router is the target) or merged (when already known) and answered.
+fn assert_off_link_senders_are_learned_by_default(s: &ForwardingSnapshot<'_>) {
+    const OFF_LINK: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 7]);
+    const OTHER_LINK: Ipv4Address = Ipv4Address::from_octets([10, 9, 0, 5]);
+    assert!(!s.arp_policy().require_on_link_sender());
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut cache = [DynamicNeighborSlot::EMPTY; 4];
+    let mut rt = runtime!(
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        states,
+        actions,
+        cache
+    );
+    let mut io = SimIo::new();
+
+    // An off-link Request for our address: learned and answered.
+    io.inject(IFACE, arp(1, OFF_LINK, LOCAL, PEER_MAC, PEER_MAC));
+    let mut trace = VecTrace::default();
+    let report = run(&mut io, &mut rt, s, 0, 1, &mut trace);
+    assert_eq!((report.tx_requested, report.dropped), (1, 0));
+    let reply = io.pop_tx().unwrap();
+    assert_eq!(&reply.bytes[0..6], &PEER_MAC.0);
+    assert_eq!(&reply.bytes[38..42], &OFF_LINK.octets());
+    assert_eq!(rt.dynamic_neighbor_count(), 1);
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::ArpControl {
+            disposition: ControlDisposition::Inserted,
+            ..
+        }
+    )));
+
+    // A gratuitous ARP of the known off-link sender merges the new MAC.
+    io.inject(IFACE, arp(1, OFF_LINK, OFF_LINK, NEW_MAC, NEW_MAC));
+    let mut trace = VecTrace::default();
+    let report = run(&mut io, &mut rt, s, 1, 1, &mut trace);
+    assert_eq!((report.tx_requested, report.dropped), (0, 0));
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::ArpControl {
+            disposition: ControlDisposition::Updated,
+            ..
+        }
+    )));
+
+    // RFC 826 negative case: an unknown off-link sender whose target is
+    // not the router is neither inserted nor answered (only a known sender
+    // is merged).
+    const UNKNOWN_OFF_LINK: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 8]);
+    io.inject(
+        IFACE,
+        arp(1, UNKNOWN_OFF_LINK, OFF_LINK, PEER_MAC, PEER_MAC),
+    );
+    let mut trace = VecTrace::default();
+    let report = run(&mut io, &mut rt, s, 1, 1, &mut trace);
+    assert_eq!((report.tx_requested, report.dropped), (0, 0));
+    assert_eq!(rt.dynamic_neighbor_count(), 1);
+    assert!(trace.events().iter().any(|event| matches!(
+        event,
+        TraceEvent::ArpControl {
+            disposition: ControlDisposition::Ignored,
+            ..
+        }
+    )));
+
+    // A Reply to us from a sender on-link only on another interface is
+    // learned on this one.
+    io.inject(IFACE, arp(2, OTHER_LINK, LOCAL, PEER_MAC, PEER_MAC));
+    let report = run(&mut io, &mut rt, s, 2, 1, &mut VecTrace::default());
+    assert_eq!((report.consumed, report.dropped), (1, 0));
+    assert_eq!(rt.dynamic_neighbor_count(), 2);
+}
+
+fn off_link_tables() -> (
+    [Route; 3],
+    [Interface; 2],
+    [Neighbor; 1],
+    [LocalIpv4Binding; 1],
+) {
     const OTHER_IFACE: IfId = IfId(2);
-    let routes = [
-        Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, IFACE, None).unwrap(),
-        Route::new(
-            Ipv4Address::from_octets([0; 4]),
-            0,
-            IFACE,
-            Some(Ipv4Address::from_octets([203, 0, 113, 1])),
-        )
-        .unwrap(),
-        Route::new(
-            Ipv4Address::from_octets([10, 9, 0, 0]),
-            16,
-            OTHER_IFACE,
-            None,
-        )
-        .unwrap(),
-    ];
-    let interfaces = [
-        Interface {
-            id: IFACE,
-            mac: LOCAL_MAC,
-        },
-        Interface {
-            id: OTHER_IFACE,
-            mac: MacAddress([2, 0, 0, 0, 0, 2]),
-        },
-    ];
-    let neighbors = [Neighbor {
-        interface: IFACE,
-        target: OFF_LINK_STATIC,
-        mac: PEER_MAC,
-    }];
-    let bindings = [LocalIpv4Binding {
-        interface: IFACE,
-        address: LOCAL,
-    }];
-    assert_off_link_senders_are_dropped(&snapshot(&routes, &interfaces, &neighbors, &bindings));
+    (
+        [
+            Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, IFACE, None).unwrap(),
+            Route::new(
+                Ipv4Address::from_octets([0; 4]),
+                0,
+                IFACE,
+                Some(Ipv4Address::from_octets([203, 0, 113, 1])),
+            )
+            .unwrap(),
+            Route::new(
+                Ipv4Address::from_octets([10, 9, 0, 0]),
+                16,
+                OTHER_IFACE,
+                None,
+            )
+            .unwrap(),
+        ],
+        [
+            Interface {
+                id: IFACE,
+                mac: LOCAL_MAC,
+            },
+            Interface {
+                id: OTHER_IFACE,
+                mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            },
+        ],
+        [Neighbor {
+            interface: IFACE,
+            target: OFF_LINK_STATIC,
+            mac: PEER_MAC,
+        }],
+        [LocalIpv4Binding {
+            interface: IFACE,
+            address: LOCAL,
+        }],
+    )
+}
+
+#[test]
+fn off_link_arp_senders_are_learned_and_answered_by_default() {
+    let (routes, interfaces, neighbors, bindings) = off_link_tables();
+    assert_off_link_senders_are_learned_by_default(&snapshot(
+        &routes,
+        &interfaces,
+        &neighbors,
+        &bindings,
+    ));
     let owner = ruster_core::ValidatedForwardingOwner::new(
         routes.into(),
         interfaces.into(),
@@ -1064,5 +1157,25 @@ fn off_link_arp_senders_are_dropped_without_learning_or_reply() {
         ruster_core::Ipv4OriginPolicy::default(),
     )
     .unwrap();
+    assert_off_link_senders_are_learned_by_default(&owner.snapshot());
+}
+
+#[test]
+fn off_link_arp_senders_are_dropped_without_learning_or_reply_when_required() {
+    let required = ArpPolicy::RFC826.with_require_on_link_sender(true);
+    let (routes, interfaces, neighbors, bindings) = off_link_tables();
+    let borrowed = snapshot(&routes, &interfaces, &neighbors, &bindings);
+    let hardened = borrowed.with_arp_policy(required);
+    assert!(hardened.arp_policy().require_on_link_sender());
+    assert_off_link_senders_are_dropped(&hardened);
+    let owner = ruster_core::ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        neighbors.into(),
+        bindings.into(),
+        ruster_core::Ipv4OriginPolicy::default(),
+    )
+    .unwrap()
+    .with_arp_policy(required);
     assert_off_link_senders_are_dropped(&owner.snapshot());
 }

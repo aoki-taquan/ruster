@@ -14,7 +14,7 @@ usage:
   ruster run-sim [--hold] --scenario <scenario.toml>
   ruster run-sim [--hold] -- <scenario.toml>
   ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
-             [--allow-kernel-ipv6]
+             [--allow-kernel-ipv6] [--allow-ipv4-weak-host]
              [--strict-config-perms] [--stats-interval <seconds>]
              [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
              [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
@@ -107,6 +107,12 @@ pub struct RunArgs {
     /// IPv6 forwarding, or an unreadable IPv6 fact): warned instead of
     /// refused (XDP-063).
     pub allow_kernel_ipv6: bool,
+    /// Start although a port's effective IPv4 `rp_filter` is 0 (or
+    /// unreadable), which exposes every local IPv4 address of the host
+    /// through the address-less port while the router is detached (weak
+    /// host model): warned (`IPV4_WEAK_HOST_EXPOSURE`) instead of refused
+    /// (`KERNEL_IPV4_WEAK_HOST`, CLI-079).
+    pub allow_ipv4_weak_host: bool,
     /// Refuse a config file that group or other may write or that is
     /// owned by neither root nor the effective user (startup and reload).
     pub strict_config_perms: bool,
@@ -268,6 +274,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut allow_multi_queue = false;
     let mut allow_kernel_forwarding = false;
     let mut allow_kernel_ipv6 = false;
+    let mut allow_ipv4_weak_host = false;
     let mut strict_config_perms = false;
     let mut numbers: [Option<u64>; NUMERIC.len()] = [None; NUMERIC.len()];
     let mut words = rest.iter();
@@ -317,6 +324,9 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
                 flag(&mut allow_kernel_forwarding, "--allow-kernel-forwarding")?;
             }
             Some("--allow-kernel-ipv6") => flag(&mut allow_kernel_ipv6, "--allow-kernel-ipv6")?,
+            Some("--allow-ipv4-weak-host") => {
+                flag(&mut allow_ipv4_weak_host, "--allow-ipv4-weak-host")?;
+            }
             Some("--strict-config-perms") => {
                 flag(&mut strict_config_perms, "--strict-config-perms")?
             }
@@ -347,6 +357,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
             .unwrap_or(DEFAULT_STARTUP_ATTEMPTS),
         allow_kernel_forwarding,
         allow_kernel_ipv6,
+        allow_ipv4_weak_host,
         strict_config_perms,
         tx_stall_warn_secs,
         tx_stall_fatal_secs,
@@ -584,6 +595,7 @@ mod tests {
             startup_attempts: DEFAULT_STARTUP_ATTEMPTS,
             allow_kernel_forwarding: false,
             allow_kernel_ipv6: false,
+            allow_ipv4_weak_host: false,
             strict_config_perms: false,
             tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
             tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
@@ -597,6 +609,7 @@ mod tests {
             "run",
             "--allow-kernel-forwarding",
             "--allow-kernel-ipv6",
+            "--allow-ipv4-weak-host",
             "--strict-config-perms",
             "--tx-stall-warn-secs=2",
             "--tx-stall-fatal-secs",
@@ -609,6 +622,7 @@ mod tests {
         };
         assert!(args.allow_kernel_forwarding && args.strict_config_perms);
         assert!(args.allow_kernel_ipv6);
+        assert!(args.allow_ipv4_weak_host);
         assert_eq!(
             (
                 args.tx_stall_warn_secs,
@@ -622,6 +636,7 @@ mod tests {
         };
         assert!(!defaults.allow_kernel_forwarding && !defaults.strict_config_perms);
         assert!(!defaults.allow_kernel_ipv6);
+        assert!(!defaults.allow_ipv4_weak_host);
         assert_eq!(
             (
                 defaults.tx_stall_warn_secs,
@@ -633,6 +648,7 @@ mod tests {
         for flag in [
             "--allow-kernel-forwarding",
             "--allow-kernel-ipv6",
+            "--allow-ipv4-weak-host",
             "--strict-config-perms",
         ] {
             assert_eq!(
@@ -686,6 +702,7 @@ mod tests {
                 startup_attempts: attempts,
                 allow_kernel_forwarding: false,
                 allow_kernel_ipv6: false,
+                allow_ipv4_weak_host: false,
                 strict_config_perms: false,
                 tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
                 tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,

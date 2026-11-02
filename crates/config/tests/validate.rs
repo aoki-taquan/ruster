@@ -1003,3 +1003,30 @@ fn nat44_tcp_inbound_sessions_per_remote_maps_onto_the_core_policy() {
         );
     }
 }
+
+/// `[arp]` maps onto the core ARP policy: absent or empty is RFC 826 (no
+/// on-link condition on the sender), `require-on-link-sender = true` opts
+/// into ARP-031.
+#[test]
+fn arp_policy_maps_onto_the_core_policy() {
+    use ruster_core::ArpPolicy;
+
+    let defaults = validated(VALID);
+    assert_eq!(defaults.arp(), ArpPolicy::RFC826);
+    let with = |body: &str| {
+        VALID.replacen(
+            "[resolution.policy]",
+            &format!("[arp]\n{body}\n[resolution.policy]"),
+            1,
+        )
+    };
+    assert_eq!(validated(&with("")).arp(), ArpPolicy::RFC826);
+    assert_eq!(
+        validated(&with("require-on-link-sender = false\n")).arp(),
+        ArpPolicy::RFC826
+    );
+    assert_eq!(
+        validated(&with("require-on-link-sender = true\n")).arp(),
+        ArpPolicy::RFC826.with_require_on_link_sender(true)
+    );
+}

@@ -516,3 +516,32 @@ fn config_bridge_moves_complete_topology_and_origin_policy_into_candidate() {
     assert_eq!(rendered, format!("{expected:?}"));
     assert!(rendered.contains("default_ttl: 200"), "{rendered}");
 }
+
+/// The `[arp]` policy reaches the candidate's forwarding snapshot: absent
+/// is RFC 826 (no on-link condition), `require-on-link-sender = true` opts
+/// into ARP-031.
+#[test]
+fn config_bridge_carries_the_arp_policy_into_the_snapshot() {
+    let default = validated(CONFIG);
+    assert_eq!(default.arp(), ruster_core::ArpPolicy::RFC826);
+    let candidate = sim_candidate(&default, 1);
+    assert!(!candidate
+        .authority()
+        .snapshot()
+        .arp_policy()
+        .require_on_link_sender());
+
+    let hardened_text = CONFIG.replacen(
+        "[resolution.policy]",
+        "[arp]\nrequire-on-link-sender = true\n\n[resolution.policy]",
+        1,
+    );
+    let hardened = validated(&hardened_text);
+    assert!(hardened.arp().require_on_link_sender());
+    let candidate = sim_candidate(&hardened, 2);
+    assert!(candidate
+        .authority()
+        .snapshot()
+        .arp_policy()
+        .require_on_link_sender());
+}

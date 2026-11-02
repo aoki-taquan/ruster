@@ -191,7 +191,9 @@ pub enum DropReason {
     Nat44Icmpv4EndHostSourceMismatch = 153,
     /// An ARP packet's sender protocol address is not on the link of the
     /// ingress interface: outside every direct route out of it and not one
-    /// of its configured gateways (ARP-031). Nothing is learned or answered.
+    /// of its configured gateways (ARP-031). Only with the opt-in
+    /// [`ArpPolicy::with_require_on_link_sender`]; the RFC 826 default
+    /// learns and answers such a sender. Nothing is learned or answered.
     ArpSenderNotOnLink = 154,
 }
 
@@ -609,6 +611,50 @@ impl Default for Ipv4OriginPolicy {
     }
 }
 
+/// ARP receive policy of the forwarding snapshot.
+///
+/// The default is RFC 826 behavior: the merge and reply algorithm places no
+/// condition on the sender's protocol address, so every valid ARP packet
+/// from a host sender is merged or learned and, if it targets a router
+/// address on the ingress, answered. ARP-031 on-link sender hardening is an
+/// opt-in (owner decision 2026-11-02 「rfc準きょで」; the reading "RFC default,
+/// hardening opt-in" is the coordinator's).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArpPolicy {
+    require_on_link_sender: bool,
+}
+
+impl ArpPolicy {
+    /// RFC 826: no condition on the sender's protocol address.
+    pub const RFC826: Self = Self {
+        require_on_link_sender: false,
+    };
+
+    /// Returns this policy with the ARP-031 on-link sender rule enabled or
+    /// disabled.
+    ///
+    /// When enabled, an ARP Request or Reply (gratuitous included) whose
+    /// sender is a host outside every direct route out of the ingress and
+    /// not one of its gateways is dropped as
+    /// [`DropReason::ArpSenderNotOnLink`] without learning, merging,
+    /// replying, or moving the resolution clock. Static neighbors, the
+    /// router's own address, and non-host senders (the RFC 5227 probe
+    /// sender 0.0.0.0, connected network or broadcast addresses) keep their
+    /// dispositions either way.
+    #[must_use]
+    pub const fn with_require_on_link_sender(self, enabled: bool) -> Self {
+        Self {
+            require_on_link_sender: enabled,
+        }
+    }
+
+    /// Whether ARP from off-link senders is dropped (ARP-031 hardening).
+    #[must_use]
+    pub const fn require_on_link_sender(self) -> bool {
+        self.require_on_link_sender
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct ForwardingSnapshot<'a> {
     pub(crate) routes: &'a [Route],
@@ -616,6 +662,7 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) neighbors: &'a [Neighbor],
     pub(crate) local_ipv4: &'a [LocalIpv4Binding],
     pub(crate) ipv4_origin: Ipv4OriginPolicy,
+    pub(crate) arp: ArpPolicy,
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
     /// Without it every lookup uses the linear reference (PERF-002).
@@ -634,6 +681,7 @@ impl std::fmt::Debug for ForwardingSnapshot<'_> {
             .field("neighbors_len", &self.neighbors.len())
             .field("local_ipv4_len", &self.local_ipv4.len())
             .field("ipv4_origin", &self.ipv4_origin)
+            .field("arp", &self.arp)
             .finish_non_exhaustive()
     }
 }
@@ -660,6 +708,7 @@ pub struct ValidatedForwardingOwner {
     neighbors: Box<[Neighbor]>,
     local_ipv4: Box<[LocalIpv4Binding]>,
     ipv4_origin: Ipv4OriginPolicy,
+    arp: ArpPolicy,
     index: ForwardingIndex,
     authority: u64,
 }
@@ -680,6 +729,7 @@ impl std::fmt::Debug for ValidatedForwardingOwner {
             .field("neighbors_len", &self.neighbors.len())
             .field("local_ipv4_len", &self.local_ipv4.len())
             .field("ipv4_origin", &self.ipv4_origin)
+            .field("arp", &self.arp)
             .finish_non_exhaustive()
     }
 }
@@ -785,6 +835,7 @@ impl<'a> ForwardingSnapshot<'a> {
             neighbors,
             local_ipv4,
             ipv4_origin,
+            arp: ArpPolicy::RFC826,
             index: None,
             authority: calculate_snapshot_authority(
                 routes,
@@ -792,8 +843,47 @@ impl<'a> ForwardingSnapshot<'a> {
                 neighbors,
                 local_ipv4,
                 ipv4_origin,
+                ArpPolicy::RFC826,
             ),
         })
+    }
+
+    /// Returns this snapshot with `arp` as its ARP receive policy (default
+    /// [`ArpPolicy::RFC826`]). A snapshot not borrowed from a
+    /// [`ValidatedForwardingOwner`] recomputes its authority, so two
+    /// snapshots of the same tables with different ARP policies are never
+    /// the same authority.
+    ///
+    /// For tests and benches that borrow tables directly. Production code
+    /// sets the policy on the owner
+    /// ([`ValidatedForwardingOwner::with_arp_policy`], from the validated
+    /// `[arp]` config through the publication plan), whose snapshots carry
+    /// it.
+    #[must_use]
+    pub fn with_arp_policy(self, arp: ArpPolicy) -> Self {
+        let authority = if self.authority & VALIDATED_OWNER_AUTHORITY_BIT == 0 {
+            calculate_snapshot_authority(
+                self.routes,
+                self.interfaces,
+                self.neighbors,
+                self.local_ipv4,
+                self.ipv4_origin,
+                arp,
+            )
+        } else {
+            self.authority
+        };
+        Self {
+            arp,
+            authority,
+            ..self
+        }
+    }
+
+    /// The ARP receive policy.
+    #[must_use]
+    pub const fn arp_policy(&self) -> ArpPolicy {
+        self.arp
     }
 
     pub(crate) const fn authority(&self) -> u64 {
@@ -1002,9 +1092,19 @@ impl ValidatedForwardingOwner {
             neighbors,
             local_ipv4,
             ipv4_origin,
+            arp: ArpPolicy::RFC826,
             index,
             authority,
         })
+    }
+
+    /// Returns this owner with `arp` as the ARP receive policy of every
+    /// snapshot it lends (default [`ArpPolicy::RFC826`]). The policy is
+    /// not a table, so nothing is revalidated or reindexed.
+    #[must_use]
+    pub fn with_arp_policy(mut self, arp: ArpPolicy) -> Self {
+        self.arp = arp;
+        self
     }
 
     /// Borrows a coherent snapshot without validation, hashing, or allocation.
@@ -1016,6 +1116,7 @@ impl ValidatedForwardingOwner {
             neighbors: &self.neighbors,
             local_ipv4: &self.local_ipv4,
             ipv4_origin: self.ipv4_origin,
+            arp: self.arp,
             index: Some(&self.index),
             authority: self.authority,
         }
@@ -1082,6 +1183,7 @@ fn calculate_snapshot_authority(
     neighbors: &[Neighbor],
     local_ipv4: &[LocalIpv4Binding],
     ipv4_origin: Ipv4OriginPolicy,
+    arp: ArpPolicy,
 ) -> u64 {
     fn mix(hash: u64, value: u64) -> u64 {
         (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
@@ -1130,6 +1232,9 @@ fn calculate_snapshot_authority(
     // authority values.
     if !ipv4_origin.echo_reply() {
         hash = mix(hash, 0xec);
+    }
+    if arp.require_on_link_sender() {
+        hash = mix(hash, 0xa7);
     }
     hash & !VALIDATED_OWNER_AUTHORITY_BIT
 }
@@ -5505,16 +5610,17 @@ fn decide_arp<T: TraceSink>(
     let static_key = snapshot
         .static_neighbor(ingress, arp.sender_protocol)
         .is_some();
-    // ARP-031: a sender the router could never resolve on this interface
-    // (outside every direct route out of it and not one of its gateways)
-    // is not a neighbor on this link. Learning it would only fill the
-    // dynamic cache, and the router has no route back over this link to
-    // answer it, so the packet is dropped before any state, clock, or
-    // reply. A configured static neighbor, our own address (a conflict),
-    // and the non-host senders (`sender_is_host` is false for the RFC 5227
-    // probe sender 0.0.0.0 and for connected network or broadcast
-    // addresses) keep their earlier dispositions.
-    if !static_key
+    // ARP-031 (opt-in hardening; RFC 826 places no condition on the
+    // sender, so the default learns and answers it): a sender the router
+    // could never resolve on this interface (outside every direct route out
+    // of it and not one of its gateways) is not a neighbor on this link.
+    // When enabled, it is dropped before any state, clock, or reply. A
+    // configured static neighbor, our own address (a conflict), and the
+    // non-host senders (`sender_is_host` is false for the RFC 5227 probe
+    // sender 0.0.0.0 and for connected network or broadcast addresses)
+    // keep their dispositions either way.
+    if snapshot.arp.require_on_link_sender()
+        && !static_key
         && !sender_local
         && sender_host
         && !snapshot.sender_on_link(ingress, arp.sender_protocol)
@@ -5807,7 +5913,7 @@ fn apply_icmpv4_echo_reply(
 mod tests {
     use super::{
         decide_ipv4, forward_batch, forward_batch_with_nat44_udp_and_tcp_and_firewall,
-        next_publication_nonce_from, BatchReport, DropReason, Ipv4OriginPolicy,
+        next_publication_nonce_from, ArpPolicy, BatchReport, DropReason, Ipv4OriginPolicy,
         ValidatedForwardingOwner, FULL_FORWARDING_VALIDATIONS, VALIDATED_OWNER_AUTHORITY_BIT,
     };
     use crate::{
@@ -5887,6 +5993,41 @@ mod tests {
         assert_eq!(moved_snapshot.publication_nonce(), publication_nonce);
     }
 
+    /// The ARP policy is RFC 826 by default; opting into ARP-031 changes
+    /// the authority of a borrowed snapshot (mixed only when non-default,
+    /// so existing authorities are unchanged) and keeps the nonce of an
+    /// owner snapshot.
+    #[test]
+    fn arp_policy_defaults_to_rfc826_and_is_part_of_borrowed_authority() {
+        let required = ArpPolicy::RFC826.with_require_on_link_sender(true);
+        assert_eq!(ArpPolicy::default(), ArpPolicy::RFC826);
+        assert!(!ArpPolicy::RFC826.require_on_link_sender());
+        assert!(required.require_on_link_sender());
+        let borrowed = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        assert_eq!(borrowed.arp_policy(), ArpPolicy::RFC826);
+        let hardened = borrowed.with_arp_policy(required);
+        assert_eq!(hardened.arp_policy(), required);
+        assert_ne!(hardened.authority(), borrowed.authority());
+        assert_eq!(hardened.publication_nonce(), 0);
+        assert_eq!(
+            hardened.with_arp_policy(ArpPolicy::RFC826).authority(),
+            borrowed.authority()
+        );
+        let owner = empty_validated_owner();
+        assert_eq!(owner.snapshot().arp_policy(), ArpPolicy::RFC826);
+        let nonce = owner.snapshot().publication_nonce();
+        let owner = owner.with_arp_policy(required);
+        assert_eq!(owner.snapshot().arp_policy(), required);
+        assert_eq!(owner.snapshot().publication_nonce(), nonce);
+        assert_eq!(
+            owner
+                .snapshot()
+                .with_arp_policy(ArpPolicy::RFC826)
+                .authority(),
+            nonce
+        );
+    }
+
     #[test]
     fn validated_owner_nonce_distinguishes_equal_empty_storage_without_identity_leak() {
         let first = empty_validated_owner();
@@ -5909,12 +6050,14 @@ mod tests {
         assert_eq!(
             format!("{first_snapshot:?}"),
             "ForwardingSnapshot { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
-             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, .. }"
+             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
+             arp: ArpPolicy { require_on_link_sender: false }, .. }"
         );
         assert_eq!(
             format!("{first:?}"),
             "ValidatedForwardingOwner { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
-             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, .. }"
+             local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
+             arp: ArpPolicy { require_on_link_sender: false }, .. }"
         );
     }
 

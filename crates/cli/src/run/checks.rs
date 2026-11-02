@@ -7,8 +7,9 @@
 //! session's interface index, in the caller's network namespace), so they
 //! are tested without a kernel.
 //! Every reader fails closed: a fact that cannot be read refuses startup,
-//! including the IPv4 forwarding sysctls unless `--allow-kernel-forwarding`
-//! and the IPv6 facts unless `--allow-kernel-ipv6`.
+//! including the IPv4 forwarding sysctls unless `--allow-kernel-forwarding`,
+//! the IPv6 facts unless `--allow-kernel-ipv6`, and `rp_filter` unless
+//! `--allow-ipv4-weak-host`.
 
 use std::fmt;
 
@@ -304,6 +305,10 @@ pub struct CheckPolicy {
     /// addresses, routes, forwarding, or an unreadable IPv6 fact) is warned
     /// instead of refused.
     pub allow_kernel_ipv6: bool,
+    /// `--allow-ipv4-weak-host`: an effective IPv4 `rp_filter` of 0 (or an
+    /// unreadable one) on a port is warned (`IPV4_WEAK_HOST_EXPOSURE`)
+    /// instead of refused (`KERNEL_IPV4_WEAK_HOST`).
+    pub allow_ipv4_weak_host: bool,
 }
 
 /// Which forwarding sysctl was on.
@@ -369,6 +374,12 @@ pub enum CheckFailure {
     /// Kernel IPv4 forwarding is on and `--allow-kernel-forwarding` was not
     /// given.
     KernelForwardingEnabled(ForwardingScope),
+    /// The effective IPv4 `rp_filter` of the port (the larger of
+    /// `conf/all` and `conf/<dev>`) is 0 and `--allow-ipv4-weak-host` was
+    /// not given: while detached the kernel delivers frames received on
+    /// the address-less port for any local IPv4 address of the host (weak
+    /// host model, CLI-079).
+    KernelIpv4WeakHost,
     /// A fact could not be read or did not belong to the opened device.
     Unverifiable(Probe),
 }
@@ -403,6 +414,9 @@ pub enum Probe {
     Ipv6Routes,
     /// An IPv6 forwarding sysctl could not be read.
     Ipv6Forwarding,
+    /// `conf/all/rp_filter` or `conf/<dev>/rp_filter` could not be read
+    /// (refused without `--allow-ipv4-weak-host`).
+    RpFilter,
 }
 
 impl Probe {
@@ -419,6 +433,7 @@ impl Probe {
             Self::Ipv6Addresses => "ipv6-addresses",
             Self::Ipv6Routes => "ipv6-routes",
             Self::Ipv6Forwarding => "ipv6-forwarding",
+            Self::RpFilter => "rp-filter",
         }
     }
 }
@@ -458,6 +473,7 @@ impl fmt::Display for CheckFailure {
                 scope.name()
             ),
             Self::KernelIpv6Enabled => formatter.write_str("KERNEL_IPV6_ENABLED"),
+            Self::KernelIpv4WeakHost => formatter.write_str("KERNEL_IPV4_WEAK_HOST"),
         }
     }
 }
@@ -475,8 +491,8 @@ pub struct Warnings {
     pub forwarding_multicast: bool,
     /// A forwarding sysctl could not be read.
     pub forwarding_unreadable: bool,
-    /// Effective `rp_filter` 0 (or unreadable): weak-host exposure while
-    /// detached (never refused).
+    /// Accepted through `--allow-ipv4-weak-host`: effective `rp_filter` 0
+    /// (or unreadable), weak-host exposure while detached.
     pub weak_host: bool,
     /// Accepted through `--allow-kernel-ipv6`: IPv6 is enabled on the port.
     pub ipv6_enabled: bool,
@@ -591,9 +607,13 @@ impl Warnings {
 ///   validation of a device without addresses passes them
 ///   (`__fib_validate_source`, the no-address `last_resort` path) and they
 ///   are delivered to local sockets; `arp_ignore` only stops ARP replies, so
-///   it does not change this. With the effective `rp_filter` 0 (or
-///   unreadable) a warning `IPV4_WEAK_HOST_EXPOSURE`, never a refusal
-///   (whether to refuse is an open owner question, CLI-034).
+///   it does not change this. With the effective `rp_filter` 0 refused
+///   (`KERNEL_IPV4_WEAK_HOST`; unreadable: `UNVERIFIABLE probe=rp-filter`)
+///   unless `--allow-ipv4-weak-host`, which accepts both with the warning
+///   `IPV4_WEAK_HOST_EXPOSURE` (owner decision 2026-11-02 「1.は拒否」,
+///   CLI-079). `rp_filter` 1 (strict) or 2 (loose) rejects them, since
+///   the port has no route back to any source. The forwarding refusals
+///   come first, the IPv6 ones after.
 /// - Kernel IPv6 ([`evaluate_ipv6`]): refused whenever IPv6 is enabled on
 ///   the port, unless `--allow-kernel-ipv6`.
 /// - MTU: the rtnetlink MTU must equal the one the session read at open
@@ -661,7 +681,12 @@ pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warni
             return Err(CheckFailure::Unverifiable(Probe::Forwarding));
         }
     }
-    warnings.weak_host = facts.weak_host != Some(false);
+    match facts.weak_host {
+        Some(false) => {}
+        _ if policy.allow_ipv4_weak_host => warnings.weak_host = true,
+        Some(true) => return Err(CheckFailure::KernelIpv4WeakHost),
+        None => return Err(CheckFailure::Unverifiable(Probe::RpFilter)),
+    }
     evaluate_ipv6(&facts.ipv6, policy.allow_kernel_ipv6, &mut warnings)?;
     Ok(warnings)
 }
@@ -1418,6 +1443,85 @@ mod tests {
         );
     }
 
+    /// CLI-079 (owner decision 2026-11-02): an effective `rp_filter` of 0
+    /// is refused (`KERNEL_IPV4_WEAK_HOST`), an unreadable one is
+    /// `UNVERIFIABLE probe=rp-filter`; `--allow-ipv4-weak-host` turns both
+    /// into the `IPV4_WEAK_HOST_EXPOSURE` warning. Forwarding is refused
+    /// first, the IPv6 refusals come after.
+    #[test]
+    fn ipv4_weak_host_is_refused_unless_allowed() {
+        let clean = DeviceFacts {
+            ifindex: 7,
+            rx_queues: 1,
+            link_mtu: 1500,
+            session_mtu: 1500,
+            frame_capacity: 1792,
+            forwarding_global: Some(false),
+            forwarding_device: Some(false),
+            forwarding_multicast: Some(false),
+            weak_host: Some(false),
+            ipv6: Ipv6Facts::DISABLED,
+            ..DeviceFacts::default()
+        };
+        let strict = CheckPolicy::default();
+        let allowed = CheckPolicy {
+            allow_ipv4_weak_host: true,
+            ..strict
+        };
+        for (weak_host, refusal) in [
+            (Some(true), CheckFailure::KernelIpv4WeakHost),
+            (None, CheckFailure::Unverifiable(Probe::RpFilter)),
+        ] {
+            let facts = DeviceFacts { weak_host, ..clean };
+            assert_eq!(evaluate_device(&facts, strict), Err(refusal), "{facts:?}");
+            let warnings = evaluate_device(&facts, allowed).expect("warned when allowed");
+            assert_eq!(
+                warnings.codes().collect::<Vec<_>>(),
+                ["IPV4_WEAK_HOST_EXPOSURE"],
+                "{facts:?}"
+            );
+            // The other overrides do not accept it.
+            let others = CheckPolicy {
+                allow_kernel_forwarding: true,
+                allow_kernel_ipv6: true,
+                allow_multi_queue: true,
+                allow_ipv4_weak_host: false,
+            };
+            assert_eq!(evaluate_device(&facts, others), Err(refusal), "{facts:?}");
+            // Kernel forwarding is reported before the weak host.
+            let forwarding = DeviceFacts {
+                forwarding_global: Some(true),
+                ..facts
+            };
+            assert_eq!(
+                evaluate_device(&forwarding, allowed),
+                Err(CheckFailure::KernelForwardingEnabled(
+                    ForwardingScope::Global
+                ))
+            );
+            // IPv6 is checked after the weak host.
+            let ipv6 = DeviceFacts {
+                ipv6: Ipv6Facts::CLEAN,
+                ..facts
+            };
+            assert_eq!(evaluate_device(&ipv6, strict), Err(refusal));
+            assert_eq!(
+                evaluate_device(&ipv6, allowed),
+                Err(CheckFailure::KernelIpv6Enabled)
+            );
+        }
+        assert_eq!(evaluate_device(&clean, strict), Ok(Warnings::default()));
+        assert_eq!(evaluate_device(&clean, allowed), Ok(Warnings::default()));
+        assert_eq!(
+            CheckFailure::KernelIpv4WeakHost.to_string(),
+            "KERNEL_IPV4_WEAK_HOST"
+        );
+        assert_eq!(
+            CheckFailure::Unverifiable(Probe::RpFilter).to_string(),
+            "UNVERIFIABLE probe=rp-filter"
+        );
+    }
+
     fn ipv6_clean() -> DeviceFacts {
         DeviceFacts {
             ifindex: 7,
@@ -1695,9 +1799,10 @@ mod tests {
 
     /// IPv4 `mc_forwarding` is refused like the other forwarding sysctls
     /// (warned under `--allow-kernel-forwarding`); the weak-host exposure
-    /// (or an unreadable `rp_filter`) only ever warns.
+    /// (or an unreadable `rp_filter`) is not accepted by
+    /// `--allow-kernel-forwarding`, only by `--allow-ipv4-weak-host`.
     #[test]
-    fn multicast_forwarding_refuses_and_weak_host_only_warns() {
+    fn multicast_forwarding_refuses_and_weak_host_needs_its_own_override() {
         let clean = DeviceFacts {
             ipv6: Ipv6Facts::DISABLED,
             ..ipv6_clean()
@@ -1731,9 +1836,15 @@ mod tests {
             ),
             Err(CheckFailure::Unverifiable(Probe::Forwarding))
         );
+        let weak_allowed = CheckPolicy {
+            allow_ipv4_weak_host: true,
+            ..strict
+        };
         for weak_host in [Some(true), None] {
             let facts = DeviceFacts { weak_host, ..clean };
-            let warnings = evaluate_device(&facts, strict).expect("never refused");
+            assert!(evaluate_device(&facts, strict).is_err(), "{weak_host:?}");
+            assert!(evaluate_device(&facts, allowed).is_err(), "{weak_host:?}");
+            let warnings = evaluate_device(&facts, weak_allowed).expect("warned when allowed");
             assert_eq!(
                 warnings.codes().collect::<Vec<_>>(),
                 ["IPV4_WEAK_HOST_EXPOSURE"],
