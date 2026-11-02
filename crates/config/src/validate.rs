@@ -1332,6 +1332,22 @@ fn validate_v1(
                         path(&["nat44", "tcp", "idle-ttl-ms"]),
                     )
                 })?
+                // RFC 5382 REQ-5: transitory timeouts of at least 4 minutes
+                // (and no longer than the established one).
+                .with_opening_idle_ttl_ms(source.opening_idle_ttl_ms)
+                .map_err(|error| {
+                    ValidationError::new(
+                        ValidationCode::Nat44TcpPolicy(error),
+                        path(&["nat44", "tcp", "opening-idle-ttl-ms"]),
+                    )
+                })?
+                .with_closing_idle_ttl_ms(source.closing_idle_ttl_ms)
+                .map_err(|error| {
+                    ValidationError::new(
+                        ValidationCode::Nat44TcpPolicy(error),
+                        path(&["nat44", "tcp", "closing-idle-ttl-ms"]),
+                    )
+                })?
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)

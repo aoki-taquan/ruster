@@ -10,6 +10,7 @@ mod icmpv4_error;
 mod io;
 mod nat44;
 mod nat44_syn_hold;
+mod nat44_tcp_state;
 mod observability;
 mod packet;
 mod resolution;
@@ -91,15 +92,17 @@ pub use nat44::{
     Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Nat44UdpReconcileError,
     Nat44UdpReconcilePermit, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
     Nat44UdpStorageShape, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
-    NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_INBOUND_SLOT_PROBES,
-    NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE,
-    NAT44_TCP_MIN_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS,
+    NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
+    NAT44_TCP_INBOUND_SLOT_PROBES, NAT44_TCP_MAX_IDLE_TTL_MS,
+    NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_MIN_IDLE_TTL_MS,
+    NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS,
     NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 pub use nat44_syn_hold::{
     Nat44TcpSynHoldSlot, NAT44_TCP_SYN_HOLD_CHAIN_LIMIT, NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS,
     NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
 };
+pub use nat44_tcp_state::Nat44TcpSessionPhase;
 pub(crate) use observability::OccupancyCounter;
 pub use observability::{
     BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields, TableOccupancy,

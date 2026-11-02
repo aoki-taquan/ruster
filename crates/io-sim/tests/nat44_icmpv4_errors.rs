@@ -1395,11 +1395,12 @@ fn inside_tcp_error_about_an_expired_session_is_a_session_miss() {
     let mut world = World::new(false);
     let public = public_source_port(&world.establish(H1, P1, true));
     let (_, delivered) = world.reply(public, true);
-    // A second session keeps the mapping live past the first's idle TTL.
-    world.now = 7_000_000;
+    // A second session keeps the mapping live past the first's idle TTL
+    // (both are opening, so the transitory TTL of 240 s applies).
+    world.now = 200_000;
     world.run(LAN, tcp_frame(H1, REMOTE, P1, 444, SYN));
     assert_eq!(world.io.pop_tx().unwrap().egress, WAN);
-    world.now = 7_440_010;
+    world.now = 240_010;
     world.assert_refused(
         LAN,
         icmp_error(H1, REMOTE, 3, 1, &delivered),

@@ -805,6 +805,74 @@ fn nat44_tcp_inbound_sessions_per_remote_defaults_and_is_exact() {
     }
 }
 
+/// N1 (RFC 5382 REQ-5, RFC 7857 §2.1): `[nat44.tcp] opening-idle-ttl-ms`
+/// and `closing-idle-ttl-ms` default to 240000 and are exact u64 TCP-only
+/// keys.
+#[test]
+fn nat44_tcp_transitory_idle_ttls_default_and_are_exact() {
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let VersionedConfig::V1(config) = parse(VALID_V1.as_bytes()).unwrap() else {
+        panic!("schema version 1");
+    };
+    let tcp = config.nat44.unwrap().tcp.unwrap();
+    assert_eq!(
+        (tcp.opening_idle_ttl_ms, tcp.closing_idle_ttl_ms),
+        (240_000, 240_000)
+    );
+    assert_eq!(
+        ruster_core::NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
+        240_000
+    );
+    for key in ["opening-idle-ttl-ms", "closing-idle-ttl-ms"] {
+        for value in [0_u64, 300_000, i64::MAX as u64] {
+            let source = VALID_V1.replacen(TCP, &format!("{TCP}{key} = {value}\n"), 1);
+            let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+                panic!("schema version 1");
+            };
+            // The decoder takes any u64; the bounds are a semantic check.
+            let tcp = config.nat44.unwrap().tcp.unwrap();
+            let decoded = if key.starts_with("opening") {
+                (tcp.opening_idle_ttl_ms, tcp.closing_idle_ttl_ms)
+            } else {
+                (tcp.closing_idle_ttl_ms, tcp.opening_idle_ttl_ms)
+            };
+            assert_eq!(decoded, (value, 240_000), "{key}");
+        }
+        for value in ["-1", "\"240000\"", "240000.0", "true"] {
+            let source = VALID_V1.replacen(TCP, &format!("{TCP}{key} = {value}\n"), 1);
+            let diagnostic = parse(source.as_bytes()).unwrap_err();
+            assert_eq!(
+                diagnostic.code(),
+                DiagnosticCode::InvalidType,
+                "{key} {value}"
+            );
+            assert_eq!(
+                diagnostic.path().segments(),
+                &[
+                    PathSegment::Field("nat44".to_owned()),
+                    PathSegment::Field("tcp".to_owned()),
+                    PathSegment::Field(key.to_owned()),
+                ],
+                "{key} {value}"
+            );
+        }
+        // TCP only: the UDP section and the realm reject it.
+        for anchor in ["icmpv4-errors = \"external-only\"\n", "[nat44.realm.ports]"] {
+            let misplaced = parse(
+                VALID_V1
+                    .replacen(anchor, &format!("{key} = 240000\n{anchor}"), 1)
+                    .as_bytes(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                misplaced.code(),
+                DiagnosticCode::UnknownField,
+                "{key} {anchor}"
+            );
+        }
+    }
+}
+
 /// B3 (RFC 5382 REQ-4): `[nat44.tcp] unsolicited-syn-icmp` defaults to
 /// `true` and `[nat44.tcp.capacity] unsolicited-syn-holds` to
 /// `DEFAULT_UNSOLICITED_SYN_HOLDS` (64); both are exact and TCP-only.

@@ -98,6 +98,12 @@ const fn default_inbound_sessions_per_remote() -> u8 {
     ruster_core::NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
 }
 
+/// Default `[nat44.tcp] opening-idle-ttl-ms` and `closing-idle-ttl-ms`:
+/// the RFC 5382 REQ-5 transitory floor of 4 minutes.
+const fn default_transitory_idle_ttl_ms() -> u64 {
+    ruster_core::NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS
+}
+
 /// Default `[nat44.tcp.capacity] unsolicited-syn-holds`. Each hold lasts
 /// [`ruster_core::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`] (6 s) and the default
 /// Port Unreachable limiter sends at most one error per egress per second,
@@ -296,7 +302,20 @@ pub struct Nat44UdpCapacityV1 {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Nat44TcpV1 {
+    /// Established connection idle timeout (RFC 5382 REQ-5, at least
+    /// 2h4m).
     pub idle_ttl_ms: u64,
+    /// Idle timeout of a partially open connection (SYN and ACK not yet
+    /// seen in both directions); absent means 240000 (4 minutes, the RFC
+    /// 5382 REQ-5 transitory floor). Validated to at least that floor and
+    /// at most `idle-ttl-ms`.
+    #[serde(default = "default_transitory_idle_ttl_ms")]
+    pub opening_idle_ttl_ms: u64,
+    /// Idle timeout of a closing connection (FIN in both directions) and
+    /// of one whose last segment was a RST (RFC 7857 §2.2); absent means
+    /// 240000. Same bounds as `opening-idle-ttl-ms`.
+    #[serde(default = "default_transitory_idle_ttl_ms")]
+    pub closing_idle_ttl_ms: u64,
     pub allocator_seed: AllocatorSeedV1,
     /// ICMPv4 error translation; absent means `bidirectional`.
     #[serde(default)]
@@ -310,8 +329,9 @@ pub struct Nat44TcpV1 {
     pub hairpinning: bool,
     /// Limit on live sessions that external inbound initial SYNs created on
     /// one mapping from one remote IPv4 address; `0` means no limit. Absent
-    /// means 0: closed connections count until the idle TTL, so a limit is
-    /// an opt-in local security policy. Validated to at most 16 (the
+    /// means 0 (no limit): a limit is an opt-in local security policy, and
+    /// closed connections count until their closing idle TTL (4 minutes by
+    /// default). Validated to at most 16 (the
     /// bounded inbound chain walk).
     #[serde(default = "default_inbound_sessions_per_remote")]
     pub inbound_sessions_per_remote: u8,

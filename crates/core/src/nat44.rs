@@ -18,6 +18,9 @@ use crate::{
         unsolicited_syn_deadline_ms, MaturedSynHold, SynHoldInsert, SynHoldKey, SynHoldTable,
         MAX_SYN_HOLD_SLOTS,
     },
+    nat44_tcp_state::{
+        next_state, phase_of, Nat44TcpDirection, Nat44TcpSegment, Nat44TcpSessionPhase,
+    },
     slot_list::{Linked, SlotLinks, SlotList, LINK_NONE},
     DirectoryBucket, DirectoryNode, ForwardingSnapshot, IfId, Ipv4Address, Nat44TcpSynHoldSlot,
     OccupancyCounter, PortOwnerSlot, TableOccupancy,
@@ -29,6 +32,13 @@ pub const NAT44_UDP_MAX_IDLE_TTL_MS: u64 = 86_400_000;
 pub const NAT44_TCP_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
+/// Floor of the TCP transitory connection idle-timeout (RFC 5382 REQ-5:
+/// "MUST NOT be less than 4 minutes"), for both the opening (partially
+/// open) and the closing phase.
+pub const NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS: u64 = 240_000;
+/// Default opening and closing (transitory) idle timeout: the RFC 5382
+/// REQ-5 floor, also RFC 7857 §2.1's RECOMMENDED minimum default.
+pub const NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS: u64 = NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS;
 /// Per-packet work bound for an inbound initial SYN that passed the NAT
 /// filter: at most this many session slots examined for reuse, and at most
 /// this many remote-address chain nodes for address-dependent admission and
@@ -36,11 +46,11 @@ pub const NAT44_TCP_MAX_IDLE_TTL_MS: u64 = 604_800_000;
 pub const NAT44_TCP_INBOUND_SLOT_PROBES: usize = 16;
 /// Default limit on live TCP sessions that external inbound initial SYNs
 /// created on one mapping from one remote IPv4 address: `0`, no limit (the
-/// RFC baseline). The TCP NAT does not track FIN/RST, so a closed
-/// connection keeps its session, and its quota, until the idle TTL (at
-/// least 2h4m) expires. A default limit would therefore refuse legitimate
-/// reconnects for hours. Operators who admit new inbound flows can opt into
-/// a limit (8 is a reasonable choice). See
+/// RFC baseline, kept pending an owner decision, NAT44-081). A closed or
+/// reset connection keeps its session, and its quota, for the closing idle
+/// timeout (default 4 minutes), and a SYN the remote never completes for
+/// the opening idle timeout. Operators who admit new inbound flows can opt
+/// into a limit (8 is a reasonable choice). See
 /// [`Nat44TcpPolicy::with_inbound_sessions_per_remote`].
 pub const NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE: u8 = 0;
 /// Largest finite per-remote limit: the count is taken by one remote-address
@@ -213,6 +223,9 @@ impl std::fmt::Debug for Nat44UdpPolicy {
 mod tcp_tests {
     use super::*;
     use crate::{Interface, LocalIpv4Binding, MacAddress, Neighbor, Route};
+
+    // `nat44/tcp_tests/timers.rs`: the per-phase timers (N1).
+    mod timers;
 
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
@@ -465,7 +478,7 @@ mod tcp_tests {
     #[test]
     fn tcp_exact_expiry_recreates_generation_and_reconcile_flushes() {
         with_config(
-            Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 7).unwrap(),
+            single_timer(Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 7).unwrap()),
             40_000,
             40_000,
             |config| {
@@ -646,7 +659,7 @@ mod tcp_tests {
     fn tcp_mapping_summary_tracks_staggered_sessions_at_exact_expiry() {
         let ttl = NAT44_TCP_MIN_IDLE_TTL_MS;
         with_config(
-            Nat44TcpPolicy::new(ttl, 0).unwrap(),
+            single_timer(Nat44TcpPolicy::new(ttl, 0).unwrap()),
             40_000,
             40_000,
             |config| {
@@ -909,8 +922,7 @@ mod tcp_tests {
     #[test]
     fn tcp_icmp_lookup_is_read_only_across_time_generation_and_zero_capacity() {
         with_config(
-            Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 0)
-                .unwrap()
+            single_timer(Nat44TcpPolicy::new(NAT44_TCP_MIN_IDLE_TTL_MS, 0).unwrap())
                 .with_icmpv4_errors(Nat44Icmpv4ErrorPolicy::ExternalOnly),
             40_000,
             40_000,
@@ -1080,15 +1092,17 @@ mod tcp_tests {
                     443,
                 ]
             );
-            // 48 bytes of state plus the reuse-list links (PERF-001),
+            // 60 bytes of state (N1 added the established-session count and the
+            // expiry) plus the reuse-list links (PERF-001),
             // rounded up to the 16-byte alignment of the lifecycle epoch.
-            assert_eq!(std::mem::size_of::<Nat44TcpMappingSlot>(), 64);
+            assert_eq!(std::mem::size_of::<Nat44TcpMappingSlot>(), 80);
             assert_eq!(std::mem::size_of::<Nat44TcpSessionSlot>(), 64);
             // A new session is keyed into both the exact and the
             // remote-address session directory, so the plan carries two
-            // prepared session links (288 bytes on x86_64).
+            // prepared session links (336 bytes on x86_64 with the 80-byte
+            // mapping copy of N1).
             assert!(
-                std::mem::size_of::<Nat44TcpOutboundPlan>() <= 320,
+                std::mem::size_of::<Nat44TcpOutboundPlan>() <= 352,
                 "plan size {}",
                 std::mem::size_of::<Nat44TcpOutboundPlan>()
             );
@@ -1375,8 +1389,9 @@ mod tcp_tests {
     fn small_tcp_session_table_with_one_free_slot_always_admits_inbound_syn() {
         for capacity in [2, 5, NAT44_TCP_INBOUND_SLOT_PROBES] {
             for free in 0..capacity {
-                let policy =
-                    Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent);
+                let policy = single_timer(
+                    Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent),
+                );
                 with_config(policy, 40_000, 40_000, |config| {
                     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
                     let mut sessions = vec![Nat44TcpSessionSlot::default(); capacity];
@@ -1442,9 +1457,27 @@ mod tcp_tests {
     }
 
     fn quota_policy(filtering: Nat44Filtering, limit: u8) -> Nat44TcpPolicy {
-        Nat44TcpPolicy::default()
-            .with_filtering(filtering)
-            .with_inbound_sessions_per_remote(limit)
+        single_timer(
+            Nat44TcpPolicy::default()
+                .with_filtering(filtering)
+                .with_inbound_sessions_per_remote(limit)
+                .unwrap(),
+        )
+    }
+
+    /// `policy` with its opening and closing idle timeouts raised to its
+    /// established one: every phase shares one TTL, the profile before
+    /// N1. Tests of slot reuse, expiry boundaries, quota release, and index
+    /// bookkeeping that predate TCP state tracking use it, so their
+    /// sessions (which see only SYNs and bare ACKs and stay opening) keep
+    /// the single TTL those tests reason about; the per-phase timers have
+    /// their own tests below.
+    fn single_timer(policy: Nat44TcpPolicy) -> Nat44TcpPolicy {
+        let ttl = policy.idle_ttl_ms();
+        policy
+            .with_opening_idle_ttl_ms(ttl)
+            .unwrap()
+            .with_closing_idle_ttl_ms(ttl)
             .unwrap()
     }
 
@@ -2029,7 +2062,9 @@ mod tcp_tests {
                 internal_address: INTERNAL,
                 internal_port: 40_000,
                 public_port: 40_000,
+                established_sessions: 0,
                 last_activity_ms: 3,
+                expires_ms: 3 + NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
                 link: TcpMappingLink::default(),
             };
             let occupied_session = Nat44TcpSessionSlot {
@@ -2041,6 +2076,7 @@ mod tcp_tests {
                 remote_port: 443,
                 last_activity_ms: 3,
                 external_inbound: false,
+                state: 0,
                 links: SlotLinks::UNLINKED,
             };
             let mut mappings = [occupied_mapping];
@@ -2795,14 +2831,15 @@ mod tcp_tests {
 
     /// PERF-001 cost bound: with 65536-slot tables and the widest pool,
     /// every new flow, even with every public port owned, examines at most
-    /// two mapping slots, one session slot, two port owners, and 34 bitmap
+    /// four mapping list heads (two per activity list), three session list heads
+    /// (one per phase), two port owners, and 34 bitmap
     /// words; the search before PERF-001 visited up to every mapping slot,
     /// every session slot, and every pool port.
     #[test]
     fn tcp_new_flow_work_is_constant_in_a_nearly_full_65536_slot_table() {
         const SLOTS: usize = 65_536;
         let ttl = NAT44_TCP_MIN_IDLE_TTL_MS;
-        let policy = Nat44TcpPolicy::new(ttl, 0x5eed_1234_5678_9abc).unwrap();
+        let policy = single_timer(Nat44TcpPolicy::new(ttl, 0x5eed_1234_5678_9abc).unwrap());
         with_config(policy, 1, 65_535, |config| {
             let mut mappings = vec![Nat44TcpMappingSlot::default(); SLOTS];
             let mut sessions = vec![Nat44TcpSessionSlot::default(); SLOTS];
@@ -2854,7 +2891,7 @@ mod tcp_tests {
             assert!(runtime.reuse_lists_are_consistent());
             assert!(runtime.port_owners.bitmap_matches_slots());
             assert!(
-                worst[0] <= 2 && worst[1] <= 1 && worst[2] <= 2 && worst[3] <= 34,
+                worst[0] <= 4 && worst[1] <= 3 && worst[2] <= 2 && worst[3] <= 34,
                 "work per new flow {worst:?}"
             );
         });
@@ -5819,6 +5856,8 @@ impl Nat44TcpHashKey {
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44TcpPolicy {
     idle_ttl_ms: u64,
+    opening_idle_ttl_ms: u64,
+    closing_idle_ttl_ms: u64,
     allocator_seed: u64,
     icmpv4_errors: Nat44Icmpv4ErrorPolicy,
     filtering: Nat44Filtering,
@@ -5832,6 +5871,8 @@ impl std::fmt::Debug for Nat44TcpPolicy {
         formatter
             .debug_struct("Nat44TcpPolicy")
             .field("idle_ttl_ms", &self.idle_ttl_ms)
+            .field("opening_idle_ttl_ms", &self.opening_idle_ttl_ms)
+            .field("closing_idle_ttl_ms", &self.closing_idle_ttl_ms)
             .field("allocator_seed", &Redacted)
             .field("icmpv4_errors", &self.icmpv4_errors)
             .field("filtering", &self.filtering)
@@ -5850,12 +5891,28 @@ impl std::fmt::Debug for Nat44TcpPolicy {
 pub enum Nat44TcpPolicyError {
     IdleTtlTooShort,
     IdleTtlTooLong,
+    /// An opening or closing (transitory) idle timeout below
+    /// [`NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS`] (RFC 5382 REQ-5).
+    TransitoryIdleTtlTooShort,
+    /// An opening or closing idle timeout above the established idle
+    /// timeout ([`Nat44TcpPolicy::idle_ttl_ms`]).
+    TransitoryIdleTtlAboveEstablished,
     /// A finite per-remote inbound session limit above
     /// [`NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE`].
     InboundSessionsPerRemoteTooLarge,
 }
 
 impl Nat44TcpPolicy {
+    /// A policy with established connection idle timeout `idle_ttl_ms`
+    /// (RFC 5382 REQ-5: at least [`NAT44_TCP_MIN_IDLE_TTL_MS`], 2h4m) and
+    /// the default opening and closing idle timeouts
+    /// ([`NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS`], 4 minutes).
+    ///
+    /// # Errors
+    ///
+    /// [`Nat44TcpPolicyError::IdleTtlTooShort`] or
+    /// [`Nat44TcpPolicyError::IdleTtlTooLong`] outside
+    /// [`NAT44_TCP_MIN_IDLE_TTL_MS`]..=[`NAT44_TCP_MAX_IDLE_TTL_MS`].
     pub const fn new(idle_ttl_ms: u64, allocator_seed: u64) -> Result<Self, Nat44TcpPolicyError> {
         if idle_ttl_ms < NAT44_TCP_MIN_IDLE_TTL_MS {
             return Err(Nat44TcpPolicyError::IdleTtlTooShort);
@@ -5865,6 +5922,8 @@ impl Nat44TcpPolicy {
         }
         Ok(Self {
             idle_ttl_ms,
+            opening_idle_ttl_ms: NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
+            closing_idle_ttl_ms: NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
             allocator_seed,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
@@ -5874,9 +5933,94 @@ impl Nat44TcpPolicy {
         })
     }
 
+    /// The established connection idle timeout (RFC 5382 REQ-5).
     #[must_use]
     pub const fn idle_ttl_ms(self) -> u64 {
         self.idle_ttl_ms
+    }
+
+    /// Sets the opening (partially open phase) idle timeout, one of RFC
+    /// 5382's transitory connection idle-timeouts; RFC 7857 §2.1 asks for
+    /// the opening and closing timeouts to be configurable separately.
+    ///
+    /// # Errors
+    ///
+    /// [`Nat44TcpPolicyError::TransitoryIdleTtlTooShort`] below
+    /// [`NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS`] (REQ-5 MUST);
+    /// [`Nat44TcpPolicyError::TransitoryIdleTtlAboveEstablished`] above
+    /// [`Self::idle_ttl_ms`].
+    pub const fn with_opening_idle_ttl_ms(
+        mut self,
+        ttl_ms: u64,
+    ) -> Result<Self, Nat44TcpPolicyError> {
+        match self.check_transitory(ttl_ms) {
+            Ok(()) => {
+                self.opening_idle_ttl_ms = ttl_ms;
+                Ok(self)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Sets the closing idle timeout (FIN in both directions, or after a
+    /// RST, RFC 7857 §2.2), the other transitory connection idle-timeout.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::with_opening_idle_ttl_ms`].
+    pub const fn with_closing_idle_ttl_ms(
+        mut self,
+        ttl_ms: u64,
+    ) -> Result<Self, Nat44TcpPolicyError> {
+        match self.check_transitory(ttl_ms) {
+            Ok(()) => {
+                self.closing_idle_ttl_ms = ttl_ms;
+                Ok(self)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    const fn check_transitory(self, ttl_ms: u64) -> Result<(), Nat44TcpPolicyError> {
+        if ttl_ms < NAT44_TCP_MIN_TRANSITORY_IDLE_TTL_MS {
+            Err(Nat44TcpPolicyError::TransitoryIdleTtlTooShort)
+        } else if ttl_ms > self.idle_ttl_ms {
+            Err(Nat44TcpPolicyError::TransitoryIdleTtlAboveEstablished)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// The opening (partially open phase) idle timeout.
+    #[must_use]
+    pub const fn opening_idle_ttl_ms(self) -> u64 {
+        self.opening_idle_ttl_ms
+    }
+
+    /// The closing idle timeout.
+    #[must_use]
+    pub const fn closing_idle_ttl_ms(self) -> u64 {
+        self.closing_idle_ttl_ms
+    }
+
+    /// The idle timeout of a session in `phase`.
+    #[must_use]
+    pub const fn session_idle_ttl_ms(self, phase: Nat44TcpSessionPhase) -> u64 {
+        match phase {
+            Nat44TcpSessionPhase::Opening => self.opening_idle_ttl_ms,
+            Nat44TcpSessionPhase::Established => self.idle_ttl_ms,
+            Nat44TcpSessionPhase::Closing => self.closing_idle_ttl_ms,
+        }
+    }
+
+    /// The longer transitory timeout: a mapping without an established
+    /// session lives this long after its last activity.
+    const fn transitory_bound_ms(self) -> u64 {
+        if self.opening_idle_ttl_ms > self.closing_idle_ttl_ms {
+            self.opening_idle_ttl_ms
+        } else {
+            self.closing_idle_ttl_ms
+        }
     }
 
     #[must_use]
@@ -5941,8 +6085,9 @@ impl Nat44TcpPolicy {
     /// configuration, not adaptive, so the device stays deterministic
     /// (RFC 4787 §13).
     ///
-    /// FIN and RST are not tracked: a cleanly closed connection keeps
-    /// counting until its idle TTL expires. The count is taken over at most
+    /// A closed or reset connection keeps counting until its session
+    /// expires on the closing idle timeout, and a SYN the remote never
+    /// completes until the opening idle timeout. The count is taken over at most
     /// [`NAT44_TCP_INBOUND_SLOT_PROBES`] remote-address chain nodes, which
     /// also hold the outbound-created sessions of the same mapping and
     /// remote; those reduce the effective limit, and a longer chain refuses
@@ -6011,6 +6156,8 @@ impl Default for Nat44TcpPolicy {
     fn default() -> Self {
         Self {
             idle_ttl_ms: NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+            opening_idle_ttl_ms: NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
+            closing_idle_ttl_ms: NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
             allocator_seed: 0,
             icmpv4_errors: Nat44Icmpv4ErrorPolicy::Bidirectional,
             filtering: Nat44Filtering::AddressDependent,
@@ -6158,11 +6305,14 @@ enum TcpMappingList {
     /// after the fresh boundary, untouched (equal to the default slot).
     #[default]
     Free,
-    /// Occupied and owning its public port, in `last_activity_ms` order
-    /// (oldest first): every commit stamps the current time and moves the
-    /// slot to the tail, so if any slot on this list is expired, the head
-    /// is.
-    Lru,
+    /// Occupied and owning its public port, expiring `idle_ttl_ms` after
+    /// its last commit of an established session: `expires_ms` minus that
+    /// TTL is a commit time, so the list is in `expires_ms` order and, if
+    /// any slot on it is expired, the head is.
+    Established,
+    /// Occupied and owning its public port, expiring the longer transitory
+    /// TTL after its last commit; in `expires_ms` order as above.
+    Transitory,
     /// Expired, its public port taken by a newer mapping.
     Retired,
 }
@@ -6177,26 +6327,39 @@ struct TcpMappingLink {
 /// Fresh boundaries and reuse lists of the TCP mappings and sessions. Slots
 /// at and after a fresh boundary have never been used since the last flush
 /// (they are default slots) and those before it are occupied: slots leave
-/// the fresh set only in index order. An occupied session is on the session
-/// activity list, in `last_activity_ms` order (oldest first).
+/// the fresh set only in index order. An occupied session is on the
+/// activity list of its phase ([`Nat44TcpSessionPhase`]), in
+/// `last_activity_ms` order (oldest first); each list has one idle TTL, so
+/// its head is the first of its sessions to expire.
 #[derive(Clone, Copy)]
 struct TcpReuseLists {
     next_fresh_mapping: usize,
-    mapping_lru: SlotList,
+    mapping_established: SlotList,
+    mapping_transitory: SlotList,
     mapping_retired: SlotList,
     next_fresh_session: usize,
-    session_lru: SlotList,
+    session_lru: [SlotList; Nat44TcpSessionPhase::COUNT],
 }
 
 impl TcpReuseLists {
     /// Every slot fresh (construction and reconcile flush).
     const FLUSHED: Self = Self {
         next_fresh_mapping: 0,
-        mapping_lru: SlotList::EMPTY,
+        mapping_established: SlotList::EMPTY,
+        mapping_transitory: SlotList::EMPTY,
         mapping_retired: SlotList::EMPTY,
         next_fresh_session: 0,
-        session_lru: SlotList::EMPTY,
+        session_lru: [SlotList::EMPTY; Nat44TcpSessionPhase::COUNT],
     };
+
+    fn mapping_list_mut(&mut self, list: TcpMappingList) -> &mut SlotList {
+        match list {
+            TcpMappingList::Established => &mut self.mapping_established,
+            TcpMappingList::Transitory => &mut self.mapping_transitory,
+            TcpMappingList::Retired => &mut self.mapping_retired,
+            TcpMappingList::Free => unreachable!("the fresh set is not a list"),
+        }
+    }
 
     /// Takes mapping slot `index` out of `list` in O(1).
     fn detach_mapping(
@@ -6210,8 +6373,7 @@ impl TcpReuseLists {
                 debug_assert!(index == self.next_fresh_mapping);
                 self.next_fresh_mapping += 1;
             }
-            TcpMappingList::Lru => self.mapping_lru.unlink(mappings, index),
-            TcpMappingList::Retired => self.mapping_retired.unlink(mappings, index),
+            list => self.mapping_list_mut(list).unlink(mappings, index),
         }
     }
 }
@@ -6226,7 +6388,18 @@ pub struct Nat44TcpMappingSlot {
     internal_address: Ipv4Address,
     internal_port: u16,
     public_port: u16,
+    /// Established sessions of this generation (occupied slots in the
+    /// established phase, live or expired); see [`Self::expires_ms`].
+    established_sessions: u32,
     last_activity_ms: u64,
+    /// The mapping is live strictly before this time. Every commit sets it
+    /// to `now + idle_ttl_ms` when the committed session is established;
+    /// otherwise to `now` + the longer transitory TTL when no established
+    /// session remains, else to the larger of that and its current value.
+    /// It is therefore never earlier than any session's expiry (a session
+    /// of an expired mapping has expired), and the mapping expires with
+    /// its last session once no session is established.
+    expires_ms: u64,
     link: TcpMappingLink,
 }
 
@@ -6263,7 +6436,9 @@ impl Default for Nat44TcpMappingSlot {
             internal_address: Ipv4Address::from_octets([0; 4]),
             internal_port: 0,
             public_port: 0,
+            established_sessions: 0,
             last_activity_ms: 0,
+            expires_ms: 0,
             link: TcpMappingLink::default(),
         }
     }
@@ -6303,8 +6478,10 @@ pub struct Nat44TcpSessionSlot {
     /// Created by an external (non-hairpin) inbound initial SYN; counted
     /// against the per-remote inbound session limit while live.
     external_inbound: bool,
-    /// Free-list links while unoccupied, activity-list links while
-    /// occupied.
+    /// TCP flags seen per direction (`nat44_tcp_state`); selects the phase
+    /// and with it the idle TTL and the activity list.
+    state: u8,
+    /// Activity-list links of the slot's phase while occupied.
     links: SlotLinks,
 }
 
@@ -6339,6 +6516,7 @@ impl Default for Nat44TcpSessionSlot {
             remote_port: 0,
             last_activity_ms: 0,
             external_inbound: false,
+            state: 0,
             links: SlotLinks::UNLINKED,
         }
     }
@@ -6370,6 +6548,36 @@ impl Nat44TcpSessionSlot {
     #[must_use]
     pub const fn is_external_inbound(self) -> bool {
         self.external_inbound
+    }
+
+    /// The RFC 5382 §5 phase of the session's connection, which selects its
+    /// idle TTL ([`Nat44TcpPolicy::session_idle_ttl_ms`]).
+    #[must_use]
+    pub const fn phase(self) -> Nat44TcpSessionPhase {
+        phase_of(self.state)
+    }
+
+    /// A new session of `mapping` (in slot `mapping_index`) before its
+    /// first segment is stamped ([`Nat44TcpRuntime::stamp_session`]).
+    const fn new_for(
+        mapping_index: usize,
+        mapping: Nat44TcpMappingSlot,
+        remote_address: Ipv4Address,
+        remote_port: u16,
+        external_inbound: bool,
+    ) -> Self {
+        Self {
+            occupied: true,
+            mapping_index,
+            mapping_generation: mapping.generation,
+            mapping_lifecycle_epoch: mapping.lifecycle_epoch,
+            remote_address,
+            remote_port,
+            last_activity_ms: 0,
+            external_inbound,
+            state: 0,
+            links: SlotLinks::UNLINKED,
+        }
     }
 }
 
@@ -6462,6 +6670,22 @@ pub struct Nat44TcpCounters {
     /// table is flushed (every hold dropped silently, fail closed), so a
     /// corrupt entry can never block later holds.
     pub unsolicited_syn_index_corrupt: u64,
+    /// Committed segments that moved a session into the established phase
+    /// (SYN and ACK now seen in both directions, or a non-RST segment after
+    /// a RST on such a session).
+    pub sessions_established: u64,
+    /// Committed segments that moved a session into the closing phase with
+    /// a FIN in both directions (not after a RST).
+    pub sessions_closed: u64,
+    /// Committed RST segments on a session without a pending RST: the
+    /// session moved to the closing idle timeout (RFC 7857 §2.2).
+    pub sessions_reset: u64,
+    /// Expired sessions reclaimed (also in `sessions_expired`) whose last
+    /// phase was opening, established, or closing: which idle timeout
+    /// ended them.
+    pub sessions_expired_opening: u64,
+    pub sessions_expired_established: u64,
+    pub sessions_expired_closing: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -6696,6 +6920,8 @@ enum Nat44TcpIndexInvariantError {
     DuplicateSessionKey,
     MappingWithoutCurrentSession,
     MappingSummaryMismatch,
+    MappingExpiresBeforeSession,
+    EstablishedCountMismatch,
     ReuseLists,
 }
 
@@ -7330,7 +7556,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         internal_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: impl Into<Nat44TcpSegment>,
         now_ms: u64,
     ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
         if self.state_revision == u128::MAX {
@@ -7342,7 +7568,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             internal_port,
             remote_address,
             remote_port,
-            initial_syn,
+            segment.into(),
             now_ms,
         )
     }
@@ -7354,7 +7580,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         internal_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: impl Into<Nat44TcpSegment>,
         now_ms: u64,
     ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
         self.check_now_read_only(now_ms)?;
@@ -7363,7 +7589,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             internal_port,
             remote_address,
             remote_port,
-            initial_syn,
+            segment.into(),
             now_ms,
         )
     }
@@ -7375,12 +7601,13 @@ impl<'a> Nat44TcpRuntime<'a> {
         internal_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: Nat44TcpSegment,
         now_ms: u64,
     ) -> Result<Nat44TcpOutboundPlan, Nat44TcpPlanError> {
         if self.state_revision == u128::MAX {
             return Err(Nat44TcpPlanError::StateRevisionExhausted);
         }
+        let initial_syn = segment.is_initial_syn();
         let exact_mapping = self.find_mapping(internal_address, internal_port)?;
         if let Some((mapping_index, mut mapping)) =
             exact_mapping.filter(|(_, mapping)| self.mapping_is_live(*mapping, now_ms))
@@ -7397,8 +7624,14 @@ impl<'a> Nat44TcpRuntime<'a> {
                 exact_session.filter(|(_, session)| self.session_is_live(*session, now_ms))
             {
                 let session_before = session;
-                mapping.last_activity_ms = now_ms;
-                session.last_activity_ms = now_ms;
+                self.stamp_session(
+                    &mut mapping,
+                    &mut session,
+                    segment,
+                    Nat44TcpDirection::Outbound,
+                    false,
+                    now_ms,
+                );
                 return self.prepare_outbound_plan(
                     Nat44TcpOutboundPlan {
                         authority: self.plan_authority(now_ms, mapping_before, session_before),
@@ -7428,24 +7661,28 @@ impl<'a> Nat44TcpRuntime<'a> {
             };
             let session_before = self.sessions[session_index];
             let session_expired = session_before.occupied;
-            mapping.last_activity_ms = now_ms;
+            let mut session = Nat44TcpSessionSlot::new_for(
+                mapping_index,
+                mapping,
+                remote_address,
+                remote_port,
+                false,
+            );
+            self.stamp_session(
+                &mut mapping,
+                &mut session,
+                segment,
+                Nat44TcpDirection::Outbound,
+                self.established_owner(session_before) == Some(mapping_index),
+                now_ms,
+            );
             return self.prepare_outbound_plan(
                 Nat44TcpOutboundPlan {
                     authority: self.plan_authority(now_ms, mapping_before, session_before),
                     mapping_index: encode_udp_index(mapping_index),
                     mapping,
                     session_index: encode_udp_index(session_index),
-                    session: Nat44TcpSessionSlot {
-                        occupied: true,
-                        mapping_index,
-                        mapping_generation: mapping.generation,
-                        mapping_lifecycle_epoch: mapping.lifecycle_epoch,
-                        remote_address,
-                        remote_port,
-                        last_activity_ms: now_ms,
-                        external_inbound: false,
-                        links: SlotLinks::UNLINKED,
-                    },
+                    session,
                     mapping_created: false,
                     mapping_expired: false,
                     session_created: true,
@@ -7482,34 +7719,45 @@ impl<'a> Nat44TcpRuntime<'a> {
         let session_before = self.sessions[session_index];
         let mapping_expired = mapping_before.occupied;
         let session_expired = session_before.occupied;
+        let mut mapping = Nat44TcpMappingSlot {
+            occupied: true,
+            generation,
+            lifecycle_epoch: self.runtime_epoch,
+            port_owned: true,
+            inside: self.config.inside,
+            internal_address,
+            internal_port,
+            public_port: port.port,
+            established_sessions: 0,
+            last_activity_ms: now_ms,
+            expires_ms: 0,
+            link: TcpMappingLink::default(),
+        };
+        let mut session = Nat44TcpSessionSlot::new_for(
+            mapping_index,
+            mapping,
+            remote_address,
+            remote_port,
+            false,
+        );
+        // A new generation starts with no established session; one the
+        // reused session slot held belongs to another mapping (or to the
+        // previous generation of this slot) and is released by the commit.
+        self.stamp_session(
+            &mut mapping,
+            &mut session,
+            segment,
+            Nat44TcpDirection::Outbound,
+            false,
+            now_ms,
+        );
         self.prepare_outbound_plan(
             Nat44TcpOutboundPlan {
                 authority: self.plan_authority(now_ms, mapping_before, session_before),
                 mapping_index: encode_udp_index(mapping_index),
-                mapping: Nat44TcpMappingSlot {
-                    occupied: true,
-                    generation,
-                    lifecycle_epoch: self.runtime_epoch,
-                    port_owned: true,
-                    inside: self.config.inside,
-                    internal_address,
-                    internal_port,
-                    public_port: port.port,
-                    last_activity_ms: now_ms,
-                    link: TcpMappingLink::default(),
-                },
+                mapping,
                 session_index: encode_udp_index(session_index),
-                session: Nat44TcpSessionSlot {
-                    occupied: true,
-                    mapping_index,
-                    mapping_generation: generation,
-                    mapping_lifecycle_epoch: self.runtime_epoch,
-                    remote_address,
-                    remote_port,
-                    last_activity_ms: now_ms,
-                    external_inbound: false,
-                    links: SlotLinks::UNLINKED,
-                },
+                session,
                 mapping_created: true,
                 mapping_expired,
                 session_created: true,
@@ -7528,7 +7776,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: impl Into<Nat44TcpSegment>,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.observe_now(now_ms)?;
@@ -7536,7 +7784,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             public_port,
             remote_address,
             remote_port,
-            initial_syn,
+            segment.into(),
             Nat44TcpInboundOrigin::External,
             now_ms,
         )
@@ -7547,7 +7795,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: impl Into<Nat44TcpSegment>,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.check_now_read_only(now_ms)?;
@@ -7555,7 +7803,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             public_port,
             remote_address,
             remote_port,
-            initial_syn,
+            segment.into(),
             Nat44TcpInboundOrigin::External,
             now_ms,
         )
@@ -7569,7 +7817,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: impl Into<Nat44TcpSegment>,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.observe_now(now_ms)?;
@@ -7577,7 +7825,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             public_port,
             remote_address,
             remote_port,
-            initial_syn,
+            segment.into(),
             Nat44TcpInboundOrigin::Hairpin,
             now_ms,
         )
@@ -7589,7 +7837,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: impl Into<Nat44TcpSegment>,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         self.check_now_read_only(now_ms)?;
@@ -7597,7 +7845,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             public_port,
             remote_address,
             remote_port,
-            initial_syn,
+            segment.into(),
             Nat44TcpInboundOrigin::Hairpin,
             now_ms,
         )
@@ -7620,13 +7868,14 @@ impl<'a> Nat44TcpRuntime<'a> {
         public_port: u16,
         remote_address: Ipv4Address,
         remote_port: u16,
-        initial_syn: bool,
+        segment: Nat44TcpSegment,
         origin: Nat44TcpInboundOrigin,
         now_ms: u64,
     ) -> Result<Nat44TcpInboundPlan, Nat44TcpPlanError> {
         if self.state_revision == u128::MAX {
             return Err(Nat44TcpPlanError::StateRevisionExhausted);
         }
+        let initial_syn = segment.is_initial_syn();
         let Some((mapping_index, mut mapping)) =
             self.mapping_for_public_port(public_port, now_ms)?
         else {
@@ -7644,8 +7893,14 @@ impl<'a> Nat44TcpRuntime<'a> {
             exact_session.filter(|(_, session)| self.session_is_live(*session, now_ms))
         {
             let session_before = session;
-            mapping.last_activity_ms = now_ms;
-            session.last_activity_ms = now_ms;
+            self.stamp_session(
+                &mut mapping,
+                &mut session,
+                segment,
+                Nat44TcpDirection::Inbound,
+                false,
+                now_ms,
+            );
             return Ok(Nat44TcpInboundPlan {
                 authority: self.plan_authority(now_ms, mapping_before, session_before),
                 mapping_index,
@@ -7684,19 +7939,22 @@ impl<'a> Nat44TcpRuntime<'a> {
             return Err(Nat44TcpPlanError::SessionFull);
         };
         let session_before = self.sessions[session_index];
-        let session = Nat44TcpSessionSlot {
-            occupied: true,
+        let mut session = Nat44TcpSessionSlot::new_for(
             mapping_index,
-            mapping_generation: mapping.generation,
-            mapping_lifecycle_epoch: mapping.lifecycle_epoch,
+            mapping,
             remote_address,
             remote_port,
-            last_activity_ms: now_ms,
-            external_inbound: origin == Nat44TcpInboundOrigin::External,
-            links: SlotLinks::UNLINKED,
-        };
+            origin == Nat44TcpInboundOrigin::External,
+        );
+        self.stamp_session(
+            &mut mapping,
+            &mut session,
+            segment,
+            Nat44TcpDirection::Inbound,
+            self.established_owner(session_before) == Some(mapping_index),
+            now_ms,
+        );
         let prepared = self.prepare_session_link(session_index, session)?;
-        mapping.last_activity_ms = now_ms;
         Ok(Nat44TcpInboundPlan {
             authority: self.plan_authority(now_ms, mapping_before, session_before),
             mapping_index,
@@ -7996,6 +8254,12 @@ impl<'a> Nat44TcpRuntime<'a> {
             self.mappings[displaced].port_owned = false;
             self.retire_mapping(displaced);
         }
+        self.record_session_commit(
+            plan.session_index(),
+            plan.session,
+            plan.session_created,
+            plan.mapping_index(),
+        );
         self.write_mapping_slot(plan.mapping_index(), plan.mapping);
         self.write_session_slot(plan.session_index(), plan.session);
         self.watermark_ms = Some(now_ms);
@@ -8199,6 +8463,12 @@ impl<'a> Nat44TcpRuntime<'a> {
         hairpin: bool,
     ) {
         self.apply_session_link(plan.prepared);
+        self.record_session_commit(
+            plan.session_index,
+            plan.session,
+            plan.session_created,
+            plan.mapping_index,
+        );
         self.write_mapping_slot(plan.mapping_index, plan.mapping);
         self.write_session_slot(plan.session_index, plan.session);
         self.watermark_ms = Some(now_ms);
@@ -8223,50 +8493,73 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// Moves an expired mapping that just lost its public port from the
     /// activity list to the retired list; O(1).
     fn retire_mapping(&mut self, index: usize) {
-        debug_assert!(self.mappings[index].link.list == TcpMappingList::Lru);
-        self.reuse_lists.mapping_lru.unlink(self.mappings, index);
+        let list = self.mappings[index].link.list;
+        debug_assert!(matches!(
+            list,
+            TcpMappingList::Established | TcpMappingList::Transitory
+        ));
+        self.reuse_lists
+            .mapping_list_mut(list)
+            .unlink(self.mappings, index);
         self.mappings[index].link.list = TcpMappingList::Retired;
         self.reuse_lists
             .mapping_retired
             .push_back(self.mappings, index);
     }
 
-    /// Overwrites one mapping slot (just stamped with the current time) and
-    /// its O(1) occupancy counter, and moves the slot to the tail of the
-    /// mapping activity list.
+    /// Overwrites one mapping slot (just stamped by [`Self::stamp_session`])
+    /// and its O(1) occupancy counter. The slot moves to the tail of the
+    /// activity list `mapping.link.list` names, unless it is already on
+    /// that list with the same expiry (an established mapping whose
+    /// established TTL outlasts this transitory commit), where it keeps its
+    /// place. Either way each activity list stays in `expires_ms` order.
     fn write_mapping_slot(&mut self, index: usize, mapping: Nat44TcpMappingSlot) {
         let before = self.mappings[index];
-        debug_assert!(self
-            .reuse_lists
-            .mapping_lru
-            .tail()
-            .is_none_or(|tail| self.mappings[tail].last_activity_ms <= mapping.last_activity_ms));
-        self.reuse_lists
-            .detach_mapping(self.mappings, index, before.link.list);
-        self.mappings[index] = Nat44TcpMappingSlot {
-            link: TcpMappingLink {
-                links: SlotLinks::UNLINKED,
-                list: TcpMappingList::Lru,
-            },
-            ..mapping
-        };
-        self.reuse_lists.mapping_lru.push_back(self.mappings, index);
+        let list = mapping.link.list;
+        debug_assert!(matches!(
+            list,
+            TcpMappingList::Established | TcpMappingList::Transitory
+        ));
+        if before.occupied && before.link.list == list && before.expires_ms == mapping.expires_ms {
+            self.mappings[index] = Nat44TcpMappingSlot {
+                link: before.link,
+                ..mapping
+            };
+        } else {
+            debug_assert!(self
+                .reuse_lists
+                .mapping_list_mut(list)
+                .tail()
+                .is_none_or(|tail| self.mappings[tail].expires_ms <= mapping.expires_ms));
+            self.reuse_lists
+                .detach_mapping(self.mappings, index, before.link.list);
+            self.mappings[index] = Nat44TcpMappingSlot {
+                link: TcpMappingLink {
+                    links: SlotLinks::UNLINKED,
+                    list,
+                },
+                ..mapping
+            };
+            self.reuse_lists
+                .mapping_list_mut(list)
+                .push_back(self.mappings, index);
+        }
         self.mapping_occupancy
             .transition(before.occupied, mapping.occupied);
     }
 
     /// Overwrites one session slot (just stamped with the current time) and
     /// its O(1) occupancy counters, and moves the slot from the fresh set or
-    /// its place on the session activity list to that list's tail.
+    /// its place on its phase's activity list to the tail of the activity
+    /// list of its new phase.
     fn write_session_slot(&mut self, index: usize, session: Nat44TcpSessionSlot) {
         let before = self.sessions[index];
-        debug_assert!(self
-            .reuse_lists
-            .session_lru
+        let list = session.phase().index();
+        debug_assert!(self.reuse_lists.session_lru[list]
             .tail()
             .is_none_or(|tail| self.sessions[tail].last_activity_ms <= session.last_activity_ms));
         if before.occupied {
-            self.reuse_lists.session_lru.unlink(self.sessions, index);
+            self.reuse_lists.session_lru[before.phase().index()].unlink(self.sessions, index);
         } else {
             debug_assert!(index == self.reuse_lists.next_fresh_session);
             self.reuse_lists.next_fresh_session += 1;
@@ -8275,13 +8568,140 @@ impl<'a> Nat44TcpRuntime<'a> {
             links: SlotLinks::UNLINKED,
             ..session
         };
-        self.reuse_lists.session_lru.push_back(self.sessions, index);
+        self.reuse_lists.session_lru[list].push_back(self.sessions, index);
         self.session_occupancy
             .transition(before.occupied, session.occupied);
         self.external_inbound_occupancy.transition(
             before.occupied && before.external_inbound,
             session.occupied && session.external_inbound,
         );
+    }
+
+    /// Applies one committed segment to the planned copies of a session and
+    /// its mapping (O(1), no other slot is read): the session's TCP state
+    /// advances ([`next_state`]) and its activity is stamped with `now_ms`;
+    /// the mapping's established-session count follows the session's phase
+    /// change (`released_own_established` when the reused slot held an
+    /// expired established session of this same mapping generation), and
+    /// the mapping's expiry and activity list are recomputed:
+    ///
+    /// - an established session: `now + idle_ttl_ms`, the established list;
+    /// - otherwise, with no established session left: `now` + the longer
+    ///   transitory TTL, the transitory list (this may shorten the
+    ///   mapping: every remaining session is transitory and was last active
+    ///   at or before `now`);
+    /// - otherwise, if the established-list expiry still lies beyond that,
+    ///   it is kept (and the slot keeps its place); else as above.
+    ///
+    /// So the mapping never expires before any of its sessions, which the
+    /// session reuse search relies on, and each activity list stays in
+    /// expiry order: a slot pushed to a tail gets `now` + the list's TTL,
+    /// the largest expiry on that list.
+    fn stamp_session(
+        &self,
+        mapping: &mut Nat44TcpMappingSlot,
+        session: &mut Nat44TcpSessionSlot,
+        segment: Nat44TcpSegment,
+        direction: Nat44TcpDirection,
+        released_own_established: bool,
+        now_ms: u64,
+    ) {
+        let policy = self.config.policy;
+        let was_established = session.phase() == Nat44TcpSessionPhase::Established;
+        session.state = next_state(session.state, segment, direction);
+        session.last_activity_ms = now_ms;
+        let established = session.phase() == Nat44TcpSessionPhase::Established;
+        let released = u32::from(was_established) + u32::from(released_own_established);
+        debug_assert!(mapping.established_sessions >= released);
+        mapping.established_sessions = mapping
+            .established_sessions
+            .saturating_sub(released)
+            .saturating_add(u32::from(established));
+        mapping.last_activity_ms = now_ms;
+        if established {
+            mapping.expires_ms = now_ms.saturating_add(policy.idle_ttl_ms);
+            mapping.link.list = TcpMappingList::Established;
+            return;
+        }
+        let transitory = now_ms.saturating_add(policy.transitory_bound_ms());
+        let keep_established = mapping.established_sessions != 0
+            && mapping.link.list == TcpMappingList::Established
+            && mapping.expires_ms > transitory;
+        if !keep_established {
+            mapping.expires_ms = transitory;
+            mapping.link.list = TcpMappingList::Transitory;
+        }
+    }
+
+    /// The mapping slot whose established-session count includes
+    /// `session`: the slot of its mapping when the session is occupied,
+    /// established, and of that slot's current generation.
+    fn established_owner(&self, session: Nat44TcpSessionSlot) -> Option<usize> {
+        if !session.occupied || session.phase() != Nat44TcpSessionPhase::Established {
+            return None;
+        }
+        self.mappings
+            .get(session.mapping_index)
+            .is_some_and(|mapping| {
+                mapping.occupied
+                    && mapping.generation == session.mapping_generation
+                    && mapping.lifecycle_epoch == session.mapping_lifecycle_epoch
+            })
+            .then_some(session.mapping_index)
+    }
+
+    /// Commit-time bookkeeping of one session slot write, before the slot
+    /// is overwritten: an expired established session that a new session
+    /// replaces leaves its mapping's established count (unless that is the
+    /// committing mapping, whose planned copy already accounts for it or
+    /// which is being recreated), and the phase counters advance.
+    fn record_session_commit(
+        &mut self,
+        session_index: usize,
+        session: Nat44TcpSessionSlot,
+        session_created: bool,
+        mapping_index: usize,
+    ) {
+        let before = self.sessions[session_index];
+        let before_state = if session_created {
+            if before.occupied {
+                if let Some(owner) = self
+                    .established_owner(before)
+                    .filter(|owner| *owner != mapping_index)
+                {
+                    let count = &mut self.mappings[owner].established_sessions;
+                    debug_assert!(*count > 0);
+                    *count = count.saturating_sub(1);
+                }
+                let counter = match before.phase() {
+                    Nat44TcpSessionPhase::Opening => &mut self.counters.sessions_expired_opening,
+                    Nat44TcpSessionPhase::Established => {
+                        &mut self.counters.sessions_expired_established
+                    }
+                    Nat44TcpSessionPhase::Closing => &mut self.counters.sessions_expired_closing,
+                };
+                *counter = counter.saturating_add(1);
+            }
+            0
+        } else {
+            before.state
+        };
+        let (old, new) = (phase_of(before_state), session.phase());
+        if new == Nat44TcpSessionPhase::Established && old != new {
+            self.counters.sessions_established =
+                self.counters.sessions_established.saturating_add(1);
+        }
+        let reset = crate::nat44_tcp_state::STATE_RESET;
+        let fin_both = crate::nat44_tcp_state::STATE_FIN_OUT | crate::nat44_tcp_state::STATE_FIN_IN;
+        if session.state & reset != 0 && before_state & reset == 0 {
+            self.counters.sessions_reset = self.counters.sessions_reset.saturating_add(1);
+        }
+        if session.state & reset == 0
+            && session.state & fin_both == fin_both
+            && before_state & fin_both != fin_both
+        {
+            self.counters.sessions_closed = self.counters.sessions_closed.saturating_add(1);
+        }
     }
 
     fn plan_authority(
@@ -8457,7 +8877,14 @@ impl<'a> Nat44TcpRuntime<'a> {
             .set(self.session_liveness_checks.get().saturating_add(1));
         session.occupied
             && now_ms >= session.last_activity_ms
-            && now_ms - session.last_activity_ms < self.config.policy.idle_ttl_ms
+            && now_ms < self.session_expires_ms(session)
+    }
+
+    /// When `session` expires: its last activity plus its phase's TTL.
+    fn session_expires_ms(&self, session: Nat44TcpSessionSlot) -> u64 {
+        session
+            .last_activity_ms
+            .saturating_add(self.config.policy.session_idle_ttl_ms(session.phase()))
     }
 
     fn check_now_read_only(&self, now_ms: u64) -> Result<(), Nat44TcpPlanError> {
@@ -8475,9 +8902,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         #[cfg(test)]
         self.mapping_liveness_checks
             .set(self.mapping_liveness_checks.get().saturating_add(1));
-        mapping.occupied
-            && now_ms >= mapping.last_activity_ms
-            && now_ms - mapping.last_activity_ms < self.config.policy.idle_ttl_ms
+        mapping.occupied && now_ms >= mapping.last_activity_ms && now_ms < mapping.expires_ms
     }
 
     #[cfg(test)]
@@ -8578,14 +9003,24 @@ impl<'a> Nat44TcpRuntime<'a> {
         Ok(probe.state_index.map(|index| (index, self.sessions[index])))
     }
 
-    /// The head of the mapping activity list when it is expired: the oldest
-    /// mapping that still owns its port. One liveness check.
+    /// The expired head of the two mapping activity lists that expired
+    /// first (the established list on a tie), among mappings that still own
+    /// their port. Each list is in expiry order, so some mapping on them is
+    /// expired exactly when one of the heads is. Two liveness checks.
     fn expired_mapping_head(&self, now_ms: u64) -> Option<usize> {
-        #[cfg(test)]
-        self.reusable_mapping_checks
-            .set(self.reusable_mapping_checks.get().saturating_add(1));
-        let head = self.reuse_lists.mapping_lru.head()?;
-        (!self.mapping_is_live(self.mappings[head], now_ms)).then_some(head)
+        let lists = self.reuse_lists;
+        [lists.mapping_established, lists.mapping_transitory]
+            .into_iter()
+            .filter_map(|list| {
+                #[cfg(test)]
+                self.reusable_mapping_checks
+                    .set(self.reusable_mapping_checks.get().saturating_add(1));
+                let head = list.head()?;
+                let mapping = self.mappings[head];
+                (!self.mapping_is_live(mapping, now_ms)).then_some((mapping.expires_ms, head))
+            })
+            .min_by_key(|(expires_ms, _)| *expires_ms)
+            .map(|(_, head)| head)
     }
 
     /// A reusable (unoccupied or expired) mapping slot in O(1), or `None`
@@ -8612,17 +9047,20 @@ impl<'a> Nat44TcpRuntime<'a> {
         (index < self.sessions.len()).then_some(index)
     }
 
-    /// A reusable session slot in O(1): the head of the session activity
-    /// list (the least recently active session) when it is reusable, else
-    /// the lowest never-used slot. A session's mapping is refreshed with it
-    /// and shares its TTL, so a session whose mapping expired or was
+    /// A reusable session slot in O(1): of the three phase activity-list
+    /// heads (each list has one TTL, so its head expires first), the
+    /// reusable one that expired first, else the lowest never-used slot. A
+    /// session's mapping is refreshed with it and never expires before it
+    /// ([`Self::stamp_session`]), so a session whose mapping expired or was
     /// recreated has itself expired: `None` exactly when every session is
     /// live.
     fn find_reusable_session(&self, now_ms: u64) -> Option<usize> {
         self.reuse_lists
             .session_lru
-            .head()
+            .iter()
+            .filter_map(|list| list.head())
             .filter(|&head| self.session_slot_reusable(head, now_ms))
+            .min_by_key(|&head| self.session_expires_ms(self.sessions[head]))
             .or_else(|| self.fresh_session())
     }
 
@@ -9039,6 +9477,7 @@ impl<'a> Nat44TcpRuntime<'a> {
                 return Err(Nat44TcpIndexInvariantError::DuplicateMappingKey);
             }
             let mut maximum = None;
+            let mut established = 0_u32;
             for session in self.sessions.iter().copied().filter(|session| {
                 session.occupied
                     && session.mapping_index == index
@@ -9048,6 +9487,16 @@ impl<'a> Nat44TcpRuntime<'a> {
                 maximum = Some(maximum.map_or(session.last_activity_ms, |current: u64| {
                     current.max(session.last_activity_ms)
                 }));
+                if session.phase() == Nat44TcpSessionPhase::Established {
+                    established += 1;
+                }
+                // A mapping never expires before one of its sessions.
+                if self.session_expires_ms(session) > mapping.expires_ms {
+                    return Err(Nat44TcpIndexInvariantError::MappingExpiresBeforeSession);
+                }
+            }
+            if established != mapping.established_sessions {
+                return Err(Nat44TcpIndexInvariantError::EstablishedCountMismatch);
             }
             if self
                 .watermark_ms
@@ -9112,20 +9561,41 @@ impl<'a> Nat44TcpRuntime<'a> {
             return false;
         }
         let mut listed = fresh_mappings.len();
+        let policy = self.config.policy;
         for (header, list) in [
-            (lists.mapping_lru, TcpMappingList::Lru),
+            (lists.mapping_established, TcpMappingList::Established),
+            (lists.mapping_transitory, TcpMappingList::Transitory),
             (lists.mapping_retired, TcpMappingList::Retired),
         ] {
             let mut previous_ms = 0;
             let consistent = header.validate(self.mappings, |index| {
                 listed += 1;
                 let mapping = self.mappings[index];
-                let ordered = previous_ms <= mapping.last_activity_ms;
-                previous_ms = mapping.last_activity_ms;
+                let ordered = previous_ms <= mapping.expires_ms;
+                previous_ms = mapping.expires_ms;
                 mapping.link.list == list
                     && match list {
                         TcpMappingList::Free => false,
-                        TcpMappingList::Lru => mapping.occupied && mapping.port_owned && ordered,
+                        // Expiry is the list's TTL after a commit at or
+                        // before the last activity (the last one for the
+                        // transitory list).
+                        TcpMappingList::Established => {
+                            mapping.occupied
+                                && mapping.port_owned
+                                && ordered
+                                && mapping.expires_ms >= policy.idle_ttl_ms
+                                && mapping.expires_ms - policy.idle_ttl_ms
+                                    <= mapping.last_activity_ms
+                        }
+                        TcpMappingList::Transitory => {
+                            mapping.occupied
+                                && mapping.port_owned
+                                && ordered
+                                && mapping.expires_ms
+                                    == mapping
+                                        .last_activity_ms
+                                        .saturating_add(policy.transitory_bound_ms())
+                        }
                         TcpMappingList::Retired => {
                             mapping.occupied
                                 && !mapping.port_owned
@@ -9143,14 +9613,19 @@ impl<'a> Nat44TcpRuntime<'a> {
             return false;
         }
         let mut listed = fresh_sessions.len();
-        let mut previous_ms = 0;
-        lists.session_lru.validate(self.sessions, |index| {
-            listed += 1;
-            let session = self.sessions[index];
-            let ordered = previous_ms <= session.last_activity_ms;
-            previous_ms = session.last_activity_ms;
-            session.occupied && ordered
-        }) && listed == self.sessions.len()
+        for (phase_index, header) in lists.session_lru.into_iter().enumerate() {
+            let mut previous_ms = 0;
+            if !header.validate(self.sessions, |index| {
+                listed += 1;
+                let session = self.sessions[index];
+                let ordered = previous_ms <= session.last_activity_ms;
+                previous_ms = session.last_activity_ms;
+                session.occupied && ordered && session.phase().index() == phase_index
+            }) {
+                return false;
+            }
+        }
+        listed == self.sessions.len()
     }
 
     /// Public port of a new mapping (NAT44-004, NAT44-068), in O(1):
@@ -9318,13 +9793,14 @@ mod tests {
         );
         assert_eq!(
             format!("{tcp_policy:?}"),
-            "Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
+            "Nat44TcpPolicy { idle_ttl_ms: 7440000, opening_idle_ttl_ms: 240000, \
+             closing_idle_ttl_ms: 240000, allocator_seed: [REDACTED], \
              icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
              inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true }"
         );
         assert_eq!(
             format!("{tcp_policy:#?}"),
-            "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    allocator_seed: [REDACTED],\n    \
+            "Nat44TcpPolicy {\n    idle_ttl_ms: 7440000,\n    opening_idle_ttl_ms: 240000,\n    closing_idle_ttl_ms: 240000,\n    allocator_seed: [REDACTED],\n    \
              icmpv4_errors: ExternalOnly,\n    filtering: AddressDependent,\n    hairpinning: true,\n    \
              inbound_sessions_per_remote: 0,\n    unsolicited_syn_icmp: true,\n}"
         );
@@ -9366,7 +9842,8 @@ mod tests {
                 format!("{tcp_config:?}"),
                 "Nat44TcpConfig { inside: IfId(1), outside: IfId(2), public_address: \
                  Ipv4Address(3405803786), first_port: 40000, last_port: 40001, policy: \
-                 Nat44TcpPolicy { idle_ttl_ms: 7440000, allocator_seed: [REDACTED], \
+                 Nat44TcpPolicy { idle_ttl_ms: 7440000, opening_idle_ttl_ms: 240000, \
+                 closing_idle_ttl_ms: 240000, allocator_seed: [REDACTED], \
                  icmpv4_errors: ExternalOnly, filtering: AddressDependent, hairpinning: true, \
                  inbound_sessions_per_remote: 0, unsolicited_syn_icmp: true }, authority: \
                  [REDACTED], snapshot_identity: \
@@ -9389,7 +9866,7 @@ mod tests {
                 "Nat44TcpConfig {\n    inside: IfId(\n        1,\n    ),\n    outside: IfId(\n        \
                  2,\n    ),\n    public_address: Ipv4Address(\n        3405803786,\n    ),\n    \
                  first_port: 40000,\n    last_port: 40001,\n    policy: Nat44TcpPolicy {\n        \
-                 idle_ttl_ms: 7440000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
+                 idle_ttl_ms: 7440000,\n        opening_idle_ttl_ms: 240000,\n        closing_idle_ttl_ms: 240000,\n        allocator_seed: [REDACTED],\n        icmpv4_errors: \
                  ExternalOnly,\n        filtering: AddressDependent,\n        hairpinning: true,\n        \
                  inbound_sessions_per_remote: 0,\n        unsolicited_syn_icmp: true,\n    },\n    authority: \
                  [REDACTED],\n    snapshot_identity: \
@@ -9532,7 +10009,9 @@ mod tests {
             internal_address: POISON_ADDRESS,
             internal_port: 65_533,
             public_port: 40_001,
+            established_sessions: 7,
             last_activity_ms: 88,
+            expires_ms: POISON_U64,
             link: TcpMappingLink::default(),
         };
         let mut tcp_mapping_hidden = tcp_mapping;
@@ -9565,6 +10044,7 @@ mod tests {
             remote_port: 65_529,
             last_activity_ms: 99,
             external_inbound: true,
+            state: 0x7f,
             links: SlotLinks::UNLINKED,
         };
         let mut tcp_session_hidden = tcp_session;
@@ -9881,6 +10361,12 @@ mod tests {
                 "unsolicited_syn_icmp_suppressed",
                 "unsolicited_syn_firewall_denied",
                 "unsolicited_syn_index_corrupt",
+                "sessions_established",
+                "sessions_closed",
+                "sessions_reset",
+                "sessions_expired_opening",
+                "sessions_expired_established",
+                "sessions_expired_closing",
             ]
         );
         assert_eq!(

@@ -625,14 +625,14 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
     }
 
     // Outbound half: X1:x1 -> P:x2' as an ordinary outbound segment.
-    let initial_syn = tcp.flags & 0x17 == 0x02;
+    let segment = crate::nat44_tcp_state::Nat44TcpSegment::from_flags(tcp.flags);
     let planned = if read_only {
         runtime.plan_outbound_read_only(
             ipv4.source,
             tcp.source_port,
             config.public_address(),
             tcp.destination_port,
-            initial_syn,
+            segment,
             now.0,
         )
     } else {
@@ -641,7 +641,7 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
             tcp.source_port,
             config.public_address(),
             tcp.destination_port,
-            initial_syn,
+            segment,
             now.0,
         )
     };
@@ -702,7 +702,7 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
         ingress,
         ipv4,
         tcp,
-        initial_syn,
+        segment,
         resolution,
         config,
         runtime,
@@ -728,7 +728,7 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
     tcp: ValidatedNat44Tcp,
-    initial_syn: bool,
+    segment: crate::nat44_tcp_state::Nat44TcpSegment,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44TcpConfig,
     runtime: &mut Nat44TcpRuntime<'_>,
@@ -747,7 +747,7 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
             tcp.destination_port,
             tuples.public_address,
             tuples.sender_public_port,
-            initial_syn,
+            segment,
             now.0,
         )
     } else {
@@ -755,7 +755,7 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
             tcp.destination_port,
             tuples.public_address,
             tuples.sender_public_port,
-            initial_syn,
+            segment,
             now.0,
         )
     };

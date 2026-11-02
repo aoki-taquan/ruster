@@ -269,9 +269,10 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 88);
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
-        assert_eq!(size_of::<Nat44TcpConfig>(), 112);
+        // N1 added the opening and closing idle TTLs to the TCP policy.
+        assert_eq!(size_of::<Nat44TcpConfig>(), 128);
         assert_eq!(size_of::<Nat44UdpServiceView<'static, 'static>>(), 120);
-        assert_eq!(size_of::<Nat44TcpServiceView<'static, 'static>>(), 120);
+        assert_eq!(size_of::<Nat44TcpServiceView<'static, 'static>>(), 136);
         assert_eq!(size_of::<FirewallServiceView<'static, 'static>>(), 168);
         assert!(size_of::<FullServiceView<'static, 'static>>() <= 576);
     }
