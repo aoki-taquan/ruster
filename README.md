@@ -21,7 +21,7 @@ E2EをCIで実行。coordinatorのscoping提案でowner決定ではない）は�
 [`docs/runbook-m2.md`](docs/runbook-m2.md)にあります。multi-queue、zero-copy、X05 hardware
 benchmark（M2b）はowner決定（2026-11-02）でdeferredです: multi-queueは2a「C」で当面portごとに1 queue
 （X05のNIC選定と合わせて再検討）、X05 labは当面不要で運用はveth（実NIC/native/zero-copy未検証の
-riskはownerが受け入れ）。B3（delayed ICMP、NAT44-038）は「A」で、CLI-034 hardeningの後に実装します。
+riskはownerが受け入れ）。B3（delayed ICMP、NAT44-038）は「A」で、CLI-034 hardeningの後（順序はcoordinator既定）に実装します。
 
 workspaceは12 crateです。data-planeとI/Oのlibrary crateは外部依存を持ちません。cold
 control-planeの`ruster-config`とsim専用の`ruster-sim-scenario`だけが、保守されている

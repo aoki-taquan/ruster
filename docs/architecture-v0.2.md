@@ -2557,8 +2557,8 @@ blockされたsubmitごとにも繰り返して2048 entry ringで一tick約4.3k 
 止まり、generated poolもin-flightのままARPが消え、quiescenceが`TxInFlight`のまま全publicationを
 延期した）。callerが`set_clock`でmonotonic clockを渡すと（`ruster run`のloopが一iterationに一回）、
 link downの間の再試行はsettleごとでなく、最初の`ENETDOWN`の1 ms後から待ちを倍にして64 msまでの間隔だけ
-kickし、期限前のsettleはreapだけして`kick_retries_suppressed`を数えます（debtは保持、link upから最大
-64 msで送信。XDP-178）。それ以外のkick失敗（`EINVAL`等）はbatch errorですがstickyではありません。budgetを使い
+kickし、期限前のsettleはreapだけして`kick_retries_suppressed`を数えます（debtは保持、link upから約
+64 ms（加えて最大1回の1 ms idle pause）以内に送信。XDP-178）。それ以外のkick失敗（`EINVAL`等）はbatch errorですがstickyではありません。budgetを使い
 切ってin-flightが残れば`kick_budget_exhausted`に数えます。kick数とdeferred数はengineの`tx_kicks`/
 `kicks_deferred`です。
 

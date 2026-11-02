@@ -22,8 +22,8 @@ use super::checks::{
     required_memlock, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe,
 };
 use super::engine::{
-    Clock, Datapath, DrainProgress, IdleBackoff, LinkMonitor, StopSignal, DRAIN_DEADLINE_MS,
-    DRAIN_ROUNDS, MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
+    Clock, ClockedIo, Datapath, DrainProgress, IdleBackoff, LinkMonitor, StopSignal,
+    DRAIN_DEADLINE_MS, DRAIN_ROUNDS, MAX_PAUSE, MIN_PAUSE, SPIN_TICKS,
 };
 use super::netlink::{LinkFacts, NetlinkError};
 use super::reload::ConfigSource;
@@ -171,6 +171,52 @@ struct FakeSession {
     attached: bool,
 }
 
+thread_local! {
+    /// The last reading `SimIo` received through [`ClockedIo`].
+    static SIM_CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+impl ClockedIo for SimIo {
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        SIM_CLOCK.with(|clock| clock.set(Some(now.0)));
+    }
+}
+
+/// A datapath that keeps the provided `Datapath::set_clock`.
+struct ForwardingDatapath {
+    io: SimIo,
+}
+
+impl Datapath for ForwardingDatapath {
+    type Io = SimIo;
+
+    fn io(&mut self) -> &mut SimIo {
+        &mut self.io
+    }
+
+    fn drain(&mut self, _rounds: u32) -> Result<DrainProgress, XdpIoError> {
+        Ok(DrainProgress::default())
+    }
+
+    fn write_stats(&self, _out: &mut String) {}
+
+    fn port_count(&self) -> usize {
+        0
+    }
+
+    fn sample_ports(&self, _visit: &mut impl FnMut(PortSample)) {}
+}
+
+#[test]
+fn the_provided_set_clock_forwards_to_the_io() {
+    let mut datapath = ForwardingDatapath { io: SimIo::new() };
+    SIM_CLOCK.with(|clock| clock.set(None));
+    datapath.set_clock(MonotonicMillis(42));
+    assert_eq!(SIM_CLOCK.with(Cell::get), Some(42));
+    datapath.set_clock(MonotonicMillis(43));
+    assert_eq!(SIM_CLOCK.with(Cell::get), Some(43));
+}
+
 struct FakeDatapath<'s> {
     ports: &'s mut [OpenPort<FakeSession>],
     state: Rc<State>,
@@ -192,6 +238,9 @@ impl Datapath for FakeDatapath<'_> {
         &mut self.io
     }
 
+    /// Overrides the provided forwarding (which goes through `io()`, the
+    /// fake's tick counter and frame-injection schedule) to record the
+    /// call order instead.
     fn set_clock(&mut self, now: MonotonicMillis) {
         let state = &self.state;
         let sets = state.clock_sets.get();

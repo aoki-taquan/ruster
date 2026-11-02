@@ -73,17 +73,26 @@ pub const DRAIN_PAUSE: Duration = Duration::from_millis(1);
 /// Wall-clock bound of the whole shutdown drain.
 pub const DRAIN_DEADLINE_MS: u64 = 2_000;
 
+/// Backend I/O that takes the loop's clock reading at a cold boundary.
+/// The AF_XDP adapter rate-limits TX kick retries on a down link with it.
+pub trait ClockedIo {
+    /// Hands the backend the current clock reading (never per packet).
+    fn set_clock(&mut self, now: MonotonicMillis);
+}
+
 /// A datapath the loop drives: the core-facing I/O plus the shutdown and
 /// stats operations of the backend.
 pub trait Datapath {
-    type Io: PacketIo + GeneratedPacketIo + PublicationQuiescence;
+    type Io: PacketIo + GeneratedPacketIo + PublicationQuiescence + ClockedIo;
 
     fn io(&mut self) -> &mut Self::Io;
 
     /// Hands the backend the loop's clock reading (cold boundary: once per
-    /// loop iteration, before any I/O of that iteration). The AF_XDP
-    /// adapter rate-limits TX kick retries on a down link with it.
-    fn set_clock(&mut self, now: MonotonicMillis);
+    /// loop iteration, before any I/O of that iteration): forwards to
+    /// [`ClockedIo::set_clock`] of the I/O.
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        self.io().set_clock(now);
+    }
 
     /// One bounded shutdown drain call over every port (see
     /// `XdpPacketIo::drain`): stops RX/Fill and new TX for good, reclaims

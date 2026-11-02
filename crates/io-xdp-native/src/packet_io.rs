@@ -129,8 +129,8 @@
 //! is due reaps but skips the kick (`kick_retries_suppressed`). The debt is
 //! kept: when the link returns, the held TX is kicked within one retry
 //! interval. Without a clock (tests, tools) every settle retries. Other
-//! kick failures are the batch error (not sticky). `receive` also answers a Fill need-wakeup request with a
-//! non-sleeping `poll` kick.
+//! kick failures are the batch error (not sticky). `receive` also answers
+//! a Fill need-wakeup request with a non-sleeping `poll` kick.
 //!
 //! # Quiescence
 //!
@@ -177,9 +177,10 @@ pub const KICK_SLACK: u32 = 2;
 /// retry, in clock milliseconds.
 pub const LINK_DOWN_RETRY_MIN_MS: u64 = 1;
 /// Longest wait between TX kick retries on a down link: at most about 16
-/// `sendto` calls per second per down port, and held TX resumes at most
-/// this long after the link returns (well inside the 1 s link watch
-/// interval and below Linux's 200 ms minimum TCP retransmission timeout).
+/// `sendto` calls per second per down port, and held TX resumes within
+/// about this long after the link returns, plus up to one 1 ms idle pause
+/// of the run loop (well inside the 1 s link watch interval and below
+/// Linux's 200 ms minimum TCP retransmission timeout).
 pub const LINK_DOWN_RETRY_MAX_MS: u64 = 64;
 
 /// Generated-pool frames of a port that cross-port copies never take:

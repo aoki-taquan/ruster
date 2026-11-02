@@ -376,7 +376,8 @@ further wait doubles up to 64 ms, so a port that stays down costs about
 16 `sendto` calls per second (`if<id>.af_xdp_port.kicks_link_down`); a
 settle before the retry is due only reaps and counts
 `kick_retries_suppressed`. When the link returns, the held frames are
-transmitted at the next retry, at most 64 ms later and without new
+transmitted at the next retry, within about 64 ms (plus up to one 1 ms
+idle pause) and without new
 traffic (they may be stale by then), and the ring drains; the backoff
 starts again at 1 ms on the next down period. With only carrier lost (`IFF_LOWER_UP` clear, for example the
 peer down), the kernel consumes and drops the frames instead, so the ring
@@ -548,8 +549,8 @@ CLI-034).
   privilege drop, SIGUSR1 stats, structured logs, systemd notify, opt-in
   "link down / forwarding 0 at exit", state carried across a reload.
 - While a port is down with TX held, its owed kick is retried about 16
-  times per second (1 ms doubling to 64 ms, §8), so held TX resumes up to
-  64 ms after the link returns; the run loop's link watch (1 s) does not
+  times per second (1 ms doubling to 64 ms, §8), so held TX resumes within about
+  64 ms (plus up to one 1 ms idle pause) after the link returns; the run loop's link watch (1 s) does not
   shortcut the retry.
 - Verified kernels: the development host and the CI runner only
   (XDP-062). A TX stall with the link up (`TX_STALL`) cannot be produced

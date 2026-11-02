@@ -12,7 +12,7 @@ use ruster_io_xdp_native::{
 };
 
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
-use super::engine::{Datapath, DrainProgress, LinkMonitor};
+use super::engine::{ClockedIo, Datapath, DrainProgress, LinkMonitor};
 use super::netlink::{self, LinkFacts, LinkProbe, NetlinkError};
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::stats::write_fields;
@@ -173,6 +173,12 @@ impl LinkMonitor for NetlinkLinks {
     }
 }
 
+impl ClockedIo for XdpPacketIo<'_> {
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        XdpPacketIo::set_clock(self, now);
+    }
+}
+
 /// The adapter over every port's engine.
 pub struct XdpDatapath<'s> {
     io: XdpPacketIo<'s>,
@@ -183,10 +189,6 @@ impl<'s> Datapath for XdpDatapath<'s> {
 
     fn io(&mut self) -> &mut XdpPacketIo<'s> {
         &mut self.io
-    }
-
-    fn set_clock(&mut self, now: MonotonicMillis) {
-        self.io.set_clock(now);
     }
 
     fn drain(&mut self, rounds: u32) -> Result<DrainProgress, XdpIoError> {
