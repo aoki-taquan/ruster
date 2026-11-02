@@ -2176,10 +2176,10 @@ cancel/abandon、partial TX/reject、finish errorを決定的に実装します�
 packet bytesをcloneしません。次の実I/O backendも同じlease contractを実装し、
 backend固有pointerをcoreへ漏らしません。
 
-以下のAF_PACKET/AF_XDPはproduction backendではありません。AF_PACKETはscripted syscall上で
-copy `PacketIo` conformanceを通した段階（IO-012）、AF_XDPはownership model、native
-ABI/ring/syscall scaffold、session/attach、RX/Fill engine（M2 S3）の段階で、どちらも`ruster` CLIからは使えず、実NIC動作やthroughputを
-主張しません。
+以下のAF_PACKET/AF_XDPはproduction backendではありません。AF_PACKETはAP3でpublic live
+adapter `AfPacketIo`（netns/veth smokeまで、AFPKT-008〜014）を持ちますが`ruster run`からはまだ
+選べず（AFPKT-015）、debug/fallback backendという位置付けです。AF_XDPの段階は下の各節のとおりで、
+どちらも実NIC動作やthroughputを主張しません。
 
 ### AF_PACKET checked combined-mapping substrate
 
@@ -2302,12 +2302,10 @@ generated ARP/ICMPを全portでskipするため、level-triggeredでは一つの
 無期限にstarveさせます。halt状態は`BackendStats`で引き続き観測でき、health報告とescalationは
 R15/AP3へdeferredです。
 
-`PacketIo`単体はTX completionを回収しません。受理frameを戻すのはengineのbounded
-`scan_completions`だけで、現在これを呼ぶのはtestだけです。従って各egress TX ringは
-`frame_count`回の受理で尽き、以降のcommitはring fullの通常rejectとして`error == None`の
-まま拒否されます。AP3がcompletion schedulingを追加するまでpublic constructorを公開しては
-なりません。`finish`とDropは受理portごとに`send(MSG_DONTWAIT)`を最大
-一回だけ試しretryしません。hot pathはheap allocation、lock、trait objectを使いません。
+engineの`PacketIo`単体はTX completionを回収しません（copy conformance suiteがAP2 contractを
+そのまま観測するため）。回収はAP3のlive入口がbatchを開く前に行います（下の「AF_PACKET live
+adapter (AP3)」）。`finish`とDropは受理portごとに`send(MSG_DONTWAIT)`をbatch内で最大一回だけ
+試しbatch内ではretryしません。hot pathはheap allocation、lock、trait objectを使いません。
 
 IO-012の証跡として、reusable `ruster-io-conformance` RX-to-distinct-TX copy suiteを
 private static-dispatchの`ConformanceOps`(scripted mmap/kick)上の実engineで実行します。
@@ -2327,8 +2325,59 @@ rejected TX ABAが守る性質は、rejectがframeをreserveせずgenerationを�
 によるpartial reject、kick失敗のfinish errorとsingle kick、RX halt/TX faultのerror mapping、
 hairpin byte、round-robin、forget、steady allocation zeroをAF_PACKET固有testで検証します。
 poll統合、TX completionのscheduling、live stats/cleanup、public constructorはAP3、実NIC/netns
-E2Eと性能はR14以降へdeferredです。AP1-TXのstatus pathはvolatileとfenceのままで、RXの
-`AtomicU32`化とは共有helperを持たないためfollow-upです。
+E2Eと性能はR14以降へdeferredです。AP3でTX status accessもRXと同じ`AtomicU32` Acquire/Release
+になりました（publishのstoreはprepare時に検査済みの語へ行い失敗しません）。
+
+### AF_PACKET live adapter (AP3)
+
+AP3はengineを運用可能にし、public `AfPacketIo`（64-bit Linux）を公開します。`AfPacketIo`は
+private `AfPacketEngine<LinuxOps>`を一つ所有し、core `PacketIo`、`GeneratedPacketIo`、
+`PublicationQuiescence`、`BackendStats`をstatic dispatchで実装します。batch/slot型はengine側の
+generic型（scripted syscall seamで置換できる）の薄いnewtypeなので、scripted testが検証する
+schedulingとadapterが実行するものは同一です。errorはring offsetやtokenを含まないpublic
+`AfPacketError`へ写します。
+
+- **Open**（AFPKT-008）: portごとにprotocol zeroのsocket、`PACKET_VERSION`、
+  `PACKET_IGNORE_OUTGOING`、`PACKET_LOSS`（ring前）、RX/TX ring、combined mmapとextent再検査、
+  最後に`ETH_P_ALL`の`bind`（唯一のactivation点）。失敗は取得済みをmapping→socketの順で一度ずつ
+  解放します（前のportも）。promiscuous、fanout（single queue）、`PACKET_QDISC_BYPASS`は使いません。
+  AF_XDP pathと同じく、routerは各portのinterface MAC宛てとbroadcast/multicastだけを受け、TXは
+  qdiscを通ります。`PACKET_LOSS`が無いと、kernelは送れないframeをWRONG_FORMATにしてTX headを
+  そこで止め、FIFO producerは後ろへpublishを続けるため、producerが一周するまでringが詰まります。
+- **Settle**（AFPKT-009）: `receive`（全port）、`begin_generated`（egressだけ）、quiescence check、
+  drainが、in-flight frameだけのbounded FIFO completion scanと借りkickのretryを行います。kickを
+  借りるのは、直前のkickが失敗したportと、最古in-flight frameがSEND_REQUESTのまま（kernel未取得）
+  のportです。retryは`set_clock`で渡されたloop clockが再試行時刻に達したときだけで、間隔は
+  1 msから64 msへ倍増し、回収があればresetして次のretryを即座に許します（clockが一度も渡されて
+  いなければ毎settleでretry、AF_XDPと同じ）。errnoは`EAGAIN`/`ENOBUFS`/`EINTR`/`EBUSY`が
+  deferred、`ENETDOWN`がlink downで、どちらもbatch errorではありません（runtimeは
+  finish errorでそのtickのgenerated ARP/ICMPを全portでskipするため）。`ENXIO`は`tpacket_snd`が
+  bind先deviceを見つけられない（unregister済み）恒久状態なので、batch errorにしてportを
+  `unbound`にし、以後retryしません（AF_XDPの`NotBound`と同じくerror）。その他はfaultでbatch error
+  で、backoff付きでretryします。TX statusは`TP_STATUS_TS_*`（bit 29〜31）を除いて解釈し、
+  completion scanの不正status/ownershipはinvariant違反で、engineを恒久停止します。forgetされた
+  generated lease（Preparedのまま）はsessionの`finish`か次のreserveがAvailableへ戻します。
+- **Generated**（AFPKT-010）: generated frameはegress TX ringのproducer-head frameそのもので、
+  copy commitと同じreserveの後にdata `len` byteをzero化して貸します。statusはAVAILABLEのままなので
+  kernelは読みません。commitでheaderを書きRelease SEND_REQUEST、cancel/abandonはring無変更で
+  戻します。router生成frameはcopyされません。
+- **Quiescence**（AFPKT-011）: settle後にin-flight TXが無いときだけguardを返し、in-flightは
+  `ContinueOldIo`、drain/fault停止は恒久`Stop`です。
+- **Idle wait**（AFPKT-012）: RX workが見えれば即`Ready`、無ければ固定`pollfd`配列で全socketを
+  `poll(2)`します。TPACKET_V3はblockが満杯かretire timerで初めて見えるので、idle時の単発frameは
+  最大RX `retire_timeout_ms`遅れます（router用途は1 msを推奨）。
+- **Stats**（OBS-028）: portごとのcounterはevent時にO(1)で更新し、`backend_stats`は合計を
+  allocationなしで返します。kernelの`PACKET_STATISTICS`は読むとresetされるので、`&self`の
+  `backend_stats`では読まず、cold `refresh_kernel_stats`だけが累積します。
+- **Drain/cleanup**（AFPKT-013）: 最初の`drain`でRX/新規TXを恒久停止し、backoffなしの強制kickで
+  boundedにsettleします。dropはmapping→socketの順に一度ずつ解放します。
+
+露出モデル: AF_XDPのXDP programはbind queueのframeをkernel stackから奪いますが（queue外は
+drop）、AF_PACKETはframeのcopyを受け取るだけで、kernel stackは同じframeを処理し続けます。
+従ってAF_PACKETのportにはkernelのIPv4/IPv6 address、route、forwarding役割を一切持たせては
+いけません（addressが無ければkernelはIP frameを捨て、ARPにも答えません）。この検査は
+`ruster run`接続（AFPKT-015）のstartup checkで行います。性能はframeごとの一回copy、block
+retire latency、kernel stackとの二重処理のため、AF_XDP copy modeより低いと見込みます（未計測）。
 
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
 pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core

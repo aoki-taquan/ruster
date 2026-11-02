@@ -1262,14 +1262,15 @@ pub fn completion_capable_batch_drop_is_exact<H: RxCopyCompletionHarness>() {
     );
 }
 
-/// A kick errno is reported once without retry; already published descriptors
+/// A fault-class kick errno (EIO; a backend may treat EAGAIN-like deferrals as
+/// non-errors) is reported once without retry; already published descriptors
 /// remain accepted and complete normally.
 pub fn kick_errno_has_no_retry_or_reclassification<H>()
 where
     H: RxCopyKickErrorHarness + RxCopyCompletionHarness,
 {
     let mut harness = H::new();
-    harness.fail_next_copy_kick(CopyErrno(11));
+    harness.fail_next_copy_kick(CopyErrno(5));
     let baseline = harness.free_copy_tx_frames();
     harness.inject_rx_block(CONFORMANCE_LAN, vec![vec![1], vec![2]]);
     let completion = {
@@ -1288,7 +1289,7 @@ where
         harness.drain_copy_tx_kicks(),
         [CopyKickEvent {
             endpoint: expected_endpoint(CONFORMANCE_WAN),
-            result: Err(CopyErrno(11)),
+            result: Err(CopyErrno(5)),
         }]
     );
     assert_eq!(harness.copy_operation_counters().kick_syscalls, 1);

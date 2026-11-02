@@ -24,11 +24,14 @@ pub enum SyscallStage {
     Socket,
     SetVersion,
     SetIgnoreOutgoing,
+    SetLoss,
     SetRxRing,
     SetTxRing,
     Bind,
     Mmap,
     Kick,
+    Poll,
+    Statistics,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -637,6 +637,7 @@ impl<O: PacketOps> PacketRingResources<O> {
                         lent: true,
                     };
                     report.leased += 1;
+                    super::bump(&mut self.counters.rx_packets);
                     return Step::Lease {
                         token,
                         data,
@@ -648,6 +649,7 @@ impl<O: PacketOps> PacketRingResources<O> {
         };
         self.rx_stats.record(BackendStat::DescriptorRejected);
         report.packet_faults += 1;
+        super::bump(&mut self.counters.rx_packet_faults);
         match self.rx_complete(token, Completion::Fault, report) {
             Ok(returned) => Step::Fault(RxFault::Packet {
                 token,
@@ -744,6 +746,7 @@ impl<O: PacketOps> PacketRingResources<O> {
         }
         self.rx_advance(index);
         report.blocks_returned += 1;
+        super::bump(&mut self.counters.rx_blocks_returned);
         #[cfg(test)]
         self.probe.mark_rx_return();
         Ok(RxBlockReturn {
@@ -762,6 +765,7 @@ impl<O: PacketOps> PacketRingResources<O> {
     ) -> Step {
         self.rx_stats.record(BackendStat::GeometryRejected);
         report.block_faults += 1;
+        super::bump(&mut self.counters.rx_block_faults);
         // The block was observed USER, so userspace may hand it back. None of
         // its packets was exposed and no later descriptor is visited.
         let return_error = self.rx_store_kernel(block_start).err();
@@ -780,6 +784,7 @@ impl<O: PacketOps> PacketRingResources<O> {
         }
         self.rx_advance(block.block_index);
         report.blocks_returned += 1;
+        super::bump(&mut self.counters.rx_blocks_returned);
         #[cfg(test)]
         self.probe.mark_rx_return();
         Step::Fault(fault)
@@ -801,6 +806,29 @@ impl<O: PacketOps> PacketRingResources<O> {
     fn rx_halt(&mut self, fault: RxFault) -> Step {
         self.rx_note_halt(fault);
         Step::Halt(fault)
+    }
+
+    /// Whether the cursor has RX work to take now: a block in validation or
+    /// delivery, or a USER head block (one Acquire load, no budget). A
+    /// halted cursor is not work in any phase: a halt (for example a failed
+    /// block return in the delivery phase) cannot progress by itself, and
+    /// reporting it would turn the idle wait into a busy spin. The batch
+    /// still retries the halted step at every tick.
+    pub(super) fn rx_ready(&mut self) -> bool {
+        if self.rx_cursor.sticky.is_some() {
+            return false;
+        }
+        if self.rx_cursor.phase != RxPhase::Idle {
+            return true;
+        }
+        let Ok(range) = self.rx.block_range(self.rx_cursor.head) else {
+            return false;
+        };
+        matches!(
+            self.rx_load_status(range.start)
+                .map(RxOwnership::from_status),
+            Ok(Ok(RxOwnership::User))
+        )
     }
 
     /// The halting fault already counted for the current condition, if any.

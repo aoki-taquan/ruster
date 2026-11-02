@@ -63,6 +63,21 @@ impl PacketOps for FixtureOps {
         Ok(())
     }
 
+    fn poll(
+        &mut self,
+        _fds: &mut [crate::sys::PollFd],
+        _timeout_ms: c_int,
+    ) -> Result<usize, PlatformError> {
+        Ok(0)
+    }
+
+    fn packet_statistics(
+        &mut self,
+        _fd: RawFd,
+    ) -> Result<crate::sys::TpacketStatsV3, PlatformError> {
+        Ok(crate::sys::TpacketStatsV3::default())
+    }
+
     fn unmap(&mut self, _base: NonNull<u8>, _len: usize) {}
 
     fn close(&mut self, _fd: RawFd) {}

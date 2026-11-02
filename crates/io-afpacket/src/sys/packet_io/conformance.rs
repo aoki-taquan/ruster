@@ -234,6 +234,21 @@ impl PacketOps for ConformanceOps {
         })
     }
 
+    fn poll(
+        &mut self,
+        _fds: &mut [crate::sys::PollFd],
+        _timeout_ms: c_int,
+    ) -> Result<usize, PlatformError> {
+        Ok(0)
+    }
+
+    fn packet_statistics(
+        &mut self,
+        _fd: RawFd,
+    ) -> Result<crate::sys::TpacketStatsV3, PlatformError> {
+        Ok(crate::sys::TpacketStatsV3::default())
+    }
+
     fn unmap(&mut self, base: NonNull<u8>, len: usize) {
         let layout = Layout::from_size_align(len, PAGE).expect("mapping layout");
         // SAFETY: the engine's mapping owner unmaps exactly once with the

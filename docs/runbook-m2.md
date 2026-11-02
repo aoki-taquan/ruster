@@ -1856,6 +1856,61 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   (XDP-062). A TX stall with the link up (`TX_STALL`) cannot be produced
   on veth and is tested only against a scripted kernel (CLI-050).
 
+### AF_PACKET backend (AP3, not selectable yet)
+
+`ruster run` drives AF_XDP only. The AF_PACKET backend
+(`ruster-io-afpacket::AfPacketIo`, AFPKT-008 to AFPKT-014) is complete as a
+library and proven on veth inside a namespace, but `backend.kind =
+"af-packet"` does not exist yet (AFPKT-015, the next slice). What an
+operator should know before choosing it once it is wired:
+
+- **Backend choice.** AF_XDP stays the primary backend. AF_PACKET is the
+  debug/fallback backend: it needs no XDP program, no `CAP_BPF`, no
+  `RLIMIT_MEMLOCK`, and no single-queue or RSS steering, only `CAP_NET_RAW`,
+  so it runs where XDP attach is impossible (a driver or kernel without XDP,
+  a device that already carries a foreign XDP program, a container without
+  BPF privileges).
+- **Exposure model.** An AF_XDP port's frames are redirected away from the
+  kernel stack (frames outside the bound queue are dropped). An AF_PACKET
+  socket only receives a *copy*: the kernel stack still processes every
+  frame of the port. A port must therefore carry no kernel IPv4 or IPv6
+  address and no kernel route, IPv4 forwarding must stay off, and IPv6
+  should be disabled on the port (`disable_ipv6=1`), so the kernel drops
+  the IP frames it sees and answers no ARP or neighbor discovery. The
+  existing kernel-exposure startup checks (section 5) are mandatory for
+  AF_PACKET, not a hardening extra. The socket sets
+  `PACKET_IGNORE_OUTGOING` (the router never receives its own TX) and asks
+  for no promiscuous mode: like the AF_XDP path, the port receives frames
+  for its own MAC plus broadcast and multicast.
+- **Latency.** TPACKET_V3 hands a block to userspace when it is full or its
+  retire timer fires. An idle port therefore delivers a lone frame up to
+  the RX `retire_timeout_ms` late; use 1 ms for a router.
+- **Performance expectation (not measured).** Every forwarded frame is
+  copied once into a TX frame (router-generated ARP/ICMP frames are not
+  copied: they are written into the TX ring directly), the kernel stack
+  processes each received frame a second time, and TX goes through the
+  device qdisc. Expect throughput below AF_XDP copy mode; no number is
+  claimed.
+- **Stats.** `af_packet.*` and `af_packet_port.*` (OBS-028): RX packets and
+  faults, TX published/copies/completed/ring full, kicks deferred, link
+  down, errors, retries and suppressed retries, generated frames, and the
+  kernel's `tp_packets`/`tp_drops`/`tp_freeze_q_cnt` (folded in only by a
+  cold refresh, because reading them resets them). A growing `kernel_drops`
+  means the RX ring is too small or the router thread too slow.
+- **Kicks on a down link** (`ENETDOWN`) are a link state, not an error:
+  frames stay in the TX ring and the owed kick is retried at most about 16
+  times a second (1 ms doubling to 64 ms) until the link is back. `ENXIO`
+  means the port's device was unregistered: that is permanent, reported as
+  an error, the port is marked `unbound` and never kicked again; restart
+  the router with the device back.
+- **Notes for the integration (AFPKT-015).** A down egress with queued TX
+  keeps those frames in flight, and a reload waits for in-flight TX to
+  drain (publication quiescence), so a SIGHUP reload during such an outage
+  is held back until the reload quiesce timeout. The kernel's
+  `PACKET_STATISTICS` counters are 32-bit and reset on every read; the
+  integration must refresh them periodically (for example with the stats
+  interval), not only at exit, so they neither wrap nor lose drops.
+
 ## 13. CI and E2E
 
 The `XDP veth` job (`.github/workflows/xdp-veth.yml`, M2 S11) runs on every
@@ -1877,6 +1932,10 @@ What it proves, on the runner's kernel only:
 - The native layer on a real kernel: `scripts/priv-xdp-smoke.sh` (the
   `priv_xdp_*` phases: session, attach, engine, tx, generated, adapter,
   foreign program, SIGKILL holder).
+- The AF_PACKET live adapter on a real kernel (AP3, library level, not
+  `ruster run`): `scripts/priv-afpacket-smoke.sh` (`priv_afpacket_*`):
+  idle poll, core forwarding between two veth ports, a generated burst,
+  a link flap, a failed open that releases its first port, drain and close.
 - The operator flows of sections 5 to 10 end to end:
   `scripts/priv-run-smoke.sh`, in three dedicated namespaces with copy mode
   and native XDP on veth: forwarding with ARP, NAT44 and the firewall;

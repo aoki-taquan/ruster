@@ -89,7 +89,7 @@ fn af_packet_finish_error_preserves_partial_reject_accounting_and_single_kick() 
     // reserves and copies nothing. The injected kick errno is the finish
     // error.
     let mut harness = OneFrameHarness::new();
-    harness.fail_next_copy_kick(CopyErrno(11));
+    harness.fail_next_copy_kick(CopyErrno(5));
     harness.inject_rx_block(CONFORMANCE_LAN, vec![vec![1], vec![2], vec![3]]);
     let completion = {
         let (io, _) = harness.io_and_observer();
@@ -107,7 +107,7 @@ fn af_packet_finish_error_preserves_partial_reject_accounting_and_single_kick() 
             interface: CONFORMANCE_WAN,
             error: PlatformError::Syscall {
                 stage: SyscallStage::Kick,
-                errno: Errno::new(11),
+                errno: Errno::new(5),
             },
         })
     );
@@ -115,7 +115,7 @@ fn af_packet_finish_error_preserves_partial_reject_accounting_and_single_kick() 
         harness.drain_copy_tx_kicks(),
         [CopyKickEvent {
             endpoint: CONFORMANCE_WAN_ENDPOINT,
-            result: Err(CopyErrno(11)),
+            result: Err(CopyErrno(5)),
         }]
     );
     let counters = harness.copy_operation_counters();

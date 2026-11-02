@@ -5,9 +5,10 @@ name: XDP veth
 #     AF_XDP and XDP attach on a veth inside a throwaway netns; it never
 #     skips or passes vacuously
 #   - build as the runner user, run only the privileged parts with `sudo -n`
-#   - scripts/priv-xdp-smoke.sh (native session tests, priv_xdp_session) and
-#     scripts/priv-run-smoke.sh (`ruster run` E2E) with RUSTER_REQUIRE_PRIV=1,
-#     so every would-be skip is a failure
+#   - scripts/priv-xdp-smoke.sh (native session tests, priv_xdp_session),
+#     scripts/priv-run-smoke.sh (`ruster run` E2E), and
+#     scripts/priv-afpacket-smoke.sh (AP3 AF_PACKET adapter, priv_afpacket)
+#     with RUSTER_REQUIRE_PRIV=1, so every would-be skip is a failure
 # Every veth lives in a dedicated `ruster-*` network namespace that the
 # scripts always delete; nothing is created in the initial namespace and no
 # host interface is touched. Not a required check (owner decision 2e: optional for now).
@@ -65,6 +66,12 @@ jobs:
             --exact priv_gate_fails_instead_of_skipping_when_required > "${RUNNER_TEMP}/gate.log"
           cat "${RUNNER_TEMP}/gate.log"
           grep -q '^test result: ok\. 1 passed;' "${RUNNER_TEMP}/gate.log"
+          cargo test --locked -p ruster-io-afpacket --test priv_afpacket --no-run
+          cargo test --locked -p ruster-io-afpacket --test priv_afpacket -- \
+            --exact priv_afpacket_gate_fails_instead_of_skipping_when_required \
+            > "${RUNNER_TEMP}/afpacket-gate.log"
+          cat "${RUNNER_TEMP}/afpacket-gate.log"
+          grep -q '^test result: ok\. 1 passed;' "${RUNNER_TEMP}/afpacket-gate.log"
 
       - name: Native AF_XDP smoke (priv_xdp_session)
         shell: bash
@@ -76,6 +83,17 @@ jobs:
           TMPDIR="${RUNNER_TEMP}/smoke-tmp" \
             timeout --signal=TERM --kill-after=30s 10m \
             scripts/priv-xdp-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-logs/priv-xdp-smoke.log"
+
+      - name: AF_PACKET adapter smoke (priv_afpacket)
+        shell: bash
+        env:
+          RUSTER_REQUIRE_PRIV: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/smoke-logs" "${RUNNER_TEMP}/smoke-tmp"
+          TMPDIR="${RUNNER_TEMP}/smoke-tmp" \
+            timeout --signal=TERM --kill-after=30s 5m \
+            scripts/priv-afpacket-smoke.sh 2>&1 | tee "${RUNNER_TEMP}/smoke-logs/priv-afpacket-smoke.log"
 
       - name: ruster run E2E smoke
         shell: bash

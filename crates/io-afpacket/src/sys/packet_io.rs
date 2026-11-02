@@ -60,8 +60,9 @@
 //!   they appear only in the per-port `BackendStats`. A `mem::forget`-ten
 //!   lease is finalized by a later cursor step and is not counted either.
 //! - `error`: the first backend fault of the batch: a newly observed halting
-//!   RX fault of any port, a TX fault-class rejection, or the first failed
-//!   kick. Routine rejections are not errors. Accounting is complete in every
+//!   RX fault of any port, a TX fault-class rejection, or the first
+//!   fault-class kick failure. Routine rejections, deferred kicks, and kicks
+//!   on a down link are not errors. Accounting is complete in every
 //!   case.
 //!
 //! RX halts are edge-triggered. A halt becomes `error` only in the batch that
@@ -72,23 +73,25 @@
 //! is reported again. The runtime treats any finish error as a backend I/O
 //! failure and skips generated ARP/ICMP for every port in that tick, so a
 //! level-triggered report would let one halted port starve healthy ports
-//! indefinitely. The halted state stays visible through `BackendStats`;
-//! health reporting and escalation are deferred (R15/AP3).
+//! indefinitely. The halted state stays visible through `BackendStats` and the
+//! AP3 port stats (`rx_halted`); escalation is deferred.
 //!
-//! PacketIo alone never reaps TX completions. Accepted frames are returned
-//! only by the engine's bounded `scan_completions`, which today only tests
-//! call. Without it each egress TX ring is exhausted after `frame_count`
-//! accepted commits, and later commits are routinely rejected as ring full
-//! with `error == None`. A public constructor must not be exposed before AP3
-//! adds completion scheduling.
+//! This PacketIo alone never reaps TX completions, so the reusable copy
+//! conformance suite observes exactly the AP2 contract. The AP3 live entry
+//! point (`live_receive`, used by the public `AfPacketIo`) first settles
+//! every port: it reaps completions with the bounded FIFO scan and retries
+//! owed kicks (see `schedule`), and only then opens this batch.
 //!
 //! `finish` and `Drop` both try `send(MSG_DONTWAIT)` at most once per egress
-//! port that accepted a frame in this batch and never retry.
+//! port that accepted a frame in this batch and never retry within the
+//! batch. `EAGAIN`, `ENOBUFS`, `EINTR`, `EBUSY` (deferred) and `ENETDOWN`
+//! (link down) are not errors: the kick is owed and a later settle retries
+//! it. `ENXIO` (the bound device was unregistered, permanent) is the batch
+//! `error` and marks the port unbound, which is never retried. Any other
+//! errno is the batch `error` and is owed and retried.
 //!
 //! Steady operation allocates nothing, takes no lock, uses no trait object,
 //! and does O(1) work per packet plus bounded per-port status/descriptor work.
-//! Poll integration, TX completion scheduling, live telemetry, and the public
-//! constructor are deferred to AP3.
 
 use std::ptr::NonNull;
 
@@ -98,7 +101,7 @@ use ruster_core::{
 
 use super::{
     rx::{Completion, RxBatchReport, RxBudget, RxFault, RxPacketToken, RxStop, Step},
-    AfPacketEngine, LinuxOps, PacketOps, TxPayload, TxSubmitError,
+    AfPacketEngine, LinuxOps, PacketOps, TxCompletionError, TxPayload, TxSubmitError,
 };
 use crate::PlatformError;
 
@@ -110,11 +113,20 @@ pub(crate) enum AfPacketIoError {
     Rx { interface: IfId, fault: RxFault },
     /// A fault-class TX rejection; the RX packet was still completed.
     Tx { egress: IfId, error: TxSubmitError },
-    /// The first failed nonblocking kick. Published frames stay in flight.
+    /// The first fault-class kick failure (a deferral or a down link is not
+    /// an error). Published frames stay in flight and the kick is owed.
     Kick {
         interface: IfId,
         error: PlatformError,
     },
+    /// A TX completion scan found an invariant violation; the engine
+    /// stopped for good (AP3 live entry points only).
+    Completion {
+        interface: IfId,
+        error: TxCompletionError,
+    },
+    /// The engine was drained or stopped by an earlier fault.
+    Stopped,
 }
 
 impl<O: PacketOps> PacketIo for AfPacketEngine<O> {
@@ -183,10 +195,28 @@ struct LeasedRx {
 }
 
 #[allow(dead_code)]
-impl<O: PacketOps> AfPacketBatch<'_, O> {
+impl<'a, O: PacketOps> AfPacketBatch<'a, O> {
     /// Aggregated RX work and lifecycle counters of this batch.
     pub(crate) const fn rx_report(&self) -> RxBatchReport {
         self.rx_report
+    }
+
+    /// The next lease's backend slot (the public adapter wraps it).
+    pub(crate) fn next_slot(&mut self) -> Option<AfPacketSlot<'_, 'a, O>> {
+        let leased = self.next_rx()?;
+        Some(AfPacketSlot {
+            batch: self,
+            port: leased.port,
+            token: leased.token,
+            data: leased.data,
+            len: leased.len,
+            completed: false,
+        })
+    }
+
+    /// `finish` that the public adapter calls through its wrapper.
+    pub(crate) fn finish_batch(mut self) -> BatchCompletion<AfPacketIoError> {
+        self.finish_inner()
     }
 
     fn record(&mut self, error: AfPacketIoError) {
@@ -313,15 +343,7 @@ impl<'a, O: PacketOps> PacketBatch for AfPacketBatch<'a, O> {
         Self: 'b;
 
     fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
-        let leased = self.next_rx()?;
-        Some(PacketLease::new(AfPacketSlot {
-            batch: self,
-            port: leased.port,
-            token: leased.token,
-            data: leased.data,
-            len: leased.len,
-            completed: false,
-        }))
+        self.next_slot().map(PacketLease::new)
     }
 
     fn finish(mut self) -> BatchCompletion<Self::Error> {

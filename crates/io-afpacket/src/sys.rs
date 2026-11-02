@@ -4,21 +4,29 @@ use std::{
     mem::{align_of, offset_of, size_of},
     os::fd::RawFd,
     ptr::NonNull,
-    sync::atomic::{fence, AtomicU32, Ordering},
+    sync::atomic::{AtomicU32, Ordering},
 };
 
 use ruster_core::IfId;
 
 use crate::{
     boundary::{ColdRingMetadata, CombinedRingExtents},
-    BackendStats, Errno, MappingAccessError, OwnershipError, PlatformError, PortTable, RingKind,
-    RingLayout, SyscallStage, TxOwnership, UapiLayout, ValidatedConfig, ValidatedPort,
-    TPACKET_ALIGNMENT, TPACKET_V3_TX_DATA_OFFSET, TP_STATUS_AVAILABLE, TP_STATUS_SENDING,
-    TP_STATUS_SEND_REQUEST, TP_STATUS_WRONG_FORMAT,
+    AfPacketCounters, BackendStats, Errno, MappingAccessError, OwnershipError, PlatformError,
+    PortTable, RingKind, RingLayout, SyscallStage, TxOwnership, UapiLayout, ValidatedConfig,
+    ValidatedPort, TPACKET_ALIGNMENT, TPACKET_V3_TX_DATA_OFFSET, TP_STATUS_AVAILABLE,
+    TP_STATUS_SENDING, TP_STATUS_SEND_REQUEST, TP_STATUS_WRONG_FORMAT,
 };
 
+mod generated;
+mod live;
 mod packet_io;
 mod rx;
+mod schedule;
+
+pub use live::{
+    AfPacketDrain, AfPacketError, AfPacketGeneratedBatch, AfPacketGeneratedSlot, AfPacketIo,
+    AfPacketQuiescenceError, AfPacketRxBatch, AfPacketRxFault, AfPacketRxSlot, AfPacketTxFault,
+};
 
 #[allow(unused_imports)]
 pub(crate) use rx::{
@@ -33,6 +41,14 @@ const PACKET_RX_RING: c_int = 5;
 const PACKET_VERSION: c_int = 10;
 const PACKET_TX_RING: c_int = 13;
 const PACKET_IGNORE_OUTGOING: c_int = 23;
+const PACKET_LOSS: c_int = 14;
+const PACKET_STATISTICS: c_int = 6;
+const POLLIN: i16 = 0x001;
+const POLLNVAL: i16 = 0x020;
+const SC_PAGESIZE: c_int = 30;
+/// Linux `TP_STATUS_TS_SOFTWARE | TP_STATUS_TS_SYS_HARDWARE |
+/// TP_STATUS_TS_RAW_HARDWARE`.
+const TP_STATUS_TS_MASK: u32 = (1 << 29) | (1 << 30) | (1 << 31);
 const TPACKET_V3: c_int = 2;
 const ETH_P_ALL: u16 = 0x0003;
 const PROT_READ: c_int = 1;
@@ -154,6 +170,27 @@ impl SockaddrLl {
     }
 }
 
+/// Linux `struct pollfd`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PollFd {
+    pub(crate) fd: c_int,
+    pub(crate) events: i16,
+    pub(crate) revents: i16,
+}
+
+/// Linux `struct tpacket_stats_v3`, the `PACKET_STATISTICS` value of a
+/// TPACKET_V3 socket. The kernel resets its counters on every read.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TpacketStatsV3 {
+    pub(crate) tp_packets: u32,
+    pub(crate) tp_drops: u32,
+    pub(crate) tp_freeze_q_cnt: u32,
+}
+
+const _: [(); 8] = [(); size_of::<PollFd>()];
+const _: [(); 12] = [(); size_of::<TpacketStatsV3>()];
 const _: [(); 48] = [(); size_of::<Tpacket3Hdr>()];
 const _: [(); 48] = [(); size_of::<TpacketBlockDesc>()];
 const _: [(); 8] = [(); align_of::<TpacketHdrV1>()];
@@ -217,6 +254,14 @@ pub(crate) trait PacketOps: Clone {
     fn map(&mut self, fd: RawFd, len: usize) -> Result<NonNull<u8>, PlatformError>;
 
     fn kick(&mut self, fd: RawFd) -> Result<(), PlatformError>;
+
+    /// One `poll(2)` over `fds`; returns the number of entries with nonzero
+    /// `revents`. `EINTR` is returned as a `Poll` syscall error.
+    fn poll(&mut self, fds: &mut [PollFd], timeout_ms: c_int) -> Result<usize, PlatformError>;
+
+    /// `getsockopt(SOL_PACKET, PACKET_STATISTICS)`; the kernel resets the
+    /// counters it returns.
+    fn packet_statistics(&mut self, fd: RawFd) -> Result<TpacketStatsV3, PlatformError>;
 
     fn unmap(&mut self, base: NonNull<u8>, len: usize);
 
@@ -319,6 +364,47 @@ impl PacketOps for LinuxOps {
         }
     }
 
+    fn poll(&mut self, fds: &mut [PollFd], timeout_ms: c_int) -> Result<usize, PlatformError> {
+        let count = std::ffi::c_ulong::try_from(fds.len()).map_err(|_| PlatformError::Syscall {
+            stage: SyscallStage::Poll,
+            errno: Errno::new(22),
+        })?;
+        // SAFETY: `fds` is an exclusively borrowed, initialized array of
+        // C-layout `pollfd` of exactly `count` entries that stays live until
+        // the call returns; the kernel writes only `revents`.
+        let result = unsafe { poll(fds.as_mut_ptr().cast(), count, timeout_ms) };
+        if result < 0 {
+            Err(last_error(SyscallStage::Poll))
+        } else {
+            Ok(usize::try_from(result).unwrap_or(0))
+        }
+    }
+
+    fn packet_statistics(&mut self, fd: RawFd) -> Result<TpacketStatsV3, PlatformError> {
+        let mut value = TpacketStatsV3::default();
+        let mut len = u32::try_from(size_of::<TpacketStatsV3>()).expect("stats size fits");
+        // SAFETY: `value` and `len` are initialized locals that outlive the
+        // call; `len` bounds the bytes the kernel may write into `value`.
+        let result = unsafe {
+            getsockopt(
+                fd,
+                SOL_PACKET,
+                PACKET_STATISTICS,
+                (&raw mut value).cast(),
+                &raw mut len,
+            )
+        };
+        if result < 0 {
+            return Err(last_error(SyscallStage::Statistics));
+        }
+        // Only the exact TPACKET_V3 layout is accepted: a shorter value would
+        // leave counters unwritten and a V1/V2 layout means another version.
+        if usize::try_from(len).ok() != Some(size_of::<TpacketStatsV3>()) {
+            return Err(PlatformError::UapiLayoutMismatch);
+        }
+        Ok(value)
+    }
+
     fn unmap(&mut self, base: NonNull<u8>, len: usize) {
         // SAFETY: the mapping owner calls this once with the exact live range.
         let _ = unsafe { munmap(base.as_ptr().cast(), len) };
@@ -341,6 +427,7 @@ pub(crate) struct PacketRingResources<O: PacketOps = LinuxOps> {
     mapping: MmapRegion<O>,
     socket: PacketSocket<O>,
     interface: IfId,
+    if_index: u32,
     max_frame_len: usize,
     rx: RingLayout,
     extents: CombinedRingExtents,
@@ -348,6 +435,8 @@ pub(crate) struct PacketRingResources<O: PacketOps = LinuxOps> {
     rx_cursor: rx::RxCursor,
     rx_stats: BackendStats,
     tx_state: TxPortState,
+    counters: AfPacketCounters,
+    kick: schedule::KickState,
     #[cfg(test)]
     rx_injection: rx::RxFaultInjection,
     #[cfg(test)]
@@ -420,6 +509,9 @@ impl<O: PacketOps> PacketRingResources<O> {
         let mut socket = PacketSocket::open(ops.clone())?;
         socket.set_version()?;
         socket.ignore_outgoing()?;
+        // PACKET_LOSS must precede ring setup (the kernel refuses it with
+        // EBUSY afterwards).
+        socket.set_loss()?;
         socket.set_ring(
             PACKET_RX_RING,
             port.rx().geometry(),
@@ -441,6 +533,7 @@ impl<O: PacketOps> PacketRingResources<O> {
             mapping,
             socket,
             interface: port.interface(),
+            if_index: port.if_index(),
             max_frame_len: port.max_frame_len(),
             rx: port.rx(),
             extents,
@@ -448,6 +541,8 @@ impl<O: PacketOps> PacketRingResources<O> {
             rx_cursor: rx::RxCursor::new(),
             rx_stats: BackendStats::new(),
             tx_state: TxPortState::default(),
+            counters: AfPacketCounters::default(),
+            kick: schedule::KickState::new(),
             #[cfg(test)]
             rx_injection: rx::RxFaultInjection::default(),
             #[cfg(test)]
@@ -459,19 +554,27 @@ impl<O: PacketOps> PacketRingResources<O> {
         self.metadata.tx_frames().len()
     }
 
+    /// Acquire load of a TX frame status with the `TP_STATUS_TS_*` bits
+    /// (29..=31) removed: the kernel ORs a timestamp source into the
+    /// AVAILABLE it stores at TX completion when timestamping is enabled on
+    /// the socket or device, and that must not read as an unknown status.
     fn load_tx_status(&self, frame_index: usize) -> Result<u32, MappingAccessError> {
         let status_offset = self.tx_frame_status_offset(frame_index)?;
-        self.mapping.load_status_acquire(status_offset)
+        Ok(self.mapping.load_status_acquire(status_offset)? & !TP_STATUS_TS_MASK)
     }
 
-    fn publish_tx_frame(
+    /// Resolves every checked address of the producer-head frame for a
+    /// `len`-byte payload and moves its ownership to Prepared. Nothing is
+    /// written to the ring; the status word stays AVAILABLE, so the kernel
+    /// never reads the frame until [`Self::tx_publish`].
+    fn tx_prepare(
         &mut self,
         frame_index: usize,
-        payload: TxPayload<'_>,
+        len: usize,
         generation: u64,
-    ) -> Result<(), MappingAccessError> {
+    ) -> Result<TxReservation, MappingAccessError> {
         let frame_offset = self.tx_frame_offset(frame_index)?;
-        let header_address = self.mapping.ring_address(
+        let header = self.mapping.ring_address(
             self.extents,
             RingKind::Tx,
             frame_offset,
@@ -481,20 +584,41 @@ impl<O: PacketOps> PacketRingResources<O> {
         let data_offset = frame_offset
             .checked_add(TPACKET_V3_TX_DATA_OFFSET)
             .ok_or(MappingAccessError::ArithmeticOverflow)?;
-        let data_address =
-            self.mapping
-                .ring_address(self.extents, RingKind::Tx, data_offset, payload.len, 1)?;
-        let length =
-            u32::try_from(payload.len).map_err(|_| MappingAccessError::ArithmeticOverflow)?;
+        let data = self
+            .mapping
+            .ring_address(self.extents, RingKind::Tx, data_offset, len, 1)?;
+        let data = NonNull::new(data).ok_or(MappingAccessError::ArithmeticOverflow)?;
+        u32::try_from(len).map_err(|_| MappingAccessError::ArithmeticOverflow)?;
         // Every checked address, including the status word, is resolved
-        // before ownership changes or any byte moves.
+        // before ownership changes or any byte moves, so publication cannot
+        // fail on an address once the frame is Prepared.
         let status_offset = self.tx_frame_status_offset(frame_index)?;
+        let status =
+            self.mapping
+                .checked_address(status_offset, size_of::<u32>(), align_of::<u32>())?;
+        let status =
+            NonNull::new(status.cast::<u32>()).ok_or(MappingAccessError::ArithmeticOverflow)?;
         let frame = &mut self.metadata.tx_frames_mut()[frame_index];
         frame
             .ownership
             .prepare()
             .map_err(MappingAccessError::Ownership)?;
         frame.generation = generation;
+        Ok(TxReservation {
+            frame_index,
+            generation,
+            header: header.cast::<Tpacket3Hdr>(),
+            data,
+            status,
+            len,
+        })
+    }
+
+    /// Writes the V3 header of a prepared frame and hands it to the kernel
+    /// with a Release store of SEND_REQUEST.
+    fn tx_publish(&mut self, reservation: TxReservation) -> Result<(), MappingAccessError> {
+        let length =
+            u32::try_from(reservation.len).map_err(|_| MappingAccessError::ArithmeticOverflow)?;
         let header = Tpacket3Hdr {
             tp_next_offset: 0,
             tp_sec: 0,
@@ -512,38 +636,61 @@ impl<O: PacketOps> PacketRingResources<O> {
             },
             tp_padding: [0; 8],
         };
-        // SAFETY: ring_address proved the complete aligned header is within
-        // the TX extent, and AVAILABLE ownership excludes kernel access.
-        unsafe { std::ptr::write(header_address.cast::<Tpacket3Hdr>(), header) };
-        // SAFETY: ring_address proved `data_address..+len` lies inside this
-        // backend-owned TX frame of the live mapping, and AVAILABLE ownership
-        // excludes the kernel. `TxPayload`'s constructor contract makes the
-        // source readable for `len` bytes, free of any live `&mut` alias, and
-        // disjoint from every TX extent: TX frame bytes are never lent out of
-        // `sys`, and an RX source lies in an RX extent, which the checked
-        // combined-mapping layout (`CombinedRingExtents`, RX `[0, rx_len)`,
-        // TX `[rx_len, combined_len)`) keeps disjoint from the TX extent of
-        // the same mapping; other ports own separate mappings. The ranges
-        // therefore cannot overlap. This is the accepted path's single
-        // packet-byte copy.
-        unsafe {
-            std::ptr::copy_nonoverlapping(payload.source.as_ptr(), data_address, payload.len);
-        }
-        #[cfg(test)]
-        self.probe.record(|counts| {
-            counts.tx_copies += 1;
-            counts.tx_copied_bytes += payload.len;
-        });
+        // SAFETY: `tx_prepare` proved (through ring_address) that the
+        // complete aligned header lies within the TX extent of the live
+        // mapping, which outlives `self`. The frame is Prepared with status
+        // AVAILABLE, which excludes kernel access, and no userspace reference
+        // to the header exists (only the data range is ever lent).
+        unsafe { std::ptr::write(reservation.header, header) };
+        let frame = &mut self.metadata.tx_frames_mut()[reservation.frame_index];
         if let Err(error) = frame.ownership.publish() {
             // The ring status is still AVAILABLE, so the kernel never sees
-            // the copied bytes. Roll the frame back to Available instead of
-            // leaving it Prepared, which would make it a silent permanent
-            // Unavailable; the caller reports the error as a fault.
+            // the frame. Roll it back to Available instead of leaving it
+            // Prepared, which would make it a silent permanent Unavailable;
+            // the caller reports the error as a fault.
             let _ = frame.ownership.cancel_prepared();
             return Err(MappingAccessError::Ownership(error));
         }
-        self.mapping
-            .store_status_release(status_offset, TP_STATUS_SEND_REQUEST)
+        // SAFETY: `tx_prepare` proved (through checked_address) a live,
+        // 4-byte-aligned status word inside this port's mapping, which
+        // outlives `self`; `align_of::<u32>() == align_of::<AtomicU32>()`.
+        // Userspace touches status words only atomically, and the kernel
+        // accesses them atomically too. This Release store hands the
+        // completely written header and payload to the kernel.
+        unsafe { AtomicU32::from_ptr(reservation.status.as_ptr()) }
+            .store(TP_STATUS_SEND_REQUEST, Ordering::Release);
+        let frame_count = self.tx_frame_count();
+        let state = &mut self.tx_state;
+        state.producer_head = (state.producer_head + 1) % frame_count;
+        state.in_flight += 1;
+        bump(&mut self.counters.tx_published);
+        let in_flight = self.tx_state.in_flight as u64;
+        if in_flight > self.counters.tx_inflight_high_water {
+            self.counters.tx_inflight_high_water = in_flight;
+        }
+        Ok(())
+    }
+
+    /// Returns an orphaned Prepared frame (its lease was forgotten) to
+    /// Available. Only callable while no slot can be live (`&mut self` of
+    /// the port, reached through an exclusively borrowed engine).
+    fn tx_reclaim_orphan(&mut self, frame_index: usize) -> bool {
+        let frame = &mut self.metadata.tx_frames_mut()[frame_index];
+        if frame.ownership.owner() == TxOwnership::Prepared
+            && frame.ownership.cancel_prepared().is_ok()
+        {
+            bump(&mut self.counters.tx_orphans_reclaimed);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns a prepared, unpublished frame to Available. Its status word
+    /// was never changed, so the kernel cannot have seen it.
+    fn tx_cancel(&mut self, reservation: TxReservation) {
+        let frame = &mut self.metadata.tx_frames_mut()[reservation.frame_index];
+        let _ = frame.ownership.cancel_prepared();
     }
 
     fn tx_metadata(&self, frame_index: usize) -> &crate::boundary::TxFrameMetadata {
@@ -612,9 +759,11 @@ pub(crate) struct TxPayload<'p> {
 }
 
 impl<'p> TxPayload<'p> {
-    /// Borrows caller-owned bytes. TX frame bytes are never lent out of
-    /// `sys`, so a slice obtained through any production API cannot overlap
-    /// a TX frame.
+    /// Borrows caller-owned bytes. TX frame bytes are lent out of `sys` only
+    /// to a generated slot (AP3), which exclusively borrows the engine for
+    /// its whole life, so no slice of a TX frame can exist while a payload
+    /// is submitted: a slice obtained through any production API cannot
+    /// overlap a TX frame here.
     pub(crate) fn from_slice(bytes: &'p [u8]) -> Self {
         Self {
             source: NonNull::from(bytes).cast::<u8>(),
@@ -641,6 +790,27 @@ impl<'p> TxPayload<'p> {
             len,
             _borrow: PhantomData,
         }
+    }
+}
+
+/// A Prepared producer-head frame: every address checked, nothing written.
+pub(crate) struct TxReservation {
+    frame_index: usize,
+    generation: u64,
+    header: *mut Tpacket3Hdr,
+    data: NonNull<u8>,
+    /// Checked, aligned status word of the frame.
+    status: NonNull<u32>,
+    len: usize,
+}
+
+impl TxReservation {
+    pub(crate) const fn data(&self) -> NonNull<u8> {
+        self.data
+    }
+
+    pub(crate) const fn len(&self) -> usize {
+        self.len
     }
 }
 
@@ -727,14 +897,18 @@ struct TxPortState {
 
 #[allow(dead_code)]
 impl<O: PacketOps> PacketRingResources<O> {
-    fn tx_submit(
+    /// Reject-before-reserve checks of the producer head for a `len`-byte
+    /// frame, then [`Self::tx_prepare`]. A rejection reads at most one status
+    /// word and reserves, copies, and writes nothing.
+    fn tx_reserve(
         &mut self,
-        payload: TxPayload<'_>,
+        len: usize,
         status_reads: &mut usize,
-    ) -> Result<TxSubmission, TxSubmitError> {
-        if payload.len > self.max_frame_len {
+    ) -> Result<TxReservation, TxSubmitError> {
+        if len > self.max_frame_len {
+            bump(&mut self.counters.tx_oversize);
             return Err(TxSubmitError::Oversize {
-                length: payload.len,
+                length: len,
                 maximum: self.max_frame_len,
             });
         }
@@ -746,37 +920,102 @@ impl<O: PacketOps> PacketRingResources<O> {
         #[cfg(test)]
         self.probe
             .record(|counts| counts.tx_submit_status_reads += 1);
-        let status = self
-            .load_tx_status(frame_index)
-            .map_err(TxSubmitError::Mapping)?;
+        let status = match self.load_tx_status(frame_index) {
+            Ok(status) => status,
+            Err(error) => {
+                bump(&mut self.counters.tx_faults);
+                return Err(TxSubmitError::Mapping(error));
+            }
+        };
         match status {
             TP_STATUS_AVAILABLE => {}
             TP_STATUS_SEND_REQUEST | TP_STATUS_SENDING | TP_STATUS_WRONG_FORMAT => {
+                bump(&mut self.counters.tx_ring_full);
                 return Err(TxSubmitError::Unavailable { status });
             }
-            _ => return Err(TxSubmitError::InvalidStatus { status }),
+            _ => {
+                bump(&mut self.counters.tx_faults);
+                return Err(TxSubmitError::InvalidStatus { status });
+            }
+        }
+        if self.tx_metadata(frame_index).ownership.owner() == TxOwnership::Prepared {
+            // A Prepared frame is lent only to a generated slot, which
+            // exclusively borrows the engine; reaching this call means that
+            // borrow is over, so the slot was forgotten (`mem::forget`)
+            // without a terminal action. Its status word was never written,
+            // so the kernel never saw it: return it to Available.
+            self.tx_reclaim_orphan(frame_index);
         }
         let metadata = self.tx_metadata(frame_index);
         if metadata.ownership.owner() != TxOwnership::Available {
+            bump(&mut self.counters.tx_ring_full);
             return Err(TxSubmitError::Unavailable { status });
         }
-        let generation = metadata
-            .generation
-            .checked_add(1)
-            .ok_or(TxSubmitError::GenerationExhausted { frame_index })?;
-        self.publish_tx_frame(frame_index, payload, generation)
-            .map_err(|error| match error {
+        let Some(generation) = metadata.generation.checked_add(1) else {
+            bump(&mut self.counters.tx_faults);
+            return Err(TxSubmitError::GenerationExhausted { frame_index });
+        };
+        self.tx_prepare(frame_index, len, generation)
+            .map_err(|error| {
+                bump(&mut self.counters.tx_faults);
+                match error {
+                    MappingAccessError::Ownership(source) => TxSubmitError::Ownership(source),
+                    source => TxSubmitError::Mapping(source),
+                }
+            })
+    }
+
+    /// Publishes a reservation; a failure is a fault and leaves the frame
+    /// Available and unseen by the kernel.
+    fn tx_commit(&mut self, reservation: TxReservation) -> Result<TxSubmission, TxSubmitError> {
+        let submission = TxSubmission {
+            frame_index: reservation.frame_index,
+            generation: reservation.generation,
+        };
+        self.tx_publish(reservation).map_err(|error| {
+            bump(&mut self.counters.tx_faults);
+            match error {
                 MappingAccessError::Ownership(source) => TxSubmitError::Ownership(source),
                 source => TxSubmitError::Mapping(source),
-            })?;
-        let frame_count = self.tx_frame_count();
-        let state = &mut self.tx_state;
-        state.producer_head = (state.producer_head + 1) % frame_count;
-        state.in_flight += 1;
-        Ok(TxSubmission {
-            frame_index,
-            generation,
-        })
+            }
+        })?;
+        Ok(submission)
+    }
+
+    fn tx_submit(
+        &mut self,
+        payload: TxPayload<'_>,
+        status_reads: &mut usize,
+    ) -> Result<TxSubmission, TxSubmitError> {
+        let reservation = self.tx_reserve(payload.len, status_reads)?;
+        // SAFETY: `tx_prepare` proved (through ring_address) that
+        // `data..+len` lies inside this backend-owned TX frame of the live
+        // mapping, and Prepared ownership with status AVAILABLE excludes the
+        // kernel. `TxPayload`'s constructor contract makes the source
+        // readable for `len` bytes, free of any live `&mut` alias, and
+        // disjoint from every TX extent: an RX source lies in an RX extent,
+        // which the checked combined-mapping layout (`CombinedRingExtents`,
+        // RX `[0, rx_len)`, TX `[rx_len, combined_len)`) keeps disjoint from
+        // the TX extent of the same mapping, other ports own separate
+        // mappings, and TX frame bytes are lent out of `sys` only to a
+        // generated slot, which exclusively borrows the engine and so cannot
+        // coexist with this call. The ranges therefore cannot overlap. This
+        // is the accepted path's single packet-byte copy.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                payload.source.as_ptr(),
+                reservation.data.as_ptr(),
+                payload.len,
+            );
+        }
+        #[cfg(test)]
+        self.probe.record(|counts| {
+            counts.tx_copies += 1;
+            counts.tx_copied_bytes += payload.len;
+        });
+        let submission = self.tx_commit(reservation)?;
+        bump(&mut self.counters.tx_copies);
+        Ok(submission)
     }
 
     fn tx_scan_completions(
@@ -837,6 +1076,7 @@ impl<O: PacketOps> PacketRingResources<O> {
                         });
                     }
                     report.reclaimed += 1;
+                    bump(&mut self.counters.tx_completed);
                     self.tx_advance_completion();
                 }
                 TP_STATUS_WRONG_FORMAT => {
@@ -861,6 +1101,8 @@ impl<O: PacketOps> PacketRingResources<O> {
                         .map_err(TxCompletionError::Mapping)?;
                     report.reclaimed += 1;
                     report.wrong_format += 1;
+                    bump(&mut self.counters.tx_completed);
+                    bump(&mut self.counters.tx_wrong_format);
                     self.tx_advance_completion();
                 }
                 _ => return Err(TxCompletionError::InvalidStatus { status }),
@@ -917,6 +1159,15 @@ pub(crate) struct AfPacketEngine<O: PacketOps = LinuxOps> {
     epoch: u64,
     rx_start: usize,
     limits: WorkLimits,
+    /// Cold scheduling state (AP3): one `pollfd` per port, the loop's clock,
+    /// drain and fault stop, and unknown generated egress.
+    poll_fds: Box<[PollFd]>,
+    now_ms: u64,
+    /// Whether `set_clock` was ever called (retry pacing needs a clock).
+    clock_set: bool,
+    draining: bool,
+    stopped: Option<schedule::StopCause>,
+    generated_unknown_egress: u64,
 }
 
 #[allow(dead_code)]
@@ -934,6 +1185,14 @@ impl<O: PacketOps> AfPacketEngine<O> {
         // Fixed engine storage is allocated before any port acquires a socket.
         let touched_epoch = fixed_tx_storage(entries, 0_u64)?;
         let touched_ports = fixed_tx_storage(entries, usize::MAX)?;
+        let mut poll_fds = fixed_tx_storage(
+            entries,
+            PollFd {
+                fd: -1,
+                events: POLLIN,
+                revents: 0,
+            },
+        )?;
         let mut ports = Vec::new();
         ports
             .try_reserve_exact(entries)
@@ -941,8 +1200,10 @@ impl<O: PacketOps> AfPacketEngine<O> {
                 kind: RingKind::Tx,
                 entries,
             })?;
-        for port in validated_ports.iter().copied() {
-            ports.push(PacketRingResources::open_with_ops(port, ops.clone())?);
+        for (slot, port) in poll_fds.iter_mut().zip(validated_ports.iter().copied()) {
+            let resources = PacketRingResources::open_with_ops(port, ops.clone())?;
+            slot.fd = resources.socket.fd;
+            ports.push(resources);
         }
         Ok(Self {
             table,
@@ -952,6 +1213,12 @@ impl<O: PacketOps> AfPacketEngine<O> {
             epoch: 0,
             rx_start: 0,
             limits: WorkLimits::GEOMETRY_BOUNDED,
+            poll_fds,
+            now_ms: 0,
+            clock_set: false,
+            draining: false,
+            stopped: None,
+            generated_unknown_egress: 0,
         })
     }
 
@@ -1030,10 +1297,13 @@ impl<O: PacketOps> AfPacketEngine<O> {
         for scratch_index in 0..touched_len {
             let port_index = self.touched_ports[scratch_index];
             report.kick_attempted += 1;
-            if let Err(error) = self.ports[port_index].kick_tx() {
+            let now = self.now_ms;
+            if let Err(error) = self.ports[port_index].kick_classified(now, false) {
                 report.kick_failed += 1;
-                if report.first_kick_error.is_none() {
-                    report.first_kick_error = Some(error);
+                // Only a fault-class errno is an error: deferral and link
+                // down leave the kick owed for a later settle.
+                if error.class.is_error() && report.first_kick_error.is_none() {
+                    report.first_kick_error = Some(error.error);
                     report.first_kick_interface = Some(self.ports[port_index].interface);
                 }
             }
@@ -1125,6 +1395,16 @@ impl<O: PacketOps> PacketSocket<O> {
             &1_i32,
             SyscallStage::SetIgnoreOutgoing,
         )
+    }
+
+    /// `PACKET_LOSS = 1`: the kernel marks a TX frame it cannot send as
+    /// AVAILABLE and moves on instead of leaving it WRONG_FORMAT. Without it
+    /// the kernel's TX head stays on the malformed frame while this FIFO
+    /// producer keeps publishing behind it, so the ring would stall until
+    /// the producer wraps around onto frames that never complete.
+    fn set_loss(&mut self) -> Result<(), PlatformError> {
+        self.ops
+            .set_socket_option(self.fd, PACKET_LOSS, &1_i32, SyscallStage::SetLoss)
     }
 
     fn set_ring(
@@ -1268,8 +1548,8 @@ impl<O: PacketOps> MmapRegion<O> {
 
     // Ring status words are the kernel/userspace ownership handoff points, so
     // they are accessed as `AtomicU32` with Acquire/Release ordering rather
-    // than as volatile accesses plus separate fences. Only the RX engine uses
-    // these helpers; the AP1-TX status path is unchanged (follow-up).
+    // than as volatile accesses plus separate fences. The RX engine uses
+    // these helpers; TX status words use the same atomics (AP3).
     fn ring_load_status_acquire(
         &self,
         extents: CombinedRingExtents,
@@ -1321,6 +1601,8 @@ impl<O: PacketOps> MmapRegion<O> {
         Ok(address)
     }
 
+    /// Test-only plain read of a non-status ring word.
+    #[cfg(test)]
     fn read_u32_volatile(&self, offset: usize) -> Result<u32, MappingAccessError> {
         let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
         // SAFETY: checked_address proves a live, aligned 4-byte range. A
@@ -1328,10 +1610,16 @@ impl<O: PacketOps> MmapRegion<O> {
         Ok(unsafe { std::ptr::read_volatile(address.cast::<u32>()) })
     }
 
+    // TX status words use the same `AtomicU32` Acquire/Release handoff as
+    // the RX ring helpers above.
     fn load_status_acquire(&self, offset: usize) -> Result<u32, MappingAccessError> {
-        let status = self.read_u32_volatile(offset)?;
-        fence(Ordering::Acquire);
-        Ok(status)
+        let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
+        // SAFETY: checked_address proved a live 4-byte range aligned to
+        // `align_of::<u32>() == align_of::<AtomicU32>()`. The mapping
+        // outlives this call, and userspace never accesses a status word
+        // non-atomically.
+        let status = unsafe { AtomicU32::from_ptr(address.cast::<u32>()) };
+        Ok(status.load(Ordering::Acquire))
     }
 
     fn store_status_release(
@@ -1340,10 +1628,10 @@ impl<O: PacketOps> MmapRegion<O> {
         status: u32,
     ) -> Result<(), MappingAccessError> {
         let address = self.checked_address(offset, size_of::<u32>(), align_of::<u32>())?;
-        fence(Ordering::Release);
-        // SAFETY: checked_address proves a live, aligned 4-byte range and
-        // `&mut self` excludes any simultaneous userspace mutable access.
-        unsafe { std::ptr::write_volatile(address.cast::<u32>(), status) };
+        // SAFETY: as in load_status_acquire; `&mut self` additionally
+        // excludes any simultaneous userspace access through this owner.
+        let word = unsafe { AtomicU32::from_ptr(address.cast::<u32>()) };
+        word.store(status, Ordering::Release);
         Ok(())
     }
 
@@ -1379,6 +1667,11 @@ impl<O: PacketOps> Drop for MmapRegion<O> {
     }
 }
 
+/// Saturating counter increment.
+pub(crate) fn bump(counter: &mut u64) {
+    *counter = counter.saturating_add(1);
+}
+
 fn last_error(stage: SyscallStage) -> PlatformError {
     let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(5);
     PlatformError::Syscall {
@@ -1408,6 +1701,25 @@ unsafe extern "C" {
     fn munmap(address: *mut c_void, length: usize) -> c_int;
     fn send(socket: c_int, buffer: *const c_void, length: usize, flags: c_int) -> isize;
     fn close(fd: c_int) -> c_int;
+    fn poll(fds: *mut c_void, count: std::ffi::c_ulong, timeout: c_int) -> c_int;
+    fn getsockopt(
+        socket: c_int,
+        level: c_int,
+        option_name: c_int,
+        option_value: *mut c_void,
+        option_len: *mut u32,
+    ) -> c_int;
+    fn sysconf(name: c_int) -> std::ffi::c_long;
+}
+
+/// The system page size (`sysconf(_SC_PAGESIZE)`), for ring geometry.
+pub(crate) fn page_size() -> Result<usize, PlatformError> {
+    // SAFETY: `sysconf` takes no pointer arguments.
+    let value = unsafe { sysconf(SC_PAGESIZE) };
+    match usize::try_from(value) {
+        Ok(size) if size.is_power_of_two() => Ok(size),
+        _ => Err(PlatformError::UapiLayoutMismatch),
+    }
 }
 
 #[cfg(test)]
@@ -1582,6 +1894,21 @@ mod tests {
             self.fail_if_requested(SyscallStage::Kick)
         }
 
+        fn poll(
+            &mut self,
+            _fds: &mut [crate::sys::PollFd],
+            _timeout_ms: c_int,
+        ) -> Result<usize, PlatformError> {
+            Ok(0)
+        }
+
+        fn packet_statistics(
+            &mut self,
+            _fd: RawFd,
+        ) -> Result<crate::sys::TpacketStatsV3, PlatformError> {
+            Ok(crate::sys::TpacketStatsV3::default())
+        }
+
         fn unmap(&mut self, _base: NonNull<u8>, len: usize) {
             self.0.borrow_mut().calls.push(ScriptedCall::Unmap(len));
         }
@@ -1748,6 +2075,7 @@ mod tests {
             SyscallStage::Socket,
             SyscallStage::SetVersion,
             SyscallStage::SetIgnoreOutgoing,
+            SyscallStage::SetLoss,
             SyscallStage::SetRxRing,
             SyscallStage::SetTxRing,
             SyscallStage::Mmap,
@@ -1794,6 +2122,8 @@ mod tests {
                 ScriptedCall::Socket,
                 ScriptedCall::Set(SyscallStage::SetVersion),
                 ScriptedCall::Set(SyscallStage::SetIgnoreOutgoing),
+                // PACKET_LOSS before the rings: the kernel refuses it after.
+                ScriptedCall::Set(SyscallStage::SetLoss),
                 ScriptedCall::Set(SyscallStage::SetRxRing),
                 ScriptedCall::Set(SyscallStage::SetTxRing),
                 ScriptedCall::Map(8_192),
@@ -2198,6 +2528,21 @@ mod tests {
         fn kick(&mut self, _fd: RawFd) -> Result<(), PlatformError> {
             self.kicks.set(self.kicks.get() + 1);
             Ok(())
+        }
+
+        fn poll(
+            &mut self,
+            _fds: &mut [crate::sys::PollFd],
+            _timeout_ms: c_int,
+        ) -> Result<usize, PlatformError> {
+            Ok(0)
+        }
+
+        fn packet_statistics(
+            &mut self,
+            _fd: RawFd,
+        ) -> Result<crate::sys::TpacketStatsV3, PlatformError> {
+            Ok(crate::sys::TpacketStatsV3::default())
         }
 
         fn unmap(&mut self, _base: NonNull<u8>, _len: usize) {}

@@ -82,21 +82,32 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
-- `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backendのchecked configuration、
-  fixed IfId mapping、ring ownership/UAPI scaffold。combined mmapのRX/TX extentを
-  overlap/gap/overflow/実address alignmentまで検証し、後続state machine用metadataを
+- `ruster-io-afpacket`: Linux AF_PACKET/TPACKET_V3 backend（AF_XDPに対するdebug/fallback
+  backend）。checked configuration、fixed IfId mapping、ring ownership/UAPI scaffold。combined
+  mmapのRX/TX extentをoverlap/gap/overflow/実address alignmentまで検証し、metadataを
   resource取得前のcold pathで固定長preallocateする。内部TX engineはfixed frameへexact
   one-copyでpublishし、FIFO completionとendpoint単位のnonblocking kickをboundedに処理する。
   内部RX engineはpersistent block cursorでUSER blockを検証してからzero-copy leaseを貸す。
   AP2では全portのRX/TXを一つのprivate engineへ統合し、core `PacketIo`のcopy backendとして
   RX leaseをin-placeで借用させ、受理時だけ任意port(ingress自身のhairpinを含む)のTX frameへ
   exactly one copyする。reusable copy conformance suiteをscripted syscall上の実engineで実行する。
-  64-bit Linux、SOCK_RAW Ethernet II、PACKET_RESERVEなしのstrict profileで、TX
-  requestのretire timeout/private/feature fieldsはzeroに限定する。RX private areaは
-  kernel同様に8-byte alignした`BLK_PLUS_PRIV`を使い、宣言した最大Ethernet frameを
-  block内で切り詰めず保持できるgeometryだけを許す。Linux syscallとtest scriptは
-  privateなstatic dispatch seamを共有するが、public live constructor/adapter、zero-copy
-  TX mode、poll、cleanup/stats、実NIC/netns E2E、throughputを主張する段階ではない。
+  AP3のpublic `AfPacketIo::open(ValidatedConfig)`（64-bit Linux、`CAP_NET_RAW`）はportごとに
+  socket→`PACKET_VERSION`→`PACKET_IGNORE_OUTGOING`→`PACKET_LOSS`→RX/TX ring→combined
+  mmap→`bind`を一つのfailure-atomic transactionで組み立てる（promiscuous、fanout、qdisc
+  bypassなし）。`receive`/`begin_generated`/quiescence checkはbatchを開く前にTX completionを
+  boundedに回収し、kickを借りたport（kick失敗、またはkernelがSEND_REQUESTのまま残したframe）を
+  `set_clock`のloop clockで1 msから64 msへ倍増するbackoffでretryする。kick errnoは
+  `EAGAIN`/`ENOBUFS`/`EINTR`/`EBUSY`がdeferred、`ENETDOWN`がlink downでどちらもerrorに
+  しない。`ENXIO`（bind先deviceの削除）は恒久なのでbatch errorでportを`unbound`にしretryしない。core `GeneratedPacketIo`のframeはegress TX ringのframeそのもの（zero化して貸し、copy
+  なし）。`PublicationQuiescence`はin-flight TXが無いときだけguardを返し、`wait_rx`は全socketの
+  `poll(2)`によるidle wait、`BackendStats`（OBS-028）は固定順のport合計counter（kernel
+  `PACKET_STATISTICS`はcoldな`refresh_kernel_stats`だけが累積）、`drain`はI/Oを恒久停止して
+  強制kickで回収する。completion ringの不正statusはengineを恒久停止する（fail closed）。
+  AF_PACKETはAF_XDPと違いframeをkernelから奪わずcopyを受け取るだけなので、portにkernelの
+  address/route/forwardingを持たせてはならない。TPACKET_V3のblock retireのため、idle時の単発
+  frameは最大RX `retire_timeout_ms`遅れる。privileged smokeは`scripts/priv-afpacket-smoke.sh`
+  （専用netns内のveth二組、`RUSTER_PRIV_AFPACKET=1`）。`ruster run`からの選択
+  （`backend.kind = "af-packet"`、AFPKT-015）、実NIC E2E、throughputは次slice以降。
 - `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
   UMEM layout、descriptor境界、nonzero generation token、frame state ledger、
   fixed-storage ring、authoritative ledgerと結合したfinite fake kernelを持つ。
@@ -1088,11 +1099,26 @@ checkです。musl向けartifactのlink、test実行、実NICでのruntime compa
 MIRIFLAGS=-Zmiri-strict-provenance cargo +nightly miri test -p ruster-io-xdp-native --lib
 ```
 
+`ruster-io-afpacket`のscripted syscall test（AP3のscheduling testを含む）も任意でMiriで確認できます。
+test harnessがmapping addressを整数で持つためpermissive provenanceで実行します（CI gateではありません）。
+
+```bash
+MIRIFLAGS=-Zmiri-permissive-provenance cargo +nightly miri test -p ruster-io-afpacket --lib
+```
+
 AF_XDP native session/XDP attachのprivileged smokeは`sudo -n`が使えるLinux 5.9以上のhost
 （`ip`はlibbpf付きiproute2、`python3`が必要）で明示的に実行します（CIでは下の`XDP veth` job）。
 
 ```bash
 scripts/priv-xdp-smoke.sh
+```
+
+AF_PACKET live adapterのprivileged smoke（AP3）は`sudo -n`と`ip`、`python3`があるLinuxで
+`scripts/priv-afpacket-smoke.sh`です（CIでは同じ`XDP veth` jobの一step）。専用netns内だけに
+veth二組を作り、netnsを必ず削除します。
+
+```bash
+scripts/priv-afpacket-smoke.sh
 ```
 
 `ruster run`のprivileged E2Eは`scripts/priv-run-smoke.sh`です（同じ前提に加え`ethtool`）。

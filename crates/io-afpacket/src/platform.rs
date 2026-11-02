@@ -26,6 +26,21 @@ impl AfPacketPlatform {
     pub fn ensure_supported() -> Result<UapiLayout, PlatformError> {
         platform_uapi_layout()
     }
+
+    /// The system page size, the unit of RX/TX block sizes.
+    pub fn page_size() -> Result<usize, PlatformError> {
+        platform_page_size()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn platform_page_size() -> Result<usize, PlatformError> {
+    crate::sys::page_size()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_page_size() -> Result<usize, PlatformError> {
+    Err(PlatformError::UnsupportedPlatform)
 }
 
 #[cfg(target_os = "linux")]
