@@ -8632,9 +8632,11 @@ impl<'a> Nat44TcpRuntime<'a> {
     /// on, and each activity list stays in expiry order: a slot pushed to a
     /// tail gets `now` + the list's TTL, the largest expiry on that list.
     ///
-    /// An outbound initial SYN that restarts a FIN-closed session starts an
-    /// outbound-initiated connection, so the session stops counting as
-    /// externally created.
+    /// A restart of a FIN-closed session by the inside host is a new
+    /// connection: an outbound initial SYN makes it outbound-initiated (it
+    /// stops counting as externally created); an outbound SYN-ACK makes it
+    /// remote-initiated (it counts, unless it is a hairpin inbound half,
+    /// whose remote is the public address).
     ///
     /// # Errors
     ///
@@ -8654,8 +8656,12 @@ impl<'a> Nat44TcpRuntime<'a> {
         let was_established = session.phase() == Nat44TcpSessionPhase::Established;
         let transition = next_state(session.state, segment, direction, policy.inbound_rst);
         session.state = transition.state;
-        if transition.restarted {
-            session.external_inbound = false;
+        match transition.restart {
+            Some(Nat44TcpDirection::Outbound) => session.external_inbound = false,
+            Some(Nat44TcpDirection::Inbound) => {
+                session.external_inbound = session.remote_address != self.config.public_address;
+            }
+            None => {}
         }
         session.last_activity_ms = now_ms;
         let established = session.phase() == Nat44TcpSessionPhase::Established;

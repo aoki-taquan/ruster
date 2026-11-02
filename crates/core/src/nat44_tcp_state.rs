@@ -185,10 +185,12 @@ pub(crate) const fn phase_of(state: u8) -> Nat44TcpSessionPhase {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Nat44TcpTransition {
     pub(crate) state: u8,
-    /// The segment was an outbound initial SYN on a session closed by FIN
-    /// in both directions: the flags were cleared first (a new connection
-    /// on the same 5-tuple, created by the inside host).
-    pub(crate) restarted: bool,
+    /// The segment restarted a session closed by FIN in both directions as
+    /// a new connection on the same 5-tuple; the value is the side that
+    /// initiated it: `Outbound` for an outbound initial SYN (the inside host
+    /// reconnects), `Inbound` for an outbound SYN-ACK (the inside host
+    /// accepted a new SYN from the remote).
+    pub(crate) restart: Option<Nat44TcpDirection>,
 }
 
 /// The session state after `segment` from `direction` is committed on a
@@ -205,12 +207,17 @@ pub(crate) struct Nat44TcpTransition {
 ///   other than a RST packet is received ... The state is moved to
 ///   ESTABLISHED"; here: back to the phase the flags describe, SYN
 ///   included).
-/// - An outbound initial SYN on a session closed by FIN in both directions
-///   starts a new connection on the same 5-tuple (reopen from TIME-WAIT,
-///   RFC 1122 §4.2.2.13): the flags are cleared first. Inbound SYNs never
+/// - On a session closed by FIN in both directions, a new connection on
+///   the same 5-tuple (reopen from TIME-WAIT, RFC 1122 §4.2.2.13) clears
+///   the flags first, but only on evidence from the inside host: an
+///   outbound initial SYN (the inside reconnects), or an outbound SYN-ACK
+///   (the inside accepted a new SYN from the remote; the remote's SYN is
+///   recorded for the new connection). Inbound segments alone never
 ///   restart a session: they can be spoofed.
 /// - SYN, ACK, and FIN are recorded for the sending direction (with the
-///   corroboration rules of [`Nat44TcpInboundRst::Corroborate`]).
+///   corroboration rules of [`Nat44TcpInboundRst::Corroborate`]: there an
+///   inbound FIN is unconfirmed until a later outbound FIN or RST, whatever
+///   the order of the two FINs).
 pub(crate) const fn next_state(
     state: u8,
     segment: Nat44TcpSegment,
@@ -229,14 +236,22 @@ pub(crate) const fn next_state(
         };
         return Nat44TcpTransition {
             state,
-            restarted: false,
+            restart: None,
         };
     }
     let mut next = state & !STATE_RESET;
-    let restarted = outbound && segment.is_initial_syn() && fin_closed(next);
-    if restarted {
+    let syn_ack = segment.flags & (TCP_SYN | TCP_ACK | TCP_RST | TCP_FIN) == TCP_SYN | TCP_ACK;
+    let restart = if !outbound || !fin_closed(next) {
+        None
+    } else if segment.is_initial_syn() {
         next = 0;
-    }
+        Some(Nat44TcpDirection::Outbound)
+    } else if syn_ack {
+        next = STATE_SYN_IN;
+        Some(Nat44TcpDirection::Inbound)
+    } else {
+        None
+    };
     let (syn, ack, fin) = if outbound {
         (STATE_SYN_OUT, STATE_ACK_OUT, STATE_FIN_OUT)
     } else {
@@ -252,15 +267,18 @@ pub(crate) const fn next_state(
         if outbound {
             next = (next | fin) & !STATE_FIN_IN_UNCONFIRMED;
         } else if next & STATE_FIN_IN == 0 {
+            // The first inbound FIN. A repeated one never re-arms the
+            // confirmation of a confirmed FIN and leaves an unconfirmed one
+            // waiting for the same outbound FIN or RST.
             next |= fin;
-            if corroborate && next & STATE_FIN_OUT != 0 {
+            if corroborate {
                 next |= STATE_FIN_IN_UNCONFIRMED;
             }
         }
     }
     Nat44TcpTransition {
         state: next,
-        restarted,
+        restart,
     }
 }
 
@@ -495,18 +513,18 @@ mod tests {
                 let transition =
                     next_state(state, Nat44TcpSegment::from_flags(flags), direction, policy);
                 state = transition.state;
-                restarts.push(transition.restarted);
+                restarts.push(transition.restart);
             }
             if policy == RFC {
-                assert_eq!(restarts, [false, false, false, false, false, true]);
+                assert_eq!(restarts, [None, None, None, None, None, Some(Outbound)]);
                 assert_eq!(state, STATE_SYN_OUT);
             } else {
                 // Inside closed first: the inbound FIN is unconfirmed, so
                 // the session is not closed and the SYN does not restart.
-                assert!(!restarts[5]);
+                assert_eq!(restarts[5], None);
             }
         }
-        // An inbound SYN never restarts (it can be spoofed).
+        // An inbound SYN alone never restarts (it can be spoofed).
         let mut segments = closed.to_vec();
         segments.push((SYN, Inbound));
         assert_eq!(phases(&segments)[5], Closing);
@@ -516,6 +534,75 @@ mod tests {
         let (phases_seen, state) = run(RFC, &segments);
         assert_eq!(phases_seen[3..], [Closing, Established]);
         assert_ne!(state & STATE_ACK_BOTH, 0);
+    }
+
+    /// Review L-new-2: a remote reconnect on the same 5-tuple after a FIN
+    /// close restarts when the inside host answers with a SYN-ACK (the
+    /// inbound SYN alone does not), and the new connection establishes.
+    #[test]
+    fn an_inside_syn_ack_restarts_a_fin_closed_session_for_a_remote_reconnect() {
+        let mut segments = OPEN_OUT.to_vec();
+        segments.extend([(FIN_ACK, Outbound), (FIN_ACK, Inbound), (ACK, Outbound)]);
+        segments.extend([(SYN, Inbound), (SYN_ACK, Outbound), (ACK, Inbound)]);
+        assert_eq!(
+            phases(&segments)[5..],
+            [Closing, Closing, Opening, Established]
+        );
+        let mut state = 0;
+        for &(flags, direction) in &segments[..6] {
+            state = next_state(state, Nat44TcpSegment::from_flags(flags), direction, RFC).state;
+        }
+        let transition = next_state(state, Nat44TcpSegment::from_flags(SYN_ACK), Outbound, RFC);
+        assert_eq!(transition.restart, Some(Inbound));
+        assert_eq!(
+            transition.state,
+            STATE_SYN_IN | STATE_SYN_OUT | STATE_ACK_OUT
+        );
+        // Corroborate: the remote-first close is confirmed by the inside
+        // FIN, the restart works the same, and establishing needs an inside
+        // ACK without SYN.
+        let mut segments = OPEN_OUT.to_vec();
+        segments.extend([(FIN_ACK, Inbound), (FIN_ACK, Outbound), (ACK, Inbound)]);
+        segments.extend([
+            (SYN, Inbound),
+            (SYN_ACK, Outbound),
+            (ACK, Inbound),
+            (ACK, Outbound),
+        ]);
+        assert_eq!(
+            run(STRICT, &segments).0[5..],
+            [Closing, Closing, Opening, Opening, Established]
+        );
+    }
+
+    /// Review L-new-1: under corroboration every inbound FIN is unconfirmed
+    /// until an outbound FIN or RST follows, whichever side closed first; a
+    /// later real FIN is not lost behind the first one. Without sequence
+    /// numbers an early spoofed FIN followed by a genuine inside half-close
+    /// looks exactly like a remote-first close (inbound FIN, then outbound
+    /// FIN), so it still closes: that ordering is the documented residual.
+    #[test]
+    fn under_corroboration_every_inbound_fin_waits_for_an_outbound_fin_or_rst() {
+        let mut spoofed = OPEN_OUT.to_vec();
+        spoofed.push((FIN_ACK, Inbound));
+        let (phases_seen, state) = run(STRICT, &spoofed);
+        assert_eq!(phases_seen[3], Established);
+        assert_ne!(state & STATE_FIN_IN_UNCONFIRMED, 0);
+        // Data and ACKs in both directions do not confirm it.
+        let mut traffic = spoofed.to_vec();
+        traffic.extend([(ACK, Outbound), (ACK, Inbound), (ACK, Inbound)]);
+        let (phases_seen, state) = run(STRICT, &traffic);
+        assert_eq!(phases_seen[6], Established);
+        assert_ne!(state & STATE_FIN_IN_UNCONFIRMED, 0);
+        // The remote's later real FIN keeps waiting; the inside FIN closes.
+        let mut real = traffic.to_vec();
+        real.extend([(FIN_ACK, Inbound), (FIN_ACK, Outbound)]);
+        assert_eq!(run(STRICT, &real).0[7..], [Established, Closing]);
+        // The documented residual: the early spoofed FIN, then a genuine
+        // inside half-close, is a remote-first close for the NAT.
+        let mut half_close = spoofed.to_vec();
+        half_close.push((FIN_ACK, Outbound));
+        assert_eq!(run(STRICT, &half_close).0[4], Closing);
     }
 
     #[test]
@@ -545,17 +632,25 @@ mod tests {
                         } else {
                             assert_eq!(next & STATE_RESET, 0);
                         }
-                        // A restart is only an outbound initial SYN on a
-                        // FIN-closed session.
-                        assert_eq!(
-                            transition.restarted,
-                            direction == Outbound
-                                && segment.is_initial_syn()
-                                && fin_closed(state & !STATE_RESET)
-                        );
+                        // A restart is only an outbound initial SYN or
+                        // SYN-ACK on a FIN-closed session.
+                        let closed = direction == Outbound
+                            && flags & TCP_RST == 0
+                            && fin_closed(state & !STATE_RESET);
+                        let control = flags & (TCP_SYN | TCP_ACK | TCP_RST | TCP_FIN);
+                        let expected = if closed && control == TCP_SYN {
+                            Some(Outbound)
+                        } else if closed && control == TCP_SYN | TCP_ACK {
+                            Some(Inbound)
+                        } else {
+                            None
+                        };
+                        assert_eq!(transition.restart, expected);
                         // An established session never leaves the
                         // established phase for opening without a restart.
-                        if phase_of(state & !STATE_RESET) == Established && !transition.restarted {
+                        if phase_of(state & !STATE_RESET) == Established
+                            && transition.restart.is_none()
+                        {
                             assert_ne!(phase_of(next), Opening);
                         }
                         if policy == RFC {

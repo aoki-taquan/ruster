@@ -1239,6 +1239,28 @@ fn a_spoofed_rst_and_syn_do_not_downgrade_an_established_connection() {
     world.out(PORT, ACK, 1_003 + TRANSITORY + 1_000 + ESTABLISHED - 1);
 }
 
+/// Review L-new-2 through the full worker: after a FIN close, the remote
+/// reconnects on the same 5-tuple; the inside SYN-ACK restarts the session,
+/// which becomes established and outlives every transitory timer.
+#[test]
+fn a_remote_reconnect_after_a_fin_close_gets_the_established_timer() {
+    let mut world = World::new(Setup::default());
+    world.handshake(0);
+    world.out(PORT, FIN_ACK, 1);
+    world.inbound(FIN_ACK, 2);
+    world.out(PORT, ACK, 3);
+    world.inbound(SYN, 10);
+    world.out(PORT, SYN_ACK, 11);
+    world.inbound(ACK, 12);
+    world.out(PORT, ACK, 13);
+    assert_eq!(
+        world.tcp.sessions()[0].phase(),
+        ruster_core::Nat44TcpSessionPhase::Established
+    );
+    assert!(world.tcp.sessions()[0].is_external_inbound());
+    world.inbound(ACK, 13 + TRANSITORY + 1_000);
+}
+
 /// RFC 7857 §2.2: a RST is translated and the session kept for the closing
 /// timeout; a later non-RST segment returns it to the established phase.
 /// An injected RST therefore never ends a session earlier than the closing

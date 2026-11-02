@@ -470,6 +470,21 @@ fn hairpin_halves_track_both_sessions() {
         }
         assert!(runtime.session_is_live(runtime.sessions[s1], 5 + CLOSING - 1));
         assert!(!runtime.session_is_live(runtime.sessions[s1], 5 + CLOSING));
+        // X1 reconnects on the same tuples: its SYN restarts X1's session
+        // (outbound initial SYN), X2's SYN-ACK restarts X2's (an inside
+        // SYN-ACK). Neither counts as externally created: X2's remote is
+        // the public address (hairpin, exempt as at creation).
+        hairpin(&mut runtime, x1, p2, SYN, 6);
+        hairpin(&mut runtime, x2, p1, SYN_ACK, 7);
+        hairpin(&mut runtime, x1, p2, ACK, 8);
+        for session in [s1, s2] {
+            assert_eq!(
+                runtime.sessions[session].phase(),
+                Nat44TcpSessionPhase::Established
+            );
+            assert!(!runtime.sessions[session].external_inbound);
+        }
+        assert_eq!(runtime.occupancy().external_inbound_sessions.occupied(), 0);
     });
 }
 
@@ -959,6 +974,47 @@ fn an_outbound_restart_of_an_external_session_stops_counting_it() {
         );
         assert!(!runtime.sessions[session].external_inbound);
         assert_eq!(runtime.occupancy().external_inbound_sessions.occupied(), 0);
+    });
+}
+
+/// Review L-new-2: after a FIN close, a remote reconnect on the same
+/// 5-tuple (SYN in, inside SYN-ACK, ACK in, ACK out) restarts on the inside
+/// SYN-ACK, becomes established, and stays live past every transitory
+/// timer. The new connection was initiated by the remote, so it counts as
+/// externally created (per-remote quota and occupancy).
+#[test]
+fn a_remote_reconnect_after_a_fin_close_establishes_and_counts_as_external() {
+    with_config(timer_policy(), 40_000, 40_000, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 1];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let (mapping, session) = handshake(&mut runtime, HOST, PEER, 0);
+        let port = runtime.mappings[mapping].public_port;
+        out(&mut runtime, HOST, PEER, FIN_ACK, 1).unwrap();
+        inbound(&mut runtime, port, PEER, FIN_ACK, 2).unwrap();
+        out(&mut runtime, HOST, PEER, ACK, 3).unwrap();
+        assert!(!runtime.sessions[session].external_inbound);
+        inbound(&mut runtime, port, PEER, SYN, 10).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Closing
+        );
+        out(&mut runtime, HOST, PEER, SYN_ACK, 11).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Opening
+        );
+        assert!(runtime.sessions[session].external_inbound);
+        assert_eq!(runtime.occupancy().external_inbound_sessions.occupied(), 1);
+        inbound(&mut runtime, port, PEER, ACK, 12).unwrap();
+        out(&mut runtime, HOST, PEER, ACK, 13).unwrap();
+        assert_eq!(
+            runtime.sessions[session].phase(),
+            Nat44TcpSessionPhase::Established
+        );
+        for idle in [CLOSING + 1, OPENING + 1, ESTABLISHED - 1] {
+            assert_eq!(probe(&runtime, port, PEER, 13 + idle), Ok(()), "{idle}");
+        }
     });
 }
 
