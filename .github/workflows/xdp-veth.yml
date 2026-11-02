@@ -10,7 +10,7 @@ name: XDP veth
 #     so every would-be skip is a failure
 # Every veth lives in a dedicated `ruster-*` network namespace that the
 # scripts always delete; nothing is created in the initial namespace and no
-# host interface is touched. Not a required check (owner decision).
+# host interface is touched. Not a required check (owner decision 2e is open).
 
 on:
   push:

@@ -5,7 +5,9 @@
 //!
 //! ```text
 //! ruster-run-stats kind=periodic uptime-ms=60000
-//! observability.generation=1
+//! observer.taken_at=60000
+//! observer.state=healthy
+//! observer.generation=1
 //! ...
 //! af_xdp.ports=2
 //! ...

@@ -2007,7 +2007,7 @@ unmap後のaccessはMiriが検出し、lib testはstrict provenanceのMiriでUB�
 
 X00DはX00Cのbind済みsessionのqueueを、そのsocketへredirectします。libbpf/libxdpにlinkせず、
 `bpf(2)`を同じsealed seam（`native_unsafe/syscall.rs`）から`syscall(SYS_bpf, ...)`で呼びます。
-owner決定は次のとおりです。
+coordinator既定値2c（owner決定ではない）は次のとおりです。
 
 - attachは`bpf_link`（`BPF_LINK_CREATE`、attach type `BPF_XDP`）だけで行い、minimum kernelは
   XDPの`bpf_link`が入った**Linux 5.9**です。netlink（`IFLA_XDP`）attachは使いません。
