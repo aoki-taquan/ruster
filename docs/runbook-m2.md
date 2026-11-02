@@ -359,6 +359,22 @@ forwarding is enabled; detached ports may be forwarded by the kernel` or
 answered and routed by the kernel`. Kernel routes are checked at startup
 only.
 
+TX while a port is down: with the port administratively down (`IFF_UP`
+clear), every TX kick fails `ENETDOWN`, the kernel consumes no TX
+descriptor, and forwards to the port fill its TX ring
+(`if<id>.af_xdp_port.tx_inflight` reaches the ring size, then
+`tx_ring_full`/`tx_blocked` and `rx.tx_rejected` count the frames that no
+longer fit; they are dropped). A
+port that is down is `LINK_DOWN` only: neither `TX_STALL` nor
+`KICK_ERRORS` is timed, whatever the thresholds. When the link returns,
+the held frames are transmitted (they may be stale by then) and the ring
+drains. With only carrier lost (`IFF_LOWER_UP` clear, for example the
+peer down), the kernel consumes and drops the frames instead, so the ring
+does not fill. A cross-port forward also needs a free generated frame of
+the egress port, so with `generated-frames` below the TX ring size the
+copy pool runs out first (`cross_port_copy_unavailable`). The XDP veth
+smoke runs this case (release evidence, criterion 5).
+
 After a fatal device event the summary starts with `stopped after a fatal
 health event port=if<id> code=<CODE>` and the exit status is 1, so
 `Restart=on-failure` restarts with the new device state (after a removal
@@ -522,8 +538,8 @@ CLI-034).
   privilege drop, SIGUSR1 stats, structured logs, systemd notify, opt-in
   "link down / forwarding 0 at exit", state carried across a reload.
 - Verified kernels: the development host and the CI runner only
-  (XDP-062). Router-generated ICMPv4 and a full TX ring have no end-to-end
-  test on a real kernel (release evidence, criteria 2 and 5).
+  (XDP-062). A TX stall with the link up (`TX_STALL`) cannot be produced
+  on veth and is tested only against a scripted kernel (CLI-050).
 
 ## 13. CI and E2E
 
@@ -558,6 +574,17 @@ What it proves, on the runner's kernel only:
   accepted with `--allow-kernel-forwarding`, and only warned while running;
   per-port `conf/<dev>/forwarding` refused (`scope=device`) and warned; an
   undrained stdout FIFO proven full before SIGTERM; SIGKILL and restart.
+  Added by #305 (CI-005 to CI-007): `ruster validate` on every smoke config
+  and an invalid one (exit 2, refused by `run` and by a SIGHUP reload with
+  the same diagnostic), `ruster plan` verdicts that the running router then
+  follows (reloadable applied, restart-required refused with the plan's
+  reasons); router-generated ICMPv4 captured on host A (Echo Reply, Time
+  Exceeded, Destination Unreachable Host, and Network after a reload that
+  permits route misses), checked for type/code, TTL, TOS, checksums and
+  the quote; a full WAN TX ring (port down, 128 of 128 in flight) held past
+  tight fatal thresholds without a fatal and recovered with the held
+  frames delivered and the counters adding up; `observer.state` and
+  `watch.state` in the stats blocks.
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 
@@ -569,9 +596,9 @@ but `1` (an empty value counts as unset). Without the variable a plain
 test binary's `priv_xdp_*` tests differ from the phases it runs.
 
 Not covered: zero-copy NICs, kernels other than the runner's (5.9 to 6.x,
-XDP-062), multi-queue, a full TX ring, router-generated ICMPv4 on the wire,
-`ruster validate`/`plan` on the af-xdp config inside the smoke (covered by
-unit and process tests), and performance (X05).
+XDP-062), multi-queue, a TX stall with the link up (`TX_STALL`; veth
+cannot produce one, CLI-050 uses a scripted kernel), `observer.state`
+`degraded`/`stale` (unit tests only), and performance (X05).
 
 To run the same sequence locally (Linux 5.9+, passwordless `sudo -n`,
 iproute2 with libbpf, `python3`, `ethtool`):
