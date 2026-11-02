@@ -149,7 +149,7 @@ pub trait LinkMonitor {
     fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()>;
 
     /// The IPv4 weak-host exposure of `target`'s port: `Some(true)` if the
-    /// effective `rp_filter` and `arp_ignore` are both 0, `None` if
+    /// effective `rp_filter` is 0, `None` if
     /// unreadable. Cold path, no allocation.
     fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool>;
 }

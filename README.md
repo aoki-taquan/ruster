@@ -612,9 +612,10 @@ sudo kill -HUP <pid>                                               # configをre
   deviceは`disable_ipv6=0`が既定なので、portに`disable_ipv6=1`を設定する（または
   `--allow-kernel-ipv6`）まで起動を拒否します。IPv4の`mc_forwarding`（multicast routing daemon）は
   `KERNEL_FORWARDING_ENABLED scope=multicast`で拒否（`--allow-kernel-forwarding`でwarning）。
-  addressの無いportで実効`rp_filter`と`arp_ignore`が共に0なら`IPV4_WEAK_HOST_EXPOSURE`の
-  warningだけを出します（拒否するかはowner判断待ち。`net.ipv4.conf.all.arp_ignore=1`と
-  `rp_filter=1`を推奨）。
+  addressの無いportで実効`rp_filter`（`all`とdeviceの大きい方）が0なら、detach中はportのMAC宛てに
+  届いたhostの任意のIPv4 address宛てframeがlocalに配送されるので（`arp_ignore`はARP応答を止めるだけで
+  これは防がない）`IPV4_WEAK_HOST_EXPOSURE`のwarningだけを出します（拒否するかはowner判断待ち。
+  `net.ipv4.conf.all.rp_filter=1`（または2）と、助言として`arp_ignore=1`を推奨）。
   `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1（または読めない）なら既定で
   `KERNEL_FORWARDING_ENABLED`（`UNVERIFIABLE probe=forwarding`）で拒否します。router停止中・exit後・
   crash後にport間をfirewall/NAT抜きで運び得るのはkernel forwardingだからで、namespaceの他の

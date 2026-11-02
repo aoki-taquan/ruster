@@ -47,7 +47,7 @@
 //! | `net.ipv4.ip_forward` or `conf/<dev>/forwarding` turns on (procfs, same round) | warning `KERNEL_FORWARDING_ENABLED`, recovered when off; not fatal (see below) |
 //! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` |
 //! | IPv4 `mc_forwarding` (of `all` or the device) turns on | counted with the forwarding sysctls: warning `KERNEL_FORWARDING_ENABLED` |
-//! | the effective `rp_filter` and `arp_ignore` are both 0, or unreadable | warning `IPV4_WEAK_HOST_EXPOSURE`, recovered when either is set; never fatal, never a failed query |
+//! | the effective `rp_filter` (the larger of `all` and the device) is 0, or unreadable | warning `IPV4_WEAK_HOST_EXPOSURE`, recovered when it is 1 or 2; never fatal, never a failed query |
 //! | `disable_ipv6` is 0 on the port (also when it flips while running) | warning `KERNEL_IPV6_ENABLED`, recovered when it is 1 again; not fatal |
 //! | with IPv6 enabled on the port: an IPv6 address outside `fe80::/10`, an IPv6 route out of the port beyond the automatic link-local and multicast ones, `net.ipv6.conf.all.forwarding`, `conf/<dev>/forwarding`, a `force_forwarding`, or an IPv6 `mc_forwarding` on | warnings `KERNEL_IPV6_ADDRESSES`, `KERNEL_IPV6_ROUTES`, `KERNEL_IPV6_FORWARDING_ENABLED`, each recovered when gone (or when `disable_ipv6` turns on); not fatal |
 //! | an IPv6 fact is unreadable (`disable_ipv6`/forwarding sysctls, address or route dump) | a failed query of its kind; with `--allow-kernel-ipv6` a warning `IPV6_UNVERIFIABLE` instead |
@@ -269,7 +269,7 @@ pub enum Condition {
     Ipv6Unverifiable,
     /// IPv6 is enabled on the port (`disable_ipv6 = 0`).
     KernelIpv6Enabled,
-    /// The address-less port has `rp_filter` and `arp_ignore` both 0 (or
+    /// The address-less port has the effective `rp_filter` 0 (or
     /// unreadable): weak-host exposure once detached.
     Ipv4WeakHost,
 }
@@ -433,7 +433,7 @@ pub struct PortHealth {
     pub kernel_ipv6_forwarding: bool,
     /// IPv6 was enabled on the port (`disable_ipv6 = 0`) in the last round.
     pub kernel_ipv6_enabled: bool,
-    /// The last round saw `rp_filter` and `arp_ignore` both 0 (or
+    /// The last round saw the effective `rp_filter` 0 (or
     /// unreadable).
     pub ipv4_weak_host: bool,
     pub warnings: u64,
@@ -711,7 +711,7 @@ impl Watch {
     }
 
     /// Folds the IPv4 weak-host reading of port `index` (`Some(true)`:
-    /// `rp_filter` and `arp_ignore` both 0; `None`: unreadable): a warning
+    /// the effective `rp_filter` 0; `None`: unreadable): a warning
     /// `IPV4_WEAK_HOST_EXPOSURE` unless `Some(false)`, recovered then.
     /// Never fatal and never a failed query: it is advice, not a check.
     pub fn on_weak_host(

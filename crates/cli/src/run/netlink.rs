@@ -16,8 +16,15 @@
 //! the dumps itself: address dumps by `ifa_index`, route dumps by an
 //! `RTA_OIF` attribute (which the kernel matches against every nexthop,
 //! multipath and nexthop objects included, `fib_info_nh_uses_dev` and
-//! `fib6_info_uses_dev`). The userspace match below still runs on every
-//! message (defense in depth). After any failed query the socket is
+//! `fib6_info_uses_dev`). The kernel's filter is trusted only if the dump
+//! says it applied it (`NLM_F_DUMP_FILTERED` on a message of the dump,
+//! which Linux sets on `NLMSG_DONE`); otherwise the dump fails closed
+//! ([`NetlinkError::Unfiltered`]). The userspace match below still runs on
+//! every message (defense in depth). A strict route dump without
+//! `RTM_F_CLONED` lists FIB entries only, so IPv6 cached exceptions (PMTU
+//! and redirect clones) are omitted; that is harmless, because every
+//! exception hangs off a FIB route through the same device, which the dump
+//! does list. After any failed query the socket is
 //! replaced, so an aborted dump never leaves a running dump behind that
 //! would make the next request fail with `EBUSY`.
 //! - Link facts of one interface index through one `RTM_GETLINK` request
@@ -100,6 +107,8 @@ const NLM_F_DUMP: u16 = 0x300;
 /// `NLM_F_DUMP_INTR`: the dump raced a change; its result is not
 /// consistent.
 const NLM_F_DUMP_INTR: u16 = 0x10;
+/// `NLM_F_DUMP_FILTERED`: the kernel applied the dump's filter.
+const NLM_F_DUMP_FILTERED: u16 = 0x20;
 /// `sizeof(struct nlmsghdr)`.
 const HEADER_LEN: usize = 16;
 /// `sizeof(struct ifaddrmsg)`.
@@ -132,6 +141,10 @@ pub enum NetlinkError {
     UnexpectedPort,
     /// A link reply described another interface index than requested.
     UnexpectedLink,
+    /// A filtered dump ended without any message carrying
+    /// `NLM_F_DUMP_FILTERED`: the kernel did not confirm the device
+    /// filter, so the count cannot be trusted.
+    Unfiltered,
 }
 
 impl NetlinkError {
@@ -231,6 +244,8 @@ pub struct Chunk {
     pub done: bool,
     /// A message carried `NLM_F_DUMP_INTR`.
     pub interrupted: bool,
+    /// A message of this dump carried `NLM_F_DUMP_FILTERED`.
+    pub filtered: bool,
 }
 
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
@@ -277,6 +292,9 @@ pub fn parse_chunk(
             }
             if flags & NLM_F_DUMP_INTR != 0 {
                 chunk.interrupted = true;
+            }
+            if flags & NLM_F_DUMP_FILTERED != 0 {
+                chunk.filtered = true;
             }
             match kind {
                 NLMSG_DONE => {
@@ -789,8 +807,7 @@ fn dump_once(
     socket.send(&request[..len])?;
     // The connect bound the socket; its port id names our replies.
     let port = socket.port_id()?;
-    let mut total = 0_u32;
-    let mut interrupted = false;
+    let mut total = Chunk::default();
     loop {
         let received = socket.receive(buffer, true)?;
         if received == 0 {
@@ -800,12 +817,29 @@ fn dump_once(
             return Err(NetlinkError::Truncated);
         }
         let chunk = parse_chunk(&buffer[..received], sequence, port, dump, ifindex)?;
-        total = total.saturating_add(chunk.count);
-        interrupted |= chunk.interrupted;
+        total.count = total.count.saturating_add(chunk.count);
+        total.interrupted |= chunk.interrupted;
+        total.filtered |= chunk.filtered;
         if chunk.done {
-            return Ok((!interrupted).then_some(total));
+            return finish_dump(total);
         }
     }
+}
+
+/// The result of a completed dump (every chunk folded into `total`):
+/// `Ok(None)` if it raced a change (`NLM_F_DUMP_INTR`, retried), the count
+/// otherwise, but only if the kernel confirmed it applied the device filter
+/// of the request (`NLM_F_DUMP_FILTERED`, [`NetlinkError::Unfiltered`]
+/// otherwise: fail closed, an unfiltered dump would be matched only in
+/// userspace).
+pub fn finish_dump(total: Chunk) -> Result<Option<u32>, NetlinkError> {
+    if total.interrupted {
+        return Ok(None);
+    }
+    if !total.filtered {
+        return Err(NetlinkError::Unfiltered);
+    }
+    Ok(Some(total.count))
 }
 
 #[cfg(target_os = "linux")]
@@ -1401,7 +1435,8 @@ mod tests {
             Ok(Chunk {
                 count: 2,
                 done: false,
-                interrupted: false
+                interrupted: false,
+                filtered: false
             })
         );
         datagram.extend(message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes()));
@@ -1412,7 +1447,8 @@ mod tests {
             Ok(Chunk {
                 count: 2,
                 done: true,
-                interrupted: false
+                interrupted: false,
+                filtered: false
             })
         );
         // Another sequence is skipped entirely.
@@ -1420,6 +1456,51 @@ mod tests {
             parse_chunk(&datagram, 8, PORT, V4A, 5),
             Ok(Chunk::default())
         );
+    }
+
+    /// The kernel's device filter is trusted only when the dump says it
+    /// applied it: `NLM_F_DUMP_FILTERED` on `NLMSG_DONE` (as Linux sets it)
+    /// or on a message; a dump without it fails closed.
+    #[test]
+    fn a_dump_without_the_filtered_flag_fails_closed() {
+        let filtered_done = message(
+            NLMSG_DONE,
+            0x2 | NLM_F_DUMP_FILTERED,
+            7,
+            &0_i32.to_ne_bytes(),
+        );
+        let plain_done = message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes());
+        let mut flagged_address = address(2, 5);
+        flagged_address[6..8].copy_from_slice(&(0x2 | NLM_F_DUMP_FILTERED).to_ne_bytes());
+        let finish = |parts: &[&[u8]]| {
+            let mut total = Chunk::default();
+            for part in parts {
+                let chunk = parse_chunk(part, 7, PORT, V4A, 5).expect("parsed");
+                total.count += chunk.count;
+                total.interrupted |= chunk.interrupted;
+                total.filtered |= chunk.filtered;
+            }
+            finish_dump(total)
+        };
+        assert_eq!(finish(&[&address(2, 5), &filtered_done]), Ok(Some(1)));
+        assert_eq!(finish(&[&filtered_done]), Ok(Some(0)), "empty, filtered");
+        assert_eq!(finish(&[&flagged_address, &plain_done]), Ok(Some(1)));
+        assert_eq!(
+            finish(&[&address(2, 5), &plain_done]),
+            Err(NetlinkError::Unfiltered)
+        );
+        assert_eq!(finish(&[&plain_done]), Err(NetlinkError::Unfiltered));
+        // Another sequence's flag does not count.
+        let mut foreign = filtered_done.clone();
+        foreign[8..12].copy_from_slice(&8_u32.to_ne_bytes());
+        assert_eq!(
+            finish(&[&foreign, &plain_done]),
+            Err(NetlinkError::Unfiltered)
+        );
+        // A raced dump is retried whatever its flags.
+        let mut raced = plain_done.clone();
+        raced[6..8].copy_from_slice(&(0x2 | NLM_F_DUMP_INTR).to_ne_bytes());
+        assert_eq!(finish(&[&raced]), Ok(None));
     }
 
     #[test]

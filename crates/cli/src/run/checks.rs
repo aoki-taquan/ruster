@@ -228,8 +228,8 @@ pub struct DeviceFacts {
     /// unreadable.
     pub forwarding_multicast: Option<bool>,
     /// Weak-host exposure of the address-less port: the effective
-    /// `rp_filter` (the larger of `conf/all` and `conf/<dev>`) and the
-    /// effective `arp_ignore` (likewise) are both 0; `None` if unreadable.
+    /// `rp_filter` (the larger of `conf/all` and `conf/<dev>`) is 0;
+    /// `None` if unreadable.
     pub weak_host: Option<bool>,
     /// The kernel IPv6 stack on the device.
     pub ipv6: Ipv6Facts,
@@ -475,8 +475,8 @@ pub struct Warnings {
     pub forwarding_multicast: bool,
     /// A forwarding sysctl could not be read.
     pub forwarding_unreadable: bool,
-    /// `rp_filter` and `arp_ignore` both 0 (or unreadable): weak-host
-    /// exposure while detached (never refused).
+    /// Effective `rp_filter` 0 (or unreadable): weak-host exposure while
+    /// detached (never refused).
     pub weak_host: bool,
     /// Accepted through `--allow-kernel-ipv6`: IPv6 is enabled on the port.
     pub ipv6_enabled: bool,
@@ -586,9 +586,12 @@ impl Warnings {
 ///   address and route refusals still keep the kernel without a connected
 ///   route through the ports.
 /// - IPv4 weak host: an address-less port still receives, while detached,
-///   frames addressed to any local IPv4 address of the host (Linux's weak
-///   host model) and answers ARP for them unless `arp_ignore` is set.
-///   With the effective `rp_filter` and `arp_ignore` both 0 (or
+///   frames sent to its MAC for any local IPv4 address of the host (Linux's
+///   weak host model): with the effective `rp_filter` 0 the source
+///   validation of a device without addresses passes them
+///   (`__fib_validate_source`, the no-address `last_resort` path) and they
+///   are delivered to local sockets; `arp_ignore` only stops ARP replies, so
+///   it does not change this. With the effective `rp_filter` 0 (or
 ///   unreadable) a warning `IPV4_WEAK_HOST_EXPOSURE`, never a refusal
 ///   (whether to refuse is an open owner question, CLI-034).
 /// - Kernel IPv6 ([`evaluate_ipv6`]): refused whenever IPv6 is enabled on
@@ -890,7 +893,6 @@ pub mod linux {
     const IP_FORWARD: &str = "/proc/sys/net/ipv4/ip_forward";
     const IPV4_MC_FORWARDING_ALL: &str = "/proc/sys/net/ipv4/conf/all/mc_forwarding";
     const IPV4_RP_FILTER_ALL: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
-    const IPV4_ARP_IGNORE_ALL: &str = "/proc/sys/net/ipv4/conf/all/arp_ignore";
     const IPV6_FORWARDING_ALL: &str = "/proc/sys/net/ipv6/conf/all/forwarding";
     const IPV6_FORCE_FORWARDING_ALL: &str = "/proc/sys/net/ipv6/conf/all/force_forwarding";
     const IPV6_MC_FORWARDING_ALL: &str = "/proc/sys/net/ipv6/conf/all/mc_forwarding";
@@ -919,11 +921,11 @@ pub mod linux {
         (ipv6_missing && ipv4_present).then_some(true)
     }
 
-    /// Weak-host exposure from `(all, device)` pairs of `rp_filter` and
-    /// `arp_ignore`: the kernel applies the larger value of each pair
-    /// (`IN_DEV_MAXCONF`), and only both effective values 0 are exposed.
-    fn weak_host(rp_filter: (u32, u32), arp_ignore: (u32, u32)) -> bool {
-        rp_filter.0.max(rp_filter.1) == 0 && arp_ignore.0.max(arp_ignore.1) == 0
+    /// Weak-host exposure from the `(all, device)` pair of `rp_filter`:
+    /// the kernel applies the larger value (`IN_DEV_MAXCONF`), and with 0
+    /// a device without addresses accepts frames for any local address.
+    fn weak_host(rp_filter: (u32, u32)) -> bool {
+        rp_filter.0.max(rp_filter.1) == 0
     }
 
     /// The IPv4 procfs facts of one port.
@@ -959,7 +961,6 @@ pub mod linux {
         ipv4_forwarding: PathBuf,
         ipv4_mc_forwarding: PathBuf,
         ipv4_rp_filter: PathBuf,
-        ipv4_arp_ignore: PathBuf,
         ipv6_disable: PathBuf,
         ipv6_forwarding: PathBuf,
         ipv6_force_forwarding: PathBuf,
@@ -976,7 +977,6 @@ pub mod linux {
                 ipv4_forwarding: v4("forwarding"),
                 ipv4_mc_forwarding: v4("mc_forwarding"),
                 ipv4_rp_filter: v4("rp_filter"),
-                ipv4_arp_ignore: v4("arp_ignore"),
                 ipv6_disable: v6("disable_ipv6"),
                 ipv6_forwarding: v6("forwarding"),
                 ipv6_force_forwarding: v6("force_forwarding"),
@@ -986,15 +986,13 @@ pub mod linux {
 
         /// IPv4 forwarding (`ip_forward`, the device's `forwarding`, and
         /// `mc_forwarding` of `all` or the device) and the weak-host
-        /// exposure (effective `rp_filter` and `arp_ignore`, the larger of
-        /// `all` and the device as the kernel takes them, both 0).
+        /// exposure (the effective `rp_filter`, the larger of `all` and
+        /// the device as the kernel takes it, is 0).
         pub fn ipv4(&self) -> Ipv4Sysctls {
             let pair = |all: &str, device: &Path| -> Option<(u32, u32)> {
                 Some((read_number(Path::new(all)).ok()?, read_number(device).ok()?))
             };
-            let weak_host = pair(IPV4_RP_FILTER_ALL, &self.ipv4_rp_filter)
-                .zip(pair(IPV4_ARP_IGNORE_ALL, &self.ipv4_arp_ignore))
-                .map(|(rp_filter, arp_ignore)| weak_host(rp_filter, arp_ignore));
+            let weak_host = pair(IPV4_RP_FILTER_ALL, &self.ipv4_rp_filter).map(weak_host);
             Ipv4Sysctls {
                 forwarding_global: read_flag(Path::new(IP_FORWARD)),
                 forwarding_device: read_flag(&self.ipv4_forwarding),
@@ -1112,21 +1110,14 @@ pub mod linux {
             assert_eq!(without_flag(false, false), None);
         }
 
-        /// The effective `rp_filter`/`arp_ignore` is the larger of `all`
-        /// and the device.
+        /// The effective `rp_filter` is the larger of `all` and the device;
+        /// only 0 is exposed (strict 1 and loose 2 both validate the
+        /// source).
         #[test]
         fn weak_host_takes_the_larger_of_all_and_the_device() {
-            assert!(weak_host((0, 0), (0, 0)));
-            for (rp_filter, arp_ignore) in [
-                ((0, 1), (0, 0)),
-                ((2, 0), (0, 0)),
-                ((0, 0), (1, 0)),
-                ((0, 0), (0, 8)),
-            ] {
-                assert!(
-                    !weak_host(rp_filter, arp_ignore),
-                    "{rp_filter:?} {arp_ignore:?}"
-                );
+            assert!(weak_host((0, 0)));
+            for rp_filter in [(0, 1), (2, 0), (1, 1), (0, 2)] {
+                assert!(!weak_host(rp_filter), "{rp_filter:?}");
             }
         }
 
@@ -1704,7 +1695,7 @@ mod tests {
 
     /// IPv4 `mc_forwarding` is refused like the other forwarding sysctls
     /// (warned under `--allow-kernel-forwarding`); the weak-host exposure
-    /// (or an unreadable `rp_filter`/`arp_ignore`) only ever warns.
+    /// (or an unreadable `rp_filter`) only ever warns.
     #[test]
     fn multicast_forwarding_refuses_and_weak_host_only_warns() {
         let clean = DeviceFacts {

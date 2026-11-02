@@ -124,14 +124,18 @@ All commands assume a dedicated router host or network namespace. Replace
   (`IPV6_ENABLED_ALLOWED` and the codes of section 3); `disable_ipv6=1` is
   the fix.
 - **IPv4 weak host (warning only)**: an address-less port still receives,
-  while detached, frames for any local IPv4 address of the host, and with
-  `arp_ignore=0` answers ARP for them. When the effective `rp_filter` (the
-  larger of `conf/all` and `conf/<port>`) and the effective `arp_ignore`
-  are both 0, or cannot be read, startup warns `IPV4_WEAK_HOST_EXPOSURE`
-  and the watch warns `health=IPV4_WEAK_HOST_EXPOSURE` (recovered when
-  fixed). It is never refused (whether it should be is an open owner
-  question, CLI-034). Set `net.ipv4.conf.all.arp_ignore=1` and
-  `net.ipv4.conf.all.rp_filter=1` (or 2) in the router namespace.
+  while detached, frames sent to its MAC for any local IPv4 address of the
+  host: with the effective `rp_filter` (the larger of `conf/all` and
+  `conf/<port>`) 0, the source check of a device without addresses passes
+  them (`__fib_validate_source`, the no-address path) and they reach local
+  sockets. `arp_ignore` only stops the ARP replies that would reveal those
+  addresses, so it does not change this. With the effective `rp_filter` 0,
+  or unreadable, startup warns `IPV4_WEAK_HOST_EXPOSURE` and the watch
+  warns `health=IPV4_WEAK_HOST_EXPOSURE` (recovered when it is 1 or 2). It
+  is never refused (whether it should be is an open owner question,
+  CLI-034). Set `net.ipv4.conf.all.rp_filter=1` (strict) or `2` (loose) in
+  the router namespace, and `net.ipv4.conf.all.arp_ignore=1` as advice
+  (no ARP replies for addresses the port does not hold).
 - **Port devices** (each checked at startup, refused otherwise):
   - exactly one RX queue: `ethtool -l lan0`, then `ethtool -L lan0 combined 1`
     (or `rx 1`). The count is rtnetlink's `IFLA_NUM_RX_QUEUES`, the number
@@ -430,7 +434,7 @@ Every second the router queries each port's interface index over
 rtnetlink (`RTM_GETLINK`, namespace correct), dumps the namespace's IPv4
 addresses (`RTM_GETADDR`) and IPv4 routes of every table
 (`RTM_GETROUTE`), reads the IPv4 forwarding sysctls (`mc_forwarding`
-included) and `rp_filter`/`arp_ignore` (procfs), and then the port's
+included) and `rp_filter` (procfs), and then the port's
 `disable_ipv6`; unless it is 1 it also reads the IPv6 forwarding sysctls
 (`force_forwarding` and `mc_forwarding` included) and dumps the IPv6
 addresses and routes. The dumps are filtered by the kernel to the port
@@ -449,7 +453,7 @@ router thread, on one reused socket and buffer, without allocation:
 | a kernel IPv4 address appears on a port | warning `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`), recovered when gone; keeps running |
 | a kernel IPv4 route out of a port appears in any table (policy routing and multipath nexthops included) | warning `KERNEL_IPV4_ROUTES` (`if<id>.watch.kernel_ipv4_routes`), recovered when gone; keeps running |
 | `net.ipv4.ip_forward`, `conf/<port>/forwarding`, or an IPv4 `mc_forwarding` turns on | warning `KERNEL_FORWARDING_ENABLED` (`if<id>.watch.kernel_forwarding`), recovered when off; keeps running |
-| effective `rp_filter` and `arp_ignore` both 0 (or unreadable) | warning `IPV4_WEAK_HOST_EXPOSURE` (`if<id>.watch.ipv4_weak_host`), recovered when either is set; never fatal, never a failed query |
+| effective `rp_filter` 0 (or unreadable) | warning `IPV4_WEAK_HOST_EXPOSURE` (`if<id>.watch.ipv4_weak_host`), recovered when it is 1 or 2; never fatal, never a failed query |
 | `disable_ipv6` flips to 0 on the port | warning `KERNEL_IPV6_ENABLED` (`if<id>.watch.kernel_ipv6_enabled`), recovered when it is 1 again; keeps running |
 | a forwarding sysctl becomes unreadable (for example the device renamed) | a failed query; with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` instead |
 | with IPv6 on for the port: an IPv6 address outside `fe80::/10` appears | warning `KERNEL_IPV6_ADDRESSES` (`if<id>.watch.kernel_ipv6_addresses`), recovered when gone; keeps running |
@@ -660,6 +664,12 @@ CLI-034).
   the old name, that device's sysctls are read until the next restart. Do
   not rename ports while the router runs.
 - IPv4 weak host (`IPV4_WEAK_HOST_EXPOSURE`) only warns (section 1).
+- The kernel's dump filter is trusted only when the dump confirms it
+  (`NLM_F_DUMP_FILTERED` on `NLMSG_DONE`); a dump without it fails closed
+  as an unverifiable query. The strict route dumps list FIB entries only,
+  so IPv6 cached exceptions (PMTU and redirect clones) are not listed;
+  harmless, because each hangs off a FIB route through the same device,
+  which is listed.
 - The config is validated with the same limits as `run-sim`
   (`SIM_VALIDATION_LIMITS`); production limits are not decided yet.
 - Capability diagnostics read `CapEff` in the caller's user namespace; in a
@@ -734,8 +744,8 @@ What it proves, on the runner's kernel only:
   not exist) refused; at run time `disable_ipv6` flipped to 0, a global
   address and its route, `force_forwarding`, an IPv4 route in table 300,
   and IPv6 forwarding warned and recovered with traffic forwarded and no
-  fatal, exit warnings for what was still on; `rp_filter=0` with
-  `arp_ignore=0` only warned; an IPv4 multicast routing socket
+  fatal, exit warnings for what was still on; an effective `rp_filter=0`
+  only warned, also with `arp_ignore=1`, and recovered with 2 and 1; an IPv4 multicast routing socket
   (`mc_forwarding=1`) refused and accepted with `--allow-kernel-forwarding`
   (markers `priv_run_ipv6_enabled`, `priv_run_ipv6_address`,
   `priv_run_ipv6_route`, `priv_run_ipv6_forwarding`,
@@ -830,7 +840,7 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `health=MTU_RAISED` | — | MTU raised within the frame bound; TX still bounded by the old MTU | restart to use the new MTU |
 | `health=LINK_PROBE` / `LINK_UNVERIFIABLE` | 1 if `LINK_UNVERIFIABLE` | rtnetlink/procfs queries failing (3 in a row is fatal) | check the namespace; a renamed device makes its forwarding sysctl unreadable |
 | `health=KERNEL_IPV4_ADDRESSES` / `KERNEL_IPV4_ROUTES` / `KERNEL_FORWARDING_ENABLED` / `FORWARDING_UNVERIFIABLE` | — | kernel L3 or forwarding appeared while attached | remove it while the router runs (section 8) |
-| `IPV4_WEAK_HOST_EXPOSURE` (startup or `health=`) | — | `rp_filter` and `arp_ignore` both 0 | `sysctl -w net.ipv4.conf.all.arp_ignore=1 net.ipv4.conf.all.rp_filter=1` |
+| `IPV4_WEAK_HOST_EXPOSURE` (startup or `health=`) | — | effective `rp_filter` 0 (`arp_ignore` does not matter) | `sysctl -w net.ipv4.conf.all.rp_filter=1` (or 2); `arp_ignore=1` as well |
 | `health=KERNEL_IPV6_ENABLED` / `KERNEL_IPV6_ADDRESSES` / `KERNEL_IPV6_ROUTES` / `KERNEL_IPV6_FORWARDING_ENABLED` / `IPV6_UNVERIFIABLE` | — | kernel IPv6 on a port with IPv6 on, while attached | `sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1` while the router runs (section 8) |
 | `reload refused: code=RESTART_REQUIRED reasons=...` | — | the change needs a restart | restart in a quiet period |
 | `reload failed: stage=quiesce code=TIMEOUT` | — | TX did not settle within 200 ms (often a port down with TX queued) | bring the link up, send SIGHUP again |

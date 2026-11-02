@@ -91,9 +91,9 @@
 #             address, force_forwarding, an IPv4 route in table 300, and
 #             IPv6 forwarding each warn and recover (disable_ipv6=1 on ra
 #             recovers if1 only), no fatal, exit warnings for rb
-#   weakhost  rp_filter=0 and arp_ignore=0 (the setup sets all.rp_filter=1
-#             and all.arp_ignore=1) only warn IPV4_WEAK_HOST_EXPOSURE, at
-#             startup and while running, and recover
+#   weakhost  an effective rp_filter=0 (the setup sets all.rp_filter=1),
+#             also with arp_ignore=1, only warns IPV4_WEAK_HOST_EXPOSURE, at
+#             startup and while running, and recovers with rp_filter 2 or 1
 #   mc_forwarding  an IPv4 multicast routing socket (MRT_INIT) makes
 #             all/mc_forwarding=1: refused (scope=multicast), accepted with
 #             --allow-kernel-forwarding, warned and recovered (SKIPPED with
@@ -229,8 +229,9 @@ done
 # forwarding off (refused by `ruster run` unless --allow-kernel-forwarding),
 # IPv6 off on every port device (refused unless --allow-kernel-ipv6; the
 # ipv6 phase turns it on where it tests that), IPv6 forwarding off, and
-# all.rp_filter=1 / all.arp_ignore=1 (otherwise IPV4_WEAK_HOST_EXPOSURE is
-# warned; the weakhost phase tests that).
+# all.rp_filter=1 (otherwise IPV4_WEAK_HOST_EXPOSURE is warned; the
+# weakhost phase tests that) and all.arp_ignore=1 (advice: no ARP replies
+# for addresses the port does not hold).
 in_ns "$router" sysctl -qw net.ipv4.ip_forward=0
 in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=0
 in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.all.arp_ignore=1
@@ -1250,32 +1251,43 @@ in_ns "$router" sysctl -qw net.ipv6.conf.all.forwarding=0
 set_ipv6 rb off
 echo "priv_run_ipv6_runtime: disable_ipv6 flipped to 0, a global IPv6 address and its route, force_forwarding (${force_forwarding:-skipped}), an IPv4 route in table 300, and IPv6 forwarding warned and recovered while forwarding (disable_ipv6 on ra recovered if1 only), no fatal, exit warnings for rb verified"
 
-# weakhost: rp_filter and arp_ignore both 0 on an address-less port is
-# only warned (an owner decision whether to refuse), at startup and while
-# running; the setup's all.arp_ignore=1 / all.rp_filter=1 avoid it.
+# weakhost: an effective rp_filter of 0 on an address-less port is only
+# warned (an owner decision whether to refuse), at startup and while
+# running, also with arp_ignore=1 (which stops ARP replies only: a frame
+# sent to the port's MAC for any host address is still delivered). The
+# setup's all.rp_filter=1 avoids it; strict (1) or loose (2) recovers.
 for dev in all ra rb; do
-    in_ns "$router" sysctl -qw "net.ipv4.conf.$dev.rp_filter=0" "net.ipv4.conf.$dev.arp_ignore=0"
+    in_ns "$router" sysctl -qw "net.ipv4.conf.$dev.rp_filter=0"
 done
+[ "$(in_ns "$router" sysctl -n net.ipv4.conf.all.arp_ignore)" = 1 ] ||
+    fail "weakhost: all.arp_ignore is not 1"
 start_ruster weakhost "$work/router.toml"
 wait_ready weakhost || fail "weakhost: ruster exited during startup"
 grep -q "warning: port=if1 IPV4_WEAK_HOST_EXPOSURE" "$work/weakhost.err" ||
-    fail "weakhost: no startup warning"
+    fail "weakhost: no startup warning with arp_ignore=1"
 wait_line weakhost "warning: port=if2 health=IPV4_WEAK_HOST_EXPOSURE"
-in_ns "$router" sysctl -qw net.ipv4.conf.all.arp_ignore=1
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=2
 wait_line weakhost "recovered: port=if2 health=IPV4_WEAK_HOST_EXPOSURE"
-in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=1
 forward_once weakhost
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=0
+wait_count weakhost "warning: port=if2 health=IPV4_WEAK_HOST_EXPOSURE" 2
+in_ns "$router" sysctl -qw net.ipv4.conf.all.rp_filter=1
+wait_count weakhost "recovered: port=if2 health=IPV4_WEAK_HOST_EXPOSURE" 2
 signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "weakhost: exit status $status"
+if grep -q "fatal:" "$work/weakhost.err"; then
+    fail "weakhost: a fatal event"
+fi
 assert_detached "the weak-host run"
-echo "priv_run_weak_host: rp_filter=0 and arp_ignore=0 warned at startup and while running, recovered with arp_ignore=1, never refused verified"
+echo "priv_run_weak_host: effective rp_filter=0 warned at startup and while running although arp_ignore=1, recovered with rp_filter=2 and with 1, never refused verified"
 
 # mc_forwarding: a multicast routing socket (MRT_INIT) sets IPv4
 # conf/all/mc_forwarding=1 while it is open: refused (scope=multicast)
 # unless --allow-kernel-forwarding. Without kernel multicast routing the
 # step says it is skipped.
-rm -f "$work/mroute.ready" "$stopfile"
+mroute_stop="$work/mroute.stop"
+rm -f "$work/mroute.ready" "$mroute_stop"
 in_ns "$router" python3 -I -c '
 import os, socket, sys, time
 try:
@@ -1288,7 +1300,7 @@ open(sys.argv[1], "w").write("ready\n")
 deadline = time.monotonic() + 120
 while not os.path.exists(sys.argv[2]) and time.monotonic() < deadline:
     time.sleep(0.05)
-' "$work/mroute.ready" "$stopfile" &
+' "$work/mroute.ready" "$mroute_stop" &
 mroute=$!
 tries=0
 while [ ! -s "$work/mroute.ready" ]; do
@@ -1305,7 +1317,7 @@ if grep -q ready "$work/mroute.ready"; then
     grep -q "warning: port=if1 IPV4_FORWARDING_ENABLED scope=multicast" "$work/mc-forwarding-allowed.err" ||
         fail "mc-forwarding-allowed: no warning"
     wait_line mc-forwarding-allowed "warning: port=if1 health=KERNEL_FORWARDING_ENABLED"
-    : >"$stopfile"
+    : >"$mroute_stop"
     wait "$mroute" || true
     mroute=
     wait_line mc-forwarding-allowed "recovered: port=if1 health=KERNEL_FORWARDING_ENABLED"
@@ -1315,12 +1327,12 @@ if grep -q ready "$work/mroute.ready"; then
     assert_detached "the mc_forwarding override run"
     echo "priv_run_mc_forwarding: an IPv4 multicast routing socket (all/mc_forwarding=1) refused (scope=multicast), accepted with --allow-kernel-forwarding, warned and recovered while running verified"
 else
-    : >"$stopfile"
+    : >"$mroute_stop"
     wait "$mroute" || true
     mroute=
     echo "priv_run_mc_forwarding: SKIPPED (MRT_INIT failed: $(cat "$work/mroute.ready"))"
 fi
-rm -f "$stopfile"
+rm -f "$mroute_stop"
 
 # stuck: an undrained stdout must not keep the process alive.
 mkfifo "$work/stuck.fifo"
