@@ -145,8 +145,8 @@ fn wrong_expectations_fail_with_typed_mismatches() {
     // A wrong NAT port in the first translated UDP frame.
     let wrong_port = replace_once(
         &source,
-        "src-port = 40011, dst-port = 53",
-        "src-port = 40012, dst-port = 53",
+        "src-port = 40014, dst-port = 53",
+        "src-port = 40015, dst-port = 53",
     );
     let (result, output) = run_text(&wrong_port);
     match result {
