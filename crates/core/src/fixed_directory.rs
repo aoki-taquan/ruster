@@ -53,6 +53,10 @@ pub(crate) enum DirectoryHashDomain {
     TcpSession = 0x4e41_5434_5453_4553,
     TcpSessionAddress = 0x4e41_5434_5453_4144,
     TcpInboundSlot = 0x4e41_5434_5449_534c,
+    ResolutionState = 0x5253_4c56_5354_4154,
+    ResolutionDynamicNeighbor = 0x5253_4c56_444e_4248,
+    ResolutionHoldForward = 0x5253_4c56_4846_5744,
+    ResolutionHoldReverse = 0x5253_4c56_4852_4556,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

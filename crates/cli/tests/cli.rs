@@ -94,7 +94,7 @@ fn validate_reports_summary_or_typed_diagnostics_with_exit_status() {
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=17184 backend=sim\n"
+         storage-bytes=18400 backend=sim\n"
     );
     assert!(ok.stderr.is_empty());
 
@@ -802,7 +802,7 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=17184 backend=af-xdp ports=2 umem-bytes=20971520\n"
+         storage-bytes=18400 backend=af-xdp ports=2 umem-bytes=20971520\n"
     );
 
     let current = fixtures().join("router-v1.toml");
@@ -1009,7 +1009,7 @@ fn run_exits_in_bounded_time_with_an_undrained_stdout() {
 
 /// H3: `validate` and `run` apply the production limits to an af-xdp
 /// document: every table at its production limit is accepted; one slot
-/// above (a scanned resolution table at 4097, which the simulator's limits
+/// above (a quote table, the resolution failure holds, at 4097, which the simulator's limits
 /// still accept as a sim document, and a firewall table at 65537) is exit 2
 /// with a value-free code and path from both. `run` of the maximal document
 /// gets past validation and storage allocation to the privilege preflight
@@ -1025,7 +1025,7 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     let ok = ruster(&["validate".as_ref(), max.as_os_str()]);
     assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
     assert!(
-        text(&ok.stdout).contains(" storage-bytes=38224064 backend=af-xdp "),
+        text(&ok.stdout).contains(" storage-bytes=53592256 backend=af-xdp "),
         "{}",
         text(&ok.stdout)
     );
@@ -1036,9 +1036,9 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     };
     for (from, to, path, limit) in [
         (
-            "dynamic-neighbors = 4096\n",
-            "dynamic-neighbors = 4097\n",
-            "resolution.capacity.dynamic-neighbors",
+            "failure-holds = 4096\n",
+            "failure-holds = 4097\n",
+            "resolution.capacity.failure-holds",
             4096,
         ),
         (

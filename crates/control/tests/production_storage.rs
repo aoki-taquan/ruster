@@ -70,17 +70,19 @@ const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-m
 /// widest, computed from the slot types `FullServiceStorage` allocates.
 fn worst_case_bytes() -> usize {
     let slots = PRODUCTION_VALIDATION_LIMITS.max_slots_per_table as usize;
-    let scanned = PRODUCTION_VALIDATION_LIMITS.max_scanned_slots_per_table as usize;
+    let quote = PRODUCTION_VALIDATION_LIMITS.max_quote_slots_per_table as usize;
     let ports = 65_535;
     let directory = size_of::<DirectoryBucket>() + size_of::<DirectoryNode>();
     // One owner slot per pool port plus the free-port bitmap.
     let port_index = ports * size_of::<PortOwnerSlot>() + port_free_bitmap_words(ports) * 8;
-    let resolution = scanned
+    // Failure holds and ICMPv4 error actions hold a quoted datagram.
+    let resolution = slots
         * (size_of::<ResolutionStateSlot>()
             + size_of::<ResolutionActionSlot>()
-            + size_of::<DynamicNeighborSlot>()
-            + size_of::<ResolutionFailureHoldSlot>());
-    let icmpv4 = scanned * (size_of::<Icmpv4ErrorStateSlot>() + size_of::<Icmpv4ErrorActionSlot>());
+            + size_of::<DynamicNeighborSlot>())
+        + quote * size_of::<ResolutionFailureHoldSlot>();
+    let icmpv4 =
+        slots * size_of::<Icmpv4ErrorStateSlot>() + quote * size_of::<Icmpv4ErrorActionSlot>();
     let udp = slots * (size_of::<Nat44UdpMappingSlot>() + size_of::<Nat44UdpPeerSlot>())
         + 2 * slots * directory
         + port_index;
@@ -95,7 +97,7 @@ fn worst_case_bytes() -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 38_224_064;
+    const WORST_CASE: usize = 53_592_256;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 

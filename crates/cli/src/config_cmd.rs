@@ -378,6 +378,63 @@ pub fn report_load(err: &mut impl Write, label: &str, error: &LoadError) -> u8 {
     }
 }
 
+/// Ticks above which one round-robin sweep of a resolution table is
+/// reported as slow: about 1 s when `ruster run` sleeps 1 ms between idle
+/// ticks (H4b review).
+pub const SWEEP_SLOW_TICKS: u64 = 1_000;
+
+/// A resolution table whose tick-budgeted round-robin sweep (retry and
+/// timeout timers, Host Unreachable dispatch) takes more than
+/// [`SWEEP_SLOW_TICKS`] ticks. Value-free: the table and the tick count.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SweepSlow {
+    pub table: &'static str,
+    /// `None`: the table is never swept (a zero scan budget).
+    pub ticks: Option<u64>,
+}
+
+impl std::fmt::Display for SweepSlow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "RESOLUTION_SWEEP_SLOW table={} ticks=",
+            self.table
+        )?;
+        match self.ticks {
+            Some(ticks) => write!(formatter, "{ticks}"),
+            None => formatter.write_str("never"),
+        }
+    }
+}
+
+/// The slow sweeps of `config`: resolution states against
+/// `tick.resolution-timer-scans` and failure holds against
+/// `tick.failure-dispatch-scans`, as `ceil(capacity / scans)` ticks.
+#[must_use]
+pub fn sweep_warnings(config: &ValidatedConfigV1) -> [Option<SweepSlow>; 2] {
+    let tick = config.tick();
+    let Some(storage) = config.resolution().map(|resolution| resolution.storage()) else {
+        return [None, None];
+    };
+    let slow = |table: &'static str, capacity: u32, scans: u32| {
+        if capacity == 0 {
+            return None;
+        }
+        let ticks = (scans != 0).then(|| u64::from(capacity).div_ceil(u64::from(scans)));
+        ticks
+            .is_none_or(|ticks| ticks > SWEEP_SLOW_TICKS)
+            .then_some(SweepSlow { table, ticks })
+    };
+    [
+        slow("states", storage.states, tick.resolution_timer_scans),
+        slow(
+            "failure-holds",
+            storage.failure_holds,
+            tick.failure_dispatch_scans,
+        ),
+    ]
+}
+
 /// `ruster validate <config>`: summary on stdout, diagnostics on stderr.
 pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
     validate_loaded(load(path), out, err)
@@ -418,6 +475,13 @@ pub fn validate_loaded(
     );
     if out.write_all(summary.as_bytes()).is_err() {
         return EXIT_RUNTIME;
+    }
+    // The sweep latency of `ruster run` (af-xdp only: the simulator has no
+    // idle backoff).
+    if config.backend().af_xdp().is_some() {
+        for warning in sweep_warnings(&config).into_iter().flatten() {
+            let _ = writeln!(err, "ruster: warning: {warning}");
+        }
     }
     0
 }

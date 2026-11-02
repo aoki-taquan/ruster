@@ -64,7 +64,7 @@ pub const RUN_SIM_SCHEMA_V1: &str = "ruster-run-sim/v1";
 /// Storage bounds the simulation driver passes to configuration validation.
 pub const SIM_VALIDATION_LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 16,
-    max_scanned_slots_per_table: 1 << 16,
+    max_quote_slots_per_table: 1 << 16,
     max_runtime_bytes: 64 << 20,
 };
 

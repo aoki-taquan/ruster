@@ -794,6 +794,21 @@ fn startup_runs_in_ifid_order_and_shutdown_closes_in_reverse() {
     );
     assert!(outcome.out.contains("\ntick.ticks=3\n"), "{}", outcome.out);
     assert!(outcome.out.contains("\nfake.ports=2\n"));
+    // H4b: the resolution index outcomes are part of every `run` block.
+    for key in [
+        "state_probe_exhausted",
+        "dynamic_probe_exhausted",
+        "failure_hold_probe_exhausted",
+        "index_corrupt",
+    ] {
+        assert!(
+            outcome
+                .out
+                .contains(&format!("\nresolution_index.{key}=0\n")),
+            "{}",
+            outcome.out
+        );
+    }
     // The loop hands each iteration's clock reading to the datapath
     // before that iteration's I/O (the adapter's link-down kick retry
     // rate limit runs on it), once per tick, never going backwards.
@@ -1779,11 +1794,50 @@ fn the_maximal_production_config_starts() {
     let err = String::from_utf8(err).expect("utf-8");
     assert_eq!(status, 0, "{err}");
     assert!(err.contains(READY), "{err}");
+    assert!(!err.contains("RESOLUTION_SWEEP_SLOW"), "{err}");
+}
+
+/// H4b review: a scan budget that sweeps the resolution states slower than
+/// about 1 s at the idle backoff starts with a value-free warning.
+#[test]
+fn a_slow_resolution_sweep_starts_with_a_warning() {
+    use crate::limits_tests::MAXIMAL;
+    let text = MAXIMAL.replacen(
+        "resolution-timer-scans = 128",
+        "resolution-timer-scans = 16",
+        1,
+    );
+    assert_ne!(text, MAXIMAL);
+    let config = crate::config_cmd::validate_bytes(text.as_bytes())
+        .unwrap_or_else(|error| panic!("{}", error.render()));
+    let host = FakeHost::default();
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let status = execute_with(
+        &host,
+        config,
+        FakeSource::default(),
+        settings(CheckPolicy::default(), 0),
+        &mut FakeClock {
+            step_us: 1_000,
+            ..FakeClock::default()
+        },
+        &FakeStop::after(FIRST_LOOP_CHECK + 1),
+        &mut out,
+        &mut err,
+    );
+    let err = String::from_utf8(err).expect("utf-8");
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("ruster run: warning: RESOLUTION_SWEEP_SLOW table=states ticks=4096\n"),
+        "{err}"
+    );
+    assert!(!err.contains("table=failure-holds"), "{err}");
 }
 
 /// H3: one slot above its production limit, for every table (4096 for the
-/// scanned resolution and ICMPv4 error tables, 65536 for NAT44 and the
-/// firewall), is refused by the loader of `ruster run` (startup and
+/// quote tables, resolution failure holds and ICMPv4 error actions, 65536
+/// for every other table), is refused by the loader of `ruster run` (startup and
 /// reload) with exit 2 and a value-free code and schema path, before any
 /// resource, also where the simulator's limits would accept it.
 #[test]

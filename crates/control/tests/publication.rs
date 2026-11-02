@@ -12,7 +12,7 @@ use ruster_core::{
     LocalIpv4Binding, MacAddress, Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
     Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpHashKey, Nat44UdpIndexStorage,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, PortOwnerSlot,
-    ResolutionPolicy, Route,
+    ResolutionHashKey, ResolutionPolicy, Route,
 };
 
 const LAN: IfId = IfId(1);
@@ -64,6 +64,21 @@ fn plan_with_controls(
 }
 
 fn base_plan(
+    generation: u64,
+    shape: FullServiceStorageShape,
+    resolution_policy: ResolutionPolicy,
+    icmpv4_error_policy: Icmpv4ErrorPolicy,
+) -> PublicationPlan {
+    bare_plan(generation, shape, resolution_policy, icmpv4_error_policy)
+        .with_resolution_hash_key(resolution_key(generation))
+}
+
+fn resolution_key(generation: u64) -> ResolutionHashKey {
+    ResolutionHashKey::new(generation, 0x7265_736f_6c76_6572).unwrap()
+}
+
+/// A plan without any service input or resolution index key.
+fn bare_plan(
     generation: u64,
     shape: FullServiceStorageShape,
     resolution_policy: ResolutionPolicy,
@@ -156,7 +171,8 @@ fn interface_candidate(generation: u64, interfaces: &[(u8, u8)]) -> ValidatedCan
         )
         .with_nat44_udp(udp_input((seed, seed + 1)))
         .with_nat44_tcp(tcp_input((seed + 2, seed + 3)))
-        .with_firewall(firewall_input((seed + 4, seed + 5))),
+        .with_firewall(firewall_input((seed + 4, seed + 5)))
+        .with_resolution_hash_key(resolution_key(seed)),
     )
     .unwrap()
 }
@@ -251,6 +267,22 @@ fn candidate_rejects_missing_services_shapes_and_realm_before_runtime() {
         ValidatedCandidate::new(missing_firewall).err(),
         Some(PublicationCandidateError::MissingService(
             RuntimeService::Firewall
+        ))
+    );
+
+    let missing_resolution_key = bare_plan(
+        1,
+        exact_shape(),
+        ResolutionPolicy::new(1_000, 2_000).unwrap(),
+        Icmpv4ErrorPolicy::default(),
+    )
+    .with_nat44_udp(udp_input((1, 2)))
+    .with_nat44_tcp(tcp_input((3, 4)))
+    .with_firewall(firewall_input((5, 6)));
+    assert_eq!(
+        ValidatedCandidate::new(missing_resolution_key).err(),
+        Some(PublicationCandidateError::MissingService(
+            RuntimeService::Resolution
         ))
     );
 
@@ -544,6 +576,14 @@ fn successor_checks_generation_keys_shape_and_fixed_policies_without_apply() {
     assert_eq!(
         active.validate_successor(&firewall_reuse),
         Err(SuccessorError::FirewallHashKeyReused)
+    );
+    let resolution_reuse = ValidatedCandidate::new(
+        plan(2, (100, 101), (102, 103), (104, 105)).with_resolution_hash_key(resolution_key(1)),
+    )
+    .unwrap();
+    assert_eq!(
+        active.validate_successor(&resolution_reuse),
+        Err(SuccessorError::ResolutionHashKeyReused)
     );
     let changed_shape = FullServiceStorageShape::new(
         exact_shape().resolution(),

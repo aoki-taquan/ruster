@@ -7,7 +7,9 @@ use ruster_control::{
     PublicationKeys, ResolutionStorageShape, RuntimeService, SimDeterministicKeySource,
     SuccessorError, ValidatedCandidate,
 };
-use ruster_core::{FirewallHashKey, IfId, Ipv4Address, Nat44TcpHashKey, Nat44UdpHashKey};
+use ruster_core::{
+    FirewallHashKey, IfId, Ipv4Address, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey,
+};
 
 const SIM_SEED: u64 = 0x5eed_0bad_cafe_f00d;
 const ALLOCATOR_SEED_TEXT: &str = "9876543210123";
@@ -140,7 +142,7 @@ last = 65535
 
 const LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 20,
-    max_scanned_slots_per_table: 1 << 20,
+    max_quote_slots_per_table: 1 << 20,
     max_runtime_bytes: 1 << 30,
 };
 
@@ -212,6 +214,7 @@ impl PublicationKeySource for ReusingSource {
             Nat44UdpHashKey::new(1, 2).unwrap(),
             Nat44TcpHashKey::new(3, 4).unwrap(),
             FirewallHashKey::new(5, 6).unwrap(),
+            ResolutionHashKey::new(7, 8).unwrap(),
         ))
     }
 }

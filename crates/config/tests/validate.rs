@@ -151,7 +151,7 @@ generated-icmpv4 = 2
 
 const GENEROUS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1_048_576,
-    max_scanned_slots_per_table: 1_048_576,
+    max_quote_slots_per_table: 1_048_576,
     max_runtime_bytes: 1 << 30,
 };
 
@@ -294,7 +294,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         VALID,
         ValidationLimits {
             max_slots_per_table: 8,
-            max_scanned_slots_per_table: 8,
+            max_quote_slots_per_table: 8,
             max_runtime_bytes: expected,
         }
     )
@@ -303,7 +303,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         VALID,
         ValidationLimits {
             max_slots_per_table: 8,
-            max_scanned_slots_per_table: 8,
+            max_quote_slots_per_table: 8,
             max_runtime_bytes: expected - 1,
         },
     )
@@ -324,7 +324,7 @@ fn capacity_zero_exact_limit_and_next_power_overflow_are_typed() {
         &zero,
         ValidationLimits {
             max_slots_per_table: 8,
-            max_scanned_slots_per_table: 8,
+            max_quote_slots_per_table: 8,
             max_runtime_bytes: 1 << 30,
         },
     )
@@ -339,7 +339,7 @@ fn capacity_zero_exact_limit_and_next_power_overflow_are_typed() {
         &over_limit,
         ValidationLimits {
             max_slots_per_table: 8,
-            max_scanned_slots_per_table: 8,
+            max_quote_slots_per_table: 8,
             max_runtime_bytes: usize::MAX,
         },
     )
@@ -354,7 +354,7 @@ fn capacity_zero_exact_limit_and_next_power_overflow_are_typed() {
         &overflow,
         ValidationLimits {
             max_slots_per_table: u32::MAX,
-            max_scanned_slots_per_table: u32::MAX,
+            max_quote_slots_per_table: u32::MAX,
             max_runtime_bytes: usize::MAX,
         },
     )

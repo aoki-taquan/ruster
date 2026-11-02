@@ -126,7 +126,8 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
         Vec::new().into_boxed_slice(),
         FirewallPolicy::default(),
         FirewallHashKey::new(5, 6).unwrap(),
-    ));
+    ))
+    .with_resolution_hash_key(ruster_core::ResolutionHashKey::new(7, 8).unwrap());
     let candidate = ValidatedCandidate::new(plan).unwrap();
 
     assert_eq!(take_full_forwarding_validation_count(), 1);

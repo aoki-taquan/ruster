@@ -35,7 +35,8 @@ use ruster_config::{
 };
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    Nat44Filtering, Nat44TcpHashKey, Nat44UdpHashKey, Neighbor, PublicationQuiescence, Route,
+    Nat44Filtering, Nat44TcpHashKey, Nat44UdpHashKey, Neighbor, PublicationQuiescence,
+    ResolutionHashKey, Route,
 };
 
 use crate::{
@@ -639,6 +640,7 @@ struct IssuedKeys {
     nat44_udp: Nat44UdpHashKey,
     nat44_tcp: Nat44TcpHashKey,
     firewall: FirewallHashKey,
+    resolution: ResolutionHashKey,
 }
 
 /// Control-owned generation allocator and key-reuse guard.
@@ -646,10 +648,10 @@ struct IssuedKeys {
 /// Each [`PublicationSequencer::candidate`] call consumes the next
 /// generation, whether or not the build succeeds, so no generation is ever
 /// issued twice. Every issued key is remembered for the lifetime of the
-/// sequencer (three keys per generation, cold path), and a candidate whose
-/// UDP, TCP, or firewall key equals any earlier issued key of that service is
-/// rejected. A→B→A therefore yields three generations with three distinct key
-/// sets even when the key source misbehaves.
+/// sequencer (four keys per generation, cold path), and a candidate whose
+/// UDP, TCP, firewall, or resolution key equals any earlier issued key of
+/// that service is rejected. A→B→A therefore yields three generations with
+/// three distinct key sets even when the key source misbehaves.
 ///
 /// Exactly one sequencer must serve the whole process (S5b driver and S6
 /// CLI included), also across storage re-creation for a restart-required
@@ -727,6 +729,7 @@ impl<S: PublicationKeySource> PublicationSequencer<S> {
             nat44_udp: authority.nat44_udp_hash_key(),
             nat44_tcp: authority.nat44_tcp_hash_key(),
             firewall: authority.firewall_config().hash_key(),
+            resolution: authority.resolution_hash_key(),
         };
         for issued in &self.issued {
             let reused = if issued.nat44_udp == keys.nat44_udp {
@@ -735,6 +738,8 @@ impl<S: PublicationKeySource> PublicationSequencer<S> {
                 Some(RuntimeService::Nat44Tcp)
             } else if issued.firewall == keys.firewall {
                 Some(RuntimeService::Firewall)
+            } else if issued.resolution == keys.resolution {
+                Some(RuntimeService::Resolution)
             } else {
                 None
             };

@@ -353,6 +353,8 @@ pub enum Icmpv4ErrorPublicationError {
     ActionQueueWindow,
     QueuedStateMismatch,
     RuntimeEpochExhausted,
+    /// The occupied limiter states are not exactly a prefix of the table.
+    OccupiedPrefix,
 }
 
 /// Exclusive proof that old generated-ICMP authority can be flushed totally.
@@ -393,6 +395,12 @@ pub struct Icmpv4ErrorRuntime<'a> {
     actions: &'a mut [Icmpv4ErrorActionSlot],
     head: usize,
     len: usize,
+    /// Occupied limiter states are exactly `states[..occupied_prefix]`: a
+    /// state is only ever created in the lowest free slot and only a
+    /// publication flush frees one. Every occupied state has its own egress
+    /// interface, so per-packet searches read at most one slot per egress
+    /// interface in use (H4b, PERF-001), not the whole capacity.
+    occupied_prefix: usize,
     last_now: Option<MonotonicMillis>,
     runtime_epoch: u128,
     counters: Icmpv4ErrorCounters,
@@ -416,6 +424,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             actions,
             head: 0,
             len: 0,
+            occupied_prefix: 0,
             last_now: None,
             runtime_epoch: 1,
             counters: Icmpv4ErrorCounters::default(),
@@ -472,6 +481,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 .all(|slot| *slot == Icmpv4ErrorActionSlot::EMPTY)
             && self.head == 0
             && self.len == 0
+            && self.occupied_prefix == 0
             && self.last_now.is_none()
             && self.runtime_epoch == 1
             && self.counters == Icmpv4ErrorCounters::default()
@@ -508,6 +518,15 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             .any(|state| state.action_queued && !state.occupied)
         {
             return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
+        }
+        if self.occupied_prefix > self.states.len()
+            || self
+                .states
+                .iter()
+                .enumerate()
+                .any(|(index, state)| state.occupied != (index < self.occupied_prefix))
+        {
+            return Err(Icmpv4ErrorPublicationError::OccupiedPrefix);
         }
         let queued_states = self
             .states
@@ -650,8 +669,8 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         if !self.observe_now(now) {
             return self.record_suppression(Icmpv4TimeExceededDisposition::ClockRegression);
         }
-        if let Some(index) = self
-            .states
+        let occupied = &self.states[..self.occupied_prefix];
+        if let Some(index) = occupied
             .iter()
             .position(|state| state.occupied && state.egress == action.egress)
         {
@@ -671,18 +690,27 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             return self.enqueue(index, action);
         }
 
-        let Some(index) = self.states.iter().position(|state| {
-            !state.occupied
-                || (!state.action_queued
+        // The lowest occupied state past its TTL, else the first free slot,
+        // which is the slot right after the occupied prefix.
+        let Some(index) = self.states[..self.occupied_prefix]
+            .iter()
+            .position(|state| {
+                !state.action_queued
                     && state.has_requested
-                    && now.0.saturating_sub(state.requested_at.0) >= self.policy.state_ttl_ms)
-        }) else {
+                    && now.0.saturating_sub(state.requested_at.0) >= self.policy.state_ttl_ms
+            })
+            .or((self.occupied_prefix < self.states.len()).then_some(self.occupied_prefix))
+        else {
             return self.record_suppression(Icmpv4TimeExceededDisposition::StateFull);
         };
         if self.len == self.actions.len() {
             return self.record_suppression(Icmpv4TimeExceededDisposition::ActionFull);
         }
         let reclaimed = self.states[index].occupied;
+        if !reclaimed {
+            debug_assert_eq!(index, self.occupied_prefix);
+            self.occupied_prefix += 1;
+        }
         self.states[index] = Icmpv4ErrorStateSlot {
             egress: action.egress,
             generation: self.states[index].generation.wrapping_add(1),
@@ -769,11 +797,14 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.dequeued_host_unreachable += 1;
             }
         }
-        if let Some(state) = self.states.iter_mut().find(|state| {
-            state.occupied
-                && state.egress == queued.action.egress
-                && state.generation == queued.generation
-        }) {
+        if let Some(state) = self.states[..self.occupied_prefix]
+            .iter_mut()
+            .find(|state| {
+                state.occupied
+                    && state.egress == queued.action.egress
+                    && state.generation == queued.generation
+            })
+        {
             state.action_queued = false;
             state.has_requested = true;
             state.requested_at = now;
@@ -788,6 +819,7 @@ impl Icmpv4ErrorPublicationPermit<'_, '_> {
         self.runtime.actions.fill(Icmpv4ErrorActionSlot::EMPTY);
         self.runtime.head = 0;
         self.runtime.len = 0;
+        self.runtime.occupied_prefix = 0;
         self.runtime.last_now = None;
         self.runtime.runtime_epoch = self.next_runtime_epoch;
         self.runtime.state_occupancy.flush();
@@ -1577,5 +1609,40 @@ mod tests {
         assert_eq!(exact_state_occupancy(&runtime), (0, 0, 2));
         runtime.schedule(action(2, 20), MonotonicMillis(0));
         assert_eq!(exact_state_occupancy(&runtime), (1, 1, 2));
+    }
+
+    /// H4b: occupied limiter states stay a prefix of the table, so a new
+    /// egress reads only the occupied states (at most one per egress
+    /// interface), however large the capacity is; a broken prefix is
+    /// refused by the publication preflight.
+    #[test]
+    fn occupied_states_are_a_prefix_and_searches_stay_inside_it() {
+        let policy = Icmpv4ErrorPolicy::new(1, 2).unwrap();
+        let mut states = vec![Icmpv4ErrorStateSlot::EMPTY; 1 << 16];
+        let mut actions = [Icmpv4ErrorActionSlot::EMPTY; 8];
+        let mut runtime = Icmpv4ErrorRuntime::new(policy, &mut states, &mut actions);
+        for egress in 1..=3 {
+            runtime.schedule(action(egress, 20), MonotonicMillis(0));
+            assert_eq!(runtime.occupied_prefix, usize::from(egress));
+        }
+        // An existing egress and a reclaim reuse the prefix in place.
+        while let Some(front) = runtime.front() {
+            runtime.committed(front, MonotonicMillis(0));
+        }
+        runtime.schedule(action(2, 20), MonotonicMillis(5));
+        runtime.schedule(action(9, 20), MonotonicMillis(5));
+        assert_eq!(runtime.occupied_prefix, 3);
+        assert!(runtime.states[..3].iter().all(|state| state.occupied));
+        assert!(runtime.states[3..].iter().all(|state| !state.occupied));
+        assert!(runtime.preflight_publication().is_ok());
+        runtime.states[7].occupied = true;
+        assert_eq!(
+            runtime.preflight_publication().err(),
+            Some(Icmpv4ErrorPublicationError::OccupiedPrefix)
+        );
+        runtime.states[7].occupied = false;
+        runtime.preflight_publication().unwrap().commit();
+        assert_eq!(runtime.occupied_prefix, 0);
+        assert!(runtime.states.iter().all(|state| !state.occupied));
     }
 }

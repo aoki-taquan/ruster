@@ -95,8 +95,9 @@ buffer unavailableを区別し、失敗時はownershipを移しません。finis
 `attempts=allocated+failed`、`allocated=requested+cancelled+abandoned`、
 `accepted+rejected=requested`のaccountingを返し、rejectをreturn前にrecycleします。
 
-resolution runtimeも`!Send + !Sync`で、caller提供のlinear fixed resolution table、
-action ring、dynamic neighbor table、任意のfailure hold tableを借用します。すべてのkeyは
+resolution runtimeも`!Send + !Sync`で、caller提供のfixed resolution table、
+action queue、dynamic neighbor table、任意のfailure hold tableを借用し、各tableのindexを
+そのslotの中に持ちます（下の「Resolution bounded indexes」）。すべてのkeyは
 `(IfId,target IPv4)`です。stateはauthoritativeなRequest action、generation、committed
 total attempts、backend accepted attempts、request/failure時刻を保持し、
 `InitialQueued → Waiting → RetryQueued → Waiting → Failed`を明示します。
@@ -112,7 +113,8 @@ dynamic neighbor TTLはzeroを拒否するconfigurable policyです。static nei
 lookupし、static missだけdynamicを参照します。dynamic slotは`elapsed < TTL`だけliveで、
 exact boundaryではlazy expiryして転送に使いません。insert時もempty/expired slotだけを
 reuseし、liveな別keyをevictしません。既存keyのMAC/refresh時刻更新は追加capacity不要です。
-periodic scanはなく、lookup/insert時のbounded linear lazy maintenanceです。
+periodic scanはなく、lookup/insert時のlazy maintenanceです（H4b以降はkeyed chainとrefresh順
+listで定数、償却定数）。
 
 control planeがforwarding snapshotを公開する同じworker tickでは、timer pollや次のpacket
 より前に、そのsnapshotを`ResolutionRuntime::reconcile_publication`へ渡します。これにより
@@ -328,7 +330,7 @@ forward authority、最大548-byte quoteだけを持ちます。packet lease、E
 padding、buffer pointerは保持しません。各generationの最初のeligible packetが勝ち、後続packet
 はquoteを置換しません。最初がRFC error suppression対象なら後続eligible packetで空slotを
 埋められますが、すでにFailedのgenerationへretroactive captureはしません。generation wrapは
-live forward/reverse tokenをbounded scanでskipします。
+live forward/reverse tokenをforward/reverse chainで確かめてskipします。
 
 terminal候補のdispatchも明示scan budgetとpersistent round-robin cursorを使います。current
 snapshotでforward direct authorityと未解決状態を再確認し、元sourceへのreverse LPMを行います。
@@ -1191,6 +1193,72 @@ reconcileのflush（control path）とdebug/testの全体検証だけです。ke
 secret per-publication SipHash keyでchainを狙えず期待O(1)ですが、存在するkeyを見落とすと
 endpoint-independent mappingが壊れるので上限で打ち切りません。
 
+### Resolution bounded indexes
+
+H4b（PERF-001、ARP-030）以前は、resolution runtimeのpacket path操作がtableをslot 0から
+走査しました。dynamic-neighbor miss（`lookup_dynamic`）は全slot、`schedule`はstate検索と
+空きslot探索で二回、failure captureとFailed/expiryの照合は全hold、ARP学習はstate走査に
+加えaction ring全体のcompactionとhold走査をしました。release実測で65536 slotなら一packet
+74〜943 µs、H3の4096 capでも4.5〜72 µsです。いまはconstructorのsignatureを変えずに、
+各tableのindexをcaller-backed slotの中に埋め込みます（`slot_index.rs`。allocationなし）。
+
+- key chain: tableのslot数と同じ数のbucketを持ち、slot iがbucket iのhead（table word）を、
+  各slotが自分のchain node（bucket、prev、next）を持つ。bucketはsecret keyed SipHash
+  （`ResolutionHashKey`、control planeがpublicationごとに新しく引き、commitで切り替える。
+  successorは再利用keyを`ResolutionHashKeyReused`で拒否）をmultiply-highでslot数へ縮める。
+  stateとdynamic neighborのkeyは`(IfId, IPv4)`、failure holdはforward chainが
+  `(forward egress, forward target)`（全generation）、reverse chainがWaitingReverseのholdの
+  reverse token `(egress, target, generation)`。reverse chainには異なるtokenごとに一つの
+  leaderだけを載せ、同じtokenを待つ他のholdはleaderからのgroup list（slot内のprev/next）に
+  つなぐ。leaderが消えるとgroupの次のholdがchain上の位置をO(1)で引き継ぐ（`replace`）。
+- chain上限: state、dynamic neighbor、forward holdのchainは`RESOLUTION_INDEX_CHAIN_LIMIT`（16）を
+  超えて伸ばさず、超えるinsertは既存の`StateFull`/`CacheFull`/`CapacityFull`でfail closedし
+  `ResolutionIndexCounters`の`*_probe_exhausted`を数える。insertが伸ばさないのでlookupは
+  最大16 slotで完全。secret keyと一slotあたり一bucketなので偶然には起きず、keyが秘密である限り狙えない
+  （Poisson(1)で16以上は65536 bucket全体で約1e-9）。reverse chainはtokenの種類数だけを
+  持つので、同じtokenを待つholdが何千あっても（一つのspoofed source）他のtokenの照合
+  （generation alias check、expiry）はそれを辿らない（review L1。修正前はknown keyで
+  一操作約50 µs）。上限は付けず走査はtable size以下で、secret keyなら期待O(1)。token自身の
+  holdを消すときはgroupを一度ずつ辿り、それぞれ一度captureされたもの（償却O(1)）。
+- 再利用可能slot: 2段の「used」bitmap（leaf word wはslot w、summary word sはslot
+  `leaf_words + s`に置く。合計はslot数以下）で最小indexの未使用slotを、65536 slotなら最大
+  summary 16 word + leaf 1 wordで見つける。all-zeroが「全部空き」なのでentryが全部消えた
+  tableはbit単位で`EMPTY`に戻る（`is_pristine`と全flushはそのまま）。
+- 時刻順list: stateはrequestをcommitした順（`requested_at`順。時刻はwatermarkで単調）、
+  dynamic neighborはrefresh順のintrusive list（`slot_list.rs`）に載る。新しいkeyを入れる前に
+  先頭からinterval（TTL）経過済みのものを外し、cooldown（expired entry）ならbitmap上で
+  再利用可能にする。各commit（refresh）がlistに一度入り一度出るので償却O(1)。timer poll
+  もtickごとにscan budgetまで先頭から外す（挙動に影響しないbookkeeping）ので、insertが
+  まとめて払うのは同時にexpireしたのにまだtickが外していない分だけ（65536同時expiryの
+  直後で約0.8 ms、一回）。insertごとに打ち切ると「最小index」の選択が変わるので上限は
+  付けない。これで
+  「free、またはinterval経過済みcooldown（expired entry）の最小index」が従来のslot 0からの
+  scanと同じslotになり、poll/dispatch cursorの巡回順、ARP/ICMPのwire順、occupancy、
+  generation番号が変わらない。
+- action queue: action slot上のFIFO list（free slotはbitmap）。queued stateは自分のaction
+  slotを持ち、cancelはそのactionだけをO(1)で外す（残りの順序は従来のcompactionと同じ）。
+- ICMPv4 error limiter: stateは最小の空きslotにだけ作られflushだけが空けるので、occupied
+  stateはtableのprefix。探索をprefix内（使用中egress interface数以下）に限る。崩れたprefixは
+  preflightの`OccupiedPrefix`。
+
+壊れたindex（範囲外link、別bucketのnode、長すぎるchain、bitmapの矛盾）はpacket pathの
+lookupが検出し、mutation前にfail closed（`StateFull`/`CacheFull`/`CapacityFull`/miss、
+`index_corrupt`）。mutationは隣接nodeを確かめてから書く。`preflight_publication`は全index
+（chain、bitmap、order list、action所有）をO(capacity)で検証し、不一致は`IndexCorrupt`。
+
+slot sizeはstate 56→96、action 32→56、dynamic neighbor 24→64、failure hold 608→656 bytes（reverse group link込み）
+で、ほかのstorageはありません（`required_bytes`と最大configが計上）。挙動は変わりません:
+seeded churn testが同じ操作列を旧runtime（`resolution_reference.rs`、origin/main b1e31aaの
+test専用copy）にも適用し、全結果、trace、slot、queue順、counterの一致を確かめます。新しい
+結果はchain上限のinsert拒否だけです。fail closedの件数（`ResolutionIndexCounters`）は
+`ruster run`のstats blockに`resolution_index.*`として出ます（run-simのschemaには入れない）。
+残るO(N)はpublication preflight/commit（control path）、tick budget付きのtimer/dispatchの
+巡回（packet pathではない。`ceil(capacity / scans)` tickでretry/Host Unreachableの遅れが
+決まり、1000 tick（idle backoffで約1 s）を超えると`validate`/`run`が
+`RESOLUTION_SWEEP_SLOW`を警告）、debug/testの全体検証です。forwarding snapshotの
+config由来list（route LPM、local address、static neighbor）は依然packetごとに線形です
+（PERF-002、H4c）。
+
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの
 selected-prefix境界を分類するread-only LPMを行います。このlookupはbytes、watermark、state、
@@ -1404,13 +1472,13 @@ resource（socket、UMEM、XDP program）を所有するprocessがreload時に�
 
 `candidate_from_config`は`ValidatedConfigV1`、generation、`PublicationKeySource`から
 `ValidatedCandidate`を作ります。key sourceは`KIND`で由来を自己申告し、M1の
-`SimDeterministicKeySource`はscenario seedとgenerationから決定的にUDP/TCP NAT44/firewall keyを
-導出する`DeterministicSimulation`です。key、seed、allocator seedはどのDebug/plan/run-sim出力にも
+`SimDeterministicKeySource`はscenario seedとgenerationから決定的にUDP/TCP NAT44/firewall/
+resolution keyを導出する`DeterministicSimulation`です。key、seed、allocator seedはどのDebug/plan/run-sim出力にも
 出ません。
 
 production key sourceは`OsRandomKeySource`（KIND=`OperatingSystemRandom`）です。`open`で
 `/dev/urandom`を`std`だけで一度開いてcharacter deviceかつdevice番号1:9/1:8であることを確かめ、
-publicationごとに48 bytesを新たに読みます。kernel 5.18未満の`/dev/urandom`は起動初期にseed前の
+publicationごとに64 bytes（四つのkeyに各2 word）を新たに読みます。kernel 5.18未満の`/dev/urandom`は起動初期にseed前の
 CRNG出力を返しうるため、`getrandom(2)`化はfollow-upです。short readは続きを読み、`EINTR`は再試行し、それ以外のopen/read失敗、
 EOF、all-zero keyはvalue-freeな`KeySourceError`（`ErrorKind`だけを持つ）になり、予測可能な
 keyへfallbackしません。generation採番、key再利用拒否、rollbackは`PublicationSequencer`の
@@ -1429,8 +1497,8 @@ directory/node/port-owner shapeを先に検査し、`ValidatedForwardingOwner`�
 snapshotへUDP/TCP configと`ValidatedFirewallOwner`をbindします。dependent configとfirewall
 ownerをforwarding ownerより先にdropするfield順で保持しますが、self-reference、leak、unsafe
 pointerは使いません。`authority()`はcandidate lifetimeに制約されたsnapshot/config viewを
-allocation、再validation、再hashなしのO(1)で返します。generation前進、UDP/TCP/firewall key
-rotation、固定shape/policyはstatic successor checkだけを提供し、ownerのinstallやruntime変更は
+allocation、再validation、再hashなしのO(1)で返します。generation前進、UDP/TCP/firewall/
+resolution key rotation、固定shape/policyはstatic successor checkだけを提供し、ownerのinstallやruntime変更は
 行いません。
 
 live activationは`FullServiceStorage`と`ActivePublication<'storage>`だけで行います。

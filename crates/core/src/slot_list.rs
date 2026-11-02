@@ -11,7 +11,7 @@ pub(crate) const LINK_NONE: u32 = u32::MAX;
 
 /// Previous and next slot of the list a slot is on (`LINK_NONE` at the ends
 /// and when unlinked).
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct SlotLinks {
     prev: u32,
     next: u32,
@@ -70,6 +70,10 @@ impl SlotList {
     }
 
     #[cfg(test)]
+    pub(crate) const fn from_raw_for_test(head: u32, tail: u32, len: u32) -> Self {
+        Self { head, tail, len }
+    }
+
     pub(crate) const fn len(self) -> usize {
         self.len as usize
     }

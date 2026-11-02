@@ -12,7 +12,10 @@ mod nat44;
 mod observability;
 mod packet;
 mod resolution;
+#[cfg(test)]
+mod resolution_reference;
 mod route;
+mod slot_index;
 mod slot_list;
 
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
@@ -103,10 +106,11 @@ pub use resolution::{
     ResolutionActionSlot, ResolutionCounters, ResolutionFailureCapture, ResolutionFailureCounters,
     ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureHoldPhase,
     ResolutionFailureHoldSlot, ResolutionFailureTrace, ResolutionFailureTraceSink,
-    ResolutionGenerationToken, ResolutionPhase, ResolutionPolicy, ResolutionPolicyError,
-    ResolutionPublicationError, ResolutionPublicationPermit, ResolutionPublicationReport,
-    ResolutionResult, ResolutionRuntime, ResolutionStateSlot, ResolutionStatus,
-    ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTrace, ResolutionTimerTraceSink,
-    StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
+    ResolutionGenerationToken, ResolutionHashKey, ResolutionHashKeyError, ResolutionIndexCounters,
+    ResolutionPhase, ResolutionPolicy, ResolutionPolicyError, ResolutionPublicationError,
+    ResolutionPublicationPermit, ResolutionPublicationReport, ResolutionResult, ResolutionRuntime,
+    ResolutionStateSlot, ResolutionStatus, ResolutionTimerError, ResolutionTimerReport,
+    ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
+    RESOLUTION_INDEX_CHAIN_LIMIT,
 };
 pub use route::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError};

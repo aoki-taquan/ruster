@@ -154,7 +154,8 @@ fn candidate(generation: u64) -> ValidatedCandidate {
         Vec::new().into_boxed_slice(),
         FirewallPolicy::default(),
         FirewallHashKey::new(key + 5, key + 6).unwrap(),
-    ));
+    ))
+    .with_resolution_hash_key(ruster_core::ResolutionHashKey::new(key + 7, key + 8).unwrap());
     ValidatedCandidate::new(plan).unwrap()
 }
 

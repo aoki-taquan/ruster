@@ -15,15 +15,15 @@ use crate::config_cmd::{
 /// Every table at its production limit (fixture header).
 pub const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-max.toml");
 
-/// Runtime storage of [`MAXIMAL`] in bytes (36.45 MiB).
-pub const MAXIMAL_STORAGE_BYTES: u64 = 38_224_064;
+/// Runtime storage of [`MAXIMAL`] in bytes (51.11 MiB).
+pub const MAXIMAL_STORAGE_BYTES: u64 = 53_592_256;
 
 /// Which production bound a table has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Bound {
-    /// A per-packet path scans it: `max_scanned_slots_per_table`.
-    Scanned,
-    /// NAT44 and firewall: `max_slots_per_table`.
+    /// Each slot holds a quoted datagram: `max_quote_slots_per_table`.
+    Quote,
+    /// Every other table: `max_slots_per_table`.
     Table,
 }
 
@@ -31,7 +31,7 @@ impl Bound {
     /// The production limit of this kind of table.
     pub const fn production(self) -> u32 {
         match self {
-            Self::Scanned => PRODUCTION_VALIDATION_LIMITS.max_scanned_slots_per_table,
+            Self::Quote => PRODUCTION_VALIDATION_LIMITS.max_quote_slots_per_table,
             Self::Table => PRODUCTION_VALIDATION_LIMITS.max_slots_per_table,
         }
     }
@@ -44,37 +44,37 @@ pub const CAPACITY_FIELDS: [(&str, &str, &str, Bound); 11] = [
         "resolution.capacity",
         "states",
         "resolution.capacity.states",
-        Bound::Scanned,
+        Bound::Table,
     ),
     (
         "resolution.capacity",
         "actions",
         "resolution.capacity.actions",
-        Bound::Scanned,
+        Bound::Table,
     ),
     (
         "resolution.capacity",
         "dynamic-neighbors",
         "resolution.capacity.dynamic-neighbors",
-        Bound::Scanned,
+        Bound::Table,
     ),
     (
         "resolution.capacity",
         "failure-holds",
         "resolution.capacity.failure-holds",
-        Bound::Scanned,
+        Bound::Quote,
     ),
     (
         "icmpv4-errors.capacity",
         "states",
         "icmpv4-errors.capacity.states",
-        Bound::Scanned,
+        Bound::Table,
     ),
     (
         "icmpv4-errors.capacity",
         "actions",
         "icmpv4-errors.capacity.actions",
-        Bound::Scanned,
+        Bound::Quote,
     ),
     (
         "nat44.udp.capacity",
@@ -141,7 +141,7 @@ fn the_limits_table_is_pinned() {
         SIM_VALIDATION_LIMITS,
         ValidationLimits {
             max_slots_per_table: 65_536,
-            max_scanned_slots_per_table: 65_536,
+            max_quote_slots_per_table: 65_536,
             max_runtime_bytes: 64 << 20,
         }
     );
@@ -149,7 +149,7 @@ fn the_limits_table_is_pinned() {
         PRODUCTION_VALIDATION_LIMITS,
         ValidationLimits {
             max_slots_per_table: 65_536,
-            max_scanned_slots_per_table: 4_096,
+            max_quote_slots_per_table: 4_096,
             max_runtime_bytes: 64 << 20,
         }
     );
@@ -212,7 +212,7 @@ fn validate_accepts_the_maximal_production_config() {
 
 /// For every table: at its production limit accepted (every table of
 /// [`MAXIMAL`] is), one slot above refused with a typed, value-free line
-/// and exit 2, by `validate` and by the loader `ruster run` uses. A scanned
+/// and exit 2, by `validate` and by the loader `ruster run` uses. A quote
 /// table above the production limit is still within the simulator's, so
 /// the same document with a sim backend is accepted: `validate` (and
 /// `run`) of af-xdp must not fall back to the sim limits.
@@ -233,25 +233,76 @@ fn validate_refuses_each_table_one_slot_above_the_production_limit() {
         assert_eq!(format!("ruster: invalid config: {}\n", error.render()), err);
         let (status, _, err) = validate_text(&as_sim(&above));
         match bound {
-            Bound::Scanned => assert_eq!(status, 0, "{path} as sim: {err}"),
+            Bound::Quote => assert_eq!(status, 0, "{path} as sim: {err}"),
             Bound::Table => assert_eq!(err, above_line(path, limit), "{path} as sim"),
         }
     }
-    // The simulator's own bound for the scanned tables is unchanged.
+    // The simulator's own bound for the quote tables is unchanged.
     let sim = with_capacity(
         &as_sim(MAXIMAL),
         "resolution.capacity",
-        "dynamic-neighbors",
-        SIM_VALIDATION_LIMITS.max_scanned_slots_per_table + 1,
+        "failure-holds",
+        SIM_VALIDATION_LIMITS.max_quote_slots_per_table + 1,
     );
     let (status, _, err) = validate_text(&sim);
     assert_eq!(status, crate::EXIT_INVALID);
     assert_eq!(
         err,
         above_line(
-            "resolution.capacity.dynamic-neighbors",
-            SIM_VALIDATION_LIMITS.max_scanned_slots_per_table
+            "resolution.capacity.failure-holds",
+            SIM_VALIDATION_LIMITS.max_quote_slots_per_table
         )
+    );
+}
+
+/// H4b review: `validate` of an af-xdp document warns (exit 0, value-free)
+/// when a resolution table takes more than about 1 s (1000 ticks) to sweep;
+/// the maximal config is tuned below that, a sim document never warns.
+#[test]
+fn validate_warns_about_a_slow_resolution_sweep() {
+    let (status, _, err) = validate_text(MAXIMAL);
+    assert_eq!((status, err.as_str()), (0, ""));
+    for (from, to, line) in [
+        (
+            "resolution-timer-scans = 128",
+            "resolution-timer-scans = 16",
+            "ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=4096\n",
+        ),
+        (
+            "resolution-timer-scans = 128",
+            "resolution-timer-scans = 0",
+            "ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=never\n",
+        ),
+        (
+            "failure-dispatch-scans = 16",
+            "failure-dispatch-scans = 4",
+            "ruster: warning: RESOLUTION_SWEEP_SLOW table=failure-holds ticks=1024\n",
+        ),
+    ] {
+        let text = MAXIMAL.replacen(from, to, 1);
+        assert_ne!(text, MAXIMAL, "{from}");
+        let (status, out, err) = validate_text(&text);
+        assert_eq!(status, 0, "{err}");
+        assert!(out.starts_with("valid: "), "{out}");
+        assert_eq!(err, line);
+        let (status, _, err) = validate_text(&as_sim(&text));
+        assert_eq!((status, err.as_str()), (0, ""), "as sim");
+    }
+    // Exactly at the threshold is not slow: 65536 / 66 = 993.0.. -> 994.
+    let at = MAXIMAL.replacen(
+        "resolution-timer-scans = 128",
+        "resolution-timer-scans = 66",
+        1,
+    );
+    assert_eq!(validate_text(&at).2, "");
+    let over = MAXIMAL.replacen(
+        "resolution-timer-scans = 128",
+        "resolution-timer-scans = 65",
+        1,
+    );
+    assert_eq!(
+        validate_text(&over).2,
+        "ruster: warning: RESOLUTION_SWEEP_SLOW table=states ticks=1009\n"
     );
 }
 
@@ -281,8 +332,8 @@ fn plan_loads_each_side_with_its_backend_limits() {
         with_capacity(
             text,
             "resolution.capacity",
-            "dynamic-neighbors",
-            Bound::Scanned.production() + 1,
+            "failure-holds",
+            Bound::Quote.production() + 1,
         )
     };
     // A sim current side may use the simulator's wider bound...
@@ -294,8 +345,8 @@ fn plan_loads_each_side_with_its_backend_limits() {
     assert_eq!(
         err,
         above_line(
-            "resolution.capacity.dynamic-neighbors",
-            Bound::Scanned.production()
+            "resolution.capacity.failure-holds",
+            Bound::Quote.production()
         )
         .replace("invalid config", "invalid next config")
     );
@@ -310,10 +361,10 @@ fn the_run_file_loader_applies_the_production_limits() {
     let at = dir.join("at.toml");
     let above = dir.join("above.toml");
     std::fs::write(&at, MAXIMAL).expect("write");
-    let limit = Bound::Scanned.production();
+    let limit = Bound::Quote.production();
     std::fs::write(
         &above,
-        with_capacity(MAXIMAL, "icmpv4-errors.capacity", "states", limit + 1),
+        with_capacity(MAXIMAL, "icmpv4-errors.capacity", "actions", limit + 1),
     )
     .expect("write");
     let loaded = load_validated_regular(&at, false);
@@ -331,6 +382,6 @@ fn the_run_file_loader_applies_the_production_limits() {
     };
     assert_eq!(
         format!("ruster: invalid config: {}\n", error.render()),
-        above_line("icmpv4-errors.capacity.states", limit)
+        above_line("icmpv4-errors.capacity.actions", limit)
     );
 }

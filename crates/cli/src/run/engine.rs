@@ -461,6 +461,14 @@ where
             }
             if let Some(outcome) = control.reloader.finish(generation, result) {
                 let _ = writeln!(err, "ruster run: {outcome}");
+                if matches!(outcome, super::reload::ReloadOutcome::Applied { .. }) {
+                    for warning in crate::config_cmd::sweep_warnings(control.reloader.current())
+                        .into_iter()
+                        .flatten()
+                    {
+                        let _ = writeln!(err, "ruster run: warning: {warning}");
+                    }
+                }
             }
             budgets = control.reloader.budgets();
             if matches!(result, TickApply::Applied(None)) {
