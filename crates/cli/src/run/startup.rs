@@ -61,6 +61,8 @@ pub enum Stage {
     Adapter,
     /// `ActivePublication::new` of generation 1.
     Activate,
+    /// The link watcher and reload worker threads (H7).
+    Workers,
     /// The privilege drop after activation (or of an output thread at
     /// spawn).
     PrivilegeDrop,
@@ -80,6 +82,7 @@ impl Stage {
             Self::Engine => "engine",
             Self::Adapter => "adapter",
             Self::Activate => "activate",
+            Self::Workers => "workers",
             Self::PrivilegeDrop => "privilege-drop",
         }
     }
@@ -103,6 +106,8 @@ pub enum Failure {
     Links(NetlinkError),
     /// The privilege drop after activation failed.
     PrivilegeDrop(DropFailure),
+    /// A worker thread could not be spawned.
+    Spawn,
     /// A failure injected by a test host.
     #[cfg(test)]
     Injected,
@@ -186,6 +191,7 @@ impl fmt::Display for Failure {
             Self::Activation(error) => write!(formatter, "code={}", token(error)),
             Self::Links(error) => write!(formatter, "code={}", token(error)),
             Self::PrivilegeDrop(error) => write!(formatter, "{error}"),
+            Self::Spawn => formatter.write_str("code=THREAD_SPAWN"),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
             #[cfg(test)]
@@ -329,12 +335,18 @@ pub trait PortHost {
     type Datapath<'s>: Datapath
     where
         Self: 's;
-    type Links: LinkMonitor;
+    /// Moved to the link watcher thread (H7), hence `Send`.
+    type Links: LinkMonitor + Send + 'static;
 
     /// Opens the run-time link watch (before the datapath is built).
     /// `devices` are the ports' interfaces and kernel device names, in
     /// `IfId` order (for the forwarding sysctls).
     fn links(&self, devices: &[(IfId, &str)]) -> Result<Self::Links, Failure>;
+
+    /// The per-thread privilege drop each worker thread runs first (the
+    /// live one drops the calling thread's privileges, see
+    /// [`super::privileges::linux::drop_thread`]).
+    fn thread_prologue(&self) -> fn(PrivilegePolicy) -> Result<(), DropFailure>;
 
     /// Capabilities and memlock for `backend`, and the preconditions of
     /// the privilege drop of `policy`, before any resource.

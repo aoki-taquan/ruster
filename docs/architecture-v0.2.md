@@ -2993,7 +2993,7 @@ sleepを挟み、busyなtickで即spinへ戻ります。idle時のwake-upは約1
 最初のframeは最大1 ms（+timer slack）RX ringで待ちます。1 msなら2048 entryのRX ringは約2 Mppsまで
 取りこぼさず、負荷中はsleepしません。socket fdの`poll`待ちはnative crateに複数fdのsyscallが要るので
 deferred（CLI-034）です。tickごとのallocationは0（counting allocatorのtest。health/link watchを毎tick
-走らせても0）。backendが自らStop（ring破損等）を
+走らせても0。link roundのrequestと受け取りも含む）。backendが自らStop（ring破損等）を
 報告するとloopを抜けexit 1です。`--stats-interval`（既定60 s、0で無効）ごとにstdoutへ
 `ruster-run-stats kind=periodic`のblock（worker observability、service counter、`af_xdp.*`、
 `if<id>.af_xdp_port.*`の`section.key=value`、`end`）をcold pathで出します。counter、gauge、flag、
@@ -3024,9 +3024,13 @@ M2 S10b（run-time operations、cold pathだけ）:
 - 起動retry（XDP-045）: port openの`BIND/BUSY`、`REGISTER_UMEM/MEMLOCK_LIMIT`/`OUT_OF_MEMORY`、
   `ERRNO_11`だけを、開いた全portのrollback後に250 ms〜2 sのbackoffで`--startup-attempts`（既定3）まで
   やり直します。他の失敗は即終了です。
-- SIGHUP reload: handlerは`RELOAD`へstoreするだけで、loopがtick境界で取り、起動と同じ
+- SIGHUP reload: handlerは`RELOAD`へstoreするだけで、loopはreloadが準備中でもpendingでもないtick境界で
+  取り（その間のSIGHUPは一つにまとまる）、worker thread `ruster-reload`へ渡します（H7）。workerは起動と同じ
   `load_validated`経路（regular fileだけ、`O_NONBLOCK`）→ `ProductionSequencer`の新candidate →
-  `ApplyPlan::for_active`（restart-requiredは拒否、dry run失敗は失敗）を通します。通ったcandidateは
+  `ApplyPlan::between`（restart-requiredは拒否）を行い、router threadはその間もtickを続け、答えを
+  `try_recv`で受けてlive dry run（`ActivePublication::check_successor`、失敗は失敗）だけを行います。
+  `ProductionSequencer`と文書は起動後ずっとworkerだけが持ち（単一所有、message passing）、適用されると
+  router threadが`Applied`を送ってworkerの基準文書を進めます。通ったcandidateは
   backendのquiescence probe（reapとkickを含むadapterのcheck、guardは即drop）がOKになったtickの
   publication phaseへ渡し、待つ間はRXを止めて最大200 msです。拒否・失敗は旧generationとstateを変えず、
   適用はPUB-006どおりNAT/FW/ARP stateをflushします。candidateをDeferredで捨てる`run_tick`の挙動に
@@ -3037,16 +3041,27 @@ M2 S10b（run-time operations、cold pathだけ）:
   閾値は`--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`（fatal 0でwarnだけ）。
   TX stallはPAUSE floodでwireから起こせるので設定可能にし、既定のfatalはforwarding既定拒否と
   kernel L3拒否によりexit後もfail closedであることを前提にしています（#302 sec M1）。
-- link watch（1 s）: 起動時に開きkernel（pid 0）へ`connect()`した一つのrtnetlink socketと事前確保
+- link watch（1 s）: worker thread `ruster-watch`が（H7。router threadは毎秒requestし、戻ったroundを
+  判定するだけ。roundは起動時に確保した一つのbufferを貸し借りし、出ているroundは最大一つ）、
+  起動時に開きkernel（pid 0）へ`connect()`した一つのrtnetlink socketと事前確保
   bufferでportのifindexを`RTM_GETLINK`し、続けて`RTM_GETADDR` dumpでkernel IPv4 addressを数えます。
   ENODEV（device削除）、startup未満のMTU、frame超のMTU、3回連続のquery失敗（address dumpとforwarding readも別々に数える）は
   fatal、link down/upとframe内のMTU上昇、run中に現れたportのkernel IPv4 addressとkernel forwardingは
   warning/recoveredだけです（attach中はkernelがportのframeを見ないので無害で、fatal exitのdetachこそが
   bypassを作るため。exit時は最後のroundで見えていれば警告行を出し、次の起動は拒否）。
+  watcherがRTNL lock待ちなどで詰まると、dueごとに`watch.link_rounds_late`を数え、roundが
+  `--link-stale-secs`（既定5 s）より古くなると以後dueごとに全portのlink query失敗一回
+  （`LINK_WATCH_STALE`、`LINK_PROBE`、3回目で`LINK_UNVERIFIABLE` fatal）とします（CLI-098）。
+- worker thread（H7、CLI-096〜CLI-101）: `ruster-watch`と`ruster-reload`はactivateの後、router threadの
+  privilege dropの前にspawnし、最初に自分のthreadのdropを行います（spawn側は結果を待つ）。router側は
+  bounded `std::sync::mpsc`への`try_send`/`try_recv`だけで、blockもallocationもapplication lockもしません。
+  停止時はloop終了でchannelを閉じ、drainと重ねて最大500 ms待ち、終わらないworkerは警告して切り離します
+  （detachとexitの遅れはloop終了から最大500 ms。XDP detach自体もRTNLを取るので、他processがRTNLを持つ間の
+  exitはH7以前と同じくkernelを待ちます）。reload準備の経過は`reload.preparing_ms`、10 sを超えると一回warningです。
 - startup checkはkernel IPv4 forwarding（global/port）を既定で拒否し、`--allow-kernel-forwarding`で
   warningにします。`--strict-config-perms`は起動時とreload時にconfigの所有者とmodeを`fstat`で確認し、
   configは常に`O_NONBLOCK|O_NOCTTY`のregular fileとして読みます。reloadの`Applied`は権威的で、
-  commit reportが無ければinvariant違反としてexit 1、停止時の待機中reloadは`STOPPED`として数えます。
+  commit reportが無ければinvariant違反としてexit 1、停止時の準備中・待機中reloadは`STOPPED`として数えます。
 - fatal eventはloopを`LoopEnd::Fatal{port, cause}`で抜け、SIGTERMと同じdrain/detach/closeの後exit 1。
   drainは誰もcancelできない失われたTX handoffを`tx_handoffs_outstanding`として報告し、0でなければexit 1
   （XDP-177）。
@@ -3059,12 +3074,14 @@ XDP link）だけです。run中のkick（`sendto`/`poll`）、`XDP_STATISTICS`�
 全threadが全capability（inheritable/permitted/effective/ambient、`CAP_SETPCAP`があればbounding）を
 落とし`no_new_privs`を立て、processをdumpable 0にし（最初のidentity変更より前と`setresuid`直後）、`--user`/`--group`ならuid/gidも切り替えます（既定on、`--keep-privileges`で
 opt-out）。credentialはthreadごとで、libcの`setuid`はprocess全体へbroadcastするため、privateな
-FFI module（`run::privileges::linux::sys`）のraw `syscall(2)`でthreadごとに行います。output threadは
-spawn時（何も書く前、spawn側は結果を待つ）、router threadはactivate後に自分を落とし、
+FFI module（`run::privileges::linux::sys`）のraw `syscall(2)`でthreadごとに行います。output threadと
+worker thread（`ruster-watch`、`ruster-reload`）はspawn時（何かをする前、spawn側は結果を待つ）、router
+threadはactivate後で最後に自分を落とし、
 `/proc/thread-self/status`で自分を、最後に`/proc/self/task/*/status`で全threadを検証します。
 失敗はstartup failureとして全portをrollbackしexit 1（`stage=privilege-drop`）。前提（identity切替の
 `CAP_SETUID`/`CAP_SETGID`、teardownが権限なしで動くkernel）は資源取得前のpreflightでexit 4。
 seccompは未実装です。`poll`待機はdeferredです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
 privileged E2Eは`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、reload、link
 down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL後のrestart、drop後の全threadの
-credentialと`--keep-privileges`）です（CLI-008〜059、CLI-089〜095、XDP-045、XDP-063、XDP-177）。
+credentialと`--keep-privileges`、大きなconfigのreload準備中もEchoが欠けないこと）です（CLI-008〜059、
+CLI-089〜101、XDP-045、XDP-063、XDP-177）。

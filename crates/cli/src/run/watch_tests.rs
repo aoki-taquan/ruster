@@ -1,6 +1,8 @@
 //! Thresholds and outcomes of the health and link watch.
 
 use super::*;
+use crate::run::engine::LinkMonitor;
+use crate::run::workers::{probe_round, LinkRound, PortRound};
 
 const PORT: IfId = IfId(1);
 // The default thresholds.
@@ -874,4 +876,152 @@ fn weak_host_warns_and_multicast_forwarding_is_forwarding() {
     let mut watch = fresh();
     assert!(exposure_round(&mut watch, Ok(0), force)
         .contains(&warning(Condition::KernelIpv6ForwardingEnabled)));
+}
+
+fn late(watch: &mut Watch, now: u64, since: u64) -> Vec<WatchEvent> {
+    let mut events = Vec::new();
+    watch.on_late_round(MonotonicMillis(now), MonotonicMillis(since), &mut |event| {
+        events.push(event)
+    });
+    events
+}
+
+/// A monitor that answers with one fixed port round.
+struct Scripted(PortRound);
+
+impl LinkMonitor for Scripted {
+    fn query(&mut self, _: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
+        self.0.link
+    }
+    fn ipv4_addresses(&mut self, _: &LinkTarget) -> Result<u32, NetlinkError> {
+        self.0.addresses.unwrap_or(Ok(0))
+    }
+    fn ipv4_routes(&mut self, _: &LinkTarget) -> Result<u32, NetlinkError> {
+        self.0.routes.unwrap_or(Ok(0))
+    }
+    fn ipv6(&mut self, _: &LinkTarget) -> Ipv6Sample {
+        self.0.ipv6.unwrap_or(Ipv6Sample::DISABLED)
+    }
+    fn forwarding(&mut self, _: &LinkTarget) -> Result<Forwarding, ()> {
+        self.0.forwarding
+    }
+    fn ipv4_weak_host(&mut self, _: &LinkTarget) -> Option<bool> {
+        self.0.weak_host
+    }
+}
+
+fn round_of(port: PortRound) -> LinkRound {
+    let mut round = LinkRound::new(1);
+    probe_round(&mut Scripted(port), &[TARGET], &mut round);
+    round
+}
+
+fn port_round(link: Result<LinkFacts, NetlinkError>, addresses: u32, routes: u32) -> PortRound {
+    let linked = link.is_ok();
+    PortRound {
+        link,
+        addresses: linked.then_some(Ok(addresses)),
+        routes: linked.then_some(Ok(routes)),
+        forwarding: Ok(Forwarding::default()),
+        weak_host: Some(false),
+        ipv6: linked.then_some(Ipv6Sample::DISABLED),
+    }
+}
+
+fn fold(watch: &mut Watch, round: &LinkRound) -> Vec<WatchEvent> {
+    let mut events = Vec::new();
+    watch.on_round(round, &mut |event| events.push(event));
+    events
+}
+
+/// The staleness rule (H7): a round still outstanding when the next is
+/// due is late only; from the stale threshold on each due round is a
+/// failed link query of every port (`LINK_PROBE`, then
+/// `LINK_UNVERIFIABLE` at the third in a row) and `LINK_WATCH_STALE`.
+#[test]
+fn a_stuck_link_round_is_late_then_stale_then_fatal() {
+    let mut watch = watch().with_link_stale_ms(5_000);
+    // Requested at 1 s; due again every second.
+    for now in [2_000, 3_000, 4_000, 5_000] {
+        assert_eq!(late(&mut watch, now, 1_000), [], "{now}");
+    }
+    assert!(
+        !watch.warning(),
+        "a brief hold costs nothing but late rounds"
+    );
+    assert_eq!(
+        late(&mut watch, 6_000, 1_000),
+        [
+            warning(Condition::LinkWatchStale),
+            warning(Condition::LinkProbe)
+        ]
+    );
+    assert_eq!(late(&mut watch, 7_000, 1_000), []);
+    assert_eq!(
+        late(&mut watch, 8_000, 1_000),
+        [fatal(Fatal::LinkUnverifiable)]
+    );
+    let rounds = watch.rounds();
+    assert_eq!((rounds.completed, rounds.late, rounds.stale), (0, 7, 3));
+    let mut text = String::new();
+    crate::run::stats::write_fields(&mut text, None, &watch);
+    assert!(text.contains("watch.state=warning\n"), "{text}");
+    assert!(
+        text.contains("watch.link_rounds=0\nwatch.link_rounds_late=7\nwatch.link_rounds_stale=3\n"),
+        "{text}"
+    );
+}
+
+/// A stuck round that comes back before the third stale round recovers
+/// everything: its link query succeeds, the failure count restarts, and
+/// the next stale episode starts from zero.
+#[test]
+fn a_returning_round_recovers_the_stale_warning() {
+    let mut watch = watch().with_link_stale_ms(2_000);
+    assert_eq!(late(&mut watch, 2_000, 1_000), []);
+    assert_eq!(
+        late(&mut watch, 3_000, 1_000),
+        [
+            warning(Condition::LinkWatchStale),
+            warning(Condition::LinkProbe)
+        ]
+    );
+    assert_eq!(late(&mut watch, 4_000, 1_000), []);
+    assert_eq!(
+        fold(&mut watch, &round_of(port_round(up(1500), 0, 0))),
+        [
+            recovered(Condition::LinkWatchStale),
+            recovered(Condition::LinkProbe)
+        ]
+    );
+    assert!(!watch.warning());
+    // Two more stale rounds are not fatal: the count restarted.
+    assert_eq!(
+        late(&mut watch, 7_000, 5_000),
+        [
+            warning(Condition::LinkWatchStale),
+            warning(Condition::LinkProbe)
+        ]
+    );
+    assert_eq!(late(&mut watch, 8_000, 5_000), []);
+    assert_eq!(watch.rounds().completed, 1);
+}
+
+/// A folded round reports what the pre-H7 synchronous round reported for
+/// the same results.
+#[test]
+fn a_folded_round_has_the_synchronous_outcomes() {
+    let mut watch = watch();
+    assert_eq!(
+        fold(&mut watch, &round_of(port_round(up(1500), 1, 2))),
+        [
+            warning(Condition::KernelIpv4Addresses),
+            warning(Condition::KernelIpv4Routes)
+        ]
+    );
+    let removed = Err(NetlinkError::Kernel(crate::run::netlink::KERNEL_ENODEV));
+    assert_eq!(
+        fold(&mut watch, &round_of(port_round(removed, 0, 0))),
+        [fatal(Fatal::DeviceRemoved)]
+    );
 }

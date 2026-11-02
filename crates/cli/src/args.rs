@@ -18,6 +18,7 @@ usage:
              [--strict-config-perms] [--stats-interval <seconds>]
              [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
              [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
+             [--link-stale-secs <s>]
              [--keep-privileges | --user <uid> --group <gid>]
              --config <config.toml>
   ruster run [options] -- <config.toml>
@@ -50,6 +51,9 @@ pub const DEFAULT_TX_STALL_WARN_SECS: u64 = 1;
 pub const DEFAULT_TX_STALL_FATAL_SECS: u64 = 10;
 /// Default `--kick-errors-fatal-secs` (0 disables the fatal exit).
 pub const DEFAULT_KICK_ERRORS_FATAL_SECS: u64 = 5;
+/// Default `--link-stale-secs`: a link round outstanding this long makes
+/// every further due round a failed link query (H7).
+pub const DEFAULT_LINK_STALE_SECS: u64 = 5;
 /// Largest accepted health threshold (one hour).
 pub const MAX_HEALTH_SECS: u64 = 3_600;
 
@@ -64,7 +68,7 @@ struct Numeric {
     max: u64,
 }
 
-const NUMERIC: [Numeric; 5] = [
+const NUMERIC: [Numeric; 6] = [
     Numeric {
         name: "--stats-interval",
         min: 0,
@@ -88,6 +92,11 @@ const NUMERIC: [Numeric; 5] = [
     Numeric {
         name: "--kick-errors-fatal-secs",
         min: 0,
+        max: MAX_HEALTH_SECS,
+    },
+    Numeric {
+        name: "--link-stale-secs",
+        min: 1,
         max: MAX_HEALTH_SECS,
     },
 ];
@@ -128,6 +137,10 @@ pub struct RunArgs {
     pub tx_stall_warn_secs: u64,
     pub tx_stall_fatal_secs: u64,
     pub kick_errors_fatal_secs: u64,
+    /// Age in seconds of an outstanding link watcher round from which
+    /// every due round counts as a failed link query (1 to 3600; no 0:
+    /// losing observability always ends the run eventually).
+    pub link_stale_secs: u64,
     /// Keep every capability after startup instead of dropping them all
     /// (the default drop is security relevant; this is the opt-out).
     pub keep_privileges: bool,
@@ -387,7 +400,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         }
     }
     let config = config.ok_or(UsageError::MissingValue("--config"))?;
-    let [interval, attempts, warn, fatal, kicks] = numbers;
+    let [interval, attempts, warn, fatal, kicks, stale] = numbers;
     let tx_stall_warn_secs = warn.unwrap_or(DEFAULT_TX_STALL_WARN_SECS);
     let tx_stall_fatal_secs = fatal.unwrap_or(DEFAULT_TX_STALL_FATAL_SECS);
     if tx_stall_fatal_secs != 0 && tx_stall_fatal_secs < tx_stall_warn_secs {
@@ -414,6 +427,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         tx_stall_warn_secs,
         tx_stall_fatal_secs,
         kick_errors_fatal_secs: kicks.unwrap_or(DEFAULT_KICK_ERRORS_FATAL_SECS),
+        link_stale_secs: stale.unwrap_or(DEFAULT_LINK_STALE_SECS),
         keep_privileges,
         user,
         group,
@@ -677,6 +691,7 @@ mod tests {
             tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
             tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
             kick_errors_fatal_secs: DEFAULT_KICK_ERRORS_FATAL_SECS,
+            link_stale_secs: DEFAULT_LINK_STALE_SECS,
             keep_privileges: false,
             user: None,
             group: None,
@@ -779,6 +794,8 @@ mod tests {
             "--tx-stall-fatal-secs",
             "0",
             "--kick-errors-fatal-secs=0",
+            "--link-stale-secs",
+            "9",
             "--config",
             "r.toml",
         ]) else {
@@ -795,6 +812,7 @@ mod tests {
             ),
             (2, 0, 0)
         );
+        assert_eq!(args.link_stale_secs, 9);
         let Ok(Command::Run(defaults)) = run(&["run", "--config", "r.toml"]) else {
             panic!("parsed");
         };
@@ -809,6 +827,7 @@ mod tests {
             ),
             (1, 10, 5)
         );
+        assert_eq!(defaults.link_stale_secs, 5);
         for flag in [
             "--allow-kernel-forwarding",
             "--allow-kernel-ipv6",
@@ -825,6 +844,8 @@ mod tests {
             ("--tx-stall-warn-secs=3601", "--tx-stall-warn-secs"),
             ("--tx-stall-fatal-secs=3601", "--tx-stall-fatal-secs"),
             ("--kick-errors-fatal-secs=-1", "--kick-errors-fatal-secs"),
+            ("--link-stale-secs=0", "--link-stale-secs"),
+            ("--link-stale-secs=3601", "--link-stale-secs"),
         ] {
             assert_eq!(
                 run(&["run", "--config", "a", word]),
@@ -871,6 +892,7 @@ mod tests {
                 tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
                 tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
                 kick_errors_fatal_secs: DEFAULT_KICK_ERRORS_FATAL_SECS,
+                link_stale_secs: DEFAULT_LINK_STALE_SECS,
                 keep_privileges: false,
                 user: None,
                 group: None,

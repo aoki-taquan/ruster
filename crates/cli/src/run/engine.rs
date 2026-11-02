@@ -10,9 +10,14 @@
 //! the O(1) state-table occupancy, and asks [`IdleBackoff`] whether to
 //! pause. Nothing on this path allocates, formats, or locks; the cold work
 //! between ticks is the periodic stats block (at most once per interval),
-//! a SIGHUP reload (only on request; see [`super::reload`]), and the health
-//! sample and rtnetlink link query round of [`super::watch`] (at most every
-//! 500 ms and 1 s; allocation-free unless an event line is printed).
+//! a SIGHUP reload (only on request; see [`super::reload`]), the health
+//! sample of [`super::watch`] (at most every 500 ms), and the link round:
+//! requested from the link watcher thread at most every 1 s and folded in
+//! when it came back ([`super::workers`], H7). Allocation-free unless an
+//! event line is printed. Neither the link round's rtnetlink and sysctl
+//! I/O nor the reload's read, parse, validation, candidate, and plan run
+//! on this thread: it only hands requests to the worker threads and takes
+//! their answers with non-blocking `try_send`/`try_recv`.
 //!
 //! A pending reload holds RX back (no tick runs) until the backend is
 //! quiescent or [`super::reload::RELOAD_QUIESCE_MS`] passed; its candidate
@@ -45,7 +50,7 @@ use std::io::Write;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ruster_control::{ActivePublication, ProductionKeySource};
+use ruster_control::ActivePublication;
 use ruster_core::{
     GeneratedPacketIo, IfId, MonotonicMillis, PacketIo, PublicationQuiescence,
     PublicationQuiescenceDisposition,
@@ -57,8 +62,9 @@ use ruster_runtime::{
 };
 
 use super::netlink::{LinkFacts, NetlinkError};
-use super::reload::{ConfigSource, ReloadCounters, Reloader, TickApply};
+use super::reload::{ReloadCounters, Reloader, TickApply};
 use super::watch::{Fatal, Forwarding, Ipv6Sample, LinkTarget, PortSample, Watch, WatchEvent};
+use super::workers::LinkWatcher;
 
 /// Idle ticks before the loop starts to sleep.
 pub const SPIN_TICKS: u32 = 64;
@@ -127,7 +133,8 @@ pub trait Datapath {
     }
 }
 
-/// rtnetlink link queries of the ports (cold path).
+/// rtnetlink link queries of the ports (cold path; the link watcher
+/// thread's, [`super::workers::probe_round`]).
 pub trait LinkMonitor {
     /// Link facts of `target`'s interface index in the router's network
     /// namespace.
@@ -341,13 +348,15 @@ pub struct LoopSettings {
     pub link_interval_ms: u64,
     /// Longest wait of a pending reload for quiescence.
     pub reload_quiesce_ms: u64,
+    /// A reload preparation running this long is warned once.
+    pub reload_prepare_warn_ms: u64,
 }
 
 /// The cold-path control of the loop: reload, health, and link watch.
-pub struct Control<K: ProductionKeySource, R, L> {
-    pub reloader: Reloader<K, R>,
+pub struct Control {
+    pub reloader: Reloader,
     pub watch: Watch,
-    pub links: L,
+    pub links: LinkWatcher,
 }
 
 /// What a periodic stats block reads besides the publication and backend.
@@ -357,20 +366,20 @@ pub struct RunStatus<'a> {
 }
 
 /// Runs ticks until a stop request, a backend stop, or a fatal watch
-/// event. Between ticks (cold path): a reload request is prepared and,
-/// once the backend is quiescent, its candidate rides the next tick's
-/// publication phase; the health and link watch sample at their
-/// intervals; `periodic` is called once per `stats_interval_ms`. Lines go
-/// to `err`.
+/// event. Between ticks (cold path): a reload request goes to the reload
+/// worker; its prepared candidate, once dry-run and once the backend is
+/// quiescent, rides the next tick's publication phase; the health watch
+/// samples and the link watcher is asked for a round at their intervals;
+/// `periodic` is called once per `stats_interval_ms`. Lines go to `err`.
 #[allow(clippy::too_many_arguments)]
-pub fn run_loop<'s, D, C, S, K, R, L, E, F>(
+pub fn run_loop<'s, D, C, S, E, F>(
     active: &mut ActivePublication<'s, D::Io>,
     datapath: &mut D,
     observer: &mut TickObserver,
     clock: &mut C,
     stop: &S,
     settings: LoopSettings,
-    control: &mut Control<K, R, L>,
+    control: &mut Control,
     err: &mut E,
     mut periodic: F,
 ) -> LoopEnd
@@ -378,9 +387,6 @@ where
     D: Datapath,
     C: Clock,
     S: StopSignal,
-    K: ProductionKeySource,
-    R: ConfigSource,
-    L: LinkMonitor,
     E: Write,
     F: FnMut(&ActivePublication<'s, D::Io>, &D, &TickObserver, &RunStatus<'_>, MonotonicMillis),
 {
@@ -395,14 +401,27 @@ where
         let now = clock.now();
         datapath.set_clock(now);
         let generation = active.generation();
-        if control.reloader.pending_since().is_none() && stop.take_reload() {
+        if !control.reloader.busy() && stop.take_reload() {
             let _ = writeln!(
                 err,
                 "ruster run: reload requested (generation {generation})"
             );
-            if let Some(outcome) = control.reloader.prepare(active, now) {
+            if let Some(outcome) = control.reloader.request(generation, now) {
                 let _ = writeln!(err, "ruster run: {outcome}");
             }
+        }
+        if let Some(outcome) = control.reloader.poll(active, now) {
+            let _ = writeln!(err, "ruster run: {outcome}");
+        }
+        if let Some(seconds) = control
+            .reloader
+            .observe_preparation(now, settings.reload_prepare_warn_ms)
+        {
+            let _ = writeln!(
+                err,
+                "ruster run: warning: reload preparation running for {seconds} s; \
+                 later SIGHUPs are held"
+            );
         }
         let mut candidate = None;
         if let Some(since) = control.reloader.pending_since() {
@@ -462,10 +481,7 @@ where
             if let Some(outcome) = control.reloader.finish(generation, result) {
                 let _ = writeln!(err, "ruster run: {outcome}");
                 if matches!(outcome, super::reload::ReloadOutcome::Applied { .. }) {
-                    for warning in crate::config_cmd::sweep_warnings(control.reloader.current())
-                        .into_iter()
-                        .flatten()
-                    {
+                    for warning in control.reloader.sweep().into_iter().flatten() {
                         let _ = writeln!(err, "ruster run: warning: {warning}");
                     }
                 }
@@ -507,19 +523,19 @@ where
     }
 }
 
-/// The health sample and link query round, when due. Returns the first
-/// fatal event as the loop end.
-fn watch_step<D, K, R, L, E>(
+/// The health sample when due, and the link round: a finished round is
+/// folded in, a due one is requested (or counted late, and stale past the
+/// threshold, while the previous one still runs). Returns the first fatal
+/// event as the loop end.
+pub(super) fn watch_step<D, E>(
     datapath: &D,
-    control: &mut Control<K, R, L>,
+    control: &mut Control,
     now: MonotonicMillis,
     settings: LoopSettings,
     err: &mut E,
 ) -> Option<LoopEnd>
 where
     D: Datapath,
-    K: ProductionKeySource,
-    L: LinkMonitor,
     E: Write,
 {
     let mut end = None;
@@ -536,28 +552,19 @@ where
     if watch.health_due(now, settings.health_interval_ms) {
         datapath.sample_ports(&mut |sample| watch.on_sample(now, sample, &mut on_event));
     }
+    if let Some(round) = control.links.poll() {
+        watch.on_round(round, &mut on_event);
+    }
     if watch.link_due(now, settings.link_interval_ms) {
-        for index in 0..watch.port_count() {
-            let Some(target) = watch.target(index) else {
-                break;
-            };
-            let result = control.links.query(&target);
-            let linked = result.is_ok();
-            watch.on_link(index, result, &mut on_event);
-            if linked {
-                let addresses = control.links.ipv4_addresses(&target);
-                watch.on_addresses(index, addresses, &mut on_event);
-                let routes = control.links.ipv4_routes(&target);
-                watch.on_ipv4_routes(index, routes, &mut on_event);
+        if !control.links.request(now) {
+            if let Some(since) = control.links.running_since() {
+                watch.on_late_round(now, since, &mut on_event);
             }
-            let forwarding = control.links.forwarding(&target);
-            watch.on_forwarding(index, forwarding, &mut on_event);
-            let weak_host = control.links.ipv4_weak_host(&target);
-            watch.on_weak_host(index, weak_host, &mut on_event);
-            if linked {
-                let ipv6 = control.links.ipv6(&target);
-                watch.on_ipv6(index, ipv6, &mut on_event);
-            }
+        }
+        // A round that is already back (test lockstep, or a fast watcher)
+        // is folded in at once.
+        if let Some(round) = control.links.poll() {
+            watch.on_round(round, &mut on_event);
         }
     }
     end

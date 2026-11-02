@@ -147,6 +147,20 @@
 #             restart (bounded retry of the transient BIND/BUSY or
 #             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
 #             test only) and forward again, then SIGTERM, exit 0
+#   workers   (H7) the link watcher and the reload worker are threads of
+#             their own (ruster-watch, ruster-reload; every thread dropped
+#             and switched to the invoking user,
+#             threads=5). A ~0.9 MiB config (4000 routes, 2400 firewall
+#             rules, a changed UMEM: restart-required) takes the reload
+#             worker hundreds of milliseconds to read, validate, and plan in
+#             this debug build; three SIGHUPs during a 500 pps ping flood
+#             from host A to the router coalesce into two refused reloads
+#             (reload.requested=2), and the flood loses no Echo and its
+#             longest round trip stays far below the preparation time (before
+#             H7 RX stopped for the whole preparation: a 128-entry RX ring
+#             overflows within 0.3 s at that rate). Link rounds keep coming
+#             (watch.link_rounds, no stale round); SIGTERM exits 0 with no
+#             abandoned worker and nothing attached
 #   stuck     stdout on a FIFO that is held open but never read: the stats
 #             blocks fill it (checked: queued bytes at capacity and not
 #             moving), yet SIGTERM still drains, detaches, and the process
@@ -163,7 +177,7 @@ case ${RUSTER_REQUIRE_PRIV-} in
     ;;
 esac
 
-for tool in cargo ip sudo python3 od ethtool ps; do
+for tool in cargo ip sudo python3 od ethtool ps ping date; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "priv-run-smoke: missing $tool" >&2
         exit 1
@@ -618,10 +632,25 @@ status_row() {
     printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tr -s '[:space:]' ' ' | sed 's/ $//'
 }
 
+# H7: the threads of the running ruster ($ruster_pid) are at least the
+# router, the two output threads, the link watcher (ruster-watch), and the
+# reload worker (ruster-reload). $1 names the phase, $2 the count.
+assert_workers() {
+    [ "$2" -ge 5 ] || fail "$1: only $2 thread(s)"
+    for want in ruster-watch ruster-reload ruster-stdout ruster-stderr; do
+        found=
+        for task in $(sudo -n ls "/proc/$ruster_pid/task"); do
+            [ "$(sudo -n cat "/proc/$ruster_pid/task/$task/comm")" = "$want" ] && found=1
+        done
+        [ -n "$found" ] || fail "$1: no thread $want"
+    done
+}
+
 # H6: every thread of the running ruster ($ruster_pid) holds no
 # capability (inheritable, permitted, effective, ambient, bounding) and
 # has NoNewPrivs 1; with $2 = "<uid> <gid>" also that uid/gid in every
-# field and no supplementary group. Sets `threads`.
+# field and no supplementary group. Sets `threads`. Covers the H7 worker
+# threads (assert_workers).
 assert_dropped() {
     name=$1
     ids=${2-}
@@ -651,7 +680,7 @@ assert_dropped() {
         fi
         threads=$((threads + 1))
     done
-    [ "$threads" -ge 3 ] || fail "$name: only $threads thread(s)"
+    assert_workers "$name" "$threads"
 }
 
 # H6 --keep-privileges: every thread still has CAP_NET_ADMIN (bit 12)
@@ -667,7 +696,102 @@ assert_kept() {
         [ "$(status_row "$st" NoNewPrivs)" = 0 ] || fail "$name: task $task NoNewPrivs set"
         threads=$((threads + 1))
     done
-    [ "$threads" -ge 3 ] || fail "$name: only $threads thread(s)"
+    assert_workers "$name" "$threads"
+}
+
+# The config of the workers phase (argv: base config, routes, rules): the
+# base with that many extra routes (10.x.y.0/24 via the WAN gateway) and
+# UDP deny rules, appended as further array-of-tables entries.
+BIG_CONFIG='
+import sys
+out = [open(sys.argv[1]).read()]
+for i in range(int(sys.argv[2])):
+    out.append("[[routes]]\nprefix = \"10.%d.%d.0/24\"\negress = \"wan\"\nvia = \"203.0.113.1\"\n" % (i // 250, i % 250))
+for i in range(int(sys.argv[3])):
+    out.append(
+        "[[firewall.rules]]\nid = %d\ningress = \"lan\"\negress = \"wan\"\n"
+        "source = \"192.168.1.0/24\"\ndestination = \"10.%d.%d.1/32\"\n"
+        "protocol = \"udp\"\naction = \"deny\"\n"
+        "[firewall.rules.source-ports]\nfirst = 1\nlast = 65535\n"
+        "[firewall.rules.destination-ports]\nfirst = 9\nlast = 9\n" % (1000 + i, i // 250, i % 250))
+sys.stdout.write("\n".join(out))
+'
+
+# workers (H7): a large reload is prepared off the router thread while a
+# ping flood is answered without loss, and SIGHUPs coalesce.
+phase_workers() {
+    # A changed LAN UMEM (frame-count) makes it restart-required: refused
+    # only after the whole preparation, with no quiescence hold.
+    sed '0,/frame-count = 512/s//frame-count = 1024/' "$work/router.toml" >"$work/big-base.toml"
+    python3 -I -c "$BIG_CONFIG" "$work/big-base.toml" 4000 2400 >"$work/big.toml"
+    big_bytes=$(wc -c <"$work/big.toml")
+    [ "$big_bytes" -le 1048576 ] || fail "workers: the big config has $big_bytes bytes"
+    status=0
+    "$binary_path" validate "$work/big.toml" >"$work/validate-big.txt" 2>&1 || status=$?
+    [ "$status" -eq 0 ] || fail "workers: validate exit status $status: $(cat "$work/validate-big.txt")"
+    grep -q " routes=4003 .* firewall-rules=2403 " "$work/validate-big.txt" ||
+        fail "workers: validate: $(cat "$work/validate-big.txt")"
+    cp "$work/router.toml" "$work/workers.toml"
+    # As the invoking user, who can read the work directory on reload.
+    start_ruster workers "$work/workers.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready workers || fail "workers: ruster exited during startup"
+    assert_dropped workers "$smoke_uid $smoke_gid"
+    grep -qxF "ruster run: privileges dropped: threads=5 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched" \
+        "$work/workers.err" || fail "workers: no privilege drop line for 5 threads"
+    # ARP and the echo path first.
+    in_ns "$host_a" ping -n -q -c 3 -i 0.2 -W 2 192.168.1.1 >"$work/workers-warm.txt" 2>&1 ||
+        fail "workers: the router does not answer ping: $(cat "$work/workers-warm.txt")"
+    in_ns "$host_a" ping -n -q -c 3000 -i 0.002 -W 2 192.168.1.1 >"$work/workers-ping.txt" 2>&1 &
+    pinger=$!
+    sleep 0.5
+    cp "$work/big.toml" "$work/workers.toml.next"
+    mv "$work/workers.toml.next" "$work/workers.toml"
+    started=$(date +%s%N)
+    signal_ruster HUP
+    # Two more while the first is prepared: they coalesce into one.
+    wait_line workers "reload requested (generation 1)"
+    grep -qF "reload refused" "$work/workers.err" &&
+        fail "workers: the reload ended before the coalescing SIGHUPs"
+    signal_ruster HUP
+    signal_ruster HUP
+    refused="reload refused: code=RESTART_REQUIRED reasons=BACKEND; generation 1 keeps running"
+    wait_line workers "$refused"
+    prepared_ms=$((($(date +%s%N) - started) / 1000000))
+    kill -0 "$pinger" 2>/dev/null || fail "workers: the ping flood ended before the reload was prepared"
+    tries=0
+    while [ "$(grep -cF -- "$refused" "$work/workers.err")" -lt 2 ]; do
+        launcher_alive || fail "workers: exited while waiting for the second reload"
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "workers: the coalesced reload never ended"
+        sleep 0.05
+    done
+    kill -0 "$pinger" 2>/dev/null || fail "workers: the ping flood ended before the second reload"
+    status=0
+    wait "$pinger" || status=$?
+    summary=$(cat "$work/workers-ping.txt")
+    sent=$(printf '%s\n' "$summary" | sed -n 's/^\([0-9]*\) packets transmitted, \([0-9]*\) received.*/\1/p')
+    got=$(printf '%s\n' "$summary" | sed -n 's/^\([0-9]*\) packets transmitted, \([0-9]*\) received.*/\2/p')
+    # Whole milliseconds of the longest round trip (the integer part, so no
+    # leading-zero arithmetic such as 0907).
+    max_ms=$(printf '%s\n' "$summary" | sed -n 's|^rtt min/avg/max/mdev = [0-9.]*/[0-9.]*/\([0-9]*\)\.[0-9]*/.*|\1|p')
+    [ -n "$sent" ] && [ -n "$got" ] && [ -n "$max_ms" ] || fail "workers: ping summary: $summary"
+    [ "$prepared_ms" -ge 200 ] ||
+        fail "workers: the reload was prepared in $prepared_ms ms; too fast to show a stall"
+    [ "$got" -eq "$sent" ] || fail "workers: $got of $sent echoes answered during the reloads"
+    [ "$max_ms" -lt 100 ] && [ "$max_ms" -lt $((prepared_ms / 4)) ] ||
+        fail "workers: longest round trip $max_ms ms during a $prepared_ms ms preparation"
+    wait_block workers watch.link_rounds_stale=0
+    rounds=$(stat_in "$work/workers.block" watch.link_rounds)
+    [ "${rounds:-0}" -ge 2 ] || fail "workers: watch.link_rounds=${rounds:-missing}"
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "workers: exit status $status after SIGTERM"
+    assert_detached "the workers phase"
+    ! grep -q "did not end within" "$work/workers.err" || fail "workers: a worker was abandoned"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/workers.out" >"$work/workers.final"
+    block_has "$work/workers.final" reload.requested=2 reload.refused=2 reload.applied=0 \
+        reload.failed=0 watch.link_rounds_stale=0 watch.state=ok privileges.threads=5
+    echo "priv_run_workers: threads ruster-watch and ruster-reload present and dropped (threads=5); a $big_bytes-byte reload prepared for $prepared_ms ms off the router thread while $got of $sent pings (500 pps) were answered, longest round trip $max_ms ms; three SIGHUPs coalesced into two refused reloads; $rounds link rounds, none stale; exit 0, detached verified"
 }
 
 # Host A's view of router-generated ICMPv4 (argv: mode target ttl marker
@@ -870,7 +994,7 @@ wait_ready forward || fail "forward: ruster exited during startup"
 case $(xdp_on ra) in xdp\ [0-9]*) ;; *) fail "forward: no native XDP on ra" ;; esac
 case $(xdp_on rb) in xdp\ [0-9]*) ;; *) fail "forward: no native XDP on rb" ;; esac
 assert_dropped forward
-grep -qxF "ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged" \
+grep -qxF "ruster run: privileges dropped: threads=5 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged" \
     "$work/forward.err" || fail "forward: no privilege drop line"
 forward_once forward
 echo "priv_run_privileges_dropped: all $threads threads CapInh/CapPrm/CapEff/CapAmb/CapBnd=0 NoNewPrivs=1 uid 0, forwarding after the drop verified"
@@ -884,13 +1008,15 @@ sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/forward.out" >"$work/for
 block_has "$work/forward.final" observer.state=healthy observer.generation=1 watch.state=ok \
     resolution_index.state_probe_exhausted=0 resolution_index.index_corrupt=0 \
     privileges.state=dropped privileges.bounding_set=cleared privileges.identity=unchanged \
-    privileges.threads=3
+    privileges.threads=5
 received=$(sed -n 's/^rx.received=//p' "$work/forward.out" | tail -n 1)
 [ "${received:-0}" -ge 1 ] || fail "forward: final rx.received is ${received:-missing}"
 grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
     "$work/forward.err" || fail "forward: no shutdown summary"
 cat "$work/forward.err"
 echo "priv_run_shutdown: SIGTERM exit 0, XDP detached, final counters (rx.received=$received) verified"
+
+phase_workers
 
 # limits (H3): every table at its production limit runs; one slot above a
 # quote table is refused by validate and run, not by the sim limits.
@@ -932,7 +1058,7 @@ cp "$work/router.toml" "$work/ops.toml"
 start_ruster ops "$work/ops.toml" --user "$smoke_uid" --group "$smoke_gid"
 wait_ready ops || fail "ops: ruster exited during startup"
 assert_dropped ops "$smoke_uid $smoke_gid"
-grep -qxF "ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched" \
+grep -qxF "ruster run: privileges dropped: threads=5 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched" \
     "$work/ops.err" || fail "ops: no identity switch line"
 echo "priv_run_privileges_identity: all $threads threads switched to the invoking uid/gid (real, effective, saved, fs) with no supplementary group, no capability, NoNewPrivs=1 verified"
 forward_once ops-before
@@ -1124,8 +1250,10 @@ tcp = tcp[:16] + struct.pack("!H", 0xFFFF - fold(pseudo + tcp)) + tcp[18:]
 icmp_raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
 icmp_raw.settimeout(0.1)
 syn = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-syn.sendto(tcp, ("203.0.113.2", 0))
+# Read the clock before the send: the router may receive (and start its
+# hold) before sendto returns, so a later reading shortens the delay.
 sent = time.monotonic()
+syn.sendto(tcp, ("203.0.113.2", 0))
 answers = []
 while time.monotonic() - sent < wait:
     try:

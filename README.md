@@ -661,8 +661,8 @@ sudo kill -HUP <pid>                                               # configをre
   既定でonで、`--keep-privileges`で無効にできます（起動後も全capabilityを持ち続けるrisk付きの
   opt-out）。`--user <uid> --group <gid>`（数値、両方そろえて）は同時にreal/effective/saved/fsの
   uid/gidを切り替えsupplementary groupを消します（`CAP_SETUID`/`CAP_SETGID`が必要）。credentialは
-  threadごとなので、stdout/stderrのoutput threadはspawn時に自分で、router threadはactivate後に
-  自分でraw syscall（libcのprocess全体へのset-id broadcastは使わない）で落とし、最後に
+  threadごとなので、stdout/stderrのoutput threadとlink watcher/reload workerのthread（H7）は
+  spawn時に自分で、router threadはactivate後に最後に自分でraw syscall（libcのprocess全体へのset-id broadcastは使わない）で落とし、最後に
   `/proc/self/task/*/status`で全threadを確かめます。どれかが失敗すれば全portをrollbackして
   `stage=privilege-drop`でexit 1（fail closed）。drop後もRX/TX kick、`XDP_STATISTICS`、link watch
   （netlink dump）、SIGHUP reload、health/device eventのfatal、drain、detachは権限なしで動きます
@@ -745,9 +745,11 @@ sudo kill -HUP <pid>                                               # configをre
   `BIND/BUSY`、`REGISTER_UMEM/MEMLOCK_LIMIT`（`OUT_OF_MEMORY`）、`ERRNO_11`だけは開いた全portを
   rollbackしてから250 ms（倍々、最大2 s）後に起動全体をやり直します。`--startup-attempts`
   （1〜10、既定3、1でretryなし）が上限で、他の失敗はretryしません。
-- SIGHUP reload: handlerはflagを立てるだけで、tick境界で`--config`を起動時と同じ経路で読み直して
-  validateし（regular file以外は拒否）、新generationのcandidateを作り`ApplyPlan::for_active`で
-  稼働中generationと比べます。restart-required（`[backend]`、interface id/MAC、storage shape、
+- SIGHUP reload: handlerはflagを立てるだけで、tick境界でreload worker thread（`ruster-reload`、H7）へ
+  渡します。workerが`--config`を起動時と同じ経路で読み直してvalidateし（regular file以外は拒否）、
+  新generationのcandidateを作り（production key sequencerは起動後ずっとworkerだけが持つ）、
+  稼働中generationの文書と比べます。その間もrouter threadはtickを続け、答えを受けてlive dry runだけを
+  行います。準備中・待機中のSIGHUPは一つにまとまって後で一回reloadされます。restart-required（`[backend]`、interface id/MAC、storage shape、
   resolution/ICMPv4 policy）は`reload refused: code=RESTART_REQUIRED reasons=...`、読めない・不正・
   dry run失敗は`reload failed: stage=... code=...`で、どちらも旧generationがそのまま動き続けます。
   通ればbackendがquiescent（旧generationのTXがkernelに無い）になったtick境界でpublication phaseへ
@@ -755,12 +757,17 @@ sudo kill -HUP <pid>                                               # configをre
   `reload applied: generation=N previous=P; interfaces=.. routes=.. firewall-rules=.. ...; flushed ...`
   です（件数で切り詰められたconfigに気づける）。適用時はcontrol-planeの契約どおり
   ARP学習・NAT44 mapping・firewall flowをflushし（hash keyがrotateする）、counterは保持します。
-  `reload.requested|applied|refused|failed`をstatsに出し、停止時に待機中のreloadは
-  `stage=quiesce code=STOPPED`で数えるのでfinalでは常にrequested = applied + refused + failedです。
-  parse/planとquiescence待ちはrouter threadで同期的に走るため、負荷中はRX ringが溢れ得ます
+  `reload.requested|applied|refused|failed`をstatsに出し、停止時に準備中・待機中のreloadは
+  `stage=prepare|quiesce code=STOPPED`で数えるのでfinalでは常にrequested = applied + refused + failedです。
+  準備中のreloadの経過は`reload.preparing_ms`に出し、10 sを超えると一回だけ
+  `warning: reload preparation running for N s; later SIGHUPs are held`を出します。
+  quiescence待ち（最大200 ms）だけはRXを止めるので、負荷中はその間にRX ringが溢れ得ます
   （`kernel_rx_ring_full`）。SIGHUPで`ruster run`は終了しません。
 - health/link watch（cold path）: 500 msごとにportのcounterを、1 sごとにrtnetlink `RTM_GETLINK`で
-  linkを見ます。最古のin-flight TX frameが完了しない`TX_STALL`は既定1 sでwarning、10 sでfatal、
+  linkを見ます（rtnetlinkとsysctlのroundはlink watcher thread `ruster-watch`が行い、router threadは
+  戻った結果を判定するだけ。H7。RTNL lock待ちでwatcherが詰まってもforwardingは止まらず、roundが
+  `--link-stale-secs`（既定5）より古くなると以後dueごとにlink query失敗として数え
+  `LINK_WATCH_STALE`、3回目で`LINK_UNVERIFIABLE` fatal）。最古のin-flight TX frameが完了しない`TX_STALL`は既定1 sでwarning、10 sでfatal、
   `FILL_STARVED`はwarningだけ、`ENETDOWN`以外のkick errorが続く`KICK_ERRORS`は既定5 sでfatal。
   `--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`で変えられ、fatalを0にすると
   warningだけです（802.3x PAUSE floodのようにwireからTX stallを起こせる環境向け。既定がfatalなのは
@@ -780,7 +787,8 @@ sudo kill -HUP <pid>                                               # configをre
   `if<id>.watch.*`。行はすべて`warning:|recovered:|fatal: port=if<id> health=<CODE>`のvalue-free形式。
 - stats: `ruster-run-stats kind=periodic|final uptime-ms=N`の後に`section.key=value`行
   （`observer.*`、`health.*`、`tick.*`、`rx.*`、`drop.*`、`af_xdp.*`、`if<id>.af_xdp_port.*`、
-  `reload.*`、`watch.*`、`if<id>.watch.*`等）と
+  `reload.*`、`watch.*`（`watch.link_rounds`/`link_rounds_late`/`link_rounds_stale`を含む）、
+  `if<id>.watch.*`等）と
   `end`。counterとlabelだけでaddress、MAC、device名、key、seedは出しません。
 - idle時は64 tick spinした後50 µsから1 msまで倍々でsleepします（idle後最初のframeは最大約1 ms
   遅れる。負荷中はsleepしない）。

@@ -54,6 +54,10 @@ impl PortHost for LinuxHost {
         privileges::linux::drop_process(identity)
     }
 
+    fn thread_prologue(&self) -> fn(PrivilegePolicy) -> Result<(), DropFailure> {
+        drop_worker_thread
+    }
+
     fn open(&self, port: &ValidatedAfXdpPortV1) -> Result<NativeSession, Failure> {
         let config = SessionConfig::new(
             port.device(),
@@ -123,6 +127,12 @@ impl PortHost for LinuxHost {
     fn close(&self, session: NativeSession) -> Result<(), CloseFailure> {
         session.close().map_err(CloseFailure::Cleanup)
     }
+}
+
+/// The prologue of a worker thread: drops the calling thread's privileges
+/// (nothing with [`PrivilegePolicy::Keep`]).
+fn drop_worker_thread(policy: PrivilegePolicy) -> Result<(), DropFailure> {
+    privileges::linux::drop_thread(policy).map(drop)
 }
 
 /// The interface an adapter setup error names, if any.
