@@ -58,7 +58,7 @@ use ruster_runtime::{
 
 use super::netlink::{LinkFacts, NetlinkError};
 use super::reload::{ConfigSource, ReloadCounters, Reloader, TickApply};
-use super::watch::{Fatal, Forwarding, LinkTarget, PortSample, Watch, WatchEvent};
+use super::watch::{Fatal, Forwarding, Ipv6Sample, LinkTarget, PortSample, Watch, WatchEvent};
 
 /// Idle ticks before the loop starts to sleep.
 pub const SPIN_TICKS: u32 = 64;
@@ -135,6 +135,14 @@ pub trait LinkMonitor {
 
     /// Kernel IPv4 addresses on `target`'s interface index.
     fn ipv4_addresses(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError>;
+
+    /// Kernel IPv4 routes out of `target`'s interface index in every
+    /// table.
+    fn ipv4_routes(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError>;
+
+    /// The kernel IPv6 facts of `target`'s port ([`Ipv6Sample`]). Cold
+    /// path, no allocation.
+    fn ipv6(&mut self, target: &LinkTarget) -> Ipv6Sample;
 
     /// The kernel IPv4 forwarding sysctls (global and `target`'s device);
     /// `Err` if either is unreadable. Cold path, no allocation.
@@ -526,9 +534,15 @@ where
             if linked {
                 let addresses = control.links.ipv4_addresses(&target);
                 watch.on_addresses(index, addresses, &mut on_event);
+                let routes = control.links.ipv4_routes(&target);
+                watch.on_ipv4_routes(index, routes, &mut on_event);
             }
             let forwarding = control.links.forwarding(&target);
             watch.on_forwarding(index, forwarding, &mut on_event);
+            if linked {
+                let ipv6 = control.links.ipv6(&target);
+                watch.on_ipv6(index, ipv6, &mut on_event);
+            }
         }
     }
     end

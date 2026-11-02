@@ -75,7 +75,7 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `run`（x86_64 LinuxのAF_XDP static router、下の「`ruster run`」）を提供し、SIGINT/SIGTERMは
   private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
   flag。`run`のSIGHUPはreload flagへstoreするだけ）。`unsafe`はそのhandlerと`run`のrtnetlink
-  query（address dumpとlink）だけです（下の「使い方」）。
+  query（IPv4/IPv6のaddress dump、全tableのroute dump、link）だけです（下の「使い方」）。
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
@@ -592,9 +592,19 @@ sudo kill -HUP <pid>                                               # configをre
   NICやRSS/ntupleで全trafficをbind queueへ寄せたなら`--allow-multi-queue`、他queueのframeは
   XDPが捨てる）。MTU + 14がUMEM frame（`frame-size - 256 - headroom`）に収まること
   （`MTU_ABOVE_FRAME`）。port上に
-  kernelのIPv4 addressとIPv4 route（main table）を置かない（`ip -4 addr flush dev <dev>`）。
+  kernelのIPv4 addressと、portを出口にするIPv4 route（rtnetlink `RTM_GETROUTE`で全table、
+  policy routing tableとmultipath nexthopを含む）を置かない（`ip -4 addr flush dev <dev>`）。
   attach中は無意味で、停止中やcrash後にkernelがfirewall/NATを迂回してforwardし得るためで、
   `stage=checks code=KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`MULTI_QUEUE_DEVICE`で拒否します。
+  routerはIPv4だけなので、portのIPv6はoffを推奨します（`sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1`、
+  そのportのIPv6 checkは全て通る）。IPv6がonのportでは、link-local（`fe80::/10`）以外のIPv6 address
+  （`KERNEL_IPV6_ADDRESSES`）、自動のlink-local/multicast route以外のIPv6 route（`KERNEL_IPV6_ROUTES`）、
+  `net.ipv6.conf.all.forwarding`か`conf/<dev>/forwarding`（`KERNEL_IPV6_FORWARDING_ENABLED
+  scope=global|device`）、読めないIPv6 fact（`UNVERIFIABLE probe=ipv6-*`）を既定で拒否します。
+  link-local addressだけならkernelはport間をforwardできない（RFC 4291 2.5.6）ので受理します。
+  `--allow-kernel-ipv6`はこれらをまとめてwarningにします（kernelのIPv6 stackがdetach中にportで
+  応答・forwardし得るriskを受け入れる宣言。IPv4の拒否と`--allow-kernel-forwarding`には影響しません）。
+  既存環境でportにSLAAC/DHCPv6のglobal addressやRA由来のdefault routeがあると、今回から起動を拒否します。
   `net.ipv4.ip_forward`や`conf/<dev>/forwarding`が1（または読めない）なら既定で
   `KERNEL_FORWARDING_ENABLED`（`UNVERIFIABLE probe=forwarding`）で拒否します。router停止中・exit後・
   crash後にport間をfirewall/NAT抜きで運び得るのはkernel forwardingだからで、namespaceの他の
@@ -637,9 +647,13 @@ sudo kill -HUP <pid>                                               # configをre
   `--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`で変えられ、fatalを0にすると
   warningだけです（802.3x PAUSE floodのようにwireからTX stallを起こせる環境向け。既定がfatalなのは
   exit後もforwarding拒否とkernel L3拒否でfail closedだから）。同じroundでportにkernel IPv4
-  addressが現れたり（`RTM_GETADDR`）、kernel forwardingがonになったら（procfs）`KERNEL_IPV4_ADDRESSES`/
-  `KERNEL_FORWARDING_ENABLED`のwarningで動き続けます（attach中はkernelがframeを見ないので無害で、
-  fatalにするとdetachがbypassを作るため。次の起動は拒否、exit時に警告行）。
+  addressや全tableのIPv4 routeが現れたり（`RTM_GETADDR`/`RTM_GETROUTE`）、kernel forwardingがonに
+  なったら（procfs）、またIPv6がonのportでIPv6のaddress/route/forwardingが現れたら
+  `KERNEL_IPV4_ADDRESSES`/`KERNEL_IPV4_ROUTES`/`KERNEL_FORWARDING_ENABLED`/`KERNEL_IPV6_ADDRESSES`/
+  `KERNEL_IPV6_ROUTES`/`KERNEL_IPV6_FORWARDING_ENABLED`のwarningで動き続けます（attach中はkernelが
+  frameを見ないので無害で、fatalにするとdetachがbypassを作るため。次の起動は拒否、exit時に種類ごとの
+  警告行）。各queryの失敗は種類ごとに数え3回連続でfatal（IPv6は`--allow-kernel-ipv6`なら
+  `IPV6_UNVERIFIABLE` warning）。
   link downはwarningと計数だけで動き続け、upで`recovered`になりowed kickが再開します。device削除
   （`DEVICE_REMOVED`）、startup MTU未満へのMTU低下（`MTU_DECREASED`）、frameに収まらないMTU
   （`MTU_ABOVE_FRAME`）、3回連続のlink query失敗はfatalです。fatalはdrain・detach・closeの後

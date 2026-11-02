@@ -13,10 +13,10 @@ use ruster_io_xdp_native::{
 
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
 use super::engine::{ClockedIo, Datapath, DrainProgress, LinkMonitor};
-use super::netlink::{self, LinkFacts, LinkProbe, NetlinkError};
+use super::netlink::{Dump, Family, LinkFacts, LinkProbe, NetlinkError};
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::stats::write_fields;
-use super::watch::{Forwarding, LinkTarget, PortSample};
+use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
 
 /// High bits of every engine's UMEM domain id (`"rstr"`); the low bits are
 /// the port's `IfId`, so domains are distinct per port.
@@ -34,14 +34,20 @@ impl PortHost for LinuxHost {
         let probe = LinkProbe::open().map_err(Failure::Links)?;
         // Device names were accepted by `SessionConfig::new` (one path
         // component).
-        let forwarding = devices
+        let paths = devices
             .iter()
-            .map(|(interface, device)| {
-                let path = format!("/proc/sys/net/ipv4/conf/{device}/forwarding");
-                (*interface, PathBuf::from(path))
+            .map(|(interface, device)| PortPaths {
+                interface: *interface,
+                forwarding: PathBuf::from(format!("/proc/sys/net/ipv4/conf/{device}/forwarding")),
+                ipv6_disable: PathBuf::from(format!(
+                    "/proc/sys/net/ipv6/conf/{device}/disable_ipv6"
+                )),
+                ipv6_forwarding: PathBuf::from(format!(
+                    "/proc/sys/net/ipv6/conf/{device}/forwarding"
+                )),
             })
             .collect();
-        Ok(NetlinkLinks { probe, forwarding })
+        Ok(NetlinkLinks { probe, paths })
     }
 
     fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure> {
@@ -70,12 +76,8 @@ impl PortHost for LinuxHost {
             mtu: session.mtu(),
             frame_capacity: port.umem().visible_capacity(),
         };
-        checks::linux::device_facts(
-            port.device(),
-            facts,
-            |ifindex| LinkProbe::open().ok()?.query(ifindex).ok(),
-            |ifindex| netlink::ipv4_address_count(ifindex).ok(),
-        )
+        let mut probe = LinkProbe::open().ok();
+        checks::linux::device_facts(port.device(), facts, probe.as_mut())
     }
 
     fn attach(&self, session: &mut NativeSession, mode: XdpAttachModeV1) -> Result<(), Failure> {
@@ -141,11 +143,29 @@ fn domain(interface: IfId) -> UmemDomainId {
 }
 
 /// The run-time link watch: one reused rtnetlink socket and buffer, and
-/// the forwarding sysctl paths built once at startup.
+/// the sysctl paths built once at startup.
 pub struct NetlinkLinks {
     probe: LinkProbe,
-    /// `conf/<dev>/forwarding` of each port.
-    forwarding: Vec<(IfId, PathBuf)>,
+    paths: Vec<PortPaths>,
+}
+
+/// The per-port sysctl paths of the watch.
+struct PortPaths {
+    interface: IfId,
+    /// `net/ipv4/conf/<dev>/forwarding`.
+    forwarding: PathBuf,
+    /// `net/ipv6/conf/<dev>/disable_ipv6`.
+    ipv6_disable: PathBuf,
+    /// `net/ipv6/conf/<dev>/forwarding`.
+    ipv6_forwarding: PathBuf,
+}
+
+impl NetlinkLinks {
+    fn paths(&self, target: &LinkTarget) -> Option<&PortPaths> {
+        self.paths
+            .iter()
+            .find(|paths| paths.interface == target.interface)
+    }
 }
 
 /// `net.ipv4.ip_forward` of this namespace.
@@ -160,16 +180,50 @@ impl LinkMonitor for NetlinkLinks {
         self.probe.ipv4_addresses(target.ifindex)
     }
 
+    fn ipv4_routes(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
+        self.probe.count(Dump::Routes(Family::Ipv4), target.ifindex)
+    }
+
     fn forwarding(&mut self, target: &LinkTarget) -> Result<Forwarding, ()> {
-        let device = self
-            .forwarding
-            .iter()
-            .find(|(interface, _)| *interface == target.interface)
-            .ok_or(())?;
+        let device = &self.paths(target).ok_or(())?.forwarding;
         Ok(Forwarding {
             global: checks::linux::read_flag(Path::new(IP_FORWARD)).ok_or(())?,
-            device: checks::linux::read_flag(&device.1).ok_or(())?,
+            device: checks::linux::read_flag(device).ok_or(())?,
         })
+    }
+
+    /// `disable_ipv6` first: when set (or without IPv6 in the namespace)
+    /// nothing else is read; otherwise both IPv6 dumps and both IPv6
+    /// forwarding sysctls (also when the flag was unreadable: fail
+    /// closed). No allocation.
+    fn ipv6(&mut self, target: &LinkTarget) -> Ipv6Sample {
+        let Some(paths) = self.paths(target) else {
+            return Ipv6Sample {
+                disabled: Err(()),
+                addresses: Err(NetlinkError::UnexpectedLink),
+                routes: Err(NetlinkError::UnexpectedLink),
+                forwarding: Err(()),
+            };
+        };
+        let disabled = checks::linux::ipv6_disabled(&paths.ipv6_disable).ok_or(());
+        if disabled == Ok(true) {
+            return Ipv6Sample::DISABLED;
+        }
+        let read = |path: &Path| checks::linux::read_flag(path).ok_or(());
+        let forwarding = read(Path::new(checks::linux::IPV6_FORWARDING_ALL)).and_then(|global| {
+            Ok(Forwarding {
+                global,
+                device: read(&paths.ipv6_forwarding)?,
+            })
+        });
+        Ipv6Sample {
+            disabled,
+            addresses: self
+                .probe
+                .count(Dump::Addresses(Family::Ipv6), target.ifindex),
+            routes: self.probe.count(Dump::Routes(Family::Ipv6), target.ifindex),
+            forwarding,
+        }
     }
 }
 

@@ -868,3 +868,244 @@ fn only_deferred_release_failures_are_transient() {
     assert_eq!(retry_pause_ms(10), STARTUP_RETRY_PAUSE_MAX_MS);
     assert_eq!(retry_pause_ms(u32::MAX), STARTUP_RETRY_PAUSE_MAX_MS);
 }
+
+/// Kernel IPv6 on a port and an IPv4 route in any table are refused
+/// before attach with every port rolled back; `--allow-kernel-ipv6`
+/// starts with warnings (and does not cover the IPv4 route).
+#[test]
+fn kernel_ipv6_and_routes_are_refused_at_startup_unless_allowed() {
+    let exposed = Ipv6Facts {
+        addresses: Some(1),
+        forwarding_global: Some(true),
+        ..Ipv6Facts::CLEAN
+    };
+    let cases = [
+        (
+            FakeHost {
+                ipv6: Some(exposed),
+                ..FakeHost::default()
+            },
+            "code=KERNEL_IPV6_ADDRESSES count=1",
+        ),
+        (
+            FakeHost {
+                ipv6: Some(Ipv6Facts {
+                    routes: Some(2),
+                    ..Ipv6Facts::CLEAN
+                }),
+                ..FakeHost::default()
+            },
+            "code=KERNEL_IPV6_ROUTES count=2",
+        ),
+        (
+            FakeHost {
+                ipv6: Some(Ipv6Facts {
+                    forwarding_device: Some(true),
+                    ..Ipv6Facts::CLEAN
+                }),
+                ..FakeHost::default()
+            },
+            "code=KERNEL_IPV6_FORWARDING_ENABLED scope=device",
+        ),
+        (
+            FakeHost {
+                ipv6: Some(Ipv6Facts {
+                    routes: None,
+                    ..Ipv6Facts::CLEAN
+                }),
+                ..FakeHost::default()
+            },
+            "code=UNVERIFIABLE probe=ipv6-routes",
+        ),
+        (
+            FakeHost {
+                ipv4_routes: 1,
+                ..FakeHost::default()
+            },
+            "code=KERNEL_IPV4_ROUTES count=1",
+        ),
+    ];
+    for (host, code) in &cases {
+        let outcome = run(host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+        assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+        let line = format!("startup failed: stage=checks port=if1 {code}");
+        assert!(outcome.err.contains(&line), "{line}\n{}", outcome.err);
+        assert!(!host
+            .events()
+            .iter()
+            .any(|event| matches!(event, Event::Attach(..))));
+        host.assert_released();
+    }
+    // Disabled on the ports: the same exposure does not matter.
+    let host = FakeHost {
+        ipv6: Some(Ipv6Facts {
+            disabled: Some(true),
+            ..exposed
+        }),
+        ..FakeHost::default()
+    };
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(!outcome.err.contains("IPV6"), "{}", outcome.err);
+    host.assert_released();
+    // The override.
+    let allowed = CheckPolicy {
+        allow_kernel_ipv6: true,
+        ..CheckPolicy::default()
+    };
+    let host = FakeHost {
+        ipv6: Some(exposed),
+        ..FakeHost::default()
+    };
+    let outcome = run_with(
+        &host,
+        allowed,
+        &FakeStop::after(FIRST_LOOP_CHECK + 1),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    for line in [
+        "warning: port=if1 IPV6_ADDRESSES_ALLOWED count=1",
+        "warning: port=if1 IPV6_FORWARDING_ENABLED scope=global",
+        "warning: port=if2 IPV6_ADDRESSES_ALLOWED count=1",
+    ] {
+        assert!(outcome.err.contains(line), "{line}\n{}", outcome.err);
+    }
+    host.assert_released();
+    let host = FakeHost {
+        ipv4_routes: 1,
+        ..FakeHost::default()
+    };
+    let outcome = run_with(
+        &host,
+        CheckPolicy {
+            allow_kernel_forwarding: true,
+            allow_multi_queue: true,
+            ..allowed
+        },
+        &FakeStop::after(FIRST_LOOP_CHECK + 1),
+        &mut FakeClock::default(),
+    );
+    assert_eq!(outcome.status, EXIT_RUNTIME, "no override for IPv4 routes");
+    host.assert_released();
+}
+
+/// IPv4 routes and kernel IPv6 appearing while attached warn, keep the
+/// router forwarding, show in the stats, and print one exit line per
+/// kind still seen at the stop.
+#[test]
+fn kernel_routes_and_ipv6_while_running_warn_and_are_reported_at_exit() {
+    let exposed = Ipv6Sample {
+        disabled: Ok(false),
+        addresses: Ok(1),
+        routes: Ok(1),
+        forwarding: Ok(Forwarding {
+            global: true,
+            device: false,
+        }),
+    };
+    let host = FakeHost::default();
+    for _ in 0..1_000 {
+        host.state.routes.borrow_mut().push_back((IfId(WAN), Ok(2)));
+        host.state.ipv6.borrow_mut().push_back((IfId(WAN), exposed));
+    }
+    host.state
+        .inject_at
+        .borrow_mut()
+        .push_back((10, IfId(LAN), echo_request(1)));
+    let outcome = fatal_run(&host, 20);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    for line in [
+        "warning: port=if2 health=KERNEL_IPV4_ROUTES",
+        "warning: port=if2 health=KERNEL_IPV6_ADDRESSES",
+        "warning: port=if2 health=KERNEL_IPV6_ROUTES",
+        "warning: port=if2 health=KERNEL_IPV6_FORWARDING_ENABLED",
+        "warning: kernel IPv4 routes lead out of a port; detached ports may be routed by the kernel",
+        "warning: kernel IPv6 forwarding is enabled for a port; detached ports may be forwarded by the kernel",
+        "warning: kernel IPv6 addresses are on a port; detached ports may be answered and routed by the kernel",
+        "warning: kernel IPv6 routes lead out of a port; detached ports may be routed by the kernel",
+    ] {
+        assert!(outcome.err.contains(line), "{line}\n{}", outcome.err);
+    }
+    assert!(!outcome.err.contains("fatal:"), "{}", outcome.err);
+    assert!(!outcome.err.contains("kernel forwarding is enabled"));
+    assert!(!outcome.err.contains("port=if1 health=KERNEL"));
+    let out = &outcome.out;
+    assert_eq!(line_value(out, "rx.tx_accepted"), Some("1"), "kept routing");
+    assert_eq!(line_value(out, "watch.state"), Some("warning"));
+    for (field, value) in [
+        ("if2.watch.kernel_ipv4_routes", "2"),
+        ("if2.watch.kernel_ipv6_addresses", "1"),
+        ("if2.watch.kernel_ipv6_routes", "1"),
+        ("if2.watch.kernel_ipv6_forwarding", "true"),
+        ("if1.watch.kernel_ipv6_forwarding", "false"),
+    ] {
+        assert_eq!(line_value(out, field), Some(value), "{field}\n{out}");
+    }
+    host.assert_released();
+    // Disabled on the port before the stop: recovered, no exit line.
+    let host = FakeHost::default();
+    host.state.ipv6.borrow_mut().push_back((IfId(WAN), exposed));
+    for _ in 0..1_000 {
+        host.state
+            .ipv6
+            .borrow_mut()
+            .push_back((IfId(WAN), Ipv6Sample::DISABLED));
+    }
+    let outcome = fatal_run(&host, 20);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(outcome
+        .err
+        .contains("recovered: port=if2 health=KERNEL_IPV6_ADDRESSES"));
+    assert!(!outcome.err.contains("kernel IPv6"), "{}", outcome.err);
+}
+
+/// An IPv6 fact that stays unreadable while running ends the run with
+/// `LINK_UNVERIFIABLE` (lost observability fails closed), unless the run
+/// was started with `--allow-kernel-ipv6`, which only warns.
+#[test]
+fn unreadable_ipv6_while_running_is_fatal_unless_allowed() {
+    let unreadable = Ipv6Sample {
+        disabled: Err(()),
+        addresses: Ok(0),
+        routes: Ok(0),
+        forwarding: Ok(Forwarding::default()),
+    };
+    let script = |host: &FakeHost| {
+        for _ in 0..1_000 {
+            host.state
+                .ipv6
+                .borrow_mut()
+                .push_back((IfId(WAN), unreadable));
+        }
+    };
+    let host = FakeHost::default();
+    script(&host);
+    let outcome = fatal_run(&host, 20);
+    assert_fatal(&outcome, &host, "LINK_UNVERIFIABLE");
+
+    let host = FakeHost::default();
+    script(&host);
+    let outcome = run_full(
+        &host,
+        settings(
+            CheckPolicy {
+                allow_kernel_ipv6: true,
+                ..CheckPolicy::default()
+            },
+            0,
+        ),
+        FakeSource::default(),
+        &StopAfterTicks::new(&host, 20, &[]),
+        &mut FakeClock {
+            step_us: 1_000,
+            ..FakeClock::default()
+        },
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(outcome
+        .err
+        .contains("warning: port=if2 health=IPV6_UNVERIFIABLE"));
+    assert!(!outcome.err.contains("fatal:"), "{}", outcome.err);
+    host.assert_released();
+}

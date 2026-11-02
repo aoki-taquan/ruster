@@ -171,6 +171,7 @@ impl Settings {
             policy: CheckPolicy {
                 allow_multi_queue: args.allow_multi_queue,
                 allow_kernel_forwarding: args.allow_kernel_forwarding,
+                allow_kernel_ipv6: args.allow_kernel_ipv6,
             },
             stats_interval_ms: args.stats_interval_secs.saturating_mul(1_000),
             drain_deadline_ms: DRAIN_DEADLINE_MS,
@@ -555,7 +556,8 @@ where
     let mut control = Control {
         reloader,
         watch: Watch::new(&targets, settings.thresholds)
-            .allowing_kernel_forwarding(settings.policy.allow_kernel_forwarding),
+            .allowing_kernel_forwarding(settings.policy.allow_kernel_forwarding)
+            .allowing_kernel_ipv6(settings.policy.allow_kernel_ipv6),
         links,
     };
     let end = run_loop(
@@ -594,18 +596,36 @@ where
     let shutdown = shutdown_drain(&mut datapath, clock, stop, settings.drain_deadline_ms);
     // The ports are about to be detached: whatever the kernel would do
     // with their frames now matters.
-    let (forwarding, addresses) = control.watch.kernel_exposure();
-    if forwarding {
-        let _ = writeln!(
-            err,
-            "ruster run: warning: kernel forwarding is enabled; detached ports may be forwarded by the kernel"
-        );
-    }
-    if addresses {
-        let _ = writeln!(
-            err,
-            "ruster run: warning: kernel IPv4 addresses are on a port; detached ports may be answered and routed by the kernel"
-        );
+    let exposure = control.watch.kernel_exposure();
+    for (seen, line) in [
+        (
+            exposure.forwarding,
+            "kernel forwarding is enabled; detached ports may be forwarded by the kernel",
+        ),
+        (
+            exposure.addresses,
+            "kernel IPv4 addresses are on a port; detached ports may be answered and routed by the kernel",
+        ),
+        (
+            exposure.routes,
+            "kernel IPv4 routes lead out of a port; detached ports may be routed by the kernel",
+        ),
+        (
+            exposure.ipv6_forwarding,
+            "kernel IPv6 forwarding is enabled for a port; detached ports may be forwarded by the kernel",
+        ),
+        (
+            exposure.ipv6_addresses,
+            "kernel IPv6 addresses are on a port; detached ports may be answered and routed by the kernel",
+        ),
+        (
+            exposure.ipv6_routes,
+            "kernel IPv6 routes lead out of a port; detached ports may be routed by the kernel",
+        ),
+    ] {
+        if seen {
+            let _ = writeln!(err, "ruster run: warning: {line}");
+        }
     }
     let now = clock.now();
     let status = RunStatus {
