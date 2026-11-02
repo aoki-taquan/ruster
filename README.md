@@ -271,8 +271,8 @@ UDP NAT44は`forward_batch_with_nat44_udp`、またはgenerated ICMP errorも含
 inside/outside/public IPv4とnonzero port poolを設定し、mappingとremote-address filter
 peerに加えてmapping/peer directoryとpublic-port ownerをcaller-backed固定配列で所有します。
 control planeはruntime生成とreconcileごとにfreshな`Nat44UdpHashKey`を供給します。
-mapping/peer/public-port lookupは固定capacityでbounded、port allocationはpoolを最大一周し、
-候補ごとのmapping全走査は行いません。outboundはEndpoint-Independent Mappingです。
+mapping/peer/public-port lookupは固定capacityでbounded、新しいmapping/peerの再利用slotと
+public portはactivity順のslot listとfree-port bitmapからO(1)で選びます（PERF-001、H4a）。outboundはEndpoint-Independent Mappingです。
 inbound filteringはUDP/TCPごとにRFC 4787 §5の三分類から選べ、defaultは過去に送信した
 remote IPv4だけを許すAddress-Dependent Filteringです（下の「NAT44 inbound filtering」）。
 IPv4 optionsなし、DF=1/MF=0/offset=0のatomic UDPだけを変換します。受信reserved flagは
@@ -309,8 +309,8 @@ RSTを含むvalid packetを双方向に変換します。TCP header/options/data
 ままです。TCPもreserved flagをfragment判定から除外してwireへ保存し、reserved以外は
 DF=1/MF=0/offset=0を要求します。
 
-outbound lookupはmapping/session/port pool capacityをそれぞれ最大1回だけ調べる
-additive `O(M+S+P)`、inboundとquoted ICMPはdirect owner後にexact sessionだけを調べます。
+outboundの再利用slotとpublic portの探索はO(1)（UDPと同じslot listとfree-port bitmap）、
+inboundとquoted ICMPはdirect owner後にexact sessionだけを調べます。
 mapping再生成時は旧sessionを全走査せずgeneration+epochでlazyに無効化します。
 
 TCP session idle TTLはdefault/minimumともに2時間4分です。sequence/window/ACK妥当性は追跡
@@ -627,11 +627,11 @@ sudo kill -HUP <pid>                                               # configをre
   あるdeviceは`stage=attach code=CREATE_LINK/EXISTING_PROGRAM`で拒否し、置換しません。
 - validation limit（H3）: configは起動時もreload時も本番limitで検証します。packet pathで全slotを
   線形scanするtable（`resolution.capacity.*`と`icmpv4-errors.capacity.*`）は一つ4096 slotまで
-  （`run-sim`は65536。index化（H4、PERF-001）までの暫定。dynamic-neighbor miss 1回の読み込みが
+  （`run-sim`は65536。index化（H4b、PERF-001）までの暫定。dynamic-neighbor miss 1回の読み込みが
   65536で約1.5 MiB、4096で96 KiB）、NAT44とfirewallのtable（directory、port poolを含む）は65536
-  slotまで（NAT44は新しいmapping/peer/sessionごとに空きslotをslot 0から探すのでO(live entry)。
-  想定flow数に合わせて設定する）、runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは33.44 MiBです。storageは
+  slotまで（NAT44の再利用slotとport探索はH4a以降O(1)。想定flow数に合わせて設定する）、
+  runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは36.45 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>

@@ -12,10 +12,10 @@ use std::{
 use ruster_config::{parse, validate, ValidatedConfig, PRODUCTION_VALIDATION_LIMITS};
 use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministicKeySource};
 use ruster_core::{
-    DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorStateSlot, Nat44TcpMappingSlot, Nat44TcpSessionSlot, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionStateSlot,
+    port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionStateSlot,
 };
 
 /// Bytes currently allocated through the global allocator.
@@ -73,6 +73,8 @@ fn worst_case_bytes() -> usize {
     let scanned = PRODUCTION_VALIDATION_LIMITS.max_scanned_slots_per_table as usize;
     let ports = 65_535;
     let directory = size_of::<DirectoryBucket>() + size_of::<DirectoryNode>();
+    // One owner slot per pool port plus the free-port bitmap.
+    let port_index = ports * size_of::<PortOwnerSlot>() + port_free_bitmap_words(ports) * 8;
     let resolution = scanned
         * (size_of::<ResolutionStateSlot>()
             + size_of::<ResolutionActionSlot>()
@@ -81,11 +83,11 @@ fn worst_case_bytes() -> usize {
     let icmpv4 = scanned * (size_of::<Icmpv4ErrorStateSlot>() + size_of::<Icmpv4ErrorActionSlot>());
     let udp = slots * (size_of::<Nat44UdpMappingSlot>() + size_of::<Nat44UdpPeerSlot>())
         + 2 * slots * directory
-        + ports * size_of::<PortOwnerSlot>();
+        + port_index;
     // Mapping, session, and session remote-address directories.
     let tcp = slots * (size_of::<Nat44TcpMappingSlot>() + size_of::<Nat44TcpSessionSlot>())
         + 3 * slots * directory
-        + ports * size_of::<PortOwnerSlot>();
+        + port_index;
     let firewall = slots * size_of::<FirewallStateSlot>();
     resolution + icmpv4 + udp + tcp + firewall
 }
@@ -93,7 +95,7 @@ fn worst_case_bytes() -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 35_061_696;
+    const WORST_CASE: usize = 38_224_064;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 

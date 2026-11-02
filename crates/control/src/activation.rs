@@ -168,14 +168,14 @@
 use std::{marker::PhantomData, num::NonZeroU64};
 
 use ruster_core::{
-    DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallReconcileError,
-    FirewallReconcileReport, FirewallRuntime, FirewallStateSlot, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError,
-    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot,
-    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpReconcileError,
-    Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError, PortOwnerSlot,
-    PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot,
+    FirewallReconcileError, FirewallReconcileReport, FirewallRuntime, FirewallStateSlot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
+    Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
+    Nat44TcpSessionSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
+    PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
     ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
     ResolutionStateSlot,
 };
@@ -227,6 +227,7 @@ pub struct FullServiceStorage {
 
 /// Mapping, secondary-state, directory, and port-owner arrays of one NAT
 /// runtime. UDP secondary state is peers; TCP secondary state is sessions.
+/// The free-port bitmap is sized from the port-owner count.
 struct NatTables<M, S> {
     mappings: Box<[M]>,
     secondary: Box<[S]>,
@@ -235,6 +236,7 @@ struct NatTables<M, S> {
     secondary_buckets: Box<[DirectoryBucket]>,
     secondary_nodes: Box<[DirectoryNode]>,
     port_owners: Box<[PortOwnerSlot]>,
+    port_free_bits: Box<[u64]>,
 }
 
 impl FullServiceStorage {
@@ -347,6 +349,12 @@ impl<M: Copy + Default, S: Copy + Default> NatTables<M, S> {
             secondary_buckets: slots(secondary_buckets, DirectoryBucket::default(), service)?,
             secondary_nodes: slots(secondary_nodes, DirectoryNode::default(), service)?,
             port_owners: slots(port_owners, PortOwnerSlot::default(), service)?,
+            port_free_bits: slots(
+                u32::try_from(port_free_bitmap_words(port_owners as usize))
+                    .map_err(|_| StorageAllocationError { service })?,
+                0,
+                service,
+            )?,
         })
     }
 }
@@ -664,6 +672,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 &mut udp.secondary_buckets,
                 &mut udp.secondary_nodes,
                 &mut udp.port_owners,
+                &mut udp.port_free_bits,
             ),
             authority.nat44_udp_hash_key(),
         )
@@ -680,6 +689,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 tcp_session_address_buckets,
                 tcp_session_address_nodes,
                 &mut tcp.port_owners,
+                &mut tcp.port_free_bits,
             ),
             authority.nat44_tcp_hash_key(),
         )

@@ -1,18 +1,18 @@
 use std::{fmt, mem::size_of, net::Ipv4Addr, num::ParseIntError};
 
 use ruster_core::{
-    validate_firewall_rules, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallAction,
-    FirewallConfigError, FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError,
-    FirewallPolicy, FirewallPolicyError, FirewallPortRange, FirewallPortRangeError,
-    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv4OriginPolicyError,
-    LocalIpv4Binding, MacAddress, Nat44Filtering, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpConfigError, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
-    Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor, PortOwnerSlot,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy, ResolutionPolicyError,
-    ResolutionStateSlot, Route, RouteError, SnapshotError,
+    port_free_bitmap_words, validate_firewall_rules, DirectoryBucket, DirectoryNode,
+    DynamicNeighborSlot, FirewallAction, FirewallConfigError, FirewallInterface,
+    FirewallIpv4Prefix, FirewallIpv4PrefixError, FirewallPolicy, FirewallPolicyError,
+    FirewallPortRange, FirewallPortRangeError, FirewallProtocol, FirewallRule, FirewallRuleId,
+    FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
+    Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
+    Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
+    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
+    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
+    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
+    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -57,15 +57,15 @@ pub struct ValidationLimits {
 ///   hosts) and cuts the worst case per miss 16-fold. The action queues
 ///   are O(1) per packet but each queued action comes from a state (an
 ///   ICMPv4 state queues at most one), so they get the same bound. Raising
-///   it needs keyed indexes for these tables (H4).
+///   it needs keyed indexes for these tables (H4b).
 /// - `max_slots_per_table` = 2^16 for the NAT44 and firewall tables (home
-///   NAT needs many sessions). NAT44 slot reuse scans from slot 0 on every
-///   new mapping, peer, or session, O(live entries), and port selection
-///   walks the pool (H4); the firewall probe is keyed SipHash with
-///   occupancy capped near 75%, so only its amortized expiry sweep is
+///   NAT needs many sessions). NAT44 finds a reusable mapping, peer, or
+///   session and a free public port in O(1) (activity-ordered slot lists
+///   and a free-port bitmap, H4a); the firewall probe is keyed SipHash
+///   with occupancy capped near 75%, so only its amortized expiry sweep is
 ///   linear. 2^16 also equals the largest NAT44 port pool (1..=65535).
 /// - `max_runtime_bytes` = 64 MiB, the simulator's value. Every table at its
-///   limit (with the widest port pool) needs 35061696 bytes (33.44 MiB)
+///   limit (with the widest port pool) needs 38224064 bytes (36.45 MiB)
 ///   with the current slot sizes, so the per-table limits bind and this
 ///   bound only fails closed if a slot type grows. The storage is ordinary
 ///   heap (not memlocked), allocated once at startup.
@@ -1987,11 +1987,7 @@ fn build_storage_shape(
             )?;
             add_directory_bytes(&mut bytes, shape.mapping_buckets, shape.mapping_nodes)?;
             add_directory_bytes(&mut bytes, shape.peer_buckets, shape.peer_nodes)?;
-            add_bytes::<PortOwnerSlot>(
-                &mut bytes,
-                shape.port_owners,
-                path(&["nat44", "realm", "ports"]),
-            )?;
+            add_port_owner_bytes(&mut bytes, shape.port_owners)?;
             Ok(shape)
         })
         .transpose()?;
@@ -2013,11 +2009,7 @@ fn build_storage_shape(
             add_directory_bytes(&mut bytes, shape.session_buckets, shape.session_nodes)?;
             // Session remote-address directory: same dimensions.
             add_directory_bytes(&mut bytes, shape.session_buckets, shape.session_nodes)?;
-            add_bytes::<PortOwnerSlot>(
-                &mut bytes,
-                shape.port_owners,
-                path(&["nat44", "realm", "ports"]),
-            )?;
+            add_port_owner_bytes(&mut bytes, shape.port_owners)?;
             Ok(shape)
         })
         .transpose()?;
@@ -2150,6 +2142,21 @@ fn check_scanned_slots(
 fn add_directory_bytes(bytes: &mut usize, buckets: u32, nodes: u32) -> Result<(), ValidationError> {
     add_bytes::<DirectoryBucket>(bytes, buckets, SourcePath::default())?;
     add_bytes::<DirectoryNode>(bytes, nodes, SourcePath::default())
+}
+
+/// One port-owner slot per pool port plus the free-port bitmap words
+/// (`ruster_core::port_free_bitmap_words`) of one NAT44 protocol.
+fn add_port_owner_bytes(bytes: &mut usize, port_owners: u32) -> Result<(), ValidationError> {
+    let ports = path(&["nat44", "realm", "ports"]);
+    add_bytes::<PortOwnerSlot>(bytes, port_owners, ports.clone())?;
+    let words = usize::try_from(port_owners)
+        .ok()
+        .map(port_free_bitmap_words)
+        .and_then(|words| u32::try_from(words).ok())
+        .ok_or_else(|| {
+            ValidationError::new(ValidationCode::CapacityNotRepresentable, ports.clone())
+        })?;
+    add_bytes::<u64>(bytes, words, ports)
 }
 
 fn add_bytes<T>(bytes: &mut usize, count: u32, path: SourcePath) -> Result<(), ValidationError> {

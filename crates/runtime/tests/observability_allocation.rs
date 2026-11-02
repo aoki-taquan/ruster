@@ -108,12 +108,21 @@ fn observability_sink_is_allocation_free_in_steady_state() {
     // error runtime; the accessors are O(1) whatever the storage holds.
     let mut udp_owner = [PortOwnerSlot::default(); 1];
     let mut tcp_owner = [PortOwnerSlot::default(); 1];
+    let mut udp_owner_bits = [0_u64; 2];
+    let mut tcp_owner_bits = [0_u64; 2];
     let no_buckets: &mut [DirectoryBucket] = &mut [];
     let nat44_udp = Nat44UdpRuntime::new(
         udp_config(&snapshot),
         &mut [],
         &mut [],
-        Nat44UdpIndexStorage::new(no_buckets, &mut [], &mut [], &mut [], &mut udp_owner),
+        Nat44UdpIndexStorage::new(
+            no_buckets,
+            &mut [],
+            &mut [],
+            &mut [],
+            &mut udp_owner,
+            &mut udp_owner_bits,
+        ),
         Nat44UdpHashKey::new(3, 4).unwrap(),
     )
     .unwrap();
@@ -129,6 +138,7 @@ fn observability_sink_is_allocation_free_in_steady_state() {
             &mut [],
             &mut [],
             &mut tcp_owner,
+            &mut tcp_owner_bits,
         ),
         Nat44TcpHashKey::new(5, 6).unwrap(),
     )

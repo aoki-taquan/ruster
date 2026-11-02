@@ -49,6 +49,7 @@ struct UdpBenchIndexes {
     peer_buckets: [DirectoryBucket; 4],
     peer_nodes: [DirectoryNode; 4],
     port_owners: [PortOwnerSlot; 1],
+    port_free_bits: [u64; 2],
 }
 
 impl UdpBenchIndexes {
@@ -64,6 +65,7 @@ impl UdpBenchIndexes {
             &mut self.peer_buckets,
             &mut self.peer_nodes,
             &mut self.port_owners,
+            &mut self.port_free_bits,
         );
         Nat44UdpRuntime::new(
             config,
@@ -86,6 +88,7 @@ struct TcpBenchIndexes {
     session_address_buckets: [DirectoryBucket; 4],
     session_address_nodes: [DirectoryNode; 4],
     port_owners: [PortOwnerSlot; 1],
+    port_free_bits: [u64; 2],
 }
 
 impl TcpBenchIndexes {
@@ -103,6 +106,7 @@ impl TcpBenchIndexes {
             &mut self.session_address_buckets,
             &mut self.session_address_nodes,
             &mut self.port_owners,
+            &mut self.port_free_bits,
         );
         Nat44TcpRuntime::new(
             config,

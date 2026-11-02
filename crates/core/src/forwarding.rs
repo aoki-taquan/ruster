@@ -1985,6 +1985,25 @@ where
                 trace,
             )
             .and_then(|decision| {
+                // Every NAT commit is checked before the packet is
+                // rewritten, so a plan the runtime would refuse (stale or
+                // corrupt reuse lists or indexes) is a counted drop, never
+                // a worker panic.
+                if let PacketDecision::Nat44Udp(nat) = decision {
+                    let runtime = nat44_udp
+                        .as_deref()
+                        .ok_or(DropReason::Nat44UdpRuntimeUnavailable)?;
+                    match nat.transition {
+                        Nat44UdpTransition::Outbound(plan) => runtime
+                            .prevalidate_outbound_commit(plan, nat_now_ms)
+                            .map_err(|_| DropReason::Nat44UdpConfigMismatch)?,
+                        Nat44UdpTransition::Inbound(plan) | Nat44UdpTransition::Hairpin(plan) => {
+                            runtime
+                                .prevalidate_inbound_commit(plan, nat_now_ms)
+                                .map_err(|_| DropReason::Nat44UdpConfigMismatch)?;
+                        }
+                    }
+                }
                 if let PacketDecision::Nat44Tcp(nat) = decision {
                     let runtime = nat44_tcp
                         .as_deref()
@@ -6237,6 +6256,7 @@ mod tests {
         let mut session_address_buckets = session_buckets;
         let mut session_address_nodes = session_nodes;
         let mut owners = [PortOwnerSlot::default(); 1];
+        let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(1)];
         let mut firewall_states = [FirewallStateSlot::default(); 1];
         let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
         let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
@@ -6267,6 +6287,7 @@ mod tests {
                     &mut session_address_buckets,
                     &mut session_address_nodes,
                     &mut owners,
+                    &mut owner_bits,
                 ),
                 Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
             )

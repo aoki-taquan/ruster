@@ -7,10 +7,10 @@ use ruster_config::{
     MAX_ROUTES,
 };
 use ruster_core::{
-    DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
+    port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId,
+    FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot,
+    Nat44TcpSessionSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
 };
 
 const VALID: &str = r#"
@@ -285,6 +285,8 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + (4 + 8 + 8) * size_of::<DirectoryBucket>()
         + (3 + 5 + 5) * size_of::<DirectoryNode>()
         + 8 * size_of::<PortOwnerSlot>()
+        // free-port bitmaps of the UDP and TCP port-owner indexes
+        + 2 * port_free_bitmap_words(8) * size_of::<u64>()
         + 6 * size_of::<FirewallStateSlot>();
     assert_eq!(shape.required_bytes, expected);
 

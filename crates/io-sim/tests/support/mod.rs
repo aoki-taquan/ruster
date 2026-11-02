@@ -1,7 +1,8 @@
 use ruster_core::{
-    DirectoryBucket, DirectoryNode, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpIndexStorage,
-    Nat44TcpMappingSlot, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey,
-    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpRuntime, PortOwnerSlot,
+    port_free_bitmap_words, DirectoryBucket, DirectoryNode, Nat44TcpConfig, Nat44TcpHashKey,
+    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpRuntime, Nat44TcpSessionSlot,
+    Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpRuntime, PortOwnerSlot,
 };
 
 #[allow(dead_code)]
@@ -34,6 +35,8 @@ pub fn tcp_runtime<'a>(
         Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
     let port_count = usize::from(config.last_port() - config.first_port()) + 1;
     let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
+    let port_free_bits =
+        Box::leak(vec![0_u64; port_free_bitmap_words(port_count)].into_boxed_slice());
     Nat44TcpRuntime::new(
         config,
         mappings,
@@ -46,6 +49,7 @@ pub fn tcp_runtime<'a>(
             session_address_buckets,
             session_address_nodes,
             port_owners,
+            port_free_bits,
         ),
         Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
     )
@@ -58,6 +62,7 @@ pub struct UdpTestIndexes {
     peer_buckets: Vec<DirectoryBucket>,
     peer_nodes: Vec<DirectoryNode>,
     port_owners: Vec<PortOwnerSlot>,
+    port_free_bits: Vec<u64>,
 }
 
 impl UdpTestIndexes {
@@ -79,6 +84,7 @@ impl UdpTestIndexes {
             peer_buckets: vec![DirectoryBucket::default(); peer_bucket_count],
             peer_nodes: vec![DirectoryNode::default(); peer_capacity],
             port_owners: vec![PortOwnerSlot::default(); port_count],
+            port_free_bits: vec![0; port_free_bitmap_words(port_count)],
         }
     }
 
@@ -94,6 +100,7 @@ impl UdpTestIndexes {
             &mut self.peer_buckets,
             &mut self.peer_nodes,
             &mut self.port_owners,
+            &mut self.port_free_bits,
         );
         Nat44UdpRuntime::new(
             config,

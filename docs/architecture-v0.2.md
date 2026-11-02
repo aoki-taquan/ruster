@@ -510,8 +510,9 @@ profileを参照する限定実装です。RFC 5382全体への準拠は主張�
 
 `Nat44TcpRuntime`はUDP runtimeとstorage、key、generation、watermark、allocatorを共有しない
 `!Send + !Sync` worker-local ownerです。caller-backed mapping/session directoryと
-protocol-local direct public-port ownerを専有し、outbound worst-caseはadditive
-`O(M+S+P)`、inbound/quoted ICMPはownerからexact sessionへ直接到達します。mapping keyは
+protocol-local direct public-port ownerを専有し、outboundの再利用slotとpublic portの探索は
+O(1)（下の「NAT44 bounded slot and port reuse」）、inbound/quoted ICMPはownerからexact
+sessionへ直接到達します。mapping keyは
 `(inside IfId, internal IPv4, internal TCP port)`、session keyは
 `(mapping slot, mapping generation, lifecycle epoch, remote IPv4, remote TCP port)`です。
 mapping再生成は旧sessionを全走査せずgeneration+epochでlazyに無効化します。複数remote sessionは
@@ -1125,11 +1126,70 @@ placementが成功します。したがって`FirewallStateTableFull`はoccupied
 release buildでもstaleとして拒否します。live evictionはありません。probe、maintenance shift/hash/scan、
 rule evaluation数はcounterで観測できます。
 
-NAT44 UDP/TCPのexpired mapping/peer/sessionは、作成時の`find_reusable_*`がslice全体を
-linear scanし、`select_port`が非liveなport ownerを置換候補にするため、opportunisticな回収
-だけに頼る同種のliveness gapはありません。ただしこれらはindex 0からの走査で下界gateも
-cursorも持たず、ほぼ満杯時には新規作成attemptごとにO(N)の既存costがあります（NAT44-035、
-follow-up）。
+NAT44 UDP/TCPのexpired mapping/peer/sessionにも同種のliveness gapはありません。再利用
+slotは下の「NAT44 bounded slot and port reuse」のlist先頭からO(1)で見つかり、再利用可能な
+slotが一つでもあれば必ず見つかります（全slotのscanと照合するseeded churn test、NAT44-035）。
+
+### NAT44 bounded slot and port reuse
+
+H4a（PERF-001、NAT44-035、NAT44-068）以前は、新しいmapping/peer/sessionごとにslot 0から
+expired slotを探し、port選択はpoolを一周し得たため、ほぼ満杯の65536 slot tableでは新規flow
+1回が数百µs（release実測でTCP約430 µs、UDP約350 µs）かかり、LAN hostのflow churnで1 queue
+を飽和させられました。いまは各tableがslotに埋め込んだintrusive list（`slot_list.rs`、
+prev/next u32、caller-backed storageのみでallocationなし）とfresh境界を持ちます。
+
+- activity list: occupiedなmapping（UDP/TCP）とsession（TCP）を最後のrefresh時刻順に並べる。
+  commitは常に現在時刻をslotへ書いて末尾へ移し、時刻はwatermarkで単調なので、expiredなslotが
+  あれば先頭がexpiredです。TTLはruntimeで一つ（reconcileは全flush）。expiryはlazyのままで、
+  timerもsweepもありません。先頭のliveness確認1回で再利用可否が決まります。
+- fresh境界: 未使用slot（defaultのまま）は境界以降にあり、index順にだけ使われます。外部inbound
+  SYNの16 keyed probe（NAT44-037）が未使用slotに当たった場合も最小の未使用slotを使います。
+- UDP mappingはさらにparked（expired、portを保持、peerは手放した）とretired（portもpeerも無い）
+  の二つのlist、TCP mappingはretiredを持ちます。activity list上のmappingは常にportを持ち、
+  UDPでは一つ以上のpeerを持つので、先頭からpeerやportを取り出すときはそのmappingをparked/
+  retiredへ移し、同じmappingを何度も見ることはありません。
+- UDP peer: mappingごとの現世代peerのsingly linked chain（mapping slotにhead/tail）とstale
+  chain。mappingの再生成やparkでは旧peer chainをstale chainへO(1)でspliceします。peerの
+  再利用可否はmappingのlivenessで決まるので、peerを個別に並べる必要がありません。
+- TCP sessionはmappingと同時にrefreshされ同じTTLなので、mappingがexpiredまたは再生成なら
+  そのsessionもexpiredで、session activity listの先頭だけで正確に判定できます。
+
+探索順はmappingがretired、parked、expiredなactivity先頭、未使用slot、peerがstale chain、
+expiredなactivity先頭のpeer、未使用slot、sessionがexpiredなactivity先頭、未使用slotです。
+expired slotを未使用slotより先に使うので、occupancyの「flush以降に使われた異なるslot数」は
+従来と同じ値の意味を保ちます（slotのindexは観測されない内部値で、変わり得ます）。planは
+read-onlyのまま選び、commitがlistを更新します。UDP commitはplanのpeer slotがまだlistの示す
+slotか、未使用のmapping target slotが最小の未使用slotかを変更前に再確認し、違えば
+IndexCorruptです。TCPの`prevalidate_*_commit`も未使用のmapping/session target slotが最小の未使用
+slotであることを確かめ、違えばStalePlanです。forwardingはUDPもTCPもpacketをrewriteする前に
+このprevalidationを行い、拒否を`NAT44_UDP_CONFIG_MISMATCH`/`NAT44_TCP_CONFIG_MISMATCH`の
+drop（drop reason counterに計上）にするのでworkerはpanicしません。listはstate revisionが同じ
+限り変わらないので、通常はplan時と同じ結果になります。debug buildは毎commitでUDP index全体を
+O(M+P)以上で検証するため本番に使ってはいけません。
+
+public portはport owner tableと同時に更新されるcaller-backed free-port bitmap（portごとに
+1 bit、64 portごとにsummary 1 bit。pool 65535で1040 words、8320 bytes）から選びます。
+順に、(1) internal portがowner無しかexpired ownerならそれ（RFC 4787 REQ-3のport
+preservation）、(2) 同じinternal endpointのexpired mappingをその場で再生成するとき、その
+mappingがまだ自分のportを持っていればそのport（戻ってきたendpointのpublic portを保つ。O(1)）、
+(3) secret allocator seedとinternal endpointから決まるseeded startから最初のowner無しport
+（bitmapで、owner無しportだけを見るpoolの走査と同じport。読み込みは2 + 2×summary words、最大
+34 words）、(4) owner無しportが無ければparked mapping、次にexpiredなactivity先頭のportを
+引き継ぎます。live ownerだけならfail closedで`PORT_EXHAUSTED`です。
+
+H4a前の走査はseeded startから「owner無し**または**expired owner」の最初のportを選んだので、
+(3)はowner無しportより手前にexpired ownerのportがあるときに違うportを選びます（reviewの測定で
+64 seed、8801回中597回）。戻ってきたendpointについては(2)が以前と同じportを保ち、それ以外の
+新しいendpointでは最近expiredしたportの再利用が遅れるだけで、RFC 4787/6056上の要件に差は
+ありません。(4)はexpiry順（FIFO）でseedやendpointに依存せず予測可能です。そこに至るのは
+pool全体にownerがあるときだけで、port randomizationは元々deferred（NAT44-020）です。
+
+slot sizeはUDP/TCP mappingとTCP sessionが48→64 bytes（link 16 bytes、u128のalignment）、
+UDP peerは48 bytesのまま、bitmapはprotocolごとに上記のwords。storage shape変更なので
+restart-requiredで、`required_bytes`とcounting allocatorのtestが計上します。残るO(N)は
+reconcileのflush（control path）とdebug/testの全体検証だけです。keyed directoryのlookupは
+secret per-publication SipHash keyでchainを狙えず期待O(1)ですが、存在するkeyを見落とすと
+endpoint-independent mappingが壊れるので上限で打ち切りません。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの
