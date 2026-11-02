@@ -34,6 +34,7 @@ use super::checks::{
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
 use super::netlink::NetlinkError;
 use super::privileges::{DropFailure, DropReport, Identity, PrivilegePolicy};
+use super::seccomp::{ConfineFailure, ConfineReport, SeccompMode};
 use super::watch::LinkTarget;
 
 /// Startup stage, in execution order.
@@ -66,6 +67,8 @@ pub enum Stage {
     /// The privilege drop after activation (or of an output thread at
     /// spawn).
     PrivilegeDrop,
+    /// The syscall filter after the privilege drop (H8).
+    Seccomp,
 }
 
 impl Stage {
@@ -84,6 +87,7 @@ impl Stage {
             Self::Activate => "activate",
             Self::Workers => "workers",
             Self::PrivilegeDrop => "privilege-drop",
+            Self::Seccomp => "seccomp",
         }
     }
 }
@@ -106,6 +110,8 @@ pub enum Failure {
     Links(NetlinkError),
     /// The privilege drop after activation failed.
     PrivilegeDrop(DropFailure),
+    /// The syscall filter could not be installed or verified.
+    Seccomp(ConfineFailure),
     /// A worker thread could not be spawned.
     Spawn,
     /// A failure injected by a test host.
@@ -191,6 +197,7 @@ impl fmt::Display for Failure {
             Self::Activation(error) => write!(formatter, "code={}", token(error)),
             Self::Links(error) => write!(formatter, "code={}", token(error)),
             Self::PrivilegeDrop(error) => write!(formatter, "{error}"),
+            Self::Seccomp(error) => write!(formatter, "{error}"),
             Self::Spawn => formatter.write_str("code=THREAD_SPAWN"),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
@@ -382,6 +389,10 @@ pub trait PortHost {
     /// Drops every privilege of the process after startup (and switches to
     /// `identity`), irreversibly, and verifies every thread.
     fn lockdown(&self, identity: Option<Identity>) -> Result<DropReport, DropFailure>;
+
+    /// Installs the syscall filter of `mode` (never `Off`) on every thread
+    /// of the process after the privilege drop, and verifies every thread.
+    fn confine(&self, mode: SeccompMode) -> Result<ConfineReport, ConfineFailure>;
 
     /// Detaches (if attached) and closes one session, releasing every
     /// resource even when a step reports an error.

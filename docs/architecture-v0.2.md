@@ -3089,8 +3089,22 @@ threadはactivate後で最後に自分を落とし、
 `/proc/thread-self/status`で自分を、最後に`/proc/self/task/*/status`で全threadを検証します。
 失敗はstartup failureとして全portをrollbackしexit 1（`stage=privilege-drop`）。前提（identity切替の
 `CAP_SETUID`/`CAP_SETGID`、teardownが権限なしで動くkernel）は資源取得前のpreflightでexit 4。
-seccompは未実装です。`poll`待機はdeferredです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
+dropの直後（`--keep-privileges`でも）、router threadは`run::seccomp`のclassic BPF allowlistを
+`seccomp(SECCOMP_SET_MODE_FILTER, SECCOMP_FILTER_FLAG_TSYNC)`一回で全threadへ付けます（H8、
+CLI-102〜109）。programは手で組み（外部依存なし、`run::seccomp::program`）、archが
+`AUDIT_ARCH_X86_64`でないかx32 bitの番号は常に`SECCOMP_RET_KILL_PROCESS`、allowlistの40 syscall
+（一部はint引数の下位32 bitに条件: `socket`は`AF_NETLINK`/`NETLINK_ROUTE`、`bpf`は
+`BPF_MAP_DELETE_ELEM`、`mmap`/`mprotect`は`PROT_EXEC`なし、`openat`は書き込み・作成・切り詰め
+なし、`setsockopt`、`fcntl`、`tgkill`）は許可、それ以外は`--seccomp kill`（既定）なら
+`SECCOMP_RET_KILL_PROCESS`、`log`なら`SECCOMP_RET_LOG`、`off`ならfilterなし。TSYNCにしたのは、
+dropを早く済ませるoutput threadにもまだstartupが残るためと、attach点を一つにして全thread
+（`/proc/self/task/*/status`の`Seccomp`/`Seccomp_filters`/`NoNewPrivs`）を一度に検証するため。
+以後threadは作らない（`clone`は不許可）。hot pathの`sendto`/`poll`/`getsockopt`/`futex`/
+`clock_nanosleep`は無条件なのでkernelのaction cache（5.11）でprogramを通らない。unsafeは
+`run::seccomp::linux::sys`（`prctl`と`seccomp`のraw syscall）だけ。失敗は`stage=seccomp`で全port
+rollback、exit 1。`poll`待機はdeferredです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
 privileged E2Eは`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、reload、link
 down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL後のrestart、drop後の全threadの
-credentialと`--keep-privileges`、大きなconfigのreload準備中もEchoが欠けないこと）です（CLI-008〜059、
-CLI-089〜101、XDP-045、XDP-063、XDP-177）。
+credentialと`--keep-privileges`、大きなconfigのreload準備中もEchoが欠けないこと、全threadの
+seccomp filterと`--seccomp log`/`off`、SIGSYSでのdetach）です（CLI-008〜059、CLI-089〜109、XDP-045、
+XDP-063、XDP-177）。

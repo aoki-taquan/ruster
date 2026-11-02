@@ -20,6 +20,7 @@ usage:
              [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
              [--link-stale-secs <s>]
              [--keep-privileges | --user <uid> --group <gid>]
+             [--seccomp kill|log|off]
              --config <config.toml>
   ruster run [options] -- <config.toml>
   ruster --help | --version
@@ -28,6 +29,9 @@ usage:
 A fatal threshold of 0 disables that fatal exit (warn only).
 After startup `run` drops every capability (and with --user/--group switches
 to that numeric uid/gid); --keep-privileges keeps them for the whole run.
+It then confines every thread to a syscall allowlist (seccomp): a syscall
+outside it kills the process (--seccomp kill, the default), is logged and
+allowed (--seccomp log), or the filter is not installed (--seccomp off).
 
 exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
 (including unreadable files, and `run` stopped by a fatal health or device
@@ -60,6 +64,41 @@ pub const MAX_HEALTH_SECS: u64 = 3_600;
 /// Largest `--user`/`--group` id (`u32::MAX` means "unchanged" to the
 /// kernel's set-id calls).
 pub const MAX_ID: u32 = u32::MAX - 1;
+
+/// What `ruster run` does about syscalls outside its allowlist after
+/// startup (`--seccomp`, H8).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SeccompMode {
+    /// `kill` (the default): the kernel kills the whole process
+    /// (`SECCOMP_RET_KILL_PROCESS`).
+    #[default]
+    Kill,
+    /// `log`: the kernel logs the syscall and lets it run
+    /// (`SECCOMP_RET_LOG`); for diagnosing a kill.
+    Log,
+    /// `off`: no filter is installed.
+    Off,
+}
+
+impl SeccompMode {
+    /// The option value (and the stats label).
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Kill => "kill",
+            Self::Log => "log",
+            Self::Off => "off",
+        }
+    }
+
+    fn parse(value: &OsStr) -> Option<Self> {
+        match value.to_str()? {
+            "kill" => Some(Self::Kill),
+            "log" => Some(Self::Log),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
 
 /// A numeric `run` option: name and accepted range.
 struct Numeric {
@@ -148,6 +187,8 @@ pub struct RunArgs {
     /// `--group`, only together, never with `--keep-privileges`).
     pub user: Option<u32>,
     pub group: Option<u32>,
+    /// The syscall filter after startup (`--seccomp`, default kill).
+    pub seccomp: SeccompMode,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -191,6 +232,9 @@ impl fmt::Display for UsageError {
             Self::MissingOperand(name) => write!(formatter, "missing operand <{name}>"),
             Self::MissingValue(option) => write!(formatter, "option {option} requires a value"),
             Self::DuplicateOption(option) => write!(formatter, "option {option} given twice"),
+            Self::InvalidValue("--seccomp") => {
+                formatter.write_str("option --seccomp needs kill, log, or off")
+            }
             Self::InvalidValue(option @ ("--user" | "--group")) => write!(
                 formatter,
                 "option {option} needs a numeric id from 1 to {MAX_ID}"
@@ -319,6 +363,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut strict_config_perms = false;
     let mut keep_privileges = false;
     let mut ids: [Option<u32>; 2] = [None; 2];
+    let mut seccomp = None;
     let mut numbers: [Option<u64>; NUMERIC.len()] = [None; NUMERIC.len()];
     let mut words = rest.iter();
     'words: while let Some(word) = words.next() {
@@ -327,6 +372,18 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
                 return Err(UsageError::MissingValue("--config"));
             }
             set_once(&mut config, value.into(), "--config")?;
+            continue;
+        }
+        if let Some(value) = equals_value(word, "--seccomp=") {
+            set_seccomp(&mut seccomp, &value)?;
+            continue;
+        }
+        if word.to_str() == Some("--seccomp") {
+            let value = words
+                .next()
+                .filter(|value| !is_option(value))
+                .ok_or(UsageError::MissingValue("--seccomp"))?;
+            set_seccomp(&mut seccomp, value)?;
             continue;
         }
         for (index, &name) in ID_OPTIONS.iter().enumerate() {
@@ -431,7 +488,17 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         keep_privileges,
         user,
         group,
+        seccomp: seccomp.unwrap_or_default(),
     }))
+}
+
+/// `--seccomp kill|log|off`, at most once.
+fn set_seccomp(slot: &mut Option<SeccompMode>, value: &OsStr) -> Result<(), UsageError> {
+    let mode = SeccompMode::parse(value).ok_or(UsageError::InvalidValue("--seccomp"))?;
+    if slot.replace(mode).is_some() {
+        return Err(UsageError::DuplicateOption("--seccomp"));
+    }
+    Ok(())
 }
 
 /// The identity options of `run`, in `ids` order.
@@ -695,6 +762,7 @@ mod tests {
             keep_privileges: false,
             user: None,
             group: None,
+            seccomp: SeccompMode::Kill,
         })
     }
 
@@ -780,6 +848,68 @@ mod tests {
             "option --user needs a numeric id from 1 to 4294967294"
         );
         assert!(USAGE.contains("[--keep-privileges | --user <uid> --group <gid>]"));
+    }
+
+    #[test]
+    fn run_parses_the_seccomp_option() {
+        let parsed = |words: &[&str]| match run(words) {
+            Ok(Command::Run(args)) => args.seccomp,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parsed(&["run", "--config", "a"]), SeccompMode::Kill);
+        assert_eq!(SeccompMode::default(), SeccompMode::Kill);
+        for (value, mode) in [
+            ("kill", SeccompMode::Kill),
+            ("log", SeccompMode::Log),
+            ("off", SeccompMode::Off),
+        ] {
+            assert_eq!(parsed(&["run", "--seccomp", value, "--config", "a"]), mode);
+            assert_eq!(
+                parsed(&["run", &format!("--seccomp={value}"), "--config", "a"]),
+                mode
+            );
+            assert_eq!(mode.label(), value);
+        }
+        // Every mode combines with every privilege policy.
+        assert_eq!(
+            parsed(&["run", "--keep-privileges", "--seccomp=log", "--config", "a"]),
+            SeccompMode::Log
+        );
+        assert_eq!(
+            parsed(&[
+                "run",
+                "--user=1",
+                "--group=1",
+                "--seccomp=off",
+                "--config",
+                "a"
+            ]),
+            SeccompMode::Off
+        );
+        for bad in ["", "KILL", "Kill", "errno", "trap", "0", " kill", "kill "] {
+            assert_eq!(
+                run(&["run", "--config", "a", &format!("--seccomp={bad}")]),
+                Err(UsageError::InvalidValue("--seccomp")),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            run(&["run", "--config", "a", "--seccomp"]),
+            Err(UsageError::MissingValue("--seccomp"))
+        );
+        assert_eq!(
+            run(&["run", "--seccomp", "--config", "a"]),
+            Err(UsageError::MissingValue("--seccomp"))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--seccomp=log", "--seccomp", "log"]),
+            Err(UsageError::DuplicateOption("--seccomp"))
+        );
+        assert_eq!(
+            UsageError::InvalidValue("--seccomp").to_string(),
+            "option --seccomp needs kill, log, or off"
+        );
+        assert!(USAGE.contains("[--seccomp kill|log|off]"));
     }
 
     #[test]
@@ -896,6 +1026,7 @@ mod tests {
                 keep_privileges: false,
                 user: None,
                 group: None,
+                seccomp: SeccompMode::Kill,
             }))
         };
         assert_eq!(

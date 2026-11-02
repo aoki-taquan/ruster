@@ -23,7 +23,12 @@
 #             (H6) Every phase runs with the default privilege drop: here
 #             every thread of the running router (/proc/<pid>/task/*/status)
 #             shows CapInh/CapPrm/CapEff/CapAmb/CapBnd 0 and NoNewPrivs 1,
-#             and the startup line and stats say privileges dropped
+#             and the startup line and stats say privileges dropped.
+#             (H8) Every phase also runs under the default seccomp filter
+#             (--seccomp kill): wherever the threads are checked, every
+#             thread shows Seccomp 2 and one filter more than this shell
+#             (Seccomp_filters 1 on an unconfined host), and the startup
+#             line and stats say seccomp mode=kill
 #   limits    (H3) a config with every runtime table at its production
 #             limit (failure holds and ICMPv4 error actions 4096, every
 #             other table 65536, NAT44 pool 1-65535, 51.11 MiB of storage) is
@@ -57,7 +62,8 @@
 #             a SIGHUP reload from it fails with stage=read
 #             code=PERMISSION_DENIED while forwarding goes on (no
 #             CAP_DAC_OVERRIDE); with --keep-privileges every thread keeps
-#             CAP_NET_ADMIN (NoNewPrivs 0), the same reload applies, and
+#             CAP_NET_ADMIN (NoNewPrivs 1: the seccomp filter sets it),
+#             the same reload applies, and
 #             the stats say privileges.state=kept; all exit 0 on SIGTERM
 #             with nothing attached
 #   validate  (gap fill) `ruster validate` on every config the smoke runs
@@ -143,6 +149,21 @@
 #             all/mc_forwarding=1: refused (scope=multicast), accepted with
 #             --allow-kernel-forwarding, warned and recovered (SKIPPED with
 #             the reason when MRT_INIT fails)
+#   seccomp   (H8) --seccomp log: every thread filtered (Seccomp 2), the
+#             log-mode warning, forwarding, an applied SIGHUP reload, a
+#             link down/up, SIGTERM exit 0, and no seccomp record of the
+#             ruster binary in the kernel log (dmesg; best effort: with
+#             auditd running the records go to its log instead).
+#             --seccomp off: no thread filtered (Seccomp 0), the warning,
+#             seccomp.mode=off, forwarding, exit 0. A kill by the filter
+#             cannot be provoked from outside (nothing reachable makes a
+#             denied syscall, and there is no test hook in the binary;
+#             the Rust test seccomp::tests::live kills a filtered child):
+#             a SIGSYS sent to the running router stands in for it (the
+#             kernel's seccomp kill is the same group exit by SIGSYS):
+#             it dies by that signal and both links detach. At the end,
+#             no seccomp kill of the ruster binary was logged during the
+#             whole smoke (same best effort)
 #   restart   SIGKILL a running router: the unpinned links auto-detach;
 #             restart (bounded retry of the transient BIND/BUSY or
 #             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
@@ -650,10 +671,12 @@ assert_workers() {
 # capability (inheritable, permitted, effective, ambient, bounding) and
 # has NoNewPrivs 1; with $2 = "<uid> <gid>" also that uid/gid in every
 # field and no supplementary group. Sets `threads`. Covers the H7 worker
-# threads (assert_workers).
+# threads (assert_workers) and (H8) the seccomp filter on every thread
+# (assert_confined) unless $3 is "unconfined" (--seccomp off).
 assert_dropped() {
     name=$1
     ids=${2-}
+    filtered=${3-filtered}
     threads=0
     for task in $(sudo -n ls "/proc/$ruster_pid/task"); do
         st=$(sudo -n cat "/proc/$ruster_pid/task/$task/status") ||
@@ -681,10 +704,48 @@ assert_dropped() {
         threads=$((threads + 1))
     done
     assert_workers "$name" "$threads"
+    [ "$filtered" = unconfined ] || assert_confined "$name"
+}
+
+# H8: every thread of the running ruster ($ruster_pid) runs under the
+# seccomp filter ($2 = 1, the default) or under none ($2 = 0, --seccomp
+# off): Seccomp 2 and one filter more than this shell, or this shell's
+# Seccomp mode and filter count.
+assert_confined() {
+    name=$1
+    want=${2:-1}
+    count=0
+    for task in $(sudo -n ls "/proc/$ruster_pid/task"); do
+        st=$(sudo -n cat "/proc/$ruster_pid/task/$task/status") ||
+            fail "$name: cannot read task $task"
+        comm=$(status_row "$st" Name)
+        mode=$(status_row "$st" Seccomp)
+        filters=$(status_row "$st" Seccomp_filters)
+        if [ "$want" = 1 ]; then
+            [ "$mode" = 2 ] || fail "$name: thread $comm ($task) Seccomp=$mode, not 2"
+            [ "$filters" = $((seccomp_base + 1)) ] ||
+                fail "$name: thread $comm ($task) Seccomp_filters=$filters, not $((seccomp_base + 1))"
+        else
+            [ "$mode" = "$seccomp_mode_base" ] ||
+                fail "$name: thread $comm ($task) Seccomp=$mode under --seccomp off"
+            [ "$filters" = "$seccomp_base" ] ||
+                fail "$name: thread $comm ($task) Seccomp_filters=$filters under --seccomp off"
+        fi
+        count=$((count + 1))
+    done
+    [ "$count" -ge 5 ] || fail "$name: only $count thread(s)"
+}
+
+# Number of seccomp records (`type=1326`) of the ruster binary in the
+# kernel log so far; empty if the kernel log cannot be read.
+seccomp_records() {
+    log=$(sudo -n dmesg 2>/dev/null) || return 0
+    printf '%s\n' "$log" | grep -F "type=1326" | grep -cF "exe=\"$binary_path\"" || true
 }
 
 # H6 --keep-privileges: every thread still has CAP_NET_ADMIN (bit 12)
-# effective and NoNewPrivs 0.
+# effective; NoNewPrivs is 1 (set for the seccomp filter, which also runs
+# with --keep-privileges).
 assert_kept() {
     name=$1
     threads=0
@@ -693,10 +754,11 @@ assert_kept() {
             fail "$name: cannot read task $task"
         eff=$(status_row "$st" CapEff)
         [ $((0x$eff >> 12 & 1)) -eq 1 ] || fail "$name: task $task CapEff=$eff without CAP_NET_ADMIN"
-        [ "$(status_row "$st" NoNewPrivs)" = 0 ] || fail "$name: task $task NoNewPrivs set"
+        [ "$(status_row "$st" NoNewPrivs)" = 1 ] || fail "$name: task $task NoNewPrivs not set"
         threads=$((threads + 1))
     done
     assert_workers "$name" "$threads"
+    assert_confined "$name"
 }
 
 # The config of the workers phase (argv: base config, routes, rules): the
@@ -988,6 +1050,16 @@ grep -qxF "ruster: invalid next config: $invalid_detail" "$work/plan-router-inva
 reshape_reasons=$(sed -n 's/^restart-required: //p' "$work/plan-router-reshape.txt")
 echo "priv_run_plan: deny and router-v2 reloadable, reshape and txfull restart-required BACKEND, invalid next exit 2 verified"
 
+# H8: the seccomp state this shell passes on to ruster (on an unconfined
+# host Seccomp 0 with 0 filters; under a supervisor's filter ruster adds
+# one on top).
+seccomp_base=$(sed -n 's/^Seccomp_filters:[[:space:]]*//p' /proc/self/status)
+seccomp_mode_base=$(sed -n 's/^Seccomp:[[:space:]]*//p' /proc/self/status)
+case $seccomp_base in
+"" | *[!0-9]*) fail "no Seccomp_filters row in /proc/self/status (Linux 5.9 or newer needed)" ;;
+esac
+seccomp_records_start=$(seccomp_records)
+
 # forward: cold start, forward, SIGTERM.
 start_ruster forward "$work/router.toml"
 wait_ready forward || fail "forward: ruster exited during startup"
@@ -996,7 +1068,10 @@ case $(xdp_on rb) in xdp\ [0-9]*) ;; *) fail "forward: no native XDP on rb" ;; e
 assert_dropped forward
 grep -qxF "ruster run: privileges dropped: threads=5 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged" \
     "$work/forward.err" || fail "forward: no privilege drop line"
+grep -Eqx "ruster run: seccomp filter installed: mode=kill threads=5 syscalls=[0-9]+ arch=x86_64" \
+    "$work/forward.err" || fail "forward: no seccomp line"
 forward_once forward
+echo "priv_run_seccomp_kill: all $threads threads Seccomp=2 Seccomp_filters=$((seccomp_base + 1)) under the default kill filter, forwarding verified"
 echo "priv_run_privileges_dropped: all $threads threads CapInh/CapPrm/CapEff/CapAmb/CapBnd=0 NoNewPrivs=1 uid 0, forwarding after the drop verified"
 signal_ruster TERM
 wait_ruster
@@ -1008,7 +1083,7 @@ sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/forward.out" >"$work/for
 block_has "$work/forward.final" observer.state=healthy observer.generation=1 watch.state=ok \
     resolution_index.state_probe_exhausted=0 resolution_index.index_corrupt=0 \
     privileges.state=dropped privileges.bounding_set=cleared privileges.identity=unchanged \
-    privileges.threads=5
+    privileges.threads=5 seccomp.mode=kill seccomp.threads=5
 received=$(sed -n 's/^rx.received=//p' "$work/forward.out" | tail -n 1)
 [ "${received:-0}" -ge 1 ] || fail "forward: final rx.received is ${received:-missing}"
 grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
@@ -1174,7 +1249,7 @@ wait_ruster
 assert_detached "the --keep-privileges run"
 sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/keep.out" >"$work/keep.final"
 block_has "$work/keep.final" privileges.state=kept privileges.threads=0
-echo "priv_run_privileges_kept: --keep-privileges kept CAP_NET_ADMIN in all $threads threads (NoNewPrivs=0), the same reload applied, privileges.state=kept, exit 0, detached verified"
+echo "priv_run_privileges_kept: --keep-privileges kept CAP_NET_ADMIN in all $threads threads (NoNewPrivs=1, Seccomp=2: the filter still applies), the same reload applied, privileges.state=kept, exit 0, detached verified"
 
 # icmp: router-generated ICMPv4 on the wire over AF_XDP, seen by host A.
 cp "$work/router.toml" "$work/icmp.toml"
@@ -1953,6 +2028,69 @@ exec 3<&-
 assert_detached "SIGTERM with an undrained stdout"
 echo "priv_run_stuck: undrained stdout, SIGTERM drained, detached, and exited in bounded time verified"
 
+# seccomp (H8): the log and off modes, and a SIGSYS kill detaches.
+phase_seccomp() {
+    before=$(seccomp_records)
+    start_ruster seccomp-log "$work/router.toml" --seccomp log \
+        --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready seccomp-log || fail "seccomp-log: ruster exited during startup"
+    assert_dropped seccomp-log "$smoke_uid $smoke_gid"
+    grep -Eqx "ruster run: seccomp filter installed: mode=log threads=5 syscalls=[0-9]+ arch=x86_64" \
+        "$work/seccomp-log.err" || fail "seccomp-log: no seccomp line"
+    grep -qxF "ruster run: warning: seccomp=log (--seccomp log): a syscall outside the allowlist is logged by the kernel and allowed" \
+        "$work/seccomp-log.err" || fail "seccomp-log: no warning"
+    forward_once seccomp-log
+    signal_ruster HUP
+    wait_line seccomp-log "reload applied: generation=2 previous=1"
+    sudo -n ip -n "$router" link set ra down
+    wait_line seccomp-log "warning: port=if1 health=LINK_DOWN"
+    sudo -n ip -n "$router" link set ra up
+    wait_line seccomp-log "recovered: port=if1 health=LINK_DOWN"
+    forward_once seccomp-log-after
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "seccomp-log: exit status $status after SIGTERM"
+    assert_detached "the --seccomp log run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/seccomp-log.out" >"$work/seccomp-log.final"
+    block_has "$work/seccomp-log.final" seccomp.mode=log seccomp.threads=5
+    after=$(seccomp_records)
+    [ "${after:-0}" -le "${before:-0}" ] ||
+        fail "seccomp-log: the kernel logged $((after - before)) seccomp record(s) of the ruster binary"
+    echo "priv_run_seccomp_log: --seccomp log filtered all 5 threads, forwarded, reloaded (generation 2), survived a link down/up, exit 0, detached, no seccomp record in the kernel log (${after:-unreadable} in all) verified"
+
+    start_ruster seccomp-off "$work/router.toml" --seccomp=off
+    wait_ready seccomp-off || fail "seccomp-off: ruster exited during startup"
+    assert_dropped seccomp-off "" unconfined
+    assert_confined seccomp-off 0
+    grep -qxF "ruster run: warning: seccomp=off (--seccomp off): no syscall filter" \
+        "$work/seccomp-off.err" || fail "seccomp-off: no warning"
+    forward_once seccomp-off
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "seccomp-off: exit status $status after SIGTERM"
+    assert_detached "the --seccomp off run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/seccomp-off.out" >"$work/seccomp-off.final"
+    block_has "$work/seccomp-off.final" seccomp.mode=off seccomp.threads=0 seccomp.syscalls=0
+    echo "priv_run_seccomp_off: --seccomp off left every thread unfiltered (Seccomp=$seccomp_mode_base), forwarded, exit 0, detached verified"
+
+    start_ruster seccomp-sigsys "$work/router.toml"
+    wait_ready seccomp-sigsys || fail "seccomp-sigsys: ruster exited during startup"
+    assert_confined seccomp-sigsys
+    signal_ruster SYS
+    wait_ruster
+    [ "$status" -ne 0 ] || fail "seccomp-sigsys: exit status 0 after SIGSYS"
+    tries=0
+    while [ -n "$(xdp_on ra)$(xdp_on rb)" ]; do
+        tries=$((tries + 1))
+        [ "$tries" -le 100 ] || fail "links survived SIGSYS of their owner"
+        sleep 0.02
+    done
+    grep -q "stopped by signal" "$work/seccomp-sigsys.err" && fail "seccomp-sigsys: ran an ordered shutdown"
+    echo "priv_run_seccomp_sigsys: a SIGSYS group exit (what the kill filter does) ended the router with status $status and both links auto-detached verified"
+}
+
+phase_seccomp
+
 # restart: SIGKILL, auto-detach, bounded restart retry, forward again.
 start_ruster killed "$work/router.toml"
 wait_ready killed || fail "killed: ruster exited during startup"
@@ -2017,6 +2155,13 @@ if sudo -n ip -n "$router" link show dev ra >/dev/null 2>&1; then
 fi
 cat "$work/removal.err"
 echo "priv_run_removal: deleted port device failed closed with exit 1, nothing left attached verified"
+
+# H8: no seccomp kill (or log record) of the ruster binary in the whole
+# smoke: every syscall the phases above made was on the allowlist.
+seccomp_records_end=$(seccomp_records)
+[ "${seccomp_records_end:-0}" -le "${seccomp_records_start:-0}" ] ||
+    fail "the kernel logged $((seccomp_records_end - seccomp_records_start)) seccomp record(s) of the ruster binary"
+echo "priv_run_seccomp_no_violation: no seccomp record of the ruster binary in the kernel log during the smoke (${seccomp_records_end:-unreadable} in all) verified"
 
 cleanup
 trap - EXIT

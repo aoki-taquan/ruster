@@ -15,6 +15,7 @@ use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
 use super::engine::{ClockedIo, Datapath, DrainProgress, LinkMonitor};
 use super::netlink::{Dump, Family, LinkFacts, LinkProbe, NetlinkError};
 use super::privileges::{self, DropFailure, DropReport, Identity, PrivilegePolicy};
+use super::seccomp::{self, ConfineFailure, ConfineReport, SeccompMode};
 use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
 use super::stats::write_fields;
 use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
@@ -56,6 +57,10 @@ impl PortHost for LinuxHost {
 
     fn thread_prologue(&self) -> fn(PrivilegePolicy) -> Result<(), DropFailure> {
         drop_worker_thread
+    }
+
+    fn confine(&self, mode: SeccompMode) -> Result<ConfineReport, ConfineFailure> {
+        seccomp::linux::confine(mode)
     }
 
     fn open(&self, port: &ValidatedAfXdpPortV1) -> Result<NativeSession, Failure> {
