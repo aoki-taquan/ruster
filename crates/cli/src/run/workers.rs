@@ -39,9 +39,11 @@
 //! worker waiting for a request ends at once, one in the middle of a round
 //! or a preparation ends when that returns. [`Worker::finish`] waits for
 //! that at most until a deadline ([`WORKER_STOP_MS`] after the loop ended,
-//! overlapping the drain) and then abandons the thread: a watcher stuck in
-//! a `send` while another process holds the RTNL lock cannot delay the
-//! drain, the detach, or the exit, and dies with the process.
+//! overlapping the drain) and then abandons the thread, which dies with the
+//! process: a watcher stuck in a `send` while another process holds the
+//! RTNL lock delays the detach and the exit by at most that bound. (The
+//! XDP detach itself needs RTNL too, so while another process holds it the
+//! exit waits for the kernel anyway, as before H7.)
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread::{self, JoinHandle};
@@ -198,12 +200,14 @@ pub struct LinkWatcher {
     /// The buffer while no round runs.
     idle: Option<Box<LinkRound>>,
     /// A reply taken early by a lockstep request (tests).
+    #[cfg(test)]
     early: Option<Box<LinkRound>>,
     /// When the outstanding round was requested (or the watcher was found
     /// gone).
     since: Option<MonotonicMillis>,
     worker: Option<Worker>,
     /// Tests: every request waits for its reply (see [`lockstep_wait`]).
+    #[cfg(test)]
     lockstep: bool,
 }
 
@@ -234,9 +238,11 @@ impl LinkWatcher {
             requests,
             replies,
             idle: Some(Box::new(LinkRound::new(targets.len()))),
+            #[cfg(test)]
             early: None,
             since: None,
             worker: Some(worker),
+            #[cfg(test)]
             lockstep: false,
         })
     }
@@ -261,18 +267,24 @@ impl LinkWatcher {
         self.since = Some(now);
         match self.requests.try_send(round) {
             Ok(()) => {
+                #[cfg(test)]
                 if self.lockstep {
                     self.early = lockstep_wait(&self.replies);
                 }
                 true
             }
-            // Only one buffer exists, so the queue is never full; a gone
-            // watcher keeps the round outstanding forever (stale).
+            // Only one buffer exists and it is lent only while idle, so the
+            // queue is never full.
             Err(TrySendError::Full(round)) => {
+                debug_assert!(false, "the link request queue is never full");
                 self.idle = Some(round);
                 self.since = None;
                 false
             }
+            // A gone watcher: the buffer is dropped on purpose, so `idle`
+            // stays empty and the round stays outstanding since `now`
+            // forever, which the watch turns into stale rounds (fail
+            // closed). Nothing is allocated or freed per round otherwise.
             Err(TrySendError::Disconnected(_)) => false,
         }
     }
@@ -283,7 +295,11 @@ impl LinkWatcher {
         if self.idle.is_some() || self.since.is_none() {
             return None;
         }
-        let round = match self.early.take() {
+        #[cfg(test)]
+        let early = self.early.take();
+        #[cfg(not(test))]
+        let early = None;
+        let round = match early {
             Some(round) => round,
             None => match self.replies.try_recv() {
                 Ok(round) => round,
@@ -314,6 +330,7 @@ impl LinkWatcher {
 /// Tests only (`lockstep`): waits up to 30 s of wall time for a reply,
 /// spinning on `try_recv` with short sleeps (no allocation, no blocking
 /// `recv`).
+#[cfg(test)]
 pub fn lockstep_wait<T>(replies: &Receiver<T>) -> Option<T> {
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
     loop {

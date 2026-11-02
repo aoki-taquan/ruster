@@ -729,6 +729,7 @@ fn settings(policy: CheckPolicy, stats_interval_ms: u64) -> Settings {
         link_interval_ms: 0,
         link_stale_ms: super::watch::DEFAULT_LINK_STALE_MS,
         reload_quiesce_ms: super::reload::RELOAD_QUIESCE_MS,
+        reload_prepare_warn_ms: super::reload::RELOAD_PREPARE_WARN_MS,
         thresholds: super::watch::Thresholds::default(),
         privileges: PrivilegePolicy::default(),
     }

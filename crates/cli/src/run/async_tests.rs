@@ -167,19 +167,23 @@ fn traffic_flows_while_a_reload_is_prepared_and_it_applies_at_a_boundary() {
 }
 
 /// A reload still preparing when the run stops fails as `STOPPED` (the
-/// counters add up), and the held worker does not hold the exit: it is
-/// abandoned after the bound.
+/// counters add up), and the held worker delays the exit by at most the
+/// bound, after which it is abandoned. While it prepares, `reload.preparing_ms`
+/// grows and one warning is given past the bound.
 #[test]
 fn a_reload_preparing_at_the_stop_is_stopped_and_the_worker_abandoned() {
     struct StopWhileHeld {
         state: Rc<State>,
         source: FakeSource,
+        err: SharedText,
         started: Instant,
     }
     impl StopSignal for StopWhileHeld {
         fn stop(&self) -> bool {
             within(self.started, "the held load");
-            self.state.io_calls.get() >= 50 && self.source.loads.load(Ordering::SeqCst) == 1
+            self.state.io_calls.get() >= 50
+                && self.source.loads.load(Ordering::SeqCst) == 1
+                && self.err.text().contains("reload preparation running")
         }
         fn force(&self) -> bool {
             false
@@ -191,14 +195,20 @@ fn a_reload_preparing_at_the_stop_is_stopped_and_the_worker_abandoned() {
     let host = FakeHost::default();
     let source = FakeSource::with([Ok(echo_off())]);
     source.hold.store(true, Ordering::SeqCst);
+    let mut err = SharedText::default();
     let stop = StopWhileHeld {
         state: Rc::clone(&host.state),
         source: source.clone(),
+        err: err.clone(),
         started: Instant::now(),
     };
-    let mut err = SharedText::default();
+    let settings = Settings {
+        stats_interval_ms: 100,
+        reload_prepare_warn_ms: 2_000,
+        ..never_stale()
+    };
     let started = Instant::now();
-    let (status, out) = run_async(&host, source.clone(), never_stale(), &stop, &mut err);
+    let (status, out) = run_async(&host, source.clone(), settings, &stop, &mut err);
     let elapsed = started.elapsed();
     source.hold.store(false, Ordering::SeqCst);
     let text = err.text();
@@ -222,6 +232,23 @@ fn a_reload_preparing_at_the_stop_is_stopped_and_the_worker_abandoned() {
     assert_eq!(line_value(&out, "reload.requested"), Some("1"));
     assert_eq!(line_value(&out, "reload.failed"), Some("1"));
     assert_eq!(line_value(&out, "reload.applied"), Some("0"));
+    // Exactly one warning, at the bound (fake time).
+    assert_eq!(
+        text.matches(
+            "ruster run: warning: reload preparation running for 2 s; later SIGHUPs are held\n"
+        )
+        .count(),
+        1,
+        "{text}"
+    );
+    let preparing: Vec<u64> = out
+        .lines()
+        .filter_map(|line| line.strip_prefix("reload.preparing_ms="))
+        .map(|value| value.parse().expect("number"))
+        .collect();
+    assert!(preparing.iter().any(|ms| *ms >= 1_000), "{preparing:?}");
+    // The final block: nothing preparing any more.
+    assert_eq!(line_value(&out, "reload.preparing_ms"), Some("0"));
     host.assert_released();
 }
 
@@ -408,6 +435,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
         health_interval_ms: 1_000_000,
         link_interval_ms: 1_000,
         reload_quiesce_ms: 200,
+        reload_prepare_warn_ms: 10_000,
     };
     let datapath = ForwardingDatapath { io: SimIo::new() };
     let mut err = Vec::new();

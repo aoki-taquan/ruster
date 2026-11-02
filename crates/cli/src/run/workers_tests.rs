@@ -230,7 +230,7 @@ fn the_handoff_does_not_allocate_on_the_router_thread() {
 }
 
 /// Shutdown: an idle watcher ends at once; one stuck in a round is
-/// abandoned at the deadline instead of holding the caller.
+/// abandoned at the deadline, so the caller waits at most until then.
 #[test]
 fn a_stopped_watcher_ends_or_is_abandoned_at_the_deadline() {
     let watcher = LinkWatcher::spawn(Monitor::default(), &TARGETS, no_prologue).expect("spawned");

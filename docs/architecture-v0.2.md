@@ -3055,7 +3055,9 @@ M2 S10b（run-time operations、cold pathだけ）:
 - worker thread（H7、CLI-096〜CLI-101）: `ruster-watch`と`ruster-reload`はactivateの後、router threadの
   privilege dropの前にspawnし、最初に自分のthreadのdropを行います（spawn側は結果を待つ）。router側は
   bounded `std::sync::mpsc`への`try_send`/`try_recv`だけで、blockもallocationもapplication lockもしません。
-  停止時はloop終了でchannelを閉じ、drainと重ねて最大500 ms待ち、終わらないworkerは警告して切り離します。
+  停止時はloop終了でchannelを閉じ、drainと重ねて最大500 ms待ち、終わらないworkerは警告して切り離します
+  （detachとexitの遅れはloop終了から最大500 ms。XDP detach自体もRTNLを取るので、他processがRTNLを持つ間の
+  exitはH7以前と同じくkernelを待ちます）。reload準備の経過は`reload.preparing_ms`、10 sを超えると一回warningです。
 - startup checkはkernel IPv4 forwarding（global/port）を既定で拒否し、`--allow-kernel-forwarding`で
   warningにします。`--strict-config-perms`は起動時とreload時にconfigの所有者とmodeを`fstat`で確認し、
   configは常に`O_NONBLOCK|O_NOCTTY`のregular fileとして読みます。reloadの`Applied`は権威的で、

@@ -348,6 +348,8 @@ pub struct LoopSettings {
     pub link_interval_ms: u64,
     /// Longest wait of a pending reload for quiescence.
     pub reload_quiesce_ms: u64,
+    /// A reload preparation running this long is warned once.
+    pub reload_prepare_warn_ms: u64,
 }
 
 /// The cold-path control of the loop: reload, health, and link watch.
@@ -404,12 +406,22 @@ where
                 err,
                 "ruster run: reload requested (generation {generation})"
             );
-            if let Some(outcome) = control.reloader.request(generation) {
+            if let Some(outcome) = control.reloader.request(generation, now) {
                 let _ = writeln!(err, "ruster run: {outcome}");
             }
         }
         if let Some(outcome) = control.reloader.poll(active, now) {
             let _ = writeln!(err, "ruster run: {outcome}");
+        }
+        if let Some(seconds) = control
+            .reloader
+            .observe_preparation(now, settings.reload_prepare_warn_ms)
+        {
+            let _ = writeln!(
+                err,
+                "ruster run: warning: reload preparation running for {seconds} s; \
+                 later SIGHUPs are held"
+            );
         }
         let mut candidate = None;
         if let Some(since) = control.reloader.pending_since() {

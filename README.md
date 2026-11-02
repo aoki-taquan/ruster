@@ -759,6 +759,8 @@ sudo kill -HUP <pid>                                               # configをre
   ARP学習・NAT44 mapping・firewall flowをflushし（hash keyがrotateする）、counterは保持します。
   `reload.requested|applied|refused|failed`をstatsに出し、停止時に準備中・待機中のreloadは
   `stage=prepare|quiesce code=STOPPED`で数えるのでfinalでは常にrequested = applied + refused + failedです。
+  準備中のreloadの経過は`reload.preparing_ms`に出し、10 sを超えると一回だけ
+  `warning: reload preparation running for N s; later SIGHUPs are held`を出します。
   quiescence待ち（最大200 ms）だけはRXを止めるので、負荷中はその間にRX ringが溢れ得ます
   （`kernel_rx_ring_full`）。SIGHUPで`ruster run`は終了しません。
 - health/link watch（cold path）: 500 msごとにportのcounterを、1 sごとにrtnetlink `RTM_GETLINK`で

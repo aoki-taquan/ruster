@@ -716,8 +716,23 @@ workers are told to stop when the loop ends and are waited for at most
 500 ms (overlapping the drain); a worker still busy then (a watcher stuck
 on the RTNL lock, a reload still reading) is abandoned with `warning: the
 link watcher thread did not end within 500 ms after the loop; abandoned`
-(or `reload worker`) and dies with the process: drain, detach and exit are
-never held by it.
+(or `reload worker`) and dies with the process. A busy worker therefore
+delays the detach and the exit by at most 500 ms after the loop. The XDP
+detach itself (closing each link) also takes the kernel's RTNL lock: while
+another process holds it, the exit waits for the kernel whatever the
+workers do (the same before H7).
+
+Scheduling: the workers inherit the router's CPU affinity and scheduling
+policy. Do not run `ruster run` under `SCHED_FIFO`/`SCHED_RR` pinned to a
+single CPU: a busy router then never yields to the link watcher, whose
+round goes stale and ends the run with `LINK_UNVERIFIABLE` after about
+7 s (section 8). Keep at least one CPU in the affinity mask where the
+workers can run (or leave the default `SCHED_OTHER`).
+
+A reload preparation that runs for 10 s (for example a config read stuck on
+a hung file system) prints once `warning: reload preparation running for N
+s; later SIGHUPs are held`; `reload.preparing_ms` in the stats shows how
+long the current one has run (0 when none).
 
 The router samples every port's backend counters every 500 ms (cold path)
 and prints a value-free line when a condition starts or ends:
@@ -777,7 +792,7 @@ outstanding:
 | MTU below the startup MTU | fatal `MTU_DECREASED` (TX is bounded by the startup MTU; longer frames could be stranded in the kernel) |
 | MTU above what a frame holds (`frame-size - 256 - headroom - 14`) | fatal `MTU_ABOVE_FRAME` |
 | MTU raised within that bound | warning `MTU_RAISED`, recovered when it returns; TX stays bounded by the startup MTU until a restart |
-| a round is still running when the next is due (watcher stuck, usually on the RTNL lock) | `watch.link_rounds_late` +1, nothing else while the round is younger than `--link-stale-secs` (5) |
+| a round is still running when the next is due (watcher stuck, usually on the RTNL lock) | `watch.link_rounds_late` +1, nothing else while the round is younger than `--link-stale-secs` (5). Rounds that are persistently slow but never stale (each finishing within the threshold, yet after the next was due) show up only in `watch.link_rounds_late` growing, with no warning: watch it, as it means the namespace's dumps or RTNL contention take longer than the 1 s interval |
 | ... the running round is older than `--link-stale-secs` | each due round: warning `LINK_WATCH_STALE` (once, every port) and a failed link query on every port (`watch.link_rounds_stale` +1, warning `LINK_PROBE`, fatal `LINK_UNVERIFIABLE` at the third in a row: with the defaults about 7 s after the stuck round started). When the round comes back its results count as usual and `LINK_WATCH_STALE` recovers |
 | a query fails | warning `LINK_PROBE`; fatal `LINK_UNVERIFIABLE` after 3 failures in a row. The link query, each dump (IPv4 addresses, IPv4 routes, IPv6 addresses, IPv6 routes) and the procfs reads (IPv4 forwarding; `disable_ipv6` with the IPv6 forwarding sysctls) each count their own failures |
 | a kernel IPv4 address appears on a port | warning `KERNEL_IPV4_ADDRESSES` (`if<id>.watch.kernel_ipv4_addresses`), recovered when gone; keeps running |
@@ -931,7 +946,7 @@ Sections, in this order:
 | `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `firewall.*` | the five service runtimes' cumulative counters |
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
-| `reload.*` | `requested`, `applied`, `refused`, `failed` |
+| `reload.*` | `requested`, `applied`, `refused`, `failed`, `preparing_ms` (how long the reload being prepared on the worker has run; 0 when none) |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports), `link_rounds` (link rounds that came back from the watcher), `link_rounds_late` (due rounds skipped because one still ran), `link_rounds_stale` (late rounds past `--link-stale-secs`, each a failed link query) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
 | `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |

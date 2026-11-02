@@ -178,6 +178,8 @@ pub struct Settings {
     /// (`--link-stale-secs`, [`watch`]).
     pub link_stale_ms: u64,
     pub reload_quiesce_ms: u64,
+    /// A reload preparation running this long is warned once.
+    pub reload_prepare_warn_ms: u64,
     /// Health thresholds of the watch.
     pub thresholds: Thresholds,
     /// The privilege drop after startup.
@@ -201,6 +203,7 @@ impl Settings {
             link_interval_ms: LINK_INTERVAL_MS,
             link_stale_ms: args.link_stale_secs.saturating_mul(1_000),
             reload_quiesce_ms: reload::RELOAD_QUIESCE_MS,
+            reload_prepare_warn_ms: reload::RELOAD_PREPARE_WARN_MS,
             thresholds: Thresholds::from_secs(
                 args.tx_stall_warn_secs,
                 args.tx_stall_fatal_secs,
@@ -636,6 +639,7 @@ where
         health_interval_ms: settings.health_interval_ms,
         link_interval_ms: settings.link_interval_ms,
         reload_quiesce_ms: settings.reload_quiesce_ms,
+        reload_prepare_warn_ms: settings.reload_prepare_warn_ms,
     };
     let mut control = Control {
         reloader,

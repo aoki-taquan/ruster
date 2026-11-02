@@ -60,7 +60,7 @@
 use std::fmt;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 
 use ruster_config::ValidatedConfigV1;
 use ruster_control::{
@@ -77,10 +77,16 @@ use crate::config_cmd::{self, LoadError, SweepSlow};
 use super::output::SpawnError;
 use super::privileges::DropFailure;
 use super::startup::token;
-use super::workers::{lockstep_wait, spawn, Worker};
+#[cfg(test)]
+use super::workers::lockstep_wait;
+use super::workers::{spawn, Worker};
 
 /// Longest wait for backend quiescence before a pending reload fails.
 pub const RELOAD_QUIESCE_MS: u64 = 200;
+
+/// A preparation running this long gets one warning line (the worker
+/// cannot be interrupted, and later SIGHUPs wait for it).
+pub const RELOAD_PREPARE_WARN_MS: u64 = 10_000;
 
 /// Where a reload reads the next document.
 pub trait ConfigSource {
@@ -107,6 +113,9 @@ pub struct ReloadCounters {
     pub applied: u64,
     pub refused: u64,
     pub failed: u64,
+    /// How long the reload in preparation has run, as of the last loop
+    /// iteration (0 when none is preparing): a gauge.
+    pub preparing_ms: u64,
 }
 
 impl ObservableFields for ReloadCounters {
@@ -116,6 +125,11 @@ impl ObservableFields for ReloadCounters {
         visitor.field(SECTION, "applied", FieldValue::Count(self.applied));
         visitor.field(SECTION, "refused", FieldValue::Count(self.refused));
         visitor.field(SECTION, "failed", FieldValue::Count(self.failed));
+        visitor.field(
+            SECTION,
+            "preparing_ms",
+            FieldValue::Count(self.preparing_ms),
+        );
     }
 }
 
@@ -364,8 +378,10 @@ pub struct ReloadWorker {
     requests: SyncSender<Request>,
     replies: Receiver<Prepared>,
     /// A reply taken early by a lockstep request (tests).
+    #[cfg(test)]
     early: Option<Prepared>,
     worker: Option<Worker>,
+    #[cfg(test)]
     lockstep: bool,
 }
 
@@ -402,8 +418,10 @@ impl ReloadWorker {
         Ok(Self {
             requests,
             replies,
+            #[cfg(test)]
             early: None,
             worker: Some(worker),
+            #[cfg(test)]
             lockstep: false,
         })
     }
@@ -416,10 +434,19 @@ impl ReloadWorker {
         self
     }
 
+    /// `Full` is unreachable: a `Prepare` is sent only while no reload is
+    /// in flight, so the queue holds at most the previous `Applied` and
+    /// this `Prepare` (capacity 2); only `Disconnected` (a dead worker)
+    /// fails here.
     fn request(&mut self) -> Result<(), WorkerGone> {
-        self.requests
-            .try_send(Request::Prepare)
-            .map_err(|_| WorkerGone)?;
+        self.requests.try_send(Request::Prepare).map_err(|error| {
+            debug_assert!(
+                matches!(error, TrySendError::Disconnected(_)),
+                "the reload request queue is never full"
+            );
+            WorkerGone
+        })?;
+        #[cfg(test)]
         if self.lockstep {
             self.early = lockstep_wait(&self.replies);
         }
@@ -427,11 +454,13 @@ impl ReloadWorker {
     }
 
     fn applied(&mut self) {
-        // A gone worker fails the next request instead.
+        // A gone worker fails the next request instead. Never full: the
+        // worker took the `Prepare` of this reload before answering it.
         let _ = self.requests.try_send(Request::Applied);
     }
 
     fn poll(&mut self) -> Result<Option<Prepared>, WorkerGone> {
+        #[cfg(test)]
         if let Some(reply) = self.early.take() {
             return Ok(Some(reply));
         }
@@ -453,8 +482,12 @@ impl ReloadWorker {
 /// Where one reload is on the router thread.
 enum Phase {
     Idle,
-    /// Requested from the worker; RX goes on meanwhile.
-    Preparing,
+    /// Requested from the worker at `since`; RX goes on meanwhile.
+    /// `warned` once the slow-preparation warning was given.
+    Preparing {
+        since: MonotonicMillis,
+        warned: bool,
+    },
     /// Passed the dry run; waits for quiescence since `since`.
     Pending {
         ready: Box<Ready>,
@@ -526,9 +559,13 @@ impl Reloader {
         }
     }
 
-    /// Hands a reload request to the worker (never blocks). `Some` if it
-    /// ended at once (the worker is gone).
-    pub fn request(&mut self, generation: NonZeroU64) -> Option<ReloadOutcome> {
+    /// Hands a reload request to the worker at `now` (never blocks).
+    /// `Some` if it ended at once (the worker is gone).
+    pub fn request(
+        &mut self,
+        generation: NonZeroU64,
+        now: MonotonicMillis,
+    ) -> Option<ReloadOutcome> {
         self.counters.requested = self.counters.requested.saturating_add(1);
         let sent = self
             .worker
@@ -536,7 +573,10 @@ impl Reloader {
             .map_or(Err(WorkerGone), ReloadWorker::request);
         match sent {
             Ok(()) => {
-                self.phase = Phase::Preparing;
+                self.phase = Phase::Preparing {
+                    since: now,
+                    warned: false,
+                };
                 None
             }
             Err(WorkerGone) => {
@@ -554,7 +594,7 @@ impl Reloader {
         active: &mut ActivePublication<'_, I>,
         now: MonotonicMillis,
     ) -> Option<ReloadOutcome> {
-        if !matches!(self.phase, Phase::Preparing) {
+        if !matches!(self.phase, Phase::Preparing { .. }) {
             return None;
         }
         let generation = active.generation();
@@ -567,10 +607,12 @@ impl Reloader {
             Ok(Some(reply)) => reply,
             Err(WorkerGone) => {
                 self.phase = Phase::Idle;
+                self.counters.preparing_ms = 0;
                 return Some(self.failed("prepare", "WORKER_STOPPED".to_owned(), generation));
             }
         };
         self.phase = Phase::Idle;
+        self.counters.preparing_ms = 0;
         match reply {
             Prepared::Failed(detail) => Some(self.failed_with(detail, generation)),
             Prepared::Refused(reasons) => {
@@ -657,10 +699,27 @@ impl Reloader {
     pub fn abandon(&mut self, code: &'static str, generation: NonZeroU64) -> Option<ReloadOutcome> {
         let stage = match std::mem::replace(&mut self.phase, Phase::Idle) {
             Phase::Idle => return None,
-            Phase::Preparing => "prepare",
+            Phase::Preparing { .. } => "prepare",
             Phase::Pending { .. } => "quiesce",
         };
+        self.counters.preparing_ms = 0;
         Some(self.failed(stage, code.to_owned(), generation))
+    }
+
+    /// Updates `reload.preparing_ms` at `now` (no allocation, no I/O) and
+    /// returns the whole seconds the preparation has run, once, when it
+    /// first reaches `warn_ms` ([`RELOAD_PREPARE_WARN_MS`]).
+    pub fn observe_preparation(&mut self, now: MonotonicMillis, warn_ms: u64) -> Option<u64> {
+        let Phase::Preparing { since, warned } = &mut self.phase else {
+            return None;
+        };
+        let running = now.0.saturating_sub(since.0);
+        self.counters.preparing_ms = running;
+        if *warned || running < warn_ms {
+            return None;
+        }
+        *warned = true;
+        Some(running / 1_000)
     }
 
     /// Ends the worker (see [`ReloadWorker::stop`]).
