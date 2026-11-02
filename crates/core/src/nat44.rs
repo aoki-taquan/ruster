@@ -6636,9 +6636,10 @@ impl Nat44TcpPolicy {
     /// mappings, their refreshes, and new sessions on them are unaffected.
     /// A TCP mapping counts as live for this limit only until its
     /// host-driven expiry: segments the host sends on its own
-    /// outbound-initiated or established sessions refresh it, remote
-    /// activity alone does not, so a remote cannot keep a host at its
-    /// limit. When the address holds `limit` mappings and one is past its
+    /// outbound-initiated or established sessions refresh it, except
+    /// segments that leave the session closing (a RST, or an ACK from
+    /// TIME-WAIT); remote activity, and the host stack's answers to it,
+    /// do not, so a remote cannot keep a host at its limit. When the address holds `limit` mappings and one is past its
     /// host-driven expiry, the new mapping takes over that mapping's slot
     /// (ending any sessions only remotes still kept alive; the public port
     /// comes from the normal selection). The default `0` is no limit (RFC 6888 asks only that a
@@ -6915,7 +6916,8 @@ pub struct Nat44TcpMappingSlot {
     link: TcpMappingLink,
     /// Host-driven expiry (N3): like `expires_ms`, but advanced only by
     /// segments the inside host sends on its own outbound-initiated
-    /// sessions or on established sessions, so inbound-only activity (a
+    /// sessions or on established sessions that do not leave the session
+    /// closing, so inbound-only activity (a
     /// remote that keeps sending SYNs to the public port) cannot keep the
     /// mapping counting against the host's mapping quota. Never later than
     /// `expires_ms`; it orders the host's quota lists.
@@ -9401,13 +9403,19 @@ impl<'a> Nat44TcpRuntime<'a> {
         }
         // Host-driven expiry (N3): the same rule, applied only to segments
         // the inside host sends on its own outbound-initiated sessions or
-        // on established ones. A value above `transitory` can only come
-        // from an established refresh (time is monotonic), so it plays the
-        // role of the established list. It is capped by `expires_ms`, so
-        // it never outlives the mapping, and every change sets it to `now`
-        // plus one of the two TTLs, keeping the host lists in order.
-        let host_driven =
-            direction == Nat44TcpDirection::Outbound && (!session.external_inbound || established);
+        // on established ones, and never to one that leaves the session in
+        // the closing phase: a RST, or anything on a FIN-closed connection
+        // (an ACK from TIME-WAIT), is what a host's stack sends in answer
+        // to whatever a remote sends on the old 4-tuple, so it must not
+        // keep the mapping counting (review M1). A value above `transitory`
+        // can only come from an established refresh (time is monotonic),
+        // so it plays the role of the established list. It is capped by
+        // `expires_ms`, so it never outlives the mapping, and every change
+        // sets it to `now` plus one of the two TTLs, keeping the host lists
+        // in order.
+        let host_driven = direction == Nat44TcpDirection::Outbound
+            && session.phase() != Nat44TcpSessionPhase::Closing
+            && (!session.external_inbound || established);
         if host_driven {
             if established {
                 mapping.host_expires_ms = established_expiry;

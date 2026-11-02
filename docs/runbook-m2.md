@@ -1441,8 +1441,12 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
   unaffected. For TCP, "live" here means kept alive by the host itself:
   only segments the host sends on connections it opened, or on
   established connections, refresh a mapping for the quota (with the same
-  phase TTLs as the mapping), so a remote that keeps sending SYNs to the
-  host's public ports cannot keep the host at its limit. It recovers by
+  phase TTLs as the mapping), and never a segment that leaves the
+  connection closing (any RST, or an ACK from TIME-WAIT, which the host's
+  stack sends in answer to whatever a remote sends on an old 4-tuple). So
+  neither a remote that keeps sending SYNs to the host's public ports nor
+  the remote of a closed connection that keeps poking it can keep the host
+  at its limit. It recovers by
   itself: once one of its mappings has expired (UDP idle TTL; TCP the
   phase TTL of the host's last segment, 4 minutes for a closed or
   half-open connection), the next new mapping takes over that mapping's
@@ -1480,12 +1484,12 @@ SYNs nobody completes, such as a scan or a spoofed SYN flood.
     inside routes tight (the connected LAN prefix rather than a broad
     route). A LAN host spoofing a chosen victim's address can also use up
     that victim's quota and lock it out, which is the same residual.
-  - A returning TCP endpoint whose own mapping was taken over (retired)
-    while the host is at its limit can reuse only an outright expired
-    mapping of the host; while the host's only reclaimable mapping is
-    still kept live by a remote, that endpoint is refused (a mapping is
-    never retired while live). Other source ports of the host are not
-    affected.
+  - Narrow TCP residual: a returning endpoint whose own mapping was
+    already taken over (retired) is refused while the host is at its
+    limit and every one of its mappings past the host-driven expiry is
+    still kept live by a remote's inbound segments (a mapping is never
+    retired while live). Retired slots are the first reused, so the window
+    is short, and other source ports of the host are not affected.
   - No ICMP is sent for a refusal, and there is no per-host usage report
     (NAT44-096).
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)

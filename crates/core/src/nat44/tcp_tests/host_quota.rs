@@ -385,6 +385,163 @@ fn a_retired_endpoint_at_the_limit_never_retires_a_live_mapping() {
     });
 }
 
+/// Review N3 sec M1 re-check: the remote of one of the victim's own
+/// outbound connections keeps sending on the original 4-tuple every 200 s
+/// for 2400 s, and the victim's stack answers. The answer leaves the
+/// session in the closing phase (a RST, or an ACK from TIME-WAIT), so it
+/// is not host-driven: the mapping stays live, but the victim's new
+/// connection is accepted at a limit of 1. Five variants: (inbound, the
+/// victim's answer) after a closed established connection (ACK, RST), on a
+/// half-open connection (SYN-ACK, RST), after a closed connection (SYN on
+/// the same tuple, RST), in TIME-WAIT (ACK, ACK), and after the victim
+/// reset the connection (ACK, RST).
+/// Setup segments (`true` for outbound) after the victim's SYN, the
+/// remote's repeated segment, and the victim stack's answer.
+type Variant<'a> = (&'a [(bool, u8)], u8, u8);
+
+#[test]
+fn a_remote_answered_on_the_old_tuple_cannot_pin_the_quota() {
+    const FIN: u8 = 0x01;
+    let attacker = (REMOTE1, 443);
+    let victim = (INTERNAL, 1_000);
+    // (setup segments: (outbound?, flags), repeated inbound, victim answer)
+    let variants: [Variant<'_>; 5] = [
+        (
+            &[
+                (true, SYN),
+                (false, SYN_ACK),
+                (true, ACK),
+                (false, FIN | ACK),
+                (true, FIN | ACK),
+                (false, ACK),
+            ],
+            ACK,
+            RST,
+        ),
+        (&[(true, SYN)], SYN_ACK, RST),
+        (
+            &[
+                (true, SYN),
+                (false, SYN_ACK),
+                (true, ACK),
+                (true, FIN | ACK),
+                (false, FIN | ACK),
+                (true, ACK),
+            ],
+            SYN,
+            RST,
+        ),
+        (
+            &[
+                (true, SYN),
+                (false, SYN_ACK),
+                (true, ACK),
+                (true, FIN | ACK),
+                (false, FIN | ACK),
+                (true, ACK),
+            ],
+            ACK,
+            ACK,
+        ),
+        (
+            &[(true, SYN), (false, SYN_ACK), (true, ACK), (true, RST)],
+            ACK,
+            RST,
+        ),
+    ];
+    for (index, (setup, remote_flags, answer)) in variants.into_iter().enumerate() {
+        with_config(quota_policy(1), 40_000, 40_063, |config| {
+            let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+            let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+            let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+            let first = out(&mut runtime, victim, attacker, SYN, 0).unwrap();
+            for (outbound, flags) in setup.iter().skip(1).copied() {
+                if outbound {
+                    out(&mut runtime, victim, attacker, flags, 0).unwrap();
+                } else {
+                    inbound(&mut runtime, first.public_port(), attacker, flags, 0).unwrap();
+                }
+            }
+            let mut now = 0;
+            while now < 2_400_000 {
+                now += 200_000;
+                inbound(
+                    &mut runtime,
+                    first.public_port(),
+                    attacker,
+                    remote_flags,
+                    now,
+                )
+                .unwrap_or_else(|error| panic!("variant {index}: {error:?}"));
+                out(&mut runtime, victim, attacker, answer, now)
+                    .unwrap_or_else(|error| panic!("variant {index}: {error:?}"));
+            }
+            let pinned = runtime.mappings[first.mapping_index()];
+            assert!(runtime.mapping_is_live(pinned, now), "variant {index}");
+            assert!(
+                !runtime.mapping_is_host_live(pinned, now),
+                "variant {index}"
+            );
+            let fresh = out(&mut runtime, (INTERNAL, 2_000), (REMOTE2, 80), SYN, now)
+                .unwrap_or_else(|error| panic!("variant {index}: {error:?}"));
+            assert_eq!(
+                fresh.mapping_index(),
+                first.mapping_index(),
+                "variant {index}"
+            );
+            assert_eq!(runtime.counters().host_quota_exceeded, 0, "variant {index}");
+            assert_eq!(runtime.validate_indexes(), Ok(()), "variant {index}");
+        });
+    }
+}
+
+/// Legitimate host-driven refreshes are unaffected by the closing-phase
+/// exclusion: after a half-close (the victim's single FIN keeps the
+/// connection established), the victim's ACKs of the remote's data keep
+/// the mapping counted, and so does a retransmitted SYN of a half-open
+/// connection.
+#[test]
+fn half_close_and_opening_refreshes_still_keep_the_quota() {
+    const FIN: u8 = 0x01;
+    let remote = (REMOTE1, 443);
+    with_config(quota_policy(1), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let first = out(&mut runtime, (INTERNAL, 1_000), remote, SYN, 0).unwrap();
+        inbound(&mut runtime, first.public_port(), remote, SYN_ACK, 0).unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), remote, ACK, 0).unwrap();
+        out(&mut runtime, (INTERNAL, 1_000), remote, FIN | ACK, 0).unwrap();
+        let mut now = 0;
+        while now < 2_400_000 {
+            now += 200_000;
+            inbound(&mut runtime, first.public_port(), remote, ACK, now).unwrap();
+            out(&mut runtime, (INTERNAL, 1_000), remote, ACK, now).unwrap();
+        }
+        assert!(runtime.mapping_is_host_live(runtime.mappings[first.mapping_index()], now));
+        assert_eq!(
+            out(&mut runtime, (INTERNAL, 2_000), (REMOTE2, 80), SYN, now).map(|_| ()),
+            Err(Nat44TcpPlanError::HostQuotaExceeded)
+        );
+    });
+    with_config(quota_policy(1), 40_000, 40_063, |config| {
+        let mut mappings = [Nat44TcpMappingSlot::default(); 8];
+        let mut sessions = [Nat44TcpSessionSlot::default(); 16];
+        let mut runtime = test_tcp_runtime(config, &mut mappings, &mut sessions);
+        let first = out(&mut runtime, (INTERNAL, 1_000), remote, SYN, 0).unwrap();
+        let mut now = 0;
+        while now < 1_200_000 {
+            now += 200_000;
+            out(&mut runtime, (INTERNAL, 1_000), remote, SYN, now).unwrap();
+        }
+        assert!(runtime.mapping_is_host_live(runtime.mappings[first.mapping_index()], now));
+        assert_eq!(
+            out(&mut runtime, (INTERNAL, 2_000), (REMOTE2, 80), SYN, now).map(|_| ()),
+            Err(Nat44TcpPlanError::HostQuotaExceeded)
+        );
+    });
+}
+
 /// The other side of the review fix: an inside server whose inbound
 /// connections are established and that keeps answering them keeps its
 /// mapping counting, so at the limit its new outbound mapping is refused

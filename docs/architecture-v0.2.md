@@ -1486,7 +1486,9 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
 - **TCPのhost-driven liveness（review M1、NAT44-097）**: TCP mappingの`expires_ms`はinbound
   segmentでも進むので、remoteがSYNを送り続けるとhostが全connectionを閉じてもmappingが
   liveのままでした。quotaはmappingごとの`host_expires_ms`で数えます。hostが自分の開いた
-  sessionかestablished sessionで送るsegmentだけが`expires_ms`と同じ規則で進め、毎commitで
+  sessionかestablished sessionで送るsegmentだけが`expires_ms`と同じ規則で進め（sessionを遷移後に
+  closing phaseに置くRSTやTIME-WAITのACKは、remoteが古い4-tupleへ送ったものへのstackの応答に
+  すぎないので進めない）、毎commitで
   `expires_ms`にcapします（`host_expires_ms ≤ expires_ms`）。変わるときは常に`now + TTL`なので、
   hostのTCP listはestablished TTLとtransitory TTLの2本でhost-driven expiry順です。上限では
   そのexpiryを過ぎた先頭を引き継ぎ、remoteだけが保っていたsessionはgenerationの不一致で
