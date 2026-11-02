@@ -1048,8 +1048,10 @@ the session's phase. A RST never removes a session: it is translated and
 the session moves to the closing timeout; any later non-RST segment, a SYN
 included, moves it back (RFC 7857 section 2.2). An injected RST therefore
 cannot end a session sooner than the closing timeout, and live traffic
-undoes it. Only an inside host's new SYN on a connection closed by FIN in
-both directions starts it over as a new connection. The router does not
+undoes it. Only the inside host restarts a connection closed by FIN in
+both directions as a new one: with a new SYN, or with a SYN-ACK to the
+remote's new SYN (that reconnect then gets the established timeout). The
+router does not
 track TCP sequence numbers, so it accepts any RST or FIN that matches the
 exact connection (address and port pair). A mapping, with its public port,
 lives as long as its latest session: the established timeout while it has
@@ -1067,7 +1069,7 @@ RST or a FIN, so it ends after 4 minutes idle, and can make a spoofed SYN
 look established by following it with blind ACKs, so that session holds a
 slot for 2 h 4 min. `inbound-rst = "corroborate"` (reloadable, `plan`
 shows `nat44-tcp inbound-rst ~ closing -> corroborate`) ignores inbound RSTs
-for the phase, closes on an inbound FIN that follows the inside FIN only
+for the phase, closes on an inbound FIN only
 after an outbound FIN or RST, and counts a connection as established only
 after the inside host sent an ACK without SYN. Its cost: a connection the
 inside host closes first keeps the established timeout, and an inbound

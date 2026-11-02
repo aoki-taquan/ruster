@@ -334,7 +334,7 @@ default/minimum 2時間4分。片方向のFINではここに留まる）、FIN�
 closing（`closing-idle-ttl-ms`、default 4分）。transitoryの二つは4分未満とestablished超を
 `NAT44_TCP_POLICY`で拒否します。RSTはsessionを削除せず変換してclosing TTLへ移し、続く非RST
 segment（SYNも含む）で元のphaseへ戻します（RFC 7857 §2.2）。FIN両方向で閉じたsessionへの
-insideからのinitial SYNだけが同じ5-tupleの新connectionとしてやり直します。sequence/windowは
+insideからのinitial SYNか、remoteの新しいSYNへのinsideのSYN-ACKだけが同じ5-tupleの新connectionとしてやり直します。sequence/windowは
 追跡しないため、RSTはexact 5-tupleのsessionに一致すれば受理しますが、注入されたRSTでもsessionは
 closing TTLより早くは消えません。詐称し得るinbound RST/FINとinsideのSYN-ACKだけでphaseを
 進めないopt-inの`inbound-rst = "corroborate"`もあります（default `"closing"`、reloadable、

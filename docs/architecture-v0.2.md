@@ -617,10 +617,12 @@ inbound = outside→inside、hairpinは各halfの向き）のSYN/ACK/FIN、「RS
 
 遷移はTX requestまで進んだcommitだけで行い（planはread-onlyでcopyを作るだけ）、RST segmentは
 RST bitだけを立てる（SYN/ACK/FINは記録しない）、非RST segment（SYNも含む）はRST bitだけを消し
-flagを保ってSYN/ACK/FINを足す（RFC 6146 TRANS）、FIN両方向でclosingのsessionへの**outbound**
-initial SYNだけは記録を消してから足す（同じ5-tupleの新connection、RFC 1122 §4.2.2.13。inbound
-SYNは詐称できるのでrestartしない。restartしたsessionはoutbound開始として`external_inbound`を
-外す）、の三つです。
+flagを保ってSYN/ACK/FINを足す（RFC 6146 TRANS）、FIN両方向でclosingのsessionへのinside hostの
+**outbound** initial SYNかSYN-ACKだけは記録を消してから足す（同じ5-tupleの新connection、RFC 1122
+§4.2.2.13）、の三つです。initial SYNはinsideの再接続でoutbound開始（`external_inbound`を外す）、
+SYN-ACKはinsideがremoteの新しいSYNを受理したremote開始（remoteのSYNも記録し、hairpin以外は
+`external_inbound`）です。inbound SYNだけは詐称できるのでrestartしません。旧connectionは既に
+closeしているので、insideのSYN-ACKでやり直しても詐称者は何も得ません（review L-new-2）。
 
 establishedの判定はRFC 5382 §5の文言どおり「両endpointがACK flag付きpacketを送った」（SYNは
 どちらか一方向でよい）で、RFC 7857 Figure 1の「Server SYN」より弱い定義です。両方向のSYNを
@@ -651,9 +653,11 @@ closing TTLへの移行だけで、sessionをclosing TTLより早く消すこと
 **Inbound corroboration（`inbound-rst`）.** owner policy（security関連はconfigurable）により
 `[nat44.tcp] inbound-rst`で選びます。default `closing`は上のRFC 7857 §2.2の挙動です。opt-inの
 `corroborate`では、詐称し得るinbound segmentだけではphaseをclosingへもestablishedへも進めません:
-inbound RSTは変換・forwardしますがphaseを変えません（outbound RSTはclosingへ）。outbound FINの
-後に来たinbound FINは「未確認」として記録し、outbound FINかRSTが続くまでclosingにしません
-（remoteが先にcloseした場合はinsideのFINがそのまま確認になる）。establishedに要るoutbound ACKは
+inbound RSTは変換・forwardしますがphaseを変えません（outbound RSTはclosingへ）。inbound FINは
+どちらが先にcloseしたかによらず「未確認」として記録し、その後にoutbound FINかRSTが来るまで
+closingにしません（remoteが先にcloseした場合はinsideのFINがそのまま確認になり、後から来る
+remoteの本物のFINも同じ確認を待つ）。sequenceを見ないため、早い詐称FINの後に本物のinside
+half-closeが来る列はremote-first closeと区別できず、closingになります（残余、review L-new-1）。establishedに要るoutbound ACKは
 SYNを含まないsegmentに限ります（insideのSYN-ACKだけでは足りないので、上のblind spoofed
 handshakeはopeningのまま4分で切れる）。costは、insideが先にcloseしたconnection（FIN out、FIN in、
 ACK out）がestablished TTLで残ることと、inside hostがSYN-ACKの後に何も送らないinbound開始
