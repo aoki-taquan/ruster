@@ -1202,6 +1202,105 @@ fn nat44_mappings_per_host_maps_onto_core_and_sizes_host_storage() {
     );
 }
 
+/// N6: `peers-per-host` (UDP) and `sessions-per-host` (TCP) map onto the
+/// core policies (default `0`). A UDP peer limit needs the same per-host
+/// storage as a UDP mapping limit (each with a link word and a host
+/// counter), so with a mapping limit already set it does not change the
+/// shape; a TCP session limit adds per-session host storage (one host link,
+/// link word, host slot with three lists, and directory node per session
+/// slot, and the session directory's bucket count). `required_bytes`
+/// counts it all exactly, and only switching storage on or off changes the
+/// shape.
+#[test]
+fn nat44_peer_and_session_limits_map_onto_core_and_size_their_storage() {
+    use ruster_core::{
+        DirectoryBucket, DirectoryNode, Nat44HostCounter, Nat44HostLink, Nat44TcpPolicy,
+        Nat44TcpSessionHostSlot, Nat44UdpHostSlot, Nat44UdpPolicy, NAT44_DEFAULT_STATE_PER_HOST,
+    };
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let with = |udp: &str, tcp: &str| {
+        VALID
+            .replacen(UDP, &format!("{UDP}{udp}"), 1)
+            .replacen(TCP, &format!("{TCP}{tcp}"), 1)
+    };
+    let defaults = validated(VALID);
+    let nat = defaults.nat44().unwrap();
+    assert_eq!(NAT44_DEFAULT_STATE_PER_HOST, 0);
+    assert_eq!(nat.udp().unwrap().policy().peers_per_host(), 0);
+    assert_eq!(nat.tcp().unwrap().policy().sessions_per_host(), 0);
+    assert_eq!(Nat44UdpPolicy::default().peers_per_host(), 0);
+    assert_eq!(Nat44TcpPolicy::default().sessions_per_host(), 0);
+    let shape = defaults.storage_shape();
+    assert_eq!(shape.nat44_tcp.unwrap().session_hosts, 0);
+    assert_eq!(
+        validated(&with("peers-per-host = 0\n", "sessions-per-host = 0\n")).storage_shape(),
+        shape
+    );
+
+    let limited = validated(&with("peers-per-host = 4\n", "sessions-per-host = 5\n"));
+    let limited_nat = limited.nat44().unwrap();
+    let (udp, tcp) = (
+        limited_nat.udp().unwrap().policy(),
+        limited_nat.tcp().unwrap().policy(),
+    );
+    assert_eq!((udp.peers_per_host(), tcp.sessions_per_host()), (4, 5));
+    assert_eq!(udp.with_peers_per_host(0), nat.udp().unwrap().policy());
+    assert_eq!(tcp.with_sessions_per_host(0), nat.tcp().unwrap().policy());
+    let limited_shape = limited.storage_shape();
+    let (udp_shape, tcp_shape) = (
+        limited_shape.nat44_udp.unwrap(),
+        limited_shape.nat44_tcp.unwrap(),
+    );
+    // UDP: 3 mapping slots, a 4-bucket mapping directory; TCP: 5 session
+    // slots, an 8-bucket session directory; no TCP mapping host storage.
+    assert_eq!(
+        (udp_shape.hosts, tcp_shape.hosts, tcp_shape.session_hosts),
+        (3, 0, 5)
+    );
+    let udp_bytes = 3
+        * (size_of::<Nat44HostLink>()
+            + size_of::<Nat44UdpHostSlot>()
+            + size_of::<u32>()
+            + size_of::<Nat44HostCounter>()
+            + size_of::<DirectoryNode>())
+        + 4 * size_of::<DirectoryBucket>();
+    let tcp_bytes = 5
+        * (size_of::<Nat44HostLink>()
+            + size_of::<Nat44TcpSessionHostSlot>()
+            + size_of::<u32>()
+            + size_of::<DirectoryNode>())
+        + 8 * size_of::<DirectoryBucket>();
+    assert_eq!(
+        limited_shape.required_bytes,
+        shape.required_bytes + udp_bytes + tcp_bytes
+    );
+    // Other nonzero values keep the shape (reloadable).
+    assert_eq!(
+        validated(&with("peers-per-host = 65535\n", "sessions-per-host = 1\n")).storage_shape(),
+        limited_shape
+    );
+    // A UDP peer limit next to a mapping limit shares its storage.
+    let mapping_limit = validated(&with("mappings-per-host = 2\n", "")).storage_shape();
+    assert_eq!(
+        validated(&with("mappings-per-host = 2\npeers-per-host = 9\n", "")).storage_shape(),
+        mapping_limit
+    );
+    // The byte limit counts the storage (fail closed).
+    let tight = ValidationLimits {
+        max_runtime_bytes: shape.required_bytes + udp_bytes,
+        ..GENEROUS
+    };
+    assert!(validated_with(&with("peers-per-host = 4\n", ""), tight).is_ok());
+    let error = validated_with(&with("", "sessions-per-host = 5\n"), tight)
+        .err()
+        .expect("session host storage exceeds the byte limit");
+    assert_eq!(
+        error.code(),
+        ruster_config::ValidationCode::RuntimeStorageBytesExceeded
+    );
+}
+
 /// B3: the switch maps onto the core TCP policy without changing the
 /// storage shape; the hold capacity is a quote table (bounded by
 /// `max_quote_slots_per_table`) counted in `required_bytes`.

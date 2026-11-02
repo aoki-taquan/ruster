@@ -449,6 +449,47 @@ fn capacity_pool_and_host_quota_fail_closed_without_eviction() {
     });
 }
 
+/// The per-host peer limit (N6) applied to queries: a host that already
+/// queries `limit` remote addresses on live mappings is refused a new
+/// remote (on its mapping or a new one) without state change, maps the
+/// refusal to its own disposition and counter, keeps its existing peers
+/// working, and recovers when a mapping expires.
+#[test]
+fn per_host_peer_limit_refuses_new_remotes_and_recovers_by_expiry() {
+    let policy = Nat44IcmpPolicy::default().with_peers_per_host(2);
+    assert_eq!(policy.peers_per_host(), 2);
+    assert_eq!(Nat44IcmpPolicy::default().peers_per_host(), 0);
+    with_config(policy, 1, 65_535, |config| {
+        assert_eq!(config.policy().peers_per_host(), 2);
+        let mut tables = Tables::new(config, 4, 8);
+        let mut runtime = tables.runtime(config);
+        query(&mut runtime, HOST_A, 1, REMOTE1, 0).unwrap();
+        query(&mut runtime, HOST_A, 1, REMOTE2, 0).unwrap();
+        let mappings = runtime.mappings().to_vec();
+        let peers = runtime.peers().to_vec();
+        let third = Ipv4Address::from_octets([198, 51, 100, 99]);
+        for identifier in [1, 2] {
+            let error = runtime.plan_outbound(HOST_A, identifier, third, 1).err();
+            assert_eq!(error, Some(Nat44UdpPlanError::HostPeerQuotaExceeded));
+            runtime.record_plan_error(Nat44UdpPlanError::HostPeerQuotaExceeded);
+        }
+        assert_eq!(
+            Nat44IcmpDisposition::from_engine(Nat44UdpDisposition::HostPeerQuotaExceeded),
+            Nat44IcmpDisposition::HostPeerQuotaExceeded
+        );
+        assert_eq!(runtime.counters().host_peer_quota_exceeded, 2);
+        assert_eq!(runtime.mappings(), &mappings[..]);
+        assert_eq!(runtime.peers(), &peers[..]);
+        // Existing peers keep working; another host has its own budget.
+        query(&mut runtime, HOST_A, 1, REMOTE1, 1).unwrap();
+        assert_eq!(reply(&mut runtime, 1, REMOTE2, 1), Ok((HOST_A, 1)));
+        query(&mut runtime, HOST_B, 7, third, 1).unwrap();
+        let ttl = NAT44_ICMP_DEFAULT_IDLE_TTL_MS;
+        query(&mut runtime, HOST_A, 2, third, 1 + ttl).unwrap();
+        assert_eq!(runtime.engine().validate_indexes(), Ok(()));
+    });
+}
+
 /// Reconcile flushes every mapping and peer and requires a rotated key;
 /// the binding check sees config and key.
 #[test]
