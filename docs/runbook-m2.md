@@ -469,8 +469,12 @@ What it proves, on the runner's kernel only:
 
 Both smokes run with `RUSTER_REQUIRE_PRIV=1`: the privileged tests then
 fail (`PRIV_REQUIRED: ...`) rather than skip when `RUSTER_PRIV_XDP` is
-missing or their phase is not selected, and the scripts refuse any other
-value. Without the variable a plain `cargo test` keeps skipping them.
+missing or their phase is not selected, and the scripts refuse any value
+but `1`; an empty value counts as unset (the scripts do not pass it on).
+Without the variable a plain `cargo test` keeps skipping them.
+`priv-xdp-smoke.sh` also fails when the test binary's `priv_xdp_*` tests
+differ from the phases it runs, so a new privileged test cannot be left
+out silently.
 
 Not covered: zero-copy NICs, kernels other than the runner's (5.9-6.x,
 XDP-062), multi-queue, and performance (X05).

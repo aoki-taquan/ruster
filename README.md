@@ -788,7 +788,9 @@ compilerなしで生成）、holder（attachした別processをSIGKILLしlinkが
    （`priv_gate_fails_instead_of_skipping_when_required`）を非特権で実行。
 3. `RUSTER_REQUIRE_PRIV=1`で`scripts/priv-xdp-smoke.sh`（`priv_xdp_session`の各phase）と
    `scripts/priv-run-smoke.sh`。この変数の下ではtestは`RUSTER_PRIV_XDP`が無い・phaseが選ばれて
-   いない場合もskipせずfailします。
+   いない場合もskipせずfailします。scriptは`1`か未設定だけを受け、空文字は未設定として扱います
+   （testへ渡さない）。`priv-xdp-smoke.sh`はtest binaryの`priv_xdp_*` testの集合が配線済みphaseと
+   一致しなければfailします。
 4. `ruster-*` netnsが残っていないことを確認し、失敗時はsmoke log（value-free、throwaway netns内）
    をartifactとして保存します。
 

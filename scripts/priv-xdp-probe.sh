@@ -67,21 +67,25 @@ sys.exit(0 if ok else 1)
 
 ip -V | grep -q libbpf || fail PROBE_IPROUTE_LIBBPF "$(ip -V)"
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-probe.XXXXXX")
 suffix=$(od -An -N4 -tx4 /dev/urandom | tr -d ' \n')
 netns="ruster-probe-$$-$suffix"
 created=
+work=
 
 cleanup() {
     if [ -n "$created" ]; then
         sudo -n ip netns del "$netns" 2>/dev/null || true
         created=
     fi
-    rm -rf "$work"
+    if [ -n "$work" ]; then
+        rm -rf "$work"
+    fi
 }
+# The trap is in place before anything is created.
 trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
+work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-probe.XXXXXX")
 
 # A pre-existing namespace of this name is never adopted or deleted.
 sudo -n ip netns add "$netns" 2>"$work/err" ||
@@ -91,8 +95,18 @@ in_netns() {
     sudo -n ip netns exec "$netns" "$@"
 }
 in_netns true 2>"$work/err" || fail PROBE_NETNS "ip netns exec: $(cat "$work/err")"
-[ "$(sudo -n readlink "/proc/1/ns/net")" != "$(in_netns readlink /proc/self/ns/net)" ] ||
-    fail PROBE_NETNS "ip netns exec stayed in the initial namespace"
+# Both links must be real namespace ids (`net:[<inode>]`) before they are
+# compared, so a failed readlink cannot pass as "different".
+initial_ns=$(sudo -n readlink /proc/1/ns/net) || initial_ns=
+probe_ns=$(in_netns readlink /proc/self/ns/net) || probe_ns=
+for id in "$initial_ns" "$probe_ns"; do
+    case $id in
+    net:\[[0-9]*\]) ;;
+    *) fail PROBE_NETNS "unexpected namespace id '$id'" ;;
+    esac
+done
+[ "$initial_ns" != "$probe_ns" ] ||
+    fail PROBE_NETNS "ip netns exec stayed in the initial namespace ($probe_ns)"
 
 sudo -n ip -n "$netns" link add rprobe0 numtxqueues 1 numrxqueues 1 type veth \
     peer name rprobe1 numtxqueues 1 numrxqueues 1 2>"$work/err" ||
@@ -113,8 +127,9 @@ for key in net.ipv4.ip_forward net.ipv4.conf.rprobe0.forwarding; do
         fail PROBE_SYSCTL "write $key: $(cat "$work/err")"
 done
 
-# AF_XDP is address family 44 (Linux UAPI); creation alone proves
-# CONFIG_XDP_SOCKETS and the capability. The smokes then bind for real.
+# AF_XDP is address family 44 (Linux UAPI). Creating the socket proves the
+# kernel has AF_XDP (CONFIG_XDP_SOCKETS) and that root inside the netns may
+# open one; binding it to a queue is left to the smokes.
 in_netns python3 -I -c '
 import socket
 socket.socket(44, socket.SOCK_RAW, 0).close()
@@ -142,4 +157,5 @@ trap - EXIT
 if sudo -n ip netns list | grep -qx "$netns\( .*\)\{0,1\}"; then
     fail PROBE_CLEANUP "namespace $netns survived cleanup"
 fi
-echo "priv-xdp-probe: ok kernel=$release netns veth sysctl af_xdp xdpgeneric xdpdrv (namespace $netns removed)"
+echo "priv-xdp-probe: ok kernel=$release netns veth sysctl af_xdp xdpgeneric xdpdrv" \
+    "(namespace $netns removed)"

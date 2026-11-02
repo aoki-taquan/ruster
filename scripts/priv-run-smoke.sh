@@ -52,8 +52,8 @@
 #             exits within 10 seconds with status 0 (#301 LN1)
 set -eu
 
-# RUSTER_REQUIRE_PRIV=1 (the `XDP veth` CI job) is passed to the privileged
-# tests, which then fail instead of skipping. Nothing here ever skips.
+# RUSTER_REQUIRE_PRIV must be 1 or unset (empty counts as unset), as in
+# priv-xdp-smoke.sh; this script has no skip path either way.
 case ${RUSTER_REQUIRE_PRIV-} in
 "" | 1) ;;
 *)
@@ -600,7 +600,8 @@ if grep -q "fatal:" "$work/forwarding-device-runtime.err"; then
     fail "forwarding-device-runtime: a fatal event"
 fi
 assert_detached "the run-time per-port forwarding run"
-echo "priv_run_forwarding_device: conf/ra/forwarding=1 with ip_forward=0 refused at startup (scope=device), warned on if1 only and recovered while running verified"
+echo "priv_run_forwarding_device: conf/ra/forwarding=1 with ip_forward=0 refused at startup" \
+    "(scope=device), warned on if1 only and recovered while running verified"
 
 # stuck: an undrained stdout must not keep the process alive.
 mkfifo "$work/stuck.fifo"
@@ -622,16 +623,22 @@ wait_ready stuck || fail "stuck: ruster exited during startup"
 # About one stats block (>10 KiB) per second fills the 64 KiB pipe.
 sleep 8
 # Prove the pipe is really full (the writer thread is blocked, so the
-# phase is not vacuous): queued bytes within one page of the capacity, and
-# unchanged 1.5 s later while ruster keeps producing stats.
-first=$(python3 -I -c "$PIPE_FILL" "$work/stuck.fifo") || fail "stuck: cannot read the FIFO fill"
+# phase is not vacuous). "Full" is mainly "not moving": the queued byte
+# count is unchanged 1.5 s later although ruster emits a stats block every
+# second. The byte count itself is only checked against a loose floor of
+# half the capacity, because the kernel merges small writes into a pipe
+# page only while the whole write fits, so a full pipe holds somewhat less
+# than its capacity (a few unused bytes per page).
+first=$(python3 -I -c "$PIPE_FILL" "$work/stuck.fifo") ||
+    fail "stuck: cannot read the FIFO fill"
 sleep 1.5
-second=$(python3 -I -c "$PIPE_FILL" "$work/stuck.fifo") || fail "stuck: cannot read the FIFO fill"
+second=$(python3 -I -c "$PIPE_FILL" "$work/stuck.fifo") ||
+    fail "stuck: cannot read the FIFO fill"
 queued=${first% *}
 capacity=${first#* }
-[ "$queued" -gt 0 ] && [ $((queued + 4096)) -gt "$capacity" ] ||
-    fail "stuck: stdout pipe not full ($queued of $capacity bytes queued)"
 [ "$first" = "$second" ] || fail "stuck: stdout pipe still moving ($first, then $second)"
+[ "$queued" -gt 0 ] && [ $((queued * 2)) -ge "$capacity" ] ||
+    fail "stuck: stdout pipe not full ($queued of $capacity bytes queued)"
 launcher_alive || fail "stuck: exited before SIGTERM"
 echo "priv_run_stuck: stdout pipe full ($queued of $capacity bytes) and not draining"
 signal_ruster TERM

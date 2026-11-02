@@ -38,7 +38,8 @@
 set -eu
 
 # RUSTER_REQUIRE_PRIV=1 (the `XDP veth` CI job) is passed to the privileged
-# tests, which then fail instead of skipping. Nothing here ever skips.
+# tests, which then fail instead of skipping. Empty counts as unset (it is
+# not passed on). Nothing here ever skips.
 case ${RUSTER_REQUIRE_PRIV-} in
 "" | 1) ;;
 *)
@@ -82,6 +83,23 @@ fwd_b=rx00c6
 fwd_b_peer=rx00c7
 work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-xdp.XXXXXX")
 binary_path=$(readlink -f "$binary")
+
+# Every privileged test must be wired to a phase below: a new `priv_xdp_*`
+# test that is not listed here fails the smoke instead of never running.
+wired='priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains
+priv_xdp_attach_holder_waits_for_sigkill
+priv_xdp_attach_redirects_refuses_second_and_detaches_on_netns_veth
+priv_xdp_attach_refuses_foreign_program_and_leaves_it_untouched
+priv_xdp_engine_validates_and_recycles_peer_frames
+priv_xdp_generated_arp_request_is_learned_by_the_peer_and_drained
+priv_xdp_session_opens_copy_mode_on_netns_veth
+priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth'
+listed=$("$binary" --list --format=terse | sed -n 's/^\(priv_xdp_[a-z0-9_]*\): test$/\1/p' | LC_ALL=C sort)
+[ "$listed" = "$(printf '%s\n' "$wired" | LC_ALL=C sort)" ] || {
+    echo "priv-xdp-smoke: privileged tests differ from the wired phases" >&2
+    printf 'listed:\n%s\nwired:\n%s\n' "$listed" "$wired" >&2
+    exit 1
+}
 holder_pid=
 launcher=
 

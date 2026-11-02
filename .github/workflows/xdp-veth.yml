@@ -44,8 +44,6 @@ jobs:
           sudo -n apt-get install -y -q --no-install-recommends ethtool iproute2 python3 procps
 
       - name: Probe AF_XDP on veth in a netns
-        env:
-          RUSTER_REQUIRE_PRIV: "1"
         run: >-
           timeout --signal=TERM --kill-after=30s 2m
           scripts/priv-xdp-probe.sh
@@ -56,12 +54,17 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
 
       - name: Build smoke binaries (unprivileged)
+        shell: bash
         run: |
+          set -euo pipefail
           cargo build --locked -p ruster-cli --bin ruster
           cargo test --locked -p ruster-io-xdp-native --test priv_xdp_session --no-run
-          # The pure gate test (skip vs fail) runs without privileges.
+          # The pure gate test (skip vs fail) runs without privileges; it
+          # must really run (an empty filter would pass with 0 tests).
           cargo test --locked -p ruster-io-xdp-native --test priv_xdp_session -- \
-            --exact priv_gate_fails_instead_of_skipping_when_required
+            --exact priv_gate_fails_instead_of_skipping_when_required > "${RUNNER_TEMP}/gate.log"
+          cat "${RUNNER_TEMP}/gate.log"
+          grep -q '^test result: ok\. 1 passed;' "${RUNNER_TEMP}/gate.log"
 
       - name: Native AF_XDP smoke (priv_xdp_session)
         shell: bash
