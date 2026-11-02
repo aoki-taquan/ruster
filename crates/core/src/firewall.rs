@@ -1042,6 +1042,20 @@ pub(crate) struct FirewallRouteMissPacket {
     pub tcp_flags: u8,
 }
 
+/// An unsolicited inbound TCP SYN that the TCP NAT refused, before
+/// translation, so its inside destination is unknown. See
+/// `FirewallRuntime::permits_unsolicited_syn`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct FirewallUnsolicitedSynPacket {
+    /// The NAT's outside interface (the SYN's ingress).
+    pub ingress: IfId,
+    /// The NAT's inside interface (the egress of every translated inbound
+    /// packet).
+    pub egress: IfId,
+    pub source: Ipv4Address,
+    pub source_port: u16,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FirewallPlan {
     index: usize,
@@ -1635,6 +1649,67 @@ impl<'state> FirewallRuntime<'state> {
                     return valid_initial.then_some(rule.id);
                 }
                 (_, FirewallAction::Deny) => return None,
+            }
+        }
+        None
+    }
+
+    /// Decides whether an unsolicited inbound TCP SYN refused by the TCP NAT
+    /// (no mapping for its public port, or a filtering refusal) may be held
+    /// for, and answered with, a delayed ICMP Port Unreachable (RFC 5382
+    /// REQ-4). REQ-4 a requires a silent drop when a response would violate
+    /// the security policy, so the error is permitted only if the firewall
+    /// would admit this SYN as a new connection to *every* inside
+    /// destination it could have been translated to. As with
+    /// [`Self::permits_route_miss`], the answer then reveals nothing that
+    /// forwarding the SYN would not, and it does not depend on whether a
+    /// mapping exists for the public port.
+    ///
+    /// The translated destination (inside address and port) is unknown, so
+    /// rules are walked in first-match order with the selectors that are
+    /// known: ingress (the outside interface), egress (the inside interface,
+    /// where every translated inbound packet goes), source address, source
+    /// port, and protocol TCP:
+    ///
+    /// - a matching `AllowStateful` rule whose destination is every address
+    ///   (`0.0.0.0/0`) and every port a translation can use (1-65535)
+    ///   permits;
+    /// - a matching `AllowStateful` rule with a narrower destination might
+    ///   not match the translated packet and is skipped;
+    /// - a matching `Deny` rule denies, whatever its destination (fail
+    ///   closed: the SYN would be denied if it were translated there);
+    /// - no deciding rule is the default deny.
+    ///
+    /// The NAT already checked that the SYN is a valid initial SYN.
+    /// Established state is never consulted, no state is created or
+    /// refreshed, the clock watermark is not touched, and only
+    /// `rule_evaluations` is counted.
+    pub(crate) fn permits_unsolicited_syn(
+        &mut self,
+        config: &FirewallConfig<'_>,
+        packet: FirewallUnsolicitedSynPacket,
+    ) -> Option<FirewallRuleId> {
+        debug_assert!(self.config_matches(config));
+        for rule in config.rules.iter().copied() {
+            self.counters.rule_evaluations = self.counters.rule_evaluations.saturating_add(1);
+            if !(rule.ingress.matches(packet.ingress)
+                && rule.egress.matches(packet.egress)
+                && rule.source.matches(packet.source)
+                && rule.protocol == FirewallProtocol::Tcp
+                && rule.source_ports.contains(packet.source_port))
+            {
+                continue;
+            }
+            match rule.action {
+                FirewallAction::Deny => return None,
+                FirewallAction::AllowStateful => {
+                    let every_destination = rule.destination.prefix_len() == 0
+                        && rule.destination_ports.first() <= 1
+                        && rule.destination_ports.last() == u16::MAX;
+                    if every_destination {
+                        return Some(rule.id);
+                    }
+                }
             }
         }
         None
@@ -3836,6 +3911,154 @@ mod tests {
             );
             (verdict, evaluations)
         })
+    }
+
+    fn syn_rule(
+        id: u32,
+        egress: FirewallInterface,
+        source: FirewallIpv4Prefix,
+        destination: FirewallIpv4Prefix,
+        destination_ports: (u16, u16),
+        action: FirewallAction,
+    ) -> FirewallRule {
+        FirewallRule::new(
+            FirewallRuleId(id),
+            FirewallInterface::Interface(WAN),
+            egress,
+            source,
+            destination,
+            FirewallProtocol::Tcp,
+            FirewallPortRange::new(0, u16::MAX).unwrap(),
+            FirewallPortRange::new(destination_ports.0, destination_ports.1).unwrap(),
+            action,
+        )
+    }
+
+    fn permits_unsolicited_syn_with(rules: &[FirewallRule]) -> (Option<FirewallRuleId>, u64) {
+        with_snapshot(|snapshot| {
+            let config =
+                FirewallConfig::new(snapshot, rules, FirewallPolicy::default(), 1, hash_key())
+                    .unwrap();
+            let mut slots = [FirewallStateSlot::default(); 2];
+            let mut runtime = FirewallRuntime::new(config, &mut slots);
+            let mut before = runtime_image(&runtime);
+            let verdict = runtime.permits_unsolicited_syn(
+                &config,
+                FirewallUnsolicitedSynPacket {
+                    ingress: WAN,
+                    egress: LAN,
+                    source: REMOTE,
+                    source_port: 443,
+                },
+            );
+            let evaluations = runtime.counters().rule_evaluations;
+            before.counters.rule_evaluations = evaluations;
+            assert_eq!(
+                runtime_image(&runtime),
+                before,
+                "only rule_evaluations moves"
+            );
+            (verdict, evaluations)
+        })
+    }
+
+    /// RFC 5382 REQ-4 a: an unsolicited SYN is answered only if the firewall
+    /// would admit it as a new flow to every inside destination.
+    #[test]
+    fn unsolicited_syn_policy_requires_admission_to_every_inside_destination() {
+        use FirewallAction::{AllowStateful, Deny};
+        use FirewallInterface::{Any, Interface};
+        let all = (1, u16::MAX);
+        let remote = FirewallIpv4Prefix::new(REMOTE, 32).unwrap();
+        let internal = FirewallIpv4Prefix::new(INTERNAL, 32).unwrap();
+        // Default deny.
+        assert_eq!(permits_unsolicited_syn_with(&[]), (None, 0));
+        // An allow to every destination decides, toward the inside egress or
+        // any egress, and from port 0 up as well.
+        for egress in [Interface(LAN), Any] {
+            assert_eq!(
+                permits_unsolicited_syn_with(&[syn_rule(
+                    5,
+                    egress,
+                    any(),
+                    any(),
+                    all,
+                    AllowStateful
+                )]),
+                (Some(FirewallRuleId(5)), 1)
+            );
+        }
+        assert_eq!(
+            permits_unsolicited_syn_with(&[syn_rule(
+                5,
+                Any,
+                any(),
+                any(),
+                (0, u16::MAX),
+                AllowStateful
+            )]),
+            (Some(FirewallRuleId(5)), 1)
+        );
+        // An allow toward another egress cannot match.
+        assert_eq!(
+            permits_unsolicited_syn_with(&[syn_rule(
+                5,
+                Interface(WAN),
+                any(),
+                any(),
+                all,
+                AllowStateful
+            )]),
+            (None, 1)
+        );
+        // A narrower destination (address or ports) is skipped: the
+        // translated packet might not match it. A later wide allow decides.
+        for narrow in [
+            syn_rule(5, Any, any(), internal, all, AllowStateful),
+            syn_rule(5, Any, any(), any(), (2, u16::MAX), AllowStateful),
+            syn_rule(5, Any, any(), any(), (1, u16::MAX - 1), AllowStateful),
+        ] {
+            assert_eq!(permits_unsolicited_syn_with(&[narrow]), (None, 1));
+            assert_eq!(
+                permits_unsolicited_syn_with(&[
+                    narrow,
+                    syn_rule(6, Any, any(), any(), all, AllowStateful)
+                ]),
+                (Some(FirewallRuleId(6)), 2)
+            );
+        }
+        // A matching deny is silent whatever its destination, and stops the
+        // walk before a later allow; a deny for another source does not match.
+        for deny in [
+            syn_rule(5, Any, remote, any(), all, Deny),
+            syn_rule(5, Interface(LAN), any(), internal, (22, 22), Deny),
+        ] {
+            assert_eq!(
+                permits_unsolicited_syn_with(&[
+                    deny,
+                    syn_rule(6, Any, any(), any(), all, AllowStateful)
+                ]),
+                (None, 1)
+            );
+        }
+        let other_source = FirewallIpv4Prefix::new(INTERNAL, 32).unwrap();
+        assert_eq!(
+            permits_unsolicited_syn_with(&[
+                syn_rule(5, Any, other_source, any(), all, Deny),
+                syn_rule(6, Any, any(), any(), all, AllowStateful)
+            ]),
+            (Some(FirewallRuleId(6)), 2)
+        );
+        // UDP rules and rules for another ingress never match.
+        let mut udp = syn_rule(5, Any, any(), any(), all, AllowStateful);
+        udp.protocol = FirewallProtocol::Udp;
+        let mut lan_ingress = syn_rule(6, Any, any(), any(), all, AllowStateful);
+        lan_ingress.ingress = Interface(LAN);
+        assert_eq!(permits_unsolicited_syn_with(&[udp, lan_ingress]), (None, 2));
+        // A rule bound to another source port does not match.
+        let mut port = syn_rule(5, Any, any(), any(), all, AllowStateful);
+        port.source_ports = FirewallPortRange::new(444, 444).unwrap();
+        assert_eq!(permits_unsolicited_syn_with(&[port]), (None, 1));
     }
 
     #[test]

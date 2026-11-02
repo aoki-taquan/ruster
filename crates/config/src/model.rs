@@ -98,6 +98,18 @@ const fn default_inbound_sessions_per_remote() -> u8 {
     ruster_core::NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE
 }
 
+/// Default `[nat44.tcp.capacity] unsolicited-syn-holds`. Each hold lasts
+/// [`ruster_core::NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`] (6 s) and the default
+/// Port Unreachable limiter sends at most one error per egress per second,
+/// so 64 slots (592 bytes each, about 37 KiB) leave ample room for
+/// retransmissions and bursts while keeping the RFC 5382 REQ-4 default on.
+/// With the switch off, 0 frees them.
+pub const DEFAULT_UNSOLICITED_SYN_HOLDS: u32 = 64;
+
+const fn default_unsolicited_syn_holds() -> u32 {
+    DEFAULT_UNSOLICITED_SYN_HOLDS
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ResolutionPolicyV1 {
@@ -128,6 +140,17 @@ pub struct ResolutionV1 {
 pub struct Icmpv4ErrorPolicyV1 {
     pub interval_ms: u64,
     pub state_ttl_ms: u64,
+    /// Minimum interval between two ICMP Port Unreachable errors (the TCP
+    /// NAT's RFC 5382 REQ-4 answer to unsolicited inbound SYNs) on one
+    /// egress. Port Unreachable has its own limiter, so it never uses up
+    /// `interval-ms` of the other kinds. Default
+    /// [`ruster_core::ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS`] (1 s).
+    #[serde(default = "default_port_unreachable_interval_ms")]
+    pub port_unreachable_interval_ms: u64,
+}
+
+const fn default_port_unreachable_interval_ms() -> u64 {
+    ruster_core::ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -292,6 +315,11 @@ pub struct Nat44TcpV1 {
     /// bounded inbound chain walk).
     #[serde(default = "default_inbound_sessions_per_remote")]
     pub inbound_sessions_per_remote: u8,
+    /// Delayed ICMP Port Unreachable for unsolicited inbound SYNs (RFC 5382
+    /// REQ-4); absent means `true` (the RFC SHOULD). `false` keeps the
+    /// REQ-4 a silent drop as the only policy.
+    #[serde(default = "enabled")]
+    pub unsolicited_syn_icmp: bool,
     pub capacity: Nat44TcpCapacityV1,
 }
 
@@ -300,6 +328,11 @@ pub struct Nat44TcpV1 {
 pub struct Nat44TcpCapacityV1 {
     pub mappings: u32,
     pub sessions: u32,
+    /// Slots of the unsolicited-SYN hold table (each holds a quoted
+    /// datagram); absent means [`DEFAULT_UNSOLICITED_SYN_HOLDS`]. `0`
+    /// disables the delayed ICMP like `unsolicited-syn-icmp = false`.
+    #[serde(default = "default_unsolicited_syn_holds")]
+    pub unsolicited_syn_holds: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

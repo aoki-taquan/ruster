@@ -17,20 +17,43 @@ pub enum Icmpv4ErrorKind {
     TimeExceededTtl,
     DestinationUnreachableNetwork,
     DestinationUnreachableHost,
+    /// Destination Unreachable, Port Unreachable (Type 3, Code 3): the
+    /// delayed answer of the TCP NAT to an unsolicited inbound SYN
+    /// (RFC 5382 REQ-4). Its on/off switch is the NAT's
+    /// [`crate::Nat44TcpPolicy::with_unsolicited_syn_icmp`]. It shares the
+    /// action queue with every other kind but has its own per-egress
+    /// limiter class and interval
+    /// ([`Icmpv4ErrorPolicy::with_port_unreachable_interval_ms`]), so a SYN
+    /// flood cannot use up the limiter of the other kinds.
+    DestinationUnreachablePort,
 }
 
 impl Icmpv4ErrorKind {
     const fn icmp_type(self) -> u8 {
         match self {
             Self::TimeExceededTtl => 11,
-            Self::DestinationUnreachableNetwork | Self::DestinationUnreachableHost => 3,
+            Self::DestinationUnreachableNetwork
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachablePort => 3,
         }
     }
 
     const fn icmp_code(self) -> u8 {
         match self {
             Self::DestinationUnreachableHost => 1,
+            Self::DestinationUnreachablePort => 3,
             Self::TimeExceededTtl | Self::DestinationUnreachableNetwork => 0,
+        }
+    }
+
+    /// The limiter class: a limiter state is keyed by egress and class.
+    /// Port Unreachable has its own class; every other kind shares class 0.
+    const fn limiter_class(self) -> u8 {
+        match self {
+            Self::DestinationUnreachablePort => 1,
+            Self::TimeExceededTtl
+            | Self::DestinationUnreachableNetwork
+            | Self::DestinationUnreachableHost => 0,
         }
     }
 
@@ -39,6 +62,7 @@ impl Icmpv4ErrorKind {
             Self::TimeExceededTtl => 1,
             Self::DestinationUnreachableNetwork => 1 << 1,
             Self::DestinationUnreachableHost => 1 << 2,
+            Self::DestinationUnreachablePort => 1 << 3,
         }
     }
 }
@@ -61,9 +85,14 @@ pub enum Icmpv4ErrorPolicyError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Icmpv4ErrorPolicy {
     interval_ms: u64,
+    port_unreachable_interval_ms: u64,
     state_ttl_ms: u64,
     disabled: u8,
 }
+
+/// Default minimum interval between two ICMP Port Unreachable errors on one
+/// egress ([`Icmpv4ErrorPolicy::port_unreachable_interval_ms`]).
+pub const ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS: u64 = 1_000;
 
 impl Icmpv4ErrorPolicy {
     pub const fn new(interval_ms: u64, state_ttl_ms: u64) -> Result<Self, Icmpv4ErrorPolicyError> {
@@ -75,9 +104,59 @@ impl Icmpv4ErrorPolicy {
         }
         Ok(Self {
             interval_ms,
+            port_unreachable_interval_ms: ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
             state_ttl_ms,
             disabled: 0,
         })
+    }
+
+    /// Returns this policy with `interval_ms` as the minimum interval
+    /// between two Port Unreachable errors (RFC 5382 REQ-4, from the TCP
+    /// NAT) on one egress. Port Unreachable is limited separately from the
+    /// other kinds (its own limiter state per egress), so a flood of
+    /// unsolicited SYNs never delays a Time Exceeded or another Destination
+    /// Unreachable. The default is
+    /// [`ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS`].
+    ///
+    /// # Errors
+    ///
+    /// [`Icmpv4ErrorPolicyError::IntervalZero`] for 0.
+    pub const fn with_port_unreachable_interval_ms(
+        self,
+        interval_ms: u64,
+    ) -> Result<Self, Icmpv4ErrorPolicyError> {
+        if interval_ms == 0 {
+            return Err(Icmpv4ErrorPolicyError::IntervalZero);
+        }
+        Ok(Self {
+            port_unreachable_interval_ms: interval_ms,
+            ..self
+        })
+    }
+
+    #[must_use]
+    pub const fn port_unreachable_interval_ms(self) -> u64 {
+        self.port_unreachable_interval_ms
+    }
+
+    const fn class_interval_ms(self, class: u8) -> u64 {
+        if class == 0 {
+            self.interval_ms
+        } else {
+            self.port_unreachable_interval_ms
+        }
+    }
+
+    /// An idle limiter state is reclaimed only once both the state TTL and
+    /// its class interval have passed, so reclaiming never shortens the
+    /// interval.
+    const fn class_reclaim_ms(self, class: u8) -> u64 {
+        let interval = self.class_interval_ms(class);
+        if interval > self.state_ttl_ms {
+            interval
+        } else {
+            self.state_ttl_ms
+        }
     }
 
     /// Returns this policy with generation of `kind` enabled or disabled.
@@ -115,6 +194,7 @@ impl Default for Icmpv4ErrorPolicy {
     fn default() -> Self {
         Self {
             interval_ms: 100,
+            port_unreachable_interval_ms: ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
             state_ttl_ms: 60_000,
             disabled: 0,
         }
@@ -222,6 +302,9 @@ impl Icmpv4ErrorActionSlot {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Icmpv4ErrorStateSlot {
     egress: IfId,
+    /// Limiter class (`Icmpv4ErrorKind::limiter_class`): a state is keyed by
+    /// egress and class.
+    class: u8,
     generation: u64,
     requested_at: MonotonicMillis,
     occupied: bool,
@@ -232,6 +315,7 @@ pub struct Icmpv4ErrorStateSlot {
 impl Icmpv4ErrorStateSlot {
     pub const EMPTY: Self = Self {
         egress: IfId(0),
+        class: 0,
         generation: 0,
         requested_at: MonotonicMillis(0),
         occupied: false,
@@ -258,6 +342,10 @@ pub enum Icmpv4ErrorDisposition {
         quote_len: usize,
     },
     HostUnreachableQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
+    PortUnreachableQueued {
         egress: IfId,
         quote_len: usize,
     },
@@ -310,11 +398,13 @@ pub struct Icmpv4ErrorCounters {
     pub queued_time_exceeded: usize,
     pub queued_destination_unreachable: usize,
     pub queued_host_unreachable: usize,
+    pub queued_port_unreachable: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub disabled_time_exceeded: usize,
     pub disabled_destination_unreachable: usize,
     pub disabled_host_unreachable: usize,
+    pub disabled_port_unreachable: usize,
     pub state_full: usize,
     pub action_full: usize,
     pub clock_regressions: usize,
@@ -337,6 +427,7 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_time_exceeded: usize,
     pub dequeued_destination_unreachable: usize,
     pub dequeued_host_unreachable: usize,
+    pub dequeued_port_unreachable: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -398,8 +489,10 @@ pub struct Icmpv4ErrorRuntime<'a> {
     /// Occupied limiter states are exactly `states[..occupied_prefix]`: a
     /// state is only ever created in the lowest free slot and only a
     /// publication flush frees one. Every occupied state has its own egress
-    /// interface, so per-packet searches read at most one slot per egress
-    /// interface in use (H4b, PERF-001), not the whole capacity.
+    /// interface and limiter class (at most two per egress: Port
+    /// Unreachable has its own), so per-packet searches read at most two
+    /// slots per egress interface in use (H4b, PERF-001), not the whole
+    /// capacity.
     occupied_prefix: usize,
     last_now: Option<MonotonicMillis>,
     runtime_epoch: u128,
@@ -545,6 +638,8 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 let previous_index = (self.head + previous_offset) % self.actions.len();
                 self.actions[previous_index].0.is_some_and(|previous| {
                     previous.action.egress == queued.action.egress
+                        && previous.action.kind.limiter_class()
+                            == queued.action.kind.limiter_class()
                         && previous.generation == queued.generation
                 })
             }) {
@@ -554,6 +649,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 state.occupied
                     && state.action_queued
                     && state.egress == queued.action.egress
+                    && state.class == queued.action.kind.limiter_class()
                     && state.generation == queued.generation
             }) {
                 return Err(Icmpv4ErrorPublicationError::QueuedStateMismatch);
@@ -591,6 +687,10 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.queued += 1;
                 self.counters.queued_host_unreachable += 1;
             }
+            Icmpv4ErrorDisposition::PortUnreachableQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_port_unreachable += 1;
+            }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
@@ -602,6 +702,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 }
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     self.counters.disabled_host_unreachable += 1;
+                }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    self.counters.disabled_port_unreachable += 1;
                 }
             },
             Icmpv4ErrorDisposition::StateFull => self.counters.state_full += 1,
@@ -669,11 +772,11 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         if !self.observe_now(now) {
             return self.record_suppression(Icmpv4TimeExceededDisposition::ClockRegression);
         }
+        let class = action.kind.limiter_class();
         let occupied = &self.states[..self.occupied_prefix];
-        if let Some(index) = occupied
-            .iter()
-            .position(|state| state.occupied && state.egress == action.egress)
-        {
+        if let Some(index) = occupied.iter().position(|state| {
+            state.occupied && state.egress == action.egress && state.class == class
+        }) {
             let state = self.states[index];
             if state.action_queued {
                 return self.record_suppression(Icmpv4TimeExceededDisposition::Pending {
@@ -681,7 +784,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 });
             }
             if state.has_requested
-                && now.0.saturating_sub(state.requested_at.0) < self.policy.interval_ms
+                && now.0.saturating_sub(state.requested_at.0) < self.policy.class_interval_ms(class)
             {
                 return self.record_suppression(Icmpv4TimeExceededDisposition::RateLimited {
                     egress: action.egress,
@@ -697,7 +800,8 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             .position(|state| {
                 !state.action_queued
                     && state.has_requested
-                    && now.0.saturating_sub(state.requested_at.0) >= self.policy.state_ttl_ms
+                    && now.0.saturating_sub(state.requested_at.0)
+                        >= self.policy.class_reclaim_ms(state.class)
             })
             .or((self.occupied_prefix < self.states.len()).then_some(self.occupied_prefix))
         else {
@@ -713,6 +817,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         }
         self.states[index] = Icmpv4ErrorStateSlot {
             egress: action.egress,
+            class,
             generation: self.states[index].generation.wrapping_add(1),
             requested_at: MonotonicMillis(0),
             occupied: true,
@@ -746,6 +851,12 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             }
             Icmpv4ErrorKind::DestinationUnreachableHost => {
                 Icmpv4ErrorDisposition::HostUnreachableQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
+            Icmpv4ErrorKind::DestinationUnreachablePort => {
+                Icmpv4ErrorDisposition::PortUnreachableQueued {
                     egress: action.egress,
                     quote_len: action.quote_len(),
                 }
@@ -796,12 +907,16 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             Icmpv4ErrorKind::DestinationUnreachableHost => {
                 self.counters.dequeued_host_unreachable += 1;
             }
+            Icmpv4ErrorKind::DestinationUnreachablePort => {
+                self.counters.dequeued_port_unreachable += 1;
+            }
         }
         if let Some(state) = self.states[..self.occupied_prefix]
             .iter_mut()
             .find(|state| {
                 state.occupied
                     && state.egress == queued.action.egress
+                    && state.class == queued.action.kind.limiter_class()
                     && state.generation == queued.generation
             })
         {
@@ -849,9 +964,12 @@ pub enum GeneratedIcmpv4Trace {
     DestinationUnreachableBuildFailed(Icmpv4ErrorBuildError),
     HostUnreachableAllocationFailed(GeneratedAllocationError),
     HostUnreachableBuildFailed(Icmpv4ErrorBuildError),
+    PortUnreachableAllocationFailed(GeneratedAllocationError),
+    PortUnreachableBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
     DestinationUnreachableClockRegression,
     HostUnreachableClockRegression,
+    PortUnreachableClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
@@ -864,6 +982,10 @@ pub enum GeneratedIcmpv4Trace {
         egress: IfId,
         destination: Ipv4Address,
     },
+    PortUnreachableTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+    },
     BatchCompleted {
         accepted: usize,
         rejected: usize,
@@ -873,6 +995,10 @@ pub enum GeneratedIcmpv4Trace {
         rejected: usize,
     },
     HostUnreachableBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    PortUnreachableBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -932,6 +1058,9 @@ where
             Icmpv4ErrorKind::DestinationUnreachableHost => {
                 GeneratedIcmpv4Trace::HostUnreachableClockRegression
             }
+            Icmpv4ErrorKind::DestinationUnreachablePort => {
+                GeneratedIcmpv4Trace::PortUnreachableClockRegression
+            }
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -957,6 +1086,12 @@ where
                         destination: queued.action.destination_ip,
                     }
                 }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::PortUnreachableTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                    }
+                }
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -970,6 +1105,9 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     GeneratedIcmpv4Trace::HostUnreachableAllocationFailed(error)
                 }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::PortUnreachableAllocationFailed(error)
+                }
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -982,6 +1120,9 @@ where
                 }
                 Icmpv4ErrorKind::DestinationUnreachableHost => {
                     GeneratedIcmpv4Trace::HostUnreachableBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachablePort => {
+                    GeneratedIcmpv4Trace::PortUnreachableBuildFailed(error)
                 }
             };
             trace.record_generated_icmpv4(event);
@@ -1002,6 +1143,12 @@ where
         }
         Icmpv4ErrorKind::DestinationUnreachableHost => {
             GeneratedIcmpv4Trace::HostUnreachableBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::DestinationUnreachablePort => {
+            GeneratedIcmpv4Trace::PortUnreachableBatchCompleted {
                 accepted: completion.accepted,
                 rejected: completion.rejected,
             }
@@ -1451,6 +1598,110 @@ mod tests {
                 ..Icmpv4ErrorCounters::default()
             }
         );
+    }
+
+    /// Port Unreachable (RFC 5382 REQ-4) has its own limiter class per
+    /// egress with its own interval: a burst of it is neither held back by
+    /// nor holds back Time Exceeded or another Destination Unreachable on
+    /// the same egress, and it is limited to one per
+    /// `port_unreachable_interval_ms`.
+    #[test]
+    fn port_unreachable_has_its_own_limiter_class_per_egress() {
+        assert_eq!(
+            Icmpv4ErrorPolicy::default().port_unreachable_interval_ms(),
+            ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS
+        );
+        assert_eq!(
+            Icmpv4ErrorPolicy::default().with_port_unreachable_interval_ms(0),
+            Err(Icmpv4ErrorPolicyError::IntervalZero)
+        );
+        let policy = Icmpv4ErrorPolicy::new(100, 1_000)
+            .unwrap()
+            .with_port_unreachable_interval_ms(500)
+            .unwrap();
+        assert_ne!(policy, Icmpv4ErrorPolicy::new(100, 1_000).unwrap());
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 3];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 4];
+        let mut runtime = Icmpv4ErrorRuntime::new(policy, &mut states, &mut slots);
+        let port = action_kind(Icmpv4ErrorKind::DestinationUnreachablePort, 1, 40);
+        let time = action_kind(Icmpv4ErrorKind::TimeExceededTtl, 1, 20);
+        assert!(matches!(
+            runtime.schedule(port, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::PortUnreachableQueued { .. }
+        ));
+        // A queued Port Unreachable does not make other kinds pending.
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        assert_eq!(
+            runtime.schedule(port, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Pending { egress: IfId(1) }
+        );
+        assert_eq!(runtime.occupied_prefix, 2, "one state per egress and class");
+        for _ in 0..2 {
+            let queued = runtime.front().unwrap();
+            runtime.committed(queued, MonotonicMillis(0));
+        }
+        // Each class runs its own interval from its own last error.
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(100)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(100));
+        assert_eq!(
+            runtime.schedule(port, MonotonicMillis(150)),
+            Icmpv4ErrorDisposition::RateLimited { egress: IfId(1) }
+        );
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(200)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(200));
+        assert_eq!(
+            runtime.schedule(port, MonotonicMillis(499)),
+            Icmpv4ErrorDisposition::RateLimited { egress: IfId(1) }
+        );
+        assert!(matches!(
+            runtime.schedule(port, MonotonicMillis(500)),
+            Icmpv4ErrorDisposition::PortUnreachableQueued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(500));
+        assert!(runtime.preflight_publication().is_ok());
+    }
+
+    /// An idle state is reclaimed only after both its TTL and its class
+    /// interval, so a Port Unreachable interval longer than the state TTL is
+    /// never cut short by reclaiming its state.
+    #[test]
+    fn reclaiming_a_state_never_shortens_its_class_interval() {
+        let policy = Icmpv4ErrorPolicy::new(100, 1_000)
+            .unwrap()
+            .with_port_unreachable_interval_ms(5_000)
+            .unwrap();
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut runtime = Icmpv4ErrorRuntime::new(policy, &mut states, &mut slots);
+        let port = action_kind(Icmpv4ErrorKind::DestinationUnreachablePort, 1, 40);
+        let other_egress = action_kind(Icmpv4ErrorKind::TimeExceededTtl, 2, 20);
+        assert!(matches!(
+            runtime.schedule(port, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::PortUnreachableQueued { .. }
+        ));
+        let queued = runtime.front().unwrap();
+        runtime.committed(queued, MonotonicMillis(0));
+        // Past the state TTL but within the class interval: not reclaimed.
+        assert_eq!(
+            runtime.schedule(other_egress, MonotonicMillis(4_999)),
+            Icmpv4ErrorDisposition::StateFull
+        );
+        assert!(matches!(
+            runtime.schedule(other_egress, MonotonicMillis(5_000)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
     }
 
     #[test]

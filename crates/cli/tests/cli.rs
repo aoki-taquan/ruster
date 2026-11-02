@@ -94,7 +94,7 @@ fn validate_reports_summary_or_typed_diagnostics_with_exit_status() {
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=18400 backend=sim\n"
+         storage-bytes=56288 backend=sim\n"
     );
     assert!(ok.stderr.is_empty());
 
@@ -806,6 +806,42 @@ fn plan_text_renders_the_tcp_inbound_limit_as_a_reloadable_typed_delta() {
     assert!(!stderr.contains("17"), "{stderr}");
 }
 
+/// B3: the RFC 5382 REQ-4 switch is a reloadable typed delta, and the hold
+/// capacity is restart-required storage shape (value-free, like every
+/// capacity).
+#[test]
+fn plan_text_renders_the_unsolicited_syn_switch_and_hold_capacity() {
+    let on = fixtures().join("../b3/router.toml");
+    let off = fixtures().join("../b3/router-off.toml");
+    for (from, to, line) in [
+        (&on, &off, "  nat44-tcp unsolicited-syn-icmp ~ on -> off\n"),
+        (&off, &on, "  nat44-tcp unsolicited-syn-icmp ~ off -> on\n"),
+    ] {
+        let plan = ruster(&["plan".as_ref(), from.as_os_str(), to.as_os_str()]);
+        assert_eq!(status(&plan), 0);
+        let stdout = text(&plan.stdout);
+        assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+        assert!(stdout.contains(line), "{stdout}");
+        assert!(!stdout.contains("policy ~ changed"), "{stdout}");
+    }
+    let dir = scratch();
+    let more = dir.join("b3-more-holds.toml");
+    fs::write(
+        &more,
+        fs::read_to_string(&on).unwrap().replacen(
+            "unsolicited-syn-holds = 4\n",
+            "unsolicited-syn-holds = 5\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let plan = ruster(&["plan".as_ref(), on.as_os_str(), more.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    let stdout = text(&plan.stdout);
+    assert!(stdout.starts_with("plan: restart-required\n"), "{stdout}");
+    assert!(stdout.contains("STORAGE_SHAPE"), "{stdout}");
+}
+
 /// An AF_XDP `[backend]` binding both M1 interfaces (lan listed second).
 const AF_XDP_BACKEND: &str = r#"
 [backend]
@@ -849,7 +885,7 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=18400 backend=af-xdp ports=2 umem-bytes=20971520\n"
+         storage-bytes=56288 backend=af-xdp ports=2 umem-bytes=20971520\n"
     );
 
     let current = fixtures().join("router-v1.toml");
@@ -1122,7 +1158,7 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     let ok = ruster(&["validate".as_ref(), max.as_os_str()]);
     assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
     assert!(
-        text(&ok.stdout).contains(" storage-bytes=53592256 backend=af-xdp "),
+        text(&ok.stdout).contains(" storage-bytes=56017088 backend=af-xdp "),
         "{}",
         text(&ok.stdout)
     );

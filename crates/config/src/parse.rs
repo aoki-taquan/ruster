@@ -101,6 +101,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "outside",
     "peers",
     "policy",
+    "port-unreachable-interval-ms",
     "ports",
     "prefix",
     "protocol",
@@ -128,6 +129,8 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "tx",
     "udp",
     "udp-idle-ttl-ms",
+    "unsolicited-syn-holds",
+    "unsolicited-syn-icmp",
     "via",
     "xdp-attach",
 ];

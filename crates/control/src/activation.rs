@@ -173,11 +173,11 @@ use ruster_core::{
     Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport,
     Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
     Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
-    Nat44TcpSessionSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
-    PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
-    ResolutionStateSlot,
+    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime,
+    Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionPublicationError, ResolutionPublicationReport,
+    ResolutionRuntime, ResolutionStateSlot,
 };
 use ruster_core::{
     FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
@@ -222,6 +222,8 @@ pub struct FullServiceStorage {
     /// directory (address-dependent filtering).
     tcp_session_address_buckets: Box<[DirectoryBucket]>,
     tcp_session_address_nodes: Box<[DirectoryNode]>,
+    /// TCP unsolicited-SYN holds (RFC 5382 REQ-4).
+    tcp_syn_holds: Box<[Nat44TcpSynHoldSlot]>,
     firewall_states: Box<[FirewallStateSlot]>,
 }
 
@@ -314,6 +316,11 @@ impl FullServiceStorage {
             tcp_session_address_nodes: slots(
                 tcp.session_nodes(),
                 DirectoryNode::default(),
+                Nat44Tcp,
+            )?,
+            tcp_syn_holds: slots(
+                tcp.unsolicited_syn_hold_slots(),
+                Nat44TcpSynHoldSlot::EMPTY,
                 Nat44Tcp,
             )?,
             firewall_states: slots(
@@ -660,6 +667,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             tcp,
             tcp_session_address_buckets,
             tcp_session_address_nodes,
+            tcp_syn_holds,
             firewall_states,
         } = storage;
         let authority = candidate.authority();
@@ -694,6 +702,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             ),
             authority.nat44_tcp_hash_key(),
         )
+        .and_then(|runtime| runtime.with_unsolicited_syn_holds(tcp_syn_holds))
         .map_err(ActivationError::Nat44Tcp)?;
         let resolution = ResolutionRuntime::with_hash_key(
             authority.resolution_policy(),

@@ -418,6 +418,51 @@ fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag()
     assert!(both.restart_required().is_empty());
 }
 
+/// B3: the RFC 5382 REQ-4 switch is a reloadable typed TCP delta outside
+/// the opaque policy flag; the hold capacity is storage shape.
+#[test]
+fn unsolicited_syn_switch_is_reloadable_and_hold_capacity_is_storage_shape() {
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    const CAPACITY: &str = "[nat44.tcp.capacity]\nmappings = 4\n";
+    // Spelling out the defaults is no change.
+    only(
+        &plan(&[
+            (
+                TCP,
+                "allocator-seed = \"11\"\nunsolicited-syn-icmp = true\n",
+            ),
+            (
+                CAPACITY,
+                "[nat44.tcp.capacity]\nunsolicited-syn-holds = 64\nmappings = 4\n",
+            ),
+        ]),
+        &[],
+    );
+
+    let off = plan(&[(
+        TCP,
+        "allocator-seed = \"11\"\nunsolicited-syn-icmp = false\n",
+    )]);
+    only(&off, &["nat44_tcp"]);
+    assert_eq!(
+        off.nat44_tcp().unsolicited_syn_icmp,
+        Some(Delta {
+            old: true,
+            new: false
+        })
+    );
+    assert!(!off.nat44_tcp().policy_changed);
+    assert!(off.restart_required().is_empty());
+    assert_eq!(off.nat44_udp().unsolicited_syn_icmp, None);
+
+    let holds = plan(&[(
+        CAPACITY,
+        "[nat44.tcp.capacity]\nunsolicited-syn-holds = 65\nmappings = 4\n",
+    )]);
+    only(&holds, &["restart"]);
+    assert_eq!(holds.restart_required(), [RestartRequired::StorageShape]);
+}
+
 #[test]
 fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
     let interface = plan(&[INTERFACE_CHANGE]);

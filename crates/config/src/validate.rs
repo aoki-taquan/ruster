@@ -9,10 +9,10 @@ use ruster_core::{
     Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
     Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpConfigError,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
-    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
-    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -168,6 +168,16 @@ pub enum ValidationCode {
     BackendGeneratedFramesZero,
     /// `frame-count` is below `fill + tx + generated-frames`.
     BackendFrameCountTooSmall,
+    /// `icmpv4-errors.capacity.states` is below the number of interfaces
+    /// plus one while the TCP NAT can send delayed Port Unreachable errors
+    /// (`unsolicited-syn-icmp` on and `unsolicited-syn-holds` above 0).
+    /// Limiter states are keyed by egress and class, and Port Unreachable
+    /// has its own class on the outside egress, so up to interfaces + 1
+    /// states can be in use at once. With fewer, a SYN flood could keep the
+    /// Port Unreachable state alive and leave another egress `StateFull`,
+    /// which would silently suppress its Time Exceeded and Destination
+    /// Unreachable errors.
+    Icmpv4ErrorStatesTooFewForPortUnreachable,
     /// One socket's UMEM exceeds [`MAX_AF_XDP_UMEM_BYTES_PER_PORT`].
     BackendUmemTooLarge,
     /// The UMEM of all sockets exceeds [`MAX_AF_XDP_UMEM_BYTES`].
@@ -247,6 +257,9 @@ impl ValidationCode {
             Self::BackendHeadroomTooLarge => "BACKEND_HEADROOM_TOO_LARGE",
             Self::BackendGeneratedFramesZero => "BACKEND_GENERATED_FRAMES_ZERO",
             Self::BackendFrameCountTooSmall => "BACKEND_FRAME_COUNT_TOO_SMALL",
+            Self::Icmpv4ErrorStatesTooFewForPortUnreachable => {
+                "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
+            }
             Self::BackendUmemTooLarge => "BACKEND_UMEM_TOO_LARGE",
             Self::BackendTotalUmemTooLarge => "BACKEND_TOTAL_UMEM_TOO_LARGE",
             Self::BackendNativeProfile => "BACKEND_NATIVE_PROFILE",
@@ -383,6 +396,9 @@ pub struct Nat44TcpStorageShapeV1 {
     pub session_buckets: u32,
     pub session_nodes: u32,
     pub port_owners: u32,
+    /// Slots of the unsolicited-SYN hold table (RFC 5382 REQ-4), each with
+    /// a quoted datagram.
+    pub unsolicited_syn_holds: u32,
 }
 
 /// Complete caller-owned runtime storage requested by one V1 candidate.
@@ -1217,6 +1233,11 @@ fn validate_v1(
         .map(|source| {
             let generate = source.generate;
             Icmpv4ErrorPolicy::new(source.policy.interval_ms, source.policy.state_ttl_ms)
+                .and_then(|policy| {
+                    policy.with_port_unreachable_interval_ms(
+                        source.policy.port_unreachable_interval_ms,
+                    )
+                })
                 .map(|policy| {
                     policy
                         .with_generation(Icmpv4ErrorKind::TimeExceededTtl, generate.time_exceeded)
@@ -1314,6 +1335,7 @@ fn validate_v1(
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)
+                .with_unsolicited_syn_icmp(source.unsolicited_syn_icmp)
                 .with_inbound_sessions_per_remote(source.inbound_sessions_per_remote)
                 .map_err(|error| {
                     ValidationError::new(
@@ -1336,6 +1358,21 @@ fn validate_v1(
                     path(&["nat44", "realm"]),
                 )
             })?;
+            // Delayed Port Unreachable (RFC 5382 REQ-4) uses its own
+            // limiter state on the outside egress besides the one per
+            // egress of the other kinds: require room for both so a SYN
+            // flood can never make another egress StateFull.
+            if let Some(icmp) = icmp_source {
+                let sends_port_unreachable =
+                    policy.unsolicited_syn_icmp() && source.capacity.unsolicited_syn_holds > 0;
+                let needed = core_interfaces.len() as u64 + 1;
+                if sends_port_unreachable && u64::from(icmp.capacity.states) < needed {
+                    return Err(ValidationError::new(
+                        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
+                        path(&["icmpv4-errors", "capacity", "states"]),
+                    ));
+                }
+            }
             tcp_capacity = Some(source.capacity);
             validated_tcp = Some((inside, outside, public_address, nat.realm.ports, policy));
         }
@@ -2035,6 +2072,11 @@ fn build_storage_shape(
             // Session remote-address directory: same dimensions.
             add_directory_bytes(&mut bytes, shape.session_buckets, shape.session_nodes)?;
             add_port_owner_bytes(&mut bytes, shape.port_owners)?;
+            add_bytes::<Nat44TcpSynHoldSlot>(
+                &mut bytes,
+                shape.unsolicited_syn_holds,
+                path(&["nat44", "tcp", "capacity", "unsolicited-syn-holds"]),
+            )?;
             Ok(shape)
         })
         .transpose()?;
@@ -2101,6 +2143,11 @@ fn tcp_shape(
     let session_buckets = directory_buckets(capacity.sessions, limits, session_path)?;
     let port_owners = port_count(ports);
     check_slots(port_owners, limits, path(&["nat44", "realm", "ports"]))?;
+    check_quote_slots(
+        capacity.unsolicited_syn_holds,
+        limits,
+        path(&["nat44", "tcp", "capacity", "unsolicited-syn-holds"]),
+    )?;
     Ok(Nat44TcpStorageShapeV1 {
         mappings: capacity.mappings,
         sessions: capacity.sessions,
@@ -2109,6 +2156,7 @@ fn tcp_shape(
         session_buckets,
         session_nodes: capacity.sessions,
         port_owners,
+        unsolicited_syn_holds: capacity.unsolicited_syn_holds,
     })
 }
 

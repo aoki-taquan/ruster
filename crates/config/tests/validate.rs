@@ -9,7 +9,7 @@ use ruster_config::{
 use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallRuleId,
     FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot,
-    Nat44TcpSessionSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
+    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
     ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot, RouteError,
 };
 
@@ -71,7 +71,7 @@ interval-ms = 100
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 2
+states = 3
 actions = 3
 
 [nat44.realm]
@@ -100,6 +100,7 @@ icmpv4-errors = "disabled"
 [nat44.tcp.capacity]
 mappings = 3
 sessions = 5
+unsolicited-syn-holds = 7
 
 [firewall.policy]
 udp-idle-ttl-ms = 300000
@@ -243,7 +244,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 failure_holds: 5,
             }),
             icmpv4_errors: Some(ruster_config::Icmpv4ErrorStorageShapeV1 {
-                states: 2,
+                states: 3,
                 actions: 3,
             }),
             nat44_udp: Some(ruster_config::Nat44UdpStorageShapeV1 {
@@ -263,6 +264,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 session_buckets: 8,
                 session_nodes: 5,
                 port_owners: 8,
+                unsolicited_syn_holds: 7,
             }),
             firewall_states: Some(6),
             required_bytes: shape.required_bytes,
@@ -272,7 +274,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 3 * size_of::<ResolutionActionSlot>()
         + 4 * size_of::<DynamicNeighborSlot>()
         + 5 * size_of::<ResolutionFailureHoldSlot>()
-        + 2 * size_of::<Icmpv4ErrorStateSlot>()
+        + 3 * size_of::<Icmpv4ErrorStateSlot>()
         + 3 * size_of::<Icmpv4ErrorActionSlot>()
         + 3 * size_of::<Nat44UdpMappingSlot>()
         + 5 * size_of::<Nat44UdpPeerSlot>()
@@ -287,6 +289,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 8 * size_of::<PortOwnerSlot>()
         // free-port bitmaps of the UDP and TCP port-owner indexes
         + 2 * port_free_bitmap_words(8) * size_of::<u64>()
+        + 7 * size_of::<Nat44TcpSynHoldSlot>()
         + 6 * size_of::<FirewallStateSlot>();
     assert_eq!(shape.required_bytes, expected);
 
@@ -777,6 +780,56 @@ fn icmpv4_generation_switches_map_onto_core_policies() {
     );
 }
 
+/// B3: the Port Unreachable limiter interval defaults to 1 s, is a policy
+/// field (restart-required with the rest of the ICMPv4 error policy), and
+/// must not be 0.
+#[test]
+fn icmpv4_port_unreachable_interval_maps_onto_the_core_policy() {
+    use ruster_core::{
+        Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
+    };
+    let with = |value: u64| {
+        VALID.replacen(
+            "state-ttl-ms = 60000
+
+[icmpv4-errors.capacity]",
+            &format!(
+                "state-ttl-ms = 60000
+port-unreachable-interval-ms = {value}
+
+\
+                 [icmpv4-errors.capacity]"
+            ),
+            1,
+        )
+    };
+    let defaults = validated(VALID);
+    let policy = defaults.icmpv4_errors().unwrap().policy();
+    assert_eq!(
+        policy.port_unreachable_interval_ms(),
+        ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS
+    );
+    assert_eq!(
+        validated(&with(1_000)).icmpv4_errors().unwrap().policy(),
+        policy
+    );
+    let slower = validated(&with(5_000));
+    let slower = slower.icmpv4_errors().unwrap().policy();
+    assert_eq!(slower.port_unreachable_interval_ms(), 5_000);
+    assert_eq!(
+        slower,
+        Icmpv4ErrorPolicy::new(100, 60_000)
+            .unwrap()
+            .with_port_unreachable_interval_ms(5_000)
+            .unwrap()
+    );
+    assert_eq!(slower.interval_ms(), 100, "the other kinds keep theirs");
+    assert_eq!(
+        error(&with(0)).code(),
+        ValidationCode::Icmpv4ErrorPolicy(Icmpv4ErrorPolicyError::IntervalZero)
+    );
+}
+
 #[test]
 fn nat44_filtering_maps_onto_core_policies_per_protocol() {
     use ruster_core::{Nat44Filtering, Nat44TcpPolicy, Nat44UdpPolicy};
@@ -946,6 +999,101 @@ fn nat44_hairpinning_maps_onto_core_policies_per_protocol() {
     assert_eq!(udp_off.with_hairpinning(true), udp);
     assert_eq!(tcp_off.with_hairpinning(true), tcp);
     assert_eq!(off.storage_shape(), defaults.storage_shape());
+}
+
+/// B3: the switch maps onto the core TCP policy without changing the
+/// storage shape; the hold capacity is a quote table (bounded by
+/// `max_quote_slots_per_table`) counted in `required_bytes`.
+#[test]
+fn nat44_unsolicited_syn_switch_and_holds_map_onto_core_and_storage() {
+    use ruster_config::ValidationCode;
+    use ruster_core::Nat44TcpPolicy;
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+
+    let on = validated(VALID);
+    let tcp_on = on.nat44().unwrap().tcp().unwrap().policy();
+    assert!(tcp_on.unsolicited_syn_icmp());
+    assert!(Nat44TcpPolicy::default().unsolicited_syn_icmp());
+    let off = validated(&VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1));
+    let tcp_off = off.nat44().unwrap().tcp().unwrap().policy();
+    assert!(!tcp_off.unsolicited_syn_icmp());
+    assert_eq!(tcp_off.with_unsolicited_syn_icmp(true), tcp_on);
+    assert_eq!(off.storage_shape(), on.storage_shape());
+
+    let holds = |value: u32| {
+        VALID.replacen(
+            "unsolicited-syn-holds = 7\n",
+            &format!("unsolicited-syn-holds = {value}\n"),
+            1,
+        )
+    };
+    let bytes = |value: u32| validated(&holds(value)).storage_shape().required_bytes;
+    assert_eq!(bytes(8) - bytes(7), size_of::<Nat44TcpSynHoldSlot>());
+    assert_eq!(
+        validated(&holds(0))
+            .storage_shape()
+            .nat44_tcp
+            .unwrap()
+            .unsolicited_syn_holds,
+        0
+    );
+    let limits = ValidationLimits {
+        max_slots_per_table: 1 << 16,
+        max_quote_slots_per_table: 8,
+        max_runtime_bytes: 1 << 30,
+    };
+    assert!(validated_with(&holds(8), limits).is_ok());
+    let refused = validated_with(&holds(9), limits)
+        .err()
+        .expect("over the quote limit");
+    assert_eq!(refused.code(), ValidationCode::CapacityLimitExceeded);
+    assert_eq!(
+        refused.path().segments(),
+        ["nat44", "tcp", "capacity", "unsolicited-syn-holds"]
+            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
+    );
+}
+
+/// While the TCP NAT can send delayed Port Unreachable errors, the ICMPv4
+/// limiter needs one state per interface plus one for the Port Unreachable
+/// class on the outside egress; fewer is refused with a value-free code at
+/// the states path. With the switch off or no holds, any size is accepted.
+#[test]
+fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    // VALID has two interfaces.
+    let states = |source: &str, value: u32| {
+        source.replacen(
+            "[icmpv4-errors.capacity]\nstates = 3\n",
+            &format!("[icmpv4-errors.capacity]\nstates = {value}\n"),
+            1,
+        )
+    };
+    validated(&states(VALID, 3));
+    let refused = error(&states(VALID, 2));
+    assert_eq!(
+        refused.code(),
+        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
+    );
+    assert_eq!(
+        refused.code().code(),
+        "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
+    );
+    assert_eq!(
+        refused.path().segments(),
+        ["icmpv4-errors", "capacity", "states"]
+            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
+    );
+    assert_eq!((refused.limit(), refused.actual()), (None, None));
+    // No Port Unreachable can be sent: the interface count is enough.
+    let off = VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
+    validated(&states(&off, 2));
+    let no_holds = VALID.replacen(
+        "unsolicited-syn-holds = 7\n",
+        "unsolicited-syn-holds = 0\n",
+        1,
+    );
+    validated(&states(&no_holds, 2));
 }
 
 #[test]

@@ -57,6 +57,7 @@ pub(crate) enum DirectoryHashDomain {
     ResolutionDynamicNeighbor = 0x5253_4c56_444e_4248,
     ResolutionHoldForward = 0x5253_4c56_4846_5744,
     ResolutionHoldReverse = 0x5253_4c56_4852_4556,
+    TcpSynHold = 0x4e41_5434_5453_5948,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

@@ -77,6 +77,16 @@
 #             Unreachable Network (RFC 1812 5.2.7.1). Every error is checked
 #             for type/code, outer source/TTL/TOS/checksums, and a quote that
 #             is the whole original datagram with a valid header checksum
+#   unsolicited_syn  (B3, RFC 5382 REQ-4) with a firewall rule that admits
+#             new WAN -> LAN TCP flows to every destination, host B sends a
+#             TCP SYN to a public port without a mapping: nothing for 6 s,
+#             then exactly one ICMP Destination Unreachable Port Unreachable
+#             (3/3) from 203.0.113.2 quoting the SYN; after a reloadable
+#             SIGHUP to `unsolicited-syn-icmp = false`, nothing within 9 s;
+#             after one back to router-v1's default-deny firewall (switch
+#             on), nothing within 9 s either (REQ-4 a, counted as
+#             unsolicited_syn_firewall_denied). Run with --user/--group so
+#             the reloads can read the work files
 #   txfull    (gap fill) the WAN TX ring (128 entries; 256 generated frames
 #             so the ring, not the copy pool, is the bound) driven full:
 #             `ip link set rb down` in the router namespace makes every TX
@@ -337,7 +347,7 @@ write_config "$work/router-v2.toml" ra 0 router-v2
 # a cross-port forward is copied into an egress generated frame, so with
 # more of those than TX entries the 128-entry TX ring is what fills.
 write_config "$work/txfull.toml" ra 0 router-v1 256
-# H3: every runtime table at its production limit (51.11 MiB of storage),
+# H3: every runtime table at its production limit (53.42 MiB of storage),
 # without the fixture's own backend; and one more failure hold (above the
 # production 4096, within the simulator's 65536), as af-xdp and as sim.
 sed -e '/^\[backend\]$/,$d' -e 's/device = "rusternodev0"/device = "sim0"/' \
@@ -887,7 +897,7 @@ echo "priv_run_shutdown: SIGTERM exit 0, XDP detached, final counters (rx.receiv
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=53592256 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=56017088 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -911,7 +921,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 53592256 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 56017088 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
@@ -1082,6 +1092,152 @@ completed=$(stat_in "$work/icmp.final" if1.af_xdp_port.generated_completed)
     fail "icmp: if1 generated committed $committed, completed $completed"
 cat "$work/icmp.err"
 echo "priv_run_icmp: generated_icmpv4.tx_accepted=$accepted, if1 generated committed=completed=$completed, exit 0 verified"
+
+# unsolicited_syn (B3): host B's raw-socket view of the RFC 5382 REQ-4
+# delayed ICMP Port Unreachable. argv: mode (icmp|absent), public port,
+# source port, deadline seconds. Sends one SYN 203.0.113.1 -> 203.0.113.2
+# and reads every ICMPv4 message on a raw socket until the deadline. For
+# `icmp`, exactly one Type 3 Code 3 from 203.0.113.2 must quote the SYN as
+# sent (IPv4 addresses, TCP ports, sequence number), with valid checksums,
+# TTL 64 and TOS 0xc0, and arrive no earlier than 6 s after the SYN.
+UNSOLICITED_SYN='
+import os, socket, struct, sys, time
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+def check(ok, what):
+    if not ok:
+        sys.exit("unsolicited syn %s: %s" % (mode, what))
+
+mode, dport, sport, wait = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4])
+me, router = socket.inet_aton("203.0.113.1"), socket.inet_aton("203.0.113.2")
+seq = int.from_bytes(os.urandom(4), "big")
+tcp = struct.pack("!HHIIBBHHH", sport, dport, seq, 0, 5 << 4, 0x02, 8192, 0, 0)
+pseudo = me + router + struct.pack("!BBH", 0, 6, len(tcp))
+tcp = tcp[:16] + struct.pack("!H", 0xFFFF - fold(pseudo + tcp)) + tcp[18:]
+icmp_raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+icmp_raw.settimeout(0.1)
+syn = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+syn.sendto(tcp, ("203.0.113.2", 0))
+sent = time.monotonic()
+answers = []
+while time.monotonic() - sent < wait:
+    try:
+        pkt = icmp_raw.recv(4096)
+    except socket.timeout:
+        continue
+    ihl = (pkt[0] & 15) * 4
+    icmp = pkt[ihl:]
+    if len(icmp) < 36 or icmp[0] != 3:
+        continue
+    quote = icmp[8:]
+    qihl = (quote[0] & 15) * 4
+    if quote[9] != 6 or quote[12:16] != me or len(quote) < qihl + 8:
+        continue
+    if struct.unpack("!HHI", quote[qihl:qihl + 8]) != (sport, dport, seq):
+        continue
+    answers.append((time.monotonic() - sent, pkt, icmp, quote, qihl))
+if mode == "absent":
+    check(not answers, "an ICMPv4 error answered the SYN with the switch off")
+    print("no ICMPv4 error for the unsolicited SYN to 203.0.113.2:%d within %s s" % (dport, sys.argv[4]))
+    sys.exit(0)
+check(len(answers) == 1, "%d answers within %s s" % (len(answers), sys.argv[4]))
+delay, pkt, icmp, quote, qihl = answers[0]
+ihl = (pkt[0] & 15) * 4
+check(delay >= 6.0, "answered after %.3f s, before the 6 s hold" % delay)
+check((icmp[0], icmp[1]) == (3, 3), "type/code %d/%d" % (icmp[0], icmp[1]))
+check(pkt[12:16] == router and pkt[16:20] == me, "outer addresses")
+check(pkt[9] == 1 and fold(pkt[:ihl]) == 0xFFFF, "outer protocol or header checksum")
+check(pkt[8] == 64 and pkt[1] == 0xC0, "outer TTL %d TOS 0x%02x" % (pkt[8], pkt[1]))
+check(fold(icmp) == 0xFFFF and icmp[4:8] == b"\0\0\0\0", "ICMP checksum or unused field")
+check(quote[16:20] == router and fold(quote[:qihl]) == 0xFFFF, "quoted IPv4 header")
+check(quote[qihl:qihl + 20] == tcp, "quoted TCP header differs from the SYN sent")
+print("type=3 code=3 from 203.0.113.2 ttl=64 tos=0xc0 after %.2f s (>= 6 s), quoting the SYN 203.0.113.1:%d -> 203.0.113.2:%d seq=%d" % (delay, sport, dport, seq))
+'
+
+unsolicited_syn_probe() {
+    in_ns "$host_b" python3 -I -c "$UNSOLICITED_SYN" "$1" "$2" "$3" "$4" \
+        >"$work/unsolicited-syn-$1.txt" 2>&1 ||
+        fail "unsolicited_syn: $(cat "$work/unsolicited-syn-$1.txt")"
+}
+
+phase_unsolicited_syn() {
+    # router-v1 keeps the default unsolicited-syn-icmp = true (64 holds)
+    # but its firewall denies every new WAN -> LAN flow, so REQ-4 a keeps
+    # unsolicited SYNs silent there (syn-deny). syn-on adds rule 90, which
+    # admits new WAN -> LAN TCP flows to every inside destination; the off
+    # copy of it only flips the reloadable switch.
+    cp "$work/router.toml" "$work/syn-deny.toml"
+    cp "$work/router.toml" "$work/syn-on.toml"
+    cat >>"$work/syn-on.toml" <<'EOF'
+
+[[firewall.rules]]
+id = 90
+ingress = "wan"
+egress = "lan"
+source = "0.0.0.0/0"
+destination = "0.0.0.0/0"
+protocol = "tcp"
+action = "allow-stateful"
+
+[firewall.rules.source-ports]
+first = 1
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 1
+last = 65535
+EOF
+    "$binary_path" validate "$work/syn-on.toml" >"$work/validate-syn-on.txt" 2>&1 ||
+        fail "unsolicited_syn: syn-on.toml invalid: $(cat "$work/validate-syn-on.txt")"
+    awk '{print} /^\[nat44\.tcp\]$/{print "unsolicited-syn-icmp = false"}' \
+        "$work/syn-on.toml" >"$work/syn-off.toml"
+    grep -q '^unsolicited-syn-icmp = false$' "$work/syn-off.toml" ||
+        fail "unsolicited_syn: off config not written"
+    cp "$work/syn-on.toml" "$work/syn.toml"
+    expect_plan syn-on syn-off reloadable none
+    expect_plan syn-off syn-deny reloadable none
+    grep -qxF '  nat44-tcp unsolicited-syn-icmp ~ on -> off' "$work/plan-syn-on-syn-off.txt" ||
+        fail "unsolicited_syn: plan does not show the switch: $(cat "$work/plan-syn-on-syn-off.txt")"
+    start_ruster syn "$work/syn.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready syn || fail "unsolicited_syn: ruster exited during startup"
+    # Resolves host B on the router (the ICMP's reverse neighbor) and
+    # creates the only TCP-free UDP mapping; 40003 has no TCP mapping.
+    forward_once syn_resolve
+    unsolicited_syn_probe icmp 40003 33001 12
+    wait_stat_ge syn nat44_tcp.unsolicited_syn_icmp_queued 1
+    latest_block syn
+    block_has "$work/syn.block" nat44_tcp.unsolicited_syn_held=1 \
+        icmpv4_errors.dequeued_port_unreachable=1 drop.NAT44_TCP_MAPPING_MISS=1
+    echo "priv_run_unsolicited_syn: $(cat "$work/unsolicited-syn-icmp.txt") verified"
+    reload_with "$work/syn-off.toml" "$work/syn.toml"
+    wait_line syn "reload applied: generation=2 previous=1;"
+    unsolicited_syn_probe absent 40004 33002 9
+    wait_stat_ge syn drop.NAT44_TCP_MAPPING_MISS 2
+    latest_block syn
+    block_has "$work/syn.block" nat44_tcp.unsolicited_syn_held=1 \
+        icmpv4_errors.dequeued_port_unreachable=1
+    echo "priv_run_unsolicited_syn_off: after the reloadable SIGHUP to unsolicited-syn-icmp = false, $(cat "$work/unsolicited-syn-absent.txt") (REQ-4 a silent drop) verified"
+    reload_with "$work/syn-deny.toml" "$work/syn.toml"
+    wait_line syn "reload applied: generation=3 previous=2;"
+    unsolicited_syn_probe absent 40005 33003 9
+    wait_stat_ge syn nat44_tcp.unsolicited_syn_firewall_denied 1
+    latest_block syn
+    block_has "$work/syn.block" nat44_tcp.unsolicited_syn_held=1 \
+        icmpv4_errors.dequeued_port_unreachable=1
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "unsolicited_syn: exit status $status after SIGTERM"
+    assert_detached "the unsolicited_syn run"
+    echo "priv_run_unsolicited_syn_firewall: after the reloadable SIGHUP to router-v1's default-deny firewall (switch on), $(cat "$work/unsolicited-syn-absent.txt") (REQ-4 a, unsolicited_syn_firewall_denied counted), exit 0 verified"
+}
+phase_unsolicited_syn
 
 # txfull: the WAN TX ring driven full and recovered.
 start_ruster txfull "$work/txfull.toml" --tx-stall-warn-secs 1 --tx-stall-fatal-secs 2 \

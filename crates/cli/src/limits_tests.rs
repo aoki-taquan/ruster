@@ -15,8 +15,8 @@ use crate::config_cmd::{
 /// Every table at its production limit (fixture header).
 pub const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-max.toml");
 
-/// Runtime storage of [`MAXIMAL`] in bytes (51.11 MiB).
-pub const MAXIMAL_STORAGE_BYTES: u64 = 53_592_256;
+/// Runtime storage of [`MAXIMAL`] in bytes (53.42 MiB).
+pub const MAXIMAL_STORAGE_BYTES: u64 = 56_017_088;
 
 /// Which production bound a table has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -39,7 +39,7 @@ impl Bound {
 
 /// Every operator-sized runtime table: TOML section, key, schema path,
 /// and its production bound.
-pub const CAPACITY_FIELDS: [(&str, &str, &str, Bound); 11] = [
+pub const CAPACITY_FIELDS: [(&str, &str, &str, Bound); 12] = [
     (
         "resolution.capacity",
         "states",
@@ -99,6 +99,12 @@ pub const CAPACITY_FIELDS: [(&str, &str, &str, Bound); 11] = [
         "sessions",
         "nat44.tcp.capacity.sessions",
         Bound::Table,
+    ),
+    (
+        "nat44.tcp.capacity",
+        "unsolicited-syn-holds",
+        "nat44.tcp.capacity.unsolicited-syn-holds",
+        Bound::Quote,
     ),
     (
         "firewall.capacity",

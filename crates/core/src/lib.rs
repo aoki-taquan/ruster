@@ -9,6 +9,7 @@ mod generated;
 mod icmpv4_error;
 mod io;
 mod nat44;
+mod nat44_syn_hold;
 mod observability;
 mod packet;
 mod resolution;
@@ -41,6 +42,10 @@ pub use fixed_directory::{port_free_bitmap_words, DirectoryBucket, DirectoryNode
 #[doc(hidden)]
 pub use forwarding::take_full_forwarding_validation_count;
 pub use forwarding::{
+    dispatch_nat44_tcp_unsolicited_syns, Nat44TcpUnsolicitedSynDispatchError,
+    Nat44TcpUnsolicitedSynDispatchReport, Nat44TcpUnsolicitedSynDisposition,
+};
+pub use forwarding::{
     forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,
     forward_batch_with_firewall_and_icmpv4_errors_audited, forward_batch_with_firewall_audited,
     forward_batch_with_nat44_tcp, forward_batch_with_nat44_tcp_and_icmpv4_errors,
@@ -66,8 +71,9 @@ pub use icmpv4_error::{
     Icmpv4ErrorPolicyError, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationPermit,
     Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
     Icmpv4TimeExceededAction, Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition,
-    NoGeneratedIcmpv4Trace, ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN,
-    ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN, ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
+    NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
+    ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
+    ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,
@@ -89,6 +95,9 @@ pub use nat44::{
     NAT44_TCP_MAX_IDLE_TTL_MS, NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE,
     NAT44_TCP_MIN_IDLE_TTL_MS, NAT44_UDP_DEFAULT_IDLE_TTL_MS, NAT44_UDP_MAX_IDLE_TTL_MS,
     NAT44_UDP_MIN_IDLE_TTL_MS,
+};
+pub use nat44_syn_hold::{
+    Nat44TcpSynHoldSlot, NAT44_TCP_SYN_HOLD_CHAIN_LIMIT, NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
 };
 pub(crate) use observability::OccupancyCounter;
 pub use observability::{

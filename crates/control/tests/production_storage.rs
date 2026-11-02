@@ -9,8 +9,8 @@ use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministic
 use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44TcpMappingSlot, Nat44TcpSessionSlot,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionStateSlot,
+    Nat44TcpSynHoldSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot,
 };
 
 /// Net bytes the measuring thread allocated while armed.
@@ -134,10 +134,12 @@ fn worst_case_bytes() -> usize {
     let udp = slots * (size_of::<Nat44UdpMappingSlot>() + size_of::<Nat44UdpPeerSlot>())
         + 2 * slots * directory
         + port_index;
-    // Mapping, session, and session remote-address directories.
+    // Mapping, session, and session remote-address directories, and the
+    // unsolicited-SYN holds (each with a quoted datagram).
     let tcp = slots * (size_of::<Nat44TcpMappingSlot>() + size_of::<Nat44TcpSessionSlot>())
         + 3 * slots * directory
-        + port_index;
+        + port_index
+        + quote * size_of::<Nat44TcpSynHoldSlot>();
     let firewall = slots * size_of::<FirewallStateSlot>();
     resolution + icmpv4 + udp + tcp + firewall
 }
@@ -145,7 +147,7 @@ fn worst_case_bytes() -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 53_592_256;
+    const WORST_CASE: usize = 56_017_088;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 

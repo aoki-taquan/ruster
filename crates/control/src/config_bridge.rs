@@ -421,7 +421,8 @@ pub(crate) fn required_services(
             tcp_shape.session_buckets,
             tcp_shape.session_nodes,
             tcp_shape.port_owners,
-        ),
+        )
+        .with_unsolicited_syn_hold_slots(tcp_shape.unsolicited_syn_holds),
         firewall_states,
     );
     Ok(RequiredServices {

@@ -805,6 +805,93 @@ fn nat44_tcp_inbound_sessions_per_remote_defaults_and_is_exact() {
     }
 }
 
+/// B3 (RFC 5382 REQ-4): `[nat44.tcp] unsolicited-syn-icmp` defaults to
+/// `true` and `[nat44.tcp.capacity] unsolicited-syn-holds` to
+/// `DEFAULT_UNSOLICITED_SYN_HOLDS` (64); both are exact and TCP-only.
+#[test]
+fn nat44_tcp_unsolicited_syn_keys_default_on_and_are_exact() {
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    const CAPACITY: &str = "[nat44.tcp.capacity]\nmappings = 1024\nsessions = 4096\n";
+    let tcp = |source: &str| {
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        config.nat44.unwrap().tcp.unwrap()
+    };
+    let absent = tcp(VALID_V1);
+    assert!(absent.unsolicited_syn_icmp);
+    assert_eq!(absent.capacity.unsolicited_syn_holds, 64);
+    assert_eq!(ruster_config::DEFAULT_UNSOLICITED_SYN_HOLDS, 64);
+    for value in [false, true] {
+        let source = VALID_V1.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = {value}\n"), 1);
+        assert_eq!(tcp(&source).unsolicited_syn_icmp, value);
+    }
+    for value in [0_u32, 1, 4096, u32::MAX] {
+        let source = VALID_V1.replacen(
+            CAPACITY,
+            &format!("{CAPACITY}unsolicited-syn-holds = {value}\n"),
+            1,
+        );
+        assert_eq!(tcp(&source).capacity.unsolicited_syn_holds, value);
+    }
+    for (anchor, key, value, path) in [
+        (
+            TCP,
+            "unsolicited-syn-icmp",
+            "1",
+            &["nat44", "tcp", "unsolicited-syn-icmp"][..],
+        ),
+        (
+            TCP,
+            "unsolicited-syn-icmp",
+            "\"true\"",
+            &["nat44", "tcp", "unsolicited-syn-icmp"][..],
+        ),
+        (
+            CAPACITY,
+            "unsolicited-syn-holds",
+            "-1",
+            &["nat44", "tcp", "capacity", "unsolicited-syn-holds"][..],
+        ),
+        (
+            CAPACITY,
+            "unsolicited-syn-holds",
+            "4294967296",
+            &["nat44", "tcp", "capacity", "unsolicited-syn-holds"][..],
+        ),
+    ] {
+        let source = VALID_V1.replacen(anchor, &format!("{anchor}{key} = {value}\n"), 1);
+        let diagnostic = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(
+            diagnostic.code(),
+            DiagnosticCode::InvalidType,
+            "{key}={value}"
+        );
+        let expected: Vec<PathSegment> = path
+            .iter()
+            .map(|field| PathSegment::Field((*field).to_owned()))
+            .collect();
+        assert_eq!(diagnostic.path().segments(), expected.as_slice());
+    }
+    // TCP only: the UDP section, the UDP capacity, and the realm reject them.
+    for (anchor, key) in [
+        (
+            "icmpv4-errors = \"external-only\"\n",
+            "unsolicited-syn-icmp = true",
+        ),
+        ("[nat44.realm.ports]", "unsolicited-syn-icmp = true"),
+        ("peers = 4096\n", "unsolicited-syn-holds = 1"),
+    ] {
+        let misplaced = parse(
+            VALID_V1
+                .replacen(anchor, &format!("{key}\n{anchor}"), 1)
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(misplaced.code(), DiagnosticCode::UnknownField, "{anchor}");
+    }
+}
+
 /// `[arp]` is optional and RFC 826 by default; `require-on-link-sender`
 /// (ARP-031 hardening) is an exact boolean, and unknown keys are rejected.
 #[test]
