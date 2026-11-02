@@ -2986,7 +2986,20 @@ M2 S10b（run-time operations、cold pathだけ）:
   drainは誰もcancelできない失われたTX handoffを`tx_handoffs_outstanding`として報告し、0でなければexit 1
   （XDP-177）。
 
-privilegeのdropと`poll`待機はdeferredです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
+privilege drop（H6、CLI-089〜CLI-095）: 権限が要るのは起動（AF_XDP socket、UMEM登録、BPF load、
+XDP link）だけです。run中のkick（`sendto`/`poll`）、`XDP_STATISTICS`、ring/UMEMは所有するfdとmemoryへの
+操作、link watchのnetlink dumpとsysctl読み取りは誰でもでき、reloadはsocketもprogramも作らず（backend
+変更はrestart-required）、teardownはlink fdのclose（detach）、保持するmap fdへのXSKMAP entry削除
+（Linux 6.5以上は権限不要）、munmap、closeです。そこでgeneration 1のactivate後・最初のtickの前に
+全threadが全capability（inheritable/permitted/effective/ambient、`CAP_SETPCAP`があればbounding）を
+落とし`no_new_privs`を立て、processをdumpable 0にし（最初のidentity変更より前と`setresuid`直後）、`--user`/`--group`ならuid/gidも切り替えます（既定on、`--keep-privileges`で
+opt-out）。credentialはthreadごとで、libcの`setuid`はprocess全体へbroadcastするため、privateな
+FFI module（`run::privileges::linux::sys`）のraw `syscall(2)`でthreadごとに行います。output threadは
+spawn時（何も書く前、spawn側は結果を待つ）、router threadはactivate後に自分を落とし、
+`/proc/thread-self/status`で自分を、最後に`/proc/self/task/*/status`で全threadを検証します。
+失敗はstartup failureとして全portをrollbackしexit 1（`stage=privilege-drop`）。前提（identity切替の
+`CAP_SETUID`/`CAP_SETGID`、teardownが権限なしで動くkernel）は資源取得前のpreflightでexit 4。
+seccompは未実装です。`poll`待機はdeferredです（CLI-034）。operator手順は[`runbook-m2.md`](runbook-m2.md)、
 privileged E2Eは`scripts/priv-run-smoke.sh`（三つの専用netns、forward、SIGTERM、reload、link
-down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL後のrestart）です（CLI-008〜059、
-XDP-045、XDP-063、XDP-177）。
+down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL後のrestart、drop後の全threadの
+credentialと`--keep-privileges`）です（CLI-008〜059、CLI-089〜095、XDP-045、XDP-063、XDP-177）。

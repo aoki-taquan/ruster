@@ -16,11 +16,12 @@
 //! expectation failure (for `run` also a fatal health or device event), 2
 //! usage error or invalid configuration/scenario;
 //! `run` adds 3 (shutdown deadline with TX frames still in the kernel) and
-//! 4 (missing privilege or memlock).
+//! 4 (missing privilege or memlock, or a privilege drop that cannot work).
 //!
-//! The only `unsafe` code is FFI in two private modules: the signal
-//! handlers (`signal`) and the rtnetlink queries of `ruster run`'s
-//! startup check and link watch (`run::netlink`).
+//! The only `unsafe` code is FFI in three private modules: the signal
+//! handlers (`signal`), the rtnetlink queries of `ruster run`'s startup
+//! check and link watch (`run::netlink`), and the per-thread credential
+//! syscalls of `ruster run`'s privilege drop (`run::privileges`).
 
 mod args;
 mod config_cmd;

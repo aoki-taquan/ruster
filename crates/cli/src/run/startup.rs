@@ -33,6 +33,7 @@ use super::checks::{
 };
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
 use super::netlink::NetlinkError;
+use super::privileges::{DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::watch::LinkTarget;
 
 /// Startup stage, in execution order.
@@ -60,6 +61,9 @@ pub enum Stage {
     Adapter,
     /// `ActivePublication::new` of generation 1.
     Activate,
+    /// The privilege drop after activation (or of an output thread at
+    /// spawn).
+    PrivilegeDrop,
 }
 
 impl Stage {
@@ -76,6 +80,7 @@ impl Stage {
             Self::Engine => "engine",
             Self::Adapter => "adapter",
             Self::Activate => "activate",
+            Self::PrivilegeDrop => "privilege-drop",
         }
     }
 }
@@ -96,6 +101,8 @@ pub enum Failure {
     Activation(ActivationError),
     /// The link watch's rtnetlink socket could not be opened.
     Links(NetlinkError),
+    /// The privilege drop after activation failed.
+    PrivilegeDrop(DropFailure),
     /// A failure injected by a test host.
     #[cfg(test)]
     Injected,
@@ -178,6 +185,7 @@ impl fmt::Display for Failure {
             Self::Adapter(error) => write!(formatter, "code={}", token(error)),
             Self::Activation(error) => write!(formatter, "code={}", token(error)),
             Self::Links(error) => write!(formatter, "code={}", token(error)),
+            Self::PrivilegeDrop(error) => write!(formatter, "{error}"),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
             #[cfg(test)]
@@ -328,8 +336,13 @@ pub trait PortHost {
     /// `IfId` order (for the forwarding sysctls).
     fn links(&self, devices: &[(IfId, &str)]) -> Result<Self::Links, Failure>;
 
-    /// Capabilities and memlock for `backend`, before any resource.
-    fn preflight(&self, backend: &ValidatedAfXdpV1) -> Result<(), PrivilegeFailure>;
+    /// Capabilities and memlock for `backend`, and the preconditions of
+    /// the privilege drop of `policy`, before any resource.
+    fn preflight(
+        &self,
+        backend: &ValidatedAfXdpV1,
+        policy: PrivilegePolicy,
+    ) -> Result<(), PrivilegeFailure>;
 
     /// Opens one session (no XDP attached yet).
     fn open(&self, port: &ValidatedAfXdpPortV1) -> Result<Self::Session, Failure>;
@@ -353,6 +366,10 @@ pub trait PortHost {
     ) -> Result<Self::Datapath<'s>, StartupError>
     where
         Self: 's;
+
+    /// Drops every privilege of the process after startup (and switches to
+    /// `identity`), irreversibly, and verifies every thread.
+    fn lockdown(&self, identity: Option<Identity>) -> Result<DropReport, DropFailure>;
 
     /// Detaches (if attached) and closes one session, releasing every
     /// resource even when a step reports an error.

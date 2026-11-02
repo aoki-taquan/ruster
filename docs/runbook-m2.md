@@ -46,8 +46,13 @@ All commands assume a dedicated router host or network namespace. Replace
   capabilities `CAP_NET_ADMIN`, `CAP_NET_RAW`, and `CAP_BPF` + `CAP_PERFMON`
   (or `CAP_SYS_ADMIN` instead of both). Checked before any resource is
   taken; missing ones exit 4 (`privileges code=MISSING_CAPABILITIES
-  missing=...`). `ruster run` does not drop privileges after startup
-  (deferred, CLI-034).
+  missing=...`). These are needed only for startup: once generation 1 is
+  active, `ruster run` drops every capability of every thread (and, with
+  `--user`/`--group`, switches to that uid/gid) before the first tick
+  (section 5, "Privilege drop"); `--keep-privileges` opts out. The default
+  drop needs Linux 6.5 or newer, or `kernel.unprivileged_bpf_disabled=0`
+  (exit 4 `privileges code=TEARDOWN_NEEDS_CAPABILITIES` otherwise);
+  `--user`/`--group` also need `CAP_SETUID` and `CAP_SETGID`.
 - **Memlock**: without `CAP_IPC_LOCK`, the soft `RLIMIT_MEMLOCK` must be at
   least the sum over ports of `frame-count x frame-size` (rounded up to
   4 KiB pages; twice that for `mode = "auto"`) plus 64 KiB per port for the
@@ -371,17 +376,48 @@ example with `NetworkNamespacePath=/run/netns/router`):
 ```ini
 [Service]
 NetworkNamespacePath=/run/netns/router
-ExecStart=/usr/local/bin/ruster run --config /etc/ruster/router.toml
+ExecStart=/usr/local/bin/ruster run --user 990 --group 990 --config /etc/ruster/router.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=1
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_SETUID CAP_SETGID CAP_SETPCAP
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_PERFMON CAP_SETUID CAP_SETGID CAP_SETPCAP
 LimitMEMLOCK=infinity
 KillSignal=SIGTERM
 TimeoutStopSec=10
 ```
 
+`990` stands for a dedicated system account with no login and no other
+use (`useradd --system --no-create-home --shell /usr/sbin/nologin ruster`,
+which also creates its group). Recommended config layout, readable by the
+router in every mode of section 5 ("Privilege drop") and accepted by
+`--strict-config-perms`:
+
+```bash
+sudo install -d -o root -g ruster -m 0750 /etc/ruster
+sudo install -o root -g ruster -m 0640 router.toml /etc/ruster/router.toml
+```
+
+Root reads it as the owner (also after the drop, without
+`CAP_DAC_OVERRIDE`), the switched user through `--group`, and nobody else
+can read or change it. Replace it on reload with the same owner and mode
+(`install ... router.toml.next` and `mv`). Without
+`--user`/`--group` drop `CAP_SETUID CAP_SETGID` from both lines; without
+`CAP_SETPCAP` the bounding set cannot be cleared and the drop reports
+`bounding-set=kept` (harmless: no capability can come back, see section 5).
+Do not use `NoNewPrivileges=yes` with `ExecStartPre=` helpers that need it
+off; `ruster run` sets no_new_privs itself after startup.
+
+Upgrade note (H6, behaviour change): the drop is on by default. On a kernel
+older than 6.5 with `kernel.unprivileged_bpf_disabled` nonzero (the default
+of, for example, Ubuntu 22.04 and RHEL 9 kernels) an unchanged unit now
+exits 4 at startup with `stage=privileges code=TEARDOWN_NEEDS_CAPABILITIES`
+before touching any port, and `Restart=on-failure` restarts it in a loop.
+There, add `--keep-privileges` (and accept its risk, section 3) or move to
+Linux 6.5 or newer. The check reads the kernel version only: a vendor
+kernel that backported the 6.5 change under an older version is not
+detected and is refused too (fail closed). `--keep-privileges` is needed
+only in that case, or to diagnose a drop failure.
 `Restart=on-failure` restarts after exit 1, 3 and 4 and after a crash;
 exit 2 (usage or invalid config) also restarts under this setting, so fix
 the config first. `TimeoutStopSec` must exceed the 2 s drain plus the 1 s
@@ -395,6 +431,7 @@ ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
            [--strict-config-perms] [--stats-interval <seconds>]
            [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
            [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
+           [--keep-privileges | --user <uid> --group <gid>]
            --config <config.toml>
 ruster run [options] -- <config.toml>
 ```
@@ -412,9 +449,11 @@ ruster run [options] -- <config.toml>
 | `--tx-stall-warn-secs <s>` | 1 | 1 to 3600 | `TX_STALL` warning delay |
 | `--tx-stall-fatal-secs <s>` | 10 | 0 to 3600 | `TX_STALL` fatal exit; 0 never; otherwise at least `--tx-stall-warn-secs` |
 | `--kick-errors-fatal-secs <s>` | 5 | 0 to 3600 | `KICK_ERRORS` fatal exit; 0 never |
+| `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, or on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused) |
+| `--user <uid>` `--group <gid>` | none | numeric ids 1 to 4294967294, both or neither, not with `--keep-privileges` | with the drop, also switch every thread's real, effective, saved and filesystem uid and gid to these ids and clear the supplementary groups. Names are not resolved. Needs `CAP_SETUID` and `CAP_SETGID` at startup (exit 4 otherwise, checked before anything is opened). The config must then be readable by that user for reloads |
 
-Numbers are decimal digits only (at most 6, no sign). Every option may be
-given once; `-h`/`--help` prints the usage. The thresholds and intervals
+Numbers are decimal digits only (at most 6, no sign; ids at most 10).
+Every option may be given once; `-h`/`--help` prints the usage. The thresholds and intervals
 are set at start and are not reloadable. The config file is always opened
 `O_NONBLOCK | O_NOCTTY` and must be a regular file (a FIFO or device is
 `NOT_A_FILE`).
@@ -428,10 +467,10 @@ its terminal hangs up or under `nohup`.
 | status | meaning |
 |---|---|
 | 0 | ordered shutdown after SIGINT/SIGTERM with no TX frame left in the kernel; also a signal during startup or during a retry pause, after a clean rollback |
-| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (open, checks, attach, watch, datapath, engine, adapter, activate, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; signal handler or output thread setup failure; unsupported platform |
+| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (open, checks, attach, watch, datapath, engine, adapter, activate, privilege-drop, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; signal handler or output thread setup failure; unsupported platform |
 | 2 | usage error, or invalid config (`parse`, `version`, `validate`, the `sim` backend, or `candidate code=MISSING_SERVICE_*`) |
 | 3 | the shutdown drain deadline (or a second signal) left TX frames with the kernel; everything was still detached and closed |
-| 4 | missing capability, too small `RLIMIT_MEMLOCK`, or unreadable `/proc/self/status`/`/proc/self/limits`; nothing was acquired |
+| 4 | missing capability (also `CAP_SETUID`/`CAP_SETGID` for `--user`/`--group`), too small `RLIMIT_MEMLOCK`, a kernel whose teardown would need `CAP_BPF` after the drop (`TEARDOWN_NEEDS_CAPABILITIES`), or unreadable `/proc/self/status`/`/proc/self/limits`/`/proc/sys/kernel/osrelease`/`/proc/sys/kernel/unprivileged_bpf_disabled`; nothing was acquired |
 | 101 | a panic (section 9) |
 
 A refused or failed reload never ends the run.
@@ -445,7 +484,9 @@ A refused or failed reload never ends the run.
    preflight, then per port in interface-id order: open the session (TX
    queue and MTU read from sysfs), device checks (rtnetlink, procfs), XDP
    attach; then the link-watch socket, every datapath, every engine, the
-   adapter, and activation of generation 1.
+   adapter, activation of generation 1, and the privilege drop
+   (`ruster run: privileges dropped: threads=3 capabilities=none
+   bounding-set=cleared|kept no-new-privs=1 identity=unchanged|switched`).
 3. Ready when stderr shows
    `ruster run: running generation 1 on N port(s); send SIGINT or SIGTERM to
    stop, SIGHUP to reload`.
@@ -493,6 +534,92 @@ bounds the attempts. The candidate, storage and privilege preflight are not
 repeated. Every other failure is final at once. A signal during the pause
 cancels (`startup cancelled by signal; rolled back N port(s)`, exit 0).
 
+### Privilege drop
+
+Before startup completes the process needs the capabilities of section 1.
+After it, nothing does, so the process gives them up for good:
+
+| | before the drop (startup) | after the drop (the whole run) |
+|---|---|---|
+| capabilities (`CapInh`, `CapPrm`, `CapEff`, `CapAmb`) | as started (root: all) | none, in every thread |
+| bounding set (`CapBnd`) | as started | empty if `CAP_SETPCAP` was effective, otherwise unchanged (`bounding-set=kept`) |
+| `no_new_privs` | as started | 1: no `execve` can grant anything (setuid binaries, file capabilities) |
+| uid/gid | as started | unchanged, or with `--user`/`--group` those ids (real, effective, saved, filesystem) and no supplementary group |
+
+When: after every port is open, checked and attached, the datapath and
+adapter are built and generation 1 is active, and before the first tick.
+Linux credentials are per thread. The two output threads (`ruster-stdout`,
+`ruster-stderr`) are started before startup and drop their own privileges
+(the same steps, the same identity) before they write anything; the router
+thread drops its own after activation. Each uses raw per-thread syscalls
+(not the C library's process-wide `setuid`, which would also drop the
+router thread too early). Steps per thread: `PR_SET_DUMPABLE` 0 (a flag
+of the whole process, set before the first identity change, set again
+right after `setresuid` because an euid change resets it to
+`fs.suid_dumpable`, and read back at the end); `PR_SET_KEEPCAPS` 0; with
+`CAP_SETPCAP`, `PR_CAPBSET_DROP` of every capability; `PR_CAP_AMBIENT`
+clear; with `--user`/`--group` `setgroups(0)`, `setresgid`, `setresuid`;
+`capset` with empty sets; `PR_SET_NO_NEW_PRIVS` 1. Each thread then checks
+its own `/proc/thread-self/status`, and the router thread finally reads
+`/proc/self/task/*/status` and requires every thread of the process to show
+the dropped state. The line reports how many threads were checked
+(`threads=3`).
+
+What still works without any capability (verified by the privileged smoke,
+section 13): AF_XDP RX/TX on the open sockets (ring and UMEM memory, the
+`sendto`/`poll` kicks), `XDP_STATISTICS` (`getsockopt` on an owned
+socket), the link watch (new `NETLINK_ROUTE` sockets and `GETLINK`,
+`GETADDR`, `GETROUTE` dumps are open to every user, also when the socket is
+recreated after a failure; the sysctls it reads are world-readable), SIGHUP
+reload (it never opens a socket or attaches a program: backend changes are
+restart-required and refused), the health watch and its fatal exits, the
+drain, and the teardown (closing the XDP link fd detaches; the XSKMAP entry
+delete runs on a map fd the process holds, which Linux 6.5 and newer allow
+without a capability; earlier kernels refuse every `bpf(2)` call without
+`CAP_BPF` while `kernel.unprivileged_bpf_disabled` is set, so the drop is
+refused there at startup with `TEARDOWN_NEEDS_CAPABILITIES`).
+
+What changes:
+
+- Root without capabilities has no `CAP_DAC_OVERRIDE`: a reload reads the
+  config with plain file permissions. A config in another user's private
+  directory fails with `reload failed: stage=read code=PERMISSION_DENIED`
+  (startup still read it). With `--user`/`--group` the config and every
+  directory above it must be readable by that user, and
+  `--strict-config-perms` then accepts files owned by root or by that user.
+  The layout of section 2 (`/etc/ruster` `root:<group> 0750`, the config
+  `root:<group> 0640`) works in every mode: root reads it as the owner,
+  the switched user through its group, and `--strict-config-perms` accepts
+  it (the privileged smoke reloads exactly this layout).
+- uid 0 without capabilities still owns every root-owned file. Use
+  `--user`/`--group` with a dedicated account to take that away too.
+- The process is not dumpable from the drop on: no core dumps, and
+  `ptrace` or `/proc/<pid>/mem` of it needs `CAP_SYS_PTRACE`, also for the
+  switched user. Its `/proc/<pid>` entries are owned by root.
+- With `--user`/`--group` that user can signal the router (SIGHUP reload,
+  SIGTERM stop: the kernel lets a user signal a process whose real or
+  saved uid is theirs) and owns its locked memory accounting from then on.
+  The output threads switch at spawn, before startup, so during startup
+  (usually under a second, longer with startup retries) that user can already send them signals,
+  which are delivered to the process like any other: SIGHUP and SIGTERM
+  are only flags read by the router thread (a stop during startup rolls
+  back and exits 0), and SIGKILL or SIGSTOP end or pause the process like
+  a crash (the unpinned links detach). The user cannot `ptrace` or read
+  the still privileged router thread: the process is made not dumpable
+  before any thread switches. What remains: with `fs.suid_dumpable=1` (not
+  a default) the kernel makes the process dumpable again inside each
+  thread's `setresuid` until the very next `PR_SET_DUMPABLE` call, a
+  window of one syscall per thread; keep `fs.suid_dumpable` at 0 or 2.
+- Nothing can bring a capability back: restart the router to change
+  anything restart-required, as before.
+
+Failure: any failed step aborts startup with the full rollback of section 5
+(`startup failed: stage=privilege-drop code=<STEP>/ERRNO_<n>`,
+`code=NOT_DROPPED/<WHAT>` when a thread still holds something, or
+`code=STATUS_UNREADABLE`; exit 1). An output thread that cannot drop fails
+before anything is opened (`stage=privilege-drop code=... thread=output`,
+exit 1). The router never runs half-dropped.
+
 ### Output never blocks the router
 
 stdout and stderr are written by separate output threads. The router
@@ -514,7 +641,8 @@ stats block and summary can then be lost (the teardown itself completed).
    between two ticks and prints `reload requested (generation G)`. SIGHUPs
    that arrive while one reload is pending are coalesced into one more.
 3. The file is read and validated like at startup (same limits, regular
-   file only, `--strict-config-perms` applies), a successor generation is
+   file only, `--strict-config-perms` applies; after the privilege drop with
+   plain file permissions, section 5), a successor generation is
    built with fresh keys, and the plan is checked against the running
    generation. One line reports the outcome:
 
@@ -762,6 +890,7 @@ Sections, in this order:
 | `reload.*` | `requested`, `applied`, `refused`, `failed` |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports) |
 | `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
+| `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |
 | `output.dropped` | output messages dropped because a stream could not keep up |
 
 What to watch in operation: `observer.state=healthy`, `watch.state=ok`,
@@ -901,8 +1030,14 @@ CLI-034).
   after the system's entropy is initialized.
 - Not implemented (CLI-034): `poll`-based waiting on the socket fds (the
   loop spins 64 ticks, then sleeps 50 µs doubling to 1 ms when idle),
-  privilege drop, SIGUSR1 stats, structured logs, systemd notify, opt-in
+  SIGUSR1 stats, structured logs, systemd notify, opt-in
   "link down / forwarding 0 at exit", state carried across a reload.
+- Privilege drop limits (CLI-089 to CLI-095): no seccomp filter (a
+  compromised process keeps every syscall an unprivileged process has, such
+  as opening netlink sockets and reading world-readable files), no chroot
+  or mount namespace, numeric `--user`/`--group` only, and the drop needs
+  Linux 6.5 or newer unless `kernel.unprivileged_bpf_disabled=0`. Without
+  `--user`/`--group` the process stays uid 0 (owner of every root file).
 - While a port is down with TX held, its owed kick is retried about 16
   times per second (1 ms doubling to 64 ms, §8), so held TX resumes within about
   64 ms (plus up to one 1 ms idle pause) after the link returns; the run loop's link watch (1 s) does not
@@ -984,6 +1119,27 @@ What it proves, on the runner's kernel only:
   translates, and exits 0 on SIGTERM; one more failure hold (4097, a
   quote table) refused by `validate` and `run` (exit 2) although
   accepted as a sim document.
+  Added by H6: every phase runs with the default privilege drop. Markers
+  `priv_run_privileges_dropped` (every thread of the running router has
+  `CapInh`, `CapPrm`, `CapEff`, `CapAmb` and `CapBnd` 0 and `NoNewPrivs` 1
+  in `/proc/<pid>/task/*/status`, forwarding works),
+  `priv_run_privileges_identity` (the ops and icmp phases run with
+  `--user`/`--group` as the invoking user: every uid/gid field switched, no
+  supplementary group), `priv_run_privileges_runtime` (after the drop:
+  reloads applied and refused, link down/up, the MTU fatal exit, drain and
+  detach), `priv_run_privileges_reload_dropped` (the recommended layout in
+  a root-owned `/run/ruster-smoke.XXXXXX` directory, `root:<gid> 0750` with
+  the config `root:<gid> 0640`, removed on every exit: a SIGHUP reload that
+  swaps the file applies, generation 2, and the firewall then denies,
+  after the default drop as root, with `--strict-config-perms`, and with
+  `--user`/`--group` plus `--strict-config-perms`, where `/proc/<pid>` is
+  also owned by root because the process is not dumpable),
+  `priv_run_privileges_no_dac_override` (uid 0 after the drop cannot
+  reload a config from the smoke's 0700 work directory owned by the
+  invoking user, generation 1 and forwarding kept) and
+  `priv_run_privileges_kept` (`--keep-privileges`:
+  `CAP_NET_ADMIN` in every thread, the same reload applies,
+  `privileges.state=kept`).
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 
@@ -1028,7 +1184,11 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=storage code=ALLOCATION.<SERVICE>` | 1 | runtime storage could not be allocated | lower the capacities or give the process more memory |
 | `stage=privileges code=MISSING_CAPABILITIES missing=...` | 4 | effective capabilities missing | run as root or grant the listed capabilities |
 | `stage=privileges code=MEMLOCK_LIMIT limit-bytes=L required-bytes=R` | 4 | soft memlock limit below the UMEM estimate | raise `ulimit -l`/`LimitMEMLOCK` to at least R, or grant `CAP_IPC_LOCK` |
-| `stage=privileges code=UNREADABLE source=/proc/self/status\|/proc/self/limits` | 4 | procfs not readable | mount procfs in the namespace/container |
+| `stage=privileges code=UNREADABLE source=/proc/self/status\|/proc/self/limits\|/proc/sys/kernel/osrelease\|/proc/sys/kernel/unprivileged_bpf_disabled` | 4 | procfs not readable | mount procfs in the namespace/container |
+| `stage=privileges code=MISSING_CAPABILITIES missing=CAP_SETGID,CAP_SETUID` | 4 | `--user`/`--group` without the capabilities to switch | grant `CAP_SETUID` and `CAP_SETGID` (systemd: add them to `AmbientCapabilities`/`CapabilityBoundingSet`), or drop `--user`/`--group` |
+| `stage=privileges code=TEARDOWN_NEEDS_CAPABILITIES` | 4 | kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (Ubuntu 22.04, RHEL 9 defaults; vendor backports are not detected): the teardown after the drop would fail | use Linux 6.5 or newer, or knowingly `--keep-privileges` (section 2, upgrade note); with `Restart=on-failure` the unit otherwise restarts in a loop |
+| `stage=privilege-drop code=<STEP>/ERRNO_<n>` (`DUMPABLE`, `KEEPCAPS`, `BOUNDING`, `AMBIENT`, `GROUPS`, `GID`, `UID`, `CAPSET`, `NO_NEW_PRIVS`), `code=NOT_DROPPED/CAPABILITIES\|BOUNDING\|NO_NEW_PRIVS\|IDENTITY\|GROUPS\|DUMPABLE`, `code=STATUS_UNREADABLE` [`thread=output`] | 1 | the privilege drop failed (everything was rolled back) | check seccomp/LSM policy on `prctl`/`capset`/set-id calls and procfs; `NOT_DROPPED` names what a thread kept: report it |
+| `reload failed: stage=read code=PERMISSION_DENIED` after a clean start | — | after the drop the config is read without `CAP_DAC_OVERRIDE` (section 5) | make the config and its directories readable by the process's user (root: a root-owned path such as `/etc/ruster`) |
 | `stage=open code=INTERFACE_LOOKUP/NO_SUCH_DEVICE` | 1 | the `device` does not exist in this namespace | fix `device`, or run in the right namespace |
 | `stage=open code=TX_QUEUE_CHECK/NO_TX_QUEUE`, `BIND/INVALID_ARGUMENT` | 1 | `queue` is not a queue of the device | use queue 0, or a queue that has RX and TX |
 | `stage=open code=BIND/BUSY` | 1 | another AF_XDP socket owns the queue (retried first) | stop the other user; after a crash, wait and start again |

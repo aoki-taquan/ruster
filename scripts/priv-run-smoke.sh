@@ -19,7 +19,11 @@
 #   forward   start `ruster run`; a UDP datagram from host A to host B
 #             crosses the router (ARP reply from the router to A, ARP
 #             request from the router to B, NAT44 to 203.0.113.2, stateful
-#             firewall); SIGTERM; exit 0, no XDP left on ra/rb, final stats
+#             firewall); SIGTERM; exit 0, no XDP left on ra/rb, final stats.
+#             (H6) Every phase runs with the default privilege drop: here
+#             every thread of the running router (/proc/<pid>/task/*/status)
+#             shows CapInh/CapPrm/CapEff/CapAmb/CapBnd 0 and NoNewPrivs 1,
+#             and the startup line and stats say privileges dropped
 #   limits    (H3) a config with every runtime table at its production
 #             limit (failure holds and ICMPv4 error actions 4096, every
 #             other table 65536, NAT44 pool 1-65535, 51.11 MiB of storage) is
@@ -28,7 +32,10 @@
 #             simulator's limits accept it as a sim document; `ruster run`
 #             starts the maximal config, forwards and translates, and exits
 #             0 on SIGTERM
-#   ops       (M2 S10b) on one running router: SIGHUP reload that turns the
+#   ops       (M2 S10b) on one running router, started with --user/--group
+#             as the invoking user (H6: every thread switched to that uid
+#             and gid with no supplementary group and no capability, so the
+#             reloads below read the config as that user): SIGHUP reload that turns the
 #             LAN->WAN UDP rule into deny (the datagram stops arriving) and
 #             back (it arrives again), generations 2 and 3, no restart; a
 #             restart-required reload (UMEM shape) refused while traffic
@@ -36,6 +43,23 @@
 #             namespace warns and recovers with forwarding; then rb's MTU
 #             raised beyond the 2048-byte frame bound: exit 1 after drain,
 #             nothing left attached
+#   privileges  (H6) the recommended config layout (runbook section 5):
+#             a root-owned directory /run/ruster-smoke.XXXXXX (root:<gid>
+#             0750, removed on every exit; a plain directory, nothing
+#             network-related in the initial namespace) with the config
+#             root:<gid> 0640. With the default drop as root (no --user),
+#             again with --strict-config-perms, and with --user/--group
+#             plus --strict-config-perms, a SIGHUP reload that swaps the
+#             file in that directory applies (generation 2) and the
+#             firewall then denies. After the drop root keeps uid 0 but no
+#             capability: the smoke's own work directory (0700, owned by
+#             the invoking user) is read at startup (still privileged) but
+#             a SIGHUP reload from it fails with stage=read
+#             code=PERMISSION_DENIED while forwarding goes on (no
+#             CAP_DAC_OVERRIDE); with --keep-privileges every thread keeps
+#             CAP_NET_ADMIN (NoNewPrivs 0), the same reload applies, and
+#             the stats say privileges.state=kept; all exit 0 on SIGTERM
+#             with nothing attached
 #   validate  (gap fill) `ruster validate` on every config the smoke runs
 #             (exit 0, af-xdp backend with 2 ports) and on an invalid one
 #             (exit 2); `ruster plan` between the configs the smoke reloads
@@ -161,6 +185,7 @@ created=
 launcher=
 ruster_pid=
 mroute=
+etcdir=
 
 # True only if `$1` is a live process running the built ruster binary.
 is_ruster() {
@@ -185,6 +210,10 @@ cleanup() {
         launcher=
     fi
     : >"$stopfile" 2>/dev/null || true
+    case $etcdir in
+    /run/ruster-smoke.*) sudo -n rm -rf -- "$etcdir" 2>/dev/null || true ;;
+    esac
+    etcdir=
     for ns in $created; do
         sudo -n ip netns del "$ns" 2>/dev/null || true
     done
@@ -566,6 +595,71 @@ block_has() {
     done
 }
 
+# The invoking user's ids: the identity the ops and icmp phases switch to
+# (--user/--group), which can read the smoke's work files on reload.
+smoke_uid=$(id -u)
+smoke_gid=$(id -g)
+[ "$smoke_uid" -ne 0 ] && [ "$smoke_gid" -ne 0 ] ||
+    fail "run the smoke as a regular user (it uses sudo -n itself)"
+
+# Prints the value of the row $2 of the status file text in $1, its
+# fields separated by single spaces.
+status_row() {
+    printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | tr -s '[:space:]' ' ' | sed 's/ $//'
+}
+
+# H6: every thread of the running ruster ($ruster_pid) holds no
+# capability (inheritable, permitted, effective, ambient, bounding) and
+# has NoNewPrivs 1; with $2 = "<uid> <gid>" also that uid/gid in every
+# field and no supplementary group. Sets `threads`.
+assert_dropped() {
+    name=$1
+    ids=${2-}
+    threads=0
+    for task in $(sudo -n ls "/proc/$ruster_pid/task"); do
+        st=$(sudo -n cat "/proc/$ruster_pid/task/$task/status") ||
+            fail "$name: cannot read task $task"
+        comm=$(status_row "$st" Name)
+        for key in CapInh CapPrm CapEff CapAmb CapBnd; do
+            value=$(status_row "$st" "$key")
+            [ "$value" = 0000000000000000 ] ||
+                fail "$name: thread $comm ($task) $key=$value after the drop"
+        done
+        [ "$(status_row "$st" NoNewPrivs)" = 1 ] ||
+            fail "$name: thread $comm ($task) NoNewPrivs is not 1"
+        if [ -n "$ids" ]; then
+            set -- $ids
+            uids=$(status_row "$st" Uid)
+            gids=$(status_row "$st" Gid)
+            [ "$uids" = "$1 $1 $1 $1" ] || fail "$name: thread $comm ($task) Uid $uids"
+            [ "$gids" = "$2 $2 $2 $2" ] || fail "$name: thread $comm ($task) Gid $gids"
+            [ -z "$(status_row "$st" Groups)" ] ||
+                fail "$name: thread $comm ($task) kept supplementary groups"
+        else
+            [ "$(status_row "$st" Uid)" = "0 0 0 0" ] ||
+                fail "$name: thread $comm ($task) changed uid without --user"
+        fi
+        threads=$((threads + 1))
+    done
+    [ "$threads" -ge 3 ] || fail "$name: only $threads thread(s)"
+}
+
+# H6 --keep-privileges: every thread still has CAP_NET_ADMIN (bit 12)
+# effective and NoNewPrivs 0.
+assert_kept() {
+    name=$1
+    threads=0
+    for task in $(sudo -n ls "/proc/$ruster_pid/task"); do
+        st=$(sudo -n cat "/proc/$ruster_pid/task/$task/status") ||
+            fail "$name: cannot read task $task"
+        eff=$(status_row "$st" CapEff)
+        [ $((0x$eff >> 12 & 1)) -eq 1 ] || fail "$name: task $task CapEff=$eff without CAP_NET_ADMIN"
+        [ "$(status_row "$st" NoNewPrivs)" = 0 ] || fail "$name: task $task NoNewPrivs set"
+        threads=$((threads + 1))
+    done
+    [ "$threads" -ge 3 ] || fail "$name: only $threads thread(s)"
+}
+
 # Host A's view of router-generated ICMPv4 (argv: mode target ttl marker
 # deadline-seconds). Repeats the probe (an Echo Request on a raw socket, or
 # a UDP datagram to port 9 with the given TTL) every 0.3 s and reads every
@@ -765,7 +859,11 @@ start_ruster forward "$work/router.toml"
 wait_ready forward || fail "forward: ruster exited during startup"
 case $(xdp_on ra) in xdp\ [0-9]*) ;; *) fail "forward: no native XDP on ra" ;; esac
 case $(xdp_on rb) in xdp\ [0-9]*) ;; *) fail "forward: no native XDP on rb" ;; esac
+assert_dropped forward
+grep -qxF "ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged" \
+    "$work/forward.err" || fail "forward: no privilege drop line"
 forward_once forward
+echo "priv_run_privileges_dropped: all $threads threads CapInh/CapPrm/CapEff/CapAmb/CapBnd=0 NoNewPrivs=1 uid 0, forwarding after the drop verified"
 signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "forward: exit status $status after SIGTERM"
@@ -774,7 +872,9 @@ grep -q "^ruster-run-stats kind=final" "$work/forward.out" || fail "forward: no 
 grep -q "^af_xdp.ports=2$" "$work/forward.out" || fail "forward: no backend stats"
 sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/forward.out" >"$work/forward.final"
 block_has "$work/forward.final" observer.state=healthy observer.generation=1 watch.state=ok \
-    resolution_index.state_probe_exhausted=0 resolution_index.index_corrupt=0
+    resolution_index.state_probe_exhausted=0 resolution_index.index_corrupt=0 \
+    privileges.state=dropped privileges.bounding_set=cleared privileges.identity=unchanged \
+    privileges.threads=3
 received=$(sed -n 's/^rx.received=//p' "$work/forward.out" | tail -n 1)
 [ "${received:-0}" -ge 1 ] || fail "forward: final rx.received is ${received:-missing}"
 grep -q "stopped by signal; .* tx-in-flight=0 .*detached and closed 2 port(s)" \
@@ -819,8 +919,12 @@ echo "priv_run_limits: every table at its production limit (storage 53592256 byt
 # deny -> router reloadable (applied), router -> reshape restart-required
 # with $reshape_reasons (refused with exactly those reasons).
 cp "$work/router.toml" "$work/ops.toml"
-start_ruster ops "$work/ops.toml"
+start_ruster ops "$work/ops.toml" --user "$smoke_uid" --group "$smoke_gid"
 wait_ready ops || fail "ops: ruster exited during startup"
+assert_dropped ops "$smoke_uid $smoke_gid"
+grep -qxF "ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched" \
+    "$work/ops.err" || fail "ops: no identity switch line"
+echo "priv_run_privileges_identity: all $threads threads switched to the invoking uid/gid (real, effective, saved, fs) with no supplementary group, no capability, NoNewPrivs=1 verified"
 forward_once ops-before
 reload_with "$work/deny.toml"
 wait_line ops "reload applied: generation=2 previous=1"
@@ -854,14 +958,91 @@ grep -q "^reload.applied=3$" "$work/ops.final" || fail "ops: final reload.applie
 grep -q "^reload.refused=1$" "$work/ops.final" || fail "ops: final reload.refused"
 grep -q "^reload.requested=4$" "$work/ops.final" || fail "ops: final reload.requested"
 grep -q "^if1.watch.link_down_events=1$" "$work/ops.final" || fail "ops: final link counters"
+block_has "$work/ops.final" privileges.state=dropped privileges.identity=switched
 assert_detached "the MTU fail-closed exit"
 sudo -n ip -n "$router" link set rb mtu 1500
 cat "$work/ops.err"
 echo "priv_run_mtu: MTU above the frame bound failed closed with exit 1 and detached verified"
+echo "priv_run_privileges_runtime: after the drop and identity switch, three SIGHUP reloads applied and one refused, link down/up warned and recovered, the MTU event failed closed, drain and detach completed verified"
+
+# privileges (H6): the recommended layout reloads under every drop mode.
+etcdir=$(sudo -n mktemp -d /run/ruster-smoke.XXXXXX)
+case $etcdir in
+/run/ruster-smoke.*) ;;
+*) fail "privileges: unexpected directory $etcdir" ;;
+esac
+sudo -n chown "root:$smoke_gid" "$etcdir"
+sudo -n chmod 0750 "$etcdir"
+# Installs $1 as $etcdir/router.toml (root:<gid> 0640) by an atomic swap.
+install_etc() {
+    sudo -n install -m 0640 -o root -g "$smoke_gid" "$1" "$etcdir/router.toml.next"
+    sudo -n mv -f "$etcdir/router.toml.next" "$etcdir/router.toml"
+}
+for mode in default strict user-strict; do
+    case $mode in
+    default) set -- ;;
+    strict) set -- --strict-config-perms ;;
+    user-strict) set -- --strict-config-perms --user "$smoke_uid" --group "$smoke_gid" ;;
+    esac
+    name="etc-$mode"
+    install_etc "$work/router.toml"
+    start_ruster "$name" "$etcdir/router.toml" "$@"
+    wait_ready "$name" || fail "$name: ruster exited during startup"
+    if [ "$mode" = user-strict ]; then
+        assert_dropped "$name" "$smoke_uid $smoke_gid"
+        # Not dumpable after the switch: procfs reports root as the owner.
+        [ "$(sudo -n stat -c %u "/proc/$ruster_pid/status")" = 0 ] ||
+            fail "$name: the switched process is dumpable"
+    else
+        assert_dropped "$name"
+    fi
+    forward_once "$name-before"
+    install_etc "$work/deny.toml"
+    signal_ruster HUP
+    wait_line "$name" "reload applied: generation=2 previous=1"
+    forward_blocked "$name-denied"
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "$name: exit status $status after SIGTERM"
+    assert_detached "the $name run"
+done
+set --
+sudo -n rm -rf -- "$etcdir"
+etcdir=
+echo "priv_run_privileges_reload_dropped: a config root:<gid> 0640 in a root:<gid> 0750 directory reloaded (generation 2, firewall then denied) after the default drop as root, with --strict-config-perms, and with --user/--group plus --strict-config-perms (process not dumpable), exit 0, detached verified"
+# What the drop takes from root: the work directory is 0700 and owned by
+# the invoking user, so uid 0 without CAP_DAC_OVERRIDE cannot read it.
+start_ruster drop-root "$work/router.toml"
+wait_ready drop-root || fail "drop-root: ruster exited during startup"
+assert_dropped drop-root
+signal_ruster HUP
+wait_line drop-root "reload failed: stage=read code=PERMISSION_DENIED; generation 1 keeps running"
+forward_once drop-root
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "drop-root: exit status $status after SIGTERM"
+assert_detached "the drop-root run"
+echo "priv_run_privileges_no_dac_override: after the drop uid 0 could not reload a config in the 0700 work directory of another user (PERMISSION_DENIED, generation 1 kept, forwarding kept), exit 0, detached verified"
+start_ruster keep "$work/router.toml" --keep-privileges
+wait_ready keep || fail "keep: ruster exited during startup"
+grep -qxF "ruster run: warning: privileges kept (--keep-privileges): every capability stays for the whole run" \
+    "$work/keep.err" || fail "keep: no warning"
+grep -q "privileges dropped" "$work/keep.err" && fail "keep: dropped anyway"
+assert_kept keep
+signal_ruster HUP
+wait_line keep "reload applied: generation=2 previous=1"
+forward_once keep
+signal_ruster TERM
+wait_ruster
+[ "$status" -eq 0 ] || fail "keep: exit status $status after SIGTERM"
+assert_detached "the --keep-privileges run"
+sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/keep.out" >"$work/keep.final"
+block_has "$work/keep.final" privileges.state=kept privileges.threads=0
+echo "priv_run_privileges_kept: --keep-privileges kept CAP_NET_ADMIN in all $threads threads (NoNewPrivs=0), the same reload applied, privileges.state=kept, exit 0, detached verified"
 
 # icmp: router-generated ICMPv4 on the wire over AF_XDP, seen by host A.
 cp "$work/router.toml" "$work/icmp.toml"
-start_ruster icmp "$work/icmp.toml"
+start_ruster icmp "$work/icmp.toml" --user "$smoke_uid" --group "$smoke_gid"
 wait_ready icmp || fail "icmp: ruster exited during startup"
 icmp_probe echo 192.168.1.1 64 10
 echo "priv_run_icmp_echo: $(cat "$work/icmp-echo.txt") verified"

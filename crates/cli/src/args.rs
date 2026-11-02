@@ -18,18 +18,22 @@ usage:
              [--strict-config-perms] [--stats-interval <seconds>]
              [--startup-attempts <n>] [--tx-stall-warn-secs <s>]
              [--tx-stall-fatal-secs <s>] [--kick-errors-fatal-secs <s>]
+             [--keep-privileges | --user <uid> --group <gid>]
              --config <config.toml>
   ruster run [options] -- <config.toml>
   ruster --help | --version
 
 `run`: SIGINT/SIGTERM stop (a second one forces), SIGHUP reloads the config.
 A fatal threshold of 0 disables that fatal exit (warn only).
+After startup `run` drops every capability (and with --user/--group switches
+to that numeric uid/gid); --keep-privileges keeps them for the whole run.
 
 exit status: 0 success or signal shutdown, 1 runtime/I/O/expectation failure
 (including unreadable files, and `run` stopped by a fatal health or device
 event), 2 usage error or invalid config/scenario;
 `run` also: 3 shutdown deadline passed with TX frames still in the kernel,
-4 missing privilege or too small RLIMIT_MEMLOCK (nothing was acquired)
+4 missing privilege or too small RLIMIT_MEMLOCK, or a privilege drop that
+cannot work (nothing was acquired)
 ";
 
 /// Default `ruster run --stats-interval` in seconds.
@@ -48,6 +52,10 @@ pub const DEFAULT_TX_STALL_FATAL_SECS: u64 = 10;
 pub const DEFAULT_KICK_ERRORS_FATAL_SECS: u64 = 5;
 /// Largest accepted health threshold (one hour).
 pub const MAX_HEALTH_SECS: u64 = 3_600;
+
+/// Largest `--user`/`--group` id (`u32::MAX` means "unchanged" to the
+/// kernel's set-id calls).
+pub const MAX_ID: u32 = u32::MAX - 1;
 
 /// A numeric `run` option: name and accepted range.
 struct Numeric {
@@ -120,6 +128,13 @@ pub struct RunArgs {
     pub tx_stall_warn_secs: u64,
     pub tx_stall_fatal_secs: u64,
     pub kick_errors_fatal_secs: u64,
+    /// Keep every capability after startup instead of dropping them all
+    /// (the default drop is security relevant; this is the opt-out).
+    pub keep_privileges: bool,
+    /// Numeric uid and gid to switch to with the drop (`--user` and
+    /// `--group`, only together, never with `--keep-privileges`).
+    pub user: Option<u32>,
+    pub group: Option<u32>,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -147,6 +162,10 @@ pub enum UsageError {
     /// `--tx-stall-fatal-secs` is neither 0 nor at least
     /// `--tx-stall-warn-secs`.
     FatalBelowWarning,
+    /// `--user` without `--group` or the other way round.
+    IdentityIncomplete,
+    /// `--keep-privileges` with `--user`/`--group`.
+    KeepWithIdentity,
 }
 
 impl fmt::Display for UsageError {
@@ -159,6 +178,10 @@ impl fmt::Display for UsageError {
             Self::MissingOperand(name) => write!(formatter, "missing operand <{name}>"),
             Self::MissingValue(option) => write!(formatter, "option {option} requires a value"),
             Self::DuplicateOption(option) => write!(formatter, "option {option} given twice"),
+            Self::InvalidValue(option @ ("--user" | "--group")) => write!(
+                formatter,
+                "option {option} needs a numeric id from 1 to {MAX_ID}"
+            ),
             Self::InvalidValue(option) => match NUMERIC.iter().find(|n| n.name == *option) {
                 Some(n) if n.name == "--startup-attempts" => write!(
                     formatter,
@@ -175,6 +198,11 @@ impl fmt::Display for UsageError {
             Self::FatalBelowWarning => formatter.write_str(
                 "option --tx-stall-fatal-secs must be 0 or at least --tx-stall-warn-secs",
             ),
+            Self::IdentityIncomplete => {
+                formatter.write_str("options --user and --group must be given together")
+            }
+            Self::KeepWithIdentity => formatter
+                .write_str("option --keep-privileges cannot be combined with --user/--group"),
         }
     }
 }
@@ -276,6 +304,8 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut allow_kernel_ipv6 = false;
     let mut allow_ipv4_weak_host = false;
     let mut strict_config_perms = false;
+    let mut keep_privileges = false;
+    let mut ids: [Option<u32>; 2] = [None; 2];
     let mut numbers: [Option<u64>; NUMERIC.len()] = [None; NUMERIC.len()];
     let mut words = rest.iter();
     'words: while let Some(word) = words.next() {
@@ -285,6 +315,20 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
             }
             set_once(&mut config, value.into(), "--config")?;
             continue;
+        }
+        for (index, &name) in ID_OPTIONS.iter().enumerate() {
+            if let Some(value) = equals_value(word, &format!("{name}=")) {
+                set_id(&mut ids[index], name, &value)?;
+                continue 'words;
+            }
+            if word.to_str() == Some(name) {
+                let value = words
+                    .next()
+                    .filter(|value| !is_option(value))
+                    .ok_or(UsageError::MissingValue(name))?;
+                set_id(&mut ids[index], name, value)?;
+                continue 'words;
+            }
         }
         for (index, numeric) in NUMERIC.iter().enumerate() {
             let prefix = format!("{}=", numeric.name);
@@ -330,6 +374,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
             Some("--strict-config-perms") => {
                 flag(&mut strict_config_perms, "--strict-config-perms")?
             }
+            Some("--keep-privileges") => flag(&mut keep_privileges, "--keep-privileges")?,
             Some("--config") => {
                 let value = words
                     .next()
@@ -348,6 +393,13 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     if tx_stall_fatal_secs != 0 && tx_stall_fatal_secs < tx_stall_warn_secs {
         return Err(UsageError::FatalBelowWarning);
     }
+    let [user, group] = ids;
+    if user.is_some() != group.is_some() {
+        return Err(UsageError::IdentityIncomplete);
+    }
+    if keep_privileges && user.is_some() {
+        return Err(UsageError::KeepWithIdentity);
+    }
     Ok(Command::Run(RunArgs {
         config,
         allow_multi_queue,
@@ -362,7 +414,32 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         tx_stall_warn_secs,
         tx_stall_fatal_secs,
         kick_errors_fatal_secs: kicks.unwrap_or(DEFAULT_KICK_ERRORS_FATAL_SECS),
+        keep_privileges,
+        user,
+        group,
     }))
+}
+
+/// The identity options of `run`, in `ids` order.
+const ID_OPTIONS: [&str; 2] = ["--user", "--group"];
+
+/// A numeric uid/gid from 1 to [`MAX_ID`], ASCII digits only (no sign, no
+/// whitespace, at most 10 digits). Names are not resolved: a name lookup
+/// would need the C library's NSS.
+fn set_id(slot: &mut Option<u32>, name: &'static str, value: &OsStr) -> Result<(), UsageError> {
+    let id = value
+        .to_str()
+        .filter(|text| {
+            !text.is_empty() && text.len() <= 10 && text.bytes().all(|b| b.is_ascii_digit())
+        })
+        .and_then(|text| text.parse::<u64>().ok())
+        .filter(|id| (1..=u64::from(MAX_ID)).contains(id))
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or(UsageError::InvalidValue(name))?;
+    if slot.replace(id).is_some() {
+        return Err(UsageError::DuplicateOption(name));
+    }
+    Ok(())
 }
 
 /// A decimal number in the option's range, ASCII digits only (no sign,
@@ -600,7 +677,94 @@ mod tests {
             tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
             tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
             kick_errors_fatal_secs: DEFAULT_KICK_ERRORS_FATAL_SECS,
+            keep_privileges: false,
+            user: None,
+            group: None,
         })
+    }
+
+    #[test]
+    fn run_parses_the_privilege_options() {
+        let parsed = |words: &[&str]| match run(words) {
+            Ok(Command::Run(args)) => (args.keep_privileges, args.user, args.group),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parsed(&["run", "--config", "a"]), (false, None, None));
+        assert_eq!(
+            parsed(&["run", "--keep-privileges", "--config", "a"]),
+            (true, None, None)
+        );
+        assert_eq!(
+            parsed(&["run", "--user", "990", "--group=991", "--config", "a"]),
+            (false, Some(990), Some(991))
+        );
+        assert_eq!(
+            parsed(&["run", "--user=4294967294", "--group", "1", "--config", "a"]),
+            (false, Some(MAX_ID), Some(1))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--user", "990"]),
+            Err(UsageError::IdentityIncomplete)
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--group", "990"]),
+            Err(UsageError::IdentityIncomplete)
+        );
+        assert_eq!(
+            run(&[
+                "run",
+                "--config",
+                "a",
+                "--keep-privileges",
+                "--user=1",
+                "--group=1"
+            ]),
+            Err(UsageError::KeepWithIdentity)
+        );
+        assert_eq!(
+            run(&[
+                "run",
+                "--config",
+                "a",
+                "--keep-privileges",
+                "--keep-privileges"
+            ]),
+            Err(UsageError::DuplicateOption("--keep-privileges"))
+        );
+        assert_eq!(
+            run(&["run", "--config", "a", "--user=1", "--user=2", "--group=1"]),
+            Err(UsageError::DuplicateOption("--user"))
+        );
+        for bad in [
+            "",
+            "0",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "x",
+            "root",
+            "4294967295",
+            "99999999999",
+            "1.0",
+        ] {
+            for option in ["--user", "--group"] {
+                assert_eq!(
+                    run(&["run", "--config", "a", &format!("{option}={bad}")]),
+                    Err(UsageError::InvalidValue(option)),
+                    "{option}={bad}"
+                );
+            }
+        }
+        assert_eq!(
+            run(&["run", "--config", "a", "--user", "--group", "1"]),
+            Err(UsageError::MissingValue("--user"))
+        );
+        assert_eq!(
+            UsageError::InvalidValue("--user").to_string(),
+            "option --user needs a numeric id from 1 to 4294967294"
+        );
+        assert!(USAGE.contains("[--keep-privileges | --user <uid> --group <gid>]"));
     }
 
     #[test]
@@ -707,6 +871,9 @@ mod tests {
                 tx_stall_warn_secs: DEFAULT_TX_STALL_WARN_SECS,
                 tx_stall_fatal_secs: DEFAULT_TX_STALL_FATAL_SECS,
                 kick_errors_fatal_secs: DEFAULT_KICK_ERRORS_FATAL_SECS,
+                keep_privileges: false,
+                user: None,
+                group: None,
             }))
         };
         assert_eq!(

@@ -994,7 +994,57 @@ fn run_without_privileges_or_devices_fails_closed() {
         "{stderr}"
     );
     assert!(!stderr.contains("running generation"), "{stderr}");
+    // The output threads dropped their own privileges at spawn (open to
+    // any user) before the refusal went through them.
+    assert!(!stderr.contains("privilege-drop"), "{stderr}");
     assert!(output.stdout.is_empty());
+    // With an identity switch the refusal comes before the output threads
+    // (which switch at spawn) and names CAP_SETUID/CAP_SETGID too.
+    let output = ruster(&[
+        "run".as_ref(),
+        "--user".as_ref(),
+        "65534".as_ref(),
+        "--group".as_ref(),
+        "65534".as_ref(),
+        "--config".as_ref(),
+        config.as_os_str(),
+    ]);
+    let stderr = text(&output.stderr);
+    assert_eq!(status(&output), 4, "{stderr}");
+    assert!(
+        stderr.contains("startup failed: stage=privileges code=MISSING_CAPABILITIES missing=")
+            && stderr.contains("CAP_SETGID,CAP_SETUID,"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("--user/--group also need CAP_SETUID and CAP_SETGID"),
+        "{stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+/// `--keep-privileges` and `--user`/`--group` are usage errors together,
+/// and `--user` needs `--group` (exit 2 before the config is read).
+#[test]
+fn run_privilege_options_are_usage_errors_when_combined_wrongly() {
+    for args in [
+        &[
+            "run",
+            "--keep-privileges",
+            "--user=1",
+            "--group=1",
+            "--config",
+            "a.toml",
+        ][..],
+        &["run", "--user=1", "--config", "a.toml"][..],
+        &["run", "--group=1", "--config", "a.toml"][..],
+        &["run", "--user=root", "--group=1", "--config", "a.toml"][..],
+        &["run", "--user=0", "--group=0", "--config", "a.toml"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(status(&output), 2, "{args:?}");
+        assert!(text(&output.stderr).contains("usage:"), "{args:?}");
+    }
 }
 
 /// Waits at most `limit` for `child`, killing it on timeout.

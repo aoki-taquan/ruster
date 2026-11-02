@@ -74,8 +74,9 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
 - `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`と、M2 S10a/S10bの
   `run`（x86_64 LinuxのAF_XDP static router、下の「`ruster run`」）を提供し、SIGINT/SIGTERMは
   private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
-  flag。`run`のSIGHUPはreload flagへstoreするだけ）。`unsafe`はそのhandlerと`run`のrtnetlink
-  query（IPv4/IPv6のaddress dump、全tableのroute dump、link）だけです（下の「使い方」）。
+  flag。`run`のSIGHUPはreload flagへstoreするだけ）。`unsafe`はそのhandler、`run`のrtnetlink
+  query（IPv4/IPv6のaddress dump、全tableのroute dump、link）、起動後のprivilege drop
+  （threadごとの`prctl`/`capset`/`setresuid`等のraw syscall）だけです（下の「使い方」）。
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
@@ -593,6 +594,10 @@ cargo build --release -p ruster-cli
 sudo target/release/ruster run --config router.toml                # 既定: 60秒ごとにstats
 sudo target/release/ruster run --stats-interval 0 -- router.toml   # 周期statsなし
 sudo target/release/ruster run --startup-attempts 1 -- router.toml # 起動retryなし
+sudo target/release/ruster run -- router.toml                      # 既定のdrop
+# stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=unchanged
+sudo target/release/ruster run --user 990 --group 990 -- router.toml # 起動後にuid/gid 990へ切替
+# stderr: ruster run: privileges dropped: threads=3 capabilities=none bounding-set=cleared no-new-privs=1 identity=switched
 # stderr: ruster run: running generation 1 on 2 port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload
 sudo kill -HUP <pid>                                               # configをreload
 ```
@@ -601,7 +606,28 @@ sudo kill -HUP <pid>                                               # configをre
   （または`CAP_SYS_ADMIN`）、つまりrootか`setcap`/systemdの`AmbientCapabilities`です。
   `CAP_IPC_LOCK`が無ければsoft `RLIMIT_MEMLOCK`がport UMEMの合計（`mode = "auto"`は2倍、
   5.11前のkernelのBPF object分としてportごとに64 KiBを加算した下限）以上必要です（`ulimit -l`、systemdの`LimitMEMLOCK=`）。不足は何も取得せずexit 4で、不足した
-  capabilityまたは`limit-bytes`/`required-bytes`を表示します。起動後もprivilegeは落としません。
+  capabilityまたは`limit-bytes`/`required-bytes`を表示します。
+- privilege drop（H6、CLI-089〜CLI-095）: 権限が要るのは起動（socket、UMEM、XDP attach）だけなので、
+  generation 1をactivateした後・最初のtickの前に全threadの全capability（effective、permitted、
+  inheritable、ambient、`CAP_SETPCAP`があればbounding setも）を落とし、`no_new_privs`を立てます。
+  既定でonで、`--keep-privileges`で無効にできます（起動後も全capabilityを持ち続けるrisk付きの
+  opt-out）。`--user <uid> --group <gid>`（数値、両方そろえて）は同時にreal/effective/saved/fsの
+  uid/gidを切り替えsupplementary groupを消します（`CAP_SETUID`/`CAP_SETGID`が必要）。credentialは
+  threadごとなので、stdout/stderrのoutput threadはspawn時に自分で、router threadはactivate後に
+  自分でraw syscall（libcのprocess全体へのset-id broadcastは使わない）で落とし、最後に
+  `/proc/self/task/*/status`で全threadを確かめます。どれかが失敗すれば全portをrollbackして
+  `stage=privilege-drop`でexit 1（fail closed）。drop後もRX/TX kick、`XDP_STATISTICS`、link watch
+  （netlink dump）、SIGHUP reload、health/device eventのfatal、drain、detachは権限なしで動きます
+  （privileged smokeで確認）。teardownのXSKMAP entry削除はLinux 6.5以上（または
+  `kernel.unprivileged_bpf_disabled=0`）でないと権限が要るため、それ以外では起動前に
+  `TEARDOWN_NEEDS_CAPABILITIES`でexit 4です（挙動変更: Ubuntu 22.04やRHEL 9既定のkernelでは
+  変更していないunitがexit 4になり`Restart=on-failure`でloopするので`--keep-privileges`が要る。
+  vendor backportは検出せずfail closed）。processはdrop時からdumpable 0（core dumpなし、
+  `ptrace`には`CAP_SYS_PTRACE`）。drop後のrootは`CAP_DAC_OVERRIDE`を持たないので、
+  reloadするconfigは通常のpermissionで読める必要があります（推奨: `/etc/ruster`を
+  `root:<group> 0750`、configを`root:<group> 0640`。rootはownerとして、切替後のuserはgroupで読め、
+  `--strict-config-perms`も受理）。statsは`privileges.state=dropped|kept`
+  等。詳細はrunbookの「Privilege drop」。
 - portの前提（起動時に確認）: deviceのRX queueは1つ（rtnetlinkの`IFLA_NUM_RX_QUEUES`で数えるので
   namespaceに正しいが、driverが確保したqueue数。`ethtool -L <dev> combined 1`しても確保数が多い
   NICやRSS/ntupleで全trafficをbind queueへ寄せたなら`--allow-multi-queue`、他queueのframeは
@@ -713,9 +739,10 @@ sudo kill -HUP <pid>                                               # configをre
 - exit status: `0` clean shutdown（起動中のsignalでrollbackした場合も）、`1`起動失敗、backend
   fault、fatal health/device event、drain失敗、drain後に残ったTX handoff、close error、
   `2` usage/invalid config、`3`停止期限（または二回目のsignal）で
-  TX frameがkernelに残った（detach/closeは済み）、`4`権限/memlock不足。reloadの拒否・失敗では
-  終了しません。
-- privilege drop、socket fdの`poll`待機、multi-queue、systemd notify、SIGUSR1 statsはdeferred
+  TX frameがkernelに残った（detach/closeは済み）、`4`権限/memlock不足（`--user`/`--group`の
+  `CAP_SETUID`/`CAP_SETGID`不足、drop後のteardownに権限が要るkernelを含む）。privilege dropの
+  失敗は`1`。reloadの拒否・失敗では終了しません。
+- socket fdの`poll`待機、multi-queue、systemd notify、SIGUSR1 stats、seccompはdeferred
   （requirements CLI-034、runbookの「Known limits」）。
 
 ### packet backend（`[backend]`）
@@ -811,6 +838,11 @@ processとして起動します。host Aからhost BへのUDPがrouterのARP、N
 SIGTERMでexit 0・XDP detach・final stats、二つ目のportのopen/attach失敗でexit 1と一つ目のportの
 detach（外部programは不変）、2-queue device・kernel IPv4 address・kernel routeの拒否、SIGKILL後の
 auto-detachと再起動（transientなBusy/MemlockLimitはrouter自身もretryし、test側もbounded retry）、
+H6のprivilege drop（全phaseが既定のdropで動き、forward phaseで全threadの`CapInh`/`CapPrm`/`CapEff`/
+`CapAmb`/`CapBnd`が0で`NoNewPrivs`が1、ops/icmp phaseは`--user`/`--group`で実行userへ切り替えて
+全threadのuid/gidとsupplementary groupなしを確認した上でreload・link down/up・MTU fatalを行い、
+privileges phaseでdrop後のrootが他userの0700 directoryのconfigをreloadできない
+（`PERMISSION_DENIED`）こと、`--keep-privileges`ではcapabilityが残り同じreloadが通ることを確認）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの
