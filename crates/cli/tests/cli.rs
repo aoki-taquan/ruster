@@ -1008,13 +1008,13 @@ fn run_exits_in_bounded_time_with_an_undrained_stdout() {
 }
 
 /// H3: `validate` and `run` apply the production limits to an af-xdp
-/// document (every table at the per-table limit, above the simulator's
-/// byte budget), `validate` of the same document with a sim backend the
-/// simulator's; one slot above the limit is exit 2 with a value-free code
-/// and path. `run` of the maximal document gets past validation and
-/// storage allocation to the privilege preflight (exit 4) when
-/// unprivileged; with `CAP_NET_ADMIN` that half is skipped (no live
-/// startup in the caller's namespace).
+/// document: every table at its production limit is accepted; one slot
+/// above (a scanned resolution table at 4097, which the simulator's limits
+/// still accept as a sim document, and a firewall table at 65537) is exit 2
+/// with a value-free code and path from both. `run` of the maximal document
+/// gets past validation and storage allocation to the privilege preflight
+/// (exit 4) when unprivileged; with `CAP_NET_ADMIN` that half is skipped
+/// (no live startup in the caller's namespace).
 #[test]
 fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     let dir = scratch();
@@ -1025,41 +1025,54 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     let ok = ruster(&["validate".as_ref(), max.as_os_str()]);
     assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
     assert!(
-        text(&ok.stdout).contains(" storage-bytes=116654016 backend=af-xdp "),
+        text(&ok.stdout).contains(" storage-bytes=35061696 backend=af-xdp "),
         "{}",
         text(&ok.stdout)
     );
 
-    let sim = dir.join("router-sim-max.toml");
-    let at = maximal.find("\n[backend]\n").expect("backend");
-    fs::write(&sim, &maximal[..=at]).unwrap();
-    let refused = ruster(&["validate".as_ref(), sim.as_os_str()]);
-    assert_eq!(status(&refused), 2);
-    assert_eq!(
-        text(&refused.stderr),
-        "ruster: invalid config: stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED \
-         limit=67108864 actual=116654016\n"
-    );
-
-    let above = dir.join("router-production-above.toml");
-    fs::write(
-        &above,
-        maximal.replacen(
+    let sim_backend = |document: &str| {
+        let at = document.find("\n[backend]\n").expect("backend");
+        document[..=at].to_owned()
+    };
+    for (from, to, path, limit) in [
+        (
+            "dynamic-neighbors = 4096\n",
+            "dynamic-neighbors = 4097\n",
+            "resolution.capacity.dynamic-neighbors",
+            4096,
+        ),
+        (
             "[firewall.capacity]\nstates = 65536\n",
             "[firewall.capacity]\nstates = 65537\n",
-            1,
+            "firewall.capacity.states",
+            65536,
         ),
-    )
-    .unwrap();
-    let expected = "ruster: invalid config: stage=validate code=CAPACITY_LIMIT_EXCEEDED \
-                    path=firewall.capacity.states limit=65536 actual=65537\n";
-    let refused = ruster(&["validate".as_ref(), above.as_os_str()]);
-    assert_eq!(status(&refused), 2);
-    assert_eq!(text(&refused.stderr), expected);
-    let refused = ruster(&["run".as_ref(), "--config".as_ref(), above.as_os_str()]);
-    assert_eq!(status(&refused), 2);
-    assert_eq!(text(&refused.stderr), expected);
-    assert!(refused.stdout.is_empty());
+    ] {
+        assert!(maximal.contains(from), "{from}");
+        let document = maximal.replacen(from, to, 1);
+        let above = dir.join("router-production-above.toml");
+        fs::write(&above, &document).unwrap();
+        let expected = format!(
+            "ruster: invalid config: stage=validate code=CAPACITY_LIMIT_EXCEEDED \
+             path={path} limit={limit} actual={}\n",
+            limit + 1
+        );
+        let refused = ruster(&["validate".as_ref(), above.as_os_str()]);
+        assert_eq!(status(&refused), 2);
+        assert_eq!(text(&refused.stderr), expected);
+        let refused = ruster(&["run".as_ref(), "--config".as_ref(), above.as_os_str()]);
+        assert_eq!(status(&refused), 2);
+        assert_eq!(text(&refused.stderr), expected);
+        assert!(refused.stdout.is_empty());
+        let sim = dir.join("router-sim-above.toml");
+        fs::write(&sim, sim_backend(&document)).unwrap();
+        let as_sim = ruster(&["validate".as_ref(), sim.as_os_str()]);
+        if limit == 4096 {
+            assert_eq!(status(&as_sim), 0, "{}", text(&as_sim.stderr));
+        } else {
+            assert_eq!(text(&as_sim.stderr), expected);
+        }
+    }
 
     if holds_net_admin() {
         eprintln!("skipped run of the maximal config: CAP_NET_ADMIN held");

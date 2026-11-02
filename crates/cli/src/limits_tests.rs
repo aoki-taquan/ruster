@@ -7,63 +7,105 @@ use ruster_config::{
 };
 use ruster_sim_scenario::SIM_VALIDATION_LIMITS;
 
-use crate::config_cmd::{limits_for, load_bytes, plan_with, validate_bytes, validate_loaded};
+use crate::config_cmd::{
+    limits_for, load_bytes, load_validated_regular, plan_with, validate_bytes, validate_loaded,
+    LoadError,
+};
 
-/// Every table at the production per-table limit (fixture header).
+/// Every table at its production limit (fixture header).
 pub const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-max.toml");
 
-/// Runtime storage of [`MAXIMAL`] in bytes (111.25 MiB).
-pub const MAXIMAL_STORAGE_BYTES: u64 = 116_654_016;
+/// Runtime storage of [`MAXIMAL`] in bytes (33.44 MiB).
+pub const MAXIMAL_STORAGE_BYTES: u64 = 35_061_696;
 
-/// Every operator-sized runtime table: TOML section, key, schema path.
-pub const CAPACITY_FIELDS: [(&str, &str, &str); 11] = [
+/// Which production bound a table has.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Bound {
+    /// A per-packet path scans it: `max_scanned_slots_per_table`.
+    Scanned,
+    /// NAT44 and firewall: `max_slots_per_table`.
+    Table,
+}
+
+impl Bound {
+    /// The production limit of this kind of table.
+    pub const fn production(self) -> u32 {
+        match self {
+            Self::Scanned => PRODUCTION_VALIDATION_LIMITS.max_scanned_slots_per_table,
+            Self::Table => PRODUCTION_VALIDATION_LIMITS.max_slots_per_table,
+        }
+    }
+}
+
+/// Every operator-sized runtime table: TOML section, key, schema path,
+/// and its production bound.
+pub const CAPACITY_FIELDS: [(&str, &str, &str, Bound); 11] = [
     (
         "resolution.capacity",
         "states",
         "resolution.capacity.states",
+        Bound::Scanned,
     ),
     (
         "resolution.capacity",
         "actions",
         "resolution.capacity.actions",
+        Bound::Scanned,
     ),
     (
         "resolution.capacity",
         "dynamic-neighbors",
         "resolution.capacity.dynamic-neighbors",
+        Bound::Scanned,
     ),
     (
         "resolution.capacity",
         "failure-holds",
         "resolution.capacity.failure-holds",
+        Bound::Scanned,
     ),
     (
         "icmpv4-errors.capacity",
         "states",
         "icmpv4-errors.capacity.states",
+        Bound::Scanned,
     ),
     (
         "icmpv4-errors.capacity",
         "actions",
         "icmpv4-errors.capacity.actions",
+        Bound::Scanned,
     ),
     (
         "nat44.udp.capacity",
         "mappings",
         "nat44.udp.capacity.mappings",
+        Bound::Table,
     ),
-    ("nat44.udp.capacity", "peers", "nat44.udp.capacity.peers"),
+    (
+        "nat44.udp.capacity",
+        "peers",
+        "nat44.udp.capacity.peers",
+        Bound::Table,
+    ),
     (
         "nat44.tcp.capacity",
         "mappings",
         "nat44.tcp.capacity.mappings",
+        Bound::Table,
     ),
     (
         "nat44.tcp.capacity",
         "sessions",
         "nat44.tcp.capacity.sessions",
+        Bound::Table,
     ),
-    ("firewall.capacity", "states", "firewall.capacity.states"),
+    (
+        "firewall.capacity",
+        "states",
+        "firewall.capacity.states",
+        Bound::Table,
+    ),
 ];
 
 /// `text` with the first `key = ...` line after `[section]` set to `value`.
@@ -82,6 +124,15 @@ pub fn as_sim(text: &str) -> String {
     text[..=at].to_owned()
 }
 
+/// The refusal line of one slot above `limit` at `path`.
+pub fn above_line(path: &str, limit: u32) -> String {
+    format!(
+        "ruster: invalid config: stage=validate code=CAPACITY_LIMIT_EXCEEDED \
+         path={path} limit={limit} actual={}\n",
+        limit + 1
+    )
+}
+
 /// The limits each command applies. A change here is a change of what
 /// `ruster run` (or `run-sim`) accepts: update the runbook table too.
 #[test]
@@ -90,6 +141,7 @@ fn the_limits_table_is_pinned() {
         SIM_VALIDATION_LIMITS,
         ValidationLimits {
             max_slots_per_table: 65_536,
+            max_scanned_slots_per_table: 65_536,
             max_runtime_bytes: 64 << 20,
         }
     );
@@ -97,7 +149,8 @@ fn the_limits_table_is_pinned() {
         PRODUCTION_VALIDATION_LIMITS,
         ValidationLimits {
             max_slots_per_table: 65_536,
-            max_runtime_bytes: 128 << 20,
+            max_scanned_slots_per_table: 4_096,
+            max_runtime_bytes: 64 << 20,
         }
     );
     // Schema bounds of the parse stage, the same for every backend.
@@ -113,12 +166,10 @@ fn the_limits_table_is_pinned() {
         ),
         (1 << 20, 256, 1_024, 4_096, 4_096, 4_096, 256)
     );
-    // Every table at the production slot limit fits the production byte
-    // budget, so the per-table limit is the one that binds; the same
-    // document is above the simulator's budget.
+    // Every table at its production limit fits the production byte budget,
+    // so the per-table limits are the ones that bind.
     let max = usize::try_from(MAXIMAL_STORAGE_BYTES).expect("fits");
     assert!(max <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
-    assert!(max > SIM_VALIDATION_LIMITS.max_runtime_bytes);
 }
 
 #[test]
@@ -145,88 +196,141 @@ fn validate_text(text: &str) -> (u8, String, String) {
     )
 }
 
-/// `validate` of an af-xdp document applies the production limits: every
-/// table at the limit is accepted, the same document with a sim backend
-/// is refused by the simulator's byte budget.
+/// `validate` accepts every table at its production limit, as af-xdp and
+/// as sim (the simulator's limits are at least as wide).
 #[test]
-fn validate_accepts_the_maximal_af_xdp_config_and_refuses_it_as_sim() {
-    let (status, out, err) = validate_text(MAXIMAL);
-    assert_eq!(status, 0, "{err}");
-    assert!(
-        out.contains(&format!(
-            " storage-bytes={MAXIMAL_STORAGE_BYTES} backend=af-xdp "
-        )),
-        "{out}"
-    );
-    let (status, out, err) = validate_text(&as_sim(MAXIMAL));
-    assert_eq!(status, crate::EXIT_INVALID);
-    assert!(out.is_empty());
-    assert_eq!(
-        err,
-        format!(
-            "ruster: invalid config: stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED \
-             limit={} actual={MAXIMAL_STORAGE_BYTES}\n",
-            SIM_VALIDATION_LIMITS.max_runtime_bytes
-        )
-    );
+fn validate_accepts_the_maximal_production_config() {
+    for text in [MAXIMAL.to_owned(), as_sim(MAXIMAL)] {
+        let (status, out, err) = validate_text(&text);
+        assert_eq!(status, 0, "{err}");
+        assert!(
+            out.contains(&format!(" storage-bytes={MAXIMAL_STORAGE_BYTES} backend=")),
+            "{out}"
+        );
+    }
 }
 
-/// One slot above the per-table limit, for every table, is a typed,
-/// value-free refusal with the schema path; at the limit it is accepted
-/// (every table of [`MAXIMAL`] is at the limit).
+/// For every table: at its production limit accepted (every table of
+/// [`MAXIMAL`] is), one slot above refused with a typed, value-free line
+/// and exit 2, by `validate` and by the loader `ruster run` uses. A scanned
+/// table above the production limit is still within the simulator's, so
+/// the same document with a sim backend is accepted: `validate` (and
+/// `run`) of af-xdp must not fall back to the sim limits.
 #[test]
 fn validate_refuses_each_table_one_slot_above_the_production_limit() {
-    let limit = PRODUCTION_VALIDATION_LIMITS.max_slots_per_table;
-    for (section, key, path) in CAPACITY_FIELDS {
+    for (section, key, path, bound) in CAPACITY_FIELDS {
+        let limit = bound.production();
         let at = with_capacity(MAXIMAL, section, key, limit);
         assert_eq!(at, MAXIMAL, "{path} is at the limit in the fixture");
         let above = with_capacity(MAXIMAL, section, key, limit + 1);
         let (status, out, err) = validate_text(&above);
         assert_eq!(status, crate::EXIT_INVALID, "{path}");
         assert!(out.is_empty());
-        assert_eq!(
-            err,
-            format!(
-                "ruster: invalid config: stage=validate code=CAPACITY_LIMIT_EXCEEDED \
-                 path={path} limit={limit} actual={}\n",
-                limit + 1
-            )
-        );
-        // The loader `ruster run` uses gives the same refusal.
+        assert_eq!(err, above_line(path, limit));
         let Err(error) = validate_bytes(above.as_bytes()) else {
             panic!("{path} above the limit is refused");
         };
         assert_eq!(format!("ruster: invalid config: {}\n", error.render()), err);
+        let (status, _, err) = validate_text(&as_sim(&above));
+        match bound {
+            Bound::Scanned => assert_eq!(status, 0, "{path} as sim: {err}"),
+            Bound::Table => assert_eq!(err, above_line(path, limit), "{path} as sim"),
+        }
     }
+    // The simulator's own bound for the scanned tables is unchanged.
+    let sim = with_capacity(
+        &as_sim(MAXIMAL),
+        "resolution.capacity",
+        "dynamic-neighbors",
+        SIM_VALIDATION_LIMITS.max_scanned_slots_per_table + 1,
+    );
+    let (status, _, err) = validate_text(&sim);
+    assert_eq!(status, crate::EXIT_INVALID);
+    assert_eq!(
+        err,
+        above_line(
+            "resolution.capacity.dynamic-neighbors",
+            SIM_VALIDATION_LIMITS.max_scanned_slots_per_table
+        )
+    );
 }
 
 /// `plan` loads both sides with the limits of their own backend.
 #[test]
 fn plan_loads_each_side_with_its_backend_limits() {
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let status = plan_with(
-        load_bytes,
-        MAXIMAL.as_bytes(),
-        MAXIMAL.as_bytes(),
-        &mut out,
-        &mut err,
-    );
-    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&err));
-    assert!(String::from_utf8(out)
-        .expect("utf-8")
-        .starts_with("plan: reloadable\nrestart-required: none\nchanges: 0\n"));
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let status = plan_with(
-        load_bytes,
-        as_sim(MAXIMAL).as_bytes(),
-        MAXIMAL.as_bytes(),
-        &mut out,
-        &mut err,
-    );
+    let plan = |current: &str, next: &str| {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let status = plan_with(
+            load_bytes,
+            current.as_bytes(),
+            next.as_bytes(),
+            &mut out,
+            &mut err,
+        );
+        (
+            status,
+            String::from_utf8(out).expect("utf-8"),
+            String::from_utf8(err).expect("utf-8"),
+        )
+    };
+    let (status, out, err) = plan(MAXIMAL, MAXIMAL);
+    assert_eq!(status, 0, "{err}");
+    assert!(out.starts_with("plan: reloadable\nrestart-required: none\nchanges: 0\n"));
+    let wide = |text: &str| {
+        with_capacity(
+            text,
+            "resolution.capacity",
+            "dynamic-neighbors",
+            Bound::Scanned.production() + 1,
+        )
+    };
+    // A sim current side may use the simulator's wider bound...
+    let (status, _, err) = plan(&wide(&as_sim(MAXIMAL)), MAXIMAL);
+    assert_eq!(status, 0, "{err}");
+    // ...an af-xdp next side may not.
+    let (status, _, err) = plan(MAXIMAL, &wide(MAXIMAL));
     assert_eq!(status, crate::EXIT_INVALID);
-    assert!(String::from_utf8(err).expect("utf-8").starts_with(
-        "ruster: invalid current config: stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED"
-    ));
+    assert_eq!(
+        err,
+        above_line(
+            "resolution.capacity.dynamic-neighbors",
+            Bound::Scanned.production()
+        )
+        .replace("invalid config", "invalid next config")
+    );
+}
+
+/// The file loader of `ruster run` (startup and reload) applies the
+/// production limits to a file on disk.
+#[test]
+fn the_run_file_loader_applies_the_production_limits() {
+    let dir = std::env::temp_dir().join(format!("ruster-h3-limits-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let at = dir.join("at.toml");
+    let above = dir.join("above.toml");
+    std::fs::write(&at, MAXIMAL).expect("write");
+    let limit = Bound::Scanned.production();
+    std::fs::write(
+        &above,
+        with_capacity(MAXIMAL, "icmpv4-errors.capacity", "states", limit + 1),
+    )
+    .expect("write");
+    let loaded = load_validated_regular(&at, false);
+    let rejected = load_validated_regular(&above, false);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+    let Ok(config) = loaded else {
+        panic!("the maximal file loads");
+    };
+    assert_eq!(
+        u64::try_from(config.storage_shape().required_bytes).expect("fits"),
+        MAXIMAL_STORAGE_BYTES
+    );
+    let Err(error @ LoadError::Rejected(_)) = rejected else {
+        panic!("one slot above is refused");
+    };
+    assert_eq!(
+        format!("ruster: invalid config: {}\n", error.render()),
+        above_line("icmpv4-errors.capacity.states", limit)
+    );
 }

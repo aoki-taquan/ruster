@@ -32,6 +32,10 @@ pub struct ValidationLimits {
     /// Largest slot count of any one runtime table, directory bucket array,
     /// or NAT44 port owner table (`CAPACITY_LIMIT_EXCEEDED`).
     pub max_slots_per_table: u32,
+    /// Largest slot count of a table that a per-packet path scans linearly
+    /// (`CAPACITY_LIMIT_EXCEEDED`; also bounded by `max_slots_per_table`):
+    /// `resolution.capacity.*` and `icmpv4-errors.capacity.*`.
+    pub max_scanned_slots_per_table: u32,
     /// Largest preallocated runtime storage in bytes, summed over every
     /// table (`RUNTIME_STORAGE_BYTES_EXCEEDED`).
     pub max_runtime_bytes: usize,
@@ -39,27 +43,36 @@ pub struct ValidationLimits {
 
 /// Storage bounds of a production router (`ruster run`, and `ruster
 /// validate`/`plan` of a document whose `backend.kind` is `af-xdp`).
+/// Coordinator defaults, not owner decisions (H3).
 ///
-/// - `max_slots_per_table` = 2^16. Every runtime table has a per-packet
-///   path whose worst case is linear in its capacity (dynamic-neighbor
-///   and resolution lookups scan, NAT44 slot reuse scans from slot 0, the
-///   firewall's open-addressing probe walks a full table, NAT44 port
-///   selection walks the pool), so this bound is a per-packet CPU bound,
-///   not a memory one: at most 65536 slot checks per table per packet. It
-///   also equals the largest NAT44 port pool (1..=65535 is 65535 owners),
-///   so mappings above it could never get a public port of their own.
-///   Kept equal to the simulator's bound; raising it needs indexed slot
-///   reuse first (coordinator default, not an owner decision).
-/// - `max_runtime_bytes` = 128 MiB. Every table at the slot limit (with
-///   the widest port pool) needs 116654016 bytes (111.25 MiB) with the
-///   current slot sizes, so every document within the per-table bound is
-///   accepted and this bound only fails closed if a slot type grows. The
-///   storage is ordinary heap (not memlocked), allocated once at startup,
-///   and is at most one eighth of the largest UMEM
-///   ([`MAX_AF_XDP_UMEM_BYTES`], memlocked).
+/// - `max_scanned_slots_per_table` = 4096 (2^12) for the resolution
+///   tables (states, actions, dynamic neighbors, failure holds) and the
+///   ICMPv4 error tables (states, actions). Their per-packet paths scan
+///   the whole table on a miss: a dynamic-neighbor miss reads every
+///   dynamic-neighbor slot (24 bytes each: 96 KiB at 4096, 1.5 MiB at
+///   65536), resolution scheduling scans the states (56 bytes: 224 KiB vs
+///   3.5 MiB) and walks the failure holds, an ICMPv4 error scans its states
+///   (keyed by egress interface, so more than [`crate::MAX_INTERFACES`] are
+///   never used). 4096 equals [`crate::MAX_NEIGHBORS`] (a /20 of on-link
+///   hosts) and cuts the worst case per miss 16-fold. The action queues
+///   are O(1) per packet but each queued action comes from a state (an
+///   ICMPv4 state queues at most one), so they get the same bound. Raising
+///   it needs keyed indexes for these tables (H4).
+/// - `max_slots_per_table` = 2^16 for the NAT44 and firewall tables (home
+///   NAT needs many sessions). NAT44 slot reuse scans from slot 0 on every
+///   new mapping, peer, or session, O(live entries), and port selection
+///   walks the pool (H4); the firewall probe is keyed SipHash with
+///   occupancy capped near 75%, so only its amortized expiry sweep is
+///   linear. 2^16 also equals the largest NAT44 port pool (1..=65535).
+/// - `max_runtime_bytes` = 64 MiB, the simulator's value. Every table at its
+///   limit (with the widest port pool) needs 35061696 bytes (33.44 MiB)
+///   with the current slot sizes, so the per-table limits bind and this
+///   bound only fails closed if a slot type grows. The storage is ordinary
+///   heap (not memlocked), allocated once at startup.
 pub const PRODUCTION_VALIDATION_LIMITS: ValidationLimits = ValidationLimits {
     max_slots_per_table: 1 << 16,
-    max_runtime_bytes: 128 << 20,
+    max_scanned_slots_per_table: 1 << 12,
+    max_runtime_bytes: 64 << 20,
 };
 
 /// Stable, value-free semantic rejection reason.
@@ -1906,7 +1919,7 @@ fn build_storage_shape(
                 ("dynamic-neighbors", capacity.dynamic_neighbors),
                 ("failure-holds", capacity.failure_holds),
             ] {
-                check_slots(value, limits, path(&["resolution", "capacity", field]))?;
+                check_scanned_slots(value, limits, path(&["resolution", "capacity", field]))?;
             }
             add_bytes::<ResolutionStateSlot>(
                 &mut bytes,
@@ -1940,7 +1953,7 @@ fn build_storage_shape(
         .icmp
         .map(|capacity| {
             for (field, value) in [("states", capacity.states), ("actions", capacity.actions)] {
-                check_slots(value, limits, path(&["icmpv4-errors", "capacity", field]))?;
+                check_scanned_slots(value, limits, path(&["icmpv4-errors", "capacity", field]))?;
             }
             add_bytes::<Icmpv4ErrorStateSlot>(
                 &mut bytes,
@@ -2114,6 +2127,24 @@ fn check_slots(
     usize::try_from(slots)
         .map(|_| ())
         .map_err(|_| ValidationError::new(ValidationCode::CapacityNotRepresentable, path))
+}
+
+/// [`check_slots`], then the bound of a table a per-packet path scans.
+fn check_scanned_slots(
+    slots: u32,
+    limits: ValidationLimits,
+    path: SourcePath,
+) -> Result<(), ValidationError> {
+    check_slots(slots, limits, path.clone())?;
+    if slots > limits.max_scanned_slots_per_table {
+        return Err(ValidationError::bounded(
+            ValidationCode::CapacityLimitExceeded,
+            path,
+            u64::from(limits.max_scanned_slots_per_table),
+            u64::from(slots),
+        ));
+    }
+    Ok(())
 }
 
 fn add_directory_bytes(bytes: &mut usize, buckets: u32, nodes: u32) -> Result<(), ValidationError> {

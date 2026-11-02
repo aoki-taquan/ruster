@@ -66,18 +66,19 @@ static GLOBAL: CountingAllocator = CountingAllocator;
 
 const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-max.toml");
 
-/// Every table at the production per-table limit, the port pool at its
+/// Every table at its production limit, the port pool at its
 /// widest, computed from the slot types `FullServiceStorage` allocates.
 fn worst_case_bytes() -> usize {
     let slots = PRODUCTION_VALIDATION_LIMITS.max_slots_per_table as usize;
+    let scanned = PRODUCTION_VALIDATION_LIMITS.max_scanned_slots_per_table as usize;
     let ports = 65_535;
     let directory = size_of::<DirectoryBucket>() + size_of::<DirectoryNode>();
-    let resolution = slots
+    let resolution = scanned
         * (size_of::<ResolutionStateSlot>()
             + size_of::<ResolutionActionSlot>()
             + size_of::<DynamicNeighborSlot>()
             + size_of::<ResolutionFailureHoldSlot>());
-    let icmpv4 = slots * (size_of::<Icmpv4ErrorStateSlot>() + size_of::<Icmpv4ErrorActionSlot>());
+    let icmpv4 = scanned * (size_of::<Icmpv4ErrorStateSlot>() + size_of::<Icmpv4ErrorActionSlot>());
     let udp = slots * (size_of::<Nat44UdpMappingSlot>() + size_of::<Nat44UdpPeerSlot>())
         + 2 * slots * directory
         + ports * size_of::<PortOwnerSlot>();
@@ -92,7 +93,7 @@ fn worst_case_bytes() -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 116_654_016;
+    const WORST_CASE: usize = 35_061_696;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 
