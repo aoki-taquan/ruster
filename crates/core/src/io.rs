@@ -236,11 +236,21 @@ pub enum ConsumeReason {
     /// Valid local IPv4 traffic that this deliberately small control plane
     /// does not implement. It must not fall through to router forwarding.
     Ipv4LocalUnsupported,
+    /// A forwarded DF-clear IPv4 datagram above its egress MTU, after every
+    /// forwarding, NAT, and firewall decision committed, was copied into a
+    /// core fragmentation slot; its fragments (RFC 791 §3.2) are sent as
+    /// generated frames in the same tick and the received frame is
+    /// recycled (MTU2 part B).
+    Ipv4Fragmented,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 2] = [Self::ArpControl, Self::Ipv4LocalUnsupported];
+    pub const ALL: [Self; 3] = [
+        Self::ArpControl,
+        Self::Ipv4LocalUnsupported,
+        Self::Ipv4Fragmented,
+    ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
     /// variant fails to compile until it is indexed and listed.
@@ -249,6 +259,7 @@ impl ConsumeReason {
         match self {
             Self::ArpControl => 0,
             Self::Ipv4LocalUnsupported => 1,
+            Self::Ipv4Fragmented => 2,
         }
     }
 
@@ -257,6 +268,7 @@ impl ConsumeReason {
         match self {
             Self::ArpControl => "ARP_CONTROL",
             Self::Ipv4LocalUnsupported => "IPV4_LOCAL_UNSUPPORTED",
+            Self::Ipv4Fragmented => "IPV4_FRAGMENTED",
         }
     }
 }
@@ -413,7 +425,10 @@ mod tests {
             .collect();
         assert_eq!(declared, listed);
         let codes: Vec<&str> = ConsumeReason::ALL.iter().map(|r| r.code()).collect();
-        assert_eq!(codes, ["ARP_CONTROL", "IPV4_LOCAL_UNSUPPORTED"]);
+        assert_eq!(
+            codes,
+            ["ARP_CONTROL", "IPV4_LOCAL_UNSUPPORTED", "IPV4_FRAGMENTED"]
+        );
     }
 
     struct UnclassifiedBackend;

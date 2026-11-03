@@ -1,5 +1,5 @@
 use super::*;
-use crate::{GeneratedArpFailure, GeneratedPhaseReport};
+use crate::{GeneratedArpFailure, GeneratedFragmentsStop, GeneratedPhaseReport};
 use ruster_core::{
     BatchCompletion, BatchReport, ResolutionFailureDispatchReport, ResolutionTimerError,
     ResolutionTimerReport,
@@ -63,7 +63,8 @@ fn consume_reason_counters_cover_every_core_reason() {
     }
     assert_eq!(counters.count(ConsumeReason::ArpControl), 1);
     assert_eq!(counters.count(ConsumeReason::Ipv4LocalUnsupported), 2);
-    assert_eq!(counters.total(), 3);
+    assert_eq!(counters.count(ConsumeReason::Ipv4Fragmented), 3);
+    assert_eq!(counters.total(), 6);
     let mut visited = Collect::default();
     ConsumeReasonCounters::default().visit_fields(&mut visited);
     let expected: Vec<_> = ConsumeReason::ALL
@@ -202,6 +203,7 @@ fn rx_report(rx: RxPhaseReport<()>) -> Report {
         publication: PublicationOutcome::Unchanged,
         active: true,
         rx,
+        generated_fragments: generated(GeneratedFragmentsStop::QueueEmpty),
         resolution_timers: PhaseReport::Completed(ResolutionTimerReport::default()),
         failure_dispatch: PhaseReport::Completed(ResolutionFailureDispatchReport::default()),
         generated_arp: generated(GeneratedArpStop::QueueEmpty),

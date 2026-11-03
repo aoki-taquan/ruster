@@ -94,7 +94,7 @@ fn validate_reports_summary_or_typed_diagnostics_with_exit_status() {
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=56480 backend=sim\n"
+         storage-bytes=303008 backend=sim\n"
     );
     assert!(ok.stderr.is_empty());
 
@@ -1183,7 +1183,7 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=56480 backend=af-xdp ports=2 umem-bytes=20971520\n"
+         storage-bytes=303008 backend=af-xdp ports=2 umem-bytes=20971520\n"
     );
 
     let current = fixtures().join("router-v1.toml");
@@ -1456,7 +1456,7 @@ fn validate_and_run_apply_the_production_limits_to_af_xdp() {
     let ok = ruster(&["validate".as_ref(), max.as_os_str()]);
     assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
     assert!(
-        text(&ok.stdout).contains(" storage-bytes=57098432 backend=af-xdp "),
+        text(&ok.stdout).contains(" storage-bytes=61042880 backend=af-xdp "),
         "{}",
         text(&ok.stdout)
     );

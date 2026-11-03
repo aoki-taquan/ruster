@@ -192,6 +192,12 @@ destination = "0.0.0.0/0"
 protocol = "icmp"
 action = "allow-stateful"
 
+# MTU2 part B: this scenario keeps the hardening switch off, so a DF-clear
+# datagram above the egress MTU stays IPV4_FRAGMENTATION_REQUIRED (step 4;
+# fixtures/mtu2b fragments it).
+[fragmentation]
+enabled = false
+
 [tick]
 rx = 32
 resolution-timer-scans = 16

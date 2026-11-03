@@ -30,6 +30,9 @@ pub struct ConfigV1 {
     pub nat44: Option<Nat44V1>,
     pub firewall: Option<FirewallV1>,
     pub tick: Option<TickBudgetV1>,
+    /// IPv4 fragmentation of forwarded DF-clear datagrams (MTU2 part B);
+    /// absent means [`FragmentationV1::default`] (on, RFC 1812 §4.2.2.7).
+    pub fragmentation: Option<FragmentationV1>,
     /// Packet backend; absent means [`BackendKindV1::Sim`].
     pub backend: Option<BackendV1>,
 }
@@ -85,6 +88,58 @@ pub struct Ipv4OriginV1 {
 
 const fn enabled() -> bool {
     true
+}
+
+/// Default `[fragmentation] datagrams`: DF-clear datagrams one tick can
+/// fragment. A full RX batch of such datagrams fits when it is at least
+/// `[tick] rx`; each slot holds one datagram of the largest interface MTU.
+pub const DEFAULT_FRAGMENTATION_DATAGRAMS: u32 = 64;
+
+/// Largest `[fragmentation] datagrams` (`CAPACITY_LIMIT_EXCEEDED`).
+pub const MAX_FRAGMENTATION_DATAGRAMS: u32 = 1024;
+
+const fn default_fragmentation_datagrams() -> u32 {
+    DEFAULT_FRAGMENTATION_DATAGRAMS
+}
+
+const fn default_max_fragments_per_datagram() -> u32 {
+    ruster_core::IPV4_FRAGMENTATION_DEFAULT_MAX_FRAGMENTS as u32
+}
+
+/// `[fragmentation]`: fragmentation of forwarded DF-clear datagrams above
+/// their egress MTU (RFC 791 §3.2, RFC 1812 §4.2.2.7, MTU2 part B).
+///
+/// Every field defaults to RFC behaviour; turning it off or lowering the
+/// bound is hardening.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FragmentationV1 {
+    /// `false` keeps the MTU1 behaviour (`IPV4_FRAGMENTATION_REQUIRED`, no
+    /// fragment, no slot storage). Default `true` (RFC 1812 MUST).
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+    /// Most fragments one datagram may be cut into, 2 to 1365
+    /// ([`ruster_core::IPV4_FRAGMENTATION_MAX_FRAGMENTS`], the most any
+    /// datagram can need); more is `IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS`.
+    /// Default 1365.
+    #[serde(default = "default_max_fragments_per_datagram")]
+    pub max_fragments_per_datagram: u32,
+    /// Datagrams one tick can fragment (slots), 1 to
+    /// [`MAX_FRAGMENTATION_DATAGRAMS`]; more is
+    /// `IPV4_FRAGMENTATION_QUEUE_FULL`. Default
+    /// [`DEFAULT_FRAGMENTATION_DATAGRAMS`].
+    #[serde(default = "default_fragmentation_datagrams")]
+    pub datagrams: u32,
+}
+
+impl Default for FragmentationV1 {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_fragments_per_datagram: default_max_fragments_per_datagram(),
+            datagrams: DEFAULT_FRAGMENTATION_DATAGRAMS,
+        }
+    }
 }
 
 /// ARP receive policy (`[arp]`).

@@ -693,7 +693,12 @@ fn assert_translated(
     } else {
         // A DF-clear error gets a generated ID (RFC 6864 §5.3.1,
         // NAT44-126), not the one it arrived with; the sequence is checked
-        // by nat44_df_clear.
+        // by nat44_df_clear. A generated ID equals the received one with
+        // probability 1/65536 for an arbitrary key, so this inequality is
+        // a property of the fixed test hash keys of these runtimes (and the
+        // IDs these tests send), not of the generator; a key or bucket
+        // change that makes them coincide must pick another test ID, not
+        // drop the check.
         assert_ne!(&bytes[18..20], &error[18..20], "DF clear: ID generated");
     }
     assert_eq!(bytes[22], error[22] - 1, "TTL");

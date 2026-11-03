@@ -271,6 +271,12 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
             }),
             nat44_icmp: None,
             firewall_states: Some(6),
+            // `[fragmentation]` absent: on, 64 slots of 14 + 3826 bytes (the
+            // longest datagram an AF_XDP frame carries, above every MTU here).
+            fragmentation: Some(ruster_config::FragmentationStorageShapeV1 {
+                datagrams: 64,
+                slot_bytes: 3840,
+            }),
             required_bytes: shape.required_bytes,
         }
     );
@@ -294,7 +300,8 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         // free-port bitmaps of the UDP and TCP port-owner indexes
         + 2 * port_free_bitmap_words(8) * size_of::<u64>()
         + 7 * size_of::<Nat44TcpSynHoldSlot>()
-        + 6 * size_of::<FirewallStateSlot>();
+        + 6 * size_of::<FirewallStateSlot>()
+        + 64 * (size_of::<ruster_core::Ipv4FragmentSlot>() + 3840);
     assert_eq!(shape.required_bytes, expected);
 
     assert!(validated_with(
@@ -1828,7 +1835,28 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
         let config = validated(&with_mtu(mtu));
         assert_eq!(u64::from(mtu_of(&config, 1)), mtu);
         assert_eq!(mtu_of(&config, 2), ETHERNET_DEFAULT_MTU);
-        assert_eq!(config.storage_shape(), defaults.storage_shape());
+        // Only the fragmentation slots follow the largest MTU (MTU2 part B).
+        let shape = config.storage_shape();
+        let slot_bytes = 14 + u32::try_from(mtu.max(3826)).unwrap();
+        assert_eq!(
+            shape.fragmentation.map(|slots| slots.slot_bytes),
+            Some(slot_bytes)
+        );
+        let without_fragmentation =
+            |shape: ruster_config::RuntimeStorageShapeV1| ruster_config::RuntimeStorageShapeV1 {
+                fragmentation: None,
+                required_bytes: 0,
+                ..shape
+            };
+        assert_eq!(
+            without_fragmentation(shape),
+            without_fragmentation(defaults.storage_shape())
+        );
+        assert_eq!(
+            i64::try_from(shape.required_bytes).unwrap()
+                - i64::try_from(defaults.storage_shape().required_bytes).unwrap(),
+            64 * (i64::from(slot_bytes) - 3840)
+        );
     }
     for mtu in [0, 67, 65_536, u64::from(u32::MAX)] {
         let rejected = error(&with_mtu(mtu));
@@ -1884,4 +1912,82 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
         ValidationCode::Icmpv4ErrorPolicy(ruster_core::Icmpv4ErrorPolicyError::IntervalZero)
     );
     assert_eq!(dotted(rejected.path()), "icmpv4-errors.policy");
+}
+
+/// MTU2 part B: `[fragmentation]` defaults to RFC 1812 §4.2.2.7 behaviour
+/// (on, every datagram fragmented: up to 1365 fragments, 64 slots of the
+/// largest interface MTU); off has no slot storage; every bound fails
+/// closed with a value-free code at the field.
+#[test]
+fn fragmentation_section_defaults_on_and_fails_closed() {
+    use ruster_config::{FragmentationStorageShapeV1, MAX_FRAGMENTATION_DATAGRAMS};
+    use ruster_core::{Ipv4FragmentSlot, Ipv4FragmentationPolicy, Ipv4FragmentationPolicyError};
+    let with = |section: &str| VALID.replacen("[tick]", &format!("{section}\n[tick]"), 1);
+    let absent = validated(VALID);
+    assert_eq!(
+        absent.fragmentation().policy(),
+        Ipv4FragmentationPolicy::DEFAULT
+    );
+    let shape = FragmentationStorageShapeV1 {
+        datagrams: 64,
+        slot_bytes: 3840,
+    };
+    assert_eq!(absent.fragmentation().storage(), Some(shape));
+    let empty = validated(&with("[fragmentation]\n"));
+    assert_eq!(empty.fragmentation(), absent.fragmentation());
+    assert_eq!(empty.storage_shape(), absent.storage_shape());
+
+    let off = validated(&with("[fragmentation]\nenabled = false\n"));
+    assert!(!off.fragmentation().policy().enabled());
+    assert_eq!(off.fragmentation().storage(), None);
+    assert_eq!(off.storage_shape().fragmentation, None);
+    assert_eq!(
+        absent.storage_shape().required_bytes - off.storage_shape().required_bytes,
+        64 * (size_of::<Ipv4FragmentSlot>() + 3840)
+    );
+    // Off ignores the slot count (no storage), but still checks the bound.
+    let off_zero = validated(&with("[fragmentation]\nenabled = false\ndatagrams = 0\n"));
+    assert_eq!(off_zero.storage_shape(), off.storage_shape());
+
+    let tuned = validated(&with(
+        "[fragmentation]\nmax-fragments-per-datagram = 2\ndatagrams = 1024\n",
+    ));
+    assert_eq!(tuned.fragmentation().policy().max_fragments(), 2);
+    assert_eq!(
+        tuned.fragmentation().storage(),
+        Some(FragmentationStorageShapeV1 {
+            datagrams: MAX_FRAGMENTATION_DATAGRAMS,
+            slot_bytes: 3840,
+        })
+    );
+
+    for value in [1_u64, 1366, 70_000] {
+        let source = with(&format!(
+            "[fragmentation]\nmax-fragments-per-datagram = {value}\n"
+        ));
+        let rejected = error(&source);
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::FragmentationPolicy(
+                Ipv4FragmentationPolicyError::MaxFragmentsOutOfRange
+            ),
+            "{value}"
+        );
+        assert_eq!(rejected.code().code(), "FRAGMENTATION_POLICY");
+        assert_eq!(
+            dotted(rejected.path()),
+            "fragmentation.max-fragments-per-datagram"
+        );
+    }
+    let zero = error(&with("[fragmentation]\ndatagrams = 0\n"));
+    assert_eq!(zero.code(), ValidationCode::FragmentationDatagramsZero);
+    assert_eq!(zero.code().code(), "FRAGMENTATION_DATAGRAMS_ZERO");
+    assert_eq!(dotted(zero.path()), "fragmentation.datagrams");
+    let above = error(&with("[fragmentation]\ndatagrams = 1025\n"));
+    assert_eq!(above.code(), ValidationCode::CapacityLimitExceeded);
+    assert_eq!(above.limit(), Some(1024));
+    assert_eq!(above.actual(), Some(1025));
+    assert_eq!(dotted(above.path()), "fragmentation.datagrams");
+    let unknown = parse(with("[fragmentation]\nqueue-bytes = 1\n").as_bytes());
+    assert!(unknown.is_err(), "unknown field refused");
 }

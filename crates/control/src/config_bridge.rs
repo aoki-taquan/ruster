@@ -22,10 +22,11 @@ use ruster_core::{
 };
 
 use crate::publication::{
-    FirewallPublicationInput, FullServiceStorageShape, Icmpv4ErrorStorageShape,
-    Nat44IcmpPublicationInput, Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan,
-    Nat44UdpPublicationInput, Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan,
-    ResolutionStorageShape, RuntimeService, ValidatedCandidate,
+    FirewallPublicationInput, FragmentationStoragePlan, FullServiceStorageShape,
+    Icmpv4ErrorStorageShape, Nat44IcmpPublicationInput, Nat44IcmpStoragePlan,
+    Nat44TcpPublicationInput, Nat44TcpStoragePlan, Nat44UdpPublicationInput, Nat44UdpStoragePlan,
+    PublicationCandidateError, PublicationPlan, ResolutionStorageShape, RuntimeService,
+    ValidatedCandidate,
 };
 
 /// How a [`PublicationKeySource`] obtains its keys.
@@ -309,6 +310,7 @@ impl ConfigBridgeError {
             Self::MissingService(RuntimeService::Nat44Tcp) => "MISSING_SERVICE_NAT44_TCP",
             Self::MissingService(RuntimeService::Firewall) => "MISSING_SERVICE_FIREWALL",
             Self::MissingService(RuntimeService::Nat44Icmp) => "MISSING_SERVICE_NAT44_ICMP",
+            Self::MissingService(RuntimeService::Fragmentation) => "MISSING_SERVICE_FRAGMENTATION",
             Self::KeySource(_) => "KEY_SOURCE",
             Self::Candidate(_) => "CANDIDATE",
         }
@@ -463,6 +465,15 @@ pub(crate) fn required_services(
         .with_session_host_slots(tcp_shape.session_hosts),
         firewall_states,
     );
+    let fragmentation = config.fragmentation();
+    let shape = match fragmentation.storage() {
+        Some(slots) => shape.with_fragmentation(FragmentationStoragePlan::new(
+            fragmentation.policy(),
+            slots.datagrams,
+            slots.slot_bytes,
+        )),
+        None => shape,
+    };
     let icmp = nat44.and_then(|nat44| nat44.icmp());
     let shape = match icmp.zip(storage.nat44_icmp) {
         Some((_, icmp_shape)) => shape.with_nat44_icmp(

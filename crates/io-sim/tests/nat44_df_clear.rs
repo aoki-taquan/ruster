@@ -857,8 +857,10 @@ impl World {
 
 /// Review M1/L1: inbound translations count apart from outbound ones, so no
 /// amount of outside DF-clear traffic toward the inside advances the ID
-/// sequence of an outbound tuple. 4096 outside sources (each its own
-/// inbound tuple, spread over the 1024 buckets) send DF-clear datagrams to
+/// sequence of an outbound tuple. 32768 outside sources (each its own
+/// inbound tuple, spread over the 4096 buckets, so that a shared array would
+/// put one in the outbound tuple's bucket with probability about
+/// 1 - e^-8) send DF-clear datagrams to
 /// H1's mapping; H1's next outbound DF-clear datagram still takes the next
 /// ID of (PUBLIC, REMOTE, UDP). With one shared array some of those inbound
 /// tuples would share that tuple's bucket and skip its sequence.
@@ -866,7 +868,7 @@ impl World {
 fn inbound_df_clear_volume_never_advances_an_outbound_sequence() {
     let mut world = World::with_filtering(false, 1500, Nat44Filtering::EndpointIndependent);
     let (_, first) = world.run(LAN, udp(LAN, H1, REMOTE, P1, 53, 1, 0)).unwrap();
-    for n in 0..4096_u16 {
+    for n in 0..32_768_u16 {
         let [high, low] = n.to_be_bytes();
         let source = Ipv4Address::from_octets([198, 18, high, low | 1]);
         let (egress, _) = world

@@ -9,6 +9,7 @@ mod generated;
 mod icmpv4_error;
 mod icmpv4_translated_limit;
 mod io;
+mod ipv4_fragmentation;
 mod nat44;
 mod nat44_host_quota;
 mod nat44_ipv4_id;
@@ -59,6 +60,7 @@ pub use forwarding::{
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors,
+    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_icmpv4_errors,
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
     forward_batch_with_resolution_and_icmpv4_errors, ArpPolicy, BatchReport, DropReason,
@@ -90,6 +92,13 @@ pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,
     PublicationQuiescence, PublicationQuiescenceDisposition, PublicationQuiescenceGuard,
     PublicationQuiescenceWitness, SlotCompletion,
+};
+pub use ipv4_fragmentation::{
+    execute_one_ipv4_fragmentation, ipv4_fragment_slot_bytes, GeneratedIpv4FragmentReport,
+    Ipv4FragmentOutcome, Ipv4FragmentSlot, Ipv4FragmentationCounters, Ipv4FragmentationPolicy,
+    Ipv4FragmentationPolicyError, Ipv4FragmentationRuntime, Ipv4FragmentationStorageError,
+    IPV4_FRAGMENTATION_DEFAULT_MAX_FRAGMENTS, IPV4_FRAGMENTATION_MAX_FRAGMENTS,
+    IPV4_FRAGMENTATION_MIN_MAX_FRAGMENTS,
 };
 pub use nat44::{
     Nat44Filtering, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpCounters, Nat44IcmpDisposition,

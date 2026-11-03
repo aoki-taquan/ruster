@@ -956,7 +956,8 @@ fn render<D: Datapath>(
         active.nat44_tcp(),
         active.firewall(),
     )
-    .with_nat44_icmp(active.nat44_icmp());
+    .with_nat44_icmp(active.nat44_icmp())
+    .with_fragmentation(active.fragmentation());
     let resolution_index = active.resolution().index_counters();
     stats::block(kind, now, &observer.snapshot(now), &services, |out| {
         // H4b fail-closed index outcomes (ruster run only; not in run-sim).

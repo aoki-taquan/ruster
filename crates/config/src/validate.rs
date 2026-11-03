@@ -7,8 +7,9 @@ use ruster_core::{
     FirewallPortRange, FirewallPortRangeError, FirewallProtocol, FirewallRule, FirewallRuleId,
     FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
     Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
-    Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpPolicy, Nat44IcmpPolicyError,
+    Ipv4FragmentSlot, Ipv4FragmentationPolicy, Ipv4FragmentationPolicyError, Ipv4OriginPolicy,
+    Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering, Nat44HostLink,
+    Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpPolicy, Nat44IcmpPolicyError,
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
     Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
     Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
@@ -122,6 +123,10 @@ pub enum ValidationCode {
     Ipv4Origin(Ipv4OriginPolicyError),
     ResolutionPolicy(ResolutionPolicyError),
     Icmpv4ErrorPolicy(Icmpv4ErrorPolicyError),
+    /// `[fragmentation] max-fragments-per-datagram` outside 2..=1365.
+    FragmentationPolicy(Ipv4FragmentationPolicyError),
+    /// `[fragmentation] datagrams` is 0 while fragmentation is enabled.
+    FragmentationDatagramsZero,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
     Nat44RealmWithoutProtocol,
@@ -254,6 +259,8 @@ impl ValidationCode {
             Self::Ipv4Origin(_) => "IPV4_ORIGIN",
             Self::ResolutionPolicy(_) => "RESOLUTION_POLICY",
             Self::Icmpv4ErrorPolicy(_) => "ICMPV4_ERROR_POLICY",
+            Self::FragmentationPolicy(_) => "FRAGMENTATION_POLICY",
+            Self::FragmentationDatagramsZero => "FRAGMENTATION_DATAGRAMS_ZERO",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
             Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
@@ -475,6 +482,15 @@ pub struct Nat44IcmpStorageShapeV1 {
     pub hosts: u32,
 }
 
+/// Storage of IPv4 fragmentation (MTU2 part B): `datagrams` slots of
+/// `slot_bytes` bytes (an Ethernet header plus the largest interface MTU)
+/// and one [`Ipv4FragmentSlot`] each.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FragmentationStorageShapeV1 {
+    pub datagrams: u32,
+    pub slot_bytes: u32,
+}
+
 /// Complete caller-owned runtime storage requested by one V1 candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeStorageShapeV1 {
@@ -485,6 +501,8 @@ pub struct RuntimeStorageShapeV1 {
     /// `None` without `[nat44.icmp]`.
     pub nat44_icmp: Option<Nat44IcmpStorageShapeV1>,
     pub firewall_states: Option<u32>,
+    /// `None` with `[fragmentation] enabled = false`.
+    pub fragmentation: Option<FragmentationStorageShapeV1>,
     pub required_bytes: usize,
 }
 
@@ -495,6 +513,26 @@ pub struct TickBudgetsV1 {
     pub failure_dispatch_scans: u32,
     pub generated_arp: u32,
     pub generated_icmpv4: u32,
+}
+
+/// Validated `[fragmentation]` (defaults when absent).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedFragmentationV1 {
+    policy: Ipv4FragmentationPolicy,
+    storage: Option<FragmentationStorageShapeV1>,
+}
+
+impl ValidatedFragmentationV1 {
+    #[must_use]
+    pub const fn policy(&self) -> Ipv4FragmentationPolicy {
+        self.policy
+    }
+
+    /// `None` when fragmentation is off (no slot storage).
+    #[must_use]
+    pub const fn storage(&self) -> Option<FragmentationStorageShapeV1> {
+        self.storage
+    }
 }
 
 pub struct ValidatedResolutionV1 {
@@ -883,6 +921,7 @@ pub struct ValidatedConfigV1 {
     nat44: Option<ValidatedNat44V1>,
     firewall: Option<ValidatedFirewallV1>,
     tick: TickBudgetsV1,
+    fragmentation: ValidatedFragmentationV1,
     storage: RuntimeStorageShapeV1,
     backend: ValidatedBackendV1,
 }
@@ -947,6 +986,12 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn tick(&self) -> TickBudgetsV1 {
         self.tick
+    }
+
+    /// `[fragmentation]` (MTU2 part B); defaults (on) when absent.
+    #[must_use]
+    pub const fn fragmentation(&self) -> ValidatedFragmentationV1 {
+        self.fragmentation
     }
 
     #[must_use]
@@ -1761,6 +1806,56 @@ fn validate_v1(
         firewall_rules = Some(rules.into_boxed_slice());
     }
 
+    let fragmentation_source = config.fragmentation.unwrap_or_default();
+    let fragmentation_path = |field: &str| path(&["fragmentation", field]);
+    let fragmentation_policy = u16::try_from(fragmentation_source.max_fragments_per_datagram)
+        .map_err(|_| Ipv4FragmentationPolicyError::MaxFragmentsOutOfRange)
+        .and_then(|max| Ipv4FragmentationPolicy::new(fragmentation_source.enabled, max))
+        .map_err(|error| {
+            ValidationError::new(
+                ValidationCode::FragmentationPolicy(error),
+                fragmentation_path("max-fragments-per-datagram"),
+            )
+        })?;
+    let fragmentation_slots = if fragmentation_policy.enabled() {
+        if fragmentation_source.datagrams == 0 {
+            return Err(ValidationError::new(
+                ValidationCode::FragmentationDatagramsZero,
+                fragmentation_path("datagrams"),
+            ));
+        }
+        if fragmentation_source.datagrams > crate::MAX_FRAGMENTATION_DATAGRAMS {
+            return Err(ValidationError::bounded(
+                ValidationCode::CapacityLimitExceeded,
+                fragmentation_path("datagrams"),
+                u64::from(crate::MAX_FRAGMENTATION_DATAGRAMS),
+                u64::from(fragmentation_source.datagrams),
+            ));
+        }
+        // A slot holds the longest datagram the router can receive. The
+        // configured interface MTU is not enforced at ingress (a device MTU
+        // may be larger, `MTU_BELOW_DEVICE`), so the bound is the larger of
+        // every interface MTU and the longest datagram a production backend
+        // frame can carry (`FRAGMENTATION_MIN_SLOT_DATAGRAM`). A datagram
+        // within it is fragmented as RFC 1812 §4.2.2.7 requires even when it
+        // is above every configured MTU. The bound does not depend on the
+        // backend section, so a backend change never changes the storage
+        // shape.
+        let received = interfaces
+            .iter()
+            .map(InterfaceBindingV1::mtu)
+            .max()
+            .unwrap_or(ruster_core::ETHERNET_DEFAULT_MTU)
+            .max(FRAGMENTATION_MIN_SLOT_DATAGRAM);
+        Some(FragmentationStorageShapeV1 {
+            datagrams: fragmentation_source.datagrams,
+            slot_bytes: u32::try_from(ruster_core::ipv4_fragment_slot_bytes(received))
+                .expect("14 + a u16 MTU fits u32"),
+        })
+    } else {
+        None
+    };
+
     let storage = build_storage_shape(
         StorageInputs {
             resolution: resolution_source.map(|source| source.capacity),
@@ -1787,6 +1882,7 @@ fn validate_v1(
                 )
             })),
             firewall_states: firewall_capacity,
+            fragmentation: fragmentation_slots,
         },
         limits,
     )?;
@@ -1865,10 +1961,35 @@ fn validate_v1(
         nat44,
         firewall,
         tick,
+        fragmentation: ValidatedFragmentationV1 {
+            policy: fragmentation_policy,
+            storage: fragmentation_slots,
+        },
         storage,
         backend,
     })
 }
+
+/// The longest IPv4 datagram an AF_XDP frame can carry: the largest
+/// supported chunk (4096 bytes) minus the kernel's XDP headroom and the
+/// Ethernet header, 3826 bytes. Fragmentation slots are at least this long
+/// (MTU2 part B), so every datagram a production port receives fits a slot
+/// whatever the device MTU.
+pub const FRAGMENTATION_MIN_SLOT_DATAGRAM: u16 = 4096 - 256 - 14;
+
+const _: () = {
+    let mut largest = 0;
+    let mut index = 0;
+    while index < SUPPORTED_ALIGNED_CHUNK_SIZES.len() {
+        if SUPPORTED_ALIGNED_CHUNK_SIZES[index] > largest {
+            largest = SUPPORTED_ALIGNED_CHUNK_SIZES[index];
+        }
+        index += 1;
+    }
+    assert!(
+        largest as u64 - XDP_PACKET_HEADROOM as u64 - 14 == FRAGMENTATION_MIN_SLOT_DATAGRAM as u64
+    );
+};
 
 /// Validates `[backend]` against the validated interfaces.
 ///
@@ -2278,6 +2399,7 @@ struct StorageInputs {
     /// ICMP query NAT (N5): capacity, identifier pool, per-host limit set.
     icmp_query: Option<(crate::Nat44IcmpCapacityV1, NatStorageInputs)>,
     firewall_states: Option<u32>,
+    fragmentation: Option<FragmentationStorageShapeV1>,
 }
 
 fn build_storage_shape(
@@ -2461,6 +2583,29 @@ fn build_storage_shape(
             path(&["firewall", "capacity", "states"]),
         )?;
     }
+    if let Some(shape) = inputs.fragmentation {
+        let datagrams_path = path(&["fragmentation", "datagrams"]);
+        add_bytes::<Ipv4FragmentSlot>(&mut bytes, shape.datagrams, datagrams_path.clone())?;
+        let slot_bytes = usize::try_from(shape.slot_bytes).map_err(|_| {
+            ValidationError::new(
+                ValidationCode::CapacityNotRepresentable,
+                datagrams_path.clone(),
+            )
+        })?;
+        let datagrams = usize::try_from(shape.datagrams).map_err(|_| {
+            ValidationError::new(
+                ValidationCode::CapacityNotRepresentable,
+                datagrams_path.clone(),
+            )
+        })?;
+        let arena = datagrams
+            .checked_mul(slot_bytes)
+            .and_then(|arena| bytes.checked_add(arena))
+            .ok_or_else(|| {
+                ValidationError::new(ValidationCode::CapacityArithmeticOverflow, datagrams_path)
+            })?;
+        bytes = arena;
+    }
     if bytes > limits.max_runtime_bytes {
         return Err(ValidationError::bounded(
             ValidationCode::RuntimeStorageBytesExceeded,
@@ -2476,6 +2621,7 @@ fn build_storage_shape(
         nat44_tcp,
         nat44_icmp,
         firewall_states: inputs.firewall_states,
+        fragmentation: inputs.fragmentation,
         required_bytes: bytes,
     })
 }

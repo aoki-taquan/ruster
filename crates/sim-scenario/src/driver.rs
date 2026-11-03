@@ -562,7 +562,8 @@ impl SimRun<'_> {
             active.nat44_tcp(),
             active.firewall(),
         )
-        .with_nat44_icmp(active.nat44_icmp());
+        .with_nat44_icmp(active.nat44_icmp())
+        .with_fragmentation(active.fragmentation());
         let mut line = Line::event("final");
         line.u64("at_ms", self.now);
         line.u64("generation", self.generation().get());

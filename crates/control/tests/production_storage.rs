@@ -4,14 +4,16 @@
 
 use std::{mem::size_of, num::NonZeroU64};
 
-use ruster_config::{parse, validate, ValidatedConfig, PRODUCTION_VALIDATION_LIMITS};
+use ruster_config::{
+    parse, validate, ValidatedConfig, MAX_FRAGMENTATION_DATAGRAMS, PRODUCTION_VALIDATION_LIMITS,
+};
 use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministicKeySource};
 use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Nat44HostCounter, Nat44HostLink, Nat44TcpHostSlot,
-    Nat44TcpMappingSlot, Nat44TcpSessionHostSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot,
-    Nat44UdpHostSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionStateSlot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4FragmentSlot, Nat44HostCounter, Nat44HostLink,
+    Nat44TcpHostSlot, Nat44TcpMappingSlot, Nat44TcpSessionHostSlot, Nat44TcpSessionSlot,
+    Nat44TcpSynHoldSlot, Nat44UdpHostSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot,
 };
 
 /// Net bytes the measuring thread allocated while armed.
@@ -142,13 +144,20 @@ fn worst_case_bytes() -> usize {
         + port_index
         + quote * size_of::<Nat44TcpSynHoldSlot>();
     let firewall = slots * size_of::<FirewallStateSlot>();
-    resolution + icmpv4 + udp + tcp + firewall
+    resolution + icmpv4 + udp + tcp + firewall + fragmentation_bytes(MAX_FRAGMENTATION_DATAGRAMS)
+}
+
+/// `datagrams` fragmentation slots (MTU2 part B): a slot record and 14 +
+/// 3826 bytes each (the longest datagram an AF_XDP frame can carry, above
+/// the 1500-byte MTUs).
+fn fragmentation_bytes(datagrams: u32) -> usize {
+    datagrams as usize * (size_of::<Ipv4FragmentSlot>() + 14 + 3826)
 }
 
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 57_098_432;
+    const WORST_CASE: usize = 61_042_880;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 
@@ -191,11 +200,16 @@ fn the_maximal_config_with_per_host_limits_still_fits_the_bound() {
     // 12-byte links, 24- and 36-byte host slots (one and two host lists),
     // and the UDP table's 4-byte link word and 8-byte peer counter (N6).
     assert_eq!(host_bytes, 9_961_472);
-    let worst_case = worst_case_bytes() + host_bytes;
-    assert_eq!(worst_case, 67_059_904);
+    // With every table at its limit the per-host tables leave room for 12
+    // fragmentation slots (not the 1024 of the maximal config).
+    let worst_case = worst_case_bytes() - fragmentation_bytes(MAX_FRAGMENTATION_DATAGRAMS)
+        + fragmentation_bytes(12)
+        + host_bytes;
+    assert_eq!(worst_case, 67_106_128);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let text = MAXIMAL
+        .replacen("datagrams = 1024", "datagrams = 12", 1)
         .replacen(
             "[nat44.udp.capacity]",
             "mappings-per-host = 256\n\n[nat44.udp.capacity]",
@@ -249,7 +263,7 @@ fn the_maximal_config_with_a_session_limit_fits_and_all_limits_fail_closed() {
     // 12-byte links, 4-byte words, 48-byte host slots (three lists).
     assert_eq!(session_host_bytes, 6_029_312);
     let worst_case = worst_case_bytes() + session_host_bytes;
-    assert_eq!(worst_case, 63_127_744);
+    assert_eq!(worst_case, 67_072_192);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let with_sessions = MAXIMAL.replacen(

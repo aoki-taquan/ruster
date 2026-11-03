@@ -1,4 +1,5 @@
 use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError, FirewallRouteMissPacket};
+use crate::ipv4_fragmentation::Ipv4FragmentPlan;
 use crate::nat44::{
     Nat44TcpInboundPlan, Nat44TcpOutboundPlan, Nat44TcpPlanError, Nat44UdpInboundPlan,
     Nat44UdpOutboundPlan, Nat44UdpPlanError,
@@ -10,8 +11,8 @@ use crate::{
     FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
     FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
     FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
-    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, LocalIpv4Binding,
-    MonotonicMillis, Nat44IcmpConfig, Nat44IcmpDisposition, Nat44IcmpRuntime,
+    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4FragmentationRuntime,
+    LocalIpv4Binding, MonotonicMillis, Nat44IcmpConfig, Nat44IcmpDisposition, Nat44IcmpRuntime,
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig,
     Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
     ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
@@ -297,10 +298,11 @@ pub enum DropReason {
     /// MTU as Next-Hop MTU (RFC 1191 §4) is queued to its source (MTU1).
     Ipv4FragmentationNeeded = 182,
     /// A forwarded IPv4 datagram without Don't Fragment is longer than the
-    /// MTU of its egress interface. RFC 1812 §4.2.2.7 requires the router to
-    /// fragment it (RFC 791); fragmentation is not implemented yet, so it is
-    /// discarded without an ICMP error (a tracked deviation, NAT44-019L,
-    /// until MTU2).
+    /// MTU of its egress interface and fragmentation is off
+    /// (`[fragmentation] enabled = false`, a hardening option against RFC
+    /// 1812 §4.2.2.7) or not part of the composition. It is discarded
+    /// without an ICMP error (Code 4 means DF set). With fragmentation on
+    /// (the default, MTU2 part B) such a datagram is fragmented instead.
     Ipv4FragmentationRequired = 183,
     /// The local Echo Reply to a valid Echo Request would be longer than the
     /// MTU of its egress interface (the request arrived over a device MTU
@@ -314,6 +316,26 @@ pub enum DropReason {
     /// itself fits). Minimum Ethernet padding (to 60 bytes) never trips it,
     /// since every MTU is at least 68 (MTU1 review).
     Ipv4FrameExceedsMtu = 185,
+    /// A DF-clear datagram above the egress MTU would need more fragments
+    /// than `[fragmentation] max-fragments-per-datagram`. The whole
+    /// datagram is discarded before any NAT, firewall, or ID state commits;
+    /// no fragment is sent (MTU2 part B).
+    Ipv4FragmentationTooManyFragments = 186,
+    /// A DF-clear datagram above the egress MTU found every fragmentation
+    /// slot of this tick taken (`[fragmentation] datagrams`). The whole
+    /// datagram is discarded before any state commits (MTU2 part B).
+    Ipv4FragmentationQueueFull = 187,
+    /// A DF-clear datagram above the egress MTU is longer than a
+    /// fragmentation slot (the config sizes slots for the larger of the
+    /// largest interface MTU and the longest AF_XDP datagram, so only a
+    /// simulated frame can be longer). The whole
+    /// datagram is discarded before any state commits (MTU2 part B).
+    Ipv4FragmentationDatagramTooLarge = 188,
+    /// A DF-clear fragment above the egress MTU whose Fragment Offset plus
+    /// data run past the largest IPv4 datagram (RFC 791: 65535 bytes), so
+    /// a fragment of it would need an offset beyond 13 bits. The whole
+    /// fragment is discarded before any state commits (MTU2 part B).
+    Ipv4FragmentationOffsetOverflow = 189,
 }
 
 use DropReason::*;
@@ -321,7 +343,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 185] = [
+    pub const ALL: [Self; 189] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -507,6 +529,10 @@ impl DropReason {
         Ipv4FragmentationRequired,
         Icmpv4EchoReplyExceedsMtu,
         Ipv4FrameExceedsMtu,
+        Ipv4FragmentationTooManyFragments,
+        Ipv4FragmentationQueueFull,
+        Ipv4FragmentationDatagramTooLarge,
+        Ipv4FragmentationOffsetOverflow,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -709,6 +735,10 @@ impl DropReason {
             Ipv4FragmentationRequired => "IPV4_FRAGMENTATION_REQUIRED",
             Icmpv4EchoReplyExceedsMtu => "ICMPV4_ECHO_REPLY_EXCEEDS_MTU",
             Ipv4FrameExceedsMtu => "IPV4_FRAME_EXCEEDS_MTU",
+            Ipv4FragmentationTooManyFragments => "IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS",
+            Ipv4FragmentationQueueFull => "IPV4_FRAGMENTATION_QUEUE_FULL",
+            Ipv4FragmentationDatagramTooLarge => "IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE",
+            Ipv4FragmentationOffsetOverflow => "IPV4_FRAGMENTATION_OFFSET_OVERFLOW",
         }
     }
 }
@@ -1558,6 +1588,16 @@ pub enum TraceEvent {
         ingress: IfId,
         reason: ConsumeReason,
     },
+    /// A DF-clear datagram above the egress MTU was staged for
+    /// fragmentation into `fragments` fragments toward `egress`; the
+    /// received frame was consumed as `reason`
+    /// ([`ConsumeReason::Ipv4Fragmented`]).
+    Ipv4FragmentationQueued {
+        ingress: IfId,
+        egress: IfId,
+        fragments: u16,
+        reason: ConsumeReason,
+    },
     BatchCompleted {
         tx_accepted: usize,
         tx_rejected: usize,
@@ -1762,6 +1802,9 @@ enum PacketDecision {
 struct PlannedPacket {
     decision: PacketDecision,
     firewall: Option<FirewallPlan>,
+    /// Fragments of a datagram staged for fragmentation; the received
+    /// frame is consumed instead of committed.
+    fragments: Option<u16>,
 }
 
 impl PacketDecision {
@@ -1800,7 +1843,8 @@ where
     T: TraceSink,
 {
     forward_batch_inner(
-        batch, snapshot, None, None, None, None, None, None, None, None, None, None, None, trace,
+        batch, snapshot, None, None, None, None, None, None, None, None, None, None, None, None,
+        trace,
     )
 }
 
@@ -1823,6 +1867,7 @@ where
         batch,
         snapshot,
         Some((runtime, now)),
+        None,
         None,
         None,
         None,
@@ -1860,6 +1905,7 @@ where
         snapshot,
         Some((resolution, now)),
         Some((icmpv4_errors, now)),
+        None,
         None,
         None,
         None,
@@ -1909,6 +1955,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1950,6 +1997,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -1979,6 +2027,7 @@ where
         None,
         Some(config),
         nat44_tcp,
+        None,
         None,
         None,
         None,
@@ -2020,6 +2069,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -2052,6 +2102,7 @@ where
         nat44_udp,
         Some(tcp_config),
         nat44_tcp,
+        None,
         None,
         None,
         None,
@@ -2095,6 +2146,7 @@ where
         None,
         None,
         None,
+        None,
         trace,
     )
 }
@@ -2133,6 +2185,7 @@ where
         Some(config),
         firewall,
         None,
+        None,
         trace,
     )
 }
@@ -2170,6 +2223,7 @@ where
         Some(config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -2206,6 +2260,7 @@ where
         None,
         Some(config),
         firewall,
+        None,
         None,
         trace,
     )
@@ -2244,6 +2299,7 @@ where
         Some(config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -2282,6 +2338,7 @@ where
         None,
         Some(firewall_config),
         firewall,
+        None,
         None,
         trace,
     )
@@ -2324,6 +2381,7 @@ where
         Some(firewall_config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -2366,6 +2424,7 @@ where
         Some(firewall_config),
         firewall,
         None,
+        None,
         trace,
     )
 }
@@ -2406,6 +2465,7 @@ where
         Some(firewall_config),
         firewall,
         Some(audit),
+        None,
         trace,
     )
 }
@@ -2446,6 +2506,7 @@ where
         nat44_tcp,
         Some(icmp_config),
         nat44_icmp,
+        None,
         None,
         None,
         None,
@@ -2500,6 +2561,67 @@ where
         Some(firewall_config),
         firewall,
         audit,
+        None,
+        trace,
+    )
+}
+
+/// [`forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors`]
+/// with IPv4 fragmentation (MTU2 part B, RFC 791 §3.2, RFC 1812
+/// §4.2.2.7): a DF-clear datagram above its egress MTU is, after every
+/// decision and before any commit, admitted by `fragmentation`'s policy and
+/// slot table (or dropped whole with a typed reason), rewritten, staged in
+/// a slot, and its received frame consumed as
+/// [`ConsumeReason::Ipv4Fragmented`]. The caller then sends the staged
+/// datagrams with [`crate::execute_one_ipv4_fragmentation`] in the same
+/// tick. Without a runtime such a datagram is
+/// [`DropReason::Ipv4FragmentationRequired`], as in the compositions
+/// without fragmentation. The [`forward_batch`] fresh-batch precondition
+/// applies.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation<
+    B,
+    T,
+>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    icmp: Option<(&Nat44IcmpConfig, Option<&mut Nat44IcmpRuntime<'_>>)>,
+    firewall_config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
+    audit: Option<&mut FirewallAuditBuffer<'_>>,
+    fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    let (icmp_config, nat44_icmp) = match icmp {
+        Some((config, runtime)) => (Some(config), runtime),
+        None => (None, None),
+    };
+    forward_batch_inner(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        icmp_config,
+        nat44_icmp,
+        Some(firewall_config),
+        firewall,
+        audit,
+        fragmentation,
         trace,
     )
 }
@@ -2519,6 +2641,7 @@ fn forward_batch_inner<B, T>(
     firewall_config: Option<&FirewallConfig<'_>>,
     mut firewall: Option<&mut FirewallRuntime<'_>>,
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
+    mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -2606,25 +2729,30 @@ where
                     decision,
                     PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local
                 ) {
-                    Ok(decision)
+                    Ok((decision, None))
                 } else {
                     // After every plan is known to commit and before the
                     // frame is rewritten, so the error quotes the datagram
                     // as received and no NAT or firewall state is created
-                    // for a datagram that is not sent.
-                    check_egress_mtu(
+                    // for a datagram that is not sent. A DF-clear datagram
+                    // that is fragmented is admitted here too (bound and
+                    // slot checked), so a refused one commits nothing.
+                    let fragment = check_egress_mtu(
                         &*frame,
                         snapshot,
                         ingress,
                         decision,
                         &mut resolution,
                         &mut icmpv4_errors,
+                        fragmentation.as_deref(),
                         trace,
                     )?;
                     apply_decision(frame, decision)?;
                     // Only for a datagram the core commits for TX: a plan,
                     // MTU, or firewall drop consumes no ID (a later backend
-                    // TX rejection does not return it).
+                    // TX rejection does not return it). A fragmented
+                    // datagram takes its ID here, so every fragment carries
+                    // the generated ID.
                     rewrite_translated_non_atomic_id(
                         frame,
                         decision,
@@ -2632,12 +2760,21 @@ where
                         &mut nat44_tcp,
                         &mut nat44_icmp,
                     )?;
-                    Ok(decision)
+                    // The last fallible step is above: staging cannot fail
+                    // for a plan admitted by check_egress_mtu.
+                    if let Some(plan) = fragment {
+                        fragmentation
+                            .as_deref_mut()
+                            .expect("an admitted fragment plan has a runtime")
+                            .stage(frame, plan, decision.egress());
+                    }
+                    Ok((decision, fragment.map(Ipv4FragmentPlan::fragments)))
                 }
             })
-            .map(|decision| PlannedPacket {
+            .map(|(decision, fragments)| PlannedPacket {
                 decision,
                 firewall: firewall_plan,
+                fragments,
             })
         };
         match result {
@@ -2742,6 +2879,19 @@ where
                         .commit(plan)
                         .expect("sequential packet path keeps firewall plan authority stable");
                 }
+                if let Some(fragments) = planned.fragments {
+                    // The datagram lives on in its fragmentation slot; the
+                    // received frame goes back to the backend.
+                    packet.consume(ConsumeReason::Ipv4Fragmented);
+                    consumed += 1;
+                    trace.record(TraceEvent::Ipv4FragmentationQueued {
+                        ingress,
+                        egress,
+                        fragments,
+                        reason: ConsumeReason::Ipv4Fragmented,
+                    });
+                    continue;
+                }
                 packet.commit(egress);
                 tx_requested += 1;
                 if let PacketDecision::ArpReply(arp) = decision {
@@ -2808,9 +2958,13 @@ where
 ///   The quote is the datagram as received, before any translation, so an
 ///   inside host behind the NAT sees its own datagram and an outside host
 ///   the one it sent to the public address.
-/// - DF clear: [`DropReason::Ipv4FragmentationRequired`] without an error.
-///   RFC 1812 §4.2.2.7 requires fragmentation, which is not implemented
-///   (NAT44-019L, MTU2).
+/// - DF clear: fragmented (RFC 1812 §4.2.2.7, RFC 791 §3.2, MTU2 part B)
+///   when a fragmentation runtime is bound and its policy is on: the
+///   returned plan has passed the per-datagram bound and found a free slot
+///   (otherwise a typed drop of the whole datagram, see
+///   [`crate::Ipv4FragmentationRuntime`]). Without a runtime, or with
+///   `enabled = false`, [`DropReason::Ipv4FragmentationRequired`] without
+///   an error (Code 4 means DF set).
 /// - A local Echo Reply: [`DropReason::Icmpv4EchoReplyExceedsMtu`]; the
 ///   router does not fragment its own datagrams.
 ///
@@ -2825,15 +2979,16 @@ fn check_egress_mtu<T: TraceSink>(
     decision: PacketDecision,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    fragmentation: Option<&Ipv4FragmentationRuntime<'_>>,
     trace: &mut T,
-) -> Result<(), DropReason> {
+) -> Result<Option<Ipv4FragmentPlan>, DropReason> {
     if matches!(
         decision,
         PacketDecision::ArpReply(_)
             | PacketDecision::ConsumeArp(_)
             | PacketDecision::ConsumeIpv4Local
     ) {
-        return Ok(());
+        return Ok(None);
     }
     let mtu = snapshot
         .interface(decision.egress())
@@ -2847,7 +3002,7 @@ fn check_egress_mtu<T: TraceSink>(
         if payload_len > usize::from(mtu) {
             return Err(Ipv4FrameExceedsMtu);
         }
-        return Ok(());
+        return Ok(None);
     }
     exceeds_egress_mtu(
         frame,
@@ -2857,8 +3012,10 @@ fn check_egress_mtu<T: TraceSink>(
         mtu,
         resolution,
         icmpv4_errors,
+        fragmentation,
         trace,
     )
+    .map(Some)
 }
 
 /// The cold half of [`check_egress_mtu`]: the datagram is longer than
@@ -2874,8 +3031,9 @@ fn exceeds_egress_mtu<T: TraceSink>(
     mtu: u16,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    fragmentation: Option<&Ipv4FragmentationRuntime<'_>>,
     trace: &mut T,
-) -> Result<(), DropReason> {
+) -> Result<Ipv4FragmentPlan, DropReason> {
     if matches!(decision, PacketDecision::Icmpv4EchoReply(_)) {
         return Err(Icmpv4EchoReplyExceedsMtu);
     }
@@ -2883,7 +3041,9 @@ fn exceeds_egress_mtu<T: TraceSink>(
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderTruncated)?;
     if flags_fragment & 0x4000 == 0 {
-        return Err(Ipv4FragmentationRequired);
+        return fragmentation.map_or(Err(Ipv4FragmentationRequired), |runtime| {
+            runtime.plan(frame, mtu)
+        });
     }
     if let Some((runtime, now)) = icmpv4_errors.as_mut() {
         let disposition = decide_icmpv4_error(
@@ -7966,6 +8126,10 @@ mod tests {
             (183, "IPV4_FRAGMENTATION_REQUIRED"),
             (184, "ICMPV4_ECHO_REPLY_EXCEEDS_MTU"),
             (185, "IPV4_FRAME_EXCEEDS_MTU"),
+            (186, "IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS"),
+            (187, "IPV4_FRAGMENTATION_QUEUE_FULL"),
+            (188, "IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE"),
+            (189, "IPV4_FRAGMENTATION_OFFSET_OVERFLOW"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -7975,7 +8139,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(186), None);
+        assert_eq!(DropReason::from_code(190), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
