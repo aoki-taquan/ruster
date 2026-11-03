@@ -50,8 +50,9 @@ impl Monitor {
 }
 
 impl LinkMonitor for Monitor {
-    fn stacked_links(&mut self, _: &LinkTarget) -> Result<u32, NetlinkError> {
-        Ok(0)
+    fn stacked_links(&mut self, _: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError> {
+        counts.iter_mut().for_each(|count| *count = 0);
+        Ok(())
     }
 
     fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {

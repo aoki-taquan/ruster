@@ -108,6 +108,11 @@ fn af_packet_run_checks_every_port_then_opens_all_at_once_and_closes_by_drop() {
     assert!(outcome.out.contains("fake.ports=2\n"), "{}", outcome.out);
     // Every health sample (here every tick) follows a backend refresh
     // (AF_PACKET folds PACKET_STATISTICS there).
+    // One stacked-device link dump per round serves both ports.
+    let dumps = *host.state.stacked_dumps.borrow_mut();
+    let queries = *host.state.link_queries.borrow_mut();
+    assert!(dumps >= 1, "{dumps}");
+    assert_eq!(dumps * 2, queries, "one dump for two ports per round");
     // ... and the final block follows one more (after the drain).
     assert!(host.state.sampled.get() >= 3);
     assert_eq!(host.state.refreshes.get(), host.state.sampled.get() + 1);

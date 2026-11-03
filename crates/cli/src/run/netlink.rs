@@ -296,6 +296,71 @@ pub fn parse_chunk(
     dump: Dump,
     ifindex: u32,
 ) -> Result<Chunk, NetlinkError> {
+    parse_chunk_with(datagram, sequence, port, |kind, message| match kind {
+        RTM_NEWADDR => match dump {
+            Dump::Addresses(family) => Ok(u32::from(address_matches(message, family, ifindex)?)),
+            _ => Ok(0),
+        },
+        RTM_NEWROUTE => match dump {
+            Dump::Routes(family) => Ok(u32::from(route_matches(message, family, ifindex)?)),
+            _ => Ok(0),
+        },
+        RTM_NEWLINK if dump == Dump::StackedLinks => Ok(u32::from(stacked_on(message, ifindex)?)),
+        _ => Ok(0),
+    })
+}
+
+/// Parses one datagram of the link dump `sequence` (one
+/// [`Dump::StackedLinks`] request for every port at once) and adds to
+/// `counts[i]` the devices of this datagram stacked on `ifindexes[i]`
+/// ([`stacked_lower`]); `counts` is at least as long as `ifindexes`. The
+/// header checks are those of [`parse_chunk`].
+pub fn parse_stacked_chunk(
+    datagram: &[u8],
+    sequence: u32,
+    port: u32,
+    ifindexes: &[u32],
+    counts: &mut [u32],
+) -> Result<Chunk, NetlinkError> {
+    parse_chunk_with(datagram, sequence, port, |kind, message| {
+        if kind != RTM_NEWLINK {
+            return Ok(0);
+        }
+        if let Some((index, lower)) = stacked_lower(message)? {
+            for (port_index, count) in ifindexes.iter().zip(counts.iter_mut()) {
+                if *port_index == lower && index != lower {
+                    *count = count.saturating_add(1);
+                }
+            }
+        }
+        Ok(0)
+    })
+}
+
+/// The outcome of a stacked-device dump whose every attempt was interrupted
+/// (`NLM_F_DUMP_INTR`), from the most each port saw in any attempt
+/// (`seen`): if any port saw a stacked device, those counts are the result
+/// (`Ok`, copied into `counts`): the device existed when it was listed, so
+/// reporting it is fail closed and churn cannot hide it; otherwise
+/// [`NetlinkError::Interrupted`] (a failed query with its own threshold).
+pub fn interrupted_outcome(seen: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError> {
+    if seen.iter().all(|count| *count == 0) {
+        return Err(NetlinkError::Interrupted);
+    }
+    for (count, most) in counts.iter_mut().zip(seen) {
+        *count = *most;
+    }
+    Ok(())
+}
+
+/// The header walk of [`parse_chunk`]: `matches` gets every other message
+/// of `sequence` (its type and bytes) and returns how many it counts.
+fn parse_chunk_with(
+    datagram: &[u8],
+    sequence: u32,
+    port: u32,
+    mut matches: impl FnMut(u16, &[u8]) -> Result<u32, NetlinkError>,
+) -> Result<Chunk, NetlinkError> {
     let mut chunk = Chunk::default();
     let mut at = 0;
     while at < datagram.len() {
@@ -340,25 +405,9 @@ pub fn parse_chunk(
                         return Err(NetlinkError::Kernel(error));
                     }
                 }
-                RTM_NEWADDR => {
-                    if let Dump::Addresses(family) = dump {
-                        if address_matches(message, family, ifindex)? {
-                            chunk.count = chunk.count.saturating_add(1);
-                        }
-                    }
+                kind => {
+                    chunk.count = chunk.count.saturating_add(matches(kind, message)?);
                 }
-                RTM_NEWROUTE => {
-                    if let Dump::Routes(family) = dump {
-                        if route_matches(message, family, ifindex)? {
-                            chunk.count = chunk.count.saturating_add(1);
-                        }
-                    }
-                }
-                RTM_NEWLINK if dump == Dump::StackedLinks => {
-                    let stacked = stacked_on(message, ifindex)?;
-                    chunk.count = chunk.count.saturating_add(u32::from(stacked));
-                }
-                _ => {}
             }
         }
         // NLMSG_ALIGN: 4-byte alignment between messages.
@@ -401,6 +450,13 @@ fn attributes<'m>(
 /// message, a duplicated or wrongly sized `IFLA_LINK`, or a duplicated
 /// `IFLA_LINK_NETNSID` fails closed.
 pub fn stacked_on(message: &[u8], ifindex: u32) -> Result<bool, NetlinkError> {
+    Ok(stacked_lower(message)?.is_some_and(|(index, lower)| lower == ifindex && index != ifindex))
+}
+
+/// The `(index, lower)` of the `RTM_NEWLINK` `message` if it is stacked on
+/// a device of this namespace (`IFLA_LINK` without `IFLA_LINK_NETNSID`),
+/// `None` otherwise; fails closed as [`stacked_on`].
+pub fn stacked_lower(message: &[u8]) -> Result<Option<(u32, u32)>, NetlinkError> {
     if message.len() < HEADER_LEN + IFINFOMSG_LEN {
         return Err(NetlinkError::Malformed);
     }
@@ -417,9 +473,10 @@ pub fn stacked_on(message: &[u8], ifindex: u32) -> Result<bool, NetlinkError> {
         },
     )?;
     let Some(link) = link else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(index != ifindex && u32_payload(link)? == ifindex && netnsid.is_none())
+    let lower = u32_payload(link)?;
+    Ok(netnsid.is_none().then_some((index, lower)))
 }
 
 /// Stores `payload` in an empty `slot`: a second copy of the attribute
@@ -969,6 +1026,73 @@ impl LinkProbe {
             }
         }
         Err(NetlinkError::Interrupted)
+    }
+
+    /// The devices of the namespace stacked on each of `ifindexes`, into
+    /// `counts` (as long as `ifindexes`), through ONE link dump for all of
+    /// them on the reused socket and buffer (no allocation): the dump reads
+    /// every link of the namespace, so one per round instead of one per
+    /// port keeps its cost (and the RTNL hold) independent of the port
+    /// count. A dump that raced a change (`NLM_F_DUMP_INTR`, frequent on
+    /// a host whose links churn) is retried at most [`DUMP_ATTEMPTS`]
+    /// times, then [`NetlinkError::Interrupted`].
+    pub fn count_stacked(
+        &mut self,
+        ifindexes: &[u32],
+        counts: &mut [u32],
+    ) -> Result<(), NetlinkError> {
+        let result = self.count_stacked_once(ifindexes, counts);
+        self.recover(result)
+    }
+
+    fn count_stacked_once(
+        &mut self,
+        ifindexes: &[u32],
+        counts: &mut [u32],
+    ) -> Result<(), NetlinkError> {
+        if counts.len() < ifindexes.len() || ifindexes.len() > ruster_config::MAX_BACKEND_PORTS {
+            return Err(NetlinkError::Malformed);
+        }
+        // The most each port saw in any attempt: an interrupted dump still
+        // saw what it listed (the device existed then), so link churn cannot
+        // hide one by interrupting every attempt.
+        let mut seen = [0_u32; ruster_config::MAX_BACKEND_PORTS];
+        let seen = &mut seen[..ifindexes.len()];
+        for _ in 0..DUMP_ATTEMPTS {
+            counts.iter_mut().for_each(|count| *count = 0);
+            let sequence = self.next_sequence();
+            let (request, len) = dump_request(Dump::StackedLinks, sequence, 0);
+            self.socket.send(&request[..len])?;
+            let port = self.socket.port_id()?;
+            let mut interrupted = false;
+            loop {
+                let received = self.socket.receive(&mut self.buffer, true)?;
+                if received == 0 {
+                    return Err(NetlinkError::EndOfStream);
+                }
+                if received > self.buffer.len() {
+                    return Err(NetlinkError::Truncated);
+                }
+                let chunk = parse_stacked_chunk(
+                    &self.buffer[..received],
+                    sequence,
+                    port,
+                    ifindexes,
+                    counts,
+                )?;
+                interrupted |= chunk.interrupted;
+                if chunk.done {
+                    break;
+                }
+            }
+            if !interrupted {
+                return Ok(());
+            }
+            for (most, count) in seen.iter_mut().zip(counts.iter()) {
+                *most = (*most).max(*count);
+            }
+        }
+        interrupted_outcome(seen, counts)
     }
 
     /// Kernel IPv4 addresses of `ifindex` ([`Self::count`]).
@@ -2064,6 +2188,39 @@ mod tests {
         // Other dumps ignore link messages.
         let parsed = parse_chunk(&chunk, 7, PORT, V4A, 5).expect("chunk");
         assert_eq!(parsed.count, 0);
+        // One dump for every port: 6 and 8 on 5, a peer elsewhere not, a
+        // macvlan 9 on 3, nothing on 4.
+        let mut multi = chunk.clone();
+        multi.truncate(multi.len() - message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes()).len());
+        multi.extend(on(9, 3, false));
+        multi.extend(message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes()));
+        let mut counts = [0_u32; 3];
+        let parsed = parse_stacked_chunk(&multi, 7, PORT, &[5, 3, 4], &mut counts).expect("chunk");
+        assert!(parsed.done);
+        assert_eq!(counts, [2, 1, 0]);
+        // A hostile message fails the whole dump closed.
+        let mut hostile = doubled.clone();
+        hostile[8..12].copy_from_slice(&7_u32.to_ne_bytes());
+        assert_eq!(
+            parse_stacked_chunk(&hostile, 7, PORT, &[5], &mut counts),
+            Err(NetlinkError::Malformed)
+        );
+    }
+
+    /// L1 (#334 review): an interrupted dump keeps what it saw.
+    #[test]
+    fn an_interrupted_stacked_dump_reports_what_any_attempt_saw() {
+        let mut counts = [9_u32; 3];
+        assert_eq!(
+            interrupted_outcome(&[0, 0, 0], &mut counts),
+            Err(NetlinkError::Interrupted),
+            "nothing seen: unverifiable"
+        );
+        assert_eq!(interrupted_outcome(&[0, 2, 0], &mut counts), Ok(()));
+        assert_eq!(counts, [0, 2, 0], "a device seen in any attempt counts");
+        let mut shorter = [9_u32; 2];
+        assert_eq!(interrupted_outcome(&[1, 0], &mut shorter), Ok(()));
+        assert_eq!(shorter, [1, 0]);
     }
 
     #[test]
@@ -2189,6 +2346,16 @@ mod tests {
         assert!(probe.ipv4_addresses(1).is_ok());
         // Nothing is stacked on loopback; the dump reads every link.
         assert_eq!(probe.count(Dump::StackedLinks, 1), Ok(0));
+        let mut counts = [7_u32; 3];
+        assert_eq!(
+            probe.count_stacked(&[1, i32::MAX as u32], &mut counts),
+            Ok(())
+        );
+        assert_eq!(counts, [0, 0, 0]);
+        assert_eq!(
+            probe.count_stacked(&[1, 2], &mut [0]),
+            Err(NetlinkError::Malformed)
+        );
         // Strict checking: the kernel filters by index and refuses one
         // that does not exist.
         assert!(probe

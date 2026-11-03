@@ -181,7 +181,12 @@ impl PortHost for LinuxHost {
             frame_capacity: max_frame_len,
         };
         let sysctls = PortSysctls::new(port.device());
-        let device = checks::linux::device_facts(&sysctls, facts, Some(&mut probe))?;
+        let mut device = checks::linux::device_facts(&sysctls, facts, Some(&mut probe))?;
+        let mut stacked = [0_u32];
+        device.stacked = probe
+            .count_stacked(&[ifindex], &mut stacked)
+            .ok()
+            .map(|()| stacked[0]);
         Ok(PacketFacts { device, offload })
     }
 
@@ -300,8 +305,8 @@ impl LinkMonitor for NetlinkLinks {
         self.sysctls(target)?.ipv4().weak_host
     }
 
-    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
-        self.probe.count(Dump::StackedLinks, target.ifindex)
+    fn stacked_links(&mut self, ifindexes: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError> {
+        self.probe.count_stacked(ifindexes, counts)
     }
 
     /// `disable_ipv6` first: when set (or without IPv6 in the namespace)
