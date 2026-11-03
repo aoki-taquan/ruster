@@ -518,7 +518,7 @@ in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの�
   `admit_first_fragment`でL2/IPv4 ingressの検査、RFC 791の構造（MF付きのdataは8の倍数）と
   tableのroom（空きentry、`entries-per-host`）を確かめます（何も変えない。拒否は
   `IPV4_FRAGMENT_TABLE_FULL`/`HOST_LIMIT`）。decided datagramへの二つ目の最初のfragmentは
-  `IPV4_FRAGMENT_DUPLICATE_FIRST`で、byte一致（長さと先頭8 data byte）の重複ならそれだけを捨て、
+  `IPV4_FRAGMENT_DUPLICATE_FIRST`で、byte一致（長さと全dataのFNV-1a fingerprint）の重複ならそれだけを捨て、
   それ以外はentryをpoisonします（下の「同じkeyの二つのdatagram」）。
   その後は通常の`decide`を`ValidatedIpv4::first_fragment = true`で通し、firewallとNATのvalidatorは
   header（UDP 8、ICMP query 8、TCPはdata offset分のoptionsまで）だけを検証し、datagram全体を覆う
@@ -561,9 +561,14 @@ in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの�
   分かれたdatagramはtimeoutまで解放しません。
 - **bounds**: entry数（`entries`）、(ingress, source)ごとのentry（`entries-per-host`）、held数
   （`held-fragments`）、(ingress, source)ごとのheld（`held-per-host`）。tableかhostのquotaが満ちると
-  最古のpending/deny entryを（その全体かそのhostの）evict listからO(1)でevictし、allow entryは
-  evictしません（後続を転送するのはallow templateだけなので、evictは後続を拒否か新しいholdにするだけ）。
-  WANからのfloodが作れるのはevictできるentryだけなので、ingressごとのreservationは置きません。held slotの長さ（fragmentation slotと同じ。
+  そのscope（host、ingress、table）の古いentryからevictします: pending/denyが先（hostとingressは
+  最古の8件、tableはevict listの先頭）、無ければscope最古のallow entryがtimeoutの1/5（default 1 s）
+  停滞していればそれ。後続を転送するのはallow templateだけなので、pending/denyのevictは後続を拒否か新しい
+  holdにするだけです。mappingを持つpeerを詐称した最初のfragmentはreturn trafficとして許可されallow entryに
+  なるので（re-review M-D）、さらに一つのingressのentryをtableの`ingress-share-percent`（default 50）までに
+  制限し、あるinterfaceのfloodが他のinterfaceのdatagramのentryを取れないようにします
+  （`IPV4_FRAGMENT_INGRESS_LIMIT`）。held slotが尽きるとholdを持つ最古のpendingをevictし、一datagramの
+  holdは16までです。`run_tick`は毎tick最大4件をsweepしてoccupancyとexpiry counterを進めます。held slotの長さ（fragmentation slotと同じ。
   超過は`IPV4_FRAGMENT_HOLD_TOO_LARGE`、production portからは起きない）。entryは最初に見たfragmentから
   `timeout-ms`で失効し延長しません。全entryの寿命が同じなので作成順に失効し、age list（entryに
   intrusiveなdoubly-linked list）の先頭から失効させるだけでscanはありません（操作ごとに最大2件、

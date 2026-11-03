@@ -342,7 +342,8 @@ protocol, ID）に記録し、同じdatagramの後続fragmentは同じ書き換�
 `IPV4_FRAGMENT_DUPLICATE_FIRST`（byte一致の重複以外はassociationをpoisonし、同じkeyの両datagramの残りを拒否。
 keyはportを含まないのでIDの再利用や二hostへの同じIDの応答を混ぜない）、RFC 791の構造違反は`IPV4_FRAGMENT_MALFORMED`、table/held/host上限は
 `IPV4_FRAGMENT_TABLE_FULL`、`HOST_LIMIT`、`HOLD_FULL`、`HOST_HOLD_LIMIT`、`HOLD_TOO_LARGE`です
-（host単位は(ingress, source)。tableかhostの上限では最古のpending/deny associationをevictし、allowはevictしない。
+（host単位は(ingress, source)。一つのingressはtableの`ingress-share-percent`（50）まで（超過は`IPV4_FRAGMENT_INGRESS_LIMIT`）。
+上限では古いpending/deny、無ければtimeoutの1/5停滞したallowをevict。一datagramのholdは16まで（`IPV4_FRAGMENT_DATAGRAM_HOLD_LIMIT`）。
 完了は0から終端までの全byteを重複なしに数え、終端と矛盾するfragmentは`IPV4_FRAGMENT_MALFORMED`でpoison）。
 routerのlocal address宛てのfragmentは対象外（reassembly未実装）。apply（SIGHUP reload）で全associationを
 破棄します。fragmentでないframeのfast pathはflags wordの一回の読みだけです。
@@ -355,6 +356,7 @@ entries-per-host = 32               # 省略時32、1以上。source addressご�
 held-fragments = 64                 # 省略時64、0〜512。最初のfragmentより先に届いた分（[fragmentation] offではholdしない）
 held-per-host = 16                  # 省略時16。source addressごと
 timeout-ms = 5000                   # 省略時5000、100〜60000。最初に見たfragmentから
+ingress-share-percent = 50          # 省略時50、1〜100。一つのinterfaceが取れるtableの割合
 ```
 
 EtherTypeを読んだ直後、IPv4/ARPはsnapshot上の正確なingress interfaceを解決し、
@@ -1044,7 +1046,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`を含む）のstorageは63.41 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`を含む）のstorageは63.53 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
