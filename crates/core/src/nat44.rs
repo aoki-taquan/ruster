@@ -4421,10 +4421,17 @@ impl<'a> Nat44UdpRuntime<'a> {
         self.config == config && self.hash_key == hash_key
     }
 
-    /// The generator of the IDs of the non-atomic datagrams this runtime
-    /// translates (RFC 6864 §5.3.1, NAT44-126).
-    pub(crate) fn ipv4_ids_mut(&mut self) -> &mut Ipv4IdGenerator {
-        &mut self.ipv4_ids
+    /// The ID of the next non-atomic datagram this runtime translates into
+    /// the (source, destination, protocol) tuple (RFC 6864 §5.3.1,
+    /// NAT44-126); the public address selects the direction's counters.
+    pub(crate) fn next_ipv4_id(
+        &mut self,
+        source: [u8; 4],
+        destination: [u8; 4],
+        protocol: u8,
+    ) -> u16 {
+        let public = self.config.public_address().octets();
+        self.ipv4_ids.next(source, destination, protocol, public)
     }
 
     #[must_use]
@@ -8313,10 +8320,17 @@ impl<'a> Nat44TcpRuntime<'a> {
         self.config
     }
 
-    /// The generator of the IDs of the non-atomic datagrams this runtime
-    /// translates (RFC 6864 §5.3.1, NAT44-126).
-    pub(crate) fn ipv4_ids_mut(&mut self) -> &mut Ipv4IdGenerator {
-        &mut self.ipv4_ids
+    /// The ID of the next non-atomic datagram this runtime translates into
+    /// the (source, destination, protocol) tuple (RFC 6864 §5.3.1,
+    /// NAT44-126); the public address selects the direction's counters.
+    pub(crate) fn next_ipv4_id(
+        &mut self,
+        source: [u8; 4],
+        destination: [u8; 4],
+        protocol: u8,
+    ) -> u16 {
+        let public = self.config.public_address().octets();
+        self.ipv4_ids.next(source, destination, protocol, public)
     }
 
     #[must_use]

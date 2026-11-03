@@ -810,3 +810,105 @@ fn queries_and_translated_errors_share_the_icmp_sequence() {
     assert_eq!(ipv4_header_checksum(&error[14..34]), 0);
     assert_eq!(&error[26..30], &PUBLIC.octets());
 }
+
+impl World {
+    /// Runs one frame through the UDP-only (`udp_only`) or TCP-only NAT
+    /// composition: no ICMP query runtime is bound.
+    fn run_single(
+        &mut self,
+        udp_only: bool,
+        ingress: IfId,
+        frame: Vec<u8>,
+    ) -> Result<(IfId, Vec<u8>), DropReason> {
+        self.io.inject(ingress, frame);
+        let now = MonotonicMillis(1_000);
+        let report = if udp_only {
+            self.io.run_nat44_udp_once(
+                1,
+                &self.snapshot,
+                &mut self.resolution,
+                &self.udp_config,
+                Some(&mut self.udp),
+                now,
+                &mut self.trace,
+            )
+        } else {
+            self.io.run_nat44_tcp_once(
+                1,
+                &self.snapshot,
+                &mut self.resolution,
+                &self.tcp_config,
+                Some(&mut self.tcp),
+                now,
+                &mut self.trace,
+            )
+        }
+        .unwrap();
+        assert!(report.invariants_hold());
+        if let Some(tx) = self.io.pop_tx() {
+            return Ok((tx.egress, tx.bytes));
+        }
+        match self.io.pop_recycled().expect("dropped").cause {
+            RecycleCause::Forwarding(reason) => Err(reason),
+            other => panic!("unexpected recycle {other:?}"),
+        }
+    }
+}
+
+/// Review M1/L1: inbound translations count apart from outbound ones, so no
+/// amount of outside DF-clear traffic toward the inside advances the ID
+/// sequence of an outbound tuple. 4096 outside sources (each its own
+/// inbound tuple, spread over the 1024 buckets) send DF-clear datagrams to
+/// H1's mapping; H1's next outbound DF-clear datagram still takes the next
+/// ID of (PUBLIC, REMOTE, UDP). With one shared array some of those inbound
+/// tuples would share that tuple's bucket and skip its sequence.
+#[test]
+fn inbound_df_clear_volume_never_advances_an_outbound_sequence() {
+    let mut world = World::with_filtering(false, 1500, Nat44Filtering::EndpointIndependent);
+    let (_, first) = world.run(LAN, udp(LAN, H1, REMOTE, P1, 53, 1, 0)).unwrap();
+    for n in 0..4096_u16 {
+        let [high, low] = n.to_be_bytes();
+        let source = Ipv4Address::from_octets([198, 18, high, low | 1]);
+        let (egress, _) = world
+            .run(WAN, udp(WAN, source, PUBLIC, 53, P1, n, 0))
+            .unwrap();
+        assert_eq!(egress, LAN);
+    }
+    let (_, next) = world.run(LAN, udp(LAN, H1, REMOTE, P1, 53, 1, 0)).unwrap();
+    assert_eq!(id_of(&next), id_of(&first).wrapping_add(1));
+}
+
+/// Review L2: without an ICMP query runtime, protocol 1 (translated errors)
+/// takes its IDs from the UDP runtime, or the TCP one when it is alone; a
+/// DF-clear error is translated with consecutive generated IDs, never
+/// refused.
+#[test]
+fn translated_errors_without_the_icmp_runtime_get_generated_ids() {
+    for udp_only in [true, false] {
+        let mut world = World::new(false, 1500);
+        let out = if udp_only {
+            world
+                .run_single(true, LAN, udp(LAN, H1, REMOTE, P1, 53, 1, 0))
+                .unwrap()
+                .1
+        } else {
+            let syn = tcp_segment(H1, REMOTE, P1, 443, SYN);
+            world
+                .run_single(
+                    false,
+                    LAN,
+                    ipv4_frame(LAN_MAC, H1_MAC, H1, REMOTE, 1, 0, 64, TCP, &syn),
+                )
+                .unwrap()
+                .1
+        };
+        let icmp = icmp_message(11, 0, [0; 4], &out[14..42]);
+        let error = ipv4_frame(WAN_MAC, GW_MAC, ROUTER, PUBLIC, 0x7777, 0, 64, 1, &icmp);
+        let (egress, a) = world.run_single(udp_only, WAN, error.clone()).unwrap();
+        assert_eq!(egress, LAN);
+        let (_, b) = world.run_single(udp_only, WAN, error).unwrap();
+        assert_eq!(id_of(&b), id_of(&a).wrapping_add(1), "udp_only={udp_only}");
+        assert_eq!(ipv4_header_checksum(&a[14..34]), 0);
+        assert_eq!(&a[30..34], &H1.octets());
+    }
+}

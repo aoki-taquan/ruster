@@ -2622,8 +2622,9 @@ where
                         trace,
                     )?;
                     apply_decision(frame, decision)?;
-                    // Only for a datagram that is sent: a dropped one
-                    // consumes no ID.
+                    // Only for a datagram the core commits for TX: a plan,
+                    // MTU, or firewall drop consumes no ID (a later backend
+                    // TX rejection does not return it).
                     rewrite_translated_non_atomic_id(
                         frame,
                         decision,
@@ -6651,8 +6652,14 @@ fn sender_is_host(
 /// translated tuple from the generator of its protocol: UDP from the UDP
 /// runtime, TCP from the TCP runtime, and ICMP (queries and translated
 /// errors share protocol 1, so one sequence) from the ICMP query runtime,
-/// else the UDP, else the TCP runtime. The header checksum is updated
-/// incrementally (RFC 1624).
+/// else the UDP, else the TCP runtime. Each generator counts tuples whose
+/// source is the public address (outbound, hairpin) apart from the others
+/// (inbound), so outside traffic cannot advance an outbound sequence. The
+/// header checksum is updated incrementally (RFC 1624).
+///
+/// The ID is taken when the core commits the frame for TX, before the
+/// backend accepts it: a backend TX rejection does not return it. A plan,
+/// MTU, or firewall drop happens earlier and takes none.
 fn rewrite_translated_non_atomic_id(
     frame: &mut [u8],
     decision: PacketDecision,
@@ -6676,28 +6683,10 @@ fn rewrite_translated_non_atomic_id(
     if flags_fragment & 0x7fff != 0 {
         return Ok(());
     }
-    let ids = match decision {
-        PacketDecision::Nat44Udp(_) => nat44_udp
-            .as_deref_mut()
-            .map(Nat44UdpRuntime::ipv4_ids_mut)
-            .ok_or(Nat44UdpRuntimeUnavailable)?,
-        PacketDecision::Nat44Tcp(_) => nat44_tcp
-            .as_deref_mut()
-            .map(Nat44TcpRuntime::ipv4_ids_mut)
-            .ok_or(Nat44TcpRuntimeUnavailable)?,
-        _ => {
-            if let Some(runtime) = nat44_icmp.as_deref_mut() {
-                runtime.ipv4_ids_mut()
-            } else if let Some(runtime) = nat44_udp.as_deref_mut() {
-                runtime.ipv4_ids_mut()
-            } else {
-                nat44_tcp
-                    .as_deref_mut()
-                    .map(Nat44TcpRuntime::ipv4_ids_mut)
-                    .ok_or(Nat44IcmpRuntimeUnavailable)?
-            }
-        }
-    };
+    // The NAT translates only IHL=5 datagrams (options are refused before
+    // any NAT decision, `Ipv4OptionsUnsupported`), so the IPv4 header is at
+    // the fixed offsets after the Ethernet header: ID at 4, flags at 6,
+    // protocol at 9, checksum at 10, addresses at 12..20.
     let old_id = packet::read_u16(frame, header + 4).ok_or(Ipv4HeaderTruncated)?;
     let checksum = packet::read_u16(frame, header + 10).ok_or(Ipv4HeaderTruncated)?;
     let addresses: [u8; 8] = frame
@@ -6705,11 +6694,30 @@ fn rewrite_translated_non_atomic_id(
         .and_then(|bytes| bytes.try_into().ok())
         .ok_or(Ipv4HeaderTruncated)?;
     let protocol = frame[header + 9];
-    let id = ids.next(
-        [addresses[0], addresses[1], addresses[2], addresses[3]],
-        [addresses[4], addresses[5], addresses[6], addresses[7]],
-        protocol,
-    );
+    let source = [addresses[0], addresses[1], addresses[2], addresses[3]];
+    let destination = [addresses[4], addresses[5], addresses[6], addresses[7]];
+    let id = match decision {
+        PacketDecision::Nat44Udp(_) => nat44_udp
+            .as_deref_mut()
+            .ok_or(Nat44UdpRuntimeUnavailable)?
+            .next_ipv4_id(source, destination, protocol),
+        PacketDecision::Nat44Tcp(_) => nat44_tcp
+            .as_deref_mut()
+            .ok_or(Nat44TcpRuntimeUnavailable)?
+            .next_ipv4_id(source, destination, protocol),
+        _ => {
+            if let Some(runtime) = nat44_icmp.as_deref_mut() {
+                runtime.next_ipv4_id(source, destination, protocol)
+            } else if let Some(runtime) = nat44_udp.as_deref_mut() {
+                runtime.next_ipv4_id(source, destination, protocol)
+            } else {
+                nat44_tcp
+                    .as_deref_mut()
+                    .ok_or(Nat44IcmpRuntimeUnavailable)?
+                    .next_ipv4_id(source, destination, protocol)
+            }
+        }
+    };
     frame[header + 4..header + 6].copy_from_slice(&id.to_be_bytes());
     frame[header + 10..header + 12]
         .copy_from_slice(&rfc1624_update(checksum, old_id, id).to_be_bytes());
