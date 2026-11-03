@@ -158,7 +158,9 @@
 #             startup with scope=device, warned on if1 (only) while
 #             running and recovered when cleared (M2 S11)
 #   afpacket  (AFPKT-015, after removal, which it follows by recreating
-#             ra/pa) `ruster run` with `backend.kind = "af-packet"`: GRO on
+#             ra/pa) `ruster run` with `backend.kind = "af-packet"` (MTU2
+#             part B: first the inbound run of the frag phase over
+#             AF_PACKET, lan `mtu = 1280`, fragments in the lan TX ring): GRO on
 #             ra, rb MTU 1400 (below the configured MTU), a kernel address
 #             on rb, and a VLAN on ra are refused
 #             (exit 1, no packet socket left); one router forwards with
@@ -2090,6 +2092,36 @@ frag_stop() {
         fail "$1: fragments ${fragments:-missing}, tx_accepted ${accepted:-missing}, fragmented $fragmented"
 }
 
+# Host B -> host A through the NAT toward lan `mtu = 1280`: host B answers
+# a poke from host A port 33300 (NAT mapping and firewall state) with a
+# 1400-byte DF-clear datagram (1372-byte payload) from port 9005; the
+# router translates it back and fragments it; captured on pa. $1 tag.
+frag_inbound() {
+    # As for host A (setup): full UDP checksums from host B's socket, or
+    # the router drops the reply (FIREWALL_UDP_CHECKSUM_INVALID).
+    in_ns "$host_b" ethtool -K pb tx off >/dev/null
+    rm -f "$stopfile"
+    in_ns "$host_b" python3 -I -c "$FRAG_SEND" 0.0.0.0 9005 1372 \
+        "ruster-$1-$suffix" "$stopfile" "ruster-$1-poke-$suffix" \
+        >"$work/frag-send-$1.out" 2>&1 &
+    sender=$!
+    tries=0
+    while ! grep -q ready "$work/frag-send-$1.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "$1: host B replier not ready"
+        sleep 0.05
+    done
+    frag_ns=$host_a
+    frag_receiver_start "frag-recv-$1.out" expect pa 33300 203.0.113.1 192.168.1.10 9005-9005 \
+        1280 1372 "ruster-$1-$suffix" 10 203.0.113.1 9005 "ruster-$1-poke-$suffix"
+    status=0
+    wait "$frag_receiver" || status=$?
+    : >"$stopfile"
+    wait "$sender" || true
+    in_ns "$host_b" ethtool -K pb tx on >/dev/null
+    [ "$status" -eq 0 ] || fail "$1: $(cat "$work/frag-recv-$1.out")"
+}
+
 phase_frag() {
     # Outbound: the WAN at 1400 (rb, pb, wan `mtu = 1400`), lan at its
     # default 1500.
@@ -2147,30 +2179,8 @@ phase_frag() {
     grep -q "warning: port=if1 MTU_BELOW_DEVICE mtu=1500 config=1280" "$work/frag-in.err" ||
         fail "frag-in: no MTU_BELOW_DEVICE warning for if1"
     forward_once frag_in_resolve
-    # As for host A (setup): full UDP checksums from host B's socket, or
-    # the router drops the reply (FIREWALL_UDP_CHECKSUM_INVALID).
-    in_ns "$host_b" ethtool -K pb tx off >/dev/null
-    rm -f "$stopfile"
-    in_ns "$host_b" python3 -I -c "$FRAG_SEND" 0.0.0.0 9005 1372 \
-        "ruster-frag-in-$suffix" "$stopfile" "ruster-frag-poke-$suffix" \
-        >"$work/frag-send-in.out" 2>&1 &
-    sender=$!
-    tries=0
-    while ! grep -q ready "$work/frag-send-in.out" 2>/dev/null; do
-        tries=$((tries + 1))
-        [ "$tries" -le 200 ] || fail "frag-in: host B replier not ready"
-        sleep 0.05
-    done
-    frag_ns=$host_a
-    frag_receiver_start frag-recv-in.out expect pa 33300 203.0.113.1 192.168.1.10 9005-9005 \
-        1280 1372 "ruster-frag-in-$suffix" 10 203.0.113.1 9005 "ruster-frag-poke-$suffix"
-    status=0
-    wait "$frag_receiver" || status=$?
-    : >"$stopfile"
-    wait "$sender" || true
-    in_ns "$host_b" ethtool -K pb tx on >/dev/null
-    [ "$status" -eq 0 ] || fail "frag-in: $(cat "$work/frag-recv-in.out")"
-    echo "priv_run_frag_inbound: $(sed -n 2p "$work/frag-recv-in.out") verified"
+    frag_inbound frag-in
+    echo "priv_run_frag_inbound: $(sed -n 2p "$work/frag-recv-frag-in.out") verified"
     frag_stop frag-in 1
     echo "priv_run_frag: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1280); inbound fragmentation.fragmented=consume.IPV4_FRAGMENTED=$fragmented, fragments=generated_fragments.tx_accepted=$fragments, nothing dropped or incomplete, drop.IPV4_FRAGMENTATION_REQUIRED=0, exit 0, detached verified"
 }
@@ -3323,6 +3333,22 @@ phase_afpacket() {
     expect_plan packet-router packet-reshape restart-required BACKEND
     expect_plan router packet-router restart-required BACKEND
     echo "priv_run_afpacket_config: af-packet configs valid (2 ports, 786432 ring bytes), firewall change reloadable, ring change and af-xdp -> af-packet restart-required BACKEND verified"
+
+    # MTU2 part B over AF_PACKET: the inbound run of the frag phase (lan
+    # `mtu = 1280`, every device at 1500) with the AF_PACKET backend: the
+    # fragments are generated frames written into the lan port's TX ring.
+    sed -e '/^mac = "02:00:00:00:00:01"$/a mtu = 1280' "$work/packet-router.toml" \
+        >"$work/packet-frag-in.toml"
+    [ "$(grep -cx "mtu = 1280" "$work/packet-frag-in.toml")" -eq 1 ] ||
+        fail "afpacket-frag: config edit"
+    in_ns "$host_a" ip route flush cache
+    in_ns "$host_b" ip route flush cache
+    start_ruster afpacket-frag "$work/packet-frag-in.toml"
+    wait_ready afpacket-frag || fail "afpacket-frag: ruster exited during startup"
+    forward_once afpacket_frag_resolve
+    frag_inbound afpacket-frag
+    frag_stop afpacket-frag 1
+    echo "priv_run_afpacket_frag: over AF_PACKET $(sed -n 2p "$work/frag-recv-afpacket-frag.out"); fragmentation.fragmented=consume.IPV4_FRAGMENTED=$fragmented, fragments=generated_fragments.tx_accepted=$fragments, nothing dropped or incomplete, exit 0 verified"
 
     # Refusals: GRO on a port, a port MTU below max-frame-len - 14, a
     # kernel IPv4 address on a port. Each opens no socket.
