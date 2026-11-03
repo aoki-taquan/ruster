@@ -1389,11 +1389,17 @@ impl CarryRoutes<'_> {
     /// both directions exactly. Two route lookups per snapshot.
     ///
     /// An endpoint that is one of the router's own addresses in both
-    /// snapshots is skipped (core L2): no forwarded packet is routed to a
-    /// router address. Such an endpoint appears only in the canonical tuple
-    /// of a hairpin flow (destination = the NAT public address), whose
-    /// packets the NAT translates back inside without a route lookup for
-    /// that address, so a route change toward it moves nothing.
+    /// snapshots is skipped (core L2). Such an endpoint can be a flow's
+    /// responder (the NAT public address in a hairpin flow's canonical
+    /// tuple, or a router address reached through a more specific route),
+    /// but no packet *from* it can reach the firewall: ingress validation
+    /// drops every received IPv4 packet whose source is a router address
+    /// (`Ipv4SourceLocalAddress`) before any state lookup. So the remote
+    /// side of such a flow can never refresh it from outside, which is what
+    /// revoking on a moved route protects against, and a route change
+    /// toward that address has nothing to close.
+    /// `carried_flow_never_admits_a_reverse_packet_from_a_router_address`
+    /// (io-sim) pins that assumption.
     fn moved(self, slot: FirewallStateSlot) -> bool {
         [slot.responder_address, slot.initiator_address]
             .into_iter()
