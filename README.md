@@ -550,13 +550,15 @@ unsolicited-syn-holds = 64       # 省略時64。quote table（本番上限4096�
 
 [icmpv4-errors.policy]
 port-unreachable-interval-ms = 1000  # 省略時1000。Port Unreachable専用limiter（egressごと）。restart-required
+fragmentation-needed-interval-ms = 10  # 省略時10。Fragmentation Needed専用limiter（egressごと、0不可）。restart-required
 
 [icmpv4-errors.translated]  # 省略可。outsideからの変換errorの(inside host, 引用remote)ごとの上限（NAT44-065）。restart-required
 rate-per-second = 100       # 省略時100（1〜1000000、無制限設定なし）
 burst = 100                 # 省略時100（同時刻に届く上限）。両方1000000で実質off
 
 [icmpv4-errors.capacity]
-states = 8   # delayed Port Unreachableがon（switch onかつholds > 0）ならinterface数 + 1以上が必須
+states = 8   # Fragmentation Neededがon（default）なら2 × interface数以上、delayed Port Unreachableもon（switch onかつholds > 0）なら2 × interface数 + 1以上が必須（Fragmentation Needed offならinterface数 + 1）
+actions = 8  # states下限以上を推奨（少ないと一つのclassが次の実行までaction_fullになり得る）
 ```
 
 | `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |

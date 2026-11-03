@@ -1453,7 +1453,13 @@ suppresses its Time Exceeded and Net/Host Unreachable. Each state can have
 one error queued, so size `icmpv4-errors.capacity.actions` the same way:
 with fewer actions than states in use, a full queue refuses the extra
 errors as `action_full` until the generated phase drains it (within the
-same tick at the default budgets).
+same tick at the default budgets). The queue is shared by every class, so
+with `actions` below the state bound (2 x interfaces, plus 1 with delayed
+Port Unreachable, while Fragmentation Needed is on) a burst of one class
+(a TTL sweep, a SYN flood) can hold every action and make another class,
+Fragmentation Needed included, `action_full` until the next execution.
+Set `actions` at least to the state bound; validation does not enforce
+it.
 
 Turning the switch off is a reloadable change (`plan` shows `nat44-tcp
 unsolicited-syn-icmp ~ on -> off`). Changing the capacity is
