@@ -624,7 +624,11 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   （holdがbindされている時）。
 - **bound**: (egress, next hop)ごとに`per-neighbor`（default 3）。超えたらそのnext hopの古いものを
   置き換え、最新を残します（RFC 1122の「latest」、`replaced`）。置き換えるのは送信者自身((ingress,
-  source))の最古があればそれ、無ければ最古（一つのhostが別hostのholdを押し出さない、review sec L2）。
+  source))の最古があればそれ、無ければ同じingressの最古、それも無ければこのnext hopで最も多く
+  holdしているingress（同数なら最古を持つもの）の最古です（一つのhostやinterfaceが自分の分を持つ間は
+  他を押し出さない。新しいingressはこのnext hopに一つも持たないので最大の利用者から取る。一つの
+  interfaceのfloodは`per-ingress` shareで抑える。review sec L2、re-review L2、#342 review L-4）。
+  置き換えられたものが最初のfragmentなら、association tableでそのdatagramをdenyします（下）。
   (ingress, source)ごと（NAT-FRAGと同じく、WANからinside addressを名乗るdatagramがinside hostの枠を
   使わない）に`per-host`（default 16、`ARP_HOLD_HOST_LIMIT`、置き換えるものが同じhostならその分を
   数えない）。ingress interfaceごとに`per-ingress`（default `packets`の半分、32、
@@ -640,9 +644,10 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
 - **replay**: `run_tick`はRX batchの直後（そのbatchのARP replyで解決したnext hopを同じtickで使う）、
   generated phaseを止めるbackend failureが無ければ`replay_arp_holds`を呼びます。held datagramを古い順に
   歩き（無ければO(1)）、next hopがstaticか生きたdynamic neighborになったものをreadyにし（その
-  tickのfragmentation slotの空き数まで。最初のfragment（MF、offset 0）はfragment association tableが
-  holdしているfragmentの数も予約する: 許可されるとそれらが同じslotへreleaseされるので、NAT/firewallを
-  commitしたreplayが必ず自分のslotを得る（review core #2）。残りは次のtick、`deferred`）、readyなものを`PacketBatch`として
+  tickのfragmentation slotの空き数まで。最初のfragment（MF、offset 0）はそのdatagramのheld fragment
+  の分も予約する: 許可されるとそれらが同じslotへreleaseされるので、NAT/firewallをcommitしたreplayが
+  必ず自分のslotを得る（review core #2）。予約はそのdatagram自身のheld数（`held_for`、変更なしの
+  lookup、高々16）で、他のdatagramのheld fragmentは数えない（re-review L1、#342 review L-1）。残りは次のtick、`deferred`）、readyなものを`PacketBatch`として
   通常の`forward_batch_tracked`へもう一度通します（holdはoff、二重holdは無い）。route、TTL、firewall、
   NAT、egress MTUとfragmentationはreplay時点で、同じpublicationの下で受信直後のように判定されcommit
   します。TTLはまだ減っておらず一回だけ減り、NAT/firewall stateはhold時には一つも作られていません。
@@ -650,7 +655,9 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   stage（`replay_sent`）、DF=0でegress MTUを超えるものはforwarding pathがfragmentとしてstage
   （`replay_fragmented`）、それ以外のdropは`replay_dropped`で数えます。replayのdrop/consume/staging
   のtrace eventはobserverへ渡しません（受信時に`ARP_HELD`として一度数えたframeなので、drop/consume
-  counterに二重に出さない。NAT、firewall、ICMP、resolutionのeventは渡す。firewallの
+  counterに二重に出さない。dropは理由付きの`TraceEvent::ArpHoldReplayDropped`としてtraceへ出し、
+  理由別のcounterは持たない。fragment association tableにparkされたもの（`IPV4_FRAGMENT_HELD`、
+  起きない想定）は`replay_parked`。NAT、firewall、ICMP、resolutionのeventは渡す。firewallの
   `rule_evaluations`のような作業量のcounterは判定を二回すれば二回数える）。
   同じtickの最後の`GeneratedFragments` phaseがrouter自身のARPとICMPv4の後、`[tick]
   generated-fragments`の範囲で送ります。新しいtick phaseもbackend APIも要りません。replayが作るICMPv4
@@ -666,8 +673,19 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   `[reload] state`によらず全holdを捨てます（`flushed`）。re-decideにすれば安全に送れますが、旧routeで
   選んだnext hopを待つholdを新しいroute/firewall/NATで判定することになるので、fail closedに捨てます
   （送信者の再送が拾う）。policyとstorageはshapeの一部（restart-required）。
-- **fragment**: holdした最初のfragmentはfragment association tableでdecideせず（`commit_deny`しない、
-  ticketを捨てるだけで何も変わらない）、その後続fragmentはtableのpending entryにheldされます。replayで
+- **fragment**: 最初のfragmentのadmissionはroomを計画するだけで、victimのevictはcommit
+  （`commit_allow`/`commit_deny`）の時です。ARP holdされた最初のfragmentはcommitしないので何もevict
+  しません（#341 re-review L4。replayのadmissionが改めて計画する）。holdした最初のfragmentは
+  decideせず、そのdatagramのpending entry（無ければevictなしで取れる時だけ新しく取る、`hold_first`）の
+  indexと作成時刻の下位16 bit（stamp。entryには何も足さない）をhold slotのpaddingへ記録します
+  （storageは増えない）。holdがfailed/cancelled/expiredやper-neighbor置き換えで捨てる最初の
+  fragmentは、その記録したentryが同じindex、stamp、keyのままpendingの時だけ`deny_pending`で
+  Denyにし、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。
+  `deny_pending`はlookupもinsertもevictもせず、decided entryには触れずpoisonもしません。IDが一巡して
+  同じkeyの新しいdatagramが同じslotを取っていればstampが違うので触れません（#342 review M1。
+  同じミリ秒（65536 ms周期）に作られた時だけ一致し得る。entryは高々60 sしか生きない）。pending entryを取れなかった最初のfragmentは
+  記録が無く、後続はtableのtimeoutで解放されます。apply（`flushed`）では同じapplyでtable自体も
+  flushされるので何もしません。replayで
   最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る
   ことがある。受信側のreassemblyには関係ない）。
 - **hairpin、翻訳ICMPv4 error、NAT inbound**: どれもmiss siteで記録され、replayが通常のpathで再判定します。
@@ -688,8 +706,8 @@ AGENTS.mdのbackend所有buffer契約に反する）。(2) hold時にdecisionを
 残余: replayはそのtickのgenerated fragment phaseで出るので、同じRX batchでARP replyの後に届いた同じ
 flowの新しいdatagram（RXでcommit）が先に出ます（IPは順序を保証しない。TCPのSYN再送やping seqの入れ替わり
 程度）。holdしたdatagramとその再送は両方送られます（重複はTCP/UDPのapplicationが扱う）。最初の
-fragmentの予約はtable全体のheld数で数えるので保守的で、fragmentation slotがそれより少なければその
-最初のfragmentは期限までreplayされません（何もcommitしない）。expiryは`interval × max-attempts`固定。
+fragmentの予約はそのdatagramのheld数なので、fragmentation slotがそれより少なければその最初の
+fragmentは期限までreplayされません（何もcommitせず、期限で上のdenyが後続も解放する）。expiryは`interval × max-attempts`固定。
 NAT inboundのneighbor missの前に出るNAT disposition trace（`Rejected(NeighborUnresolved)`）はhold
 されたdatagramにも出ます（traceだけで、counterは`ARP_HELD`）。multi-workerではworker間でholdを共有しない。
 
