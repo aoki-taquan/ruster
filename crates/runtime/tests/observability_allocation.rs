@@ -110,7 +110,7 @@ fn frames() -> [Vec<u8>; PER_TICK as usize] {
         truncated_ethernet(),
         unsupported_ethertype(),
         bad_ipv4_checksum(),
-        local_udp(),
+        local_unsupported(),
         echo_request(),
     ]
 }

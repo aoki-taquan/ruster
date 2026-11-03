@@ -818,6 +818,43 @@ fn icmpv4_generation_switches_map_onto_core_policies() {
     );
 }
 
+/// ICMP-ERR: the four new switches map onto their core kinds. Protocol
+/// Unreachable, the router's own UDP Port Unreachable, and Parameter
+/// Problem default on (RFC behavior); Communication Administratively
+/// Prohibited defaults off (owner decision, RFC 1812 §5.2.7.1 option).
+#[test]
+fn icmp_err_switches_map_onto_core_policies() {
+    use ruster_core::Icmpv4ErrorKind;
+
+    let new_kinds = [
+        Icmpv4ErrorKind::DestinationUnreachableProtocol,
+        Icmpv4ErrorKind::DestinationUnreachableLocalPort,
+        Icmpv4ErrorKind::ParameterProblem,
+        Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+    ];
+    let defaults = validated(VALID).icmpv4_errors().unwrap().policy();
+    assert_eq!(
+        new_kinds.map(|kind| defaults.generates(kind)),
+        [true, true, true, false]
+    );
+    let flipped = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nprotocol-unreachable = false\nudp-port-unreachable = false\n\
+         parameter-problem = false\nadmin-prohibited = true\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    let config = validated(&flipped);
+    let policy = config.icmpv4_errors().unwrap().policy();
+    assert_eq!(
+        new_kinds.map(|kind| policy.generates(kind)),
+        [false, false, false, true]
+    );
+    // The other kinds and the storage shape are unaffected.
+    assert!(policy.generates(Icmpv4ErrorKind::TimeExceededTtl));
+    assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachablePort));
+    assert_eq!(config.storage_shape(), validated(VALID).storage_shape());
+}
+
 /// B3: the Port Unreachable limiter interval defaults to 1 s, is a policy
 /// field (restart-required with the rest of the ICMPv4 error policy), and
 /// must not be 0.

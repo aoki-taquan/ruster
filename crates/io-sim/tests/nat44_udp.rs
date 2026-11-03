@@ -271,6 +271,113 @@ fn nat_config_rejects_missing_or_ambiguous_authority_and_invalid_pool() {
     );
 }
 
+/// Runs one frame through UDP NAT with the generated-error runtime bound
+/// and returns its recycle cause and the error counters (ICMP-ERR).
+fn nat_with_errors(
+    ingress: IfId,
+    frame: &[u8],
+) -> (RecycleCause, ruster_core::Icmpv4ErrorCounters, usize) {
+    let (routes, interfaces, neighbors, bindings) = base();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let config = config(&snapshot, 40_000, 40_010);
+    let mut mappings = [Nat44UdpMappingSlot::default(); 2];
+    let mut peers = [Nat44UdpPeerSlot::default(); 4];
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut rs, &mut ra);
+    let mut es = [ruster_core::Icmpv4ErrorStateSlot::EMPTY; 2];
+    let mut ea = [ruster_core::Icmpv4ErrorActionSlot::EMPTY; 2];
+    let mut errors = ruster_core::Icmpv4ErrorRuntime::new(
+        ruster_core::Icmpv4ErrorPolicy::default(),
+        &mut es,
+        &mut ea,
+    );
+    let mut io = SimIo::new();
+    io.inject(ingress, frame.to_vec());
+    let report = ruster_core::forward_batch_with_nat44_udp_and_icmpv4_errors(
+        ruster_core::PacketIo::receive(&mut io, 1).unwrap(),
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        &config,
+        Some(&mut nat),
+        MonotonicMillis(0),
+        &mut NoTrace,
+    );
+    assert_eq!(report.tx_requested, 0);
+    let recycled = io.pop_recycled().unwrap();
+    assert_eq!(recycled.bytes, frame);
+    (recycled.cause, errors.counters(), errors.pending_actions())
+}
+
+/// ICMP-ERR: UDP to the NAT public address (a router address) is the NAT's,
+/// not the router's own UDP: no mapping is a NAT miss, never Port
+/// Unreachable.
+#[test]
+fn udp_to_the_public_address_goes_to_the_nat_not_port_unreachable() {
+    let unsolicited = udp_frame(
+        REMOTE1,
+        PUBLIC,
+        9_999,
+        40_005,
+        64,
+        0x4000,
+        &[1, 2, 3],
+        &[],
+        UdpChecksum::Valid,
+    );
+    let (cause, counters, pending) = nat_with_errors(WAN, &unsolicited);
+    assert_eq!(
+        cause,
+        RecycleCause::Forwarding(DropReason::Nat44UdpMappingMiss)
+    );
+    assert_eq!(counters, Default::default());
+    assert_eq!(pending, 0);
+}
+
+/// ICMP-ERR: a header problem of an outside datagram toward the inside
+/// (which the NAT refuses as a bypass) stays silent: the Parameter Problem
+/// must not reveal that the inside prefix is routed.
+#[test]
+fn outside_to_inside_header_problems_stay_silent() {
+    let to_inside = udp_frame(
+        REMOTE1,
+        HOST,
+        9_999,
+        53,
+        64,
+        0x4000,
+        &[1, 2, 3],
+        &[],
+        UdpChecksum::Valid,
+    );
+    let mut options = to_inside.clone();
+    options.splice(34..34, [7, 36, 4, 0]);
+    options[14] = 0x46;
+    let total = u16::from_be_bytes([options[16], options[17]]) + 4;
+    options[16..18].copy_from_slice(&total.to_be_bytes());
+    options[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&options[14..38]);
+    options[24..26].copy_from_slice(&checksum.to_be_bytes());
+    let mut truncated = to_inside;
+    let claimed = u16::from_be_bytes([truncated[16], truncated[17]]) + 20;
+    truncated[16..18].copy_from_slice(&claimed.to_be_bytes());
+    truncated[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&truncated[14..34]);
+    truncated[24..26].copy_from_slice(&checksum.to_be_bytes());
+    for (received, reason) in [
+        (options, DropReason::Ipv4OptionsUnsupported),
+        (truncated, DropReason::Ipv4TotalLengthExceedsPacket),
+    ] {
+        let (cause, counters, pending) = nat_with_errors(WAN, &received);
+        assert_eq!(cause, RecycleCause::Forwarding(reason));
+        assert_eq!(counters, Default::default(), "{reason:?}");
+        assert_eq!(pending, 0);
+    }
+}
+
 #[test]
 fn exact_bidirectional_wire_and_same_batch_visibility() {
     let (routes, interfaces, neighbors, bindings) = base();

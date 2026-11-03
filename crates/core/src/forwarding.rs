@@ -422,6 +422,24 @@ pub enum DropReason {
     /// datagrams held, so a flood arriving on one interface (with any
     /// sources) cannot take the slots of another's hosts (ARP-HOLD).
     ArpHoldIngressLimit = 204,
+    /// A whole datagram addressed to the router carries an IP protocol the
+    /// router does not implement (not ICMP, TCP, or UDP); a Protocol
+    /// Unreachable error (Type 3, Code 2) is generated when enabled
+    /// (ICMP-ERR, RFC 1812 §5.2.7.1, RFC 1122 §3.2.2.1).
+    Ipv4LocalProtocolUnreachable = 205,
+    /// A valid whole UDP datagram addressed to the router: no UDP port is
+    /// open on the router, so a Port Unreachable error (Type 3, Code 3) is
+    /// generated when enabled (ICMP-ERR, RFC 1122 §4.1.3.1).
+    Ipv4LocalUdpPortUnreachable = 206,
+    /// A whole UDP datagram addressed to the router with a truncated header,
+    /// an invalid UDP length, or a nonzero invalid checksum: silently
+    /// discarded without an error (RFC 1122 §4.1.3.4).
+    Ipv4LocalUdpInvalid = 207,
+    /// A TCP segment addressed to the router, which runs no TCP service.
+    /// Silently discarded: a closed TCP port answers with a RST (RFC 793
+    /// §3.4 Reset Generation, RFC 1122 §4.2.2.12), not ICMP, and the
+    /// router originates no TCP (ICMP-ERR).
+    Ipv4LocalTcpUnsupported = 208,
 }
 
 use DropReason::*;
@@ -429,7 +447,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 204] = [
+    pub const ALL: [Self; 208] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -634,6 +652,10 @@ impl DropReason {
         ArpHoldHostLimit,
         ArpHoldTooLarge,
         ArpHoldIngressLimit,
+        Ipv4LocalProtocolUnreachable,
+        Ipv4LocalUdpPortUnreachable,
+        Ipv4LocalUdpInvalid,
+        Ipv4LocalTcpUnsupported,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -855,6 +877,10 @@ impl DropReason {
             ArpHoldHostLimit => "ARP_HOLD_HOST_LIMIT",
             ArpHoldTooLarge => "ARP_HOLD_TOO_LARGE",
             ArpHoldIngressLimit => "ARP_HOLD_INGRESS_LIMIT",
+            Ipv4LocalProtocolUnreachable => "IPV4_LOCAL_PROTOCOL_UNREACHABLE",
+            Ipv4LocalUdpPortUnreachable => "IPV4_LOCAL_UDP_PORT_UNREACHABLE",
+            Ipv4LocalUdpInvalid => "IPV4_LOCAL_UDP_INVALID",
+            Ipv4LocalTcpUnsupported => "IPV4_LOCAL_TCP_UNSUPPORTED",
         }
     }
 }
@@ -1630,6 +1656,12 @@ pub enum TraceEvent {
     /// The disposition of the Fragmentation Needed error (Type 3, Code 4)
     /// about a DF datagram longer than its egress MTU (MTU1).
     Icmpv4FragmentationNeededDisposition {
+        ingress: IfId,
+        disposition: Icmpv4ErrorDisposition,
+    },
+    /// The disposition of a Parameter Problem error (Type 12) about a
+    /// datagram whose IPv4 header the router cannot process (ICMP-ERR).
+    Icmpv4ParameterProblemDisposition {
         ingress: IfId,
         disposition: Icmpv4ErrorDisposition,
     },
@@ -4023,7 +4055,29 @@ fn decide_ipv4<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let mut ipv4 = validate_ipv4_frame(frame)?;
+    let mut ipv4 = match validate_ipv4_frame(frame) {
+        Ok(ipv4) => ipv4,
+        Err(Ipv4TotalLengthExceedsPacket) => {
+            // RFC 1812 §5.2.2: a datagram the link truncated SHOULD get a
+            // Parameter Problem pointing at Total Length; still discarded.
+            if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                truncated_parameter_problem(
+                    frame,
+                    snapshot,
+                    ingress,
+                    firewall_config.is_some(),
+                    nat44_udp_config,
+                    nat44_tcp_config,
+                    resolution,
+                    runtime,
+                    *now,
+                    trace,
+                );
+            }
+            return Err(Ipv4TotalLengthExceedsPacket);
+        }
+        Err(reason) => return Err(reason),
+    };
     // Only the fragment association table admits a first fragment
     // (NAT-FRAG); the validators then check its transport header only.
     ipv4.first_fragment = first_fragment;
@@ -4130,7 +4184,15 @@ fn decide_ipv4<T: TraceSink>(
             if ingress == config.inside()
                 && peek_icmp_type(frame, ipv4).is_some_and(is_query_request)
             {
-                return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
+                return decide_local_ipv4_with_errors(
+                    frame,
+                    snapshot,
+                    ingress,
+                    ipv4,
+                    resolution,
+                    icmpv4_errors,
+                    trace,
+                );
             }
             if icmp_reply_to_public && ingress != config.outside() {
                 return nat44_icmp_drop(ingress, Nat44IcmpWrongIngress, trace);
@@ -4329,9 +4391,50 @@ fn decide_ipv4<T: TraceSink>(
         }
     }
     if local {
-        return decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
+        return decide_local_ipv4_with_errors(
+            frame,
+            snapshot,
+            ingress,
+            ipv4,
+            resolution,
+            icmpv4_errors,
+            trace,
+        );
     }
     if ipv4.header_len > 20 {
+        // A firewall refused every option-bearing datagram above
+        // (`FIREWALL_IPV4_OPTIONS_UNSUPPORTED`), so this is the path
+        // without one. Malformed options keep the drop reason; the
+        // Parameter Problem disposition and counters tell them apart.
+        if let Ipv4OptionCheck::Invalid { pointer } =
+            ipv4_option_check(frame, snapshot, ipv4, false)
+        {
+            if let (Some(pointer), Some((runtime, now))) = (pointer, icmpv4_errors.as_mut()) {
+                if transit_error_allowed(
+                    ingress,
+                    selected_route,
+                    nat44_udp_config,
+                    nat44_tcp_config,
+                ) {
+                    let disposition = decide_icmpv4_error(
+                        frame,
+                        snapshot,
+                        ipv4,
+                        selected_route,
+                        Icmpv4ErrorKind::ParameterProblem,
+                        u16::from(pointer),
+                        resolution,
+                        runtime,
+                        *now,
+                        trace,
+                    );
+                    trace.record(TraceEvent::Icmpv4ParameterProblemDisposition {
+                        ingress,
+                        disposition,
+                    });
+                }
+            }
+        }
         return Err(Ipv4OptionsUnsupported);
     }
     let Some(route) = selected_route else {
@@ -4448,7 +4551,7 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
         let runtime = require_firewall_runtime(snapshot, config, firewall)?;
-        *firewall_plan = Some(plan_firewall(
+        let planned = plan_firewall(
             ingress,
             route.egress(),
             ipv4,
@@ -4458,7 +4561,36 @@ fn decide_ipv4<T: TraceSink>(
             runtime,
             firewall_audit,
             nat_now.0,
-        )?);
+        );
+        match planned {
+            Ok(plan) => *firewall_plan = Some(plan),
+            Err(reason) => {
+                // RFC 1812 §5.2.7.1 Code 13 for an administrative deny,
+                // off unless `admin-prohibited = true` (ICMP-ERR). The
+                // datagram is quoted as received, before any translation.
+                if matches!(reason, FirewallRuleDenied | FirewallDefaultDenied) {
+                    if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                        let disposition = decide_icmpv4_error(
+                            frame,
+                            snapshot,
+                            ipv4,
+                            Some(route),
+                            Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+                            0,
+                            resolution,
+                            runtime,
+                            *now,
+                            trace,
+                        );
+                        trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                            ingress,
+                            disposition,
+                        });
+                    }
+                }
+                return Err(reason);
+            }
+        }
     }
     if ipv4.ttl <= 1 {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
@@ -7118,7 +7250,7 @@ fn decide_icmpv4_error<T: TraceSink>(
     ipv4: packet::ValidatedIpv4,
     selected_destination_route: Option<Route>,
     kind: Icmpv4ErrorKind,
-    next_hop_mtu: u16,
+    header_value: u16,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
@@ -7178,14 +7310,16 @@ fn decide_icmpv4_error<T: TraceSink>(
         }
     }
 
-    let quote_end = ipv4.header_offset + ipv4.total_len;
+    // A datagram the link truncated (Parameter Problem about its Total
+    // Length) is quoted as far as it was received.
+    let quote_end = (ipv4.header_offset + ipv4.total_len).min(frame.len());
     schedule_reverse_icmpv4_error(
         snapshot,
         ipv4.source,
         frame[ipv4.header_offset + 1],
         &frame[ipv4.header_offset..quote_end],
         kind,
-        next_hop_mtu,
+        header_value,
         resolution,
         runtime,
         now,
@@ -7197,8 +7331,9 @@ fn decide_icmpv4_error<T: TraceSink>(
 /// `original_source` and queues it: the reverse route, the egress binding,
 /// the reverse neighbor (static, then fresh dynamic; a miss queues only an
 /// ARP Request), then the generated-ICMPv4 limiter. The caller has already
-/// applied the RFC 1812 §4.3.2.7 suppression rules. `next_hop_mtu` is the
-/// Next-Hop MTU of a Fragmentation Needed error (ignored for other kinds).
+/// applied the RFC 1812 §4.3.2.7 suppression rules. `header_value` is the
+/// Next-Hop MTU of a Fragmentation Needed error or the pointer of a
+/// Parameter Problem (ignored for other kinds).
 /// The quote is cut so the error fits the MTU of the reverse egress.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
@@ -7207,7 +7342,7 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     original_tos: u8,
     original_ipv4: &[u8],
     kind: Icmpv4ErrorKind,
-    next_hop_mtu: u16,
+    header_value: u16,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
@@ -7303,7 +7438,8 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
             snapshot.ipv4_origin.default_ttl(),
             original_ipv4,
         )
-        .with_next_hop_mtu(next_hop_mtu)
+        .with_next_hop_mtu(header_value)
+        .with_pointer(header_value as u8)
         .fit_egress_mtu(interface.mtu),
         now,
     )
@@ -7376,22 +7512,316 @@ fn reverse_target_forbidden(
         || snapshot.is_connected_boundary(egress, target)
 }
 
+/// [`decide_local_ipv4`], then the ICMP-ERR error its drop asks for:
+/// Protocol Unreachable, the router's own UDP Port Unreachable, or a
+/// Parameter Problem about malformed options (RFC 1812 §§4.3.3.5,
+/// 5.2.7.1). Every RFC 1812 §4.3.2.7 suppression, the per-kind switch, the
+/// reverse route and neighbor, and the class-0 limiter apply as for every
+/// other generated error. A datagram addressed to the router passes no
+/// forward firewall (there is no input firewall yet): these errors answer
+/// on every router address however the forward policy is set, so they
+/// show the router's presence and its (lack of) services to anyone who
+/// can reach an address. Their switches are the only control.
+#[allow(clippy::too_many_arguments)]
+fn decide_local_ipv4_with_errors<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    trace: &mut T,
+) -> Result<PacketDecision, DropReason> {
+    // Without a Port Unreachable to send, the UDP checksum is not read: a
+    // flood of UDP to a router address costs no payload pass.
+    let udp_checksum = icmpv4_errors.as_ref().is_some_and(|(runtime, _)| {
+        runtime
+            .policy()
+            .generates(Icmpv4ErrorKind::DestinationUnreachableLocalPort)
+    });
+    let decided = decide_local_ipv4(frame, snapshot, ingress, ipv4, udp_checksum, trace);
+    let Err(reason) = decided else {
+        return decided;
+    };
+    let Some((runtime, now)) = icmpv4_errors.as_mut() else {
+        return decided;
+    };
+    let (kind, header_value) = match reason {
+        Ipv4LocalProtocolUnreachable => (Icmpv4ErrorKind::DestinationUnreachableProtocol, 0),
+        Ipv4LocalUdpPortUnreachable => (Icmpv4ErrorKind::DestinationUnreachableLocalPort, 0),
+        Ipv4OptionsUnsupported => match ipv4_option_check(frame, snapshot, ipv4, true) {
+            Ipv4OptionCheck::Invalid {
+                pointer: Some(pointer),
+            } => (Icmpv4ErrorKind::ParameterProblem, u16::from(pointer)),
+            _ => return decided,
+        },
+        _ => return decided,
+    };
+    let disposition = decide_icmpv4_error(
+        frame,
+        snapshot,
+        ipv4,
+        None,
+        kind,
+        header_value,
+        resolution,
+        runtime,
+        *now,
+        trace,
+    );
+    trace.record(if kind == Icmpv4ErrorKind::ParameterProblem {
+        TraceEvent::Icmpv4ParameterProblemDisposition {
+            ingress,
+            disposition,
+        }
+    } else {
+        TraceEvent::Icmpv4DestinationUnreachableDisposition {
+            ingress,
+            disposition,
+        }
+    });
+    decided
+}
+
+/// A datagram addressed to the router that is not ICMP (ICMP-ERR). The
+/// router runs no UDP or TCP service and implements no other protocol:
+///
+/// - a fragment (no reassembly, ICMP4-006) is consumed as before, without
+///   an error (the protocol port of a later fragment is unknown);
+/// - UDP is checked like a host would (RFC 1122 §4.1.3.4: a truncated
+///   header, a length outside the IPv4 payload, or a nonzero invalid
+///   checksum is a silent drop) and then refused as Port Unreachable. The
+///   checksum is verified only when `udp_checksum` (a Port Unreachable can
+///   be sent): otherwise every UDP datagram with a valid header is
+///   `IPV4_LOCAL_UDP_PORT_UNREACHABLE`, answered or not;
+/// - TCP is a silent drop, a deliberate deviation (a closed TCP port
+///   answers with RST, RFC 793 §3.4, which the router does not originate);
+/// - every other protocol is Protocol Unreachable.
+fn decide_local_transport(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    flags_fragment: u16,
+    udp_checksum: bool,
+) -> Result<PacketDecision, DropReason> {
+    if flags_fragment & 0x3fff != 0 {
+        return Ok(PacketDecision::ConsumeIpv4Local);
+    }
+    match ipv4.protocol {
+        6 => Err(Ipv4LocalTcpUnsupported),
+        17 => {
+            let udp = validate_nat44_udp(frame, ipv4).map_err(|_| Ipv4LocalUdpInvalid)?;
+            if udp_checksum && udp.checksum != 0 && !udp_checksum_valid(frame, ipv4, udp.offset) {
+                return Err(Ipv4LocalUdpInvalid);
+            }
+            Err(Ipv4LocalUdpPortUnreachable)
+        }
+        _ => Err(Ipv4LocalProtocolUnreachable),
+    }
+}
+
+/// The result of walking the options of an IPv4 header (ICMP-ERR).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Ipv4OptionCheck {
+    /// Every option is well formed. The datagram is refused as
+    /// `IPV4_OPTIONS_UNSUPPORTED` either way (option processing is not
+    /// implemented); only an invalid one gets a Parameter Problem.
+    WellFormed,
+    /// A Parameter Problem: `pointer` is the offending octet in the IPv4
+    /// header, or `None` when the error cannot be sent because a
+    /// well-formed source route precedes the problem (RFC 1812 §4.3.2.6:
+    /// the error would need the reversed route).
+    Invalid { pointer: Option<u8> },
+}
+
+/// Walks the options of an option-bearing IPv4 header (at most 40 octets,
+/// cold: the datagram is refused either way). Problems, in walk order:
+///
+/// - an option without room for its length octet: pointer at the option
+///   type; a length below 2 or past the header: pointer at the length
+///   (RFC 791 §3.1, RFC 1812 §4.3.3.5);
+/// - Record Route (7), Loose (131) or Strict (137) Source Route whose
+///   length is below 3 or not 3 plus whole addresses: pointer at the
+///   length; whose pointer octet is below 4: pointer at it. Timestamp (68)
+///   shorter than 4 octets: pointer at the length; with a pointer octet
+///   below 5: pointer at it (RFC 791 §3.1);
+/// - a second source route option: pointer at its first octet (RFC 1812
+///   §5.2.4.1);
+/// - a Strict Source and Record Route in a datagram whose destination is
+///   none of the router's addresses (on any interface): pointer at the
+///   destination address, 16 (RFC 1812 §5.2.2). `local` is the ingress
+///   scoped local decision (ICMP4-001); a destination that is a router
+///   address on another interface counts as the router too.
+fn ipv4_option_check(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ipv4: packet::ValidatedIpv4,
+    local: bool,
+) -> Ipv4OptionCheck {
+    let for_router = local || snapshot.is_local_ipv4(ipv4.destination);
+    let Some(header) = frame.get(ipv4.header_offset..ipv4.header_offset + ipv4.header_len) else {
+        return Ipv4OptionCheck::WellFormed;
+    };
+    let mut offset = 20;
+    let mut source_route = false;
+    let invalid = |pointer: usize, source_route: bool| Ipv4OptionCheck::Invalid {
+        pointer: (!source_route).then_some(pointer as u8),
+    };
+    while offset < header.len() {
+        let option = header[offset];
+        match option {
+            0 => break,
+            1 => {
+                offset += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let Some(&length) = header.get(offset + 1) else {
+            return invalid(offset, source_route);
+        };
+        let length = usize::from(length);
+        if length < 2 || offset + length > header.len() {
+            return invalid(offset + 1, source_route);
+        }
+        if matches!(option, 7 | 131 | 137) {
+            if length < 3 || (length - 3) % 4 != 0 {
+                return invalid(offset + 1, source_route);
+            }
+            if header[offset + 2] < 4 {
+                return invalid(offset + 2, source_route);
+            }
+        }
+        if option == 68 {
+            if length < 4 {
+                return invalid(offset + 1, source_route);
+            }
+            if header[offset + 2] < 5 {
+                return invalid(offset + 2, source_route);
+            }
+        }
+        if matches!(option, 131 | 137) {
+            if source_route {
+                return Ipv4OptionCheck::Invalid {
+                    pointer: Some(offset as u8),
+                };
+            }
+            if option == 137 && !for_router {
+                return Ipv4OptionCheck::Invalid { pointer: Some(16) };
+            }
+            source_route = true;
+        }
+        offset += length;
+    }
+    Ipv4OptionCheck::WellFormed
+}
+
+/// Whether an error about a header problem of a datagram that is not
+/// addressed to the router may be sent (ICMP-ERR): only when the datagram
+/// has a route and no NAT gate refuses its crossing (outside to inside),
+/// so the error never reveals what the route or the NAT would hide. A
+/// forward firewall evaluates whole, option-free datagrams only, so with
+/// one these problems stay silent (the callers check).
+fn transit_error_allowed(
+    ingress: IfId,
+    selected_route: Option<Route>,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+) -> bool {
+    let Some(route) = selected_route else {
+        return false;
+    };
+    !(nat44_udp_config
+        .is_some_and(|config| ingress == config.outside() && route.egress() == config.inside())
+        || nat44_tcp_config
+            .is_some_and(|config| ingress == config.outside() && route.egress() == config.inside()))
+}
+
+/// RFC 1812 §5.2.2: a datagram whose Total Length is longer than the link
+/// delivered SHOULD get a Parameter Problem whose pointer is the Total
+/// Length field (2); it is still discarded as
+/// `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`. Only for a header whose version,
+/// IHL, and checksum are valid (the checksum is checked here, after the
+/// length), whose addresses pass the common ingress checks, and that is
+/// addressed to the router or, without a forward firewall, has a route
+/// [`transit_error_allowed`]. The quote is what was received.
+#[allow(clippy::too_many_arguments)]
+fn truncated_parameter_problem<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    firewall: bool,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    runtime: &mut Icmpv4ErrorRuntime<'_>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) {
+    let Some(ipv4) = packet::validate_truncated_ipv4_header(frame) else {
+        return;
+    };
+    if validate_ipv4_ingress(snapshot, ipv4).is_err() {
+        return;
+    }
+    // A datagram to the NAT public address with a firewall would be a NAT
+    // inbound candidate the firewall judges: stay silent like transit. On
+    // purpose for every protocol (not only the UDP/TCP/ICMP-reply inbound
+    // candidates): a truncated datagram has no reliable transport header,
+    // and silence is the fail-closed answer.
+    if firewall
+        && (nat44_udp_config.is_some_and(|config| ipv4.destination == config.public_address())
+            || nat44_tcp_config.is_some_and(|config| ipv4.destination == config.public_address()))
+    {
+        return;
+    }
+    let local = snapshot.is_local_ipv4_on(ingress, ipv4.destination);
+    let selected_route = if local {
+        None
+    } else {
+        let selected_route = snapshot.route_lookup(ipv4.destination);
+        if firewall
+            || validate_ipv4_forward_destination(ipv4, selected_route).is_err()
+            || !transit_error_allowed(ingress, selected_route, nat44_udp_config, nat44_tcp_config)
+        {
+            return;
+        }
+        selected_route
+    };
+    let disposition = decide_icmpv4_error(
+        frame,
+        snapshot,
+        ipv4,
+        selected_route,
+        Icmpv4ErrorKind::ParameterProblem,
+        2,
+        resolution,
+        runtime,
+        now,
+        trace,
+    );
+    trace.record(TraceEvent::Icmpv4ParameterProblemDisposition {
+        ingress,
+        disposition,
+    });
+}
+
 fn decide_local_ipv4<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
+    udp_checksum: bool,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     if ipv4.header_len > 20 {
         return Err(Ipv4OptionsUnsupported);
     }
-    if ipv4.protocol != 1 {
-        return Ok(PacketDecision::ConsumeIpv4Local);
-    }
-
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
+    if ipv4.protocol != 1 {
+        return decide_local_transport(frame, ipv4, flags_fragment, udp_checksum);
+    }
+
     if flags_fragment & 0x3fff != 0 {
         return Err(Icmpv4FragmentUnsupported);
     }
@@ -8961,6 +9391,10 @@ mod tests {
             (202, "ARP_HOLD_HOST_LIMIT"),
             (203, "ARP_HOLD_TOO_LARGE"),
             (204, "ARP_HOLD_INGRESS_LIMIT"),
+            (205, "IPV4_LOCAL_PROTOCOL_UNREACHABLE"),
+            (206, "IPV4_LOCAL_UDP_PORT_UNREACHABLE"),
+            (207, "IPV4_LOCAL_UDP_INVALID"),
+            (208, "IPV4_LOCAL_TCP_UNSUPPORTED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -8970,7 +9404,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(205), None);
+        assert_eq!(DropReason::from_code(209), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

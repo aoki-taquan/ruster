@@ -1516,6 +1516,10 @@ impl ObservableFields for ServiceCounters {
             reverse_binding_miss, reverse_target_forbidden, reverse_neighbor_unresolved,
             dequeued, dequeued_time_exceeded, dequeued_destination_unreachable,
             dequeued_host_unreachable, dequeued_port_unreachable, dequeued_fragmentation_needed,
+            queued_protocol_unreachable, queued_udp_port_unreachable, queued_parameter_problem,
+            queued_admin_prohibited, disabled_protocol_unreachable, disabled_udp_port_unreachable,
+            disabled_parameter_problem, disabled_admin_prohibited, dequeued_protocol_unreachable,
+            dequeued_udp_port_unreachable, dequeued_parameter_problem, dequeued_admin_prohibited,
         }}
         visit_counts! {v, "nat44_udp", self.nat44_udp, Nat44UdpCounters {
             mappings_created, mappings_reused, mappings_expired, peers_created,

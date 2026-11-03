@@ -190,13 +190,14 @@ pub fn bad_ipv4_checksum() -> Vec<u8> {
     frame
 }
 
-/// UDP to the router's own LAN address: consumed as local-unsupported.
-pub fn local_udp() -> Vec<u8> {
-    ipv4(
-        17,
-        LAN_IP,
-        &[0x30, 0x39, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00],
-    )
+/// An ICMP Echo Reply to the router's own LAN address: consumed as
+/// local-unsupported (no ICMP user interface, ICMP4-010A). A UDP datagram
+/// would be refused with Port Unreachable (ICMP-ERR).
+pub fn local_unsupported() -> Vec<u8> {
+    let mut icmp = [0, 0, 0, 0, 0x12, 0x34, 0, 1];
+    let checksum = internet_checksum(&icmp).to_be_bytes();
+    icmp[2..4].copy_from_slice(&checksum);
+    ipv4(1, LAN_IP, &icmp)
 }
 
 /// ICMPv4 Echo Request to the router's LAN address: answered in place.

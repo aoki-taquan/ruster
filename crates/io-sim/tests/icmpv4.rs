@@ -504,7 +504,9 @@ fn valid_unsupported_local_traffic_is_consumed_without_routing() {
     let interfaces = interfaces();
     let bindings = [local_binding(LAN)];
     let snapshot = local_snapshot(&interfaces, &bindings);
-    let udp = ipv4_frame(LOCAL_IP, 17, 64, 0, &[0; 8], &[]);
+    // A local fragment (no reassembly, ICMP4-006) is still consumed; a whole
+    // UDP datagram is refused with Port Unreachable (ICMP-ERR).
+    let udp = ipv4_frame(LOCAL_IP, 17, 64, 0x2000, &[0; 8], &[]);
     let unreachable = ipv4_frame(LOCAL_IP, 1, 64, 0, &icmp_message(3, 0, &[]), &[]);
     let originals = [udp.clone(), unreachable.clone()];
     let mut io = SimIo::new();
@@ -612,7 +614,7 @@ fn local_echo_and_consume_leave_resolution_runtime_untouched() {
     assert_eq!(runtime.pending_actions(), 2);
 
     io.inject(LAN, echo_request(&[], &[]));
-    io.inject(LAN, ipv4_frame(LOCAL_IP, 17, 64, 0, &[0; 8], &[]));
+    io.inject(LAN, ipv4_frame(LOCAL_IP, 17, 64, 0x2000, &[0; 8], &[]));
     let batch = io.receive(2).unwrap();
     let local = forward_batch_with_resolution(
         batch,

@@ -89,7 +89,9 @@
 #             refused on SIGHUP with the validate diagnostic (and by `run`)
 #   icmp      (gap fill) router-generated ICMPv4 over AF_XDP, captured on
 #             host A with a raw socket: Echo Reply from 192.168.1.1; Time
-#             Exceeded (TTL 1), Destination Unreachable Host (an on-link WAN
+#             Exceeded (TTL 1), Destination Unreachable Port (ICMP-ERR: UDP
+#             to the router's own 192.168.1.1, no port open), Destination
+#             Unreachable Host (an on-link WAN
 #             address that never answers ARP); a route miss is silent under
 #             router-v1 (FIREWALL_ROUTE_UNAVAILABLE) and, after a SIGHUP
 #             reload to router-v2 (rule 40, no egress), Destination
@@ -1173,7 +1175,8 @@ if mode == "echo":
     check(icmp[1] == 0 and icmp[6:8] == b"\0\x01" and icmp[8:] == marker, "echo code/sequence/payload")
     print("echo-reply type=0 code=0 from 192.168.1.1, identifier, sequence, and payload echoed")
     sys.exit(0)
-want = {"time-exceeded": (11, 0), "net-unreachable": (3, 0), "host-unreachable": (3, 1)}[mode]
+want = {"time-exceeded": (11, 0), "net-unreachable": (3, 0), "host-unreachable": (3, 1),
+        "port-unreachable": (3, 3)}[mode]
 check((icmp[0], icmp[1]) == want, "type/code %d/%d" % (icmp[0], icmp[1]))
 check(pkt[8] == 64, "outer TTL %d" % pkt[8])
 check(pkt[1] == 0xC0, "outer TOS 0x%02x" % pkt[1])
@@ -1613,6 +1616,11 @@ start_ruster icmp "$work/icmp.toml" --user "$smoke_uid" --group "$smoke_gid"
 wait_ready icmp || fail "icmp: ruster exited during startup"
 icmp_probe echo 192.168.1.1 64 10
 echo "priv_run_icmp_echo: $(cat "$work/icmp-echo.txt") verified"
+# ICMP-ERR: UDP to the router's own address (no UDP port is open) gets
+# Port Unreachable (RFC 1812 5.2.7.1, RFC 1122 4.1.3.1).
+icmp_probe port-unreachable 192.168.1.1 64 10
+wait_stat_ge icmp drop.IPV4_LOCAL_UDP_PORT_UNREACHABLE 1
+echo "priv_run_icmp_port_unreachable: $(cat "$work/icmp-port-unreachable.txt") verified"
 icmp_probe time-exceeded 203.0.113.1 1 10
 echo "priv_run_icmp_time_exceeded: $(cat "$work/icmp-time-exceeded.txt") verified"
 # 203.0.113.99 is on-link on the WAN and never answers the router's ARP

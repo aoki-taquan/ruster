@@ -3995,6 +3995,156 @@ fn route_miss_net_unreachable_switch_keeps_the_firewall_verdict_and_drop_reason(
     assert!(io.pop_tx().is_none());
 }
 
+/// ICMP-ERR: a firewall deny is a silent drop by default; with
+/// `admin-prohibited = true` it also gets an exact Communication
+/// Administratively Prohibited (Type 3, Code 13, RFC 1812 §5.2.7.1) toward
+/// the source, quoting the datagram as received. The verdict, the drop
+/// reason, and the firewall state are the same either way.
+#[test]
+fn firewall_deny_gets_admin_prohibited_only_when_enabled() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [allow(FirewallProtocol::Udp)];
+    let config = firewall_config(&snapshot, &rules, 1);
+    let unsolicited = udp_frame(REMOTE, HOST, 53, 40_000, 0x4000, true);
+    for enabled in [false, true] {
+        let mut firewall_slots = [FirewallStateSlot::default(); 2];
+        let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+        let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let policy = Icmpv4ErrorPolicy::default().with_generation(
+            Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+            enabled,
+        );
+        let mut errors = Icmpv4ErrorRuntime::new(policy, &mut error_states, &mut error_actions);
+        let mut io = SimIo::new();
+        io.inject(WAN, unsolicited.clone());
+        io.run_firewall_with_icmpv4_errors_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(1),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, DropReason::FirewallDefaultDenied, &unsolicited);
+        assert_eq!(firewall.counters().denied_default, 1);
+        assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
+        let counters = errors.counters();
+        if !enabled {
+            assert_eq!(
+                (counters.disabled_admin_prohibited, counters.queued),
+                (1, 0)
+            );
+            assert_eq!(errors.pending_actions(), 0);
+            assert!(io.pop_tx().is_none());
+            continue;
+        }
+        assert_eq!((counters.queued_admin_prohibited, counters.queued), (1, 1));
+        execute_one_icmpv4_error(
+            &mut io,
+            &mut errors,
+            MonotonicMillis(1),
+            &mut NoGeneratedIcmpv4Trace,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(errors.counters().dequeued_admin_prohibited, 1);
+        let generated = io.pop_tx().unwrap();
+        assert_eq!(generated.egress, WAN);
+        let quote = &unsolicited[14..14 + 31];
+        let mut expected = vec![0_u8; 14 + 28 + quote.len()];
+        expected[0..6].copy_from_slice(&GW_MAC.0);
+        expected[6..12].copy_from_slice(&WAN_MAC.0);
+        expected[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+        expected[14] = 0x45;
+        expected[15] = 0xc0;
+        expected[16..18].copy_from_slice(&u16::try_from(28 + quote.len()).unwrap().to_be_bytes());
+        expected[20..22].copy_from_slice(&0x4000_u16.to_be_bytes());
+        expected[22] = 64;
+        expected[23] = 1;
+        expected[26..30].copy_from_slice(&WAN_LOCAL.octets());
+        expected[30..34].copy_from_slice(&REMOTE.octets());
+        let checksum = ipv4_header_checksum(&expected[14..34]);
+        expected[24..26].copy_from_slice(&checksum.to_be_bytes());
+        expected[34] = 3;
+        expected[35] = 13;
+        expected[42..].copy_from_slice(quote);
+        let checksum = internet_checksum(&expected[34..]);
+        expected[36..38].copy_from_slice(&checksum.to_be_bytes());
+        assert_eq!(generated.bytes, expected);
+    }
+}
+
+/// ICMP-ERR: with a forward firewall, header problems of transit
+/// datagrams stay silent (the firewall cannot evaluate them, and the error
+/// must not reveal what the policy would refuse): malformed options are
+/// refused first as `FIREWALL_IPV4_OPTIONS_UNSUPPORTED`, a truncated
+/// datagram keeps `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`, neither answered.
+#[test]
+fn transit_header_problems_stay_silent_with_a_firewall() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [allow(FirewallProtocol::Udp)];
+    let config = firewall_config(&snapshot, &rules, 1);
+    let admitted = udp_frame(HOST, REMOTE, 40_000, 53, 0x4000, true);
+    // Record Route whose length runs past the header.
+    let mut options = admitted.clone();
+    options.splice(34..34, [7, 36, 4, 0]);
+    options[14] = 0x46;
+    let total = u16::from_be_bytes([options[16], options[17]]) + 4;
+    options[16..18].copy_from_slice(&total.to_be_bytes());
+    options[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&options[14..38]);
+    options[24..26].copy_from_slice(&checksum.to_be_bytes());
+    let mut truncated = admitted.clone();
+    let claimed = u16::from_be_bytes([truncated[16], truncated[17]]) + 20;
+    truncated[16..18].copy_from_slice(&claimed.to_be_bytes());
+    truncated[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&truncated[14..34]);
+    truncated[24..26].copy_from_slice(&checksum.to_be_bytes());
+    for (received, reason) in [
+        (options, DropReason::FirewallIpv4OptionsUnsupported),
+        (truncated, DropReason::Ipv4TotalLengthExceedsPacket),
+    ] {
+        let mut firewall_slots = [FirewallStateSlot::default(); 2];
+        let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
+        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
+        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+        let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+        let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+        let mut errors = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::default(),
+            &mut error_states,
+            &mut error_actions,
+        );
+        let mut io = SimIo::new();
+        io.inject(LAN, received.clone());
+        io.run_firewall_with_icmpv4_errors_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            &config,
+            Some(&mut firewall),
+            MonotonicMillis(1),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, reason, &received);
+        assert_eq!(errors.counters(), Default::default(), "{reason:?}");
+        assert_eq!(errors.pending_actions(), 0);
+        assert!(io.pop_tx().is_none());
+    }
+}
+
 /// FW-025: every route change is a new publication generation that flushes
 /// all firewall flows, so a flow's later packets are new-flow attempts. With
 /// the route back they are silently denied too, so answering only the route
