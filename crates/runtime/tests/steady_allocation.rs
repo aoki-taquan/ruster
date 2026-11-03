@@ -272,8 +272,11 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         // borrowed slice, 16 bytes) to the by-value snapshot; ARP-033 the
         // flattened RFC 5227 announcement policy (8 bytes past the ARP and
         // IPv4 origin policies' padding); INPUT-FW the input firewall rules
-        // (a borrowed slice, 16 bytes; the default action sits in padding).
-        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 128);
+        // (a borrowed slice, 16 bytes; the default action sits in padding);
+        // ARP-040 the per-interface announce/defense overrides (a borrowed
+        // slice, 16 bytes; the router-wide announce switch sits in the ARP
+        // policy's padding).
+        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 144);
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
         // N1 added the opening and closing idle TTLs to the TCP policy, and
@@ -288,8 +291,9 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
             120
         );
         // URPF: +16 bytes, the source validation slice of the snapshot;
-        // INPUT-FW: +16 bytes, the input firewall rules slice.
-        assert!(size_of::<FullServiceView<'static, 'static>>() <= 728);
+        // INPUT-FW: +16 bytes, the input firewall rules slice; ARP-040: +16
+        // bytes, the per-interface ARP override slice.
+        assert!(size_of::<FullServiceView<'static, 'static>>() <= 744);
     }
 
     counting::self_check();

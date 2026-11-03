@@ -167,8 +167,10 @@ pub enum ValidationCode {
     /// or shorter than one sequence (ARP-034).
     ArpAnnouncePolicy(ruster_core::ArpAnnouncePolicyError),
     /// `[tick] generated-arp = 0` with `[arp] announce` or
-    /// `conflict-defense` on: an owed Announcement could never be sent
-    /// (ARP-034; it would also keep the idle loop from waiting).
+    /// `conflict-defense` on for some interface (router-wide or by its
+    /// `[[interfaces]] arp-announce` or `arp-conflict-defense` override,
+    /// ARP-040): an owed Announcement could never be sent (ARP-034; it
+    /// would also keep the idle loop from waiting).
     ArpAnnounceWithoutGeneratedArp,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
@@ -1293,6 +1295,7 @@ pub struct ValidatedConfigV1 {
     ipv4_origin: Ipv4OriginPolicy,
     arp: ArpPolicy,
     source_validation: Box<[SourceValidationBinding]>,
+    arp_interfaces: Box<[ruster_core::ArpInterfacePolicy]>,
     resolution: Option<ValidatedResolutionV1>,
     icmpv4_errors: Option<ValidatedIcmpv4ErrorV1>,
     nat44: Option<ValidatedNat44V1>,
@@ -1387,6 +1390,15 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub fn source_validation(&self) -> &[SourceValidationBinding] {
         &self.source_validation
+    }
+
+    /// The `[[interfaces]] arp-announce` and `arp-conflict-defense`
+    /// overrides (ARP-040) of every interface that sets either, sorted by
+    /// interface (`None`: inherits `[arp]`); empty when no interface
+    /// overrides.
+    #[must_use]
+    pub fn arp_interfaces(&self) -> &[ruster_core::ArpInterfacePolicy] {
+        &self.arp_interfaces
     }
 
     #[must_use]
@@ -1531,6 +1543,7 @@ fn validate_v1(
     let exit_protection = config.exit_protection.unwrap_or_default();
     let mut interface_records = Vec::with_capacity(config.interfaces.len());
     let mut source_validation = Vec::new();
+    let mut arp_interfaces = Vec::new();
     for (index, source) in config.interfaces.into_iter().enumerate() {
         let base = indexed_path("interfaces", index);
         if source.name.is_empty() {
@@ -1612,6 +1625,13 @@ fn validate_v1(
             source_validation.push(SourceValidationBinding {
                 interface: IfId(source.id),
                 mode,
+            });
+        }
+        if source.arp_announce.is_some() || source.arp_conflict_defense.is_some() {
+            arp_interfaces.push(ruster_core::ArpInterfacePolicy {
+                interface: IfId(source.id),
+                announce: source.arp_announce,
+                conflict_defense: source.arp_conflict_defense,
             });
         }
         let binding = InterfaceBindingV1 {
@@ -1835,13 +1855,16 @@ fn validate_v1(
             path(&["arp", key]),
         )
     })?;
+    // The timing is kept with `announce = false`, for the interfaces that
+    // switch announcements on (ARP-040).
     let arp = ArpPolicy::RFC826
         .with_require_on_link_sender(arp_source.require_on_link_sender)
-        .with_announce(arp_source.announce.then_some(announce))
+        .with_announce_timing(announce, arp_source.announce)
         .with_defend_conflicts(arp_source.conflict_defense);
 
     interface_records.sort_by_key(|record| record.binding.id);
     source_validation.sort_by_key(|binding| binding.interface);
+    arp_interfaces.sort_by_key(|policy: &ruster_core::ArpInterfacePolicy| policy.interface);
     local_ipv4_with_paths.sort_by_key(|(binding, _)| binding.interface);
     neighbors_with_paths.sort_by_key(|(neighbor, _)| {
         (
@@ -2547,8 +2570,21 @@ fn validate_v1(
         });
     if let Some(source) = config.tick {
         // ARP-034: the RFC 5227 frames leave through the generated ARP
-        // budget; with none they could never be sent.
-        if source.generated_arp == 0 && (arp.announce().is_some() || arp.defend_conflicts()) {
+        // budget; with none they could never be sent. ARP-040: only an
+        // interface with either switch on (router-wide or by its override)
+        // can owe one.
+        let owes_arp = core_interfaces.iter().any(|interface| {
+            let policy = arp_interfaces
+                .iter()
+                .find(|policy| policy.interface == interface.id);
+            policy
+                .and_then(|policy| policy.announce)
+                .unwrap_or(arp.announce().is_some())
+                || policy
+                    .and_then(|policy| policy.conflict_defense)
+                    .unwrap_or(arp.defend_conflicts())
+        });
+        if source.generated_arp == 0 && owes_arp {
             return Err(ValidationError::new(
                 ValidationCode::ArpAnnounceWithoutGeneratedArp,
                 path(&["tick", "generated-arp"]),
@@ -2580,6 +2616,7 @@ fn validate_v1(
         ipv4_origin,
         arp,
         source_validation: source_validation.into_boxed_slice(),
+        arp_interfaces: arp_interfaces.into_boxed_slice(),
         resolution,
         icmpv4_errors,
         nat44,

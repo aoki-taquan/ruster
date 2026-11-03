@@ -1,4 +1,4 @@
-//! Unit tests of the RFC 5227 announcement slots (ARP-033..ARP-039): the
+//! Unit tests of the RFC 5227 announcement slots (ARP-033..ARP-040): the
 //! defense frame next to a running sequence and a flap-bound wait, retry
 //! after `Unavailable` without holding other ports back, backend rejects,
 //! the reload switch-off, the counters, and the slot rebind.
@@ -448,6 +448,148 @@ fn defense_off_by_reload_drops_an_owed_defense() {
         [WAN],
         "sequence only"
     );
+}
+
+/// ARP-040: a reload that switches one interface's overrides off cancels
+/// only that interface's running sequence and drops only its owed defense
+/// (the same semantics as the router-wide switches); the other interface
+/// keeps both. Detection still counts on the switched-off interface.
+#[test]
+fn per_interface_switch_off_by_reload_cancels_only_that_interface() {
+    world!(runtime, snapshot, ArpPolicy::RFC826);
+    let mut io = Io::default();
+    runtime.request_announcements(&snapshot, None);
+    assert_eq!(tick(&mut io, &mut runtime, &snapshot, 0), [LAN, WAN]);
+    conflict(&mut runtime, &snapshot, LAN, 1_000);
+    conflict(&mut runtime, &snapshot, WAN, 1_000);
+    assert_eq!(runtime.pending_announcements(), 2);
+    let (routes, interfaces, bindings) = (routes(), interfaces(), bindings());
+    let overrides = [ArpInterfacePolicy {
+        interface: WAN,
+        announce: Some(false),
+        conflict_defense: Some(false),
+    }];
+    let off = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings)
+        .unwrap()
+        .with_arp_interfaces(&overrides)
+        .unwrap();
+    assert!(off.announce_on(LAN).is_some() && off.defend_conflicts_on(LAN));
+    assert!(off.announce_on(WAN).is_none() && !off.defend_conflicts_on(WAN));
+    runtime.announce_changed_bindings(&snapshot, &off);
+    // WAN: its sequence and its defense, both cancelled.
+    assert_eq!(runtime.announce_counters().cancelled, 2);
+    assert_eq!(runtime.pending_announcements(), 1);
+    assert_eq!(tick(&mut io, &mut runtime, &off, 1_000), [LAN], "defense");
+    assert_eq!(tick(&mut io, &mut runtime, &off, 2_000), [LAN], "sequence");
+    assert_eq!(runtime.pending_announcements(), 0);
+    // WAN still detects and counts, but neither defends nor announces.
+    conflict(&mut runtime, &off, WAN, 20_000);
+    assert_eq!(
+        runtime.address_conflicts().collect::<Vec<_>>(),
+        [(LAN, 1), (WAN, 2)]
+    );
+    assert_eq!(runtime.request_announcements(&off, Some(WAN)), 0);
+    assert_eq!(runtime.pending_announcements(), 0);
+    assert!(tick(&mut io, &mut runtime, &off, 20_000).is_empty());
+}
+
+/// ARP-040: an interface override switches announcements on where the
+/// router-wide switch is off, with the router-wide timing (kept while
+/// off); the other interface inherits off.
+#[test]
+fn an_override_switches_announcements_on_under_a_global_off() {
+    let timing = ArpAnnouncePolicy::new(3, 1_000, 5_000).unwrap();
+    let global = ArpPolicy::RFC826
+        .with_announce_timing(timing, false)
+        .with_defend_conflicts(false);
+    assert_eq!(global.announce(), None);
+    assert_eq!(global.announce_timing(), timing);
+    let (routes, interfaces, bindings) = (routes(), interfaces(), bindings());
+    let overrides = [ArpInterfacePolicy {
+        interface: LAN,
+        announce: Some(true),
+        conflict_defense: None,
+    }];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings)
+        .unwrap()
+        .with_arp_policy(global)
+        .with_arp_interfaces(&overrides)
+        .unwrap();
+    assert_eq!(snapshot.announce_on(LAN), Some(timing));
+    assert_eq!(snapshot.announce_on(WAN), None);
+    assert!(!snapshot.defend_conflicts_on(LAN), "inherited");
+    let mut states = [ResolutionStateSlot::EMPTY; 2];
+    let mut actions = [ResolutionActionSlot::EMPTY; 2];
+    let mut slots = [ArpAnnounceSlot::EMPTY; 2];
+    let mut runtime = ResolutionRuntime::new(
+        ResolutionPolicy::new(1_000, 3_000).unwrap(),
+        &mut states,
+        &mut actions,
+    )
+    .with_announce_slots(&mut slots, &snapshot);
+    let mut io = Io::default();
+    assert_eq!(runtime.request_announcements(&snapshot, None), 1);
+    assert_eq!(runtime.announce_counters().disabled, 1);
+    let mut sent = Vec::new();
+    for now in (0..=4_000).step_by(500) {
+        sent.extend(
+            tick(&mut io, &mut runtime, &snapshot, now)
+                .into_iter()
+                .map(|id| (now, id)),
+        );
+    }
+    assert_eq!(sent, [(0, LAN), (1_000, LAN), (2_000, LAN)]);
+}
+
+/// ARP-040: borrowed overrides must name known interfaces, once each,
+/// sorted; the owner sorts and drops an override that overrides nothing.
+#[test]
+fn arp_interface_overrides_are_checked() {
+    let (routes, interfaces, bindings) = (routes(), interfaces(), bindings());
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
+    let policy = |interface| ArpInterfacePolicy {
+        interface,
+        announce: Some(false),
+        conflict_defense: None,
+    };
+    assert_eq!(std::mem::size_of::<ArpInterfacePolicy>(), 4);
+    assert_eq!(
+        snapshot.with_arp_interfaces(&[policy(IfId(9))]).err(),
+        Some(crate::SnapshotError::ArpInterfaceUnknownInterface)
+    );
+    assert_eq!(
+        snapshot
+            .with_arp_interfaces(&[policy(LAN), policy(LAN)])
+            .err(),
+        Some(crate::SnapshotError::DuplicateArpInterface)
+    );
+    assert_eq!(
+        snapshot
+            .with_arp_interfaces(&[policy(WAN), policy(LAN)])
+            .err(),
+        Some(crate::SnapshotError::ArpInterfaceUnsorted)
+    );
+    let owner = crate::ValidatedForwardingOwner::new(
+        routes.into(),
+        interfaces.into(),
+        Box::default(),
+        bindings.into(),
+        crate::Ipv4OriginPolicy::default(),
+    )
+    .unwrap()
+    .with_arp_interfaces(&[
+        policy(WAN),
+        ArpInterfacePolicy {
+            interface: LAN,
+            announce: None,
+            conflict_defense: None,
+        },
+    ])
+    .unwrap();
+    assert_eq!(owner.arp_interfaces(), [policy(WAN)]);
+    assert_eq!(owner.snapshot().arp_interface_policies(), [policy(WAN)]);
+    assert!(owner.snapshot().announce_on(WAN).is_none());
+    assert!(owner.snapshot().announce_on(LAN).is_some());
 }
 
 /// A port whose generated frames keep failing backs off exponentially

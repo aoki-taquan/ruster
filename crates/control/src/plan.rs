@@ -34,10 +34,11 @@ use ruster_config::{
     ValidatedAfXdpPortV1, ValidatedBackendV1, ValidatedConfigV1,
 };
 use ruster_core::{
-    FirewallHashKey, FirewallRule, FirewallRuleId, IfId, InputFirewallAction, InputFirewallRule,
-    Interface, Ipv4Address, LocalIpv4Binding, Nat44CarryIdentity, Nat44Filtering, Nat44TcpHashKey,
-    Nat44TcpInboundRst, Nat44UdpHashKey, Neighbor, PublicationQuiescence, ResolutionHashKey, Route,
-    SourceValidationBinding, StateCarryConflict, StateCarryOutcome,
+    ArpInterfacePolicy, FirewallHashKey, FirewallRule, FirewallRuleId, IfId, InputFirewallAction,
+    InputFirewallRule, Interface, Ipv4Address, LocalIpv4Binding, Nat44CarryIdentity,
+    Nat44Filtering, Nat44TcpHashKey, Nat44TcpInboundRst, Nat44UdpHashKey, Neighbor,
+    PublicationQuiescence, ResolutionHashKey, Route, SourceValidationBinding, StateCarryConflict,
+    StateCarryOutcome,
 };
 
 use crate::{
@@ -404,6 +405,7 @@ pub struct ApplyPlan {
     ipv4_origin_changed: bool,
     arp_policy_changed: bool,
     source_validation: Box<[Change<SourceValidationBinding>]>,
+    arp_interfaces: Box<[Change<ArpInterfacePolicy>]>,
     input_firewall_rules: Box<[Change<InputFirewallRule>]>,
     input_firewall_rule_order_changed: bool,
     input_firewall_default: Option<Delta<InputFirewallAction>>,
@@ -497,6 +499,9 @@ impl ApplyPlan {
                 next.source_validation(),
                 |binding| binding.interface,
             ),
+            arp_interfaces: diff(current.arp_interfaces(), next.arp_interfaces(), |policy| {
+                policy.interface
+            }),
             input_firewall_rules: diff(
                 old.firewall.input_rules(),
                 new.firewall.input_rules(),
@@ -640,6 +645,18 @@ impl ApplyPlan {
     #[must_use]
     pub fn source_validation(&self) -> &[Change<SourceValidationBinding>] {
         &self.source_validation
+    }
+
+    /// Per-interface `arp-announce` / `arp-conflict-defense` override
+    /// changes (ARP-040), in IfId order: an interface that starts
+    /// overriding is `Added`, one that stops (inherits `[arp]` again) is
+    /// `Removed`. Reloadable: the overrides are part of the forwarding
+    /// snapshot that every reload replaces, and take effect at the commit
+    /// like the `[arp]` switches (an off cancels a running sequence and
+    /// drops an owed defense on that interface).
+    #[must_use]
+    pub fn arp_interfaces(&self) -> &[Change<ArpInterfacePolicy>] {
+        &self.arp_interfaces
     }
 
     /// `[[firewall.input.rules]]` changes (INPUT-FW), by rule id.

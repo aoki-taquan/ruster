@@ -810,6 +810,64 @@ fn plan_prints_source_validation_as_a_reloadable_delta() {
     );
 }
 
+/// ARP-040: `[[interfaces]] arp-announce` and `arp-conflict-defense` are a
+/// reloadable per-interface delta, shown like `source-validation`: an
+/// interface that starts overriding is `+`, a changed override `~`, one
+/// back to inheriting `[arp]` `-`; an absent key prints `inherit`.
+#[test]
+fn plan_prints_per_interface_arp_switches_as_a_reloadable_delta() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let with = |name: &str, keys: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "mac = \"02:00:00:00:00:02\"\n",
+                &format!("mac = \"02:00:00:00:00:02\"\n{keys}"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let quiet = with("arp-wan-quiet.toml", "arp-announce = false\n");
+    let both = with(
+        "arp-wan-both.toml",
+        "arp-announce = false\narp-conflict-defense = false\n",
+    );
+    assert_eq!(status(&ruster(&["validate".as_ref(), both.as_os_str()])), 0);
+
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), quiet.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!(
+            "plan: reloadable\nrestart-required: none\nchanges: 1\n  \
+             arp-interface + if2 announce off conflict-defense inherit\n{CARRY_ALL}"
+        )
+    );
+    let plan = ruster(&["plan".as_ref(), quiet.as_os_str(), both.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert!(
+        text(&plan.stdout).contains(
+            "  arp-interface ~ if2 announce off conflict-defense inherit \
+             -> if2 announce off conflict-defense off\n"
+        ),
+        "{}",
+        text(&plan.stdout)
+    );
+    let plan = ruster(&["plan".as_ref(), both.as_os_str(), current.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert!(
+        text(&plan.stdout).contains("  arp-interface - if2 announce off conflict-defense off\n"),
+        "{}",
+        text(&plan.stdout)
+    );
+    assert!(text(&plan.stdout).starts_with("plan: reloadable\n"));
+}
+
 /// URPF sec L2: `validate` warns (value-free, exit 0) about `loose`
 /// without allow-default on the egress of a `/0` route and about `strict`
 /// on an interface no route leaves through; neither is refused, and a

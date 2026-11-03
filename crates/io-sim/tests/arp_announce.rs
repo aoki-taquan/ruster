@@ -1,5 +1,5 @@
 //! RFC 5227 ARP Announcements of the router's own addresses and address
-//! conflict detection/defense (ARP-033..ARP-039), through the validated
+//! conflict detection/defense (ARP-033..ARP-040), through the validated
 //! config, the publication, `run_tick`, and SimIo
 //! (fixtures/arphold/router.toml: LAN 192.168.1.1/24 on if1, WAN
 //! 203.0.113.2/24 on if2).
@@ -573,4 +573,150 @@ fn a_conflicting_request_for_our_address_is_answered_and_defended() {
         ]
     );
     assert_eq!(world.conflicts(), [(LAN, 1), (WAN, 0)]);
+}
+
+/// `text` with `wan` and `lan` appended to those `[[interfaces]]` entries
+/// (ARP-040 per-interface keys).
+fn interface_keys(text: &str, wan: &str, lan: &str) -> String {
+    let text = text.replacen(
+        "mac = \"02:00:00:00:00:02\"\n",
+        &format!("mac = \"02:00:00:00:00:02\"\n{wan}"),
+        1,
+    );
+    text.replacen(
+        "mac = \"02:00:00:00:00:01\"\n",
+        &format!("mac = \"02:00:00:00:00:01\"\n{lan}"),
+        1,
+    )
+}
+
+/// A conflicting ARP Reply claiming the WAN address (a Request for our
+/// address would also be answered, ARP-008).
+fn wan_conflict() -> (IfId, Vec<u8>) {
+    (
+        WAN,
+        arp(
+            BROADCAST,
+            OTHER_MAC,
+            2,
+            (OTHER_MAC, PUBLIC),
+            (H_MAC, [203, 0, 113, 9]),
+        ),
+    )
+}
+
+/// A conflicting ARP Reply claiming the LAN address.
+fn lan_conflict() -> (IfId, Vec<u8>) {
+    (
+        LAN,
+        arp(
+            LAN_MAC,
+            OTHER_MAC,
+            2,
+            (OTHER_MAC, LAN_IP),
+            (LAN_MAC, LAN_IP),
+        ),
+    )
+}
+
+/// ARP-040: `arp-announce = false` on the WAN (a shared ISP segment)
+/// stops its Announcements at startup and link-up while the LAN still
+/// announces; the WAN still inherits the defense.
+#[test]
+fn an_interface_override_turns_announcements_off_on_one_port() {
+    let text = interface_keys(ROUTER, "arp-announce = false\n", "");
+    let mut world = World::started(&text);
+    assert_eq!(world.active.resolution().pending_announcements(), 1);
+    assert_eq!(world.tick(0, &[]), [lan()]);
+    assert_eq!(idle(&mut world, 100, 6_000), [(2_000, lan())]);
+    assert_eq!(world.active.request_arp_announcements(Some(WAN)), 0);
+    assert!(idle(&mut world, 6_100, 9_000).is_empty());
+    let counters = world.counters();
+    assert_eq!(
+        (counters.requested, counters.disabled, counters.committed),
+        (1, 2, 2)
+    );
+    // The defense is a separate switch: still on, so the WAN defends.
+    assert_eq!(world.tick(10_000, &[wan_conflict()]), [wan()]);
+    assert_eq!(world.conflicts(), [(LAN, 0), (WAN, 1)]);
+}
+
+/// ARP-040: `arp-conflict-defense = false` on the WAN: a conflict there is
+/// still detected and counted (ARP-039) but not defended, while the LAN
+/// still defends (an operator-selected §2.4 deviation on the WAN only,
+/// ARP-038).
+#[test]
+fn defense_off_on_one_port_still_counts_conflicts() {
+    let text = interface_keys(ROUTER, "arp-conflict-defense = false\n", "");
+    let mut world = World::new(&text);
+    assert_eq!(world.tick(0, &[wan_conflict(), lan_conflict()]), [lan()]);
+    assert!(world.tick(20_000, &[wan_conflict()]).is_empty());
+    assert_eq!(world.conflicts(), [(LAN, 1), (WAN, 2)]);
+    let counters = world.counters();
+    assert_eq!(
+        (
+            counters.conflicts,
+            counters.defended,
+            counters.defense_suppressed
+        ),
+        (3, 1, 2)
+    );
+    // Announcements are a separate switch: the WAN still announces.
+    assert_eq!(world.active.request_arp_announcements(Some(WAN)), 1);
+    assert_eq!(world.tick(20_100, &[]), [wan()]);
+}
+
+/// ARP-040: the overrides are reloadable and take effect at the commit,
+/// like `[arp]`: switching the WAN off cancels its running sequence (the
+/// LAN's goes on), and removing the override (back to inheriting) lets the
+/// next link-up announce again, still bounded by the minimum interval
+/// since the sequence that ran before.
+#[test]
+fn a_reload_toggling_an_override_takes_effect_at_once() {
+    let mut world = World::started(ROUTER);
+    assert_eq!(world.tick(0, &[]), [lan(), wan()]);
+    let off = interface_keys(ROUTER, "arp-announce = false\n", "");
+    assert!(world.reload(1_000, &off).is_empty());
+    assert_eq!(world.counters().cancelled, 1);
+    assert_eq!(idle(&mut world, 1_100, 6_000), [(2_000, lan())]);
+    assert_eq!(world.active.request_arp_announcements(Some(WAN)), 0);
+
+    assert!(world.reload(7_000, ROUTER).is_empty(), "inherits again");
+    assert_eq!(world.active.request_arp_announcements(Some(WAN)), 1);
+    assert_eq!(
+        idle(&mut world, 7_100, 13_000),
+        [(10_000, wan()), (12_000, wan())]
+    );
+}
+
+/// ARP-040: an interface without a key inherits the router-wide switch.
+/// With `[arp] announce = false` and `conflict-defense = false`, the LAN
+/// switches announcements back on (and inherits defense off) and the WAN
+/// switches defense back on (and inherits announcements off).
+#[test]
+fn interfaces_inherit_the_router_wide_switches() {
+    let global_off = router("announce = false\nconflict-defense = false", LAN_IP);
+    let text = interface_keys(
+        &global_off,
+        "arp-conflict-defense = true\n",
+        "arp-announce = true\n",
+    );
+    let mut world = World::started(&text);
+    assert_eq!(world.tick(0, &[]), [lan()]);
+    assert_eq!(idle(&mut world, 100, 3_000), [(2_000, lan())]);
+    assert_eq!(world.counters().disabled, 1, "the WAN inherits off");
+    assert!(
+        world.tick(5_000, &[lan_conflict()]).is_empty(),
+        "the LAN inherits defense off"
+    );
+    assert_eq!(world.tick(5_100, &[wan_conflict()]), [wan()]);
+    assert_eq!(world.conflicts(), [(LAN, 1), (WAN, 1)]);
+
+    // The same document without the keys: every interface inherits off.
+    let mut plain = World::started(&global_off);
+    assert!(idle(&mut plain, 0, 3_000).is_empty());
+    assert!(plain
+        .tick(5_000, &[lan_conflict(), wan_conflict()])
+        .is_empty());
+    assert_eq!(plain.conflicts(), [(LAN, 1), (WAN, 1)]);
 }
