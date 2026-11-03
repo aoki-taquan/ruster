@@ -1154,3 +1154,27 @@ fn a_parked_replay_is_counted_apart_and_dropped_first_fragments_are_reported() {
     assert_eq!(reported, [(7, 3)]);
     assert_eq!(runtime.live(), 0);
 }
+
+/// #345 review L-c: a first fragment whose key now belongs to another
+/// datagram (the hook returns `None`) is freed as cancelled; the rest of
+/// the walk goes on.
+#[test]
+fn a_first_fragment_whose_key_was_reused_is_cancelled() {
+    let mut table = Table::new(4);
+    let mut runtime = table.runtime(8, 16);
+    let mut first = frame([192, 168, 1, 10], 60, 1);
+    first[20] = 0x20; // MF, offset 0
+    let mut later = frame([192, 168, 1, 10], 60, 2);
+    later[20..22].copy_from_slice(&[0x20, 0x10]); // MF, offset 16
+    runtime
+        .hold(&first, LAN, miss(GW, 9_000), |_, _, _, _, _| {})
+        .unwrap();
+    runtime
+        .hold(&later, LAN, miss(GW, 9_000), |_, _, _, _, _| {})
+        .unwrap();
+    let known = |_: IfId, _: Ipv4Address| ArpHoldNextHop::Known;
+    assert_eq!(runtime.mark_ready(0, 8, known, |_| None), 1);
+    assert_eq!(runtime.counters().cancelled, 1);
+    assert_eq!(runtime.counters().deferred, 0);
+    assert_eq!(tags(&runtime), [2]);
+}

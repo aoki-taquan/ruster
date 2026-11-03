@@ -195,7 +195,7 @@ fn deny_pending_spares_an_entry_created_after_the_hold_with_the_same_stamp() {
     // 65.536 s later (the old entry long expired), a newer datagram on the
     // key takes the same slot with the same stamp.
     hold_later(&mut tracker, 10, 5, 65_536);
-    assert_eq!(tracker.pending_for(first), Some((index, generation, 1)));
+    assert_eq!(tracker.entry_for(first), Some((index, generation, 1)));
     assert!(!tracker.deny_pending(index, generation, first, 0, 65_600));
     assert_eq!(tracker.held_for(first), 1);
     tracker.check_invariants().unwrap();

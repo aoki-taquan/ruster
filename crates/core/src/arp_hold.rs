@@ -317,7 +317,11 @@ pub struct ArpHoldCounters {
     /// Held datagrams freed because their resolution failed.
     pub failed: usize,
     /// Held datagrams freed because their resolution was cancelled or its
-    /// learned neighbour expired before the replay found room.
+    /// learned neighbour expired before the replay found room, or (a held
+    /// first fragment) because its datagram's association entry is gone
+    /// and the key now has another entry: a newer datagram reusing the
+    /// key, or the datagram's own later fragments recreating it after an
+    /// eviction (indistinguishable, so it fails closed).
     pub cancelled: usize,
     /// Held datagrams freed when their resolution could no longer succeed.
     pub expired: usize,

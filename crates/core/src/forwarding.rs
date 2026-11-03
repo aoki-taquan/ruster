@@ -2982,7 +2982,10 @@ where
                     else {
                         return Some(0);
                     };
-                    match (tracker.pending_for(info), association) {
+                    // Any live entry on the key (pending or decided) that is not
+                    // the recorded one belongs to a newer datagram: replaying
+                    // would decide or poison it (#345 review L-a).
+                    match (tracker.entry_for(info), association) {
                         (Some((index, stamp, _)), Some(recorded)) if (index, stamp) != recorded => {
                             None
                         }

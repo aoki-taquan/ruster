@@ -1386,3 +1386,78 @@ fn a_held_first_fragment_whose_key_was_reused_is_not_replayed() {
     );
     assert_eq!(tracker_counters(&world).first_allowed, 0);
 }
+
+/// #345 review L-a: a newer datagram on the reused key whose first fragment
+/// was forwarded (its entry decided) before the replay, in the same RX batch
+/// after the ARP reply: the old held first fragment is not replayed and the
+/// newer datagram is not poisoned.
+#[test]
+fn a_held_first_fragment_does_not_poison_a_decided_newer_datagram() {
+    let text = ROUTER.replacen(
+        "[tick]",
+        "[fragment-tracking]\ntimeout-ms = 1000\n\n[tick]",
+        1,
+    );
+    let mut world = World::new(&text);
+    let frames = h_fragments(0x5801, 5000);
+    world.tick(0, &frames[..2]);
+    assert_eq!(tracker_held(&world), (1, 0));
+    world.tick(1_200, &[]);
+    assert_eq!(tracker_held(&world).0, 0);
+    // The reply, then the newer datagram's first fragment, in one batch.
+    let mut batch = vec![(WAN, g_reply())];
+    batch.extend_from_slice(&frames[..1]);
+    let sent = world.tick(1_300, &batch);
+    assert_eq!(sent.len(), 1, "only the newer first fragment: {sent:?}");
+    let counters = world.hold();
+    assert_eq!(
+        (counters.cancelled, counters.replayed, world.live()),
+        (1, 0, 0)
+    );
+    // Its later fragments follow the allowed entry.
+    let sent = world.tick(1_400, &frames[1..]);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let tracker = tracker_counters(&world);
+    assert_eq!((tracker.poisoned, tracker.first_denied), (0, 0));
+}
+
+/// #345 review L-c, end to end: a hold window over 65.536 s (10 s × 10
+/// attempts). The held first fragment's entry expires and a newer datagram
+/// on the key creates an entry at 65 536 ms in the same slot with the same
+/// 16-bit stamp; when the hold fails, the hold start derived from the
+/// deadline keeps the newer datagram from being denied.
+#[test]
+fn a_hold_longer_than_the_stamp_period_spares_a_same_stamp_newer_datagram() {
+    let text = ROUTER
+        .replacen(
+            "interval-ms = 1000\nstate-ttl-ms = 3000",
+            "interval-ms = 10000\nstate-ttl-ms = 10000",
+            1,
+        )
+        .replacen("max-attempts = 3", "max-attempts = 10", 1)
+        .replacen(
+            "[tick]",
+            "[fragment-tracking]\ntimeout-ms = 60000\n\n[tick]",
+            1,
+        );
+    let mut world = World::new(&text);
+    let frames = h_fragments(0x5901, 5000);
+    world.tick(0, &frames[..2]);
+    assert_eq!(tracker_held(&world), (1, 0));
+    world.tick(61_000, &[]);
+    assert_eq!(tracker_held(&world).0, 0, "the entry expired");
+    world.tick(65_536, &frames[2..]);
+    assert_eq!(tracker_held(&world).0, 1);
+    // Same slot and stamp: the walk takes the newer entry for its own.
+    world.tick(70_000, &[]);
+    assert_eq!((world.live(), world.hold().cancelled), (1, 0));
+    let mut now = 70_000;
+    while world.live() != 0 {
+        assert!(now < 120_000, "the hold fails by its deadline");
+        now += 1_000;
+        world.tick(now, &[]);
+    }
+    assert_eq!((world.hold().expired, now), (1, 100_000));
+    assert_eq!(tracker_held(&world), (1, 0), "the newer datagram is kept");
+    assert_eq!(tracker_counters(&world).first_denied, 0);
+}
