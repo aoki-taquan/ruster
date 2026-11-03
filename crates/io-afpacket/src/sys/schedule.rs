@@ -383,6 +383,18 @@ impl<O: PacketOps> AfPacketEngine<O> {
         if self.settle_all(false).is_err() {
             return Err(AfPacketQuiescenceError::Stopped);
         }
+        // First pass: TX on a port not seen down blocks, without probing a
+        // down port (the confirming kick bypasses the retry backoff, so it
+        // runs only when it can decide the check).
+        let blocking: u64 = self
+            .ports
+            .iter()
+            .filter(|port| !port.kick.link_down || port.kick.unbound)
+            .map(|port| port.tx_state.in_flight as u64)
+            .sum();
+        if blocking != 0 {
+            return Err(AfPacketQuiescenceError::TxInFlight { frames: blocking });
+        }
         let now = self.now_ms;
         let mut frames: u64 = 0;
         for port in self.ports.iter_mut() {

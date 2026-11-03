@@ -170,9 +170,10 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `EAGAIN`/`EBUSY`/`ENOBUFS`/`EINTR`を`KickOutcome::Deferred`、他をtyped `KickError`にする。
   `attach_xdp`は`take_datapath`より前に呼ぶ。`NativeSession::open`はinterface lookup直後に、bind queueに
   TX queueがあることをcallerのnetnsのrtnetlink `RTM_GETLINK`（`IFLA_NUM_TX_QUEUES`、`IFLA_IFNAME`が設定名。
-  OPS-EXITでsysfsから移行し、query失敗はtyped `SessionFailure::LinkQuery`。TX queueが2以上の時の
-  active数はsysfsのviewがこのdeviceを示す時だけ`queues/tx-<queue>`で確かめ、示さなければ
-  `TxQueueUnverifiable`でfail closed）で確かめ、無ければresource取得前に`SessionFailure::NoTxQueue`で拒否する
+  OPS-EXITでsysfsから移行し、query失敗はtyped `SessionFailure::LinkQuery`。割当TX queueが一つ（vethは
+  `ip link add ... numtxqueues 1`）ならqueue 0だけでsysfsは読まない。2以上の時のactive数はsysfsのviewの
+  `ifindex`と`address`が両方rtnetlinkの値と一致する時だけ`queues/tx-<queue>`で確かめ（ifindexはnetnsごとなので
+  addressで裏付ける。証明ではない）、一致しなければ`TxQueueUnverifiable`でfail closed）で確かめ、無ければresource取得前に`SessionFailure::NoTxQueue`で拒否する
   （Linuxは`queue < max(RX, TX)`でbindを許すがcopy-mode TXは黙って何も送らない）。`drain(rounds)`は新規TXとFillを止めてcompletionを
   回収し、全frameを一回だけledgerへ戻し、kernelがまだ持つframeを`DrainOutcome::TxInFlight`と
   `FrameAccounting`で報告する（返ったことにはしない）。M2 S5（X03）の`allocate_generated(len)`は
@@ -1213,7 +1214,7 @@ sudo kill -HUP <pid>                                               # configをre
   seccompの前に開くがkernelは書き込み・link変更ごとに`CAP_NET_ADMIN`を確かめるので、どちらのkeyも
   `--keep-privileges`だけ（`EXIT_FORWARDING_NEEDS_PRIVILEGES`/`EXIT_LINK_DOWN_NEEDS_PRIVILEGES`）。
   `--keep-privileges`は全threadに全capabilityを残し、compromiseされたprocessがrtnetlinkでnamespaceの
-  networkを書き換えられるので、`[exit-protection]`は`--seccomp off`/`--fs-confine off`とは組めない
+  networkを書き換えられるので、`[exit-protection]`は`--seccomp off`/`log`、`--fs-confine off`とは組めない
   （`EXIT_PROTECTION_NEEDS_SECCOMP`/`EXIT_PROTECTION_NEEDS_FS_CONFINE`）。drop下で動くhelper process案は
   architectureにowner決定待ちとして記載。`SIGKILL`等はsupervisorの`ExecStopPost=`で補う（runbookの9章）。
   非initial user namespaceでは起動時に`USER_NAMESPACE_NOT_INITIAL`をwarningする。

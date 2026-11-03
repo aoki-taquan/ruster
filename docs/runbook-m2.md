@@ -2219,7 +2219,7 @@ link-down = false           # set every port's link administratively down (IFF_U
   before Landlock and the syscall filter, which allow the later `write`
   and `sendto`/`recvfrom`; until the owner decides on a privileged helper
   process (architecture document), `[exit-protection]` is refused with
-  `--seccomp off` (`EXIT_PROTECTION_NEEDS_SECCOMP`) or `--fs-confine off`
+  `--seccomp off` or `log` (log lets every syscall run; `EXIT_PROTECTION_NEEDS_SECCOMP`) or `--fs-confine off`
   (`EXIT_PROTECTION_NEEDS_FS_CONFINE`), exit 2. With the default drop, use
   the supervisor's post-stop hook below instead.
 - **What `--keep-privileges` costs.** It keeps every capability the
@@ -3550,11 +3550,11 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `reload refused: code=RESTART_REQUIRED reasons=...` | — | the change needs a restart | restart in a quiet period |
 | `reload failed: stage=quiesce code=TIMEOUT` | — | TX on a port whose link is up did not complete within 200 ms (a port that is down no longer blocks, section 12) | check the port's TX (`tx_inflight`, `TX_STALL`), send SIGHUP again |
 | `invalid config: stage=exit-protection code=EXIT_LINK_DOWN_NEEDS_PRIVILEGES` | 2 | `link-down = true` under the privilege drop: no thread holds `CAP_NET_ADMIN` at exit | run with `--keep-privileges` (every capability stays, section 9), or set the link down in `ExecStopPost=` |
-| `invalid config: stage=exit-protection code=EXIT_PROTECTION_NEEDS_SECCOMP` / `EXIT_PROTECTION_NEEDS_FS_CONFINE` | 2 | `[exit-protection]` (which needs `--keep-privileges`) with `--seccomp off` / `--fs-confine off` | keep the syscall filter and Landlock on, or use `ExecStopPost=` |
-| `startup failed: stage=open code=TX_QUEUE_CHECK/TX_QUEUE_UNVERIFIABLE` | 1 | the device has more than one TX queue and the sysfs view is not the router namespace's (the active TX queue count cannot be proven) | run in the namespace with its own sysfs (`ip netns exec` remounts it), or use a single-queue device |
+| `invalid config: stage=exit-protection code=EXIT_PROTECTION_NEEDS_SECCOMP` / `EXIT_PROTECTION_NEEDS_FS_CONFINE` | 2 | `[exit-protection]` (which needs `--keep-privileges`) with `--seccomp off` or `log` / `--fs-confine off` | keep the syscall filter and Landlock on, or use `ExecStopPost=` |
+| `startup failed: stage=open code=TX_QUEUE_CHECK/TX_QUEUE_UNVERIFIABLE` | 1 | the device has more than one allocated TX queue and no sysfs view corroborates it (the view's `ifindex` and `address` must both equal rtnetlink's; another namespace's sysfs, or a device without a 6-byte address, does not), so the active TX queue count cannot be checked | use a device with one allocated TX queue (for veth: `ip link add ... numtxqueues 1`), or run where sysfs is the router namespace's (`ip netns exec` remounts it) |
 | `reload failed: stage=quiesce code=DOWN_LINK_TX_HELD` | — | `[reload] down-link-tx = "refuse"` and a port whose link is down holds TX | bring the link up and reload again, or restart (which discards the held frames) |
 | `invalid config: stage=exit-protection code=EXIT_FORWARDING_NEEDS_PRIVILEGES` | 2 | `ipv4-forwarding-off = true` under the privilege drop: the sysctl write needs `CAP_NET_ADMIN` at exit | run with `--keep-privileges`, or write the sysctl in `ExecStopPost=` (section 9) |
-| `startup failed: stage=exit-protection port=if<id> code=ERRNO_<n>` | 1 | a port's forwarding sysctl could not be opened (no such device, read-only `/proc/sys`) or the rtnetlink socket failed | check `/proc/sys/net/ipv4/conf/<device>/forwarding` in the router's namespace |
+| `startup failed: stage=exit-protection port=if<id> code=ERRNO_<n>` (or `code=RENAMED`) | 1 | a port's forwarding sysctl could not be opened (no such device, read-only `/proc/sys`) or the rtnetlink socket failed; `RENAMED`: after the open, the port's name no longer resolves to its interface index (a rename or replacement since the startup checks) | check `/proc/sys/net/ipv4/conf/<device>/forwarding` in the router's namespace and that the device keeps its name; restart |
 | `exit protection failed: port=if<id> action=<action> code=<code>` | 1 | an exit action failed (`KERNEL_1`: `EPERM`; `ERRNO_2`: the sysctl entry is gone, e.g. the device was renamed or removed) | apply it by hand: `sysctl -w net.ipv4.conf.<device>.forwarding=0`, `ip link set dev <device> down` |
 | `reload failed: stage=apply code=RESTART_REQUIRED.<R>\|NOT_QUIESCENT\|...` | — | the live apply refused | nothing changed; check the plan |
 | `stopped after a backend fault` | 1 | ring fault or wedged adapter | collect the final stats; restart |

@@ -503,7 +503,7 @@ const SAMPLES: &[(&str, &str, &str)] = &[
         "info",
     ),
     (
-        "ruster run: exit protection keeps every capability; it is refused without the syscall filter",
+        "ruster run: exit protection keeps every capability; it is refused unless the syscall filter kills",
         "STARTUP_HINT",
         "info",
     ),

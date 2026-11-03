@@ -177,8 +177,9 @@ pub enum ExitPreflight {
     LinkDownNeedsPrivileges,
     /// `ipv4-forwarding-off` without `--keep-privileges`.
     ForwardingNeedsPrivileges,
-    /// Either key with `--seccomp off`: the kept privileges would run with
-    /// no syscall filter.
+    /// Either key with `--seccomp off` or `log`: the kept privileges would
+    /// run with no syscall filter (`log` reports a violation and lets it
+    /// run; it is a diagnostics mode, follow-up L2).
     NeedsSeccomp,
     /// Either key with `--fs-confine off`: the kept privileges would run
     /// with the whole filesystem view.
@@ -217,8 +218,8 @@ impl ExitPreflight {
                  the supervisor's post-stop hook"
             }
             Self::NeedsSeccomp => {
-                "exit protection keeps every capability; it is refused without the syscall \
-                 filter (use --seccomp kill or log)"
+                "exit protection keeps every capability; it is refused unless the syscall \
+                 filter kills (use --seccomp kill; log and off let every syscall run)"
             }
             Self::NeedsFsConfine => {
                 "exit protection keeps every capability; it is refused without the filesystem \
@@ -250,7 +251,7 @@ pub fn preflight(
             ExitPreflight::ForwardingNeedsPrivileges
         });
     }
-    if seccomp == SeccompMode::Off {
+    if seccomp != SeccompMode::Kill {
         return Err(ExitPreflight::NeedsSeccomp);
     }
     if fs_confine == FsConfineMode::Off {
@@ -377,7 +378,7 @@ mod tests {
                 SeccompMode::Log,
                 FsConfineMode::Landlock
             ),
-            Ok(())
+            Err(ExitPreflight::NeedsSeccomp)
         );
         for policy in [drop, switch] {
             assert_eq!(

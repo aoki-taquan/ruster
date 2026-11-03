@@ -184,6 +184,7 @@ impl SessionFake {
             link: Cell::new(Ok(crate::LinkAttributes {
                 mtu: 1_500,
                 tx_queues: 4,
+                address: None,
             })),
         }
     }
@@ -285,7 +286,13 @@ impl sealed::Sealed for SessionFake {}
 unsafe impl MapsRealMemory for SessionFake {}
 
 impl Syscalls for SessionFake {
-    fn tx_queue_probe(&self, _name: &[u8; IFNAMSIZ], ifindex: u32, _queue: u32) -> TxQueueProbe {
+    fn tx_queue_probe(
+        &self,
+        _name: &[u8; IFNAMSIZ],
+        ifindex: u32,
+        _address: Option<[u8; 6]>,
+        _queue: u32,
+    ) -> TxQueueProbe {
         assert_eq!(ifindex, FAKE_IFINDEX, "probed with the resolved ifindex");
         self.tx_queue.get()
     }
@@ -1853,6 +1860,7 @@ fn native_session_refuses_a_queue_without_tx_queue_before_any_resource() {
         Ok(crate::LinkAttributes {
             mtu: 1_500,
             tx_queues,
+            address: None,
         })
     };
     for (probe, link, failure) in [
@@ -1915,6 +1923,7 @@ fn native_session_fails_closed_on_an_unproven_sysfs_view_of_a_multi_queue_device
     fake.link.set(Ok(crate::LinkAttributes {
         mtu: 1_500,
         tx_queues: 1,
+        address: None,
     }));
     let queue_zero = SessionConfig::new(
         "veth0",
@@ -1932,7 +1941,13 @@ fn native_session_fails_closed_on_an_unproven_sysfs_view_of_a_multi_queue_device
 
 #[test]
 fn native_session_reads_the_mtu_before_any_resource_and_fails_closed() {
-    let link = |mtu| Ok(crate::LinkAttributes { mtu, tx_queues: 4 });
+    let link = |mtu| {
+        Ok(crate::LinkAttributes {
+            mtu,
+            tx_queues: 4,
+            address: None,
+        })
+    };
     let fake = SessionFake::new();
     fake.link.set(link(9_000));
     let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("open");
