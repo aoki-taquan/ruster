@@ -75,6 +75,9 @@ pub(crate) enum DirectoryHashDomain {
     /// Bucket of the translated ICMPv4 error limiter (N4, NAT44-065),
     /// keyed by the resolution key in this separate domain.
     Icmpv4TranslatedLimit = 0x4943_4d50_544c_494d,
+    /// IPv4 Identification of a translated non-atomic datagram (MTU2,
+    /// RFC 6864 §5.3.1), keyed by the NAT runtime key in this domain.
+    Ipv4Identification = 0x4e41_5434_4950_4944,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

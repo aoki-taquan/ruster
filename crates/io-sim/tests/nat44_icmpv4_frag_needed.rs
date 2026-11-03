@@ -812,7 +812,9 @@ fn disabled_policy_preserves_local_consume_and_candidate_drops_are_atomic() {
     }
 
     let mut bad_quote = outbound.bytes[14..42].to_vec();
-    bad_quote[6..8].copy_from_slice(&0_u16.to_be_bytes());
+    // MF with DF clear: a fragment (a whole DF-clear quote is translated,
+    // MTU2).
+    bad_quote[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
     refresh_inner_checksum(&mut bad_quote);
     let malformed = frag_needed(&bad_quote, 64, 0, &[]);
     io.inject(WAN, malformed.clone());

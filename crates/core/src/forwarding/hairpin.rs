@@ -244,7 +244,7 @@ pub(super) fn decide_nat44_udp_hairpin<T: TraceSink>(
     if ipv4.header_len > 20 {
         return nat44_udp_drop(ingress, Ipv4OptionsUnsupported, trace);
     }
-    if let Err(reason) = validate_nat44_atomic(frame, ipv4) {
+    if let Err(reason) = validate_nat44_unfragmented(frame, ipv4) {
         return nat44_udp_drop(ingress, reason, trace);
     }
     let udp = match validate_nat44_udp(frame, ipv4) {
@@ -586,7 +586,7 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
     if ipv4.header_len > 20 {
         return nat44_tcp_drop(ingress, Ipv4OptionsUnsupported, trace);
     }
-    if let Err(reason) = validate_nat44_tcp_atomic(frame, ipv4) {
+    if let Err(reason) = validate_nat44_tcp_unfragmented(frame, ipv4) {
         return nat44_tcp_drop(ingress, reason, trace);
     }
     let tcp = match validate_nat44_tcp(frame, ipv4) {

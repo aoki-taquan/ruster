@@ -17,6 +17,7 @@ pub use icmp_query::{
     NAT44_ICMP_MAX_IDLE_TTL_MS, NAT44_ICMP_MIN_IDLE_TTL_MS,
 };
 
+use crate::nat44_ipv4_id::Ipv4IdGenerator;
 use crate::{
     fixed_directory::{
         port_free_bitmap_words, DirectoryHashDomain, DirectoryHashKey, DirectorySemanticError,
@@ -4275,6 +4276,9 @@ pub struct Nat44UdpRuntime<'a> {
     /// peer counts (N6).
     hosts: HostTable<'a, 1>,
     hash_key: Nat44UdpHashKey,
+    /// IDs of translated non-atomic datagrams (RFC 6864 §5.3.1), keyed by
+    /// the construction key and kept across reconcile and flush.
+    ipv4_ids: Ipv4IdGenerator,
     watermark_ms: Option<u64>,
     next_generation: u64,
     runtime_epoch: u128,
@@ -4374,6 +4378,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             port_owners,
             hosts,
             hash_key,
+            ipv4_ids: Ipv4IdGenerator::new(hash_key.0),
             watermark_ms: None,
             next_generation: 1,
             runtime_epoch: 1,
@@ -4414,6 +4419,12 @@ impl<'a> Nat44UdpRuntime<'a> {
         hash_key: Nat44UdpHashKey,
     ) -> bool {
         self.config == config && self.hash_key == hash_key
+    }
+
+    /// The generator of the IDs of the non-atomic datagrams this runtime
+    /// translates (RFC 6864 §5.3.1, NAT44-126).
+    pub(crate) fn ipv4_ids_mut(&mut self) -> &mut Ipv4IdGenerator {
+        &mut self.ipv4_ids
     }
 
     #[must_use]
@@ -8104,6 +8115,9 @@ pub struct Nat44TcpRuntime<'a> {
     /// [`Nat44TcpRuntime::session_host_expiry`].
     session_hosts: HostTable<'a, 3>,
     hash_key: Nat44TcpHashKey,
+    /// IDs of translated non-atomic datagrams (RFC 6864 §5.3.1), keyed by
+    /// the construction key and kept across reconcile and flush.
+    ipv4_ids: Ipv4IdGenerator,
     watermark_ms: Option<u64>,
     runtime_epoch: u128,
     next_generation: u64,
@@ -8235,6 +8249,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             hosts,
             session_hosts,
             hash_key,
+            ipv4_ids: Ipv4IdGenerator::new(hash_key.0),
             watermark_ms: None,
             runtime_epoch: 1,
             next_generation: 1,
@@ -8296,6 +8311,12 @@ impl<'a> Nat44TcpRuntime<'a> {
     #[must_use]
     pub const fn config(&self) -> Nat44TcpConfig {
         self.config
+    }
+
+    /// The generator of the IDs of the non-atomic datagrams this runtime
+    /// translates (RFC 6864 §5.3.1, NAT44-126).
+    pub(crate) fn ipv4_ids_mut(&mut self) -> &mut Ipv4IdGenerator {
+        &mut self.ipv4_ids
     }
 
     #[must_use]

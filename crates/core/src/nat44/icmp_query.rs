@@ -559,6 +559,13 @@ impl<'a> Nat44IcmpRuntime<'a> {
             .publication_binding_matches(config.0, hash_key.0)
     }
 
+    /// The generator of the IDs of the non-atomic datagrams this runtime
+    /// translates: ICMP queries and, when bound, every translated ICMPv4
+    /// error (one protocol, one sequence; RFC 6864 §5.3.1).
+    pub(crate) fn ipv4_ids_mut(&mut self) -> &mut crate::nat44_ipv4_id::Ipv4IdGenerator {
+        self.engine.ipv4_ids_mut()
+    }
+
     #[must_use]
     pub const fn counters(&self) -> Nat44IcmpCounters {
         Nat44IcmpCounters::from_engine(self.engine.counters())

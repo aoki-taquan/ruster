@@ -19,7 +19,8 @@ fn mtu1_scenario_answers_oversized_df_datagrams_with_fragmentation_needed() {
     assert_eq!(summary.generation.get(), 1);
     let drops = &summary.snapshot.drops;
     assert_eq!(drops.count(DropReason::Ipv4FragmentationNeeded), 4);
-    assert_eq!(drops.count(DropReason::Ipv4FragmentationRequired), 0);
+    assert_eq!(drops.count(DropReason::Ipv4FragmentationRequired), 1);
+    assert_eq!(drops.count(DropReason::Nat44UdpNonAtomicIpv4Unsupported), 0);
     assert_eq!(drops.count(DropReason::Icmpv4EchoReplyExceedsMtu), 1);
     let output = String::from_utf8(out).expect("UTF-8");
     let start = output.lines().next().expect("start event");
