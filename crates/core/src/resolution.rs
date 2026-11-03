@@ -2083,6 +2083,14 @@ impl<'a> ResolutionRuntime<'a> {
         self.forward_miss = None;
     }
 
+    /// How long a datagram is held at most: `interval × max-attempts`
+    /// (ARP-HOLD; a hold's start is its deadline minus this).
+    pub(crate) const fn hold_window_ms(&self) -> u64 {
+        self.policy
+            .interval_ms
+            .saturating_mul(self.policy.max_attempts as u64)
+    }
+
     /// The current datagram's resolving miss, with the time after which its
     /// resolution can no longer succeed: `interval × max-attempts` from now
     /// (the last request goes out at most `(max-attempts - 1) × interval`

@@ -625,10 +625,11 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
 - **bound**: (egress, next hop)ごとに`per-neighbor`（default 3）。超えたらそのnext hopの古いものを
   置き換え、最新を残します（RFC 1122の「latest」、`replaced`）。置き換えるのは送信者自身((ingress,
   source))の最古があればそれ、無ければ同じingressの最古、それも無ければこのnext hopで最も多く
-  holdしているingress（同数なら最古を持つもの）の最古です（一つのhostやinterfaceが自分の分を持つ間は
+  holdしているingress（同数ならその最古が最も新しいingressが譲る。最も長く待つdatagramを残し、新しいingressが次々来ても古いものを回し出せない。#342 re-review sec L1）の最古です（一つのhostやinterfaceが自分の分を持つ間は
   他を押し出さない。新しいingressはこのnext hopに一つも持たないので最大の利用者から取る。一つの
   interfaceのfloodは`per-ingress` shareで抑える。review sec L2、re-review L2、#342 review L-4）。
-  置き換えられたものが最初のfragmentなら、association tableでそのdatagramをdenyします（下）。
+  置き換えられたものが最初のfragmentなら、association tableでそのdatagramをdenyします（下）。ただし置き換える側が同じdatagramの最初のfragment（再送）ならdenyせず、associationを新しいslotへ移します（#342 re-review core L1）。
+  ingressを共有するhost同士は、送信元を詐称すれば互いのsender枠に入れます（sender単位の優先はsource addressを信じる。interface全体は`per-ingress` shareで抑える。#342 re-review sec L2）。
   (ingress, source)ごと（NAT-FRAGと同じく、WANからinside addressを名乗るdatagramがinside hostの枠を
   使わない）に`per-host`（default 16、`ARP_HOLD_HOST_LIMIT`、置き換えるものが同じhostならその分を
   数えない）。ingress interfaceごとに`per-ingress`（default `packets`の半分、32、
@@ -682,8 +683,13 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   fragmentは、その記録したentryが同じindex、stamp、keyのままpendingの時だけ`deny_pending`で
   Denyにし、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。
   `deny_pending`はlookupもinsertもevictもせず、decided entryには触れずpoisonもしません。IDが一巡して
-  同じkeyの新しいdatagramが同じslotを取っていればstampが違うので触れません（#342 review M1。
-  同じミリ秒（65536 ms周期）に作られた時だけ一致し得る。entryは高々60 sしか生きない）。pending entryを取れなかった最初のfragmentは
+  同じkeyの新しいdatagramが同じslotを取っていればstampが違うので触れません（#342 review M1）。
+  holdは`interval × max-attempts`続き65.536 sを超え得るので、stamp（作成時刻の下位16 bit）だけでは
+  足りません。hold開始（`deadline − interval × max-attempts`）より後に作られたentryも拒否します
+  （#342 re-review core L2。stampはhold前に作られたentry同士だけを区別する）。
+  replayでも記録したassociation（index、stamp）がlookupの結果と違えば、keyが新しいdatagramのものに
+  なっているのでreplayせず`cancelled`で解放します（#342 re-review core L3。記録の無い最初のfragmentは
+  holdされなかった遅い最初のfragmentと同じ扱いが残る）。pending entryを取れなかった最初のfragmentは
   記録が無く、後続はtableのtimeoutで解放されます。apply（`flushed`）では同じapplyでtable自体も
   flushされるので何もしません。replayで
   最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る

@@ -1307,3 +1307,82 @@ fn with_fragment_tracking_off_no_fragment_is_held() {
     assert_eq!(world.live(), 0);
     assert_eq!(world.drops(DropReason::FirewallFragmentUnsupported), 3);
 }
+
+fn tracker_counters(world: &World) -> ruster_core::Ipv4FragmentTrackingCounters {
+    world.active.fragment_tracking().unwrap().counters()
+}
+
+/// #342 re-review core L1: a duplicate of a held first fragment that
+/// replaces it (the latest is kept) continues its datagram's entry: the
+/// datagram is not refused, and the replay sends it with its later fragment.
+#[test]
+fn a_duplicate_held_first_fragment_keeps_its_datagram() {
+    let text = ROUTER.replacen("per-neighbor = 3", "per-neighbor = 1", 1);
+    let mut world = World::new(&text);
+    let frames = h_fragments(0x5601, 5000);
+    world.tick(0, &frames[..2]);
+    // The retransmitted first fragment replaces the held one.
+    world.tick(1, &frames[..1]);
+    assert_eq!(world.hold().replaced, 1);
+    assert_eq!(tracker_held(&world), (1, 0), "not refused");
+    let sent = world.tick(10, &[(WAN, g_reply())]);
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    let counters = tracker_counters(&world);
+    assert_eq!((counters.poisoned, counters.first_denied), (0, 0));
+}
+
+/// A datagram reusing the held first fragment's key after its entry
+/// expired: config with a 1 s association timeout.
+fn reused_key_world() -> World {
+    let text = ROUTER.replacen(
+        "[tick]",
+        "[fragment-tracking]\ntimeout-ms = 1000\n\n[tick]",
+        1,
+    );
+    let mut world = World::new(&text);
+    let frames = h_fragments(0x5701, 5000);
+    world.tick(0, &frames[..2]);
+    assert_eq!(tracker_held(&world), (1, 0));
+    // The entry times out; a newer datagram with the same key (the ID
+    // wrapped) sends its last fragment first.
+    world.tick(1_200, &[]);
+    assert_eq!(tracker_held(&world).0, 0);
+    world.tick(2_500, &frames[2..]);
+    assert_eq!(tracker_held(&world).0, 1);
+    world
+}
+
+/// The held first fragment is dropped after the key was reused: the newer
+/// datagram's entry is not refused.
+#[test]
+fn a_held_first_fragment_dropped_after_its_key_was_reused_spares_the_newer_datagram() {
+    let mut world = reused_key_world();
+    // The next walk finds its key taken by the newer datagram: the hold is
+    // freed (cancelled) without refusing that datagram, before it expires.
+    world.tick(2_600, &[]);
+    assert_eq!(world.live(), 0);
+    assert_eq!(world.hold().cancelled, 1);
+    world.tick(3_000, &[]);
+    assert_eq!(tracker_held(&world), (1, 0));
+    assert_eq!(tracker_counters(&world).first_denied, 0);
+}
+
+/// #342 re-review core L3: a held first fragment whose key now belongs to a
+/// newer datagram is not replayed (it would decide that datagram).
+#[test]
+fn a_held_first_fragment_whose_key_was_reused_is_not_replayed() {
+    let mut world = reused_key_world();
+    let sent = world.tick(2_600, &[(WAN, g_reply())]);
+    assert!(sent.is_empty(), "{sent:?}");
+    let counters = world.hold();
+    assert_eq!(
+        (counters.cancelled, counters.replayed, world.live()),
+        (1, 0, 0)
+    );
+    assert_eq!(
+        tracker_held(&world),
+        (1, 0),
+        "the newer datagram is untouched"
+    );
+    assert_eq!(tracker_counters(&world).first_allowed, 0);
+}
