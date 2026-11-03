@@ -1749,6 +1749,35 @@ fn arp_announce_keys_default_to_rfc_5227_and_fail_closed() {
     }
 }
 
+/// ARP-034 (#351 review M): `[tick] generated-arp = 0` cannot send an
+/// Announcement or a defense, so with either on it fails closed as
+/// `ARP_ANNOUNCE_WITHOUT_GENERATED_ARP` at `tick.generated-arp`; with both
+/// off it is accepted as before.
+#[test]
+fn announcements_need_a_generated_arp_budget() {
+    let zero = VALID.replacen("generated-arp = 4", "generated-arp = 0", 1);
+    assert_ne!(zero, VALID);
+    let with = |body: &str| {
+        zero.replacen(
+            "[resolution.policy]",
+            &format!("[arp]\n{body}\n[resolution.policy]"),
+            1,
+        )
+    };
+    for body in ["", "announce = false", "conflict-defense = false"] {
+        let rejected = error(&with(body));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::ArpAnnounceWithoutGeneratedArp,
+            "{body}"
+        );
+        assert_eq!(rejected.code().code(), "ARP_ANNOUNCE_WITHOUT_GENERATED_ARP");
+        assert_eq!(dotted(rejected.path()), "tick.generated-arp", "{body}");
+    }
+    let off = validated(&with("announce = false\nconflict-defense = false"));
+    assert_eq!(off.tick().generated_arp, 0);
+}
+
 /// N5: `[nat44.icmp]` maps onto the core ICMP query policy with RFC 5508
 /// defaults (60 s, address-dependent, identifier preservation, errors
 /// bidirectional), the identifier pool defaults to the realm ports, and its

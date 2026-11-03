@@ -285,7 +285,10 @@ ANNOUNCE_INTERVAL（2 s）間隔で送ります（RFC 5227 §2.3。§1.3は「ho
 announcement stormになりません。他のMACが自分のaddressをsenderにしたARP（conflicting ARP
 packet、§2.4）はportごとに数え、`warning: port=ifN health=ARP_ADDRESS_CONFLICT`（値なし）を
 episodeごとに一度出し、§2.4 (c)に従いDEFEND_INTERVAL（10 s）に高々1回のAnnouncementで
-defenseします。Probe（§2.1）は静的addressのrouterでは送りません（ARP-036）。
+defenseします（sequenceとは別の1 frame）。`watch.state`は`ok`のままで、episode中は
+`ifN.watch.arp_address_conflict`が立ちます。Probe（§2.1）は静的addressのrouterでは送りません
+（ARP-036）。`[tick] generated-arp = 0`でannounceかdefenseがonなら
+`ARP_ANNOUNCE_WITHOUT_GENERATED_ARP`で拒否します。interfaceごとの切り替えは未実装です（ARP-040）。
 
 ```toml
 [arp]                           # table/keyとも省略可能、すべてreload可能

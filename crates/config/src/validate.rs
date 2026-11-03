@@ -165,6 +165,10 @@ pub enum ValidationCode {
     /// outside 1000..=3600000, or `announce-min-interval-ms` above 3600000
     /// or shorter than one sequence (ARP-034).
     ArpAnnouncePolicy(ruster_core::ArpAnnouncePolicyError),
+    /// `[tick] generated-arp = 0` with `[arp] announce` or
+    /// `conflict-defense` on: an owed Announcement could never be sent
+    /// (ARP-034; it would also keep the idle loop from waiting).
+    ArpAnnounceWithoutGeneratedArp,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
     Nat44RealmWithoutProtocol,
@@ -345,6 +349,7 @@ impl ValidationCode {
             Self::ArpHoldBoundAbovePackets => "ARP_HOLD_BOUND_ABOVE_PACKETS",
             Self::ArpHoldWithoutFragmentation => "ARP_HOLD_WITHOUT_FRAGMENTATION",
             Self::ArpAnnouncePolicy(_) => "ARP_ANNOUNCE_POLICY",
+            Self::ArpAnnounceWithoutGeneratedArp => "ARP_ANNOUNCE_WITHOUT_GENERATED_ARP",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
             Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
@@ -511,7 +516,7 @@ pub struct ResolutionStorageShapeV1 {
     pub dynamic_neighbors: u32,
     pub failure_holds: u32,
     /// One RFC 5227 announcement slot per interface (ARP-033,
-    /// [`ruster_core::ArpAnnounceSlot`], 32 bytes each), whether `[arp]
+    /// [`ruster_core::ArpAnnounceSlot`], 48 bytes each), whether `[arp]
     /// announce` is on or off, so the switch is reloadable.
     pub announce_slots: u32,
 }
@@ -2449,6 +2454,14 @@ fn validate_v1(
             generated_fragments: tick.generated_fragments,
         });
     if let Some(source) = config.tick {
+        // ARP-034: the RFC 5227 frames leave through the generated ARP
+        // budget; with none they could never be sent.
+        if source.generated_arp == 0 && (arp.announce().is_some() || arp.defend_conflicts()) {
+            return Err(ValidationError::new(
+                ValidationCode::ArpAnnounceWithoutGeneratedArp,
+                path(&["tick", "generated-arp"]),
+            ));
+        }
         let budget_path = path(&["tick", "generated-fragments"]);
         if source.generated_fragments == 0 {
             return Err(ValidationError::new(

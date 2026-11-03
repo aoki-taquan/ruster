@@ -310,9 +310,9 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-67050240 bytes (63.94 MiB). GARP (ARP-033) added one 32-byte announcement
-slot per interface (64 bytes for its two interfaces; 67050176 bytes
-before; at most 8 KiB with 256 interfaces). ARP-HOLD added the largest hold table (64
+67050272 bytes (63.94 MiB). GARP (ARP-033) added one 48-byte announcement
+slot per interface (96 bytes for its two interfaces; 67050176 bytes
+before; at most 12 KiB with 256 interfaces). ARP-HOLD added the largest hold table (64
 slots of 40 + 3840 bytes: 248320 bytes; 66801856 bytes, 63.71 MiB,
 before). NAT-FRAG added the largest fragment association
 table (16384 entries of an entry, a host slot, and two directory buckets
@@ -801,7 +801,7 @@ reasons instead, or exclude the four new codes. The twelve new
 `icmpv4_errors.*` counters are appended after the existing ones, so the
 order of the earlier fields in stats and JSONL is unchanged. Storage is
 unchanged (67050176 bytes for the maximal production config at the time;
-67050240 since GARP).
+67050272 since GARP).
 
 ### Source address validation (URPF)
 
@@ -1311,7 +1311,7 @@ now pass the firewall's rules and the NAT on their first fragment, creating
 mappings and firewall state; review the rules if you relied on that drop,
 and expect those counters to fall to 0. The default table adds 305472
 bytes of storage (the maximal production config, with `entries = 16384` and
-`held-fragments = 512`, was 67050176 bytes; 67050240 since GARP). A config with every table at
+`held-fragments = 512`, was 67050176 bytes; 67050272 since GARP). A config with every table at
 its production limit and per-host NAT44 limits that just fitted 64 MiB may
 now fail with `RUNTIME_STORAGE_BYTES_EXCEEDED`: lower `[fragment-tracking]
 entries`/`held-fragments` or `[fragmentation] datagrams`, size a table
@@ -1414,7 +1414,7 @@ for configs without `[resolution.hold]`. Datagrams that were dropped as
 (near) 0 and `consume.ARP_HELD` rises; firewall and NAT state for them is
 created when they are sent, not dropped. The default table adds 248320
 bytes of storage (the maximal production config was 67050176 bytes;
-67050240 since GARP). **A
+67050272 since GARP). **A
 config that just fitted 64 MiB fails after the upgrade with no change of
 its own**: `stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED
 path=resolution.hold.packets` (the path is set when the document fits
@@ -2805,8 +2805,20 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   between are folded into one later sequence (`arp_announce.coalesced`,
   `arp_announce.rate_limited`), so a flapping link costs at most
   `announce-count` frames per minimum interval. They use the generated
-  ARP frame budget (`[tick] generated-arp`) after the resolution requests.
-  `[arp] announce = false` turns them off (reloadable). The router does
+  ARP frame budget (`[tick] generated-arp`): the first frame of each tick
+  goes to a due Announcement or defense, the rest to resolution requests
+  and then the other Announcements. `[tick] generated-arp = 0` with
+  announcements or defense on is refused
+  (`ARP_ANNOUNCE_WITHOUT_GENERATED_ARP`). A port whose generated frame
+  cannot be allocated (pool empty, AF_PACKET TX ring full on an admin-down
+  port) retries every 10 ms (`arp_announce.unavailable`) without holding
+  the other ports back. `arp_announce.committed` counts frames handed to
+  the backend, `accepted` and `rejected` what it did with them (a rejected
+  one is not resent). `[arp] announce = false` turns them off
+  (reloadable; a sequence already running stops at once). Link-up is seen
+  by the link watch round (the `[watch]` link interval, about 1 s), from
+  the link's admin and carrier state: a flap that goes down and up
+  between two rounds is not seen and announces nothing. The router does
   not send RFC 5227 Probes before using its static addresses (ARP-036):
   it could not pick another address anyway.
 - **Address conflicts (ARP-038, ARP-039).** An ARP Request or Reply on a
@@ -2819,8 +2831,14 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   never stops the router. With `[arp] conflict-defense = true` (default,
   RFC 5227 §2.4 (c)) the router answers with one Announcement, at most
   one per 10 s (DEFEND_INTERVAL) per port (`arp_announce.defended`,
-  `arp_announce.defense_suppressed`); `false` only counts and reports.
-  Neither puts the other host into the neighbour cache.
+  `arp_announce.defense_suppressed`); the defense is one extra frame and
+  does not shorten a running announcement sequence. `false` only counts
+  and reports, which RFC 5227 §2.4 does not allow a host that keeps its
+  address (an operator-selected deviation). Neither puts the other host
+  into the neighbour cache. `watch.state` stays `ok` during a conflict
+  episode (any host on the link can send one; automation keyed on
+  `watch.state` cannot be driven by a spoofer): alert on
+  `ifN.watch.arp_address_conflict` (the open episode) or the log line.
 - NAT44 slot reuse and port selection
   are O(1) per new flow since H4a (NAT44-035). What NAT44 still does in
   more than constant time: a keyed directory lookup walks its hash chain

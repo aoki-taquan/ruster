@@ -1471,6 +1471,9 @@ fn arp_address_conflicts_warn_once_per_episode_and_never_end_the_run() {
     );
     let (_, health) = watch.health().next().expect("port");
     assert_eq!(health.arp_address_conflicts, 1_001);
+    // Its own flag, not `watch.state` (a spoofer cannot drive automation).
+    assert!(health.arp_address_conflict);
+    assert!(!watch.warning());
     assert_eq!(Condition::ArpAddressConflict.code(), "ARP_ADDRESS_CONFLICT");
     assert!(!ExposurePolicy::default().is_fatal(Condition::ArpAddressConflict));
 }

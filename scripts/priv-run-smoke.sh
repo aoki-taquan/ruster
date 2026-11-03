@@ -1353,7 +1353,7 @@ phase_idle
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=67050240 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=67050272 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -1377,7 +1377,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 67050240 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 67050272 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
@@ -3174,7 +3174,7 @@ phase_announce() {
     natfrag_stop announce-off
     [ "$(announcements "$capture" | wc -l)" -eq 0 ] ||
         fail "announce: announced with announce = false: $(cat "$capture")"
-    block_has "$work/announce-off.final" arp_announce.sent=0
+    block_has "$work/announce-off.final" arp_announce.committed=0
     echo "priv_run_announce_off: with [arp] announce = false nothing was announced verified"
 }
 phase_announce

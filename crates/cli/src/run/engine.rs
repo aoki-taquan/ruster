@@ -438,6 +438,19 @@ impl Pending {
     }
 }
 
+/// The idle-wait deadline of the next RFC 5227 announcement due at `due`
+/// (ARP-033): `due` itself when still ahead, else [`SHORT_WAIT_MS`] from
+/// `now`. A due time at or before `now` is one the tick just ran could not
+/// send, and a deadline of `now` would make every idle wait 0 (a busy
+/// loop).
+pub fn announcement_deadline(now: MonotonicMillis, due: MonotonicMillis) -> MonotonicMillis {
+    if due > now {
+        due
+    } else {
+        MonotonicMillis(now.0.saturating_add(SHORT_WAIT_MS))
+    }
+}
+
 /// The timeout of the idle wait after a tick at `now`: `max_wait_ms`, or
 /// [`SHORT_WAIT_MS`] (never more than `max_wait_ms`) while work is
 /// `pending`, and never past `next_deadline`. 0 means a deadline is due:
@@ -952,10 +965,15 @@ where
             IdleAction::Spin => {}
             action => {
                 let resolution = active.resolution();
+                // An RFC 5227 announcement or defense already due that
+                // this tick could not send (ARP-033): the frame budget, or
+                // a port's retry after `Unavailable`.
+                let announcement_due = active.next_arp_announcement_due();
                 let pending = Pending {
                     resolution: resolution.pending_states() != 0
                         || resolution.pending_failure_holds() != 0
-                        || resolution.pending_actions() != 0,
+                        || resolution.pending_actions() != 0
+                        || announcement_due.is_some_and(|due| due <= now),
                     icmpv4: active.icmpv4_errors().pending_actions() != 0
                         || occupancy.nat44_tcp_unsolicited_syn_holds.occupied() != 0,
                     tx: datapath.tx_outstanding(),
@@ -972,7 +990,9 @@ where
                     watch_due,
                     control.notify.watchdog_due(),
                     on_demand_stats.next_due(),
-                    active.next_arp_announcement_due(),
+                    // A due one waits the short wait instead of spinning
+                    // the loop; a later one wakes the wait on time.
+                    announcement_due.map(|due| announcement_deadline(now, due)),
                 ]
                 .into_iter()
                 .flatten()
@@ -1076,7 +1096,7 @@ pub(super) fn watch_step<D, E, A>(
 where
     D: Datapath,
     E: Write,
-    A: IntoIterator<Item = (IfId, u32)>,
+    A: IntoIterator<Item = (IfId, u64)>,
 {
     let mut end = None;
     let mut on_event = |event: WatchEvent| {
@@ -1104,7 +1124,7 @@ where
         });
         // Conflicting ARP packets for each port's address (ARP-039).
         for (interface, count) in arp_conflicts {
-            watch.on_arp_conflicts(now, interface, u64::from(count), &mut on_event);
+            watch.on_arp_conflicts(now, interface, count, &mut on_event);
         }
     }
     if let Some(round) = control.links.poll() {

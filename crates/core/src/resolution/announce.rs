@@ -27,11 +27,15 @@
 //!   and whose sender MAC is not the interface's MAC is a conflicting ARP
 //!   packet (§2.4). It is counted per interface. With defense on, the first
 //!   conflict after DEFEND_INTERVAL (10 s) without a defense queues one
-//!   Announcement (§2.4 (c)); later ones within the interval do not.
+//!   extra Announcement (§2.4 (c)), apart from any sequence; later ones
+//!   within the interval do not.
 //!
-//! Every frame goes through the generated-ARP phase and its frame budget,
-//! after the resolution Requests, into a backend-owned generated frame
-//! (no allocation, no packet copy).
+//! Every frame goes through the generated-ARP phase and its frame budget
+//! (the runtime gives the first frame of each tick to a due Announcement,
+//! the rest to the resolution Requests first) into a backend-owned
+//! generated frame (no allocation, no packet copy). Slots are scanned
+//! round robin, and a port whose frame cannot be allocated waits
+//! [`ARP_ANNOUNCE_RETRY_MS`] without holding the other ports back.
 
 use super::{
     allocate_arp_request, ArpRequestAction, ArpRequestBuildError, ArpRequestGenerationError,
@@ -170,41 +174,61 @@ impl ArpAnnouncePolicy {
 }
 
 const NEVER: u64 = u64::MAX;
-/// `next_due` of a waiting slot whose start the minimum interval holds
-/// back (already counted `rate_limited`).
-const DEFERRED: u64 = u64::MAX;
 
-/// Announcement and conflict state of one interface (32 bytes).
+/// How long a port's due Announcement waits after its generated frame
+/// could not be allocated (backend `Unavailable`) or built, so a port whose
+/// pool stays empty is not retried on every tick and cannot spin the idle
+/// loop (at least the run loop's 1 ms short wait).
+pub const ARP_ANNOUNCE_RETRY_MS: u64 = 10;
+
+/// A trigger waits for the next sequence.
+const REQUESTED: u8 = 1;
+/// The minimum interval holds the waiting trigger back (`rate_limited`
+/// counted once for this wait).
+const DEFERRED: u8 = 1 << 1;
+/// One defensive Announcement is owed (RFC 5227 §2.4 (c)), apart from any
+/// sequence.
+const DEFEND: u8 = 1 << 2;
+
+/// Announcement and conflict state of one interface (48 bytes).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpAnnounceSlot {
     interface: IfId,
     /// Announcements left in the running sequence (0: none running).
     remaining: u8,
-    /// A trigger waits for the next sequence.
-    requested: bool,
-    /// Conflicting ARP packets seen on the interface (saturating).
-    conflicts: u32,
+    /// [`REQUESTED`], [`DEFERRED`], [`DEFEND`].
+    flags: u8,
+    /// Conflicting ARP packets seen on the interface (saturating; a u64
+    /// never saturates in practice, so the alarm cannot be silenced).
+    conflicts: u64,
     /// When the next Announcement of the running sequence is due.
     next_due: u64,
     /// When the last sequence started ([`NEVER`]: none yet).
     last_start: u64,
     /// When the last defense was decided ([`NEVER`]: none yet).
     last_defense: u64,
+    /// No frame of this slot before this time (after `Unavailable`).
+    retry_at: u64,
 }
 
 impl ArpAnnounceSlot {
     pub const EMPTY: Self = Self {
         interface: IfId(0),
         remaining: 0,
-        requested: false,
+        flags: 0,
         conflicts: 0,
         next_due: 0,
         last_start: NEVER,
         last_defense: NEVER,
+        retry_at: 0,
     };
 
+    const fn has(&self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
     const fn busy(&self) -> bool {
-        self.requested || self.remaining != 0
+        self.remaining != 0 || self.flags & (REQUESTED | DEFEND) != 0
     }
 }
 
@@ -213,8 +237,8 @@ impl ArpAnnounceSlot {
 /// include them.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ArpAnnounceCounters {
-    /// Triggers that marked an idle interface (startup, link-up, changed
-    /// address).
+    /// Triggers that marked an interface with no trigger waiting and no
+    /// sequence running (startup, link-up, changed address).
     pub requested: u64,
     /// Triggers folded into one already waiting or running.
     pub coalesced: u64,
@@ -225,10 +249,22 @@ pub struct ArpAnnounceCounters {
     /// Waiting triggers whose sequence start the minimum interval held
     /// back (flap bound), once per wait.
     pub rate_limited: u64,
-    /// Announcements committed for TX (defenses included).
-    pub sent: u64,
+    /// Announcements written into a generated frame and committed for TX
+    /// (defenses included). The backend may still refuse one
+    /// (`rejected`); `accepted` + `rejected` = `committed`.
+    pub committed: u64,
+    /// Committed Announcements the backend accepted for TX (descriptor
+    /// publication, not wire delivery).
+    pub accepted: u64,
+    /// Committed Announcements the backend refused (back-pressure, a full
+    /// TX ring); they are not retried.
+    pub rejected: u64,
+    /// Generated frames that could not be allocated or built; the
+    /// Announcement stays due and is retried after
+    /// [`ARP_ANNOUNCE_RETRY_MS`].
+    pub unavailable: u64,
     /// Waiting or running sequences dropped because the interface had no
-    /// IPv4 address (or announcements were switched off) at send time.
+    /// IPv4 address at send time or announcements were switched off.
     pub cancelled: u64,
     /// Conflicting ARP packets (RFC 5227 §2.4), all interfaces.
     pub conflicts: u64,
@@ -247,7 +283,10 @@ impl crate::ObservableFields for ArpAnnounceCounters {
             disabled,
             sequences,
             rate_limited,
-            sent,
+            committed,
+            accepted,
+            rejected,
+            unavailable,
             cancelled,
             conflicts,
             defended,
@@ -259,7 +298,10 @@ impl crate::ObservableFields for ArpAnnounceCounters {
             ("disabled", disabled),
             ("sequences", sequences),
             ("rate_limited", rate_limited),
-            ("sent", sent),
+            ("committed", committed),
+            ("accepted", accepted),
+            ("rejected", rejected),
+            ("unavailable", unavailable),
             ("cancelled", cancelled),
             ("conflicts", conflicts),
             ("defended", defended),
@@ -274,13 +316,23 @@ fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
+/// Which frame of a slot is due.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AnnounceKind {
+    /// The owed defensive Announcement (§2.4 (c)): an extra frame that
+    /// leaves the sequence timing alone.
+    Defense,
+    /// The next Announcement of the running sequence (§2.3).
+    Sequence,
+}
+
 impl<'a> ResolutionRuntime<'a> {
     /// Attaches one announcement slot per interface of `snapshot` (the
     /// slot at index `i` belongs to its `i`-th interface) and clears them.
     ///
     /// `slots` must have exactly as many slots as `snapshot` has
-    /// interfaces; any other length leaves announcements and conflict
-    /// counting off (no slot is used).
+    /// interfaces; any other length leaves announcements and per-interface
+    /// conflict counting off (no slot is used).
     #[must_use]
     pub fn with_announce_slots(
         mut self,
@@ -296,6 +348,7 @@ impl<'a> ResolutionRuntime<'a> {
             self.announce = slots;
         }
         self.announce_busy = 0;
+        self.announce_cursor = 0;
         self
     }
 
@@ -305,15 +358,21 @@ impl<'a> ResolutionRuntime<'a> {
         self.announce_counters
     }
 
-    /// Interfaces with an announcement waiting or running.
+    /// Interfaces with an announcement or defense waiting or running.
     #[must_use]
     pub const fn pending_announcements(&self) -> usize {
         self.announce_busy
     }
 
+    /// Whether interfaces have announcement slots attached.
+    #[must_use]
+    pub const fn announce_slots_attached(&self) -> bool {
+        !self.announce.is_empty()
+    }
+
     /// The conflicting ARP packets seen on each interface, in snapshot
     /// interface order.
-    pub fn address_conflicts(&self) -> impl Iterator<Item = (IfId, u32)> + '_ {
+    pub fn address_conflicts(&self) -> impl Iterator<Item = (IfId, u64)> + '_ {
         self.announce
             .iter()
             .map(|slot| (slot.interface, slot.conflicts))
@@ -342,17 +401,24 @@ impl<'a> ResolutionRuntime<'a> {
         marked
     }
 
-    /// Marks every interface whose IPv4 address in `next` is new or
-    /// differs from `current` (a reload that adds or changes an address),
-    /// and rebinds the slots to `next`'s interface order (the interface
-    /// set itself is restart-required, so only the order can differ).
-    /// Returns the interfaces newly marked.
+    /// After a publication: rebinds the slots to `next`'s interface order
+    /// (the interface set itself is restart-required, so only the order
+    /// can differ); with announcements off in `next`, cancels every waiting
+    /// trigger and the rest of every running sequence at once (an owed
+    /// defense stays: it follows `conflict-defense`); and marks every
+    /// interface whose IPv4 address in `next` is new or differs from
+    /// `current`. Returns the interfaces newly marked.
     pub fn announce_changed_bindings(
         &mut self,
         current: &ForwardingSnapshot<'_>,
         next: &ForwardingSnapshot<'_>,
     ) -> usize {
         self.rebind_announce_slots(next);
+        if next.arp.announce().is_none() {
+            for index in 0..self.announce.len() {
+                self.cancel_sequence(index);
+            }
+        }
         let mut marked = 0;
         for index in 0..self.announce.len() {
             let id = self.announce[index].interface;
@@ -376,6 +442,7 @@ impl<'a> ResolutionRuntime<'a> {
             // interface set is restart-required): stop using the slots.
             self.announce = &mut [];
             self.announce_busy = 0;
+            self.announce_cursor = 0;
             return;
         }
         for (index, interface) in interfaces.iter().enumerate() {
@@ -405,25 +472,55 @@ impl<'a> ResolutionRuntime<'a> {
             return false;
         }
         let slot = &mut self.announce[index];
-        if slot.requested {
+        if slot.has(REQUESTED) || slot.remaining != 0 {
             bump(&mut self.announce_counters.coalesced);
-            return false;
-        }
-        if slot.remaining != 0 {
-            bump(&mut self.announce_counters.coalesced);
+            if slot.has(REQUESTED) {
+                return false;
+            }
         } else {
+            // Idle, or only a defense owed: a new trigger.
             bump(&mut self.announce_counters.requested);
+        }
+        if !slot.busy() {
             self.announce_busy += 1;
         }
-        slot.requested = true;
+        let slot = &mut self.announce[index];
+        slot.flags = (slot.flags | REQUESTED) & !DEFERRED;
         true
+    }
+
+    /// Drops a waiting trigger and the rest of a running sequence; an owed
+    /// defense stays.
+    fn cancel_sequence(&mut self, index: usize) {
+        let slot = &mut self.announce[index];
+        if slot.remaining == 0 && !slot.has(REQUESTED) {
+            return;
+        }
+        slot.remaining = 0;
+        slot.flags &= !(REQUESTED | DEFERRED);
+        bump(&mut self.announce_counters.cancelled);
+        if !self.announce[index].busy() {
+            self.announce_busy -= 1;
+        }
+    }
+
+    /// Drops everything owed by the slot (no address to announce).
+    fn cancel_announce(&mut self, index: usize) {
+        if self.announce[index].busy() {
+            let slot = &mut self.announce[index];
+            slot.remaining = 0;
+            slot.flags = 0;
+            self.announce_busy -= 1;
+            bump(&mut self.announce_counters.cancelled);
+        }
     }
 
     /// RX path: an ARP packet on `ingress` whose sender IP is the
     /// interface's own address. A sender MAC other than the interface's is
     /// a conflicting ARP packet (RFC 5227 §2.4): counted, and with defense
-    /// on, defended by one Announcement unless one was decided within
-    /// DEFEND_INTERVAL. O(log interfaces), no allocation.
+    /// on, defended by one extra Announcement unless one was decided within
+    /// DEFEND_INTERVAL. The defense leaves a running sequence's timing
+    /// alone. O(log interfaces), no allocation.
     pub(crate) fn observe_local_sender(
         &mut self,
         snapshot: &ForwardingSnapshot<'_>,
@@ -455,31 +552,29 @@ impl<'a> ResolutionRuntime<'a> {
         }
         slot.last_defense = now.0;
         bump(&mut self.announce_counters.defended);
-        if slot.remaining == 0 {
-            if !slot.requested {
-                self.announce_busy += 1;
-            }
-            slot.remaining = 1;
-            slot.next_due = now.0;
-        } else {
-            // A running sequence sends its next Announcement now.
-            slot.next_due = slot.next_due.min(now.0);
+        if !slot.busy() {
+            self.announce_busy += 1;
         }
+        self.announce[index].flags |= DEFEND;
     }
 
-    /// The first slot with an Announcement due at `now`, starting the
-    /// sequences whose minimum interval has passed. O(interfaces) only
-    /// while some interface is waiting or running; O(1) otherwise.
+    /// The next slot (round robin from the cursor, so one port's failing
+    /// allocations cannot hold the others back) with a frame due at `now`,
+    /// starting the sequences whose minimum interval has passed.
+    /// O(interfaces) only while some interface is waiting or running; O(1)
+    /// otherwise.
     fn due_announcement(
         &mut self,
         snapshot: &ForwardingSnapshot<'_>,
         now: MonotonicMillis,
-    ) -> Option<(usize, ArpRequestAction)> {
+    ) -> Option<(usize, AnnounceKind, ArpRequestAction)> {
         if self.announce_busy == 0 {
             return None;
         }
         let policy = snapshot.arp.announce();
-        for index in 0..self.announce.len() {
+        let len = self.announce.len();
+        for step in 0..len {
+            let index = (self.announce_cursor + step) % len;
             let slot = self.announce[index];
             if !slot.busy() {
                 continue;
@@ -490,27 +585,33 @@ impl<'a> ResolutionRuntime<'a> {
                 self.cancel_announce(index);
                 continue;
             };
-            // A defense (remaining set by a conflict) runs with
-            // announcements off; a waiting trigger does not.
-            if slot.requested && slot.remaining == 0 {
-                let Some(policy) = policy else {
-                    self.cancel_announce(index);
-                    continue;
-                };
+            let Some(policy) = policy else {
+                // Announcements off: only an owed defense is sent.
+                self.cancel_sequence(index);
+                if self.announce[index].has(DEFEND) && now.0 >= slot.retry_at {
+                    return Some(self.pick(index, AnnounceKind::Defense, interface, binding));
+                }
+                continue;
+            };
+            if now.0 < slot.retry_at {
+                continue;
+            }
+            if slot.has(DEFEND) {
+                return Some(self.pick(index, AnnounceKind::Defense, interface, binding));
+            }
+            if slot.has(REQUESTED) && slot.remaining == 0 {
                 if slot.last_start != NEVER
                     && now.0.saturating_sub(slot.last_start) < policy.min_interval_ms()
                 {
-                    // The flap bound holds this trigger back. An idle
-                    // slot's `next_due` is unused, so it marks the wait to
-                    // count it once.
-                    if slot.next_due != DEFERRED {
-                        self.announce[index].next_due = DEFERRED;
+                    // The flap bound holds this trigger back.
+                    if !slot.has(DEFERRED) {
+                        self.announce[index].flags |= DEFERRED;
                         bump(&mut self.announce_counters.rate_limited);
                     }
                     continue;
                 }
                 let slot = &mut self.announce[index];
-                slot.requested = false;
+                slot.flags &= !(REQUESTED | DEFERRED);
                 slot.remaining = policy.count();
                 slot.next_due = now.0;
                 slot.last_start = now.0;
@@ -518,43 +619,62 @@ impl<'a> ResolutionRuntime<'a> {
             }
             let slot = self.announce[index];
             if slot.remaining != 0 && now.0 >= slot.next_due {
-                return Some((
-                    index,
-                    ArpRequestAction {
-                        egress: slot.interface,
-                        source_mac: interface.mac,
-                        source_ip: binding.address,
-                        target_ip: binding.address,
-                    },
-                ));
+                return Some(self.pick(index, AnnounceKind::Sequence, interface, binding));
             }
         }
         None
     }
 
-    fn cancel_announce(&mut self, index: usize) {
-        let slot = &mut self.announce[index];
-        if slot.busy() {
-            slot.requested = false;
-            slot.remaining = 0;
-            slot.next_due = 0;
-            self.announce_busy -= 1;
-            bump(&mut self.announce_counters.cancelled);
-        }
+    fn pick(
+        &mut self,
+        index: usize,
+        kind: AnnounceKind,
+        interface: &crate::Interface,
+        binding: &crate::LocalIpv4Binding,
+    ) -> (usize, AnnounceKind, ArpRequestAction) {
+        self.announce_cursor = (index + 1) % self.announce.len();
+        (
+            index,
+            kind,
+            ArpRequestAction {
+                egress: interface.id,
+                source_mac: interface.mac,
+                source_ip: binding.address,
+                target_ip: binding.address,
+            },
+        )
     }
 
-    fn announcement_committed(&mut self, index: usize, now: MonotonicMillis, interval: u64) {
+    fn announcement_committed(
+        &mut self,
+        index: usize,
+        kind: AnnounceKind,
+        now: MonotonicMillis,
+        interval: u64,
+    ) {
         let slot = &mut self.announce[index];
-        slot.remaining -= 1;
-        slot.next_due = now.0.saturating_add(interval);
-        if !slot.busy() {
+        match kind {
+            AnnounceKind::Defense => slot.flags &= !DEFEND,
+            AnnounceKind::Sequence => {
+                slot.remaining -= 1;
+                slot.next_due = now.0.saturating_add(interval);
+            }
+        }
+        if !self.announce[index].busy() {
             self.announce_busy -= 1;
         }
-        bump(&mut self.announce_counters.sent);
+        bump(&mut self.announce_counters.committed);
     }
 
-    /// The earliest time an interface's waiting or running announcement
-    /// becomes due, for an idle wait; `None` when none waits.
+    fn announcement_unavailable(&mut self, index: usize, now: MonotonicMillis) {
+        self.announce[index].retry_at = now.0.saturating_add(ARP_ANNOUNCE_RETRY_MS);
+        bump(&mut self.announce_counters.unavailable);
+    }
+
+    /// The earliest time a waiting or running announcement or an owed
+    /// defense becomes due, for an idle wait; `None` when none waits. The
+    /// time can be in the past (due but not yet sent: the frame budget, or
+    /// a retry after `Unavailable`): the caller bounds its wait from below.
     #[must_use]
     pub fn next_announcement_due(
         &self,
@@ -563,21 +683,22 @@ impl<'a> ResolutionRuntime<'a> {
         if self.announce_busy == 0 {
             return None;
         }
-        let min_interval = snapshot
-            .arp
-            .announce()
-            .map_or(0, ArpAnnouncePolicy::min_interval_ms);
+        let policy = snapshot.arp.announce();
+        let min_interval = policy.map_or(0, ArpAnnouncePolicy::min_interval_ms);
         self.announce
             .iter()
             .filter(|slot| slot.busy())
             .map(|slot| {
-                if slot.remaining != 0 {
+                let due = if slot.has(DEFEND) || policy.is_none() {
+                    0
+                } else if slot.remaining != 0 {
                     slot.next_due
                 } else if slot.last_start == NEVER {
                     0
                 } else {
                     slot.last_start.saturating_add(min_interval)
-                }
+                };
+                due.max(slot.retry_at)
             })
             .min()
             .map(MonotonicMillis)
@@ -589,7 +710,8 @@ impl<'a> ResolutionRuntime<'a> {
 /// MAC zero, broadcast) into a backend-owned generated frame.
 ///
 /// Returns `Ok(None)` when none is due. An allocation or build failure
-/// keeps the Announcement due for a later tick.
+/// keeps the Announcement due and holds that port back for
+/// [`ARP_ANNOUNCE_RETRY_MS`]; the other ports are not held back.
 pub fn execute_one_arp_announcement<I, T>(
     io: &mut I,
     runtime: &mut ResolutionRuntime<'_>,
@@ -612,29 +734,37 @@ where
         .arp
         .announce()
         .map_or(ARP_ANNOUNCE_INTERVAL_MS, ArpAnnouncePolicy::interval_ms);
-    let Some((index, action)) = runtime.due_announcement(snapshot, now) else {
+    let Some((index, kind, action)) = runtime.due_announcement(snapshot, now) else {
         return Ok(None);
     };
     let mut batch = io.begin_generated(action.egress);
-    let (allocation_error, build_error) = match allocate_arp_request(&mut batch, action) {
+    let (allocation_error, build_error, committed) = match allocate_arp_request(&mut batch, action)
+    {
         Ok(()) => {
-            runtime.announcement_committed(index, now, interval);
+            runtime.announcement_committed(index, kind, now, interval);
             trace.record_generated(GeneratedArpTrace::TxRequested {
                 egress: action.egress,
                 target: action.target_ip,
             });
-            (None, None)
+            (None, None, true)
         }
         Err(ArpRequestGenerationError::Allocation(error)) => {
+            runtime.announcement_unavailable(index, now);
             trace.record_generated(GeneratedArpTrace::AllocationFailed(error));
-            (Some(error), None)
+            (Some(error), None, false)
         }
         Err(ArpRequestGenerationError::Build(error)) => {
+            runtime.announcement_unavailable(index, now);
             trace.record_generated(GeneratedArpTrace::BuildFailed(error));
-            (None, Some::<ArpRequestBuildError>(error))
+            (None, Some::<ArpRequestBuildError>(error), false)
         }
     };
     let completion = batch.finish();
+    if committed {
+        let counters = &mut runtime.announce_counters;
+        counters.accepted = counters.accepted.saturating_add(completion.accepted as u64);
+        counters.rejected = counters.rejected.saturating_add(completion.rejected as u64);
+    }
     trace.record_generated(GeneratedArpTrace::BatchCompleted {
         accepted: completion.accepted,
         rejected: completion.rejected,
@@ -646,3 +776,7 @@ where
         completion,
     }))
 }
+
+#[cfg(test)]
+#[path = "announce_tests.rs"]
+mod tests;

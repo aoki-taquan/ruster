@@ -765,12 +765,22 @@ where
     T: GeneratedTraceSink,
 {
     let mut accounting = GeneratedAccounting::default();
-    for _ in 0..budget {
-        // Resolution Requests first, then the RFC 5227 Announcements of
-        // the router's own addresses (ARP-033), within the same budget.
-        let executed = match execute_one_arp_request(io, runtime, now, trace) {
-            Ok(None) => execute_one_arp_announcement(io, runtime, snapshot, now, trace),
-            other => other,
+    for frame in 0..budget {
+        // The first frame of the budget goes to a due RFC 5227
+        // Announcement or defense of the router's own addresses (ARP-033,
+        // ARP-038), so a stream of resolution Requests cannot starve them;
+        // then resolution Requests, then the other Announcements, within
+        // the same budget.
+        let executed = if frame == 0 {
+            match execute_one_arp_announcement(io, runtime, snapshot, now, trace) {
+                Ok(None) => execute_one_arp_request(io, runtime, now, trace),
+                other => other,
+            }
+        } else {
+            match execute_one_arp_request(io, runtime, now, trace) {
+                Ok(None) => execute_one_arp_announcement(io, runtime, snapshot, now, trace),
+                other => other,
+            }
         };
         let result = match executed {
             Ok(Some(result)) => result,

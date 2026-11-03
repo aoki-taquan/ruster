@@ -703,6 +703,9 @@ pub struct PortHealth {
     /// Conflicting ARP packets for the port's address since startup
     /// (RFC 5227 §2.4, last sample, ARP-039).
     pub arp_address_conflicts: u64,
+    /// An `ARP_ADDRESS_CONFLICT` episode is open (warned, not yet
+    /// recovered). Kept out of `watch.state` (ARP-039).
+    pub arp_address_conflict: bool,
 }
 
 impl ObservableFields for PortHealth {
@@ -788,6 +791,11 @@ impl ObservableFields for PortHealth {
             SECTION,
             "arp_address_conflicts",
             FieldValue::Count(self.arp_address_conflicts),
+        );
+        visitor.field(
+            SECTION,
+            "arp_address_conflict",
+            FieldValue::Flag(self.arp_address_conflict),
         );
     }
 }
@@ -965,6 +973,7 @@ impl Watch {
                 None,
                 emit,
             );
+            port.counters.arp_address_conflict = port.arp_conflict.warned;
         }
     }
 
@@ -1156,6 +1165,10 @@ impl Watch {
                 || port.uppers_warned
                 || port.quarantine.warned
                 || port.invalid_descs.warned
+            // Not `arp_conflict` (ARP-039): any host on a link can send a
+            // conflicting ARP packet, so it must not turn `watch.state`
+            // into `warning` and drive automation; it has its own
+            // `ifN.watch.arp_address_conflict` flag.
         })
     }
 

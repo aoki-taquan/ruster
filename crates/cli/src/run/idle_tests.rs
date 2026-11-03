@@ -475,3 +475,35 @@ fn a_pending_resolution_keeps_the_waits_short() {
             .count()
     );
 }
+
+/// ARP-033 regression (#351 review M): an RFC 5227 announcement that is due
+/// but whose generated frame can never be allocated (a backend whose every
+/// generated allocation is `Unavailable`) must not spin the idle loop. The
+/// port is retried every `ARP_ANNOUNCE_RETRY_MS`; the loop waits between
+/// the retries instead of ticking with timeout 0.
+#[test]
+fn an_unallocatable_announcement_does_not_spin_the_idle_loop() {
+    let host = waiting_host();
+    host.state.generated_budget.set(Some(0));
+    let (outcome, _) = run_until(
+        &host,
+        config(),
+        settings(CheckPolicy::default(), 0),
+        3_000 * MS,
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let out = &outcome.out;
+    assert_eq!(stat(out, "arp_announce.committed"), 0, "{out}");
+    assert!(stat(out, "arp_announce.unavailable") >= 100, "{out}");
+    // About one tick per 10 ms retry, as many waits; a spin made one tick
+    // per clock reading (10 µs), about 300000.
+    let ticks = host.state.io_calls.get();
+    let waits = host.state.wait_log.borrow().len();
+    assert!(ticks <= 2 * SPIN_TICKS + 700, "{ticks} ticks in 3 s");
+    assert!(waits >= 200, "{waits} waits");
+    assert!(
+        timeouts(&host.state).iter().all(|timeout| *timeout >= 1),
+        "{:?}",
+        timeouts(&host.state)
+    );
+}

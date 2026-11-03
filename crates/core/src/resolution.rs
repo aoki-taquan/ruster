@@ -23,7 +23,7 @@ pub use announce::{
     execute_one_arp_announcement, ArpAnnounceCounters, ArpAnnouncePolicy, ArpAnnouncePolicyError,
     ArpAnnounceSlot, ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS, ARP_ANNOUNCE_INTERVAL_MS,
     ARP_ANNOUNCE_MAX_COUNT, ARP_ANNOUNCE_MAX_INTERVAL_MS, ARP_ANNOUNCE_MIN_INTERVAL_MS,
-    ARP_ANNOUNCE_NUM, ARP_DEFEND_INTERVAL_MS,
+    ARP_ANNOUNCE_NUM, ARP_ANNOUNCE_RETRY_MS, ARP_DEFEND_INTERVAL_MS,
 };
 
 pub const ARP_REQUEST_FRAME_LEN: usize = 60;
@@ -1014,6 +1014,8 @@ pub struct ResolutionRuntime<'a> {
     announce: &'a mut [ArpAnnounceSlot],
     /// Slots with a trigger waiting or a sequence running.
     announce_busy: usize,
+    /// Round-robin start of the next announcement scan.
+    announce_cursor: usize,
     announce_counters: ArpAnnounceCounters,
     /// Index slots visited (chain nodes, list heads, bitmap words). Cost
     /// tests read it; it never affects behavior. Test builds only.
@@ -1144,13 +1146,17 @@ impl<'a> ResolutionRuntime<'a> {
             forward_miss: None,
             announce: &mut [],
             announce_busy: 0,
+            announce_cursor: 0,
             announce_counters: ArpAnnounceCounters {
                 requested: 0,
                 coalesced: 0,
                 disabled: 0,
                 sequences: 0,
                 rate_limited: 0,
-                sent: 0,
+                committed: 0,
+                accepted: 0,
+                rejected: 0,
+                unavailable: 0,
                 cancelled: 0,
                 conflicts: 0,
                 defended: 0,

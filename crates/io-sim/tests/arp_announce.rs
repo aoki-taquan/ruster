@@ -190,7 +190,7 @@ impl World {
         self.active.resolution().announce_counters()
     }
 
-    fn conflicts(&self) -> Vec<(IfId, u32)> {
+    fn conflicts(&self) -> Vec<(IfId, u64)> {
         self.active.resolution().address_conflicts().collect()
     }
 }
@@ -222,7 +222,7 @@ fn startup_announces_every_address_twice_two_seconds_apart() {
     assert_eq!(world.active.resolution().pending_announcements(), 0);
     let counters = world.counters();
     assert_eq!(
-        (counters.requested, counters.sequences, counters.sent),
+        (counters.requested, counters.sequences, counters.committed),
         (2, 2, 4)
     );
     // The generated ARP accounting carries them (shared frame budget).
@@ -352,7 +352,7 @@ fn a_conflicting_arp_packet_is_counted_and_defended_once_per_defend_interval() {
             counters.conflicts,
             counters.defended,
             counters.defense_suppressed,
-            counters.sent
+            counters.committed
         ),
         (4, 2, 2, 2)
     );
@@ -429,4 +429,148 @@ fn configured_count_and_interval_are_used() {
         idle(&mut world, 0, 4_000),
         [(0, lan()), (1_000, lan()), (2_000, lan())]
     );
+}
+
+/// RFC 1071 one's-complement checksum, independent of the router's.
+fn sum16(bytes: &[u8]) -> u16 {
+    let mut sum = 0_u32;
+    for pair in bytes.chunks(2) {
+        sum += u32::from(pair[0]) << 8 | u32::from(*pair.get(1).unwrap_or(&0));
+    }
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// An RFC 768 datagram from H to `destination` in an RFC 791 header, on
+/// the LAN.
+fn udp_from_h(destination: [u8; 4], source_port: u16) -> Vec<u8> {
+    let payload = b"announce";
+    let mut segment = Vec::new();
+    segment.extend_from_slice(&source_port.to_be_bytes());
+    segment.extend_from_slice(&9_000_u16.to_be_bytes());
+    segment.extend_from_slice(&u16::try_from(8 + payload.len()).unwrap().to_be_bytes());
+    segment.extend_from_slice(&[0, 0]);
+    segment.extend_from_slice(payload);
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&H);
+    pseudo.extend_from_slice(&destination);
+    pseudo.extend_from_slice(&[0, 17]);
+    pseudo.extend_from_slice(&u16::try_from(segment.len()).unwrap().to_be_bytes());
+    pseudo.extend_from_slice(&segment);
+    let checksum = match sum16(&pseudo) {
+        0 => 0xffff,
+        sum => sum,
+    };
+    segment[6..8].copy_from_slice(&checksum.to_be_bytes());
+    let mut packet = vec![0x45, 0];
+    packet.extend_from_slice(&u16::try_from(20 + segment.len()).unwrap().to_be_bytes());
+    packet.extend_from_slice(&[0, 1, 0x40, 0, 64, 17, 0, 0]);
+    packet.extend_from_slice(&H);
+    packet.extend_from_slice(&destination);
+    let checksum = sum16(&packet);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+    packet.extend_from_slice(&segment);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&LAN_MAC);
+    frame.extend_from_slice(&H_MAC);
+    frame.extend_from_slice(&0x0800_u16.to_be_bytes());
+    frame.extend_from_slice(&packet);
+    frame
+}
+
+/// The first frame of each tick's generated ARP budget goes to a due
+/// Announcement (#351 review L-b): with a budget of one frame and a
+/// resolution Request queued every tick, the announcements still leave,
+/// one per tick, and the Requests after them.
+#[test]
+fn resolution_requests_cannot_starve_the_announcements() {
+    let mut world = World::started(ROUTER);
+    let budgets = TickBudgets {
+        generated_arp: 1,
+        ..budgets()
+    };
+    let mut sent = Vec::new();
+    for now in 0..4_u8 {
+        // A datagram to another unresolved WAN host every tick.
+        let target = [203, 0, 113, 10 + now];
+        world
+            .io
+            .inject(LAN, udp_from_h(target, 40_000 + u16::from(now)));
+        let _report = run_tick(
+            &mut world.active,
+            None,
+            &mut world.io,
+            MonotonicMillis(u64::from(now)),
+            budgets,
+            &mut world.observer,
+        );
+        sent.push(world.sent());
+    }
+    let request = |last: u8| {
+        (
+            WAN,
+            arp(
+                BROADCAST,
+                WAN_MAC,
+                1,
+                (WAN_MAC, PUBLIC),
+                ([0; 6], [203, 0, 113, last]),
+            ),
+        )
+    };
+    assert_eq!(
+        sent,
+        [
+            vec![lan()],
+            vec![wan()],
+            vec![request(10)],
+            vec![request(11)]
+        ]
+    );
+}
+
+/// A conflicting ARP Request for the router's own address (RFC 5227
+/// §2.4): the router answers it as before (RFC 826, ARP-008, a unicast
+/// Reply in place) and also defends with the broadcast Announcement, in
+/// the same tick.
+#[test]
+fn a_conflicting_request_for_our_address_is_answered_and_defended() {
+    let mut world = World::new(ROUTER);
+    let probe_like = arp(
+        BROADCAST,
+        OTHER_MAC,
+        1,
+        (OTHER_MAC, LAN_IP),
+        ([0; 6], LAN_IP),
+    );
+    world.io.inject(LAN, probe_like);
+    let _report = run_tick(
+        &mut world.active,
+        None,
+        &mut world.io,
+        MonotonicMillis(0),
+        budgets(),
+        &mut world.observer,
+    );
+    while world.io.pop_recycled().is_some() {}
+    let sent: Vec<(FrameOrigin, IfId, Vec<u8>)> = std::iter::from_fn(|| world.io.pop_tx())
+        .map(|frame| (frame.origin, frame.egress, frame.bytes))
+        .collect();
+    let reply = arp(
+        OTHER_MAC,
+        LAN_MAC,
+        2,
+        (LAN_MAC, LAN_IP),
+        (OTHER_MAC, LAN_IP),
+    );
+    assert_eq!(
+        sent,
+        [
+            (FrameOrigin::Received { ingress: LAN }, LAN, reply),
+            (FrameOrigin::Generated, LAN, announcement(LAN_MAC, LAN_IP)),
+        ]
+    );
+    assert_eq!(world.conflicts(), [(LAN, 1), (WAN, 0)]);
 }
