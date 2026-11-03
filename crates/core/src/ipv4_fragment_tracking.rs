@@ -429,8 +429,6 @@ pub struct Ipv4FragmentEntrySlot {
     /// most 60000 ms).
     progress_ms: u16,
     host: u32,
-    /// Index of the ingress slot.
-    ingress: u16,
     held_head: u32,
     held_tail: u32,
     held: u16,
@@ -441,10 +439,9 @@ pub struct Ipv4FragmentEntrySlot {
     first_len: u16,
     first_fingerprint: u32,
     /// The datagram's data length, fixed by the first fragment with MF clear
-    /// (0 before).
-    total: u32,
-    /// The largest data end seen.
-    max_end: u32,
+    /// (0 before), and the largest data end seen: both at most 65515.
+    total: u16,
+    max_end: u16,
     /// Disjoint, sorted data ranges seen; `untracked` once more were needed.
     ranges: [[u16; 2]; COVERAGE_RANGES],
     ranges_len: u8,
@@ -474,7 +471,6 @@ impl Ipv4FragmentEntrySlot {
         created_ms: 0,
         progress_ms: 0,
         host: NONE,
-        ingress: 0,
         held_head: NONE,
         held_tail: NONE,
         held: 0,
@@ -496,7 +492,8 @@ impl Ipv4FragmentEntrySlot {
         if self.poisoned {
             return Ok(());
         }
-        let end = offset + len;
+        // Data ends at most 65515 bytes in (`parse_fragment`).
+        let end = u16::try_from(offset + len).map_err(|_| ())?;
         if !more {
             if (self.total != 0 && self.total != end) || self.max_end > end {
                 return Err(());
@@ -509,8 +506,8 @@ impl Ipv4FragmentEntrySlot {
         if self.untracked {
             return Ok(());
         }
-        // Both fit 16 bits: data ends at most 65515 bytes in.
-        let (mut start, mut stop) = (offset as u16, end as u16);
+        // The offset is below the end, which fits 16 bits.
+        let (mut start, mut stop) = (offset as u16, end);
         let mut merged = [[0_u16; 2]; COVERAGE_RANGES];
         let mut count = 0;
         let mut placed = false;
@@ -559,7 +556,7 @@ impl Ipv4FragmentEntrySlot {
             && self.total != 0
             && self.ranges_len == 1
             && u32::from(self.ranges[0][0]) == 0
-            && u32::from(self.ranges[0][1]) == self.total
+            && self.ranges[0][1] == self.total
     }
 }
 
@@ -601,6 +598,8 @@ fn remove(entries: &mut [Ipv4FragmentEntrySlot], ends: &mut Ends, index: u32, li
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4FragmentHostSlot {
     ingress: IfId,
+    /// Index of the ingress slot of `ingress`.
+    ingress_slot: u16,
     address: [u8; 4],
     entries: u32,
     held: u32,
@@ -613,6 +612,7 @@ pub struct Ipv4FragmentHostSlot {
 impl Ipv4FragmentHostSlot {
     pub const EMPTY: Self = Self {
         ingress: IfId(0),
+        ingress_slot: 0,
         address: [0; 4],
         entries: 0,
         held: 0,
@@ -1117,7 +1117,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     fn class_link(&mut self, index: u32) {
         let entry = self.entries[index as usize];
         let host = entry.host as usize;
-        let ingress = usize::from(entry.ingress);
+        let ingress = usize::from(self.hosts[host].ingress_slot);
         if entry.state == EntryState::Allow {
             push(self.entries, &mut self.allow, index, CLASS);
             push(self.entries, &mut self.hosts[host].allow, index, HOST);
@@ -1143,7 +1143,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     fn class_unlink(&mut self, index: u32) {
         let entry = self.entries[index as usize];
         let host = entry.host as usize;
-        let ingress = usize::from(entry.ingress);
+        let ingress = usize::from(self.hosts[host].ingress_slot);
         if entry.state == EntryState::Allow {
             remove(self.entries, &mut self.allow, index, CLASS);
             remove(self.entries, &mut self.hosts[host].allow, index, HOST);
@@ -1332,6 +1332,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
                 self.free_host = self.hosts[host as usize].next_free;
                 self.hosts[host as usize] = Ipv4FragmentHostSlot {
                     ingress: key.ingress,
+                    ingress_slot: u16::try_from(ingress).expect("at most 256 ingresses"),
                     address: key.source,
                     ..Ipv4FragmentHostSlot::EMPTY
                 };
@@ -1358,7 +1359,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
             key,
             created_ms: now_ms,
             host: u32::try_from(host).expect("host index below NONE"),
-            ingress: u16::try_from(ingress).expect("at most 256 ingresses"),
             ..Ipv4FragmentEntrySlot::EMPTY
         };
         push(self.entries, &mut self.age, index, AGE);
@@ -1384,15 +1384,12 @@ impl<'a> Ipv4FragmentTracker<'a> {
         let id = u32::try_from(index).expect("entry index below NONE");
         self.class_unlink(id);
         remove(self.entries, &mut self.age, id, AGE);
-        let entry = self.entries[index];
+        let host = self.entries[index].host as usize;
         let _ = self.entry_directory.unlink(index);
-        let ingress = usize::from(entry.ingress);
+        let ingress = usize::from(self.hosts[host].ingress_slot);
         self.ingresses[ingress].entries = self.ingresses[ingress].entries.saturating_sub(1);
-        let host = entry.host as usize;
-        if let Some(slot) = self.hosts.get_mut(host) {
-            slot.entries = slot.entries.saturating_sub(1);
-            self.release_host_if_empty(host);
-        }
+        self.hosts[host].entries = self.hosts[host].entries.saturating_sub(1);
+        self.release_host_if_empty(host);
         self.entries[index] = Ipv4FragmentEntrySlot::EMPTY;
         self.entries[index].links[AGE][NEWER] = self.free_entry;
         self.free_entry = id;

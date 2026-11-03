@@ -60,7 +60,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  63.77 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  63.89 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -209,7 +209,7 @@ whole-document storage, which has no path.
 |---|---|---|---|
 | quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 592, and 592 bytes), so the bound is memory: at 65536 these three alone would need 115.0 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 63.77 MiB (with `[fragmentation] datagrams = 1024`, MTU2 part B, `[fragment-tracking] entries = 16384, held-fragments = 512`, NAT-FRAG, and `[resolution.hold] packets = 64`, ARP-HOLD; 64.00 MiB with `mappings-per-host` set on both NAT44 protocols, only 12 fragmentation slots, `[fragment-tracking] mode = "refuse"`, and `[resolution.hold] enabled = false`, N3, and 63.97 MiB with only `sessions-per-host`, `mode = "refuse"`, and the hold off, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 63.89 MiB (with `[fragmentation] datagrams = 1024`, MTU2 part B, `[fragment-tracking] entries = 16384, held-fragments = 512`, NAT-FRAG, and `[resolution.hold] packets = 64`, ARP-HOLD; 64.00 MiB with `mappings-per-host` set on both NAT44 protocols, only 12 fragmentation slots, `[fragment-tracking] mode = "refuse"`, and `[resolution.hold] enabled = false`, N3, and 63.97 MiB with only `sessions-per-host`, `mode = "refuse"`, and the hold off, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -310,12 +310,13 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-66865856 bytes (63.77 MiB). ARP-HOLD added the largest hold table (64
-slots of 40 + 3840 bytes: 248320 bytes; 66617536 bytes, 63.53 MiB,
+66996928 bytes (63.89 MiB). ARP-HOLD added the largest hold table (64
+slots of 40 + 3840 bytes: 248320 bytes; 66748608 bytes, 63.66 MiB,
 before). NAT-FRAG added the largest fragment association
 table (16384 entries of an entry, a host slot, and two directory buckets
-and nodes, and 512 held fragments of 8 + 3840 bytes: 5.57 MiB; 61042880
-bytes, 58.22 MiB, before). MTU2 part B added 1024 fragmentation slots
+and nodes, and 512 held fragments of 8 + 3840 bytes: 5.44 MiB; 61042880
+bytes, 58.22 MiB, before; its follow-ups grew the host slot by 8 bytes,
+128 KiB at the limit, and kept the entry at 136 bytes). MTU2 part B added 1024 fragmentation slots
 of 12 + 3840 bytes (3.76 MiB; 57098432 bytes, 54.45 MiB, before). MTU1 grew the ICMPv4 error action slot from 584
 to 592 bytes (the Next-Hop MTU of Fragmentation Needed, 32 KiB at the limit;
 57065664 bytes, 54.42 MiB, before). N1 grew the TCP NAT mapping slot from 64 to 80
@@ -332,7 +333,7 @@ raised states, actions, dynamic neighbors, and ICMPv4 error states to
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (63.77 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (63.89 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -1024,7 +1025,7 @@ Tuning:
   flushes it).
 - Storage: `entries` × (entry + host slot + 2 directory nodes) +
   next_power_of_two(`entries`) × 2 directory buckets + `held-fragments` ×
-  (record + slot): 306688 bytes by default, counted in `storage-bytes`.
+  (record + slot): 304640 bytes by default, counted in `storage-bytes`.
   Every `[fragment-tracking]` change is restart-required (`STORAGE_SHAPE`).
 - A reload (SIGHUP apply) discards every association and held fragment
   (`fragment_tracking.entries_flushed`, `held_flushed`): a datagram in
@@ -1062,9 +1063,9 @@ were dropped as `drop.FIREWALL_FRAGMENT_UNSUPPORTED` (and, without the
 firewall, `NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`/`NAT44_ICMP_FRAGMENT_UNSUPPORTED`)
 now pass the firewall's rules and the NAT on their first fragment, creating
 mappings and firewall state; review the rules if you relied on that drop,
-and expect those counters to fall to 0. The default table adds 306688
+and expect those counters to fall to 0. The default table adds 304640
 bytes of storage (the maximal production config, with `entries = 16384` and
-`held-fragments = 512`, is 66879680 bytes). A config with every table at
+`held-fragments = 512`, is 66996928 bytes). A config with every table at
 its production limit and per-host NAT44 limits that just fitted 64 MiB may
 now fail with `RUNTIME_STORAGE_BYTES_EXCEEDED`: lower `[fragment-tracking]
 entries`/`held-fragments` or `[fragmentation] datagrams`, size a table
@@ -1164,7 +1165,7 @@ for configs without `[resolution.hold]`. Datagrams that were dropped as
 `drop.NEIGHBOR_UNRESOLVED` are now held and sent, so that counter falls to
 (near) 0 and `consume.ARP_HELD` rises; firewall and NAT state for them is
 created when they are sent, not dropped. The default table adds 248320
-bytes of storage (the maximal production config is 66865856 bytes). **A
+bytes of storage (the maximal production config is 66996928 bytes). **A
 config that just fitted 64 MiB fails after the upgrade with no change of
 its own**: `stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED
 path=resolution.hold.packets` (the path is set when the document fits

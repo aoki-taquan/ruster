@@ -1072,7 +1072,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`、`[resolution.hold] packets = 64`を含む）のstorageは63.77 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`、`[resolution.hold] packets = 64`を含む）のstorageは63.89 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
