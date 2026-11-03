@@ -1848,6 +1848,23 @@ mod tests {
     }
 
     #[test]
+    fn every_kind_has_its_own_generation_switch() {
+        let kinds = [
+            Icmpv4ErrorKind::TimeExceededTtl,
+            Icmpv4ErrorKind::DestinationUnreachableNetwork,
+            Icmpv4ErrorKind::DestinationUnreachableHost,
+            Icmpv4ErrorKind::DestinationUnreachablePort,
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
+        ];
+        for off in kinds {
+            let policy = Icmpv4ErrorPolicy::default().with_generation(off, false);
+            for kind in kinds {
+                assert_eq!(policy.generates(kind), kind != off, "{off:?} off, {kind:?}");
+            }
+        }
+    }
+
+    #[test]
     fn fit_egress_mtu_cuts_and_zeroes_the_quote_only_when_needed() {
         let full = action_kind(
             Icmpv4ErrorKind::TimeExceededTtl,

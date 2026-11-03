@@ -1075,3 +1075,93 @@ fn round_robin_and_icmp_pressure_retain_candidates_until_each_queues() {
         (1, 0, 1)
     );
 }
+
+/// MTU1 (ICMP4-012M3): the Host Unreachable dispatched from a failure hold
+/// is cut to the MTU of its reverse egress (LAN 100 here): a 170-byte
+/// datagram is quoted with 72 bytes and the error is exactly 100 bytes of
+/// IPv4.
+#[test]
+fn host_unreachable_is_cut_to_the_reverse_egress_mtu() {
+    let routes = direct_routes();
+    let mut interfaces = interfaces();
+    interfaces[0].mtu = 100;
+    let bindings = bindings();
+    let neighbors = [Neighbor {
+        interface: LAN,
+        target: SOURCE,
+        mac: REVERSE_MAC,
+    }];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let body: Vec<u8> = (0..150_u8).collect();
+    let original = frame(&body, 0x4000, 17);
+    let mut states = [ResolutionStateSlot::EMPTY; 2];
+    let mut actions = [ResolutionActionSlot::EMPTY; 2];
+    let mut dynamic = [DynamicNeighborSlot::EMPTY; 2];
+    let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+    let mut resolution = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+        retry_policy(),
+        &mut states,
+        &mut actions,
+        &mut dynamic,
+        &mut holds,
+    );
+    let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
+    let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut error_states,
+        &mut error_actions,
+    );
+    let mut io = SimIo::new();
+    io.inject(LAN, original.clone());
+    forward_batch_with_resolution_and_icmpv4_errors(
+        io.receive(1).unwrap(),
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        MonotonicMillis(0),
+        &mut NoTrace,
+    );
+    assert_eq!(resolution.pending_failure_holds(), 1);
+    execute_one_arp_request(
+        &mut io,
+        &mut resolution,
+        MonotonicMillis(0),
+        &mut NoGeneratedTrace,
+    )
+    .unwrap()
+    .unwrap();
+    io.pop_tx().unwrap();
+    poll_resolution_timers(
+        &mut resolution,
+        MonotonicMillis(1_000),
+        2,
+        &mut NoResolutionTimerTrace,
+    )
+    .unwrap();
+    let dispatched = dispatch_host_unreachable_failures(
+        &mut resolution,
+        &mut errors,
+        &snapshot,
+        MonotonicMillis(1_000),
+        1,
+        &mut NoResolutionFailureTrace,
+    )
+    .unwrap();
+    assert_eq!(dispatched.queued, 1);
+    let generated = execute_one_icmpv4_error(
+        &mut io,
+        &mut errors,
+        MonotonicMillis(1_000),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(generated.action.quote_len(), 72);
+    let tx = io.pop_tx().unwrap();
+    assert_eq!(tx.bytes.len(), 14 + 100);
+    assert_eq!(u16::from_be_bytes([tx.bytes[16], tx.bytes[17]]), 100);
+    assert_eq!(&tx.bytes[34..36], &[3, 1]);
+    assert_eq!(internet_checksum(&tx.bytes[34..]), 0);
+    assert_eq!(&tx.bytes[42..], &original[14..14 + 72]);
+}
