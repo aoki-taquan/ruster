@@ -161,6 +161,14 @@ pub enum ValidationCode {
     /// false`: a replay leaves through the fragmentation slots, so nothing
     /// could be held (ARP-HOLD).
     ArpHoldWithoutFragmentation,
+    /// `[arp] announce-count` outside 1..=10, `announce-interval-ms`
+    /// outside 1000..=3600000, or `announce-min-interval-ms` above 3600000
+    /// or shorter than one sequence (ARP-034).
+    ArpAnnouncePolicy(ruster_core::ArpAnnouncePolicyError),
+    /// `[tick] generated-arp = 0` with `[arp] announce` or
+    /// `conflict-defense` on: an owed Announcement could never be sent
+    /// (ARP-034; it would also keep the idle loop from waiting).
+    ArpAnnounceWithoutGeneratedArp,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
     Nat44RealmWithoutProtocol,
@@ -340,6 +348,8 @@ impl ValidationCode {
             Self::ArpHoldPacketsZero => "ARP_HOLD_PACKETS_ZERO",
             Self::ArpHoldBoundAbovePackets => "ARP_HOLD_BOUND_ABOVE_PACKETS",
             Self::ArpHoldWithoutFragmentation => "ARP_HOLD_WITHOUT_FRAGMENTATION",
+            Self::ArpAnnouncePolicy(_) => "ARP_ANNOUNCE_POLICY",
+            Self::ArpAnnounceWithoutGeneratedArp => "ARP_ANNOUNCE_WITHOUT_GENERATED_ARP",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
             Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
@@ -505,6 +515,10 @@ pub struct ResolutionStorageShapeV1 {
     pub actions: u32,
     pub dynamic_neighbors: u32,
     pub failure_holds: u32,
+    /// One RFC 5227 announcement slot per interface (ARP-033,
+    /// [`ruster_core::ArpAnnounceSlot`], 48 bytes each), whether `[arp]
+    /// announce` is on or off, so the switch is reloadable.
+    pub announce_slots: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1765,8 +1779,31 @@ fn validate_v1(
             .with_echo_reply(source.echo_reply),
         None => Ipv4OriginPolicy::default(),
     };
+    let arp_source = config.arp.unwrap_or_default();
+    // ARP-034: the announcement values are checked even when `announce =
+    // false`, so switching it on by reload cannot meet a bad value.
+    let announce = ruster_core::ArpAnnouncePolicy::new(
+        arp_source.announce_count,
+        arp_source.announce_interval_ms,
+        arp_source.announce_min_interval_ms,
+    )
+    .map_err(|error| {
+        let key = match error {
+            ruster_core::ArpAnnouncePolicyError::CountOutOfRange => "announce-count",
+            ruster_core::ArpAnnouncePolicyError::IntervalOutOfRange => "announce-interval-ms",
+            ruster_core::ArpAnnouncePolicyError::MinIntervalOutOfRange => {
+                "announce-min-interval-ms"
+            }
+        };
+        ValidationError::new(
+            ValidationCode::ArpAnnouncePolicy(error),
+            path(&["arp", key]),
+        )
+    })?;
     let arp = ArpPolicy::RFC826
-        .with_require_on_link_sender(config.arp.unwrap_or_default().require_on_link_sender);
+        .with_require_on_link_sender(arp_source.require_on_link_sender)
+        .with_announce(arp_source.announce.then_some(announce))
+        .with_defend_conflicts(arp_source.conflict_defense);
 
     interface_records.sort_by_key(|record| record.binding.id);
     source_validation.sort_by_key(|binding| binding.interface);
@@ -2325,6 +2362,8 @@ fn validate_v1(
     let storage = build_storage_shape(
         StorageInputs {
             resolution: resolution_source.map(|source| source.capacity),
+            interfaces: u32::try_from(interfaces.len())
+                .expect("the parser bounds interfaces at 256"),
             icmp: icmp_source.map(|source| source.capacity),
             udp: udp_capacity.zip(validated_udp.map(|(_, _, _, ports, policy)| {
                 (
@@ -2415,6 +2454,14 @@ fn validate_v1(
             generated_fragments: tick.generated_fragments,
         });
     if let Some(source) = config.tick {
+        // ARP-034: the RFC 5227 frames leave through the generated ARP
+        // budget; with none they could never be sent.
+        if source.generated_arp == 0 && (arp.announce().is_some() || arp.defend_conflicts()) {
+            return Err(ValidationError::new(
+                ValidationCode::ArpAnnounceWithoutGeneratedArp,
+                path(&["tick", "generated-arp"]),
+            ));
+        }
         let budget_path = path(&["tick", "generated-fragments"]);
         if source.generated_fragments == 0 {
             return Err(ValidationError::new(
@@ -3494,6 +3541,8 @@ type TcpStorageInputs = ((u16, u16), (bool, bool));
 
 struct StorageInputs {
     resolution: Option<crate::ResolutionCapacityV1>,
+    /// Interfaces of the document: one announcement slot each (ARP-033).
+    interfaces: u32,
     icmp: Option<crate::Icmpv4ErrorCapacityV1>,
     udp: Option<(crate::Nat44UdpCapacityV1, NatStorageInputs)>,
     tcp: Option<(crate::Nat44TcpCapacityV1, TcpStorageInputs)>,
@@ -3546,11 +3595,17 @@ fn build_storage_shape(
                 capacity.failure_holds,
                 path(&["resolution", "capacity", "failure-holds"]),
             )?;
+            add_bytes::<ruster_core::ArpAnnounceSlot>(
+                &mut bytes,
+                inputs.interfaces,
+                path(&["interfaces"]),
+            )?;
             Ok(ResolutionStorageShapeV1 {
                 states: capacity.states,
                 actions: capacity.actions,
                 dynamic_neighbors: capacity.dynamic_neighbors,
                 failure_holds: capacity.failure_holds,
+                announce_slots: inputs.interfaces,
             })
         })
         .transpose()?;

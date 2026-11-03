@@ -415,10 +415,11 @@ impl Default for FragmentTrackingV1 {
     }
 }
 
-/// ARP receive policy (`[arp]`).
+/// ARP policy (`[arp]`).
 ///
-/// Every field defaults to RFC 826 behavior; hardening is opt-in.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+/// Every field defaults to RFC behavior (RFC 826 for received ARP, RFC
+/// 5227 for the router's own addresses); hardening is opt-in.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct ArpV1 {
     /// ARP-031 hardening (default `false`, RFC 826): drop an ARP Request or
@@ -427,6 +428,54 @@ pub struct ArpV1 {
     /// `ARP_SENDER_NOT_ON_LINK`, without learning or replying.
     #[serde(default)]
     pub require_on_link_sender: bool,
+    /// RFC 5227 §2.3 ARP Announcements of an interface's address when it
+    /// becomes active (startup, link-up, a reload that adds or changes it)
+    /// (default `true`, ARP-033).
+    #[serde(default = "enabled")]
+    pub announce: bool,
+    /// Announcements per sequence (default 2, RFC 5227 ANNOUNCE_NUM;
+    /// 1..=10).
+    #[serde(default = "default_announce_count")]
+    pub announce_count: u8,
+    /// Time between the Announcements of a sequence (default 2000, RFC
+    /// 5227 ANNOUNCE_INTERVAL; 1000..=3600000).
+    #[serde(default = "default_announce_interval_ms")]
+    pub announce_interval_ms: u64,
+    /// Minimum time between two sequences on one interface, the link-flap
+    /// bound (default 10000, local; at least one sequence, at most
+    /// 3600000, ARP-035).
+    #[serde(default = "default_announce_min_interval_ms")]
+    pub announce_min_interval_ms: u64,
+    /// RFC 5227 §2.4 (c): defend an address against a conflicting ARP
+    /// packet with one Announcement per DEFEND_INTERVAL (default `true`,
+    /// ARP-038). Detection and counters stay on either way.
+    #[serde(default = "enabled")]
+    pub conflict_defense: bool,
+}
+
+impl Default for ArpV1 {
+    fn default() -> Self {
+        Self {
+            require_on_link_sender: false,
+            announce: true,
+            announce_count: default_announce_count(),
+            announce_interval_ms: default_announce_interval_ms(),
+            announce_min_interval_ms: default_announce_min_interval_ms(),
+            conflict_defense: true,
+        }
+    }
+}
+
+const fn default_announce_count() -> u8 {
+    ruster_core::ARP_ANNOUNCE_NUM
+}
+
+const fn default_announce_interval_ms() -> u64 {
+    ruster_core::ARP_ANNOUNCE_INTERVAL_MS
+}
+
+const fn default_announce_min_interval_ms() -> u64 {
+    ruster_core::ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS
 }
 
 const fn default_inbound_sessions_per_remote() -> u8 {

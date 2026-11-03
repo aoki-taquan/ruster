@@ -518,7 +518,9 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
         &mut control,
         MonotonicMillis(0),
         settings,
-        &mut err
+        &mut err,
+        [],
+        &mut Vec::new(),
     )
     .is_none());
     let started = std::time::Instant::now();
@@ -532,7 +534,9 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
             &mut control,
             MonotonicMillis(500),
             settings,
-            &mut err
+            &mut err,
+            [],
+            &mut Vec::new(),
         )
         .is_none());
         std::thread::sleep(Duration::from_millis(1));

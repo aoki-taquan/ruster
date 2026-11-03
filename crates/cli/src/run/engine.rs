@@ -438,6 +438,19 @@ impl Pending {
     }
 }
 
+/// The idle-wait deadline of the next RFC 5227 announcement due at `due`
+/// (ARP-033): `due` itself when still ahead, else [`SHORT_WAIT_MS`] from
+/// `now`. A due time at or before `now` is one the tick just ran could not
+/// send, and a deadline of `now` would make every idle wait 0 (a busy
+/// loop).
+pub fn announcement_deadline(now: MonotonicMillis, due: MonotonicMillis) -> MonotonicMillis {
+    if due > now {
+        due
+    } else {
+        MonotonicMillis(now.0.saturating_add(SHORT_WAIT_MS))
+    }
+}
+
 /// The timeout of the idle wait after a tick at `now`: `max_wait_ms`, or
 /// [`SHORT_WAIT_MS`] (never more than `max_wait_ms`) while work is
 /// `pending`, and never past `next_deadline`. 0 means a deadline is due:
@@ -701,6 +714,9 @@ where
     let mut on_demand_stats = OnDemandStats::default();
     let mut budgets = control.reloader.budgets();
     let mut ops = control.reloader.ops();
+    // Ports whose link came back up in a link round (ARP-033); filled by
+    // `watch_step`, drained into announcement requests.
+    let mut link_ups = Vec::with_capacity(datapath.port_count());
     loop {
         if stop.stop() {
             return LoopEnd::Signal;
@@ -890,8 +906,23 @@ where
         }
         let busy = tick_was_busy(&report);
         drop(report);
-        if let Some(end) = watch_step(datapath, control, now, settings, err) {
+        let end = watch_step(
+            datapath,
+            control,
+            now,
+            settings,
+            err,
+            active.resolution().address_conflicts(),
+            &mut link_ups,
+        );
+        if let Some(end) = end {
             return end;
+        }
+        // RFC 5227 §2.1/§2.3 (ARP-033): a port whose link came back up
+        // announces its address from the next tick, bounded per port by
+        // `[arp] announce-min-interval-ms`.
+        for port in link_ups.drain(..) {
+            active.request_arp_announcements(Some(port));
         }
         // Here, between ticks, so a router stuck anywhere stops pinging.
         control.notify.watchdog(now);
@@ -934,10 +965,15 @@ where
             IdleAction::Spin => {}
             action => {
                 let resolution = active.resolution();
+                // An RFC 5227 announcement or defense already due that
+                // this tick could not send (ARP-033): the frame budget, or
+                // a port's retry after `Unavailable`.
+                let announcement_due = active.next_arp_announcement_due();
                 let pending = Pending {
                     resolution: resolution.pending_states() != 0
                         || resolution.pending_failure_holds() != 0
-                        || resolution.pending_actions() != 0,
+                        || resolution.pending_actions() != 0
+                        || announcement_due.is_some_and(|due| due <= now),
                     icmpv4: active.icmpv4_errors().pending_actions() != 0
                         || occupancy.nat44_tcp_unsolicited_syn_holds.occupied() != 0,
                     tx: datapath.tx_outstanding(),
@@ -954,6 +990,9 @@ where
                     watch_due,
                     control.notify.watchdog_due(),
                     on_demand_stats.next_due(),
+                    // A due one waits the short wait instead of spinning
+                    // the loop; a later one wakes the wait on time.
+                    announcement_due.map(|due| announcement_deadline(now, due)),
                 ]
                 .into_iter()
                 .flatten()
@@ -1045,19 +1084,29 @@ fn bump(counter: &mut u64) {
 /// round: a finished round is folded in, a due one is requested (or
 /// counted late, and stale past the threshold, while the previous one
 /// still runs). Returns the first fatal event as the loop end.
-pub(super) fn watch_step<D, E>(
+pub(super) fn watch_step<D, E, A>(
     datapath: &mut D,
     control: &mut Control,
     now: MonotonicMillis,
     settings: LoopSettings,
     err: &mut E,
+    arp_conflicts: A,
+    link_ups: &mut Vec<IfId>,
 ) -> Option<LoopEnd>
 where
     D: Datapath,
     E: Write,
+    A: IntoIterator<Item = (IfId, u64)>,
 {
     let mut end = None;
     let mut on_event = |event: WatchEvent| {
+        if let WatchEvent::Recovered {
+            port,
+            condition: super::watch::Condition::LinkDown,
+        } = event
+        {
+            link_ups.push(port);
+        }
         if let WatchEvent::Fatal { port, cause } = event {
             if end.is_some() {
                 return;
@@ -1073,6 +1122,10 @@ where
             HealthSample::Port(sample) => watch.on_sample(now, sample, &mut on_event),
             HealthSample::Integrity(sample) => watch.on_integrity(now, sample, &mut on_event),
         });
+        // Conflicting ARP packets for each port's address (ARP-039).
+        for (interface, count) in arp_conflicts {
+            watch.on_arp_conflicts(now, interface, count, &mut on_event);
+        }
     }
     if let Some(round) = control.links.poll() {
         watch.on_round(round, &mut on_event);

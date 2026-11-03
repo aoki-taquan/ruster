@@ -1438,6 +1438,46 @@ fn integrity_counters_warn_recover_and_become_fatal_at_the_threshold() {
     assert!(!policy.is_fatal(Condition::TxInvalidDescs));
 }
 
+fn conflicts(watch: &mut Watch, at: u64, count: u64) -> Vec<WatchEvent> {
+    let mut events = Vec::new();
+    watch.on_arp_conflicts(MonotonicMillis(at), PORT, count, &mut |event| {
+        events.push(event);
+    });
+    events
+}
+
+/// ARP-039: conflicting ARP packets for a port's address (RFC 5227 §2.4)
+/// warn `ARP_ADDRESS_CONFLICT` once per episode however many arrive (the
+/// §2.4 (c) rate-controlled notification), recover after
+/// `INTEGRITY_QUIET_MS` without one, are never fatal, and show in the
+/// port's health fields.
+#[test]
+fn arp_address_conflicts_warn_once_per_episode_and_never_end_the_run() {
+    let mut watch = watch();
+    assert_eq!(conflicts(&mut watch, 0, 0), []);
+    assert_eq!(
+        conflicts(&mut watch, 500, 1),
+        [warning(Condition::ArpAddressConflict)]
+    );
+    assert_eq!(conflicts(&mut watch, 1_000, 1_000), []);
+    assert_eq!(conflicts(&mut watch, 10_999, 1_000), []);
+    assert_eq!(
+        conflicts(&mut watch, 11_000, 1_000),
+        [recovered(Condition::ArpAddressConflict)]
+    );
+    assert_eq!(
+        conflicts(&mut watch, 12_000, 1_001),
+        [warning(Condition::ArpAddressConflict)]
+    );
+    let (_, health) = watch.health().next().expect("port");
+    assert_eq!(health.arp_address_conflicts, 1_001);
+    // Its own flag, not `watch.state` (a spoofer cannot drive automation).
+    assert!(health.arp_address_conflict);
+    assert!(!watch.warning());
+    assert_eq!(Condition::ArpAddressConflict.code(), "ARP_ADDRESS_CONFLICT");
+    assert!(!ExposurePolicy::default().is_fatal(Condition::ArpAddressConflict));
+}
+
 /// OPS-LOG: new thresholds take over from the next sample; conditions
 /// being timed keep their start, so a lowered fatal bound already passed
 /// acts at once, and the limits reach every port.

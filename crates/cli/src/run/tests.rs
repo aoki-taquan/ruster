@@ -198,6 +198,9 @@ struct State {
     signal: Cell<bool>,
     /// What `tx_outstanding` reports.
     tx_outstanding: Cell<bool>,
+    /// ARP-033: generated frames each batch of the datapath allocates
+    /// (`None`: unbounded); `Some(0)` makes every allocation `Unavailable`.
+    generated_budget: Cell<Option<usize>>,
     /// What `held_tx_on_down_links` reports (OPS-EXIT).
     held_tx: Cell<u64>,
     /// The datapath's drain panics (OPS-EXIT: a panic after readiness).
@@ -971,6 +974,9 @@ impl PortHost for FakeHost {
             return Err(StartupError::new(Stage::Adapter, None, Failure::Injected));
         }
         let mut io = SimIo::new();
+        if let Some(budget) = self.state.generated_budget.get() {
+            io.set_generated_budget(budget);
+        }
         for (ingress, bytes) in self.state.inject.borrow_mut().drain(..) {
             io.inject(ingress, bytes);
         }
@@ -1056,6 +1062,9 @@ impl PortHost for FakeHost {
             .live
             .set(self.state.live.get() + u32::try_from(ports).expect("few"));
         let mut io = SimIo::new();
+        if let Some(budget) = self.state.generated_budget.get() {
+            io.set_generated_budget(budget);
+        }
         for (ingress, bytes) in self.state.inject.borrow_mut().drain(..) {
             io.inject(ingress, bytes);
         }

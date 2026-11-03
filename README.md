@@ -276,9 +276,28 @@ coordinatorの解釈。H4c（#311）では無条件dropでした）。有効に�
 addressで動的cacheを埋められなくなる一方、linkを共有する別prefixのhost（secondary subnet）は
 direct `[[routes]]`（`via`なし）を足すまで解決されません。
 
+routerは自分のaddressをRFC 5227のARP Announcement（GARP）で知らせます（ARP-033〜ARP-039）。
+`ruster run`の起動でportを開いた後、portのlink-up、IPv4 addressを追加・変更したreloadのときに、
+そのinterfaceからsender IP = target IP = 自分のaddressのbroadcast ARP RequestをANNOUNCE_NUM（2）回、
+ANNOUNCE_INTERVAL（2 s）間隔で送ります（RFC 5227 §2.3。§1.3は「host」がrouterのinterfaceにも
+当てはまるとする）。router置き換えやMAC変更のときにneighbourのcacheを更新するためです。
+同じportの2つのsequenceは`announce-min-interval-ms`（既定10 s）以上離れ、link flap stormでも
+announcement stormになりません。他のMACが自分のaddressをsenderにしたARP（conflicting ARP
+packet、§2.4）はportごとに数え、`warning: port=ifN health=ARP_ADDRESS_CONFLICT`（値なし）を
+episodeごとに一度出し、§2.4 (c)に従いDEFEND_INTERVAL（10 s）に高々1回のAnnouncementで
+defenseします（sequenceとは別の1 frame）。`watch.state`は`ok`のままで、episode中は
+`ifN.watch.arp_address_conflict`が立ちます。Probe（§2.1）は静的addressのrouterでは送りません
+（ARP-036）。`[tick] generated-arp = 0`でannounceかdefenseがonなら
+`ARP_ANNOUNCE_WITHOUT_GENERATED_ARP`で拒否します。interfaceごとの切り替えは未実装です（ARP-040）。
+
 ```toml
-[arp]                           # table/keyとも省略可能
-require-on-link-sender = false  # true: off-link senderのARPを ARP_SENDER_NOT_ON_LINK でdrop（reload可能）
+[arp]                           # table/keyとも省略可能、すべてreload可能
+require-on-link-sender = false  # true: off-link senderのARPを ARP_SENDER_NOT_ON_LINK でdrop
+announce = true                 # RFC 5227 §2.3 Announcement（false: 送らない）
+announce-count = 2              # 1〜10（RFC 5227 ANNOUNCE_NUM）
+announce-interval-ms = 2000     # 1000〜3600000（ANNOUNCE_INTERVAL）
+announce-min-interval-ms = 10000  # portごとのsequence開始の最小間隔（1 sequence以上）
+conflict-defense = true         # §2.4 (c) defense（false: 検出と計数だけ）
 ```
 
 nonlocal IPv4はoptions/local判定後にまずLPMします。routeが無ければ元packetをbyte不変の

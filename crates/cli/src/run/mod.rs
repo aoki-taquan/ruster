@@ -1061,6 +1061,10 @@ where
     );
     let _ = err.flush();
     notify.ready(active.generation().get());
+    // RFC 5227 §2.3 (ARP-033): the ports are open, so every interface
+    // address becomes active now; the first tick announces it (a no-op with
+    // `[arp] announce = false`).
+    active.request_arp_announcements(None);
     let loop_settings = LoopSettings {
         stats_interval_ms: settings.stats_interval_ms,
         health_interval_ms: ops.health_interval_ms,
@@ -1340,9 +1344,12 @@ fn render<D: Datapath>(
     .with_fragment_tracking(active.fragment_tracking())
     .with_arp_hold(active.arp_hold());
     let resolution_index = active.resolution().index_counters();
+    let arp_announce = active.resolution().announce_counters();
     stats::block(kind, now, &observer.snapshot(now), &services, |out| {
         // H4b fail-closed index outcomes (ruster run only; not in run-sim).
         stats::write_fields(out, None, &resolution_index);
+        // RFC 5227 announcements and conflicts (ARP-033..ARP-039).
+        stats::write_fields(out, None, &arp_announce);
         datapath.write_stats(out);
         stats::write_fields(out, None, &status.reload);
         stats::write_fields(out, None, &status.idle);

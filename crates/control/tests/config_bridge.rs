@@ -245,7 +245,7 @@ fn config_bridge_builds_candidates_and_rejects_missing_services() {
     assert_eq!(
         candidate.storage_shape(),
         FullServiceStorageShape::new(
-            ResolutionStorageShape::new(5, 6, 7, 9),
+            ResolutionStorageShape::new(5, 6, 7, 9).with_announce_slots(2),
             Icmpv4ErrorStorageShape::new(10, 11),
             Nat44UdpStoragePlan::new(12, 40, 16, 12, 64, 40, 21),
             Nat44TcpStoragePlan::new(24, 100, 32, 24, 128, 100, 21)

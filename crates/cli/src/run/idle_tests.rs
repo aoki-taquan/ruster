@@ -168,22 +168,33 @@ fn an_idle_loop_blocks_in_the_wait_and_wakes_on_a_frame() {
         3_000 * MS,
     );
     assert_eq!(outcome.status, 0, "{}", outcome.err);
-    // 3 s of simulated time: two spin phases of 64 ticks (start, after
-    // the frame) and about 300 waits of 10 ms; the pre-H9 1 ms sleep made
-    // about 3000 ticks.
+    // 3 s of simulated time: three spin phases of 64 ticks (start with the
+    // first RFC 5227 announcements, the second announcements at 2 s,
+    // ARP-033, and after the frame) and about 300 waits of 10 ms; the
+    // pre-H9 1 ms sleep made about 3000 ticks.
     let ticks = host.state.io_calls.get();
     let waits = host.state.wait_log.borrow().len();
     assert!((290..=305).contains(&waits), "{waits} waits");
     assert!(
-        ticks <= 2 * SPIN_TICKS + 310,
+        ticks <= 3 * SPIN_TICKS + 310,
         "{ticks} ticks in 3 simulated seconds"
     );
+    // Every wait is the configured one, except the one the second
+    // announcement's deadline (2 s) cut short.
+    let timeouts = timeouts(&host.state);
     assert!(
-        timeouts(&host.state)
+        timeouts
             .iter()
-            .all(|timeout| u64::from(*timeout) == crate::args::DEFAULT_IDLE_WAIT_MS),
-        "{:?}",
-        timeouts(&host.state)
+            .all(|timeout| u64::from(*timeout) <= crate::args::DEFAULT_IDLE_WAIT_MS),
+        "{timeouts:?}"
+    );
+    assert!(
+        timeouts
+            .iter()
+            .filter(|timeout| u64::from(**timeout) != crate::args::DEFAULT_IDLE_WAIT_MS)
+            .count()
+            <= 1,
+        "{timeouts:?}"
     );
     assert_eq!(clock.pauses, 0, "no sleep: every wait could block");
     // Served by the first tick after the wait ended at the arrival (one
@@ -462,5 +473,37 @@ fn a_pending_resolution_keeps_the_waits_short() {
             .iter()
             .filter(|timeout| u64::from(**timeout) != SHORT_WAIT_MS)
             .count()
+    );
+}
+
+/// ARP-033 regression (#351 review M): an RFC 5227 announcement that is due
+/// but whose generated frame can never be allocated (a backend whose every
+/// generated allocation is `Unavailable`) must not spin the idle loop. The
+/// port is retried every `ARP_ANNOUNCE_RETRY_MS`; the loop waits between
+/// the retries instead of ticking with timeout 0.
+#[test]
+fn an_unallocatable_announcement_does_not_spin_the_idle_loop() {
+    let host = waiting_host();
+    host.state.generated_budget.set(Some(0));
+    let (outcome, _) = run_until(
+        &host,
+        config(),
+        settings(CheckPolicy::default(), 0),
+        3_000 * MS,
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let out = &outcome.out;
+    assert_eq!(stat(out, "arp_announce.committed"), 0, "{out}");
+    assert!(stat(out, "arp_announce.unavailable") >= 100, "{out}");
+    // About one tick per 10 ms retry, as many waits; a spin made one tick
+    // per clock reading (10 µs), about 300000.
+    let ticks = host.state.io_calls.get();
+    let waits = host.state.wait_log.borrow().len();
+    assert!(ticks <= 2 * SPIN_TICKS + 700, "{ticks} ticks in 3 s");
+    assert!(waits >= 200, "{waits} waits");
+    assert!(
+        timeouts(&host.state).iter().all(|timeout| *timeout >= 1),
+        "{:?}",
+        timeouts(&host.state)
     );
 }

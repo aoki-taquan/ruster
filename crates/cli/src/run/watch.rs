@@ -21,6 +21,7 @@
 //! | `KICK_ERRORS` | `kick_errors` (kick failures other than `ENETDOWN`) grew in every sample | first growth | [`Thresholds::kick_errors_fatal_ms`] (default 5 s, `None`: never) of growth in every sample |
 //! | `FRAMES_QUARANTINED` | AF_XDP: the port's quarantined frames grew since the last sample ([`IntegritySample`]) | first growth of an episode (recovered after [`INTEGRITY_QUIET_MS`] without growth) | the count since startup at [`Limits::frames_quarantined_fatal`] (default 64, `None`: never) |
 //! | `TX_INVALID_DESCS` | AF_XDP: the kernel's `tx_invalid_descs` of the port grew | first growth of an episode (recovered after [`INTEGRITY_QUIET_MS`] without growth) | the count since startup at [`Limits::tx_invalid_descs_fatal`] (default 64, `None`: never) |
+//! | `ARP_ADDRESS_CONFLICT` | another host's ARP packet claimed the port's IPv4 address with another MAC (RFC 5227 §2.4) since the last sample ([`Watch::on_arp_conflicts`], ARP-039) | first growth of an episode (recovered after [`INTEGRITY_QUIET_MS`] without growth) | never (the router keeps its address, §2.4 (c)) |
 //!
 //! The thresholds and both intervals come from the config's `[health]` and
 //! `[watch]` keys, falling back to `--tx-stall-warn-secs`,
@@ -429,6 +430,10 @@ pub enum Condition {
     /// AF_XDP: the kernel refused TX descriptors of the port since the
     /// last sample (OPS-LOG).
     TxInvalidDescs,
+    /// Another host claimed the port's IPv4 address with another MAC (a
+    /// conflicting ARP packet, RFC 5227 §2.4) since the last sample
+    /// (ARP-039).
+    ArpAddressConflict,
 }
 
 impl Condition {
@@ -454,6 +459,7 @@ impl Condition {
             Self::KernelUpperDevice => "KERNEL_UPPER_DEVICE",
             Self::FramesQuarantined => "FRAMES_QUARANTINED",
             Self::TxInvalidDescs => "TX_INVALID_DESCS",
+            Self::ArpAddressConflict => "ARP_ADDRESS_CONFLICT",
         }
     }
 }
@@ -542,7 +548,8 @@ impl ExposurePolicy {
             | Condition::Ipv6Unverifiable
             | Condition::LinkWatchStale
             | Condition::FramesQuarantined
-            | Condition::TxInvalidDescs => false,
+            | Condition::TxInvalidDescs
+            | Condition::ArpAddressConflict => false,
         }
     }
 }
@@ -647,6 +654,8 @@ struct PortWatch {
     integrity: Option<IntegritySample>,
     quarantine: Episode,
     invalid_descs: Episode,
+    /// Conflicting ARP packets on the port (ARP-039).
+    arp_conflict: Episode,
     limits: Limits,
     counters: PortHealth,
     /// AF_PACKET: the kernel exposure conditions that end the run.
@@ -691,6 +700,12 @@ pub struct PortHealth {
     /// TX descriptors the kernel refused since startup (AF_XDP, last
     /// sample).
     pub tx_invalid_descs: u64,
+    /// Conflicting ARP packets for the port's address since startup
+    /// (RFC 5227 §2.4, last sample, ARP-039).
+    pub arp_address_conflicts: u64,
+    /// An `ARP_ADDRESS_CONFLICT` episode is open (warned, not yet
+    /// recovered). Kept out of `watch.state` (ARP-039).
+    pub arp_address_conflict: bool,
 }
 
 impl ObservableFields for PortHealth {
@@ -772,6 +787,16 @@ impl ObservableFields for PortHealth {
             "tx_invalid_descs",
             FieldValue::Count(self.tx_invalid_descs),
         );
+        visitor.field(
+            SECTION,
+            "arp_address_conflicts",
+            FieldValue::Count(self.arp_address_conflicts),
+        );
+        visitor.field(
+            SECTION,
+            "arp_address_conflict",
+            FieldValue::Flag(self.arp_address_conflict),
+        );
     }
 }
 
@@ -835,6 +860,7 @@ impl Watch {
                     integrity: None,
                     quarantine: Episode::default(),
                     invalid_descs: Episode::default(),
+                    arp_conflict: Episode::default(),
                     limits: Limits::default(),
                     exposure_fatal: None,
                     counters: PortHealth {
@@ -911,6 +937,43 @@ impl Watch {
             .find(|port| port.target.interface == sample.interface)
         {
             port.integrity(now, sample, emit);
+        }
+    }
+
+    /// Folds the count of conflicting ARP packets for `interface`'s
+    /// address since startup (RFC 5227 §2.4, ARP-039): growth warns
+    /// `ARP_ADDRESS_CONFLICT` once per episode (one log line, value-free,
+    /// however many packets: §2.4 (c) asks the notifications to be
+    /// rate-controlled), recovered after [`INTEGRITY_QUIET_MS`] without
+    /// growth; never fatal.
+    pub fn on_arp_conflicts(
+        &mut self,
+        now: MonotonicMillis,
+        interface: IfId,
+        count: u64,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        if let Some(port) = self
+            .ports
+            .iter_mut()
+            .find(|port| port.target.interface == interface)
+        {
+            let last = port.counters.arp_address_conflicts;
+            let count = count.max(last);
+            port.counters.arp_address_conflicts = count;
+            port.counted(
+                now,
+                count,
+                last,
+                |port| &mut port.arp_conflict,
+                (
+                    Condition::ArpAddressConflict,
+                    Fatal::KernelExposure(Condition::ArpAddressConflict),
+                ),
+                None,
+                emit,
+            );
+            port.counters.arp_address_conflict = port.arp_conflict.warned;
         }
     }
 
@@ -1102,6 +1165,10 @@ impl Watch {
                 || port.uppers_warned
                 || port.quarantine.warned
                 || port.invalid_descs.warned
+            // Not `arp_conflict` (ARP-039): any host on a link can send a
+            // conflicting ARP packet, so it must not turn `watch.state`
+            // into `warning` and drive automation; it has its own
+            // `ifN.watch.arp_address_conflict` flag.
         })
     }
 

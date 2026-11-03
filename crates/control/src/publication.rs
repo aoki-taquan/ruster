@@ -17,6 +17,7 @@ pub struct ResolutionStorageShape {
     action_slots: u32,
     dynamic_neighbor_slots: u32,
     failure_hold_slots: u32,
+    announce_slots: u32,
 }
 
 impl ResolutionStorageShape {
@@ -32,7 +33,22 @@ impl ResolutionStorageShape {
             action_slots,
             dynamic_neighbor_slots,
             failure_hold_slots,
+            announce_slots: 0,
         }
+    }
+
+    /// This shape with `slots` RFC 5227 announcement slots, one per
+    /// interface of the snapshot (ARP-033); 0 (the default) leaves
+    /// announcements and conflict counting off.
+    #[must_use]
+    pub const fn with_announce_slots(mut self, slots: u32) -> Self {
+        self.announce_slots = slots;
+        self
+    }
+
+    #[must_use]
+    pub const fn announce_slots(self) -> u32 {
+        self.announce_slots
     }
 
     #[must_use]
