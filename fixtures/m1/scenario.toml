@@ -179,8 +179,10 @@ tx = [
 ]
 drops = [{ reason = "NEIGHBOR_UNRESOLVED", count = 2 }]
 
-# --- 7. Reload v2 at a generation boundary. Every reload flushes ARP
-# learning and all NAT/firewall state (flush counts are in the apply event).
+# --- 7. Reload v2 at a generation boundary. v2 sets `[reload] state =
+# "flush"`, so this reload flushes ARP learning and all NAT/firewall state
+# with fresh hash keys (flush counts are in the apply event; the default
+# "carry" would keep them, RELOAD-CARRY).
 [[step]]
 kind = "tick"
 at-ms = 3300
@@ -297,8 +299,12 @@ tx = [
   { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "192.0.2.50", id = 14, ttl = 63 }, src-port = 40000, dst-port = 9, payload-ascii = "nowhere" } },
 ]
 
-# --- 9. Rollback: re-applying v1 is a new generation (5) with fresh keys;
-# the v2-only route is gone again.
+# --- 9. Rollback: re-applying v1 is a new generation (5); the v2-only route
+# is gone again. v1 uses the default `[reload] state = "carry"`, so the apply
+# event shows the UDP mapping and the learned gateway carried, and the
+# firewall flow of H's packets to 192.0.2.50 revoked: its route disappeared
+# (firewall_flows_revoked = 1). They now miss the route and stay silent
+# (FW-025).
 [[step]]
 kind = "apply"
 config = "router-v1.toml"

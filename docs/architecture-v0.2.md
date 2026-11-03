@@ -546,7 +546,8 @@ MAC/refresh時刻やpending resolutionを変更しません。
   direct routeを足すまで解決されないことです。policyは`ArpPolicy`としてforwarding
   snapshotが値で持ち（`ValidatedForwardingOwner::with_arp_policy`、snapshotは88 bytesのまま）、
   packet pathではbool一つの分岐です。reloadable（`ApplyPlan::arp_policy_changed`）で、
-  reloadはARP学習を全flushします。
+  既定の`[reload] state = "carry"`ではreloadが学習entryのうちon-link条件を満たすものだけを残し、
+  hardeningをonにしたreloadはoff-linkで学習したentryを捨てます（RELOAD-CARRY）。
 - 学習成功時だけmatching active resolution/actionをcancelし、unrelated FIFOを維持する。
   commit済みRequestのflood cooldown tombstoneは残す。
 
@@ -809,7 +810,7 @@ ACK out）がestablished TTLで残ることと、inside hostがSYN-ACKの後に�
 connectionがopening TTLで切れ得ること（REQ-5のestablished定義より厳しい）で、このため既定に
 しません。sequenceを見ない残余risk（NAT44-030の隣、requirements NAT44-088）: 5-tupleを当てた
 攻撃者はどのpolicyでもinbound segmentでsessionをrefreshし続けられ、`closing`ではRST/FIN注入で
-idleなconnectionを4分で落とせます。変更はreloadable（applyでNAT stateをflush）、planは
+idleなconnectionを4分で落とせます。変更はreloadable（applyはNAT stateを引き継ぐ、RELOAD-CARRY）、planは
 `nat44-tcp inbound-rst ~ closing -> corroborate`のtyped deltaです。
 
 **Mapping lifetime.** mappingは`expires_ms`と同generationのestablished session数を持ちます。
@@ -840,7 +841,8 @@ mappingのlistはestablished（期限 = commit + `idle-ttl-ms`）とtransitory�
 expireしたものを選ぶO(1)です（NAT44 bounded slot and port reuse）。
 
 **Config/plan.** `[nat44.tcp] opening-idle-ttl-ms`/`closing-idle-ttl-ms`（省略時240000）は
-`idle-ttl-ms`と同じくTCP policyで、変更はreloadable（applyで全NAT stateをflush）、planは
+`idle-ttl-ms`と同じくTCP policyで、変更はreloadable（TCP mappingは絶対deadlineを持つので、TCP
+timeoutの変更はTCP NAT stateだけをflushする、`flushed:timers`）、planは
 `policy ~ changed`です（`inbound-rst`は上のtyped delta）。counterは`sessions_established`、`sessions_closed`（RSTでないFIN両方向）、
 `sessions_reset`（RST pendingでないsessionへのRST）、`sessions_expired_{opening,established,closing}`
 （再利用したexpired sessionの最後のphase、合計は`sessions_expired`）。
@@ -1102,7 +1104,7 @@ trade-offも大きい）。`address-dependent`（filteringのdefault）では詐
 remoteに限られるため、攻撃者が占有できるのは高々`limit × そのremote数`です。
 
 limitはpolicyの一部で、変更はreloadable（storage shapeに依存しないため`STORAGE_SHAPE`にならず、
-applyは全NAT stateをflush）です。`NatChange::inbound_sessions_per_remote`（TCPのみ）はtyped
+applyはNAT stateを引き継ぎ、limitを下げても既存sessionはevictしない）です。`NatChange::inbound_sessions_per_remote`（TCPのみ）はtyped
 deltaで`policy_changed`に含めず、plan textは`nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8`
 と値を出します。範囲外（17〜255）はvalidateが`NAT44_TCP_POLICY`
 （path `nat44.tcp.inbound-sessions-per-remote`）、u8外や型違いはparserが`INVALID_TYPE`で拒否します。
@@ -1217,7 +1219,7 @@ bindしたworkerでは他のinside発packetと同じくfirewallのtransport pref
 inside発のpublic address宛てのそのprotocol全部（UDP-only serviceへのTCPなどを含む）でしたが、
 新codeはそのprotocolのruntimeがhairpinning offの場合だけで、他protocolは
 `*_UNSUPPORTED_TRANSPORT`です。変更はfilteringと同じ
-reloadableで、storage shapeは変わらず、applyは全NAT stateをflushします。`ApplyPlan`は
+reloadableで、storage shapeは変わらず、filter peerのkeyが変わるのでapplyはそのNAT familyのstateをflushします（`flushed:filtering`）。`ApplyPlan`は
 `NatChange::hairpinning`を`Delta<bool>`として出し、`policy_changed`には含めません。
 
 ### RFC 5508 REQ-7
@@ -1513,7 +1515,7 @@ randomnessやsyscallをpacket pathへ持ち込みません。同一generationと
 identity/hash keyのreconcileはno-op、
 同一generationの別identityとgeneration regressionは拒否します。generation前進時に同じ
 hash keyを再利用したpublicationも`HashKeyNotRotated`で拒否し、fresh keyを伴うforward
-generationだけが全stateをflushします。
+generationだけが全stateをflushします（carryする`preflight_reconcile_carrying`はRELOAD-CARRY参照）。
 新しいpublication pathでは`ValidatedFirewallOwner`が
 `ValidatedForwardingOwner`のnonzero nonceへbindしたboxed rulesを一度だけ検証・fingerprint化
 します。owner固有のnonzero firewall publication nonceもchecked incrementだけで発行し、
@@ -1526,7 +1528,7 @@ runtimeがpublicationを跨いで保持するのはpointerをdereferenceしな�
 だけで、rules sliceはcurrent `FirewallConfig`からrule scan中だけborrowします。
 `preflight_reconcile`はgeneration regression、same-generation collision、hash-key reuse、
 runtime epoch exhaustionをmutation前に検証し、exact runtime borrowをpermitへ保持します。
-permit Dropとerrorは全field不変です。fresh generationのtotal commitは全flow stateをflushし、
+permit Dropとerrorは全field不変です（carryはRELOAD-CARRY）。fresh generationのtotal commitは全flow stateをflushし、
 binding/epochを更新し、counterだけをsaturating加算します。旧rules allocationはその後drop
 でき、新allocationだけを次batchへ渡せるためself-referenceを作らず、fast pathのrule scanは
 borrow-onlyのままです。
@@ -1617,8 +1619,8 @@ prev/next u32、caller-backed storageのみでallocationなし）とfresh境界�
 
 - activity list: occupiedなmapping（UDP/TCP）とsession（TCP）を最後のrefresh時刻順に並べる。
   commitは常に現在時刻をslotへ書いて末尾へ移し、時刻はwatermarkで単調なので、list一本のTTLが
-  一つならexpiredなslotがあれば先頭がexpiredです（TTLはpublicationごとに固定、reconcileは
-  全flush）。TCPはN1でTTLが三つ（phase）になったため、sessionはphaseごとの3本、mappingは
+  一つならexpiredなslotがあれば先頭がexpiredです（TTLはpublicationごとに固定。carryで新TTLが
+  bindされても全mappingに同じTTLなので順序は保たれる。TCPはtimeout変更でflush）。TCPはN1でTTLが三つ（phase）になったため、sessionはphaseごとの3本、mappingは
   established/transitoryの2本に分け、各listを期限順に保ちます（「TCP session phases and
   timers」）。expiryはlazyのままで、timerもsweepもありません。先頭のliveness確認（UDP 1回、
   TCP mapping 2回、TCP session 3回）で再利用可否が決まります。
@@ -1691,7 +1693,7 @@ RFC 6056 §4に従うべき（SHOULD）とし、RFC 6888 REQ-15はCGNのport割�
   NAPT。従来の挙動）。保存したportの予測不能性はhost自身のsource port選択と同じで、RFC 6056に
   従うhostはrandomizeします。予測可能なsource portを使うhostを抱える構成のためにprotocolごとの
   `[nat44.udp]`/`[nat44.tcp]` `port-preservation = false`（reloadable、`NatChange::port_preservation`
-  のtyped delta、applyはNAT stateをflush）で常にkeyed portにできます。(2)はどちらでも保ちます。`false`はhostのport選択を隠しますが、keyed startはkey generation内でendpointごとに固定なので、source port固定のendpoint（DNS resolverなど）のpublic portはflowごとに変わりません（resolverはRFC 5452どおり自分でrandomizeする）。preservation onではinside hostがport使用状況を知れ、他hostの直前にexpiredしたportを(1)で取れるので、信頼できないinside hostがある構成も`false`の理由です（(1)をowner無しportだけにする案はNAT44-093でdeferred。hostごとのmapping上限はN3のNAT44-092、下の「Per-host mapping quota」）。
+  のtyped delta、applyはNAT stateを引き継ぎ新規mappingから効く）で常にkeyed portにできます。(2)はどちらでも保ちます。`false`はhostのport選択を隠しますが、keyed startはkey generation内でendpointごとに固定なので、source port固定のendpoint（DNS resolverなど）のpublic portはflowごとに変わりません（resolverはRFC 5452どおり自分でrandomizeする）。preservation onではinside hostがport使用状況を知れ、他hostの直前にexpiredしたportを(1)で取れるので、信頼できないinside hostがある構成も`false`の理由です（(1)をowner無しportだけにする案はNAT44-093でdeferred。hostごとのmapping上限はN3のNAT44-092、下の「Per-host mapping quota」）。
 - **(4) takeover**: domain `UdpPortTakeover`/`TcpPortTakeover`で（endpoint、mapping generation、
   時刻、probe番号）をhashした`NAT44_PORT_TAKEOVER_PROBES`（8）個のpool portをO(1)のowner確認で
   調べ、ownerがexpiredな最初のportを取ります。全てliveならexpiry順へfallbackします（expiredの
@@ -1754,7 +1756,8 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
   outrightにexpiredなmappingが要ります。
 - **不変条件の骨子**: (I1) hostのcount = そのaddressのport所有mapping数（listの長さ）、各
   mappingは高々一つのlist上。(I2) count ≤ limit: commitはcountを高々+1しか増やさず、上限
-  到達時は同じcommitで同じhostのmappingを一つ外す。limitの変更はapplyのflushを伴う。
+  到達時は同じcommitで同じhostのmappingを一つ外す。limitの変更はcarryされ、下げた場合も
+  live mappingはevictせず、countがlimit未満になるまで新規mappingを拒否する（RELOAD-006）。
   (I3) 拒否 ⇔ hostのlive mapping数（TCPはhost-live）≥ limit: count = limitで先頭（expiryが
   最も早い）がliveなら全てlive、expiredなら引き継げる。expiryはlazyでも、hostの全mappingがexpiredになった
   瞬間から次のmappingは通ります（timerもsweepも要らない）。
@@ -1768,7 +1771,7 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
   せん（hot pathのcostもmemoryも従来どおり）。非zeroなら上記をmapping capacity分確保し
   `required_bytes`が数えます（production最大tableで両protocolなら+9961472 bytes（N6のUDP peer
   counterを含む）、計67059904 bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
-  非zero同士の変更はreloadable（他のNAT変更と同じくapplyでNAT stateをflush）。planは
+  非zero同士の変更はreloadable（applyはNAT stateを引き継ぎ、下げたlimitは新規stateだけを拒否）。planは
   `NatChange::mappings_per_host`のtyped deltaです。
 - **限界**（NAT44-096）: 上限はaddress単位です。reverse-path checkがinside sourceをinside-routed
   prefixに限りますが、ARP/MACとの結び付けは無いので、LAN上のhostはそのprefix内の詐称address
@@ -2007,19 +2010,23 @@ source port 0のUDP/53はroute有りならsilent、route無しならICMPにな�
 残るdeviation: routeが撤去された後の既存flowのpacket（例: established TCPのACK、許可ruleが
 egress限定のflowのUDP）はsilentな`FirewallRouteUnavailable`で、firewallなしの経路やRFC 1812
 §5.2.7.1のMUSTと異なりNetwork Unreachableを返しません（FW-025）。2026-11-01にRFC準拠を基準として
-再評価し、次の理由でdeviationを維持しました。
+再評価し、次の理由でdeviationを維持しました（2026-11-03 RELOAD-CARRYで再確認、維持）。
 
-- routeはconfig publicationでしか変わらず、すべてのpublicationは新generationとfirewall hash key
-  rotationで全flowをflushします。route missの時点で「撤去前のflow」のstateは存在しないため、
-  established lookup（egress非依存にinterfaceごとprobeする等）を加えてもhitせず、効果がありません。
+- routeはconfig publicationでしか変わりません。RELOAD-CARRY以前はすべてのpublicationが全flowを
+  flushしましたが、既定の`[reload] state = "carry"`ではflowがrouteの変わるreloadを越えて残ります。
+  それでもroute miss判定（`permits_route_miss`）はstateを参照せずpacketとruleだけで決まるので、
+  carryしたflowのpacketも同じpacketの新規attemptと同じ結果になり、state有無はICMPに現れません。
+  routeのegressが変わった（消えた）flowはcarry時にrevokeされ（RELOAD-017）、以後どちらの向きも
+  新規attemptとして評価されます。
 - 同じreloadの後にrouteが残っていても、そのpacketはstateなしの新規attemptとしてfirewallにsilent
   dropされます（TCP ACKなら`FirewallTcpInvalidInitialFlags`）。route missの場合だけerrorを返すと
   route有無が外から観測でき、上記のroute oracleを再び開きます。
 - egress限定allowで許可されていたUDPをadmitするには撤去前routeのegressを知る必要がありますが、
   routerはそれを保持せず、推測でadmitすると拒否宛先空間のroute有無が漏れます。
 
-解消には、flowを保ったままrouteを変えるpublication（動的routing等）と、それに合わせたstate
-参照が前提になるため、そのsliceで再検討します。RFC動作が必要なtrafficはegress `Any`のallow
+RELOAD-CARRYで「flowを保ったままrouteを変えるpublication」は入りましたが、route miss経路はstateを
+参照しないままなので上の結論は変わりません。RFC動作の解消にはegress非依存のstate参照が前提に
+なるため、動的routingのsliceで再検討します。RFC動作が必要なtrafficはegress `Any`のallow
 ruleでegress-free評価をpermitにでき、逆にroute-miss errorを全体に止めたい場合は
 `net-unreachable = false`を使えます。
 
@@ -2207,10 +2214,12 @@ applyは`validate_successor`の後、Resolution/ICMPv4 errorの`preflight_public
 NAT44 UDP/TCP・firewallの`preflight_reconcile`の5 permitを同時に保持し、全て成功した場合だけ
 一点でcommitします。各permit commitとcandidate swapには失敗分岐がありません。途中の失敗では
 permitのDropにより全runtimeが不変で、旧candidate/snapshot/generationが継続します。
-Resolution/ICMP runtimeは旧snapshotのauthorityを持つqueueを全flushし、NAT/firewallはkey
-rotationに伴いflow stateを全flushします。累積counterは保持します。storage shapeと
+Resolution/ICMP runtimeは旧snapshotのauthorityを持つqueueを全flushします。NAT/firewall/学習
+ARP neighborの扱いはsuccessorの`[reload] state`で決まり（下の「reload state carry」）、既定の
+`carry`では互換なstateをhash keyごと引き継ぎ、`flush`ではkey rotationに伴い全flushします。
+累積counterは保持します。storage shapeと
 Resolution/ICMP policy、interface IfId/MACの変更はtyped `RestartRequired`としてrejectし、
-resizeしません。reloadのたびにARP学習も消え、NAT/FW keyのrotationによりTCP sessionも切れます。
+resizeしません。restartは常に全stateを捨てます。
 `ApplyPlan`は二つのvalidated config文書からmutationなしでkey順のroute/neighbor/local IPv4/
 interface/FW rule差分、FW順序・policy、NAT realm/port/policy変更、restart理由、flush見込みを
 作ります。`ActivePublication::check_successor`はguardなしで同じ検証と5 preflightを行い、
@@ -2219,6 +2228,101 @@ permitをcommitせず破棄するdry-runで、live flush数を返します。gen
 旧config文書を再validateし、新generation・新keyとしてapplyすることです。storageは
 activateした最大generationを保持し、再activationはそれより大きいgenerationだけを受理します。
 process restartをまたぐgeneration/key履歴は持たず、M1はprocess起動ごとに新規開始します。
+
+### reload state carry（RELOAD-CARRY）
+
+RELOAD-CARRY以前はPUB-006のkey rotationがflushを兼ね、firewall ruleの小変更を含む全reloadが
+全NAT44 mapping/session、全firewall flow、全ARP学習を捨てていました。これはunrelatedな管理操作で
+live mappingを落とさないというRFC 4787 REQ-1/REQ-5、RFC 5382 REQ-5（established idle 2時間4分
+以上）の意図に反します。現在はapplyするsuccessor文書の`[reload] state`（既定`carry`、
+`flush`はRELOAD以前の挙動）で、意味的に安全なstateだけをfamilyごとに引き継ぎます。mode自体も
+successorのものなので、その切り替えもreloadableです。
+
+**family別の互換条件。** coreの各runtimeが`preflight_*_carrying`を持ち、非互換なら従来の
+flush permit（新keyへのrotationを要求）を返して`StateCarryOutcome::FlushIncompatible(reason)`を
+報告します。判定はcore自身が行い、controlのplanは同じ`Nat44CarryIdentity`で予測します。
+
+| family | 引き継ぐ条件 | 引き継ぐもの | 非互換時 |
+|---|---|---|---|
+| NAT44 UDP / ICMP query | inside/outside、public address、port（identifier）pool、filtering modeが等しく、idle timeoutが延びず、per-host limitが下がらず新設もされない | mapping、peer、directory、port owner、per-host count、hash key、runtime epoch、clock watermark。commitはconfigの代入だけでO(1) | `interfaces`/`public-address`/`port-range`/`filtering`/`timers`/`quota` |
+| NAT44 TCP | 上記（timeout以外）に加えestablished/opening/closingのidle timeoutが等しい | 同上とsession（RFC 7857 §2のphase）。unsolicited-SYN holdは常に捨てる | 上記と`timers` |
+| firewall | idle timeoutが延びない | flow table、table key/generation。ruleもrouteも等しければ評価なし。watermark時点でexpire済みのflowは落とす | `timers`、再評価が予算超えなら`reevaluation-budget` |
+| 学習ARP neighbor | entryごと: interfaceのlocal IPv4 bindingが不変、static neighborが無い、ARP-031有効時はon-link | 条件を満たすentryとindex key | 満たさないentryだけを削除 |
+
+pending resolution state、queued ARP action、failure hold、ICMPv4 error queueとlimiterは常に
+flushします。旧snapshotのauthority（routeやbindingの検証済み前提）を持ち、どれも短命で次の
+packetから作り直せるためです。TCP unsolicited-SYN holdも旧firewallとswitchが許可した高々6秒先の
+ICMP予約なので、carryでも送りません。
+
+**timer。** 不変条件は「旧policyでexpireしたstateはreloadで再びliveにならない」です。UDP/ICMP
+mappingとfirewall flowのlivenessは常に「最終activity + bindされたTTL」で計算されるので、TTLを
+延ばすとexpire済みでlazy reclaim前のstateがliveに戻ります。UDPではexpireしたmappingが既に
+parked/retired listへ移っている場合があり、liveに戻るとreuse listとN6 peer countが壊れます
+（review H1で再現）。commit時に旧TTLで期限切れを掃除する案は、commitに正確なnowがなく（watermark
+は遅れ得る）未観測の期限切れが残るので採らず、延長はそのfamilyのflush（`timers`）にしました。
+短縮は期限切れを増やすだけで安全なので、新しいTTLが引き継いだstateに最終activityから効きます
+（activity順listは単一TTLで順序が保たれる。firewallは旧earliest-deadline boundより早いdeadlineが
+生じ得るのでsweep boundを0へ戻す）。
+TCP mappingはexpiryを絶対deadlineとしてdeadline順listに持つので新timeoutを受け入れられず、TCP
+timeoutの変更はTCPだけflushします（`timers`）。in-placeの再計算はlistの並べ直しになりapplyの
+boundを壊すため採りませんでした。
+
+**quota。** per-host（mapping/peer/session）limitを下げる、または新設するsuccessorはそのNAT
+familyをflushします（`quota`）。reclaim pathはlimit到達hostのexpireしたslotを1対1で引き継ぐので、
+carryすると上限を超えたhostは使い続ける限り上限まで下がりません（review M2/sec M1で再現）。
+expireしたheadを新規なしで解放する案は、読み取り専用のplanと一点commitの分離を4経路で崩すので
+採らず、即時に効くflushを選びました。上げる・外す変更はcarryします。TCP per-remote limitはSYN
+ごとにlive sessionを数えるので、carryしても即時に効きます。per-host tableの有無はstorage shape
+なのでon/offはrestart-requiredです。
+
+**firewall再評価（fail closed）。** carryはcommit内（失敗分岐なし）の一passで、watermark時点で
+旧policyでexpire済みのflowを落とし（`states_expired`）、routeが変わっていればどちらかのendpointへの
+routeのegressが変わった（現れた、消えた）flowをrevokeし、ruleが変わっていれば残る全flowのorigin
+tuple/interfacesをinitial packet（TCPはSYN、ICMPはrequest）として新ruleにfirst-matchし、allowなら
+`origin_rule_id`を更新、deny/default denyなら`config_generation = 0`でrevokeします。route変更での
+revokeが要るのは、stateがorigin interfaceを含むexact tupleでしかhitしないためです: forward routeが
+別egressへ移ってもforward方向だけが新規attemptになり、reverse方向はstateに当たり続けremoteが
+refreshし続けられます（review sec M2）。next hopだけが同じinterfaceで変わったflowは両方向とも
+exactに当たるので残します。NAT44 mappingはrouteに束縛せず引き継ぎます: full-serviceではfirewallが
+必須でNATを通る全packetを評価するので、FW flowがrevokeされたmappingは何も通さず寿命で消えます
+（その間per-host quotaを占める）。
+revokeしたflowはapply後どちらの向きにも通らず（replyは新規attemptとしてdefault deny、outboundは
+deny rule）、slotはexpireと同じlazy reclaimで消えます（`states_revoked`に数え`states_expired`には
+数えない）。次packet時のlazy評価はrelated ICMPv4やroute miss等のstate参照点ごとに未評価flowを
+扱う境界が増えるため、apply時の一括評価を選びました。仕事量はwatermark時点でliveなflowだけを
+数えた`live x (ruleが変わればrule数 + routeが変わればlookup 4)`をpreflightで先に計算し、
+`FIREWALL_CARRY_REEVALUATION_BUDGET` = 2^22 test（時間ではなく件数）を超えればfirewallだけflush
+（fail closed）します。dry run（`check_successor`）は評価を繰り返さず、再評価するcarryのflushを
+`invalidated`として返すので、SIGHUPごとにpassがrouter threadで二回走ることはありません。最大table（2^16 slot、usable 49152 flow）x 85 ruleの4,177,920 testは開発host
+のrelease buildで約25 ms（約6 ns/test、`worst_case_reevaluation_at_the_budget_takes_milliseconds`）で、
+reloadのquiescence上限200 ms未満です（時間はhostで変わります）。NAT carryはO(1)、resolutionはO(学習neighbor)でindex経由
+O(1) lookupなので、applyの最悪時間はこのfirewall予算が支配します。route missはstateを参照しない
+ので、FW-025の「route oracleを作らない」根拠はcarry後も成り立ちます。
+
+**hash key。** carryしたfamilyのruntimeは旧secret key（OS CSPRNGの128 bit、Debugでredact、
+SipHash/keyed directory）を使い続け、新candidateのkeyは使いません。hash-flooding耐性はkeyの
+秘密性によるもので、回転によりません。carryは新しい観測手段（keyやhome slotの露出）を作らないので、
+攻撃者がkeyを推定する機会はflush時と同じです。全tableを新keyでapply時に再挿入すると最大tableで
+数万件のdirectory/port owner/host listの再構築になり、applyのboundとfailure atomicityの検証面を
+広げるので採りませんでした。keyはflush（mode、非互換、予算超え）とrestartで従来どおりrotateし、
+sequencerは発行key再利用を拒否し続けます。carry中はkeyがprocessの寿命の間変わらず、定期rotationは
+未実装（RELOAD-016）で、必要なら`state = "flush"`のreloadかrestartで回します（同時に毒された
+ARP学習とNAT/FW stateも消える）。firewallは`table_key`/`table_generation`（構築または
+flush時のもの）でhashし、`binding`だけを新configへ移すので、forwarding pathの`config_matches`は
+新configと一致し、table内のflowも見つかります。NATのforwarding pathはconfigだけを照合します。
+
+**failure atomicity。** carry permitもPUB-006と同じく全runtimeのpreflightを同時に保持してから一点で
+commitし、preflight失敗やpermit dropでは全runtimeが不変です（部分carryはない）。firewall permitは
+successorのrule sliceをcommitまで借用します（boxed ownerなのでcandidateのmove後もaddressは不変）。
+6 stageへの失敗注入をcarry、rule再評価付きcarry、flushの3 successorで行います（PUB-006、
+RELOAD-014）。
+
+**観測。** core reportは`outcome`、`*_carried`、firewallの`states_revoked`を持ち、
+`ApplyCarryCounts`が`apply.carry.*`、`apply.state.<family>`（`carried`/`flushed`/
+`flushed:<reason>`）、累積`carried.*`としてobserverへ入ります。run-simのapply eventは`carry`
+object、`ruster run`の`reload applied`行は`carried ...; state arp=.. nat44-udp=.. ...`を出します。
+`ApplyPlan::carry`はdocumentから、`SuccessorCheck::{carry, carried}`はlive permitから予測し、
+`ruster plan`は`state:` blockを表示します。
 
 ### worker tick（`ruster-runtime`）
 
@@ -2374,8 +2478,9 @@ rtnetlink address dump（`run::netlink`）だけで、crateは`#![deny(unsafe_co
   cold側`Vec<u8>`を確保します）。
 - firewall有効時のroute missは、egress-free評価で許可されegress依存のNAT gateにも当たらない
   packetだけにDestination Unreachable Networkを返します。route撤去後の既存flowのpacketは
-  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。全reloadがflowをflushするため
-  参照できるstateがなく、answerするとroute oracleになるため2026-11-01の再評価でも維持）。
+  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。route missの判定はstateを参照せず、
+  routeのegressが変わった（消えた）flowはcarry時にrevokeされ（RELOAD-017）、answerするとroute
+  oracleになるため2026-11-01と2026-11-03の再評価でも維持）。
 - router-originated ICMPv4の4 class（Echo Reply、Time Exceeded、Network/Host Unreachable）は
   default onで、classごとにoffにできます（上記inventory）。
 - restart-requiredのapplyはrun-sim内でrejectとして報告し、storageを作り直しません（SIM-016）。

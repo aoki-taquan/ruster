@@ -421,7 +421,7 @@ fn service_counters_render_in_fixed_order(
         ("nat44_udp", 19),
         ("nat44_tcp", 40),
         ("nat44_icmp", 16),
-        ("firewall", 13),
+        ("firewall", 14),
         ("fragmentation", 8),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);

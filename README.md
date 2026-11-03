@@ -371,7 +371,8 @@ NAT runtimeへ到達した非退行時刻はdrop結果でもwatermarkへ反映�
 時刻によるmapping復活を許しません。outsideからinsideへのpublic DNATを通らない直通LPMも
 neighbor解決前にfail closedです。
 publication変更はvalidated config、fresh hash key、reconcile permitの事前検証後に行う
-明示的な全state/index flushを要求します。`storage_shape`はmapping/peerと全index backing
+明示的な全state/index flushか、realm・port pool・filteringが同じsuccessorへのstate/index/keyの
+引き継ぎ（RELOAD-CARRY、下の「reload時のstate引き継ぎ」）を要求します。`storage_shape`はmapping/peerと全index backing
 arrayのcapacityを一つのopaque valueとして返します。受信ICMPv4 errorの変換（RFC 5508）は下の
 「NAT44 ICMPv4 error translation」を参照してください。outside/public宛てerrorは引用する
 live UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleをinsideへ
@@ -446,7 +447,7 @@ runbookの「Port preservation」にあります。
 
 ```toml
 [nat44.udp]
-port-preservation = true   # 省略時true。false: 常にkeyed port（reloadable、applyでNAT stateをflush）
+port-preservation = true   # 省略時true。false: 常にkeyed port（reloadable、NAT stateは引き継ぐ）
 
 [nat44.tcp]
 port-preservation = true
@@ -564,7 +565,7 @@ TCPの従来のexact remote address/port filterは`address-and-port-dependent`�
 
 ```toml
 [nat44.udp]
-# 省略時 "address-dependent"。変更はreloadable（applyで全NAT stateをflush）
+# 省略時 "address-dependent"。変更はreloadable（filter peerのkeyが変わるのでapplyはそのNAT stateをflush）
 filtering = "address-dependent"  # | "endpoint-independent" | "address-and-port-dependent"
 
 [nat44.tcp]
@@ -718,7 +719,7 @@ REQ-5の引用remote portもauthorityになりません。firewallをbindする�
 ```toml
 [nat44.udp]
 # 省略時 "bidirectional"（RFC 5508 REQ-4/5/7）。security option: "external-only"
-# （outsideからのerrorだけ）、"disabled"（変換しない）。変更はreloadable（applyで全NAT stateをflush）
+# （outsideからのerrorだけ）、"disabled"（変換しない）。変更はreloadable（NAT stateは引き継ぐ）
 icmpv4-errors = "bidirectional"
 
 [nat44.tcp]
@@ -819,11 +820,15 @@ $B validate fixtures/m1/router-invalid.toml
 $B plan fixtures/m1/router-v1.toml fixtures/m1/router-v2.toml
 # plan: reloadable
 # restart-required: none
-# changes: 2
+# changes: 3
 #   route + 192.0.2.0/24 dev if2 via 203.0.113.1
 #   firewall-rule + id 40 udp if1 -> any 192.168.1.0/24 -> 0.0.0.0/0 sport 1-65535 dport 1-65535 allow-stateful
+#   reload-state ~ carry -> flush
 # expected-flush:
 #   resolution_states all
+#   ...
+# state: flush
+#   arp flushed
 #   ...
 
 # scenarioを決定的に実行。stdoutはcanonical JSONL ruster-run-sim/v1、stderrは人向けsummary
@@ -840,8 +845,11 @@ $B run-sim --scenario fixtures/m1/scenario.toml --hold
   scenario seedを出力しません。`validate`はM1で必須のresolution、ICMPv4 error、NAT44
   UDP/TCP、firewallの欠落も`stage=bridge`で拒否します。
 - `plan`は両documentに`validate`と同じbridge確認を行います。`expected-flush`はdocument間の
-  planなので`all`（apply時に全live stateをflush）で、実際のflush数は`run-sim`の`apply` eventに
-  出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
+  planなので、flushするfamilyは`all`、引き継ぐNAT/firewallは`0`、引き継ぐが新文書が無効にする
+  entryだけ落ちる学習ARP neighborとruleの変わるfirewall flowは`invalidated`です。続く`state:`
+  blockは`carry`/`flush`/`restart`とfamilyごとの`carried`・`flushed`・`flushed:<reason>`
+  （firewallはruleが変われば` reevaluate`）を出します（RELOAD-CARRY）。実際のflush数とcarry数は
+  `run-sim`の`apply` event（`flush`と`carry` object）に出ます。capacityやresolution/ICMP/NAT/firewall policyの変更はrestart理由（`STORAGE_SHAPE`等）
   または`changed` flagとしてだけ出し、fieldごとの値は出しません。例外はsecretでないNAT
   filtering、hairpinning、TCP inbound limit、TCP unsolicited-SYN ICMP switch、TCP inbound-rst policy（`nat44-tcp inbound-rst ~ closing -> corroborate`）で、`nat44-tcp filtering ~ address-dependent -> endpoint-independent`、
   `nat44-udp hairpinning ~ on -> off`、`nat44-tcp inbound-sessions-per-remote ~ unlimited -> 8`、
@@ -1038,8 +1046,10 @@ sudo kill -HUP <pid>                                               # configをre
   通ればbackendがquiescent（旧generationのTXがkernelに無い）になったtick境界でpublication phaseへ
   渡し（待つ間はRXを最大200 ms止める。過ぎれば`stage=quiesce code=TIMEOUT`）、
   `reload applied: generation=N previous=P; interfaces=.. routes=.. firewall-rules=.. ...; flushed ...`
-  です（件数で切り詰められたconfigに気づける）。適用時はcontrol-planeの契約どおり
-  ARP学習・NAT44 mapping・firewall flowをflushし（hash keyがrotateする）、counterは保持します。
+  です（件数で切り詰められたconfigに気づける。行の後半は`carried ...; state arp=.. nat44-udp=..
+  nat44-tcp=.. nat44-icmp=.. firewall=..`）。適用時はpending resolution/ICMPv4 errorを捨て、
+  NAT44 mapping/session・firewall flow・学習ARP neighborは下の「reload時のstate引き継ぎ」に従って
+  引き継ぐか（既定）flushし、counterは保持します。
   `reload.requested|applied|refused|failed`をstatsに出し、停止時に準備中・待機中のreloadは
   `stage=prepare|quiesce code=STOPPED`で数えるのでfinalでは常にrequested = applied + refused + failedです。
   準備中のreloadの経過は`reload.preparing_ms`に出し、10 sを超えると一回だけ
@@ -1101,6 +1111,33 @@ sudo kill -HUP <pid>                                               # configをre
 - multi-queue、structured logはdeferred
   （requirements CLI-034、runbookの「Known limits」）。filesystemの閉じ込め（CLI-034の
   chroot/mount namespace項目）はH11でLandlockとして実装。
+
+### reload時のstate引き継ぎ（RELOAD-CARRY）
+
+applyするsuccessor文書の`[reload] state`が、reloadで既存stateをどうするかを決めます（table/key
+省略時は`carry`。mode切り替え自体もreloadable）。
+
+```toml
+[reload]
+state = "carry"   # 既定。"flush": RELOAD以前どおり全flushして全hash keyをrotate
+```
+
+`carry`ではfamilyごとに、新文書が意味を変えないstateをhash keyごと引き継ぎます。firewall ruleの
+追加のような無関係な変更でNATを通るTCP/UDP接続は切れません（RFC 4787 REQ-1/REQ-5、RFC 5382
+REQ-5）。
+
+| family | 引き継ぐ条件 | 引き継げないとき |
+|---|---|---|
+| NAT44 UDP/TCP/ICMP query | inside/outside、public address、port pool、filteringが同じで、UDP/ICMP idle timeoutが延びず、per-host limitが下がらず新設もされない（TCPはphase timeoutも同じ） | そのfamilyだけflush（`flushed:interfaces`/`public-address`/`port-range`/`filtering`/`timers`/`quota`） |
+| firewall flow | idle timeoutが延びない。expire済みのflowは落とし、routeのegressが変わった（消えた）flowはrevoke、ruleが変わればapply時に残る全flowを新ruleで再評価し、拒否されるflowはrevoke（以後どちらの向きも通らない） | timeout延長はflush（`flushed:timers`）、`live flows x (rules + 4)`が4194304 testを超えるとflush（`flushed:reevaluation-budget`、件数であり時間ではない。最大tableで開発host約25 ms） |
+| 学習ARP neighbor | interfaceのIPv4 addressが同じ、static neighborに置き換わらない、ARP-031有効時はon-link | そのentryだけ削除 |
+
+pending resolution、ICMPv4 error queue/limiter、TCP unsolicited-SYN holdは常に捨てます。旧設定で
+expireしたstateはreloadで生き返りません（timeoutの延長はflush、短縮は引き継いだstateに最終
+activityから効く）。carry中はhash keyがprocessの寿命の間変わらないので、`state = "flush"`のreload
+かrestartで定期的に回してください（毒されたARP学習とNAT/FW stateも同時に消えます）。applyは失敗原子的で、失敗したreloadは
+何も引き継ぎも捨てもしません。restartは常に全flushです。詳細はarchitectureの「reload state carry」、
+運用はrunbookの6章です。
 
 ### packet backend（`[backend]`）
 
@@ -1270,7 +1307,7 @@ directory外の読めるfileへのsymlinkにatomicに置き換えると`stage=re
 directory内へ置くとapply。uid 0では`/etc/shadow`、`/etc/passwd`、`/proc/1/status`、
 `/proc/<pid>/root/etc/shadow`へのsymlinkが全て`PERMISSION_DENIED`。対照として`--fs-confine off`では
 同じ`/etc/passwd`がreadを通る）、
-B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、
+RELOAD-CARRYのreload_carry phase（host Aからhost BへのNAT越しの長寿命TCP接続と固定source portのUDP flowが、無関係なfirewall ruleを足すSIGHUP reloadの後も同じsocket・同じpublic portで通り（reload行は全family `carried`、revoke 0）、両方を拒否するruleへのreloadでrevokeされ以後通らない（`firewall-revoked=2`）。AF_PACKET phaseの中でも同じ確認をする）、B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの

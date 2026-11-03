@@ -376,7 +376,11 @@ pub fn candidate_from_config<S: PublicationKeySource>(
         firewall.policy(),
         key_set.firewall,
     ))
-    .with_resolution_hash_key(key_set.resolution);
+    .with_resolution_hash_key(key_set.resolution)
+    .with_reload_state(match config.reload_state() {
+        ruster_config::ReloadStateV1::Carry => crate::ReloadState::Carry,
+        ruster_config::ReloadStateV1::Flush => crate::ReloadState::Flush,
+    });
     let plan = match icmp {
         Some(icmp) => plan.with_nat44_icmp(Nat44IcmpPublicationInput::new(
             icmp.inside(),

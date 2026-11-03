@@ -288,6 +288,13 @@ pub enum Nat44IcmpConfigError {
 }
 
 impl Nat44IcmpConfig {
+    /// The fields that must stay equal for state to carry across a
+    /// publication (RELOAD-CARRY); the identifier pool is the port pool.
+    #[must_use]
+    pub const fn carry_identity(self) -> crate::Nat44CarryIdentity {
+        self.0.carry_identity()
+    }
+
     pub fn new(
         snapshot: &ForwardingSnapshot<'_>,
         inside: IfId,
@@ -514,9 +521,16 @@ pub struct Nat44IcmpReconcilePermit<'runtime, 'storage>(
 
 impl Nat44IcmpReconcilePermit<'_, '_> {
     /// Consumes this one-shot permit and applies its prevalidated reconcile:
-    /// every mapping and peer is flushed and the key rotates.
+    /// every mapping and peer is flushed and the key rotates, or, for a
+    /// carrying permit, every mapping and peer is kept with the key.
     pub fn commit(self) -> Nat44IcmpReconcileReport {
         self.0.commit()
+    }
+
+    /// What [`Self::commit`] will do with the state.
+    #[must_use]
+    pub const fn outcome(&self) -> crate::StateCarryOutcome {
+        self.0.outcome()
     }
 }
 
@@ -614,6 +628,28 @@ impl<'a> Nat44IcmpRuntime<'a> {
     ) -> Result<Nat44IcmpReconcilePermit<'runtime, 'a>, Nat44IcmpReconcileError> {
         self.engine
             .preflight_reconcile(config.0, hash_key.0)
+            .map(Nat44IcmpReconcilePermit)
+    }
+
+    /// Why `config` cannot carry this runtime's state, if it cannot
+    /// (RELOAD-CARRY): the realm, the identifier pool, or the filtering mode
+    /// changed.
+    #[must_use]
+    pub fn carry_conflict(&self, config: Nat44IcmpConfig) -> Option<crate::StateCarryConflict> {
+        self.engine.carry_conflict(config.0)
+    }
+
+    /// Preflights a successor that keeps this runtime's mappings and peers
+    /// when [`Self::carry_conflict`] finds nothing, and flushes and rotates
+    /// the key otherwise; see
+    /// [`Nat44UdpRuntime::preflight_reconcile_carrying`].
+    pub fn preflight_reconcile_carrying<'runtime>(
+        &'runtime mut self,
+        config: Nat44IcmpConfig,
+        hash_key: Nat44IcmpHashKey,
+    ) -> Result<Nat44IcmpReconcilePermit<'runtime, 'a>, Nat44IcmpReconcileError> {
+        self.engine
+            .preflight_reconcile_carrying(config.0, hash_key.0)
             .map(Nat44IcmpReconcilePermit)
     }
 
