@@ -2371,12 +2371,15 @@ frag_stop() {
     fragments=$(stat_in "$work/$1.final" fragmentation.fragments)
     consumed=$(stat_in "$work/$1.final" consume.IPV4_FRAGMENTED)
     accepted=$(stat_in "$work/$1.final" generated_fragments.tx_accepted)
+    # Frames sent whole through the fragmentation slots (a datagram held for
+    # ARP and replayed, ARP-HOLD) are generated fragment frames too.
+    whole=$(stat_in "$work/$1.final" fragmentation.whole)
     [ "${fragmented:-0}" -ge "$2" ] ||
         fail "$1: fragmentation.fragmented is ${fragmented:-missing}"
     [ "${consumed:-x}" = "$fragmented" ] ||
         fail "$1: consume.IPV4_FRAGMENTED ${consumed:-missing}, fragmented $fragmented"
-    [ "${fragments:-0}" -eq $((fragmented * 2)) ] && [ "${accepted:-x}" = "$fragments" ] ||
-        fail "$1: fragments ${fragments:-missing}, tx_accepted ${accepted:-missing}, fragmented $fragmented"
+    [ "${fragments:-0}" -eq $((fragmented * 2)) ] && [ "${accepted:-x}" = $((fragments + ${whole:-0})) ] ||
+        fail "$1: fragments ${fragments:-missing}, tx_accepted ${accepted:-missing}, whole ${whole:-missing}, fragmented $fragmented"
 }
 
 # Host B -> host A through the NAT toward lan `mtu = 1280`: host B answers
