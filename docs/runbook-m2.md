@@ -1270,7 +1270,7 @@ runtime storage (`storage-bytes`; the maximal production config with
 `datagrams = 1024` was 61042880 bytes before NAT-FRAG). A config with every table at its
 production limit and `mappings-per-host` on both NAT44 protocols now needs
 67306432 bytes with the default 64 slots and fails with
-`RUNTIME_STORAGE_BYTES_EXCEEDED` (64 MiB); set `[fragmentation] datagrams`
+`RUNTIME_STORAGE_BYTES_EXCEEDED` (64 MiB); set `fragmentation.datagrams`
 to at most 12, or size a table down. New `[tick] generated-fragments`
 (default 64). New drop codes: 186
 `IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS`, 187
@@ -1402,7 +1402,7 @@ Tuning:
   fragmentation slot's size (3840 bytes by default). Without fragmentation
   (`[fragmentation] enabled = false`) nothing can be held and every
   fragment that arrives first is `IPV4_FRAGMENT_HOLD_FULL`. Released
-  fragments use fragmentation slots (`[fragmentation] datagrams`) and the
+  fragments use fragmentation slots (`fragmentation.datagrams`) and the
   tick's fragment budget (`[tick] generated-fragments`).
 - `timeout-ms` is not refreshed; fragments of one datagram normally arrive
   within milliseconds. Shorter frees the table sooner after a loss.
@@ -1458,7 +1458,7 @@ Troubleshooting:
 | reordered fragments lost under load | `fragment_tracking.entries_evicted`, `held_evicted` | pending associations were evicted for new datagrams: raise `entries`; check for a flood of fragments (spoofed sources) |
 | a fragmented flow stops after one datagram | `fragment_tracking.poisoned`, `drop.IPV4_FRAGMENT_DUPLICATE_FIRST` | two datagrams shared a key (a sender reusing IDs fast, or a server answering two inside hosts with one ID): both were refused |
 | reordered fragments lost | `drop.IPV4_FRAGMENT_HOLD_FULL`, `HOST_HOLD_LIMIT`, `fragment_tracking.held_expired` | raise `held-fragments`/`held-per-host`; `held_expired` alone means the first fragment never came (lost upstream or refused before the table) |
-| held fragments not sent | `fragment_tracking.release_dropped`, `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | raise `[fragmentation] datagrams` and `[tick] generated-fragments` |
+| held fragments not sent | `fragment_tracking.release_dropped`, `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | raise `fragmentation.datagrams` and `[tick] generated-fragments` |
 | a fragment flow refused as a whole | `fragment_tracking.first_denied`, `drop.IPV4_FRAGMENT_FIRST_DENIED` | the first fragment was refused: see its own drop reason (firewall rule, NAT mapping) |
 | fragments refused everywhere | `drop.FIREWALL_FRAGMENT_UNSUPPORTED` | `[fragment-tracking] mode = "refuse"` is set |
 
@@ -1473,7 +1473,7 @@ bytes of storage (the maximal production config, with `entries = 16384` and
 `held-fragments = 512`, was 67050176 bytes; 67050272 since GARP). A config with every table at
 its production limit and per-host NAT44 limits that just fitted 64 MiB may
 now fail with `RUNTIME_STORAGE_BYTES_EXCEEDED`: lower `[fragment-tracking]
-entries`/`held-fragments` or `[fragmentation] datagrams`, size a table
+entries`/`held-fragments` or `fragmentation.datagrams`, size a table
 down, or (hardening) set `mode = "refuse"`. New drop codes 190
 `IPV4_FRAGMENT_FIRST_DENIED`, 191 `IPV4_FRAGMENT_DUPLICATE_FIRST`, 192
 `IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`, 193 `IPV4_FRAGMENT_MALFORMED`, 194
@@ -1564,7 +1564,7 @@ false` is `ARP_HOLD_WITHOUT_FRAGMENTATION`.
 | first datagrams of new flows still lost | `drop.NEIGHBOR_UNRESOLVED` | the hold is off, there is no fragmentation, or the resolution could not start (`resolution.state_full`/`action_full`, a Failed hold-down) |
 | first datagrams lost under load | `drop.ARP_HOLD_FULL`, `drop.ARP_HOLD_HOST_LIMIT`, `drop.ARP_HOLD_INGRESS_LIMIT` | many unresolved next hops at once (a scan of a connected network, or a flood from one interface?): raise `packets`/`per-host`/`per-ingress` or find the source |
 | only the last few of a burst arrive | `arp_hold.replaced` | `per-neighbor` datagrams per next hop are kept: raise it |
-| held datagrams sent late | `arp_hold.deferred` | not enough free fragmentation slots per tick: raise `[fragmentation] datagrams` |
+| held datagrams sent late | `arp_hold.deferred` | not enough free fragmentation slots per tick: raise `fragmentation.datagrams` |
 | held datagrams never sent | `arp_hold.failed`, `expired`, `resolution.timed_out` | the neighbour never answered ARP |
 
 Upgrade note (ARP-HOLD, behaviour change): the hold is on by default, also
@@ -1577,7 +1577,7 @@ bytes of storage (the maximal production config was 67050176 bytes;
 config that just fitted 64 MiB fails after the upgrade with no change of
 its own**: `stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED
 path=resolution.hold.packets` (the path is set when the document fits
-without the hold). Lower `[resolution.hold] packets` (each slot is about
+without the hold). Lower `resolution.hold.packets` (each slot is about
 3.8 KiB) or set `enabled = false`, before upgrading a router whose
 `ruster validate` shows `storage-bytes=` above 66860000.
 New drop codes 201 `ARP_HOLD_FULL`, 202 `ARP_HOLD_HOST_LIMIT`, 203
@@ -2616,7 +2616,7 @@ Sections, in this order:
 
 | prefix | content |
 |---|---|
-| `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `carried.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome, its flush counts (`apply.flush.*`), carry counts (`apply.carry.*`, including `firewall_flows_revoked`) and per-family outcome (`apply.state.<family>`: `carried`, `flushed`, `flushed:<reason>`, RELOAD-CARRY), cumulative `flushed.*` and `carried.*`, NAT/FW/ICMP limiter occupancy and high-water. `firewall.states_revoked` counts the flows reloads revoked |
+| `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `carried.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome, its flush counts (`apply.flush.*`), carry counts (`apply.carry.*`, including `firewall_flows_revoked`) and per-family outcome (`apply.state.<family>`: `carried`, `flushed`, `flushed:<reason>`, RELOAD-CARRY), cumulative `flushed.*` and `carried.*`, NAT/FW/ICMP limiter occupancy and high-water (OBS-015), and the resolution, generated action, hold, and fragment occupancy (OBS-017, below). `firewall.states_revoked` counts the flows reloads revoked |
 | `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `nat44_icmp.*`, `firewall.*` | the service runtimes' cumulative counters (`nat44_icmp.*` is all zero without `[nat44.icmp]`) |
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall; the gauge `tx_held_on_down_link` is the TX held while the link is last seen down, which a reload does not wait for, OPS-EXIT), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
@@ -2629,6 +2629,33 @@ Sections, in this order:
 | `fs.*` | `confine` (`landlock`, `off`), `abi` (the kernel's Landlock ABI; 0 when off), `rules` (rules of the ruleset; 0 when off), `threads` (threads confined; 0 when off) |
 | `seccomp.*` | `mode` (`kill`, `log`, `off`), `threads` (threads verified with the filter; 0 when off), `syscalls` (allowlist entries; 0 when off) |
 | `output.dropped` | output messages dropped because a stream could not keep up |
+
+Occupancy (`occupancy.<table>.<field>`). Every table has four fields:
+`occupied` (in use now, at the last sample after a tick), `high_water`
+(the most in use since startup or the last apply that flushed the table),
+`capacity` (its configured slots), and `peak` (the largest `high_water`
+of any sample, so it survives reloads). `occupancy.samples` counts the
+samples (one after each tick). The OBS-015 tables are the NAT44, firewall
+state, and ICMPv4 limiter state tables. OBS-017 adds:
+
+| table | counts | capacity from | `high_water` restarts |
+|---|---|---|---|
+| `resolution_states` | pending ARP resolutions (queued or waiting for a reply; cooldowns not counted) | `resolution.capacity.states` | at every apply |
+| `resolution_actions` | the generated ARP request queue | `resolution.capacity.actions` | at every apply |
+| `resolution_dynamic_neighbors` | learned neighbors (expired ones until their slot is reused) | `resolution.capacity.dynamic-neighbors` | at every apply; with `[reload] state` carrying, at the carried count |
+| `resolution_failure_holds` | datagrams kept for a Host Unreachable | `resolution.capacity.failure-holds` | at every apply |
+| `icmpv4_error_actions` | the generated ICMPv4 error queue (pending errors) | `icmpv4-errors.capacity.actions` | at every apply |
+| `arp_hold_packets` | datagrams held for ARP (ARP-HOLD) | `resolution.hold.packets` | at every apply |
+| `fragment_tracking_entries`, `fragment_tracking_held` | fragment associations and held later fragments (NAT-FRAG) | `fragment-tracking.entries`, `fragment-tracking.held-fragments` | at every apply |
+| `fragmentation_slots` | staged fragmentation slots (MTU2) | `fragmentation.datagrams` | never: nothing staged outlives a tick, so `occupied` is 0 between ticks and `high_water` is the fullest a tick's queue got |
+
+An optional table that is not configured shows `capacity=0`. A `peak` at
+or near `capacity` means that table has been full: check the matching
+full counter (`resolution.state_full`, `resolution.action_full`,
+`icmpv4_errors.action_full`, `arp_hold.refused_full`,
+`fragment_tracking.entries_evicted`/`held_evicted`,
+`drop.IPV4_FRAGMENTATION_QUEUE_FULL`) and size the table up. No
+occupancy value is a health condition (OBS-030).
 
 What to watch in operation: `observer.state=healthy`, `watch.state=ok`,
 `rx.received` growing, `drop.<REASON>`, `af_xdp.mode=copy`,
@@ -3879,7 +3906,7 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `drop.IPV4_FRAGMENTATION_NEEDED` growing | — | DF datagrams above an egress MTU; senders get Fragmentation Needed | normal for PMTUD; persistent growth from one sender means it ignores the error (check `icmpv4_errors.rate_limited`, firewalls in front of the sender) |
 | `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU with `[fragmentation] enabled = false` | turn fragmentation on (the default), raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
 | `drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS` | — | a DF-clear datagram would need more fragments than `max-fragments-per-datagram` | raise the bound (default 1365), or raise the egress MTU |
-| `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | — | more DF-clear datagrams above an egress MTU in one tick than `[fragmentation] datagrams` | raise `datagrams` to at least `[tick] rx` (restart) |
+| `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | — | more DF-clear datagrams above an egress MTU in one tick than `fragmentation.datagrams` | raise `datagrams` to at least `[tick] rx` (restart) |
 | `drop.IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE` | — | a DF-clear datagram longer than a fragmentation slot (the largest of the interface `mtu`s, 3826, and the AF_PACKET `max-frame-len` - 14); no production port delivers one, so only the simulator can | none on AF_XDP or AF_PACKET; in a scenario, keep injected datagrams within the slot |
 | `stage=validate code=FRAGMENTATION_BACKEND_ROOM_TOO_SMALL` | 2 | fragmentation is on and a port has fewer than 4 AF_XDP `generated-frames` or AF_PACKET TX ring frames, so it could never send a fragment set (two fragments plus the router reserve of two) | raise that port's `generated-frames` (and `frame-count`) or TX ring, or set `[fragmentation] enabled = false` |
 | `fragmentation.dropped_budget` growing | — | more fragment frames per tick than `[tick] generated-fragments` | raise `generated-fragments` (and the egress `generated-frames` / TX ring with it) if the link carries much fragmented traffic |

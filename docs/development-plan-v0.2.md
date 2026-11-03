@@ -197,7 +197,7 @@ partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-cop
   operator runbook（[`runbook-m2.md`](runbook-m2.md)）の確定、ledgerのM2a判定。
 - NAT/FW占有（割当済みslot数とgeneration内high-water）はM2 S8で追加した（OBS-015、
   OBS-022〜026）。TTL未満のlive数（OBS-027）、resolution/action/audit high-watermark、native
-  ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはAP3でOBS-028、OBS-017はdeferred）。core `PublicationQuiescenceGuard::new`はsealされていない。
+  ringのsaturationはM2 S6でAF_XDPの`BackendStats`へ接続した（OBS-018。AF_PACKETはAP3でOBS-028、OBS-017はOBS-HWMで実装）。core `PublicationQuiescenceGuard::new`はsealされていない。
 - optional serviceを表すcomposition seamが無く、M1はUDP/TCP NAT44+FWを必須とする。
 - `ruster run-sim`によるfrozen benchmark spec SHAの表示（R12 acceptance）が無い。spec SHA自体は
   M1 release evidenceへ固定済み。
