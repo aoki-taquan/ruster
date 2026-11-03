@@ -101,8 +101,10 @@ pub use ipv4_fragment_tracking::{
     ipv4_fragment_tracking_buckets, Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot,
     Ipv4FragmentHostSlot, Ipv4FragmentTracker, Ipv4FragmentTrackingCounters,
     Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError, Ipv4FragmentTrackingStorage,
-    Ipv4FragmentTrackingStorageError, IPV4_FRAGMENT_TRACKING_DEFAULT_TIMEOUT_MS,
-    IPV4_FRAGMENT_TRACKING_MAX_TIMEOUT_MS, IPV4_FRAGMENT_TRACKING_MIN_TIMEOUT_MS,
+    Ipv4FragmentTrackingStorageError, IPV4_FRAGMENT_TRACKING_DEFAULT_INGRESS_SHARE_PERCENT,
+    IPV4_FRAGMENT_TRACKING_DEFAULT_TIMEOUT_MS, IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM,
+    IPV4_FRAGMENT_TRACKING_MAX_INGRESSES, IPV4_FRAGMENT_TRACKING_MAX_TIMEOUT_MS,
+    IPV4_FRAGMENT_TRACKING_MIN_TIMEOUT_MS,
 };
 pub use ipv4_fragmentation::{
     execute_one_ipv4_fragmentation, ipv4_fragment_slot_bytes, GeneratedIpv4FragmentReport,

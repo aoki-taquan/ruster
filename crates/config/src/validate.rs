@@ -136,8 +136,9 @@ pub enum ValidationCode {
     FragmentationBackendRoomTooSmall,
     /// `[tick] generated-fragments` is 0 (no fragment could ever be sent).
     TickGeneratedFragmentsZero,
-    /// `[fragment-tracking] timeout-ms` outside 100..=60000 or
-    /// `entries-per-host` 0 (NAT-FRAG).
+    /// `[fragment-tracking] timeout-ms` outside 100..=60000,
+    /// `entries-per-host` 0, or `ingress-share-percent` outside 1..=100
+    /// (NAT-FRAG).
     FragmentTrackingPolicy(Ipv4FragmentTrackingPolicyError),
     /// `[fragment-tracking] entries` is 0 in `associate` mode (NAT-FRAG).
     FragmentTrackingEntriesZero,
@@ -2319,9 +2320,11 @@ fn validate_fragment_tracking(
         source.entries_per_host,
         source.held_per_host,
     )
+    .and_then(|policy| policy.with_ingress_share_percent(source.ingress_share_percent))
     .map_err(|error| {
         let name = match error {
             Ipv4FragmentTrackingPolicyError::EntriesPerHostZero => "entries-per-host",
+            Ipv4FragmentTrackingPolicyError::IngressShareOutOfRange => "ingress-share-percent",
             _ => "timeout-ms",
         };
         ValidationError::new(ValidationCode::FragmentTrackingPolicy(error), field(name))

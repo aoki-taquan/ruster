@@ -2104,6 +2104,14 @@ fn fragment_tracking_section_defaults_to_association_and_fails_closed() {
         tuned.fragment_tracking().policy(),
         Some(Ipv4FragmentTrackingPolicy::new(100, 1, 0).unwrap())
     );
+    let whole = validated(&with("[fragment-tracking]\ningress-share-percent = 100\n"));
+    assert_eq!(
+        whole
+            .fragment_tracking()
+            .policy()
+            .map(Ipv4FragmentTrackingPolicy::ingress_share_percent),
+        Some(100)
+    );
     assert_eq!(
         tuned.fragment_tracking().storage(),
         Some(FragmentTrackingStorageShapeV1 {
@@ -2155,6 +2163,20 @@ fn fragment_tracking_section_defaults_to_association_and_fails_closed() {
             "entries = 0",
             ValidationCode::FragmentTrackingEntriesZero,
             "fragment-tracking.entries",
+        ),
+        (
+            "ingress-share-percent = 0",
+            ValidationCode::FragmentTrackingPolicy(
+                Ipv4FragmentTrackingPolicyError::IngressShareOutOfRange,
+            ),
+            "fragment-tracking.ingress-share-percent",
+        ),
+        (
+            "ingress-share-percent = 101",
+            ValidationCode::FragmentTrackingPolicy(
+                Ipv4FragmentTrackingPolicyError::IngressShareOutOfRange,
+            ),
+            "fragment-tracking.ingress-share-percent",
         ),
     ] {
         let rejected = error(&with(&format!("[fragment-tracking]\n{section}\n")));

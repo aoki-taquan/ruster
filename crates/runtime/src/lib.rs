@@ -1185,7 +1185,7 @@ where
         nat44_icmp,
         firewall,
         mut fragmentation,
-        fragment_tracking,
+        mut fragment_tracking,
     } = view;
     let Nat44IcmpServiceView {
         config: icmp_config,
@@ -1208,6 +1208,12 @@ where
     // can never be sent: the RX phase refuses it before any commit.
     if let Some(runtime) = fragmentation.as_deref_mut() {
         runtime.set_tick_frame_budget(budgets.generated_fragments);
+    }
+    // NAT-FRAG: a bounded expiry sweep each tick keeps the association
+    // table's occupancy and expiry counters current without traffic (four
+    // entries at most; O(1) when nothing is due).
+    if let Some(tracker) = fragment_tracking.as_deref_mut() {
+        tracker.sweep(now.0, 4);
     }
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {

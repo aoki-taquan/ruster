@@ -352,7 +352,7 @@ pub enum DropReason {
     Ipv4FragmentFirstDenied = 190,
     /// A first fragment (MF set, offset 0) for a datagram whose first
     /// fragment was already decided. A byte-identical duplicate (same length
-    /// and first 8 data bytes) is dropped alone; any other one means two
+    /// and fingerprint of all its data) is dropped alone; any other one means two
     /// datagrams share the key (an ID reused, or two datagrams that differ
     /// only in what the key leaves out, such as the destination port) or a
     /// different transport header (RFC 1858 §4), and poisons the entry: every
@@ -393,6 +393,16 @@ pub enum DropReason {
     /// than a held slot (sized like a fragmentation slot, so only a
     /// simulated frame can be) (NAT-FRAG).
     Ipv4FragmentHoldTooLarge = 198,
+    /// The datagram's ingress interface already has its share of the
+    /// association table (`[fragment-tracking] ingress-share-percent`), none
+    /// of it evictable (only allowing entries of datagrams that are still
+    /// arriving), so a flood on one interface cannot take the entries of
+    /// another's datagrams (NAT-FRAG).
+    Ipv4FragmentIngressLimit = 199,
+    /// A later fragment arrived before its first fragment and its datagram
+    /// already holds the most fragments one datagram may hold (16)
+    /// (NAT-FRAG).
+    Ipv4FragmentDatagramHoldLimit = 200,
 }
 
 use DropReason::*;
@@ -400,7 +410,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 198] = [
+    pub const ALL: [Self; 200] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -599,6 +609,8 @@ impl DropReason {
         Ipv4FragmentHoldFull,
         Ipv4FragmentHostHoldLimit,
         Ipv4FragmentHoldTooLarge,
+        Ipv4FragmentIngressLimit,
+        Ipv4FragmentDatagramHoldLimit,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -814,6 +826,8 @@ impl DropReason {
             Ipv4FragmentHoldFull => "IPV4_FRAGMENT_HOLD_FULL",
             Ipv4FragmentHostHoldLimit => "IPV4_FRAGMENT_HOST_HOLD_LIMIT",
             Ipv4FragmentHoldTooLarge => "IPV4_FRAGMENT_HOLD_TOO_LARGE",
+            Ipv4FragmentIngressLimit => "IPV4_FRAGMENT_INGRESS_LIMIT",
+            Ipv4FragmentDatagramHoldLimit => "IPV4_FRAGMENT_DATAGRAM_HOLD_LIMIT",
         }
     }
 }
@@ -8583,6 +8597,8 @@ mod tests {
             (196, "IPV4_FRAGMENT_HOLD_FULL"),
             (197, "IPV4_FRAGMENT_HOST_HOLD_LIMIT"),
             (198, "IPV4_FRAGMENT_HOLD_TOO_LARGE"),
+            (199, "IPV4_FRAGMENT_INGRESS_LIMIT"),
+            (200, "IPV4_FRAGMENT_DATAGRAM_HOLD_LIMIT"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -8592,7 +8608,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(199), None);
+        assert_eq!(DropReason::from_code(201), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

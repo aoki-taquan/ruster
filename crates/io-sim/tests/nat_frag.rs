@@ -1127,7 +1127,13 @@ fn associations_and_held_fragments_expire_after_the_timeout() {
 #[test]
 fn per_host_and_global_caps_refuse_new_datagrams() {
     let mut world = World::new(Setup {
-        tracking: Some(Ipv4FragmentTrackingPolicy::new(5_000, 2, 1).unwrap()),
+        // Without the ingress partition (every datagram is from the LAN).
+        tracking: Some(
+            Ipv4FragmentTrackingPolicy::new(5_000, 2, 1)
+                .unwrap()
+                .with_ingress_share_percent(100)
+                .unwrap(),
+        ),
         entries: 3,
         held: 2,
         ..Setup::default()
@@ -1883,4 +1889,142 @@ fn hairpinned_fragments_are_translated_both_ways_in_any_order() {
         assert_eq!(sorted(out.clone()), sorted(cut(&expected, &sizes)), "TCP");
         assert_eq!(reassemble(&out), expected);
     }
+}
+
+// ------------------------------------------- re-review follow-ups (#337) ----
+
+/// Re-review M-E: a fixed-length UDP tunnel with checksum 0 (VXLAN, RFC
+/// 7348). After A's middle fragment is lost and the ID wraps, B's first
+/// fragment has A's length and A's first 8 data bytes (the UDP header) but
+/// other data: it poisons the entry (the fingerprint covers every data
+/// byte), so B's middle fragment is not forwarded under A's template and
+/// ID (A0 + B1 + A2 would reassemble with no checksum to catch it).
+#[test]
+fn a_checksum_zero_tunnel_reusing_an_id_poisons_instead_of_misassembling() {
+    let mut world = World::new(Setup::default());
+    let datagram = |flip: u8| {
+        let mut segment = udp_segment(H1, REMOTE, (P1, 4789), UDP_DATA);
+        segment[6..8].fill(0);
+        for byte in &mut segment[8..] {
+            *byte ^= flip;
+        }
+        cut(
+            &ipv4_frame((LAN_MAC, H1_MAC), H1, REMOTE, 0x0bbb, 0, 64, UDP, &segment),
+            &SIZES,
+        )
+    };
+    let a = datagram(0);
+    let b = datagram(0x55);
+    assert_eq!(a[0][34..42], b[0][34..42], "same UDP header");
+    let outcome = world.run(&lan(&[a[0].clone(), a[2].clone()]));
+    assert_eq!(frames_to(&outcome, WAN).len(), 2);
+    let outcome = world.run(&lan(&b));
+    assert!(outcome.tx.is_empty(), "nothing of B leaves");
+    assert_eq!(
+        outcome.drops,
+        [
+            DropReason::Ipv4FragmentDuplicateFirst,
+            DropReason::Ipv4FragmentFirstDenied,
+            DropReason::Ipv4FragmentFirstDenied,
+        ]
+    );
+    assert_eq!(world.counters().poisoned, 1);
+}
+
+/// Opens H1's NAT mapping and firewall state toward `remote`:53 from P1.
+fn open_to(world: &mut World, remote: Ipv4Address) {
+    let request = udp_segment(H1, remote, (P1, 53), 8);
+    let outcome = world.run(&lan(&[ipv4_frame(
+        (LAN_MAC, H1_MAC),
+        H1,
+        remote,
+        1,
+        DF,
+        64,
+        UDP,
+        &request,
+    )]));
+    assert_eq!(outcome.tx.len(), 1);
+}
+
+/// A first fragment from `remote`:53 to PUBLIC:P1 (return traffic of H1's
+/// mapping, so allowed) with `id`, whose later fragments never come.
+fn spoofed_first(remote: Ipv4Address, id: u16) -> Vec<u8> {
+    let answer = udp_segment(remote, PUBLIC, (53, P1), UDP_DATA);
+    cut(
+        &ipv4_frame((WAN_MAC, GW_MAC), remote, PUBLIC, id, 0, 60, UDP, &answer),
+        &SIZES,
+    )
+    .remove(0)
+}
+
+/// Re-review M-D repro 1: spoofed first fragments from a peer that has a
+/// mapping are allowed as return traffic, and their allowing entries used
+/// to be unevictable: 32 of them at 6.4 pps filled the peer's quota and its
+/// legitimate reply was IPV4_FRAGMENT_HOST_LIMIT. An allowing entry whose
+/// datagram stalled for a fifth of the timeout is now evicted.
+#[test]
+fn stalled_allowing_entries_do_not_hold_a_peers_quota() {
+    let mut world = World::new(Setup {
+        entries: 64,
+        ..Setup::default()
+    });
+    open_to(&mut world, REMOTE);
+    for index in 0..32_u16 {
+        let now = NOW + u64::from(index) * 150;
+        world.run_at(now, &wan(&[spoofed_first(REMOTE, 0x7100 + index)]));
+    }
+    let answer = udp_segment(REMOTE, PUBLIC, (53, P1), UDP_DATA);
+    let sent = ipv4_frame(
+        (WAN_MAC, GW_MAC),
+        REMOTE,
+        PUBLIC,
+        0x7200,
+        0,
+        60,
+        UDP,
+        &answer,
+    );
+    let outcome = world.run_at(NOW + 32 * 150, &wan(&cut(&sent, &SIZES)));
+    assert!(outcome.drops.is_empty(), "{:?}", outcome.drops);
+    assert_eq!(frames_to(&outcome, LAN).len(), 3);
+    assert!(world.counters().entries_evicted >= 1);
+}
+
+/// Re-review M-D repro 2: four spoofed peers × 8 fresh allowing first
+/// fragments filled the table and an unrelated LAN host's outbound
+/// fragments were IPV4_FRAGMENT_TABLE_FULL. The WAN may now take only its
+/// share (`ingress-share-percent`, 50 by default): the rest of its flood is
+/// IPV4_FRAGMENT_INGRESS_LIMIT and the LAN keeps its half.
+#[test]
+fn one_ingress_cannot_take_another_ingresss_share() {
+    let mut world = World::new(Setup {
+        entries: 32,
+        ..Setup::default()
+    });
+    let peers = [
+        REMOTE,
+        Ipv4Address::from_octets([198, 51, 100, 21]),
+        Ipv4Address::from_octets([198, 51, 100, 22]),
+        Ipv4Address::from_octets([198, 51, 100, 23]),
+    ];
+    for peer in peers {
+        open_to(&mut world, peer);
+    }
+    let flood: Vec<_> = peers
+        .iter()
+        .flat_map(|peer| (0..8).map(move |index| spoofed_first(*peer, 0x7300 + index)))
+        .collect();
+    let outcome = world.run(&wan(&flood));
+    assert_eq!(
+        outcome.drops,
+        [DropReason::Ipv4FragmentIngressLimit; 16],
+        "the WAN's share is 16 of 32"
+    );
+    // An unrelated LAN host's datagram still gets an entry.
+    let segment = udp_segment(H2, D, (5000, 9000), UDP_DATA);
+    let sent = ipv4_frame((LAN_MAC, H2_MAC), H2, D, 0x7400, 0, 64, UDP, &segment);
+    let outcome = world.run(&lan(&cut(&sent, &SIZES)));
+    assert!(outcome.drops.is_empty(), "{:?}", outcome.drops);
+    assert_eq!(frames_to(&outcome, DMZ).len(), 3);
 }

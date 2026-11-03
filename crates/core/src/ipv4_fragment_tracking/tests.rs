@@ -123,8 +123,13 @@ fn key() -> ResolutionHashKey {
     ResolutionHashKey::new(7, 9).unwrap()
 }
 
+/// A policy without the ingress partition (one ingress in most tests; the
+/// partition has its own test).
 fn policy(timeout: u32, entries_per_host: u32, held_per_host: u32) -> Ipv4FragmentTrackingPolicy {
-    Ipv4FragmentTrackingPolicy::new(timeout, entries_per_host, held_per_host).unwrap()
+    Ipv4FragmentTrackingPolicy::new(timeout, entries_per_host, held_per_host)
+        .unwrap()
+        .with_ingress_share_percent(100)
+        .unwrap()
 }
 
 fn snapshot(wan_mtu: u16) -> ForwardingSnapshot<'static> {
@@ -578,12 +583,16 @@ fn held_fragments_need_room_and_respect_the_host_limit() {
         tracker.follow(info(&other), &other, other.len(), 0),
         Ok(Ipv4FragmentFollow::Held)
     );
+    // Every held slot taken: the oldest pending datagram (SOURCE's) is
+    // evicted with what it holds.
     let third = fragment_from([10, 0, 0, 12], 1, 1, 64, 17, 8);
     assert_eq!(
         tracker.follow(info(&third), &third, third.len(), 0),
-        Err(DropReason::Ipv4FragmentHoldFull)
+        Ok(Ipv4FragmentFollow::Held)
     );
     assert_eq!((tracker.entries(), tracker.held()), (2, 2));
+    let counters = tracker.counters();
+    assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
     // No held slot at all: every early fragment is refused.
     let mut none = Storage::new(4, 0, 0);
     let mut tracker = Ipv4FragmentTracker::new(policy(1_000, 4, 4), none.borrow(), key()).unwrap();
@@ -599,14 +608,16 @@ fn entries_expire_oldest_first_and_free_room_for_new_ones() {
     let mut storage = Storage::new(2, 2, 1514);
     let mut tracker = Ipv4FragmentTracker::new(policy(100, 4, 4), storage.borrow(), key()).unwrap();
     let snapshot = snapshot(1500);
-    for (id, at) in [(1, 0), (2, 50)] {
+    for (id, at) in [(1, 0), (2, 10)] {
         let ticket = tracker
             .admit_first(info(&fragment(id, MF, 64, 17, 8)), at)
             .unwrap();
         tracker.commit_allow(ticket, template(8), &snapshot, None, at);
     }
+    // Both allowing and younger than a fifth of the timeout: nothing to
+    // evict.
     assert_eq!(
-        tracker.admit_first(info(&fragment(3, MF, 64, 17, 8)), 99),
+        tracker.admit_first(info(&fragment(3, MF, 64, 17, 8)), 19),
         Err(DropReason::Ipv4FragmentTableFull)
     );
     // At 100 ms the oldest has expired; the younger is still live.
@@ -617,13 +628,13 @@ fn entries_expire_oldest_first_and_free_room_for_new_ones() {
     assert_eq!(tracker.counters().entries_expired, 1);
     let later = fragment(2, 1, 64, 17, 8);
     assert!(matches!(
-        tracker.follow(info(&later), &later, later.len(), 149),
+        tracker.follow(info(&later), &later, later.len(), 109),
         Ok(Ipv4FragmentFollow::Allow { .. })
     ));
     let gone = fragment(1, 1, 64, 17, 8);
     // Datagram 1 is unknown again: held (it takes 2's expired entry).
     assert_eq!(
-        tracker.follow(info(&gone), &gone, gone.len(), 150),
+        tracker.follow(info(&gone), &gone, gone.len(), 110),
         Ok(Ipv4FragmentFollow::Held)
     );
     assert_eq!(tracker.counters().entries_expired, 2);
@@ -849,7 +860,8 @@ fn an_expired_entry_found_by_lookup_is_counted_with_its_held_fragments() {
 #[test]
 fn freeing_a_middle_entry_keeps_the_age_and_free_lists() {
     let mut storage = Storage::new(3, 0, 0);
-    let mut tracker = Ipv4FragmentTracker::new(policy(100, 8, 0), storage.borrow(), key()).unwrap();
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 8, 0), storage.borrow(), key()).unwrap();
     for (id, now) in [(1, 0), (2, 1), (3, 2)] {
         allow(&mut tracker, id, now);
     }
@@ -866,17 +878,17 @@ fn freeing_a_middle_entry_keeps_the_age_and_free_lists() {
         Err(DropReason::Ipv4FragmentTableFull)
     );
     for id in [5, 6] {
-        allow(&mut tracker, id, 102);
+        allow(&mut tracker, id, 1_002);
     }
     assert_eq!(tracker.counters().entries_expired, 2);
     assert_eq!(tracker.entries(), 3);
     // Free everything: every slot is reachable from the free list again.
     for id in [4, 5, 6] {
-        complete(&mut tracker, id, SOURCE, 103);
+        complete(&mut tracker, id, SOURCE, 1_003);
     }
     assert_eq!(tracker.entries(), 0);
     for id in [7, 8, 9] {
-        allow(&mut tracker, id, 104);
+        allow(&mut tracker, id, 1_004);
     }
     assert_eq!(tracker.entries(), 3);
 }
@@ -1228,4 +1240,63 @@ fn host_accounting_is_per_ingress_and_eviction_spares_allowing_entries() {
         pass(&mut tracker, 1, 2 | MF, 16),
         Ok(Ipv4FragmentFollow::Allow { .. })
     ));
+}
+
+// ------------------------------------------- re-review follow-ups (#337) ----
+
+#[test]
+fn the_ingress_share_is_bounded_and_partitions_the_table() {
+    let base = Ipv4FragmentTrackingPolicy::new(1_000, 8, 8).unwrap();
+    assert_eq!(base.ingress_share_percent(), 50);
+    for percent in [0, 101, u8::MAX] {
+        assert_eq!(
+            base.with_ingress_share_percent(percent),
+            Err(Ipv4FragmentTrackingPolicyError::IngressShareOutOfRange)
+        );
+    }
+    let mut storage = Storage::new(4, 0, 0);
+    let mut tracker = Ipv4FragmentTracker::new(base, storage.borrow(), key()).unwrap();
+    // LAN takes its two (50 % of 4); a third LAN datagram waits for room.
+    allow(&mut tracker, 1, 0);
+    allow(&mut tracker, 2, 0);
+    assert_eq!(
+        tracker.admit_first(info(&fragment(3, MF, 64, 17, 16)), 0),
+        Err(DropReason::Ipv4FragmentIngressLimit)
+    );
+    // WAN still has its own two.
+    for id in [4, 5] {
+        let mut wan = info(&fragment(id, MF, 64, 17, 16));
+        wan.key.ingress = WAN;
+        let ticket = tracker.admit_first(wan, 0).unwrap();
+        tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 0);
+    }
+    assert_eq!(tracker.entries(), 4);
+    // A stalled LAN datagram (a fifth of the timeout) gives way.
+    assert!(tracker
+        .admit_first(info(&fragment(3, MF, 64, 17, 16)), 200)
+        .is_ok());
+}
+
+#[test]
+fn one_datagram_holds_at_most_sixteen_fragments() {
+    let mut storage = Storage::new(4, 32, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 32), storage.borrow(), key()).unwrap();
+    for block in 0..16 {
+        let frame = fragment(1, (1 + block) | MF, 64, 17, 8);
+        assert_eq!(
+            tracker.follow(info(&frame), &frame, frame.len(), 0),
+            Ok(Ipv4FragmentFollow::Held)
+        );
+    }
+    let frame = fragment(1, 17 | MF, 64, 17, 8);
+    assert_eq!(
+        tracker.follow(info(&frame), &frame, frame.len(), 0),
+        Err(DropReason::Ipv4FragmentDatagramHoldLimit)
+    );
+    assert_eq!(tracker.held(), 16);
+    // The bounded sweep frees it at the timeout.
+    assert_eq!(tracker.sweep(999, 4), 0);
+    assert_eq!(tracker.sweep(1_000, 4), 1);
+    assert_eq!(tracker.held(), 0);
 }

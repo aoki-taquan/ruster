@@ -101,6 +101,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "idle-ttl-ms",
     "inbound-rst",
     "inbound-sessions-per-remote",
+    "ingress-share-percent",
     "ingress",
     "inside",
     "interface",

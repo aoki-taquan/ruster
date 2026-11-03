@@ -256,6 +256,15 @@ pub struct FragmentTrackingV1 {
     /// 60000 ms. Default 5000.
     #[serde(default = "default_fragment_tracking_timeout_ms")]
     pub timeout_ms: u32,
+    /// The share of `entries` the datagrams of one ingress interface may
+    /// take, 1 to 100 percent (100 does not partition). Default 50: a flood
+    /// on one interface cannot take the other's entries.
+    #[serde(default = "default_fragment_tracking_ingress_share_percent")]
+    pub ingress_share_percent: u8,
+}
+
+const fn default_fragment_tracking_ingress_share_percent() -> u8 {
+    ruster_core::IPV4_FRAGMENT_TRACKING_DEFAULT_INGRESS_SHARE_PERCENT
 }
 
 impl Default for FragmentTrackingV1 {
@@ -267,6 +276,7 @@ impl Default for FragmentTrackingV1 {
             held_fragments: DEFAULT_FRAGMENT_TRACKING_HELD,
             held_per_host: DEFAULT_FRAGMENT_TRACKING_HELD_PER_HOST,
             timeout_ms: default_fragment_tracking_timeout_ms(),
+            ingress_share_percent: default_fragment_tracking_ingress_share_percent(),
         }
     }
 }
