@@ -11,8 +11,8 @@
 //!    the RFC 791 algorithm and refuses, as a typed drop of the whole
 //!    datagram, a count above `max-fragments-per-datagram`
 //!    ([`crate::DropReason::Ipv4FragmentationTooManyFragments`]), a
-//!    fragment whose offsets would not fit 13 bits (an overlong received
-//!    fragment, [`crate::DropReason::Ipv4FragmentationOffsetOverflow`]), a
+//!    received fragment whose data ends past the largest datagram (65535
+//!    bytes, [`crate::DropReason::Ipv4FragmentationOffsetOverflow`]), a
 //!    datagram longer than a slot
 //!    ([`crate::DropReason::Ipv4FragmentationDatagramTooLarge`]), or a full
 //!    slot table ([`crate::DropReason::Ipv4FragmentationQueueFull`]).
@@ -75,6 +75,8 @@ const FLAG_RESERVED: u16 = 0x8000;
 const FLAG_DONT_FRAGMENT: u16 = 0x4000;
 const FLAG_MORE_FRAGMENTS: u16 = 0x2000;
 const OFFSET_MASK: u16 = 0x1fff;
+/// Data bytes of the largest IPv4 datagram: 65535 minus a 20-byte header.
+const MAX_DATAGRAM_DATA: usize = u16::MAX as usize - IPV4_HEADER_LEN;
 
 /// The most fragments any IPv4 datagram can need: 65535 bytes with a
 /// 20-byte header at the IPv4 minimum MTU of 68 (48 data bytes per
@@ -199,6 +201,10 @@ pub struct Ipv4FragmentationCounters {
     /// Staged datagrams dropped whole because the egress session refused
     /// the largest fragment's length (`FrameTooLarge`/`ZeroLength`).
     pub dropped_frame_too_large: usize,
+    /// Staged datagrams dropped whole because their fragments did not fit
+    /// the tick's remaining fragment frame budget (`[tick]
+    /// generated-fragments`); no session was opened.
+    pub dropped_budget: usize,
     /// Staged datagrams whose set was cut short after `check_capacity`
     /// promised room: an allocation failed or a lease had the wrong length,
     /// both backend faults. The fragments committed before it were sent.
@@ -215,6 +221,9 @@ pub enum Ipv4FragmentOutcome {
     Sent,
     /// The session refused room for the set; nothing was allocated or sent.
     Refused(GeneratedAllocationError),
+    /// The set did not fit the tick's remaining fragment frame budget; no
+    /// session was opened and nothing was sent.
+    OverBudget,
     /// An allocation failed after `check_capacity` promised room (a backend
     /// fault); `committed` fragments had been committed.
     AllocationFailed {
@@ -232,7 +241,8 @@ pub struct GeneratedIpv4FragmentReport<E> {
     pub egress: IfId,
     pub fragments: u16,
     pub outcome: Ipv4FragmentOutcome,
-    pub completion: GeneratedBatchCompletion<E>,
+    /// `None` when no session was opened ([`Ipv4FragmentOutcome::OverBudget`]).
+    pub completion: Option<GeneratedBatchCompletion<E>>,
 }
 
 /// The fragment count and staged frame length of an admitted datagram.
@@ -373,13 +383,23 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
         if fragments > usize::from(self.policy.max_fragments) {
             return Err(DropReason::Ipv4FragmentationTooManyFragments);
         }
-        let last_offset = usize::from(flags_offset & OFFSET_MASK) + (fragments - 1) * block / 8;
-        if last_offset > usize::from(OFFSET_MASK) {
+        // RFC 791: a datagram is at most 65535 bytes, so the data of a
+        // fragment ends at most 65535 - 20 bytes into it. A received fragment
+        // that ends later is malformed and is not cut further (every piece
+        // would carry the overlong end; its last offsets might not even fit
+        // 13 bits). Unreachable in production: the firewall refuses every
+        // received fragment first.
+        let end = usize::from(flags_offset & OFFSET_MASK) * 8 + data_len;
+        if end > MAX_DATAGRAM_DATA {
             return Err(DropReason::Ipv4FragmentationOffsetOverflow);
         }
         let frame_len = header + usize::from(total_len);
         // With no slot at all the table is simply full (below).
-        if frame_len > frame.len() || (!self.slots.is_empty() && frame_len > self.slot_bytes) {
+        if frame_len > frame.len() {
+            // Not reachable after IPv4 validation.
+            return Err(DropReason::Ipv4TotalLengthExceedsPacket);
+        }
+        if !self.slots.is_empty() && frame_len > self.slot_bytes {
             return Err(DropReason::Ipv4FragmentationDatagramTooLarge);
         }
         if self.len == self.slots.len() {
@@ -477,14 +497,32 @@ fn write_fragment(staged: &[u8], block: usize, index: usize, out: &mut [u8]) {
 /// ([`Ipv4FragmentOutcome::Refused`]). Then each fragment is allocated with
 /// its exact frame length, written, and committed in order. The datagram
 /// leaves its slot in every case.
+///
+/// `frame_budget` is the tick's fragment frames left: a set with more
+/// fragments is dropped whole without opening a session
+/// ([`Ipv4FragmentOutcome::OverBudget`]); a session that opens takes its
+/// whole set from the budget, so the phase never generates more frames than
+/// the budget whatever the backend does.
 pub fn execute_one_ipv4_fragmentation<I>(
     io: &mut I,
     runtime: &mut Ipv4FragmentationRuntime<'_>,
+    frame_budget: &mut usize,
 ) -> Option<GeneratedIpv4FragmentReport<I::Error>>
 where
     I: GeneratedPacketIo,
 {
     let (slot, start) = runtime.take_front()?;
+    let fragments = usize::from(slot.fragments);
+    if fragments > *frame_budget {
+        runtime.counters.dropped_budget += 1;
+        return Some(GeneratedIpv4FragmentReport {
+            egress: slot.egress,
+            fragments: slot.fragments,
+            outcome: Ipv4FragmentOutcome::OverBudget,
+            completion: None,
+        });
+    }
+    *frame_budget -= fragments;
     let staged = &runtime.bytes[start..start + slot.frame_len as usize];
     let block = fragment_block(slot.mtu);
     let data_len = staged.len() - FRAGMENT_HEADERS_LEN;
@@ -505,6 +543,7 @@ where
             counters.dropped_unavailable += 1;
         }
         Ipv4FragmentOutcome::Refused(_) => counters.dropped_frame_too_large += 1,
+        Ipv4FragmentOutcome::OverBudget => unreachable!("handled before the session"),
         Ipv4FragmentOutcome::AllocationFailed { committed, .. }
         | Ipv4FragmentOutcome::WrongLength { committed } => {
             counters.incomplete += 1;
@@ -515,7 +554,7 @@ where
         egress: slot.egress,
         fragments: slot.fragments,
         outcome,
-        completion,
+        completion: Some(completion),
     })
 }
 

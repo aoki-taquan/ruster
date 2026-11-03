@@ -537,6 +537,7 @@ pub fn run_traced(case: &CaseEnvelope<'_>) -> Result<(StateCoverage, Vec<Refusal
         failure_dispatch_scans: usize::try_from(tick.failure_dispatch_scans).unwrap(),
         generated_arp: usize::try_from(tick.generated_arp).unwrap(),
         generated_icmpv4: usize::try_from(tick.generated_icmpv4).unwrap(),
+        generated_fragments: usize::try_from(tick.generated_fragments).unwrap(),
     };
     let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(case.seed));
     let candidate = sequencer

@@ -23,6 +23,7 @@ const BUDGETS: TickBudgets = TickBudgets {
     failure_dispatch_scans: 4,
     generated_arp: 4,
     generated_icmpv4: 4,
+    generated_fragments: 4,
 };
 
 #[test]
@@ -421,7 +422,7 @@ fn service_counters_render_in_fixed_order(
         ("nat44_tcp", 40),
         ("nat44_icmp", 16),
         ("firewall", 13),
-        ("fragmentation", 7),
+        ("fragmentation", 8),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);
     }

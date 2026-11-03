@@ -329,7 +329,9 @@ impl World {
             }
         }
         if let Some(runtime) = self.fragmentation.as_mut() {
-            while let Some(report) = execute_one_ipv4_fragmentation(&mut self.io, runtime) {
+            while let Some(report) =
+                execute_one_ipv4_fragmentation(&mut self.io, runtime, &mut { usize::MAX })
+            {
                 outcome.fragment_outcomes.push(report.outcome);
             }
             assert_eq!(runtime.pending(), 0);

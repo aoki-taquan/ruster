@@ -43,6 +43,7 @@ const BUDGETS: TickBudgets = TickBudgets {
     failure_dispatch_scans: 8,
     generated_arp: 8,
     generated_icmpv4: 8,
+    generated_fragments: 8,
 };
 
 /// Records the unsolicited-SYN dispositions.

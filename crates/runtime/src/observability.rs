@@ -1375,7 +1375,7 @@ impl ObservableFields for ServiceCounters {
         }}
         visit_counts! {v, "fragmentation", self.fragmentation, Ipv4FragmentationCounters {
             queued, fragmented, fragments, dropped_unavailable, dropped_frame_too_large,
-            incomplete, flushed,
+            dropped_budget, incomplete, flushed,
         }}
     }
 }

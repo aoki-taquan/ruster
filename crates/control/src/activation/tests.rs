@@ -286,6 +286,7 @@ const BUDGETS: TickBudgets = TickBudgets {
     failure_dispatch_scans: 8,
     generated_arp: 0,
     generated_icmpv4: 0,
+    generated_fragments: 0,
 };
 
 type Report = ruster_runtime::TickReport<

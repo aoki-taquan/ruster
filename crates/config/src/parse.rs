@@ -82,6 +82,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "frame-size",
     "generate",
     "generated-arp",
+    "generated-fragments",
     "generated-frames",
     "generated-icmpv4",
     "hairpinning",

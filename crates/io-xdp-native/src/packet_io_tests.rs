@@ -1958,23 +1958,44 @@ fn check_capacity_is_bounded_by_the_generated_pool_and_counts_nothing() {
             batch.check_capacity(99, 1_515),
             Err(GeneratedAllocationError::FrameTooLarge)
         );
+        // The router reserve (2 of 4 frames) stays free for ARP and ICMP.
+        let room = generated as usize - generated_reserve(generated) as usize;
+        assert_eq!(room, 2);
         assert_eq!(
-            batch.check_capacity(generated as usize + 1, 60),
+            batch.check_capacity(room + 1, 60),
             Err(GeneratedAllocationError::Unavailable)
         );
-        assert_eq!(batch.check_capacity(generated as usize, 1_514), Ok(()));
+        assert_eq!(batch.check_capacity(room, 1_514), Ok(()));
         batch.finish()
     };
     assert_untouched(&completion);
     assert_eq!(completion.error, None);
     assert_unchanged(&io, before);
 
-    // Ok means exactly that many allocations succeed and are accepted.
+    // Ok means exactly that many allocations succeed and are accepted, and
+    // the reserve is still there for single router frames afterwards.
     let completion = {
         let mut batch = io.begin_generated(WAN);
-        assert_eq!(batch.check_capacity(generated as usize, 1_514), Ok(()));
-        for len in [1_514, 14, 60, 1_514] {
+        assert_eq!(
+            batch.check_capacity(
+                generated as usize - generated_reserve(generated) as usize,
+                1_514
+            ),
+            Ok(())
+        );
+        for len in [1_514, 14] {
             batch.allocate(len).expect("promised").commit();
+        }
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable),
+            "the reserve is not offered to sets"
+        );
+        for len in [60, 1_514] {
+            batch
+                .allocate(len)
+                .expect("reserve for router frames")
+                .commit();
         }
         assert_eq!(
             batch.check_capacity(1, 60),

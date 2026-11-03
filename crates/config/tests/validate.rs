@@ -1991,3 +1991,38 @@ fn fragmentation_section_defaults_on_and_fails_closed() {
     let unknown = parse(with("[fragmentation]\nqueue-bytes = 1\n").as_bytes());
     assert!(unknown.is_err(), "unknown field refused");
 }
+
+/// MTU2 part B review: `[tick] generated-fragments` bounds the fragment
+/// frames of one tick (default 64), 1 to 65536, fail closed.
+#[test]
+fn tick_generated_fragments_defaults_and_fails_closed() {
+    use ruster_config::{DEFAULT_TICK_GENERATED_FRAGMENTS, MAX_TICK_GENERATED_FRAGMENTS};
+    assert_eq!(
+        validated(VALID).tick().generated_fragments,
+        DEFAULT_TICK_GENERATED_FRAGMENTS
+    );
+    assert_eq!(DEFAULT_TICK_GENERATED_FRAGMENTS, 64);
+    let with = |value: u64| {
+        VALID.replacen(
+            "[tick]\n",
+            &format!("[tick]\ngenerated-fragments = {value}\n"),
+            1,
+        )
+    };
+    assert_eq!(validated(&with(1)).tick().generated_fragments, 1);
+    assert_eq!(
+        validated(&with(65_536)).tick().generated_fragments,
+        MAX_TICK_GENERATED_FRAGMENTS
+    );
+    let zero = error(&with(0));
+    assert_eq!(zero.code(), ValidationCode::TickGeneratedFragmentsZero);
+    assert_eq!(zero.code().code(), "TICK_GENERATED_FRAGMENTS_ZERO");
+    assert_eq!(dotted(zero.path()), "tick.generated-fragments");
+    let above = error(&with(65_537));
+    assert_eq!(above.code(), ValidationCode::CapacityLimitExceeded);
+    assert_eq!(
+        (above.limit(), above.actual()),
+        (Some(65_536), Some(65_537))
+    );
+    assert_eq!(dotted(above.path()), "tick.generated-fragments");
+}

@@ -326,15 +326,18 @@ pub enum DropReason {
     /// datagram is discarded before any state commits (MTU2 part B).
     Ipv4FragmentationQueueFull = 187,
     /// A DF-clear datagram above the egress MTU is longer than a
-    /// fragmentation slot (the config sizes slots for the larger of the
-    /// largest interface MTU and the longest AF_XDP datagram, so only a
-    /// simulated frame can be longer). The whole
+    /// fragmentation slot. The config sizes slots for the largest of the
+    /// interface MTUs, the longest AF_XDP datagram (3826 bytes), and the
+    /// AF_PACKET `max-frame-len` minus 14, so no production port delivers a
+    /// longer one; only a simulated frame can be. The whole
     /// datagram is discarded before any state commits (MTU2 part B).
     Ipv4FragmentationDatagramTooLarge = 188,
-    /// A DF-clear fragment above the egress MTU whose Fragment Offset plus
-    /// data run past the largest IPv4 datagram (RFC 791: 65535 bytes), so
-    /// a fragment of it would need an offset beyond 13 bits. The whole
-    /// fragment is discarded before any state commits (MTU2 part B).
+    /// A DF-clear fragment above the egress MTU whose data, at its Fragment
+    /// Offset, ends past the largest IPv4 datagram (RFC 791: 65535 bytes,
+    /// so `offset * 8 + data > 65515`): malformed, not cut further. The
+    /// whole fragment is discarded before any state commits (MTU2 part B).
+    /// Unreachable in production: the firewall refuses received fragments
+    /// first.
     Ipv4FragmentationOffsetOverflow = 189,
 }
 

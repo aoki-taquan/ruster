@@ -224,10 +224,11 @@ fn fragment(frame: &[u8], mtu: u16) -> Vec<Vec<u8>> {
     let plan = runtime.plan(frame, mtu).unwrap();
     runtime.stage(frame, plan, EGRESS);
     let mut io = io();
-    let report = execute_one_ipv4_fragmentation(&mut io, &mut runtime).unwrap();
+    let report =
+        execute_one_ipv4_fragmentation(&mut io, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(report.outcome, Ipv4FragmentOutcome::Sent);
     assert_eq!(usize::from(report.fragments), io.sent.len());
-    assert!(execute_one_ipv4_fragmentation(&mut io, &mut runtime).is_none());
+    assert!(execute_one_ipv4_fragmentation(&mut io, &mut runtime, &mut { usize::MAX }).is_none());
     io.sent
         .into_iter()
         .map(|(egress, bytes)| {
@@ -367,19 +368,23 @@ fn every_refusal_is_typed_and_checked_in_order() {
     assert!(runtime
         .plan(&datagram(600, (65_515 - 600) / 8), 576)
         .is_ok());
-    // Three fragments of 1200 data bytes at 576: the last starts 1104 bytes
-    // (138 blocks) in, so offset 8053 puts it exactly at 8191 (fits) and
-    // 8054 one block beyond.
+    // 1203 data bytes at offset 8039 (64312 bytes) end exactly at
+    // 65535 - 20 (fits); one block later they end past it.
     let default = storage.runtime(Ipv4FragmentationPolicy::DEFAULT);
     assert_eq!(
         default
-            .plan(&datagram(1200, 8053), 576)
+            .plan(&datagram(1203, 8039), 576)
             .map(Ipv4FragmentPlan::fragments),
         Ok(3)
     );
     assert_eq!(
-        default.plan(&datagram(1200, 8054), 576),
+        default.plan(&datagram(1203, 8040), 576),
         Err(DropReason::Ipv4FragmentationOffsetOverflow)
+    );
+    assert_eq!(
+        default.plan(&datagram(1204, 8039), 576),
+        Err(DropReason::Ipv4FragmentationOffsetOverflow),
+        "one byte past 65535"
     );
     // A datagram longer than a slot (1514 bytes here).
     let runtime = storage.runtime(Ipv4FragmentationPolicy::DEFAULT);
@@ -392,7 +397,7 @@ fn every_refusal_is_typed_and_checked_in_order() {
     let truncated = datagram(1000, 0);
     assert_eq!(
         runtime.plan(&truncated[..truncated.len() - 1], 576),
-        Err(DropReason::Ipv4FragmentationDatagramTooLarge)
+        Err(DropReason::Ipv4TotalLengthExceedsPacket)
     );
     // The bound is checked before the slot table.
     let mut runtime = runtime;
@@ -530,7 +535,8 @@ fn the_worst_case_sends_1365_fragments_of_48_bytes() {
         max_frame: 14 + 68,
         ..FakeIo::default()
     };
-    let report = execute_one_ipv4_fragmentation(&mut io, &mut runtime).unwrap();
+    let report =
+        execute_one_ipv4_fragmentation(&mut io, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(report.outcome, Ipv4FragmentOutcome::Sent);
     assert_eq!(io.capacity_checks, [(EGRESS, 1365, 14 + 68)]);
     assert_eq!(io.sent.len(), 1365);
@@ -556,12 +562,13 @@ fn a_refused_set_sends_nothing_and_counts_the_reason() {
         refuse: Some(GeneratedAllocationError::Unavailable),
         ..io()
     };
-    let report = execute_one_ipv4_fragmentation(&mut refusing, &mut runtime).unwrap();
+    let report =
+        execute_one_ipv4_fragmentation(&mut refusing, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(
         report.outcome,
         Ipv4FragmentOutcome::Refused(GeneratedAllocationError::Unavailable)
     );
-    assert_eq!(report.completion.attempts, 0);
+    assert_eq!(report.completion.unwrap().attempts, 0);
     assert!(refusing.sent.is_empty());
     // The check asks for the whole set at the first fragment's length.
     assert_eq!(refusing.capacity_checks, [(EGRESS, 3, 14 + 572)]);
@@ -569,14 +576,15 @@ fn a_refused_set_sends_nothing_and_counts_the_reason() {
         max_frame: 500,
         ..FakeIo::default()
     };
-    let report = execute_one_ipv4_fragmentation(&mut small, &mut runtime).unwrap();
+    let report =
+        execute_one_ipv4_fragmentation(&mut small, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(
         report.outcome,
         Ipv4FragmentOutcome::Refused(GeneratedAllocationError::FrameTooLarge)
     );
     assert!(small.sent.is_empty());
     let mut ok = io();
-    execute_one_ipv4_fragmentation(&mut ok, &mut runtime).unwrap();
+    execute_one_ipv4_fragmentation(&mut ok, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(ok.sent.len(), 3);
     assert_eq!(
         runtime.counters(),
@@ -586,11 +594,53 @@ fn a_refused_set_sends_nothing_and_counts_the_reason() {
             fragments: 3,
             dropped_unavailable: 1,
             dropped_frame_too_large: 1,
+            dropped_budget: 0,
             incomplete: 0,
             flushed: 0,
         }
     );
     assert_eq!(runtime.pending(), 0);
+}
+
+#[test]
+fn the_frame_budget_refuses_whole_sets_without_a_session() {
+    // Three staged sets of 3 fragments each against a budget of 7 frames:
+    // the first two fit exactly (3 + 3), the third (3 > 1) is refused
+    // whole before any session is opened.
+    let frame = datagram(1480, 0);
+    let mut storage = Storage::new(3, 1500);
+    let mut runtime = storage.runtime(Ipv4FragmentationPolicy::DEFAULT);
+    for _ in 0..3 {
+        let plan = runtime.plan(&frame, 576).unwrap();
+        runtime.stage(&frame, plan, EGRESS);
+    }
+    let mut io = io();
+    let mut budget = 7;
+    for left in [4, 1] {
+        let report = execute_one_ipv4_fragmentation(&mut io, &mut runtime, &mut budget).unwrap();
+        assert_eq!(report.outcome, Ipv4FragmentOutcome::Sent);
+        assert!(report.completion.is_some());
+        assert_eq!(budget, left);
+    }
+    let report = execute_one_ipv4_fragmentation(&mut io, &mut runtime, &mut budget).unwrap();
+    assert_eq!(report.outcome, Ipv4FragmentOutcome::OverBudget);
+    assert_eq!(report.completion, None);
+    assert_eq!(budget, 1, "a refused set takes nothing");
+    assert_eq!(io.sent.len(), 6);
+    assert_eq!(
+        io.capacity_checks.len(),
+        2,
+        "no session for the refused set"
+    );
+    let counters = runtime.counters();
+    assert_eq!((counters.fragmented, counters.dropped_budget), (2, 1));
+    assert_eq!(runtime.pending(), 0);
+    // Exactly the set's size fits.
+    let plan = runtime.plan(&frame, 576).unwrap();
+    runtime.stage(&frame, plan, EGRESS);
+    let mut exact = 3;
+    let report = execute_one_ipv4_fragmentation(&mut io, &mut runtime, &mut exact).unwrap();
+    assert_eq!((report.outcome, exact), (Ipv4FragmentOutcome::Sent, 0));
 }
 
 #[test]
@@ -606,7 +656,8 @@ fn a_backend_fault_after_the_check_is_counted_incomplete() {
         fail_allocation: Some(1),
         ..io()
     };
-    let report = execute_one_ipv4_fragmentation(&mut failing, &mut runtime).unwrap();
+    let report =
+        execute_one_ipv4_fragmentation(&mut failing, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(
         report.outcome,
         Ipv4FragmentOutcome::AllocationFailed {
@@ -620,14 +671,15 @@ fn a_backend_fault_after_the_check_is_counted_incomplete() {
         short_lease: Some(2),
         ..io()
     };
-    let report = execute_one_ipv4_fragmentation(&mut short, &mut runtime).unwrap();
+    let report =
+        execute_one_ipv4_fragmentation(&mut short, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(
         report.outcome,
         Ipv4FragmentOutcome::WrongLength { committed: 2 }
     );
     assert_eq!(short.sent.len(), 2);
     assert_eq!(short.cancelled, 1);
-    assert_eq!(report.completion.cancelled, 1);
+    assert_eq!(report.completion.unwrap().cancelled, 1);
     let counters = runtime.counters();
     assert_eq!(counters.incomplete, 2);
     assert_eq!(counters.fragments, 3);
@@ -645,9 +697,9 @@ fn datagrams_leave_in_order_and_the_table_is_reused() {
     let plan = runtime.plan(&second, 576).unwrap();
     runtime.stage(&second, plan, IfId(3));
     let mut sink = io();
-    execute_one_ipv4_fragmentation(&mut sink, &mut runtime).unwrap();
+    execute_one_ipv4_fragmentation(&mut sink, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(runtime.pending(), 1);
-    execute_one_ipv4_fragmentation(&mut sink, &mut runtime).unwrap();
+    execute_one_ipv4_fragmentation(&mut sink, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(runtime.pending(), 0);
     assert_eq!(
         sink.sent,
@@ -669,6 +721,6 @@ fn datagrams_leave_in_order_and_the_table_is_reused() {
     assert_eq!(runtime.flush(), 0);
     assert_eq!(runtime.counters().flushed, 2);
     assert_eq!(runtime.counters().queued, 4);
-    assert!(execute_one_ipv4_fragmentation(&mut sink, &mut runtime).is_none());
+    assert!(execute_one_ipv4_fragmentation(&mut sink, &mut runtime, &mut { usize::MAX }).is_none());
     assert!(runtime.plan(&first, 576).is_ok());
 }

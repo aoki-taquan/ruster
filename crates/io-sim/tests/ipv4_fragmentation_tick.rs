@@ -12,7 +12,7 @@ use ruster_core::{internet_checksum, IfId, MonotonicMillis};
 use ruster_io_sim::{FrameOrigin, SimIo};
 use ruster_runtime::{
     run_tick, GeneratedAccounting, GeneratedFragmentsStop, GeneratedPhaseReport, PhaseReport,
-    TickBudgets, TickObserver, TickPhaseSkip,
+    TickBudgets, TickObserver,
 };
 
 const LAN: IfId = IfId(1);
@@ -33,11 +33,17 @@ fn config_text() -> String {
 /// A DF-clear UDP datagram of `total` bytes from H 192.168.1.10:`port` to
 /// S 198.51.100.20:53, as received on the LAN.
 fn datagram(port: u16, total: usize) -> Vec<u8> {
+    udp_to([198, 51, 100, 20], 64, port, total)
+}
+
+/// A DF-clear UDP datagram from H 192.168.1.10:`port` to `destination`:53.
+fn udp_to(destination: [u8; 4], ttl: u8, port: u16, total: usize) -> Vec<u8> {
     let mut frame = vec![2, 0, 0, 0, 0, 1, 2, 0, 0, 0, 0, 0x10, 0x08, 0x00];
     let mut header = vec![0x45, 0];
     header.extend_from_slice(&u16::try_from(total).unwrap().to_be_bytes());
-    header.extend_from_slice(&[0x12, 0x34, 0, 0, 64, 17, 0, 0]);
-    header.extend_from_slice(&[192, 168, 1, 10, 198, 51, 100, 20]);
+    header.extend_from_slice(&[0x12, 0x34, 0, 0, ttl, 17, 0, 0]);
+    header.extend_from_slice(&[192, 168, 1, 10]);
+    header.extend_from_slice(&destination);
     let sum = internet_checksum(&header);
     header[10..12].copy_from_slice(&sum.to_be_bytes());
     frame.extend_from_slice(&header);
@@ -48,7 +54,9 @@ fn datagram(port: u16, total: usize) -> Vec<u8> {
     udp.extend_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
     udp.extend_from_slice(&[0, 0]);
     udp.extend((0..len - 8).map(|i| i as u8));
-    let mut pseudo = vec![192, 168, 1, 10, 198, 51, 100, 20, 0, 17];
+    let mut pseudo = vec![192, 168, 1, 10];
+    pseudo.extend_from_slice(&destination);
+    pseudo.extend_from_slice(&[0, 17]);
     pseudo.extend_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
     pseudo.extend_from_slice(&udp);
     let sum = match internet_checksum(&pseudo) {
@@ -67,6 +75,7 @@ fn budgets() -> TickBudgets {
         failure_dispatch_scans: 8,
         generated_arp: 8,
         generated_icmpv4: 8,
+        generated_fragments: 8,
     }
 }
 
@@ -127,8 +136,9 @@ fn the_fragment_phase_sends_in_the_tick_and_a_finish_error_flushes_the_rest() {
     );
     assert_eq!(active.fragmentation().unwrap().pending(), 0);
 
-    // The first session's finish fails: its fragments were committed, the
-    // second datagram is flushed, and the later generated phases skip.
+    // The first fragment session's finish fails: its fragments were
+    // committed and the second datagram is flushed. The fragment phase is
+    // the last of the tick, so the ARP and ICMPv4 phases already ran.
     io.inject(LAN, datagram(5000, 1000));
     io.inject(LAN, datagram(5001, 1000));
     io.fail_next_generated_finish();
@@ -152,14 +162,8 @@ fn the_fragment_phase_sends_in_the_tick_and_a_finish_error_flushes_the_rest() {
         "{:?}",
         report.generated_fragments
     );
-    assert_eq!(
-        report.generated_arp,
-        PhaseReport::Skipped(TickPhaseSkip::BackendIoFailure)
-    );
-    assert_eq!(
-        report.generated_icmpv4,
-        PhaseReport::Skipped(TickPhaseSkip::BackendIoFailure)
-    );
+    assert!(matches!(report.generated_arp, PhaseReport::Completed(_)));
+    assert!(matches!(report.generated_icmpv4, PhaseReport::Completed(_)));
     let fragmentation = active.fragmentation().unwrap();
     assert_eq!(fragmentation.pending(), 0, "nothing outlives the tick");
     let counters = fragmentation.counters();
@@ -251,4 +255,119 @@ fn a_datagram_above_every_configured_mtu_is_still_fragmented() {
         .collect();
     // 1480 data bytes at MTU 1400: 1376 + 104.
     assert_eq!(lengths, [1396, 124]);
+}
+
+fn activate(text: &str) -> (FullServiceStorage, ruster_control::ValidatedCandidate) {
+    let ValidatedConfig::V1(config) = validate(
+        parse(text.as_bytes()).unwrap(),
+        PRODUCTION_VALIDATION_LIMITS,
+    )
+    .unwrap() else {
+        unreachable!("schema V1");
+    };
+    let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(7));
+    let candidate = sequencer.candidate(&config).unwrap();
+    let storage = FullServiceStorage::new(candidate.storage_shape()).unwrap();
+    (storage, candidate)
+}
+
+/// Review (MTU2 part B): the fragment phase runs last, after generated ARP
+/// and ICMPv4, so a fragment set larger than the room the backend has left
+/// never starves the router's own frames: an ARP request for an unresolved
+/// next hop and a Time Exceeded queued in the same RX batch are still sent,
+/// and the set is refused whole (`dropped_unavailable`), nothing partial.
+#[test]
+fn router_frames_go_first_and_a_set_beyond_the_room_is_refused_whole() {
+    let (mut storage, candidate) = activate(&config_text());
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate).unwrap();
+    let mut io = SimIo::new();
+    // One frame of room per generated session: enough for one ARP request
+    // or one ICMP error, not for a two-fragment set.
+    io.set_generated_budget(1);
+    let mut observer = TickObserver::default();
+    io.inject(LAN, udp_to([203, 0, 113, 50], 64, 5000, 100));
+    io.inject(LAN, udp_to([198, 51, 100, 20], 1, 5001, 100));
+    io.inject(LAN, datagram(5002, 1000));
+    let report = run_tick(
+        &mut active,
+        None,
+        &mut io,
+        MonotonicMillis(1),
+        budgets(),
+        &mut observer,
+    );
+    let mut sent = Vec::new();
+    while let Some(frame) = io.pop_tx() {
+        sent.push((frame.egress, frame.bytes));
+    }
+    // The ARP request (WAN, EtherType 0x0806) and the Time Exceeded (LAN,
+    // ICMP type 11) went out; no fragment did.
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!((sent[0].0, &sent[0].1[12..14]), (WAN, &[0x08, 0x06][..]));
+    assert_eq!((sent[1].0, sent[1].1[23], sent[1].1[34]), (LAN, 1, 11));
+    assert!(matches!(
+        report.generated_fragments,
+        PhaseReport::Completed(GeneratedPhaseReport {
+            accounting: GeneratedAccounting {
+                sessions: 1,
+                allocated: 0,
+                tx_requested: 0,
+                ..
+            },
+            stop: GeneratedFragmentsStop::QueueEmpty,
+        })
+    ));
+    let counters = active.fragmentation().unwrap().counters();
+    assert_eq!((counters.queued, counters.dropped_unavailable), (1, 1));
+    assert_eq!(counters.fragments, 0);
+}
+
+/// `[tick] generated-fragments` bounds the fragment frames of one tick: a
+/// set that does not fit what is left is dropped whole without a session
+/// (`dropped_budget`), and the budget is fresh in the next tick.
+#[test]
+fn the_tick_fragment_budget_refuses_whole_sets() {
+    let (mut storage, candidate) = activate(&config_text());
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate).unwrap();
+    let mut io = SimIo::new();
+    let mut observer = TickObserver::default();
+    let tight = TickBudgets {
+        generated_fragments: 3,
+        ..budgets()
+    };
+    io.inject(LAN, datagram(5000, 1000));
+    io.inject(LAN, datagram(5001, 1000));
+    let report = run_tick(
+        &mut active,
+        None,
+        &mut io,
+        MonotonicMillis(1),
+        tight,
+        &mut observer,
+    );
+    assert!(matches!(
+        report.generated_fragments,
+        PhaseReport::Completed(GeneratedPhaseReport {
+            accounting: GeneratedAccounting {
+                sessions: 1,
+                tx_accepted: 2,
+                ..
+            },
+            stop: GeneratedFragmentsStop::QueueEmpty,
+        })
+    ));
+    assert_eq!(std::iter::from_fn(|| io.pop_tx()).count(), 2);
+    let counters = active.fragmentation().unwrap().counters();
+    assert_eq!((counters.fragmented, counters.dropped_budget), (1, 1));
+    io.inject(LAN, datagram(5001, 1000));
+    run_tick(
+        &mut active,
+        None,
+        &mut io,
+        MonotonicMillis(2),
+        tight,
+        &mut observer,
+    );
+    assert_eq!(std::iter::from_fn(|| io.pop_tx()).count(), 2);
+    assert_eq!(active.fragmentation().unwrap().counters().fragmented, 2);
 }

@@ -36,7 +36,10 @@ pub trait GeneratedPacketBatch {
     /// reports from [`Self::finish`], may still fail one of them. A caller
     /// that must send a set of frames all or nothing (the fragments of one
     /// IPv4 datagram, RFC 791 §3.2) checks the whole set first, because a
-    /// committed frame cannot be taken back.
+    /// committed frame cannot be taken back. A backend may withhold a small
+    /// reserve it keeps for the router's own single frames (ARP, ICMP errors)
+    /// from the room it offers here, so a frame set never takes the last of
+    /// its pool (the AF_XDP adapter keeps `max(2, pool / 8)`, MTU2 part B).
     ///
     /// `frames == 0` is `Ok(())`. Otherwise the error is the one
     /// [`Self::allocate`] would return first: [`GeneratedAllocationError::ZeroLength`]

@@ -127,6 +127,8 @@ pub enum ValidationCode {
     FragmentationPolicy(Ipv4FragmentationPolicyError),
     /// `[fragmentation] datagrams` is 0 while fragmentation is enabled.
     FragmentationDatagramsZero,
+    /// `[tick] generated-fragments` is 0 (no fragment could ever be sent).
+    TickGeneratedFragmentsZero,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
     Nat44RealmWithoutProtocol,
@@ -286,6 +288,7 @@ impl ValidationCode {
             Self::Icmpv4ErrorPolicy(_) => "ICMPV4_ERROR_POLICY",
             Self::FragmentationPolicy(_) => "FRAGMENTATION_POLICY",
             Self::FragmentationDatagramsZero => "FRAGMENTATION_DATAGRAMS_ZERO",
+            Self::TickGeneratedFragmentsZero => "TICK_GENERATED_FRAGMENTS_ZERO",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
             Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
@@ -547,6 +550,9 @@ pub struct TickBudgetsV1 {
     pub failure_dispatch_scans: u32,
     pub generated_arp: u32,
     pub generated_icmpv4: u32,
+    /// Fragment frames per tick (MTU2 part B); 0 only when `[tick]` is
+    /// absent, like every other budget.
+    pub generated_fragments: u32,
 }
 
 /// Validated `[fragmentation]` (defaults when absent).
@@ -2005,6 +2011,10 @@ fn validate_v1(
         firewall_rules = Some(rules.into_boxed_slice());
     }
 
+    // Before the fragmentation slots, whose size depends on the largest
+    // frame an AF_PACKET port receives.
+    let backend = validate_backend(config.backend.unwrap_or_default(), &interfaces)?;
+
     let fragmentation_source = config.fragmentation.unwrap_or_default();
     let fragmentation_path = |field: &str| path(&["fragmentation", field]);
     let fragmentation_policy = u16::try_from(fragmentation_source.max_fragments_per_datagram)
@@ -2033,19 +2043,20 @@ fn validate_v1(
         }
         // A slot holds the longest datagram the router can receive. The
         // configured interface MTU is not enforced at ingress (a device MTU
-        // may be larger, `MTU_BELOW_DEVICE`), so the bound is the larger of
-        // every interface MTU and the longest datagram a production backend
-        // frame can carry (`FRAGMENTATION_MIN_SLOT_DATAGRAM`). A datagram
+        // may be larger, `MTU_BELOW_DEVICE`), so the bound is the largest of
+        // every interface MTU, the longest datagram an AF_XDP frame can carry
+        // (`FRAGMENTATION_MIN_SLOT_DATAGRAM`), and, for AF_PACKET, its
+        // `max-frame-len` minus the Ethernet header (up to 9216). A datagram
         // within it is fragmented as RFC 1812 §4.2.2.7 requires even when it
-        // is above every configured MTU. The bound does not depend on the
-        // backend section, so a backend change never changes the storage
-        // shape.
+        // is above every configured MTU. So an AF_PACKET `max-frame-len`
+        // above 3840 changes the storage shape (restart-required anyway).
         let received = interfaces
             .iter()
             .map(InterfaceBindingV1::mtu)
             .max()
             .unwrap_or(ruster_core::ETHERNET_DEFAULT_MTU)
-            .max(FRAGMENTATION_MIN_SLOT_DATAGRAM);
+            .max(FRAGMENTATION_MIN_SLOT_DATAGRAM)
+            .max(af_packet_received_datagram(&backend));
         Some(FragmentationStorageShapeV1 {
             datagrams: fragmentation_source.datagrams,
             slot_bytes: u32::try_from(ruster_core::ipv4_fragment_slot_bytes(received))
@@ -2143,9 +2154,25 @@ fn validate_v1(
             failure_dispatch_scans: tick.failure_dispatch_scans,
             generated_arp: tick.generated_arp,
             generated_icmpv4: tick.generated_icmpv4,
+            generated_fragments: tick.generated_fragments,
         });
-
-    let backend = validate_backend(config.backend.unwrap_or_default(), &interfaces)?;
+    if let Some(source) = config.tick {
+        let budget_path = path(&["tick", "generated-fragments"]);
+        if source.generated_fragments == 0 {
+            return Err(ValidationError::new(
+                ValidationCode::TickGeneratedFragmentsZero,
+                budget_path,
+            ));
+        }
+        if source.generated_fragments > crate::MAX_TICK_GENERATED_FRAGMENTS {
+            return Err(ValidationError::bounded(
+                ValidationCode::CapacityLimitExceeded,
+                budget_path,
+                u64::from(crate::MAX_TICK_GENERATED_FRAGMENTS),
+                u64::from(source.generated_fragments),
+            ));
+        }
+    }
 
     Ok(ValidatedConfigV1 {
         interfaces,
@@ -2189,6 +2216,20 @@ const _: () = {
         largest as u64 - XDP_PACKET_HEADROOM as u64 - 14 == FRAGMENTATION_MIN_SLOT_DATAGRAM as u64
     );
 };
+
+/// The longest IPv4 datagram an AF_PACKET port receives (its frame minus the
+/// Ethernet header); 0 for the other backends.
+fn af_packet_received_datagram(backend: &ValidatedBackendV1) -> u16 {
+    match backend {
+        ValidatedBackendV1::AfPacket(af_packet) => u16::try_from(
+            af_packet
+                .max_frame_len()
+                .saturating_sub(ruster_core::ETHERNET_HEADER_LEN as u32),
+        )
+        .unwrap_or(u16::MAX),
+        ValidatedBackendV1::Sim | ValidatedBackendV1::AfXdp(_) => 0,
+    }
+}
 
 /// Validates `[backend]` against the validated interfaces.
 ///

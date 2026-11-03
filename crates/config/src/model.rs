@@ -655,6 +655,25 @@ pub struct TickBudgetV1 {
     pub failure_dispatch_scans: u32,
     pub generated_arp: u32,
     pub generated_icmpv4: u32,
+    /// Fragment frames per tick (MTU2 part B); absent means
+    /// [`DEFAULT_TICK_GENERATED_FRAGMENTS`]. 1 to
+    /// [`MAX_TICK_GENERATED_FRAGMENTS`].
+    #[serde(default = "default_tick_generated_fragments")]
+    pub generated_fragments: u32,
+}
+
+/// Default `[tick] generated-fragments`: fragment frames one tick may send
+/// (MTU2 part B). The fragment phase runs after generated ARP and ICMPv4, so
+/// this bounds how much of a port's generated pool and TX ring forwarded
+/// fragments take per tick; 64 is 32 datagrams of 1500 bytes over a 1280- or
+/// 1400-byte link.
+pub const DEFAULT_TICK_GENERATED_FRAGMENTS: u32 = 64;
+
+/// Largest `[tick] generated-fragments` (`CAPACITY_LIMIT_EXCEEDED`).
+pub const MAX_TICK_GENERATED_FRAGMENTS: u32 = 1 << 16;
+
+const fn default_tick_generated_fragments() -> u32 {
+    DEFAULT_TICK_GENERATED_FRAGMENTS
 }
 
 /// Packet backend selection (`[backend]`).

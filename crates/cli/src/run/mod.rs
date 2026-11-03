@@ -463,6 +463,7 @@ fn budgets(config: &ValidatedConfigV1) -> TickBudgets {
         failure_dispatch_scans: wide(tick.failure_dispatch_scans),
         generated_arp: wide(tick.generated_arp),
         generated_icmpv4: wide(tick.generated_icmpv4),
+        generated_fragments: wide(tick.generated_fragments),
     }
 }
 

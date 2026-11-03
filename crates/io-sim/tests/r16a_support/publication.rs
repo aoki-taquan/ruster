@@ -389,6 +389,7 @@ pub fn run_with_coverage(case: &CaseEnvelope<'_>) -> Result<PublicationCoverage,
             failure_dispatch_scans: usize::try_from(tick.failure_dispatch_scans).unwrap(),
             generated_arp: usize::try_from(tick.generated_arp).unwrap(),
             generated_icmpv4: usize::try_from(tick.generated_icmpv4).unwrap(),
+            generated_fragments: usize::try_from(tick.generated_fragments).unwrap(),
         },
         coverage: PublicationCoverage::default(),
     };

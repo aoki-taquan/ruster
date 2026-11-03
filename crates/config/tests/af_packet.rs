@@ -554,3 +554,24 @@ fn af_packet_geometry_is_consistent_with_the_backend_validator() {
     }
     assert!(accepted > 30, "{accepted}");
 }
+
+/// MTU2 part B: a fragmentation slot holds the longest datagram an
+/// AF_PACKET port can receive, its `max-frame-len` minus the Ethernet
+/// header, when that is above 3826 (the longest AF_XDP datagram) and every
+/// interface MTU; so a 9000-byte DF-clear datagram is fragmented, not
+/// refused for its size.
+#[test]
+fn af_packet_frames_size_the_fragmentation_slots() {
+    let slot = |head: &str| {
+        check(&two_ports(head))
+            .unwrap()
+            .storage_shape()
+            .fragmentation
+            .map(|shape| shape.slot_bytes)
+    };
+    assert_eq!(slot(""), Some(14 + 3826), "1514-byte frames: the floor");
+    assert_eq!(slot("max-frame-len = 3840\n"), Some(14 + 3826));
+    assert_eq!(slot("max-frame-len = 3841\n"), Some(3841));
+    assert_eq!(slot("max-frame-len = 9014\n"), Some(9014));
+    assert_eq!(slot("max-frame-len = 9230\n"), Some(9230));
+}

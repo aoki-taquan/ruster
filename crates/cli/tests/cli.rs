@@ -1302,7 +1302,7 @@ fn af_packet_backend_validates_plans_as_restart_required_and_is_refused_by_run_s
         text(&ok.stdout),
         "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
          firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
-         storage-bytes=56480 backend=af-packet ports=2 max-frame-len=1514 ring-bytes=786432\n"
+         storage-bytes=303008 backend=af-packet ports=2 max-frame-len=1514 ring-bytes=786432\n"
     );
 
     let current = fixtures().join("router-v1.toml");

@@ -1597,7 +1597,11 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
         }
     }
 
-    /// Room is `min(generated free frames, TX submit room)`: an allocation
+    /// Room is `min(generated free frames - router reserve, TX submit
+    /// room)`. The router reserve ([`generated_reserve`], the frames cross-port
+    /// copies never take either) stays free for the router's own single
+    /// frames (ARP, ICMP errors), so a fragment set never takes the last of
+    /// the pool (MTU2 part B review). An allocation
     /// pops one generated free-list entry, and a commit submits one TX
     /// descriptor under the ring room and the in-flight bound
     /// ([`RxFillEngine::tx_submit_room`](RxFillEngine::tx_submit_room)).
@@ -1652,7 +1656,8 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
         {
             return Err(GeneratedAllocationError::FrameTooLarge);
         }
-        if frames > engine.generated_free_frames() as usize {
+        let reserve = state.copy_reserve as usize;
+        if frames.saturating_add(reserve) > engine.generated_free_frames() as usize {
             return Err(GeneratedAllocationError::Unavailable);
         }
         match engine.tx_submit_room() {
