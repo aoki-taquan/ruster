@@ -977,10 +977,13 @@ Tuning:
   reservation: one ingress takes at most floor(`entries` × share / 100)
   entries (at least one), so the last of n interfaces keeps room only while
   that times n − 1 stays below `entries`; use 100/n or less for equal
-  parts. `ruster validate`, `ruster run`, and an applied reload warn with
-  `FRAGMENT_INGRESS_SHARE_OVERCOMMITTED share-percent=P interfaces=N
-  entries=E` (event `FRAGMENT_SHARE_OVERCOMMITTED`) when floor(`entries` ×
-  share / 100) × (n − 1) ≥ `entries`. With the default 50 the warning is
+  parts. The held slots are shared the same way (floor(`held-fragments` ×
+  share / 100) each, at least one). `ruster validate`, `ruster run`, and an
+  applied reload warn with `FRAGMENT_INGRESS_SHARE_OVERCOMMITTED
+  share-percent=P interfaces=N entries=E held=H` (event
+  `FRAGMENT_SHARE_OVERCOMMITTED`) when, for the entries or the held slots,
+  floor(size × share / 100) × (n − 1) ≥ size (on a small table the
+  rounding can warn below 100/n too). With the default 50 the warning is
   expected on three or more interfaces: lower the share if one interface
   must keep room while the others are flooded.
   When the table, an ingress's share, or one (ingress, source)'s
@@ -991,8 +994,9 @@ Tuning:
   datagram's fragments arrive within milliseconds; a duplicate fragment is
   not progress). Finding the victim is O(1) whatever the scope holds, and
   victims are evicted only when the whole admission succeeds (a fragment
-  refused for a limit evicts nothing). An evicted allowing or poisoned
-  association is remembered for `timeout-ms` (one tombstone per sixteen
+  refused for a limit evicts nothing). An evicted association that
+  allowed its datagram (still allowing, or poisoned since) is remembered
+  for `timeout-ms` (one tombstone per sixteen
   entries, at least 16; `fragment_tracking.tombstones_overwritten` counts
   the ones overwritten early): its late fragments and a new first fragment
   with its key are refused (`IPV4_FRAGMENT_FIRST_DENIED`,

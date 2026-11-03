@@ -2086,3 +2086,20 @@ fn a_held_flood_behind_allowing_entries_is_still_evicted() {
     let counters = world.counters();
     assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
 }
+
+/// Re-review L3: every fragment of a TTL-1 datagram is refused with
+/// IPV4_TTL_EXPIRED; the first fragment leaves a refusing entry, and the
+/// later ones still count toward its coverage, so it is freed at once
+/// instead of living for the timeout. Nothing is held.
+#[test]
+fn expiring_fragments_complete_their_refused_datagram() {
+    let mut world = World::new(Setup::default());
+    let segment = udp_segment(H1, REMOTE, (P1, 53), UDP_DATA);
+    let sent = ipv4_frame((LAN_MAC, H1_MAC), H1, REMOTE, 0x7800, 0, 1, UDP, &segment);
+    let outcome = world.run(&lan(&cut(&sent, &SIZES)));
+    assert!(frames_to(&outcome, WAN).is_empty());
+    assert!(outcome.drops.contains(&DropReason::Ipv4TtlExpired));
+    assert_eq!(world.occupancy(), (0, 0));
+    let counters = world.counters();
+    assert_eq!((counters.first_denied, counters.entries_completed), (1, 1));
+}

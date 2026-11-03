@@ -66,7 +66,7 @@
 //! of the timeout; each scope keeps both classes on their own lists, so a
 //! victim is found in O(1), and victims are evicted only once the whole
 //! admission is known to succeed. Held slots are shared between ingresses
-//! the same way. An evicted allowing or poisoned key is remembered (a
+//! the same way. An evicted key that allowed its datagram is remembered (a
 //! tombstone) until the timeout: a new first fragment on it is refused, so
 //! its late fragments never follow another datagram's template. Every
 //! table is
@@ -377,10 +377,14 @@ pub(crate) fn parse_fragment(
 }
 
 /// A fingerprint of every byte of `data`: four independent 64-bit lanes,
-/// each taking every fourth 8-byte word through a bijective step (xor,
-/// multiply by the odd FNV-1a 64 prime, rotate), so two inputs of one
-/// length that differ anywhere differ in at least one lane; the lanes and
-/// the length are folded to 32 bits with the MurmurHash3 finalizer.
+/// each taking every fourth 8-byte word through a step that is a bijection
+/// of the lane for a given word and of the word for a given lane (xor,
+/// multiply by the odd FNV-1a 64 prime, rotate). Two inputs of one length
+/// that differ in a single word therefore always differ in that word's
+/// lane; inputs that differ in several words of one lane differ in it
+/// unless those differences cancel, which no structure makes likelier
+/// than any 64-bit collision. The lanes and the length are folded to 32
+/// bits with the MurmurHash3 finalizer.
 /// Deterministic and unkeyed: it only tells a network duplicate from
 /// another first fragment (a checksum-0 tunnel repeats its header, so no
 /// prefix would do), and is about a word per byte-step of FNV-1a's cost.
@@ -458,6 +462,9 @@ pub struct Ipv4FragmentEntrySlot {
     /// A second, different first fragment or an inconsistent end turned the
     /// entry into a refusal for good (no early completion).
     poisoned: bool,
+    /// The entry has allowed its datagram at some point (it may be
+    /// poisoned since): only such an entry leaves a tombstone when evicted.
+    was_allowed: bool,
     key: Ipv4FragmentKey,
     template: Ipv4FragmentTemplate,
     created_ms: u64,
@@ -490,6 +497,7 @@ impl Ipv4FragmentEntrySlot {
     pub const EMPTY: Self = Self {
         state: EntryState::Free,
         poisoned: false,
+        was_allowed: false,
         key: Ipv4FragmentKey {
             ingress: IfId(0),
             source: [0; 4],
@@ -544,7 +552,14 @@ impl Ipv4FragmentEntrySlot {
         }
         self.max_end = self.max_end.max(end);
         if self.untracked {
-            return Ok(before != (self.total, self.max_end, self.untracked));
+            // The ranges stay as they were when tracking stopped: a fragment
+            // inside one of them is a duplicate; any other may add data
+            // (a heavily reordered datagram must not look stalled).
+            let (start, stop) = (offset as u16, end);
+            let duplicate = self.ranges[..usize::from(self.ranges_len)]
+                .iter()
+                .any(|range| range[0] <= start && stop <= range[1]);
+            return Ok(!duplicate || before != (self.total, self.max_end, self.untracked));
         }
         // The offset is below the end, which fits 16 bits.
         let (mut start, mut stop) = (offset as u16, end);
@@ -696,7 +711,7 @@ impl Default for Ipv4FragmentHeldSlot {
     }
 }
 
-/// An evicted allowing or poisoned key and when it was evicted
+/// An evicted key that allowed its datagram and when it was evicted
 /// (caller-owned storage, [`ipv4_fragment_tracking_tombstones`] of them).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4FragmentTombstoneSlot {
@@ -856,7 +871,7 @@ pub struct Ipv4FragmentTrackingCounters {
     /// Later fragments forwarded (or re-fragmented) on arrival.
     pub followed: usize,
     /// Later fragments refused because their first fragment was (or the
-    /// key's allowing or poisoned entry was evicted, a tombstone).
+    /// key's entry was evicted after it allowed its datagram, a tombstone).
     pub followed_denied: usize,
     /// Later fragments held because their first fragment had not arrived.
     pub held: usize,
@@ -887,7 +902,7 @@ pub struct Ipv4FragmentTrackingCounters {
     /// Entries turned into a refusal for good: a second, different first
     /// fragment for a decided datagram (an ID reused, or two datagrams with
     /// one key), a fragment contradicting the datagram's end, or a first
-    /// fragment on the key of an evicted allowing or poisoned entry.
+    /// fragment on the key of an evicted entry that allowed its datagram.
     pub poisoned: usize,
     /// Byte-identical duplicate first fragments dropped alone.
     pub duplicate_first: usize,
@@ -896,7 +911,7 @@ pub struct Ipv4FragmentTrackingCounters {
     /// Held fragments discarded by a publication apply.
     pub held_flushed: usize,
     /// Tombstones overwritten before their timeout (more evictions of
-    /// allowing or poisoned entries within a timeout than tombstone slots):
+    /// entries that allowed their datagram within a timeout than tombstone slots):
     /// those keys are no longer refused.
     pub tombstones_overwritten: usize,
 }
@@ -1271,6 +1286,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         let host = entry.host as usize;
         let ingress = self.ingress_of_entry(index);
         if entry.state == EntryState::Allow {
+            self.entries[index as usize].was_allowed = true;
             push(self.entries, &mut self.allow, index, CLASS);
             push(self.entries, &mut self.hosts[host].allow, index, HOST);
             push(
@@ -1446,15 +1462,17 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.ingresses[slot].over = over;
     }
 
-    /// Discards an entry to make room (counted). An allowing or poisoned
-    /// one leaves a tombstone: a new first fragment on its key could be
-    /// another datagram reusing it, and its late fragments must not be
-    /// held for one (a poisoned entry was allowing, or refuses both
-    /// datagrams of its key).
+    /// Discards an entry to make room (counted). One that ever allowed its
+    /// datagram (allowing still, or poisoned since) leaves a tombstone: a
+    /// new first fragment on its key could be another datagram reusing it,
+    /// and its late fragments must not be held for one. An entry that only
+    /// ever refused leaves none: its fragments were never forwarded, so a
+    /// later datagram on the key cannot be mixed with forwarded ones, and a
+    /// flood of refused first fragments cannot churn the tombstones.
     fn evict(&mut self, index: u32, now_ms: u64) {
         self.counters.entries_evicted += 1;
         let entry = self.entries[index as usize];
-        if entry.state == EntryState::Allow || entry.poisoned {
+        if entry.was_allowed {
             self.entomb(entry.key, now_ms);
         }
         let held = self.free_entry_at(index as usize);
@@ -1487,7 +1505,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.tombstone_next = (slot + 1) % self.tombstones.len();
     }
 
-    /// Whether `key`'s allowing or poisoned entry was evicted within the
+    /// Whether `key`'s entry was evicted, after it allowed its datagram, within the
     /// timeout (O(1), keyed lookup).
     fn tombstoned(&self, key: Ipv4FragmentKey, now_ms: u64) -> bool {
         let tombstones = &*self.tombstones;
@@ -1528,8 +1546,13 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// victim (see [`Self::victim`]). `Err` when a scope has none: then
     /// nothing is evicted at all. Only an allowing template ever forwards
     /// a later fragment, so evicting a pending or refusing entry can only
-    /// turn later fragments into refusals or new holds; a stalled allowing
-    /// or a poisoned one leaves a tombstone.
+    /// turn later fragments into refusals or new holds; one that allowed
+    /// (stalled, or poisoned since) leaves a tombstone. The table scope
+    /// takes the table's oldest evictable entry without preferring an
+    /// ingress over its share: while the shares do not overlap (share × n
+    /// ≤ 100), the requester's own share is reached first and its victim
+    /// also makes the table's room, so the table scope only decides when
+    /// the shares overlap, which `ruster validate` warns about.
     fn plan_room(
         &self,
         ingress: IfId,
@@ -1762,7 +1785,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// Admits a first fragment before its decision: a pending entry
     /// continues; a decided one drops a byte-identical duplicate alone and
     /// is poisoned by any other first fragment (`IPV4_FRAGMENT_DUPLICATE_FIRST`
-    /// either way); the key of an evicted allowing or poisoned entry is
+    /// either way); the key of an evicted entry that allowed its datagram is
     /// refused the same way (a tombstone); a new one needs room (evicting
     /// victims only when all the room it needs can be made). Changes
     /// nothing else.
@@ -1914,7 +1937,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// a copy of `frame` until the first fragment decides. Every answer
     /// records the fragment's data; one that contradicts the datagram's end
     /// poisons the entry and is `IPV4_FRAGMENT_MALFORMED`. A fragment on the
-    /// key of an evicted allowing or poisoned entry is refused (its
+    /// key of an evicted entry that allowed its datagram is refused (that
     /// datagram is gone). A hold is admitted whole before anything is
     /// evicted for it: a fragment that is then refused evicts nothing.
     pub(crate) fn follow(
@@ -2041,6 +2064,25 @@ impl<'a> Ipv4FragmentTracker<'a> {
         let index = entry as usize;
         if self.entries.get(index).is_some() {
             self.complete_if_covered(index);
+        }
+    }
+
+    /// A later fragment refused before the table for its TTL (it can never
+    /// leave). When its datagram is already refused, its data still counts
+    /// toward the entry's coverage (no hold, no progress), so the entry can
+    /// complete early; a contradiction poisons it as in [`Self::follow`].
+    /// Any other entry is left alone: nothing is held or forwarded for a
+    /// fragment that cannot leave.
+    pub(crate) fn ttl_expired(&mut self, info: Ipv4FragmentInfo, now_ms: u64) {
+        let Some(index) = self.lookup(info.key, now_ms) else {
+            return;
+        };
+        if self.entries[index].state != EntryState::Deny {
+            return;
+        }
+        match self.entries[index].record(info.offset, info.data_len, info.more) {
+            Ok(_) => self.complete_if_covered(index),
+            Err(()) => self.poison(index),
         }
     }
 
@@ -2197,6 +2239,44 @@ impl<'a> Ipv4FragmentTracker<'a> {
         }
         if listed != over {
             return Err("over-share list length");
+        }
+        if self.entry_directory.validate().is_err()
+            || self.host_directory.validate().is_err()
+            || self.tombstone_directory.validate().is_err()
+        {
+            return Err("directory structure");
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            if self.entry_directory.is_linked(index) != Some(entry.state != EntryState::Free) {
+                return Err("entry directory link");
+            }
+        }
+        for (index, host) in self.hosts.iter().enumerate() {
+            if self.host_directory.is_linked(index) != Some(host.entries != 0) {
+                return Err("host directory link");
+            }
+        }
+        for (index, tombstone) in self.tombstones.iter().enumerate() {
+            if self.tombstone_directory.is_linked(index) != Some(tombstone.live) {
+                return Err("tombstone directory link");
+            }
+            if tombstone.live {
+                let found = self
+                    .tombstone_directory
+                    .lookup(
+                        DirectoryHashDomain::Ipv4FragmentTombstone,
+                        &tombstone.key.words(),
+                        |slot| slot == index,
+                    )
+                    .ok()
+                    .and_then(|probe| probe.state_index);
+                if found != Some(index) {
+                    return Err("tombstone not found by its key");
+                }
+            }
+        }
+        if self.tombstone_next >= self.tombstones.len() {
+            return Err("tombstone cursor");
         }
         Ok(())
     }

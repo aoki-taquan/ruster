@@ -1974,3 +1974,112 @@ fn a_contradicting_hold_evicts_nothing() {
     );
     tracker.check_invariants().unwrap();
 }
+
+// ------------------------------------------- re-review of #341 ----
+
+/// Re-review L1: an entry that only ever refused leaves no tombstone when
+/// it is evicted, poisoned or not (a flood of refused first fragments
+/// cannot churn the tombstones); one that allowed and was poisoned does.
+#[test]
+fn a_refusing_entry_leaves_no_tombstone() {
+    let mut storage = Storage::new(8, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 2, 0), storage.borrow(), key()).unwrap();
+    let ticket = tracker
+        .admit_first(info(&fragment(1, MF, 64, 17, 16)), 0)
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
+    // A different first fragment poisons the refusing entry.
+    assert_eq!(
+        tracker.admit_first(info(&fragment(1, MF, 64, 17, 24)), 0),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    assert_eq!(tracker.counters().poisoned, 1);
+    let ticket = tracker
+        .admit_first(info(&fragment(2, MF, 64, 17, 16)), 0)
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
+    // The host's quota is full: the poisoned refusing entry is evicted.
+    assert!(tracker
+        .admit_first(info(&fragment(3, MF, 64, 17, 16)), 0)
+        .is_ok());
+    assert_eq!(tracker.counters().entries_evicted, 1);
+    let key_of = |id| info(&fragment(id, MF, 64, 17, 16)).key;
+    assert!(!tracker.tombstoned(key_of(1), 0));
+    // Allowed, then poisoned, then evicted: a tombstone.
+    allow(&mut tracker, 4, 0);
+    assert_eq!(
+        tracker.admit_first(info(&fragment(4, MF, 64, 17, 24)), 0),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    // The host's oldest evictable entries go first: 2, then the poisoned 4.
+    let ticket = tracker
+        .admit_first(info(&fragment(5, MF, 64, 17, 16)), 0)
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
+    assert!(!tracker.tombstoned(key_of(4), 0));
+    assert!(tracker
+        .admit_first(info(&fragment(6, MF, 64, 17, 16)), 0)
+        .is_ok());
+    assert!(tracker.tombstoned(key_of(4), 0));
+    assert!(!tracker.tombstoned(key_of(2), 0));
+    tracker.check_invariants().unwrap();
+}
+
+/// Re-review L2: once a datagram arrives in more than four disjoint pieces
+/// its coverage is no longer tracked, but a fragment outside the ranges
+/// tracked so far is still progress (a heavily reordered datagram does not
+/// look stalled); one inside them is a duplicate.
+#[test]
+fn an_untracked_datagram_still_progresses() {
+    let mut storage = Storage::new(1, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 0);
+    // [0,16) [32,40) [48,56) [64,72), then a fifth piece: untracked.
+    for word in [4, 6, 8, 12] {
+        progress(&mut tracker, 1, word, 10);
+    }
+    // A gap below the largest end: progress at 150.
+    progress(&mut tracker, 1, 3, 150);
+    // A duplicate of a tracked range: no progress.
+    progress(&mut tracker, 1, 4, 300);
+    assert_eq!(
+        tracker.admit_first(info(&fragment(2, MF, 64, 17, 16)), 340),
+        Err(DropReason::Ipv4FragmentTableFull)
+    );
+    assert!(tracker
+        .admit_first(info(&fragment(2, MF, 64, 17, 16)), 350)
+        .is_ok());
+}
+
+/// Re-review L3: a later fragment refused for its TTL still counts toward
+/// a refused datagram's coverage, so the refusing entry completes early;
+/// an allowing or pending entry is left alone.
+#[test]
+fn an_expired_ttl_fragment_completes_a_refused_datagram() {
+    let mut storage = Storage::new(4, 2, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage.borrow(), key()).unwrap();
+    let ticket = tracker
+        .admit_first(info(&fragment(1, MF, 64, 17, 16)), 0)
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
+    allow(&mut tracker, 2, 0);
+    let last = |id| info(&fragment(id, 2, 1, 17, 5));
+    tracker.ttl_expired(last(2), 0);
+    assert_eq!(tracker.entries(), 2, "the allowing entry is left alone");
+    tracker.ttl_expired(last(3), 0);
+    assert_eq!((tracker.entries(), tracker.held()), (2, 0), "nothing held");
+    tracker.ttl_expired(last(1), 0);
+    assert_eq!(tracker.entries(), 1);
+    assert_eq!(tracker.counters().entries_completed, 1);
+    // A contradicting one poisons a refusing entry, as a followed one does.
+    let ticket = tracker
+        .admit_first(info(&fragment(4, MF, 64, 17, 24)), 0)
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
+    tracker.ttl_expired(info(&fragment(4, 1, 1, 17, 8)), 0);
+    assert_eq!(tracker.counters().poisoned, 1);
+    tracker.check_invariants().unwrap();
+}

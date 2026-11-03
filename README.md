@@ -369,7 +369,7 @@ protocol, ID）に記録し、同じdatagramの後続fragmentは同じ書き換�
 keyはportを含まないのでIDの再利用や二hostへの同じIDの応答を混ぜない）、RFC 791の構造違反は`IPV4_FRAGMENT_MALFORMED`、table/held/host上限は
 `IPV4_FRAGMENT_TABLE_FULL`、`HOST_LIMIT`、`HOLD_FULL`、`HOST_HOLD_LIMIT`、`HOLD_TOO_LARGE`です
 （host単位は(ingress, source)。一つのingressはtableの`ingress-share-percent`（50）まで（超過は`IPV4_FRAGMENT_INGRESS_LIMIT`）。
-上限では古いpending/deny、無ければtimeoutの1/5 progress（dataを増やしたfragment）の無いallowをO(1)でevict（admission全体が成り立つ時だけ。evictしたallowとpoisonedのkeyはtimeoutまで拒否）。held slotもingressのshareで分ける。interfaceがn個ならshareは100/n以下で等分（floor(entries × share / 100) × (n − 1) ≥ entriesなら`FRAGMENT_INGRESS_SHARE_OVERCOMMITTED`警告。default 50でinterface三つ以上なら出るのは想定どおり）。一datagramのholdは16まで（`IPV4_FRAGMENT_DATAGRAM_HOLD_LIMIT`）。
+上限では古いpending/deny、無ければtimeoutの1/5 progress（dataを増やしたfragment）の無いallowをO(1)でevict（admission全体が成り立つ時だけ。evictした、一度allowしたentryのkeyはtimeoutまで拒否）。held slotもingressのshareで分ける。interfaceがn個ならshareは100/n以下で等分（entryかheld slotでfloor(数 × share / 100) × (n − 1) ≥ 数なら`FRAGMENT_INGRESS_SHARE_OVERCOMMITTED`警告。default 50でinterface三つ以上なら出るのは想定どおり）。一datagramのholdは16まで（`IPV4_FRAGMENT_DATAGRAM_HOLD_LIMIT`）。
 完了は0から終端までの全byteを重複なしに数え、終端と矛盾するfragmentは`IPV4_FRAGMENT_MALFORMED`でpoison）。
 routerのlocal address宛てのfragmentは対象外（reassembly未実装）。apply（SIGHUP reload）で全associationを
 破棄します。fragmentでないframeのfast pathはflags wordの一回の読みだけです。

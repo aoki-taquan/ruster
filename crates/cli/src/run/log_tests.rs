@@ -378,7 +378,7 @@ const SAMPLES: &[(&str, &str, &str)] = &[
         "warn",
     ),
     (
-        "ruster run: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED share-percent=50 interfaces=3 entries=256",
+        "ruster run: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED share-percent=50 interfaces=3 entries=256 held=64",
         "FRAGMENT_SHARE_OVERCOMMITTED",
         "warn",
     ),
