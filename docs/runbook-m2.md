@@ -60,7 +60,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  54.45 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  58.22 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -209,7 +209,7 @@ whole-document storage, which has no path.
 |---|---|---|---|
 | quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 592, and 592 bytes), so the bound is memory: at 65536 these three alone would need 115.0 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.45 MiB (63.95 MiB with `mappings-per-host` set on both NAT44 protocols, N3, and 60.20 MiB with only `sessions-per-host`, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 58.22 MiB (with `[fragmentation] datagrams = 1024`, MTU2 part B; 64.00 MiB with `mappings-per-host` set on both NAT44 protocols and only 12 fragmentation slots, N3, and 63.97 MiB with only `sessions-per-host`, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -310,7 +310,8 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-57098432 bytes (54.45 MiB). MTU1 grew the ICMPv4 error action slot from 584
+61042880 bytes (58.22 MiB). MTU2 part B added 1024 fragmentation slots
+of 12 + 3840 bytes (3.76 MiB; 57098432 bytes, 54.45 MiB, before). MTU1 grew the ICMPv4 error action slot from 584
 to 592 bytes (the Next-Hop MTU of Fragmentation Needed, 32 KiB at the limit;
 57065664 bytes, 54.42 MiB, before). N1 grew the TCP NAT mapping slot from 64 to 80
 bytes (established-session count and expiry, 1 MiB at the limit; 56017088
@@ -326,7 +327,7 @@ raised states, actions, dynamic neighbors, and ICMPv4 error states to
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (54.45 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (58.22 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -645,11 +646,11 @@ A forwarded datagram longer than the egress MTU is dropped:
   least twice the number of interfaces (plus one with delayed Port
   Unreachable), or validation fails with
   `ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`.
-- DF clear: `IPV4_FRAGMENTATION_REQUIRED`, no error. The router does not
-  fragment yet (a deviation of RFC 1812 4.2.2.7, NAT44-019L; MTU2 part B).
-  Since MTU2 part A this also concerns traffic through the NAT, which now
-  translates whole DF-clear datagrams (see "DF-clear datagrams through the
-  NAT" below); the NAT commits no mapping or state for such a drop.
+- DF clear: fragmented (RFC 1812 4.2.2.7, RFC 791 3.2; since MTU2 part B,
+  see "Fragmentation" below), also through the NAT, which translates whole
+  DF-clear datagrams (see "DF-clear datagrams through the NAT" below).
+  With `[fragmentation] enabled = false`: `IPV4_FRAGMENTATION_REQUIRED`, no
+  error, and the NAT commits no mapping or state for such a drop.
 - The firewall decides first: a datagram it refuses is dropped with the
   firewall's reason and never answered, so the error reveals nothing about
   traffic the policy does not admit. To an admitted peer the error does
@@ -714,8 +715,9 @@ VPNs) without DF; before MTU2 the NAT dropped all of it as
   Translating fragments (RFC 4787 REQ-14) is the later NAT-FRAG slice
   (NAT44-018). A sender whose datagrams are larger than the path MTU should
   use PMTUD (DF) or a smaller MTU.
-- A DF-clear datagram larger than the egress MTU is still
-  `drop.IPV4_FRAGMENTATION_REQUIRED` until fragmentation (MTU2 part B).
+- A DF-clear datagram larger than the egress MTU is fragmented after the
+  translation (MTU2 part B, below); every fragment carries the generated
+  ID.
 
 Upgrade note (MTU2 part A, behaviour change): traffic that was dropped as
 `*_NON_ATOMIC_IPV4_UNSUPPORTED` now passes the NAT and the firewall's rules
@@ -723,6 +725,117 @@ like any other datagram, creating mappings and firewall state. Review the
 firewall rules if you relied on that drop. Expect those counters to fall to
 the rate of real fragments, and new mappings for the hosts concerned. No
 config key changes; nothing to migrate.
+
+### Fragmentation (MTU2 part B)
+
+A forwarded datagram without DF that is longer than the MTU of the
+interface it leaves is cut into fragments (RFC 791 3.2, RFC 1812 4.2.2.7
+MUST): plain routing, NAT44 outbound and inbound (toward a smaller LAN
+MTU), hairpin, and translated ICMP errors. The router never fragments its
+own datagrams (Echo Replies, ICMP errors fit the MTU) or a datagram with
+DF (that gets Fragmentation Needed, above).
+
+- Order: every decision comes first (TTL, firewall, NAT plan), then the
+  fragmentation bound and slot are checked, and only then does anything
+  commit. A refused datagram is dropped whole, byte-unchanged, without an
+  error, and takes no NAT mapping, firewall state, or IPv4 ID. The
+  datagram is then rewritten as usual (MACs, TTL, NAT translation and
+  generated ID), copied into a fragmentation slot, and the received frame
+  goes back to the backend (`consume.IPV4_FRAGMENTED`).
+- Right after the RX batch of the same tick the router sends each slot as
+  fragments on its egress, through the same backend-owned generated-frame
+  path as ICMP errors (`generated_fragments.*`, the frames show as
+  `origin=generated`). It first asks the backend for room for the whole
+  set; without room it sends nothing (`fragmentation.dropped_unavailable`):
+  the router never sends a partial fragment set for lack of TX room. The
+  NAT and firewall state of such a datagram stays committed, as for a
+  forwarded frame the backend refuses.
+- Layout: every fragment but the last carries the largest multiple of 8
+  data bytes that fits the MTU after the 20-byte header (1376 at 1400, 1256
+  at 1280, 552 at 576), the last carries the rest. All carry the same ID,
+  DF clear, MF on all but the last (the last keeps the datagram's own MF),
+  and the offset of their data; the header checksum is computed for each.
+  Bytes after the IPv4 Total Length (link padding) are not sent.
+- Received fragments are refused by the firewall before any decision
+  (`drop.FIREWALL_FRAGMENT_UNSUPPORTED`), so the router does not
+  re-fragment fragments in production; IPv4 options are refused as before
+  (`IPV4_OPTIONS_UNSUPPORTED`).
+- Cost: the fast path is unchanged (one compare against the MTU). A
+  fragmented datagram is copied twice (into its slot, then into its
+  fragments) and needs as many generated frames as fragments; on AF_XDP
+  they come from the `generated-frames` pool and the TX ring of the egress
+  port, shared with ARP and ICMP errors. Size `generated-frames` for a full
+  RX batch of fragmented datagrams if that is your traffic (a 1500-byte
+  datagram over a 1280 or 1400 link needs 2 frames, over 576 3).
+
+```toml
+[fragmentation]
+enabled = true                      # default; false = hardening (RFC 1812 MUST off)
+max-fragments-per-datagram = 1365   # default 1365, 2..=1365
+datagrams = 64                      # default 64, 1..=1024; slots per tick
+```
+
+- `enabled = false` turns fragmentation off: DF-clear datagrams above the
+  egress MTU are `drop.IPV4_FRAGMENTATION_REQUIRED` as in MTU1, and no slot
+  storage is allocated. Senders without PMTUD (most UDP from Windows, many
+  VPN and game clients) then lose every datagram above the path MTU.
+- `max-fragments-per-datagram` bounds the fragments of one datagram
+  (`drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS` above it). The default
+  1365 is the most any IPv4 datagram can need (65535 bytes at the minimum
+  MTU 68), so by default every datagram RFC 1812 requires the router to
+  fragment is fragmented. Real links need far fewer: 1500 → 1280 or 1400
+  needs 2, 1500 → 576 3, 9000 → 1500 7. Lower it to bound the packet
+  amplification of an unusually small egress MTU.
+- `datagrams` is the number of datagrams one tick can fragment
+  (`drop.IPV4_FRAGMENTATION_QUEUE_FULL` beyond). Keep it at least `[tick]
+  rx` if most of your traffic needs fragmentation (a PPPoE or tunnel WAN
+  link below 1500 with senders that do not use PMTUD). Each slot holds the
+  longest datagram the router can receive: the larger of the largest
+  interface `mtu` and 3826 bytes (the most a 4096-byte AF_XDP frame
+  carries). The interface `mtu` is not enforced on received frames (a
+  device above it only warns `MTU_BELOW_DEVICE`), so a 1500-byte datagram
+  arriving on a device configured at 1280 is still fragmented, never
+  dropped for its size. 64 × (12 + 14 + 3826) = 246528 bytes by default,
+  3.76 MiB at 1024 slots, 9.2 MiB at 1024 slots and a 9000-byte MTU. The
+  storage counts in `storage-bytes` and the production byte limit.
+- Every `[fragmentation]` change is restart-required (`STORAGE_SHAPE`):
+  the policy and slots are part of the storage shape. So is an interface
+  MTU change above 3826 that changes the largest MTU (the slot size),
+  besides `INTERFACES`. A `[backend]` change never changes the slots.
+- IPv4 ID of inbound fragments: the NAT generates the ID of an inbound
+  DF-clear datagram from the inbound sequence of (remote, inside host,
+  protocol) (NAT44-126) and fragments it with that ID. The inbound
+  sequences are shared by every outside sender (4096 counters): an outside
+  sender with enough volume could make another remote's sequence repeat
+  within the inside host's reassembly time (about 2.7e8 datagrams, about
+  9 Mpps over Linux's 30 s), which could make the inside host misassemble
+  two datagrams (RFC 4963). That volume is far above what one worker
+  forwards; UDP and TCP checksums also catch most misassembly. It is a
+  documented residual (NAT44-126 (7)).
+
+Counters (`ruster-run-stats`): `fragmentation.queued` (staged),
+`fragmentation.fragmented` (every fragment committed), `fragmentation.fragments`,
+`fragmentation.dropped_unavailable` (no TX room for the set),
+`fragmentation.dropped_frame_too_large` (the backend refused the fragment
+length), `fragmentation.incomplete` (a backend fault after the room check
+cut a set short), `fragmentation.flushed` (the tick's fragment phase did
+not run after a backend failure), and `generated_fragments.*` (sessions,
+allocations, TX accepted/rejected).
+
+Upgrade note (MTU2 part B, behaviour change): fragmentation is on by
+default, also for configs without `[fragmentation]`. DF-clear datagrams
+above an egress MTU, so far `drop.IPV4_FRAGMENTATION_REQUIRED`, are now
+fragmented and create NAT mappings and firewall state like any forwarded
+datagram; expect that counter to fall to 0 and `consume.IPV4_FRAGMENTED`
+and `generated_fragments.*` to grow. The default slots add 246528 bytes of
+runtime storage (`storage-bytes`; the maximal production config with
+`datagrams = 1024` is 61042880 bytes). New drop codes: 186
+`IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS`, 187
+`IPV4_FRAGMENTATION_QUEUE_FULL`, 188
+`IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE`, 189
+`IPV4_FRAGMENTATION_OFFSET_OVERFLOW`; new consume code `IPV4_FRAGMENTED`;
+new stats sections `fragmentation.*` and `generated_fragments.*`. To keep
+the MTU1 behaviour set `[fragmentation] enabled = false` (restart).
 
 ### Startup retry (XDP-045)
 
@@ -1984,8 +2097,10 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     (`STORAGE_SHAPE`), changing one nonzero limit to another reloadable
     (`ruster plan` shows `nat44-tcp sessions-per-host ~ 32 -> 64`; the apply
     flushes the NAT state). At the production maximum (every table at
-    65536 slots) `sessions-per-host` alone fits the 64 MiB bound (63127744
-    bytes) and both mapping limits fit (67059904 bytes), but all four
+    65536 slots, with the 1024 fragmentation slots of MTU2 part B)
+    `sessions-per-host` alone fits the 64 MiB bound (67072192 bytes), both
+    mapping limits fit only with at most 12 fragmentation slots (67106128
+    bytes at 12; the default 64 slots exceed the bound), and all four
     per-host limits together do not: validation fails closed with
     `RUNTIME_STORAGE_BYTES_EXCEEDED`; lower a capacity (for example
     `capacity.sessions = 32768`) instead.
@@ -2170,6 +2285,16 @@ What it proves, on the runner's kernel only:
   to host B; host B sees all three from 203.0.113.2 with valid checksums,
   the DF-clear ones still without DF and with consecutive generated IDs,
   the DF one with the ID host A sent; no fragment drop is counted.
+  Added by MTU2 part B (`priv_run_frag*`): with the WAN link (rb, pb, and
+  the wan `mtu`) at 1400, a DF-clear 1500-byte UDP datagram from host A
+  arrives at host B's pb as exactly the RFC 791 pair of fragments from
+  203.0.113.2 (1376 + 104 data bytes, one generated ID) and is reassembled
+  by host B's kernel with the payload as sent; with `[fragmentation]
+  enabled = false` it does not arrive (`drop.IPV4_FRAGMENTATION_REQUIRED`);
+  with the LAN `mtu` at 1280,
+  host B's DF-clear 1400-byte answer arrives at host A as two fragments
+  (1256 + 124) and is reassembled; the final counters show the fragmented
+  datagrams and no drop, no flush, no TX rejection.
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one
@@ -2381,7 +2506,13 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `drop.IPV4_FRAME_EXCEEDS_MTU` | — | frames carry bytes after the IPv4 datagram beyond the egress MTU | find the sender appending trailers; the datagrams themselves fit |
 | `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
 | `drop.IPV4_FRAGMENTATION_NEEDED` growing | — | DF datagrams above an egress MTU; senders get Fragmentation Needed | normal for PMTUD; persistent growth from one sender means it ignores the error (check `icmpv4_errors.rate_limited`, firewalls in front of the sender) |
-| `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU (fragmentation is not implemented) | raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
+| `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU with `[fragmentation] enabled = false` | turn fragmentation on (the default), raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
+| `drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS` | — | a DF-clear datagram would need more fragments than `max-fragments-per-datagram` | raise the bound (default 1365), or raise the egress MTU |
+| `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | — | more DF-clear datagrams above an egress MTU in one tick than `[fragmentation] datagrams` | raise `datagrams` to at least `[tick] rx` (restart) |
+| `drop.IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE` | — | a DF-clear datagram longer than a fragmentation slot (the larger of the largest interface `mtu` and 3826); no AF_XDP port delivers one, so only the simulator can | none on AF_XDP; in a scenario, keep injected datagrams within the slot |
+| `drop.IPV4_FRAGMENTATION_OFFSET_OVERFLOW` | — | a fragment whose offset plus data run past 65535 bytes (malformed, ping-of-death shape) | nothing to fix on the router; find the sender (the firewall normally refuses fragments first) |
+| `fragmentation.dropped_unavailable` growing | — | no generated-frame or TX room on the egress for a whole fragment set | raise `generated-frames` (AF_XDP) or the TX ring; check `tx_ring_full` and completion lag |
+| `fragmentation.incomplete` / `fragmentation.flushed` growing | — | backend faults during the fragment phase (an allocation failed after the room check, or a finish error) | check the backend stats and health lines of that tick; these are backend faults, not configuration |
 | `drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED` / `drop.NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED` growing | — | IPv4 fragments (MF or an offset) through the NAT; whole DF-clear datagrams are translated since MTU2 (section 5, "DF-clear datagrams through the NAT") | find the sender that fragments (a datagram above its link MTU); have it use PMTUD (DF) or a smaller MTU. Fragment translation is not implemented (NAT44-018) |
 | DF-clear datagram has a different IPv4 ID after the router | — | the NAT generates the ID of every translated DF-clear datagram (RFC 6864 5.3.1, NAT44-126) | expected; match captures by addresses, ports and payload |
 | `health=LINK_PROBE` / `LINK_UNVERIFIABLE` | 1 if `LINK_UNVERIFIABLE` | rtnetlink/procfs queries failing (3 in a row is fatal) | check the namespace |
