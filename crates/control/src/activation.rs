@@ -171,16 +171,18 @@ use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot,
     FirewallReconcileError, FirewallReconcileReport, FirewallRuntime, FirewallStateSlot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Ipv4FragmentSlot, Ipv4FragmentationRuntime,
-    Ipv4FragmentationStorageError, Nat44HostCounter, Nat44HostLink, Nat44HostSlot,
-    Nat44HostStorage, Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport,
-    Nat44IcmpRuntime, Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
-    Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
-    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime,
-    Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionPublicationError, ResolutionPublicationReport,
-    ResolutionRuntime, ResolutionStateSlot,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot,
+    Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTracker, Ipv4FragmentTrackingStorage,
+    Ipv4FragmentTrackingStorageError, Ipv4FragmentationRuntime, Ipv4FragmentationStorageError,
+    Nat44HostCounter, Nat44HostLink, Nat44HostSlot, Nat44HostStorage, Nat44IcmpReconcileError,
+    Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
+    Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError,
+    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot,
+    Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
+    PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
+    ResolutionStateSlot,
 };
 use ruster_core::{
     FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
@@ -242,6 +244,21 @@ pub struct FullServiceStorage {
     firewall_states: Box<[FirewallStateSlot]>,
     /// IPv4 fragmentation slots and their bytes (MTU2 part B), when on.
     fragmentation: Option<FragmentationTables>,
+    /// IPv4 fragment association tables (NAT-FRAG), unless `refuse`.
+    fragment_tracking: Option<FragmentTrackingTables>,
+}
+
+/// Fragment association entries, hosts, their two directories, and the held
+/// fragments with their bytes (NAT-FRAG).
+struct FragmentTrackingTables {
+    entries: Box<[Ipv4FragmentEntrySlot]>,
+    entry_buckets: Box<[DirectoryBucket]>,
+    entry_nodes: Box<[DirectoryNode]>,
+    hosts: Box<[Ipv4FragmentHostSlot]>,
+    host_buckets: Box<[DirectoryBucket]>,
+    host_nodes: Box<[DirectoryNode]>,
+    held: Box<[Ipv4FragmentHeldSlot]>,
+    held_bytes: Box<[u8]>,
 }
 
 /// Fragmentation slot records and their datagram bytes (MTU2 part B).
@@ -318,7 +335,8 @@ impl FullServiceStorage {
     /// Allocation failure is reported per service instead of aborting.
     pub fn new(shape: FullServiceStorageShape) -> Result<Self, StorageAllocationError> {
         use RuntimeService::{
-            Firewall, Fragmentation, Icmpv4Errors, Nat44Icmp, Nat44Tcp, Nat44Udp, Resolution,
+            Firewall, FragmentTracking, Fragmentation, Icmpv4Errors, Nat44Icmp, Nat44Tcp, Nat44Udp,
+            Resolution,
         };
         let resolution = shape.resolution();
         let icmpv4 = shape.icmpv4_errors();
@@ -453,6 +471,50 @@ impl FullServiceStorage {
                     ))
                 })
                 .transpose()?,
+            fragment_tracking: shape
+                .fragment_tracking()
+                .map(|plan| {
+                    let held_bytes = plan.held().checked_mul(plan.held_slot_bytes()).ok_or(
+                        StorageAllocationError {
+                            service: FragmentTracking,
+                        },
+                    )?;
+                    Ok(FragmentTrackingTables {
+                        entries: slots(
+                            plan.entries(),
+                            Ipv4FragmentEntrySlot::EMPTY,
+                            FragmentTracking,
+                        )?,
+                        entry_buckets: slots(
+                            plan.buckets(),
+                            DirectoryBucket::default(),
+                            FragmentTracking,
+                        )?,
+                        entry_nodes: slots(
+                            plan.entries(),
+                            DirectoryNode::default(),
+                            FragmentTracking,
+                        )?,
+                        hosts: slots(
+                            plan.entries(),
+                            Ipv4FragmentHostSlot::EMPTY,
+                            FragmentTracking,
+                        )?,
+                        host_buckets: slots(
+                            plan.buckets(),
+                            DirectoryBucket::default(),
+                            FragmentTracking,
+                        )?,
+                        host_nodes: slots(
+                            plan.entries(),
+                            DirectoryNode::default(),
+                            FragmentTracking,
+                        )?,
+                        held: slots(plan.held(), Ipv4FragmentHeldSlot::EMPTY, FragmentTracking)?,
+                        held_bytes: slots(held_bytes, 0_u8, FragmentTracking)?,
+                    })
+                })
+                .transpose()?,
         })
     }
 
@@ -518,6 +580,8 @@ pub enum ActivationError {
     Nat44Icmp(Nat44IcmpRuntimeConfigError),
     /// The fragmentation slot bytes do not form whole slots of a valid size.
     Fragmentation(Ipv4FragmentationStorageError),
+    /// The fragment association tables do not match their shape (NAT-FRAG).
+    FragmentTracking(Ipv4FragmentTrackingStorageError),
 }
 
 /// Successor change that live activation cannot apply in place.
@@ -666,6 +730,8 @@ struct LiveRuntimes<'storage> {
     firewall: FirewallRuntime<'storage>,
     /// IPv4 fragmentation (MTU2 part B), when on.
     fragmentation: Option<Ipv4FragmentationRuntime<'storage>>,
+    /// IPv4 fragment association (NAT-FRAG), unless `refuse`.
+    fragment_tracking: Option<Ipv4FragmentTracker<'storage>>,
 }
 
 /// All exclusive permits of one successor, held at once.
@@ -841,6 +907,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             icmp,
             firewall_states,
             fragmentation,
+            fragment_tracking,
         } = storage;
         let fragmentation = match (
             fragmentation.as_mut(),
@@ -856,6 +923,34 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             }
         };
         let authority = candidate.authority();
+        // The association table hashes with the publication's secret
+        // resolution key in its own domains (NAT-FRAG).
+        let fragment_tracking = match (
+            fragment_tracking.as_mut(),
+            candidate.storage_shape().fragment_tracking(),
+        ) {
+            (Some(tables), Some(plan)) => Some(
+                Ipv4FragmentTracker::new(
+                    plan.policy(),
+                    Ipv4FragmentTrackingStorage {
+                        entries: &mut tables.entries,
+                        entry_buckets: &mut tables.entry_buckets,
+                        entry_nodes: &mut tables.entry_nodes,
+                        hosts: &mut tables.hosts,
+                        host_buckets: &mut tables.host_buckets,
+                        host_nodes: &mut tables.host_nodes,
+                        held: &mut tables.held,
+                        held_bytes: &mut tables.held_bytes,
+                    },
+                    authority.resolution_hash_key(),
+                )
+                .map_err(ActivationError::FragmentTracking)?,
+            ),
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ActivationError::StorageShapeMismatch);
+            }
+        };
         let nat44_icmp = match (
             icmp.as_mut(),
             authority
@@ -949,6 +1044,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 nat44_icmp,
                 firewall,
                 fragmentation,
+                fragment_tracking,
             },
             generation_floor,
             last_apply: None,
@@ -1007,6 +1103,12 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
     #[must_use]
     pub const fn fragmentation(&self) -> Option<&Ipv4FragmentationRuntime<'storage>> {
         self.runtimes.fragmentation.as_ref()
+    }
+
+    /// The IPv4 fragment association table (NAT-FRAG), unless `refuse`.
+    #[must_use]
+    pub const fn fragment_tracking(&self) -> Option<&Ipv4FragmentTracker<'storage>> {
+        self.runtimes.fragment_tracking.as_ref()
     }
 
     /// Guard-free dry-run of `successor` against this publication.
@@ -1089,6 +1191,14 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
         if let Some(fragmentation) = self.runtimes.fragmentation.as_mut() {
             fragmentation.flush();
         }
+        // NAT-FRAG: entries hold the old publication's egress and neighbor
+        // MACs, so they do not carry over: every association and held
+        // fragment is dropped (counted) and the table is rekeyed with the
+        // successor's resolution key. A datagram in flight across an apply
+        // loses its later fragments (the receiver's reassembly times out).
+        if let Some(tracker) = self.runtimes.fragment_tracking.as_mut() {
+            tracker.flush_with_key(resolution_hash_key);
+        }
         // No permit borrows `successor`, so it can move into place.
         let previous = std::mem::replace(&mut self.candidate, successor);
         *self.generation_floor = Some(report.generation);
@@ -1138,8 +1248,12 @@ impl<'storage, I: PublicationQuiescence> FullServicePublication<'storage, I>
             ),
         )
         .with_nat44_icmp(nat44_icmp);
-        Some(match self.runtimes.fragmentation.as_mut() {
+        let view = match self.runtimes.fragmentation.as_mut() {
             Some(fragmentation) => view.with_fragmentation(fragmentation),
+            None => view,
+        };
+        Some(match self.runtimes.fragment_tracking.as_mut() {
+            Some(tracker) => view.with_fragment_tracking(tracker),
             None => view,
         })
     }

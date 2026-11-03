@@ -214,6 +214,11 @@ pub struct Ipv4FragmentationCounters {
     /// Staged datagrams dropped because the generated phase did not run in
     /// their tick (an earlier backend failure).
     pub flushed: usize,
+    /// Staged frames sent whole, unchanged, as one frame: fragments that
+    /// arrived before their first fragment and were held, released when it
+    /// was allowed (NAT-FRAG). Counted in `queued` too, never in
+    /// `fragmented` or `fragments`.
+    pub whole: usize,
 }
 
 /// What happened to one staged datagram.
@@ -402,8 +407,8 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
         // fragment ends at most 65535 - 20 bytes into it. A received fragment
         // that ends later is malformed and is not cut further (every piece
         // would carry the overlong end; its last offsets might not even fit
-        // 13 bits). Unreachable in production: the firewall refuses every
-        // received fragment first.
+        // 13 bits). Not reached in production: the fragment association
+        // table refuses it first (`IPV4_FRAGMENT_MALFORMED`, NAT-FRAG).
         let end = usize::from(flags_offset & OFFSET_MASK) * 8 + data_len;
         if end > MAX_DATAGRAM_DATA {
             return Err(DropReason::Ipv4FragmentationOffsetOverflow);
@@ -422,6 +427,46 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
         }
         Ok(Ipv4FragmentPlan {
             fragments: u16::try_from(fragments).expect("bounded by max_fragments"),
+            frame_len,
+            mtu,
+        })
+    }
+
+    /// [`Self::plan`] for a held fragment released by the fragment
+    /// association table (NAT-FRAG), already rewritten for its egress: one
+    /// that fits `mtu` is staged whole and sent unchanged as one frame (also
+    /// with `enabled = false`, which only forbids cutting); a longer one is
+    /// fragmented like any datagram when DF is clear, and is
+    /// [`DropReason::Ipv4FragmentationNeeded`] when DF is set (no ICMP
+    /// error: it is not an initial fragment, RFC 1812 §4.3.2.7).
+    pub(crate) fn plan_forward(
+        &self,
+        frame: &[u8],
+        mtu: u16,
+    ) -> Result<Ipv4FragmentPlan, DropReason> {
+        let header = packet::ETHERNET_HEADER_LEN;
+        let total_len =
+            packet::read_u16(frame, header + 2).ok_or(DropReason::Ipv4HeaderTruncated)?;
+        if total_len > mtu {
+            let flags_offset =
+                packet::read_u16(frame, header + 6).ok_or(DropReason::Ipv4HeaderTruncated)?;
+            if flags_offset & FLAG_DONT_FRAGMENT != 0 {
+                return Err(DropReason::Ipv4FragmentationNeeded);
+            }
+            return self.plan(frame, mtu);
+        }
+        let frame_len = header + usize::from(total_len);
+        if frame_len > frame.len() {
+            return Err(DropReason::Ipv4TotalLengthExceedsPacket);
+        }
+        if !self.slots.is_empty() && frame_len > self.slot_bytes {
+            return Err(DropReason::Ipv4FragmentationDatagramTooLarge);
+        }
+        if self.len == self.slots.len() {
+            return Err(DropReason::Ipv4FragmentationQueueFull);
+        }
+        Ok(Ipv4FragmentPlan {
+            fragments: 1,
             frame_len,
             mtu,
         })
@@ -539,17 +584,27 @@ where
     }
     *frame_budget -= fragments;
     let staged = &runtime.bytes[start..start + slot.frame_len as usize];
+    // One "fragment" is a released held fragment that fits its egress MTU
+    // (`plan_forward`): sent whole and unchanged. A cut set always has at
+    // least two fragments (the datagram is longer than the MTU).
+    let whole = slot.fragments == 1;
     let block = fragment_block(slot.mtu);
     let data_len = staged.len() - FRAGMENT_HEADERS_LEN;
-    let largest = FRAGMENT_HEADERS_LEN + block.min(data_len);
+    let largest = if whole {
+        staged.len()
+    } else {
+        FRAGMENT_HEADERS_LEN + block.min(data_len)
+    };
     let mut batch = io.begin_generated(slot.egress);
     let outcome = match batch.check_capacity(usize::from(slot.fragments), largest) {
         Err(error) => Ipv4FragmentOutcome::Refused(error),
+        Ok(()) if whole => send_whole(&mut batch, staged),
         Ok(()) => send_fragments(&mut batch, staged, block, slot.fragments),
     };
     let completion = batch.finish();
     let counters = &mut runtime.counters;
     match outcome {
+        Ipv4FragmentOutcome::Sent if whole => counters.whole += 1,
         Ipv4FragmentOutcome::Sent => {
             counters.fragmented += 1;
             counters.fragments += usize::from(slot.fragments);
@@ -562,7 +617,9 @@ where
         Ipv4FragmentOutcome::AllocationFailed { committed, .. }
         | Ipv4FragmentOutcome::WrongLength { committed } => {
             counters.incomplete += 1;
-            counters.fragments += usize::from(committed);
+            if !whole {
+                counters.fragments += usize::from(committed);
+            }
         }
     }
     Some(GeneratedIpv4FragmentReport {
@@ -571,6 +628,28 @@ where
         outcome,
         completion: Some(completion),
     })
+}
+
+/// Sends a staged frame as it is (a released held fragment within its
+/// egress MTU).
+fn send_whole<B: GeneratedPacketBatch>(batch: &mut B, staged: &[u8]) -> Ipv4FragmentOutcome {
+    let mut lease = match batch.allocate(staged.len()) {
+        Ok(lease) => lease,
+        Err(error) => {
+            return Ipv4FragmentOutcome::AllocationFailed {
+                committed: 0,
+                error,
+            }
+        }
+    };
+    let bytes = lease.bytes_mut();
+    if bytes.len() != staged.len() {
+        lease.cancel();
+        return Ipv4FragmentOutcome::WrongLength { committed: 0 };
+    }
+    bytes.copy_from_slice(staged);
+    lease.commit();
+    Ipv4FragmentOutcome::Sent
 }
 
 fn send_fragments<B: GeneratedPacketBatch>(

@@ -626,11 +626,11 @@ fn the_exact_mtu_is_forwarded_whole_and_one_byte_more_is_fragmented() {
     assert_eq!(fragments[1].len(), 14 + 20 + 5);
 }
 
-/// The production composition always has the stateful firewall, which
-/// refuses every fragment before any decision (FIREWALL_FRAGMENT_UNSUPPORTED),
-/// so a received fragment (also an overlong one) never reaches
-/// fragmentation there; re-fragmentation itself (offsets and MF of a
-/// fragment, RFC 791) is unit-tested in core.
+/// Without the fragment association table (this composition, or `[fragment-
+/// tracking] mode = "refuse"`) the stateful firewall refuses every fragment
+/// before any decision (FIREWALL_FRAGMENT_UNSUPPORTED), so a received
+/// fragment (also an overlong one) never reaches fragmentation; with the
+/// table it does and is re-fragmented (crates/io-sim/tests/nat_frag.rs).
 #[test]
 fn received_fragments_are_refused_by_the_firewall_before_fragmentation() {
     let mut world = World::new(Setup {

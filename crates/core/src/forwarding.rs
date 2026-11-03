@@ -1,4 +1,8 @@
 use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError, FirewallRouteMissPacket};
+use crate::ipv4_fragment_tracking::{
+    parse_fragment, Ipv4FragmentFirstTicket, Ipv4FragmentFollow, Ipv4FragmentInfo,
+    Ipv4FragmentTemplate,
+};
 use crate::ipv4_fragmentation::Ipv4FragmentPlan;
 use crate::nat44::{
     Nat44TcpInboundPlan, Nat44TcpOutboundPlan, Nat44TcpPlanError, Nat44UdpInboundPlan,
@@ -11,11 +15,12 @@ use crate::{
     FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
     FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
     FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
-    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4FragmentationRuntime,
-    LocalIpv4Binding, MonotonicMillis, Nat44IcmpConfig, Nat44IcmpDisposition, Nat44IcmpRuntime,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig,
-    Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
-    ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4FragmentTracker,
+    Ipv4FragmentationRuntime, LocalIpv4Binding, MonotonicMillis, Nat44IcmpConfig,
+    Nat44IcmpDisposition, Nat44IcmpRuntime, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime,
+    Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route, ARP_ETHERTYPE,
+    IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
 use lookup::{linear, ForwardingIndex};
@@ -336,9 +341,50 @@ pub enum DropReason {
     /// Offset, ends past the largest IPv4 datagram (RFC 791: 65535 bytes,
     /// so `offset * 8 + data > 65515`): malformed, not cut further. The
     /// whole fragment is discarded before any state commits (MTU2 part B).
-    /// Unreachable in production: the firewall refuses received fragments
-    /// first.
+    /// Not reached in production: the fragment association table (NAT-FRAG)
+    /// refuses such a fragment first (`IPV4_FRAGMENT_MALFORMED`), and without
+    /// the table the firewall refuses every received fragment.
     Ipv4FragmentationOffsetOverflow = 189,
+    /// A later fragment (Fragment Offset not 0) of a datagram whose first
+    /// fragment the router refused (firewall, NAT, or any forwarding drop):
+    /// the fragment association entry refuses the rest of the datagram
+    /// (NAT-FRAG).
+    Ipv4FragmentFirstDenied = 190,
+    /// A first fragment (MF set, offset 0) for a datagram whose first
+    /// fragment was already decided: a second transport header could differ
+    /// from the one the decision was made on (RFC 1858 §4 overlap), so it
+    /// is refused (NAT-FRAG).
+    Ipv4FragmentDuplicateFirst = 191,
+    /// A later fragment that starts inside its first fragment's transport
+    /// header (or, before the first fragment is seen, inside the smallest
+    /// header of its protocol: 20 bytes for TCP, RFC 1858 §3.2's offset 1
+    /// rule) could rewrite the ports or TCP flags the decision was made on
+    /// (RFC 1858, RFC 3128). Refused (NAT-FRAG).
+    Ipv4FragmentTransportHeaderOverlap = 192,
+    /// A fragment that breaks RFC 791's structure: no data, a fragment
+    /// with MF set whose data is not a multiple of 8 bytes, or data ending
+    /// past the largest datagram (65515 data bytes). Refused (NAT-FRAG).
+    Ipv4FragmentMalformed = 193,
+    /// No free fragment association entry (`[fragment-tracking] entries`)
+    /// for a new datagram, after expiring the oldest. A first fragment is
+    /// refused before its decision, so no NAT or firewall state commits
+    /// (NAT-FRAG).
+    Ipv4FragmentTableFull = 194,
+    /// The datagram's source already has `[fragment-tracking]
+    /// entries-per-host` association entries (NAT-FRAG).
+    Ipv4FragmentHostLimit = 195,
+    /// A later fragment arrived before its first fragment and no held slot
+    /// is free (`[fragment-tracking] held-fragments`, none without
+    /// fragmentation), after expiring the oldest entry (NAT-FRAG).
+    Ipv4FragmentHoldFull = 196,
+    /// A later fragment arrived before its first fragment and its source
+    /// already has `[fragment-tracking] held-per-host` held fragments
+    /// (NAT-FRAG).
+    Ipv4FragmentHostHoldLimit = 197,
+    /// A later fragment arrived before its first fragment and is longer
+    /// than a held slot (sized like a fragmentation slot, so only a
+    /// simulated frame can be) (NAT-FRAG).
+    Ipv4FragmentHoldTooLarge = 198,
 }
 
 use DropReason::*;
@@ -346,7 +392,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 189] = [
+    pub const ALL: [Self; 198] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -536,6 +582,15 @@ impl DropReason {
         Ipv4FragmentationQueueFull,
         Ipv4FragmentationDatagramTooLarge,
         Ipv4FragmentationOffsetOverflow,
+        Ipv4FragmentFirstDenied,
+        Ipv4FragmentDuplicateFirst,
+        Ipv4FragmentTransportHeaderOverlap,
+        Ipv4FragmentMalformed,
+        Ipv4FragmentTableFull,
+        Ipv4FragmentHostLimit,
+        Ipv4FragmentHoldFull,
+        Ipv4FragmentHostHoldLimit,
+        Ipv4FragmentHoldTooLarge,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -742,6 +797,15 @@ impl DropReason {
             Ipv4FragmentationQueueFull => "IPV4_FRAGMENTATION_QUEUE_FULL",
             Ipv4FragmentationDatagramTooLarge => "IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE",
             Ipv4FragmentationOffsetOverflow => "IPV4_FRAGMENTATION_OFFSET_OVERFLOW",
+            Ipv4FragmentFirstDenied => "IPV4_FRAGMENT_FIRST_DENIED",
+            Ipv4FragmentDuplicateFirst => "IPV4_FRAGMENT_DUPLICATE_FIRST",
+            Ipv4FragmentTransportHeaderOverlap => "IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP",
+            Ipv4FragmentMalformed => "IPV4_FRAGMENT_MALFORMED",
+            Ipv4FragmentTableFull => "IPV4_FRAGMENT_TABLE_FULL",
+            Ipv4FragmentHostLimit => "IPV4_FRAGMENT_HOST_LIMIT",
+            Ipv4FragmentHoldFull => "IPV4_FRAGMENT_HOLD_FULL",
+            Ipv4FragmentHostHoldLimit => "IPV4_FRAGMENT_HOST_HOLD_LIMIT",
+            Ipv4FragmentHoldTooLarge => "IPV4_FRAGMENT_HOLD_TOO_LARGE",
         }
     }
 }
@@ -1601,6 +1665,13 @@ pub enum TraceEvent {
         fragments: u16,
         reason: ConsumeReason,
     },
+    /// A later fragment that arrived before its first fragment was held in
+    /// the fragment association table; the received frame was consumed as
+    /// `reason` ([`ConsumeReason::Ipv4FragmentHeld`], NAT-FRAG).
+    Ipv4FragmentHeld {
+        ingress: IfId,
+        reason: ConsumeReason,
+    },
     BatchCompleted {
         tx_accepted: usize,
         tx_rejected: usize,
@@ -1797,8 +1868,21 @@ enum PacketDecision {
     Nat44Icmp(Nat44IcmpRewriteDecision),
     ArpReply(ArpReplyDecision),
     Icmpv4EchoReply(Icmpv4EchoReplyDecision),
+    /// A later fragment that follows its first fragment's forwarding
+    /// (NAT-FRAG).
+    FragmentFollow(FragmentFollowDecision),
     ConsumeArp(ControlDisposition),
     ConsumeIpv4Local,
+    /// A later fragment held until its first fragment decides (NAT-FRAG).
+    ConsumeFragmentHeld,
+}
+
+/// A later fragment rewritten with its first fragment's template.
+#[derive(Clone, Copy)]
+struct FragmentFollowDecision {
+    entry: u32,
+    template: Ipv4FragmentTemplate,
+    info: Ipv4FragmentInfo,
 }
 
 #[derive(Clone, Copy)]
@@ -1820,7 +1904,8 @@ impl PacketDecision {
             Self::Nat44Icmp(decision) => decision.forwarding.egress,
             Self::ArpReply(decision) => decision.egress,
             Self::Icmpv4EchoReply(decision) => decision.egress,
-            Self::ConsumeArp(_) | Self::ConsumeIpv4Local => {
+            Self::FragmentFollow(decision) => decision.template.egress,
+            Self::ConsumeArp(_) | Self::ConsumeIpv4Local | Self::ConsumeFragmentHeld => {
                 unreachable!("consumed controls have no egress")
             }
         }
@@ -2629,8 +2714,111 @@ where
     )
 }
 
+/// [`forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation`]
+/// with IPv4 fragment association (NAT-FRAG, RFC 4787 REQ-14): with
+/// `fragment_tracking` bound, a first fragment (MF set, offset 0) is decided
+/// by the firewall and the NAT on its transport header like a whole
+/// datagram, and every later fragment of its datagram follows that decision
+/// (the same translation and generated IPv4 ID, or the same refusal); a later
+/// fragment that arrives first is held until its first fragment decides.
+/// See [`Ipv4FragmentTracker`]. Without it, fragments keep their typed
+/// drops (`FIREWALL_FRAGMENT_UNSUPPORTED` first).
+///
+/// The [`forward_batch`] fresh-batch precondition applies.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking<
+    B,
+    T,
+>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: &mut ResolutionRuntime<'_>,
+    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
+    udp_config: &Nat44UdpConfig,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    tcp_config: &Nat44TcpConfig,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    icmp: Option<(&Nat44IcmpConfig, Option<&mut Nat44IcmpRuntime<'_>>)>,
+    firewall_config: &FirewallConfig<'_>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
+    audit: Option<&mut FirewallAuditBuffer<'_>>,
+    fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
+    fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    let (icmp_config, nat44_icmp) = match icmp {
+        Some((config, runtime)) => (Some(config), runtime),
+        None => (None, None),
+    };
+    forward_batch_tracked(
+        batch,
+        snapshot,
+        Some((resolution, now)),
+        Some((icmpv4_errors, now)),
+        Some(udp_config),
+        nat44_udp,
+        Some(tcp_config),
+        nat44_tcp,
+        icmp_config,
+        nat44_icmp,
+        Some(firewall_config),
+        firewall,
+        audit,
+        fragmentation,
+        fragment_tracking,
+        trace,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_batch_inner<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    resolution: Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+    nat44_icmp: Option<&mut Nat44IcmpRuntime<'_>>,
+    firewall_config: Option<&FirewallConfig<'_>>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
+    firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
+    fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_tracked(
+        batch,
+        snapshot,
+        resolution,
+        icmpv4_errors,
+        nat44_udp_config,
+        nat44_udp,
+        nat44_tcp_config,
+        nat44_tcp,
+        nat44_icmp_config,
+        nat44_icmp,
+        firewall_config,
+        firewall,
+        firewall_audit,
+        fragmentation,
+        None,
+        trace,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_batch_tracked<B, T>(
     mut batch: B,
     snapshot: &ForwardingSnapshot<'_>,
     mut resolution: Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
@@ -2645,6 +2833,7 @@ fn forward_batch_inner<B, T>(
     mut firewall: Option<&mut FirewallRuntime<'_>>,
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
     mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
+    mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -2660,125 +2849,185 @@ where
         let ingress = packet.ingress();
         let nat_now_ms = resolution.as_ref().map_or(0, |(_, now)| now.0);
         let mut firewall_plan = None;
+        // NAT-FRAG: a first fragment admitted by the association table
+        // before its decision, and the rewrite it left with.
+        let mut first_fragment: Option<Ipv4FragmentFirstTicket> = None;
+        let mut first_template: Option<Ipv4FragmentTemplate> = None;
         let result = {
             let frame = packet.bytes_mut();
-            decide(
-                &*frame,
-                snapshot,
-                ingress,
-                &mut resolution,
-                &mut icmpv4_errors,
-                nat44_udp_config,
-                &mut nat44_udp,
-                nat44_tcp_config,
-                &mut nat44_tcp,
-                nat44_icmp_config,
-                &mut nat44_icmp,
-                firewall_config,
-                &mut firewall,
-                &mut firewall_audit,
-                &mut firewall_plan,
-                trace,
-            )
-            .and_then(|decision| {
-                // Every NAT commit is checked before the packet is
-                // rewritten, so a plan the runtime would refuse (stale or
-                // corrupt reuse lists or indexes) is a counted drop, never
-                // a worker panic.
-                if let PacketDecision::Nat44Udp(nat) = decision {
-                    let runtime = nat44_udp
-                        .as_deref()
-                        .ok_or(DropReason::Nat44UdpRuntimeUnavailable)?;
-                    match nat.transition {
-                        Nat44UdpTransition::Outbound(plan) => runtime
-                            .prevalidate_outbound_commit(plan, nat_now_ms)
-                            .map_err(|_| DropReason::Nat44UdpConfigMismatch)?,
-                        Nat44UdpTransition::Inbound(plan) | Nat44UdpTransition::Hairpin(plan) => {
-                            runtime
-                                .prevalidate_inbound_commit(plan, nat_now_ms)
-                                .map_err(|_| DropReason::Nat44UdpConfigMismatch)?;
-                        }
-                    }
-                }
-                if let PacketDecision::Nat44Tcp(nat) = decision {
-                    let runtime = nat44_tcp
-                        .as_deref()
-                        .ok_or(DropReason::Nat44TcpRuntimeUnavailable)?;
-                    match nat.transition {
-                        Nat44TcpTransition::Outbound(plan) => runtime
-                            .prevalidate_outbound_commit(plan, nat_now_ms)
-                            .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
-                        Nat44TcpTransition::Inbound(plan) | Nat44TcpTransition::Hairpin(plan) => {
-                            runtime
-                                .prevalidate_inbound_commit(plan, nat_now_ms)
-                                .map_err(|_| DropReason::Nat44TcpConfigMismatch)?;
-                        }
-                    }
-                }
-                if let PacketDecision::Nat44Icmp(nat) = decision {
-                    let runtime = nat44_icmp
-                        .as_deref()
-                        .ok_or(DropReason::Nat44IcmpRuntimeUnavailable)?;
-                    match nat.transition {
-                        Nat44IcmpTransition::Outbound(plan) => runtime
-                            .prevalidate_outbound_commit(plan, nat_now_ms)
-                            .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
-                        Nat44IcmpTransition::Inbound(plan) => runtime
-                            .prevalidate_inbound_commit(plan, nat_now_ms)
-                            .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
-                    }
-                }
-                if matches!(
-                    decision,
-                    PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local
-                ) {
-                    Ok((decision, None))
-                } else {
-                    // After every plan is known to commit and before the
-                    // frame is rewritten, so the error quotes the datagram
-                    // as received and no NAT or firewall state is created
-                    // for a datagram that is not sent. A DF-clear datagram
-                    // that is fragmented is admitted here too (bound and
-                    // slot checked), so a refused one commits nothing.
-                    let fragment = check_egress_mtu(
+            // One read of the flags word for a frame that is not a fragment.
+            let fragment = match fragment_tracking.as_deref_mut() {
+                Some(tracker) if is_ipv4_fragment(frame) => tracked_fragment(
+                    &*frame,
+                    snapshot,
+                    ingress,
+                    nat44_udp_config,
+                    nat44_tcp_config,
+                    nat44_icmp_config,
+                )
+                .map(|(ipv4, info)| (tracker, ipv4, info)),
+                _ => None,
+            };
+            let decided = match fragment {
+                Some((tracker, ipv4, info)) if !info.is_first() => decide_later_fragment(
+                    &*frame, snapshot, ingress, ipv4, info, tracker, nat_now_ms,
+                ),
+                Some((tracker, ipv4, info)) => admit_first_fragment(
+                    &*frame, snapshot, ingress, ipv4, info, tracker, nat_now_ms,
+                )
+                .and_then(|ticket| {
+                    first_fragment = Some(ticket);
+                    decide(
                         &*frame,
                         snapshot,
                         ingress,
-                        decision,
+                        true,
                         &mut resolution,
                         &mut icmpv4_errors,
-                        fragmentation.as_deref(),
-                        trace,
-                    )?;
-                    apply_decision(frame, decision)?;
-                    // Only for a datagram the core commits for TX: a plan,
-                    // MTU, or firewall drop consumes no ID (a later backend
-                    // TX rejection does not return it). A fragmented
-                    // datagram takes its ID here, so every fragment carries
-                    // the generated ID.
-                    rewrite_translated_non_atomic_id(
-                        frame,
-                        decision,
+                        nat44_udp_config,
                         &mut nat44_udp,
+                        nat44_tcp_config,
                         &mut nat44_tcp,
+                        nat44_icmp_config,
                         &mut nat44_icmp,
-                    )?;
-                    // The last fallible step is above: staging cannot fail
-                    // for a plan admitted by check_egress_mtu.
-                    if let Some(plan) = fragment {
-                        fragmentation
-                            .as_deref_mut()
-                            .expect("an admitted fragment plan has a runtime")
-                            .stage(frame, plan, decision.egress());
+                        firewall_config,
+                        &mut firewall,
+                        &mut firewall_audit,
+                        &mut firewall_plan,
+                        trace,
+                    )
+                }),
+                None => decide(
+                    &*frame,
+                    snapshot,
+                    ingress,
+                    false,
+                    &mut resolution,
+                    &mut icmpv4_errors,
+                    nat44_udp_config,
+                    &mut nat44_udp,
+                    nat44_tcp_config,
+                    &mut nat44_tcp,
+                    nat44_icmp_config,
+                    &mut nat44_icmp,
+                    firewall_config,
+                    &mut firewall,
+                    &mut firewall_audit,
+                    &mut firewall_plan,
+                    trace,
+                ),
+            };
+            decided
+                .and_then(|decision| {
+                    // Every NAT commit is checked before the packet is
+                    // rewritten, so a plan the runtime would refuse (stale or
+                    // corrupt reuse lists or indexes) is a counted drop, never
+                    // a worker panic.
+                    if let PacketDecision::Nat44Udp(nat) = decision {
+                        let runtime = nat44_udp
+                            .as_deref()
+                            .ok_or(DropReason::Nat44UdpRuntimeUnavailable)?;
+                        match nat.transition {
+                            Nat44UdpTransition::Outbound(plan) => runtime
+                                .prevalidate_outbound_commit(plan, nat_now_ms)
+                                .map_err(|_| DropReason::Nat44UdpConfigMismatch)?,
+                            Nat44UdpTransition::Inbound(plan)
+                            | Nat44UdpTransition::Hairpin(plan) => {
+                                runtime
+                                    .prevalidate_inbound_commit(plan, nat_now_ms)
+                                    .map_err(|_| DropReason::Nat44UdpConfigMismatch)?;
+                            }
+                        }
                     }
-                    Ok((decision, fragment.map(Ipv4FragmentPlan::fragments)))
-                }
-            })
-            .map(|(decision, fragments)| PlannedPacket {
-                decision,
-                firewall: firewall_plan,
-                fragments,
-            })
+                    if let PacketDecision::Nat44Tcp(nat) = decision {
+                        let runtime = nat44_tcp
+                            .as_deref()
+                            .ok_or(DropReason::Nat44TcpRuntimeUnavailable)?;
+                        match nat.transition {
+                            Nat44TcpTransition::Outbound(plan) => runtime
+                                .prevalidate_outbound_commit(plan, nat_now_ms)
+                                .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
+                            Nat44TcpTransition::Inbound(plan)
+                            | Nat44TcpTransition::Hairpin(plan) => {
+                                runtime
+                                    .prevalidate_inbound_commit(plan, nat_now_ms)
+                                    .map_err(|_| DropReason::Nat44TcpConfigMismatch)?;
+                            }
+                        }
+                    }
+                    if let PacketDecision::Nat44Icmp(nat) = decision {
+                        let runtime = nat44_icmp
+                            .as_deref()
+                            .ok_or(DropReason::Nat44IcmpRuntimeUnavailable)?;
+                        match nat.transition {
+                            Nat44IcmpTransition::Outbound(plan) => runtime
+                                .prevalidate_outbound_commit(plan, nat_now_ms)
+                                .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
+                            Nat44IcmpTransition::Inbound(plan) => runtime
+                                .prevalidate_inbound_commit(plan, nat_now_ms)
+                                .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
+                        }
+                    }
+                    if matches!(
+                        decision,
+                        PacketDecision::ConsumeArp(_)
+                            | PacketDecision::ConsumeIpv4Local
+                            | PacketDecision::ConsumeFragmentHeld
+                    ) {
+                        Ok((decision, None))
+                    } else {
+                        // After every plan is known to commit and before the
+                        // frame is rewritten, so the error quotes the datagram
+                        // as received and no NAT or firewall state is created
+                        // for a datagram that is not sent. A DF-clear datagram
+                        // that is fragmented is admitted here too (bound and
+                        // slot checked), so a refused one commits nothing.
+                        let fragment = check_egress_mtu(
+                            &*frame,
+                            snapshot,
+                            ingress,
+                            decision,
+                            &mut resolution,
+                            &mut icmpv4_errors,
+                            fragmentation.as_deref(),
+                            trace,
+                        )?;
+                        apply_decision(frame, decision)?;
+                        // Only for a datagram the core commits for TX: a plan,
+                        // MTU, or firewall drop consumes no ID (a later backend
+                        // TX rejection does not return it). A fragmented
+                        // datagram takes its ID here, so every fragment carries
+                        // the generated ID.
+                        rewrite_translated_non_atomic_id(
+                            frame,
+                            decision,
+                            &mut nat44_udp,
+                            &mut nat44_tcp,
+                            &mut nat44_icmp,
+                        )?;
+                        // NAT-FRAG: the first fragment as it leaves (addresses,
+                        // MACs, and the ID generated above) is what every later
+                        // fragment of its datagram gets.
+                        if first_fragment.is_some() {
+                            first_template =
+                                Ipv4FragmentTemplate::capture(frame, decision.egress());
+                        }
+                        // The last fallible step is above: staging cannot fail
+                        // for a plan admitted by check_egress_mtu.
+                        if let Some(plan) = fragment {
+                            fragmentation
+                                .as_deref_mut()
+                                .expect("an admitted fragment plan has a runtime")
+                                .stage(frame, plan, decision.egress());
+                        }
+                        Ok((decision, fragment.map(Ipv4FragmentPlan::fragments)))
+                    }
+                })
+                .map(|(decision, fragments)| PlannedPacket {
+                    decision,
+                    firewall: firewall_plan,
+                    fragments,
+                })
         };
         match result {
             Ok(PlannedPacket {
@@ -2794,9 +3043,25 @@ where
                 });
             }
             Ok(PlannedPacket {
+                decision: PacketDecision::ConsumeFragmentHeld,
+                ..
+            }) => {
+                packet.consume(ConsumeReason::Ipv4FragmentHeld);
+                consumed += 1;
+                trace.record(TraceEvent::Ipv4FragmentHeld {
+                    ingress,
+                    reason: ConsumeReason::Ipv4FragmentHeld,
+                });
+            }
+            Ok(PlannedPacket {
                 decision: PacketDecision::ConsumeIpv4Local,
                 ..
             }) => {
+                if let Some(ticket) = first_fragment {
+                    if let Some(tracker) = fragment_tracking.as_deref_mut() {
+                        tracker.commit_deny(ticket, nat_now_ms);
+                    }
+                }
                 packet.consume(ConsumeReason::Ipv4LocalUnsupported);
                 consumed += 1;
                 trace.record(TraceEvent::Ipv4LocalConsumed {
@@ -2882,6 +3147,25 @@ where
                         .commit(plan)
                         .expect("sequential packet path keeps firewall plan authority stable");
                 }
+                if let Some(tracker) = fragment_tracking.as_deref_mut() {
+                    if let Some(ticket) = first_fragment {
+                        // After the first fragment's own staging, so its
+                        // pieces go first; the held fragments follow.
+                        match first_template {
+                            Some(template) => tracker.commit_allow(
+                                ticket,
+                                template,
+                                snapshot,
+                                fragmentation.as_deref_mut(),
+                                nat_now_ms,
+                            ),
+                            None => tracker.commit_deny(ticket, nat_now_ms),
+                        }
+                    }
+                    if let PacketDecision::FragmentFollow(follow) = decision {
+                        tracker.followed(follow.entry, follow.info);
+                    }
+                }
                 if let Some(fragments) = planned.fragments {
                     // The datagram lives on in its fragmentation slot; the
                     // received frame goes back to the backend.
@@ -2913,6 +3197,11 @@ where
                 trace.record(TraceEvent::TxRequested { egress });
             }
             Err(reason) => {
+                if let Some(ticket) = first_fragment {
+                    if let Some(tracker) = fragment_tracking.as_deref_mut() {
+                        tracker.commit_deny(ticket, nat_now_ms);
+                    }
+                }
                 packet.recycle(reason);
                 dropped += 1;
                 trace.record(TraceEvent::Dropped { ingress, reason });
@@ -2990,6 +3279,7 @@ fn check_egress_mtu<T: TraceSink>(
         PacketDecision::ArpReply(_)
             | PacketDecision::ConsumeArp(_)
             | PacketDecision::ConsumeIpv4Local
+            | PacketDecision::ConsumeFragmentHeld
     ) {
         return Ok(None);
     }
@@ -3069,11 +3359,110 @@ fn exceeds_egress_mtu<T: TraceSink>(
     Err(Ipv4FragmentationNeeded)
 }
 
+/// Whether `frame` is an IPv4 fragment (MF set or a Fragment Offset): the
+/// one read the fast path pays for fragment association (NAT-FRAG).
+#[inline]
+fn is_ipv4_fragment(frame: &[u8]) -> bool {
+    matches!(
+        frame.get(12..packet::ETHERNET_HEADER_LEN + 8),
+        Some([0x08, 0x00, _, _, _, _, _, _, flags, offset])
+            if u16::from_be_bytes([*flags, *offset]) & 0x3fff != 0
+    )
+}
+
+/// A valid IPv4 fragment the association table handles (NAT-FRAG): every
+/// fragment the router forwards or translates. A fragment for one of the
+/// router's own addresses on its ingress that is not a NAT public address
+/// keeps the local path (no reassembly, ICMP4-006). `None` also for an
+/// invalid IPv4 header, which the normal decision refuses.
+#[cold]
+#[inline(never)]
+fn tracked_fragment(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+) -> Option<(packet::ValidatedIpv4, Ipv4FragmentInfo)> {
+    let ipv4 = validate_ipv4_frame(frame).ok()?;
+    let public = nat44_udp_config.is_some_and(|config| config.public_address() == ipv4.destination)
+        || nat44_tcp_config.is_some_and(|config| config.public_address() == ipv4.destination)
+        || nat44_icmp_config.is_some_and(|config| config.public_address() == ipv4.destination);
+    if !public && snapshot.is_local_ipv4_on(ingress, ipv4.destination) {
+        return None;
+    }
+    parse_fragment(frame, ipv4, ingress).map(|info| (ipv4, info))
+}
+
+/// Admits a first fragment before its decision (NAT-FRAG): the same L2 and
+/// IPv4 ingress checks as the decision (so a frame the decision would refuse
+/// for them leaves no entry), RFC 791 structure, and room in the table.
+#[cold]
+#[inline(never)]
+fn admit_first_fragment(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    info: Ipv4FragmentInfo,
+    tracker: &mut Ipv4FragmentTracker<'_>,
+    now_ms: u64,
+) -> Result<Ipv4FragmentFirstTicket, DropReason> {
+    validate_ethernet_ingress(frame, snapshot, ingress, IPV4_ETHERTYPE)?;
+    validate_ipv4_ingress(snapshot, ipv4)?;
+    info.check_structure()?;
+    tracker.admit_first(info, now_ms)
+}
+
+/// Decides a later fragment (Fragment Offset not 0, NAT-FRAG) without a
+/// transport header: the L2 and IPv4 ingress checks, no options, RFC 791
+/// structure, no overlap with the transport header (RFC 1858, RFC 3128),
+/// then its first fragment's decision through the association table:
+/// forwarded with the first fragment's rewrite, refused, or held until the
+/// first fragment arrives. A TTL that expires drops it without an ICMP
+/// error (RFC 1812 §4.3.2.7: none about a non-initial fragment).
+#[cold]
+#[inline(never)]
+fn decide_later_fragment(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    info: Ipv4FragmentInfo,
+    tracker: &mut Ipv4FragmentTracker<'_>,
+    now_ms: u64,
+) -> Result<PacketDecision, DropReason> {
+    validate_ethernet_ingress(frame, snapshot, ingress, IPV4_ETHERTYPE)?;
+    validate_ipv4_ingress(snapshot, ipv4)?;
+    if ipv4.header_len != 20 {
+        return Err(Ipv4OptionsUnsupported);
+    }
+    info.check_structure()?;
+    info.check_static_overlap()?;
+    let frame_len = ipv4.header_offset + ipv4.total_len;
+    match tracker.follow(info, frame, frame_len, now_ms)? {
+        Ipv4FragmentFollow::Allow { entry, template } => {
+            if ipv4.ttl <= 1 {
+                return Err(Ipv4TtlExpired);
+            }
+            Ok(PacketDecision::FragmentFollow(FragmentFollowDecision {
+                entry,
+                template,
+                info,
+            }))
+        }
+        Ipv4FragmentFollow::Deny => Err(Ipv4FragmentFirstDenied),
+        Ipv4FragmentFollow::Held => Ok(PacketDecision::ConsumeFragmentHeld),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
+    first_fragment: bool,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
@@ -3095,6 +3484,7 @@ fn decide<T: TraceSink>(
             frame,
             snapshot,
             ingress,
+            first_fragment,
             resolution,
             icmpv4_errors,
             nat44_udp_config,
@@ -3237,6 +3627,7 @@ fn decide_ipv4<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
+    first_fragment: bool,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
@@ -3251,7 +3642,10 @@ fn decide_ipv4<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let ipv4 = validate_ipv4_frame(frame)?;
+    let mut ipv4 = validate_ipv4_frame(frame)?;
+    // Only the fragment association table admits a first fragment
+    // (NAT-FRAG); the validators then check its transport header only.
+    ipv4.first_fragment = first_fragment;
     trace.record(TraceEvent::Ipv4Validated {
         ingress,
         destination: ipv4.destination,
@@ -5053,7 +5447,11 @@ fn validate_firewall_transport(
     }
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(FirewallFragmentUnsupported)?;
-    if !matches!(flags_fragment & 0x7fff, 0 | 0x4000) {
+    // A whole datagram, or a first fragment the fragment association table
+    // admitted (NAT-FRAG: its decision covers the later fragments). Any
+    // other fragment never reaches a decision with the table bound, and is
+    // refused without it (the `refuse` mode).
+    if !matches!(flags_fragment & 0x7fff, 0 | 0x4000) && !first_fragment(ipv4, flags_fragment) {
         return Err(FirewallFragmentUnsupported);
     }
     let protocol = FirewallProtocol::from_ipv4(ipv4.protocol).ok_or(FirewallUnsupportedProtocol)?;
@@ -5096,7 +5494,12 @@ fn validate_firewall_transport(
             if udp.destination_port == 0 {
                 return Err(FirewallUdpDestinationPortZero);
             }
-            if udp.checksum != 0 && !udp_checksum_valid(frame, ipv4, udp.offset) {
+            // The checksum of a first fragment covers data still to come:
+            // the receiver checks it after reassembly.
+            if udp.checksum != 0
+                && !ipv4.first_fragment
+                && !udp_checksum_valid(frame, ipv4, udp.offset)
+            {
                 return Err(FirewallUdpChecksumInvalid);
             }
             ValidatedFirewallTransport {
@@ -5763,22 +6166,32 @@ struct ValidatedNat44Tcp {
     flags: u8,
 }
 
-/// NAT44 translates whole datagrams only (MTU2, NAT44-008): MF clear and
-/// offset 0. DF and the reserved flag are ignored and preserved; a DF-clear
-/// datagram gets a new ID after translation
-/// ([`rewrite_translated_non_atomic_id`]). A fragment is refused as
-/// [`DropReason::Nat44TcpNonAtomicIpv4Unsupported`]: fragment translation
-/// (RFC 4787 REQ-14) is the deferred NAT-FRAG slice.
+/// NAT44 translates whole datagrams (MTU2, NAT44-008: MF clear and offset
+/// 0; DF and the reserved flag are ignored and preserved; a DF-clear
+/// datagram gets a new ID after translation,
+/// [`rewrite_translated_non_atomic_id`]) and first fragments the fragment
+/// association table admitted (NAT-FRAG, RFC 4787 REQ-14), whose later
+/// fragments follow their translation. Any other fragment is refused as
+/// [`DropReason::Nat44TcpNonAtomicIpv4Unsupported`].
 fn validate_nat44_tcp_unfragmented(
     frame: &[u8],
     ipv4: packet::ValidatedIpv4,
 ) -> Result<(), DropReason> {
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    if flags_fragment & 0x3fff != 0 {
+    if flags_fragment & 0x3fff != 0 && !first_fragment(ipv4, flags_fragment) {
         return Err(Nat44TcpNonAtomicIpv4Unsupported);
     }
     Ok(())
+}
+
+/// Whether `ipv4` is a first fragment (MF set, offset 0, reserved flag
+/// clear; DF may be set) that the fragment association table admitted
+/// (NAT-FRAG). The NAT and the firewall decide on it like a whole datagram,
+/// checking its transport header but not the transport checksum or the UDP
+/// length, which cover the whole datagram.
+fn first_fragment(ipv4: packet::ValidatedIpv4, flags_fragment: u16) -> bool {
+    ipv4.first_fragment && flags_fragment & 0xbfff == 0x2000
 }
 
 fn validate_nat44_tcp(
@@ -5809,7 +6222,9 @@ fn validate_nat44_tcp(
         return Err(Nat44TcpDataOffsetExceedsIpv4Payload);
     }
     let segment = frame.get(offset..ipv4_end).ok_or(Nat44TcpHeaderTruncated)?;
-    if !tcp_checksum_valid(ipv4.source, ipv4.destination, segment) {
+    // A first fragment holds the whole header (checked above, RFC 1858's
+    // tiny fragment) but not the whole segment its checksum covers.
+    if !ipv4.first_fragment && !tcp_checksum_valid(ipv4.source, ipv4.destination, segment) {
         return Err(Nat44TcpChecksumInvalid);
     }
     Ok(ValidatedNat44Tcp {
@@ -5942,7 +6357,7 @@ fn validate_nat44_unfragmented(
 ) -> Result<(), DropReason> {
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    if flags_fragment & 0x3fff != 0 {
+    if flags_fragment & 0x3fff != 0 && !first_fragment(ipv4, flags_fragment) {
         return Err(Nat44UdpNonAtomicIpv4Unsupported);
     }
     Ok(())
@@ -5969,7 +6384,13 @@ fn validate_nat44_udp(
         return Err(Nat44UdpLengthTooSmall);
     }
     let payload_len = ipv4.total_len - ipv4.header_len;
-    if length > payload_len {
+    if ipv4.first_fragment {
+        // The UDP length covers the whole datagram, of which a first
+        // fragment carries only a part: it must be longer than this part.
+        if length <= payload_len {
+            return Err(Nat44UdpLengthTooSmall);
+        }
+    } else if length > payload_len {
         return Err(Nat44UdpLengthExceedsIpv4Payload);
     }
     Ok(ValidatedNat44Udp {
@@ -6841,9 +7262,11 @@ fn rewrite_translated_non_atomic_id(
     }
     let header = packet::ETHERNET_HEADER_LEN;
     let flags_fragment = packet::read_u16(frame, header + 6).ok_or(Ipv4HeaderTruncated)?;
-    // DF set: atomic. MF or an offset never reaches a NAT decision; such a
-    // fragment would keep its ID so that its datagram still reassembles.
-    if flags_fragment & 0x7fff != 0 {
+    // Atomic (RFC 6864 §4.1: DF set, MF clear, offset 0): the ID is kept.
+    // Every other datagram is non-atomic: a whole DF-clear datagram, or a
+    // first fragment the association table admitted (NAT-FRAG), whose
+    // generated ID the table gives every later fragment of the datagram.
+    if flags_fragment & 0x7fff == 0x4000 {
         return Ok(());
     }
     // The NAT translates only IHL=5 datagrams (options are refused before
@@ -6896,7 +7319,10 @@ fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), Drop
         PacketDecision::Nat44Icmp(nat) => apply_nat44_icmp_rewrite(frame, nat),
         PacketDecision::ArpReply(arp) => apply_arp_reply(frame, arp),
         PacketDecision::Icmpv4EchoReply(icmp) => apply_icmpv4_echo_reply(frame, icmp),
-        PacketDecision::ConsumeArp(_) | PacketDecision::ConsumeIpv4Local => {
+        PacketDecision::FragmentFollow(follow) => follow.template.apply(frame),
+        PacketDecision::ConsumeArp(_)
+        | PacketDecision::ConsumeIpv4Local
+        | PacketDecision::ConsumeFragmentHeld => {
             unreachable!("consume decisions are never rewritten")
         }
     }
@@ -7605,6 +8031,7 @@ mod tests {
                 &frame,
                 &snapshot,
                 WAN,
+                false,
                 &mut resolution,
                 &mut None,
                 None,
@@ -7913,6 +8340,7 @@ mod tests {
             &frag_needed_frame(),
             &snapshot,
             WAN,
+            false,
             &mut resolution,
             &mut generated_errors,
             Some(&config),
@@ -8133,6 +8561,15 @@ mod tests {
             (187, "IPV4_FRAGMENTATION_QUEUE_FULL"),
             (188, "IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE"),
             (189, "IPV4_FRAGMENTATION_OFFSET_OVERFLOW"),
+            (190, "IPV4_FRAGMENT_FIRST_DENIED"),
+            (191, "IPV4_FRAGMENT_DUPLICATE_FIRST"),
+            (192, "IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP"),
+            (193, "IPV4_FRAGMENT_MALFORMED"),
+            (194, "IPV4_FRAGMENT_TABLE_FULL"),
+            (195, "IPV4_FRAGMENT_HOST_LIMIT"),
+            (196, "IPV4_FRAGMENT_HOLD_FULL"),
+            (197, "IPV4_FRAGMENT_HOST_HOLD_LIMIT"),
+            (198, "IPV4_FRAGMENT_HOLD_TOO_LARGE"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -8142,7 +8579,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(190), None);
+        assert_eq!(DropReason::from_code(199), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

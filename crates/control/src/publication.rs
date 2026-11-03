@@ -2,12 +2,12 @@ use std::num::NonZeroU64;
 
 use ruster_core::{
     ArpPolicy, FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy, FirewallRule,
-    ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4FragmentationPolicy,
-    Ipv4OriginPolicy, LocalIpv4Binding, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey,
-    Nat44IcmpPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy,
-    Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor,
-    ResolutionHashKey, ResolutionPolicy, Route, ValidatedFirewallOwner, ValidatedForwardingOwner,
-    ValidatedForwardingOwnerError,
+    ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address,
+    Ipv4FragmentTrackingPolicy, Ipv4FragmentationPolicy, Ipv4OriginPolicy, LocalIpv4Binding,
+    Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey, Nat44IcmpPolicy, Nat44TcpConfig,
+    Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpConfigError,
+    Nat44UdpHashKey, Nat44UdpPolicy, Neighbor, ResolutionHashKey, ResolutionPolicy, Route,
+    ValidatedFirewallOwner, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -338,6 +338,65 @@ pub struct FullServiceStorageShape {
     /// part of the shape, so any `[fragmentation]` change is restart-required
     /// (`STORAGE_SHAPE`).
     fragmentation: Option<FragmentationStoragePlan>,
+    /// `None` without fragment association (`[fragment-tracking] mode =
+    /// "refuse"`); the policy is part of the shape (restart-required).
+    fragment_tracking: Option<FragmentTrackingStoragePlan>,
+}
+
+/// IPv4 fragment association (NAT-FRAG): its policy, `entries` entry and
+/// host slots with `buckets` buckets per directory, and `held` held
+/// fragments of `held_slot_bytes` bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentTrackingStoragePlan {
+    policy: Ipv4FragmentTrackingPolicy,
+    entries: u32,
+    buckets: u32,
+    held: u32,
+    held_slot_bytes: u32,
+}
+
+impl FragmentTrackingStoragePlan {
+    #[must_use]
+    pub const fn new(
+        policy: Ipv4FragmentTrackingPolicy,
+        entries: u32,
+        buckets: u32,
+        held: u32,
+        held_slot_bytes: u32,
+    ) -> Self {
+        Self {
+            policy,
+            entries,
+            buckets,
+            held,
+            held_slot_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn policy(self) -> Ipv4FragmentTrackingPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn entries(self) -> u32 {
+        self.entries
+    }
+
+    #[must_use]
+    pub const fn buckets(self) -> u32 {
+        self.buckets
+    }
+
+    #[must_use]
+    pub const fn held(self) -> u32 {
+        self.held
+    }
+
+    #[must_use]
+    pub const fn held_slot_bytes(self) -> u32 {
+        self.held_slot_bytes
+    }
 }
 
 /// IPv4 fragmentation (MTU2 part B): its policy (enabled) and `datagrams`
@@ -392,7 +451,22 @@ impl FullServiceStorageShape {
             nat44_icmp: None,
             firewall_state_slots,
             fragmentation: None,
+            fragment_tracking: None,
         }
+    }
+
+    /// This shape with IPv4 fragment association (NAT-FRAG). Without it
+    /// every received fragment is refused (`FIREWALL_FRAGMENT_UNSUPPORTED`
+    /// first).
+    #[must_use]
+    pub const fn with_fragment_tracking(mut self, plan: FragmentTrackingStoragePlan) -> Self {
+        self.fragment_tracking = Some(plan);
+        self
+    }
+
+    #[must_use]
+    pub const fn fragment_tracking(self) -> Option<FragmentTrackingStoragePlan> {
+        self.fragment_tracking
     }
 
     /// This shape with IPv4 fragmentation (MTU2 part B). Without it a
@@ -708,6 +782,8 @@ pub enum RuntimeService {
     Nat44Icmp,
     /// The optional IPv4 fragmentation slots (MTU2 part B).
     Fragmentation,
+    /// The optional IPv4 fragment association table (NAT-FRAG).
+    FragmentTracking,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

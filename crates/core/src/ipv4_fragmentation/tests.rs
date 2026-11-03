@@ -597,6 +597,7 @@ fn a_refused_set_sends_nothing_and_counts_the_reason() {
             dropped_budget: 0,
             incomplete: 0,
             flushed: 0,
+            whole: 0,
         }
     );
     assert_eq!(runtime.pending(), 0);

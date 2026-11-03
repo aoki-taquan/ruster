@@ -792,6 +792,29 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
             ),
             RestartRequired::StorageShape,
         ),
+        // NAT-FRAG: the association policy and tables are part of the
+        // storage shape too.
+        (
+            (
+                "[resolution.policy]",
+                "[fragment-tracking]\nmode = \"refuse\"\n\n[resolution.policy]",
+            ),
+            RestartRequired::StorageShape,
+        ),
+        (
+            (
+                "[resolution.policy]",
+                "[fragment-tracking]\ntimeout-ms = 2000\n\n[resolution.policy]",
+            ),
+            RestartRequired::StorageShape,
+        ),
+        (
+            (
+                "[resolution.policy]",
+                "[fragment-tracking]\nheld-fragments = 8\n\n[resolution.policy]",
+            ),
+            RestartRequired::StorageShape,
+        ),
     ] {
         let plan = plan(&[edit]);
         only(&plan, &["restart"]);

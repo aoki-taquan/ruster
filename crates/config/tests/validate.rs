@@ -277,6 +277,15 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 datagrams: 64,
                 slot_bytes: 3840,
             }),
+            // `[fragment-tracking]` absent: `associate`, 256 entries (256
+            // buckets per directory) and 64 held fragments sized like a
+            // fragmentation slot (NAT-FRAG).
+            fragment_tracking: Some(ruster_config::FragmentTrackingStorageShapeV1 {
+                entries: 256,
+                buckets: 256,
+                held: 64,
+                held_slot_bytes: 3840,
+            }),
             required_bytes: shape.required_bytes,
         }
     );
@@ -301,7 +310,13 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 2 * port_free_bitmap_words(8) * size_of::<u64>()
         + 7 * size_of::<Nat44TcpSynHoldSlot>()
         + 6 * size_of::<FirewallStateSlot>()
-        + 64 * (size_of::<ruster_core::Ipv4FragmentSlot>() + 3840);
+        + 64 * (size_of::<ruster_core::Ipv4FragmentSlot>() + 3840)
+        // fragment association: entries, hosts, two directories, held
+        + 256
+            * (size_of::<ruster_core::Ipv4FragmentEntrySlot>()
+                + size_of::<ruster_core::Ipv4FragmentHostSlot>())
+        + 2 * 256 * (size_of::<DirectoryBucket>() + size_of::<DirectoryNode>())
+        + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840);
     assert_eq!(shape.required_bytes, expected);
 
     assert!(validated_with(
@@ -1845,6 +1860,7 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
         let without_fragmentation =
             |shape: ruster_config::RuntimeStorageShapeV1| ruster_config::RuntimeStorageShapeV1 {
                 fragmentation: None,
+                fragment_tracking: None,
                 required_bytes: 0,
                 ..shape
             };
@@ -1855,7 +1871,8 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
         assert_eq!(
             i64::try_from(shape.required_bytes).unwrap()
                 - i64::try_from(defaults.storage_shape().required_bytes).unwrap(),
-            64 * (i64::from(slot_bytes) - 3840)
+            // 64 fragmentation slots and 64 held fragments (NAT-FRAG).
+            2 * 64 * (i64::from(slot_bytes) - 3840)
         );
     }
     for mtu in [0, 67, 65_536, u64::from(u32::MAX)] {
@@ -1941,9 +1958,19 @@ fn fragmentation_section_defaults_on_and_fails_closed() {
     assert!(!off.fragmentation().policy().enabled());
     assert_eq!(off.fragmentation().storage(), None);
     assert_eq!(off.storage_shape().fragmentation, None);
+    // Without fragmentation the fragment association table holds nothing
+    // either (NAT-FRAG: held fragments leave through the fragmentation
+    // slots), so its 64 held fragments go too.
+    assert_eq!(
+        off.storage_shape()
+            .fragment_tracking
+            .map(|shape| shape.held),
+        Some(0)
+    );
     assert_eq!(
         absent.storage_shape().required_bytes - off.storage_shape().required_bytes,
         64 * (size_of::<Ipv4FragmentSlot>() + 3840)
+            + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
     );
     // Off ignores the slot count (no storage), but still checks the bound.
     let off_zero = validated(&with("[fragmentation]\nenabled = false\ndatagrams = 0\n"));
@@ -2025,4 +2052,146 @@ fn tick_generated_fragments_defaults_and_fails_closed() {
         (Some(65_536), Some(65_537))
     );
     assert_eq!(dotted(above.path()), "tick.generated-fragments");
+}
+
+/// NAT-FRAG (CONFIG-011): `[fragment-tracking]` absent is `associate` with
+/// the default bounds; `refuse` has no policy and no storage; held
+/// fragments are sized like a fragmentation slot and exist only with
+/// fragmentation on; every bound fails closed with a value-free code at
+/// the field.
+#[test]
+fn fragment_tracking_section_defaults_to_association_and_fails_closed() {
+    use ruster_config::{FragmentTrackingStorageShapeV1, MAX_FRAGMENT_TRACKING_ENTRIES};
+    use ruster_core::{Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError};
+
+    let with = |section: &str| VALID.replacen("[tick]", &format!("{section}\n[tick]"), 1);
+    let absent = validated(VALID);
+    let defaults = Ipv4FragmentTrackingPolicy::new(5_000, 32, 16).unwrap();
+    assert_eq!(absent.fragment_tracking().policy(), Some(defaults));
+    let shape = FragmentTrackingStorageShapeV1 {
+        entries: 256,
+        buckets: 256,
+        held: 64,
+        held_slot_bytes: 3840,
+    };
+    assert_eq!(absent.fragment_tracking().storage(), Some(shape));
+    let empty = validated(&with("[fragment-tracking]\n"));
+    assert_eq!(empty.fragment_tracking(), absent.fragment_tracking());
+    assert_eq!(empty.storage_shape(), absent.storage_shape());
+
+    // The hardening switch: no association, no storage.
+    let refuse = validated(&with("[fragment-tracking]\nmode = \"refuse\"\n"));
+    assert_eq!(refuse.fragment_tracking().policy(), None);
+    assert_eq!(refuse.storage_shape().fragment_tracking, None);
+    let directory = size_of::<DirectoryBucket>() + size_of::<DirectoryNode>();
+    assert_eq!(
+        absent.storage_shape().required_bytes - refuse.storage_shape().required_bytes,
+        256 * (size_of::<ruster_core::Ipv4FragmentEntrySlot>()
+            + size_of::<ruster_core::Ipv4FragmentHostSlot>()
+            + 2 * directory)
+            + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
+    );
+    // `refuse` does not look at the other keys.
+    let refuse_zero = validated(&with(
+        "[fragment-tracking]\nmode = \"refuse\"\nentries = 0\ntimeout-ms = 1\n",
+    ));
+    assert_eq!(refuse_zero.storage_shape(), refuse.storage_shape());
+
+    let tuned = validated(&with(
+        "[fragment-tracking]\nentries = 16384\nentries-per-host = 1\nheld-fragments = 0\nheld-per-host = 0\ntimeout-ms = 100\n",
+    ));
+    assert_eq!(
+        tuned.fragment_tracking().policy(),
+        Some(Ipv4FragmentTrackingPolicy::new(100, 1, 0).unwrap())
+    );
+    assert_eq!(
+        tuned.fragment_tracking().storage(),
+        Some(FragmentTrackingStorageShapeV1 {
+            entries: MAX_FRAGMENT_TRACKING_ENTRIES,
+            buckets: MAX_FRAGMENT_TRACKING_ENTRIES,
+            held: 0,
+            held_slot_bytes: 0,
+        })
+    );
+    // A non-power-of-two count gets the next power of two of buckets.
+    let odd = validated(&with("[fragment-tracking]\nentries = 300\n"));
+    assert_eq!(
+        odd.fragment_tracking().storage().map(|shape| shape.buckets),
+        Some(512)
+    );
+    // Held fragments leave through the fragmentation slots: none without.
+    let no_fragmentation = validated(&with("[fragmentation]\nenabled = false\n"));
+    assert_eq!(
+        no_fragmentation
+            .fragment_tracking()
+            .storage()
+            .map(|shape| (shape.held, shape.held_slot_bytes)),
+        Some((0, 0))
+    );
+
+    for (section, code, field) in [
+        (
+            "timeout-ms = 99",
+            ValidationCode::FragmentTrackingPolicy(
+                Ipv4FragmentTrackingPolicyError::TimeoutOutOfRange,
+            ),
+            "fragment-tracking.timeout-ms",
+        ),
+        (
+            "timeout-ms = 60001",
+            ValidationCode::FragmentTrackingPolicy(
+                Ipv4FragmentTrackingPolicyError::TimeoutOutOfRange,
+            ),
+            "fragment-tracking.timeout-ms",
+        ),
+        (
+            "entries-per-host = 0",
+            ValidationCode::FragmentTrackingPolicy(
+                Ipv4FragmentTrackingPolicyError::EntriesPerHostZero,
+            ),
+            "fragment-tracking.entries-per-host",
+        ),
+        (
+            "entries = 0",
+            ValidationCode::FragmentTrackingEntriesZero,
+            "fragment-tracking.entries",
+        ),
+    ] {
+        let rejected = error(&with(&format!("[fragment-tracking]\n{section}\n")));
+        assert_eq!(rejected.code(), code, "{section}");
+        assert_eq!(dotted(rejected.path()), field, "{section}");
+    }
+    assert_eq!(
+        error(&with("[fragment-tracking]\ntimeout-ms = 1\n"))
+            .code()
+            .code(),
+        "FRAGMENT_TRACKING_POLICY"
+    );
+    assert_eq!(
+        error(&with("[fragment-tracking]\nentries = 0\n"))
+            .code()
+            .code(),
+        "FRAGMENT_TRACKING_ENTRIES_ZERO"
+    );
+    for (section, field, limit, actual) in [
+        ("entries = 16385", "fragment-tracking.entries", 16384, 16385),
+        (
+            "held-fragments = 513",
+            "fragment-tracking.held-fragments",
+            512,
+            513,
+        ),
+    ] {
+        let above = error(&with(&format!("[fragment-tracking]\n{section}\n")));
+        assert_eq!(above.code(), ValidationCode::CapacityLimitExceeded);
+        assert_eq!(above.limit(), Some(limit));
+        assert_eq!(above.actual(), Some(actual));
+        assert_eq!(dotted(above.path()), field);
+    }
+    for unknown in [
+        "[fragment-tracking]\nqueue = 1\n",
+        "[fragment-tracking]\nmode = \"reassemble\"\n",
+    ] {
+        assert!(parse(with(unknown).as_bytes()).is_err(), "{unknown}");
+    }
 }

@@ -7,14 +7,16 @@ use ruster_core::{
     FirewallPortRange, FirewallPortRangeError, FirewallProtocol, FirewallRule, FirewallRuleId,
     FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
     Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    Ipv4FragmentSlot, Ipv4FragmentationPolicy, Ipv4FragmentationPolicyError, Ipv4OriginPolicy,
-    Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering, Nat44HostLink,
-    Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpPolicy, Nat44IcmpPolicyError,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
-    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot,
+    Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError, Ipv4FragmentationPolicy,
+    Ipv4FragmentationPolicyError, Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding,
+    MacAddress, Nat44Filtering, Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError,
+    Nat44IcmpPolicy, Nat44IcmpPolicyError, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpConfigError, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
+    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig, Nat44UdpConfigError,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
+    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
+    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -133,6 +135,11 @@ pub enum ValidationCode {
     FragmentationBackendRoomTooSmall,
     /// `[tick] generated-fragments` is 0 (no fragment could ever be sent).
     TickGeneratedFragmentsZero,
+    /// `[fragment-tracking] timeout-ms` outside 100..=60000 or
+    /// `entries-per-host` 0 (NAT-FRAG).
+    FragmentTrackingPolicy(Ipv4FragmentTrackingPolicyError),
+    /// `[fragment-tracking] entries` is 0 in `associate` mode (NAT-FRAG).
+    FragmentTrackingEntriesZero,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
     Nat44RealmWithoutProtocol,
@@ -294,6 +301,8 @@ impl ValidationCode {
             Self::FragmentationDatagramsZero => "FRAGMENTATION_DATAGRAMS_ZERO",
             Self::FragmentationBackendRoomTooSmall => "FRAGMENTATION_BACKEND_ROOM_TOO_SMALL",
             Self::TickGeneratedFragmentsZero => "TICK_GENERATED_FRAGMENTS_ZERO",
+            Self::FragmentTrackingPolicy(_) => "FRAGMENT_TRACKING_POLICY",
+            Self::FragmentTrackingEntriesZero => "FRAGMENT_TRACKING_ENTRIES_ZERO",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
             Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
@@ -533,6 +542,18 @@ pub struct FragmentationStorageShapeV1 {
     pub slot_bytes: u32,
 }
 
+/// Storage of IPv4 fragment association (NAT-FRAG): `entries` entry and
+/// host slots with two keyed directories of `buckets` buckets and `entries`
+/// nodes each, and `held` held-fragment records of `held_slot_bytes` bytes
+/// (a fragmentation slot's size; 0 held without fragmentation).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FragmentTrackingStorageShapeV1 {
+    pub entries: u32,
+    pub buckets: u32,
+    pub held: u32,
+    pub held_slot_bytes: u32,
+}
+
 /// Complete caller-owned runtime storage requested by one V1 candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeStorageShapeV1 {
@@ -545,6 +566,8 @@ pub struct RuntimeStorageShapeV1 {
     pub firewall_states: Option<u32>,
     /// `None` with `[fragmentation] enabled = false`.
     pub fragmentation: Option<FragmentationStorageShapeV1>,
+    /// `None` with `[fragment-tracking] mode = "refuse"`.
+    pub fragment_tracking: Option<FragmentTrackingStorageShapeV1>,
     pub required_bytes: usize,
 }
 
@@ -576,6 +599,27 @@ impl ValidatedFragmentationV1 {
     /// `None` when fragmentation is off (no slot storage).
     #[must_use]
     pub const fn storage(&self) -> Option<FragmentationStorageShapeV1> {
+        self.storage
+    }
+}
+
+/// Validated `[fragment-tracking]` (defaults when absent, NAT-FRAG).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedFragmentTrackingV1 {
+    policy: Option<Ipv4FragmentTrackingPolicy>,
+    storage: Option<FragmentTrackingStorageShapeV1>,
+}
+
+impl ValidatedFragmentTrackingV1 {
+    /// `None` in `refuse` mode (every fragment refused, no storage).
+    #[must_use]
+    pub const fn policy(&self) -> Option<Ipv4FragmentTrackingPolicy> {
+        self.policy
+    }
+
+    /// `None` in `refuse` mode.
+    #[must_use]
+    pub const fn storage(&self) -> Option<FragmentTrackingStorageShapeV1> {
         self.storage
     }
 }
@@ -1132,6 +1176,7 @@ pub struct ValidatedConfigV1 {
     firewall: Option<ValidatedFirewallV1>,
     tick: TickBudgetsV1,
     fragmentation: ValidatedFragmentationV1,
+    fragment_tracking: ValidatedFragmentTrackingV1,
     storage: RuntimeStorageShapeV1,
     backend: ValidatedBackendV1,
 }
@@ -1202,6 +1247,12 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn fragmentation(&self) -> ValidatedFragmentationV1 {
         self.fragmentation
+    }
+
+    /// `[fragment-tracking]` (NAT-FRAG); defaults (`associate`) when absent.
+    #[must_use]
+    pub const fn fragment_tracking(&self) -> ValidatedFragmentTrackingV1 {
+        self.fragment_tracking
     }
 
     #[must_use]
@@ -2094,6 +2145,11 @@ fn validate_v1(
         None
     };
 
+    let (fragment_tracking_policy, fragment_tracking_storage) = validate_fragment_tracking(
+        config.fragment_tracking.unwrap_or_default(),
+        fragmentation_slots,
+    )?;
+
     let storage = build_storage_shape(
         StorageInputs {
             resolution: resolution_source.map(|source| source.capacity),
@@ -2121,6 +2177,7 @@ fn validate_v1(
             })),
             firewall_states: firewall_capacity,
             fragmentation: fragmentation_slots,
+            fragment_tracking: fragment_tracking_storage,
         },
         limits,
     )?;
@@ -2219,9 +2276,85 @@ fn validate_v1(
             policy: fragmentation_policy,
             storage: fragmentation_slots,
         },
+        fragment_tracking: ValidatedFragmentTrackingV1 {
+            policy: fragment_tracking_policy,
+            storage: fragment_tracking_storage,
+        },
         storage,
         backend,
     })
+}
+
+/// Validates `[fragment-tracking]` (NAT-FRAG). `refuse` has no policy and no
+/// storage. In `associate` mode the held fragments leave through the
+/// fragmentation slots, so they are sized like one and there are none
+/// without fragmentation (`[fragmentation] enabled = false`): every fragment
+/// that arrives before its first fragment is then `IPV4_FRAGMENT_HOLD_FULL`.
+fn validate_fragment_tracking(
+    source: crate::FragmentTrackingV1,
+    fragmentation: Option<FragmentationStorageShapeV1>,
+) -> Result<
+    (
+        Option<Ipv4FragmentTrackingPolicy>,
+        Option<FragmentTrackingStorageShapeV1>,
+    ),
+    ValidationError,
+> {
+    let field = |name: &str| path(&["fragment-tracking", name]);
+    if source.mode == crate::FragmentTrackingModeV1::Refuse {
+        return Ok((None, None));
+    }
+    let policy = Ipv4FragmentTrackingPolicy::new(
+        source.timeout_ms,
+        source.entries_per_host,
+        source.held_per_host,
+    )
+    .map_err(|error| {
+        let name = match error {
+            Ipv4FragmentTrackingPolicyError::EntriesPerHostZero => "entries-per-host",
+            _ => "timeout-ms",
+        };
+        ValidationError::new(ValidationCode::FragmentTrackingPolicy(error), field(name))
+    })?;
+    if source.entries == 0 {
+        return Err(ValidationError::new(
+            ValidationCode::FragmentTrackingEntriesZero,
+            field("entries"),
+        ));
+    }
+    if source.entries > crate::MAX_FRAGMENT_TRACKING_ENTRIES {
+        return Err(ValidationError::bounded(
+            ValidationCode::CapacityLimitExceeded,
+            field("entries"),
+            u64::from(crate::MAX_FRAGMENT_TRACKING_ENTRIES),
+            u64::from(source.entries),
+        ));
+    }
+    if source.held_fragments > crate::MAX_FRAGMENT_TRACKING_HELD {
+        return Err(ValidationError::bounded(
+            ValidationCode::CapacityLimitExceeded,
+            field("held-fragments"),
+            u64::from(crate::MAX_FRAGMENT_TRACKING_HELD),
+            u64::from(source.held_fragments),
+        ));
+    }
+    let (held, held_slot_bytes) = match fragmentation {
+        Some(slots) if source.held_fragments > 0 => (source.held_fragments, slots.slot_bytes),
+        _ => (0, 0),
+    };
+    let buckets = u32::try_from(ruster_core::ipv4_fragment_tracking_buckets(
+        usize::try_from(source.entries).expect("bounded entries fit usize"),
+    ))
+    .expect("bounded entries have a u32 bucket count");
+    Ok((
+        Some(policy),
+        Some(FragmentTrackingStorageShapeV1 {
+            entries: source.entries,
+            buckets,
+            held,
+            held_slot_bytes,
+        }),
+    ))
 }
 
 /// The longest IPv4 datagram an AF_XDP frame can carry: the largest
@@ -2953,6 +3086,7 @@ struct StorageInputs {
     icmp_query: Option<(crate::Nat44IcmpCapacityV1, NatStorageInputs)>,
     firewall_states: Option<u32>,
     fragmentation: Option<FragmentationStorageShapeV1>,
+    fragment_tracking: Option<FragmentTrackingStorageShapeV1>,
 }
 
 fn build_storage_shape(
@@ -3159,6 +3293,24 @@ fn build_storage_shape(
             })?;
         bytes = arena;
     }
+    if let Some(shape) = inputs.fragment_tracking {
+        let entries_path = path(&["fragment-tracking", "entries"]);
+        add_bytes::<Ipv4FragmentEntrySlot>(&mut bytes, shape.entries, entries_path.clone())?;
+        add_bytes::<Ipv4FragmentHostSlot>(&mut bytes, shape.entries, entries_path.clone())?;
+        for _ in 0..2 {
+            add_bytes::<DirectoryBucket>(&mut bytes, shape.buckets, entries_path.clone())?;
+            add_bytes::<DirectoryNode>(&mut bytes, shape.entries, entries_path.clone())?;
+        }
+        let held_path = path(&["fragment-tracking", "held-fragments"]);
+        add_bytes::<Ipv4FragmentHeldSlot>(&mut bytes, shape.held, held_path.clone())?;
+        let arena = usize::try_from(u64::from(shape.held) * u64::from(shape.held_slot_bytes))
+            .ok()
+            .and_then(|arena| bytes.checked_add(arena))
+            .ok_or_else(|| {
+                ValidationError::new(ValidationCode::CapacityArithmeticOverflow, held_path)
+            })?;
+        bytes = arena;
+    }
     if bytes > limits.max_runtime_bytes {
         return Err(ValidationError::bounded(
             ValidationCode::RuntimeStorageBytesExceeded,
@@ -3175,6 +3327,7 @@ fn build_storage_shape(
         nat44_icmp,
         firewall_states: inputs.firewall_states,
         fragmentation: inputs.fragmentation,
+        fragment_tracking: inputs.fragment_tracking,
         required_bytes: bytes,
     })
 }

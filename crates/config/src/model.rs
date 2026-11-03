@@ -33,6 +33,10 @@ pub struct ConfigV1 {
     /// IPv4 fragmentation of forwarded DF-clear datagrams (MTU2 part B);
     /// absent means [`FragmentationV1::default`] (on, RFC 1812 §4.2.2.7).
     pub fragmentation: Option<FragmentationV1>,
+    /// IPv4 fragment association for the NAT and the firewall (NAT-FRAG);
+    /// absent means [`FragmentTrackingV1::default`] (`associate`, RFC 4787
+    /// REQ-14).
+    pub fragment_tracking: Option<FragmentTrackingV1>,
     /// Packet backend; absent means [`BackendKindV1::Sim`].
     pub backend: Option<BackendV1>,
 }
@@ -138,6 +142,106 @@ impl Default for FragmentationV1 {
             enabled: true,
             max_fragments_per_datagram: default_max_fragments_per_datagram(),
             datagrams: DEFAULT_FRAGMENTATION_DATAGRAMS,
+        }
+    }
+}
+
+/// `[fragment-tracking] mode`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FragmentTrackingModeV1 {
+    /// Default (RFC 4787 REQ-14, RFC 1812): the first fragment of a datagram
+    /// gets the firewall and NAT decision on its transport header and every
+    /// later fragment follows it; a later fragment that arrives first is
+    /// held (bounded) until its first fragment decides.
+    #[default]
+    Associate,
+    /// Hardening: every received fragment is refused as before NAT-FRAG
+    /// (`FIREWALL_FRAGMENT_UNSUPPORTED` first), and no association storage
+    /// exists.
+    Refuse,
+}
+
+/// Default `[fragment-tracking] entries`: datagrams in flight at once.
+pub const DEFAULT_FRAGMENT_TRACKING_ENTRIES: u32 = 256;
+/// Largest `[fragment-tracking] entries` (`CAPACITY_LIMIT_EXCEEDED`).
+pub const MAX_FRAGMENT_TRACKING_ENTRIES: u32 = 1 << 14;
+/// Default `[fragment-tracking] entries-per-host`.
+pub const DEFAULT_FRAGMENT_TRACKING_ENTRIES_PER_HOST: u32 = 32;
+/// Default `[fragment-tracking] held-fragments`.
+pub const DEFAULT_FRAGMENT_TRACKING_HELD: u32 = 64;
+/// Largest `[fragment-tracking] held-fragments` (`CAPACITY_LIMIT_EXCEEDED`).
+pub const MAX_FRAGMENT_TRACKING_HELD: u32 = 512;
+/// Default `[fragment-tracking] held-per-host`.
+pub const DEFAULT_FRAGMENT_TRACKING_HELD_PER_HOST: u32 = 16;
+
+const fn default_fragment_tracking_entries() -> u32 {
+    DEFAULT_FRAGMENT_TRACKING_ENTRIES
+}
+
+const fn default_fragment_tracking_entries_per_host() -> u32 {
+    DEFAULT_FRAGMENT_TRACKING_ENTRIES_PER_HOST
+}
+
+const fn default_fragment_tracking_held() -> u32 {
+    DEFAULT_FRAGMENT_TRACKING_HELD
+}
+
+const fn default_fragment_tracking_held_per_host() -> u32 {
+    DEFAULT_FRAGMENT_TRACKING_HELD_PER_HOST
+}
+
+const fn default_fragment_tracking_timeout_ms() -> u32 {
+    ruster_core::IPV4_FRAGMENT_TRACKING_DEFAULT_TIMEOUT_MS
+}
+
+/// `[fragment-tracking]`: IPv4 fragment association for the NAT and the
+/// stateful firewall (NAT-FRAG, RFC 4787 REQ-14).
+///
+/// Every field defaults to the RFC behaviour (`associate`); `refuse` and
+/// smaller bounds are hardening.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FragmentTrackingV1 {
+    #[serde(default)]
+    pub mode: FragmentTrackingModeV1,
+    /// Datagrams associated at once, 1 to [`MAX_FRAGMENT_TRACKING_ENTRIES`];
+    /// a new one beyond is `IPV4_FRAGMENT_TABLE_FULL`. Default
+    /// [`DEFAULT_FRAGMENT_TRACKING_ENTRIES`].
+    #[serde(default = "default_fragment_tracking_entries")]
+    pub entries: u32,
+    /// Datagrams of one source associated at once (at least 1); beyond is
+    /// `IPV4_FRAGMENT_HOST_LIMIT`. Default
+    /// [`DEFAULT_FRAGMENT_TRACKING_ENTRIES_PER_HOST`].
+    #[serde(default = "default_fragment_tracking_entries_per_host")]
+    pub entries_per_host: u32,
+    /// Fragments held because they arrived before their first fragment, 0
+    /// to [`MAX_FRAGMENT_TRACKING_HELD`] (0 refuses them all,
+    /// `IPV4_FRAGMENT_HOLD_FULL`). Needs `[fragmentation]` on (the held
+    /// fragments leave through its slots); none are held without it.
+    /// Default [`DEFAULT_FRAGMENT_TRACKING_HELD`].
+    #[serde(default = "default_fragment_tracking_held")]
+    pub held_fragments: u32,
+    /// Fragments of one source held at once; beyond is
+    /// `IPV4_FRAGMENT_HOST_HOLD_LIMIT`. Default
+    /// [`DEFAULT_FRAGMENT_TRACKING_HELD_PER_HOST`].
+    #[serde(default = "default_fragment_tracking_held_per_host")]
+    pub held_per_host: u32,
+    /// Lifetime of an association from the first fragment seen, 100 to
+    /// 60000 ms. Default 5000.
+    #[serde(default = "default_fragment_tracking_timeout_ms")]
+    pub timeout_ms: u32,
+}
+
+impl Default for FragmentTrackingV1 {
+    fn default() -> Self {
+        Self {
+            mode: FragmentTrackingModeV1::Associate,
+            entries: DEFAULT_FRAGMENT_TRACKING_ENTRIES,
+            entries_per_host: DEFAULT_FRAGMENT_TRACKING_ENTRIES_PER_HOST,
+            held_fragments: DEFAULT_FRAGMENT_TRACKING_HELD,
+            held_per_host: DEFAULT_FRAGMENT_TRACKING_HELD_PER_HOST,
+            timeout_ms: default_fragment_tracking_timeout_ms(),
         }
     }
 }

@@ -20,6 +20,13 @@ pub struct ValidatedIpv4 {
     pub source: crate::Ipv4Address,
     pub destination: crate::Ipv4Address,
     pub checksum: u16,
+    /// The first fragment of a datagram (MF set, offset 0) that the fragment
+    /// association table admitted (NAT-FRAG). Its transport header is
+    /// complete but its transport checksum and UDP length cover the whole
+    /// datagram, so the NAT and firewall validators check the header only.
+    /// [`validate_ipv4_frame`] always sets `false`; only the forwarding
+    /// path sets it.
+    pub first_fragment: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +120,7 @@ pub fn validate_ipv4_frame(frame: &[u8]) -> Result<ValidatedIpv4, DropReason> {
         ]),
         checksum: read_u16(frame, ETHERNET_HEADER_LEN + 10)
             .ok_or(DropReason::Ipv4HeaderTruncated)?,
+        first_fragment: false,
     })
 }
 

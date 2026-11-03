@@ -182,6 +182,13 @@ generated-icmpv4 = 8
 [fragmentation]
 datagrams = 1024
 
+# NAT-FRAG: the most fragment association entries (each an entry and a host
+# slot plus a bucket and a node in each of two directories) and held
+# fragments (each a record and a fragmentation slot's 3840 bytes).
+[fragment-tracking]
+entries = 16384
+held-fragments = 512
+
 [backend]
 kind = "af-xdp"
 
