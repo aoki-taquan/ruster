@@ -2102,3 +2102,51 @@ fn an_expired_ttl_fragment_completes_a_refused_datagram() {
     assert_eq!(tracker.counters().poisoned, 1);
     tracker.check_invariants().unwrap();
 }
+
+/// `record` directly: touching ranges merge at both ends; past four pieces
+/// a piece spanning several ranges merges them, replays are duplicates, a
+/// gap inside an over-approximated range is a duplicate too (the
+/// trade-off), and an untracked entry never completes even when its
+/// ranges look full.
+#[test]
+fn record_merges_touching_ranges_and_over_approximates() {
+    let ranges =
+        |entry: &Ipv4FragmentEntrySlot| entry.ranges[..usize::from(entry.ranges_len)].to_vec();
+    // Touching at both ends: [0,8) and [16,24) joined by [8,16).
+    let mut entry = Ipv4FragmentEntrySlot::EMPTY;
+    assert_eq!(entry.record(0, 8, true), Ok(true));
+    assert_eq!(entry.record(16, 8, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 8], [16, 24]]);
+    assert_eq!(entry.record(8, 8, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 24]]);
+    assert_eq!(entry.record(8, 8, true), Ok(false), "a replay");
+    assert_eq!(entry.record(24, 8, false), Ok(true), "touching the end");
+    assert_eq!(ranges(&entry), [[0, 32]]);
+    assert!(entry.complete());
+
+    // Five pieces: the smallest gap closes (all equal: the first).
+    let mut entry = Ipv4FragmentEntrySlot::EMPTY;
+    for offset in [0, 16, 32, 48] {
+        assert_eq!(entry.record(offset, 8, true), Ok(true));
+    }
+    assert!(!entry.untracked);
+    assert_eq!(entry.record(64, 8, false), Ok(true));
+    assert!(entry.untracked);
+    assert_eq!(ranges(&entry), [[0, 24], [32, 40], [48, 56], [64, 72]]);
+    // A piece spanning several ranges merges them; its replay is a
+    // duplicate.
+    assert_eq!(entry.record(24, 32, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 56], [64, 72]]);
+    assert_eq!(entry.record(24, 32, true), Ok(false));
+    // The ranges now look full, but [8,16) was never seen: no completion.
+    assert_eq!(entry.record(56, 8, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 72]]);
+    assert_eq!(entry.total, 72);
+    assert!(!entry.complete());
+    // The never-seen gap [8,16) lies inside the over-approximated range: a
+    // duplicate, so it does not refresh the stall timer (the trade-off).
+    assert_eq!(entry.record(8, 8, true), Ok(false));
+    assert!(!entry.complete());
+    // The end still holds: data past it is a contradiction.
+    assert_eq!(entry.record(72, 8, true), Err(()));
+}

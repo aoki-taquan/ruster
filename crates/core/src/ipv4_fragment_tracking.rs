@@ -543,7 +543,10 @@ impl Ipv4FragmentEntrySlot {
     /// over-approximate: the two closest ranges are merged, so they still
     /// cover every byte seen, a fragment inside one of them is a duplicate,
     /// and progress is bounded by the datagram's size (a replayed piece
-    /// never counts twice).
+    /// never counts twice). The trade-off: a fragment that fills a gap
+    /// inside a merged range counts as a duplicate too, so it does not
+    /// refresh the stall timer (its datagram already arrived in more pieces
+    /// than the table tracks).
     fn record(&mut self, offset: u32, len: u32, more: bool) -> Result<bool, ()> {
         if self.poisoned {
             return Ok(false);
