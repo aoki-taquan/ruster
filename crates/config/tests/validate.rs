@@ -71,7 +71,7 @@ interval-ms = 100
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 5
+states = 7
 actions = 3
 
 [nat44.realm]
@@ -246,7 +246,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 announce_slots: 2,
             }),
             icmpv4_errors: Some(ruster_config::Icmpv4ErrorStorageShapeV1 {
-                states: 5,
+                states: 7,
                 actions: 3,
             }),
             nat44_udp: Some(ruster_config::Nat44UdpStorageShapeV1 {
@@ -302,7 +302,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 4 * size_of::<DynamicNeighborSlot>()
         + 5 * size_of::<ResolutionFailureHoldSlot>()
         + 2 * size_of::<ruster_core::ArpAnnounceSlot>()
-        + 5 * size_of::<Icmpv4ErrorStateSlot>()
+        + 7 * size_of::<Icmpv4ErrorStateSlot>()
         + 3 * size_of::<Icmpv4ErrorActionSlot>()
         + 3 * size_of::<Nat44UdpMappingSlot>()
         + 5 * size_of::<Nat44UdpPeerSlot>()
@@ -856,6 +856,36 @@ fn icmp_err_switches_map_onto_core_policies() {
     assert!(policy.generates(Icmpv4ErrorKind::TimeExceededTtl));
     assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachablePort));
     assert_eq!(config.storage_shape(), validated(VALID).storage_shape());
+}
+
+/// ICMP-REDIRECT: `redirect` defaults to `true` (RFC 1812 §5.2.7.2, Redirect
+/// for Host), maps onto exactly the core Redirect kind, and does not change
+/// the storage shape.
+#[test]
+fn icmp_redirect_switch_maps_onto_the_core_policy() {
+    use ruster_core::Icmpv4ErrorKind;
+
+    let defaults = validated(VALID).icmpv4_errors().unwrap().policy();
+    assert!(defaults.generates(Icmpv4ErrorKind::RedirectHost));
+    let off = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nredirect = false\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    let config = validated(&off);
+    let policy = config.icmpv4_errors().unwrap().policy();
+    assert!(!policy.generates(Icmpv4ErrorKind::RedirectHost));
+    assert_eq!(
+        policy.with_generation(Icmpv4ErrorKind::RedirectHost, true),
+        defaults
+    );
+    assert_eq!(config.storage_shape(), validated(VALID).storage_shape());
+    let on = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nredirect = true\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    assert_eq!(validated(&on).icmpv4_errors().unwrap().policy(), defaults);
 }
 
 /// B3: the Port Unreachable limiter interval defaults to 1 s, is a policy
@@ -1429,23 +1459,35 @@ fn nat44_unsolicited_syn_switch_and_holds_map_onto_core_and_storage() {
 }
 
 /// While the TCP NAT can send delayed Port Unreachable errors, the ICMPv4
-/// limiter needs one state per interface plus one for the Port Unreachable
-/// class on the outside egress; fewer is refused with a value-free code at
-/// the states path. With the switch off or no holds, any size is accepted.
+/// limiter needs one state per interface for every class it uses (the
+/// shared class, Fragmentation Needed, Redirect) plus one for the Port
+/// Unreachable class on the outside egress; fewer is refused with a
+/// value-free code at the states path, naming the first class without
+/// room. With the switches off or no holds, the bound drops accordingly.
 #[test]
 fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
     const TCP: &str = "icmpv4-errors = \"disabled\"\n";
-    // VALID has two interfaces: two classes each (MTU1: Fragmentation
-    // Needed has its own) plus the Port Unreachable class.
+    // VALID has two interfaces: three classes each (MTU1: Fragmentation
+    // Needed, ICMP-REDIRECT: Redirect have their own) plus the Port
+    // Unreachable class.
     let states = |source: &str, value: u32| {
         source.replacen(
-            "[icmpv4-errors.capacity]\nstates = 5\n",
+            "[icmpv4-errors.capacity]\nstates = 7\n",
             &format!("[icmpv4-errors.capacity]\nstates = {value}\n"),
             1,
         )
     };
-    validated(&states(VALID, 5));
-    let refused = error(&states(VALID, 4));
+    let generate = |source: &str, switches: &str| {
+        source.replacen(
+            "[icmpv4-errors.capacity]",
+            &format!("[icmpv4-errors.generate]\n{switches}\n[icmpv4-errors.capacity]"),
+            1,
+        )
+    };
+    let path = ["icmpv4-errors", "capacity", "states"]
+        .map(|field| ruster_config::PathSegment::Field(field.to_owned()));
+    validated(&states(VALID, 7));
+    let refused = error(&states(VALID, 6));
     assert_eq!(
         refused.code(),
         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
@@ -1454,12 +1496,27 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
         refused.code().code(),
         "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
     );
-    assert_eq!(
-        refused.path().segments(),
-        ["icmpv4-errors", "capacity", "states"]
-            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
-    );
-    assert_eq!((refused.limit(), refused.actual()), (None, None));
+    assert_eq!(refused.path().segments(), path);
+    // Review L2: every states error reports the whole minimum (here 3 x 2
+    // interfaces + 1 for Port Unreachable) and the configured value.
+    assert_eq!((refused.limit(), refused.actual()), (Some(7), Some(6)));
+    // Fewer than three per interface: refused for Redirect.
+    for value in [5, 4] {
+        let refused = error(&states(VALID, value));
+        assert_eq!(
+            refused.code(),
+            ValidationCode::Icmpv4ErrorStatesTooFewForRedirect
+        );
+        assert_eq!(
+            refused.code().code(),
+            "ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT"
+        );
+        assert_eq!(refused.path().segments(), path);
+        assert_eq!(
+            (refused.limit(), refused.actual()),
+            (Some(7), Some(u64::from(value)))
+        );
+    }
     // Fewer than two per interface: refused for Fragmentation Needed.
     let refused = error(&states(VALID, 3));
     assert_eq!(
@@ -1470,33 +1527,81 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
         refused.code().code(),
         "ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED"
     );
-    assert_eq!(
-        refused.path().segments(),
-        ["icmpv4-errors", "capacity", "states"]
-            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
-    );
-    // No Port Unreachable can be sent: two per interface are enough.
+    assert_eq!(refused.path().segments(), path);
+    assert_eq!((refused.limit(), refused.actual()), (Some(7), Some(3)));
+    // No Port Unreachable can be sent: three per interface are enough.
     let off = VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
-    validated(&states(&off, 4));
+    validated(&states(&off, 6));
     let no_holds = VALID.replacen(
         "unsolicited-syn-holds = 7\n",
         "unsolicited-syn-holds = 0\n",
         1,
     );
-    validated(&states(&no_holds, 4));
-    // Fragmentation Needed off: one per interface plus Port Unreachable.
-    let frag_off = VALID.replacen(
-        "[icmpv4-errors.capacity]",
-        "[icmpv4-errors.generate]\nfragmentation-needed = false\n\n[icmpv4-errors.capacity]",
-        1,
-    );
-    validated(&states(&frag_off, 3));
+    validated(&states(&no_holds, 6));
+    let refused = error(&states(&no_holds, 5));
     assert_eq!(
-        error(&states(&frag_off, 2)).code(),
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForRedirect,
+            Some(6),
+            Some(5)
+        )
+    );
+    // Redirect off: the bound before ICMP-REDIRECT (two per interface plus
+    // Port Unreachable).
+    let redirect_off = generate(VALID, "redirect = false\n");
+    validated(&states(&redirect_off, 5));
+    let refused = error(&states(&redirect_off, 4));
+    assert_eq!(
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
+            Some(5),
+            Some(4)
+        )
+    );
+    let refused = error(&states(&redirect_off, 3));
+    assert_eq!(
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForFragmentationNeeded,
+            Some(5),
+            Some(3)
+        )
+    );
+    // Fragmentation Needed off: Redirect and the shared class per interface
+    // plus Port Unreachable.
+    let frag_off = generate(VALID, "fragmentation-needed = false\n");
+    validated(&states(&frag_off, 5));
+    let refused = error(&states(&frag_off, 3));
+    assert_eq!(
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForRedirect,
+            Some(5),
+            Some(3)
+        )
+    );
+    let refused = error(&states(&frag_off, 4));
+    assert_eq!(
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
+            Some(5),
+            Some(4)
+        )
+    );
+    // Both off: one per interface plus Port Unreachable, as before MTU1.
+    let both_off = generate(VALID, "fragmentation-needed = false\nredirect = false\n");
+    validated(&states(&both_off, 3));
+    let refused = error(&states(&both_off, 2));
+    assert_eq!((refused.limit(), refused.actual()), (Some(3), Some(2)));
+    assert_eq!(
+        refused.code(),
         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
     );
-    let both_off = frag_off.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
-    validated(&states(&both_off, 2));
+    let all_off = both_off.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
+    validated(&states(&all_off, 2));
 }
 
 #[test]

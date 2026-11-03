@@ -32,7 +32,7 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、解決中のnext hopへのdatagramの有界なholdとreplay（ARP-HOLD）、
   fixed-capacity dynamic ARP cache、local ICMPv4 Echo
-  responder、ICMPv4 Time Exceeded / Destination Unreachable / Parameter Problem生成、opt-inの
+  responder、ICMPv4 Time Exceeded / Destination Unreachable / Parameter Problem / Redirect生成、opt-inの
   single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
   stateful forward firewall、router宛てdatagramのstateless input firewall（INPUT-FW）、forwardしたDF=0 datagramのfragmentation（MTU2 part B）、受信fragmentを
   最初のfragmentの判定へ結びつけるfragment association（NAT-FRAG）と、それらを一workerへbindする
@@ -311,8 +311,8 @@ staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、�
 
 routerが自身で生成するICMPv4（Echo Reply、Time Exceeded、Destination Unreachable
 Network/Host/Fragmentation Needed、ICMP-ERRのProtocol Unreachable、router宛てUDPのPort
-Unreachable、Parameter Problem）はすべてdefaultでRFC 1812どおり生成し、security上の理由で
-classごとにoffにできます（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。firewall denyへの
+Unreachable、Parameter Problem、ICMP-REDIRECTのRedirect for Host）はすべてdefaultでRFC 1812
+どおり生成し、security上の理由でclassごとにoffにできます（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。firewall denyへの
 Communication Administratively Prohibited（Type 3/Code 13）だけはdefault offです（RFC 1812
 §5.2.7.1が生成しないoptionをMAYで認める。denyはsilent dropのまま、owner決定待ち）。offにしたerror class
 （Time Exceeded、Network/Host Unreachable）は元packetのbyte不変drop reasonを変えず、ICMPも
@@ -333,7 +333,28 @@ protocol-unreachable = true # Type 3/Code 2  router宛ての未実装protocol（
 udp-port-unreachable = true # Type 3/Code 3  router宛てUDP（routerにUDP serviceは無い）
 parameter-problem = true   # Type 12/Code 0 Total Length > frame（pointer 2）、壊れたIPv4 option
 admin-prohibited = false   # Type 3/Code 13 firewall deny（default off: silent drop）
+redirect = true            # Type 5/Code 1  同じinterfaceへforwardするとき（ICMP-REDIRECT）
 ```
+
+**Upgrade注意（ICMP-REDIRECT）**: Redirectはdefault on（`redirect = true`、RFC動作）で、ICMPv4
+limiter stateがinterfaceあたり1つ多く要ります。`icmpv4-errors.capacity.states`が旧下限（2 ×
+interface数、delayed Port Unreachableありで+1）ちょうどのconfigはexit 2
+（`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT ... limit=<下限> actual=<states>`）になるので、更新後の
+再起動やreloadの前に`ruster validate`を実行し、`states`を`limit`まで上げるか`redirect = false`に
+してください。同一interface（LAN→LAN）のtrafficをrusterのforward firewallに通し続けたい場合も
+`redirect = false`です（Redirectに従ったhostはnext hopへ直接送りfirewallを通らない）。
+
+ICMP-REDIRECTで、plainなforwardがingress interfaceから出て、sourceとnext hopがそのinterfaceの
+connected subnet上なら、datagramはそのままforwardしつつsourceへRedirect for Host（5/1、RFC 1812
+§5.2.7.2、gateway fieldはnext hop）を送ります。Network Redirect（code 0/2）は送りません。NAT、
+firewall deny、TTL切れ、later fragment、ICMP errorには付かず、ARP-HOLDのdatagramはreplayで送ります。
+NAT outside interfaceとrouter自身のaddressをgatewayにする場合は送らず、sourceのneighborが既知で
+なければ送りません（ARPを始めない）。limiterは専用class 3（Redirectを無視するhostが他hostの
+Time Exceededを止めない）で、`icmpv4-errors.capacity.states`はinterfaceあたり1多く要ります
+（不足は`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`）。storageは増えません。Redirectはsubnet上の別routerの
+存在を明かし、詐称sourceで第三者宛てに誘発でき、従ったhostはrusterのLAN→LAN firewallを通らなく
+なるので、別routerの無いsubnetや信頼できないsegmentでは`redirect = false`を推奨します（router全体の
+switch、詳細はrunbookの「ICMP Redirect」）。
 
 ICMP-ERRで、router宛て（ingress interfaceのaddress）のfragmentでないdatagramは、UDPなら
 `IPV4_LOCAL_UDP_PORT_UNREACHABLE`（header/checksumが壊れていれば無応答の`IPV4_LOCAL_UDP_INVALID`）、

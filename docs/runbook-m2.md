@@ -660,7 +660,8 @@ A forwarded datagram longer than the egress MTU is dropped:
   state on every interface: `icmpv4-errors.capacity.states` must be at
   least twice the number of interfaces (plus one with delayed Port
   Unreachable), or validation fails with
-  `ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`.
+  `ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`; Redirect (on by
+  default) needs one more per interface (see "ICMP Redirect").
 - DF clear: fragmented (RFC 1812 4.2.2.7, RFC 791 3.2; since MTU2 part B,
   see "Fragmentation" below), also through the NAT, which translates whole
   DF-clear datagrams (see "DF-clear datagrams through the NAT" below).
@@ -809,6 +810,101 @@ reasons instead, or exclude the four new codes. The twelve new
 order of the earlier fields in stats and JSONL is unchanged. Storage is
 unchanged (67050176 bytes for the maximal production config at the time;
 67050272 since GARP).
+
+### ICMP Redirect (ICMP-REDIRECT)
+
+> **Upgrade note.** Redirect is on by default (`redirect = true`, RFC
+> behavior) and needs one more ICMPv4 limiter state per interface. A
+> config whose `icmpv4-errors.capacity.states` equals the old minimum
+> (2 x interfaces, +1 with delayed Port Unreachable) now fails with exit 2:
+> `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT
+> path=icmpv4-errors.capacity.states limit=<minimum> actual=<states>`.
+> Run `ruster validate <config>` before restarting or reloading after the
+> upgrade, then either raise `states` to the printed `limit` or set
+> `[icmpv4-errors.generate] redirect = false`. Choose `redirect = false`
+> also when same-interface (LAN->LAN) traffic must keep going through
+> ruster's forward firewall: a host that follows a Redirect sends to the
+> next hop directly and bypasses it.
+
+When the router forwards a datagram back out of the interface it arrived
+on, and both the source and the chosen next hop are on that interface's
+connected subnet, it still forwards the datagram and also sends the source
+an ICMP Redirect for Host (Type 5/Code 1, RFC 1812 §5.2.7.2) whose gateway
+field is that next hop (the route's gateway, or the destination itself for
+a directly connected destination). A typical case: a LAN host uses the
+router as its default gateway for a prefix that another router on the same
+LAN serves, or for another host on its own subnet.
+
+```toml
+[icmpv4-errors.generate]
+redirect = true   # default (RFC 1812: MUST be able to generate Code 1)
+```
+
+- Only Code 1. Network Redirects (Codes 0 and 2) are never sent (MUST
+  NOT). Code 3 (Host and TOS) is not sent either: the router has no TOS
+  routing, and RFC 1812 then asks for Code 1.
+- No Redirect when the source is not on the ingress subnet (it came
+  through another router), when the next hop is outside that subnet (for
+  example on an interface route of the same link), when the next hop is
+  the source itself, for the datagrams the router does not forward (TTL
+  0/1 get Time Exceeded, firewall denies, URPF drops, Fragmentation
+  Needed), for NAT traffic (outbound, inbound, hairpin, translated errors),
+  for later fragments, and about ICMP errors. A datagram with IPv4 options
+  (so any source route) is never forwarded, so it never gets one.
+- Never on the NAT outside interface, never naming one of the router's
+  own addresses, and only when the source is on the ingress interface's
+  own connected subnet (a wider interface route that covers the router's
+  address does not count). A Redirect never starts an ARP Request: if
+  the source is not a static or fresh dynamic neighbor, none is sent.
+- ARP-HOLD: a datagram held while its next hop resolves gets its Redirect
+  when it is replayed and forwarded, not when it is held.
+- Rate limit: Redirects have their own per-egress limiter class (one
+  queued per egress, one per `interval-ms`, default 100 ms), checked
+  before any reverse route or neighbor work. A LAN host that ignores
+  Redirects (`accept_redirects=0`, as on many container and Kubernetes
+  nodes) and keeps sending through the router gets at most one Redirect
+  per interval and never delays Time Exceeded or Unreachable errors for
+  the other hosts on that LAN. The class is per egress, not per host: while
+  one such host keeps it busy, Redirects to the other hosts on that egress
+  come late (at most one per interval for the whole egress). The pre-check
+  runs after the RFC 1812 4.3.2.7 header rules, so later fragments, ICMP
+  errors, and group destinations are counted under their own suppression
+  counters, not as `rate_limited`.
+- Subnet: only the interface's own address and its connected subnet count.
+  A host reached through an extra interface route without a gateway on the
+  same link (a second prefix on the LAN) gets no Redirect.
+- Capacity: the Redirect class needs one limiter state per interface.
+  With `redirect = true`, `icmpv4-errors.capacity.states` must be at least
+  interfaces x (1 + 1 for Fragmentation Needed when it is on + 1), plus one
+  with delayed Port Unreachable; otherwise validate, plan, and reload fail
+  with `ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`, whose `limit=` is the whole
+  minimum and `actual=` the configured value (the Fragmentation Needed and
+  Port Unreachable states errors report the same pair). Upgrading: see the
+  note at the top of this section. Storage per state is unchanged (24
+  bytes).
+- Counters: `icmpv4_errors.queued_redirect`, `dequeued_redirect`, and
+  `disabled_redirect` (the Redirects that would have been sent while
+  `redirect = false`), appended after the existing counters. Changing the
+  switch is restart-required, like every `[icmpv4-errors.generate]` key.
+- Security: a Redirect reveals that another router or host on the subnet
+  is the better first hop, and the source is not authenticated, so anyone
+  on the ingress subnet (or anyone who can spoof an address of it, unless
+  URPF drops it) can make the router send Redirects to that address. The
+  amount is bounded by the class 0 limiter (10 per second per egress by
+  default), the gateway named is always the router's own correct next
+  hop, and a host accepts a Redirect only from its current gateway (RFC
+  1122 §3.2.2.2). Recommendation: keep the default on a LAN where hosts
+  benefit from it; set `redirect = false` where the subnet has no other
+  router, where hosts should always use this router (for example to keep
+  their traffic in front of its firewall), or on untrusted segments. The
+  switch is router-wide; there is no per-interface override yet.
+- Firewall: a host that follows a Redirect then talks to the next hop
+  directly, so its traffic to that destination no longer crosses ruster
+  and bypasses ruster's LAN->LAN forward firewall rules. Set
+  `redirect = false` if same-interface traffic must stay filtered.
+- Storage is unchanged: the gateway shares the action's existing header
+  field (widened inside the slot's padding), so the action slot stays 592
+  bytes and the maximal production config stays at 67050272 bytes.
 
 ### Source address validation (URPF)
 
@@ -3631,6 +3727,14 @@ What it proves, on the runner's kernel only:
   `drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED`; a SIGHUP reload adding a rule
   for Echo from 203.0.113.1/32 on the WAN (generation 2) answers it; exit
   0, nothing attached.
+  Added by ICMP-REDIRECT (`priv_run_redirect`): with a host route
+  192.168.1.77/32 via 192.168.1.1 on host A (its `accept_redirects` set to
+  0 in its own namespace), a static neighbor 192.168.1.77 and a lan->lan
+  UDP allow rule on the router, host A's UDP to .77 is forwarded back out
+  of ra and host A's raw socket receives a Redirect for Host (5/1) from
+  192.168.1.1 naming .77, with valid checksums and the datagram quoted;
+  with `redirect = false` no Redirect arrives within 2 s and
+  `icmpv4_errors.disabled_redirect` counts; exit 0, nothing attached.
   Added by MTU2 part B (`priv_run_frag*`): with the WAN link (rb, pb, and
   the wan `mtu`) at 1400, a DF-clear 1500-byte UDP datagram from host A
   arrives at host B's pb as exactly the RFC 791 pair of fragments from
@@ -3904,7 +4008,8 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `health=MTU_DECREASED` / `MTU_ABOVE_FRAME` | 1 | MTU changed below the startup MTU / above the frame bound | restore the MTU, then restart |
 | `health=MTU_RAISED` | — | MTU raised within the frame bound; TX still bounded by the old MTU | restart to use the new MTU |
 | `warning: port=if<id> MTU_BELOW_DEVICE mtu=M config=C` | — | the device carries M but forwarding is limited to the interface's `mtu` C (default 1500) | set `mtu = M` if the link carries it (restart) |
-| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED path=icmpv4-errors.capacity.states` | 2 | fewer than two ICMPv4 error limiter states per interface while Fragmentation Needed is on | raise `states` to at least 2 × interfaces (+1 with delayed Port Unreachable) |
+| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED path=icmpv4-errors.capacity.states limit=<minimum> actual=<states>` | 2 | fewer than two ICMPv4 error limiter states per interface while Fragmentation Needed is on | raise `states` to at least 2 × interfaces (+1 with delayed Port Unreachable) |
+| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT path=icmpv4-errors.capacity.states limit=<minimum> actual=<states>` | 2 | no room for the Redirect limiter class on every interface while `redirect = true` (the default) | raise `states` to at least 3 × interfaces with Fragmentation Needed on (2 × with it off), +1 with delayed Port Unreachable, or set `redirect = false` |
 | `drop.IPV4_FRAME_EXCEEDS_MTU` | — | frames carry bytes after the IPv4 datagram beyond the egress MTU | find the sender appending trailers; the datagrams themselves fit |
 | `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
 | `drop.IPV4_LOCAL_UDP_PORT_UNREACHABLE` / `IPV4_LOCAL_PROTOCOL_UNREACHABLE` growing | — | UDP or another protocol sent to a router address (scans, misconfigured clients, a service expected on the router) | normal at a low rate; `udp-port-unreachable = false` / `protocol-unreachable = false` to stop answering (ICMP-ERR) |

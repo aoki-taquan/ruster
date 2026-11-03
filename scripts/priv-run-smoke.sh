@@ -130,6 +130,16 @@
 #             (drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED, no reply); a SIGHUP
 #             reload adding a rule for Echo from 203.0.113.1/32 on the WAN
 #             (generation 2) answers it again; exit 0
+#   redirect  (ICMP-REDIRECT, RFC 1812 5.2.7.2) host A sends UDP to
+#             192.168.1.77 (its own subnet; a host route via the router, a
+#             static neighbor .77 on the router, a lan->lan allow rule): the
+#             router forwards it back out of ra and host A's raw socket
+#             receives a Redirect for Host (5/1) from 192.168.1.1 naming .77,
+#             with valid checksums and the datagram quoted; with
+#             `redirect = false` no Redirect within 2 s and
+#             icmpv4_errors.disabled_redirect counts. Host A's
+#             accept_redirects is set to 0 (in its own namespace) so every
+#             probe still goes through the router
 #   frag      (MTU2 part B, RFC 791 3.2, RFC 1812 4.2.2.7) rb and pb at
 #             1400 and wan `mtu = 1400`: a 1500-byte DF-clear UDP datagram
 #             from host A (IP_PMTUDISC_DONT) reaches host B as exactly two
@@ -2057,6 +2067,134 @@ phase_inputfw() {
     echo "priv_run_inputfw: default deny with a LAN accept rule forwards and answers host A, drops $dropped WAN Echo(s) silently, reload with a WAN Echo rule answers host B, exit 0 verified"
 }
 phase_inputfw
+
+# redirect (ICMP-REDIRECT): RFC 1812 5.2.7.2 Redirect for Host on the wire.
+# Host A sends UDP to 192.168.1.77, an address on its own subnet, through
+# the router (a host route via 192.168.1.1); the router forwards it back out
+# of the LAN to the static neighbor .77 (a MAC nobody owns) and sends host A
+# a Redirect naming .77 as the better first hop. Host A does not act on
+# Redirects (accept_redirects=0), so every probe still goes through the
+# router; its raw socket sees the Redirect either way. Then the same with
+# `redirect = false`: forwarded, no Redirect, disabled_redirect counted.
+REDIRECT_EXTRA='
+[[firewall.rules]]
+id = 70
+ingress = "lan"
+egress = "lan"
+source = "192.168.1.0/24"
+destination = "192.168.1.0/24"
+protocol = "udp"
+action = "allow-stateful"
+
+[firewall.rules.source-ports]
+first = 1
+last = 65535
+
+[firewall.rules.destination-ports]
+first = 1
+last = 65535
+
+[[neighbors]]
+interface = "lan"
+address = "192.168.1.77"
+mac = "02:00:00:00:00:77"
+'
+# argv: mode (redirect or absent), marker, deadline seconds. Prints the
+# gateway of the Redirect found.
+REDIRECT_PROBE='
+import socket, struct, sys, time
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+mode, marker = sys.argv[1], sys.argv[2].encode()
+deadline = time.monotonic() + float(sys.argv[3])
+target = socket.inet_aton("192.168.1.77")
+raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+raw.settimeout(0.1)
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.bind(("0.0.0.0", 0))
+sport = udp.getsockname()[1]
+found = None
+while found is None and time.monotonic() < deadline:
+    udp.sendto(marker, ("192.168.1.77", 9))
+    end = time.monotonic() + 0.3
+    while found is None and time.monotonic() < end:
+        try:
+            pkt = raw.recv(4096)
+        except socket.timeout:
+            continue
+        ihl = (pkt[0] & 15) * 4
+        icmp = pkt[ihl:]
+        if len(icmp) < 36 or icmp[0] != 5:
+            continue
+        quote = icmp[8:]
+        qihl = (quote[0] & 15) * 4
+        if quote[16:20] != target or struct.unpack("!H", quote[qihl:qihl + 2])[0] != sport:
+            continue
+        found = (pkt, icmp)
+if mode == "absent":
+    if found is not None:
+        sys.exit("redirect probe: a Redirect arrived with redirect = false")
+    print("no Redirect within %s s" % sys.argv[3])
+    sys.exit(0)
+if found is None:
+    sys.exit("redirect probe: no Redirect within %s s" % sys.argv[3])
+pkt, icmp = found
+ihl = (pkt[0] & 15) * 4
+checks = [
+    (pkt[12:16] == socket.inet_aton("192.168.1.1"), "outer source"),
+    (pkt[16:20] == socket.inet_aton("192.168.1.10"), "outer destination"),
+    (fold(pkt[:ihl]) == 0xFFFF, "outer header checksum"),
+    (icmp[1] == 1, "code (Redirect for Host)"),
+    (icmp[4:8] == target, "gateway field"),
+    (fold(icmp) == 0xFFFF, "ICMP checksum"),
+    (icmp[8 + 28:8 + 28 + len(marker)] == marker, "quoted data"),
+]
+for ok, what in checks:
+    if not ok:
+        sys.exit("redirect probe: " + what)
+print("Redirect for Host from 192.168.1.1, gateway %s, %d quoted bytes, checksums valid"
+      % (socket.inet_ntoa(icmp[4:8]), len(icmp) - 8))
+'
+phase_redirect() {
+    { cat "$work/router.toml"; printf '%s' "$REDIRECT_EXTRA"; } >"$work/redirect-on.toml"
+    sed 's/^\[icmpv4-errors\.generate\]$/&\nredirect = false/' "$work/redirect-on.toml" \
+        >"$work/redirect-off.toml"
+    grep -qx 'redirect = false' "$work/redirect-off.toml" ||
+        fail "redirect: switch-off config not written"
+    in_ns "$host_a" sysctl -q -w net.ipv4.conf.all.accept_redirects=0 net.ipv4.conf.pa.accept_redirects=0
+    sudo -n ip -n "$host_a" route add 192.168.1.77/32 via 192.168.1.1
+    for run in on off; do
+        cp "$work/redirect-$run.toml" "$work/redirect.toml"
+        start_ruster redirect "$work/redirect.toml" --user "$smoke_uid" --group "$smoke_gid"
+        wait_ready redirect || fail "redirect ($run): ruster exited during startup"
+        if [ "$run" = on ]; then
+            in_ns "$host_a" python3 -I -c "$REDIRECT_PROBE" redirect "ruster-redirect-$suffix" 10 \
+                >"$work/redirect-$run.txt" 2>&1 || fail "redirect: $(cat "$work/redirect-$run.txt")"
+            wait_stat_ge redirect icmpv4_errors.dequeued_redirect 1
+        else
+            in_ns "$host_a" python3 -I -c "$REDIRECT_PROBE" absent "ruster-redirect-$suffix" 2 \
+                >"$work/redirect-$run.txt" 2>&1 || fail "redirect: $(cat "$work/redirect-$run.txt")"
+            wait_stat_ge redirect icmpv4_errors.disabled_redirect 1
+        fi
+        signal_ruster TERM
+        wait_ruster
+        [ "$status" -eq 0 ] || fail "redirect ($run): exit status $status after SIGTERM"
+        assert_detached "the redirect ($run) run"
+        sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/redirect.out" >"$work/redirect-$run.final"
+    done
+    sudo -n ip -n "$host_a" route del 192.168.1.77/32 via 192.168.1.1
+    block_has "$work/redirect-off.final" icmpv4_errors.queued_redirect=0
+    forwarded=$(stat_in "$work/redirect-off.final" icmpv4_errors.disabled_redirect)
+    echo "priv_run_redirect: $(cat "$work/redirect-on.txt"); with redirect = false $forwarded datagram(s) forwarded without one (disabled_redirect=$forwarded), exit 0 verified"
+}
+phase_redirect
 
 # reload_carry (RELOAD-CARRY): a long-lived TCP connection and a UDP flow
 # from host A to host B through the NAT survive an applied SIGHUP reload

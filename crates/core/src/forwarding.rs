@@ -2102,6 +2102,14 @@ pub enum TraceEvent {
         ingress: IfId,
         disposition: Icmpv4ErrorDisposition,
     },
+    /// The disposition of a Redirect for Host (Type 5, Code 1) about a
+    /// datagram forwarded back out of its ingress interface toward a next
+    /// hop on its source's subnet (ICMP-REDIRECT). The datagram itself is
+    /// forwarded either way.
+    Icmpv4RedirectDisposition {
+        ingress: IfId,
+        disposition: Icmpv4ErrorDisposition,
+    },
     ArpRequestValidated {
         ingress: IfId,
         sender_protocol: crate::Ipv4Address,
@@ -3842,6 +3850,32 @@ where
                             fragmentation.as_deref(),
                             trace,
                         )?;
+                        // ICMP-REDIRECT: one compare for a plain forward;
+                        // a datagram leaving through its ingress interface
+                        // goes to the cold check. After every drop the
+                        // decision can still take (URPF, the forward
+                        // firewall's allow, TTL, MTU) and before the rewrite,
+                        // so the Redirect quotes the datagram as received.
+                        // NAT, hairpin, and translated-error decisions are
+                        // other variants and never get one.
+                        if let PacketDecision::Ipv4(forwarding) = decision {
+                            if forwarding.egress == ingress {
+                                redirect_to_better_first_hop(
+                                    &*frame,
+                                    snapshot,
+                                    ingress,
+                                    is_nat_outside(
+                                        ingress,
+                                        nat44_udp_config,
+                                        nat44_tcp_config,
+                                        nat44_icmp_config,
+                                    ),
+                                    &mut resolution,
+                                    &mut icmpv4_errors,
+                                    trace,
+                                );
+                            }
+                        }
                         apply_decision(frame, decision)?;
                         // Only for a datagram the core commits for TX: a plan,
                         // MTU, or firewall drop consumes no ID (a later backend
@@ -4242,7 +4276,7 @@ fn exceeds_egress_mtu<T: TraceSink>(
             ipv4,
             snapshot.route_lookup(ipv4.destination),
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
-            mtu,
+            u32::from(mtu),
             resolution,
             runtime,
             *now,
@@ -4929,7 +4963,7 @@ fn decide_ipv4<T: TraceSink>(
                         ipv4,
                         selected_route,
                         Icmpv4ErrorKind::ParameterProblem,
-                        u16::from(pointer),
+                        u32::from(pointer),
                         resolution,
                         runtime,
                         *now,
@@ -7757,7 +7791,7 @@ fn decide_icmpv4_error<T: TraceSink>(
     ipv4: packet::ValidatedIpv4,
     selected_destination_route: Option<Route>,
     kind: Icmpv4ErrorKind,
-    header_value: u16,
+    header_value: u32,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
@@ -7839,8 +7873,9 @@ fn decide_icmpv4_error<T: TraceSink>(
 /// the reverse neighbor (static, then fresh dynamic; a miss queues only an
 /// ARP Request), then the generated-ICMPv4 limiter. The caller has already
 /// applied the RFC 1812 §4.3.2.7 suppression rules. `header_value` is the
-/// Next-Hop MTU of a Fragmentation Needed error or the pointer of a
-/// Parameter Problem (ignored for other kinds).
+/// Next-Hop MTU of a Fragmentation Needed error, the pointer of a
+/// Parameter Problem, or the gateway address of a Redirect (ignored for
+/// other kinds).
 /// The quote is cut so the error fits the MTU of the reverse egress.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
@@ -7849,7 +7884,7 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     original_tos: u8,
     original_ipv4: &[u8],
     kind: Icmpv4ErrorKind,
-    header_value: u16,
+    header_value: u32,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
@@ -7894,6 +7929,17 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
                         egress: reverse_egress,
                         target,
                         resolution: ResolutionResult::ClockRegression,
+                    },
+                );
+            }
+            // A Redirect never starts an ARP Request: its source just
+            // sent the datagram, and an unknown one gets no Redirect.
+            DynamicLookup::Miss if kind == Icmpv4ErrorKind::RedirectHost => {
+                return runtime.record_suppression(
+                    Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
+                        egress: reverse_egress,
+                        target,
+                        resolution: ResolutionResult::Suppressed,
                     },
                 );
             }
@@ -7945,11 +7991,128 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
             snapshot.ipv4_origin.default_ttl(),
             original_ipv4,
         )
-        .with_next_hop_mtu(header_value)
+        .with_next_hop_mtu(header_value as u16)
         .with_pointer(header_value as u8)
+        .with_gateway(crate::Ipv4Address::from_octets(header_value.to_be_bytes()))
         .fit_egress_mtu(interface.mtu),
         now,
     )
+}
+
+/// Whether `ingress` is the outside interface of a NAT realm (cold).
+#[cold]
+#[inline(never)]
+fn is_nat_outside(
+    ingress: IfId,
+    udp: Option<&Nat44UdpConfig>,
+    tcp: Option<&Nat44TcpConfig>,
+    icmp: Option<&Nat44IcmpConfig>,
+) -> bool {
+    udp.is_some_and(|config| config.outside() == ingress)
+        || tcp.is_some_and(|config| config.outside() == ingress)
+        || icmp.is_some_and(|config| config.outside() == ingress)
+}
+
+/// RFC 1812 §5.2.7.2 Redirect for Host (Type 5, Code 1) about a plain
+/// forward that leaves through its ingress interface (the caller checked).
+/// A Redirect is sent only when all of these hold:
+///
+/// - the ingress interface is not a NAT realm's outside interface (the
+///   router never tells the outside about first hops behind it);
+/// - the source's route is the ingress interface's own connected route
+///   (the route the ingress address itself selects, with no gateway), so
+///   the source and the router share one logical subnet and the error's
+///   source address (the ingress address, chosen by the reverse route)
+///   belongs to the destination's subnet as §5.2.7.2 requires; a wider
+///   direct route that merely covers the address does not count;
+/// - the next hop (the route's gateway, or the destination of a direct
+///   route) is on that same subnet, is not the source itself, and is not
+///   one of the router's own addresses;
+/// - the datagram has no source route option: a datagram with any IPv4
+///   option is never forwarded (`IPV4_OPTIONS_UNSUPPORTED`), so this path
+///   only sees option-free headers;
+/// - the Redirect limiter (class 3 of the ingress egress) admits it, read
+///   before any reverse route or neighbor work; then the generic error
+///   rules (switch, suppression of §4.3.2.7, reverse route and a *known*
+///   reverse neighbor: a Redirect never starts an ARP Request).
+///
+/// The gateway field is the next hop. The datagram is forwarded as usual.
+/// Cold: only same-interface forwards pay the route lookups.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn redirect_to_better_first_hop<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    nat_outside: bool,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    trace: &mut T,
+) {
+    if nat_outside {
+        return;
+    }
+    let Some((runtime, now)) = icmpv4_errors.as_mut() else {
+        return;
+    };
+    let Ok(ipv4) = validate_ipv4_frame(frame) else {
+        return;
+    };
+    if ipv4.header_len > 20 {
+        return;
+    }
+    let Some(route) = snapshot.route_lookup(ipv4.destination) else {
+        return;
+    };
+    let gateway = route.next_hop().unwrap_or(ipv4.destination);
+    let Some(binding) = snapshot.local_binding_on(ingress) else {
+        return;
+    };
+    let Some(source_subnet) = snapshot.route_lookup(ipv4.source) else {
+        return;
+    };
+    if route.egress() != ingress
+        || source_subnet.egress() != ingress
+        || source_subnet.next_hop().is_some()
+        || snapshot.route_lookup(binding.address) != Some(source_subnet)
+        || !source_subnet.matches(gateway)
+        || gateway == ipv4.source
+        || snapshot.is_local_ipv4(gateway)
+    {
+        return;
+    }
+    let kind = Icmpv4ErrorKind::RedirectHost;
+    // The limiter pre-check runs only for a datagram the §4.3.2.7 header
+    // rules admit (a pure check, no counters), so a later fragment, an ICMP
+    // error, or a group destination is counted under its own suppression
+    // by `decide_icmpv4_error`, never as RateLimited/Pending.
+    let refusal = if runtime.policy().generates(kind)
+        && icmp_error_candidate_eligible(frame, snapshot, ipv4, Some(route))
+    {
+        runtime.limiter_refusal(kind, ingress, *now)
+    } else {
+        None
+    };
+    let disposition = match refusal {
+        Some(refusal) => runtime.record_suppression(refusal),
+        _ => decide_icmpv4_error(
+            frame,
+            snapshot,
+            ipv4,
+            Some(route),
+            kind,
+            u32::from_be_bytes(gateway.octets()),
+            resolution,
+            runtime,
+            *now,
+            trace,
+        ),
+    };
+    trace.record(TraceEvent::Icmpv4RedirectDisposition {
+        ingress,
+        disposition,
+    });
 }
 
 fn icmp_error_source_is_host(
@@ -8182,7 +8345,7 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
         Ipv4OptionsUnsupported => match ipv4_option_check(frame, snapshot, ipv4, true) {
             Ipv4OptionCheck::Invalid {
                 pointer: Some(pointer),
-            } => (Icmpv4ErrorKind::ParameterProblem, u16::from(pointer)),
+            } => (Icmpv4ErrorKind::ParameterProblem, u32::from(pointer)),
             _ => return decided,
         },
         _ => return decided,

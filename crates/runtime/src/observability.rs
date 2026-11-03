@@ -1648,6 +1648,7 @@ impl ObservableFields for ServiceCounters {
             queued_admin_prohibited, disabled_protocol_unreachable, disabled_udp_port_unreachable,
             disabled_parameter_problem, disabled_admin_prohibited, dequeued_protocol_unreachable,
             dequeued_udp_port_unreachable, dequeued_parameter_problem, dequeued_admin_prohibited,
+            queued_redirect, disabled_redirect, dequeued_redirect,
         }}
         visit_counts! {v, "nat44_udp", self.nat44_udp, Nat44UdpCounters {
             mappings_created, mappings_reused, mappings_expired, peers_created,

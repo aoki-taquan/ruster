@@ -297,7 +297,7 @@ worker-localであり、共有lock、packet clone、backend buffer pointerを持
 
 ### router-originated ICMPv4 inventoryとoperator switch
 
-routerが自身の名前で生成または応答するICMPv4は次の9 class（とB3のPort Unreachable）だけです（NAT44のICMPv4 error変換は
+routerが自身の名前で生成または応答するICMPv4は次の10 class（とB3のPort Unreachable）だけです（NAT44のICMPv4 error変換は
 受信errorのtranslationで生成ではなく、`nat44.*.icmpv4-errors`で別途設定します）。owner方針
 （2026-11-01）により既定値はすべてRFC動作で、security上offにしたい運用者向けにclassごとの
 switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である限り、SHOULDに反するoption
@@ -314,11 +314,12 @@ switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である
 | Destination Unreachable Port（Type 3/Code 3、router宛てUDP） | router宛ての正しいUDP（UDP serviceなし、ICMP-ERR） | RFC 1122 §4.1.3.1 SHOULD、RFC 1812 §5.2.7.1 | `udp-port-unreachable`（`true`） | `IPV4_LOCAL_UDP_PORT_UNREACHABLE`のまま、`icmpv4_errors.disabled_udp_port_unreachable` | restart-required |
 | Parameter Problem（Type 12/Code 0） | Total Lengthがframeより長い（pointer 2）、壊れたIPv4 option（ICMP-ERR） | RFC 1812 §§4.3.3.5 MUST, 5.2.2 SHOULD | `parameter-problem`（`true`） | `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`/`IPV4_OPTIONS_UNSUPPORTED`のまま、`icmpv4_errors.disabled_parameter_problem` | restart-required |
 | Destination Unreachable Communication Administratively Prohibited（Type 3/Code 13） | forward firewallのrule/default deny（ICMP-ERR） | RFC 1812 §5.2.7.1 SHOULD use Code 13、出さないoptionはMAY | `admin-prohibited`（**`false`**、owner決定待ち） | denyのdrop reasonのまま、`icmpv4_errors.disabled_admin_prohibited` | restart-required |
+| Redirect for Host（Type 5/Code 1） | plain forwardがingress interfaceから出て、sourceとnext hopがそのinterfaceのsubnet上（ICMP-REDIRECT、下） | RFC 1812 §5.2.7.2 MUST be able to generate（Code 0/2はMUST NOT）、§5.2.1 (12) | `redirect`（`true`） | datagramはそのままforward、`icmpv4_errors.disabled_redirect` | restart-required |
 
 security上の理由は、Echoがhost discovery、Time Exceededがtraceroute topology disclosure、
 Network Unreachableがroute table probing、Host UnreachableがLAN host enumeration、Protocol/Port
-UnreachableとParameter Problemがrouter自身のfingerprint、Code 13がfirewall policyの観測に使える
-ことです。Code 13だけはRFC 1812 §5.2.7.1自身が生成しないoptionをMAYで認めており、firewall denyの
+UnreachableとParameter Problemがrouter自身のfingerprint、Code 13がfirewall policyの観測、Redirectが
+subnet上の別routerやhostの存在の開示と詐称sourceによる第三者宛てRedirectの誘発に使えることです。Code 13だけはRFC 1812 §5.2.7.1自身が生成しないoptionをMAYで認めており、firewall denyの
 silent dropが慣行なので、default offにしています（default offもRFC準拠、owner決定待ち）。
 rate limit（RFC 1812 §4.3.2.8のSHOULD settable）は既存の`interval-ms`/`state-ttl-ms`で、switchは
 limiterを変更しません。disabled kindは`decide_icmpv4_error`先頭（および`schedule`と
@@ -451,6 +452,39 @@ NAT44 inboundの判定のまま）。NAT inbound/hairpin/ICMP query NATの経路
 pointerはFragmentation NeededのNext-Hop MTUと同じaction field（`header_value`）に入るので、action
 slotは592 bytesのまま、最大production configのstorage（67050176 bytes）は変わりません
 （GARPのannouncement slotで67050272 bytes）。
+
+### ICMP-REDIRECT（RFC 1812 §§4.3.3.2, 5.2.7.2）
+
+Redirect for Host（5/1）は`Icmpv4ErrorKind::RedirectHost`として同じ`Icmpv4ErrorRuntime`、
+builder、generated ICMPv4 phaseを使い、limiterは専用class 3（間隔は`interval-ms`の値）です。Redirectはdropではなくforwardに付く
+errorなので、判定は`forward_batch_tracked`で`check_egress_mtu`が通った後、frame rewriteの前です。
+fast pathの追加は「decisionが`PacketDecision::Ipv4`（plain forward）でegress == ingress」の一比較
+だけで、条件を満たすdatagramだけが`#[cold]`の`redirect_to_better_first_hop`に入ります。cold pathは
+受信frameを再検証し、ingressがNAT outsideでなく、destination、source、ingress addressを各1回
+LPMして、sourceのrouteがingressのconnected route（ingress addressが選ぶdirect route）そのもので、
+next hop（routeのgatewayかdestination自身）がそのrouteに含まれ、sourceでもrouterのaddressでも
+ないときだけ進みます。次にclass 3のlimiter状態を読み（Pending/RateLimitedならここで抑止）、それから
+`decide_icmpv4_error`（switch、§4.3.2.7のsuppression、reverse route/neighbor）です。reverse
+neighbor（source）が既知でなければARPを始めずに抑止します。source route optionを持つdatagramはforwardされない
+（`IPV4_OPTIONS_UNSUPPORTED`）のでこの経路には来ません。gatewayはICMP header 2語目全体で、
+`header_value`をu16からu32に広げて入れます（Next-Hop MTUとpointerは同じfieldの下位bit）。actionは
+578から580 bytesになりますが既存のpaddingに収まり、action slotは592 bytesのまま、runtime storageは
+増えません（最大production config 67050272 bytes、per-host config 67106224 bytes）。
+
+位置の帰結: URPFのdrop、forward firewallのdeny、TTL 0/1（Time Exceeded）、Fragmentation Needed、
+fragmentation slot不足のdropにはRedirectは付きません。NAT（outbound/inbound/hairpin）、translated
+ICMP error、ICMP query NAT、later fragmentの`FragmentFollow`は別variantなので対象外です。ARP-HOLDの
+holdはdecisionが`NEIGHBOR_UNRESOLVED`なのでRedirectを出さず、replayが同じ経路で改めて判定して
+forwardと一緒に送ります（replayの送信はtick最後のfragment phaseなので、Redirectが先に出ます）。
+limiterは専用class 3です（review sec M1）。共有class 0では、Redirectを無視するLAN host
+（`accept_redirects=0`）の同一subnet宛てtrafficがそのLAN egressのclass 0を`interval-ms`ごとに使い、
+他hostのTime Exceeded/Unreachableを止めてしまうためです。代わりに`states`容量の下限が
+interfaceあたり1増え（`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`）、default onなので`states`が
+ちょうど2 × interface数（+ 1）の既存configは`states`を増やすか`redirect = false`が要ります。
+stateは容量の内側なのでstorageは増えません。(source, gateway)ごとのbackoffはstateあたり8 bytesが要り
+per-host configの余裕（2640 bytes）を超えるので入れません。interface別のswitchはありません
+（`[icmpv4-errors.generate] redirect`はrouter全体、ICMP4-035）。Redirectに従ったhostはnext hopへ直接
+送るので、ruster上のLAN→LAN forward firewallを通らなくなります。
 
 ### egress MTU（MTU1、RFC 1812 §4.2.2.7、RFC 1191 §4）
 
@@ -1258,10 +1292,11 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
   state TTLとclass intervalの両方の経過後。flood中のPort Unreachable stateがstate表を埋めて他egressが
   `StateFull`（Time Exceeded/Net/Host Unreachableのsilent抑止）にならないよう、switch onかつ
   hold容量>0のときvalidateは`icmpv4-errors.capacity.states >= interface数 + 1`を要求する
-  （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、値は
-  出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない
+  （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、ICMP-REDIRECT以降は
+  `limit`に下限、`actual`に`states`を出す）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない
   （MTU1以降、Fragmentation Neededを生成するときはclass 2がinterfaceごとに加わり、下限は
-  2 × interface数（+ 1）。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`）。
+  2 × interface数（+ 1）。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`。ICMP-REDIRECT以降、
+  Redirectを生成するときはclass 3がさらに加わる。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`）。
   1 slotをreserveする案はegressが3つ以上だと他egressを守れないため採らない。remote単位のfairnessはdeferred（NAT44-077）。
 - **Config/plan.** `[nat44.tcp] unsolicited-syn-icmp`（default true、`Nat44TcpPolicy`の一部、
   reloadable、`NatChange::unsolicited_syn_icmp`はtyped delta）と`[nat44.tcp.capacity]
