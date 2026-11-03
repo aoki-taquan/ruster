@@ -297,7 +297,7 @@ worker-localであり、共有lock、packet clone、backend buffer pointerを持
 
 ### router-originated ICMPv4 inventoryとoperator switch
 
-routerが自身の名前で生成または応答するICMPv4は次の4 classだけです（NAT44のICMPv4 error変換は
+routerが自身の名前で生成または応答するICMPv4は次の5 class（とB3のPort Unreachable）だけです（NAT44のICMPv4 error変換は
 受信errorのtranslationで生成ではなく、`nat44.*.icmpv4-errors`で別途設定します）。owner方針
 （2026-11-01）により既定値はすべてRFC動作で、security上offにしたい運用者向けにclassごとの
 switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である限り、SHOULDに反するoption
@@ -309,6 +309,7 @@ switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である
 | Time Exceeded（Type 11/Code 0） | route hitでTTL 0/1 | RFC 1812 §5.3.1 MUST | `[icmpv4-errors.generate] time-exceeded`（`true`） | `IPV4_TTL_EXPIRED`のまま、`icmpv4_errors.disabled_time_exceeded` | restart-required（`Icmpv4ErrorPolicy`） |
 | Destination Unreachable Network（Type 3/Code 0） | LPM miss（firewall有効時はegress-free permitのみ） | RFC 1812 §§4.3.3.1, 5.2.7.1 MUST | `net-unreachable`（`true`） | `ROUTE_MISS`/`FIREWALL_ROUTE_UNAVAILABLE`のまま、`icmpv4_errors.disabled_destination_unreachable` | restart-required |
 | Destination Unreachable Host（Type 3/Code 1） | direct targetのfruitless ARP | RFC 1812 §5.2.7.1（MUST be able to generate、最も近いcodeをSHOULD） | `host-unreachable`（`true`） | holdをreverse route/reverse ARP前にretire、`icmpv4_errors.disabled_host_unreachable`と`ResolutionFailureCounters::generation_disabled` | restart-required |
+| Destination Unreachable Fragmentation Needed（Type 3/Code 4） | DF付きでegress MTU超過（MTU1、下の「egress MTU」） | RFC 1812 §§4.2.2.7, 5.2.7.1 MUST、RFC 1191 §4 MUST（Next-Hop MTU） | `fragmentation-needed`（`true`） | `IPV4_FRAGMENTATION_NEEDED`のまま、`icmpv4_errors.disabled_fragmentation_needed`。PMTUDをblack holeにする | restart-required |
 
 security上の理由は、Echoがhost discovery、Time Exceededがtraceroute topology disclosure、
 Network Unreachableがroute table probing、Host UnreachableがLAN host enumerationに使えることです。
@@ -395,7 +396,47 @@ deadlineを開始しexact boundaryを許可します。allocation/build失敗は
 開始せず、backend reject/finish errorもTX requested済みなのでdeadlineを開始します。
 state/action fullとclock regressionはphantom state/action/deadlineを作りません。expired idle
 stateだけ再利用します。multi-worker共通limit、packet hold/replay、RFC 4884 extension、
-MTU別quote縮小/generated fragmentation、interface別disableはdeferredです。
+generated fragmentation、interface別disableはdeferredです。MTU別quote縮小はMTU1で実装しました
+（下）。
+
+### egress MTU（MTU1、RFC 1812 §4.2.2.7、RFC 1191 §4）
+
+MTUの正（source of truth）はconfigです。`[[interfaces]] mtu`（default 1500、68〜65535）が
+`Interface::mtu`としてforwarding snapshot（validated owner、publication）に入り、interface
+identityの一部なので変更は`InterfacesChanged`/`INTERFACES`のrestart-requiredです。
+`ForwardingSnapshot::new`は68未満を拒否します（RFC 791）。AF_XDP backendは別にdevice MTUを
+sessionのopen時に読みTXを`mtu + 14`に制限するので（XDP-139）、`ruster run`はattach前に
+config MTU ≤ session MTUを要求し（`MTU_BELOW_CONFIG`）、run中のdevice MTU低下は
+`MTU_DECREASED`でfatalです。よってcoreを通ったdatagramはTXの上限を超えません。device MTUを
+自動でconfigへ取り込まないのは、sim（deviceなし）とreload（configだけから候補を作る）で同じ
+publication経路を保つためです。
+
+判定は`forward_batch_inner`で`decide`がdecisionを返し、NAT planのprevalidateが通った後、
+`apply_decision`がframeを書き換える前に一か所で行います（`check_egress_mtu`）。対象は受信frameを
+送るすべてのIPv4 decision（`Ipv4`、`Nat44Udp`/`Nat44Tcp`（hairpin含む）、`Nat44Icmp`、
+`Nat44Icmpv4`、`Icmpv4EchoReply`）で、ARP replyとconsumeは除きます。NAT44は長さを変えないので
+受信Total Lengthがegress上の長さです。fast pathはdecisionのegressのindexed interface lookup
+一回とu16比較一回で、allocation、copy、共有stateはありません。超過時だけcoldな関数が
+frameを再検証しDF bitを読みます。この位置なので:
+
+- TTL判定（Time Exceeded）、route miss、firewall planの後です。firewallが拒否するdatagramは
+  firewall reasonで落ち、Fragmentation Neededはfirewallが許可したdatagramにだけ返ります
+  （route missのNetwork Unreachableと同じく、errorがpolicyのoracleにならない）。
+- NAT mapping/peer/session、ICMP query mapping、firewall stateのcommitは`check_egress_mtu`の後
+  なので、dropしたdatagramはstateを作りません。例外はhairpinのoutbound halfで、これは`decide`の
+  中でcommit済みです（拒否されたinbound halfと同じ扱い。inbound halfはcommitしない）。
+- quoteは書き換え前の受信datagramです。inside→outsideではinside hostが送ったまま（NAT前）、
+  outside→public addressではoutside hostが送ったまま（public address宛て）で、どちらも送信者が
+  自分のsocketと照合できる形です。errorのsource、reverse route、neighbor、suppression、
+  limiterは他のgenerated errorと同じ`decide_icmpv4_error`/`schedule_reverse_icmpv4_error`です。
+
+超過はDF=1なら`IPV4_FRAGMENTATION_NEEDED`とType 3/Code 4（Next-Hop MTU = egress MTUをICMP
+header 2語目の下位16 bitへ、上位16 bitは0）、DF=0なら`IPV4_FRAGMENTATION_REQUIRED`（fragmentation
+未実装のdeviation、MTU2）、local Echo Replyなら`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。
+`Icmpv4ErrorAction`はNext-Hop MTUを2 bytes持ち（action slotは584→592 bytes）、limiter classは
+他のrouter生成errorと共有のclass 0です。すべてのgenerated errorは`fit_egress_mtu`でreverse
+egressのMTUから28を引いた長さまでquoteを切ります（切った部分は0で、同じactionは等しいまま）。
+ARP（28 bytes）はMTU 68に常に収まります。
 
 ## ARP control scope
 
@@ -1618,7 +1659,7 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
 - **storageとclassification**: `mappings-per-host = 0`ならhost storageを確保せずhost処理もしま
   せん（hot pathのcostもmemoryも従来どおり）。非zeroなら上記をmapping capacity分確保し
   `required_bytes`が数えます（production最大tableで両protocolなら+9961472 bytes（N6のUDP peer
-  counterを含む）、計67027136 bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
+  counterを含む）、計67059904 bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
   非zero同士の変更はreloadable（他のNAT変更と同じくapplyでNAT stateをflush）。planは
   `NatChange::mappings_per_host`のtyped deltaです。
 - **限界**（NAT44-096）: 上限はaddress単位です。reverse-path checkがinside sourceをinside-routed

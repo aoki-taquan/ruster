@@ -271,6 +271,32 @@ echo-reply = true          # false: Echo Requestを ICMPV4_ECHO_DISABLED でdrop
 time-exceeded = true       # Type 11/Code 0  -> icmpv4_errors.disabled_time_exceeded
 net-unreachable = true     # Type 3/Code 0   -> icmpv4_errors.disabled_destination_unreachable
 host-unreachable = true    # Type 3/Code 1   -> icmpv4_errors.disabled_host_unreachable
+fragmentation-needed = true # Type 3/Code 4  -> icmpv4_errors.disabled_fragmentation_needed
+```
+
+interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は
+`INTERFACES`のrestart-required）です。forwardingはTTL判定とfirewallの後、NAT/firewall stateを
+commitする前に、受信frameを送るすべてのIPv4 decision（plain、NAT44 UDP/TCP/ICMP query、
+hairpin、翻訳したICMP error、local Echo Reply）のTotal Lengthをegress interfaceのMTUと比べます
+（NATは長さを変えません）。ちょうどMTUは通り、超過はbyte不変dropです: DF付きは
+`IPV4_FRAGMENTATION_NEEDED`とDestination Unreachable, Fragmentation Needed and DF Set
+（Type 3/Code 4、RFC 1812 §5.2.7.1）で、ICMP header 2語目の下位16 bitにegress MTUを
+Next-Hop MTUとして入れ（RFC 1191 §4）、NAT前の受信datagramを引用して元sourceへ返します
+（PMTUD）。他のerrorと同じsuppression、reverse route、limiter（class 0を共有）を通ります。
+DFなしは`IPV4_FRAGMENTATION_REQUIRED`でICMPなし（fragmentationは未実装のdeviation、
+NAT44-019L、MTU2。NATを通るDFなしdatagramはその前にnon-atomicとして落ちます）、local Echo
+Replyの超過は`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。firewallが拒否するdatagramはfirewallの
+reasonで落ちerrorを生みません。router生成のすべてのICMP errorはreverse egressのMTUに
+収まるようquoteを切ります。`ruster run`はconfigのMTUがdeviceのMTU以下であることをattach前に
+確かめ、超えれば`MTU_BELOW_CONFIG`でexit 1です（device MTUがconfigより大きいのは可）。
+
+```toml
+[[interfaces]]
+id = 2
+name = "wan"
+device = "eth1"
+mac = "02:00:00:00:00:02"
+mtu = 1400                 # 省略時1500。deviceのMTU以下（ruster runが確認）
 ```
 
 EtherTypeを読んだ直後、IPv4/ARPはsnapshot上の正確なingress interfaceを解決し、
@@ -946,7 +972,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは54.42 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは54.45 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
