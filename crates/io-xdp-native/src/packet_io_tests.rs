@@ -867,6 +867,45 @@ fn link_flap_recovers_without_new_traffic() {
 /// Any other kick outcome clears it, so TX in flight blocks the
 /// quiescence again: a successful kick that the kernel does not act on
 /// yet, and a kick that fails with another errno.
+/// OPS-EXIT follow-up L1: while another port's TX blocks the quiescence,
+/// the checks of a pending reload never probe the down port: its kicks
+/// stay rate-limited (XDP-178), however often the check runs.
+#[test]
+fn a_blocked_quiescence_never_probes_the_down_link() {
+    // The down port (LAN, if1) comes before the blocking one (WAN) in the
+    // check's port order.
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    for kernel in [&lan, &wan] {
+        kernel.set_copy_transmit(Some(KICK_TX_BATCH));
+        kernel.set_tx_flags(XDP_RING_NEED_WAKEUP);
+    }
+    io.set_clock(MonotonicMillis(10_000));
+    lan.set_link_down(true);
+    deliver(&wan, &ipv4_frame(60, 64));
+    {
+        let mut batch = io.receive(8).expect("receive");
+        batch.next_packet().expect("lease").commit(LAN);
+        let _ = batch.finish();
+    }
+    assert!(io.port_stats(LAN).expect("LAN").link_down);
+    // WAN's kernel takes kicks but does not consume: its TX stays in flight.
+    wan.set_copy_transmit(None);
+    forward_one_to_wan(&mut io, &lan);
+    let kicks = lan.kicks(KickRing::Tx);
+    for _ in 0..200 {
+        assert!(matches!(
+            io.try_publication_quiescence(),
+            Err(XdpQuiescenceError::TxInFlight { interface: WAN, .. })
+        ));
+    }
+    assert_eq!(lan.kicks(KickRing::Tx), kicks, "no confirming kick");
+    // Once WAN drains, one check confirms the down link and passes.
+    transmit_all(&wan);
+    assert!(io.try_publication_quiescence().is_ok());
+    assert_eq!(lan.kicks(KickRing::Tx), kicks + 1);
+}
+
 #[test]
 fn only_a_fresh_enetdown_lets_held_tx_pass_the_quiescence() {
     for outcome in ["sent", "other errno"] {

@@ -447,11 +447,16 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         // The allocated count is an upper bound of the active one
         // (`real_num_tx_queues`, which rtnetlink does not report). A device
         // with one allocated TX queue has exactly queue 0 active; otherwise
-        // the active count comes from sysfs where its view proves to be
-        // this device (ifindex), and a view that cannot be proven fails
+        // the active count comes from sysfs where its view matches this
+        // device (ifindex and hardware address), and a view that does not fails
         // closed (OPS-EXIT review M2).
         if link.tx_queues > 1 {
-            match syscalls.tx_queue_probe(config.interface_name_bytes(), ifindex, config.queue()) {
+            match syscalls.tx_queue_probe(
+                config.interface_name_bytes(),
+                ifindex,
+                link.address,
+                config.queue(),
+            ) {
                 TxQueueProbe::Present => {}
                 TxQueueProbe::Absent => {
                     return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));

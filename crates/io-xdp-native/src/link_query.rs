@@ -18,7 +18,7 @@
 //! (`real_num_tx_queues`, which rtnetlink does not report). A queue id at or
 //! above it has no TX queue at all; the active count can still be lower
 //! after `ethtool -L`, which the session narrows from sysfs only where the
-//! sysfs view proves to describe the resolved device (see
+//! sysfs view's `ifindex` and `address` both match rtnetlink's (see
 //! `SessionStage::TxQueueCheck`).
 //!
 //! This module is the pure, safe half: the request bytes and a fail-closed
@@ -39,6 +39,8 @@ const NLM_F_REQUEST: u16 = 1;
 const HEADER_LEN: usize = 16;
 /// `struct ifinfomsg` bytes.
 const IFINFOMSG_LEN: usize = 16;
+/// `IFLA_ADDRESS`.
+const IFLA_ADDRESS: u16 = 1;
 /// `IFLA_IFNAME`.
 const IFLA_IFNAME: u16 = 3;
 /// `IFLA_MTU`.
@@ -65,6 +67,9 @@ pub struct LinkAttributes {
     pub mtu: u32,
     /// `IFLA_NUM_TX_QUEUES`: the allocated TX queue count.
     pub tx_queues: u32,
+    /// `IFLA_ADDRESS` when it is a 6-byte (Ethernet) address: what a sysfs
+    /// view must also show to be taken as this device's.
+    pub address: Option<[u8; 6]>,
 }
 
 /// Why the rtnetlink link query failed. Value-free: errnos and kernel
@@ -203,6 +208,7 @@ fn parse_link(message: &[u8], ifindex: u32, name: &[u8]) -> Result<LinkAttribute
     }
     let mut mtu = None;
     let mut tx_queues = None;
+    let mut address: Option<&[u8]> = None;
     let mut found_name: Option<&[u8]> = None;
     let mut at = HEADER_LEN + IFINFOMSG_LEN;
     while at < message.len() {
@@ -229,6 +235,11 @@ fn parse_link(message: &[u8], ifindex: u32, name: &[u8]) -> Result<LinkAttribute
                     return Err(LinkQueryError::Malformed);
                 }
             }
+            IFLA_ADDRESS => {
+                if address.replace(payload).is_some() {
+                    return Err(LinkQueryError::Malformed);
+                }
+            }
             IFLA_IFNAME => {
                 // NUL-terminated, at most IFNAMSIZ (16) bytes with the NUL.
                 let end = payload
@@ -249,7 +260,12 @@ fn parse_link(message: &[u8], ifindex: u32, name: &[u8]) -> Result<LinkAttribute
     if found_name != name {
         return Err(LinkQueryError::NameMismatch);
     }
-    Ok(LinkAttributes { mtu, tx_queues })
+    let address = address.and_then(|bytes| <[u8; 6]>::try_from(bytes).ok());
+    Ok(LinkAttributes {
+        mtu,
+        tx_queues,
+        address,
+    })
 }
 
 #[cfg(test)]
@@ -292,6 +308,7 @@ mod tests {
             attribute(IFLA_IFNAME, b"veth0\0"),
             attribute(IFLA_MTU, &1_500_u32.to_ne_bytes()),
             attribute(IFLA_NUM_TX_QUEUES, &2_u32.to_ne_bytes()),
+            attribute(IFLA_ADDRESS, &[2, 0, 0, 0, 0, 1]),
             // An unknown nested attribute is skipped.
             attribute(0x8000 | 26, &[0; 8]),
         ]
@@ -316,7 +333,8 @@ mod tests {
             parse_reply(&ok, 9, 5, 7, b"veth0"),
             Ok(Some(LinkAttributes {
                 mtu: 1_500,
-                tx_queues: 2
+                tx_queues: 2,
+                address: Some([2, 0, 0, 0, 0, 1]),
             }))
         );
         // Another request's late answer is skipped.

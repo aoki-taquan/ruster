@@ -331,9 +331,15 @@ pub(super) trait Syscalls: sealed::Sealed {
     /// `if_nametoindex(3)`. `name` is NUL-padded with `name[IFNAMSIZ - 1] == 0`.
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno>;
     /// Whether device `name` (resolved to `ifindex`) has active TX queue
-    /// `queue` in a sysfs view proven to describe it (`Unverifiable`: the
+    /// `queue` in a sysfs view whose `ifindex` and `address` match it (`Unverifiable`: the
     /// view is not this device's). Cold path; it may allocate.
-    fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe;
+    fn tx_queue_probe(
+        &self,
+        name: &[u8; IFNAMSIZ],
+        ifindex: u32,
+        address: Option<[u8; 6]>,
+        queue: u32,
+    ) -> TxQueueProbe;
     /// The MTU and allocated TX queue count of `ifindex` from one rtnetlink
     /// `RTM_GETLINK` in the caller's network namespace, whose
     /// `IFLA_IFNAME` must be `name`. Cold path; it may allocate.
@@ -424,8 +430,14 @@ impl sealed::Sealed for LinuxSyscalls {}
 unsafe impl MapsRealMemory for LinuxSyscalls {}
 
 impl Syscalls for LinuxSyscalls {
-    fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
-        linux_tx_queue_probe(name, ifindex, queue)
+    fn tx_queue_probe(
+        &self,
+        name: &[u8; IFNAMSIZ],
+        ifindex: u32,
+        address: Option<[u8; 6]>,
+        queue: u32,
+    ) -> TxQueueProbe {
+        linux_tx_queue_probe(name, ifindex, address, queue)
     }
 
     fn link_query(
@@ -686,8 +698,13 @@ impl Syscalls for LinuxSyscalls {
 /// Reads sysfs with safe std only. The device name was validated by
 /// `SessionConfig` (ASCII graphic, no `/`, `:`, `.` or `..`), so it is one
 /// path component.
-fn linux_tx_queue_probe(name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe {
-    let Some(base) = linux_sysfs_device(name, ifindex) else {
+fn linux_tx_queue_probe(
+    name: &[u8; IFNAMSIZ],
+    ifindex: u32,
+    address: Option<[u8; 6]>,
+    queue: u32,
+) -> TxQueueProbe {
+    let Some(base) = linux_sysfs_device(name, ifindex, address) else {
         return TxQueueProbe::Unverifiable;
     };
     let queues = base.join("queues");
@@ -703,21 +720,47 @@ fn linux_tx_queue_probe(name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQu
     }
 }
 
-/// The sysfs directory of device `name`, only after proving that its
-/// `ifindex` is the one this namespace resolved (safe std only).
-fn linux_sysfs_device(name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<std::path::PathBuf> {
+/// The sysfs directory of device `name`, only where its view matches the
+/// device this namespace resolved: the same `ifindex` and the same hardware
+/// address as rtnetlink reported (`IFLA_ADDRESS`). Interface indexes are
+/// per network namespace, so the index alone could match another
+/// namespace's device; the address corroborates it (not a proof: two
+/// namespaces can hold devices with equal index and MAC). Safe std only.
+fn linux_sysfs_device(
+    name: &[u8; IFNAMSIZ],
+    ifindex: u32,
+    address: Option<[u8; 6]>,
+) -> Option<std::path::PathBuf> {
+    let address = address?;
     let len = name.iter().position(|byte| *byte == 0).unwrap_or(IFNAMSIZ);
     let device = std::str::from_utf8(&name[..len]).ok()?;
     if device.is_empty() || device == "." || device == ".." || device.contains('/') {
         return None;
     }
     let base = std::path::Path::new("/sys/class/net").join(device);
-    // The sysfs view must describe the device this namespace resolved.
-    let same_device = std::fs::read_to_string(base.join("ifindex"))
+    let same_index = std::fs::read_to_string(base.join("ifindex"))
         .ok()
         .and_then(|text| text.trim().parse::<u32>().ok())
         == Some(ifindex);
-    same_device.then_some(base)
+    let same_address = std::fs::read_to_string(base.join("address"))
+        .ok()
+        .and_then(|text| parse_mac(text.trim()))
+        == Some(address);
+    (same_index && same_address).then_some(base)
+}
+
+/// `aa:bb:cc:dd:ee:ff` as sysfs prints a 6-byte address.
+fn parse_mac(text: &str) -> Option<[u8; 6]> {
+    let mut out = [0_u8; 6];
+    let mut parts = text.split(':');
+    for byte in &mut out {
+        let part = parts.next()?;
+        if part.len() != 2 {
+            return None;
+        }
+        *byte = u8::from_str_radix(part, 16).ok()?;
+    }
+    parts.next().is_none().then_some(out)
 }
 
 /// `AF_NETLINK`, `NETLINK_ROUTE`, `MSG_TRUNC`.
@@ -1697,7 +1740,13 @@ mod tests {
             self.result(SyscallStage::InterfaceIndex).map(|()| 3)
         }
 
-        fn tx_queue_probe(&self, _: &[u8; IFNAMSIZ], _: u32, _: u32) -> TxQueueProbe {
+        fn tx_queue_probe(
+            &self,
+            _: &[u8; IFNAMSIZ],
+            _: u32,
+            _: Option<[u8; 6]>,
+            _: u32,
+        ) -> TxQueueProbe {
             TxQueueProbe::Present
         }
 
@@ -1709,6 +1758,7 @@ mod tests {
             Ok(crate::LinkAttributes {
                 mtu: 1_500,
                 tx_queues: 1,
+                address: Some([2, 0, 0, 0, 0, 1]),
             })
         }
 
@@ -2518,25 +2568,46 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "reads sysfs")]
     fn native_tx_queue_probe_reads_sysfs_for_the_resolved_device() {
-        // `lo` is ifindex 1 in every network namespace and has one TX queue.
+        // `lo` is ifindex 1 in every network namespace, has one TX queue,
+        // and the all-zero address.
         let mut lo = [0_u8; IFNAMSIZ];
         lo[..2].copy_from_slice(b"lo");
-        assert_eq!(linux_tx_queue_probe(&lo, 1, 0), TxQueueProbe::Present);
-        assert_eq!(linux_tx_queue_probe(&lo, 1, 1_000), TxQueueProbe::Absent);
-        // A sysfs view of another device fails closed.
-        assert_eq!(linux_tx_queue_probe(&lo, 2, 0), TxQueueProbe::Unverifiable);
+        let zero = Some([0_u8; 6]);
+        assert_eq!(linux_tx_queue_probe(&lo, 1, zero, 0), TxQueueProbe::Present);
+        assert_eq!(
+            linux_tx_queue_probe(&lo, 1, zero, 1_000),
+            TxQueueProbe::Absent
+        );
+        // A sysfs view of another device (index or address), or no
+        // address to compare, fails closed.
+        assert_eq!(
+            linux_tx_queue_probe(&lo, 2, zero, 0),
+            TxQueueProbe::Unverifiable
+        );
+        assert_eq!(
+            linux_tx_queue_probe(&lo, 1, Some([2, 0, 0, 0, 0, 1]), 0),
+            TxQueueProbe::Unverifiable
+        );
+        assert_eq!(
+            linux_tx_queue_probe(&lo, 1, None, 0),
+            TxQueueProbe::Unverifiable
+        );
         let mut missing = [0_u8; IFNAMSIZ];
         missing[..12].copy_from_slice(b"rusterNoDev0");
         assert_eq!(
-            linux_tx_queue_probe(&missing, 1, 0),
+            linux_tx_queue_probe(&missing, 1, zero, 0),
             TxQueueProbe::Unverifiable
         );
         let mut dots = [0_u8; IFNAMSIZ];
         dots[..2].copy_from_slice(b"..");
         assert_eq!(
-            linux_tx_queue_probe(&dots, 1, 0),
+            linux_tx_queue_probe(&dots, 1, zero, 0),
             TxQueueProbe::Unverifiable
         );
+        assert_eq!(parse_mac("02:00:0a:ff:00:01"), Some([2, 0, 10, 255, 0, 1]));
+        assert_eq!(parse_mac("02:00:0a:ff:00"), None);
+        assert_eq!(parse_mac("02:00:0a:ff:00:01:02"), None);
+        assert_eq!(parse_mac("2:00:0a:ff:00:01"), None);
     }
 
     /// OPS-EXIT item 3: the live rtnetlink query of the loopback device

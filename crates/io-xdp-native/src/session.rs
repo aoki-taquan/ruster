@@ -206,9 +206,11 @@ pub enum SessionStage {
     /// count, never below the active one). A device with one allocated TX
     /// queue has exactly queue 0 active. With more, the active count comes
     /// from sysfs (`/sys/class/net/<dev>/queues/tx-<queue>`, which follows
-    /// `ethtool -L`) only where its view proves to describe the resolved
-    /// device (its `ifindex` matches); otherwise `TxQueueUnverifiable`
-    /// (fail closed).
+    /// `ethtool -L`) only where its view's `ifindex` and `address` both
+    /// equal rtnetlink's (indexes are per namespace, so the address
+    /// corroborates the match; it is not a proof); otherwise
+    /// `TxQueueUnverifiable` (fail closed). A device with one allocated TX
+    /// queue (veth: `ip link add ... numtxqueues 1`) never reads sysfs.
     TxQueueCheck,
     /// The device MTU (`IFLA_MTU` of the same rtnetlink answer as
     /// [`Self::TxQueueCheck`]), which bounds TX length.

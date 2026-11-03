@@ -255,12 +255,18 @@ fn a_fatal_event_still_applies_the_exit_actions() {
 }
 
 /// Review M3 (interim posture): the kept privileges are refused without
-/// the syscall filter or the filesystem confinement.
+/// the killing syscall filter (`--seccomp off`, and `log`, which lets every
+/// syscall run: follow-up L2) or the filesystem confinement.
 #[test]
 fn exit_protection_needs_the_filters_on() {
     for (seccomp, fs, code) in [
         (
             SeccompMode::Off,
+            FsConfineMode::Landlock,
+            "EXIT_PROTECTION_NEEDS_SECCOMP",
+        ),
+        (
+            SeccompMode::Log,
             FsConfineMode::Landlock,
             "EXIT_PROTECTION_NEEDS_SECCOMP",
         ),
@@ -285,11 +291,9 @@ fn exit_protection_needs_the_filters_on() {
         );
         assert!(host.events().is_empty());
     }
-    // `--seccomp log` keeps a filter and is accepted.
+    // `--seccomp kill` with Landlock is accepted.
     let host = FakeHost::default();
-    let mut settings = keep();
-    settings.seccomp = SeccompMode::Log;
-    let outcome = run_config(&host, protected(FORWARDING), settings, FIRST_LOOP_CHECK + 2);
+    let outcome = run_config(&host, protected(FORWARDING), keep(), FIRST_LOOP_CHECK + 2);
     assert_eq!(outcome.status, 0, "{}", outcome.err);
 }
 

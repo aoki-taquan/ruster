@@ -640,6 +640,31 @@ fn af_packet_quiescence_waits_for_in_flight_tx_and_then_admits_a_publication() {
 /// returns. Review M1: any other kick outcome (a successful kick, a
 /// deferral, another errno) clears `link_down`, and TX in flight blocks
 /// again.
+/// OPS-EXIT follow-up L1: while another port's TX blocks, the check never
+/// sends the confirming kick to the down port.
+#[test]
+fn af_packet_a_blocked_quiescence_never_probes_the_down_link() {
+    let mut live = Live::new();
+    live.clock(0);
+    // The down port (LAN) comes before the blocking one (WAN).
+    live.fail_kicks(&[ENETDOWN]);
+    assert_eq!(live.generate(LAN, 1, 60), 1);
+    assert!(live.port(LAN).link_down);
+    // WAN publishes a frame the kernel has not completed yet.
+    assert_eq!(live.generate(WAN, 1, 60), 1);
+    let _ = live.kicks();
+    for _ in 0..200 {
+        assert!(matches!(
+            live.engine.quiescence_check(),
+            Err(AfPacketQuiescenceError::TxInFlight { frames: 1 })
+        ));
+    }
+    assert!(
+        live.kicks().iter().all(|(fd, _)| *fd != LAN_FD),
+        "no confirming kick to the down port"
+    );
+}
+
 #[test]
 fn af_packet_quiescence_does_not_wait_for_tx_held_on_a_down_link() {
     let mut live = Live::new();

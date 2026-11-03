@@ -3591,7 +3591,7 @@ XDP-181。sysfsのviewはmountしたnetnsのもので、`setns`後のprocessに�
 `IFLA_NUM_TX_QUEUES`が1ならqueue 0だけが在り、そのまま証明されます。2以上では`ethtool -L`で減り得る
 active数（`real_num_tx_queues`、rtnetlinkは出さない。ethtool netlinkの`CHANNELS_GET`はdriverごとに
 channelとqueueの対応が違うので採らない）をsysfsのviewがこのdeviceを
-示す（`ifindex`一致）ときだけ`queues/tx-<queue>`で確かめ、証明できないviewは`TxQueueUnverifiable`で
+示す（`ifindex`とsysfsの`address`が両方rtnetlinkの`IFLA_ADDRESS`と一致。ifindexはnetnsごとなのでaddressで裏付けるが証明ではない）ときだけ`queues/tx-<queue>`で確かめ、一致しないviewは`TxQueueUnverifiable`で
 fail closedです（review M2）。runtimeの`ethtool -L`などで後からTX queueを失ったstallの検出は
 X04のhealthです。
 
@@ -4113,7 +4113,7 @@ sysctlの書き込みごとに（`proc_sys_call_handler`、drop前に開いたfd
 一つのthreadだけに`CAP_NET_ADMIN`を残す案は、全threadのdrop検証（CLI-090）を崩し、同じaddress spaceの
 code実行には無意味なので採りません。暫定のposture（下のhelperのowner決定まで）: `--keep-privileges`は全
 threadに全capabilityを残すので、`[exit-protection]`は`--seccomp off`（`EXIT_PROTECTION_NEEDS_SECCOMP`）と
-`--fs-confine off`（`EXIT_PROTECTION_NEEDS_FS_CONFINE`）を起動時にexit 2で拒否します（filterが`execve`、
+`--fs-confine off`（`EXIT_PROTECTION_NEEDS_FS_CONFINE`）を起動時にexit 2で拒否します（`--seccomp log`も全syscallを通すので拒否）（filterが`execve`、
 `ptrace`、`mount`、BPF load、NETLINK_ROUTE以外のsocket、書き込みopenを止め、Landlockが読めるfileを限る）。
 既定のdropのままの運用にはsupervisorの`ExecStopPost=`をrunbookで案内します。
 

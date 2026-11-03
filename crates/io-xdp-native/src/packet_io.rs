@@ -1824,8 +1824,22 @@ impl PublicationQuiescence for XdpPacketIo<'_> {
                 });
             }
         }
-        // A link confirmed down by a fresh `ENETDOWN` kick holds its TX
-        // until the link returns: not waited for (OPS-EXIT item 2).
+        // First pass: TX on a port not seen down blocks, without probing any
+        // down port (a pending reload checks about every millisecond while
+        // another port drains; the confirming kick must not bypass the
+        // XDP-178 backoff that often).
+        for port in self.ports.iter() {
+            let in_flight = port.engine.tx_inflight();
+            if in_flight != 0 && !port.link_down {
+                return Err(XdpQuiescenceError::TxInFlight {
+                    interface: port.config.interface,
+                    frames: in_flight,
+                });
+            }
+        }
+        // Second pass, only when nothing else blocks: a link confirmed down
+        // by a fresh `ENETDOWN` kick holds its TX until the link returns:
+        // not waited for (OPS-EXIT item 2).
         for index in 0..self.ports.len() {
             let port = &mut self.ports[index];
             let in_flight = port.engine.tx_inflight();
