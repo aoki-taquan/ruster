@@ -310,7 +310,9 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-67050176 bytes (63.94 MiB). ARP-HOLD added the largest hold table (64
+67050240 bytes (63.94 MiB). GARP (ARP-033) added one 32-byte announcement
+slot per interface (64 bytes for its two interfaces; 67050176 bytes
+before; at most 8 KiB with 256 interfaces). ARP-HOLD added the largest hold table (64
 slots of 40 + 3840 bytes: 248320 bytes; 66801856 bytes, 63.71 MiB,
 before). NAT-FRAG added the largest fragment association
 table (16384 entries of an entry, a host slot, and two directory buckets
@@ -798,7 +800,8 @@ fire on ordinary UDP probes of the router; alert on the forwarding drop
 reasons instead, or exclude the four new codes. The twelve new
 `icmpv4_errors.*` counters are appended after the existing ones, so the
 order of the earlier fields in stats and JSONL is unchanged. Storage is
-unchanged (67050176 bytes for the maximal production config).
+unchanged (67050176 bytes for the maximal production config at the time;
+67050240 since GARP).
 
 ### Source address validation (URPF)
 
@@ -1308,7 +1311,7 @@ now pass the firewall's rules and the NAT on their first fragment, creating
 mappings and firewall state; review the rules if you relied on that drop,
 and expect those counters to fall to 0. The default table adds 305472
 bytes of storage (the maximal production config, with `entries = 16384` and
-`held-fragments = 512`, is 67050176 bytes). A config with every table at
+`held-fragments = 512`, was 67050176 bytes; 67050240 since GARP). A config with every table at
 its production limit and per-host NAT44 limits that just fitted 64 MiB may
 now fail with `RUNTIME_STORAGE_BYTES_EXCEEDED`: lower `[fragment-tracking]
 entries`/`held-fragments` or `[fragmentation] datagrams`, size a table
@@ -1410,7 +1413,8 @@ for configs without `[resolution.hold]`. Datagrams that were dropped as
 `drop.NEIGHBOR_UNRESOLVED` are now held and sent, so that counter falls to
 (near) 0 and `consume.ARP_HELD` rises; firewall and NAT state for them is
 created when they are sent, not dropped. The default table adds 248320
-bytes of storage (the maximal production config is 67050176 bytes). **A
+bytes of storage (the maximal production config was 67050176 bytes;
+67050240 since GARP). **A
 config that just fitted 64 MiB fails after the upgrade with no change of
 its own**: `stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED
 path=resolution.hold.packets` (the path is set when the document fits
@@ -1985,6 +1989,7 @@ holds.
 | `KICK_ERRORS` | kick failures other than `ENETDOWN` grew in every sample | at the first growth | after `kick-errors-fatal-ms` (5000; 0 never) of growth in every sample |
 | `FRAMES_QUARANTINED` | AF_XDP: the port quarantined frames since the last sample (a kernel descriptor broke the frame ownership contract: a completion at another address, an RX descriptor with options, inside the headroom, or past its frame; the frame never returns to the pool, so the UMEM shrinks by one each time) | at the first growth of an episode (recovered after 10 s without growth) | when the port's count since startup reaches `frames-quarantined-fatal` (64; 0 never) |
 | `TX_INVALID_DESCS` | AF_XDP: the kernel's `XDP_STATISTICS` `tx_invalid_descs` of the port grew (it consumed a TX descriptor without sending or completing it; that frame stays in flight for good, so `TX_STALL` follows within `tx-stall-fatal-ms` unless the fatal stall is off) | at the first growth of an episode (recovered after 10 s without growth) | when the count since startup reaches `tx-invalid-descs-fatal` (64; 0 never) |
+| `ARP_ADDRESS_CONFLICT` | another host's ARP packet claimed the port's IPv4 address with another MAC since the last sample (RFC 5227 §2.4; `ifN.watch.arp_address_conflicts`, ARP-039) | at the first growth of an episode (recovered after 10 s without growth) | never |
 
 The names in the table are the `[health]` keys below (defaults in
 parentheses). Neither integrity condition exists on AF_PACKET (no frame
@@ -2787,6 +2792,35 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   that interface). Off (default), such hosts are learned and answered as
   before H4c; the counter stays 0. The option is reloadable (`ruster plan`
   shows `arp ~ changed`).
+- **ARP Announcements (GARP, ARP-033..ARP-039).** The router announces
+  each interface address with RFC 5227 ARP Announcements (an ARP Request,
+  broadcast, sender IP = target IP = the address, target MAC zero): at
+  startup once the ports are open, after a port's link comes back up
+  (the `recovered: ... health=LINK_DOWN` line), and after a reload that
+  adds or changes the interface's address (an unchanged address is not
+  announced). Each is `announce-count` frames (default 2, RFC 5227
+  ANNOUNCE_NUM) `announce-interval-ms` apart (default 2000,
+  ANNOUNCE_INTERVAL), the first at once. Two sequences on one port start
+  at least `announce-min-interval-ms` apart (default 10000): triggers in
+  between are folded into one later sequence (`arp_announce.coalesced`,
+  `arp_announce.rate_limited`), so a flapping link costs at most
+  `announce-count` frames per minimum interval. They use the generated
+  ARP frame budget (`[tick] generated-arp`) after the resolution requests.
+  `[arp] announce = false` turns them off (reloadable). The router does
+  not send RFC 5227 Probes before using its static addresses (ARP-036):
+  it could not pick another address anyway.
+- **Address conflicts (ARP-038, ARP-039).** An ARP Request or Reply on a
+  port whose sender IP is the port's address and whose sender MAC is not
+  the port's MAC is a conflict: another host uses the router's address.
+  It is counted (`arp_announce.conflicts`, `ifN.watch.arp_address_conflicts`)
+  and reported once per episode as `warning: port=ifN
+  health=ARP_ADDRESS_CONFLICT` (no address or MAC in the line; find the
+  host with a capture on the link), recovered after 10 s without one; it
+  never stops the router. With `[arp] conflict-defense = true` (default,
+  RFC 5227 §2.4 (c)) the router answers with one Announcement, at most
+  one per 10 s (DEFEND_INTERVAL) per port (`arp_announce.defended`,
+  `arp_announce.defense_suppressed`); `false` only counts and reports.
+  Neither puts the other host into the neighbour cache.
 - NAT44 slot reuse and port selection
   are O(1) per new flow since H4a (NAT44-035). What NAT44 still does in
   more than constant time: a keyed directory lookup walks its hash chain
@@ -3639,6 +3673,7 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `health=TX_INVALID_DESCS` | 1 at `tx-invalid-descs-fatal` | the kernel refused TX descriptors (`kernel_tx_invalid_descs`); those frames never complete | a geometry mismatch between the router and the kernel (UMEM, headroom, MTU) or a kernel bug: compare the device MTU and `max_frame`, restart; `TX_STALL` usually follows |
 | `reload failed: stage=health code=HEALTH_FATAL_BELOW_WARNING` | — | the reloaded `[health]` keys and the threshold flags disagree (fatal TX stall below the warning) | set both `tx-stall-warn-ms` and `tx-stall-fatal-ms` in the config, or drop the flag (section 7) |
 | `health=LINK_DOWN` | — | carrier or admin down | fix the link; forwarding resumes by itself |
+| `health=ARP_ADDRESS_CONFLICT` | — | another host on that link uses the router's address (a conflicting ARP packet, RFC 5227 §2.4); with `conflict-defense` the router re-announces at most every 10 s | find the host (`tcpdump -e arp` on the link shows its MAC; the log line carries none) and fix its address |
 | `health=DEVICE_REMOVED` | 1 | the port device is gone | restore the device, then restart |
 | `health=DEVICE_RENAMED`, `checks code=UNVERIFIABLE probe=name` | 1 | the port's interface index carries another name than the config's `device` | rename it back or fix the config, then restart |
 | `stage=notify code=NOTIFY_SOCKET_INVALID\|WATCHDOG_USEC_INVALID\|WATCHDOG_PID_INVALID\|NOTIFY_SOCKET_OPEN` | 1 | the service manager's notification environment is not usable (section 5, "Service notification") | fix the unit's environment (`NOTIFY_SOCKET` must be an absolute path or `@name`) |

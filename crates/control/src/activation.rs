@@ -192,21 +192,22 @@ use std::{marker::PhantomData, num::NonZeroU64};
 
 use ruster_core::{
     ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_tombstones, port_free_bitmap_words,
-    ArpHoldRuntime, ArpHoldSlot, ArpHoldStorageError, DirectoryBucket, DirectoryNode,
-    DynamicNeighborSlot, FirewallReconcileError, FirewallReconcileReport, FirewallRuntime,
-    FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError,
-    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot,
-    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
-    Ipv4FragmentTracker, Ipv4FragmentTrackingStorage, Ipv4FragmentTrackingStorageError,
-    Ipv4FragmentationRuntime, Ipv4FragmentationStorageError, Nat44HostCounter, Nat44HostLink,
-    Nat44HostSlot, Nat44HostStorage, Nat44IcmpReconcileError, Nat44IcmpReconcilePermit,
-    Nat44IcmpReconcileReport, Nat44IcmpRuntime, Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage,
-    Nat44TcpMappingSlot, Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime,
-    Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport,
-    Nat44UdpRuntime, Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPublicationError,
-    ResolutionPublicationReport, ResolutionRuntime, ResolutionStateSlot,
+    ArpAnnounceSlot, ArpHoldRuntime, ArpHoldSlot, ArpHoldStorageError, DirectoryBucket,
+    DirectoryNode, DynamicNeighborSlot, FirewallReconcileError, FirewallReconcileReport,
+    FirewallRuntime, FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError,
+    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
+    Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot,
+    Ipv4FragmentTombstoneSlot, Ipv4FragmentTracker, Ipv4FragmentTrackingStorage,
+    Ipv4FragmentTrackingStorageError, Ipv4FragmentationRuntime, Ipv4FragmentationStorageError,
+    Nat44HostCounter, Nat44HostLink, Nat44HostSlot, Nat44HostStorage, Nat44IcmpReconcileError,
+    Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
+    Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError,
+    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot,
+    Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
+    PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
+    ResolutionStateSlot,
 };
 use ruster_core::{
     FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
@@ -243,6 +244,8 @@ pub struct FullServiceStorage {
     resolution_actions: Box<[ResolutionActionSlot]>,
     dynamic_neighbors: Box<[DynamicNeighborSlot]>,
     failure_holds: Box<[ResolutionFailureHoldSlot]>,
+    /// One RFC 5227 announcement slot per interface (ARP-033).
+    arp_announce: Box<[ArpAnnounceSlot]>,
     icmpv4_states: Box<[Icmpv4ErrorStateSlot]>,
     icmpv4_actions: Box<[Icmpv4ErrorActionSlot]>,
     udp: NatTables<Nat44UdpMappingSlot, Nat44UdpPeerSlot>,
@@ -395,6 +398,11 @@ impl FullServiceStorage {
             failure_holds: slots(
                 resolution.failure_hold_slots(),
                 ResolutionFailureHoldSlot::EMPTY,
+                Resolution,
+            )?,
+            arp_announce: slots(
+                resolution.announce_slots(),
+                ArpAnnounceSlot::EMPTY,
                 Resolution,
             )?,
             icmpv4_states: slots(
@@ -1001,6 +1009,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             resolution_actions,
             dynamic_neighbors,
             failure_holds,
+            arp_announce,
             icmpv4_states,
             icmpv4_actions,
             udp,
@@ -1144,7 +1153,8 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             dynamic_neighbors,
             failure_holds,
             authority.resolution_hash_key(),
-        );
+        )
+        .with_announce_slots(arp_announce, &authority.snapshot());
         // The translated error limiter (NAT44-065) hashes with the
         // publication's secret resolution key in its own domain.
         let icmpv4_errors = Icmpv4ErrorRuntime::new(
@@ -1193,6 +1203,28 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
     #[must_use]
     pub const fn resolution(&self) -> &ResolutionRuntime<'storage> {
         &self.runtimes.resolution
+    }
+
+    /// When the next waiting or running ARP announcement is due, for the
+    /// idle wait (`None`: none waits).
+    #[must_use]
+    pub fn next_arp_announcement_due(&self) -> Option<ruster_core::MonotonicMillis> {
+        self.runtimes
+            .resolution
+            .next_announcement_due(&self.candidate.authority().snapshot())
+    }
+
+    /// Marks `interface` (every interface when `None`) to send RFC 5227
+    /// ARP Announcements of its IPv4 address from the next tick's
+    /// generated ARP phase (ARP-033): `ruster run` calls it once the ports
+    /// are open (startup) and after a port's link comes back up. Bounded
+    /// by `[arp] announce-min-interval-ms` per interface; a no-op with
+    /// `[arp] announce = false`. Returns the interfaces newly marked.
+    pub fn request_arp_announcements(&mut self, interface: Option<IfId>) -> usize {
+        let snapshot = self.candidate.authority().snapshot();
+        self.runtimes
+            .resolution
+            .request_announcements(&snapshot, interface)
     }
 
     #[must_use]
@@ -1395,6 +1427,13 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
         // that a future caller left from carrying the old publication's
         // egress and MACs. The policy and slots are part of the shape, which
         // successor validation found unchanged.
+        // RFC 5227 §2.3 (ARP-037): an interface whose IPv4 address the
+        // successor adds or changes announces it; an unchanged address does
+        // not, whatever `[reload] state` says.
+        self.runtimes.resolution.announce_changed_bindings(
+            &self.candidate.authority().snapshot(),
+            &successor.authority().snapshot(),
+        );
         if let Some(fragmentation) = self.runtimes.fragmentation.as_mut() {
             fragmentation.flush();
         }

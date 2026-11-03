@@ -242,6 +242,8 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 actions: 3,
                 dynamic_neighbors: 4,
                 failure_holds: 5,
+                // One RFC 5227 announcement slot per interface (ARP-033).
+                announce_slots: 2,
             }),
             icmpv4_errors: Some(ruster_config::Icmpv4ErrorStorageShapeV1 {
                 states: 5,
@@ -299,6 +301,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 3 * size_of::<ResolutionActionSlot>()
         + 4 * size_of::<DynamicNeighborSlot>()
         + 5 * size_of::<ResolutionFailureHoldSlot>()
+        + 2 * size_of::<ruster_core::ArpAnnounceSlot>()
         + 5 * size_of::<Icmpv4ErrorStateSlot>()
         + 3 * size_of::<Icmpv4ErrorActionSlot>()
         + 3 * size_of::<Nat44UdpMappingSlot>()
@@ -1663,6 +1666,87 @@ fn arp_policy_maps_onto_the_core_policy() {
         validated(&with("require-on-link-sender = true\n")).arp(),
         ArpPolicy::RFC826.with_require_on_link_sender(true)
     );
+}
+
+/// ARP-034: the RFC 5227 announcement keys of `[arp]`. Absent, they are
+/// RFC 5227 (ANNOUNCE_NUM 2, ANNOUNCE_INTERVAL 2 s), the local 10 s
+/// minimum interval, and the §2.4 (c) defense on; each value is checked
+/// even with `announce = false`, and a bad one is `ARP_ANNOUNCE_POLICY` at
+/// its key. The switches do not change the storage shape (reloadable).
+#[test]
+fn arp_announce_keys_default_to_rfc_5227_and_fail_closed() {
+    use ruster_core::{ArpAnnouncePolicy, ArpAnnouncePolicyError, ArpPolicy};
+
+    let with = |body: &str| {
+        VALID.replacen(
+            "[resolution.policy]",
+            &format!("[arp]\n{body}\n[resolution.policy]"),
+            1,
+        )
+    };
+    let defaults = validated(VALID);
+    assert_eq!(defaults.arp().announce(), Some(ArpAnnouncePolicy::RFC5227));
+    assert_eq!(
+        (
+            ArpAnnouncePolicy::RFC5227.count(),
+            ArpAnnouncePolicy::RFC5227.interval_ms(),
+            ArpAnnouncePolicy::RFC5227.min_interval_ms(),
+        ),
+        (2, 2_000, 10_000)
+    );
+    assert!(defaults.arp().defend_conflicts());
+    let off = validated(&with("announce = false\nconflict-defense = false\n"));
+    assert_eq!(
+        off.arp(),
+        ArpPolicy::RFC826
+            .with_announce(None)
+            .with_defend_conflicts(false)
+    );
+    assert_eq!(off.storage_shape(), defaults.storage_shape());
+    assert_eq!(
+        validated(&with(
+            "announce-count = 3\nannounce-interval-ms = 1000\nannounce-min-interval-ms = 5000\n"
+        ))
+        .arp()
+        .announce(),
+        Some(ArpAnnouncePolicy::new(3, 1_000, 5_000).unwrap())
+    );
+    for (keys, code, field) in [
+        (
+            "announce-count = 0",
+            ArpAnnouncePolicyError::CountOutOfRange,
+            "arp.announce-count",
+        ),
+        (
+            "announce-count = 11",
+            ArpAnnouncePolicyError::CountOutOfRange,
+            "arp.announce-count",
+        ),
+        (
+            "announce-interval-ms = 999",
+            ArpAnnouncePolicyError::IntervalOutOfRange,
+            "arp.announce-interval-ms",
+        ),
+        (
+            "announce-min-interval-ms = 1999",
+            ArpAnnouncePolicyError::MinIntervalOutOfRange,
+            "arp.announce-min-interval-ms",
+        ),
+        (
+            "announce = false\nannounce-min-interval-ms = 3600001",
+            ArpAnnouncePolicyError::MinIntervalOutOfRange,
+            "arp.announce-min-interval-ms",
+        ),
+    ] {
+        let rejected = error(&with(&format!("{keys}\n")));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::ArpAnnouncePolicy(code),
+            "{keys}"
+        );
+        assert_eq!(rejected.code().code(), "ARP_ANNOUNCE_POLICY");
+        assert_eq!(dotted(rejected.path()), field, "{keys}");
+    }
 }
 
 /// N5: `[nat44.icmp]` maps onto the core ICMP query policy with RFC 5508

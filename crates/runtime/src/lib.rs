@@ -3,7 +3,8 @@
 
 use ruster_core::{
     dispatch_host_unreachable_failures, dispatch_nat44_tcp_unsolicited_syns,
-    execute_one_arp_request, execute_one_icmpv4_error, execute_one_ipv4_fragmentation,
+    execute_one_arp_announcement, execute_one_arp_request, execute_one_icmpv4_error,
+    execute_one_ipv4_fragmentation,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking_and_arp_hold,
     poll_resolution_timers, replay_arp_holds, ArpHoldRuntime, ArpRequestBuildError, BatchReport,
     ExecuteArpRequestError, ExecuteIcmpv4Error, FirewallConfig, FirewallRuntime,
@@ -751,6 +752,7 @@ fn add_generated_accounting<E>(
 fn run_generated_arp<I, T>(
     io: &mut I,
     runtime: &mut ResolutionRuntime<'_>,
+    snapshot: &ForwardingSnapshot<'_>,
     now: MonotonicMillis,
     budget: usize,
     trace: &mut T,
@@ -764,7 +766,13 @@ where
 {
     let mut accounting = GeneratedAccounting::default();
     for _ in 0..budget {
-        let result = match execute_one_arp_request(io, runtime, now, trace) {
+        // Resolution Requests first, then the RFC 5227 Announcements of
+        // the router's own addresses (ARP-033), within the same budget.
+        let executed = match execute_one_arp_request(io, runtime, now, trace) {
+            Ok(None) => execute_one_arp_announcement(io, runtime, snapshot, now, trace),
+            other => other,
+        };
+        let result = match executed {
             Ok(Some(result)) => result,
             Ok(None) => {
                 return (
@@ -828,7 +836,7 @@ where
             );
         }
     }
-    let pending = runtime.pending_actions();
+    let pending = runtime.pending_actions() + runtime.pending_announcements();
     (
         GeneratedPhaseReport {
             accounting,
@@ -1387,7 +1395,7 @@ where
     } else {
         trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::GeneratedArp));
         let (report, downstream_skip) =
-            run_generated_arp(io, resolution, now, budgets.generated_arp, trace);
+            run_generated_arp(io, resolution, &snapshot, now, budgets.generated_arp, trace);
         trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::GeneratedArp));
         (PhaseReport::Completed(report), downstream_skip)
     };

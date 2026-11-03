@@ -448,7 +448,8 @@ NAT44 inboundの判定のまま）。NAT inbound/hairpin/ICMP query NATの経路
 出さずsilentのままです（residual）。
 
 pointerはFragmentation NeededのNext-Hop MTUと同じaction field（`header_value`）に入るので、action
-slotは592 bytesのまま、最大production configのstorage（67050176 bytes）は変わりません。
+slotは592 bytesのまま、最大production configのstorage（67050176 bytes）は変わりません
+（GARPのannouncement slotで67050240 bytes）。
 
 ### egress MTU（MTU1、RFC 1812 §4.2.2.7、RFC 1191 §4）
 
@@ -789,6 +790,18 @@ MAC/refresh時刻やpending resolutionを変更しません。
 - local SPA claimの保護はlink scopedで、`(ingress IfId, SPA)`がlocal bindingと一致する場合
   だけ学習しない。同じIPv4値が別interfaceのlocal bindingでも、ingress上では通常peerとして
   学習できる。
+- RFC 5227 Announcement（GARP、ARP-033〜ARP-039）: resolution runtimeはforwarding snapshotの
+  interfaceごとに一つの`ArpAnnounceSlot`（32 bytes、caller storage、slot iはsnapshotのi番目の
+  interface）を持つ。trigger（`ruster run`の起動とlink-up、publication commit後のaddress追加・
+  変更）はslotに印を付けるだけで、generated ARP phaseがresolution Requestの後に同じframe
+  budgetで、送信時点のsnapshotのMACとaddressからAnnouncement（sender IP = target IP、target
+  MAC zero、broadcast）をbackend所有のgenerated frameへ組む（allocation、copyなし）。
+  `[arp] announce-count`回を`announce-interval-ms`間隔で、同じslotのsequence開始は
+  `announce-min-interval-ms`以上離す（間のtriggerは一つにまとめて後で始める）。待ちも実行中も
+  無ければO(1)。RX pathはlocal SPAで他MACのARPをconflictとして数え（slot indexはsnapshot
+  indexの二分探索）、`conflict-defense`ならDEFEND_INTERVAL（10 s）に一度だけAnnouncementを
+  予約する。policyはforwarding snapshotの`ArpPolicy`にflattenして持ち（by-value snapshotは
+  88→96 bytes）、slot数はinterface数で固定なのでon/offはreloadできる。Probe（§2.1）は送らない。
 - SPAのon-link条件（ARP-031）はopt-inです（`[arp] require-on-link-sender`、既定`false`）。
   既定はRFC 826どおりで、mergeとreplyはsender addressに条件を課さず、off-linkのsenderも
   routerがtargetなら学習してreplyし、既知なら更新する（ARP-032）。H4c（#311）では無条件の

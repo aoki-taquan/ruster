@@ -994,16 +994,87 @@ impl Default for Ipv4OriginPolicy {
 /// address on the ingress, answered. ARP-031 on-link sender hardening is an
 /// opt-in (owner decision 2026-11-02 「rfc準きょで」; the reading "RFC default,
 /// hardening opt-in" is the coordinator's).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+///
+/// The default also follows RFC 5227 for the router's own addresses
+/// (ARP-033..ARP-039; RFC 5227 §1.3: "host" applies equally to router
+/// interfaces): ANNOUNCE_NUM (2) ARP Announcements ANNOUNCE_INTERVAL (2 s)
+/// apart when an address becomes active (§2.3), and the §2.4 (c) defense
+/// of an address the router never gives up: at most one Announcement per
+/// DEFEND_INTERVAL (10 s) after a conflicting ARP packet. Both can be
+/// switched off; conflict detection and its counters stay on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpPolicy {
     require_on_link_sender: bool,
+    defend_conflicts: bool,
+    // The announcement policy, flattened so the by-value snapshot grows by
+    // 8 bytes only (RT-002): `announce_count` 0 means announcements off.
+    announce_count: u8,
+    announce_interval_ms: u32,
+    announce_min_interval_ms: u32,
+}
+
+impl Default for ArpPolicy {
+    fn default() -> Self {
+        Self::RFC826
+    }
 }
 
 impl ArpPolicy {
-    /// RFC 826: no condition on the sender's protocol address.
+    /// RFC 826: no condition on the sender's protocol address; RFC 5227
+    /// announcements ([`crate::ArpAnnouncePolicy::RFC5227`]) and the §2.4
+    /// (c) conflict defense on.
     pub const RFC826: Self = Self {
         require_on_link_sender: false,
+        defend_conflicts: true,
+        announce_count: crate::ArpAnnouncePolicy::RFC5227.count(),
+        announce_interval_ms: crate::ArpAnnouncePolicy::RFC5227.interval_ms_u32(),
+        announce_min_interval_ms: crate::ArpAnnouncePolicy::RFC5227.min_interval_ms_u32(),
     };
+
+    /// Returns this policy with RFC 5227 §2.3 announcements of the router's
+    /// own addresses set to `announce` (`None`: never announce).
+    #[must_use]
+    pub const fn with_announce(self, announce: Option<crate::ArpAnnouncePolicy>) -> Self {
+        match announce {
+            Some(policy) => Self {
+                announce_count: policy.count(),
+                announce_interval_ms: policy.interval_ms_u32(),
+                announce_min_interval_ms: policy.min_interval_ms_u32(),
+                ..self
+            },
+            None => Self {
+                announce_count: 0,
+                ..self
+            },
+        }
+    }
+
+    /// Returns this policy with the RFC 5227 §2.4 (c) defense (one
+    /// Announcement per DEFEND_INTERVAL after a conflicting ARP packet)
+    /// enabled or disabled. Detection and counting stay on either way.
+    #[must_use]
+    pub const fn with_defend_conflicts(self, enabled: bool) -> Self {
+        Self {
+            defend_conflicts: enabled,
+            ..self
+        }
+    }
+
+    /// The announcement policy, `None` when announcements are off.
+    #[must_use]
+    pub const fn announce(self) -> Option<crate::ArpAnnouncePolicy> {
+        crate::ArpAnnouncePolicy::from_parts(
+            self.announce_count,
+            self.announce_interval_ms,
+            self.announce_min_interval_ms,
+        )
+    }
+
+    /// Whether a conflicting ARP packet is defended (RFC 5227 §2.4 (c)).
+    #[must_use]
+    pub const fn defend_conflicts(self) -> bool {
+        self.defend_conflicts
+    }
 
     /// Returns this policy with the ARP-031 on-link sender rule enabled or
     /// disabled.
@@ -1020,6 +1091,7 @@ impl ArpPolicy {
     pub const fn with_require_on_link_sender(self, enabled: bool) -> Self {
         Self {
             require_on_link_sender: enabled,
+            ..self
         }
     }
 
@@ -1372,6 +1444,25 @@ impl<'a> ForwardingSnapshot<'a> {
             Some(index) => index.interface(id).0.map(|slot| &self.interfaces[slot]),
             None => linear::interface(self.interfaces, id),
         }
+    }
+
+    /// The position of the interface `id` in the snapshot's interface
+    /// table (bounded binary search over the owner index; linear
+    /// reference without one).
+    #[inline]
+    pub(crate) fn interface_slot(&self, id: IfId) -> Option<usize> {
+        match self.index {
+            Some(index) => index.interface(id).0,
+            None => self
+                .interfaces
+                .iter()
+                .position(|interface| interface.id == id),
+        }
+    }
+
+    /// The interfaces of the snapshot, in table order.
+    pub(crate) const fn interfaces(&self) -> &'a [Interface] {
+        self.interfaces
     }
 
     /// The local IPv4 binding of `interface` (at most one per interface).
@@ -8185,6 +8276,9 @@ fn decide_arp<T: TraceSink>(
             }
         } else if sender_local {
             if runtime.observe_control(*now) {
+                // RFC 5227 §2.4: another MAC claiming this address is a
+                // conflicting ARP packet (counted, defended when on).
+                runtime.observe_local_sender(snapshot, ingress, arp.sender_hardware, *now);
                 ControlDisposition::LocalAddressPreserved
             } else {
                 ControlDisposition::ClockRegression
@@ -8682,13 +8776,17 @@ mod tests {
             format!("{first_snapshot:?}"),
             "ForwardingSnapshot { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
-             arp: ArpPolicy { require_on_link_sender: false }, source_validation_len: 0, .. }"
+             arp: ArpPolicy { require_on_link_sender: false, defend_conflicts: true, \
+             announce_count: 2, announce_interval_ms: 2000, announce_min_interval_ms: 10000 }, \
+             source_validation_len: 0, .. }"
         );
         assert_eq!(
             format!("{first:?}"),
             "ValidatedForwardingOwner { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
-             arp: ArpPolicy { require_on_link_sender: false }, source_validation_len: 0, .. }"
+             arp: ArpPolicy { require_on_link_sender: false, defend_conflicts: true, \
+             announce_count: 2, announce_interval_ms: 2000, announce_min_interval_ms: 10000 }, \
+             source_validation_len: 0, .. }"
         );
     }
 

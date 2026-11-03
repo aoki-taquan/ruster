@@ -448,7 +448,8 @@ pub(crate) fn required_services(
             resolution_shape.actions,
             resolution_shape.dynamic_neighbors,
             resolution_shape.failure_holds,
-        ),
+        )
+        .with_announce_slots(resolution_shape.announce_slots),
         Icmpv4ErrorStorageShape::new(icmpv4_shape.states, icmpv4_shape.actions),
         Nat44UdpStoragePlan::new(
             udp_shape.mappings,

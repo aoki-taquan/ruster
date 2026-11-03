@@ -134,7 +134,9 @@ fn worst_case_bytes() -> usize {
         * (size_of::<ResolutionStateSlot>()
             + size_of::<ResolutionActionSlot>()
             + size_of::<DynamicNeighborSlot>())
-        + quote * size_of::<ResolutionFailureHoldSlot>();
+        + quote * size_of::<ResolutionFailureHoldSlot>()
+        // One RFC 5227 announcement slot per interface (two, ARP-033).
+        + 2 * size_of::<ruster_core::ArpAnnounceSlot>();
     let icmpv4 =
         slots * size_of::<Icmpv4ErrorStateSlot>() + quote * size_of::<Icmpv4ErrorActionSlot>();
     let udp = slots * (size_of::<Nat44UdpMappingSlot>() + size_of::<Nat44UdpPeerSlot>())
@@ -201,7 +203,7 @@ fn fragmentation_bytes(datagrams: u32) -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 67_050_176;
+    const WORST_CASE: usize = 67_050_240;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 
@@ -252,7 +254,7 @@ fn the_maximal_config_with_per_host_limits_still_fits_the_bound() {
         - fragment_tracking_bytes(MAX_FRAGMENT_TRACKING_ENTRIES, MAX_FRAGMENT_TRACKING_HELD)
         - arp_hold_bytes(ARP_HOLD_MAX_PACKETS)
         + host_bytes;
-    assert_eq!(worst_case, 67_106_128);
+    assert_eq!(worst_case, 67_106_192);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let text = MAXIMAL
@@ -317,7 +319,7 @@ fn the_maximal_config_with_a_session_limit_fits_and_all_limits_fail_closed() {
         - fragment_tracking_bytes(MAX_FRAGMENT_TRACKING_ENTRIES, MAX_FRAGMENT_TRACKING_HELD)
         - arp_hold_bytes(ARP_HOLD_MAX_PACKETS)
         + session_host_bytes;
-    assert_eq!(worst_case, 67_072_192);
+    assert_eq!(worst_case, 67_072_256);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let with_sessions = MAXIMAL

@@ -269,8 +269,10 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
     #[cfg(target_pointer_width = "64")]
     {
         // URPF added the per-interface source validation bindings (a
-        // borrowed slice, 16 bytes) to the by-value snapshot.
-        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 104);
+        // borrowed slice, 16 bytes) to the by-value snapshot; ARP-033 the
+        // flattened RFC 5227 announcement policy (8 bytes past the ARP and
+        // IPv4 origin policies' padding).
+        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 112);
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
         // N1 added the opening and closing idle TTLs to the TCP policy, and

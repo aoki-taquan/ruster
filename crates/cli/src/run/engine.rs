@@ -701,6 +701,9 @@ where
     let mut on_demand_stats = OnDemandStats::default();
     let mut budgets = control.reloader.budgets();
     let mut ops = control.reloader.ops();
+    // Ports whose link came back up in a link round (ARP-033); filled by
+    // `watch_step`, drained into announcement requests.
+    let mut link_ups = Vec::with_capacity(datapath.port_count());
     loop {
         if stop.stop() {
             return LoopEnd::Signal;
@@ -890,8 +893,23 @@ where
         }
         let busy = tick_was_busy(&report);
         drop(report);
-        if let Some(end) = watch_step(datapath, control, now, settings, err) {
+        let end = watch_step(
+            datapath,
+            control,
+            now,
+            settings,
+            err,
+            active.resolution().address_conflicts(),
+            &mut link_ups,
+        );
+        if let Some(end) = end {
             return end;
+        }
+        // RFC 5227 §2.1/§2.3 (ARP-033): a port whose link came back up
+        // announces its address from the next tick, bounded per port by
+        // `[arp] announce-min-interval-ms`.
+        for port in link_ups.drain(..) {
+            active.request_arp_announcements(Some(port));
         }
         // Here, between ticks, so a router stuck anywhere stops pinging.
         control.notify.watchdog(now);
@@ -954,6 +972,7 @@ where
                     watch_due,
                     control.notify.watchdog_due(),
                     on_demand_stats.next_due(),
+                    active.next_arp_announcement_due(),
                 ]
                 .into_iter()
                 .flatten()
@@ -1045,19 +1064,29 @@ fn bump(counter: &mut u64) {
 /// round: a finished round is folded in, a due one is requested (or
 /// counted late, and stale past the threshold, while the previous one
 /// still runs). Returns the first fatal event as the loop end.
-pub(super) fn watch_step<D, E>(
+pub(super) fn watch_step<D, E, A>(
     datapath: &mut D,
     control: &mut Control,
     now: MonotonicMillis,
     settings: LoopSettings,
     err: &mut E,
+    arp_conflicts: A,
+    link_ups: &mut Vec<IfId>,
 ) -> Option<LoopEnd>
 where
     D: Datapath,
     E: Write,
+    A: IntoIterator<Item = (IfId, u32)>,
 {
     let mut end = None;
     let mut on_event = |event: WatchEvent| {
+        if let WatchEvent::Recovered {
+            port,
+            condition: super::watch::Condition::LinkDown,
+        } = event
+        {
+            link_ups.push(port);
+        }
         if let WatchEvent::Fatal { port, cause } = event {
             if end.is_some() {
                 return;
@@ -1073,6 +1102,10 @@ where
             HealthSample::Port(sample) => watch.on_sample(now, sample, &mut on_event),
             HealthSample::Integrity(sample) => watch.on_integrity(now, sample, &mut on_event),
         });
+        // Conflicting ARP packets for each port's address (ARP-039).
+        for (interface, count) in arp_conflicts {
+            watch.on_arp_conflicts(now, interface, u64::from(count), &mut on_event);
+        }
     }
     if let Some(round) = control.links.poll() {
         watch.on_round(round, &mut on_event);

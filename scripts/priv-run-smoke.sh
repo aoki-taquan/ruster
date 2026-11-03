@@ -311,6 +311,16 @@
 #             overflows within 0.3 s at that rate). Link rounds keep coming
 #             (watch.link_rounds, no stale round); SIGTERM exits 0 with no
 #             abandoned worker and nothing attached
+#   announce  (ARP-033..ARP-039) RFC 5227 announcements, captured on pb
+#             with an AF_PACKET (ETH_P_ARP) socket in host B: at startup
+#             exactly 2 ARP Requests with sender = target = 203.0.113.2 from
+#             02:00:00:00:00:02, broadcast, about 2 s apart; after rb
+#             down/up (LINK_DOWN warned and recovered) 2 more; a conflicting
+#             ARP Reply from host B claiming 203.0.113.2 warns
+#             ARP_ADDRESS_CONFLICT (no address or MAC in the log), counts
+#             arp_announce.conflicts=1 and if2.watch.arp_address_conflicts=1,
+#             and is defended by exactly one announcement; with `[arp]
+#             announce = false` nothing is announced; exit 0 each
 #   idle      (H9) an idle router blocks in poll() on its port sockets: over
 #             3 s without traffic the router thread (the main thread) wakes
 #             at most 400 times per second (voluntary context switches;
@@ -1343,7 +1353,7 @@ phase_idle
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=67050176 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=67050240 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -1367,7 +1377,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 67050176 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 67050240 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
@@ -3047,6 +3057,128 @@ phase_arphold() {
 }
 phase_arphold
 
+# announce: RFC 5227 ARP Announcements of the router's own addresses
+# (ARP-033..ARP-039). Host B captures every ARP frame on pb with an
+# AF_PACKET (ETH_P_ARP) socket and prints "<seconds> <op> <sha> <spa> <tpa>"
+# per frame, from the time it prints "ready" until the stop file appears.
+ARP_CAPTURE='
+import os, socket, sys, time
+iface, stopfile, deadline = sys.argv[1], sys.argv[2], time.monotonic() + float(sys.argv[3])
+cap = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+cap.bind((iface, 0x0806))
+cap.settimeout(0.05)
+start = time.monotonic()
+print("ready", flush=True)
+while time.monotonic() < deadline and not os.path.exists(stopfile):
+    try:
+        frame, addr = cap.recvfrom(65535)
+    except socket.timeout:
+        continue
+    if addr[2] == socket.PACKET_OUTGOING or len(frame) < 42:
+        continue
+    op = int.from_bytes(frame[20:22], "big")
+    sha = frame[22:28].hex(":")
+    spa = ".".join(str(b) for b in frame[28:32])
+    tpa = ".".join(str(b) for b in frame[38:42])
+    dst = frame[0:6].hex(":")
+    print("%.3f %d %s %s %s %s" % (time.monotonic() - start, op, sha, spa, tpa, dst), flush=True)
+'
+# Host B claims an address of the router: one ARP Reply from pb's own MAC
+# with sender IP $2, broadcast (a conflicting ARP packet, RFC 5227 §2.4).
+ARP_CLAIM='
+import socket, sys
+iface, claimed = sys.argv[1], bytes(int(x) for x in sys.argv[2].split("."))
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+s.bind((iface, 0x0806))
+mac = s.getsockname()[4][:6]
+body = bytes([0, 1, 8, 0, 6, 4, 0, 2]) + mac + claimed + mac + bytes([203, 0, 113, 1])
+s.send(b"\xff" * 6 + mac + b"\x08\x06" + body + bytes(60 - 14 - len(body)))
+'
+# The announcements of 203.0.113.2 (sender = target, broadcast, from the
+# router's wan MAC) in capture file $1, one start time per line.
+announcements() {
+    awk '$2 == 1 && $3 == "02:00:00:00:00:02" && $4 == "203.0.113.2" &&
+        $5 == "203.0.113.2" && $6 == "ff:ff:ff:ff:ff:ff" { print $1 }' "$1"
+}
+phase_announce() {
+    # A 2 s minimum interval (one sequence) so the link-up below, more
+    # than 2 s after startup, announces again at once.
+    printf '\n[arp]\nannounce-min-interval-ms = 2000\n' |
+        cat "$work/router.toml" - >"$work/announce.toml"
+    capture="$work/announce-capture.txt"
+    rm -f "$stopfile"
+    in_ns "$host_b" python3 -I -c "$ARP_CAPTURE" pb "$stopfile" 30 >"$capture" 2>&1 &
+    capturer=$!
+    tries=0
+    while ! grep -q ready "$capture" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "announce: capture not ready"
+        sleep 0.05
+    done
+    start_ruster announce "$work/announce.toml"
+    wait_ready announce || fail "announce: ruster exited during startup"
+    # Startup: ANNOUNCE_NUM (2) Announcements ANNOUNCE_INTERVAL (2 s) apart.
+    sleep 3
+    [ "$(announcements "$capture" | wc -l)" -eq 2 ] ||
+        fail "announce: startup did not send exactly 2 announcements: $(cat "$capture")"
+    gap=$(announcements "$capture" | awk 'NR == 1 { a = $1 } NR == 2 { print $1 - a }')
+    awk -v g="$gap" 'BEGIN { exit !(g >= 1.9 && g <= 3.0) }' ||
+        fail "announce: startup announcements $gap s apart"
+    echo "priv_run_announce_startup: 2 RFC 5227 announcements of 203.0.113.2 from 02:00:00:00:00:02 on pb, $gap s apart verified"
+
+    # Link-up: one more sequence on that port.
+    sudo -n ip -n "$router" link set rb down
+    wait_line announce "warning: port=if2 health=LINK_DOWN"
+    sudo -n ip -n "$router" link set rb up
+    wait_line announce "recovered: port=if2 health=LINK_DOWN"
+    sleep 3
+    [ "$(announcements "$capture" | wc -l)" -eq 4 ] ||
+        fail "announce: link-up did not send 2 more announcements: $(cat "$capture")"
+    echo "priv_run_announce_link_up: link down/up on rb sent 2 more announcements verified"
+
+    # A conflicting ARP packet: counted, logged value-free, and defended by
+    # one announcement (RFC 5227 §2.4 (c)).
+    in_ns "$host_b" python3 -I -c "$ARP_CLAIM" pb 203.0.113.2 ||
+        fail "announce: could not send the conflicting ARP packet"
+    wait_line announce "warning: port=if2 health=ARP_ADDRESS_CONFLICT"
+    sleep 1
+    [ "$(announcements "$capture" | wc -l)" -eq 5 ] ||
+        fail "announce: the conflict was not defended once: $(cat "$capture")"
+    touch "$stopfile"
+    wait "$capturer" || fail "announce: capture failed: $(cat "$capture")"
+    natfrag_stop announce
+    block_has "$work/announce.final" arp_announce.conflicts=1 arp_announce.defended=1 \
+        if2.watch.arp_address_conflicts=1
+    if grep -q '02:00:00:00:00:66\|203\.0\.113\.2' "$work/announce.err"; then
+        fail "announce: the conflict log line carries a value"
+    fi
+    echo "priv_run_announce_conflict: a conflicting ARP Reply was counted (arp_announce.conflicts=1, if2.watch.arp_address_conflicts=1), logged as ARP_ADDRESS_CONFLICT, and defended by one announcement verified"
+
+    # The switch: no announcement at startup.
+    printf '\n[arp]\nannounce = false\n' |
+        cat "$work/router.toml" - >"$work/announce-off.toml"
+    rm -f "$stopfile"
+    in_ns "$host_b" python3 -I -c "$ARP_CAPTURE" pb "$stopfile" 30 >"$capture" 2>&1 &
+    capturer=$!
+    tries=0
+    while ! grep -q ready "$capture" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "announce: capture not ready (off)"
+        sleep 0.05
+    done
+    start_ruster announce-off "$work/announce-off.toml"
+    wait_ready announce-off || fail "announce: ruster exited during startup (off)"
+    sleep 3
+    touch "$stopfile"
+    wait "$capturer" || fail "announce: capture failed (off): $(cat "$capture")"
+    natfrag_stop announce-off
+    [ "$(announcements "$capture" | wc -l)" -eq 0 ] ||
+        fail "announce: announced with announce = false: $(cat "$capture")"
+    block_has "$work/announce-off.final" arp_announce.sent=0
+    echo "priv_run_announce_off: with [arp] announce = false nothing was announced verified"
+}
+phase_announce
+
 # exit_protection: OPS-EXIT `[exit-protection]` on ra/rb of the router
 # namespace only (every sysctl and link here is in that namespace).
 fwd_of() {
@@ -3147,9 +3279,13 @@ block_has "$work/txfull.held" observer.state=healthy watch.state=warning \
     if1.af_xdp_port.tx_blocked=0
 ring_full=$(stat_in "$work/txfull.held" if2.af_xdp_port.tx_ring_full)
 blocked=$(stat_in "$work/txfull.held" if2.af_xdp_port.tx_blocked)
+# A router frame (the second startup ARP Announcement, ARP-033, 2 s after
+# startup) can meet the full ring too: it counts as generated_tx_blocked.
+generated_blocked=$(stat_in "$work/txfull.held" if2.af_xdp_port.generated_tx_blocked)
 link_down_kicks=$(stat_in "$work/txfull.held" if2.af_xdp_port.kicks_link_down)
-[ "${ring_full:-0}" -ge 1 ] && [ "$ring_full" = "$blocked" ] ||
-    fail "txfull: tx_ring_full ${ring_full:-missing}, tx_blocked ${blocked:-missing}"
+[ "${ring_full:-0}" -ge 1 ] && [ "${generated_blocked:-x}" -le 2 ] &&
+    [ "$ring_full" -eq $((blocked + generated_blocked)) ] ||
+    fail "txfull: tx_ring_full ${ring_full:-missing}, tx_blocked ${blocked:-missing}, generated_tx_blocked ${generated_blocked:-missing}"
 [ "${link_down_kicks:-0}" -ge 1 ] || fail "txfull: no ENETDOWN kick while held"
 # The adapter retries a down link's owed kick at most every 1 ms doubling
 # to 64 ms: at most 7 + held_ms / 64 ENETDOWN kicks since rb went down
@@ -3163,7 +3299,7 @@ suppressed=$(stat_in "$work/txfull.held" if2.af_xdp_port.kick_retries_suppressed
 if grep -Eq "fatal:|health=(TX_STALL|KICK_ERRORS)" "$work/txfull.err"; then
     fail "txfull: a TX_STALL/KICK_ERRORS event or a fatal while the link was down"
 fi
-echo "priv_run_txfull: rb down, TX ring full (tx_inflight=128 of 128, tx_ring_full=tx_blocked=$ring_full, $link_down_kicks ENETDOWN kicks in ${held_ms} ms, at most $kick_bound, $suppressed retries suppressed), held 4 s past --tx-stall-fatal-secs 2 and --kick-errors-fatal-secs 2 without a fatal, observer.state=healthy watch.state=warning verified"
+echo "priv_run_txfull: rb down, TX ring full (tx_inflight=128 of 128, tx_ring_full=$ring_full=tx_blocked $blocked + generated_tx_blocked $generated_blocked, $link_down_kicks ENETDOWN kicks in ${held_ms} ms, at most $kick_bound, $suppressed retries suppressed), held 4 s past --tx-stall-fatal-secs 2 and --kick-errors-fatal-secs 2 without a fatal, observer.state=healthy watch.state=warning verified"
 # OPS-EXIT item 2: a reload while rb is admin-down with its TX ring full
 # applies at once; the held TX does not block the quiescence (before, it
 # failed with stage=quiesce code=TIMEOUT) and stays in flight.
