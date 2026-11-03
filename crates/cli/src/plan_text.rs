@@ -28,7 +28,7 @@ use ruster_config::{ValidatedAfPacketPortV1, ValidatedAfXdpPortV1};
 use ruster_control::{ApplyPlan, BackendChange, Change, Delta, FlushCount, NatChange, StateFlush};
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, Route,
+    Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, Route, SourceValidationBinding,
 };
 
 fn ip(address: Ipv4Address) -> String {
@@ -82,6 +82,10 @@ fn neighbor(neighbor: &Neighbor) -> String {
         ip(neighbor.target),
         mac(neighbor.mac)
     )
+}
+
+fn source_validation(binding: &SourceValidationBinding) -> String {
+    format!("{} {}", iface(binding.interface), binding.mode.label())
 }
 
 fn local(binding: &LocalIpv4Binding) -> String {
@@ -378,6 +382,12 @@ pub fn render(plan: &ApplyPlan) -> String {
     if plan.arp_policy_changed() {
         lines.push("arp ~ changed".to_owned());
     }
+    changes(
+        &mut lines,
+        "source-validation",
+        plan.source_validation(),
+        source_validation,
+    );
     nat(&mut lines, "nat44-udp", plan.nat44_udp());
     nat(&mut lines, "nat44-tcp", plan.nat44_tcp());
     if let Some(Delta { old, new }) = plan.nat44_icmp_presence() {

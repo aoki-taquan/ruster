@@ -333,6 +333,45 @@ Protocol Unreachableを返し、外からport/protocol scanとrouterの存在確
 `[nat44.tcp] unsolicited-syn-icmp = false`も。switchはrouter全体、interface別は未実装）。詳細は
 runbookの「Errors about datagrams for the router and bad headers (ICMP-ERR)」。
 
+IPv4 source address validation (URPF)は`[[interfaces]]`ごとの`source-validation`です。
+RFC 1812 §5.3.8（"If this feature is implemented, it MUST be disabled by default"）に従いdefaultは
+`off`で、hardeningとして`strict`（sourceへのlongest-match routeがそのinterfaceから出る。default
+routeも数える。RFC 1812 §5.3.8、RFC 3704 §2.2）と`loose`（`/0`以外のrouteがある。RFC 3704 §2.5。
+`source-validation-allow-default = true`でdefault routeも可、§2.4）を選べます。失敗は
+`IPV4_SOURCE_VALIDATION_FAILED`（code 209）のsilent dropで、ICMP errorは一切返しません
+（RFC 1812 §5.3.8 "MUST silently discard"）。WAN（NAT outside）には`strict`が向きます: Internetの
+sourceはdefault routeで通りNATの応答も変換される一方、WANに来たinside sourceの詐称は落ち、
+inside egressのclass 0 limiter（ICMP4-023）とLAN側のARP解決が守られます。WAN egressのclass 0は
+守られません: 詐称したInternet sourceやWAN subnet上のsourceはWANのstrictを通るので、WAN egressの
+class 0を使い切りon-linkのWAN addressへARP解決をさせることはまだできます。default routeしか
+無いWANに`loose`を置くとInternet sourceが全部落ちます。ここの`strict`はRFC 1812の字義どおり
+default routeも数えます（Cisco/Juniperのstrictは`allow-default`なしではdefault routeを数えない）。
+そのため`source-validation-allow-default`の意味も異なり、`loose`だけに効き§2.5を§2.4にします。
+LANの`strict`はBCP 38（RFC 2827）のinside filteringで、asymmetric routing（LANの裏に別経路がある等）
+では正当なtrafficを落とすので任意のhardeningです。upstreamが複数なら`loose`
+（+ allow-default）を使います。`validate`、起動時、適用したreloadごとに、`/0` routeのegressで
+allow-defaultなしの`loose`には`SOURCE_VALIDATION_DEFAULT_IGNORED interface=if<id>`、routeが一つも
+出ていないinterfaceの`strict`には`SOURCE_VALIDATION_NO_ROUTE interface=if<id>`の警告を出します
+（値なし、拒否はしない）。判定はmartian検査が既に
+行うsourceのroute lookupを再利用し（追加lookupなし、`off`ならbranch一つ）、reload可能で、
+storageは増えません。feasible-path（RFC 3704 §2.3、RFC 8704）はprefixごとに一つのpathしか無いので
+提供しません。詳細はrunbookの「Source address validation (URPF)」。
+
+推奨するhome/NAT edgeの設定（coordinatorの既定でowner異議待ち。built-in defaultと汎用fixtureは`off`のまま）:
+
+```toml
+[[interfaces]]
+name = "lan"
+# ...
+# source-validation = "strict"  # 任意のBCP 38 hardening（asymmetric routingでは使わない）
+
+[[interfaces]]
+name = "wan"
+# ...
+source-validation = "strict"            # "off"（default）| "loose" | "strict"、reload可能
+# source-validation-allow-default = true  # "loose"のときだけ（RFC 3704 §2.4）。複数upstreamなら loose + これ
+```
+
 interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は
 `INTERFACES`のrestart-required）です。forwardingはTTL判定とfirewallの後、NAT/firewall stateを
 commitする前に、受信frameを送るすべてのIPv4 decision（plain、NAT44 UDP/TCP/ICMP query、
@@ -461,7 +500,8 @@ arrayのcapacityを一つのopaque valueとして返します。受信ICMPv4 err
 「NAT44 ICMPv4 error translation」を参照してください。outside/public宛てerrorは引用する
 live UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleをinsideへ
 戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
-local strict-uRPF policyで、asymmetric external pathを意図的に拒否します。中継routerの
+local strict-uRPF policyで、asymmetric external pathを意図的に拒否します（受信datagram全般の
+interfaceごとのsource address validationは下の「IPv4 source address validation (URPF)」）。中継routerの
 addressは引用remoteと異なっていても保存します。fragment、local MTU起因の
 Type 3/Code 4生成、PMTU cache、static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への

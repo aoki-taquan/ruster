@@ -160,6 +160,8 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "sessions-per-host",
     "source",
     "source-ports",
+    "source-validation",
+    "source-validation-allow-default",
     "state",
     "state-ttl-ms",
     "states",

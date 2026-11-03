@@ -17,7 +17,8 @@ use ruster_core::{
     Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig, Nat44UdpConfigError,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
     PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
-    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError, SourceValidation,
+    SourceValidationBinding,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -105,6 +106,10 @@ pub enum ValidationCode {
     /// An interface `mtu` outside 68 ([`ruster_core::IPV4_MIN_MTU`], RFC
     /// 791) to 65535.
     InterfaceMtuOutOfRange,
+    /// `source-validation-allow-default` on an interface whose
+    /// `source-validation` is not `loose` (URPF): strict already accepts a
+    /// default route out of the ingress, and off checks nothing.
+    SourceValidationAllowDefaultNotLoose,
     InvalidMac,
     NonCanonicalMac,
     MacNotUnicast,
@@ -300,6 +305,9 @@ impl ValidationCode {
             Self::DuplicateInterfaceName => "DUPLICATE_INTERFACE_NAME",
             Self::DuplicateDeviceName => "DUPLICATE_DEVICE_NAME",
             Self::InterfaceMtuOutOfRange => "INTERFACE_MTU_OUT_OF_RANGE",
+            Self::SourceValidationAllowDefaultNotLoose => {
+                "SOURCE_VALIDATION_ALLOW_DEFAULT_NOT_LOOSE"
+            }
             Self::InvalidMac => "INVALID_MAC",
             Self::NonCanonicalMac => "NON_CANONICAL_MAC",
             Self::MacNotUnicast => "MAC_NOT_UNICAST",
@@ -1235,6 +1243,7 @@ pub struct ValidatedConfigV1 {
     local_ipv4: Box<[LocalIpv4Binding]>,
     ipv4_origin: Ipv4OriginPolicy,
     arp: ArpPolicy,
+    source_validation: Box<[SourceValidationBinding]>,
     resolution: Option<ValidatedResolutionV1>,
     icmpv4_errors: Option<ValidatedIcmpv4ErrorV1>,
     nat44: Option<ValidatedNat44V1>,
@@ -1321,6 +1330,14 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn arp(&self) -> ArpPolicy {
         self.arp
+    }
+
+    /// The `[[interfaces]] source-validation` (URPF) of every interface
+    /// whose mode is not off, sorted by interface; empty when every
+    /// interface is off (the RFC 1812 §5.3.8 default).
+    #[must_use]
+    pub fn source_validation(&self) -> &[SourceValidationBinding] {
+        &self.source_validation
     }
 
     #[must_use]
@@ -1464,6 +1481,7 @@ fn validate_v1(
     let watch = validate_watch(config.watch.unwrap_or_default())?;
     let exit_protection = config.exit_protection.unwrap_or_default();
     let mut interface_records = Vec::with_capacity(config.interfaces.len());
+    let mut source_validation = Vec::new();
     for (index, source) in config.interfaces.into_iter().enumerate() {
         let base = indexed_path("interfaces", index);
         if source.name.is_empty() {
@@ -1528,6 +1546,25 @@ fn validate_v1(
                     )
                 })?,
         };
+        let allow_default = source.source_validation_allow_default.unwrap_or(false);
+        let mode = match (source.source_validation.unwrap_or_default(), allow_default) {
+            (crate::SourceValidationV1::Loose, false) => SourceValidation::Loose,
+            (crate::SourceValidationV1::Loose, true) => SourceValidation::LooseAllowDefault,
+            (_, true) => {
+                return Err(ValidationError::new(
+                    ValidationCode::SourceValidationAllowDefaultNotLoose,
+                    child_path(&base, "source-validation-allow-default"),
+                ));
+            }
+            (crate::SourceValidationV1::Off, false) => SourceValidation::Off,
+            (crate::SourceValidationV1::Strict, false) => SourceValidation::Strict,
+        };
+        if mode != SourceValidation::Off {
+            source_validation.push(SourceValidationBinding {
+                interface: IfId(source.id),
+                mode,
+            });
+        }
         let binding = InterfaceBindingV1 {
             id: IfId(source.id),
             name: source.name.into_boxed_str(),
@@ -1732,6 +1769,7 @@ fn validate_v1(
         .with_require_on_link_sender(config.arp.unwrap_or_default().require_on_link_sender);
 
     interface_records.sort_by_key(|record| record.binding.id);
+    source_validation.sort_by_key(|binding| binding.interface);
     local_ipv4_with_paths.sort_by_key(|(binding, _)| binding.interface);
     neighbors_with_paths.sort_by_key(|(neighbor, _)| {
         (
@@ -2402,6 +2440,7 @@ fn validate_v1(
         local_ipv4,
         ipv4_origin,
         arp,
+        source_validation: source_validation.into_boxed_slice(),
         resolution,
         icmpv4_errors,
         nat44,

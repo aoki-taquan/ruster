@@ -22,6 +22,7 @@ use ruster_control::{
     candidate_from_config, ApplyPlan, ConfigBridgeError, PlanError, PlanSide,
     SimDeterministicKeySource,
 };
+use ruster_core::{IfId, SourceValidation};
 use ruster_sim_scenario::SIM_VALIDATION_LIMITS;
 
 use crate::{plan_text, EXIT_INVALID, EXIT_RUNTIME};
@@ -492,6 +493,66 @@ pub fn fragment_share_warning(config: &ValidatedConfigV1) -> Option<FragmentShar
     )
 }
 
+/// A `source-validation` (URPF) setting that is valid but probably not
+/// what the operator meant (sec L2 of #350). Value-free: the code and the
+/// interface id only. Warned at `validate`, at startup, and after every
+/// applied reload; never refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceValidationWarning {
+    /// `loose` without `source-validation-allow-default` on an interface
+    /// that is the egress of a `/0` route: RFC 3704 §2.5 ignores that
+    /// default route, so every source whose only route is the default is
+    /// dropped (typically all Internet traffic on a WAN).
+    DefaultIgnored(IfId),
+    /// `strict` on an interface no route leaves through: every datagram it
+    /// receives fails (RFC 1812 §5.3.8).
+    NoRoute(IfId),
+}
+
+impl std::fmt::Display for SourceValidationWarning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DefaultIgnored(interface) => write!(
+                formatter,
+                "SOURCE_VALIDATION_DEFAULT_IGNORED interface=if{}",
+                interface.0
+            ),
+            Self::NoRoute(interface) => {
+                write!(
+                    formatter,
+                    "SOURCE_VALIDATION_NO_ROUTE interface=if{}",
+                    interface.0
+                )
+            }
+        }
+    }
+}
+
+/// The source validation warnings of `config`, in interface order. Cold
+/// (runs once per document).
+#[must_use]
+pub fn source_validation_warnings(config: &ValidatedConfigV1) -> Box<[SourceValidationWarning]> {
+    config
+        .source_validation()
+        .iter()
+        .filter_map(|binding| {
+            let mut egress = config
+                .routes()
+                .iter()
+                .filter(|route| route.egress() == binding.interface);
+            match binding.mode {
+                SourceValidation::Loose if egress.any(|route| route.prefix_len() == 0) => {
+                    Some(SourceValidationWarning::DefaultIgnored(binding.interface))
+                }
+                SourceValidation::Strict if egress.next().is_none() => {
+                    Some(SourceValidationWarning::NoRoute(binding.interface))
+                }
+                _ => None,
+            }
+        })
+        .collect()
+}
+
 /// `ruster validate <config>`: summary on stdout, diagnostics on stderr.
 pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
     validate_loaded(load(path), out, err)
@@ -554,6 +615,9 @@ pub fn validate_loaded(
         }
     }
     if let Some(warning) = fragment_share_warning(&config) {
+        let _ = writeln!(err, "ruster: warning: {warning}");
+    }
+    for warning in source_validation_warnings(&config).iter() {
         let _ = writeln!(err, "ruster: warning: {warning}");
     }
     0

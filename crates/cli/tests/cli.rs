@@ -741,6 +741,143 @@ fn plan_prints_the_arp_policy_as_reloadable() {
     );
 }
 
+/// URPF: `[[interfaces]] source-validation` is a reloadable per-interface
+/// delta; `off` spelled out is no change, and allow-default without
+/// `loose` is refused by `validate`.
+#[test]
+fn plan_prints_source_validation_as_a_reloadable_delta() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let with = |name: &str, keys: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "mac = \"02:00:00:00:00:02\"\n",
+                &format!("mac = \"02:00:00:00:00:02\"\n{keys}"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let strict = with("urpf-strict.toml", "source-validation = \"strict\"\n");
+    let loose = with(
+        "urpf-loose.toml",
+        "source-validation = \"loose\"\nsource-validation-allow-default = true\n",
+    );
+    let off = with("urpf-off.toml", "source-validation = \"off\"\n");
+    let invalid = with(
+        "urpf-invalid.toml",
+        "source-validation = \"strict\"\nsource-validation-allow-default = true\n",
+    );
+    assert_eq!(
+        status(&ruster(&["validate".as_ref(), strict.as_os_str()])),
+        0
+    );
+
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), strict.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!(
+            "plan: reloadable\nrestart-required: none\nchanges: 1\n  \
+             source-validation + if2 strict\n{CARRY_ALL}"
+        )
+    );
+    let plan = ruster(&["plan".as_ref(), strict.as_os_str(), loose.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert!(
+        text(&plan.stdout)
+            .contains("  source-validation ~ if2 strict -> if2 loose-allow-default\n"),
+        "{}",
+        text(&plan.stdout)
+    );
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), off.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{CARRY_ALL}")
+    );
+
+    let rejected = ruster(&["validate".as_ref(), invalid.as_os_str()]);
+    assert_ne!(status(&rejected), 0);
+    let stderr = text(&rejected.stderr);
+    assert!(
+        stderr.contains("SOURCE_VALIDATION_ALLOW_DEFAULT_NOT_LOOSE"),
+        "{stderr}"
+    );
+}
+
+/// URPF sec L2: `validate` warns (value-free, exit 0) about `loose`
+/// without allow-default on the egress of a `/0` route and about `strict`
+/// on an interface no route leaves through; neither is refused, and a
+/// sensible setting (strict on the WAN, loose with allow-default) is quiet.
+#[test]
+fn validate_warns_about_suspicious_source_validation() {
+    let dir = scratch();
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/urpf/router.toml"),
+    )
+    .unwrap();
+    let wan = "mac = \"02:00:00:00:00:02\"\nsource-validation = \"off\"\n";
+    // A third interface with no address and no route.
+    let spare = "[[interfaces]]\nid = 3\nname = \"spare\"\ndevice = \"sim2\"\n\
+                 mac = \"02:00:00:00:00:03\"\nsource-validation = \"strict\"\n\n[[addresses]]";
+    let write = |name: &str, text: String| {
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    };
+    let cases = [
+        (
+            "urpf-loose.toml",
+            source.replacen(
+                wan,
+                "mac = \"02:00:00:00:00:02\"\nsource-validation = \"loose\"\n",
+                1,
+            ),
+            vec!["ruster: warning: SOURCE_VALIDATION_DEFAULT_IGNORED interface=if2"],
+        ),
+        (
+            "urpf-no-route.toml",
+            source.replacen("[[addresses]]", spare, 1),
+            vec!["ruster: warning: SOURCE_VALIDATION_NO_ROUTE interface=if3"],
+        ),
+        (
+            "urpf-quiet.toml",
+            source.replacen(
+                wan,
+                "mac = \"02:00:00:00:00:02\"\nsource-validation = \"strict\"\n",
+                1,
+            ),
+            vec![],
+        ),
+        (
+            "urpf-allowed.toml",
+            source.replacen(
+                wan,
+                "mac = \"02:00:00:00:00:02\"\nsource-validation = \"loose\"\n\
+                 source-validation-allow-default = true\n",
+                1,
+            ),
+            vec![],
+        ),
+    ];
+    for (name, document, expected) in cases {
+        let path = write(name, document);
+        let validated = ruster(&["validate".as_ref(), path.as_os_str()]);
+        assert_eq!(status(&validated), 0, "{name}: {}", text(&validated.stderr));
+        let warnings: Vec<String> = text(&validated.stderr)
+            .lines()
+            .filter(|line| line.contains("SOURCE_VALIDATION_"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(warnings, expected, "{name}");
+    }
+}
+
 #[test]
 fn plan_prints_nat_filtering_as_a_reloadable_typed_delta() {
     let dir = scratch();

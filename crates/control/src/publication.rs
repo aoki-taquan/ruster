@@ -7,7 +7,8 @@ use ruster_core::{
     Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey, Nat44IcmpPolicy, Nat44TcpConfig,
     Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpConfigError,
     Nat44UdpHashKey, Nat44UdpPolicy, Neighbor, ResolutionHashKey, ResolutionPolicy, Route,
-    ValidatedFirewallOwner, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
+    SourceValidationBinding, ValidatedFirewallOwner, ValidatedForwardingOwner,
+    ValidatedForwardingOwnerError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -736,6 +737,7 @@ pub struct PublicationPlan {
     local_ipv4: Box<[LocalIpv4Binding]>,
     ipv4_origin: Ipv4OriginPolicy,
     arp_policy: ArpPolicy,
+    source_validation: Box<[SourceValidationBinding]>,
     resolution_policy: ResolutionPolicy,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
     resolution_hash_key: Option<ResolutionHashKey>,
@@ -800,6 +802,7 @@ impl PublicationPlan {
             local_ipv4,
             ipv4_origin,
             arp_policy: ArpPolicy::RFC826,
+            source_validation: Box::default(),
             resolution_policy,
             icmpv4_error_policy,
             resolution_hash_key: None,
@@ -842,6 +845,16 @@ impl PublicationPlan {
     #[must_use]
     pub fn with_arp_policy(mut self, arp: ArpPolicy) -> Self {
         self.arp_policy = arp;
+        self
+    }
+
+    /// Sets the per-interface IPv4 source validation (URPF) of the
+    /// forwarding snapshot (default: every interface off, RFC 1812
+    /// §5.3.8). A binding naming an unknown interface, or one interface
+    /// twice, rejects the candidate as a forwarding error.
+    #[must_use]
+    pub fn with_source_validation(mut self, bindings: Box<[SourceValidationBinding]>) -> Self {
+        self.source_validation = bindings;
         self
     }
 
@@ -976,6 +989,7 @@ impl ValidatedCandidate {
             local_ipv4,
             ipv4_origin,
             arp_policy,
+            source_validation,
             resolution_policy,
             icmpv4_error_policy,
             resolution_hash_key,
@@ -1006,7 +1020,9 @@ impl ValidatedCandidate {
         let forwarding =
             ValidatedForwardingOwner::new(routes, interfaces, neighbors, local_ipv4, ipv4_origin)
                 .map_err(PublicationCandidateError::Forwarding)?
-                .with_arp_policy(arp_policy);
+                .with_arp_policy(arp_policy)
+                .with_source_validation(&source_validation)
+                .map_err(PublicationCandidateError::Forwarding)?;
         let snapshot = forwarding.snapshot();
         let udp_config = Nat44UdpConfig::new(
             &snapshot,

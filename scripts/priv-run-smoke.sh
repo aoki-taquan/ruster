@@ -115,6 +115,13 @@
 #             socket sees all three translated (source 203.0.113.2), the
 #             DF-clear ones still without DF and with consecutive generated
 #             IDs, the DF one with the ID host A sent; every checksum valid
+#   urpf      (URPF, RFC 1812 5.3.8, RFC 3704) `source-validation =
+#             "strict"` on lan and wan: host A -> host B still forwards and
+#             translates, host B's Echo Request to 203.0.113.2 is answered,
+#             the same Echo from host B claiming the inside source
+#             192.168.1.99 is silently dropped
+#             (drop.IPV4_SOURCE_VALIDATION_FAILED, no reply); a SIGHUP
+#             reload to `off` (generation 2) answers it again; exit 0
 #   frag      (MTU2 part B, RFC 791 3.2, RFC 1812 4.2.2.7) rb and pb at
 #             1400 and wan `mtu = 1400`: a 1500-byte DF-clear UDP datagram
 #             from host A (IP_PMTUDISC_DONT) reaches host B as exactly two
@@ -1940,6 +1947,44 @@ phase_df_clear() {
     echo "priv_run_df_clear: $(sed -n 2p "$work/df-clear-recv.out"), exit 0 verified"
 }
 phase_df_clear
+
+# urpf (URPF): strict source validation on both ports. Host B gets the
+# inside address 192.168.1.99/32 as a second source; its Echo Requests to
+# the router's WAN address from that source arrive on the WAN with a
+# source whose route leaves through the LAN.
+phase_urpf() {
+    sed '/^device = "r[ab]"$/a source-validation = "strict"' "$work/router.toml" \
+        >"$work/urpf-strict.toml"
+    [ "$(grep -c '^source-validation = "strict"$' "$work/urpf-strict.toml")" -eq 2 ] ||
+        fail "urpf: strict config not written"
+    expect_plan router urpf-strict reloadable none
+    cp "$work/urpf-strict.toml" "$work/urpf.toml"
+    sudo -n ip -n "$host_b" addr add 192.168.1.99/32 dev pb
+    # As the invoking user, so the reload can read the work directory.
+    start_ruster urpf "$work/urpf.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready urpf || fail "urpf: ruster exited during startup"
+    forward_once urpf
+    in_ns "$host_b" ping -c 1 -W 2 203.0.113.2 >"$work/urpf-ping.txt" 2>&1 ||
+        fail "urpf: host B's own Echo was not answered: $(cat "$work/urpf-ping.txt")"
+    if in_ns "$host_b" ping -c 2 -W 1 -I 192.168.1.99 203.0.113.2 >"$work/urpf-spoof.txt" 2>&1; then
+        fail "urpf: an Echo from a spoofed inside source was answered"
+    fi
+    wait_stat_ge urpf drop.IPV4_SOURCE_VALIDATION_FAILED 2
+    reload_with "$work/router.toml" "$work/urpf.toml"
+    wait_line urpf "reload applied: generation=2 previous=1"
+    in_ns "$host_b" ping -c 1 -W 2 -I 192.168.1.99 203.0.113.2 >"$work/urpf-off.txt" 2>&1 ||
+        fail "urpf: with source-validation off the Echo was not answered: $(cat "$work/urpf-off.txt")"
+    signal_ruster TERM
+    wait_ruster
+    sudo -n ip -n "$host_b" addr del 192.168.1.99/32 dev pb
+    [ "$status" -eq 0 ] || fail "urpf: exit status $status after SIGTERM"
+    assert_detached "the urpf run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/urpf.out" >"$work/urpf.final"
+    dropped=$(stat_in "$work/urpf.final" drop.IPV4_SOURCE_VALIDATION_FAILED)
+    [ "${dropped:-0}" -ge 2 ] || fail "urpf: final drop.IPV4_SOURCE_VALIDATION_FAILED=${dropped:-missing}"
+    echo "priv_run_urpf: strict lan/wan forwards, answers host B, drops $dropped spoofed inside-source Echo(s) silently, reload to off answers them, exit 0 verified"
+}
+phase_urpf
 
 # reload_carry (RELOAD-CARRY): a long-lived TCP connection and a UDP flow
 # from host A to host B through the NAT survive an applied SIGHUP reload

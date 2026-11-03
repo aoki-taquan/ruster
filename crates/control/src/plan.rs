@@ -36,8 +36,8 @@ use ruster_config::{
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
     Nat44CarryIdentity, Nat44Filtering, Nat44TcpHashKey, Nat44TcpInboundRst, Nat44UdpHashKey,
-    Neighbor, PublicationQuiescence, ResolutionHashKey, Route, StateCarryConflict,
-    StateCarryOutcome,
+    Neighbor, PublicationQuiescence, ResolutionHashKey, Route, SourceValidationBinding,
+    StateCarryConflict, StateCarryOutcome,
 };
 
 use crate::{
@@ -403,6 +403,7 @@ pub struct ApplyPlan {
     firewall_policy_changed: bool,
     ipv4_origin_changed: bool,
     arp_policy_changed: bool,
+    source_validation: Box<[Change<SourceValidationBinding>]>,
     nat44_udp: NatChange,
     nat44_tcp: NatChange,
     nat44_icmp_presence: Option<Delta<bool>>,
@@ -488,6 +489,11 @@ impl ApplyPlan {
             firewall_policy_changed: old.firewall.policy() != new.firewall.policy(),
             ipv4_origin_changed: current.ipv4_origin() != next.ipv4_origin(),
             arp_policy_changed: current.arp() != next.arp(),
+            source_validation: diff(
+                current.source_validation(),
+                next.source_validation(),
+                |binding| binding.interface,
+            ),
             nat44_udp: nat_change(&old, &new, Protocol::Udp),
             nat44_tcp: nat_change(&old, &new, Protocol::Tcp),
             nat44_icmp_presence: delta(old.icmp.is_some(), new.icmp.is_some()),
@@ -608,6 +614,15 @@ impl ApplyPlan {
     #[must_use]
     pub const fn arp_policy_changed(&self) -> bool {
         self.arp_policy_changed
+    }
+
+    /// Per-interface `source-validation` (URPF) changes, in IfId order: an
+    /// interface leaving `off` is `Added`, one returning to `off` is
+    /// `Removed`. Reloadable: the modes are part of the forwarding snapshot
+    /// that every reload replaces, and no runtime state depends on them.
+    #[must_use]
+    pub fn source_validation(&self) -> &[Change<SourceValidationBinding>] {
+        &self.source_validation
     }
 
     #[must_use]

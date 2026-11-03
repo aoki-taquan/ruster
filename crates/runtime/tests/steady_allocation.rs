@@ -268,7 +268,9 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
 
     #[cfg(target_pointer_width = "64")]
     {
-        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 88);
+        // URPF added the per-interface source validation bindings (a
+        // borrowed slice, 16 bytes) to the by-value snapshot.
+        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 104);
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
         // N1 added the opening and closing idle TTLs to the TCP policy, and
@@ -282,7 +284,8 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
             size_of::<ruster_runtime::Nat44IcmpServiceView<'static, 'static>>(),
             120
         );
-        assert!(size_of::<FullServiceView<'static, 'static>>() <= 696);
+        // URPF: +16 bytes, the source validation slice of the snapshot.
+        assert!(size_of::<FullServiceView<'static, 'static>>() <= 712);
     }
 
     counting::self_check();

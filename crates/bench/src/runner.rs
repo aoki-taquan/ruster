@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use ruster_core::{
     forward_batch, internet_checksum, validate_ipv4_frame, ForwardingSnapshot, IfId, Interface,
     Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, NoTrace, PacketIo,
-    Route, ValidatedForwardingOwner,
+    Route, SourceValidation, SourceValidationBinding, ValidatedForwardingOwner,
 };
 
 use crate::{
@@ -116,7 +116,7 @@ pub fn run(config: &RunConfig) -> Result<Vec<ResultRow>, RunError> {
     let rows_per_size = config
         .batches
         .len()
-        .checked_mul(25)
+        .checked_mul(26)
         .and_then(|count| count.checked_add(2))
         .ok_or(RunError::RepetitionOverflow)?;
     let mut rows = Vec::with_capacity(
@@ -127,7 +127,8 @@ pub fn run(config: &RunConfig) -> Result<Vec<ResultRow>, RunError> {
     );
     for size in FrameSize::ALL {
         for &batch in &config.batches {
-            rows.push(run_plain_case(config, size, batch)?);
+            rows.push(run_plain_case(config, size, batch, false)?);
+            rows.push(run_plain_case(config, size, batch, true)?);
             rows.extend(crate::matrix::run_matrix(config, size, batch)?);
         }
         rows.push(run_checksum_case(config, size, 1)?);
@@ -149,20 +150,37 @@ fn validate_config(config: &RunConfig) -> Result<(), RunError> {
     Ok(())
 }
 
+/// `plain-ipv4`, or with `urpf` the same datagram with strict source
+/// validation on the LAN ingress (`plain-ipv4-urpf-strict`, URPF): the LAN
+/// gets its connected route so the source passes, and the check reuses the
+/// source lookup the martian checks already make.
 fn run_plain_case(
     config: &RunConfig,
     size: FrameSize,
     batch_size: usize,
+    urpf: bool,
 ) -> Result<ResultRow, RunError> {
+    let case = if urpf {
+        "plain-ipv4-urpf-strict"
+    } else {
+        "plain-ipv4"
+    };
     let template = plain_ipv4_fixture(size, config.seed);
     let mut backend = BenchBackend::new(batch_size, LAN, &template);
-    let routes = [Route::new(
+    let default_route = Route::new(
         Ipv4Address::from_octets([0, 0, 0, 0]),
         0,
         WAN,
         Some(Ipv4Address::from_octets([203, 0, 113, 1])),
     )
-    .expect("benchmark route is valid")];
+    .expect("benchmark route is valid");
+    let lan_route = Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, LAN, None)
+        .expect("benchmark route is valid");
+    let routes: Box<[Route]> = if urpf {
+        [default_route, lan_route].into()
+    } else {
+        [default_route].into()
+    };
     let interfaces = [
         Interface {
             id: LAN,
@@ -185,13 +203,18 @@ fn run_plain_case(
         address: Ipv4Address::from_octets([192, 0, 2, 1]),
     }];
     // The production path: an owner with publication-time lookup indexes.
+    let strict = [SourceValidationBinding {
+        interface: LAN,
+        mode: SourceValidation::Strict,
+    }];
     let owner = ValidatedForwardingOwner::new(
-        routes.into(),
+        routes,
         interfaces.into(),
         neighbors.into(),
         bindings.into(),
         Ipv4OriginPolicy::default(),
     )
+    .and_then(|owner| owner.with_source_validation(if urpf { &strict } else { &[] }))
     .expect("benchmark snapshot is valid");
     let snapshot = owner.snapshot();
 
@@ -224,13 +247,13 @@ fn run_plain_case(
     }
     if allocations != 0 {
         return Err(RunError::TimedAllocations {
-            case: "plain-ipv4",
+            case,
             count: allocations,
         });
     }
     verify_forwarded(&backend, &template, batch_size)?;
     Ok(ResultRow {
-        case: "plain-ipv4",
+        case,
         size,
         batch: batch_size,
         checksum_passes: 0,
@@ -498,11 +521,13 @@ mod tests {
         config.warmup_time = Duration::ZERO;
         config.batches = vec![1];
         let rows = run(&config).unwrap();
-        assert_eq!(rows.len(), 54);
+        assert_eq!(rows.len(), 56);
         assert!(rows.iter().all(|row| row.timed_allocations == 0));
-        assert!(rows.iter().any(|row| {
-            row.case == "plain-ipv4" && row.size == FrameSize::Wire64 && row.stats.samples == 1
-        }));
+        for case in ["plain-ipv4", "plain-ipv4-urpf-strict"] {
+            assert!(rows.iter().any(|row| {
+                row.case == case && row.size == FrameSize::Wire64 && row.stats.samples == 1
+            }));
+        }
     }
 
     #[test]

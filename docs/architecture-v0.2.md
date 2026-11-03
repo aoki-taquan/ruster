@@ -2209,7 +2209,38 @@ memoryはsnapshot memory（runtime storageの`storage-bytes`には含めない�
 reload中は旧generationの分と合わせて約524 KiBです
 （`ValidatedForwardingOwner::index_heap_bytes`）。publication costはO(n log n)の
 sortだけです。snapshotは`identity`（8 word）を保持せず借用sliceから都度作るので
-（O(1)）、index参照を足しても`ForwardingSnapshot`は144→88 bytesです（RT-002）。
+（O(1)）、index参照を足しても`ForwardingSnapshot`は144→88 bytesです（RT-002）。URPFで
+source validation bindingの借用slice（16 bytes）を足し104 bytesになりました。
+
+### IPv4 source address validation (URPF)
+
+interfaceごとの`[[interfaces]] source-validation`（`off`/`loose`/`strict`と、`loose`だけの
+`source-validation-allow-default`）は`SourceValidation`/`SourceValidationBinding`として
+`ValidatedForwardingOwner::with_source_validation`がinterface順にsortし、`off`を除いて
+ownerが持ちます。snapshotはその借用slice（`off`だけなら空）です。判定はIPv4 ingress
+admission（`validate_ipv4_ingress`）の最後、martian source/destinationの後でlocal delivery、
+NAT、firewall、fragment association、ARP holdより前に行い、martian source検査が既に行う
+sourceのread-only LPMの結果を再利用するので専用lookupはありません。`strict`は
+longest-match routeのegressがingressであること（default route含む、RFC 1812 §5.3.8、
+RFC 3704 §2.2）、`loose`は`/0`でないrouteが存在すること（RFC 3704 §2.5）、
+allow-defaultは任意のrouteの存在（§2.4）です。defaultは`off`（RFC 1812 §5.3.8 "MUST be
+disabled by default"）。packet pathのcostは`off`で空sliceのbranch一つ、有効時はingressの
+modeのbinary search（validateするinterface数）とroute比較で、allocation/Mutex/String/dyn/
+packet cloneはありません。失敗は他のingress rejectionと同じsilent drop
+（`IPV4_SOURCE_VALIDATION_FAILED`、code 209）で、ICMP errorはrouter宛て、transit、truncated
+datagramのParameter Problemを含め一切生成しません（RFC 1812 §5.3.8 "MUST silently
+discard"）。drop時だけcoldにsourceを読み`TraceEvent::Ipv4SourceValidationFailed`を出します。
+fragmentはそれぞれ同じsourceで独立に判定され、association tableへのadmit/holdより前に
+落ちます。ARP holdのreplayは同じsnapshotで判定をやり直すので結果は同じです（publication
+applyは全holdを捨てる）。modeはsnapshotの一部なのでreloadableで、runtime stateは
+依存しません（`ApplyPlan::source_validation`）。FIBはprefixごとに一つのpathなので
+feasible-path（RFC 3704 §2.3、RFC 8704）はstrictと同じになり提供しません。WANをstrictに
+するとICMP4-023のclass 0 vector（WANに来た詐称inside sourceによるinside egressのerror
+limiter消費）が閉じます。WAN egressのclass 0と、on-linkのWAN addressへのARP解決は、strictを通る
+詐称Internet/WAN subnet sourceで使い切れるので守られません。strictはRFC 1812の字義どおりdefault
+routeを数えます（Cisco/Juniperのstrictとは違う）。`ruster`は`/0`のegressに置いたallow-defaultなしの
+`loose`と、routeが一つも出ないinterfaceの`strict`を値なしで警告します（validate、起動時、reload）。
+`SnapshotError`はURPFのvariantを足したので`#[non_exhaustive]`にしました。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの
