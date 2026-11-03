@@ -288,7 +288,7 @@ Time Exceeded等のfloodに使い切られません（`icmpv4-errors.capacity.st
 Port Unreachableも送るなら+1）。Ethernet payload（Total Length後のbytesを含む）がMTUを超える
 frameは`IPV4_FRAME_EXCEEDS_MTU`でdropします。
 DFなしは`IPV4_FRAGMENTATION_REQUIRED`でICMPなし（fragmentationは未実装のdeviation、
-NAT44-019L、MTU2。NATを通るDFなしdatagramはその前にnon-atomicとして落ちます）、local Echo
+NAT44-019L、MTU2 part B。NATを通るDFなしdatagramも変換後ここに来ます）、local Echo
 Replyの超過は`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。firewallが拒否するdatagramはfirewallの
 reasonで落ちerrorを生みません。router生成のすべてのICMP errorはreverse egressのMTUに
 収まるようquoteを切ります。`ruster run`はconfigのMTUがdeviceのMTU以下であることをattach前に
@@ -333,8 +333,11 @@ mapping/peer/public-port lookupは固定capacityでbounded、新しいmapping/pe
 public portはactivity順のslot listとfree-port bitmapからO(1)で選びます（PERF-001、H4a）。outboundはEndpoint-Independent Mappingです。
 inbound filteringはUDP/TCPごとにRFC 4787 §5の三分類から選べ、defaultは過去に送信した
 remote IPv4だけを許すAddress-Dependent Filteringです（下の「NAT44 inbound filtering」）。
-IPv4 optionsなし、DF=1/MF=0/offset=0のatomic UDPだけを変換します。受信reserved flagは
-fragment判定から除外し、NAT rewrite後もwire上に保存します。UDP checksum zeroを保存、
+IPv4 optionsなし、MF=0/offset=0の完全なUDP datagramをDFの有無によらず変換します（MTU2 part A、
+NAT44-008。fragmentは`NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED`でdrop、fragment変換はNAT44-018で
+deferred）。DF=0のdatagramは変換後にIPv4 IDを生成し直します（RFC 6864 §5.3.1、NAT44-126:
+変換後の(source, destination, protocol)ごとにkeyed counterで連続、DF=1はIDを保存、設定なし）。
+受信reserved flagはfragment判定から除外し、NAT rewrite後もwire上に保存します。UDP checksum zeroを保存、
 nonzero checksumとIPv4 checksumをRFC 1624でincremental更新します。
 
 idle TTLはdefault 300秒、minimum 120秒で、outbound TX requestだけがrefreshします。
@@ -353,8 +356,8 @@ addressは引用remoteと異なっていても保存します。fragment、local
 Type 3/Code 4生成、PMTU cache、static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への
 準拠は主張しません。
-引用UDP/TCP IPv4 headerもreserved flagをfragment判定から除外し、reserved以外は
-DF=1/MF=0/offset=0を要求します。引用reserved flagはtuple rewrite後も保存します。
+引用UDP/TCP IPv4 headerもreserved flagをfragment判定から除外し、
+MF=0/offset=0を要求します（DFは問わない）。引用reserved flagはtuple rewrite後も保存します。
 
 TCP NAT44は別のcaller-backed mapping/session storage、両keyed directory、direct
 public-port ownerを持ち、UDPと同じ数値public portを独立して使用できます。freshなTCP専用
@@ -364,8 +367,8 @@ ACK/RST/FIN=0だけが作成し、新規sessionはそれに加えてinbound filt
 inbound initial SYNだけが既存live mapping上に作成します。既存sessionではSYN-ACK、data、FIN、
 RSTを含むvalid packetを双方向に変換します。TCP header/options/dataを含むIPv4 payload全体のchecksumをstate更新前に
 検証し、address/port rewrite後もRFC 1624で更新します。TCPでは算術結果zeroもwire zeroの
-ままです。TCPもreserved flagをfragment判定から除外してwireへ保存し、reserved以外は
-DF=1/MF=0/offset=0を要求します。
+ままです。TCPもreserved flagをfragment判定から除外してwireへ保存し、MF=0/offset=0を要求します
+（DFは問わず、DF=0ならUDPと同じくIDを生成。fragmentは`NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED`）。
 
 outboundの再利用slotとpublic portの探索はO(1)（UDPと同じslot listとfree-port bitmap）、
 inboundとquoted ICMPはdirect owner後にexact sessionだけを調べます。
@@ -482,7 +485,7 @@ UDP/TCP引用と同じ経路でread-onlyに変換され（REQ-4/5/6）、N4のli
 checkも共有します。public address宛てのEcho Requestはinsideからでもoutsideからでもrouter
 自身が答えます（NAPTにはhairpinできるinbound query sessionが無い。REQ-7はBasic NATの要件、
 RFC 7857 §12）。Information/Address Mask（RFC 6918でdeprecated）とinsideからのReplyは
-変換せず`NAT44_ICMP_TYPE_UNSUPPORTED`です。UDP/TCP（DF=1だけ）と違い、fragmentでない
+変換せず`NAT44_ICMP_TYPE_UNSUPPORTED`です。UDP/TCPと同じく、fragmentでない
 queryはDF=0でも変換します（LinuxのEcho ReplyとWindowsのpingはDF=0。NAT44-116）。sectionが無ければ従来どおりinside→
 outsideのICMP queryは`NAT44_UDP_UNSUPPORTED_TRANSPORT`（UDPが無くTCPだけなら`NAT44_TCP_UNSUPPORTED_TRANSPORT`）でdrop（local policyとしての無効化）
 で、sectionの追加・削除はstorage shapeの変更（restart-required）です。firewallは
@@ -1197,7 +1200,7 @@ directory外の読めるfileへのsymlinkにatomicに置き換えると`stage=re
 directory内へ置くとapply。uid 0では`/etc/shadow`、`/etc/passwd`、`/proc/1/status`、
 `/proc/<pid>/root/etc/shadow`へのsymlinkが全て`PERMISSION_DENIED`。対照として`--fs-confine off`では
 同じ`/etc/passwd`がreadを通る）、
-B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、
+B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの

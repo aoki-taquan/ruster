@@ -79,9 +79,9 @@ drops = [
 ]
 
 # --- 4. The same 10 ms later is discarded but rate limited (its own 20 ms
-# limiter of this router, per egress). Without DF the NAT refuses the datagram before any MTU check
-# (it translates only atomic datagrams); a DF-clear datagram routed
-# without NAT would be IPV4_FRAGMENTATION_REQUIRED (NAT44-019L).
+# limiter of this router, per egress). Without DF the NAT admits the whole
+# datagram (MTU2) but the MTU check refuses it as IPV4_FRAGMENTATION_REQUIRED
+# without an error, before the mapping commits (NAT44-019L).
 [[step]]
 kind = "inject"
 interface = "lan"
@@ -101,7 +101,7 @@ kind = "expect"
 tx = []
 drops = [
   { reason = "IPV4_FRAGMENTATION_NEEDED", count = 2 },
-  { reason = "NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED", count = 1 },
+  { reason = "IPV4_FRAGMENTATION_REQUIRED", count = 1 },
 ]
 
 # --- 5. Inbound: S's 121-byte DF answer to the public mapping exceeds the

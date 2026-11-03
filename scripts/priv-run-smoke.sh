@@ -107,6 +107,12 @@
 #             refuses the next 1500-byte send (EMSGSIZE), a 1400-byte DF
 #             datagram reaches host B, and tracepath from host A discovers
 #             pmtu 1400; the final counters show the drops and errors
+#   df_clear  (MTU2 part A, NAT44-008, RFC 6864 5.3.1) host A sends, from a
+#             raw socket, two DF-clear UDP datagrams with the same IPv4 ID
+#             and one with DF set to host B through the NAT: host B's raw
+#             socket sees all three translated (source 203.0.113.2), the
+#             DF-clear ones still without DF and with consecutive generated
+#             IDs, the DF one with the ID host A sent; every checksum valid
 #   unsolicited_syn  (B3, RFC 5382 REQ-4) with a firewall rule that admits
 #             new WAN -> LAN TCP flows to every destination, host B sends a
 #             TCP SYN to a public port without a mapping: nothing for 6 s,
@@ -1729,6 +1735,120 @@ phase_pmtu() {
     echo "priv_run_pmtu: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1400) only; drop.IPV4_FRAGMENTATION_NEEDED=$needed, queued_fragmentation_needed=dequeued=$queued, exit 0, detached verified"
 }
 phase_pmtu
+
+# df_clear (MTU2 part A): NAT44 translates whole DF-clear datagrams
+# (Windows sends unfragmented UDP without DF) and generates their IPv4 ID
+# (RFC 6864 5.3.1). DF_CLEAR_SEND (host A, raw IP_HDRINCL socket) sends
+# argv[3] copies of a DF-clear UDP datagram with ID 0x4242 and one with DF
+# and ID 0x4343, source port argv[2], to host B port argv[1]. DF_CLEAR_RECV
+# (host B, raw UDP socket, plus a bound UDP socket so that the kernel sends
+# no Port Unreachable) checks the first two DF-clear arrivals and the DF
+# one: source 203.0.113.2, valid IPv4 and UDP checksums, the payload as
+# sent, DF clear with IDs n and n+1 (one translated tuple), and DF with ID
+# 0x4343 (atomic: the ID is kept).
+DF_CLEAR_SEND='
+import socket, struct, sys
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+dport, sport, copies = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+src, dst = socket.inet_aton("192.168.1.10"), socket.inet_aton("203.0.113.1")
+raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+
+def datagram(ident, flags, payload):
+    udp = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload
+    csum = 0xFFFF - fold(src + dst + struct.pack("!BBH", 0, 17, len(udp)) + udp)
+    udp = udp[:6] + struct.pack("!H", csum or 0xFFFF) + udp[8:]
+    header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), ident, flags, 64, 17, 0, src, dst)
+    header = header[:10] + struct.pack("!H", 0xFFFF - fold(header)) + header[12:]
+    return header + udp
+
+for n in range(copies):
+    raw.sendto(datagram(0x4242, 0, b"ruster-df-clear-%d" % n), ("203.0.113.1", 0))
+raw.sendto(datagram(0x4343, 0x4000, b"ruster-df-set"), ("203.0.113.1", 0))
+'
+DF_CLEAR_RECV='
+import socket, struct, sys, time
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+def check(ok, what):
+    if not ok:
+        sys.exit("df_clear: %s" % what)
+
+dport, deadline = int(sys.argv[1]), time.monotonic() + float(sys.argv[2])
+public, me = socket.inet_aton("203.0.113.2"), socket.inet_aton("203.0.113.1")
+sink = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sink.bind(("0.0.0.0", dport))
+raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_UDP)
+raw.settimeout(0.1)
+print("ready", flush=True)
+clear, kept = {}, None
+while (len(clear) < 2 or kept is None) and time.monotonic() < deadline:
+    try:
+        pkt = raw.recv(4096)
+    except socket.timeout:
+        continue
+    ihl = (pkt[0] & 15) * 4
+    udp = pkt[ihl:]
+    if len(udp) < 8 or struct.unpack("!H", udp[2:4])[0] != dport:
+        continue
+    check(pkt[12:16] == public and pkt[16:20] == me, "addresses %s" % pkt[12:20].hex())
+    check(fold(pkt[:ihl]) == 0xFFFF, "IPv4 header checksum")
+    check(fold(public + me + struct.pack("!BBH", 0, 17, len(udp)) + udp) == 0xFFFF, "UDP checksum")
+    ident, flags = struct.unpack("!HH", pkt[4:8])
+    payload = udp[8:]
+    if payload == b"ruster-df-set":
+        check(flags == 0x4000 and ident == 0x4343, "DF datagram flags 0x%04x id 0x%04x" % (flags, ident))
+        kept = ident
+    elif payload.startswith(b"ruster-df-clear-"):
+        check(flags == 0, "DF-clear datagram arrived with flags 0x%04x" % flags)
+        clear[int(payload[16:])] = ident
+check(0 in clear and 1 in clear and kept is not None, "arrived: %s, DF one %s" % (clear, kept))
+check(clear[1] == (clear[0] + 1) & 0xFFFF, "IDs 0x%04x, 0x%04x not consecutive" % (clear[0], clear[1]))
+print("DF-clear UDP 192.168.1.10 -> 203.0.113.1:%d (host ID 0x4242 twice) arrived from 203.0.113.2 without DF with generated IDs 0x%04x, 0x%04x; the DF one kept ID 0x4343" % (dport, clear[0], clear[1]))
+'
+
+phase_df_clear() {
+    start_ruster dfclear "$work/router.toml"
+    wait_ready dfclear || fail "df_clear: ruster exited during startup"
+    forward_once dfclear_resolve
+    rm -f "$work/df-clear-recv.out"
+    in_ns "$host_b" python3 -I -c "$DF_CLEAR_RECV" 9003 10 >"$work/df-clear-recv.out" 2>&1 &
+    receiver=$!
+    tries=0
+    while ! grep -q ready "$work/df-clear-recv.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "df_clear: receiver not ready"
+        sleep 0.05
+    done
+    in_ns "$host_a" python3 -I -c "$DF_CLEAR_SEND" 9003 33200 2 >"$work/df-clear-send.out" 2>&1 ||
+        fail "df_clear: send: $(cat "$work/df-clear-send.out")"
+    status=0
+    wait "$receiver" || status=$?
+    [ "$status" -eq 0 ] || fail "$(cat "$work/df-clear-recv.out")"
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "df_clear: exit status $status after SIGTERM"
+    assert_detached "the df_clear run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/dfclear.out" >"$work/dfclear.final"
+    block_has "$work/dfclear.final" drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED=0 \
+        drop.FIREWALL_FRAGMENT_UNSUPPORTED=0
+    echo "priv_run_df_clear: $(sed -n 2p "$work/df-clear-recv.out"), exit 0 verified"
+}
+phase_df_clear
 
 # unsolicited_syn (B3): host B's raw-socket view of the RFC 5382 REQ-4
 # delayed ICMP Port Unreachable. argv: mode (icmp|absent), public port,

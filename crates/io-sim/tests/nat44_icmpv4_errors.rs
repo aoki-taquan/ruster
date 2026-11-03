@@ -686,7 +686,16 @@ fn assert_translated(
     assert_eq!(&bytes[0..6], &destination_mac.0);
     let egress_mac = if egress == LAN { LAN_MAC } else { WAN_MAC };
     assert_eq!(&bytes[6..12], &egress_mac.0);
-    assert_eq!(&bytes[14..22], &error[14..22], "version..flags preserved");
+    assert_eq!(&bytes[14..18], &error[14..18], "version..length preserved");
+    assert_eq!(&bytes[20..22], &error[20..22], "flags preserved");
+    if error[20] & 0x40 != 0 {
+        assert_eq!(&bytes[18..20], &error[18..20], "atomic: ID preserved");
+    } else {
+        // A DF-clear error gets a generated ID (RFC 6864 §5.3.1,
+        // NAT44-126), not the one it arrived with; the sequence is checked
+        // by nat44_df_clear.
+        assert_ne!(&bytes[18..20], &error[18..20], "DF clear: ID generated");
+    }
     assert_eq!(bytes[22], error[22] - 1, "TTL");
     assert_eq!(bytes[23], 1);
     assert_eq!(&bytes[26..30], &outer_source.octets());

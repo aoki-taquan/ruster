@@ -2621,7 +2621,18 @@ where
                         &mut icmpv4_errors,
                         trace,
                     )?;
-                    apply_decision(frame, decision).map(|()| decision)
+                    apply_decision(frame, decision)?;
+                    // Only for a datagram the core commits for TX: a plan,
+                    // MTU, or firewall drop consumes no ID (a later backend
+                    // TX rejection does not return it).
+                    rewrite_translated_non_atomic_id(
+                        frame,
+                        decision,
+                        &mut nat44_udp,
+                        &mut nat44_tcp,
+                        &mut nat44_icmp,
+                    )?;
+                    Ok(decision)
                 }
             })
             .map(|decision| PlannedPacket {
@@ -4275,7 +4286,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
 /// REQ-3): outer IHL 5, nonfragment, TTL > 1, valid ICMP checksum, a
 /// Fragmentation Needed Next-Hop MTU of 0 or at least 68; a quoted
 /// IPv4 header with a valid checksum (options skipped by IHL), reserved flag
-/// masked, DF=1/MF=0/offset=0, UDP or TCP, and the first 8 transport bytes.
+/// and DF ignored, MF=0/offset=0, UDP, TCP or an ICMP query, and the first
+/// 8 transport bytes.
 /// The embedded transport checksum is located but not validated.
 fn parse_nat44_icmpv4_error(
     frame: &[u8],
@@ -4343,15 +4355,9 @@ fn parse_nat44_icmpv4_error(
     let protocol = *inner_header
         .get(9)
         .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
-    // UDP and TCP quotes must be atomic (NAT44-008). A quoted ICMP query
-    // only has to be unfragmented: queries are translated with DF either
-    // way (NAT44-116).
-    let quote_admitted = if protocol == 1 {
-        inner_flags & 0x3fff == 0
-    } else {
-        inner_flags & 0x7fff == 0x4000
-    };
-    if !quote_admitted {
+    // The quoted datagram must be whole, as every translated datagram
+    // (NAT44-008, NAT44-116): MF clear and offset 0, DF either way (MTU2).
+    if inner_flags & 0x3fff != 0 {
         return Err(Nat44Icmpv4QuotedFragmentUnsupported);
     }
     if !matches!(protocol, 1 | 6 | 17) {
@@ -5041,7 +5047,7 @@ fn decide_nat44_udp_outbound<T: TraceSink>(
     if ipv4.protocol != 17 {
         return nat44_udp_drop(ingress, Nat44UdpUnsupportedTransport, trace);
     }
-    if let Err(reason) = validate_nat44_atomic(frame, ipv4) {
+    if let Err(reason) = validate_nat44_unfragmented(frame, ipv4) {
         return nat44_udp_drop(ingress, reason, trace);
     }
     let udp = match validate_nat44_udp(frame, ipv4) {
@@ -5142,7 +5148,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     if ipv4.header_len > 20 {
         return nat44_udp_drop(ingress, Ipv4OptionsUnsupported, trace);
     }
-    if let Err(reason) = validate_nat44_atomic(frame, ipv4) {
+    if let Err(reason) = validate_nat44_unfragmented(frame, ipv4) {
         return nat44_udp_drop(ingress, reason, trace);
     }
     let udp = match validate_nat44_udp(frame, ipv4) {
@@ -5305,7 +5311,7 @@ fn decide_nat44_tcp_outbound<T: TraceSink>(
     if ipv4.protocol != 6 {
         return nat44_tcp_drop(ingress, Nat44TcpUnsupportedTransport, trace);
     }
-    if let Err(reason) = validate_nat44_tcp_atomic(frame, ipv4) {
+    if let Err(reason) = validate_nat44_tcp_unfragmented(frame, ipv4) {
         return nat44_tcp_drop(ingress, reason, trace);
     }
     let tcp = match validate_nat44_tcp(frame, ipv4) {
@@ -5409,7 +5415,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     if ipv4.header_len > 20 {
         return nat44_tcp_drop(ingress, Ipv4OptionsUnsupported, trace);
     }
-    if let Err(reason) = validate_nat44_tcp_atomic(frame, ipv4) {
+    if let Err(reason) = validate_nat44_tcp_unfragmented(frame, ipv4) {
         return nat44_tcp_drop(ingress, reason, trace);
     }
     let tcp = match validate_nat44_tcp(frame, ipv4) {
@@ -5594,10 +5600,19 @@ struct ValidatedNat44Tcp {
     flags: u8,
 }
 
-fn validate_nat44_tcp_atomic(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<(), DropReason> {
+/// NAT44 translates whole datagrams only (MTU2, NAT44-008): MF clear and
+/// offset 0. DF and the reserved flag are ignored and preserved; a DF-clear
+/// datagram gets a new ID after translation
+/// ([`rewrite_translated_non_atomic_id`]). A fragment is refused as
+/// [`DropReason::Nat44TcpNonAtomicIpv4Unsupported`]: fragment translation
+/// (RFC 4787 REQ-14) is the deferred NAT-FRAG slice.
+fn validate_nat44_tcp_unfragmented(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+) -> Result<(), DropReason> {
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    if flags_fragment & 0x7fff != 0x4000 {
+    if flags_fragment & 0x3fff != 0 {
         return Err(Nat44TcpNonAtomicIpv4Unsupported);
     }
     Ok(())
@@ -5756,10 +5771,15 @@ struct ValidatedNat44Udp {
     checksum: u16,
 }
 
-fn validate_nat44_atomic(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Result<(), DropReason> {
+/// The UDP form of [`validate_nat44_tcp_unfragmented`]: a fragment is
+/// [`DropReason::Nat44UdpNonAtomicIpv4Unsupported`].
+fn validate_nat44_unfragmented(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+) -> Result<(), DropReason> {
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
-    if flags_fragment & 0x7fff != 0x4000 {
+    if flags_fragment & 0x3fff != 0 {
         return Err(Nat44UdpNonAtomicIpv4Unsupported);
     }
     Ok(())
@@ -6618,6 +6638,90 @@ fn sender_is_host(
         && octets[0] != 127
         && octets[0] < 224
         && !snapshot.is_connected_boundary(ingress, sender)
+}
+
+/// RFC 6864 §5.3.1 (NAT44-126): an address-sharing device generates the
+/// IPv4 ID of the non-atomic datagrams it translates instead of copying it,
+/// so the IDs of inside hosts sharing the public address stay unique per
+/// (source, destination, protocol) if a datagram is fragmented downstream.
+///
+/// Runs on the translated frame. A datagram with DF set (atomic, RFC 6864
+/// §4.1: its ID has no meaning) keeps its ID, which costs one header read
+/// on the fast path; so does any non-NAT decision. A whole DF-clear
+/// datagram (the NAT translates no fragment) gets the next ID of its
+/// translated tuple from the generator of its protocol: UDP from the UDP
+/// runtime, TCP from the TCP runtime, and ICMP (queries and translated
+/// errors share protocol 1, so one sequence) from the ICMP query runtime,
+/// else the UDP, else the TCP runtime. Each generator counts tuples whose
+/// source is the public address (outbound, hairpin) apart from the others
+/// (inbound), so outside traffic cannot advance an outbound sequence. The
+/// header checksum is updated incrementally (RFC 1624).
+///
+/// The ID is taken when the core commits the frame for TX, before the
+/// backend accepts it: a backend TX rejection does not return it. A plan,
+/// MTU, or firewall drop happens earlier and takes none.
+fn rewrite_translated_non_atomic_id(
+    frame: &mut [u8],
+    decision: PacketDecision,
+    nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
+) -> Result<(), DropReason> {
+    if !matches!(
+        decision,
+        PacketDecision::Nat44Udp(_)
+            | PacketDecision::Nat44Tcp(_)
+            | PacketDecision::Nat44Icmp(_)
+            | PacketDecision::Nat44Icmpv4(_)
+    ) {
+        return Ok(());
+    }
+    let header = packet::ETHERNET_HEADER_LEN;
+    let flags_fragment = packet::read_u16(frame, header + 6).ok_or(Ipv4HeaderTruncated)?;
+    // DF set: atomic. MF or an offset never reaches a NAT decision; such a
+    // fragment would keep its ID so that its datagram still reassembles.
+    if flags_fragment & 0x7fff != 0 {
+        return Ok(());
+    }
+    // The NAT translates only IHL=5 datagrams (options are refused before
+    // any NAT decision, `Ipv4OptionsUnsupported`), so the IPv4 header is at
+    // the fixed offsets after the Ethernet header: ID at 4, flags at 6,
+    // protocol at 9, checksum at 10, addresses at 12..20.
+    let old_id = packet::read_u16(frame, header + 4).ok_or(Ipv4HeaderTruncated)?;
+    let checksum = packet::read_u16(frame, header + 10).ok_or(Ipv4HeaderTruncated)?;
+    let addresses: [u8; 8] = frame
+        .get(header + 12..header + 20)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or(Ipv4HeaderTruncated)?;
+    let protocol = frame[header + 9];
+    let source = [addresses[0], addresses[1], addresses[2], addresses[3]];
+    let destination = [addresses[4], addresses[5], addresses[6], addresses[7]];
+    let id = match decision {
+        PacketDecision::Nat44Udp(_) => nat44_udp
+            .as_deref_mut()
+            .ok_or(Nat44UdpRuntimeUnavailable)?
+            .next_ipv4_id(source, destination, protocol),
+        PacketDecision::Nat44Tcp(_) => nat44_tcp
+            .as_deref_mut()
+            .ok_or(Nat44TcpRuntimeUnavailable)?
+            .next_ipv4_id(source, destination, protocol),
+        _ => {
+            if let Some(runtime) = nat44_icmp.as_deref_mut() {
+                runtime.next_ipv4_id(source, destination, protocol)
+            } else if let Some(runtime) = nat44_udp.as_deref_mut() {
+                runtime.next_ipv4_id(source, destination, protocol)
+            } else {
+                nat44_tcp
+                    .as_deref_mut()
+                    .ok_or(Nat44IcmpRuntimeUnavailable)?
+                    .next_ipv4_id(source, destination, protocol)
+            }
+        }
+    };
+    frame[header + 4..header + 6].copy_from_slice(&id.to_be_bytes());
+    frame[header + 10..header + 12]
+        .copy_from_slice(&rfc1624_update(checksum, old_id, id).to_be_bytes());
+    Ok(())
 }
 
 fn apply_decision(frame: &mut [u8], decision: PacketDecision) -> Result<(), DropReason> {

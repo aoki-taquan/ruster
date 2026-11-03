@@ -646,10 +646,10 @@ A forwarded datagram longer than the egress MTU is dropped:
   Unreachable), or validation fails with
   `ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`.
 - DF clear: `IPV4_FRAGMENTATION_REQUIRED`, no error. The router does not
-  fragment yet (a deviation of RFC 1812 4.2.2.7, NAT44-019L; MTU2). NAT44
-  translates only DF datagrams anyway (others are
-  `NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`), so this concerns routed traffic
-  between interfaces without NAT.
+  fragment yet (a deviation of RFC 1812 4.2.2.7, NAT44-019L; MTU2 part B).
+  Since MTU2 part A this also concerns traffic through the NAT, which now
+  translates whole DF-clear datagrams (see "DF-clear datagrams through the
+  NAT" below); the NAT commits no mapping or state for such a drop.
 - The firewall decides first: a datagram it refuses is dropped with the
   firewall's reason and never answered, so the error reveals nothing about
   traffic the policy does not admit. To an admitted peer the error does
@@ -673,6 +673,56 @@ through the router: TCP connections whose segments exceed the MTU stall
 after the handshake. Leave it on unless every sender behind the router
 clamps its MSS. Every router-generated error is cut to fit the MTU of the
 interface it leaves (at most 576 bytes of IPv4 as before).
+
+### DF-clear datagrams through the NAT (MTU2 part A)
+
+NAT44 translates every whole datagram (More Fragments clear, fragment
+offset 0) whether Don't Fragment is set or not: UDP, TCP, ICMP queries,
+and the ICMPv4 errors it translates, in both directions and hairpinned
+(NAT44-008). Windows and other hosts send unfragmented UDP (DNS, games,
+VPNs) without DF; before MTU2 the NAT dropped all of it as
+`drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED` (TCP:
+`NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED`).
+
+- IPv4 ID: a translated DF-clear datagram leaves with a new IPv4
+  Identification (RFC 6864 5.3.1: a NAT that shares one public address
+  must generate the ID, not copy it, or two inside hosts sending the same
+  ID to one server could have their fragments mixed if a later link
+  fragments them). Each translated (source, destination, protocol) gets
+  consecutive IDs from a keyed counter; the start is secret. A datagram
+  with DF set keeps its ID (it can never be fragmented, RFC 6864 4.1).
+  There is no switch: copying the ID is not allowed by RFC 6864. Packet
+  captures on both sides of the router therefore show different IDs for
+  DF-clear datagrams; match them by addresses, ports and payload. An ICMP
+  error about such a datagram quotes the generated ID in either direction
+  (an outside router's error about an outbound datagram, or an inside
+  host's error about an inbound one); the router translates the quoted
+  addresses and ports back but not the ID (hosts match errors by addresses
+  and ports). Outbound and inbound datagrams count in separate sequences,
+  so outside traffic cannot advance the sequence of outbound traffic. All
+  inside hosts share the outbound sequence of one (public address,
+  destination, protocol): one host sending about 2.2 kpps of DF-clear
+  datagrams to one destination makes that sequence wrap within 30 s; there
+  is no per-host rate limit yet.
+- Fragments (MF set or a nonzero offset) are still dropped:
+  `drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED`,
+  `drop.NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED`,
+  `drop.NAT44_ICMP_FRAGMENT_UNSUPPORTED`,
+  `drop.NAT44_ICMPV4_QUOTED_FRAGMENT_UNSUPPORTED`, or, with the firewall,
+  `drop.FIREWALL_FRAGMENT_UNSUPPORTED` first. The codes and their names are
+  unchanged, but `*_NON_ATOMIC_IPV4_*` now counts only fragments.
+  Translating fragments (RFC 4787 REQ-14) is the later NAT-FRAG slice
+  (NAT44-018). A sender whose datagrams are larger than the path MTU should
+  use PMTUD (DF) or a smaller MTU.
+- A DF-clear datagram larger than the egress MTU is still
+  `drop.IPV4_FRAGMENTATION_REQUIRED` until fragmentation (MTU2 part B).
+
+Upgrade note (MTU2 part A, behaviour change): traffic that was dropped as
+`*_NON_ATOMIC_IPV4_UNSUPPORTED` now passes the NAT and the firewall's rules
+like any other datagram, creating mappings and firewall state. Review the
+firewall rules if you relied on that drop. Expect those counters to fall to
+the rate of real fragments, and new mappings for the hosts concerned. No
+config key changes; nothing to migrate.
 
 ### Startup retry (XDP-045)
 
@@ -1767,7 +1817,8 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   - Queries are translated whether DF is set or not (Linux sends Echo
     Replies, and Windows Echo Requests, with DF clear), but never as
     fragments (`NAT44_ICMP_FRAGMENT_UNSUPPORTED`, NAT44-116): a ping larger
-    than the path MTU fails. The IPv4 ID is not rewritten.
+    than the path MTU fails. A DF-clear query gets a generated IPv4 ID
+    (NAT44-126, below).
   - The idle timeout is 60 s by default (RFC 5508 REQ-2 floor); a ping
     with an interval above it gets a new mapping (and possibly a new public
     identifier) per request.
@@ -2114,6 +2165,11 @@ What it proves, on the runner's kernel only:
   LAN, so a reply proves both translations), a ping of 203.0.113.2 is
   answered by the router, and the stats show 3 outbound and 3 inbound
   translations on one mapping.
+  Added by MTU2 part A (`priv_run_df_clear`): host A sends, from a raw
+  socket, two DF-clear UDP datagrams with the same IPv4 ID and one with DF
+  to host B; host B sees all three from 203.0.113.2 with valid checksums,
+  the DF-clear ones still without DF and with consecutive generated IDs,
+  the DF one with the ID host A sent; no fragment drop is counted.
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one
@@ -2326,6 +2382,8 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
 | `drop.IPV4_FRAGMENTATION_NEEDED` growing | — | DF datagrams above an egress MTU; senders get Fragmentation Needed | normal for PMTUD; persistent growth from one sender means it ignores the error (check `icmpv4_errors.rate_limited`, firewalls in front of the sender) |
 | `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU (fragmentation is not implemented) | raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
+| `drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED` / `drop.NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED` growing | — | IPv4 fragments (MF or an offset) through the NAT; whole DF-clear datagrams are translated since MTU2 (section 5, "DF-clear datagrams through the NAT") | find the sender that fragments (a datagram above its link MTU); have it use PMTUD (DF) or a smaller MTU. Fragment translation is not implemented (NAT44-018) |
+| DF-clear datagram has a different IPv4 ID after the router | — | the NAT generates the ID of every translated DF-clear datagram (RFC 6864 5.3.1, NAT44-126) | expected; match captures by addresses, ports and payload |
 | `health=LINK_PROBE` / `LINK_UNVERIFIABLE` | 1 if `LINK_UNVERIFIABLE` | rtnetlink/procfs queries failing (3 in a row is fatal) | check the namespace |
 | `health=KERNEL_IPV4_ADDRESSES` / `KERNEL_IPV4_ROUTES` / `KERNEL_FORWARDING_ENABLED` / `FORWARDING_UNVERIFIABLE` | — | kernel L3 or forwarding appeared while attached | remove it while the router runs (section 8) |
 | `IPV4_WEAK_HOST_EXPOSURE` (startup under `--allow-ipv4-weak-host`, or `health=`) | — | effective `rp_filter` 0 (`arp_ignore` does not matter) | `sysctl -w net.ipv4.conf.all.rp_filter=1` (or 2); `arp_ignore=1` as well; without the flag the next start is refused |

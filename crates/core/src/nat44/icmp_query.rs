@@ -559,6 +559,18 @@ impl<'a> Nat44IcmpRuntime<'a> {
             .publication_binding_matches(config.0, hash_key.0)
     }
 
+    /// The ID of the next non-atomic datagram this runtime translates: ICMP
+    /// queries and, when bound, every translated ICMPv4 error (one protocol,
+    /// one sequence; RFC 6864 §5.3.1, NAT44-126).
+    pub(crate) fn next_ipv4_id(
+        &mut self,
+        source: [u8; 4],
+        destination: [u8; 4],
+        protocol: u8,
+    ) -> u16 {
+        self.engine.next_ipv4_id(source, destination, protocol)
+    }
+
     #[must_use]
     pub const fn counters(&self) -> Nat44IcmpCounters {
         Nat44IcmpCounters::from_engine(self.engine.counters())

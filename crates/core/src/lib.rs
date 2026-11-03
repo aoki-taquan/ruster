@@ -11,6 +11,7 @@ mod icmpv4_translated_limit;
 mod io;
 mod nat44;
 mod nat44_host_quota;
+mod nat44_ipv4_id;
 mod nat44_syn_hold;
 mod nat44_tcp_state;
 mod observability;

@@ -1017,7 +1017,7 @@ fn structural_and_policy_failures_are_byte_and_state_atomic() {
                 40_000,
                 53,
                 64,
-                0,
+                0x2000,
                 &[],
                 &[],
                 UdpChecksum::Zero,
@@ -1918,13 +1918,14 @@ fn later_forwarding_and_structural_failures_still_advance_nat_time() {
     .unwrap();
     assert_drop(&mut io, DropReason::NeighborUnresolved, &equal);
 
+    // A fragment (MF set); a whole DF-clear datagram is translated (MTU2).
     let malformed = udp_frame(
         HOST,
         REMOTE1,
         40_000,
         53,
         64,
-        0,
+        0x2000,
         &[],
         &[],
         UdpChecksum::Zero,

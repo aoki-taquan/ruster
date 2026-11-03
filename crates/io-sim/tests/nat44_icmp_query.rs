@@ -402,6 +402,18 @@ fn refresh(frame: &mut [u8]) {
     frame[24..26].copy_from_slice(&checksum.to_be_bytes());
 }
 
+/// `expected` with the IPv4 ID of `actual` and its IPv4 checksum
+/// recomputed: a DF-clear translated datagram gets a generated ID (RFC 6864
+/// §5.3.1, NAT44-126; the sequence is checked by the ID policy tests).
+fn adopt_id(mut expected: Vec<u8>, actual: &[u8]) -> Vec<u8> {
+    assert_eq!(expected[20] & 0x40, 0, "only a DF-clear datagram");
+    expected[18..20].copy_from_slice(&actual[18..20]);
+    expected[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&expected[14..34]);
+    expected[24..26].copy_from_slice(&checksum.to_be_bytes());
+    expected
+}
+
 /// A query as received on `ingress` from `source`.
 fn received(
     ingress: IfId,
@@ -744,7 +756,7 @@ fn external_errors_quoting_a_query_reach_the_host_with_the_quote_reverted() {
             frame[6..12].copy_from_slice(&LAN_MAC.0);
             frame[22] -= 1;
             refresh(&mut frame);
-            frame
+            adopt_id(frame, &delivered)
         };
         assert_eq!(delivered, expected);
         assert_eq!(
@@ -808,7 +820,7 @@ fn inside_errors_quoting_a_reply_reach_the_remote_with_the_external_view() {
             frame[6..12].copy_from_slice(&WAN_MAC.0);
             frame[22] -= 1;
             refresh(&mut frame);
-            frame
+            adopt_id(frame, &out)
         };
         assert_eq!(out, expected);
         // Only a reply can have reached H2 through the NAT: an error quoting
@@ -933,8 +945,9 @@ fn errors_quoting_a_query_share_the_translated_limit_and_mtu_check() {
 }
 
 /// NAT44-116: an unfragmented query with DF clear (Windows Echo Requests,
-/// Linux Echo Replies) is translated both ways with its flags and IPv4 ID
-/// preserved, and an error quoting such a query is translated too.
+/// Linux Echo Replies) is translated both ways with its flags preserved and
+/// a generated IPv4 ID (NAT44-126: consecutive per translated tuple), and
+/// an error quoting such a query is translated too.
 #[test]
 fn unfragmented_queries_with_df_clear_translate_both_ways() {
     for firewall in [Firewall::None, Firewall::WithIcmpRule] {
@@ -950,19 +963,28 @@ fn unfragmented_queries_with_df_clear_translate_both_ways() {
                 clear_df(received(LAN, H1, REMOTE, ECHO_REQUEST, FIRST)),
             )
             .unwrap();
-        assert_eq!(
-            out,
-            clear_df(query_frame(
-                GW_MAC,
-                WAN_MAC,
-                PUBLIC,
-                REMOTE,
-                63,
-                ECHO_REQUEST,
-                FIRST,
-                7
-            ))
-        );
+        let expected_out = clear_df(query_frame(
+            GW_MAC,
+            WAN_MAC,
+            PUBLIC,
+            REMOTE,
+            63,
+            ECHO_REQUEST,
+            FIRST,
+            7,
+        ));
+        assert_eq!(out, adopt_id(expected_out.clone(), &out));
+        // The next DF-clear datagram of (PUBLIC, REMOTE, ICMP) takes the next
+        // ID of the tuple, whatever ID the host sent.
+        let (_, again) = world
+            .run(
+                LAN,
+                clear_df(received(LAN, H1, REMOTE, ECHO_REQUEST, FIRST)),
+            )
+            .unwrap();
+        let next = u16::from_be_bytes([out[18], out[19]]).wrapping_add(1);
+        assert_eq!(u16::from_be_bytes([again[18], again[19]]), next);
+        assert_eq!(again, adopt_id(expected_out, &again));
         let (_, back) = world
             .run(
                 WAN,
@@ -971,9 +993,12 @@ fn unfragmented_queries_with_df_clear_translate_both_ways() {
             .unwrap();
         assert_eq!(
             back,
-            clear_df(query_frame(
-                H1_MAC, LAN_MAC, REMOTE, H1, 63, ECHO_REPLY, FIRST, 7
-            ))
+            adopt_id(
+                clear_df(query_frame(
+                    H1_MAC, LAN_MAC, REMOTE, H1, 63, ECHO_REPLY, FIRST, 7
+                )),
+                &back
+            )
         );
         let (egress, _) = world
             .run(WAN, icmp_error(WAN, ROUTER, PUBLIC, 11, 0, &out))

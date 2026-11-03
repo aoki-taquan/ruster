@@ -1110,7 +1110,7 @@ fn malformed_checksum_fragment_source_zero_and_options_are_atomic() {
     checksum[50] ^= 1;
     cases.push((checksum, DropReason::Nat44TcpChecksumInvalid));
     cases.push((
-        tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0, 0x02, &[], &[], &[]),
+        tcp_frame(HOST, REMOTE1, 40_000, 443, 64, 0x2000, 0x02, &[], &[], &[]),
         DropReason::Nat44TcpNonAtomicIpv4Unsupported,
     ));
     cases.push((

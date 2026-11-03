@@ -130,11 +130,11 @@ pub(super) fn validate_icmp_query(
     })
 }
 
-/// Whether a query is a whole datagram (MF clear, offset 0). Unlike UDP and
+/// Whether a query is a whole datagram (MF clear, offset 0). As for UDP and
 /// TCP (NAT44-008), DF may be clear: Linux sends Echo Replies and Windows
-/// sends Echo Requests with DF clear, and a query that size never needs
-/// the IPv4 ID to identify it (NAT44-116). The reserved flag is ignored and
-/// preserved; the IPv4 ID is preserved.
+/// sends Echo Requests with DF clear (NAT44-116). The reserved flag is
+/// ignored and preserved; a DF-clear query gets a generated IPv4 ID after
+/// translation (NAT44-126), a DF-set one keeps its ID.
 fn unfragmented(frame: &[u8], ipv4: packet::ValidatedIpv4) -> bool {
     packet::read_u16(frame, ipv4.header_offset + 6).is_some_and(|flags| flags & 0x3fff == 0)
 }

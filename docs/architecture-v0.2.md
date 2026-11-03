@@ -432,7 +432,7 @@ frameを再検証しDF bitを読みます。この位置なので:
 
 超過はDF=1なら`IPV4_FRAGMENTATION_NEEDED`とType 3/Code 4（Next-Hop MTU = egress MTUをICMP
 header 2語目の下位16 bitへ、上位16 bitは0）、DF=0なら`IPV4_FRAGMENTATION_REQUIRED`（fragmentation
-未実装のdeviation、MTU2）、local Echo Replyなら`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。
+未実装のdeviation、MTU2 part B。part AからNATを通る完全なDF=0 datagramもここに来る）、local Echo Replyなら`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。
 `Icmpv4ErrorAction`はNext-Hop MTUを2 bytes持ちます（action slotは584→592 bytes）。limiter classは
 Port Unreachable（class 1）と同様に専用のclass 2で、間隔は`fragmentation-needed-interval-ms`（default
 10 ms）です（review M1: class 0を共有するとTTL=1を100 msごとに送るだけで他hostのFragmentation Neededが
@@ -544,7 +544,7 @@ mappingをrefreshせずdropし、filterを緩めません。live mappingをevict
    neighborを先に確定。source reverse-LPMがinsideであることを確認。
 3. inbound public UDPはlocal deliveryより先にinterceptし、mapping/ADF lookup後、
    translated internal destinationを通常LPMしinside neighborを確定。
-4. reserved flagをfragment判定からmaskした上でDF=1/MF=0/offset=0、UDP header/length、
+4. reserved flagをfragment判定からmaskした上でMF=0/offset=0（DFは問わない、MTU2 part A）、UDP header/length、
    全offset、mapping/peer/port transactionをmutationなしでplan。
 5. L2、TTL、IPv4 address、UDP port、IPv4/UDP checksumの完全なrewrite planを適用。
 6. mapping/peer/refreshをinfallible commitし、最後にRX leaseをTX requestへcommit。
@@ -567,8 +567,41 @@ RFC 768のUDP lengthは8以上かつIPv4 payload以下を要求し、短いUDP l
 paddingは保存します。checksum zeroはzeroのままです。nonzero checksumはRFC 1624で
 translated IPv4 address wordsとportを更新し、算術結果zeroをUDP wireの`0xffff`へencode
 します。入力nonzero checksumを新規にfull validationしないrouter profileです。IPv4 IDは
-RFC 6864 atomic datagramとして保存します。RFC 1812 §4.2.2.3に従いreserved flagだけでは
+DF=1（RFC 6864 atomic datagram）なら保存し、DF=0なら下の「translated non-atomic IPv4 ID」の
+とおり生成し直します。RFC 1812 §4.2.2.3に従いreserved flagだけでは
 dropせず、IPv4 flags/fragment wordをNAT rewrite後のwireへそのまま保存します。
+
+### translated non-atomic IPv4 ID（MTU2 part A、NAT44-126）
+
+NAT44（UDP、TCP、ICMP query、翻訳するICMPv4 error、hairpin）はMF=0/offset=0の完全な
+datagramをDFの有無によらず変換します（NAT44-008。Windowsは非fragmentのUDPをDF=0で送る）。
+fragmentは従来どおり`NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`などのtyped dropで、fragment変換
+（RFC 4787 REQ-14）はNAT-FRAG sliceへdeferredです（NAT44-018）。
+
+RFC 6864 §5.3.1はaddress-sharing deviceに、変換したdatagramのIDをsourceと同じ規則
+（non-atomicは(source, destination, protocol)ごとにMDL内で一意、§4.3）に従わせ、address/protocolを
+書き換えるならcopyせず生成することを求めます。NAPTは多数のinside hostを一つのpublic addressへ
+集約するので、pass-throughでは別hostの同じIDが変換後の同じtupleで衝突し、下流でfragmentされると
+誤再構成（RFC 4963 §2）になり得ます。そこで`forward_batch_inner`は`check_egress_mtu`と
+`apply_decision`の後、commitの直前に`rewrite_translated_non_atomic_id`を呼びます。NAT decisionで
+DF=0のframeだけ、変換後の(source, destination, protocol)を`Ipv4IdGenerator`
+（`nat44_ipv4_id.rs`）に渡します。generatorはNAT runtimeのhash keyで構築時に固定したkeyed
+SipHash（domain `Ipv4Identification`）でtupleから1024個のu16 counterのbucketと秘密のoffsetを得て、
+ID = counter + offsetを返しcounterを1進めます。counter配列はsourceがpublic addressのtuple
+（outbound、hairpin）とそれ以外（inbound）で分け、outsideからのinbound trafficがoutbound tupleの
+sequenceを進められないようにします（hairpinはinside hostだけが駆動しtupleがoutboundと一致しないので
+outbound側）。inline配列なのでallocationもlockもなく、keyは構築時に固定しreconcileでrotateせず
+（sequenceをresetしないため）、reconcile/flushでもresetしません。generatorはworkerごとなので、
+multi-workerにする時はworkerごとの派生keyと重ならないID範囲、または(source, destination,
+protocol)でのaffine shardingが要ります（そうしないと同じtupleのIDがworker間で重複する）。IPv4 checksumはRFC 1624で更新します。UDPはUDP runtime、TCPは
+TCP runtimeのgeneratorを使い、protocol 1（ICMP queryと翻訳したerror）は同じ列にするため
+ICMP query runtime、無ければUDP、無ければTCP runtimeのgeneratorを使います。DF=1のframeは
+flagsを一回読むだけでIDを変えません（RFC 6864 §4.1）。plan、MTU、firewallでdropしたdatagramは
+IDを消費しません（消費はcoreのTX commit時でbackendのTX受理より前）。
+pass-throughは§5.3.1のMUSTに反するので設定にしません。残余は一つのbucketで65536個/MDLを超えると
+一巡すること（inside hostはoutbound配列を共有し、一つのhostが約2.2 kpps送ると共有tupleが30 sで
+一巡する。host単位のrate limitは無い）、同じoutbound bucketを共有するtupleからの件数推測、
+翻訳したerrorのquote内IDをどちらの方向でも戻さないこと、runtime作り直しでの再開です（NAT44-126）。
 
 fragment handling/reassembly、static port forward、複数public address、port randomization/parity、minimal
 stateful sliceを越えるfull packet filterはdeferredです。RFC 3022/4787/7857の全機能準拠は
@@ -615,7 +648,7 @@ reconcileがgenerationをresetしたABAやslot再利用後に旧tupleを復活�
 
 admissionとtransaction順はUDP profileに合わせ、次を追加します。
 
-1. IHL=5、reserved flagを除いてDF=1/MF=0/offset=0、protocol=6、IPv4 payload 20 bytes以上を
+1. IHL=5、reserved flagを除いてMF=0/offset=0（DFは問わない、MTU2 part A）、protocol=6、IPv4 payload 20 bytes以上を
    要求する。reserved flagは受理してNAT rewrite後も保存する。
 2. TCP Data Offsetは5以上かつheader endがIPv4 Total Length内であることを要求する。
 3. pseudo-headerとIPv4 TCP payload全体（odd final byteはlogical zero pad）を含むincoming
@@ -1145,7 +1178,7 @@ Unreachable code 0–4, 6, 7, 9–15、Time Exceeded code 0、Parameter Problem 
 除外はType 3 code 5（NAT44はoptionsなしpacketだけを変換するのでsource routeを持つ変換済み
 packetは無い）、code 8（obsolete。RFC 1812 §5.2.7.1はSHOULD NOT generateで禁止ではなく、古い
 routerが送り得るがdeviation NAT44-067として除外）、未割当code、Time Exceeded code 1
-（変換はatomic datagramだけでreassemblyが起きない）、Source Quench（REQ-10 c.1 SHOULD NOT、
+（変換は完全なdatagramだけでreassemblyが起きない）、Source Quench（REQ-10 c.1 SHOULD NOT、
 RFC 6633）、Redirect（link-local advice）です。非対象はcandidateにならず従来の経路に残ります。
 
 `Nat44UdpPolicy`/`Nat44TcpPolicy`の`icmpv4_errors`（`Nat44Icmpv4ErrorPolicy`）は
@@ -1170,7 +1203,7 @@ type（Type 3 code 0/1/4/6/7/9–15、Time Exceeded、Parameter Problem）は同
 peekはouter IPv4 Total Length内だけで行い、link paddingをcandidate bytesとして扱いません。
 対象はouter IHL=5、nonfragment、TTL>1、valid ICMP checksumと、validなIPv4 headerを含む
 引用です。引用datagramはreserved flagをfragment判定からmaskした上で
-DF=1/MF=0/offset=0、UDPまたはTCP、public sourceで、IPv4 headerとtransport先頭8 bytesが
+MF=0/offset=0（DFは問わない、MTU2 part A）、UDP、TCPまたはICMP query、public sourceで、IPv4 headerとtransport先頭8 bytesが
 実際に存在することを要求します。RFC 1812 §4.2.2.3に従いreserved flagだけではdropせず、
 引用tuple/checksum rewrite後もflags/fragment wordへ保存します。reserved併存MF/offsetは
 MF/offsetを理由にtyped dropします。
@@ -1211,9 +1244,9 @@ MTU 16 bitsはclampせず32 bitsすべてを保存します。MTU 0、68、1500�
 Next-Hop MTU 1〜67で、IPv4の最小MTU 68（RFC 791）未満はどのrouterも報告し得ない
 （RFC 1191 §4）ので、ICMP checksum検証の直後に両方向で`NAT44_ICMPV4_FRAG_NEEDED_MTU_INVALID`
 としてdropします（NAT44-098）。0はRFC 1191以前のrouter（§5）として有効です。
-local forwarding MTUとの比較、PMTU cache更新、MTU 0のplateau推定、local MTU超過時の
-Type 3/Code 4生成はまだありません。DF=0 packetの必要なfragmentation、
-RFC 4884 full supportもdeferredです。
+local forwarding MTUとの比較とlocal MTU超過時のType 3/Code 4生成はMTU1で実装しました
+（上の「egress MTU」）。PMTU cache更新、MTU 0のplateau推定、DF=0 packetの必要なfragmentation
+（MTU2 part B）、RFC 4884 full supportはdeferredです。
 
 ### translated error rate limit（NAT44-065）
 
@@ -1270,7 +1303,7 @@ policy `Bidirectional`のserviceは、inside realmから来るICMPv4 errorも変
 満たすpacketです: inside ingress、router-localでない宛先、対応type/code、引用protocol側の
 policyが`Bidirectional`、宛先が`P`（REQ-7）またはLPMでoutsideへ出る（REQ-5）。それ以外は
 従来どおりfail closedです。parserとvalidation（outer IHL 5、nonfragment、TTL>1、ICMPと引用
-IPv4のchecksum、引用のDF=1/MF=0/offset=0、UDP/TCP、transport先頭8 bytes）は外部errorと共有します。
+IPv4のchecksum、引用のMF=0/offset=0、UDP/TCP/ICMP query、transport先頭8 bytes）は外部errorと共有します。
 
 **REQ-5。** inside host X（またはXへのinside next hop）が、NATが届けたinbound packet
 `R:r -> X:x`についてRへerrorを返します。NATは引用を外部での姿`R:r -> P:x'`へ戻し（REQ-5 a）、
@@ -1355,7 +1388,7 @@ packet path（`forwarding/nat44_icmp_query.rs`）:
 - inside→outside（routeのegressがoutside、protocol 1）: `[nat44.icmp]`があればUDP/TCPの
   「unsupported transport」gateを通らず、route/TTL/neighborの後で`decide_nat44_icmp_outbound`。
   Echo/Timestamp Request以外（Reply、Information、Address Mask、他のnon-error）は
-  `NAT44_ICMP_TYPE_UNSUPPORTED`。checksum、code 0、header長、unfragmented（MF=0/offset=0。UDP/TCPと違いDF=0も変換、NAT44-116）、source admission、
+  `NAT44_ICMP_TYPE_UNSUPPORTED`。checksum、code 0、header長、unfragmented（MF=0/offset=0。DF=0も変換しIDを生成、NAT44-116/NAT44-126。MTU2からUDP/TCPも同じ）、source admission、
   inside reverse routeをstate変更前に検証し、plan→prevalidate→rewrite→commitの順はUDPと同じ。
 - outside→public address: Reply（0/14）だけをNAT inboundとして扱い、Requestはrouter自身の
   Echo responder（local）。Replyがoutside以外から来たら`NAT44_ICMP_WRONG_INGRESS`。
@@ -1905,9 +1938,9 @@ ICMPとなり、外部からinside側のroute有無を走査できます。そ�
 realm mismatch時のTCP/UDPでingressがinside、またはinside発のUDP/TCPで対応するNAT runtimeが
 不在/不一致なら、counter/trace/stateを変えずsilentな`FirewallRouteUnavailable`にします
 （いずれも保守側で、該当egressへのrouteが無い場合も含む）。firewall評価より後で行う
-outbound NATのshape/plan reject（DF=0の`Nat44UdpNonAtomicIpv4Unsupported`、source port 0、
+outbound NATのshape/plan reject（source port 0、
 SourceForbidden、ReverseAuthorityMismatch、port pool枯渇など）は再現しないため、例えばLANからの
-DF=0 UDP/53はroute有りならsilent、route無しならICMPになります。これは受容します: 送信者はinside
+source port 0のUDP/53はroute有りならsilent、route無しならICMPになります。これは受容します: 送信者はinside
 にいて有効なDF=1 trafficで同じroute有無を知ることができ、firewallなしの経路にも同じ非対称が
 あり、生成errorはper-egress rate limiterで抑えられるためです。
 
