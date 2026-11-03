@@ -184,11 +184,13 @@ pub enum ValidationCode {
     /// `frame-count` is below `fill + tx + generated-frames`.
     BackendFrameCountTooSmall,
     /// `icmpv4-errors.capacity.states` is below the number of interfaces
-    /// plus one while the TCP NAT can send delayed Port Unreachable errors
-    /// (`unsolicited-syn-icmp` on and `unsolicited-syn-holds` above 0).
-    /// Limiter states are keyed by egress and class, and Port Unreachable
-    /// has its own class on the outside egress, so up to interfaces + 1
-    /// states can be in use at once. With fewer, a SYN flood could keep the
+    /// plus one (twice the number of interfaces plus one while
+    /// Fragmentation Needed is generated, MTU1) while the TCP NAT can send
+    /// delayed Port Unreachable errors (`unsolicited-syn-icmp` on and
+    /// `unsolicited-syn-holds` above 0). Limiter states are keyed by egress
+    /// and class, and Port Unreachable has its own class on the outside
+    /// egress (Fragmentation Needed its own on every egress), so up to
+    /// interfaces + 1 (2 x interfaces + 1) states can be in use at once. With fewer, a SYN flood could keep the
     /// Port Unreachable state alive and leave another egress `StateFull`,
     /// which would silently suppress its Time Exceeded and Destination
     /// Unreachable errors.
