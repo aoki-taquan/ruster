@@ -5,8 +5,8 @@
 use std::num::{NonZeroU128, NonZeroU32};
 
 use ruster_config::{
-    AfPacketRingV1, ValidatedAfPacketPortV1, ValidatedAfPacketV1, ValidatedAfXdpPortV1,
-    ValidatedAfXdpV1, XdpAttachModeV1,
+    AfPacketRingV1, ExitProtectionV1, ValidatedAfPacketPortV1, ValidatedAfPacketV1,
+    ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1,
 };
 use ruster_core::{BackendStats, IfId, MonotonicMillis};
 use ruster_io_afpacket::{
@@ -23,6 +23,7 @@ use super::checks::linux::PortSysctls;
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure, Probe};
 use super::engine::HealthSample;
 use super::engine::{ClockedIo, Datapath, DrainProgress, IdleWake, LinkMonitor, WaitError};
+use super::exit_guard::{ExitAction, ExitActions, ExitError, ExitReport};
 use super::fs_confine::{self, FsFailure, FsReport};
 use super::netlink::{Dump, Family, IfName, LinkFacts, LinkProbe, NetlinkError};
 use super::offload;
@@ -46,6 +47,21 @@ impl PortHost for LinuxHost {
     type Datapath<'s> = XdpDatapath<'s>;
     type Packet = PacketDatapath;
     type Links = NetlinkLinks;
+    type Exit = LinuxExit;
+
+    fn initial_user_namespace(&self) -> Option<bool> {
+        std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .map(|map| is_initial_uid_map(&map))
+    }
+
+    fn exit_actions(
+        &self,
+        protection: ExitProtectionV1,
+        targets: &[LinkTarget],
+    ) -> Result<LinuxExit, (Option<IfId>, ExitError)> {
+        LinuxExit::open(protection, targets)
+    }
 
     fn links(&self, devices: &[(IfId, &str)]) -> Result<NetlinkLinks, Failure> {
         let probe = LinkProbe::open().map_err(Failure::Links)?;
@@ -552,6 +568,89 @@ impl Datapath for PacketDatapath {
     }
 }
 
+/// Whether `/proc/self/uid_map` is the initial user namespace's: one
+/// extent mapping every uid onto itself (`0 0 4294967295`).
+fn is_initial_uid_map(map: &str) -> bool {
+    let mut lines = map.lines();
+    let first = lines
+        .next()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>());
+    lines.next().is_none() && first.as_deref() == Some(&["0", "0", "4294967295"][..])
+}
+
+/// The live exit actions (OPS-EXIT, [`super::exit_guard`]): the ports'
+/// IPv4 forwarding sysctl files opened write-only and an rtnetlink socket,
+/// all opened before the privilege drop and any confinement.
+pub struct LinuxExit {
+    forwarding: Vec<(IfId, std::fs::File)>,
+    links: Option<(LinkProbe, Vec<(IfId, u32)>)>,
+}
+
+impl LinuxExit {
+    fn open(
+        protection: ExitProtectionV1,
+        targets: &[LinkTarget],
+    ) -> Result<Self, (Option<IfId>, ExitError)> {
+        let mut forwarding = Vec::new();
+        if protection.ipv4_forwarding_off {
+            for target in targets {
+                let fail = |error| (Some(target.interface), error);
+                // The configured device name (an ASCII path component,
+                // checked by the config and `IfName`).
+                let device = std::str::from_utf8(target.name.as_bytes())
+                    .map_err(|_| fail(ExitError::Errno(EINVAL)))?;
+                let path = format!("/proc/sys/net/ipv4/conf/{device}/forwarding");
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .map_err(|error| fail(io_error(&error)))?;
+                forwarding.push((target.interface, file));
+            }
+        }
+        let links = if protection.link_down {
+            let probe = LinkProbe::open().map_err(|error| (None, ExitError::Netlink(error)))?;
+            let ports = targets
+                .iter()
+                .map(|target| (target.interface, target.ifindex))
+                .collect();
+            Some((probe, ports))
+        } else {
+            None
+        };
+        Ok(Self { forwarding, links })
+    }
+}
+
+/// `EINVAL`.
+const EINVAL: i32 = 22;
+
+fn io_error(error: &std::io::Error) -> ExitError {
+    ExitError::Errno(error.raw_os_error().unwrap_or(0))
+}
+
+impl ExitActions for LinuxExit {
+    /// Forwarding first (it only narrows what the kernel does), then the
+    /// links. Each sysctl file is written once at offset 0 (never written
+    /// before), as `0` and a newline.
+    fn apply(&mut self, report: &mut ExitReport) {
+        use std::io::Write as _;
+        for (interface, file) in &mut self.forwarding {
+            let result = match file.write(b"0\n") {
+                Ok(2) => Ok(()),
+                Ok(_) => Err(ExitError::ShortWrite),
+                Err(error) => Err(io_error(&error)),
+            };
+            report.record(*interface, ExitAction::Ipv4ForwardingOff, result);
+        }
+        if let Some((probe, ports)) = &mut self.links {
+            for (interface, ifindex) in ports.iter() {
+                let result = probe.set_down(*ifindex).map_err(ExitError::Netlink);
+                report.record(*interface, ExitAction::LinkDown, result);
+            }
+        }
+    }
+}
+
 /// The kick failures the health watch times as `KICK_ERRORS`: the
 /// engine's `kick_errors` counts every failed kick, `ENETDOWN` included,
 /// while the adapter counts the `ENETDOWN` ones separately
@@ -570,6 +669,15 @@ fn watched_kick_errors(counters: &XdpCounters) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_identity_uid_map_is_the_initial_user_namespace() {
+        assert!(is_initial_uid_map("         0          0 4294967295\n"));
+        assert!(!is_initial_uid_map("         0       1000          1\n"));
+        assert!(!is_initial_uid_map("0 0 4294967295\n1 1 1\n"));
+        assert!(!is_initial_uid_map("0 0 65536\n"));
+        assert!(!is_initial_uid_map(""));
+    }
 
     #[test]
     fn enetdown_kicks_are_not_kick_errors_for_the_watch() {

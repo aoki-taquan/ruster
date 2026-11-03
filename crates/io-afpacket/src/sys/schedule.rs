@@ -359,7 +359,13 @@ impl<O: PacketOps> AfPacketEngine<O> {
 
     /// The publication quiescence check: no batch or lease can be open
     /// (`&mut self`), so after settling every port only in-flight TX can
-    /// still carry the current publication's authority.
+    /// still carry the current publication's authority. A port whose link
+    /// is down (its last kick was `ENETDOWN`) does not block (OPS-EXIT):
+    /// `tpacket_snd` leaves every frame SEND_REQUEST while the device is
+    /// down, so waiting would block every publication for as long as the
+    /// link stays down; a granted check adds those frames to the port's
+    /// `quiescence_link_down_tx`, and they stay in flight (sent or
+    /// reported by the drain as before).
     pub(crate) fn quiescence_check(&mut self) -> Result<(), AfPacketQuiescenceError> {
         if self.is_stopped() {
             return Err(AfPacketQuiescenceError::Stopped);
@@ -367,10 +373,21 @@ impl<O: PacketOps> AfPacketEngine<O> {
         if self.settle_all(false).is_err() {
             return Err(AfPacketQuiescenceError::Stopped);
         }
-        match self.tx_in_flight() {
-            0 => Ok(()),
-            frames => Err(AfPacketQuiescenceError::TxInFlight { frames }),
+        let frames: u64 = self
+            .ports
+            .iter()
+            .filter(|port| !port.kick.link_down)
+            .map(|port| port.tx_state.in_flight as u64)
+            .sum();
+        if frames != 0 {
+            return Err(AfPacketQuiescenceError::TxInFlight { frames });
         }
+        for port in self.ports.iter_mut().filter(|port| port.kick.link_down) {
+            let held = port.tx_state.in_flight as u64;
+            port.counters.quiescence_link_down_tx =
+                port.counters.quiescence_link_down_tx.saturating_add(held);
+        }
+        Ok(())
     }
 
     pub(crate) const fn io_disposition(&self) -> PublicationQuiescenceDisposition {

@@ -199,12 +199,17 @@ pub enum SessionStage {
     /// The bound queue must have a TX queue: Linux v6.8 `xsk_bind` only
     /// requires `queue < max(real_num_rx_queues, real_num_tx_queues)`, but
     /// copy-mode `__xsk_generic_xmit` silently transmits nothing on a queue
-    /// at or above `real_num_tx_queues`. Checked through sysfs
-    /// (`/sys/class/net/<dev>/queues/tx-<queue>`) after proving that the
-    /// sysfs view's `ifindex` is the resolved device.
+    /// at or above `real_num_tx_queues`. Checked with one rtnetlink
+    /// `RTM_GETLINK` of the resolved index in the caller's network
+    /// namespace (OPS-EXIT item 3; its `IFLA_IFNAME` must be the configured
+    /// name): the queue must be below `IFLA_NUM_TX_QUEUES` (the allocated
+    /// count). Where the sysfs view proves to describe the resolved device
+    /// (its `ifindex` matches), the active count narrows it
+    /// (`/sys/class/net/<dev>/queues/tx-<queue>`, which follows `ethtool
+    /// -L`); a sysfs view of another namespace is not consulted.
     TxQueueCheck,
-    /// The device MTU (`/sys/class/net/<dev>/mtu`, through the same proven
-    /// sysfs view as [`Self::TxQueueCheck`]), which bounds TX length.
+    /// The device MTU (`IFLA_MTU` of the same rtnetlink answer as
+    /// [`Self::TxQueueCheck`]), which bounds TX length.
     MtuProbe,
     /// `socket(AF_XDP, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)`.
     OpenSocket,
@@ -305,14 +310,16 @@ pub enum SessionFailure {
     /// or after `ethtool -L`). Binding would succeed and TX would stall
     /// silently, so the session is refused.
     NoTxQueue,
-    /// The TX queue count could not be verified: sysfs is not mounted for
-    /// this network namespace, the device's sysfs `ifindex` differs from
-    /// the resolved one (a stale sysfs view after `setns`, or a rename
-    /// race), or sysfs could not be read. Fails closed.
+    /// No longer produced: the TX queue count comes from rtnetlink
+    /// ([`Self::LinkQuery`]); a sysfs view that cannot be proven is not
+    /// consulted. Kept so the stable code stays reserved.
     TxQueueUnverifiable,
-    /// The device MTU could not be read from the proven sysfs view (or was
-    /// zero). Fails closed: without it TX length cannot be bounded.
+    /// The device MTU rtnetlink reported is zero. Fails closed: without it
+    /// TX length cannot be bounded.
     MtuUnverifiable,
+    /// The rtnetlink link query of [`SessionStage::TxQueueCheck`] failed
+    /// (typed, value-free). Fails closed.
+    LinkQuery(crate::LinkQueryError),
     /// The negotiated mode differs from the explicitly bound copy policy.
     NegotiatedModeMismatch {
         /// Mode reported by the kernel.

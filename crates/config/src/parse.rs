@@ -188,6 +188,10 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "tx-stall-fatal-ms",
     "tx-stall-warn-ms",
     "watch",
+    // OPS-EXIT `[exit-protection]`.
+    "exit-protection",
+    "ipv4-forwarding-off",
+    "link-down",
 ];
 
 /// Parses bounded UTF-8 TOML using schema-version predispatch and exact V1 DTOs.

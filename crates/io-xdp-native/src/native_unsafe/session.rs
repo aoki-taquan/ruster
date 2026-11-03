@@ -437,26 +437,29 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             .map_err(at(SessionStage::InterfaceLookup))?;
         // Before any resource: a queue without a TX queue binds fine and
         // then never transmits.
-        match syscalls.tx_queue_probe(config.interface_name_bytes(), ifindex, config.queue()) {
-            TxQueueProbe::Present => {}
-            TxQueueProbe::Absent => {
-                return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));
-            }
-            TxQueueProbe::Unverifiable => {
-                return Err(fail(
-                    SessionStage::TxQueueCheck,
-                    SessionFailure::TxQueueUnverifiable,
-                ));
-            }
+        // One rtnetlink query in the caller's namespace (OPS-EXIT item 3).
+        let link = syscalls
+            .link_query(config.interface_name_bytes(), ifindex)
+            .map_err(|error| fail(SessionStage::TxQueueCheck, SessionFailure::LinkQuery(error)))?;
+        if config.queue() >= link.tx_queues {
+            return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));
+        }
+        // The active count narrows the allocated one where sysfs proves to
+        // describe this device; another namespace's view is not consulted.
+        if syscalls.tx_queue_probe(config.interface_name_bytes(), ifindex, config.queue())
+            == TxQueueProbe::Absent
+        {
+            return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));
         }
         // The TX length bound of the core adapter (mtu + Ethernet header):
         // read once here, before any resource.
-        let Some(mtu) = syscalls.mtu_probe(config.interface_name_bytes(), ifindex) else {
+        let mtu = link.mtu;
+        if mtu == 0 {
             return Err(fail(
                 SessionStage::MtuProbe,
                 SessionFailure::MtuUnverifiable,
             ));
-        };
+        }
         let raw = config.bind_flags().raw();
         match config.mode() {
             BindMode::CopyRequired | BindMode::ZeroCopyRequired => {
@@ -1012,8 +1015,9 @@ impl NativeSession {
         self.core.queue()
     }
 
-    /// Returns the device MTU read from sysfs (`/sys/class/net/<dev>/mtu`,
-    /// after proving its `ifindex`) by [`Self::open`], before any resource.
+    /// Returns the device MTU read by [`Self::open`] before any resource,
+    /// from rtnetlink (`IFLA_MTU` of the resolved index in the caller's
+    /// network namespace, OPS-EXIT item 3).
     ///
     /// This is the L3 MTU: the longest Ethernet frame the device sends is
     /// `mtu + 14` bytes, the TX bound the core adapter enforces

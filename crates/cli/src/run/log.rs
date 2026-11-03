@@ -186,6 +186,26 @@ pub static EVENTS: &[Rule] = &[
         Warn,
     ),
     rule(Prefix("warning: kernel "), "KERNEL_EXPOSURE_AT_EXIT", Warn),
+    rule(
+        Prefix("warning: user namespace:"),
+        "USER_NAMESPACE_NOT_INITIAL",
+        Warn,
+    ),
+    rule(
+        Prefix("exit protection armed:"),
+        "EXIT_PROTECTION_ARMED",
+        Info,
+    ),
+    rule(
+        Prefix("exit protection failed:"),
+        "EXIT_PROTECTION_FAILED",
+        Error,
+    ),
+    rule(
+        Prefix("exit protection applied:"),
+        "EXIT_PROTECTION_APPLIED",
+        Info,
+    ),
     rule(Prefix("warning: privileges kept"), "PRIVILEGES_KEPT", Warn),
     rule(Prefix("privileges dropped:"), "PRIVILEGES_DROPPED", Info),
     rule(Prefix("filesystem confined:"), "FS_CONFINED", Info),
@@ -224,6 +244,12 @@ pub static EVENTS: &[Rule] = &[
         Info,
     ),
     rule(Prefix("the config's directory is /"), "STARTUP_HINT", Info),
+    rule(Prefix("setting a link down needs"), "STARTUP_HINT", Info),
+    rule(
+        Prefix("writing the forwarding sysctl"),
+        "STARTUP_HINT",
+        Info,
+    ),
     rule(Prefix("cannot install "), "SIGNAL_INSTALL_FAILED", Error),
     rule(
         Prefix("cannot start the output thread"),

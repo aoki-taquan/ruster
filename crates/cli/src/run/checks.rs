@@ -476,8 +476,8 @@ pub enum Probe {
     /// (a kernel without `CONFIG_RPS`).
     RxQueues,
     /// The link's MTU differs from the one the session read at open (the
-    /// MTU changed in between, or the session's sysfs view is not this
-    /// namespace's device).
+    /// MTU changed in between; both are rtnetlink answers of the same
+    /// namespace since OPS-EXIT item 3).
     Mtu,
     /// The netlink address dump failed.
     Ipv4Addresses,

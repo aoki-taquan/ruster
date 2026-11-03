@@ -453,6 +453,7 @@ fn an_applied_reload_without_its_report_is_not_kept_running() {
         end: super::super::LoopEnd::Invariant,
         shutdown: super::super::ShutdownReport::default(),
         final_block: String::new(),
+        exit_failed: false,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(

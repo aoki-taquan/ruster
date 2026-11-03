@@ -631,6 +631,41 @@ fn af_packet_quiescence_waits_for_in_flight_tx_and_then_admits_a_publication() {
     );
     live.kernel_completes(1);
     assert_eq!(live.engine.quiescence_check(), Ok(()));
+    assert_eq!(live.port(WAN).counters.quiescence_link_down_tx, 0);
+}
+
+/// OPS-EXIT item 2: TX held on a down link (`ENETDOWN`) does not block a
+/// publication; each granted check counts it, the frames stay published
+/// and leave once the link returns. TX of a port whose link is up still
+/// blocks.
+#[test]
+fn af_packet_quiescence_does_not_wait_for_tx_held_on_a_down_link() {
+    let mut live = Live::new();
+    live.fail_kicks_persistently(Some(ENETDOWN));
+    live.clock(0);
+    assert_eq!(live.generate(WAN, 2, 60), 2);
+    assert!(live.port(WAN).link_down);
+    assert_eq!(live.engine.quiescence_check(), Ok(()));
+    assert_eq!(live.engine.quiescence_check(), Ok(()));
+    let wan = live.port(WAN);
+    assert_eq!(wan.tx_inflight, 2, "frames stay published");
+    assert_eq!(wan.counters.quiescence_link_down_tx, 4);
+    assert_eq!(
+        live.engine.backend_stats().counters.quiescence_link_down_tx,
+        4
+    );
+    // The link returns: the next due retry sends; until the kernel
+    // completes, the frames block again like any in-flight TX.
+    live.fail_kicks_persistently(None);
+    live.clock(256);
+    assert_eq!(
+        live.engine.quiescence_check(),
+        Err(AfPacketQuiescenceError::TxInFlight { frames: 2 })
+    );
+    assert!(!live.port(WAN).link_down);
+    live.kernel_completes(1);
+    assert_eq!(live.engine.quiescence_check(), Ok(()));
+    assert_eq!(live.port(WAN).tx_inflight, 0);
 }
 
 #[test]

@@ -143,7 +143,17 @@
 //! frame of either pool, no staged handoff, and no TX in flight. In-flight
 //! TX still carries bytes rewritten under the active publication, so it
 //! defers the publication but lets old I/O continue
-//! ([`PublicationQuiescenceDisposition::ContinueOldIo`]). A staged handoff
+//! ([`PublicationQuiescenceDisposition::ContinueOldIo`]). The one exception
+//! is a port whose link is down (its last kick was `ENETDOWN`, OPS-EXIT):
+//! the kernel takes nothing from a down device's TX ring until the link
+//! returns, and AF_XDP has no way to take a published descriptor back, so
+//! waiting would block every publication for as long as the link stays
+//! down. Those frames do not block; each granted check adds them to the
+//! port's `quiescence_link_down_tx`. They stay in flight and complete (or
+//! are reported by the shutdown drain) as before: no frame is lost to the
+//! ledger. They already left every decision of the old generation (like
+//! frames in a NIC queue at any publication) and leave when the link
+//! returns. A staged handoff
 //! that no batch owns (only an engine-level leak) is
 //! [`PublicationQuiescenceDisposition::SkipIo`] for good. RX frames
 //! validated but not yet lent carry no publication authority and do not
@@ -445,6 +455,12 @@ pub struct XdpAdapterCounters {
     /// Settles on a down link that skipped the kick because the next retry
     /// was not due yet (the kick stays owed; no syscall, not a kick error).
     pub kick_retries_suppressed: u64,
+    /// TX frames in flight on this port while its link was down that a
+    /// granted publication quiescence check did not wait for (summed per
+    /// granted check, OPS-EXIT): the kernel holds them until the link
+    /// returns, so waiting would block every reload (`TxInFlight`) for as
+    /// long as the link stays down.
+    pub quiescence_link_down_tx: u64,
 }
 
 struct PortState<'memory> {
@@ -1776,11 +1792,20 @@ impl PublicationQuiescence for XdpPacketIo<'_> {
                 });
             }
             let in_flight = port.engine.tx_inflight();
-            if in_flight != 0 {
+            // A down link (the last kick was `ENETDOWN`) holds its TX
+            // until the link returns: not waited for (OPS-EXIT item 2).
+            if in_flight != 0 && !port.link_down {
                 return Err(XdpQuiescenceError::TxInFlight {
                     interface,
                     frames: in_flight,
                 });
+            }
+        }
+        for port in self.ports.iter_mut() {
+            if port.link_down {
+                let held = u64::from(port.engine.tx_inflight());
+                port.counters.quiescence_link_down_tx =
+                    port.counters.quiescence_link_down_tx.saturating_add(held);
             }
         }
         Ok(PublicationQuiescenceGuard::new(self))
@@ -1907,6 +1932,7 @@ pub struct XdpCounters {
     pub kicks_link_down: u64,
     pub kick_budget_exhausted: u64,
     pub kick_retries_suppressed: u64,
+    pub quiescence_link_down_tx: u64,
     // Ring occupancy gauges (one atomic load each, at stats time).
     /// Fill entries published and not yet taken by the kernel.
     pub fill_ring_occupancy: u64,
@@ -1995,6 +2021,7 @@ impl XdpCounters {
             kicks_link_down: adapter.kicks_link_down,
             kick_budget_exhausted: adapter.kick_budget_exhausted,
             kick_retries_suppressed: adapter.kick_retries_suppressed,
+            quiescence_link_down_tx: adapter.quiescence_link_down_tx,
             fill_ring_occupancy: u64::from(engine.fill_occupancy()),
             rx_ring_occupancy: u64::from(engine.rx_occupancy()),
             tx_ring_unconsumed: u64::from(engine.tx_unconsumed()),
@@ -2070,6 +2097,7 @@ impl XdpCounters {
             kicks_link_down,
             kick_budget_exhausted,
             kick_retries_suppressed,
+            quiescence_link_down_tx,
             fill_ring_occupancy,
             rx_ring_occupancy,
             tx_ring_unconsumed,
@@ -2166,6 +2194,7 @@ impl XdpCounters {
         count("kicks_link_down", self.kicks_link_down);
         count("kick_budget_exhausted", self.kick_budget_exhausted);
         count("kick_retries_suppressed", self.kick_retries_suppressed);
+        count("quiescence_link_down_tx", self.quiescence_link_down_tx);
         count("fill_ring_occupancy", self.fill_ring_occupancy);
         count("rx_ring_occupancy", self.rx_ring_occupancy);
         count("tx_ring_unconsumed", self.tx_ring_unconsumed);

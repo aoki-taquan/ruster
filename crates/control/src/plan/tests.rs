@@ -1404,3 +1404,30 @@ fn health_and_watch_changes_are_reloadable_and_no_plan_aspect() {
     );
     assert!(!plan(&[OPS]).requires_restart());
 }
+
+/// OPS-EXIT: `[exit-protection]` is restart-required (the process opens
+/// what the exit actions need before its privilege drop), listed after
+/// `Backend`, and an identical section is no change.
+#[test]
+fn exit_protection_changes_are_restart_required_and_listed_last() {
+    const ON: (&str, &str) = (
+        "[resolution.policy]",
+        "[exit-protection]\nlink-down = true\n\n[resolution.policy]",
+    );
+    const OFF: (&str, &str) = (
+        "[resolution.policy]",
+        "[exit-protection]\nlink-down = false\nipv4-forwarding-off = false\n\n[resolution.policy]",
+    );
+    let on = plan(&[ON]);
+    only(&on, &["restart"]);
+    assert_eq!(on.restart_required(), [RestartRequired::ExitProtection]);
+    assert_eq!(RestartRequired::ExitProtection.code(), "EXIT_PROTECTION");
+    // Spelling out the defaults is no change.
+    let off = plan(&[OFF]);
+    only(&off, &[]);
+    let both = ApplyPlan::between(&config(&[]), &config(&[ON, INTERFACE_CHANGE])).unwrap();
+    assert_eq!(
+        both.restart_required(),
+        [RestartRequired::Interfaces, RestartRequired::ExitProtection]
+    );
+}

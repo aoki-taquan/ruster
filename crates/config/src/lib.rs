@@ -16,7 +16,7 @@ pub use diagnostic::{Diagnostic, DiagnosticCode, PathSegment, SourcePath};
 pub use model::{
     AddressV1, AfPacketPortV1, AfPacketRxRingV1, AfPacketTxRingV1, AfPacketV1, AfXdpModeV1,
     AfXdpPortV1, AfXdpRingsV1, AllocatorSeedV1, ArpV1, BackendKindV1, BackendV1, ConfigV1,
-    ExistingXdpProgramV1, FirewallActionV1, FirewallCapacityV1, FirewallPolicyV1,
+    ExistingXdpProgramV1, ExitProtectionV1, FirewallActionV1, FirewallCapacityV1, FirewallPolicyV1,
     FirewallProtocolV1, FirewallRuleV1, FirewallV1, FragmentTrackingModeV1, FragmentTrackingV1,
     FragmentationV1, HealthV1, Icmpv4ErrorCapacityV1, Icmpv4ErrorGenerateV1, Icmpv4ErrorPolicyV1,
     Icmpv4ErrorTranslatedV1, Icmpv4ErrorV1, InterfaceV1, Ipv4OriginV1, Nat44FilteringV1,

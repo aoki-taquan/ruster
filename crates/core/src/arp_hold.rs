@@ -235,19 +235,8 @@ pub(crate) struct ArpHoldMiss {
 /// table.
 pub(crate) enum ArpHoldFragmentHook<'f> {
     /// How many fragments the held first fragment `frame` from `ingress`
-    /// has waiting in the table (room its replay must reserve), or `None`
-    /// when the table's entry for its key is no longer the one recorded at
-    /// hold time (`association`, `generation`; a newer datagram reusing the
-    /// key, also when it was created after the hold started with the same
-    /// 16-bit stamp): the replay would decide that other datagram, so it is
-    /// freed.
-    Reserve {
-        frame: &'f [u8],
-        ingress: IfId,
-        association: Option<(u32, u16)>,
-        /// The hold's deadline (its start is this minus the hold window).
-        deadline_ms: u64,
-    },
+    /// has waiting in the table (room its replay must reserve).
+    Reserve { frame: &'f [u8], ingress: IfId },
     /// A held first fragment (`frame` from `ingress`) with this pending
     /// entry was freed: refuse its datagram.
     Dropped {
@@ -255,8 +244,6 @@ pub(crate) enum ArpHoldFragmentHook<'f> {
         ingress: IfId,
         association: u32,
         generation: u16,
-        /// The hold's deadline (its start is this minus the hold window).
-        deadline_ms: u64,
     },
 }
 
@@ -321,11 +308,7 @@ pub struct ArpHoldCounters {
     /// Held datagrams freed because their resolution failed.
     pub failed: usize,
     /// Held datagrams freed because their resolution was cancelled or its
-    /// learned neighbour expired before the replay found room, or (a held
-    /// first fragment) because its datagram's association entry is gone
-    /// and the key now has another entry: a newer datagram reusing the
-    /// key, or the datagram's own later fragments recreating it after an
-    /// eviction (indistinguishable, so it fails closed).
+    /// learned neighbour expired before the replay found room.
     pub cancelled: usize,
     /// Held datagrams freed when their resolution could no longer succeed.
     pub expired: usize,
@@ -497,7 +480,7 @@ impl<'a> ArpHoldRuntime<'a> {
         frame: &[u8],
         ingress: IfId,
         miss: ArpHoldMiss,
-        mut association_dropped: impl FnMut(&[u8], IfId, u32, u16, u64),
+        mut association_dropped: impl FnMut(&[u8], IfId, u32, u16),
     ) -> Result<(), DropReason> {
         if frame.len() > self.slot_bytes && !self.slots.is_empty() {
             self.counters.refused_too_large += 1;
@@ -551,8 +534,7 @@ impl<'a> ArpHoldRuntime<'a> {
         // sender's own oldest there, else the oldest from the same ingress
         // (one host, or one interface, cannot push out another's while it
         // has its own there), else the oldest from the ingress holding the
-        // most datagrams for this next hop (on a tie, of the ingress whose
-        // oldest is the newest):
+        // most datagrams for this next hop (the oldest of those on a tie):
         // the new ingress holds none there, so it takes from the largest
         // user, and a flood from one interface is bounded by its
         // `per-ingress` share, not by evicting a smaller one.
@@ -563,13 +545,11 @@ impl<'a> ArpHoldRuntime<'a> {
         } else if neighbor_oldest_same_ingress != NONE {
             Some(neighbor_oldest_same_ingress)
         } else {
-            // `at_neighbor` is in age order of each ingress's oldest; on a
-            // tie the ingress whose oldest datagram is the newest gives way
-            // (#342 review sec L1: the datagram waiting longest is kept, so
-            // a stream of new ingresses cannot rotate out an old one).
+            // `at_neighbor` is in age order of each ingress's oldest, so the
+            // first with the largest count is the oldest on a tie.
             let mut busiest: Option<(u16, u32)> = None;
             for &(_, count, oldest) in &at_neighbor[..ingresses] {
-                if busiest.is_none_or(|(most, _)| count >= most) {
+                if busiest.is_none_or(|(most, _)| count > most) {
                     busiest = Some((count, oldest));
                 }
             }
@@ -603,7 +583,6 @@ impl<'a> ArpHoldRuntime<'a> {
                     slot.ingress,
                     slot.association,
                     slot.association_generation,
-                    slot.deadline_ms,
                 );
             }
             self.release(victim);
@@ -668,7 +647,7 @@ impl<'a> ArpHoldRuntime<'a> {
         now_ms: u64,
         mut room: usize,
         mut probe: impl FnMut(IfId, Ipv4Address) -> ArpHoldNextHop,
-        mut fragments: impl FnMut(ArpHoldFragmentHook<'_>) -> Option<usize>,
+        mut fragments: impl FnMut(ArpHoldFragmentHook<'_>) -> usize,
     ) -> usize {
         let mut ready = 0;
         let mut cursor = self.oldest;
@@ -680,23 +659,12 @@ impl<'a> ArpHoldRuntime<'a> {
                 continue;
             }
             let cost = if self.is_first_fragment(index) {
-                fragments(ArpHoldFragmentHook::Reserve {
+                1 + fragments(ArpHoldFragmentHook::Reserve {
                     frame: &self.bytes[self.range(index)],
                     ingress: slot.ingress,
-                    association: (slot.association != NONE)
-                        .then_some((slot.association, slot.association_generation)),
-                    deadline_ms: slot.deadline_ms,
                 })
-                .map(|held| 1 + held)
             } else {
-                Some(1)
-            };
-            let Some(cost) = cost else {
-                // Its key now belongs to another datagram: not replayed
-                // (and not denied: that entry is not its own).
-                self.counters.cancelled += 1;
-                self.release(index);
-                continue;
+                1
             };
             let freed = match probe(slot.egress, slot.target) {
                 ArpHoldNextHop::Known if room >= cost => {
@@ -733,7 +701,6 @@ impl<'a> ArpHoldRuntime<'a> {
                         ingress: slot.ingress,
                         association: slot.association,
                         generation: slot.association_generation,
-                        deadline_ms: slot.deadline_ms,
                     });
                 }
                 self.release(index);

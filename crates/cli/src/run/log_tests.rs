@@ -493,6 +493,36 @@ const SAMPLES: &[(&str, &str, &str)] = &[
         "info",
     ),
     (
+        "ruster run: setting a link down needs CAP_NET_ADMIN at exit; run with --keep-privileges",
+        "STARTUP_HINT",
+        "info",
+    ),
+    (
+        "ruster run: writing the forwarding sysctl needs CAP_NET_ADMIN at exit; run with --keep-privileges",
+        "STARTUP_HINT",
+        "info",
+    ),
+    (
+        "ruster run: warning: user namespace: code=USER_NAMESPACE_NOT_INITIAL (or unreadable)",
+        "USER_NAMESPACE_NOT_INITIAL",
+        "warn",
+    ),
+    (
+        "ruster run: exit protection armed: ipv4-forwarding-off=true link-down=false ports=2",
+        "EXIT_PROTECTION_ARMED",
+        "info",
+    ),
+    (
+        "ruster run: exit protection failed: port=if1 action=link-down code=KERNEL_1",
+        "EXIT_PROTECTION_FAILED",
+        "error",
+    ),
+    (
+        "ruster run: exit protection applied: ipv4-forwarding-off=2 link-down=0 failed=0",
+        "EXIT_PROTECTION_APPLIED",
+        "info",
+    ),
+    (
         "ruster run: cannot install SIGHUP handler",
         "SIGNAL_INSTALL_FAILED",
         "error",
@@ -598,10 +628,12 @@ fn every_event_code_has_a_sample_and_classifies() {
          WATCH_SETTINGS_APPLIED HEALTH_WARNING HEALTH_RECOVERED HEALTH_FATAL CHECK_WARNING \
          SWEEP_SLOW FRAGMENT_SHARE_OVERCOMMITTED RELOAD_PREPARE_SLOW IDLE_POLL_FAILED \
          WORKER_ABANDONED \
-         KERNEL_EXPOSURE_AT_EXIT PRIVILEGES_KEPT PRIVILEGES_DROPPED FS_CONFINED FS_CONFINE_OFF \
+         KERNEL_EXPOSURE_AT_EXIT USER_NAMESPACE_NOT_INITIAL EXIT_PROTECTION_ARMED \
+         EXIT_PROTECTION_FAILED EXIT_PROTECTION_APPLIED \
+         PRIVILEGES_KEPT PRIVILEGES_DROPPED FS_CONFINED FS_CONFINE_OFF \
          FS_CONFINE_WARNING SECCOMP_INSTALLED SECCOMP_LOG SECCOMP_OFF FLAG_OVERRIDDEN \
          STARTUP_RETRY STARTUP_CANCELLED STARTUP_FAILED STARTUP_HINT STARTUP_HINT STARTUP_HINT \
-         STARTUP_HINT STARTUP_HINT STARTUP_HINT SIGNAL_INSTALL_FAILED OUTPUT_THREAD_FAILED \
+         STARTUP_HINT STARTUP_HINT STARTUP_HINT STARTUP_HINT STARTUP_HINT SIGNAL_INSTALL_FAILED OUTPUT_THREAD_FAILED \
          UNSUPPORTED_PLATFORM CONFIG_INVALID CONFIG_UNREADABLE CONFIG_REFUSED SHUTDOWN_DRAINING \
          DRAIN_FAILED CLOSE_FAILED SHUTDOWN_SUMMARY WARNING"
     );

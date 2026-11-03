@@ -563,6 +563,8 @@ fn quiescence_reaps_first_and_defers_only_on_in_flight_tx() {
     transmit_all(&lan);
     assert!(io.try_publication_quiescence().is_ok());
     assert_eq!(io.engine(LAN).expect("LAN").tx_inflight(), 0);
+    // A link that is up never counts as skipped (OPS-EXIT item 2).
+    assert_eq!(io.backend_stats().counters.quiescence_link_down_tx, 0);
 
     // A drain stops the adapter for good.
     deliver(&lan, &ipv4_frame(60, 64));
@@ -814,13 +816,23 @@ fn link_flap_recovers_without_new_traffic() {
         "{stats:?}"
     );
     assert_eq!(io.backend_stats().link_down_ports, 1);
-    assert!(matches!(
-        io.try_publication_quiescence(),
-        Err(XdpQuiescenceError::TxInFlight {
-            interface: WAN,
-            frames: 2
-        })
-    ));
+    // OPS-EXIT item 2: the down link's TX does not block a publication
+    // (the kernel holds it until the link returns); each granted check
+    // counts the frames it did not wait for, and they stay in flight.
+    assert!(io.try_publication_quiescence().is_ok());
+    assert!(io.try_publication_quiescence().is_ok());
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert_eq!(stats.counters.quiescence_link_down_tx, 4);
+    assert_eq!(stats.counters.tx_inflight, 2);
+    assert_eq!(wan.transmitted(), 0);
+    assert_eq!(
+        io.backend_stats().counters.quiescence_link_down_tx,
+        4,
+        "summed over the ports"
+    );
+    // (TX in flight on a port whose link is up still blocks:
+    // `quiescence_reaps_first_and_defers_only_on_in_flight_tx`, with
+    // `quiescence_link_down_tx` 0 there.)
     // The link returns; no new traffic. The quiescence check itself
     // settles the owed kick and becomes ready.
     wan.set_link_down(false);
@@ -880,8 +892,11 @@ fn link_down_kick_retries_are_rate_limited_and_the_debt_is_kicked_after_up() {
         io.service().expect("service");
     }
     drop(io.receive(0).expect("idle receive"));
-    assert!(io.try_publication_quiescence().is_err());
+    // The down link's TX does not block (OPS-EXIT item 2) and the check
+    // kicks nothing either: its settle is rate-limited too.
+    assert!(io.try_publication_quiescence().is_ok());
     let stats = io.port_stats(WAN).expect("WAN");
+    assert_eq!(stats.counters.quiescence_link_down_tx, 1);
     assert_eq!(wan.kicks(KickRing::Tx), 1, "{stats:?}");
     assert!(stats.link_down && stats.kick_owed, "{stats:?}");
     assert_eq!(stats.counters.kicks_link_down, 1);

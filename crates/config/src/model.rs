@@ -49,6 +49,41 @@ pub struct ConfigV1 {
     /// `ruster run` watch intervals (`[watch]`, OPS-LOG); same fallback as
     /// [`HealthV1`].
     pub watch: Option<WatchV1>,
+    /// What `ruster run` does to the ports' kernel state when it exits
+    /// after serving (`[exit-protection]`, OPS-EXIT); absent means
+    /// [`ExitProtectionV1::default`] (nothing). Restart-required. Ignored by
+    /// `run-sim`.
+    pub exit_protection: Option<ExitProtectionV1>,
+}
+
+/// `[exit-protection]`: opt-in changes `ruster run` makes to every port's
+/// kernel state when it exits after it served (OPS-EXIT). Detaching the
+/// router hands the ports back to the kernel, which may then forward,
+/// answer, or route their traffic without the router's firewall and NAT;
+/// these keys close that gap. Both rewrite operator and kernel state, so
+/// both default to off. Changing either is restart-required.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ExitProtectionV1 {
+    /// Set every port's link administratively down (`IFF_UP` cleared over
+    /// rtnetlink) at exit. Needs `CAP_NET_ADMIN` at exit, so `ruster run`
+    /// refuses it unless `--keep-privileges`.
+    #[serde(default)]
+    pub link_down: bool,
+    /// Write 0 to every port's `net.ipv4.conf.<device>.forwarding` at exit.
+    /// The files are opened before the privilege drop, but Linux checks
+    /// `CAP_NET_ADMIN` at every write, so `ruster run` refuses it unless
+    /// `--keep-privileges`.
+    #[serde(default)]
+    pub ipv4_forwarding_off: bool,
+}
+
+impl ExitProtectionV1 {
+    /// Whether any exit action is on.
+    #[must_use]
+    pub const fn any(self) -> bool {
+        self.link_down || self.ipv4_forwarding_off
+    }
 }
 
 /// `[health]`: the health thresholds of `ruster run`'s watch (OPS-LOG).

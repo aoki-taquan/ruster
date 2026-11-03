@@ -53,6 +53,11 @@ pub struct AfPacketCounters {
     pub kick_retries: u64,
     /// Settles that left an owed retry for later because of the backoff.
     pub kick_retries_suppressed: u64,
+    /// TX frames in flight on this port while its link was down that a
+    /// granted publication quiescence check did not wait for (summed per
+    /// granted check, OPS-EXIT): the kernel leaves them SEND_REQUEST until
+    /// the link returns.
+    pub quiescence_link_down_tx: u64,
     /// Generated frames lent to core.
     pub generated_allocated: u64,
     /// Generated allocations refused because the TX ring was full.
@@ -113,6 +118,7 @@ impl AfPacketCounters {
             kick_errors,
             kick_retries,
             kick_retries_suppressed,
+            quiescence_link_down_tx,
             generated_allocated,
             generated_unavailable,
             generated_rejected,
@@ -158,6 +164,7 @@ impl AfPacketCounters {
             kick_errors,
             kick_retries,
             kick_retries_suppressed,
+            quiescence_link_down_tx,
             generated_allocated,
             generated_unavailable,
             generated_rejected,

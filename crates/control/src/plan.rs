@@ -453,6 +453,9 @@ impl ApplyPlan {
         if current.backend() != next.backend() {
             restart_required.push(RestartRequired::Backend);
         }
+        if current.exit_protection() != next.exit_protection() {
+            restart_required.push(RestartRequired::ExitProtection);
+        }
 
         let old_rules = old.firewall.rules();
         let new_rules = new.firewall.rules();
@@ -516,7 +519,8 @@ impl ApplyPlan {
     /// carries no backend). Such a plan skips the live check: the dry run is
     /// recorded as `Err(ApplyError::RestartRequired(restart_required()[0]))`
     /// (`Backend` itself only when it is the sole reason, because `Backend`
-    /// is always listed last), and the flush stays [`FlushCount::All`], so
+    /// and then [`RestartRequired::ExitProtection`] are always listed last;
+    /// an `ExitProtection` plan skips the live check the same way), and the flush stays [`FlushCount::All`], so
     /// no caller can mistake it for an in-place reload and the recorded
     /// reason is the first one, as for every other restart-required plan.
     pub fn for_active<I: PublicationQuiescence>(
@@ -526,7 +530,12 @@ impl ApplyPlan {
         successor: &ValidatedCandidate,
     ) -> Result<Self, PlanError> {
         let mut plan = Self::between(current, next)?;
-        if plan.restart_required.contains(&RestartRequired::Backend) {
+        if plan.restart_required.iter().any(|reason| {
+            matches!(
+                reason,
+                RestartRequired::Backend | RestartRequired::ExitProtection
+            )
+        }) {
             let first = plan.restart_required[0];
             plan.dry_run = Some(Err(ApplyError::RestartRequired(first)));
             return Ok(plan);

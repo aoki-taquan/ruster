@@ -625,11 +625,10 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
 - **bound**: (egress, next hop)ごとに`per-neighbor`（default 3）。超えたらそのnext hopの古いものを
   置き換え、最新を残します（RFC 1122の「latest」、`replaced`）。置き換えるのは送信者自身((ingress,
   source))の最古があればそれ、無ければ同じingressの最古、それも無ければこのnext hopで最も多く
-  holdしているingress（同数ならその最古が最も新しいingressが譲る。最も長く待つdatagramを残し、新しいingressが次々来ても古いものを回し出せない。#342 re-review sec L1）の最古です（一つのhostやinterfaceが自分の分を持つ間は
+  holdしているingress（同数なら最古を持つもの）の最古です（一つのhostやinterfaceが自分の分を持つ間は
   他を押し出さない。新しいingressはこのnext hopに一つも持たないので最大の利用者から取る。一つの
   interfaceのfloodは`per-ingress` shareで抑える。review sec L2、re-review L2、#342 review L-4）。
-  置き換えられたものが最初のfragmentなら、association tableでそのdatagramをdenyします（下）。ただし置き換える側が同じdatagramの最初のfragment（再送）ならdenyせず、associationを新しいslotへ移します（#342 re-review core L1）。
-  ingressを共有するhost同士は、送信元を詐称すれば互いのsender枠に入れます（sender単位の優先はsource addressを信じる。interface全体は`per-ingress` shareで抑える。#342 re-review sec L2）。
+  置き換えられたものが最初のfragmentなら、association tableでそのdatagramをdenyします（下）。
   (ingress, source)ごと（NAT-FRAGと同じく、WANからinside addressを名乗るdatagramがinside hostの枠を
   使わない）に`per-host`（default 16、`ARP_HOLD_HOST_LIMIT`、置き換えるものが同じhostならその分を
   数えない）。ingress interfaceごとに`per-ingress`（default `packets`の半分、32、
@@ -683,16 +682,8 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   fragmentは、その記録したentryが同じindex、stamp、keyのままpendingの時だけ`deny_pending`で
   Denyにし、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。
   `deny_pending`はlookupもinsertもevictもせず、decided entryには触れずpoisonもしません。IDが一巡して
-  同じkeyの新しいdatagramが同じslotを取っていればstampが違うので触れません（#342 review M1）。
-  holdは`interval × max-attempts`続き65.536 sを超え得るので、stamp（作成時刻の下位16 bit）だけでは
-  足りません。hold開始（`deadline − interval × max-attempts`）より後に作られたentryも拒否します
-  （#342 re-review core L2。stampはhold前に作られたentry同士だけを区別する）。
-  replayでも記録したassociation（index、stamp）がkeyのlive entry（pendingでもdecidedでも）と違うか、
-  そのentryがhold開始より後に作られていれば（65.536 sを超えるholdのstamp一致、#346）、
-  keyが新しいdatagramのものになっているのでreplayせず`cancelled`で解放します（#342 re-review core L3、
-  #345 review L-a。eviction後にdatagram自身の後続fragmentが作り直したentryも区別できないので同じく
-  fail closed。記録の無い最初のfragmentは
-  holdされなかった遅い最初のfragmentと同じ扱いが残る）。pending entryを取れなかった最初のfragmentは
+  同じkeyの新しいdatagramが同じslotを取っていればstampが違うので触れません（#342 review M1。
+  同じミリ秒（65536 ms周期）に作られた時だけ一致し得る。entryは高々60 sしか生きない）。pending entryを取れなかった最初のfragmentは
   記録が無く、後続はtableのtimeoutで解放されます。apply（`flushed`）では同じapplyでtable自体も
   flushされるので何もしません。replayで
   最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る
@@ -3593,9 +3584,12 @@ ring reserve/write/publishの失敗も同じくrollbackし、拒否したbatch�
 real_num_tx_queues)`だけを要求し、copy-modeの`__xsk_generic_xmit`は`queue >= real_num_tx_queues`
 では黙って何も送りません（kickは`Woken`のまま、TXは`RingFull`、drainは永久に`TxInFlight`）。
 そこで`NativeSession::open`はinterface lookup直後、resource取得前に`SessionStage::TxQueueCheck`で
-sysfs（`/sys/class/net/<dev>/ifindex`が解決済みifindexと一致することを確認してから
-`queues/tx-<queue>`）を調べ、無ければ`SessionFailure::NoTxQueue`、確かめられなければ
-`TxQueueUnverifiable`で拒否します。runtimeの`ethtool -L`などで後からTX queueを失ったstallの検出は
+callerのnetnsの`NETLINK_ROUTE` socketから解決済みindexの`RTM_GETLINK`を一回送り（OPS-EXIT item 3、
+XDP-181。sysfsのviewはmountしたnetnsのもので、`setns`後のprocessには別namespaceのdeviceが見える）、
+`IFLA_IFNAME`が設定名であること、`queue < IFLA_NUM_TX_QUEUES`（割当数）を要求し、無ければ
+`SessionFailure::NoTxQueue`、queryの失敗はtyped `SessionFailure::LinkQuery(LinkQueryError)`で拒否します。
+`ethtool -L`で減ったactive数（`real_num_tx_queues`、rtnetlinkは出さない）はsysfsのviewがこのdeviceを
+示す（`ifindex`一致）ときだけ`queues/tx-<queue>`で狭め、別netnsのviewは参照しません。runtimeの`ethtool -L`などで後からTX queueを失ったstallの検出は
 X04のhealthです。
 
 **kernel-trustの限界**: copy modeでは`xsk_poll`もtransmit loopを回すので`wake_fill()`もTXを進めます。
@@ -3755,11 +3749,10 @@ egress portをsettle（completion reapと負っているkick）するので、�
 reserveはportのstats（`copy_reserve`）に出る定数式で、configは持ちません。
 
 TX length bound: forwarded/generatedともTXはegress portの`mtu + 14`（`XdpPortConfig::max_frame_len`、
-VLANはM2 profile外）以下に限ります。MTUは`NativeSession::open`がTX queue checkと同じifindex確認済み
-sysfs view（`/sys/class/net/<dev>/mtu`、safe std）からresource取得前に一回読み
-（`SessionStage::MtuProbe`、読めなければ`SessionFailure::MtuUnverifiable`でfail closed）、
-`NativeSession::mtu()`と`XdpPortConfig::from_session`で渡します。configにMTUは無く、kernelのMTUが
-実際にcopy-mode TXを決めるためsysfsを選びました。超過したforwarded frameはdescriptorを書く前に拒否して
+VLANはM2 profile外）以下に限ります。MTUは`NativeSession::open`がTX queue checkと同じrtnetlink
+answerの`IFLA_MTU`をresource取得前に一回読み（OPS-EXIT以前はsysfs。`SessionStage::MtuProbe`、0なら
+`SessionFailure::MtuUnverifiable`でfail closed）、`NativeSession::mtu()`と`XdpPortConfig::from_session`
+で渡します。configにMTUは無く、kernelのMTUが実際にcopy-mode TXを決めます。超過したforwarded frameはdescriptorを書く前に拒否して
 （`tx_over_mtu`、`tx_rejected`、errorなし）ingressのframeをrecycleし、generatedは`FrameTooLarge`
 （`generated_over_mtu`）です。実効上限はframe容量（frame size − headroom）でも切ります。Linux
 copy-mode transmitはover-MTU descriptorをcompletionなしで消費し得るため、frameが`TxOwnedByKernel`の
@@ -4099,3 +4092,39 @@ down/up、MTU超過とdevice削除のfail closed、rollback、XDP-063、SIGKILL�
 credentialと`--keep-privileges`、大きなconfigのreload準備中もEchoが欠けないこと、全threadの
 seccomp filterと`--seccomp log`/`off`、SIGSYSでのdetach）です（CLI-008〜059、CLI-089〜109、XDP-045、
 XDP-063、XDP-177）。
+
+exit protection（OPS-EXIT、CLI-142〜CLI-145）: detachでportはkernelへ戻り、kernelはrouterの
+firewall/NATなしにforward、応答、routingし得ます。起動時checkはその状態のkernelを拒否しますが、run中に
+operatorや他のtoolがforwardingを入れることは止められず（link watchはwarning）、
+`--allow-kernel-forwarding`はそれを許して走ります。opt-inの`[exit-protection]`（既定は両方false、
+operatorとkernelの状態を書き換えるため。変更は`RestartRequired::ExitProtection`）は二つのexit
+actionを持ちます。`ipv4-forwarding-off`は各portの`net.ipv4.conf.<device>.forwarding`をwrite-onlyで
+activation後、worker起動、privilege drop、Landlock、seccompの前に開き、exit時に`0`を書きます（Landlockは
+open時だけ検査、seccompは`write`を許す）。`link-down`は同じく先に開いたrtnetlink socketから
+`RTM_NEWLINK`（`ifi_change = IFF_UP`、`ifi_flags = 0`、`NLM_F_ACK`）でlinkを落とします。ただしkernelは
+sysctlの書き込みごとに（`proc_sys_call_handler`、drop前に開いたfdでも、uid 0でcapabilityなしなら
+`EPERM`。Linux 7.0で確認）、rtnetlinkのlink変更ごとに送信threadの`CAP_NET_ADMIN`を確かめ
+（`netlink_net_capable`: socketを開いた者と現在のcredentialの両方。`SIOCSIFFLAGS`、sysfsの`flags`も
+同じ）ます。既定のdrop後はどのthreadもそれを持たないので、どちらのkeyも`--keep-privileges`の時だけ
+受け付けます（`EXIT_FORWARDING_NEEDS_PRIVILEGES`/`EXIT_LINK_DOWN_NEEDS_PRIVILEGES`でexit 2）。
+一つのthreadだけに`CAP_NET_ADMIN`を残す案は、全threadのdrop検証（CLI-090）を崩し、同じaddress spaceの
+code実行には無意味なので採りません。drop前にforkした特権helper processがpipeのEOFでactionを実行する案は
+`SIGKILL`やseccomp killも覆えますが、特権processを常駐させるので見送り（residual）、代わりにsupervisorの
+`ExecStopPost=`をrunbookで案内します。actionはreadinessの直前にarmし、shutdown drain（link upでTXを
+完了させる）の後、datapathのdropとsessionのclose（detach）の前に一回だけ実行します。signal、fatal
+event、backend fault、invariant違反、panic（`ExitGuard`の`Drop`がunwind中、`OpenedPorts`のcloseより
+前）のどれでも走り、startupの失敗やcancelではarmされません（routerが一度もserveしなかったportは
+operatorの状態のまま）。portとactionごとに試し、失敗は`exit protection failed: port=if<id> action=...
+code=...`でexit 1です。unsafeは既存のnetlink `sys` module（`send`/`recvfrom`）だけで、新しいFFIはありません。
+
+down linkのTXとquiescence（OPS-EXIT item 2、XDP-180、AFPKT-017）: admin downのdeviceではkernelがTX
+ringを読まず（AF_XDPは`xsk_check_common`の`ENETDOWN`、AF_PACKETは`tpacket_snd`の`ENETDOWN`）、AF_XDPには
+公開済みdescriptorを取り戻すUAPIがありません（producerを巻き戻すとkernelが`cached_prod`までの古い
+slotを読む）。そのportのin-flight TXを待つとlinkが戻るまでreloadが`stage=quiesce code=TIMEOUT`になる
+ため、両adapterのquiescence checkは最後のkickが`ENETDOWN`だったportのin-flight TXを待たず、許可した
+checkごとに`quiescence_link_down_tx`へ数えます。frameはin flightのまま（ledgerから失われず、linkが
+戻れば送られる。shutdown drainの`tx-in-flight`は従来どおり）。frameは旧generationのdecisionをすべて
+終えたbyteで、NICのqueueにあるframeと同じくrouterは再判定しません（RFC neutral）。
+
+非initial user namespace（OPS-EXIT item 4、CLI-146）: `/proc/self/uid_map`が`0 0 4294967295`の一行で
+なければ起動時に`USER_NAMESPACE_NOT_INITIAL`をwarningします（`CapEff`は所有するnamespaceにしか効かない）。

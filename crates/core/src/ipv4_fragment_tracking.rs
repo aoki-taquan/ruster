@@ -937,13 +937,6 @@ const fn stamp(created_ms: u64) -> u16 {
     (created_ms & 0xffff) as u16
 }
 
-impl Ipv4FragmentFirstTicket {
-    /// The pending entry the first fragment continues, if any.
-    pub(crate) const fn existing(self) -> Option<u32> {
-        self.existing
-    }
-}
-
 /// What the table says about a later fragment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Ipv4FragmentFollow {
@@ -1886,16 +1879,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
             }
             Some(_) => return None,
             None => {
-                // The victims were planned by this packet's admission with
-                // nothing in between: still live.
-                debug_assert!(
-                    ticket
-                        .victims
-                        .as_slice()
-                        .iter()
-                        .all(|&victim| self.entries[victim as usize].state != EntryState::Free),
-                    "commit-time victims are live entries"
-                );
                 self.evict_all(&ticket.victims, now_ms);
                 self.insert_entry(ticket.info.key, state, now_ms)?
             }
@@ -1942,13 +1925,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// Refuses the datagram of an ARP-held first fragment that was dropped
     /// (its resolution failed, was cancelled or replaced, or ran out of
     /// time): only the pending entry recorded by [`Self::hold_first`] while
-    /// it is still that entry: same index, key, and creation stamp, still
-    /// pending, not expired, and created no later than the hold
-    /// (`held_since_ms`). An entry created after the hold (a newer datagram
-    /// reusing the key in the same slot, however long the hold lasted) is
-    /// refused by the last check; the stamp only has to tell apart entries
-    /// created before the hold, of which only the recorded one can still be
-    /// live. Its held later fragments are freed (`held_denied`) and the
+    /// it is still that entry (same index, key, and creation stamp, still
+    /// pending, not expired). A newer datagram with the same key in the
+    /// same slot would have to be created in the same millisecond modulo
+    /// 65536 (an entry lives at most the 60 s timeout). Its held later fragments are freed (`held_denied`) and the
     /// entry refuses the rest until its timeout. Looks nothing up, inserts
     /// nothing, evicts nothing, never poisons. Returns whether it denied.
     #[cold]
@@ -1957,7 +1937,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
         index: u32,
         created: u16,
         info: Ipv4FragmentInfo,
-        held_since_ms: u64,
         now_ms: u64,
     ) -> bool {
         let index = index as usize;
@@ -1966,7 +1945,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
         };
         if entry.state != EntryState::Pending
             || stamp(entry.created_ms) != created
-            || entry.created_ms > held_since_ms
             || entry.key != info.key
             || self.expired(index, now_ms)
         {
@@ -1979,40 +1957,9 @@ impl<'a> Ipv4FragmentTracker<'a> {
         true
     }
 
-    /// The live entry of the key of `info`, whatever its state: its index,
-    /// creation stamp, creation time, and held fragments (at most
-    /// [`IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM`]; 0 unless it is
-    /// pending). A lookup that changes nothing.
-    pub(crate) fn entry_for(&self, info: Ipv4FragmentInfo) -> Option<(u32, u16, u64, usize)> {
-        let entries = &*self.entries;
-        self.entry_directory
-            .lookup(
-                DirectoryHashDomain::Ipv4FragmentAssociation,
-                &info.key.words(),
-                |index| entries[index].state != EntryState::Free && entries[index].key == info.key,
-            )
-            .ok()
-            .and_then(|probe| probe.state_index)
-            .map(|index| {
-                let entry = &entries[index];
-                let held = if entry.state == EntryState::Pending {
-                    usize::from(entry.held)
-                } else {
-                    0
-                };
-                (
-                    u32::try_from(index).expect("entry index below NONE"),
-                    stamp(entry.created_ms),
-                    entry.created_ms,
-                    held,
-                )
-            })
-    }
-
     /// Fragments held for the datagram of `info` (pending entry), at most
     /// [`IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM`]; 0 without one. A
     /// lookup that changes nothing.
-    #[cfg(test)]
     pub(crate) fn held_for(&self, info: Ipv4FragmentInfo) -> usize {
         let entries = &*self.entries;
         self.entry_directory
