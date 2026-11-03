@@ -1794,15 +1794,19 @@ phase_pmtu() {
     sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/pmtu.out" >"$work/pmtu.final"
     block_has "$work/pmtu.final" drop.IPV4_FRAGMENTATION_REQUIRED=0 \
         icmpv4_errors.disabled_fragmentation_needed=0 generated_icmpv4.tx_rejected=0
-    needed=$(stat_in "$work/pmtu.final" drop.IPV4_FRAGMENTATION_NEEDED)
+    # The first DF datagram is held while the router resolves host B (ARP-HOLD)
+    # and refused for its MTU at replay: counted by the hold
+    # (arp_hold.replay_dropped), not again under drop.*.
+    needed=$(($(stat_in "$work/pmtu.final" drop.IPV4_FRAGMENTATION_NEEDED) + \
+        $(stat_in "$work/pmtu.final" arp_hold.replay_dropped)))
     queued=$(stat_in "$work/pmtu.final" icmpv4_errors.queued_fragmentation_needed)
     sent=$(stat_in "$work/pmtu.final" icmpv4_errors.dequeued_fragmentation_needed)
-    [ "${needed:-0}" -ge 2 ] || fail "pmtu: drop.IPV4_FRAGMENTATION_NEEDED is ${needed:-missing}"
+    [ "${needed:-0}" -ge 2 ] || fail "pmtu: drop.IPV4_FRAGMENTATION_NEEDED + arp_hold.replay_dropped is ${needed:-missing}"
     [ "${queued:-0}" -ge 2 ] && [ "${queued:-0}" = "${sent:-x}" ] ||
         fail "pmtu: queued_fragmentation_needed $queued, dequeued $sent"
     sudo -n ip -n "$router" link set rb mtu 1500
     sudo -n ip -n "$host_b" link set pb mtu 1500
-    echo "priv_run_pmtu: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1400) only; drop.IPV4_FRAGMENTATION_NEEDED=$needed, queued_fragmentation_needed=dequeued=$queued, exit 0, detached verified"
+    echo "priv_run_pmtu: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1400) only; drop.IPV4_FRAGMENTATION_NEEDED + arp_hold.replay_dropped=$needed, queued_fragmentation_needed=dequeued=$queued, exit 0, detached verified"
 }
 phase_pmtu
 
