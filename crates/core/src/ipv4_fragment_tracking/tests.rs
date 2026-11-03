@@ -2009,10 +2009,12 @@ fn a_refusing_entry_leaves_no_tombstone() {
         .admit_first(info(&fragment(2, MF, 64, 17, 16)), 0)
         .unwrap();
     tracker.commit_deny(ticket, 0);
-    // The host's quota is full: the poisoned refusing entry is evicted.
-    assert!(tracker
+    // The host's quota is full: the poisoned refusing entry is evicted
+    // (when the first fragment commits, ARP-HOLD #341 re-review L4).
+    let ticket = tracker
         .admit_first(info(&fragment(3, MF, 64, 17, 16)), 0)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
     assert_eq!(tracker.counters().entries_evicted, 1);
     let key_of = |id| info(&fragment(id, MF, 64, 17, 16)).key;
     assert!(!tracker.tombstoned(key_of(1), 0));
@@ -2022,15 +2024,17 @@ fn a_refusing_entry_leaves_no_tombstone() {
         tracker.admit_first(info(&fragment(4, MF, 64, 17, 24)), 0),
         Err(DropReason::Ipv4FragmentDuplicateFirst)
     );
-    // The host's oldest evictable entries go first: 2, then the poisoned 4.
+    // The host's oldest evictable entries go first (2 went for 4, 3 goes
+    // for 5), then the poisoned 4.
     let ticket = tracker
         .admit_first(info(&fragment(5, MF, 64, 17, 16)), 0)
         .unwrap();
     tracker.commit_deny(ticket, 0);
     assert!(!tracker.tombstoned(key_of(4), 0));
-    assert!(tracker
+    let ticket = tracker
         .admit_first(info(&fragment(6, MF, 64, 17, 16)), 0)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
     assert!(tracker.tombstoned(key_of(4), 0));
     assert!(!tracker.tombstoned(key_of(2), 0));
     tracker.check_invariants().unwrap();
