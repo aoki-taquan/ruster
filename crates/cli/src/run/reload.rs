@@ -75,7 +75,7 @@ use ruster_core::{
 };
 use ruster_runtime::{ApplyCarryCounts, ApplyFlushCounts, TickBudgets};
 
-use crate::config_cmd::{self, LoadError, SweepSlow};
+use crate::config_cmd::{self, FragmentShareOvercommitted, LoadError, SweepSlow};
 
 use super::ops::{Fallback, Ops};
 use super::output::SpawnError;
@@ -337,6 +337,8 @@ pub struct Ready {
     counts: DocumentCounts,
     /// The slow-sweep warnings of its document, printed once applied.
     sweep: [Option<SweepSlow>; 2],
+    /// The fragment share warning of its document, printed once applied.
+    share: Option<FragmentShareOvercommitted>,
     /// The watch settings of its document (OPS-LOG), applied with it.
     ops: Ops,
 }
@@ -445,6 +447,7 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             budgets: super::budgets(&next),
             counts: DocumentCounts::of(&next),
             sweep: config_cmd::sweep_warnings(&next),
+            share: config_cmd::fragment_share_warning(&next),
         };
         self.next = Some((next, ops));
         Prepared::Ready(Box::new(ready))
@@ -594,6 +597,7 @@ pub struct Reloader {
     phase: Phase,
     budgets: TickBudgets,
     sweep: [Option<SweepSlow>; 2],
+    share: Option<FragmentShareOvercommitted>,
     counters: ReloadCounters,
     /// The watch settings of the active generation's document (OPS-LOG).
     ops: Ops,
@@ -607,6 +611,7 @@ impl Reloader {
             phase: Phase::Idle,
             budgets,
             sweep: [None, None],
+            share: None,
             counters: ReloadCounters::default(),
             ops: Ops::default(),
         }
@@ -633,6 +638,7 @@ impl Reloader {
             phase: Phase::Idle,
             budgets,
             sweep: [None, None],
+            share: None,
             counters: ReloadCounters::default(),
             ops: Ops::default(),
         }
@@ -650,6 +656,11 @@ impl Reloader {
     /// The slow-sweep warnings of the last applied document.
     pub const fn sweep(&self) -> [Option<SweepSlow>; 2] {
         self.sweep
+    }
+
+    /// The fragment share warning of the last applied document.
+    pub const fn share(&self) -> Option<FragmentShareOvercommitted> {
+        self.share
     }
 
     /// Whether a reload is in flight (preparing or pending): further
@@ -761,6 +772,7 @@ impl Reloader {
                 budgets,
                 counts: DocumentCounts::default(),
                 sweep: [None, None],
+                share: None,
                 ops: self.ops,
             }),
             since: MonotonicMillis(0),
@@ -791,6 +803,7 @@ impl Reloader {
             TickApply::Applied(report) => {
                 self.budgets = ready.budgets;
                 self.sweep = ready.sweep;
+                self.share = ready.share;
                 self.ops = ready.ops;
                 if let Some(worker) = self.worker.as_mut() {
                     worker.applied();

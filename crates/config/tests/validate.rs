@@ -322,6 +322,10 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
             * (size_of::<ruster_core::Ipv4FragmentEntrySlot>()
                 + size_of::<ruster_core::Ipv4FragmentHostSlot>())
         + 2 * 256 * (size_of::<DirectoryBucket>() + size_of::<DirectoryNode>())
+        // 16 tombstones (one per sixteen entries, at least 16) and their directory
+        + 16 * (size_of::<ruster_core::Ipv4FragmentTombstoneSlot>()
+            + size_of::<DirectoryBucket>()
+            + size_of::<DirectoryNode>())
         + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
         // ARP hold slots and their frames
         + 64 * (size_of::<ruster_core::ArpHoldSlot>() + 3840);
@@ -2104,6 +2108,7 @@ fn fragment_tracking_section_defaults_to_association_and_fails_closed() {
         256 * (size_of::<ruster_core::Ipv4FragmentEntrySlot>()
             + size_of::<ruster_core::Ipv4FragmentHostSlot>()
             + 2 * directory)
+            + 16 * (size_of::<ruster_core::Ipv4FragmentTombstoneSlot>() + directory)
             + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
     );
     // `refuse` does not look at the other keys.

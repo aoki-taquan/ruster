@@ -83,6 +83,9 @@ pub(crate) enum DirectoryHashDomain {
     Ipv4FragmentAssociation = 0x4950_4652_4153_534f,
     /// Per-source accounting of the fragment association table (NAT-FRAG).
     Ipv4FragmentHost = 0x4950_4652_484f_5354,
+    /// Evicted allowing or poisoned keys of the fragment association table
+    /// (NAT-FRAG tombstones).
+    Ipv4FragmentTombstone = 0x4950_4652_544f_4d42,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

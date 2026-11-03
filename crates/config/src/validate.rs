@@ -8,15 +8,16 @@ use ruster_core::{
     FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError,
     Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4FragmentEntrySlot,
-    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTrackingPolicy,
-    Ipv4FragmentTrackingPolicyError, Ipv4FragmentationPolicy, Ipv4FragmentationPolicyError,
-    Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
-    Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpPolicy, Nat44IcmpPolicyError,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
-    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
+    Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError, Ipv4FragmentationPolicy,
+    Ipv4FragmentationPolicyError, Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding,
+    MacAddress, Nat44Filtering, Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError,
+    Nat44IcmpPolicy, Nat44IcmpPolicyError, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpConfigError, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
+    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig, Nat44UdpConfigError,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
+    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
+    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -3643,6 +3644,19 @@ fn build_storage_shape(
             add_bytes::<DirectoryBucket>(&mut bytes, shape.buckets, entries_path.clone())?;
             add_bytes::<DirectoryNode>(&mut bytes, shape.entries, entries_path.clone())?;
         }
+        // Tombstones of evicted allowing or poisoned keys, with their own
+        // directory: derived from the entries.
+        let tombstones = u32::try_from(ruster_core::ipv4_fragment_tracking_tombstones(
+            usize::try_from(shape.entries).expect("bounded entries fit usize"),
+        ))
+        .expect("bounded entries have a u32 tombstone count");
+        let tombstone_buckets = u32::try_from(ruster_core::ipv4_fragment_tracking_buckets(
+            usize::try_from(tombstones).expect("u32 fits usize"),
+        ))
+        .expect("bounded tombstones have a u32 bucket count");
+        add_bytes::<Ipv4FragmentTombstoneSlot>(&mut bytes, tombstones, entries_path.clone())?;
+        add_bytes::<DirectoryBucket>(&mut bytes, tombstone_buckets, entries_path.clone())?;
+        add_bytes::<DirectoryNode>(&mut bytes, tombstones, entries_path.clone())?;
         let held_path = path(&["fragment-tracking", "held-fragments"]);
         add_bytes::<Ipv4FragmentHeldSlot>(&mut bytes, shape.held, held_path.clone())?;
         let arena = usize::try_from(u64::from(shape.held) * u64::from(shape.held_slot_bytes))

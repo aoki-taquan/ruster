@@ -12,10 +12,11 @@ use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministic
 use ruster_core::{
     port_free_bitmap_words, ArpHoldSlot, DirectoryBucket, DirectoryNode, DynamicNeighborSlot,
     FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot,
-    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Nat44HostCounter, Nat44HostLink,
-    Nat44TcpHostSlot, Nat44TcpMappingSlot, Nat44TcpSessionHostSlot, Nat44TcpSessionSlot,
-    Nat44TcpSynHoldSlot, Nat44UdpHostSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot, ARP_HOLD_MAX_PACKETS,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
+    Nat44HostCounter, Nat44HostLink, Nat44TcpHostSlot, Nat44TcpMappingSlot,
+    Nat44TcpSessionHostSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpHostSlot,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionStateSlot, ARP_HOLD_MAX_PACKETS,
 };
 
 /// Net bytes the measuring thread allocated while armed.
@@ -178,12 +179,15 @@ const REFUSED_TRACKING: (&str, &str) = (
 
 /// Fragment association (NAT-FRAG): per entry an entry slot, a host slot,
 /// and a bucket and a node in each of the two directories (the entry count
-/// is a power of two); per held fragment a record and a fragmentation
-/// slot's 14 + 3826 bytes.
+/// is a power of two); one tombstone slot, bucket, and node per sixteen
+/// entries (at least 16, a power of two here); per held fragment a record
+/// and a fragmentation slot's 14 + 3826 bytes.
 fn fragment_tracking_bytes(entries: u32, held: u32) -> usize {
     let directory = size_of::<DirectoryBucket>() + size_of::<DirectoryNode>();
+    let tombstones = (entries as usize / 16).max(16);
     entries as usize
         * (size_of::<Ipv4FragmentEntrySlot>() + size_of::<Ipv4FragmentHostSlot>() + 2 * directory)
+        + tombstones * (size_of::<Ipv4FragmentTombstoneSlot>() + directory)
         + held as usize * (size_of::<Ipv4FragmentHeldSlot>() + 14 + 3826)
 }
 
@@ -197,7 +201,7 @@ fn fragmentation_bytes(datagrams: u32) -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 66_865_856;
+    const WORST_CASE: usize = 67_050_176;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 

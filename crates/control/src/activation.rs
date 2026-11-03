@@ -191,21 +191,22 @@
 use std::{marker::PhantomData, num::NonZeroU64};
 
 use ruster_core::{
-    port_free_bitmap_words, ArpHoldRuntime, ArpHoldSlot, ArpHoldStorageError, DirectoryBucket,
-    DirectoryNode, DynamicNeighborSlot, FirewallReconcileError, FirewallReconcileReport,
-    FirewallRuntime, FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError,
+    ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_tombstones, port_free_bitmap_words,
+    ArpHoldRuntime, ArpHoldSlot, ArpHoldStorageError, DirectoryBucket, DirectoryNode,
+    DynamicNeighborSlot, FirewallReconcileError, FirewallReconcileReport, FirewallRuntime,
+    FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError,
     Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot,
-    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTracker,
-    Ipv4FragmentTrackingStorage, Ipv4FragmentTrackingStorageError, Ipv4FragmentationRuntime,
-    Ipv4FragmentationStorageError, Nat44HostCounter, Nat44HostLink, Nat44HostSlot,
-    Nat44HostStorage, Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport,
-    Nat44IcmpRuntime, Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
-    Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
-    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime,
-    Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionPublicationError, ResolutionPublicationReport,
-    ResolutionRuntime, ResolutionStateSlot,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
+    Ipv4FragmentTracker, Ipv4FragmentTrackingStorage, Ipv4FragmentTrackingStorageError,
+    Ipv4FragmentationRuntime, Ipv4FragmentationStorageError, Nat44HostCounter, Nat44HostLink,
+    Nat44HostSlot, Nat44HostStorage, Nat44IcmpReconcileError, Nat44IcmpReconcilePermit,
+    Nat44IcmpReconcileReport, Nat44IcmpRuntime, Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage,
+    Nat44TcpMappingSlot, Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime,
+    Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage,
+    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport,
+    Nat44UdpRuntime, Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPublicationError,
+    ResolutionPublicationReport, ResolutionRuntime, ResolutionStateSlot,
 };
 use ruster_core::{
     FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
@@ -285,6 +286,9 @@ struct FragmentTrackingTables {
     hosts: Box<[Ipv4FragmentHostSlot]>,
     host_buckets: Box<[DirectoryBucket]>,
     host_nodes: Box<[DirectoryNode]>,
+    tombstones: Box<[Ipv4FragmentTombstoneSlot]>,
+    tombstone_buckets: Box<[DirectoryBucket]>,
+    tombstone_nodes: Box<[DirectoryNode]>,
     held: Box<[Ipv4FragmentHeldSlot]>,
     held_bytes: Box<[u8]>,
 }
@@ -507,6 +511,17 @@ impl FullServiceStorage {
                             service: FragmentTracking,
                         },
                     )?;
+                    // Derived from the entries (`ipv4_fragment_tracking_tombstones`).
+                    let tombstones =
+                        u32::try_from(ipv4_fragment_tracking_tombstones(plan.entries() as usize))
+                            .map_err(|_| StorageAllocationError {
+                            service: FragmentTracking,
+                        })?;
+                    let tombstone_buckets =
+                        u32::try_from(ipv4_fragment_tracking_buckets(tombstones as usize))
+                            .map_err(|_| StorageAllocationError {
+                                service: FragmentTracking,
+                            })?;
                     Ok(FragmentTrackingTables {
                         entries: slots(
                             plan.entries(),
@@ -535,6 +550,21 @@ impl FullServiceStorage {
                         )?,
                         host_nodes: slots(
                             plan.entries(),
+                            DirectoryNode::default(),
+                            FragmentTracking,
+                        )?,
+                        tombstones: slots(
+                            tombstones,
+                            Ipv4FragmentTombstoneSlot::EMPTY,
+                            FragmentTracking,
+                        )?,
+                        tombstone_buckets: slots(
+                            tombstone_buckets,
+                            DirectoryBucket::default(),
+                            FragmentTracking,
+                        )?,
+                        tombstone_nodes: slots(
+                            tombstones,
                             DirectoryNode::default(),
                             FragmentTracking,
                         )?,
@@ -1021,6 +1051,9 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                         hosts: &mut tables.hosts,
                         host_buckets: &mut tables.host_buckets,
                         host_nodes: &mut tables.host_nodes,
+                        tombstones: &mut tables.tombstones,
+                        tombstone_buckets: &mut tables.tombstone_buckets,
+                        tombstone_nodes: &mut tables.tombstone_nodes,
                         held: &mut tables.held,
                         held_bytes: &mut tables.held_bytes,
                     },

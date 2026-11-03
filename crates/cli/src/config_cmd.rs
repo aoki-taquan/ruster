@@ -436,6 +436,49 @@ pub fn sweep_warnings(config: &ValidatedConfigV1) -> [Option<SweepSlow>; 2] {
     ]
 }
 
+/// `[fragment-tracking] ingress-share-percent` is a cap, not a
+/// reservation: each ingress may take `floor(entries × share / 100)`
+/// entries (at least one), so when that times `interfaces − 1` reaches
+/// `entries`, the other ingresses can take every entry and leave none to
+/// the last (a share of at most 100/N leaves each an equal part).
+/// Value-free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentShareOvercommitted {
+    pub share_percent: u8,
+    pub interfaces: usize,
+    pub entries: u32,
+}
+
+impl std::fmt::Display for FragmentShareOvercommitted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "FRAGMENT_INGRESS_SHARE_OVERCOMMITTED share-percent={} interfaces={} entries={}",
+            self.share_percent, self.interfaces, self.entries
+        )
+    }
+}
+
+/// The fragment share warning of `config` (associate mode with a share
+/// below 100: 100 does not partition the table), computed on the share the
+/// table enforces (`ipv4_fragment_tracking_ingress_cap`).
+#[must_use]
+pub fn fragment_share_warning(config: &ValidatedConfigV1) -> Option<FragmentShareOvercommitted> {
+    let tracking = config.fragment_tracking();
+    let share = tracking.policy()?.ingress_share_percent();
+    let entries = tracking.storage()?.entries;
+    let interfaces = config.interfaces().len();
+    let total = usize::try_from(entries).ok()?;
+    let cap = ruster_core::ipv4_fragment_tracking_ingress_cap(total, share);
+    (share < 100 && interfaces > 1 && cap.saturating_mul(interfaces - 1) >= total).then_some(
+        FragmentShareOvercommitted {
+            share_percent: share,
+            interfaces,
+            entries,
+        },
+    )
+}
+
 /// `ruster validate <config>`: summary on stdout, diagnostics on stderr.
 pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
     validate_loaded(load(path), out, err)
@@ -496,6 +539,9 @@ pub fn validate_loaded(
         for warning in sweep_warnings(&config).into_iter().flatten() {
             let _ = writeln!(err, "ruster: warning: {warning}");
         }
+    }
+    if let Some(warning) = fragment_share_warning(&config) {
+        let _ = writeln!(err, "ruster: warning: {warning}");
     }
     0
 }

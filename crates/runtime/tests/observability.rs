@@ -425,7 +425,7 @@ fn service_counters_render_in_fixed_order(
         ("nat44_icmp", 16),
         ("firewall", 14),
         ("fragmentation", 9),
-        ("fragment_tracking", 17),
+        ("fragment_tracking", 18),
         ("arp_hold", 16),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);

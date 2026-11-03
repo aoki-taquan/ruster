@@ -165,6 +165,11 @@ pub static EVENTS: &[Rule] = &[
         "SWEEP_SLOW",
         Warn,
     )),
+    with_condition(rule(
+        Prefix("warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED"),
+        "FRAGMENT_SHARE_OVERCOMMITTED",
+        Warn,
+    )),
     rule(
         Prefix("warning: reload preparation running"),
         "RELOAD_PREPARE_SLOW",
