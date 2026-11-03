@@ -336,6 +336,14 @@ admin-prohibited = false   # Type 3/Code 13 firewall deny（default off: silent 
 redirect = true            # Type 5/Code 1  同じinterfaceへforwardするとき（ICMP-REDIRECT）
 ```
 
+**Upgrade注意（ICMP-REDIRECT）**: Redirectはdefault on（`redirect = true`、RFC動作）で、ICMPv4
+limiter stateがinterfaceあたり1つ多く要ります。`icmpv4-errors.capacity.states`が旧下限（2 ×
+interface数、delayed Port Unreachableありで+1）ちょうどのconfigはexit 2
+（`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT ... limit=<下限> actual=<states>`）になるので、更新後の
+再起動やreloadの前に`ruster validate`を実行し、`states`を`limit`まで上げるか`redirect = false`に
+してください。同一interface（LAN→LAN）のtrafficをrusterのforward firewallに通し続けたい場合も
+`redirect = false`です（Redirectに従ったhostはnext hopへ直接送りfirewallを通らない）。
+
 ICMP-REDIRECTで、plainなforwardがingress interfaceから出て、sourceとnext hopがそのinterfaceの
 connected subnet上なら、datagramはそのままforwardしつつsourceへRedirect for Host（5/1、RFC 1812
 §5.2.7.2、gateway fieldはnext hop）を送ります。Network Redirect（code 0/2）は送りません。NAT、

@@ -813,6 +813,19 @@ unchanged (67050176 bytes for the maximal production config at the time;
 
 ### ICMP Redirect (ICMP-REDIRECT)
 
+> **Upgrade note.** Redirect is on by default (`redirect = true`, RFC
+> behavior) and needs one more ICMPv4 limiter state per interface. A
+> config whose `icmpv4-errors.capacity.states` equals the old minimum
+> (2 x interfaces, +1 with delayed Port Unreachable) now fails with exit 2:
+> `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT
+> path=icmpv4-errors.capacity.states limit=<minimum> actual=<states>`.
+> Run `ruster validate <config>` before restarting or reloading after the
+> upgrade, then either raise `states` to the printed `limit` or set
+> `[icmpv4-errors.generate] redirect = false`. Choose `redirect = false`
+> also when same-interface (LAN->LAN) traffic must keep going through
+> ruster's forward firewall: a host that follows a Redirect sends to the
+> next hop directly and bypasses it.
+
 When the router forwards a datagram back out of the interface it arrived
 on, and both the source and the chosen next hop are on that interface's
 connected subnet, it still forwards the datagram and also sends the source
@@ -851,14 +864,24 @@ redirect = true   # default (RFC 1812: MUST be able to generate Code 1)
   Redirects (`accept_redirects=0`, as on many container and Kubernetes
   nodes) and keeps sending through the router gets at most one Redirect
   per interval and never delays Time Exceeded or Unreachable errors for
-  the other hosts on that LAN.
+  the other hosts on that LAN. The class is per egress, not per host: while
+  one such host keeps it busy, Redirects to the other hosts on that egress
+  come late (at most one per interval for the whole egress). The pre-check
+  runs after the RFC 1812 4.3.2.7 header rules, so later fragments, ICMP
+  errors, and group destinations are counted under their own suppression
+  counters, not as `rate_limited`.
+- Subnet: only the interface's own address and its connected subnet count.
+  A host reached through an extra interface route without a gateway on the
+  same link (a second prefix on the LAN) gets no Redirect.
 - Capacity: the Redirect class needs one limiter state per interface.
   With `redirect = true`, `icmpv4-errors.capacity.states` must be at least
   interfaces x (1 + 1 for Fragmentation Needed when it is on + 1), plus one
   with delayed Port Unreachable; otherwise validate, plan, and reload fail
-  with `ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`. Upgrading: a config whose
-  `states` was exactly 2 x interfaces (+1) needs a larger `states` or
-  `redirect = false`. Storage per state is unchanged (24 bytes).
+  with `ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`, whose `limit=` is the whole
+  minimum and `actual=` the configured value (the Fragmentation Needed and
+  Port Unreachable states errors report the same pair). Upgrading: see the
+  note at the top of this section. Storage per state is unchanged (24
+  bytes).
 - Counters: `icmpv4_errors.queued_redirect`, `dequeued_redirect`, and
   `disabled_redirect` (the Redirects that would have been sent while
   `redirect = false`), appended after the existing counters. Changing the
@@ -3985,8 +4008,8 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `health=MTU_DECREASED` / `MTU_ABOVE_FRAME` | 1 | MTU changed below the startup MTU / above the frame bound | restore the MTU, then restart |
 | `health=MTU_RAISED` | — | MTU raised within the frame bound; TX still bounded by the old MTU | restart to use the new MTU |
 | `warning: port=if<id> MTU_BELOW_DEVICE mtu=M config=C` | — | the device carries M but forwarding is limited to the interface's `mtu` C (default 1500) | set `mtu = M` if the link carries it (restart) |
-| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED path=icmpv4-errors.capacity.states` | 2 | fewer than two ICMPv4 error limiter states per interface while Fragmentation Needed is on | raise `states` to at least 2 × interfaces (+1 with delayed Port Unreachable) |
-| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT path=icmpv4-errors.capacity.states` | 2 | no room for the Redirect limiter class on every interface while `redirect = true` (the default) | raise `states` to at least 3 × interfaces with Fragmentation Needed on (2 × with it off), +1 with delayed Port Unreachable, or set `redirect = false` |
+| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED path=icmpv4-errors.capacity.states limit=<minimum> actual=<states>` | 2 | fewer than two ICMPv4 error limiter states per interface while Fragmentation Needed is on | raise `states` to at least 2 × interfaces (+1 with delayed Port Unreachable) |
+| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT path=icmpv4-errors.capacity.states limit=<minimum> actual=<states>` | 2 | no room for the Redirect limiter class on every interface while `redirect = true` (the default) | raise `states` to at least 3 × interfaces with Fragmentation Needed on (2 × with it off), +1 with delayed Port Unreachable, or set `redirect = false` |
 | `drop.IPV4_FRAME_EXCEEDS_MTU` | — | frames carry bytes after the IPv4 datagram beyond the egress MTU | find the sender appending trailers; the datagrams themselves fit |
 | `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
 | `drop.IPV4_LOCAL_UDP_PORT_UNREACHABLE` / `IPV4_LOCAL_PROTOCOL_UNREACHABLE` growing | — | UDP or another protocol sent to a router address (scans, misconfigured clients, a service expected on the router) | normal at a low rate; `udp-port-unreachable = false` / `protocol-unreachable = false` to stop answering (ICMP-ERR) |

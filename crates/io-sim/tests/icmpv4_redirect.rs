@@ -632,6 +632,13 @@ fn the_limiter_comes_first_and_a_redirect_never_starts_arp() {
         Some(Icmpv4ErrorDisposition::Pending { egress: LAN })
     );
     assert_eq!(world.counters().reverse_neighbor_unresolved, 0);
+    // The §4.3.2.7 header rules come before the pre-check: a later
+    // fragment is counted as such, not as Pending.
+    let later = frame(A_MAC, A, B, 2, 64, 17, b"later fragment..");
+    assert_eq!(
+        world.forward(LAN, &later, 12).redirect,
+        Some(Icmpv4ErrorDisposition::NonInitialFragment)
+    );
 
     let mut world = World::new(Icmpv4ErrorPolicy::default());
     let step = world.forward(LAN, &other, 10);

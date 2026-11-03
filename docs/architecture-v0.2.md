@@ -1292,8 +1292,8 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
   state TTLとclass intervalの両方の経過後。flood中のPort Unreachable stateがstate表を埋めて他egressが
   `StateFull`（Time Exceeded/Net/Host Unreachableのsilent抑止）にならないよう、switch onかつ
   hold容量>0のときvalidateは`icmpv4-errors.capacity.states >= interface数 + 1`を要求する
-  （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、値は
-  出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない
+  （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、ICMP-REDIRECT以降は
+  `limit`に下限、`actual`に`states`を出す）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない
   （MTU1以降、Fragmentation Neededを生成するときはclass 2がinterfaceごとに加わり、下限は
   2 × interface数（+ 1）。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`。ICMP-REDIRECT以降、
   Redirectを生成するときはclass 3がさらに加わる。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`）。

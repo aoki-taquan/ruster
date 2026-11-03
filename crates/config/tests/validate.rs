@@ -1497,7 +1497,9 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
         "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
     );
     assert_eq!(refused.path().segments(), path);
-    assert_eq!((refused.limit(), refused.actual()), (None, None));
+    // Review L2: every states error reports the whole minimum (here 3 x 2
+    // interfaces + 1 for Port Unreachable) and the configured value.
+    assert_eq!((refused.limit(), refused.actual()), (Some(7), Some(6)));
     // Fewer than three per interface: refused for Redirect.
     for value in [5, 4] {
         let refused = error(&states(VALID, value));
@@ -1510,7 +1512,10 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
             "ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT"
         );
         assert_eq!(refused.path().segments(), path);
-        assert_eq!((refused.limit(), refused.actual()), (None, None));
+        assert_eq!(
+            (refused.limit(), refused.actual()),
+            (Some(7), Some(u64::from(value)))
+        );
     }
     // Fewer than two per interface: refused for Fragmentation Needed.
     let refused = error(&states(VALID, 3));
@@ -1523,6 +1528,7 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
         "ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED"
     );
     assert_eq!(refused.path().segments(), path);
+    assert_eq!((refused.limit(), refused.actual()), (Some(7), Some(3)));
     // No Port Unreachable can be sent: three per interface are enough.
     let off = VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
     validated(&states(&off, 6));
@@ -1532,35 +1538,66 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
         1,
     );
     validated(&states(&no_holds, 6));
+    let refused = error(&states(&no_holds, 5));
     assert_eq!(
-        error(&states(&no_holds, 5)).code(),
-        ValidationCode::Icmpv4ErrorStatesTooFewForRedirect
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForRedirect,
+            Some(6),
+            Some(5)
+        )
     );
     // Redirect off: the bound before ICMP-REDIRECT (two per interface plus
     // Port Unreachable).
     let redirect_off = generate(VALID, "redirect = false\n");
     validated(&states(&redirect_off, 5));
+    let refused = error(&states(&redirect_off, 4));
     assert_eq!(
-        error(&states(&redirect_off, 4)).code(),
-        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
+            Some(5),
+            Some(4)
+        )
+    );
+    let refused = error(&states(&redirect_off, 3));
+    assert_eq!(
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForFragmentationNeeded,
+            Some(5),
+            Some(3)
+        )
     );
     // Fragmentation Needed off: Redirect and the shared class per interface
     // plus Port Unreachable.
     let frag_off = generate(VALID, "fragmentation-needed = false\n");
     validated(&states(&frag_off, 5));
+    let refused = error(&states(&frag_off, 3));
     assert_eq!(
-        error(&states(&frag_off, 3)).code(),
-        ValidationCode::Icmpv4ErrorStatesTooFewForRedirect
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForRedirect,
+            Some(5),
+            Some(3)
+        )
     );
+    let refused = error(&states(&frag_off, 4));
     assert_eq!(
-        error(&states(&frag_off, 4)).code(),
-        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
+        (refused.code(), refused.limit(), refused.actual()),
+        (
+            ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
+            Some(5),
+            Some(4)
+        )
     );
     // Both off: one per interface plus Port Unreachable, as before MTU1.
     let both_off = generate(VALID, "fragmentation-needed = false\nredirect = false\n");
     validated(&states(&both_off, 3));
+    let refused = error(&states(&both_off, 2));
+    assert_eq!((refused.limit(), refused.actual()), (Some(3), Some(2)));
     assert_eq!(
-        error(&states(&both_off, 2)).code(),
+        refused.code(),
         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
     );
     let all_off = both_off.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);

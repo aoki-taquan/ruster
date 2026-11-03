@@ -1972,6 +1972,14 @@ fn validate_v1(
                 })
         })
         .transpose()?;
+    // The delayed Port Unreachable class (B3) adds one state when the TCP
+    // NAT can send it; read from the DTO here so every states error reports
+    // the whole minimum as its limit.
+    let port_unreachable_state = u64::from(config.nat44.as_ref().is_some_and(|nat| {
+        nat.tcp
+            .as_ref()
+            .is_some_and(|tcp| tcp.unsolicited_syn_icmp && tcp.capacity.unsolicited_syn_holds > 0)
+    }));
     // Fragmentation Needed has its own limiter class on every egress
     // (MTU1): room for both classes on every interface, so neither can make
     // another egress StateFull.
@@ -1981,9 +1989,13 @@ fn validate_v1(
         {
             let needed = core_interfaces.len() as u64;
             if u64::from(source.capacity.states) < 2 * needed {
-                return Err(ValidationError::new(
+                let redirect = icmp_policy
+                    .is_some_and(|policy| policy.generates(Icmpv4ErrorKind::RedirectHost));
+                return Err(ValidationError::bounded(
                     ValidationCode::Icmpv4ErrorStatesTooFewForFragmentationNeeded,
                     path(&["icmpv4-errors", "capacity", "states"]),
+                    (2 + u64::from(redirect)) * needed + port_unreachable_state,
+                    u64::from(source.capacity.states),
                 ));
             }
             needed
@@ -1996,9 +2008,11 @@ fn validate_v1(
         (Some(source), Some(policy)) if policy.generates(Icmpv4ErrorKind::RedirectHost) => {
             let needed = core_interfaces.len() as u64;
             if u64::from(source.capacity.states) < needed + fragmentation_needed_states + needed {
-                return Err(ValidationError::new(
+                return Err(ValidationError::bounded(
                     ValidationCode::Icmpv4ErrorStatesTooFewForRedirect,
                     path(&["icmpv4-errors", "capacity", "states"]),
+                    needed + fragmentation_needed_states + needed + port_unreachable_state,
+                    u64::from(source.capacity.states),
                 ));
             }
             needed
@@ -2143,9 +2157,11 @@ fn validate_v1(
                     + redirect_states
                     + 1;
                 if sends_port_unreachable && u64::from(icmp.capacity.states) < needed {
-                    return Err(ValidationError::new(
+                    return Err(ValidationError::bounded(
                         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
                         path(&["icmpv4-errors", "capacity", "states"]),
+                        needed,
+                        u64::from(icmp.capacity.states),
                     ));
                 }
             }

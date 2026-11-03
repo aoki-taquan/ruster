@@ -8083,8 +8083,19 @@ fn redirect_to_better_first_hop<T: TraceSink>(
         return;
     }
     let kind = Icmpv4ErrorKind::RedirectHost;
-    let disposition = match runtime.limiter_refusal(kind, ingress, *now) {
-        Some(refusal) if runtime.policy().generates(kind) => runtime.record_suppression(refusal),
+    // The limiter pre-check runs only for a datagram the §4.3.2.7 header
+    // rules admit (a pure check, no counters), so a later fragment, an ICMP
+    // error, or a group destination is counted under its own suppression
+    // by `decide_icmpv4_error`, never as RateLimited/Pending.
+    let refusal = if runtime.policy().generates(kind)
+        && icmp_error_candidate_eligible(frame, snapshot, ipv4, Some(route))
+    {
+        runtime.limiter_refusal(kind, ingress, *now)
+    } else {
+        None
+    };
+    let disposition = match refusal {
+        Some(refusal) => runtime.record_suppression(refusal),
         _ => decide_icmpv4_error(
             frame,
             snapshot,
