@@ -1835,7 +1835,12 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     session is still driven), so letting sessions lapse and resuming them
     cannot exceed the limit. A connection the remote reopens after a FIN
     close (the host answers its SYN) is remote-opened and stops counting;
-    one the host reopens with its own SYN counts.
+    one the host reopens with its own SYN counts. A host at
+    `sessions-per-host` that resumes a connection after more than its idle
+    timeout of its own silence may see that connection's segments dropped
+    as `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` until one of its other
+    sessions goes idle. Size the limit with headroom above the host's
+    normal number of concurrent connections.
   - Sizing: like the mapping quota, `capacity.peers` or `capacity.sessions`
     divided by the expected inside hosts keeps every host able to work
     (for example 65536 sessions / 64 hosts = 1024). Browsers open tens to a
