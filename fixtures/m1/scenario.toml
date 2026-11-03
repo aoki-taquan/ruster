@@ -19,7 +19,8 @@ schema = "ruster-scenario/v1"
 seed = 20261101
 config = "router-v1.toml"
 
-# --- 1. Dynamic ARP: the first packet to S triggers an ARP Request for G.
+# --- 1. Dynamic ARP: the first packet to S triggers an ARP Request for G
+# and is held until G resolves (ARP-HOLD, RFC 1122 §2.3.2.2), not dropped.
 [[step]]
 kind = "inject"
 interface = "lan"
@@ -35,19 +36,15 @@ generation = 1
 tx = [
   { interface = "wan", frame = { kind = "arp", eth = { src = "02:00:00:00:00:02", dst = "ff:ff:ff:ff:ff:ff" }, op = "request", sender-mac = "02:00:00:00:00:02", sender-ip = "203.0.113.2", target-ip = "203.0.113.1", pad-to-min = true } },
 ]
-drops = [{ reason = "NEIGHBOR_UNRESOLVED", count = 1 }]
+consumes = [{ reason = "ARP_HELD", count = 1 }]
 
-# --- 2. G replies; the reply is learned and the retransmitted query is routed
-# via the static route, source-NATed, and sent to G's learned MAC.
+# --- 2. G replies; the reply is learned and the held query is decided anew:
+# routed via the static route, source-NATed, and sent to G's learned MAC,
+# with no retransmission by H.
 [[step]]
 kind = "inject"
 interface = "wan"
 frame = { kind = "arp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, op = "reply", sender-mac = "02:00:00:00:00:fe", sender-ip = "203.0.113.1", target-mac = "02:00:00:00:00:02", target-ip = "203.0.113.2", pad-to-min = true }
-
-[[step]]
-kind = "inject"
-interface = "lan"
-frame = { kind = "udp", eth = { src = "02:00:00:00:00:10", dst = "02:00:00:00:00:01" }, ip = { src = "192.168.1.10", dst = "198.51.100.20", id = 2 }, src-port = 5000, dst-port = 53, payload-ascii = "query-1" }
 
 [[step]]
 kind = "tick"
@@ -56,9 +53,12 @@ at-ms = 10
 [[step]]
 kind = "expect"
 tx = [
-  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "198.51.100.20", id = 2, ttl = 63 }, src-port = 40014, dst-port = 53, payload-ascii = "query-1" } },
+  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "198.51.100.20", id = 1, ttl = 63 }, src-port = 40014, dst-port = 53, payload-ascii = "query-1" } },
 ]
-consumes = [{ reason = "ARP_CONTROL", count = 1 }]
+consumes = [
+  { reason = "ARP_CONTROL", count = 1 },
+  { reason = "ARP_HELD", count = 1 },
+]
 
 # --- 3. UDP NAT: S's answer to the public mapping is de-translated to H.
 [[step]]
@@ -145,9 +145,10 @@ drops = [
   { reason = "FIREWALL_ROUTE_UNAVAILABLE", count = 1 },
 ]
 
-# --- 6. Host unreachable: a directly connected WAN host never answers. Three
-# ARP Requests one second apart, then ICMPv4 Destination Unreachable
-# (Host, code 1) to H once the resolution times out.
+# --- 6. Host unreachable: a directly connected WAN host never answers. The
+# datagram is held; three ARP Requests one second apart, then ICMPv4
+# Destination Unreachable (Host, code 1) to H once the resolution times out,
+# and the held datagram is discarded.
 [[step]]
 kind = "inject"
 interface = "lan"
@@ -177,7 +178,7 @@ tx = [
   { interface = "wan", frame = { kind = "arp", eth = { src = "02:00:00:00:00:02", dst = "ff:ff:ff:ff:ff:ff" }, op = "request", sender-mac = "02:00:00:00:00:02", sender-ip = "203.0.113.2", target-ip = "203.0.113.50", pad-to-min = true } },
   { interface = "lan", frame = { kind = "ipv4", eth = { src = "02:00:00:00:00:01", dst = "02:00:00:00:00:10" }, ip = { src = "192.168.1.1", dst = "192.168.1.10", tos = 192, ttl = 64 }, protocol = 1, payload-hex = "0301fb03 00000000 45000022000a400040113cdcc0a8010acb007132 138d0007000eaa47 68656c6c6f3f" } },
 ]
-drops = [{ reason = "NEIGHBOR_UNRESOLVED", count = 2 }]
+consumes = [{ reason = "ARP_HELD", count = 2 }]
 
 # --- 7. Reload v2 at a generation boundary. v2 sets `[reload] state =
 # "flush"`, so this reload flushes ARP learning and all NAT/firewall state
@@ -198,7 +199,8 @@ generation = 2
 tx = []
 
 # The flushed UDP mapping no longer admits S's late answer, and the new
-# 192.0.2.0/24 route needs the flushed gateway to be resolved again.
+# 192.0.2.0/24 route needs the flushed gateway to be resolved again: H's
+# datagram is held and, once G answers, sent after H's next one.
 [[step]]
 kind = "inject"
 interface = "wan"
@@ -233,12 +235,13 @@ generation = 2
 tx = [
   { interface = "wan", frame = { kind = "arp", eth = { src = "02:00:00:00:00:02", dst = "ff:ff:ff:ff:ff:ff" }, op = "request", sender-mac = "02:00:00:00:00:02", sender-ip = "203.0.113.2", target-ip = "203.0.113.1", pad-to-min = true } },
   { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "192.0.2.50", id = 13, ttl = 63 }, src-port = 40000, dst-port = 9, payload-ascii = "nowhere" } },
+  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "192.0.2.50", id = 12, ttl = 63 }, src-port = 40000, dst-port = 9, payload-ascii = "nowhere" } },
 ]
-drops = [
-  { reason = "NAT44_UDP_MAPPING_MISS", count = 2 },
-  { reason = "NEIGHBOR_UNRESOLVED", count = 3 },
+drops = [{ reason = "NAT44_UDP_MAPPING_MISS", count = 2 }]
+consumes = [
+  { reason = "ARP_CONTROL", count = 2 },
+  { reason = "ARP_HELD", count = 3 },
 ]
-consumes = [{ reason = "ARP_CONTROL", count = 2 }]
 
 # --- 7b. Route miss admitted by v2's egress-free rule 40: RFC 1812
 # §5.2.7.1 ICMPv4 Destination Unreachable (Network, code 0) to H, quoting
@@ -328,7 +331,9 @@ drops = [
   { reason = "FIREWALL_RULE_DENIED", count = 1 },
   { reason = "IPV4_TTL_EXPIRED", count = 1 },
   { reason = "NAT44_UDP_MAPPING_MISS", count = 2 },
-  { reason = "NEIGHBOR_UNRESOLVED", count = 3 },
   { reason = "ROUTE_MISS", count = 1 },
 ]
-consumes = [{ reason = "ARP_CONTROL", count = 2 }]
+consumes = [
+  { reason = "ARP_CONTROL", count = 2 },
+  { reason = "ARP_HELD", count = 3 },
+]
