@@ -965,6 +965,36 @@ impl<O: PacketOps> PacketRingResources<O> {
             })
     }
 
+    /// How many of the next `limit` [`Self::tx_reserve`] calls would find
+    /// their frame free: the run of consecutive frames from the producer
+    /// head whose status is AVAILABLE and whose ownership is Available (or
+    /// a forgotten Prepared lease, which `tx_reserve` reclaims). Reads at
+    /// most `limit` status words with the same Acquire load and changes
+    /// nothing, counters included. The kernel only ever returns frames to
+    /// AVAILABLE, so the run cannot shrink until userspace publishes. A
+    /// status that cannot be read or is unknown, or an exhausted
+    /// generation, ends the run: `tx_reserve` reports it as a fault.
+    fn tx_available_run(&self, limit: usize) -> usize {
+        let count = self.tx_frame_count();
+        let mut run = 0;
+        while run < limit.min(count) {
+            let frame_index = (self.tx_state.producer_head + run) % count;
+            if !matches!(self.load_tx_status(frame_index), Ok(TP_STATUS_AVAILABLE)) {
+                break;
+            }
+            let metadata = self.tx_metadata(frame_index);
+            let free = matches!(
+                metadata.ownership.owner(),
+                TxOwnership::Available | TxOwnership::Prepared
+            );
+            if !free || metadata.generation == u64::MAX {
+                break;
+            }
+            run += 1;
+        }
+        run
+    }
+
     /// Publishes a reservation; a failure is a fault and leaves the frame
     /// Available and unseen by the kernel.
     fn tx_commit(&mut self, reservation: TxReservation) -> Result<TxSubmission, TxSubmitError> {

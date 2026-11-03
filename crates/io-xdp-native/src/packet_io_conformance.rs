@@ -596,6 +596,7 @@ fn xdp_adapter_passes_the_rx_cq_pool_suite() {
 #[cfg_attr(miri, ignore = "the harness leaks its 'static scripted kernels")]
 fn xdp_adapter_passes_the_generated_conformance_suite() {
     generated::empty_session_has_zero_accounting::<XdpGeneratedHarness>();
+    generated::check_capacity_promises_exact_room::<XdpGeneratedHarness>();
     generated::allocation_failures_bind_only_successful_ownership::<XdpGeneratedHarness>();
     generated::commit_cancel_and_abandon_bind_exact_lengths::<XdpGeneratedHarness>();
     generated::partial_reject_reclaims_exact_tokens::<XdpGeneratedHarness>();

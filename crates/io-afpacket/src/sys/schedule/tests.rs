@@ -15,8 +15,9 @@ use std::{
 };
 
 use ruster_core::{
-    DropReason, FieldValue, FieldVisitor, GeneratedAllocationError, GeneratedPacketBatch, IfId,
-    MonotonicMillis, ObservableFields, PacketBatch, PublicationQuiescenceDisposition,
+    DropReason, FieldValue, FieldVisitor, GeneratedAllocationError, GeneratedBatchCompletion,
+    GeneratedPacketBatch, IfId, MonotonicMillis, ObservableFields, PacketBatch,
+    PublicationQuiescenceDisposition,
 };
 
 use super::{AfPacketQuiescenceError, KICK_BACKOFF_MAX_MS};
@@ -1088,4 +1089,136 @@ fn af_packet_tx_timestamp_status_bits_do_not_stop_the_engine() {
     live.set_tx_status(1, 2, TP_STATUS_AVAILABLE | (1 << 30));
     assert_eq!(live.generate(WAN, 4, 60), 4);
     assert_eq!(live.port(WAN).counters.tx_completed, 2);
+}
+
+/// Session accounting of a session that only checked capacity.
+fn assert_untouched(completion: &GeneratedBatchCompletion<AfPacketIoError>) {
+    assert!(completion.invariants_hold(), "{completion:?}");
+    assert_eq!(
+        (
+            completion.attempts,
+            completion.allocated,
+            completion.failed,
+            completion.requested,
+            completion.accepted,
+            completion.rejected,
+            completion.abandoned,
+        ),
+        (0, 0, 0, 0, 0, 0, 0),
+        "{completion:?}"
+    );
+    assert_eq!(completion.error, None);
+}
+
+#[test]
+fn af_packet_check_capacity_counts_the_free_run_from_the_producer_head() {
+    let mut live = Live::new();
+    let before = (live.port(WAN), live.engine.backend_stats());
+    let mut batch = live.engine.live_begin_generated(WAN);
+    assert_eq!(batch.check_capacity(0, 0), Ok(()));
+    assert_eq!(
+        batch.check_capacity(1, 0),
+        Err(GeneratedAllocationError::ZeroLength)
+    );
+    assert_eq!(
+        batch.check_capacity(1, 13),
+        Err(GeneratedAllocationError::FrameTooLarge)
+    );
+    assert_eq!(
+        batch.check_capacity(9, 1_515),
+        Err(GeneratedAllocationError::FrameTooLarge),
+        "length before room"
+    );
+    assert_eq!(
+        batch.check_capacity(TX_FRAMES + 1, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
+    assert_eq!(batch.check_capacity(TX_FRAMES, 1_514), Ok(()));
+    assert_untouched(&batch.finish());
+    assert_eq!((live.port(WAN), live.engine.backend_stats()), before);
+    assert!(live.kicks().is_empty());
+
+    // Two frames in flight: exactly two more fit, and both are accepted.
+    assert_eq!(live.generate(WAN, 2, 60), 2);
+    let mut batch = live.engine.live_begin_generated(WAN);
+    assert_eq!(
+        batch.check_capacity(3, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
+    assert_eq!(batch.check_capacity(2, 1_514), Ok(()));
+    for len in [1_514, 14] {
+        batch.allocate(len).expect("promised").commit();
+    }
+    assert_eq!(
+        batch.check_capacity(1, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
+    let completion = batch.finish();
+    assert!(completion.invariants_hold(), "{completion:?}");
+    assert_eq!((completion.accepted, completion.rejected), (2, 0));
+    assert_eq!(completion.error, None);
+
+    // The kernel completed frame 0 only: the head (frame 0, wrapped) is
+    // free once reaped, frame 1 is still in flight.
+    live.set_tx_status(1, 0, TP_STATUS_AVAILABLE);
+    let mut batch = live.engine.live_begin_generated(WAN);
+    assert_eq!(
+        batch.check_capacity(2, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
+    assert_eq!(batch.check_capacity(1, 60), Ok(()));
+    batch.allocate(60).expect("promised").commit();
+    assert_eq!(batch.finish().accepted, 1);
+}
+
+#[test]
+fn af_packet_check_capacity_counts_a_forgotten_lease_at_the_head_as_free() {
+    let mut live = Live::new();
+    let mut batch = live.engine.live_begin_generated(WAN);
+    std::mem::forget(batch.allocate(60).expect("frame"));
+    assert_eq!(batch.check_capacity(TX_FRAMES, 60), Ok(()));
+    for _ in 0..TX_FRAMES {
+        batch.allocate(60).expect("promised").commit();
+    }
+    let completion = batch.finish();
+    assert!(completion.invariants_hold(), "{completion:?}");
+    assert_eq!(
+        (
+            completion.accepted,
+            completion.rejected,
+            completion.abandoned
+        ),
+        (TX_FRAMES, 0, 1)
+    );
+    assert_eq!(completion.error, None);
+}
+
+#[test]
+fn af_packet_check_capacity_refuses_unknown_egress_and_a_stopped_engine() {
+    let mut live = Live::new();
+    let mut batch = live.engine.live_begin_generated(UNKNOWN);
+    assert_eq!(
+        batch.check_capacity(1, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
+    assert_eq!(
+        batch.check_capacity(1, 0),
+        Err(GeneratedAllocationError::ZeroLength),
+        "allocate's order: the length first"
+    );
+    assert_untouched(&batch.finish());
+    // Only begin_generated counted the unknown egress.
+    assert_eq!(live.engine.backend_stats().generated_unknown_egress, 1);
+
+    // A completion fault stops the engine.
+    assert_eq!(live.generate(WAN, 1, 60), 1);
+    live.set_tx_status(1, 0, 0x7);
+    assert!(live.engine.live_receive(1).is_err());
+    assert!(live.engine.is_stopped());
+    let mut batch = live.engine.live_begin_generated(LAN);
+    assert_eq!(
+        batch.check_capacity(1, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
+    assert_untouched(&batch.finish());
 }

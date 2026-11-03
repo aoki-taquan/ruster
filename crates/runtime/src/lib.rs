@@ -1803,6 +1803,21 @@ mod tests {
             }))
         }
 
+        /// One frame per session, like the ARP/ICMPv4 actions it serves.
+        fn check_capacity(
+            &mut self,
+            frames: usize,
+            _frame_len: usize,
+        ) -> Result<(), GeneratedAllocationError> {
+            if frames == 0 {
+                return Ok(());
+            }
+            if self.mode == GeneratedMode::AllocationFailure || self.attempted || frames > 1 {
+                return Err(GeneratedAllocationError::Unavailable);
+            }
+            Ok(())
+        }
+
         fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
             let (requested, cancelled, abandoned) = match self.completion {
                 Some(GeneratedSlotCompletion::Transmit) => (1, 0, 0),

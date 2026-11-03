@@ -947,6 +947,23 @@ impl RxFillEngine<'_> {
         self.tx.capacity()
     }
 
+    /// How many handoffs [`Self::submit_tx_batch`] would submit right now:
+    /// `min(TX ring room, TX capacity - in flight)`, or zero while
+    /// draining. One Acquire load of the kernel's TX consumer; nothing is
+    /// reserved or counted. The room only grows until something is
+    /// submitted (the kernel consumes, completions are reaped), so a
+    /// caller that submits at most this many handoffs one by one is not
+    /// blocked. A corrupted ring (the error [`Self::submit_tx_batch`]
+    /// would report as [`TxSubmitError::Ring`]) is returned as is.
+    pub fn tx_submit_room(&self) -> Result<u32, NativeRingError> {
+        if self.state.draining {
+            return Ok(0);
+        }
+        let room = self.tx.free_slots()?;
+        let inflight = u32::try_from(self.state.inflight.free()).expect("bounded by the u32 ring");
+        Ok(room.min(inflight))
+    }
+
     /// In-flight count and the age of the oldest in-flight frame.
     #[must_use]
     pub fn completion_lag(&self) -> CompletionLag {
