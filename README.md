@@ -33,7 +33,9 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
   responder、ICMPv4 Time Exceeded / Destination Unreachable生成、opt-inの
   single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
-  stateful forward firewallと、それらを一workerへbindするfull composition wrapperを扱う。
+  stateful forward firewall、forwardしたDF=0 datagramのfragmentation（MTU2 part B）、受信fragmentを
+  最初のfragmentの判定へ結びつけるfragment association（NAT-FRAG）と、それらを一workerへbindする
+  full composition wrapperを扱う。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
   `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4 → generated fragments`を
   明示budget付きのsingle-worker tickとして実行する。`TickObserver`はtraceとして渡す
@@ -318,14 +320,38 @@ fragmentationの上限とslotを確かめ（拒否は`IPV4_FRAGMENTATION_TOO_MAN
 （省略時64 frame、1〜65536。収まらないsetは丸ごとdrop、`fragmentation.dropped_budget`）の範囲で、
 egressのgenerated sessionにset全体のroomを`check_capacity`で確かめてから（roomが無ければ一枚も送らない。
 AF_XDPとAF_PACKETはARP/ICMP用のrouter reserveをsetに渡さない）、RFC 791どおりのfragment（最後以外は
-8の倍数のdata、同じID、MF/offset、checksum再計算）を送ります。受信fragmentはfirewallが先に拒否し、
-optionsは従来どおり拒否なので再fragmentやoption copyは起きません。
+8の倍数のdata、同じID、MF/offset、checksum再計算）を送ります。受信fragmentもfragment association
+（下）の後にMTUを超えれば再fragmentします（offsetとMFを保つ）。optionsは従来どおり拒否なのでoption copyは起きません。
 
 ```toml
 [fragmentation]                     # 省略時は全項目default（on）。変更はrestart-required
 enabled = true                      # 省略時true（RFC 1812のMUST）。falseはhardeningでIPV4_FRAGMENTATION_REQUIRED
 max-fragments-per-datagram = 1365   # 省略時1365（どのdatagramも収まる最大）、2〜1365
 datagrams = 64                      # 省略時64、1〜1024。1 tickでfragmentできるdatagram数（[tick] rx以上を推奨）
+```
+
+受信したfragment（MFかoffset≠0）はfragment association（NAT-FRAG、RFC 4787 REQ-14）で通します。
+transport headerを持つ最初のfragment（offset 0）だけがfirewallとNATの通常の判定を受け（headerだけを検証し、
+datagram全体を覆うtransport checksumは受信側に任せる）、その書き換え（MAC、変換後のaddress、NAT44-126で
+datagramに一度だけ生成したID、egress）をcore所有の固定長table（key = ingress, source, destination,
+protocol, ID）に記録し、同じdatagramの後続fragmentは同じ書き換えで転送、最初のfragmentが拒否されれば
+`IPV4_FRAGMENT_FIRST_DENIED`です。最初のfragmentより先に届いた後続fragmentはcore所有のheld slotへcopyして
+`IPV4_FRAGMENT_HELD`でbackendへ返し、最初のfragmentの許可で同じtickのfragment phaseから送ります
+（拒否かtimeoutで破棄）。transport headerの中から始まるfragment（RFC 1858/3128）は
+`IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`、decided datagramの二つ目の最初のfragmentは
+`IPV4_FRAGMENT_DUPLICATE_FIRST`、RFC 791の構造違反は`IPV4_FRAGMENT_MALFORMED`、table/held/host上限は
+`IPV4_FRAGMENT_TABLE_FULL`、`HOST_LIMIT`、`HOLD_FULL`、`HOST_HOLD_LIMIT`、`HOLD_TOO_LARGE`です。
+routerのlocal address宛てのfragmentは対象外（reassembly未実装）。apply（SIGHUP reload）で全associationを
+破棄します。fragmentでないframeのfast pathはflags wordの一回の読みだけです。
+
+```toml
+[fragment-tracking]                 # 省略時は全項目default（associate）。変更はrestart-required
+mode = "associate"                  # 省略時associate。"refuse"はhardeningで全fragmentを拒否（FIREWALL_FRAGMENT_UNSUPPORTED）
+entries = 256                       # 省略時256、1〜16384。同時にassociationするdatagram数
+entries-per-host = 32               # 省略時32、1以上。source addressごと
+held-fragments = 64                 # 省略時64、0〜512。最初のfragmentより先に届いた分（[fragmentation] offではholdしない）
+held-per-host = 16                  # 省略時16。source addressごと
+timeout-ms = 5000                   # 省略時5000、100〜60000。最初に見たfragmentから
 ```
 
 EtherTypeを読んだ直後、IPv4/ARPはsnapshot上の正確なingress interfaceを解決し、
@@ -1007,7 +1033,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`を含む）のstorageは58.22 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`を含む）のstorageは62.59 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
@@ -1270,7 +1296,7 @@ directory外の読めるfileへのsymlinkにatomicに置き換えると`stage=re
 directory内へ置くとapply。uid 0では`/etc/shadow`、`/etc/passwd`、`/proc/1/status`、
 `/proc/<pid>/root/etc/shadow`へのsymlinkが全て`PERMISSION_DENIED`。対照として`--fs-confine off`では
 同じ`/etc/passwd`がreadを通る）、
-B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、
+B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、NAT-FRAGのnatfrag phase（firewall on、host Bのkernelがfragmentした3000-byte UDPがNATを通ってhost Aで再構成され、host Aのraw socketから最後のfragmentを先に送ったoutboundもrouterがholdとreleaseしてhost Bで再構成される。`mode = "refuse"`では届かない）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの
