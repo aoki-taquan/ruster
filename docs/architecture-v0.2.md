@@ -494,14 +494,104 @@ fragment: `NFB = (MTU - 20) / 8`、最後以外のdata長は`NFB × 8`、header�
 （ID共通、reserved flag保持、DF=0）にTotal Length、MF（最後以外は1、最後はdatagramのMF）、
 offset（datagramのoffset + data位置/8）を入れ、header checksumを計算し直します。optionsは
 すべてのforwarding pathがdecision前に拒否するので20-byte headerだけを扱い（届いたら
-`IPV4_OPTIONS_UNSUPPORTED`）、最大fragment数は1365（65535 bytesをMTU 68へ）です。stateful
-firewallは受信fragmentをdecision前に拒否するので、production compositionでfragmentの再fragmentは
-起きません（algorithmは単体testで確かめる）。
+`IPV4_OPTIONS_UNSUPPORTED`）、最大fragment数は1365（65535 bytesをMTU 68へ）です。受信fragmentの
+再fragment（offsetとMFを保つ）はNAT-FRAGのfragment association（下）の後にproductionでも起きます。
 
 configは`[fragmentation]`（`enabled` default true、`max-fragments-per-datagram` default 1365、
 `datagrams` default 64）で、policyとslotはstorage shapeの一部（restart-required）です。
 `FullServiceView::with_fragmentation`がruntimeをviewに加え、無いcompositionでは従来どおり
 `IPV4_FRAGMENTATION_REQUIRED`です。
+
+### fragment association（NAT-FRAG、RFC 4787 REQ-14、RFC 1858、RFC 3128）
+
+transport header（port、TCP flags、ICMP identifier）を持つのはdatagramの最初のfragment（offset 0）
+だけなので、NATとstateful firewallはそれでしか判定できません。RFC 4787 REQ-14はNATに
+in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの大きなDNS応答、UDP tunnel、
+自分でfragmentするhost）も必要とします。そこでcoreの`Ipv4FragmentTracker`
+（`ipv4_fragment_tracking.rs`）が、最初のfragmentの判定を同じdatagramの後続fragmentへ引き継ぎます。
+
+- **key**: 受信したままの(ingress, source, destination, protocol, ID)。RFC 791 §3.2のreassembly key
+  にingressを加え、別interfaceから届いたfragmentが他のdatagramの判定に乗らないようにします。
+  keyed SipHash（publicationのresolution keyを別domain `Ipv4FragmentAssociation`で使う）の
+  fixed directoryで引き、per-sourceの数は`Ipv4FragmentHost` domainのもう一つのdirectoryで数えます。
+- **最初のfragment**（MF=1、offset 0）: `forward_batch_tracked`がdecisionの前に
+  `admit_first_fragment`でL2/IPv4 ingressの検査、RFC 791の構造（MF付きのdataは8の倍数）と
+  tableのroom（空きentry、`entries-per-host`）を確かめます（何も変えない。拒否は
+  `IPV4_FRAGMENT_TABLE_FULL`/`HOST_LIMIT`）。decided datagramへの二つ目の最初のfragmentは
+  `IPV4_FRAGMENT_DUPLICATE_FIRST`で、byte一致（長さと全dataのFNV-1a fingerprint）の重複ならそれだけを捨て、
+  それ以外はentryをpoisonします（下の「同じkeyの二つのdatagram」）。
+  その後は通常の`decide`を`ValidatedIpv4::first_fragment = true`で通し、firewallとNATのvalidatorは
+  header（UDP 8、ICMP query 8、TCPはdata offset分のoptionsまで）だけを検証し、datagram全体を覆う
+  transport checksumとUDP lengthの上限は見ません（UDP lengthはfragmentのdataより長くなければならない）。
+  headerがfragmentに収まらなければ（tiny fragment、RFC 1858 §3.1）通常のheader truncatedで拒否です。
+  firewall plan、NAT plan、MTU判定、frame書き換え、ID生成（NAT44-126。fragmentはnon-atomicなので
+  DFの有無によらず生成し、datagramに一度だけ）の後、書き換えたframeからtemplate
+  （egress、Ethernet destination/source、変換後source/destination、ID、transport header長）を
+  読み、NAT/firewallのcommitと同じ点でentryを`Allow`にします。どの理由で落ちても（consumeも）
+  entryは`Deny`です。
+- **後続fragment**（offset≠0）: `decide_later_fragment`がL2/IPv4 ingress、options、構造、
+  protocolの最小header内から始まらないこと（TCPはoffset 1と2、RFC 1858 §3.2）を確かめてtableを
+  引きます。`Allow`ならtemplateのheader長の内から始まらないことを確かめ（`IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`）、
+  TTL > 1なら（non-initial fragmentにはICMP errorを出さない、RFC 1812 §4.3.2.7）
+  `PacketDecision::FragmentFollow`としてMAC、ID、address、TTL - 1を書きheader checksumを計算し直して
+  通常のcommit経路（`check_egress_mtu`によるMTU判定と再fragment、FWD-012）へ渡します。firewall
+  stateとNAT stateは最初のfragmentがcommit済みで、後続は触りません。`Deny`なら
+  `IPV4_FRAGMENT_FIRST_DENIED`。
+- **out-of-order**（選択肢(a) bounded buffering）: entryが無いかpendingなら、frame（Ethernet header +
+  Total Length bytes、paddingなし）をcore所有のheld slotへcopyしてentryをpendingにし、受信frameは
+  `ConsumeReason::Ipv4FragmentHeld`でbackendへ返します（backend所有bufferはcommitかrecycleの契約の
+  まま）。最初のfragmentが許可されると、`commit_allow`がheld fragmentをtemplateで書き換えて
+  （TTL、overlap、DF付きのMTU超過、slot不足は捨てて`release_dropped`）MTU2 part Bの
+  fragmentation slotへstageし（`Ipv4FragmentationRuntime::plan_forward`: MTU以下は一frameのまま、
+  超過かつDF=0はRFC 791で再fragment）、同じtickの`TickPhase::GeneratedFragments`が送ります
+  （`fragmentation.whole`）。新しいtick phaseもbackend APIも要りません。最初のfragmentが拒否されれば
+  heldは捨てます（`held_denied`、そのdataはdatagramの終端の計算に入る）。
+  (b) virtual reassembly（全fragmentをholdしてから判定・転送）は採りませんでした: in-orderの大半の
+  datagramまでholdしてmemoryとlatencyを払い、最大datagram 65535 bytes分のslotが要ります。(a)は
+  順序の崩れた分だけをholdし、in-orderは一つもcopyしません。(c) dropはREQ-14のMUSTに反します。
+  `[fragmentation] enabled = false`ではheld slotを持たず（releaseの出口が無い）、先に届いた後続
+  fragmentは`IPV4_FRAGMENT_HOLD_FULL`です。
+- **同じkeyの二つのdatagram**（review #337 M-A）: keyはportを含まないので、失われたfragmentの後に
+  IDを再利用したdatagramや、一つのpublic addressの裏の二hostへserverが同じIDで返す応答は一つの
+  keyになります。二つ目の別の最初のfragmentはentryをpoison（Denyに固定し早期解放しない）し、両
+  datagramの残りを全て拒否します（fail closed。templateとIDを他のdatagramへ流用しない）。
+- **完了判定**（review #337 M-B）: entryは最大4つの離れたdata範囲を保ち（RFC 815のhole listの裏返し、
+  重複とoverlapは一度だけ数える）、0から終端までを覆った時だけ早期解放します。終端はMF=0の最初の
+  fragmentで固定し、別の終端や終端を越えるdataは`IPV4_FRAGMENT_MALFORMED`でpoisonします。5つ以上に
+  分かれたdatagramはtimeoutまで解放しません。
+- **bounds**: entry数（`entries`）、(ingress, source)ごとのentry（`entries-per-host`）、held数
+  （`held-fragments`）、(ingress, source)ごとのheld（`held-per-host`）。tableかhostのquotaが満ちると
+  そのscope（host、ingress、table）の古いentryからevictします: pending/denyが先（hostとingressは
+  最古の8件、tableはevict listの先頭）、無ければscope最古のallow entryがtimeoutの1/5（default 1 s）
+  停滞していればそれ。後続を転送するのはallow templateだけなので、pending/denyのevictは後続を拒否か新しい
+  holdにするだけです。mappingを持つpeerを詐称した最初のfragmentはreturn trafficとして許可されallow entryに
+  なるので（re-review M-D）、さらに一つのingressのentryをtableの`ingress-share-percent`（default 50）までに
+  制限し、あるinterfaceのfloodが他のinterfaceのdatagramのentryを取れないようにします
+  （`IPV4_FRAGMENT_INGRESS_LIMIT`）。held slotが尽きるとholdを持つ最古のpendingをevictし、一datagramの
+  holdは16までです。`run_tick`は毎tick最大4件をsweepしてoccupancyとexpiry counterを進めます。held slotの長さ（fragmentation slotと同じ。
+  超過は`IPV4_FRAGMENT_HOLD_TOO_LARGE`、production portからは起きない）。entryは最初に見たfragmentから
+  `timeout-ms`で失効し延長しません。全entryの寿命が同じなので作成順に失効し、age list（entryに
+  intrusiveなdoubly-linked list）の先頭から失効させるだけでscanはありません（操作ごとに最大2件、
+  roomが要る時に1件）。最後のfragmentまでの全data byteが通ったentryはその場で解放します
+  （`entries_completed`）。fragmentでないframeのfast pathはflags wordの一回の読みだけで、
+  allocation、lock、packet clone、per-packet `String`、`dyn`はありません。fragmentの処理は全て
+  `#[cold]`の関数です。
+- **routerのlocal address**: ingressのlocal address宛て（NAT public address以外）のfragmentは
+  associationせず、従来どおりlocal path（reassembly未実装、ICMP4-006）です。
+- **publication**: templateは旧publicationのegressとneighbor MACを持つので、applyで全entryと
+  held fragmentを捨て（`entries_flushed`/`held_flushed`）、successorのresolution keyでrekeyします。
+  tableはNAT/firewallのstate構造から独立したruntimeで、reload時のstate carry（別slice）は運びません。
+  policyとstorageはshapeの一部（restart-required）。
+- **hardening switch**: `[fragment-tracking] mode = "refuse"`はtableを持たず、NAT-FRAG前どおり全受信
+  fragmentを拒否します（`FIREWALL_FRAGMENT_UNSUPPORTED`が先）。
+
+残余: spoof可能なsourceによるheld slotの占有とpending entryのevict（global上限が最後の防御、timeoutの間だけ）、
+pending entryはheld fragmentがどのdatagramのものか区別できない、allow entryはfirewall stateの終了や
+MAC変更の後もtimeoutまで残る、IDを当てた
+第三者による後続fragmentの注入（header外のdataのみ。stateless routerと同じで受信側の再構成と
+checksumが検出）、翻訳するICMPv4 errorのfragmentは引き続き拒否、releaseはtemplateのMACを再解決しない、
+R16Aのfragment targetは無い（io-simのbounded property testで代替）、multi-workerではworker間で
+tableを共有しない（flow affinityが要る）。
 
 ## ARP control scope
 
@@ -628,8 +718,9 @@ dropせず、IPv4 flags/fragment wordをNAT rewrite後のwireへそのまま保�
 
 NAT44（UDP、TCP、ICMP query、翻訳するICMPv4 error、hairpin）はMF=0/offset=0の完全な
 datagramをDFの有無によらず変換します（NAT44-008。Windowsは非fragmentのUDPをDF=0で送る）。
-fragmentは従来どおり`NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`などのtyped dropで、fragment変換
-（RFC 4787 REQ-14）はNAT-FRAG sliceへdeferredです（NAT44-018）。
+fragment（RFC 4787 REQ-14）はNAT-FRAGのfragment association（上）で変換します（NAT44-018）。
+最初のfragmentもnon-atomicとしてIDを生成し、templateで全後続fragmentへ同じIDを与えます。tableの
+無いcompositionでは従来どおり`NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`などのtyped dropです。
 
 RFC 6864 §5.3.1はaddress-sharing deviceに、変換したdatagramのIDをsourceと同じ規則
 （non-atomicは(source, destination, protocol)ごとにMDL内で一意、§4.3）に従わせ、address/protocolを
@@ -664,7 +755,7 @@ inboundのDF=0 datagramを小さいLAN MTUへfragmentするので、これはins
 特別扱いはしません: 必要な速度は再構成時間30 s内に約9 Mppsでsingle workerの転送能力を超え、
 UDP/TCP checksumも大半を検出します（NAT44-126 (7)）。
 
-fragment handling/reassembly、static port forward、複数public address、port randomization/parity、minimal
+local reassembly、static port forward、複数public address、port randomization/parity、minimal
 stateful sliceを越えるfull packet filterはdeferredです。RFC 3022/4787/7857の全機能準拠は
 主張しません。
 
@@ -739,7 +830,7 @@ traditional NAT domain境界はprotocol非依存です。設定済みoutside→i
 private sourceや外部から内部へのbypassを許可しません。runtime/config/snapshot mismatchはneighbor処理やstate変更より前にtyped dropします。
 inside発のpublic address宛てUDP/TCPは後述の「NAT44 hairpinning」で扱います。
 
-TCP fragment association/reassembly、static forwards、sequence/window validation（RSTのin-window検査を含む）、
+static forwards、sequence/window validation（RSTのin-window検査を含む）、
 NATからのkeep-alive probe（RFC 6146 ESTABLISHED満了時のSHOULD）はdeferredです。
 
 ### TCP session phases and timers（N1、RFC 5382 REQ-5、RFC 7857 §2）
@@ -1490,9 +1581,10 @@ Mask、ICMP-only NAT、fragmentはdeferred（NAT44-117）です。
 firewallはopt-inの追加serviceであり、既存`forward_batch*` APIとdefault forwardingを変更
 しません。`forward_batch_with_firewall`はplain forwarding、combined APIはUDP/TCP NAT44と
 同じworker-local RX transactionで合成します。対象はrouterを通過するunfragmented IPv4
-UDP/TCPだけです。ARP、ingress-scoped router-local IPv4、RX phase後に実行するrouter-originated
-generated packetはfirewall domain外です。options、MF、nonzero fragment offset、
-TCP/UDP以外のforward protocolはsilent typed dropで、ICMP/RSTを生成しません。
+UDP/TCPと、fragment association（NAT-FRAG、上の「fragment association」）が受理した最初の
+fragmentです（後続fragmentはその判定に従う）。ARP、ingress-scoped router-local IPv4、RX phase後に実行するrouter-originated
+generated packetはfirewall domain外です。options、tableの無いcompositionのMF、nonzero fragment
+offset、TCP/UDP以外のforward protocolはsilent typed dropで、ICMP/RSTを生成しません。
 RFC 791のfragment fieldsでMF=0/offset=0なら、DF=0とDF=1のどちらもunfragmented datagram
 として許可します。RFC 1812 §4.2.2.3に従いreserved flagはfragment判定からmaskし、単独では
 dropせずforward wireへ保存します。reserved flagとMF/offsetが同時にある場合は、MF/offsetを

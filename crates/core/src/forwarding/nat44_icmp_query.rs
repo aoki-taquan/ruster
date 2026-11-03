@@ -119,7 +119,9 @@ pub(super) fn validate_icmp_query(
     if icmp[1] != 0 {
         return Err(IcmpQueryError::CodeInvalid);
     }
-    if crate::internet_checksum(icmp) != 0 {
+    // A first fragment admitted by the association table (NAT-FRAG) holds
+    // the header but not the whole message the checksum covers.
+    if !ipv4.first_fragment && crate::internet_checksum(icmp) != 0 {
         return Err(IcmpQueryError::ChecksumInvalid);
     }
     Ok(ValidatedIcmpQuery {
@@ -135,8 +137,13 @@ pub(super) fn validate_icmp_query(
 /// sends Echo Requests with DF clear (NAT44-116). The reserved flag is
 /// ignored and preserved; a DF-clear query gets a generated IPv4 ID after
 /// translation (NAT44-126), a DF-set one keeps its ID.
+///
+/// A first fragment the association table admitted (NAT-FRAG) is translated
+/// too: its later fragments follow its translation.
 fn unfragmented(frame: &[u8], ipv4: packet::ValidatedIpv4) -> bool {
-    packet::read_u16(frame, ipv4.header_offset + 6).is_some_and(|flags| flags & 0x3fff == 0)
+    packet::read_u16(frame, ipv4.header_offset + 6).is_some_and(|flags| {
+        flags & 0x3fff == 0 || (ipv4.first_fragment && flags & 0xbfff == 0x2000)
+    })
 }
 
 const fn nat_reason(error: IcmpQueryError) -> DropReason {

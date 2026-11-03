@@ -143,9 +143,11 @@ tx = [
   { interface = "lan", frame = { kind = "icmp-echo", eth = { src = "02:00:00:00:00:01", dst = "02:00:00:00:00:10" }, ip = { src = "198.51.100.20", dst = "192.168.1.10", id = 36674, df = false, ttl = 63 }, op = "reply", id = 40007, seq = 1, payload-ascii = "ping-1" } },
 ]
 
-# --- 6. A fragment (MF) stays refused, before any state: the firewall
+# --- 6. With `[fragment-tracking] mode = "refuse"` (the hardening switch,
+# NAT-FRAG) a fragment (MF) is refused before any state: the firewall
 # validates first (FIREWALL_FRAGMENT_UNSUPPORTED); without the firewall it
-# would be NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED (NAT-FRAG, deferred).
+# would be NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED. The default (`associate`)
+# translates it (fixtures/natfrag).
 [[step]]
 kind = "inject"
 interface = "lan"

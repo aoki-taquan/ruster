@@ -4,12 +4,12 @@
 use ruster_core::{
     dispatch_host_unreachable_failures, dispatch_nat44_tcp_unsolicited_syns,
     execute_one_arp_request, execute_one_icmpv4_error, execute_one_ipv4_fragmentation,
-    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation,
+    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking,
     poll_resolution_timers, ArpRequestBuildError, BatchReport, ExecuteArpRequestError,
     ExecuteIcmpv4Error, FirewallConfig, FirewallRuntime, ForwardingSnapshot,
     GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo, GeneratedTraceSink,
-    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, Ipv4FragmentationRuntime, MonotonicMillis,
-    Nat44IcmpConfig, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpRuntime,
+    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, Ipv4FragmentTracker, Ipv4FragmentationRuntime,
+    MonotonicMillis, Nat44IcmpConfig, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpRuntime,
     Nat44TcpUnsolicitedSynDispatchError, Nat44UdpConfig, Nat44UdpRuntime, PacketIo,
     PublicationQuiescence, PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
     ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
@@ -242,6 +242,9 @@ pub struct FullServiceView<'view, 'storage> {
     /// Optional IPv4 fragmentation (MTU2 part B); see
     /// [`FullServiceView::with_fragmentation`].
     fragmentation: Option<&'view mut Ipv4FragmentationRuntime<'storage>>,
+    /// Optional IPv4 fragment association (NAT-FRAG); see
+    /// [`FullServiceView::with_fragment_tracking`].
+    fragment_tracking: Option<&'view mut Ipv4FragmentTracker<'storage>>,
 }
 
 impl<'view, 'storage> FullServiceView<'view, 'storage> {
@@ -288,7 +291,23 @@ impl<'view, 'storage> FullServiceView<'view, 'storage> {
             nat44_icmp: Nat44IcmpServiceView::default(),
             firewall,
             fragmentation: None,
+            fragment_tracking: None,
         }
+    }
+
+    /// Adds IPv4 fragment association (NAT-FRAG, RFC 4787 REQ-14) to the
+    /// view: the first fragment of a datagram gets the firewall and NAT
+    /// decision and the later fragments follow it; a later fragment that
+    /// arrives first is held and, once released, sent through the
+    /// fragmentation slots in [`TickPhase::GeneratedFragments`]. Without it
+    /// every received fragment is refused.
+    #[must_use]
+    pub fn with_fragment_tracking(
+        mut self,
+        fragment_tracking: &'view mut Ipv4FragmentTracker<'storage>,
+    ) -> Self {
+        self.fragment_tracking = Some(fragment_tracking);
+        self
     }
 
     /// Adds IPv4 fragmentation (MTU2 part B, RFC 1812 §4.2.2.7) to the view:
@@ -1166,6 +1185,7 @@ where
         nat44_icmp,
         firewall,
         mut fragmentation,
+        mut fragment_tracking,
     } = view;
     let Nat44IcmpServiceView {
         config: icmp_config,
@@ -1189,11 +1209,17 @@ where
     if let Some(runtime) = fragmentation.as_deref_mut() {
         runtime.set_tick_frame_budget(budgets.generated_fragments);
     }
+    // NAT-FRAG: a bounded expiry sweep each tick keeps the association
+    // table's occupancy and expiry counters current without traffic (four
+    // entries at most; O(1) when nothing is due).
+    if let Some(tracker) = fragment_tracking.as_deref_mut() {
+        tracker.sweep(now.0, 4);
+    }
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {
         Ok(batch) => {
             let report =
-                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation(
+                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking(
                     batch,
                     &snapshot,
                     resolution,
@@ -1207,6 +1233,7 @@ where
                     firewall.as_deref_mut(),
                     None,
                     fragmentation.as_deref_mut(),
+                    fragment_tracking,
                     now,
                     trace,
                 );
@@ -1443,6 +1470,7 @@ mod tests {
                 },
                 nat44_icmp: Nat44IcmpServiceView::default(),
                 fragmentation: None,
+                fragment_tracking: None,
                 firewall: FirewallServiceView {
                     config: self.firewall_config,
                     runtime: None,

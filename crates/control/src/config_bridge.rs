@@ -22,11 +22,11 @@ use ruster_core::{
 };
 
 use crate::publication::{
-    FirewallPublicationInput, FragmentationStoragePlan, FullServiceStorageShape,
-    Icmpv4ErrorStorageShape, Nat44IcmpPublicationInput, Nat44IcmpStoragePlan,
-    Nat44TcpPublicationInput, Nat44TcpStoragePlan, Nat44UdpPublicationInput, Nat44UdpStoragePlan,
-    PublicationCandidateError, PublicationPlan, ResolutionStorageShape, RuntimeService,
-    ValidatedCandidate,
+    FirewallPublicationInput, FragmentTrackingStoragePlan, FragmentationStoragePlan,
+    FullServiceStorageShape, Icmpv4ErrorStorageShape, Nat44IcmpPublicationInput,
+    Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan, Nat44UdpPublicationInput,
+    Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan, ResolutionStorageShape,
+    RuntimeService, ValidatedCandidate,
 };
 
 /// How a [`PublicationKeySource`] obtains its keys.
@@ -311,6 +311,9 @@ impl ConfigBridgeError {
             Self::MissingService(RuntimeService::Firewall) => "MISSING_SERVICE_FIREWALL",
             Self::MissingService(RuntimeService::Nat44Icmp) => "MISSING_SERVICE_NAT44_ICMP",
             Self::MissingService(RuntimeService::Fragmentation) => "MISSING_SERVICE_FRAGMENTATION",
+            Self::MissingService(RuntimeService::FragmentTracking) => {
+                "MISSING_SERVICE_FRAGMENT_TRACKING"
+            }
             Self::KeySource(_) => "KEY_SOURCE",
             Self::Candidate(_) => "CANDIDATE",
         }
@@ -469,6 +472,17 @@ pub(crate) fn required_services(
         .with_session_host_slots(tcp_shape.session_hosts),
         firewall_states,
     );
+    let tracking = config.fragment_tracking();
+    let shape = match tracking.policy().zip(tracking.storage()) {
+        Some((policy, storage)) => shape.with_fragment_tracking(FragmentTrackingStoragePlan::new(
+            policy,
+            storage.entries,
+            storage.buckets,
+            storage.held,
+            storage.held_slot_bytes,
+        )),
+        None => shape,
+    };
     let fragmentation = config.fragmentation();
     let shape = match fragmentation.storage() {
         Some(slots) => shape.with_fragmentation(FragmentationStoragePlan::new(

@@ -9,6 +9,7 @@ mod generated;
 mod icmpv4_error;
 mod icmpv4_translated_limit;
 mod io;
+mod ipv4_fragment_tracking;
 mod ipv4_fragmentation;
 mod nat44;
 mod nat44_host_quota;
@@ -62,6 +63,7 @@ pub use forwarding::{
     forward_batch_with_nat44_udp_and_tcp_and_firewall_and_icmpv4_errors_audited,
     forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors,
+    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_icmpv4_errors,
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
@@ -94,6 +96,15 @@ pub use io::{
     BatchCompletion, ConsumeReason, PacketBatch, PacketIo, PacketLease, PacketSlot,
     PublicationQuiescence, PublicationQuiescenceDisposition, PublicationQuiescenceGuard,
     PublicationQuiescenceWitness, SlotCompletion,
+};
+pub use ipv4_fragment_tracking::{
+    ipv4_fragment_tracking_buckets, Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot,
+    Ipv4FragmentHostSlot, Ipv4FragmentTracker, Ipv4FragmentTrackingCounters,
+    Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError, Ipv4FragmentTrackingStorage,
+    Ipv4FragmentTrackingStorageError, IPV4_FRAGMENT_TRACKING_DEFAULT_INGRESS_SHARE_PERCENT,
+    IPV4_FRAGMENT_TRACKING_DEFAULT_TIMEOUT_MS, IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM,
+    IPV4_FRAGMENT_TRACKING_MAX_INGRESSES, IPV4_FRAGMENT_TRACKING_MAX_TIMEOUT_MS,
+    IPV4_FRAGMENT_TRACKING_MIN_TIMEOUT_MS,
 };
 pub use ipv4_fragmentation::{
     execute_one_ipv4_fragmentation, ipv4_fragment_slot_bytes, GeneratedIpv4FragmentReport,

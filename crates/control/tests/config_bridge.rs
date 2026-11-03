@@ -2,14 +2,15 @@ use std::num::NonZeroU64;
 
 use ruster_config::{parse, validate, ValidatedConfig, ValidatedConfigV1, ValidationLimits};
 use ruster_control::{
-    candidate_from_config, ConfigBridgeError, FragmentationStoragePlan, FullServiceStorageShape,
-    Icmpv4ErrorStorageShape, KeySourceError, KeySourceKind, Nat44TcpStoragePlan,
-    Nat44UdpStoragePlan, PublicationKeySource, PublicationKeys, ResolutionStorageShape,
-    RuntimeService, SimDeterministicKeySource, SuccessorError, ValidatedCandidate,
+    candidate_from_config, ConfigBridgeError, FragmentTrackingStoragePlan,
+    FragmentationStoragePlan, FullServiceStorageShape, Icmpv4ErrorStorageShape, KeySourceError,
+    KeySourceKind, Nat44TcpStoragePlan, Nat44UdpStoragePlan, PublicationKeySource, PublicationKeys,
+    ResolutionStorageShape, RuntimeService, SimDeterministicKeySource, SuccessorError,
+    ValidatedCandidate,
 };
 use ruster_core::{
-    FirewallHashKey, IfId, Ipv4Address, Ipv4FragmentationPolicy, Nat44TcpHashKey, Nat44UdpHashKey,
-    ResolutionHashKey,
+    FirewallHashKey, IfId, Ipv4Address, Ipv4FragmentTrackingPolicy, Ipv4FragmentationPolicy,
+    Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey,
 };
 
 const SIM_SEED: u64 = 0x5eed_0bad_cafe_f00d;
@@ -254,6 +255,15 @@ fn config_bridge_builds_candidates_and_rejects_missing_services() {
         // `[fragmentation]` absent: on, 64 slots of 14 + 3826 bytes.
         .with_fragmentation(FragmentationStoragePlan::new(
             Ipv4FragmentationPolicy::DEFAULT,
+            64,
+            3840
+        ))
+        // `[fragment-tracking]` absent: `associate`, 256 entries, 64 held
+        // fragments of a fragmentation slot's size (NAT-FRAG).
+        .with_fragment_tracking(FragmentTrackingStoragePlan::new(
+            Ipv4FragmentTrackingPolicy::new(5000, 32, 16).unwrap(),
+            256,
+            256,
             64,
             3840
         ))

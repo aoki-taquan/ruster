@@ -78,6 +78,11 @@ pub(crate) enum DirectoryHashDomain {
     /// IPv4 Identification of a translated non-atomic datagram (MTU2,
     /// RFC 6864 §5.3.1), keyed by the NAT runtime key in this domain.
     Ipv4Identification = 0x4e41_5434_4950_4944,
+    /// Fragment association entries (NAT-FRAG), keyed by the resolution
+    /// key in this domain.
+    Ipv4FragmentAssociation = 0x4950_4652_4153_534f,
+    /// Per-source accounting of the fragment association table (NAT-FRAG).
+    Ipv4FragmentHost = 0x4950_4652_484f_5354,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]

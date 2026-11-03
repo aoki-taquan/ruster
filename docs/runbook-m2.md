@@ -60,7 +60,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  58.22 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  63.53 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -209,7 +209,7 @@ whole-document storage, which has no path.
 |---|---|---|---|
 | quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 592, and 592 bytes), so the bound is memory: at 65536 these three alone would need 115.0 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 58.22 MiB (with `[fragmentation] datagrams = 1024`, MTU2 part B; 64.00 MiB with `mappings-per-host` set on both NAT44 protocols and only 12 fragmentation slots, N3, and 63.97 MiB with only `sessions-per-host`, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 63.53 MiB (with `[fragmentation] datagrams = 1024`, MTU2 part B, and `[fragment-tracking] entries = 16384, held-fragments = 512`, NAT-FRAG; 64.00 MiB with `mappings-per-host` set on both NAT44 protocols, only 12 fragmentation slots, and `[fragment-tracking] mode = "refuse"`, N3, and 63.97 MiB with only `sessions-per-host` and `mode = "refuse"`, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -310,7 +310,10 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-61042880 bytes (58.22 MiB). MTU2 part B added 1024 fragmentation slots
+66617536 bytes (63.53 MiB). NAT-FRAG added the largest fragment association
+table (16384 entries of an entry, a host slot, and two directory buckets
+and nodes, and 512 held fragments of 8 + 3840 bytes: 5.32 MiB; 61042880
+bytes, 58.22 MiB, before). MTU2 part B added 1024 fragmentation slots
 of 12 + 3840 bytes (3.76 MiB; 57098432 bytes, 54.45 MiB, before). MTU1 grew the ICMPv4 error action slot from 584
 to 592 bytes (the Next-Hop MTU of Fragmentation Needed, 32 KiB at the limit;
 57065664 bytes, 54.42 MiB, before). N1 grew the TCP NAT mapping slot from 64 to 80
@@ -327,7 +330,7 @@ raised states, actions, dynamic neighbors, and ICMPv4 error states to
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (58.22 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (63.53 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -710,16 +713,15 @@ VPNs) without DF; before MTU2 the NAT dropped all of it as
   destination, protocol): one host sending about 2.2 kpps of DF-clear
   datagrams to one destination makes that sequence wrap within 30 s; there
   is no per-host rate limit yet.
-- Fragments (MF set or a nonzero offset) are still dropped:
-  `drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED`,
+- Fragments (MF set or a nonzero offset) are translated through the
+  fragment association table (NAT-FRAG, "Fragments through the firewall and
+  the NAT" below). With `[fragment-tracking] mode = "refuse"` they are
+  dropped as before: `drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED`,
   `drop.NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED`,
   `drop.NAT44_ICMP_FRAGMENT_UNSUPPORTED`,
   `drop.NAT44_ICMPV4_QUOTED_FRAGMENT_UNSUPPORTED`, or, with the firewall,
-  `drop.FIREWALL_FRAGMENT_UNSUPPORTED` first. The codes and their names are
-  unchanged, but `*_NON_ATOMIC_IPV4_*` now counts only fragments.
-  Translating fragments (RFC 4787 REQ-14) is the later NAT-FRAG slice
-  (NAT44-018). A sender whose datagrams are larger than the path MTU should
-  use PMTUD (DF) or a smaller MTU.
+  `drop.FIREWALL_FRAGMENT_UNSUPPORTED` first (`*_NON_ATOMIC_IPV4_*` counts
+  only fragments).
 - A DF-clear datagram larger than the egress MTU is fragmented after the
   translation (MTU2 part B, below); every fragment carries the generated
   ID.
@@ -780,9 +782,9 @@ DF (that gets Fragmentation Needed, above).
   DF clear, MF on all but the last (the last keeps the datagram's own MF),
   and the offset of their data; the header checksum is computed for each.
   Bytes after the IPv4 Total Length (link padding) are not sent.
-- Received fragments are refused by the firewall before any decision
-  (`drop.FIREWALL_FRAGMENT_UNSUPPORTED`), so the router does not
-  re-fragment fragments in production; IPv4 options are refused as before
+- Received fragments that the fragment association table forwards (NAT-FRAG,
+  below) are fragmented again when they are above the egress MTU (offsets
+  and MF kept); IPv4 options are refused as before
   (`IPV4_OPTIONS_UNSUPPORTED`).
 - Cost: the fast path is unchanged (one compare against the MTU). A
   fragmented datagram is copied twice (into its slot, then into its
@@ -875,7 +877,7 @@ fragmented and create NAT mappings and firewall state like any forwarded
 datagram; expect that counter to fall to 0 and `consume.IPV4_FRAGMENTED`
 and `generated_fragments.*` to grow. The default slots add 246528 bytes of
 runtime storage (`storage-bytes`; the maximal production config with
-`datagrams = 1024` is 61042880 bytes). A config with every table at its
+`datagrams = 1024` was 61042880 bytes before NAT-FRAG). A config with every table at its
 production limit and `mappings-per-host` on both NAT44 protocols now needs
 67306432 bytes with the default 64 slots and fails with
 `RUNTIME_STORAGE_BYTES_EXCEEDED` (64 MiB); set `[fragmentation] datagrams`
@@ -886,7 +888,185 @@ to at most 12, or size a table down. New `[tick] generated-fragments`
 `IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE`, 189
 `IPV4_FRAGMENTATION_OFFSET_OVERFLOW`; new consume code `IPV4_FRAGMENTED`;
 new stats sections `fragmentation.*` and `generated_fragments.*`. To keep
-the MTU1 behaviour set `[fragmentation] enabled = false` (restart).
+the MTU1 behaviour set `[fragmentation] enabled = false` (restart). Since
+#335, while fragmentation is enabled, a config whose AF_XDP
+`generated-frames` or AF_PACKET TX ring is under 4 frames fails validation
+with `FRAGMENTATION_BACKEND_ROOM_TOO_SMALL`.
+
+### Fragments through the firewall and the NAT (NAT-FRAG)
+
+Only the first fragment of an IPv4 datagram (offset 0) carries the UDP,
+TCP, or ICMP header, so the firewall and the NAT can only decide on it.
+With the default `[fragment-tracking] mode = "associate"` the router keeps
+a bounded association table (RFC 4787 REQ-14: a NAT must receive in-order
+and out-of-order fragments):
+
+- The first fragment gets the normal firewall rules and NAT translation on
+  its header (the header must be whole in that fragment; the transport
+  checksum covers the whole datagram and is left to the receiver). The
+  table records how it left: egress, MACs, translated addresses, and the
+  IPv4 ID the NAT generated for the datagram (once; every fragment of one
+  datagram carries it).
+- Every later fragment of the same datagram (same ingress, source,
+  destination, protocol, and ID) is forwarded with that rewrite (TTL - 1);
+  if the first fragment was refused, so is the rest
+  (`drop.IPV4_FRAGMENT_FIRST_DENIED`). Fragments of plain routed traffic
+  (no NAT) keep their addresses and ID.
+- A later fragment that arrives before the first one is copied into a held
+  slot and the frame is returned (`consume.IPV4_FRAGMENT_HELD`). When the
+  first fragment is allowed, the held ones are rewritten and sent in the
+  same tick through the fragmentation slots (`fragmentation.whole`, or cut
+  again when above the egress MTU); when it is refused or does not come
+  within `timeout-ms`, they are discarded (`fragment_tracking.held_denied`,
+  `fragment_tracking.held_expired`).
+- A forwarded fragment above the egress MTU is fragmented again like any
+  DF-clear datagram (`fragmentation.*`), with the same generated ID.
+- Refused as attacks on the transport header (RFC 1858, RFC 3128): a first
+  fragment too short for its header (the usual
+  `drop.FIREWALL_*_HEADER_TRUNCATED`, then the rest is
+  `IPV4_FRAGMENT_FIRST_DENIED`), a later fragment that starts inside the
+  header (`drop.IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`; for TCP offsets 8
+  and 16 always), a second first fragment of a decided datagram
+  (`drop.IPV4_FRAGMENT_DUPLICATE_FIRST`), and fragments that break RFC 791
+  (`drop.IPV4_FRAGMENT_MALFORMED`: no data, MF with data not a multiple of
+  8, data past 65515 bytes, or an end that contradicts the datagram's).
+- Two datagrams with one key: the key has no ports, so an ID reused after
+  a lost fragment, or a server answering two inside hosts with the same ID,
+  share it. A second first fragment that is not a byte-identical duplicate
+  (same length and a fingerprint of all its data) poisons the association: every
+  remaining fragment of both datagrams is refused
+  (`fragment_tracking.poisoned`, `drop.IPV4_FRAGMENT_FIRST_DENIED`), so a
+  receiver never gets one datagram's fragments under the other's
+  translation or ID. A byte-identical duplicate is dropped alone
+  (`fragment_tracking.duplicate_first`). A fragment that contradicts the
+  datagram's end (fixed by its first fragment with MF clear) poisons it too.
+- An association is freed early once every data byte from 0 to the end was
+  seen (duplicates and overlaps count once; a datagram in more than four
+  separate pieces at a time waits for the timeout).
+- Fragments addressed to the router's own addresses (other than the NAT
+  public address) are not associated: the router does not reassemble
+  (ICMP4-006, `drop.ICMPV4_FRAGMENT_UNSUPPORTED` for a fragmented ping).
+  Fragmented ICMP errors through the NAT stay refused.
+
+```toml
+[fragment-tracking]
+mode = "associate"     # default; "refuse" = hardening (every fragment dropped)
+entries = 256          # default 256, 1..=16384; datagrams associated at once
+entries-per-host = 32  # default 32, >= 1; per source address
+held-fragments = 64    # default 64, 0..=512; fragments held before their first
+held-per-host = 16     # default 16; per source address (0 = hold none)
+timeout-ms = 5000      # default 5000, 100..=60000; from the first fragment seen
+ingress-share-percent = 50  # default 50, 1..=100; most of the table one interface takes
+```
+
+The table is swept each tick (at most four expired associations), so the
+occupancy and the expiry counters stay current without traffic.
+
+Tuning:
+
+- `entries` bounds the datagrams in flight at once; an entry is freed as
+  soon as every byte up to the last fragment has passed, otherwise after
+  `timeout-ms`. One ingress interface may take at most
+  `ingress-share-percent` of the table (default 50; with three or more
+  interfaces use about 100/n): a flood arriving on the WAN cannot take the
+  entries of LAN-originated datagrams (`drop.IPV4_FRAGMENT_INGRESS_LIMIT`).
+  When the table, an ingress's share, or one (ingress, source)'s
+  `entries-per-host` is full, an old association of that scope is evicted
+  (`fragment_tracking.entries_evicted`, `held_evicted`): a pending or
+  refused one first, else one that allows a datagram that has stalled for a
+  fifth of `timeout-ms` (1 s by default; a datagram's fragments arrive
+  within milliseconds). Only then is a new one refused
+  (`drop.IPV4_FRAGMENT_TABLE_FULL`, `IPV4_FRAGMENT_INGRESS_LIMIT`,
+  `IPV4_FRAGMENT_HOST_LIMIT`). Sizing: one entry per fragmented datagram in
+  flight, plus one for every datagram that lost a fragment, for
+  `timeout-ms`; a busy NAT with fragmented traffic and some loss (for
+  example 50 lossy datagrams per second) needs `entries` of at least
+  rate × timeout / share (here 50 × 5 / 0.5 = 500): raise `entries` above
+  the default 256, or lower `timeout-ms`.
+  A refused first fragment is refused before any NAT or firewall state is
+  created.
+- `held-fragments` bounds out-of-order fragments (`drop.IPV4_FRAGMENT_HOLD_FULL`,
+  `drop.IPV4_FRAGMENT_HOST_HOLD_LIMIT`). Each holds one datagram of a
+  fragmentation slot's size (3840 bytes by default). Without fragmentation
+  (`[fragmentation] enabled = false`) nothing can be held and every
+  fragment that arrives first is `IPV4_FRAGMENT_HOLD_FULL`. Released
+  fragments use fragmentation slots (`[fragmentation] datagrams`) and the
+  tick's fragment budget (`[tick] generated-fragments`).
+- `timeout-ms` is not refreshed; fragments of one datagram normally arrive
+  within milliseconds. Shorter frees the table sooner after a loss.
+- The per-host limits count (ingress, source address): fragments from the
+  WAN that claim an inside host's address use their own quota. A source
+  can still be spoofed: a flood of forged fragments stays within its
+  ingress's share, and its entries are evictable, but on that ingress it
+  can evict other hosts' pending out-of-order datagrams, and about 13 forged
+  later fragments per second compete with them for the 64 default held
+  slots (a full slot table evicts the oldest pending datagram; one datagram
+  holds at most 16 fragments, `drop.IPV4_FRAGMENT_DATAGRAM_HOLD_LIMIT`).
+  Whole datagrams and in-order fragments are not affected. Whoever guesses a
+  datagram's ID can poison its association and lose that one datagram
+  (fail closed); a poisoned key refuses new datagrams for `timeout-ms`
+  (residual FRAG-012).
+- An allowing association lives until its datagram is complete or
+  `timeout-ms`: the rest of a datagram still follows it for up to that long
+  after its firewall state closed or its neighbor's MAC changed (a reload
+  flushes it).
+- Storage: `entries` × (entry + host slot + 2 directory nodes) +
+  next_power_of_two(`entries`) × 2 directory buckets + `held-fragments` ×
+  (record + slot): 302592 bytes by default, counted in `storage-bytes`.
+  Every `[fragment-tracking]` change is restart-required (`STORAGE_SHAPE`).
+- A reload (SIGHUP apply) discards every association and held fragment
+  (`fragment_tracking.entries_flushed`, `held_flushed`): a datagram in
+  flight across a reload loses its later fragments (its receiver times
+  out). The next datagram is associated normally.
+
+Counters (`ruster-run-stats`): `fragment_tracking.first_allowed`,
+`first_denied`, `followed` (later fragments forwarded), `followed_denied`,
+`held`, `released` (held fragments staged in the fragmentation slots, not
+yet sent: `fragmentation.whole` and `generated_fragments.*` report what
+left), `release_dropped` (a held fragment that could not be staged: TTL,
+overlap, DF above the MTU, or no fragmentation slot), `held_denied` (with a
+refused first fragment or a poisoned association), `held_expired`,
+`entries_expired`, `entries_completed` (every byte decided, before the
+backend took the last fragments), `entries_evicted`, `held_evicted`,
+`poisoned`, `duplicate_first`, `entries_flushed`, `held_flushed`; `consume.IPV4_FRAGMENT_HELD`
+(= `held`); `fragmentation.whole` (released fragments sent unchanged).
+
+Troubleshooting:
+
+| Symptom | Counter | What to do |
+|---|---|---|
+| fragmented datagrams of one host stop | `drop.IPV4_FRAGMENT_HOST_LIMIT` | that source has `entries-per-host` datagrams in flight, all allowed: raise it, look for a host sending many fragmented datagrams |
+| fragmented datagrams of every host stop | `drop.IPV4_FRAGMENT_TABLE_FULL` | every entry allows a datagram: raise `entries` |
+| reordered fragments lost under load | `fragment_tracking.entries_evicted`, `held_evicted` | pending associations were evicted for new datagrams: raise `entries`; check for a flood of fragments (spoofed sources) |
+| a fragmented flow stops after one datagram | `fragment_tracking.poisoned`, `drop.IPV4_FRAGMENT_DUPLICATE_FIRST` | two datagrams shared a key (a sender reusing IDs fast, or a server answering two inside hosts with one ID): both were refused |
+| reordered fragments lost | `drop.IPV4_FRAGMENT_HOLD_FULL`, `HOST_HOLD_LIMIT`, `fragment_tracking.held_expired` | raise `held-fragments`/`held-per-host`; `held_expired` alone means the first fragment never came (lost upstream or refused before the table) |
+| held fragments not sent | `fragment_tracking.release_dropped`, `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | raise `[fragmentation] datagrams` and `[tick] generated-fragments` |
+| a fragment flow refused as a whole | `fragment_tracking.first_denied`, `drop.IPV4_FRAGMENT_FIRST_DENIED` | the first fragment was refused: see its own drop reason (firewall rule, NAT mapping) |
+| fragments refused everywhere | `drop.FIREWALL_FRAGMENT_UNSUPPORTED` | `[fragment-tracking] mode = "refuse"` is set |
+
+Upgrade note (NAT-FRAG, behaviour change): fragment association is on by
+default, also for configs without `[fragment-tracking]`. Fragments that
+were dropped as `drop.FIREWALL_FRAGMENT_UNSUPPORTED` (and, without the
+firewall, `NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`/`NAT44_ICMP_FRAGMENT_UNSUPPORTED`)
+now pass the firewall's rules and the NAT on their first fragment, creating
+mappings and firewall state; review the rules if you relied on that drop,
+and expect those counters to fall to 0. The default table adds 302592
+bytes of storage (the maximal production config, with `entries = 16384` and
+`held-fragments = 512`, is 66617536 bytes). A config with every table at
+its production limit and per-host NAT44 limits that just fitted 64 MiB may
+now fail with `RUNTIME_STORAGE_BYTES_EXCEEDED`: lower `[fragment-tracking]
+entries`/`held-fragments` or `[fragmentation] datagrams`, size a table
+down, or (hardening) set `mode = "refuse"`. New drop codes 190
+`IPV4_FRAGMENT_FIRST_DENIED`, 191 `IPV4_FRAGMENT_DUPLICATE_FIRST`, 192
+`IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`, 193 `IPV4_FRAGMENT_MALFORMED`, 194
+`IPV4_FRAGMENT_TABLE_FULL`, 195 `IPV4_FRAGMENT_HOST_LIMIT`, 196
+`IPV4_FRAGMENT_HOLD_FULL`, 197 `IPV4_FRAGMENT_HOST_HOLD_LIMIT`, 198
+`IPV4_FRAGMENT_HOLD_TOO_LARGE`, 199 `IPV4_FRAGMENT_INGRESS_LIMIT`, 200
+`IPV4_FRAGMENT_DATAGRAM_HOLD_LIMIT`; new consume code `IPV4_FRAGMENT_HELD`; new
+stats section `fragment_tracking.*` and `fragmentation.whole`; new
+validation codes `FRAGMENT_TRACKING_POLICY` and
+`FRAGMENT_TRACKING_ENTRIES_ZERO`. To keep the old behaviour set
+`[fragment-tracking] mode = "refuse"` (restart).
 
 ### Startup retry (XDP-045)
 
@@ -2714,6 +2894,17 @@ What it proves, on the runner's kernel only:
   datagrams and no drop, no flush, no TX rejection. The afpacket phase
   repeats the inbound run with `backend.kind = "af-packet"`
   (`priv_run_afpacket_frag`).
+  Added by NAT-FRAG (`priv_run_natfrag*`): every device at 1500, the
+  firewall on, the default `[fragment-tracking]`: host B's 3000-byte
+  DF-clear UDP answer to host A's NAT mapping, fragmented by host B's
+  kernel (1480 + 1480 + 20 data bytes), arrives at host A translated (one
+  inbound generated ID, TTL 63) and is reassembled; host A's own fragments
+  from a raw socket, sent last first, are held and released by the router
+  and reassembled by host B with the payload as sent (source 203.0.113.2);
+  the final counters show `fragment_tracking.held` =
+  `consume.IPV4_FRAGMENT_HELD`, released, and no fragment refused. With
+  `[fragment-tracking] mode = "refuse"` the same fragments never arrive
+  (`drop.FIREWALL_FRAGMENT_UNSUPPORTED`).
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one

@@ -192,3 +192,9 @@ resolution-timer-scans = 16
 failure-dispatch-scans = 16
 generated-arp = 8
 generated-icmpv4 = 8
+
+# NAT-FRAG: this fixture keeps the hardening switch that refuses every
+# received fragment (step 6); fixtures/natfrag covers the default
+# association.
+[fragment-tracking]
+mode = "refuse"

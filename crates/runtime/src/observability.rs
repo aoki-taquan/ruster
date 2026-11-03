@@ -28,9 +28,10 @@ use ruster_core::{
     ConsumeReason, DropReason, FieldValue, FieldVisitor, FirewallCounters, FirewallReconcileReport,
     FirewallRuntime, GeneratedAllocationError, GeneratedArpTrace, GeneratedIcmpv4Trace,
     GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorCounters,
-    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Ipv4FragmentationCounters,
-    Ipv4FragmentationRuntime, MonotonicMillis, Nat44IcmpCounters, Nat44IcmpReconcileReport,
-    Nat44IcmpRuntime, Nat44TcpCounters, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44UdpCounters,
+    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Ipv4FragmentTracker,
+    Ipv4FragmentTrackingCounters, Ipv4FragmentationCounters, Ipv4FragmentationRuntime,
+    MonotonicMillis, Nat44IcmpCounters, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
+    Nat44TcpCounters, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44UdpCounters,
     Nat44UdpReconcileReport, Nat44UdpRuntime, ObservableFields, PublicationQuiescenceDisposition,
     ResolutionCounters, ResolutionFailureDispatchError, ResolutionFailureTrace,
     ResolutionFailureTraceSink, ResolutionPublicationReport, ResolutionRuntime,
@@ -1292,7 +1293,8 @@ impl TraceSink for TickObserver {
             TraceEvent::Dropped { reason, .. } => self.drops.record(reason),
             TraceEvent::Consumed { reason, .. }
             | TraceEvent::Ipv4LocalConsumed { reason, .. }
-            | TraceEvent::Ipv4FragmentationQueued { reason, .. } => {
+            | TraceEvent::Ipv4FragmentationQueued { reason, .. }
+            | TraceEvent::Ipv4FragmentHeld { reason, .. } => {
                 self.consumes.record(reason);
             }
             _ => {}
@@ -1415,6 +1417,8 @@ pub struct ServiceCounters {
     pub firewall: FirewallCounters,
     /// IPv4 fragmentation (MTU2 part B); zero when not configured.
     pub fragmentation: Ipv4FragmentationCounters,
+    /// IPv4 fragment association (NAT-FRAG); zero in `refuse` mode.
+    pub fragment_tracking: Ipv4FragmentTrackingCounters,
 }
 
 impl ServiceCounters {
@@ -1436,7 +1440,21 @@ impl ServiceCounters {
             nat44_icmp: Nat44IcmpCounters::default(),
             firewall: firewall.counters(),
             fragmentation: Ipv4FragmentationCounters::default(),
+            fragment_tracking: Ipv4FragmentTrackingCounters::default(),
         }
+    }
+
+    /// Adds the IPv4 fragment association counters (NAT-FRAG) when the
+    /// table exists.
+    #[must_use]
+    pub fn with_fragment_tracking(
+        mut self,
+        fragment_tracking: Option<&Ipv4FragmentTracker<'_>>,
+    ) -> Self {
+        if let Some(tracker) = fragment_tracking {
+            self.fragment_tracking = tracker.counters();
+        }
+        self
     }
 
     /// Adds the IPv4 fragmentation counters (MTU2 part B) when the runtime
@@ -1520,7 +1538,13 @@ impl ObservableFields for ServiceCounters {
         }}
         visit_counts! {v, "fragmentation", self.fragmentation, Ipv4FragmentationCounters {
             queued, fragmented, fragments, dropped_unavailable, dropped_frame_too_large,
-            dropped_budget, incomplete, flushed,
+            dropped_budget, incomplete, flushed, whole,
+        }}
+        visit_counts! {v, "fragment_tracking", self.fragment_tracking, Ipv4FragmentTrackingCounters {
+            first_allowed, first_denied, followed, followed_denied, held, released,
+            release_dropped, held_denied, held_expired, entries_expired, entries_completed,
+            entries_evicted, held_evicted, poisoned, duplicate_first, entries_flushed,
+            held_flushed,
         }}
     }
 }

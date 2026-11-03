@@ -242,14 +242,22 @@ pub enum ConsumeReason {
     /// generated frames in the same tick and the received frame is
     /// recycled (MTU2 part B).
     Ipv4Fragmented,
+    /// A later fragment of an IPv4 datagram (Fragment Offset not 0) that
+    /// arrived before its first fragment was copied into a core-owned held
+    /// slot of the fragment association table (NAT-FRAG, RFC 4787 REQ-14);
+    /// it is sent when the first fragment is allowed and discarded (and
+    /// counted) when it is refused or does not arrive in time. The received
+    /// frame is recycled.
+    Ipv4FragmentHeld,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
+        Self::Ipv4FragmentHeld,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -260,6 +268,7 @@ impl ConsumeReason {
             Self::ArpControl => 0,
             Self::Ipv4LocalUnsupported => 1,
             Self::Ipv4Fragmented => 2,
+            Self::Ipv4FragmentHeld => 3,
         }
     }
 
@@ -269,6 +278,7 @@ impl ConsumeReason {
             Self::ArpControl => "ARP_CONTROL",
             Self::Ipv4LocalUnsupported => "IPV4_LOCAL_UNSUPPORTED",
             Self::Ipv4Fragmented => "IPV4_FRAGMENTED",
+            Self::Ipv4FragmentHeld => "IPV4_FRAGMENT_HELD",
         }
     }
 }
@@ -427,7 +437,12 @@ mod tests {
         let codes: Vec<&str> = ConsumeReason::ALL.iter().map(|r| r.code()).collect();
         assert_eq!(
             codes,
-            ["ARP_CONTROL", "IPV4_LOCAL_UNSUPPORTED", "IPV4_FRAGMENTED"]
+            [
+                "ARP_CONTROL",
+                "IPV4_LOCAL_UNSUPPORTED",
+                "IPV4_FRAGMENTED",
+                "IPV4_FRAGMENT_HELD"
+            ]
         );
     }
 
