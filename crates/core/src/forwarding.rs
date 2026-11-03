@@ -3118,12 +3118,19 @@ fn hold_unresolved(
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     frame: &[u8],
     ingress: IfId,
+    first_fragment_dropped: impl FnOnce(&[u8], IfId),
 ) -> Result<ArpHoldMiss, DropReason> {
     let Some((runtime, now)) = resolution.as_mut() else {
         return Err(NeighborUnresolved);
     };
     let miss = runtime.take_forward_miss(*now).ok_or(NeighborUnresolved)?;
-    hold.hold(frame, ingress, miss).map(|()| miss)
+    let mut dropped = Some(first_fragment_dropped);
+    hold.hold(frame, ingress, miss, |held, held_ingress| {
+        if let Some(dropped) = dropped.take() {
+            dropped(held, held_ingress);
+        }
+    })
+    .map(|()| miss)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3529,7 +3536,30 @@ where
                 // held (nothing committed for it) instead of dropped.
                 let reason = match arp_hold.as_deref_mut() {
                     Some(hold) if reason == NeighborUnresolved => {
-                        match hold_unresolved(hold, &mut resolution, packet.bytes_mut(), ingress) {
+                        // A held first fragment the hold replaces (the latest
+                        // is kept per next hop) refuses its datagram.
+                        let tracker = fragment_tracking.as_deref_mut();
+                        let dropped = |frame: &[u8], held_ingress: IfId| {
+                            if let Some(tracker) = tracker {
+                                deny_dropped_first_fragment(
+                                    frame,
+                                    snapshot,
+                                    held_ingress,
+                                    nat44_udp_config,
+                                    nat44_tcp_config,
+                                    nat44_icmp_config,
+                                    tracker,
+                                    nat_now_ms,
+                                );
+                            }
+                        };
+                        match hold_unresolved(
+                            hold,
+                            &mut resolution,
+                            packet.bytes_mut(),
+                            ingress,
+                            dropped,
+                        ) {
                             Ok(miss) => {
                                 // A held first fragment stays undecided: its
                                 // later fragments are held by the association

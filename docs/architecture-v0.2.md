@@ -624,10 +624,11 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   （holdがbindされている時）。
 - **bound**: (egress, next hop)ごとに`per-neighbor`（default 3）。超えたらそのnext hopの古いものを
   置き換え、最新を残します（RFC 1122の「latest」、`replaced`）。置き換えるのは送信者自身((ingress,
-  source))の最古があればそれ、無ければ同じingressの最古、それも無ければ別ingressの最古ですが、
-  それは新しいdatagramのingressの方がholdが少ない時だけで、そうでなければ`ARP_HOLD_INGRESS_LIMIT`
-  （一つのhostやinterfaceが別のもののholdを押し出さない。少ない側だけが多い側から取れる、
-  review sec L2、re-review L2。RFC 1122の「latest」は自分のingress内では常に保たれる）。
+  source))の最古があればそれ、無ければ同じingressの最古、それも無ければこのnext hopで最も多く
+  holdしているingress（同数なら最古を持つもの）の最古です（一つのhostやinterfaceが自分の分を持つ間は
+  他を押し出さない。新しいingressはこのnext hopに一つも持たないので最大の利用者から取る。一つの
+  interfaceのfloodは`per-ingress` shareで抑える。review sec L2、re-review L2、#342 review L-4）。
+  置き換えられたものが最初のfragmentなら、association tableでそのdatagramをdenyします（下）。
   (ingress, source)ごと（NAT-FRAGと同じく、WANからinside addressを名乗るdatagramがinside hostの枠を
   使わない）に`per-host`（default 16、`ARP_HOLD_HOST_LIMIT`、置き換えるものが同じhostならその分を
   数えない）。ingress interfaceごとに`per-ingress`（default `packets`の半分、32、
@@ -675,8 +676,9 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
 - **fragment**: holdした最初のfragmentはfragment association tableでdecideせず（`commit_deny`しない、
   ticketを捨てるだけで何も変わらない）、その後続fragmentはtableのpending entryにheldされます。hold
   がfailed/cancelled/expiredで捨てる最初のfragmentは、forwarding pathのdropと同じくtableで
-  `commit_deny`し、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。apply
-  （`flushed`）ではtable自体もflushされます。replayで
+  `commit_deny`し、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。
+  per-neighbor置き換えで捨てる最初のfragmentも同じです。apply（`flushed`）では同じapplyでtable自体も
+  flushされるので何もしません。replayで
   最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る
   ことがある。受信側のreassemblyには関係ない）。
 - **hairpin、翻訳ICMPv4 error、NAT inbound**: どれもmiss siteで記録され、replayが通常のpathで再判定します。

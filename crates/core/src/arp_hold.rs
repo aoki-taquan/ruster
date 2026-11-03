@@ -415,6 +415,17 @@ impl<'a> ArpHoldRuntime<'a> {
         start..start + self.slots[index].frame_len as usize
     }
 
+    /// Whether the held frame in `index` is a first fragment (MF set,
+    /// offset 0).
+    fn is_first_fragment(&self, index: usize) -> bool {
+        let start = index * self.slot_bytes;
+        let flags = self
+            .bytes
+            .get(start + packet::ETHERNET_HEADER_LEN + 6..start + packet::ETHERNET_HEADER_LEN + 8)
+            .map_or(0, |word| u16::from_be_bytes([word[0], word[1]]));
+        flags & 0x3fff == 0x2000
+    }
+
     /// Unlinks a held slot from the age list and puts it on the free list.
     fn release(&mut self, index: usize) {
         let ArpHoldSlot { older, newer, .. } = self.slots[index];
@@ -445,6 +456,7 @@ impl<'a> ArpHoldRuntime<'a> {
         frame: &[u8],
         ingress: IfId,
         miss: ArpHoldMiss,
+        mut first_fragment_dropped: impl FnMut(&[u8], IfId),
     ) -> Result<(), DropReason> {
         if frame.len() > self.slot_bytes && !self.slots.is_empty() {
             self.counters.refused_too_large += 1;
@@ -456,9 +468,13 @@ impl<'a> ArpHoldRuntime<'a> {
                 Ipv4Address::from_octets([octets[0], octets[1], octets[2], octets[3]])
             });
         let mut neighbor_count = 0_usize;
-        let mut neighbor_oldest = NONE;
         let mut neighbor_oldest_own = NONE;
         let mut neighbor_oldest_same_ingress = NONE;
+        // Per ingress at this next hop: (ingress, count, oldest). At most
+        // `per-neighbor` (<= 64) datagrams are held for one next hop, so at
+        // most that many ingresses; a fixed array on the stack, cold path.
+        let mut at_neighbor = [(IfId(0), 0_u16, NONE); ARP_HOLD_MAX_PER_NEIGHBOR as usize];
+        let mut ingresses = 0_usize;
         let mut host_count = 0_usize;
         let mut ingress_count = 0_usize;
         let mut cursor = self.oldest;
@@ -466,14 +482,22 @@ impl<'a> ArpHoldRuntime<'a> {
             let slot = &self.slots[cursor as usize];
             let own = slot.ingress == ingress && slot.source == source;
             if slot.egress == miss.egress && slot.target == miss.target {
-                if neighbor_count == 0 {
-                    neighbor_oldest = cursor;
-                }
                 if own && neighbor_oldest_own == NONE {
                     neighbor_oldest_own = cursor;
                 }
                 if slot.ingress == ingress && neighbor_oldest_same_ingress == NONE {
                     neighbor_oldest_same_ingress = cursor;
+                }
+                match at_neighbor[..ingresses]
+                    .iter_mut()
+                    .find(|(seen, _, _)| *seen == slot.ingress)
+                {
+                    Some((_, count, _)) => *count += 1,
+                    None if ingresses < ARP_HOLD_MAX_PER_NEIGHBOR as usize => {
+                        at_neighbor[ingresses] = (slot.ingress, 1, cursor);
+                        ingresses += 1;
+                    }
+                    None => {}
                 }
                 neighbor_count += 1;
             }
@@ -484,11 +508,12 @@ impl<'a> ArpHoldRuntime<'a> {
         // RFC 1122 §2.3.2.2 keeps the latest datagram: at the next-hop bound
         // an older datagram of that next hop makes room. Which one: the
         // sender's own oldest there, else the oldest from the same ingress
-        // (one host, or one interface, cannot push out another's), else the
-        // oldest from another ingress, but only when the new datagram's
-        // ingress holds fewer datagrams than that one (the smaller user may
-        // take from the larger; a flood from one interface cannot evict
-        // another's datagrams, it is ARP_HOLD_INGRESS_LIMIT instead).
+        // (one host, or one interface, cannot push out another's while it
+        // has its own there), else the oldest from the ingress holding the
+        // most datagrams for this next hop (the oldest of those on a tie):
+        // the new ingress holds none there, so it takes from the largest
+        // user, and a flood from one interface is bounded by its
+        // `per-ingress` share, not by evicting a smaller one.
         let victim = if neighbor_count < usize::from(self.policy.per_neighbor) {
             None
         } else if neighbor_oldest_own != NONE {
@@ -496,19 +521,15 @@ impl<'a> ArpHoldRuntime<'a> {
         } else if neighbor_oldest_same_ingress != NONE {
             Some(neighbor_oldest_same_ingress)
         } else {
-            let other = self.slots[neighbor_oldest as usize].ingress;
-            let mut other_count = 0_usize;
-            let mut cursor = self.oldest;
-            while cursor != NONE {
-                let slot = &self.slots[cursor as usize];
-                other_count += usize::from(slot.ingress == other);
-                cursor = slot.newer;
+            // `at_neighbor` is in age order of each ingress's oldest, so the
+            // first with the largest count is the oldest on a tie.
+            let mut busiest: Option<(u16, u32)> = None;
+            for &(_, count, oldest) in &at_neighbor[..ingresses] {
+                if busiest.is_none_or(|(most, _)| count > most) {
+                    busiest = Some((count, oldest));
+                }
             }
-            if ingress_count >= other_count {
-                self.counters.refused_ingress_limit += 1;
-                return Err(DropReason::ArpHoldIngressLimit);
-            }
-            Some(neighbor_oldest)
+            busiest.map(|(_, oldest)| oldest)
         };
         let (freed_for_host, freed_for_ingress) = victim.map_or((false, false), |victim| {
             let slot = &self.slots[victim as usize];
@@ -530,7 +551,11 @@ impl<'a> ArpHoldRuntime<'a> {
             return Err(DropReason::ArpHoldIngressLimit);
         }
         if let Some(victim) = victim {
-            self.release(victim as usize);
+            let victim = victim as usize;
+            if self.is_first_fragment(victim) {
+                first_fragment_dropped(&self.bytes[self.range(victim)], self.slots[victim].ingress);
+            }
+            self.release(victim);
             self.counters.replaced += 1;
         }
         let index = self.free;
@@ -590,17 +615,7 @@ impl<'a> ArpHoldRuntime<'a> {
             if slot.state != HoldState::Held {
                 continue;
             }
-            let first_fragment = {
-                let start = index * self.slot_bytes;
-                let flags = self
-                    .bytes
-                    .get(
-                        start + packet::ETHERNET_HEADER_LEN + 6
-                            ..start + packet::ETHERNET_HEADER_LEN + 8,
-                    )
-                    .map_or(0, |word| u16::from_be_bytes([word[0], word[1]]));
-                flags & 0x3fff == 0x2000
-            };
+            let first_fragment = self.is_first_fragment(index);
             let cost = if first_fragment {
                 1 + fragment_reserve
             } else {

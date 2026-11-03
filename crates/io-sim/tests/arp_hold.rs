@@ -1202,3 +1202,108 @@ fn a_dropped_held_first_fragment_frees_its_later_fragments_at_once() {
     assert_eq!(world.live(), 0);
     assert_eq!(tracker(&world), (0, 2));
 }
+
+/// Fragments of the datagram from H with `id` and source port `port`, cut
+/// at 1500 (three fragments).
+fn h_fragments(id: u16, port: u16) -> Vec<(IfId, Vec<u8>)> {
+    let payload: Vec<u8> = (0..2972_u32).map(|i| (i % 251) as u8).collect();
+    let datagram = from_h(S, id, 0, 64, 17, &udp(H, S, (port, 4789), &payload));
+    cut(&datagram, 1500).into_iter().map(|f| (LAN, f)).collect()
+}
+
+fn tracker_held(world: &World) -> (usize, usize) {
+    let tracker = world.active.fragment_tracking().unwrap();
+    (tracker.held(), tracker.counters().held_denied)
+}
+
+/// Two held first fragments become ready in one tick: each reserves room
+/// for its own released fragments, and all six fragments go out.
+#[test]
+fn two_held_first_fragments_replay_in_one_tick() {
+    let mut world = World::new(ROUTER);
+    let mut frames = h_fragments(0x5101, 5000);
+    frames.extend(h_fragments(0x5102, 5001));
+    world.tick(0, &frames);
+    assert_eq!((world.live(), tracker_held(&world).0), (2, 4));
+    let sent = world.tick(10, &[(WAN, g_reply())]);
+    assert_eq!(sent.len(), 6);
+    let counters = world.hold();
+    assert_eq!((counters.replay_sent, counters.replay_unstaged), (2, 0));
+    assert_eq!(tracker_held(&world), (0, 0));
+}
+
+/// A held first fragment whose resolution failed refuses its datagram in
+/// the association table: its later fragments are freed then.
+#[test]
+fn a_held_first_fragment_of_a_failed_resolution_frees_its_later_fragments() {
+    let mut world = World::new(ROUTER);
+    // A datagram at 0 starts the resolution; the fragments come at 500, so
+    // their deadline (3500) is after the resolution fails (3000).
+    world.tick(
+        0,
+        &[(LAN, from_h(S, 1, DF, 64, 17, &udp(H, S, (6000, 53), b"q")))],
+    );
+    world.tick(500, &h_fragments(0x5201, 5000));
+    for now in [1_000, 2_000, 3_000] {
+        world.tick(now, &[]);
+    }
+    assert_eq!(tracker_held(&world), (2, 0));
+    world.tick(3_100, &[]);
+    // The datagram at 0 expired at its deadline (3000); the first fragment
+    // is freed as failed.
+    let counters = world.hold();
+    assert_eq!((counters.expired, counters.failed), (1, 1));
+    assert_eq!(tracker_held(&world), (0, 2));
+}
+
+/// A held first fragment whose replay waited for room while its learned
+/// neighbour expired (cancelled) refuses its datagram too.
+#[test]
+fn a_cancelled_held_first_fragment_frees_its_later_fragments() {
+    let text = ROUTER
+        .replacen(
+            "dynamic-neighbor-ttl-ms = 60000",
+            "dynamic-neighbor-ttl-ms = 100",
+            1,
+        )
+        .replacen("[tick]", "[fragmentation]\ndatagrams = 2\n\n[tick]", 1);
+    let mut world = World::new(&text);
+    world.tick(0, &h_fragments(0x5301, 5000));
+    // Room 2, cost 1 + 2: it waits.
+    assert!(world.tick(10, &[(WAN, g_reply())]).is_empty());
+    assert_eq!(world.hold().deferred, 1);
+    world.tick(200, &[]);
+    assert_eq!(world.hold().cancelled, 1);
+    assert_eq!(tracker_held(&world), (0, 2));
+}
+
+/// A held first fragment replaced by a later datagram to the same next hop
+/// (the latest is kept) refuses its datagram too.
+#[test]
+fn a_replaced_held_first_fragment_frees_its_later_fragments() {
+    let text = ROUTER.replacen("per-neighbor = 3", "per-neighbor = 1", 1);
+    let mut world = World::new(&text);
+    world.tick(0, &h_fragments(0x5401, 5000));
+    assert_eq!(tracker_held(&world), (2, 0));
+    world.tick(
+        1,
+        &[(LAN, from_h(S, 9, DF, 64, 17, &udp(H, S, (6000, 53), b"q")))],
+    );
+    assert_eq!(world.hold().replaced, 1);
+    assert_eq!(tracker_held(&world), (0, 2));
+}
+
+/// With fragment tracking off (`mode = "refuse"`) a first fragment is
+/// refused before its next hop is looked at: never held.
+#[test]
+fn with_fragment_tracking_off_no_fragment_is_held() {
+    let text = ROUTER.replacen(
+        "[tick]",
+        "[fragment-tracking]\nmode = \"refuse\"\n\n[tick]",
+        1,
+    );
+    let mut world = World::new(&text);
+    world.tick(0, &h_fragments(0x5501, 5000));
+    assert_eq!(world.live(), 0);
+    assert_eq!(world.drops(DropReason::FirewallFragmentUnsupported), 3);
+}
