@@ -2,11 +2,11 @@ use std::num::NonZeroU64;
 
 use ruster_core::{
     ArpPolicy, FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy, FirewallRule,
-    ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4OriginPolicy,
-    LocalIpv4Binding, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey, Nat44IcmpPolicy,
-    Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy, Nat44UdpConfig,
-    Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor, ResolutionHashKey,
-    ResolutionPolicy, Route, ValidatedFirewallOwner, ValidatedForwardingOwner,
+    ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address, Ipv4FragmentationPolicy,
+    Ipv4OriginPolicy, LocalIpv4Binding, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey,
+    Nat44IcmpPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy,
+    Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor,
+    ResolutionHashKey, ResolutionPolicy, Route, ValidatedFirewallOwner, ValidatedForwardingOwner,
     ValidatedForwardingOwnerError,
 };
 
@@ -334,6 +334,45 @@ pub struct FullServiceStorageShape {
     /// shape (restart-required).
     nat44_icmp: Option<Nat44IcmpStoragePlan>,
     firewall_state_slots: u32,
+    /// `None` without fragmentation (off, or not configured); the policy is
+    /// part of the shape, so any `[fragmentation]` change is restart-required
+    /// (`STORAGE_SHAPE`).
+    fragmentation: Option<FragmentationStoragePlan>,
+}
+
+/// IPv4 fragmentation (MTU2 part B): its policy (enabled) and `datagrams`
+/// slots of `slot_bytes` bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentationStoragePlan {
+    policy: Ipv4FragmentationPolicy,
+    datagrams: u32,
+    slot_bytes: u32,
+}
+
+impl FragmentationStoragePlan {
+    #[must_use]
+    pub const fn new(policy: Ipv4FragmentationPolicy, datagrams: u32, slot_bytes: u32) -> Self {
+        Self {
+            policy,
+            datagrams,
+            slot_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn policy(self) -> Ipv4FragmentationPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn datagrams(self) -> u32 {
+        self.datagrams
+    }
+
+    #[must_use]
+    pub const fn slot_bytes(self) -> u32 {
+        self.slot_bytes
+    }
 }
 
 impl FullServiceStorageShape {
@@ -352,7 +391,21 @@ impl FullServiceStorageShape {
             nat44_tcp,
             nat44_icmp: None,
             firewall_state_slots,
+            fragmentation: None,
         }
+    }
+
+    /// This shape with IPv4 fragmentation (MTU2 part B). Without it a
+    /// DF-clear datagram above its egress MTU is `IPV4_FRAGMENTATION_REQUIRED`.
+    #[must_use]
+    pub const fn with_fragmentation(mut self, plan: FragmentationStoragePlan) -> Self {
+        self.fragmentation = Some(plan);
+        self
+    }
+
+    #[must_use]
+    pub const fn fragmentation(self) -> Option<FragmentationStoragePlan> {
+        self.fragmentation
     }
 
     /// This shape with ICMP query NAT storage (N5).
@@ -653,6 +706,8 @@ pub enum RuntimeService {
     Firewall,
     /// The optional ICMP query NAT (N5).
     Nat44Icmp,
+    /// The optional IPv4 fragmentation slots (MTU2 part B).
+    Fragmentation,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

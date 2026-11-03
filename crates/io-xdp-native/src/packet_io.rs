@@ -1597,6 +1597,86 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
         }
     }
 
+    /// Room is `min(generated free frames, TX submit room) - router
+    /// reserve`. The router reserve ([`generated_reserve`], the frames cross-port
+    /// copies never take either) stays free for the router's own single
+    /// frames (ARP, ICMP errors), so a fragment set never takes the last of
+    /// the pool (MTU2 part B review). An allocation
+    /// pops one generated free-list entry, and a commit submits one TX
+    /// descriptor under the ring room and the in-flight bound
+    /// ([`RxFillEngine::tx_submit_room`](RxFillEngine::tx_submit_room)).
+    /// Neither shrinks inside the session except by its own frames. Refusals
+    /// follow [`Self::allocate`]'s order (unknown egress or a stopped adapter,
+    /// the `max_frame` bound, a draining engine, a zero length, the
+    /// Ethernet-header floor, the generated length bound) without counting
+    /// anything.
+    ///
+    /// The one non-fault exception: a free generated frame whose ledger
+    /// generation is exhausted (after 2^64 ownership cycles) is quarantined
+    /// by its allocation, which then takes the next free frame, so the last
+    /// promised allocation could find the list empty. A corrupted TX ring
+    /// is a fault: it stops the adapter, is reported from
+    /// [`Self::finish`], and the check returns `Unavailable`.
+    fn check_capacity(
+        &mut self,
+        frames: usize,
+        frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError> {
+        if frames == 0 {
+            return Ok(());
+        }
+        let Some(port) = self.port else {
+            return Err(GeneratedAllocationError::Unavailable);
+        };
+        if self.io.running().is_err() {
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        #[cfg(test)]
+        if let Some(budget) = self.allocation_budget {
+            if frame_len != 0
+                && frame_len <= self.io.ports[port].max_frame as usize
+                && budget < frames
+            {
+                return Err(GeneratedAllocationError::Unavailable);
+            }
+        }
+        let state = &self.io.ports[port];
+        let engine = &state.engine;
+        if frame_len > state.max_frame as usize {
+            return Err(GeneratedAllocationError::FrameTooLarge);
+        }
+        if engine.is_draining() {
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        if frame_len == 0 {
+            return Err(GeneratedAllocationError::ZeroLength);
+        }
+        if frame_len < ETHERNET_HEADER_LEN as usize
+            || frame_len > engine.generated_max_len() as usize
+        {
+            return Err(GeneratedAllocationError::FrameTooLarge);
+        }
+        let reserve = state.copy_reserve as usize;
+        if frames.saturating_add(reserve) > engine.generated_free_frames() as usize {
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        match engine.tx_submit_room() {
+            // The same reserve stays free in the TX room, so fragments in
+            // flight never take the last ring slots either.
+            Ok(room) if frames.saturating_add(reserve) <= room as usize => Ok(()),
+            Ok(_) => Err(GeneratedAllocationError::Unavailable),
+            Err(error) => {
+                let interface = state.config.interface;
+                let failure = self.io.fault(XdpIoError::Submit {
+                    interface,
+                    rejection: TxRejection::Ring(error),
+                });
+                self.completion.error.get_or_insert(failure);
+                Err(GeneratedAllocationError::Unavailable)
+            }
+        }
+    }
+
     fn finish(mut self) -> GeneratedBatchCompletion<Self::Error> {
         self.settle();
         self.finished = true;

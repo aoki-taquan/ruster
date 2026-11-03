@@ -24,6 +24,36 @@ pub trait GeneratedPacketBatch {
         frame_len: usize,
     ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError>;
 
+    /// Checks, without allocating anything or changing the session
+    /// accounting, that this session can take `frames` more frames of at
+    /// most `frame_len` visible bytes each.
+    ///
+    /// `Ok(())` promises that, if nothing else is allocated in this session
+    /// in between, the next `frames` calls to [`Self::allocate`] with a
+    /// length of at most `frame_len` succeed, and that committing all of
+    /// them is not rejected for lack of room (free frames, TX ring slots,
+    /// or an in-flight bound). Only a backend fault, which the session then
+    /// reports from [`Self::finish`], may still fail one of them. A caller
+    /// that must send a set of frames all or nothing (the fragments of one
+    /// IPv4 datagram, RFC 791 §3.2) checks the whole set first, because a
+    /// committed frame cannot be taken back. A backend may withhold a small
+    /// reserve it keeps for the router's own single frames (ARP, ICMP errors)
+    /// from the room it offers here, so a frame set never takes the last of
+    /// its pool (the AF_XDP adapter keeps `max(2, pool / 8)`, MTU2 part B).
+    ///
+    /// `frames == 0` is `Ok(())`. Otherwise the error is the one
+    /// [`Self::allocate`] would return first: [`GeneratedAllocationError::ZeroLength`]
+    /// for `frame_len == 0`, [`GeneratedAllocationError::FrameTooLarge`]
+    /// when `allocate` refuses `frame_len` for its length, and
+    /// [`GeneratedAllocationError::Unavailable`] when fewer than `frames`
+    /// frames (or less TX room) are available now, the egress is unknown,
+    /// or the backend is stopped. Bounded and allocation-free.
+    fn check_capacity(
+        &mut self,
+        frames: usize,
+        frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError>;
+
     /// Flushes requested transmissions and always returns accounting.
     ///
     /// Backends must preserve the three invariants checked by

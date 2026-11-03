@@ -196,6 +196,7 @@ fn observability_sink_is_allocation_free_in_steady_state() {
         failure_dispatch_scans: 4,
         generated_arp: 4,
         generated_icmpv4: 4,
+        generated_fragments: 4,
     };
 
     // Warm-up grows the simulated backend's queues once.

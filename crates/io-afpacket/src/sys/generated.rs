@@ -62,6 +62,19 @@ impl<O: PacketOps> AfPacketEngine<O> {
     }
 }
 
+/// TX frames of a port that `check_capacity` never offers a frame set:
+/// `max(2, tx frames / 8)`, capped at the ring. Single allocations (the
+/// router's ARP requests and ICMP errors) may still use them.
+pub(crate) const fn tx_router_reserve(tx_frames: usize) -> usize {
+    let eighth = tx_frames / 8;
+    let reserve = if eighth > 2 { eighth } else { 2 };
+    if reserve < tx_frames {
+        reserve
+    } else {
+        tx_frames
+    }
+}
+
 /// One generated session on one egress port.
 #[must_use]
 pub(crate) struct AfPacketGenBatch<'a, O: PacketOps = LinuxOps> {
@@ -160,6 +173,43 @@ impl<'a, O: PacketOps> AfPacketGenBatch<'a, O> {
         }
     }
 
+    /// [`GeneratedPacketBatch::check_capacity`]: refusals in
+    /// [`Self::allocate_slot`]'s order, then the run of free TX frames from
+    /// the egress producer head
+    /// (`PacketRingResources::tx_available_run`),
+    /// which is both the allocation and the commit room (one frame each).
+    /// Reads at most `frames` status words; counts nothing.
+    pub(crate) fn check_room(
+        &mut self,
+        frames: usize,
+        frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError> {
+        if frames == 0 {
+            return Ok(());
+        }
+        if frame_len == 0 {
+            return Err(GeneratedAllocationError::ZeroLength);
+        }
+        let Some(port) = self.port else {
+            return Err(GeneratedAllocationError::Unavailable);
+        };
+        if self.engine.is_stopped() {
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        let resources = &self.engine.ports[port];
+        if !(ETHERNET_HEADER_LEN..=resources.max_frame_len).contains(&frame_len) {
+            return Err(GeneratedAllocationError::FrameTooLarge);
+        }
+        // The router reserve stays free for single router frames (ARP, ICMP
+        // errors): a set is offered only the run beyond it (MTU2 part B
+        // review), so fragments in flight never take the last TX frames.
+        let needed = frames.saturating_add(tx_router_reserve(resources.tx_frame_count()));
+        if resources.tx_available_run(needed) < needed {
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        Ok(())
+    }
+
     fn finish_inner(&mut self) -> GeneratedBatchCompletion<AfPacketIoError> {
         self.finished = true;
         // A lease forgotten with `mem::forget` never ran its completion. Its
@@ -225,6 +275,14 @@ impl<'a, O: PacketOps> GeneratedPacketBatch for AfPacketGenBatch<'a, O> {
         frame_len: usize,
     ) -> Result<GeneratedPacketLease<Self::Slot<'_>>, GeneratedAllocationError> {
         self.allocate_slot(frame_len).map(GeneratedPacketLease::new)
+    }
+
+    fn check_capacity(
+        &mut self,
+        frames: usize,
+        frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError> {
+        self.check_room(frames, frame_len)
     }
 
     fn finish(mut self) -> GeneratedBatchCompletion<Self::Error> {

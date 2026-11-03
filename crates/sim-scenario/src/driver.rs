@@ -562,7 +562,8 @@ impl SimRun<'_> {
             active.nat44_tcp(),
             active.firewall(),
         )
-        .with_nat44_icmp(active.nat44_icmp());
+        .with_nat44_icmp(active.nat44_icmp())
+        .with_fragmentation(active.fragmentation());
         let mut line = Line::event("final");
         line.u64("at_ms", self.now);
         line.u64("generation", self.generation().get());
@@ -1004,12 +1005,14 @@ impl SimRun<'_> {
             failure_dispatch_scans,
             generated_arp,
             generated_icmpv4,
+            generated_fragments,
         } = self.budgets;
         line.usize("rx", rx);
         line.usize("resolution_timer_scans", resolution_timer_scans);
         line.usize("failure_dispatch_scans", failure_dispatch_scans);
         line.usize("generated_arp", generated_arp);
         line.usize("generated_icmpv4", generated_icmpv4);
+        line.usize("generated_fragments", generated_fragments);
         line.close();
         emit(out, line)
     }
@@ -1087,6 +1090,7 @@ fn budgets(config: &ValidatedConfigV1) -> TickBudgets {
         failure_dispatch_scans: wide(tick.failure_dispatch_scans),
         generated_arp: wide(tick.generated_arp),
         generated_icmpv4: wide(tick.generated_icmpv4),
+        generated_fragments: wide(tick.generated_fragments),
     }
 }
 

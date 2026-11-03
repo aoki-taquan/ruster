@@ -396,7 +396,7 @@ deadlineを開始しexact boundaryを許可します。allocation/build失敗は
 開始せず、backend reject/finish errorもTX requested済みなのでdeadlineを開始します。
 state/action fullとclock regressionはphantom state/action/deadlineを作りません。expired idle
 stateだけ再利用します。multi-worker共通limit、packet hold/replay、RFC 4884 extension、
-generated fragmentation、interface別disableはdeferredです。MTU別quote縮小はMTU1で実装しました
+generated errorのfragmentation（errorは常にMTUに収める）、interface別disableはdeferredです。MTU別quote縮小はMTU1で実装しました
 （下）。
 
 ### egress MTU（MTU1、RFC 1812 §4.2.2.7、RFC 1191 §4）
@@ -431,8 +431,9 @@ frameを再検証しDF bitを読みます。この位置なので:
   limiter（classは別）は他のgenerated errorと同じ`decide_icmpv4_error`/`schedule_reverse_icmpv4_error`です。
 
 超過はDF=1なら`IPV4_FRAGMENTATION_NEEDED`とType 3/Code 4（Next-Hop MTU = egress MTUをICMP
-header 2語目の下位16 bitへ、上位16 bitは0）、DF=0なら`IPV4_FRAGMENTATION_REQUIRED`（fragmentation
-未実装のdeviation、MTU2 part B。part AからNATを通る完全なDF=0 datagramもここに来る）、local Echo Replyなら`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。
+header 2語目の下位16 bitへ、上位16 bitは0）、DF=0ならfragmentation（下の「fragmentation」、
+MTU2 part B。`[fragmentation] enabled = false`かruntimeの無いcompositionでは
+`IPV4_FRAGMENTATION_REQUIRED`）、local Echo Replyなら`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。
 `Icmpv4ErrorAction`はNext-Hop MTUを2 bytes持ちます（action slotは584→592 bytes）。limiter classは
 Port Unreachable（class 1）と同様に専用のclass 2で、間隔は`fragmentation-needed-interval-ms`（default
 10 ms）です（review M1: class 0を共有するとTTL=1を100 msごとに送るだけで他hostのFragmentation Neededが
@@ -450,6 +451,57 @@ backendはframe全体を送るので、Total LengthがMTU以下でもEthernet pa
 egress MTUを超えるframeは`IPV4_FRAME_EXCEEDS_MTU`で落とします（ICMPなし）。trimはしません
 （backendのcommitはframe長を変えない契約のため）。`ruster run`はdevice MTUがconfigより大きいと
 `MTU_BELOW_DEVICE`を警告します。
+
+### fragmentation（MTU2 part B、RFC 791 §3.2、RFC 1812 §4.2.2.7）
+
+DF=0でegress MTUを超えるdatagram（plain routing、NAT44 UDP/TCP/ICMP queryのoutbound/inbound、
+hairpin、翻訳したICMPv4 error）はfragmentします（RFC 1812のMUST）。coreの
+`Ipv4FragmentationRuntime`（`ipv4_fragmentation.rs`）はcaller所有のslot record配列と
+`datagrams × (14 + max(最大interface MTU, 3826, AF_PACKET max-frame-len - 14))` bytesのslot bytesを
+借り、allocationもlockも持ちません（3826は4096-byte AF_XDP frameが運べる最大datagram、AF_PACKETは
+port frameの最大。configのMTUはingressで強制しないので、slotはproduction portが受け取り得るどの
+datagramも収め、DF=1と同じくDF=0も大きさで落とさない。AF_PACKETの大きいframeではslotがbackendに
+依存する）。
+
+1. `check_egress_mtu`のcold halfが`plan`で受理を決めます（`enabled`、fragment数 ≤
+   `max-fragments-per-datagram`、dataの終わりが65535 - 20以内、slotの長さ、空きslot）。全decisionと
+   NAT prevalidationの後、何もcommitしない位置なので、拒否はbyte不変のtyped drop
+   （186〜189、183）でNAT/firewall state/IDを消費しません。
+2. `apply_decision`と`rewrite_translated_non_atomic_id`（NAT44-126のID生成）の後、最後の
+   fallibleでないstepとして`stage`がEthernet header + Total Length bytesをslotへcopyします。
+   NAT/firewallはcommitし、受信frameは`ConsumeReason::Ipv4Fragmented`でbackendへ返します
+   （backend所有bufferはcommitかrecycleのどちらか、という契約のまま）。
+3. `run_tick`はtickの最後（generated ARP/ICMPv4の後）に`TickPhase::GeneratedFragments`を実行し、
+   `execute_one_ipv4_fragmentation`がslotごとにegressの`begin_generated`を開き、
+   `GeneratedPacketBatch::check_capacity(n, 最初のfragment長)`でset全体のroomを確かめてから
+   一枚ずつexact長でallocate、RFC 791どおり書き込み、commitします。roomが無ければ何も送らず
+   datagramを捨てます（`dropped_unavailable`。AF_XDPとAF_PACKETはrouter自身のsingle frame用の
+   reserveをpoolとTX roomからsetに渡さない）。tickのbudgetを超えるfragment数のdatagramは送れないので
+   RX phaseのadmissionで`TOO_MANY_FRAGMENTS`としてcommit前に拒否します。
+   `[tick] generated-fragments`のframe budgetに収まらないsetはsessionを開かず丸ごと捨てます
+   （`dropped_budget`）。generated phaseがskipされるtickはphaseをskipしてflushし、finish errorや
+   accounting違反は残りをflushします。stageした
+   datagramはtickを越えず、publication applyも念のためflushします。
+
+受信frameをそのまま最初のfragmentにする（commit長を縮める）案は採りませんでした。RX batchの
+lease中はbackendが排他borrowされgenerated sessionを開けないので、残りのfragmentはどのみち
+後のphaseで送ることになり、そのphaseでroomが無いと一部だけ送った（partial）setになるからです。
+全fragmentを同じgenerated sessionで、room確認の後に送ればsetはall or nothingで、backendの
+commit長の契約も変えません（変えたのは`check_capacity`の追加だけ）。代償は一datagramにつき
+copy二回（slotへ、fragmentへ）で、fragmentationはcold pathです。
+
+fragment: `NFB = (MTU - 20) / 8`、最後以外のdata長は`NFB × 8`、headerはdatagramのもの
+（ID共通、reserved flag保持、DF=0）にTotal Length、MF（最後以外は1、最後はdatagramのMF）、
+offset（datagramのoffset + data位置/8）を入れ、header checksumを計算し直します。optionsは
+すべてのforwarding pathがdecision前に拒否するので20-byte headerだけを扱い（届いたら
+`IPV4_OPTIONS_UNSUPPORTED`）、最大fragment数は1365（65535 bytesをMTU 68へ）です。stateful
+firewallは受信fragmentをdecision前に拒否するので、production compositionでfragmentの再fragmentは
+起きません（algorithmは単体testで確かめる）。
+
+configは`[fragmentation]`（`enabled` default true、`max-fragments-per-datagram` default 1365、
+`datagrams` default 64）で、policyとslotはstorage shapeの一部（restart-required）です。
+`FullServiceView::with_fragmentation`がruntimeをviewに加え、無いcompositionでは従来どおり
+`IPV4_FRAGMENTATION_REQUIRED`です。
 
 ## ARP control scope
 
@@ -586,10 +638,12 @@ RFC 6864 §5.3.1はaddress-sharing deviceに、変換したdatagramのIDをsourc
 `apply_decision`の後、commitの直前に`rewrite_translated_non_atomic_id`を呼びます。NAT decisionで
 DF=0のframeだけ、変換後の(source, destination, protocol)を`Ipv4IdGenerator`
 （`nat44_ipv4_id.rs`）に渡します。generatorはNAT runtimeのhash keyで構築時に固定したkeyed
-SipHash（domain `Ipv4Identification`）でtupleから1024個のu16 counterのbucketと秘密のoffsetを得て、
+SipHash（domain `Ipv4Identification`）でtupleから4096個（MTU2 part Bで1024から増加）のu16 counterのbucketと秘密のoffsetを得て、
 ID = counter + offsetを返しcounterを1進めます。counter配列はsourceがpublic addressのtuple
 （outbound、hairpin）とそれ以外（inbound）で分け、outsideからのinbound trafficがoutbound tupleの
-sequenceを進められないようにします（hairpinはinside hostだけが駆動しtupleがoutboundと一致しないので
+sequenceを直接は進められないようにします（insideのhostやrouterにDF=0の応答を出させれば、その応答が
+outbound bucket (P, 攻撃者, proto)に入るので間接には進められる。bucketはkeyが秘密なので選べず、
+N addressの観測者が覆うbucketは約1-(1-1/4096)^N）（hairpinはinside hostだけが駆動しtupleがoutboundと一致しないので
 outbound側）。inline配列なのでallocationもlockもなく、keyは構築時に固定しreconcileでrotateせず
 （sequenceをresetしないため）、reconcile/flushでもresetしません。generatorはworkerごとなので、
 multi-workerにする時はworkerごとの派生keyと重ならないID範囲、または(source, destination,
@@ -601,7 +655,13 @@ IDを消費しません（消費はcoreのTX commit時でbackendのTX受理よ�
 pass-throughは§5.3.1のMUSTに反するので設定にしません。残余は一つのbucketで65536個/MDLを超えると
 一巡すること（inside hostはoutbound配列を共有し、一つのhostが約2.2 kpps送ると共有tupleが30 sで
 一巡する。host単位のrate limitは無い）、同じoutbound bucketを共有するtupleからの件数推測、
-翻訳したerrorのquote内IDをどちらの方向でも戻さないこと、runtime作り直しでの再開です（NAT44-126）。
+翻訳したerrorのquote内IDをどちらの方向でも戻さないこと、runtime作り直しでの再開、そしてinbound配列を
+すべてのoutside送信元が共有するため、outsideのtraffic量（一つのbucketを一巡させるのに平均
+65536 × 4096 ≈ 2.7e8 datagram）で他のremoteのinbound tupleを一巡させ得ることです。MTU2 part Bで
+inboundのDF=0 datagramを小さいLAN MTUへfragmentするので、これはinside hostでの誤再構成
+（RFC 4963 §2）につながり得ますが、fragmentは生成IDのまま出し（RFC 6864 §5.3.1、RFC 791）、
+特別扱いはしません: 必要な速度は再構成時間30 s内に約9 Mppsでsingle workerの転送能力を超え、
+UDP/TCP checksumも大半を検出します（NAT44-126 (7)）。
 
 fragment handling/reassembly、static port forward、複数public address、port randomization/parity、minimal
 stateful sliceを越えるfull packet filterはdeferredです。RFC 3022/4787/7857の全機能準拠は
@@ -1968,9 +2028,10 @@ rule/default deny、runtime/config/snapshot authority failure、上記egress-fre
 LPM missはICMP/ARPをqueueしないsilent dropを維持します。認可済みpacketのTTL 0/1は既存のerror suppressionとreverse
 authorityを通過した場合にactionをqueueし、quoteはNAT rewrite前の受信IPv4 datagramです。
 TTL failureではNAT mapping/sessionとfirewall flowをcommitしません。captureはRX phaseだけで、
-generated実行をforwarding wrapper内へ融合しません。worker tick順は引き続き
+generated実行をforwarding wrapper内へ融合しません。worker tick順は
 `publication/reconcile → RX → resolution timer poll → failure dispatch → generated ARP →
-generated ICMP`で、生成packetはfirewall domain外です。
+generated ICMP → generated fragments（MTU2 part B）`で、生成packetはfirewall domain外です
+（fragmentはfirewallが許可しcommitしたdatagramから作る）。
 
 planが返すcreate/refresh replacementと論理的にliveなflowのactivity/phaseはcommitまで反映
 しません。一方、security watermarkと同様にlazy expiry housekeepingはprobe中に実行でき、
@@ -2203,7 +2264,14 @@ breakであり、runtime borrowはprivate fieldにしたためdownstream adapter
 zeroであることを固定します。
 
 `TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
-generated ICMPv4 actionを独立に制限します。RX batchはlexical scopeでwrapperへmoveし、
+generated ICMPv4 action、generated fragment frame（`generated_fragments`、MTU2 part B）を
+独立に制限します。generated fragment phaseはtickの最後（ARP/ICMPv4の後、review M）で、tick内では
+router自身のframeが先に出ます。backendはrouter reserveをsetに渡さないので、in-flightのfragmentが
+次のtickのrouter frameの分まで取ることもありません。budgetは全sourceとegressで共有する一つのFIFO
+poolで（source単位のfairnessは無い）、収まらないsetは丸ごと捨てて数え（`dropped_budget`）、budget
+全体より大きいsetはRX phaseのadmissionで拒否します。それ以前のgenerated phaseがskipされたか
+backend failure（ICMPv4 phaseのfinish error、accounting違反、clock regressionを含む）で終わった
+tickはskipしてstageをflushし、自身のfinish error/accounting違反は残りをflushします。RX batchはlexical scopeでwrapperへmoveし、
 `finish`後にだけgenerated I/Oを再borrowします。generated allocation/build/finish errorは同じ
 tickで同じpending actionを再試行せず、そのphaseを一回で停止します。accounting invariant違反は
 backend contract failureとして以後のgenerated phaseを停止します。固定サイズreportとphase

@@ -480,6 +480,16 @@ impl GeneratedHarness for XdpGeneratedHarness {
         self.0.hold_tx_slots(budget);
     }
 
+    fn generated_router_reserve(&mut self) -> usize {
+        let frames = self
+            .0
+            .io()
+            .engine(ENDPOINTS[1].interface)
+            .expect("WAN port")
+            .generated_frames();
+        crate::generated_reserve(frames) as usize
+    }
+
     fn drain_generated_events(&mut self) -> Vec<GeneratedEvent> {
         let mut events = Vec::new();
         for (port, descriptor, frame, bytes) in self.0.take_submissions() {
@@ -596,6 +606,7 @@ fn xdp_adapter_passes_the_rx_cq_pool_suite() {
 #[cfg_attr(miri, ignore = "the harness leaks its 'static scripted kernels")]
 fn xdp_adapter_passes_the_generated_conformance_suite() {
     generated::empty_session_has_zero_accounting::<XdpGeneratedHarness>();
+    generated::check_capacity_promises_exact_room::<XdpGeneratedHarness>();
     generated::allocation_failures_bind_only_successful_ownership::<XdpGeneratedHarness>();
     generated::commit_cancel_and_abandon_bind_exact_lengths::<XdpGeneratedHarness>();
     generated::partial_reject_reclaims_exact_tokens::<XdpGeneratedHarness>();

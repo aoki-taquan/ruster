@@ -28,19 +28,20 @@ use ruster_core::{
     ConsumeReason, DropReason, FieldValue, FieldVisitor, FirewallCounters, FirewallReconcileReport,
     FirewallRuntime, GeneratedAllocationError, GeneratedArpTrace, GeneratedIcmpv4Trace,
     GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorCounters,
-    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, MonotonicMillis, Nat44IcmpCounters,
-    Nat44IcmpReconcileReport, Nat44IcmpRuntime, Nat44TcpCounters, Nat44TcpReconcileReport,
-    Nat44TcpRuntime, Nat44UdpCounters, Nat44UdpReconcileReport, Nat44UdpRuntime, ObservableFields,
-    PublicationQuiescenceDisposition, ResolutionCounters, ResolutionFailureDispatchError,
-    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionPublicationReport,
-    ResolutionRuntime, ResolutionTimerError, ResolutionTimerTrace, ResolutionTimerTraceSink,
-    TableOccupancy, TraceEvent, TraceSink,
+    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Ipv4FragmentationCounters,
+    Ipv4FragmentationRuntime, MonotonicMillis, Nat44IcmpCounters, Nat44IcmpReconcileReport,
+    Nat44IcmpRuntime, Nat44TcpCounters, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44UdpCounters,
+    Nat44UdpReconcileReport, Nat44UdpRuntime, ObservableFields, PublicationQuiescenceDisposition,
+    ResolutionCounters, ResolutionFailureDispatchError, ResolutionFailureTrace,
+    ResolutionFailureTraceSink, ResolutionPublicationReport, ResolutionRuntime,
+    ResolutionTimerError, ResolutionTimerTrace, ResolutionTimerTraceSink, TableOccupancy,
+    TraceEvent, TraceSink,
 };
 
 use crate::{
-    GeneratedAccounting, GeneratedArpStop, GeneratedIcmpv4Stop, GeneratedPhaseReport, PhaseReport,
-    PublicationOutcome, RxPhaseReport, TickPhaseSkip, TickPhaseTrace, TickPhaseTraceSink,
-    TickReport,
+    GeneratedAccounting, GeneratedArpStop, GeneratedFragmentsStop, GeneratedIcmpv4Stop,
+    GeneratedPhaseReport, PhaseReport, PublicationOutcome, RxPhaseReport, TickPhaseSkip,
+    TickPhaseTrace, TickPhaseTraceSink, TickReport,
 };
 
 /// One past the largest stable [`DropReason`] discriminant (OBS-001).
@@ -372,6 +373,8 @@ pub struct TickTotals {
     pub failure_dispatch_queued: u64,
     pub generated_arp: GeneratedTotals,
     pub generated_icmpv4: GeneratedTotals,
+    /// Fragment sessions (MTU2 part B), one per staged datagram.
+    pub generated_fragments: GeneratedTotals,
 }
 
 /// Worker health derived from observed ticks and injected monotonic time.
@@ -929,6 +932,19 @@ impl TickObserver {
             }
         }
 
+        let fragments = &mut totals.generated_fragments;
+        flags.generated(
+            health,
+            fragments,
+            &report.generated_fragments,
+            |s| match s {
+                GeneratedFragmentsStop::QueueEmpty => GeneratedEnd::Done,
+                GeneratedFragmentsStop::Failed { .. } => GeneratedEnd::failed(None, false, true),
+                GeneratedFragmentsStop::AccountingInvariantViolation { .. } => {
+                    GeneratedEnd::Violation
+                }
+            },
+        );
         flags.generated(
             health,
             &mut totals.generated_arp,
@@ -1133,7 +1149,9 @@ impl TraceSink for TickObserver {
     fn record(&mut self, event: TraceEvent) {
         match event {
             TraceEvent::Dropped { reason, .. } => self.drops.record(reason),
-            TraceEvent::Consumed { reason, .. } | TraceEvent::Ipv4LocalConsumed { reason, .. } => {
+            TraceEvent::Consumed { reason, .. }
+            | TraceEvent::Ipv4LocalConsumed { reason, .. }
+            | TraceEvent::Ipv4FragmentationQueued { reason, .. } => {
                 self.consumes.record(reason);
             }
             _ => {}
@@ -1206,7 +1224,7 @@ impl ObservableFields for ObservabilitySnapshot {
             publications_deferred, apply_flushes_recorded, resolution_timer_scanned,
             resolution_retries_queued,
             resolution_timed_out, failure_dispatch_scanned, failure_dispatch_queued;
-            rx, generated_arp, generated_icmpv4
+            rx, generated_arp, generated_icmpv4, generated_fragments
         }}
         visit_counts! {v, "rx", self.totals.rx, RxTotals {
             batches, received, tx_requested, tx_accepted, tx_rejected, dropped, consumed,
@@ -1214,6 +1232,9 @@ impl ObservableFields for ObservabilitySnapshot {
         }}
         self.totals.generated_arp.visit("generated_arp", v);
         self.totals.generated_icmpv4.visit("generated_icmpv4", v);
+        self.totals
+            .generated_fragments
+            .visit("generated_fragments", v);
         self.phase_skips.visit_fields(v);
         self.drops.visit_fields(v);
         self.consumes.visit_fields(v);
@@ -1247,6 +1268,8 @@ pub struct ServiceCounters {
     /// ICMP query NAT (N5); zero when not configured.
     pub nat44_icmp: Nat44IcmpCounters,
     pub firewall: FirewallCounters,
+    /// IPv4 fragmentation (MTU2 part B); zero when not configured.
+    pub fragmentation: Ipv4FragmentationCounters,
 }
 
 impl ServiceCounters {
@@ -1267,7 +1290,21 @@ impl ServiceCounters {
             nat44_tcp: nat44_tcp.counters(),
             nat44_icmp: Nat44IcmpCounters::default(),
             firewall: firewall.counters(),
+            fragmentation: Ipv4FragmentationCounters::default(),
         }
+    }
+
+    /// Adds the IPv4 fragmentation counters (MTU2 part B) when the runtime
+    /// exists.
+    #[must_use]
+    pub fn with_fragmentation(
+        mut self,
+        fragmentation: Option<&Ipv4FragmentationRuntime<'_>>,
+    ) -> Self {
+        if let Some(runtime) = fragmentation {
+            self.fragmentation = runtime.counters();
+        }
+        self
     }
 
     /// Adds the ICMP query NAT counters (N5) when the runtime exists.
@@ -1335,6 +1372,10 @@ impl ObservableFields for ServiceCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,
             state_full, clock_regressions, config_mismatches, reconciliations, states_expired,
             state_probes, maintenance_steps, rule_evaluations,
+        }}
+        visit_counts! {v, "fragmentation", self.fragmentation, Ipv4FragmentationCounters {
+            queued, fragmented, fragments, dropped_unavailable, dropped_frame_too_large,
+            dropped_budget, incomplete, flushed,
         }}
     }
 }

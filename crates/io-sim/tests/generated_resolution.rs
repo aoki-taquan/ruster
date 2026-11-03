@@ -1024,6 +1024,15 @@ impl GeneratedPacketBatch for ShortBufferBatch {
         }))
     }
 
+    /// Not used for fragment sets; refuses every set (fail closed).
+    fn check_capacity(
+        &mut self,
+        _frames: usize,
+        _frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError> {
+        Err(GeneratedAllocationError::Unavailable)
+    }
+
     fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
         GeneratedBatchCompletion {
             attempts: 1,

@@ -11,7 +11,7 @@
 //!
 //! The NAT therefore gives every translated non-atomic datagram (DF clear;
 //! the NAT only translates whole datagrams, so MF=0 and offset 0) a new ID
-//! from a fixed array of [`IPV4_ID_BUCKETS`] counters. The bucket and a per
+//! from a fixed array of [`IPV4_ID_BUCKETS`] counters per direction. The bucket and a per
 //! tuple offset come from one keyed hash of the translated (source,
 //! destination, protocol) tuple (RFC 6864 §4.3: uniqueness is per tuple), so
 //! consecutive datagrams of one tuple get consecutive IDs and no ID of a
@@ -40,6 +40,27 @@
 //! shared (public, destination, protocol) tuple within the MDL, for every
 //! inside host using it; no per-host packet rate limit exists yet.
 //!
+//! The split stops outside traffic from advancing an outbound sequence
+//! *directly*. It can still do so indirectly: an outside host that elicits
+//! DF-clear replies from inside hosts or routers (UDP answers, Echo
+//! Replies) has those replies counted in the outbound bucket of
+//! (public, attacker, protocol), a bucket it cannot choose (the key is
+//! secret). An observer holding N tuples covers about 1 - (1 - 1/B)^N of
+//! the B buckets: with B = 1024, 1024 addresses cover about 63%; with the
+//! B = 4096 used since MTU2 part B, about 22% (4096 addresses about 63%).
+//!
+//! The inbound array is shared by every outside sender, so outside volume
+//! can wrap another remote's inbound sequence (X, H, protocol): one bucket
+//! needs on average 65536 x B datagrams (about 2.7e8 at B = 4096, 6.7e7 at
+//! 1024) to wrap. Since MTU2 part B the router fragments inbound DF-clear
+//! datagrams toward a smaller LAN MTU with the generated ID (RFC 6864
+//! §5.3.1, RFC 791: one ID for every fragment), so a wrap within the inside
+//! host's reassembly time (Linux: 30 s, so about 9 Mpps) could make it
+//! misassemble (RFC 4963 §2). That rate is far beyond one worker and
+//! transport checksums catch most misassembly; it is a documented residual
+//! (NAT44-126 (7)), not special-cased: copying the received ID would break
+//! §5.3.1 and refusing to fragment would break RFC 1812 §4.2.2.7.
+//!
 //! The counters advance by exactly 1. A random per-bucket increment (Linux
 //! `ip_idents`) is not used: it shortens the wrap period of every tuple
 //! (uniqueness is the RFC 6864 MUST), and with the direction split an
@@ -62,8 +83,11 @@
 use crate::fixed_directory::{DirectoryHashDomain, DirectoryHashKey};
 
 /// Counters of one direction. A power of two, so the bucket is the low bits
-/// of the hash.
-pub(crate) const IPV4_ID_BUCKETS: usize = 1024;
+/// of the hash. 4096 since MTU2 part B (1024 before): an 8 KiB inline array
+/// per direction, a quarter of the bucket coverage per observed tuple, and
+/// four times the volume needed to wrap a bucket, for one indexed u16 per
+/// DF-clear datagram as before.
+pub(crate) const IPV4_ID_BUCKETS: usize = 4096;
 
 /// Per-worker generator of the IDs of translated non-atomic datagrams.
 pub(crate) struct Ipv4IdGenerator {

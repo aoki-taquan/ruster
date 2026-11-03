@@ -499,6 +499,34 @@ impl<const FAULT: u8> GeneratedPacketBatch for FakeGeneratedBatch<FAULT> {
         }))
     }
 
+    fn check_capacity(
+        &mut self,
+        frames: usize,
+        frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError> {
+        if frames == 0 {
+            return Ok(());
+        }
+        if frame_len == 0 {
+            return Err(GeneratedAllocationError::ZeroLength);
+        }
+        if frame_len > self.max_frame {
+            return Err(GeneratedAllocationError::FrameTooLarge);
+        }
+        let state = self.state.borrow();
+        let accept_room = state
+            .generated_accept_budget
+            .saturating_sub(self.pending.borrow().len());
+        if State::<FAULT>::publication_endpoint(self.egress).is_none()
+            || frames > self.remaining_allocations
+            || frames > state.free.len()
+            || frames > accept_room
+        {
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        Ok(())
+    }
+
     fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
         let mut state = self.state.borrow_mut();
         let endpoint = State::<FAULT>::publication_endpoint(self.egress);
@@ -795,6 +823,7 @@ fn finite_fake_positive_rx_cases_include_unknown_egress_and_cq_reuse() {
 
 #[test]
 fn finite_fake_positive_generated_cases_include_unknown_egress_and_cq_reuse() {
+    generated::check_capacity_promises_exact_room::<FakeHarness<GOOD>>();
     generated::partial_reject_reclaims_exact_tokens::<FakeHarness<GOOD>>();
     generated::repeated_rejects_restore_physical_pool_and_advance_generation::<FakeHarness<GOOD>>();
     generated::unknown_egress_is_rejected_without_submission::<FakeHarness<GOOD>>();

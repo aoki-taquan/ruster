@@ -3,17 +3,17 @@
 
 use ruster_core::{
     dispatch_host_unreachable_failures, dispatch_nat44_tcp_unsolicited_syns,
-    execute_one_arp_request, execute_one_icmpv4_error,
-    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors,
+    execute_one_arp_request, execute_one_icmpv4_error, execute_one_ipv4_fragmentation,
+    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation,
     poll_resolution_timers, ArpRequestBuildError, BatchReport, ExecuteArpRequestError,
     ExecuteIcmpv4Error, FirewallConfig, FirewallRuntime, ForwardingSnapshot,
     GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo, GeneratedTraceSink,
-    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, MonotonicMillis, Nat44IcmpConfig, Nat44IcmpRuntime,
-    Nat44TcpConfig, Nat44TcpRuntime, Nat44TcpUnsolicitedSynDispatchError, Nat44UdpConfig,
-    Nat44UdpRuntime, PacketIo, PublicationQuiescence, PublicationQuiescenceDisposition,
-    ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureTraceSink,
-    ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink,
-    TraceSink,
+    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, Ipv4FragmentationRuntime, MonotonicMillis,
+    Nat44IcmpConfig, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpRuntime,
+    Nat44TcpUnsolicitedSynDispatchError, Nat44UdpConfig, Nat44UdpRuntime, PacketIo,
+    PublicationQuiescence, PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
+    ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
+    ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink, TraceSink,
 };
 use std::{marker::PhantomData, num::NonZeroU64};
 
@@ -238,6 +238,9 @@ pub struct FullServiceView<'view, 'storage> {
     /// Optional ICMP query NAT (N5); see [`FullServiceView::with_nat44_icmp`].
     pub nat44_icmp: Nat44IcmpServiceView<'view, 'storage>,
     pub firewall: FirewallServiceView<'view, 'storage>,
+    /// Optional IPv4 fragmentation (MTU2 part B); see
+    /// [`FullServiceView::with_fragmentation`].
+    fragmentation: Option<&'view mut Ipv4FragmentationRuntime<'storage>>,
 }
 
 impl<'view, 'storage> FullServiceView<'view, 'storage> {
@@ -283,7 +286,21 @@ impl<'view, 'storage> FullServiceView<'view, 'storage> {
             nat44_tcp,
             nat44_icmp: Nat44IcmpServiceView::default(),
             firewall,
+            fragmentation: None,
         }
+    }
+
+    /// Adds IPv4 fragmentation (MTU2 part B, RFC 1812 §4.2.2.7) to the view:
+    /// DF-clear datagrams above their egress MTU are staged during RX and
+    /// sent as fragments in [`TickPhase::GeneratedFragments`]. Without it
+    /// such a datagram is `IPV4_FRAGMENTATION_REQUIRED`.
+    #[must_use]
+    pub fn with_fragmentation(
+        mut self,
+        fragmentation: &'view mut Ipv4FragmentationRuntime<'storage>,
+    ) -> Self {
+        self.fragmentation = Some(fragmentation);
+        self
     }
 
     /// Adds ICMP query NAT (N5) to the view. Without it, the tick runs the
@@ -409,12 +426,21 @@ pub struct TickBudgets {
     pub failure_dispatch_scans: usize,
     pub generated_arp: usize,
     pub generated_icmpv4: usize,
+    /// Fragment frames the generated fragment phase may send per tick (MTU2
+    /// part B, `[tick] generated-fragments`). A staged datagram whose set
+    /// does not fit what is left is dropped whole and counted
+    /// (`fragmentation.dropped_budget`).
+    pub generated_fragments: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TickPhase {
     Publication,
     Rx,
+    /// Fragments of the datagrams staged by this tick's RX (MTU2 part B),
+    /// the last phase of the tick, after generated ARP and ICMPv4, within
+    /// [`TickBudgets::generated_fragments`] frames.
+    GeneratedFragments,
     ResolutionTimers,
     FailureDispatch,
     GeneratedArp,
@@ -583,6 +609,27 @@ pub enum GeneratedIcmpv4Stop<E> {
     AccountingInvariantViolation(GeneratedAccountingViolation<E, Icmpv4ErrorBuildError>),
 }
 
+/// How the generated fragment phase ended (MTU2 part B). The phase is the
+/// last of the tick; it is `Skipped` (and the staged datagrams flushed)
+/// whenever an earlier generated phase did not run or ended in a backend
+/// failure (I/O, contract violation, clock regression).
+#[derive(Debug, Eq, PartialEq)]
+pub enum GeneratedFragmentsStop<E> {
+    /// Every staged datagram was handled (sent, or refused whole by its
+    /// session's capacity check or the tick budget and counted in the
+    /// fragmentation counters).
+    QueueEmpty,
+    /// A session's finish reported a backend error; the datagrams still
+    /// staged were flushed (counted `flushed`).
+    Failed { finish: E, flushed: usize },
+    /// A session's accounting broke the backend contract; the datagrams
+    /// still staged were flushed.
+    AccountingInvariantViolation {
+        completion: GeneratedCompletion<E>,
+        flushed: usize,
+    },
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub struct GeneratedPhaseReport<S> {
     pub accounting: GeneratedAccounting,
@@ -594,6 +641,12 @@ pub struct TickReport<PublicationError, QuiescenceError, RxError, GeneratedError
     pub publication: PublicationOutcome<PublicationError, QuiescenceError>,
     pub active: bool,
     pub rx: RxPhaseReport<RxError>,
+    /// The generated fragment phase; `Completed` with no session when no
+    /// fragmentation runtime is bound.
+    pub generated_fragments: PhaseReport<
+        GeneratedPhaseReport<GeneratedFragmentsStop<GeneratedError>>,
+        core::convert::Infallible,
+    >,
     pub resolution_timers: PhaseReport<ResolutionTimerReport, ResolutionTimerError>,
     pub failure_dispatch:
         PhaseReport<ResolutionFailureDispatchReport, ResolutionFailureDispatchError>,
@@ -811,12 +864,18 @@ where
             finish: completion.error,
         };
         if failure.allocation.is_some() || failure.build.is_some() || failure.finish.is_some() {
+            // A finish error is a backend I/O failure: the fragment phase
+            // after this one does not run in this tick.
+            let downstream_skip = failure
+                .finish
+                .is_some()
+                .then_some(TickPhaseSkip::BackendIoFailure);
             return (
                 GeneratedPhaseReport {
                     accounting,
                     stop: GeneratedIcmpv4Stop::Failed(failure),
                 },
-                None,
+                downstream_skip,
             );
         }
     }
@@ -829,6 +888,72 @@ where
             } else {
                 GeneratedIcmpv4Stop::BudgetExhausted { pending }
             },
+        },
+        None,
+    )
+}
+
+/// Sends every datagram staged by this tick's RX as fragments (MTU2 part
+/// B). A refused set is counted by the core and the phase goes on with the
+/// next datagram (another egress may have room); a finish error or an
+/// accounting violation flushes the rest. The phase is the last of the
+/// tick, so nothing after it is skipped.
+fn run_generated_fragments<I>(
+    io: &mut I,
+    runtime: Option<&mut Ipv4FragmentationRuntime<'_>>,
+    frame_budget: usize,
+) -> (
+    GeneratedPhaseReport<GeneratedFragmentsStop<I::Error>>,
+    Option<TickPhaseSkip>,
+)
+where
+    I: GeneratedPacketIo,
+{
+    let mut accounting = GeneratedAccounting::default();
+    let Some(runtime) = runtime else {
+        return (
+            GeneratedPhaseReport {
+                accounting,
+                stop: GeneratedFragmentsStop::QueueEmpty,
+            },
+            None,
+        );
+    };
+    let mut frame_budget = frame_budget;
+    while let Some(report) = execute_one_ipv4_fragmentation(io, runtime, &mut frame_budget) {
+        // A set over the budget opened no session: nothing to account.
+        let Some(completion) = report.completion else {
+            continue;
+        };
+        let mut completion = GeneratedCompletion::from_core(completion);
+        if !add_generated_accounting(&mut accounting, &completion) {
+            let flushed = runtime.flush();
+            return (
+                GeneratedPhaseReport {
+                    accounting,
+                    stop: GeneratedFragmentsStop::AccountingInvariantViolation {
+                        completion,
+                        flushed,
+                    },
+                },
+                Some(TickPhaseSkip::BackendContractViolation),
+            );
+        }
+        if let Some(finish) = completion.error.take() {
+            let flushed = runtime.flush();
+            return (
+                GeneratedPhaseReport {
+                    accounting,
+                    stop: GeneratedFragmentsStop::Failed { finish, flushed },
+                },
+                Some(TickPhaseSkip::BackendIoFailure),
+            );
+        }
+    }
+    (
+        GeneratedPhaseReport {
+            accounting,
+            stop: GeneratedFragmentsStop::QueueEmpty,
         },
         None,
     )
@@ -981,6 +1106,7 @@ where
             TickPhase::FailureDispatch,
             TickPhase::GeneratedArp,
             TickPhase::GeneratedIcmpv4,
+            TickPhase::GeneratedFragments,
         ] {
             skip_phase(trace, phase, TickPhaseSkip::NoActivePublication);
         }
@@ -989,6 +1115,7 @@ where
             publication: publication_report,
             active: false,
             rx: RxPhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
+            generated_fragments: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
             resolution_timers: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
             failure_dispatch: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
             generated_arp: PhaseReport::Skipped(TickPhaseSkip::NoActivePublication),
@@ -1011,6 +1138,7 @@ where
             TickPhase::FailureDispatch,
             TickPhase::GeneratedArp,
             TickPhase::GeneratedIcmpv4,
+            TickPhase::GeneratedFragments,
         ] {
             skip_phase(trace, phase, reason);
         }
@@ -1019,6 +1147,7 @@ where
             publication: publication_report,
             active: true,
             rx: RxPhaseReport::Skipped(reason),
+            generated_fragments: PhaseReport::Skipped(reason),
             resolution_timers: PhaseReport::Skipped(reason),
             failure_dispatch: PhaseReport::Skipped(reason),
             generated_arp: PhaseReport::Skipped(reason),
@@ -1035,6 +1164,7 @@ where
         nat44_tcp,
         nat44_icmp,
         firewall,
+        mut fragmentation,
     } = view;
     let Nat44IcmpServiceView {
         config: icmp_config,
@@ -1053,11 +1183,16 @@ where
         runtime: mut firewall,
     } = firewall;
 
+    // A datagram needing more fragments than this tick's fragment budget
+    // can never be sent: the RX phase refuses it before any commit.
+    if let Some(runtime) = fragmentation.as_deref_mut() {
+        runtime.set_tick_frame_budget(budgets.generated_fragments);
+    }
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {
         Ok(batch) => {
             let report =
-                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors(
+                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation(
                     batch,
                     &snapshot,
                     resolution,
@@ -1070,6 +1205,7 @@ where
                     &firewall_config,
                     firewall.as_deref_mut(),
                     None,
+                    fragmentation.as_deref_mut(),
                     now,
                     trace,
                 );
@@ -1175,14 +1311,34 @@ where
         (PhaseReport::Completed(report), downstream_skip)
     };
 
-    let generated_icmpv4 = if let Some(reason) = arp_skip {
+    let (generated_icmpv4, icmp_skip) = if let Some(reason) = arp_skip {
         skip_phase(trace, TickPhase::GeneratedIcmpv4, reason);
-        PhaseReport::Skipped(reason)
+        (PhaseReport::Skipped(reason), None)
     } else {
         trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::GeneratedIcmpv4));
-        let (report, _) =
+        let (report, downstream_skip) =
             run_generated_icmpv4(io, icmpv4_errors, now, budgets.generated_icmpv4, trace);
         trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::GeneratedIcmpv4));
+        (PhaseReport::Completed(report), downstream_skip)
+    };
+
+    // Last, after generated ARP and ICMPv4, so forwarded fragments never
+    // take the generated frames or TX room the router's own ARP and ICMP
+    // need, and within its own frame budget. Still in the tick the
+    // datagrams arrived in. When a generated phase before it did not run or
+    // ended in a backend failure (I/O, contract violation, clock
+    // regression), it does not run either and the staged datagrams are
+    // flushed: nothing staged outlives its tick.
+    let generated_fragments = if let Some(reason) = arp_skip.or(icmp_skip) {
+        skip_phase(trace, TickPhase::GeneratedFragments, reason);
+        if let Some(runtime) = fragmentation.as_deref_mut() {
+            runtime.flush();
+        }
+        PhaseReport::Skipped(reason)
+    } else {
+        trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::GeneratedFragments));
+        let (report, _) = run_generated_fragments(io, fragmentation, budgets.generated_fragments);
+        trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::GeneratedFragments));
         PhaseReport::Completed(report)
     };
 
@@ -1191,6 +1347,7 @@ where
         publication: publication_report,
         active: true,
         rx,
+        generated_fragments,
         resolution_timers,
         failure_dispatch,
         generated_arp,
@@ -1284,6 +1441,7 @@ mod tests {
                     runtime: None,
                 },
                 nat44_icmp: Nat44IcmpServiceView::default(),
+                fragmentation: None,
                 firewall: FirewallServiceView {
                     config: self.firewall_config,
                     runtime: None,
@@ -1803,6 +1961,21 @@ mod tests {
             }))
         }
 
+        /// One frame per session, like the ARP/ICMPv4 actions it serves.
+        fn check_capacity(
+            &mut self,
+            frames: usize,
+            _frame_len: usize,
+        ) -> Result<(), GeneratedAllocationError> {
+            if frames == 0 {
+                return Ok(());
+            }
+            if self.mode == GeneratedMode::AllocationFailure || self.attempted || frames > 1 {
+                return Err(GeneratedAllocationError::Unavailable);
+            }
+            Ok(())
+        }
+
         fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
             let (requested, cancelled, abandoned) = match self.completion {
                 Some(GeneratedSlotCompletion::Transmit) => (1, 0, 0),
@@ -1913,6 +2086,7 @@ mod tests {
                     failure_dispatch_scans: 0,
                     generated_arp: 1,
                     generated_icmpv4: 0,
+                    generated_fragments: 0,
                 },
                 trace,
             );
@@ -1961,6 +2135,8 @@ mod tests {
                     Some(TickPhaseTrace::PhaseFinished(TickPhase::GeneratedArp)),
                     Some(TickPhaseTrace::PhaseStarted(TickPhase::GeneratedIcmpv4)),
                     Some(TickPhaseTrace::PhaseFinished(TickPhase::GeneratedIcmpv4)),
+                    Some(TickPhaseTrace::PhaseStarted(TickPhase::GeneratedFragments)),
+                    Some(TickPhaseTrace::PhaseFinished(TickPhase::GeneratedFragments)),
                     Some(TickPhaseTrace::TickFinished),
                 ]
             );
@@ -1983,6 +2159,7 @@ mod tests {
                     rx: 1,
                     generated_arp: 1,
                     generated_icmpv4: 1,
+                    generated_fragments: 1,
                     ..TickBudgets::default()
                 },
                 trace,
@@ -2020,6 +2197,7 @@ mod tests {
                     failure_dispatch_scans: usize::MAX,
                     generated_arp: usize::MAX,
                     generated_icmpv4: usize::MAX,
+                    generated_fragments: usize::MAX,
                 },
                 trace,
             );
@@ -2034,7 +2212,7 @@ mod tests {
                 report.generated_icmpv4,
                 PhaseReport::Skipped(TickPhaseSkip::NoActivePublication)
             ));
-            assert_eq!(trace.phase_len, 9);
+            assert_eq!(trace.phase_len, 10);
             assert_eq!(
                 trace.phases[trace.phase_len - 1],
                 Some(TickPhaseTrace::TickFinished)
@@ -2138,6 +2316,7 @@ mod tests {
                             failure_dispatch_scans: usize::MAX,
                             generated_arp: usize::MAX,
                             generated_icmpv4: usize::MAX,
+                            generated_fragments: usize::MAX,
                         },
                         trace,
                     );
@@ -2169,7 +2348,7 @@ mod tests {
                         report.generated_icmpv4,
                         PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
                     ));
-                    assert_eq!(trace.phase_len, 9);
+                    assert_eq!(trace.phase_len, 10);
                     assert_eq!(($io.receive_calls, $io.generated_calls), (0, 0));
 
                     *trace = TestTrace::default();
@@ -2184,6 +2363,7 @@ mod tests {
                             failure_dispatch_scans: usize::MAX,
                             generated_arp: usize::MAX,
                             generated_icmpv4: usize::MAX,
+                            generated_fragments: usize::MAX,
                         },
                         trace,
                     );
@@ -2209,7 +2389,7 @@ mod tests {
                         report.generated_icmpv4,
                         PhaseReport::Skipped(TickPhaseSkip::BackendIoNotReentrant)
                     ));
-                    assert_eq!(trace.phase_len, 9);
+                    assert_eq!(trace.phase_len, 10);
                     assert_eq!(($io.receive_calls, $io.generated_calls), (0, 0));
                 }};
             }
@@ -2314,6 +2494,7 @@ mod tests {
                         failure_dispatch_scans: usize::MAX,
                         generated_arp: usize::MAX,
                         generated_icmpv4: usize::MAX,
+                        generated_fragments: usize::MAX,
                     },
                     trace,
                 );
@@ -2359,6 +2540,7 @@ mod tests {
                         failure_dispatch_scans: usize::MAX,
                         generated_arp: usize::MAX,
                         generated_icmpv4: usize::MAX,
+                        generated_fragments: usize::MAX,
                     },
                     trace,
                 );
@@ -2473,6 +2655,7 @@ mod tests {
                     TickBudgets {
                         generated_arp: 4,
                         generated_icmpv4: 1,
+                        generated_fragments: 1,
                         ..TickBudgets::default()
                     },
                     trace,
@@ -2629,6 +2812,7 @@ mod tests {
                     failure_dispatch_scans: 1,
                     generated_arp: 1,
                     generated_icmpv4: 1,
+                    generated_fragments: 1,
                     ..TickBudgets::default()
                 },
                 trace,
@@ -2670,6 +2854,7 @@ mod tests {
                 TickBudgets {
                     generated_arp: 2,
                     generated_icmpv4: 1,
+                    generated_fragments: 1,
                     ..TickBudgets::default()
                 },
                 trace,
@@ -2714,6 +2899,7 @@ mod tests {
                 MonotonicMillis(0),
                 TickBudgets {
                     generated_icmpv4: 4,
+                    generated_fragments: 4,
                     ..TickBudgets::default()
                 },
                 trace,

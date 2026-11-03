@@ -2,13 +2,14 @@ use std::num::NonZeroU64;
 
 use ruster_config::{parse, validate, ValidatedConfig, ValidatedConfigV1, ValidationLimits};
 use ruster_control::{
-    candidate_from_config, ConfigBridgeError, FullServiceStorageShape, Icmpv4ErrorStorageShape,
-    KeySourceError, KeySourceKind, Nat44TcpStoragePlan, Nat44UdpStoragePlan, PublicationKeySource,
-    PublicationKeys, ResolutionStorageShape, RuntimeService, SimDeterministicKeySource,
-    SuccessorError, ValidatedCandidate,
+    candidate_from_config, ConfigBridgeError, FragmentationStoragePlan, FullServiceStorageShape,
+    Icmpv4ErrorStorageShape, KeySourceError, KeySourceKind, Nat44TcpStoragePlan,
+    Nat44UdpStoragePlan, PublicationKeySource, PublicationKeys, ResolutionStorageShape,
+    RuntimeService, SimDeterministicKeySource, SuccessorError, ValidatedCandidate,
 };
 use ruster_core::{
-    FirewallHashKey, IfId, Ipv4Address, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey,
+    FirewallHashKey, IfId, Ipv4Address, Ipv4FragmentationPolicy, Nat44TcpHashKey, Nat44UdpHashKey,
+    ResolutionHashKey,
 };
 
 const SIM_SEED: u64 = 0x5eed_0bad_cafe_f00d;
@@ -250,6 +251,12 @@ fn config_bridge_builds_candidates_and_rejects_missing_services() {
                 .with_unsolicited_syn_hold_slots(33),
             30,
         )
+        // `[fragmentation]` absent: on, 64 slots of 14 + 3826 bytes.
+        .with_fragmentation(FragmentationStoragePlan::new(
+            Ipv4FragmentationPolicy::DEFAULT,
+            64,
+            3840
+        ))
     );
     let udp = storage.nat44_udp.unwrap();
     assert_eq!(

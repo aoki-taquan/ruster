@@ -947,6 +947,30 @@ impl GeneratedPacketBatch for SimGeneratedBatch<'_> {
         }))
     }
 
+    /// The simulated session has `generated_budget` allocations and accepts
+    /// at most `generated_accept_budget` of its commits at `finish`, so a set
+    /// fits when both still have room for it.
+    fn check_capacity(
+        &mut self,
+        frames: usize,
+        frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError> {
+        if frames == 0 {
+            return Ok(());
+        }
+        if frame_len == 0 {
+            return Err(GeneratedAllocationError::ZeroLength);
+        }
+        if frame_len > self.max_frame {
+            return Err(GeneratedAllocationError::FrameTooLarge);
+        }
+        let accept_room = self.accept_budget.saturating_sub(self.pending.len());
+        if frames > self.remaining_allocations || frames > accept_room {
+            return Err(GeneratedAllocationError::Unavailable);
+        }
+        Ok(())
+    }
+
     fn finish(mut self) -> GeneratedBatchCompletion<Self::Error> {
         let accepted = self.accept_budget.min(self.pending.len());
         for _ in 0..accepted {

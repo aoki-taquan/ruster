@@ -212,6 +212,12 @@ pub trait GeneratedHarness: Sized {
     fn set_generated_allocation_budget(&mut self, budget: usize);
     fn set_generated_max_frame(&mut self, max_frame: usize);
     fn set_generated_accept_budget(&mut self, budget: usize);
+    /// Frames of the WAN egress that `check_capacity` withholds from a frame
+    /// set for the router's own single frames (the AF_XDP adapter's router
+    /// reserve); 0 for a backend that keeps none.
+    fn generated_router_reserve(&mut self) -> usize {
+        0
+    }
     /// Drains observations from actual publication and reclamation rings.
     ///
     /// Rejected/reclaimed events are already reusable; submitted events remain
@@ -936,6 +942,95 @@ pub mod generated {
             (0, 0, 0, 0, 0, 0, 0, 0)
         );
         assert!(harness.drain_generated_events().is_empty());
+    }
+
+    /// `check_capacity` counts nothing, refuses in `allocate`'s order, and
+    /// its `Ok` promises exactly that many allocations whose commits are all
+    /// accepted, under an allocation limit (`budget_limited`) or a TX accept
+    /// limit.
+    pub fn check_capacity_promises_exact_room<H: GeneratedHarness>() {
+        for budget_limited in [true, false] {
+            let mut harness = H::new();
+            harness.set_generated_max_frame(64);
+            if budget_limited {
+                harness.set_generated_allocation_budget(2);
+                harness.set_generated_accept_budget(4);
+            } else {
+                // The TX room is the bound; a backend's router reserve comes
+                // on top of the room a set may take.
+                harness.set_generated_allocation_budget(3);
+                let reserve = harness.generated_router_reserve();
+                harness.set_generated_accept_budget(2 + reserve);
+            }
+            let mut live = Vec::new();
+            let checked = {
+                let (io, _) = harness.io_and_observer();
+                let mut batch = io.begin_generated(WAN);
+                assert_eq!(batch.check_capacity(0, 0), Ok(()));
+                assert_eq!(
+                    batch.check_capacity(1, 0),
+                    Err(GeneratedAllocationError::ZeroLength)
+                );
+                assert_eq!(
+                    batch.check_capacity(9, 65),
+                    Err(GeneratedAllocationError::FrameTooLarge)
+                );
+                assert_eq!(
+                    batch.check_capacity(3, 64),
+                    Err(GeneratedAllocationError::Unavailable),
+                    "check_capacity promised more room than the backend has"
+                );
+                assert_eq!(batch.check_capacity(2, 64), Ok(()));
+                batch.finish()
+            };
+            assert!(checked.invariants_hold());
+            assert_eq!(
+                (
+                    checked.attempts,
+                    checked.allocated,
+                    checked.failed,
+                    checked.requested,
+                    checked.cancelled,
+                    checked.abandoned,
+                    checked.accepted,
+                    checked.rejected,
+                ),
+                (0, 0, 0, 0, 0, 0, 0, 0),
+                "check_capacity changed the session accounting"
+            );
+            assert!(harness.drain_generated_events().is_empty());
+            let completion = {
+                let (io, observer) = harness.io_and_observer();
+                let mut batch = io.begin_generated(WAN);
+                assert_eq!(batch.check_capacity(2, 64), Ok(()));
+                for (marker, len) in [(1_u8, 64), (2, 60)] {
+                    let mut packet = batch.allocate(len).expect("promised allocation");
+                    packet.bytes_mut().fill(marker);
+                    live.push(observer.bind(packet.bytes_mut(), len));
+                    packet.commit();
+                }
+                batch.finish()
+            };
+            assert!(completion.invariants_hold());
+            assert_eq!(
+                (
+                    completion.attempts,
+                    completion.allocated,
+                    completion.failed,
+                    completion.requested,
+                    completion.accepted,
+                    completion.rejected,
+                ),
+                (2, 2, 0, 2, 2, 0),
+                "a promised commit was refused"
+            );
+            let events = harness.drain_generated_events();
+            assert_event_bindings(&live, &events);
+            assert_eq!(events.len(), 2);
+            for event in events {
+                assert!(matches!(event.kind, GeneratedEventKind::TxSubmitted { .. }));
+            }
+        }
     }
 
     pub fn allocation_failures_bind_only_successful_ownership<H: GeneratedHarness>() {

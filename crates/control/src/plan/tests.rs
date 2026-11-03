@@ -769,6 +769,29 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
         (RESOLUTION_POLICY_CHANGE, RestartRequired::ResolutionPolicy),
         (ICMPV4_POLICY_CHANGE, RestartRequired::Icmpv4ErrorPolicy),
         (ICMPV4_GENERATION_CHANGE, RestartRequired::Icmpv4ErrorPolicy),
+        // MTU2 part B: the fragmentation policy and slots are part of the
+        // storage shape, so every `[fragmentation]` change restarts.
+        (
+            (
+                "[resolution.policy]",
+                "[fragmentation]\nenabled = false\n\n[resolution.policy]",
+            ),
+            RestartRequired::StorageShape,
+        ),
+        (
+            (
+                "[resolution.policy]",
+                "[fragmentation]\nmax-fragments-per-datagram = 8\n\n[resolution.policy]",
+            ),
+            RestartRequired::StorageShape,
+        ),
+        (
+            (
+                "[resolution.policy]",
+                "[fragmentation]\ndatagrams = 8\n\n[resolution.policy]",
+            ),
+            RestartRequired::StorageShape,
+        ),
     ] {
         let plan = plan(&[edit]);
         only(&plan, &["restart"]);

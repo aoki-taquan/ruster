@@ -7,9 +7,10 @@ use std::num::{NonZeroU128, NonZeroU32};
 
 use ruster_core::{
     forward_batch, ipv4_header_checksum, BackendMode, BackendStats, FieldValue, FieldVisitor,
-    ForwardingSnapshot, GeneratedAllocationError, GeneratedPacketBatch, GeneratedPacketIo, IfId,
-    Interface, Ipv4Address, MacAddress, MonotonicMillis, Neighbor, NoTrace, ObservableFields,
-    PacketBatch, PacketIo, PublicationQuiescence, PublicationQuiescenceDisposition, Route,
+    ForwardingSnapshot, GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch,
+    GeneratedPacketIo, IfId, Interface, Ipv4Address, MacAddress, MonotonicMillis, Neighbor,
+    NoTrace, ObservableFields, PacketBatch, PacketIo, PublicationQuiescence,
+    PublicationQuiescenceDisposition, Route,
 };
 
 use crate::{
@@ -24,8 +25,8 @@ use crate::{
         LINK_DOWN_RETRY_MIN_MS,
     },
     KickError, NegotiatedMode, RingEntries, RingName, RxFillConfig, RxFillEngine, TxRejection,
-    UmemConfig, UmemDomainId, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
-    XdpPortConfig, XdpQuiescenceError, XDP_PACKET_HEADROOM,
+    UmemConfig, UmemDomainId, XdpBackendStats, XdpIoError, XdpPacketIo, XdpPacketIoSetupError,
+    XdpPort, XdpPortConfig, XdpPortStats, XdpQuiescenceError, XDP_PACKET_HEADROOM,
 };
 
 pub(crate) const FRAME_SIZE: u32 = 2_048;
@@ -1902,4 +1903,306 @@ fn idle_wait_refills_fill_from_reaped_frames_before_blocking() {
     assert_eq!(starved(&io), before);
     assert_eq!(fill(&io), 0);
     audit(&io);
+}
+
+fn stats(io: &XdpPacketIo<'_>) -> (XdpPortStats, XdpBackendStats) {
+    (io.port_stats(WAN).expect("WAN"), io.backend_stats())
+}
+
+/// Checks counted nothing in the adapter, the port, or the engine.
+fn assert_unchanged(io: &XdpPacketIo<'_>, before: (XdpPortStats, XdpBackendStats)) {
+    assert_eq!(stats(io), before);
+}
+
+/// A session that only checked: no session accounting moved.
+fn assert_untouched(completion: &GeneratedBatchCompletion<XdpIoError>) {
+    assert!(completion.invariants_hold(), "{completion:?}");
+    assert_eq!(
+        (
+            completion.attempts,
+            completion.allocated,
+            completion.failed,
+            completion.requested,
+            completion.accepted,
+            completion.rejected,
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{completion:?}"
+    );
+}
+
+#[test]
+fn check_capacity_is_bounded_by_the_generated_pool_and_counts_nothing() {
+    let generated = 4;
+    let (lan, wan) = (kernel(), kernel_with(RX_FRAMES, generated));
+    let mut io = adapter(&lan, &wan);
+    let before = stats(&io);
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(batch.check_capacity(0, 0), Ok(()));
+        assert_eq!(
+            batch.check_capacity(1, 0),
+            Err(GeneratedAllocationError::ZeroLength)
+        );
+        assert_eq!(
+            batch.check_capacity(1, 13),
+            Err(GeneratedAllocationError::FrameTooLarge),
+            "below an Ethernet header"
+        );
+        assert_eq!(
+            batch.check_capacity(1, 1_515),
+            Err(GeneratedAllocationError::FrameTooLarge)
+        );
+        // Length errors come before room errors.
+        assert_eq!(
+            batch.check_capacity(99, 1_515),
+            Err(GeneratedAllocationError::FrameTooLarge)
+        );
+        // The router reserve (2 of 4 frames) stays free for ARP and ICMP.
+        let room = generated as usize - generated_reserve(generated) as usize;
+        assert_eq!(room, 2);
+        assert_eq!(
+            batch.check_capacity(room + 1, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        assert_eq!(batch.check_capacity(room, 1_514), Ok(()));
+        batch.finish()
+    };
+    assert_untouched(&completion);
+    assert_eq!(completion.error, None);
+    assert_unchanged(&io, before);
+
+    // Ok means exactly that many allocations succeed and are accepted, and
+    // the reserve is still there for single router frames afterwards.
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(
+            batch.check_capacity(
+                generated as usize - generated_reserve(generated) as usize,
+                1_514
+            ),
+            Ok(())
+        );
+        for len in [1_514, 14] {
+            batch.allocate(len).expect("promised").commit();
+        }
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable),
+            "the reserve is not offered to sets"
+        );
+        for len in [60, 1_514] {
+            batch
+                .allocate(len)
+                .expect("reserve for router frames")
+                .commit();
+        }
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        assert!(matches!(
+            batch.allocate(60),
+            Err(GeneratedAllocationError::Unavailable)
+        ));
+        batch.finish()
+    };
+    assert!(completion.invariants_hold(), "{completion:?}");
+    assert_eq!(completion.attempts, generated as usize + 1);
+    assert_eq!(completion.accepted, generated as usize);
+    assert_eq!((completion.rejected, completion.failed), (0, 1));
+    assert_eq!(completion.error, None);
+    transmit_all(&wan);
+    io.service().expect("service");
+    audit(&io);
+}
+
+#[test]
+fn check_capacity_is_bounded_by_tx_ring_room_and_the_in_flight_bound() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    // Three of the eight TX slots are taken; the generated pool has 16, so
+    // its router reserve (2) is withheld from the TX room as well: a set
+    // gets 5 - 2.
+    {
+        let mut batch = io.begin_generated(WAN);
+        for _ in 0..3 {
+            batch.allocate(60).expect("generated").commit();
+        }
+        assert_eq!(batch.finish().accepted, 3);
+    }
+    assert_eq!(generated_reserve(16), 2);
+    let before = stats(&io);
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(
+            batch.check_capacity(4, 60),
+            Err(GeneratedAllocationError::Unavailable),
+            "ring room minus the reserve"
+        );
+        batch.finish()
+    };
+    assert_untouched(&completion);
+    assert_unchanged(&io, before);
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(batch.check_capacity(3, 60), Ok(()));
+        for _ in 0..3 {
+            batch.allocate(60).expect("promised").commit();
+        }
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable),
+            "the reserve is not offered to sets"
+        );
+        // Single router frames still get the reserved slots.
+        for _ in 0..2 {
+            batch.allocate(60).expect("reserve").commit();
+        }
+        batch.finish()
+    };
+    assert_eq!((completion.accepted, completion.rejected), (5, 0));
+    assert_eq!(completion.error, None);
+
+    // The kernel consumes every slot but completes none: the ring has room
+    // again, the in-flight bound does not.
+    let mut consumed = Vec::new();
+    while let Some(descriptor) = wan.consume_tx() {
+        consumed.push(descriptor.address);
+    }
+    assert_eq!(consumed.len(), RING as usize);
+    let before = stats(&io);
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable),
+            "in-flight bound"
+        );
+        batch.finish()
+    };
+    assert_untouched(&completion);
+    assert_unchanged(&io, before);
+    // Four completions (reaped by begin_generated) make room for two, past
+    // the reserve.
+    for address in consumed.drain(..4) {
+        assert!(wan.produce_completion(address));
+    }
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(
+            batch.check_capacity(3, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        assert_eq!(batch.check_capacity(2, 60), Ok(()));
+        for _ in 0..2 {
+            batch.allocate(60).expect("promised").commit();
+        }
+        batch.finish()
+    };
+    assert_eq!((completion.accepted, completion.rejected), (2, 0));
+    let counters = io.port_stats(WAN).expect("WAN").counters;
+    assert_eq!(counters.generated_tx_blocked, 0);
+    for address in consumed {
+        assert!(wan.produce_completion(address));
+    }
+    transmit_all(&wan);
+    io.service().expect("service");
+    audit(&io);
+}
+
+#[test]
+fn check_capacity_respects_the_test_allocation_budget() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    io.set_generated_allocation_budget(Some(2));
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(
+            batch.check_capacity(3, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        assert_eq!(batch.check_capacity(2, 60), Ok(()));
+        for _ in 0..2 {
+            batch.allocate(60).expect("promised").commit();
+        }
+        batch.finish()
+    };
+    assert_eq!((completion.accepted, completion.rejected), (2, 0));
+    io.set_generated_allocation_budget(None);
+    transmit_all(&wan);
+    io.service().expect("service");
+    audit(&io);
+}
+
+#[test]
+fn check_capacity_refuses_unknown_egress_stopped_and_corrupt_rings() {
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    let before = stats(&io);
+    let completion = {
+        let mut batch = io.begin_generated(IfId(42));
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        // An unknown egress refuses before any length rule, like allocate.
+        assert_eq!(
+            batch.check_capacity(1, 0),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        assert_eq!(batch.check_capacity(0, 60), Ok(()));
+        batch.finish()
+    };
+    assert_untouched(&completion);
+    assert_eq!(completion.error, None);
+    assert_unchanged(&io, before);
+    assert_eq!(io.backend_stats().generated_unknown_egress, 0);
+
+    // A corrupt TX ring is a fault: it stops the adapter.
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        wan.set_tx_consumer(wan.tx_producer().wrapping_add(1));
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        batch.finish()
+    };
+    assert_untouched(&completion);
+    assert!(matches!(
+        completion.error,
+        Some(XdpIoError::Submit {
+            interface: WAN,
+            rejection: TxRejection::Ring(_),
+        })
+    ));
+    assert_eq!(
+        io.current_io_disposition(),
+        PublicationQuiescenceDisposition::Stop
+    );
+    wan.set_tx_consumer(wan.tx_producer());
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        batch.finish()
+    };
+    assert_untouched(&completion);
+
+    // A drained (stopped) adapter refuses too.
+    let (lan, wan) = (kernel(), kernel());
+    let mut io = adapter(&lan, &wan);
+    io.drain(4).expect("drain");
+    let completion = {
+        let mut batch = io.begin_generated(WAN);
+        assert_eq!(
+            batch.check_capacity(1, 60),
+            Err(GeneratedAllocationError::Unavailable)
+        );
+        batch.finish()
+    };
+    assert_untouched(&completion);
 }

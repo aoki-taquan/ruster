@@ -463,6 +463,7 @@ fn budgets(config: &ValidatedConfigV1) -> TickBudgets {
         failure_dispatch_scans: wide(tick.failure_dispatch_scans),
         generated_arp: wide(tick.generated_arp),
         generated_icmpv4: wide(tick.generated_icmpv4),
+        generated_fragments: wide(tick.generated_fragments),
     }
 }
 
@@ -1180,7 +1181,8 @@ fn render<D: Datapath>(
         active.nat44_tcp(),
         active.firewall(),
     )
-    .with_nat44_icmp(active.nat44_icmp());
+    .with_nat44_icmp(active.nat44_icmp())
+    .with_fragmentation(active.fragmentation());
     let resolution_index = active.resolution().index_counters();
     stats::block(kind, now, &observer.snapshot(now), &services, |out| {
         // H4b fail-closed index outcomes (ruster run only; not in run-sim).

@@ -385,6 +385,17 @@ impl<'a> GeneratedPacketBatch for AfPacketGeneratedBatch<'a> {
             .map(|slot| GeneratedPacketLease::new(AfPacketGeneratedSlot(slot)))
     }
 
+    /// Room is the run of free TX frames from the egress producer head:
+    /// one frame per allocation, published in place by the commit. Counts
+    /// nothing and reads at most `frames` status words.
+    fn check_capacity(
+        &mut self,
+        frames: usize,
+        frame_len: usize,
+    ) -> Result<(), GeneratedAllocationError> {
+        self.0.check_room(frames, frame_len)
+    }
+
     fn finish(self) -> GeneratedBatchCompletion<Self::Error> {
         let inner = self.0.finish_batch();
         GeneratedBatchCompletion {
