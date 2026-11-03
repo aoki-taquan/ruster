@@ -741,6 +741,75 @@ fn plan_prints_the_arp_policy_as_reloadable() {
     );
 }
 
+/// URPF: `[[interfaces]] source-validation` is a reloadable per-interface
+/// delta; `off` spelled out is no change, and allow-default without
+/// `loose` is refused by `validate`.
+#[test]
+fn plan_prints_source_validation_as_a_reloadable_delta() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let with = |name: &str, keys: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen(
+                "mac = \"02:00:00:00:00:02\"\n",
+                &format!("mac = \"02:00:00:00:00:02\"\n{keys}"),
+                1,
+            ),
+        )
+        .unwrap();
+        path
+    };
+    let strict = with("urpf-strict.toml", "source-validation = \"strict\"\n");
+    let loose = with(
+        "urpf-loose.toml",
+        "source-validation = \"loose\"\nsource-validation-allow-default = true\n",
+    );
+    let off = with("urpf-off.toml", "source-validation = \"off\"\n");
+    let invalid = with(
+        "urpf-invalid.toml",
+        "source-validation = \"strict\"\nsource-validation-allow-default = true\n",
+    );
+    assert_eq!(
+        status(&ruster(&["validate".as_ref(), strict.as_os_str()])),
+        0
+    );
+
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), strict.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!(
+            "plan: reloadable\nrestart-required: none\nchanges: 1\n  \
+             source-validation + if2 strict\n{CARRY_ALL}"
+        )
+    );
+    let plan = ruster(&["plan".as_ref(), strict.as_os_str(), loose.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert!(
+        text(&plan.stdout)
+            .contains("  source-validation ~ if2 strict -> if2 loose-allow-default\n"),
+        "{}",
+        text(&plan.stdout)
+    );
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), off.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{CARRY_ALL}")
+    );
+
+    let rejected = ruster(&["validate".as_ref(), invalid.as_os_str()]);
+    assert_ne!(status(&rejected), 0);
+    let stderr = text(&rejected.stderr);
+    assert!(
+        stderr.contains("SOURCE_VALIDATION_ALLOW_DEFAULT_NOT_LOOSE"),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn plan_prints_nat_filtering_as_a_reloadable_typed_delta() {
     let dir = scratch();

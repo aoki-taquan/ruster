@@ -65,6 +65,11 @@ pub(crate) const ARP_ON_LINK_CHANGE: (&str, &str) = (
     "[resolution.policy]",
     "[arp]\nrequire-on-link-sender = true\n\n[resolution.policy]",
 );
+/// URPF: `[[interfaces]] source-validation` is reloadable.
+pub(crate) const SOURCE_VALIDATION_LAN_STRICT: (&str, &str) = (
+    "mac = \"02:00:00:00:00:01\"\n",
+    "mac = \"02:00:00:00:00:01\"\nsource-validation = \"strict\"\n",
+);
 /// NAT filtering modes are reloadable (the storage shape does not depend on
 /// them); this edit loosens UDP and tightens TCP.
 pub(crate) const NAT_FILTERING_CHANGE: [(&str, &str); 2] = [
@@ -111,6 +116,7 @@ fn only(plan: &ApplyPlan, aspects: &[&str]) {
         ("firewall_policy", plan.firewall_policy_changed()),
         ("ipv4_origin", plan.ipv4_origin_changed()),
         ("arp", plan.arp_policy_changed()),
+        ("source_validation", !plan.source_validation().is_empty()),
         ("nat44_udp", !plan.nat44_udp().is_empty()),
         ("nat44_tcp", !plan.nat44_tcp().is_empty()),
         ("backend", !plan.backend().is_empty()),
@@ -1429,5 +1435,72 @@ fn exit_protection_changes_are_restart_required_and_listed_last() {
     assert_eq!(
         both.restart_required(),
         [RestartRequired::Interfaces, RestartRequired::ExitProtection]
+    );
+}
+
+/// URPF: a `source-validation` change is a reloadable per-interface delta
+/// (an interface leaving `off` is added, returning to `off` removed, a mode
+/// change is a change), never an interface change or a restart, and
+/// spelling out `off` is no change at all.
+#[test]
+fn source_validation_changes_are_reloadable_per_interface_deltas() {
+    use ruster_core::{SourceValidation, SourceValidationBinding};
+
+    let lan = |mode| SourceValidationBinding {
+        interface: IfId(1),
+        mode,
+    };
+    let added = plan(&[SOURCE_VALIDATION_LAN_STRICT]);
+    only(&added, &["source_validation"]);
+    assert_eq!(
+        added.source_validation(),
+        [Change::Added(lan(SourceValidation::Strict))]
+    );
+    assert!(added.restart_required().is_empty());
+
+    let removed =
+        ApplyPlan::between(&config(&[SOURCE_VALIDATION_LAN_STRICT]), &config(&[])).expect("plan");
+    only(&removed, &["source_validation"]);
+    assert_eq!(
+        removed.source_validation(),
+        [Change::Removed(lan(SourceValidation::Strict))]
+    );
+
+    let loose = (
+        "mac = \"02:00:00:00:00:01\"\n",
+        "mac = \"02:00:00:00:00:01\"\nsource-validation = \"loose\"\n\
+         source-validation-allow-default = true\n",
+    );
+    let changed = ApplyPlan::between(&config(&[SOURCE_VALIDATION_LAN_STRICT]), &config(&[loose]))
+        .expect("plan");
+    only(&changed, &["source_validation"]);
+    assert_eq!(
+        changed.source_validation(),
+        [Change::Changed(Delta {
+            old: lan(SourceValidation::Strict),
+            new: lan(SourceValidation::LooseAllowDefault),
+        })]
+    );
+
+    only(
+        &plan(&[(
+            "mac = \"02:00:00:00:00:01\"\n",
+            "mac = \"02:00:00:00:00:01\"\nsource-validation = \"off\"\n",
+        )]),
+        &[],
+    );
+
+    // The successor carries the new bindings into its forwarding snapshot.
+    let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(SEED));
+    let candidate = sequencer
+        .candidate(&config(&[SOURCE_VALIDATION_LAN_STRICT]))
+        .expect("candidate");
+    assert_eq!(
+        candidate.authority().snapshot().source_validation(IfId(1)),
+        SourceValidation::Strict
+    );
+    assert_eq!(
+        candidate.authority().snapshot().source_validation(IfId(2)),
+        SourceValidation::Off
     );
 }

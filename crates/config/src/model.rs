@@ -191,6 +191,29 @@ pub struct InterfaceV1 {
     /// longer out of the interface (Fragmentation Needed with this MTU for
     /// DF datagrams). `ruster run` refuses an MTU above the device's.
     pub mtu: Option<u32>,
+    /// IPv4 source address validation (URPF) of datagrams received on this
+    /// interface; absent means `off` (RFC 1812 §5.3.8: disabled by
+    /// default). Reloadable.
+    pub source_validation: Option<SourceValidationV1>,
+    /// With `source-validation = "loose"`, also accept a source whose only
+    /// route is a default route (RFC 3704 §2.4 instead of §2.5). Only
+    /// valid with `loose`; absent means false.
+    pub source_validation_allow_default: Option<bool>,
+}
+
+/// `[[interfaces]] source-validation` (URPF).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum SourceValidationV1 {
+    /// No check (RFC 1812 §5.3.8 default).
+    #[default]
+    Off,
+    /// RFC 3704 §2.5: the source has a route other than a default route,
+    /// out of any interface.
+    Loose,
+    /// RFC 1812 §5.3.8, RFC 3704 §2.2: the longest matching route for the
+    /// source, a default route included, leaves through this interface.
+    Strict,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

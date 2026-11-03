@@ -21,7 +21,8 @@ use crate::{
     MonotonicMillis, Nat44IcmpConfig, Nat44IcmpDisposition, Nat44IcmpRuntime,
     Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig,
     Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
-    ResolutionRuntime, Route, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    ResolutionRuntime, Route, SourceValidation, SourceValidationBinding, ARP_ETHERTYPE,
+    IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
 use lookup::{linear, ForwardingIndex};
@@ -440,6 +441,14 @@ pub enum DropReason {
     /// §3.4 Reset Generation, RFC 1122 §4.2.2.12), not ICMP, and the
     /// router originates no TCP (ICMP-ERR).
     Ipv4LocalTcpUnsupported = 208,
+    /// The ingress interface validates IPv4 source addresses (URPF) and the
+    /// source failed its mode: strict, the longest matching route for the
+    /// source does not leave through the ingress interface (RFC 1812
+    /// §5.3.8, RFC 3704 §2.2); loose, the source has no route, or only a
+    /// default route unless defaults are allowed (RFC 3704 §§2.4, 2.5).
+    /// Silently discarded: no ICMP error (RFC 1812 §5.3.8 "MUST silently
+    /// discard"), for transit and router-addressed datagrams alike.
+    Ipv4SourceValidationFailed = 209,
 }
 
 use DropReason::*;
@@ -447,7 +456,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 208] = [
+    pub const ALL: [Self; 209] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -656,6 +665,7 @@ impl DropReason {
         Ipv4LocalUdpPortUnreachable,
         Ipv4LocalUdpInvalid,
         Ipv4LocalTcpUnsupported,
+        Ipv4SourceValidationFailed,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -881,6 +891,7 @@ impl DropReason {
             Ipv4LocalUdpPortUnreachable => "IPV4_LOCAL_UDP_PORT_UNREACHABLE",
             Ipv4LocalUdpInvalid => "IPV4_LOCAL_UDP_INVALID",
             Ipv4LocalTcpUnsupported => "IPV4_LOCAL_TCP_UNSUPPORTED",
+            Ipv4SourceValidationFailed => "IPV4_SOURCE_VALIDATION_FAILED",
         }
     }
 }
@@ -906,6 +917,14 @@ pub enum SnapshotError {
     LocalIpv4BindingUnspecified,
     /// An interface MTU is below [`crate::IPV4_MIN_MTU`] (RFC 791).
     InterfaceMtuBelowMinimum,
+    /// A source validation binding names an interface the snapshot does
+    /// not have (URPF).
+    SourceValidationUnknownInterface,
+    /// Two source validation bindings name the same interface (URPF).
+    DuplicateSourceValidation,
+    /// Borrowed source validation bindings are not sorted by interface
+    /// (URPF; [`ValidatedForwardingOwner::with_source_validation`] sorts).
+    SourceValidationUnsorted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1018,6 +1037,10 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) local_ipv4: &'a [LocalIpv4Binding],
     pub(crate) ipv4_origin: Ipv4OriginPolicy,
     pub(crate) arp: ArpPolicy,
+    /// Per-interface source validation (URPF), sorted by interface, every
+    /// mode other than [`SourceValidation::Off`]. Empty (the RFC 1812
+    /// §5.3.8 default) costs the packet path one branch.
+    source_validation: &'a [SourceValidationBinding],
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
     /// Without it every lookup uses the linear reference (PERF-002).
@@ -1037,6 +1060,7 @@ impl std::fmt::Debug for ForwardingSnapshot<'_> {
             .field("local_ipv4_len", &self.local_ipv4.len())
             .field("ipv4_origin", &self.ipv4_origin)
             .field("arp", &self.arp)
+            .field("source_validation_len", &self.source_validation.len())
             .finish_non_exhaustive()
     }
 }
@@ -1064,6 +1088,7 @@ pub struct ValidatedForwardingOwner {
     local_ipv4: Box<[LocalIpv4Binding]>,
     ipv4_origin: Ipv4OriginPolicy,
     arp: ArpPolicy,
+    source_validation: Box<[SourceValidationBinding]>,
     index: ForwardingIndex,
     authority: u64,
 }
@@ -1085,6 +1110,7 @@ impl std::fmt::Debug for ValidatedForwardingOwner {
             .field("local_ipv4_len", &self.local_ipv4.len())
             .field("ipv4_origin", &self.ipv4_origin)
             .field("arp", &self.arp)
+            .field("source_validation_len", &self.source_validation.len())
             .finish_non_exhaustive()
     }
 }
@@ -1194,6 +1220,7 @@ impl<'a> ForwardingSnapshot<'a> {
             local_ipv4,
             ipv4_origin,
             arp: ArpPolicy::RFC826,
+            source_validation: &[],
             index: None,
             authority: calculate_snapshot_authority(
                 routes,
@@ -1202,6 +1229,7 @@ impl<'a> ForwardingSnapshot<'a> {
                 local_ipv4,
                 ipv4_origin,
                 ArpPolicy::RFC826,
+                &[],
             ),
         })
     }
@@ -1227,6 +1255,7 @@ impl<'a> ForwardingSnapshot<'a> {
                 self.local_ipv4,
                 self.ipv4_origin,
                 arp,
+                self.source_validation,
             )
         } else {
             self.authority
@@ -1242,6 +1271,59 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub const fn arp_policy(&self) -> ArpPolicy {
         self.arp
+    }
+
+    /// Returns this snapshot with `bindings` as its per-interface source
+    /// validation (URPF; default: every interface
+    /// [`SourceValidation::Off`]). `bindings` must be sorted by interface,
+    /// name only interfaces of this snapshot, and name each at most once;
+    /// an interface without a binding is off. A snapshot not borrowed from
+    /// a [`ValidatedForwardingOwner`] recomputes its authority.
+    ///
+    /// For tests and benches that borrow tables directly. Production code
+    /// sets the bindings on the owner
+    /// ([`ValidatedForwardingOwner::with_source_validation`]).
+    pub fn with_source_validation(
+        self,
+        bindings: &'a [SourceValidationBinding],
+    ) -> Result<Self, SnapshotError> {
+        check_source_validation(self.interfaces, bindings)?;
+        if bindings
+            .windows(2)
+            .any(|pair| pair[0].interface >= pair[1].interface)
+        {
+            return Err(SnapshotError::SourceValidationUnsorted);
+        }
+        let authority = if self.authority & VALIDATED_OWNER_AUTHORITY_BIT == 0 {
+            calculate_snapshot_authority(
+                self.routes,
+                self.interfaces,
+                self.neighbors,
+                self.local_ipv4,
+                self.ipv4_origin,
+                self.arp,
+                bindings,
+            )
+        } else {
+            self.authority
+        };
+        Ok(Self {
+            source_validation: bindings,
+            authority,
+            ..self
+        })
+    }
+
+    /// The source validation mode of `interface` (URPF).
+    #[must_use]
+    pub fn source_validation(&self, interface: IfId) -> SourceValidation {
+        source_validation_of(self.source_validation, interface)
+    }
+
+    /// The per-interface source validation bindings, sorted by interface.
+    #[must_use]
+    pub const fn source_validation_bindings(&self) -> &'a [SourceValidationBinding] {
+        self.source_validation
     }
 
     pub(crate) const fn authority(&self) -> u64 {
@@ -1451,9 +1533,38 @@ impl ValidatedForwardingOwner {
             local_ipv4,
             ipv4_origin,
             arp: ArpPolicy::RFC826,
+            source_validation: Box::default(),
             index,
             authority,
         })
+    }
+
+    /// Returns this owner with `bindings` as the per-interface source
+    /// validation (URPF) of every snapshot it lends. An interface without
+    /// a binding is [`SourceValidation::Off`] (RFC 1812 §5.3.8: disabled by
+    /// default). Bindings may come in any order and are sorted here; `Off`
+    /// bindings are dropped, so an all-off owner allocates nothing and the
+    /// packet path pays one branch. Cold path, nothing is reindexed.
+    pub fn with_source_validation(
+        mut self,
+        bindings: &[SourceValidationBinding],
+    ) -> Result<Self, ValidatedForwardingOwnerError> {
+        check_source_validation(&self.interfaces, bindings)
+            .map_err(ValidatedForwardingOwnerError::Snapshot)?;
+        let mut sorted: Vec<SourceValidationBinding> = bindings
+            .iter()
+            .copied()
+            .filter(|binding| binding.mode != SourceValidation::Off)
+            .collect();
+        sorted.sort_by_key(|binding| binding.interface);
+        self.source_validation = sorted.into_boxed_slice();
+        Ok(self)
+    }
+
+    /// The source validation bindings other than off, sorted by interface.
+    #[must_use]
+    pub fn source_validation(&self) -> &[SourceValidationBinding] {
+        &self.source_validation
     }
 
     /// Returns this owner with `arp` as the ARP receive policy of every
@@ -1475,6 +1586,7 @@ impl ValidatedForwardingOwner {
             local_ipv4: &self.local_ipv4,
             ipv4_origin: self.ipv4_origin,
             arp: self.arp,
+            source_validation: &self.source_validation,
             index: Some(&self.index),
             authority: self.authority,
         }
@@ -1542,6 +1654,7 @@ fn calculate_snapshot_authority(
     local_ipv4: &[LocalIpv4Binding],
     ipv4_origin: Ipv4OriginPolicy,
     arp: ArpPolicy,
+    source_validation: &[SourceValidationBinding],
 ) -> u64 {
     fn mix(hash: u64, value: u64) -> u64 {
         (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
@@ -1599,7 +1712,48 @@ fn calculate_snapshot_authority(
     if arp.require_on_link_sender() {
         hash = mix(hash, 0xa7);
     }
+    // Empty (every interface off) mixes nothing, so existing publications
+    // keep their authority values.
+    for binding in source_validation {
+        hash = mix(hash, 0x5f_0000 | u64::from(binding.interface.0));
+        hash = mix(hash, binding.mode as u64);
+    }
     hash & !VALIDATED_OWNER_AUTHORITY_BIT
+}
+
+/// Every binding names a known interface, at most once (URPF).
+fn check_source_validation(
+    interfaces: &[Interface],
+    bindings: &[SourceValidationBinding],
+) -> Result<(), SnapshotError> {
+    for (index, binding) in bindings.iter().enumerate() {
+        if !interfaces
+            .iter()
+            .any(|interface| interface.id == binding.interface)
+        {
+            return Err(SnapshotError::SourceValidationUnknownInterface);
+        }
+        if bindings[..index]
+            .iter()
+            .any(|candidate| candidate.interface == binding.interface)
+        {
+            return Err(SnapshotError::DuplicateSourceValidation);
+        }
+    }
+    Ok(())
+}
+
+/// The mode of `interface` in sorted `bindings`; off without a binding.
+/// One branch when every interface is off, else a binary search over the
+/// interfaces that validate (at most 256).
+#[inline]
+fn source_validation_of(bindings: &[SourceValidationBinding], interface: IfId) -> SourceValidation {
+    if bindings.is_empty() {
+        return SourceValidation::Off;
+    }
+    bindings
+        .binary_search_by_key(&interface, |binding| binding.interface)
+        .map_or(SourceValidation::Off, |index| bindings[index].mode)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1761,6 +1915,16 @@ pub enum TraceEvent {
         egress: IfId,
         target: crate::Ipv4Address,
         reason: ConsumeReason,
+    },
+    /// A received IPv4 datagram failed the source validation `mode` of its
+    /// ingress interface (URPF); it is then dropped as
+    /// [`DropReason::Ipv4SourceValidationFailed`] (or, replayed from an ARP
+    /// hold, counted as the hold's `replay_dropped`), without any ICMP
+    /// error.
+    Ipv4SourceValidationFailed {
+        ingress: IfId,
+        source: crate::Ipv4Address,
+        mode: SourceValidation,
     },
     /// A datagram held for ARP was dropped with `reason` when it was
     /// replayed (ARP-HOLD). Not a received frame's drop: the frame was
@@ -3124,6 +3288,26 @@ impl<T: TraceSink> TraceSink for ReplayTrace<'_, T> {
     }
 }
 
+/// Records the source and mode of a URPF drop. Cold: only a failing
+/// datagram reads its source again.
+#[cold]
+#[inline(never)]
+fn trace_source_validation_failure<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    trace: &mut T,
+) {
+    let offset = packet::ETHERNET_HEADER_LEN + 12;
+    if let Some(&[a, b, c, d]) = frame.get(offset..offset + 4) {
+        trace.record(TraceEvent::Ipv4SourceValidationFailed {
+            ingress,
+            source: crate::Ipv4Address::from_octets([a, b, c, d]),
+            mode: snapshot.source_validation(ingress),
+        });
+    }
+}
+
 /// Holds a datagram whose decision ended at a resolving neighbour miss
 /// (ARP-HOLD); `Err` is the typed refusal, or `NEIGHBOR_UNRESOLVED` when the
 /// miss started no resolution that could end in a replay. Cold path.
@@ -3611,6 +3795,9 @@ where
                         tracker.commit_deny(ticket, nat_now_ms);
                     }
                 }
+                if reason == Ipv4SourceValidationFailed {
+                    trace_source_validation_failure(packet.bytes_mut(), snapshot, ingress, trace);
+                }
                 packet.recycle(reason);
                 dropped += 1;
                 trace.record(TraceEvent::Dropped { ingress, reason });
@@ -3819,7 +4006,7 @@ fn admit_first_fragment(
     now_ms: u64,
 ) -> Result<Ipv4FragmentFirstTicket, DropReason> {
     validate_ethernet_ingress(frame, snapshot, ingress, IPV4_ETHERTYPE)?;
-    validate_ipv4_ingress(snapshot, ipv4)?;
+    validate_ipv4_ingress(snapshot, ingress, ipv4)?;
     info.check_structure()?;
     tracker.admit_first(info, now_ms)
 }
@@ -3844,7 +4031,7 @@ fn decide_later_fragment(
     now_ms: u64,
 ) -> Result<PacketDecision, DropReason> {
     validate_ethernet_ingress(frame, snapshot, ingress, IPV4_ETHERTYPE)?;
-    validate_ipv4_ingress(snapshot, ipv4)?;
+    validate_ipv4_ingress(snapshot, ingress, ipv4)?;
     if ipv4.header_len != 20 {
         return Err(Ipv4OptionsUnsupported);
     }
@@ -3980,8 +4167,14 @@ fn validate_ethernet_ingress(
     Ok(())
 }
 
+/// The IPv4 ingress checks every received datagram passes before any
+/// decision, state, or ICMP error: martian sources (RFC 1812 §5.3.7),
+/// martian destinations, then the ingress interface's source validation
+/// (URPF, RFC 1812 §5.3.8, RFC 3704), which reuses the source route lookup
+/// of the martian checks. A failure is a silent drop.
 fn validate_ipv4_ingress(
     snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
     ipv4: packet::ValidatedIpv4,
 ) -> Result<(), DropReason> {
     let source = ipv4.source.octets();
@@ -3998,7 +4191,8 @@ fn validate_ipv4_ingress(
     if snapshot.is_local_ipv4(ipv4.source) {
         return Err(Ipv4SourceLocalAddress);
     }
-    if let Some(selected) = snapshot.route_lookup(ipv4.source) {
+    let source_route = snapshot.route_lookup(ipv4.source);
+    if let Some(selected) = source_route {
         if selected.is_prefix_network_address(ipv4.source) {
             return Err(Ipv4SourceNetworkAddress);
         }
@@ -4012,12 +4206,21 @@ fn validate_ipv4_ingress(
         return Err(Ipv4DestinationLimitedBroadcast);
     }
     match destination[0] {
-        0 => Err(Ipv4DestinationUnspecifiedNetwork),
-        127 => Err(Ipv4DestinationLoopback),
-        224..=239 => Err(Ipv4DestinationMulticast),
-        240..=255 => Err(Ipv4DestinationClassE),
-        _ => Ok(()),
+        0 => return Err(Ipv4DestinationUnspecifiedNetwork),
+        127 => return Err(Ipv4DestinationLoopback),
+        224..=239 => return Err(Ipv4DestinationMulticast),
+        240..=255 => return Err(Ipv4DestinationClassE),
+        _ => {}
     }
+    // URPF: no lookup of its own. With every interface off the bindings are
+    // empty and this is one branch.
+    if !snapshot
+        .source_validation(ingress)
+        .admits(ingress, source_route)
+    {
+        return Err(Ipv4SourceValidationFailed);
+    }
+    Ok(())
 }
 
 fn validate_ipv4_forward_destination(
@@ -4085,7 +4288,7 @@ fn decide_ipv4<T: TraceSink>(
         ingress,
         destination: ipv4.destination,
     });
-    validate_ipv4_ingress(snapshot, ipv4)?;
+    validate_ipv4_ingress(snapshot, ingress, ipv4)?;
     let local = snapshot.is_local_ipv4_on(ingress, ipv4.destination);
     let selected_route = if local {
         None
@@ -7760,7 +7963,7 @@ fn truncated_parameter_problem<T: TraceSink>(
     let Some(ipv4) = packet::validate_truncated_ipv4_header(frame) else {
         return;
     };
-    if validate_ipv4_ingress(snapshot, ipv4).is_err() {
+    if validate_ipv4_ingress(snapshot, ingress, ipv4).is_err() {
         return;
     }
     // A datagram to the NAT public address with a firewall would be a NAT
@@ -8477,13 +8680,13 @@ mod tests {
             format!("{first_snapshot:?}"),
             "ForwardingSnapshot { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
-             arp: ArpPolicy { require_on_link_sender: false }, .. }"
+             arp: ArpPolicy { require_on_link_sender: false }, source_validation_len: 0, .. }"
         );
         assert_eq!(
             format!("{first:?}"),
             "ValidatedForwardingOwner { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
-             arp: ArpPolicy { require_on_link_sender: false }, .. }"
+             arp: ArpPolicy { require_on_link_sender: false }, source_validation_len: 0, .. }"
         );
     }
 
@@ -9395,6 +9598,7 @@ mod tests {
             (206, "IPV4_LOCAL_UDP_PORT_UNREACHABLE"),
             (207, "IPV4_LOCAL_UDP_INVALID"),
             (208, "IPV4_LOCAL_TCP_UNSUPPORTED"),
+            (209, "IPV4_SOURCE_VALIDATION_FAILED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9404,7 +9608,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(209), None);
+        assert_eq!(DropReason::from_code(210), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

@@ -333,6 +333,27 @@ Protocol Unreachableを返し、外からport/protocol scanとrouterの存在確
 `[nat44.tcp] unsolicited-syn-icmp = false`も。switchはrouter全体、interface別は未実装）。詳細は
 runbookの「Errors about datagrams for the router and bad headers (ICMP-ERR)」。
 
+IPv4 source address validation (URPF)は`[[interfaces]]`ごとの`source-validation`です。
+RFC 1812 §5.3.8（"If this feature is implemented, it MUST be disabled by default"）に従いdefaultは
+`off`で、hardeningとして`strict`（sourceへのlongest-match routeがそのinterfaceから出る。default
+routeも数える。RFC 1812 §5.3.8、RFC 3704 §2.2）と`loose`（`/0`以外のrouteがある。RFC 3704 §2.5。
+`source-validation-allow-default = true`でdefault routeも可、§2.4）を選べます。失敗は
+`IPV4_SOURCE_VALIDATION_FAILED`（code 209）のsilent dropで、ICMP errorは一切返しません
+（RFC 1812 §5.3.8 "MUST silently discard"）。WAN（NAT outside）には`strict`が向きます: Internetの
+sourceはdefault routeで通りNATの応答も変換される一方、WANに来たinside sourceの詐称は落ち、
+ICMP4-023のclass 0 vectorが閉じます（default routeしか無いWANに`loose`を置くとInternet sourceが
+全部落ちる）。LANの`strict`はBCP 38（RFC 2827）のinside filteringです。判定はmartian検査が既に
+行うsourceのroute lookupを再利用し（追加lookupなし、`off`ならbranch一つ）、reload可能で、
+storageは増えません。feasible-path（RFC 3704 §2.3、RFC 8704）はprefixごとに一つのpathしか無いので
+提供しません。詳細はrunbookの「Source address validation (URPF)」。
+
+```toml
+[[interfaces]]
+# ...
+source-validation = "strict"            # "off"（default）| "loose" | "strict"、reload可能
+# source-validation-allow-default = true  # "loose"のときだけ（RFC 3704 §2.4）
+```
+
 interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は
 `INTERFACES`のrestart-required）です。forwardingはTTL判定とfirewallの後、NAT/firewall stateを
 commitする前に、受信frameを送るすべてのIPv4 decision（plain、NAT44 UDP/TCP/ICMP query、
@@ -461,7 +482,8 @@ arrayのcapacityを一つのopaque valueとして返します。受信ICMPv4 err
 「NAT44 ICMPv4 error translation」を参照してください。outside/public宛てerrorは引用する
 live UDP mapping/ADF peerをread-only参照し、outer destinationと引用source tupleをinsideへ
 戻します。outer sourceはexternal host-unicastかつoutsideへのreverse LPMを要求する
-local strict-uRPF policyで、asymmetric external pathを意図的に拒否します。中継routerの
+local strict-uRPF policyで、asymmetric external pathを意図的に拒否します（受信datagram全般の
+interfaceごとのsource address validationは下の「IPv4 source address validation (URPF)」）。中継routerの
 addressは引用remoteと異なっていても保存します。fragment、local MTU起因の
 Type 3/Code 4生成、PMTU cache、static forward、
 multi-public、port randomization/parity、full packet filterはdeferredで、RFC 4787/7857全体への

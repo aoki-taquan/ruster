@@ -737,10 +737,12 @@ admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
   change. A UDP flood to a router address therefore also delays Time
   Exceeded toward the same interface (`icmpv4_errors.rate_limited`,
   `pending`); turn `udp-port-unreachable` off if that matters more than
-  answering UDP probes. Sources are not authenticated and there is no
-  ingress (uRPF) source filtering yet: UDP to a router address with a
-  spoofed inside source uses up the limiter of the inside interface and
-  delays errors to the real inside hosts.
+  answering UDP probes. Sources are not authenticated: with the default
+  `source-validation = "off"`, UDP to a router address with a spoofed
+  inside source uses up the limiter of the inside interface and delays
+  errors to the real inside hosts. `source-validation = "strict"` on the
+  WAN drops such datagrams silently before any error is considered (see
+  "Source address validation (URPF)" below).
 - With `udp-port-unreachable = false` the UDP checksum of router-addressed
   datagrams is not read (a flood costs no payload pass); such datagrams
   are all `IPV4_LOCAL_UDP_PORT_UNREACHABLE`, a broken header still
@@ -797,6 +799,72 @@ reasons instead, or exclude the four new codes. The twelve new
 `icmpv4_errors.*` counters are appended after the existing ones, so the
 order of the earlier fields in stats and JSONL is unchanged. Storage is
 unchanged (67050176 bytes for the maximal production config).
+
+### Source address validation (URPF)
+
+Each `[[interfaces]]` entry can check the source address of the IPv4
+datagrams it receives against the forwarding table (RFC 1812 §5.3.8,
+RFC 3704, BCP 38/RFC 2827):
+
+```toml
+[[interfaces]]
+id = 2
+name = "wan"
+device = "wan0"
+mac = "02:00:00:00:00:02"
+source-validation = "strict"            # "off" (default) | "loose" | "strict"
+# source-validation-allow-default = true  # only with "loose"
+```
+
+| mode | passes when the longest matching route for the source ... | RFC |
+|---|---|---|
+| `off` (default) | (no check) | RFC 1812 §5.3.8 "MUST be disabled by default" |
+| `strict` | exists and leaves through this interface; a default route counts | RFC 1812 §5.3.8, RFC 3704 §2.2 |
+| `loose` | exists and is not a `/0`, out of any interface | RFC 3704 §2.5 |
+| `loose` + `source-validation-allow-default = true` | exists, a default route included | RFC 3704 §2.4 |
+
+- A failing datagram is silently discarded (RFC 1812 §5.3.8 "MUST silently
+  discard"): `drop.IPV4_SOURCE_VALIDATION_FAILED` (code 209), the trace
+  event `Ipv4SourceValidationFailed{ingress, source, mode}`, and no ICMP
+  error of any kind (no Echo Reply, Port/Protocol Unreachable, Time
+  Exceeded, or Parameter Problem). The counter is router-wide; the
+  `Dropped` trace carries the ingress interface.
+- Which mode where. On the WAN (NAT outside) use `strict`: the Internet's
+  default route leaves through the WAN, so every Internet source passes
+  and NAT answers to the public address are translated as usual, while a
+  datagram claiming an inside (or any LAN-routed) source arriving on the
+  WAN is dropped. That closes the ICMP4-023 class 0 vector (spoofed inside
+  sources making the router queue errors toward the inside egress). Do
+  not use plain `loose` on a WAN whose only route back is the default
+  route: it ignores default routes and drops all Internet traffic.
+  On the LAN, `strict` is BCP 38 filtering of the inside network: hosts on
+  the connected prefixes (and prefixes routed via a LAN gateway) pass,
+  spoofed Internet sources never reach the NAT or the firewall.
+- Asymmetric routing: if traffic from a prefix can arrive on an interface
+  other than the one its route leaves through, `strict` drops it; use
+  `loose` there.
+- Feasible-path uRPF (RFC 3704 §2.3, RFC 8704) is not offered: the
+  forwarding table has one path per prefix, so it would equal `strict`.
+- The check runs in the IPv4 ingress validation after the martian source
+  and destination checks (they keep their own reasons) and before local
+  delivery, NAT, the firewall, the fragment association table, and ARP
+  holds, for transit and router-addressed datagrams alike. It reuses the
+  source route lookup those checks already make; with every interface
+  `off` it costs one branch. ARP and the router's own generated frames are
+  not checked. A held datagram is decided again at replay against the same
+  publication (an apply drops every hold), so it gets the same answer.
+- Reload: changing either key is reloadable (`ruster plan` shows
+  `source-validation + if2 strict`, `~ if2 strict -> if2 loose`, or `-`);
+  no state is flushed for it. `source-validation-allow-default` without
+  `loose` is refused by `validate` with
+  `SOURCE_VALIDATION_ALLOW_DEFAULT_NOT_LOOSE`; an unknown mode is
+  `INVALID_TYPE`.
+- Storage is unchanged (67050176 bytes for the maximal production config):
+  the modes live in the forwarding snapshot, not in runtime storage.
+- Upgrade note: the new drop code 209 `IPV4_SOURCE_VALIDATION_FAILED` is
+  appended after 208, so stats and JSONL gain one `drop.*` field at the
+  end (0 while every interface is `off`); nothing else changes for a
+  config without the keys.
 
 ### DF-clear datagrams through the NAT (MTU2 part A)
 
@@ -3253,6 +3321,12 @@ What it proves, on the runner's kernel only:
   to host B; host B sees all three from 203.0.113.2 with valid checksums,
   the DF-clear ones still without DF and with consecutive generated IDs,
   the DF one with the ID host A sent; no fragment drop is counted.
+  Added by URPF (`priv_run_urpf`): with `source-validation = "strict"` on
+  both ports, host A -> host B is still forwarded and translated and host
+  B's Echo Request to 203.0.113.2 is answered, while the same Echo sent
+  from host B's extra inside address 192.168.1.99/32 gets no reply and
+  counts `drop.IPV4_SOURCE_VALIDATION_FAILED`; a SIGHUP reload to `off`
+  (generation 2) answers it again; exit 0, nothing attached.
   Added by MTU2 part B (`priv_run_frag*`): with the WAN link (rb, pb, and
   the wan `mtu`) at 1400, a DF-clear 1500-byte UDP datagram from host A
   arrives at host B's pb as exactly the RFC 791 pair of fragments from

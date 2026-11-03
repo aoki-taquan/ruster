@@ -2650,3 +2650,88 @@ fn resolution_hold_section_defaults_on_and_fails_closed() {
         assert!(parse(with(unknown).as_bytes()).is_err(), "{unknown}");
     }
 }
+
+/// URPF: `[[interfaces]] source-validation` is off when absent (RFC 1812
+/// §5.3.8 "MUST be disabled by default"), maps `loose`/`strict` (and
+/// `loose` with `source-validation-allow-default`) onto the core modes
+/// sorted by interface, and refuses the allow-default switch without
+/// `loose` at its own path. Unknown modes are a type error.
+#[test]
+fn source_validation_is_off_by_default_and_maps_onto_core_modes() {
+    use ruster_core::{IfId, SourceValidation, SourceValidationBinding};
+
+    assert!(validated(VALID).source_validation().is_empty());
+    let with = |wan: &str, lan: &str| {
+        VALID
+            .replacen(
+                "mac = \"02:00:00:00:00:02\"\n",
+                &format!("mac = \"02:00:00:00:00:02\"\n{wan}"),
+                1,
+            )
+            .replacen(
+                "mac = \"02:00:00:00:00:01\"\n",
+                &format!("mac = \"02:00:00:00:00:01\"\n{lan}"),
+                1,
+            )
+    };
+    let binding = |id, mode| SourceValidationBinding {
+        interface: IfId(id),
+        mode,
+    };
+    assert!(validated(&with(
+        "source-validation = \"off\"\n",
+        "source-validation-allow-default = false\n"
+    ))
+    .source_validation()
+    .is_empty());
+    // The WAN (id 2) is listed first in the document; bindings are sorted.
+    assert_eq!(
+        validated(&with(
+            "source-validation = \"strict\"\n",
+            "source-validation = \"loose\"\n"
+        ))
+        .source_validation(),
+        [
+            binding(1, SourceValidation::Loose),
+            binding(2, SourceValidation::Strict)
+        ]
+    );
+    assert_eq!(
+        validated(&with(
+            "source-validation = \"loose\"\nsource-validation-allow-default = true\n",
+            ""
+        ))
+        .source_validation(),
+        [binding(2, SourceValidation::LooseAllowDefault)]
+    );
+    for wan in [
+        "source-validation = \"strict\"\nsource-validation-allow-default = true\n",
+        "source-validation = \"off\"\nsource-validation-allow-default = true\n",
+        "source-validation-allow-default = true\n",
+    ] {
+        let rejected = error(&with(wan, ""));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::SourceValidationAllowDefaultNotLoose
+        );
+        assert_eq!(
+            rejected.code().code(),
+            "SOURCE_VALIDATION_ALLOW_DEFAULT_NOT_LOOSE"
+        );
+        assert_eq!(
+            dotted(rejected.path()),
+            "interfaces[0].source-validation-allow-default"
+        );
+    }
+    for wan in [
+        "source-validation = \"feasible\"\n",
+        "source-validation = true\n",
+        "source-validation-allow-default = \"yes\"\n",
+    ] {
+        let diagnostic = parse(with(wan, "").as_bytes()).unwrap_err();
+        assert_eq!(
+            diagnostic.code(),
+            ruster_config::DiagnosticCode::InvalidType
+        );
+    }
+}

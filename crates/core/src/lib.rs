@@ -26,6 +26,7 @@ mod resolution_reference;
 mod route;
 mod slot_index;
 mod slot_list;
+mod source_validation;
 
 pub use arp_hold::{
     ArpHoldCounters, ArpHoldPolicy, ArpHoldPolicyError, ArpHoldRuntime, ArpHoldSlot,
@@ -184,3 +185,4 @@ pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError,
     ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
+pub use source_validation::{SourceValidation, SourceValidationBinding};
