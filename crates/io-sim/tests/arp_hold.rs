@@ -812,6 +812,76 @@ fn holding_off_drops_as_before() {
     assert!(world.tick(10, &[(WAN, g_reply())]).is_empty());
 }
 
+/// ICMP-REDIRECT: a LAN-to-LAN datagram (H to J, both on 192.168.1.0/24)
+/// whose next hop J is unresolved is held without a Redirect; the replay
+/// decides it anew, forwards it to J, and only then sends H the Redirect
+/// for Host naming J (RFC 1812 §5.2.7.2), quoting the datagram as H sent
+/// it. A hold is not a forward, so a datagram dropped from the hold never
+/// provoked one.
+#[test]
+fn a_held_lan_to_lan_datagram_is_redirected_at_replay() {
+    let text = ROUTER.replacen(
+        "[tick]",
+        "[[firewall.rules]]\nid = 70\ningress = \"lan\"\negress = \"lan\"\n\
+         source = \"192.168.1.0/24\"\ndestination = \"192.168.1.0/24\"\n\
+         protocol = \"udp\"\naction = \"allow-stateful\"\n\n\
+         [firewall.rules.source-ports]\nfirst = 1\nlast = 65535\n\n\
+         [firewall.rules.destination-ports]\nfirst = 1\nlast = 65535\n\n[tick]",
+        1,
+    );
+    let mut world = World::new(&text);
+    let datagram = ipv4(H, J, 0x0909, DF, 64, 17, &udp(H, J, (5000, 7000), b"lan"));
+    let received = ethernet(LAN_MAC, H_MAC, 0x0800, &datagram);
+    let sent = world.tick(0, &[(LAN, received)]);
+    assert_eq!(bytes(&sent), [(LAN, arp_request(LAN_MAC, LAN_IP, J))]);
+    assert_eq!(world.live(), 1);
+
+    let j_reply = arp(LAN_MAC, 2, (J_MAC, J), (LAN_MAC, LAN_IP));
+    let sent = world.tick(10, &[(LAN, j_reply)]);
+    let mut redirect = vec![5, 1, 0, 0];
+    redirect.extend_from_slice(&J);
+    redirect.extend_from_slice(&datagram);
+    let checksum = sum16(&redirect);
+    redirect[2..4].copy_from_slice(&checksum.to_be_bytes());
+    let mut outer = ipv4(LAN_IP, H, 0, DF, 64, 1, &redirect);
+    outer[1] = 0xc0;
+    outer[10..12].fill(0);
+    let checksum = sum16(&outer[..20]);
+    outer[10..12].copy_from_slice(&checksum.to_be_bytes());
+    // The replayed datagram is staged and leaves in the tick's last
+    // (generated fragment) phase, after the generated ICMPv4 phase.
+    assert_eq!(
+        bytes(&sent),
+        [
+            (LAN, ethernet(H_MAC, LAN_MAC, 0x0800, &outer)),
+            (
+                LAN,
+                ethernet(
+                    J_MAC,
+                    LAN_MAC,
+                    0x0800,
+                    &ipv4(H, J, 0x0909, DF, 63, 17, &udp(H, J, (5000, 7000), b"lan"))
+                )
+            ),
+        ]
+    );
+    assert_eq!(world.hold().replay_sent, 1);
+}
+
+/// ICMP-REDIRECT: the forward firewall decides first, so a LAN-to-LAN
+/// datagram it denies (the fixture has no LAN-to-LAN rule) gets no
+/// Redirect and no ARP: a Redirect never tells a source about a path the
+/// policy refuses.
+#[test]
+fn a_firewall_denied_lan_to_lan_datagram_gets_no_redirect() {
+    let mut world = World::new(ROUTER);
+    let datagram = ipv4(H, J, 0x0a0a, DF, 64, 17, &udp(H, J, (5000, 7000), b"lan"));
+    let sent = world.tick(0, &[(LAN, ethernet(LAN_MAC, H_MAC, 0x0800, &datagram))]);
+    assert!(sent.is_empty(), "{sent:?}");
+    assert_eq!(world.drops(DropReason::FirewallDefaultDenied), 1);
+    assert_eq!(world.hold().held, 0);
+}
+
 /// Hairpin (RFC 4787 REQ-9): H's datagram to J's public mapping turns back
 /// into the LAN towards J, which the router has not resolved: it is held,
 /// and sent with H's external source when J answers the ARP Request.

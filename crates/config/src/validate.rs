@@ -1941,6 +1941,7 @@ fn validate_v1(
                             Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
                             generate.admin_prohibited,
                         )
+                        .with_generation(Icmpv4ErrorKind::RedirectHost, generate.redirect)
                 })
                 .map_err(|error| {
                     ValidationError::new(

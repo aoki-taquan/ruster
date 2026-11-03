@@ -693,6 +693,14 @@ pub struct Icmpv4ErrorGenerateV1 {
     /// option; owner decision).
     #[serde(default)]
     pub admin_prohibited: bool,
+    /// Redirect for Host (Type 5/Code 1) to a source on the ingress
+    /// interface's subnet whose datagram the router forwards back out of
+    /// that interface to a next hop on the same subnet (RFC 1812 §5.2.7.2:
+    /// routers MUST be able to generate it, and §5.2.1 step 12 sends it).
+    /// Default `true`. `false` stops it (topology disclosure, Redirects
+    /// provoked by spoofed sources); the datagram is forwarded either way.
+    #[serde(default = "enabled")]
+    pub redirect: bool,
 }
 
 impl Default for Icmpv4ErrorGenerateV1 {
@@ -706,6 +714,7 @@ impl Default for Icmpv4ErrorGenerateV1 {
             udp_port_unreachable: true,
             parameter_problem: true,
             admin_prohibited: false,
+            redirect: true,
         }
     }
 }

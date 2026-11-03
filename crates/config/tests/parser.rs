@@ -472,7 +472,7 @@ fn icmpv4_generation_switches_default_on_and_are_exact() {
     for (needle, replacement, code) in [
         (
             "[icmpv4-errors.capacity]",
-            "[icmpv4-errors.generate]\nredirect = false\n\n[icmpv4-errors.capacity]",
+            "[icmpv4-errors.generate]\nsource-quench = false\n\n[icmpv4-errors.capacity]",
             DiagnosticCode::UnknownField,
         ),
         (

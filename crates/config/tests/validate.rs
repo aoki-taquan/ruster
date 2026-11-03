@@ -858,6 +858,36 @@ fn icmp_err_switches_map_onto_core_policies() {
     assert_eq!(config.storage_shape(), validated(VALID).storage_shape());
 }
 
+/// ICMP-REDIRECT: `redirect` defaults to `true` (RFC 1812 §5.2.7.2, Redirect
+/// for Host), maps onto exactly the core Redirect kind, and does not change
+/// the storage shape.
+#[test]
+fn icmp_redirect_switch_maps_onto_the_core_policy() {
+    use ruster_core::Icmpv4ErrorKind;
+
+    let defaults = validated(VALID).icmpv4_errors().unwrap().policy();
+    assert!(defaults.generates(Icmpv4ErrorKind::RedirectHost));
+    let off = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nredirect = false\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    let config = validated(&off);
+    let policy = config.icmpv4_errors().unwrap().policy();
+    assert!(!policy.generates(Icmpv4ErrorKind::RedirectHost));
+    assert_eq!(
+        policy.with_generation(Icmpv4ErrorKind::RedirectHost, true),
+        defaults
+    );
+    assert_eq!(config.storage_shape(), validated(VALID).storage_shape());
+    let on = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nredirect = true\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    assert_eq!(validated(&on).icmpv4_errors().unwrap().policy(), defaults);
+}
+
 /// B3: the Port Unreachable limiter interval defaults to 1 s, is a policy
 /// field (restart-required with the rest of the ICMPv4 error policy), and
 /// must not be 0.

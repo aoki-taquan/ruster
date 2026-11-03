@@ -537,7 +537,7 @@ fn service_counters_render_in_fixed_order(
     );
     for (section, fields) in [
         ("resolution", 13),
-        ("icmpv4_errors", 50),
+        ("icmpv4_errors", 53),
         ("nat44_udp", 19),
         ("nat44_tcp", 40),
         ("nat44_icmp", 16),

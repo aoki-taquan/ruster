@@ -810,6 +810,61 @@ order of the earlier fields in stats and JSONL is unchanged. Storage is
 unchanged (67050176 bytes for the maximal production config at the time;
 67050272 since GARP).
 
+### ICMP Redirect (ICMP-REDIRECT)
+
+When the router forwards a datagram back out of the interface it arrived
+on, and both the source and the chosen next hop are on that interface's
+connected subnet, it still forwards the datagram and also sends the source
+an ICMP Redirect for Host (Type 5/Code 1, RFC 1812 §5.2.7.2) whose gateway
+field is that next hop (the route's gateway, or the destination itself for
+a directly connected destination). A typical case: a LAN host uses the
+router as its default gateway for a prefix that another router on the same
+LAN serves, or for another host on its own subnet.
+
+```toml
+[icmpv4-errors.generate]
+redirect = true   # default (RFC 1812: MUST be able to generate Code 1)
+```
+
+- Only Code 1. Network Redirects (Codes 0 and 2) are never sent (MUST
+  NOT). Code 3 (Host and TOS) is not sent either: the router has no TOS
+  routing, and RFC 1812 then asks for Code 1.
+- No Redirect when the source is not on the ingress subnet (it came
+  through another router), when the next hop is outside that subnet (for
+  example on an interface route of the same link), when the next hop is
+  the source itself, for the datagrams the router does not forward (TTL
+  0/1 get Time Exceeded, firewall denies, URPF drops, Fragmentation
+  Needed), for NAT traffic (outbound, inbound, hairpin, translated errors),
+  for later fragments, and about ICMP errors. A datagram with IPv4 options
+  (so any source route) is never forwarded, so it never gets one.
+- ARP-HOLD: a datagram held while its next hop resolves gets its Redirect
+  when it is replayed and forwarded, not when it is held.
+- Rate limit: Redirects share the per-egress class 0 limiter with Time
+  Exceeded and Network/Host/Protocol/Port Unreachable (`interval-ms`,
+  default 100 ms). A LAN host that ignores Redirects and keeps sending
+  through the router uses one class 0 slot per interval on that LAN
+  egress, which can delay (`rate_limited`) the other class 0 errors to
+  that LAN.
+- Counters: `icmpv4_errors.queued_redirect`, `dequeued_redirect`, and
+  `disabled_redirect` (the Redirects that would have been sent while
+  `redirect = false`), appended after the existing counters. Changing the
+  switch is restart-required, like every `[icmpv4-errors.generate]` key.
+- Security: a Redirect reveals that another router or host on the subnet
+  is the better first hop, and the source is not authenticated, so anyone
+  on the ingress subnet (or anyone who can spoof an address of it, unless
+  URPF drops it) can make the router send Redirects to that address. The
+  amount is bounded by the class 0 limiter (10 per second per egress by
+  default), the gateway named is always the router's own correct next
+  hop, and a host accepts a Redirect only from its current gateway (RFC
+  1122 §3.2.2.2). Recommendation: keep the default on a LAN where hosts
+  benefit from it; set `redirect = false` where the subnet has no other
+  router, where hosts should always use this router (for example to keep
+  their traffic in front of its firewall), or on untrusted segments. The
+  switch is router-wide; there is no per-interface override yet.
+- Storage is unchanged: the gateway shares the action's existing header
+  field (widened inside the slot's padding), so the action slot stays 592
+  bytes and the maximal production config stays at 67050272 bytes.
+
 ### Source address validation (URPF)
 
 Each `[[interfaces]]` entry can check the source address of the IPv4
@@ -3631,6 +3686,14 @@ What it proves, on the runner's kernel only:
   `drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED`; a SIGHUP reload adding a rule
   for Echo from 203.0.113.1/32 on the WAN (generation 2) answers it; exit
   0, nothing attached.
+  Added by ICMP-REDIRECT (`priv_run_redirect`): with a host route
+  192.168.1.77/32 via 192.168.1.1 on host A (its `accept_redirects` set to
+  0 in its own namespace), a static neighbor 192.168.1.77 and a lan->lan
+  UDP allow rule on the router, host A's UDP to .77 is forwarded back out
+  of ra and host A's raw socket receives a Redirect for Host (5/1) from
+  192.168.1.1 naming .77, with valid checksums and the datagram quoted;
+  with `redirect = false` no Redirect arrives within 2 s and
+  `icmpv4_errors.disabled_redirect` counts; exit 0, nothing attached.
   Added by MTU2 part B (`priv_run_frag*`): with the WAN link (rb, pb, and
   the wan `mtu`) at 1400, a DF-clear 1500-byte UDP datagram from host A
   arrives at host B's pb as exactly the RFC 791 pair of fragments from

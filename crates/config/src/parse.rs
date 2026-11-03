@@ -153,6 +153,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "queue",
     "rate-per-second",
     "realm",
+    "redirect",
     "reload",
     "require-on-link-sender",
     "resolution",
