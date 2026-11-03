@@ -1683,11 +1683,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
         if self.free_held == NONE {
             return Err(DropReason::Ipv4FragmentHoldFull);
         }
-        let existing = match existing {
-            // The expiry above may have freed it.
-            Some(index) if self.entries[index].state == EntryState::Pending => Some(index),
-            _ => self.lookup(info.key, now_ms),
-        };
+        // `make_held_room` left `existing` live: it was not expired at
+        // `now_ms` and is never its own victim.
         let index = match existing {
             Some(index) => index,
             None => {

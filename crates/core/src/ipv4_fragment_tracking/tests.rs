@@ -1445,6 +1445,7 @@ fn an_evicted_allowing_key_is_refused_until_the_timeout() {
         Ok(Ipv4FragmentFollow::Deny)
     );
     assert_eq!((tracker.entries(), tracker.held()), (0, 0));
+    assert_eq!(tracker.counters().followed_denied, 1);
     // A new first fragment on the key (maybe another datagram) is refused.
     let poisoned = tracker.counters().poisoned;
     assert_eq!(
@@ -1493,4 +1494,67 @@ fn every_ingress_is_found_and_the_two_hundred_fifty_seventh_refused() {
         tracker.admit_first(first, 0),
         Err(DropReason::Ipv4FragmentIngressLimit)
     );
+}
+
+#[test]
+fn stalling_counts_from_the_last_progress_not_the_creation() {
+    let mut storage = Storage::new(1, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 1_000);
+    progress(&mut tracker, 1, 1_300);
+    // 150 ms since the progress at 1300 (450 since the creation): live.
+    assert_eq!(
+        tracker.admit_first(info(&fragment(2, MF, 64, 17, 16)), 1_450),
+        Err(DropReason::Ipv4FragmentTableFull)
+    );
+    // 200 ms since the progress: stalled.
+    assert!(tracker
+        .admit_first(info(&fragment(2, MF, 64, 17, 16)), 1_500)
+        .is_ok());
+}
+
+#[test]
+fn every_evicted_allowing_key_is_remembered_up_to_sixteen() {
+    let mut storage = Storage::new(17, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 64, 0), storage.borrow(), key()).unwrap();
+    for id in 1..=17_u16 {
+        allow(&mut tracker, id, 0);
+    }
+    // Seventeen new datagrams evict the seventeen stalled ones in order.
+    for id in 18..=34_u16 {
+        allow(&mut tracker, id, 200);
+    }
+    assert_eq!(tracker.counters().entries_evicted, 17);
+    let key_of = |id| info(&fragment(id, MF, 64, 17, 16)).key;
+    // The last sixteen evicted keys are remembered; the first was
+    // overwritten in the ring.
+    for id in 2..=17 {
+        assert!(tracker.tombstoned(key_of(id), 300), "{id}");
+    }
+    assert!(!tracker.tombstoned(key_of(1), 300));
+    assert!(!tracker.tombstoned(key_of(18), 300));
+    // Until the timeout from their eviction.
+    assert!(tracker.tombstoned(key_of(2), 1_199));
+    assert!(!tracker.tombstoned(key_of(2), 1_200));
+}
+
+#[test]
+fn an_entry_is_counted_against_its_own_ingress_until_freed() {
+    let base = Ipv4FragmentTrackingPolicy::new(1_000, 8, 8).unwrap();
+    let mut storage = Storage::new(4, 0, 0);
+    let mut tracker = Ipv4FragmentTracker::new(base, storage.borrow(), key()).unwrap();
+    // WAN takes the first ingress slot, LAN the second and its share (2).
+    let mut wan = info(&fragment(9, MF, 64, 17, 16));
+    wan.key.ingress = WAN;
+    let ticket = tracker.admit_first(wan, 0).unwrap();
+    tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 0);
+    allow(&mut tracker, 1, 0);
+    allow(&mut tracker, 2, 0);
+    // Completing a LAN datagram gives the LAN its room back.
+    complete(&mut tracker, 1, SOURCE, 0);
+    assert!(tracker
+        .admit_first(info(&fragment(3, MF, 64, 17, 16)), 0)
+        .is_ok());
 }
