@@ -634,14 +634,9 @@ fn af_packet_quiescence_waits_for_in_flight_tx_and_then_admits_a_publication() {
     assert_eq!(live.port(WAN).tx_held_on_down_link, 0);
 }
 
-/// OPS-EXIT item 2: TX held on a down link (`ENETDOWN`, confirmed by a
-/// fresh kick at each check) does not block a publication; the frames stay
-/// published (gauge `tx_held_on_down_link`) and leave once the link
-/// returns. Review M1: any other kick outcome (a successful kick, a
-/// deferral, another errno) clears `link_down`, and TX in flight blocks
-/// again.
 /// OPS-EXIT follow-up L1: while another port's TX blocks, the check never
-/// sends the confirming kick to the down port.
+/// sends the confirming kick to the down port; once nothing else blocks,
+/// exactly one confirming kick reaches it and the check passes.
 #[test]
 fn af_packet_a_blocked_quiescence_never_probes_the_down_link() {
     let mut live = Live::new();
@@ -663,8 +658,21 @@ fn af_packet_a_blocked_quiescence_never_probes_the_down_link() {
         live.kicks().iter().all(|(fd, _)| *fd != LAN_FD),
         "no confirming kick to the down port"
     );
+    // WAN completes: the next check confirms LAN with one kick and passes.
+    live.kernel_completes(1);
+    live.fail_kicks(&[ENETDOWN]);
+    assert_eq!(live.engine.quiescence_check(), Ok(()));
+    let lan_kicks = live.kicks().iter().filter(|(fd, _)| *fd == LAN_FD).count();
+    assert_eq!(lan_kicks, 1, "exactly one confirming kick");
+    assert_eq!(live.port(LAN).tx_held_on_down_link, 1);
 }
 
+/// OPS-EXIT item 2: TX held on a down link (`ENETDOWN`, confirmed by a
+/// fresh kick at each check) does not block a publication; the frames stay
+/// published (gauge `tx_held_on_down_link`) and leave once the link
+/// returns. Review M1: any other kick outcome (a successful kick, a
+/// deferral, another errno) clears `link_down`, and TX in flight blocks
+/// again.
 #[test]
 fn af_packet_quiescence_does_not_wait_for_tx_held_on_a_down_link() {
     let mut live = Live::new();

@@ -755,7 +755,7 @@ fn parse_mac(text: &str) -> Option<[u8; 6]> {
     let mut parts = text.split(':');
     for byte in &mut out {
         let part = parts.next()?;
-        if part.len() != 2 {
+        if part.len() != 2 || !part.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return None;
         }
         *byte = u8::from_str_radix(part, 16).ok()?;
@@ -2608,6 +2608,8 @@ mod tests {
         assert_eq!(parse_mac("02:00:0a:ff:00"), None);
         assert_eq!(parse_mac("02:00:0a:ff:00:01:02"), None);
         assert_eq!(parse_mac("2:00:0a:ff:00:01"), None);
+        assert_eq!(parse_mac("+2:00:0a:ff:00:01"), None);
+        assert_eq!(parse_mac("02:00:0a:ff:00:+1"), None);
     }
 
     /// OPS-EXIT item 3: the live rtnetlink query of the loopback device

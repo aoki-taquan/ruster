@@ -863,10 +863,6 @@ fn link_flap_recovers_without_new_traffic() {
     audit(&io);
 }
 
-/// OPS-EXIT (review M1): `link_down` is only the last kick's `ENETDOWN`.
-/// Any other kick outcome clears it, so TX in flight blocks the
-/// quiescence again: a successful kick that the kernel does not act on
-/// yet, and a kick that fails with another errno.
 /// OPS-EXIT follow-up L1: while another port's TX blocks the quiescence,
 /// the checks of a pending reload never probe the down port: its kicks
 /// stay rate-limited (XDP-178), however often the check runs.
@@ -906,6 +902,10 @@ fn a_blocked_quiescence_never_probes_the_down_link() {
     assert_eq!(lan.kicks(KickRing::Tx), kicks + 1);
 }
 
+/// OPS-EXIT (review M1): `link_down` is only the last kick's `ENETDOWN`.
+/// Any other kick outcome clears it, so TX in flight blocks the
+/// quiescence again: a successful kick that the kernel does not act on
+/// yet, and a kick that fails with another errno.
 #[test]
 fn only_a_fresh_enetdown_lets_held_tx_pass_the_quiescence() {
     for outcome in ["sent", "other errno"] {
