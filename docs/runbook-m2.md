@@ -723,7 +723,7 @@ admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
   still lets the WAN address answer every UDP port with Port Unreachable
   (so a scanner learns that all are closed and that the router is there)
   and every unimplemented protocol with Protocol Unreachable (a working
-  protocol scan). For a silent WAN address use the recommended WAN
+  protocol scan). For a WAN address silent at L3 use the recommended WAN
   stealth policy (input `default-action = "deny"` with an `accept` rule
   for the LAN, and optionally Echo from a management prefix): it is per
   interface and leaves the LAN answered. The router-wide switches
@@ -958,15 +958,39 @@ action = "accept"
 
 That is the recommended WAN stealth policy: the LAN is answered as
 before (Echo, Port/Protocol Unreachable, Parameter Problem), the WAN
-answers Echo from the management prefix only, and nothing else on the WAN
-gets any answer. Drop rule 20 for a WAN that answers nothing. The
-built-in default and the fixtures stay `accept` (owner policy: RFC by
-default, hardening configurable).
+answers Echo from the management prefix only, and the WAN is silent at L3
+for datagrams to the router's addresses. Drop rule 20 for a WAN that
+answers no datagram to the router at all. The built-in default and the
+fixtures stay `accept` (owner policy: RFC by default, hardening
+configurable).
+
+What stays visible from the WAN under it (the input firewall judges only
+datagrams addressed to the router):
+
+- ARP: replies for the WAN address and the RFC 5227 announcements (GARP)
+  of `[arp]`, which every on-link host sees.
+- Errors about transit datagrams, sent from the WAN address: Time
+  Exceeded, Fragmentation Needed, Network/Host Unreachable for datagrams
+  the router forwards (`[icmpv4-errors.generate]`), including Time Exceeded
+  for traffic with a live NAT mapping, and Communication Administratively
+  Prohibited (3/13) when `admin-prohibited = true`.
+- The TCP NAT's delayed Port Unreachable to unsolicited SYNs
+  (`[nat44.tcp] unsolicited-syn-icmp`) when the forward firewall admits
+  them (B3): TCP to the public address is NAT traffic, not local delivery.
+- Replies to NAT mappings (they are what the NAT is for).
+- With rule 20: Echo Replies to any source inside the management prefix.
+  Source addresses are not authenticated, so anyone who can spoof a source
+  in that prefix gets one Echo Reply per Echo Request sent to that source
+  (a 1:1 reflector toward the prefix, rate-limited by nothing but the
+  sender); keep the prefix small, and use `source-validation = "strict"`
+  where a spoofed source would arrive on the wrong interface.
 
 - A denied datagram is silently discarded before any local decision:
   `drop.IPV4_INPUT_FIREWALL_RULE_DENIED` (code 210) for a `deny` rule,
   `drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED` (code 211) for the `deny`
-  default, trace event `Ipv4InputFirewallDenied{ingress, source, rule}`.
+  default, trace event `Ipv4InputFirewallDenied{ingress, source, rule,
+  transport_header}` (`transport_header = false`: the deny was decided
+  without the ICMP type or port, see fragments below).
   No Echo Reply and no ICMP error of any kind (Port/Protocol Unreachable,
   Parameter Problem). Input deny wins: the `[icmpv4-errors.generate]`
   switches and `[ipv4-origin] echo-reply` are never reached, so their
@@ -979,7 +1003,15 @@ default, hardening configurable).
   `FIREWALL_INPUT_ICMP_TYPE_NOT_ICMP`, `FIREWALL_INPUT_PORTS_NOT_TCP_UDP`,
   `FIREWALL_INPUT_RULES` (zero or repeated id), and the forward rules'
   `UNKNOWN_INTERFACE`, `FIREWALL_PREFIX`, `FIREWALL_PORT_RANGE`. At most
-  4096 rules (`LIST_TOO_LONG`). Input and forward rule ids are separate.
+  256 rules (`LIST_TOO_LONG path=firewall.input.rules limit=256`; the core
+  refuses more as `InputFirewallError::TooManyRules`). Input and forward
+  rule ids are separate.
+- `destination` only ever sees the address of the datagram's ingress
+  interface (local delivery is ingress-scoped, ICMP4-001), or the NAT
+  public address for an inside host's Echo/Timestamp with `[nat44.icmp]`.
+  A rule whose destination covers neither can never match; `validate`
+  warns `INPUT_FIREWALL_DESTINATION_NOT_LOCAL rule=<id>` (value-free, not
+  refused).
 - Stateless on purpose: the router originates no TCP or UDP session and
   no ICMP query, so nothing addressed to it is a reply to something it
   started; its own ICMP errors are never answered, and replies to NAT
@@ -995,15 +1027,32 @@ default, hardening configurable).
   run first and keep their reasons; then the input firewall; then the
   local decision and its errors. Transit pays nothing (the check is on the
   local path only); without rules and with `accept` the local path pays
-  one branch; otherwise one walk of at most 4096 rules, no allocation.
+  one branch.
+- Cost per datagram for the router (any host that can reach an address
+  causes it): at publication the rules are split into lists per ingress
+  interface and per protocol class (ICMP, TCP, UDP, other), each in
+  first-match order, a rule without `ingress` or `protocol` in every list
+  it can match. A datagram walks only its own list: a binary search over
+  the interfaces the rules name, then at most 256 rule tests (about 6 ns
+  each on the development host, the forward rule test measurement), so at
+  worst about 1.5 µs; the stealth policy tests one rule for a WAN Echo and
+  none for other WAN traffic. `firewall.input_rule_evaluations` counts the
+  tests (like `firewall.rule_evaluations`): divide by the local datagrams
+  to see the average walk, and shorten or reorder the rules if it grows.
+  The lists are snapshot memory (at most about 130 KiB for 256 rules),
+  not runtime storage. No allocation on the packet path.
 - Fragments for the router (consumed without reassembly, ICMP4-006) are
   judged one by one. A first fragment carries its transport header; a
   later fragment does not, and neither does a datagram the link truncated.
   Without a transport header a rule with `icmp-type` or a partial
   `destination-ports` range matches only if it denies (fail closed): an
   Echo `accept` rule never admits an unknown type, a `deny` rule for a port
-  refuses it. A truncated datagram denied this way gets no Parameter
-  Problem and keeps its drop `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`.
+  refuses it. Such a deny is attributed to the first deny rule (in
+  first-match order) that needs a header, even if the real type or port
+  would not have matched it; the trace says `transport_header = false`. A
+  truncated datagram denied this way gets no Parameter Problem and keeps
+  its drop `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`; it is counted as
+  `firewall.input_truncated_denied` (and not in the 210/211 drops).
 - The address of another interface (for example the LAN address arriving
   on the WAN) is not local delivery (ICMP4-001): it is transit, judged by
   the NAT and the forward firewall. Limited and directed broadcasts are
@@ -1018,8 +1067,10 @@ default, hardening configurable).
   67106224 with the per-host limits): the rules live in the forwarding
   snapshot like the forward rules, not in runtime storage.
 - Upgrade note: drop codes 210 `IPV4_INPUT_FIREWALL_RULE_DENIED` and 211
-  `IPV4_INPUT_FIREWALL_DEFAULT_DENIED` are appended after 209, so stats and
-  JSONL gain two `drop.*` fields at the end (0 without the table).
+  `IPV4_INPUT_FIREWALL_DEFAULT_DENIED` are appended after 209, and the
+  firewall counters `input_rule_evaluations` and `input_truncated_denied`
+  after `states_revoked`, so stats and JSONL gain two `drop.*` and two
+  `firewall.*` fields (0 without the table).
 
 ### DF-clear datagrams through the NAT (MTU2 part A)
 

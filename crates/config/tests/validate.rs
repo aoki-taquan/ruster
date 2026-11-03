@@ -2857,7 +2857,7 @@ fn source_validation_is_off_by_default_and_maps_onto_core_modes() {
 /// The rule list is bounded like the forward rules.
 #[test]
 fn input_firewall_defaults_to_accept_and_maps_onto_core_rules() {
-    use ruster_config::{FirewallInputV1, ValidationCode, MAX_FIREWALL_RULES};
+    use ruster_config::{FirewallInputV1, ValidationCode, MAX_INPUT_FIREWALL_RULES};
     use ruster_core::{
         FirewallInterface, FirewallRuleId, IfId, InputFirewallAction, InputFirewallError,
         InputFirewallProtocol,
@@ -3016,10 +3016,11 @@ fn input_firewall_defaults_to_accept_and_maps_onto_core_rules() {
         destination_ports: None,
         action: ruster_config::FirewallInputActionV1::Deny,
     };
-    input.rules = vec![one; MAX_FIREWALL_RULES + 1];
+    input.rules = vec![one; MAX_INPUT_FIREWALL_RULES + 1];
     firewall.input = Some(input);
     let rejected = dto_error(bounded);
     assert_eq!(rejected.code(), ValidationCode::ListTooLong);
-    assert_eq!(rejected.limit(), Some(MAX_FIREWALL_RULES as u64));
+    assert_eq!(MAX_INPUT_FIREWALL_RULES, 256);
+    assert_eq!(rejected.limit(), Some(MAX_INPUT_FIREWALL_RULES as u64));
     assert_eq!(dotted(rejected.path()), "firewall.input.rules");
 }

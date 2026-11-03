@@ -3441,7 +3441,7 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
             check_list_bound(
                 path(&["firewall", "input", "rules"]),
                 input.rules.len(),
-                crate::MAX_FIREWALL_RULES,
+                crate::MAX_INPUT_FIREWALL_RULES,
             )?;
         }
     }

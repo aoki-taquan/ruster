@@ -52,7 +52,7 @@ pub use firewall::{
     FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS, FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
-    FIREWALL_UDP_MIN_IDLE_TTL_MS,
+    FIREWALL_UDP_MIN_IDLE_TTL_MS, INPUT_FIREWALL_MAX_RULES,
 };
 pub use fixed_directory::{port_free_bitmap_words, DirectoryBucket, DirectoryNode, PortOwnerSlot};
 #[cfg(feature = "validation-test-hooks")]

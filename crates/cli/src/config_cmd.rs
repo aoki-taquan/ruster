@@ -22,7 +22,7 @@ use ruster_control::{
     candidate_from_config, ApplyPlan, ConfigBridgeError, PlanError, PlanSide,
     SimDeterministicKeySource,
 };
-use ruster_core::{IfId, SourceValidation};
+use ruster_core::{FirewallInterface, FirewallRuleId, IfId, SourceValidation};
 use ruster_sim_scenario::SIM_VALIDATION_LIMITS;
 
 use crate::{plan_text, EXIT_INVALID, EXIT_RUNTIME};
@@ -553,6 +553,63 @@ pub fn source_validation_warnings(config: &ValidatedConfigV1) -> Box<[SourceVali
         .collect()
 }
 
+/// An input firewall rule (INPUT-FW) whose `destination` covers no
+/// address it can ever see (core L4 of #353): local delivery is
+/// ingress-scoped (ICMP4-001), so a rule only sees the address of its
+/// ingress interface (any interface's without one), or the NAT public
+/// address for an inside host's ICMP query with `[nat44.icmp]`. Value-free
+/// (the rule id only), printed by `validate`, never refused.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InputFirewallDestinationWarning(pub FirewallRuleId);
+
+impl std::fmt::Display for InputFirewallDestinationWarning {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "INPUT_FIREWALL_DESTINATION_NOT_LOCAL rule={}",
+            (self.0).0
+        )
+    }
+}
+
+/// The input rules whose destination can match no datagram. Cold.
+#[must_use]
+pub fn input_firewall_warnings(
+    config: &ValidatedConfigV1,
+) -> Box<[InputFirewallDestinationWarning]> {
+    let Some(firewall) = config.firewall() else {
+        return Box::default();
+    };
+    let public = config
+        .nat44()
+        .and_then(|nat| nat.icmp())
+        .map(|icmp| icmp.public_address());
+    firewall
+        .input_rules()
+        .iter()
+        .filter(|rule| {
+            let destination = rule.destination();
+            let mask = match destination.prefix_len() {
+                0 => return false,
+                len => u32::MAX << (32 - u32::from(len)),
+            };
+            let network = u32::from_be_bytes(destination.address().octets());
+            let covers = |address: ruster_core::Ipv4Address| {
+                u32::from_be_bytes(address.octets()) & mask == network
+            };
+            let local = config.local_ipv4().iter().any(|binding| {
+                let on_ingress = match rule.ingress() {
+                    FirewallInterface::Any => true,
+                    FirewallInterface::Interface(id) => id == binding.interface,
+                };
+                on_ingress && covers(binding.address)
+            });
+            !local && !public.is_some_and(covers)
+        })
+        .map(|rule| InputFirewallDestinationWarning(rule.id()))
+        .collect()
+}
+
 /// `ruster validate <config>`: summary on stdout, diagnostics on stderr.
 pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
     validate_loaded(load(path), out, err)
@@ -618,6 +675,9 @@ pub fn validate_loaded(
         let _ = writeln!(err, "ruster: warning: {warning}");
     }
     for warning in source_validation_warnings(&config).iter() {
+        let _ = writeln!(err, "ruster: warning: {warning}");
+    }
+    for warning in input_firewall_warnings(&config).iter() {
         let _ = writeln!(err, "ruster: warning: {warning}");
     }
     0

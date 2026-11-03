@@ -2280,11 +2280,24 @@ local宛ての分岐です。どちらもL2検査、martian source/destination�
 NAT inbound（public address宛てUDP/TCP、ICMP query NATのreply、NAT ICMPv4 error candidate、
 public address宛てfragmentのassociation）はこの分岐より前に別経路へ行くので、public address =
 WAN addressでも判定しません。transitはこの分岐に来ないので追加costはゼロ、local経路ではrule無しで
-`Accept`ならbranch一つ、そうでなければcoldな関数で最大4096 ruleのwalk（allocation、Mutex、String、
-dyn、packet cloneなし）です。denyは`IPV4_INPUT_FIREWALL_RULE_DENIED`（210）/
+`Accept`ならbranch一つ、そうでなければcoldな関数でruleをwalkします（allocation、Mutex、String、
+dyn、packet cloneなし）。router addressへ届く任意のhostがこのwalkを起こせるので（#353 sec M1）、
+ruleは最大256（`INPUT_FIREWALL_MAX_RULES`、configは`LIST_TOO_LONG`、coreは`TooManyRules`）で、
+ownerはpublication時に`InputFirewallIndex`（`ForwardingIndex`の一部）を作ります: ingress
+interface別・protocol class別（ICMP、TCP、UDP、他）のrule slot list（u16）をfirst-match順に持ち、
+`ingress`/`protocol`の無いruleは該当する全listの元の位置に入り、ruleに名前の無いinterfaceは一組の
+共有listを使います。datagramは名前付きinterfaceのbinary searchと自分のlistのwalkだけ
+（最悪256 test）で、判定はlinear walkと同じです（differential test）。ownerを持たないsnapshotは
+linear walkです。listはsnapshot memory（256 ruleで最大約130 KiB、`index_heap_bytes`に含む）で、
+runtime storageではありません。rule test数は`FirewallCounters::input_rule_evaluations`
+（forward firewall runtimeがあるworkerで）に数えます。denyは`IPV4_INPUT_FIREWALL_RULE_DENIED`（210）/
 `IPV4_INPUT_FIREWALL_DEFAULT_DENIED`（211）のsilent dropと`TraceEvent::Ipv4InputFirewallDenied
 {ingress, source, rule}`で、local判定に入らないのでICMP-ERRのswitchや`echo-reply`より優先します。
-truncated datagramはdropを`IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`のままParameter Problemだけ抑えます。
+truncated datagramはdropを`IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`のままParameter Problemだけ抑え、
+`input_truncated_denied`に数えます。traceの`transport_header`はtransport selectorを読めたかで、
+読めないfail-closedのdenyは最初のheaderを要るdeny ruleに帰属します。`destination`が見るのは
+ingress interfaceのaddressと、`[nat44.icmp]`のinside queryのpublic addressだけです（`validate`が
+どれも含まないruleを警告）。
 
 transport selector（ICMP type、TCP/UDP destination port）はwhole datagramとfirst fragmentの
 Total Length内から読みます。later fragment、truncated datagram、短いheaderはtransportなしで、

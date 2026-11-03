@@ -69,6 +69,9 @@ pub(crate) struct ForwardingIndex {
     /// Disjoint, sorted, inclusive `(interface << 32 | first, interface <<
     /// 32 | last)` ranges covered by direct routes.
     on_link: Box<[(u64, u64)]>,
+    /// The input firewall rules split by ingress and protocol class
+    /// (INPUT-FW), set by [`crate::ValidatedForwardingOwner::with_input_firewall`].
+    input_firewall: crate::firewall::InputFirewallIndex,
 }
 
 impl std::fmt::Debug for ForwardingIndex {
@@ -217,7 +220,19 @@ impl ForwardingIndex {
             connected_boundaries: connected_boundaries.into_boxed_slice(),
             gateways: gateways.into_boxed_slice(),
             on_link: on_link.into_boxed_slice(),
+            input_firewall: crate::firewall::InputFirewallIndex::default(),
         }
+    }
+
+    /// Replaces the input firewall lists (INPUT-FW, cold).
+    pub(crate) fn set_input_firewall(&mut self, index: crate::firewall::InputFirewallIndex) {
+        self.input_firewall = index;
+    }
+
+    /// The input firewall lists (INPUT-FW).
+    #[inline]
+    pub(crate) const fn input_firewall(&self) -> &crate::firewall::InputFirewallIndex {
+        &self.input_firewall
     }
 
     /// Heap bytes held by the index (snapshot memory, freed with the owner).
@@ -232,6 +247,7 @@ impl ForwardingIndex {
             + size_of_val(&*self.connected_boundaries)
             + size_of_val(&*self.gateways)
             + size_of_val(&*self.on_link)
+            + self.input_firewall.heap_bytes()
     }
 
     /// Slice index of the longest-prefix route for `destination`.

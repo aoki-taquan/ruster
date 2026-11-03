@@ -5,11 +5,12 @@ use crate::{ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter, TableOccupa
 mod input;
 
 pub(crate) use input::{
-    check_input_firewall_rules, evaluate_input_firewall, InputFirewallPacket, InputFirewallVerdict,
+    check_input_firewall_rules, evaluate_input_firewall, InputFirewallIndex, InputFirewallPacket,
+    InputFirewallVerdict,
 };
 pub use input::{
     validate_input_firewall_rules, InputFirewallAction, InputFirewallError, InputFirewallProtocol,
-    InputFirewallRule,
+    InputFirewallRule, INPUT_FIREWALL_MAX_RULES,
 };
 
 pub const FIREWALL_UDP_MIN_IDLE_TTL_MS: u64 = 120_000;
@@ -897,6 +898,15 @@ pub struct FirewallCounters {
     /// Flows revoked by carrying publications whose new rules no longer
     /// admit them (RELOAD-CARRY).
     pub states_revoked: u64,
+    /// Input firewall rule tests (INPUT-FW, `[firewall.input]`): the rules
+    /// walked for datagrams addressed to the router, counted like
+    /// [`Self::rule_evaluations`] (one per rule tested).
+    pub input_rule_evaluations: u64,
+    /// Truncated datagrams addressed to the router (Total Length longer
+    /// than the frame) that the input firewall denied: their Parameter
+    /// Problem is suppressed and their drop stays
+    /// `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`, so only this counts them.
+    pub input_truncated_denied: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1540,6 +1550,18 @@ impl<'state> FirewallRuntime<'state> {
     #[must_use]
     pub const fn counters(&self) -> FirewallCounters {
         self.counters
+    }
+
+    /// Counts `tests` input firewall rule tests (INPUT-FW).
+    pub(crate) fn record_input_rule_evaluations(&mut self, tests: u64) {
+        self.counters.input_rule_evaluations =
+            self.counters.input_rule_evaluations.saturating_add(tests);
+    }
+
+    /// Counts a truncated datagram the input firewall denied (INPUT-FW).
+    pub(crate) fn record_input_truncated_denied(&mut self) {
+        self.counters.input_truncated_denied =
+            self.counters.input_truncated_denied.saturating_add(1);
     }
 
     #[must_use]

@@ -782,6 +782,7 @@ fn snapshot_rules_trace_their_ids_and_are_validated() {
             ingress: WAN,
             source: Ipv4Address::from_octets(X),
             rule: Some(FirewallRuleId(7)),
+            transport_header: true,
         }));
     assert!(trace
         .events()
@@ -789,6 +790,7 @@ fn snapshot_rules_trace_their_ids_and_are_validated() {
             ingress: LAN,
             source: Ipv4Address::from_octets(H),
             rule: None,
+            transport_header: true,
         }));
     for (reason, code, value) in [
         (
@@ -835,4 +837,111 @@ fn snapshot_rules_trace_their_ids_and_are_validated() {
             Some(SnapshotError::InputFirewall(error))
         );
     }
+}
+
+/// core L2 (a) of #353: an inside host's Echo to the public address (the
+/// ICMP query NAT's local branch, `[nat44.icmp]`) is judged too: the
+/// stealth policy's LAN rule answers it, a deny-all policy drops it.
+#[test]
+fn lan_echo_to_the_public_address_is_judged_by_the_input_firewall() {
+    let ping_public = || on_lan(PUBLIC, DF, 1, &icmp_echo(8, 0x31, 1, b"pub"));
+    let mut stealth = World::new(&input("deny", STEALTH));
+    let sent = stealth.tick(0, &[(LAN, ping_public())]);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].egress, LAN);
+    assert_eq!(icmp_kind(&sent[0]), (0, 0));
+    assert_eq!(stealth.input_drops(), (0, 0));
+
+    let mut denying = World::new(&input("deny", ""));
+    assert!(denying.tick(0, &[(LAN, ping_public())]).is_empty());
+    assert_eq!(denying.input_drops(), (0, 1));
+}
+
+/// core L2 (b): an Echo with a well-formed 4-octet NOP option from the
+/// management prefix passes the Echo rule (the transport header is read
+/// after the options) and is then refused by the local decision as
+/// `IPV4_OPTIONS_UNSUPPORTED` without a Parameter Problem, not as an input
+/// deny.
+#[test]
+fn an_admitted_echo_with_options_keeps_its_options_drop() {
+    let mut world = World::new(&input("deny", STEALTH));
+    let frame = ethernet(
+        WAN_MAC,
+        G_MAC,
+        0x0800,
+        &ipv4_with_options(
+            MGMT,
+            PUBLIC,
+            0x0808,
+            DF,
+            64,
+            1,
+            &[1, 1, 1, 1],
+            &icmp_echo(8, 1, 1, b"nop"),
+        ),
+    );
+    assert!(world.tick(0, &[(WAN, frame)]).is_empty());
+    assert_eq!(world.drops(DropReason::Ipv4OptionsUnsupported), 1);
+    assert_eq!(world.input_drops(), (0, 0));
+}
+
+/// core L2 (c), sec L3: a truncated datagram has no transport header. An
+/// Echo `accept` rule does not admit it (the default denies), a `deny`
+/// rule for Echo refuses it under an accepting default, and a rule for
+/// another protocol leaves it to the default. Each deny suppresses the
+/// Parameter Problem and counts `firewall.input_truncated_denied`; the
+/// drop stays `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`.
+#[test]
+fn truncated_datagrams_match_only_deny_rules_that_need_a_header() {
+    let echo_rule = |action: &str| {
+        format!(
+            "[[firewall.input.rules]]\nid = 8\ningress = \"lan\"\nprotocol = \"icmp\"\n\
+             icmp-type = 8\naction = \"{action}\"\n"
+        )
+    };
+    let truncated_denied =
+        |world: &World| world.active.firewall().counters().input_truncated_denied;
+
+    let mut accepting_rule = World::new(&input("deny", &echo_rule("accept")));
+    assert!(accepting_rule.tick(0, &[(LAN, truncated_lan())]).is_empty());
+    assert_eq!(truncated_denied(&accepting_rule), 1);
+    // The whole Echo is admitted by the same rule.
+    assert_eq!(accepting_rule.tick(1_000, &[(LAN, ping_lan())]).len(), 1);
+
+    let mut denying_rule = World::new(&input("accept", &echo_rule("deny")));
+    assert!(denying_rule.tick(0, &[(LAN, truncated_lan())]).is_empty());
+    assert_eq!(truncated_denied(&denying_rule), 1);
+    assert_eq!(
+        denying_rule.drops(DropReason::Ipv4TotalLengthExceedsPacket),
+        1
+    );
+    assert_eq!(denying_rule.input_drops(), (0, 0));
+
+    let udp_rule = "[[firewall.input.rules]]\nid = 9\nprotocol = \"udp\"\n\
+        destination-ports = { first = 53, last = 53 }\naction = \"deny\"\n";
+    let mut other = World::new(&input("accept", udp_rule));
+    let sent = other.tick(0, &[(LAN, truncated_lan())]);
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(icmp_kind(&sent[0]), (12, 0));
+    assert_eq!(truncated_denied(&other), 0);
+}
+
+/// sec M1 of #353: the rule tests are counted
+/// (`firewall.input_rule_evaluations`), and a WAN datagram walks only the
+/// rules that can match its ingress and protocol: under the stealth policy
+/// a WAN UDP datagram tests none (rule 10 is for the LAN, rule 20 for ICMP)
+/// and a WAN Echo one.
+#[test]
+fn the_rule_walk_is_counted_and_split_by_ingress_and_protocol() {
+    let mut world = World::new(&input("deny", STEALTH));
+    let evaluations = |world: &World| world.active.firewall().counters().input_rule_evaluations;
+    assert_eq!(evaluations(&world), 0);
+    let udp_wan = on_wan(X, PUBLIC, 47, &[0; 8]);
+    world.tick(0, &[(WAN, udp_wan)]);
+    assert_eq!(evaluations(&world), 0);
+    world.tick(1_000, &[(WAN, ping_wan(X))]);
+    assert_eq!(evaluations(&world), 1);
+    world.tick(2_000, &[(LAN, ping_lan())]);
+    assert_eq!(evaluations(&world), 2);
+    assert_eq!(world.input_drops(), (0, 2));
 }

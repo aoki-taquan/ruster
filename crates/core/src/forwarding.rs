@@ -1734,6 +1734,8 @@ impl ValidatedForwardingOwner {
     ) -> Result<Self, ValidatedForwardingOwnerError> {
         check_input_firewall(&self.interfaces, &rules)
             .map_err(ValidatedForwardingOwnerError::Snapshot)?;
+        self.index
+            .set_input_firewall(crate::firewall::InputFirewallIndex::build(&rules));
         self.input_firewall_rules = rules;
         self.input_firewall_default = default;
         Ok(self)
@@ -2207,6 +2209,11 @@ pub enum TraceEvent {
         ingress: IfId,
         source: crate::Ipv4Address,
         rule: Option<crate::FirewallRuleId>,
+        /// Whether the transport selector (ICMP type, destination port)
+        /// was read. `false` for a later fragment, a truncated datagram, a
+        /// short transport header, or a protocol without one: a `rule`
+        /// then needed no transport header or matched fail closed.
+        transport_header: bool,
     },
     /// A datagram held for ARP was dropped with `reason` when it was
     /// replayed (ARP-HOLD). Not a received frame's drop: the frame was
@@ -4556,6 +4563,7 @@ fn decide_ipv4<T: TraceSink>(
                     resolution,
                     runtime,
                     *now,
+                    firewall.as_deref_mut(),
                     trace,
                 );
             }
@@ -4676,6 +4684,7 @@ fn decide_ipv4<T: TraceSink>(
                     ipv4,
                     resolution,
                     icmpv4_errors,
+                    firewall.as_deref_mut(),
                     trace,
                 );
             }
@@ -4883,6 +4892,7 @@ fn decide_ipv4<T: TraceSink>(
             ipv4,
             resolution,
             icmpv4_errors,
+            firewall.as_deref_mut(),
             trace,
         );
     }
@@ -8000,7 +8010,8 @@ fn reverse_target_forbidden(
 /// The input firewall (INPUT-FW) for a datagram addressed to the router:
 /// `Ok` to go on to the local decision, else the silent drop. One branch
 /// without rules and with the `accept` default (the RFC behavior); never
-/// reached by transit or NAT traffic.
+/// reached by transit or NAT traffic. `firewall` (the worker's forward
+/// firewall runtime, present in production) only counts the rule tests.
 #[inline]
 fn input_firewall_admits<T: TraceSink>(
     frame: &[u8],
@@ -8008,6 +8019,7 @@ fn input_firewall_admits<T: TraceSink>(
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
     transport_readable: bool,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     trace: &mut T,
 ) -> Result<(), DropReason> {
     if snapshot.input_firewall_rules.is_empty()
@@ -8015,14 +8027,27 @@ fn input_firewall_admits<T: TraceSink>(
     {
         return Ok(());
     }
-    judge_input_firewall(frame, snapshot, ingress, ipv4, transport_readable, trace)
+    judge_input_firewall(
+        frame,
+        snapshot,
+        ingress,
+        ipv4,
+        transport_readable,
+        firewall,
+        trace,
+    )
 }
 
-/// Walks the input rules (at most 4096 tests, no allocation). The
-/// transport selector is the ICMP type or the TCP/UDP destination port of
-/// a whole datagram or a first fragment; a later fragment, a datagram the
-/// link truncated (`transport_readable` false), or a header too short to
-/// hold it has none (only deny rules then match a transport selector).
+/// Walks the input rules that can match the datagram's ingress and
+/// protocol class (the owner's per-ingress lists; every rule for a snapshot
+/// borrowed without an owner), at most [`crate::INPUT_FIREWALL_MAX_RULES`]
+/// tests, no allocation, and counts them as
+/// `firewall.input_rule_evaluations`. The transport selector is the ICMP
+/// type or the TCP/UDP destination port of a whole datagram or a first
+/// fragment; a later fragment, a datagram the link truncated
+/// (`transport_readable` false), or a header too short to hold it has none,
+/// and then a rule that needs one matches only if it denies (fail closed):
+/// the deny is attributed to the first such deny rule in first-match order.
 #[cold]
 #[inline(never)]
 fn judge_input_firewall<T: TraceSink>(
@@ -8031,6 +8056,7 @@ fn judge_input_firewall<T: TraceSink>(
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
     transport_readable: bool,
+    mut firewall: Option<&mut FirewallRuntime<'_>>,
     trace: &mut T,
 ) -> Result<(), DropReason> {
     let transport = if transport_readable {
@@ -8045,11 +8071,16 @@ fn judge_input_firewall<T: TraceSink>(
         protocol: ipv4.protocol,
         transport,
     };
-    let (rule, reason) = match crate::firewall::evaluate_input_firewall(
+    let (verdict, tests) = crate::firewall::evaluate_input_firewall(
         snapshot.input_firewall_rules,
+        snapshot.index.map(ForwardingIndex::input_firewall),
         snapshot.input_firewall_default,
         &packet,
-    ) {
+    );
+    if let Some(runtime) = firewall.as_deref_mut() {
+        runtime.record_input_rule_evaluations(tests);
+    }
+    let (rule, reason) = match verdict {
         crate::firewall::InputFirewallVerdict::Accept => return Ok(()),
         crate::firewall::InputFirewallVerdict::DeniedByRule(rule) => {
             (Some(rule), Ipv4InputFirewallRuleDenied)
@@ -8058,10 +8089,16 @@ fn judge_input_firewall<T: TraceSink>(
             (None, Ipv4InputFirewallDefaultDenied)
         }
     };
+    if !transport_readable {
+        if let Some(runtime) = firewall {
+            runtime.record_input_truncated_denied();
+        }
+    }
     trace.record(TraceEvent::Ipv4InputFirewallDenied {
         ingress,
         source: ipv4.source,
         rule,
+        transport_header: transport.is_some(),
     });
     Err(reason)
 }
@@ -8106,9 +8143,10 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
     ipv4: packet::ValidatedIpv4,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    firewall: Option<&mut FirewallRuntime<'_>>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    input_firewall_admits(frame, snapshot, ingress, ipv4, true, trace)?;
+    input_firewall_admits(frame, snapshot, ingress, ipv4, true, firewall, trace)?;
     // Without a Port Unreachable to send, the UDP checksum is not read: a
     // flood of UDP to a router address costs no payload pass.
     let udp_checksum = icmpv4_errors.as_ref().is_some_and(|(runtime, _)| {
@@ -8332,6 +8370,7 @@ fn truncated_parameter_problem<T: TraceSink>(
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
+    input_firewall: Option<&mut FirewallRuntime<'_>>,
     trace: &mut T,
 ) {
     let Some(ipv4) = packet::validate_truncated_ipv4_header(frame) else {
@@ -8355,7 +8394,10 @@ fn truncated_parameter_problem<T: TraceSink>(
     // INPUT-FW: a truncated datagram has no reliable transport header, so
     // the input policy judges it without one; a deny is silent (the drop
     // stays `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`).
-    if local && input_firewall_admits(frame, snapshot, ingress, ipv4, false, trace).is_err() {
+    if local
+        && input_firewall_admits(frame, snapshot, ingress, ipv4, false, input_firewall, trace)
+            .is_err()
+    {
         return;
     }
     let selected_route = if local {

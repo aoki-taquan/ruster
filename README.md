@@ -364,10 +364,15 @@ matcherを使います。denyはlocal判定の前のsilent drop（`IPV4_INPUT_FI
 Parameter Problemも返さず、`[icmpv4-errors.generate]`と`echo-reply`より優先します（input deny wins）。
 routerはTCP/UDP sessionもICMP queryも自分から始めないのでrouter宛てに「応答」は無く、stateは持ちません。
 martian検査とURPFの後、local errorの前に判定し、transitは追加costなし（local経路だけ）、rule無し+
-`accept`ならbranch一つ。NAT public address宛てのNAT traffic（UDP/TCP、mappingへのEcho Reply/ICMP
+`accept`ならbranch一つ。ruleは最大256で、publication時にingress interface別・protocol class別
+（ICMP/TCP/UDP/他）のfirst-match順listに分けるので、datagramは自分のingressとprotocolのruleだけを
+試します（最悪256 test、約1.5 µs。`firewall.input_rule_evaluations`で数える）。`destination`が
+見るのはingress interfaceのaddress（`[nat44.icmp]`ならinsideからのqueryのpublic addressも）だけで、
+どれも含まないruleは`validate`が`INPUT_FIREWALL_DESTINATION_NOT_LOCAL`で警告します。NAT public address宛てのNAT traffic（UDP/TCP、mappingへのEcho Reply/ICMP
 error、public address宛てfragment）はpublic address = WAN addressでもlocal deliveryではなくNATの
 経路のまま。router宛てfragment（reassemblyなし）とtruncated datagramはtransport headerなしで判定し、
-ICMP typeやportを要るruleは`deny`のときだけmatchします（fail closed）。reload可能で、ruleは
+ICMP typeやportを要るruleは`deny`のときだけmatchします（fail closed、最初のそういうdeny ruleに
+帰属。truncatedのdenyは`firewall.input_truncated_denied`）。reload可能で、ruleとlistは
 forwarding snapshotにありruntime storageは増えません。
 
 推奨するWAN stealth設定（built-in defaultとfixtureは`accept`のまま）:
@@ -389,6 +394,13 @@ protocol = "icmp"
 icmp-type = 8
 action = "accept"
 ```
+
+これでWANはrouterのaddress宛てdatagramについてL3でsilentになります。見えるまま残るもの:
+ARP replyとGARP announcement、transit datagramへのTime Exceeded・Fragmentation Needed・
+Network/Host Unreachable（WAN addressから。live NAT mappingのtrafficのTime Exceededも）、
+`admin-prohibited = true`ならCode 13、forward firewallがunsolicited SYNを許すときのTCP NATの遅延
+Port Unreachable。source prefixの`accept`はsource詐称で使える（そのprefix宛ての1:1 Echo reflector）
+ので、prefixは小さく保ちます。
 
 IPv4 source address validation (URPF)は`[[interfaces]]`ごとの`source-validation`です。
 RFC 1812 §5.3.8（"If this feature is implemented, it MUST be disabled by default"）に従いdefaultは

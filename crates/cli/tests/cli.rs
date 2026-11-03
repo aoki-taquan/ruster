@@ -2107,3 +2107,35 @@ fn plan_prints_input_firewall_changes_as_reloadable() {
         text(&refused.stderr)
     );
 }
+
+/// core L4 of #353: an input rule whose destination covers no address it
+/// can see (the ingress interface's, or the NAT public address with
+/// `[nat44.icmp]`) is warned about by `validate`, value-free, and still
+/// accepted.
+#[test]
+fn validate_warns_about_an_input_rule_destination_that_is_not_local() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let path = dir.join("inputfw-destination.toml");
+    let rules = "[[firewall.input.rules]]\nid = 4\ningress = \"lan\"\n\
+                 destination = \"203.0.113.2/32\"\naction = \"accept\"\n\n\
+                 [[firewall.input.rules]]\nid = 5\ndestination = \"203.0.113.2/32\"\n\
+                 action = \"accept\"\n\n\
+                 [[firewall.input.rules]]\nid = 6\ndestination = \"10.9.9.9/32\"\n\
+                 action = \"accept\"\n\n[tick]";
+    fs::write(&path, source.replacen("[tick]", rules, 1)).unwrap();
+    let output = ruster(&["validate".as_ref(), path.as_os_str()]);
+    assert_eq!(status(&output), 0, "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("rule=5"), "{stderr}");
+    assert!(
+        stderr.contains("ruster: warning: INPUT_FIREWALL_DESTINATION_NOT_LOCAL rule=6\n"),
+        "{stderr}"
+    );
+    // router-v1 has no [nat44.icmp]: the WAN address is never seen on the
+    // LAN.
+    assert!(
+        stderr.contains("ruster: warning: INPUT_FIREWALL_DESTINATION_NOT_LOCAL rule=4\n"),
+        "{stderr}"
+    );
+}

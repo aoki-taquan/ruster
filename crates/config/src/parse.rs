@@ -11,6 +11,10 @@ pub const MAX_ADDRESSES: usize = 1024;
 pub const MAX_ROUTES: usize = 4096;
 pub const MAX_NEIGHBORS: usize = 4096;
 pub const MAX_FIREWALL_RULES: usize = 4096;
+/// Bound of `[[firewall.input.rules]]` (INPUT-FW): any host that reaches a
+/// router address makes the router walk them, so the per-datagram worst
+/// case stays at 256 rule tests ([`ruster_core::INPUT_FIREWALL_MAX_RULES`]).
+pub const MAX_INPUT_FIREWALL_RULES: usize = ruster_core::INPUT_FIREWALL_MAX_RULES;
 /// Bound of `[[backend.ports]]` and `[[backend.af-packet.ports]]`. M2
 /// binds at most one queue (one packet socket) per interface.
 pub const MAX_BACKEND_PORTS: usize = MAX_INTERFACES;
@@ -352,7 +356,7 @@ fn enforce_list_bounds(config: &ConfigV1) -> Result<(), Diagnostic> {
             let mut path = SourcePath::root_field("firewall");
             path.push_field("input");
             path.push_field("rules");
-            check_list_path(path, input.rules.len(), MAX_FIREWALL_RULES)?;
+            check_list_path(path, input.rules.len(), MAX_INPUT_FIREWALL_RULES)?;
         }
     }
     if let Some(backend) = &config.backend {
