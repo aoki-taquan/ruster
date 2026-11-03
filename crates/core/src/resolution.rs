@@ -471,7 +471,12 @@ pub struct ResolutionCounters {
 ///   for a reply, failed hold-downs, and cooldowns whose request interval
 ///   has not elapsed yet (still on the request order). An elapsed cooldown
 ///   is reusable and not counted. This is the same "used" bit that slot
-///   admission reads, so `state_full` happens only at `capacity`.
+///   admission reads, so `state_full` happens only at `capacity`, or
+///   earlier when the key's hash chain is full
+///   (`resolution_index.state_probe_exhausted`). A cooldown whose interval
+///   has elapsed still counts until `mature_states`
+///   takes it off the request order, which runs lazily (at an insert, and
+///   from the timer poll with a bounded budget per tick).
 /// - `actions`: the generated ARP request queue.
 /// - `dynamic_neighbors`: learned neighbors, expired ones included until
 ///   their slot is reused or removed.
@@ -1469,6 +1474,7 @@ impl<'a> ResolutionRuntime<'a> {
             && validate_bits::<StateBits>(states, |index| state_used(&states[index]))
             && order_valid
             && states.iter().filter(|slot| slot.in_order).count() == ordered
+            && states.iter().filter(|slot| state_used(slot)).count() == self.used_state_count
             && states.iter().enumerate().all(|(index, slot)| {
                 let queued = slot.entry.occupied
                     && matches!(
@@ -2452,6 +2458,7 @@ impl<'a> ResolutionRuntime<'a> {
                 self.high_water.states.observe(self.used_state_count);
             }
             (true, false) => {
+                debug_assert!(self.used_state_count != 0, "used state count underflow");
                 self.used_state_count = self.used_state_count.saturating_sub(1);
             }
             (false, false) | (true, true) => {}
