@@ -1128,13 +1128,14 @@ REQ-5）。
 
 | family | 引き継ぐ条件 | 引き継げないとき |
 |---|---|---|
-| NAT44 UDP/TCP/ICMP query | inside/outside、public address、port pool、filteringが同じ（TCPはphase timeoutも同じ） | そのfamilyだけflush（`flushed:interfaces`/`public-address`/`port-range`/`filtering`/`timers`） |
-| firewall flow | 常に。ruleが変わればapply時に全flowを新ruleで再評価し、拒否されるflowはrevoke（以後どちらの向きも通らない） | `flows x rules`が4194304 rule testを超えるとflush（`flushed:reevaluation-budget`、最大tableで約25 ms） |
+| NAT44 UDP/TCP/ICMP query | inside/outside、public address、port pool、filteringが同じで、UDP/ICMP idle timeoutが延びず、per-host limitが下がらず新設もされない（TCPはphase timeoutも同じ） | そのfamilyだけflush（`flushed:interfaces`/`public-address`/`port-range`/`filtering`/`timers`/`quota`） |
+| firewall flow | idle timeoutが延びない。expire済みのflowは落とし、routeのegressが変わった（消えた）flowはrevoke、ruleが変わればapply時に残る全flowを新ruleで再評価し、拒否されるflowはrevoke（以後どちらの向きも通らない） | timeout延長はflush（`flushed:timers`）、`live flows x (rules + 4)`が4194304 testを超えるとflush（`flushed:reevaluation-budget`、件数であり時間ではない。最大tableで開発host約25 ms） |
 | 学習ARP neighbor | interfaceのIPv4 addressが同じ、static neighborに置き換わらない、ARP-031有効時はon-link | そのentryだけ削除 |
 
-pending resolution、ICMPv4 error queue/limiter、TCP unsolicited-SYN holdは常に捨てます。UDP/ICMP/
-firewallのidle timeoutの変更は引き継いだstateにも最終activityから効き、per-host limitを下げても
-live stateはevictせず上限未満になるまで新規だけを拒否します。applyは失敗原子的で、失敗したreloadは
+pending resolution、ICMPv4 error queue/limiter、TCP unsolicited-SYN holdは常に捨てます。旧設定で
+expireしたstateはreloadで生き返りません（timeoutの延長はflush、短縮は引き継いだstateに最終
+activityから効く）。carry中はhash keyがprocessの寿命の間変わらないので、`state = "flush"`のreload
+かrestartで定期的に回してください（毒されたARP学習とNAT/FW stateも同時に消えます）。applyは失敗原子的で、失敗したreloadは
 何も引き継ぎも捨てもしません。restartは常に全flushです。詳細はarchitectureの「reload state carry」、
 運用はrunbookの6章です。
 

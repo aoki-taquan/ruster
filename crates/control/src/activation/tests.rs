@@ -1346,10 +1346,12 @@ fn carry_keeps_live_flows_and_learned_neighbors_across_a_route_reload() {
             flush.resolution_actions,
             flush.nat44_udp_mappings,
             flush.nat44_tcp_sessions,
-            flush.firewall_flows,
         ],
-        [0, applied.resolution.actions_flushed, 0, 0, 0].map(exact)
+        [0, applied.resolution.actions_flushed, 0, 0].map(exact)
     );
+    // The route (gateway) changed, so the commit re-evaluates the flows; a
+    // new next hop out of the same interface keeps every one of them.
+    assert_eq!(flush.firewall_flows, crate::FlushCount::Invalidated);
     assert_eq!(
         [
             check.carried.dynamic_neighbors,
@@ -1375,7 +1377,7 @@ fn carry_keeps_live_flows_and_learned_neighbors_across_a_route_reload() {
             check.carry.firewall,
             check.carry.firewall_reevaluated
         ),
-        (crate::ReloadState::Carry, Carried, Carried, false)
+        (crate::ReloadState::Carry, Carried, Carried, true)
     );
 
     // The NAT runtimes kept their secret keys (the new candidate's keys
@@ -1448,8 +1450,10 @@ fn carry_revokes_the_flows_the_new_rules_deny() {
 
     let successor = candidate(&V2_DENY_UDP, 2);
     let check = active.check_successor(&successor).expect("dry run");
-    assert_eq!(check.flush.firewall_flows, exact(udp_flows));
-    assert_eq!(check.carried.firewall_flows, tcp_flows);
+    // The dry run does not repeat the re-evaluation: which flows the commit
+    // revokes is `invalidated`, and every live flow is a carry candidate.
+    assert_eq!(check.flush.firewall_flows, crate::FlushCount::Invalidated);
+    assert_eq!(check.carried.firewall_flows, udp_flows + tcp_flows);
     assert!(check.carry.firewall_reevaluated);
     let report = tick(&mut active, &mut io, 1_020, Some(successor));
     assert_eq!(report.publication, PublicationOutcome::Applied);

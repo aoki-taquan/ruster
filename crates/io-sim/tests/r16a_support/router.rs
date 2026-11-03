@@ -74,6 +74,13 @@ pub struct RouterParams {
     pub offlink_route: bool,
     /// `[reload] state = "flush"` instead of the default carry.
     pub reload_flush: bool,
+    /// `[nat44.udp] idle-ttl-ms`.
+    pub udp_idle_ttl_ms: u64,
+    /// `[firewall.policy] udp-idle-ttl-ms`.
+    pub firewall_udp_idle_ttl_ms: u64,
+    /// `[nat44.udp] mappings-per-host` (rendered only when nonzero; adds
+    /// per-host storage, so a different storage shape).
+    pub udp_mappings_per_host: u16,
 }
 
 impl RouterParams {
@@ -92,6 +99,9 @@ impl RouterParams {
         include_nat: true,
         offlink_route: false,
         reload_flush: false,
+        udp_idle_ttl_ms: 300_000,
+        firewall_udp_idle_ttl_ms: 300_000,
+        udp_mappings_per_host: 0,
     };
 
     pub fn port_last(self) -> u16 {
@@ -150,12 +160,18 @@ impl RouterParams {
                 out,
                 "[nat44.realm]\ninside = \"lan\"\noutside = \"wan\"\npublic-address = \"203.0.113.2\"\n\n\
                  [nat44.realm.ports]\nfirst = {}\nlast = {}\n\n\
-                 [nat44.udp]\nidle-ttl-ms = 300000\nallocator-seed = \"11\"\nicmpv4-errors = \"disabled\"\n\n\
+                 [nat44.udp]\nidle-ttl-ms = {}\nallocator-seed = \"11\"\nicmpv4-errors = \"disabled\"\n{}\n\
                  [nat44.udp.capacity]\nmappings = {}\npeers = {}\n\n\
                  [nat44.tcp]\nidle-ttl-ms = 7440000\nallocator-seed = \"12\"\nicmpv4-errors = \"disabled\"\n\n\
                  [nat44.tcp.capacity]\nmappings = {}\nsessions = {}\n\n",
                 PORT_FIRST,
                 self.port_last(),
+                self.udp_idle_ttl_ms,
+                if self.udp_mappings_per_host == 0 {
+                    String::new()
+                } else {
+                    format!("mappings-per-host = {}\n", self.udp_mappings_per_host)
+                },
                 self.udp_mappings,
                 self.udp_peers,
                 self.tcp_mappings,
@@ -164,10 +180,10 @@ impl RouterParams {
         }
         let _ = write!(
             out,
-            "[firewall.policy]\nudp-idle-ttl-ms = 300000\ntcp-opening-idle-ttl-ms = 240000\n\
+            "[firewall.policy]\nudp-idle-ttl-ms = {}\ntcp-opening-idle-ttl-ms = 240000\n\
              tcp-active-idle-ttl-ms = 7440000\n\n\
              [firewall.capacity]\nstates = {}\n\n",
-            self.firewall_states
+            self.firewall_udp_idle_ttl_ms, self.firewall_states
         );
         let mut rule = |id: u32, protocol: &str, action: &str, ports: (u16, u16)| {
             let _ = write!(

@@ -41,8 +41,14 @@ pub enum StateCarryConflict {
     Filtering,
     /// NAT44 TCP: an idle timeout of a session phase changed. TCP mappings
     /// keep absolute expiry deadlines in deadline-ordered lists, so they
-    /// cannot take a new timeout in place.
+    /// cannot take a new timeout in place; or a UDP/ICMP query idle timeout
+    /// or a firewall idle timeout grew, which would make state that already
+    /// expired under the old timeout live again.
     Timers,
+    /// NAT44: a per-host limit was lowered or added; a host above it would
+    /// never come down to it, because its expired slots are taken over one
+    /// for one.
+    Quota,
     /// Firewall: re-evaluating every carried flow against changed rules
     /// would exceed [`crate::FIREWALL_CARRY_REEVALUATION_BUDGET`] rule
     /// evaluations, so the apply flushes instead of stalling the worker.
@@ -70,6 +76,7 @@ impl StateCarryOutcome {
                 StateCarryConflict::PortRange => "flushed:port-range",
                 StateCarryConflict::Filtering => "flushed:filtering",
                 StateCarryConflict::Timers => "flushed:timers",
+                StateCarryConflict::Quota => "flushed:quota",
                 StateCarryConflict::ReevaluationBudget => "flushed:reevaluation-budget",
             },
         }
@@ -91,6 +98,7 @@ mod tests {
             StateCarryOutcome::FlushIncompatible(StateCarryConflict::Filtering),
             StateCarryOutcome::FlushIncompatible(StateCarryConflict::ReevaluationBudget),
             StateCarryOutcome::FlushIncompatible(StateCarryConflict::Timers),
+            StateCarryOutcome::FlushIncompatible(StateCarryConflict::Quota),
         ];
         let labels = all.map(StateCarryOutcome::label);
         assert_eq!(
@@ -104,6 +112,7 @@ mod tests {
                 "flushed:filtering",
                 "flushed:reevaluation-budget",
                 "flushed:timers",
+                "flushed:quota",
             ]
         );
         assert_eq!(

@@ -301,9 +301,10 @@ tx = [
 
 # --- 9. Rollback: re-applying v1 is a new generation (5); the v2-only route
 # is gone again. v1 uses the default `[reload] state = "carry"`, so the apply
-# event shows the UDP mapping, the learned gateway, and the firewall flow
-# carried: H's packets to 192.0.2.50 now miss the route and stay silent
-# (FW-025), whether or not their state was carried.
+# event shows the UDP mapping and the learned gateway carried, and the
+# firewall flow of H's packets to 192.0.2.50 revoked: its route disappeared
+# (firewall_flows_revoked = 1). They now miss the route and stay silent
+# (FW-025).
 [[step]]
 kind = "apply"
 config = "router-v1.toml"

@@ -170,6 +170,10 @@ fn an_incompatible_tcp_successor_flushes_with_a_fresh_key() {
             policy.with_closing_idle_ttl_ms(300_000).unwrap(),
             StateCarryConflict::Timers,
         ),
+        // A new or lowered per-host limit (the reclaim paths would never
+        // bring a host above it down to it).
+        (policy.with_mappings_per_host(2), StateCarryConflict::Quota),
+        (policy.with_sessions_per_host(2), StateCarryConflict::Quota),
     ];
     for (next_policy, conflict) in cases {
         incompatible(policy, next_policy, conflict);

@@ -36,7 +36,8 @@ use ruster_config::{
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
     Nat44CarryIdentity, Nat44Filtering, Nat44TcpHashKey, Nat44TcpInboundRst, Nat44UdpHashKey,
-    Neighbor, PublicationQuiescence, ResolutionHashKey, Route, StateCarryOutcome,
+    Neighbor, PublicationQuiescence, ResolutionHashKey, Route, StateCarryConflict,
+    StateCarryOutcome,
 };
 
 use crate::{
@@ -65,9 +66,11 @@ pub enum FlushCount {
 /// [`ReloadState::Flush`] it also flushes ARP learning, all NAT
 /// mappings/peers/sessions, and all firewall flows (every hash key
 /// rotates); with [`ReloadState::Carry`] those families flush only when the
-/// successor is incompatible ([`StateCarry`]). `firewall_flows` counts the
-/// flows the apply drops, flushed or revoked by re-evaluation. Cumulative
-/// counters are preserved.
+/// successor is incompatible ([`StateCarry`]). `firewall_flows` is the
+/// flows the apply flushes; when carried flows are re-evaluated (changed
+/// rules or routes) it is [`FlushCount::Invalidated`], because which of them
+/// the commit revokes is decided only by the commit. Cumulative counters
+/// are preserved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct StateFlush {
@@ -120,7 +123,8 @@ pub struct StateCarry {
     /// `None` when the successor has no ICMP query NAT (N5).
     pub nat44_icmp: Option<StateCarryOutcome>,
     pub firewall: StateCarryOutcome,
-    /// Carried firewall flows are re-evaluated against changed rules.
+    /// Carried firewall flows are re-evaluated at the commit: the rules or
+    /// the routes changed.
     pub firewall_reevaluated: bool,
 }
 
@@ -152,7 +156,8 @@ pub struct CarriedCounts {
     pub nat44_tcp_sessions: usize,
     pub nat44_icmp_mappings: usize,
     pub nat44_icmp_peers: usize,
-    /// Flows kept after re-evaluation.
+    /// Live flows the apply keeps, before the commit's re-evaluation
+    /// (an upper bound when [`StateCarry::firewall_reevaluated`]).
     pub firewall_flows: usize,
 }
 
@@ -450,7 +455,12 @@ impl ApplyPlan {
         let new_rules = new.firewall.rules();
         // A restart flushes everything regardless of `[reload] state`.
         let carry = if restart_required.is_empty() {
-            document_carry(&old, &new, next.reload_state())
+            document_carry(
+                &old,
+                &new,
+                next.reload_state(),
+                current.routes() != next.routes(),
+            )
         } else {
             StateCarry::flush(new.icmp.is_some())
         };
@@ -676,6 +686,7 @@ fn document_carry(
     old: &RequiredServices<'_>,
     new: &RequiredServices<'_>,
     mode: ruster_config::ReloadStateV1,
+    routes_changed: bool,
 ) -> StateCarry {
     if mode == ruster_config::ReloadStateV1::Flush {
         return StateCarry::flush(new.icmp.is_some());
@@ -693,6 +704,11 @@ fn document_carry(
             udp.last_port(),
             udp.policy().filtering(),
         )
+        .with_idle_ttl(udp.policy().idle_ttl_ms())
+        .with_host_limits([
+            udp.policy().mappings_per_host(),
+            udp.policy().peers_per_host(),
+        ])
     };
     let tcp = |tcp: &ruster_config::ValidatedNat44TcpV1| {
         Nat44CarryIdentity::new(
@@ -704,6 +720,10 @@ fn document_carry(
             tcp.policy().filtering(),
         )
         .with_tcp_timers(tcp.policy().carry_timers())
+        .with_host_limits([
+            tcp.policy().mappings_per_host(),
+            tcp.policy().sessions_per_host(),
+        ])
     };
     let icmp = |icmp: &ruster_config::ValidatedNat44IcmpV1| {
         Nat44CarryIdentity::new(
@@ -714,6 +734,11 @@ fn document_carry(
             icmp.last_identifier(),
             icmp.policy().filtering(),
         )
+        .with_idle_ttl(icmp.policy().idle_ttl_ms())
+        .with_host_limits([
+            icmp.policy().mappings_per_host(),
+            icmp.policy().peers_per_host(),
+        ])
     };
     StateCarry {
         mode: ReloadState::Carry,
@@ -728,8 +753,18 @@ fn document_carry(
                     outcome(icmp(previous), icmp(next))
                 })
         }),
-        firewall: StateCarryOutcome::Carried,
-        firewall_reevaluated: old.firewall.rules() != new.firewall.rules(),
+        firewall: {
+            let (old, new) = (old.firewall.policy(), new.firewall.policy());
+            let longer = new.udp_idle_ttl_ms() > old.udp_idle_ttl_ms()
+                || new.tcp_opening_idle_ttl_ms() > old.tcp_opening_idle_ttl_ms()
+                || new.tcp_active_idle_ttl_ms() > old.tcp_active_idle_ttl_ms();
+            if longer {
+                StateCarryOutcome::FlushIncompatible(StateCarryConflict::Timers)
+            } else {
+                StateCarryOutcome::Carried
+            }
+        },
+        firewall_reevaluated: old.firewall.rules() != new.firewall.rules() || routes_changed,
     }
 }
 

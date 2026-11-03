@@ -80,8 +80,11 @@ fn unchanged_rules_carry_every_flow_and_the_key_without_evaluating() {
         let flows = runtime.states.to_vec();
         let evaluations = runtime.counters.rule_evaluations;
 
-        let permit = runtime.preflight_reconcile_carrying(current, next).unwrap();
+        let permit = runtime
+            .preflight_reconcile_carrying(current, next, *snapshot, *snapshot)
+            .unwrap();
         assert_eq!(permit.outcome(), StateCarryOutcome::Carried);
+        assert!(!permit.reevaluates());
         let preview = permit.preview();
         let report = permit.commit();
         assert_eq!(report, preview);
@@ -146,10 +149,15 @@ fn changed_rules_revoke_exactly_the_flows_they_no_longer_admit() {
         pass(&mut runtime, &current, https, 10).unwrap();
         let evaluations = runtime.counters.rule_evaluations;
 
-        let permit = runtime.preflight_reconcile_carrying(current, next).unwrap();
+        let permit = runtime
+            .preflight_reconcile_carrying(current, next, *snapshot, *snapshot)
+            .unwrap();
         let preview = permit.preview();
+        assert!(permit.reevaluates());
+        // The dry run does not evaluate: both live flows are carried before
+        // the commit's pass.
+        assert_eq!((preview.states_carried, preview.states_revoked), (2, 0));
         let report = permit.commit();
-        assert_eq!(report, preview, "the dry run predicts the commit");
         assert_eq!(
             report,
             FirewallReconcileReport {
@@ -221,7 +229,7 @@ fn reevaluation_is_bounded_by_the_budget_and_flushes_above_it() {
         }
         let evaluations = runtime.counters.rule_evaluations;
         let report = runtime
-            .preflight_reconcile_carrying(current, next)
+            .preflight_reconcile_carrying(current, next, *snapshot, *snapshot)
             .unwrap()
             .commit();
         assert_eq!(report.outcome, StateCarryOutcome::Carried);
@@ -242,11 +250,13 @@ fn reevaluation_is_bounded_by_the_budget_and_flushes_above_it() {
         let same_key = config(snapshot, &next_rules, 2, hash_key());
         assert_eq!(
             runtime
-                .preflight_reconcile_carrying(current, same_key)
+                .preflight_reconcile_carrying(current, same_key, *snapshot, *snapshot)
                 .err(),
             Some(FirewallReconcileError::HashKeyNotRotated)
         );
-        let permit = runtime.preflight_reconcile_carrying(current, next).unwrap();
+        let permit = runtime
+            .preflight_reconcile_carrying(current, next, *snapshot, *snapshot)
+            .unwrap();
         assert_eq!(
             permit.outcome(),
             StateCarryOutcome::FlushIncompatible(StateCarryConflict::ReevaluationBudget)
@@ -278,7 +288,9 @@ fn refused_carrying_preflights_change_nothing() {
             (current, older, FirewallReconcileError::GenerationRegression),
         ] {
             assert_eq!(
-                runtime.preflight_reconcile_carrying(claimed, next).err(),
+                runtime
+                    .preflight_reconcile_carrying(claimed, next, *snapshot, *snapshot)
+                    .err(),
                 Some(expected)
             );
             assert_eq!(runtime_image(&runtime), before);
@@ -287,8 +299,10 @@ fn refused_carrying_preflights_change_nothing() {
         // changed rules to re-evaluate.
         let next_rules = [udp_rule(5, FirewallAction::Deny, (1, u16::MAX))];
         let next = config(snapshot, &next_rules, 3, rotated_hash_key());
-        let permit = runtime.preflight_reconcile_carrying(current, next).unwrap();
-        assert_eq!(permit.preview().states_revoked, 1);
+        let permit = runtime
+            .preflight_reconcile_carrying(current, next, *snapshot, *snapshot)
+            .unwrap();
+        assert!(permit.reevaluates());
         drop(permit);
         assert_eq!(runtime_image(&runtime), before);
     });
@@ -318,7 +332,7 @@ fn a_shorter_idle_timeout_applies_to_carried_flows_and_reopens_the_sweep() {
             3 * FIREWALL_UDP_MIN_IDLE_TTL_MS
         );
         runtime
-            .preflight_reconcile_carrying(current, next)
+            .preflight_reconcile_carrying(current, next, *snapshot, *snapshot)
             .unwrap()
             .commit();
         assert_eq!(runtime.reclaim_not_before_ms, 0);
@@ -342,6 +356,171 @@ fn a_shorter_idle_timeout_applies_to_carried_flows_and_reopens_the_sweep() {
             ),
             Err(FirewallPlanError::DefaultDenied)
         );
+    });
+}
+
+/// The reviewers' probe (core M1): a UDP flow at 0 with timeout T, a carry
+/// at 5 T to a 10 T timeout. A longer timeout would make the expired, not
+/// yet reclaimed flow live again; it flushes instead, so the pinhole stays
+/// closed. Flows expired at the watermark are dropped by every carry and
+/// do not count against the budget.
+#[test]
+fn expired_flows_never_revive_across_a_carry() {
+    with_snapshot(|snapshot| {
+        let rules = [udp_rule(1, FirewallAction::AllowStateful, (1, u16::MAX))];
+        let ttl = FIREWALL_UDP_MIN_IDLE_TTL_MS;
+        let policy = |udp| FirewallPolicy::new(udp, 240_000, 7_440_000).unwrap();
+        let current = FirewallConfig::new(snapshot, &rules, policy(ttl), 1, hash_key()).unwrap();
+        let longer =
+            FirewallConfig::new(snapshot, &rules, policy(10 * ttl), 2, rotated_hash_key()).unwrap();
+        let mut states = [FirewallStateSlot::default(); 8];
+        let mut runtime = FirewallRuntime::new(current, &mut states);
+        pass(&mut runtime, &current, udp_flow(1_000), 0).unwrap();
+        // Another flow moves the watermark to 5 T.
+        pass(&mut runtime, &current, udp_flow(1_001), 5 * ttl).unwrap();
+        let permit = runtime
+            .preflight_reconcile_carrying(current, longer, *snapshot, *snapshot)
+            .unwrap();
+        assert_eq!(
+            permit.outcome(),
+            StateCarryOutcome::FlushIncompatible(StateCarryConflict::Timers)
+        );
+        permit.commit();
+        assert_eq!(
+            pass(&mut runtime, &longer, reply(udp_flow(1_000)), 5 * ttl + 1),
+            Err(FirewallPlanError::DefaultDenied)
+        );
+
+        // The same timeout: the flow expired at the watermark is dropped
+        // (counted as expired), the live one is carried.
+        let mut states = [FirewallStateSlot::default(); 8];
+        let mut runtime = FirewallRuntime::new(current, &mut states);
+        pass(&mut runtime, &current, udp_flow(1_000), 0).unwrap();
+        pass(&mut runtime, &current, udp_flow(1_001), 5 * ttl).unwrap();
+        let same =
+            FirewallConfig::new(snapshot, &rules, policy(ttl), 2, rotated_hash_key()).unwrap();
+        let expired = runtime.counters.states_expired;
+        let permit = runtime
+            .preflight_reconcile_carrying(current, same, *snapshot, *snapshot)
+            .unwrap();
+        assert_eq!(permit.preview().states_carried, 1, "only live flows count");
+        let report = permit.commit();
+        assert_eq!((report.states_carried, report.states_revoked), (1, 0));
+        assert_eq!(runtime.counters.states_expired, expired + 1);
+        assert_eq!(
+            pass(&mut runtime, &same, reply(udp_flow(1_000)), 5 * ttl + 1),
+            Err(FirewallPlanError::DefaultDenied)
+        );
+        assert_eq!(
+            pass(&mut runtime, &same, reply(udp_flow(1_001)), 5 * ttl + 1),
+            Ok(FirewallConnectionClass::Established)
+        );
+    });
+}
+
+/// Sec M2: when the route to a flow's endpoint changes (or disappears),
+/// the flow is revoked, so the remote cannot keep the reverse direction
+/// open; flows whose routes did not change are carried.
+#[test]
+fn a_changed_route_revokes_the_flows_it_moves() {
+    with_snapshot(|snapshot| {
+        let rules = [udp_rule(1, FirewallAction::AllowStateful, (1, u16::MAX))];
+        let current = config(snapshot, &rules, 1, hash_key());
+        // The next routes send 198.51.100.0/24 out of LAN instead of WAN
+        // and keep everything else.
+        let mut routes = snapshot.routes.to_vec();
+        routes
+            .push(Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, LAN, None).unwrap());
+        let moved = ForwardingSnapshot::new(
+            &routes,
+            snapshot.interfaces,
+            snapshot.neighbors,
+            snapshot.local_ipv4,
+        )
+        .unwrap();
+        let next = config(&moved, &rules, 2, rotated_hash_key());
+        let mut states = [FirewallStateSlot::default(); 8];
+        let mut runtime = FirewallRuntime::new(current, &mut states);
+        let other = FirewallPacket {
+            destination: Ipv4Address::from_octets([203, 0, 113, 50]),
+            ..udp_flow(1_001)
+        };
+        pass(&mut runtime, &current, udp_flow(1_000), 10).unwrap();
+        pass(&mut runtime, &current, other, 10).unwrap();
+        let permit = runtime
+            .preflight_reconcile_carrying(current, next, *snapshot, moved)
+            .unwrap();
+        assert!(permit.reevaluates());
+        let report = permit.commit();
+        assert_eq!((report.states_carried, report.states_revoked), (1, 1));
+        // The moved flow's remote cannot refresh it any more.
+        assert_eq!(
+            pass(&mut runtime, &next, reply(udp_flow(1_000)), 20),
+            Err(FirewallPlanError::DefaultDenied)
+        );
+        assert_eq!(
+            pass(&mut runtime, &next, reply(other), 20),
+            Ok(FirewallConnectionClass::Established)
+        );
+    });
+}
+
+/// A next hop that changes out of the same interface keeps the flows (their
+/// state still matches both directions); route lookups count against the
+/// budget: 4092 rules plus 4 lookups per flow, so 1024 flows are exactly the
+/// budget and 1025 flush.
+#[test]
+fn a_new_next_hop_keeps_flows_and_route_work_counts_against_the_budget() {
+    with_snapshot(|snapshot| {
+        let rules = [udp_rule(1, FirewallAction::AllowStateful, (1, u16::MAX))];
+        let current = config(snapshot, &rules, 1, hash_key());
+        // The default route now goes through another gateway on WAN.
+        let mut routes = snapshot.routes.to_vec();
+        routes[1] = Route::new(
+            Ipv4Address::from_octets([0; 4]),
+            0,
+            WAN,
+            Some(Ipv4Address::from_octets([203, 0, 113, 9])),
+        )
+        .unwrap();
+        let regatewayed = ForwardingSnapshot::new(
+            &routes,
+            snapshot.interfaces,
+            snapshot.neighbors,
+            snapshot.local_ipv4,
+        )
+        .unwrap();
+        let next = config(&regatewayed, &rules, 2, rotated_hash_key());
+        let mut states = [FirewallStateSlot::default(); 8];
+        let mut runtime = FirewallRuntime::new(current, &mut states);
+        pass(&mut runtime, &current, udp_flow(1_000), 10).unwrap();
+        let permit = runtime
+            .preflight_reconcile_carrying(current, next, *snapshot, regatewayed)
+            .unwrap();
+        assert!(permit.reevaluates());
+        let report = permit.commit();
+        assert_eq!((report.states_carried, report.states_revoked), (1, 0));
+
+        let mut next_rules: Vec<FirewallRule> = (0..4_091)
+            .map(|id| udp_rule(10 + id, FirewallAction::Deny, (2, 2)))
+            .collect();
+        next_rules.push(udp_rule(
+            9_999,
+            FirewallAction::AllowStateful,
+            (1, u16::MAX),
+        ));
+        let next = config(&regatewayed, &next_rules, 2, rotated_hash_key());
+        for (flows, carried) in [(1_024_u16, true), (1_025, false)] {
+            let mut states = vec![FirewallStateSlot::default(); 2_048];
+            let mut runtime = FirewallRuntime::new(current, &mut states);
+            for port in 0..flows {
+                pass(&mut runtime, &current, udp_flow(1_000 + port), 10).unwrap();
+            }
+            let permit = runtime
+                .preflight_reconcile_carrying(current, next, *snapshot, regatewayed)
+                .unwrap();
+            assert_eq!(permit.outcome().carried(), carried, "{flows} flows");
+        }
     });
 }
 
@@ -375,7 +554,7 @@ fn worst_case_reevaluation_at_the_budget_takes_milliseconds() {
         assert!(work <= FIREWALL_CARRY_REEVALUATION_BUDGET);
         let started = std::time::Instant::now();
         let report = runtime
-            .preflight_reconcile_carrying(current, next)
+            .preflight_reconcile_carrying(current, next, *snapshot, *snapshot)
             .unwrap()
             .commit();
         let elapsed = started.elapsed();

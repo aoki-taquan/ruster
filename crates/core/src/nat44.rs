@@ -3337,6 +3337,8 @@ impl Nat44UdpConfig {
             self.last_port,
             self.policy.filtering,
         )
+        .with_idle_ttl(self.policy.idle_ttl_ms)
+        .with_host_limits([self.policy.mappings_per_host, self.policy.peers_per_host])
     }
 
     #[must_use]
@@ -3759,6 +3761,15 @@ pub struct Nat44CarryIdentity {
     /// TCP (established, opening, closing) idle timeouts; zero for UDP and
     /// ICMP, whose liveness is computed from the bound timeout.
     timers: [u64; 3],
+    /// UDP/ICMP idle timeout; zero for TCP. A carry may lower it but not
+    /// raise it: a longer timeout would make mappings that already expired
+    /// (and may already be parked or retired) live again.
+    idle_ttl_ceiling: u64,
+    /// Per-host limits (mappings, then peers or sessions; `0` = none). A
+    /// carry may raise or remove a limit but not lower or add one: the
+    /// reclaim paths take over a host's expired slot one for one, so a host
+    /// above a lowered limit would never come down to it.
+    host_limits: [u16; 2],
 }
 
 impl Nat44CarryIdentity {
@@ -3781,7 +3792,25 @@ impl Nat44CarryIdentity {
             last_port,
             filtering,
             timers: [0; 3],
+            idle_ttl_ceiling: 0,
+            host_limits: [0; 2],
         }
+    }
+
+    /// This identity with the UDP or ICMP idle timeout, which a carry may
+    /// lower but not raise.
+    #[must_use]
+    pub const fn with_idle_ttl(mut self, idle_ttl_ms: u64) -> Self {
+        self.idle_ttl_ceiling = idle_ttl_ms;
+        self
+    }
+
+    /// This identity with the per-host limits (mappings, then peers or
+    /// sessions; `0` = none), which a carry may raise but not lower.
+    #[must_use]
+    pub const fn with_host_limits(mut self, limits: [u16; 2]) -> Self {
+        self.host_limits = limits;
+        self
     }
 
     /// This identity with the TCP (established, opening, closing) idle
@@ -3793,7 +3822,9 @@ impl Nat44CarryIdentity {
     }
 
     /// Why state created under `self` cannot carry into `next`, in this
-    /// order: interfaces, public address, pool, filtering, TCP timers.
+    /// order: interfaces, public address, pool, filtering, timers (any TCP
+    /// timeout change, a longer UDP/ICMP timeout), per-host limits (a lower
+    /// or new limit).
     #[must_use]
     pub fn carry_conflict(self, next: Self) -> Option<crate::StateCarryConflict> {
         use crate::StateCarryConflict;
@@ -3805,8 +3836,13 @@ impl Nat44CarryIdentity {
             Some(StateCarryConflict::PortRange)
         } else if self.filtering != next.filtering {
             Some(StateCarryConflict::Filtering)
-        } else if self.timers != next.timers {
+        } else if self.timers != next.timers || next.idle_ttl_ceiling > self.idle_ttl_ceiling {
             Some(StateCarryConflict::Timers)
+        } else if (0..2).any(|list| {
+            let (old, new) = (self.host_limits[list], next.host_limits[list]);
+            new != 0 && (old == 0 || new < old)
+        }) {
+            Some(StateCarryConflict::Quota)
         } else {
             None
         }
@@ -4687,12 +4723,14 @@ impl<'a> Nat44UdpRuntime<'a> {
     /// When [`Self::carry_conflict`] finds nothing, the permit carries: its
     /// commit only binds `config` and keeps every mapping, peer, index,
     /// port owner, per-host count, the hash key, the runtime epoch, and the
-    /// clock watermark, in O(1). The new idle TTL, quotas, and policy then
-    /// apply to carried state exactly as to new state: liveness is always
-    /// the last activity plus the bound TTL, and a host above a lowered
-    /// quota keeps its live mappings but gets no new one until it is below
-    /// the limit (no eviction). `hash_key` is not used by a carry; the old
-    /// key stays secret and keeps keying the indexes.
+    /// clock watermark, in O(1). A shorter idle timeout and the rest of the
+    /// policy then apply to carried state exactly as to new state: liveness
+    /// is always the last activity plus the bound TTL, which only makes
+    /// more mappings expired. A longer timeout or a lowered or new per-host
+    /// limit is a conflict (it would revive parked or retired mappings, or
+    /// never take effect for a churning host), so state that expired under
+    /// the old policy never becomes live again. `hash_key` is not used by a
+    /// carry; the old key stays secret and keeps keying the indexes.
     ///
     /// Otherwise this is [`Self::preflight_reconcile`] (flush and key
     /// rotation), reported as [`crate::StateCarryOutcome::FlushIncompatible`].
@@ -7249,6 +7287,7 @@ impl Nat44TcpConfig {
             self.policy.filtering,
         )
         .with_tcp_timers(self.policy.carry_timers())
+        .with_host_limits([self.policy.mappings_per_host, self.policy.sessions_per_host])
     }
 
     #[must_use]
@@ -8718,10 +8757,10 @@ impl<'a> Nat44TcpRuntime<'a> {
     ///
     /// A carry keeps every mapping, session (with its RFC 7857 phase),
     /// index, port owner, per-host and per-remote count, the hash key, the
-    /// runtime epoch, and the clock watermark, in O(1). Each phase's new
-    /// idle TTL applies to carried sessions from their last activity, and
-    /// lowered per-host limits refuse new state without evicting live
-    /// state. Unsolicited-SYN holds (RFC 5382 REQ-4) are always dropped:
+    /// runtime epoch, and the clock watermark, in O(1). The phase timeouts
+    /// must be unchanged (mappings keep absolute deadlines) and the per-host
+    /// limits not lowered or added; otherwise this flushes. Unsolicited-SYN
+    /// holds (RFC 5382 REQ-4) are always dropped:
     /// each was admitted by the old firewall and switch for an ICMP error
     /// at most 6 s later, so none is sent on the old authority.
     pub fn preflight_reconcile_carrying<'runtime>(

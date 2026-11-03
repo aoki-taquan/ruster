@@ -1,8 +1,9 @@
 //! RELOAD-CARRY for the UDP NAT (and, through its engine, ICMP query NAT):
 //! a compatible successor keeps every mapping, peer, index, port owner, the
 //! hash key, the epoch, and the clock watermark; an incompatible one flushes
-//! with a fresh key and names the conflict; timers and quotas of the
-//! successor apply to carried state.
+//! with a fresh key and names the conflict. State that expired under the old
+//! policy never becomes live again: a longer idle timeout and a lowered or
+//! new per-host limit flush.
 
 use super::*;
 
@@ -55,9 +56,9 @@ fn kept(runtime: &Nat44UdpRuntime<'_>) -> impl PartialEq + std::fmt::Debug {
 #[test]
 fn a_compatible_successor_carries_every_mapping_and_its_key() {
     with_port_config(policy(), 40_000, 40_015, |current| {
-        // A successor with another idle TTL, seed, hairpinning, and port
+        // A successor with another seed, hairpinning, and port
         // preservation, from another snapshot: still compatible.
-        let next_policy = Nat44UdpPolicy::new(TTL * 2, 99)
+        let next_policy = Nat44UdpPolicy::new(TTL, 99)
             .unwrap()
             .with_hairpinning(false)
             .with_port_preservation(false);
@@ -93,13 +94,12 @@ fn a_compatible_successor_carries_every_mapping_and_its_key() {
             assert!(!runtime.publication_binding_matches(next, rotated_udp_hash_key()));
             assert_eq!(runtime.counters().reconciliations, reconciliations + 1);
 
-            // The carried mapping still translates replies, and the new,
-            // longer TTL applies from its last outbound activity.
+            // The carried mapping still translates replies until its TTL
+            // from its last outbound activity.
             let port = first.public_port();
-            assert_eq!(inbound(&runtime, port, REMOTE1, 10 + TTL), Ok(()));
-            assert_eq!(inbound(&runtime, port, REMOTE1, 10 + 2 * TTL - 1), Ok(()));
+            assert_eq!(inbound(&runtime, port, REMOTE1, 10 + TTL - 1), Ok(()));
             assert_eq!(
-                inbound(&runtime, port, REMOTE1, 10 + 2 * TTL),
+                inbound(&runtime, port, REMOTE1, 10 + TTL),
                 Err(Nat44UdpPlanError::MappingMiss)
             );
             // The reused mapping keeps its port; nothing was rehashed.
@@ -143,50 +143,107 @@ fn a_shorter_ttl_reevaluates_carried_mappings_from_their_last_activity() {
 }
 
 #[test]
-fn a_lowered_quota_keeps_live_mappings_and_refuses_new_ones_until_below_it() {
-    let quota = |limit| policy().with_mappings_per_host(limit);
-    with_port_config(quota(3), 40_000, 40_063, |current| {
-        with_port_config(quota(1), 40_000, 40_063, |next| {
-            let mut mappings = [Nat44UdpMappingSlot::default(); 8];
-            let mut peers = [Nat44UdpPeerSlot::default(); 16];
-            let mut indexes = TestNat44UdpIndexes::new(current, mappings.len(), peers.len());
-            let mut runtime = indexes.runtime(current, &mut mappings, &mut peers);
-            let ports: Vec<u16> = (0..3)
-                .map(|index| {
-                    outbound(
-                        &mut runtime,
-                        INTERNAL,
-                        1_000 + index,
-                        REMOTE1,
-                        10 * u64::from(index),
-                    )
+fn a_lowered_or_new_quota_flushes_and_a_raised_or_removed_one_carries() {
+    use crate::{StateCarryConflict, StateCarryOutcome};
+    let quota = |mappings, peers| {
+        policy()
+            .with_mappings_per_host(mappings)
+            .with_peers_per_host(peers)
+    };
+    // (current, next, carried): the reclaim paths take over a host's
+    // expired slot one for one, so a host above a lowered limit would never
+    // come down to it; a lower or new limit therefore flushes (and takes
+    // effect at once), a higher or removed one carries.
+    for (current_policy, next_policy, carried) in [
+        (quota(3, 0), quota(1, 0), false),
+        (quota(3, 4), quota(3, 2), false),
+        (quota(0, 4), quota(2, 4), false),
+        (quota(3, 4), quota(3, 0), true),
+        (quota(1, 4), quota(3, 8), true),
+    ] {
+        with_port_config(current_policy, 40_000, 40_063, |current| {
+            with_port_config(next_policy, 40_000, 40_063, |next| {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 8];
+                let mut peers = [Nat44UdpPeerSlot::default(); 16];
+                let mut indexes = TestNat44UdpIndexes::new(current, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(current, &mut mappings, &mut peers);
+                let port = outbound(&mut runtime, INTERNAL, 1_000, REMOTE1, 10)
                     .unwrap()
-                    .public_port()
-                })
-                .collect();
-            runtime
-                .preflight_reconcile_carrying(next, rotated_udp_hash_key())
-                .unwrap()
-                .commit();
-            // No live mapping is evicted: all three still translate.
-            for port in &ports {
-                assert_eq!(inbound(&runtime, *port, REMOTE1, 100), Ok(()));
-            }
-            // A new mapping for the host is refused while it holds more than
-            // the new limit of live mappings, without any state change.
-            let before = (runtime.mappings.to_vec(), runtime.peers.to_vec());
-            assert_eq!(
-                outbound(&mut runtime, INTERNAL, 1_003, REMOTE1, 100).map(|_| ()),
-                Err(Nat44UdpPlanError::HostQuotaExceeded)
-            );
-            assert_eq!((runtime.mappings.to_vec(), runtime.peers.to_vec()), before);
-            // Existing mappings keep working (refresh, new peer).
-            outbound(&mut runtime, INTERNAL, 1_002, REMOTE2, 100).unwrap();
-            // Other hosts are unaffected.
-            outbound(&mut runtime, INTERNAL2, 1_000, REMOTE1, 100).unwrap();
-            assert_eq!(runtime.validate_indexes(), Ok(()));
+                    .public_port();
+                let report = runtime
+                    .preflight_reconcile_carrying(next, rotated_udp_hash_key())
+                    .unwrap()
+                    .commit();
+                if carried {
+                    assert_eq!(report.outcome, StateCarryOutcome::Carried);
+                    assert_eq!(inbound(&runtime, port, REMOTE1, 20), Ok(()));
+                } else {
+                    assert_eq!(
+                        report.outcome,
+                        StateCarryOutcome::FlushIncompatible(StateCarryConflict::Quota)
+                    );
+                    assert_eq!(report.mappings_flushed, 1);
+                    assert_eq!(
+                        inbound(&runtime, port, REMOTE1, 20),
+                        Err(Nat44UdpPlanError::MappingMiss)
+                    );
+                }
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            });
         });
-    });
+    }
+}
+
+/// The reviewers' probe (H1): mappings 4, peers 3. A maps to two remotes
+/// at 0, B to one at T - 1; at T + 5 B's new peer parks A's expired
+/// mapping. A carry to a 3 T timeout would make the parked mapping count
+/// as live again and corrupt the reuse lists; it flushes instead, and a
+/// shorter timeout carries with consistent indexes.
+#[test]
+fn a_longer_idle_timeout_flushes_so_parked_mappings_never_revive() {
+    use crate::{StateCarryConflict, StateCarryOutcome};
+    for (next_ttl, carried) in [(3 * TTL, false), (TTL, true)] {
+        with_port_config(policy(), 40_000, 40_015, |current| {
+            let next_policy = Nat44UdpPolicy::new(next_ttl, 0).unwrap();
+            with_port_config(next_policy, 40_000, 40_015, |next| {
+                let mut mappings = [Nat44UdpMappingSlot::default(); 4];
+                let mut peers = [Nat44UdpPeerSlot::default(); 3];
+                let mut indexes = TestNat44UdpIndexes::new(current, mappings.len(), peers.len());
+                let mut runtime = indexes.runtime(current, &mut mappings, &mut peers);
+                let a = outbound(&mut runtime, INTERNAL, 1_000, REMOTE1, 0)
+                    .unwrap()
+                    .public_port();
+                outbound(&mut runtime, INTERNAL, 1_000, REMOTE2, 0).unwrap();
+                outbound(&mut runtime, INTERNAL2, 1_000, REMOTE1, TTL - 1).unwrap();
+                outbound(&mut runtime, INTERNAL2, 1_000, REMOTE2, TTL + 5).unwrap();
+                assert!(runtime
+                    .mappings
+                    .iter()
+                    .any(|slot| slot.occupied && slot.link.list != UdpMappingList::Lru));
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+                let report = runtime
+                    .preflight_reconcile_carrying(next, rotated_udp_hash_key())
+                    .unwrap()
+                    .commit();
+                assert_eq!(report.outcome.carried(), carried);
+                if !carried {
+                    assert_eq!(
+                        report.outcome,
+                        StateCarryOutcome::FlushIncompatible(StateCarryConflict::Timers)
+                    );
+                }
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+                // The expired mapping of A does not translate, and A's next
+                // outbound refresh works with consistent indexes.
+                assert_eq!(
+                    inbound(&runtime, a, REMOTE1, TTL + 6),
+                    Err(Nat44UdpPlanError::MappingMiss)
+                );
+                outbound(&mut runtime, INTERNAL, 1_000, REMOTE1, TTL + 7).unwrap();
+                assert_eq!(runtime.validate_indexes(), Ok(()));
+            });
+        });
+    }
 }
 
 #[test]

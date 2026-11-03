@@ -222,6 +222,7 @@ fn random_router(rng: &mut V1Rng) -> RouterParams {
         include_nat: true,
         offlink_route: false,
         reload_flush: false,
+        ..RouterParams::BASE
     }
 }
 

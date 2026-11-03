@@ -712,7 +712,7 @@ impl<'storage> LiveRuntimes<'storage> {
     /// that stage's permit (and every earlier one) is still held.
     fn preflight<'runtime, 'rules, F>(
         &'runtime mut self,
-        current: &ValidatedCandidate,
+        current: &'rules ValidatedCandidate,
         successor: &'rules ValidatedCandidate,
         fault: &mut F,
     ) -> Result<Permits<'runtime, 'storage, 'rules>, ApplyError>
@@ -790,6 +790,8 @@ impl<'storage> LiveRuntimes<'storage> {
             self.firewall.preflight_reconcile_carrying(
                 current.authority().firewall_config(),
                 authority.firewall_config(),
+                current.authority().snapshot(),
+                authority.snapshot(),
             )
         } else {
             self.firewall
@@ -1070,7 +1072,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
         let next = successor.authority().snapshot();
         // The permits are discarded at the end of this block without a
         // commit, which leaves every runtime unchanged.
-        let (resolution, firewall, udp, tcp, icmp) = {
+        let (resolution, firewall, firewall_reevaluates, udp, tcp, icmp) = {
             let permits = self
                 .runtimes
                 .preflight(&self.candidate, successor, &mut |_| None)?;
@@ -1082,6 +1084,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             (
                 resolution,
                 permits.firewall.preview(),
+                permits.firewall.reevaluates(),
                 permits.nat44_udp.outcome(),
                 permits.nat44_tcp.outcome(),
                 permits
@@ -1122,9 +1125,13 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 nat44_tcp_sessions: tcp_sessions,
                 nat44_icmp_mappings: icmp_mappings,
                 nat44_icmp_peers: icmp_peers,
-                firewall_flows: FlushCount::Exact(
-                    firewall.states_flushed + firewall.states_revoked,
-                ),
+                // The re-evaluation runs only in the commit, so a dry run
+                // never stalls the worker with it a second time.
+                firewall_flows: if firewall_reevaluates {
+                    FlushCount::Invalidated
+                } else {
+                    FlushCount::Exact(firewall.states_flushed)
+                },
                 ..flush
             },
             carry: StateCarry {
@@ -1134,9 +1141,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 nat44_tcp: tcp,
                 nat44_icmp: icmp,
                 firewall: firewall.outcome,
-                firewall_reevaluated: firewall.outcome.carried()
-                    && self.candidate.authority().firewall_config().rules()
-                        != successor.authority().firewall_config().rules(),
+                firewall_reevaluated: firewall_reevaluates,
             },
             carried: CarriedCounts {
                 dynamic_neighbors: resolution.dynamic_neighbors_carried,

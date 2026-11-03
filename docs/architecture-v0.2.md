@@ -2016,8 +2016,8 @@ egress限定のflowのUDP）はsilentな`FirewallRouteUnavailable`で、firewall
   flushしましたが、既定の`[reload] state = "carry"`ではflowがrouteの変わるreloadを越えて残ります。
   それでもroute miss判定（`permits_route_miss`）はstateを参照せずpacketとruleだけで決まるので、
   carryしたflowのpacketも同じpacketの新規attemptと同じ結果になり、state有無はICMPに現れません。
-  routeが別egressへ移ったflowのpacketはorigin interfaceを含むexact tupleのstateにhitせず新規
-  attemptとして評価されます。
+  routeのegressが変わった（消えた）flowはcarry時にrevokeされ（RELOAD-017）、以後どちらの向きも
+  新規attemptとして評価されます。
 - 同じreloadの後にrouteが残っていても、そのpacketはstateなしの新規attemptとしてfirewallにsilent
   dropされます（TCP ACKなら`FirewallTcpInvalidInitialFlags`）。route missの場合だけerrorを返すと
   route有無が外から観測でき、上記のroute oracleを再び開きます。
@@ -2244,9 +2244,9 @@ flush permit（新keyへのrotationを要求）を返して`StateCarryOutcome::F
 
 | family | 引き継ぐ条件 | 引き継ぐもの | 非互換時 |
 |---|---|---|---|
-| NAT44 UDP / ICMP query | inside/outside、public address、port（identifier）pool、filtering modeが等しい | mapping、peer、directory、port owner、per-host count、hash key、runtime epoch、clock watermark。commitはconfigの代入だけでO(1) | `interfaces`/`public-address`/`port-range`/`filtering` |
-| NAT44 TCP | 上記に加えestablished/opening/closingのidle timeoutが等しい | 同上とsession（RFC 7857 §2のphase）。unsolicited-SYN holdは常に捨てる | 上記と`timers` |
-| firewall | 常に（ruleが変われば再評価） | flow table、table key/generation。ruleが等しければ評価なし | 再評価が予算超えなら`reevaluation-budget` |
+| NAT44 UDP / ICMP query | inside/outside、public address、port（identifier）pool、filtering modeが等しく、idle timeoutが延びず、per-host limitが下がらず新設もされない | mapping、peer、directory、port owner、per-host count、hash key、runtime epoch、clock watermark。commitはconfigの代入だけでO(1) | `interfaces`/`public-address`/`port-range`/`filtering`/`timers`/`quota` |
+| NAT44 TCP | 上記（timeout以外）に加えestablished/opening/closingのidle timeoutが等しい | 同上とsession（RFC 7857 §2のphase）。unsolicited-SYN holdは常に捨てる | 上記と`timers` |
+| firewall | idle timeoutが延びない | flow table、table key/generation。ruleもrouteも等しければ評価なし。watermark時点でexpire済みのflowは落とす | `timers`、再評価が予算超えなら`reevaluation-budget` |
 | 学習ARP neighbor | entryごと: interfaceのlocal IPv4 bindingが不変、static neighborが無い、ARP-031有効時はon-link | 条件を満たすentryとindex key | 満たさないentryだけを削除 |
 
 pending resolution state、queued ARP action、failure hold、ICMPv4 error queueとlimiterは常に
@@ -2254,35 +2254,50 @@ flushします。旧snapshotのauthority（routeやbindingの検証済み前提�
 packetから作り直せるためです。TCP unsolicited-SYN holdも旧firewallとswitchが許可した高々6秒先の
 ICMP予約なので、carryでも送りません。
 
-**timer。** 「残り寿命を保つ」ではなく「再評価」を選びました。UDP/ICMP mappingとfirewall flowの
-livenessは常に「最終activity + bindされたTTL」で計算され、activity順listは単一TTLなので順序も
-保たれます。新しいTTLは引き継いだstateにも最終activityから効きます（短縮で即expireもあり得る。
-firewallは旧earliest-deadline boundより早いdeadlineが生じ得るのでsweep boundを0へ戻す）。
+**timer。** 不変条件は「旧policyでexpireしたstateはreloadで再びliveにならない」です。UDP/ICMP
+mappingとfirewall flowのlivenessは常に「最終activity + bindされたTTL」で計算されるので、TTLを
+延ばすとexpire済みでlazy reclaim前のstateがliveに戻ります。UDPではexpireしたmappingが既に
+parked/retired listへ移っている場合があり、liveに戻るとreuse listとN6 peer countが壊れます
+（review H1で再現）。commit時に旧TTLで期限切れを掃除する案は、commitに正確なnowがなく（watermark
+は遅れ得る）未観測の期限切れが残るので採らず、延長はそのfamilyのflush（`timers`）にしました。
+短縮は期限切れを増やすだけで安全なので、新しいTTLが引き継いだstateに最終activityから効きます
+（activity順listは単一TTLで順序が保たれる。firewallは旧earliest-deadline boundより早いdeadlineが
+生じ得るのでsweep boundを0へ戻す）。
 TCP mappingはexpiryを絶対deadlineとしてdeadline順listに持つので新timeoutを受け入れられず、TCP
 timeoutの変更はTCPだけflushします（`timers`）。in-placeの再計算はlistの並べ直しになりapplyの
 boundを壊すため採りませんでした。
 
-**quota。** per-host（mapping/peer/session）とTCP per-remoteのlimitを下げても、live stateは
-evictしません（どのhostにも同じ扱いで、既存stateはRFC 4787 REQ-1どおり寿命まで残る）。上限を
-超えるhostの新規stateは、件数が上限未満になるまで既存の`*_QUOTA_EXCEEDED`で拒否します（自host
-のexpireしたslotのreclaimは件数を増やさないので許可）。per-host tableの有無はstorage shapeなので
-on/offはrestart-requiredです。
+**quota。** per-host（mapping/peer/session）limitを下げる、または新設するsuccessorはそのNAT
+familyをflushします（`quota`）。reclaim pathはlimit到達hostのexpireしたslotを1対1で引き継ぐので、
+carryすると上限を超えたhostは使い続ける限り上限まで下がりません（review M2/sec M1で再現）。
+expireしたheadを新規なしで解放する案は、読み取り専用のplanと一点commitの分離を4経路で崩すので
+採らず、即時に効くflushを選びました。上げる・外す変更はcarryします。TCP per-remote limitはSYN
+ごとにlive sessionを数えるので、carryしても即時に効きます。per-host tableの有無はstorage shape
+なのでon/offはrestart-requiredです。
 
-**firewall再評価（fail closed）。** ruleが変わったcarryは、commit内（失敗分岐なし）で全carry
-flowのorigin tuple/interfacesをinitial packet（TCPはSYN、ICMPはrequest）として新ruleにfirst-match
-し、allowなら`origin_rule_id`を更新、deny/default denyなら`config_generation = 0`でrevokeします。
+**firewall再評価（fail closed）。** carryはcommit内（失敗分岐なし）の一passで、watermark時点で
+旧policyでexpire済みのflowを落とし（`states_expired`）、routeが変わっていればどちらかのendpointへの
+routeのegressが変わった（現れた、消えた）flowをrevokeし、ruleが変わっていれば残る全flowのorigin
+tuple/interfacesをinitial packet（TCPはSYN、ICMPはrequest）として新ruleにfirst-matchし、allowなら
+`origin_rule_id`を更新、deny/default denyなら`config_generation = 0`でrevokeします。route変更での
+revokeが要るのは、stateがorigin interfaceを含むexact tupleでしかhitしないためです: forward routeが
+別egressへ移ってもforward方向だけが新規attemptになり、reverse方向はstateに当たり続けremoteが
+refreshし続けられます（review sec M2）。next hopだけが同じinterfaceで変わったflowは両方向とも
+exactに当たるので残します。NAT44 mappingはrouteに束縛せず引き継ぎます: full-serviceではfirewallが
+必須でNATを通る全packetを評価するので、FW flowがrevokeされたmappingは何も通さず寿命で消えます
+（その間per-host quotaを占める）。
 revokeしたflowはapply後どちらの向きにも通らず（replyは新規attemptとしてdefault deny、outboundは
 deny rule）、slotはexpireと同じlazy reclaimで消えます（`states_revoked`に数え`states_expired`には
 数えない）。次packet時のlazy評価はrelated ICMPv4やroute miss等のstate参照点ごとに未評価flowを
-扱う境界が増えるため、apply時の一括評価を選びました。仕事量は`carried flows x rules`をpreflightで
-先に計算し、`FIREWALL_CARRY_REEVALUATION_BUDGET` = 2^22 rule testを超えればfirewallだけflush
-（fail closed）します。最大table（2^16 slot、usable 49152 flow）x 85 ruleの4,177,920 testは開発host
+扱う境界が増えるため、apply時の一括評価を選びました。仕事量はwatermark時点でliveなflowだけを
+数えた`live x (ruleが変わればrule数 + routeが変わればlookup 4)`をpreflightで先に計算し、
+`FIREWALL_CARRY_REEVALUATION_BUDGET` = 2^22 test（時間ではなく件数）を超えればfirewallだけflush
+（fail closed）します。dry run（`check_successor`）は評価を繰り返さず、再評価するcarryのflushを
+`invalidated`として返すので、SIGHUPごとにpassがrouter threadで二回走ることはありません。最大table（2^16 slot、usable 49152 flow）x 85 ruleの4,177,920 testは開発host
 のrelease buildで約25 ms（約6 ns/test、`worst_case_reevaluation_at_the_budget_takes_milliseconds`）で、
-reloadのquiescence上限200 ms未満です。NAT carryはO(1)、resolutionはO(学習neighbor)でindex経由
-O(1) lookupなので、applyの最悪時間はこのfirewall予算が支配します。routeは参照しません。flow stateは
-origin interfaceを含むexact tupleでしかhitしないので、routeが別egressへ移ったflowのpacketは新規
-attemptとして評価され、route missはstateを参照しません（FW-025の「route oracleを作らない」根拠は
-carry後も成り立つ）。
+reloadのquiescence上限200 ms未満です（時間はhostで変わります）。NAT carryはO(1)、resolutionはO(学習neighbor)でindex経由
+O(1) lookupなので、applyの最悪時間はこのfirewall予算が支配します。route missはstateを参照しない
+ので、FW-025の「route oracleを作らない」根拠はcarry後も成り立ちます。
 
 **hash key。** carryしたfamilyのruntimeは旧secret key（OS CSPRNGの128 bit、Debugでredact、
 SipHash/keyed directory）を使い続け、新candidateのkeyは使いません。hash-flooding耐性はkeyの
@@ -2290,8 +2305,9 @@ SipHash/keyed directory）を使い続け、新candidateのkeyは使いません
 攻撃者がkeyを推定する機会はflush時と同じです。全tableを新keyでapply時に再挿入すると最大tableで
 数万件のdirectory/port owner/host listの再構築になり、applyのboundとfailure atomicityの検証面を
 広げるので採りませんでした。keyはflush（mode、非互換、予算超え）とrestartで従来どおりrotateし、
-sequencerは発行key再利用を拒否し続けます。carry中の定期rotationは未実装（RELOAD-016）で、必要なら
-`state = "flush"`のreloadかrestartで回します。firewallは`table_key`/`table_generation`（構築または
+sequencerは発行key再利用を拒否し続けます。carry中はkeyがprocessの寿命の間変わらず、定期rotationは
+未実装（RELOAD-016）で、必要なら`state = "flush"`のreloadかrestartで回します（同時に毒された
+ARP学習とNAT/FW stateも消える）。firewallは`table_key`/`table_generation`（構築または
 flush時のもの）でhashし、`binding`だけを新configへ移すので、forwarding pathの`config_matches`は
 新configと一致し、table内のflowも見つかります。NATのforwarding pathはconfigだけを照合します。
 
@@ -2462,8 +2478,9 @@ rtnetlink address dump（`run::netlink`）だけで、crateは`#![deny(unsafe_co
   cold側`Vec<u8>`を確保します）。
 - firewall有効時のroute missは、egress-free評価で許可されegress依存のNAT gateにも当たらない
   packetだけにDestination Unreachable Networkを返します。route撤去後の既存flowのpacketは
-  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。全reloadがflowをflushするため
-  参照できるstateがなく、answerするとroute oracleになるため2026-11-01の再評価でも維持）。
+  silentです（RFC 1812 §5.2.7.1からのtracked deviation、FW-025。route missの判定はstateを参照せず、
+  routeのegressが変わった（消えた）flowはcarry時にrevokeされ（RELOAD-017）、answerするとroute
+  oracleになるため2026-11-01と2026-11-03の再評価でも維持）。
 - router-originated ICMPv4の4 class（Echo Reply、Time Exceeded、Network/Host Unreachable）は
   default onで、classごとにoffにできます（上記inventory）。
 - restart-requiredのapplyはrun-sim内でrejectとして報告し、storageを作り直しません（SIM-016）。
