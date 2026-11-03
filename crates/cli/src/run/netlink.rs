@@ -116,6 +116,9 @@ const IFF_LOWER_UP: u32 = 0x1_0000;
 pub const KERNEL_ENODEV: i32 = -19;
 /// `NLM_F_REQUEST`.
 const NLM_F_REQUEST: u16 = 0x1;
+/// `NLM_F_ACK`: the kernel answers a change with an `NLMSG_ERROR` whose
+/// error is 0 on success.
+const NLM_F_ACK: u16 = 0x4;
 /// `NLM_F_DUMP` (`NLM_F_ROOT | NLM_F_MATCH`).
 const NLM_F_DUMP: u16 = 0x300;
 /// `NLM_F_DUMP_INTR`: the dump raced a change; its result is not
@@ -764,6 +767,69 @@ pub fn link_request(sequence: u32, ifindex: u32) -> [u8; HEADER_LEN + IFINFOMSG_
     request
 }
 
+/// The 32-byte `RTM_NEWLINK` request that sets interface `ifindex`
+/// administratively down (OPS-EXIT): `ifi_change` is `IFF_UP` and
+/// `ifi_flags` 0, so the kernel clears `IFF_UP` and changes nothing else
+/// (`dev_change_flags` of `(flags & ~change) | (0 & change)`). With
+/// `NLM_F_ACK` the kernel answers with exactly one `NLMSG_ERROR` (0 on
+/// success). Needs `CAP_NET_ADMIN` over the network namespace of the
+/// sending thread at the time of the send (rtnetlink checks the sender,
+/// not only the socket's opener).
+pub fn link_down_request(sequence: u32, ifindex: u32) -> [u8; HEADER_LEN + IFINFOMSG_LEN] {
+    let mut request = [0_u8; HEADER_LEN + IFINFOMSG_LEN];
+    let len = u32::try_from(request.len()).unwrap_or(u32::MAX);
+    request[0..4].copy_from_slice(&len.to_ne_bytes());
+    request[4..6].copy_from_slice(&RTM_NEWLINK.to_ne_bytes());
+    request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_ACK).to_ne_bytes());
+    request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    // ifinfomsg: AF_UNSPEC, type 0, the index, flags 0, change IFF_UP.
+    request[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&ifindex.to_ne_bytes());
+    request[HEADER_LEN + 12..HEADER_LEN + 16].copy_from_slice(&IFF_UP.to_ne_bytes());
+    request
+}
+
+/// Parses one datagram answering the acknowledged request `sequence` on
+/// the socket with port id `port` ([`link_down_request`]). `Ok(None)` if
+/// the datagram holds no message of this request; `Ok(Some(()))` for the
+/// acknowledgement (an `NLMSG_ERROR` with error 0). Fails closed: a
+/// message of this request for another port id, a negative error
+/// ([`NetlinkError::Kernel`]), a short message, and any other message
+/// type.
+pub fn parse_ack(datagram: &[u8], sequence: u32, port: u32) -> Result<Option<()>, NetlinkError> {
+    let mut at = 0;
+    while at < datagram.len() {
+        let rest = &datagram[at..];
+        let len = u32_at(rest, 0).ok_or(NetlinkError::Malformed)? as usize;
+        if len < HEADER_LEN || len > rest.len() {
+            return Err(NetlinkError::Malformed);
+        }
+        let kind = u16_at(rest, 4).ok_or(NetlinkError::Malformed)?;
+        let seq = u32_at(rest, 8).ok_or(NetlinkError::Malformed)?;
+        let pid = u32_at(rest, 12).ok_or(NetlinkError::Malformed)?;
+        if seq == sequence {
+            if pid != port {
+                return Err(NetlinkError::UnexpectedPort);
+            }
+            if kind != NLMSG_ERROR {
+                return Err(NetlinkError::Malformed);
+            }
+            let error = u32_at(&rest[..len], HEADER_LEN).ok_or(NetlinkError::Malformed)?;
+            let error = i32::from_ne_bytes(error.to_ne_bytes());
+            return match error {
+                0 => Ok(Some(())),
+                error if error < 0 => Err(NetlinkError::Kernel(error)),
+                _ => Err(NetlinkError::Malformed),
+            };
+        }
+        let advance = len.div_ceil(4) * 4;
+        if advance >= rest.len() {
+            break;
+        }
+        at += advance;
+    }
+    Ok(None)
+}
+
 /// Largest [`link_name_request`]: the header, `ifinfomsg`, and one
 /// `IFLA_IFNAME` attribute of at most `IFNAMSIZ` bytes (4-byte aligned).
 pub const LINK_NAME_REQUEST_MAX: usize = HEADER_LEN + IFINFOMSG_LEN + 4 + IFNAMSIZ;
@@ -1116,6 +1182,23 @@ impl LinkProbe {
         self.answer(|datagram, port| parse_link_reply(datagram, sequence, port, ifindex))
     }
 
+    /// Sets interface `ifindex` administratively down and waits for the
+    /// kernel's acknowledgement (OPS-EXIT, cold: once per port at exit).
+    /// The kernel handles the request while handling the `send` and queues
+    /// the acknowledgement before it returns, so the receive never blocks.
+    /// `Kernel(-1)` (`EPERM`) means the calling thread lacks
+    /// `CAP_NET_ADMIN`; `ENODEV` that the device is gone.
+    pub fn set_down(&mut self, ifindex: u32) -> Result<(), NetlinkError> {
+        let result = self.set_down_once(ifindex);
+        self.recover(result)
+    }
+
+    fn set_down_once(&mut self, ifindex: u32) -> Result<(), NetlinkError> {
+        let sequence = self.next_sequence();
+        self.socket.send(&link_down_request(sequence, ifindex))?;
+        self.answer(|datagram, port| parse_ack(datagram, sequence, port))
+    }
+
     /// The interface index and link facts of the device named `name` in
     /// this socket's (the caller's) network namespace (cold, startup:
     /// AF_PACKET ports are bound by index). `ENODEV`
@@ -1448,6 +1531,53 @@ mod sys {
 
 #[cfg(test)]
 mod tests {
+    /// OPS-EXIT: the link-down request is exactly the 32 bytes the kernel
+    /// expects, and its acknowledgement parses strictly.
+    #[test]
+    fn link_down_request_and_its_ack_are_exact() {
+        let request = super::link_down_request(7, 42);
+        let mut expected = [0_u8; 32];
+        expected[0..4].copy_from_slice(&32_u32.to_ne_bytes());
+        expected[4..6].copy_from_slice(&16_u16.to_ne_bytes());
+        expected[6..8].copy_from_slice(&5_u16.to_ne_bytes());
+        expected[8..12].copy_from_slice(&7_u32.to_ne_bytes());
+        expected[20..24].copy_from_slice(&42_u32.to_ne_bytes());
+        expected[28..32].copy_from_slice(&1_u32.to_ne_bytes());
+        assert_eq!(request, expected);
+
+        let ack = |sequence: u32, pid: u32, kind: u16, error: i32| {
+            let mut message = vec![0_u8; 36];
+            message[0..4].copy_from_slice(&36_u32.to_ne_bytes());
+            message[4..6].copy_from_slice(&kind.to_ne_bytes());
+            message[8..12].copy_from_slice(&sequence.to_ne_bytes());
+            message[12..16].copy_from_slice(&pid.to_ne_bytes());
+            message[16..20].copy_from_slice(&error.to_ne_bytes());
+            message
+        };
+        assert_eq!(super::parse_ack(&ack(7, 9, 2, 0), 7, 9), Ok(Some(())));
+        assert_eq!(super::parse_ack(&ack(6, 9, 2, 0), 7, 9), Ok(None));
+        assert_eq!(
+            super::parse_ack(&ack(7, 9, 2, -1), 7, 9),
+            Err(super::NetlinkError::Kernel(-1))
+        );
+        assert_eq!(
+            super::parse_ack(&ack(7, 8, 2, 0), 7, 9),
+            Err(super::NetlinkError::UnexpectedPort)
+        );
+        assert_eq!(
+            super::parse_ack(&ack(7, 9, 16, 0), 7, 9),
+            Err(super::NetlinkError::Malformed)
+        );
+        assert_eq!(
+            super::parse_ack(&ack(7, 9, 2, 5), 7, 9),
+            Err(super::NetlinkError::Malformed)
+        );
+        assert_eq!(
+            super::parse_ack(&ack(7, 9, 2, 0)[..18], 7, 9),
+            Err(super::NetlinkError::Malformed)
+        );
+    }
+
     use super::*;
 
     const PORT: u32 = 4242;

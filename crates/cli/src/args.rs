@@ -30,7 +30,10 @@ usage:
 `run`: SIGINT/SIGTERM stop (a second one forces), SIGHUP reloads the config.
 A fatal threshold of 0 disables that fatal exit (warn only).
 After startup `run` drops every capability (and with --user/--group switches
-to that numeric uid/gid); --keep-privileges keeps them for the whole run.
+to that numeric uid/gid); --keep-privileges keeps every capability (root:
+all of them) on every thread for the whole run, so a compromised router can
+reconfigure the namespace's network over rtnetlink (and, without the filters
+below, far more); [exit-protection] needs it, with both filters kept on.
 It then confines every thread to a syscall allowlist (seccomp): a syscall
 outside it kills the process (--seccomp kill, the default), is logged and
 allowed (--seccomp log), or the filter is not installed (--seccomp off).

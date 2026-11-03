@@ -1176,6 +1176,24 @@ fn backend_only_plan_for_active_is_never_live_applicable() {
     );
     assert_eq!(plan.flush(), StateFlush::ALL);
     assert!(observe(&active) == before);
+
+    // OPS-EXIT: an `[exit-protection]` change alone skips the live check
+    // the same way.
+    let next = config(&[(
+        "[resolution.policy]",
+        "[exit-protection]\nipv4-forwarding-off = true\n\n[resolution.policy]",
+    )]);
+    let successor = sequencer.candidate(&next).unwrap();
+    let plan = ApplyPlan::for_active(&mut active, &current, &next, &successor).unwrap();
+    assert_eq!(plan.restart_required(), [RestartRequired::ExitProtection]);
+    assert_eq!(
+        plan.dry_run(),
+        Some(Err(ApplyError::RestartRequired(
+            RestartRequired::ExitProtection
+        )))
+    );
+    assert_eq!(plan.flush(), StateFlush::ALL);
+    assert!(observe(&active) == before);
 }
 
 #[test]

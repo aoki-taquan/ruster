@@ -27,8 +27,8 @@ use ruster_core::{
     NoTrace, PacketBatch, PacketIo, PublicationQuiescence, PublicationQuiescenceDisposition, Route,
 };
 use ruster_io_afpacket::{
-    AfPacketError, AfPacketIo, AfPacketPlatform, AfPacketQuiescenceError, Errno, PlatformError,
-    PortConfig, RingGeometry, RxWait, SyscallStage, ValidatedConfig,
+    AfPacketError, AfPacketIo, AfPacketPlatform, Errno, PlatformError, PortConfig, RingGeometry,
+    RxWait, SyscallStage, ValidatedConfig,
 };
 
 const LAN: IfId = IfId(1);
@@ -572,15 +572,19 @@ fn priv_afpacket_forwards_between_two_veth_ports_through_core_and_drains() {
     let down = io.port_stats(WAN).expect("WAN");
     assert!(down.link_down && down.kick_owed, "{down:?}");
     assert_eq!(down.tx_inflight, 3, "{down:?}");
-    assert!(matches!(
-        io.try_publication_quiescence().map(|_| ()),
-        Err(AfPacketQuiescenceError::TxInFlight { frames: 3 })
-    ));
+    // OPS-EXIT (AFPKT-017): TX held on the down link (confirmed by a fresh
+    // ENETDOWN kick) does not block a publication; the frames stay.
+    assert!(io.try_publication_quiescence().is_ok());
+    let held = io.port_stats(WAN).expect("WAN");
+    assert_eq!(held.tx_held_on_down_link, 3, "{held:?}");
+    assert_eq!(held.tx_inflight, 3, "{held:?}");
     ip_link("up");
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         io.set_clock(now_ms(start));
-        if io.try_publication_quiescence().is_ok() {
+        let ready = io.try_publication_quiescence().is_ok();
+        let port = io.port_stats(WAN).expect("WAN");
+        if ready && !port.link_down && port.tx_inflight == 0 {
             break;
         }
         assert!(

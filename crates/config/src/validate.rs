@@ -27,9 +27,9 @@ use ruster_io_xdp::native_profile::{
 
 use crate::{
     AfPacketPortV1, AfPacketV1, AfXdpModeV1, AfXdpPortV1, BackendKindV1, BackendV1, ConfigV1,
-    ExistingXdpProgramV1, FirewallActionV1, FirewallProtocolV1, HealthV1, Nat44FilteringV1,
-    Nat44Icmpv4ErrorsV1, Nat44TcpInboundRstV1, ReloadStateV1, SourcePath, VersionedConfig, WatchV1,
-    XdpAttachModeV1,
+    ExistingXdpProgramV1, ExitProtectionV1, FirewallActionV1, FirewallProtocolV1, HealthV1,
+    Nat44FilteringV1, Nat44Icmpv4ErrorsV1, Nat44TcpInboundRstV1, ReloadStateV1, SourcePath,
+    VersionedConfig, WatchV1, XdpAttachModeV1,
 };
 
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
@@ -1246,8 +1246,10 @@ pub struct ValidatedConfigV1 {
     storage: RuntimeStorageShapeV1,
     backend: ValidatedBackendV1,
     reload_state: ReloadStateV1,
+    down_link_tx: crate::DownLinkTxV1,
     health: HealthV1,
     watch: WatchV1,
+    exit_protection: ExitProtectionV1,
 }
 
 impl ValidatedConfigV1 {
@@ -1265,11 +1267,24 @@ impl ValidatedConfigV1 {
         self.watch
     }
 
+    /// `[exit-protection]` (OPS-EXIT); every key false when absent.
+    #[must_use]
+    pub const fn exit_protection(&self) -> ExitProtectionV1 {
+        self.exit_protection
+    }
+
     /// `[reload] state` ([`ReloadStateV1::Carry`] when absent): what an
     /// applied reload to this document does with runtime state.
     #[must_use]
     pub const fn reload_state(&self) -> ReloadStateV1 {
         self.reload_state
+    }
+
+    /// `[reload] down-link-tx` (OPS-EXIT), read from the document being
+    /// applied like [`Self::reload_state`].
+    #[must_use]
+    pub const fn reload_down_link_tx(&self) -> crate::DownLinkTxV1 {
+        self.down_link_tx
     }
 
     #[must_use]
@@ -1447,6 +1462,7 @@ fn validate_v1(
     preflight_public_dto(&config)?;
     let health = validate_health(config.health.unwrap_or_default())?;
     let watch = validate_watch(config.watch.unwrap_or_default())?;
+    let exit_protection = config.exit_protection.unwrap_or_default();
     let mut interface_records = Vec::with_capacity(config.interfaces.len());
     for (index, source) in config.interfaces.into_iter().enumerate() {
         let base = indexed_path("interfaces", index);
@@ -2390,8 +2406,10 @@ fn validate_v1(
         storage,
         backend,
         reload_state: config.reload.unwrap_or_default().state,
+        down_link_tx: config.reload.unwrap_or_default().down_link_tx,
         health,
         watch,
+        exit_protection,
     })
 }
 

@@ -245,6 +245,10 @@ pub struct AfPacketPortStats {
     pub kick_owed: bool,
     /// The last kick found the link down.
     pub link_down: bool,
+    /// Gauge (OPS-EXIT): TX frames in flight while the link is last seen
+    /// down; the kernel leaves them SEND_REQUEST until the link returns and
+    /// a publication does not wait for them.
+    pub tx_held_on_down_link: u32,
     /// A kick found the bound device gone (`ENXIO`): permanent, the port
     /// is no longer kicked or retried; the process must restart.
     pub unbound: bool,
@@ -289,6 +293,11 @@ impl ObservableFields for AfPacketPortStats {
         visitor.field(SECTION, "rx_halted", FieldValue::Flag(self.rx_halted));
         visitor.field(SECTION, "kick_owed", FieldValue::Flag(self.kick_owed));
         visitor.field(SECTION, "link_down", FieldValue::Flag(self.link_down));
+        visitor.field(
+            SECTION,
+            "tx_held_on_down_link",
+            FieldValue::Count(u64::from(self.tx_held_on_down_link)),
+        );
         visitor.field(SECTION, "unbound", FieldValue::Flag(self.unbound));
         visit_faults(SECTION, &self.faults, visitor);
         self.counters.visit(SECTION, visitor);
@@ -305,6 +314,8 @@ pub struct AfPacketBackendStats {
     pub rx_halted_ports: u32,
     pub kick_owed_ports: u32,
     pub link_down_ports: u32,
+    /// Gauge (OPS-EXIT): TX frames held on ports whose link is down.
+    pub tx_held_on_down_link: u64,
     /// Ports whose bound device is gone (`ENXIO`).
     pub unbound_ports: u32,
     /// Generated sessions started for an interface without a port.
@@ -335,6 +346,11 @@ impl ObservableFields for AfPacketBackendStats {
             SECTION,
             "link_down_ports",
             FieldValue::Count(u64::from(self.link_down_ports)),
+        );
+        visitor.field(
+            SECTION,
+            "tx_held_on_down_link",
+            FieldValue::Count(self.tx_held_on_down_link),
         );
         visitor.field(
             SECTION,

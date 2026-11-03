@@ -100,6 +100,13 @@ enum Event {
     OpenPacket([u32; 2]),
     /// AF_PACKET: the datapath (and with it every socket) dropped.
     ClosePacket,
+    /// OPS-EXIT: the exit actions' resources opened, with the keys.
+    ExitOpen {
+        link_down: bool,
+        forwarding_off: bool,
+    },
+    /// OPS-EXIT: the exit actions ran.
+    ExitApplied,
 }
 
 #[derive(Default)]
@@ -191,6 +198,10 @@ struct State {
     signal: Cell<bool>,
     /// What `tx_outstanding` reports.
     tx_outstanding: Cell<bool>,
+    /// What `held_tx_on_down_links` reports (OPS-EXIT).
+    held_tx: Cell<u64>,
+    /// The datapath's drain panics (OPS-EXIT: a panic after readiness).
+    panic_in_drain: Cell<bool>,
     /// `Datapath::refresh` calls, health samples, and whether a sample
     /// came without a refresh right before it.
     refreshes: Cell<u32>,
@@ -266,6 +277,42 @@ struct FakeHost {
     packet_master: Option<u16>,
     /// AF_PACKET: the port with a device stacked on it.
     packet_stacked: Option<u16>,
+    /// OPS-EXIT item 4: not the initial user namespace.
+    user_namespace: bool,
+    /// OPS-EXIT: this port's exit actions fail.
+    exit_fails: Option<u16>,
+}
+
+/// The fake exit actions (OPS-EXIT): record that they ran.
+struct FakeExit {
+    state: Rc<State>,
+    protection: ruster_config::ExitProtectionV1,
+    ports: Vec<IfId>,
+    fails: Option<u16>,
+}
+
+impl super::exit_guard::ExitActions for FakeExit {
+    fn apply(&mut self, report: &mut super::exit_guard::ExitReport) {
+        use super::exit_guard::{ExitAction, ExitError};
+        self.state.push(Event::ExitApplied);
+        let result = |port: IfId| {
+            if self.fails == Some(port.0) {
+                Err(ExitError::Injected)
+            } else {
+                Ok(())
+            }
+        };
+        for &port in &self.ports {
+            if self.protection.ipv4_forwarding_off {
+                report.record(port, ExitAction::Ipv4ForwardingOff, result(port));
+            }
+        }
+        for &port in &self.ports {
+            if self.protection.link_down {
+                report.record(port, ExitAction::LinkDown, result(port));
+            }
+        }
+    }
 }
 
 /// State shared with a worker thread (test only).
@@ -503,6 +550,7 @@ impl Datapath for FakeDatapath<'_> {
 
     fn drain(&mut self, rounds: u32) -> Result<DrainProgress, XdpIoError> {
         self.state.push(Event::Drain(rounds));
+        assert!(!self.state.panic_in_drain.get(), "injected drain panic");
         self.state
             .drains
             .borrow_mut()
@@ -573,6 +621,10 @@ impl Datapath for FakeDatapath<'_> {
 
     fn tx_outstanding(&self) -> bool {
         self.state.tx_outstanding.get()
+    }
+
+    fn held_tx_on_down_links(&self) -> u64 {
+        self.state.held_tx.get()
     }
 }
 
@@ -703,6 +755,34 @@ impl PortHost for FakeHost {
     type Datapath<'s> = FakeDatapath<'s>;
     type Packet = FakeDatapath<'static>;
     type Links = FakeLinks;
+    type Exit = FakeExit;
+
+    fn initial_user_namespace(&self) -> Option<bool> {
+        Some(!self.user_namespace)
+    }
+
+    fn exit_actions(
+        &self,
+        protection: ruster_config::ExitProtectionV1,
+        targets: &[LinkTarget],
+    ) -> Result<FakeExit, (Option<IfId>, super::exit_guard::ExitError)> {
+        self.state.push(Event::ExitOpen {
+            link_down: protection.link_down,
+            forwarding_off: protection.ipv4_forwarding_off,
+        });
+        if self.fails(Stage::ExitProtection, None) {
+            return Err((
+                targets.first().map(|target| target.interface),
+                super::exit_guard::ExitError::Injected,
+            ));
+        }
+        Ok(FakeExit {
+            state: Rc::clone(&self.state),
+            protection,
+            ports: targets.iter().map(|target| target.interface).collect(),
+            fails: self.exit_fails,
+        })
+    }
 
     fn links(&self, devices: &[(IfId, &str)]) -> Result<FakeLinks, Failure> {
         assert_eq!(
@@ -2059,6 +2139,7 @@ fn a_backend_stop_ends_the_run_with_exit_1() {
         end: super::LoopEnd::BackendStopped,
         shutdown: super::ShutdownReport::default(),
         final_block: String::new(),
+        exit_failed: false,
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
@@ -3066,3 +3147,6 @@ mod idle;
 
 #[path = "packet_tests.rs"]
 mod packet;
+
+#[path = "exit_tests.rs"]
+mod exit;

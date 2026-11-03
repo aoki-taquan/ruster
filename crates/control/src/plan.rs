@@ -453,6 +453,9 @@ impl ApplyPlan {
         if current.backend() != next.backend() {
             restart_required.push(RestartRequired::Backend);
         }
+        if current.exit_protection() != next.exit_protection() {
+            restart_required.push(RestartRequired::ExitProtection);
+        }
 
         let old_rules = old.firewall.rules();
         let new_rules = new.firewall.rules();
@@ -511,14 +514,16 @@ impl ApplyPlan {
     /// document of the active generation and `successor` being built from
     /// `next`.
     ///
-    /// A [`RestartRequired::Backend`] plan is never live-applicable even
-    /// though the publication would accept the successor (a candidate
-    /// carries no backend). Such a plan skips the live check: the dry run is
-    /// recorded as `Err(ApplyError::RestartRequired(restart_required()[0]))`
-    /// (`Backend` itself only when it is the sole reason, because `Backend`
-    /// is always listed last), and the flush stays [`FlushCount::All`], so
-    /// no caller can mistake it for an in-place reload and the recorded
-    /// reason is the first one, as for every other restart-required plan.
+    /// A [`RestartRequired::Backend`] or [`RestartRequired::ExitProtection`]
+    /// plan is never live-applicable even though the publication would
+    /// accept the successor (a candidate carries neither the backend nor
+    /// the exit protection). Such a plan skips the live check: the dry run
+    /// is recorded as `Err(ApplyError::RestartRequired(restart_required()[0]))`
+    /// and the flush stays [`FlushCount::All`], so no caller can mistake it
+    /// for an in-place reload. The reasons are listed in validation order
+    /// with `Backend`, then `ExitProtection`, last, so the recorded reason is
+    /// one of those two only when nothing else needs the restart, as for
+    /// every other restart-required plan.
     pub fn for_active<I: PublicationQuiescence>(
         active: &mut ActivePublication<'_, I>,
         current: &ValidatedConfigV1,
@@ -526,7 +531,12 @@ impl ApplyPlan {
         successor: &ValidatedCandidate,
     ) -> Result<Self, PlanError> {
         let mut plan = Self::between(current, next)?;
-        if plan.restart_required.contains(&RestartRequired::Backend) {
+        if plan.restart_required.iter().any(|reason| {
+            matches!(
+                reason,
+                RestartRequired::Backend | RestartRequired::ExitProtection
+            )
+        }) {
             let first = plan.restart_required[0];
             plan.dry_run = Some(Err(ApplyError::RestartRequired(first)));
             return Ok(plan);
@@ -635,7 +645,7 @@ impl ApplyPlan {
     }
 
     /// Reasons the change cannot be applied in place, in successor
-    /// validation order (with [`RestartRequired::Backend`] last). The NAT port-owner table holds exactly one slot per
+    /// validation order (with [`RestartRequired::Backend`], then [`RestartRequired::ExitProtection`], last). The NAT port-owner table holds exactly one slot per
     /// pool port, so only a pool *size* change alters the storage shape and
     /// is restart-required; a same-size shift of the range and a realm change
     /// are reloadable.

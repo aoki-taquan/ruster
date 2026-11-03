@@ -49,6 +49,7 @@ use super::checks::{
     DeviceFacts, PrivilegeFailure, Probe, Warnings,
 };
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
+use super::exit_guard::{ExitActions, ExitError};
 use super::fs_confine::{FsFailure, FsReport};
 use super::netlink::{IfName, NetlinkError};
 use super::offload::Offload;
@@ -91,6 +92,9 @@ pub enum Stage {
     FsConfine,
     /// The syscall filter after the privilege drop (H8).
     Seccomp,
+    /// The resources of the exit actions (`[exit-protection]`, OPS-EXIT),
+    /// opened after activation and before the privilege drop.
+    ExitProtection,
 }
 
 impl Stage {
@@ -111,6 +115,7 @@ impl Stage {
             Self::PrivilegeDrop => "privilege-drop",
             Self::FsConfine => "fs-confine",
             Self::Seccomp => "seccomp",
+            Self::ExitProtection => "exit-protection",
         }
     }
 }
@@ -141,6 +146,8 @@ pub enum Failure {
     Spawn,
     /// The AF_PACKET backend could not be opened (AFPKT-015).
     Packet(PacketOpenError),
+    /// A resource of the exit actions could not be opened (OPS-EXIT).
+    ExitProtection(ExitError),
     /// A failure injected by a test host.
     #[cfg(test)]
     Injected,
@@ -228,6 +235,7 @@ impl fmt::Display for Failure {
             Self::Seccomp(error) => write!(formatter, "{error}"),
             Self::Spawn => formatter.write_str("code=THREAD_SPAWN"),
             Self::Packet(error) => write!(formatter, "code={error}"),
+            Self::ExitProtection(error) => write!(formatter, "code={error}"),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
             #[cfg(test)]
@@ -413,6 +421,22 @@ pub trait PortHost {
     type Packet: Datapath;
     /// Moved to the link watcher thread (H7), hence `Send`.
     type Links: LinkMonitor + Send + 'static;
+    /// The exit actions of `[exit-protection]` (OPS-EXIT).
+    type Exit: ExitActions;
+
+    /// Whether the process runs in the initial user namespace; `None` if
+    /// that cannot be read.
+    fn initial_user_namespace(&self) -> Option<bool>;
+
+    /// Opens what the exit actions of `protection` need for every port of
+    /// `targets` (after activation, before the privilege drop and any
+    /// confinement): the forwarding sysctl files write-only, the rtnetlink
+    /// socket. On error nothing stays open; the error names the port.
+    fn exit_actions(
+        &self,
+        protection: ruster_config::ExitProtectionV1,
+        targets: &[LinkTarget],
+    ) -> Result<Self::Exit, (Option<IfId>, ExitError)>;
 
     /// Opens the run-time link watch (before the datapath is built).
     /// `devices` are the ports' interfaces and kernel device names, in

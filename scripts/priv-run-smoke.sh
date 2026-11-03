@@ -168,7 +168,16 @@
 #             on), nothing within 9 s either (REQ-4 a, counted as
 #             unsolicited_syn_firewall_denied). Run with --user/--group so
 #             the reloads can read the work files
-#   txfull    (gap fill) the WAN TX ring (128 entries; 256 generated frames
+#   exit_protection  (OPS-EXIT, after txfull) `[exit-protection]`: each
+#             key is refused under the default drop (exit 2,
+#             EXIT_FORWARDING_NEEDS_PRIVILEGES / EXIT_LINK_DOWN_NEEDS_PRIVILEGES);
+#             with --keep-privileges (seccomp kill, Landlock) ra/rb
+#             forwarding set to 1 (accepted with --allow-kernel-forwarding)
+#             reads 0 after SIGTERM, and link-down sets ra and rb down at
+#             exit (set up again after); exit 0.
+#             Only the router namespace's links and sysctls are touched
+#   txfull    (gap fill; run with --user/--group so its reload can read
+#             the work file) the WAN TX ring (128 entries; 256 generated frames
 #             so the ring, not the copy pool, is the bound) driven full:
 #             `ip link set rb down` in the router namespace makes every TX
 #             kick fail ENETDOWN, so the kernel consumes nothing; a burst
@@ -2985,9 +2994,81 @@ phase_arphold() {
 }
 phase_arphold
 
+# exit_protection: OPS-EXIT `[exit-protection]` on ra/rb of the router
+# namespace only (every sysctl and link here is in that namespace).
+fwd_of() {
+    sudo -n ip netns exec "$router" cat "/proc/sys/net/ipv4/conf/$1/forwarding"
+}
+phase_exit_protection() {
+    # Every exit action needs CAP_NET_ADMIN at exit (Linux checks it at
+    # every sysctl write and link change): refused under the default drop
+    # before any resource (exit 2), applied with --keep-privileges, where
+    # both ports' forwarding was 1 (accepted with --allow-kernel-forwarding)
+    # and is 0 after the exit.
+    cp "$work/router.toml" "$work/exit-forwarding.toml"
+    printf '\n[exit-protection]\nipv4-forwarding-off = true\n' >>"$work/exit-forwarding.toml"
+    start_ruster exit-forwarding-refused "$work/exit-forwarding.toml"
+    wait_ruster
+    [ "$status" -eq 2 ] || fail "exit: forwarding-off without --keep-privileges exit status $status"
+    grep -q "invalid config: stage=exit-protection code=EXIT_FORWARDING_NEEDS_PRIVILEGES" \
+        "$work/exit-forwarding-refused.err" || fail "exit: forwarding-off refusal: $(cat "$work/exit-forwarding-refused.err")"
+    assert_detached "the forwarding-off refusal"
+    for device in ra rb; do
+        sudo -n ip netns exec "$router" sh -c \
+            "echo 1 >/proc/sys/net/ipv4/conf/$device/forwarding"
+    done
+    [ "$(fwd_of ra)$(fwd_of rb)" = 11 ] || fail "exit: forwarding not set up"
+    start_ruster exit-forwarding "$work/exit-forwarding.toml" --allow-kernel-forwarding --keep-privileges
+    wait_ready exit-forwarding || fail "exit: forwarding-off run exited during startup: $(cat "$work/exit-forwarding.err")"
+    grep -q "exit protection armed: ipv4-forwarding-off=true link-down=false ports=2" \
+        "$work/exit-forwarding.err" || fail "exit: not armed"
+    grep -q "seccomp filter installed: mode=kill" "$work/exit-forwarding.err" ||
+        fail "exit: forwarding-off run without the syscall filter"
+    grep -q "filesystem confined: mode=landlock" "$work/exit-forwarding.err" ||
+        fail "exit: forwarding-off run without Landlock"
+    forward_once exit-forwarding
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "exit: forwarding-off exit status $status"
+    grep -q "exit protection applied: ipv4-forwarding-off=2 link-down=0 failed=0" \
+        "$work/exit-forwarding.err" || fail "exit: forwarding-off not applied: $(cat "$work/exit-forwarding.err")"
+    [ "$(fwd_of ra)$(fwd_of rb)" = 00 ] || fail "exit: forwarding is $(fwd_of ra)/$(fwd_of rb) after the exit"
+    assert_detached "the forwarding-off exit"
+    echo "priv_run_exit_forwarding: ipv4-forwarding-off refused under the default drop (exit 2, EXIT_FORWARDING_NEEDS_PRIVILEGES); with --keep-privileges under seccomp kill and Landlock ra and rb forwarding 1 -> 0 at exit, exit 0 verified"
+
+    # link-down needs CAP_NET_ADMIN at exit: refused under the default
+    # drop before any resource, applied with --keep-privileges.
+    cp "$work/router.toml" "$work/exit-link.toml"
+    printf '\n[exit-protection]\nlink-down = true\n' >>"$work/exit-link.toml"
+    start_ruster exit-link-refused "$work/exit-link.toml"
+    wait_ruster
+    [ "$status" -eq 2 ] || fail "exit: link-down without --keep-privileges exit status $status"
+    grep -q "invalid config: stage=exit-protection code=EXIT_LINK_DOWN_NEEDS_PRIVILEGES" \
+        "$work/exit-link-refused.err" || fail "exit: link-down refusal: $(cat "$work/exit-link-refused.err")"
+    assert_detached "the link-down refusal"
+    start_ruster exit-link "$work/exit-link.toml" --keep-privileges
+    wait_ready exit-link || fail "exit: link-down run exited during startup: $(cat "$work/exit-link.err")"
+    forward_once exit-link
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "exit: link-down exit status $status"
+    grep -q "exit protection applied: ipv4-forwarding-off=0 link-down=2 failed=0" \
+        "$work/exit-link.err" || fail "exit: link-down not applied: $(cat "$work/exit-link.err")"
+    for device in ra rb; do
+        if sudo -n ip -n "$router" -o link show dev "$device" | grep -q "[<,]UP[,>]"; then
+            fail "exit: $device is still up after the exit"
+        fi
+    done
+    assert_detached "the link-down exit"
+    sudo -n ip -n "$router" link set ra up
+    sudo -n ip -n "$router" link set rb up
+    echo "priv_run_exit_link: link-down refused without --keep-privileges (exit 2, EXIT_LINK_DOWN_NEEDS_PRIVILEGES); with it ra and rb set down at exit, exit 0, then set up again verified"
+}
+
 # txfull: the WAN TX ring driven full and recovered.
+# --user/--group: the reload while held reads the work file as that user.
 start_ruster txfull "$work/txfull.toml" --tx-stall-warn-secs 1 --tx-stall-fatal-secs 2 \
-    --kick-errors-fatal-secs 2
+    --kick-errors-fatal-secs 2 --user "$smoke_uid" --group "$smoke_gid"
 wait_ready txfull || fail "txfull: ruster exited during startup"
 forward_once txfull-before
 # rb administratively down inside the router namespace: every TX kick
@@ -3030,6 +3111,29 @@ if grep -Eq "fatal:|health=(TX_STALL|KICK_ERRORS)" "$work/txfull.err"; then
     fail "txfull: a TX_STALL/KICK_ERRORS event or a fatal while the link was down"
 fi
 echo "priv_run_txfull: rb down, TX ring full (tx_inflight=128 of 128, tx_ring_full=tx_blocked=$ring_full, $link_down_kicks ENETDOWN kicks in ${held_ms} ms, at most $kick_bound, $suppressed retries suppressed), held 4 s past --tx-stall-fatal-secs 2 and --kick-errors-fatal-secs 2 without a fatal, observer.state=healthy watch.state=warning verified"
+# OPS-EXIT item 2: a reload while rb is admin-down with its TX ring full
+# applies at once; the held TX does not block the quiescence (before, it
+# failed with stage=quiesce code=TIMEOUT) and stays in flight.
+reload_with "$work/txfull.toml" "$work/txfull.toml"
+wait_line txfull "reload applied: generation=2 previous=1"
+if grep -q "stage=quiesce" "$work/txfull.err"; then
+    fail "txfull: the reload waited for the down link's TX"
+fi
+grep -q "reload applied: generation=2 previous=1; .*; held-tx-on-down-links=128" \
+    "$work/txfull.err" || fail "txfull: the reload line does not count the 128 held frames"
+wait_block txfull observer.generation=2
+block_has "$work/txfull.block" if2.af_xdp_port.tx_inflight=128 \
+    if2.af_xdp_port.tx_held_on_down_link=128
+# The strict `[reload] down-link-tx = "refuse"` refuses the same reload
+# while the frames are held; generation 2 keeps running.
+cp "$work/txfull.toml" "$work/txfull-strict.toml"
+printf '\n[reload]\ndown-link-tx = "refuse"\n' >>"$work/txfull-strict.toml"
+cp "$work/txfull.toml" "$work/txfull-default.toml"
+reload_with "$work/txfull-strict.toml" "$work/txfull.toml"
+wait_line txfull "stage=quiesce code=DOWN_LINK_TX_HELD; generation 2 keeps running"
+reload_with "$work/txfull-default.toml" "$work/txfull.toml"
+wait_line txfull "reload applied: generation=4 previous=2"
+echo "priv_run_txfull_reload: SIGHUP while rb was down with 128 frames held applied generation 2 without waiting (held-tx-on-down-links=128, gauge tx_held_on_down_link=128, the frames still in flight); with [reload] down-link-tx = \"refuse\" the next reload was refused (DOWN_LINK_TX_HELD), the default applied again verified"
 rm -f "$work/recv-txfull-backlog.out"
 in_ns "$host_b" python3 -I -c "$COUNT" 9001 "ruster-txfull-$suffix" 3 \
     >"$work/recv-txfull-backlog.out" 2>&1 &
@@ -3072,6 +3176,7 @@ final() {
 [ "$(final rx.received)" -eq $(($(final rx.tx_requested) + $(final rx.dropped) + $(final rx.consumed))) ] ||
     fail "txfull: rx.received != tx_requested + dropped + consumed"
 cat "$work/txfull.err"
+phase_exit_protection
 echo "priv_run_txfull: rb up, the 128 held datagrams reached host B, forwarding recovered, exit 0; final rx.received=$(final rx.received) = tx_requested + dropped + consumed, tx_requested = tx_accepted + tx_rejected ($(final rx.tx_rejected) = if2 tx_blocked), if2 TX submitted = completed = $(final if2.af_xdp_port.tx_completed), nothing in flight, observer.state=healthy watch.state=ok verified"
 
 # rollback: the second port fails after the first one attached.

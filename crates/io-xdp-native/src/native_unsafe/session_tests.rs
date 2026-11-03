@@ -153,7 +153,7 @@ struct SessionFake {
     verifier_log: Cell<Option<(usize, bool)>>,
     kicks: ScriptedKicks,
     tx_queue: Cell<TxQueueProbe>,
-    mtu: Cell<Option<u32>>,
+    link: Cell<Result<crate::LinkAttributes, crate::LinkQueryError>>,
 }
 
 impl SessionFake {
@@ -181,7 +181,10 @@ impl SessionFake {
             verifier_log: Cell::new(None),
             kicks: ScriptedKicks::default(),
             tx_queue: Cell::new(TxQueueProbe::Present),
-            mtu: Cell::new(Some(1_500)),
+            link: Cell::new(Ok(crate::LinkAttributes {
+                mtu: 1_500,
+                tx_queues: 4,
+            })),
         }
     }
 
@@ -287,9 +290,13 @@ impl Syscalls for SessionFake {
         self.tx_queue.get()
     }
 
-    fn mtu_probe(&self, _name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32> {
-        assert_eq!(ifindex, FAKE_IFINDEX, "probed with the resolved ifindex");
-        self.mtu.get()
+    fn link_query(
+        &self,
+        _name: &[u8; IFNAMSIZ],
+        ifindex: u32,
+    ) -> Result<crate::LinkAttributes, crate::LinkQueryError> {
+        assert_eq!(ifindex, FAKE_IFINDEX, "queried with the resolved ifindex");
+        self.link.get()
     }
 
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
@@ -1842,15 +1849,32 @@ fn native_session_datapath_is_taken_once_and_excludes_raw_rings() {
 
 #[test]
 fn native_session_refuses_a_queue_without_tx_queue_before_any_resource() {
-    for (probe, failure) in [
-        (TxQueueProbe::Absent, SessionFailure::NoTxQueue),
+    let link = |tx_queues| {
+        Ok(crate::LinkAttributes {
+            mtu: 1_500,
+            tx_queues,
+        })
+    };
+    for (probe, link, failure) in [
+        // rtnetlink: the queue (3) is not below the allocated count.
+        (TxQueueProbe::Present, link(3), SessionFailure::NoTxQueue),
+        // A proven sysfs view narrows it to the active count.
+        (TxQueueProbe::Absent, link(4), SessionFailure::NoTxQueue),
+        // The query itself fails closed, typed.
         (
-            TxQueueProbe::Unverifiable,
-            SessionFailure::TxQueueUnverifiable,
+            TxQueueProbe::Present,
+            Err(crate::LinkQueryError::Kernel(-19)),
+            SessionFailure::LinkQuery(crate::LinkQueryError::Kernel(-19)),
+        ),
+        (
+            TxQueueProbe::Present,
+            Err(crate::LinkQueryError::NameMismatch),
+            SessionFailure::LinkQuery(crate::LinkQueryError::NameMismatch),
         ),
     ] {
         let fake = SessionFake::new();
         fake.tx_queue.set(probe);
+        fake.link.set(link);
         let error = SessionCore::open(&fake, &config(XDP_COPY))
             .map(|_| ())
             .expect_err("refused");
@@ -1865,17 +1889,59 @@ fn native_session_refuses_a_queue_without_tx_queue_before_any_resource() {
     }
 }
 
+/// OPS-EXIT item 3 (review M2): a sysfs view that is not this device's
+/// (another network namespace) fails closed when the device has more than
+/// one allocated TX queue; with exactly one, queue 0 is proven by
+/// rtnetlink alone and sysfs is not read.
+#[test]
+fn native_session_fails_closed_on_an_unproven_sysfs_view_of_a_multi_queue_device() {
+    let fake = SessionFake::new();
+    fake.tx_queue.set(TxQueueProbe::Unverifiable);
+    let error = SessionCore::open(&fake, &config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("refused");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (
+            SessionStage::TxQueueCheck,
+            SessionFailure::TxQueueUnverifiable
+        )
+    );
+    assert_eq!(fake.len.get(), 1);
+    assert_eq!(fake.open_fds.get(), 0);
+
+    let fake = SessionFake::new();
+    fake.tx_queue.set(TxQueueProbe::Absent);
+    fake.link.set(Ok(crate::LinkAttributes {
+        mtu: 1_500,
+        tx_queues: 1,
+    }));
+    let queue_zero = SessionConfig::new(
+        "veth0",
+        0,
+        ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | XDP_COPY).expect("valid flags"),
+        RingConfig::new(64, 128, 64, 256).expect("valid rings"),
+        umem(),
+    )
+    .expect("valid session config");
+    let mut session = SessionCore::open(&fake, &queue_zero).expect("one TX queue: queue 0");
+    let _ = session.rings().expect("rings");
+    session.close().expect("teardown");
+    assert_eq!(fake.open_fds.get(), 0);
+}
+
 #[test]
 fn native_session_reads_the_mtu_before_any_resource_and_fails_closed() {
+    let link = |mtu| Ok(crate::LinkAttributes { mtu, tx_queues: 4 });
     let fake = SessionFake::new();
-    fake.mtu.set(Some(9_000));
+    fake.link.set(link(9_000));
     let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("open");
     assert_eq!(session.mtu(), 9_000);
     let _ = session.rings().expect("rings");
     session.close().expect("teardown");
 
     let fake = SessionFake::new();
-    fake.mtu.set(None);
+    fake.link.set(link(0));
     let error = SessionCore::open(&fake, &config(XDP_COPY))
         .map(|_| ())
         .expect_err("refused");

@@ -682,6 +682,11 @@ pub enum RestartRequired {
     /// The `[backend]` section changed: backend kind, existing-program
     /// policy, or any AF_XDP port (queue, mode, attach, ring, or UMEM).
     Backend,
+    /// `[exit-protection]` changed (OPS-EXIT): the process opens what the
+    /// exit actions need before it drops its privileges, so only a restart
+    /// can take a change. Like [`Self::Backend`], reported only by
+    /// [`ApplyPlan`](crate::ApplyPlan).
+    ExitProtection,
 }
 
 impl RestartRequired {
@@ -697,6 +702,7 @@ impl RestartRequired {
             Self::Icmpv4ErrorPolicy => "ICMPV4_ERROR_POLICY",
             Self::Interfaces => "INTERFACES",
             Self::Backend => "BACKEND",
+            Self::ExitProtection => "EXIT_PROTECTION",
         }
     }
 }

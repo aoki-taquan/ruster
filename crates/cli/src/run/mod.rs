@@ -26,7 +26,11 @@
 //!    datapath, build every engine, build the `XdpPacketIo` adapter, and
 //!    activate generation 1 ([`startup`] explains why the datapath comes
 //!    after all attaches).
-//! 6. Start the link watcher and the reload worker threads ([`workers`],
+//! 6. With `[exit-protection]` ([`exit_guard`], OPS-EXIT), open what its
+//!    exit actions need (the ports' forwarding sysctl files write-only, an
+//!    rtnetlink socket) before any of the following; a failure is
+//!    `stage=exit-protection`, exit 1. Then start the link watcher and the
+//!    reload worker threads ([`workers`],
 //!    H7), each dropping its own privileges first, then drop every
 //!    privilege of every thread, irreversibly, before the first tick
 //!    ([`privileges`]; the output threads dropped their own at spawn).
@@ -44,7 +48,8 @@
 //!    `log`; `off` skips it), also with `--keep-privileges`. A failed
 //!    install rolls back the same way (`stage=seccomp`, exit 1).
 //!
-//! 8. Report readiness: the stderr line, and with `NOTIFY_SOCKET` (systemd
+//! 8. Arm the exit actions (`exit protection armed: ...`), then report
+//!    readiness: the stderr line, and with `NOTIFY_SOCKET` (systemd
 //!    `Type=notify`/`notify-reload`) `READY=1` ([`notify`], H10; the
 //!    notification socket was opened first thing, before any thread, so
 //!    the run only `sendto`s on it).
@@ -106,7 +111,9 @@
 //! leaked leases are reclaimed, unlent RX frames return, owed TX is kicked
 //! and reaped. A second signal cuts the drain short (one zero-round call to
 //! stop the adapter and count what the kernel holds). The final stats are
-//! captured, the adapter and engines are dropped, and every session is
+//! captured, the exit actions run if armed (OPS-EXIT: after the drain,
+//! before the detach; also on a fatal event or a panic), the adapter and
+//! engines are dropped, and every session is
 //! closed last port first (link close detaches XDP). The final stats
 //! block goes to stdout, the summary with the frames still held by the
 //! kernel to stderr.
@@ -120,10 +127,12 @@
 //!   failure after the last attempt), a backend fault during the run, a fatal health or
 //!   device event ([`watch`]: TX stall, persistent kick errors, device
 //!   removed, MTU decreased or above the frame bound, link unverifiable),
-//!   a drain failure, a stranded TX handoff after the drain, or a close
-//!   error. A refused or failed reload never ends the run.
+//!   a drain failure, a stranded TX handoff after the drain, a failed exit
+//!   action (`exit protection failed:`), or a close error. A refused or
+//!   failed reload never ends the run.
 //! - 2: usage error or invalid configuration (including the `sim`
-//!   backend).
+//!   backend, and `[exit-protection]` keys the privilege policy would
+//!   defeat: `stage=exit-protection`).
 //! - 3: shutdown deadline (or a second signal) with TX frames still owned
 //!   by the kernel; everything was still detached and closed.
 //! - 4: missing capability or too small `RLIMIT_MEMLOCK`, or a privilege
@@ -133,6 +142,7 @@
 
 mod checks;
 mod engine;
+mod exit_guard;
 mod fs_confine;
 #[cfg(all(
     target_os = "linux",
@@ -192,6 +202,7 @@ use engine::{
     port_label, run_loop, shutdown_drain, Clock, Control, Datapath, LoopEnd, LoopSettings,
     RunStatus, ShutdownReport, StopSignal, DRAIN_DEADLINE_MS,
 };
+use exit_guard::ExitGuard;
 use fs_confine::{FsConfineMode, FsState};
 use notify::Notifier;
 use privileges::{DropFailure, Identity, PrivilegePolicy, PrivilegeState};
@@ -209,6 +220,13 @@ use workers::{LinkWatcher, Worker, WORKER_STOP_MS};
 
 /// Shutdown deadline passed with TX frames still owned by the kernel.
 pub const EXIT_DRAIN_INCOMPLETE: u8 = 3;
+
+/// The startup warning outside the initial user namespace (OPS-EXIT item
+/// 4, #301 review sec N1). Value-free.
+pub const USER_NAMESPACE_WARNING: &str =
+    "user namespace: code=USER_NAMESPACE_NOT_INITIAL (or unreadable): CapEff shows the \
+     capabilities of this user namespace, which act only on the network namespaces it owns; \
+     ports of a namespace it does not own refuse every change";
 /// Missing capability or too small `RLIMIT_MEMLOCK`.
 pub const EXIT_PRIVILEGE: u8 = 4;
 
@@ -550,6 +568,28 @@ where
     if let Some(warning) = crate::config_cmd::fragment_share_warning(&config) {
         let _ = writeln!(err, "ruster run: warning: {warning}");
     }
+    // OPS-EXIT item 4: capabilities of a user namespace act only on what it
+    // owns, though `CapEff` looks the same.
+    if host.initial_user_namespace() != Some(true) {
+        let _ = writeln!(err, "ruster run: warning: {}", USER_NAMESPACE_WARNING);
+    }
+    // OPS-EXIT: refuse exit actions the privilege policy would defeat,
+    // before any resource.
+    if let Err(refusal) = exit_guard::preflight(
+        config.exit_protection(),
+        settings.privileges,
+        settings.seccomp,
+        settings.fs_confine,
+    ) {
+        let _ = writeln!(
+            err,
+            "ruster run: invalid config: stage=exit-protection code={} path={}",
+            refusal.code(),
+            refusal.path()
+        );
+        let _ = writeln!(err, "ruster run: {}", refusal.hint());
+        return EXIT_INVALID;
+    }
     let candidate = match sequencer.candidate(&config) {
         Ok(candidate) => candidate,
         Err(error) => {
@@ -818,6 +858,8 @@ struct Ran {
     end: LoopEnd,
     shutdown: ShutdownReport,
     final_block: String,
+    /// An exit action failed (OPS-EXIT).
+    exit_failed: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -924,6 +966,23 @@ where
             Failure::Activation(error),
         ))
     })?;
+    // OPS-EXIT: what the exit actions need, opened before the privilege
+    // drop and every confinement; armed only at readiness.
+    let protection = preparer.current().exit_protection();
+    let mut exit = ExitGuard::new(if protection.any() {
+        Some(
+            host.exit_actions(protection, targets)
+                .map_err(|(port, error)| {
+                    Interrupt::Failed(StartupError::new(
+                        Stage::ExitProtection,
+                        port,
+                        Failure::ExitProtection(error),
+                    ))
+                })?,
+        )
+    } else {
+        None
+    });
     // The cold-path workers (H7) start before the drop and drop their own
     // privileges first, so the process-wide check below covers them.
     let (links, reloads) = spawn_workers(host, links, targets, preparer, settings.privileges)
@@ -984,6 +1043,13 @@ where
         seccomp,
     };
     let mut observer = TickObserver::new(HealthPolicy::default());
+    if exit.arm() {
+        let _ = writeln!(
+            err,
+            "ruster run: {}",
+            exit_guard::armed_line(protection, datapath.port_count())
+        );
+    }
     let _ = writeln!(
         err,
         "{READY} {} on {} port(s); send SIGINT or SIGTERM to stop, SIGHUP to reload",
@@ -1072,6 +1138,40 @@ where
     let shutdown = shutdown_drain(&mut datapath, clock, stop, settings.drain_deadline_ms);
     // The final block shows the kernel counters as of the drain.
     datapath.refresh();
+    // OPS-EXIT: after the drain (which needs the links up) and before the
+    // ports are detached or closed.
+    let report = exit.fire();
+    if let Some(report) = &report {
+        for line in exit_guard::report_lines(report) {
+            let _ = writeln!(err, "ruster run: {line}");
+        }
+    }
+    let exit_failed = report
+        .as_ref()
+        .is_some_and(|report| !report.failures.is_empty());
+    // Which exit action closed which exposure, for the warnings below
+    // (review core L2): every port's link down leaves the kernel nothing
+    // to act on; every port's forwarding off stops forwarding what the
+    // ports receive.
+    let ports = u32::try_from(datapath.port_count()).unwrap_or(u32::MAX);
+    let closed = |action, done: u32| {
+        report.as_ref().is_some_and(|report| {
+            done == ports
+                && !report
+                    .failures
+                    .iter()
+                    .any(|failure| failure.action == action)
+        })
+    };
+    let links_down = report
+        .as_ref()
+        .is_some_and(|report| closed(exit_guard::ExitAction::LinkDown, report.link_down));
+    let forwarding_off = report.as_ref().is_some_and(|report| {
+        closed(
+            exit_guard::ExitAction::Ipv4ForwardingOff,
+            report.forwarding_off,
+        )
+    });
     finish_workers(workers, workers_deadline, err);
     // AF_XDP: the ports are about to be detached, so whatever the kernel
     // would do with their frames now matters. AF_PACKET: the kernel acted
@@ -1108,13 +1208,20 @@ where
             "kernel IPv6 routes lead out of a port; detached ports may be routed by the kernel",
         ),
     ] {
-        if seen {
+        if seen && !links_down {
             if packet {
                 let condition = line.split(';').next().unwrap_or(line);
                 let _ = writeln!(
                     err,
                     "ruster run: warning: {condition}; the kernel acts on every frame of the \
                      AF_PACKET ports, also now that the router stops"
+                );
+            } else if forwarding_off && line.starts_with("kernel forwarding is enabled") {
+                let _ = writeln!(
+                    err,
+                    "ruster run: warning: kernel forwarding is enabled; the ports' forwarding \
+                     was turned off at exit, but the kernel may still route other \
+                     interfaces' traffic out of them"
                 );
             } else {
                 let _ = writeln!(err, "ruster run: warning: {line}");
@@ -1143,6 +1250,7 @@ where
         end,
         shutdown,
         final_block,
+        exit_failed,
     })
 }
 
@@ -1363,6 +1471,7 @@ fn finished(
         },
     );
     if !cleanup.is_empty()
+        || ran.exit_failed
         || ran.end != LoopEnd::Signal
         || shutdown.fault.is_some()
         || shutdown.tx_handoffs != 0

@@ -20,6 +20,15 @@
 mod config;
 mod datapath;
 mod error;
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    )),
+    allow(dead_code)
+)]
+mod link_query;
 mod packet_io;
 mod platform;
 mod ring;
@@ -71,6 +80,7 @@ pub use config::{
     XDP_PACKET_HEADROOM,
 };
 pub use datapath::{DatapathError, DatapathRings, RingsError};
+pub use link_query::{LinkAttributes, LinkQueryError};
 pub use ruster_io_xdp::native_profile::ConfigError;
 
 pub use error::{

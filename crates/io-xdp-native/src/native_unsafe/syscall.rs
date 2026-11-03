@@ -330,12 +330,18 @@ pub(super) enum TxQueueProbe {
 pub(super) trait Syscalls: sealed::Sealed {
     /// `if_nametoindex(3)`. `name` is NUL-padded with `name[IFNAMSIZ - 1] == 0`.
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno>;
-    /// Whether device `name` (resolved to `ifindex`) has TX queue `queue`.
-    /// Cold path; it may allocate.
+    /// Whether device `name` (resolved to `ifindex`) has active TX queue
+    /// `queue` in a sysfs view proven to describe it (`Unverifiable`: the
+    /// view is not this device's). Cold path; it may allocate.
     fn tx_queue_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32, queue: u32) -> TxQueueProbe;
-    /// The MTU of device `name` (resolved to `ifindex`), `None` when it
-    /// cannot be verified. Cold path; it may allocate.
-    fn mtu_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32>;
+    /// The MTU and allocated TX queue count of `ifindex` from one rtnetlink
+    /// `RTM_GETLINK` in the caller's network namespace, whose
+    /// `IFLA_IFNAME` must be `name`. Cold path; it may allocate.
+    fn link_query(
+        &self,
+        name: &[u8; IFNAMSIZ],
+        ifindex: u32,
+    ) -> Result<crate::LinkAttributes, crate::LinkQueryError>;
     fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno>;
     fn set_socket_option(
         &self,
@@ -422,8 +428,12 @@ impl Syscalls for LinuxSyscalls {
         linux_tx_queue_probe(name, ifindex, queue)
     }
 
-    fn mtu_probe(&self, name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32> {
-        linux_mtu_probe(name, ifindex)
+    fn link_query(
+        &self,
+        name: &[u8; IFNAMSIZ],
+        ifindex: u32,
+    ) -> Result<crate::LinkAttributes, crate::LinkQueryError> {
+        linux_link_query(name, ifindex)
     }
 
     fn interface_index(&self, name: &[u8; IFNAMSIZ]) -> Result<u32, Errno> {
@@ -710,14 +720,139 @@ fn linux_sysfs_device(name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<std::path::
     same_device.then_some(base)
 }
 
-/// Reads `/sys/class/net/<dev>/mtu` (the L3 MTU, excluding the Ethernet
-/// header) of the resolved device with safe std only. Zero is refused.
-fn linux_mtu_probe(name: &[u8; IFNAMSIZ], ifindex: u32) -> Option<u32> {
-    let base = linux_sysfs_device(name, ifindex)?;
-    std::fs::read_to_string(base.join("mtu"))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .filter(|mtu| *mtu > 0)
+/// `AF_NETLINK`, `NETLINK_ROUTE`, `MSG_TRUNC`.
+const AF_NETLINK: c_int = 16;
+const NETLINK_ROUTE: c_int = 0;
+const MSG_TRUNC: c_int = 0x20;
+
+/// Linux `struct sockaddr_nl` (12 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SockAddrNl {
+    family: u16,
+    pad: u16,
+    pid: u32,
+    groups: u32,
+}
+
+const SOCKADDR_NL_LEN: SockLen = size_of::<SockAddrNl>() as SockLen;
+const _: () = assert!(SOCKADDR_NL_LEN == 12);
+
+/// One `NETLINK_ROUTE` socket closed exactly once.
+struct RouteFd(c_int);
+
+impl Drop for RouteFd {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` is the fd `socket` returned to `linux_link_query`
+        // and owned only by this guard, which closes it once; nothing uses
+        // it afterwards.
+        let _ = unsafe { ffi::close(self.0) };
+    }
+}
+
+/// `EINTR`.
+const EINTR_NUMBER: u16 = 4;
+
+fn errno_number() -> u16 {
+    last_errno().raw().unwrap_or(0)
+}
+
+/// One rtnetlink `RTM_GETLINK` of `ifindex` (OPS-EXIT item 3, see
+/// [`crate::link_query`]): a fresh `NETLINK_ROUTE` socket of the calling
+/// thread's network namespace, the request sent to the kernel, then at
+/// most `MAX_DATAGRAMS` non-blocking receives (the kernel queues its answer
+/// while handling the `sendto`). Cold path: one 32 KiB buffer.
+fn linux_link_query(
+    name: &[u8; IFNAMSIZ],
+    ifindex: u32,
+) -> Result<crate::LinkAttributes, crate::LinkQueryError> {
+    use crate::link_query::{parse_reply, request, MAX_DATAGRAMS, RECEIVE_BUFFER};
+    use crate::LinkQueryError;
+
+    let len = name.iter().position(|byte| *byte == 0).unwrap_or(IFNAMSIZ);
+    let name = &name[..len];
+    // SAFETY: `socket` has no pointer arguments; a nonnegative result is a
+    // new fd that `RouteFd` owns from here on.
+    let fd = unsafe { ffi::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE) };
+    if fd < 0 {
+        return Err(LinkQueryError::Socket(errno_number()));
+    }
+    let fd = RouteFd(fd);
+    let sequence = 1;
+    let message = request(sequence, ifindex);
+    let kernel = SockAddrNl {
+        family: AF_NETLINK as u16,
+        ..SockAddrNl::default()
+    };
+    // SAFETY: `message` and `kernel` are live, initialized locals of the
+    // passed lengths that the kernel only reads during the call; the fd is
+    // open (owned by `fd`).
+    let sent = unsafe {
+        ffi::sendto(
+            fd.0,
+            message.as_ptr().cast(),
+            message.len(),
+            0,
+            (&raw const kernel).cast(),
+            SOCKADDR_NL_LEN,
+        )
+    };
+    if sent < 0 {
+        return Err(LinkQueryError::Send(errno_number()));
+    }
+    if sent as usize != message.len() {
+        return Err(LinkQueryError::Send(0));
+    }
+    let mut own = SockAddrNl::default();
+    let mut own_len = SOCKADDR_NL_LEN;
+    // SAFETY: `own` is a live, exclusively borrowed 12-byte `sockaddr_nl`
+    // and `own_len` holds its size; the kernel writes at most that many
+    // bytes and the actual size. The fd is open.
+    if unsafe { ffi::getsockname(fd.0, (&raw mut own).cast(), &raw mut own_len) } != 0 {
+        return Err(LinkQueryError::Address(errno_number()));
+    }
+    if own_len != SOCKADDR_NL_LEN || own.family != AF_NETLINK as u16 {
+        return Err(LinkQueryError::NotFromKernel);
+    }
+    let mut buffer = vec![0_u8; RECEIVE_BUFFER];
+    for _ in 0..MAX_DATAGRAMS {
+        let mut from = SockAddrNl::default();
+        let mut from_len = SOCKADDR_NL_LEN;
+        // SAFETY: `buffer` is a live, exclusively borrowed allocation of
+        // `buffer.len()` writable bytes and `from` a live 12-byte
+        // `sockaddr_nl` whose size `from_len` holds, for the duration of
+        // the call; the kernel writes at most those sizes. The fd is open.
+        let received = unsafe {
+            ffi::recvfrom(
+                fd.0,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                MSG_DONTWAIT | MSG_TRUNC,
+                (&raw mut from).cast(),
+                &raw mut from_len,
+            )
+        };
+        if received < 0 {
+            let errno = errno_number();
+            if errno == EINTR_NUMBER {
+                // A signal before any byte: receive again (bounded by the
+                // datagram count; the answer stays queued).
+                continue;
+            }
+            return Err(LinkQueryError::Receive(errno));
+        }
+        let received = received as usize;
+        if received > buffer.len() {
+            return Err(LinkQueryError::Truncated);
+        }
+        if from_len != SOCKADDR_NL_LEN || from.family != AF_NETLINK as u16 || from.pid != 0 {
+            return Err(LinkQueryError::NotFromKernel);
+        }
+        if let Some(link) = parse_reply(&buffer[..received], sequence, own.pid, ifindex, name)? {
+            return Ok(link);
+        }
+    }
+    Err(LinkQueryError::NoAnswer)
 }
 
 /// Leading bytes of one `union bpf_attr`, 8-byte aligned like the kernel's
@@ -1388,6 +1523,15 @@ mod ffi {
             destination_len: SockLen,
         ) -> isize;
         pub(super) fn close(fd: c_int) -> c_int;
+        pub(super) fn recvfrom(
+            fd: c_int,
+            buffer: *mut c_void,
+            byte_len: usize,
+            flags: c_int,
+            source: *mut c_void,
+            source_len: *mut SockLen,
+        ) -> isize;
+        pub(super) fn getsockname(fd: c_int, address: *mut c_void, length: *mut SockLen) -> c_int;
         pub(super) fn syscall(number: c_long, ...) -> c_long;
         pub(super) fn if_nametoindex(name: *const c_char) -> c_uint;
         pub(super) fn __errno_location() -> *mut c_int;
@@ -1557,8 +1701,15 @@ mod tests {
             TxQueueProbe::Present
         }
 
-        fn mtu_probe(&self, _: &[u8; IFNAMSIZ], _: u32) -> Option<u32> {
-            Some(1_500)
+        fn link_query(
+            &self,
+            _: &[u8; IFNAMSIZ],
+            _: u32,
+        ) -> Result<crate::LinkAttributes, crate::LinkQueryError> {
+            Ok(crate::LinkAttributes {
+                mtu: 1_500,
+                tx_queues: 1,
+            })
         }
 
         fn socket(&self, domain: c_int, kind: c_int, protocol: c_int) -> Result<RawFd, Errno> {
@@ -2388,25 +2539,27 @@ mod tests {
         );
     }
 
+    /// OPS-EXIT item 3: the live rtnetlink query of the loopback device
+    /// (read-only `RTM_GETLINK`, no change to any interface).
     #[test]
-    #[cfg_attr(miri, ignore = "reads sysfs")]
-    fn native_mtu_probe_reads_sysfs_for_the_resolved_device() {
+    #[cfg_attr(miri, ignore = "rtnetlink syscalls")]
+    fn native_link_query_reads_rtnetlink_for_the_resolved_device() {
         let mut lo = [0_u8; IFNAMSIZ];
         lo[..2].copy_from_slice(b"lo");
-        let expected = std::fs::read_to_string("/sys/class/net/lo/mtu")
-            .expect("lo mtu")
-            .trim()
-            .parse::<u32>()
-            .expect("numeric mtu");
-        assert_eq!(linux_mtu_probe(&lo, 1), Some(expected));
-        // A sysfs view of another device, or no device, fails closed.
-        assert_eq!(linux_mtu_probe(&lo, 2), None);
-        let mut missing = [0_u8; IFNAMSIZ];
-        missing[..12].copy_from_slice(b"rusterNoDev0");
-        assert_eq!(linux_mtu_probe(&missing, 1), None);
-        let mut dots = [0_u8; IFNAMSIZ];
-        dots[..2].copy_from_slice(b"..");
-        assert_eq!(linux_mtu_probe(&dots, 1), None);
+        let index = LinuxSyscalls.interface_index(&lo).expect("lo exists");
+        let link = linux_link_query(&lo, index).expect("lo answers");
+        assert!(link.mtu > 0, "{link:?}");
+        assert!(link.tx_queues >= 1, "{link:?}");
+        // Another name on that index, or an index that does not exist,
+        // fails closed.
+        let mut other = [0_u8; IFNAMSIZ];
+        other[..12].copy_from_slice(b"rusterNoDev0");
+        assert_eq!(
+            linux_link_query(&other, index),
+            Err(crate::LinkQueryError::NameMismatch)
+        );
+        let gone = linux_link_query(&lo, 0x7fff_fff0).expect_err("no such index");
+        assert!(gone.is_no_device(), "{gone:?}");
     }
 
     #[test]

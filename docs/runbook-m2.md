@@ -501,7 +501,7 @@ ruster run [options] -- <config.toml>
 | `--kick-errors-fatal-secs <s>` | 5 | 0 to 3600 | deprecated: the fallback of `[health] kick-errors-fatal-ms`; `KICK_ERRORS` fatal exit; 0 never |
 | `--link-stale-secs <s>` | 5 | 1 to 3600 | deprecated: the fallback of `[watch] link-stale-ms`; age of a link watcher round still running (a `send` waiting for the kernel's RTNL lock) from which every further due round counts as a failed link query on every port (`LINK_WATCH_STALE`, `LINK_PROBE`; `LINK_UNVERIFIABLE` at the third, so about `s + 2` seconds after the stuck round started; section 8). No 0: losing observability of the ports always ends the run eventually. Raise it on hosts where driver resets hold RTNL longer |
 | `--idle-wait-ms <ms>` | 10 | 1 to 100 | longest idle wait (section 7, "Idle wait"): an idle router blocks in `poll()` on its port sockets for at most this long, or at most 1 ms while timers, TX, or a reload are pending; an arriving frame ends the wait at once. Larger: fewer idle wake-ups and less CPU, but a signal delivered to another thread, a worker's answer, and anything the router only notices at a tick are seen up to this much later. 1 keeps the pre-H9 idle cadence (about 1000 wake-ups per second) |
-| `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, or on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused) |
+| `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused), or for `[exit-protection]` (section 9), which needs it and then also requires the syscall filter and Landlock (they keep the reach to rtnetlink changes and the open descriptors) |
 | `--seccomp kill\|log\|off` (or `--seccomp=<mode>`) | `kill` | one of the three | the syscall filter after startup (section 5, "Syscall filter"). `kill`: a syscall outside the allowlist kills the whole process at once (`SECCOMP_RET_KILL_PROCESS`; the XDP links detach as after SIGKILL). `log`: the kernel logs it and lets it run (`SECCOMP_RET_LOG`; `warning: seccomp=log`), for finding a missing entry without an outage. `off`: no filter (`warning: seccomp=off`, `seccomp.mode=off`). Risk of `log` and `off`: a compromised router can then make every syscall an unprivileged process (after the drop) or a privileged one (with `--keep-privileges`) can: open inet sockets and connect out, write any file its user may write, start programs, `ptrace` its own user's processes, load BPF programs where unprivileged BPF is allowed, and probe kernel interfaces that the filter keeps out of reach. Use `log` to diagnose a kill, `off` only on a platform where the filter cannot be installed. On a kernel before Landlock ABI 3 (Linux 6.2) the filter is also what keeps a writable file from being truncated by path (the `O_TRUNC` rule, no `truncate`), so `log`/`off` there loses that too; before ABI 4 (Linux 6.7) it is also the only limit on TCP sockets. An i386 or x32 syscall kills in every mode but `off`. Independent of `--keep-privileges` and `--user`/`--group` |
 | `--fs-confine landlock\|off` (or `--fs-confine=<mode>`) | `landlock` | one of the two | the filesystem confinement after startup (section 5, "Filesystem confinement", H11). `landlock`: every thread can open only the files the run reads (the config's directory, its own `/proc/<pid>`, `/proc/sys/net`, its binary; read-only; a config directory of `/` is refused), and startup fails without Landlock (`stage=fs-confine code=LANDLOCK_UNSUPPORTED\|LANDLOCK_DISABLED\|LANDLOCK_BLOCKED`). `off`: no confinement (`warning: fs-confine=off`, `fs.confine=off`). Risk of `off`: a compromised router can then read every file its user may read, which without `--user`/`--group` is every root-readable file (`/etc/shadow`, private keys, other services' configs), and send it out over the ports or its output. Use `off` only on a kernel without Landlock (before 5.13, or `landlock` missing from the boot `lsm=` list). Independent of `--keep-privileges`, `--user`/`--group`, and `--seccomp` |
 | `--user <uid>` `--group <gid>` | none | numeric ids 1 to 4294967294, both or neither, not with `--keep-privileges` | with the drop, also switch every thread's real, effective, saved and filesystem uid and gid to these ids and clear the supplementary groups. Names are not resolved. Needs `CAP_SETUID` and `CAP_SETGID` at startup (exit 4 otherwise, checked before anything is opened). The config must then be readable by that user for reloads |
@@ -530,8 +530,8 @@ its terminal hangs up or under `nohup`.
 | status | meaning |
 |---|---|
 | 0 | ordered shutdown after SIGINT/SIGTERM with no TX frame left in the kernel; also a signal during startup or during a retry pause, after a clean rollback |
-| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (notify, fs-confine, open, checks, attach, watch, datapath, engine, adapter, activate, privilege-drop, seccomp, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; signal handler or output thread setup failure; unsupported platform |
-| 2 | usage error, or invalid config (`parse`, `version`, `validate`, the `sim` backend, or `candidate code=MISSING_SERVICE_*`) |
+| 1 | runtime failure: unreadable or refused config file; a startup failure at any stage after the config (notify, fs-confine, open, checks, attach, watch, datapath, engine, adapter, activate, exit-protection, privilege-drop, seccomp, storage, key source; a transient open failure after the last attempt); a backend fault, a fatal health or device event, or an invariant violation during the run; a drain failure; a stranded TX handoff; a close error; a failed exit action (`exit protection failed:`); signal handler or output thread setup failure; unsupported platform |
+| 2 | usage error, or invalid config (`parse`, `version`, `validate`, the `sim` backend, `candidate code=MISSING_SERVICE_*`, or `stage=exit-protection` with a privilege policy that would defeat it) |
 | 3 | the shutdown drain deadline (or a second signal) left TX frames with the kernel; everything was still detached and closed |
 | 4 | missing capability (also `CAP_SETUID`/`CAP_SETGID` for `--user`/`--group`), too small `RLIMIT_MEMLOCK`, a kernel whose teardown would need `CAP_BPF` after the drop (`TEARDOWN_NEEDS_CAPABILITIES`), or unreadable `/proc/self/status`/`/proc/self/limits`/`/proc/sys/kernel/osrelease`/`/proc/sys/kernel/unprivileged_bpf_disabled`; nothing was acquired |
 | 101 | a panic (section 9) |
@@ -2069,6 +2069,111 @@ violation code=APPLY_REPORT_MISSING` when the run ended for those reasons
 (exit 1), and `drain failed: code=<CODE>` precedes it when the drain itself
 failed (exit 1). Every port is still closed.
 
+### Exit protection (`[exit-protection]`, OPS-EXIT)
+
+Detaching hands the ports back to the kernel. The startup checks refuse a
+kernel that would forward, answer, or route their frames, but nothing
+stops an operator or a tool from turning kernel forwarding on while the
+router runs (the link watch only warns, section 8), and
+`--allow-kernel-forwarding` runs with it on. Two opt-in exit actions close
+that gap; both rewrite operator and kernel state, so both are off by
+default:
+
+```toml
+[exit-protection]          # optional; every key false when absent. Restart-required
+ipv4-forwarding-off = false # write 0 to net.ipv4.conf.<device>.forwarding of every port
+link-down = false           # set every port's link administratively down (IFF_UP off)
+```
+
+- **When.** The actions are armed at readiness (`exit protection armed:
+  ipv4-forwarding-off=<bool> link-down=<bool> ports=N`, before the
+  `running generation 1` line) and run once after the drain (which needs
+  the links up) and before the ports are detached: on a stop signal, a
+  fatal health or device event, a backend fault, an invariant violation,
+  and a panic (unreported). A startup that fails or is cancelled never
+  arms them, so ports the router never served keep the operator's state.
+  `exit protection applied: ipv4-forwarding-off=N link-down=N failed=N`
+  reports the outcome; each failure is `exit protection failed:
+  port=if<id> action=<action> code=<code>` and makes the exit status 1
+  (the ports are still detached and closed).
+- **Privileges.** Both actions need `CAP_NET_ADMIN` over the ports'
+  network namespace at the moment they run: Linux checks it at every
+  sysctl write (even on a file opened before the drop, and even for uid
+  0 without capabilities: `EPERM`, seen on Linux 7.0) and at every link
+  change (rtnetlink, `SIOCSIFFLAGS`, and sysfs all check the calling
+  thread). No thread keeps a capability after the default privilege drop,
+  so either key is refused at startup unless `--keep-privileges`
+  (`EXIT_FORWARDING_NEEDS_PRIVILEGES`, `EXIT_LINK_DOWN_NEEDS_PRIVILEGES`,
+  exit 2 before anything). The files and the rtnetlink socket are opened
+  before Landlock and the syscall filter, which allow the later `write`
+  and `sendto`/`recvfrom`; until the owner decides on a privileged helper
+  process (architecture document), `[exit-protection]` is refused with
+  `--seccomp off` (`EXIT_PROTECTION_NEEDS_SECCOMP`) or `--fs-confine off`
+  (`EXIT_PROTECTION_NEEDS_FS_CONFINE`), exit 2. With the default drop, use
+  the supervisor's post-stop hook below instead.
+- **What `--keep-privileges` costs.** It keeps every capability the
+  process started with (as root: all of them, `CAP_SYS_ADMIN`,
+  `CAP_NET_ADMIN`, `CAP_BPF`, `CAP_SYS_PTRACE` included) on every thread
+  for the whole run. Code that gained control of the router (a parser or
+  datapath bug) could then change every link, address, route, and
+  neighbor of the namespace over rtnetlink (with `CAP_NET_ADMIN`; the
+  only socket the syscall filter lets it open is `NETLINK_ROUTE`), and
+  write through the descriptors it holds open. The syscall filter (which
+  must stay on) still blocks `execve`, `ptrace`, `mount`, BPF loads, other
+  sockets, and writable opens, and Landlock limits reads to the confined
+  files; without those filters the kept capabilities would be the whole
+  machine. The default drop removes all of that; prefer it with the
+  post-stop hook unless the exit actions must also run on an exit the
+  supervisor does not see.
+- **Reload.** A change of either key is refused as restart-required
+  (`reload refused: code=RESTART_REQUIRED reasons=EXIT_PROTECTION`; `ruster plan` says
+  the same).
+- **Not covered.** A process killed outright (`SIGKILL`, a seccomp kill,
+  the OOM killer, a panic while unwinding) runs nothing. Cover those, and
+  both actions under the default drop, with the supervisor's post-stop
+  hook:
+
+  ```ini
+  [Service]
+  # "+": full privileges even with User=/CapabilityBoundingSet= set for the
+  # unit; "-": a failing line (a device already gone) does not fail the
+  # others or the unit's stop.
+  ExecStopPost=-+/usr/sbin/sysctl -q -w net.ipv4.conf.lan0.forwarding=0
+  ExecStopPost=-+/usr/sbin/sysctl -q -w net.ipv4.conf.wan0.forwarding=0
+  ExecStopPost=-+/usr/sbin/ip link set dev lan0 down
+  ExecStopPost=-+/usr/sbin/ip link set dev wan0 down
+  ```
+
+  Notes: the hook runs in the unit's network namespace (with
+  `NetworkNamespacePath=` that namespace, otherwise the host's), so the
+  device names must be the router's; it also runs after a startup that
+  failed (the ports then keep the state of the hook, not the operator's);
+  it covers IPv4 forwarding only (IPv6 forwarding,
+  `net.ipv6.conf.<device>.forwarding`, needs its own line, or keep IPv6
+  disabled on the ports, section 1). Bring the links up again in
+  `ExecStartPre=-+/usr/sbin/ip link set dev lan0 up` (and wan0): until
+  the router attaches, the startup forwarding check
+  (`KERNEL_FORWARDING`) is what keeps the kernel from forwarding the
+  port's traffic, so keep the forwarding sysctls at 0 rather than relying
+  on the link state alone.
+
+- **Interaction with the startup checks.** `ipv4-forwarding-off` writes
+  only the ports' per-device `forwarding`. The next startup's forwarding
+  check (`KERNEL_FORWARDING`, section 1) still reads `net.ipv4.ip_forward`
+  too; Linux copies a write of `net.ipv4.ip_forward` or
+  `conf.all.forwarding` to every device, so turning global forwarding on
+  later re-enables the ports as well. Neither action changes `rp_filter`,
+  so the weak-host check (`KERNEL_IPV4_WEAK_HOST`) reads the same after an
+  exit. `link-down` makes the kernel drop the IPv4 routes through the
+  port (the startup refuses those anyway, `KERNEL_IPV4_ROUTES`) and its
+  non-permanent IPv6 addresses. `ruster run` never sets a link up: bring
+  the ports up before the next start (`ip link set dev <device> up`, or
+  `ExecStartPre=`); a port that is still down starts with the
+  `LINK_DOWN` warning and forwards nothing until it is up (section 8).
+- **AF_PACKET.** The same keys work over AF_PACKET; there the kernel saw
+  every frame all along (its exposure is fatal while running), so the
+  actions only keep it from forwarding after the router stops.
+
 ### Panics
 
 `ruster run` keeps Rust's default `panic = "unwind"`. Under the
@@ -2090,7 +2195,8 @@ after SIGKILL.
    detach by themselves within milliseconds. Confirm with
    `ip -details link show dev lan0` (no `prog/xdp`). While detached, frames
    reach the kernel stack: keep the ports free of kernel L3 and forwarding
-   off (section 1).
+   off (section 1). `[exit-protection]` (section 9) does not run here; the
+   supervisor's `ExecStopPost=` does.
 2. Restart with the same command. The first attempt can fail transiently
    with `open code=BIND/BUSY` or `REGISTER_UMEM/MEMLOCK_LIMIT`; `ruster run`
    rolls back and retries (section 5). If every attempt fails it exits 1
@@ -2124,7 +2230,7 @@ Sections, in this order:
 | `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `carried.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome, its flush counts (`apply.flush.*`), carry counts (`apply.carry.*`, including `firewall_flows_revoked`) and per-family outcome (`apply.state.<family>`: `carried`, `flushed`, `flushed:<reason>`, RELOAD-CARRY), cumulative `flushed.*` and `carried.*`, NAT/FW/ICMP limiter occupancy and high-water. `firewall.states_revoked` counts the flows reloads revoked |
 | `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `nat44_icmp.*`, `firewall.*` | the service runtimes' cumulative counters (`nat44_icmp.*` is all zero without `[nat44.icmp]`) |
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
-| `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
+| `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall; the gauge `tx_held_on_down_link` is the TX held while the link is last seen down, which a reload does not wait for, OPS-EXIT), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
 | `reload.*` | `requested`, `applied`, `refused`, `failed`, `preparing_ms` (how long the reload being prepared on the worker has run; 0 when none) |
 | `idle.*` | the idle wait (section 7): `max_wait_ms` (`--idle-wait-ms`), `waits` (blocking `poll`s), `woken` (ended by a frame on a port), `timed_out`, `interrupted` (a signal handler ran), `short` (waits the 1 ms pending cap made shorter than `--idle-wait-ms` and the next deadline would have; it grows about 1000 per second for as long as TX is held on a down link, resolution states are `Failed`, or unsolicited-SYN holds exist, as before H9), `sleeps` (plain sleeps of at most 1 ms after a ready socket that no tick used, or because `poll` failed), `errors` (failed `poll`s; warned once) |
 | `notify.*` | systemd notification (section 5, H10): `enabled` (`NOTIFY_SOCKET` was set), `watchdog_interval_ms` (half of `WATCHDOG_USEC`; 0 without a watchdog), `sent`, `watchdog_pings` (of them), `failed` (not delivered: nobody listening, or the manager's queue full) |
@@ -2359,8 +2465,21 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   waiting until the run stops (`stage=prepare code=STOPPED`). Keep the
   config on a local file system.
 - A port that is administratively down with TX queued holds those frames
-  in the kernel's ring, so a reload while it is down fails with
-  `stage=quiesce code=TIMEOUT`; bring the link up first.
+  in the kernel's ring until the link returns (AF_XDP has no way to take a
+  published TX descriptor back). Since OPS-EXIT a reload does not wait for
+  them: they already left every decision of the old generation, and they
+  leave the port when the link comes back up, possibly after the new
+  generation is active (like frames in a NIC queue at any reload). The
+  check confirms the link is down with one fresh kick (only `ENETDOWN`
+  confirms; any other outcome makes the frames block as before). The
+  `reload applied` line ends with `held-tx-on-down-links=N`, and the gauge
+  `if<id>.af_xdp_port.tx_held_on_down_link` (AF_PACKET:
+  `if<id>.af_packet_port.tx_held_on_down_link`, `af_packet.tx_held_on_down_link`)
+  shows them. The hardening `[reload] down-link-tx = "refuse"` (read from
+  the document being applied, default `"send"`) refuses such a reload
+  instead (`reload failed: stage=quiesce code=DOWN_LINK_TX_HELD`; bring the
+  link up or restart). TX queued on a port whose link is up still has to
+  complete first (`stage=quiesce code=TIMEOUT` after 200 ms).
 - With the default `[reload] state = "carry"` a reload keeps NAT44,
   firewall, and ARP state the new document does not invalidate, with its
   hash keys (section 6). The keys rotate only when a family is flushed
@@ -2715,7 +2834,15 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
 - Capability diagnostics read `CapEff` in the caller's user namespace; in a
   non-initial user namespace the bits can look sufficient while BPF still
   needs init-namespace capabilities, so the failure appears later as
-  `attach code=.../PERMISSION_DENIED`.
+  `attach code=.../PERMISSION_DENIED`. The startup warns once
+  (`warning: user namespace: code=USER_NAMESPACE_NOT_INITIAL ...`, log
+  event `USER_NAMESPACE_NOT_INITIAL`) when `/proc/self/uid_map` is not the
+  initial namespace's identity map (or cannot be read); it does not stop
+  the start.
+- `[exit-protection]` (section 9) cannot run when the process is killed
+  outright (`SIGKILL`, a seccomp kill, the OOM killer) or panics while
+  unwinding; both keys need `--keep-privileges`. Use the supervisor's
+  post-stop hook for those cases.
 - Under `sudo` from an interactive terminal, Ctrl-C reaches `ruster run`
   both from the terminal's process group and relayed by sudo, so one key
   press can count as two signals and force the drain (`forced=true`). Use
@@ -3307,7 +3434,14 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `IPV4_WEAK_HOST_EXPOSURE` (startup under `--allow-ipv4-weak-host`, or `health=`) | — | effective `rp_filter` 0 (`arp_ignore` does not matter) | `sysctl -w net.ipv4.conf.all.rp_filter=1` (or 2); `arp_ignore=1` as well; without the flag the next start is refused |
 | `health=KERNEL_IPV6_ENABLED` / `KERNEL_IPV6_ADDRESSES` / `KERNEL_IPV6_ROUTES` / `KERNEL_IPV6_FORWARDING_ENABLED` / `IPV6_UNVERIFIABLE` | — | kernel IPv6 on a port with IPv6 on, while attached | `sysctl -w net.ipv6.conf.<dev>.disable_ipv6=1` while the router runs (section 8) |
 | `reload refused: code=RESTART_REQUIRED reasons=...` | — | the change needs a restart | restart in a quiet period |
-| `reload failed: stage=quiesce code=TIMEOUT` | — | TX did not settle within 200 ms (often a port down with TX queued) | bring the link up, send SIGHUP again |
+| `reload failed: stage=quiesce code=TIMEOUT` | — | TX on a port whose link is up did not complete within 200 ms (a port that is down no longer blocks, section 12) | check the port's TX (`tx_inflight`, `TX_STALL`), send SIGHUP again |
+| `invalid config: stage=exit-protection code=EXIT_LINK_DOWN_NEEDS_PRIVILEGES` | 2 | `link-down = true` under the privilege drop: no thread holds `CAP_NET_ADMIN` at exit | run with `--keep-privileges` (every capability stays, section 9), or set the link down in `ExecStopPost=` |
+| `invalid config: stage=exit-protection code=EXIT_PROTECTION_NEEDS_SECCOMP` / `EXIT_PROTECTION_NEEDS_FS_CONFINE` | 2 | `[exit-protection]` (which needs `--keep-privileges`) with `--seccomp off` / `--fs-confine off` | keep the syscall filter and Landlock on, or use `ExecStopPost=` |
+| `startup failed: stage=open code=TX_QUEUE_CHECK/TX_QUEUE_UNVERIFIABLE` | 1 | the device has more than one TX queue and the sysfs view is not the router namespace's (the active TX queue count cannot be proven) | run in the namespace with its own sysfs (`ip netns exec` remounts it), or use a single-queue device |
+| `reload failed: stage=quiesce code=DOWN_LINK_TX_HELD` | — | `[reload] down-link-tx = "refuse"` and a port whose link is down holds TX | bring the link up and reload again, or restart (which discards the held frames) |
+| `invalid config: stage=exit-protection code=EXIT_FORWARDING_NEEDS_PRIVILEGES` | 2 | `ipv4-forwarding-off = true` under the privilege drop: the sysctl write needs `CAP_NET_ADMIN` at exit | run with `--keep-privileges`, or write the sysctl in `ExecStopPost=` (section 9) |
+| `startup failed: stage=exit-protection port=if<id> code=ERRNO_<n>` | 1 | a port's forwarding sysctl could not be opened (no such device, read-only `/proc/sys`) or the rtnetlink socket failed | check `/proc/sys/net/ipv4/conf/<device>/forwarding` in the router's namespace |
+| `exit protection failed: port=if<id> action=<action> code=<code>` | 1 | an exit action failed (`KERNEL_1`: `EPERM`; `ERRNO_2`: the sysctl entry is gone, e.g. the device was renamed or removed) | apply it by hand: `sysctl -w net.ipv4.conf.<device>.forwarding=0`, `ip link set dev <device> down` |
 | `reload failed: stage=apply code=RESTART_REQUIRED.<R>\|NOT_QUIESCENT\|...` | — | the live apply refused | nothing changed; check the plan |
 | `stopped after a backend fault` | 1 | ring fault or wedged adapter | collect the final stats; restart |
 | `stopped after an invariant violation code=APPLY_REPORT_MISSING` | 1 | publication contract broken | report it |

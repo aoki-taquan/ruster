@@ -563,6 +563,8 @@ fn quiescence_reaps_first_and_defers_only_on_in_flight_tx() {
     transmit_all(&lan);
     assert!(io.try_publication_quiescence().is_ok());
     assert_eq!(io.engine(LAN).expect("LAN").tx_inflight(), 0);
+    // A link that is up never counts as skipped (OPS-EXIT item 2).
+    assert_eq!(io.backend_stats().counters.tx_held_on_down_link, 0);
 
     // A drain stops the adapter for good.
     deliver(&lan, &ipv4_frame(60, 64));
@@ -814,13 +816,25 @@ fn link_flap_recovers_without_new_traffic() {
         "{stats:?}"
     );
     assert_eq!(io.backend_stats().link_down_ports, 1);
-    assert!(matches!(
-        io.try_publication_quiescence(),
-        Err(XdpQuiescenceError::TxInFlight {
-            interface: WAN,
-            frames: 2
-        })
-    ));
+    // OPS-EXIT item 2: the down link's TX does not block a publication
+    // (the kernel holds it until the link returns) once a fresh kick
+    // confirms the link is down; the frames stay in flight and the gauge
+    // shows them.
+    let kicks = wan.kicks(KickRing::Tx);
+    assert!(io.try_publication_quiescence().is_ok());
+    assert!(wan.kicks(KickRing::Tx) > kicks, "confirmed by a fresh kick");
+    let stats = io.port_stats(WAN).expect("WAN");
+    assert_eq!(stats.counters.tx_held_on_down_link, 2);
+    assert_eq!(stats.counters.tx_inflight, 2);
+    assert_eq!(wan.transmitted(), 0);
+    assert_eq!(
+        io.backend_stats().counters.tx_held_on_down_link,
+        2,
+        "summed over the ports"
+    );
+    // (TX in flight on a port whose link is up still blocks:
+    // `quiescence_reaps_first_and_defers_only_on_in_flight_tx`, with
+    // `tx_held_on_down_link` 0 there.)
     // The link returns; no new traffic. The quiescence check itself
     // settles the owed kick and becomes ready.
     wan.set_link_down(false);
@@ -847,6 +861,49 @@ fn link_flap_recovers_without_new_traffic() {
     assert_eq!(wan.transmitted(), 3);
     assert_eq!(io.engine(WAN).expect("WAN").tx_inflight(), 0);
     audit(&io);
+}
+
+/// OPS-EXIT (review M1): `link_down` is only the last kick's `ENETDOWN`.
+/// Any other kick outcome clears it, so TX in flight blocks the
+/// quiescence again: a successful kick that the kernel does not act on
+/// yet, and a kick that fails with another errno.
+#[test]
+fn only_a_fresh_enetdown_lets_held_tx_pass_the_quiescence() {
+    for outcome in ["sent", "other errno"] {
+        let (lan, wan) = (kernel(), kernel());
+        let mut io = adapter(&lan, &wan);
+        for kernel in [&lan, &wan] {
+            kernel.set_copy_transmit(Some(KICK_TX_BATCH));
+            kernel.set_tx_flags(XDP_RING_NEED_WAKEUP);
+        }
+        wan.set_link_down(true);
+        forward_one_to_wan(&mut io, &lan);
+        assert!(io.port_stats(WAN).expect("WAN").link_down);
+        assert!(io.try_publication_quiescence().is_ok(), "{outcome}: held");
+        match outcome {
+            "sent" => {
+                // The link returns; the kernel takes the kick but has not
+                // consumed the descriptor yet.
+                wan.set_link_down(false);
+                wan.set_copy_transmit(None);
+            }
+            _ => wan.fail_next_kick(Some(5)), // EIO
+        }
+        let blocked = io.try_publication_quiescence();
+        assert!(
+            matches!(
+                blocked,
+                Err(XdpQuiescenceError::TxInFlight {
+                    interface: WAN,
+                    frames: 1
+                })
+            ),
+            "{outcome}"
+        );
+        let stats = io.port_stats(WAN).expect("WAN");
+        assert!(!stats.link_down, "{outcome}: {stats:?}");
+        assert_eq!(stats.counters.tx_held_on_down_link, 0, "{outcome}");
+    }
 }
 
 /// One cross-port copy from LAN committed to WAN in a finished batch.
@@ -880,13 +937,12 @@ fn link_down_kick_retries_are_rate_limited_and_the_debt_is_kicked_after_up() {
         io.service().expect("service");
     }
     drop(io.receive(0).expect("idle receive"));
-    assert!(io.try_publication_quiescence().is_err());
     let stats = io.port_stats(WAN).expect("WAN");
     assert_eq!(wan.kicks(KickRing::Tx), 1, "{stats:?}");
     assert!(stats.link_down && stats.kick_owed, "{stats:?}");
     assert_eq!(stats.counters.kicks_link_down, 1);
     assert_eq!(
-        stats.counters.kick_retries_suppressed, 103,
+        stats.counters.kick_retries_suppressed, 102,
         "receive and its drop settle twice"
     );
     // Due again after the minimum wait, then each wait doubles: kicks at
@@ -922,7 +978,7 @@ fn link_down_kick_retries_are_rate_limited_and_the_debt_is_kicked_after_up() {
     assert_eq!(stats.counters.kick_errors, stats.counters.kicks_link_down);
     assert_eq!(
         stats.counters.kick_retries_suppressed,
-        103 + 3 * DOWN_MS - (kicks - 1)
+        102 + 3 * DOWN_MS - (kicks - 1)
     );
     assert_eq!(stats.counters.tx_inflight, 1);
     assert_eq!(wan.transmitted(), 0);

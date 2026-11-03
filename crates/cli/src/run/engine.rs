@@ -169,6 +169,12 @@ pub trait Datapath {
         false
     }
 
+    /// TX frames held by ports whose link is down (OPS-EXIT): a granted
+    /// quiescence does not wait for them. Cold (a reload's publication).
+    fn held_tx_on_down_links(&self) -> u64 {
+        0
+    }
+
     /// Hands each port's health counters to `visit` (cold path, no
     /// allocation).
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample));
@@ -734,7 +740,20 @@ where
         let mut candidate = None;
         if let Some(since) = control.reloader.pending_since() {
             match datapath.probe_quiescence() {
-                Ok(()) => candidate = control.reloader.take_candidate(),
+                Ok(()) => {
+                    // OPS-EXIT: TX a down link holds does not block; strict
+                    // `[reload] down-link-tx = "refuse"` refuses instead.
+                    let held = datapath.held_tx_on_down_links();
+                    if held != 0 && control.reloader.refuses_held_tx() {
+                        if let Some(outcome) =
+                            control.reloader.abandon("DOWN_LINK_TX_HELD", generation)
+                        {
+                            let _ = writeln!(err, "ruster run: {outcome}");
+                        }
+                    } else {
+                        candidate = control.reloader.take_candidate(held);
+                    }
+                }
                 Err(PublicationQuiescenceDisposition::Stop) => {
                     if let Some(outcome) = control.reloader.abandon("BACKEND_STOPPED", generation) {
                         let _ = writeln!(err, "ruster run: {outcome}");
