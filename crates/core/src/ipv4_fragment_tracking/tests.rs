@@ -1300,3 +1300,197 @@ fn one_datagram_holds_at_most_sixteen_fragments() {
     assert_eq!(tracker.sweep(1_000, 4), 1);
     assert_eq!(tracker.held(), 0);
 }
+
+// ------------------------------------------- low follow-ups (#337) ----
+
+/// Holds a later fragment of `id` from `source` at `now`.
+fn hold(tracker: &mut Ipv4FragmentTracker<'_>, source: [u8; 4], id: u16, now: u64) {
+    let frame = fragment_from(source, id, 2 | MF, 64, 17, 8);
+    assert_eq!(
+        tracker.follow(info(&frame), &frame, frame.len(), now),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+}
+
+/// Forwards a later fragment of `id` from SOURCE at `now`.
+fn progress(tracker: &mut Ipv4FragmentTracker<'_>, id: u16, now: u64) {
+    let frame = fragment(id, 2 | MF, 64, 17, 8);
+    assert!(matches!(
+        tracker.follow(info(&frame), &frame, frame.len(), now),
+        Ok(Ipv4FragmentFollow::Allow { .. })
+    ));
+}
+
+#[test]
+fn victims_are_found_behind_any_number_of_allowing_entries() {
+    // Twelve allowing entries of one host, then one pending: at the host's
+    // limit the pending one is evicted however many allowing ones precede
+    // it (an eight-entry probe window could be shielded).
+    let mut storage = Storage::new(16, 4, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 13, 4), storage.borrow(), key()).unwrap();
+    for id in 1..=12 {
+        allow(&mut tracker, id, 0);
+    }
+    hold(&mut tracker, SOURCE, 13, 0);
+    assert!(tracker
+        .admit_first(info(&fragment(14, MF, 64, 17, 16)), 0)
+        .is_ok());
+    let counters = tracker.counters();
+    assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
+    // Same at the ingress share (8 of 16).
+    let mut storage = Storage::new(16, 4, 1514);
+    let base = Ipv4FragmentTrackingPolicy::new(1_000, 16, 4).unwrap();
+    let mut tracker = Ipv4FragmentTracker::new(base, storage.borrow(), key()).unwrap();
+    for id in 1..=7 {
+        allow(&mut tracker, id, 0);
+    }
+    hold(&mut tracker, SOURCE, 8, 0);
+    assert!(tracker
+        .admit_first(info(&fragment(9, MF, 64, 17, 16)), 0)
+        .is_ok());
+    assert_eq!(tracker.counters().entries_evicted, 1);
+}
+
+#[test]
+fn held_room_never_evicts_the_datagram_it_is_made_for() {
+    // Two held slots: datagram 1 holds one (oldest), datagram 2 the other.
+    let mut storage = Storage::new(4, 2, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage.borrow(), key()).unwrap();
+    hold(&mut tracker, SOURCE, 1, 0);
+    hold(&mut tracker, [10, 0, 0, 11], 2, 0);
+    // A second fragment of datagram 1 evicts datagram 2, not datagram 1.
+    let frame = fragment(1, 3 | MF, 64, 17, 8);
+    assert_eq!(
+        tracker.follow(info(&frame), &frame, frame.len(), 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    assert_eq!((tracker.entries(), tracker.held()), (1, 2));
+    let counters = tracker.counters();
+    assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
+    // Only datagram 1 holds: its next fragment finds no other victim.
+    let frame = fragment(1, 4 | MF, 64, 17, 8);
+    assert_eq!(
+        tracker.follow(info(&frame), &frame, frame.len(), 0),
+        Err(DropReason::Ipv4FragmentHoldFull)
+    );
+    assert_eq!(tracker.held(), 2);
+}
+
+#[test]
+fn the_host_hold_limit_is_checked_before_anything_is_evicted() {
+    let mut storage = Storage::new(4, 2, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 1), storage.borrow(), key()).unwrap();
+    hold(&mut tracker, [10, 0, 0, 11], 1, 0);
+    hold(&mut tracker, SOURCE, 2, 0);
+    // SOURCE is at its hold limit and the held slots are full: refused
+    // without evicting the other host's datagram.
+    let frame = fragment(3, 2 | MF, 64, 17, 8);
+    assert_eq!(
+        tracker.follow(info(&frame), &frame, frame.len(), 0),
+        Err(DropReason::Ipv4FragmentHostHoldLimit)
+    );
+    assert_eq!(tracker.counters().entries_evicted, 0);
+    assert_eq!(tracker.held(), 2);
+}
+
+#[test]
+fn a_datagram_in_progress_is_not_stalled_however_old() {
+    let mut storage = Storage::new(2, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 0);
+    allow(&mut tracker, 2, 0);
+    // Datagram 1 keeps progressing; 2 does not.
+    for now in [150, 300, 450] {
+        progress(&mut tracker, 1, now);
+    }
+    // At 500 ms both are 500 ms old, but only 2 made no progress for a
+    // fifth of the timeout: it is the one evicted.
+    let ticket = tracker
+        .admit_first(info(&fragment(3, MF, 64, 17, 16)), 500)
+        .unwrap();
+    tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 500);
+    progress(&mut tracker, 1, 550);
+    // At 600 neither stalled (progress at 550 and 500).
+    assert_eq!(
+        tracker.admit_first(info(&fragment(4, MF, 64, 17, 16)), 600),
+        Err(DropReason::Ipv4FragmentTableFull)
+    );
+    // At 720 datagram 3 stalled (220 ms), 1 did not (170 ms).
+    assert!(tracker
+        .admit_first(info(&fragment(4, MF, 64, 17, 16)), 720)
+        .is_ok());
+    progress(&mut tracker, 1, 720);
+    assert_eq!(tracker.counters().entries_evicted, 2);
+}
+
+#[test]
+fn an_evicted_allowing_key_is_refused_until_the_timeout() {
+    let mut storage = Storage::new(1, 2, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 2), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 0);
+    // Datagram 2 evicts the stalled datagram 1 and leaves a tombstone.
+    allow(&mut tracker, 2, 200);
+    assert_eq!(tracker.counters().entries_evicted, 1);
+    complete(&mut tracker, 2, SOURCE, 200);
+    assert_eq!(tracker.entries(), 0);
+    // A late fragment of datagram 1 is refused, not held.
+    let late = fragment(1, 2, 64, 17, 5);
+    assert_eq!(
+        tracker.follow(info(&late), &late, late.len(), 300),
+        Ok(Ipv4FragmentFollow::Deny)
+    );
+    assert_eq!((tracker.entries(), tracker.held()), (0, 0));
+    // A new first fragment on the key (maybe another datagram) is refused.
+    let poisoned = tracker.counters().poisoned;
+    assert_eq!(
+        tracker.admit_first(info(&fragment(1, MF, 64, 17, 16)), 300),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    assert_eq!(tracker.counters().poisoned, poisoned + 1);
+    // Other keys are not affected; after the timeout the key is free.
+    assert!(tracker
+        .admit_first(info(&fragment(5, MF, 64, 17, 16)), 300)
+        .is_ok());
+    assert!(tracker
+        .admit_first(info(&fragment(1, MF, 64, 17, 16)), 1_200)
+        .is_ok());
+    // A flush forgets the tombstones.
+    allow(&mut tracker, 1, 1_200);
+    allow(&mut tracker, 6, 1_400);
+    tracker.flush();
+    assert!(tracker
+        .admit_first(info(&fragment(1, MF, 64, 17, 16)), 1_400)
+        .is_ok());
+}
+
+#[test]
+fn every_ingress_is_found_and_the_two_hundred_fifty_seventh_refused() {
+    let mut storage = Storage::new(512, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
+    for round in 0..2_u16 {
+        for ingress in 0..256_u16 {
+            let mut first = info(&fragment(round, MF, 64, 17, 16));
+            first.key.ingress = IfId(ingress * 7);
+            let ticket = tracker.admit_first(first, 0).unwrap();
+            tracker.commit_deny(ticket, 0);
+        }
+    }
+    assert_eq!(tracker.entries(), 512);
+    for ingress in 0..256_u16 {
+        let slot = tracker.ingress_of(IfId(ingress * 7)).unwrap();
+        assert_eq!(tracker.ingresses[slot].entries, 2);
+    }
+    assert_eq!(tracker.ingress_of(IfId(1)), None);
+    let mut first = info(&fragment(9, MF, 64, 17, 16));
+    first.key.ingress = IfId(1);
+    assert_eq!(
+        tracker.admit_first(first, 0),
+        Err(DropReason::Ipv4FragmentIngressLimit)
+    );
+}

@@ -314,7 +314,7 @@ validate` prints the total as `storage-bytes=`. The largest config that
 slots of 40 + 3840 bytes: 248320 bytes; 66617536 bytes, 63.53 MiB,
 before). NAT-FRAG added the largest fragment association
 table (16384 entries of an entry, a host slot, and two directory buckets
-and nodes, and 512 held fragments of 8 + 3840 bytes: 5.32 MiB; 61042880
+and nodes, and 512 held fragments of 8 + 3840 bytes: 5.57 MiB; 61042880
 bytes, 58.22 MiB, before). MTU2 part B added 1024 fragmentation slots
 of 12 + 3840 bytes (3.76 MiB; 57098432 bytes, 54.45 MiB, before). MTU1 grew the ICMPv4 error action slot from 584
 to 592 bytes (the Next-Hop MTU of Fragmentation Needed, 32 KiB at the limit;
@@ -969,15 +969,25 @@ Tuning:
 - `entries` bounds the datagrams in flight at once; an entry is freed as
   soon as every byte up to the last fragment has passed, otherwise after
   `timeout-ms`. One ingress interface may take at most
-  `ingress-share-percent` of the table (default 50; with three or more
-  interfaces use about 100/n): a flood arriving on the WAN cannot take the
-  entries of LAN-originated datagrams (`drop.IPV4_FRAGMENT_INGRESS_LIMIT`).
+  `ingress-share-percent` of the table (default 50): a flood arriving on
+  the WAN cannot take the entries of LAN-originated datagrams
+  (`drop.IPV4_FRAGMENT_INGRESS_LIMIT`). The share is a cap, not a
+  reservation: with n interfaces, use 100/n or less so that each keeps at
+  least an entry when all the others are full. `ruster validate` and
+  `ruster run` warn with `FRAGMENT_INGRESS_SHARE_OVERCOMMITTED
+  share-percent=P interfaces=N` (event `FRAGMENT_SHARE_OVERCOMMITTED`) when
+  share × (n − 1) ≥ 100; the default 50 is fine for two interfaces.
   When the table, an ingress's share, or one (ingress, source)'s
   `entries-per-host` is full, an old association of that scope is evicted
   (`fragment_tracking.entries_evicted`, `held_evicted`): a pending or
-  refused one first, else one that allows a datagram that has stalled for a
-  fifth of `timeout-ms` (1 s by default; a datagram's fragments arrive
-  within milliseconds). Only then is a new one refused
+  refused one first, else one that allows a datagram that has made no
+  progress (no fragment) for a fifth of `timeout-ms` (1 s by default; a
+  datagram's fragments arrive within milliseconds). Finding the victim is
+  O(1) whatever the scope holds. An evicted allowing association is
+  remembered for `timeout-ms` (up to 16 at once): its late fragments and a
+  new first fragment with its key are refused
+  (`IPV4_FRAGMENT_FIRST_DENIED`, `IPV4_FRAGMENT_DUPLICATE_FIRST`, counted in
+  `poisoned`). Only then is a new one refused
   (`drop.IPV4_FRAGMENT_TABLE_FULL`, `IPV4_FRAGMENT_INGRESS_LIMIT`,
   `IPV4_FRAGMENT_HOST_LIMIT`). Sizing: one entry per fragmented datagram in
   flight, plus one for every datagram that lost a fragment, for
@@ -1014,7 +1024,7 @@ Tuning:
   flushes it).
 - Storage: `entries` × (entry + host slot + 2 directory nodes) +
   next_power_of_two(`entries`) × 2 directory buckets + `held-fragments` ×
-  (record + slot): 302592 bytes by default, counted in `storage-bytes`.
+  (record + slot): 306688 bytes by default, counted in `storage-bytes`.
   Every `[fragment-tracking]` change is restart-required (`STORAGE_SHAPE`).
 - A reload (SIGHUP apply) discards every association and held fragment
   (`fragment_tracking.entries_flushed`, `held_flushed`): a datagram in
@@ -1052,9 +1062,9 @@ were dropped as `drop.FIREWALL_FRAGMENT_UNSUPPORTED` (and, without the
 firewall, `NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`/`NAT44_ICMP_FRAGMENT_UNSUPPORTED`)
 now pass the firewall's rules and the NAT on their first fragment, creating
 mappings and firewall state; review the rules if you relied on that drop,
-and expect those counters to fall to 0. The default table adds 302592
+and expect those counters to fall to 0. The default table adds 306688
 bytes of storage (the maximal production config, with `entries = 16384` and
-`held-fragments = 512`, is 66617536 bytes). A config with every table at
+`held-fragments = 512`, is 66879680 bytes). A config with every table at
 its production limit and per-host NAT44 limits that just fitted 64 MiB may
 now fail with `RUNTIME_STORAGE_BYTES_EXCEEDED`: lower `[fragment-tracking]
 entries`/`held-fragments` or `[fragmentation] datagrams`, size a table
@@ -1545,6 +1555,7 @@ so new messages get new codes):
 | `HEALTH_WARNING`, `HEALTH_RECOVERED`, `HEALTH_FATAL` | warn, info, error | `warning:`, `recovered:`, `fatal: port=if<id> health=<CODE>` (sections 7 and 8) |
 | `CHECK_WARNING` | warn | `warning: port=if<id> <CODE> ...` (startup device check accepted by an override, `MTU_BELOW_DEVICE`) |
 | `SWEEP_SLOW` | warn | `warning: RESOLUTION_SWEEP_SLOW ...` |
+| `FRAGMENT_SHARE_OVERCOMMITTED` | warn | `warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED ...` |
 | `RELOAD_PREPARE_SLOW`, `IDLE_POLL_FAILED`, `WORKER_ABANDONED`, `KERNEL_EXPOSURE_AT_EXIT` | warn | `warning: reload preparation running ...`, `warning: idle poll failed ...`, `warning: the <thread> thread did not end ...`, `warning: kernel ...` (exit) |
 | `PRIVILEGES_DROPPED`, `FS_CONFINED`, `SECCOMP_INSTALLED` | info | the hardening lines of section 5 |
 | `PRIVILEGES_KEPT`, `FS_CONFINE_OFF`, `FS_CONFINE_WARNING`, `SECCOMP_LOG`, `SECCOMP_OFF` | warn | their opt-out and broad-directory warnings |

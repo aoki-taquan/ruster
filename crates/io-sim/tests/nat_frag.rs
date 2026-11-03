@@ -2028,3 +2028,53 @@ fn one_ingress_cannot_take_another_ingresss_share() {
     assert!(outcome.drops.is_empty(), "{:?}", outcome.drops);
     assert_eq!(frames_to(&outcome, DMZ).len(), 3);
 }
+
+/// Follow-up L1: thirty fresh allowing entries of a spoofed peer used to
+/// shield its pending entries (held forged later fragments) from eviction,
+/// since only the eight oldest entries of a scope were probed: the peer's
+/// legitimate reply was IPV4_FRAGMENT_HOST_LIMIT. The scope's pending and
+/// refusing entries are now on their own list and evicted in O(1).
+#[test]
+fn a_held_flood_behind_allowing_entries_is_still_evicted() {
+    let mut world = World::new(Setup {
+        entries: 64,
+        ..Setup::default()
+    });
+    open_to(&mut world, REMOTE);
+    let mut flood: Vec<_> = (0..30_u16)
+        .map(|index| spoofed_first(REMOTE, 0x7500 + index))
+        .collect();
+    for index in 0..2_u16 {
+        let answer = udp_segment(REMOTE, PUBLIC, (53, P1), UDP_DATA);
+        let sent = ipv4_frame(
+            (WAN_MAC, GW_MAC),
+            REMOTE,
+            PUBLIC,
+            0x7600 + index,
+            0,
+            60,
+            UDP,
+            &answer,
+        );
+        flood.push(cut(&sent, &SIZES).remove(1));
+    }
+    let outcome = world.run(&wan(&flood));
+    assert!(outcome.drops.is_empty(), "{:?}", outcome.drops);
+    assert_eq!(world.occupancy(), (32, 2));
+    let answer = udp_segment(REMOTE, PUBLIC, (53, P1), UDP_DATA);
+    let sent = ipv4_frame(
+        (WAN_MAC, GW_MAC),
+        REMOTE,
+        PUBLIC,
+        0x7700,
+        0,
+        60,
+        UDP,
+        &answer,
+    );
+    let outcome = world.run(&wan(&cut(&sent, &SIZES)));
+    assert!(outcome.drops.is_empty(), "{:?}", outcome.drops);
+    assert_eq!(frames_to(&outcome, LAN).len(), 3);
+    let counters = world.counters();
+    assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
+}

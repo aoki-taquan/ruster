@@ -312,6 +312,45 @@ fn validate_warns_about_a_slow_resolution_sweep() {
     );
 }
 
+/// Follow-up #337 sec L4: `ingress-share-percent` is a cap, not a
+/// reservation; `validate` warns (exit 0, value-free, every backend) when
+/// `share × (interfaces − 1) ≥ 100`, so the other ingresses can take the
+/// whole table. 100/N or less keeps an entry for each.
+#[test]
+fn validate_warns_about_an_overcommitted_fragment_share() {
+    const NATFRAG: &str = include_str!("../../../fixtures/natfrag/router.toml");
+    let third = "[[interfaces]]\nid = 3\nname = \"dmz\"\ndevice = \"sim2\"\n\
+                 mac = \"02:00:00:00:00:03\"\n\n[[addresses]]\n";
+    let three = NATFRAG.replacen("[[addresses]]\n", third, 1);
+    assert_ne!(three, NATFRAG);
+    // Two interfaces at the default 50: no warning.
+    assert_eq!(validate_text(NATFRAG).2, "");
+    // Three at 50: 50 × 2 = 100, overcommitted. 34 × 2 = 68 < 100 leaves
+    // the third ingress 82 of 256 entries (two take 87 each).
+    for (share, line) in [
+        (
+            "",
+            "ruster: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED \
+             share-percent=50 interfaces=3\n",
+        ),
+        ("ingress-share-percent = 34\n", ""),
+        ("ingress-share-percent = 33\n", ""),
+        ("ingress-share-percent = 100\n", ""),
+    ] {
+        let text = three.replacen(
+            "timeout-ms = 1000\n",
+            &format!("timeout-ms = 1000\n{share}"),
+            1,
+        );
+        let (status, out, err) = validate_text(&text);
+        assert_eq!(status, 0, "{err}");
+        assert!(out.starts_with("valid: "), "{out}");
+        assert_eq!(err, line, "{share}");
+    }
+    let refuse = three.replacen("mode = \"associate\"", "mode = \"refuse\"", 1);
+    assert_eq!(validate_text(&refuse).2, "", "no table in refuse mode");
+}
+
 /// `plan` loads both sides with the limits of their own backend.
 #[test]
 fn plan_loads_each_side_with_its_backend_limits() {

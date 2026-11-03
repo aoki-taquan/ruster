@@ -547,6 +547,9 @@ where
     {
         let _ = writeln!(err, "ruster run: warning: {warning}");
     }
+    if let Some(warning) = crate::config_cmd::fragment_share_warning(&config) {
+        let _ = writeln!(err, "ruster run: warning: {warning}");
+    }
     let candidate = match sequencer.candidate(&config) {
         Ok(candidate) => candidate,
         Err(error) => {

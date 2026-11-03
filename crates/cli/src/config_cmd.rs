@@ -436,6 +436,40 @@ pub fn sweep_warnings(config: &ValidatedConfigV1) -> [Option<SweepSlow>; 2] {
     ]
 }
 
+/// `[fragment-tracking] ingress-share-percent` is a cap, not a
+/// reservation: with `interfaces` ingresses and `share × (interfaces − 1)
+/// ≥ 100`, the others can take every entry and leave none to the last
+/// (100/N guarantees each one at least an entry). Value-free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FragmentShareOvercommitted {
+    pub share_percent: u8,
+    pub interfaces: usize,
+}
+
+impl std::fmt::Display for FragmentShareOvercommitted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "FRAGMENT_INGRESS_SHARE_OVERCOMMITTED share-percent={} interfaces={}",
+            self.share_percent, self.interfaces
+        )
+    }
+}
+
+/// The fragment share warning of `config` (associate mode with a share
+/// below 100: 100 does not partition the table).
+#[must_use]
+pub fn fragment_share_warning(config: &ValidatedConfigV1) -> Option<FragmentShareOvercommitted> {
+    let share = config.fragment_tracking().policy()?.ingress_share_percent();
+    let interfaces = config.interfaces().len();
+    (share < 100 && interfaces > 1 && usize::from(share) * (interfaces - 1) >= 100).then_some(
+        FragmentShareOvercommitted {
+            share_percent: share,
+            interfaces,
+        },
+    )
+}
+
 /// `ruster validate <config>`: summary on stdout, diagnostics on stderr.
 pub fn run_validate(path: &Path, out: &mut impl Write, err: &mut impl Write) -> u8 {
     validate_loaded(load(path), out, err)
@@ -496,6 +530,9 @@ pub fn validate_loaded(
         for warning in sweep_warnings(&config).into_iter().flatten() {
             let _ = writeln!(err, "ruster: warning: {warning}");
         }
+    }
+    if let Some(warning) = fragment_share_warning(&config) {
+        let _ = writeln!(err, "ruster: warning: {warning}");
     }
     0
 }
