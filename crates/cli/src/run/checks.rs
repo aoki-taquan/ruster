@@ -296,8 +296,8 @@ pub struct DeviceFacts {
     pub master: Option<u32>,
     /// Devices of the namespace stacked on the port (`IFLA_LINK` is the
     /// port, no `IFLA_LINK_NETNSID`: VLAN, macvlan, ipvlan, MACsec, a
-    /// same-namespace veth peer); `None` if the link dump failed (checked
-    /// for AF_PACKET ports only).
+    /// same-namespace veth peer); `None` if the link dump failed or was
+    /// not made (only the AF_PACKET startup makes it and checks it).
     pub stacked: Option<u32>,
 }
 
@@ -1388,7 +1388,9 @@ pub mod linux {
             weak_host: ipv4.weak_host,
             ipv6,
             master: link.master,
-            stacked: probe.count(Dump::StackedLinks, ifindex).ok(),
+            // AF_PACKET only: its startup path dumps the links
+            // (`inspect_packet`); AF_XDP ignores upper devices.
+            stacked: None,
         })
     }
 
@@ -2300,12 +2302,13 @@ mod tests {
         assert_eq!(parse_flag(""), None);
     }
 
-    /// AFPKT-015: an AF_PACKET port needs MTU at most `max-frame-len - 14`,
+    /// AFPKT-015: an AF_PACKET port needs an MTU of at most `max-frame-len -
+    /// 14` (smaller is fine),
     /// no upper device, and no merging receive offload, checked before the
     /// kernel exposure (which is the AF_XDP rule unchanged); its RX queue
     /// count does not matter.
     #[test]
-    fn af_packet_ports_need_the_exact_mtu_no_master_and_no_receive_offload() {
+    fn af_packet_ports_need_an_mtu_within_the_frame_no_upper_device_and_no_receive_offload() {
         use super::super::offload::Offload;
         let clean = DeviceFacts {
             ifindex: 7,

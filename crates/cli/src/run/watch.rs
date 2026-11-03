@@ -52,7 +52,7 @@
 //! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` |
 //! | IPv4 `mc_forwarding` (of `all` or the device) turns on | counted with the forwarding sysctls: warning `KERNEL_FORWARDING_ENABLED` |
 //! | the effective `rp_filter` (the larger of `all` and the device) is 0, or unreadable | warning `IPV4_WEAK_HOST_EXPOSURE`, recovered when it is 1 or 2; never fatal, never a failed query (the startup refuses it as `KERNEL_IPV4_WEAK_HOST` unless `--allow-ipv4-weak-host`, CLI-079) |
-//! | AF_PACKET: the port is enslaved (`IFLA_MASTER`) or a device of the namespace is stacked on it (link dump: `IFLA_LINK` is the port, no `IFLA_LINK_NETNSID`) | fatal `KERNEL_UPPER_DEVICE` (after its warning); a failed dump is a failed query. Not queried for AF_XDP ports (XDP takes the frames first) |
+//! | AF_PACKET: the port is enslaved (`IFLA_MASTER`) or a device of the namespace is stacked on it (one link dump per round for every AF_PACKET port: `IFLA_LINK` is the port, no `IFLA_LINK_NETNSID`) | fatal `KERNEL_UPPER_DEVICE` (after its warning); a failed dump is a failed query; a dump interrupted by link changes in all its attempts is counted apart, fatal `LINK_UNVERIFIABLE` after [`LINK_DUMP_INTERRUPTED_FATAL`] rounds in a row. Not queried for AF_XDP ports (XDP takes the frames first) |
 //! | `disable_ipv6` is 0 on the port (also when it flips while running) | warning `KERNEL_IPV6_ENABLED`, recovered when it is 1 again; not fatal |
 //! | with IPv6 enabled on the port: an IPv6 address outside `fe80::/10`, an IPv6 route out of the port beyond the automatic link-local and multicast ones, `net.ipv6.conf.all.forwarding`, `conf/<dev>/forwarding`, a `force_forwarding`, or an IPv6 `mc_forwarding` on | warnings `KERNEL_IPV6_ADDRESSES`, `KERNEL_IPV6_ROUTES`, `KERNEL_IPV6_FORWARDING_ENABLED`, each recovered when gone (or when `disable_ipv6` turns on); not fatal |
 //! | an IPv6 fact is unreadable (`disable_ipv6`/forwarding sysctls, address or route dump) | a failed query of its kind; with `--allow-kernel-ipv6` a warning `IPV6_UNVERIFIABLE` instead |
@@ -222,6 +222,13 @@ impl Thresholds {
 }
 /// Link queries failing in a row before the link counts as unverifiable.
 pub const LINK_PROBE_FAILURES_FATAL: u32 = 3;
+/// Rounds in a row whose stacked-device link dump was interrupted by link
+/// changes in all its attempts before that counts as unverifiable
+/// (`LINK_UNVERIFIABLE`). Higher than [`LINK_PROBE_FAILURES_FATAL`]: on a
+/// host whose links churn (containers coming and going) an interrupted
+/// dump is ordinary, not lost observability; but a dump that never
+/// completes for this long still fails closed.
+pub const LINK_DUMP_INTERRUPTED_FATAL: u32 = 10;
 /// Default age of an outstanding link round from which every due round
 /// counts as a failed link query (`--link-stale-secs`).
 pub const DEFAULT_LINK_STALE_MS: u64 = 5_000;
@@ -266,10 +273,14 @@ pub enum Query {
     Ipv6Routes = 6,
     /// AF_PACKET: the link dump for devices stacked on the port.
     Uppers = 7,
+    /// AF_PACKET: the stacked-device link dump raced link changes in
+    /// every attempt of the round (`NLM_F_DUMP_INTR`), counted apart with
+    /// its own threshold ([`LINK_DUMP_INTERRUPTED_FATAL`]).
+    UppersInterrupted = 8,
 }
 
 impl Query {
-    const COUNT: usize = 8;
+    const COUNT: usize = 9;
 }
 
 /// The two kernel IPv4 forwarding sysctls of one port.
@@ -802,6 +813,7 @@ impl Watch {
         if let Some(port) = self.ports.get_mut(index) {
             match stacked {
                 Ok(count) => {
+                    port.probe_ok(Query::UppersInterrupted, emit);
                     port.probe_ok(Query::Uppers, emit);
                     port.exposure(
                         |port| &mut port.uppers_warned,
@@ -810,6 +822,11 @@ impl Watch {
                         emit,
                     );
                 }
+                Err(NetlinkError::Interrupted) => port.probe_failed_after(
+                    Query::UppersInterrupted,
+                    LINK_DUMP_INTERRUPTED_FATAL,
+                    emit,
+                ),
                 Err(_) => port.probe_failed(Query::Uppers, emit),
             }
         }
@@ -1220,10 +1237,15 @@ impl PortWatch {
     /// consecutive failures, so one that always fails cannot be reset by
     /// another that succeeds in the same round.
     fn probe_failed(&mut self, query: Query, emit: &mut impl FnMut(WatchEvent)) {
+        self.probe_failed_after(query, LINK_PROBE_FAILURES_FATAL, emit);
+    }
+
+    /// [`Self::probe_failed`] with its own fatal threshold.
+    fn probe_failed_after(&mut self, query: Query, fatal: u32, emit: &mut impl FnMut(WatchEvent)) {
         self.counters.link_probe_errors = self.counters.link_probe_errors.saturating_add(1);
         let failures = &mut self.probe_failures[query as usize];
         *failures = failures.saturating_add(1);
-        if *failures >= LINK_PROBE_FAILURES_FATAL {
+        if *failures >= fatal {
             self.fatal(Fatal::LinkUnverifiable, emit);
         } else if !self.probe_warned {
             self.probe_warned = true;

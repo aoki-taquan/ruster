@@ -895,8 +895,10 @@ fn late(watch: &mut Watch, now: u64, since: u64) -> Vec<WatchEvent> {
 struct Scripted(PortRound);
 
 impl LinkMonitor for Scripted {
-    fn stacked_links(&mut self, _: &LinkTarget) -> Result<u32, NetlinkError> {
-        self.0.uppers.unwrap_or(Ok(0))
+    fn stacked_links(&mut self, _: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError> {
+        let count = self.0.uppers.unwrap_or(Ok(0))?;
+        counts.iter_mut().for_each(|slot| *slot = count);
+        Ok(())
     }
 
     fn query(&mut self, _: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
@@ -1275,4 +1277,57 @@ fn an_upper_device_at_run_time_ends_an_af_packet_run() {
         ..port_round(up(1500), 0, 0)
     });
     assert_eq!(round.ports()[0].uppers, None, "not asked for AF_XDP");
+}
+
+/// A stacked-device dump that link churn interrupts in every attempt is
+/// counted apart, with its own higher threshold (still fail closed); a
+/// completed dump resets it; another failure keeps the usual threshold.
+#[test]
+fn an_interrupted_upper_device_dump_fails_closed_only_after_its_own_threshold() {
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    for _ in 1..LINK_DUMP_INTERRUPTED_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::Interrupted), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [warning(Condition::LinkProbe)],
+        "below the threshold"
+    );
+    // A completed dump resets the count and recovers.
+    let mut events = Vec::new();
+    packet.on_uppers(0, false, Ok(0), &mut |event| events.push(event));
+    assert_eq!(events, [recovered(Condition::LinkProbe)]);
+    let mut events = Vec::new();
+    for _ in 0..LINK_DUMP_INTERRUPTED_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::Interrupted), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ],
+        "fatal at the threshold"
+    );
+    const { assert!(LINK_DUMP_INTERRUPTED_FATAL > LINK_PROBE_FAILURES_FATAL) };
+    // Any other dump failure: the usual threshold.
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    for _ in 0..LINK_PROBE_FAILURES_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::Truncated), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ]
+    );
 }

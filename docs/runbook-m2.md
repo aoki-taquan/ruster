@@ -2134,7 +2134,8 @@ as before and after it. So the kernel must have nothing to act on:
   stacked on the port are found with one link dump of the namespace
   (`IFLA_LINK` is the port and no `IFLA_LINK_NETNSID`; a failed dump is
   `UNVERIFIABLE probe=upper-devices`), at startup and at every link round
-  while running, where one is fatal (`fatal: port=ifN
+  while running (one dump per round for all AF_PACKET ports together),
+  where one is fatal (`fatal: port=ifN
   health=KERNEL_UPPER_DEVICE`), as is the port becoming enslaved. A device
   stacked on the port *from another namespace* (a macvlan or ipvlan created
   in, or moved to, a container's namespace) carries `IFLA_LINK_NETNSID`
@@ -2185,6 +2186,18 @@ is full or its retire timer fires, so an idle port delivers a lone frame
 up to `retire-timeout-ms` late; 1 to 2 ms suits a router (the timer runs in
 the kernel, not in the router thread). A growing `kernel_drops` means the
 RX ring is too small (more or larger blocks) or the router thread too slow.
+
+**Link dump cost and churn.** The dump reads every link of the router's
+namespace once per link round (every second), whatever the port count,
+into the watcher's reused 32 KiB buffer. On a namespace with thousands of
+links (a Kubernetes node with about 2000 veths) that is a few MB of
+rtnetlink replies per second and an RTNL hold per round: run the router in
+its own namespace with only its ports, as recommended. A dump that link
+changes interrupt (`NLM_F_DUMP_INTR`) is retried within the round; a round
+whose every attempt was interrupted is a failed query counted apart, and
+only 10 such rounds in a row (`LINK_DUMP_INTERRUPTED_FATAL`) end the run
+with `LINK_UNVERIFIABLE`; other dump failures are fatal after 3, as for
+the other queries.
 
 **Kernel memory.** The TPACKET rings are kernel pages allocated when the
 sockets open: up to 256 MiB per port and 1 GiB in all (the validation

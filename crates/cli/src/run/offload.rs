@@ -90,20 +90,20 @@ pub enum OffloadError {
 pub enum Command {
     /// `ETHTOOL_GSSET_INFO` for `ETH_SS_FEATURES`.
     SsetInfo,
-    /// `ETHTOOL_GSTRINGS` of `count` feature strings (the count
-    /// `SsetInfo` returned, at most [`MAX_FEATURES`]).
-    Strings { count: usize },
+    /// `ETHTOOL_GSTRINGS` of the feature strings, into room for
+    /// [`MAX_FEATURES`] strings whatever the count (the kernel ignores the
+    /// count we pass, see the ioctl's SAFETY comment).
+    Strings,
     /// `ETHTOOL_GFEATURES` of `words` feature words.
     Features { words: usize },
 }
 
 impl Command {
-    /// The request buffer of this command (checked sizes; a count above
-    /// [`MAX_FEATURES`] is refused).
+    /// The request buffer of this command (checked sizes).
     pub fn buffer(self) -> Result<Vec<u8>, OffloadError> {
         match self {
             Self::SsetInfo => Ok(sset_info_request().to_vec()),
-            Self::Strings { count } => strings_request(count),
+            Self::Strings => Ok(strings_request()),
             Self::Features { words } => features_request(words),
         }
     }
@@ -145,32 +145,26 @@ pub fn sset_info_count(reply: &[u8]) -> Result<usize, OffloadError> {
     Ok(count)
 }
 
-/// The `ETHTOOL_GSTRINGS` request for `count` feature strings: `cmd`,
-/// `string_set`, `len`, then `count * 32` bytes of room. 1 to
-/// [`MAX_FEATURES`] strings.
-fn strings_request(count: usize) -> Result<Vec<u8>, OffloadError> {
-    if count == 0 || count > MAX_FEATURES {
-        return Err(OffloadError::Malformed);
-    }
-    let room = count
-        .checked_mul(GSTRING_LEN)
-        .and_then(|room| room.checked_add(12))
-        .ok_or(OffloadError::Malformed)?;
-    let mut request = vec![0_u8; room];
+/// Bytes of a [`Command::Strings`] buffer: the header and room for
+/// [`MAX_FEATURES`] strings (32 KiB).
+pub const STRINGS_BUFFER: usize = 12 + MAX_FEATURES * GSTRING_LEN;
+
+/// The `ETHTOOL_GSTRINGS` request for the feature strings: `cmd`,
+/// `string_set`, `len` (0: the kernel ignores it), then room for
+/// [`MAX_FEATURES`] strings. Fixed size, whatever count the kernel has.
+fn strings_request() -> Vec<u8> {
+    let mut request = vec![0_u8; STRINGS_BUFFER];
     request[0..4].copy_from_slice(&GSTRINGS.to_ne_bytes());
     request[4..8].copy_from_slice(&SS_FEATURES.to_ne_bytes());
-    let len = u32::try_from(count).map_err(|_| OffloadError::Malformed)?;
-    request[8..12].copy_from_slice(&len.to_ne_bytes());
-    Ok(request)
+    request
 }
 
-/// The feature bit of `name` in an answered [`strings_request`] of `count`
-/// strings (each NUL-padded to 32 bytes).
+/// The feature bit of `name` in an answered [`Command::Strings`] buffer,
+/// whose `len` the kernel set to its feature count: it must be the
+/// `count` of the `GSSET_INFO` before (1 to [`MAX_FEATURES`]), and only
+/// that many strings (each NUL-padded to 32 bytes) are read.
 pub fn feature_bit(reply: &[u8], count: usize, name: &str) -> Result<Option<usize>, OffloadError> {
-    let expected = count
-        .checked_mul(GSTRING_LEN)
-        .and_then(|room| room.checked_add(12));
-    if Some(reply.len()) != expected {
+    if reply.len() != STRINGS_BUFFER || count == 0 || count > MAX_FEATURES {
         return Err(OffloadError::Malformed);
     }
     let len = u32::from_ne_bytes(
@@ -181,7 +175,8 @@ pub fn feature_bit(reply: &[u8], count: usize, name: &str) -> Result<Option<usiz
     if usize::try_from(len).ok() != Some(count) {
         return Err(OffloadError::Malformed);
     }
-    Ok(reply[12..].chunks_exact(GSTRING_LEN).position(|string| {
+    let strings = &reply[12..12 + count * GSTRING_LEN];
+    Ok(strings.chunks_exact(GSTRING_LEN).position(|string| {
         let end = string
             .iter()
             .position(|byte| *byte == 0)
@@ -266,7 +261,7 @@ pub mod linux {
         let socket = sys::Socket::open()?;
         let info = socket.ethtool(device, Command::SsetInfo)?;
         let count = sset_info_count(&info)?;
-        let strings = socket.ethtool(device, Command::Strings { count })?;
+        let strings = socket.ethtool(device, Command::Strings)?;
         let features = socket.ethtool(
             device,
             Command::Features {
@@ -367,13 +362,12 @@ pub mod linux {
                 //   buffer is header plus one `u32` (20 bytes).
                 // - `ETHTOOL_GSTRINGS` ignores the `len` we pass: it writes
                 //   `len = count` and `count * ETH_GSTRING_LEN` bytes, where
-                //   `count` is the kernel's own `ETH_SS_FEATURES` count,
-                //   `NETDEV_FEATURE_COUNT`, a compile-time constant of the
-                //   running kernel, which is exactly the count the
-                //   `GSSET_INFO` before this returned and the buffer was
-                //   sized for (`Command::Strings { count }` from
-                //   `sset_info_count`; the ethtool user tool relies on the
-                //   same).
+                //   `count` is the kernel's `ETH_SS_FEATURES` count,
+                //   `NETDEV_FEATURE_COUNT`: one string per bit of
+                //   `netdev_features_t`, a 64-bit type, so at most 64. The
+                //   buffer has room for `MAX_FEATURES` (1024) strings
+                //   whatever this or any earlier call returned, so no call
+                //   sequence can make the kernel write past it.
                 // - `ETHTOOL_GFEATURES` copies `min(size we pass,
                 //   ETHTOOL_DEV_FEATURE_WORDS)` blocks, at most what the
                 //   buffer holds.
@@ -398,7 +392,9 @@ mod tests {
     use super::*;
 
     fn strings(names: &[&str]) -> Vec<u8> {
-        let mut reply = strings_request(names.len()).unwrap();
+        let mut reply = strings_request();
+        let len = u32::try_from(names.len()).unwrap();
+        reply[8..12].copy_from_slice(&len.to_ne_bytes());
         for (index, name) in names.iter().enumerate() {
             let at = 12 + index * GSTRING_LEN;
             reply[at..at + name.len()].copy_from_slice(name.as_bytes());
@@ -423,20 +419,15 @@ mod tests {
         assert_eq!(info.len(), 20);
         assert_eq!(u32::from_ne_bytes(info[0..4].try_into().unwrap()), 0x37);
         assert_eq!(u64::from_ne_bytes(info[8..16].try_into().unwrap()), 16);
-        let request = Command::Strings { count: 3 }.buffer().unwrap();
-        assert_eq!(request.len(), 12 + 96);
+        let request = Command::Strings.buffer().unwrap();
+        assert_eq!(request.len(), 12 + 1_024 * 32);
         assert_eq!(u32::from_ne_bytes(request[0..4].try_into().unwrap()), 0x1b);
         assert_eq!(u32::from_ne_bytes(request[4..8].try_into().unwrap()), 4);
-        assert_eq!(u32::from_ne_bytes(request[8..12].try_into().unwrap()), 3);
+        assert_eq!(u32::from_ne_bytes(request[8..12].try_into().unwrap()), 0);
         let request = Command::Features { words: 3 }.buffer().unwrap();
         assert_eq!(request.len(), 8 + 48);
         // Sizes are checked: no empty or oversized command.
         for command in [
-            Command::Strings { count: 0 },
-            Command::Strings {
-                count: MAX_FEATURES + 1,
-            },
-            Command::Strings { count: usize::MAX },
             Command::Features { words: 0 },
             Command::Features { words: 33 },
             Command::Features { words: usize::MAX },
@@ -447,11 +438,6 @@ mod tests {
                 "{command:?}"
             );
         }
-        assert!(Command::Strings {
-            count: MAX_FEATURES
-        }
-        .buffer()
-        .is_ok());
         assert!(Command::Features { words: 32 }.buffer().is_ok());
         assert_eq!(u32::from_ne_bytes(request[0..4].try_into().unwrap()), 0x3a);
         assert_eq!(u32::from_ne_bytes(request[4..8].try_into().unwrap()), 3);
@@ -530,6 +516,18 @@ mod tests {
             feature_bit(&strings[..strings.len() - 1], 2, "rx-gro"),
             Err(OffloadError::Malformed)
         );
+        for count in [0, MAX_FEATURES + 1, usize::MAX] {
+            assert_eq!(
+                feature_bit(&strings, count, "rx-gro"),
+                Err(OffloadError::Malformed),
+                "{count}"
+            );
+        }
+        // Only the counted strings are read.
+        assert_eq!(feature_bit(&strings, 2, "rx-lro"), Ok(Some(1)));
+        let mut one = strings.clone();
+        one[8..12].copy_from_slice(&1_u32.to_ne_bytes());
+        assert_eq!(feature_bit(&one, 1, "rx-lro"), Ok(None));
         let mut miscounted = strings.clone();
         miscounted[8..12].copy_from_slice(&1_u32.to_ne_bytes());
         assert_eq!(

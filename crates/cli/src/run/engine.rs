@@ -220,10 +220,11 @@ pub trait LinkMonitor {
     /// unreadable. Cold path, no allocation.
     fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool>;
 
-    /// Devices of the namespace stacked on `target`'s interface index (a
-    /// link dump, [`super::netlink::stacked_on`]); AF_PACKET ports only.
-    /// Cold path, no allocation.
-    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError>;
+    /// The devices of the namespace stacked on each of `ifindexes` into
+    /// `counts` (as long as `ifindexes`), with ONE link dump for all of
+    /// them ([`super::netlink::LinkProbe::count_stacked`]); AF_PACKET
+    /// ports only. Cold path, no allocation.
+    fn stacked_links(&mut self, ifindexes: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError>;
 }
 
 /// Summed result of one drain call.

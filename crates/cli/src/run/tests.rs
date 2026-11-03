@@ -149,6 +149,8 @@ struct State {
     /// Stacked-device dump results, consumed in order by the matching
     /// port.
     stacked: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    /// Stacked-device link dumps made (one per round for every port).
+    stacked_dumps: Shared<u32>,
     /// The link watcher's queries block while this gate is closed.
     link_gate: Shared<Gate>,
     /// Quiescence probes refused before one succeeds.
@@ -574,6 +576,7 @@ struct FakeLinks {
     weak_host: Shared<VecDeque<(IfId, Option<bool>)>>,
     ipv6: Shared<VecDeque<(IfId, Ipv6Sample)>>,
     stacked: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
+    stacked_dumps: Shared<u32>,
     gate: Shared<Gate>,
 }
 
@@ -588,6 +591,7 @@ impl FakeLinks {
             weak_host: state.weak_host.share(),
             ipv6: state.ipv6.share(),
             stacked: state.stacked.share(),
+            stacked_dumps: state.stacked_dumps.share(),
             gate: state.link_gate.share(),
         }
     }
@@ -657,8 +661,15 @@ impl LinkMonitor for FakeLinks {
         scripted(&self.ipv6, target.interface).unwrap_or(Ipv6Sample::DISABLED)
     }
 
-    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
-        scripted(&self.stacked, target.interface).unwrap_or(Ok(0))
+    /// One scripted result per port (by the fake's interface index); the
+    /// first failure fails the whole dump, as one dump serves every port.
+    fn stacked_links(&mut self, ifindexes: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError> {
+        *self.stacked_dumps.borrow_mut() += 1;
+        for (ifindex, count) in ifindexes.iter().zip(counts.iter_mut()) {
+            let interface = IfId(u16::try_from(ifindex - 100).expect("fake index"));
+            *count = scripted(&self.stacked, interface).unwrap_or(Ok(0))?;
+        }
+        Ok(())
     }
 }
 
