@@ -49,6 +49,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
+use ruster_config::MAX_BACKEND_PORTS;
 use ruster_core::MonotonicMillis;
 
 use super::engine::LinkMonitor;
@@ -137,6 +138,9 @@ pub struct PortRound {
     pub forwarding: Result<Forwarding, ()>,
     pub weak_host: Option<bool>,
     pub ipv6: Option<Ipv6Sample>,
+    /// AF_PACKET ports: devices stacked on the port (one bounded link
+    /// dump into the probe's reused buffer, no allocation).
+    pub uppers: Option<Result<u32, NetlinkError>>,
 }
 
 impl PortRound {
@@ -148,6 +152,7 @@ impl PortRound {
         forwarding: Err(()),
         weak_host: None,
         ipv6: None,
+        uppers: None,
     };
 }
 
@@ -183,6 +188,43 @@ pub fn probe_round<L: LinkMonitor>(links: &mut L, targets: &[LinkTarget], round:
         port.forwarding = links.forwarding(target);
         port.weak_host = links.ipv4_weak_host(target);
         port.ipv6 = linked.then(|| links.ipv6(target));
+        port.uppers = None;
+    }
+    stacked_round(links, targets, round);
+}
+
+/// The stacked-device check of the round: one link dump for every
+/// AF_PACKET port whose link query succeeded (the dump reads every link
+/// of the namespace, so its cost does not grow with the port count), into
+/// fixed arrays of [`MAX_BACKEND_PORTS`] (no allocation).
+fn stacked_round<L: LinkMonitor>(links: &mut L, targets: &[LinkTarget], round: &mut LinkRound) {
+    let mut ifindexes = [0_u32; MAX_BACKEND_PORTS];
+    let mut counts = [0_u32; MAX_BACKEND_PORTS];
+    let mut watched = 0;
+    for (target, port) in targets.iter().zip(round.ports.iter()) {
+        if target.watch_uppers && port.link.is_ok() && watched < MAX_BACKEND_PORTS {
+            ifindexes[watched] = target.ifindex;
+            watched += 1;
+        }
+    }
+    // Validation bounds the ports by MAX_BACKEND_PORTS, so every watched
+    // port fits; one that did not would get a failed query below (fail
+    // closed), never no answer.
+    debug_assert!(targets.len() <= MAX_BACKEND_PORTS);
+    if watched == 0 {
+        return;
+    }
+    let result = links.stacked_links(&ifindexes[..watched], &mut counts[..watched]);
+    let mut at = 0;
+    for (target, port) in targets.iter().zip(round.ports.iter_mut()) {
+        if target.watch_uppers && port.link.is_ok() {
+            port.uppers = Some(if at < watched {
+                result.map(|()| counts[at])
+            } else {
+                Err(NetlinkError::Truncated)
+            });
+            at += 1;
+        }
     }
 }
 

@@ -7,8 +7,8 @@
 //!   on stdout, including restart-required reasons and the expected flush.
 //! - `ruster run-sim --scenario <scenario.toml> [--hold]`: canonical
 //!   `ruster-run-sim/v1` JSONL on stdout, human summary on stderr.
-//! - `ruster run --config <config.toml>`: the AF_XDP static router (x86_64
-//!   Linux); stats blocks on stdout, progress and diagnostics on stderr;
+//! - `ruster run --config <config.toml>`: the AF_XDP (or AF_PACKET) static
+//!   router (x86_64 Linux); stats blocks on stdout, progress and diagnostics on stderr;
 //!   SIGHUP reloads the config, SIGUSR1 prints a stats block, and with
 //!   `NOTIFY_SOCKET` it notifies systemd (`sd_notify`).
 //!
@@ -19,9 +19,10 @@
 //! `run` adds 3 (shutdown deadline with TX frames still in the kernel) and
 //! 4 (missing privilege or memlock, or a privilege drop that cannot work).
 //!
-//! The only `unsafe` code is FFI in five private modules: the signal
+//! The only `unsafe` code is FFI in a few private modules: the signal
 //! handlers (`signal`), the rtnetlink queries of `ruster run`'s startup
-//! check and link watch (`run::netlink`), the per-thread credential
+//! check and link watch (`run::netlink`), the `SIOCETHTOOL` receive-offload
+//! probe of an AF_PACKET port at startup (`run::offload`), the per-thread credential
 //! syscalls of `ruster run`'s privilege drop (`run::privileges`), the
 //! `prctl`/`seccomp` calls that install its syscall filter
 //! (`run::seccomp`), and the `clock_gettime(CLOCK_MONOTONIC)` of its

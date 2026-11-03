@@ -23,9 +23,9 @@ use ruster_io_xdp::native_profile::{
 };
 
 use crate::{
-    AfXdpModeV1, AfXdpPortV1, BackendKindV1, BackendV1, ConfigV1, ExistingXdpProgramV1,
-    FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1, Nat44Icmpv4ErrorsV1,
-    Nat44TcpInboundRstV1, SourcePath, VersionedConfig, XdpAttachModeV1,
+    AfPacketPortV1, AfPacketV1, AfXdpModeV1, AfXdpPortV1, BackendKindV1, BackendV1, ConfigV1,
+    ExistingXdpProgramV1, FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1,
+    Nat44Icmpv4ErrorsV1, Nat44TcpInboundRstV1, SourcePath, VersionedConfig, XdpAttachModeV1,
 };
 
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
@@ -216,6 +216,31 @@ pub enum ValidationCode {
     /// The native AF_XDP profile rejected a geometry the configuration
     /// checks accepted. Unreachable unless the two drift apart.
     BackendNativeProfile,
+    /// `[backend.af-packet]` is present but `backend.kind` is not
+    /// `af-packet`.
+    BackendAfPacketWithoutKind,
+    /// Two `[[backend.af-packet.ports]]` bind the same interface.
+    BackendDuplicateInterface,
+    /// `max-frame-len` is outside
+    /// [`MIN_AF_PACKET_FRAME_LEN`]..=[`MAX_AF_PACKET_FRAME_LEN`].
+    BackendMaxFrameLenOutOfRange,
+    /// A ring `block-size` is not a power of two within
+    /// [`MIN_AF_PACKET_BLOCK_SIZE`]..=[`MAX_AF_PACKET_BLOCK_SIZE`].
+    BackendBlockSizeInvalid,
+    /// A ring `block-size` cannot hold one maximum frame with its TPACKET
+    /// headers (RX: block descriptor, packet header, and frame; RX and TX:
+    /// the frame slot the geometry derives from `max-frame-len`).
+    BackendBlockTooSmall,
+    /// A ring `block-count` is outside 1..=[`MAX_AF_PACKET_BLOCK_COUNT`].
+    BackendBlockCountOutOfRange,
+    /// The RX `retire-timeout-ms` is outside
+    /// 1..=[`MAX_AF_PACKET_RETIRE_TIMEOUT_MS`].
+    BackendRetireTimeoutOutOfRange,
+    /// One port's RX plus TX ring exceeds
+    /// [`MAX_AF_PACKET_RING_BYTES_PER_PORT`].
+    BackendRingTooLarge,
+    /// The rings of all ports exceed [`MAX_AF_PACKET_RING_BYTES`].
+    BackendTotalRingTooLarge,
 }
 
 impl ValidationCode {
@@ -304,6 +329,15 @@ impl ValidationCode {
             Self::BackendUmemTooLarge => "BACKEND_UMEM_TOO_LARGE",
             Self::BackendTotalUmemTooLarge => "BACKEND_TOTAL_UMEM_TOO_LARGE",
             Self::BackendNativeProfile => "BACKEND_NATIVE_PROFILE",
+            Self::BackendAfPacketWithoutKind => "BACKEND_AF_PACKET_WITHOUT_KIND",
+            Self::BackendDuplicateInterface => "BACKEND_DUPLICATE_INTERFACE",
+            Self::BackendMaxFrameLenOutOfRange => "BACKEND_MAX_FRAME_LEN_OUT_OF_RANGE",
+            Self::BackendBlockSizeInvalid => "BACKEND_BLOCK_SIZE_INVALID",
+            Self::BackendBlockTooSmall => "BACKEND_BLOCK_TOO_SMALL",
+            Self::BackendBlockCountOutOfRange => "BACKEND_BLOCK_COUNT_OUT_OF_RANGE",
+            Self::BackendRetireTimeoutOutOfRange => "BACKEND_RETIRE_TIMEOUT_OUT_OF_RANGE",
+            Self::BackendRingTooLarge => "BACKEND_RING_TOO_LARGE",
+            Self::BackendTotalRingTooLarge => "BACKEND_TOTAL_RING_TOO_LARGE",
         }
     }
 }
@@ -869,12 +903,167 @@ impl ValidatedAfXdpV1 {
     }
 }
 
+/// Default `max-frame-len` of the AF_PACKET backend: one untagged
+/// 1500-byte-MTU Ethernet II frame without FCS.
+pub const DEFAULT_AF_PACKET_FRAME_LEN: u32 = 1_514;
+/// Smallest AF_PACKET `max-frame-len`: the largest frame the router itself
+/// generates (a 576-byte ICMPv4 error plus the 14-byte Ethernet header),
+/// so every generated frame fits a TX frame.
+pub const MIN_AF_PACKET_FRAME_LEN: u32 = 590;
+/// Largest AF_PACKET `max-frame-len`: a 9216-byte jumbo MTU plus the
+/// Ethernet header.
+pub const MAX_AF_PACKET_FRAME_LEN: u32 = 9_230;
+/// Smallest AF_PACKET ring block (one 4 KiB page).
+pub const MIN_AF_PACKET_BLOCK_SIZE: u32 = 4_096;
+/// Largest AF_PACKET ring block (4 MiB).
+pub const MAX_AF_PACKET_BLOCK_SIZE: u32 = 4 << 20;
+/// Largest AF_PACKET ring block count.
+pub const MAX_AF_PACKET_BLOCK_COUNT: u32 = 65_536;
+/// Largest RX block retire timeout (1 s): a lone frame on an idle port
+/// waits up to this long.
+pub const MAX_AF_PACKET_RETIRE_TIMEOUT_MS: u32 = 1_000;
+/// Largest RX plus TX ring of one AF_PACKET port (256 MiB).
+pub const MAX_AF_PACKET_RING_BYTES_PER_PORT: u64 = 256 << 20;
+/// Largest ring memory of all AF_PACKET ports of one configuration
+/// (1 GiB).
+pub const MAX_AF_PACKET_RING_BYTES: u64 = 1 << 30;
+
+/// `TPACKET_ALIGNMENT`.
+const AF_PACKET_ALIGNMENT: u32 = 16;
+/// Offset of the Ethernet header in a TPACKET_V3 `SOCK_RAW` RX frame: the
+/// network header at `TPACKET_ALIGN(TPACKET3_HDRLEN + 16)` (96) minus the
+/// 14-byte Ethernet header.
+const AF_PACKET_RX_MAC_OFFSET: u32 = 82;
+/// Data offset of a TPACKET_V3 TX frame (`TPACKET3_HDRLEN -
+/// sizeof(struct sockaddr_ll)`).
+const AF_PACKET_TX_DATA_OFFSET: u32 = 48;
+/// `BLK_PLUS_PRIV(0)`: the TPACKET_V3 block descriptor.
+const AF_PACKET_BLOCK_HEADER: u32 = 48;
+
+/// One validated TPACKET_V3 ring: `block_count` blocks of `block_size`
+/// bytes, each cut into `frame_size` slots (the smallest power of two
+/// that holds the kernel's per-frame header and the maximum frame). The
+/// page-size and kernel-layout checks run again when `ruster run` opens
+/// the socket (`ruster-io-afpacket`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AfPacketRingV1 {
+    block_size: u32,
+    block_count: u32,
+    frame_size: u32,
+    retire_timeout_ms: u32,
+}
+
+impl AfPacketRingV1 {
+    #[must_use]
+    pub const fn block_size(self) -> u32 {
+        self.block_size
+    }
+
+    #[must_use]
+    pub const fn block_count(self) -> u32 {
+        self.block_count
+    }
+
+    /// The derived frame slot size.
+    #[must_use]
+    pub const fn frame_size(self) -> u32 {
+        self.frame_size
+    }
+
+    /// `block_size / frame_size * block_count`, saturating (the bounds
+    /// keep it far below `u32::MAX`).
+    #[must_use]
+    pub const fn frame_count(self) -> u32 {
+        (self.block_size / self.frame_size).saturating_mul(self.block_count)
+    }
+
+    /// RX: the block retire timeout; TX: 0.
+    #[must_use]
+    pub const fn retire_timeout_ms(self) -> u32 {
+        self.retire_timeout_ms
+    }
+
+    /// Mapped bytes of the ring.
+    #[must_use]
+    pub const fn byte_len(self) -> u64 {
+        self.block_size as u64 * self.block_count as u64
+    }
+}
+
+/// One validated AF_PACKET socket: an interface's device with checked RX
+/// and TX ring geometry.
+///
+/// The port owns a copy of the bound device name, so two ports compare
+/// unequal when the interface keeps its IfId but moves to another device.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAfPacketPortV1 {
+    interface: IfId,
+    device: Box<str>,
+    rx: AfPacketRingV1,
+    tx: AfPacketRingV1,
+}
+
+impl ValidatedAfPacketPortV1 {
+    /// The bound interface.
+    #[must_use]
+    pub const fn interface(&self) -> IfId {
+        self.interface
+    }
+
+    /// The bound device: the `device` of [`Self::interface`], already
+    /// restricted to the CONFIG-003 label charset.
+    #[must_use]
+    pub fn device(&self) -> &str {
+        &self.device
+    }
+
+    #[must_use]
+    pub const fn rx(&self) -> AfPacketRingV1 {
+        self.rx
+    }
+
+    #[must_use]
+    pub const fn tx(&self) -> AfPacketRingV1 {
+        self.tx
+    }
+}
+
+/// Validated AF_PACKET backend: sockets in interface IfId order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidatedAfPacketV1 {
+    max_frame_len: u32,
+    ports: Box<[ValidatedAfPacketPortV1]>,
+    ring_bytes: u64,
+}
+
+impl ValidatedAfPacketV1 {
+    /// The longest Ethernet frame of every port (each port's MTU must be
+    /// this minus 14).
+    #[must_use]
+    pub const fn max_frame_len(&self) -> u32 {
+        self.max_frame_len
+    }
+
+    /// One socket per interface, sorted by IfId.
+    #[must_use]
+    pub fn ports(&self) -> &[ValidatedAfPacketPortV1] {
+        &self.ports
+    }
+
+    /// Sum of every port's RX and TX ring bytes.
+    #[must_use]
+    pub const fn ring_bytes(&self) -> u64 {
+        self.ring_bytes
+    }
+}
+
 /// Validated packet backend.
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ValidatedBackendV1 {
     Sim,
     AfXdp(ValidatedAfXdpV1),
+    AfPacket(ValidatedAfPacketV1),
 }
 
 impl ValidatedBackendV1 {
@@ -883,15 +1072,25 @@ impl ValidatedBackendV1 {
         match self {
             Self::Sim => BackendKindV1::Sim,
             Self::AfXdp(_) => BackendKindV1::AfXdp,
+            Self::AfPacket(_) => BackendKindV1::AfPacket,
         }
     }
 
-    /// The AF_XDP sockets, or `None` for the simulation backend.
+    /// The AF_XDP sockets, or `None` for another backend.
     #[must_use]
     pub const fn af_xdp(&self) -> Option<&ValidatedAfXdpV1> {
         match self {
-            Self::Sim => None,
             Self::AfXdp(af_xdp) => Some(af_xdp),
+            Self::Sim | Self::AfPacket(_) => None,
+        }
+    }
+
+    /// The AF_PACKET sockets, or `None` for another backend.
+    #[must_use]
+    pub const fn af_packet(&self) -> Option<&ValidatedAfPacketV1> {
+        match self {
+            Self::AfPacket(af_packet) => Some(af_packet),
+            Self::Sim | Self::AfXdp(_) => None,
         }
     }
 }
@@ -2002,15 +2201,23 @@ fn validate_backend(
     interfaces: &[InterfaceBindingV1],
 ) -> Result<ValidatedBackendV1, ValidationError> {
     let ports_path = path(&["backend", "ports"]);
+    if source.kind != BackendKindV1::AfXdp && !source.ports.is_empty() {
+        return Err(ValidationError::new(
+            ValidationCode::BackendPortsWithoutAfXdp,
+            ports_path,
+        ));
+    }
+    if source.kind != BackendKindV1::AfPacket && source.af_packet.is_some() {
+        return Err(ValidationError::new(
+            ValidationCode::BackendAfPacketWithoutKind,
+            path(&["backend", "af-packet"]),
+        ));
+    }
     match source.kind {
-        BackendKindV1::Sim => {
-            if !source.ports.is_empty() {
-                return Err(ValidationError::new(
-                    ValidationCode::BackendPortsWithoutAfXdp,
-                    ports_path,
-                ));
-            }
-            return Ok(ValidatedBackendV1::Sim);
+        BackendKindV1::Sim => return Ok(ValidatedBackendV1::Sim),
+        BackendKindV1::AfPacket => {
+            return validate_af_packet(source.af_packet.unwrap_or_default(), interfaces)
+                .map(ValidatedBackendV1::AfPacket);
         }
         BackendKindV1::AfXdp => {}
     }
@@ -2054,6 +2261,207 @@ fn validate_backend(
         ports: ports.into_boxed_slice(),
         umem_bytes,
     }))
+}
+
+/// Validates `[backend.af-packet]`: the maximum frame, then each port in
+/// source order (interface, RX ring, TX ring, ring bytes), then that every
+/// interface has a port. Bounded like [`validate_backend`]; the result is
+/// sorted by IfId.
+fn validate_af_packet(
+    source: AfPacketV1,
+    interfaces: &[InterfaceBindingV1],
+) -> Result<ValidatedAfPacketV1, ValidationError> {
+    let base = path(&["backend", "af-packet"]);
+    let max_frame_len = source.max_frame_len.unwrap_or(DEFAULT_AF_PACKET_FRAME_LEN);
+    if !(MIN_AF_PACKET_FRAME_LEN..=MAX_AF_PACKET_FRAME_LEN).contains(&max_frame_len) {
+        let limit = if max_frame_len < MIN_AF_PACKET_FRAME_LEN {
+            MIN_AF_PACKET_FRAME_LEN
+        } else {
+            MAX_AF_PACKET_FRAME_LEN
+        };
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendMaxFrameLenOutOfRange,
+            child_path(&base, "max-frame-len"),
+            u64::from(limit),
+            u64::from(max_frame_len),
+        ));
+    }
+    let ports_path = child_path(&base, "ports");
+    if source.ports.is_empty() {
+        return Err(ValidationError::new(
+            ValidationCode::BackendNoPorts,
+            ports_path,
+        ));
+    }
+    let mut ports: Vec<ValidatedAfPacketPortV1> = Vec::with_capacity(source.ports.len());
+    let mut ring_bytes = 0_u64;
+    for (index, port) in source.ports.iter().enumerate() {
+        let mut port_path = ports_path.clone();
+        port_path.push_index(index);
+        let validated =
+            validate_af_packet_port(port, interfaces, &ports, max_frame_len, &port_path)?;
+        let bytes = validated.rx.byte_len() + validated.tx.byte_len();
+        ring_bytes = ring_bytes
+            .checked_add(bytes)
+            .filter(|total| *total <= MAX_AF_PACKET_RING_BYTES)
+            .ok_or_else(|| {
+                ValidationError::bounded(
+                    ValidationCode::BackendTotalRingTooLarge,
+                    child_path(&port_path, "rx"),
+                    MAX_AF_PACKET_RING_BYTES,
+                    ring_bytes.saturating_add(bytes),
+                )
+            })?;
+        ports.push(validated);
+    }
+    for (index, interface) in interfaces.iter().enumerate() {
+        if !ports.iter().any(|port| port.interface == interface.id) {
+            return Err(ValidationError::new(
+                ValidationCode::BackendInterfaceUnbound,
+                child_path(&indexed_path("interfaces", index), "name"),
+            ));
+        }
+    }
+    ports.sort_unstable_by_key(|port| port.interface);
+    Ok(ValidatedAfPacketV1 {
+        max_frame_len,
+        ports: ports.into_boxed_slice(),
+        ring_bytes,
+    })
+}
+
+/// The smallest power-of-two frame slot that holds `offset` bytes of
+/// TPACKET header and a `max_frame_len` frame, `TPACKET_ALIGNMENT`
+/// aligned (both bounded, so nothing overflows).
+const fn af_packet_frame_size(offset: u32, max_frame_len: u32) -> u32 {
+    let aligned = (offset + max_frame_len).div_ceil(AF_PACKET_ALIGNMENT) * AF_PACKET_ALIGNMENT;
+    aligned.next_power_of_two()
+}
+
+fn validate_af_packet_port(
+    port: &AfPacketPortV1,
+    interfaces: &[InterfaceBindingV1],
+    earlier: &[ValidatedAfPacketPortV1],
+    max_frame_len: u32,
+    base: &SourcePath,
+) -> Result<ValidatedAfPacketPortV1, ValidationError> {
+    let binding = interfaces
+        .iter()
+        .find(|binding| binding.name() == port.interface)
+        .ok_or_else(|| {
+            ValidationError::new(
+                ValidationCode::UnknownInterface,
+                child_path(base, "interface"),
+            )
+        })?;
+    let interface = binding.id();
+    // Interface devices are unique, so the same IfId is the same device.
+    if earlier.iter().any(|other| other.interface == interface) {
+        return Err(ValidationError::new(
+            ValidationCode::BackendDuplicateInterface,
+            child_path(base, "interface"),
+        ));
+    }
+    let rx_path = child_path(base, "rx");
+    let rx_frame = af_packet_frame_size(AF_PACKET_RX_MAC_OFFSET, max_frame_len);
+    // An RX block holds its descriptor, then a packet header and the frame.
+    let rx_minimum =
+        (AF_PACKET_BLOCK_HEADER + AF_PACKET_RX_MAC_OFFSET + max_frame_len).max(rx_frame);
+    let rx = af_packet_ring(
+        port.rx.block_size,
+        port.rx.block_count,
+        rx_frame,
+        rx_minimum,
+        &rx_path,
+    )?;
+    if !(1..=MAX_AF_PACKET_RETIRE_TIMEOUT_MS).contains(&port.rx.retire_timeout_ms) {
+        let limit = if port.rx.retire_timeout_ms == 0 {
+            1
+        } else {
+            MAX_AF_PACKET_RETIRE_TIMEOUT_MS
+        };
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendRetireTimeoutOutOfRange,
+            child_path(&rx_path, "retire-timeout-ms"),
+            u64::from(limit),
+            u64::from(port.rx.retire_timeout_ms),
+        ));
+    }
+    let rx = AfPacketRingV1 {
+        retire_timeout_ms: port.rx.retire_timeout_ms,
+        ..rx
+    };
+    let tx_frame = af_packet_frame_size(AF_PACKET_TX_DATA_OFFSET, max_frame_len);
+    let tx = af_packet_ring(
+        port.tx.block_size,
+        port.tx.block_count,
+        tx_frame,
+        tx_frame,
+        &child_path(base, "tx"),
+    )?;
+    let bytes = rx.byte_len() + tx.byte_len();
+    if bytes > MAX_AF_PACKET_RING_BYTES_PER_PORT {
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendRingTooLarge,
+            rx_path,
+            MAX_AF_PACKET_RING_BYTES_PER_PORT,
+            bytes,
+        ));
+    }
+    Ok(ValidatedAfPacketPortV1 {
+        interface,
+        device: binding.device().into(),
+        rx,
+        tx,
+    })
+}
+
+/// One ring's `block-size` and `block-count` with the derived frame slot.
+fn af_packet_ring(
+    block_size: u32,
+    block_count: u32,
+    frame_size: u32,
+    minimum_block: u32,
+    base: &SourcePath,
+) -> Result<AfPacketRingV1, ValidationError> {
+    let size_path = child_path(base, "block-size");
+    if !block_size.is_power_of_two()
+        || !(MIN_AF_PACKET_BLOCK_SIZE..=MAX_AF_PACKET_BLOCK_SIZE).contains(&block_size)
+    {
+        return Err(ValidationError::new(
+            ValidationCode::BackendBlockSizeInvalid,
+            size_path,
+        ));
+    }
+    // Both are powers of two: a block at least as large as the frame slot
+    // is a whole number of slots.
+    if block_size < minimum_block {
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendBlockTooSmall,
+            size_path,
+            u64::from(minimum_block.next_power_of_two()),
+            u64::from(block_size),
+        ));
+    }
+    if !(1..=MAX_AF_PACKET_BLOCK_COUNT).contains(&block_count) {
+        let limit = if block_count == 0 {
+            1
+        } else {
+            MAX_AF_PACKET_BLOCK_COUNT
+        };
+        return Err(ValidationError::bounded(
+            ValidationCode::BackendBlockCountOutOfRange,
+            child_path(base, "block-count"),
+            u64::from(limit),
+            u64::from(block_count),
+        ));
+    }
+    Ok(AfPacketRingV1 {
+        block_size,
+        block_count,
+        frame_size,
+        retire_timeout_ms: 0,
+    })
 }
 
 fn validate_af_xdp_port(
@@ -2254,6 +2662,13 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
             backend.ports.len(),
             crate::MAX_BACKEND_PORTS,
         )?;
+        if let Some(af_packet) = &backend.af_packet {
+            check_list_bound(
+                path(&["backend", "af-packet", "ports"]),
+                af_packet.ports.len(),
+                crate::MAX_BACKEND_PORTS,
+            )?;
+        }
     }
 
     let mut text = TextBudget { used: 0 };

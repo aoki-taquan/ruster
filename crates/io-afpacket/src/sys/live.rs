@@ -74,7 +74,7 @@ impl AfPacketIo {
     /// its own MAC plus broadcast and multicast, and TX goes through the
     /// device's qdisc. Requires `CAP_NET_RAW`.
     ///
-    /// # Exposure / not yet enforced
+    /// # Exposure
     ///
     /// AF_PACKET receives *copies*: unlike AF_XDP it does not take frames
     /// away from the kernel, so the kernel stack still sees and processes
@@ -83,9 +83,8 @@ impl AfPacketIo {
     /// kernel route, or a forwarding role, that `rp_filter` and IPv6
     /// (`disable_ipv6=1`) leave the kernel nothing to answer, and that the
     /// configured maximum frame does not exceed the device MTU plus 14.
-    /// `ruster run` does not select this backend yet; until its startup
-    /// checks enforce this exposure model (AFPKT-015) the backend is not
-    /// production-ready.
+    /// `ruster run` (`backend.kind = "af-packet"`, AFPKT-015) enforces this
+    /// before it calls `open` and watches it while it runs.
     pub fn open(config: ValidatedConfig) -> Result<Self, PlatformError> {
         super::validated_uapi_layout()?;
         Ok(Self {

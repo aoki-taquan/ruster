@@ -1083,7 +1083,7 @@ attached to the running router; the Rust test
 |---|---|---|
 | `sendto` (44) | — | router: AF_XDP TX kick and the systemd notifications (H10, on the socket opened before the filter); link watcher: netlink requests (`send`) |
 | `poll` (7) | — | router: the idle wait on every port socket (section 7, H9) and the Fill-ring wakeup of the need-wakeup profile; glibc's `poll()` is this syscall on x86_64, never `ppoll` |
-| `getsockopt` (55) | — | router: `XDP_STATISTICS` per stats sample |
+| `getsockopt` (55) | (level, option) one of `(SOL_XDP, XDP_STATISTICS)`, `(SOL_PACKET, PACKET_STATISTICS)`, `(SOL_SOCKET, SO_ERROR)` | router: AF_XDP `XDP_STATISTICS` per stats sample; AF_PACKET `PACKET_STATISTICS` per health sample and `SO_ERROR` after a `POLLERR` (AFPKT-015) |
 | `clock_nanosleep` (230), `nanosleep` (35), `restart_syscall` (219) | — | the 1 ms fallback sleep of the idle wait, the reload quiescence pause, the drain, and every `thread::sleep` (`nanosleep` where the C library's sleep uses it: older glibc, musl); resuming one a signal interrupted |
 | `clock_gettime` (228) | — | the monotonic clock (normally a vDSO call; this syscall without a vDSO) |
 | `futex` (202), `sched_yield` (24) | — | channels between the threads; std's channels back off with `yield_now` in disconnect and preemption races (dropping the worker and output channels) |
@@ -2173,60 +2173,188 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   (XDP-062). A TX stall with the link up (`TX_STALL`) cannot be produced
   on veth and is tested only against a scripted kernel (CLI-050).
 
-### AF_PACKET backend (AP3, not selectable yet)
+### AF_PACKET backend (AFPKT-015)
 
-`ruster run` drives AF_XDP only. The AF_PACKET backend
-(`ruster-io-afpacket::AfPacketIo`, AFPKT-008 to AFPKT-014) is complete as a
-library and proven on veth inside a namespace, but `backend.kind =
-"af-packet"` does not exist yet (AFPKT-015, the next slice). What an
-operator should know before choosing it once it is wired:
+`ruster run` drives either backend; `backend.kind` selects it. AF_XDP stays
+the primary backend. AF_PACKET (`ruster-io-afpacket::AfPacketIo`, AP3) is
+the debug/fallback backend: it needs no XDP program, no `CAP_BPF`, no
+`RLIMIT_MEMLOCK`, and no single-queue or RSS steering, only `CAP_NET_RAW`,
+so it runs where XDP attach is impossible (a driver or kernel without XDP,
+a device that already carries a foreign XDP program, a container without
+BPF privileges).
 
-- **Backend choice.** AF_XDP stays the primary backend. AF_PACKET is the
-  debug/fallback backend: it needs no XDP program, no `CAP_BPF`, no
-  `RLIMIT_MEMLOCK`, and no single-queue or RSS steering, only `CAP_NET_RAW`,
-  so it runs where XDP attach is impossible (a driver or kernel without XDP,
-  a device that already carries a foreign XDP program, a container without
-  BPF privileges).
-- **Exposure model.** An AF_XDP port's frames are redirected away from the
-  kernel stack (frames outside the bound queue are dropped). An AF_PACKET
-  socket only receives a *copy*: the kernel stack still processes every
-  frame of the port. A port must therefore carry no kernel IPv4 or IPv6
-  address and no kernel route, IPv4 forwarding must stay off, and IPv6
-  should be disabled on the port (`disable_ipv6=1`), so the kernel drops
-  the IP frames it sees and answers no ARP or neighbor discovery. The
-  existing kernel-exposure startup checks (section 5) are mandatory for
-  AF_PACKET, not a hardening extra. The socket sets
-  `PACKET_IGNORE_OUTGOING` (the router never receives its own TX) and asks
-  for no promiscuous mode: like the AF_XDP path, the port receives frames
-  for its own MAC plus broadcast and multicast.
-- **Latency.** TPACKET_V3 hands a block to userspace when it is full or its
-  retire timer fires. An idle port therefore delivers a lone frame up to
-  the RX `retire_timeout_ms` late; use 1 ms for a router.
-- **Performance expectation (not measured).** Every forwarded frame is
-  copied once into a TX frame (router-generated ARP/ICMP frames are not
-  copied: they are written into the TX ring directly), the kernel stack
-  processes each received frame a second time, and TX goes through the
-  device qdisc. Expect throughput below AF_XDP copy mode; no number is
-  claimed.
-- **Stats.** `af_packet.*` and `af_packet_port.*` (OBS-028): RX packets and
-  faults, TX published/copies/completed/ring full, kicks deferred, link
-  down, errors, retries and suppressed retries, generated frames, and the
-  kernel's `tp_packets`/`tp_drops`/`tp_freeze_q_cnt` (folded in only by a
-  cold refresh, because reading them resets them). A growing `kernel_drops`
-  means the RX ring is too small or the router thread too slow.
-- **Kicks on a down link** (`ENETDOWN`) are a link state, not an error:
-  frames stay in the TX ring and the owed kick is retried at most about 16
-  times a second (1 ms doubling to 64 ms) until the link is back. `ENXIO`
-  means the port's device was unregistered: that is permanent, reported as
-  an error, the port is marked `unbound` and never kicked again; restart
-  the router with the device back.
-- **Notes for the integration (AFPKT-015).** A down egress with queued TX
-  keeps those frames in flight, and a reload waits for in-flight TX to
-  drain (publication quiescence), so a SIGHUP reload during such an outage
-  is held back until the reload quiesce timeout. The kernel's
-  `PACKET_STATISTICS` counters are 32-bit and reset on every read; the
-  integration must refresh them periodically (for example with the stats
-  interval), not only at exit, so they neither wrap nor lose drops.
+**Selecting it.** Replace the `[backend]` section:
+
+```toml
+[backend]
+kind = "af-packet"
+
+[backend.af-packet]
+max-frame-len = 1514            # optional, default 1514; every port's device MTU must be at most this - 14
+
+[[backend.af-packet.ports]]     # one per [[interfaces]] entry
+interface = "lan"
+rx = { block-size = 65536, block-count = 8, retire-timeout-ms = 2 }
+tx = { block-size = 65536, block-count = 4 }
+
+[[backend.af-packet.ports]]
+interface = "wan"
+rx = { block-size = 65536, block-count = 8, retire-timeout-ms = 2 }
+tx = { block-size = 65536, block-count = 4 }
+```
+
+- `block-size` is a power of two from 4096 to 4 MiB (and a multiple of the
+  page size, checked when the socket opens), `block-count` 1 to 65536,
+  `retire-timeout-ms` 1 to 1000; `max-frame-len` 590 to 9230. The frame
+  slot is derived (the smallest power of two that holds the kernel's
+  per-frame header and `max-frame-len`: 2048 for 1514), so the TX ring holds
+  `block-size / slot * block-count` frames (128 in the example) and an RX
+  block at least one frame. One port's rings are at most 256 MiB, all
+  ports' at most 1 GiB (`ruster validate` prints `ring-bytes=`).
+- Every backend change (kind, `max-frame-len`, any ring value) is
+  restart-required (`ruster plan` shows `backend ~ ...`,
+  `backend af-packet max-frame-len ~ ...`, `backend-af-packet-port ...`;
+  `restart-required: BACKEND`); a SIGHUP reload refuses it.
+- `ruster run` startup line, stats, reload, drop, Landlock, seccomp, and
+  the exit statuses are those of AF_XDP. The shutdown summary ends in
+  `closed N port(s)` (there is nothing to detach). Exit 4 without
+  `CAP_NET_RAW` prints `run as root or grant CAP_NET_RAW`.
+
+**Exposure model.** An AF_XDP port's frames are redirected away from the
+kernel stack. An AF_PACKET socket only receives a *copy*: the kernel stack
+keeps processing every frame of the port while the router runs, as well
+as before and after it. So the kernel must have nothing to act on:
+
+- Startup refuses, per port, exactly what it refuses for AF_XDP (section
+  5): kernel IPv4 addresses or routes, IPv4 forwarding (`ip_forward`, the
+  device's `forwarding`, `mc_forwarding`), the weak host (`rp_filter` 0),
+  and IPv6 enabled on the port, with the same overrides
+  (`--allow-kernel-forwarding`, `--allow-ipv4-weak-host`,
+  `--allow-kernel-ipv6`). The RX queue count does not matter (a packet
+  socket receives from every queue; no `--allow-multi-queue` needed).
+- In addition: the device MTU must be at most `max-frame-len - 14`
+  (`MTU_ABOVE_FRAME mtu= limit=`: longer frames would be truncated by the
+  RX ring and dropped; a raise above it while running is fatal too). A
+  smaller device MTU is fine: the router never sends a frame above an
+  interface's configured `mtu` (MTU1: Fragmentation Needed instead), which
+  may not exceed the device MTU, and a decrease while running is fatal
+  (`MTU_DECREASED`). So mixed MTUs share one `max-frame-len`, the largest
+  port's MTU plus 14: a 9000-byte LAN and a 1500-byte WAN run with
+  `max-frame-len = 9014` (the rings then hold 9014-byte frames for both).
+  The port must not be enslaved to a bridge, bond, team, or VRF, and no
+  device of the router's namespace may be stacked on it: a VLAN, macvlan,
+  ipvlan, or MACsec device on the port, or the port's veth peer in the
+  same namespace (`KERNEL_UPPER_DEVICE`: a bridge forwards every frame
+  around the router, a macvlan delivers frames to its own stack). Devices
+  stacked on the port are found with one link dump of the namespace
+  (`IFLA_LINK` is the port and no `IFLA_LINK_NETNSID`; a failed dump is
+  `UNVERIFIABLE probe=upper-devices`), at startup and at every link round
+  while running (one dump per round for all AF_PACKET ports together),
+  where one is fatal (`fatal: port=ifN
+  health=KERNEL_UPPER_DEVICE`), as is the port becoming enslaved. A device
+  stacked on the port *from another namespace* (a macvlan or ipvlan created
+  in, or moved to, a container's namespace) carries `IFLA_LINK_NETNSID`
+  and is not in this namespace's dump: the router cannot see it, so keeping
+  the ports free of such devices is the operator's responsibility. Finally,
+  no merging receive offload may be active
+  (`RECEIVE_OFFLOAD feature=rx-gro|rx-lro|rx-gro-hw`; a packet socket sees
+  frames after GRO, so merged super-frames would be truncated and dropped;
+  `UNVERIFIABLE probe=offloads` if the features cannot be read). Fix:
+  `ethtool -K <dev> gro off lro off`, and set the MTU. The configured
+  `[[interfaces]] mtu` (MTU1) is checked as for AF_XDP: above the device
+  MTU refused (`MTU_BELOW_CONFIG`), below it warned (`MTU_BELOW_DEVICE`).
+- While running, the link watch's kernel exposure conditions are **fatal**
+  for AF_PACKET (under AF_XDP they only warn): a kernel address or route
+  appearing on a port, forwarding turning on, `rp_filter` dropping to 0,
+  IPv6 turning on (or an IPv6 address, route, or forwarding with it) print
+  the warning and then `fatal: port=ifN health=<same code>`; the router
+  drains and exits 1, and the next start refuses until it is fixed.
+  Stopping does not reduce the kernel's exposure (it was already acting on
+  every frame), but it makes the misconfiguration visible at once instead
+  of letting the kernel answer, deliver, or forward in parallel. What an
+  override accepted at startup stays a warning. A GRO toggle or a new
+  upper device at run time is fatal (above). Receive offloads are not
+  watched while running (the probe is an ioctl the syscall filter does not
+  allow): turning GRO or LRO back on shows as growing
+  `ifN.af_packet_port.rx_packet_faults` (merged super-frames truncated and
+  dropped) and TCP through the router stalling under load; turn it off
+  again (`ethtool -K <dev> gro off lro off`), and the next start refuses it
+  anyway.
+- The kernel sends nothing of its own on a correctly configured port: no
+  IPv4 address means no ARP and no IGMP report source, `disable_ipv6=1`
+  means no neighbor discovery or MLD, and forwarding off with `rp_filter`
+  1 means a received IP frame is dropped (`ip_error` sends no ICMP while
+  forwarding is off). The privileged smoke checks that every frame the
+  router's devices transmitted during a run was one the router sent. A
+  local socket that joins a multicast group on a port would make the
+  kernel send IGMP reports; do not run other services on the ports.
+- The socket sets `PACKET_IGNORE_OUTGOING` (the router never receives its
+  own TX) and requests no promiscuous mode: the port receives frames for
+  its own MAC plus broadcast and multicast, as with AF_XDP.
+
+**Performance (not measured).** Every forwarded frame is copied once into a
+TX frame (router-generated ARP/ICMP is written into the TX ring directly),
+the kernel stack processes each received frame a second time, and TX goes
+through the device qdisc. Expect throughput well below AF_XDP copy mode;
+no number is claimed. TPACKET_V3 hands an RX block to the router when it
+is full or its retire timer fires, so an idle port delivers a lone frame
+up to `retire-timeout-ms` late; 1 to 2 ms suits a router (the timer runs in
+the kernel, not in the router thread). A growing `kernel_drops` means the
+RX ring is too small (more or larger blocks) or the router thread too slow.
+
+**Link dump cost and churn.** The dump reads every link of the router's
+namespace once per link round (every second), whatever the port count,
+into the watcher's reused 32 KiB buffer. On a namespace with thousands of
+links (a Kubernetes node with about 2000 veths) that is a few MB of
+rtnetlink replies per second and an RTNL hold per round: run the router in
+its own namespace with only its ports, as recommended. A dump that link
+changes interrupt (`NLM_F_DUMP_INTR`) is retried within the round; a
+device any attempt listed is still reported (fatal `KERNEL_UPPER_DEVICE`:
+it existed then), so churn cannot hide one; a round whose every attempt
+was interrupted without listing one is a failed query counted apart, and
+only 10 such rounds in a row (`LINK_DUMP_INTERRUPTED_FATAL`) end the run
+with `LINK_UNVERIFIABLE`; other dump failures are fatal after 3, as for
+the other queries.
+
+**Kernel memory.** The TPACKET rings are kernel pages allocated when the
+sockets open: up to 256 MiB per port and 1 GiB in all (the validation
+bounds, `ring-bytes=` in `ruster validate`). They are not charged to
+`RLIMIT_MEMLOCK` and, as `packet_mmap` ring pages, not to the memory cgroup
+of the service either, so a container or systemd `MemoryMax=` does not
+bound them: size the rings for the host, not for the cgroup.
+
+**Stats.** `af_packet.*` (sum) and `ifN.af_packet_port.*` (per port,
+OBS-028): RX packets and faults, TX published/copies/completed/ring full/
+oversize, kicks (deferred, link down, unbound, errors, retries,
+suppressed), generated frames, `socket_errors` (a pending socket error the
+idle wait read and cleared after the port went down or away), and the
+kernel's `tp_packets`/`tp_drops`/`tp_freeze_q_cnt` as `kernel_packets`/
+`kernel_drops`/`kernel_freeze_q`, folded in at every health sample (every
+500 ms; the kernel keeps them in 32-bit counters that reset on read).
+
+**Troubleshooting.**
+
+| Symptom | Cause and fix |
+|---|---|
+| `stage=checks port=ifN code=RECEIVE_OFFLOAD feature=rx-gro` | GRO (or LRO, hardware GRO) on: `ethtool -K <dev> gro off lro off` |
+| `code=MTU_ABOVE_FRAME mtu=M limit=L` | lower the port MTU to at most `max-frame-len - 14`, or raise `max-frame-len` (restart-required) |
+| `code=MTU_BELOW_CONFIG mtu=M config=C` | the interface's configured `mtu` is above the device MTU: raise the device MTU or lower `mtu` (MTU1) |
+| `code=KERNEL_UPPER_DEVICE` (startup or `fatal: ... health=KERNEL_UPPER_DEVICE`) | remove the port from its bridge/bond/team/VRF, and delete the VLAN/macvlan/ipvlan/MACsec devices on it (`ip -d link show` lists `@<port>`); a veth pair needs its peer in another namespace |
+| `code=UNVERIFIABLE probe=upper-devices` | the namespace's link dump failed (rtnetlink); retry, check the kernel log |
+| `af_packet_port.rx_packet_faults` grows, TCP stalls under load | GRO or LRO was turned on while running (not watched): `ethtool -K <dev> gro off lro off`; the next start refuses it |
+| `code=UNVERIFIABLE probe=link` at startup | the configured device does not exist in the router's network namespace |
+| `stage=open code=CONFIG.RING...` | the ring geometry does not fit this system's page size (a 16 or 64 KiB page needs blocks of at least that size) |
+| `stage=open code=SOCKET/ERRNO_1` | no `CAP_NET_RAW` in the namespace that opens the socket |
+| `fatal: port=ifN health=KERNEL_...` while running | a kernel address, route, forwarding, weak host, or IPv6 appeared on the port; remove it, then restart |
+| `fatal: port=ifN health=DEVICE_REMOVED` | the port's device was deleted (rtnetlink `ENODEV`, or a TX kick found it gone with `ENXIO`, which also strands its in-flight TX); restart with the device back |
+| `warning: port=ifN health=LINK_DOWN` | carrier lost or the port set down: frames queue in the TX ring and the owed kick is retried at most about 16 times a second until the link is back; a reload waits for those frames (publication quiescence) and is abandoned after the quiesce timeout |
+| `kernel_drops` grows | RX ring too small or router overloaded |
+
+**Notes.** A down egress with queued TX keeps those frames in flight, and a
+SIGHUP reload during such an outage is held back until the link returns or
+the reload quiesce timeout passes. AF_PACKET runs are x86_64 Linux only
+(as `ruster run`), 64-bit, and verified on veth in the privileged smoke
+only; no real NIC has been tried.
 
 ## 13. CI and E2E
 
@@ -2249,8 +2377,8 @@ What it proves, on the runner's kernel only:
 - The native layer on a real kernel: `scripts/priv-xdp-smoke.sh` (the
   `priv_xdp_*` phases: session, attach, engine, tx, generated, adapter,
   foreign program, SIGKILL holder).
-- The AF_PACKET live adapter on a real kernel (AP3, library level, not
-  `ruster run`): `scripts/priv-afpacket-smoke.sh` (`priv_afpacket_*`):
+- The AF_PACKET live adapter on a real kernel (AP3, library level):
+  `scripts/priv-afpacket-smoke.sh` (`priv_afpacket_*`):
   idle poll, core forwarding between two veth ports, a generated burst,
   a link flap, a failed open that releases its first port, drain and close.
 - The operator flows of sections 5 to 10 end to end:
@@ -2412,6 +2540,31 @@ What it proves, on the runner's kernel only:
   is last, and `notify.sent` equals the datagrams received) and
   `priv_run_rename` (`ip link set ra down` and `name rx` while running:
   exit 1 `DEVICE_RENAMED`, nothing attached).
+  Added by AFPKT-015 (last, after the AF_XDP removal, recreating ra/pa):
+  `ruster run` with `backend.kind = "af-packet"` (the AF_PACKET backend
+  section above). Markers `priv_run_afpacket_config` (the af-packet
+  configs validate with `ring-bytes=786432`; a firewall change plans
+  reloadable, a ring change and af-xdp -> af-packet restart-required
+  `BACKEND`), `priv_run_afpacket_refusals` (GRO on ra
+  `RECEIVE_OFFLOAD feature=rx-gro`, rb MTU 1400 `MTU_BELOW_CONFIG`, a kernel
+  address on rb `KERNEL_IPV4_ADDRESSES`, a VLAN on ra
+  `KERNEL_UPPER_DEVICE`: exit 1, no packet socket in the
+  namespace's `/proc/net/packet`), `priv_run_afpacket_forward` (UDP with
+  NAT44 to host B, 3 of 3 pings of 192.168.1.1 answered, every thread
+  dropped and under the kill filter, Landlock, two packet sockets open),
+  `priv_run_afpacket_reload` (deny applied, allow applied, a ring change
+  refused `RESTART_REQUIRED reasons=BACKEND` while forwarding),
+  `priv_run_afpacket_link` (pb down/up: `LINK_DOWN` warned and recovered;
+  ra down/up: `if1.af_packet_port.socket_errors >= 1` and over the next
+  1.5 s the idle wait keeps blocking (at most 20 more sleeps, at least 20
+  more waits); forwarding after each), `priv_run_afpacket_shutdown`
+  (SIGTERM exit 0 with nothing in flight and `closed 2 port(s)`, no packet
+  socket left, final `af_packet.*`, and on ra and rb no more frames
+  transmitted than the router completed: the kernel sent none of its own)
+  `priv_run_afpacket_upper` (a bridge in the router namespace enslaving
+  rb while running: exit 1 `KERNEL_UPPER_DEVICE`, no packet socket left)
+  and `priv_run_afpacket_removal` (`ip link del rb` while running: exit 1
+  `DEVICE_REMOVED`, no packet socket left).
 - Nothing is left behind: a final step fails if any `ruster-*` namespace
   survives. Smoke logs are uploaded as an artifact when the job fails.
 

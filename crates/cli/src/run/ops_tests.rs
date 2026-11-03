@@ -434,7 +434,7 @@ fn an_applied_reload_without_its_report_is_not_kept_running() {
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
-        super::super::finished(&ran, 2, &[], &mut out, &mut err),
+        super::super::finished(&ran, 2, &[], true, &mut out, &mut err),
         EXIT_RUNTIME
     );
     assert!(String::from_utf8(err)
@@ -650,6 +650,7 @@ fn device_removal_and_mtu_violations_fail_closed_with_exit_1() {
             rx_queues: Some(1),
             admin_up: true,
             lower_up: true,
+            master: None,
         })
     };
     let renamed = Ok(LinkFacts {
@@ -679,6 +680,7 @@ fn a_link_down_and_up_keeps_running_and_is_counted() {
         rx_queues: Some(1),
         admin_up: false,
         lower_up: false,
+        master: None,
     });
     {
         let mut links = host.state.links.borrow_mut();
@@ -692,6 +694,7 @@ fn a_link_down_and_up_keeps_running_and_is_counted() {
         rx_queues: Some(1),
         admin_up: true,
         lower_up: true,
+        master: None,
     });
     host.state.links.borrow_mut().push_back((IfId(WAN), raised));
     host.state
@@ -735,6 +738,7 @@ fn a_persistent_tx_stall_fails_closed_with_exit_1() {
             fill_starved: 0,
             fill_ring_occupancy: 8,
             rx_packets: 0,
+            device_gone: false,
         }]
     });
     host.state.samples.borrow_mut().extend(rounds);
@@ -1411,6 +1415,7 @@ fn a_fatal_event_is_notified_as_stopping() {
         rx_queues: Some(1),
         admin_up: true,
         lower_up: true,
+        master: None,
     });
     host.state
         .links

@@ -1268,6 +1268,135 @@ fn af_xdp_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim(
     );
 }
 
+const AF_PACKET_BACKEND: &str = r#"
+[backend]
+kind = "af-packet"
+
+[backend.af-packet]
+max-frame-len = 1514
+
+[[backend.af-packet.ports]]
+interface = "wan"
+rx = { block-size = 65536, block-count = 4, retire-timeout-ms = 4 }
+tx = { block-size = 65536, block-count = 2 }
+
+[[backend.af-packet.ports]]
+interface = "lan"
+rx = { block-size = 131072, block-count = 2, retire-timeout-ms = 10 }
+tx = { block-size = 65536, block-count = 2 }
+"#;
+
+/// AFPKT-015: `validate` and `plan` accept the AF_PACKET backend with the
+/// production limits; a backend change is restart-required with typed
+/// per-port lines; `run-sim` refuses it.
+#[test]
+fn af_packet_backend_validates_plans_as_restart_required_and_is_refused_by_run_sim() {
+    let dir = scratch();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let packet = dir.join("router-af-packet.toml");
+    fs::write(&packet, format!("{v1}{AF_PACKET_BACKEND}")).unwrap();
+
+    let ok = ruster(&["validate".as_ref(), packet.as_os_str()]);
+    assert_eq!(status(&ok), 0, "{}", text(&ok.stderr));
+    assert_eq!(
+        text(&ok.stdout),
+        "valid: schema-version=1 interfaces=2 routes=3 neighbors=1 local-ipv4=2 \
+         firewall-rules=3 services=resolution,icmpv4-errors,nat44-udp,nat44-tcp,firewall \
+         storage-bytes=56480 backend=af-packet ports=2 max-frame-len=1514 ring-bytes=786432\n"
+    );
+
+    let current = fixtures().join("router-v1.toml");
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), packet.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    let stdout = text(&plan.stdout);
+    assert!(
+        stdout.starts_with(
+            "plan: restart-required\nrestart-required: BACKEND\nchanges: 4\n\
+             \x20 backend ~ sim -> af-packet\n\
+             \x20 backend af-packet max-frame-len ~ none -> 1514\n\
+             \x20 backend-af-packet-port + if1 dev sim0 rx 2x131072 frame 2048 retire 10 ms \
+             tx 2x65536 frame 2048\n\
+             \x20 backend-af-packet-port + if2 dev sim1 rx 4x65536 frame 2048 retire 4 ms \
+             tx 2x65536 frame 2048\n\
+             expected-flush:\n"
+        ),
+        "{stdout}"
+    );
+    // One ring setting: a typed `~` line for that port only.
+    let longer = dir.join("router-af-packet-longer.toml");
+    fs::write(
+        &longer,
+        format!(
+            "{v1}{}",
+            AF_PACKET_BACKEND.replacen("retire-timeout-ms = 4", "retire-timeout-ms = 8", 1)
+        ),
+    )
+    .unwrap();
+    let plan = ruster(&["plan".as_ref(), packet.as_os_str(), longer.as_os_str()]);
+    let stdout = text(&plan.stdout);
+    assert!(
+        stdout.starts_with(
+            "plan: restart-required\nrestart-required: BACKEND\nchanges: 1\n\
+             \x20 backend-af-packet-port ~ if2 dev sim1 rx 4x65536 frame 2048 retire 4 ms \
+             tx 2x65536 frame 2048 -> if2 dev sim1 rx 4x65536 frame 2048 retire 8 ms \
+             tx 2x65536 frame 2048\n"
+        ),
+        "{stdout}"
+    );
+    // AF_XDP to AF_PACKET: every port of each is removed or added.
+    let xdp = dir.join("router-af-xdp.toml");
+    fs::write(&xdp, format!("{v1}{AF_XDP_BACKEND}")).unwrap();
+    let plan = ruster(&["plan".as_ref(), xdp.as_os_str(), packet.as_os_str()]);
+    let stdout = text(&plan.stdout);
+    assert!(
+        stdout.starts_with("plan: restart-required\nrestart-required: BACKEND\nchanges: 6\n")
+            && stdout.contains("  backend ~ af-xdp -> af-packet\n")
+            && stdout.contains("  backend-port - if1 dev sim0 ")
+            && stdout.contains("  backend-af-packet-port + if2 dev sim1 "),
+        "{stdout}"
+    );
+    let same = ruster(&["plan".as_ref(), packet.as_os_str(), packet.as_os_str()]);
+    assert!(
+        text(&same.stdout).starts_with("plan: reloadable\nrestart-required: none\nchanges: 0\n")
+    );
+
+    // A rule violation is a value-free path.
+    let bad = dir.join("router-af-packet-bad.toml");
+    fs::write(
+        &bad,
+        format!(
+            "{v1}{}",
+            AF_PACKET_BACKEND.replacen("retire-timeout-ms = 4", "retire-timeout-ms = 0", 1)
+        ),
+    )
+    .unwrap();
+    let output = ruster(&["validate".as_ref(), bad.as_os_str()]);
+    assert_eq!(status(&output), 2);
+    assert_eq!(
+        text(&output.stderr),
+        "ruster: invalid config: stage=validate code=BACKEND_RETIRE_TIMEOUT_OUT_OF_RANGE \
+         path=backend.af-packet.ports[0].rx.retire-timeout-ms limit=1 actual=0\n"
+    );
+
+    fs::write(
+        dir.join("scenario.toml"),
+        "schema = \"ruster-scenario/v1\"\nseed = 1\nconfig = \"router-af-packet.toml\"\n",
+    )
+    .unwrap();
+    let scenario = dir.join("scenario.toml");
+    let output = ruster(&[
+        "run-sim".as_ref(),
+        "--scenario".as_ref(),
+        scenario.as_os_str(),
+    ]);
+    assert_eq!(status(&output), 2);
+    assert_eq!(
+        text(&output.stderr),
+        "ruster run-sim: invalid initial config: initial config rejected at backend: \
+         UNSUPPORTED_BACKEND\n"
+    );
+}
+
 /// `ruster run` refuses the simulation backend (pointing to `run-sim`) and
 /// an unreadable config with the documented statuses, before any signal
 /// handler, key source, or socket.

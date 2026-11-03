@@ -78,6 +78,10 @@ impl PacketOps for FixtureOps {
         Ok(crate::sys::TpacketStatsV3::default())
     }
 
+    fn take_socket_error(&mut self, _fd: RawFd) -> Result<i32, PlatformError> {
+        Ok(0)
+    }
+
     fn unmap(&mut self, _base: NonNull<u8>, _len: usize) {}
 
     fn close(&mut self, _fd: RawFd) {}

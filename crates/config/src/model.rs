@@ -661,7 +661,8 @@ pub struct TickBudgetV1 {
 ///
 /// The section is optional and defaults to the deterministic simulation
 /// backend, so every schema-version 1 document written before the section
-/// existed keeps its meaning. `ports` is valid only with `kind = "af-xdp"`.
+/// existed keeps its meaning. `ports` is valid only with `kind = "af-xdp"`,
+/// `af-packet` only with `kind = "af-packet"`.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct BackendV1 {
@@ -675,6 +676,56 @@ pub struct BackendV1 {
     /// One AF_XDP socket per entry (`[[backend.ports]]`).
     #[serde(default)]
     pub ports: Vec<AfXdpPortV1>,
+    /// The AF_PACKET backend (`[backend.af-packet]`).
+    #[serde(default)]
+    pub af_packet: Option<AfPacketV1>,
+}
+
+/// The AF_PACKET (TPACKET_V3) backend (`[backend.af-packet]`).
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AfPacketV1 {
+    /// The longest Ethernet frame (header included, FCS excluded) of every
+    /// port; every port's device MTU must be at most this minus 14 (so the
+    /// largest port's MTU plus 14 for mixed MTUs). Absent means
+    /// 1514 (MTU 1500).
+    #[serde(default)]
+    pub max_frame_len: Option<u32>,
+    /// One packet socket per entry (`[[backend.af-packet.ports]]`).
+    #[serde(default)]
+    pub ports: Vec<AfPacketPortV1>,
+}
+
+/// One AF_PACKET socket bound to one configured interface's device.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AfPacketPortV1 {
+    /// `name` of an `[[interfaces]]` entry; its `device` is bound.
+    pub interface: String,
+    /// The TPACKET_V3 RX ring.
+    pub rx: AfPacketRxRingV1,
+    /// The TPACKET_V3 TX ring.
+    pub tx: AfPacketTxRingV1,
+}
+
+/// Geometry of one port's RX ring: `block-count` blocks of `block-size`
+/// bytes; the kernel hands a block over when it is full or
+/// `retire-timeout-ms` after its first frame.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AfPacketRxRingV1 {
+    pub block_size: u32,
+    pub block_count: u32,
+    pub retire_timeout_ms: u32,
+}
+
+/// Geometry of one port's TX ring: `block-count` blocks of `block-size`
+/// bytes, cut into fixed frames that hold the maximum frame.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct AfPacketTxRingV1 {
+    pub block_size: u32,
+    pub block_count: u32,
 }
 
 /// Which packet backend a router process drives.
@@ -686,6 +737,9 @@ pub enum BackendKindV1 {
     Sim,
     /// Linux AF_XDP sockets on real devices.
     AfXdp,
+    /// Linux AF_PACKET (TPACKET_V3) sockets on real devices: the
+    /// debug/fallback backend.
+    AfPacket,
 }
 
 impl BackendKindV1 {
@@ -695,6 +749,7 @@ impl BackendKindV1 {
         match self {
             Self::Sim => "sim",
             Self::AfXdp => "af-xdp",
+            Self::AfPacket => "af-packet",
         }
     }
 }

@@ -273,6 +273,41 @@ fn the_argument_filters_hold_on_the_low_32_bits() {
     for (level, name) in [(270, 1), (270, 11), (1, 12), (283, 12), (283, 4), (0, 0)] {
         assert!(!filter.allows(setsockopt, [5, level, name, 0, 4, 0]));
     }
+    // getsockopt: XDP_STATISTICS, PACKET_STATISTICS, and SO_ERROR only
+    // (AFPKT-015), each exactly as a (level, name) pair.
+    let getsockopt = rule("getsockopt").nr;
+    for (level, name) in [(283, 7), (263, 6), (1, 4)] {
+        assert!(filter.allows(getsockopt, [9, level, name, 0, 0, 0]));
+        assert!(
+            filter.allows(getsockopt, [9, high | level, high | name, 0, 0, 0]),
+            "the kernel reads only the low 32 bits of ({level}, {name})"
+        );
+    }
+    for (level, name) in [
+        (283, 1),
+        (283, 8),
+        (283, 6),
+        (283, 4),
+        (263, 7),
+        (263, 4),
+        (263, 5),
+        (263, 13),
+        (1, 7),
+        (1, 6),
+        (1, 3),
+        (1, 17),
+        (7, 283),
+        (6, 263),
+        (4, 1),
+        (0, 0),
+        (270, 12),
+        (u64::from(u32::MAX), 4),
+    ] {
+        assert!(
+            !filter.allows(getsockopt, [9, level, name, 0, 0, 0]),
+            "getsockopt({level}, {name})"
+        );
+    }
     // bpf: the XSKMAP entry delete only.
     let bpf = rule("bpf").nr;
     assert!(filter.allows(bpf, [3, 0, 0, 0, 0, 0]));
@@ -345,6 +380,89 @@ fn the_argument_filters_hold_on_the_low_32_bits() {
     assert_eq!(log.eval(socket, [2, 2, 0, 0, 0, 0]), RET_LOG);
     assert_eq!(log.eval(bpf, [5, 0, 0, 0, 0, 0]), RET_LOG);
     assert_eq!(log.eval(socket, [16, 3, 0, 0, 0, 0]), RET_ALLOW);
+}
+
+/// A one-of condition between two plain conditions, in a rule between two
+/// other conditional rules: every pair passes on to the next condition,
+/// every mismatch (in any pair, any condition) is denied, and the rules
+/// around it are unaffected.
+#[test]
+fn a_one_of_condition_chains_with_the_conditions_around_it() {
+    static RULES: [Rule; 4] = [
+        Rule {
+            name: "plain",
+            nr: 1,
+            conditions: &[],
+        },
+        Rule {
+            name: "before",
+            nr: 2,
+            conditions: &[Condition::Equal {
+                index: 0,
+                value: Value::Fixed(5),
+            }],
+        },
+        Rule {
+            name: "chained",
+            nr: 3,
+            conditions: &[
+                Condition::Equal {
+                    index: 0,
+                    value: Value::Fixed(9),
+                },
+                Condition::OneOf {
+                    first: 1,
+                    second: 2,
+                    pairs: &[(10, 11), (20, 21), (30, 31)],
+                },
+                Condition::Clear {
+                    index: 3,
+                    mask: 0x4,
+                },
+            ],
+        },
+        Rule {
+            name: "after",
+            nr: 4,
+            conditions: &[Condition::OneOf {
+                first: 0,
+                second: 1,
+                // The same first value twice: a mismatch of the second
+                // must go on to the next pair from its first load.
+                pairs: &[(7, 8), (7, 9)],
+            }],
+        },
+    ];
+    let program = program(&RULES, RET_LOG, PID).expect("assembles");
+    validate(&program);
+    let run = |nr: u32, args: [u64; 6]| interpret(&program, &data(AUDIT_ARCH_X86_64, nr, args));
+    assert_eq!(run(1, [0; 6]), RET_ALLOW);
+    assert_eq!(run(2, [5, 0, 0, 0, 0, 0]), RET_ALLOW);
+    assert_eq!(run(2, [6, 0, 0, 0, 0, 0]), RET_LOG);
+    for (a, b) in [(10, 11), (20, 21), (30, 31)] {
+        assert_eq!(run(3, [9, a, b, 0, 0, 0]), RET_ALLOW, "{a} {b}");
+        assert_eq!(run(3, [9, a, b, 3, 0, 0]), RET_ALLOW, "{a} {b}");
+        // The condition after the one-of still holds.
+        assert_eq!(run(3, [9, a, b, 4, 0, 0]), RET_LOG, "{a} {b}");
+        // ... and the one before it.
+        assert_eq!(run(3, [8, a, b, 0, 0, 0]), RET_LOG, "{a} {b}");
+    }
+    for (a, b) in [
+        (10, 21),
+        (20, 11),
+        (30, 11),
+        (10, 31),
+        (11, 10),
+        (0, 0),
+        (31, 30),
+    ] {
+        assert_eq!(run(3, [9, a, b, 0, 0, 0]), RET_LOG, "{a} {b}");
+    }
+    assert_eq!(run(4, [7, 8, 0, 0, 0, 0]), RET_ALLOW);
+    assert_eq!(run(4, [7, 9, 0, 0, 0, 0]), RET_ALLOW);
+    assert_eq!(run(4, [7, 10, 0, 0, 0, 0]), RET_LOG);
+    assert_eq!(run(4, [8, 8, 0, 0, 0, 0]), RET_LOG);
+    assert_eq!(run(5, [0; 6]), RET_LOG);
 }
 
 #[test]

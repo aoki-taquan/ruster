@@ -43,7 +43,10 @@ const PACKET_TX_RING: c_int = 13;
 const PACKET_IGNORE_OUTGOING: c_int = 23;
 const PACKET_LOSS: c_int = 14;
 const PACKET_STATISTICS: c_int = 6;
+const SOL_SOCKET: c_int = 1;
+const SO_ERROR: c_int = 4;
 const POLLIN: i16 = 0x001;
+const POLLERR: i16 = 0x008;
 const POLLNVAL: i16 = 0x020;
 const SC_PAGESIZE: c_int = 30;
 /// Linux `TP_STATUS_TS_SOFTWARE | TP_STATUS_TS_SYS_HARDWARE |
@@ -263,6 +266,11 @@ pub(crate) trait PacketOps: Clone {
     /// counters it returns.
     fn packet_statistics(&mut self, fd: RawFd) -> Result<TpacketStatsV3, PlatformError>;
 
+    /// `getsockopt(SOL_SOCKET, SO_ERROR)`: reads and clears the socket's
+    /// pending error (`sk_err`), which keeps `poll` reporting `POLLERR`
+    /// until it is read. Returns the cleared errno (0 if none).
+    fn take_socket_error(&mut self, fd: RawFd) -> Result<i32, PlatformError>;
+
     fn unmap(&mut self, base: NonNull<u8>, len: usize);
 
     fn close(&mut self, fd: RawFd);
@@ -400,6 +408,29 @@ impl PacketOps for LinuxOps {
         // Only the exact TPACKET_V3 layout is accepted: a shorter value would
         // leave counters unwritten and a V1/V2 layout means another version.
         if usize::try_from(len).ok() != Some(size_of::<TpacketStatsV3>()) {
+            return Err(PlatformError::UapiLayoutMismatch);
+        }
+        Ok(value)
+    }
+
+    fn take_socket_error(&mut self, fd: RawFd) -> Result<i32, PlatformError> {
+        let mut value: c_int = 0;
+        let mut len = u32::try_from(size_of::<c_int>()).expect("int size fits");
+        // SAFETY: `value` and `len` are initialized locals that outlive the
+        // call; `len` bounds the bytes the kernel may write into `value`.
+        let result = unsafe {
+            getsockopt(
+                fd,
+                SOL_SOCKET,
+                SO_ERROR,
+                (&raw mut value).cast(),
+                &raw mut len,
+            )
+        };
+        if result < 0 {
+            return Err(last_error(SyscallStage::SocketError));
+        }
+        if usize::try_from(len).ok() != Some(size_of::<c_int>()) {
             return Err(PlatformError::UapiLayoutMismatch);
         }
         Ok(value)
@@ -1939,6 +1970,10 @@ mod tests {
             Ok(crate::sys::TpacketStatsV3::default())
         }
 
+        fn take_socket_error(&mut self, _fd: RawFd) -> Result<i32, PlatformError> {
+            Ok(0)
+        }
+
         fn unmap(&mut self, _base: NonNull<u8>, len: usize) {
             self.0.borrow_mut().calls.push(ScriptedCall::Unmap(len));
         }
@@ -2573,6 +2608,10 @@ mod tests {
             _fd: RawFd,
         ) -> Result<crate::sys::TpacketStatsV3, PlatformError> {
             Ok(crate::sys::TpacketStatsV3::default())
+        }
+
+        fn take_socket_error(&mut self, _fd: RawFd) -> Result<i32, PlatformError> {
+            Ok(0)
         }
 
         fn unmap(&mut self, _base: NonNull<u8>, _len: usize) {}

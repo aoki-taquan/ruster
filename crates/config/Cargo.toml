@@ -11,3 +11,6 @@ ruster-io-xdp = { path = "../io-xdp" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_path_to_error = "0.1.20"
 toml = { version = "1.1.4", default-features = false, features = ["parse", "serde", "std"] }
+
+[dev-dependencies]
+ruster-io-afpacket = { path = "../io-afpacket" }

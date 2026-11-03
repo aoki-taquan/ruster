@@ -10,6 +10,7 @@ const TX_STALL_WARN_MS: u64 = 1_000;
 const TX_STALL_FATAL_MS: u64 = 10_000;
 const KICK_ERRORS_FATAL_MS: u64 = 5_000;
 const TARGET: LinkTarget = LinkTarget {
+    watch_uppers: false,
     interface: PORT,
     ifindex: 7,
     name: IfName::literal(b"ra"),
@@ -44,6 +45,7 @@ fn sample() -> PortSample {
         fill_starved: 0,
         fill_ring_occupancy: 64,
         rx_packets: 0,
+        device_gone: false,
     }
 }
 
@@ -54,6 +56,7 @@ fn up(mtu: u32) -> Result<LinkFacts, NetlinkError> {
         rx_queues: Some(1),
         admin_up: true,
         lower_up: true,
+        master: None,
     })
 }
 
@@ -892,6 +895,12 @@ fn late(watch: &mut Watch, now: u64, since: u64) -> Vec<WatchEvent> {
 struct Scripted(PortRound);
 
 impl LinkMonitor for Scripted {
+    fn stacked_links(&mut self, _: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError> {
+        let count = self.0.uppers.unwrap_or(Ok(0))?;
+        counts.iter_mut().for_each(|slot| *slot = count);
+        Ok(())
+    }
+
     fn query(&mut self, _: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
         self.0.link
     }
@@ -927,6 +936,7 @@ fn port_round(link: Result<LinkFacts, NetlinkError>, addresses: u32, routes: u32
         forwarding: Ok(Forwarding::default()),
         weak_host: Some(false),
         ipv6: linked.then_some(Ipv6Sample::DISABLED),
+        uppers: None,
     }
 }
 
@@ -1076,5 +1086,248 @@ fn a_renamed_port_is_fatal_and_its_round_is_not_read() {
         fold(&mut watch(), &round_of(exposed(up(1500)))).len(),
         4,
         "addresses, routes, forwarding, weak host"
+    );
+}
+
+/// AFPKT-015: on an AF_PACKET port a kernel exposure condition found at
+/// run time is fatal under its own code, unless the startup accepted it
+/// through an override; the device found gone by the backend is
+/// `DEVICE_REMOVED`; AF_XDP keeps warning only.
+#[test]
+fn af_packet_kernel_exposure_is_fatal_unless_overridden() {
+    let strict = ExposurePolicy::default();
+    let mut packet = watch().failing_on_kernel_exposure(strict);
+    let mut events = Vec::new();
+    packet.on_addresses(0, Ok(1), &mut |event| events.push(event));
+    assert_eq!(
+        events,
+        [
+            warning(Condition::KernelIpv4Addresses),
+            fatal(Fatal::KernelExposure(Condition::KernelIpv4Addresses)),
+        ]
+    );
+    assert_eq!(
+        Fatal::KernelExposure(Condition::KernelIpv4Addresses).code(),
+        "KERNEL_IPV4_ADDRESSES"
+    );
+    for (condition, fatal_by_default) in [
+        (Condition::KernelIpv4Addresses, true),
+        (Condition::KernelIpv4Routes, true),
+        (Condition::KernelForwardingEnabled, true),
+        (Condition::Ipv4WeakHost, true),
+        (Condition::KernelIpv6Enabled, true),
+        (Condition::KernelIpv6Addresses, true),
+        (Condition::KernelIpv6Routes, true),
+        (Condition::KernelIpv6ForwardingEnabled, true),
+        (Condition::TxStall, false),
+        (Condition::LinkDown, false),
+        (Condition::LinkProbe, false),
+        (Condition::ForwardingUnverifiable, false),
+        (Condition::Ipv6Unverifiable, false),
+        (Condition::LinkWatchStale, false),
+        (Condition::MtuRaised, false),
+        (Condition::KickErrors, false),
+        (Condition::FillStarved, false),
+    ] {
+        assert_eq!(
+            strict.is_fatal(condition),
+            fatal_by_default,
+            "{condition:?}"
+        );
+    }
+    let allowed = ExposurePolicy {
+        allow_kernel_forwarding: true,
+        allow_kernel_ipv6: true,
+        allow_ipv4_weak_host: true,
+    };
+    for condition in [
+        Condition::KernelForwardingEnabled,
+        Condition::Ipv4WeakHost,
+        Condition::KernelIpv6Enabled,
+        Condition::KernelIpv6Addresses,
+        Condition::KernelIpv6Routes,
+        Condition::KernelIpv6ForwardingEnabled,
+    ] {
+        assert!(!allowed.is_fatal(condition), "{condition:?}");
+    }
+    assert!(allowed.is_fatal(Condition::KernelIpv4Addresses));
+    assert!(allowed.is_fatal(Condition::KernelIpv4Routes));
+    // The weak host with its override: a warning only.
+    let mut packet = watch().failing_on_kernel_exposure(allowed);
+    let mut events = Vec::new();
+    packet.on_weak_host(0, Some(true), &mut |event| events.push(event));
+    assert_eq!(events, [warning(Condition::Ipv4WeakHost)]);
+    // AF_XDP: an address only warns.
+    let mut xdp = watch();
+    let mut events = Vec::new();
+    xdp.on_addresses(0, Ok(1), &mut |event| events.push(event));
+    assert_eq!(events, [warning(Condition::KernelIpv4Addresses)]);
+    // The backend's unbound port.
+    let mut packet = watch().failing_on_kernel_exposure(strict);
+    assert_eq!(
+        run(
+            &mut packet,
+            10,
+            PortSample {
+                device_gone: true,
+                ..sample()
+            }
+        ),
+        [fatal(Fatal::DeviceRemoved)]
+    );
+}
+
+/// AF_PACKET: an upper device appearing at run time (the port enslaved,
+/// `IFLA_MASTER` in the link query; or a device stacked on it, the link
+/// dump) is fatal `KERNEL_UPPER_DEVICE`; a failing dump counts as a failed
+/// query; an AF_XDP port is not asked.
+#[test]
+fn an_upper_device_at_run_time_ends_an_af_packet_run() {
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    packet.on_uppers(0, false, Ok(0), &mut |event| events.push(event));
+    assert!(events.is_empty());
+    for (master, stacked) in [(true, 0), (false, 1), (true, 2)] {
+        let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+        let mut events = Vec::new();
+        packet.on_uppers(0, master, Ok(stacked), &mut |event| events.push(event));
+        assert_eq!(
+            events,
+            [
+                warning(Condition::KernelUpperDevice),
+                fatal(Fatal::KernelExposure(Condition::KernelUpperDevice)),
+            ],
+            "{master} {stacked}"
+        );
+        assert_eq!(
+            Fatal::KernelExposure(Condition::KernelUpperDevice).code(),
+            "KERNEL_UPPER_DEVICE"
+        );
+    }
+    // Even with every override: no override accepts an upper device.
+    let all = ExposurePolicy {
+        allow_kernel_forwarding: true,
+        allow_kernel_ipv6: true,
+        allow_ipv4_weak_host: true,
+    };
+    assert!(all.is_fatal(Condition::KernelUpperDevice));
+    // A failing dump is a failed query (fatal LINK_UNVERIFIABLE after three).
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    for _ in 0..LINK_PROBE_FAILURES_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::EndOfStream), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ]
+    );
+    // Through a whole round: the link query's master is used, and the
+    // dump only for a port that watches its uppers.
+    let enslaved = Ok(LinkFacts {
+        master: Some(9),
+        ..up(1500).expect("facts")
+    });
+    let packet_target = LinkTarget {
+        watch_uppers: true,
+        ..TARGET
+    };
+    let mut round = LinkRound::new(1);
+    probe_round(
+        &mut Scripted(port_round(enslaved, 0, 0)),
+        &[packet_target],
+        &mut round,
+    );
+    let mut packet = Watch::new(&[packet_target], Thresholds::default())
+        .failing_on_kernel_exposure(ExposurePolicy::default());
+    assert_eq!(
+        fold(&mut packet, &round),
+        [
+            warning(Condition::KernelUpperDevice),
+            fatal(Fatal::KernelExposure(Condition::KernelUpperDevice)),
+        ]
+    );
+    // A stacked device found by the dump of the same round.
+    let mut round = LinkRound::new(1);
+    probe_round(
+        &mut Scripted(PortRound {
+            uppers: Some(Ok(1)),
+            ..port_round(up(1500), 0, 0)
+        }),
+        &[packet_target],
+        &mut round,
+    );
+    assert_eq!(round.ports()[0].uppers, Some(Ok(1)));
+    let mut packet = Watch::new(&[packet_target], Thresholds::default())
+        .failing_on_kernel_exposure(ExposurePolicy::default());
+    assert_eq!(
+        fold(&mut packet, &round),
+        [
+            warning(Condition::KernelUpperDevice),
+            fatal(Fatal::KernelExposure(Condition::KernelUpperDevice)),
+        ]
+    );
+    // AF_XDP ports are not asked.
+    let round = round_of(PortRound {
+        uppers: Some(Ok(1)),
+        ..port_round(up(1500), 0, 0)
+    });
+    assert_eq!(round.ports()[0].uppers, None, "not asked for AF_XDP");
+}
+
+/// A stacked-device dump that link churn interrupts in every attempt is
+/// counted apart, with its own higher threshold (still fail closed); a
+/// completed dump resets it; another failure keeps the usual threshold.
+#[test]
+fn an_interrupted_upper_device_dump_fails_closed_only_after_its_own_threshold() {
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    for _ in 1..LINK_DUMP_INTERRUPTED_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::Interrupted), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [warning(Condition::LinkProbe)],
+        "below the threshold"
+    );
+    // A completed dump resets the count and recovers.
+    let mut events = Vec::new();
+    packet.on_uppers(0, false, Ok(0), &mut |event| events.push(event));
+    assert_eq!(events, [recovered(Condition::LinkProbe)]);
+    let mut events = Vec::new();
+    for _ in 0..LINK_DUMP_INTERRUPTED_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::Interrupted), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ],
+        "fatal at the threshold"
+    );
+    const { assert!(LINK_DUMP_INTERRUPTED_FATAL > LINK_PROBE_FAILURES_FATAL) };
+    // Any other dump failure: the usual threshold.
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    for _ in 0..LINK_PROBE_FAILURES_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::Truncated), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ]
     );
 }

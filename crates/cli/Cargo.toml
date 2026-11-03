@@ -13,6 +13,7 @@ path = "src/main.rs"
 ruster-config = { path = "../config" }
 ruster-control = { path = "../control" }
 ruster-core = { path = "../core" }
+ruster-io-afpacket = { path = "../io-afpacket" }
 ruster-io-sim = { path = "../io-sim" }
 ruster-io-xdp-native = { path = "../io-xdp-native" }
 ruster-runtime = { path = "../runtime" }

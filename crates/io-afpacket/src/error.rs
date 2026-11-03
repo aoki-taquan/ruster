@@ -32,6 +32,8 @@ pub enum SyscallStage {
     Kick,
     Poll,
     Statistics,
+    /// `getsockopt(SOL_SOCKET, SO_ERROR)` after `poll` reported `POLLERR`.
+    SocketError,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -875,6 +875,82 @@ fn af_xdp_text(edits: &[(&str, &str)], wan_queue: u32, wan_mode: &str) -> String
     )
 }
 
+/// The fixture document with an AF_PACKET `[backend]` binding lan and wan,
+/// with the given `max-frame-len` and wan RX retire timeout.
+fn af_packet(max_frame_len: u32, wan_retire_ms: u32) -> ValidatedConfigV1 {
+    let port = |interface: &str, retire: u32| {
+        format!(
+            "\n[[backend.af-packet.ports]]\ninterface = \"{interface}\"\n\
+             rx = {{ block-size = 65536, block-count = 4, retire-timeout-ms = {retire} }}\n\
+             tx = {{ block-size = 65536, block-count = 2 }}\n"
+        )
+    };
+    document(&format!(
+        "{}\n[backend]\nkind = \"af-packet\"\n\n[backend.af-packet]\nmax-frame-len = {max_frame_len}\n{}{}",
+        edited(&[]),
+        port("wan", wan_retire_ms),
+        port("lan", 4),
+    ))
+}
+
+/// AFPKT-015: every AF_PACKET backend difference (kind, maximum frame, a
+/// port's ring) is restart-required and typed; the same backend is not.
+#[test]
+fn af_packet_backend_changes_are_restart_required_and_typed() {
+    let sim = config(&[]);
+    let packet = af_packet(1_514, 4);
+    let up = ApplyPlan::between(&sim, &packet).unwrap();
+    only(&up, &["backend", "restart"]);
+    assert_eq!(up.restart_required(), [RestartRequired::Backend]);
+    assert_eq!(
+        up.backend().kind,
+        Some(Delta {
+            old: BackendKindV1::Sim,
+            new: BackendKindV1::AfPacket,
+        })
+    );
+    assert_eq!(
+        up.backend().af_packet_max_frame_len,
+        Some(Delta {
+            old: None,
+            new: Some(1_514),
+        })
+    );
+    assert!(up.backend().ports.is_empty());
+    assert!(matches!(
+        &*up.backend().af_packet_ports,
+        [Change::Added(lan), Change::Added(wan)]
+            if lan.interface() == IfId(1) && wan.interface() == IfId(2)
+    ));
+    only(
+        &ApplyPlan::between(&packet, &af_packet(1_514, 4)).unwrap(),
+        &[],
+    );
+    let frame = ApplyPlan::between(&packet, &af_packet(1_518, 4)).unwrap();
+    only(&frame, &["backend", "restart"]);
+    assert!(frame.backend().af_packet_ports.is_empty());
+    assert!(frame.backend().af_packet_max_frame_len.is_some());
+    let retire = ApplyPlan::between(&packet, &af_packet(1_514, 8)).unwrap();
+    only(&retire, &["backend", "restart"]);
+    let [Change::Changed(Delta { old, new })] = &*retire.backend().af_packet_ports else {
+        panic!(
+            "one wan port change: {:?}",
+            retire.backend().af_packet_ports
+        );
+    };
+    assert_eq!((old.interface(), new.interface()), (IfId(2), IfId(2)));
+    assert_eq!(
+        (old.rx().retire_timeout_ms(), new.rx().retire_timeout_ms()),
+        (4, 8)
+    );
+    // AF_XDP to AF_PACKET removes every AF_XDP port and adds every
+    // AF_PACKET one.
+    let across = ApplyPlan::between(&af_xdp(&[], 0, "copy"), &packet).unwrap();
+    only(&across, &["backend", "restart"]);
+    assert_eq!(across.backend().ports.len(), 2);
+    assert_eq!(across.backend().af_packet_ports.len(), 2);
+}
+
 #[test]
 fn backend_changes_are_restart_required_typed_and_listed_last() {
     let sim = config(&[]);

@@ -5,7 +5,8 @@
 //! geometry, descriptor bounds, ownership state, the Linux syscall/mmap
 //! boundary, and since AP3 the live backend [`AfPacketIo`] (Linux only).
 //! The AF_PACKET backend is the debug/fallback backend of `ruster`; AF_XDP
-//! is the primary one. `ruster run` does not select it yet (next slice).
+//! is the primary one. `ruster run` selects it with
+//! `backend.kind = "af-packet"` (AFPKT-015).
 //!
 //! Engines (all private, static dispatch over one syscall seam that scripted
 //! tests replace): the AP1 TX engine publishes fixed frames, scans FIFO
@@ -38,7 +39,7 @@
 //! Exposure model: unlike AF_XDP, AF_PACKET does not take frames away from
 //! the kernel. The kernel stack still receives every frame of a port, so a
 //! port must carry no kernel address, route, or forwarding role (enforced by
-//! the future `ruster run` integration's startup checks). TPACKET_V3 makes a
+//! `ruster run`'s startup checks and, while it runs, its link watch). TPACKET_V3 makes a
 //! block visible only when it is full or its retire timer fires, so an idle
 //! port delivers a lone frame up to the RX `retire_timeout_ms` late.
 //!
