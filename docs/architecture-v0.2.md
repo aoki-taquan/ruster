@@ -587,14 +587,21 @@ RFC 6864 §5.3.1はaddress-sharing deviceに、変換したdatagramのIDをsourc
 DF=0のframeだけ、変換後の(source, destination, protocol)を`Ipv4IdGenerator`
 （`nat44_ipv4_id.rs`）に渡します。generatorはNAT runtimeのhash keyで構築時に固定したkeyed
 SipHash（domain `Ipv4Identification`）でtupleから1024個のu16 counterのbucketと秘密のoffsetを得て、
-ID = counter + offsetを返しcounterを1進めます。inline配列なのでallocationもlockもなく、
-reconcile/flushでもresetしません。IPv4 checksumはRFC 1624で更新します。UDPはUDP runtime、TCPは
+ID = counter + offsetを返しcounterを1進めます。counter配列はsourceがpublic addressのtuple
+（outbound、hairpin）とそれ以外（inbound）で分け、outsideからのinbound trafficがoutbound tupleの
+sequenceを進められないようにします（hairpinはinside hostだけが駆動しtupleがoutboundと一致しないので
+outbound側）。inline配列なのでallocationもlockもなく、keyは構築時に固定しreconcileでrotateせず
+（sequenceをresetしないため）、reconcile/flushでもresetしません。generatorはworkerごとなので、
+multi-workerにする時はworkerごとの派生keyと重ならないID範囲、または(source, destination,
+protocol)でのaffine shardingが要ります（そうしないと同じtupleのIDがworker間で重複する）。IPv4 checksumはRFC 1624で更新します。UDPはUDP runtime、TCPは
 TCP runtimeのgeneratorを使い、protocol 1（ICMP queryと翻訳したerror）は同じ列にするため
 ICMP query runtime、無ければUDP、無ければTCP runtimeのgeneratorを使います。DF=1のframeは
-flagsを一回読むだけでIDを変えません（RFC 6864 §4.1）。dropしたdatagramはIDを消費しません。
+flagsを一回読むだけでIDを変えません（RFC 6864 §4.1）。plan、MTU、firewallでdropしたdatagramは
+IDを消費しません（消費はcoreのTX commit時でbackendのTX受理より前）。
 pass-throughは§5.3.1のMUSTに反するので設定にしません。残余は一つのbucketで65536個/MDLを超えると
-一巡すること、同じbucketを共有するtupleからの件数推測、翻訳したerrorのquote内IDを戻さないこと、
-runtime作り直しでの再開です（NAT44-126）。
+一巡すること（inside hostはoutbound配列を共有し、一つのhostが約2.2 kpps送ると共有tupleが30 sで
+一巡する。host単位のrate limitは無い）、同じoutbound bucketを共有するtupleからの件数推測、
+翻訳したerrorのquote内IDをどちらの方向でも戻さないこと、runtime作り直しでの再開です（NAT44-126）。
 
 fragment handling/reassembly、static port forward、複数public address、port randomization/parity、minimal
 stateful sliceを越えるfull packet filterはdeferredです。RFC 3022/4787/7857の全機能準拠は

@@ -694,9 +694,16 @@ VPNs) without DF; before MTU2 the NAT dropped all of it as
   There is no switch: copying the ID is not allowed by RFC 6864. Packet
   captures on both sides of the router therefore show different IDs for
   DF-clear datagrams; match them by addresses, ports and payload. An ICMP
-  error about such a datagram that comes back from outside quotes the
-  generated ID; the router translates the quoted addresses and ports back
-  but not the ID (hosts match errors by addresses and ports).
+  error about such a datagram quotes the generated ID in either direction
+  (an outside router's error about an outbound datagram, or an inside
+  host's error about an inbound one); the router translates the quoted
+  addresses and ports back but not the ID (hosts match errors by addresses
+  and ports). Outbound and inbound datagrams count in separate sequences,
+  so outside traffic cannot advance the sequence of outbound traffic. All
+  inside hosts share the outbound sequence of one (public address,
+  destination, protocol): one host sending about 2.2 kpps of DF-clear
+  datagrams to one destination makes that sequence wrap within 30 s; there
+  is no per-host rate limit yet.
 - Fragments (MF set or a nonzero offset) are still dropped:
   `drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED`,
   `drop.NAT44_TCP_NON_ATOMIC_IPV4_UNSUPPORTED`,
