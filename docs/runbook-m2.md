@@ -477,7 +477,7 @@ ruster run [--allow-multi-queue] [--allow-kernel-forwarding]
            [--link-stale-secs <s>] [--idle-wait-ms <ms>]
            [--keep-privileges | --user <uid> --group <gid>]
            [--seccomp kill|log|off] [--fs-confine landlock|off]
-           --config <config.toml>
+           [--log-format text|json] --config <config.toml>
 ruster run [options] -- <config.toml>
 ```
 
@@ -491,10 +491,11 @@ ruster run [options] -- <config.toml>
 | `--strict-config-perms` | off | flag | refuse a config (startup and reload) that group/other may write (`WRITABLE_BY_OTHERS`), owned by neither root nor the effective user (`UNTRUSTED_OWNER`), with a symbolic link in its path (`SYMLINK_IN_PATH`), or in a directory up to `/` that is not owned by root/the user (`UNTRUSTED_DIRECTORY`) or is group/other writable (`WRITABLE_DIRECTORY`; a root-owned sticky directory such as `/tmp` is allowed); any error checking it is `OWNER_UNVERIFIABLE` |
 | `--stats-interval <s>` | 60 | 0 to 86400 | seconds between periodic stats blocks on stdout; 0 disables them (the final block is always printed) |
 | `--startup-attempts <n>` | 3 | 1 to 10 | whole startups tried on a transient open failure (section 5); 1 disables the retry |
-| `--tx-stall-warn-secs <s>` | 1 | 1 to 3600 | `TX_STALL` warning delay |
-| `--tx-stall-fatal-secs <s>` | 10 | 0 to 3600 | `TX_STALL` fatal exit; 0 never; otherwise at least `--tx-stall-warn-secs` |
-| `--kick-errors-fatal-secs <s>` | 5 | 0 to 3600 | `KICK_ERRORS` fatal exit; 0 never |
-| `--link-stale-secs <s>` | 5 | 1 to 3600 | age of a link watcher round still running (a `send` waiting for the kernel's RTNL lock) from which every further due round counts as a failed link query on every port (`LINK_WATCH_STALE`, `LINK_PROBE`; `LINK_UNVERIFIABLE` at the third, so about `s + 2` seconds after the stuck round started; section 8). No 0: losing observability of the ports always ends the run eventually. Raise it on hosts where driver resets hold RTNL longer |
+| `--log-format text\|json` (or `--log-format=<format>`) | `text` | one of the two | the output format (section 11, "JSON log format", OPS-LOG). `text`: the human-readable lines, unchanged. `json`: every line on stderr and every stats block on stdout is one JSON object (`ruster-run-log/v1`), also the refusals before startup (a config that does not load). Fixed for the process (not a config key: it applies before the config is read, and the output threads own it) |
+| `--tx-stall-warn-secs <s>` | 1 | 1 to 3600 | deprecated (OPS-LOG): the fallback of `[health] tx-stall-warn-ms` (section 7, "Thresholds and intervals"); `TX_STALL` warning delay |
+| `--tx-stall-fatal-secs <s>` | 10 | 0 to 3600 | deprecated: the fallback of `[health] tx-stall-fatal-ms`; `TX_STALL` fatal exit; 0 never; otherwise at least `--tx-stall-warn-secs` |
+| `--kick-errors-fatal-secs <s>` | 5 | 0 to 3600 | deprecated: the fallback of `[health] kick-errors-fatal-ms`; `KICK_ERRORS` fatal exit; 0 never |
+| `--link-stale-secs <s>` | 5 | 1 to 3600 | deprecated: the fallback of `[watch] link-stale-ms`; age of a link watcher round still running (a `send` waiting for the kernel's RTNL lock) from which every further due round counts as a failed link query on every port (`LINK_WATCH_STALE`, `LINK_PROBE`; `LINK_UNVERIFIABLE` at the third, so about `s + 2` seconds after the stuck round started; section 8). No 0: losing observability of the ports always ends the run eventually. Raise it on hosts where driver resets hold RTNL longer |
 | `--idle-wait-ms <ms>` | 10 | 1 to 100 | longest idle wait (section 7, "Idle wait"): an idle router blocks in `poll()` on its port sockets for at most this long, or at most 1 ms while timers, TX, or a reload are pending; an arriving frame ends the wait at once. Larger: fewer idle wake-ups and less CPU, but a signal delivered to another thread, a worker's answer, and anything the router only notices at a tick are seen up to this much later. 1 keeps the pre-H9 idle cadence (about 1000 wake-ups per second) |
 | `--keep-privileges` | off | flag | do not drop privileges after startup (section 5, "Privilege drop"): the process keeps every capability it started with for its whole life (`warning: privileges kept (--keep-privileges)`, `privileges.state=kept`). Risk: a memory-safety bug or a logic flaw reachable from packets or the config then runs with `CAP_NET_ADMIN`, `CAP_NET_RAW`, `CAP_BPF`/`CAP_SYS_ADMIN` (as root: every capability), so it can reconfigure every interface and route of the namespace, sniff and inject on any device, load BPF programs, and (as root) read and write any file. Use it only to diagnose a drop problem, or on a kernel before 6.5 with `kernel.unprivileged_bpf_disabled` set (where the drop is refused) |
 | `--seccomp kill\|log\|off` (or `--seccomp=<mode>`) | `kill` | one of the three | the syscall filter after startup (section 5, "Syscall filter"). `kill`: a syscall outside the allowlist kills the whole process at once (`SECCOMP_RET_KILL_PROCESS`; the XDP links detach as after SIGKILL). `log`: the kernel logs it and lets it run (`SECCOMP_RET_LOG`; `warning: seccomp=log`), for finding a missing entry without an outage. `off`: no filter (`warning: seccomp=off`, `seccomp.mode=off`). Risk of `log` and `off`: a compromised router can then make every syscall an unprivileged process (after the drop) or a privileged one (with `--keep-privileges`) can: open inet sockets and connect out, write any file its user may write, start programs, `ptrace` its own user's processes, load BPF programs where unprivileged BPF is allowed, and probe kernel interfaces that the filter keeps out of reach. Use `log` to diagnose a kill, `off` only on a platform where the filter cannot be installed. On a kernel before Landlock ABI 3 (Linux 6.2) the filter is also what keeps a writable file from being truncated by path (the `O_TRUNC` rule, no `truncate`), so `log`/`off` there loses that too; before ABI 4 (Linux 6.7) it is also the only limit on TCP sockets. An i386 or x32 syscall kills in every mode but `off`. Independent of `--keep-privileges` and `--user`/`--group` |
@@ -504,8 +505,12 @@ ruster run [options] -- <config.toml>
 Numbers are decimal digits only (at most 6, no sign; ids at most 10).
 `--idle-wait-ms` is in milliseconds, the other numeric options in seconds
 (`--startup-attempts` a count).
-Every option may be given once; `-h`/`--help` prints the usage. The thresholds and intervals
-are set at start and are not reloadable. The config file is always opened
+Every option may be given once; `-h`/`--help` prints the usage. The
+health thresholds and watch intervals are config keys since OPS-LOG
+(`[health]`, `[watch]`, section 7) and reload with the config; the four
+threshold flags above only set what a key the config does not set falls
+back to. `--stats-interval`, `--idle-wait-ms`, `--startup-attempts` and
+`--log-format` are set at start and need a restart. The config file is always opened
 `O_NONBLOCK | O_NOCTTY` and must be a regular file (a FIFO or device is
 `NOT_A_FILE`).
 
@@ -1391,6 +1396,86 @@ stop flag, the drain and the detach never wait for output. At exit the
 process waits at most 1 s for queued output, then exits anyway; the final
 stats block and summary can then be lost (the teardown itself completed).
 
+### JSON log format (`--log-format json`, OPS-LOG)
+
+With `--log-format json` every line `ruster run` writes is one JSON object
+on its own line (JSON Lines, RFC 8259), on the same stream as in text:
+events on stderr, stats blocks on stdout. The router thread still queues
+the same text; each output thread translates what it writes, so the
+bounded queues, `output.dropped`, and the bounded exit wait above are the
+same in both formats, and the router does no extra work per line. Lines
+written before the output threads start (a config that does not load, a
+failed early startup step) are translated on the main thread. Usage
+errors (bad flags) are text: the format is not known yet. Under systemd
+each stderr line becomes one journal entry (`journalctl -u ruster -o cat |
+jq`); the `sd_notify` messages (section 5) do not change.
+
+Schema `ruster-run-log/v1`, keys in this order:
+
+| key | type | content |
+|---|---|---|
+| `schema` | string | `ruster-run-log/v1` |
+| `ts` | string | UTC wall clock when the output thread wrote the line, RFC 3339 with milliseconds (`2026-11-03T12:14:56.789Z`); for ordering within the run use `uptime-ms` of the stats and the line order |
+| `level` | string | `info`, `warn`, or `error` |
+| `event` | string | stable event code (below) |
+| `msg` | string | the text line without the `ruster run: ` (or `ruster: `) prefix, so every text match still works on `msg` |
+| `fields` | object | every `key=value` token of `msg`: whole numbers as numbers, `true`/`false` as booleans, the rest as strings. In a `;`-separated clause that starts with one bare word the keys get that word as prefix (`flushed.dynamic-neighbors`, `carried.firewall-flows`, `state.arp`, `drain.calls`); of two equal keys the first wins. Health and startup check lines also get `code` (the condition, `TX_STALL`, `MULTI_QUEUE_ALLOWED`, ...) |
+| `truncated` | boolean | only when `msg` was cut at 16 KiB or a stats block at 65536 lines |
+| `stats` | object | `STATS` only: each `section.key=value` line of the block under its text key (`"if1.watch.link_up": true`, `"observer.generation": 2`, `"observer.last_apply": null` for `none`, labels as strings); `fields` holds `kind` and `uptime-ms` |
+
+Strings are escaped per RFC 8259 and the output is pure ASCII (`"`, `\`,
+control characters, DEL and every non-ASCII character as `\uXXXX`), so a
+value can never end the line or add a key or an event. The messages are
+value-free by design anyway (interface ids, codes, counts, fixed names; no
+device name, address, or path from the config or the command line: the
+`directory=` of `FS_CONFINE_WARNING` is one of the fixed broad directories
+such as `/etc`, never the `--config` path). Numbers are exact unsigned
+64-bit values; a consumer that reads JSON numbers as doubles (JavaScript,
+`jq` before 1.7) loses precision above 2^53.
+
+Event codes (one per message form; a renamed code is a breaking change,
+so new messages get new codes):
+
+| event | level | text line |
+|---|---|---|
+| `READY` | info | `running generation N on M port(s); ...` |
+| `RELOAD_REQUESTED`, `RELOAD_CHECKED`, `RELOAD_APPLIED` | info | `reload requested`, `reload checked:`, `reload applied:` (section 6) |
+| `RELOAD_REFUSED`, `RELOAD_FAILED` | warn | `reload refused:`, `reload failed:` |
+| `WATCH_SETTINGS_APPLIED` | info | `watch settings applied:` (section 7) |
+| `HEALTH_WARNING`, `HEALTH_RECOVERED`, `HEALTH_FATAL` | warn, info, error | `warning:`, `recovered:`, `fatal: port=if<id> health=<CODE>` (sections 7 and 8) |
+| `CHECK_WARNING` | warn | `warning: port=if<id> <CODE> ...` (startup device check accepted by an override, `MTU_BELOW_DEVICE`) |
+| `SWEEP_SLOW` | warn | `warning: RESOLUTION_SWEEP_SLOW ...` |
+| `RELOAD_PREPARE_SLOW`, `IDLE_POLL_FAILED`, `WORKER_ABANDONED`, `KERNEL_EXPOSURE_AT_EXIT` | warn | `warning: reload preparation running ...`, `warning: idle poll failed ...`, `warning: the <thread> thread did not end ...`, `warning: kernel ...` (exit) |
+| `PRIVILEGES_DROPPED`, `FS_CONFINED`, `SECCOMP_INSTALLED` | info | the hardening lines of section 5 |
+| `PRIVILEGES_KEPT`, `FS_CONFINE_OFF`, `FS_CONFINE_WARNING`, `SECCOMP_LOG`, `SECCOMP_OFF` | warn | their opt-out and broad-directory warnings |
+| `FLAG_OVERRIDDEN` | warn | `warning: --<flag> is overridden by ...` |
+| `STARTUP_RETRY` | warn | `startup attempt N of M failed: ...` |
+| `STARTUP_CANCELLED` | info | `startup cancelled by signal; ...` |
+| `STARTUP_FAILED` | error | `startup failed: ...` |
+| `STARTUP_HINT` | info | the advice lines after a startup failure (`run as root or grant ...`, Landlock hints) |
+| `SIGNAL_INSTALL_FAILED`, `OUTPUT_THREAD_FAILED`, `UNSUPPORTED_PLATFORM` | error | `cannot install ...`, `cannot start the output thread`, `unsupported platform` |
+| `CONFIG_INVALID`, `CONFIG_UNREADABLE`, `CONFIG_REFUSED` | error | `invalid config:`, `cannot read config:`, `refused config:` |
+| `SHUTDOWN_DRAINING` | info after a signal, else error | `<why>; draining` |
+| `DRAIN_FAILED`, `CLOSE_FAILED` | error | `drain failed:`, `close failed:` |
+| `SHUTDOWN_SUMMARY` | info after a signal, else error | `stopped ...; drain calls=...; ...` |
+| `WARNING` | warn | any other `warning:` line |
+| `STATS` | info | a stats block (stdout) |
+| `UNCLASSIFIED` | info | a line no rule matches: a bug, please report it |
+
+Example:
+
+```json
+{"schema":"ruster-run-log/v1","ts":"2026-11-03T12:14:56.789Z","level":"warn","event":"HEALTH_WARNING","msg":"warning: port=if2 health=TX_STALL","fields":{"code":"TX_STALL","port":"if2","health":"TX_STALL"}}
+{"schema":"ruster-run-log/v1","ts":"2026-11-03T12:15:00.001Z","level":"info","event":"STATS","msg":"ruster-run-stats kind=periodic uptime-ms=60000","fields":{"kind":"periodic","uptime-ms":60000},"stats":{"observer.taken_at":60000,"observer.state":"healthy","...":0,"output.dropped":0}}
+```
+
+Migration from text: keep `text` (the default) where scripts parse the
+lines; they do not change. For a collector, switch to `json` and match on
+`event` (and `fields.code`) instead of line prefixes; `msg` carries the old
+line. Stats consumers read `stats` of the `STATS` objects instead of the
+`ruster-run-stats` ... `end` blocks (same keys). `jq` example:
+`journalctl -u ruster -o cat | jq -c 'select(.level != "info")'`.
+
 ## 6. Config reload (SIGHUP)
 
 1. Write the new config to a new file and `mv` it over the file given to
@@ -1409,7 +1494,8 @@ stats block and summary can then be lost (the teardown itself completed).
    |---|---|
    | `reload applied: generation=N previous=P; interfaces=.. addresses=.. routes=.. neighbors=.. firewall-rules=.. nat44-ports=..; flushed dynamic-neighbors=.. resolution-states=.. nat44-udp-mappings=.. nat44-tcp-sessions=.. firewall-flows=..; carried dynamic-neighbors=.. nat44-udp-mappings=.. nat44-tcp-sessions=.. nat44-icmp-mappings=.. firewall-flows=.. firewall-revoked=..; state arp=.. nat44-udp=.. nat44-tcp=.. nat44-icmp=.. firewall=..` | active from this tick on. Compare the counts with what you meant to load (a truncated file that still validates shows fewer rules or routes; `routes` includes connected routes). `state` says per family what happened to its state (item 5): `carried`, `flushed` (`[reload] state = "flush"`), or `flushed:<reason>`; `nat44-icmp=none` without `[nat44.icmp]` |
    | `reload refused: code=RESTART_REQUIRED reasons=<R>[,<R>...]; generation P keeps running` | the change needs a restart; nothing changed |
-   | `reload failed: stage=<stage> code=<code>[ path=...]; generation P keeps running` | nothing changed. Stages: `read`, `permissions`, `parse`, `version`, `validate`, `candidate`, `plan`, `dry-run`, `apply`, `quiesce` (`code=TIMEOUT`: not quiescent within 200 ms; `code=STOPPED`: the run stopped while the reload waited) |
+   | `reload failed: stage=<stage> code=<code>[ path=...]; generation P keeps running` | nothing changed. Stages: `read`, `permissions`, `parse`, `version`, `validate`, `candidate`, `plan`, `health` (the `[health]` keys and the threshold flags disagree after the merge, section 7), `dry-run`, `apply`, `quiesce` (`code=TIMEOUT`: not quiescent within 200 ms; `code=STOPPED`: the run stopped while the reload waited) |
+   | `watch settings applied: tx-stall-warn-ms=.. ... link-stale-ms=..` | after `reload applied`, only when the applied document's `[health]`/`[watch]` settings differ from the running ones; they apply from the next health sample and link round (section 7) |
 
 4. Restart-required reasons (`R`): `BACKEND` (anything in `[backend]`:
    device, queue, mode, attach, rings, UMEM; also an interface `device`
@@ -1536,9 +1622,107 @@ holds.
 
 | code | condition | warning | fatal (exit 1) |
 |---|---|---|---|
-| `TX_STALL` | TX is in flight and the oldest in-flight frame has not completed, while the link is up | after `--tx-stall-warn-secs` (1) | after `--tx-stall-fatal-secs` (10; 0 never) |
-| `FILL_STARVED` | no Fill frame with the kernel, no RX, and the free list was empty when refilling | after 1 s (fixed) | never (the frames are held by TX, which `TX_STALL` covers) |
-| `KICK_ERRORS` | kick failures other than `ENETDOWN` grew in every sample | at the first growth | after `--kick-errors-fatal-secs` (5; 0 never) of growth in every sample |
+| `TX_STALL` | TX is in flight and the oldest in-flight frame has not completed, while the link is up | after `tx-stall-warn-ms` (1000) | after `tx-stall-fatal-ms` (10000; 0 never) |
+| `FILL_STARVED` | no Fill frame with the kernel, no RX, and the free list was empty when refilling | after `fill-starved-warn-ms` (1000) | never (the frames are held by TX, which `TX_STALL` covers) |
+| `KICK_ERRORS` | kick failures other than `ENETDOWN` grew in every sample | at the first growth | after `kick-errors-fatal-ms` (5000; 0 never) of growth in every sample |
+| `FRAMES_QUARANTINED` | AF_XDP: the port quarantined frames since the last sample (a kernel descriptor broke the frame ownership contract: a completion at another address, an RX descriptor with options, inside the headroom, or past its frame; the frame never returns to the pool, so the UMEM shrinks by one each time) | at the first growth of an episode (recovered after 10 s without growth) | when the port's count since startup reaches `frames-quarantined-fatal` (64; 0 never) |
+| `TX_INVALID_DESCS` | AF_XDP: the kernel's `XDP_STATISTICS` `tx_invalid_descs` of the port grew (it consumed a TX descriptor without sending or completing it; that frame stays in flight for good, so `TX_STALL` follows within `tx-stall-fatal-ms` unless the fatal stall is off) | at the first growth of an episode (recovered after 10 s without growth) | when the count since startup reaches `tx-invalid-descs-fatal` (64; 0 never) |
+
+The names in the table are the `[health]` keys below (defaults in
+parentheses). Neither integrity condition exists on AF_PACKET (no frame
+ownership ledger, no `XDP_STATISTICS`). Both should never happen: each
+one is a broken kernel-trust assumption (`if<id>.af_xdp_port.frames_quarantined`
+and `kernel_tx_invalid_descs` count them). Lower the fatal threshold to 1
+to stop at the first one, or set 0 to keep running on a degrading port
+with warnings only.
+
+### Thresholds and intervals (`[health]`, `[watch]`, OPS-LOG)
+
+Every health threshold and watch interval is a config key. The run reads
+them from the `--config` file at startup and from the new document at
+every reload; validation bounds each key and fails closed (exit 2 at
+startup, `reload failed: stage=validate` at a reload, the same in `ruster
+validate`):
+
+```toml
+[health]
+tx-stall-warn-ms = 1000             # 100 to 3600000
+tx-stall-fatal-ms = 10000           # 0 (never) or tx-stall-warn-ms to 3600000
+kick-errors-fatal-ms = 5000         # 0 (never) or 100 to 3600000
+fill-starved-warn-ms = 1000         # 100 to 3600000
+link-probe-failures-fatal = 3       # 1 to 100 failed link queries of one kind in a row
+link-dump-interrupted-fatal = 10    # 1 to 1000 (AF_PACKET stacked-device dump)
+frames-quarantined-fatal = 64       # 0 (never) to 1000000, per port since startup
+tx-invalid-descs-fatal = 64         # 0 (never) to 1000000, per port since startup
+
+[watch]
+health-interval-ms = 500            # 100 to 60000: backend health sample
+link-interval-ms = 1000             # 100 to 60000: link round (link, addresses,
+                                    # routes, forwarding, IPv6, rp_filter: every
+                                    # kernel exposure probe of section 8)
+link-stale-ms = 5000                # 1000 to 3600000 (section 8, stale rounds)
+```
+
+The values shown are the defaults. For the keys that existed as fixed
+values or flags before OPS-LOG they are those values. Behaviour change on
+upgrade: `FRAMES_QUARANTINED` and `TX_INVALID_DESCS` are new, so a config
+without the tables now also warns on those counters and ends the run when a
+port reaches 64 of either (set `frames-quarantined-fatal = 0` and
+`tx-invalid-descs-fatal = 0` to keep the old never-fatal behaviour). The
+kernel's `tx_invalid_descs` also counts TX descriptors it dropped in copy
+(generic) mode because it could not build the packet (for example
+`-EOVERFLOW`), not only malformed ones; a port that sees those regularly
+needs a higher threshold or 0.
+
+`health-interval-ms` is coupled to the conditions it samples:
+`KICK_ERRORS` needs growth in every sample and `FILL_STARVED` a sample
+without RX, so a shorter interval sees fewer of them (a sample can fall
+between two kick retries or two arrivals) and a longer one reacts later.
+The minimum is 100 ms for that reason; the time thresholds are in
+milliseconds but act at sample granularity (a 1000 ms warning fires at the
+first sample at or after 1 s). Errors: `HEALTH_VALUE_OUT_OF_RANGE` or `WATCH_INTERVAL_OUT_OF_RANGE`
+with `path=health.<key>` (or `watch.<key>`), `limit=` the bound crossed and
+`actual=` the value; `HEALTH_FATAL_BELOW_WARNING` when both TX stall keys
+are set and the fatal one (not 0) is below the warning.
+
+Precedence, per key: the config key, else its flag (`--tx-stall-warn-secs`,
+`--tx-stall-fatal-secs`, `--kick-errors-fatal-secs`, `--link-stale-secs`,
+in seconds; deprecated and kept for compatibility), else the default. The
+flag thus stays the fallback at every reload of a config without the key.
+A flag given with a value other than its default under a config that sets
+its key is overridden, with one startup warning: `warning:
+--tx-stall-warn-secs is overridden by [health] tx-stall-warn-ms of the
+config`. The override warning is given at startup only (a reload applies
+the key without repeating it). After the merge the fatal TX stall bound (when not 0) must still
+be at least the warning: a config `tx-stall-warn-ms = 20000` without
+`tx-stall-fatal-ms` under the default flag (10 s) is refused at startup
+(`invalid config: stage=health code=HEALTH_FATAL_BELOW_WARNING
+path=health.tx-stall-fatal-ms limit=20000 actual=10000`, exit 2) and fails a
+reload (`stage=health`, the running settings stay). Set both keys.
+
+Migration: move each threshold flag of the unit file into the config
+(`--tx-stall-fatal-secs 0` becomes `tx-stall-fatal-ms = 0`, seconds become
+milliseconds) and drop the flag; until then the flag keeps working.
+
+Reload class: every key is reloadable, none is restart-required. The
+watch only decides on cold samples between ticks, so an applied reload
+switches the thresholds and intervals at once, from the next sample and
+round, and prints `watch settings applied: ...` with every effective
+value (0 for a disabled fatal exit). A condition being timed keeps its
+start: a lowered fatal bound it has already passed ends the run at the
+next sample; a raised one gives it more time. Lowering
+`link-probe-failures-fatal` below a port's current failure count makes
+its next failed query fatal. `ruster plan` does not list `[health]` or
+`[watch]` changes (they are no publication state); a reload that changes
+only them still publishes a new generation, so its state follows `[reload]
+state` of the new document like every reload (section 6): carried by
+default, but under `state = "flush"` a reload made only to change a
+threshold also flushes every NAT44 mapping and session, firewall flow, and
+learned ARP neighbor. Keep `state = "carry"` (the default) when tuning
+thresholds on a busy router. (Applying watch-only changes without a
+publication would be a second reload path with its own failure and
+counter semantics; one atomic path is simpler to reason about, so it is
+not done.)
 
 A busy healthy link never trips these: completions retire the oldest
 frame, RX keeps arriving, kicks succeed. A link that is down holds its TX
@@ -1551,7 +1735,7 @@ transmitting, and with the default fatal exit can make the router exit
 because the router then fails closed (no kernel forwarding, no kernel L3 on
 the ports) and a stuck TX queue usually needs the restart. If availability
 under a hostile segment matters more, disable flow control
-(`ethtool -A <dev> rx off tx off`) and/or run with `--tx-stall-fatal-secs 0`.
+(`ethtool -A <dev> rx off tx off`) and/or set `[health] tx-stall-fatal-ms = 0`.
 
 Separately, if the adapter's I/O stays non-reentrant for 1 s on the loop's
 clock with no other tick in between (and at least 16 such ticks, so the
@@ -1812,7 +1996,7 @@ Sections, in this order:
 | `idle.*` | the idle wait (section 7): `max_wait_ms` (`--idle-wait-ms`), `waits` (blocking `poll`s), `woken` (ended by a frame on a port), `timed_out`, `interrupted` (a signal handler ran), `short` (waits the 1 ms pending cap made shorter than `--idle-wait-ms` and the next deadline would have; it grows about 1000 per second for as long as TX is held on a down link, resolution states are `Failed`, or unsolicited-SYN holds exist, as before H9), `sleeps` (plain sleeps of at most 1 ms after a ready socket that no tick used, or because `poll` failed), `errors` (failed `poll`s; warned once) |
 | `notify.*` | systemd notification (section 5, H10): `enabled` (`NOTIFY_SOCKET` was set), `watchdog_interval_ms` (half of `WATCHDOG_USEC`; 0 without a watchdog), `sent`, `watchdog_pings` (of them), `failed` (not delivered: nobody listening, or the manager's queue full) |
 | `watch.*` | `state` (`ok`/`warning`), `warnings` (all ports), `link_rounds` (link rounds that came back from the watcher), `link_rounds_late` (due rounds skipped because one still ran), `link_rounds_stale` (late rounds past `--link-stale-secs`, each a failed link query) |
-| `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings` |
+| `if<id>.watch.*` | `tx_stall`, `tx_stall_ms`, `fill_starved`, `kick_errors_persistent`, `link_up`, `link_down_events`, `link_up_events`, `mtu`, `link_probe_errors`, `kernel_ipv4_addresses`, `kernel_forwarding`, `kernel_ipv4_routes`, `kernel_ipv6_addresses`, `kernel_ipv6_routes`, `kernel_ipv6_forwarding`, `kernel_ipv6_enabled`, `ipv4_weak_host`, `warnings`, `frames_quarantined` and `tx_invalid_descs` (AF_XDP, since startup, as of the last health sample; 0 on AF_PACKET; OPS-LOG) |
 | `privileges.*` | `state` (`dropped`, or `kept` under `--keep-privileges`), `bounding_set` (`cleared`/`kept`), `identity` (`switched`/`unchanged`), `threads` (threads verified by the drop; 0 when kept) |
 | `fs.*` | `confine` (`landlock`, `off`), `abi` (the kernel's Landlock ABI; 0 when off), `rules` (rules of the ruleset; 0 when off), `threads` (threads confined; 0 when off) |
 | `seccomp.*` | `mode` (`kill`, `log`, `off`), `threads` (threads verified with the filter; 0 when off), `syscalls` (allowlist entries; 0 when off) |
@@ -2058,10 +2242,9 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   count: 20-48 ms for a full table on the development host); above the
   bound it flushes the firewall flows instead. A route change revokes the
   flows whose route moved to another interface or disappeared.
-- The `FILL_STARVED` delay (1 s), the 3 failed queries, the watch
-  intervals (500 ms health, 1 s link), and the 500 ms worker stop bound are
-  fixed; the TX stall, kick error and stale-round thresholds are flags
-  (section 3), not reloadable.
+- The health thresholds and watch intervals are reloadable config keys
+  (section 7, OPS-LOG); the 500 ms worker stop bound, `--stats-interval`,
+  and `--idle-wait-ms` are fixed for the run.
 - Kernel routes are attributed to a port by the kernel's device filter and
   then by `RTA_OIF` and `RTA_MULTIPATH` nexthops in userspace. With
   `net.ipv4.nexthop_compat_mode=0` (shared by IPv6) a route through a
@@ -2415,8 +2598,9 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   other than the router, a link round, and anything not on the "pending"
   list of section 7 are seen up to `--idle-wait-ms` (10 ms) later while
   idle. The wait is level-triggered on RX only.
-- Not implemented (CLI-034): structured logs, opt-in
-  "link down / forwarding 0 at exit", state carried across a reload.
+- Not implemented (CLI-034): opt-in "link down / forwarding 0 at exit".
+  (Structured logs, `[health]`/`[watch]`, and the integrity conditions are
+  OPS-LOG; state carried across a reload is RELOAD-CARRY.)
   (SIGUSR1 stats and systemd notification are H10.)
 - systemd notification (H10): the watchdog is pinged by the router
   thread only, so a stuck worker thread does not stop it (the link
@@ -2948,9 +3132,12 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=watch code=...` | 1 | the link watch's rtnetlink socket could not be opened | check netlink access in the namespace |
 | `stage=datapath\|engine\|adapter\|activate code=...` | 1 | internal setup fault after attach (everything was rolled back) | report it with the line |
 | `cannot install <signal> handler`, `cannot start the output thread` | 1 | process setup failed | report it |
-| `health=TX_STALL` | 1 if fatal | oldest TX frame not completing while the link is up | check PAUSE frames/flow control, driver state; restart; `--tx-stall-fatal-secs 0` to warn only |
+| `health=TX_STALL` | 1 if fatal | oldest TX frame not completing while the link is up | check PAUSE frames/flow control, driver state; restart; `[health] tx-stall-fatal-ms = 0` to warn only |
 | `health=FILL_STARVED` | — | no free frame to give the kernel for RX | usually follows a TX stall; check `tx_inflight` and `TX_STALL` |
 | `health=KICK_ERRORS` | 1 if fatal | kicks keep failing (not `ENETDOWN`) | check the device; `last-kick-error=` in the summary names the errno token |
+| `health=FRAMES_QUARANTINED` | 1 at `frames-quarantined-fatal` | the kernel handed back a descriptor that breaks the frame ownership contract; the frame is withheld for good | a kernel or driver bug (or memory corruption): note the kernel version and driver, `if<id>.af_xdp_port.frames_quarantined` and the RX invalid reasons; restart; report it |
+| `health=TX_INVALID_DESCS` | 1 at `tx-invalid-descs-fatal` | the kernel refused TX descriptors (`kernel_tx_invalid_descs`); those frames never complete | a geometry mismatch between the router and the kernel (UMEM, headroom, MTU) or a kernel bug: compare the device MTU and `max_frame`, restart; `TX_STALL` usually follows |
+| `reload failed: stage=health code=HEALTH_FATAL_BELOW_WARNING` | — | the reloaded `[health]` keys and the threshold flags disagree (fatal TX stall below the warning) | set both `tx-stall-warn-ms` and `tx-stall-fatal-ms` in the config, or drop the flag (section 7) |
 | `health=LINK_DOWN` | — | carrier or admin down | fix the link; forwarding resumes by itself |
 | `health=DEVICE_REMOVED` | 1 | the port device is gone | restore the device, then restart |
 | `health=DEVICE_RENAMED`, `checks code=UNVERIFIABLE probe=name` | 1 | the port's interface index carries another name than the config's `device` | rename it back or fix the config, then restart |

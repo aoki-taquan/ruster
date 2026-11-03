@@ -169,6 +169,20 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "unsolicited-syn-icmp",
     "via",
     "xdp-attach",
+    // OPS-LOG `[health]` and `[watch]`.
+    "fill-starved-warn-ms",
+    "frames-quarantined-fatal",
+    "health",
+    "health-interval-ms",
+    "kick-errors-fatal-ms",
+    "link-dump-interrupted-fatal",
+    "link-interval-ms",
+    "link-probe-failures-fatal",
+    "link-stale-ms",
+    "tx-invalid-descs-fatal",
+    "tx-stall-fatal-ms",
+    "tx-stall-warn-ms",
+    "watch",
 ];
 
 /// Parses bounded UTF-8 TOML using schema-version predispatch and exact V1 DTOs.

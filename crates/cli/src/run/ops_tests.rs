@@ -1492,3 +1492,445 @@ fn a_sigusr1_burst_prints_two_blocks_100_ms_apart() {
     assert_eq!(uptimes.len(), 2, "{}", outcome.out);
     assert!(uptimes[1] - uptimes[0] >= 100, "{uptimes:?}");
 }
+
+/// A WAN sample whose oldest in-flight frame never changes (stamp 0).
+fn stalled(polls: u64) -> PortSample {
+    PortSample {
+        interface: IfId(WAN),
+        polls,
+        tx_inflight: 1,
+        oldest_age_polls: polls,
+        kick_errors: 0,
+        kick_link_down: false,
+        fill_starved: 0,
+        fill_ring_occupancy: 8,
+        rx_packets: 0,
+        device_gone: false,
+    }
+}
+
+/// The test config with `[health]`/`[watch]` text appended.
+fn with_ops(extra: &str) -> ValidatedConfigV1 {
+    edited(|text| format!("{text}\n{extra}\n"))
+}
+
+/// `execute` over `config` with 100 ms per clock reading, stopping after
+/// `ticks` ticks with reloads at `reloads`.
+fn run_config(
+    host: &FakeHost,
+    config: ValidatedConfigV1,
+    settings: Settings,
+    source: FakeSource,
+    ticks: u32,
+    reloads: &[u32],
+) -> Outcome {
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let status = execute_with(
+        host,
+        config,
+        source,
+        settings,
+        &mut FakeClock {
+            step_us: 100_000,
+            ..FakeClock::default()
+        },
+        &StopAfterTicks::new(host, ticks, reloads),
+        &mut out,
+        &mut err,
+    );
+    let outcome = Outcome {
+        status,
+        out: String::from_utf8(out).expect("utf-8"),
+        err: String::from_utf8(err).expect("utf-8"),
+    };
+    super::super::log::tests::assert_classified(&outcome.err);
+    outcome
+}
+
+/// OPS-LOG: the `[health]`/`[watch]` keys of the document a reload applies
+/// take over from the next sample. A TX stall that only warned under the
+/// startup thresholds (fatal exit off by flag) ends the run once a reload
+/// sets `tx-stall-fatal-ms`; the run prints the settings it applied.
+#[test]
+fn a_reload_changes_the_health_thresholds_and_watch_intervals() {
+    let host = FakeHost::default();
+    host.state
+        .samples
+        .borrow_mut()
+        .extend((1..=1_000_u64).map(|polls| vec![stalled(polls)]));
+    let warn_only = Settings {
+        thresholds: super::super::watch::Thresholds::from_secs(1, 0, 5),
+        ..settings(CheckPolicy::default(), 0)
+    };
+    let next = with_ops(
+        "[health]\ntx-stall-fatal-ms = 2000\nframes-quarantined-fatal = 0\n\n\
+         [watch]\nlink-stale-ms = 7000\nlink-interval-ms = 250",
+    );
+    let outcome = run_full(
+        &host,
+        warn_only,
+        FakeSource::with([Ok(next)]),
+        &StopAfterTicks::new(&host, 1_000, &[100]),
+        &mut FakeClock {
+            step_us: 100_000,
+            ..FakeClock::default()
+        },
+    );
+    let err = &outcome.err;
+    let warned = err
+        .find("ruster run: warning: port=if2 health=TX_STALL")
+        .expect(err);
+    let applied = err
+        .find(
+            "ruster run: watch settings applied: tx-stall-warn-ms=1000 tx-stall-fatal-ms=2000 \
+             kick-errors-fatal-ms=5000 fill-starved-warn-ms=1000 link-probe-failures-fatal=3 \
+             link-dump-interrupted-fatal=10 frames-quarantined-fatal=0 \
+             tx-invalid-descs-fatal=64 health-interval-ms=0 link-interval-ms=250 \
+             link-stale-ms=7000\n",
+        )
+        .expect(err);
+    let fatal = err
+        .find("ruster run: fatal: port=if2 health=TX_STALL")
+        .expect(err);
+    assert!(warned < applied && applied < fatal, "{err}");
+    assert!(
+        err.contains("ruster run: reload applied: generation=2"),
+        "{err}"
+    );
+    assert_fatal(&outcome, &host, "TX_STALL");
+    // Without the reload the same stall never ends the run.
+    let host = FakeHost::default();
+    host.state
+        .samples
+        .borrow_mut()
+        .extend((1..=300_u64).map(|polls| vec![stalled(polls)]));
+    let outcome = run_full(
+        &host,
+        warn_only,
+        FakeSource::default(),
+        &StopAfterTicks::new(&host, 300, &[]),
+        &mut FakeClock {
+            step_us: 100_000,
+            ..FakeClock::default()
+        },
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(!outcome.err.contains("watch settings applied"));
+}
+
+/// OPS-LOG: a reload whose keys disagree with a flag (fatal below warning
+/// after the merge) fails like an invalid document and keeps the running
+/// settings; a startup with such a document is an invalid config (exit 2)
+/// before anything is opened.
+#[test]
+fn merged_thresholds_that_disagree_fail_closed() {
+    let slow_warning = "[health]\ntx-stall-warn-ms = 20000";
+    let host = FakeHost::default();
+    let outcome = ops(
+        &host,
+        FakeSource::with([Ok(with_ops(slow_warning))]),
+        &StopAfterTicks::new(&host, 40, &[10]),
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(
+        outcome.err.contains(
+            "ruster run: reload failed: stage=health code=HEALTH_FATAL_BELOW_WARNING \
+             path=health.tx-stall-fatal-ms limit=20000 actual=10000; generation 1 keeps running"
+        ),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains("watch settings applied"));
+    assert_eq!(line_value(&outcome.out, "reload.failed"), Some("1"));
+
+    let host = FakeHost::default();
+    let outcome = run_config(
+        &host,
+        with_ops(slow_warning),
+        settings(CheckPolicy::default(), 0),
+        FakeSource::default(),
+        40,
+        &[],
+    );
+    assert_eq!(outcome.status, EXIT_INVALID, "{}", outcome.err);
+    assert_eq!(
+        outcome.err,
+        "ruster run: invalid config: stage=health code=HEALTH_FATAL_BELOW_WARNING \
+         path=health.tx-stall-fatal-ms limit=20000 actual=10000\n"
+    );
+    assert!(host.events().is_empty());
+    // With the fatal exit off by flag the same document starts.
+    let host = FakeHost::default();
+    let outcome = run_config(
+        &host,
+        with_ops(slow_warning),
+        Settings {
+            thresholds: super::super::watch::Thresholds::from_secs(1, 0, 5),
+            ..settings(CheckPolicy::default(), 0)
+        },
+        FakeSource::default(),
+        40,
+        &[],
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+}
+
+/// OPS-LOG: a flag given with another value than its default is
+/// overridden by the document's key, with one warning per flag at startup.
+#[test]
+fn a_document_key_overrides_its_flag_with_a_warning() {
+    let host = FakeHost::default();
+    let outcome = run_config(
+        &host,
+        with_ops("[health]\ntx-stall-warn-ms = 3000\n\n[watch]\nlink-stale-ms = 2000"),
+        Settings {
+            thresholds: super::super::watch::Thresholds::from_secs(2, 10, 5),
+            link_stale_ms: 9_000,
+            ..settings(CheckPolicy::default(), 0)
+        },
+        FakeSource::default(),
+        40,
+        &[],
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(outcome.err.starts_with(
+        "ruster run: warning: --tx-stall-warn-secs is overridden by [health] tx-stall-warn-ms \
+         of the config\n\
+         ruster run: warning: --link-stale-secs is overridden by [watch] link-stale-ms of the \
+         config\n"
+    ));
+    // Default-valued flags under the same document: no warning.
+    let host = FakeHost::default();
+    let outcome = run_config(
+        &host,
+        with_ops("[health]\ntx-stall-warn-ms = 3000"),
+        settings(CheckPolicy::default(), 0),
+        FakeSource::default(),
+        40,
+        &[],
+    );
+    assert!(!outcome.err.contains("is overridden by"), "{}", outcome.err);
+}
+
+/// OPS-LOG: quarantined frames and kernel-refused TX descriptors are
+/// health conditions: growth warns once per episode, and
+/// the count since startup at the `[health]` threshold is fatal (exit 1,
+/// drained and closed like every fatal event).
+#[test]
+fn quarantined_frames_and_invalid_tx_descriptors_warn_and_become_fatal() {
+    let integrity = |frames: u64, descs: u64| {
+        vec![IntegritySample {
+            interface: IfId(WAN),
+            frames_quarantined: frames,
+            tx_invalid_descs: descs,
+        }]
+    };
+    let host = FakeHost::default();
+    host.state.integrity.borrow_mut().extend([
+        integrity(0, 0),
+        integrity(1, 0),
+        integrity(1, 0),
+        integrity(2, 0),
+        integrity(3, 0),
+    ]);
+    let outcome = run_config(
+        &host,
+        with_ops("[health]\nframes-quarantined-fatal = 3"),
+        settings(CheckPolicy::default(), 0),
+        FakeSource::default(),
+        200,
+        &[],
+    );
+    let lines: Vec<&str> = outcome
+        .err
+        .lines()
+        .filter(|line| line.contains("health=FRAMES_QUARANTINED"))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            // One episode: the samples 100 ms apart never stay quiet for
+            // INTEGRITY_QUIET_MS, so no recovered/warning pair in between.
+            "ruster run: warning: port=if2 health=FRAMES_QUARANTINED",
+            "ruster run: fatal: port=if2 health=FRAMES_QUARANTINED",
+        ],
+        "{}",
+        outcome.err
+    );
+    assert_fatal(&outcome, &host, "FRAMES_QUARANTINED");
+    assert_eq!(
+        line_value(&outcome.out, "if2.watch.frames_quarantined"),
+        Some("3")
+    );
+
+    // The default TX descriptor threshold (64).
+    let host = FakeHost::default();
+    host.state
+        .integrity
+        .borrow_mut()
+        .extend([integrity(0, 1), integrity(0, 63), integrity(0, 64)]);
+    let outcome = run_config(
+        &host,
+        config(),
+        settings(CheckPolicy::default(), 0),
+        FakeSource::default(),
+        200,
+        &[],
+    );
+    assert!(outcome
+        .err
+        .contains("ruster run: warning: port=if2 health=TX_INVALID_DESCS\n"));
+    assert_fatal(&outcome, &host, "TX_INVALID_DESCS");
+
+    // 0 turns the fatal exit off: warning only.
+    let host = FakeHost::default();
+    host.state
+        .integrity
+        .borrow_mut()
+        .extend([integrity(500, 500), integrity(1_000, 1_000)]);
+    let outcome = run_config(
+        &host,
+        with_ops("[health]\nframes-quarantined-fatal = 0\ntx-invalid-descs-fatal = 0"),
+        settings(CheckPolicy::default(), 0),
+        FakeSource::default(),
+        40,
+        &[],
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(outcome
+        .err
+        .contains("ruster run: warning: port=if2 health=TX_INVALID_DESCS\n"));
+    assert!(!outcome.err.contains("fatal: port"));
+}
+
+/// OPS-LOG: with the JSON translation every line of a whole run (startup,
+/// hardening, readiness, reload, on-demand stats, shutdown, summary) is
+/// one valid object with a known event code, the text and JSON forms
+/// carry the same lines, and every stats block is one `STATS` object.
+#[test]
+fn a_json_run_writes_one_valid_object_per_line() {
+    use super::super::log::tests::{parse_lines, Json};
+    use super::super::log::JsonLines;
+    use std::io::Write as _;
+
+    let run = |json: bool| {
+        let host = FakeHost::default();
+        host.state.inject_at.borrow_mut().extend([
+            (1, IfId(LAN), echo_request(1)),
+            (20, IfId(LAN), echo_request(2)),
+        ]);
+        let mut out = JsonLines::with_clock(Vec::new(), || 1_793_708_096_789);
+        let mut err = JsonLines::with_clock(Vec::new(), || 1_793_708_096_789);
+        let mut text_out = Vec::new();
+        let mut text_err = Vec::new();
+        let stop = StopAfterTicks::new(&host, 40, &[10]).with_stats(&[30]);
+        let mut clock = FakeClock {
+            step_us: 1_000,
+            ..FakeClock::default()
+        };
+        let source = FakeSource::with([Ok(echo_off())]);
+        let status = if json {
+            execute_with(
+                &host,
+                config(),
+                source,
+                settings(CheckPolicy::default(), 0),
+                &mut clock,
+                &stop,
+                &mut out,
+                &mut err,
+            )
+        } else {
+            execute_with(
+                &host,
+                config(),
+                source,
+                settings(CheckPolicy::default(), 0),
+                &mut clock,
+                &stop,
+                &mut text_out,
+                &mut text_err,
+            )
+        };
+        out.flush().expect("vec");
+        err.flush().expect("vec");
+        (
+            status,
+            out.into_inner(),
+            err.into_inner(),
+            text_out,
+            text_err,
+        )
+    };
+    let (status, out, err, _, _) = run(true);
+    assert_eq!(status, 0);
+    let events = parse_lines(&err);
+    let codes: Vec<&str> = events
+        .iter()
+        .map(|event| event.str("event").expect("event"))
+        .collect();
+    for code in [
+        "PRIVILEGES_DROPPED",
+        "READY",
+        "RELOAD_REQUESTED",
+        "RELOAD_CHECKED",
+        "RELOAD_APPLIED",
+        "SHUTDOWN_DRAINING",
+        "SHUTDOWN_SUMMARY",
+    ] {
+        assert!(codes.contains(&code), "{code} missing from {codes:?}");
+    }
+    assert!(
+        !codes.contains(&super::super::log::UNCLASSIFIED),
+        "{codes:?}"
+    );
+    let ready = &events[codes
+        .iter()
+        .position(|code| *code == "READY")
+        .expect("ready")];
+    assert_eq!(ready.str("level"), Some("info"));
+    assert_eq!(ready.str("ts"), Some("2026-11-03T12:14:56.789Z"));
+    let summary = events.last().expect("summary");
+    assert_eq!(summary.str("event"), Some("SHUTDOWN_SUMMARY"));
+    assert_eq!(
+        summary
+            .get("fields")
+            .and_then(|fields| fields.get("drain.calls")),
+        Some(&Json::Number("1".into()))
+    );
+    let stats = parse_lines(&out);
+    let kinds: Vec<_> = stats
+        .iter()
+        .map(|block| {
+            assert_eq!(block.str("event"), Some("STATS"));
+            block
+                .get("fields")
+                .and_then(|fields| fields.str("kind"))
+                .expect("kind")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(kinds, ["on-demand", "final"]);
+    let last = stats[1].get("stats").expect("stats");
+    assert_eq!(
+        last.get("observer.generation"),
+        Some(&Json::Number("2".into()))
+    );
+    assert_eq!(last.get("reload.applied"), Some(&Json::Number("1".into())));
+    assert_eq!(last.str("watch.state"), Some("ok"));
+
+    // The text run of the same script: same lines, one object each.
+    let (status, _, _, text_out, text_err) = run(false);
+    assert_eq!(status, 0);
+    let text_err = String::from_utf8(text_err).expect("utf-8");
+    assert_eq!(text_err.lines().count(), events.len(), "{text_err}");
+    for (line, event) in text_err.lines().zip(&events) {
+        assert_eq!(
+            Some(line.strip_prefix("ruster run: ").unwrap_or(line)),
+            event.str("msg")
+        );
+    }
+    let text_out = String::from_utf8(text_out).expect("utf-8");
+    assert_eq!(text_out.matches("ruster-run-stats ").count(), stats.len());
+}

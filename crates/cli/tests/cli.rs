@@ -1819,3 +1819,88 @@ fn plan_shows_a_flushed_firewall_without_reevaluate() {
     assert!(out.contains("  firewall carried reevaluate\n"), "{out}");
     assert!(out.contains("  firewall_flows invalidated\n"), "{out}");
 }
+
+/// OPS-LOG: `--log-format json` turns the refusals before startup into
+/// one JSON line each (the `ruster-run-log/v1` schema; the in-process tests
+/// parse every field), a `[health]` key out of range is a typed invalid
+/// config, and a bad format value is a usage error.
+#[test]
+fn run_json_log_format_reports_refusals_as_json_lines() {
+    let one_line = |output: &Output, event: &str, level: &str| {
+        assert!(output.stdout.is_empty());
+        let stderr = text(&output.stderr);
+        assert!(stderr.is_ascii(), "{stderr}");
+        let lines: Vec<&str> = stderr.lines().collect();
+        assert_eq!(lines.len(), 1, "{stderr}");
+        let line = lines[0];
+        assert!(
+            line.starts_with("{\"schema\":\"ruster-run-log/v1\",\"ts\":\""),
+            "{line}"
+        );
+        assert!(
+            line.contains(&format!(
+                "\",\"level\":\"{level}\",\"event\":\"{event}\",\"msg\":"
+            )),
+            "{line}"
+        );
+        assert!(line.ends_with('}'), "{line}");
+        line.to_owned()
+    };
+    let sim = run(&[
+        "run",
+        "--log-format",
+        "json",
+        "--config",
+        &fixture("router-v1.toml"),
+    ]);
+    assert_eq!(status(&sim), 2);
+    let line = one_line(&sim, "CONFIG_INVALID", "error");
+    assert!(
+        line.contains("\"fields\":{\"stage\":\"backend\",\"code\":\"SIM_BACKEND\"}"),
+        "{line}"
+    );
+    let missing = run(&[
+        "run",
+        "--log-format=json",
+        "--config",
+        "/nonexistent/ruster-run.toml",
+    ]);
+    assert_eq!(status(&missing), 1);
+    one_line(&missing, "CONFIG_UNREADABLE", "error");
+
+    let dir = scratch();
+    let v1 = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let config = dir.join("health.toml");
+    fs::write(&config, format!("{v1}\n[health]\ntx-stall-warn-ms = 5\n")).unwrap();
+    let health = run(&[
+        "run",
+        "--log-format",
+        "json",
+        "--config",
+        config.to_str().expect("utf-8"),
+    ]);
+    assert_eq!(status(&health), 2);
+    let line = one_line(&health, "CONFIG_INVALID", "error");
+    assert!(
+        line.contains(
+            "\"fields\":{\"stage\":\"validate\",\"code\":\"HEALTH_VALUE_OUT_OF_RANGE\",\
+             \"path\":\"health.tx-stall-warn-ms\",\"limit\":100,\"actual\":5}"
+        ),
+        "{line}"
+    );
+    // The text default is unchanged.
+    let text_run = run(&["run", "--config", config.to_str().expect("utf-8")]);
+    assert_eq!(
+        text(&text_run.stderr),
+        "ruster: invalid config: stage=validate code=HEALTH_VALUE_OUT_OF_RANGE \
+         path=health.tx-stall-warn-ms limit=100 actual=5\n"
+    );
+    // `validate` checks the same keys.
+    let validate = ruster(&["validate".as_ref(), config.as_os_str()]);
+    assert_eq!(status(&validate), 2);
+    assert!(text(&validate.stderr).contains("code=HEALTH_VALUE_OUT_OF_RANGE"));
+
+    let bad = run(&["run", "--log-format", "xml", "--config", "a.toml"]);
+    assert_eq!(status(&bad), 2);
+    assert!(text(&bad.stderr).contains("option --log-format needs text or json"));
+}

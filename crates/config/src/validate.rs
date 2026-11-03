@@ -26,8 +26,8 @@ use ruster_io_xdp::native_profile::{
 
 use crate::{
     AfPacketPortV1, AfPacketV1, AfXdpModeV1, AfXdpPortV1, BackendKindV1, BackendV1, ConfigV1,
-    ExistingXdpProgramV1, FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1,
-    Nat44Icmpv4ErrorsV1, Nat44TcpInboundRstV1, ReloadStateV1, SourcePath, VersionedConfig,
+    ExistingXdpProgramV1, FirewallActionV1, FirewallProtocolV1, HealthV1, Nat44FilteringV1,
+    Nat44Icmpv4ErrorsV1, Nat44TcpInboundRstV1, ReloadStateV1, SourcePath, VersionedConfig, WatchV1,
     XdpAttachModeV1,
 };
 
@@ -256,6 +256,15 @@ pub enum ValidationCode {
     BackendRingTooLarge,
     /// The rings of all ports exceed [`MAX_AF_PACKET_RING_BYTES`].
     BackendTotalRingTooLarge,
+    /// A `[health]` key outside its range (OPS-LOG; `limit` is the bound
+    /// it crossed).
+    HealthValueOutOfRange,
+    /// `[health] tx-stall-fatal-ms` is neither 0 nor at least
+    /// `tx-stall-warn-ms`.
+    HealthFatalBelowWarning,
+    /// A `[watch]` interval outside its range (OPS-LOG; `limit` is the
+    /// bound it crossed).
+    WatchIntervalOutOfRange,
 }
 
 impl ValidationCode {
@@ -357,6 +366,9 @@ impl ValidationCode {
             Self::BackendRetireTimeoutOutOfRange => "BACKEND_RETIRE_TIMEOUT_OUT_OF_RANGE",
             Self::BackendRingTooLarge => "BACKEND_RING_TOO_LARGE",
             Self::BackendTotalRingTooLarge => "BACKEND_TOTAL_RING_TOO_LARGE",
+            Self::HealthValueOutOfRange => "HEALTH_VALUE_OUT_OF_RANGE",
+            Self::HealthFatalBelowWarning => "HEALTH_FATAL_BELOW_WARNING",
+            Self::WatchIntervalOutOfRange => "WATCH_INTERVAL_OUT_OF_RANGE",
         }
     }
 }
@@ -1182,9 +1194,25 @@ pub struct ValidatedConfigV1 {
     storage: RuntimeStorageShapeV1,
     backend: ValidatedBackendV1,
     reload_state: ReloadStateV1,
+    health: HealthV1,
+    watch: WatchV1,
 }
 
 impl ValidatedConfigV1 {
+    /// `[health]` (OPS-LOG), every key within its bound; `None` for a key
+    /// the document does not set (all `None` without the table).
+    #[must_use]
+    pub const fn health(&self) -> HealthV1 {
+        self.health
+    }
+
+    /// `[watch]` (OPS-LOG), every key within its bound; `None` for a key
+    /// the document does not set.
+    #[must_use]
+    pub const fn watch(&self) -> WatchV1 {
+        self.watch
+    }
+
     /// `[reload] state` ([`ReloadStateV1::Carry`] when absent): what an
     /// applied reload to this document does with runtime state.
     #[must_use]
@@ -1359,6 +1387,8 @@ fn validate_v1(
         ));
     }
     preflight_public_dto(&config)?;
+    let health = validate_health(config.health.unwrap_or_default())?;
+    let watch = validate_watch(config.watch.unwrap_or_default())?;
     let mut interface_records = Vec::with_capacity(config.interfaces.len());
     for (index, source) in config.interfaces.into_iter().enumerate() {
         let base = indexed_path("interfaces", index);
@@ -2293,6 +2323,8 @@ fn validate_v1(
         storage,
         backend,
         reload_state: config.reload.unwrap_or_default().state,
+        health,
+        watch,
     })
 }
 
@@ -2368,6 +2400,152 @@ fn validate_fragment_tracking(
             held_slot_bytes,
         }),
     ))
+}
+
+/// Bounds of the `[health]` durations (milliseconds): 100 ms to one hour.
+pub const HEALTH_MS_RANGE: (u64, u64) = (100, 3_600_000);
+/// Bounds of `[health] link-probe-failures-fatal`.
+pub const HEALTH_LINK_PROBE_FAILURES_RANGE: (u64, u64) = (1, 100);
+/// Bounds of `[health] link-dump-interrupted-fatal`.
+pub const HEALTH_LINK_DUMP_INTERRUPTED_RANGE: (u64, u64) = (1, 1_000);
+/// Largest `[health] frames-quarantined-fatal` and
+/// `tx-invalid-descs-fatal` (0 disables the fatal exit).
+pub const HEALTH_INTEGRITY_FATAL_MAX: u64 = 1_000_000;
+/// Bounds of `[watch] health-interval-ms`. At least 100 ms: `KICK_ERRORS`
+/// needs growth in every sample and `FILL_STARVED` a sample without RX,
+/// so a much shorter interval would sample between kick retries and
+/// arrivals and rarely see either (PR #339 review L4).
+pub const WATCH_HEALTH_INTERVAL_RANGE: (u64, u64) = (100, 60_000);
+/// Bounds of `[watch] link-interval-ms`.
+pub const WATCH_LINK_INTERVAL_RANGE: (u64, u64) = (100, 60_000);
+/// Bounds of `[watch] link-stale-ms`.
+pub const WATCH_LINK_STALE_RANGE: (u64, u64) = (1_000, 3_600_000);
+
+/// Checks `value` of `table.key` against `range` (inclusive); `zero_ok`
+/// also accepts 0 (a disabled fatal exit).
+fn check_ops_value(
+    code: ValidationCode,
+    table: &str,
+    key: &str,
+    value: Option<u64>,
+    range: (u64, u64),
+    zero_ok: bool,
+) -> Result<(), ValidationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if zero_ok && value == 0 {
+        return Ok(());
+    }
+    let (min, max) = range;
+    if value < min {
+        return Err(ValidationError::bounded(
+            code,
+            path(&[table, key]),
+            min,
+            value,
+        ));
+    }
+    if value > max {
+        return Err(ValidationError::bounded(
+            code,
+            path(&[table, key]),
+            max,
+            value,
+        ));
+    }
+    Ok(())
+}
+
+/// Bounded validation of `[health]` (OPS-LOG): every key in range and a
+/// nonzero `tx-stall-fatal-ms` at least `tx-stall-warn-ms` when both are
+/// set (the CLI checks the merged values again, with the flag fallback).
+fn validate_health(health: HealthV1) -> Result<HealthV1, ValidationError> {
+    let code = ValidationCode::HealthValueOutOfRange;
+    for (key, value, range, zero_ok) in [
+        (
+            "tx-stall-warn-ms",
+            health.tx_stall_warn_ms,
+            HEALTH_MS_RANGE,
+            false,
+        ),
+        (
+            "tx-stall-fatal-ms",
+            health.tx_stall_fatal_ms,
+            HEALTH_MS_RANGE,
+            true,
+        ),
+        (
+            "kick-errors-fatal-ms",
+            health.kick_errors_fatal_ms,
+            HEALTH_MS_RANGE,
+            true,
+        ),
+        (
+            "fill-starved-warn-ms",
+            health.fill_starved_warn_ms,
+            HEALTH_MS_RANGE,
+            false,
+        ),
+        (
+            "link-probe-failures-fatal",
+            health.link_probe_failures_fatal,
+            HEALTH_LINK_PROBE_FAILURES_RANGE,
+            false,
+        ),
+        (
+            "link-dump-interrupted-fatal",
+            health.link_dump_interrupted_fatal,
+            HEALTH_LINK_DUMP_INTERRUPTED_RANGE,
+            false,
+        ),
+        (
+            "frames-quarantined-fatal",
+            health.frames_quarantined_fatal,
+            (1, HEALTH_INTEGRITY_FATAL_MAX),
+            true,
+        ),
+        (
+            "tx-invalid-descs-fatal",
+            health.tx_invalid_descs_fatal,
+            (1, HEALTH_INTEGRITY_FATAL_MAX),
+            true,
+        ),
+    ] {
+        check_ops_value(code, "health", key, value, range, zero_ok)?;
+    }
+    if let (Some(warn), Some(fatal)) = (health.tx_stall_warn_ms, health.tx_stall_fatal_ms) {
+        if fatal != 0 && fatal < warn {
+            return Err(ValidationError::bounded(
+                ValidationCode::HealthFatalBelowWarning,
+                path(&["health", "tx-stall-fatal-ms"]),
+                warn,
+                fatal,
+            ));
+        }
+    }
+    Ok(health)
+}
+
+/// Bounded validation of `[watch]` (OPS-LOG).
+fn validate_watch(watch: WatchV1) -> Result<WatchV1, ValidationError> {
+    let code = ValidationCode::WatchIntervalOutOfRange;
+    for (key, value, range) in [
+        (
+            "health-interval-ms",
+            watch.health_interval_ms,
+            WATCH_HEALTH_INTERVAL_RANGE,
+        ),
+        (
+            "link-interval-ms",
+            watch.link_interval_ms,
+            WATCH_LINK_INTERVAL_RANGE,
+        ),
+        ("link-stale-ms", watch.link_stale_ms, WATCH_LINK_STALE_RANGE),
+    ] {
+        check_ops_value(code, "watch", key, value, range, false)?;
+    }
+    Ok(watch)
 }
 
 /// The longest IPv4 datagram an AF_XDP frame can carry: the largest
