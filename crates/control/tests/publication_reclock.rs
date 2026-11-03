@@ -92,10 +92,12 @@ fn candidate(generation: u64) -> ValidatedCandidate {
         Interface {
             id: LAN,
             mac: MacAddress(LAN_MAC),
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: MacAddress(WAN_MAC),
+            mtu: 1500,
         },
     ];
     let bindings = [

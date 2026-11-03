@@ -76,8 +76,9 @@ pub use icmpv4_error::{
     Icmpv4ErrorPolicyError, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationPermit,
     Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
     Icmpv4TimeExceededAction, Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition,
-    NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
-    ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
+    NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS,
+    ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS, ICMPV4_ERROR_MAX_FRAME_LEN,
+    ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
     ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use icmpv4_translated_limit::{
@@ -144,4 +145,7 @@ pub use resolution::{
     ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
     RESOLUTION_INDEX_CHAIN_LIMIT,
 };
-pub use route::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError};
+pub use route::{
+    IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError,
+    ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
+};

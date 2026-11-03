@@ -20,7 +20,7 @@
 
 use std::fmt;
 
-use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
+use ruster_config::{InterfaceBindingV1, ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
 use ruster_control::{ActivationError, SequencerError, StorageAllocationError};
 use ruster_core::IfId;
 use ruster_io_xdp_native::{
@@ -29,7 +29,8 @@ use ruster_io_xdp_native::{
 };
 
 use super::checks::{
-    evaluate_device, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe, Warnings,
+    evaluate_config_mtu, evaluate_device, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure,
+    Probe, Warnings,
 };
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
 use super::fs_confine::{FsFailure, FsReport};
@@ -479,10 +480,13 @@ pub enum Interrupt {
 
 /// Opens, checks, and attaches every port of `backend` in `IfId` order
 /// into `opened`. On `Err` the caller must [`OpenedPorts::close_all`].
-/// `warn` receives each port's non-fatal check findings.
+/// `warn` receives each port's non-fatal check findings. `interfaces` are
+/// the configured interfaces, whose `mtu` the device must carry
+/// ([`evaluate_config_mtu`]).
 pub fn open_ports<H: PortHost, S: StopSignal>(
     opened: &mut OpenedPorts<'_, H>,
     backend: &ValidatedAfXdpV1,
+    interfaces: &[InterfaceBindingV1],
     policy: CheckPolicy,
     stop: &S,
     mut warn: impl FnMut(IfId, &Warnings),
@@ -524,7 +528,21 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
                 Failure::Check(CheckFailure::Unverifiable(Probe::Name)),
             ));
         }
-        let warnings = evaluate_device(&facts, policy)
+        let mut warnings = evaluate_device(&facts, policy)
+            .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
+        // Validation binds every port to a configured interface; a miss
+        // fails closed.
+        let config_mtu = interfaces
+            .iter()
+            .find(|binding| binding.id() == interface)
+            .map(InterfaceBindingV1::mtu)
+            .ok_or_else(|| {
+                fail(
+                    Stage::Checks,
+                    Failure::Check(CheckFailure::Unverifiable(Probe::Mtu)),
+                )
+            })?;
+        warnings.mtu_below_device = evaluate_config_mtu(config_mtu, &facts)
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
         entry.link = link_target(interface, &facts);
         warn(interface, &warnings);

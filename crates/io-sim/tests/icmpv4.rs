@@ -22,10 +22,12 @@ fn interfaces() -> [Interface; 2] {
         Interface {
             id: LAN,
             mac: LOCAL_MAC,
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: 1500,
         },
     ]
 }

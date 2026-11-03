@@ -23,10 +23,27 @@ impl Ipv4Address {
     }
 }
 
+/// The smallest IPv4 MTU every link must carry (RFC 791: "Every internet
+/// module must be able to forward a datagram of 68 octets without further
+/// fragmentation"). [`crate::ForwardingSnapshot::new`] rejects a smaller
+/// interface MTU.
+pub const IPV4_MIN_MTU: u16 = 68;
+
+/// The Ethernet II MTU (RFC 894): the default interface MTU of the config.
+pub const ETHERNET_DEFAULT_MTU: u16 = 1500;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Interface {
     pub id: IfId,
     pub mac: MacAddress,
+    /// The IPv4 MTU of the link (the largest IPv4 datagram, header
+    /// included, the interface sends without fragmentation; the Ethernet
+    /// header is not part of it). Forwarding refuses a longer datagram out
+    /// of this interface (RFC 1812 §§4.2.2.7, 5.2.7.1: Fragmentation Needed
+    /// with this value as the Next-Hop MTU of RFC 1191 §4 when DF is set),
+    /// and every ICMPv4 error the router sends out of it fits it. At least
+    /// [`IPV4_MIN_MTU`].
+    pub mtu: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

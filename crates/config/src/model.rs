@@ -41,6 +41,13 @@ pub struct InterfaceV1 {
     pub name: String,
     pub device: String,
     pub mac: String,
+    /// IPv4 MTU of the link (the largest IPv4 datagram the interface sends,
+    /// without the Ethernet header); absent means
+    /// [`ruster_core::ETHERNET_DEFAULT_MTU`] (1500). 68
+    /// ([`ruster_core::IPV4_MIN_MTU`]) to 65535. Forwarding sends nothing
+    /// longer out of the interface (Fragmentation Needed with this MTU for
+    /// DF datagrams). `ruster run` refuses an MTU above the device's.
+    pub mtu: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -153,6 +160,17 @@ pub struct Icmpv4ErrorPolicyV1 {
     /// [`ruster_core::ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS`] (1 s).
     #[serde(default = "default_port_unreachable_interval_ms")]
     pub port_unreachable_interval_ms: u64,
+    /// Minimum interval between two ICMP Fragmentation Needed errors
+    /// (MTU1, Path MTU Discovery) on one egress. Fragmentation Needed has
+    /// its own limiter, so other errors never use it up. Must not be 0.
+    /// Default [`ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS`]
+    /// (10 ms).
+    #[serde(default = "default_fragmentation_needed_interval_ms")]
+    pub fragmentation_needed_interval_ms: u64,
+}
+
+const fn default_fragmentation_needed_interval_ms() -> u64 {
+    ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS
 }
 
 const fn default_port_unreachable_interval_ms() -> u64 {
@@ -228,6 +246,11 @@ pub struct Icmpv4ErrorGenerateV1 {
     /// Destination Unreachable, Host (Type 3/Code 1) after fruitless ARP.
     #[serde(default = "enabled")]
     pub host_unreachable: bool,
+    /// Destination Unreachable, Fragmentation Needed and DF Set (Type
+    /// 3/Code 4) for a DF datagram longer than its egress MTU. Turning it
+    /// off black-holes Path MTU Discovery (RFC 1191) through the router.
+    #[serde(default = "enabled")]
+    pub fragmentation_needed: bool,
 }
 
 impl Default for Icmpv4ErrorGenerateV1 {
@@ -236,6 +259,7 @@ impl Default for Icmpv4ErrorGenerateV1 {
             time_exceeded: true,
             net_unreachable: true,
             host_unreachable: true,
+            fragmentation_needed: true,
         }
     }
 }

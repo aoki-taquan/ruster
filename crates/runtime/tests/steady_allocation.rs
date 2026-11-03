@@ -185,10 +185,12 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: 1500,
         },
     ];
     let bindings = [

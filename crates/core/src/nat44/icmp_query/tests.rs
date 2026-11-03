@@ -33,10 +33,12 @@ fn with_config<R>(
         Interface {
             id: INSIDE,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: OUTSIDE,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: 1500,
         },
     ];
     let neighbors: [Neighbor; 0] = [];
@@ -185,10 +187,12 @@ fn config_validates_the_identifier_pool_and_redacts_authority() {
         Interface {
             id: INSIDE,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: OUTSIDE,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: 1500,
         },
     ];
     let bindings = [LocalIpv4Binding {

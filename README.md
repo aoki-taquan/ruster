@@ -271,6 +271,37 @@ echo-reply = true          # false: Echo Requestを ICMPV4_ECHO_DISABLED でdrop
 time-exceeded = true       # Type 11/Code 0  -> icmpv4_errors.disabled_time_exceeded
 net-unreachable = true     # Type 3/Code 0   -> icmpv4_errors.disabled_destination_unreachable
 host-unreachable = true    # Type 3/Code 1   -> icmpv4_errors.disabled_host_unreachable
+fragmentation-needed = true # Type 3/Code 4  -> icmpv4_errors.disabled_fragmentation_needed
+```
+
+interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は
+`INTERFACES`のrestart-required）です。forwardingはTTL判定とfirewallの後、NAT/firewall stateを
+commitする前に、受信frameを送るすべてのIPv4 decision（plain、NAT44 UDP/TCP/ICMP query、
+hairpin、翻訳したICMP error、local Echo Reply）のTotal Lengthをegress interfaceのMTUと比べます
+（NATは長さを変えません）。ちょうどMTUは通り、超過はbyte不変dropです: DF付きは
+`IPV4_FRAGMENTATION_NEEDED`とDestination Unreachable, Fragmentation Needed and DF Set
+（Type 3/Code 4、RFC 1812 §5.2.7.1）で、ICMP header 2語目の下位16 bitにegress MTUを
+Next-Hop MTUとして入れ（RFC 1191 §4）、NAT前の受信datagramを引用して元sourceへ返します
+（PMTUD）。他のerrorと同じsuppressionとreverse routeを通り、limiterは専用class
+（`[icmpv4-errors.policy] fragmentation-needed-interval-ms`、default 10 ms、egressごと）なので
+Time Exceeded等のfloodに使い切られません（`icmpv4-errors.capacity.states`は2 × interfaces以上、
+Port Unreachableも送るなら+1）。Ethernet payload（Total Length後のbytesを含む）がMTUを超える
+frameは`IPV4_FRAME_EXCEEDS_MTU`でdropします。
+DFなしは`IPV4_FRAGMENTATION_REQUIRED`でICMPなし（fragmentationは未実装のdeviation、
+NAT44-019L、MTU2。NATを通るDFなしdatagramはその前にnon-atomicとして落ちます）、local Echo
+Replyの超過は`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。firewallが拒否するdatagramはfirewallの
+reasonで落ちerrorを生みません。router生成のすべてのICMP errorはreverse egressのMTUに
+収まるようquoteを切ります。`ruster run`はconfigのMTUがdeviceのMTU以下であることをattach前に
+確かめ、超えれば`MTU_BELOW_CONFIG`でexit 1です（device MTUがconfigより大きいのは可で、
+`MTU_BELOW_DEVICE`を警告します）。
+
+```toml
+[[interfaces]]
+id = 2
+name = "wan"
+device = "eth1"
+mac = "02:00:00:00:00:02"
+mtu = 1400                 # 省略時1500。deviceのMTU以下（ruster runが確認）
 ```
 
 EtherTypeを読んだ直後、IPv4/ARPはsnapshot上の正確なingress interfaceを解決し、
@@ -519,13 +550,15 @@ unsolicited-syn-holds = 64       # 省略時64。quote table（本番上限4096�
 
 [icmpv4-errors.policy]
 port-unreachable-interval-ms = 1000  # 省略時1000。Port Unreachable専用limiter（egressごと）。restart-required
+fragmentation-needed-interval-ms = 10  # 省略時10。Fragmentation Needed専用limiter（egressごと、0不可）。restart-required
 
 [icmpv4-errors.translated]  # 省略可。outsideからの変換errorの(inside host, 引用remote)ごとの上限（NAT44-065）。restart-required
 rate-per-second = 100       # 省略時100（1〜1000000、無制限設定なし）
 burst = 100                 # 省略時100（同時刻に届く上限）。両方1000000で実質off
 
 [icmpv4-errors.capacity]
-states = 8   # delayed Port Unreachableがon（switch onかつholds > 0）ならinterface数 + 1以上が必須
+states = 8   # Fragmentation Neededがon（default）なら2 × interface数以上、delayed Port Unreachableもon（switch onかつholds > 0）なら2 × interface数 + 1以上が必須（Fragmentation Needed offならinterface数 + 1）
+actions = 8  # states下限以上を推奨（少ないと一つのclassが次の実行までaction_fullになり得る）
 ```
 
 | `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |
@@ -946,7 +979,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは54.42 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは54.45 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>

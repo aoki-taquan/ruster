@@ -290,6 +290,30 @@ pub enum DropReason {
     /// internal address that already holds the per-host limit of peers on live query mappings
     /// (N6). Nothing was created or evicted.
     Nat44IcmpHostPeerQuotaExceeded = 181,
+    /// A forwarded IPv4 datagram with Don't Fragment set is longer than the
+    /// MTU of its egress interface (RFC 1812 §§4.2.2.7, 5.2.7.1). It is
+    /// discarded and, unless suppressed, ICMP Destination Unreachable,
+    /// Fragmentation Needed and DF Set (Type 3, Code 4) carrying the egress
+    /// MTU as Next-Hop MTU (RFC 1191 §4) is queued to its source (MTU1).
+    Ipv4FragmentationNeeded = 182,
+    /// A forwarded IPv4 datagram without Don't Fragment is longer than the
+    /// MTU of its egress interface. RFC 1812 §4.2.2.7 requires the router to
+    /// fragment it (RFC 791); fragmentation is not implemented yet, so it is
+    /// discarded without an ICMP error (a tracked deviation, NAT44-019L,
+    /// until MTU2).
+    Ipv4FragmentationRequired = 183,
+    /// The local Echo Reply to a valid Echo Request would be longer than the
+    /// MTU of its egress interface (the request arrived over a device MTU
+    /// above the configured interface MTU). It is not sent; the router does
+    /// not fragment its own datagrams.
+    Icmpv4EchoReplyExceedsMtu = 184,
+    /// A datagram within the egress MTU arrived in a frame whose Ethernet
+    /// payload (the datagram plus bytes after its Total Length) is longer
+    /// than that MTU. The backend sends the whole frame, so it would exceed
+    /// the link MTU; it is discarded without an ICMP error (the datagram
+    /// itself fits). Minimum Ethernet padding (to 60 bytes) never trips it,
+    /// since every MTU is at least 68 (MTU1 review).
+    Ipv4FrameExceedsMtu = 185,
 }
 
 use DropReason::*;
@@ -297,7 +321,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 181] = [
+    pub const ALL: [Self; 185] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -479,6 +503,10 @@ impl DropReason {
         Nat44UdpHostPeerQuotaExceeded,
         Nat44TcpHostSessionQuotaExceeded,
         Nat44IcmpHostPeerQuotaExceeded,
+        Ipv4FragmentationNeeded,
+        Ipv4FragmentationRequired,
+        Icmpv4EchoReplyExceedsMtu,
+        Ipv4FrameExceedsMtu,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -677,6 +705,10 @@ impl DropReason {
             Nat44UdpHostPeerQuotaExceeded => "NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED",
             Nat44TcpHostSessionQuotaExceeded => "NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED",
             Nat44IcmpHostPeerQuotaExceeded => "NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED",
+            Ipv4FragmentationNeeded => "IPV4_FRAGMENTATION_NEEDED",
+            Ipv4FragmentationRequired => "IPV4_FRAGMENTATION_REQUIRED",
+            Icmpv4EchoReplyExceedsMtu => "ICMPV4_ECHO_REPLY_EXCEEDS_MTU",
+            Ipv4FrameExceedsMtu => "IPV4_FRAME_EXCEEDS_MTU",
         }
     }
 }
@@ -700,6 +732,8 @@ pub enum SnapshotError {
     DuplicateLocalIpv4Binding,
     LocalIpv4BindingUnknownInterface,
     LocalIpv4BindingUnspecified,
+    /// An interface MTU is below [`crate::IPV4_MIN_MTU`] (RFC 791).
+    InterfaceMtuBelowMinimum,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -947,6 +981,9 @@ impl<'a> ForwardingSnapshot<'a> {
                 .any(|candidate| candidate.id == interface.id)
             {
                 return Err(SnapshotError::DuplicateInterface);
+            }
+            if interface.mtu < crate::IPV4_MIN_MTU {
+                return Err(SnapshotError::InterfaceMtuBelowMinimum);
             }
         }
         for (index, neighbor) in neighbors.iter().enumerate() {
@@ -1344,6 +1381,11 @@ fn calculate_snapshot_authority(
         for octet in interface.mac.0 {
             hash = mix(hash, u64::from(octet));
         }
+        // Mixed only when non-default so existing publications keep their
+        // authority values.
+        if interface.mtu != crate::ETHERNET_DEFAULT_MTU {
+            hash = mix(hash, 0x1_0000 | u64::from(interface.mtu));
+        }
     }
     hash = mix(hash, 0xff);
     for binding in local_ipv4 {
@@ -1436,6 +1478,12 @@ pub enum TraceEvent {
         disposition: Icmpv4ErrorDisposition,
     },
     Icmpv4DestinationUnreachableDisposition {
+        ingress: IfId,
+        disposition: Icmpv4ErrorDisposition,
+    },
+    /// The disposition of the Fragmentation Needed error (Type 3, Code 4)
+    /// about a DF datagram longer than its egress MTU (MTU1).
+    Icmpv4FragmentationNeededDisposition {
         ingress: IfId,
         disposition: Icmpv4ErrorDisposition,
     },
@@ -2560,6 +2608,19 @@ where
                 ) {
                     Ok(decision)
                 } else {
+                    // After every plan is known to commit and before the
+                    // frame is rewritten, so the error quotes the datagram
+                    // as received and no NAT or firewall state is created
+                    // for a datagram that is not sent.
+                    check_egress_mtu(
+                        &*frame,
+                        snapshot,
+                        ingress,
+                        decision,
+                        &mut resolution,
+                        &mut icmpv4_errors,
+                        trace,
+                    )?;
                     apply_decision(frame, decision).map(|()| decision)
                 }
             })
@@ -2714,6 +2775,124 @@ where
         });
     }
     report
+}
+
+/// The egress MTU rule of RFC 1812 §4.2.2.7 for every IPv4 decision that
+/// sends the received frame (forwarded, NAT-translated, hairpinned,
+/// translated ICMP error, local Echo Reply).
+///
+/// NAT never changes the datagram length, so the received Total Length is
+/// the length on the egress link. A datagram of at most the egress MTU
+/// passes (one indexed interface lookup and one compare). A longer one is
+/// discarded:
+///
+/// - DF set: [`DropReason::Ipv4FragmentationNeeded`], and an ICMP
+///   Destination Unreachable, Fragmentation Needed and DF Set (Type 3,
+///   Code 4) whose Next-Hop MTU is the egress MTU (RFC 1191 §4) goes to the
+///   datagram's source (RFC 1812 §5.2.7.1) through the generated-ICMPv4
+///   path: RFC 1812 §4.3.2.7 suppression (no error about an ICMP error, a
+///   non-initial fragment, or a non-unicast source or destination), the
+///   reverse route and its interface address as source (§4.3.2.4), the
+///   reverse neighbor, the per-kind switch, and the limiter (§4.3.2.8).
+///   The quote is the datagram as received, before any translation, so an
+///   inside host behind the NAT sees its own datagram and an outside host
+///   the one it sent to the public address.
+/// - DF clear: [`DropReason::Ipv4FragmentationRequired`] without an error.
+///   RFC 1812 §4.2.2.7 requires fragmentation, which is not implemented
+///   (NAT44-019L, MTU2).
+/// - A local Echo Reply: [`DropReason::Icmpv4EchoReplyExceedsMtu`]; the
+///   router does not fragment its own datagrams.
+///
+/// A datagram within the MTU in a frame that carries bytes after its Total
+/// Length beyond the MTU is [`DropReason::Ipv4FrameExceedsMtu`]: the
+/// backend sends the whole frame, which must fit the link.
+#[allow(clippy::too_many_arguments)]
+fn check_egress_mtu<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    decision: PacketDecision,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    if matches!(
+        decision,
+        PacketDecision::ArpReply(_)
+            | PacketDecision::ConsumeArp(_)
+            | PacketDecision::ConsumeIpv4Local
+    ) {
+        return Ok(());
+    }
+    let mtu = snapshot
+        .interface(decision.egress())
+        .ok_or(InterfaceMiss)?
+        .mtu;
+    let total_len =
+        packet::read_u16(frame, packet::ETHERNET_HEADER_LEN + 2).ok_or(Ipv4HeaderTruncated)?;
+    // The backend sends the whole frame: bytes after Total Length count too.
+    let payload_len = frame.len() - packet::ETHERNET_HEADER_LEN;
+    if total_len <= mtu {
+        if payload_len > usize::from(mtu) {
+            return Err(Ipv4FrameExceedsMtu);
+        }
+        return Ok(());
+    }
+    exceeds_egress_mtu(
+        frame,
+        snapshot,
+        ingress,
+        decision,
+        mtu,
+        resolution,
+        icmpv4_errors,
+        trace,
+    )
+}
+
+/// The cold half of [`check_egress_mtu`]: the datagram is longer than
+/// `mtu`.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn exceeds_egress_mtu<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    decision: PacketDecision,
+    mtu: u16,
+    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    if matches!(decision, PacketDecision::Icmpv4EchoReply(_)) {
+        return Err(Icmpv4EchoReplyExceedsMtu);
+    }
+    let ipv4 = validate_ipv4_frame(frame)?;
+    let flags_fragment =
+        packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderTruncated)?;
+    if flags_fragment & 0x4000 == 0 {
+        return Err(Ipv4FragmentationRequired);
+    }
+    if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+        let disposition = decide_icmpv4_error(
+            frame,
+            snapshot,
+            ipv4,
+            snapshot.route_lookup(ipv4.destination),
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
+            mtu,
+            resolution,
+            runtime,
+            *now,
+            trace,
+        );
+        trace.record(TraceEvent::Icmpv4FragmentationNeededDisposition {
+            ingress,
+            disposition,
+        });
+    }
+    Err(Ipv4FragmentationNeeded)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3249,6 +3428,7 @@ fn decide_ipv4<T: TraceSink>(
                 ipv4,
                 None,
                 Icmpv4ErrorKind::DestinationUnreachableNetwork,
+                0,
                 resolution,
                 runtime,
                 *now,
@@ -3339,6 +3519,7 @@ fn decide_ipv4<T: TraceSink>(
                 ipv4,
                 Some(route),
                 Icmpv4ErrorKind::TimeExceededTtl,
+                0,
                 resolution,
                 runtime,
                 *now,
@@ -5948,6 +6129,7 @@ fn decide_icmpv4_error<T: TraceSink>(
     ipv4: packet::ValidatedIpv4,
     selected_destination_route: Option<Route>,
     kind: Icmpv4ErrorKind,
+    next_hop_mtu: u16,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
@@ -6014,6 +6196,7 @@ fn decide_icmpv4_error<T: TraceSink>(
         frame[ipv4.header_offset + 1],
         &frame[ipv4.header_offset..quote_end],
         kind,
+        next_hop_mtu,
         resolution,
         runtime,
         now,
@@ -6025,7 +6208,9 @@ fn decide_icmpv4_error<T: TraceSink>(
 /// `original_source` and queues it: the reverse route, the egress binding,
 /// the reverse neighbor (static, then fresh dynamic; a miss queues only an
 /// ARP Request), then the generated-ICMPv4 limiter. The caller has already
-/// applied the RFC 1812 §4.3.2.7 suppression rules.
+/// applied the RFC 1812 §4.3.2.7 suppression rules. `next_hop_mtu` is the
+/// Next-Hop MTU of a Fragmentation Needed error (ignored for other kinds).
+/// The quote is cut so the error fits the MTU of the reverse egress.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
@@ -6033,6 +6218,7 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     original_tos: u8,
     original_ipv4: &[u8],
     kind: Icmpv4ErrorKind,
+    next_hop_mtu: u16,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
@@ -6127,7 +6313,9 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
             original_tos,
             snapshot.ipv4_origin.default_ttl(),
             original_ipv4,
-        ),
+        )
+        .with_next_hop_mtu(next_hop_mtu)
+        .fit_egress_mtu(interface.mtu),
         now,
     )
 }
@@ -6811,6 +6999,7 @@ mod tests {
         let interfaces = [Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         }];
         let neighbors = [crate::Neighbor {
             interface: LAN,
@@ -7054,10 +7243,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: 1500,
             },
         ];
         let bindings = [
@@ -7182,10 +7373,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: 1500,
             },
         ];
         let neighbors = [
@@ -7396,10 +7589,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: 1500,
             },
         ];
         let bindings = [
@@ -7663,6 +7858,10 @@ mod tests {
             (179, "NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED"),
             (180, "NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED"),
             (181, "NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED"),
+            (182, "IPV4_FRAGMENTATION_NEEDED"),
+            (183, "IPV4_FRAGMENTATION_REQUIRED"),
+            (184, "ICMPV4_ECHO_REPLY_EXCEEDS_MTU"),
+            (185, "IPV4_FRAME_EXCEEDS_MTU"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -7672,7 +7871,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(182), None);
+        assert_eq!(DropReason::from_code(186), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

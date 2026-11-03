@@ -420,6 +420,11 @@ pub enum CheckFailure {
     /// multi-buffer) every longer frame before the router sees it.
     /// `limit` is the largest MTU the frames hold.
     MtuAboveFrame { mtu: u32, limit: u32 },
+    /// The device MTU is below the configured interface `mtu`: the router
+    /// would forward datagrams the device cannot send (they would be
+    /// refused at TX, silently for the sender) instead of answering them
+    /// with Fragmentation Needed (MTU1). `config` is the configured MTU.
+    MtuBelowConfig { mtu: u32, config: u16 },
     /// Kernel IPv4 forwarding is on and `--allow-kernel-forwarding` was not
     /// given.
     KernelForwardingEnabled(ForwardingScope),
@@ -507,6 +512,9 @@ impl fmt::Display for CheckFailure {
             Self::MtuAboveFrame { mtu, limit } => {
                 write!(formatter, "MTU_ABOVE_FRAME mtu={mtu} limit={limit}")
             }
+            Self::MtuBelowConfig { mtu, config } => {
+                write!(formatter, "MTU_BELOW_CONFIG mtu={mtu} config={config}")
+            }
             Self::KernelIpv6Addresses { count } => {
                 write!(formatter, "KERNEL_IPV6_ADDRESSES count={count}")
             }
@@ -564,6 +572,10 @@ pub struct Warnings {
     pub ipv6_forwarding_force: bool,
     /// ... IPv6 `mc_forwarding` on.
     pub ipv6_forwarding_multicast: bool,
+    /// The device MTU (first) is above the configured interface MTU
+    /// (second): forwarding is limited to the configured MTU (MTU1; a jumbo
+    /// device left at the default `mtu` of 1500).
+    pub mtu_below_device: Option<(u32, u16)>,
 }
 
 impl Warnings {
@@ -611,6 +623,9 @@ impl Warnings {
         .into_iter()
         .filter(|(on, _)| *on)
         .map(|(_, scope)| format!("IPV6_FORWARDING_ENABLED scope={}", scope.name()));
+        let mtu = self
+            .mtu_below_device
+            .map(|(device, config)| format!("MTU_BELOW_DEVICE mtu={device} config={config}"));
         multi
             .into_iter()
             .chain(ipv4)
@@ -618,6 +633,7 @@ impl Warnings {
             .chain(ipv6_addresses)
             .chain(ipv6_routes)
             .chain(ipv6_forwarding)
+            .chain(mtu)
     }
 }
 
@@ -836,6 +852,33 @@ pub fn evaluate_ipv6(
     }
     warnings.ipv6_enabled = true;
     Ok(())
+}
+
+/// The configured interface MTU (`[[interfaces]] mtu`, which the
+/// forwarding core enforces with Fragmentation Needed, MTU1) must not
+/// exceed the MTU the session read at open (which bounds TX): a datagram
+/// between the two would pass the core and be refused at TX without an
+/// ICMP error. A smaller configured MTU is allowed (the core is stricter
+/// than the device) but returned for a warning: a jumbo device left at the
+/// default `mtu` of 1500 forwards only 1500-byte datagrams. The link watch
+/// keeps the device MTU at or above the startup MTU (`MTU_DECREASED` is
+/// fatal), so this holds for the run.
+pub const fn evaluate_config_mtu(
+    config_mtu: u16,
+    facts: &DeviceFacts,
+) -> Result<Option<(u32, u16)>, CheckFailure> {
+    // Widening u16 -> u32 (`u32::from` is not const).
+    let config = config_mtu as u32;
+    if config > facts.session_mtu {
+        return Err(CheckFailure::MtuBelowConfig {
+            mtu: facts.session_mtu,
+            config: config_mtu,
+        });
+    }
+    if config < facts.session_mtu {
+        return Ok(Some((facts.session_mtu, config_mtu)));
+    }
+    Ok(None)
 }
 
 /// The largest MTU whose frames (MTU plus the 14-byte Ethernet header)
@@ -2066,6 +2109,33 @@ mod tests {
             }
             .to_string(),
             "MTU_ABOVE_FRAME mtu=9000 limit=1778"
+        );
+        // MTU1: the configured interface MTU must not exceed the device's.
+        assert_eq!(evaluate_config_mtu(1778, &clean), Ok(None));
+        assert_eq!(evaluate_config_mtu(68, &clean), Ok(Some((1778, 68))));
+        assert_eq!(
+            Warnings {
+                mtu_below_device: Some((9000, 1500)),
+                ..Warnings::default()
+            }
+            .codes()
+            .collect::<Vec<_>>(),
+            ["MTU_BELOW_DEVICE mtu=9000 config=1500"]
+        );
+        assert_eq!(
+            evaluate_config_mtu(1779, &clean),
+            Err(CheckFailure::MtuBelowConfig {
+                mtu: 1778,
+                config: 1779
+            })
+        );
+        assert_eq!(
+            CheckFailure::MtuBelowConfig {
+                mtu: 1400,
+                config: 1500
+            }
+            .to_string(),
+            "MTU_BELOW_CONFIG mtu=1400 config=1500"
         );
         assert_eq!(
             CheckFailure::Unverifiable(Probe::Link).to_string(),

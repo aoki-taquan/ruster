@@ -1291,16 +1291,17 @@ impl ObservableFields for ServiceCounters {
         }}
         visit_counts! {v, "icmpv4_errors", self.icmpv4_errors, Icmpv4ErrorCounters {
             queued, queued_time_exceeded, queued_destination_unreachable,
-            queued_host_unreachable, queued_port_unreachable, pending, rate_limited,
-            disabled_time_exceeded, disabled_destination_unreachable, disabled_host_unreachable,
-            disabled_port_unreachable, state_full, action_full,
+            queued_host_unreachable, queued_port_unreachable, queued_fragmentation_needed,
+            pending, rate_limited, disabled_time_exceeded, disabled_destination_unreachable,
+            disabled_host_unreachable, disabled_port_unreachable, disabled_fragmentation_needed,
+            quote_below_minimum, state_full, action_full,
             clock_regressions, source_not_unicast, source_is_local, destination_multicast,
             destination_limited_broadcast, destination_network_address,
             destination_directed_broadcast, ethernet_destination_group, noninitial_fragment,
             icmp_error_message, icmp_type_missing, reverse_route_miss, reverse_interface_miss,
             reverse_binding_miss, reverse_target_forbidden, reverse_neighbor_unresolved,
             dequeued, dequeued_time_exceeded, dequeued_destination_unreachable,
-            dequeued_host_unreachable, dequeued_port_unreachable,
+            dequeued_host_unreachable, dequeued_port_unreachable, dequeued_fragmentation_needed,
         }}
         visit_counts! {v, "nat44_udp", self.nat44_udp, Nat44UdpCounters {
             mappings_created, mappings_reused, mappings_expired, peers_created,

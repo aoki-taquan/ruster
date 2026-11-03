@@ -58,6 +58,7 @@ fn random_tables(rng: &mut Rng, max_routes: u64) -> Tables {
         .map(|id| Interface {
             id: IfId(id * 3 + 1),
             mac: MacAddress([2, 0, 0, 0, 0, id as u8]),
+            mtu: 1500,
         })
         .collect();
     let bases: Vec<u32> = (0..4).map(|_| rng.address()).collect();
@@ -364,6 +365,7 @@ fn limit_tables() -> Tables {
         .map(|id| Interface {
             id: IfId(id),
             mac: MacAddress([2, 0, 0, 0, (id >> 8) as u8, id as u8]),
+            mtu: 1500,
         })
         .collect();
     // 4096 /24 routes, the shape the review measured, half of them direct.
@@ -524,10 +526,12 @@ fn unvalidated_duplicate_keys_resolve_to_the_first_like_find() {
         Interface {
             id: IfId(4),
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: IfId(4),
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: 1500,
         },
     ];
     let local_ipv4 = [
@@ -570,6 +574,7 @@ fn index_heap_at_the_worst_config_shape_is_about_262_kib() {
         .map(|id| Interface {
             id: IfId(id),
             mac: MacAddress([2, 0, 0, 0, (id >> 8) as u8, id as u8]),
+            mtu: 1500,
         })
         .collect();
     // /24s spaced one /24 apart: no two ranges touch, nothing merges.

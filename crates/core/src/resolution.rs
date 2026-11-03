@@ -806,6 +806,12 @@ pub struct ResolutionFailureCounters {
     /// Holds retired because the ICMPv4 error policy disables Host
     /// Unreachable generation; no reverse ARP or action was attempted.
     pub generation_disabled: usize,
+    /// Holds retired because the reverse egress MTU leaves less room than
+    /// the RFC 792 minimum quote of the held datagram (its header with
+    /// options and 8 data bytes; MTU1). Retired, not retained: the hold
+    /// could never be answered and would otherwise be re-suppressed on
+    /// every scan.
+    pub quote_below_minimum: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -861,6 +867,10 @@ pub enum ResolutionFailureTrace {
         forward: ResolutionGenerationToken,
     },
     GenerationDisabled {
+        forward: ResolutionGenerationToken,
+    },
+    /// The hold retired as [`ResolutionFailureCounters::quote_below_minimum`].
+    QuoteBelowMinimum {
         forward: ResolutionGenerationToken,
     },
     ClockRegression,
@@ -3076,6 +3086,14 @@ pub fn dispatch_host_unreachable_failures<T: ResolutionFailureTraceSink>(
                     forward: hold.forward,
                 });
             }
+            FailureDispatch::QuoteBelowMinimum => {
+                resolution.clear_failure_hold(index);
+                resolution.failure_counters.quote_below_minimum += 1;
+                report.retired += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::QuoteBelowMinimum {
+                    forward: hold.forward,
+                });
+            }
             FailureDispatch::AuthorityLost => {
                 resolution.clear_failure_hold(index);
                 resolution.failure_counters.retired_permanent += 1;
@@ -3100,6 +3118,9 @@ enum FailureDispatch {
     ReverseFailed(ResolutionGenerationToken),
     SameFailedKey,
     GenerationDisabled,
+    /// The reverse egress MTU cannot carry the RFC 792 minimum quote of the
+    /// held datagram (MTU1 review); permanent for the hold, so it retires.
+    QuoteBelowMinimum,
     AuthorityLost,
 }
 
@@ -3280,16 +3301,16 @@ fn dispatch_one_failure(
             hold.original_tos,
             snapshot.ipv4_origin.default_ttl(),
             &hold.quote[..usize::from(hold.quote_len)],
-        ),
+        )
+        .fit_egress_mtu(interface.mtu),
         now,
     );
-    if matches!(
-        disposition,
-        Icmpv4ErrorDisposition::HostUnreachableQueued { .. }
-    ) {
-        FailureDispatch::Queued(reverse_egress)
-    } else {
-        FailureDispatch::Retain(disposition)
+    match disposition {
+        Icmpv4ErrorDisposition::HostUnreachableQueued { .. } => {
+            FailureDispatch::Queued(reverse_egress)
+        }
+        Icmpv4ErrorDisposition::QuoteBelowMinimum { .. } => FailureDispatch::QuoteBelowMinimum,
+        _ => FailureDispatch::Retain(disposition),
     }
 }
 
@@ -4196,6 +4217,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4219,6 +4241,7 @@ mod tests {
         let changed_interfaces = [Interface {
             id: WAN,
             mac: MacAddress([7; 6]),
+            mtu: 1500,
         }];
         let changed =
             ForwardingSnapshot::new(&routes, &changed_interfaces, &[], &bindings).unwrap();
@@ -4367,6 +4390,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4459,6 +4483,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: new_mac,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4552,6 +4577,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4594,6 +4620,130 @@ mod tests {
             assert_eq!((report.scanned, report.pending), (1, 1));
             assert_pending_accounting(&runtime);
         }
+    }
+
+    /// MTU1 review: a hold whose quote cannot fit the RFC 792 minimum on
+    /// the reverse egress (IHL 15 = 60-byte header + 8 bytes, MTU 70 leaves
+    /// 42) retires as `quote_below_minimum` on the first dispatch instead of
+    /// being retained and re-suppressed on every scan.
+    #[test]
+    fn a_hold_below_the_quote_minimum_retires() {
+        const LAN: IfId = IfId(1);
+        let host = Ipv4Address::from_octets([198, 51, 100, 10]);
+        let routes = [
+            Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, None).unwrap(),
+            Route::new(Ipv4Address::from_octets([198, 51, 100, 0]), 24, LAN, None).unwrap(),
+        ];
+        let interfaces = [
+            Interface {
+                id: LAN,
+                mac: MacAddress([2, 0, 0, 0, 0, 9]),
+                mtu: 70,
+            },
+            Interface {
+                id: WAN,
+                mac: SOURCE_MAC,
+                mtu: 1500,
+            },
+        ];
+        let neighbors = [Neighbor {
+            interface: LAN,
+            target: host,
+            mac: MacAddress([2, 0, 0, 0, 0, 0x10]),
+        }];
+        let bindings = [
+            LocalIpv4Binding {
+                interface: LAN,
+                address: Ipv4Address::from_octets([198, 51, 100, 1]),
+            },
+            LocalIpv4Binding {
+                interface: WAN,
+                address: SOURCE_IP,
+            },
+        ];
+        let snapshot =
+            ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+        let policy = ResolutionPolicy::with_retry(1_000, 1_000, 1).unwrap();
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
+        let mut runtime = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
+            policy,
+            &mut states,
+            &mut actions,
+            &mut [],
+            &mut holds,
+        );
+        assert_eq!(
+            runtime.schedule(action(5), MonotonicMillis(0), false),
+            ResolutionResult::Queued
+        );
+        commit_front_accepted(&mut runtime, 0);
+        let mut quote = [0_u8; 68];
+        quote[0] = 0x4f;
+        assert!(matches!(
+            runtime.capture_failure_candidate(
+                WAN,
+                target(5),
+                host,
+                target(5),
+                SOURCE_MAC,
+                SOURCE_IP,
+                Ipv4Address::from_octets([192, 0, 2, 0]),
+                24,
+                0,
+                &quote,
+            ),
+            ResolutionFailureCapture::Captured(_)
+        ));
+        poll_resolution_timers(
+            &mut runtime,
+            MonotonicMillis(1_000),
+            usize::MAX,
+            &mut NoResolutionTimerTrace,
+        )
+        .unwrap();
+        let mut icmp_states = [crate::Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut icmp_actions = [crate::Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut icmpv4_errors = Icmpv4ErrorRuntime::new(
+            crate::Icmpv4ErrorPolicy::default(),
+            &mut icmp_states,
+            &mut icmp_actions,
+        );
+        let report = dispatch_host_unreachable_failures(
+            &mut runtime,
+            &mut icmpv4_errors,
+            &snapshot,
+            MonotonicMillis(1_000),
+            usize::MAX,
+            &mut NoResolutionFailureTrace,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.scanned,
+                report.retired,
+                report.retained,
+                report.pending
+            ),
+            (1, 1, 0, 0)
+        );
+        assert_eq!(runtime.failure_counters().quote_below_minimum, 1);
+        assert_eq!(runtime.failure_counters().retained_transient, 0);
+        assert_eq!(icmpv4_errors.counters().quote_below_minimum, 1);
+        assert_eq!(icmpv4_errors.pending_actions(), 0);
+        assert_pending_accounting(&runtime);
+        let again = dispatch_host_unreachable_failures(
+            &mut runtime,
+            &mut icmpv4_errors,
+            &snapshot,
+            MonotonicMillis(2_000),
+            usize::MAX,
+            &mut NoResolutionFailureTrace,
+        )
+        .unwrap();
+        assert_eq!((again.retired, again.retained, again.pending), (0, 0, 0));
+        assert_eq!(icmpv4_errors.counters().quote_below_minimum, 1);
     }
 
     #[test]

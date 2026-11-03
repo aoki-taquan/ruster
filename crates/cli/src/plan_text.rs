@@ -87,7 +87,12 @@ fn local(binding: &LocalIpv4Binding) -> String {
 }
 
 fn interface(interface: &Interface) -> String {
-    format!("{} mac {}", iface(interface.id), mac(interface.mac))
+    format!(
+        "{} mac {} mtu {}",
+        iface(interface.id),
+        mac(interface.mac),
+        interface.mtu
+    )
 }
 
 fn side(interface: FirewallInterface) -> String {

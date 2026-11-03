@@ -96,6 +96,17 @@
 #             Unreachable Network (RFC 1812 5.2.7.1). Every error is checked
 #             for type/code, outer source/TTL/TOS/checksums, and a quote that
 #             is the whole original datagram with a valid header checksum
+#   pmtu      (MTU1, RFC 1812 4.2.2.7/5.2.7.1, RFC 1191) rb and pb at MTU
+#             1400: the default config (wan mtu 1500) is refused before
+#             attach (MTU_BELOW_CONFIG mtu=1400 config=1500); with
+#             `mtu = 1400` on both interfaces (warning MTU_BELOW_DEVICE for
+#             ra at 1500 only) a 1500-byte DF UDP datagram from host A
+#             (IP_PMTUDISC_DO) is answered with Fragmentation Needed (3/4,
+#             Next-Hop MTU 1400, from 192.168.1.1, quoting 548 bytes of the
+#             untranslated datagram), host A's kernel learns PMTU 1400 and
+#             refuses the next 1500-byte send (EMSGSIZE), a 1400-byte DF
+#             datagram reaches host B, and tracepath from host A discovers
+#             pmtu 1400; the final counters show the drops and errors
 #   unsolicited_syn  (B3, RFC 5382 REQ-4) with a firewall rule that admits
 #             new WAN -> LAN TCP flows to every destination, host B sends a
 #             TCP SYN to a public port without a mapping: nothing for 6 s,
@@ -423,7 +434,7 @@ write_config "$work/router-v2.toml" ra 0 router-v2
 # a cross-port forward is copied into an egress generated frame, so with
 # more of those than TX entries the 128-entry TX ring is what fills.
 write_config "$work/txfull.toml" ra 0 router-v1 256
-# H3: every runtime table at its production limit (54.42 MiB of storage),
+# H3: every runtime table at its production limit (54.45 MiB of storage),
 # without the fixture's own backend; and one more failure hold (above the
 # production 4096, within the simulator's 65536), as af-xdp and as sim.
 sed -e '/^\[backend\]$/,$d' -e 's/device = "rusternodev0"/device = "sim0"/' \
@@ -1237,7 +1248,7 @@ phase_idle
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=57065664 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=57098432 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -1261,7 +1272,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 57065664 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 57098432 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
@@ -1553,6 +1564,171 @@ completed=$(stat_in "$work/icmp.final" if1.af_xdp_port.generated_completed)
     fail "icmp: if1 generated committed $committed, completed $completed"
 cat "$work/icmp.err"
 echo "priv_run_icmp: generated_icmpv4.tx_accepted=$accepted, if1 generated committed=completed=$completed, exit 0 verified"
+
+# pmtu (MTU1): RFC 1812 4.2.2.7/5.2.7.1 and RFC 1191 Path MTU Discovery
+# through the router over AF_XDP. The WAN link carries 1400 (rb, pb, and
+# `mtu = 1400` of the wan interface). Host A sends DF UDP (IP_PMTUDISC_DO)
+# to host B. argv: target, port, marker of the datagram that must fit,
+# deadline seconds. The 1500-byte datagram must be answered by exactly
+# the RFC layout: Destination Unreachable, Fragmentation Needed (3/4) from
+# 192.168.1.1, TTL 64, TOS 0xc0, valid checksums, unused 16 bits zero and
+# Next-Hop MTU 1400 (RFC 1191 4), quoting the first 548 bytes of the
+# datagram as sent (before NAT; 576 bytes in all, RFC 1812 4.3.2.3); the
+# kernel of host A must then hold PMTU 1400 for host B (IP_MTU of the
+# connected socket) and refuse the 1500-byte send locally (EMSGSIZE); a
+# 1400-byte DF datagram (exactly the MTU) is sent for host B to receive.
+PMTU_PROBE='
+import errno, socket, struct, sys, time
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+def check(ok, what):
+    if not ok:
+        sys.exit("pmtu probe: %s" % what)
+
+IP_MTU_DISCOVER, IP_PMTUDISC_DO, IP_MTU = 10, 2, 14
+target, port, fit_marker = sys.argv[1], int(sys.argv[2]), sys.argv[3].encode()
+deadline = time.monotonic() + float(sys.argv[4])
+router, host = socket.inet_aton("192.168.1.1"), socket.inet_aton("192.168.1.10")
+raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+raw.settimeout(0.1)
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.setsockopt(socket.IPPROTO_IP, IP_MTU_DISCOVER, IP_PMTUDISC_DO)
+udp.connect((target, port))
+sport = udp.getsockname()[1]
+check(udp.getsockopt(socket.IPPROTO_IP, IP_MTU) == 1500, "PMTU cache not flushed")
+big = bytes((i * 7) & 0xFF for i in range(1472))
+found = None
+while found is None and time.monotonic() < deadline:
+    try:
+        udp.send(big)
+    except OSError as error:
+        check(error.errno == errno.EMSGSIZE, "send: %s" % error)
+    end = time.monotonic() + 0.3
+    while found is None and time.monotonic() < end:
+        try:
+            pkt = raw.recv(4096)
+        except socket.timeout:
+            continue
+        icmp = pkt[(pkt[0] & 15) * 4:]
+        if len(icmp) < 36 or (icmp[0], icmp[1]) != (3, 4):
+            continue
+        quote = icmp[8:]
+        if quote[16:20] == socket.inet_aton(target) and struct.unpack("!H", quote[20:22])[0] == sport:
+            found = (pkt, icmp)
+check(found is not None, "no Fragmentation Needed within %s s" % sys.argv[4])
+pkt, icmp = found
+ihl = (pkt[0] & 15) * 4
+check(pkt[12:16] == router and pkt[16:20] == host, "outer addresses")
+check(pkt[9] == 1 and fold(pkt[:ihl]) == 0xFFFF, "outer protocol or header checksum")
+check(pkt[8] == 64 and pkt[1] == 0xC0, "outer TTL %d or TOS 0x%02x" % (pkt[8], pkt[1]))
+check(struct.unpack("!H", pkt[2:4])[0] == 576 == len(pkt), "outer length %d" % len(pkt))
+check(fold(icmp) == 0xFFFF, "ICMP checksum")
+check(icmp[4:6] == b"\0\0", "unused bits")
+mtu = struct.unpack("!H", icmp[6:8])[0]
+check(mtu == 1400, "Next-Hop MTU %d" % mtu)
+quote = icmp[8:]
+check(len(quote) == 548, "quote length %d" % len(quote))
+check(quote[0] == 0x45 and quote[9] == 17 and quote[12:16] == host, "quoted IPv4 header")
+check(struct.unpack("!H", quote[2:4])[0] == 1500, "quoted total length")
+check(struct.unpack("!H", quote[6:8])[0] & 0x4000, "quoted DF")
+check(fold(quote[:20]) == 0xFFFF, "quoted header checksum")
+check(struct.unpack("!HH", quote[20:24]) == (sport, port), "quoted UDP ports (untranslated)")
+check(quote[28:] == big[:520], "quoted payload")
+learned = udp.getsockopt(socket.IPPROTO_IP, IP_MTU)
+check(learned == 1400, "host A learned PMTU %d" % learned)
+# Each Fragmentation Needed also leaves EMSGSIZE pending on the connected
+# socket (reported by the next call); clear it so that the refusal below
+# is the local PMTU check.
+time.sleep(0.3)
+udp.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+try:
+    udp.send(big)
+    check(False, "a 1500-byte DF send passed after PMTU 1400 was learned")
+except OSError as error:
+    check(error.errno == errno.EMSGSIZE, "send after PMTUD: %s" % error)
+fit = fit_marker + bytes(1372 - len(fit_marker))
+for _ in range(20):
+    udp.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+    udp.send(fit)
+    time.sleep(0.05)
+print("type=3 code=4 from 192.168.1.1 ttl=64 tos=0xc0 next-hop-mtu=1400, quoting 548 bytes of the 1500-byte DF datagram 192.168.1.10:%d -> %s:%d as sent (576 bytes in all); host A learned PMTU 1400 and refused a 1500-byte send (EMSGSIZE)" % (sport, target, port))
+'
+
+phase_pmtu() {
+    sudo -n ip -n "$router" link set rb mtu 1400
+    sudo -n ip -n "$host_b" link set pb mtu 1400
+    # The configured MTU (1500 by default) above the device's: refused
+    # before attach.
+    start_ruster pmtu-refused "$work/router.toml"
+    wait_ruster
+    [ "$status" -eq 1 ] || fail "pmtu-refused: exit status $status"
+    grep -q "startup failed: stage=checks port=if2 code=MTU_BELOW_CONFIG mtu=1400 config=1500" \
+        "$work/pmtu-refused.err" || fail "pmtu-refused: wrong failure"
+    assert_detached "the MTU_BELOW_CONFIG refusal"
+    echo "priv_run_pmtu_refused: wan mtu 1500 (default) on a 1400-byte rb refused before attach (MTU_BELOW_CONFIG mtu=1400 config=1500), exit 1, detached verified"
+
+    # wan at the link's 1400; lan at 1400 too, below ra's 1500: started
+    # with the MTU_BELOW_DEVICE warning for if1 only.
+    sed -e '/^mac = "02:00:00:00:00:02"$/a mtu = 1400' \
+        -e '/^mac = "02:00:00:00:00:01"$/a mtu = 1400' "$work/router.toml" >"$work/pmtu.toml"
+    [ "$(grep -cx "mtu = 1400" "$work/pmtu.toml")" -eq 2 ] || fail "pmtu: config edit"
+    start_ruster pmtu "$work/pmtu.toml"
+    wait_ready pmtu || fail "pmtu: ruster exited during startup"
+    grep -q "warning: port=if1 MTU_BELOW_DEVICE mtu=1500 config=1400" "$work/pmtu.err" ||
+        fail "pmtu: no MTU_BELOW_DEVICE warning for if1"
+    ! grep -q "port=if2 MTU_BELOW_DEVICE" "$work/pmtu.err" ||
+        fail "pmtu: MTU_BELOW_DEVICE warning for if2 at equal MTUs"
+    in_ns "$host_a" ip route flush cache
+    marker="ruster-pmtu-fit-$suffix"
+    rm -f "$work/recv-pmtu.out"
+    in_ns "$host_b" python3 -I -c "$RECEIVE" 9002 "$marker" 15 >"$work/recv-pmtu.out" 2>&1 &
+    receiver=$!
+    tries=0
+    while ! grep -q ready "$work/recv-pmtu.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "pmtu: receiver not ready"
+        sleep 0.05
+    done
+    in_ns "$host_a" python3 -I -c "$PMTU_PROBE" 203.0.113.1 9002 "$marker" 10 \
+        >"$work/pmtu-probe.txt" 2>&1 || fail "pmtu: $(cat "$work/pmtu-probe.txt")"
+    status=0
+    wait "$receiver" || status=$?
+    [ "$status" -eq 0 ] || fail "pmtu: host B never received the 1400-byte DF datagram"
+    echo "priv_run_pmtu_frag_needed: $(cat "$work/pmtu-probe.txt"); the 1400-byte DF datagram reached host B verified"
+
+    # tracepath discovers the path MTU from scratch (cache flushed).
+    in_ns "$host_a" ip route flush cache
+    in_ns "$host_a" tracepath -n -m 4 -p 33500 203.0.113.1 >"$work/tracepath.txt" 2>&1 || true
+    grep -q "pmtu 1400" "$work/tracepath.txt" ||
+        fail "pmtu: tracepath did not discover PMTU 1400: $(cat "$work/tracepath.txt")"
+    resume=$(grep "Resume:" "$work/tracepath.txt" || true)
+    echo "priv_run_pmtu_tracepath: tracepath from host A discovered pmtu 1400 at 192.168.1.1 (${resume:-no resume line}) verified"
+
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "pmtu: exit status $status after SIGTERM"
+    assert_detached "the pmtu run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/pmtu.out" >"$work/pmtu.final"
+    block_has "$work/pmtu.final" drop.IPV4_FRAGMENTATION_REQUIRED=0 \
+        icmpv4_errors.disabled_fragmentation_needed=0 generated_icmpv4.tx_rejected=0
+    needed=$(stat_in "$work/pmtu.final" drop.IPV4_FRAGMENTATION_NEEDED)
+    queued=$(stat_in "$work/pmtu.final" icmpv4_errors.queued_fragmentation_needed)
+    sent=$(stat_in "$work/pmtu.final" icmpv4_errors.dequeued_fragmentation_needed)
+    [ "${needed:-0}" -ge 2 ] || fail "pmtu: drop.IPV4_FRAGMENTATION_NEEDED is ${needed:-missing}"
+    [ "${queued:-0}" -ge 2 ] && [ "${queued:-0}" = "${sent:-x}" ] ||
+        fail "pmtu: queued_fragmentation_needed $queued, dequeued $sent"
+    sudo -n ip -n "$router" link set rb mtu 1500
+    sudo -n ip -n "$host_b" link set pb mtu 1500
+    echo "priv_run_pmtu: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1400) only; drop.IPV4_FRAGMENTATION_NEEDED=$needed, queued_fragmentation_needed=dequeued=$queued, exit 0, detached verified"
+}
+phase_pmtu
 
 # unsolicited_syn (B3): host B's raw-socket view of the RFC 5382 REQ-4
 # delayed ICMP Port Unreachable. argv: mode (icmp|absent), public port,

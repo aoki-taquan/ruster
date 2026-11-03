@@ -937,6 +937,7 @@ impl SimRun<'_> {
             line.str("name", binding.name());
             line.str("device", binding.device());
             line.mac("mac", binding.mac());
+            line.u64("mtu", u64::from(binding.mtu()));
             line.close();
         }
         line.close_array();

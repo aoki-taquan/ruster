@@ -690,10 +690,12 @@ fn padded_typed_arp_request_equals_core_generated_request() {
         Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: 1500,
         },
     ];
     let bindings = [LocalIpv4Binding {

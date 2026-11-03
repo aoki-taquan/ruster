@@ -41,6 +41,7 @@ fn interface() -> Interface {
     Interface {
         id: WAN,
         mac: ROUTER_MAC,
+        mtu: 1500,
     }
 }
 
@@ -49,6 +50,7 @@ fn interfaces() -> [Interface; 2] {
         Interface {
             id: LAN,
             mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         interface(),
     ]
@@ -370,6 +372,7 @@ fn resolution_keys_are_independent_by_interface_and_target() {
     let other_interface = Interface {
         id: IfId(3),
         mac: MacAddress([3; 6]),
+        mtu: 1500,
     };
     let other_route = Route::new(
         Ipv4Address::from_octets([198, 51, 100, 10]),
@@ -387,6 +390,7 @@ fn resolution_keys_are_independent_by_interface_and_target() {
         Interface {
             id: LAN,
             mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         other_interface,
     ];
