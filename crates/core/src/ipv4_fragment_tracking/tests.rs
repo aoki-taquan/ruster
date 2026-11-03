@@ -796,8 +796,19 @@ fn flush_discards_and_counts_everything_and_the_table_is_reusable() {
         .admit_first(info(&fragment(2, MF, 64, 17, 8)), 0)
         .unwrap();
     tracker.commit_deny(ticket, 0);
+    let occupancy = tracker.occupancy();
+    assert_eq!(occupancy.entries, TableOccupancy::new(2, 2, 2).unwrap());
+    assert_eq!(occupancy.held, TableOccupancy::new(1, 1, 2).unwrap());
     tracker.flush();
     assert_eq!((tracker.entries(), tracker.held()), (0, 0));
+    // OBS-017: a flush restarts both high-water marks.
+    assert_eq!(
+        tracker.occupancy(),
+        Ipv4FragmentTrackingOccupancy {
+            entries: TableOccupancy::new(0, 0, 2).unwrap(),
+            held: TableOccupancy::new(0, 0, 2).unwrap(),
+        }
+    );
     let counters = tracker.counters();
     assert_eq!((counters.entries_flushed, counters.held_flushed), (2, 1));
     tracker.flush_with_key(ResolutionHashKey::new(1, 1).unwrap());
@@ -809,6 +820,9 @@ fn flush_discards_and_counts_everything_and_the_table_is_reusable() {
             .is_ok());
     }
     assert_eq!((tracker.entries(), tracker.held()), (2, 2));
+    let occupancy = tracker.occupancy();
+    assert_eq!(occupancy.entries, TableOccupancy::new(2, 2, 2).unwrap());
+    assert_eq!(occupancy.held, TableOccupancy::new(2, 2, 2).unwrap());
     assert_eq!(tracker.entry_capacity(), 2);
     assert_eq!(tracker.held_capacity(), 2);
     assert_eq!(tracker.policy(), policy(1_000, 4, 4));

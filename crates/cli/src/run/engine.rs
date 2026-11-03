@@ -894,12 +894,16 @@ where
             .notify
             .reload_settled(control.reloader.busy(), generation.get());
         let occupancy = ServiceOccupancy::capture(
+            active.resolution(),
             active.icmpv4_errors(),
             active.nat44_udp(),
             active.nat44_tcp(),
             active.firewall(),
         )
-        .with_nat44_icmp(active.nat44_icmp());
+        .with_nat44_icmp(active.nat44_icmp())
+        .with_arp_hold(active.arp_hold())
+        .with_fragment_tracking(active.fragment_tracking())
+        .with_fragmentation(active.fragmentation());
         observer.record_occupancy(occupancy);
         if let Some(end) = wedge.after_tick(now, &report) {
             return end;

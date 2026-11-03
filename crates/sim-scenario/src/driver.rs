@@ -638,12 +638,16 @@ impl SimRun<'_> {
         let active = &self.active;
         self.observer.record_occupancy(
             ServiceOccupancy::capture(
+                active.resolution(),
                 active.icmpv4_errors(),
                 active.nat44_udp(),
                 active.nat44_tcp(),
                 active.firewall(),
             )
-            .with_nat44_icmp(active.nat44_icmp()),
+            .with_nat44_icmp(active.nat44_icmp())
+            .with_arp_hold(active.arp_hold())
+            .with_fragment_tracking(active.fragment_tracking())
+            .with_fragmentation(active.fragmentation()),
         );
         let publication = match report.publication {
             PublicationOutcome::Unchanged => TickPublication::Unchanged,

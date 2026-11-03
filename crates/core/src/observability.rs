@@ -185,6 +185,55 @@ impl OccupancyCounter {
     }
 }
 
+/// High-water mark of a queue or table whose occupancy its runtime
+/// already counts (OBS-017).
+///
+/// The owner calls [`Self::observe`] with the new count right after every
+/// increment, at most one compare and one store, and [`Self::reset`] when a
+/// publication flush (or a carry) leaves the table at a known count.
+/// [`Self::snapshot`] pairs it with the current count and the capacity as a
+/// [`TableOccupancy`]; it never scales with the slot count.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct HighWaterMark(usize);
+
+impl HighWaterMark {
+    #[inline]
+    pub(crate) fn observe(&mut self, occupied: usize) {
+        if occupied > self.0 {
+            self.0 = occupied;
+        }
+    }
+
+    /// The table was flushed (`occupied` 0) or kept `occupied` entries.
+    #[inline]
+    pub(crate) fn reset(&mut self, occupied: usize) {
+        self.0 = occupied;
+    }
+
+    /// `occupied` and `capacity` come from the owner; the result keeps
+    /// `occupied <= high_water <= capacity` even if an owner missed an
+    /// observation.
+    #[must_use]
+    pub(crate) const fn snapshot(self, occupied: usize, capacity: usize) -> TableOccupancy {
+        let high_water = if self.0 > occupied { self.0 } else { occupied };
+        let high_water = if high_water < capacity {
+            high_water
+        } else {
+            capacity
+        };
+        let occupied = if occupied < high_water {
+            occupied
+        } else {
+            high_water
+        };
+        TableOccupancy {
+            occupied,
+            high_water,
+            capacity,
+        }
+    }
+}
+
 #[cfg(test)]
 mod occupancy_tests {
     use super::*;
@@ -213,6 +262,24 @@ mod occupancy_tests {
         assert_eq!(counter.snapshot(4).high_water(), 3);
         counter.flush();
         assert_eq!(counter.snapshot(4), TableOccupancy::new(0, 0, 4).unwrap());
+    }
+
+    #[test]
+    fn high_water_mark_keeps_the_peak_until_reset_and_clamps_its_snapshot() {
+        let mut mark = HighWaterMark::default();
+        assert_eq!(mark.snapshot(0, 4), TableOccupancy::new(0, 0, 4).unwrap());
+        mark.observe(1);
+        mark.observe(3);
+        mark.observe(2);
+        assert_eq!(mark.snapshot(2, 4), TableOccupancy::new(2, 3, 4).unwrap());
+        assert_eq!(mark.snapshot(0, 4), TableOccupancy::new(0, 3, 4).unwrap());
+        // A missed observation still yields an ordered value.
+        assert_eq!(mark.snapshot(4, 4), TableOccupancy::new(4, 4, 4).unwrap());
+        assert_eq!(mark.snapshot(9, 4), TableOccupancy::new(4, 4, 4).unwrap());
+        mark.reset(1);
+        assert_eq!(mark.snapshot(1, 4), TableOccupancy::new(1, 1, 4).unwrap());
+        mark.reset(0);
+        assert_eq!(mark, HighWaterMark::default());
     }
 
     #[test]

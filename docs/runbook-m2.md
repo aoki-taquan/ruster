@@ -2616,7 +2616,7 @@ Sections, in this order:
 
 | prefix | content |
 |---|---|
-| `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `carried.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome, its flush counts (`apply.flush.*`), carry counts (`apply.carry.*`, including `firewall_flows_revoked`) and per-family outcome (`apply.state.<family>`: `carried`, `flushed`, `flushed:<reason>`, RELOAD-CARRY), cumulative `flushed.*` and `carried.*`, NAT/FW/ICMP limiter occupancy and high-water. `firewall.states_revoked` counts the flows reloads revoked |
+| `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `carried.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome, its flush counts (`apply.flush.*`), carry counts (`apply.carry.*`, including `firewall_flows_revoked`) and per-family outcome (`apply.state.<family>`: `carried`, `flushed`, `flushed:<reason>`, RELOAD-CARRY), cumulative `flushed.*` and `carried.*`, NAT/FW/ICMP limiter occupancy and high-water (OBS-015), and the resolution, generated action, hold, and fragment occupancy (OBS-017, below). `firewall.states_revoked` counts the flows reloads revoked |
 | `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `nat44_icmp.*`, `firewall.*` | the service runtimes' cumulative counters (`nat44_icmp.*` is all zero without `[nat44.icmp]`) |
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall; the gauge `tx_held_on_down_link` is the TX held while the link is last seen down, which a reload does not wait for, OPS-EXIT), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
@@ -2629,6 +2629,41 @@ Sections, in this order:
 | `fs.*` | `confine` (`landlock`, `off`), `abi` (the kernel's Landlock ABI; 0 when off), `rules` (rules of the ruleset; 0 when off), `threads` (threads confined; 0 when off) |
 | `seccomp.*` | `mode` (`kill`, `log`, `off`), `threads` (threads verified with the filter; 0 when off), `syscalls` (allowlist entries; 0 when off) |
 | `output.dropped` | output messages dropped because a stream could not keep up |
+
+Occupancy (`occupancy.<table>.<field>`). Every table has four fields:
+`occupied` (in use now, at the last sample after a tick), `high_water`
+(the most in use since startup or the last apply that flushed the table),
+`capacity` (its configured slots), and `peak` (the largest `high_water`
+of any sample, so it survives reloads). `occupancy.samples` counts the
+samples (one after each tick). The OBS-015 tables are the NAT44, firewall
+state, and ICMPv4 limiter state tables; like them, an apply that keeps a
+table's state (`[reload] state` carrying) keeps its `high_water`. OBS-017
+adds:
+
+| table | counts | capacity from | `high_water` restarts |
+|---|---|---|---|
+| `resolution_states` | state slots a new resolution cannot take: queued, waiting for a reply, failed hold-downs, and cooldowns whose request interval has not elapsed yet (an answered resolution leaves one) | `resolution.capacity.states` | at every apply |
+| `resolution_actions` | the generated ARP request queue | `resolution.capacity.actions` | at every apply |
+| `resolution_dynamic_neighbors` | learned neighbors (expired ones until their slot is reused) | `resolution.capacity.dynamic-neighbors` | at an apply that flushes them; kept when they are carried |
+| `resolution_failure_holds` | datagrams kept for a Host Unreachable | `resolution.capacity.failure-holds` | at every apply |
+| `icmpv4_error_actions` | the generated ICMPv4 error queue (pending errors) | `icmpv4-errors.capacity.actions` | at every apply |
+| `arp_hold_packets` | datagrams held for ARP (ARP-HOLD) | `resolution.hold.packets` | at every apply |
+| `fragment_tracking_entries`, `fragment_tracking_held` | fragment associations and held later fragments (NAT-FRAG) | `fragment-tracking.entries`, `fragment-tracking.held-fragments` | at every apply |
+| `fragmentation_slots` | staged fragmentation slots (MTU2) | `fragmentation.datagrams` | never: nothing staged outlives a tick, so `occupied` is 0 between ticks and `high_water` is the fullest a tick's queue got |
+
+An optional table that is not configured shows `capacity=0`. A `peak` at
+or near `capacity` means that table has been full: check the matching
+full counter (`resolution.state_full`, `resolution.action_full`,
+`icmpv4_errors.action_full`, `arp_hold.refused_full`,
+`fragment_tracking.entries_evicted`/`held_evicted`,
+`drop.IPV4_FRAGMENTATION_QUEUE_FULL`) and size the table up. The
+exception is `resolution_dynamic_neighbors`: expired neighbors count
+until a new one reuses their slot, so after enough churn (many hosts
+over time, an ARP scan) `occupied` and `peak` sit at `capacity` while
+the router works normally. There is no separate counter for a
+learned-neighbor cache that refused a new entry; only a full key chain
+is counted (`resolution_index.dynamic_probe_exhausted`). No occupancy
+value is a health condition (OBS-030).
 
 What to watch in operation: `observer.state=healthy`, `watch.state=ok`,
 `rx.received` growing, `drop.<REASON>`, `af_xdp.mode=copy`,

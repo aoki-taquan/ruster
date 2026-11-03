@@ -1,6 +1,8 @@
 use std::{marker::PhantomData, rc::Rc};
 
-use crate::{ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter, TableOccupancy};
+use crate::{
+    ForwardingSnapshot, HighWaterMark, IfId, Ipv4Address, OccupancyCounter, TableOccupancy,
+};
 
 mod input;
 
@@ -983,6 +985,8 @@ pub struct FirewallAuditBuffer<'a> {
     storage: &'a mut [FirewallAuditRecord],
     len: usize,
     dropped_records: u64,
+    /// Largest `len` before a [`Self::clear`] (OBS-017).
+    high_water: HighWaterMark,
 }
 
 impl<'a> FirewallAuditBuffer<'a> {
@@ -992,6 +996,7 @@ impl<'a> FirewallAuditBuffer<'a> {
             storage,
             len: 0,
             dropped_records: 0,
+            high_water: HighWaterMark::default(),
         }
     }
 
@@ -1023,7 +1028,16 @@ impl<'a> FirewallAuditBuffer<'a> {
         self.dropped_records
     }
 
+    /// Records held now, the most held since the buffer was created
+    /// (across [`Self::clear`]), and the capacity (OBS-017). O(1); a record
+    /// costs nothing extra, the mark is folded in at each clear.
+    #[must_use]
+    pub const fn occupancy(&self) -> TableOccupancy {
+        self.high_water.snapshot(self.len, self.storage.len())
+    }
+
     pub fn clear(&mut self) {
+        self.high_water.observe(self.len);
         self.len = 0;
         self.dropped_records = 0;
     }
@@ -2508,6 +2522,8 @@ mod tests {
     // `firewall/tests/carry.rs`: flows carried and re-evaluated across a
     // publication (RELOAD-CARRY).
     mod carry;
+    // `firewall/tests/audit.rs`: the audit buffer's occupancy (OBS-017).
+    mod audit;
 
     fn with_snapshot<T>(test: impl FnOnce(&ForwardingSnapshot<'_>) -> T) -> T {
         let routes = [

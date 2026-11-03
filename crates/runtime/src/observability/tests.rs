@@ -631,7 +631,7 @@ fn snapshot_rendering_is_stable_and_ordered() {
     assert!(lines.contains(&"apply.state.firewall=flushed"));
     assert!(lines.contains(&"apply.state.nat44_icmp=none"));
     assert_eq!(lines.len() - occupancy, OCCUPANCY_FIELDS);
-    assert_eq!(lines.last(), Some(&"occupancy.icmpv4_error_states.peak=0"));
+    assert_eq!(lines.last(), Some(&"occupancy.fragmentation_slots.peak=0"));
     let keys = |text: &str| -> Vec<String> {
         text.lines()
             .map(|l| l.split_once('=').unwrap().0.to_owned())
@@ -663,8 +663,9 @@ fn snapshot_rendering_is_stable_and_ordered() {
     assert_eq!(keys(&idle), keys(&text));
 }
 
-/// `samples` plus four fields for each of the ten tables.
-const OCCUPANCY_FIELDS: usize = 1 + 10 * 4;
+/// `samples` plus four fields for each of the ten OBS-015 and nine OBS-017
+/// tables.
+const OCCUPANCY_FIELDS: usize = 1 + 19 * 4;
 
 fn table(occupied: usize, high_water: usize, capacity: usize) -> TableOccupancy {
     TableOccupancy::new(occupied, high_water, capacity).unwrap()
@@ -758,9 +759,91 @@ fn occupancy_samples_keep_the_last_value_and_a_lifetime_peak() {
             "occupancy.nat44_icmp_peers",
             "occupancy.firewall_states",
             "occupancy.icmpv4_error_states",
+            "occupancy.resolution_states",
+            "occupancy.resolution_actions",
+            "occupancy.resolution_dynamic_neighbors",
+            "occupancy.resolution_failure_holds",
+            "occupancy.icmpv4_error_actions",
+            "occupancy.arp_hold_packets",
+            "occupancy.fragment_tracking_entries",
+            "occupancy.fragment_tracking_held",
+            "occupancy.fragmentation_slots",
         ]
     );
     assert!(rendered.contains(&"occupancy.firewall_states.capacity=6"));
+}
+
+/// OBS-017: every resolution, generated action, hold, and fragment table
+/// is folded in like the OBS-015 tables (last value, the core's mark, and a
+/// peak that survives a flush) and rendered under its own key.
+#[test]
+fn obs017_tables_keep_the_last_value_and_a_peak_across_flushes() {
+    let tables = |n: usize| ServiceOccupancy {
+        resolution_states: table(n, n + 1, 64),
+        resolution_actions: table(n, n + 2, 65),
+        resolution_dynamic_neighbors: table(n, n + 3, 66),
+        resolution_failure_holds: table(n, n + 4, 67),
+        icmpv4_error_actions: table(n, n + 5, 68),
+        arp_hold_packets: table(n, n + 6, 69),
+        fragment_tracking_entries: table(n, n + 7, 70),
+        fragment_tracking_held: table(n, n + 8, 71),
+        fragmentation_slots: table(n, n + 9, 72),
+        ..ServiceOccupancy::default()
+    };
+    let mut observer = TickObserver::default();
+    observer.record_occupancy(tables(2));
+    // A flush: every core value restarts at zero.
+    observer.record_occupancy(ServiceOccupancy {
+        resolution_states: table(0, 0, 64),
+        resolution_actions: table(0, 0, 65),
+        resolution_dynamic_neighbors: table(0, 0, 66),
+        resolution_failure_holds: table(0, 0, 67),
+        icmpv4_error_actions: table(0, 0, 68),
+        arp_hold_packets: table(0, 0, 69),
+        fragment_tracking_entries: table(0, 0, 70),
+        fragment_tracking_held: table(0, 0, 71),
+        fragmentation_slots: table(0, 0, 72),
+        ..ServiceOccupancy::default()
+    });
+    let observed = observer.snapshot(MonotonicMillis(0)).occupancy;
+    let all = [
+        observed.resolution_states,
+        observed.resolution_actions,
+        observed.resolution_dynamic_neighbors,
+        observed.resolution_failure_holds,
+        observed.icmpv4_error_actions,
+        observed.arp_hold_packets,
+        observed.fragment_tracking_entries,
+        observed.fragment_tracking_held,
+        observed.fragmentation_slots,
+    ];
+    for (index, table) in all.iter().enumerate() {
+        let index = index as u64;
+        assert_eq!(
+            *table,
+            ObservedTable {
+                occupied: 0,
+                high_water: 0,
+                capacity: 64 + index,
+                peak: 3 + index,
+            }
+        );
+    }
+    let text = FieldsDisplay(&observer.snapshot(MonotonicMillis(0))).to_string();
+    for line in [
+        "occupancy.resolution_states.peak=3\n",
+        "occupancy.resolution_actions.capacity=65\n",
+        "occupancy.resolution_dynamic_neighbors.peak=5\n",
+        "occupancy.resolution_failure_holds.peak=6\n",
+        "occupancy.icmpv4_error_actions.peak=7\n",
+        "occupancy.arp_hold_packets.peak=8\n",
+        "occupancy.fragment_tracking_entries.peak=9\n",
+        "occupancy.fragment_tracking_held.peak=10\n",
+        "occupancy.fragmentation_slots.peak=11\n",
+        "occupancy.fragmentation_slots.high_water=0\n",
+    ] {
+        assert!(text.contains(line), "{line}");
+    }
 }
 
 /// io-sim implements the core-defined trait, so a runtime unit test sees the

@@ -86,7 +86,7 @@ use std::{marker::PhantomData, rc::Rc};
 use crate::{
     fixed_directory::{DirectoryHashDomain, FixedDirectory},
     ipv4_header_checksum, packet, DirectoryBucket, DirectoryNode, DropReason, ForwardingSnapshot,
-    IfId, Ipv4FragmentationRuntime, ResolutionHashKey,
+    HighWaterMark, IfId, Ipv4FragmentationRuntime, ResolutionHashKey, TableOccupancy,
 };
 
 const NONE: u32 = u32::MAX;
@@ -949,6 +949,17 @@ pub(crate) enum Ipv4FragmentFollow {
     Held,
 }
 
+/// Occupancy of an [`Ipv4FragmentTracker`]; see
+/// [`Ipv4FragmentTracker::occupancy`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Ipv4FragmentTrackingOccupancy {
+    /// Live entries (pending, allowing, or refusing; expired ones until
+    /// expiry frees them).
+    pub entries: TableOccupancy,
+    /// Held later fragments.
+    pub held: TableOccupancy,
+}
+
 /// Caller-backed, worker-local fragment association table.
 ///
 /// ```compile_fail
@@ -987,6 +998,10 @@ pub struct Ipv4FragmentTracker<'a> {
     tombstone_next: usize,
     live_entries: usize,
     live_held: usize,
+    /// Largest `live_entries` and `live_held` since construction or the
+    /// last flush (OBS-017).
+    entries_high_water: HighWaterMark,
+    held_high_water: HighWaterMark,
     counters: Ipv4FragmentTrackingCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
@@ -1087,6 +1102,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
             tombstone_next: 0,
             live_entries: 0,
             live_held: 0,
+            entries_high_water: HighWaterMark::default(),
+            held_high_water: HighWaterMark::default(),
             counters: Ipv4FragmentTrackingCounters::default(),
             _worker_local: PhantomData,
         };
@@ -1124,6 +1141,21 @@ impl<'a> Ipv4FragmentTracker<'a> {
     #[must_use]
     pub const fn held_capacity(&self) -> usize {
         self.held.len()
+    }
+
+    /// Live entries and held fragments with their high-water marks since
+    /// construction or the last flush (a publication apply), and the
+    /// capacities (OBS-017). O(1).
+    #[must_use]
+    pub const fn occupancy(&self) -> Ipv4FragmentTrackingOccupancy {
+        Ipv4FragmentTrackingOccupancy {
+            entries: self
+                .entries_high_water
+                .snapshot(self.live_entries, self.entries.len()),
+            held: self
+                .held_high_water
+                .snapshot(self.live_held, self.held.len()),
+        }
     }
 
     /// Discards every entry, held fragment, and tombstone (entries and
@@ -1177,6 +1209,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.tombstone_next = 0;
         self.live_entries = 0;
         self.live_held = 0;
+        self.entries_high_water.reset(0);
+        self.held_high_water.reset(0);
     }
 
     /// Frees every entry older than the timeout at `now_ms`, at most
@@ -1684,6 +1718,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         push(self.entries, &mut self.age, index, AGE);
         self.class_link(index);
         self.live_entries += 1;
+        self.entries_high_water.observe(self.live_entries);
         Some(index as usize)
     }
 
@@ -2157,6 +2192,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.ingresses[slot].held += 1;
         self.update_over(slot);
         self.live_held += 1;
+        self.held_high_water.observe(self.live_held);
         self.counters.held += 1;
         Ok(Ipv4FragmentFollow::Held)
     }

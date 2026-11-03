@@ -16,7 +16,7 @@ fn lan(last: u8) -> Ipv4Address {
 
 /// Snapshot tables: WAN 192.0.2.0/24 bound to `wan_ip`, LAN 10.0.0.0/24
 /// bound to 10.0.0.1, and the given static neighbors.
-struct Tables {
+pub(super) struct Tables {
     routes: [Route; 2],
     interfaces: [Interface; 2],
     bindings: [LocalIpv4Binding; 2],
@@ -24,7 +24,7 @@ struct Tables {
 }
 
 impl Tables {
-    fn new(wan_ip: Ipv4Address, neighbors: Vec<Neighbor>) -> Self {
+    pub(super) fn new(wan_ip: Ipv4Address, neighbors: Vec<Neighbor>) -> Self {
         Self {
             routes: [
                 Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, None).unwrap(),
@@ -56,7 +56,7 @@ impl Tables {
         }
     }
 
-    fn snapshot(&self) -> ForwardingSnapshot<'_> {
+    pub(super) fn snapshot(&self) -> ForwardingSnapshot<'_> {
         ForwardingSnapshot::new(
             &self.routes,
             &self.interfaces,

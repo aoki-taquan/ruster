@@ -12,8 +12,9 @@ use crate::{
     },
     slot_list::{Linked, SlotLinks, SlotList},
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
-    Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, IfId,
-    Ipv4Address, MacAddress, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN, IPV4_ETHERTYPE,
+    HighWaterMark, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime,
+    IfId, Ipv4Address, MacAddress, TableOccupancy, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN,
+    IPV4_ETHERTYPE,
 };
 
 // RFC 5227 announcements of the router's own addresses and address
@@ -461,6 +462,46 @@ pub struct ResolutionCounters {
     pub timed_out: usize,
     pub failed_hits: usize,
     pub failures_expired: usize,
+}
+
+/// Occupancy of the bounded resolution tables (OBS-017); see
+/// [`ResolutionRuntime::occupancy`].
+///
+/// - `states`: state slots a new resolution cannot take: queued, waiting
+///   for a reply, failed hold-downs, and cooldowns whose request interval
+///   has not elapsed yet (still on the request order). An elapsed cooldown
+///   is reusable and not counted. This is the same "used" bit that slot
+///   admission reads, so `state_full` happens only at `capacity`, or
+///   earlier when the key's hash chain is full
+///   (`resolution_index.state_probe_exhausted`). A cooldown whose interval
+///   has elapsed still counts until `mature_states`
+///   takes it off the request order, which runs lazily (at an insert, and
+///   from the timer poll with a bounded budget per tick).
+/// - `actions`: the generated ARP request queue.
+/// - `dynamic_neighbors`: learned neighbors, expired ones included until
+///   their slot is reused or removed.
+/// - `failure_holds`: datagrams held for a Host Unreachable error.
+///
+/// `high_water` is the largest count since construction or the last
+/// publication commit. Every commit flushes the states, actions, and
+/// failure holds, so their marks restart at zero. A flushing commit also
+/// empties the learned neighbors and restarts their mark; a carrying commit
+/// keeps the mark (as OBS-015 keeps it across a reconcile that keeps state).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionOccupancy {
+    pub states: TableOccupancy,
+    pub actions: TableOccupancy,
+    pub dynamic_neighbors: TableOccupancy,
+    pub failure_holds: TableOccupancy,
+}
+
+/// High-water marks behind [`ResolutionOccupancy`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResolutionHighWater {
+    states: HighWaterMark,
+    actions: HighWaterMark,
+    dynamic_neighbors: HighWaterMark,
+    failure_holds: HighWaterMark,
 }
 
 /// Fail-closed outcomes of the hashed indexes (H4b).
@@ -997,6 +1038,9 @@ pub struct ResolutionRuntime<'a> {
     dynamic_order: SlotList,
     dynamic_count: usize,
     pending_state_count: usize,
+    /// State slots marked used in the reusable bitmap (OBS-017), kept at
+    /// [`Self::refresh_state_bit`], the only place the bit changes.
+    used_state_count: usize,
     pending_failure_hold_count: usize,
     poll_cursor: usize,
     failure_cursor: usize,
@@ -1005,6 +1049,7 @@ pub struct ResolutionRuntime<'a> {
     counters: ResolutionCounters,
     failure_counters: ResolutionFailureCounters,
     index_counters: ResolutionIndexCounters,
+    high_water: ResolutionHighWater,
     /// The neighbour miss of the datagram being decided that started or
     /// joined an ARP resolution (ARP-HOLD): set at a forwarding miss,
     /// cleared before each datagram when holding is on.
@@ -1135,6 +1180,7 @@ impl<'a> ResolutionRuntime<'a> {
             dynamic_order: SlotList::EMPTY,
             dynamic_count: 0,
             pending_state_count: 0,
+            used_state_count: 0,
             pending_failure_hold_count: 0,
             poll_cursor: 0,
             failure_cursor: 0,
@@ -1143,6 +1189,7 @@ impl<'a> ResolutionRuntime<'a> {
             counters: ResolutionCounters::default(),
             failure_counters: ResolutionFailureCounters::default(),
             index_counters: ResolutionIndexCounters::default(),
+            high_water: ResolutionHighWater::default(),
             forward_miss: None,
             announce: &mut [],
             announce_busy: 0,
@@ -1199,6 +1246,27 @@ impl<'a> ResolutionRuntime<'a> {
         self.failure_holds.len()
     }
 
+    /// Occupancy and high-water marks of the bounded tables (OBS-017), in
+    /// O(1): every count is maintained at its slot transitions.
+    #[must_use]
+    pub const fn occupancy(&self) -> ResolutionOccupancy {
+        let high_water = self.high_water;
+        ResolutionOccupancy {
+            states: high_water
+                .states
+                .snapshot(self.used_state_count, self.states.len()),
+            actions: high_water
+                .actions
+                .snapshot(self.action_queue.len(), self.actions.len()),
+            dynamic_neighbors: high_water
+                .dynamic_neighbors
+                .snapshot(self.dynamic_count, self.dynamic_neighbors.len()),
+            failure_holds: high_water
+                .failure_holds
+                .snapshot(self.pending_failure_hold_count, self.failure_holds.len()),
+        }
+    }
+
     /// Fail-closed outcomes of the hashed indexes.
     #[must_use]
     pub const fn index_counters(&self) -> ResolutionIndexCounters {
@@ -1228,6 +1296,7 @@ impl<'a> ResolutionRuntime<'a> {
             && self.dynamic_order == SlotList::EMPTY
             && self.dynamic_count == 0
             && self.pending_state_count == 0
+            && self.used_state_count == 0
             && self.pending_failure_hold_count == 0
             && self.poll_cursor == 0
             && self.failure_cursor == 0
@@ -1236,6 +1305,7 @@ impl<'a> ResolutionRuntime<'a> {
             && self.counters == ResolutionCounters::default()
             && self.failure_counters == ResolutionFailureCounters::default()
             && self.index_counters == ResolutionIndexCounters::default()
+            && self.high_water == ResolutionHighWater::default()
     }
 
     /// Validates queue/accounting/index invariants and previews one
@@ -1404,6 +1474,7 @@ impl<'a> ResolutionRuntime<'a> {
             && validate_bits::<StateBits>(states, |index| state_used(&states[index]))
             && order_valid
             && states.iter().filter(|slot| slot.in_order).count() == ordered
+            && states.iter().filter(|slot| state_used(slot)).count() == self.used_state_count
             && states.iter().enumerate().all(|(index, slot)| {
                 let queued = slot.entry.occupied
                     && matches!(
@@ -1939,6 +2010,9 @@ impl<'a> ResolutionRuntime<'a> {
         set_used::<HoldBits>(self.failure_holds, index, true);
         debug_assert!(self.pending_failure_hold_count < self.failure_holds.len());
         self.pending_failure_hold_count += 1;
+        self.high_water
+            .failure_holds
+            .observe(self.pending_failure_hold_count);
         self.failure_counters.captured += 1;
         ResolutionFailureCapture::Captured(token)
     }
@@ -2288,6 +2362,9 @@ impl<'a> ResolutionRuntime<'a> {
         let linked = link::<DynamicChain>(self.dynamic_neighbors, index, lookup.bucket);
         self.index_result(linked);
         self.dynamic_count += 1;
+        self.high_water
+            .dynamic_neighbors
+            .observe(self.dynamic_count);
         self.touch_dynamic(index);
         self.clear_resolution(interface, sender);
         ControlDisposition::Inserted
@@ -2373,6 +2450,19 @@ impl<'a> ResolutionRuntime<'a> {
 
     fn refresh_state_bit(&mut self, index: usize) {
         let used = state_used(&self.states[index]);
+        let word = StateBits::word(&self.states[index / 64]);
+        let was_used = word & (1u64 << (index % 64)) != 0;
+        match (was_used, used) {
+            (false, true) => {
+                self.used_state_count += 1;
+                self.high_water.states.observe(self.used_state_count);
+            }
+            (true, false) => {
+                debug_assert!(self.used_state_count != 0, "used state count underflow");
+                self.used_state_count = self.used_state_count.saturating_sub(1);
+            }
+            (false, false) | (true, true) => {}
+        }
         set_used::<StateBits>(self.states, index, used);
     }
 
@@ -2612,6 +2702,7 @@ impl<'a> ResolutionRuntime<'a> {
         self.actions[action_slot].state = u32::try_from(index).expect("validated capacity");
         set_used::<ActionBits>(self.actions, action_slot, true);
         self.action_queue.push_back(self.actions, action_slot);
+        self.high_water.actions.observe(self.action_queue.len());
         self.states[index].action_slot = u32::try_from(action_slot).expect("validated capacity");
     }
 
@@ -2965,6 +3056,7 @@ impl ResolutionPublicationPermit<'_, '_> {
         runtime.hash_key = hash_key;
         runtime.dynamic_order = SlotList::EMPTY;
         runtime.dynamic_count = 0;
+        runtime.high_water.dynamic_neighbors.reset(0);
         self.preview
     }
 
@@ -3067,7 +3159,11 @@ impl ResolutionRuntime<'_> {
         self.action_queue = SlotList::EMPTY;
         self.request_order = SlotList::EMPTY;
         self.pending_state_count = 0;
+        self.used_state_count = 0;
         self.pending_failure_hold_count = 0;
+        self.high_water.states.reset(0);
+        self.high_water.actions.reset(0);
+        self.high_water.failure_holds.reset(0);
         self.poll_cursor = 0;
         self.failure_cursor = 0;
         self.publication_epoch = next_runtime_epoch;
@@ -3718,6 +3814,8 @@ mod tests {
     // `resolution/tests/carry.rs`: learned neighbors carried across a
     // publication (RELOAD-CARRY).
     mod carry;
+    // `resolution/tests/occupancy.rs`: table high-water marks (OBS-017).
+    mod occupancy;
 
     const WAN: IfId = IfId(2);
     const SOURCE_IP: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 1]);

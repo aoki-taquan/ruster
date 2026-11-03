@@ -4,12 +4,17 @@ use std::{collections::BTreeMap, num::NonZeroU64};
 
 use observability_support::*;
 use ruster_core::{
-    ConsumeReason, DirectoryBucket, DropReason, FirewallRuntime, FirewallStateSlot,
-    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, MonotonicMillis, Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpRuntime,
-    Nat44UdpHashKey, Nat44UdpIndexStorage, Nat44UdpRuntime, PortOwnerSlot,
-    PublicationQuiescenceDisposition, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
+    ipv4_fragment_slot_bytes, ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_tombstones,
+    ArpHoldPolicy, ArpHoldRuntime, ArpHoldSlot, ConsumeReason, DirectoryBucket, DirectoryNode,
+    DropReason, FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot,
+    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
+    Ipv4FragmentTracker, Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingStorage,
+    Ipv4FragmentationPolicy, Ipv4FragmentationRuntime, MonotonicMillis, Nat44TcpHashKey,
+    Nat44TcpIndexStorage, Nat44TcpRuntime, Nat44UdpHashKey, Nat44UdpIndexStorage, Nat44UdpRuntime,
+    PortOwnerSlot, PublicationQuiescenceDisposition, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionHashKey, ResolutionPolicy, ResolutionRuntime,
+    ResolutionStateSlot,
 };
 use ruster_io_sim::{RecycleCause, SimIo, SimIoStats};
 use ruster_runtime::{
@@ -342,40 +347,153 @@ fn with_service_runtimes(
 
 #[test]
 fn service_occupancy_capture_copies_every_runtime_accessor() {
-    with_service_runtimes(|_, icmpv4_errors, nat44_udp, nat44_tcp, firewall| {
-        let occupancy = ServiceOccupancy::capture(icmpv4_errors, nat44_udp, nat44_tcp, firewall);
-        let udp = nat44_udp.occupancy();
-        let tcp = nat44_tcp.occupancy();
-        assert_eq!(
-            occupancy,
-            ServiceOccupancy {
-                nat44_udp_mappings: udp.mappings,
-                nat44_udp_peers: udp.peers,
-                nat44_tcp_mappings: tcp.mappings,
-                nat44_tcp_sessions: tcp.sessions,
-                nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
-                nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
-                nat44_icmp_mappings: Default::default(),
-                nat44_icmp_peers: Default::default(),
-                firewall_states: firewall.occupancy(),
-                icmpv4_error_states: icmpv4_errors.state_occupancy(),
-            }
-        );
-        // Capacities come from each runtime's own storage shape.
-        assert_eq!(occupancy.icmpv4_error_states.capacity(), 1);
-        assert_eq!(
-            occupancy.firewall_states.capacity(),
-            firewall.usable_capacity()
-        );
-        assert_eq!(occupancy.firewall_states.capacity(), 3);
-        assert_eq!(occupancy.nat44_udp_mappings.capacity(), 0);
-        let mut observer = TickObserver::default();
-        observer.record_occupancy(occupancy);
-        let observed = observer.snapshot(MonotonicMillis(0)).occupancy;
-        assert_eq!(observed.samples, 1);
-        assert_eq!(observed.firewall_states.capacity, 3);
-        assert_eq!(observed.icmpv4_error_states.capacity, 1);
-    });
+    with_service_runtimes(
+        |resolution, icmpv4_errors, nat44_udp, nat44_tcp, firewall| {
+            let occupancy = ServiceOccupancy::capture(
+                resolution,
+                icmpv4_errors,
+                nat44_udp,
+                nat44_tcp,
+                firewall,
+            );
+            let udp = nat44_udp.occupancy();
+            let tcp = nat44_tcp.occupancy();
+            let resolved = resolution.occupancy();
+            assert_eq!(
+                occupancy,
+                ServiceOccupancy {
+                    nat44_udp_mappings: udp.mappings,
+                    nat44_udp_peers: udp.peers,
+                    nat44_tcp_mappings: tcp.mappings,
+                    nat44_tcp_sessions: tcp.sessions,
+                    nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
+                    nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
+                    nat44_icmp_mappings: Default::default(),
+                    nat44_icmp_peers: Default::default(),
+                    firewall_states: firewall.occupancy(),
+                    icmpv4_error_states: icmpv4_errors.state_occupancy(),
+                    resolution_states: resolved.states,
+                    resolution_actions: resolved.actions,
+                    resolution_dynamic_neighbors: resolved.dynamic_neighbors,
+                    resolution_failure_holds: resolved.failure_holds,
+                    icmpv4_error_actions: icmpv4_errors.action_occupancy(),
+                    arp_hold_packets: Default::default(),
+                    fragment_tracking_entries: Default::default(),
+                    fragment_tracking_held: Default::default(),
+                    fragmentation_slots: Default::default(),
+                }
+            );
+            // OBS-017: the resolution and ICMPv4 action tables' capacities.
+            assert_eq!(occupancy.resolution_states.capacity(), 1);
+            assert_eq!(occupancy.resolution_actions.capacity(), 1);
+            assert_eq!(occupancy.resolution_dynamic_neighbors.capacity(), 0);
+            assert_eq!(occupancy.icmpv4_error_actions.capacity(), 1);
+            // Optional tables stay empty without their runtime.
+            assert_eq!(
+                occupancy
+                    .with_arp_hold(None)
+                    .with_fragment_tracking(None)
+                    .with_fragmentation(None),
+                occupancy
+            );
+            // Capacities come from each runtime's own storage shape.
+            assert_eq!(occupancy.icmpv4_error_states.capacity(), 1);
+            assert_eq!(
+                occupancy.firewall_states.capacity(),
+                firewall.usable_capacity()
+            );
+            assert_eq!(occupancy.firewall_states.capacity(), 3);
+            assert_eq!(occupancy.nat44_udp_mappings.capacity(), 0);
+            let mut observer = TickObserver::default();
+            observer.record_occupancy(occupancy);
+            let observed = observer.snapshot(MonotonicMillis(0)).occupancy;
+            assert_eq!(observed.samples, 1);
+            assert_eq!(observed.firewall_states.capacity, 3);
+            assert_eq!(observed.icmpv4_error_states.capacity, 1);
+            assert_eq!(observed.resolution_actions.capacity, 1);
+            assert_eq!(observed.icmpv4_error_actions.capacity, 1);
+        },
+    );
+}
+
+/// OBS-017: the optional tables are read from their runtimes when present.
+#[test]
+fn service_occupancy_reads_the_optional_hold_and_fragment_runtimes() {
+    let slot_bytes = ipv4_fragment_slot_bytes(1500);
+    let mut hold_slots = [ArpHoldSlot::EMPTY; 3];
+    let mut hold_bytes = vec![0_u8; 3 * slot_bytes];
+    let arp_hold = ArpHoldRuntime::new(
+        ArpHoldPolicy::new(2, 4).unwrap(),
+        &mut hold_slots,
+        &mut hold_bytes,
+    )
+    .unwrap();
+    let mut fragment_slots = [Ipv4FragmentSlot::EMPTY; 5];
+    let mut fragment_bytes = vec![0_u8; 5 * slot_bytes];
+    let fragmentation = Ipv4FragmentationRuntime::new(
+        Ipv4FragmentationPolicy::DEFAULT,
+        &mut fragment_slots,
+        &mut fragment_bytes,
+    )
+    .unwrap();
+    let entries = 16;
+    let held = 2;
+    let buckets = ipv4_fragment_tracking_buckets(entries);
+    let tombstones = ipv4_fragment_tracking_tombstones(entries);
+    let mut entry_slots = vec![Ipv4FragmentEntrySlot::EMPTY; entries];
+    let mut entry_buckets = vec![DirectoryBucket::default(); buckets];
+    let mut entry_nodes = vec![DirectoryNode::default(); entries];
+    let mut hosts = vec![Ipv4FragmentHostSlot::EMPTY; entries];
+    let mut host_buckets = vec![DirectoryBucket::default(); buckets];
+    let mut host_nodes = vec![DirectoryNode::default(); entries];
+    let mut tombstone_slots = vec![Ipv4FragmentTombstoneSlot::EMPTY; tombstones];
+    let mut tombstone_buckets =
+        vec![DirectoryBucket::default(); ipv4_fragment_tracking_buckets(tombstones)];
+    let mut tombstone_nodes = vec![DirectoryNode::default(); tombstones];
+    let mut held_slots = vec![Ipv4FragmentHeldSlot::EMPTY; held];
+    let mut held_bytes = vec![0_u8; held * slot_bytes];
+    let tracker = Ipv4FragmentTracker::new(
+        Ipv4FragmentTrackingPolicy::new(5_000, 4, 2).unwrap(),
+        Ipv4FragmentTrackingStorage {
+            entries: &mut entry_slots,
+            entry_buckets: &mut entry_buckets,
+            entry_nodes: &mut entry_nodes,
+            hosts: &mut hosts,
+            host_buckets: &mut host_buckets,
+            host_nodes: &mut host_nodes,
+            tombstones: &mut tombstone_slots,
+            tombstone_buckets: &mut tombstone_buckets,
+            tombstone_nodes: &mut tombstone_nodes,
+            held: &mut held_slots,
+            held_bytes: &mut held_bytes,
+        },
+        ResolutionHashKey::new(1, 2).unwrap(),
+    )
+    .unwrap();
+    let occupancy = ServiceOccupancy::default()
+        .with_arp_hold(Some(&arp_hold))
+        .with_fragment_tracking(Some(&tracker))
+        .with_fragmentation(Some(&fragmentation));
+    assert_eq!(occupancy.arp_hold_packets, arp_hold.occupancy());
+    assert_eq!(occupancy.arp_hold_packets.capacity(), 3);
+    let tracked = tracker.occupancy();
+    assert_eq!(occupancy.fragment_tracking_entries, tracked.entries);
+    assert_eq!(occupancy.fragment_tracking_held, tracked.held);
+    assert_eq!(occupancy.fragment_tracking_entries.capacity(), entries);
+    assert_eq!(occupancy.fragment_tracking_held.capacity(), held);
+    assert_eq!(occupancy.fragmentation_slots, fragmentation.occupancy());
+    assert_eq!(occupancy.fragmentation_slots.capacity(), 5);
+    assert_eq!(
+        ServiceOccupancy {
+            arp_hold_packets: Default::default(),
+            fragment_tracking_entries: Default::default(),
+            fragment_tracking_held: Default::default(),
+            fragmentation_slots: Default::default(),
+            ..occupancy
+        },
+        ServiceOccupancy::default(),
+        "only the optional tables are set"
+    );
 }
 
 #[test]

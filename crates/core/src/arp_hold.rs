@@ -57,8 +57,9 @@
 use std::{convert::Infallible, marker::PhantomData, rc::Rc};
 
 use crate::{
-    packet, BatchCompletion, ConsumeReason, DropReason, ForwardingSnapshot, IfId, Ipv4Address,
-    Ipv4FragmentationRuntime, PacketBatch, PacketLease, PacketSlot, SlotCompletion,
+    packet, BatchCompletion, ConsumeReason, DropReason, ForwardingSnapshot, HighWaterMark, IfId,
+    Ipv4Address, Ipv4FragmentationRuntime, PacketBatch, PacketLease, PacketSlot, SlotCompletion,
+    TableOccupancy,
 };
 
 const NONE: u32 = u32::MAX;
@@ -333,6 +334,8 @@ pub struct ArpHoldRuntime<'a> {
     /// Free slots, linked through `newer`.
     free: u32,
     live: usize,
+    /// Largest `live` since construction or the last flush (OBS-017).
+    live_high_water: HighWaterMark,
     counters: ArpHoldCounters,
     _worker_local: PhantomData<Rc<()>>,
 }
@@ -375,6 +378,7 @@ impl<'a> ArpHoldRuntime<'a> {
             newest: NONE,
             free: NONE,
             live: 0,
+            live_high_water: HighWaterMark::default(),
             counters: ArpHoldCounters::default(),
             _worker_local: PhantomData,
         };
@@ -402,6 +406,14 @@ impl<'a> ArpHoldRuntime<'a> {
     #[must_use]
     pub const fn slot_capacity(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Held datagrams, their high-water mark since construction or the last
+    /// [`Self::flush`] (a publication apply), and the slot count (OBS-017).
+    /// O(1).
+    #[must_use]
+    pub const fn occupancy(&self) -> TableOccupancy {
+        self.live_high_water.snapshot(self.live, self.slots.len())
     }
 
     #[must_use]
@@ -432,6 +444,7 @@ impl<'a> ArpHoldRuntime<'a> {
         self.oldest = NONE;
         self.newest = NONE;
         self.live = 0;
+        self.live_high_water.reset(0);
     }
 
     fn range(&self, index: usize) -> std::ops::Range<usize> {
@@ -617,6 +630,7 @@ impl<'a> ArpHoldRuntime<'a> {
         }
         self.newest = index;
         self.live += 1;
+        self.live_high_water.observe(self.live);
         self.counters.held += 1;
         Ok(())
     }

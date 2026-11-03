@@ -6,8 +6,8 @@ use crate::icmpv4_translated_limit::{
 };
 use crate::{
     internet_checksum, ipv4_header_checksum, GeneratedAllocationError, GeneratedBatchCompletion,
-    GeneratedPacketBatch, GeneratedPacketIo, IfId, Ipv4Address, MacAddress, MonotonicMillis,
-    OccupancyCounter, TableOccupancy, IPV4_ETHERTYPE,
+    GeneratedPacketBatch, GeneratedPacketIo, HighWaterMark, IfId, Ipv4Address, MacAddress,
+    MonotonicMillis, OccupancyCounter, TableOccupancy, IPV4_ETHERTYPE,
 };
 
 pub const ICMPV4_ERROR_MAX_QUOTE_LEN: usize = 548;
@@ -822,6 +822,8 @@ pub struct Icmpv4ErrorRuntime<'a> {
     counters: Icmpv4ErrorCounters,
     /// Allocated limiter state slots; see [`Icmpv4ErrorRuntime::state_occupancy`].
     state_occupancy: OccupancyCounter,
+    /// Largest queued action count; see [`Icmpv4ErrorRuntime::action_occupancy`].
+    action_high_water: HighWaterMark,
     /// Limiter of translated NAT44 errors per (inside host, quoted remote)
     /// (NAT44-065). A publication that installs the same key keeps it (the
     /// policy cannot change without a restart); a new key empties it.
@@ -849,6 +851,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             runtime_epoch: 1,
             counters: Icmpv4ErrorCounters::default(),
             state_occupancy: OccupancyCounter::default(),
+            action_high_water: HighWaterMark::default(),
             translated: TranslatedIcmpv4Limiter::EMPTY,
             _worker_local: PhantomData,
         }
@@ -927,6 +930,15 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.state_occupancy.snapshot(self.states.len())
     }
 
+    /// The generated error action queue (pending errors) and its high-water
+    /// mark since construction or the last publication commit, which empties
+    /// the queue (OBS-017). O(1).
+    #[must_use]
+    pub const fn action_occupancy(&self) -> TableOccupancy {
+        self.action_high_water
+            .snapshot(self.len, self.actions.len())
+    }
+
     /// Returns whether this runtime is still in its exact constructor state.
     #[must_use]
     pub fn is_pristine(&self) -> bool {
@@ -944,6 +956,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             && self.runtime_epoch == 1
             && self.counters == Icmpv4ErrorCounters::default()
             && self.state_occupancy == OccupancyCounter::default()
+            && self.action_high_water == HighWaterMark::default()
             && self.translated.is_pristine()
     }
 
@@ -1247,6 +1260,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.states[state_index].generation = generation;
         self.states[state_index].action_queued = true;
         self.len += 1;
+        self.action_high_water.observe(self.len);
         let disposition = match action.kind {
             Icmpv4ErrorKind::TimeExceededTtl => Icmpv4ErrorDisposition::Queued {
                 egress: action.egress,
@@ -1401,6 +1415,7 @@ impl Icmpv4ErrorPublicationPermit<'_, '_> {
         self.runtime.last_now = None;
         self.runtime.runtime_epoch = self.next_runtime_epoch;
         self.runtime.state_occupancy.flush();
+        self.runtime.action_high_water.reset(0);
         self.report
     }
 }
@@ -1767,6 +1782,7 @@ mod tests {
         runtime_epoch: u128,
         counters: Icmpv4ErrorCounters,
         state_occupancy: OccupancyCounter,
+        action_high_water: HighWaterMark,
     }
 
     fn runtime_image(runtime: &Icmpv4ErrorRuntime<'_>) -> RuntimeImage {
@@ -1780,6 +1796,7 @@ mod tests {
             runtime_epoch: runtime.runtime_epoch,
             counters: runtime.counters,
             state_occupancy: runtime.state_occupancy,
+            action_high_water: runtime.action_high_water,
         }
     }
 
@@ -2634,6 +2651,47 @@ mod tests {
         assert_eq!(exact_state_occupancy(&runtime), (0, 0, 2));
         runtime.schedule(action(2, 20), MonotonicMillis(0));
         assert_eq!(exact_state_occupancy(&runtime), (1, 1, 2));
+    }
+
+    fn action_queue(runtime: &Icmpv4ErrorRuntime<'_>) -> (usize, usize, usize) {
+        let occupancy = runtime.action_occupancy();
+        assert_eq!(occupancy.occupied(), runtime.pending_actions());
+        (
+            occupancy.occupied(),
+            occupancy.high_water(),
+            occupancy.capacity(),
+        )
+    }
+
+    /// OBS-017: the action queue's high-water mark follows enqueues, stays
+    /// through dequeues and a refused enqueue, and restarts at a commit.
+    #[test]
+    fn action_queue_high_water_survives_dequeue_and_restarts_at_commit() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 4];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut runtime = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::new(1, 2).unwrap(),
+            &mut states,
+            &mut slots,
+        );
+        assert_eq!(action_queue(&runtime), (0, 0, 2));
+        runtime.schedule(action(1, 20), MonotonicMillis(0));
+        runtime.schedule(action(2, 20), MonotonicMillis(0));
+        assert_eq!(action_queue(&runtime), (2, 2, 2));
+        assert!(matches!(
+            runtime.schedule(action(3, 20), MonotonicMillis(0)),
+            Icmpv4TimeExceededDisposition::ActionFull
+        ));
+        assert_eq!(action_queue(&runtime), (2, 2, 2));
+        let front = runtime.front().unwrap();
+        runtime.committed(front, MonotonicMillis(0));
+        assert_eq!(action_queue(&runtime), (1, 2, 2));
+        drop(runtime.preflight_publication().unwrap());
+        assert_eq!(action_queue(&runtime), (1, 2, 2), "a dropped permit");
+        runtime.preflight_publication().unwrap().commit();
+        assert_eq!(action_queue(&runtime), (0, 0, 2));
+        runtime.schedule(action(2, 20), MonotonicMillis(0));
+        assert_eq!(action_queue(&runtime), (1, 1, 2));
     }
 
     /// H4b: occupied limiter states stay a prefix of the table, so a new

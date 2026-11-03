@@ -16,10 +16,11 @@
 //! lines. The visiting vocabulary and [`BackendStats`](ruster_core::BackendStats)
 //! live in `ruster-core` so packet backends need not depend on this crate.
 //!
-//! State-table occupancy (OBS-015) is read between ticks through the O(1)
-//! core accessors by [`ServiceOccupancy::capture`] and folded in with
-//! [`TickObserver::record_occupancy`]; see [`OccupancyTotals`] for the
-//! definitions.
+//! State-table occupancy (OBS-015) and the occupancy of the resolution,
+//! generated action, hold, and fragment tables (OBS-017) are read between
+//! ticks through the O(1) core accessors by [`ServiceOccupancy::capture`]
+//! and folded in with [`TickObserver::record_occupancy`]; see
+//! [`OccupancyTotals`] for the definitions.
 
 use core::{convert::Infallible, fmt};
 use std::num::NonZeroU64;
@@ -752,8 +753,30 @@ impl ObservedTable {
     }
 }
 
-/// Core occupancy of every NAT44, firewall, and ICMPv4 error limiter table,
-/// read through each runtime's O(1) accessor.
+/// Core occupancy of every NAT44, firewall, and ICMPv4 error limiter table
+/// (OBS-015) and of the bounded resolution, generated action, hold, and
+/// fragment tables (OBS-017), read through each runtime's O(1) accessor.
+///
+/// The OBS-017 tables count, at the core's own counters:
+///
+/// - `resolution_states`: state slots a new resolution cannot take (queued,
+///   waiting, failed hold-downs, and cooldowns whose request interval has
+///   not elapsed), the same slots admission treats as used;
+/// - `resolution_actions`: the generated ARP request queue;
+/// - `resolution_dynamic_neighbors`: learned neighbors (expired ones until
+///   reused or removed); a carrying publication keeps the core mark, as an
+///   OBS-015 reconcile that keeps state does;
+/// - `resolution_failure_holds`: datagrams kept for a Host Unreachable;
+/// - `icmpv4_error_actions`: the generated ICMPv4 error queue;
+/// - `arp_hold_packets`: datagrams held for ARP (ARP-HOLD);
+/// - `fragment_tracking_entries` and `fragment_tracking_held`: fragment
+///   associations and held later fragments (NAT-FRAG);
+/// - `fragmentation_slots`: staged fragmentation slots (MTU2). Nothing
+///   staged outlives a tick, so between ticks `occupied` is 0, and the core
+///   mark never resets (a flush happens inside a tick).
+///
+/// Optional tables (ARP-HOLD, NAT-FRAG, MTU2) are empty (capacity 0) when
+/// not configured.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ServiceOccupancy {
     pub nat44_udp_mappings: TableOccupancy,
@@ -767,6 +790,15 @@ pub struct ServiceOccupancy {
     pub nat44_icmp_peers: TableOccupancy,
     pub firewall_states: TableOccupancy,
     pub icmpv4_error_states: TableOccupancy,
+    pub resolution_states: TableOccupancy,
+    pub resolution_actions: TableOccupancy,
+    pub resolution_dynamic_neighbors: TableOccupancy,
+    pub resolution_failure_holds: TableOccupancy,
+    pub icmpv4_error_actions: TableOccupancy,
+    pub arp_hold_packets: TableOccupancy,
+    pub fragment_tracking_entries: TableOccupancy,
+    pub fragment_tracking_held: TableOccupancy,
+    pub fragmentation_slots: TableOccupancy,
 }
 
 impl ServiceOccupancy {
@@ -775,6 +807,7 @@ impl ServiceOccupancy {
     /// runtime accessors.
     #[must_use]
     pub fn capture(
+        resolution: &ResolutionRuntime<'_>,
         icmpv4_errors: &Icmpv4ErrorRuntime<'_>,
         nat44_udp: &Nat44UdpRuntime<'_>,
         nat44_tcp: &Nat44TcpRuntime<'_>,
@@ -782,6 +815,7 @@ impl ServiceOccupancy {
     ) -> Self {
         let udp = nat44_udp.occupancy();
         let tcp = nat44_tcp.occupancy();
+        let resolution = resolution.occupancy();
         Self {
             nat44_udp_mappings: udp.mappings,
             nat44_udp_peers: udp.peers,
@@ -793,7 +827,53 @@ impl ServiceOccupancy {
             nat44_icmp_peers: TableOccupancy::default(),
             firewall_states: firewall.occupancy(),
             icmpv4_error_states: icmpv4_errors.state_occupancy(),
+            resolution_states: resolution.states,
+            resolution_actions: resolution.actions,
+            resolution_dynamic_neighbors: resolution.dynamic_neighbors,
+            resolution_failure_holds: resolution.failure_holds,
+            icmpv4_error_actions: icmpv4_errors.action_occupancy(),
+            arp_hold_packets: TableOccupancy::default(),
+            fragment_tracking_entries: TableOccupancy::default(),
+            fragment_tracking_held: TableOccupancy::default(),
+            fragmentation_slots: TableOccupancy::default(),
         }
+    }
+
+    /// Adds the ARP hold table (ARP-HOLD) when holding is on. O(1).
+    #[must_use]
+    pub fn with_arp_hold(mut self, arp_hold: Option<&ArpHoldRuntime<'_>>) -> Self {
+        if let Some(runtime) = arp_hold {
+            self.arp_hold_packets = runtime.occupancy();
+        }
+        self
+    }
+
+    /// Adds the IPv4 fragment association tables (NAT-FRAG) when the table
+    /// exists. O(1).
+    #[must_use]
+    pub fn with_fragment_tracking(
+        mut self,
+        fragment_tracking: Option<&Ipv4FragmentTracker<'_>>,
+    ) -> Self {
+        if let Some(tracker) = fragment_tracking {
+            let occupancy = tracker.occupancy();
+            self.fragment_tracking_entries = occupancy.entries;
+            self.fragment_tracking_held = occupancy.held;
+        }
+        self
+    }
+
+    /// Adds the IPv4 fragmentation slots (MTU2 part B) when the runtime
+    /// exists. O(1).
+    #[must_use]
+    pub fn with_fragmentation(
+        mut self,
+        fragmentation: Option<&Ipv4FragmentationRuntime<'_>>,
+    ) -> Self {
+        if let Some(runtime) = fragmentation {
+            self.fragmentation_slots = runtime.occupancy();
+        }
+        self
     }
 
     /// Adds the ICMP query NAT tables (N5) when the runtime exists. O(1).
@@ -827,6 +907,15 @@ pub struct OccupancyTotals {
     pub nat44_icmp_peers: ObservedTable,
     pub firewall_states: ObservedTable,
     pub icmpv4_error_states: ObservedTable,
+    pub resolution_states: ObservedTable,
+    pub resolution_actions: ObservedTable,
+    pub resolution_dynamic_neighbors: ObservedTable,
+    pub resolution_failure_holds: ObservedTable,
+    pub icmpv4_error_actions: ObservedTable,
+    pub arp_hold_packets: ObservedTable,
+    pub fragment_tracking_entries: ObservedTable,
+    pub fragment_tracking_held: ObservedTable,
+    pub fragmentation_slots: ObservedTable,
 }
 
 impl OccupancyTotals {
@@ -842,6 +931,15 @@ impl OccupancyTotals {
             nat44_icmp_peers,
             firewall_states,
             icmpv4_error_states,
+            resolution_states,
+            resolution_actions,
+            resolution_dynamic_neighbors,
+            resolution_failure_holds,
+            icmpv4_error_actions,
+            arp_hold_packets,
+            fragment_tracking_entries,
+            fragment_tracking_held,
+            fragmentation_slots,
         } = *occupancy;
         incr(&mut self.samples);
         self.nat44_icmp_mappings.record(nat44_icmp_mappings);
@@ -856,6 +954,18 @@ impl OccupancyTotals {
             .record(nat44_tcp_unsolicited_syn_holds);
         self.firewall_states.record(firewall_states);
         self.icmpv4_error_states.record(icmpv4_error_states);
+        self.resolution_states.record(resolution_states);
+        self.resolution_actions.record(resolution_actions);
+        self.resolution_dynamic_neighbors
+            .record(resolution_dynamic_neighbors);
+        self.resolution_failure_holds
+            .record(resolution_failure_holds);
+        self.icmpv4_error_actions.record(icmpv4_error_actions);
+        self.arp_hold_packets.record(arp_hold_packets);
+        self.fragment_tracking_entries
+            .record(fragment_tracking_entries);
+        self.fragment_tracking_held.record(fragment_tracking_held);
+        self.fragmentation_slots.record(fragmentation_slots);
     }
 
     fn visit<V: FieldVisitor>(&self, v: &mut V) {
@@ -871,6 +981,15 @@ impl OccupancyTotals {
             nat44_icmp_peers,
             firewall_states,
             icmpv4_error_states,
+            resolution_states,
+            resolution_actions,
+            resolution_dynamic_neighbors,
+            resolution_failure_holds,
+            icmpv4_error_actions,
+            arp_hold_packets,
+            fragment_tracking_entries,
+            fragment_tracking_held,
+            fragmentation_slots,
         } = self;
         v.field("occupancy", "samples", FieldValue::Count(*samples));
         nat44_udp_mappings.visit("occupancy.nat44_udp_mappings", v);
@@ -884,6 +1003,15 @@ impl OccupancyTotals {
         nat44_icmp_peers.visit("occupancy.nat44_icmp_peers", v);
         firewall_states.visit("occupancy.firewall_states", v);
         icmpv4_error_states.visit("occupancy.icmpv4_error_states", v);
+        resolution_states.visit("occupancy.resolution_states", v);
+        resolution_actions.visit("occupancy.resolution_actions", v);
+        resolution_dynamic_neighbors.visit("occupancy.resolution_dynamic_neighbors", v);
+        resolution_failure_holds.visit("occupancy.resolution_failure_holds", v);
+        icmpv4_error_actions.visit("occupancy.icmpv4_error_actions", v);
+        arp_hold_packets.visit("occupancy.arp_hold_packets", v);
+        fragment_tracking_entries.visit("occupancy.fragment_tracking_entries", v);
+        fragment_tracking_held.visit("occupancy.fragment_tracking_held", v);
+        fragmentation_slots.visit("occupancy.fragmentation_slots", v);
     }
 }
 

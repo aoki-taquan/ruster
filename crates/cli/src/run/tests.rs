@@ -1875,6 +1875,91 @@ fn periodic_stats_follow_the_interval() {
     );
 }
 
+/// OBS-017: every `run` stats block carries the resolution, generated
+/// action, hold, and fragment occupancy (occupied, the core's high-water
+/// mark, capacity, and the peak across flushes), typed as numbers in the
+/// `--log-format json` STATS object.
+#[test]
+fn stats_blocks_carry_the_obs017_occupancy_in_text_and_json() {
+    let host = FakeHost::default();
+    // From 192.168.1.20, which has no static neighbor entry.
+    let mut request = arp_request();
+    request[31] = 20;
+    host.state.inject.borrow_mut().push((IfId(LAN), request));
+    let mut clock = FakeClock {
+        step_us: 10,
+        ..FakeClock::default()
+    };
+    let outcome = run_with(
+        &host,
+        CheckPolicy::default(),
+        &FakeStop::after(FIRST_LOOP_CHECK + 4),
+        &mut clock,
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(outcome.out.contains("\nrx.received=1\n"), "{}", outcome.out);
+    let tables = [
+        "resolution_states",
+        "resolution_actions",
+        "resolution_dynamic_neighbors",
+        "resolution_failure_holds",
+        "icmpv4_error_actions",
+        "arp_hold_packets",
+        "fragment_tracking_entries",
+        "fragment_tracking_held",
+        "fragmentation_slots",
+    ];
+    let fields = ["occupied", "high_water", "capacity", "peak"];
+    let value = |key: &str| -> u64 {
+        let prefix = format!("\n{key}=");
+        let start = outcome
+            .out
+            .rfind(&prefix)
+            .unwrap_or_else(|| panic!("{key}"));
+        let rest = &outcome.out[start + prefix.len()..];
+        rest[..rest.find('\n').unwrap()].parse().unwrap()
+    };
+    for table in tables {
+        let key = |field: &str| value(&format!("occupancy.{table}.{field}"));
+        assert!(key("occupied") <= key("high_water"), "{table}");
+        assert!(key("high_water") <= key("capacity"), "{table}");
+        assert!(key("high_water") <= key("peak"), "{table}");
+    }
+    // The ARP request from the LAN host taught the router its neighbor.
+    let occupancy: Vec<&str> = outcome
+        .out
+        .lines()
+        .filter(|line| line.starts_with("occupancy.") || line.starts_with("resolution."))
+        .collect();
+    assert_eq!(
+        value("occupancy.resolution_dynamic_neighbors.occupied"),
+        1,
+        "{occupancy:#?}"
+    );
+    assert_eq!(value("occupancy.resolution_dynamic_neighbors.peak"), 1);
+    assert_ne!(value("occupancy.resolution_states.capacity"), 0);
+    assert_ne!(value("occupancy.icmpv4_error_actions.capacity"), 0);
+
+    let mut json = super::log::JsonLines::with_clock(Vec::new(), || 0);
+    std::io::Write::write_all(&mut json, outcome.out.as_bytes()).expect("vec");
+    std::io::Write::flush(&mut json).expect("vec");
+    let objects = super::log::tests::parse_lines(&json.into_inner());
+    let stats = objects
+        .last()
+        .and_then(|object| object.get("stats"))
+        .expect("a STATS object");
+    for table in tables {
+        for field in fields {
+            let key = format!("occupancy.{table}.{field}");
+            assert_eq!(
+                stats.get(&key),
+                Some(&super::log::tests::Json::Number(value(&key).to_string())),
+                "{key}"
+            );
+        }
+    }
+}
+
 #[test]
 fn stats_never_carry_secrets_or_addresses() {
     let host = FakeHost::default();
