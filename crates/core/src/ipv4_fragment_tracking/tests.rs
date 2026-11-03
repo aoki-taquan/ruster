@@ -2041,9 +2041,10 @@ fn a_refusing_entry_leaves_no_tombstone() {
 }
 
 /// Re-review L2: once a datagram arrives in more than four disjoint pieces
-/// its coverage is no longer tracked, but a fragment outside the ranges
-/// tracked so far is still progress (a heavily reordered datagram does not
-/// look stalled); one inside them is a duplicate.
+/// its coverage is no longer tracked exactly, but a fragment adding bytes
+/// is still progress (a heavily reordered datagram does not look stalled);
+/// the over-approximated ranges make every replay a duplicate (follow-up
+/// L-1: frozen ranges counted each replay of an outside piece).
 #[test]
 fn an_untracked_datagram_still_progresses() {
     let mut storage = Storage::new(1, 0, 0);
@@ -2054,10 +2055,14 @@ fn an_untracked_datagram_still_progresses() {
     for word in [4, 6, 8, 12] {
         progress(&mut tracker, 1, word, 10);
     }
-    // A gap below the largest end: progress at 150.
+    // The ranges over-approximate: [0,16) [32,56) [64,72) [96,104) (the
+    // smallest gap closed). A gap below the largest end: progress at 150.
     progress(&mut tracker, 1, 3, 150);
-    // A duplicate of a tracked range: no progress.
-    progress(&mut tracker, 1, 4, 300);
+    // Replays are no progress: a piece inside a range, the piece that made
+    // the datagram untracked, and the one that just progressed.
+    for word in [4, 12, 3] {
+        progress(&mut tracker, 1, word, 300);
+    }
     assert_eq!(
         tracker.admit_first(info(&fragment(2, MF, 64, 17, 16)), 340),
         Err(DropReason::Ipv4FragmentTableFull)

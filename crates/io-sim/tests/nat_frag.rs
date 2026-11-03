@@ -2099,6 +2099,16 @@ fn expiring_fragments_complete_their_refused_datagram() {
     let outcome = world.run(&lan(&cut(&sent, &SIZES)));
     assert!(frames_to(&outcome, WAN).is_empty());
     assert!(outcome.drops.contains(&DropReason::Ipv4TtlExpired));
+    // At most one Time Exceeded reaches the LAN, about the first fragment
+    // only: none about a non-initial fragment (RFC 1812 §4.3.2.7).
+    let errors = frames_to(&outcome, LAN);
+    assert!(errors.len() <= 1, "{errors:?}");
+    for error in &errors {
+        // Ethernet 14 + IPv4 20: ICMP type 11; the quoted header at 42.
+        assert_eq!((error[23], error[34]), (1, 11));
+        let quoted_word = u16::from_be_bytes([error[42 + 6], error[42 + 7]]);
+        assert_eq!(quoted_word & 0x1fff, 0, "quotes the first fragment");
+    }
     assert_eq!(world.occupancy(), (0, 0));
     let counters = world.counters();
     assert_eq!((counters.first_denied, counters.entries_completed), (1, 1));

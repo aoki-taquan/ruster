@@ -68,8 +68,12 @@
 //! admission is known to succeed. Held slots are shared between ingresses
 //! the same way. An evicted key that allowed its datagram is remembered (a
 //! tombstone) until the timeout: a new first fragment on it is refused, so
-//! its late fragments never follow another datagram's template. Every
-//! table is
+//! its late fragments never follow another datagram's template. An evicted
+//! entry that only ever refused leaves none: nothing of its datagram was
+//! forwarded, but a later datagram on the reused key is not protected from
+//! having the refused datagram's late fragments held and released with it
+//! (a mix only of refused fragments into a new datagram, which the
+//! transport checksum mostly detects; residual FRAG-012). Every table is
 //! caller-owned storage sized once from the config; there is no allocation,
 //! no lock, and no copy on the fast path (a frame that is not a fragment
 //! costs one read of the flags word).
@@ -531,10 +535,15 @@ impl Ipv4FragmentEntrySlot {
     };
 
     /// Records the data range of one fragment: `Ok(true)` when it added
-    /// data (a new end, a larger end, or bytes not seen before), `Ok(false)`
-    /// for a duplicate. `Err` when it contradicts what was seen: a second,
-    /// different end (MF clear), or data past the end. Duplicates and
-    /// overlaps count once.
+    /// data (a new end, a larger end, or bytes not covered before),
+    /// `Ok(false)` for a duplicate. `Err` when it contradicts what was seen:
+    /// a second, different end (MF clear), or data past the end. Duplicates
+    /// and overlaps count once. Past [`COVERAGE_RANGES`] disjoint pieces the
+    /// entry is `untracked` (it no longer completes early) and the ranges
+    /// over-approximate: the two closest ranges are merged, so they still
+    /// cover every byte seen, a fragment inside one of them is a duplicate,
+    /// and progress is bounded by the datagram's size (a replayed piece
+    /// never counts twice).
     fn record(&mut self, offset: u32, len: u32, more: bool) -> Result<bool, ()> {
         if self.poisoned {
             return Ok(false);
@@ -551,19 +560,9 @@ impl Ipv4FragmentEntrySlot {
             return Err(());
         }
         self.max_end = self.max_end.max(end);
-        if self.untracked {
-            // The ranges stay as they were when tracking stopped: a fragment
-            // inside one of them is a duplicate; any other may add data
-            // (a heavily reordered datagram must not look stalled).
-            let (start, stop) = (offset as u16, end);
-            let duplicate = self.ranges[..usize::from(self.ranges_len)]
-                .iter()
-                .any(|range| range[0] <= start && stop <= range[1]);
-            return Ok(!duplicate || before != (self.total, self.max_end, self.untracked));
-        }
         // The offset is below the end, which fits 16 bits.
         let (mut start, mut stop) = (offset as u16, end);
-        let mut merged = [[0_u16; 2]; COVERAGE_RANGES];
+        let mut merged = [[0_u16; 2]; COVERAGE_RANGES + 1];
         let mut count = 0;
         let mut placed = false;
         for range in &self.ranges[..usize::from(self.ranges_len)] {
@@ -572,17 +571,9 @@ impl Ipv4FragmentEntrySlot {
                 count += 1;
             } else if range[0] > stop {
                 if !placed {
-                    if count == COVERAGE_RANGES {
-                        self.untracked = true;
-                        return Ok(true);
-                    }
                     merged[count] = [start, stop];
                     count += 1;
                     placed = true;
-                }
-                if count == COVERAGE_RANGES {
-                    self.untracked = true;
-                    return Ok(true);
                 }
                 merged[count] = *range;
                 count += 1;
@@ -592,18 +583,27 @@ impl Ipv4FragmentEntrySlot {
             }
         }
         if !placed {
-            if count == COVERAGE_RANGES {
-                self.untracked = true;
-                return Ok(true);
-            }
             merged[count] = [start, stop];
             count += 1;
         }
+        if count > COVERAGE_RANGES {
+            // Over-approximate: close the smallest gap.
+            self.untracked = true;
+            let at = (0..count - 1)
+                .min_by_key(|&index| merged[index + 1][0] - merged[index][1])
+                .expect("at least two ranges");
+            merged[at][1] = merged[at + 1][1];
+            merged.copy_within(at + 2..count, at + 1);
+            count -= 1;
+            merged[count] = [0, 0];
+        }
+        let mut ranges = [[0_u16; 2]; COVERAGE_RANGES];
+        ranges.copy_from_slice(&merged[..COVERAGE_RANGES]);
         let count = u8::try_from(count).expect("at most COVERAGE_RANGES");
         let grew = before != (self.total, self.max_end, self.untracked)
             || count != self.ranges_len
-            || merged != self.ranges;
-        self.ranges = merged;
+            || ranges != self.ranges;
+        self.ranges = ranges;
         self.ranges_len = count;
         Ok(grew)
     }
@@ -1365,8 +1365,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
 
     /// An allowing entry without progress for a fifth of the timeout: its
     /// datagram stalled (fragments of one datagram arrive within
-    /// milliseconds; a spoofed first fragment never gets the rest, and a
-    /// duplicate is not progress).
+    /// milliseconds; a spoofed first fragment never gets the rest). Only a
+    /// fragment that adds bytes to the ranges is progress (see
+    /// `Ipv4FragmentEntrySlot::record`): a replay is not, also once the
+    /// ranges over-approximate.
     fn stalled(&self, index: u32, now_ms: u64) -> bool {
         let entry = &self.entries[index as usize];
         now_ms.saturating_sub(entry.created_ms + u64::from(entry.progress_ms))
@@ -2169,9 +2171,11 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// A later fragment refused before the table for its TTL (it can never
     /// leave). When its datagram is already refused, its data still counts
     /// toward the entry's coverage (no hold, no progress), so the entry can
-    /// complete early; a contradiction poisons it as in [`Self::follow`].
-    /// Any other entry is left alone: nothing is held or forwarded for a
-    /// fragment that cannot leave.
+    /// complete early; a contradiction poisons it as in [`Self::follow`],
+    /// while the fragment's own drop is still reported as
+    /// `IPV4_TTL_EXPIRED` (the poisoning shows in
+    /// `fragment_tracking.poisoned`). Any other entry is left alone:
+    /// nothing is held or forwarded for a fragment that cannot leave.
     pub(crate) fn ttl_expired(&mut self, info: Ipv4FragmentInfo, now_ms: u64) {
         let Some(index) = self.lookup(info.key, now_ms) else {
             return;
