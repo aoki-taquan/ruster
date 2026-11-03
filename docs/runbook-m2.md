@@ -60,7 +60,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  54.42 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  54.45 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -207,9 +207,9 @@ whole-document storage, which has no path.
 
 | Limit | `run-sim` (and `validate` of `sim`) | `ruster run` (and `validate` of `af-xdp`) | Why |
 |---|---|---|---|
-| quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 584, and 592 bytes), so the bound is memory: at 65536 these three alone would need 114.5 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
+| quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 592, and 592 bytes), so the bound is memory: at 65536 these three alone would need 115.0 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.42 MiB (63.17 MiB with `mappings-per-host` set on both NAT44 protocols, N3), so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.45 MiB (63.95 MiB with `mappings-per-host` set on both NAT44 protocols, N3, and 60.20 MiB with only `sessions-per-host`, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -246,8 +246,8 @@ reload path.
 | resolution `failure-holds` (656 B) | capture on a miss, promotion and expiry of a failed resolution, ARP learn | the forward chain of the key (at most 16 holds) and, for holds waiting on a reverse resolution, the reverse chain, which carries one leader per distinct waiting token (the other holds of a token hang off its leader, so thousands of holds behind one spoofed source cost other tokens nothing); clearing a token's holds visits each once, and each was captured once (amortized O(1)) | — | a few times `states` |
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | at least the number of interfaces plus one (the WAN's Port Unreachable class; `validate` requires it while delayed Port Unreachable is on) |
-| ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` (one queued error per state; fewer only means `action_full` refusals while the queue is full) |
-| NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories; with `mappings-per-host` also 64/76 B per mapping slot of per-host storage) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
+| ICMPv4 error `actions` (592 B) | O(1) ring; one per state | O(1) | — | like `states` (one queued error per state; fewer only means `action_full` refusals while the queue is full) |
+| NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories; with `mappings-per-host` or `peers-per-host` also 76/76 B per mapping slot of per-host storage, with `sessions-per-host` 92 B per TCP session slot) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `nat44.icmp.capacity` `mappings`/`peers` (64/48 B + directories), `nat44.icmp.identifiers` (32 B per identifier plus the free bitmap) | the same O(1) mapping engine as UDP (N5) on its own tables and key | O(1) per query; a full table refuses without eviction (`NAT44_ICMP_MAPPING_TABLE_FULL`) | same (65536) | one mapping per running ping per host and one peer per pinged remote; the pool defaults to the realm port numbers |
 | `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick (the same budget value as the resolution failure dispatch, applied separately, so the phase does up to twice that), never scanning unmatured ones; each matured hold walks the firewall rules once. An inconsistent table is flushed (`unsolicited_syn_index_corrupt`) | — | default 64. The Port Unreachable limiter sends at most 1 per second per egress by default, so a bigger table does not send more ICMP; it only holds more SYNs that the limiter will refuse. 0 frees the 37 KiB when the switch is off |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
@@ -297,7 +297,7 @@ attacker must first fill the table, one packet per entry.
 | `resolution.capacity.dynamic-neighbors` | 64 | 4 MiB (65536) |
 | `resolution.capacity.failure-holds` (holds a quoted datagram) | 656 | 2.56 MiB (4096) |
 | `icmpv4-errors.capacity.states` | 24 | 1.5 MiB (65536) |
-| `icmpv4-errors.capacity.actions` (holds a quoted datagram) | 584 | 2.28 MiB (4096) |
+| `icmpv4-errors.capacity.actions` (holds a quoted datagram) | 592 | 2.31 MiB (4096) |
 | `nat44.udp.capacity.mappings` | 64 + 28 directory | 5.75 MiB (65536) |
 | `nat44.udp.capacity.peers` | 48 + 28 directory | 4.75 MiB (65536) |
 | `nat44.tcp.capacity.mappings` | 80 + 28 directory | 6.75 MiB (65536) |
@@ -310,7 +310,9 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-57065664 bytes (54.42 MiB). N1 grew the TCP NAT mapping slot from 64 to 80
+57098432 bytes (54.45 MiB). MTU1 grew the ICMPv4 error action slot from 584
+to 592 bytes (the Next-Hop MTU of Fragmentation Needed, 32 KiB at the limit;
+57065664 bytes, 54.42 MiB, before). N1 grew the TCP NAT mapping slot from 64 to 80
 bytes (established-session count and expiry, 1 MiB at the limit; 56017088
 bytes, 53.42 MiB, before). B3 added the 4096 unsolicited-SYN holds
 (2.31 MiB; 53592256 bytes, 51.11 MiB, before). H4a added 16 bytes per NAT44 mapping and
@@ -324,7 +326,7 @@ raised states, actions, dynamic neighbors, and ICMPv4 error states to
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (54.42 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (54.45 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -603,6 +605,74 @@ with `ip -details link show` that no `prog/xdp` is left, fix, and start
 again. Session and attach codes are `<STEP>/<FAILURE>` tokens of the native
 error (`BIND/BUSY`, `CREATE_LINK/EXISTING_PROGRAM`, `ERRNO_<n>` for another
 errno). The table of all of them with actions is section 14.
+
+### Interface MTU and Path MTU Discovery (MTU1)
+
+Each `[[interfaces]]` entry has an IPv4 `mtu` (default 1500, 68 to 65535;
+the largest IPv4 datagram the router sends out of it, without the Ethernet
+header). Set it to the MTU of the link: the device MTU, or less when a
+smaller link sits behind the device (a PPPoE or tunnel hop the next router
+does not report). After the device checks and before attach, `ruster run`
+refuses a port whose device MTU is below the configured one
+(`stage=checks port=if<id> code=MTU_BELOW_CONFIG mtu=<device>
+config=<config>`): the router would forward datagrams the device cannot
+send, and the AF_XDP TX would refuse them silently (`tx_over_mtu`) instead
+of the sender learning the path MTU. A device MTU above the configured one
+is allowed and warned (`warning: port=if<id> MTU_BELOW_DEVICE mtu=<device>
+config=<config>`): a jumbo device left at the default `mtu` forwards only
+1500-byte datagrams. The link watch keeps the device MTU at or above the startup MTU
+(`MTU_DECREASED` is fatal), so the relation holds for the whole run. An MTU
+change in the config is restart-required (`INTERFACES`).
+
+A forwarded datagram longer than the egress MTU is dropped:
+
+- DF set (every PMTUD sender, every TCP stack by default):
+  `IPV4_FRAGMENTATION_NEEDED`, and the sender gets ICMP Destination
+  Unreachable, Fragmentation Needed and DF Set (Type 3, Code 4) with the
+  egress MTU as Next-Hop MTU, from the router's address on the interface
+  toward the sender, quoting its datagram as it sent it (before NAT). The
+  sender lowers its path MTU and retries (`ip route get <dst>` shows
+  `mtu`; `tracepath <dst>` reports `pmtu`). The error has its own limiter
+  per egress toward the senders (`[icmpv4-errors.policy]
+  fragmentation-needed-interval-ms`, default 10 ms, at least 1), so a flood
+  of other errors (a TTL sweep) never uses it up. It is per egress, not per
+  sender: one host sending oversized DF datagrams continuously can still
+  delay the error to other hosts behind the same interface
+  (`icmpv4_errors.rate_limited`); TCP retransmits until one arrives.
+  Mitigate with MSS clamping on the senders (or their gateway) and, if
+  needed, a shorter interval. Fragmentation Needed needs its own limiter
+  state on every interface: `icmpv4-errors.capacity.states` must be at
+  least twice the number of interfaces (plus one with delayed Port
+  Unreachable), or validation fails with
+  `ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`.
+- DF clear: `IPV4_FRAGMENTATION_REQUIRED`, no error. The router does not
+  fragment yet (a deviation of RFC 1812 4.2.2.7, NAT44-019L; MTU2). NAT44
+  translates only DF datagrams anyway (others are
+  `NAT44_*_NON_ATOMIC_IPV4_UNSUPPORTED`), so this concerns routed traffic
+  between interfaces without NAT.
+- The firewall decides first: a datagram it refuses is dropped with the
+  firewall's reason and never answered, so the error reveals nothing about
+  traffic the policy does not admit. To an admitted peer the error does
+  reveal the MTU of the router's link toward the destination (the inside
+  link MTU, for an outside sender): that is what RFC 1191 asks of a router.
+- A frame whose Ethernet payload is longer than the egress MTU although
+  its datagram fits (bytes after the IPv4 Total Length) is
+  `IPV4_FRAME_EXCEEDS_MTU`, without an error: the backend sends whole
+  frames. Ethernet minimum padding never trips it.
+- An ICMP error the router translates (NAT44) that is itself longer than
+  the egress MTU with DF is counted as `IPV4_FRAGMENTATION_NEEDED` but
+  answered with nothing (no error about an error, RFC 1812 4.3.2.7).
+- An unresolved next hop comes first: the first oversized datagram to a
+  neighbor not yet resolved is `NEIGHBOR_UNRESOLVED` (ARP starts, and a
+  fruitless ARP yields Host Unreachable); once the neighbor answers, the
+  next one gets Fragmentation Needed.
+
+`[icmpv4-errors.generate] fragmentation-needed = false` turns the error off
+(`icmpv4_errors.disabled_fragmentation_needed`). That black-holes PMTUD
+through the router: TCP connections whose segments exceed the MTU stall
+after the handshake. Leave it on unless every sender behind the router
+clamps its MSS. Every router-generated error is cut to fit the MTU of the
+interface it leaves (at most 576 bytes of IPv4 as before).
 
 ### Startup retry (XDP-045)
 
@@ -1372,6 +1442,8 @@ port-unreachable-interval-ms`, default 1000, a restart-required
 Exceeded or a Net/Host Unreachable. It uses one more limiter state on the
 WAN egress, so `validate` (and `run`, `plan`, and every reload) refuses
 `icmpv4-errors.capacity.states` below the number of interfaces plus one
+(twice the number of interfaces plus one while Fragmentation Needed is
+generated, MTU1: it has a limiter state of its own on every egress)
 while `unsolicited-syn-icmp` is on and `unsolicited-syn-holds` is above 0:
 `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE
 path=icmpv4-errors.capacity.states`. With fewer states, a SYN flood could
@@ -1381,7 +1453,13 @@ suppresses its Time Exceeded and Net/Host Unreachable. Each state can have
 one error queued, so size `icmpv4-errors.capacity.actions` the same way:
 with fewer actions than states in use, a full queue refuses the extra
 errors as `action_full` until the generated phase drains it (within the
-same tick at the default budgets).
+same tick at the default budgets). The queue is shared by every class, so
+with `actions` below the state bound (2 x interfaces, plus 1 with delayed
+Port Unreachable, while Fragmentation Needed is on) a burst of one class
+(a TTL sweep, a SYN flood) can hold every action and make another class,
+Fragmentation Needed included, `action_full` until the next execution.
+Set `actions` at least to the state bound; validation does not enforce
+it.
 
 Turning the switch off is a reloadable change (`plan` shows `nat44-tcp
 unsolicited-syn-icmp ~ on -> off`). Changing the capacity is
@@ -1720,11 +1798,12 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     and peer tables (one mapping per identifier, one peer per pinged
     address; a ping sweep makes many peers). Set a nonzero
     `mappings-per-host` (for example `capacity.mappings / expected hosts`)
-    and size `peers` for sweeps; peers per host are not limited (as for
-    UDP, NAT44-096).
+    and size `peers` for sweeps; `peers-per-host` (N6) limits the pinged
+    addresses per host as for UDP.
   - Counters: `nat44_icmp.*` (for example `outbound_translated`,
     `inbound_translated`, `mapping_misses`, `filter_denied`,
-    `identifier_exhausted`, `host_quota_exceeded`) and
+    `identifier_exhausted`, `host_quota_exceeded`,
+    `host_peer_quota_exceeded`) and
     `occupancy.nat44_icmp_{mappings,peers}`; drop reasons
     `NAT44_ICMP_*` and `FIREWALL_ICMP_QUERY_INVALID`.
 - Per-host mapping quota (`[nat44.udp]`/`[nat44.tcp]` `mappings-per-host`,
@@ -1763,18 +1842,16 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   refused. If unsure, enable it with a generous value (for example 4096)
   and lower it by reload. Watch the counters: a steadily rising count on a
   well-behaved host means the limit is too low. Enabling it allocates
-  per-host storage sized from `capacity.mappings` (64 bytes per UDP
-  mapping slot and 76 per TCP slot at a power-of-two capacity, 9175040
-  bytes for both at 65536 slots; it still fits the 64 MiB production
-  bound), so changing between `0` and a limit is restart-required
+  per-host storage sized from `capacity.mappings` (76 bytes per UDP
+  mapping slot, including the N6 peer counters, and 76 per TCP slot at a
+  power-of-two capacity, 9961472 bytes for both at 65536 slots; it still
+  fits the 64 MiB production bound), so changing between `0` and a limit is restart-required
   (`STORAGE_SHAPE`); changing one limit to another is reloadable (`ruster
   plan` shows `nat44-udp mappings-per-host ~ 64 -> 128`; the apply flushes
   the NAT state like every NAT change). Limits:
-  - The quota covers mappings (public ports) only. Per-host UDP peers and
-    TCP sessions are not limited (RFC 6888 REQ-5 is deferred), so one host
-    can still fill the `peers` or `sessions` table with many remotes on
-    its few mappings, even with the quota on (NAT44-096). Size those
-    tables with headroom and use the firewall against untrusted hosts.
+  - The quota covers mappings (public ports) only. One host can still
+    fill the `peers` or `sessions` table with many remotes on its few
+    mappings unless the per-host peer and session limits below are set.
   - The limit is per inside IPv4 address. The router's reverse-path check
     accepts an inside source only if its address routes back out of the
     inside interface, so spoofing is bounded to the inside-routed
@@ -1791,6 +1868,80 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     is short, and other source ports of the host are not affected.
   - No ICMP is sent for a refusal, and there is no per-host usage report
     (NAT44-096).
+- Per-host peer and session limits (`[nat44.udp]`/`[nat44.icmp]`
+  `peers-per-host`, `[nat44.tcp]` `sessions-per-host`, N6, NAT44-119;
+  default `0`, no limit; RFC 6888 REQ-5 SHOULD). Without them one inside
+  host can fill the shared `peers` or `sessions` table by talking to many
+  remotes from a few mappings, and every other host then gets
+  `PEER_TABLE_FULL` / `SESSION_TABLE_FULL`. With a limit, a host's next new
+  UDP or ICMP query filter peer (a remote address, or address and port under
+  address-and-port-dependent filtering) or its next new outbound TCP
+  connection is dropped as `NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED` /
+  `NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED` /
+  `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` (counters
+  `nat44_{udp,icmp}.host_peer_quota_exceeded`,
+  `nat44_tcp.host_session_quota_exceeded`) while it holds that many; nothing
+  is evicted and existing flows and inbound traffic are unaffected. What
+  counts:
+  - UDP/ICMP: the peers of the host's live mappings. Peers live as long as
+    their mapping, which only the host's outbound packets refresh, so a
+    host recovers one idle TTL after it stops using a mapping. Every peer
+    the host's own packets create counts, including its answers to
+    remotes that reached it first. Under `filtering =
+    "endpoint-independent"` any remote (or spoofed source) can reach a
+    host's mapped port, so a host that runs a UDP responder (a game or SIP
+    server, a P2P node) can have its whole budget spent by the remotes it
+    answers, after which its own new peers (its DNS client too) are
+    refused while it keeps answering. Do not combine endpoint-independent
+    filtering with `peers-per-host` for hosts that run UDP services; under
+    the default address-dependent filtering such packets are filtered
+    before the host sees them (NAT44-125).
+  - TCP: only sessions the host opened with an outbound SYN (the outbound
+    half of a hairpin too). Connections remotes open to the host (inbound
+    SYNs, the inbound half of a hairpin) never count, so an attacker cannot
+    spend a victim's budget; bound those with `inbound-sessions-per-remote`
+    and filtering. A counted session counts while the host keeps it alive
+    by the same rule as the mapping quota above (its own segments, never a
+    RST or an ACK from TIME-WAIT, and only the 4-minute transitory timeout
+    once the host has sent its FIN), so a closed connection stops counting
+    4 minutes after the host's last segment (an opening one after the
+    opening timeout, an idle established one after the established
+    timeout) even if the remote keeps it alive; it is then left to the
+    remote and is no longer counted. If the host resumes such a session,
+    its next segment counts it again within the limit like a new session
+    (dropped as `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` while every counted
+    session is still driven), so letting sessions lapse and resuming them
+    cannot exceed the limit. A connection the remote reopens after a FIN
+    close (the host answers its SYN) is remote-opened and stops counting;
+    one the host reopens with its own SYN counts. A host at
+    `sessions-per-host` that resumes a connection after more than its idle
+    timeout of its own silence may see that connection's segments dropped
+    as `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` until one of its other
+    sessions goes idle. Size the limit with headroom above the host's
+    normal number of concurrent connections.
+  - Sizing: like the mapping quota, `capacity.peers` or `capacity.sessions`
+    divided by the expected inside hosts keeps every host able to work
+    (for example 65536 sessions / 64 hosts = 1024). Browsers open tens to a
+    few hundred connections; P2P clients and scanners thousands. Start
+    generous (for example 2048) and lower by reload while watching the
+    counters.
+  - Storage and classification: a UDP or ICMP `peers-per-host` uses the
+    same per-host storage as `mappings-per-host` (76 bytes per mapping
+    slot), so it is a storage change only when neither was set before; a
+    TCP `sessions-per-host` adds 92 bytes per session slot (6029312 bytes
+    at 65536). Switching storage on or off is restart-required
+    (`STORAGE_SHAPE`), changing one nonzero limit to another reloadable
+    (`ruster plan` shows `nat44-tcp sessions-per-host ~ 32 -> 64`; the apply
+    flushes the NAT state). At the production maximum (every table at
+    65536 slots) `sessions-per-host` alone fits the 64 MiB bound (63127744
+    bytes) and both mapping limits fit (67059904 bytes), but all four
+    per-host limits together do not: validation fails closed with
+    `RUNTIME_STORAGE_BYTES_EXCEEDED`; lower a capacity (for example
+    `capacity.sessions = 32768`) instead.
+  - Limits: no rate limit on state creation (REQ-5 b), no ICMP or
+    notification for a refusal, a host colluding with a remote can still
+    add inbound-created TCP sessions, and the endpoint-independent UDP
+    responder case above (NAT44-125).
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)
   and more per packet). Use only release builds (`cargo build --release`)
   in production.
@@ -1925,7 +2076,9 @@ as before and after it. So the kernel must have nothing to act on:
   (`RECEIVE_OFFLOAD feature=rx-gro|rx-lro|rx-gro-hw`; a packet socket sees
   frames after GRO, so merged super-frames would be truncated and dropped;
   `UNVERIFIABLE probe=offloads` if the features cannot be read). Fix:
-  `ethtool -K <dev> gro off lro off`, and set the MTU.
+  `ethtool -K <dev> gro off lro off`, and set the MTU. The configured
+  `[[interfaces]] mtu` (MTU1) is checked as for AF_XDP: above the device
+  MTU refused (`MTU_BELOW_CONFIG`), below it warned (`MTU_BELOW_DEVICE`).
 - While running, the link watch's kernel exposure conditions are **fatal**
   for AF_PACKET (under AF_XDP they only warn): a kernel address or route
   appearing on a port, forwarding turning on, `rp_filter` dropping to 0,
@@ -2270,6 +2423,12 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=notify code=NOTIFY_SOCKET_INVALID\|WATCHDOG_USEC_INVALID\|WATCHDOG_PID_INVALID\|NOTIFY_SOCKET_OPEN` | 1 | the service manager's notification environment is not usable (section 5, "Service notification") | fix the unit's environment (`NOTIFY_SOCKET` must be an absolute path or `@name`) |
 | `health=MTU_DECREASED` / `MTU_ABOVE_FRAME` | 1 | MTU changed below the startup MTU / above the frame bound | restore the MTU, then restart |
 | `health=MTU_RAISED` | — | MTU raised within the frame bound; TX still bounded by the old MTU | restart to use the new MTU |
+| `warning: port=if<id> MTU_BELOW_DEVICE mtu=M config=C` | — | the device carries M but forwarding is limited to the interface's `mtu` C (default 1500) | set `mtu = M` if the link carries it (restart) |
+| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED path=icmpv4-errors.capacity.states` | 2 | fewer than two ICMPv4 error limiter states per interface while Fragmentation Needed is on | raise `states` to at least 2 × interfaces (+1 with delayed Port Unreachable) |
+| `drop.IPV4_FRAME_EXCEEDS_MTU` | — | frames carry bytes after the IPv4 datagram beyond the egress MTU | find the sender appending trailers; the datagrams themselves fit |
+| `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
+| `drop.IPV4_FRAGMENTATION_NEEDED` growing | — | DF datagrams above an egress MTU; senders get Fragmentation Needed | normal for PMTUD; persistent growth from one sender means it ignores the error (check `icmpv4_errors.rate_limited`, firewalls in front of the sender) |
+| `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU (fragmentation is not implemented) | raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
 | `health=LINK_PROBE` / `LINK_UNVERIFIABLE` | 1 if `LINK_UNVERIFIABLE` | rtnetlink/procfs queries failing (3 in a row is fatal) | check the namespace |
 | `health=KERNEL_IPV4_ADDRESSES` / `KERNEL_IPV4_ROUTES` / `KERNEL_FORWARDING_ENABLED` / `FORWARDING_UNVERIFIABLE` | — | kernel L3 or forwarding appeared while attached | remove it while the router runs (section 8) |
 | `IPV4_WEAK_HOST_EXPOSURE` (startup under `--allow-ipv4-weak-host`, or `health=`) | — | effective `rp_filter` 0 (`arp_ignore` does not matter) | `sysctl -w net.ipv4.conf.all.rp_filter=1` (or 2); `arp_ignore=1` as well; without the flag the next start is refused |

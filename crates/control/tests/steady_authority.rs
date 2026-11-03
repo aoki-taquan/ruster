@@ -110,10 +110,12 @@ fn validated_candidate_builds_1024_static_authority_views_without_work() {
         Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: 1500,
         },
     ];
     let bindings = [

@@ -76,8 +76,9 @@ pub use icmpv4_error::{
     Icmpv4ErrorPolicyError, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationPermit,
     Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
     Icmpv4TimeExceededAction, Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition,
-    NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
-    ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
+    NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS,
+    ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS, ICMPV4_ERROR_MAX_FRAME_LEN,
+    ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
     ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use icmpv4_translated_limit::{
@@ -104,8 +105,8 @@ pub use nat44::{
     Nat44UdpMappingSlot, Nat44UdpOccupancy, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError,
     Nat44UdpReconcileError, Nat44UdpReconcilePermit, Nat44UdpReconcileReport, Nat44UdpRuntime,
     Nat44UdpRuntimeConfigError, Nat44UdpStorageShape, NAT44_DEFAULT_MAPPINGS_PER_HOST,
-    NAT44_ICMP_DEFAULT_IDLE_TTL_MS, NAT44_ICMP_MAX_IDLE_TTL_MS, NAT44_ICMP_MIN_IDLE_TTL_MS,
-    NAT44_PORT_TAKEOVER_PROBES, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    NAT44_DEFAULT_STATE_PER_HOST, NAT44_ICMP_DEFAULT_IDLE_TTL_MS, NAT44_ICMP_MAX_IDLE_TTL_MS,
+    NAT44_ICMP_MIN_IDLE_TTL_MS, NAT44_PORT_TAKEOVER_PROBES, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
     NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
     NAT44_TCP_INBOUND_SLOT_PROBES, NAT44_TCP_MAX_IDLE_TTL_MS,
     NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_MIN_IDLE_TTL_MS,
@@ -113,7 +114,8 @@ pub use nat44::{
     NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 pub use nat44_host_quota::{
-    Nat44HostLink, Nat44HostSlot, Nat44HostStorage, Nat44TcpHostSlot, Nat44UdpHostSlot,
+    Nat44HostCounter, Nat44HostLink, Nat44HostSlot, Nat44HostStorage, Nat44TcpHostSlot,
+    Nat44TcpSessionHostSlot, Nat44UdpHostSlot,
 };
 pub use nat44_syn_hold::{
     Nat44TcpSynHoldSlot, NAT44_TCP_SYN_HOLD_CHAIN_LIMIT, NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS,
@@ -143,4 +145,7 @@ pub use resolution::{
     ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
     RESOLUTION_INDEX_CHAIN_LIMIT,
 };
-pub use route::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError};
+pub use route::{
+    IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError,
+    ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
+};

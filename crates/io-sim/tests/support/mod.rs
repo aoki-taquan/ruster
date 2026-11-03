@@ -1,8 +1,9 @@
 use ruster_core::{
-    port_free_bitmap_words, DirectoryBucket, DirectoryNode, Nat44HostLink, Nat44HostStorage,
-    Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpHostSlot, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
-    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpHostSlot,
-    Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpRuntime, PortOwnerSlot,
+    port_free_bitmap_words, DirectoryBucket, DirectoryNode, Nat44HostCounter, Nat44HostLink,
+    Nat44HostStorage, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpHostSlot, Nat44TcpIndexStorage,
+    Nat44TcpMappingSlot, Nat44TcpRuntime, Nat44TcpSessionHostSlot, Nat44TcpSessionSlot,
+    Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpHostSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpRuntime, PortOwnerSlot,
 };
 
 #[allow(dead_code)]
@@ -44,6 +45,14 @@ pub fn tcp_runtime<'a>(
         Box::leak(vec![DirectoryBucket::default(); mapping_bucket_count].into_boxed_slice()),
         Box::leak(vec![DirectoryNode::default(); mappings.len()].into_boxed_slice()),
     );
+    // Per-host session accounting storage (N6), one link word per session.
+    let session_hosts = Nat44HostStorage::new(
+        Box::leak(vec![Nat44HostLink::EMPTY; sessions.len()].into_boxed_slice()),
+        Box::leak(vec![Nat44TcpSessionHostSlot::EMPTY; sessions.len()].into_boxed_slice()),
+        Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice()),
+        Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice()),
+    )
+    .with_link_words(Box::leak(vec![0_u32; sessions.len()].into_boxed_slice()));
     Nat44TcpRuntime::new(
         config,
         mappings,
@@ -58,7 +67,8 @@ pub fn tcp_runtime<'a>(
             port_owners,
             port_free_bits,
             hosts,
-        ),
+        )
+        .with_session_hosts(session_hosts),
         Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
     )
     .unwrap()
@@ -75,6 +85,8 @@ pub struct UdpTestIndexes {
     hosts: Vec<Nat44UdpHostSlot>,
     host_buckets: Vec<DirectoryBucket>,
     host_nodes: Vec<DirectoryNode>,
+    host_words: Vec<u32>,
+    host_counters: Vec<Nat44HostCounter>,
 }
 
 impl UdpTestIndexes {
@@ -101,6 +113,8 @@ impl UdpTestIndexes {
             hosts: vec![Nat44UdpHostSlot::EMPTY; mapping_capacity],
             host_buckets: vec![DirectoryBucket::default(); mapping_bucket_count],
             host_nodes: vec![DirectoryNode::default(); mapping_capacity],
+            host_words: vec![0; mapping_capacity],
+            host_counters: vec![Nat44HostCounter::EMPTY; mapping_capacity],
         }
     }
 
@@ -122,7 +136,9 @@ impl UdpTestIndexes {
                 &mut self.hosts,
                 &mut self.host_buckets,
                 &mut self.host_nodes,
-            ),
+            )
+            .with_link_words(&mut self.host_words)
+            .with_host_counters(&mut self.host_counters),
         );
         Nat44UdpRuntime::new(
             config,
@@ -169,7 +185,11 @@ pub fn icmp_runtime(
             Box::leak(vec![Nat44UdpHostSlot::EMPTY; mapping_capacity].into_boxed_slice()),
             leak(bucket_count(mapping_capacity), DirectoryBucket::default()),
             nodes(mapping_capacity),
-        ),
+        )
+        .with_link_words(Box::leak(vec![0_u32; mapping_capacity].into_boxed_slice()))
+        .with_host_counters(Box::leak(
+            vec![Nat44HostCounter::EMPTY; mapping_capacity].into_boxed_slice(),
+        )),
     );
     ruster_core::Nat44IcmpRuntime::new(
         config,

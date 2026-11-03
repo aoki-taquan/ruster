@@ -503,6 +503,83 @@ fn nat_mappings_per_host_is_a_typed_delta_and_only_switching_it_on_or_off_is_a_s
     );
 }
 
+/// N6: `peers-per-host` (UDP) and `sessions-per-host` (TCP) are typed
+/// deltas, never the opaque policy flag. Switching the TCP session limit
+/// between `0` and a limit is a storage-shape change; so is switching the
+/// UDP peer limit on or off when no UDP mapping limit already provides the
+/// per-host storage, and not when one does. Changing one nonzero limit to
+/// another is reloadable.
+#[test]
+fn nat_peer_and_session_limits_are_typed_deltas_and_only_storage_switches_restart() {
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "allocator-seed = \"11\"\n";
+    let udp = |text: &str| (UDP, format!("icmpv4-errors = \"external-only\"\n{text}"));
+    let tcp = |text: &str| (TCP, format!("allocator-seed = \"11\"\n{text}"));
+    let edits = |edits: &[(&'static str, String)]| -> ValidatedConfigV1 {
+        let borrowed: Vec<(&str, &str)> = edits
+            .iter()
+            .map(|(anchor, text)| (*anchor, text.as_str()))
+            .collect();
+        config(&borrowed)
+    };
+    only(
+        &ApplyPlan::between(
+            &config(&[]),
+            &edits(&[udp("peers-per-host = 0\n"), tcp("sessions-per-host = 0\n")]),
+        )
+        .unwrap(),
+        &[],
+    );
+
+    let on = ApplyPlan::between(&config(&[]), &edits(&[tcp("sessions-per-host = 32\n")])).unwrap();
+    only(&on, &["nat44_tcp", "restart"]);
+    assert_eq!(on.restart_required(), [RestartRequired::StorageShape]);
+    assert_eq!(
+        on.nat44_tcp().sessions_per_host,
+        Some(Delta { old: 0, new: 32 })
+    );
+    assert_eq!(on.nat44_tcp().peers_per_host, None);
+    assert!(!on.nat44_tcp().policy_changed);
+
+    let udp_on = ApplyPlan::between(&config(&[]), &edits(&[udp("peers-per-host = 16\n")])).unwrap();
+    only(&udp_on, &["nat44_udp", "restart"]);
+    assert_eq!(udp_on.restart_required(), [RestartRequired::StorageShape]);
+    assert_eq!(
+        udp_on.nat44_udp().peers_per_host,
+        Some(Delta { old: 0, new: 16 })
+    );
+    assert_eq!(udp_on.nat44_udp().sessions_per_host, None);
+
+    // With a mapping limit the storage exists: the peer limit reloads.
+    let shared = ApplyPlan::between(
+        &edits(&[udp("mappings-per-host = 8\n")]),
+        &edits(&[udp("mappings-per-host = 8\npeers-per-host = 16\n")]),
+    )
+    .unwrap();
+    only(&shared, &["nat44_udp"]);
+    assert!(shared.restart_required().is_empty());
+
+    let change = ApplyPlan::between(
+        &edits(&[
+            udp("peers-per-host = 16\n"),
+            tcp("sessions-per-host = 32\n"),
+        ]),
+        &edits(&[udp("peers-per-host = 64\n"), tcp("sessions-per-host = 8\n")]),
+    )
+    .unwrap();
+    only(&change, &["nat44_udp", "nat44_tcp"]);
+    assert!(change.restart_required().is_empty());
+    assert_eq!(
+        change.nat44_udp().peers_per_host,
+        Some(Delta { old: 16, new: 64 })
+    );
+    assert_eq!(
+        change.nat44_tcp().sessions_per_host,
+        Some(Delta { old: 32, new: 8 })
+    );
+    assert!(!change.nat44_udp().policy_changed && !change.nat44_tcp().policy_changed);
+}
+
 #[test]
 fn tcp_inbound_limit_is_a_reloadable_typed_delta_separate_from_the_policy_flag() {
     const TCP: &str = "allocator-seed = \"11\"\n";
@@ -658,6 +735,21 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
         [Change::Changed(Delta { old, new })] if old.id == IfId(2) && new.mac == MacAddress([2, 0, 0, 0, 0, 0x22])
     ));
     assert_eq!(interface.restart_required(), [RestartRequired::Interfaces]);
+
+    // MTU1: the interface MTU is part of the interface identity the running
+    // backend was checked against (`ruster run` refuses a configured MTU
+    // above the device's), so a change is restart-required.
+    let mtu = plan(&[(
+        "mac = \"02:00:00:00:00:02\"",
+        "mac = \"02:00:00:00:00:02\"\nmtu = 1400",
+    )]);
+    only(&mtu, &["interfaces", "restart"]);
+    assert!(matches!(
+        mtu.interfaces(),
+        [Change::Changed(Delta { old, new })]
+            if old.id == IfId(2) && old.mtu == 1500 && new.mtu == 1400 && old.mac == new.mac
+    ));
+    assert_eq!(mtu.restart_required(), [RestartRequired::Interfaces]);
 
     // Name/device are control-plane labels: informational, reloadable.
     // Every reference is by name, so rename all of them.

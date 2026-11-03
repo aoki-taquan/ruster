@@ -238,6 +238,12 @@ struct FakeHost {
     ipv4_routes: u32,
     /// The port whose index carries another name at startup (H10).
     renamed: Option<u16>,
+    /// The port whose device MTU is 1400, below the configured 1500
+    /// (MTU1).
+    small_mtu: Option<u16>,
+    /// The port whose device MTU is 1700, above the configured 1500 (MTU1
+    /// review L3).
+    big_mtu: Option<u16>,
     /// The policy each `preflight` call was given.
     preflight_policies: RefCell<Vec<PrivilegePolicy>>,
     /// AF_PACKET: the MTU of every port (`None`: `max-frame-len - 14`).
@@ -288,6 +294,16 @@ fn scripted<T>(queue: &Shared<VecDeque<(IfId, T)>>, port: IfId) -> Option<T> {
 }
 
 impl FakeHost {
+    fn device_mtu(&self, id: u16) -> u32 {
+        if self.small_mtu == Some(id) {
+            1400
+        } else if self.big_mtu == Some(id) {
+            1700
+        } else {
+            1500
+        }
+    }
+
     fn failing(stage: Stage, port: Option<u16>) -> Self {
         Self {
             fail: Some((stage, port)),
@@ -780,8 +796,8 @@ impl PortHost for FakeHost {
                 super::netlink::IfName::new(port.device().as_bytes()).expect("device name")
             },
             rx_queues: if self.multi_queue == Some(id) { 4 } else { 1 },
-            link_mtu: 1500,
-            session_mtu: 1500,
+            link_mtu: self.device_mtu(id),
+            session_mtu: self.device_mtu(id),
             frame_capacity: port.umem().visible_capacity(),
             ipv4_addresses: 0,
             ipv4_routes: self.ipv4_routes,
@@ -1434,6 +1450,52 @@ fn a_port_renamed_before_attach_is_refused() {
         outcome
             .err
             .contains("startup failed: stage=checks port=if2 code=UNVERIFIABLE probe=name"),
+        "{}",
+        outcome.err
+    );
+    assert!(!host
+        .events()
+        .iter()
+        .any(|event| matches!(event, Event::Attach(WAN, _))));
+    host.assert_released();
+}
+
+/// MTU1 review L3: a device MTU above the configured one (a jumbo device
+/// left at the default 1500) starts with a warning naming both.
+#[test]
+fn a_device_mtu_above_the_configured_mtu_is_warned() {
+    let host = FakeHost {
+        big_mtu: Some(WAN),
+        ..FakeHost::default()
+    };
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("warning: port=if2 MTU_BELOW_DEVICE mtu=1700 config=1500"),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains("port=if1 MTU_BELOW_DEVICE"));
+    host.assert_released();
+}
+
+/// MTU1: a device whose MTU is below the configured interface MTU (1500
+/// by default) is refused before attach: the core would forward datagrams
+/// the device cannot send instead of answering Fragmentation Needed.
+#[test]
+fn a_device_mtu_below_the_configured_mtu_is_refused() {
+    let host = FakeHost {
+        small_mtu: Some(WAN),
+        ..FakeHost::default()
+    };
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome.err.contains(
+            "startup failed: stage=checks port=if2 code=MTU_BELOW_CONFIG mtu=1400 config=1500"
+        ),
         "{}",
         outcome.err
     );

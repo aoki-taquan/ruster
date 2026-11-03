@@ -1,4 +1,4 @@
-//! `[backend.af-packet]` schema and validation (CONFIG-008): the
+//! `[backend.af-packet]` schema and validation (CONFIG-009): the
 //! AF_PACKET (TPACKET_V3) backend of `ruster run` (AFPKT-015).
 
 use ruster_config::{

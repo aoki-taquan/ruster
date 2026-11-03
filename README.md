@@ -275,6 +275,37 @@ echo-reply = true          # false: Echo Requestを ICMPV4_ECHO_DISABLED でdrop
 time-exceeded = true       # Type 11/Code 0  -> icmpv4_errors.disabled_time_exceeded
 net-unreachable = true     # Type 3/Code 0   -> icmpv4_errors.disabled_destination_unreachable
 host-unreachable = true    # Type 3/Code 1   -> icmpv4_errors.disabled_host_unreachable
+fragmentation-needed = true # Type 3/Code 4  -> icmpv4_errors.disabled_fragmentation_needed
+```
+
+interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は
+`INTERFACES`のrestart-required）です。forwardingはTTL判定とfirewallの後、NAT/firewall stateを
+commitする前に、受信frameを送るすべてのIPv4 decision（plain、NAT44 UDP/TCP/ICMP query、
+hairpin、翻訳したICMP error、local Echo Reply）のTotal Lengthをegress interfaceのMTUと比べます
+（NATは長さを変えません）。ちょうどMTUは通り、超過はbyte不変dropです: DF付きは
+`IPV4_FRAGMENTATION_NEEDED`とDestination Unreachable, Fragmentation Needed and DF Set
+（Type 3/Code 4、RFC 1812 §5.2.7.1）で、ICMP header 2語目の下位16 bitにegress MTUを
+Next-Hop MTUとして入れ（RFC 1191 §4）、NAT前の受信datagramを引用して元sourceへ返します
+（PMTUD）。他のerrorと同じsuppressionとreverse routeを通り、limiterは専用class
+（`[icmpv4-errors.policy] fragmentation-needed-interval-ms`、default 10 ms、egressごと）なので
+Time Exceeded等のfloodに使い切られません（`icmpv4-errors.capacity.states`は2 × interfaces以上、
+Port Unreachableも送るなら+1）。Ethernet payload（Total Length後のbytesを含む）がMTUを超える
+frameは`IPV4_FRAME_EXCEEDS_MTU`でdropします。
+DFなしは`IPV4_FRAGMENTATION_REQUIRED`でICMPなし（fragmentationは未実装のdeviation、
+NAT44-019L、MTU2。NATを通るDFなしdatagramはその前にnon-atomicとして落ちます）、local Echo
+Replyの超過は`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。firewallが拒否するdatagramはfirewallの
+reasonで落ちerrorを生みません。router生成のすべてのICMP errorはreverse egressのMTUに
+収まるようquoteを切ります。`ruster run`はconfigのMTUがdeviceのMTU以下であることをattach前に
+確かめ、超えれば`MTU_BELOW_CONFIG`でexit 1です（device MTUがconfigより大きいのは可で、
+`MTU_BELOW_DEVICE`を警告します）。
+
+```toml
+[[interfaces]]
+id = 2
+name = "wan"
+device = "eth1"
+mac = "02:00:00:00:00:02"
+mtu = 1400                 # 省略時1500。deviceのMTU以下（ruster runが確認）
 ```
 
 EtherTypeを読んだ直後、IPv4/ARPはsnapshot上の正確なingress interfaceを解決し、
@@ -409,17 +440,37 @@ hostが保っているもの（自分の開いたconnectionかestablished connec
 進める）で、remoteがSYNを送り続けてもhostを上限に留められません。hostごとの
 intrusive listとkeyed host directoryでO(1)、scanもtimerもありません。defaultの`0`は無制限で、
 host storageも確保しません。非zeroにするとmapping capacity分のhost storage（mapping slotごとに
-UDP約64、TCP約76 bytes）を確保するので、`0`と非zeroの切り替えはrestart-required
+UDP約76、TCP約76 bytes）を確保するので、`0`と非zeroの切り替えはrestart-required
 （`STORAGE_SHAPE`）、非zero同士の変更はreloadableなので、値は最初から決めておくのが安全です。
-推奨値（pool size ÷ inside host数など）と限界（LAN上のsource address詐称、hostごとのpeer/session
-は無制限）はrunbookの「Known limits」にあります。
+推奨値（pool size ÷ inside host数など）と限界（LAN上のsource address詐称）はrunbookの
+「Known limits」にあります。
+
+internal hostごとのpeer/session上限（N6、NAT44-119〜125。RFC 6888 REQ-5はsubscriberごとの
+state memory（session数、filter数など）の制限をsupportすることをSHOULDで求める）:
+`[nat44.udp]`/`[nat44.icmp]`の`peers-per-host`はhostのlive mappingが持つfilter peer（話している
+remote）の合計、`[nat44.tcp]`の`sessions-per-host`はhostがoutbound SYNで開き、自分で保っている
+sessionの数を制限します。上限では新しいpeer/session（それを運ぶ新mappingも）をbyte不変の
+`NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED`/`NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED`/
+`NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED`（counter `nat44_{udp,icmp}.host_peer_quota_exceeded`、
+`nat44_tcp.host_session_quota_exceeded`）でdropし、何もevictしません。これで一つのhostが共有の
+`peers`/`sessions` tableを使い切って他hostを`PEER_TABLE_FULL`/`SESSION_TABLE_FULL`にすることを
+防ぎます。inbound SYNが作るsession（remoteが開くconnection、hairpinのinbound半分）は数えないので、
+remoteがvictimのTCP予算を使い切ることはできず（UDPはEIFでresponderを動かすhostなら応答先の
+remoteに使い切られうるので、その組み合わせは避ける。runbook）、remoteのsegmentやそれへのhostのRST/TIME-WAIT ACKは
+countを延ばしません。数えなくなったsessionをhostが再び動かすと上限内で数え直します。hostがFINを送ったconnectionは4分（transitory）で数えなくなります（N3の
+mapping quotaも同じ。NAT44-124）。回復はO(1)で、UDPはmappingのexpiry、TCPはhostがsessionを
+4分（opening/閉じたもの）またはestablished timeout動かさなかった時点です。default `0`は無制限。
+UDP/ICMPは`mappings-per-host`と同じhost storageを使い、TCPはsession slotごとに約92 bytesを
+確保するので、storageの有無が変わる切り替えはrestart-required、非zero同士はreloadableです。
 
 ```toml
 [nat44.udp]
 mappings-per-host = 1024   # 省略時0（無制限）。u16
+peers-per-host = 2048      # 省略時0（無制限）。u16
 
 [nat44.tcp]
 mappings-per-host = 1024
+sessions-per-host = 1024   # 省略時0（無制限）。u16
 ```
 
 ICMP query NAT（N5、NAT44-100〜118。RFC 5508 §3）: `[nat44.icmp]`があるとき、insideからの
@@ -456,6 +507,7 @@ filtering = "address-dependent"    # | "endpoint-independent"（reloadable）
 identifier-preservation = true     # false: 常にkeyed identifier（reloadable）
 icmpv4-errors = "bidirectional"    # queryを引用するerrorの変換（reloadable）
 mappings-per-host = 0              # 0=無制限。0⇔非0はrestart-required
+peers-per-host = 0                 # 0=無制限（N6）。mappings-per-hostとstorageを共有
 
 [nat44.icmp.identifiers]           # 省略時[nat44.realm.ports]の数値（identifierごとに32 byte）
 first = 40000
@@ -502,13 +554,15 @@ unsolicited-syn-holds = 64       # 省略時64。quote table（本番上限4096�
 
 [icmpv4-errors.policy]
 port-unreachable-interval-ms = 1000  # 省略時1000。Port Unreachable専用limiter（egressごと）。restart-required
+fragmentation-needed-interval-ms = 10  # 省略時10。Fragmentation Needed専用limiter（egressごと、0不可）。restart-required
 
 [icmpv4-errors.translated]  # 省略可。outsideからの変換errorの(inside host, 引用remote)ごとの上限（NAT44-065）。restart-required
 rate-per-second = 100       # 省略時100（1〜1000000、無制限設定なし）
 burst = 100                 # 省略時100（同時刻に届く上限）。両方1000000で実質off
 
 [icmpv4-errors.capacity]
-states = 8   # delayed Port Unreachableがon（switch onかつholds > 0）ならinterface数 + 1以上が必須
+states = 8   # Fragmentation Neededがon（default）なら2 × interface数以上、delayed Port Unreachableもon（switch onかつholds > 0）なら2 × interface数 + 1以上が必須（Fragmentation Needed offならinterface数 + 1）
+actions = 8  # states下限以上を推奨（少ないと一つのclassが次の実行までaction_fullになり得る）
 ```
 
 | `filtering` | UDP inbound（live mapping必須） | TCP inbound（exact live sessionが無い場合） |
@@ -929,7 +983,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは54.42 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`）のstorageは54.45 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
@@ -1103,6 +1157,8 @@ tx = { block-size = 65536, block-count = 4 }
   RX queue数は問いません。加えてMTUが`max-frame-len - 14`と違う（`MTU_ABOVE_FRAME`/`MTU_BELOW_FRAME`）、
   bridge/bond/team/VRFへの従属（`KERNEL_UPPER_DEVICE`）、GRO/LRO/hardware GROがon
   （`RECEIVE_OFFLOAD feature=rx-gro`等、`ethtool -K <dev> gro off lro off`）を拒否します。
+  `[[interfaces]] mtu`（MTU1）はAF_XDPと同じくdevice MTU超過が`MTU_BELOW_CONFIG`（拒否）、未満が
+  `MTU_BELOW_DEVICE`（warning）です。
 - run中はlink watchのkernel露出（address、route、forwarding、weak host、IPv6）がAF_XDPのwarningではなく
   同じcodeのfatal（exit 1）です（overrideで受理したものはwarningのまま）。kickの`ENXIO`でbind先deviceが
   消えたportは`DEVICE_REMOVED`、kernelの`PACKET_STATISTICS`（32-bit、読むとreset）はhealth sample

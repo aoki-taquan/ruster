@@ -47,14 +47,17 @@ fn base() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: 1500,
             },
             Interface {
                 id: DMZ,
                 mac: DMZ_MAC,
+                mtu: 1500,
             },
         ],
         [
@@ -768,6 +771,101 @@ fn host_at_its_mapping_limit_is_refused_while_another_host_is_served() {
     run(&mut io, &mut nat, ttl);
     let back = io.pop_tx().unwrap();
     assert_eq!(&back.bytes[36..38], &50_002_u16.to_be_bytes());
+}
+
+/// N6 (RFC 6888 REQ-5, NAT44-119): with `peers-per-host = 2`, host A's
+/// third remote is dropped byte-for-byte as
+/// `NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED`, on its existing mapping and from a
+/// new source port alike, while host B is served and A's existing peers
+/// keep translating both ways. Replies never refresh A's budget; once A's
+/// mapping expires (idle TTL after its last outbound packet) the third
+/// remote is admitted without operator action.
+#[test]
+fn host_at_its_peer_limit_is_refused_while_another_host_is_served() {
+    let (routes, interfaces, neighbors, bindings) = base();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let policy = Nat44UdpPolicy::default().with_peers_per_host(2);
+    let config = Nat44UdpConfig::new(&snapshot, LAN, WAN, PUBLIC, 40_000, 40_063, policy).unwrap();
+    let mut mappings = [Nat44UdpMappingSlot::default(); 8];
+    let mut peers = [Nat44UdpPeerSlot::default(); 8];
+    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
+    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
+    let mut rs = [ResolutionStateSlot::EMPTY; 1];
+    let mut ra = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut rs, &mut ra);
+    let mut io = SimIo::new();
+    let mut run = |io: &mut SimIo, nat: &mut _, now| {
+        io.run_nat44_udp_once(
+            1,
+            &snapshot,
+            &mut resolution,
+            &config,
+            Some(nat),
+            MonotonicMillis(now),
+            &mut NoTrace,
+        )
+        .unwrap();
+    };
+    let third = Ipv4Address::from_octets([198, 51, 100, 99]);
+    let outbound = |host, port, remote| {
+        udp_frame(
+            host,
+            remote,
+            port,
+            53,
+            64,
+            0x4000,
+            &[1],
+            &[],
+            UdpChecksum::Valid,
+        )
+    };
+    let mut public_port = 0;
+    for remote in [REMOTE1, REMOTE2] {
+        io.inject(LAN, outbound(HOST, 50_000, remote));
+        run(&mut io, &mut nat, 0);
+        let out = io.pop_tx().unwrap();
+        assert_eq!(out.egress, WAN);
+        public_port = u16::from_be_bytes(out.bytes[34..36].try_into().unwrap());
+    }
+    for refused in [outbound(HOST, 50_000, third), outbound(HOST, 50_001, third)] {
+        io.inject(LAN, refused.clone());
+        run(&mut io, &mut nat, 1);
+        assert_drop(&mut io, DropReason::Nat44UdpHostPeerQuotaExceeded, &refused);
+    }
+    assert_eq!(nat.counters().host_peer_quota_exceeded, 2);
+    assert_eq!(nat.counters().peer_full, 0);
+    // Host B is served; A's peers keep translating both ways.
+    io.inject(LAN, outbound(HOST2, 50_000, third));
+    run(&mut io, &mut nat, 2);
+    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    let ttl = Nat44UdpPolicy::default().idle_ttl_ms();
+    let reply = udp_frame(
+        REMOTE2,
+        PUBLIC,
+        53,
+        public_port,
+        64,
+        0x4000,
+        &[2],
+        &[],
+        UdpChecksum::Valid,
+    );
+    for now in [2, ttl / 2, ttl - 1] {
+        io.inject(WAN, reply.clone());
+        run(&mut io, &mut nat, now);
+        let back = io.pop_tx().unwrap();
+        assert_eq!(back.egress, LAN);
+        assert_eq!(&back.bytes[30..34], &HOST.octets());
+    }
+    let refused = outbound(HOST, 50_000, third);
+    io.inject(LAN, refused.clone());
+    run(&mut io, &mut nat, ttl - 1);
+    assert_drop(&mut io, DropReason::Nat44UdpHostPeerQuotaExceeded, &refused);
+    io.inject(LAN, refused);
+    run(&mut io, &mut nat, ttl);
+    assert_eq!(io.pop_tx().unwrap().egress, WAN);
+    assert_eq!(nat.counters().host_peer_quota_exceeded, 3);
 }
 
 #[test]

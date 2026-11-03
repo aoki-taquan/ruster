@@ -70,6 +70,8 @@ pub(crate) enum DirectoryHashDomain {
     UdpHost = 0x4e41_5434_5548_4f53,
     /// Internal-host directory of the TCP per-host mapping quota (N3).
     TcpHost = 0x4e41_5434_5448_4f53,
+    /// Internal-host directory of the TCP per-host session limit (N6).
+    TcpSessionHost = 0x4e41_5434_5453_484f,
     /// Bucket of the translated ICMPv4 error limiter (N4, NAT44-065),
     /// keyed by the resolution key in this separate domain.
     Icmpv4TranslatedLimit = 0x4943_4d50_544c_494d,

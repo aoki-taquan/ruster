@@ -71,7 +71,7 @@ interval-ms = 100
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 3
+states = 5
 actions = 3
 
 [nat44.realm]
@@ -244,7 +244,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 failure_holds: 5,
             }),
             icmpv4_errors: Some(ruster_config::Icmpv4ErrorStorageShapeV1 {
-                states: 3,
+                states: 5,
                 actions: 3,
             }),
             nat44_udp: Some(ruster_config::Nat44UdpStorageShapeV1 {
@@ -267,6 +267,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 port_owners: 8,
                 unsolicited_syn_holds: 7,
                 hosts: 0,
+                session_hosts: 0,
             }),
             nat44_icmp: None,
             firewall_states: Some(6),
@@ -277,7 +278,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 3 * size_of::<ResolutionActionSlot>()
         + 4 * size_of::<DynamicNeighborSlot>()
         + 5 * size_of::<ResolutionFailureHoldSlot>()
-        + 3 * size_of::<Icmpv4ErrorStateSlot>()
+        + 5 * size_of::<Icmpv4ErrorStateSlot>()
         + 3 * size_of::<Icmpv4ErrorActionSlot>()
         + 3 * size_of::<Nat44UdpMappingSlot>()
         + 5 * size_of::<Nat44UdpPeerSlot>()
@@ -1164,8 +1165,10 @@ fn nat44_mappings_per_host_maps_onto_core_and_sizes_host_storage() {
     );
     assert_eq!((udp_shape.hosts, tcp_shape.hosts), (3, 3));
     // UDP and TCP: 3 mapping slots, a 4-bucket mapping directory.
+    // UDP also has a link word and a peer counter per slot (N6).
     let host_bytes = 3 * (2 * size_of::<Nat44HostLink>() + 2 * size_of::<DirectoryNode>())
         + 3 * (size_of::<Nat44UdpHostSlot>() + size_of::<Nat44TcpHostSlot>())
+        + 3 * (size_of::<u32>() + size_of::<ruster_core::Nat44HostCounter>())
         + 2 * 4 * size_of::<DirectoryBucket>();
     assert_eq!(
         limited_shape.required_bytes,
@@ -1193,6 +1196,105 @@ fn nat44_mappings_per_host_maps_onto_core_and_sizes_host_storage() {
     let error = validated_with(&with_limits(2, 3), tight)
         .err()
         .expect("host storage exceeds the byte limit");
+    assert_eq!(
+        error.code(),
+        ruster_config::ValidationCode::RuntimeStorageBytesExceeded
+    );
+}
+
+/// N6: `peers-per-host` (UDP) and `sessions-per-host` (TCP) map onto the
+/// core policies (default `0`). A UDP peer limit needs the same per-host
+/// storage as a UDP mapping limit (each with a link word and a host
+/// counter), so with a mapping limit already set it does not change the
+/// shape; a TCP session limit adds per-session host storage (one host link,
+/// link word, host slot with three lists, and directory node per session
+/// slot, and the session directory's bucket count). `required_bytes`
+/// counts it all exactly, and only switching storage on or off changes the
+/// shape.
+#[test]
+fn nat44_peer_and_session_limits_map_onto_core_and_size_their_storage() {
+    use ruster_core::{
+        DirectoryBucket, DirectoryNode, Nat44HostCounter, Nat44HostLink, Nat44TcpPolicy,
+        Nat44TcpSessionHostSlot, Nat44UdpHostSlot, Nat44UdpPolicy, NAT44_DEFAULT_STATE_PER_HOST,
+    };
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let with = |udp: &str, tcp: &str| {
+        VALID
+            .replacen(UDP, &format!("{UDP}{udp}"), 1)
+            .replacen(TCP, &format!("{TCP}{tcp}"), 1)
+    };
+    let defaults = validated(VALID);
+    let nat = defaults.nat44().unwrap();
+    assert_eq!(NAT44_DEFAULT_STATE_PER_HOST, 0);
+    assert_eq!(nat.udp().unwrap().policy().peers_per_host(), 0);
+    assert_eq!(nat.tcp().unwrap().policy().sessions_per_host(), 0);
+    assert_eq!(Nat44UdpPolicy::default().peers_per_host(), 0);
+    assert_eq!(Nat44TcpPolicy::default().sessions_per_host(), 0);
+    let shape = defaults.storage_shape();
+    assert_eq!(shape.nat44_tcp.unwrap().session_hosts, 0);
+    assert_eq!(
+        validated(&with("peers-per-host = 0\n", "sessions-per-host = 0\n")).storage_shape(),
+        shape
+    );
+
+    let limited = validated(&with("peers-per-host = 4\n", "sessions-per-host = 5\n"));
+    let limited_nat = limited.nat44().unwrap();
+    let (udp, tcp) = (
+        limited_nat.udp().unwrap().policy(),
+        limited_nat.tcp().unwrap().policy(),
+    );
+    assert_eq!((udp.peers_per_host(), tcp.sessions_per_host()), (4, 5));
+    assert_eq!(udp.with_peers_per_host(0), nat.udp().unwrap().policy());
+    assert_eq!(tcp.with_sessions_per_host(0), nat.tcp().unwrap().policy());
+    let limited_shape = limited.storage_shape();
+    let (udp_shape, tcp_shape) = (
+        limited_shape.nat44_udp.unwrap(),
+        limited_shape.nat44_tcp.unwrap(),
+    );
+    // UDP: 3 mapping slots, a 4-bucket mapping directory; TCP: 5 session
+    // slots, an 8-bucket session directory; no TCP mapping host storage.
+    assert_eq!(
+        (udp_shape.hosts, tcp_shape.hosts, tcp_shape.session_hosts),
+        (3, 0, 5)
+    );
+    let udp_bytes = 3
+        * (size_of::<Nat44HostLink>()
+            + size_of::<Nat44UdpHostSlot>()
+            + size_of::<u32>()
+            + size_of::<Nat44HostCounter>()
+            + size_of::<DirectoryNode>())
+        + 4 * size_of::<DirectoryBucket>();
+    let tcp_bytes = 5
+        * (size_of::<Nat44HostLink>()
+            + size_of::<Nat44TcpSessionHostSlot>()
+            + size_of::<u32>()
+            + size_of::<DirectoryNode>())
+        + 8 * size_of::<DirectoryBucket>();
+    assert_eq!(
+        limited_shape.required_bytes,
+        shape.required_bytes + udp_bytes + tcp_bytes
+    );
+    // Other nonzero values keep the shape (reloadable).
+    assert_eq!(
+        validated(&with("peers-per-host = 65535\n", "sessions-per-host = 1\n")).storage_shape(),
+        limited_shape
+    );
+    // A UDP peer limit next to a mapping limit shares its storage.
+    let mapping_limit = validated(&with("mappings-per-host = 2\n", "")).storage_shape();
+    assert_eq!(
+        validated(&with("mappings-per-host = 2\npeers-per-host = 9\n", "")).storage_shape(),
+        mapping_limit
+    );
+    // The byte limit counts the storage (fail closed).
+    let tight = ValidationLimits {
+        max_runtime_bytes: shape.required_bytes + udp_bytes,
+        ..GENEROUS
+    };
+    assert!(validated_with(&with("peers-per-host = 4\n", ""), tight).is_ok());
+    let error = validated_with(&with("", "sessions-per-host = 5\n"), tight)
+        .err()
+        .expect("session host storage exceeds the byte limit");
     assert_eq!(
         error.code(),
         ruster_config::ValidationCode::RuntimeStorageBytesExceeded
@@ -1259,16 +1361,17 @@ fn nat44_unsolicited_syn_switch_and_holds_map_onto_core_and_storage() {
 #[test]
 fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
     const TCP: &str = "icmpv4-errors = \"disabled\"\n";
-    // VALID has two interfaces.
+    // VALID has two interfaces: two classes each (MTU1: Fragmentation
+    // Needed has its own) plus the Port Unreachable class.
     let states = |source: &str, value: u32| {
         source.replacen(
-            "[icmpv4-errors.capacity]\nstates = 3\n",
+            "[icmpv4-errors.capacity]\nstates = 5\n",
             &format!("[icmpv4-errors.capacity]\nstates = {value}\n"),
             1,
         )
     };
-    validated(&states(VALID, 3));
-    let refused = error(&states(VALID, 2));
+    validated(&states(VALID, 5));
+    let refused = error(&states(VALID, 4));
     assert_eq!(
         refused.code(),
         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
@@ -1283,15 +1386,43 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
             .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
     );
     assert_eq!((refused.limit(), refused.actual()), (None, None));
-    // No Port Unreachable can be sent: the interface count is enough.
+    // Fewer than two per interface: refused for Fragmentation Needed.
+    let refused = error(&states(VALID, 3));
+    assert_eq!(
+        refused.code(),
+        ValidationCode::Icmpv4ErrorStatesTooFewForFragmentationNeeded
+    );
+    assert_eq!(
+        refused.code().code(),
+        "ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED"
+    );
+    assert_eq!(
+        refused.path().segments(),
+        ["icmpv4-errors", "capacity", "states"]
+            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
+    );
+    // No Port Unreachable can be sent: two per interface are enough.
     let off = VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
-    validated(&states(&off, 2));
+    validated(&states(&off, 4));
     let no_holds = VALID.replacen(
         "unsolicited-syn-holds = 7\n",
         "unsolicited-syn-holds = 0\n",
         1,
     );
-    validated(&states(&no_holds, 2));
+    validated(&states(&no_holds, 4));
+    // Fragmentation Needed off: one per interface plus Port Unreachable.
+    let frag_off = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nfragmentation-needed = false\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    validated(&states(&frag_off, 3));
+    assert_eq!(
+        error(&states(&frag_off, 2)).code(),
+        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
+    );
+    let both_off = frag_off.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
+    validated(&states(&both_off, 2));
 }
 
 #[test]
@@ -1656,4 +1787,101 @@ fn dotted(path: &ruster_config::SourcePath) -> String {
         }
     }
     text
+}
+
+/// MTU1: `[[interfaces]] mtu` defaults to the Ethernet MTU 1500, accepts 68
+/// (RFC 791) to 65535, reaches the core interface, and is refused outside
+/// that range at its own path. `fragmentation-needed` is a generation
+/// switch like the others.
+#[test]
+fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
+    use ruster_core::{Icmpv4ErrorKind, IfId, ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU};
+
+    let defaults = validated(VALID);
+    assert!(defaults
+        .core_interfaces()
+        .iter()
+        .all(|interface| interface.mtu == ETHERNET_DEFAULT_MTU));
+    assert!(defaults
+        .interfaces()
+        .iter()
+        .all(|binding| binding.mtu() == ETHERNET_DEFAULT_MTU));
+    let policy = defaults.icmpv4_errors().unwrap().policy();
+    assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded));
+
+    let with_mtu = |mtu: u64| {
+        VALID.replacen(
+            "mac = \"02:00:00:00:00:01\"\n",
+            &format!("mac = \"02:00:00:00:00:01\"\nmtu = {mtu}\n"),
+            1,
+        )
+    };
+    let mtu_of = |config: &ValidatedConfigV1, id: u16| {
+        config
+            .core_interfaces()
+            .iter()
+            .find(|interface| interface.id == IfId(id))
+            .unwrap()
+            .mtu
+    };
+    for mtu in [u64::from(IPV4_MIN_MTU), 1400, 9000, 65_535] {
+        let config = validated(&with_mtu(mtu));
+        assert_eq!(u64::from(mtu_of(&config, 1)), mtu);
+        assert_eq!(mtu_of(&config, 2), ETHERNET_DEFAULT_MTU);
+        assert_eq!(config.storage_shape(), defaults.storage_shape());
+    }
+    for mtu in [0, 67, 65_536, u64::from(u32::MAX)] {
+        let rejected = error(&with_mtu(mtu));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::InterfaceMtuOutOfRange,
+            "{mtu}"
+        );
+        assert_eq!(rejected.code().code(), "INTERFACE_MTU_OUT_OF_RANGE");
+        assert_eq!(dotted(rejected.path()), "interfaces[1].mtu", "{mtu}");
+    }
+
+    let off = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nfragmentation-needed = false\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    let policy = validated(&off).icmpv4_errors().unwrap().policy();
+    assert!(!policy.generates(Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded));
+    assert!(policy.generates(Icmpv4ErrorKind::TimeExceededTtl));
+    assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachableHost));
+
+    // Review M1: its own limiter interval, default 10 ms, never 0.
+    assert_eq!(
+        defaults
+            .icmpv4_errors()
+            .unwrap()
+            .policy()
+            .fragmentation_needed_interval_ms(),
+        ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS
+    );
+    let interval = |value: u64| {
+        VALID.replacen(
+            "state-ttl-ms = 60000\n\n[icmpv4-errors.capacity]",
+            &format!(
+                "state-ttl-ms = 60000\nfragmentation-needed-interval-ms = {value}\n\n\
+                 [icmpv4-errors.capacity]"
+            ),
+            1,
+        )
+    };
+    assert_eq!(
+        validated(&interval(250))
+            .icmpv4_errors()
+            .unwrap()
+            .policy()
+            .fragmentation_needed_interval_ms(),
+        250
+    );
+    let rejected = error(&interval(0));
+    assert_eq!(
+        rejected.code(),
+        ValidationCode::Icmpv4ErrorPolicy(ruster_core::Icmpv4ErrorPolicyError::IntervalZero)
+    );
+    assert_eq!(dotted(rejected.path()), "icmpv4-errors.policy");
 }

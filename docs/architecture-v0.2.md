@@ -297,7 +297,7 @@ worker-localであり、共有lock、packet clone、backend buffer pointerを持
 
 ### router-originated ICMPv4 inventoryとoperator switch
 
-routerが自身の名前で生成または応答するICMPv4は次の4 classだけです（NAT44のICMPv4 error変換は
+routerが自身の名前で生成または応答するICMPv4は次の5 class（とB3のPort Unreachable）だけです（NAT44のICMPv4 error変換は
 受信errorのtranslationで生成ではなく、`nat44.*.icmpv4-errors`で別途設定します）。owner方針
 （2026-11-01）により既定値はすべてRFC動作で、security上offにしたい運用者向けにclassごとの
 switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である限り、SHOULDに反するoption
@@ -309,6 +309,7 @@ switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である
 | Time Exceeded（Type 11/Code 0） | route hitでTTL 0/1 | RFC 1812 §5.3.1 MUST | `[icmpv4-errors.generate] time-exceeded`（`true`） | `IPV4_TTL_EXPIRED`のまま、`icmpv4_errors.disabled_time_exceeded` | restart-required（`Icmpv4ErrorPolicy`） |
 | Destination Unreachable Network（Type 3/Code 0） | LPM miss（firewall有効時はegress-free permitのみ） | RFC 1812 §§4.3.3.1, 5.2.7.1 MUST | `net-unreachable`（`true`） | `ROUTE_MISS`/`FIREWALL_ROUTE_UNAVAILABLE`のまま、`icmpv4_errors.disabled_destination_unreachable` | restart-required |
 | Destination Unreachable Host（Type 3/Code 1） | direct targetのfruitless ARP | RFC 1812 §5.2.7.1（MUST be able to generate、最も近いcodeをSHOULD） | `host-unreachable`（`true`） | holdをreverse route/reverse ARP前にretire、`icmpv4_errors.disabled_host_unreachable`と`ResolutionFailureCounters::generation_disabled` | restart-required |
+| Destination Unreachable Fragmentation Needed（Type 3/Code 4） | DF付きでegress MTU超過（MTU1、下の「egress MTU」） | RFC 1812 §§4.2.2.7, 5.2.7.1 MUST、RFC 1191 §4 MUST（Next-Hop MTU） | `fragmentation-needed`（`true`） | `IPV4_FRAGMENTATION_NEEDED`のまま、`icmpv4_errors.disabled_fragmentation_needed`。PMTUDをblack holeにする | restart-required |
 
 security上の理由は、Echoがhost discovery、Time Exceededがtraceroute topology disclosure、
 Network Unreachableがroute table probing、Host UnreachableがLAN host enumerationに使えることです。
@@ -395,7 +396,60 @@ deadlineを開始しexact boundaryを許可します。allocation/build失敗は
 開始せず、backend reject/finish errorもTX requested済みなのでdeadlineを開始します。
 state/action fullとclock regressionはphantom state/action/deadlineを作りません。expired idle
 stateだけ再利用します。multi-worker共通limit、packet hold/replay、RFC 4884 extension、
-MTU別quote縮小/generated fragmentation、interface別disableはdeferredです。
+generated fragmentation、interface別disableはdeferredです。MTU別quote縮小はMTU1で実装しました
+（下）。
+
+### egress MTU（MTU1、RFC 1812 §4.2.2.7、RFC 1191 §4）
+
+MTUの正（source of truth）はconfigです。`[[interfaces]] mtu`（default 1500、68〜65535）が
+`Interface::mtu`としてforwarding snapshot（validated owner、publication）に入り、interface
+identityの一部なので変更は`InterfacesChanged`/`INTERFACES`のrestart-requiredです。
+`ForwardingSnapshot::new`は68未満を拒否します（RFC 791）。AF_XDP backendは別にdevice MTUを
+sessionのopen時に読みTXを`mtu + 14`に制限するので（XDP-139）、`ruster run`はattach前に
+config MTU ≤ session MTUを要求し（`MTU_BELOW_CONFIG`）、run中のdevice MTU低下は
+`MTU_DECREASED`でfatalです。よってcoreを通ったdatagramはTXの上限を超えません。device MTUを
+自動でconfigへ取り込まないのは、sim（deviceなし）とreload（configだけから候補を作る）で同じ
+publication経路を保つためです。
+
+判定は`forward_batch_inner`で`decide`がdecisionを返し、NAT planのprevalidateが通った後、
+`apply_decision`がframeを書き換える前に一か所で行います（`check_egress_mtu`）。対象は受信frameを
+送るすべてのIPv4 decision（`Ipv4`、`Nat44Udp`/`Nat44Tcp`（hairpin含む）、`Nat44Icmp`、
+`Nat44Icmpv4`、`Icmpv4EchoReply`）で、ARP replyとconsumeは除きます。NAT44は長さを変えないので
+受信Total Lengthがegress上の長さです。fast pathはdecisionのegressのindexed interface lookup
+一回とu16比較一回で、allocation、copy、共有stateはありません。超過時だけcoldな関数が
+frameを再検証しDF bitを読みます。この位置なので:
+
+- TTL判定（Time Exceeded）、route miss、firewall planの後です。firewallが拒否するdatagramは
+  firewall reasonで落ち、Fragmentation Neededはfirewallが許可したdatagramにだけ返ります
+  （route missのNetwork Unreachableと同じく、errorがpolicyのoracleにならない）。
+- NAT mapping/peer/session、ICMP query mapping、firewall stateのcommitは`check_egress_mtu`の後
+  なので、dropしたdatagramはstateを作りません。例外はhairpinのoutbound halfで、これは`decide`の
+  中でcommit済みです（拒否されたinbound halfと同じ扱い。inbound halfはcommitしない）。
+- quoteは書き換え前の受信datagramです。inside→outsideではinside hostが送ったまま（NAT前）、
+  outside→public addressではoutside hostが送ったまま（public address宛て）で、どちらも送信者が
+  自分のsocketと照合できる形です。errorのsource、reverse route、neighbor、suppression、
+  limiter（classは別）は他のgenerated errorと同じ`decide_icmpv4_error`/`schedule_reverse_icmpv4_error`です。
+
+超過はDF=1なら`IPV4_FRAGMENTATION_NEEDED`とType 3/Code 4（Next-Hop MTU = egress MTUをICMP
+header 2語目の下位16 bitへ、上位16 bitは0）、DF=0なら`IPV4_FRAGMENTATION_REQUIRED`（fragmentation
+未実装のdeviation、MTU2）、local Echo Replyなら`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。
+`Icmpv4ErrorAction`はNext-Hop MTUを2 bytes持ちます（action slotは584→592 bytes）。limiter classは
+Port Unreachable（class 1）と同様に専用のclass 2で、間隔は`fragmentation-needed-interval-ms`（default
+10 ms）です（review M1: class 0を共有するとTTL=1を100 msごとに送るだけで他hostのFragmentation Neededが
+すべてrate limitされ、PMTUDのremote black holeになった）。class 2のためlimiter stateはinterfaceごとに
+2つ要り、configは`icmpv4-errors.capacity.states` ≥ 2 × interfaces（Port Unreachableも送るなら+1）を
+要求します。per-egressで送信元単位ではないので、一つのsenderのfloodは同じegressの他senderへの
+errorを遅らせ得ます（residual）。
+
+すべてのgenerated errorは`fit_egress_mtu`でreverse egressのMTUから28を引いた長さまでquoteを切ります
+（切った部分は0で、同じactionは等しいまま）。roomが引用datagramのIHL × 4 + 8未満ならRFC 792の
+最小quoteを満たせないので、actionに印を付け`schedule`がclock/limiterより前に`QuoteBelowMinimum`で
+抑止します。ARP（28 bytes）はMTU 68に常に収まります。
+
+backendはframe全体を送るので、Total LengthがMTU以下でもEthernet payload（Total Length後のbytesを含む）が
+egress MTUを超えるframeは`IPV4_FRAME_EXCEEDS_MTU`で落とします（ICMPなし）。trimはしません
+（backendのcommitはframe長を変えない契約のため）。`ruster run`はdevice MTUがconfigより大きいと
+`MTU_BELOW_DEVICE`を警告します。
 
 ## ARP control scope
 
@@ -834,7 +888,9 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
   `StateFull`（Time Exceeded/Net/Host Unreachableのsilent抑止）にならないよう、switch onかつ
   hold容量>0のときvalidateは`icmpv4-errors.capacity.states >= interface数 + 1`を要求する
   （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、値は
-  出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない。
+  出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない
+  （MTU1以降、Fragmentation Neededを生成するときはclass 2がinterfaceごとに加わり、下限は
+  2 × interface数（+ 1）。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`）。
   1 slotをreserveする案はegressが3つ以上だと他egressを守れないため採らない。remote単位のfairnessはdeferred（NAT44-077）。
 - **Config/plan.** `[nat44.tcp] unsolicited-syn-icmp`（default true、`Nat44TcpPolicy`の一部、
   reloadable、`NatChange::unsolicited_syn_icmp`はtyped delta）と`[nat44.tcp.capacity]
@@ -1617,16 +1673,75 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
   とcommitが同じstateから再計算でき（planの大きさは変わらない）、commitはinfallibleです。
 - **storageとclassification**: `mappings-per-host = 0`ならhost storageを確保せずhost処理もしま
   せん（hot pathのcostもmemoryも従来どおり）。非zeroなら上記をmapping capacity分確保し
-  `required_bytes`が数えます（production最大tableで両protocolなら+9175040 bytes、計66240704
-  bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
+  `required_bytes`が数えます（production最大tableで両protocolなら+9961472 bytes（N6のUDP peer
+  counterを含む）、計67059904 bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
   非zero同士の変更はreloadable（他のNAT変更と同じくapplyでNAT stateをflush）。planは
   `NatChange::mappings_per_host`のtyped deltaです。
 - **限界**（NAT44-096）: 上限はaddress単位です。reverse-path checkがinside sourceをinside-routed
   prefixに限りますが、ARP/MACとの結び付けは無いので、LAN上のhostはそのprefix内の詐称address
   ごとに上限まで作れ、victimのaddressを詐称してそのquotaを使い切ることもできます（inside routeは
-  狭く保つ）。hostごとのpeer/sessionは制限しません（RFC 6888 REQ-5）。RFC 6888 REQ-11の
+  狭く保つ）。hostごとのpeer/sessionはN6（下）が制限します。RFC 6888 REQ-11の
   ICMP Host Unreachableは送らず（他のresource拒否と同じsilent drop）、hostごとの使用数の
   観測もありません。
+
+#### Per-host peer and session limits (N6)
+
+N6（NAT44-119〜125）はRFC 6888 REQ-5（mappingごと・subscriberごとのstate memoryの制限をsupport:
+SHOULD）を、internal IPv4 addressごとのUDP/ICMP query filter peer上限`peers-per-host`とTCP
+session上限`sessions-per-host`（u16、default `0`=無制限）として実装します。上限では新しい
+peer/session（それを運ぶ新mappingも）をstateを変えずに`NAT44_{UDP,ICMP}_HOST_PEER_QUOTA_EXCEEDED`
+/`NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED`でdropし、evictしません（REQ-11 a/d）。plan時の判定順は
+N3のmapping quota、N6、table満杯です。
+
+- **UDP/ICMP（mapping単位の集計）**: peerはmappingのgenerationと生死を共にし、mappingは
+  outboundだけがrefreshするので、remoteはhostの予算を保てません。N3のhost tableを
+  *member-counting*にし、mapping slotごとのlink word（そのmappingのchainのpeer数）とhostごとの
+  counter（合計と*cursor*）をcaller-backed配列で持ちます。hostのlistはactivity順のままで、
+  先頭からpeerを数えないexpired mappingの接頭部、cursorから数えるmapping（liveなものは全て
+  ここ）が続きます。peer追加で+1、park（peerをstale chainへ）、retire、slot再利用、flushで
+  そのmappingの数だけ−（O(1)）。parkされるのは常にhostのcursorか既に数えないmappingです
+  （global LRUの先頭が数えるmappingならそのhostで最も古い数えるmapping）。上限ではcursorだけを
+  見て、liveなら拒否、expiredならcursorを進めて（そのmappingのpeerは死んでいる）受理します。
+  mappingはportとchainを持ったままN3のmapping数に残り、tableのpark/再利用を待ちます。数える
+  mappingはactivity listにあり1 peer以上持つので、count ≤ limitは保たれます。hostのoutboundが
+  作るpeerは応答でも数えるので、EIFではUDP responderのhostの予算を応答先のremoteが使い切れます
+  （review sec M1、NAT44-125。runbookはその組み合わせを避けるよう勧める）。
+- **TCP（session単位、host開始だけ）**: 数えるのはoutboundのinitial SYN（hairpinのoutbound半分を
+  含む）が作ったsessionだけです。inbound SYNが作るsessionを数えると、remoteがvictimのpublic port
+  へSYNを送るだけでvictimの予算を使い切れる（N3 M1と同じtargeted DoS）ので数えません（per-remote
+  inbound limitとfilteringの担当）。session slotと並ぶ二つ目のhost table（session slotごとの
+  link 12 bytesとlink word、3本のlistを持つhost slot 48 bytes、domain `TcpSessionHost`のkeyed
+  directory）で、各counted sessionは*host-driven expiry*を持ちます: N3のmapping規則をsessionごとに
+  適用し（hostが送り、closingに置かず、自分が開いたかestablishedのsessionのsegmentが`now`+phase
+  TTLに進める。hostがFINを送ったestablishedはtransitory）、毎commitでsession自身のexpiryで
+  capします。値は常に`now`+三つのphase TTLのどれかなので、hostごとの3本のlist（TTLの種類別）は
+  expiry順で、link wordにはsessionのlast activityからのoffsetを置きます（saturateしても既に
+  過ぎた期限がさらに早くなるだけ）。上限では3つの先頭の最小を見て、host-liveなら全てhost-live
+  （capによりlive）で拒否、過ぎていればそのsessionを数えるのをやめて受理します。session自体は
+  消さないので、remoteだけが保つsessionはremoteに任され、REQ-11 dを満たします。数えるのは
+  sessionの`host_initiated`（outbound SYNで作るかrestart）で、数えなくなったhost開始sessionは
+  hostの次のhost-driven segmentで新sessionと同じく上限内で数え直し（上限では拒否）、remoteが
+  restartしたsessionは数えなくなります（review core M、sec L1/L2）。
+- **TCPの不変条件**: (J1) hostのcount = 数えるsession数 ≤ limit（commitは+1と同時に1つ外す）。
+  (J2) 数えるsessionのhost-driven expiry ≤ session自身のexpiry（毎commit cap）。(J3) 数える
+  sessionのhost-driven expiry ≤ そのmappingの`host_expires_ms`（同じsegmentに同じ規則、両方cap）。
+  N3が引き継ぐmapping（host-driven expiry過ぎ）やexpired/retireされたmappingのsessionはJ3により
+  過ぎているので、generationが変わったsessionがhost-liveのまま残ることはなく、拒否 ⇔
+  host-liveなsession ≥ limitです。sessionの作成はslotの前のsessionの数えを終えます（inbound作成も）。
+- **half-close（NAT44-124）**: hostがFINを送ったestablished sessionのhost-driven refreshは、
+  sessionはtransitory TTL、mapping（N3）は同じmappingに他のestablished sessionが無ければ
+  transitory TTLにします。FINを返さないserverが閉じたconnectionをestablishedに保っても、host
+  quotaに数えさせられるのはhostの最後のsegmentから4分です。
+- **storageとclassification**: UDP/ICMPはN3のhost storageにlink word（4）とhost counter（8）を
+  加え、`mappings-per-host`か`peers-per-host`があれば確保します（TCPのmapping host tableは不変）。
+  TCPは`sessions-per-host`があればsession slot分（92 bytes/slot）。storageの有無の切り替えは
+  restart-required、非zero同士はreloadable、planは`NatChange::peers_per_host`/
+  `sessions_per_host`のtyped deltaです。production最大tableでは全てのper-host limitを同時に
+  有効にすると64 MiBを超え`RUNTIME_STORAGE_BYTES_EXCEEDED`でfail closedします（runbookの
+  sizing）。
+- **cost**: UDPの拒否はmappingのlinkからhostを引くのでhost lookup無しでcursorのliveness確認
+  1回、TCPはsession host lookup 1回と先頭3つ、受理はplan・再検証・commitのlookupと一回のO(1)
+  uncount。allocationは無く、65536 slotのtestで一定です。
 
 ### Resolution bounded indexes
 

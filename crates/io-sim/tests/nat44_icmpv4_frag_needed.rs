@@ -43,10 +43,12 @@ fn topology() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: 1500,
             },
         ],
         [
@@ -1082,14 +1084,17 @@ fn combined_realm_mismatch_is_candidate_only_and_precedes_lookup_without_counter
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: 1500,
         },
         Interface {
             id: DMZ,
             mac: MacAddress([2, 0, 0, 0, 0, 3]),
+            mtu: 1500,
         },
     ];
     let neighbors = [
@@ -1224,10 +1229,12 @@ fn outer_source_admission_rejects_non_hosts_local_and_inside_routes_atomically()
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: 1500,
         },
     ];
     let neighbors = [

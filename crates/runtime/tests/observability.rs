@@ -415,10 +415,10 @@ fn service_counters_render_in_fixed_order(
     );
     for (section, fields) in [
         ("resolution", 13),
-        ("icmpv4_errors", 34),
-        ("nat44_udp", 18),
-        ("nat44_tcp", 39),
-        ("nat44_icmp", 15),
+        ("icmpv4_errors", 38),
+        ("nat44_udp", 19),
+        ("nat44_tcp", 40),
+        ("nat44_icmp", 16),
         ("firewall", 13),
     ] {
         assert_eq!(sections.iter().filter(|s| **s == section).count(), fields);

@@ -167,10 +167,12 @@ fn run_plain_case(
         Interface {
             id: LAN,
             mac: MacAddress([0x02, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: 1500,
         },
     ];
     let neighbors = [Neighbor {

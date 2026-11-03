@@ -33,8 +33,8 @@
 use std::fmt;
 
 use ruster_config::{
-    ValidatedAfPacketPortV1, ValidatedAfPacketV1, ValidatedAfXdpPortV1, ValidatedAfXdpV1,
-    XdpAttachModeV1,
+    InterfaceBindingV1, ValidatedAfPacketPortV1, ValidatedAfPacketV1, ValidatedAfXdpPortV1,
+    ValidatedAfXdpV1, XdpAttachModeV1,
 };
 use ruster_control::{ActivationError, SequencerError, StorageAllocationError};
 use ruster_core::IfId;
@@ -45,8 +45,8 @@ use ruster_io_xdp_native::{
 };
 
 use super::checks::{
-    evaluate_device, evaluate_packet_device, CheckFailure, CheckPolicy, DeviceFacts,
-    PrivilegeFailure, Probe, Warnings,
+    evaluate_config_mtu, evaluate_device, evaluate_packet_device, CheckFailure, CheckPolicy,
+    DeviceFacts, PrivilegeFailure, Probe, Warnings,
 };
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
 use super::fs_confine::{FsFailure, FsReport};
@@ -563,10 +563,13 @@ pub enum Interrupt {
 
 /// Opens, checks, and attaches every port of `backend` in `IfId` order
 /// into `opened`. On `Err` the caller must [`OpenedPorts::close_all`].
-/// `warn` receives each port's non-fatal check findings.
+/// `warn` receives each port's non-fatal check findings. `interfaces` are
+/// the configured interfaces, whose `mtu` the device must carry
+/// ([`evaluate_config_mtu`]).
 pub fn open_ports<H: PortHost, S: StopSignal>(
     opened: &mut OpenedPorts<'_, H>,
     backend: &ValidatedAfXdpV1,
+    interfaces: &[InterfaceBindingV1],
     policy: CheckPolicy,
     stop: &S,
     mut warn: impl FnMut(IfId, &Warnings),
@@ -608,7 +611,21 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
                 Failure::Check(CheckFailure::Unverifiable(Probe::Name)),
             ));
         }
-        let warnings = evaluate_device(&facts, policy)
+        let mut warnings = evaluate_device(&facts, policy)
+            .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
+        // Validation binds every port to a configured interface; a miss
+        // fails closed.
+        let config_mtu = interfaces
+            .iter()
+            .find(|binding| binding.id() == interface)
+            .map(InterfaceBindingV1::mtu)
+            .ok_or_else(|| {
+                fail(
+                    Stage::Checks,
+                    Failure::Check(CheckFailure::Unverifiable(Probe::Mtu)),
+                )
+            })?;
+        warnings.mtu_below_device = evaluate_config_mtu(config_mtu, &facts)
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
         entry.link = link_target(interface, &facts);
         warn(interface, &warnings);
@@ -622,12 +639,16 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
 }
 
 /// Resolves and checks every AF_PACKET port of `backend` in `IfId` order
-/// ([`evaluate_packet_device`], with the device name check of H10) and
-/// returns their link watch targets. Nothing is opened: on `Err` there is
-/// nothing to roll back. `warn` receives each port's non-fatal findings.
+/// ([`evaluate_packet_device`], with the device name check of H10, then
+/// the configured interface MTU of MTU1, [`evaluate_config_mtu`]: above
+/// the device MTU refused `MTU_BELOW_CONFIG`, below it the warning
+/// `MTU_BELOW_DEVICE`) and returns their link watch targets. Nothing is
+/// opened: on `Err` there is nothing to roll back. `warn` receives each
+/// port's non-fatal findings.
 pub fn open_packet_ports<H: PortHost, S: StopSignal>(
     host: &H,
     backend: &ValidatedAfPacketV1,
+    interfaces: &[InterfaceBindingV1],
     policy: CheckPolicy,
     stop: &S,
     mut warn: impl FnMut(IfId, &Warnings),
@@ -653,8 +674,16 @@ pub fn open_packet_ports<H: PortHost, S: StopSignal>(
         if IfName::new(port.device().as_bytes()) != Some(facts.device.link_name) {
             return Err(fail(CheckFailure::Unverifiable(Probe::Name)));
         }
-        let warnings =
+        let mut warnings =
             evaluate_packet_device(&facts.device, facts.offload, policy).map_err(fail)?;
+        // Validation binds every port to a configured interface; a miss
+        // fails closed.
+        let config_mtu = interfaces
+            .iter()
+            .find(|binding| binding.id() == interface)
+            .map(InterfaceBindingV1::mtu)
+            .ok_or_else(|| fail(CheckFailure::Unverifiable(Probe::Mtu)))?;
+        warnings.mtu_below_device = evaluate_config_mtu(config_mtu, &facts.device).map_err(fail)?;
         targets.push(link_target(interface, &facts.device));
         warn(interface, &warnings);
     }

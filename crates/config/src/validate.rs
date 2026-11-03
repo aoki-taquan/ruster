@@ -65,8 +65,8 @@ pub struct ValidationLimits {
 ///   (1..=65535).
 /// - `max_quote_slots_per_table` = 4096 (2^12) for the two tables whose
 ///   slots each hold a quoted datagram: resolution failure holds (656
-///   bytes per slot) and ICMPv4 error actions (584 bytes). The bound is
-///   memory, not cost: at 2^16 these two tables alone would need 77.5 MiB.
+///   bytes per slot) and ICMPv4 error actions (592 bytes). The bound is
+///   memory, not cost: at 2^16 these two tables alone would need 78.0 MiB.
 ///   4096 equals [`crate::MAX_NEIGHBORS`].
 /// - `max_runtime_bytes` = 64 MiB, the simulator's value. Every table at its
 ///   limit (with the widest port pool) needs 53592256 bytes (51.11 MiB)
@@ -97,6 +97,9 @@ pub enum ValidationCode {
     DuplicateInterfaceId,
     DuplicateInterfaceName,
     DuplicateDeviceName,
+    /// An interface `mtu` outside 68 ([`ruster_core::IPV4_MIN_MTU`], RFC
+    /// 791) to 65535.
+    InterfaceMtuOutOfRange,
     InvalidMac,
     NonCanonicalMac,
     MacNotUnicast,
@@ -181,15 +184,26 @@ pub enum ValidationCode {
     /// `frame-count` is below `fill + tx + generated-frames`.
     BackendFrameCountTooSmall,
     /// `icmpv4-errors.capacity.states` is below the number of interfaces
-    /// plus one while the TCP NAT can send delayed Port Unreachable errors
-    /// (`unsolicited-syn-icmp` on and `unsolicited-syn-holds` above 0).
-    /// Limiter states are keyed by egress and class, and Port Unreachable
-    /// has its own class on the outside egress, so up to interfaces + 1
-    /// states can be in use at once. With fewer, a SYN flood could keep the
+    /// plus one (twice the number of interfaces plus one while
+    /// Fragmentation Needed is generated, MTU1) while the TCP NAT can send
+    /// delayed Port Unreachable errors (`unsolicited-syn-icmp` on and
+    /// `unsolicited-syn-holds` above 0). Limiter states are keyed by egress
+    /// and class, and Port Unreachable has its own class on the outside
+    /// egress (Fragmentation Needed its own on every egress), so up to
+    /// interfaces + 1 (2 x interfaces + 1) states can be in use at once. With fewer, a SYN flood could keep the
     /// Port Unreachable state alive and leave another egress `StateFull`,
     /// which would silently suppress its Time Exceeded and Destination
     /// Unreachable errors.
     Icmpv4ErrorStatesTooFewForPortUnreachable,
+    /// `icmpv4-errors.capacity.states` is below twice the number of
+    /// interfaces while Fragmentation Needed is generated
+    /// (`generate.fragmentation-needed`, MTU1). Fragmentation Needed has its
+    /// own limiter class on every egress besides the class of the other
+    /// errors, so up to two states per interface can be in use at once.
+    /// With fewer, a flood of one class could leave another egress
+    /// `StateFull` and silently suppress its errors (Path MTU Discovery
+    /// included).
+    Icmpv4ErrorStatesTooFewForFragmentationNeeded,
     /// One socket's UMEM exceeds [`MAX_AF_XDP_UMEM_BYTES_PER_PORT`].
     BackendUmemTooLarge,
     /// The UMEM of all sockets exceeds [`MAX_AF_XDP_UMEM_BYTES`].
@@ -242,6 +256,7 @@ impl ValidationCode {
             Self::DuplicateInterfaceId => "DUPLICATE_INTERFACE_ID",
             Self::DuplicateInterfaceName => "DUPLICATE_INTERFACE_NAME",
             Self::DuplicateDeviceName => "DUPLICATE_DEVICE_NAME",
+            Self::InterfaceMtuOutOfRange => "INTERFACE_MTU_OUT_OF_RANGE",
             Self::InvalidMac => "INVALID_MAC",
             Self::NonCanonicalMac => "NON_CANONICAL_MAC",
             Self::MacNotUnicast => "MAC_NOT_UNICAST",
@@ -300,6 +315,9 @@ impl ValidationCode {
             Self::BackendFrameCountTooSmall => "BACKEND_FRAME_COUNT_TOO_SMALL",
             Self::Icmpv4ErrorStatesTooFewForPortUnreachable => {
                 "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
+            }
+            Self::Icmpv4ErrorStatesTooFewForFragmentationNeeded => {
+                "ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED"
             }
             Self::BackendUmemTooLarge => "BACKEND_UMEM_TOO_LARGE",
             Self::BackendTotalUmemTooLarge => "BACKEND_TOTAL_UMEM_TOO_LARGE",
@@ -385,6 +403,7 @@ pub struct InterfaceBindingV1 {
     name: Box<str>,
     device: Box<str>,
     mac: MacAddress,
+    mtu: u16,
 }
 
 impl InterfaceBindingV1 {
@@ -406,6 +425,13 @@ impl InterfaceBindingV1 {
     #[must_use]
     pub const fn mac(&self) -> MacAddress {
         self.mac
+    }
+
+    /// The IPv4 MTU of the interface (`mtu`, default
+    /// [`ruster_core::ETHERNET_DEFAULT_MTU`]).
+    #[must_use]
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
     }
 }
 
@@ -432,10 +458,11 @@ pub struct Nat44UdpStorageShapeV1 {
     pub peer_buckets: u32,
     pub peer_nodes: u32,
     pub port_owners: u32,
-    /// Host slots of the per-host mapping accounting (N3): `mappings` with a
-    /// nonzero `mappings-per-host`, else 0. Each comes with a per-mapping
-    /// link and a host directory node, and the host directory has
-    /// `mapping_buckets` buckets; `required_bytes` counts all of them.
+    /// Host slots of the per-host accounting (N3, N6): `mappings` with a
+    /// nonzero `mappings-per-host` or `peers-per-host`, else 0. Each comes
+    /// with a per-mapping link and a host directory node, and the host
+    /// directory has `mapping_buckets` buckets; `required_bytes` counts all
+    /// of them.
     pub hosts: u32,
 }
 
@@ -454,8 +481,14 @@ pub struct Nat44TcpStorageShapeV1 {
     /// Slots of the unsolicited-SYN hold table (RFC 5382 REQ-4), each with
     /// a quoted datagram.
     pub unsolicited_syn_holds: u32,
-    /// Host slots of the per-host mapping accounting (N3), as for UDP.
+    /// Host slots of the per-host mapping accounting (N3): `mappings` with
+    /// a nonzero `mappings-per-host`, else 0, as for UDP.
     pub hosts: u32,
+    /// Host slots of the per-host session accounting (N6): `sessions` with
+    /// a nonzero `sessions-per-host`, else 0. Each comes with a per-session
+    /// link and a host directory node, and that directory has
+    /// `session_buckets` buckets; `required_bytes` counts all of them.
+    pub session_hosts: u32,
 }
 
 /// Storage of the ICMP query NAT (N5): the datagram mapping engine's
@@ -472,7 +505,7 @@ pub struct Nat44IcmpStorageShapeV1 {
     /// engine), plus its free bitmap.
     pub identifier_owners: u32,
     /// Host slots of the per-host accounting: `mappings` with a nonzero
-    /// `mappings-per-host`, else 0.
+    /// `mappings-per-host` or `peers-per-host`, else 0.
     pub hosts: u32,
 }
 
@@ -1262,16 +1295,30 @@ fn validate_v1(
             ));
         }
         let mac = parse_mac(&source.mac, child_path(&base, "mac"))?;
+        let mtu = match source.mtu {
+            None => ruster_core::ETHERNET_DEFAULT_MTU,
+            Some(mtu) => u16::try_from(mtu)
+                .ok()
+                .filter(|mtu| *mtu >= ruster_core::IPV4_MIN_MTU)
+                .ok_or_else(|| {
+                    ValidationError::new(
+                        ValidationCode::InterfaceMtuOutOfRange,
+                        child_path(&base, "mtu"),
+                    )
+                })?,
+        };
         let binding = InterfaceBindingV1 {
             id: IfId(source.id),
             name: source.name.into_boxed_str(),
             device: source.device.into_boxed_str(),
             mac,
+            mtu,
         };
         interface_records.push(InterfaceRecord {
             core: Interface {
                 id: binding.id,
                 mac,
+                mtu,
             },
             binding,
         });
@@ -1535,6 +1582,11 @@ fn validate_v1(
                         source.policy.port_unreachable_interval_ms,
                     )
                 })
+                .and_then(|policy| {
+                    policy.with_fragmentation_needed_interval_ms(
+                        source.policy.fragmentation_needed_interval_ms,
+                    )
+                })
                 .map(|policy| {
                     policy
                         .with_generation(Icmpv4ErrorKind::TimeExceededTtl, generate.time_exceeded)
@@ -1545,6 +1597,10 @@ fn validate_v1(
                         .with_generation(
                             Icmpv4ErrorKind::DestinationUnreachableHost,
                             generate.host_unreachable,
+                        )
+                        .with_generation(
+                            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
+                            generate.fragmentation_needed,
                         )
                 })
                 .map_err(|error| {
@@ -1568,6 +1624,24 @@ fn validate_v1(
                 })
         })
         .transpose()?;
+    // Fragmentation Needed has its own limiter class on every egress
+    // (MTU1): room for both classes on every interface, so neither can make
+    // another egress StateFull.
+    let fragmentation_needed_states = match (icmp_source, icmp_policy) {
+        (Some(source), Some(policy))
+            if policy.generates(Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded) =>
+        {
+            let needed = core_interfaces.len() as u64;
+            if u64::from(source.capacity.states) < 2 * needed {
+                return Err(ValidationError::new(
+                    ValidationCode::Icmpv4ErrorStatesTooFewForFragmentationNeeded,
+                    path(&["icmpv4-errors", "capacity", "states"]),
+                ));
+            }
+            needed
+        }
+        _ => 0,
+    };
 
     let nat_source = config.nat44;
     let mut validated_udp = None;
@@ -1615,7 +1689,8 @@ fn validate_v1(
                 .with_filtering(map_filtering(source.filtering))
                 .with_hairpinning(source.hairpinning)
                 .with_port_preservation(source.port_preservation)
-                .with_mappings_per_host(source.mappings_per_host);
+                .with_mappings_per_host(source.mappings_per_host)
+                .with_peers_per_host(source.peers_per_host);
             Nat44UdpConfig::new(
                 &snapshot,
                 inside,
@@ -1667,6 +1742,7 @@ fn validate_v1(
                 .with_hairpinning(source.hairpinning)
                 .with_port_preservation(source.port_preservation)
                 .with_mappings_per_host(source.mappings_per_host)
+                .with_sessions_per_host(source.sessions_per_host)
                 .with_unsolicited_syn_icmp(source.unsolicited_syn_icmp)
                 .with_inbound_rst(map_inbound_rst(source.inbound_rst))
                 .with_inbound_sessions_per_remote(source.inbound_sessions_per_remote)
@@ -1693,12 +1769,13 @@ fn validate_v1(
             })?;
             // Delayed Port Unreachable (RFC 5382 REQ-4) uses its own
             // limiter state on the outside egress besides the one per
-            // egress of the other kinds: require room for both so a SYN
-            // flood can never make another egress StateFull.
+            // egress of the other kinds (and of Fragmentation Needed):
+            // require room for all so a SYN flood can never make another
+            // egress StateFull.
             if let Some(icmp) = icmp_source {
                 let sends_port_unreachable =
                     policy.unsolicited_syn_icmp() && source.capacity.unsolicited_syn_holds > 0;
-                let needed = core_interfaces.len() as u64 + 1;
+                let needed = core_interfaces.len() as u64 + fragmentation_needed_states + 1;
                 if sends_port_unreachable && u64::from(icmp.capacity.states) < needed {
                     return Err(ValidationError::new(
                         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,
@@ -1731,7 +1808,8 @@ fn validate_v1(
                 .map_err(policy_error("filtering"))?
                 .with_icmpv4_errors(map_icmp_policy(source.icmpv4_errors))
                 .with_identifier_preservation(source.identifier_preservation)
-                .with_mappings_per_host(source.mappings_per_host);
+                .with_mappings_per_host(source.mappings_per_host)
+                .with_peers_per_host(source.peers_per_host);
             let identifiers = source.identifiers.unwrap_or(nat.realm.ports);
             Nat44IcmpConfig::new(
                 &snapshot,
@@ -1887,13 +1965,25 @@ fn validate_v1(
             resolution: resolution_source.map(|source| source.capacity),
             icmp: icmp_source.map(|source| source.capacity),
             udp: udp_capacity.zip(validated_udp.map(|(_, _, _, ports, policy)| {
-                ((ports.first, ports.last), policy.mappings_per_host() != 0)
+                (
+                    (ports.first, ports.last),
+                    per_host_key(policy.mappings_per_host(), policy.peers_per_host()),
+                )
             })),
             tcp: tcp_capacity.zip(validated_tcp.map(|(_, _, _, ports, policy)| {
-                ((ports.first, ports.last), policy.mappings_per_host() != 0)
+                (
+                    (ports.first, ports.last),
+                    (
+                        policy.mappings_per_host() != 0,
+                        policy.sessions_per_host() != 0,
+                    ),
+                )
             })),
             icmp_query: icmp_capacity.zip(validated_icmp.map(|(_, _, _, ids, policy)| {
-                ((ids.first, ids.last), policy.mappings_per_host() != 0)
+                (
+                    (ids.first, ids.last),
+                    per_host_key(policy.mappings_per_host(), policy.peers_per_host()),
+                )
             })),
             firewall_states: firewall_capacity,
         },
@@ -2575,13 +2665,31 @@ impl TextBudget {
 
 /// Port pool of one NAT44 protocol and whether its per-host mapping limit
 /// is set (N3).
-type NatStorageInputs = ((u16, u16), bool);
+/// Port (or identifier) pool of a datagram NAT44 table and the limit key
+/// that adds its per-host storage, if any (N3, N6).
+type NatStorageInputs = ((u16, u16), Option<&'static str>);
+
+/// The key that adds a datagram NAT44 runtime's per-host storage: the
+/// mapping limit if set, else the peer limit if set (N3, N6), so a byte
+/// budget error names a key the operator actually set.
+fn per_host_key(mappings_per_host: u16, peers_per_host: u16) -> Option<&'static str> {
+    if mappings_per_host != 0 {
+        Some("mappings-per-host")
+    } else if peers_per_host != 0 {
+        Some("peers-per-host")
+    } else {
+        None
+    }
+}
+/// TCP port pool and whether its per-host mapping (N3) and session (N6)
+/// limits are set.
+type TcpStorageInputs = ((u16, u16), (bool, bool));
 
 struct StorageInputs {
     resolution: Option<crate::ResolutionCapacityV1>,
     icmp: Option<crate::Icmpv4ErrorCapacityV1>,
     udp: Option<(crate::Nat44UdpCapacityV1, NatStorageInputs)>,
-    tcp: Option<(crate::Nat44TcpCapacityV1, NatStorageInputs)>,
+    tcp: Option<(crate::Nat44TcpCapacityV1, TcpStorageInputs)>,
     /// ICMP query NAT (N5): capacity, identifier pool, per-host limit set.
     icmp_query: Option<(crate::Nat44IcmpCapacityV1, NatStorageInputs)>,
     firewall_states: Option<u32>,
@@ -2668,7 +2776,7 @@ fn build_storage_shape(
     let nat44_udp = inputs
         .udp
         .map(|(capacity, (ports, per_host))| {
-            let shape = udp_shape(capacity, ports, per_host, limits)?;
+            let shape = udp_shape(capacity, ports, per_host.is_some(), limits)?;
             add_bytes::<Nat44UdpMappingSlot>(
                 &mut bytes,
                 shape.mappings,
@@ -2682,7 +2790,13 @@ fn build_storage_shape(
             add_directory_bytes(&mut bytes, shape.mapping_buckets, shape.mapping_nodes)?;
             add_directory_bytes(&mut bytes, shape.peer_buckets, shape.peer_nodes)?;
             add_port_owner_bytes(&mut bytes, shape.port_owners)?;
-            add_host_bytes::<1>(&mut bytes, shape.hosts, shape.mapping_buckets, "udp")?;
+            add_host_bytes::<1>(
+                &mut bytes,
+                shape.hosts,
+                shape.mapping_buckets,
+                PEER_COUNTING,
+                path(&["nat44", "udp", per_host.unwrap_or("mappings-per-host")]),
+            )?;
             Ok(shape)
         })
         .transpose()?;
@@ -2710,14 +2824,27 @@ fn build_storage_shape(
                 shape.unsolicited_syn_holds,
                 path(&["nat44", "tcp", "capacity", "unsolicited-syn-holds"]),
             )?;
-            add_host_bytes::<2>(&mut bytes, shape.hosts, shape.mapping_buckets, "tcp")?;
+            add_host_bytes::<2>(
+                &mut bytes,
+                shape.hosts,
+                shape.mapping_buckets,
+                LISTS_ONLY,
+                path(&["nat44", "tcp", "mappings-per-host"]),
+            )?;
+            add_host_bytes::<3>(
+                &mut bytes,
+                shape.session_hosts,
+                shape.session_buckets,
+                LINK_WORDS,
+                path(&["nat44", "tcp", "sessions-per-host"]),
+            )?;
             Ok(shape)
         })
         .transpose()?;
     let nat44_icmp = inputs
         .icmp_query
         .map(|(capacity, (identifiers, per_host))| {
-            let shape = icmp_shape(capacity, identifiers, per_host, limits)?;
+            let shape = icmp_shape(capacity, identifiers, per_host.is_some(), limits)?;
             add_bytes::<Nat44UdpMappingSlot>(
                 &mut bytes,
                 shape.mappings,
@@ -2731,7 +2858,13 @@ fn build_storage_shape(
             add_directory_bytes(&mut bytes, shape.mapping_buckets, shape.mapping_nodes)?;
             add_directory_bytes(&mut bytes, shape.peer_buckets, shape.peer_nodes)?;
             add_port_owner_bytes(&mut bytes, shape.identifier_owners)?;
-            add_host_bytes::<1>(&mut bytes, shape.hosts, shape.mapping_buckets, "icmp")?;
+            add_host_bytes::<1>(
+                &mut bytes,
+                shape.hosts,
+                shape.mapping_buckets,
+                PEER_COUNTING,
+                path(&["nat44", "icmp", per_host.unwrap_or("mappings-per-host")]),
+            )?;
             Ok(shape)
         })
         .transpose()?;
@@ -2821,7 +2954,7 @@ fn udp_shape(
 fn tcp_shape(
     capacity: crate::Nat44TcpCapacityV1,
     ports: (u16, u16),
-    per_host: bool,
+    (per_host, sessions_per_host): (bool, bool),
     limits: ValidationLimits,
 ) -> Result<Nat44TcpStorageShapeV1, ValidationError> {
     let mapping_path = path(&["nat44", "tcp", "capacity", "mappings"]);
@@ -2847,6 +2980,11 @@ fn tcp_shape(
         port_owners,
         unsolicited_syn_holds: capacity.unsolicited_syn_holds,
         hosts: if per_host { capacity.mappings } else { 0 },
+        session_hosts: if sessions_per_host {
+            capacity.sessions
+        } else {
+            0
+        },
     })
 }
 
@@ -2907,20 +3045,31 @@ fn add_directory_bytes(bytes: &mut usize, buckets: u32, nodes: u32) -> Result<()
     add_bytes::<DirectoryNode>(bytes, nodes, SourcePath::default())
 }
 
-/// Per-host mapping accounting of one NAT44 protocol with `LISTS` host
-/// lists (N3): one link and one host slot per host, and a host directory of
-/// `hosts` nodes and, when there are hosts, the mapping directory's
-/// `mapping_buckets` buckets.
+/// The UDP and ICMP query host tables count filter peers (N6): a link word
+/// and a host counter per host slot.
+const PEER_COUNTING: (bool, bool) = (true, true);
+/// The TCP mapping host table (N3) has lists only.
+const LISTS_ONLY: (bool, bool) = (false, false);
+/// The TCP session host table (N6) has a link word per session slot.
+const LINK_WORDS: (bool, bool) = (true, false);
+
+/// Per-host accounting of one NAT44 table with `LISTS` host lists (N3,
+/// N6): one link and one host slot per host, a host directory of `hosts`
+/// nodes and, when there are hosts, the accounted table's directory bucket
+/// count (`buckets`), and the link words and host counters the table needs
+/// (`optional`). `path` names the limit that adds it.
 fn add_host_bytes<const LISTS: usize>(
     bytes: &mut usize,
     hosts: u32,
-    mapping_buckets: u32,
-    protocol: &str,
+    buckets: u32,
+    (words, counters): (bool, bool),
+    path: SourcePath,
 ) -> Result<(), ValidationError> {
-    let path = path(&["nat44", protocol, "mappings-per-host"]);
     add_bytes::<Nat44HostLink>(bytes, hosts, path.clone())?;
-    add_bytes::<ruster_core::Nat44HostSlot<LISTS>>(bytes, hosts, path)?;
-    add_directory_bytes(bytes, if hosts == 0 { 0 } else { mapping_buckets }, hosts)
+    add_bytes::<ruster_core::Nat44HostSlot<LISTS>>(bytes, hosts, path.clone())?;
+    add_bytes::<u32>(bytes, if words { hosts } else { 0 }, path.clone())?;
+    add_bytes::<ruster_core::Nat44HostCounter>(bytes, if counters { hosts } else { 0 }, path)?;
+    add_directory_bytes(bytes, if hosts == 0 { 0 } else { buckets }, hosts)
 }
 
 /// One port-owner slot per pool port plus the free-port bitmap words

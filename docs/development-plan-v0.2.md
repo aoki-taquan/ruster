@@ -75,8 +75,8 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
     live adapter `AfPacketIo`（failure-atomic open、TX completion schedulingと分類済み借りkick
     retry、TX ringから直接貸すgenerated frame、quiescence、poll idle wait、`BackendStats`
     （OBS-028）、drain。AFPKT-008〜014）とnetns/veth privileged smoke。debug/fallback backendで、
-    AFPKT-015で`ruster run`から`backend.kind = "af-packet"`として選べる（CONFIG-008、
-    CLI-128〜131、AFPKT-016）。実NIC E2Eと性能測定は無い
+    AFPKT-015で`ruster run`から`backend.kind = "af-packet"`として選べる（CONFIG-009、
+    CLI-130〜133、AFPKT-016）。実NIC E2Eと性能測定は無い
   - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、safe native profile
     （`ruster-io-xdp::native_profile`、configと共有）、native ABI/ring scaffold、private syscall
     RAII seam（XDP rows）、一socketのnative session（X00C）、XDP program/`bpf_link`

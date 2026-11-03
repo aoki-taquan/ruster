@@ -171,15 +171,15 @@ use ruster_core::{
     port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot,
     FirewallReconcileError, FirewallReconcileReport, FirewallRuntime, FirewallStateSlot,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Nat44HostLink, Nat44HostSlot, Nat44HostStorage,
-    Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
-    Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError,
-    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot,
-    Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
-    PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
-    ResolutionStateSlot,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Nat44HostCounter, Nat44HostLink, Nat44HostSlot,
+    Nat44HostStorage, Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport,
+    Nat44IcmpRuntime, Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
+    Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
+    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime,
+    Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionPublicationError, ResolutionPublicationReport,
+    ResolutionRuntime, ResolutionStateSlot,
 };
 use ruster_core::{
     FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
@@ -226,9 +226,12 @@ pub struct FullServiceStorage {
     tcp_session_address_nodes: Box<[DirectoryNode]>,
     /// TCP unsolicited-SYN holds (RFC 5382 REQ-4).
     tcp_syn_holds: Box<[Nat44TcpSynHoldSlot]>,
-    /// Per-host mapping accounting (N3); empty without a per-host limit.
+    /// Per-host accounting (N3, N6); empty without a per-host limit.
     udp_hosts: HostTables<1>,
     tcp_hosts: HostTables<2>,
+    /// Per-host TCP session accounting (N6), one link per session slot;
+    /// empty without a per-host session limit.
+    tcp_session_hosts: HostTables<3>,
     /// The optional ICMP query NAT (N5): the datagram engine's tables and
     /// its per-host accounting.
     icmp: Option<(
@@ -238,26 +241,34 @@ pub struct FullServiceStorage {
     firewall_states: Box<[FirewallStateSlot]>,
 }
 
-/// Per-host mapping accounting arrays of one NAT runtime (N3): a link per
-/// mapping slot, the host slots, and the host directory.
+/// Per-host accounting arrays of one NAT runtime table (N3, N6): a link per
+/// accounted slot, the host slots, and the host directory, plus a link word
+/// per link (`WORDS`) and a peer counter per host slot (`COUNTERS`) where
+/// the table needs them.
 struct HostTables<const LISTS: usize> {
     links: Box<[Nat44HostLink]>,
     hosts: Box<[Nat44HostSlot<LISTS>]>,
     buckets: Box<[DirectoryBucket]>,
     nodes: Box<[DirectoryNode]>,
+    words: Box<[u32]>,
+    counters: Box<[Nat44HostCounter]>,
 }
 
 impl<const LISTS: usize> HostTables<LISTS> {
     fn new(
         host_slots: u32,
         buckets: u32,
+        (words, counters): (bool, bool),
         service: RuntimeService,
     ) -> Result<Self, StorageAllocationError> {
+        let optional = |present: bool| if present { host_slots } else { 0 };
         Ok(Self {
             links: slots(host_slots, Nat44HostLink::EMPTY, service)?,
             hosts: slots(host_slots, Nat44HostSlot::EMPTY, service)?,
             buckets: slots(buckets, DirectoryBucket::default(), service)?,
             nodes: slots(host_slots, DirectoryNode::default(), service)?,
+            words: slots(optional(words), 0, service)?,
+            counters: slots(optional(counters), Nat44HostCounter::EMPTY, service)?,
         })
     }
 
@@ -268,8 +279,18 @@ impl<const LISTS: usize> HostTables<LISTS> {
             &mut self.buckets,
             &mut self.nodes,
         )
+        .with_link_words(&mut self.words)
+        .with_host_counters(&mut self.counters)
     }
 }
+
+/// The UDP and ICMP query host tables count filter peers (N6): a link word
+/// and a host counter per slot.
+const PEER_COUNTING: (bool, bool) = (true, true);
+/// The TCP mapping host table (N3) has lists only.
+const LISTS_ONLY: (bool, bool) = (false, false);
+/// The TCP session host table (N6) has a link word per session slot.
+const LINK_WORDS: (bool, bool) = (true, false);
 
 /// Mapping, secondary-state, directory, and port-owner arrays of one NAT
 /// runtime. UDP secondary state is peers; TCP secondary state is sessions.
@@ -367,8 +388,19 @@ impl FullServiceStorage {
                 Nat44TcpSynHoldSlot::EMPTY,
                 Nat44Tcp,
             )?,
-            udp_hosts: HostTables::new(udp.host_slots(), udp.host_buckets(), Nat44Udp)?,
-            tcp_hosts: HostTables::new(tcp.host_slots(), tcp.host_buckets(), Nat44Tcp)?,
+            udp_hosts: HostTables::new(
+                udp.host_slots(),
+                udp.host_buckets(),
+                PEER_COUNTING,
+                Nat44Udp,
+            )?,
+            tcp_hosts: HostTables::new(tcp.host_slots(), tcp.host_buckets(), LISTS_ONLY, Nat44Tcp)?,
+            tcp_session_hosts: HostTables::new(
+                tcp.session_host_slots(),
+                tcp.session_host_buckets(),
+                LINK_WORDS,
+                Nat44Tcp,
+            )?,
             icmp: shape
                 .nat44_icmp()
                 .map(|icmp| {
@@ -385,7 +417,12 @@ impl FullServiceStorage {
                             ],
                             Nat44Icmp,
                         )?,
-                        HostTables::new(icmp.host_slots(), icmp.host_buckets(), Nat44Icmp)?,
+                        HostTables::new(
+                            icmp.host_slots(),
+                            icmp.host_buckets(),
+                            PEER_COUNTING,
+                            Nat44Icmp,
+                        )?,
                     ))
                 })
                 .transpose()?,
@@ -774,6 +811,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             tcp_syn_holds,
             udp_hosts,
             tcp_hosts,
+            tcp_session_hosts,
             icmp,
             firewall_states,
         } = storage;
@@ -837,7 +875,8 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 &mut tcp.port_owners,
                 &mut tcp.port_free_bits,
                 tcp_hosts.storage(),
-            ),
+            )
+            .with_session_hosts(tcp_session_hosts.storage()),
             authority.nat44_tcp_hash_key(),
         )
         .and_then(|runtime| runtime.with_unsolicited_syn_holds(tcp_syn_holds))

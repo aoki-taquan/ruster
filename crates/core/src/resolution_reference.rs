@@ -1324,6 +1324,14 @@ pub(crate) fn ref_dispatch_host_unreachable_failures<T: ResolutionFailureTraceSi
                     forward: hold.forward,
                 });
             }
+            FailureDispatch::QuoteBelowMinimum => {
+                resolution.clear_failure_hold(index);
+                resolution.failure_counters.quote_below_minimum += 1;
+                report.retired += 1;
+                trace.record_resolution_failure(ResolutionFailureTrace::QuoteBelowMinimum {
+                    forward: hold.forward,
+                });
+            }
             FailureDispatch::AuthorityLost => {
                 resolution.clear_failure_hold(index);
                 resolution.failure_counters.retired_permanent += 1;
@@ -1348,6 +1356,9 @@ enum FailureDispatch {
     ReverseFailed(ResolutionGenerationToken),
     SameFailedKey,
     GenerationDisabled,
+    /// The reverse egress MTU cannot carry the RFC 792 minimum quote of the
+    /// held datagram (MTU1 review); permanent for the hold, so it retires.
+    QuoteBelowMinimum,
     AuthorityLost,
 }
 
@@ -1539,16 +1550,16 @@ fn dispatch_one_failure(
             hold.original_tos,
             snapshot.ipv4_origin.default_ttl(),
             &hold.quote[..usize::from(hold.quote_len)],
-        ),
+        )
+        .fit_egress_mtu(interface.mtu),
         now,
     );
-    if matches!(
-        disposition,
-        Icmpv4ErrorDisposition::HostUnreachableQueued { .. }
-    ) {
-        FailureDispatch::Queued(reverse_egress)
-    } else {
-        FailureDispatch::Retain(disposition)
+    match disposition {
+        Icmpv4ErrorDisposition::HostUnreachableQueued { .. } => {
+            FailureDispatch::Queued(reverse_egress)
+        }
+        Icmpv4ErrorDisposition::QuoteBelowMinimum { .. } => FailureDispatch::QuoteBelowMinimum,
+        _ => FailureDispatch::Retain(disposition),
     }
 }
 

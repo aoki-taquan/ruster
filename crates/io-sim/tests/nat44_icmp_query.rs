@@ -60,10 +60,12 @@ fn snapshot() -> ForwardingSnapshot<'static> {
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: 1500,
         },
     ]);
     let neighbors = leak([
@@ -867,6 +869,41 @@ fn full_tables_fail_closed_and_expired_mappings_are_reused() {
         .run(LAN, received(LAN, H1, REMOTE, ECHO_REQUEST, FIRST + 4))
         .unwrap();
     assert_eq!(world.icmp.counters().mappings_expired, 1);
+}
+
+/// N6: with `peers-per-host = 1` a host that already queries one remote
+/// on a live mapping is refused a second remote (on the same identifier or
+/// a new one) as `NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED` without state, while
+/// another host is served; the host recovers when its mapping expires.
+#[test]
+fn a_host_at_its_query_peer_limit_is_refused_while_another_is_served() {
+    let mut world = World::new(
+        Firewall::None,
+        Nat44IcmpPolicy::default().with_peers_per_host(1),
+    );
+    let other = Ipv4Address::from_octets([198, 51, 100, 21]);
+    world
+        .run(LAN, received(LAN, H1, REMOTE, ECHO_REQUEST, FIRST))
+        .unwrap();
+    let state = world.icmp_state();
+    for id in [FIRST, FIRST + 1] {
+        assert_eq!(
+            world.run(LAN, received(LAN, H1, other, ECHO_REQUEST, id)),
+            Err(DropReason::Nat44IcmpHostPeerQuotaExceeded)
+        );
+    }
+    assert_eq!(world.icmp_state(), state);
+    assert_eq!(world.icmp.counters().host_peer_quota_exceeded, 2);
+    world
+        .run(LAN, received(LAN, H1, REMOTE, ECHO_REQUEST, FIRST))
+        .unwrap();
+    world
+        .run(LAN, received(LAN, H2, other, ECHO_REQUEST, FIRST))
+        .unwrap();
+    world.now += Nat44IcmpPolicy::default().idle_ttl_ms();
+    world
+        .run(LAN, received(LAN, H1, other, ECHO_REQUEST, FIRST + 1))
+        .unwrap();
 }
 
 /// N4 gates apply to errors quoting a query exactly as to UDP/TCP quotes:

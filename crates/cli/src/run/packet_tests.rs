@@ -219,6 +219,67 @@ fn af_packet_startup_refusals_open_nothing() {
     assert!(!outcome.err.contains("CAP_BPF"), "{}", outcome.err);
 }
 
+/// MTU1 on AF_PACKET: a configured interface MTU above the device MTU is
+/// refused (`MTU_BELOW_CONFIG`), one below it only warned
+/// (`MTU_BELOW_DEVICE`); the device MTU itself stays `max-frame-len - 14`.
+#[test]
+fn af_packet_ports_follow_the_configured_interface_mtu() {
+    let with_mtu = |mtu: u32| {
+        let base = include_str!("../../../../fixtures/m1/router-v1.toml");
+        let marker = "name = \"wan\"\n";
+        assert_eq!(base.matches(marker).count(), 1);
+        let text = format!(
+            "{}{PACKET_BACKEND}",
+            base.replacen(marker, &format!("{marker}mtu = {mtu}\n"), 1)
+        );
+        match crate::config_cmd::validate_bytes(text.as_bytes()) {
+            Ok(config) => config,
+            Err(error) => panic!("valid config: {}", error.render()),
+        }
+    };
+    let run_config = |host: &FakeHost, config: ValidatedConfigV1| {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let status = execute_with(
+            host,
+            config,
+            FakeSource::default(),
+            settings(CheckPolicy::default(), 0),
+            &mut FakeClock {
+                step_us: 1_000,
+                ..FakeClock::default()
+            },
+            &FakeStop::after(PACKET_FIRST_LOOP_CHECK + 1),
+            &mut out,
+            &mut err,
+        );
+        (status, String::from_utf8(err).expect("utf-8"))
+    };
+    let host = FakeHost::default();
+    let (status, err) = run_config(&host, with_mtu(1_600));
+    assert_eq!(status, EXIT_RUNTIME, "{err}");
+    assert!(
+        err.contains(
+            "startup failed: stage=checks port=if2 code=MTU_BELOW_CONFIG mtu=1500 config=1600\n"
+        ),
+        "{err}"
+    );
+    assert!(!host
+        .events()
+        .iter()
+        .any(|event| matches!(event, Event::OpenPacket(_))));
+    host.assert_released();
+    let host = FakeHost::default();
+    let (status, err) = run_config(&host, with_mtu(1_400));
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("ruster run: warning: port=if2 MTU_BELOW_DEVICE mtu=1500 config=1400\n"),
+        "{err}"
+    );
+    assert!(!err.contains("port=if1 MTU_BELOW_DEVICE"), "{err}");
+    host.assert_released();
+}
+
 #[test]
 fn af_packet_overrides_and_queue_counts_follow_the_af_xdp_rules() {
     // A multi-queue device needs no override (a packet socket receives

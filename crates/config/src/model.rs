@@ -41,6 +41,13 @@ pub struct InterfaceV1 {
     pub name: String,
     pub device: String,
     pub mac: String,
+    /// IPv4 MTU of the link (the largest IPv4 datagram the interface sends,
+    /// without the Ethernet header); absent means
+    /// [`ruster_core::ETHERNET_DEFAULT_MTU`] (1500). 68
+    /// ([`ruster_core::IPV4_MIN_MTU`]) to 65535. Forwarding sends nothing
+    /// longer out of the interface (Fragmentation Needed with this MTU for
+    /// DF datagrams). `ruster run` refuses an MTU above the device's.
+    pub mtu: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -153,6 +160,17 @@ pub struct Icmpv4ErrorPolicyV1 {
     /// [`ruster_core::ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS`] (1 s).
     #[serde(default = "default_port_unreachable_interval_ms")]
     pub port_unreachable_interval_ms: u64,
+    /// Minimum interval between two ICMP Fragmentation Needed errors
+    /// (MTU1, Path MTU Discovery) on one egress. Fragmentation Needed has
+    /// its own limiter, so other errors never use it up. Must not be 0.
+    /// Default [`ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS`]
+    /// (10 ms).
+    #[serde(default = "default_fragmentation_needed_interval_ms")]
+    pub fragmentation_needed_interval_ms: u64,
+}
+
+const fn default_fragmentation_needed_interval_ms() -> u64 {
+    ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS
 }
 
 const fn default_port_unreachable_interval_ms() -> u64 {
@@ -228,6 +246,11 @@ pub struct Icmpv4ErrorGenerateV1 {
     /// Destination Unreachable, Host (Type 3/Code 1) after fruitless ARP.
     #[serde(default = "enabled")]
     pub host_unreachable: bool,
+    /// Destination Unreachable, Fragmentation Needed and DF Set (Type
+    /// 3/Code 4) for a DF datagram longer than its egress MTU. Turning it
+    /// off black-holes Path MTU Discovery (RFC 1191) through the router.
+    #[serde(default = "enabled")]
+    pub fragmentation_needed: bool,
 }
 
 impl Default for Icmpv4ErrorGenerateV1 {
@@ -236,6 +259,7 @@ impl Default for Icmpv4ErrorGenerateV1 {
             time_exceeded: true,
             net_unreachable: true,
             host_unreachable: true,
+            fragmentation_needed: true,
         }
     }
 }
@@ -358,6 +382,14 @@ pub struct Nat44UdpV1 {
     /// limit is reloadable.
     #[serde(default)]
     pub mappings_per_host: u16,
+    /// Limit on the filter peers the mappings of one internal IPv4 address
+    /// may hold together (N6, NAT44-119, RFC 6888 REQ-5); `0` means no
+    /// limit. Absent means 0. A nonzero limit needs the per-host storage
+    /// (as `mappings-per-host` does), so switching between "neither limit
+    /// set" and "a limit set" is restart-required; other changes are
+    /// reloadable.
+    #[serde(default)]
+    pub peers_per_host: u16,
     pub capacity: Nat44UdpCapacityV1,
 }
 
@@ -403,6 +435,11 @@ pub struct Nat44IcmpV1 {
     /// restart-required.
     #[serde(default)]
     pub mappings_per_host: u16,
+    /// Per-internal-host query peer limit (N6, the UDP `peers-per-host`
+    /// applied to queries); `0` (default) is no limit. It shares the
+    /// per-host storage of `mappings-per-host`.
+    #[serde(default)]
+    pub peers_per_host: u16,
     /// Public identifier pool; absent means the `[nat44.realm.ports]`
     /// numbers. One owner slot per identifier, so the pool sizes storage.
     pub identifiers: Option<Nat44PortRangeV1>,
@@ -475,6 +512,14 @@ pub struct Nat44TcpV1 {
     /// limit is reloadable.
     #[serde(default)]
     pub mappings_per_host: u16,
+    /// Limit on the sessions one internal IPv4 address opens with outbound
+    /// SYNs and keeps alive (N6, NAT44-119, RFC 6888 REQ-5); `0` means no
+    /// limit. Absent means 0. Sessions created by inbound SYNs never count.
+    /// A nonzero limit adds per-session host storage sized from
+    /// `capacity.sessions`, so switching between `0` and a limit is
+    /// restart-required; changing a nonzero limit is reloadable.
+    #[serde(default)]
+    pub sessions_per_host: u16,
     pub capacity: Nat44TcpCapacityV1,
 }
 

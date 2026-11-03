@@ -559,6 +559,7 @@ where
             Some(backend) => open_ports(
                 &mut opened,
                 backend,
+                config.interfaces(),
                 settings.policy,
                 stop,
                 |port, warnings| {
@@ -675,11 +676,19 @@ where
         return startup_failed(err, error, &[]);
     }
     let ports = backend.ports().len();
-    let targets = match open_packet_ports(host, backend, settings.policy, stop, |port, warnings| {
-        for code in warnings.codes() {
-            let _ = writeln!(err, "ruster run: warning: port={} {code}", port_label(port));
-        }
-    }) {
+    let interfaces = config.interfaces();
+    let targets = match open_packet_ports(
+        host,
+        backend,
+        interfaces,
+        settings.policy,
+        stop,
+        |port, warnings| {
+            for code in warnings.codes() {
+                let _ = writeln!(err, "ruster run: warning: port={} {code}", port_label(port));
+            }
+        },
+    ) {
         Ok(targets) => targets,
         Err(Interrupt::Failed(error)) => return startup_failed(err, error, &[]),
         Err(Interrupt::Signalled) => {

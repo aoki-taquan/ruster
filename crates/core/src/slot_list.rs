@@ -22,6 +22,11 @@ impl SlotLinks {
         prev: LINK_NONE,
         next: LINK_NONE,
     };
+
+    /// The next slot on the list (`LINK_NONE` at the tail or unlinked).
+    pub(crate) const fn next_link(self) -> u32 {
+        self.next
+    }
 }
 
 impl Default for SlotLinks {

@@ -1301,10 +1301,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: 1500,
             },
         ];
         let bindings = [
