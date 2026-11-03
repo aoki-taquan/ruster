@@ -2969,24 +2969,34 @@ where
                 // IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM) into the same
                 // slots: reserve them, so a replay that commits NAT and
                 // firewall state always finds its own slot.
-                // A pending entry for the key that is not the one recorded
-                // at hold time belongs to a newer datagram reusing the key:
-                // the replay would decide it, so it is not replayed.
+                // A live entry for the key that is not the one recorded at
+                // hold time belongs to a newer datagram reusing the key: the
+                // replay would decide it, so it is not replayed.
                 ArpHoldFragmentHook::Reserve {
                     frame,
                     ingress,
                     association,
+                    deadline_ms,
                 } => {
                     let Some((_, info)) =
                         tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
                     else {
                         return Some(0);
                     };
-                    match (tracker.pending_for(info), association) {
-                        (Some((index, stamp, _)), Some(recorded)) if (index, stamp) != recorded => {
+                    // Any live entry on the key (pending or decided) that is not
+                    // the recorded one belongs to a newer datagram: replaying
+                    // would decide or poison it (#345 review L-a). The
+                    // recorded entry was created by the hold's start at the
+                    // latest, so a later one is another datagram even when
+                    // its 16-bit stamp matches (a hold over 65.536 s).
+                    let held_since = deadline_ms.saturating_sub(window);
+                    match (tracker.entry_for(info), association) {
+                        (Some((index, stamp, created_ms, _)), Some(recorded))
+                            if (index, stamp) != recorded || created_ms > held_since =>
+                        {
                             None
                         }
-                        (Some((_, _, held)), _) => Some(held),
+                        (Some((_, _, _, held)), _) => Some(held),
                         (None, _) => Some(0),
                     }
                 }

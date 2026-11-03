@@ -238,11 +238,15 @@ pub(crate) enum ArpHoldFragmentHook<'f> {
     /// has waiting in the table (room its replay must reserve), or `None`
     /// when the table's entry for its key is no longer the one recorded at
     /// hold time (`association`, `generation`; a newer datagram reusing the
-    /// key): the replay would decide that other datagram, so it is freed.
+    /// key, also when it was created after the hold started with the same
+    /// 16-bit stamp): the replay would decide that other datagram, so it is
+    /// freed.
     Reserve {
         frame: &'f [u8],
         ingress: IfId,
         association: Option<(u32, u16)>,
+        /// The hold's deadline (its start is this minus the hold window).
+        deadline_ms: u64,
     },
     /// A held first fragment (`frame` from `ingress`) with this pending
     /// entry was freed: refuse its datagram.
@@ -317,7 +321,11 @@ pub struct ArpHoldCounters {
     /// Held datagrams freed because their resolution failed.
     pub failed: usize,
     /// Held datagrams freed because their resolution was cancelled or its
-    /// learned neighbour expired before the replay found room.
+    /// learned neighbour expired before the replay found room, or (a held
+    /// first fragment) because its datagram's association entry is gone
+    /// and the key now has another entry: a newer datagram reusing the
+    /// key, or the datagram's own later fragments recreating it after an
+    /// eviction (indistinguishable, so it fails closed).
     pub cancelled: usize,
     /// Held datagrams freed when their resolution could no longer succeed.
     pub expired: usize,
@@ -677,6 +685,7 @@ impl<'a> ArpHoldRuntime<'a> {
                     ingress: slot.ingress,
                     association: (slot.association != NONE)
                         .then_some((slot.association, slot.association_generation)),
+                    deadline_ms: slot.deadline_ms,
                 })
                 .map(|held| 1 + held)
             } else {
