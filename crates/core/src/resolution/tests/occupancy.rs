@@ -1,8 +1,8 @@
-//! OBS-017: the resolution tables' occupancy. Each count equals the
-//! runtime's own counter (and a scan), the high-water marks keep the peak
-//! through dequeues, cancels, and removals, a flushing commit restarts the
-//! marks at zero, and a carrying commit restarts the learned neighbors' mark
-//! at the carried count.
+//! OBS-017: the resolution tables' occupancy. Each count equals a scan
+//! (states: the slots admission treats as used, cooldowns whose interval
+//! has not elapsed included), the high-water marks keep the peak through
+//! dequeues, cancels, and removals, a commit restarts the marks at zero,
+//! and a carrying commit keeps the learned neighbors' mark.
 
 use super::*;
 
@@ -16,15 +16,15 @@ fn table(occupancy: TableOccupancy) -> (usize, usize, usize) {
 
 fn assert_counts_match_a_scan(runtime: &ResolutionRuntime<'_>) {
     let occupancy = runtime.occupancy();
-    assert_eq!(occupancy.states.occupied(), runtime.pending_states());
     assert_eq!(
         occupancy.states.occupied(),
         runtime
             .states
             .iter()
-            .filter(|state| state_is_pending(state.entry))
+            .filter(|slot| state_used(slot))
             .count()
     );
+    assert!(occupancy.states.occupied() >= runtime.pending_states());
     assert_eq!(occupancy.actions.occupied(), runtime.pending_actions());
     assert_eq!(
         occupancy.actions.occupied(),
@@ -110,8 +110,57 @@ fn state_and_action_high_water_marks_keep_the_peak_until_a_commit() {
     assert_counts_match_a_scan(&runtime);
 }
 
+/// Review M1: a resolution answered before its request interval elapsed
+/// leaves a cooldown that still holds its slot; occupancy counts it, so
+/// `state_full` happens at `capacity`, and the slot leaves the count once
+/// the timer poll matures it.
 #[test]
-fn learned_neighbor_high_water_restarts_at_a_flush_or_the_carried_count() {
+fn answered_resolutions_leave_cooldowns_that_count_until_they_mature() {
+    let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
+    let mut states = [ResolutionStateSlot::EMPTY; 3];
+    let mut actions = [ResolutionActionSlot::EMPTY; 3];
+    let mut dynamic = [DynamicNeighborSlot::EMPTY; 4];
+    let mut runtime =
+        ResolutionRuntime::with_dynamic_neighbors(policy, &mut states, &mut actions, &mut dynamic);
+    for last in [5, 6, 7] {
+        assert_eq!(
+            runtime.schedule(action(last), MonotonicMillis(10), false),
+            ResolutionResult::Queued
+        );
+        commit_front(&mut runtime, 10);
+        // The reply comes at once.
+        learn(&mut runtime, last);
+    }
+    assert_eq!(runtime.pending_states(), 0);
+    assert_counts_match_a_scan(&runtime);
+    assert_eq!(table(runtime.occupancy().states), (3, 3, 3));
+    // Every slot is a fresh cooldown, so a new resolution is refused.
+    assert_eq!(
+        runtime.schedule(action(8), MonotonicMillis(10), false),
+        ResolutionResult::StateFull
+    );
+    assert_eq!(runtime.counters().state_full, 1);
+    assert_eq!(table(runtime.occupancy().states), (3, 3, 3));
+    // Past the interval the timer poll matures them: reusable, not counted.
+    poll_resolution_timers(
+        &mut runtime,
+        MonotonicMillis(1_010),
+        usize::MAX,
+        &mut NoResolutionTimerTrace,
+    )
+    .unwrap();
+    assert_counts_match_a_scan(&runtime);
+    assert_eq!(table(runtime.occupancy().states), (0, 3, 3));
+    assert_eq!(
+        runtime.schedule(action(8), MonotonicMillis(1_010), false),
+        ResolutionResult::Queued
+    );
+    assert_eq!(table(runtime.occupancy().states), (1, 3, 3));
+    assert_counts_match_a_scan(&runtime);
+}
+
+#[test]
+fn learned_neighbor_high_water_restarts_at_a_flush_and_stays_at_a_carry() {
     let policy = ResolutionPolicy::new(1_000, 1_000).unwrap();
     let mut states = [ResolutionStateSlot::EMPTY; 2];
     let mut actions = [ResolutionActionSlot::EMPTY; 2];
@@ -131,16 +180,17 @@ fn learned_neighbor_high_water_restarts_at_a_flush_or_the_carried_count() {
         .unwrap()
         .commit_carrying(&snapshot, &snapshot);
     assert_eq!(table(runtime.occupancy().dynamic_neighbors), (3, 3, 4));
-    // A renumbered WAN drops them: the mark restarts at the carried zero.
+    // A renumbered WAN drops them; a carrying commit keeps the mark, like
+    // an OBS-015 reconcile that keeps state.
     let renumbered = carry::Tables::new(target(3), Vec::new());
     runtime
         .preflight_publication()
         .unwrap()
         .commit_carrying(&snapshot, &renumbered.snapshot());
-    assert_eq!(table(runtime.occupancy().dynamic_neighbors), (0, 0, 4));
+    assert_eq!(table(runtime.occupancy().dynamic_neighbors), (0, 3, 4));
     learn(&mut runtime, 7);
     learn(&mut runtime, 8);
-    assert_eq!(table(runtime.occupancy().dynamic_neighbors), (2, 2, 4));
+    assert_eq!(table(runtime.occupancy().dynamic_neighbors), (2, 3, 4));
     runtime.preflight_publication().unwrap().commit();
     assert_eq!(table(runtime.occupancy().dynamic_neighbors), (0, 0, 4));
     assert_counts_match_a_scan(&runtime);

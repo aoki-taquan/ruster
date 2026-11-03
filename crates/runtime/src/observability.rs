@@ -759,11 +759,13 @@ impl ObservedTable {
 ///
 /// The OBS-017 tables count, at the core's own counters:
 ///
-/// - `resolution_states`: pending ARP resolutions (cooldowns excluded);
+/// - `resolution_states`: state slots a new resolution cannot take (queued,
+///   waiting, failed hold-downs, and cooldowns whose request interval has
+///   not elapsed), the same slots admission treats as used;
 /// - `resolution_actions`: the generated ARP request queue;
 /// - `resolution_dynamic_neighbors`: learned neighbors (expired ones until
-///   reused or removed); a carrying publication restarts the core mark at
-///   the carried count;
+///   reused or removed); a carrying publication keeps the core mark, as an
+///   OBS-015 reconcile that keeps state does;
 /// - `resolution_failure_holds`: datagrams kept for a Host Unreachable;
 /// - `icmpv4_error_actions`: the generated ICMPv4 error queue;
 /// - `arp_hold_packets`: datagrams held for ARP (ARP-HOLD);

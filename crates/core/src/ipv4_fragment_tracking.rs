@@ -949,12 +949,6 @@ pub(crate) enum Ipv4FragmentFollow {
     Held,
 }
 
-/// Caller-backed, worker-local fragment association table.
-///
-/// ```compile_fail
-/// fn require_send<T: Send>() {}
-/// require_send::<ruster_core::Ipv4FragmentTracker<'static>>();
-/// ```
 /// Occupancy of an [`Ipv4FragmentTracker`]; see
 /// [`Ipv4FragmentTracker::occupancy`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -966,6 +960,12 @@ pub struct Ipv4FragmentTrackingOccupancy {
     pub held: TableOccupancy,
 }
 
+/// Caller-backed, worker-local fragment association table.
+///
+/// ```compile_fail
+/// fn require_send<T: Send>() {}
+/// require_send::<ruster_core::Ipv4FragmentTracker<'static>>();
+/// ```
 pub struct Ipv4FragmentTracker<'a> {
     policy: Ipv4FragmentTrackingPolicy,
     entries: &'a mut [Ipv4FragmentEntrySlot],

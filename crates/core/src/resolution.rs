@@ -467,18 +467,21 @@ pub struct ResolutionCounters {
 /// Occupancy of the bounded resolution tables (OBS-017); see
 /// [`ResolutionRuntime::occupancy`].
 ///
-/// - `states`: pending resolutions (initial or retry queued, or waiting
-///   for a reply); cooldown states, which a later miss may reuse, are not
-///   counted.
+/// - `states`: state slots a new resolution cannot take: queued, waiting
+///   for a reply, failed hold-downs, and cooldowns whose request interval
+///   has not elapsed yet (still on the request order). An elapsed cooldown
+///   is reusable and not counted. This is the same "used" bit that slot
+///   admission reads, so `state_full` happens only at `capacity`.
 /// - `actions`: the generated ARP request queue.
 /// - `dynamic_neighbors`: learned neighbors, expired ones included until
 ///   their slot is reused or removed.
 /// - `failure_holds`: datagrams held for a Host Unreachable error.
 ///
 /// `high_water` is the largest count since construction or the last
-/// publication commit: a commit flushes the first three and the failure
-/// holds, so their marks restart at zero; a carrying commit restarts the
-/// learned neighbors' mark at the carried count.
+/// publication commit. Every commit flushes the states, actions, and
+/// failure holds, so their marks restart at zero. A flushing commit also
+/// empties the learned neighbors and restarts their mark; a carrying commit
+/// keeps the mark (as OBS-015 keeps it across a reconcile that keeps state).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ResolutionOccupancy {
     pub states: TableOccupancy,
@@ -1030,6 +1033,9 @@ pub struct ResolutionRuntime<'a> {
     dynamic_order: SlotList,
     dynamic_count: usize,
     pending_state_count: usize,
+    /// State slots marked used in the reusable bitmap (OBS-017), kept at
+    /// [`Self::refresh_state_bit`], the only place the bit changes.
+    used_state_count: usize,
     pending_failure_hold_count: usize,
     poll_cursor: usize,
     failure_cursor: usize,
@@ -1169,6 +1175,7 @@ impl<'a> ResolutionRuntime<'a> {
             dynamic_order: SlotList::EMPTY,
             dynamic_count: 0,
             pending_state_count: 0,
+            used_state_count: 0,
             pending_failure_hold_count: 0,
             poll_cursor: 0,
             failure_cursor: 0,
@@ -1242,7 +1249,7 @@ impl<'a> ResolutionRuntime<'a> {
         ResolutionOccupancy {
             states: high_water
                 .states
-                .snapshot(self.pending_state_count, self.states.len()),
+                .snapshot(self.used_state_count, self.states.len()),
             actions: high_water
                 .actions
                 .snapshot(self.action_queue.len(), self.actions.len()),
@@ -1284,6 +1291,7 @@ impl<'a> ResolutionRuntime<'a> {
             && self.dynamic_order == SlotList::EMPTY
             && self.dynamic_count == 0
             && self.pending_state_count == 0
+            && self.used_state_count == 0
             && self.pending_failure_hold_count == 0
             && self.poll_cursor == 0
             && self.failure_cursor == 0
@@ -2436,6 +2444,18 @@ impl<'a> ResolutionRuntime<'a> {
 
     fn refresh_state_bit(&mut self, index: usize) {
         let used = state_used(&self.states[index]);
+        let word = StateBits::word(&self.states[index / 64]);
+        let was_used = word & (1u64 << (index % 64)) != 0;
+        match (was_used, used) {
+            (false, true) => {
+                self.used_state_count += 1;
+                self.high_water.states.observe(self.used_state_count);
+            }
+            (true, false) => {
+                self.used_state_count = self.used_state_count.saturating_sub(1);
+            }
+            (false, false) | (true, true) => {}
+        }
         set_used::<StateBits>(self.states, index, used);
     }
 
@@ -2642,7 +2662,6 @@ impl<'a> ResolutionRuntime<'a> {
         if !was_pending {
             debug_assert!(self.pending_state_count < self.states.len());
             self.pending_state_count += 1;
-            self.high_water.states.observe(self.pending_state_count);
         }
     }
 
@@ -3092,10 +3111,6 @@ impl ResolutionPublicationPermit<'_, '_> {
                 dropped += 1;
             }
         }
-        runtime
-            .high_water
-            .dynamic_neighbors
-            .reset(runtime.dynamic_count);
         ResolutionPublicationReport {
             dynamic_neighbors_flushed: dropped,
             dynamic_neighbors_carried: runtime.dynamic_count,
@@ -3137,6 +3152,7 @@ impl ResolutionRuntime<'_> {
         self.action_queue = SlotList::EMPTY;
         self.request_order = SlotList::EMPTY;
         self.pending_state_count = 0;
+        self.used_state_count = 0;
         self.pending_failure_hold_count = 0;
         self.high_water.states.reset(0);
         self.high_water.actions.reset(0);
