@@ -1129,7 +1129,7 @@ REQ-5）。
 | family | 引き継ぐ条件 | 引き継げないとき |
 |---|---|---|
 | NAT44 UDP/TCP/ICMP query | inside/outside、public address、port pool、filteringが同じで、UDP/ICMP idle timeoutが延びず、per-host limitが下がらず新設もされない（TCPはphase timeoutも同じ） | そのfamilyだけflush（`flushed:interfaces`/`public-address`/`port-range`/`filtering`/`timers`/`quota`） |
-| firewall flow | idle timeoutが延びない。expire済みのflowは落とし、routeのegressが変わった（消えた）flowはrevoke、ruleが変わればapply時に残る全flowを新ruleで再評価し、拒否されるflowはrevoke（以後どちらの向きも通らない） | timeout延長はflush（`flushed:timers`）、`live flows x (rules + 4)`が4194304 testを超えるとflush（`flushed:reevaluation-budget`、件数であり時間ではない。最大tableで開発host約25 ms） |
+| firewall flow | idle timeoutが延びない。expire済みのflowは落とし、routeのegressが変わった（消えた）flowはrevoke、ruleが変わればapply時に残る全flowを新ruleで再評価し、拒否されるflowはrevoke（以後どちらの向きも通らない） | timeout延長はflush（`flushed:timers`）、`live flows x (rules + 4 x 16)`が4194304 testを超えるとflush（`flushed:reevaluation-budget`、件数であり時間ではない。最大tableで開発host 20〜48 ms、route lookupは1件16単位） |
 | 学習ARP neighbor | interfaceのIPv4 addressが同じ、static neighborに置き換わらない、ARP-031有効時はon-link | そのentryだけ削除 |
 
 pending resolution、ICMPv4 error queue/limiter、TCP unsolicited-SYN holdは常に捨てます。旧設定で

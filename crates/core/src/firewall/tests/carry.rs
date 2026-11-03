@@ -467,7 +467,7 @@ fn a_changed_route_revokes_the_flows_it_moves() {
 
 /// A next hop that changes out of the same interface keeps the flows (their
 /// state still matches both directions); route lookups count against the
-/// budget: 4092 rules plus 4 lookups per flow, so 1024 flows are exactly the
+/// budget: 4032 rules plus 4 lookups of weight 16 per flow, so 1024 flows are exactly the
 /// budget and 1025 flush.
 #[test]
 fn a_new_next_hop_keeps_flows_and_route_work_counts_against_the_budget() {
@@ -501,7 +501,7 @@ fn a_new_next_hop_keeps_flows_and_route_work_counts_against_the_budget() {
         let report = permit.commit();
         assert_eq!((report.states_carried, report.states_revoked), (1, 0));
 
-        let mut next_rules: Vec<FirewallRule> = (0..4_091)
+        let mut next_rules: Vec<FirewallRule> = (0..4_031)
             .map(|id| udp_rule(10 + id, FirewallAction::Deny, (2, 2)))
             .collect();
         next_rules.push(udp_rule(
@@ -521,6 +521,52 @@ fn a_new_next_hop_keeps_flows_and_route_work_counts_against_the_budget() {
                 .unwrap();
             assert_eq!(permit.outcome().carried(), carried, "{flows} flows");
         }
+    });
+}
+
+/// Core L2: an endpoint that is a router address in both snapshots (the
+/// NAT public address in a hairpin flow's canonical tuple) is never routed
+/// to, so a route change toward it keeps the flow; a forwarded endpoint
+/// behind the same changed route is revoked.
+#[test]
+fn a_route_change_toward_a_router_address_keeps_the_flow() {
+    with_snapshot(|snapshot| {
+        let rules = [udp_rule(1, FirewallAction::AllowStateful, (1, u16::MAX))];
+        let current = config(snapshot, &rules, 1, hash_key());
+        // 10.0.0.0/30 (the router's 10.0.0.1 and the host 10.0.0.2) now
+        // leaves through WAN.
+        let mut routes = snapshot.routes.to_vec();
+        routes.push(Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 30, WAN, None).unwrap());
+        let moved = ForwardingSnapshot::new(
+            &routes,
+            snapshot.interfaces,
+            snapshot.neighbors,
+            snapshot.local_ipv4,
+        )
+        .unwrap();
+        let next = config(&moved, &rules, 2, rotated_hash_key());
+        let mut states = [FirewallStateSlot::default(); 8];
+        let mut runtime = FirewallRuntime::new(current, &mut states);
+        let toward = |last: u8, port: u16| FirewallPacket {
+            source: Ipv4Address::from_octets([10, 0, 0, 77]),
+            destination: Ipv4Address::from_octets([10, 0, 0, last]),
+            ..udp_flow(port)
+        };
+        pass(&mut runtime, &current, toward(1, 1_000), 10).unwrap();
+        pass(&mut runtime, &current, toward(2, 1_001), 10).unwrap();
+        let report = runtime
+            .preflight_reconcile_carrying(current, next, *snapshot, moved)
+            .unwrap()
+            .commit();
+        assert_eq!((report.states_carried, report.states_revoked), (1, 1));
+        assert_eq!(
+            pass(&mut runtime, &next, reply(toward(1, 1_000)), 20),
+            Ok(FirewallConnectionClass::Established)
+        );
+        assert_eq!(
+            pass(&mut runtime, &next, reply(toward(2, 1_001)), 20),
+            Err(FirewallPlanError::DefaultDenied)
+        );
     });
 }
 
@@ -564,4 +610,132 @@ fn worst_case_reevaluation_at_the_budget_takes_milliseconds() {
             next_rules.len()
         );
     });
+}
+
+/// Sec L-a: the worst case with rules and routes both changed, over a large
+/// indexed route table. Measures the cost of one route lookup against one
+/// first-match rule test, which sets `FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT`.
+/// Run with `cargo test --release -p ruster-core --lib
+/// worst_case_with_rules_and_routes -- --ignored --nocapture`.
+#[test]
+#[ignore = "timing measurement; run in release"]
+fn worst_case_with_rules_and_routes_changed_stays_within_the_bound() {
+    use crate::{Interface, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor};
+    // 4096 routes (the config limit), all /24s out of WAN plus the LAN
+    // connected route; the next table moves one /24 to LAN.
+    let owner = |moved: bool| {
+        let mut routes =
+            vec![Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 8, LAN, None).unwrap()];
+        for index in 0..4_095_u32 {
+            let egress = if moved && index == 0 { LAN } else { WAN };
+            routes.push(
+                Route::new(
+                    Ipv4Address::from_octets([100 + (index >> 8) as u8, index as u8, 0, 0]),
+                    24,
+                    egress,
+                    if egress == WAN {
+                        Some(Ipv4Address::from_octets([203, 0, 113, 1]))
+                    } else {
+                        None
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        routes.push(Route::new(Ipv4Address::from_octets([203, 0, 113, 0]), 24, WAN, None).unwrap());
+        crate::ValidatedForwardingOwner::new(
+            routes.into(),
+            vec![
+                Interface {
+                    id: LAN,
+                    mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                    mtu: 1500,
+                },
+                Interface {
+                    id: WAN,
+                    mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                    mtu: 1500,
+                },
+            ]
+            .into(),
+            Vec::<Neighbor>::new().into(),
+            vec![
+                LocalIpv4Binding {
+                    interface: LAN,
+                    address: Ipv4Address::from_octets([10, 0, 0, 1]),
+                },
+                LocalIpv4Binding {
+                    interface: WAN,
+                    address: Ipv4Address::from_octets([203, 0, 113, 2]),
+                },
+            ]
+            .into(),
+            Ipv4OriginPolicy::default(),
+        )
+        .unwrap()
+    };
+    let (current_owner, next_owner) = (owner(false), owner(true));
+    let (current_snapshot, next_snapshot) = (current_owner.snapshot(), next_owner.snapshot());
+    let rules = [udp_rule(1, FirewallAction::AllowStateful, (1, u16::MAX))];
+    let current = config(&current_snapshot, &rules, 1, hash_key());
+    // `count` rules whose last one admits every flow (the first-match
+    // worst case for an admitted flow).
+    let rules_of = |count: u64| {
+        let mut rules: Vec<FirewallRule> = (0..count - 1)
+            .map(|id| udp_rule(10 + id as u32, FirewallAction::Deny, (2, 2)))
+            .collect();
+        rules.push(udp_rule(999, FirewallAction::AllowStateful, (1, u16::MAX)));
+        rules
+    };
+    // 85 rules to measure a rule test; with routes changed too, as many as
+    // the budget allows for a full table at the lookup weight.
+    let changed = rules_of(85);
+    let both_rules = rules_of(
+        FIREWALL_CARRY_REEVALUATION_BUDGET / 49_152 - 4 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT,
+    );
+    // Flows to remotes spread over every /24 (cache misses in the index).
+    let flow = |flow: usize| FirewallPacket {
+        source: Ipv4Address::from_octets([10, 0, (flow >> 8) as u8, flow as u8]),
+        destination: Ipv4Address::from_octets([
+            100 + ((flow % 4_095) >> 8) as u8,
+            (flow % 4_095) as u8,
+            0,
+            7,
+        ]),
+        ..udp_flow(1_000)
+    };
+    let run = |next_rules: &[FirewallRule], next_snapshot| {
+        let next = config(&next_snapshot, next_rules, 2, rotated_hash_key());
+        let mut states = vec![FirewallStateSlot::default(); 1 << 16];
+        let mut runtime = FirewallRuntime::new(current, &mut states);
+        let usable = runtime.usable_capacity();
+        for index in 0..usable {
+            pass(&mut runtime, &current, flow(index), 10).unwrap();
+        }
+        let permit = runtime
+            .preflight_reconcile_carrying(current, next, current_snapshot, next_snapshot)
+            .unwrap();
+        assert!(permit.outcome().carried());
+        let started = std::time::Instant::now();
+        let report = permit.commit();
+        (started.elapsed(), report, usable)
+    };
+    let (rules_only, _, usable) = run(&changed, current_snapshot);
+    let (routes_only, report, _) = run(&rules, next_snapshot);
+    assert!(report.states_revoked > 0);
+    let (both, _, _) = run(&both_rules, next_snapshot);
+    let per_test = rules_only.as_secs_f64() / (usable * changed.len()) as f64;
+    let per_lookup = routes_only.as_secs_f64() / (usable * 4) as f64;
+    let work = usable as u64 * (both_rules.len() as u64 + 4 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT);
+    assert!(work <= FIREWALL_CARRY_REEVALUATION_BUDGET);
+    // The ratio is printed, not asserted: timing on a shared host is noisy.
+    eprintln!(
+        "carry worst case: {usable} flows; rules only {rules_only:?} ({:.1} ns/test), routes only \
+         {routes_only:?} ({:.1} ns/lookup, ratio {:.1}), both ({} rules) {both:?}; weighted work \
+         {work} of budget {FIREWALL_CARRY_REEVALUATION_BUDGET}",
+        per_test * 1e9,
+        per_lookup * 1e9,
+        per_lookup / per_test,
+        both_rules.len(),
+    );
 }

@@ -9,18 +9,25 @@ pub const FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS: u64 = 240_000;
 pub const FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_MAX_IDLE_TTL_MS: u64 = 604_800_000;
-/// Most rule evaluations one carrying publication may spend re-evaluating
-/// carried flows against changed rules (RELOAD-CARRY): the work bound is
-/// `carried flows x rules`, checked before any evaluation. Above it the
-/// publication flushes the flow table instead
-/// ([`crate::StateCarryConflict::ReevaluationBudget`]), so an apply never
-/// stalls the worker for longer than this many first-match rule tests.
-/// 2^22 tests took about 25 ms in a release build on the development host
-/// (about 6 ns per test; the architecture document records the
-/// measurement), which is below the 200 ms reload quiescence bound, and
-/// cover every flow of a full 2^16-slot table (49152 usable) against 85
-/// rules, or 4096 flows against 1024 rules.
+/// Most work one carrying publication may spend re-evaluating carried
+/// flows (RELOAD-CARRY), in units of one first-match rule test: the bound is
+/// `live flows x (rules + 4 x FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT)`, with the
+/// rule term only when the rules changed and the lookup term only when the
+/// routes changed (two endpoints, two snapshots), checked before any work.
+/// Above it the publication flushes the flow table instead
+/// ([`crate::StateCarryConflict::ReevaluationBudget`]). The bound is a count,
+/// not a time: on the development host (release build) a rule test took
+/// about 6 ns, so the full budget took 22-40 ms depending on load (a full
+/// 2^16-slot table, 49152 usable, against 85 changed rules), and a full
+/// table with 21 changed rules and changed routes over a 4096-route index
+/// about 20 ms; the architecture document records the measurements.
 pub const FIREWALL_CARRY_REEVALUATION_BUDGET: u64 = 1 << 22;
+/// Budget units one route lookup of a carry costs (sec L-a). An indexed
+/// lookup is a binary search with cache misses: over a 4096-route index it
+/// measured 10-13 rule tests (66-75 ns) on the development host, so the
+/// weight is 16. A full table can therefore re-check changed routes alone
+/// (49152 x 64 units) or with up to 21 changed rules.
+pub const FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT: u64 = 16;
 /// `FirewallStateSlot::config_generation` of a flow that a carrying
 /// publication revoked: never a table generation (those are nonzero), so
 /// the slot is dead and reclaimed like an expired one.
@@ -1380,9 +1387,19 @@ impl CarryRoutes<'_> {
     /// another interface now, or appeared or disappeared. A changed next hop
     /// out of the same interface keeps the flow: its state still matches
     /// both directions exactly. Two route lookups per snapshot.
+    ///
+    /// An endpoint that is one of the router's own addresses in both
+    /// snapshots is skipped (core L2): no forwarded packet is routed to a
+    /// router address. Such an endpoint appears only in the canonical tuple
+    /// of a hairpin flow (destination = the NAT public address), whose
+    /// packets the NAT translates back inside without a route lookup for
+    /// that address, so a route change toward it moves nothing.
     fn moved(self, slot: FirewallStateSlot) -> bool {
         [slot.responder_address, slot.initiator_address]
             .into_iter()
+            .filter(|address| {
+                !(self.current.is_local_ipv4(*address) && self.next.is_local_ipv4(*address))
+            })
             .any(|address| {
                 let egress = |snapshot: crate::ForwardingSnapshot<'_>| {
                     snapshot.route_lookup(address).map(|route| route.egress())
@@ -1666,8 +1683,12 @@ impl<'state> FirewallRuntime<'state> {
             current: current_snapshot,
             next: next_snapshot,
         });
-        let per_flow =
-            reevaluate.map_or(0, |rules| rules.len() as u64) + if routes.is_some() { 4 } else { 0 };
+        let per_flow = reevaluate.map_or(0, |rules| rules.len() as u64)
+            + if routes.is_some() {
+                4 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT
+            } else {
+                0
+            };
         let conflict = if longer {
             Some(crate::StateCarryConflict::Timers)
         } else if (live as u64).saturating_mul(per_flow) > FIREWALL_CARRY_REEVALUATION_BUDGET {

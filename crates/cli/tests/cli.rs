@@ -1784,3 +1784,38 @@ fn run_validates_the_systemd_notification_environment() {
         "notified before readiness"
     );
 }
+
+/// Core L1: a firewall that flushes (a longer idle timeout) is not reported
+/// as re-evaluated even when its rules and routes change too.
+#[test]
+fn plan_shows_a_flushed_firewall_without_reevaluate() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let next = dir.join("longer.toml");
+    fs::write(
+        &next,
+        source
+            .replacen("udp-idle-ttl-ms = 300000", "udp-idle-ttl-ms = 600000", 1)
+            .replacen("first = 23\nlast = 23", "first = 25\nlast = 25", 1)
+            + "\n[[routes]]\nprefix = \"192.0.2.0/24\"\negress = \"wan\"\nvia = \"203.0.113.1\"\n",
+    )
+    .unwrap();
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), next.as_os_str()]);
+    assert_eq!(status(&plan), 0, "{}", text(&plan.stderr));
+    let out = text(&plan.stdout);
+    assert!(out.contains("  firewall flushed:timers\n"), "{out}");
+    assert!(!out.contains("reevaluate"), "{out}");
+    assert!(out.contains("  firewall_flows all\n"), "{out}");
+    // Without the longer timeout the same changes re-evaluate.
+    fs::write(
+        &next,
+        source.replacen("first = 23\nlast = 23", "first = 25\nlast = 25", 1)
+            + "\n[[routes]]\nprefix = \"192.0.2.0/24\"\negress = \"wan\"\nvia = \"203.0.113.1\"\n",
+    )
+    .unwrap();
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), next.as_os_str()]);
+    let out = text(&plan.stdout);
+    assert!(out.contains("  firewall carried reevaluate\n"), "{out}");
+    assert!(out.contains("  firewall_flows invalidated\n"), "{out}");
+}

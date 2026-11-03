@@ -2283,18 +2283,18 @@ tuple/interfacesをinitial packet（TCPはSYN、ICMPはrequest）として新rul
 revokeが要るのは、stateがorigin interfaceを含むexact tupleでしかhitしないためです: forward routeが
 別egressへ移ってもforward方向だけが新規attemptになり、reverse方向はstateに当たり続けremoteが
 refreshし続けられます（review sec M2）。next hopだけが同じinterfaceで変わったflowは両方向とも
-exactに当たるので残します。NAT44 mappingはrouteに束縛せず引き継ぎます: full-serviceではfirewallが
+exactに当たるので残します。両snapshotでrouter自身のaddressであるendpointは見ません: forwardされるpacketはrouter addressへrouteされず、それはhairpin flowのcanonical tuple（destination = NAT public address）にだけ現れ、NATがroute lookupなしにinsideへ戻すからです。NAT44 mappingはrouteに束縛せず引き継ぎます: full-serviceではfirewallが
 必須でNATを通る全packetを評価するので、FW flowがrevokeされたmappingは何も通さず寿命で消えます
 （その間per-host quotaを占める）。
 revokeしたflowはapply後どちらの向きにも通らず（replyは新規attemptとしてdefault deny、outboundは
 deny rule）、slotはexpireと同じlazy reclaimで消えます（`states_revoked`に数え`states_expired`には
 数えない）。次packet時のlazy評価はrelated ICMPv4やroute miss等のstate参照点ごとに未評価flowを
 扱う境界が増えるため、apply時の一括評価を選びました。仕事量はwatermark時点でliveなflowだけを
-数えた`live x (ruleが変わればrule数 + routeが変わればlookup 4)`をpreflightで先に計算し、
+数えた`live x (ruleが変わればrule数 + routeが変わればlookup 4 x 16)`をpreflightで先に計算し（indexed route lookupは4096 routeでrule test 10〜13件分と測定し、weightを16とした）、
 `FIREWALL_CARRY_REEVALUATION_BUDGET` = 2^22 test（時間ではなく件数）を超えればfirewallだけflush
 （fail closed）します。dry run（`check_successor`）は評価を繰り返さず、再評価するcarryのflushを
 `invalidated`として返すので、SIGHUPごとにpassがrouter threadで二回走ることはありません。最大table（2^16 slot、usable 49152 flow）x 85 ruleの4,177,920 testは開発host
-のrelease buildで約25 ms（約6 ns/test、`worst_case_reevaluation_at_the_budget_takes_milliseconds`）で、
+のrelease buildで22〜48 ms（負荷による。約6 ns/test、`worst_case_reevaluation_at_the_budget_takes_milliseconds`）で、
 reloadのquiescence上限200 ms未満です（時間はhostで変わります）。NAT carryはO(1)、resolutionはO(学習neighbor)でindex経由
 O(1) lookupなので、applyの最悪時間はこのfirewall予算が支配します。route missはstateを参照しない
 ので、FW-025の「route oracleを作らない」根拠はcarry後も成り立ちます。
