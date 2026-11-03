@@ -1361,3 +1361,23 @@ fn plan_and_sequencer_debug_never_show_keys_or_seeds() {
         assert!(!debug.contains(secret), "{secret} in plan Debug");
     }
 }
+
+/// OPS-LOG: `[health]` and `[watch]` are `ruster run` watch settings, not
+/// publication state: changing, adding, or removing them is no plan aspect
+/// at all and never restart-required (the run applies them with the
+/// reload, from the next health sample).
+#[test]
+fn health_and_watch_changes_are_reloadable_and_no_plan_aspect() {
+    const OPS: (&str, &str) = (
+        "[resolution.policy]",
+        "[health]\ntx-stall-warn-ms = 2000\ntx-stall-fatal-ms = 0\n\
+         frames-quarantined-fatal = 1\n\n[watch]\nhealth-interval-ms = 100\n\
+         link-interval-ms = 500\nlink-stale-ms = 9000\n\n[resolution.policy]",
+    );
+    only(&plan(&[OPS]), &[]);
+    only(
+        &ApplyPlan::between(&config(&[OPS]), &config(&[])).expect("plan"),
+        &[],
+    );
+    assert!(!plan(&[OPS]).requires_restart());
+}

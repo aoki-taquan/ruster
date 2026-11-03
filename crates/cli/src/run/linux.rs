@@ -21,6 +21,7 @@ use ruster_io_xdp_native::{
 
 use super::checks::linux::PortSysctls;
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure, Probe};
+use super::engine::HealthSample;
 use super::engine::{ClockedIo, Datapath, DrainProgress, IdleWake, LinkMonitor, WaitError};
 use super::fs_confine::{self, FsFailure, FsReport};
 use super::netlink::{Dump, Family, IfName, LinkFacts, LinkProbe, NetlinkError};
@@ -31,7 +32,7 @@ use super::startup::{
     CloseFailure, Failure, OpenPort, PacketFacts, PacketOpenError, PortHost, Stage, StartupError,
 };
 use super::stats::write_fields;
-use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
+use super::watch::{Forwarding, IntegritySample, Ipv6Sample, LinkTarget, PortSample};
 
 /// High bits of every engine's UMEM domain id (`"rstr"`); the low bits are
 /// the port's `IfId`, so domains are distinct per port.
@@ -377,11 +378,22 @@ impl<'s> Datapath for XdpDatapath<'s> {
     }
 
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
+        self.sample(&mut |sample| {
+            if let HealthSample::Port(sample) = sample {
+                visit(sample);
+            }
+        });
+    }
+
+    /// Both samples of each port, the health counters and the integrity
+    /// counters (quarantined frames and the kernel's `tx_invalid_descs`,
+    /// OPS-LOG), from ONE `getsockopt(XDP_STATISTICS)` per port; no
+    /// allocation.
+    fn sample(&self, visit: &mut impl FnMut(HealthSample)) {
         for interface in self.io.interfaces() {
-            // One getsockopt(XDP_STATISTICS) per port; no allocation.
             if let Some(stats) = self.io.port_stats(interface) {
                 let counters = stats.counters;
-                visit(PortSample {
+                visit(HealthSample::Port(PortSample {
                     interface,
                     polls: counters.polls,
                     tx_inflight: counters.tx_inflight,
@@ -392,7 +404,12 @@ impl<'s> Datapath for XdpDatapath<'s> {
                     fill_ring_occupancy: counters.fill_ring_occupancy,
                     rx_packets: counters.rx_packets,
                     device_gone: false,
-                });
+                }));
+                visit(HealthSample::Integrity(IntegritySample {
+                    interface,
+                    frames_quarantined: counters.frames_quarantined,
+                    tx_invalid_descs: counters.kernel_tx_invalid_descs,
+                }));
             }
         }
     }

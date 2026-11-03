@@ -184,9 +184,11 @@ pub fn classify_directory(canonical: &Path) -> DirectoryScope {
         })
 }
 
-/// The startup warning for a broad config directory (a fixed name of
-/// [`BROAD_DIRECTORIES`]).
-pub fn broad_warning(directory: &str) -> String {
+/// The startup warning for a broad config directory: a fixed name of
+/// [`BROAD_DIRECTORIES`] (`'static` by type, never the operator's path, so
+/// the line stays value-free and its `directory=` field cannot carry
+/// operator text into the JSON log).
+pub fn broad_warning(directory: &'static str) -> String {
     format!(
         "warning: fs-confine code=CONFIG_DIRECTORY_BROAD directory={directory}: every file \
          beneath it that the process's user may read stays readable; keep the config in a \

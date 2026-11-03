@@ -245,6 +245,15 @@
 #             STOPPING=1 last; notify.sent equals the datagrams received
 #   rename    (H10) `ip link set ra down` and `name rx` while running:
 #             exit 1 (DEVICE_RENAMED), nothing left attached; renamed back
+#   log_json  (OPS-LOG) `--log-format json` as the invoking user: forward,
+#             a SIGHUP reload whose [health]/[watch] keys change the
+#             thresholds and intervals (watch settings applied, generation
+#             2), a reload whose merged thresholds disagree (fatal below
+#             warning: reload failed stage=health, generation 2 keeps
+#             running), forward again, SIGUSR1, SIGTERM (exit 0, detached);
+#             python3 -I parses every stderr and stdout line as one JSON
+#             object of schema ruster-run-log/v1 (pure ASCII, the keys in
+#             order, a known event code, every stdout line a STATS object)
 #   restart   SIGKILL a running router: the unpinned links auto-detach;
 #             restart (bounded retry of the transient BIND/BUSY or
 #             REGISTER_UMEM/MEMLOCK_LIMIT after teardown, XDP-045, in this
@@ -3435,8 +3444,117 @@ phase_rename() {
     echo "priv_run_rename: a port renamed while running failed closed with DEVICE_RENAMED, exit 1, nothing left attached verified"
 }
 
+# log_json (OPS-LOG): every line of a `--log-format json` run is one JSON
+# object (validated by python3 -I), and a SIGHUP changes the health
+# thresholds and watch intervals from the config.
+LOG_JSON_CHECK='
+import json, sys
+schema = "ruster-run-log/v1"
+head = ["schema", "ts", "level", "event", "msg", "fields"]
+def objects(path):
+    data = open(path, "rb").read()
+    if not data.isascii():
+        sys.exit(path + ": non-ASCII output")
+    if data and not data.endswith(b"\n"):
+        sys.exit(path + ": unterminated last line")
+    out = []
+    for number, line in enumerate(data.decode().splitlines(), 1):
+        def unique(pairs):
+            keys = [key for key, _ in pairs]
+            if len(keys) != len(set(keys)):
+                sys.exit("%s:%d: duplicate key" % (path, number))
+            return dict(pairs)
+        try:
+            item = json.loads(line, object_pairs_hook=unique)
+        except ValueError as error:
+            sys.exit("%s:%d: not JSON (%s): %s" % (path, number, error, line))
+        if list(item)[:6] != head or item["schema"] != schema:
+            sys.exit("%s:%d: bad head: %s" % (path, number, line))
+        if item["level"] not in ("info", "warn", "error"):
+            sys.exit("%s:%d: bad level: %s" % (path, number, line))
+        if item["event"] == "UNCLASSIFIED" or not isinstance(item["fields"], dict):
+            sys.exit("%s:%d: unclassified: %s" % (path, number, line))
+        if len(item["ts"]) != 24 or not item["ts"].endswith("Z"):
+            sys.exit("%s:%d: bad ts: %s" % (path, number, line))
+        out.append(item)
+    return out
+events = objects(sys.argv[1])
+stats = objects(sys.argv[2])
+codes = [item["event"] for item in events]
+for code in sys.argv[3:]:
+    if code not in codes:
+        sys.exit("missing event " + code + " in " + " ".join(codes))
+if not stats or any(item["event"] != "STATS" or not isinstance(item.get("stats"), dict) for item in stats):
+    sys.exit("stdout: a line that is not a STATS object")
+final = stats[-1]
+if final["fields"].get("kind") != "final" or final["stats"].get("observer.generation") != 2:
+    sys.exit("stdout: last block is not the final one of generation 2")
+for kind in ("periodic", "on-demand"):
+    if not any(item["fields"].get("kind") == kind for item in stats):
+        sys.exit("stdout: no " + kind + " block")
+print("%d events and %d stats objects" % (len(events), len(stats)))
+'
+
+phase_log_json() {
+    cp "$work/router.toml" "$work/log.toml"
+    # Lower thresholds and other intervals; reloadable (no plan aspect).
+    cp "$work/router.toml" "$work/log-health.toml"
+    cat >>"$work/log-health.toml" <<EOF
+
+[health]
+tx-stall-warn-ms = 2000
+tx-stall-fatal-ms = 20000
+frames-quarantined-fatal = 1
+tx-invalid-descs-fatal = 1
+
+[watch]
+health-interval-ms = 250
+link-interval-ms = 500
+link-stale-ms = 8000
+EOF
+    # A warning above the (flag default) fatal bound: refused after the merge.
+    cp "$work/router.toml" "$work/log-bad.toml"
+    printf '\n[health]\ntx-stall-warn-ms = 30000\n' >>"$work/log-bad.toml"
+    "$binary" validate "$work/log-health.toml" >/dev/null ||
+        fail "log_json: the [health]/[watch] config does not validate"
+    start_ruster log_json "$work/log.toml" --log-format json \
+        --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready log_json || fail "log_json: ruster exited during startup"
+    forward_once log_json-before
+    reload_with "$work/log-health.toml" "$work/log.toml"
+    wait_line log_json "reload applied: generation=2 previous=1"
+    wait_line log_json "watch settings applied: tx-stall-warn-ms=2000 tx-stall-fatal-ms=20000 kick-errors-fatal-ms=5000 fill-starved-warn-ms=1000 link-probe-failures-fatal=3 link-dump-interrupted-fatal=10 frames-quarantined-fatal=1 tx-invalid-descs-fatal=1 health-interval-ms=250 link-interval-ms=500 link-stale-ms=8000"
+    reload_with "$work/log-bad.toml" "$work/log.toml"
+    wait_line log_json "reload failed: stage=health code=HEALTH_FATAL_BELOW_WARNING path=health.tx-stall-fatal-ms limit=30000 actual=10000; generation 2 keeps running"
+    forward_once log_json-after
+    # At least one periodic block (--stats-interval 1) before the on-demand one.
+    sleep 1.2
+    signal_ruster USR1
+    tries=0
+    while ! grep -q '"kind":"on-demand"' "$work/log_json.out"; do
+        launcher_alive || fail "log_json: exited after SIGUSR1"
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "log_json: no on-demand stats object within 10 s"
+        sleep 0.05
+    done
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "log_json: exit status $status after SIGTERM"
+    assert_detached "the log_json phase"
+    if grep -q '^ruster' "$work/log_json.err" "$work/log_json.out"; then
+        fail "log_json: a text line in JSON mode"
+    fi
+    counts=$(python3 -I -c "$LOG_JSON_CHECK" "$work/log_json.err" "$work/log_json.out" \
+        PRIVILEGES_DROPPED FS_CONFINED SECCOMP_INSTALLED READY RELOAD_REQUESTED \
+        RELOAD_CHECKED RELOAD_APPLIED WATCH_SETTINGS_APPLIED RELOAD_FAILED \
+        SHUTDOWN_DRAINING SHUTDOWN_SUMMARY) ||
+        fail "log_json: JSON lines check failed"
+    echo "priv_run_log_json: --log-format json wrote $counts, all valid ruster-run-log/v1 objects (python3 -I json, no UNCLASSIFIED); a SIGHUP applied [health]/[watch] (watch settings applied, generation 2) and a disagreeing merge was refused (stage=health, generation 2 kept); forwarding before and after; exit 0, detached verified"
+}
+
 phase_systemd
 phase_rename
+phase_log_json
 
 # restart: SIGKILL, auto-detach, bounded restart retry, forward again.
 start_ruster killed "$work/router.toml"

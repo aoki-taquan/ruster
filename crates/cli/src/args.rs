@@ -7,6 +7,8 @@ use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
+pub use crate::run::log::LogFormat;
+
 pub const USAGE: &str = "\
 usage:
   ruster validate <config.toml>
@@ -21,7 +23,7 @@ usage:
              [--link-stale-secs <s>] [--idle-wait-ms <ms>]
              [--keep-privileges | --user <uid> --group <gid>]
              [--seccomp kill|log|off] [--fs-confine landlock|off]
-             --config <config.toml>
+             [--log-format text|json] --config <config.toml>
   ruster run [options] -- <config.toml>
   ruster --help | --version
 
@@ -36,6 +38,12 @@ Before that every thread is confined to the files the run reads (Landlock:
 the config's directory, its own /proc entries, /proc/sys/net, its binary;
 --fs-confine landlock, the default, refuses to start without Landlock);
 --fs-confine off leaves the filesystem view unchanged.
+--log-format json writes every line of `run` as one JSON object
+(schema ruster-run-log/v1: stats blocks on stdout, events on stderr);
+text, the default, keeps the human-readable lines.
+Health thresholds and watch intervals are [health]/[watch] config keys
+(reloadable); the threshold flags only set what a key the config does
+not set falls back to (deprecated).
 When idle, `run` blocks in poll() on the port sockets for at most
 --idle-wait-ms (default 10, 1 to 100; at most 1 while timers or TX are
 pending); an arriving frame ends the wait at once.
@@ -241,6 +249,9 @@ pub struct RunArgs {
     /// The longest idle wait in milliseconds (`--idle-wait-ms`, 1 to
     /// [`MAX_IDLE_WAIT_MS`], H9).
     pub idle_wait_ms: u64,
+    /// The output format (`--log-format text|json`, OPS-LOG; default
+    /// text).
+    pub log_format: LogFormat,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -289,6 +300,9 @@ impl fmt::Display for UsageError {
             }
             Self::InvalidValue("--fs-confine") => {
                 formatter.write_str("option --fs-confine needs landlock or off")
+            }
+            Self::InvalidValue("--log-format") => {
+                formatter.write_str("option --log-format needs text or json")
             }
             Self::InvalidValue(option @ ("--user" | "--group")) => write!(
                 formatter,
@@ -425,6 +439,7 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
     let mut ids: [Option<u32>; 2] = [None; 2];
     let mut seccomp = None;
     let mut fs_confine = None;
+    let mut log_format = None;
     let mut numbers: [Option<u64>; NUMERIC.len()] = [None; NUMERIC.len()];
     let mut words = rest.iter();
     'words: while let Some(word) = words.next() {
@@ -445,6 +460,18 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
                 .filter(|value| !is_option(value))
                 .ok_or(UsageError::MissingValue("--seccomp"))?;
             set_seccomp(&mut seccomp, value)?;
+            continue;
+        }
+        if let Some(value) = equals_value(word, "--log-format=") {
+            set_log_format(&mut log_format, &value)?;
+            continue;
+        }
+        if word.to_str() == Some("--log-format") {
+            let value = words
+                .next()
+                .filter(|value| !is_option(value))
+                .ok_or(UsageError::MissingValue("--log-format"))?;
+            set_log_format(&mut log_format, value)?;
             continue;
         }
         if let Some(value) = equals_value(word, "--fs-confine=") {
@@ -564,7 +591,20 @@ fn parse_run(rest: &[OsString]) -> Result<Command, UsageError> {
         seccomp: seccomp.unwrap_or_default(),
         fs_confine: fs_confine.unwrap_or_default(),
         idle_wait_ms: idle_wait.unwrap_or(DEFAULT_IDLE_WAIT_MS),
+        log_format: log_format.unwrap_or_default(),
     }))
+}
+
+/// `--log-format text|json`, at most once.
+fn set_log_format(slot: &mut Option<LogFormat>, value: &OsStr) -> Result<(), UsageError> {
+    let format = value
+        .to_str()
+        .and_then(LogFormat::parse)
+        .ok_or(UsageError::InvalidValue("--log-format"))?;
+    if slot.replace(format).is_some() {
+        return Err(UsageError::DuplicateOption("--log-format"));
+    }
+    Ok(())
 }
 
 /// `--seccomp kill|log|off`, at most once.
@@ -849,6 +889,7 @@ mod tests {
             seccomp: SeccompMode::Kill,
             fs_confine: FsConfineMode::Landlock,
             idle_wait_ms: DEFAULT_IDLE_WAIT_MS,
+            log_format: LogFormat::Text,
         })
     }
 
@@ -1191,6 +1232,50 @@ mod tests {
     }
 
     #[test]
+    fn run_parses_the_log_format() {
+        let parsed = |words: &[&str]| match run(words) {
+            Ok(Command::Run(args)) => args.log_format,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(parsed(&["run", "--config", "a"]), LogFormat::Text);
+        assert_eq!(
+            parsed(&["run", "--log-format", "json", "--config", "a"]),
+            LogFormat::Json
+        );
+        assert_eq!(
+            parsed(&["run", "--log-format=text", "--config", "a"]),
+            LogFormat::Text
+        );
+        for bad in ["--log-format=xml", "--log-format=", "--log-format=JSON"] {
+            assert_eq!(
+                run(&["run", bad, "--config", "a"]),
+                Err(UsageError::InvalidValue("--log-format")),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            run(&["run", "--log-format", "--config", "a"]),
+            Err(UsageError::MissingValue("--log-format"))
+        );
+        assert_eq!(
+            run(&[
+                "run",
+                "--log-format=json",
+                "--log-format",
+                "text",
+                "--config",
+                "a"
+            ]),
+            Err(UsageError::DuplicateOption("--log-format"))
+        );
+        assert_eq!(
+            UsageError::InvalidValue("--log-format").to_string(),
+            "option --log-format needs text or json"
+        );
+        assert!(USAGE.contains("[--log-format text|json]"));
+    }
+
+    #[test]
     fn run_parses_startup_attempts() {
         let with = |attempts| {
             Ok(Command::Run(RunArgs {
@@ -1212,6 +1297,7 @@ mod tests {
                 seccomp: SeccompMode::Kill,
                 fs_confine: FsConfineMode::Landlock,
                 idle_wait_ms: DEFAULT_IDLE_WAIT_MS,
+                log_format: LogFormat::Text,
             }))
         };
         assert_eq!(

@@ -140,6 +140,7 @@ mod fs_confine;
     target_pointer_width = "64"
 ))]
 mod linux;
+pub mod log;
 #[cfg_attr(
     not(all(
         target_os = "linux",
@@ -159,6 +160,7 @@ mod notify;
     allow(dead_code)
 )]
 mod offload;
+mod ops;
 mod output;
 mod privileges;
 mod reload;
@@ -300,8 +302,22 @@ pub fn retry_pause_ms(next: u32) -> u64 {
     (STARTUP_RETRY_PAUSE_MS << doublings).min(STARTUP_RETRY_PAUSE_MAX_MS)
 }
 
-/// Runs the command and returns the exit status.
+/// Runs the command and returns the exit status. With `--log-format json`
+/// every line, also those written before the output threads start, is a
+/// JSON object ([`log`], OPS-LOG).
 pub fn run(args: &RunArgs, err: &mut impl Write) -> u8 {
+    match args.log_format {
+        log::LogFormat::Text => run_with(args, err),
+        log::LogFormat::Json => {
+            let mut json = log::JsonLines::new(err);
+            let status = run_with(args, &mut json);
+            let _ = json.flush();
+            status
+        }
+    }
+}
+
+fn run_with(args: &RunArgs, err: &mut impl Write) -> u8 {
     let config = match config_cmd::load_validated_regular(&args.config, args.strict_config_perms) {
         Ok(config) => config,
         Err(error) => return config_cmd::report_load(err, "", &error),
@@ -404,7 +420,10 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     // stalled stdout/stderr pipe cannot block the datapath or the shutdown.
     // The threads get dups of fd 1/2 as plain files: blocked writes hold
     // no std stdio lock that `main` or the exit path could wait on.
-    let output = match output::ColdOutput::process(move || linux::thread_lockdown(policy)) {
+    let output = match output::ColdOutput::process(
+        move || linux::thread_lockdown(policy),
+        args.log_format,
+    ) {
         Ok(output) => output,
         Err(output::SpawnError::Prologue(error)) => {
             let error = prologue_failed(error);
@@ -506,6 +525,22 @@ where
     if config.backend().kind() == BackendKindV1::Sim {
         return EXIT_INVALID;
     }
+    // OPS-LOG: the `[health]`/`[watch]` keys over the flags.
+    let fallback = ops::Fallback::from(&settings);
+    let ops = match ops::Ops::resolve(&config, fallback) {
+        Ok(ops) => ops,
+        Err(error) => {
+            let _ = writeln!(err, "ruster run: invalid config: {error}");
+            return EXIT_INVALID;
+        }
+    };
+    for flag in ops::overridden_flags(&config, fallback) {
+        let _ = writeln!(
+            err,
+            "ruster run: warning: {flag} is overridden by {} of the config",
+            ops::key_of(flag)
+        );
+    }
     for warning in crate::config_cmd::sweep_warnings(&config)
         .into_iter()
         .flatten()
@@ -535,6 +570,7 @@ where
             candidate,
             &mut storage,
             settings,
+            (fallback, ops),
             notify,
             clock,
             stop,
@@ -604,7 +640,7 @@ where
             &mut opened,
             candidate,
             &mut storage,
-            Preparer::new(sequencer, config, source),
+            Preparer::new(sequencer, config, source).with_ops(fallback, ops),
             settings,
             notify,
             clock,
@@ -654,6 +690,7 @@ fn execute_packet<H, K, R, C, S, O, E>(
     candidate: ValidatedCandidate,
     storage: &mut FullServiceStorage,
     settings: Settings,
+    (fallback, resolved): (ops::Fallback, ops::Ops),
     notify: Notifier,
     clock: &mut C,
     stop: &S,
@@ -738,7 +775,7 @@ where
         Some(exposure),
         candidate,
         storage,
-        Preparer::new(sequencer, config, source),
+        Preparer::new(sequencer, config, source).with_ops(fallback, resolved),
         settings,
         notify,
         clock,
@@ -860,6 +897,8 @@ where
     E: Write,
 {
     let budgets = budgets(preparer.current());
+    // OPS-LOG: the watch settings of the document (keys over flags).
+    let ops = preparer.ops();
     if stop.stop() {
         return Err(Interrupt::Signalled);
     }
@@ -891,7 +930,7 @@ where
         let lockstep = !tests::take_async_workers();
         (links.lockstep(lockstep), reloads.lockstep(lockstep))
     };
-    let reloader = Reloader::new(reloads, budgets);
+    let reloader = Reloader::new(reloads, budgets).with_ops(ops);
     // Nothing after this point needs a privilege (see [`privileges`]) or a
     // syscall outside the allowlist (see [`seccomp`]).
     let privileges = match settings.privileges {
@@ -952,16 +991,17 @@ where
     notify.ready(active.generation().get());
     let loop_settings = LoopSettings {
         stats_interval_ms: settings.stats_interval_ms,
-        health_interval_ms: settings.health_interval_ms,
-        link_interval_ms: settings.link_interval_ms,
+        health_interval_ms: ops.health_interval_ms,
+        link_interval_ms: ops.link_interval_ms,
         reload_quiesce_ms: settings.reload_quiesce_ms,
         reload_prepare_warn_ms: settings.reload_prepare_warn_ms,
         idle_wait_ms: settings.idle_wait_ms,
     };
-    let mut watch = Watch::new(targets, settings.thresholds)
+    let mut watch = Watch::new(targets, ops.thresholds)
         .allowing_kernel_forwarding(settings.policy.allow_kernel_forwarding)
         .allowing_kernel_ipv6(settings.policy.allow_kernel_ipv6)
-        .with_link_stale_ms(settings.link_stale_ms);
+        .with_link_stale_ms(ops.link_stale_ms)
+        .with_limits(ops.limits);
     if let Some(exposure) = exposure {
         watch = watch.failing_on_kernel_exposure(exposure);
     }

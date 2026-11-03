@@ -35,7 +35,7 @@ use super::seccomp::{ConfineFailure, ConfineReport, SeccompMode};
 use super::startup::{
     CloseFailure, Failure, OpenPort, PacketFacts, PacketOpenError, PortHost, Stage, StartupError,
 };
-use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
+use super::watch::{Forwarding, IntegritySample, Ipv6Sample, LinkTarget, PortSample};
 use super::{execute, Settings, EXIT_DRAIN_INCOMPLETE, EXIT_PRIVILEGE, READY};
 use crate::config_cmd::LoadError;
 use crate::{EXIT_INVALID, EXIT_RUNTIME};
@@ -132,6 +132,9 @@ struct State {
     hook_mark_ms: Cell<Option<u64>>,
     /// Health sample rounds handed out by `sample_ports`, one per call.
     samples: RefCell<VecDeque<Vec<PortSample>>>,
+    /// Integrity sample rounds handed out by `sample_integrity`, one per
+    /// call (OPS-LOG).
+    integrity: RefCell<VecDeque<Vec<IntegritySample>>>,
     /// Link query results, consumed in order by the matching port (shared
     /// with the link watcher thread, like the other link scripts).
     links: Shared<VecDeque<(IfId, Result<LinkFacts, NetlinkError>)>>,
@@ -459,6 +462,13 @@ impl Datapath for FakeDatapath<'_> {
         }
         self.state.refreshes_at_sample.set(refreshes);
         let round = self.state.samples.borrow_mut().pop_front();
+        for sample in round.into_iter().flatten() {
+            visit(sample);
+        }
+    }
+
+    fn sample_integrity(&self, visit: &mut impl FnMut(IntegritySample)) {
+        let round = self.state.integrity.borrow_mut().pop_front();
         for sample in round.into_iter().flatten() {
             visit(sample);
         }
@@ -1192,11 +1202,16 @@ fn run_full<S: StopSignal>(
         &mut out,
         &mut err,
     );
-    Outcome {
+    let outcome = Outcome {
         status,
         out: String::from_utf8(out).expect("utf-8"),
         err: String::from_utf8(err).expect("utf-8"),
-    }
+    };
+    // OPS-LOG: every line any run of these tests writes has an event code
+    // and a valid JSON form, and every stats block one STATS object.
+    super::log::tests::assert_classified(&outcome.err);
+    super::log::tests::assert_stats_translate(&outcome.out);
+    outcome
 }
 
 fn run(host: &FakeHost, stop: &FakeStop) -> Outcome {

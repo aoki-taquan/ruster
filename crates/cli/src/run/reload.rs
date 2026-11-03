@@ -77,6 +77,7 @@ use ruster_runtime::{ApplyCarryCounts, ApplyFlushCounts, TickBudgets};
 
 use crate::config_cmd::{self, LoadError, SweepSlow};
 
+use super::ops::{Fallback, Ops};
 use super::output::SpawnError;
 use super::privileges::DropFailure;
 use super::startup::token;
@@ -336,6 +337,8 @@ pub struct Ready {
     counts: DocumentCounts,
     /// The slow-sweep warnings of its document, printed once applied.
     sweep: [Option<SweepSlow>; 2],
+    /// The watch settings of its document (OPS-LOG), applied with it.
+    ops: Ops,
 }
 
 /// The preparer's answer to one request (formatted on the worker thread,
@@ -368,7 +371,11 @@ pub struct Preparer<K: ProductionKeySource, C> {
     source: C,
     /// The document of the last `Ready` answer, until it is applied or the
     /// next request.
-    next: Option<ValidatedConfigV1>,
+    next: Option<(ValidatedConfigV1, Ops)>,
+    /// What a `[health]`/`[watch]` key falls back to (OPS-LOG).
+    fallback: Fallback,
+    /// The watch settings of the current document.
+    ops: Ops,
 }
 
 impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
@@ -378,7 +385,23 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             current,
             source,
             next: None,
+            fallback: Fallback::default(),
+            ops: Ops::default(),
         }
+    }
+
+    /// The flag fallback of the `[health]`/`[watch]` keys and the resolved
+    /// settings of the current document ([`super::ops`]).
+    #[must_use]
+    pub fn with_ops(mut self, fallback: Fallback, ops: Ops) -> Self {
+        self.fallback = fallback;
+        self.ops = ops;
+        self
+    }
+
+    /// The watch settings of the current document.
+    pub const fn ops(&self) -> Ops {
+        self.ops
     }
 
     /// The active generation's document.
@@ -395,6 +418,13 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             Ok(next) => next,
             Err(error) => return Prepared::Failed(error.render()),
         };
+        // The merged watch settings first (the document validator bounded
+        // each key): a disagreement with a flag fails the reload before a
+        // generation is drawn.
+        let ops = match Ops::resolve(&next, self.fallback) {
+            Ok(ops) => ops,
+            Err(error) => return Prepared::Failed(error.to_string()),
+        };
         let candidate = match self.sequencer.candidate(&next) {
             Ok(candidate) => candidate,
             Err(SequencerError::Bridge(error)) => {
@@ -410,18 +440,20 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             return Prepared::Refused(plan.restart_required().into());
         }
         let ready = Ready {
+            ops,
             candidate: Some(candidate),
             budgets: super::budgets(&next),
             counts: DocumentCounts::of(&next),
             sweep: config_cmd::sweep_warnings(&next),
         };
-        self.next = Some(next);
+        self.next = Some((next, ops));
         Prepared::Ready(Box::new(ready))
     }
 
     /// The last prepared document was applied.
     pub fn applied(&mut self) {
-        if let Some(next) = self.next.take() {
+        if let Some((next, ops)) = self.next.take() {
+            self.ops = ops;
             self.current = next;
         }
     }
@@ -563,6 +595,8 @@ pub struct Reloader {
     budgets: TickBudgets,
     sweep: [Option<SweepSlow>; 2],
     counters: ReloadCounters,
+    /// The watch settings of the active generation's document (OPS-LOG).
+    ops: Ops,
 }
 
 impl Reloader {
@@ -574,7 +608,21 @@ impl Reloader {
             budgets,
             sweep: [None, None],
             counters: ReloadCounters::default(),
+            ops: Ops::default(),
         }
+    }
+
+    /// With the active document's watch settings (OPS-LOG).
+    #[must_use]
+    pub const fn with_ops(mut self, ops: Ops) -> Self {
+        self.ops = ops;
+        self
+    }
+
+    /// The watch settings of the active generation's document: an applied
+    /// reload switches them with its budgets.
+    pub const fn ops(&self) -> Ops {
+        self.ops
     }
 
     /// A reloader without a worker (tests of `finish`).
@@ -586,6 +634,7 @@ impl Reloader {
             budgets,
             sweep: [None, None],
             counters: ReloadCounters::default(),
+            ops: Ops::default(),
         }
     }
 
@@ -712,6 +761,7 @@ impl Reloader {
                 budgets,
                 counts: DocumentCounts::default(),
                 sweep: [None, None],
+                ops: self.ops,
             }),
             since: MonotonicMillis(0),
         };
@@ -741,6 +791,7 @@ impl Reloader {
             TickApply::Applied(report) => {
                 self.budgets = ready.budgets;
                 self.sweep = ready.sweep;
+                self.ops = ready.ops;
                 if let Some(worker) = self.worker.as_mut() {
                     worker.applied();
                 }

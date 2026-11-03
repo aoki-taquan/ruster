@@ -2026,3 +2026,192 @@ fn tick_generated_fragments_defaults_and_fails_closed() {
     );
     assert_eq!(dotted(above.path()), "tick.generated-fragments");
 }
+
+/// OPS-LOG: `[health]` and `[watch]` are optional, every key is bounded
+/// (fail closed, value-free diagnostics with the bound), and a fatal
+/// threshold of 0 is accepted where it disables a fatal exit.
+#[test]
+fn health_and_watch_keys_are_optional_and_bounded() {
+    use ruster_config::{HealthV1, WatchV1};
+    let config = validated(VALID);
+    assert_eq!(config.health(), HealthV1::default());
+    assert_eq!(config.watch(), WatchV1::default());
+
+    let with = |table: &str, body: &str| format!("{VALID}\n[{table}]\n{body}\n");
+    let all = validated(&with(
+        "health",
+        "tx-stall-warn-ms = 2000\ntx-stall-fatal-ms = 0\nkick-errors-fatal-ms = 100\n\
+         fill-starved-warn-ms = 3600000\nlink-probe-failures-fatal = 100\n\
+         link-dump-interrupted-fatal = 1\nframes-quarantined-fatal = 0\n\
+         tx-invalid-descs-fatal = 1000000",
+    ));
+    assert_eq!(
+        all.health(),
+        HealthV1 {
+            tx_stall_warn_ms: Some(2_000),
+            tx_stall_fatal_ms: Some(0),
+            kick_errors_fatal_ms: Some(100),
+            fill_starved_warn_ms: Some(3_600_000),
+            link_probe_failures_fatal: Some(100),
+            link_dump_interrupted_fatal: Some(1),
+            frames_quarantined_fatal: Some(0),
+            tx_invalid_descs_fatal: Some(1_000_000),
+        }
+    );
+    let watch = validated(&with(
+        "watch",
+        "health-interval-ms = 100\nlink-interval-ms = 60000\nlink-stale-ms = 1000",
+    ));
+    assert_eq!(
+        watch.watch(),
+        WatchV1 {
+            health_interval_ms: Some(100),
+            link_interval_ms: Some(60_000),
+            link_stale_ms: Some(1_000),
+        }
+    );
+
+    // (table, key, rejected value, code, limit)
+    for (table, key, value, code, limit) in [
+        (
+            "health",
+            "tx-stall-warn-ms",
+            0,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            100,
+        ),
+        (
+            "health",
+            "tx-stall-warn-ms",
+            99,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            100,
+        ),
+        (
+            "health",
+            "tx-stall-warn-ms",
+            3_600_001,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            3_600_000,
+        ),
+        (
+            "health",
+            "tx-stall-fatal-ms",
+            50,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            100,
+        ),
+        (
+            "health",
+            "kick-errors-fatal-ms",
+            3_600_001,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            3_600_000,
+        ),
+        (
+            "health",
+            "fill-starved-warn-ms",
+            0,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            100,
+        ),
+        (
+            "health",
+            "link-probe-failures-fatal",
+            0,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            1,
+        ),
+        (
+            "health",
+            "link-probe-failures-fatal",
+            101,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            100,
+        ),
+        (
+            "health",
+            "link-dump-interrupted-fatal",
+            1_001,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            1_000,
+        ),
+        (
+            "health",
+            "frames-quarantined-fatal",
+            1_000_001,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            1_000_000,
+        ),
+        (
+            "health",
+            "tx-invalid-descs-fatal",
+            1_000_001,
+            "HEALTH_VALUE_OUT_OF_RANGE",
+            1_000_000,
+        ),
+        (
+            "watch",
+            "health-interval-ms",
+            99,
+            "WATCH_INTERVAL_OUT_OF_RANGE",
+            100,
+        ),
+        (
+            "watch",
+            "health-interval-ms",
+            60_001,
+            "WATCH_INTERVAL_OUT_OF_RANGE",
+            60_000,
+        ),
+        (
+            "watch",
+            "link-interval-ms",
+            99,
+            "WATCH_INTERVAL_OUT_OF_RANGE",
+            100,
+        ),
+        (
+            "watch",
+            "link-stale-ms",
+            999,
+            "WATCH_INTERVAL_OUT_OF_RANGE",
+            1_000,
+        ),
+        (
+            "watch",
+            "link-stale-ms",
+            3_600_001,
+            "WATCH_INTERVAL_OUT_OF_RANGE",
+            3_600_000,
+        ),
+    ] {
+        let rejected = error(&with(table, &format!("{key} = {value}")));
+        assert_eq!(rejected.code().code(), code, "{table}.{key}={value}");
+        assert_eq!(dotted(rejected.path()), format!("{table}.{key}"));
+        assert_eq!(
+            (rejected.limit(), rejected.actual()),
+            (Some(limit), Some(value)),
+            "{table}.{key}={value}"
+        );
+    }
+
+    let below = error(&with(
+        "health",
+        "tx-stall-warn-ms = 5000\ntx-stall-fatal-ms = 4999",
+    ));
+    assert_eq!(below.code(), ValidationCode::HealthFatalBelowWarning);
+    assert_eq!(below.code().code(), "HEALTH_FATAL_BELOW_WARNING");
+    assert_eq!(dotted(below.path()), "health.tx-stall-fatal-ms");
+    assert_eq!((below.limit(), below.actual()), (Some(5_000), Some(4_999)));
+
+    // Unknown keys, wrong types, and negative values fail at decode.
+    for body in [
+        "[health]\nbogus = 1",
+        "[watch]\nlink-interval-ms = \"1s\"",
+        "[watch]\nlink-interval-ms = -1",
+    ] {
+        let source = format!("{VALID}\n{body}\n");
+        assert!(parse(source.as_bytes()).is_err(), "{body}");
+    }
+}
