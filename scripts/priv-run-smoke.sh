@@ -2933,6 +2933,9 @@ phase_arphold() {
         nat44_icmp.outbound_translated=1 nat44_icmp.inbound_translated=1
     echo "priv_run_arphold_ping: $(sed -n '/transmitted/p' "$work/arphold-ping.txt") on the first try with every neighbour cache empty; arp_hold.held=replayed=replay_sent=1, drop.NEIGHBOR_UNRESOLVED=0, exit 0, detached verified"
 
+    # Host B answers from its own TCP stack: full checksums (a veth leaves
+    # them partial, which the router's firewall rightly drops).
+    in_ns "$host_b" ethtool -K pb tx off >/dev/null
     arphold_fresh_caches
     start_ruster arphold-tcp "$work/arphold.toml"
     wait_ready arphold-tcp || fail "arphold: ruster exited during startup (tcp)"
@@ -2956,6 +2959,7 @@ phase_arphold() {
     awk -v t="$elapsed" 'BEGIN { exit !(t < 0.5) }' ||
         fail "arphold: the handshake took $elapsed s"
     natfrag_stop arphold-tcp
+    in_ns "$host_b" ethtool -K pb tx on >/dev/null
     block_has "$work/arphold-tcp.final" arp_hold.held=1 arp_hold.replayed=1 \
         arp_hold.replay_sent=1 drop.NEIGHBOR_UNRESOLVED=0 nat44_tcp.sessions_created=1
     echo "priv_run_arphold_tcp: with every neighbour cache empty the first SYN was held and sent (connect ${elapsed} s, tcpi_total_retrans=$retrans), host B accepted from $(sed -n 2p "$work/arphold-listen.out"), exit 0 verified"
