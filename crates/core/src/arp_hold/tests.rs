@@ -583,7 +583,10 @@ fn the_replay_batch_lends_ready_datagrams_and_settles_each_completion() {
     // one that was not ready is untouched.
     assert_eq!(tags(&runtime), [1, 6]);
     let committed = runtime.slots[runtime.oldest as usize];
-    assert_eq!((committed.state, committed.egress), (HoldState::Committed, LAN));
+    assert_eq!(
+        (committed.state, committed.egress),
+        (HoldState::Committed, LAN)
+    );
 }
 
 #[test]
@@ -623,14 +626,16 @@ fn staging_sends_committed_datagrams_whole_and_returns_unreached_ones() {
             ArpHoldNextHop::Resolving
         }
     });
-    let mut batch = runtime.replay_batch();
-    // 1 is committed on the WAN (MTU 576): staged whole without padding.
-    batch.next_packet().unwrap().commit(WAN);
-    // 2 is committed on an egress the snapshot does not know.
-    batch.next_packet().unwrap().commit(IfId(9));
-    // 3 (600 bytes with DF, above the WAN MTU) is committed: not stageable.
-    batch.next_packet().unwrap().commit(WAN);
-    drop(batch);
+    {
+        let mut batch = runtime.replay_batch();
+        // 1 is committed on the WAN (MTU 576): staged whole without padding.
+        batch.next_packet().unwrap().commit(WAN);
+        // 2 is committed on an egress the snapshot does not know.
+        batch.next_packet().unwrap().commit(IfId(9));
+        // 3 (600 bytes with DF, above the WAN MTU) is committed: not
+        // stageable.
+        batch.next_packet().unwrap().commit(WAN);
+    }
     runtime.stage_committed(&snapshot, &mut fragmentation);
     assert_eq!(tags(&runtime), [4]);
     assert_eq!(
