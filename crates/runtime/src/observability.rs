@@ -25,10 +25,10 @@ use core::{convert::Infallible, fmt};
 use std::num::NonZeroU64;
 
 use ruster_core::{
-    ConsumeReason, DropReason, FieldValue, FieldVisitor, FirewallCounters, FirewallReconcileReport,
-    FirewallRuntime, GeneratedAllocationError, GeneratedArpTrace, GeneratedIcmpv4Trace,
-    GeneratedIcmpv4TraceSink, GeneratedTraceSink, Icmpv4ErrorCounters,
-    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Ipv4FragmentTracker,
+    ArpHoldCounters, ArpHoldRuntime, ConsumeReason, DropReason, FieldValue, FieldVisitor,
+    FirewallCounters, FirewallReconcileReport, FirewallRuntime, GeneratedAllocationError,
+    GeneratedArpTrace, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedTraceSink,
+    Icmpv4ErrorCounters, Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Ipv4FragmentTracker,
     Ipv4FragmentTrackingCounters, Ipv4FragmentationCounters, Ipv4FragmentationRuntime,
     MonotonicMillis, Nat44IcmpCounters, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
     Nat44TcpCounters, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44UdpCounters,
@@ -1294,7 +1294,8 @@ impl TraceSink for TickObserver {
             TraceEvent::Consumed { reason, .. }
             | TraceEvent::Ipv4LocalConsumed { reason, .. }
             | TraceEvent::Ipv4FragmentationQueued { reason, .. }
-            | TraceEvent::Ipv4FragmentHeld { reason, .. } => {
+            | TraceEvent::Ipv4FragmentHeld { reason, .. }
+            | TraceEvent::ArpHeld { reason, .. } => {
                 self.consumes.record(reason);
             }
             _ => {}
@@ -1419,6 +1420,9 @@ pub struct ServiceCounters {
     pub fragmentation: Ipv4FragmentationCounters,
     /// IPv4 fragment association (NAT-FRAG); zero in `refuse` mode.
     pub fragment_tracking: Ipv4FragmentTrackingCounters,
+    /// Hold and replay of datagrams whose next hop is being resolved
+    /// (ARP-HOLD); zero when holding is off.
+    pub arp_hold: ArpHoldCounters,
 }
 
 impl ServiceCounters {
@@ -1441,7 +1445,17 @@ impl ServiceCounters {
             firewall: firewall.counters(),
             fragmentation: Ipv4FragmentationCounters::default(),
             fragment_tracking: Ipv4FragmentTrackingCounters::default(),
+            arp_hold: ArpHoldCounters::default(),
         }
+    }
+
+    /// Adds the ARP hold counters (ARP-HOLD) when holding is on.
+    #[must_use]
+    pub fn with_arp_hold(mut self, arp_hold: Option<&ArpHoldRuntime<'_>>) -> Self {
+        if let Some(runtime) = arp_hold {
+            self.arp_hold = runtime.counters();
+        }
+        self
     }
 
     /// Adds the IPv4 fragment association counters (NAT-FRAG) when the
@@ -1545,6 +1559,11 @@ impl ObservableFields for ServiceCounters {
             release_dropped, held_denied, held_expired, entries_expired, entries_completed,
             entries_evicted, held_evicted, poisoned, duplicate_first, entries_flushed,
             held_flushed,
+        }}
+        visit_counts! {v, "arp_hold", self.arp_hold, ArpHoldCounters {
+            held, replaced, refused_full, refused_host_limit, refused_ingress_limit,
+            refused_too_large, replayed, replay_sent, replay_fragmented, replay_dropped,
+            replay_unstaged, deferred, failed, cancelled, expired, flushed,
         }}
     }
 }

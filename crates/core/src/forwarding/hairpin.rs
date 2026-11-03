@@ -129,6 +129,7 @@ fn inside_forwarding<T: TraceSink>(
                         target,
                         result,
                     });
+                    resolution_runtime.note_forward_miss(route.egress(), target, result);
                 }
                 return Err(NeighborUnresolved);
             }

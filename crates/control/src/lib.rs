@@ -36,10 +36,10 @@ pub use plan::{
 };
 
 pub use publication::{
-    FirewallPublicationInput, FragmentTrackingStoragePlan, FragmentationStoragePlan,
-    FullServiceStorageShape, Icmpv4ErrorStorageShape, Nat44IcmpPublicationInput,
-    Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan, Nat44UdpPublicationInput,
-    Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan, ReloadState,
-    ResolutionStorageShape, RuntimeService, StorageShapeError, SuccessorError, ValidatedAuthority,
-    ValidatedCandidate,
+    ArpHoldStoragePlan, FirewallPublicationInput, FragmentTrackingStoragePlan,
+    FragmentationStoragePlan, FullServiceStorageShape, Icmpv4ErrorStorageShape,
+    Nat44IcmpPublicationInput, Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan,
+    Nat44UdpPublicationInput, Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan,
+    ReloadState, ResolutionStorageShape, RuntimeService, StorageShapeError, SuccessorError,
+    ValidatedAuthority, ValidatedCandidate,
 };

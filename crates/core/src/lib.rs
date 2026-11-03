@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "A small, allocation-free IPv4 and ARP packet-processing core."]
 
+mod arp_hold;
 mod checksum;
 mod firewall;
 mod fixed_directory;
@@ -26,6 +27,11 @@ mod route;
 mod slot_index;
 mod slot_list;
 
+pub use arp_hold::{
+    ArpHoldCounters, ArpHoldPolicy, ArpHoldPolicyError, ArpHoldRuntime, ArpHoldSlot,
+    ArpHoldStorageError, ARP_HOLD_DEFAULT_PACKETS, ARP_HOLD_DEFAULT_PER_HOST,
+    ARP_HOLD_DEFAULT_PER_NEIGHBOR, ARP_HOLD_MAX_PACKETS, ARP_HOLD_MAX_PER_NEIGHBOR,
+};
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[cfg(feature = "validation-test-hooks")]
 #[doc(hidden)]
@@ -64,12 +70,14 @@ pub use forwarding::{
     forward_batch_with_nat44_udp_and_tcp_and_firewall_audited,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking,
+    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking_and_arp_hold,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragmentation,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_icmpv4_errors,
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
-    forward_batch_with_resolution_and_icmpv4_errors, ArpPolicy, BatchReport, DropReason,
-    ForwardingSnapshot, Ipv4OriginPolicy, Ipv4OriginPolicyError, Nat44Icmpv4Disposition, NoTrace,
-    SnapshotError, TraceEvent, TraceSink, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
+    forward_batch_with_resolution_and_icmpv4_errors, replay_arp_holds, ArpPolicy, BatchReport,
+    DropReason, ForwardingSnapshot, Ipv4OriginPolicy, Ipv4OriginPolicyError,
+    Nat44Icmpv4Disposition, NoTrace, SnapshotError, TraceEvent, TraceSink,
+    ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,

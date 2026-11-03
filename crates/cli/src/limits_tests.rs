@@ -16,7 +16,7 @@ use crate::config_cmd::{
 pub const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-max.toml");
 
 /// Runtime storage of [`MAXIMAL`] in bytes (63.53 MiB).
-pub const MAXIMAL_STORAGE_BYTES: u64 = 66_617_536;
+pub const MAXIMAL_STORAGE_BYTES: u64 = 66_865_856;
 
 /// Which production bound a table has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

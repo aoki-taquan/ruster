@@ -286,6 +286,12 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 held: 64,
                 held_slot_bytes: 3840,
             }),
+            // `[resolution.hold]` absent: on, 64 hold slots sized like a
+            // fragmentation slot (ARP-HOLD).
+            arp_hold: Some(ruster_config::ArpHoldStorageShapeV1 {
+                packets: 64,
+                slot_bytes: 3840,
+            }),
             required_bytes: shape.required_bytes,
         }
     );
@@ -316,7 +322,9 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
             * (size_of::<ruster_core::Ipv4FragmentEntrySlot>()
                 + size_of::<ruster_core::Ipv4FragmentHostSlot>())
         + 2 * 256 * (size_of::<DirectoryBucket>() + size_of::<DirectoryNode>())
-        + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840);
+        + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
+        // ARP hold slots and their frames
+        + 64 * (size_of::<ruster_core::ArpHoldSlot>() + 3840);
     assert_eq!(shape.required_bytes, expected);
 
     assert!(validated_with(
@@ -1861,6 +1869,7 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
             |shape: ruster_config::RuntimeStorageShapeV1| ruster_config::RuntimeStorageShapeV1 {
                 fragmentation: None,
                 fragment_tracking: None,
+                arp_hold: None,
                 required_bytes: 0,
                 ..shape
             };
@@ -1871,8 +1880,9 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
         assert_eq!(
             i64::try_from(shape.required_bytes).unwrap()
                 - i64::try_from(defaults.storage_shape().required_bytes).unwrap(),
-            // 64 fragmentation slots and 64 held fragments (NAT-FRAG).
-            2 * 64 * (i64::from(slot_bytes) - 3840)
+            // 64 fragmentation slots, 64 held fragments (NAT-FRAG), and
+            // 64 ARP hold slots (ARP-HOLD).
+            3 * 64 * (i64::from(slot_bytes) - 3840)
         );
     }
     for mtu in [0, 67, 65_536, u64::from(u32::MAX)] {
@@ -1967,10 +1977,15 @@ fn fragmentation_section_defaults_on_and_fails_closed() {
             .map(|shape| shape.held),
         Some(0)
     );
+    // Nor is anything held for ARP (ARP-HOLD: a replay leaves through the
+    // fragmentation slots).
+    assert_eq!(off.storage_shape().arp_hold, None);
+    assert_eq!(off.arp_hold().policy(), None);
     assert_eq!(
         absent.storage_shape().required_bytes - off.storage_shape().required_bytes,
         64 * (size_of::<Ipv4FragmentSlot>() + 3840)
             + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
+            + 64 * (size_of::<ruster_core::ArpHoldSlot>() + 3840)
     );
     // Off ignores the slot count (no storage), but still checks the bound.
     let off_zero = validated(&with("[fragmentation]\nenabled = false\ndatagrams = 0\n"));
@@ -2404,5 +2419,192 @@ fn health_and_watch_keys_are_optional_and_bounded() {
     ] {
         let source = format!("{VALID}\n{body}\n");
         assert!(parse(source.as_bytes()).is_err(), "{body}");
+    }
+}
+
+/// ARP-HOLD: `[resolution.hold]` defaults to the RFC 1122 §2.3.2.2 hold (on,
+/// 3 per next hop, 16 per host, 64 in all, slots of a fragmentation slot's
+/// size); `enabled = false` and no fragmentation have no storage; every
+/// bound fails closed with a value-free code at the field.
+#[test]
+fn resolution_hold_section_defaults_on_and_fails_closed() {
+    use ruster_config::ArpHoldStorageShapeV1;
+    use ruster_core::{ArpHoldPolicy, ArpHoldPolicyError, ArpHoldSlot};
+
+    let with = |keys: &str| {
+        VALID.replacen(
+            "failure-holds = 5\n",
+            &format!("failure-holds = 5\n\n[resolution.hold]\n{keys}"),
+            1,
+        )
+    };
+    let absent = validated(VALID);
+    assert_eq!(absent.arp_hold().policy(), Some(ArpHoldPolicy::DEFAULT));
+    let shape = ArpHoldStorageShapeV1 {
+        packets: 64,
+        slot_bytes: 3840,
+    };
+    assert_eq!(absent.arp_hold().storage(), Some(shape));
+    assert_eq!(absent.storage_shape().arp_hold, Some(shape));
+    let empty = validated(&with(""));
+    assert_eq!(empty.arp_hold(), absent.arp_hold());
+    assert_eq!(empty.storage_shape(), absent.storage_shape());
+
+    // The switch: no hold, no storage; the bounds are not looked at.
+    let off = validated(&with("enabled = false\n"));
+    assert_eq!(off.arp_hold().policy(), None);
+    assert_eq!(off.storage_shape().arp_hold, None);
+    assert_eq!(
+        absent.storage_shape().required_bytes - off.storage_shape().required_bytes,
+        64 * (size_of::<ArpHoldSlot>() + 3840)
+    );
+    // The bounds are checked with the hold off too (fail closed).
+    assert_eq!(
+        error(&with("enabled = false\npackets = 0\n")).code(),
+        ValidationCode::ArpHoldPacketsZero
+    );
+    assert_eq!(
+        error(&with("enabled = false\nper-neighbor = 0\n")).code(),
+        ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerNeighbor)
+    );
+    let off_tuned = validated(&with("enabled = false\npackets = 8\n"));
+    assert_eq!(off_tuned.storage_shape(), off.storage_shape());
+
+    let tuned = validated(&with(
+        "per-neighbor = 64\nper-host = 1\nper-ingress = 64\npackets = 64\n",
+    ));
+    assert_eq!(
+        tuned.arp_hold().policy(),
+        Some(
+            ArpHoldPolicy::new(64, 1)
+                .unwrap()
+                .with_per_ingress(64)
+                .unwrap()
+        )
+    );
+    // Defaults are capped at `packets`; the ingress share is half of it.
+    let small = validated(&with("packets = 1\n"));
+    assert_eq!(
+        small.arp_hold().policy(),
+        Some(
+            ArpHoldPolicy::new(1, 1)
+                .unwrap()
+                .with_per_ingress(1)
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        small.arp_hold().storage(),
+        Some(ArpHoldStorageShapeV1 {
+            packets: 1,
+            slot_bytes: 3840,
+        })
+    );
+    assert_eq!(
+        absent.arp_hold().policy().map(ArpHoldPolicy::per_ingress),
+        Some(32)
+    );
+    for (keys, field) in [
+        (
+            "packets = 4\nper-neighbor = 5\n",
+            "resolution.hold.per-neighbor",
+        ),
+        ("packets = 4\nper-host = 5\n", "resolution.hold.per-host"),
+        (
+            "packets = 4\nper-ingress = 5\n",
+            "resolution.hold.per-ingress",
+        ),
+    ] {
+        let above = error(&with(keys));
+        assert_eq!(
+            above.code(),
+            ValidationCode::ArpHoldBoundAbovePackets,
+            "{keys}"
+        );
+        assert_eq!(above.code().code(), "ARP_HOLD_BOUND_ABOVE_PACKETS");
+        assert_eq!((above.limit(), above.actual()), (Some(4), Some(5)));
+        assert_eq!(dotted(above.path()), field);
+    }
+    // A replay leaves through the fragmentation slots: nothing is held
+    // without them.
+    let no_fragmentation =
+        validated(&VALID.replacen("[tick]", "[fragmentation]\nenabled = false\n\n[tick]", 1));
+    assert_eq!(no_fragmentation.arp_hold().policy(), None);
+    assert_eq!(no_fragmentation.storage_shape().arp_hold, None);
+    // ...and writing `enabled = true` there is refused, not ignored.
+    let explicit = error(
+        &VALID
+            .replacen(
+                "failure-holds = 5\n",
+                "failure-holds = 5\n\n[resolution.hold]\nenabled = true\n",
+                1,
+            )
+            .replacen("[tick]", "[fragmentation]\nenabled = false\n\n[tick]", 1),
+    );
+    assert_eq!(explicit.code(), ValidationCode::ArpHoldWithoutFragmentation);
+    assert_eq!(explicit.code().code(), "ARP_HOLD_WITHOUT_FRAGMENTATION");
+    assert_eq!(dotted(explicit.path()), "resolution.hold.enabled");
+
+    // A document that fits the storage bound only without the hold points
+    // at `[resolution.hold] packets` (ARP-HOLD made the default larger).
+    let without = validated(&with("enabled = false\n"))
+        .storage_shape()
+        .required_bytes;
+    let limits = |max_runtime_bytes| ValidationLimits {
+        max_slots_per_table: 8,
+        max_quote_slots_per_table: 8,
+        max_runtime_bytes,
+    };
+    let rejected = validated_with(VALID, limits(without)).err().unwrap();
+    assert_eq!(rejected.code(), ValidationCode::RuntimeStorageBytesExceeded);
+    assert_eq!(dotted(rejected.path()), "resolution.hold.packets");
+    let rejected = validated_with(VALID, limits(without - 1)).err().unwrap();
+    assert_eq!(dotted(rejected.path()), "");
+
+    for (keys, code, field) in [
+        (
+            "per-neighbor = 0",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerNeighbor),
+            "resolution.hold.per-neighbor",
+        ),
+        (
+            "per-neighbor = 65",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerNeighbor),
+            "resolution.hold.per-neighbor",
+        ),
+        (
+            "per-host = 0",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerHost),
+            "resolution.hold.per-host",
+        ),
+        (
+            "per-ingress = 0",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerIngress),
+            "resolution.hold.per-ingress",
+        ),
+        (
+            "packets = 0",
+            ValidationCode::ArpHoldPacketsZero,
+            "resolution.hold.packets",
+        ),
+    ] {
+        let rejected = error(&with(&format!("{keys}\n")));
+        assert_eq!(rejected.code(), code, "{keys}");
+        assert_eq!(dotted(rejected.path()), field, "{keys}");
+    }
+    assert_eq!(
+        error(&with("per-host = 0\n")).code().code(),
+        "ARP_HOLD_POLICY"
+    );
+    assert_eq!(
+        error(&with("packets = 0\n")).code().code(),
+        "ARP_HOLD_PACKETS_ZERO"
+    );
+    let above = error(&with("packets = 65\n"));
+    assert_eq!(above.code(), ValidationCode::CapacityLimitExceeded);
+    assert_eq!((above.limit(), above.actual()), (Some(64), Some(65)));
+    assert_eq!(dotted(above.path()), "resolution.hold.packets");
+    for unknown in ["queue = 1\n", "enabled = \"yes\"\n", "packets = -1\n"] {
+        assert!(parse(with(unknown).as_bytes()).is_err(), "{unknown}");
     }
 }

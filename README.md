@@ -30,14 +30,15 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
 
 - `ruster-core`: backend所有packetを借用し、Ethernet II / IPv4検証、LPM、
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
-  ARP Request生成action、fixed-capacity dynamic ARP cache、local ICMPv4 Echo
+  ARP Request生成action、解決中のnext hopへのdatagramの有界なholdとreplay（ARP-HOLD）、
+  fixed-capacity dynamic ARP cache、local ICMPv4 Echo
   responder、ICMPv4 Time Exceeded / Destination Unreachable生成、opt-inの
   single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
   stateful forward firewall、forwardしたDF=0 datagramのfragmentation（MTU2 part B）、受信fragmentを
   最初のfragmentの判定へ結びつけるfragment association（NAT-FRAG）と、それらを一workerへbindする
   full composition wrapperを扱う。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
-  `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4 → generated fragments`を
+  `RX（とARP holdのreplay） → resolution timer → failure dispatch → generated ARP → generated ICMPv4 → generated fragments`を
   明示budget付きのsingle-worker tickとして実行する。`TickObserver`はtraceとして渡す
   allocation-freeなsaturating counter sinkで、drop/consume reason別数、tick集計、注入時刻
   だけによるhealth、generation/apply結果、NAT44/firewall/ICMPv4 limiter state tableの占有
@@ -227,17 +228,42 @@ ARP profileはinterfaceごとにlocal IPv4を一つだけ持つ静的snapshotで
 RX bufferをEcho Replyへ書き換えます。local宛ての未実装protocol/controlはroutingへ
 fall throughせず、typed consumeで終端します。
 
-static neighbor missでは元IPv4 packetをbyte不変でrecycleした後、worker-localな固定
+neighbor miss（staticにもfresh dynamicにも無いnext hop）ではworker-localな固定
 storageでARP Requestを生成します。defaultは1秒間隔、total 3 attemptsで、
 traffic-independentなbounded timer pollがretryとterminal `Failed` hold-downを進めます。
 これらのretry回数・schedule・Failed/hold-downはRFC固定値ではなくlocal policyです。
 RX batchとgenerated TX sessionは二相に分離し、生成frameもbackend所有bufferを借用します。
 ARP Reply/RequestはRFC 826 mergeでworker-local cacheへ学習し、matching retry/Failed stateを
-cancelします。packet bufferのhold/replayは行いません。directly-connected targetの最初の
-eligible missだけは別caller-backed slotへ最大548-byte IPv4 quoteをcopyし、少なくとも一つ
-accepted ARP Requestを含むgenerationがfruitlessに終わった場合、bounded dispatchから
-ICMPv4 Destination Unreachable Type 3/Code 1を生成できます。元RXは直ちにrecycleされ、
-ARP成功時にも自動replayしません。gateway failureはCode 1対象外です。
+cancelします。解決中のnext hopへのdatagramはdropせずholdします（ARP-HOLD、RFC 1122 §2.3.2.2と
+RFC 1812 §3.3.2のSHOULD「未解決addressへのdatagramのうち少なくとも最新の一つを保存し、解決時に送る」）。
+decisionはcommit前（TTL、NAT、firewall、IDのどれも未commit）に解決中のmissで終わるので、受信したままの
+frameをcore所有の固定slotへcopyして`ARP_HELD`でconsumeし（backend所有bufferはrecycle）、各RX batchの後に
+next hopがstaticか生きたdynamic neighborになったものを、hold無しで通常のforwarding pathへ受信直後のように
+もう一度通します（route、TTL、firewall、NAT、egress MTU、fragmentationをその時点で判定しcommit）。送るframeは
+MTU2のfragmentation slotへstageし、同じtickの最後のgenerated fragment phase（router自身のARP/ICMPの後、
+`[tick] generated-fragments`の範囲）が送ります。DF=0でMTUを超えるものはそこでfragmentします。
+next hopごとに`per-neighbor`（3）個まで（超えると最古を置き換え、最新を残す）、(ingress, source)ごとに
+`per-host`（16）個まで（`ARP_HOLD_HOST_LIMIT`）、ingress interfaceごとに`per-ingress`（32）個まで
+（`ARP_HOLD_INGRESS_LIMIT`。sourceを詐称した一つのinterfaceからのfloodが他のinterfaceのholdを奪わない）、
+全体で`packets`（64）個まで（`ARP_HOLD_FULL`）。boundは`enabled = false`でも検証し、`packets`を超えるboundは
+`ARP_HOLD_BOUND_ABOVE_PACKETS`、`[fragmentation]` offで`enabled = true`を明示すると
+`ARP_HOLD_WITHOUT_FRAGMENTATION`です。upgrade注意: default storageが248320 bytes増えるので、64 MiBぎりぎりの
+configは変更なしに`RUNTIME_STORAGE_BYTES_EXCEEDED path=resolution.hold.packets`になります（`packets`を下げるか
+`enabled = false`）。
+resolutionが失敗したもの、cancelされたもの、`interval × max-attempts`を過ぎたものは捨てます。
+directly-connected targetのfruitlessなresolutionには従来どおり、最初のeligible missの最大548-byte
+quote（別slot）から、少なくとも一つaccepted ARP Requestを含むgenerationの後にbounded dispatchで
+ICMPv4 Destination Unreachable Type 3/Code 1を生成します（gateway failureはCode 1対象外）。
+apply（SIGHUP reload）はholdを全て捨てます。
+
+```toml
+[resolution.hold]                   # 省略時は全項目default（on）。変更はrestart-required
+enabled = true                      # 省略時true（RFC 1122/1812のSHOULD）。falseはhold無しでNEIGHBOR_UNRESOLVED
+per-neighbor = 3                    # 省略時3、1〜64。(egress, next hop)ごと。超えると最古を置き換え
+per-host = 16                       # 省略時16、1〜packets。(ingress, source)ごと。超えるとARP_HOLD_HOST_LIMIT
+per-ingress = 32                    # 省略時packetsの半分、1〜packets。ingress interfaceごと。超えるとARP_HOLD_INGRESS_LIMIT
+packets = 64                        # 省略時64、1〜64。全体。超えるとARP_HOLD_FULL。[fragmentation] offではholdしない
+```
 
 ARPのsender protocol addressには既定でon-link条件を課しません（RFC 826のmerge/reply
 algorithmどおり。ARP-032）。ingressのconnected/direct routeにもgatewayにも入らないsenderの
@@ -1046,7 +1072,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`を含む）のstorageは63.53 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`、`[resolution.hold] packets = 64`を含む）のstorageは63.77 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>
@@ -1119,7 +1145,7 @@ sudo kill -HUP <pid>                                               # configをre
 - idle時は64 tick spinした後、全portのAF_XDP socketへ`POLLIN`の`poll()`で待ちます（H9。`pollfd`
   配列は起動時に一度だけ確保）。frameが届けば即座に起き（H9前は最大約1 ms遅れた）、signal handlerでも
   戻り、timeoutは`--idle-wait-ms`（既定10 ms、1〜100）です。runtimeのtimerはtickでしか進まないので、
-  resolutionのpending state/hold/queued request、queued ICMPv4 error、unsolicited-SYN hold（B3）、
+  resolutionのpending state/hold/queued request、ARP holdしたdatagram（ARP-HOLD）、queued ICMPv4 error、unsolicited-SYN hold（B3）、
   adapterのTX in flightかowed kick、reload workerへ出ているrequestのどれかがある間は1 ms以下に保ち、
   periodic stats、health sample、link roundの期限も越えません。idleのrouter threadのwake-upは毎秒
   約1000回から約100回に減ります。準備完了のままconsumeできないsocketは1 ms sleepと交互になり
@@ -1180,7 +1206,7 @@ REQ-5）。
 | firewall flow | idle timeoutが延びない。expire済みのflowは落とし、routeのegressが変わった（消えた）flowはrevoke、ruleが変わればapply時に残る全flowを新ruleで再評価し、拒否されるflowはrevoke（以後どちらの向きも通らない） | timeout延長はflush（`flushed:timers`）、`live flows x (rules + 4 x 16)`が4194304 testを超えるとflush（`flushed:reevaluation-budget`、件数であり時間ではない。最大tableで開発host 20〜48 ms、route lookupは1件16単位） |
 | 学習ARP neighbor | interfaceのIPv4 addressが同じ、static neighborに置き換わらない、ARP-031有効時はon-link | そのentryだけ削除 |
 
-pending resolution、ICMPv4 error queue/limiter、TCP unsolicited-SYN holdは常に捨てます。旧設定で
+pending resolution、ARP holdしたdatagram、ICMPv4 error queue/limiter、TCP unsolicited-SYN holdは常に捨てます。旧設定で
 expireしたstateはreloadで生き返りません（timeoutの延長はflush、短縮は引き継いだstateに最終
 activityから効く）。carry中はhash keyがprocessの寿命の間変わらないので、`state = "flush"`のreload
 かrestartで定期的に回してください（毒されたARP学習とNAT/FW stateも同時に消えます）。applyは失敗原子的で、失敗したreloadは
@@ -1355,7 +1381,7 @@ directory外の読めるfileへのsymlinkにatomicに置き換えると`stage=re
 directory内へ置くとapply。uid 0では`/etc/shadow`、`/etc/passwd`、`/proc/1/status`、
 `/proc/<pid>/root/etc/shadow`へのsymlinkが全て`PERMISSION_DENIED`。対照として`--fs-confine off`では
 同じ`/etc/passwd`がreadを通る）、
-RELOAD-CARRYのreload_carry phase（host Aからhost BへのNAT越しの長寿命TCP接続と固定source portのUDP flowが、無関係なfirewall ruleを足すSIGHUP reloadの後も同じsocket・同じpublic portで通り（reload行は全family `carried`、revoke 0）、両方を拒否するruleへのreloadでrevokeされ以後通らない（`firewall-revoked=2`）。AF_PACKET phaseの中でも同じ確認をする）、B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、NAT-FRAGのnatfrag phase（firewall on、host Bのkernelがfragmentした3000-byte UDPがNATを通ってhost Aで再構成され、host Aのraw socketから最後のfragmentを先に送ったoutboundもrouterがholdとreleaseしてhost Bで再構成される。`mode = "refuse"`では届かない）、
+RELOAD-CARRYのreload_carry phase（host Aからhost BへのNAT越しの長寿命TCP接続と固定source portのUDP flowが、無関係なfirewall ruleを足すSIGHUP reloadの後も同じsocket・同じpublic portで通り（reload行は全family `carried`、revoke 0）、両方を拒否するruleへのreloadでrevokeされ以後通らない（`firewall-revoked=2`）。AF_PACKET phaseの中でも同じ確認をする）、B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、NAT-FRAGのnatfrag phase（firewall on、host Bのkernelがfragmentした3000-byte UDPがNATを通ってhost Aで再構成され、host Aのraw socketから最後のfragmentを先に送ったoutboundもrouterがholdとreleaseしてhost Bで再構成される。`mode = "refuse"`では届かない）、ARP-HOLDのarphold phase（全neighbor cacheが空の新しいrouterでhost Aの`ping -c1`がhost Bへ一回目で通り、別の新しいrouterで最初のTCP SYNが再送なし（`tcpi_total_retrans` 0、1 sの初期RTOより十分短いconnect）で通る。`arp_hold.held = replayed = replay_sent = 1`、`NEIGHBOR_UNRESOLVED`なし。`[resolution.hold] enabled = false`では同じpingが失われる）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの

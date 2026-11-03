@@ -65,7 +65,8 @@ fn consume_reason_counters_cover_every_core_reason() {
     assert_eq!(counters.count(ConsumeReason::Ipv4LocalUnsupported), 2);
     assert_eq!(counters.count(ConsumeReason::Ipv4Fragmented), 3);
     assert_eq!(counters.count(ConsumeReason::Ipv4FragmentHeld), 4);
-    assert_eq!(counters.total(), 10);
+    assert_eq!(counters.count(ConsumeReason::ArpHeld), 5);
+    assert_eq!(counters.total(), 15);
     let mut visited = Collect::default();
     ConsumeReasonCounters::default().visit_fields(&mut visited);
     let expected: Vec<_> = ConsumeReason::ALL

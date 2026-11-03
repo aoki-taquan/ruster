@@ -14,7 +14,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use ruster_config::ValidationCode;
-use ruster_core::DropReason;
+use ruster_core::{ConsumeReason, DropReason};
 use ruster_sim_scenario::{
     parse_scenario, run_scenario_file, ApplyClass, ApplyOutcome, ConfigRejection, DriverError,
     ExpectMismatch, FileRole, Progress, RejectReason, SimSession, RUN_SIM_SCHEMA_V1,
@@ -151,7 +151,7 @@ fn wrong_expectations_fail_with_typed_mismatches() {
     let (result, output) = run_text(&wrong_port);
     match result {
         Err(DriverError::Expect {
-            step: 6,
+            step: 5,
             mismatch:
                 ExpectMismatch::Tx {
                     index: 0,
@@ -196,16 +196,35 @@ fn wrong_expectations_fail_with_typed_mismatches() {
 
     let wrong_drop = replace_once(
         &source,
-        "drops = [{ reason = \"NEIGHBOR_UNRESOLVED\", count = 1 }]",
-        "drops = [{ reason = \"NEIGHBOR_UNRESOLVED\", count = 2 }]",
+        "drops = [\n  { reason = \"FIREWALL_RULE_DENIED\", count = 1 },",
+        "drops = [\n  { reason = \"FIREWALL_RULE_DENIED\", count = 2 },",
     );
     let (result, _) = run_text(&wrong_drop);
     assert_eq!(
         result,
         Err(DriverError::Expect {
-            step: 2,
+            step: 19,
             mismatch: ExpectMismatch::Drop {
-                reason: DropReason::NeighborUnresolved,
+                reason: DropReason::FirewallRuleDenied,
+                expected: 2,
+                actual: 1,
+            },
+        })
+    );
+
+    // ARP-HOLD: the first datagram is held, not dropped.
+    let wrong_consume = replace_once(
+        &source,
+        "consumes = [{ reason = \"ARP_HELD\", count = 1 }]",
+        "consumes = [{ reason = \"ARP_HELD\", count = 2 }]",
+    );
+    let (result, _) = run_text(&wrong_consume);
+    assert_eq!(
+        result,
+        Err(DriverError::Expect {
+            step: 2,
+            mismatch: ExpectMismatch::Consume {
+                reason: ConsumeReason::ArpHeld,
                 expected: 2,
                 actual: 1,
             },
@@ -232,7 +251,7 @@ fn wrong_expectations_fail_with_typed_mismatches() {
     assert_eq!(
         result,
         Err(DriverError::ApplyMismatch {
-            step: 41,
+            step: 40,
             expected: ApplyOutcome::Rejected {
                 reason: Some(RejectReason::Invalid)
             },
@@ -304,7 +323,7 @@ fn invalid_paths_and_inputs_fail_typed() {
         result,
         Err(DriverError::Read {
             file: FileRole::Config,
-            step: Some(28),
+            step: Some(27),
             kind: io::ErrorKind::NotFound,
         })
     );

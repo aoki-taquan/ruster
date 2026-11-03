@@ -60,7 +60,7 @@ All commands assume a dedicated router host or network namespace. Replace
   limit-bytes=L required-bytes=R`). Root has `CAP_IPC_LOCK`. The estimate is
   a lower bound (section 12).
 - **Memory (RAM)**: the runtime tables are ordinary heap, not memlocked;
-  63.53 MiB for the largest config `ruster run` accepts (64 MiB bound),
+  63.77 MiB for the largest config `ruster run` accepts (64 MiB bound),
   plus the UMEM (see "Validation limits and memory" below).
 - **Dedicated network namespace (recommended)**: run the router in its own
   namespace (`ip netns exec <ns> ruster run ...`) that holds only the port
@@ -209,7 +209,7 @@ whole-document storage, which has no path.
 |---|---|---|---|
 | quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 592, and 592 bytes), so the bound is memory: at 65536 these three alone would need 115.0 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 63.53 MiB (with `[fragmentation] datagrams = 1024`, MTU2 part B, and `[fragment-tracking] entries = 16384, held-fragments = 512`, NAT-FRAG; 64.00 MiB with `mappings-per-host` set on both NAT44 protocols, only 12 fragmentation slots, and `[fragment-tracking] mode = "refuse"`, N3, and 63.97 MiB with only `sessions-per-host` and `mode = "refuse"`, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 63.77 MiB (with `[fragmentation] datagrams = 1024`, MTU2 part B, `[fragment-tracking] entries = 16384, held-fragments = 512`, NAT-FRAG, and `[resolution.hold] packets = 64`, ARP-HOLD; 64.00 MiB with `mappings-per-host` set on both NAT44 protocols, only 12 fragmentation slots, `[fragment-tracking] mode = "refuse"`, and `[resolution.hold] enabled = false`, N3, and 63.97 MiB with only `sessions-per-host`, `mode = "refuse"`, and the hold off, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.70 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -310,7 +310,9 @@ A directory has one 4-byte bucket per slot, rounded up to a power of two,
 and one 24-byte node per slot (exact for the powers of two above). `ruster
 validate` prints the total as `storage-bytes=`. The largest config that
 `run` accepts (`fixtures/limits/router-production-max.toml`) needs
-66617536 bytes (63.53 MiB). NAT-FRAG added the largest fragment association
+66865856 bytes (63.77 MiB). ARP-HOLD added the largest hold table (64
+slots of 40 + 3840 bytes: 248320 bytes; 66617536 bytes, 63.53 MiB,
+before). NAT-FRAG added the largest fragment association
 table (16384 entries of an entry, a host slot, and two directory buckets
 and nodes, and 512 held fragments of 8 + 3840 bytes: 5.32 MiB; 61042880
 bytes, 58.22 MiB, before). MTU2 part B added 1024 fragmentation slots
@@ -330,7 +332,7 @@ raised states, actions, dynamic neighbors, and ICMPv4 error states to
 
 Worst-case resident memory of `ruster run`:
 
-- Runtime storage: at most 64 MiB (63.53 MiB with today's slot sizes).
+- Runtime storage: at most 64 MiB (63.77 MiB with today's slot sizes).
   It is allocated once at startup, before the privilege preflight, and
   filled, so it is resident from the start. If the allocation fails,
   startup reports `stage=storage code=ALLOCATION.<service>` and exits 1.
@@ -1068,6 +1070,104 @@ validation codes `FRAGMENT_TRACKING_POLICY` and
 `FRAGMENT_TRACKING_ENTRIES_ZERO`. To keep the old behaviour set
 `[fragment-tracking] mode = "refuse"` (restart).
 
+### First datagrams to an unresolved neighbour (ARP-HOLD)
+
+RFC 1122 §2.3.2.2 and RFC 1812 §3.3.2: the router should save at least the
+latest datagram to an address it is still resolving by ARP and send it when
+the address resolves. With the default `[resolution.hold]` it does:
+
+- A forwarded datagram whose next hop (the gateway, or the destination on
+  a connected network, on either side of the NAT) has no static or live
+  dynamic neighbour, and for which an ARP request is queued, retried, or
+  already pending, is copied into a hold slot and the frame is returned
+  (`consume.ARP_HELD`). Nothing is committed for it yet: no NAT mapping,
+  no firewall state, no TTL decrement. The firewall's rules still apply
+  first: a denied datagram is never held.
+- After every RX batch the held datagrams whose next hop is now known are
+  forwarded again from scratch (route, TTL, firewall, NAT, MTU, and
+  fragmentation decided then) and sent at the end of the same tick, after
+  the router's own ARP requests and ICMP errors, within `[tick]
+  generated-fragments`, through the fragmentation slots (`[fragmentation]
+  datagrams` bounds how many one tick replays; the rest go next tick,
+  `arp_hold.deferred`). A DF-clear datagram above the egress MTU is
+  fragmented then; a DF-set one gets Fragmentation Needed.
+- So `ping -c1` through the router succeeds on the first try with an empty
+  neighbour cache, the first TCP SYN goes out without waiting for its
+  retransmission, and a DNS query is not retried.
+- When the resolution fails (three requests one second apart by default),
+  the held datagrams are discarded (`arp_hold.failed` or `expired`); the
+  sender gets the same single Destination Unreachable (Host) as before for
+  a directly connected destination.
+- Every applied reload (SIGHUP) discards the held datagrams
+  (`arp_hold.flushed`), whatever `[reload] state` carries.
+
+```toml
+[resolution.hold]      # optional; absent = these defaults; restart-required
+enabled = true         # false: drop as NEIGHBOR_UNRESOLVED (the behaviour before ARP-HOLD)
+per-neighbor = 3       # 1..=64 per (egress, next hop); a new one replaces the oldest
+per-host = 16          # 1..=packets per (ingress, source); beyond: drop.ARP_HOLD_HOST_LIMIT
+per-ingress = 32       # 1..=packets per ingress interface; beyond: drop.ARP_HOLD_INGRESS_LIMIT
+                       # (default: half of packets; = packets does not partition)
+packets = 64           # 1..=64 in all; beyond: drop.ARP_HOLD_FULL
+```
+
+Each slot is a fragmentation slot's size (14 + the longest datagram a
+port can receive, 3840 bytes with AF_XDP frames) plus a 40-byte record:
+the default table is 248320 bytes. Nothing is held with `[fragmentation]
+enabled = false` (the replay leaves through its slots). The maximum of 64
+is what the 64 MiB storage bound leaves when every other table is at its
+production limit.
+
+Tuning: `per-neighbor` is how many first datagrams of new flows to one
+next hop survive (a host opening a few connections at once to a new
+gateway); raising it costs nothing until used. Lower `packets` (or turn
+the hold off) to bound the copy work a flood of datagrams to unresolvable
+addresses on a connected network can cause: each such datagram is copied
+once (cold path) and costs a walk of at most `packets` records.
+
+Counters (`ruster-run-stats`): `arp_hold.held` (= `consume.ARP_HELD`),
+`replaced`, `refused_full`/`refused_host_limit`/`refused_ingress_limit`/`refused_too_large`
+(= `drop.ARP_HOLD_FULL`/`ARP_HOLD_HOST_LIMIT`/`ARP_HOLD_INGRESS_LIMIT`/`ARP_HOLD_TOO_LARGE`),
+`replayed` (decided again), of which `replay_sent` (staged whole),
+`replay_fragmented`, `replay_dropped` (for example a NAT mapping that
+expired meanwhile; a replay's drops are not counted again under `drop.*`:
+the frame was already counted as `consume.ARP_HELD`), `replay_unstaged`
+(committed but no fragmentation slot left; a first fragment reserves room
+for the fragments the association table holds, so this stays 0),
+`deferred`, `failed` (the resolution failed), `cancelled` (cancelled, or the
+learned neighbour expired while the replay waited for room), `expired`, and
+`flushed`. Every bound is checked also with `enabled = false`; a bound
+above `packets` is `ARP_HOLD_BOUND_ABOVE_PACKETS` (the defaults are capped
+at `packets`), and `enabled = true` written with `[fragmentation] enabled =
+false` is `ARP_HOLD_WITHOUT_FRAGMENTATION`.
+
+| Symptom | Counters | Meaning / action |
+|---|---|---|
+| first datagrams of new flows still lost | `drop.NEIGHBOR_UNRESOLVED` | the hold is off, there is no fragmentation, or the resolution could not start (`resolution.state_full`/`action_full`, a Failed hold-down) |
+| first datagrams lost under load | `drop.ARP_HOLD_FULL`, `drop.ARP_HOLD_HOST_LIMIT`, `drop.ARP_HOLD_INGRESS_LIMIT` | many unresolved next hops at once (a scan of a connected network, or a flood from one interface?): raise `packets`/`per-host`/`per-ingress` or find the source |
+| only the last few of a burst arrive | `arp_hold.replaced` | `per-neighbor` datagrams per next hop are kept: raise it |
+| held datagrams sent late | `arp_hold.deferred` | not enough free fragmentation slots per tick: raise `[fragmentation] datagrams` |
+| held datagrams never sent | `arp_hold.failed`, `expired`, `resolution.timed_out` | the neighbour never answered ARP |
+
+Upgrade note (ARP-HOLD, behaviour change): the hold is on by default, also
+for configs without `[resolution.hold]`. Datagrams that were dropped as
+`drop.NEIGHBOR_UNRESOLVED` are now held and sent, so that counter falls to
+(near) 0 and `consume.ARP_HELD` rises; firewall and NAT state for them is
+created when they are sent, not dropped. The default table adds 248320
+bytes of storage (the maximal production config is 66865856 bytes). **A
+config that just fitted 64 MiB fails after the upgrade with no change of
+its own**: `stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED
+path=resolution.hold.packets` (the path is set when the document fits
+without the hold). Lower `[resolution.hold] packets` (each slot is about
+3.8 KiB) or set `enabled = false`, before upgrading a router whose
+`ruster validate` shows `storage-bytes=` above 66860000.
+New drop codes 201 `ARP_HOLD_FULL`, 202 `ARP_HOLD_HOST_LIMIT`, 203
+`ARP_HOLD_TOO_LARGE`, 204 `ARP_HOLD_INGRESS_LIMIT`; new consume code
+`ARP_HELD`; new stats section `arp_hold.*`; new validation codes
+`ARP_HOLD_POLICY`, `ARP_HOLD_PACKETS_ZERO`, `ARP_HOLD_BOUND_ABOVE_PACKETS`,
+and `ARP_HOLD_WITHOUT_FRAGMENTATION`. To keep the old behaviour set
+`[resolution.hold] enabled = false` (restart).
+
 ### Startup retry (XDP-045)
 
 Right after a previous run (or a crash) the kernel releases the old
@@ -1514,8 +1614,8 @@ line. Stats consumers read `stats` of the `STATS` objects instead of the
    ```
 
    Every reload flushes pending ARP resolution, failure holds, queued
-   ICMPv4 errors and their rate limiter, and TCP unsolicited-SYN holds
-   (all short-lived and bound to the old tables). With `carry` (the default)
+   ICMPv4 errors and their rate limiter, TCP unsolicited-SYN holds, and
+   datagrams held for ARP (ARP-HOLD) (all short-lived and bound to the old tables). With `carry` (the default)
    it keeps, per family, the state the new document does not invalidate,
    with its hash key, so established connections through the NAT continue:
 
@@ -2905,6 +3005,15 @@ What it proves, on the runner's kernel only:
   `consume.IPV4_FRAGMENT_HELD`, released, and no fragment refused. With
   `[fragment-tracking] mode = "refuse"` the same fragments never arrive
   (`drop.FIREWALL_FRAGMENT_UNSUPPORTED`).
+  Added by ARP-HOLD (`priv_run_arphold*`): with every neighbour cache empty
+  (a fresh router, host A's and host B's caches flushed), `ping -c1` from
+  host A to host B succeeds on the first try, and on another fresh router
+  the first TCP SYN to host B gets through without a retransmission
+  (`tcpi_total_retrans` 0, connect well under the 1 s initial RTO); the
+  final counters show `arp_hold.held` = `replayed` = `replay_sent` = 1 and
+  no `NEIGHBOR_UNRESOLVED`. With `[resolution.hold] enabled = false` the
+  same single ping is lost (`drop.NEIGHBOR_UNRESOLVED=1`). Not repeated over
+  AF_PACKET (the hold is in the core, the same for both backends).
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one

@@ -350,6 +350,13 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
         self.slots.len()
     }
 
+    /// Slots a datagram can still be staged in this tick (ARP-HOLD sizes
+    /// its replay by it).
+    #[must_use]
+    pub const fn free_slots(&self) -> usize {
+        self.slots.len() - self.len
+    }
+
     #[must_use]
     pub const fn slot_bytes(&self) -> usize {
         self.slot_bytes

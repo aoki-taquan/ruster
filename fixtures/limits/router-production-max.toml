@@ -189,6 +189,11 @@ datagrams = 1024
 entries = 16384
 held-fragments = 512
 
+# ARP-HOLD: the most held datagrams (each a record and a fragmentation slot's
+# 3840 bytes).
+[resolution.hold]
+packets = 64
+
 [backend]
 kind = "af-xdp"
 

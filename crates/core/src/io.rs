@@ -249,15 +249,22 @@ pub enum ConsumeReason {
     /// counted) when it is refused or does not arrive in time. The received
     /// frame is recycled.
     Ipv4FragmentHeld,
+    /// A forwarded IPv4 datagram whose next hop is being resolved by ARP was
+    /// copied, unchanged, into a core-owned hold slot (ARP-HOLD, RFC 1122
+    /// §2.3.2.2); it is decided and sent anew when the next hop resolves,
+    /// and discarded (and counted) when the resolution fails. The received
+    /// frame is recycled.
+    ArpHeld,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
         Self::Ipv4FragmentHeld,
+        Self::ArpHeld,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -269,6 +276,7 @@ impl ConsumeReason {
             Self::Ipv4LocalUnsupported => 1,
             Self::Ipv4Fragmented => 2,
             Self::Ipv4FragmentHeld => 3,
+            Self::ArpHeld => 4,
         }
     }
 
@@ -279,6 +287,7 @@ impl ConsumeReason {
             Self::Ipv4LocalUnsupported => "IPV4_LOCAL_UNSUPPORTED",
             Self::Ipv4Fragmented => "IPV4_FRAGMENTED",
             Self::Ipv4FragmentHeld => "IPV4_FRAGMENT_HELD",
+            Self::ArpHeld => "ARP_HELD",
         }
     }
 }
@@ -441,7 +450,8 @@ mod tests {
                 "ARP_CONTROL",
                 "IPV4_LOCAL_UNSUPPORTED",
                 "IPV4_FRAGMENTED",
-                "IPV4_FRAGMENT_HELD"
+                "IPV4_FRAGMENT_HELD",
+                "ARP_HELD"
             ]
         );
     }

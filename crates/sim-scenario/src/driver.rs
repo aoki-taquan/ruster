@@ -565,7 +565,8 @@ impl SimRun<'_> {
         )
         .with_nat44_icmp(active.nat44_icmp())
         .with_fragmentation(active.fragmentation())
-        .with_fragment_tracking(active.fragment_tracking());
+        .with_fragment_tracking(active.fragment_tracking())
+        .with_arp_hold(active.arp_hold());
         let mut line = Line::event("final");
         line.u64("at_ms", self.now);
         line.u64("generation", self.generation().get());
