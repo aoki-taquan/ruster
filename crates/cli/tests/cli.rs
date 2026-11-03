@@ -2041,3 +2041,101 @@ fn run_json_log_format_reports_refusals_as_json_lines() {
     assert_eq!(status(&bad), 2);
     assert!(text(&bad.stderr).contains("option --log-format needs text or json"));
 }
+
+/// INPUT-FW: `[firewall.input]` changes are reloadable; the plan lists the
+/// default action and each rule, and spelling out the defaults is no
+/// change. `validate` refuses `icmp-type` without `icmp`.
+#[test]
+fn plan_prints_input_firewall_changes_as_reloadable() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let with = |name: &str, table: &str| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source.replacen("[tick]", &format!("{table}\n[tick]"), 1),
+        )
+        .unwrap();
+        path
+    };
+    let stealth = with(
+        "inputfw-stealth.toml",
+        "[firewall.input]\ndefault-action = \"deny\"\n\n\
+         [[firewall.input.rules]]\nid = 1\ningress = \"lan\"\naction = \"accept\"\n\n\
+         [[firewall.input.rules]]\nid = 2\ningress = \"wan\"\nsource = \"198.51.100.0/24\"\n\
+         protocol = \"icmp\"\nicmp-type = 8\naction = \"accept\"\n\n\
+         [[firewall.input.rules]]\nid = 3\nprotocol = \"udp\"\n\
+         destination-ports = { first = 53, last = 53 }\naction = \"deny\"\n",
+    );
+    let defaults = with(
+        "inputfw-defaults.toml",
+        "[firewall.input]\ndefault-action = \"accept\"\n",
+    );
+    let invalid = with(
+        "inputfw-invalid.toml",
+        "[[firewall.input.rules]]\nid = 1\nprotocol = \"tcp\"\nicmp-type = 8\naction = \"deny\"\n",
+    );
+    assert_eq!(
+        status(&ruster(&["validate".as_ref(), stealth.as_os_str()])),
+        0
+    );
+
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), stealth.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!(
+            "plan: reloadable\nrestart-required: none\nchanges: 4\n  \
+             firewall-input-rule + id 1 any if1 0.0.0.0/0 -> 0.0.0.0/0 accept\n  \
+             firewall-input-rule + id 2 icmp type 8 if2 198.51.100.0/24 -> 0.0.0.0/0 accept\n  \
+             firewall-input-rule + id 3 udp dport 53-53 any 0.0.0.0/0 -> 0.0.0.0/0 deny\n  \
+             firewall-input-default ~ accept -> deny\n{CARRY_ALL}"
+        )
+    );
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), defaults.as_os_str()]);
+    assert_eq!(status(&plan), 0);
+    assert_eq!(
+        text(&plan.stdout),
+        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{CARRY_ALL}")
+    );
+    let refused = ruster(&["validate".as_ref(), invalid.as_os_str()]);
+    assert_eq!(status(&refused), 2);
+    assert!(
+        text(&refused.stderr).contains("FIREWALL_INPUT_ICMP_TYPE_NOT_ICMP"),
+        "{}",
+        text(&refused.stderr)
+    );
+}
+
+/// core L4 of #353: an input rule whose destination covers no address it
+/// can see (the ingress interface's, or the NAT public address with
+/// `[nat44.icmp]`) is warned about by `validate`, value-free, and still
+/// accepted.
+#[test]
+fn validate_warns_about_an_input_rule_destination_that_is_not_local() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let path = dir.join("inputfw-destination.toml");
+    let rules = "[[firewall.input.rules]]\nid = 4\ningress = \"lan\"\n\
+                 destination = \"203.0.113.2/32\"\naction = \"accept\"\n\n\
+                 [[firewall.input.rules]]\nid = 5\ndestination = \"203.0.113.2/32\"\n\
+                 action = \"accept\"\n\n\
+                 [[firewall.input.rules]]\nid = 6\ndestination = \"10.9.9.9/32\"\n\
+                 action = \"accept\"\n\n[tick]";
+    fs::write(&path, source.replacen("[tick]", rules, 1)).unwrap();
+    let output = ruster(&["validate".as_ref(), path.as_os_str()]);
+    assert_eq!(status(&output), 0, "{}", text(&output.stderr));
+    let stderr = text(&output.stderr);
+    assert!(!stderr.contains("rule=5"), "{stderr}");
+    assert!(
+        stderr.contains("ruster: warning: INPUT_FIREWALL_DESTINATION_NOT_LOCAL rule=6\n"),
+        "{stderr}"
+    );
+    // router-v1 has no [nat44.icmp]: the WAN address is never seen on the
+    // LAN.
+    assert!(
+        stderr.contains("ruster: warning: INPUT_FIREWALL_DESTINATION_NOT_LOCAL rule=4\n"),
+        "{stderr}"
+    );
+}

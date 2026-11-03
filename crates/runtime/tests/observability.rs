@@ -423,7 +423,7 @@ fn service_counters_render_in_fixed_order(
         ("nat44_udp", 19),
         ("nat44_tcp", 40),
         ("nat44_icmp", 16),
-        ("firewall", 14),
+        ("firewall", 16),
         ("fragmentation", 9),
         ("fragment_tracking", 18),
         ("arp_hold", 17),

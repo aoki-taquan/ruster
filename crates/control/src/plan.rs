@@ -34,10 +34,10 @@ use ruster_config::{
     ValidatedAfXdpPortV1, ValidatedBackendV1, ValidatedConfigV1,
 };
 use ruster_core::{
-    FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    Nat44CarryIdentity, Nat44Filtering, Nat44TcpHashKey, Nat44TcpInboundRst, Nat44UdpHashKey,
-    Neighbor, PublicationQuiescence, ResolutionHashKey, Route, SourceValidationBinding,
-    StateCarryConflict, StateCarryOutcome,
+    FirewallHashKey, FirewallRule, FirewallRuleId, IfId, InputFirewallAction, InputFirewallRule,
+    Interface, Ipv4Address, LocalIpv4Binding, Nat44CarryIdentity, Nat44Filtering, Nat44TcpHashKey,
+    Nat44TcpInboundRst, Nat44UdpHashKey, Neighbor, PublicationQuiescence, ResolutionHashKey, Route,
+    SourceValidationBinding, StateCarryConflict, StateCarryOutcome,
 };
 
 use crate::{
@@ -404,6 +404,9 @@ pub struct ApplyPlan {
     ipv4_origin_changed: bool,
     arp_policy_changed: bool,
     source_validation: Box<[Change<SourceValidationBinding>]>,
+    input_firewall_rules: Box<[Change<InputFirewallRule>]>,
+    input_firewall_rule_order_changed: bool,
+    input_firewall_default: Option<Delta<InputFirewallAction>>,
     nat44_udp: NatChange,
     nat44_tcp: NatChange,
     nat44_icmp_presence: Option<Delta<bool>>,
@@ -493,6 +496,20 @@ impl ApplyPlan {
                 current.source_validation(),
                 next.source_validation(),
                 |binding| binding.interface,
+            ),
+            input_firewall_rules: diff(
+                old.firewall.input_rules(),
+                new.firewall.input_rules(),
+                |rule| rule.id(),
+            ),
+            input_firewall_rule_order_changed: ids_order_changed(
+                old.firewall.input_rules(),
+                new.firewall.input_rules(),
+                |rule| rule.id(),
+            ),
+            input_firewall_default: delta(
+                old.firewall.input_default(),
+                new.firewall.input_default(),
             ),
             nat44_udp: nat_change(&old, &new, Protocol::Udp),
             nat44_tcp: nat_change(&old, &new, Protocol::Tcp),
@@ -623,6 +640,28 @@ impl ApplyPlan {
     #[must_use]
     pub fn source_validation(&self) -> &[Change<SourceValidationBinding>] {
         &self.source_validation
+    }
+
+    /// `[[firewall.input.rules]]` changes (INPUT-FW), by rule id.
+    /// Reloadable: the rules are part of the forwarding snapshot that every
+    /// reload replaces, and the input firewall keeps no state.
+    #[must_use]
+    pub fn input_firewall_rules(&self) -> &[Change<InputFirewallRule>] {
+        &self.input_firewall_rules
+    }
+
+    /// Whether input rules present in both documents changed their
+    /// relative first-match order (INPUT-FW).
+    #[must_use]
+    pub const fn input_firewall_rule_order_changed(&self) -> bool {
+        self.input_firewall_rule_order_changed
+    }
+
+    /// The `[firewall.input] default-action` change, if any (INPUT-FW,
+    /// reloadable).
+    #[must_use]
+    pub const fn input_firewall_default(&self) -> Option<Delta<InputFirewallAction>> {
+        self.input_firewall_default
     }
 
     #[must_use]
@@ -885,11 +924,17 @@ fn label_changes(
 }
 
 fn common_order_changed(old: &[FirewallRule], new: &[FirewallRule]) -> bool {
-    let common = |rules: &[FirewallRule], other: &[FirewallRule]| -> Vec<FirewallRuleId> {
+    ids_order_changed(old, new, |rule| rule.id())
+}
+
+/// Whether the ids present in both rule lists changed their relative
+/// order (forward and input rules alike).
+fn ids_order_changed<T>(old: &[T], new: &[T], id: impl Fn(&T) -> FirewallRuleId) -> bool {
+    let common = |rules: &[T], other: &[T]| -> Vec<FirewallRuleId> {
         rules
             .iter()
-            .map(|rule| rule.id())
-            .filter(|id| other.iter().any(|rule| rule.id() == *id))
+            .map(&id)
+            .filter(|candidate| other.iter().any(|rule| id(rule) == *candidate))
             .collect()
     };
     common(old, new) != common(new, old)

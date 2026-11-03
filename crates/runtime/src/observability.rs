@@ -1553,6 +1553,7 @@ impl ObservableFields for ServiceCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,
             state_full, clock_regressions, config_mismatches, reconciliations, states_expired,
             state_probes, maintenance_steps, rule_evaluations, states_revoked,
+            input_rule_evaluations, input_truncated_denied,
         }}
         visit_counts! {v, "fragmentation", self.fragmentation, Ipv4FragmentationCounters {
             queued, fragmented, fragments, dropped_unavailable, dropped_frame_too_large,

@@ -27,8 +27,9 @@ use std::fmt::Write as _;
 use ruster_config::{ValidatedAfPacketPortV1, ValidatedAfXdpPortV1};
 use ruster_control::{ApplyPlan, BackendChange, Change, Delta, FlushCount, NatChange, StateFlush};
 use ruster_core::{
-    FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, Route, SourceValidationBinding,
+    FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId, InputFirewallProtocol,
+    InputFirewallRule, Interface, Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, Route,
+    SourceValidationBinding,
 };
 
 fn ip(address: Ipv4Address) -> String {
@@ -137,6 +138,39 @@ fn rule(rule: &FirewallRule) -> String {
         dport.first(),
         dport.last(),
         action
+    )
+}
+
+/// `id 1 icmp type 8 if2 198.51.100.0/24 -> 0.0.0.0/0 accept` (INPUT-FW).
+fn input_rule(rule: &InputFirewallRule) -> String {
+    let protocol = match rule.protocol() {
+        InputFirewallProtocol::Any => "any".to_owned(),
+        InputFirewallProtocol::Icmp { icmp_type: None } => "icmp".to_owned(),
+        InputFirewallProtocol::Icmp {
+            icmp_type: Some(kind),
+        } => format!("icmp type {kind}"),
+        InputFirewallProtocol::Tcp { destination_ports } => format!(
+            "tcp dport {}-{}",
+            destination_ports.first(),
+            destination_ports.last()
+        ),
+        InputFirewallProtocol::Udp { destination_ports } => format!(
+            "udp dport {}-{}",
+            destination_ports.first(),
+            destination_ports.last()
+        ),
+    };
+    let (source, destination) = (rule.source(), rule.destination());
+    format!(
+        "id {} {} {} {}/{} -> {}/{} {}",
+        rule.id().0,
+        protocol,
+        side(rule.ingress()),
+        ip(source.address()),
+        source.prefix_len(),
+        ip(destination.address()),
+        destination.prefix_len(),
+        rule.action().label()
     )
 }
 
@@ -375,6 +409,22 @@ pub fn render(plan: &ApplyPlan) -> String {
     }
     if plan.firewall_policy_changed() {
         lines.push("firewall-policy ~ changed".to_owned());
+    }
+    changes(
+        &mut lines,
+        "firewall-input-rule",
+        plan.input_firewall_rules(),
+        input_rule,
+    );
+    if plan.input_firewall_rule_order_changed() {
+        lines.push("firewall-input-rule-order ~ changed".to_owned());
+    }
+    if let Some(Delta { old, new }) = plan.input_firewall_default() {
+        lines.push(format!(
+            "firewall-input-default ~ {} -> {}",
+            old.label(),
+            new.label()
+        ));
     }
     if plan.ipv4_origin_changed() {
         lines.push("ipv4-origin ~ changed".to_owned());

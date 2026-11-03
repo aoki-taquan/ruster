@@ -439,10 +439,11 @@ transit datagramについてのParameter ProblemとCode 13は、errorがrouteや
 無いとき（firewallはoption付きや切れたdatagramを評価できないので、そのときはsilent）だけです。
 NATとの関係: errorはすべて受信したままの（翻訳前の）datagramを引用し、ingress側のsourceへreverse
 routeで返るので翻訳は不要です（outbound NATのinside hostもinbound到着のoutside hostも自分の送った
-datagramを受け取る）。router宛てdatagramはforward firewallを通らない（input firewallは未実装、
-ICMP4-028）ので、Protocol/Port Unreachableはfirewall policyに関係なくrouterのどのaddressでも返り、
-外部からのprotocol/port scanに答えます。黙らせる手段はrouter全体のswitchだけです（interface/zone
-別はICMP4-027でdeferred）。Admin Prohibitedはplainなforward plan（翻訳前に判定するNAT outboundを
+datagramを受け取る）。router宛てdatagramはforward firewallを通らず、input firewall
+（`[firewall.input]`、INPUT-FW、ICMP4-028）が判定します。defaultは`accept`なので、tableが無ければ
+Protocol/Port Unreachableはforward policyに関係なくrouterのどのaddressでも返り、外部からの
+protocol/port scanに答えます。input denyはこれらのerrorとEcho Replyより優先し、ingress ruleで
+interface別に黙らせられます（ICMP4-027）。router全体のswitchも引き続き使えます。Admin Prohibitedはplainなforward plan（翻訳前に判定するNAT outboundを
 含む）のdenyだけが対象です。router宛てのerrorはNAT public address宛てのUDP/TCPには出ません（それらは
 NAT44 inboundの判定のまま）。NAT inbound/hairpin/ICMP query NATの経路のfirewall denyはCode 13を
 出さずsilentのままです（residual）。
@@ -2220,12 +2221,15 @@ differential testのoracleです。
 
 memoryはsnapshot memory（runtime storageの`storage-bytes`には含めない）で、ownerと一緒に
 解放されます。上限config（4096 route、4096 neighbor、interfaceごとに一つのaddress、
-256 interface）のworst shape（隣接しない4096 direct routeと4096 neighbor）で約262 KiB、
-reload中は旧generationの分と合わせて約524 KiBです
+256 interface、256 input firewall rule）のworst shape（隣接しない4096 direct routeと4096
+neighbor、per-ingress listが最大になる256 input rule）で約392 KiB、reload中は旧generationの分と
+合わせて約784 KiBです
 （`ValidatedForwardingOwner::index_heap_bytes`）。publication costはO(n log n)の
 sortだけです。snapshotは`identity`（8 word）を保持せず借用sliceから都度作るので
 （O(1)）、index参照を足しても`ForwardingSnapshot`は144→88 bytesです（RT-002）。URPFで
-source validation bindingの借用slice（16 bytes）を足し104 bytesになりました。
+source validation bindingの借用slice（16 bytes）を足し104 bytes、ARP-033で112 bytes、INPUT-FWで
+input firewall ruleの借用slice（16 bytes、default actionはARP/IPv4 origin policyのpaddingに入る）を
+足し128 bytesになりました（`FullServiceView`の上限は712→728 bytes）。
 
 ### IPv4 source address validation (URPF)
 
@@ -2256,6 +2260,55 @@ limiter消費）が閉じます。WAN egressのclass 0と、on-linkのWAN addres
 routeを数えます（Cisco/Juniperのstrictとは違う）。`ruster`は`/0`のegressに置いたallow-defaultなしの
 `loose`と、routeが一つも出ないinterfaceの`strict`を値なしで警告します（validate、起動時、reload）。
 `SnapshotError`はURPFのvariantを足したので`#[non_exhaustive]`にしました。
+
+### Input (local-delivery) firewall (INPUT-FW)
+
+`[firewall.input]`（`default-action`、`[[firewall.input.rules]]`）はrouter自身のaddress宛て
+datagram（ingress-scopedなlocal delivery、ICMP4-001）のstatelessなfirst-match policyです。
+`InputFirewallRule`はforward ruleの`FirewallRuleId`、`FirewallInterface`、`FirewallIpv4Prefix`、
+`FirewallPortRange`とそのmatcherを再利用し（`firewall::input`はfirewall moduleの子moduleで
+private matcherを共有）、selectorはingress、source/destination prefix、`InputFirewallProtocol`
+（`Any`、`Icmp{icmp_type}`、`Tcp{destination_ports}`、`Udp{destination_ports}`）、actionは
+`Accept`/`Deny`です。ruleはforward ruleと同じく検証済みconfigにあり、
+`ValidatedForwardingOwner::with_input_firewall`がownerに持ち、snapshotはその借用sliceと
+default actionです（runtime storageもstate tableも無い。storage shapeと最大production configの
+67,050,272 bytes、per-host版の67,106,224 bytesは不変）。
+
+判定点は`decide_local_ipv4_with_errors`の先頭（ingressのaddress宛ての最後の分岐と、inside
+からpublic address宛てのICMP query requestの両方の入口）と、`truncated_parameter_problem`の
+local宛ての分岐です。どちらもL2検査、martian source/destination検査、URPF（`validate_ipv4_ingress`）
+の後、local判定（Echo、ICMP-ERRのProtocol/Port Unreachable、Parameter Problem、consume）の前です。
+NAT inbound（public address宛てUDP/TCP、ICMP query NATのreply、NAT ICMPv4 error candidate、
+public address宛てfragmentのassociation）はこの分岐より前に別経路へ行くので、public address =
+WAN addressでも判定しません。transitはこの分岐に来ないので追加costはゼロ、local経路ではrule無しで
+`Accept`ならbranch一つ、そうでなければcoldな関数でruleをwalkします（allocation、Mutex、String、
+dyn、packet cloneなし）。router addressへ届く任意のhostがこのwalkを起こせるので（#353 sec M1）、
+ruleは最大256（`INPUT_FIREWALL_MAX_RULES`、configは`LIST_TOO_LONG`、coreは`TooManyRules`）で、
+ownerはpublication時に`InputFirewallIndex`（`ForwardingIndex`の一部）を作ります: ingress
+interface別・protocol class別（ICMP、TCP、UDP、他）のrule slot list（u16）をfirst-match順に持ち、
+`ingress`/`protocol`の無いruleは該当する全listの元の位置に入り、ruleに名前の無いinterfaceは一組の
+共有listを使います。datagramは名前付きinterfaceのbinary searchと自分のlistのwalkだけ
+（最悪256 test）で、判定はlinear walkと同じです（differential test）。ownerを持たないsnapshotは
+linear walkです。listはsnapshot memory（256 ruleで最大約130 KiB、`index_heap_bytes`に含む）で、
+runtime storageではありません。rule test数は`FirewallCounters::input_rule_evaluations`
+（forward firewall runtimeがあるworkerで）に数えます。denyは`IPV4_INPUT_FIREWALL_RULE_DENIED`（210）/
+`IPV4_INPUT_FIREWALL_DEFAULT_DENIED`（211）のsilent dropと`TraceEvent::Ipv4InputFirewallDenied
+{ingress, source, rule}`で、local判定に入らないのでICMP-ERRのswitchや`echo-reply`より優先します。
+truncated datagramはdropを`IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`のままParameter Problemだけ抑え、
+`input_truncated_denied`に数えます。traceの`transport_header`はtransport selectorを読めたかで、
+読めないfail-closedのdenyは最初のheaderを要るdeny ruleに帰属します。`destination`が見るのは
+ingress interfaceのaddressと、`[nat44.icmp]`のinside queryのpublic addressだけです（`validate`が
+どれも含まないruleを警告）。
+
+transport selector（ICMP type、TCP/UDP destination port）はwhole datagramとfirst fragmentの
+Total Length内から読みます。later fragment、truncated datagram、短いheaderはtransportなしで、
+transport selectorが要るruleは`Deny`のときだけmatchします（fail closed）。full range portや
+type無しのICMP ruleはtransport不要です。stateless設計の理由: routerはTCP/UDP sessionも
+ICMP queryも自分から始めず、生成するICMP errorには応答が来ない（RFC 1122 §3.2.2）ので、
+router宛てに許すべき「応答」が無く、NAT traffic の応答はNAT経路のforward firewall stateが判定する。
+policyはsnapshotの一部なのでreloadableで（`ApplyPlan::input_firewall_rules`、
+`input_firewall_rule_order_changed`、`input_firewall_default`）、forward flowのcarryには影響しません。
+limited/directed broadcastはmartianとしてこれより前に落ちるのでlocal deliveryされず、ARPは対象外です。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの
