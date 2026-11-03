@@ -3711,8 +3711,9 @@ fn admit_first_fragment(
 /// structure, no overlap with the transport header (RFC 1858, RFC 3128),
 /// then its first fragment's decision through the association table:
 /// forwarded with the first fragment's rewrite, refused, or held until the
-/// first fragment arrives. A TTL that expires drops it without an ICMP
-/// error (RFC 1812 §4.3.2.7: none about a non-initial fragment).
+/// first fragment arrives. A TTL that expires drops it before the table
+/// and without an ICMP error (RFC 1812 §4.3.2.7: none about a non-initial
+/// fragment).
 #[cold]
 #[inline(never)]
 fn decide_later_fragment(
@@ -3731,12 +3732,14 @@ fn decide_later_fragment(
     }
     info.check_structure()?;
     info.check_static_overlap()?;
+    // Before the table: a fragment that could never leave neither holds a
+    // slot nor counts as its datagram's progress.
+    if ipv4.ttl <= 1 {
+        return Err(Ipv4TtlExpired);
+    }
     let frame_len = ipv4.header_offset + ipv4.total_len;
     match tracker.follow(info, frame, frame_len, now_ms)? {
         Ipv4FragmentFollow::Allow { entry, template } => {
-            if ipv4.ttl <= 1 {
-                return Err(Ipv4TtlExpired);
-            }
             Ok(PacketDecision::FragmentFollow(FragmentFollowDecision {
                 entry,
                 template,

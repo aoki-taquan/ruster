@@ -827,6 +827,9 @@ where
                     for warning in control.reloader.sweep().into_iter().flatten() {
                         let _ = writeln!(err, "ruster run: warning: {warning}");
                     }
+                    if let Some(warning) = control.reloader.share() {
+                        let _ = writeln!(err, "ruster run: warning: {warning}");
+                    }
                 }
             }
             budgets = control.reloader.budgets();

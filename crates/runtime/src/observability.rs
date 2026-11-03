@@ -1558,7 +1558,7 @@ impl ObservableFields for ServiceCounters {
             first_allowed, first_denied, followed, followed_denied, held, released,
             release_dropped, held_denied, held_expired, entries_expired, entries_completed,
             entries_evicted, held_evicted, poisoned, duplicate_first, entries_flushed,
-            held_flushed,
+            held_flushed, tombstones_overwritten,
         }}
         visit_counts! {v, "arp_hold", self.arp_hold, ArpHoldCounters {
             held, replaced, refused_full, refused_host_limit, refused_ingress_limit,

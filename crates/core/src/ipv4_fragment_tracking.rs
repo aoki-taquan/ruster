@@ -43,7 +43,7 @@
 //! after a lost fragment, or a server answering two inside hosts behind one
 //! public address with the same ID) must not share a decision. A second
 //! first fragment for a decided datagram is `IPV4_FRAGMENT_DUPLICATE_FIRST`;
-//! unless it is byte-identical to the first one (same length and an FNV-1a
+//! unless it is byte-identical to the first one (same length and a 32-bit
 //! fingerprint of all its data, a network duplicate), it poisons the entry:
 //! every remaining fragment of both datagrams is refused, which fails
 //! closed. The fingerprint covers all the data because a prefix is not
@@ -62,11 +62,14 @@
 //! list makes expiry O(1) per entry with no scan. When the table or a
 //! host's quota or an ingress's share is full, the oldest pending or
 //! refusing entry of that scope is evicted, else the allowing one with the
-//! oldest progress if it stalled for a fifth of the timeout; each scope
-//! keeps both classes on their own lists, so a victim is found in O(1). An
-//! evicted allowing key is remembered (a tombstone) until the timeout: a
-//! new first fragment on it is refused, so its late fragments never follow
-//! another datagram's template. Every table is
+//! oldest progress (a fragment that added data) if it stalled for a fifth
+//! of the timeout; each scope keeps both classes on their own lists, so a
+//! victim is found in O(1), and victims are evicted only once the whole
+//! admission is known to succeed. Held slots are shared between ingresses
+//! the same way. An evicted allowing or poisoned key is remembered (a
+//! tombstone) until the timeout: a new first fragment on it is refused, so
+//! its late fragments never follow another datagram's template. Every
+//! table is
 //! caller-owned storage sized once from the config; there is no allocation,
 //! no lock, and no copy on the fast path (a frame that is not a fragment
 //! costs one read of the flags word).
@@ -300,8 +303,8 @@ pub(crate) struct Ipv4FragmentInfo {
     pub(crate) data_len: u32,
     pub(crate) more: bool,
     pub(crate) dont_fragment: bool,
-    /// FNV-1a over every data byte of a first fragment (0 for a later one):
-    /// with its length, the identity of a byte-identical duplicate.
+    /// [`fingerprint`] of every data byte of a first fragment (0 for a later
+    /// one): with its length, the identity of a byte-identical duplicate.
     pub(crate) fingerprint: u32,
 }
 
@@ -353,12 +356,7 @@ pub(crate) fn parse_fragment(
     let data_end = ipv4.header_offset + ipv4.total_len;
     // Only a first fragment needs it (cold path, once per first fragment).
     let fingerprint = if offset == 0 {
-        frame
-            .get(data_start..data_end)?
-            .iter()
-            .fold(0x811c_9dc5_u32, |hash, byte| {
-                (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
-            })
+        fingerprint(frame.get(data_start..data_end)?)
     } else {
         0
     };
@@ -378,6 +376,48 @@ pub(crate) fn parse_fragment(
     })
 }
 
+/// A fingerprint of every byte of `data`: four independent 64-bit lanes,
+/// each taking every fourth 8-byte word through a bijective step (xor,
+/// multiply by the odd FNV-1a 64 prime, rotate), so two inputs of one
+/// length that differ anywhere differ in at least one lane; the lanes and
+/// the length are folded to 32 bits with the MurmurHash3 finalizer.
+/// Deterministic and unkeyed: it only tells a network duplicate from
+/// another first fragment (a checksum-0 tunnel repeats its header, so no
+/// prefix would do), and is about a word per byte-step of FNV-1a's cost.
+fn fingerprint(data: &[u8]) -> u32 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let step = |lane: u64, word: u64| (lane ^ word).wrapping_mul(PRIME).rotate_left(29);
+    let mut lanes: [u64; 4] = [
+        0xcbf2_9ce4_8422_2325,
+        0x8422_2325_cbf2_9ce4,
+        0x9e37_79b9_7f4a_7c15,
+        0x7f4a_7c15_9e37_79b9,
+    ];
+    let mut chunks = data.chunks_exact(32);
+    for chunk in &mut chunks {
+        for (lane, word) in lanes.iter_mut().zip(chunk.chunks_exact(8)) {
+            let word = u64::from_le_bytes(word.try_into().expect("8-byte word"));
+            *lane = step(*lane, word);
+        }
+    }
+    for (index, byte) in chunks.remainder().iter().enumerate() {
+        lanes[index % 4] = step(lanes[index % 4], u64::from(*byte) | 0x100);
+    }
+    let fmix = |mut value: u64| {
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xff51_afd7_ed55_8ccd);
+        value ^= value >> 33;
+        value = value.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+        value ^ (value >> 33)
+    };
+    let mut hash = data.len() as u64;
+    for lane in lanes {
+        hash = fmix(hash ^ fmix(lane)).wrapping_add(lane);
+    }
+    let hash = fmix(hash);
+    (hash ^ (hash >> 32)) as u32
+}
+
 /// Coverage ranges an entry tracks exactly (RFC 815's hole list, inverted):
 /// a datagram arriving in more disjoint pieces than this is no longer
 /// tracked and its entry lives until the timeout.
@@ -390,7 +430,8 @@ const COVERAGE_RANGES: usize = 4;
 ///   ingress's list of the entry's class: pending and refusing entries in
 ///   the order they became evictable, or allowing entries by last progress
 ///   (least recent first);
-/// - `HELD`: pending entries that hold fragments, oldest first.
+/// - `HELD`: the ingress's pending entries that hold fragments, oldest
+///   first.
 const AGE: usize = 0;
 const CLASS: usize = 1;
 const HOST: usize = 2;
@@ -404,12 +445,8 @@ const NEWER: usize = 1;
 type Ends = [u32; 2];
 const NO_ENDS: Ends = [NONE, NONE];
 
-/// Evicted allowing keys remembered for a timeout: a first fragment on one
-/// of them is refused (it may be another datagram reusing the key, which
-/// would release or follow fragments of the evicted one), and so are later
-/// fragments, which would otherwise be held under a key whose datagram is
-/// gone.
-const TOMBSTONES: usize = 16;
+/// No ingress slot (the over-share list of ingresses).
+const NO_SLOT: u16 = u16::MAX;
 
 /// Slots of the ingress map: twice the most ingresses, open addressing.
 const INGRESS_MAP: usize = 2 * IPV4_FRAGMENT_TRACKING_MAX_INGRESSES;
@@ -424,9 +461,9 @@ pub struct Ipv4FragmentEntrySlot {
     key: Ipv4FragmentKey,
     template: Ipv4FragmentTemplate,
     created_ms: u64,
-    /// The last time a fragment of the datagram was answered for, in ms
-    /// after `created_ms` (a live entry is younger than the timeout, at
-    /// most 60000 ms).
+    /// The last time a fragment of the datagram added data (not a
+    /// duplicate), in ms after `created_ms` (a live entry is younger than
+    /// the timeout, at most 60000 ms).
     progress_ms: u16,
     host: u32,
     held_head: u32,
@@ -485,15 +522,18 @@ impl Ipv4FragmentEntrySlot {
         links: [[NONE; 2]; LISTS],
     };
 
-    /// Records the data range of one fragment. `Err` when it contradicts
-    /// what was seen: a second, different end (MF clear), or data past the
-    /// end. Duplicates and overlaps count once.
-    fn record(&mut self, offset: u32, len: u32, more: bool) -> Result<(), ()> {
+    /// Records the data range of one fragment: `Ok(true)` when it added
+    /// data (a new end, a larger end, or bytes not seen before), `Ok(false)`
+    /// for a duplicate. `Err` when it contradicts what was seen: a second,
+    /// different end (MF clear), or data past the end. Duplicates and
+    /// overlaps count once.
+    fn record(&mut self, offset: u32, len: u32, more: bool) -> Result<bool, ()> {
         if self.poisoned {
-            return Ok(());
+            return Ok(false);
         }
         // Data ends at most 65515 bytes in (`parse_fragment`).
         let end = u16::try_from(offset + len).map_err(|_| ())?;
+        let before = (self.total, self.max_end, self.untracked);
         if !more {
             if (self.total != 0 && self.total != end) || self.max_end > end {
                 return Err(());
@@ -504,7 +544,7 @@ impl Ipv4FragmentEntrySlot {
         }
         self.max_end = self.max_end.max(end);
         if self.untracked {
-            return Ok(());
+            return Ok(before != (self.total, self.max_end, self.untracked));
         }
         // The offset is below the end, which fits 16 bits.
         let (mut start, mut stop) = (offset as u16, end);
@@ -519,7 +559,7 @@ impl Ipv4FragmentEntrySlot {
                 if !placed {
                     if count == COVERAGE_RANGES {
                         self.untracked = true;
-                        return Ok(());
+                        return Ok(true);
                     }
                     merged[count] = [start, stop];
                     count += 1;
@@ -527,7 +567,7 @@ impl Ipv4FragmentEntrySlot {
                 }
                 if count == COVERAGE_RANGES {
                     self.untracked = true;
-                    return Ok(());
+                    return Ok(true);
                 }
                 merged[count] = *range;
                 count += 1;
@@ -539,14 +579,18 @@ impl Ipv4FragmentEntrySlot {
         if !placed {
             if count == COVERAGE_RANGES {
                 self.untracked = true;
-                return Ok(());
+                return Ok(true);
             }
             merged[count] = [start, stop];
             count += 1;
         }
+        let count = u8::try_from(count).expect("at most COVERAGE_RANGES");
+        let grew = before != (self.total, self.max_end, self.untracked)
+            || count != self.ranges_len
+            || merged != self.ranges;
         self.ranges = merged;
-        self.ranges_len = u8::try_from(count).expect("at most COVERAGE_RANGES");
-        Ok(())
+        self.ranges_len = count;
+        Ok(grew)
     }
 
     /// Every data byte from 0 to the datagram's end was seen.
@@ -652,13 +696,43 @@ impl Default for Ipv4FragmentHeldSlot {
     }
 }
 
-/// Entries of one ingress interface and its class lists.
+/// An evicted allowing or poisoned key and when it was evicted
+/// (caller-owned storage, [`ipv4_fragment_tracking_tombstones`] of them).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Ipv4FragmentTombstoneSlot {
+    key: Ipv4FragmentKey,
+    live: bool,
+    at_ms: u64,
+}
+
+impl Ipv4FragmentTombstoneSlot {
+    pub const EMPTY: Self = Self {
+        key: Ipv4FragmentEntrySlot::EMPTY.key,
+        live: false,
+        at_ms: 0,
+    };
+}
+
+impl Default for Ipv4FragmentTombstoneSlot {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+/// Entries of one ingress interface, its class lists, its pending entries
+/// that hold fragments, and its place on the over-share list.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct IngressSlot {
     id: IfId,
     entries: u32,
     evict: Ends,
     allow: Ends,
+    holding: Ends,
+    /// Held fragments of the ingress's datagrams.
+    held: u32,
+    over: bool,
+    over_previous: u16,
+    over_next: u16,
 }
 
 impl IngressSlot {
@@ -667,23 +741,40 @@ impl IngressSlot {
         entries: 0,
         evict: NO_ENDS,
         allow: NO_ENDS,
+        holding: NO_ENDS,
+        held: 0,
+        over: false,
+        over_previous: NO_SLOT,
+        over_next: NO_SLOT,
     };
 }
 
-/// An evicted allowing key and when it was evicted.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Tombstone {
-    key: Ipv4FragmentKey,
-    at_ms: u64,
-    live: bool,
+/// The entries chosen for eviction before any is evicted (an admission
+/// evicts at most one per scope: held slots, host, ingress, table).
+#[derive(Clone, Copy, Debug)]
+struct Victims {
+    chosen: [u32; 4],
+    len: usize,
 }
 
-impl Tombstone {
+impl Victims {
     const EMPTY: Self = Self {
-        key: Ipv4FragmentEntrySlot::EMPTY.key,
-        at_ms: 0,
-        live: false,
+        chosen: [NONE; 4],
+        len: 0,
     };
+
+    fn contains(&self, index: u32) -> bool {
+        self.chosen[..self.len].contains(&index)
+    }
+
+    fn push(&mut self, index: u32) {
+        self.chosen[self.len] = index;
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[u32] {
+        &self.chosen[..self.len]
+    }
 }
 
 /// Buckets of each directory for `entries` entries (a power of two, at
@@ -697,10 +788,37 @@ pub const fn ipv4_fragment_tracking_buckets(entries: usize) -> usize {
     }
 }
 
+/// Tombstone slots for `entries` entries: one per sixteen entries, at
+/// least 16 (0 for none).
+#[must_use]
+pub const fn ipv4_fragment_tracking_tombstones(entries: usize) -> usize {
+    if entries == 0 {
+        0
+    } else if entries / 16 > 16 {
+        entries / 16
+    } else {
+        16
+    }
+}
+
+/// The entries one ingress may take: `share` percent of `entries`,
+/// rounded down, at least one.
+#[must_use]
+pub const fn ipv4_fragment_tracking_ingress_cap(entries: usize, share_percent: u8) -> usize {
+    let cap = entries * share_percent as usize / 100;
+    if cap == 0 {
+        1
+    } else {
+        cap
+    }
+}
+
 /// Caller-owned storage of an [`Ipv4FragmentTracker`]: `entries` entry
 /// slots, as many host slots, a bucket array of
 /// [`ipv4_fragment_tracking_buckets`] and a node per slot for each of the
-/// two directories, and `held` held records with `held × slot` bytes.
+/// two directories, [`ipv4_fragment_tracking_tombstones`] tombstone slots
+/// with their own bucket array and nodes, and `held` held records with
+/// `held × slot` bytes.
 pub struct Ipv4FragmentTrackingStorage<'a> {
     pub entries: &'a mut [Ipv4FragmentEntrySlot],
     pub entry_buckets: &'a mut [DirectoryBucket],
@@ -708,6 +826,9 @@ pub struct Ipv4FragmentTrackingStorage<'a> {
     pub hosts: &'a mut [Ipv4FragmentHostSlot],
     pub host_buckets: &'a mut [DirectoryBucket],
     pub host_nodes: &'a mut [DirectoryNode],
+    pub tombstones: &'a mut [Ipv4FragmentTombstoneSlot],
+    pub tombstone_buckets: &'a mut [DirectoryBucket],
+    pub tombstone_nodes: &'a mut [DirectoryNode],
     pub held: &'a mut [Ipv4FragmentHeldSlot],
     pub held_bytes: &'a mut [u8],
 }
@@ -717,7 +838,8 @@ pub struct Ipv4FragmentTrackingStorage<'a> {
 pub enum Ipv4FragmentTrackingStorageError {
     /// No entry slot: nothing could be associated.
     NoEntries,
-    /// Host slots, nodes, or buckets do not match the entry count.
+    /// Host slots, tombstone slots, nodes, or buckets do not match the
+    /// entry count.
     Shape,
     /// The held bytes are not `held × slot` for a slot of at least one
     /// minimum-MTU datagram and at most 14 + 65535 bytes.
@@ -734,7 +856,7 @@ pub struct Ipv4FragmentTrackingCounters {
     /// Later fragments forwarded (or re-fragmented) on arrival.
     pub followed: usize,
     /// Later fragments refused because their first fragment was (or the
-    /// key's allowing entry was evicted, a tombstone).
+    /// key's allowing or poisoned entry was evicted, a tombstone).
     pub followed_denied: usize,
     /// Later fragments held because their first fragment had not arrived.
     pub held: usize,
@@ -765,7 +887,7 @@ pub struct Ipv4FragmentTrackingCounters {
     /// Entries turned into a refusal for good: a second, different first
     /// fragment for a decided datagram (an ID reused, or two datagrams with
     /// one key), a fragment contradicting the datagram's end, or a first
-    /// fragment on the key of an evicted allowing entry.
+    /// fragment on the key of an evicted allowing or poisoned entry.
     pub poisoned: usize,
     /// Byte-identical duplicate first fragments dropped alone.
     pub duplicate_first: usize,
@@ -773,6 +895,10 @@ pub struct Ipv4FragmentTrackingCounters {
     pub entries_flushed: usize,
     /// Held fragments discarded by a publication apply.
     pub held_flushed: usize,
+    /// Tombstones overwritten before their timeout (more evictions of
+    /// allowing or poisoned entries within a timeout than tombstone slots):
+    /// those keys are no longer refused.
+    pub tombstones_overwritten: usize,
 }
 
 /// A first fragment admitted before its decision: it either continues a
@@ -807,26 +933,29 @@ pub struct Ipv4FragmentTracker<'a> {
     entry_directory: FixedDirectory<'a>,
     hosts: &'a mut [Ipv4FragmentHostSlot],
     host_directory: FixedDirectory<'a>,
+    tombstones: &'a mut [Ipv4FragmentTombstoneSlot],
+    tombstone_directory: FixedDirectory<'a>,
     held: &'a mut [Ipv4FragmentHeldSlot],
     held_bytes: &'a mut [u8],
     held_slot_bytes: usize,
     free_entry: u32,
     free_host: u32,
     free_held: u32,
-    /// Every live entry in creation order; the table's class lists; pending
-    /// entries holding fragments.
+    /// Every live entry in creation order, and the table's class lists.
     age: Ends,
     evict: Ends,
     allow: Ends,
-    holding: Ends,
     /// Entries per ingress interface (`ingress_len` used), found through
     /// `ingress_map` (slot + 1, 0 empty, open addressing), and the share
-    /// each may take.
+    /// of the entries (`ingress_cap`) and of the held slots (`held_cap`)
+    /// each may take. `over_head` lists the ingresses holding more than
+    /// `held_cap` fragments.
     ingresses: [IngressSlot; IPV4_FRAGMENT_TRACKING_MAX_INGRESSES],
     ingress_map: [u16; INGRESS_MAP],
     ingress_len: usize,
     ingress_cap: u32,
-    tombstones: [Tombstone; TOMBSTONES],
+    held_cap: u32,
+    over_head: u16,
     tombstone_next: usize,
     live_entries: usize,
     live_held: usize,
@@ -836,7 +965,7 @@ pub struct Ipv4FragmentTracker<'a> {
 
 impl<'a> Ipv4FragmentTracker<'a> {
     /// Builds an empty table over `storage`, keyed by the publication's
-    /// resolution key in its own hash domain.
+    /// resolution key in its own hash domains.
     pub fn new(
         policy: Ipv4FragmentTrackingPolicy,
         storage: Ipv4FragmentTrackingStorage<'a>,
@@ -849,6 +978,9 @@ impl<'a> Ipv4FragmentTracker<'a> {
             hosts,
             host_buckets,
             host_nodes,
+            tombstones,
+            tombstone_buckets,
+            tombstone_nodes,
             held,
             held_bytes,
         } = storage;
@@ -857,12 +989,16 @@ impl<'a> Ipv4FragmentTracker<'a> {
             return Err(Ipv4FragmentTrackingStorageError::NoEntries);
         }
         let buckets = ipv4_fragment_tracking_buckets(count);
+        let tombstone_count = ipv4_fragment_tracking_tombstones(count);
         if count >= NONE as usize
             || hosts.len() != count
             || entry_nodes.len() != count
             || host_nodes.len() != count
             || entry_buckets.len() != buckets
             || host_buckets.len() != buckets
+            || tombstones.len() != tombstone_count
+            || tombstone_nodes.len() != tombstone_count
+            || tombstone_buckets.len() != ipv4_fragment_tracking_buckets(tombstone_count)
         {
             return Err(Ipv4FragmentTrackingStorageError::Shape);
         }
@@ -887,12 +1023,23 @@ impl<'a> Ipv4FragmentTracker<'a> {
             .map_err(|_| Ipv4FragmentTrackingStorageError::Shape)?;
         let host_directory = FixedDirectory::new(host_buckets, host_nodes, directory_key)
             .map_err(|_| Ipv4FragmentTrackingStorageError::Shape)?;
+        let tombstone_directory =
+            FixedDirectory::new(tombstone_buckets, tombstone_nodes, directory_key)
+                .map_err(|_| Ipv4FragmentTrackingStorageError::Shape)?;
+        let share = policy.ingress_share_percent;
+        let held_cap = if share >= 100 {
+            0
+        } else {
+            ipv4_fragment_tracking_ingress_cap(held.len(), share)
+        };
         let mut tracker = Self {
             policy,
             entries,
             entry_directory,
             hosts,
             host_directory,
+            tombstones,
+            tombstone_directory,
             held,
             held_bytes,
             held_slot_bytes,
@@ -902,15 +1049,13 @@ impl<'a> Ipv4FragmentTracker<'a> {
             age: NO_ENDS,
             evict: NO_ENDS,
             allow: NO_ENDS,
-            holding: NO_ENDS,
             ingresses: [IngressSlot::EMPTY; IPV4_FRAGMENT_TRACKING_MAX_INGRESSES],
             ingress_map: [0; INGRESS_MAP],
             ingress_len: 0,
-            ingress_cap: u32::try_from(
-                (count * usize::from(policy.ingress_share_percent) / 100).max(1),
-            )
-            .unwrap_or(u32::MAX),
-            tombstones: [Tombstone::EMPTY; TOMBSTONES],
+            ingress_cap: u32::try_from(ipv4_fragment_tracking_ingress_cap(count, share))
+                .unwrap_or(u32::MAX),
+            held_cap: u32::try_from(held_cap).unwrap_or(u32::MAX),
+            over_head: NO_SLOT,
             tombstone_next: 0,
             live_entries: 0,
             live_held: 0,
@@ -953,9 +1098,9 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.held.len()
     }
 
-    /// Discards every entry and held fragment (counted as flushed). A
-    /// publication apply calls it: the templates name the old publication's
-    /// egress and neighbors.
+    /// Discards every entry, held fragment, and tombstone (entries and
+    /// held fragments counted as flushed). A publication apply calls it:
+    /// the templates name the old publication's egress and neighbors.
     pub fn flush(&mut self) {
         self.counters.entries_flushed += self.live_entries;
         self.counters.held_flushed += self.live_held;
@@ -968,12 +1113,14 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.counters.held_flushed += self.live_held;
         self.entry_directory.clear_with_key(key.directory_key());
         self.host_directory.clear_with_key(key.directory_key());
+        self.tombstone_directory.clear_with_key(key.directory_key());
         self.reset();
     }
 
     fn reset(&mut self) {
         self.entry_directory.clear();
         self.host_directory.clear();
+        self.tombstone_directory.clear();
         let count = self.entries.len();
         for (index, slot) in self.entries.iter_mut().enumerate() {
             *slot = Ipv4FragmentEntrySlot::EMPTY;
@@ -983,6 +1130,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
             *slot = Ipv4FragmentHostSlot::EMPTY;
             slot.next_free = next_index(index, count);
         }
+        self.tombstones.fill(Ipv4FragmentTombstoneSlot::EMPTY);
         let held = self.held.len();
         for (index, slot) in self.held.iter_mut().enumerate() {
             *slot = Ipv4FragmentHeldSlot::EMPTY;
@@ -994,11 +1142,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.age = NO_ENDS;
         self.evict = NO_ENDS;
         self.allow = NO_ENDS;
-        self.holding = NO_ENDS;
         self.ingresses = [IngressSlot::EMPTY; IPV4_FRAGMENT_TRACKING_MAX_INGRESSES];
         self.ingress_map = [0; INGRESS_MAP];
         self.ingress_len = 0;
-        self.tombstones = [Tombstone::EMPTY; TOMBSTONES];
+        self.over_head = NO_SLOT;
         self.tombstone_next = 0;
         self.live_entries = 0;
         self.live_held = 0;
@@ -1113,11 +1260,16 @@ impl<'a> Ipv4FragmentTracker<'a> {
         Some(slot)
     }
 
+    /// The ingress slot of a live entry.
+    fn ingress_of_entry(&self, index: u32) -> usize {
+        usize::from(self.hosts[self.entries[index as usize].host as usize].ingress_slot)
+    }
+
     /// Puts an entry on the class lists of its state (table, host, ingress).
     fn class_link(&mut self, index: u32) {
         let entry = self.entries[index as usize];
         let host = entry.host as usize;
-        let ingress = usize::from(self.hosts[host].ingress_slot);
+        let ingress = self.ingress_of_entry(index);
         if entry.state == EntryState::Allow {
             push(self.entries, &mut self.allow, index, CLASS);
             push(self.entries, &mut self.hosts[host].allow, index, HOST);
@@ -1143,7 +1295,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     fn class_unlink(&mut self, index: u32) {
         let entry = self.entries[index as usize];
         let host = entry.host as usize;
-        let ingress = usize::from(self.hosts[host].ingress_slot);
+        let ingress = self.ingress_of_entry(index);
         if entry.state == EntryState::Allow {
             remove(self.entries, &mut self.allow, index, CLASS);
             remove(self.entries, &mut self.hosts[host].allow, index, HOST);
@@ -1173,8 +1325,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.class_link(id);
     }
 
-    /// A fragment of the entry's datagram was answered for: an allowing
-    /// entry moves to the recent end of its class lists.
+    /// A fragment added data to the entry's datagram: an allowing entry
+    /// moves to the recent end of its class lists.
     fn touch(&mut self, index: usize, now_ms: u64) {
         let since = now_ms.saturating_sub(self.entries[index].created_ms);
         self.entries[index].progress_ms = u16::try_from(since).unwrap_or(u16::MAX);
@@ -1187,7 +1339,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
 
     /// An allowing entry without progress for a fifth of the timeout: its
     /// datagram stalled (fragments of one datagram arrive within
-    /// milliseconds; a spoofed first fragment never gets the rest).
+    /// milliseconds; a spoofed first fragment never gets the rest, and a
+    /// duplicate is not progress).
     fn stalled(&self, index: u32, now_ms: u64) -> bool {
         let entry = &self.entries[index as usize];
         now_ms.saturating_sub(entry.created_ms + u64::from(entry.progress_ms))
@@ -1195,115 +1348,244 @@ impl<'a> Ipv4FragmentTracker<'a> {
     }
 
     /// The entry to evict from a scope with class lists `evict` and `allow`
-    /// (O(1)): the oldest pending or refusing one, else the allowing one
+    /// on `list`, other than the `chosen` ones (O(1): at most four are
+    /// skipped): the oldest pending or refusing one, else the allowing one
     /// with the oldest progress if it stalled, else none.
-    fn victim(&self, evict: Ends, allow: Ends, now_ms: u64) -> u32 {
-        if evict[OLDER] != NONE {
-            return evict[OLDER];
+    fn victim(&self, evict: Ends, allow: Ends, list: usize, chosen: &Victims, now_ms: u64) -> u32 {
+        let mut current = evict[OLDER];
+        while current != NONE && chosen.contains(current) {
+            current = self.entries[current as usize].links[list][NEWER];
         }
-        let oldest = allow[OLDER];
-        if oldest != NONE && self.stalled(oldest, now_ms) {
-            oldest
+        if current != NONE {
+            return current;
+        }
+        let mut current = allow[OLDER];
+        while current != NONE && chosen.contains(current) {
+            current = self.entries[current as usize].links[list][NEWER];
+        }
+        if current != NONE && self.stalled(current, now_ms) {
+            current
         } else {
             NONE
         }
     }
 
-    /// Discards an entry to make room (counted). An allowing one leaves a
-    /// tombstone: a new first fragment on its key could be another datagram
-    /// reusing it, and its late fragments must not be held for one.
+    /// The oldest entry of ingress `slot` that holds fragments, other than
+    /// `own` and the `chosen` ones.
+    fn oldest_holder(&self, slot: usize, own: Option<usize>, chosen: &Victims) -> u32 {
+        let mut current = self.ingresses[slot].holding[OLDER];
+        while current != NONE && (chosen.contains(current) || own == Some(current as usize)) {
+            current = self.entries[current as usize].links[HELD][NEWER];
+        }
+        current
+    }
+
+    /// The entry whose held fragments make room for one more of ingress
+    /// `requester` (O(1)): its own oldest holder when it is at its share of
+    /// the held slots, else the oldest holder of an ingress over its share,
+    /// else its own oldest holder; never `own` (the datagram the room is
+    /// for). A flood from one ingress thus only displaces its own held
+    /// fragments, or those of an ingress over its share. With a share of
+    /// 100 percent an ingress holding anything is over it, and the
+    /// requester's own holders go first.
+    fn held_victim(&self, requester: Option<usize>, own: Option<usize>, chosen: &Victims) -> u32 {
+        if let Some(slot) = requester {
+            if self.ingresses[slot].held >= self.held_cap {
+                let victim = self.oldest_holder(slot, own, chosen);
+                if victim != NONE {
+                    return victim;
+                }
+            }
+        }
+        // Skipped holders are at most `own` and four chosen: past a few
+        // ingresses one with a usable holder is found.
+        let mut slot = self.over_head;
+        for _ in 0..8 {
+            if slot == NO_SLOT {
+                break;
+            }
+            // The requester, when it is over its share, was tried above.
+            let victim = self.oldest_holder(usize::from(slot), own, chosen);
+            if victim != NONE {
+                return victim;
+            }
+            slot = self.ingresses[usize::from(slot)].over_next;
+        }
+        requester.map_or(NONE, |slot| self.oldest_holder(slot, own, chosen))
+    }
+
+    /// Puts ingress `slot` on or off the over-share list after its held
+    /// count changed.
+    fn update_over(&mut self, slot: usize) {
+        let over = self.ingresses[slot].held > self.held_cap;
+        if over == self.ingresses[slot].over {
+            return;
+        }
+        let id = u16::try_from(slot).expect("at most 256 ingresses");
+        if over {
+            self.ingresses[slot].over_previous = NO_SLOT;
+            self.ingresses[slot].over_next = self.over_head;
+            if self.over_head != NO_SLOT {
+                self.ingresses[usize::from(self.over_head)].over_previous = id;
+            }
+            self.over_head = id;
+        } else {
+            let previous = self.ingresses[slot].over_previous;
+            let next = self.ingresses[slot].over_next;
+            if previous == NO_SLOT {
+                self.over_head = next;
+            } else {
+                self.ingresses[usize::from(previous)].over_next = next;
+            }
+            if next != NO_SLOT {
+                self.ingresses[usize::from(next)].over_previous = previous;
+            }
+            self.ingresses[slot].over_previous = NO_SLOT;
+            self.ingresses[slot].over_next = NO_SLOT;
+        }
+        self.ingresses[slot].over = over;
+    }
+
+    /// Discards an entry to make room (counted). An allowing or poisoned
+    /// one leaves a tombstone: a new first fragment on its key could be
+    /// another datagram reusing it, and its late fragments must not be
+    /// held for one (a poisoned entry was allowing, or refuses both
+    /// datagrams of its key).
     fn evict(&mut self, index: u32, now_ms: u64) {
         self.counters.entries_evicted += 1;
         let entry = self.entries[index as usize];
-        if entry.state == EntryState::Allow {
-            self.tombstones[self.tombstone_next] = Tombstone {
-                key: entry.key,
-                at_ms: now_ms,
-                live: true,
-            };
-            self.tombstone_next = (self.tombstone_next + 1) % TOMBSTONES;
+        if entry.state == EntryState::Allow || entry.poisoned {
+            self.entomb(entry.key, now_ms);
         }
         let held = self.free_entry_at(index as usize);
         self.counters.held_evicted += held;
     }
 
-    /// Whether `key`'s allowing entry was evicted within the timeout.
-    fn tombstoned(&self, key: Ipv4FragmentKey, now_ms: u64) -> bool {
-        self.tombstones.iter().any(|tombstone| {
-            tombstone.live
-                && tombstone.key == key
-                && now_ms.saturating_sub(tombstone.at_ms) < u64::from(self.policy.timeout_ms)
-        })
+    /// Remembers `key` as evicted at `now_ms` in the oldest tombstone slot.
+    fn entomb(&mut self, key: Ipv4FragmentKey, now_ms: u64) {
+        let slot = self.tombstone_next;
+        let old = self.tombstones[slot];
+        if old.live {
+            if now_ms.saturating_sub(old.at_ms) < u64::from(self.policy.timeout_ms) {
+                self.counters.tombstones_overwritten += 1;
+            }
+            let _ = self.tombstone_directory.unlink(slot);
+        }
+        self.tombstones[slot] = Ipv4FragmentTombstoneSlot {
+            key,
+            live: true,
+            at_ms: now_ms,
+        };
+        let linked = self.tombstone_directory.link(
+            slot,
+            DirectoryHashDomain::Ipv4FragmentTombstone,
+            &key.words(),
+        );
+        if linked.is_err() {
+            self.tombstones[slot] = Ipv4FragmentTombstoneSlot::EMPTY;
+        }
+        self.tombstone_next = (slot + 1) % self.tombstones.len();
     }
 
-    /// Room for a new entry of `ingress`/`source`: expiring the oldest,
-    /// then, at the host's limit, the ingress's share, or a full table,
-    /// evicting that scope's victim (O(1), see [`Self::victim`]). Only an
-    /// allowing template ever forwards a later fragment, so evicting a
-    /// pending or refusing entry can only turn later fragments into
-    /// refusals or new holds; a stalled allowing one leaves a tombstone.
-    fn make_room(&mut self, ingress: IfId, source: [u8; 4], now_ms: u64) -> Result<(), DropReason> {
-        if self.free_entry == NONE {
-            self.expire(now_ms, 1);
+    /// Whether `key`'s allowing or poisoned entry was evicted within the
+    /// timeout (O(1), keyed lookup).
+    fn tombstoned(&self, key: Ipv4FragmentKey, now_ms: u64) -> bool {
+        let tombstones = &*self.tombstones;
+        let timeout = u64::from(self.policy.timeout_ms);
+        self.tombstone_directory
+            .lookup(
+                DirectoryHashDomain::Ipv4FragmentTombstone,
+                &key.words(),
+                |index| {
+                    let tombstone = tombstones[index];
+                    tombstone.live
+                        && tombstone.key == key
+                        && now_ms.saturating_sub(tombstone.at_ms) < timeout
+                },
+            )
+            .is_ok_and(|probe| probe.state_index.is_some())
+    }
+
+    /// How many `chosen` victims belong to host `host`, and to ingress
+    /// `slot`.
+    fn chosen_in(&self, chosen: &Victims, host: Option<usize>, slot: Option<usize>) -> [u32; 2] {
+        let mut counts = [0; 2];
+        for &victim in chosen.as_slice() {
+            let entry_host = self.entries[victim as usize].host as usize;
+            if host == Some(entry_host) {
+                counts[0] += 1;
+            }
+            if slot == Some(usize::from(self.hosts[entry_host].ingress_slot)) {
+                counts[1] += 1;
+            }
         }
-        if let Some(host) = self.host_of(ingress, source) {
-            if self.hosts[host].entries >= self.policy.entries_per_host {
-                let victim = self.victim(self.hosts[host].evict, self.hosts[host].allow, now_ms);
+        counts
+    }
+
+    /// Chooses, without evicting anything, the victims that make room for a
+    /// new entry of `ingress`/`source` beside the `chosen` ones: at the
+    /// host's limit, the ingress's share, or a full table, that scope's
+    /// victim (see [`Self::victim`]). `Err` when a scope has none: then
+    /// nothing is evicted at all. Only an allowing template ever forwards
+    /// a later fragment, so evicting a pending or refusing entry can only
+    /// turn later fragments into refusals or new holds; a stalled allowing
+    /// or a poisoned one leaves a tombstone.
+    fn plan_room(
+        &self,
+        ingress: IfId,
+        source: [u8; 4],
+        chosen: &mut Victims,
+        now_ms: u64,
+    ) -> Result<(), DropReason> {
+        let host = self.host_of(ingress, source);
+        let slot = self.ingress_of(ingress);
+        if let Some(host) = host {
+            let [taken, _] = self.chosen_in(chosen, Some(host), None);
+            if self.hosts[host].entries - taken >= self.policy.entries_per_host {
+                let ends = self.hosts[host];
+                let victim = self.victim(ends.evict, ends.allow, HOST, chosen, now_ms);
                 if victim == NONE {
                     return Err(DropReason::Ipv4FragmentHostLimit);
                 }
-                self.evict(victim, now_ms);
+                chosen.push(victim);
             }
         }
-        match self.ingress_of(ingress) {
-            Some(slot) => {
-                // 100 percent does not partition: a full table decides.
-                if self.ingresses[slot].entries >= self.ingress_cap
-                    && (self.ingress_cap as usize) < self.entries.len()
-                {
-                    let victim = self.victim(
-                        self.ingresses[slot].evict,
-                        self.ingresses[slot].allow,
-                        now_ms,
-                    );
+        match slot {
+            // 100 percent does not partition: a full table decides.
+            Some(slot) if (self.ingress_cap as usize) < self.entries.len() => {
+                let [_, taken] = self.chosen_in(chosen, None, Some(slot));
+                if self.ingresses[slot].entries - taken >= self.ingress_cap {
+                    let ends = self.ingresses[slot];
+                    let victim = self.victim(ends.evict, ends.allow, INGRESS, chosen, now_ms);
                     if victim == NONE {
                         return Err(DropReason::Ipv4FragmentIngressLimit);
                     }
-                    self.evict(victim, now_ms);
+                    chosen.push(victim);
                 }
             }
             None if self.ingress_len == IPV4_FRAGMENT_TRACKING_MAX_INGRESSES => {
                 return Err(DropReason::Ipv4FragmentIngressLimit);
             }
-            None => {}
+            _ => {}
         }
-        if self.free_entry == NONE {
-            let victim = self.victim(self.evict, self.allow, now_ms);
+        if self.free_entry == NONE && chosen.len == 0 {
+            let victim = self.victim(self.evict, self.allow, CLASS, chosen, now_ms);
             if victim == NONE {
                 return Err(DropReason::Ipv4FragmentTableFull);
             }
-            self.evict(victim, now_ms);
+            chosen.push(victim);
         }
         Ok(())
     }
 
-    /// Frees held slots for a new held fragment of `own` (if any): evicts the
-    /// oldest other pending entry that holds fragments (O(1)).
-    fn make_held_room(&mut self, own: Option<usize>, now_ms: u64) {
-        self.expire(now_ms, 1);
-        if self.free_held != NONE {
-            return;
-        }
-        let mut victim = self.holding[OLDER];
-        if own.is_some_and(|own| victim as usize == own) {
-            victim = self.entries[victim as usize].links[HELD][NEWER];
-        }
-        if victim != NONE {
+    /// Evicts the chosen victims (the whole admission was planned).
+    fn evict_all(&mut self, chosen: &Victims, now_ms: u64) {
+        for &victim in chosen.as_slice() {
             self.evict(victim, now_ms);
         }
     }
 
-    /// Takes a free entry for `key` (room made by `make_room`).
+    /// Takes a free entry for `key` (room made by `plan_room`).
     fn insert_entry(
         &mut self,
         key: Ipv4FragmentKey,
@@ -1403,7 +1685,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
             return 0;
         }
         let id = u32::try_from(index).expect("entry index below NONE");
-        remove(self.entries, &mut self.holding, id, HELD);
+        let slot = self.ingress_of_entry(id);
+        remove(self.entries, &mut self.ingresses[slot].holding, id, HELD);
         let mut count = 0;
         let mut current = self.entries[index].held_head;
         while current != NONE {
@@ -1420,18 +1703,19 @@ impl<'a> Ipv4FragmentTracker<'a> {
         entry.held_head = NONE;
         entry.held_tail = NONE;
         entry.held = 0;
-        if let Some(host) = self.hosts.get_mut(entry.host as usize) {
-            host.held = host
-                .held
-                .saturating_sub(u32::try_from(count).unwrap_or(u32::MAX));
-        }
+        let freed = u32::try_from(count).unwrap_or(u32::MAX);
+        let host = entry.host as usize;
+        self.hosts[host].held = self.hosts[host].held.saturating_sub(freed);
+        self.ingresses[slot].held = self.ingresses[slot].held.saturating_sub(freed);
+        self.update_over(slot);
         self.live_held -= count;
         count
     }
 
     /// Turns an entry into a refusal for good: what it held is discarded,
     /// every later fragment is refused, and it lives until the timeout (or
-    /// is evicted). Both datagrams that share the key fail closed.
+    /// is evicted, leaving a tombstone). Both datagrams that share the key
+    /// fail closed.
     fn poison(&mut self, index: usize) {
         self.counters.poisoned += 1;
         let held = self.free_held_of(index);
@@ -1453,31 +1737,35 @@ impl<'a> Ipv4FragmentTracker<'a> {
         }
     }
 
-    /// Records one fragment's data in a live entry; a contradiction poisons
-    /// it and is `IPV4_FRAGMENT_MALFORMED`.
+    /// Records one fragment's data in a live entry (progress when it added
+    /// data); a contradiction poisons it and is `IPV4_FRAGMENT_MALFORMED`.
     fn record(
         &mut self,
         index: usize,
         info: Ipv4FragmentInfo,
         now_ms: u64,
     ) -> Result<(), DropReason> {
-        if self.entries[index]
-            .record(info.offset, info.data_len, info.more)
-            .is_err()
-        {
-            self.poison(index);
-            return Err(DropReason::Ipv4FragmentMalformed);
+        match self.entries[index].record(info.offset, info.data_len, info.more) {
+            Err(()) => {
+                self.poison(index);
+                Err(DropReason::Ipv4FragmentMalformed)
+            }
+            Ok(grew) => {
+                if grew {
+                    self.touch(index, now_ms);
+                }
+                Ok(())
+            }
         }
-        self.touch(index, now_ms);
-        Ok(())
     }
 
     /// Admits a first fragment before its decision: a pending entry
     /// continues; a decided one drops a byte-identical duplicate alone and
     /// is poisoned by any other first fragment (`IPV4_FRAGMENT_DUPLICATE_FIRST`
-    /// either way); the key of an evicted allowing entry is refused the
-    /// same way (a tombstone); a new one needs room (evicting a victim if
-    /// needed). Changes nothing else.
+    /// either way); the key of an evicted allowing or poisoned entry is
+    /// refused the same way (a tombstone); a new one needs room (evicting
+    /// victims only when all the room it needs can be made). Changes
+    /// nothing else.
     pub(crate) fn admit_first(
         &mut self,
         info: Ipv4FragmentInfo,
@@ -1519,7 +1807,12 @@ impl<'a> Ipv4FragmentTracker<'a> {
                     self.counters.poisoned += 1;
                     return Err(DropReason::Ipv4FragmentDuplicateFirst);
                 }
-                self.make_room(info.key.ingress, info.key.source, now_ms)?;
+                if self.free_entry == NONE {
+                    self.expire(now_ms, 1);
+                }
+                let mut chosen = Victims::EMPTY;
+                self.plan_room(info.key.ingress, info.key.source, &mut chosen, now_ms)?;
+                self.evict_all(&chosen, now_ms);
                 Ok(Ipv4FragmentFirstTicket {
                     info,
                     existing: None,
@@ -1535,7 +1828,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
         now_ms: u64,
     ) -> Option<usize> {
         let index = match ticket.existing {
-            Some(index) if self.entries[index as usize].state == EntryState::Pending => {
+            Some(index)
+                if self.entries[index as usize].state == EntryState::Pending
+                    && self.entries[index as usize].key == ticket.info.key =>
+            {
                 let index = index as usize;
                 self.set_state(index, state);
                 index
@@ -1618,7 +1914,9 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// a copy of `frame` until the first fragment decides. Every answer
     /// records the fragment's data; one that contradicts the datagram's end
     /// poisons the entry and is `IPV4_FRAGMENT_MALFORMED`. A fragment on the
-    /// key of an evicted allowing entry is refused (its datagram is gone).
+    /// key of an evicted allowing or poisoned entry is refused (its
+    /// datagram is gone). A hold is admitted whole before anything is
+    /// evicted for it: a fragment that is then refused evicts nothing.
     pub(crate) fn follow(
         &mut self,
         info: Ipv4FragmentInfo,
@@ -1656,7 +1954,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
             self.counters.followed_denied += 1;
             return Ok(Ipv4FragmentFollow::Deny);
         }
-        // Hold: every check before any change.
+        // Hold: every check, and the choice of every victim, before any
+        // change.
         if self.held.is_empty() {
             return Err(DropReason::Ipv4FragmentHoldFull);
         }
@@ -1674,24 +1973,35 @@ impl<'a> Ipv4FragmentTracker<'a> {
         if host_held >= self.policy.held_per_host {
             return Err(DropReason::Ipv4FragmentHostHoldLimit);
         }
-        if self.free_held == NONE {
-            self.make_held_room(existing, now_ms);
+        if let Some(index) = existing {
+            let mut probe = self.entries[index];
+            if probe.record(info.offset, info.data_len, info.more).is_err() {
+                self.poison(index);
+                return Err(DropReason::Ipv4FragmentMalformed);
+            }
         }
-        if self.free_held == NONE {
-            return Err(DropReason::Ipv4FragmentHoldFull);
+        if self.free_held == NONE || (existing.is_none() && self.free_entry == NONE) {
+            // `existing` was live at `now_ms`, so this leaves it.
+            self.expire(now_ms, 1);
         }
-        // `make_held_room` left `existing` live: it was not expired at
-        // `now_ms` and is never its own victim.
+        let mut chosen = Victims::EMPTY;
+        if self.free_held == NONE {
+            let requester = self.ingress_of(info.key.ingress);
+            let victim = self.held_victim(requester, existing, &chosen);
+            if victim == NONE {
+                return Err(DropReason::Ipv4FragmentHoldFull);
+            }
+            chosen.push(victim);
+        }
+        if existing.is_none() {
+            self.plan_room(info.key.ingress, info.key.source, &mut chosen, now_ms)?;
+        }
+        self.evict_all(&chosen, now_ms);
         let index = match existing {
             Some(index) => index,
-            None => {
-                self.make_room(info.key.ingress, info.key.source, now_ms)?;
-                if self.free_held == NONE {
-                    return Err(DropReason::Ipv4FragmentHoldFull);
-                }
-                self.insert_entry(info.key, EntryState::Pending, now_ms)
-                    .ok_or(DropReason::Ipv4FragmentTableFull)?
-            }
+            None => self
+                .insert_entry(info.key, EntryState::Pending, now_ms)
+                .ok_or(DropReason::Ipv4FragmentTableFull)?,
         };
         self.record(index, info, now_ms)?;
         let held = self.free_held;
@@ -1702,9 +2012,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
             next: NONE,
             frame_len: u32::try_from(frame_len).expect("bounded by the held slot"),
         };
+        let id = u32::try_from(index).expect("entry index below NONE");
+        let slot = self.ingress_of_entry(id);
         if self.entries[index].held == 0 {
-            let id = u32::try_from(index).expect("entry index below NONE");
-            push(self.entries, &mut self.holding, id, HELD);
+            push(self.entries, &mut self.ingresses[slot].holding, id, HELD);
         }
         let entry = &mut self.entries[index];
         if entry.held_tail == NONE {
@@ -1716,6 +2027,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
         entry.held += 1;
         let host = entry.host as usize;
         self.hosts[host].held += 1;
+        self.ingresses[slot].held += 1;
+        self.update_over(slot);
         self.live_held += 1;
         self.counters.held += 1;
         Ok(Ipv4FragmentFollow::Held)
@@ -1729,6 +2042,163 @@ impl<'a> Ipv4FragmentTracker<'a> {
         if self.entries.get(index).is_some() {
             self.complete_if_covered(index);
         }
+    }
+
+    /// Walks every list and count of the table (tests only).
+    #[cfg(test)]
+    pub(crate) fn check_invariants(&self) -> Result<(), &'static str> {
+        let walk = |ends: Ends, list: usize| -> Result<Vec<u32>, &'static str> {
+            let mut out = Vec::new();
+            let mut previous = NONE;
+            let mut current = ends[OLDER];
+            while current != NONE {
+                if out.len() > self.entries.len() {
+                    return Err("list cycle");
+                }
+                let entry = &self.entries[current as usize];
+                if entry.state == EntryState::Free {
+                    return Err("free entry on a list");
+                }
+                if entry.links[list][OLDER] != previous {
+                    return Err("older link mismatch");
+                }
+                out.push(current);
+                previous = current;
+                current = entry.links[list][NEWER];
+            }
+            if ends[NEWER] != previous {
+                return Err("newest end mismatch");
+            }
+            Ok(out)
+        };
+        let live: Vec<u32> = (0..self.entries.len() as u32)
+            .filter(|&index| self.entries[index as usize].state != EntryState::Free)
+            .collect();
+        if live.len() != self.live_entries {
+            return Err("live entry count");
+        }
+        let age = walk(self.age, AGE)?;
+        if age.len() != live.len() {
+            return Err("age list");
+        }
+        let evict = walk(self.evict, CLASS)?;
+        let allow = walk(self.allow, CLASS)?;
+        if evict.len() + allow.len() != live.len()
+            || evict
+                .iter()
+                .any(|&index| self.entries[index as usize].state == EntryState::Allow)
+            || allow
+                .iter()
+                .any(|&index| self.entries[index as usize].state != EntryState::Allow)
+        {
+            return Err("table class lists");
+        }
+        let progress = |index: u32| {
+            let entry = &self.entries[index as usize];
+            entry.created_ms + u64::from(entry.progress_ms)
+        };
+        // Progress order holds while the clock does not go back.
+        if allow
+            .windows(2)
+            .any(|pair| progress(pair[0]) > progress(pair[1]))
+        {
+            return Err("allow list out of progress order");
+        }
+        let mut held_total = 0;
+        for &index in &live {
+            let entry = &self.entries[index as usize];
+            let host = &self.hosts[entry.host as usize];
+            if host.entries == 0 || host.ingress != entry.key.ingress {
+                return Err("entry host");
+            }
+            if entry.held != 0 && entry.state != EntryState::Pending {
+                return Err("decided entry holds fragments");
+            }
+            held_total += usize::from(entry.held);
+        }
+        if held_total != self.live_held {
+            return Err("held count");
+        }
+        let mut free_held = 0;
+        let mut current = self.free_held;
+        while current != NONE {
+            free_held += 1;
+            if free_held > self.held.len() {
+                return Err("free held cycle");
+            }
+            current = self.held[current as usize].next;
+        }
+        if free_held + self.live_held != self.held.len() {
+            return Err("free held list");
+        }
+        for (index, host) in self.hosts.iter().enumerate() {
+            if host.entries == 0 {
+                continue;
+            }
+            let mine: Vec<u32> = live
+                .iter()
+                .copied()
+                .filter(|&entry| self.entries[entry as usize].host as usize == index)
+                .collect();
+            let lists = walk(host.evict, HOST)?.len() + walk(host.allow, HOST)?.len();
+            if mine.len() != host.entries as usize || lists != mine.len() {
+                return Err("host lists");
+            }
+            let held: u32 = mine
+                .iter()
+                .map(|&entry| u32::from(self.entries[entry as usize].held))
+                .sum();
+            if held != host.held {
+                return Err("host held");
+            }
+        }
+        let mut over = 0;
+        for slot in 0..self.ingress_len {
+            let ingress = &self.ingresses[slot];
+            let mine: Vec<u32> = live
+                .iter()
+                .copied()
+                .filter(|&entry| self.ingress_of_entry(entry) == slot)
+                .collect();
+            let lists = walk(ingress.evict, INGRESS)?.len() + walk(ingress.allow, INGRESS)?.len();
+            if mine.len() != ingress.entries as usize || lists != mine.len() {
+                return Err("ingress lists");
+            }
+            let holding = walk(ingress.holding, HELD)?;
+            let holders = mine
+                .iter()
+                .filter(|&&entry| self.entries[entry as usize].held != 0)
+                .count();
+            let held: u32 = mine
+                .iter()
+                .map(|&entry| u32::from(self.entries[entry as usize].held))
+                .sum();
+            if holding.len() != holders || held != ingress.held {
+                return Err("ingress holding");
+            }
+            if ingress.over != (ingress.held > self.held_cap) {
+                return Err("over-share flag");
+            }
+            over += usize::from(ingress.over);
+            if self.ingress_of(ingress.id) != Some(slot) {
+                return Err("ingress map");
+            }
+        }
+        let mut listed = 0;
+        let mut slot = self.over_head;
+        while slot != NO_SLOT {
+            listed += 1;
+            if listed > IPV4_FRAGMENT_TRACKING_MAX_INGRESSES
+                || !self.ingresses[usize::from(slot)].over
+            {
+                return Err("over-share list");
+            }
+            slot = self.ingresses[usize::from(slot)].over_next;
+        }
+        if listed != over {
+            return Err("over-share list length");
+        }
+        Ok(())
     }
 }
 

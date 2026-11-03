@@ -86,6 +86,9 @@ struct Storage {
     hosts: Vec<Ipv4FragmentHostSlot>,
     host_buckets: Vec<DirectoryBucket>,
     host_nodes: Vec<DirectoryNode>,
+    tombstones: Vec<Ipv4FragmentTombstoneSlot>,
+    tombstone_buckets: Vec<DirectoryBucket>,
+    tombstone_nodes: Vec<DirectoryNode>,
     held: Vec<Ipv4FragmentHeldSlot>,
     held_bytes: Vec<u8>,
 }
@@ -93,6 +96,7 @@ struct Storage {
 impl Storage {
     fn new(entries: usize, held: usize, held_slot: usize) -> Self {
         let buckets = ipv4_fragment_tracking_buckets(entries);
+        let tombstones = ipv4_fragment_tracking_tombstones(entries);
         Self {
             entries: vec![Ipv4FragmentEntrySlot::EMPTY; entries],
             entry_buckets: vec![DirectoryBucket::default(); buckets],
@@ -100,6 +104,12 @@ impl Storage {
             hosts: vec![Ipv4FragmentHostSlot::EMPTY; entries],
             host_buckets: vec![DirectoryBucket::default(); buckets],
             host_nodes: vec![DirectoryNode::default(); entries],
+            tombstones: vec![Ipv4FragmentTombstoneSlot::EMPTY; tombstones],
+            tombstone_buckets: vec![
+                DirectoryBucket::default();
+                ipv4_fragment_tracking_buckets(tombstones)
+            ],
+            tombstone_nodes: vec![DirectoryNode::default(); tombstones],
             held: vec![Ipv4FragmentHeldSlot::EMPTY; held],
             held_bytes: vec![0; held * held_slot],
         }
@@ -113,6 +123,9 @@ impl Storage {
             hosts: &mut self.hosts,
             host_buckets: &mut self.host_buckets,
             host_nodes: &mut self.host_nodes,
+            tombstones: &mut self.tombstones,
+            tombstone_buckets: &mut self.tombstone_buckets,
+            tombstone_nodes: &mut self.tombstone_nodes,
             held: &mut self.held,
             held_bytes: &mut self.held_bytes,
         }
@@ -1312,9 +1325,10 @@ fn hold(tracker: &mut Ipv4FragmentTracker<'_>, source: [u8; 4], id: u16, now: u6
     );
 }
 
-/// Forwards a later fragment of `id` from SOURCE at `now`.
-fn progress(tracker: &mut Ipv4FragmentTracker<'_>, id: u16, now: u64) {
-    let frame = fragment(id, 2 | MF, 64, 17, 8);
+/// Forwards a later fragment of `id` from SOURCE at `now`: 8 bytes at
+/// `word` 8-byte blocks.
+fn progress(tracker: &mut Ipv4FragmentTracker<'_>, id: u16, word: u16, now: u64) {
+    let frame = fragment(id, word | MF, 64, 17, 8);
     assert!(matches!(
         tracker.follow(info(&frame), &frame, frame.len(), now),
         Ok(Ipv4FragmentFollow::Allow { .. })
@@ -1404,8 +1418,8 @@ fn a_datagram_in_progress_is_not_stalled_however_old() {
     allow(&mut tracker, 1, 0);
     allow(&mut tracker, 2, 0);
     // Datagram 1 keeps progressing; 2 does not.
-    for now in [150, 300, 450] {
-        progress(&mut tracker, 1, now);
+    for (word, now) in [(2, 150), (3, 300), (4, 450)] {
+        progress(&mut tracker, 1, word, now);
     }
     // At 500 ms both are 500 ms old, but only 2 made no progress for a
     // fifth of the timeout: it is the one evicted.
@@ -1413,7 +1427,7 @@ fn a_datagram_in_progress_is_not_stalled_however_old() {
         .admit_first(info(&fragment(3, MF, 64, 17, 16)), 500)
         .unwrap();
     tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 500);
-    progress(&mut tracker, 1, 550);
+    progress(&mut tracker, 1, 5, 550);
     // At 600 neither stalled (progress at 550 and 500).
     assert_eq!(
         tracker.admit_first(info(&fragment(4, MF, 64, 17, 16)), 600),
@@ -1423,7 +1437,7 @@ fn a_datagram_in_progress_is_not_stalled_however_old() {
     assert!(tracker
         .admit_first(info(&fragment(4, MF, 64, 17, 16)), 720)
         .is_ok());
-    progress(&mut tracker, 1, 720);
+    progress(&mut tracker, 1, 6, 720);
     assert_eq!(tracker.counters().entries_evicted, 2);
 }
 
@@ -1502,7 +1516,7 @@ fn stalling_counts_from_the_last_progress_not_the_creation() {
     let mut tracker =
         Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
     allow(&mut tracker, 1, 1_000);
-    progress(&mut tracker, 1, 1_300);
+    progress(&mut tracker, 1, 2, 1_300);
     // 150 ms since the progress at 1300 (450 since the creation): live.
     assert_eq!(
         tracker.admit_first(info(&fragment(2, MF, 64, 17, 16)), 1_450),
@@ -1538,6 +1552,9 @@ fn every_evicted_allowing_key_is_remembered_up_to_sixteen() {
     // Until the timeout from their eviction.
     assert!(tracker.tombstoned(key_of(2), 1_199));
     assert!(!tracker.tombstoned(key_of(2), 1_200));
+    // The first tombstone was overwritten within its timeout: counted.
+    assert_eq!(tracker.counters().tombstones_overwritten, 1);
+    tracker.check_invariants().unwrap();
 }
 
 #[test]
@@ -1557,4 +1574,403 @@ fn an_entry_is_counted_against_its_own_ingress_until_freed() {
     assert!(tracker
         .admit_first(info(&fragment(3, MF, 64, 17, 16)), 0)
         .is_ok());
+}
+
+// ------------------------------------------- review of #341 ----
+
+/// Offers a later fragment of `id` from `source` on `ingress` at `now` (8
+/// bytes at `word` 8-byte blocks, more to come).
+fn offer(
+    tracker: &mut Ipv4FragmentTracker<'_>,
+    ingress: IfId,
+    source: [u8; 4],
+    id: u16,
+    word: u16,
+    now: u64,
+) -> Result<Ipv4FragmentFollow, DropReason> {
+    let frame = fragment_from(source, id, word | MF, 64, 17, 8);
+    let mut later = info(&frame);
+    later.key.ingress = ingress;
+    tracker.follow(later, &frame, frame.len(), now)
+}
+
+/// Review of #341 core M1: poisoning an allowing entry moved it to the
+/// evictable class without a tombstone at eviction, so filling the host's
+/// quota evicted it and the evicted datagram's late fragments were held
+/// again, to be released by a third first fragment on the key. A poisoned
+/// entry now leaves a tombstone when it is evicted.
+#[test]
+fn an_evicted_poisoned_entry_leaves_a_tombstone() {
+    let mut storage = Storage::new(8, 4, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 2, 4), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 0);
+    // A different first fragment on the key poisons the allowing entry.
+    assert_eq!(
+        tracker.admit_first(info(&fragment(1, MF, 64, 17, 24)), 0),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    // The host's quota (2) fills, and the next datagram evicts the
+    // poisoned entry (it is refusing now).
+    allow(&mut tracker, 2, 0);
+    assert!(tracker
+        .admit_first(info(&fragment(3, MF, 64, 17, 16)), 0)
+        .is_ok());
+    assert_eq!(tracker.counters().entries_evicted, 1);
+    // The evicted datagram's late fragment is refused, not held for
+    // another datagram on the key; a third first fragment is refused too.
+    assert_eq!(
+        offer(&mut tracker, LAN, SOURCE, 1, 2, 10),
+        Ok(Ipv4FragmentFollow::Deny)
+    );
+    assert_eq!(tracker.held(), 0);
+    assert_eq!(
+        tracker.admit_first(info(&fragment(1, MF, 64, 17, 16)), 10),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    tracker.check_invariants().unwrap();
+}
+
+/// Review of #341 core M2: a duplicate fragment counted as progress, so one
+/// tiny duplicate per fifth of the timeout kept an allowing entry
+/// unevictable. Only a fragment that adds data is progress.
+#[test]
+fn duplicates_are_not_progress() {
+    let mut storage = Storage::new(1, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 0);
+    progress(&mut tracker, 1, 2, 150);
+    // The same bytes again, and bytes inside what was seen: no progress.
+    progress(&mut tracker, 1, 2, 300);
+    let inside = fragment(1, 2 | MF, 64, 17, 8);
+    assert!(matches!(
+        tracker.follow(info(&inside), &inside, inside.len(), 340),
+        Ok(Ipv4FragmentFollow::Allow { .. })
+    ));
+    // 200 ms after the last progress (150): stalled, evicted.
+    assert!(tracker
+        .admit_first(info(&fragment(2, MF, 64, 17, 16)), 350)
+        .is_ok());
+    assert_eq!(tracker.counters().entries_evicted, 1);
+}
+
+/// Review of #341 sec M1 / core L4: a later fragment that the host's limit
+/// then refuses used to evict another host's held datagram first. Every
+/// victim is chosen before any is evicted, and none is evicted when the
+/// admission fails.
+#[test]
+fn a_refused_hold_evicts_nothing() {
+    let mut storage = Storage::new(8, 2, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 2, 4), storage.borrow(), key()).unwrap();
+    let other = [10, 0, 0, 11];
+    for id in [1, 2] {
+        assert_eq!(
+            offer(&mut tracker, LAN, other, id, 2, 0),
+            Ok(Ipv4FragmentFollow::Held)
+        );
+    }
+    // SOURCE keeps its two allowing entries alive (its quota).
+    allow(&mut tracker, 3, 0);
+    allow(&mut tracker, 4, 0);
+    for id in 5..10 {
+        assert_eq!(
+            offer(&mut tracker, LAN, SOURCE, id, 2, 0),
+            Err(DropReason::Ipv4FragmentHostLimit)
+        );
+    }
+    assert_eq!(tracker.counters().entries_evicted, 0);
+    assert_eq!(tracker.held(), 2);
+    // Same for a first fragment: no partial eviction.
+    assert_eq!(
+        tracker.admit_first(info(&fragment(10, MF, 64, 17, 16)), 0),
+        Err(DropReason::Ipv4FragmentHostLimit)
+    );
+    assert_eq!(tracker.counters().entries_evicted, 0);
+    tracker.check_invariants().unwrap();
+}
+
+/// Review of #341 sec M2: held slots had no ingress protection, so forged
+/// WAN fragments evicted the LAN's out-of-order fragments. An ingress at
+/// its share of the held slots (`ingress-share-percent`) displaces its own
+/// held fragments first; one below it displaces an ingress over its share.
+#[test]
+fn held_slots_are_shared_between_ingresses() {
+    let base = Ipv4FragmentTrackingPolicy::new(1_000, 8, 8).unwrap();
+    let mut storage = Storage::new(16, 4, 1514);
+    let mut tracker = Ipv4FragmentTracker::new(base, storage.borrow(), key()).unwrap();
+    // The WAN floods every held slot (its share is 2 of 4).
+    for id in 1..=4 {
+        assert_eq!(
+            offer(
+                &mut tracker,
+                WAN,
+                [198, 51, 100, id as u8],
+                id,
+                2,
+                id.into()
+            ),
+            Ok(Ipv4FragmentFollow::Held)
+        );
+    }
+    tracker.check_invariants().unwrap();
+    // A LAN fragment displaces the WAN's oldest held datagram.
+    assert_eq!(
+        offer(&mut tracker, LAN, SOURCE, 7, 2, 10),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    assert_eq!(tracker.counters().held_evicted, 1);
+    // More WAN fragments (at its share) only displace the WAN's own.
+    for id in 20..30 {
+        assert_eq!(
+            offer(&mut tracker, WAN, [198, 51, 100, 9], id, 2, 20),
+            Ok(Ipv4FragmentFollow::Held)
+        );
+        tracker.check_invariants().unwrap();
+    }
+    // The LAN datagram is still held: its first fragment releases it.
+    let ticket = tracker
+        .admit_first(info(&fragment(7, MF, 64, 17, 16)), 30)
+        .unwrap();
+    let mut fragmentation = fragmentation(4);
+    tracker.commit_allow(
+        ticket,
+        template(8),
+        &snapshot(1500),
+        Some(&mut fragmentation),
+        30,
+    );
+    assert_eq!(tracker.counters().released, 1);
+    // A LAN at its own share displaces its own held datagram first.
+    for id in 40..42 {
+        assert_eq!(
+            offer(&mut tracker, LAN, [10, 0, 0, id as u8], id, 2, 40),
+            Ok(Ipv4FragmentFollow::Held)
+        );
+    }
+    let wan = tracker.ingress_of(WAN).unwrap();
+    let wan_before = tracker.ingresses[wan].held;
+    assert_eq!(
+        offer(&mut tracker, LAN, [10, 0, 0, 50], 50, 2, 41),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    assert_eq!(
+        tracker.ingresses[wan].held, wan_before,
+        "the LAN at its share displaced its own"
+    );
+    tracker.check_invariants().unwrap();
+}
+
+#[test]
+fn the_fingerprint_covers_every_byte_and_the_length() {
+    let base: Vec<u8> = (0..1480_u32).map(|i| (i * 7 + 3) as u8).collect();
+    assert_eq!(fingerprint(&base), fingerprint(&base.clone()));
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(fingerprint(&base));
+    for position in (0..base.len()).step_by(37).chain([base.len() - 1]) {
+        let mut changed = base.clone();
+        changed[position] ^= 0x80;
+        assert!(seen.insert(fingerprint(&changed)), "{position}");
+    }
+    for len in 0..64 {
+        assert!(seen.insert(fingerprint(&vec![0; len])), "zeros {len}");
+    }
+}
+
+/// Review of #341 core L7: random operations keep every list and count
+/// consistent.
+#[test]
+fn random_operations_keep_the_table_consistent() {
+    let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+    let mut next = move |upper: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % upper
+    };
+    let base = Ipv4FragmentTrackingPolicy::new(400, 3, 3).unwrap();
+    let mut storage = Storage::new(8, 6, 1514);
+    let mut tracker = Ipv4FragmentTracker::new(base, storage.borrow(), key()).unwrap();
+    let snapshot = snapshot(1500);
+    let mut now = 0;
+    for _ in 0..20_000 {
+        now += next(25);
+        let ingress = if next(2) == 0 { LAN } else { WAN };
+        let source = [10, 0, 0, 10 + next(4) as u8];
+        let id = next(10) as u16;
+        match next(10) {
+            0..=2 => {
+                let frame = fragment_from(source, id, MF, 64, 17, 16 + 8 * next(2) as usize);
+                let mut first = info(&frame);
+                first.key.ingress = ingress;
+                if let Ok(ticket) = tracker.admit_first(first, now) {
+                    if next(3) == 0 {
+                        tracker.commit_deny(ticket, now);
+                    } else {
+                        tracker.commit_allow(ticket, template(8), &snapshot, None, now);
+                    }
+                }
+            }
+            3..=7 => {
+                let word = 2 + next(6) as u16;
+                let more = if next(4) == 0 { 0 } else { MF };
+                let frame = fragment_from(source, id, word | more, 64, 17, 8);
+                let mut later = info(&frame);
+                later.key.ingress = ingress;
+                if let Ok(Ipv4FragmentFollow::Allow { entry, .. }) =
+                    tracker.follow(later, &frame, frame.len(), now)
+                {
+                    tracker.followed(entry);
+                }
+            }
+            _ => {
+                tracker.sweep(now, 4);
+            }
+        }
+        tracker.check_invariants().unwrap();
+    }
+    let counters = tracker.counters();
+    assert!(counters.entries_evicted > 0 && counters.held > 0 && counters.poisoned > 0);
+}
+
+/// An ingress at its share of the held slots displaces its own held
+/// datagram even when another ingress is over its share.
+#[test]
+fn an_ingress_at_its_held_share_displaces_its_own_first() {
+    let base = Ipv4FragmentTrackingPolicy::new(1_000, 8, 8)
+        .unwrap()
+        .with_ingress_share_percent(34)
+        .unwrap();
+    let mut storage = Storage::new(16, 6, 1514);
+    let mut tracker = Ipv4FragmentTracker::new(base, storage.borrow(), key()).unwrap();
+    let dmz = IfId(3);
+    // Held share 2 of 6: the WAN holds 3 (over), the LAN 2, the DMZ 1.
+    for id in 1..=3_u16 {
+        assert_eq!(
+            offer(&mut tracker, WAN, [198, 51, 100, id as u8], id, 2, 0),
+            Ok(Ipv4FragmentFollow::Held)
+        );
+    }
+    for id in 4..=5_u16 {
+        assert_eq!(
+            offer(&mut tracker, LAN, [10, 0, 0, id as u8], id, 2, 0),
+            Ok(Ipv4FragmentFollow::Held)
+        );
+    }
+    assert_eq!(
+        offer(&mut tracker, dmz, [192, 0, 2, 6], 6, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    let wan = tracker.ingress_of(WAN).unwrap();
+    let lan = tracker.ingress_of(LAN).unwrap();
+    assert_eq!(
+        offer(&mut tracker, LAN, [10, 0, 0, 7], 7, 2, 1),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    assert_eq!(
+        (tracker.ingresses[wan].held, tracker.ingresses[lan].held),
+        (3, 2)
+    );
+    tracker.check_invariants().unwrap();
+}
+
+/// The victim that frees a held slot also counts toward the host's, the
+/// ingress's, and the table's room: nothing more is evicted (and nothing
+/// unevictable is needed).
+#[test]
+fn one_victim_can_make_every_room() {
+    // Host: SOURCE at its limit (2) with a held datagram and an allowing
+    // one; the table has its two entries, and its one held slot is taken.
+    let mut storage = Storage::new(2, 1, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 2, 4), storage.borrow(), key()).unwrap();
+    assert_eq!(
+        offer(&mut tracker, LAN, SOURCE, 1, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    allow(&mut tracker, 2, 0);
+    assert_eq!(
+        offer(&mut tracker, LAN, SOURCE, 3, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    assert_eq!(tracker.counters().entries_evicted, 1);
+    tracker.check_invariants().unwrap();
+    // Ingress: the LAN at its share (2 of 4) with a held datagram and an
+    // allowing one.
+    let base = Ipv4FragmentTrackingPolicy::new(1_000, 8, 8).unwrap();
+    let mut storage = Storage::new(4, 1, 1514);
+    let mut tracker = Ipv4FragmentTracker::new(base, storage.borrow(), key()).unwrap();
+    assert_eq!(
+        offer(&mut tracker, LAN, [10, 0, 0, 1], 1, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    allow(&mut tracker, 2, 0);
+    assert_eq!(
+        offer(&mut tracker, LAN, [10, 0, 0, 3], 3, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    assert_eq!(tracker.counters().entries_evicted, 1);
+    tracker.check_invariants().unwrap();
+}
+
+/// Review of #341 core L5: a ticket names its entry by index; when that
+/// entry was evicted and its slot reused for another key before the
+/// commit, the commit leaves the other datagram alone.
+#[test]
+fn a_ticket_never_decides_another_key() {
+    let mut storage = Storage::new(1, 1, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage.borrow(), key()).unwrap();
+    assert_eq!(
+        offer(&mut tracker, LAN, SOURCE, 1, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    let ticket = tracker
+        .admit_first(info(&fragment(1, MF, 64, 17, 16)), 0)
+        .unwrap();
+    // Datagram 2 displaces datagram 1 and takes its slot.
+    assert_eq!(
+        offer(&mut tracker, LAN, [10, 0, 0, 11], 2, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 0);
+    // Datagram 2 is still undecided: its next fragment is held.
+    assert_eq!(tracker.held(), 1);
+    let frame = fragment_from([10, 0, 0, 11], 2, 2 | MF, 64, 17, 8);
+    assert!(!matches!(
+        tracker.follow(info(&frame), &frame, frame.len(), 0),
+        Ok(Ipv4FragmentFollow::Allow { .. })
+    ));
+    tracker.check_invariants().unwrap();
+}
+
+/// A held datagram's fragment that contradicts its end poisons it before
+/// any victim is chosen: nothing else is evicted for it.
+#[test]
+fn a_contradicting_hold_evicts_nothing() {
+    let mut storage = Storage::new(4, 2, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage.borrow(), key()).unwrap();
+    assert_eq!(
+        offer(&mut tracker, LAN, SOURCE, 1, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    assert_eq!(
+        offer(&mut tracker, LAN, [10, 0, 0, 11], 2, 2, 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    // Datagram 1 saw data up to 24; a last fragment ending at 16 contradicts.
+    let last = fragment(1, 1, 64, 17, 8);
+    assert_eq!(
+        tracker.follow(info(&last), &last, last.len(), 0),
+        Err(DropReason::Ipv4FragmentMalformed)
+    );
+    assert_eq!(tracker.counters().entries_evicted, 0);
+    assert_eq!(
+        tracker.held(),
+        1,
+        "only datagram 1's fragment was discarded"
+    );
+    tracker.check_invariants().unwrap();
 }

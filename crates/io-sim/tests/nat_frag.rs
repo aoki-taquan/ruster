@@ -17,12 +17,13 @@ mod support;
 use ruster_core::{
     execute_one_ipv4_fragmentation,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking,
-    ipv4_fragment_slot_bytes, ipv4_fragment_tracking_buckets, ConsumeReason, DirectoryBucket,
-    DirectoryNode, DropReason, FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface,
-    FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule,
-    FirewallRuleId, FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot,
+    ipv4_fragment_slot_bytes, ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_tombstones,
+    ConsumeReason, DirectoryBucket, DirectoryNode, DropReason, FirewallAction, FirewallConfig,
+    FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange,
+    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4FragmentEntrySlot,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
     Ipv4FragmentTracker, Ipv4FragmentTrackingCounters, Ipv4FragmentTrackingPolicy,
     Ipv4FragmentTrackingStorage, Ipv4FragmentationPolicy, Ipv4FragmentationRuntime,
     LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering, Nat44IcmpConfig,
@@ -200,6 +201,7 @@ fn tracker(
     held: usize,
 ) -> Ipv4FragmentTracker<'static> {
     let buckets = ipv4_fragment_tracking_buckets(entries);
+    let tombstones = ipv4_fragment_tracking_tombstones(entries);
     Ipv4FragmentTracker::new(
         policy,
         Ipv4FragmentTrackingStorage {
@@ -209,6 +211,12 @@ fn tracker(
             hosts: Vec::leak(vec![Ipv4FragmentHostSlot::EMPTY; entries]),
             host_buckets: Vec::leak(vec![DirectoryBucket::default(); buckets]),
             host_nodes: Vec::leak(vec![DirectoryNode::default(); entries]),
+            tombstones: Vec::leak(vec![Ipv4FragmentTombstoneSlot::EMPTY; tombstones]),
+            tombstone_buckets: Vec::leak(vec![
+                DirectoryBucket::default();
+                ipv4_fragment_tracking_buckets(tombstones)
+            ]),
+            tombstone_nodes: Vec::leak(vec![DirectoryNode::default(); tombstones]),
             held: Vec::leak(vec![Ipv4FragmentHeldSlot::EMPTY; held]),
             held_bytes: Vec::leak(vec![0; held * ipv4_fragment_slot_bytes(1500)]),
         },

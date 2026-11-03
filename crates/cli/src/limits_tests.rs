@@ -15,8 +15,8 @@ use crate::config_cmd::{
 /// Every table at its production limit (fixture header).
 pub const MAXIMAL: &str = include_str!("../../../fixtures/limits/router-production-max.toml");
 
-/// Runtime storage of [`MAXIMAL`] in bytes (63.89 MiB).
-pub const MAXIMAL_STORAGE_BYTES: u64 = 66_996_928;
+/// Runtime storage of [`MAXIMAL`] in bytes (63.94 MiB).
+pub const MAXIMAL_STORAGE_BYTES: u64 = 67_050_176;
 
 /// Which production bound a table has.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -331,7 +331,7 @@ fn validate_warns_about_an_overcommitted_fragment_share() {
         (
             "",
             "ruster: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED \
-             share-percent=50 interfaces=3\n",
+             share-percent=50 interfaces=3 entries=256\n",
         ),
         ("ingress-share-percent = 34\n", ""),
         ("ingress-share-percent = 33\n", ""),
@@ -349,6 +349,22 @@ fn validate_warns_about_an_overcommitted_fragment_share() {
     }
     let refuse = three.replacen("mode = \"associate\"", "mode = \"refuse\"", 1);
     assert_eq!(validate_text(&refuse).2, "", "no table in refuse mode");
+    // The rule uses the share the table enforces: 3 entries at 50 % give
+    // each ingress one, and two leave the third one entry (no warning);
+    // at 67 % each takes two, and two take all three.
+    let small = three.replacen("entries = 256\n", "entries = 3\n", 1);
+    assert_ne!(small, three);
+    assert_eq!(validate_text(&small).2, "");
+    let small = small.replacen(
+        "timeout-ms = 1000\n",
+        "timeout-ms = 1000\ningress-share-percent = 67\n",
+        1,
+    );
+    assert_eq!(
+        validate_text(&small).2,
+        "ruster: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED \
+         share-percent=67 interfaces=3 entries=3\n"
+    );
 }
 
 /// `plan` loads both sides with the limits of their own backend.
