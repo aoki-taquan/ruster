@@ -738,16 +738,23 @@ DF (that gets Fragmentation Needed, above).
 - Order: every decision comes first (TTL, firewall, NAT plan), then the
   fragmentation bound and slot are checked, and only then does anything
   commit. A refused datagram is dropped whole, byte-unchanged, without an
-  error, and takes no NAT mapping, firewall state, or IPv4 ID. The
+  error, and takes no NAT mapping, firewall state, or IPv4 ID (except the
+  outbound half of a hairpinned datagram, which commits before the MTU
+  check, as for every hairpin refusal). The
   datagram is then rewritten as usual (MACs, TTL, NAT translation and
   generated ID), copied into a fragmentation slot, and the received frame
   goes back to the backend (`consume.IPV4_FRAGMENTED`).
-- Right after the RX batch of the same tick the router sends each slot as
-  fragments on its egress, through the same backend-owned generated-frame
-  path as ICMP errors (`generated_fragments.*`, the frames show as
-  `origin=generated`). It first asks the backend for room for the whole
-  set; without room it sends nothing (`fragmentation.dropped_unavailable`):
-  the router never sends a partial fragment set for lack of TX room. The
+- As the last phase of the same tick, after the router's own ARP requests
+  and ICMP errors, it sends each slot as fragments on its egress, through
+  the same backend-owned generated-frame path (`generated_fragments.*`, the
+  frames show as `origin=generated`), at most `[tick]
+  generated-fragments` frames per tick (default 64, 1 to 65536; a set that
+  does not fit what is left is dropped whole, `fragmentation.dropped_budget`).
+  It first asks the backend for room for the whole set (on AF_XDP leaving
+  the router reserve of the pool free for ARP and ICMP); without room it
+  sends nothing (`fragmentation.dropped_unavailable`): the router never
+  sends a partial fragment set for lack of TX room, and forwarded
+  fragments never starve the router's own frames. The
   NAT and firewall state of such a datagram stays committed, as for a
   forwarded frame the backend refuses.
 - Layout: every fragment but the last carries the largest multiple of 8
@@ -766,7 +773,13 @@ DF (that gets Fragmentation Needed, above).
   they come from the `generated-frames` pool and the TX ring of the egress
   port, shared with ARP and ICMP errors. Size `generated-frames` for a full
   RX batch of fragmented datagrams if that is your traffic (a 1500-byte
-  datagram over a 1280 or 1400 link needs 2 frames, over 576 3).
+  datagram over a 1280 or 1400 link needs 2 frames, over 576 3). The
+  fragments one datagram can actually get are at most
+  min(`max-fragments-per-datagram`, ceil((slot - 34) / block), the free
+  generated frames of the egress minus the AF_XDP router reserve
+  (`max(2, generated-frames / 8)`), the TX ring room, `[tick]
+  generated-fragments`); a set larger than the egress pool can never be
+  sent and is counted `fragmentation.dropped_unavailable` every time.
 
 ```toml
 [fragmentation]
@@ -790,18 +803,20 @@ datagrams = 64                      # default 64, 1..=1024; slots per tick
   (`drop.IPV4_FRAGMENTATION_QUEUE_FULL` beyond). Keep it at least `[tick]
   rx` if most of your traffic needs fragmentation (a PPPoE or tunnel WAN
   link below 1500 with senders that do not use PMTUD). Each slot holds the
-  longest datagram the router can receive: the larger of the largest
-  interface `mtu` and 3826 bytes (the most a 4096-byte AF_XDP frame
-  carries). The interface `mtu` is not enforced on received frames (a
+  longest datagram the router can receive: the largest of the largest
+  interface `mtu`, 3826 bytes (the most a 4096-byte AF_XDP frame
+  carries), and, on AF_PACKET, `max-frame-len` - 14 (up to 9216). The
+  interface `mtu` is not enforced on received frames (a
   device above it only warns `MTU_BELOW_DEVICE`), so a 1500-byte datagram
   arriving on a device configured at 1280 is still fragmented, never
   dropped for its size. 64 × (12 + 14 + 3826) = 246528 bytes by default,
-  3.76 MiB at 1024 slots, 9.2 MiB at 1024 slots and a 9000-byte MTU. The
+  3.76 MiB at 1024 slots, 8.81 MiB at 1024 slots and a 9000-byte MTU. The
   storage counts in `storage-bytes` and the production byte limit.
 - Every `[fragmentation]` change is restart-required (`STORAGE_SHAPE`):
   the policy and slots are part of the storage shape. So is an interface
   MTU change above 3826 that changes the largest MTU (the slot size),
-  besides `INTERFACES`. A `[backend]` change never changes the slots.
+  besides `INTERFACES`, and an AF_PACKET `max-frame-len` above 3840 (a
+  `[backend]` change is restart-required anyway).
 - IPv4 ID of inbound fragments: the NAT generates the ID of an inbound
   DF-clear datagram from the inbound sequence of (remote, inside host,
   protocol) (NAT44-126) and fragments it with that ID. The inbound
@@ -817,7 +832,8 @@ Counters (`ruster-run-stats`): `fragmentation.queued` (staged),
 `fragmentation.fragmented` (every fragment committed), `fragmentation.fragments`,
 `fragmentation.dropped_unavailable` (no TX room for the set),
 `fragmentation.dropped_frame_too_large` (the backend refused the fragment
-length), `fragmentation.incomplete` (a backend fault after the room check
+length), `fragmentation.dropped_budget` (over the tick's fragment frame
+budget), `fragmentation.incomplete` (a backend fault after the room check
 cut a set short), `fragmentation.flushed` (the tick's fragment phase did
 not run after a backend failure), and `generated_fragments.*` (sessions,
 allocations, TX accepted/rejected).
@@ -829,7 +845,12 @@ fragmented and create NAT mappings and firewall state like any forwarded
 datagram; expect that counter to fall to 0 and `consume.IPV4_FRAGMENTED`
 and `generated_fragments.*` to grow. The default slots add 246528 bytes of
 runtime storage (`storage-bytes`; the maximal production config with
-`datagrams = 1024` is 61042880 bytes). New drop codes: 186
+`datagrams = 1024` is 61042880 bytes). A config with every table at its
+production limit and `mappings-per-host` on both NAT44 protocols now needs
+67306432 bytes with the default 64 slots and fails with
+`RUNTIME_STORAGE_BYTES_EXCEEDED` (64 MiB); set `[fragmentation] datagrams`
+to at most 12, or size a table down. New `[tick] generated-fragments`
+(default 64). New drop codes: 186
 `IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS`, 187
 `IPV4_FRAGMENTATION_QUEUE_FULL`, 188
 `IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE`, 189
@@ -2422,7 +2443,9 @@ What it proves, on the runner's kernel only:
   with the LAN `mtu` at 1280,
   host B's DF-clear 1400-byte answer arrives at host A as two fragments
   (1256 + 124) and is reassembled; the final counters show the fragmented
-  datagrams and no drop, no flush, no TX rejection.
+  datagrams and no drop, no flush, no TX rejection. The afpacket phase
+  repeats the inbound run with `backend.kind = "af-packet"`
+  (`priv_run_afpacket_frag`).
   Added by H2 (the router namespace is set up as recommended:
   `disable_ipv6=1` on every port, `all.arp_ignore=1`, `all.rp_filter=1`):
   IPv4 routes in a policy-routing table and a multipath route with one
@@ -2662,7 +2685,8 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU with `[fragmentation] enabled = false` | turn fragmentation on (the default), raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
 | `drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS` | — | a DF-clear datagram would need more fragments than `max-fragments-per-datagram` | raise the bound (default 1365), or raise the egress MTU |
 | `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | — | more DF-clear datagrams above an egress MTU in one tick than `[fragmentation] datagrams` | raise `datagrams` to at least `[tick] rx` (restart) |
-| `drop.IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE` | — | a DF-clear datagram longer than a fragmentation slot (the larger of the largest interface `mtu` and 3826); no AF_XDP port delivers one, so only the simulator can | none on AF_XDP; in a scenario, keep injected datagrams within the slot |
+| `drop.IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE` | — | a DF-clear datagram longer than a fragmentation slot (the largest of the interface `mtu`s, 3826, and the AF_PACKET `max-frame-len` - 14); no production port delivers one, so only the simulator can | none on AF_XDP or AF_PACKET; in a scenario, keep injected datagrams within the slot |
+| `fragmentation.dropped_budget` growing | — | more fragment frames per tick than `[tick] generated-fragments` | raise `generated-fragments` (and the egress `generated-frames` / TX ring with it) if the link carries much fragmented traffic |
 | `drop.IPV4_FRAGMENTATION_OFFSET_OVERFLOW` | — | a fragment whose offset plus data run past 65535 bytes (malformed, ping-of-death shape) | nothing to fix on the router; find the sender (the firewall normally refuses fragments first) |
 | `fragmentation.dropped_unavailable` growing | — | no generated-frame or TX room on the egress for a whole fragment set | raise `generated-frames` (AF_XDP) or the TX ring; check `tx_ring_full` and completion lag |
 | `fragmentation.incomplete` / `fragmentation.flushed` growing | — | backend faults during the fragment phase (an allocation failed after the room check, or a finish error) | check the backend stats and health lines of that tick; these are backend faults, not configuration |

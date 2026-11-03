@@ -35,7 +35,7 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
   stateful forward firewallと、それらを一workerへbindするfull composition wrapperを扱う。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
-  `RX → generated fragments → resolution timer → failure dispatch → generated ARP → generated ICMPv4`を
+  `RX → resolution timer → failure dispatch → generated ARP → generated ICMPv4 → generated fragments`を
   明示budget付きのsingle-worker tickとして実行する。`TickObserver`はtraceとして渡す
   allocation-freeなsaturating counter sinkで、drop/consume reason別数、tick集計、注入時刻
   だけによるhealth、generation/apply結果、NAT44/firewall/ICMPv4 limiter state tableの占有
@@ -311,10 +311,13 @@ mtu = 1400                 # 省略時1500。deviceのMTU以下（ruster runが�
 DF=0でegress MTUを超えるdatagramは、firewall、NAT planなど全decisionの後、何もcommitする前に
 fragmentationの上限とslotを確かめ（拒否は`IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS`、
 `IPV4_FRAGMENTATION_QUEUE_FULL`、`IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE`、
-`IPV4_FRAGMENTATION_OFFSET_OVERFLOW`でdatagram丸ごとdrop、NAT/firewall state/IDは消費しない）、
+`IPV4_FRAGMENTATION_OFFSET_OVERFLOW`でdatagram丸ごとdrop、NAT/firewall state/IDは消費しない。slotは
+14 + max(最大interface MTU, 3826, AF_PACKETの`max-frame-len` - 14) bytesで、受信できるdatagramはすべて収まる）、
 通常どおり書き換えてcore所有のslotへcopyし、受信frameは`IPV4_FRAGMENTED`でbackendへ返します。
-同じtickのRX直後のgenerated fragment phaseが、egressのgenerated sessionにset全体のroomを
-`check_capacity`で確かめてから（roomが無ければ一枚も送らない）、RFC 791どおりのfragment（最後以外は
+同じtickの最後（router自身のARP/ICMPの後）のgenerated fragment phaseが、`[tick] generated-fragments`
+（省略時64 frame、1〜65536。収まらないsetは丸ごとdrop、`fragmentation.dropped_budget`）の範囲で、
+egressのgenerated sessionにset全体のroomを`check_capacity`で確かめてから（roomが無ければ一枚も送らない。
+AF_XDPはARP/ICMP用のrouter reserveをsetに渡さない）、RFC 791どおりのfragment（最後以外は
 8の倍数のdata、同じID、MF/offset、checksum再計算）を送ります。受信fragmentはfirewallが先に拒否し、
 optionsは従来どおり拒否なので再fragmentやoption copyは起きません。
 
