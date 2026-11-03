@@ -207,14 +207,22 @@ fn stacked_round<L: LinkMonitor>(links: &mut L, targets: &[LinkTarget], round: &
             watched += 1;
         }
     }
+    // Validation bounds the ports by MAX_BACKEND_PORTS, so every watched
+    // port fits; one that did not would get a failed query below (fail
+    // closed), never no answer.
+    debug_assert!(targets.len() <= MAX_BACKEND_PORTS);
     if watched == 0 {
         return;
     }
     let result = links.stacked_links(&ifindexes[..watched], &mut counts[..watched]);
     let mut at = 0;
     for (target, port) in targets.iter().zip(round.ports.iter_mut()) {
-        if target.watch_uppers && port.link.is_ok() && at < watched {
-            port.uppers = Some(result.map(|()| counts[at]));
+        if target.watch_uppers && port.link.is_ok() {
+            port.uppers = Some(if at < watched {
+                result.map(|()| counts[at])
+            } else {
+                Err(NetlinkError::Truncated)
+            });
             at += 1;
         }
     }

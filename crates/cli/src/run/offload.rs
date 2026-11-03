@@ -367,7 +367,10 @@ pub mod linux {
                 //   `netdev_features_t`, a 64-bit type, so at most 64. The
                 //   buffer has room for `MAX_FEATURES` (1024) strings
                 //   whatever this or any earlier call returned, so no call
-                //   sequence can make the kernel write past it.
+                //   sequence can make the kernel write past it. Soundness
+                //   therefore relies on the kernel's NETDEV_FEATURE_COUNT
+                //   being at most 1024 (today at most 64, since
+                //   `netdev_features_t` is a `u64`).
                 // - `ETHTOOL_GFEATURES` copies `min(size we pass,
                 //   ETHTOOL_DEV_FEATURE_WORDS)` blocks, at most what the
                 //   buffer holds.

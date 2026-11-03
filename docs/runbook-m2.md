@@ -2193,8 +2193,10 @@ into the watcher's reused 32 KiB buffer. On a namespace with thousands of
 links (a Kubernetes node with about 2000 veths) that is a few MB of
 rtnetlink replies per second and an RTNL hold per round: run the router in
 its own namespace with only its ports, as recommended. A dump that link
-changes interrupt (`NLM_F_DUMP_INTR`) is retried within the round; a round
-whose every attempt was interrupted is a failed query counted apart, and
+changes interrupt (`NLM_F_DUMP_INTR`) is retried within the round; a
+device any attempt listed is still reported (fatal `KERNEL_UPPER_DEVICE`:
+it existed then), so churn cannot hide one; a round whose every attempt
+was interrupted without listing one is a failed query counted apart, and
 only 10 such rounds in a row (`LINK_DUMP_INTERRUPTED_FATAL`) end the run
 with `LINK_UNVERIFIABLE`; other dump failures are fatal after 3, as for
 the other queries.

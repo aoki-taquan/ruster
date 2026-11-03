@@ -337,6 +337,22 @@ pub fn parse_stacked_chunk(
     })
 }
 
+/// The outcome of a stacked-device dump whose every attempt was interrupted
+/// (`NLM_F_DUMP_INTR`), from the most each port saw in any attempt
+/// (`seen`): if any port saw a stacked device, those counts are the result
+/// (`Ok`, copied into `counts`): the device existed when it was listed, so
+/// reporting it is fail closed and churn cannot hide it; otherwise
+/// [`NetlinkError::Interrupted`] (a failed query with its own threshold).
+pub fn interrupted_outcome(seen: &[u32], counts: &mut [u32]) -> Result<(), NetlinkError> {
+    if seen.iter().all(|count| *count == 0) {
+        return Err(NetlinkError::Interrupted);
+    }
+    for (count, most) in counts.iter_mut().zip(seen) {
+        *count = *most;
+    }
+    Ok(())
+}
+
 /// The header walk of [`parse_chunk`]: `matches` gets every other message
 /// of `sequence` (its type and bytes) and returns how many it counts.
 fn parse_chunk_with(
@@ -1034,9 +1050,14 @@ impl LinkProbe {
         ifindexes: &[u32],
         counts: &mut [u32],
     ) -> Result<(), NetlinkError> {
-        if counts.len() < ifindexes.len() {
+        if counts.len() < ifindexes.len() || ifindexes.len() > ruster_config::MAX_BACKEND_PORTS {
             return Err(NetlinkError::Malformed);
         }
+        // The most each port saw in any attempt: an interrupted dump still
+        // saw what it listed (the device existed then), so link churn cannot
+        // hide one by interrupting every attempt.
+        let mut seen = [0_u32; ruster_config::MAX_BACKEND_PORTS];
+        let seen = &mut seen[..ifindexes.len()];
         for _ in 0..DUMP_ATTEMPTS {
             counts.iter_mut().for_each(|count| *count = 0);
             let sequence = self.next_sequence();
@@ -1067,8 +1088,11 @@ impl LinkProbe {
             if !interrupted {
                 return Ok(());
             }
+            for (most, count) in seen.iter_mut().zip(counts.iter()) {
+                *most = (*most).max(*count);
+            }
         }
-        Err(NetlinkError::Interrupted)
+        interrupted_outcome(seen, counts)
     }
 
     /// Kernel IPv4 addresses of `ifindex` ([`Self::count`]).
@@ -2181,6 +2205,22 @@ mod tests {
             parse_stacked_chunk(&hostile, 7, PORT, &[5], &mut counts),
             Err(NetlinkError::Malformed)
         );
+    }
+
+    /// L1 (#334 review): an interrupted dump keeps what it saw.
+    #[test]
+    fn an_interrupted_stacked_dump_reports_what_any_attempt_saw() {
+        let mut counts = [9_u32; 3];
+        assert_eq!(
+            interrupted_outcome(&[0, 0, 0], &mut counts),
+            Err(NetlinkError::Interrupted),
+            "nothing seen: unverifiable"
+        );
+        assert_eq!(interrupted_outcome(&[0, 2, 0], &mut counts), Ok(()));
+        assert_eq!(counts, [0, 2, 0], "a device seen in any attempt counts");
+        let mut shorter = [9_u32; 2];
+        assert_eq!(interrupted_outcome(&[1, 0], &mut shorter), Ok(()));
+        assert_eq!(shorter, [1, 0]);
     }
 
     #[test]
