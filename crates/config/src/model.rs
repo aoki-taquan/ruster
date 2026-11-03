@@ -608,7 +608,7 @@ pub struct Icmpv4ErrorGenerateV1 {
     /// Destination Unreachable, Port Unreachable (Type 3/Code 3) for a UDP
     /// datagram addressed to the router (no UDP port is open). The TCP
     /// NAT's Port Unreachable for unsolicited SYNs is
-    /// `[nat44.tcp.policy] unsolicited-syn-icmp`, not this switch.
+    /// `[nat44.tcp] unsolicited-syn-icmp`, not this switch.
     #[serde(default = "enabled")]
     pub udp_port_unreachable: bool,
     /// Parameter Problem (Type 12/Code 0) for a truncated datagram (Total

@@ -328,7 +328,8 @@ errorは受信したままのdatagramを引用してsenderの側へ返るのでN
 未実装）。default-denyでもWAN addressはUDPの全portにPort Unreachable、未実装protocolに
 Protocol Unreachableを返し、外からport/protocol scanとrouterの存在確認ができます。WANを
 黙らせるには`protocol-unreachable`/`udp-port-unreachable`/`parameter-problem`を`false`、
-`[ipv4-origin] echo-reply = false`にします（switchはrouter全体、interface別は未実装）。詳細は
+`[ipv4-origin] echo-reply = false`にします（firewallが無くpublic address = WAN addressなら
+`[nat44.tcp] unsolicited-syn-icmp = false`も。switchはrouter全体、interface別は未実装）。詳細は
 runbookの「Errors about datagrams for the router and bad headers (ICMP-ERR)」。
 
 interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は

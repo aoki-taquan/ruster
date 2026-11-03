@@ -7764,7 +7764,10 @@ fn truncated_parameter_problem<T: TraceSink>(
         return;
     }
     // A datagram to the NAT public address with a firewall would be a NAT
-    // inbound candidate the firewall judges: stay silent like transit.
+    // inbound candidate the firewall judges: stay silent like transit. On
+    // purpose for every protocol (not only the UDP/TCP/ICMP-reply inbound
+    // candidates): a truncated datagram has no reliable transport header,
+    // and silence is the fail-closed answer.
     if firewall
         && (nat44_udp_config.is_some_and(|config| ipv4.destination == config.public_address())
             || nat44_tcp_config.is_some_and(|config| ipv4.destination == config.public_address()))

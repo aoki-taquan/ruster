@@ -529,6 +529,100 @@ fn tcp_inbound_initiation_respects_session_capacity_without_eviction() {
     assert_eq!(nat.sessions()[0].remote_address(), REMOTE1);
 }
 
+/// ICMP-ERR: a truncated datagram to the NAT public address (the WAN
+/// binding) gets no Parameter Problem when a firewall is configured: it
+/// would be a NAT inbound candidate the firewall judges. Without the
+/// firewall the same datagram is router-addressed and answered.
+#[test]
+fn truncated_datagram_to_the_public_address_is_silent_with_a_firewall() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let udp_config = udp_config(&snapshot, Nat44Filtering::AddressDependent);
+    let tcp_config = tcp_config(&snapshot, Nat44Filtering::AddressDependent);
+    let mut truncated = udp(REMOTE1, PUBLIC, 443, PORT);
+    let claimed = u16::from_be_bytes([truncated[16], truncated[17]]) + 64;
+    truncated[16..18].copy_from_slice(&claimed.to_be_bytes());
+    truncated[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&truncated[14..34]);
+    truncated[24..26].copy_from_slice(&checksum.to_be_bytes());
+    let rules = [rule(
+        40,
+        WAN,
+        LAN,
+        prefix(Ipv4Address::from_octets([0; 4]), 0),
+        prefix(HOST, 32),
+        FirewallProtocol::Udp,
+        ports(PORT, PORT),
+    )];
+    let firewall_config = firewall_config(&snapshot, &rules);
+    for with_firewall in [true, false] {
+        let mut udp_mappings = [Nat44UdpMappingSlot::default(); 1];
+        let mut udp_peers = [Nat44UdpPeerSlot::default(); 1];
+        let mut udp_indexes = UdpTestIndexes::new(udp_config, udp_mappings.len(), udp_peers.len());
+        let mut udp_nat = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
+        let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
+        let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 2];
+        let mut tcp_nat = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
+        let mut firewall_slots = [FirewallStateSlot::default(); 4];
+        let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
+        let mut states = [ResolutionStateSlot::EMPTY; 1];
+        let mut actions = [ResolutionActionSlot::EMPTY; 1];
+        let mut resolution = resolution(&mut states, &mut actions);
+        let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 4];
+        let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 4];
+        let mut errors = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::default(),
+            &mut error_states,
+            &mut error_actions,
+        );
+        let mut io = SimIo::new();
+        io.inject(WAN, truncated.clone());
+        if with_firewall {
+            io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
+                1,
+                &snapshot,
+                &mut resolution,
+                &mut errors,
+                &udp_config,
+                Some(&mut udp_nat),
+                &tcp_config,
+                Some(&mut tcp_nat),
+                &firewall_config,
+                Some(&mut firewall),
+                MonotonicMillis(1),
+                &mut NoTrace,
+            )
+            .unwrap();
+        } else {
+            io.run_nat44_udp_and_tcp_with_icmpv4_errors_once(
+                1,
+                &snapshot,
+                &mut resolution,
+                &mut errors,
+                &udp_config,
+                Some(&mut udp_nat),
+                &tcp_config,
+                Some(&mut tcp_nat),
+                MonotonicMillis(1),
+                &mut NoTrace,
+            )
+            .unwrap();
+        }
+        assert_drop(
+            &mut io,
+            DropReason::Ipv4TotalLengthExceedsPacket,
+            &truncated,
+        );
+        let counters = errors.counters();
+        if with_firewall {
+            assert_eq!(counters, Default::default());
+            assert_eq!(errors.pending_actions(), 0);
+        } else {
+            assert_eq!(counters.queued_parameter_problem, 1);
+        }
+    }
+}
+
 fn firewall_config<'rules>(
     snapshot: &ForwardingSnapshot<'_>,
     rules: &'rules [FirewallRule],

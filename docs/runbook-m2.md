@@ -721,12 +721,15 @@ admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
   protocol with Protocol Unreachable (a working protocol scan). For a
   silent WAN address set `protocol-unreachable = false`,
   `udp-port-unreachable = false`, `parameter-problem = false`, and
-  `[ipv4-origin] echo-reply = false`. The switches are router-wide:
-  per-interface or per-zone scoping is not implemented yet.
+  `[ipv4-origin] echo-reply = false`; without a firewall, and with the
+  public address = WAN address, also set `[nat44.tcp]
+  unsolicited-syn-icmp = false` (the TCP NAT's delayed Port Unreachable to
+  unsolicited SYNs). The switches are router-wide: per-interface or
+  per-zone scoping is not implemented yet.
 - UDP and TCP to the NAT public address are not "for the router": they go
   to the NAT as before (no mapping: `NAT44_UDP_MAPPING_MISS`; for TCP see
   `unsolicited-syn-icmp`). `udp-port-unreachable` does not touch the TCP
-  NAT's Port Unreachable either (that one is `[nat44.tcp.policy]
+  NAT's Port Unreachable either (that one is `[nat44.tcp]
   unsolicited-syn-icmp`, counted as `queued_port_unreachable`).
 - Every error goes through the same limiter as Time Exceeded and Network/Host
   Unreachable (`interval-ms`, default 100 ms, one per egress at a time):
@@ -741,7 +744,11 @@ admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
 - With `udp-port-unreachable = false` the UDP checksum of router-addressed
   datagrams is not read (a flood costs no payload pass); such datagrams
   are all `IPV4_LOCAL_UDP_PORT_UNREACHABLE`, a broken header still
-  `IPV4_LOCAL_UDP_INVALID`.
+  `IPV4_LOCAL_UDP_INVALID`. `icmpv4_errors.disabled_udp_port_unreachable`
+  therefore also counts UDP with a bad checksum while the switch is off.
+- With a firewall configured, every truncated datagram to the NAT public
+  address is silent (whatever its protocol): it would be a NAT inbound
+  candidate that the firewall judges.
 - TCP to the router is a deliberate silent drop (no RST). The option check
   comes first, so TCP with malformed IPv4 options still gets a Parameter
   Problem. Router addresses are ingress-scoped: UDP to the address of
