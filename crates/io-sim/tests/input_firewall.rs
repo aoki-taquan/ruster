@@ -936,12 +936,122 @@ fn the_rule_walk_is_counted_and_split_by_ingress_and_protocol() {
     let mut world = World::new(&input("deny", STEALTH));
     let evaluations = |world: &World| world.active.firewall().counters().input_rule_evaluations;
     assert_eq!(evaluations(&world), 0);
-    let udp_wan = on_wan(X, PUBLIC, 47, &[0; 8]);
-    world.tick(0, &[(WAN, udp_wan)]);
+    let gre_wan = on_wan(X, PUBLIC, 47, &[0; 8]);
+    world.tick(0, &[(WAN, gre_wan)]);
     assert_eq!(evaluations(&world), 0);
-    world.tick(1_000, &[(WAN, ping_wan(X))]);
+    // UDP to the WAN address is NAT traffic (it is the public address):
+    // the input firewall tests nothing. UDP to the LAN address tests rule
+    // 10 only.
+    let udp_wan = on_wan(X, PUBLIC, 17, &udp(X, PUBLIC, (53, 40_007), b"u"));
+    world.tick(250, &[(WAN, udp_wan)]);
+    assert_eq!(evaluations(&world), 0);
+    world.tick(500, &[(LAN, udp_lan())]);
     assert_eq!(evaluations(&world), 1);
-    world.tick(2_000, &[(LAN, ping_lan())]);
+    world.tick(1_000, &[(WAN, ping_wan(X))]);
     assert_eq!(evaluations(&world), 2);
+    world.tick(2_000, &[(LAN, ping_lan())]);
+    assert_eq!(evaluations(&world), 3);
     assert_eq!(world.input_drops(), (0, 2));
+}
+
+/// Re-review of #353: `with_input_firewall` on an owner-backed snapshot
+/// replaces the rules the owner's per-ingress lists were built from, so
+/// those lists must not be used: the new rules are walked linearly and
+/// give the same verdicts as a snapshot without an owner, with no fail-open
+/// (owner without rules) and no out-of-bounds slot (owner with more rules).
+#[test]
+fn replacing_an_owners_input_rules_falls_back_to_the_linear_walk() {
+    use ruster_core::{Neighbor, Route, ValidatedForwardingOwner};
+
+    let interfaces = [
+        Interface {
+            id: LAN,
+            mac: MacAddress(LAN_MAC),
+            mtu: 1500,
+        },
+        Interface {
+            id: WAN,
+            mac: MacAddress(WAN_MAC),
+            mtu: 1500,
+        },
+    ];
+    let bindings = [
+        LocalIpv4Binding {
+            interface: LAN,
+            address: Ipv4Address::from_octets(LAN_IP),
+        },
+        LocalIpv4Binding {
+            interface: WAN,
+            address: Ipv4Address::from_octets(PUBLIC),
+        },
+    ];
+    let any = FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap();
+    let rule = |id, ingress, protocol, action| {
+        InputFirewallRule::new(FirewallRuleId(id), ingress, any, any, protocol, action)
+    };
+    let icmp = InputFirewallProtocol::Icmp { icmp_type: None };
+    let many = [
+        rule(
+            1,
+            FirewallInterface::Interface(LAN),
+            InputFirewallProtocol::Any,
+            InputFirewallAction::Accept,
+        ),
+        rule(
+            2,
+            FirewallInterface::Interface(WAN),
+            icmp,
+            InputFirewallAction::Accept,
+        ),
+        rule(
+            3,
+            FirewallInterface::Interface(WAN),
+            InputFirewallProtocol::Any,
+            InputFirewallAction::Accept,
+        ),
+    ];
+    let deny_echo = [rule(
+        9,
+        FirewallInterface::Interface(WAN),
+        InputFirewallProtocol::Icmp { icmp_type: Some(8) },
+        InputFirewallAction::Deny,
+    )];
+    let owner = |rules: &[InputFirewallRule]| {
+        ValidatedForwardingOwner::new(
+            Box::<[Route]>::default(),
+            interfaces.to_vec().into_boxed_slice(),
+            Box::<[Neighbor]>::default(),
+            bindings.to_vec().into_boxed_slice(),
+            ruster_core::Ipv4OriginPolicy::default(),
+        )
+        .unwrap()
+        .with_input_firewall(
+            rules.to_vec().into_boxed_slice(),
+            InputFirewallAction::Accept,
+        )
+        .unwrap()
+    };
+    let outcome = |snapshot: &ForwardingSnapshot<'_>| {
+        let mut io = SimIo::new();
+        io.inject(WAN, ping_wan(X));
+        io.inject(LAN, ping_lan());
+        let report = io.run_once(2, snapshot, &mut VecTrace::default()).unwrap();
+        (report.dropped, report.tx_requested)
+    };
+    let reference = ForwardingSnapshot::new(&[], &interfaces, &[], &bindings)
+        .unwrap()
+        .with_input_firewall(&deny_echo, InputFirewallAction::Accept)
+        .unwrap();
+    assert_eq!(outcome(&reference), (1, 1), "the WAN Echo is denied");
+    // An owner with no rules (empty lists) and one with three (slots past
+    // the new rules) both give the reference verdicts.
+    for base in [owner(&[]), owner(&many)] {
+        let replaced = base
+            .snapshot()
+            .with_input_firewall(&deny_echo, InputFirewallAction::Accept)
+            .unwrap();
+        assert_eq!(outcome(&replaced), outcome(&reference));
+    }
+    // The owner's own rules still use its lists.
+    assert_eq!(outcome(&owner(&many).snapshot()), (0, 2));
 }

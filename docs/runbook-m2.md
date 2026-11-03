@@ -234,9 +234,10 @@ release build with 4096 `/24` routes one route lookup went from about
 forwarded packet, about 45 kpps per queue) to about 49 ns, and a
 static-neighbor plus local-address lookup takes about 67 ns. The indexes
 are snapshot memory, not runtime storage (not in `storage-bytes`): at
-most about 262 KiB (the worst shape is 4096 non-adjacent direct routes
-plus 4096 neighbors), about 524 KiB while a reload holds the old and the
-new config. Building them is a sort, O(n log n), on the
+most about 392 KiB (the worst shape is 4096 non-adjacent direct routes
+plus 4096 neighbors, about 262 KiB, plus 256 input firewall rules in the
+shape with the longest per-ingress lists, about 130 KiB), about 784 KiB
+while a reload holds the old and the new config. Building them is a sort, O(n log n), on the
 reload path.
 
 | Table | Packet path, and what drives it | Work per packet | Release time per packet at 65536 (before H4b) | Recommended size |

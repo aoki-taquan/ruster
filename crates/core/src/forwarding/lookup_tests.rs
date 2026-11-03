@@ -566,10 +566,12 @@ fn unvalidated_duplicate_keys_resolve_to_the_first_like_find() {
 /// The largest index the config limits allow: 4096 non-adjacent direct
 /// routes (every route adds two LPM intervals, two connected boundaries,
 /// and its own on-link range), 4096 static neighbors, and 256 interfaces
-/// with one address each. About 262 KiB (snapshot memory; two owners
-/// coexist during a reload, about 524 KiB).
+/// with one address each, and 256 input firewall rules (INPUT-FW) in the
+/// shape with the most per-ingress list entries: 128 for any interface and
+/// protocol, 128 naming distinct interfaces. About 392 KiB (snapshot
+/// memory; two owners coexist during a reload, about 784 KiB).
 #[test]
-fn index_heap_at_the_worst_config_shape_is_about_262_kib() {
+fn index_heap_at_the_worst_config_shape_is_about_392_kib() {
     let interfaces: Vec<Interface> = (0..256u16)
         .map(|id| Interface {
             id: IfId(id),
@@ -602,13 +604,41 @@ fn index_heap_at_the_worst_config_shape_is_about_262_kib() {
             address: ip(0x0a00_0000 | (index << 9) | 1),
         })
         .collect();
-    let index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
-    let bytes = index.heap_bytes();
+    let mut index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
+    let tables = index.heap_bytes();
     // 8193 LPM intervals x 8 + 8192 boundaries x 8 + 4096 on-link ranges
     // x 16 + 4096 neighbors x 16 + 256 interfaces x 8 + 2 x 256 locals x 8.
     assert_eq!(
-        bytes,
+        tables,
         8193 * 8 + 8192 * 8 + 4096 * 16 + 4096 * 16 + 256 * 8 + 2 * 256 * 8
     );
-    assert!(bytes <= 300 * 1024, "{bytes}");
+    assert!(tables <= 300 * 1024, "{tables}");
+
+    // Input rules: with `a` rules for any interface and protocol and `b`
+    // naming distinct interfaces, the lists hold 4a + 4b(a + 1) entries,
+    // most at a = b = 128.
+    let any = crate::FirewallIpv4Prefix::new(ip(0), 0).unwrap();
+    let rules: Vec<crate::InputFirewallRule> = (0..crate::INPUT_FIREWALL_MAX_RULES as u32)
+        .map(|slot| {
+            let ingress = if slot < 128 {
+                crate::FirewallInterface::Any
+            } else {
+                crate::FirewallInterface::Interface(IfId((slot - 128) as u16))
+            };
+            crate::InputFirewallRule::new(
+                crate::FirewallRuleId(slot + 1),
+                ingress,
+                any,
+                any,
+                crate::InputFirewallProtocol::Any,
+                crate::InputFirewallAction::Accept,
+            )
+        })
+        .collect();
+    index.set_input_firewall(crate::firewall::InputFirewallIndex::build(&rules));
+    let bytes = index.heap_bytes();
+    let entries = 4 * 128 + 4 * 128 * 129;
+    let lists = 128 * std::mem::size_of::<(u16, [u32; 5])>();
+    assert_eq!(bytes - tables, entries * 2 + lists);
+    assert!(bytes <= 400 * 1024, "{bytes}");
 }

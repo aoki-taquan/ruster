@@ -1139,6 +1139,11 @@ pub struct ForwardingSnapshot<'a> {
     /// The input firewall action of a local datagram no rule matches. In
     /// the padding after the ARP and IPv4 origin policies.
     input_firewall_default: crate::InputFirewallAction,
+    /// Whether `index` holds the per-ingress lists of exactly
+    /// `input_firewall_rules` (an owner's own rules). Cleared by
+    /// [`Self::with_input_firewall`], whose rules the owner's lists do not
+    /// describe, so those walk linearly. Also in the padding.
+    input_firewall_indexed: bool,
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
     /// Without it every lookup uses the linear reference (PERF-002).
@@ -1327,6 +1332,7 @@ impl<'a> ForwardingSnapshot<'a> {
             source_validation: &[],
             input_firewall_rules: &[],
             input_firewall_default: crate::InputFirewallAction::Accept,
+            input_firewall_indexed: false,
             index: None,
             authority: calculate_snapshot_authority(
                 routes,
@@ -1471,6 +1477,9 @@ impl<'a> ForwardingSnapshot<'a> {
         Ok(Self {
             input_firewall_rules: rules,
             input_firewall_default: default,
+            // The owner's lists (if any) were built from its own rules,
+            // not from `rules`: walk these linearly.
+            input_firewall_indexed: false,
             authority,
             ..self
         })
@@ -1803,6 +1812,7 @@ impl ValidatedForwardingOwner {
             source_validation: &self.source_validation,
             input_firewall_rules: &self.input_firewall_rules,
             input_firewall_default: self.input_firewall_default,
+            input_firewall_indexed: true,
             index: Some(&self.index),
             authority: self.authority,
         }
@@ -1811,8 +1821,10 @@ impl ValidatedForwardingOwner {
     /// Heap bytes of the publication-time lookup indexes (snapshot memory,
     /// not runtime storage; freed with the owner). Bounded by the config
     /// limits: the worst shape (4096 non-adjacent direct routes, 4096
-    /// neighbors, 256 interfaces with one address each) is about 262 KiB,
-    /// about 524 KiB while a reload holds the old and the new owner.
+    /// neighbors, 256 interfaces with one address each, and 256 input
+    /// firewall rules split into the most per-ingress lists, INPUT-FW) is
+    /// about 392 KiB, about 784 KiB while a reload holds the old and the new
+    /// owner.
     #[must_use]
     pub fn index_heap_bytes(&self) -> usize {
         self.index.heap_bytes()
@@ -8073,7 +8085,10 @@ fn judge_input_firewall<T: TraceSink>(
     };
     let (verdict, tests) = crate::firewall::evaluate_input_firewall(
         snapshot.input_firewall_rules,
-        snapshot.index.map(ForwardingIndex::input_firewall),
+        snapshot
+            .index
+            .filter(|_| snapshot.input_firewall_indexed)
+            .map(ForwardingIndex::input_firewall),
         snapshot.input_firewall_default,
         &packet,
     );

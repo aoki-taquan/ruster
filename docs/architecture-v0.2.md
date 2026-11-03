@@ -2221,8 +2221,9 @@ differential testのoracleです。
 
 memoryはsnapshot memory（runtime storageの`storage-bytes`には含めない）で、ownerと一緒に
 解放されます。上限config（4096 route、4096 neighbor、interfaceごとに一つのaddress、
-256 interface）のworst shape（隣接しない4096 direct routeと4096 neighbor）で約262 KiB、
-reload中は旧generationの分と合わせて約524 KiBです
+256 interface、256 input firewall rule）のworst shape（隣接しない4096 direct routeと4096
+neighbor、per-ingress listが最大になる256 input rule）で約392 KiB、reload中は旧generationの分と
+合わせて約784 KiBです
 （`ValidatedForwardingOwner::index_heap_bytes`）。publication costはO(n log n)の
 sortだけです。snapshotは`identity`（8 word）を保持せず借用sliceから都度作るので
 （O(1)）、index参照を足しても`ForwardingSnapshot`は144→88 bytesです（RT-002）。URPFで
