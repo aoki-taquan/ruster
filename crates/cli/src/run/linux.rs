@@ -31,7 +31,7 @@ use super::startup::{
     CloseFailure, Failure, OpenPort, PacketFacts, PacketOpenError, PortHost, Stage, StartupError,
 };
 use super::stats::write_fields;
-use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
+use super::watch::{Forwarding, IntegritySample, Ipv6Sample, LinkTarget, PortSample};
 
 /// High bits of every engine's UMEM domain id (`"rstr"`); the low bits are
 /// the port's `IfId`, so domains are distinct per port.
@@ -392,6 +392,21 @@ impl<'s> Datapath for XdpDatapath<'s> {
                     fill_ring_occupancy: counters.fill_ring_occupancy,
                     rx_packets: counters.rx_packets,
                     device_gone: false,
+                });
+            }
+        }
+    }
+
+    /// The quarantined frames and the kernel's `tx_invalid_descs` of each
+    /// port (one more `getsockopt(XDP_STATISTICS)` per port per health
+    /// sample; no allocation).
+    fn sample_integrity(&self, visit: &mut impl FnMut(IntegritySample)) {
+        for interface in self.io.interfaces() {
+            if let Some(stats) = self.io.port_stats(interface) {
+                visit(IntegritySample {
+                    interface,
+                    frames_quarantined: stats.counters.frames_quarantined,
+                    tx_invalid_descs: stats.counters.kernel_tx_invalid_descs,
                 });
             }
         }

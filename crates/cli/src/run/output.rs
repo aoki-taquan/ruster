@@ -33,6 +33,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::log::{LogFormat, Sink};
+
 /// Messages queued per stream before new ones are dropped.
 pub const QUEUE: usize = 64;
 
@@ -139,8 +141,10 @@ impl ColdOutput {
 
     /// Writer threads over duplicates of this process's fd 1 and fd 2, as
     /// plain `File`s that take no std stdout/stderr lock, each running
-    /// `prologue` first.
-    pub fn process<P, X>(prologue: P) -> Result<Self, SpawnError<X>>
+    /// `prologue` first. With [`LogFormat::Json`] each thread translates
+    /// what it writes into JSON lines ([`super::log`]): the translation
+    /// runs on the writer threads, never on the caller's.
+    pub fn process<P, X>(prologue: P, format: LogFormat) -> Result<Self, SpawnError<X>>
     where
         P: Fn() -> Result<(), X> + Clone + Send + 'static,
         X: Send + 'static,
@@ -154,7 +158,7 @@ impl ColdOutput {
         };
         let out = duplicate(io::stdout().as_fd())?;
         let err = duplicate(io::stderr().as_fd())?;
-        Self::spawn_with(out, err, prologue)
+        Self::spawn_with(Sink::new(out, format), Sink::new(err, format), prologue)
     }
 
     /// A writer for `stream`.
@@ -299,7 +303,7 @@ mod tests {
         let stdout = io::stdout();
         let stderr = io::stderr();
         let held = (stdout.lock(), stderr.lock());
-        let output = ColdOutput::process(|| Ok::<(), ()>(())).expect("dup fds");
+        let output = ColdOutput::process(|| Ok::<(), ()>(()), LogFormat::Text).expect("dup fds");
         let mut out = output.writer(Stream::Out);
         let mut err = output.writer(Stream::Err);
         writeln!(out, "ruster-output-wiring-probe").unwrap();

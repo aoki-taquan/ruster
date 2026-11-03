@@ -38,6 +38,63 @@ pub struct ConfigV1 {
     /// What an applied reload does with runtime state; absent means
     /// [`ReloadStateV1::Carry`].
     pub reload: Option<ReloadV1>,
+    /// `ruster run` health thresholds (`[health]`, OPS-LOG); a key that is
+    /// absent falls back to the matching `ruster run` flag, then to the
+    /// built-in default. Ignored by `run-sim`.
+    pub health: Option<HealthV1>,
+    /// `ruster run` watch intervals (`[watch]`, OPS-LOG); same fallback as
+    /// [`HealthV1`].
+    pub watch: Option<WatchV1>,
+}
+
+/// `[health]`: the health thresholds of `ruster run`'s watch (OPS-LOG).
+///
+/// Every key is optional; validation bounds each one
+/// ([`crate::HEALTH_MS_RANGE`] and the other `HEALTH_*` bounds) and fails
+/// closed. A fatal threshold of 0 turns that fatal exit into a warning.
+/// All of them are reloadable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct HealthV1 {
+    /// The oldest in-flight TX frame unchanged this long: warning
+    /// `TX_STALL`.
+    pub tx_stall_warn_ms: Option<u64>,
+    /// ... this long: fatal `TX_STALL`; 0 never. At least
+    /// `tx-stall-warn-ms` unless 0.
+    pub tx_stall_fatal_ms: Option<u64>,
+    /// Kick errors growing in every sample this long: fatal
+    /// `KICK_ERRORS`; 0 never.
+    pub kick_errors_fatal_ms: Option<u64>,
+    /// Fill starved this long: warning `FILL_STARVED`.
+    pub fill_starved_warn_ms: Option<u64>,
+    /// Failed link queries of one kind in a row: fatal
+    /// `LINK_UNVERIFIABLE`.
+    pub link_probe_failures_fatal: Option<u64>,
+    /// AF_PACKET stacked-device dumps interrupted in a row: fatal
+    /// `LINK_UNVERIFIABLE`.
+    pub link_dump_interrupted_fatal: Option<u64>,
+    /// AF_XDP frames quarantined on a port since startup: fatal
+    /// `FRAMES_QUARANTINED`; 0 never (the first one always warns).
+    pub frames_quarantined_fatal: Option<u64>,
+    /// AF_XDP TX descriptors the kernel refused on a port since startup
+    /// (`XDP_STATISTICS` `tx_invalid_descs`): fatal `TX_INVALID_DESCS`; 0
+    /// never (the first one always warns).
+    pub tx_invalid_descs_fatal: Option<u64>,
+}
+
+/// `[watch]`: the cold-path watch intervals of `ruster run` (OPS-LOG). All
+/// reloadable.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct WatchV1 {
+    /// Backend health sample interval.
+    pub health_interval_ms: Option<u64>,
+    /// Link round interval (link, address, route, forwarding, IPv6, and
+    /// weak-host exposure probes of every port).
+    pub link_interval_ms: Option<u64>,
+    /// Age of an outstanding link round from which every due round is
+    /// stale (a failed link query).
+    pub link_stale_ms: Option<u64>,
 }
 
 /// Reload behavior (`[reload]`, RELOAD-CARRY). Read from the document being

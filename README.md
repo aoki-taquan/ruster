@@ -1062,7 +1062,7 @@ sudo kill -HUP <pid>                                               # configをre
   `--link-stale-secs`（既定5）より古くなると以後dueごとにlink query失敗として数え
   `LINK_WATCH_STALE`、3回目で`LINK_UNVERIFIABLE` fatal）。最古のin-flight TX frameが完了しない`TX_STALL`は既定1 sでwarning、10 sでfatal、
   `FILL_STARVED`はwarningだけ、`ENETDOWN`以外のkick errorが続く`KICK_ERRORS`は既定5 sでfatal。
-  `--tx-stall-warn-secs`/`--tx-stall-fatal-secs`/`--kick-errors-fatal-secs`で変えられ、fatalを0にすると
+  閾値は`[health]`（`tx-stall-warn-ms`/`tx-stall-fatal-ms`/`kick-errors-fatal-ms`等、OPS-LOG、下記）で変えられ、fatalを0にすると
   warningだけです（802.3x PAUSE floodのようにwireからTX stallを起こせる環境向け。既定がfatalなのは
   exit後もforwarding拒否とkernel L3拒否でfail closedだから）。同じroundでportにkernel IPv4
   addressや全tableのIPv4 routeが現れたり（`RTM_GETADDR`/`RTM_GETROUTE`）、kernel forwardingがonに
@@ -1108,7 +1108,24 @@ sudo kill -HUP <pid>                                               # configをre
   あればその半分ごとにrouter threadのtick間から`WATCHDOG=1`（止まったrouterはpingしない）。送信は
   blockせず、失敗は`notify.failed`。不正な`NOTIFY_SOCKET`/`WATCHDOG_*`は`stage=notify`でexit 1。
   unit例は`Type=notify-reload`と`WatchdogSec=`（runbookの2章）。
-- multi-queue、structured logはdeferred
+- health閾値とwatch間隔（OPS-LOG）: `[health]`（`tx-stall-warn-ms` 既定1000、`tx-stall-fatal-ms` 10000、
+  `kick-errors-fatal-ms` 5000、`fill-starved-warn-ms` 1000、`link-probe-failures-fatal` 3、
+  `link-dump-interrupted-fatal` 10、`frames-quarantined-fatal` 64、`tx-invalid-descs-fatal` 64）と
+  `[watch]`（`health-interval-ms` 500、`link-interval-ms` 1000、`link-stale-ms` 5000）のconfig key。既定は
+  従来値、範囲外は`HEALTH_VALUE_OUT_OF_RANGE`/`WATCH_INTERVAL_OUT_OF_RANGE`でfail closed、fatalの0は
+  warningだけ。すべてreload可能で、適用されたreloadの次のsampleから効き、値が変わると
+  `watch settings applied: ...`。優先順位はkeyごとにconfig → 旧flag（`--tx-stall-warn-secs`、
+  `--tx-stall-fatal-secs`、`--kick-errors-fatal-secs`、`--link-stale-secs`。deprecated、keyの無い時の
+  fallback）→ 既定。merge後にfatalがwarning未満なら`stage=health code=HEALTH_FATAL_BELOW_WARNING`
+  （起動はexit 2、reloadは失敗して旧設定のまま）。AF_XDPのframe quarantineとkernelの`tx_invalid_descs`は
+  health condition `FRAMES_QUARANTINED`/`TX_INVALID_DESCS`（増加でwarning、起動後の累計が閾値でfatal）。
+- structured log（OPS-LOG）: `--log-format json`で`ruster run`の全行を一行一つのJSON object（schema
+  `ruster-run-log/v1`: `schema`、`ts`（UTC、RFC 3339 ms）、`level`、`event`（stable code）、`msg`、
+  `fields`（`key=value`を型付き）、stats blockは`event: STATS`の`stats` object）にします。既定の`text`は
+  一行も変わりません。変換はoutput threadで行うのでrouter threadの処理、bounded queue、
+  `output.dropped`は同じで、stderrはjournaldへ一行一entryで入ります。schema、event code一覧、textからの
+  移行はrunbookの11章「JSON log format」。
+- multi-queueはdeferred
   （requirements CLI-034、runbookの「Known limits」）。filesystemの閉じ込め（CLI-034の
   chroot/mount namespace項目）はH11でLandlockとして実装。
 
@@ -1315,6 +1332,10 @@ MTUをframe上限超へ上げるとexit 1でdetach）、kernel forwardingの段�
 overrideでのwarning、稼働中のwarningとrecovered。M2 S11で`ip_forward=0`のまま
 `conf/ra/forwarding=1`の起動拒否`scope=device`と稼働中のif1だけのwarning/recoveredを追加）、
 H10のsystemd phase（work directoryのdatagram socketをpython受信者がsystemdの代わりに受け、`NOTIFY_SOCKET`と`WATCHDOG_USEC=400000`、実行userへの切り替え、既定の`--seccomp kill`の下で`READY=1`が最初、2 sに6〜14回の`WATCHDOG=1`、reloadで`RELOADING=1`（`MONOTONIC_USEC`付き）と generation 2の`READY=1`、SIGUSR1で`kind=on-demand` block、`STOPPING=1`が最後）とrename phase（稼働中に`ip link set ra down`と`name rx`でexit 1 `DEVICE_RENAMED`、attachが残らない）、
+OPS-LOGのlog_json phase（`--log-format json`の稼働中routerで転送、`[health]`/`[watch]`を変えるSIGHUP
+reloadで`watch settings applied`、fatalがwarning未満になるreloadは`reload failed: stage=health`で
+generation 2のまま、SIGUSR1、SIGTERMでexit 0・detach。stderrとstdoutの全行を`python3 -I`の`json`で
+一つのobjectとして検証し、schema、keyの順、`UNCLASSIFIED`なし、stdoutは全て`STATS`）、
 読まれないFIFOへstdoutを向けたstuck phase（FIFOがcapacityまで埋まり動かないことを`FIONREAD`で
 確かめてからSIGTERM、有界時間でexit 0）、最後にrouter netns内でraのvethを削除するとexit 1
 （`DEVICE_REMOVED`）で何もattachが残らないことを確認し、成否によらず三つのnetnsを削除します。

@@ -15,8 +15,10 @@
 //! SIGUSR1 (H10), the systemd watchdog ping when due ([`Notifier`]; a
 //! stack-composed `sendto`, no allocation), a SIGHUP reload (only on request; see
 //! [`super::reload`]), the health sample of [`super::watch`] (at most every
-//! 500 ms), and the link round: requested from the link watcher thread at
-//! most every 1 s and folded in when it came back ([`super::workers`], H7).
+//! `[watch] health-interval-ms`, default 500 ms), and the link round:
+//! requested from the link watcher thread at most every `link-interval-ms`
+//! (default 1 s) and folded in when it came back ([`super::workers`], H7).
+//! An applied reload switches the watch settings ([`super::ops`], OPS-LOG).
 //! Allocation-free unless an event line is printed. Neither the link
 //! round's rtnetlink and sysctl I/O nor the reload's read, parse,
 //! validation, candidate, and plan run on this thread: it only hands
@@ -90,7 +92,9 @@ use super::netlink::{LinkFacts, NetlinkError};
 use super::notify::{Notifier, NotifyCounters};
 use super::reload::{ReloadCounters, Reloader, TickApply};
 use super::stats::BlockKind;
-use super::watch::{Fatal, Forwarding, Ipv6Sample, LinkTarget, PortSample, Watch, WatchEvent};
+use super::watch::{
+    Fatal, Forwarding, IntegritySample, Ipv6Sample, LinkTarget, PortSample, Watch, WatchEvent,
+};
 use super::workers::LinkWatcher;
 
 /// Shortest time between two on-demand stats blocks (SIGUSR1, H10):
@@ -168,6 +172,14 @@ pub trait Datapath {
     /// Hands each port's health counters to `visit` (cold path, no
     /// allocation).
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample));
+
+    /// Hands each port's integrity counters to `visit` right after
+    /// [`Self::sample_ports`] (cold path, no allocation; OPS-LOG). AF_XDP
+    /// only: nothing by default (AF_PACKET has no frame ownership ledger
+    /// and no `XDP_STATISTICS`).
+    fn sample_integrity(&self, visit: &mut impl FnMut(IntegritySample)) {
+        let _ = visit;
+    }
 
     /// Cold-path upkeep right before each health sample (at most every
     /// [`super::watch::HEALTH_INTERVAL_MS`]); nothing by default. The
@@ -642,7 +654,7 @@ pub fn run_loop<'s, D, C, S, E, F>(
     observer: &mut TickObserver,
     clock: &mut C,
     stop: &S,
-    settings: LoopSettings,
+    mut settings: LoopSettings,
     control: &mut Control,
     err: &mut E,
     mut stats: F,
@@ -666,6 +678,7 @@ where
     let mut last_stats = clock.now();
     let mut on_demand_stats = OnDemandStats::default();
     let mut budgets = control.reloader.budgets();
+    let mut ops = control.reloader.ops();
     loop {
         if stop.stop() {
             return LoopEnd::Signal;
@@ -801,6 +814,17 @@ where
                 }
             }
             budgets = control.reloader.budgets();
+            // OPS-LOG: the applied document's watch settings take over
+            // from the next health sample and link round.
+            if control.reloader.ops() != ops {
+                ops = control.reloader.ops();
+                settings.health_interval_ms = ops.health_interval_ms;
+                settings.link_interval_ms = ops.link_interval_ms;
+                control
+                    .watch
+                    .set_thresholds(ops.thresholds, ops.limits, ops.link_stale_ms);
+                let _ = writeln!(err, "ruster run: watch settings applied: {ops}");
+            }
             if matches!(result, TickApply::Applied(None)) {
                 // Applied without a matching report: the publication
                 // contract is broken; stop rather than guess.
@@ -1005,6 +1029,7 @@ where
     if watch.health_due(now, settings.health_interval_ms) {
         datapath.refresh();
         datapath.sample_ports(&mut |sample| watch.on_sample(now, sample, &mut on_event));
+        datapath.sample_integrity(&mut |sample| watch.on_integrity(sample, &mut on_event));
     }
     if let Some(round) = control.links.poll() {
         watch.on_round(round, &mut on_event);

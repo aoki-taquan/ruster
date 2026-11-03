@@ -17,11 +17,17 @@
 //! | condition | detected when | warning after | fatal after |
 //! |---|---|---|---|
 //! | `TX_STALL` | TX is in flight and the oldest in-flight frame stays the same (no completion of it), while the link is up | [`Thresholds::tx_stall_warn_ms`] (default 1 s) | [`Thresholds::tx_stall_fatal_ms`] (default 10 s, `None`: never) |
-//! | `FILL_STARVED` | Fill holds no frame in the kernel, no RX arrived, and the engine found its free list empty (`fill_starved` grew) since the last sample | [`FILL_STARVED_WARN_MS`] | never (a symptom; the frames are held by TX, which `TX_STALL` covers) |
+//! | `FILL_STARVED` | Fill holds no frame in the kernel, no RX arrived, and the engine found its free list empty (`fill_starved` grew) since the last sample | [`Limits::fill_starved_warn_ms`] (default [`FILL_STARVED_WARN_MS`]) | never (a symptom; the frames are held by TX, which `TX_STALL` covers) |
 //! | `KICK_ERRORS` | `kick_errors` (kick failures other than `ENETDOWN`) grew in every sample | first growth | [`Thresholds::kick_errors_fatal_ms`] (default 5 s, `None`: never) of growth in every sample |
+//! | `FRAMES_QUARANTINED` | AF_XDP: the port's quarantined frames grew since the last sample ([`IntegritySample`]) | each growth (recovered without growth) | the count since startup at [`Limits::frames_quarantined_fatal`] (default 64, `None`: never) |
+//! | `TX_INVALID_DESCS` | AF_XDP: the kernel's `tx_invalid_descs` of the port grew | each growth (recovered without growth) | the count since startup at [`Limits::tx_invalid_descs_fatal`] (default 64, `None`: never) |
 //!
-//! The thresholds come from `--tx-stall-warn-secs`, `--tx-stall-fatal-secs`,
-//! and `--kick-errors-fatal-secs` (0 disables a fatal exit). A TX stall can
+//! The thresholds and both intervals come from the config's `[health]` and
+//! `[watch]` keys, falling back to `--tx-stall-warn-secs`,
+//! `--tx-stall-fatal-secs`, `--kick-errors-fatal-secs`, and
+//! `--link-stale-secs`, then to the defaults (OPS-LOG, [`super::ops`]; 0
+//! disables a fatal exit); an applied reload replaces them
+//! ([`Watch::set_thresholds`]). A TX stall can
 //! be caused from the wire (802.3x PAUSE frames from an on-segment host
 //! stop a NIC's TX), so its fatal exit is a denial-of-service lever; it
 //! stays on by default because the router fails closed (startup refuses
@@ -220,6 +226,52 @@ impl Thresholds {
         }
     }
 }
+/// The thresholds of the watch beyond [`Thresholds`] (OPS-LOG): `[health]`
+/// keys without a `ruster run` flag. [`Limits::default`] is the behaviour
+/// before they became configurable, plus the two backend integrity
+/// conditions (`FRAMES_QUARANTINED`, `TX_INVALID_DESCS`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Limits {
+    /// Fill starved this long: warning ([`FILL_STARVED_WARN_MS`]).
+    pub fill_starved_warn_ms: u64,
+    /// Failed link queries of one kind in a row: fatal
+    /// `LINK_UNVERIFIABLE` ([`LINK_PROBE_FAILURES_FATAL`]).
+    pub link_probe_failures_fatal: u32,
+    /// Interrupted stacked-device dumps in a row: fatal
+    /// `LINK_UNVERIFIABLE` ([`LINK_DUMP_INTERRUPTED_FATAL`]).
+    pub link_dump_interrupted_fatal: u32,
+    /// Frames quarantined on a port since startup: fatal
+    /// `FRAMES_QUARANTINED`; `None` never
+    /// ([`DEFAULT_FRAMES_QUARANTINED_FATAL`]).
+    pub frames_quarantined_fatal: Option<u64>,
+    /// TX descriptors the kernel refused on a port since startup: fatal
+    /// `TX_INVALID_DESCS`; `None` never
+    /// ([`DEFAULT_TX_INVALID_DESCS_FATAL`]).
+    pub tx_invalid_descs_fatal: Option<u64>,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            fill_starved_warn_ms: FILL_STARVED_WARN_MS,
+            link_probe_failures_fatal: LINK_PROBE_FAILURES_FATAL,
+            link_dump_interrupted_fatal: LINK_DUMP_INTERRUPTED_FATAL,
+            frames_quarantined_fatal: Some(DEFAULT_FRAMES_QUARANTINED_FATAL),
+            tx_invalid_descs_fatal: Some(DEFAULT_TX_INVALID_DESCS_FATAL),
+        }
+    }
+}
+
+/// Default `[health] frames-quarantined-fatal`: a port that quarantined
+/// this many frames since startup (each one a kernel descriptor that broke
+/// the frame ownership contract, withheld from the pool for good) ends the
+/// run; the first one warns.
+pub const DEFAULT_FRAMES_QUARANTINED_FATAL: u64 = 64;
+/// Default `[health] tx-invalid-descs-fatal`: a port whose kernel refused
+/// this many TX descriptors since startup (each one a frame that never
+/// completes) ends the run; the first one warns.
+pub const DEFAULT_TX_INVALID_DESCS_FATAL: u64 = 64;
+
 /// Link queries failing in a row before the link counts as unverifiable.
 pub const LINK_PROBE_FAILURES_FATAL: u32 = 3;
 /// Rounds in a row whose stacked-device link dump was interrupted by link
@@ -232,6 +284,21 @@ pub const LINK_DUMP_INTERRUPTED_FATAL: u32 = 10;
 /// Default age of an outstanding link round from which every due round
 /// counts as a failed link query (`--link-stale-secs`).
 pub const DEFAULT_LINK_STALE_MS: u64 = 5_000;
+
+/// One port's backend integrity counters at one instant (cold path,
+/// AF_XDP only; OPS-LOG): both are cumulative since the port was opened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IntegritySample {
+    pub interface: IfId,
+    /// Frames the engine quarantined (RX or TX, both pools): a kernel
+    /// descriptor that broke the ownership contract; the frame never
+    /// returns to the pool.
+    pub frames_quarantined: u64,
+    /// The kernel's `XDP_STATISTICS` `tx_invalid_descs`: TX descriptors it
+    /// consumed without sending or completing them (the frame stays in
+    /// flight for good).
+    pub tx_invalid_descs: u64,
+}
 
 /// One port's backend counters at one instant (cold path).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -356,6 +423,12 @@ pub enum Condition {
     /// AF_PACKET: the port is enslaved to an upper device, or a device of
     /// the namespace is stacked on it (always fatal there).
     KernelUpperDevice,
+    /// AF_XDP: the port quarantined frames since the last sample
+    /// (OPS-LOG).
+    FramesQuarantined,
+    /// AF_XDP: the kernel refused TX descriptors of the port since the
+    /// last sample (OPS-LOG).
+    TxInvalidDescs,
 }
 
 impl Condition {
@@ -379,6 +452,8 @@ impl Condition {
             Self::Ipv4WeakHost => "IPV4_WEAK_HOST_EXPOSURE",
             Self::LinkWatchStale => "LINK_WATCH_STALE",
             Self::KernelUpperDevice => "KERNEL_UPPER_DEVICE",
+            Self::FramesQuarantined => "FRAMES_QUARANTINED",
+            Self::TxInvalidDescs => "TX_INVALID_DESCS",
         }
     }
 }
@@ -394,6 +469,11 @@ pub enum Fatal {
     MtuDecreased,
     MtuAboveFrame,
     LinkUnverifiable,
+    /// The port quarantined [`Limits::frames_quarantined_fatal`] frames.
+    FramesQuarantined,
+    /// The kernel refused [`Limits::tx_invalid_descs_fatal`] TX
+    /// descriptors of the port.
+    TxInvalidDescs,
     /// A kernel exposure condition found at run time on an AF_PACKET port
     /// ([`ExposurePolicy`]); the code is the condition's.
     KernelExposure(Condition),
@@ -409,6 +489,8 @@ impl Fatal {
             Self::MtuDecreased => "MTU_DECREASED",
             Self::MtuAboveFrame => "MTU_ABOVE_FRAME",
             Self::LinkUnverifiable => "LINK_UNVERIFIABLE",
+            Self::FramesQuarantined => "FRAMES_QUARANTINED",
+            Self::TxInvalidDescs => "TX_INVALID_DESCS",
             Self::KernelExposure(condition) => condition.code(),
         }
     }
@@ -458,7 +540,9 @@ impl ExposurePolicy {
             | Condition::LinkProbe
             | Condition::ForwardingUnverifiable
             | Condition::Ipv6Unverifiable
-            | Condition::LinkWatchStale => false,
+            | Condition::LinkWatchStale
+            | Condition::FramesQuarantined
+            | Condition::TxInvalidDescs => false,
         }
     }
 }
@@ -545,6 +629,11 @@ struct PortWatch {
     weak_host_warned: bool,
     stale_warned: bool,
     uppers_warned: bool,
+    /// The last integrity sample (OPS-LOG).
+    integrity: Option<IntegritySample>,
+    quarantine_warned: bool,
+    invalid_descs_warned: bool,
+    limits: Limits,
     counters: PortHealth,
     /// AF_PACKET: the kernel exposure conditions that end the run.
     exposure_fatal: Option<ExposurePolicy>,
@@ -583,6 +672,11 @@ pub struct PortHealth {
     /// unreadable).
     pub ipv4_weak_host: bool,
     pub warnings: u64,
+    /// Frames quarantined on the port since startup (AF_XDP, last sample).
+    pub frames_quarantined: u64,
+    /// TX descriptors the kernel refused since startup (AF_XDP, last
+    /// sample).
+    pub tx_invalid_descs: u64,
 }
 
 impl ObservableFields for PortHealth {
@@ -654,6 +748,16 @@ impl ObservableFields for PortHealth {
             FieldValue::Flag(self.ipv4_weak_host),
         );
         visitor.field(SECTION, "warnings", FieldValue::Count(self.warnings));
+        visitor.field(
+            SECTION,
+            "frames_quarantined",
+            FieldValue::Count(self.frames_quarantined),
+        );
+        visitor.field(
+            SECTION,
+            "tx_invalid_descs",
+            FieldValue::Count(self.tx_invalid_descs),
+        );
     }
 }
 
@@ -714,6 +818,10 @@ impl Watch {
                     weak_host_warned: false,
                     stale_warned: false,
                     uppers_warned: false,
+                    integrity: None,
+                    quarantine_warned: false,
+                    invalid_descs_warned: false,
+                    limits: Limits::default(),
                     exposure_fatal: None,
                     counters: PortHealth {
                         link_up: true,
@@ -738,6 +846,52 @@ impl Watch {
     pub const fn with_link_stale_ms(mut self, stale_ms: u64) -> Self {
         self.link_stale_ms = stale_ms;
         self
+    }
+
+    /// The thresholds beyond [`Thresholds`] ([`Limits`], OPS-LOG).
+    #[must_use]
+    pub fn with_limits(mut self, limits: Limits) -> Self {
+        self.set_limits(limits);
+        self
+    }
+
+    /// Replaces every threshold (an applied reload, OPS-LOG). Conditions
+    /// being timed or counted keep their state: a lowered threshold that
+    /// one already passed acts at its next sample or query.
+    pub fn set_thresholds(&mut self, thresholds: Thresholds, limits: Limits, link_stale_ms: u64) {
+        self.thresholds = thresholds;
+        self.link_stale_ms = link_stale_ms;
+        self.set_limits(limits);
+    }
+
+    fn set_limits(&mut self, limits: Limits) {
+        for port in self.ports.iter_mut() {
+            port.limits = limits;
+        }
+    }
+
+    /// The thresholds in force.
+    #[cfg(test)]
+    pub fn thresholds(&self) -> (Thresholds, Option<Limits>, u64) {
+        (
+            self.thresholds,
+            self.ports.first().map(|port| port.limits),
+            self.link_stale_ms,
+        )
+    }
+
+    /// Folds one integrity sample of `sample.interface` (AF_XDP, OPS-LOG):
+    /// growth since the last sample warns (`FRAMES_QUARANTINED`,
+    /// `TX_INVALID_DESCS`), a sample without growth recovers, and a count
+    /// since startup at the [`Limits`] threshold is fatal.
+    pub fn on_integrity(&mut self, sample: IntegritySample, emit: &mut impl FnMut(WatchEvent)) {
+        if let Some(port) = self
+            .ports
+            .iter_mut()
+            .find(|port| port.target.interface == sample.interface)
+        {
+            port.integrity(sample, emit);
+        }
     }
 
     /// AF_PACKET (AFPKT-015): the kernel exposure conditions of `policy`
@@ -824,7 +978,7 @@ impl Watch {
                 }
                 Err(NetlinkError::Interrupted) => port.probe_failed_after(
                     Query::UppersInterrupted,
-                    LINK_DUMP_INTERRUPTED_FATAL,
+                    port.limits.link_dump_interrupted_fatal,
                     emit,
                 ),
                 Err(_) => port.probe_failed(Query::Uppers, emit),
@@ -926,6 +1080,8 @@ impl Watch {
                 || port.weak_host_warned
                 || port.stale_warned
                 || port.uppers_warned
+                || port.quarantine_warned
+                || port.invalid_descs_warned
         })
     }
 
@@ -1200,7 +1356,7 @@ impl PortWatch {
             && sample.rx_packets == last.rx_packets
             && sample.fill_starved > last.fill_starved;
         if starving {
-            if self.starved.hold(now) >= FILL_STARVED_WARN_MS && !self.starved.warned {
+            if self.starved.hold(now) >= self.limits.fill_starved_warn_ms && !self.starved.warned {
                 self.starved.warned = true;
                 self.counters.fill_starved = true;
                 self.warn(Condition::FillStarved, emit);
@@ -1237,7 +1393,70 @@ impl PortWatch {
     /// consecutive failures, so one that always fails cannot be reset by
     /// another that succeeds in the same round.
     fn probe_failed(&mut self, query: Query, emit: &mut impl FnMut(WatchEvent)) {
-        self.probe_failed_after(query, LINK_PROBE_FAILURES_FATAL, emit);
+        self.probe_failed_after(query, self.limits.link_probe_failures_fatal, emit);
+    }
+
+    /// See [`Watch::on_integrity`].
+    fn integrity(&mut self, sample: IntegritySample, emit: &mut impl FnMut(WatchEvent)) {
+        // Counted from 0: the port opened at startup with both at 0. Never
+        // backwards: a sample whose kernel statistics could not be read
+        // reports 0 for them, which must not look like growth afterwards.
+        let last = self.integrity.unwrap_or(IntegritySample {
+            interface: sample.interface,
+            frames_quarantined: 0,
+            tx_invalid_descs: 0,
+        });
+        let sample = IntegritySample {
+            interface: sample.interface,
+            frames_quarantined: sample.frames_quarantined.max(last.frames_quarantined),
+            tx_invalid_descs: sample.tx_invalid_descs.max(last.tx_invalid_descs),
+        };
+        self.integrity = Some(sample);
+        self.counters.frames_quarantined = sample.frames_quarantined;
+        self.counters.tx_invalid_descs = sample.tx_invalid_descs;
+        self.counted(
+            sample.frames_quarantined,
+            last.frames_quarantined,
+            |port| &mut port.quarantine_warned,
+            (Condition::FramesQuarantined, Fatal::FramesQuarantined),
+            self.limits.frames_quarantined_fatal,
+            emit,
+        );
+        self.counted(
+            sample.tx_invalid_descs,
+            last.tx_invalid_descs,
+            |port| &mut port.invalid_descs_warned,
+            (Condition::TxInvalidDescs, Fatal::TxInvalidDescs),
+            self.limits.tx_invalid_descs_fatal,
+            emit,
+        );
+    }
+
+    /// A cumulative counter condition: growth warns once per episode, a
+    /// sample without growth recovers, and `count` at `fatal` or above
+    /// ends the run.
+    fn counted(
+        &mut self,
+        count: u64,
+        last: u64,
+        flag: fn(&mut Self) -> &mut bool,
+        (condition, cause): (Condition, Fatal),
+        fatal: Option<u64>,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        if count > last {
+            if !*flag(self) {
+                *flag(self) = true;
+                self.warn(condition, emit);
+            }
+        } else if std::mem::take(flag(self)) {
+            self.recover(condition, emit);
+        }
+        // Also without growth: a threshold lowered by a reload below the
+        // count acts at once.
+        if fatal.is_some_and(|fatal| count >= fatal) {
+            self.fatal(cause, emit);
+        }
     }
 
     /// [`Self::probe_failed`] with its own fatal threshold.

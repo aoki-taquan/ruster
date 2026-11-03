@@ -1331,3 +1331,130 @@ fn an_interrupted_upper_device_dump_fails_closed_only_after_its_own_threshold() 
         ]
     );
 }
+
+fn integrity(watch: &mut Watch, frames: u64, descs: u64) -> Vec<WatchEvent> {
+    let mut events = Vec::new();
+    watch.on_integrity(
+        IntegritySample {
+            interface: PORT,
+            frames_quarantined: frames,
+            tx_invalid_descs: descs,
+        },
+        &mut |event| events.push(event),
+    );
+    events
+}
+
+/// OPS-LOG: growth of the quarantine or the kernel's invalid TX
+/// descriptors warns once per episode, a sample without growth recovers,
+/// the count since startup at the threshold is fatal, `None` never is,
+/// and a reading that went back (an unreadable `XDP_STATISTICS`) is not
+/// growth afterwards.
+#[test]
+fn integrity_counters_warn_recover_and_become_fatal_at_the_threshold() {
+    let mut watch = watch().with_limits(Limits {
+        frames_quarantined_fatal: Some(3),
+        tx_invalid_descs_fatal: None,
+        ..Limits::default()
+    });
+    assert_eq!(integrity(&mut watch, 0, 0), []);
+    assert_eq!(
+        integrity(&mut watch, 1, 0),
+        [warning(Condition::FramesQuarantined)]
+    );
+    assert!(watch.warning());
+    assert_eq!(integrity(&mut watch, 2, 0), []);
+    assert_eq!(
+        integrity(&mut watch, 2, 0),
+        [recovered(Condition::FramesQuarantined)]
+    );
+    assert!(!watch.warning());
+    // TX descriptors: warning only (no threshold), however many.
+    assert_eq!(
+        integrity(&mut watch, 2, 1_000_000),
+        [warning(Condition::TxInvalidDescs)]
+    );
+    // The kernel statistics unreadable (0), then back: no new growth.
+    assert_eq!(
+        integrity(&mut watch, 2, 0),
+        [recovered(Condition::TxInvalidDescs)]
+    );
+    assert_eq!(integrity(&mut watch, 2, 1_000_000), []);
+    assert_eq!(
+        integrity(&mut watch, 3, 1_000_000),
+        [
+            warning(Condition::FramesQuarantined),
+            fatal(Fatal::FramesQuarantined)
+        ]
+    );
+    let (_, health) = watch.health().next().expect("port");
+    assert_eq!(
+        (health.frames_quarantined, health.tx_invalid_descs),
+        (3, 1_000_000)
+    );
+    // Another port's sample changes nothing.
+    let mut events = Vec::new();
+    watch.on_integrity(
+        IntegritySample {
+            interface: IfId(9),
+            frames_quarantined: 99,
+            tx_invalid_descs: 99,
+        },
+        &mut |event| events.push(event),
+    );
+    assert!(events.is_empty());
+    // Defaults: 64 each, the first growth warns.
+    let mut watch = Watch::new(&[TARGET], Thresholds::default());
+    assert_eq!(
+        integrity(&mut watch, 0, 63),
+        [warning(Condition::TxInvalidDescs)]
+    );
+    assert_eq!(integrity(&mut watch, 0, 64), [fatal(Fatal::TxInvalidDescs)]);
+    assert_eq!(Condition::FramesQuarantined.code(), "FRAMES_QUARANTINED");
+    assert_eq!(Fatal::TxInvalidDescs.code(), "TX_INVALID_DESCS");
+    // Never fatal by kernel exposure policy (AF_PACKET has no such
+    // counters anyway).
+    let policy = ExposurePolicy::default();
+    assert!(!policy.is_fatal(Condition::FramesQuarantined));
+    assert!(!policy.is_fatal(Condition::TxInvalidDescs));
+}
+
+/// OPS-LOG: new thresholds take over from the next sample; conditions
+/// being timed keep their start, so a lowered fatal bound already passed
+/// acts at once, and the limits reach every port.
+#[test]
+fn replaced_thresholds_apply_from_the_next_sample() {
+    let mut watch = Watch::new(&[TARGET], Thresholds::from_secs(1, 0, 0));
+    let mut stalled = PortSample {
+        tx_inflight: 1,
+        ..sample()
+    };
+    let mut events = Vec::new();
+    for step in 0..=20_u64 {
+        stalled.polls = step;
+        stalled.oldest_age_polls = step;
+        events.extend(run(&mut watch, step * HEALTH_INTERVAL_MS, stalled));
+    }
+    assert_eq!(events, [warning(Condition::TxStall)]);
+    let limits = Limits {
+        fill_starved_warn_ms: 200,
+        link_probe_failures_fatal: 1,
+        ..Limits::default()
+    };
+    watch.set_thresholds(Thresholds::from_secs(1, 5, 0), limits, 1_234);
+    assert_eq!(
+        watch.thresholds(),
+        (Thresholds::from_secs(1, 5, 0), Some(limits), 1_234)
+    );
+    stalled.polls = 21;
+    stalled.oldest_age_polls = 21;
+    assert_eq!(
+        run(&mut watch, 21 * HEALTH_INTERVAL_MS, stalled),
+        [fatal(Fatal::TxStall)]
+    );
+    // One failed link query is now fatal.
+    assert_eq!(
+        link(&mut watch, Err(NetlinkError::Truncated)),
+        [fatal(Fatal::LinkUnverifiable)]
+    );
+}
