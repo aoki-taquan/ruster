@@ -2421,3 +2421,104 @@ fn health_and_watch_keys_are_optional_and_bounded() {
         assert!(parse(source.as_bytes()).is_err(), "{body}");
     }
 }
+
+/// ARP-HOLD: `[resolution.hold]` defaults to the RFC 1122 §2.3.2.2 hold (on,
+/// 3 per next hop, 16 per host, 64 in all, slots of a fragmentation slot's
+/// size); `enabled = false` and no fragmentation have no storage; every
+/// bound fails closed with a value-free code at the field.
+#[test]
+fn resolution_hold_section_defaults_on_and_fails_closed() {
+    use ruster_config::ArpHoldStorageShapeV1;
+    use ruster_core::{ArpHoldPolicy, ArpHoldPolicyError, ArpHoldSlot};
+
+    let with = |keys: &str| {
+        VALID.replacen(
+            "failure-holds = 5\n",
+            &format!("failure-holds = 5\n\n[resolution.hold]\n{keys}"),
+            1,
+        )
+    };
+    let absent = validated(VALID);
+    assert_eq!(absent.arp_hold().policy(), Some(ArpHoldPolicy::DEFAULT));
+    let shape = ArpHoldStorageShapeV1 {
+        packets: 64,
+        slot_bytes: 3840,
+    };
+    assert_eq!(absent.arp_hold().storage(), Some(shape));
+    assert_eq!(absent.storage_shape().arp_hold, Some(shape));
+    let empty = validated(&with(""));
+    assert_eq!(empty.arp_hold(), absent.arp_hold());
+    assert_eq!(empty.storage_shape(), absent.storage_shape());
+
+    // The switch: no hold, no storage; the bounds are not looked at.
+    let off = validated(&with("enabled = false\n"));
+    assert_eq!(off.arp_hold().policy(), None);
+    assert_eq!(off.storage_shape().arp_hold, None);
+    assert_eq!(
+        absent.storage_shape().required_bytes - off.storage_shape().required_bytes,
+        64 * (size_of::<ArpHoldSlot>() + 3840)
+    );
+    let off_zero = validated(&with("enabled = false\npackets = 0\nper-neighbor = 0\n"));
+    assert_eq!(off_zero.storage_shape(), off.storage_shape());
+
+    let tuned = validated(&with("per-neighbor = 64\nper-host = 1\npackets = 1\n"));
+    assert_eq!(
+        tuned.arp_hold().policy(),
+        Some(ArpHoldPolicy::new(64, 1).unwrap())
+    );
+    assert_eq!(
+        tuned.arp_hold().storage(),
+        Some(ArpHoldStorageShapeV1 {
+            packets: 1,
+            slot_bytes: 3840,
+        })
+    );
+    // A replay leaves through the fragmentation slots: nothing is held
+    // without them.
+    let no_fragmentation =
+        validated(&VALID.replacen("[tick]", "[fragmentation]\nenabled = false\n\n[tick]", 1));
+    assert_eq!(no_fragmentation.arp_hold().policy(), None);
+    assert_eq!(no_fragmentation.storage_shape().arp_hold, None);
+
+    for (keys, code, field) in [
+        (
+            "per-neighbor = 0",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerNeighbor),
+            "resolution.hold.per-neighbor",
+        ),
+        (
+            "per-neighbor = 65",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerNeighbor),
+            "resolution.hold.per-neighbor",
+        ),
+        (
+            "per-host = 0",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerHost),
+            "resolution.hold.per-host",
+        ),
+        (
+            "packets = 0",
+            ValidationCode::ArpHoldPacketsZero,
+            "resolution.hold.packets",
+        ),
+    ] {
+        let rejected = error(&with(&format!("{keys}\n")));
+        assert_eq!(rejected.code(), code, "{keys}");
+        assert_eq!(dotted(rejected.path()), field, "{keys}");
+    }
+    assert_eq!(
+        error(&with("per-host = 0\n")).code().code(),
+        "ARP_HOLD_POLICY"
+    );
+    assert_eq!(
+        error(&with("packets = 0\n")).code().code(),
+        "ARP_HOLD_PACKETS_ZERO"
+    );
+    let above = error(&with("packets = 65\n"));
+    assert_eq!(above.code(), ValidationCode::CapacityLimitExceeded);
+    assert_eq!((above.limit(), above.actual()), (Some(64), Some(65)));
+    assert_eq!(dotted(above.path()), "resolution.hold.packets");
+    for unknown in ["queue = 1\n", "enabled = \"yes\"\n", "packets = -1\n"] {
+        assert!(parse(with(unknown).as_bytes()).is_err(), "{unknown}");
+    }
+}
