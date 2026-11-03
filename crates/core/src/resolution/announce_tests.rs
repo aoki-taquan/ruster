@@ -421,3 +421,127 @@ fn the_frame_is_an_rfc_5227_announcement() {
     assert_eq!(frame[38..42], WAN_IP.octets());
     assert!(frame[42..].iter().all(|byte| *byte == 0));
 }
+
+/// A reload to `conflict-defense = false` drops an owed defense (#351
+/// re-review L2): a switched-off feature owes nothing, so nothing stays
+/// pending and nothing is sent.
+#[test]
+fn defense_off_by_reload_drops_an_owed_defense() {
+    world!(runtime, snapshot, ArpPolicy::RFC826);
+    let mut io = Io::default();
+    conflict(&mut runtime, &snapshot, LAN, 0);
+    assert_eq!(runtime.pending_announcements(), 1);
+    let (routes, interfaces, bindings) = (routes(), interfaces(), bindings());
+    let off = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings)
+        .unwrap()
+        .with_arp_policy(ArpPolicy::RFC826.with_defend_conflicts(false));
+    runtime.announce_changed_bindings(&snapshot, &off);
+    assert_eq!(runtime.pending_announcements(), 0);
+    assert_eq!(runtime.next_announcement_due(&off), None);
+    assert_eq!(runtime.announce_counters().cancelled, 1);
+    assert!(tick(&mut io, &mut runtime, &off, 0).is_empty());
+    // A running sequence is not a defense: it goes on.
+    runtime.request_announcements(&off, Some(WAN));
+    conflict(&mut runtime, &off, WAN, 10);
+    assert_eq!(
+        tick(&mut io, &mut runtime, &off, 10),
+        [WAN],
+        "sequence only"
+    );
+}
+
+/// A port whose generated frames keep failing backs off exponentially
+/// from ARP_ANNOUNCE_RETRY_MS (10, 20, 40, ... ms) up to
+/// ARP_ANNOUNCE_RETRY_MAX_MS, and a committed frame resets the backoff.
+#[test]
+fn unavailable_retries_back_off_exponentially_up_to_the_cap() {
+    world!(runtime, snapshot, ArpPolicy::RFC826);
+    let mut io = Io {
+        unavailable: vec![LAN],
+        ..Io::default()
+    };
+    runtime.request_announcements(&snapshot, Some(LAN));
+    let mut now = 0;
+    let mut delays = Vec::new();
+    for _ in 0..9 {
+        assert!(tick(&mut io, &mut runtime, &snapshot, now).is_empty());
+        let due = runtime
+            .next_announcement_due(&snapshot)
+            .expect("still owed")
+            .0;
+        delays.push(due - now);
+        // Nothing before the retry.
+        assert!(tick(&mut io, &mut runtime, &snapshot, due - 1).is_empty());
+        now = due;
+    }
+    assert_eq!(delays, [10, 20, 40, 80, 160, 320, 640, 1_000, 1_000]);
+    assert_eq!(runtime.announce_counters().unavailable, 9);
+    io.unavailable.clear();
+    assert_eq!(tick(&mut io, &mut runtime, &snapshot, now), [LAN]);
+    // Reset: the next failure waits 10 ms again.
+    io.unavailable.push(LAN);
+    let next = now + 2_000;
+    assert!(tick(&mut io, &mut runtime, &snapshot, next).is_empty());
+    assert_eq!(
+        runtime.next_announcement_due(&snapshot),
+        Some(MonotonicMillis(next + ARP_ANNOUNCE_RETRY_MS))
+    );
+}
+
+/// Fails the port's frames at 0, 10, 30, and 70 ms: its next retry is at
+/// 150 ms.
+fn back_off_to_150(
+    io: &mut Io,
+    runtime: &mut ResolutionRuntime<'_>,
+    snapshot: &ForwardingSnapshot<'_>,
+) {
+    for now in [0, 10, 30, 70] {
+        assert!(tick(io, runtime, snapshot, now).is_empty());
+    }
+    assert_eq!(
+        runtime.next_announcement_due(snapshot),
+        Some(MonotonicMillis(150))
+    );
+}
+
+/// A fresh trigger on a slot that only owes a (backing-off) defense is not
+/// delayed by that backoff (#352 review L-1): the defense and the first
+/// Announcement go out at once.
+#[test]
+fn a_fresh_trigger_resets_the_retry_backoff() {
+    world!(runtime, snapshot, ArpPolicy::RFC826);
+    let mut io = Io {
+        unavailable: vec![LAN],
+        ..Io::default()
+    };
+    conflict(&mut runtime, &snapshot, LAN, 0);
+    back_off_to_150(&mut io, &mut runtime, &snapshot);
+    io.unavailable.clear();
+    assert!(
+        tick(&mut io, &mut runtime, &snapshot, 100).is_empty(),
+        "backing off"
+    );
+    assert_eq!(runtime.request_announcements(&snapshot, Some(LAN)), 1);
+    assert_eq!(tick(&mut io, &mut runtime, &snapshot, 100), [LAN, LAN]);
+}
+
+/// A new defense is not delayed by the backoff of a failing sequence
+/// (#352 review L-1).
+#[test]
+fn a_new_defense_resets_the_retry_backoff() {
+    world!(runtime, snapshot, ArpPolicy::RFC826);
+    let mut io = Io {
+        unavailable: vec![LAN],
+        ..Io::default()
+    };
+    runtime.request_announcements(&snapshot, Some(LAN));
+    back_off_to_150(&mut io, &mut runtime, &snapshot);
+    io.unavailable.clear();
+    assert!(
+        tick(&mut io, &mut runtime, &snapshot, 100).is_empty(),
+        "backing off"
+    );
+    conflict(&mut runtime, &snapshot, LAN, 100);
+    assert_eq!(tick(&mut io, &mut runtime, &snapshot, 100), [LAN, LAN]);
+    assert_eq!(runtime.announce_counters().defended, 1);
+}

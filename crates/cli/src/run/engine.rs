@@ -921,8 +921,11 @@ where
         // RFC 5227 §2.1/§2.3 (ARP-033): a port whose link came back up
         // announces its address from the next tick, bounded per port by
         // `[arp] announce-min-interval-ms`.
+        // Not with a generated ARP budget of 0: nothing could be sent.
         for port in link_ups.drain(..) {
-            active.request_arp_announcements(Some(port));
+            if budgets.generated_arp != 0 {
+                active.request_arp_announcements(Some(port));
+            }
         }
         // Here, between ticks, so a router stuck anywhere stops pinging.
         control.notify.watchdog(now);
@@ -967,8 +970,13 @@ where
                 let resolution = active.resolution();
                 // An RFC 5227 announcement or defense already due that
                 // this tick could not send (ARP-033): the frame budget, or
-                // a port's retry after `Unavailable`.
-                let announcement_due = active.next_arp_announcement_due();
+                // a port's retry after `Unavailable`. With no generated
+                // ARP budget (a document without `[tick]`, whose budgets
+                // are all 0) none can ever be sent, so none is waited for:
+                // otherwise the loop would wake every 1 ms for good.
+                let announcement_due = (budgets.generated_arp != 0)
+                    .then(|| active.next_arp_announcement_due())
+                    .flatten();
                 let pending = Pending {
                     resolution: resolution.pending_states() != 0
                         || resolution.pending_failure_holds() != 0

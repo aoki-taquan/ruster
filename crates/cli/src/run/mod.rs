@@ -490,6 +490,12 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
 ))]
 const OUTPUT_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Whether `budgets` let the generated ARP phase send a frame (ARP-033:
+/// announcements are only requested then).
+const fn control_budgets_send_arp(budgets: TickBudgets) -> bool {
+    budgets.generated_arp != 0
+}
+
 /// Tick budgets of the configuration.
 fn budgets(config: &ValidatedConfigV1) -> TickBudgets {
     let tick = config.tick();
@@ -1063,8 +1069,12 @@ where
     notify.ready(active.generation().get());
     // RFC 5227 §2.3 (ARP-033): the ports are open, so every interface
     // address becomes active now; the first tick announces it (a no-op with
-    // `[arp] announce = false`).
-    active.request_arp_announcements(None);
+    // `[arp] announce = false`). Not with a generated ARP budget of 0 (a
+    // document without `[tick]`): nothing could be sent, and the stats would
+    // show never-sent work.
+    if control_budgets_send_arp(reloader.budgets()) {
+        active.request_arp_announcements(None);
+    }
     let loop_settings = LoopSettings {
         stats_interval_ms: settings.stats_interval_ms,
         health_interval_ms: ops.health_interval_ms,

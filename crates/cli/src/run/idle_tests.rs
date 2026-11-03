@@ -479,8 +479,8 @@ fn a_pending_resolution_keeps_the_waits_short() {
 /// ARP-033 regression (#351 review M): an RFC 5227 announcement that is due
 /// but whose generated frame can never be allocated (a backend whose every
 /// generated allocation is `Unavailable`) must not spin the idle loop. The
-/// port is retried every `ARP_ANNOUNCE_RETRY_MS`; the loop waits between
-/// the retries instead of ticking with timeout 0.
+/// port is retried after `ARP_ANNOUNCE_RETRY_MS`, doubling up to 1 s; the
+/// loop waits between the retries instead of ticking with timeout 0.
 #[test]
 fn an_unallocatable_announcement_does_not_spin_the_idle_loop() {
     let host = waiting_host();
@@ -494,9 +494,12 @@ fn an_unallocatable_announcement_does_not_spin_the_idle_loop() {
     assert_eq!(outcome.status, 0, "{}", outcome.err);
     let out = &outcome.out;
     assert_eq!(stat(out, "arp_announce.committed"), 0, "{out}");
-    assert!(stat(out, "arp_announce.unavailable") >= 100, "{out}");
-    // About one tick per 10 ms retry, as many waits; a spin made one tick
-    // per clock reading (10 µs), about 300000.
+    // Retries at 0, 10, 30, 70, 150, 310, 630, 1270, 2270 ms per port
+    // (two ports): the backoff holds the attempts to a few per port.
+    let unavailable = stat(out, "arp_announce.unavailable");
+    assert!((10..=24).contains(&unavailable), "{out}");
+    // About one tick per 10 ms idle wait; a spin made one tick per clock
+    // reading (10 µs), about 300000.
     let ticks = host.state.io_calls.get();
     let waits = host.state.wait_log.borrow().len();
     assert!(ticks <= 2 * SPIN_TICKS + 700, "{ticks} ticks in 3 s");
@@ -505,5 +508,44 @@ fn an_unallocatable_announcement_does_not_spin_the_idle_loop() {
         timeouts(&host.state).iter().all(|timeout| *timeout >= 1),
         "{:?}",
         timeouts(&host.state)
+    );
+}
+
+/// #351 re-review L1: a document without `[tick]` has every budget 0,
+/// generated ARP included, so its startup announcements can never be sent;
+/// the loop must not treat them as pending (it would wake every 1 ms for
+/// good) and keeps the full idle wait.
+#[test]
+fn announcements_without_a_generated_arp_budget_do_not_shorten_the_waits() {
+    let base = include_str!("../../../../fixtures/m1/router-v1.toml");
+    let start = base.find("\n[tick]\n").expect("the fixture has [tick]");
+    let end = base[start + 1..]
+        .find("\n[")
+        .map_or(base.len(), |offset| start + 1 + offset);
+    let text = format!("{}{}\n{BACKEND}", &base[..start], &base[end..]);
+    let config = match crate::config_cmd::validate_bytes(text.as_bytes()) {
+        Ok(config) => config,
+        Err(error) => panic!("valid config: {}", error.render()),
+    };
+    assert_eq!(config.tick().generated_arp, 0);
+    let host = waiting_host();
+    let (outcome, _) = run_until(
+        &host,
+        config,
+        settings(CheckPolicy::default(), 0),
+        1_000 * MS,
+    );
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    let out = &outcome.out;
+    // Not even requested: the stats show no never-sent work.
+    assert_eq!(stat(out, "arp_announce.requested"), 0, "{out}");
+    assert_eq!(stat(out, "arp_announce.committed"), 0, "{out}");
+    let timeouts = timeouts(&host.state);
+    assert!(timeouts.len() >= 50, "{timeouts:?}");
+    assert!(
+        timeouts
+            .iter()
+            .all(|timeout| u64::from(*timeout) == crate::args::DEFAULT_IDLE_WAIT_MS),
+        "{timeouts:?}"
     );
 }

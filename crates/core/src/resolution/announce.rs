@@ -175,11 +175,16 @@ impl ArpAnnouncePolicy {
 
 const NEVER: u64 = u64::MAX;
 
-/// How long a port's due Announcement waits after its generated frame
-/// could not be allocated (backend `Unavailable`) or built, so a port whose
-/// pool stays empty is not retried on every tick and cannot spin the idle
-/// loop (at least the run loop's 1 ms short wait).
+/// How long a port's due Announcement first waits after its generated
+/// frame could not be allocated (backend `Unavailable`) or built, so a port
+/// whose pool stays empty is not retried on every tick and cannot spin the
+/// idle loop (at least the run loop's 1 ms short wait). Each further
+/// failure in a row doubles the wait, up to [`ARP_ANNOUNCE_RETRY_MAX_MS`];
+/// a committed frame resets it.
 pub const ARP_ANNOUNCE_RETRY_MS: u64 = 10;
+/// Longest wait between two retries of a port whose generated frames keep
+/// failing (exponential backoff from [`ARP_ANNOUNCE_RETRY_MS`]).
+pub const ARP_ANNOUNCE_RETRY_MAX_MS: u64 = 1_000;
 
 /// A trigger waits for the next sequence.
 const REQUESTED: u8 = 1;
@@ -198,6 +203,9 @@ pub struct ArpAnnounceSlot {
     remaining: u8,
     /// [`REQUESTED`], [`DEFERRED`], [`DEFEND`].
     flags: u8,
+    /// Failed allocations in a row (the retry backoff exponent, in the
+    /// padding before `conflicts`).
+    retry_shift: u8,
     /// Conflicting ARP packets seen on the interface (saturating; a u64
     /// never saturates in practice, so the alarm cannot be silenced).
     conflicts: u64,
@@ -216,6 +224,7 @@ impl ArpAnnounceSlot {
         interface: IfId(0),
         remaining: 0,
         flags: 0,
+        retry_shift: 0,
         conflicts: 0,
         next_due: 0,
         last_start: NEVER,
@@ -261,10 +270,14 @@ pub struct ArpAnnounceCounters {
     pub rejected: u64,
     /// Generated frames that could not be allocated or built; the
     /// Announcement stays due and is retried after
-    /// [`ARP_ANNOUNCE_RETRY_MS`].
+    /// [`ARP_ANNOUNCE_RETRY_MS`], doubling for each failure in a row up to
+    /// [`ARP_ANNOUNCE_RETRY_MAX_MS`].
     pub unavailable: u64,
-    /// Waiting or running sequences dropped because the interface had no
-    /// IPv4 address at send time or announcements were switched off.
+    /// Owed frames dropped unsent: waiting or running sequences because
+    /// the interface had no IPv4 address at send time or announcements
+    /// were switched off, and owed defenses because the interface had no
+    /// address or `conflict-defense` was switched off by a reload. A
+    /// dropped defense counts both here and in `defended`.
     pub cancelled: u64,
     /// Conflicting ARP packets (RFC 5227 §2.4), all interfaces.
     pub conflicts: u64,
@@ -404,10 +417,11 @@ impl<'a> ResolutionRuntime<'a> {
     /// After a publication: rebinds the slots to `next`'s interface order
     /// (the interface set itself is restart-required, so only the order
     /// can differ); with announcements off in `next`, cancels every waiting
-    /// trigger and the rest of every running sequence at once (an owed
-    /// defense stays: it follows `conflict-defense`); and marks every
-    /// interface whose IPv4 address in `next` is new or differs from
-    /// `current`. Returns the interfaces newly marked.
+    /// trigger and the rest of every running sequence at once; with
+    /// `conflict-defense` off in `next`, drops every owed defense (so a
+    /// switched-off feature owes nothing); and marks every interface whose
+    /// IPv4 address in `next` is new or differs from `current`. Returns the
+    /// interfaces newly marked.
     pub fn announce_changed_bindings(
         &mut self,
         current: &ForwardingSnapshot<'_>,
@@ -417,6 +431,11 @@ impl<'a> ResolutionRuntime<'a> {
         if next.arp.announce().is_none() {
             for index in 0..self.announce.len() {
                 self.cancel_sequence(index);
+            }
+        }
+        if !next.arp.defend_conflicts() {
+            for index in 0..self.announce.len() {
+                self.cancel_defense(index);
             }
         }
         let mut marked = 0;
@@ -478,8 +497,12 @@ impl<'a> ResolutionRuntime<'a> {
                 return false;
             }
         } else {
-            // Idle, or only a defense owed: a new trigger.
+            // Idle, or only a defense owed: a new trigger. Backoff left
+            // from earlier failures does not delay it (a link that came
+            // back up may well have room again).
             bump(&mut self.announce_counters.requested);
+            slot.retry_shift = 0;
+            slot.retry_at = 0;
         }
         if !slot.busy() {
             self.announce_busy += 1;
@@ -498,6 +521,18 @@ impl<'a> ResolutionRuntime<'a> {
         }
         slot.remaining = 0;
         slot.flags &= !(REQUESTED | DEFERRED);
+        bump(&mut self.announce_counters.cancelled);
+        if !self.announce[index].busy() {
+            self.announce_busy -= 1;
+        }
+    }
+
+    /// Drops an owed defense (`conflict-defense` switched off).
+    fn cancel_defense(&mut self, index: usize) {
+        if !self.announce[index].has(DEFEND) {
+            return;
+        }
+        self.announce[index].flags &= !DEFEND;
         bump(&mut self.announce_counters.cancelled);
         if !self.announce[index].busy() {
             self.announce_busy -= 1;
@@ -551,6 +586,10 @@ impl<'a> ResolutionRuntime<'a> {
             return;
         }
         slot.last_defense = now.0;
+        // A new defense is not delayed by backoff left from earlier
+        // failures.
+        slot.retry_shift = 0;
+        slot.retry_at = 0;
         bump(&mut self.announce_counters.defended);
         if !slot.busy() {
             self.announce_busy += 1;
@@ -660,6 +699,7 @@ impl<'a> ResolutionRuntime<'a> {
                 slot.next_due = now.0.saturating_add(interval);
             }
         }
+        self.announce[index].retry_shift = 0;
         if !self.announce[index].busy() {
             self.announce_busy -= 1;
         }
@@ -667,7 +707,12 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn announcement_unavailable(&mut self, index: usize, now: MonotonicMillis) {
-        self.announce[index].retry_at = now.0.saturating_add(ARP_ANNOUNCE_RETRY_MS);
+        let slot = &mut self.announce[index];
+        let delay = (ARP_ANNOUNCE_RETRY_MS << slot.retry_shift).min(ARP_ANNOUNCE_RETRY_MAX_MS);
+        slot.retry_at = now.0.saturating_add(delay);
+        if delay < ARP_ANNOUNCE_RETRY_MAX_MS {
+            slot.retry_shift += 1;
+        }
         bump(&mut self.announce_counters.unavailable);
     }
 
@@ -711,7 +756,9 @@ impl<'a> ResolutionRuntime<'a> {
 ///
 /// Returns `Ok(None)` when none is due. An allocation or build failure
 /// keeps the Announcement due and holds that port back for
-/// [`ARP_ANNOUNCE_RETRY_MS`]; the other ports are not held back.
+/// [`ARP_ANNOUNCE_RETRY_MS`], doubling for each failure in a row up to
+/// [`ARP_ANNOUNCE_RETRY_MAX_MS`] (a committed frame, a fresh trigger, or a
+/// new defense resets it); the other ports are not held back.
 pub fn execute_one_arp_announcement<I, T>(
     io: &mut I,
     runtime: &mut ResolutionRuntime<'_>,
