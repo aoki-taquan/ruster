@@ -1152,6 +1152,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 nat44_icmp_mappings: exact(icmp_mappings_kept),
                 nat44_icmp_peers: exact(icmp_peers_kept),
                 firewall_flows: firewall.states_carried,
+                firewall_flows_upper_bound: firewall_reevaluates,
             },
         })
     }

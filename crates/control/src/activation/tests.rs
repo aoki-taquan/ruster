@@ -1454,6 +1454,7 @@ fn carry_revokes_the_flows_the_new_rules_deny() {
     // revokes is `invalidated`, and every live flow is a carry candidate.
     assert_eq!(check.flush.firewall_flows, crate::FlushCount::Invalidated);
     assert_eq!(check.carried.firewall_flows, udp_flows + tcp_flows);
+    assert!(check.carried.firewall_flows_upper_bound);
     assert!(check.carry.firewall_reevaluated);
     let report = tick(&mut active, &mut io, 1_020, Some(successor));
     assert_eq!(report.publication, PublicationOutcome::Applied);

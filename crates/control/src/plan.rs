@@ -157,8 +157,11 @@ pub struct CarriedCounts {
     pub nat44_icmp_mappings: usize,
     pub nat44_icmp_peers: usize,
     /// Live flows the apply keeps, before the commit's re-evaluation
-    /// (an upper bound when [`StateCarry::firewall_reevaluated`]).
+    /// (an upper bound when [`Self::firewall_flows_upper_bound`]).
     pub firewall_flows: usize,
+    /// `firewall_flows` is an upper bound: the commit re-evaluates the
+    /// carried flows (changed rules or routes) and may revoke some.
+    pub firewall_flows_upper_bound: bool,
 }
 
 /// Result of a successful guard-free dry-run of one successor.
@@ -740,6 +743,17 @@ fn document_carry(
             icmp.policy().peers_per_host(),
         ])
     };
+    let firewall = {
+        let (old, new) = (old.firewall.policy(), new.firewall.policy());
+        let longer = new.udp_idle_ttl_ms() > old.udp_idle_ttl_ms()
+            || new.tcp_opening_idle_ttl_ms() > old.tcp_opening_idle_ttl_ms()
+            || new.tcp_active_idle_ttl_ms() > old.tcp_active_idle_ttl_ms();
+        if longer {
+            StateCarryOutcome::FlushIncompatible(StateCarryConflict::Timers)
+        } else {
+            StateCarryOutcome::Carried
+        }
+    };
     StateCarry {
         mode: ReloadState::Carry,
         resolution: StateCarryOutcome::Carried,
@@ -753,18 +767,11 @@ fn document_carry(
                     outcome(icmp(previous), icmp(next))
                 })
         }),
-        firewall: {
-            let (old, new) = (old.firewall.policy(), new.firewall.policy());
-            let longer = new.udp_idle_ttl_ms() > old.udp_idle_ttl_ms()
-                || new.tcp_opening_idle_ttl_ms() > old.tcp_opening_idle_ttl_ms()
-                || new.tcp_active_idle_ttl_ms() > old.tcp_active_idle_ttl_ms();
-            if longer {
-                StateCarryOutcome::FlushIncompatible(StateCarryConflict::Timers)
-            } else {
-                StateCarryOutcome::Carried
-            }
-        },
-        firewall_reevaluated: old.firewall.rules() != new.firewall.rules() || routes_changed,
+        firewall,
+        // Only a carried firewall re-evaluates (core L1): a flushed one has
+        // nothing left to re-evaluate.
+        firewall_reevaluated: firewall.carried()
+            && (old.firewall.rules() != new.firewall.rules() || routes_changed),
     }
 }
 

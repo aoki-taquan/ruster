@@ -4083,3 +4083,97 @@ fn withdrawn_route_flow_is_flushed_so_route_hit_and_miss_stay_equally_silent() {
     assert_eq!(errors.counters().queued, 0);
     assert!(io.pop_tx().is_none());
 }
+
+/// Core L2 assumption (RELOAD-017): route revocation skips flow endpoints
+/// that are router addresses because no packet from a router address ever
+/// reaches the firewall. After a carrying reload with changed routes, a
+/// packet that would be the reverse of a carried flow but claims a router
+/// address as its source is dropped by ingress validation
+/// (`Ipv4SourceLocalAddress`) before any firewall lookup.
+#[test]
+fn carried_flow_never_admits_a_reverse_packet_from_a_router_address() {
+    let (routes, interfaces, neighbors, bindings) = topology();
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let rules = [allow(FirewallProtocol::Udp)];
+    let config = FirewallConfig::new(
+        &snapshot,
+        &rules,
+        FirewallPolicy::default(),
+        1,
+        firewall_hash_key(),
+    )
+    .unwrap();
+    let mut slots = [FirewallStateSlot::default(); 4];
+    let mut firewall = FirewallRuntime::new(config, &mut slots);
+    let mut states = [ResolutionStateSlot::EMPTY; 1];
+    let mut actions = [ResolutionActionSlot::EMPTY; 1];
+    let mut resolution = resolution(&mut states, &mut actions);
+    let mut io = SimIo::new();
+    io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0, true));
+    io.run_firewall_once(
+        1,
+        &snapshot,
+        &mut resolution,
+        &config,
+        Some(&mut firewall),
+        MonotonicMillis(10),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert!(io.pop_tx().is_some());
+
+    // A carrying reload whose routes changed (a new, unrelated route).
+    let mut next_routes = routes.to_vec();
+    next_routes
+        .push(Route::new(Ipv4Address::from_octets([192, 0, 2, 0]), 24, WAN, Some(GW)).unwrap());
+    let next_snapshot =
+        ForwardingSnapshot::new(&next_routes, &interfaces, &neighbors, &bindings).unwrap();
+    let next = FirewallConfig::new(
+        &next_snapshot,
+        &rules,
+        FirewallPolicy::default(),
+        2,
+        FirewallHashKey::new(7, 9).unwrap(),
+    )
+    .unwrap();
+    let report = firewall
+        .preflight_reconcile_carrying(config, next, snapshot, next_snapshot)
+        .unwrap()
+        .commit();
+    assert_eq!((report.states_carried, report.states_revoked), (1, 0));
+
+    // The reverse of the carried flow from its real remote passes ...
+    io.inject(WAN, udp_frame(REMOTE, HOST, 53, 12_345, 0, true));
+    io.run_firewall_once(
+        1,
+        &next_snapshot,
+        &mut resolution,
+        &next,
+        Some(&mut firewall),
+        MonotonicMillis(20),
+        &mut NoTrace,
+    )
+    .unwrap();
+    assert!(io.pop_tx().is_some());
+    // ... and a reverse-shaped packet from a router address never reaches
+    // the firewall, whatever state it carries.
+    let before = (firewall.counters(), firewall.states().to_vec());
+    for local in [WAN_LOCAL, LAN_LOCAL] {
+        let mut spoofed = udp_frame(local, HOST, 53, 12_345, 0, true);
+        // Received on WAN: addressed to the WAN interface's MAC.
+        spoofed[0..6].copy_from_slice(&WAN_MAC.0);
+        io.inject(WAN, spoofed.clone());
+        io.run_firewall_once(
+            1,
+            &next_snapshot,
+            &mut resolution,
+            &next,
+            Some(&mut firewall),
+            MonotonicMillis(30),
+            &mut NoTrace,
+        )
+        .unwrap();
+        assert_drop(&mut io, DropReason::Ipv4SourceLocalAddress, &spoofed);
+    }
+    assert_eq!((firewall.counters(), firewall.states().to_vec()), before);
+}

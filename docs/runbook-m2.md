@@ -1256,7 +1256,7 @@ stats block and summary can then be lost (the teardown itself completed).
    | family | carried when | otherwise (`state` value) |
    |---|---|---|
    | NAT44 UDP, TCP, ICMP query mappings, peers, sessions | same inside/outside interface, public address, port (identifier) pool, and filtering mode; the UDP/ICMP `idle-ttl-ms` not longer; no lowered or new per-host limit; for TCP also the same `idle-ttl-ms`, `opening-idle-ttl-ms`, `closing-idle-ttl-ms` | that family is flushed: `flushed:interfaces`, `flushed:public-address`, `flushed:port-range` (also a same-size shift), `flushed:filtering`, `flushed:timers`, `flushed:quota` |
-   | firewall flows | no firewall idle timeout is longer. Flows already expired are dropped; when routes changed, a flow whose route (to either end) now leaves through another interface, or no longer exists, is revoked; when the rules changed, every remaining flow is re-evaluated as if its first packet arrived now, and the flows the new rules deny are revoked (`firewall-revoked`): nothing of them passes after the reload | `flushed:timers` for a longer timeout; `flushed:reevaluation-budget` when `live flows x (rules + 4 route lookups)` exceeds 4194304 tests (a count, not a time: about 25 ms for a full table on the development host): the firewall table is flushed instead of stalling the router |
+   | firewall flows | no firewall idle timeout is longer. Flows already expired are dropped; when routes changed, a flow whose route (to either end) now leaves through another interface, or no longer exists, is revoked; when the rules changed, every remaining flow is re-evaluated as if its first packet arrived now, and the flows the new rules deny are revoked (`firewall-revoked`): nothing of them passes after the reload | `flushed:timers` for a longer timeout; `flushed:reevaluation-budget` when `live flows x (rules + 4 route lookups x 16)` exceeds 4194304 rule-test units (a count, not a time: 20-48 ms for a full table on the development host, depending on load): the firewall table is flushed instead of stalling the router |
    | learned ARP neighbors | the interface's own IPv4 address is unchanged, no new static neighbor replaces it, and, with `[arp] require-on-link-sender = true`, it is on-link | that entry is dropped (`flushed dynamic-neighbors`) and learned again on demand |
 
    State that expired under the old settings never becomes live again: a
@@ -1284,7 +1284,10 @@ stats block and summary can then be lost (the teardown itself completed).
 
    The live dry run before the switch does not re-evaluate firewall flows
    (`ruster plan` and the dry run show `invalidated`); only the switch
-   itself does, once.
+   itself does, once. After the dry run the router prints `reload checked:
+   generation P keeps running until the switch; would carry ...
+   firewall-flows<=N` (`<=`: the switch may still revoke some of them;
+   `=` when neither rules nor routes changed).
 6. Timing: reading, validating, building the candidate (fresh keys from
    the production sequencer) and planning run on the reload worker thread
    (`ruster-reload`, section 7), while the router keeps forwarding; a large
@@ -1872,7 +1875,7 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   `state = "flush"` still drop established connections of that family. The
   firewall re-evaluation of changed rules or routes runs on the router
   thread at the switch (bounded at 4194304 rule tests and route lookups, a
-  count: about 25 ms for a full table on the development host); above the
+  count: 20-48 ms for a full table on the development host); above the
   bound it flushes the firewall flows instead. A route change revokes the
   flows whose route moved to another interface or disappeared.
 - The `FILL_STARVED` delay (1 s), the 3 failed queries, the watch
@@ -2727,7 +2730,7 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `reload failed: stage=read code=PERMISSION_DENIED` after a clean start | — | after the drop the config is read without `CAP_DAC_OVERRIDE` (section 5) | make the config and its directories readable by the process's user (root: a root-owned path such as `/etc/ruster`) |
 | `reload applied: ... state ... nat44-udp=flushed:<reason>` (or `nat44-tcp`, `nat44-icmp`) | — | the new document changed what that NAT state means (interfaces, public address, pool, filtering, a TCP timeout or a longer UDP/ICMP timeout, a lowered or new per-host limit), so that family was flushed with a fresh key and its connections must reconnect (RELOAD-CARRY) | expected for such a change; make it when the NAT is quiet, or keep those settings and change the rest |
 | `reload applied: ... firewall-revoked=N` with N > 0 | — | the new firewall rules deny N live flows, or their routes moved to another interface or disappeared; they were revoked at the switch and pass nothing more | intended when the rules were tightened; otherwise check `ruster plan` (`firewall carried reevaluate`) and the rule order |
-| `reload applied: ... state ... firewall=flushed:reevaluation-budget` | — | re-evaluating every live flow against the changed rules or routes would take more than 4194304 rule tests and route lookups, so all firewall flows were flushed instead of stalling the router | reload when fewer flows are live, or with fewer rules (`live flows x (rules + 4)` is the cost) |
+| `reload applied: ... state ... firewall=flushed:reevaluation-budget` | — | re-evaluating every live flow against the changed rules or routes would take more than 4194304 rule tests and route lookups, so all firewall flows were flushed instead of stalling the router | reload when fewer flows are live, or with fewer rules (`live flows x (rules + 4 x 16 for changed routes)` is the cost) |
 | `reload applied: ... state ... firewall=flushed:timers` | — | a firewall idle timeout grew: a longer timeout would reopen flows that already expired, so the flows were flushed | expected; shorten timeouts freely, lengthen them when the firewall is quiet |
 | established TCP through the NAT drops at every reload | — | `[reload] state = "flush"` in the new document (`state ... =flushed` for every family), or a TCP timeout or NAT realm/pool/filtering change | remove `state = "flush"` (the default carries) or leave those settings unchanged |
 | `stage=open code=INTERFACE_LOOKUP/NO_SUCH_DEVICE` | 1 | the `device` does not exist in this namespace | fix `device`, or run in the right namespace |

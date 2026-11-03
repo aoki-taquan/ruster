@@ -159,6 +159,12 @@ pub enum ReloadOutcome {
         detail: String,
         generation: NonZeroU64,
     },
+    /// The live dry run passed; the successor waits for quiescence. Not an
+    /// end of the reload: `Applied`, `Refused`, or `Failed` follows.
+    Checked {
+        generation: NonZeroU64,
+        carried: ruster_control::CarriedCounts,
+    },
 }
 
 impl fmt::Display for ReloadOutcome {
@@ -244,6 +250,29 @@ impl fmt::Display for ReloadOutcome {
                 formatter,
                 "reload failed: {detail}; generation {generation} keeps running"
             ),
+            Self::Checked {
+                generation,
+                carried,
+            } => {
+                // `<=` when the commit re-evaluates the firewall flows and
+                // may revoke some (the dry run does not repeat that pass).
+                write!(
+                    formatter,
+                    "reload checked: generation {generation} keeps running until the switch; \
+                     would carry dynamic-neighbors={} nat44-udp-mappings={} nat44-tcp-sessions={} \
+                     nat44-icmp-mappings={} firewall-flows{}{}",
+                    carried.dynamic_neighbors,
+                    carried.nat44_udp_mappings,
+                    carried.nat44_tcp_sessions,
+                    carried.nat44_icmp_mappings,
+                    if carried.firewall_flows_upper_bound {
+                        "<="
+                    } else {
+                        "="
+                    },
+                    carried.firewall_flows,
+                )
+            }
         }
     }
 }
@@ -656,11 +685,18 @@ impl Reloader {
                     .candidate
                     .as_ref()
                     .map(|candidate| active.check_successor(candidate));
-                if let Some(Err(error)) = check {
-                    return Some(self.failed("dry-run", apply_code(error), generation));
-                }
+                let checked = match check {
+                    Some(Err(error)) => {
+                        return Some(self.failed("dry-run", apply_code(error), generation));
+                    }
+                    Some(Ok(check)) => Some(ReloadOutcome::Checked {
+                        generation,
+                        carried: check.carried,
+                    }),
+                    None => None,
+                };
                 self.phase = Phase::Pending { ready, since: now };
-                None
+                checked
             }
         }
     }
@@ -777,5 +813,33 @@ pub fn apply_code(error: ApplyError) -> String {
     match error {
         ApplyError::RestartRequired(reason) => format!("RESTART_REQUIRED.{}", reason.code()),
         other => token(&other),
+    }
+}
+
+#[cfg(test)]
+mod checked_tests {
+    use std::num::NonZeroU64;
+
+    use super::ReloadOutcome;
+
+    /// Sec Nit: a re-evaluating dry run shows the firewall count as a bound.
+    #[test]
+    fn a_reevaluating_dry_run_prints_the_firewall_count_as_a_bound() {
+        let mut carried = ruster_control::CarriedCounts::default();
+        carried.firewall_flows = 7;
+        carried.firewall_flows_upper_bound = true;
+        let line = ReloadOutcome::Checked {
+            generation: NonZeroU64::new(3).unwrap(),
+            carried,
+        }
+        .to_string();
+        assert!(line.ends_with(" firewall-flows<=7"), "{line}");
+        carried.firewall_flows_upper_bound = false;
+        let line = ReloadOutcome::Checked {
+            generation: NonZeroU64::new(3).unwrap(),
+            carried,
+        }
+        .to_string();
+        assert!(line.ends_with(" firewall-flows=7"), "{line}");
     }
 }

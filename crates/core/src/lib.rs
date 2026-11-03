@@ -38,10 +38,11 @@ pub use firewall::{
     FirewallPortRangeError, FirewallProtocol, FirewallReconcileError, FirewallReconcilePermit,
     FirewallReconcileReport, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRule,
     FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
-    ValidatedFirewallOwner, FIREWALL_CARRY_REEVALUATION_BUDGET, FIREWALL_MAX_IDLE_TTL_MS,
-    FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS,
-    FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS, FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS,
-    FIREWALL_UDP_DEFAULT_IDLE_TTL_MS, FIREWALL_UDP_MIN_IDLE_TTL_MS,
+    ValidatedFirewallOwner, FIREWALL_CARRY_REEVALUATION_BUDGET, FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT,
+    FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
+    FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS, FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
+    FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
+    FIREWALL_UDP_MIN_IDLE_TTL_MS,
 };
 pub use fixed_directory::{port_free_bitmap_words, DirectoryBucket, DirectoryNode, PortOwnerSlot};
 #[cfg(feature = "validation-test-hooks")]
