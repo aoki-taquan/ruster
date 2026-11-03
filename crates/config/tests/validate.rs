@@ -2458,27 +2458,108 @@ fn resolution_hold_section_defaults_on_and_fails_closed() {
         absent.storage_shape().required_bytes - off.storage_shape().required_bytes,
         64 * (size_of::<ArpHoldSlot>() + 3840)
     );
-    let off_zero = validated(&with("enabled = false\npackets = 0\nper-neighbor = 0\n"));
-    assert_eq!(off_zero.storage_shape(), off.storage_shape());
-
-    let tuned = validated(&with("per-neighbor = 64\nper-host = 1\npackets = 1\n"));
+    // The bounds are checked with the hold off too (fail closed).
     assert_eq!(
-        tuned.arp_hold().policy(),
-        Some(ArpHoldPolicy::new(64, 1).unwrap())
+        error(&with("enabled = false\npackets = 0\n")).code(),
+        ValidationCode::ArpHoldPacketsZero
     );
     assert_eq!(
-        tuned.arp_hold().storage(),
+        error(&with("enabled = false\nper-neighbor = 0\n")).code(),
+        ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerNeighbor)
+    );
+    let off_tuned = validated(&with("enabled = false\npackets = 8\n"));
+    assert_eq!(off_tuned.storage_shape(), off.storage_shape());
+
+    let tuned = validated(&with(
+        "per-neighbor = 64\nper-host = 1\nper-ingress = 64\npackets = 64\n",
+    ));
+    assert_eq!(
+        tuned.arp_hold().policy(),
+        Some(
+            ArpHoldPolicy::new(64, 1)
+                .unwrap()
+                .with_per_ingress(64)
+                .unwrap()
+        )
+    );
+    // Defaults are capped at `packets`; the ingress share is half of it.
+    let small = validated(&with("packets = 1\n"));
+    assert_eq!(
+        small.arp_hold().policy(),
+        Some(
+            ArpHoldPolicy::new(1, 1)
+                .unwrap()
+                .with_per_ingress(1)
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        small.arp_hold().storage(),
         Some(ArpHoldStorageShapeV1 {
             packets: 1,
             slot_bytes: 3840,
         })
     );
+    assert_eq!(
+        absent.arp_hold().policy().map(ArpHoldPolicy::per_ingress),
+        Some(32)
+    );
+    for (keys, field) in [
+        (
+            "packets = 4\nper-neighbor = 5\n",
+            "resolution.hold.per-neighbor",
+        ),
+        ("packets = 4\nper-host = 5\n", "resolution.hold.per-host"),
+        (
+            "packets = 4\nper-ingress = 5\n",
+            "resolution.hold.per-ingress",
+        ),
+    ] {
+        let above = error(&with(keys));
+        assert_eq!(
+            above.code(),
+            ValidationCode::ArpHoldBoundAbovePackets,
+            "{keys}"
+        );
+        assert_eq!(above.code().code(), "ARP_HOLD_BOUND_ABOVE_PACKETS");
+        assert_eq!((above.limit(), above.actual()), (Some(4), Some(5)));
+        assert_eq!(dotted(above.path()), field);
+    }
     // A replay leaves through the fragmentation slots: nothing is held
     // without them.
     let no_fragmentation =
         validated(&VALID.replacen("[tick]", "[fragmentation]\nenabled = false\n\n[tick]", 1));
     assert_eq!(no_fragmentation.arp_hold().policy(), None);
     assert_eq!(no_fragmentation.storage_shape().arp_hold, None);
+    // ...and writing `enabled = true` there is refused, not ignored.
+    let explicit = error(
+        &VALID
+            .replacen(
+                "failure-holds = 5\n",
+                "failure-holds = 5\n\n[resolution.hold]\nenabled = true\n",
+                1,
+            )
+            .replacen("[tick]", "[fragmentation]\nenabled = false\n\n[tick]", 1),
+    );
+    assert_eq!(explicit.code(), ValidationCode::ArpHoldWithoutFragmentation);
+    assert_eq!(explicit.code().code(), "ARP_HOLD_WITHOUT_FRAGMENTATION");
+    assert_eq!(dotted(explicit.path()), "resolution.hold.enabled");
+
+    // A document that fits the storage bound only without the hold points
+    // at `[resolution.hold] packets` (ARP-HOLD made the default larger).
+    let without = validated(&with("enabled = false\n"))
+        .storage_shape()
+        .required_bytes;
+    let limits = |max_runtime_bytes| ValidationLimits {
+        max_slots_per_table: 8,
+        max_quote_slots_per_table: 8,
+        max_runtime_bytes,
+    };
+    let rejected = validated_with(VALID, limits(without)).err().unwrap();
+    assert_eq!(rejected.code(), ValidationCode::RuntimeStorageBytesExceeded);
+    assert_eq!(dotted(rejected.path()), "resolution.hold.packets");
+    let rejected = validated_with(VALID, limits(without - 1)).err().unwrap();
+    assert_eq!(dotted(rejected.path()), "");
 
     for (keys, code, field) in [
         (
@@ -2495,6 +2576,11 @@ fn resolution_hold_section_defaults_on_and_fails_closed() {
             "per-host = 0",
             ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerHost),
             "resolution.hold.per-host",
+        ),
+        (
+            "per-ingress = 0",
+            ValidationCode::ArpHoldPolicy(ArpHoldPolicyError::PerIngress),
+            "resolution.hold.per-ingress",
         ),
         (
             "packets = 0",

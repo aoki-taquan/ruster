@@ -417,6 +417,11 @@ pub enum DropReason {
     /// slot (sized like a fragmentation slot, so only a simulated frame can
     /// be) (ARP-HOLD).
     ArpHoldTooLarge = 203,
+    /// A datagram whose next hop is being resolved could not be held: its
+    /// ingress interface already has `[resolution.hold] per-ingress`
+    /// datagrams held, so a flood arriving on one interface (with any
+    /// sources) cannot take the slots of another's hosts (ARP-HOLD).
+    ArpHoldIngressLimit = 204,
 }
 
 use DropReason::*;
@@ -424,7 +429,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 203] = [
+    pub const ALL: [Self; 204] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -628,6 +633,7 @@ impl DropReason {
         ArpHoldFull,
         ArpHoldHostLimit,
         ArpHoldTooLarge,
+        ArpHoldIngressLimit,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -848,6 +854,7 @@ impl DropReason {
             ArpHoldFull => "ARP_HOLD_FULL",
             ArpHoldHostLimit => "ARP_HOLD_HOST_LIMIT",
             ArpHoldTooLarge => "ARP_HOLD_TOO_LARGE",
+            ArpHoldIngressLimit => "ARP_HOLD_INGRESS_LIMIT",
         }
     }
 }
@@ -2899,7 +2906,11 @@ where
 /// and fragmentation are decided at `now` and the NAT and firewall commit
 /// then. One committed for TX is staged whole in a fragmentation slot; one
 /// above a DF-clear egress MTU is staged as fragments by the forwarding path;
-/// any drop is traced with its typed reason. The tick's generated fragment
+/// a drop is counted by the hold (`replay_dropped`), and the replay's drop
+/// and consume events are not traced again (the frame was counted as
+/// `ARP_HELD`). A first fragment also needs room for the fragments the
+/// association table holds, which its allowed decision releases into the
+/// same slots. The tick's generated fragment
 /// phase sends them after the generated ARP and ICMPv4 phases. Returns how
 /// many datagrams were replayed.
 #[allow(clippy::too_many_arguments)]
@@ -2927,7 +2938,13 @@ where
         return 0;
     }
     let room = fragmentation.free_slots();
-    let ready = arp_hold.mark_ready(now.0, room, |egress, target| {
+    // A replayed first fragment releases the association table's held
+    // fragments into the same slots: reserve them, so a replay that commits
+    // NAT and firewall state always finds its own slot.
+    let fragment_reserve = fragment_tracking
+        .as_deref()
+        .map_or(0, Ipv4FragmentTracker::held);
+    let ready = arp_hold.mark_ready(now.0, room, fragment_reserve, |egress, target| {
         if snapshot.static_neighbor(egress, target).is_some() {
             ArpHoldNextHop::Known
         } else {
@@ -2958,7 +2975,7 @@ where
         Some(&mut *fragmentation),
         fragment_tracking,
         None,
-        trace,
+        &mut ReplayTrace(trace),
     );
     arp_hold.stage_committed(snapshot, fragmentation);
     report.received
@@ -3005,6 +3022,29 @@ where
         None,
         trace,
     )
+}
+
+/// The trace of a replay: the replayed datagram was already counted when
+/// it was received (consumed as `ARP_HELD`), so its terminal events (drop,
+/// consume, fragmentation staging) are not passed on; the hold's own
+/// counters (`replay_dropped`, `replay_fragmented`) count them. Every other
+/// event (NAT, firewall, ICMP, resolution) is.
+struct ReplayTrace<'t, T>(&'t mut T);
+
+impl<T: TraceSink> TraceSink for ReplayTrace<'_, T> {
+    fn record(&mut self, event: TraceEvent) {
+        if !matches!(
+            event,
+            TraceEvent::Dropped { .. }
+                | TraceEvent::Consumed { .. }
+                | TraceEvent::Ipv4LocalConsumed { .. }
+                | TraceEvent::Ipv4FragmentationQueued { .. }
+                | TraceEvent::Ipv4FragmentHeld { .. }
+                | TraceEvent::ArpHeld { .. }
+        ) {
+            self.0.record(event);
+        }
+    }
 }
 
 /// Holds a datagram whose decision ended at a resolving neighbour miss
@@ -3365,8 +3405,12 @@ where
                 }
                 if let Some(tracker) = fragment_tracking.as_deref_mut() {
                     if let Some(ticket) = first_fragment {
-                        // After the first fragment's own staging, so its
-                        // pieces go first; the held fragments follow. The
+                        // After the first fragment's own staging when it
+                        // is fragmented (its pieces go first, the held
+                        // fragments follow). A first fragment sent whole
+                        // goes out before them from RX, but after them
+                        // when it is an ARP-HOLD replay (staged only after
+                        // the replay); receivers reassemble either way. The
                         // template is read from a frame the decision just
                         // rewrote, so it is always there; a missing one
                         // would fail closed (refusing the datagram).
@@ -8825,6 +8869,7 @@ mod tests {
             (201, "ARP_HOLD_FULL"),
             (202, "ARP_HOLD_HOST_LIMIT"),
             (203, "ARP_HOLD_TOO_LARGE"),
+            (204, "ARP_HOLD_INGRESS_LIMIT"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -8834,7 +8879,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(204), None);
+        assert_eq!(DropReason::from_code(205), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

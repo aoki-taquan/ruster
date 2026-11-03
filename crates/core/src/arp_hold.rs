@@ -21,8 +21,12 @@
 //!   firewall state. Cold path only (a miss), no allocation.
 //! - **Bounds.** At most `per-neighbor` datagrams per (egress, next hop): a
 //!   new one replaces the oldest of that next hop (the latest is kept, as
-//!   RFC 1122 asks). At most `per-host` per (ingress, source): beyond is
-//!   [`DropReason::ArpHoldHostLimit`]. At most `slots` in all: beyond is
+//!   RFC 1122 asks; the sender's own oldest one when it has one there). At
+//!   most `per-host` per (ingress, source): beyond is
+//!   [`DropReason::ArpHoldHostLimit`]. At most `per-ingress` per ingress
+//!   interface (sources are not authenticated, so a flood on one interface
+//!   cannot take another's slots): beyond is
+//!   [`DropReason::ArpHoldIngressLimit`]. At most `slots` in all: beyond is
 //!   [`DropReason::ArpHoldFull`]. A frame longer than a slot (sized like a
 //!   fragmentation slot, so only a simulated one can be) is
 //!   [`DropReason::ArpHoldTooLarge`].
@@ -71,6 +75,11 @@ pub const ARP_HOLD_MAX_PER_NEIGHBOR: u16 = 64;
 pub const ARP_HOLD_DEFAULT_PER_HOST: u16 = 16;
 /// Default `[resolution.hold] packets`: datagrams held in all.
 pub const ARP_HOLD_DEFAULT_PACKETS: u32 = 64;
+/// Default `[resolution.hold] per-ingress`: datagrams held per ingress
+/// interface, half of the default table, so datagrams arriving on one
+/// interface (sources are not authenticated, a WAN flood can claim any)
+/// cannot take the slots of another interface's hosts.
+pub const ARP_HOLD_DEFAULT_PER_INGRESS: u16 = 32;
 /// Largest `[resolution.hold] packets`. Holding and the replay walk visit
 /// every held datagram, so the table stays small; and each slot is a
 /// fragmentation slot's size (3840 bytes for AF_XDP), so 64 is what the
@@ -78,11 +87,12 @@ pub const ARP_HOLD_DEFAULT_PACKETS: u32 = 64;
 /// maximum.
 pub const ARP_HOLD_MAX_PACKETS: u32 = 64;
 
-/// Hold policy: the per-next-hop and per-host bounds.
+/// Hold policy: the per-next-hop, per-host, and per-ingress bounds.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpHoldPolicy {
     per_neighbor: u16,
     per_host: u16,
+    per_ingress: u16,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,14 +102,19 @@ pub enum ArpHoldPolicyError {
     PerNeighbor,
     /// `per-host` is 0.
     PerHost,
+    /// `per-ingress` is 0.
+    PerIngress,
 }
 
 impl ArpHoldPolicy {
     pub const DEFAULT: Self = Self {
         per_neighbor: ARP_HOLD_DEFAULT_PER_NEIGHBOR,
         per_host: ARP_HOLD_DEFAULT_PER_HOST,
+        per_ingress: ARP_HOLD_DEFAULT_PER_INGRESS,
     };
 
+    /// A policy with the default per-ingress bound; see
+    /// [`Self::with_per_ingress`].
     pub const fn new(per_neighbor: u16, per_host: u16) -> Result<Self, ArpHoldPolicyError> {
         if per_neighbor == 0 || per_neighbor > ARP_HOLD_MAX_PER_NEIGHBOR {
             return Err(ArpHoldPolicyError::PerNeighbor);
@@ -110,7 +125,25 @@ impl ArpHoldPolicy {
         Ok(Self {
             per_neighbor,
             per_host,
+            per_ingress: ARP_HOLD_DEFAULT_PER_INGRESS,
         })
+    }
+
+    /// This policy with at most `per_ingress` (at least 1) datagrams held
+    /// per ingress interface.
+    pub const fn with_per_ingress(self, per_ingress: u16) -> Result<Self, ArpHoldPolicyError> {
+        if per_ingress == 0 {
+            return Err(ArpHoldPolicyError::PerIngress);
+        }
+        Ok(Self {
+            per_ingress,
+            ..self
+        })
+    }
+
+    #[must_use]
+    pub const fn per_ingress(self) -> u16 {
+        self.per_ingress
     }
 
     #[must_use]
@@ -197,8 +230,12 @@ pub(crate) enum ArpHoldNextHop {
     Known,
     /// Its ARP resolution is still running: keep waiting.
     Resolving,
-    /// Its resolution failed, was cancelled, or is gone: free.
-    Over,
+    /// Its resolution failed (the Failed hold-down): free as `failed`.
+    Failed,
+    /// No resolution is running and no neighbour is known: it was
+    /// cancelled (static or authority change), or a neighbour learned for
+    /// it expired while the replay waited for room: free as `cancelled`.
+    Gone,
 }
 
 /// Cumulative hold counters (never reset by a publication).
@@ -213,6 +250,9 @@ pub struct ArpHoldCounters {
     pub refused_full: usize,
     /// Datagrams refused by the per-host bound (`ARP_HOLD_HOST_LIMIT`).
     pub refused_host_limit: usize,
+    /// Datagrams refused by the per-ingress bound
+    /// (`ARP_HOLD_INGRESS_LIMIT`).
+    pub refused_ingress_limit: usize,
     /// Datagrams refused for being longer than a slot
     /// (`ARP_HOLD_TOO_LARGE`).
     pub refused_too_large: usize,
@@ -225,8 +265,9 @@ pub struct ArpHoldCounters {
     /// Replayed datagrams the forwarding path fragmented (staged as
     /// fragments, MTU2 part B).
     pub replay_fragmented: usize,
-    /// Replayed datagrams the forwarding path dropped or consumed (their
-    /// typed drop reason is counted as for any datagram).
+    /// Replayed datagrams the forwarding path dropped or consumed (not
+    /// counted again under the drop and consume reasons: the frame was
+    /// counted as `ARP_HELD` when it was received).
     pub replay_dropped: usize,
     /// Replayed datagrams committed for TX that found no fragmentation slot
     /// (only when released held fragments took the room first).
@@ -234,9 +275,11 @@ pub struct ArpHoldCounters {
     /// Replays put off to a later tick for lack of a free fragmentation
     /// slot (counted per tick and datagram).
     pub deferred: usize,
-    /// Held datagrams freed because their resolution failed or was
-    /// cancelled.
+    /// Held datagrams freed because their resolution failed.
     pub failed: usize,
+    /// Held datagrams freed because their resolution was cancelled or its
+    /// learned neighbour expired before the replay found room.
+    pub cancelled: usize,
     /// Held datagrams freed when their resolution could no longer succeed.
     pub expired: usize,
     /// Held datagrams dropped by a publication apply.
@@ -408,32 +451,55 @@ impl<'a> ArpHoldRuntime<'a> {
             });
         let mut neighbor_count = 0_usize;
         let mut neighbor_oldest = NONE;
+        let mut neighbor_oldest_own = NONE;
         let mut host_count = 0_usize;
+        let mut ingress_count = 0_usize;
         let mut cursor = self.oldest;
         while cursor != NONE {
             let slot = &self.slots[cursor as usize];
+            let own = slot.ingress == ingress && slot.source == source;
             if slot.egress == miss.egress && slot.target == miss.target {
                 if neighbor_count == 0 {
                     neighbor_oldest = cursor;
                 }
+                if own && neighbor_oldest_own == NONE {
+                    neighbor_oldest_own = cursor;
+                }
                 neighbor_count += 1;
             }
-            if slot.ingress == ingress && slot.source == source {
-                host_count += 1;
-            }
+            host_count += usize::from(own);
+            ingress_count += usize::from(slot.ingress == ingress);
             cursor = slot.newer;
         }
         // RFC 1122 §2.3.2.2 keeps the latest datagram: at the next-hop bound
-        // the oldest of that next hop makes room.
-        let victim =
-            (neighbor_count >= usize::from(self.policy.per_neighbor)).then_some(neighbor_oldest);
-        let freed_for_host = victim.is_some_and(|victim| {
+        // an older datagram of that next hop makes room, the sender's own
+        // oldest one when it has one there (so one host cannot push out
+        // another's), else the oldest.
+        let victim = (neighbor_count >= usize::from(self.policy.per_neighbor)).then_some(
+            if neighbor_oldest_own == NONE {
+                neighbor_oldest
+            } else {
+                neighbor_oldest_own
+            },
+        );
+        let (freed_for_host, freed_for_ingress) = victim.map_or((false, false), |victim| {
             let slot = &self.slots[victim as usize];
-            slot.ingress == ingress && slot.source == source
+            (
+                slot.ingress == ingress && slot.source == source,
+                slot.ingress == ingress,
+            )
         });
         if host_count - usize::from(freed_for_host) >= usize::from(self.policy.per_host) {
             self.counters.refused_host_limit += 1;
             return Err(DropReason::ArpHoldHostLimit);
+        }
+        if victim.is_none() && self.free == NONE {
+            self.counters.refused_full += 1;
+            return Err(DropReason::ArpHoldFull);
+        }
+        if ingress_count - usize::from(freed_for_ingress) >= usize::from(self.policy.per_ingress) {
+            self.counters.refused_ingress_limit += 1;
+            return Err(DropReason::ArpHoldIngressLimit);
         }
         if let Some(victim) = victim {
             self.release(victim as usize);
@@ -470,14 +536,20 @@ impl<'a> ArpHoldRuntime<'a> {
         Ok(())
     }
 
-    /// Marks at most `room` held datagrams whose next hop `probe` says is
-    /// resolved as ready for this tick's replay (oldest first), and frees
-    /// those whose resolution is over or which passed their deadline.
-    /// Returns how many are ready.
+    /// Marks held datagrams whose next hop `probe` says is resolved as
+    /// ready for this tick's replay (oldest first) while their room fits in
+    /// `room` fragmentation slots, and frees those whose resolution is over
+    /// or which passed their deadline. Returns how many are ready.
+    ///
+    /// A datagram takes one slot; a first fragment (MF set, offset 0) takes
+    /// one plus `fragment_reserve` (the fragments the association table
+    /// holds, which its allowed decision releases into the same slots), so
+    /// a replay whose NAT and firewall state commit always finds its slot.
     pub(crate) fn mark_ready(
         &mut self,
         now_ms: u64,
         mut room: usize,
+        fragment_reserve: usize,
         mut probe: impl FnMut(IfId, Ipv4Address) -> ArpHoldNextHop,
     ) -> usize {
         let mut ready = 0;
@@ -489,9 +561,25 @@ impl<'a> ArpHoldRuntime<'a> {
             if slot.state != HoldState::Held {
                 continue;
             }
+            let first_fragment = {
+                let start = index * self.slot_bytes;
+                let flags = self
+                    .bytes
+                    .get(
+                        start + packet::ETHERNET_HEADER_LEN + 6
+                            ..start + packet::ETHERNET_HEADER_LEN + 8,
+                    )
+                    .map_or(0, |word| u16::from_be_bytes([word[0], word[1]]));
+                flags & 0x3fff == 0x2000
+            };
+            let cost = if first_fragment {
+                1 + fragment_reserve
+            } else {
+                1
+            };
             match probe(slot.egress, slot.target) {
-                ArpHoldNextHop::Known if room > 0 => {
-                    room -= 1;
+                ArpHoldNextHop::Known if room >= cost => {
+                    room -= cost;
                     ready += 1;
                     self.slots[index].state = HoldState::Ready;
                 }
@@ -501,8 +589,12 @@ impl<'a> ArpHoldRuntime<'a> {
                 }
                 ArpHoldNextHop::Known => self.counters.deferred += 1,
                 ArpHoldNextHop::Resolving => {}
-                ArpHoldNextHop::Over => {
+                ArpHoldNextHop::Failed => {
                     self.counters.failed += 1;
+                    self.release(index);
+                }
+                ArpHoldNextHop::Gone => {
+                    self.counters.cancelled += 1;
                     self.release(index);
                 }
             }

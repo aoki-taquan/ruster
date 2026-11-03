@@ -145,9 +145,16 @@ pub enum ValidationCode {
     /// `[resolution.hold] per-neighbor` outside 1..=64 or `per-host` 0
     /// (ARP-HOLD).
     ArpHoldPolicy(ArpHoldPolicyError),
-    /// `[resolution.hold] packets` is 0 while holding is enabled (ARP-HOLD;
-    /// `enabled = false` is the switch).
+    /// `[resolution.hold] packets` is 0 (ARP-HOLD; `enabled = false` is the
+    /// switch).
     ArpHoldPacketsZero,
+    /// `[resolution.hold] per-neighbor`, `per-host`, or `per-ingress` is
+    /// above `packets` (ARP-HOLD; a bound the table can never reach).
+    ArpHoldBoundAbovePackets,
+    /// `[resolution.hold] enabled = true` with `[fragmentation] enabled =
+    /// false`: a replay leaves through the fragmentation slots, so nothing
+    /// could be held (ARP-HOLD).
+    ArpHoldWithoutFragmentation,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
     Nat44RealmWithoutProtocol,
@@ -322,6 +329,8 @@ impl ValidationCode {
             Self::FragmentTrackingEntriesZero => "FRAGMENT_TRACKING_ENTRIES_ZERO",
             Self::ArpHoldPolicy(_) => "ARP_HOLD_POLICY",
             Self::ArpHoldPacketsZero => "ARP_HOLD_PACKETS_ZERO",
+            Self::ArpHoldBoundAbovePackets => "ARP_HOLD_BOUND_ABOVE_PACKETS",
+            Self::ArpHoldWithoutFragmentation => "ARP_HOLD_WITHOUT_FRAGMENTATION",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
             Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
@@ -2459,49 +2468,88 @@ fn validate_fragment_tracking(
     ))
 }
 
-/// Validates `[resolution.hold]` (ARP-HOLD). Nothing is held without
-/// `[resolution]` (no ARP), with `enabled = false`, or without fragmentation
-/// (a replayed datagram leaves through its slots, so a hold slot is sized
-/// like one); the bounds are still checked when present.
+/// Validates `[resolution.hold]` (ARP-HOLD). Every bound present is
+/// checked, also when the hold is off (fail closed). Nothing is held
+/// without `[resolution]` (no ARP), with `enabled = false`, or without
+/// fragmentation (a replayed datagram leaves through its slots, so a hold
+/// slot is sized like one); `enabled = true` written without fragmentation
+/// is refused rather than silently ignored.
 fn validate_arp_hold(
     source: Option<crate::ResolutionHoldV1>,
     fragmentation: Option<FragmentationStorageShapeV1>,
 ) -> Result<(Option<ArpHoldPolicy>, Option<ArpHoldStorageShapeV1>), ValidationError> {
     let field = |name: &str| path(&["resolution", "hold", name]);
-    let Some(source) = source.filter(|source| source.enabled) else {
+    let Some(source) = source else {
         return Ok((None, None));
     };
-    let policy = ArpHoldPolicy::new(source.per_neighbor, source.per_host).map_err(|error| {
-        let name = match error {
-            ArpHoldPolicyError::PerHost => "per-host",
-            _ => "per-neighbor",
-        };
-        ValidationError::new(ValidationCode::ArpHoldPolicy(error), field(name))
-    })?;
-    if source.packets == 0 {
+    let packets = source
+        .packets
+        .unwrap_or(ruster_core::ARP_HOLD_DEFAULT_PACKETS);
+    if packets == 0 {
         return Err(ValidationError::new(
             ValidationCode::ArpHoldPacketsZero,
             field("packets"),
         ));
     }
-    if source.packets > ruster_core::ARP_HOLD_MAX_PACKETS {
+    if packets > ruster_core::ARP_HOLD_MAX_PACKETS {
         return Err(ValidationError::bounded(
             ValidationCode::CapacityLimitExceeded,
             field("packets"),
             u64::from(ruster_core::ARP_HOLD_MAX_PACKETS),
-            u64::from(source.packets),
+            u64::from(packets),
         ));
     }
-    Ok(match fragmentation {
-        Some(slots) => (
+    let capped = |default: u16| default.min(u16::try_from(packets).unwrap_or(u16::MAX));
+    let per_neighbor = source
+        .per_neighbor
+        .unwrap_or_else(|| capped(ruster_core::ARP_HOLD_DEFAULT_PER_NEIGHBOR));
+    let per_host = source
+        .per_host
+        .unwrap_or_else(|| capped(ruster_core::ARP_HOLD_DEFAULT_PER_HOST));
+    let per_ingress = source
+        .per_ingress
+        .unwrap_or_else(|| capped(u16::try_from(packets / 2).unwrap_or(u16::MAX).max(1)));
+    let policy = ArpHoldPolicy::new(per_neighbor, per_host)
+        .and_then(|policy| policy.with_per_ingress(per_ingress))
+        .map_err(|error| {
+            let name = match error {
+                ArpHoldPolicyError::PerHost => "per-host",
+                ArpHoldPolicyError::PerIngress => "per-ingress",
+                _ => "per-neighbor",
+            };
+            ValidationError::new(ValidationCode::ArpHoldPolicy(error), field(name))
+        })?;
+    for (name, value) in [
+        ("per-neighbor", per_neighbor),
+        ("per-host", per_host),
+        ("per-ingress", per_ingress),
+    ] {
+        if u32::from(value) > packets {
+            return Err(ValidationError::bounded(
+                ValidationCode::ArpHoldBoundAbovePackets,
+                field(name),
+                u64::from(packets),
+                u64::from(value),
+            ));
+        }
+    }
+    if source.enabled == Some(false) {
+        return Ok((None, None));
+    }
+    match fragmentation {
+        Some(slots) => Ok((
             Some(policy),
             Some(ArpHoldStorageShapeV1 {
-                packets: source.packets,
+                packets,
                 slot_bytes: slots.slot_bytes,
             }),
-        ),
-        None => (None, None),
-    })
+        )),
+        None if source.enabled == Some(true) => Err(ValidationError::new(
+            ValidationCode::ArpHoldWithoutFragmentation,
+            field("enabled"),
+        )),
+        None => Ok((None, None)),
+    }
 }
 
 /// Bounds of the `[health]` durations (milliseconds): 100 ms to one hour.
@@ -3605,6 +3653,7 @@ fn build_storage_shape(
             })?;
         bytes = arena;
     }
+    let before_hold = bytes;
     if let Some(shape) = inputs.arp_hold {
         let packets_path = path(&["resolution", "hold", "packets"]);
         add_bytes::<ArpHoldSlot>(&mut bytes, shape.packets, packets_path.clone())?;
@@ -3617,9 +3666,17 @@ fn build_storage_shape(
         bytes = arena;
     }
     if bytes > limits.max_runtime_bytes {
+        // A document that fits without the ARP hold (ARP-HOLD made the
+        // default storage larger) points at `[resolution.hold]`: lower
+        // `packets` or set `enabled = false`.
+        let hint = if inputs.arp_hold.is_some() && before_hold <= limits.max_runtime_bytes {
+            path(&["resolution", "hold", "packets"])
+        } else {
+            SourcePath::default()
+        };
         return Err(ValidationError::bounded(
             ValidationCode::RuntimeStorageBytesExceeded,
-            SourcePath::default(),
+            hint,
             u64::try_from(limits.max_runtime_bytes).unwrap_or(u64::MAX),
             u64::try_from(bytes).unwrap_or(u64::MAX),
         ));

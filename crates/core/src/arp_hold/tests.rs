@@ -474,11 +474,11 @@ fn mark_ready_replays_known_next_hops_within_room_and_frees_the_rest() {
     let probe = |_: IfId, target: Ipv4Address| match target {
         GW => ArpHoldNextHop::Known,
         t if t == resolving => ArpHoldNextHop::Resolving,
-        _ => ArpHoldNextHop::Over,
+        _ => ArpHoldNextHop::Failed,
     };
     // Room for two at 1_000: 1 and 3 are ready; 6 is known but has no room
     // and its deadline passed; 7 is deferred; 5 expired; 4 failed; 2 waits.
-    assert_eq!(runtime.mark_ready(1_000, 2, probe), 2);
+    assert_eq!(runtime.mark_ready(1_000, 2, 0, probe), 2);
     let states: Vec<(u8, HoldState)> = {
         let mut out = Vec::new();
         let mut cursor = runtime.oldest;
@@ -504,9 +504,9 @@ fn mark_ready_replays_known_next_hops_within_room_and_frees_the_rest() {
         (2, 1, 1)
     );
     // A second pass skips the ready ones; one deadline exactly reached.
-    assert_eq!(runtime.mark_ready(4_999, 0, probe), 0);
+    assert_eq!(runtime.mark_ready(4_999, 0, 0, probe), 0);
     assert_eq!(runtime.counters().deferred, 2);
-    assert_eq!(runtime.mark_ready(5_000, 0, probe), 0);
+    assert_eq!(runtime.mark_ready(5_000, 0, 0, probe), 0);
     assert_eq!(tags(&runtime), [1, 3]);
     assert_eq!(runtime.counters().expired, 4);
 }
@@ -524,7 +524,7 @@ fn the_replay_batch_lends_ready_datagrams_and_settles_each_completion() {
         .hold(&frame([192, 168, 1, 10], 60, 6), WAN, miss(OTHER, 9_000))
         .unwrap();
     assert_eq!(
-        runtime.mark_ready(0, 5, |_, target| if target == GW {
+        runtime.mark_ready(0, 5, 0, |_, target| if target == GW {
             ArpHoldNextHop::Known
         } else {
             ArpHoldNextHop::Resolving
@@ -619,7 +619,7 @@ fn staging_sends_committed_datagrams_whole_and_returns_unreached_ones() {
         .hold(&frame([192, 168, 1, 10], 60, 4), LAN, miss(OTHER, 9_000))
         .unwrap();
     // Mark three ready (4's next hop resolves only later).
-    runtime.mark_ready(0, 3, |_, target| {
+    runtime.mark_ready(0, 3, 0, |_, target| {
         if target == GW {
             ArpHoldNextHop::Known
         } else {
@@ -654,11 +654,127 @@ fn staging_sends_committed_datagrams_whole_and_returns_unreached_ones() {
     runtime
         .hold(&frame([192, 168, 1, 10], 60, 1), LAN, miss(GW, 9_000))
         .unwrap();
-    runtime.mark_ready(0, 1, |_, _| ArpHoldNextHop::Known);
+    runtime.mark_ready(0, 1, 0, |_, _| ArpHoldNextHop::Known);
     runtime.stage_committed(&snapshot, &mut fragmentation);
     assert_eq!(
         runtime.slots[runtime.oldest as usize].state,
         HoldState::Held
     );
     assert_eq!(runtime.counters().replay_sent, 0);
+}
+
+#[test]
+fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
+    assert_eq!(
+        ArpHoldPolicy::DEFAULT.with_per_ingress(0),
+        Err(ArpHoldPolicyError::PerIngress)
+    );
+    assert_eq!(ArpHoldPolicy::DEFAULT.per_ingress(), 32);
+    let policy = ArpHoldPolicy::new(1, 16)
+        .unwrap()
+        .with_per_ingress(2)
+        .unwrap();
+    assert_eq!(policy.per_ingress(), 2);
+    let mut table = Table::new(4);
+    let mut runtime = ArpHoldRuntime::new(policy, &mut table.slots, &mut table.bytes).unwrap();
+    let target = |last: u8| Ipv4Address::from_octets([203, 0, 113, last]);
+    // Two spoofed sources on the WAN take the ingress share.
+    runtime
+        .hold(&frame([198, 51, 100, 1], 60, 1), WAN, miss(target(10), 1))
+        .unwrap();
+    runtime
+        .hold(&frame([198, 51, 100, 2], 60, 2), WAN, miss(target(11), 1))
+        .unwrap();
+    assert_eq!(
+        runtime.hold(&frame([198, 51, 100, 3], 60, 3), WAN, miss(target(12), 1)),
+        Err(DropReason::ArpHoldIngressLimit)
+    );
+    // Replacing one of its own (same next hop) needs no more share.
+    runtime
+        .hold(&frame([198, 51, 100, 3], 60, 4), WAN, miss(target(11), 1))
+        .unwrap();
+    // The LAN still finds room.
+    runtime
+        .hold(&frame([192, 168, 1, 10], 60, 5), LAN, miss(target(13), 1))
+        .unwrap();
+    runtime
+        .hold(&frame([192, 168, 1, 11], 60, 6), LAN, miss(target(14), 1))
+        .unwrap();
+    assert_eq!(tags(&runtime), [1, 4, 5, 6]);
+    // Full now: refused as full before the ingress share.
+    assert_eq!(
+        runtime.hold(&frame([192, 168, 1, 12], 60, 7), LAN, miss(target(15), 1)),
+        Err(DropReason::ArpHoldFull)
+    );
+    let counters = runtime.counters();
+    assert_eq!(
+        (counters.refused_ingress_limit, counters.refused_full),
+        (1, 1)
+    );
+}
+
+#[test]
+fn a_replacement_prefers_the_senders_own_datagram() {
+    let mut table = Table::new(4);
+    let mut runtime = table.runtime(2, 16);
+    let a = [192, 168, 1, 10];
+    let b = [192, 168, 1, 11];
+    runtime.hold(&frame(b, 60, 1), LAN, miss(GW, 1)).unwrap();
+    runtime.hold(&frame(a, 60, 2), LAN, miss(GW, 1)).unwrap();
+    // A's new datagram replaces A's own, not B's older one.
+    runtime.hold(&frame(a, 60, 3), LAN, miss(GW, 1)).unwrap();
+    assert_eq!(tags(&runtime), [1, 3]);
+    // C has none there: the oldest goes.
+    runtime
+        .hold(&frame([192, 168, 1, 12], 60, 4), LAN, miss(GW, 1))
+        .unwrap();
+    assert_eq!(tags(&runtime), [3, 4]);
+}
+
+#[test]
+fn a_cancelled_resolution_is_counted_apart_from_a_failed_one() {
+    let mut table = Table::new(4);
+    let mut runtime = table.runtime(8, 16);
+    runtime
+        .hold(&frame([192, 168, 1, 10], 60, 1), LAN, miss(GW, 9_000))
+        .unwrap();
+    runtime
+        .hold(&frame([192, 168, 1, 10], 60, 2), LAN, miss(OTHER, 9_000))
+        .unwrap();
+    runtime.mark_ready(0, 4, 0, |_, target| {
+        if target == GW {
+            ArpHoldNextHop::Gone
+        } else {
+            ArpHoldNextHop::Failed
+        }
+    });
+    let counters = runtime.counters();
+    assert_eq!(
+        (counters.cancelled, counters.failed, runtime.live()),
+        (1, 1, 0)
+    );
+}
+
+#[test]
+fn a_first_fragment_needs_room_for_the_held_fragments() {
+    let mut table = Table::new(4);
+    let mut runtime = table.runtime(8, 16);
+    let mut first = frame([192, 168, 1, 10], 60, 1);
+    first[20] = 0x20; // MF, offset 0
+    let mut later = frame([192, 168, 1, 10], 60, 2);
+    later[20..22].copy_from_slice(&[0x20, 0x10]); // MF, offset 16
+    runtime.hold(&first, LAN, miss(GW, 9_000)).unwrap();
+    runtime.hold(&later, LAN, miss(GW, 9_000)).unwrap();
+    let known = |_: IfId, _: Ipv4Address| ArpHoldNextHop::Known;
+    // A first fragment costs 1 + 2 reserved: with 2 slots only the later
+    // fragment (cost 1) is ready.
+    assert_eq!(runtime.mark_ready(0, 2, 2, known), 1);
+    assert_eq!(runtime.counters().deferred, 1);
+    runtime.stage_committed(&snapshot(), &mut {
+        // Nothing committed: everything goes back to waiting.
+        let slots = Box::leak(Box::new([Ipv4FragmentSlot::EMPTY; 1]));
+        let bytes = Box::leak(vec![0_u8; SLOT].into_boxed_slice());
+        Ipv4FragmentationRuntime::new(Ipv4FragmentationPolicy::DEFAULT, slots, bytes).unwrap()
+    });
+    assert_eq!(runtime.mark_ready(0, 4, 2, known), 2);
 }

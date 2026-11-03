@@ -2057,10 +2057,22 @@ impl<'a> ResolutionRuntime<'a> {
         target: Ipv4Address,
         result: ResolutionResult,
     ) {
-        if matches!(
-            result,
-            ResolutionResult::Queued | ResolutionResult::RetryQueued | ResolutionResult::Suppressed
-        ) {
+        // `Suppressed` also covers a Cooldown tombstone (a request was
+        // committed and the key then learned or cancelled): nothing will
+        // resolve it, so only a pending generation counts.
+        let pending = match result {
+            ResolutionResult::Queued | ResolutionResult::RetryQueued => true,
+            ResolutionResult::Suppressed => matches!(
+                self.status(egress, target).map(|status| status.phase),
+                Some(
+                    ResolutionPhase::InitialQueued
+                        | ResolutionPhase::Waiting
+                        | ResolutionPhase::RetryQueued
+                )
+            ),
+            _ => false,
+        };
+        if pending {
             self.forward_miss = Some(ResolutionKey { egress, target });
         }
     }
@@ -2107,9 +2119,8 @@ impl<'a> ResolutionRuntime<'a> {
                     | ResolutionPhase::Waiting
                     | ResolutionPhase::RetryQueued,
                 ) => ArpHoldNextHop::Resolving,
-                Some(ResolutionPhase::Failed | ResolutionPhase::Cooldown) | None => {
-                    ArpHoldNextHop::Over
-                }
+                Some(ResolutionPhase::Failed) => ArpHoldNextHop::Failed,
+                Some(ResolutionPhase::Cooldown) | None => ArpHoldNextHop::Gone,
             },
         }
     }

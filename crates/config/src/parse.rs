@@ -128,6 +128,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "opening-idle-ttl-ms",
     "packets",
     "per-host",
+    "per-ingress",
     "per-neighbor",
     "outside",
     "peers",

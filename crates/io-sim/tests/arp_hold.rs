@@ -488,6 +488,7 @@ fn the_latest_datagrams_are_kept_and_sent_in_order() {
 fn the_per_host_and_total_bounds_refuse_with_typed_drops() {
     let text = ROUTER
         .replacen("per-host = 16", "per-host = 2", 1)
+        .replacen("per-ingress = 32", "per-ingress = 3", 1)
         .replacen("packets = 64", "packets = 3", 1);
     let mut world = World::new(&text);
     let datagram = |source: [u8; 4], mac: [u8; 6], last: u8| {
@@ -792,7 +793,8 @@ fn a_held_df_set_datagram_above_the_egress_mtu_gets_fragmentation_needed() {
     let error = &sent[0].bytes;
     assert_eq!((sent[0].egress, &error[34..36]), (LAN, &[3, 4][..]));
     assert_eq!(u16_at(error, 40), 576);
-    assert_eq!(world.drops(DropReason::Ipv4FragmentationNeeded), 1);
+    // Counted by the hold, not again as a received frame's drop.
+    assert_eq!(world.drops(DropReason::Ipv4FragmentationNeeded), 0);
     assert_eq!(world.hold().replay_dropped, 1);
 }
 
@@ -952,4 +954,185 @@ fn a_failed_next_hop_is_dropped_not_held_under_another_miss() {
     assert_eq!(world.live(), 1, "only the datagram to S is held");
     assert_eq!(world.drops(DropReason::NeighborUnresolved), 1);
     assert_eq!(world.hold().held, 2);
+}
+
+/// A replay is not a second reception: its own terminal events (here the
+/// DF-set datagram dropped for its MTU at replay) are counted by the hold
+/// (`replay_dropped`), not again by the drop and consume counters, so
+/// drops + consumes + forwarded still equal the frames received.
+#[test]
+fn a_replay_is_not_counted_twice() {
+    let text = ROUTER.replacen(
+        "mac = \"02:00:00:00:00:02\"",
+        "mac = \"02:00:00:00:00:02\"\nmtu = 576",
+        1,
+    );
+    let mut world = World::new(&text);
+    world.tick(
+        0,
+        &[(
+            LAN,
+            from_h(S, 1, DF, 64, 17, &udp(H, S, (5000, 53), &[0; 972])),
+        )],
+    );
+    world.tick(10, &[(WAN, g_reply())]);
+    let snapshot = world.observer.snapshot(MonotonicMillis(10));
+    assert_eq!(snapshot.totals.rx.received, 2);
+    assert_eq!(snapshot.drops.total() + snapshot.consumes.total(), 2);
+    assert_eq!(snapshot.consumes.count(ConsumeReason::ArpHeld), 1);
+    assert_eq!(snapshot.consumes.count(ConsumeReason::ArpControl), 1);
+    assert_eq!(world.hold().replay_dropped, 1);
+}
+
+/// A miss while the key is in its Cooldown tombstone (the next hop was
+/// learned, its dynamic entry then expired within the request interval)
+/// starts no resolution, so the datagram is dropped as before, not held to
+/// be freed later.
+#[test]
+fn a_miss_in_cooldown_is_dropped_not_held() {
+    let text = ROUTER.replacen(
+        "dynamic-neighbor-ttl-ms = 60000",
+        "dynamic-neighbor-ttl-ms = 100",
+        1,
+    );
+    let mut world = World::new(&text);
+    let datagram = |id: u16| (LAN, from_h(S, id, DF, 64, 17, &udp(H, S, (5000, 53), b"q")));
+    world.tick(0, &[datagram(1)]);
+    assert_eq!(world.tick(10, &[(WAN, g_reply())]).len(), 1);
+    // G's entry expired at 110; the request (at 0) is less than an interval
+    // old, so the key is a Cooldown tombstone.
+    world.tick(150, &[datagram(2)]);
+    assert_eq!(world.drops(DropReason::NeighborUnresolved), 1);
+    let counters = world.hold();
+    assert_eq!(
+        (counters.held, counters.failed, counters.cancelled),
+        (1, 0, 0)
+    );
+}
+
+/// A replay deferred for room whose learned neighbour then expires is
+/// counted as cancelled, not as a failed resolution.
+#[test]
+fn a_deferred_replay_whose_neighbour_expired_is_cancelled_not_failed() {
+    let text = ROUTER
+        .replacen(
+            "dynamic-neighbor-ttl-ms = 60000",
+            "dynamic-neighbor-ttl-ms = 100",
+            1,
+        )
+        .replacen("[tick]", "[fragmentation]\ndatagrams = 1\n\n[tick]", 1);
+    let mut world = World::new(&text);
+    let frames: Vec<_> = (1..=2_u16)
+        .map(|id| (LAN, from_h(S, id, DF, 64, 17, &udp(H, S, (5000, 53), b"q"))))
+        .collect();
+    world.tick(0, &frames);
+    assert_eq!(world.tick(10, &[(WAN, g_reply())]).len(), 1);
+    assert_eq!(world.hold().deferred, 1);
+    assert!(world.tick(200, &[]).is_empty());
+    let counters = world.hold();
+    assert_eq!(
+        (
+            counters.cancelled,
+            counters.failed,
+            counters.expired,
+            world.live()
+        ),
+        (1, 0, 0, 0)
+    );
+}
+
+/// A replayed first fragment reserves room for the fragments the
+/// association table holds for it: with fewer free fragmentation slots it
+/// waits (nothing commits: no NAT mapping), so a committed replay is never
+/// left without a slot (`replay_unstaged` stays 0); with enough room every
+/// fragment goes out.
+#[test]
+fn a_held_first_fragment_waits_for_room_for_its_released_fragments() {
+    for (datagrams, sent) in [(2, 0), (3, 3)] {
+        let text = ROUTER.replacen(
+            "[tick]",
+            &format!("[fragmentation]\ndatagrams = {datagrams}\n\n[tick]"),
+            1,
+        );
+        let mut world = World::new(&text);
+        let payload: Vec<u8> = (0..2972_u32).map(|i| (i % 251) as u8).collect();
+        let datagram = from_h(S, 0x4242, 0, 64, 17, &udp(H, S, (5000, 4789), &payload));
+        let frames: Vec<_> = cut(&datagram, 1500).into_iter().map(|f| (LAN, f)).collect();
+        world.tick(0, &frames);
+        let out = world.tick(10, &[(WAN, g_reply())]);
+        assert_eq!(out.len(), sent, "{datagrams} slots");
+        let counters = world.hold();
+        assert_eq!(counters.replay_unstaged, 0);
+        assert_eq!(
+            world.state()[0],
+            usize::from(sent > 0),
+            "a NAT mapping only when it was sent"
+        );
+        if sent == 0 {
+            assert_eq!(counters.deferred, 1);
+            // It never fits: freed at its deadline, nothing committed.
+            world.tick(3_000, &[]);
+            assert_eq!((world.live(), world.hold().expired), (0, 1));
+            assert_eq!(world.state()[0], 0);
+        }
+    }
+}
+
+/// One NAT mapping for a flow however many of its datagrams were held, and
+/// none for a datagram the hold refused.
+#[test]
+fn held_datagrams_of_one_flow_create_one_mapping_and_a_refused_one_none() {
+    let text = ROUTER.replacen("per-host = 16", "per-host = 3", 1);
+    let mut world = World::new(&text);
+    let frames: Vec<_> = (1..=3_u16)
+        .map(|id| (LAN, from_h(S, id, DF, 64, 17, &udp(H, S, (5000, 53), b"q"))))
+        .collect();
+    world.tick(0, &frames);
+    // H's fourth, to another flow and next hop, is over its host bound.
+    let other = [203, 0, 113, 77];
+    world.tick(
+        1,
+        &[(
+            LAN,
+            from_h(other, 4, DF, 64, 17, &udp(H, other, (6000, 53), b"r")),
+        )],
+    );
+    assert_eq!(world.drops(DropReason::ArpHoldHostLimit), 1);
+    assert_eq!(world.state(), [0, 0, 0, 0]);
+    assert_eq!(world.tick(10, &[(WAN, g_reply())]).len(), 3);
+    let udp = world.active.nat44_udp().counters();
+    assert_eq!((udp.mappings_created, udp.mappings_reused), (1, 2));
+    assert_eq!(world.state()[0], 1);
+}
+
+/// One ingress takes at most `per-ingress` slots, so datagrams from the
+/// other interface still find room.
+#[test]
+fn one_ingress_takes_at_most_its_share() {
+    let text = ROUTER
+        .replacen("packets = 64", "packets = 4", 1)
+        .replacen("per-ingress = 32", "per-ingress = 2", 1)
+        .replacen("per-neighbor = 3", "per-neighbor = 1", 1)
+        .replacen("per-host = 16", "per-host = 4", 1);
+    let mut world = World::new(&text);
+    let frames: Vec<_> = (50..=52_u8)
+        .map(|last| {
+            let destination = [203, 0, 113, last];
+            (
+                LAN,
+                from_h(
+                    destination,
+                    1,
+                    DF,
+                    64,
+                    17,
+                    &udp(H, destination, (5000, 7), b"x"),
+                ),
+            )
+        })
+        .collect();
+    world.tick(0, &frames);
+    assert_eq!(world.drops(DropReason::ArpHoldIngressLimit), 1);
+    assert_eq!(world.live(), 2);
+    assert_eq!(world.hold().refused_ingress_limit, 1);
 }

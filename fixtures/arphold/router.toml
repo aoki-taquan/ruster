@@ -58,12 +58,14 @@ dynamic-neighbors = 8
 failure-holds = 8
 
 # The hold (the values are the defaults, spelled out): at most 3 datagrams
-# per unresolved next hop (a new one replaces the oldest), 16 per (ingress,
-# source), 64 in all, each in a slot the size of a fragmentation slot.
+# per unresolved next hop (a new one replaces an older one), 16 per
+# (ingress, source), 32 per ingress interface, 64 in all, each in a slot the
+# size of a fragmentation slot.
 [resolution.hold]
 enabled = true
 per-neighbor = 3
 per-host = 16
+per-ingress = 32
 packets = 64
 
 [icmpv4-errors.policy]
