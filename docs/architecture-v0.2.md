@@ -2793,17 +2793,18 @@ accessor copy）を`TickObserver::record_occupancy`へ渡し、最後の値と�
 を常に出します（M2 S8の29 keyからB3とN5で41 key、OBS-017で77 key）。
 
 OBS-017は同じ`TableOccupancy`/`ObservedTable`の形で、OBS-015が扱わないbounded queue/tableを
-足します: pending resolution（cooldownを除くstate）、generated ARP request queue、learned
+足します: resolution state（admissionがusedとみなすslot。interval未経過のcooldownを含む）、generated ARP request queue、learned
 neighbor、failure hold、generated ICMPv4 error queue、ARP-HOLDのheld packet、fragment association
-entryとheld fragment、fragmentation slot。各runtimeは既にO(1)のcountを持つので、core
+entryとheld fragment、fragmentation slot。各runtimeは既にO(1)のcountを持つ（stateは再利用bitmapのbitを変える唯一の点で数える
+worker-localの`usize`を足した）ので、core
 `HighWaterMark`（`usize`一つ）をその加算点の直後に`observe(count)`（compare一回とstore一回）で
 更新するだけで、slotごとのstorageも、per-packet forward pathの追加workもありません（加算点は
 neighbor miss、ARP学習、ICMP error生成、hold、fragment処理で、通常のforwardでは通らない）。
-markはpublication commitで0に戻り（resolutionのcarrying commitではlearned neighborだけ
-carryした数へ）、ARP-HOLDとfragment associationはapplyの`flush`で0に戻ります。fragmentation
+markはpublication commitで0に戻り（resolutionのcarrying commitではlearned neighborの
+markを保持、OBS-015と同じ）、ARP-HOLDとfragment associationはapplyの`flush`で0に戻ります。fragmentation
 slotはtick内のflushがsample前に起きるため、markをprocess lifetimeで保持します。firewall
 audit buffer（`FirewallAuditBuffer`）にも同じ`occupancy()`がありますが、`ruster run`は
-audit bufferを持たないためstatsには出ません。runtime structの増分は全部で80 byteで、
+audit bufferを持たないためstatsには出ません。runtime structの増分は全部で88 byteで、
 caller-backed storage（storage boundの対象）は変わりません。native ring saturation（OBS-018）
 はnative backend実装側です。
 
