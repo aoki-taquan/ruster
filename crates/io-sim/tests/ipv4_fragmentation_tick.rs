@@ -1,8 +1,9 @@
-//! MTU2 part B: the generated fragment phase of `run_tick` (right after RX)
-//! through the validated config, the publication, and SimIo: it sends the
-//! staged datagrams in the tick they arrived in, and a backend finish error
-//! flushes the rest of them and skips the later generated phases, so no
-//! staged datagram outlives its tick.
+//! MTU2 part B: the generated fragment phase of `run_tick` (the last phase,
+//! after generated ARP and ICMPv4) through the validated config, the
+//! publication, and SimIo: it sends the staged datagrams in the tick they
+//! arrived in within its frame budget; a backend failure of its own or of
+//! an earlier generated phase flushes them, so no staged datagram outlives
+//! its tick.
 
 use ruster_config::{parse, validate, ValidatedConfig, PRODUCTION_VALIDATION_LIMITS};
 use ruster_control::{
@@ -12,7 +13,7 @@ use ruster_core::{internet_checksum, IfId, MonotonicMillis};
 use ruster_io_sim::{FrameOrigin, SimIo};
 use ruster_runtime::{
     run_tick, GeneratedAccounting, GeneratedFragmentsStop, GeneratedPhaseReport, PhaseReport,
-    TickBudgets, TickObserver,
+    TickBudgets, TickObserver, TickPhaseSkip,
 };
 
 const LAN: IfId = IfId(1);
@@ -370,4 +371,77 @@ fn the_tick_fragment_budget_refuses_whole_sets() {
     );
     assert_eq!(std::iter::from_fn(|| io.pop_tx()).count(), 2);
     assert_eq!(active.fragmentation().unwrap().counters().fragmented, 2);
+}
+
+/// Re-review M1: a backend failure in the generated ICMPv4 phase (here its
+/// finish error) skips the fragment phase that follows and flushes the
+/// staged datagrams; nothing is sent for them and nothing stays staged.
+#[test]
+fn an_icmpv4_phase_failure_skips_the_fragment_phase_and_flushes() {
+    let (mut storage, candidate) = activate(&config_text());
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate).unwrap();
+    let mut io = SimIo::new();
+    let mut observer = TickObserver::default();
+    // A TTL=1 datagram queues a Time Exceeded (the tick's first generated
+    // session, whose finish fails); the DF-clear datagram is staged.
+    io.inject(LAN, udp_to([198, 51, 100, 20], 1, 5001, 100));
+    io.inject(LAN, datagram(5002, 1000));
+    io.fail_next_generated_finish();
+    let report = run_tick(
+        &mut active,
+        None,
+        &mut io,
+        MonotonicMillis(1),
+        budgets(),
+        &mut observer,
+    );
+    assert!(matches!(report.generated_icmpv4, PhaseReport::Completed(_)));
+    assert_eq!(
+        report.generated_fragments,
+        PhaseReport::Skipped(TickPhaseSkip::BackendIoFailure)
+    );
+    let fragmentation = active.fragmentation().unwrap();
+    assert_eq!(fragmentation.pending(), 0);
+    let counters = fragmentation.counters();
+    assert_eq!(
+        (counters.queued, counters.flushed, counters.fragments),
+        (1, 1, 0)
+    );
+    // Only the Time Exceeded left (its finish error does not reject it).
+    let sent: Vec<_> = std::iter::from_fn(|| io.pop_tx()).collect();
+    assert!(sent.iter().all(|frame| frame.egress == LAN), "{sent:?}");
+}
+
+/// Re-review L1: a datagram that needs more fragments than the tick's
+/// fragment budget can never be sent, so it is refused at admission
+/// (IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS) before its NAT mapping commits.
+#[test]
+fn a_set_above_the_tick_budget_is_refused_before_commit() {
+    let (mut storage, candidate) = activate(&config_text());
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, candidate).unwrap();
+    let mut io = SimIo::new();
+    let mut observer = TickObserver::default();
+    let one = TickBudgets {
+        generated_fragments: 1,
+        ..budgets()
+    };
+    io.inject(LAN, datagram(5000, 1000));
+    run_tick(
+        &mut active,
+        None,
+        &mut io,
+        MonotonicMillis(1),
+        one,
+        &mut observer,
+    );
+    assert_eq!(io.pop_tx().map(|frame| frame.egress), None);
+    let recycled = io.pop_recycled().expect("dropped");
+    assert_eq!(
+        recycled.cause,
+        ruster_io_sim::RecycleCause::Forwarding(
+            ruster_core::DropReason::Ipv4FragmentationTooManyFragments
+        )
+    );
+    assert_eq!(active.nat44_udp().counters().mappings_created, 0);
+    assert_eq!(active.fragmentation().unwrap().counters().queued, 0);
 }

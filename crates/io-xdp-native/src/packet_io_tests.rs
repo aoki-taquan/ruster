@@ -2021,21 +2021,24 @@ fn check_capacity_is_bounded_by_the_generated_pool_and_counts_nothing() {
 fn check_capacity_is_bounded_by_tx_ring_room_and_the_in_flight_bound() {
     let (lan, wan) = (kernel(), kernel());
     let mut io = adapter(&lan, &wan);
-    // Five of the eight TX slots are taken; the generated pool has 16.
+    // Three of the eight TX slots are taken; the generated pool has 16, so
+    // its router reserve (2) is withheld from the TX room as well: a set
+    // gets 5 - 2.
     {
         let mut batch = io.begin_generated(WAN);
-        for _ in 0..5 {
+        for _ in 0..3 {
             batch.allocate(60).expect("generated").commit();
         }
-        assert_eq!(batch.finish().accepted, 5);
+        assert_eq!(batch.finish().accepted, 3);
     }
+    assert_eq!(generated_reserve(16), 2);
     let before = stats(&io);
     let completion = {
         let mut batch = io.begin_generated(WAN);
         assert_eq!(
             batch.check_capacity(4, 60),
             Err(GeneratedAllocationError::Unavailable),
-            "ring room"
+            "ring room minus the reserve"
         );
         batch.finish()
     };
@@ -2049,11 +2052,16 @@ fn check_capacity_is_bounded_by_tx_ring_room_and_the_in_flight_bound() {
         }
         assert_eq!(
             batch.check_capacity(1, 60),
-            Err(GeneratedAllocationError::Unavailable)
+            Err(GeneratedAllocationError::Unavailable),
+            "the reserve is not offered to sets"
         );
+        // Single router frames still get the reserved slots.
+        for _ in 0..2 {
+            batch.allocate(60).expect("reserve").commit();
+        }
         batch.finish()
     };
-    assert_eq!((completion.accepted, completion.rejected), (3, 0));
+    assert_eq!((completion.accepted, completion.rejected), (5, 0));
     assert_eq!(completion.error, None);
 
     // The kernel consumes every slot but completes none: the ring has room
@@ -2075,8 +2083,9 @@ fn check_capacity_is_bounded_by_tx_ring_room_and_the_in_flight_bound() {
     };
     assert_untouched(&completion);
     assert_unchanged(&io, before);
-    // Two completions (reaped by begin_generated) make room for two.
-    for address in consumed.drain(..2) {
+    // Four completions (reaped by begin_generated) make room for two, past
+    // the reserve.
+    for address in consumed.drain(..4) {
         assert!(wan.produce_completion(address));
     }
     let completion = {

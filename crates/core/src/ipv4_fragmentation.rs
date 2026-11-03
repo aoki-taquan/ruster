@@ -85,9 +85,11 @@ const MAX_DATAGRAM_DATA: usize = u16::MAX as usize - IPV4_HEADER_LEN;
 pub const IPV4_FRAGMENTATION_MAX_FRAGMENTS: u16 = 1365;
 
 /// Default `max-fragments-per-datagram`: [`IPV4_FRAGMENTATION_MAX_FRAGMENTS`],
-/// so by default every datagram RFC 1812 §4.2.2.7 requires the router to
-/// fragment is fragmented (1500 → 1280 needs 2, 1500 → 576 3, 9000 → 1500
-/// 7, 65535 → 68 1365). A lower value is hardening.
+/// so this bound never refuses a datagram by itself (1500 → 1280 needs 2,
+/// 1500 → 576 3, 9000 → 1500 7, 65535 → 68 1365). The effective ceiling is
+/// lower: the tick's fragment budget (`[tick] generated-fragments`, default
+/// 64, [`Ipv4FragmentationRuntime::set_tick_frame_budget`]) and the egress
+/// room. A lower value is hardening.
 pub const IPV4_FRAGMENTATION_DEFAULT_MAX_FRAGMENTS: u16 = IPV4_FRAGMENTATION_MAX_FRAGMENTS;
 
 /// Smallest `max-fragments-per-datagram`: one fragment is no fragmentation
@@ -275,6 +277,9 @@ pub struct Ipv4FragmentationRuntime<'a> {
     /// Staged slots are `slots[head..len]`.
     len: usize,
     counters: Ipv4FragmentationCounters,
+    /// Fragment frames one tick may send (`[tick] generated-fragments`): a
+    /// datagram needing more can never be sent, so `plan` refuses it.
+    tick_frame_budget: usize,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -314,6 +319,7 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
             head: 0,
             len: 0,
             counters: Ipv4FragmentationCounters::default(),
+            tick_frame_budget: usize::MAX,
             _worker_local: PhantomData,
         })
     }
@@ -342,6 +348,15 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
     #[must_use]
     pub const fn slot_bytes(&self) -> usize {
         self.slot_bytes
+    }
+
+    /// Sets the tick's fragment frame budget (`[tick] generated-fragments`;
+    /// unlimited until set). A datagram needing more fragments than
+    /// `min(max-fragments-per-datagram, budget)` can never be sent, so
+    /// admission in the forwarding path refuses it before any state commits
+    /// (`IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS`) rather than at send time.
+    pub fn set_tick_frame_budget(&mut self, frames: usize) {
+        self.tick_frame_budget = frames;
     }
 
     /// Drops every staged datagram (counted as `flushed`) and returns how
@@ -380,7 +395,7 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
             return Err(DropReason::Ipv4FragmentationRequired);
         }
         let fragments = data_len.div_ceil(block);
-        if fragments > usize::from(self.policy.max_fragments) {
+        if fragments > usize::from(self.policy.max_fragments).min(self.tick_frame_budget) {
             return Err(DropReason::Ipv4FragmentationTooManyFragments);
         }
         // RFC 791: a datagram is at most 65535 bytes, so the data of a

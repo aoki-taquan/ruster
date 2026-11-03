@@ -603,6 +603,33 @@ fn a_refused_set_sends_nothing_and_counts_the_reason() {
 }
 
 #[test]
+fn a_set_above_the_tick_budget_is_refused_at_admission() {
+    // Every datagram needing more fragments than the tick may send is
+    // refused before commit, like the per-datagram bound.
+    let frame = datagram(1480, 0);
+    let mut storage = Storage::new(1, 1500);
+    let mut runtime = storage.runtime(Ipv4FragmentationPolicy::DEFAULT);
+    runtime.set_tick_frame_budget(2);
+    assert_eq!(
+        runtime.plan(&frame, 576),
+        Err(DropReason::Ipv4FragmentationTooManyFragments)
+    );
+    runtime.set_tick_frame_budget(3);
+    assert_eq!(
+        runtime.plan(&frame, 576).map(Ipv4FragmentPlan::fragments),
+        Ok(3)
+    );
+    // The smaller of the two bounds applies.
+    let mut bounded_storage = Storage::new(1, 1500);
+    let mut bounded = bounded_storage.runtime(policy(2));
+    bounded.set_tick_frame_budget(64);
+    assert_eq!(
+        bounded.plan(&frame, 576),
+        Err(DropReason::Ipv4FragmentationTooManyFragments)
+    );
+}
+
+#[test]
 fn the_frame_budget_refuses_whole_sets_without_a_session() {
     // Three staged sets of 3 fragments each against a budget of 7 frames:
     // the first two fit exactly (3 + 3), the third (3 > 1) is refused

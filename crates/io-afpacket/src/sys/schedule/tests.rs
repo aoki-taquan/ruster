@@ -1188,38 +1188,54 @@ fn af_packet_check_capacity_counts_the_free_run_from_the_producer_head() {
         Err(GeneratedAllocationError::FrameTooLarge),
         "length before room"
     );
+    // The router reserve (2 of the 4 TX frames) is never offered to a set.
+    let reserve = super::super::generated::tx_router_reserve(TX_FRAMES);
+    assert_eq!(reserve, 2);
+    let room = TX_FRAMES - reserve;
     assert_eq!(
-        batch.check_capacity(TX_FRAMES + 1, 60),
+        batch.check_capacity(room + 1, 60),
         Err(GeneratedAllocationError::Unavailable)
     );
-    assert_eq!(batch.check_capacity(TX_FRAMES, 1_514), Ok(()));
+    assert_eq!(batch.check_capacity(room, 1_514), Ok(()));
     assert_untouched(&batch.finish());
     assert_eq!((live.port(WAN), live.engine.backend_stats()), before);
     assert!(live.kicks().is_empty());
 
-    // Two frames in flight: exactly two more fit, and both are accepted.
-    assert_eq!(live.generate(WAN, 2, 60), 2);
+    // Ok means exactly that many allocations succeed and are accepted; the
+    // reserve is then still there for single router frames.
     let mut batch = live.engine.live_begin_generated(WAN);
-    assert_eq!(
-        batch.check_capacity(3, 60),
-        Err(GeneratedAllocationError::Unavailable)
-    );
-    assert_eq!(batch.check_capacity(2, 1_514), Ok(()));
+    assert_eq!(batch.check_capacity(room, 1_514), Ok(()));
     for len in [1_514, 14] {
         batch.allocate(len).expect("promised").commit();
     }
     assert_eq!(
         batch.check_capacity(1, 60),
-        Err(GeneratedAllocationError::Unavailable)
+        Err(GeneratedAllocationError::Unavailable),
+        "the reserve is not offered to sets"
     );
+    for len in [60, 1_514] {
+        batch
+            .allocate(len)
+            .expect("reserve for router frames")
+            .commit();
+    }
     let completion = batch.finish();
     assert!(completion.invariants_hold(), "{completion:?}");
-    assert_eq!((completion.accepted, completion.rejected), (2, 0));
+    assert_eq!((completion.accepted, completion.rejected), (4, 0));
     assert_eq!(completion.error, None);
 
-    // The kernel completed frame 0 only: the head (frame 0, wrapped) is
-    // free once reaped, frame 1 is still in flight.
+    // The kernel completed frames 0 and 1 only: the free run from the head
+    // (0, wrapped) is 2, all of it reserve.
     live.set_tx_status(1, 0, TP_STATUS_AVAILABLE);
+    live.set_tx_status(1, 1, TP_STATUS_AVAILABLE);
+    let mut batch = live.engine.live_begin_generated(WAN);
+    assert_eq!(
+        batch.check_capacity(1, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
+    assert_untouched(&batch.finish());
+    // A third completion makes room for exactly one.
+    live.set_tx_status(1, 2, TP_STATUS_AVAILABLE);
     let mut batch = live.engine.live_begin_generated(WAN);
     assert_eq!(
         batch.check_capacity(2, 60),
@@ -1235,9 +1251,14 @@ fn af_packet_check_capacity_counts_a_forgotten_lease_at_the_head_as_free() {
     let mut live = Live::new();
     let mut batch = live.engine.live_begin_generated(WAN);
     std::mem::forget(batch.allocate(60).expect("frame"));
-    assert_eq!(batch.check_capacity(TX_FRAMES, 60), Ok(()));
+    let room = TX_FRAMES - super::super::generated::tx_router_reserve(TX_FRAMES);
+    assert_eq!(batch.check_capacity(room, 60), Ok(()));
+    assert_eq!(
+        batch.check_capacity(room + 1, 60),
+        Err(GeneratedAllocationError::Unavailable)
+    );
     for _ in 0..TX_FRAMES {
-        batch.allocate(60).expect("promised").commit();
+        batch.allocate(60).expect("promised or reserve").commit();
     }
     let completion = batch.finish();
     assert!(completion.invariants_hold(), "{completion:?}");

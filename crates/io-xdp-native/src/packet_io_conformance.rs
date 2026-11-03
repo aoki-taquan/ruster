@@ -480,6 +480,16 @@ impl GeneratedHarness for XdpGeneratedHarness {
         self.0.hold_tx_slots(budget);
     }
 
+    fn generated_router_reserve(&mut self) -> usize {
+        let frames = self
+            .0
+            .io()
+            .engine(ENDPOINTS[1].interface)
+            .expect("WAN port")
+            .generated_frames();
+        crate::generated_reserve(frames) as usize
+    }
+
     fn drain_generated_events(&mut self) -> Vec<GeneratedEvent> {
         let mut events = Vec::new();
         for (port, descriptor, frame, bytes) in self.0.take_submissions() {

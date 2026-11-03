@@ -212,6 +212,12 @@ pub trait GeneratedHarness: Sized {
     fn set_generated_allocation_budget(&mut self, budget: usize);
     fn set_generated_max_frame(&mut self, max_frame: usize);
     fn set_generated_accept_budget(&mut self, budget: usize);
+    /// Frames of the WAN egress that `check_capacity` withholds from a frame
+    /// set for the router's own single frames (the AF_XDP adapter's router
+    /// reserve); 0 for a backend that keeps none.
+    fn generated_router_reserve(&mut self) -> usize {
+        0
+    }
     /// Drains observations from actual publication and reclamation rings.
     ///
     /// Rejected/reclaimed events are already reusable; submitted events remain
@@ -950,8 +956,11 @@ pub mod generated {
                 harness.set_generated_allocation_budget(2);
                 harness.set_generated_accept_budget(4);
             } else {
+                // The TX room is the bound; a backend's router reserve comes
+                // on top of the room a set may take.
                 harness.set_generated_allocation_budget(3);
-                harness.set_generated_accept_budget(2);
+                let reserve = harness.generated_router_reserve();
+                harness.set_generated_accept_budget(2 + reserve);
             }
             let mut live = Vec::new();
             let checked = {

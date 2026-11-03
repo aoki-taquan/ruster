@@ -1597,8 +1597,8 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
         }
     }
 
-    /// Room is `min(generated free frames - router reserve, TX submit
-    /// room)`. The router reserve ([`generated_reserve`], the frames cross-port
+    /// Room is `min(generated free frames, TX submit room) - router
+    /// reserve`. The router reserve ([`generated_reserve`], the frames cross-port
     /// copies never take either) stays free for the router's own single
     /// frames (ARP, ICMP errors), so a fragment set never takes the last of
     /// the pool (MTU2 part B review). An allocation
@@ -1661,7 +1661,9 @@ impl<'a, 'memory> GeneratedPacketBatch for XdpGeneratedBatch<'a, 'memory> {
             return Err(GeneratedAllocationError::Unavailable);
         }
         match engine.tx_submit_room() {
-            Ok(room) if frames <= room as usize => Ok(()),
+            // The same reserve stays free in the TX room, so fragments in
+            // flight never take the last ring slots either.
+            Ok(room) if frames.saturating_add(reserve) <= room as usize => Ok(()),
             Ok(_) => Err(GeneratedAllocationError::Unavailable),
             Err(error) => {
                 let interface = state.config.interface;

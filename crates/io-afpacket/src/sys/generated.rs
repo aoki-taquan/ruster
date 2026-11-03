@@ -62,6 +62,19 @@ impl<O: PacketOps> AfPacketEngine<O> {
     }
 }
 
+/// TX frames of a port that `check_capacity` never offers a frame set:
+/// `max(2, tx frames / 8)`, capped at the ring. Single allocations (the
+/// router's ARP requests and ICMP errors) may still use them.
+pub(crate) const fn tx_router_reserve(tx_frames: usize) -> usize {
+    let eighth = tx_frames / 8;
+    let reserve = if eighth > 2 { eighth } else { 2 };
+    if reserve < tx_frames {
+        reserve
+    } else {
+        tx_frames
+    }
+}
+
 /// One generated session on one egress port.
 #[must_use]
 pub(crate) struct AfPacketGenBatch<'a, O: PacketOps = LinuxOps> {
@@ -187,7 +200,11 @@ impl<'a, O: PacketOps> AfPacketGenBatch<'a, O> {
         if !(ETHERNET_HEADER_LEN..=resources.max_frame_len).contains(&frame_len) {
             return Err(GeneratedAllocationError::FrameTooLarge);
         }
-        if resources.tx_available_run(frames) < frames {
+        // The router reserve stays free for single router frames (ARP, ICMP
+        // errors): a set is offered only the run beyond it (MTU2 part B
+        // review), so fragments in flight never take the last TX frames.
+        let needed = frames.saturating_add(tx_router_reserve(resources.tx_frame_count()));
+        if resources.tx_available_run(needed) < needed {
             return Err(GeneratedAllocationError::Unavailable);
         }
         Ok(())

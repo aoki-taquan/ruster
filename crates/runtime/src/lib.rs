@@ -609,18 +609,21 @@ pub enum GeneratedIcmpv4Stop<E> {
     AccountingInvariantViolation(GeneratedAccountingViolation<E, Icmpv4ErrorBuildError>),
 }
 
-/// How the generated fragment phase ended (MTU2 part B).
+/// How the generated fragment phase ended (MTU2 part B). The phase is the
+/// last of the tick; it is `Skipped` (and the staged datagrams flushed)
+/// whenever an earlier generated phase did not run or ended in a backend
+/// failure (I/O, contract violation, clock regression).
 #[derive(Debug, Eq, PartialEq)]
 pub enum GeneratedFragmentsStop<E> {
     /// Every staged datagram was handled (sent, or refused whole by its
-    /// session's capacity check and counted in the fragmentation counters).
+    /// session's capacity check or the tick budget and counted in the
+    /// fragmentation counters).
     QueueEmpty,
     /// A session's finish reported a backend error; the datagrams still
-    /// staged were flushed (counted `flushed`) and later generated phases
-    /// of the tick are skipped.
+    /// staged were flushed (counted `flushed`).
     Failed { finish: E, flushed: usize },
     /// A session's accounting broke the backend contract; the datagrams
-    /// still staged were flushed and later generated phases are skipped.
+    /// still staged were flushed.
     AccountingInvariantViolation {
         completion: GeneratedCompletion<E>,
         flushed: usize,
@@ -861,12 +864,18 @@ where
             finish: completion.error,
         };
         if failure.allocation.is_some() || failure.build.is_some() || failure.finish.is_some() {
+            // A finish error is a backend I/O failure: the fragment phase
+            // after this one does not run in this tick.
+            let downstream_skip = failure
+                .finish
+                .is_some()
+                .then_some(TickPhaseSkip::BackendIoFailure);
             return (
                 GeneratedPhaseReport {
                     accounting,
                     stop: GeneratedIcmpv4Stop::Failed(failure),
                 },
-                None,
+                downstream_skip,
             );
         }
     }
@@ -887,7 +896,8 @@ where
 /// Sends every datagram staged by this tick's RX as fragments (MTU2 part
 /// B). A refused set is counted by the core and the phase goes on with the
 /// next datagram (another egress may have room); a finish error or an
-/// accounting violation flushes the rest and skips later generated phases.
+/// accounting violation flushes the rest. The phase is the last of the
+/// tick, so nothing after it is skipped.
 fn run_generated_fragments<I>(
     io: &mut I,
     runtime: Option<&mut Ipv4FragmentationRuntime<'_>>,
@@ -1173,6 +1183,11 @@ where
         runtime: mut firewall,
     } = firewall;
 
+    // A datagram needing more fragments than this tick's fragment budget
+    // can never be sent: the RX phase refuses it before any commit.
+    if let Some(runtime) = fragmentation.as_deref_mut() {
+        runtime.set_tick_frame_budget(budgets.generated_fragments);
+    }
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::Rx));
     let rx = match io.receive(budgets.rx) {
         Ok(batch) => {
@@ -1296,23 +1311,25 @@ where
         (PhaseReport::Completed(report), downstream_skip)
     };
 
-    let generated_icmpv4 = if let Some(reason) = arp_skip {
+    let (generated_icmpv4, icmp_skip) = if let Some(reason) = arp_skip {
         skip_phase(trace, TickPhase::GeneratedIcmpv4, reason);
-        PhaseReport::Skipped(reason)
+        (PhaseReport::Skipped(reason), None)
     } else {
         trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::GeneratedIcmpv4));
-        let (report, _) =
+        let (report, downstream_skip) =
             run_generated_icmpv4(io, icmpv4_errors, now, budgets.generated_icmpv4, trace);
         trace.record_tick_phase(TickPhaseTrace::PhaseFinished(TickPhase::GeneratedIcmpv4));
-        PhaseReport::Completed(report)
+        (PhaseReport::Completed(report), downstream_skip)
     };
 
     // Last, after generated ARP and ICMPv4, so forwarded fragments never
     // take the generated frames or TX room the router's own ARP and ICMP
     // need, and within its own frame budget. Still in the tick the
-    // datagrams arrived in; when the generated phases do not run, the
-    // staged datagrams are flushed: nothing staged outlives its tick.
-    let generated_fragments = if let Some(reason) = arp_skip {
+    // datagrams arrived in. When a generated phase before it did not run or
+    // ended in a backend failure (I/O, contract violation, clock
+    // regression), it does not run either and the staged datagrams are
+    // flushed: nothing staged outlives its tick.
+    let generated_fragments = if let Some(reason) = arp_skip.or(icmp_skip) {
         skip_phase(trace, TickPhase::GeneratedFragments, reason);
         if let Some(runtime) = fragmentation.as_deref_mut() {
             runtime.flush();
