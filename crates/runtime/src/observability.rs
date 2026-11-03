@@ -1543,7 +1543,8 @@ impl ObservableFields for ServiceCounters {
         visit_counts! {v, "fragment_tracking", self.fragment_tracking, Ipv4FragmentTrackingCounters {
             first_allowed, first_denied, followed, followed_denied, held, released,
             release_dropped, held_denied, held_expired, entries_expired, entries_completed,
-            entries_flushed, held_flushed,
+            entries_evicted, held_evicted, poisoned, duplicate_first, entries_flushed,
+            held_flushed,
         }}
     }
 }

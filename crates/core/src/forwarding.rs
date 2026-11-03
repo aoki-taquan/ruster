@@ -351,9 +351,12 @@ pub enum DropReason {
     /// (NAT-FRAG).
     Ipv4FragmentFirstDenied = 190,
     /// A first fragment (MF set, offset 0) for a datagram whose first
-    /// fragment was already decided: a second transport header could differ
-    /// from the one the decision was made on (RFC 1858 §4 overlap), so it
-    /// is refused (NAT-FRAG).
+    /// fragment was already decided. A byte-identical duplicate (same length
+    /// and first 8 data bytes) is dropped alone; any other one means two
+    /// datagrams share the key (an ID reused, or two datagrams that differ
+    /// only in what the key leaves out, such as the destination port) or a
+    /// different transport header (RFC 1858 §4), and poisons the entry: every
+    /// remaining fragment of both is refused (NAT-FRAG).
     Ipv4FragmentDuplicateFirst = 191,
     /// A later fragment that starts inside its first fragment's transport
     /// header (or, before the first fragment is seen, inside the smallest
@@ -362,16 +365,21 @@ pub enum DropReason {
     /// (RFC 1858, RFC 3128). Refused (NAT-FRAG).
     Ipv4FragmentTransportHeaderOverlap = 192,
     /// A fragment that breaks RFC 791's structure: no data, a fragment
-    /// with MF set whose data is not a multiple of 8 bytes, or data ending
-    /// past the largest datagram (65515 data bytes). Refused (NAT-FRAG).
+    /// with MF set whose data is not a multiple of 8 bytes, data ending
+    /// past the largest datagram (65515 data bytes), or a contradiction of
+    /// its datagram's end as fixed by the first fragment with MF clear (a
+    /// second, different end, or data past it), which also poisons the
+    /// association. Refused (NAT-FRAG).
     Ipv4FragmentMalformed = 193,
     /// No free fragment association entry (`[fragment-tracking] entries`)
-    /// for a new datagram, after expiring the oldest. A first fragment is
-    /// refused before its decision, so no NAT or firewall state commits
-    /// (NAT-FRAG).
+    /// for a new datagram, after expiring the oldest and with no pending or
+    /// refusing entry left to evict (every entry allows a datagram). A first
+    /// fragment is refused before its decision, so no NAT or firewall state
+    /// commits (NAT-FRAG).
     Ipv4FragmentTableFull = 194,
-    /// The datagram's source already has `[fragment-tracking]
-    /// entries-per-host` association entries (NAT-FRAG).
+    /// The datagram's (ingress, source) already has `[fragment-tracking]
+    /// entries-per-host` association entries, all allowing (a pending or
+    /// refusing one would have been evicted) (NAT-FRAG).
     Ipv4FragmentHostLimit = 195,
     /// A later fragment arrived before its first fragment and no held slot
     /// is free (`[fragment-tracking] held-fragments`, none without
@@ -1882,7 +1890,6 @@ enum PacketDecision {
 struct FragmentFollowDecision {
     entry: u32,
     template: Ipv4FragmentTemplate,
-    info: Ipv4FragmentInfo,
 }
 
 #[derive(Clone, Copy)]
@@ -3150,7 +3157,14 @@ where
                 if let Some(tracker) = fragment_tracking.as_deref_mut() {
                     if let Some(ticket) = first_fragment {
                         // After the first fragment's own staging, so its
-                        // pieces go first; the held fragments follow.
+                        // pieces go first; the held fragments follow. The
+                        // template is read from a frame the decision just
+                        // rewrote, so it is always there; a missing one
+                        // would fail closed (refusing the datagram).
+                        debug_assert!(
+                            first_template.is_some(),
+                            "a rewritten first fragment has a template"
+                        );
                         match first_template {
                             Some(template) => tracker.commit_allow(
                                 ticket,
@@ -3163,7 +3177,7 @@ where
                         }
                     }
                     if let PacketDecision::FragmentFollow(follow) = decision {
-                        tracker.followed(follow.entry, follow.info);
+                        tracker.followed(follow.entry);
                     }
                 }
                 if let Some(fragments) = planned.fragments {
@@ -3449,7 +3463,6 @@ fn decide_later_fragment(
             Ok(PacketDecision::FragmentFollow(FragmentFollowDecision {
                 entry,
                 template,
-                info,
             }))
         }
         Ipv4FragmentFollow::Deny => Err(Ipv4FragmentFirstDenied),

@@ -37,14 +37,31 @@
 //! fragment that starts inside the first fragment's transport header (for
 //! TCP, RFC 1858's offset 1 rule generalized to the header length; offset 1
 //! and 2 always) is `IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`, so no fragment
-//! can rewrite the ports or the TCP flags the decision was made on. A second
-//! first fragment for a decided datagram is `IPV4_FRAGMENT_DUPLICATE_FIRST`.
+//! can rewrite the ports or the TCP flags the decision was made on.
 //!
-//! Bounds: a fixed number of entries and of held fragments, a per-source
-//! limit on each, one timeout from the first fragment seen (the entry is
-//! freed earlier once every data byte up to the last fragment has passed).
-//! Entries all live for the same timeout, so they expire in creation order:
-//! an age list makes expiry O(1) per entry with no scan. Every table is
+//! Two datagrams with one key (the key leaves out the ports: an ID reused
+//! after a lost fragment, or a server answering two inside hosts behind one
+//! public address with the same ID) must not share a decision. A second
+//! first fragment for a decided datagram is `IPV4_FRAGMENT_DUPLICATE_FIRST`;
+//! unless it is byte-identical to the first one (same length and first 8
+//! data bytes, a network duplicate), it poisons the entry: every remaining
+//! fragment of both datagrams is refused, which fails closed. The datagram's
+//! end is fixed by the first fragment with MF clear; a fragment that
+//! contradicts it (another end, data past it) is `IPV4_FRAGMENT_MALFORMED`
+//! and poisons the entry too.
+//!
+//! Bounds: a fixed number of entries and of held fragments, a per-(ingress,
+//! source) limit on each, one timeout from the first fragment seen. An entry
+//! is freed earlier once every data byte from 0 to the datagram's end was
+//! seen: up to four disjoint data ranges are tracked exactly (duplicates and
+//! overlaps count once; more pieces leave the entry to the timeout). Entries
+//! all live for the same timeout, so they expire in creation order: an age
+//! list makes expiry O(1) per entry with no scan. When the table or a
+//! host's quota is full, the oldest pending or refusing entry (of the table,
+//! or of that host) is evicted through its own list, in O(1); an allowing
+//! entry never is, because only an allowing template ever forwards a later
+//! fragment, so an eviction can only turn later fragments into refusals or
+//! new holds, never forward one. Every table is
 //! caller-owned storage sized once from the config; there is no allocation,
 //! no lock, and no copy on the fast path (a frame that is not a fragment
 //! costs one read of the flags word).
@@ -165,12 +182,15 @@ pub(crate) struct Ipv4FragmentTemplate {
 
 impl Ipv4FragmentTemplate {
     /// Reads the template from a first fragment rewritten for `egress`
-    /// (Ethernet header, 20-byte IPv4 header, its transport header).
+    /// (Ethernet header, IPv4 header, its transport header). Every path that
+    /// admits a fragment refuses IPv4 options, but the transport header is
+    /// found from the IHL all the same.
     pub(crate) fn capture(frame: &[u8], egress: IfId) -> Option<Self> {
         let header = packet::ETHERNET_HEADER_LEN;
         let ipv4 = frame.get(header..header + IPV4_HEADER_LEN)?;
+        let transport = header + usize::from(ipv4[0] & 0x0f) * 4;
         let transport_header_len = if ipv4[9] == 6 {
-            let data_offset = *frame.get(header + IPV4_HEADER_LEN + 12)?;
+            let data_offset = *frame.get(transport + 12)?;
             (data_offset >> 4) * 4
         } else {
             8
@@ -243,6 +263,9 @@ pub(crate) struct Ipv4FragmentInfo {
     pub(crate) data_len: u32,
     pub(crate) more: bool,
     pub(crate) dont_fragment: bool,
+    /// The first 8 data bytes (zero past the data): a first fragment's
+    /// identity next to its length (a byte-identical duplicate).
+    pub(crate) head: [u8; 8],
 }
 
 impl Ipv4FragmentInfo {
@@ -289,6 +312,11 @@ pub(crate) fn parse_fragment(
     if !more && offset == 0 {
         return None;
     }
+    let data_start = ipv4.header_offset + ipv4.header_len;
+    let data_end = ipv4.header_offset + ipv4.total_len;
+    let mut head = [0; 8];
+    let data = frame.get(data_start..data_end.min(data_start + 8))?;
+    head[..data.len()].copy_from_slice(data);
     Some(Ipv4FragmentInfo {
         key: Ipv4FragmentKey {
             ingress,
@@ -301,32 +329,58 @@ pub(crate) fn parse_fragment(
         data_len: u32::try_from(ipv4.total_len.checked_sub(ipv4.header_len)?).ok()?,
         more,
         dont_fragment: flags & FLAG_DONT_FRAGMENT != 0,
+        head,
     })
 }
+
+/// Coverage ranges an entry tracks exactly (RFC 815's hole list, inverted):
+/// a datagram arriving in more disjoint pieces than this is no longer
+/// tracked and its entry lives until the timeout.
+const COVERAGE_RANGES: usize = 4;
 
 /// One association entry (caller-owned storage).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4FragmentEntrySlot {
     state: EntryState,
+    /// A second, different first fragment or an inconsistent end turned the
+    /// entry into a refusal for good (no early completion).
+    poisoned: bool,
     key: Ipv4FragmentKey,
     template: Ipv4FragmentTemplate,
     created_ms: u64,
     host: u32,
     held_head: u32,
     held_tail: u32,
-    held: u32,
-    /// Data bytes forwarded (or refused, for a refusing entry).
-    seen: u32,
-    /// The datagram's data length once its last fragment was seen (0 before).
+    /// The decided first fragment: whether there was one, its data length,
+    /// and its first 8 data bytes (a byte-identical duplicate is dropped
+    /// alone; any other second first fragment poisons the entry).
+    has_first: bool,
+    first_len: u16,
+    first_head: [u8; 8],
+    /// The datagram's data length, fixed by the first fragment with MF clear
+    /// (0 before).
     total: u32,
-    /// Age list (creation order) while live; free list while free.
+    /// The largest data end seen.
+    max_end: u32,
+    /// Disjoint, sorted data ranges seen; `untracked` once more were needed.
+    ranges: [[u16; 2]; COVERAGE_RANGES],
+    ranges_len: u8,
+    untracked: bool,
+    /// Age list (creation order) while live; free list (`newer`) while free.
     older: u32,
     newer: u32,
+    /// Evictable list (pending or refusing entries, in the order they
+    /// became evictable) and its per-host counterpart.
+    evict_older: u32,
+    evict_newer: u32,
+    host_older: u32,
+    host_newer: u32,
 }
 
 impl Ipv4FragmentEntrySlot {
     pub const EMPTY: Self = Self {
         state: EntryState::Free,
+        poisoned: false,
         key: Ipv4FragmentKey {
             ingress: IfId(0),
             source: [0; 4],
@@ -346,12 +400,94 @@ impl Ipv4FragmentEntrySlot {
         host: NONE,
         held_head: NONE,
         held_tail: NONE,
-        held: 0,
-        seen: 0,
+        has_first: false,
+        first_len: 0,
+        first_head: [0; 8],
         total: 0,
+        max_end: 0,
+        ranges: [[0; 2]; COVERAGE_RANGES],
+        ranges_len: 0,
+        untracked: false,
         older: NONE,
         newer: NONE,
+        evict_older: NONE,
+        evict_newer: NONE,
+        host_older: NONE,
+        host_newer: NONE,
     };
+
+    /// Records the data range of one fragment. `Err` when it contradicts
+    /// what was seen: a second, different end (MF clear), or data past the
+    /// end. Duplicates and overlaps count once.
+    fn record(&mut self, offset: u32, len: u32, more: bool) -> Result<(), ()> {
+        if self.poisoned {
+            return Ok(());
+        }
+        let end = offset + len;
+        if !more {
+            if (self.total != 0 && self.total != end) || self.max_end > end {
+                return Err(());
+            }
+            self.total = end;
+        } else if self.total != 0 && end > self.total {
+            return Err(());
+        }
+        self.max_end = self.max_end.max(end);
+        if self.untracked {
+            return Ok(());
+        }
+        // Both fit 16 bits: data ends at most 65515 bytes in.
+        let (mut start, mut stop) = (offset as u16, end as u16);
+        let mut merged = [[0_u16; 2]; COVERAGE_RANGES];
+        let mut count = 0;
+        let mut placed = false;
+        for range in &self.ranges[..usize::from(self.ranges_len)] {
+            if range[1] < start {
+                merged[count] = *range;
+                count += 1;
+            } else if range[0] > stop {
+                if !placed {
+                    if count == COVERAGE_RANGES {
+                        self.untracked = true;
+                        return Ok(());
+                    }
+                    merged[count] = [start, stop];
+                    count += 1;
+                    placed = true;
+                }
+                if count == COVERAGE_RANGES {
+                    self.untracked = true;
+                    return Ok(());
+                }
+                merged[count] = *range;
+                count += 1;
+            } else {
+                start = start.min(range[0]);
+                stop = stop.max(range[1]);
+            }
+        }
+        if !placed {
+            if count == COVERAGE_RANGES {
+                self.untracked = true;
+                return Ok(());
+            }
+            merged[count] = [start, stop];
+            count += 1;
+        }
+        self.ranges = merged;
+        self.ranges_len = u8::try_from(count).expect("at most COVERAGE_RANGES");
+        Ok(())
+    }
+
+    /// Every data byte from 0 to the datagram's end was seen.
+    fn complete(&self) -> bool {
+        !self.poisoned
+            && !self.untracked
+            && self.total != 0
+            && self.ranges_len == 1
+            && u32::from(self.ranges[0][0]) == 0
+            && u32::from(self.ranges[0][1]) == self.total
+    }
 }
 
 impl Default for Ipv4FragmentEntrySlot {
@@ -360,22 +496,33 @@ impl Default for Ipv4FragmentEntrySlot {
     }
 }
 
-/// Per-source accounting (caller-owned storage, one per entry).
+/// Per-(ingress, source) accounting (caller-owned storage, one per entry).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Ipv4FragmentHostSlot {
+    ingress: IfId,
     address: [u8; 4],
     entries: u32,
     held: u32,
     next_free: u32,
+    /// The host's evictable entries, oldest first.
+    evict_oldest: u32,
+    evict_newest: u32,
 }
 
 impl Ipv4FragmentHostSlot {
     pub const EMPTY: Self = Self {
+        ingress: IfId(0),
         address: [0; 4],
         entries: 0,
         held: 0,
         next_free: NONE,
+        evict_oldest: NONE,
+        evict_newest: NONE,
     };
+
+    fn words(ingress: IfId, address: [u8; 4]) -> [u64; 2] {
+        [u64::from(ingress.0), u64::from(u32::from_be_bytes(address))]
+    }
 }
 
 impl Default for Ipv4FragmentHostSlot {
@@ -455,20 +602,34 @@ pub struct Ipv4FragmentTrackingCounters {
     pub followed_denied: usize,
     /// Later fragments held because their first fragment had not arrived.
     pub held: usize,
-    /// Held fragments rewritten and staged for TX when their first
-    /// fragment was allowed.
+    /// Held fragments rewritten and staged in the fragmentation slots when
+    /// their first fragment was allowed (staged, not yet sent: the
+    /// `fragmentation.*` counters report what the backend took).
     pub released: usize,
     /// Held fragments discarded at release: TTL, transport header overlap,
     /// DF above the egress MTU, or no fragmentation slot.
     pub release_dropped: usize,
-    /// Held fragments discarded because their first fragment was refused.
+    /// Held fragments discarded because their first fragment was refused
+    /// or their entry was poisoned.
     pub held_denied: usize,
     /// Held fragments discarded because no first fragment came in time.
     pub held_expired: usize,
     /// Entries freed by the timeout.
     pub entries_expired: usize,
-    /// Entries freed early: every data byte up to the last fragment passed.
+    /// Entries freed early: every data byte from 0 to the datagram's end
+    /// was seen (duplicates and overlaps count once).
     pub entries_completed: usize,
+    /// Pending or refusing entries evicted, oldest first, to make room for
+    /// a new datagram (an allowing entry is never evicted).
+    pub entries_evicted: usize,
+    /// Held fragments discarded with an evicted entry.
+    pub held_evicted: usize,
+    /// Entries turned into a refusal for good: a second, different first
+    /// fragment for a decided datagram (an ID reused, or two datagrams with
+    /// one key), or a fragment contradicting the datagram's end.
+    pub poisoned: usize,
+    /// Byte-identical duplicate first fragments dropped alone.
+    pub duplicate_first: usize,
     /// Entries discarded by a publication apply.
     pub entries_flushed: usize,
     /// Held fragments discarded by a publication apply.
@@ -476,7 +637,7 @@ pub struct Ipv4FragmentTrackingCounters {
 }
 
 /// A first fragment admitted before its decision: it either continues a
-/// pending entry or will take a new one (room checked).
+/// pending entry or will take a new one (room made).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Ipv4FragmentFirstTicket {
     info: Ipv4FragmentInfo,
@@ -516,6 +677,9 @@ pub struct Ipv4FragmentTracker<'a> {
     /// Age list: oldest and newest live entry.
     oldest: u32,
     newest: u32,
+    /// Evictable list (pending and refusing entries).
+    evict_oldest: u32,
+    evict_newest: u32,
     live_entries: usize,
     live_held: usize,
     counters: Ipv4FragmentTrackingCounters,
@@ -589,6 +753,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
             free_held: NONE,
             oldest: NONE,
             newest: NONE,
+            evict_oldest: NONE,
+            evict_newest: NONE,
             live_entries: 0,
             live_held: 0,
             counters: Ipv4FragmentTrackingCounters::default(),
@@ -670,8 +836,21 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.free_held = if held == 0 { NONE } else { 0 };
         self.oldest = NONE;
         self.newest = NONE;
+        self.evict_oldest = NONE;
+        self.evict_newest = NONE;
         self.live_entries = 0;
         self.live_held = 0;
+    }
+
+    /// Frees every entry older than the timeout at `now_ms`, at most
+    /// `budget` of them, and returns how many it freed. Expiry is otherwise
+    /// lazy (each table operation expires up to two of the oldest entries);
+    /// this bounded sweep is for callers that want the occupancy and the
+    /// expiry counters current without traffic.
+    pub fn sweep(&mut self, now_ms: u64, budget: usize) -> usize {
+        let before = self.live_entries;
+        self.expire(now_ms, budget);
+        before - self.live_entries
     }
 
     fn expired(&self, index: usize, now_ms: u64) -> bool {
@@ -711,36 +890,59 @@ impl<'a> Ipv4FragmentTracker<'a> {
         Some(index)
     }
 
-    fn host_of(&self, address: [u8; 4]) -> Option<usize> {
+    fn host_of(&self, ingress: IfId, address: [u8; 4]) -> Option<usize> {
         let hosts = &*self.hosts;
         self.host_directory
             .lookup(
                 DirectoryHashDomain::Ipv4FragmentHost,
-                &[u64::from(u32::from_be_bytes(address))],
-                |index| hosts[index].entries != 0 && hosts[index].address == address,
+                &Ipv4FragmentHostSlot::words(ingress, address),
+                |index| {
+                    hosts[index].entries != 0
+                        && hosts[index].ingress == ingress
+                        && hosts[index].address == address
+                },
             )
             .ok()?
             .state_index
     }
 
-    /// Room for a new entry of `source`: a free slot (expiring the oldest
-    /// when needed) and the per-source limit.
-    fn check_new_entry(&mut self, source: [u8; 4], now_ms: u64) -> Result<(), DropReason> {
+    /// Discards an evictable entry to make room (counted).
+    fn evict(&mut self, index: u32) {
+        self.counters.entries_evicted += 1;
+        let held = self.free_entry_at(index as usize);
+        self.counters.held_evicted += held;
+    }
+
+    /// Room for a new entry of `ingress`/`source`: expiring the oldest, then
+    /// evicting the oldest pending or refusing entry of that host (at its
+    /// limit) or of the table (when full). An allowing entry is never
+    /// evicted: only its template ever forwards a later fragment, so
+    /// evicting a pending or refusing entry can only turn later fragments
+    /// into refusals or new holds.
+    fn make_room(&mut self, ingress: IfId, source: [u8; 4], now_ms: u64) -> Result<(), DropReason> {
         if self.free_entry == NONE {
             self.expire(now_ms, 1);
         }
-        if self.free_entry == NONE {
-            return Err(DropReason::Ipv4FragmentTableFull);
-        }
-        if let Some(host) = self.host_of(source) {
+        if let Some(host) = self.host_of(ingress, source) {
             if self.hosts[host].entries >= self.policy.entries_per_host {
-                return Err(DropReason::Ipv4FragmentHostLimit);
+                let victim = self.hosts[host].evict_oldest;
+                if victim == NONE {
+                    return Err(DropReason::Ipv4FragmentHostLimit);
+                }
+                self.evict(victim);
             }
+        }
+        if self.free_entry == NONE {
+            let victim = self.evict_oldest;
+            if victim == NONE {
+                return Err(DropReason::Ipv4FragmentTableFull);
+            }
+            self.evict(victim);
         }
         Ok(())
     }
 
-    /// Takes a free entry for `key` (room checked by `check_new_entry`).
+    /// Takes a free entry for `key` (room made by `make_room`).
     fn insert_entry(
         &mut self,
         key: Ipv4FragmentKey,
@@ -751,7 +953,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         if index == NONE {
             return None;
         }
-        let host = match self.host_of(key.source) {
+        let host = match self.host_of(key.ingress, key.source) {
             Some(host) => host,
             None => {
                 let host = self.free_host;
@@ -762,15 +964,14 @@ impl<'a> Ipv4FragmentTracker<'a> {
                     .link(
                         host as usize,
                         DirectoryHashDomain::Ipv4FragmentHost,
-                        &[u64::from(u32::from_be_bytes(key.source))],
+                        &Ipv4FragmentHostSlot::words(key.ingress, key.source),
                     )
                     .ok()?;
                 self.free_host = self.hosts[host as usize].next_free;
                 self.hosts[host as usize] = Ipv4FragmentHostSlot {
+                    ingress: key.ingress,
                     address: key.source,
-                    entries: 0,
-                    held: 0,
-                    next_free: NONE,
+                    ..Ipv4FragmentHostSlot::EMPTY
                 };
                 host as usize
             }
@@ -795,7 +996,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
             created_ms: now_ms,
             host: u32::try_from(host).expect("host index below NONE"),
             older: self.newest,
-            newer: NONE,
             ..Ipv4FragmentEntrySlot::EMPTY
         };
         if self.newest != NONE {
@@ -805,7 +1005,65 @@ impl<'a> Ipv4FragmentTracker<'a> {
         }
         self.newest = index;
         self.live_entries += 1;
+        if state != EntryState::Allow {
+            self.evict_link(index);
+        }
         Some(index as usize)
+    }
+
+    /// Appends a pending or refusing entry to the evictable lists.
+    fn evict_link(&mut self, index: u32) {
+        let host = self.entries[index as usize].host as usize;
+        let previous = self.evict_newest;
+        let host_previous = self.hosts[host].evict_newest;
+        let entry = &mut self.entries[index as usize];
+        entry.evict_older = previous;
+        entry.evict_newer = NONE;
+        entry.host_older = host_previous;
+        entry.host_newer = NONE;
+        if previous == NONE {
+            self.evict_oldest = index;
+        } else {
+            self.entries[previous as usize].evict_newer = index;
+        }
+        self.evict_newest = index;
+        if host_previous == NONE {
+            self.hosts[host].evict_oldest = index;
+        } else {
+            self.entries[host_previous as usize].host_newer = index;
+        }
+        self.hosts[host].evict_newest = index;
+    }
+
+    /// Removes an entry from the evictable lists.
+    fn evict_unlink(&mut self, index: u32) {
+        let entry = self.entries[index as usize];
+        if entry.evict_older == NONE {
+            self.evict_oldest = entry.evict_newer;
+        } else {
+            self.entries[entry.evict_older as usize].evict_newer = entry.evict_newer;
+        }
+        if entry.evict_newer == NONE {
+            self.evict_newest = entry.evict_older;
+        } else {
+            self.entries[entry.evict_newer as usize].evict_older = entry.evict_older;
+        }
+        let host = entry.host as usize;
+        if entry.host_older == NONE {
+            self.hosts[host].evict_oldest = entry.host_newer;
+        } else {
+            self.entries[entry.host_older as usize].host_newer = entry.host_newer;
+        }
+        if entry.host_newer == NONE {
+            self.hosts[host].evict_newest = entry.host_older;
+        } else {
+            self.entries[entry.host_newer as usize].host_older = entry.host_older;
+        }
+        let entry = &mut self.entries[index as usize];
+        entry.evict_older = NONE;
+        entry.evict_newer = NONE;
+        entry.host_older = NONE;
+        entry.host_newer = NONE;
     }
 
     fn release_host_if_empty(&mut self, host: usize) {
@@ -822,6 +1080,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// Frees a live entry and its held fragments; returns how many were held.
     fn free_entry_at(&mut self, index: usize) -> usize {
         let held = self.free_held_of(index);
+        let id = u32::try_from(index).expect("entry index below NONE");
+        if self.entries[index].state != EntryState::Allow {
+            self.evict_unlink(id);
+        }
         let entry = self.entries[index];
         let _ = self.entry_directory.unlink(index);
         if entry.older == NONE {
@@ -843,7 +1105,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
             newer: self.free_entry,
             ..Ipv4FragmentEntrySlot::EMPTY
         };
-        self.free_entry = u32::try_from(index).expect("entry index below NONE");
+        self.free_entry = id;
         self.live_entries -= 1;
         held
     }
@@ -865,7 +1127,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
         let entry = &mut self.entries[index];
         entry.held_head = NONE;
         entry.held_tail = NONE;
-        entry.held = 0;
         if let Some(host) = self.hosts.get_mut(entry.host as usize) {
             host.held = host
                 .held
@@ -875,29 +1136,50 @@ impl<'a> Ipv4FragmentTracker<'a> {
         count
     }
 
-    /// Counts forwarded (or refused) data of an entry's datagram and frees
-    /// the entry once every byte up to the last fragment has passed.
-    pub(crate) fn note(&mut self, entry: u32, offset: u32, data_len: u32, more: bool) {
-        let index = entry as usize;
-        let Some(slot) = self.entries.get_mut(index) else {
-            return;
-        };
-        if slot.state == EntryState::Free {
-            return;
+    /// Turns an entry into a refusal for good: what it held is discarded,
+    /// every later fragment is refused, and it lives until the timeout (or
+    /// is evicted). Both datagrams that share the key fail closed.
+    fn poison(&mut self, index: usize) {
+        self.counters.poisoned += 1;
+        let held = self.free_held_of(index);
+        self.counters.held_denied += held;
+        if self.entries[index].state == EntryState::Allow {
+            self.entries[index].state = EntryState::Deny;
+            self.evict_link(u32::try_from(index).expect("entry index below NONE"));
         }
-        slot.seen = slot.seen.saturating_add(data_len);
-        if !more {
-            slot.total = offset + data_len;
-        }
-        if slot.total != 0 && slot.seen >= slot.total && slot.held == 0 {
+        self.entries[index].state = EntryState::Deny;
+        self.entries[index].poisoned = true;
+    }
+
+    /// Frees an entry once its whole datagram was seen.
+    fn complete_if_covered(&mut self, index: usize) {
+        if self.entries[index].state != EntryState::Free
+            && self.entries[index].held_head == NONE
+            && self.entries[index].complete()
+        {
             self.counters.entries_completed += 1;
             self.free_entry_at(index);
         }
     }
 
+    /// Records one fragment's data in a live entry; a contradiction poisons
+    /// it and is `IPV4_FRAGMENT_MALFORMED`.
+    fn record(&mut self, index: usize, info: Ipv4FragmentInfo) -> Result<(), DropReason> {
+        if self.entries[index]
+            .record(info.offset, info.data_len, info.more)
+            .is_err()
+        {
+            self.poison(index);
+            return Err(DropReason::Ipv4FragmentMalformed);
+        }
+        Ok(())
+    }
+
     /// Admits a first fragment before its decision: a pending entry
-    /// continues, a decided one is `IPV4_FRAGMENT_DUPLICATE_FIRST`, and a
-    /// new one needs room. Changes nothing but expiry.
+    /// continues; a decided one drops a byte-identical duplicate alone and
+    /// is poisoned by any other first fragment (`IPV4_FRAGMENT_DUPLICATE_FIRST`
+    /// either way); a new one needs room (evicting a pending or refusing
+    /// entry if needed). Changes nothing else.
     pub(crate) fn admit_first(
         &mut self,
         info: Ipv4FragmentInfo,
@@ -906,15 +1188,34 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.expire(now_ms, 2);
         match self.lookup(info.key, now_ms) {
             Some(index) => match self.entries[index].state {
-                EntryState::Pending => Ok(Ipv4FragmentFirstTicket {
-                    info,
-                    existing: Some(u32::try_from(index).expect("entry index below NONE")),
-                }),
-                EntryState::Allow | EntryState::Deny => Err(DropReason::Ipv4FragmentDuplicateFirst),
+                EntryState::Pending => {
+                    // Its range must agree with the held fragments' end.
+                    let mut probe = self.entries[index];
+                    if probe.record(info.offset, info.data_len, info.more).is_err() {
+                        self.poison(index);
+                        return Err(DropReason::Ipv4FragmentMalformed);
+                    }
+                    Ok(Ipv4FragmentFirstTicket {
+                        info,
+                        existing: Some(u32::try_from(index).expect("entry index below NONE")),
+                    })
+                }
+                EntryState::Allow | EntryState::Deny => {
+                    let entry = self.entries[index];
+                    if entry.has_first
+                        && u32::from(entry.first_len) == info.data_len
+                        && entry.first_head == info.head
+                    {
+                        self.counters.duplicate_first += 1;
+                    } else if !entry.poisoned {
+                        self.poison(index);
+                    }
+                    Err(DropReason::Ipv4FragmentDuplicateFirst)
+                }
                 EntryState::Free => unreachable!("lookup returns live entries"),
             },
             None => {
-                self.check_new_entry(info.key.source, now_ms)?;
+                self.make_room(info.key.ingress, info.key.source, now_ms)?;
                 Ok(Ipv4FragmentFirstTicket {
                     info,
                     existing: None,
@@ -929,14 +1230,24 @@ impl<'a> Ipv4FragmentTracker<'a> {
         state: EntryState,
         now_ms: u64,
     ) -> Option<usize> {
-        match ticket.existing {
+        let index = match ticket.existing {
             Some(index) if self.entries[index as usize].state == EntryState::Pending => {
-                self.entries[index as usize].state = state;
-                Some(index as usize)
+                let index = index as usize;
+                self.entries[index].state = state;
+                if state == EntryState::Allow {
+                    self.evict_unlink(u32::try_from(index).expect("entry index below NONE"));
+                }
+                index
             }
-            Some(_) => None,
-            None => self.insert_entry(ticket.info.key, state, now_ms),
-        }
+            Some(_) => return None,
+            None => self.insert_entry(ticket.info.key, state, now_ms)?,
+        };
+        let info = ticket.info;
+        let entry = &mut self.entries[index];
+        entry.has_first = true;
+        entry.first_len = u16::try_from(info.data_len).unwrap_or(u16::MAX);
+        entry.first_head = info.head;
+        Some(index)
     }
 
     /// Records the forwarded first fragment's template, then rewrites and
@@ -956,14 +1267,11 @@ impl<'a> Ipv4FragmentTracker<'a> {
             return;
         };
         self.entries[index].template = template;
+        if self.record(index, ticket.info).is_err() {
+            return;
+        }
         self.release(index, snapshot, fragmentation);
-        let info = ticket.info;
-        self.note(
-            u32::try_from(index).expect("entry index below NONE"),
-            info.offset,
-            info.data_len,
-            info.more,
-        );
+        self.complete_if_covered(index);
     }
 
     /// Records a refused first fragment and discards what was held for it.
@@ -972,34 +1280,11 @@ impl<'a> Ipv4FragmentTracker<'a> {
         let Some(index) = self.entry_for_ticket(ticket, EntryState::Deny, now_ms) else {
             return;
         };
-        // The held fragments are refused with it: their data counts toward
-        // the datagram's end like the refused later fragments still to come.
-        let mut current = self.entries[index].held_head;
-        while current != NONE {
-            let slot = self.held[current as usize];
-            let start = current as usize * self.held_slot_bytes;
-            let frame = &self.held_bytes[start..start + slot.frame_len as usize];
-            if let Some(held) = packet::validate_ipv4_frame(frame)
-                .ok()
-                .and_then(|ipv4| parse_fragment(frame, ipv4, IfId(0)))
-            {
-                let entry = &mut self.entries[index];
-                entry.seen = entry.seen.saturating_add(held.data_len);
-                if !held.more {
-                    entry.total = held.offset + held.data_len;
-                }
-            }
-            current = slot.next;
-        }
         let held = self.free_held_of(index);
         self.counters.held_denied += held;
-        let info = ticket.info;
-        self.note(
-            u32::try_from(index).expect("entry index below NONE"),
-            info.offset,
-            info.data_len,
-            info.more,
-        );
+        if self.record(index, ticket.info).is_ok() {
+            self.complete_if_covered(index);
+        }
     }
 
     fn release(
@@ -1017,16 +1302,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
             let slot = self.held[current as usize];
             let start = current as usize * self.held_slot_bytes;
             let frame = &mut self.held_bytes[start..start + slot.frame_len as usize];
-            let staged = stage_released(frame, template, mtu, fragmentation.as_deref_mut());
-            match staged {
-                Some((offset, data_len, more)) => {
-                    self.counters.released += 1;
-                    self.entries[index].seen = self.entries[index].seen.saturating_add(data_len);
-                    if !more {
-                        self.entries[index].total = offset + data_len;
-                    }
-                }
-                None => self.counters.release_dropped += 1,
+            if stage_released(frame, template, mtu, fragmentation.as_deref_mut()) {
+                self.counters.released += 1;
+            } else {
+                self.counters.release_dropped += 1;
             }
             current = slot.next;
         }
@@ -1035,7 +1314,9 @@ impl<'a> Ipv4FragmentTracker<'a> {
 
     /// The table's answer for a later fragment (structure and static
     /// overlap already checked): forward with the template, refuse, or hold
-    /// a copy of `frame` until the first fragment decides.
+    /// a copy of `frame` until the first fragment decides. Every answer
+    /// records the fragment's data; one that contradicts the datagram's end
+    /// poisons the entry and is `IPV4_FRAGMENT_MALFORMED`.
     pub(crate) fn follow(
         &mut self,
         info: Ipv4FragmentInfo,
@@ -1053,6 +1334,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
                     if info.offset < entry.template.transport_header_len() {
                         return Err(DropReason::Ipv4FragmentTransportHeaderOverlap);
                     }
+                    self.record(index, info)?;
                     return Ok(Ipv4FragmentFollow::Allow {
                         entry: entry_id,
                         template: entry.template,
@@ -1060,7 +1342,9 @@ impl<'a> Ipv4FragmentTracker<'a> {
                 }
                 EntryState::Deny => {
                     self.counters.followed_denied += 1;
-                    self.note(entry_id, info.offset, info.data_len, info.more);
+                    if self.record(index, info).is_ok() {
+                        self.complete_if_covered(index);
+                    }
                     return Ok(Ipv4FragmentFollow::Deny);
                 }
                 EntryState::Pending => {}
@@ -1086,7 +1370,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
             _ => self.lookup(info.key, now_ms),
         };
         let host_held = self
-            .host_of(info.key.source)
+            .host_of(info.key.ingress, info.key.source)
             .map_or(0, |host| self.hosts[host].held);
         if host_held >= self.policy.held_per_host {
             return Err(DropReason::Ipv4FragmentHostHoldLimit);
@@ -1094,7 +1378,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         let index = match existing {
             Some(index) => index,
             None => {
-                self.check_new_entry(info.key.source, now_ms)?;
+                self.make_room(info.key.ingress, info.key.source, now_ms)?;
                 if self.free_held == NONE {
                     return Err(DropReason::Ipv4FragmentHoldFull);
                 }
@@ -1102,6 +1386,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
                     .ok_or(DropReason::Ipv4FragmentTableFull)?
             }
         };
+        self.record(index, info)?;
         let held = self.free_held;
         self.free_held = self.held[held as usize].next;
         let start = held as usize * self.held_slot_bytes;
@@ -1117,7 +1402,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
             self.held[entry.held_tail as usize].next = held;
         }
         entry.held_tail = held;
-        entry.held += 1;
         let host = entry.host as usize;
         self.hosts[host].held += 1;
         self.live_held += 1;
@@ -1125,10 +1409,14 @@ impl<'a> Ipv4FragmentTracker<'a> {
         Ok(Ipv4FragmentFollow::Held)
     }
 
-    /// A later fragment was forwarded with its entry's template.
-    pub(crate) fn followed(&mut self, entry: u32, info: Ipv4FragmentInfo) {
+    /// A later fragment was forwarded with its entry's template; the entry
+    /// is freed once its whole datagram was seen.
+    pub(crate) fn followed(&mut self, entry: u32) {
         self.counters.followed += 1;
-        self.note(entry, info.offset, info.data_len, info.more);
+        let index = entry as usize;
+        if self.entries.get(index).is_some() {
+            self.complete_if_covered(index);
+        }
     }
 }
 
@@ -1142,25 +1430,30 @@ const fn next_index(index: usize, count: usize) -> u32 {
 
 /// Rewrites one held fragment with its first fragment's template and stages
 /// it: whole when it fits the egress MTU, re-fragmented (RFC 791 §3.2) when
-/// it is DF-clear and does not. Returns its offset, data length, and MF, or
-/// `None` when it is discarded.
+/// it is DF-clear and does not. `false` when it is discarded.
 fn stage_released(
     frame: &mut [u8],
     template: Ipv4FragmentTemplate,
     mtu: Option<u16>,
     fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
-) -> Option<(u32, u32, bool)> {
-    let fragmentation = fragmentation?;
-    let mtu = mtu?;
-    let ipv4 = packet::validate_ipv4_frame(frame).ok()?;
-    let info = parse_fragment(frame, ipv4, IfId(0))?;
-    if info.offset < template.transport_header_len() {
-        return None;
+) -> bool {
+    let (Some(fragmentation), Some(mtu)) = (fragmentation, mtu) else {
+        return false;
+    };
+    let Some(info) = packet::validate_ipv4_frame(frame)
+        .ok()
+        .and_then(|ipv4| parse_fragment(frame, ipv4, IfId(0)))
+    else {
+        return false;
+    };
+    if info.offset < template.transport_header_len() || template.apply(frame).is_err() {
+        return false;
     }
-    template.apply(frame).ok()?;
-    let plan = fragmentation.plan_forward(frame, mtu).ok()?;
+    let Ok(plan) = fragmentation.plan_forward(frame, mtu) else {
+        return false;
+    };
     fragmentation.stage(frame, plan, template.egress);
-    Some((info.offset, info.data_len, info.more))
+    true
 }
 
 #[cfg(test)]

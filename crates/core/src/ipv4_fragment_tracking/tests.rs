@@ -530,13 +530,13 @@ fn completion_frees_an_entry_once_every_byte_passed() {
     let Ok(Ipv4FragmentFollow::Allow { entry, .. }) = tracker.follow(last, &[], 0, 0) else {
         panic!("allowed");
     };
-    tracker.followed(entry, last);
+    tracker.followed(entry);
     assert_eq!(tracker.entries(), 1, "16 + 5 of 37 bytes");
     let middle = info(&fragment(1, 2 | MF, 64, 17, 16));
     let Ok(Ipv4FragmentFollow::Allow { entry, .. }) = tracker.follow(middle, &[], 0, 0) else {
         panic!("allowed");
     };
-    tracker.followed(entry, middle);
+    tracker.followed(entry);
     assert_eq!(tracker.entries(), 0);
     let counters = tracker.counters();
     assert_eq!((counters.followed, counters.entries_completed), (2, 1));
@@ -545,7 +545,11 @@ fn completion_frees_an_entry_once_every_byte_passed() {
         .admit_first(info(&fragment(2, MF, 64, 17, 16)), 0)
         .unwrap();
     tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 0);
-    tracker.note(0, 16, 1_000, true);
+    let middle = info(&fragment(2, 2 | MF, 64, 17, 1000));
+    let Ok(Ipv4FragmentFollow::Allow { entry, .. }) = tracker.follow(middle, &[], 0, 0) else {
+        panic!("allowed");
+    };
+    tracker.followed(entry);
     assert_eq!(tracker.entries(), 1);
 }
 
@@ -633,34 +637,48 @@ fn entries_expire_oldest_first_and_free_room_for_new_ones() {
 }
 
 #[test]
-fn per_host_entries_are_counted_and_released() {
+fn per_host_entries_are_counted_released_and_evicted() {
     let mut storage = Storage::new(4, 0, 0);
     let mut tracker =
         Ipv4FragmentTracker::new(policy(1_000, 2, 0), storage.borrow(), key()).unwrap();
     let snapshot = snapshot(1500);
+    // Two allowing entries: at its limit the host has nothing to evict.
     for id in [1, 2] {
-        let ticket = tracker
-            .admit_first(info(&fragment(id, MF, 64, 17, 8)), 0)
-            .unwrap();
-        tracker.commit_deny(ticket, 0);
+        allow(&mut tracker, id, 0);
     }
     assert_eq!(
         tracker.admit_first(info(&fragment(3, MF, 64, 17, 8)), 0),
         Err(DropReason::Ipv4FragmentHostLimit)
     );
+    // Another source has its own limit.
     let other = fragment_from([10, 0, 0, 99], 3, MF, 64, 17, 8);
     let ticket = tracker.admit_first(info(&other), 0).unwrap();
     tracker.commit_allow(ticket, template(8), &snapshot, None, 0);
-    // Completing datagram 1 (its last fragment) frees one of the host's.
-    let last = fragment(1, 1, 64, 17, 3);
-    assert_eq!(
-        tracker.follow(info(&last), &last, last.len(), 0),
-        Ok(Ipv4FragmentFollow::Deny)
-    );
+    // Completing datagram 1 frees one of the host's entries.
+    complete(&mut tracker, 1, SOURCE, 0);
     assert_eq!(tracker.entries(), 2);
-    assert!(tracker
+    let ticket = tracker
         .admit_first(info(&fragment(3, MF, 64, 17, 8)), 0)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
+    // At the limit again, with a refusing entry: the next datagram evicts
+    // it (oldest refusing first), never the allowing one.
+    let ticket = tracker
+        .admit_first(info(&fragment(4, MF, 64, 17, 8)), 0)
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
+    assert_eq!(tracker.counters().entries_evicted, 1);
+    let still = fragment(2, 2, 64, 17, 3);
+    assert!(matches!(
+        tracker.follow(info(&still), &still, still.len(), 0),
+        Ok(Ipv4FragmentFollow::Allow { .. })
+    ));
+    let evicted = fragment(3, 2, 64, 17, 3);
+    assert_eq!(
+        tracker.follow(info(&evicted), &evicted, evicted.len(), 0),
+        Err(DropReason::Ipv4FragmentHoldFull),
+        "datagram 3 is unknown again"
+    );
 }
 
 #[test]
@@ -673,7 +691,7 @@ fn released_fragments_are_rewritten_and_staged_or_dropped() {
     // Held: one within 576 bytes, one above it with DF clear (re-cut), one
     // above with DF set (dropped), and one with TTL 1 (dropped).
     let small = fragment(1, 70 | MF, 64, 17, 504);
-    let large = fragment(1, 2, 64, 17, 800);
+    let large = fragment(1, 2 | MF, 64, 17, 800);
     let df = fragment(1, 200 | DF | MF, 64, 17, 800);
     let ttl = fragment(1, 400 | MF, 1, 17, 8);
     for frame in [&small, &large, &df, &ttl] {
@@ -792,7 +810,7 @@ fn complete(tracker: &mut Ipv4FragmentTracker<'_>, id: u16, source: [u8; 4], now
     else {
         panic!("allowed");
     };
-    tracker.followed(entry, info(&last));
+    tracker.followed(entry);
 }
 
 #[test]
@@ -883,7 +901,7 @@ fn host_slots_are_released_and_reused_and_their_counts_kept() {
     first_from(&mut tracker, SOURCE, 3).unwrap();
     assert_eq!(
         first_from(&mut tracker, SOURCE, 4),
-        Err(DropReason::Ipv4FragmentTableFull)
+        Err(DropReason::Ipv4FragmentHostLimit)
     );
     complete(&mut tracker, 2, SOURCE, 0);
     complete(&mut tracker, 3, SOURCE, 0);
@@ -992,7 +1010,7 @@ fn released_fragments_at_the_mtu_or_with_df_are_sent_whole() {
     // 576 - 20 = 556 is not a multiple of 8: exactly the MTU must stay one
     // frame (cutting would give 552 + 4). The DF one is within the MTU.
     let exact = fragment(1, 2, 64, 17, 556);
-    let df = fragment(1, 72 | MF | DF, 64, 17, 8);
+    let df = fragment(1, 1 | MF | DF, 64, 17, 8);
     for frame in [&exact, &df] {
         tracker.follow(info(frame), frame, frame.len(), 0).unwrap();
     }
@@ -1017,4 +1035,197 @@ fn released_fragments_at_the_mtu_or_with_df_are_sent_whole() {
     template(8).apply(&mut expected_df).unwrap();
     assert_eq!(recorder.frames, [(WAN, expected_exact), (WAN, expected_df)]);
     assert_eq!(fragmentation.counters().whole, 2);
+}
+
+// --------------------------------------------- review follow-ups (#337) ----
+
+/// Follows a later fragment of `id` from SOURCE (offset in 8-byte blocks,
+/// `len` data bytes, MF as given) and, when allowed, reports it forwarded.
+fn pass(
+    tracker: &mut Ipv4FragmentTracker<'_>,
+    id: u16,
+    word: u16,
+    len: usize,
+) -> Result<Ipv4FragmentFollow, DropReason> {
+    let frame = fragment(id, word, 64, 17, len);
+    let answer = tracker.follow(info(&frame), &frame, frame.len(), 0);
+    if let Ok(Ipv4FragmentFollow::Allow { entry, .. }) = answer {
+        tracker.followed(entry);
+    }
+    answer
+}
+
+#[test]
+fn coverage_counts_duplicates_and_overlaps_once() {
+    let mut storage = Storage::new(4, 0, 0);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
+    // 16 + 16 + 16 + 5 data bytes; the first fragment carries 16.
+    allow(&mut tracker, 1, 0);
+    // The last first: the end is 53.
+    assert!(pass(&mut tracker, 1, 6, 5).is_ok());
+    // The last again, then the third twice: 16 + 5 + 5 + 16 + 16 = 58
+    // would have reached 53 when duplicates counted.
+    assert!(pass(&mut tracker, 1, 6, 5).is_ok());
+    assert!(pass(&mut tracker, 1, 4 | MF, 16).is_ok());
+    assert!(pass(&mut tracker, 1, 4 | MF, 16).is_ok());
+    assert_eq!(tracker.entries(), 1, "bytes 16..32 not seen yet");
+    // An overlapping piece (8..24) does not fill the gap either.
+    assert!(pass(&mut tracker, 1, 1 | MF, 16).is_ok());
+    assert_eq!(tracker.entries(), 1, "bytes 24..32 not seen yet");
+    assert!(pass(&mut tracker, 1, 2 | MF, 16).is_ok());
+    assert_eq!(tracker.entries(), 0);
+    assert_eq!(tracker.counters().entries_completed, 1);
+}
+
+#[test]
+fn a_contradicting_end_poisons_the_entry() {
+    for (first_last, then, malformed) in [
+        // A second last fragment with another end.
+        ((6, 5), (8, 5), true),
+        // Data past the end.
+        ((6, 5), (4 | MF, 24), true),
+        // A last fragment that ends before data already seen.
+        ((6 | MF, 16), (2, 5), true),
+        // The same last fragment again is a duplicate.
+        ((6, 5), (6, 5), false),
+    ] {
+        let mut storage = Storage::new(4, 0, 0);
+        let mut tracker =
+            Ipv4FragmentTracker::new(policy(1_000, 4, 0), storage.borrow(), key()).unwrap();
+        allow(&mut tracker, 1, 0);
+        assert!(pass(&mut tracker, 1, first_last.0, first_last.1).is_ok());
+        let answer = pass(&mut tracker, 1, then.0, then.1);
+        assert_eq!(
+            answer == Err(DropReason::Ipv4FragmentMalformed),
+            malformed,
+            "{then:?}: {answer:?}"
+        );
+        if malformed {
+            // Poisoned: every later fragment is refused, and the entry
+            // stays until the timeout.
+            assert_eq!(
+                pass(&mut tracker, 1, 2 | MF, 16),
+                Ok(Ipv4FragmentFollow::Deny)
+            );
+            assert_eq!(tracker.counters().poisoned, 1);
+            assert_eq!(tracker.entries(), 1);
+        }
+    }
+}
+
+#[test]
+fn coverage_beyond_four_pieces_waits_for_the_timeout() {
+    let mut storage = Storage::new(4, 0, 0);
+    let mut tracker = Ipv4FragmentTracker::new(policy(100, 4, 0), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 0);
+    // Five disjoint pieces (the first fragment's and four more).
+    for block in [4, 8, 12, 16] {
+        assert!(pass(&mut tracker, 1, block | MF, 8).is_ok());
+    }
+    for block in [2, 6, 10, 14] {
+        assert!(pass(&mut tracker, 1, block | MF, 16).is_ok());
+    }
+    assert!(pass(&mut tracker, 1, 18, 5).is_ok());
+    assert_eq!(tracker.entries(), 1, "no longer tracked exactly");
+    assert_eq!(tracker.sweep(100, usize::MAX), 1);
+    assert_eq!(tracker.counters().entries_expired, 1);
+}
+
+#[test]
+fn a_different_second_first_fragment_poisons_an_identical_one_does_not() {
+    let mut storage = Storage::new(4, 4, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage.borrow(), key()).unwrap();
+    allow(&mut tracker, 1, 0);
+    // A byte-identical duplicate is dropped alone.
+    assert_eq!(
+        tracker.admit_first(info(&fragment(1, MF, 64, 17, 16)), 0),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    assert!(matches!(
+        pass(&mut tracker, 1, 2 | MF, 16),
+        Ok(Ipv4FragmentFollow::Allow { .. })
+    ));
+    assert_eq!(tracker.counters().duplicate_first, 1);
+    // A different one (another length, or other leading bytes) poisons.
+    let mut other = fragment(1, MF, 64, 17, 16);
+    other[34] ^= 0xff;
+    assert_eq!(
+        tracker.admit_first(info(&other), 0),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    assert_eq!(
+        pass(&mut tracker, 1, 4 | MF, 16),
+        Ok(Ipv4FragmentFollow::Deny)
+    );
+    assert_eq!(
+        tracker.admit_first(info(&fragment(1, MF, 64, 17, 24)), 0),
+        Err(DropReason::Ipv4FragmentDuplicateFirst)
+    );
+    assert_eq!(tracker.counters().poisoned, 1);
+    // A first fragment whose range contradicts what a pending entry holds
+    // poisons it and discards what it held.
+    let held = fragment(2, 2, 64, 17, 5);
+    tracker.follow(info(&held), &held, held.len(), 0).unwrap();
+    assert_eq!(
+        tracker.admit_first(info(&fragment(2, MF, 64, 17, 24)), 0),
+        Err(DropReason::Ipv4FragmentMalformed)
+    );
+    let counters = tracker.counters();
+    assert_eq!((counters.poisoned, counters.held_denied), (2, 1));
+    assert_eq!(tracker.held(), 0);
+}
+
+#[test]
+fn host_accounting_is_per_ingress_and_eviction_spares_allowing_entries() {
+    let mut storage = Storage::new(3, 2, 1514);
+    let mut tracker =
+        Ipv4FragmentTracker::new(policy(1_000, 1, 2), storage.borrow(), key()).unwrap();
+    // SOURCE on LAN takes its one entry (allowing).
+    allow(&mut tracker, 1, 0);
+    // The same address on WAN (spoofed or not) has its own quota.
+    let mut spoofed = info(&fragment(2, 2, 64, 17, 8));
+    spoofed.key.ingress = WAN;
+    let frame = fragment(2, 2, 64, 17, 8);
+    assert_eq!(
+        tracker.follow(spoofed, &frame, frame.len(), 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    // A second WAN datagram of that source evicts its pending one.
+    let mut again = info(&fragment(3, 2, 64, 17, 8));
+    again.key.ingress = WAN;
+    assert_eq!(
+        tracker.follow(again, &frame, frame.len(), 0),
+        Ok(Ipv4FragmentFollow::Held)
+    );
+    let counters = tracker.counters();
+    assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
+    // The LAN source at its limit with only an allowing entry is refused.
+    assert_eq!(
+        tracker.admit_first(info(&fragment(4, MF, 64, 17, 16)), 0),
+        Err(DropReason::Ipv4FragmentHostLimit)
+    );
+    // A full table evicts the oldest pending or refusing entry, globally.
+    let third = fragment_from([10, 0, 0, 50], 5, MF, 64, 17, 16);
+    let ticket = tracker.admit_first(info(&third), 0).unwrap();
+    tracker.commit_deny(ticket, 0);
+    let fourth = fragment_from([10, 0, 0, 51], 6, MF, 64, 17, 16);
+    let ticket = tracker.admit_first(info(&fourth), 0).unwrap();
+    tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 0);
+    assert_eq!(tracker.counters().entries_evicted, 2);
+    // Two allowing entries and one refusing: the refusing one goes next,
+    // then nothing is left to evict.
+    let fifth = fragment_from([10, 0, 0, 52], 7, MF, 64, 17, 16);
+    let ticket = tracker.admit_first(info(&fifth), 0).unwrap();
+    tracker.commit_allow(ticket, template(8), &snapshot(1500), None, 0);
+    let sixth = fragment_from([10, 0, 0, 53], 8, MF, 64, 17, 16);
+    assert_eq!(
+        tracker.admit_first(info(&sixth), 0),
+        Err(DropReason::Ipv4FragmentTableFull)
+    );
+    assert!(matches!(
+        pass(&mut tracker, 1, 2 | MF, 16),
+        Ok(Ipv4FragmentFollow::Allow { .. })
+    ));
 }

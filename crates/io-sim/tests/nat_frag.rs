@@ -237,7 +237,9 @@ impl World {
             PUBLIC,
             P1,
             P1 + 15,
-            Nat44TcpPolicy::default(),
+            // Endpoint-independent, so an inside host can open a hairpinned
+            // TCP connection to another's mapping.
+            Nat44TcpPolicy::default().with_filtering(Nat44Filtering::EndpointIndependent),
         )
         .unwrap();
         let icmp_config = Nat44IcmpConfig::new(
@@ -1157,13 +1159,22 @@ fn per_host_and_global_caps_refuse_new_datagrams() {
     // One held fragment per host.
     let outcome = world.run(&lan(&d[2..3]));
     assert_eq!(outcome.drops, [DropReason::Ipv4FragmentHostHoldLimit]);
+    // The table is full: a new datagram evicts the oldest pending entry
+    // (d, with its held fragment), never an allowing one.
     let outcome = world.run(&lan(&e[..1]));
+    assert_eq!(outcome.tx.len(), 1);
+    let counters = world.counters();
+    assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
+    assert_eq!(world.occupancy(), (3, 0));
+    // Full of allowing entries, a new datagram is refused.
+    let f = first(H2, H2_MAC, 6);
+    let outcome = world.run(&lan(&f[..1]));
     assert_eq!(outcome.drops, [DropReason::Ipv4FragmentTableFull]);
     // Finishing H1's datagrams frees their entries early.
     world.run(&lan(&a[1..]));
     world.run(&lan(&b[1..]));
-    assert_eq!(world.occupancy(), (1, 1));
-    assert_eq!(world.run(&lan(&e[..1])).tx.len(), 1);
+    assert_eq!(world.occupancy(), (1, 0));
+    assert_eq!(world.run(&lan(&f[..1])).tx.len(), 1);
 }
 
 #[test]
@@ -1268,12 +1279,13 @@ impl Rng {
 }
 
 /// A bounded property run: two hosts' datagrams of random lengths, cut at
-/// random 8-byte boundaries, interleaved in a random order over random
-/// batches (out of order included), with random malformed fragments mixed
-/// in. Every datagram arrives whole (reassembly equals the independently
-/// built translated datagram, one ID per datagram, distinct IDs for the
-/// two), nothing panics, and the table never holds more than its capacity
-/// and is empty once every datagram has completed.
+/// random 8-byte boundaries, some fragments duplicated, interleaved in a
+/// random order over random batches (out of order included), with random
+/// later fragments of datagrams that were never sent mixed in. Every
+/// datagram arrives whole (the forwarded pieces with its ID, duplicates
+/// removed, reassemble to the independently built datagram), nothing
+/// panics, the table never holds more than its capacity, and a bounded
+/// sweep after the timeout leaves it empty.
 #[test]
 fn random_cuts_orders_and_garbage_keep_every_datagram_whole() {
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -1313,13 +1325,18 @@ fn random_cuts_orders_and_garbage_keep_every_datagram_whole() {
                 expected.pop();
                 continue;
             }
+            // Duplicates (as a network may deliver them).
+            for _ in 0..rng.below(3) {
+                let copy = fragments[rng.below(fragments.len())].clone();
+                injected.push(copy);
+            }
             injected.extend(fragments);
         }
         // Garbage: random flags, offsets, and lengths from H1 with fresh
         // IDs; they may be held or refused, never forwarded whole as a
         // datagram that was not sent.
         for _ in 0..rng.below(4) {
-            let word = u16::try_from(rng.below(0x4000)).unwrap() | MF;
+            let word = u16::try_from(1 + rng.below(0x1ffe)).unwrap() | MF;
             let id = 60_000 + u16::try_from(rng.below(1000)).unwrap();
             injected.push(ipv4_frame(
                 (LAN_MAC, H1_MAC),
@@ -1347,17 +1364,22 @@ fn random_cuts_orders_and_garbage_keep_every_datagram_whole() {
             now += 1;
         }
         for (id, forwarded) in &expected {
-            let pieces: Vec<_> = out
+            let mut pieces: Vec<_> = out
                 .iter()
                 .filter(|frame| id_of(frame) == *id && frame[26..30] == forwarded[26..30])
                 .cloned()
                 .collect();
+            pieces.sort();
+            pieces.dedup();
             assert!(
                 !pieces.is_empty(),
                 "case {case}: datagram {id:#x} forwarded"
             );
             assert_eq!(&reassemble(&pieces), forwarded, "case {case}");
         }
+        let tracker = world.tracker.as_mut().unwrap();
+        tracker.sweep(now + 5_000, usize::MAX);
+        assert_eq!(world.occupancy(), (0, 0), "case {case}");
     }
 }
 
@@ -1491,4 +1513,374 @@ fn the_fragment_paths_do_not_allocate() {
         );
     }
     assert_eq!(world.counters().released, 6);
+}
+
+// --------------------------------------------- review follow-ups (#337) ----
+
+const P2: u16 = 40_001;
+
+/// Review M-A (core): an ID reused after a lost fragment. Datagram A's
+/// middle fragment is lost; datagram B then reuses A's (source,
+/// destination, protocol, ID). B's first fragment poisons the entry, so
+/// none of B's later fragments leaves under A's template and generated ID
+/// (the receiver would misassemble A from them).
+#[test]
+fn a_reused_id_poisons_the_entry_instead_of_misassembling() {
+    let mut world = World::new(Setup::default());
+    let (a, _) = outbound_udp(0x0aaa);
+    let outcome = world.run(&lan(&[a[0].clone(), a[2].clone()]));
+    assert_eq!(frames_to(&outcome, WAN).len(), 2);
+    let segment = udp_segment(H1, REMOTE, (P1, 53), UDP_DATA - 8);
+    let b = cut(
+        &ipv4_frame((LAN_MAC, H1_MAC), H1, REMOTE, 0x0aaa, 0, 64, UDP, &segment),
+        &[1480, 1480, 12],
+    );
+    let outcome = world.run(&lan(&b));
+    assert!(outcome.tx.is_empty(), "nothing of B leaves");
+    assert_eq!(
+        outcome.drops,
+        [
+            DropReason::Ipv4FragmentDuplicateFirst,
+            DropReason::Ipv4FragmentFirstDenied,
+            DropReason::Ipv4FragmentFirstDenied,
+        ]
+    );
+    // A's lost middle fragment, retransmitted by nobody but arriving late,
+    // is refused too: both datagrams fail closed.
+    let outcome = world.run(&lan(&a[1..2]));
+    assert_eq!(outcome.drops, [DropReason::Ipv4FragmentFirstDenied]);
+    assert_eq!(world.counters().poisoned, 1);
+    // A byte-identical duplicate of a first fragment is dropped alone.
+    let (c, forwarded) = outbound_udp(0x0ccc);
+    let outcome = world.run(&lan(&[
+        c[0].clone(),
+        c[0].clone(),
+        c[1].clone(),
+        c[2].clone(),
+    ]));
+    assert_eq!(outcome.drops, [DropReason::Ipv4FragmentDuplicateFirst]);
+    let out = frames_to(&outcome, WAN);
+    assert_eq!(reassemble(&out), with_id(&forwarded, one_id(&out)));
+    assert_eq!(world.counters().duplicate_first, 1);
+}
+
+/// Review M-A (sec): the inbound key has no destination port. A server
+/// answers H1 and H2 (behind one public address) with datagrams that share
+/// an ID, interleaved: A0, B0, A1, B1, A2, B2. B0 poisons the entry, so no
+/// fragment of B reaches H1 (and none of A after A0).
+#[test]
+fn colliding_inbound_ids_to_two_hosts_fail_closed() {
+    let mut world = World::new(Setup::default());
+    let mut public = Vec::new();
+    for (host, mac, port) in [(H1, H1_MAC, 5001_u16), (H2, H2_MAC, 5002)] {
+        let request = udp_segment(host, REMOTE, (port, 53), 8);
+        let outcome = world.run(&lan(&[ipv4_frame(
+            (LAN_MAC, mac),
+            host,
+            REMOTE,
+            1,
+            DF,
+            64,
+            UDP,
+            &request,
+        )]));
+        let out = frames_to(&outcome, WAN);
+        public.push(u16::from_be_bytes([out[0][34], out[0][35]]));
+    }
+    let answer = |port: u16, fill: usize| {
+        let segment = udp_segment(REMOTE, PUBLIC, (53, port), UDP_DATA - fill);
+        cut(
+            &ipv4_frame(
+                (WAN_MAC, GW_MAC),
+                REMOTE,
+                PUBLIC,
+                0x5555,
+                0,
+                60,
+                UDP,
+                &segment,
+            ),
+            &[1480, 1480, 20 - fill],
+        )
+    };
+    let a = answer(public[0], 0);
+    let b = answer(public[1], 8);
+    let outcome = world.run(&wan(&[
+        a[0].clone(),
+        b[0].clone(),
+        a[1].clone(),
+        b[1].clone(),
+        a[2].clone(),
+        b[2].clone(),
+    ]));
+    let out = frames_to(&outcome, LAN);
+    assert_eq!(out.len(), 1, "only A0, to H1");
+    assert_eq!(out[0][30..34], H1.octets());
+    assert_eq!(
+        outcome.drops,
+        [
+            DropReason::Ipv4FragmentDuplicateFirst,
+            DropReason::Ipv4FragmentFirstDenied,
+            DropReason::Ipv4FragmentFirstDenied,
+            DropReason::Ipv4FragmentFirstDenied,
+            DropReason::Ipv4FragmentFirstDenied,
+        ]
+    );
+}
+
+/// Review M-B: duplicates and overlaps do not declare a datagram complete
+/// early (which freed the entry and lost the rest), and a forged last
+/// fragment with another end poisons the entry instead of moving the end.
+#[test]
+fn duplicates_overlaps_and_forged_ends_do_not_complete_a_datagram() {
+    let mut world = World::new(Setup::default());
+    let segment = udp_segment(H1, REMOTE, (P1, 53), 4460 - 8);
+    let sent = ipv4_frame((LAN_MAC, H1_MAC), H1, REMOTE, 0x0ddd, 0, 64, UDP, &segment);
+    let sizes = [1480, 1480, 1480, 20];
+    let fragments = cut(&sent, &sizes);
+    // First, last, then the second three times: 1480 + 20 + 3 * 1480 bytes
+    // would have counted past the 4460-byte end.
+    let outcome = world.run(&lan(&[
+        fragments[0].clone(),
+        fragments[3].clone(),
+        fragments[1].clone(),
+        fragments[1].clone(),
+        fragments[1].clone(),
+    ]));
+    assert_eq!(frames_to(&outcome, WAN).len(), 5);
+    assert_eq!(world.occupancy(), (1, 0), "bytes 2960..4440 not seen");
+    let outcome = world.run(&lan(&fragments[2..3]));
+    assert_eq!(frames_to(&outcome, WAN).len(), 1, "the third still follows");
+    assert_eq!(world.occupancy(), (0, 0));
+
+    // A forged last fragment that ends before data already seen contradicts
+    // the datagram: the entry is poisoned and refuses the rest.
+    let fragments = cut(
+        &ipv4_frame((LAN_MAC, H1_MAC), H1, REMOTE, 0x0eee, 0, 64, UDP, &segment),
+        &sizes,
+    );
+    let mut forged = fragments[1][..34 + 8].to_vec();
+    forged[16..18].copy_from_slice(&28_u16.to_be_bytes());
+    forged[20..22].copy_from_slice(&185_u16.to_be_bytes());
+    forged[24..26].fill(0);
+    let checksum = sum16(&forged[14..34]);
+    forged[24..26].copy_from_slice(&checksum.to_be_bytes());
+    let outcome = world.run(&lan(&[fragments[0].clone(), fragments[2].clone(), forged]));
+    assert_eq!(
+        outcome.drops,
+        [DropReason::Ipv4FragmentMalformed],
+        "the forged end is before the third fragment's data"
+    );
+    let outcome = world.run(&lan(&[fragments[1].clone(), fragments[3].clone()]));
+    assert_eq!(outcome.drops, [DropReason::Ipv4FragmentFirstDenied; 2]);
+    assert_eq!(world.counters().poisoned, 1);
+}
+
+/// Review M-C (sec): 32 refused first fragments from a source used to fill
+/// its per-host quota for the timeout, so the same source's legitimate
+/// reply was refused. Refusing entries are evicted, oldest first.
+#[test]
+fn refused_first_fragments_cannot_hold_a_sources_quota() {
+    let mut world = World::new(Setup {
+        entries: 64,
+        ..Setup::default()
+    });
+    let request = udp_segment(H1, REMOTE, (P1, 53), 8);
+    world.run(&lan(&[ipv4_frame(
+        (LAN_MAC, H1_MAC),
+        H1,
+        REMOTE,
+        1,
+        DF,
+        64,
+        UDP,
+        &request,
+    )]));
+    // 32 first fragments from REMOTE to unmapped public ports: refused.
+    let flood: Vec<_> = (0..32)
+        .map(|index| {
+            let segment = udp_segment(REMOTE, PUBLIC, (53, P1 + 8), UDP_DATA);
+            let sent = ipv4_frame(
+                (WAN_MAC, GW_MAC),
+                REMOTE,
+                PUBLIC,
+                0x6000 + index,
+                0,
+                60,
+                UDP,
+                &segment,
+            );
+            cut(&sent, &SIZES).remove(0)
+        })
+        .collect();
+    let outcome = world.run(&wan(&flood));
+    assert_eq!(outcome.drops.len(), 32);
+    assert!(outcome.tx.is_empty());
+    let answer = udp_segment(REMOTE, PUBLIC, (53, P1), UDP_DATA);
+    let sent = ipv4_frame(
+        (WAN_MAC, GW_MAC),
+        REMOTE,
+        PUBLIC,
+        0x7000,
+        0,
+        60,
+        UDP,
+        &answer,
+    );
+    let outcome = world.run(&wan(&cut(&sent, &SIZES)));
+    assert!(outcome.drops.is_empty(), "{:?}", outcome.drops);
+    assert_eq!(frames_to(&outcome, LAN).len(), 3);
+    assert_eq!(world.counters().entries_evicted, 1);
+}
+
+/// Review M-C (sec): host accounting is per (ingress, source). Fragments
+/// from the WAN that claim an inside host's address use their own quota,
+/// not the inside host's.
+#[test]
+fn a_spoofed_inside_source_does_not_use_the_inside_hosts_quota() {
+    let mut world = World::new(Setup {
+        tracking: Some(Ipv4FragmentTrackingPolicy::new(5_000, 2, 16).unwrap()),
+        entries: 16,
+        ..Setup::default()
+    });
+    // Later fragments from the WAN claiming H1 as source, to D.
+    for id in 0..4 {
+        let spoofed = ipv4_frame(
+            (WAN_MAC, GW_MAC),
+            H1,
+            D,
+            0x6100 + id,
+            100,
+            64,
+            UDP,
+            &data(16),
+        );
+        let outcome = world.run(&wan(&[spoofed]));
+        assert_eq!(outcome.consumed, [ConsumeReason::Ipv4FragmentHeld]);
+    }
+    // H1 from the LAN: two datagrams in flight, as its quota allows.
+    for id in [0x6200, 0x6201] {
+        let segment = udp_segment(H1, D, (5000, 9000), UDP_DATA);
+        let sent = ipv4_frame((LAN_MAC, H1_MAC), H1, D, id, 0, 64, UDP, &segment);
+        let outcome = world.run(&lan(&cut(&sent, &SIZES)[..2]));
+        assert_eq!(frames_to(&outcome, DMZ).len(), 2);
+    }
+    // The spoofed ones evicted only each other (two per host at a time).
+    assert_eq!(world.counters().entries_evicted, 2);
+}
+
+/// Review L3: hairpinned fragments, UDP and TCP, in order and reversed,
+/// byte for byte (both addresses translated, the inside MTU, one ID).
+#[test]
+fn hairpinned_fragments_are_translated_both_ways_in_any_order() {
+    for reversed in [false, true] {
+        let mut world = World::new(Setup::default());
+        // UDP: H2's mapping PUBLIC:P2 and the hole punching exchange the
+        // firewall needs (H1 -> H2 is refused until H2 has sent to H1).
+        let open = udp_segment(H2, REMOTE, (P2, 53), 8);
+        world.run(&lan(&[ipv4_frame(
+            (LAN_MAC, H2_MAC),
+            H2,
+            REMOTE,
+            1,
+            DF,
+            64,
+            UDP,
+            &open,
+        )]));
+        let punch = udp_segment(H1, PUBLIC, (P1, P2), 8);
+        world.run(&lan(&[ipv4_frame(
+            (LAN_MAC, H1_MAC),
+            H1,
+            PUBLIC,
+            2,
+            DF,
+            64,
+            UDP,
+            &punch,
+        )]));
+        let reply = udp_segment(H2, PUBLIC, (P2, P1), 8);
+        let outcome = world.run(&lan(&[ipv4_frame(
+            (LAN_MAC, H2_MAC),
+            H2,
+            PUBLIC,
+            3,
+            DF,
+            64,
+            UDP,
+            &reply,
+        )]));
+        assert_eq!(frames_to(&outcome, LAN).len(), 1);
+        let segment = udp_segment(H1, PUBLIC, (P1, P2), UDP_DATA);
+        let sent = ipv4_frame((LAN_MAC, H1_MAC), H1, PUBLIC, 0x4848, 0, 64, UDP, &segment);
+        let mut fragments = cut(&sent, &SIZES);
+        if reversed {
+            fragments.reverse();
+        }
+        let outcome = world.run(&lan(&fragments));
+        assert!(outcome.drops.is_empty(), "UDP: {:?}", outcome.drops);
+        let out = frames_to(&outcome, LAN);
+        let translated = udp_segment(PUBLIC, H2, (P1, P2), UDP_DATA);
+        let expected = with_id(
+            &ipv4_frame((H2_MAC, LAN_MAC), PUBLIC, H2, 0, 0, 63, UDP, &translated),
+            one_id(&out),
+        );
+        assert_eq!(sorted(out.clone()), sorted(cut(&expected, &SIZES)), "UDP");
+        assert_eq!(reassemble(&out), expected);
+
+        // TCP: H2's session to REMOTE gives it PUBLIC:P2. Hole punching
+        // (RFC 5128 §3.4): H1's SYN to PUBLIC:P2 is refused by the firewall
+        // but keeps its outbound half; H2's SYN to PUBLIC:P1 then passes.
+        let syn = tcp_segment(H2, REMOTE, (P2, 443), 0x02, 0, 0);
+        world.run(&lan(&[ipv4_frame(
+            (LAN_MAC, H2_MAC),
+            H2,
+            REMOTE,
+            4,
+            DF,
+            64,
+            TCP,
+            &syn,
+        )]));
+        let syn = tcp_segment(H1, PUBLIC, (P1, P2), 0x02, 0, 0);
+        world.run(&lan(&[ipv4_frame(
+            (LAN_MAC, H1_MAC),
+            H1,
+            PUBLIC,
+            5,
+            DF,
+            64,
+            TCP,
+            &syn,
+        )]));
+        let syn = tcp_segment(H2, PUBLIC, (P2, P1), 0x02, 0, 0);
+        let outcome = world.run(&lan(&[ipv4_frame(
+            (LAN_MAC, H2_MAC),
+            H2,
+            PUBLIC,
+            6,
+            DF,
+            64,
+            TCP,
+            &syn,
+        )]));
+        assert_eq!(frames_to(&outcome, LAN).len(), 1, "{:?}", outcome.drops);
+        let segment = tcp_segment(H1, PUBLIC, (P1, P2), 0x10, 0, 2000);
+        let sent = ipv4_frame((LAN_MAC, H1_MAC), H1, PUBLIC, 0x4949, 0, 64, TCP, &segment);
+        let sizes = [1000, 1000, 20];
+        let mut fragments = cut(&sent, &sizes);
+        if reversed {
+            fragments.reverse();
+        }
+        let outcome = world.run(&lan(&fragments));
+        assert!(outcome.drops.is_empty(), "TCP: {:?}", outcome.drops);
+        let out = frames_to(&outcome, LAN);
+        let translated = tcp_segment(PUBLIC, H2, (P1, P2), 0x10, 0, 2000);
+        let expected = with_id(
+            &ipv4_frame((H2_MAC, LAN_MAC), PUBLIC, H2, 0, 0, 63, TCP, &translated),
+            one_id(&out),
+        );
+        assert_eq!(sorted(out.clone()), sorted(cut(&expected, &sizes)), "TCP");
+        assert_eq!(reassemble(&out), expected);
+    }
 }
