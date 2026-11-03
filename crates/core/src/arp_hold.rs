@@ -188,10 +188,11 @@ pub struct ArpHoldSlot {
     older: u32,
     newer: u32,
     /// A held first fragment's pending entry in the fragment association
-    /// table and that entry's generation (NONE: none), so a drop refuses
-    /// exactly its datagram. In the record's padding: no storage growth.
+    /// table and that entry's creation stamp (NONE: none), so a drop
+    /// refuses exactly its datagram. In the record's padding: no storage
+    /// growth.
     association: u32,
-    association_generation: u8,
+    association_generation: u16,
 }
 
 impl ArpHoldSlot {
@@ -242,7 +243,7 @@ pub(crate) enum ArpHoldFragmentHook<'f> {
         frame: &'f [u8],
         ingress: IfId,
         association: u32,
-        generation: u8,
+        generation: u16,
     },
 }
 
@@ -479,7 +480,7 @@ impl<'a> ArpHoldRuntime<'a> {
         frame: &[u8],
         ingress: IfId,
         miss: ArpHoldMiss,
-        mut association_dropped: impl FnMut(&[u8], IfId, u32, u8),
+        mut association_dropped: impl FnMut(&[u8], IfId, u32, u16),
     ) -> Result<(), DropReason> {
         if frame.len() > self.slot_bytes && !self.slots.is_empty() {
             self.counters.refused_too_large += 1;
@@ -622,7 +623,7 @@ impl<'a> ArpHoldRuntime<'a> {
 
     /// Records the fragment association of the datagram just held (a first
     /// fragment's pending entry and its generation).
-    pub(crate) fn set_newest_association(&mut self, association: (u32, u8)) {
+    pub(crate) fn set_newest_association(&mut self, association: (u32, u16)) {
         if self.newest != NONE {
             let slot = &mut self.slots[self.newest as usize];
             slot.association = association.0;

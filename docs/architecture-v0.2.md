@@ -677,13 +677,13 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   （`commit_allow`/`commit_deny`）の時です。ARP holdされた最初のfragmentはcommitしないので何もevict
   しません（#341 re-review L4。replayのadmissionが改めて計画する）。holdした最初のfragmentは
   decideせず、そのdatagramのpending entry（無ければevictなしで取れる時だけ新しく取る、`hold_first`）の
-  indexとgeneration（entryのpaddingに収まる1 byte、tableの挿入ごとに増える）をhold slotのpaddingへ
-  記録します（storageは増えない）。holdがfailed/cancelled/expiredやper-neighbor置き換えで捨てる最初の
-  fragmentは、その記録したentryが同じindex、generation、keyのままpendingの時だけ`deny_pending`で
+  indexと作成時刻の下位16 bit（stamp。entryには何も足さない）をhold slotのpaddingへ記録します
+  （storageは増えない）。holdがfailed/cancelled/expiredやper-neighbor置き換えで捨てる最初の
+  fragmentは、その記録したentryが同じindex、stamp、keyのままpendingの時だけ`deny_pending`で
   Denyにし、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。
   `deny_pending`はlookupもinsertもevictもせず、decided entryには触れずpoisonもしません。IDが一巡して
-  同じkeyの新しいdatagramが同じslotを取っていればgenerationが違うので触れません（#342 review M1。
-  同じslotで256の倍数の挿入を挟んだ時だけ一致し得る）。pending entryを取れなかった最初のfragmentは
+  同じkeyの新しいdatagramが同じslotを取っていればstampが違うので触れません（#342 review M1。
+  同じミリ秒（65536 ms周期）に作られた時だけ一致し得る。entryは高々60 sしか生きない）。pending entryを取れなかった最初のfragmentは
   記録が無く、後続はtableのtimeoutで解放されます。apply（`flushed`）では同じapplyでtable自体も
   flushされるので何もしません。replayで
   最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る

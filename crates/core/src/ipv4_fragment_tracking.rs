@@ -476,10 +476,6 @@ pub struct Ipv4FragmentEntrySlot {
     held_head: u32,
     held_tail: u32,
     held: u16,
-    /// The table's insert count when this entry was inserted (wrapping), so
-    /// a reference kept across packets (an ARP-held first fragment's
-    /// association) cannot match a later datagram in the same slot.
-    generation: u8,
     /// The decided first fragment: whether there was one, its data length,
     /// and a fingerprint of all its data (a byte-identical duplicate is
     /// dropped alone; any other second first fragment poisons the entry).
@@ -523,7 +519,6 @@ impl Ipv4FragmentEntrySlot {
         held_head: NONE,
         held_tail: NONE,
         held: 0,
-        generation: 0,
         has_first: false,
         first_len: 0,
         first_fingerprint: 0,
@@ -933,6 +928,12 @@ pub(crate) struct Ipv4FragmentFirstTicket {
     victims: Victims,
 }
 
+/// The low 16 bits of an entry's creation time: its identity for a
+/// reference kept across packets (ARP-HOLD).
+const fn stamp(created_ms: u64) -> u16 {
+    (created_ms & 0xffff) as u16
+}
+
 /// What the table says about a later fragment.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Ipv4FragmentFollow {
@@ -982,8 +983,6 @@ pub struct Ipv4FragmentTracker<'a> {
     over_head: u16,
     tombstone_next: usize,
     live_entries: usize,
-    /// The generation the next inserted entry gets (wrapping; ARP-HOLD).
-    next_generation: u8,
     live_held: usize,
     counters: Ipv4FragmentTrackingCounters,
     _worker_local: PhantomData<Rc<()>>,
@@ -1084,7 +1083,6 @@ impl<'a> Ipv4FragmentTracker<'a> {
             over_head: NO_SLOT,
             tombstone_next: 0,
             live_entries: 0,
-            next_generation: 1,
             live_held: 0,
             counters: Ipv4FragmentTrackingCounters::default(),
             _worker_local: PhantomData,
@@ -1671,14 +1669,11 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.free_entry = self.entries[index as usize].links[AGE][NEWER];
         self.hosts[host].entries += 1;
         self.ingresses[ingress].entries += 1;
-        let generation = self.next_generation;
-        self.next_generation = self.next_generation.wrapping_add(1);
         self.entries[index as usize] = Ipv4FragmentEntrySlot {
             state,
             key,
             created_ms: now_ms,
             host: u32::try_from(host).expect("host index below NONE"),
-            generation,
             ..Ipv4FragmentEntrySlot::EMPTY
         };
         push(self.entries, &mut self.age, index, AGE);
@@ -1894,15 +1889,17 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// The association of a first fragment held for ARP (ARP-HOLD) instead
     /// of decided: its pending entry, or a new pending entry when one can
     /// be taken without evicting anything (else none: its later fragments
-    /// make their own and wait for the timeout). The entry index and its
-    /// generation let [`Self::deny_pending`] refuse exactly this datagram
-    /// later. Records no first fragment (the replay decides it). Cold path.
+    /// make their own and wait for the timeout). The entry index and the
+    /// low 16 bits of its creation time (its stamp) let
+    /// [`Self::deny_pending`] refuse exactly this datagram later, with no
+    /// field added to the entry. Records no first fragment (the replay
+    /// decides it). Cold path.
     #[cold]
     pub(crate) fn hold_first(
         &mut self,
         ticket: Ipv4FragmentFirstTicket,
         now_ms: u64,
-    ) -> Option<(u32, u8)> {
+    ) -> Option<(u32, u16)> {
         let index = match ticket.existing {
             Some(index) => {
                 let entry = &self.entries[index as usize];
@@ -1916,24 +1913,24 @@ impl<'a> Ipv4FragmentTracker<'a> {
         };
         Some((
             u32::try_from(index).expect("entry index below NONE"),
-            self.entries[index].generation,
+            stamp(self.entries[index].created_ms),
         ))
     }
 
     /// Refuses the datagram of an ARP-held first fragment that was dropped
     /// (its resolution failed, was cancelled or replaced, or ran out of
     /// time): only the pending entry recorded by [`Self::hold_first`] while
-    /// it is still that entry (same generation and key, still pending, not
-    /// expired). The generation is one byte (it fits the entry's padding):
-    /// a newer datagram with the same key in the same slot would also need
-    /// a multiple of 256 inserts in between. Its held later fragments are freed (`held_denied`) and the
+    /// it is still that entry (same index, key, and creation stamp, still
+    /// pending, not expired). A newer datagram with the same key in the
+    /// same slot would have to be created in the same millisecond modulo
+    /// 65536 (an entry lives at most the 60 s timeout). Its held later fragments are freed (`held_denied`) and the
     /// entry refuses the rest until its timeout. Looks nothing up, inserts
     /// nothing, evicts nothing, never poisons. Returns whether it denied.
     #[cold]
     pub(crate) fn deny_pending(
         &mut self,
         index: u32,
-        generation: u8,
+        created: u16,
         info: Ipv4FragmentInfo,
         now_ms: u64,
     ) -> bool {
@@ -1942,7 +1939,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
             return false;
         };
         if entry.state != EntryState::Pending
-            || entry.generation != generation
+            || stamp(entry.created_ms) != created
             || entry.key != info.key
             || self.expired(index, now_ms)
         {
