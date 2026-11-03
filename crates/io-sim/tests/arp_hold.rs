@@ -926,3 +926,30 @@ fn a_translated_icmp_error_to_an_unresolved_lan_host_is_held() {
         "quoted source port translated back"
     );
 }
+
+/// Only a miss that can end in a replay holds: a datagram to a next hop in
+/// its Failed hold-down is dropped as before, even right after a datagram
+/// of the same batch was held for another next hop (the miss a hold waits
+/// on is always the datagram's own).
+#[test]
+fn a_failed_next_hop_is_dropped_not_held_under_another_miss() {
+    let mut world = World::new(ROUTER);
+    let silent = [203, 0, 113, 50];
+    let to_silent = |id: u16| from_h(silent, id, DF, 64, 17, &udp(H, silent, (5005, 7), b"x"));
+    world.tick(0, &[(LAN, to_silent(1))]);
+    for now in [1_000, 2_000, 3_000] {
+        world.tick(now, &[]);
+    }
+    assert_eq!(world.live(), 0);
+    // Within the Failed hold-down (state-ttl-ms 3000).
+    world.tick(
+        3_100,
+        &[
+            (LAN, from_h(S, 2, DF, 64, 17, &udp(H, S, (5000, 53), b"q"))),
+            (LAN, to_silent(3)),
+        ],
+    );
+    assert_eq!(world.live(), 1, "only the datagram to S is held");
+    assert_eq!(world.drops(DropReason::NeighborUnresolved), 1);
+    assert_eq!(world.hold().held, 2);
+}

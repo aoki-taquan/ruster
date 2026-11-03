@@ -645,6 +645,7 @@ fn staging_sends_committed_datagrams_whole_and_returns_unreached_ones() {
     let counters = runtime.counters();
     assert_eq!((counters.replay_sent, counters.replay_unstaged), (1, 2));
     assert_eq!(fragmentation.pending(), 1);
+    assert_eq!(fragmentation.free_slots(), 1, "one of two slots taken");
     assert_eq!(fragmentation.counters().queued, 1);
 
     // A ready datagram the replay did not reach goes back to waiting.
