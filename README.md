@@ -170,8 +170,9 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   `EAGAIN`/`EBUSY`/`ENOBUFS`/`EINTR`を`KickOutcome::Deferred`、他をtyped `KickError`にする。
   `attach_xdp`は`take_datapath`より前に呼ぶ。`NativeSession::open`はinterface lookup直後に、bind queueに
   TX queueがあることをcallerのnetnsのrtnetlink `RTM_GETLINK`（`IFLA_NUM_TX_QUEUES`、`IFLA_IFNAME`が設定名。
-  OPS-EXITでsysfsから移行し、query失敗はtyped `SessionFailure::LinkQuery`。active数はsysfsのviewが
-  このdeviceを示す時だけ`queues/tx-<queue>`で狭める）で確かめ、無ければresource取得前に`SessionFailure::NoTxQueue`で拒否する
+  OPS-EXITでsysfsから移行し、query失敗はtyped `SessionFailure::LinkQuery`。TX queueが2以上の時の
+  active数はsysfsのviewがこのdeviceを示す時だけ`queues/tx-<queue>`で確かめ、示さなければ
+  `TxQueueUnverifiable`でfail closed）で確かめ、無ければresource取得前に`SessionFailure::NoTxQueue`で拒否する
   （Linuxは`queue < max(RX, TX)`でbindを許すがcopy-mode TXは黙って何も送らない）。`drain(rounds)`は新規TXとFillを止めてcompletionを
   回収し、全frameを一回だけledgerへ戻し、kernelがまだ持つframeを`DrainOutcome::TxInFlight`と
   `FrameAccounting`で報告する（返ったことにはしない）。M2 S5（X03）の`allocate_generated(len)`は
@@ -1102,8 +1103,10 @@ sudo kill -HUP <pid>                                               # configをre
   resolution/ICMPv4 policy）は`reload refused: code=RESTART_REQUIRED reasons=...`、読めない・不正・
   dry run失敗は`reload failed: stage=... code=...`で、どちらも旧generationがそのまま動き続けます。
   通ればbackendがquiescent（旧generationのTXがkernelに無い）になったtick境界でpublication phaseへ
-  渡し（待つ間はRXを最大200 ms止める。過ぎれば`stage=quiesce code=TIMEOUT`。linkがdownのportに残るTXは
-  kernelがlinkの戻るまで持つので待たず`quiescence_link_down_tx`に数える、OPS-EXIT）、
+  渡し（待つ間はRXを最大200 ms止める。過ぎれば`stage=quiesce code=TIMEOUT`。linkがdownのport（その場の
+  kickが`ENETDOWN`）に残るTXはkernelがlinkの戻るまで持つので待たず、行末の`held-tx-on-down-links=N`と
+  gauge `tx_held_on_down_link`に出す。`[reload] down-link-tx = "refuse"`ではそのreloadを
+  `DOWN_LINK_TX_HELD`で拒否する、OPS-EXIT）、
   `reload applied: generation=N previous=P; interfaces=.. routes=.. firewall-rules=.. ...; flushed ...`
   です（件数で切り詰められたconfigに気づける。行の後半は`carried ...; state arp=.. nat44-udp=..
   nat44-tcp=.. nat44-icmp=.. firewall=..`）。適用時はpending resolution/ICMPv4 errorを捨て、
@@ -1184,7 +1187,11 @@ sudo kill -HUP <pid>                                               # configをre
   armし、drainの後・detachの前に一回実行（signal、fatal、backend fault、panicでも。startupの失敗では
   何もしない）、失敗は`exit protection failed: ...`でexit 1。sysctl fileとrtnetlink socketはLandlock、
   seccompの前に開くがkernelは書き込み・link変更ごとに`CAP_NET_ADMIN`を確かめるので、どちらのkeyも
-  `--keep-privileges`だけ（`EXIT_FORWARDING_NEEDS_PRIVILEGES`/`EXIT_LINK_DOWN_NEEDS_PRIVILEGES`）。`SIGKILL`等はsupervisorの`ExecStopPost=`で補う（runbookの9章）。
+  `--keep-privileges`だけ（`EXIT_FORWARDING_NEEDS_PRIVILEGES`/`EXIT_LINK_DOWN_NEEDS_PRIVILEGES`）。
+  `--keep-privileges`は全threadに全capabilityを残し、compromiseされたprocessがrtnetlinkでnamespaceの
+  networkを書き換えられるので、`[exit-protection]`は`--seccomp off`/`--fs-confine off`とは組めない
+  （`EXIT_PROTECTION_NEEDS_SECCOMP`/`EXIT_PROTECTION_NEEDS_FS_CONFINE`）。drop下で動くhelper process案は
+  architectureにowner決定待ちとして記載。`SIGKILL`等はsupervisorの`ExecStopPost=`で補う（runbookの9章）。
   非initial user namespaceでは起動時に`USER_NAMESPACE_NOT_INITIAL`をwarningする。
 
 ```toml
@@ -1408,7 +1415,8 @@ overrideでのwarning、稼働中のwarningとrecovered。M2 S11で`ip_forward=0
 H10のsystemd phase（work directoryのdatagram socketをpython受信者がsystemdの代わりに受け、`NOTIFY_SOCKET`と`WATCHDOG_USEC=400000`、実行userへの切り替え、既定の`--seccomp kill`の下で`READY=1`が最初、2 sに6〜14回の`WATCHDOG=1`、reloadで`RELOADING=1`（`MONOTONIC_USEC`付き）と generation 2の`READY=1`、SIGUSR1で`kind=on-demand` block、`STOPPING=1`が最後）とrename phase（稼働中に`ip link set ra down`と`name rx`でexit 1 `DEVICE_RENAMED`、attachが残らない）、
 OPS-EXITのexit_protection phase（router netnsのra/rbだけ: 両keyとも`--keep-privileges`なしでexit 2、
 ありで両portのforwarding 1→0と両portのdown、後でupへ戻す）とtxfull phaseの
-reload（ring満杯で保持中のSIGHUPがgeneration 2として即apply、`quiescence_link_down_tx >= 128`）、
+reload（ring満杯で保持中のSIGHUPがgeneration 2として即apply、`held-tx-on-down-links=128`、
+`[reload] down-link-tx = "refuse"`のreloadは`DOWN_LINK_TX_HELD`で拒否）、
 OPS-LOGのlog_json phase（`--log-format json`の稼働中routerで転送、`[health]`/`[watch]`を変えるSIGHUP
 reloadで`watch settings applied`、fatalがwarning未満になるreloadは`reload failed: stage=health`で
 generation 2のまま、SIGUSR1、SIGTERMでexit 0・detach。stderrとstdoutの全行を`python3 -I`の`json`で

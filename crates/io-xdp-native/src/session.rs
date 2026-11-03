@@ -203,10 +203,12 @@ pub enum SessionStage {
     /// `RTM_GETLINK` of the resolved index in the caller's network
     /// namespace (OPS-EXIT item 3; its `IFLA_IFNAME` must be the configured
     /// name): the queue must be below `IFLA_NUM_TX_QUEUES` (the allocated
-    /// count). Where the sysfs view proves to describe the resolved device
-    /// (its `ifindex` matches), the active count narrows it
-    /// (`/sys/class/net/<dev>/queues/tx-<queue>`, which follows `ethtool
-    /// -L`); a sysfs view of another namespace is not consulted.
+    /// count, never below the active one). A device with one allocated TX
+    /// queue has exactly queue 0 active. With more, the active count comes
+    /// from sysfs (`/sys/class/net/<dev>/queues/tx-<queue>`, which follows
+    /// `ethtool -L`) only where its view proves to describe the resolved
+    /// device (its `ifindex` matches); otherwise `TxQueueUnverifiable`
+    /// (fail closed).
     TxQueueCheck,
     /// The device MTU (`IFLA_MTU` of the same rtnetlink answer as
     /// [`Self::TxQueueCheck`]), which bounds TX length.
@@ -310,9 +312,11 @@ pub enum SessionFailure {
     /// or after `ethtool -L`). Binding would succeed and TX would stall
     /// silently, so the session is refused.
     NoTxQueue,
-    /// No longer produced: the TX queue count comes from rtnetlink
-    /// ([`Self::LinkQuery`]); a sysfs view that cannot be proven is not
-    /// consulted. Kept so the stable code stays reserved.
+    /// The device has more than one allocated TX queue
+    /// (`IFLA_NUM_TX_QUEUES`) and the active count cannot be verified: the
+    /// sysfs view is not this namespace's device (a stale view after
+    /// `setns`, or a rename race), or it is unreadable. Fails closed:
+    /// remount sysfs in the router's namespace (`ip netns exec` does).
     TxQueueUnverifiable,
     /// The device MTU rtnetlink reported is zero. Fails closed: without it
     /// TX length cannot be bounded.

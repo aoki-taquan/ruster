@@ -201,6 +201,8 @@ impl<O: PacketOps> PacketRingResources<O> {
             }
             Err(error) => {
                 let class = KickClass::of(error);
+                // Only `ENETDOWN` means the link is down (OPS-EXIT).
+                self.kick.link_down = class == KickClass::LinkDown;
                 match class {
                     KickClass::Deferred => bump(&mut self.counters.kicks_deferred),
                     KickClass::LinkDown => {
@@ -233,9 +235,11 @@ impl<O: PacketOps> PacketRingResources<O> {
         let frames = self.tx_frame_count();
         let report = self.tx_scan_completions(frames)?;
         if report.reclaimed != 0 {
-            // Progress: the kernel is taking frames again.
+            // Progress: the kernel is taking frames again (so the link is
+            // not down).
             self.kick.backoff_ms = 1;
             self.kick.retry_at_ms = now;
+            self.kick.link_down = false;
         }
         if self.tx_state.in_flight == 0 {
             self.kick.owed = false;
@@ -270,6 +274,11 @@ impl<O: PacketOps> PacketRingResources<O> {
             rx_halted: self.rx_sticky_halt().is_some(),
             kick_owed: self.kick.owed,
             link_down: self.kick.link_down,
+            tx_held_on_down_link: if self.kick.link_down {
+                u32::try_from(self.tx_state.in_flight).unwrap_or(u32::MAX)
+            } else {
+                0
+            },
             unbound: self.kick.unbound,
             faults: self.rx_stats(),
             counters: self.counters,
@@ -360,12 +369,13 @@ impl<O: PacketOps> AfPacketEngine<O> {
     /// The publication quiescence check: no batch or lease can be open
     /// (`&mut self`), so after settling every port only in-flight TX can
     /// still carry the current publication's authority. A port whose link
-    /// is down (its last kick was `ENETDOWN`) does not block (OPS-EXIT):
-    /// `tpacket_snd` leaves every frame SEND_REQUEST while the device is
-    /// down, so waiting would block every publication for as long as the
-    /// link stays down; a granted check adds those frames to the port's
-    /// `quiescence_link_down_tx`, and they stay in flight (sent or
-    /// reported by the drain as before).
+    /// is down does not block (OPS-EXIT): `tpacket_snd` leaves every frame
+    /// SEND_REQUEST while the device is down, so waiting would block every
+    /// publication for as long as the link stays down. A port the last
+    /// kick saw down is confirmed with one fresh kick (outside the
+    /// backoff): only `ENETDOWN` lets its frames pass; any other outcome
+    /// clears `link_down` and they block. The frames stay in flight (sent
+    /// or reported by the drain as before; gauge `tx_held_on_down_link`).
     pub(crate) fn quiescence_check(&mut self) -> Result<(), AfPacketQuiescenceError> {
         if self.is_stopped() {
             return Err(AfPacketQuiescenceError::Stopped);
@@ -373,19 +383,27 @@ impl<O: PacketOps> AfPacketEngine<O> {
         if self.settle_all(false).is_err() {
             return Err(AfPacketQuiescenceError::Stopped);
         }
-        let frames: u64 = self
-            .ports
-            .iter()
-            .filter(|port| !port.kick.link_down)
-            .map(|port| port.tx_state.in_flight as u64)
-            .sum();
+        let now = self.now_ms;
+        let mut frames: u64 = 0;
+        for port in self.ports.iter_mut() {
+            if port.tx_state.in_flight == 0 {
+                continue;
+            }
+            let held = port.kick.link_down
+                && !port.kick.unbound
+                && matches!(
+                    port.kick_classified(now, true),
+                    Err(KickFailure {
+                        class: KickClass::LinkDown,
+                        ..
+                    })
+                );
+            if !held {
+                frames += port.tx_state.in_flight as u64;
+            }
+        }
         if frames != 0 {
             return Err(AfPacketQuiescenceError::TxInFlight { frames });
-        }
-        for port in self.ports.iter_mut().filter(|port| port.kick.link_down) {
-            let held = port.tx_state.in_flight as u64;
-            port.counters.quiescence_link_down_tx =
-                port.counters.quiescence_link_down_tx.saturating_add(held);
         }
         Ok(())
     }
@@ -517,6 +535,7 @@ impl<O: PacketOps> AfPacketEngine<O> {
             rx_halted_ports: 0,
             kick_owed_ports: 0,
             link_down_ports: 0,
+            tx_held_on_down_link: 0,
             unbound_ports: 0,
             generated_unknown_egress: self.generated_unknown_egress,
             stopped: self.is_stopped(),
@@ -536,6 +555,7 @@ impl<O: PacketOps> AfPacketEngine<O> {
             stats.rx_halted_ports += u32::from(port.rx_halted);
             stats.kick_owed_ports += u32::from(port.kick_owed);
             stats.link_down_ports += u32::from(port.link_down);
+            stats.tx_held_on_down_link += u64::from(port.tx_held_on_down_link);
             stats.unbound_ports += u32::from(port.unbound);
             stats.faults = add_faults(stats.faults, port.faults);
             stats.counters.accumulate(&port.counters);

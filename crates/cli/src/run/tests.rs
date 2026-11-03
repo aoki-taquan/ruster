@@ -198,6 +198,10 @@ struct State {
     signal: Cell<bool>,
     /// What `tx_outstanding` reports.
     tx_outstanding: Cell<bool>,
+    /// What `held_tx_on_down_links` reports (OPS-EXIT).
+    held_tx: Cell<u64>,
+    /// The datapath's drain panics (OPS-EXIT: a panic after readiness).
+    panic_in_drain: Cell<bool>,
     /// `Datapath::refresh` calls, health samples, and whether a sample
     /// came without a refresh right before it.
     refreshes: Cell<u32>,
@@ -546,6 +550,7 @@ impl Datapath for FakeDatapath<'_> {
 
     fn drain(&mut self, rounds: u32) -> Result<DrainProgress, XdpIoError> {
         self.state.push(Event::Drain(rounds));
+        assert!(!self.state.panic_in_drain.get(), "injected drain panic");
         self.state
             .drains
             .borrow_mut()
@@ -616,6 +621,10 @@ impl Datapath for FakeDatapath<'_> {
 
     fn tx_outstanding(&self) -> bool {
         self.state.tx_outstanding.get()
+    }
+
+    fn held_tx_on_down_links(&self) -> u64 {
+        self.state.held_tx.get()
     }
 }
 

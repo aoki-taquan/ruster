@@ -750,6 +750,9 @@ impl Drop for RouteFd {
     }
 }
 
+/// `EINTR`.
+const EINTR_NUMBER: u16 = 4;
+
 fn errno_number() -> u16 {
     last_errno().raw().unwrap_or(0)
 }
@@ -830,7 +833,13 @@ fn linux_link_query(
             )
         };
         if received < 0 {
-            return Err(LinkQueryError::Receive(errno_number()));
+            let errno = errno_number();
+            if errno == EINTR_NUMBER {
+                // A signal before any byte: receive again (bounded by the
+                // datagram count; the answer stays queued).
+                continue;
+            }
+            return Err(LinkQueryError::Receive(errno));
         }
         let received = received as usize;
         if received > buffer.len() {

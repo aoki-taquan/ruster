@@ -148,8 +148,11 @@
 //! the kernel takes nothing from a down device's TX ring until the link
 //! returns, and AF_XDP has no way to take a published descriptor back, so
 //! waiting would block every publication for as long as the link stays
-//! down. Those frames do not block; each granted check adds them to the
-//! port's `quiescence_link_down_tx`. They stay in flight and complete (or
+//! down. Before it lets such a port pass, the check confirms the link is
+//! down with one fresh kick (outside the retry backoff): only `ENETDOWN`
+//! confirms; any other kick outcome clears the port's `link_down` and its
+//! TX blocks as usual. The gauge `tx_held_on_down_link` shows the frames a
+//! port whose link was last seen down holds. They stay in flight and complete (or
 //! are reported by the shutdown drain) as before: no frame is lost to the
 //! ledger. They already left every decision of the old generation (like
 //! frames in a NIC queue at any publication) and leave when the link
@@ -455,12 +458,6 @@ pub struct XdpAdapterCounters {
     /// Settles on a down link that skipped the kick because the next retry
     /// was not due yet (the kick stays owed; no syscall, not a kick error).
     pub kick_retries_suppressed: u64,
-    /// TX frames in flight on this port while its link was down that a
-    /// granted publication quiescence check did not wait for (summed per
-    /// granted check, OPS-EXIT): the kernel holds them until the link
-    /// returns, so waiting would block every reload (`TxInFlight`) for as
-    /// long as the link stays down.
-    pub quiescence_link_down_tx: u64,
 }
 
 struct PortState<'memory> {
@@ -515,10 +512,14 @@ impl PortState<'_> {
             }
             self.kick_owed = true;
             if self.engine.tx_needs_wakeup() == Ok(NeedWakeup::NotRequired) {
+                // The kernel transmits without a kick: not a down link.
+                self.link_down = false;
                 return Ok(());
             }
             if self.engine.tx_unconsumed() == 0 {
-                // Consumed, completion pending on the kernel side.
+                // Consumed, completion pending on the kernel side: the
+                // kernel took the frames, so the link is not down.
+                self.link_down = false;
                 return Ok(());
             }
             if kicks == 0 {
@@ -543,7 +544,38 @@ impl PortState<'_> {
                     bump(&mut self.counters.kicks_link_down);
                     return Ok(());
                 }
-                Err(error) => return Err(XdpIoError::Kick { interface, error }),
+                Err(error) => {
+                    // Only `ENETDOWN` means the link is down (OPS-EXIT):
+                    // any other outcome of a kick clears it.
+                    self.link_down = false;
+                    return Err(XdpIoError::Kick { interface, error });
+                }
+            }
+        }
+    }
+
+    /// OPS-EXIT: whether this port's in-flight TX is held by a link that is
+    /// down *now*. A port the last settle saw down is probed with one
+    /// fresh kick, outside the retry backoff: only `ENETDOWN` confirms it;
+    /// any other outcome (sent, deferred, another errno) clears
+    /// `link_down` and the TX blocks the quiescence as usual. Cold: only a
+    /// pending publication's check calls this, one `sendto` per down port.
+    fn held_by_down_link(&mut self) -> bool {
+        if !self.link_down || self.engine.tx_inflight() == 0 {
+            return false;
+        }
+        if self.engine.tx_unconsumed() == 0 {
+            self.link_down = false;
+            return false;
+        }
+        match self.engine.wake_tx() {
+            Err(KickError::NetworkDown) => {
+                bump(&mut self.counters.kicks_link_down);
+                true
+            }
+            _ => {
+                self.link_down = false;
+                false
             }
         }
     }
@@ -1791,21 +1823,17 @@ impl PublicationQuiescence for XdpPacketIo<'_> {
                     frames: handoffs,
                 });
             }
+        }
+        // A link confirmed down by a fresh `ENETDOWN` kick holds its TX
+        // until the link returns: not waited for (OPS-EXIT item 2).
+        for index in 0..self.ports.len() {
+            let port = &mut self.ports[index];
             let in_flight = port.engine.tx_inflight();
-            // A down link (the last kick was `ENETDOWN`) holds its TX
-            // until the link returns: not waited for (OPS-EXIT item 2).
-            if in_flight != 0 && !port.link_down {
+            if in_flight != 0 && !port.held_by_down_link() {
                 return Err(XdpQuiescenceError::TxInFlight {
-                    interface,
+                    interface: port.config.interface,
                     frames: in_flight,
                 });
-            }
-        }
-        for port in self.ports.iter_mut() {
-            if port.link_down {
-                let held = u64::from(port.engine.tx_inflight());
-                port.counters.quiescence_link_down_tx =
-                    port.counters.quiescence_link_down_tx.saturating_add(held);
             }
         }
         Ok(PublicationQuiescenceGuard::new(self))
@@ -1932,7 +1960,10 @@ pub struct XdpCounters {
     pub kicks_link_down: u64,
     pub kick_budget_exhausted: u64,
     pub kick_retries_suppressed: u64,
-    pub quiescence_link_down_tx: u64,
+    /// Gauge (OPS-EXIT): TX frames in flight on a port whose link was last
+    /// seen down (its last kick was `ENETDOWN`); the kernel holds them
+    /// until the link returns and a publication does not wait for them.
+    pub tx_held_on_down_link: u64,
     // Ring occupancy gauges (one atomic load each, at stats time).
     /// Fill entries published and not yet taken by the kernel.
     pub fill_ring_occupancy: u64,
@@ -2021,7 +2052,11 @@ impl XdpCounters {
             kicks_link_down: adapter.kicks_link_down,
             kick_budget_exhausted: adapter.kick_budget_exhausted,
             kick_retries_suppressed: adapter.kick_retries_suppressed,
-            quiescence_link_down_tx: adapter.quiescence_link_down_tx,
+            tx_held_on_down_link: if port.link_down {
+                u64::from(engine.tx_inflight())
+            } else {
+                0
+            },
             fill_ring_occupancy: u64::from(engine.fill_occupancy()),
             rx_ring_occupancy: u64::from(engine.rx_occupancy()),
             tx_ring_unconsumed: u64::from(engine.tx_unconsumed()),
@@ -2097,7 +2132,7 @@ impl XdpCounters {
             kicks_link_down,
             kick_budget_exhausted,
             kick_retries_suppressed,
-            quiescence_link_down_tx,
+            tx_held_on_down_link,
             fill_ring_occupancy,
             rx_ring_occupancy,
             tx_ring_unconsumed,
@@ -2194,7 +2229,7 @@ impl XdpCounters {
         count("kicks_link_down", self.kicks_link_down);
         count("kick_budget_exhausted", self.kick_budget_exhausted);
         count("kick_retries_suppressed", self.kick_retries_suppressed);
-        count("quiescence_link_down_tx", self.quiescence_link_down_tx);
+        count("tx_held_on_down_link", self.tx_held_on_down_link);
         count("fill_ring_occupancy", self.fill_ring_occupancy);
         count("rx_ring_occupancy", self.rx_ring_occupancy);
         count("tx_ring_unconsumed", self.tx_ring_unconsumed);

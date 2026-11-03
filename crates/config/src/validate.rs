@@ -1246,6 +1246,7 @@ pub struct ValidatedConfigV1 {
     storage: RuntimeStorageShapeV1,
     backend: ValidatedBackendV1,
     reload_state: ReloadStateV1,
+    down_link_tx: crate::DownLinkTxV1,
     health: HealthV1,
     watch: WatchV1,
     exit_protection: ExitProtectionV1,
@@ -1277,6 +1278,13 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn reload_state(&self) -> ReloadStateV1 {
         self.reload_state
+    }
+
+    /// `[reload] down-link-tx` (OPS-EXIT), read from the document being
+    /// applied like [`Self::reload_state`].
+    #[must_use]
+    pub const fn reload_down_link_tx(&self) -> crate::DownLinkTxV1 {
+        self.down_link_tx
     }
 
     #[must_use]
@@ -2398,6 +2406,7 @@ fn validate_v1(
         storage,
         backend,
         reload_state: config.reload.unwrap_or_default().state,
+        down_link_tx: config.reload.unwrap_or_default().down_link_tx,
         health,
         watch,
         exit_protection,

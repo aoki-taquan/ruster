@@ -149,6 +149,9 @@ pub enum ReloadOutcome {
         /// Boxed (cold path, once per applied reload) to keep the enum small.
         carry: Option<Box<ApplyCarryCounts>>,
         counts: DocumentCounts,
+        /// TX frames held on down links the publication did not wait for
+        /// (OPS-EXIT); they leave when the link returns.
+        held_tx: u64,
     },
     /// Restart-required reasons, in plan order.
     Refused {
@@ -177,6 +180,7 @@ impl fmt::Display for ReloadOutcome {
                 flush,
                 carry,
                 counts,
+                held_tx,
             } => {
                 write!(
                     formatter,
@@ -229,10 +233,11 @@ impl fmt::Display for ReloadOutcome {
                                 .nat44_icmp
                                 .map_or("none", ruster_core::StateCarryOutcome::label),
                             outcomes.firewall.label(),
-                        )
+                        )?;
                     }
-                    None => formatter.write_str("code=APPLY_REPORT_MISSING"),
+                    None => formatter.write_str("code=APPLY_REPORT_MISSING")?,
                 }
+                write!(formatter, "; held-tx-on-down-links={held_tx}")
             }
             Self::Refused {
                 reasons,
@@ -341,6 +346,10 @@ pub struct Ready {
     share: Option<FragmentShareOvercommitted>,
     /// The watch settings of its document (OPS-LOG), applied with it.
     ops: Ops,
+    /// Its `[reload] down-link-tx` is `refuse` (OPS-EXIT).
+    refuse_held_tx: bool,
+    /// TX frames held on down links when its candidate was taken.
+    held_tx: u64,
 }
 
 /// The preparer's answer to one request (formatted on the worker thread,
@@ -448,6 +457,8 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             counts: DocumentCounts::of(&next),
             sweep: config_cmd::sweep_warnings(&next),
             share: config_cmd::fragment_share_warning(&next),
+            refuse_held_tx: next.reload_down_link_tx() == ruster_config::DownLinkTxV1::Refuse,
+            held_tx: 0,
         };
         self.next = Some((next, ops));
         Prepared::Ready(Box::new(ready))
@@ -774,6 +785,8 @@ impl Reloader {
                 sweep: [None, None],
                 share: None,
                 ops: self.ops,
+                refuse_held_tx: false,
+                held_tx: 0,
             }),
             since: MonotonicMillis(0),
         };
@@ -781,11 +794,23 @@ impl Reloader {
 
     /// Takes the pending candidate for the publication phase of this tick;
     /// the rest stays until [`Self::finish`].
-    pub fn take_candidate(&mut self) -> Option<ValidatedCandidate> {
+    ///
+    /// `held`: TX frames held on down links that the publication does not
+    /// wait for (OPS-EXIT), shown in the `reload applied` line.
+    pub fn take_candidate(&mut self, held: u64) -> Option<ValidatedCandidate> {
         match &mut self.phase {
-            Phase::Pending { ready, .. } => ready.candidate.take(),
+            Phase::Pending { ready, .. } => {
+                ready.held_tx = held;
+                ready.candidate.take()
+            }
             _ => None,
         }
+    }
+
+    /// Whether the pending document refuses a reload while a down link
+    /// holds TX (`[reload] down-link-tx = "refuse"`, OPS-EXIT).
+    pub fn refuses_held_tx(&self) -> bool {
+        matches!(&self.phase, Phase::Pending { ready, .. } if ready.refuse_held_tx)
     }
 
     /// Ends the pending reload with the publication result of the tick
@@ -815,6 +840,7 @@ impl Reloader {
                     flush: report.map(|(_, flush, _)| flush),
                     carry: report.map(|(_, _, carry)| Box::new(carry)),
                     counts: ready.counts,
+                    held_tx: ready.held_tx,
                 }
             }
             TickApply::Rejected(error) => self.failed("apply", apply_code(error), generation),

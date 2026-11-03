@@ -254,6 +254,68 @@ fn a_fatal_event_still_applies_the_exit_actions() {
     host.assert_released();
 }
 
+/// Review M3 (interim posture): the kept privileges are refused without
+/// the syscall filter or the filesystem confinement.
+#[test]
+fn exit_protection_needs_the_filters_on() {
+    for (seccomp, fs, code) in [
+        (
+            SeccompMode::Off,
+            FsConfineMode::Landlock,
+            "EXIT_PROTECTION_NEEDS_SECCOMP",
+        ),
+        (
+            SeccompMode::Kill,
+            FsConfineMode::Off,
+            "EXIT_PROTECTION_NEEDS_FS_CONFINE",
+        ),
+    ] {
+        let host = FakeHost::default();
+        let mut settings = keep();
+        settings.seccomp = seccomp;
+        settings.fs_confine = fs;
+        let outcome = run_config(&host, protected(FORWARDING), settings, FIRST_LOOP_CHECK + 2);
+        assert_eq!(outcome.status, EXIT_INVALID, "{}", outcome.err);
+        assert!(
+            outcome.err.contains(&format!(
+                "invalid config: stage=exit-protection code={code} path=exit-protection\n"
+            )),
+            "{}",
+            outcome.err
+        );
+        assert!(host.events().is_empty());
+    }
+    // `--seccomp log` keeps a filter and is accepted.
+    let host = FakeHost::default();
+    let mut settings = keep();
+    settings.seccomp = SeccompMode::Log;
+    let outcome = run_config(&host, protected(FORWARDING), settings, FIRST_LOOP_CHECK + 2);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+}
+
+/// Review core L3: a panic after readiness (here in the drain) still runs
+/// the exit actions, through the guard's `Drop`, before any port closes.
+#[test]
+fn a_panic_after_readiness_runs_the_exit_actions_before_the_close() {
+    let host = FakeHost::default();
+    host.state.panic_in_drain.set(true);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_config(&host, protected(FORWARDING), keep(), FIRST_LOOP_CHECK + 2)
+    }));
+    assert!(result.is_err(), "the injected panic propagates");
+    host.assert_released();
+    let events = host.events();
+    let applied = events
+        .iter()
+        .position(|event| *event == Event::ExitApplied)
+        .expect("applied while unwinding");
+    let first_close = events
+        .iter()
+        .position(|event| matches!(event, Event::Close { .. }))
+        .expect("closed");
+    assert!(applied < first_close, "{events:?}");
+}
+
 /// OPS-EXIT item 4: outside the initial user namespace the startup warns
 /// once, value-free; inside it says nothing.
 #[test]
@@ -276,4 +338,51 @@ fn a_non_initial_user_namespace_is_warned() {
     let host = FakeHost::default();
     let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
     assert!(!outcome.err.contains("user namespace"), "{}", outcome.err);
+}
+
+/// Review core L2: once the exit actions closed an exposure, the exit
+/// warning says so: forwarding off rewords the forwarding warning, every
+/// link down drops the exposure warnings.
+#[test]
+fn exit_warnings_follow_what_the_exit_actions_closed() {
+    let run_with_forwarding = |config: &str| {
+        let host = FakeHost::default();
+        // Forwarding seen on the WAN port in every link round.
+        let on = Forwarding {
+            global: true,
+            device: false,
+            force: false,
+            multicast: false,
+        };
+        for _ in 0..1_000 {
+            host.state
+                .forwarding
+                .borrow_mut()
+                .push_back((IfId(WAN), Ok(on)));
+        }
+        run_config(&host, protected(config), keep(), FIRST_LOOP_CHECK + 20)
+    };
+    let plain = "kernel forwarding is enabled; detached ports may be forwarded by the kernel";
+    let outcome = run_with_forwarding("");
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(outcome.err.contains(plain), "{}", outcome.err);
+
+    let outcome = run_with_forwarding(FORWARDING);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(!outcome.err.contains(plain), "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("the ports' forwarding was turned off at exit"),
+        "{}",
+        outcome.err
+    );
+
+    let outcome = run_with_forwarding(BOTH);
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(
+        !outcome.err.contains("warning: kernel forwarding"),
+        "{}",
+        outcome.err
+    );
 }

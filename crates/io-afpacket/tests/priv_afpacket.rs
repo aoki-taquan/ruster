@@ -572,11 +572,11 @@ fn priv_afpacket_forwards_between_two_veth_ports_through_core_and_drains() {
     let down = io.port_stats(WAN).expect("WAN");
     assert!(down.link_down && down.kick_owed, "{down:?}");
     assert_eq!(down.tx_inflight, 3, "{down:?}");
-    // OPS-EXIT (AFPKT-017): TX held on the down link does not block a
-    // publication; the granted check counts it and the frames stay.
+    // OPS-EXIT (AFPKT-017): TX held on the down link (confirmed by a fresh
+    // ENETDOWN kick) does not block a publication; the frames stay.
     assert!(io.try_publication_quiescence().is_ok());
     let held = io.port_stats(WAN).expect("WAN");
-    assert_eq!(held.counters.quiescence_link_down_tx, 3, "{held:?}");
+    assert_eq!(held.tx_held_on_down_link, 3, "{held:?}");
     assert_eq!(held.tx_inflight, 3, "{held:?}");
     ip_link("up");
     let deadline = Instant::now() + Duration::from_secs(5);

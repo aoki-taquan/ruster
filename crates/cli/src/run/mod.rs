@@ -575,7 +575,12 @@ where
     }
     // OPS-EXIT: refuse exit actions the privilege policy would defeat,
     // before any resource.
-    if let Err(refusal) = exit_guard::preflight(config.exit_protection(), settings.privileges) {
+    if let Err(refusal) = exit_guard::preflight(
+        config.exit_protection(),
+        settings.privileges,
+        settings.seccomp,
+        settings.fs_confine,
+    ) {
         let _ = writeln!(
             err,
             "ruster run: invalid config: stage=exit-protection code={} path={}",
@@ -1135,11 +1140,37 @@ where
     datapath.refresh();
     // OPS-EXIT: after the drain (which needs the links up) and before the
     // ports are detached or closed.
-    let exit_failed = exit.fire().is_some_and(|report| {
-        for line in exit_guard::report_lines(&report) {
+    let report = exit.fire();
+    if let Some(report) = &report {
+        for line in exit_guard::report_lines(report) {
             let _ = writeln!(err, "ruster run: {line}");
         }
-        !report.failures.is_empty()
+    }
+    let exit_failed = report
+        .as_ref()
+        .is_some_and(|report| !report.failures.is_empty());
+    // Which exit action closed which exposure, for the warnings below
+    // (review core L2): every port's link down leaves the kernel nothing
+    // to act on; every port's forwarding off stops forwarding what the
+    // ports receive.
+    let ports = u32::try_from(datapath.port_count()).unwrap_or(u32::MAX);
+    let closed = |action, done: u32| {
+        report.as_ref().is_some_and(|report| {
+            done == ports
+                && !report
+                    .failures
+                    .iter()
+                    .any(|failure| failure.action == action)
+        })
+    };
+    let links_down = report
+        .as_ref()
+        .is_some_and(|report| closed(exit_guard::ExitAction::LinkDown, report.link_down));
+    let forwarding_off = report.as_ref().is_some_and(|report| {
+        closed(
+            exit_guard::ExitAction::Ipv4ForwardingOff,
+            report.forwarding_off,
+        )
     });
     finish_workers(workers, workers_deadline, err);
     // AF_XDP: the ports are about to be detached, so whatever the kernel
@@ -1177,13 +1208,20 @@ where
             "kernel IPv6 routes lead out of a port; detached ports may be routed by the kernel",
         ),
     ] {
-        if seen {
+        if seen && !links_down {
             if packet {
                 let condition = line.split(';').next().unwrap_or(line);
                 let _ = writeln!(
                     err,
                     "ruster run: warning: {condition}; the kernel acts on every frame of the \
                      AF_PACKET ports, also now that the router stops"
+                );
+            } else if forwarding_off && line.starts_with("kernel forwarding is enabled") {
+                let _ = writeln!(
+                    err,
+                    "ruster run: warning: kernel forwarding is enabled; the ports' forwarding \
+                     was turned off at exit, but the kernel may still route other \
+                     interfaces' traffic out of them"
                 );
             } else {
                 let _ = writeln!(err, "ruster run: warning: {line}");

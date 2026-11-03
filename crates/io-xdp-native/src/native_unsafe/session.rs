@@ -444,12 +444,25 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         if config.queue() >= link.tx_queues {
             return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));
         }
-        // The active count narrows the allocated one where sysfs proves to
-        // describe this device; another namespace's view is not consulted.
-        if syscalls.tx_queue_probe(config.interface_name_bytes(), ifindex, config.queue())
-            == TxQueueProbe::Absent
-        {
-            return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));
+        // The allocated count is an upper bound of the active one
+        // (`real_num_tx_queues`, which rtnetlink does not report). A device
+        // with one allocated TX queue has exactly queue 0 active; otherwise
+        // the active count comes from sysfs where its view proves to be
+        // this device (ifindex), and a view that cannot be proven fails
+        // closed (OPS-EXIT review M2).
+        if link.tx_queues > 1 {
+            match syscalls.tx_queue_probe(config.interface_name_bytes(), ifindex, config.queue()) {
+                TxQueueProbe::Present => {}
+                TxQueueProbe::Absent => {
+                    return Err(fail(SessionStage::TxQueueCheck, SessionFailure::NoTxQueue));
+                }
+                TxQueueProbe::Unverifiable => {
+                    return Err(fail(
+                        SessionStage::TxQueueCheck,
+                        SessionFailure::TxQueueUnverifiable,
+                    ));
+                }
+            }
         }
         // The TX length bound of the core adapter (mtu + Ethernet header):
         // read once here, before any resource.

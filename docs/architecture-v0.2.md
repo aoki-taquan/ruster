@@ -3588,8 +3588,11 @@ callerのnetnsの`NETLINK_ROUTE` socketから解決済みindexの`RTM_GETLINK`�
 XDP-181。sysfsのviewはmountしたnetnsのもので、`setns`後のprocessには別namespaceのdeviceが見える）、
 `IFLA_IFNAME`が設定名であること、`queue < IFLA_NUM_TX_QUEUES`（割当数）を要求し、無ければ
 `SessionFailure::NoTxQueue`、queryの失敗はtyped `SessionFailure::LinkQuery(LinkQueryError)`で拒否します。
-`ethtool -L`で減ったactive数（`real_num_tx_queues`、rtnetlinkは出さない）はsysfsのviewがこのdeviceを
-示す（`ifindex`一致）ときだけ`queues/tx-<queue>`で狭め、別netnsのviewは参照しません。runtimeの`ethtool -L`などで後からTX queueを失ったstallの検出は
+`IFLA_NUM_TX_QUEUES`が1ならqueue 0だけが在り、そのまま証明されます。2以上では`ethtool -L`で減り得る
+active数（`real_num_tx_queues`、rtnetlinkは出さない。ethtool netlinkの`CHANNELS_GET`はdriverごとに
+channelとqueueの対応が違うので採らない）をsysfsのviewがこのdeviceを
+示す（`ifindex`一致）ときだけ`queues/tx-<queue>`で確かめ、証明できないviewは`TxQueueUnverifiable`で
+fail closedです（review M2）。runtimeの`ethtool -L`などで後からTX queueを失ったstallの検出は
 X04のhealthです。
 
 **kernel-trustの限界**: copy modeでは`xsk_poll`もtransmit loopを回すので`wake_fill()`もTXを進めます。
@@ -4108,9 +4111,33 @@ sysctlの書き込みごとに（`proc_sys_call_handler`、drop前に開いたfd
 同じ）ます。既定のdrop後はどのthreadもそれを持たないので、どちらのkeyも`--keep-privileges`の時だけ
 受け付けます（`EXIT_FORWARDING_NEEDS_PRIVILEGES`/`EXIT_LINK_DOWN_NEEDS_PRIVILEGES`でexit 2）。
 一つのthreadだけに`CAP_NET_ADMIN`を残す案は、全threadのdrop検証（CLI-090）を崩し、同じaddress spaceの
-code実行には無意味なので採りません。drop前にforkした特権helper processがpipeのEOFでactionを実行する案は
-`SIGKILL`やseccomp killも覆えますが、特権processを常駐させるので見送り（residual）、代わりにsupervisorの
-`ExecStopPost=`をrunbookで案内します。actionはreadinessの直前にarmし、shutdown drain（link upでTXを
+code実行には無意味なので採りません。暫定のposture（下のhelperのowner決定まで）: `--keep-privileges`は全
+threadに全capabilityを残すので、`[exit-protection]`は`--seccomp off`（`EXIT_PROTECTION_NEEDS_SECCOMP`）と
+`--fs-confine off`（`EXIT_PROTECTION_NEEDS_FS_CONFINE`）を起動時にexit 2で拒否します（filterが`execve`、
+`ptrace`、`mount`、BPF load、NETLINK_ROUTE以外のsocket、書き込みopenを止め、Landlockが読めるfileを限る）。
+既定のdropのままの運用にはsupervisorの`ExecStopPost=`をrunbookで案内します。
+
+**提案（owner決定待ち、未実装）: exit helper process。** 目標は既定のdropのまま、`SIGKILL`、seccomp kill、
+OOMを含む全exitでexit actionを走らせること。設計:
+1. 起動の最初、threadが一つの間に、`/proc/self/exe`を`ruster run --exit-helper`（内部mode、CLI
+   helpに出さない）として`execve`し直したchildを作る（forkしたままのcopyではなく再exec: 親のheap、key
+   source、configを持たない）。親と子はpipe一本（子はread端だけ、親はwrite端だけ、`O_CLOEXEC`）と
+   ack用pipe一本を共有し、他のfdは子のexec前に閉じる。
+2. 子は自分のcapabilityを`CAP_NET_ADMIN`だけにし（bounding setも）、`PR_SET_NO_NEW_PRIVS`、
+   `PR_SET_DUMPABLE` 0、`PR_SET_PDEATHSIG`は使わない（pipeのEOFで十分）、`SIGTERM`/`SIGINT`/`SIGHUP`を
+   無視する（supervisorの停止signalがcgroup全体へ届いても親の後に動ける）。自分専用の極小seccomp
+   allowlist（`read`、`write`、`sendto`/`recvfrom`/`getsockname`のNETLINK_ROUTE、`exit_group`）と
+   Landlock（`/proc/sys/net/ipv4/conf/<port>/forwarding`の書き込みだけ）を、actionに要るfdとsocketを開いた
+   後に入れる。
+3. 親はreadinessの時に「arm: actionとportのifindex/名前」を一回送る（armされなければ子は何もせず終わる =
+   serveしなかったportは触らない）。exitでは親がdrainの後、detachの前に「fire」の1 byteを送り、子の
+   ackを有界（例: 1 s）に待ってからdetachする。親が殺されればpipeのEOFが「fire」の代わりになる（detach
+   後数msの窓は残る）。
+4. fail closed: 子が起動時に死ぬ・armに答えない・ackが期限内に来ない時は、起動を失敗にする（armの前）か
+   `EXIT_PROTECTION_FAILED`でexit 1（exitの時）。子のexitはcgroupに残らず、supervisorの`KillMode=`でも
+   実行後に終わる。
+費用: 常駐する特権process（`CAP_NET_ADMIN`だけ、入力はpipeの数byteだけ）とsupervisorとの相互作用
+（`NotifyAccess=main`、cgroupのprocess数）。決まるまで`[exit-protection]`は`--keep-privileges`専用です。actionはreadinessの直前にarmし、shutdown drain（link upでTXを
 完了させる）の後、datapathのdropとsessionのclose（detach）の前に一回だけ実行します。signal、fatal
 event、backend fault、invariant違反、panic（`ExitGuard`の`Drop`がunwind中、`OpenedPorts`のcloseより
 前）のどれでも走り、startupの失敗やcancelではarmされません（routerが一度もserveしなかったportは
@@ -4121,10 +4148,16 @@ down linkのTXとquiescence（OPS-EXIT item 2、XDP-180、AFPKT-017）: admin do
 ringを読まず（AF_XDPは`xsk_check_common`の`ENETDOWN`、AF_PACKETは`tpacket_snd`の`ENETDOWN`）、AF_XDPには
 公開済みdescriptorを取り戻すUAPIがありません（producerを巻き戻すとkernelが`cached_prod`までの古い
 slotを読む）。そのportのin-flight TXを待つとlinkが戻るまでreloadが`stage=quiesce code=TIMEOUT`になる
-ため、両adapterのquiescence checkは最後のkickが`ENETDOWN`だったportのin-flight TXを待たず、許可した
-checkごとに`quiescence_link_down_tx`へ数えます。frameはin flightのまま（ledgerから失われず、linkが
-戻れば送られる。shutdown drainの`tx-in-flight`は従来どおり）。frameは旧generationのdecisionをすべて
-終えたbyteで、NICのqueueにあるframeと同じくrouterは再判定しません（RFC neutral）。
+ため、両adapterのquiescence checkは最後のkickが`ENETDOWN`だったportを、その場の新しいkick一回
+（backoffの外）で確かめ、`ENETDOWN`の時だけそのin-flight TXを待ちません。`link_down`は最後のkickの
+`ENETDOWN`だけを意味し、他のどのkick結果（成功、deferral、他のerrno、kernelがdescriptorを消費済み、
+need-wakeup不要）でも消えます（review M1）。frameはin flightのまま（ledgerから失われず、linkが戻れば
+送られる。shutdown drainの`tx-in-flight`は従来どおり）、gauge `tx_held_on_down_link`と`reload applied`
+行の`held-tx-on-down-links=N`に出ます。frameは旧generationのdecisionをすべて終えたbyteで、NICのqueue
+にあるframeと同じくrouterは再判定しません（RFC neutral、既定`[reload] down-link-tx = "send"`）。
+hardeningの`"refuse"`はそのreloadを`stage=quiesce code=DOWN_LINK_TX_HELD`で拒否し、restart（held frameを
+捨てる）で適用させます。
 
-非initial user namespace（OPS-EXIT item 4、CLI-146）: `/proc/self/uid_map`が`0 0 4294967295`の一行で
-なければ起動時に`USER_NAMESPACE_NOT_INITIAL`をwarningします（`CapEff`は所有するnamespaceにしか効かない）。
+非initial user namespace（OPS-EXIT item 4、CLI-146）: `/proc/self/ns/user`のinodeが`PROC_USER_INIT_INO`
+（`0xEFFFFFFD`）でなければ（読めなければ`/proc/self/uid_map`が`0 0 4294967295`の一行でなければ）起動時に
+`USER_NAMESPACE_NOT_INITIAL`をwarningします（`CapEff`は所有するnamespaceにしか効かない）。

@@ -60,10 +60,19 @@
 use std::fmt;
 
 use ruster_config::ExitProtectionV1;
+
+// The panic path of the exit actions is the guard's `Drop` while the panic
+// unwinds; with `panic = "abort"` it would never run.
+#[cfg(panic = "abort")]
+compile_error!(
+    "ruster run needs panic = \"unwind\": the exit protection runs while a panic unwinds"
+);
 use ruster_core::IfId;
 
+use super::fs_confine::FsConfineMode;
 use super::netlink::NetlinkError;
 use super::privileges::PrivilegePolicy;
+use super::seccomp::SeccompMode;
 use super::startup::token;
 
 /// One exit action.
@@ -94,6 +103,10 @@ pub enum ExitError {
     ShortWrite,
     /// The rtnetlink request failed.
     Netlink(NetlinkError),
+    /// After its sysctl file was opened, the port's name no longer
+    /// resolves to the port's interface index (a rename or a replacement
+    /// between the startup checks and the open).
+    Renamed,
     /// A failure injected by a test host.
     #[cfg(test)]
     Injected,
@@ -104,6 +117,7 @@ impl fmt::Display for ExitError {
         match self {
             Self::Errno(errno) => write!(formatter, "ERRNO_{errno}"),
             Self::ShortWrite => formatter.write_str("SHORT_WRITE"),
+            Self::Renamed => formatter.write_str("RENAMED"),
             Self::Netlink(NetlinkError::Kernel(error)) => {
                 write!(formatter, "KERNEL_{}", error.unsigned_abs())
             }
@@ -163,6 +177,12 @@ pub enum ExitPreflight {
     LinkDownNeedsPrivileges,
     /// `ipv4-forwarding-off` without `--keep-privileges`.
     ForwardingNeedsPrivileges,
+    /// Either key with `--seccomp off`: the kept privileges would run with
+    /// no syscall filter.
+    NeedsSeccomp,
+    /// Either key with `--fs-confine off`: the kept privileges would run
+    /// with the whole filesystem view.
+    NeedsFsConfine,
 }
 
 impl ExitPreflight {
@@ -170,6 +190,8 @@ impl ExitPreflight {
         match self {
             Self::LinkDownNeedsPrivileges => "EXIT_LINK_DOWN_NEEDS_PRIVILEGES",
             Self::ForwardingNeedsPrivileges => "EXIT_FORWARDING_NEEDS_PRIVILEGES",
+            Self::NeedsSeccomp => "EXIT_PROTECTION_NEEDS_SECCOMP",
+            Self::NeedsFsConfine => "EXIT_PROTECTION_NEEDS_FS_CONFINE",
         }
     }
 
@@ -177,6 +199,7 @@ impl ExitPreflight {
         match self {
             Self::LinkDownNeedsPrivileges => "exit-protection.link-down",
             Self::ForwardingNeedsPrivileges => "exit-protection.ipv4-forwarding-off",
+            Self::NeedsSeccomp | Self::NeedsFsConfine => "exit-protection",
         }
     }
 
@@ -184,31 +207,54 @@ impl ExitPreflight {
     pub const fn hint(self) -> &'static str {
         match self {
             Self::LinkDownNeedsPrivileges => {
-                "setting a link down needs CAP_NET_ADMIN at exit; run with --keep-privileges, \
-                 use ipv4-forwarding-off, or set the link down in the supervisor's post-stop hook"
+                "setting a link down needs CAP_NET_ADMIN at exit; run with --keep-privileges \
+                 (every capability stays on every thread), or set the link down in the \
+                 supervisor's post-stop hook"
             }
             Self::ForwardingNeedsPrivileges => {
                 "writing the forwarding sysctl needs CAP_NET_ADMIN at exit; run with \
-                 --keep-privileges, or write it in the supervisor's post-stop hook"
+                 --keep-privileges (every capability stays on every thread), or write it in \
+                 the supervisor's post-stop hook"
+            }
+            Self::NeedsSeccomp => {
+                "exit protection keeps every capability; it is refused without the syscall \
+                 filter (use --seccomp kill or log)"
+            }
+            Self::NeedsFsConfine => {
+                "exit protection keeps every capability; it is refused without the filesystem \
+                 confinement (use --fs-confine landlock)"
             }
         }
     }
 }
 
 /// Whether `protection` can work under `policy`: every exit action needs
-/// `CAP_NET_ADMIN` at exit, so only `--keep-privileges` keeps it.
+/// `CAP_NET_ADMIN` at exit, so only `--keep-privileges` keeps it. Since
+/// that keeps every capability on every thread, the interim posture
+/// (until the owner decides on the helper process, see the architecture
+/// document) also refuses it without the syscall filter or the
+/// filesystem confinement (fail closed).
 pub fn preflight(
     protection: ExitProtectionV1,
     policy: PrivilegePolicy,
+    seccomp: SeccompMode,
+    fs_confine: FsConfineMode,
 ) -> Result<(), ExitPreflight> {
-    if policy == PrivilegePolicy::Keep {
+    if !protection.any() {
         return Ok(());
     }
-    if protection.link_down {
-        return Err(ExitPreflight::LinkDownNeedsPrivileges);
+    if policy != PrivilegePolicy::Keep {
+        return Err(if protection.link_down {
+            ExitPreflight::LinkDownNeedsPrivileges
+        } else {
+            ExitPreflight::ForwardingNeedsPrivileges
+        });
     }
-    if protection.ipv4_forwarding_off {
-        return Err(ExitPreflight::ForwardingNeedsPrivileges);
+    if seccomp == SeccompMode::Off {
+        return Err(ExitPreflight::NeedsSeccomp);
+    }
+    if fs_confine == FsConfineMode::Off {
+        return Err(ExitPreflight::NeedsFsConfine);
     }
     Ok(())
 }
@@ -310,20 +356,66 @@ mod tests {
         };
         let off = ExitProtectionV1::default();
         for policy in [PrivilegePolicy::Keep, drop, switch] {
-            assert_eq!(preflight(off, policy), Ok(()));
+            assert_eq!(
+                preflight(off, policy, SeccompMode::Off, FsConfineMode::Off),
+                Ok(())
+            );
         }
-        assert_eq!(preflight(BOTH, PrivilegePolicy::Keep), Ok(()));
-        assert_eq!(preflight(FORWARDING, PrivilegePolicy::Keep), Ok(()));
+        assert_eq!(
+            preflight(
+                BOTH,
+                PrivilegePolicy::Keep,
+                SeccompMode::Kill,
+                FsConfineMode::Landlock
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            preflight(
+                FORWARDING,
+                PrivilegePolicy::Keep,
+                SeccompMode::Log,
+                FsConfineMode::Landlock
+            ),
+            Ok(())
+        );
         for policy in [drop, switch] {
             assert_eq!(
-                preflight(BOTH, policy),
+                preflight(BOTH, policy, SeccompMode::Kill, FsConfineMode::Landlock),
                 Err(ExitPreflight::LinkDownNeedsPrivileges)
             );
             assert_eq!(
-                preflight(FORWARDING, policy),
+                preflight(
+                    FORWARDING,
+                    policy,
+                    SeccompMode::Kill,
+                    FsConfineMode::Landlock
+                ),
                 Err(ExitPreflight::ForwardingNeedsPrivileges)
             );
         }
+        assert_eq!(
+            preflight(
+                BOTH,
+                PrivilegePolicy::Keep,
+                SeccompMode::Off,
+                FsConfineMode::Landlock
+            ),
+            Err(ExitPreflight::NeedsSeccomp)
+        );
+        assert_eq!(
+            preflight(
+                BOTH,
+                PrivilegePolicy::Keep,
+                SeccompMode::Kill,
+                FsConfineMode::Off
+            ),
+            Err(ExitPreflight::NeedsFsConfine)
+        );
+        assert_eq!(
+            ExitPreflight::NeedsSeccomp.code(),
+            "EXIT_PROTECTION_NEEDS_SECCOMP"
+        );
         assert_eq!(
             ExitPreflight::LinkDownNeedsPrivileges.code(),
             "EXIT_LINK_DOWN_NEEDS_PRIVILEGES"

@@ -631,13 +631,15 @@ fn af_packet_quiescence_waits_for_in_flight_tx_and_then_admits_a_publication() {
     );
     live.kernel_completes(1);
     assert_eq!(live.engine.quiescence_check(), Ok(()));
-    assert_eq!(live.port(WAN).counters.quiescence_link_down_tx, 0);
+    assert_eq!(live.port(WAN).tx_held_on_down_link, 0);
 }
 
-/// OPS-EXIT item 2: TX held on a down link (`ENETDOWN`) does not block a
-/// publication; each granted check counts it, the frames stay published
-/// and leave once the link returns. TX of a port whose link is up still
-/// blocks.
+/// OPS-EXIT item 2: TX held on a down link (`ENETDOWN`, confirmed by a
+/// fresh kick at each check) does not block a publication; the frames stay
+/// published (gauge `tx_held_on_down_link`) and leave once the link
+/// returns. Review M1: any other kick outcome (a successful kick, a
+/// deferral, another errno) clears `link_down`, and TX in flight blocks
+/// again.
 #[test]
 fn af_packet_quiescence_does_not_wait_for_tx_held_on_a_down_link() {
     let mut live = Live::new();
@@ -645,19 +647,33 @@ fn af_packet_quiescence_does_not_wait_for_tx_held_on_a_down_link() {
     live.clock(0);
     assert_eq!(live.generate(WAN, 2, 60), 2);
     assert!(live.port(WAN).link_down);
+    let _ = live.kicks();
     assert_eq!(live.engine.quiescence_check(), Ok(()));
-    assert_eq!(live.engine.quiescence_check(), Ok(()));
+    assert_eq!(
+        live.kicks(),
+        [(WAN_FD, Err(ENETDOWN))],
+        "confirmed by a fresh kick"
+    );
     let wan = live.port(WAN);
     assert_eq!(wan.tx_inflight, 2, "frames stay published");
-    assert_eq!(wan.counters.quiescence_link_down_tx, 4);
-    assert_eq!(
-        live.engine.backend_stats().counters.quiescence_link_down_tx,
-        4
-    );
-    // The link returns: the next due retry sends; until the kernel
-    // completes, the frames block again like any in-flight TX.
+    assert_eq!(wan.tx_held_on_down_link, 2);
+    assert_eq!(live.engine.backend_stats().tx_held_on_down_link, 2);
+    // Another errno on the confirming kick: not a down link any more.
     live.fail_kicks_persistently(None);
-    live.clock(256);
+    live.fail_kicks(&[EIO]);
+    assert_eq!(
+        live.engine.quiescence_check(),
+        Err(AfPacketQuiescenceError::TxInFlight { frames: 2 })
+    );
+    let wan = live.port(WAN);
+    assert!(!wan.link_down);
+    assert_eq!(wan.tx_held_on_down_link, 0);
+    // Down again, then a kick that succeeds (the link returned): the frames
+    // block until the kernel completes them.
+    live.fail_kicks(&[ENETDOWN]);
+    live.clock(1_000);
+    let _ = live.engine.live_receive(1).expect("receive").finish();
+    assert!(live.port(WAN).link_down);
     assert_eq!(
         live.engine.quiescence_check(),
         Err(AfPacketQuiescenceError::TxInFlight { frames: 2 })

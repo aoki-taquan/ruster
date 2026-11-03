@@ -89,7 +89,10 @@ pub enum LinkQueryError {
     /// The answer described another interface index.
     UnexpectedLink,
     /// The answer's `IFLA_IFNAME` is not the configured name (the index
-    /// was renamed or reused between the lookup and the query).
+    /// was renamed or reused between the lookup and the query). An
+    /// alternative name (`ip link property add ... altname`) resolves to
+    /// the index but is not `IFLA_IFNAME`, so a config that names a port
+    /// by its altname is refused here: use the primary name.
     NameMismatch,
     /// The kernel refused the request with this (negative) error;
     /// `-19` (`ENODEV`) means the index is gone.

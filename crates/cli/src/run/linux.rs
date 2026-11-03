@@ -49,7 +49,14 @@ impl PortHost for LinuxHost {
     type Links = NetlinkLinks;
     type Exit = LinuxExit;
 
+    /// Exact: the inode of `/proc/self/ns/user` is the initial user
+    /// namespace's fixed `PROC_USER_INIT_INO` (review L4). Fallback when it
+    /// cannot be read: the identity `uid_map`.
     fn initial_user_namespace(&self) -> Option<bool> {
+        use std::os::unix::fs::MetadataExt as _;
+        if let Ok(metadata) = std::fs::metadata("/proc/self/ns/user") {
+            return Some(metadata.ino() == PROC_USER_INIT_INO);
+        }
         std::fs::read_to_string("/proc/self/uid_map")
             .ok()
             .map(|map| is_initial_uid_map(&map))
@@ -459,6 +466,10 @@ impl<'s> Datapath for XdpDatapath<'s> {
     fn tx_outstanding(&self) -> bool {
         self.io.tx_outstanding()
     }
+
+    fn held_tx_on_down_links(&self) -> u64 {
+        self.io.backend_stats().counters.tx_held_on_down_link
+    }
 }
 
 impl ClockedIo for AfPacketIo {
@@ -566,7 +577,15 @@ impl Datapath for PacketDatapath {
     fn tx_outstanding(&self) -> bool {
         self.io.tx_outstanding()
     }
+
+    fn held_tx_on_down_links(&self) -> u64 {
+        self.io.backend_stats().tx_held_on_down_link
+    }
 }
+
+/// `PROC_USER_INIT_INO` (`include/linux/proc_ns.h`): the inode of the
+/// initial user namespace's `nsfs` file.
+const PROC_USER_INIT_INO: u64 = 0xEFFF_FFFD;
 
 /// Whether `/proc/self/uid_map` is the initial user namespace's: one
 /// extent mapping every uid onto itself (`0 0 4294967295`).
@@ -604,6 +623,15 @@ impl LinuxExit {
                     .write(true)
                     .open(path)
                     .map_err(|error| fail(io_error(&error)))?;
+                // The name the path was built from must still be the
+                // port's index after the open (review L1).
+                let mut probe =
+                    LinkProbe::open().map_err(|error| fail(ExitError::Netlink(error)))?;
+                match probe.resolve(target.name) {
+                    Ok((ifindex, _)) if ifindex == target.ifindex => {}
+                    Ok(_) => return Err(fail(ExitError::Renamed)),
+                    Err(error) => return Err(fail(ExitError::Netlink(error))),
+                }
                 forwarding.push((target.interface, file));
             }
         }

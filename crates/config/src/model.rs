@@ -143,6 +143,25 @@ pub struct WatchV1 {
 pub struct ReloadV1 {
     #[serde(default)]
     pub state: ReloadStateV1,
+    /// What a reload does while a port whose link is down holds TX
+    /// (OPS-EXIT); absent means [`DownLinkTxV1::Send`].
+    #[serde(default)]
+    pub down_link_tx: DownLinkTxV1,
+}
+
+/// `[reload] down-link-tx` (OPS-EXIT): TX frames a port whose link is down
+/// still holds (the kernel sends them when the link returns, AF_XDP cannot
+/// take them back) do not block a reload. `send` (the default) applies the
+/// reload and lets them leave when the link returns, possibly after the
+/// new generation is active; `refuse` is the hardening: such a reload is
+/// refused (`code=DOWN_LINK_TX_HELD`) and a restart (which discards them)
+/// applies the change.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DownLinkTxV1 {
+    #[default]
+    Send,
+    Refuse,
 }
 
 /// `[reload] state`: whether an applied reload keeps NAT44 mappings and

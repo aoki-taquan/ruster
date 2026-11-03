@@ -3119,10 +3119,21 @@ wait_line txfull "reload applied: generation=2 previous=1"
 if grep -q "stage=quiesce" "$work/txfull.err"; then
     fail "txfull: the reload waited for the down link's TX"
 fi
-wait_stat_ge txfull if2.af_xdp_port.quiescence_link_down_tx 128
-latest_block txfull
-block_has "$work/txfull.block" if2.af_xdp_port.tx_inflight=128 observer.generation=2
-echo "priv_run_txfull_reload: SIGHUP while rb was down with 128 frames held applied generation 2 without waiting (if2 quiescence_link_down_tx=$(stat_in "$work/txfull.block" if2.af_xdp_port.quiescence_link_down_tx)), the 128 frames still in flight verified"
+grep -q "reload applied: generation=2 previous=1; .*; held-tx-on-down-links=128" \
+    "$work/txfull.err" || fail "txfull: the reload line does not count the 128 held frames"
+wait_block txfull observer.generation=2
+block_has "$work/txfull.block" if2.af_xdp_port.tx_inflight=128 \
+    if2.af_xdp_port.tx_held_on_down_link=128
+# The strict `[reload] down-link-tx = "refuse"` refuses the same reload
+# while the frames are held; generation 2 keeps running.
+cp "$work/txfull.toml" "$work/txfull-strict.toml"
+printf '\n[reload]\ndown-link-tx = "refuse"\n' >>"$work/txfull-strict.toml"
+cp "$work/txfull.toml" "$work/txfull-default.toml"
+reload_with "$work/txfull-strict.toml" "$work/txfull.toml"
+wait_line txfull "stage=quiesce code=DOWN_LINK_TX_HELD; generation 2 keeps running"
+reload_with "$work/txfull-default.toml" "$work/txfull.toml"
+wait_line txfull "reload applied: generation=4 previous=2"
+echo "priv_run_txfull_reload: SIGHUP while rb was down with 128 frames held applied generation 2 without waiting (held-tx-on-down-links=128, gauge tx_held_on_down_link=128, the frames still in flight); with [reload] down-link-tx = \"refuse\" the next reload was refused (DOWN_LINK_TX_HELD), the default applied again verified"
 rm -f "$work/recv-txfull-backlog.out"
 in_ns "$host_b" python3 -I -c "$COUNT" 9001 "ruster-txfull-$suffix" 3 \
     >"$work/recv-txfull-backlog.out" 2>&1 &

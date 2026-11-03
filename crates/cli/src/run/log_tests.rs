@@ -345,7 +345,7 @@ const SAMPLES: &[(&str, &str, &str)] = &[
         "info",
     ),
     (
-        "ruster run: reload applied: generation=2 previous=1; interfaces=2 addresses=2 routes=3 neighbors=1 firewall-rules=3 nat44-ports=16; flushed dynamic-neighbors=0 resolution-states=0 nat44-udp-mappings=0 nat44-tcp-sessions=0 firewall-flows=0; carried dynamic-neighbors=4 nat44-udp-mappings=1 nat44-tcp-sessions=0 nat44-icmp-mappings=0 firewall-flows=2 firewall-revoked=0; state arp=carried nat44-udp=carried nat44-tcp=carried nat44-icmp=none firewall=carried",
+        "ruster run: reload applied: generation=2 previous=1; interfaces=2 addresses=2 routes=3 neighbors=1 firewall-rules=3 nat44-ports=16; flushed dynamic-neighbors=0 resolution-states=0 nat44-udp-mappings=0 nat44-tcp-sessions=0 firewall-flows=0; carried dynamic-neighbors=4 nat44-udp-mappings=1 nat44-tcp-sessions=0 nat44-icmp-mappings=0 firewall-flows=2 firewall-revoked=0; state arp=carried nat44-udp=carried nat44-tcp=carried nat44-icmp=none firewall=carried; held-tx-on-down-links=0",
         "RELOAD_APPLIED",
         "info",
     ),
@@ -503,6 +503,11 @@ const SAMPLES: &[(&str, &str, &str)] = &[
         "info",
     ),
     (
+        "ruster run: exit protection keeps every capability; it is refused without the syscall filter",
+        "STARTUP_HINT",
+        "info",
+    ),
+    (
         "ruster run: warning: user namespace: code=USER_NAMESPACE_NOT_INITIAL (or unreadable)",
         "USER_NAMESPACE_NOT_INITIAL",
         "warn",
@@ -633,7 +638,7 @@ fn every_event_code_has_a_sample_and_classifies() {
          PRIVILEGES_KEPT PRIVILEGES_DROPPED FS_CONFINED FS_CONFINE_OFF \
          FS_CONFINE_WARNING SECCOMP_INSTALLED SECCOMP_LOG SECCOMP_OFF FLAG_OVERRIDDEN \
          STARTUP_RETRY STARTUP_CANCELLED STARTUP_FAILED STARTUP_HINT STARTUP_HINT STARTUP_HINT \
-         STARTUP_HINT STARTUP_HINT STARTUP_HINT STARTUP_HINT STARTUP_HINT SIGNAL_INSTALL_FAILED OUTPUT_THREAD_FAILED \
+         STARTUP_HINT STARTUP_HINT STARTUP_HINT STARTUP_HINT STARTUP_HINT STARTUP_HINT SIGNAL_INSTALL_FAILED OUTPUT_THREAD_FAILED \
          UNSUPPORTED_PLATFORM CONFIG_INVALID CONFIG_UNREADABLE CONFIG_REFUSED SHUTDOWN_DRAINING \
          DRAIN_FAILED CLOSE_FAILED SHUTDOWN_SUMMARY WARNING"
     );

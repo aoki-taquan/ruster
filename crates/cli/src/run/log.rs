@@ -250,6 +250,11 @@ pub static EVENTS: &[Rule] = &[
         "STARTUP_HINT",
         Info,
     ),
+    rule(
+        Prefix("exit protection keeps every capability"),
+        "STARTUP_HINT",
+        Info,
+    ),
     rule(Prefix("cannot install "), "SIGNAL_INSTALL_FAILED", Error),
     rule(
         Prefix("cannot start the output thread"),

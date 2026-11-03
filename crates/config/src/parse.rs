@@ -188,7 +188,8 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "tx-stall-fatal-ms",
     "tx-stall-warn-ms",
     "watch",
-    // OPS-EXIT `[exit-protection]`.
+    // OPS-EXIT `[exit-protection]` and `[reload] down-link-tx`.
+    "down-link-tx",
     "exit-protection",
     "ipv4-forwarding-off",
     "link-down",

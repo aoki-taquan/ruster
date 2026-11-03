@@ -181,7 +181,8 @@ fn a_reload_applies_at_a_tick_boundary_and_changes_the_traffic_outcome() {
         outcome.err.contains(
             "; carried dynamic-neighbors=0 nat44-udp-mappings=0 nat44-tcp-sessions=0 \
              nat44-icmp-mappings=0 firewall-flows=0 firewall-revoked=0; state arp=carried \
-             nat44-udp=carried nat44-tcp=carried nat44-icmp=none firewall=carried\n"
+             nat44-udp=carried nat44-tcp=carried nat44-icmp=none firewall=carried; \
+             held-tx-on-down-links=0\n"
         ),
         "{}",
         outcome.err
@@ -444,7 +445,10 @@ fn an_applied_reload_without_its_report_is_not_kept_running() {
         text.starts_with("reload applied: generation=2 previous=unknown;"),
         "{text}"
     );
-    assert!(text.ends_with("code=APPLY_REPORT_MISSING"), "{text}");
+    assert!(
+        text.ends_with("code=APPLY_REPORT_MISSING; held-tx-on-down-links=0"),
+        "{text}"
+    );
     assert!(!text.contains("keeps running"));
     assert_eq!(reloader.budgets().rx, 1, "the applied document is current");
     assert_eq!(reloader.counters().applied, 1);
@@ -1934,4 +1938,44 @@ fn a_json_run_writes_one_valid_object_per_line() {
     }
     let text_out = String::from_utf8(text_out).expect("utf-8");
     assert_eq!(text_out.matches("ruster-run-stats ").count(), stats.len());
+}
+
+/// OPS-EXIT (review L4): TX held on a down link does not block a reload by
+/// default and the `reload applied` line counts it; with
+/// `[reload] down-link-tx = "refuse"` in the reloaded document the reload
+/// is refused at once (`stage=quiesce code=DOWN_LINK_TX_HELD`) and
+/// generation 1 keeps running.
+#[test]
+fn held_tx_on_a_down_link_is_sent_later_by_default_and_refused_when_strict() {
+    let host = FakeHost::default();
+    host.state.held_tx.set(7);
+    let source = FakeSource::with([Ok(echo_off())]);
+    let outcome = ops(&host, source, &StopAfterTicks::new(&host, 30, &[5]));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("ruster run: reload applied: generation=2 previous=1;")
+            && outcome.err.contains("; held-tx-on-down-links=7\n"),
+        "{}",
+        outcome.err
+    );
+
+    let strict = edited(|text| {
+        text.replace("echo-reply = true", "echo-reply = false")
+            + "\n[reload]\ndown-link-tx = \"refuse\"\n"
+    });
+    let host = FakeHost::default();
+    host.state.held_tx.set(7);
+    let source = FakeSource::with([Ok(strict)]);
+    let outcome = ops(&host, source, &StopAfterTicks::new(&host, 30, &[5]));
+    assert_eq!(outcome.status, 0, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("stage=quiesce code=DOWN_LINK_TX_HELD; generation 1 keeps running"),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains("reload applied"), "{}", outcome.err);
 }

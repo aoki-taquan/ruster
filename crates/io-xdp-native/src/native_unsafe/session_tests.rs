@@ -1889,13 +1889,42 @@ fn native_session_refuses_a_queue_without_tx_queue_before_any_resource() {
     }
 }
 
-/// OPS-EXIT item 3: a sysfs view that is not this device's (another
-/// network namespace) is not consulted; rtnetlink decides.
+/// OPS-EXIT item 3 (review M2): a sysfs view that is not this device's
+/// (another network namespace) fails closed when the device has more than
+/// one allocated TX queue; with exactly one, queue 0 is proven by
+/// rtnetlink alone and sysfs is not read.
 #[test]
-fn native_session_ignores_an_unproven_sysfs_view() {
+fn native_session_fails_closed_on_an_unproven_sysfs_view_of_a_multi_queue_device() {
     let fake = SessionFake::new();
     fake.tx_queue.set(TxQueueProbe::Unverifiable);
-    let mut session = SessionCore::open(&fake, &config(XDP_COPY)).expect("open");
+    let error = SessionCore::open(&fake, &config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("refused");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (
+            SessionStage::TxQueueCheck,
+            SessionFailure::TxQueueUnverifiable
+        )
+    );
+    assert_eq!(fake.len.get(), 1);
+    assert_eq!(fake.open_fds.get(), 0);
+
+    let fake = SessionFake::new();
+    fake.tx_queue.set(TxQueueProbe::Absent);
+    fake.link.set(Ok(crate::LinkAttributes {
+        mtu: 1_500,
+        tx_queues: 1,
+    }));
+    let queue_zero = SessionConfig::new(
+        "veth0",
+        0,
+        ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | XDP_COPY).expect("valid flags"),
+        RingConfig::new(64, 128, 64, 256).expect("valid rings"),
+        umem(),
+    )
+    .expect("valid session config");
+    let mut session = SessionCore::open(&fake, &queue_zero).expect("one TX queue: queue 0");
     let _ = session.rings().expect("rings");
     session.close().expect("teardown");
     assert_eq!(fake.open_fds.get(), 0);
