@@ -22,11 +22,11 @@ use ruster_core::{
 };
 
 use crate::publication::{
-    FirewallPublicationInput, FragmentTrackingStoragePlan, FragmentationStoragePlan,
-    FullServiceStorageShape, Icmpv4ErrorStorageShape, Nat44IcmpPublicationInput,
-    Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan, Nat44UdpPublicationInput,
-    Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan, ResolutionStorageShape,
-    RuntimeService, ValidatedCandidate,
+    ArpHoldStoragePlan, FirewallPublicationInput, FragmentTrackingStoragePlan,
+    FragmentationStoragePlan, FullServiceStorageShape, Icmpv4ErrorStorageShape,
+    Nat44IcmpPublicationInput, Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan,
+    Nat44UdpPublicationInput, Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan,
+    ResolutionStorageShape, RuntimeService, ValidatedCandidate,
 };
 
 /// How a [`PublicationKeySource`] obtains its keys.
@@ -314,6 +314,7 @@ impl ConfigBridgeError {
             Self::MissingService(RuntimeService::FragmentTracking) => {
                 "MISSING_SERVICE_FRAGMENT_TRACKING"
             }
+            Self::MissingService(RuntimeService::ArpHold) => "MISSING_SERVICE_ARP_HOLD",
             Self::KeySource(_) => "KEY_SOURCE",
             Self::Candidate(_) => "CANDIDATE",
         }
@@ -480,6 +481,15 @@ pub(crate) fn required_services(
             storage.buckets,
             storage.held,
             storage.held_slot_bytes,
+        )),
+        None => shape,
+    };
+    let arp_hold = config.arp_hold();
+    let shape = match arp_hold.policy().zip(arp_hold.storage()) {
+        Some((policy, storage)) => shape.with_arp_hold(ArpHoldStoragePlan::new(
+            policy,
+            storage.packets,
+            storage.slot_bytes,
         )),
         None => shape,
     };

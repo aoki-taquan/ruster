@@ -397,6 +397,68 @@ pub struct ResolutionCapacityV1 {
 pub struct ResolutionV1 {
     pub policy: ResolutionPolicyV1,
     pub capacity: ResolutionCapacityV1,
+    /// Hold and replay of datagrams whose next hop is being resolved
+    /// (`[resolution.hold]`, ARP-HOLD); absent means
+    /// [`ResolutionHoldV1::default`] (on, RFC 1122 §2.3.2.2).
+    pub hold: Option<ResolutionHoldV1>,
+}
+
+const fn default_hold_per_neighbor() -> u16 {
+    ruster_core::ARP_HOLD_DEFAULT_PER_NEIGHBOR
+}
+
+const fn default_hold_per_host() -> u16 {
+    ruster_core::ARP_HOLD_DEFAULT_PER_HOST
+}
+
+const fn default_hold_packets() -> u32 {
+    ruster_core::ARP_HOLD_DEFAULT_PACKETS
+}
+
+/// `[resolution.hold]`: bounded hold and replay of forwarded datagrams whose
+/// next hop is being resolved by ARP (ARP-HOLD; RFC 1122 §2.3.2.2 and RFC
+/// 1812 §3.3.2: save at least the latest datagram per unresolved address and
+/// send it on resolution).
+///
+/// Every field defaults to the RFC behaviour (on); `enabled = false` and
+/// smaller bounds are hardening. Part of the storage shape
+/// (restart-required). Needs `[fragmentation]` on (a replayed datagram
+/// leaves through its slots); nothing is held without it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ResolutionHoldV1 {
+    /// `false` drops such a datagram (`NEIGHBOR_UNRESOLVED`, the behaviour
+    /// before ARP-HOLD) and allocates no hold storage. Default `true`.
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+    /// Datagrams held per (egress, next hop), 1 to
+    /// [`ruster_core::ARP_HOLD_MAX_PER_NEIGHBOR`]; a new one beyond replaces
+    /// the oldest (the latest is kept). Default
+    /// [`ruster_core::ARP_HOLD_DEFAULT_PER_NEIGHBOR`].
+    #[serde(default = "default_hold_per_neighbor")]
+    pub per_neighbor: u16,
+    /// Datagrams held per (ingress, source), at least 1; beyond is
+    /// `ARP_HOLD_HOST_LIMIT`. Default
+    /// [`ruster_core::ARP_HOLD_DEFAULT_PER_HOST`].
+    #[serde(default = "default_hold_per_host")]
+    pub per_host: u16,
+    /// Datagrams held in all (slots), 1 to
+    /// [`ruster_core::ARP_HOLD_MAX_PACKETS`]; beyond is `ARP_HOLD_FULL`.
+    /// Each slot is a fragmentation slot's size. Default
+    /// [`ruster_core::ARP_HOLD_DEFAULT_PACKETS`].
+    #[serde(default = "default_hold_packets")]
+    pub packets: u32,
+}
+
+impl Default for ResolutionHoldV1 {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            per_neighbor: default_hold_per_neighbor(),
+            per_host: default_hold_per_host(),
+            packets: default_hold_packets(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

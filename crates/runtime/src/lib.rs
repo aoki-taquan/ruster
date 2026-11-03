@@ -4,16 +4,17 @@
 use ruster_core::{
     dispatch_host_unreachable_failures, dispatch_nat44_tcp_unsolicited_syns,
     execute_one_arp_request, execute_one_icmpv4_error, execute_one_ipv4_fragmentation,
-    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking,
-    poll_resolution_timers, ArpRequestBuildError, BatchReport, ExecuteArpRequestError,
-    ExecuteIcmpv4Error, FirewallConfig, FirewallRuntime, ForwardingSnapshot,
-    GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo, GeneratedTraceSink,
-    Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, Ipv4FragmentTracker, Ipv4FragmentationRuntime,
-    MonotonicMillis, Nat44IcmpConfig, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpRuntime,
-    Nat44TcpUnsolicitedSynDispatchError, Nat44UdpConfig, Nat44UdpRuntime, PacketIo,
-    PublicationQuiescence, PublicationQuiescenceDisposition, ResolutionFailureDispatchError,
-    ResolutionFailureDispatchReport, ResolutionFailureTraceSink, ResolutionRuntime,
-    ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink, TraceSink,
+    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking_and_arp_hold,
+    poll_resolution_timers, replay_arp_holds, ArpHoldRuntime, ArpRequestBuildError, BatchReport,
+    ExecuteArpRequestError, ExecuteIcmpv4Error, FirewallConfig, FirewallRuntime,
+    ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4TraceSink, GeneratedPacketIo,
+    GeneratedTraceSink, Icmpv4ErrorBuildError, Icmpv4ErrorRuntime, Ipv4FragmentTracker,
+    Ipv4FragmentationRuntime, MonotonicMillis, Nat44IcmpConfig, Nat44IcmpRuntime, Nat44TcpConfig,
+    Nat44TcpRuntime, Nat44TcpUnsolicitedSynDispatchError, Nat44UdpConfig, Nat44UdpRuntime,
+    PacketIo, PublicationQuiescence, PublicationQuiescenceDisposition,
+    ResolutionFailureDispatchError, ResolutionFailureDispatchReport, ResolutionFailureTraceSink,
+    ResolutionRuntime, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTraceSink,
+    TraceSink,
 };
 use std::{marker::PhantomData, num::NonZeroU64};
 
@@ -245,6 +246,9 @@ pub struct FullServiceView<'view, 'storage> {
     /// Optional IPv4 fragment association (NAT-FRAG); see
     /// [`FullServiceView::with_fragment_tracking`].
     fragment_tracking: Option<&'view mut Ipv4FragmentTracker<'storage>>,
+    /// Optional hold and replay of datagrams whose next hop is being
+    /// resolved (ARP-HOLD); see [`FullServiceView::with_arp_hold`].
+    arp_hold: Option<&'view mut ArpHoldRuntime<'storage>>,
 }
 
 impl<'view, 'storage> FullServiceView<'view, 'storage> {
@@ -292,7 +296,21 @@ impl<'view, 'storage> FullServiceView<'view, 'storage> {
             firewall,
             fragmentation: None,
             fragment_tracking: None,
+            arp_hold: None,
         }
+    }
+
+    /// Adds bounded hold and replay of datagrams whose next hop is being
+    /// resolved (ARP-HOLD, RFC 1122 §2.3.2.2) to the view: such a datagram is
+    /// held instead of dropped, and after each RX batch the ones whose next
+    /// hop resolved are decided anew and staged in the fragmentation slots,
+    /// sent in [`TickPhase::GeneratedFragments`]. It needs
+    /// [`FullServiceView::with_fragmentation`] (the replay leaves through its
+    /// slots); without fragmentation nothing is held.
+    #[must_use]
+    pub fn with_arp_hold(mut self, arp_hold: &'view mut ArpHoldRuntime<'storage>) -> Self {
+        self.arp_hold = Some(arp_hold);
+        self
     }
 
     /// Adds IPv4 fragment association (NAT-FRAG, RFC 4787 REQ-14) to the
@@ -1186,14 +1204,18 @@ where
         firewall,
         mut fragmentation,
         mut fragment_tracking,
+        arp_hold,
     } = view;
+    // The replay leaves through the fragmentation slots: without them
+    // nothing is held (FullServiceView::with_arp_hold).
+    let mut arp_hold = arp_hold.filter(|_| fragmentation.is_some());
     let Nat44IcmpServiceView {
         config: icmp_config,
-        runtime: nat44_icmp,
+        runtime: mut nat44_icmp,
     } = nat44_icmp;
     let Nat44UdpServiceView {
         config: udp_config,
-        runtime: nat44_udp,
+        runtime: mut nat44_udp,
     } = nat44_udp;
     let Nat44TcpServiceView {
         config: tcp_config,
@@ -1219,21 +1241,24 @@ where
     let rx = match io.receive(budgets.rx) {
         Ok(batch) => {
             let report =
-                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking(
+                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking_and_arp_hold(
                     batch,
                     &snapshot,
                     resolution,
                     icmpv4_errors,
                     &udp_config,
-                    nat44_udp,
+                    nat44_udp.as_deref_mut(),
                     &tcp_config,
                     nat44_tcp.as_deref_mut(),
-                    icmp_config.as_ref().map(|config| (config, nat44_icmp)),
+                    icmp_config
+                        .as_ref()
+                        .map(|config| (config, nat44_icmp.as_deref_mut())),
                     &firewall_config,
                     firewall.as_deref_mut(),
                     None,
                     fragmentation.as_deref_mut(),
-                    fragment_tracking,
+                    fragment_tracking.as_deref_mut(),
+                    arp_hold.as_deref_mut(),
                     now,
                     trace,
                 );
@@ -1256,6 +1281,38 @@ where
         }
         RxPhaseReport::Skipped(_) | RxPhaseReport::Completed(_) => None,
     };
+    // ARP-HOLD: right after the RX batch (whose ARP replies resolve next
+    // hops), the held datagrams whose next hop is known are decided anew and
+    // staged in the fragmentation slots, which the generated fragment phase
+    // sends after the router's own ARP and ICMPv4. Expiry and failure are
+    // processed in the same walk. After a backend failure the generated
+    // phases do not run (staged datagrams would be flushed), so the replay
+    // waits for a later tick.
+    if generated_skip.is_none() {
+        if let (Some(hold), Some(fragmentation)) =
+            (arp_hold.as_deref_mut(), fragmentation.as_deref_mut())
+        {
+            replay_arp_holds(
+                hold,
+                &snapshot,
+                resolution,
+                icmpv4_errors,
+                &udp_config,
+                nat44_udp.as_deref_mut(),
+                &tcp_config,
+                nat44_tcp.as_deref_mut(),
+                icmp_config
+                    .as_ref()
+                    .map(|config| (config, nat44_icmp.as_deref_mut())),
+                &firewall_config,
+                firewall.as_deref_mut(),
+                fragmentation,
+                fragment_tracking.as_deref_mut(),
+                now,
+                trace,
+            );
+        }
+    }
 
     trace.record_tick_phase(TickPhaseTrace::PhaseStarted(TickPhase::ResolutionTimers));
     let resolution_timers =
@@ -1471,6 +1528,7 @@ mod tests {
                 nat44_icmp: Nat44IcmpServiceView::default(),
                 fragmentation: None,
                 fragment_tracking: None,
+                arp_hold: None,
                 firewall: FirewallServiceView {
                     config: self.firewall_config,
                     runtime: None,

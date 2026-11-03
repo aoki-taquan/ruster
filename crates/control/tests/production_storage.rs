@@ -10,12 +10,12 @@ use ruster_config::{
 };
 use ruster_control::{candidate_from_config, FullServiceStorage, SimDeterministicKeySource};
 use ruster_core::{
-    port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot,
-    Ipv4FragmentHostSlot, Ipv4FragmentSlot, Nat44HostCounter, Nat44HostLink, Nat44TcpHostSlot,
-    Nat44TcpMappingSlot, Nat44TcpSessionHostSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot,
-    Nat44UdpHostSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot, ResolutionActionSlot,
-    ResolutionFailureHoldSlot, ResolutionStateSlot,
+    port_free_bitmap_words, ArpHoldSlot, DirectoryBucket, DirectoryNode, DynamicNeighborSlot,
+    FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Nat44HostCounter, Nat44HostLink,
+    Nat44TcpHostSlot, Nat44TcpMappingSlot, Nat44TcpSessionHostSlot, Nat44TcpSessionSlot,
+    Nat44TcpSynHoldSlot, Nat44UdpHostSlot, Nat44UdpMappingSlot, Nat44UdpPeerSlot, PortOwnerSlot,
+    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionStateSlot, ARP_HOLD_MAX_PACKETS,
 };
 
 /// Net bytes the measuring thread allocated while armed.
@@ -153,7 +153,21 @@ fn worst_case_bytes() -> usize {
         + firewall
         + fragmentation_bytes(MAX_FRAGMENTATION_DATAGRAMS)
         + fragment_tracking_bytes(MAX_FRAGMENT_TRACKING_ENTRIES, MAX_FRAGMENT_TRACKING_HELD)
+        + arp_hold_bytes(ARP_HOLD_MAX_PACKETS)
 }
+
+/// `packets` ARP hold slots (ARP-HOLD): a record and a fragmentation slot's
+/// 14 + 3826 bytes each.
+fn arp_hold_bytes(packets: u32) -> usize {
+    packets as usize * (size_of::<ArpHoldSlot>() + 14 + 3826)
+}
+
+/// The maximal config's `[resolution.hold]` and its switched-off form,
+/// which has no storage (ARP-HOLD).
+const DISABLED_HOLD: (&str, &str) = (
+    "[resolution.hold]\npackets = 64\n",
+    "[resolution.hold]\nenabled = false\n",
+);
 
 /// The maximal config's `[fragment-tracking]` and its `refuse` form, which
 /// has no storage (NAT-FRAG).
@@ -183,7 +197,7 @@ fn fragmentation_bytes(datagrams: u32) -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 66_617_536;
+    const WORST_CASE: usize = 66_865_856;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 
@@ -232,6 +246,7 @@ fn the_maximal_config_with_per_host_limits_still_fits_the_bound() {
     let worst_case = worst_case_bytes() - fragmentation_bytes(MAX_FRAGMENTATION_DATAGRAMS)
         + fragmentation_bytes(12)
         - fragment_tracking_bytes(MAX_FRAGMENT_TRACKING_ENTRIES, MAX_FRAGMENT_TRACKING_HELD)
+        - arp_hold_bytes(ARP_HOLD_MAX_PACKETS)
         + host_bytes;
     assert_eq!(worst_case, 67_106_128);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
@@ -239,6 +254,7 @@ fn the_maximal_config_with_per_host_limits_still_fits_the_bound() {
     let text = MAXIMAL
         .replacen("datagrams = 1024", "datagrams = 12", 1)
         .replacen(REFUSED_TRACKING.0, REFUSED_TRACKING.1, 1)
+        .replacen(DISABLED_HOLD.0, DISABLED_HOLD.1, 1)
         .replacen(
             "[nat44.udp.capacity]",
             "mappings-per-host = 256\n\n[nat44.udp.capacity]",
@@ -291,15 +307,18 @@ fn the_maximal_config_with_a_session_limit_fits_and_all_limits_fail_closed() {
             + directory);
     // 12-byte links, 4-byte words, 48-byte host slots (three lists).
     assert_eq!(session_host_bytes, 6_029_312);
-    // Without the fragment association table (`mode = "refuse"`, NAT-FRAG).
+    // Without the fragment association table (`mode = "refuse"`, NAT-FRAG)
+    // and the ARP hold slots (`enabled = false`, ARP-HOLD).
     let worst_case = worst_case_bytes()
         - fragment_tracking_bytes(MAX_FRAGMENT_TRACKING_ENTRIES, MAX_FRAGMENT_TRACKING_HELD)
+        - arp_hold_bytes(ARP_HOLD_MAX_PACKETS)
         + session_host_bytes;
     assert_eq!(worst_case, 67_072_192);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let with_sessions = MAXIMAL
         .replacen(REFUSED_TRACKING.0, REFUSED_TRACKING.1, 1)
+        .replacen(DISABLED_HOLD.0, DISABLED_HOLD.1, 1)
         .replacen(
             "[nat44.tcp.capacity]",
             "sessions-per-host = 1024\n\n[nat44.tcp.capacity]",

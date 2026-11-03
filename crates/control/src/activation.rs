@@ -191,21 +191,21 @@
 use std::{marker::PhantomData, num::NonZeroU64};
 
 use ruster_core::{
-    port_free_bitmap_words, DirectoryBucket, DirectoryNode, DynamicNeighborSlot,
-    FirewallReconcileError, FirewallReconcileReport, FirewallRuntime, FirewallStateSlot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationReport,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot,
-    Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTracker, Ipv4FragmentTrackingStorage,
-    Ipv4FragmentTrackingStorageError, Ipv4FragmentationRuntime, Ipv4FragmentationStorageError,
-    Nat44HostCounter, Nat44HostLink, Nat44HostSlot, Nat44HostStorage, Nat44IcmpReconcileError,
-    Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
-    Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpReconcileError,
-    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot,
-    Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
-    PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot, ResolutionFailureHoldSlot,
-    ResolutionPublicationError, ResolutionPublicationReport, ResolutionRuntime,
-    ResolutionStateSlot,
+    port_free_bitmap_words, ArpHoldRuntime, ArpHoldSlot, ArpHoldStorageError, DirectoryBucket,
+    DirectoryNode, DynamicNeighborSlot, FirewallReconcileError, FirewallReconcileReport,
+    FirewallRuntime, FirewallStateSlot, Icmpv4ErrorActionSlot, Icmpv4ErrorPublicationError,
+    Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, Ipv4FragmentEntrySlot,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTracker,
+    Ipv4FragmentTrackingStorage, Ipv4FragmentTrackingStorageError, Ipv4FragmentationRuntime,
+    Ipv4FragmentationStorageError, Nat44HostCounter, Nat44HostLink, Nat44HostSlot,
+    Nat44HostStorage, Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport,
+    Nat44IcmpRuntime, Nat44IcmpRuntimeConfigError, Nat44TcpIndexStorage, Nat44TcpMappingSlot,
+    Nat44TcpReconcileError, Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError,
+    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpReconcileError, Nat44UdpReconcileReport, Nat44UdpRuntime,
+    Nat44UdpRuntimeConfigError, PortOwnerSlot, PublicationQuiescence, ResolutionActionSlot,
+    ResolutionFailureHoldSlot, ResolutionPublicationError, ResolutionPublicationReport,
+    ResolutionRuntime, ResolutionStateSlot,
 };
 use ruster_core::{
     FirewallReconcilePermit, Icmpv4ErrorPublicationPermit, Nat44TcpReconcilePermit,
@@ -269,7 +269,12 @@ pub struct FullServiceStorage {
     fragmentation: Option<FragmentationTables>,
     /// IPv4 fragment association tables (NAT-FRAG), unless `refuse`.
     fragment_tracking: Option<FragmentTrackingTables>,
+    /// ARP hold slots and their bytes (ARP-HOLD), when on.
+    arp_hold: Option<ArpHoldTables>,
 }
+
+/// ARP hold slot records and their frame bytes (ARP-HOLD).
+type ArpHoldTables = (Box<[ArpHoldSlot]>, Box<[u8]>);
 
 /// Fragment association entries, hosts, their two directories, and the held
 /// fragments with their bytes (NAT-FRAG).
@@ -358,8 +363,8 @@ impl FullServiceStorage {
     /// Allocation failure is reported per service instead of aborting.
     pub fn new(shape: FullServiceStorageShape) -> Result<Self, StorageAllocationError> {
         use RuntimeService::{
-            Firewall, FragmentTracking, Fragmentation, Icmpv4Errors, Nat44Icmp, Nat44Tcp, Nat44Udp,
-            Resolution,
+            ArpHold, Firewall, FragmentTracking, Fragmentation, Icmpv4Errors, Nat44Icmp, Nat44Tcp,
+            Nat44Udp, Resolution,
         };
         let resolution = shape.resolution();
         let icmpv4 = shape.icmpv4_errors();
@@ -538,6 +543,19 @@ impl FullServiceStorage {
                     })
                 })
                 .transpose()?,
+            arp_hold: shape
+                .arp_hold()
+                .map(|plan| {
+                    let bytes = plan
+                        .packets()
+                        .checked_mul(plan.slot_bytes())
+                        .ok_or(StorageAllocationError { service: ArpHold })?;
+                    Ok((
+                        slots(plan.packets(), ArpHoldSlot::EMPTY, ArpHold)?,
+                        slots(bytes, 0_u8, ArpHold)?,
+                    ))
+                })
+                .transpose()?,
         })
     }
 
@@ -605,6 +623,9 @@ pub enum ActivationError {
     Fragmentation(Ipv4FragmentationStorageError),
     /// The fragment association tables do not match their shape (NAT-FRAG).
     FragmentTracking(Ipv4FragmentTrackingStorageError),
+    /// The ARP hold slot bytes do not form whole slots of a valid size
+    /// (ARP-HOLD).
+    ArpHold(ArpHoldStorageError),
 }
 
 /// Successor change that live activation cannot apply in place.
@@ -756,6 +777,8 @@ struct LiveRuntimes<'storage> {
     fragmentation: Option<Ipv4FragmentationRuntime<'storage>>,
     /// IPv4 fragment association (NAT-FRAG), unless `refuse`.
     fragment_tracking: Option<Ipv4FragmentTracker<'storage>>,
+    /// ARP hold (ARP-HOLD), when on.
+    arp_hold: Option<ArpHoldRuntime<'storage>>,
 }
 
 /// All exclusive permits of one successor, held at once. `'rules` is the
@@ -956,7 +979,18 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             firewall_states,
             fragmentation,
             fragment_tracking,
+            arp_hold,
         } = storage;
+        let arp_hold = match (arp_hold.as_mut(), candidate.storage_shape().arp_hold()) {
+            (Some((slots, bytes)), Some(plan)) => Some(
+                ArpHoldRuntime::new(plan.policy(), slots, bytes)
+                    .map_err(ActivationError::ArpHold)?,
+            ),
+            (None, None) => None,
+            (Some(_), None) | (None, Some(_)) => {
+                return Err(ActivationError::StorageShapeMismatch);
+            }
+        };
         let fragmentation = match (
             fragmentation.as_mut(),
             candidate.storage_shape().fragmentation(),
@@ -1093,6 +1127,7 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
                 firewall,
                 fragmentation,
                 fragment_tracking,
+                arp_hold,
             },
             generation_floor,
             last_apply: None,
@@ -1157,6 +1192,12 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
     #[must_use]
     pub const fn fragment_tracking(&self) -> Option<&Ipv4FragmentTracker<'storage>> {
         self.runtimes.fragment_tracking.as_ref()
+    }
+
+    /// The ARP hold table (ARP-HOLD), when on.
+    #[must_use]
+    pub const fn arp_hold(&self) -> Option<&ArpHoldRuntime<'storage>> {
+        self.runtimes.arp_hold.as_ref()
     }
 
     /// Guard-free dry-run of `successor` against this publication.
@@ -1326,6 +1367,14 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
         if let Some(tracker) = self.runtimes.fragment_tracking.as_mut() {
             tracker.flush_with_key(resolution_hash_key);
         }
+        // ARP-HOLD: a held datagram waits on a next hop of the old
+        // publication and would be decided anew under the successor's
+        // routes, firewall rules, and NAT; it is dropped (counted as
+        // `flushed`) instead, whatever `[reload] state` carries. The sender
+        // retransmits as it would after any loss.
+        if let Some(hold) = self.runtimes.arp_hold.as_mut() {
+            hold.flush();
+        }
         // No permit borrows `successor`, so it can move into place.
         let previous = std::mem::replace(&mut self.candidate, successor);
         *self.generation_floor = Some(report.generation);
@@ -1379,8 +1428,12 @@ impl<'storage, I: PublicationQuiescence> FullServicePublication<'storage, I>
             Some(fragmentation) => view.with_fragmentation(fragmentation),
             None => view,
         };
-        Some(match self.runtimes.fragment_tracking.as_mut() {
+        let view = match self.runtimes.fragment_tracking.as_mut() {
             Some(tracker) => view.with_fragment_tracking(tracker),
+            None => view,
+        };
+        Some(match self.runtimes.arp_hold.as_mut() {
+            Some(hold) => view.with_arp_hold(hold),
             None => view,
         })
     }

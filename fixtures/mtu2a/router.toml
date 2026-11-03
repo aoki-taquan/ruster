@@ -51,6 +51,12 @@ actions = 8
 dynamic-neighbors = 8
 failure-holds = 8
 
+# ARP-HOLD off: this fixture keeps the M1 opening where the first datagram
+# to an unresolved gateway is dropped and retransmitted (fixtures/arphold
+# covers the hold).
+[resolution.hold]
+enabled = false
+
 [icmpv4-errors.policy]
 interval-ms = 100
 state-ttl-ms = 60000

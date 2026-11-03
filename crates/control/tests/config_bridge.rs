@@ -2,15 +2,15 @@ use std::num::NonZeroU64;
 
 use ruster_config::{parse, validate, ValidatedConfig, ValidatedConfigV1, ValidationLimits};
 use ruster_control::{
-    candidate_from_config, ConfigBridgeError, FragmentTrackingStoragePlan,
+    candidate_from_config, ArpHoldStoragePlan, ConfigBridgeError, FragmentTrackingStoragePlan,
     FragmentationStoragePlan, FullServiceStorageShape, Icmpv4ErrorStorageShape, KeySourceError,
     KeySourceKind, Nat44TcpStoragePlan, Nat44UdpStoragePlan, PublicationKeySource, PublicationKeys,
     ResolutionStorageShape, RuntimeService, SimDeterministicKeySource, SuccessorError,
     ValidatedCandidate,
 };
 use ruster_core::{
-    FirewallHashKey, IfId, Ipv4Address, Ipv4FragmentTrackingPolicy, Ipv4FragmentationPolicy,
-    Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey,
+    ArpHoldPolicy, FirewallHashKey, IfId, Ipv4Address, Ipv4FragmentTrackingPolicy,
+    Ipv4FragmentationPolicy, Nat44TcpHashKey, Nat44UdpHashKey, ResolutionHashKey,
 };
 
 const SIM_SEED: u64 = 0x5eed_0bad_cafe_f00d;
@@ -267,6 +267,9 @@ fn config_bridge_builds_candidates_and_rejects_missing_services() {
             64,
             3840
         ))
+        // `[resolution.hold]` absent: on, 64 hold slots of a fragmentation
+        // slot's size (ARP-HOLD).
+        .with_arp_hold(ArpHoldStoragePlan::new(ArpHoldPolicy::DEFAULT, 64, 3840))
     );
     let udp = storage.nat44_udp.unwrap();
     assert_eq!(

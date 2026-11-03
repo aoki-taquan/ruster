@@ -1,22 +1,22 @@
 use std::{fmt, mem::size_of, net::Ipv4Addr, num::ParseIntError};
 
 use ruster_core::{
-    port_free_bitmap_words, validate_firewall_rules, ArpPolicy, DirectoryBucket, DirectoryNode,
-    DynamicNeighborSlot, FirewallAction, FirewallConfigError, FirewallInterface,
-    FirewallIpv4Prefix, FirewallIpv4PrefixError, FirewallPolicy, FirewallPolicyError,
-    FirewallPortRange, FirewallPortRangeError, FirewallProtocol, FirewallRule, FirewallRuleId,
-    FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
-    Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot,
-    Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError, Ipv4FragmentationPolicy,
-    Ipv4FragmentationPolicyError, Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding,
-    MacAddress, Nat44Filtering, Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError,
-    Nat44IcmpPolicy, Nat44IcmpPolicyError, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpConfigError, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
-    Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig, Nat44UdpConfigError,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
-    PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
-    ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
+    port_free_bitmap_words, validate_firewall_rules, ArpHoldPolicy, ArpHoldPolicyError,
+    ArpHoldSlot, ArpPolicy, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallAction,
+    FirewallConfigError, FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError,
+    FirewallPolicy, FirewallPolicyError, FirewallPortRange, FirewallPortRangeError,
+    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4FragmentEntrySlot,
+    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTrackingPolicy,
+    Ipv4FragmentTrackingPolicyError, Ipv4FragmentationPolicy, Ipv4FragmentationPolicyError,
+    Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding, MacAddress, Nat44Filtering,
+    Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpPolicy, Nat44IcmpPolicyError,
+    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot,
+    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
+    Nat44UdpPolicyError, Neighbor, PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionStateSlot, Route, RouteError, SnapshotError,
 };
 
 use ruster_io_xdp::native_profile::{
@@ -142,6 +142,12 @@ pub enum ValidationCode {
     FragmentTrackingPolicy(Ipv4FragmentTrackingPolicyError),
     /// `[fragment-tracking] entries` is 0 in `associate` mode (NAT-FRAG).
     FragmentTrackingEntriesZero,
+    /// `[resolution.hold] per-neighbor` outside 1..=64 or `per-host` 0
+    /// (ARP-HOLD).
+    ArpHoldPolicy(ArpHoldPolicyError),
+    /// `[resolution.hold] packets` is 0 while holding is enabled (ARP-HOLD;
+    /// `enabled = false` is the switch).
+    ArpHoldPacketsZero,
     InvalidAllocatorSeed,
     NonCanonicalAllocatorSeed,
     Nat44RealmWithoutProtocol,
@@ -314,6 +320,8 @@ impl ValidationCode {
             Self::TickGeneratedFragmentsZero => "TICK_GENERATED_FRAGMENTS_ZERO",
             Self::FragmentTrackingPolicy(_) => "FRAGMENT_TRACKING_POLICY",
             Self::FragmentTrackingEntriesZero => "FRAGMENT_TRACKING_ENTRIES_ZERO",
+            Self::ArpHoldPolicy(_) => "ARP_HOLD_POLICY",
+            Self::ArpHoldPacketsZero => "ARP_HOLD_PACKETS_ZERO",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
             Self::Nat44RealmWithoutProtocol => "NAT44_REALM_WITHOUT_PROTOCOL",
@@ -568,6 +576,14 @@ pub struct FragmentTrackingStorageShapeV1 {
     pub held_slot_bytes: u32,
 }
 
+/// Storage of the ARP hold table (ARP-HOLD): `packets` hold records of
+/// `slot_bytes` bytes each (a fragmentation slot's size).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ArpHoldStorageShapeV1 {
+    pub packets: u32,
+    pub slot_bytes: u32,
+}
+
 /// Complete caller-owned runtime storage requested by one V1 candidate.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RuntimeStorageShapeV1 {
@@ -582,6 +598,9 @@ pub struct RuntimeStorageShapeV1 {
     pub fragmentation: Option<FragmentationStorageShapeV1>,
     /// `None` with `[fragment-tracking] mode = "refuse"`.
     pub fragment_tracking: Option<FragmentTrackingStorageShapeV1>,
+    /// `None` with `[resolution.hold] enabled = false`, without
+    /// `[resolution]`, or without fragmentation (ARP-HOLD).
+    pub arp_hold: Option<ArpHoldStorageShapeV1>,
     pub required_bytes: usize,
 }
 
@@ -634,6 +653,28 @@ impl ValidatedFragmentTrackingV1 {
     /// `None` in `refuse` mode.
     #[must_use]
     pub const fn storage(&self) -> Option<FragmentTrackingStorageShapeV1> {
+        self.storage
+    }
+}
+
+/// Validated `[resolution.hold]` (ARP-HOLD; defaults when absent).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidatedArpHoldV1 {
+    policy: Option<ArpHoldPolicy>,
+    storage: Option<ArpHoldStorageShapeV1>,
+}
+
+impl ValidatedArpHoldV1 {
+    /// `None` when holding is off (switched off, no `[resolution]`, or no
+    /// fragmentation to replay through).
+    #[must_use]
+    pub const fn policy(&self) -> Option<ArpHoldPolicy> {
+        self.policy
+    }
+
+    /// `None` when holding is off.
+    #[must_use]
+    pub const fn storage(&self) -> Option<ArpHoldStorageShapeV1> {
         self.storage
     }
 }
@@ -1191,6 +1232,7 @@ pub struct ValidatedConfigV1 {
     tick: TickBudgetsV1,
     fragmentation: ValidatedFragmentationV1,
     fragment_tracking: ValidatedFragmentTrackingV1,
+    arp_hold: ValidatedArpHoldV1,
     storage: RuntimeStorageShapeV1,
     backend: ValidatedBackendV1,
     reload_state: ReloadStateV1,
@@ -1291,6 +1333,12 @@ impl ValidatedConfigV1 {
     #[must_use]
     pub const fn fragment_tracking(&self) -> ValidatedFragmentTrackingV1 {
         self.fragment_tracking
+    }
+
+    /// `[resolution.hold]` (ARP-HOLD); defaults (on) when absent.
+    #[must_use]
+    pub const fn arp_hold(&self) -> ValidatedArpHoldV1 {
+        self.arp_hold
     }
 
     #[must_use]
@@ -2189,6 +2237,10 @@ fn validate_v1(
         config.fragment_tracking.unwrap_or_default(),
         fragmentation_slots,
     )?;
+    let (arp_hold_policy, arp_hold_storage) = validate_arp_hold(
+        resolution_source.map(|source| source.hold.unwrap_or_default()),
+        fragmentation_slots,
+    )?;
 
     let storage = build_storage_shape(
         StorageInputs {
@@ -2218,6 +2270,7 @@ fn validate_v1(
             firewall_states: firewall_capacity,
             fragmentation: fragmentation_slots,
             fragment_tracking: fragment_tracking_storage,
+            arp_hold: arp_hold_storage,
         },
         limits,
     )?;
@@ -2320,6 +2373,10 @@ fn validate_v1(
             policy: fragment_tracking_policy,
             storage: fragment_tracking_storage,
         },
+        arp_hold: ValidatedArpHoldV1 {
+            policy: arp_hold_policy,
+            storage: arp_hold_storage,
+        },
         storage,
         backend,
         reload_state: config.reload.unwrap_or_default().state,
@@ -2400,6 +2457,51 @@ fn validate_fragment_tracking(
             held_slot_bytes,
         }),
     ))
+}
+
+/// Validates `[resolution.hold]` (ARP-HOLD). Nothing is held without
+/// `[resolution]` (no ARP), with `enabled = false`, or without fragmentation
+/// (a replayed datagram leaves through its slots, so a hold slot is sized
+/// like one); the bounds are still checked when present.
+fn validate_arp_hold(
+    source: Option<crate::ResolutionHoldV1>,
+    fragmentation: Option<FragmentationStorageShapeV1>,
+) -> Result<(Option<ArpHoldPolicy>, Option<ArpHoldStorageShapeV1>), ValidationError> {
+    let field = |name: &str| path(&["resolution", "hold", name]);
+    let Some(source) = source.filter(|source| source.enabled) else {
+        return Ok((None, None));
+    };
+    let policy = ArpHoldPolicy::new(source.per_neighbor, source.per_host).map_err(|error| {
+        let name = match error {
+            ArpHoldPolicyError::PerHost => "per-host",
+            _ => "per-neighbor",
+        };
+        ValidationError::new(ValidationCode::ArpHoldPolicy(error), field(name))
+    })?;
+    if source.packets == 0 {
+        return Err(ValidationError::new(
+            ValidationCode::ArpHoldPacketsZero,
+            field("packets"),
+        ));
+    }
+    if source.packets > ruster_core::ARP_HOLD_MAX_PACKETS {
+        return Err(ValidationError::bounded(
+            ValidationCode::CapacityLimitExceeded,
+            field("packets"),
+            u64::from(ruster_core::ARP_HOLD_MAX_PACKETS),
+            u64::from(source.packets),
+        ));
+    }
+    Ok(match fragmentation {
+        Some(slots) => (
+            Some(policy),
+            Some(ArpHoldStorageShapeV1 {
+                packets: source.packets,
+                slot_bytes: slots.slot_bytes,
+            }),
+        ),
+        None => (None, None),
+    })
 }
 
 /// Bounds of the `[health]` durations (milliseconds): 100 ms to one hour.
@@ -3278,6 +3380,7 @@ struct StorageInputs {
     firewall_states: Option<u32>,
     fragmentation: Option<FragmentationStorageShapeV1>,
     fragment_tracking: Option<FragmentTrackingStorageShapeV1>,
+    arp_hold: Option<ArpHoldStorageShapeV1>,
 }
 
 fn build_storage_shape(
@@ -3502,6 +3605,17 @@ fn build_storage_shape(
             })?;
         bytes = arena;
     }
+    if let Some(shape) = inputs.arp_hold {
+        let packets_path = path(&["resolution", "hold", "packets"]);
+        add_bytes::<ArpHoldSlot>(&mut bytes, shape.packets, packets_path.clone())?;
+        let arena = usize::try_from(u64::from(shape.packets) * u64::from(shape.slot_bytes))
+            .ok()
+            .and_then(|arena| bytes.checked_add(arena))
+            .ok_or_else(|| {
+                ValidationError::new(ValidationCode::CapacityArithmeticOverflow, packets_path)
+            })?;
+        bytes = arena;
+    }
     if bytes > limits.max_runtime_bytes {
         return Err(ValidationError::bounded(
             ValidationCode::RuntimeStorageBytesExceeded,
@@ -3519,6 +3633,7 @@ fn build_storage_shape(
         firewall_states: inputs.firewall_states,
         fragmentation: inputs.fragmentation,
         fragment_tracking: inputs.fragment_tracking,
+        arp_hold: inputs.arp_hold,
         required_bytes: bytes,
     })
 }

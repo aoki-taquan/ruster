@@ -1,8 +1,8 @@
 use std::num::NonZeroU64;
 
 use ruster_core::{
-    ArpPolicy, FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy, FirewallRule,
-    ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address,
+    ArpHoldPolicy, ArpPolicy, FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy,
+    FirewallRule, ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, Interface, Ipv4Address,
     Ipv4FragmentTrackingPolicy, Ipv4FragmentationPolicy, Ipv4OriginPolicy, LocalIpv4Binding,
     Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey, Nat44IcmpPolicy, Nat44TcpConfig,
     Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpConfigError,
@@ -341,6 +341,44 @@ pub struct FullServiceStorageShape {
     /// `None` without fragment association (`[fragment-tracking] mode =
     /// "refuse"`); the policy is part of the shape (restart-required).
     fragment_tracking: Option<FragmentTrackingStoragePlan>,
+    /// `None` without ARP hold (`[resolution.hold] enabled = false`, or no
+    /// fragmentation); the policy is part of the shape (restart-required).
+    arp_hold: Option<ArpHoldStoragePlan>,
+}
+
+/// Hold and replay of datagrams whose next hop is being resolved
+/// (ARP-HOLD): its policy and `packets` hold slots of `slot_bytes` bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArpHoldStoragePlan {
+    policy: ArpHoldPolicy,
+    packets: u32,
+    slot_bytes: u32,
+}
+
+impl ArpHoldStoragePlan {
+    #[must_use]
+    pub const fn new(policy: ArpHoldPolicy, packets: u32, slot_bytes: u32) -> Self {
+        Self {
+            policy,
+            packets,
+            slot_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn policy(self) -> ArpHoldPolicy {
+        self.policy
+    }
+
+    #[must_use]
+    pub const fn packets(self) -> u32 {
+        self.packets
+    }
+
+    #[must_use]
+    pub const fn slot_bytes(self) -> u32 {
+        self.slot_bytes
+    }
 }
 
 /// IPv4 fragment association (NAT-FRAG): its policy, `entries` entry and
@@ -452,7 +490,21 @@ impl FullServiceStorageShape {
             firewall_state_slots,
             fragmentation: None,
             fragment_tracking: None,
+            arp_hold: None,
         }
+    }
+
+    /// This shape with ARP hold (ARP-HOLD). Without it a datagram whose
+    /// next hop is being resolved is `NEIGHBOR_UNRESOLVED`.
+    #[must_use]
+    pub const fn with_arp_hold(mut self, plan: ArpHoldStoragePlan) -> Self {
+        self.arp_hold = Some(plan);
+        self
+    }
+
+    #[must_use]
+    pub const fn arp_hold(self) -> Option<ArpHoldStoragePlan> {
+        self.arp_hold
     }
 
     /// This shape with IPv4 fragment association (NAT-FRAG). Without it
@@ -825,6 +877,8 @@ pub enum RuntimeService {
     Fragmentation,
     /// The optional IPv4 fragment association table (NAT-FRAG).
     FragmentTracking,
+    /// The optional ARP hold table (ARP-HOLD).
+    ArpHold,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -286,6 +286,12 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 held: 64,
                 held_slot_bytes: 3840,
             }),
+            // `[resolution.hold]` absent: on, 64 hold slots sized like a
+            // fragmentation slot (ARP-HOLD).
+            arp_hold: Some(ruster_config::ArpHoldStorageShapeV1 {
+                packets: 64,
+                slot_bytes: 3840,
+            }),
             required_bytes: shape.required_bytes,
         }
     );
@@ -316,7 +322,9 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
             * (size_of::<ruster_core::Ipv4FragmentEntrySlot>()
                 + size_of::<ruster_core::Ipv4FragmentHostSlot>())
         + 2 * 256 * (size_of::<DirectoryBucket>() + size_of::<DirectoryNode>())
-        + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840);
+        + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
+        // ARP hold slots and their frames
+        + 64 * (size_of::<ruster_core::ArpHoldSlot>() + 3840);
     assert_eq!(shape.required_bytes, expected);
 
     assert!(validated_with(
@@ -1861,6 +1869,7 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
             |shape: ruster_config::RuntimeStorageShapeV1| ruster_config::RuntimeStorageShapeV1 {
                 fragmentation: None,
                 fragment_tracking: None,
+                arp_hold: None,
                 required_bytes: 0,
                 ..shape
             };
@@ -1871,8 +1880,9 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
         assert_eq!(
             i64::try_from(shape.required_bytes).unwrap()
                 - i64::try_from(defaults.storage_shape().required_bytes).unwrap(),
-            // 64 fragmentation slots and 64 held fragments (NAT-FRAG).
-            2 * 64 * (i64::from(slot_bytes) - 3840)
+            // 64 fragmentation slots, 64 held fragments (NAT-FRAG), and
+            // 64 ARP hold slots (ARP-HOLD).
+            3 * 64 * (i64::from(slot_bytes) - 3840)
         );
     }
     for mtu in [0, 67, 65_536, u64::from(u32::MAX)] {
@@ -1967,10 +1977,15 @@ fn fragmentation_section_defaults_on_and_fails_closed() {
             .map(|shape| shape.held),
         Some(0)
     );
+    // Nor is anything held for ARP (ARP-HOLD: a replay leaves through the
+    // fragmentation slots).
+    assert_eq!(off.storage_shape().arp_hold, None);
+    assert_eq!(off.arp_hold().policy(), None);
     assert_eq!(
         absent.storage_shape().required_bytes - off.storage_shape().required_bytes,
         64 * (size_of::<Ipv4FragmentSlot>() + 3840)
             + 64 * (size_of::<ruster_core::Ipv4FragmentHeldSlot>() + 3840)
+            + 64 * (size_of::<ruster_core::ArpHoldSlot>() + 3840)
     );
     // Off ignores the slot count (no storage), but still checks the bound.
     let off_zero = validated(&with("[fragmentation]\nenabled = false\ndatagrams = 0\n"));
