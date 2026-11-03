@@ -44,7 +44,7 @@
 #             through /etc/passwd gets past the read (the control)
 #   limits   (H3) a config with every runtime table at its production
 #             limit (failure holds and ICMPv4 error actions 4096, every
-#             other table 65536, NAT44 pool 1-65535, 58.22 MiB of storage) is
+#             other table 65536, NAT44 pool 1-65535, 62.59 MiB of storage) is
 #             accepted by `validate`; one more failure hold (4097) is
 #             refused by `validate` and `ruster run` (exit 2) although the
 #             simulator's limits accept it as a sim document; `ruster run`
@@ -128,6 +128,17 @@
 #             counters show fragmentation.fragmented =
 #             consume.IPV4_FRAGMENTED, fragments = generated_fragments
 #             tx_accepted, nothing dropped or incomplete
+#   natfrag   (NAT-FRAG, RFC 4787 REQ-14) every device at 1500, firewall
+#             on, default `[fragment-tracking]`: host B's 3000-byte DF-clear
+#             UDP answer to host A's NAT mapping, fragmented by host B's
+#             kernel, reaches host A translated (one inbound generated ID,
+#             RFC 791 layout, TTL 63) and is reassembled to the exact
+#             payload; host A's own fragments from a raw socket, sent last
+#             first, are held and released by the router and reassembled by
+#             host B (source 203.0.113.2, valid UDP checksum). Final counters:
+#             fragment_tracking.held = consume.IPV4_FRAGMENT_HELD, released,
+#             nothing refused. With `[fragment-tracking] mode = "refuse"` the
+#             same fragments never arrive (drop.FIREWALL_FRAGMENT_UNSUPPORTED)
 #   unsolicited_syn  (B3, RFC 5382 REQ-4) with a firewall rule that admits
 #             new WAN -> LAN TCP flows to every destination, host B sends a
 #             TCP SYN to a public port without a mapping: nothing for 6 s,
@@ -471,7 +482,7 @@ write_config "$work/router-v2.toml" ra 0 router-v2
 # a cross-port forward is copied into an egress generated frame, so with
 # more of those than TX entries the 128-entry TX ring is what fills.
 write_config "$work/txfull.toml" ra 0 router-v1 256
-# H3: every runtime table at its production limit (58.22 MiB of storage),
+# H3: every runtime table at its production limit (62.59 MiB of storage),
 # without the fixture's own backend; and one more failure hold (above the
 # production 4096, within the simulator's 65536), as af-xdp and as sim.
 sed -e '/^\[backend\]$/,$d' -e 's/device = "rusternodev0"/device = "sim0"/' \
@@ -1285,7 +1296,7 @@ phase_idle
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=61042880 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=65634496 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -1309,7 +1320,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 61042880 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 65634496 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
@@ -2135,8 +2146,8 @@ phase_frag() {
     [ "$(grep -cx "mtu = 1280" "$work/frag-in.toml")" -eq 1 ] || fail "frag: config edit"
     # The pmtu phase left host A with a learned PMTU 1400 for host B, by
     # which its kernel would fragment the DF-clear datagram itself (the
-    # router drops fragments: FIREWALL_FRAGMENT_UNSUPPORTED). The hosts
-    # send whole datagrams at their device MTUs.
+    # router would then associate the fragments, NAT-FRAG, instead of
+    # fragmenting). The hosts send whole datagrams at their device MTUs.
     in_ns "$host_a" ip route flush cache
     in_ns "$host_b" ip route flush cache
     start_ruster frag-out "$work/frag-out.toml"
@@ -2185,6 +2196,171 @@ phase_frag() {
     echo "priv_run_frag: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1280); inbound fragmentation.fragmented=consume.IPV4_FRAGMENTED=$fragmented, fragments=generated_fragments.tx_accepted=$fragments, nothing dropped or incomplete, drop.IPV4_FRAGMENTATION_REQUIRED=0, exit 0, detached verified"
 }
 phase_frag
+
+# natfrag (NAT-FRAG, RFC 4787 REQ-14, RFC 1858): fragments of one datagram
+# through the stateful firewall and the NAT, every device at 1500 and the
+# fixture's default `[fragment-tracking]` (associate). Inbound: host B's
+# 3000-byte DF-clear UDP answer to host A's NAT mapping is fragmented by
+# host B's kernel (1480 + 1480 + 48 data bytes), each fragment follows the
+# first fragment's translation, and host A's kernel reassembles the exact
+# payload. Outbound out of order: host A sends its own fragments from a raw
+# socket (IP_HDRINCL; no netem, nothing outside the namespaces), the last
+# first and the first last, so the router holds two fragments per datagram
+# until the first one decides; host B reassembles the exact payload.
+# A separate run with `[fragment-tracking] mode = "refuse"` (the hardening
+# switch) drops every fragment (FIREWALL_FRAGMENT_UNSUPPORTED).
+# NATFRAG_RAW: argv source, destination, source port, destination port,
+# payload length, marker, stop file, fragment order (e.g. 2,1,0); sends the
+# UDP datagram (frag_payload, valid UDP checksum) as 1480-byte RFC 791
+# fragments in that order, a new ID every 0.2 s (10 s at most) until the
+# stop file exists.
+NATFRAG_RAW="$FRAG_PAYLOAD"'
+import os, socket, struct, sys, time
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+src, dst = socket.inet_aton(sys.argv[1]), socket.inet_aton(sys.argv[2])
+sport, dport, length = int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+marker, stop = sys.argv[6].encode(), sys.argv[7]
+order = [int(i) for i in sys.argv[8].split(",")]
+ulen = 8 + length
+udp = struct.pack("!HHHH", sport, dport, ulen, 0) + frag_payload(marker, length)
+check = (~fold(src + dst + struct.pack("!BBH", 0, 17, ulen) + udp)) & 0xFFFF or 0xFFFF
+udp = udp[:6] + struct.pack("!H", check) + udp[8:]
+pieces, offset = [], 0
+while offset < ulen:
+    size = min(1480, ulen - offset)
+    pieces.append((offset, offset + size < ulen, udp[offset:offset + size]))
+    offset += size
+assert sorted(order) == list(range(len(pieces)))
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+print("ready", flush=True)
+ident = 0x5100
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline and not os.path.exists(stop):
+    ident += 1
+    for index in order:
+        off, more, body = pieces[index]
+        word = (0x2000 if more else 0) | off // 8
+        header = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(body), ident, word, 64, 17, 0, src, dst)
+        header = header[:10] + struct.pack("!H", (~fold(header)) & 0xFFFF) + header[12:]
+        s.sendto(header + body, (sys.argv[2], 0))
+    time.sleep(0.2)
+'
+
+# Stops the run $1 (exit 0, nothing attached) and writes its final stats
+# block to $work/$1.final.
+natfrag_stop() {
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "$1: exit status $status after SIGTERM"
+    assert_detached "the $1 run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/$1.out" >"$work/$1.final"
+}
+
+phase_natfrag() {
+    printf '\n[fragment-tracking]\nmode = "refuse"\n' |
+        cat "$work/router.toml" - >"$work/natfrag-refuse.toml"
+    # Hosts send at their device MTUs (1500); no learned PMTU from the
+    # earlier phases.
+    in_ns "$host_a" ip route flush cache
+    in_ns "$host_b" ip route flush cache
+    start_ruster natfrag "$work/router.toml"
+    wait_ready natfrag || fail "natfrag: ruster exited during startup"
+    forward_once natfrag_resolve
+
+    # Inbound, fragmented by host B's kernel (IP_PMTUDISC_DONT, 3008-byte
+    # UDP datagram over pb's 1500): host A pokes from port 33310 (NAT
+    # mapping and firewall state), host B answers from port 9006.
+    in_ns "$host_b" ethtool -K pb tx off >/dev/null
+    rm -f "$stopfile"
+    in_ns "$host_b" python3 -I -c "$FRAG_SEND" 0.0.0.0 9006 2972 \
+        "ruster-natfrag-in-$suffix" "$stopfile" "ruster-natfrag-poke-$suffix" \
+        >"$work/natfrag-send-in.out" 2>&1 &
+    sender=$!
+    tries=0
+    while ! grep -q ready "$work/natfrag-send-in.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "natfrag: host B replier not ready"
+        sleep 0.05
+    done
+    frag_ns=$host_a
+    frag_receiver_start "natfrag-in.out" expect pa 33310 203.0.113.1 192.168.1.10 9006-9006 \
+        1500 2972 "ruster-natfrag-in-$suffix" 10 203.0.113.1 9006 "ruster-natfrag-poke-$suffix"
+    status=0
+    wait "$frag_receiver" || status=$?
+    : >"$stopfile"
+    wait "$sender" || true
+    in_ns "$host_b" ethtool -K pb tx on >/dev/null
+    [ "$status" -eq 0 ] || fail "natfrag inbound: $(cat "$work/natfrag-in.out")"
+    echo "priv_run_natfrag_inbound: host B's kernel fragments, translated by the NAT: $(sed -n 2p "$work/natfrag-in.out") verified"
+
+    # Outbound out of order from host A's raw socket: last, middle, first.
+    rm -f "$stopfile"
+    frag_ns=$host_b
+    frag_receiver_start "natfrag-out.out" expect pb 9007 203.0.113.2 203.0.113.1 40000-40015 \
+        1500 2972 "ruster-natfrag-out-$suffix" 10
+    in_ns "$host_a" python3 -I -c "$NATFRAG_RAW" 192.168.1.10 203.0.113.1 33311 9007 2972 \
+        "ruster-natfrag-out-$suffix" "$stopfile" 2,1,0 >"$work/natfrag-raw.out" 2>&1 &
+    sender=$!
+    status=0
+    wait "$frag_receiver" || status=$?
+    : >"$stopfile"
+    wait "$sender" || true
+    [ "$status" -eq 0 ] || fail "natfrag outbound: $(cat "$work/natfrag-out.out") $(cat "$work/natfrag-raw.out")"
+    echo "priv_run_natfrag_outbound: host A's raw fragments sent last first, held and released by the router: $(sed -n 2p "$work/natfrag-out.out") verified"
+    natfrag_stop natfrag
+    block_has "$work/natfrag.final" drop.FIREWALL_FRAGMENT_UNSUPPORTED=0 \
+        drop.NAT44_UDP_NON_ATOMIC_IPV4_UNSUPPORTED=0 drop.IPV4_FRAGMENT_TABLE_FULL=0 \
+        drop.IPV4_FRAGMENT_HOST_LIMIT=0 drop.IPV4_FRAGMENT_HOLD_FULL=0 \
+        drop.IPV4_FRAGMENT_HOST_HOLD_LIMIT=0 drop.IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP=0 \
+        drop.IPV4_FRAGMENT_MALFORMED=0 fragment_tracking.release_dropped=0 \
+        fragmentation.dropped_unavailable=0 fragmentation.incomplete=0
+    allowed=$(stat_in "$work/natfrag.final" fragment_tracking.first_allowed)
+    followed=$(stat_in "$work/natfrag.final" fragment_tracking.followed)
+    held=$(stat_in "$work/natfrag.final" fragment_tracking.held)
+    released=$(stat_in "$work/natfrag.final" fragment_tracking.released)
+    consumed=$(stat_in "$work/natfrag.final" consume.IPV4_FRAGMENT_HELD)
+    whole=$(stat_in "$work/natfrag.final" fragmentation.whole)
+    [ "${allowed:-0}" -ge 2 ] && [ "${followed:-0}" -ge 2 ] ||
+        fail "natfrag: first_allowed ${allowed:-missing}, followed ${followed:-missing}"
+    [ "${held:-0}" -ge 2 ] && [ "${consumed:-x}" = "$held" ] ||
+        fail "natfrag: held ${held:-missing}, consume.IPV4_FRAGMENT_HELD ${consumed:-missing}"
+    [ "${released:-0}" -ge 2 ] && [ "${whole:-x}" -ge "$released" ] ||
+        fail "natfrag: released ${released:-missing}, fragmentation.whole ${whole:-missing}"
+    echo "priv_run_natfrag: firewall on; fragment_tracking.first_allowed=$allowed followed=$followed held=consume.IPV4_FRAGMENT_HELD=$held released=$released (fragmentation.whole=$whole), no fragment refused, exit 0, detached verified"
+
+    # The hardening switch: the same out-of-order fragments are refused.
+    start_ruster natfrag-refuse "$work/natfrag-refuse.toml"
+    wait_ready natfrag-refuse || fail "natfrag-refuse: ruster exited during startup"
+    forward_once natfrag_refuse_resolve
+    rm -f "$stopfile"
+    frag_ns=$host_b
+    frag_receiver_start "natfrag-refuse.recv" absent pb 9007 203.0.113.2 203.0.113.1 40000-40015 \
+        1500 2972 "ruster-natfrag-refuse-$suffix" 3
+    in_ns "$host_a" python3 -I -c "$NATFRAG_RAW" 192.168.1.10 203.0.113.1 33312 9007 2972 \
+        "ruster-natfrag-refuse-$suffix" "$stopfile" 2,1,0 >"$work/natfrag-raw-refuse.out" 2>&1 &
+    sender=$!
+    status=0
+    wait "$frag_receiver" || status=$?
+    : >"$stopfile"
+    wait "$sender" || true
+    [ "$status" -eq 0 ] || fail "natfrag refuse: $(cat "$work/natfrag-refuse.recv")"
+    natfrag_stop natfrag-refuse
+    refused=$(stat_in "$work/natfrag-refuse.final" drop.FIREWALL_FRAGMENT_UNSUPPORTED)
+    [ "${refused:-0}" -ge 3 ] ||
+        fail "natfrag-refuse: drop.FIREWALL_FRAGMENT_UNSUPPORTED is ${refused:-missing}"
+    block_has "$work/natfrag-refuse.final" fragment_tracking.first_allowed=0 \
+        fragment_tracking.held=0 consume.IPV4_FRAGMENT_HELD=0
+    echo "priv_run_natfrag_refuse: with [fragment-tracking] mode = \"refuse\" $(sed -n 2p "$work/natfrag-refuse.recv"); drop.FIREWALL_FRAGMENT_UNSUPPORTED=$refused, exit 0, detached verified"
+}
+phase_natfrag
 
 # unsolicited_syn (B3): host B's raw-socket view of the RFC 5382 REQ-4
 # delayed ICMP Port Unreachable. argv: mode (icmp|absent), public port,
