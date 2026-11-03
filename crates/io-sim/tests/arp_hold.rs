@@ -1421,13 +1421,11 @@ fn a_held_first_fragment_does_not_poison_a_decided_newer_datagram() {
     assert_eq!((tracker.poisoned, tracker.first_denied), (0, 0));
 }
 
-/// #345 review L-c, end to end: a hold window over 65.536 s (10 s × 10
-/// attempts). The held first fragment's entry expires and a newer datagram
-/// on the key creates an entry at 65 536 ms in the same slot with the same
-/// 16-bit stamp; when the hold fails, the hold start derived from the
-/// deadline keeps the newer datagram from being denied.
-#[test]
-fn a_hold_longer_than_the_stamp_period_spares_a_same_stamp_newer_datagram() {
+/// A world whose hold window is over 65.536 s (10 s × 10 attempts) with a
+/// held first fragment whose entry has expired at 61 s; the returned
+/// fragments' last one, sent at 65 536 ms, creates a newer datagram's entry
+/// on the key in the same slot with the same 16-bit stamp.
+fn stamp_collision_world() -> (World, Vec<(IfId, Vec<u8>)>) {
     let text = ROUTER
         .replacen(
             "interval-ms = 1000\nstate-ttl-ms = 3000",
@@ -1435,6 +1433,7 @@ fn a_hold_longer_than_the_stamp_period_spares_a_same_stamp_newer_datagram() {
             1,
         )
         .replacen("max-attempts = 3", "max-attempts = 10", 1)
+        .replacen("per-neighbor = 3", "per-neighbor = 1", 1)
         .replacen(
             "[tick]",
             "[fragment-tracking]\ntimeout-ms = 60000\n\n[tick]",
@@ -1446,18 +1445,51 @@ fn a_hold_longer_than_the_stamp_period_spares_a_same_stamp_newer_datagram() {
     assert_eq!(tracker_held(&world), (1, 0));
     world.tick(61_000, &[]);
     assert_eq!(tracker_held(&world).0, 0, "the entry expired");
-    world.tick(65_536, &frames[2..]);
-    assert_eq!(tracker_held(&world).0, 1);
-    // Same slot and stamp: the walk takes the newer entry for its own.
-    world.tick(70_000, &[]);
-    assert_eq!((world.live(), world.hold().cancelled), (1, 0));
-    let mut now = 70_000;
-    while world.live() != 0 {
-        assert!(now < 120_000, "the hold fails by its deadline");
-        now += 1_000;
-        world.tick(now, &[]);
-    }
-    assert_eq!((world.hold().expired, now), (1, 100_000));
+    (world, frames)
+}
+
+/// #345 review L-c, end to end: the held first fragment is replaced in the
+/// tick the newer same-stamp entry is created; the hold start derived from
+/// the deadline keeps that newer datagram from being denied.
+#[test]
+fn a_hold_longer_than_the_stamp_period_spares_a_same_stamp_newer_datagram() {
+    let (mut world, frames) = stamp_collision_world();
+    let mut batch = frames[2..].to_vec();
+    batch.push((
+        LAN,
+        from_h(S, 0x5902, 0, 64, 17, &udp(H, S, (5001, 4789), &[1, 2, 3])),
+    ));
+    world.tick(65_536, &batch);
+    assert_eq!(world.hold().replaced, 1);
     assert_eq!(tracker_held(&world), (1, 0), "the newer datagram is kept");
     assert_eq!(tracker_counters(&world).first_denied, 0);
+}
+
+/// #346 review: the ARP reply comes before the hold expires, with the
+/// newer same-stamp entry in place: that entry was created after the hold
+/// started, so the old first fragment is not replayed and the newer
+/// datagram is not decided.
+#[test]
+fn a_hold_longer_than_the_stamp_period_does_not_replay_into_a_same_stamp_newer_datagram() {
+    let (mut world, frames) = stamp_collision_world();
+    // The newer datagram's last fragment, then the reply, in one batch.
+    let mut batch = frames[2..].to_vec();
+    batch.push((WAN, g_reply()));
+    let sent = world.tick(65_536, &batch);
+    assert!(sent.is_empty(), "{sent:?}");
+    let counters = world.hold();
+    assert_eq!(
+        (counters.cancelled, counters.replayed, world.live()),
+        (1, 0, 0)
+    );
+    assert_eq!(tracker_held(&world), (1, 0), "the newer datagram is kept");
+    let tracker = tracker_counters(&world);
+    assert_eq!(
+        (
+            tracker.first_allowed,
+            tracker.first_denied,
+            tracker.poisoned
+        ),
+        (0, 0, 0)
+    );
 }

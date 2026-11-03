@@ -687,7 +687,8 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   holdは`interval × max-attempts`続き65.536 sを超え得るので、stamp（作成時刻の下位16 bit）だけでは
   足りません。hold開始（`deadline − interval × max-attempts`）より後に作られたentryも拒否します
   （#342 re-review core L2。stampはhold前に作られたentry同士だけを区別する）。
-  replayでも記録したassociation（index、stamp）がkeyのlive entry（pendingでもdecidedでも）と違えば、
+  replayでも記録したassociation（index、stamp）がkeyのlive entry（pendingでもdecidedでも）と違うか、
+  そのentryがhold開始より後に作られていれば（65.536 sを超えるholdのstamp一致、#346）、
   keyが新しいdatagramのものになっているのでreplayせず`cancelled`で解放します（#342 re-review core L3、
   #345 review L-a。eviction後にdatagram自身の後続fragmentが作り直したentryも区別できないので同じく
   fail closed。記録の無い最初のfragmentは

@@ -1980,10 +1980,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
     }
 
     /// The live entry of the key of `info`, whatever its state: its index,
-    /// creation stamp, and held fragments (at most
+    /// creation stamp, creation time, and held fragments (at most
     /// [`IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM`]; 0 unless it is
     /// pending). A lookup that changes nothing.
-    pub(crate) fn entry_for(&self, info: Ipv4FragmentInfo) -> Option<(u32, u16, usize)> {
+    pub(crate) fn entry_for(&self, info: Ipv4FragmentInfo) -> Option<(u32, u16, u64, usize)> {
         let entries = &*self.entries;
         self.entry_directory
             .lookup(
@@ -2003,6 +2003,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
                 (
                     u32::try_from(index).expect("entry index below NONE"),
                     stamp(entry.created_ms),
+                    entry.created_ms,
                     held,
                 )
             })
