@@ -428,15 +428,28 @@ frameを再検証しDF bitを読みます。この位置なので:
 - quoteは書き換え前の受信datagramです。inside→outsideではinside hostが送ったまま（NAT前）、
   outside→public addressではoutside hostが送ったまま（public address宛て）で、どちらも送信者が
   自分のsocketと照合できる形です。errorのsource、reverse route、neighbor、suppression、
-  limiterは他のgenerated errorと同じ`decide_icmpv4_error`/`schedule_reverse_icmpv4_error`です。
+  limiter（classは別）は他のgenerated errorと同じ`decide_icmpv4_error`/`schedule_reverse_icmpv4_error`です。
 
 超過はDF=1なら`IPV4_FRAGMENTATION_NEEDED`とType 3/Code 4（Next-Hop MTU = egress MTUをICMP
 header 2語目の下位16 bitへ、上位16 bitは0）、DF=0なら`IPV4_FRAGMENTATION_REQUIRED`（fragmentation
 未実装のdeviation、MTU2）、local Echo Replyなら`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。
-`Icmpv4ErrorAction`はNext-Hop MTUを2 bytes持ち（action slotは584→592 bytes）、limiter classは
-他のrouter生成errorと共有のclass 0です。すべてのgenerated errorは`fit_egress_mtu`でreverse
-egressのMTUから28を引いた長さまでquoteを切ります（切った部分は0で、同じactionは等しいまま）。
-ARP（28 bytes）はMTU 68に常に収まります。
+`Icmpv4ErrorAction`はNext-Hop MTUを2 bytes持ちます（action slotは584→592 bytes）。limiter classは
+Port Unreachable（class 1）と同様に専用のclass 2で、間隔は`fragmentation-needed-interval-ms`（default
+10 ms）です（review M1: class 0を共有するとTTL=1を100 msごとに送るだけで他hostのFragmentation Neededが
+すべてrate limitされ、PMTUDのremote black holeになった）。class 2のためlimiter stateはinterfaceごとに
+2つ要り、configは`icmpv4-errors.capacity.states` ≥ 2 × interfaces（Port Unreachableも送るなら+1）を
+要求します。per-egressで送信元単位ではないので、一つのsenderのfloodは同じegressの他senderへの
+errorを遅らせ得ます（residual）。
+
+すべてのgenerated errorは`fit_egress_mtu`でreverse egressのMTUから28を引いた長さまでquoteを切ります
+（切った部分は0で、同じactionは等しいまま）。roomが引用datagramのIHL × 4 + 8未満ならRFC 792の
+最小quoteを満たせないので、actionに印を付け`schedule`がclock/limiterより前に`QuoteBelowMinimum`で
+抑止します。ARP（28 bytes）はMTU 68に常に収まります。
+
+backendはframe全体を送るので、Total LengthがMTU以下でもEthernet payload（Total Length後のbytesを含む）が
+egress MTUを超えるframeは`IPV4_FRAME_EXCEEDS_MTU`で落とします（ICMPなし）。trimはしません
+（backendのcommitはframe長を変えない契約のため）。`ruster run`はdevice MTUがconfigより大きいと
+`MTU_BELOW_DEVICE`を警告します。
 
 ## ARP control scope
 
@@ -875,7 +888,9 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
   `StateFull`（Time Exceeded/Net/Host Unreachableのsilent抑止）にならないよう、switch onかつ
   hold容量>0のときvalidateは`icmpv4-errors.capacity.states >= interface数 + 1`を要求する
   （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、値は
-  出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない。
+  出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない
+  （MTU1以降、Fragmentation Neededを生成するときはclass 2がinterfaceごとに加わり、下限は
+  2 × interface数（+ 1）。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`）。
   1 slotをreserveする案はegressが3つ以上だと他egressを守れないため採らない。remote単位のfairnessはdeferred（NAT44-077）。
 - **Config/plan.** `[nat44.tcp] unsolicited-syn-icmp`（default true、`Nat44TcpPolicy`の一部、
   reloadable、`NatChange::unsolicited_syn_icmp`はtyped delta）と`[nat44.tcp.capacity]

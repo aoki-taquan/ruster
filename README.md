@@ -282,13 +282,18 @@ hairpin、翻訳したICMP error、local Echo Reply）のTotal Lengthをegress i
 `IPV4_FRAGMENTATION_NEEDED`とDestination Unreachable, Fragmentation Needed and DF Set
 （Type 3/Code 4、RFC 1812 §5.2.7.1）で、ICMP header 2語目の下位16 bitにegress MTUを
 Next-Hop MTUとして入れ（RFC 1191 §4）、NAT前の受信datagramを引用して元sourceへ返します
-（PMTUD）。他のerrorと同じsuppression、reverse route、limiter（class 0を共有）を通ります。
+（PMTUD）。他のerrorと同じsuppressionとreverse routeを通り、limiterは専用class
+（`[icmpv4-errors.policy] fragmentation-needed-interval-ms`、default 10 ms、egressごと）なので
+Time Exceeded等のfloodに使い切られません（`icmpv4-errors.capacity.states`は2 × interfaces以上、
+Port Unreachableも送るなら+1）。Ethernet payload（Total Length後のbytesを含む）がMTUを超える
+frameは`IPV4_FRAME_EXCEEDS_MTU`でdropします。
 DFなしは`IPV4_FRAGMENTATION_REQUIRED`でICMPなし（fragmentationは未実装のdeviation、
 NAT44-019L、MTU2。NATを通るDFなしdatagramはその前にnon-atomicとして落ちます）、local Echo
 Replyの超過は`ICMPV4_ECHO_REPLY_EXCEEDS_MTU`です。firewallが拒否するdatagramはfirewallの
 reasonで落ちerrorを生みません。router生成のすべてのICMP errorはreverse egressのMTUに
 収まるようquoteを切ります。`ruster run`はconfigのMTUがdeviceのMTU以下であることをattach前に
-確かめ、超えれば`MTU_BELOW_CONFIG`でexit 1です（device MTUがconfigより大きいのは可）。
+確かめ、超えれば`MTU_BELOW_CONFIG`でexit 1です（device MTUがconfigより大きいのは可で、
+`MTU_BELOW_DEVICE`を警告します）。
 
 ```toml
 [[interfaces]]

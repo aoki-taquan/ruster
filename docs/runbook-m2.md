@@ -618,7 +618,9 @@ refuses a port whose device MTU is below the configured one
 config=<config>`): the router would forward datagrams the device cannot
 send, and the AF_XDP TX would refuse them silently (`tx_over_mtu`) instead
 of the sender learning the path MTU. A device MTU above the configured one
-is fine. The link watch keeps the device MTU at or above the startup MTU
+is allowed and warned (`warning: port=if<id> MTU_BELOW_DEVICE mtu=<device>
+config=<config>`): a jumbo device left at the default `mtu` forwards only
+1500-byte datagrams. The link watch keeps the device MTU at or above the startup MTU
 (`MTU_DECREASED` is fatal), so the relation holds for the whole run. An MTU
 change in the config is restart-required (`INTERFACES`).
 
@@ -630,11 +632,19 @@ A forwarded datagram longer than the egress MTU is dropped:
   egress MTU as Next-Hop MTU, from the router's address on the interface
   toward the sender, quoting its datagram as it sent it (before NAT). The
   sender lowers its path MTU and retries (`ip route get <dst>` shows
-  `mtu`; `tracepath <dst>` reports `pmtu`). The error shares the limiter of
-  the other router-generated errors (`icmpv4-errors.policy.interval-ms` per
-  egress toward the senders): a flood of oversized datagrams on one
-  interface gets one error per interval (`icmpv4_errors.rate_limited`), and
-  TCP retransmits until one arrives.
+  `mtu`; `tracepath <dst>` reports `pmtu`). The error has its own limiter
+  per egress toward the senders (`[icmpv4-errors.policy]
+  fragmentation-needed-interval-ms`, default 10 ms, at least 1), so a flood
+  of other errors (a TTL sweep) never uses it up. It is per egress, not per
+  sender: one host sending oversized DF datagrams continuously can still
+  delay the error to other hosts behind the same interface
+  (`icmpv4_errors.rate_limited`); TCP retransmits until one arrives.
+  Mitigate with MSS clamping on the senders (or their gateway) and, if
+  needed, a shorter interval. Fragmentation Needed needs its own limiter
+  state on every interface: `icmpv4-errors.capacity.states` must be at
+  least twice the number of interfaces (plus one with delayed Port
+  Unreachable), or validation fails with
+  `ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`.
 - DF clear: `IPV4_FRAGMENTATION_REQUIRED`, no error. The router does not
   fragment yet (a deviation of RFC 1812 4.2.2.7, NAT44-019L; MTU2). NAT44
   translates only DF datagrams anyway (others are
@@ -642,7 +652,20 @@ A forwarded datagram longer than the egress MTU is dropped:
   between interfaces without NAT.
 - The firewall decides first: a datagram it refuses is dropped with the
   firewall's reason and never answered, so the error reveals nothing about
-  traffic the policy does not admit.
+  traffic the policy does not admit. To an admitted peer the error does
+  reveal the MTU of the router's link toward the destination (the inside
+  link MTU, for an outside sender): that is what RFC 1191 asks of a router.
+- A frame whose Ethernet payload is longer than the egress MTU although
+  its datagram fits (bytes after the IPv4 Total Length) is
+  `IPV4_FRAME_EXCEEDS_MTU`, without an error: the backend sends whole
+  frames. Ethernet minimum padding never trips it.
+- An ICMP error the router translates (NAT44) that is itself longer than
+  the egress MTU with DF is counted as `IPV4_FRAGMENTATION_NEEDED` but
+  answered with nothing (no error about an error, RFC 1812 4.3.2.7).
+- An unresolved next hop comes first: the first oversized datagram to a
+  neighbor not yet resolved is `NEIGHBOR_UNRESOLVED` (ARP starts, and a
+  fruitless ARP yields Host Unreachable); once the neighbor answers, the
+  next one gets Fragmentation Needed.
 
 `[icmpv4-errors.generate] fragmentation-needed = false` turns the error off
 (`icmpv4_errors.disabled_fragmentation_needed`). That black-holes PMTUD
@@ -1419,6 +1442,8 @@ port-unreachable-interval-ms`, default 1000, a restart-required
 Exceeded or a Net/Host Unreachable. It uses one more limiter state on the
 WAN egress, so `validate` (and `run`, `plan`, and every reload) refuses
 `icmpv4-errors.capacity.states` below the number of interfaces plus one
+(twice the number of interfaces plus one while Fragmentation Needed is
+generated, MTU1: it has a limiter state of its own on every egress)
 while `unsolicited-syn-icmp` is on and `unsolicited-syn-holds` is above 0:
 `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE
 path=icmpv4-errors.capacity.states`. With fewer states, a SYN flood could
@@ -2289,6 +2314,9 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=notify code=NOTIFY_SOCKET_INVALID\|WATCHDOG_USEC_INVALID\|WATCHDOG_PID_INVALID\|NOTIFY_SOCKET_OPEN` | 1 | the service manager's notification environment is not usable (section 5, "Service notification") | fix the unit's environment (`NOTIFY_SOCKET` must be an absolute path or `@name`) |
 | `health=MTU_DECREASED` / `MTU_ABOVE_FRAME` | 1 | MTU changed below the startup MTU / above the frame bound | restore the MTU, then restart |
 | `health=MTU_RAISED` | — | MTU raised within the frame bound; TX still bounded by the old MTU | restart to use the new MTU |
+| `warning: port=if<id> MTU_BELOW_DEVICE mtu=M config=C` | — | the device carries M but forwarding is limited to the interface's `mtu` C (default 1500) | set `mtu = M` if the link carries it (restart) |
+| `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED path=icmpv4-errors.capacity.states` | 2 | fewer than two ICMPv4 error limiter states per interface while Fragmentation Needed is on | raise `states` to at least 2 × interfaces (+1 with delayed Port Unreachable) |
+| `drop.IPV4_FRAME_EXCEEDS_MTU` | — | frames carry bytes after the IPv4 datagram beyond the egress MTU | find the sender appending trailers; the datagrams themselves fit |
 | `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
 | `drop.IPV4_FRAGMENTATION_NEEDED` growing | — | DF datagrams above an egress MTU; senders get Fragmentation Needed | normal for PMTUD; persistent growth from one sender means it ignores the error (check `icmpv4_errors.rate_limited`, firewalls in front of the sender) |
 | `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU (fragmentation is not implemented) | raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
