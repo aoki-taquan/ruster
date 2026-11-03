@@ -92,23 +92,25 @@ fn a_held_first_fragment_takes_or_keeps_a_pending_entry() {
     let ticket = tracker.admit_first(first, 2).unwrap();
     assert_eq!(tracker.hold_first(ticket, 2), Some((index, generation)));
     // Denied while still that entry: the held fragment goes.
-    assert!(tracker.deny_pending(index, generation, first, 3));
+    assert!(tracker.deny_pending(index, generation, first, 0, 3));
     assert_eq!((tracker.held(), tracker.held_for(first)), (0, 0));
     let counters = tracker.counters();
     assert_eq!((counters.first_denied, counters.held_denied), (1, 1));
     // It is no longer pending: a second deny does nothing.
-    assert!(!tracker.deny_pending(index, generation, first, 3));
+    assert!(!tracker.deny_pending(index, generation, first, 0, 3));
     assert_eq!(tracker.counters().first_denied, 1);
+    tracker.check_invariants().unwrap();
 }
 
 #[test]
 fn deny_pending_without_an_entry_does_nothing() {
     let mut tracker = tracker(4);
     let first = info(&fragment(10, 9, MF, 16));
-    assert!(!tracker.deny_pending(0, 1, first, 0));
-    assert!(!tracker.deny_pending(99, 1, first, 0), "out of range");
+    assert!(!tracker.deny_pending(0, 1, first, 0, 0));
+    assert!(!tracker.deny_pending(99, 1, first, 0, 0), "out of range");
     assert_eq!(tracker.entries(), 0);
     assert_eq!(tracker.counters().first_denied, 0);
+    tracker.check_invariants().unwrap();
 }
 
 #[test]
@@ -120,7 +122,7 @@ fn deny_pending_never_touches_a_decided_entry() {
     // The replay decided it (refused here).
     let ticket = tracker.admit_first(first, 1).unwrap();
     tracker.commit_deny(ticket, 1);
-    assert!(!tracker.deny_pending(index, generation, first, 2));
+    assert!(!tracker.deny_pending(index, generation, first, 0, 2));
     // Not poisoned: a byte-identical duplicate is still only a duplicate.
     assert_eq!(
         tracker.admit_first(first, 3),
@@ -128,6 +130,7 @@ fn deny_pending_never_touches_a_decided_entry() {
     );
     let counters = tracker.counters();
     assert_eq!((counters.poisoned, counters.duplicate_first), (0, 1));
+    tracker.check_invariants().unwrap();
 }
 
 /// Review #342 M1: the held datagram's entry expires and a newer datagram
@@ -143,9 +146,10 @@ fn deny_pending_spares_a_newer_datagram_reusing_the_key() {
     hold_later(&mut tracker, 10, 3, 1_500);
     assert_eq!(tracker.entries(), 1);
     assert_eq!(tracker.held_for(first), 1);
-    assert!(!tracker.deny_pending(index, generation, first, 1_600));
+    assert!(!tracker.deny_pending(index, generation, first, 0, 1_600));
     assert_eq!(tracker.held_for(first), 1, "the newer datagram keeps it");
     assert_eq!(tracker.counters().first_denied, 0);
+    tracker.check_invariants().unwrap();
 }
 
 /// #341 re-review L4: admitting a first fragment plans its room but evicts
@@ -176,4 +180,23 @@ fn a_first_fragment_evicts_only_at_its_commit() {
     tracker.commit_deny(ticket, 2);
     assert_eq!((tracker.entries(), tracker.held()), (1, 0));
     assert_eq!(tracker.counters().entries_evicted, 1);
+    tracker.check_invariants().unwrap();
+}
+
+/// #342 re-review core L2: however long the hold lasts, an entry created
+/// after it is never denied, even when its creation stamp (16 bits of
+/// milliseconds) matches the recorded one.
+#[test]
+fn deny_pending_spares_an_entry_created_after_the_hold_with_the_same_stamp() {
+    let mut tracker = tracker(1);
+    let first = info(&fragment(10, 5, MF, 16));
+    let ticket = tracker.admit_first(first, 0).unwrap();
+    let (index, generation) = tracker.hold_first(ticket, 0).unwrap();
+    // 65.536 s later (the old entry long expired), a newer datagram on the
+    // key takes the same slot with the same stamp.
+    hold_later(&mut tracker, 10, 5, 65_536);
+    assert_eq!(tracker.pending_for(first), Some((index, generation, 1)));
+    assert!(!tracker.deny_pending(index, generation, first, 0, 65_600));
+    assert_eq!(tracker.held_for(first), 1);
+    tracker.check_invariants().unwrap();
 }

@@ -2945,6 +2945,7 @@ where
         return 0;
     }
     let room = fragmentation.free_slots();
+    let window = resolution.hold_window_ms();
     let udp = Some(udp_config);
     let tcp = Some(tcp_config);
     let icmp_cfg = icmp.as_ref().map(|(config, _)| *config);
@@ -2960,7 +2961,7 @@ where
         },
         |hook| {
             let Some(tracker) = fragment_tracking.as_deref_mut() else {
-                return 0;
+                return Some(0);
             };
             match hook {
                 // A replayed first fragment releases the fragments its
@@ -2968,9 +2969,26 @@ where
                 // IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM) into the same
                 // slots: reserve them, so a replay that commits NAT and
                 // firewall state always finds its own slot.
-                ArpHoldFragmentHook::Reserve { frame, ingress } => {
-                    tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
-                        .map_or(0, |(_, info)| tracker.held_for(info))
+                // A pending entry for the key that is not the one recorded
+                // at hold time belongs to a newer datagram reusing the key:
+                // the replay would decide it, so it is not replayed.
+                ArpHoldFragmentHook::Reserve {
+                    frame,
+                    ingress,
+                    association,
+                } => {
+                    let Some((_, info)) =
+                        tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
+                    else {
+                        return Some(0);
+                    };
+                    match (tracker.pending_for(info), association) {
+                        (Some((index, stamp, _)), Some(recorded)) if (index, stamp) != recorded => {
+                            None
+                        }
+                        (Some((_, _, held)), _) => Some(held),
+                        (None, _) => Some(0),
+                    }
                 }
                 // A dropped held first fragment refuses exactly its own
                 // datagram's pending entry (lookup-free, never inserts or
@@ -2980,13 +2998,20 @@ where
                     ingress,
                     association,
                     generation,
+                    deadline_ms,
                 } => {
                     if let Some((_, info)) =
                         tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
                     {
-                        tracker.deny_pending(association, generation, info, now.0);
+                        tracker.deny_pending(
+                            association,
+                            generation,
+                            info,
+                            deadline_ms.saturating_sub(window),
+                            now.0,
+                        );
                     }
-                    0
+                    Some(0)
                 }
             }
         },
@@ -3065,10 +3090,12 @@ where
 }
 
 /// The trace of a replay: the replayed datagram was already counted when
-/// it was received (consumed as `ARP_HELD`), so its terminal events (drop,
-/// consume, fragmentation staging) are not passed on; the hold's own
-/// counters (`replay_dropped`, `replay_fragmented`) count them. Every other
-/// event (NAT, firewall, ICMP, resolution) is.
+/// it was received (consumed as `ARP_HELD`), so its consume and
+/// fragmentation-staging events are not passed on, and a drop goes out as
+/// [`TraceEvent::ArpHoldReplayDropped`] with its reason instead of
+/// `Dropped` (no drop counter counts it); the hold's own counters
+/// (`replay_dropped`, `replay_fragmented`, `replay_parked`) count them.
+/// Every other event (NAT, firewall, ICMP, resolution) is passed on.
 struct ReplayTrace<'t, T>(&'t mut T);
 
 impl<T: TraceSink> TraceSink for ReplayTrace<'_, T> {
@@ -3116,18 +3143,31 @@ fn hold_unresolved(
         return Err(NeighborUnresolved);
     };
     let miss = runtime.take_forward_miss(*now).ok_or(NeighborUnresolved)?;
+    let window = runtime.hold_window_ms();
     // A held first fragment replaced here (the latest is kept per next
-    // hop) refuses its own datagram's pending entry.
+    // hop) refuses its own datagram's pending entry, unless the new
+    // datagram continues that same entry (a duplicate of the held first
+    // fragment): its association moves to the new hold instead.
+    let continues = first_fragment.and_then(Ipv4FragmentFirstTicket::existing);
     hold.hold(
         frame,
         ingress,
         miss,
-        |held, held_ingress, association, generation| {
+        |held, held_ingress, association, generation, deadline_ms| {
+            if continues == Some(association) {
+                return;
+            }
             if let Some(tracker) = fragment_tracking.as_deref_mut() {
                 if let Some((_, info)) =
                     tracked_fragment(held, snapshot, held_ingress, udp, tcp, icmp)
                 {
-                    tracker.deny_pending(association, generation, info, now.0);
+                    tracker.deny_pending(
+                        association,
+                        generation,
+                        info,
+                        deadline_ms.saturating_sub(window),
+                        now.0,
+                    );
                 }
             }
         },
