@@ -66,10 +66,12 @@ fn snapshot(static_gateway: bool) -> &'static ForwardingSnapshot<'static> {
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: 1500,
         },
     ]);
     let neighbors: &'static [Neighbor] = if static_gateway {

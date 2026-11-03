@@ -412,10 +412,12 @@ fn priv_afpacket_forwards_between_two_veth_ports_through_core_and_drains() {
         Interface {
             id: LAN,
             mac: MacAddress(mac_a),
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: MacAddress(mac_b),
+            mtu: 1500,
         },
     ];
     let neighbors = [Neighbor {

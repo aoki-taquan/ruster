@@ -330,6 +330,7 @@ pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
                         hold.original_tos,
                         hold.quote(),
                         Icmpv4ErrorKind::DestinationUnreachablePort,
+                        0,
                         &mut resolution,
                         icmpv4_errors,
                         now,

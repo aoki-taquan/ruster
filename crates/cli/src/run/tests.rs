@@ -220,6 +220,9 @@ struct FakeHost {
     ipv4_routes: u32,
     /// The port whose index carries another name at startup (H10).
     renamed: Option<u16>,
+    /// The port whose device MTU is 1400, below the configured 1500
+    /// (MTU1).
+    small_mtu: Option<u16>,
     /// The policy each `preflight` call was given.
     preflight_policies: RefCell<Vec<PrivilegePolicy>>,
 }
@@ -730,8 +733,16 @@ impl PortHost for FakeHost {
                 super::netlink::IfName::new(port.device().as_bytes()).expect("device name")
             },
             rx_queues: if self.multi_queue == Some(id) { 4 } else { 1 },
-            link_mtu: 1500,
-            session_mtu: 1500,
+            link_mtu: if self.small_mtu == Some(id) {
+                1400
+            } else {
+                1500
+            },
+            session_mtu: if self.small_mtu == Some(id) {
+                1400
+            } else {
+                1500
+            },
             frame_capacity: port.umem().visible_capacity(),
             ipv4_addresses: 0,
             ipv4_routes: self.ipv4_routes,
@@ -1304,6 +1315,31 @@ fn a_port_renamed_before_attach_is_refused() {
         outcome
             .err
             .contains("startup failed: stage=checks port=if2 code=UNVERIFIABLE probe=name"),
+        "{}",
+        outcome.err
+    );
+    assert!(!host
+        .events()
+        .iter()
+        .any(|event| matches!(event, Event::Attach(WAN, _))));
+    host.assert_released();
+}
+
+/// MTU1: a device whose MTU is below the configured interface MTU (1500
+/// by default) is refused before attach: the core would forward datagrams
+/// the device cannot send instead of answering Fragmentation Needed.
+#[test]
+fn a_device_mtu_below_the_configured_mtu_is_refused() {
+    let host = FakeHost {
+        small_mtu: Some(WAN),
+        ..FakeHost::default()
+    };
+    let outcome = run(&host, &FakeStop::after(FIRST_LOOP_CHECK + 1));
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome.err.contains(
+            "startup failed: stage=checks port=if2 code=MTU_BELOW_CONFIG mtu=1400 config=1500"
+        ),
         "{}",
         outcome.err
     );

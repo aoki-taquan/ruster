@@ -32,6 +32,7 @@ fn interface() -> Interface {
     Interface {
         id: WAN,
         mac: ROUTER_MAC,
+        mtu: 1500,
     }
 }
 
@@ -51,6 +52,7 @@ fn local_interface() -> Interface {
     Interface {
         id: LAN,
         mac: LAN_MAC,
+        mtu: 1500,
     }
 }
 
@@ -436,6 +438,7 @@ fn lpm_supports_default_and_host_routes() {
         Interface {
             id: IfId(3),
             mac: MacAddress([3; 6]),
+            mtu: 1500,
         },
     ];
     let neighbors = [
@@ -499,6 +502,7 @@ fn arp_snapshot_rejects_duplicate_or_unknown_local_addresses() {
         Interface {
             id: WAN,
             mac: ROUTER_MAC,
+            mtu: 1500,
         },
     ];
     let duplicate = [local_binding(), local_binding()];

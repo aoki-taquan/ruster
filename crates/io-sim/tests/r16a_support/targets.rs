@@ -909,10 +909,12 @@ fn admission_topology() -> (
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: 1500,
             },
         ],
         [Neighbor {
@@ -934,10 +936,12 @@ fn resolution_topology() -> ([Route; 1], [Interface; 2], [LocalIpv4Binding; 2]) 
             Interface {
                 id: LAN,
                 mac: LAN_MAC,
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: WAN_MAC,
+                mtu: 1500,
             },
         ],
         [

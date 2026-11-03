@@ -1759,3 +1759,66 @@ fn dotted(path: &ruster_config::SourcePath) -> String {
     }
     text
 }
+
+/// MTU1: `[[interfaces]] mtu` defaults to the Ethernet MTU 1500, accepts 68
+/// (RFC 791) to 65535, reaches the core interface, and is refused outside
+/// that range at its own path. `fragmentation-needed` is a generation
+/// switch like the others.
+#[test]
+fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
+    use ruster_core::{Icmpv4ErrorKind, IfId, ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU};
+
+    let defaults = validated(VALID);
+    assert!(defaults
+        .core_interfaces()
+        .iter()
+        .all(|interface| interface.mtu == ETHERNET_DEFAULT_MTU));
+    assert!(defaults
+        .interfaces()
+        .iter()
+        .all(|binding| binding.mtu() == ETHERNET_DEFAULT_MTU));
+    let policy = defaults.icmpv4_errors().unwrap().policy();
+    assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded));
+
+    let with_mtu = |mtu: u64| {
+        VALID.replacen(
+            "mac = \"02:00:00:00:00:01\"\n",
+            &format!("mac = \"02:00:00:00:00:01\"\nmtu = {mtu}\n"),
+            1,
+        )
+    };
+    let mtu_of = |config: &ValidatedConfigV1, id: u16| {
+        config
+            .core_interfaces()
+            .iter()
+            .find(|interface| interface.id == IfId(id))
+            .unwrap()
+            .mtu
+    };
+    for mtu in [u64::from(IPV4_MIN_MTU), 1400, 9000, 65_535] {
+        let config = validated(&with_mtu(mtu));
+        assert_eq!(u64::from(mtu_of(&config, 1)), mtu);
+        assert_eq!(mtu_of(&config, 2), ETHERNET_DEFAULT_MTU);
+        assert_eq!(config.storage_shape(), defaults.storage_shape());
+    }
+    for mtu in [0, 67, 65_536, u64::from(u32::MAX)] {
+        let rejected = error(&with_mtu(mtu));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::InterfaceMtuOutOfRange,
+            "{mtu}"
+        );
+        assert_eq!(rejected.code().code(), "INTERFACE_MTU_OUT_OF_RANGE");
+        assert_eq!(dotted(rejected.path()), "interfaces[1].mtu", "{mtu}");
+    }
+
+    let off = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nfragmentation-needed = false\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    let policy = validated(&off).icmpv4_errors().unwrap().policy();
+    assert!(!policy.generates(Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded));
+    assert!(policy.generates(Icmpv4ErrorKind::TimeExceededTtl));
+    assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachableHost));
+}

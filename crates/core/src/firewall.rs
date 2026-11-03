@@ -2134,10 +2134,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: 1500,
             },
         ];
         let neighbors = [Neighbor {
@@ -2169,10 +2171,12 @@ mod tests {
             Interface {
                 id: LAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 1]),
+                mtu: 1500,
             },
             Interface {
                 id: WAN,
                 mac: MacAddress([2, 0, 0, 0, 0, 2]),
+                mtu: 1500,
             },
         ];
         let neighbors = [Neighbor {

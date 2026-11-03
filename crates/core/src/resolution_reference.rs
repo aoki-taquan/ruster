@@ -1539,7 +1539,8 @@ fn dispatch_one_failure(
             hold.original_tos,
             snapshot.ipv4_origin.default_ttl(),
             &hold.quote[..usize::from(hold.quote_len)],
-        ),
+        )
+        .fit_egress_mtu(interface.mtu),
         now,
     );
     if matches!(

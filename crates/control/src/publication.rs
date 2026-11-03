@@ -726,7 +726,7 @@ pub struct ValidatedCandidate {
     resolution_policy: ResolutionPolicy,
     resolution_hash_key: ResolutionHashKey,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
-    /// Owned copy of the published interface identities (IfId and MAC),
+    /// Owned copy of the published interface identities (IfId, MAC, MTU),
     /// compared by successor validation. It borrows nothing.
     interfaces: Box<[Interface]>,
     nat44_udp: Nat44UdpConfig,
@@ -934,7 +934,7 @@ impl ValidatedCandidate {
             return Err(SuccessorError::Icmpv4ErrorPolicyChanged);
         }
         // The validated owner rejects duplicate IfIds, so equal length plus
-        // inclusion is set equality of (IfId, MAC) pairs.
+        // inclusion is set equality of (IfId, MAC, MTU) triples.
         if candidate.interfaces.len() != self.interfaces.len()
             || !candidate
                 .interfaces

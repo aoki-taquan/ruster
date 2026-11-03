@@ -148,7 +148,7 @@ fn worst_case_bytes() -> usize {
 #[test]
 fn the_maximal_production_config_allocates_within_the_documented_bound() {
     // Documented in the runbook ("Validation limits and memory").
-    const WORST_CASE: usize = 57_065_664;
+    const WORST_CASE: usize = 57_098_432;
     assert_eq!(worst_case_bytes(), WORST_CASE);
     const { assert!(WORST_CASE <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes) };
 
@@ -192,7 +192,7 @@ fn the_maximal_config_with_per_host_limits_still_fits_the_bound() {
     // and the UDP table's 4-byte link word and 8-byte peer counter (N6).
     assert_eq!(host_bytes, 9_961_472);
     let worst_case = worst_case_bytes() + host_bytes;
-    assert_eq!(worst_case, 67_027_136);
+    assert_eq!(worst_case, 67_059_904);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let text = MAXIMAL
@@ -249,7 +249,7 @@ fn the_maximal_config_with_a_session_limit_fits_and_all_limits_fail_closed() {
     // 12-byte links, 4-byte words, 48-byte host slots (three lists).
     assert_eq!(session_host_bytes, 6_029_312);
     let worst_case = worst_case_bytes() + session_host_bytes;
-    assert_eq!(worst_case, 63_094_976);
+    assert_eq!(worst_case, 63_127_744);
     assert!(worst_case <= PRODUCTION_VALIDATION_LIMITS.max_runtime_bytes);
 
     let with_sessions = MAXIMAL.replacen(

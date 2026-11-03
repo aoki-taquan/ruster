@@ -511,6 +511,7 @@ where
             Some(backend) => open_ports(
                 &mut opened,
                 backend,
+                config.interfaces(),
                 settings.policy,
                 stop,
                 |port, warnings| {

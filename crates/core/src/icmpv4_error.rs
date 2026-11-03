@@ -30,6 +30,13 @@ pub enum Icmpv4ErrorKind {
     /// ([`Icmpv4ErrorPolicy::with_port_unreachable_interval_ms`]), so a SYN
     /// flood cannot use up the limiter of the other kinds.
     DestinationUnreachablePort,
+    /// Destination Unreachable, Fragmentation Needed and DF Set (Type 3,
+    /// Code 4): a forwarded datagram with DF set is longer than the MTU of
+    /// its egress interface (RFC 1812 §§4.2.2.7, 5.2.7.1; RFC 792). The
+    /// action carries the egress MTU as the Next-Hop MTU in the low-order
+    /// 16 bits of the second ICMP header word (RFC 1191 §4). It shares the
+    /// limiter class of the other router-originated kinds.
+    DestinationUnreachableFragmentationNeeded,
 }
 
 impl Icmpv4ErrorKind {
@@ -38,7 +45,8 @@ impl Icmpv4ErrorKind {
             Self::TimeExceededTtl => 11,
             Self::DestinationUnreachableNetwork
             | Self::DestinationUnreachableHost
-            | Self::DestinationUnreachablePort => 3,
+            | Self::DestinationUnreachablePort
+            | Self::DestinationUnreachableFragmentationNeeded => 3,
         }
     }
 
@@ -46,6 +54,7 @@ impl Icmpv4ErrorKind {
         match self {
             Self::DestinationUnreachableHost => 1,
             Self::DestinationUnreachablePort => 3,
+            Self::DestinationUnreachableFragmentationNeeded => 4,
             Self::TimeExceededTtl | Self::DestinationUnreachableNetwork => 0,
         }
     }
@@ -57,7 +66,8 @@ impl Icmpv4ErrorKind {
             Self::DestinationUnreachablePort => 1,
             Self::TimeExceededTtl
             | Self::DestinationUnreachableNetwork
-            | Self::DestinationUnreachableHost => 0,
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableFragmentationNeeded => 0,
         }
     }
 
@@ -67,6 +77,7 @@ impl Icmpv4ErrorKind {
             Self::DestinationUnreachableNetwork => 1 << 1,
             Self::DestinationUnreachableHost => 1 << 2,
             Self::DestinationUnreachablePort => 1 << 3,
+            Self::DestinationUnreachableFragmentationNeeded => 1 << 4,
         }
     }
 }
@@ -274,6 +285,10 @@ pub struct Icmpv4ErrorAction {
     pub destination_ip: Ipv4Address,
     pub outer_tos: u8,
     pub outer_ttl: u8,
+    /// Next-Hop MTU (RFC 1191 §4) written to bytes 6..8 of the ICMP header
+    /// of [`Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded`];
+    /// 0 (the RFC 792 unused field) for every other kind.
+    next_hop_mtu: u16,
     quote_len: u16,
     quote: [u8; ICMPV4_ERROR_MAX_QUOTE_LEN],
 }
@@ -327,9 +342,51 @@ impl Icmpv4ErrorAction {
             destination_ip,
             outer_tos: (original_tos & 0x1e) | 0xc0,
             outer_ttl,
+            next_hop_mtu: 0,
             quote_len: quote_len as u16,
             quote,
         }
+    }
+
+    /// Returns this action with `mtu` as the Next-Hop MTU (RFC 1191 §4).
+    /// Only [`Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded`]
+    /// carries one; for every other kind the field stays 0 (unused).
+    #[must_use]
+    pub const fn with_next_hop_mtu(mut self, mtu: u16) -> Self {
+        if matches!(
+            self.kind,
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded
+        ) {
+            self.next_hop_mtu = mtu;
+        }
+        self
+    }
+
+    /// The Next-Hop MTU written to the ICMP header (0 for kinds other than
+    /// Fragmentation Needed).
+    #[must_use]
+    pub const fn next_hop_mtu(&self) -> u16 {
+        self.next_hop_mtu
+    }
+
+    /// Returns this action with the quote shortened so that the generated
+    /// IPv4 datagram (20-byte header, 8-byte ICMP header, quote) is at most
+    /// `egress_mtu` bytes: an error never needs fragmentation on the
+    /// interface it leaves (RFC 1812 §4.3.2.3 asks for as much of the
+    /// original as fits without exceeding 576 bytes, which
+    /// [`ICMPV4_ERROR_MAX_QUOTE_LEN`] already bounds). The cut bytes are
+    /// zeroed so equal actions stay equal. An MTU of at least
+    /// [`crate::IPV4_MIN_MTU`] keeps at least 40 quoted bytes, more than the
+    /// 20-byte header plus 8 data bytes RFC 792 requires.
+    #[must_use]
+    pub fn fit_egress_mtu(mut self, egress_mtu: u16) -> Self {
+        let room = usize::from(egress_mtu).saturating_sub(28);
+        let quote_len = usize::from(self.quote_len);
+        if quote_len > room {
+            self.quote[room..quote_len].fill(0);
+            self.quote_len = room as u16;
+        }
+        self
     }
 
     #[must_use]
@@ -412,6 +469,12 @@ pub enum Icmpv4ErrorDisposition {
         egress: IfId,
         quote_len: usize,
     },
+    /// A Fragmentation Needed error (Type 3, Code 4) was queued.
+    FragmentationNeededQueued {
+        egress: IfId,
+        quote_len: usize,
+        next_hop_mtu: u16,
+    },
     Pending {
         egress: IfId,
     },
@@ -462,12 +525,14 @@ pub struct Icmpv4ErrorCounters {
     pub queued_destination_unreachable: usize,
     pub queued_host_unreachable: usize,
     pub queued_port_unreachable: usize,
+    pub queued_fragmentation_needed: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub disabled_time_exceeded: usize,
     pub disabled_destination_unreachable: usize,
     pub disabled_host_unreachable: usize,
     pub disabled_port_unreachable: usize,
+    pub disabled_fragmentation_needed: usize,
     pub state_full: usize,
     pub action_full: usize,
     pub clock_regressions: usize,
@@ -491,6 +556,7 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_destination_unreachable: usize,
     pub dequeued_host_unreachable: usize,
     pub dequeued_port_unreachable: usize,
+    pub dequeued_fragmentation_needed: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -797,6 +863,10 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.queued += 1;
                 self.counters.queued_port_unreachable += 1;
             }
+            Icmpv4ErrorDisposition::FragmentationNeededQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_fragmentation_needed += 1;
+            }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
@@ -811,6 +881,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 }
                 Icmpv4ErrorKind::DestinationUnreachablePort => {
                     self.counters.disabled_port_unreachable += 1;
+                }
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+                    self.counters.disabled_fragmentation_needed += 1;
                 }
             },
             Icmpv4ErrorDisposition::StateFull => self.counters.state_full += 1,
@@ -967,6 +1040,13 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                     quote_len: action.quote_len(),
                 }
             }
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+                Icmpv4ErrorDisposition::FragmentationNeededQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                    next_hop_mtu: action.next_hop_mtu,
+                }
+            }
         };
         self.record_suppression(disposition)
     }
@@ -1015,6 +1095,9 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             }
             Icmpv4ErrorKind::DestinationUnreachablePort => {
                 self.counters.dequeued_port_unreachable += 1;
+            }
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+                self.counters.dequeued_fragmentation_needed += 1;
             }
         }
         if let Some(state) = self.states[..self.occupied_prefix]
@@ -1083,10 +1166,13 @@ pub enum GeneratedIcmpv4Trace {
     HostUnreachableBuildFailed(Icmpv4ErrorBuildError),
     PortUnreachableAllocationFailed(GeneratedAllocationError),
     PortUnreachableBuildFailed(Icmpv4ErrorBuildError),
+    FragmentationNeededAllocationFailed(GeneratedAllocationError),
+    FragmentationNeededBuildFailed(Icmpv4ErrorBuildError),
     ClockRegression,
     DestinationUnreachableClockRegression,
     HostUnreachableClockRegression,
     PortUnreachableClockRegression,
+    FragmentationNeededClockRegression,
     TxRequested {
         egress: IfId,
         destination: Ipv4Address,
@@ -1103,6 +1189,11 @@ pub enum GeneratedIcmpv4Trace {
         egress: IfId,
         destination: Ipv4Address,
     },
+    FragmentationNeededTxRequested {
+        egress: IfId,
+        destination: Ipv4Address,
+        next_hop_mtu: u16,
+    },
     BatchCompleted {
         accepted: usize,
         rejected: usize,
@@ -1116,6 +1207,10 @@ pub enum GeneratedIcmpv4Trace {
         rejected: usize,
     },
     PortUnreachableBatchCompleted {
+        accepted: usize,
+        rejected: usize,
+    },
+    FragmentationNeededBatchCompleted {
         accepted: usize,
         rejected: usize,
     },
@@ -1178,6 +1273,9 @@ where
             Icmpv4ErrorKind::DestinationUnreachablePort => {
                 GeneratedIcmpv4Trace::PortUnreachableClockRegression
             }
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+                GeneratedIcmpv4Trace::FragmentationNeededClockRegression
+            }
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -1209,6 +1307,13 @@ where
                         destination: queued.action.destination_ip,
                     }
                 }
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+                    GeneratedIcmpv4Trace::FragmentationNeededTxRequested {
+                        egress: queued.action.egress,
+                        destination: queued.action.destination_ip,
+                        next_hop_mtu: queued.action.next_hop_mtu,
+                    }
+                }
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -1225,6 +1330,9 @@ where
                 Icmpv4ErrorKind::DestinationUnreachablePort => {
                     GeneratedIcmpv4Trace::PortUnreachableAllocationFailed(error)
                 }
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+                    GeneratedIcmpv4Trace::FragmentationNeededAllocationFailed(error)
+                }
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -1240,6 +1348,9 @@ where
                 }
                 Icmpv4ErrorKind::DestinationUnreachablePort => {
                     GeneratedIcmpv4Trace::PortUnreachableBuildFailed(error)
+                }
+                Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+                    GeneratedIcmpv4Trace::FragmentationNeededBuildFailed(error)
                 }
             };
             trace.record_generated_icmpv4(event);
@@ -1266,6 +1377,12 @@ where
         }
         Icmpv4ErrorKind::DestinationUnreachablePort => {
             GeneratedIcmpv4Trace::PortUnreachableBatchCompleted {
+                accepted: completion.accepted,
+                rejected: completion.rejected,
+            }
+        }
+        Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
+            GeneratedIcmpv4Trace::FragmentationNeededBatchCompleted {
                 accepted: completion.accepted,
                 rejected: completion.rejected,
             }
@@ -1325,6 +1442,7 @@ fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
     frame[24..26].copy_from_slice(&header_checksum.to_be_bytes());
     frame[34] = action.kind.icmp_type();
     frame[35] = action.kind.icmp_code();
+    frame[40..42].copy_from_slice(&action.next_hop_mtu.to_be_bytes());
     frame[42..icmp_end].copy_from_slice(action.quote());
     let icmp_checksum = internet_checksum(&frame[34..icmp_end]);
     frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
@@ -1699,6 +1817,56 @@ mod tests {
         let mut odd_frame = [0; 63];
         build_icmpv4_error(&mut odd_frame, &odd);
         assert_eq!(internet_checksum(&odd_frame[34..63]), 0);
+    }
+
+    #[test]
+    fn fragmentation_needed_carries_the_next_hop_mtu_and_only_it_does() {
+        let action = action_kind(
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
+            1,
+            40,
+        )
+        .with_next_hop_mtu(1400);
+        assert_eq!(action.next_hop_mtu(), 1400);
+        let mut frame = [0xa5; 82];
+        build_icmpv4_error(&mut frame, &action);
+        assert_eq!(&frame[34..36], &[3, 4]);
+        // RFC 1191 §4: high-order 16 bits unused (zero), low-order the MTU.
+        assert_eq!(&frame[38..42], &[0, 0, 0x05, 0x78]);
+        assert_eq!(internet_checksum(&frame[34..]), 0);
+        for kind in [
+            Icmpv4ErrorKind::TimeExceededTtl,
+            Icmpv4ErrorKind::DestinationUnreachableNetwork,
+            Icmpv4ErrorKind::DestinationUnreachableHost,
+            Icmpv4ErrorKind::DestinationUnreachablePort,
+        ] {
+            let action = action_kind(kind, 1, 40).with_next_hop_mtu(1400);
+            assert_eq!(action.next_hop_mtu(), 0, "{kind:?}");
+            build_icmpv4_error(&mut frame, &action);
+            assert_eq!(&frame[38..42], &[0; 4], "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn fit_egress_mtu_cuts_and_zeroes_the_quote_only_when_needed() {
+        let full = action_kind(
+            Icmpv4ErrorKind::TimeExceededTtl,
+            1,
+            ICMPV4_ERROR_MAX_QUOTE_LEN,
+        );
+        assert_eq!(full.fit_egress_mtu(576), full);
+        assert_eq!(full.fit_egress_mtu(1500), full);
+        let cut = full.fit_egress_mtu(575);
+        assert_eq!(cut.quote_len(), 547);
+        assert_eq!(cut.frame_len(), 14 + 575);
+        let minimal = full.fit_egress_mtu(crate::IPV4_MIN_MTU);
+        assert_eq!(minimal.quote_len(), 40);
+        assert_eq!(
+            minimal,
+            action_kind(Icmpv4ErrorKind::TimeExceededTtl, 1, 40)
+        );
+        let short = action_kind(Icmpv4ErrorKind::TimeExceededTtl, 1, 28);
+        assert_eq!(short.fit_egress_mtu(crate::IPV4_MIN_MTU), short);
     }
 
     #[test]

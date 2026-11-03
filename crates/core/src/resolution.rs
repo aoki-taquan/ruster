@@ -3280,7 +3280,8 @@ fn dispatch_one_failure(
             hold.original_tos,
             snapshot.ipv4_origin.default_ttl(),
             &hold.quote[..usize::from(hold.quote_len)],
-        ),
+        )
+        .fit_egress_mtu(interface.mtu),
         now,
     );
     if matches!(
@@ -4196,6 +4197,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4219,6 +4221,7 @@ mod tests {
         let changed_interfaces = [Interface {
             id: WAN,
             mac: MacAddress([7; 6]),
+            mtu: 1500,
         }];
         let changed =
             ForwardingSnapshot::new(&routes, &changed_interfaces, &[], &bindings).unwrap();
@@ -4367,6 +4370,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4459,6 +4463,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: new_mac,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,
@@ -4552,6 +4557,7 @@ mod tests {
         let interfaces = [Interface {
             id: WAN,
             mac: SOURCE_MAC,
+            mtu: 1500,
         }];
         let bindings = [LocalIpv4Binding {
             interface: WAN,

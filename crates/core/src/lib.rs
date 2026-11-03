@@ -144,4 +144,7 @@ pub use resolution::{
     ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport, ARP_REQUEST_FRAME_LEN,
     RESOLUTION_INDEX_CHAIN_LIMIT,
 };
-pub use route::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError};
+pub use route::{
+    IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError,
+    ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
+};

@@ -736,6 +736,21 @@ fn plan_classifies_interface_shape_and_policy_changes_as_restart_required() {
     ));
     assert_eq!(interface.restart_required(), [RestartRequired::Interfaces]);
 
+    // MTU1: the interface MTU is part of the interface identity the running
+    // backend was checked against (`ruster run` refuses a configured MTU
+    // above the device's), so a change is restart-required.
+    let mtu = plan(&[(
+        "mac = \"02:00:00:00:00:02\"",
+        "mac = \"02:00:00:00:00:02\"\nmtu = 1400",
+    )]);
+    only(&mtu, &["interfaces", "restart"]);
+    assert!(matches!(
+        mtu.interfaces(),
+        [Change::Changed(Delta { old, new })]
+            if old.id == IfId(2) && old.mtu == 1500 && new.mtu == 1400 && old.mac == new.mac
+    ));
+    assert_eq!(mtu.restart_required(), [RestartRequired::Interfaces]);
+
     // Name/device are control-plane labels: informational, reloadable.
     // Every reference is by name, so rename all of them.
     let renamed =

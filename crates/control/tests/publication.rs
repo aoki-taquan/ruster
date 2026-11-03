@@ -98,10 +98,12 @@ fn bare_plan(
         Interface {
             id: LAN,
             mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            mtu: 1500,
         },
     ];
     let bindings = [
@@ -129,6 +131,14 @@ fn bare_plan(
 
 /// Successor candidate with fresh keys and the given interface identities.
 fn interface_candidate(generation: u64, interfaces: &[(u8, u8)]) -> ValidatedCandidate {
+    interface_candidate_with_mtu(generation, interfaces, 1500)
+}
+
+fn interface_candidate_with_mtu(
+    generation: u64,
+    interfaces: &[(u8, u8)],
+    mtu: u16,
+) -> ValidatedCandidate {
     let routes = [
         Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
         Route::new(
@@ -144,6 +154,7 @@ fn interface_candidate(generation: u64, interfaces: &[(u8, u8)]) -> ValidatedCan
         .map(|&(id, mac)| Interface {
             id: IfId(id.into()),
             mac: MacAddress([2, 0, 0, 0, 0, mac]),
+            mtu,
         })
         .collect();
     let bindings = [
@@ -636,7 +647,7 @@ fn successor_checks_generation_keys_shape_and_fixed_policies_without_apply() {
     );
     assert_eq!(active.validate_successor(&candidate(2, 100)), Ok(()));
 
-    // Interface identities (IfId set and MACs) are restart-required. The
+    // Interface identities (IfId set, MACs, MTUs) are restart-required. The
     // published order is not part of the identity.
     let base = interface_candidate(1, &[(1, 1), (2, 2)]);
     for (changed, label) in [
@@ -659,6 +670,12 @@ fn successor_checks_generation_keys_shape_and_fixed_policies_without_apply() {
         base.validate_successor(&interface_candidate(2, &[(2, 2), (1, 1)])),
         Ok(()),
         "same set in another order"
+    );
+    // MTU1: the interface MTU is part of the identity.
+    assert_eq!(
+        base.validate_successor(&interface_candidate_with_mtu(2, &[(1, 1), (2, 2)], 1400)),
+        Err(SuccessorError::InterfacesChanged),
+        "MTU changed"
     );
 
     let exhausted = candidate(u64::MAX, 200);

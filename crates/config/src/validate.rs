@@ -65,8 +65,8 @@ pub struct ValidationLimits {
 ///   (1..=65535).
 /// - `max_quote_slots_per_table` = 4096 (2^12) for the two tables whose
 ///   slots each hold a quoted datagram: resolution failure holds (656
-///   bytes per slot) and ICMPv4 error actions (584 bytes). The bound is
-///   memory, not cost: at 2^16 these two tables alone would need 77.5 MiB.
+///   bytes per slot) and ICMPv4 error actions (592 bytes). The bound is
+///   memory, not cost: at 2^16 these two tables alone would need 78.0 MiB.
 ///   4096 equals [`crate::MAX_NEIGHBORS`].
 /// - `max_runtime_bytes` = 64 MiB, the simulator's value. Every table at its
 ///   limit (with the widest port pool) needs 53592256 bytes (51.11 MiB)
@@ -97,6 +97,9 @@ pub enum ValidationCode {
     DuplicateInterfaceId,
     DuplicateInterfaceName,
     DuplicateDeviceName,
+    /// An interface `mtu` outside 68 ([`ruster_core::IPV4_MIN_MTU`], RFC
+    /// 791) to 65535.
+    InterfaceMtuOutOfRange,
     InvalidMac,
     NonCanonicalMac,
     MacNotUnicast,
@@ -217,6 +220,7 @@ impl ValidationCode {
             Self::DuplicateInterfaceId => "DUPLICATE_INTERFACE_ID",
             Self::DuplicateInterfaceName => "DUPLICATE_INTERFACE_NAME",
             Self::DuplicateDeviceName => "DUPLICATE_DEVICE_NAME",
+            Self::InterfaceMtuOutOfRange => "INTERFACE_MTU_OUT_OF_RANGE",
             Self::InvalidMac => "INVALID_MAC",
             Self::NonCanonicalMac => "NON_CANONICAL_MAC",
             Self::MacNotUnicast => "MAC_NOT_UNICAST",
@@ -351,6 +355,7 @@ pub struct InterfaceBindingV1 {
     name: Box<str>,
     device: Box<str>,
     mac: MacAddress,
+    mtu: u16,
 }
 
 impl InterfaceBindingV1 {
@@ -372,6 +377,13 @@ impl InterfaceBindingV1 {
     #[must_use]
     pub const fn mac(&self) -> MacAddress {
         self.mac
+    }
+
+    /// The IPv4 MTU of the interface (`mtu`, default
+    /// [`ruster_core::ETHERNET_DEFAULT_MTU`]).
+    #[must_use]
+    pub const fn mtu(&self) -> u16 {
+        self.mtu
     }
 }
 
@@ -1070,16 +1082,30 @@ fn validate_v1(
             ));
         }
         let mac = parse_mac(&source.mac, child_path(&base, "mac"))?;
+        let mtu = match source.mtu {
+            None => ruster_core::ETHERNET_DEFAULT_MTU,
+            Some(mtu) => u16::try_from(mtu)
+                .ok()
+                .filter(|mtu| *mtu >= ruster_core::IPV4_MIN_MTU)
+                .ok_or_else(|| {
+                    ValidationError::new(
+                        ValidationCode::InterfaceMtuOutOfRange,
+                        child_path(&base, "mtu"),
+                    )
+                })?,
+        };
         let binding = InterfaceBindingV1 {
             id: IfId(source.id),
             name: source.name.into_boxed_str(),
             device: source.device.into_boxed_str(),
             mac,
+            mtu,
         };
         interface_records.push(InterfaceRecord {
             core: Interface {
                 id: binding.id,
                 mac,
+                mtu,
             },
             binding,
         });
@@ -1353,6 +1379,10 @@ fn validate_v1(
                         .with_generation(
                             Icmpv4ErrorKind::DestinationUnreachableHost,
                             generate.host_unreachable,
+                        )
+                        .with_generation(
+                            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
+                            generate.fragmentation_needed,
                         )
                 })
                 .map_err(|error| {

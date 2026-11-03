@@ -69,10 +69,12 @@ fn snapshot() -> ForwardingSnapshot<'static> {
         Interface {
             id: LAN,
             mac: LAN_MAC,
+            mtu: 1500,
         },
         Interface {
             id: WAN,
             mac: WAN_MAC,
+            mtu: 1500,
         },
     ]);
     let neighbors = leak([
@@ -1464,4 +1466,78 @@ fn refused_inbound_halves_keep_only_the_outbound_half() {
     assert_drop(&mut world, DropReason::Nat44UdpPeerTableFull, &packet);
     assert_eq!(world.state(), state);
     assert_eq!(world.udp.counters().hairpin_inbound_refused, 0);
+}
+
+/// `frame` grown to `total_len` bytes of IPv4 with UDP payload filler and
+/// both checksums recomputed.
+fn long_udp_frame(
+    source: Ipv4Address,
+    destination: Ipv4Address,
+    sport: u16,
+    dport: u16,
+    total_len: usize,
+) -> Vec<u8> {
+    let mut frame = udp_frame(source, destination, sport, dport);
+    frame.resize(14 + total_len, 0x5a);
+    let udp_len = u16::try_from(total_len - 20).unwrap();
+    frame[16..18].copy_from_slice(&u16::try_from(total_len).unwrap().to_be_bytes());
+    frame[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&frame[14..34]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    frame[38..40].copy_from_slice(&udp_len.to_be_bytes());
+    frame[40..42].fill(0);
+    let checksum = transport_checksum(source, destination, 17, &frame[34..]);
+    frame[40..42].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+/// MTU1: a hairpinned datagram is sent back out of the inside interface, so
+/// the inside MTU (1500 here) bounds it like any forwarded datagram. One
+/// byte over with DF is `IPV4_FRAGMENTATION_NEEDED`, byte-unchanged. As for
+/// an inbound half the destination refuses, the outbound half (the
+/// sender's mapping refresh and filter peer) has already committed when the
+/// egress MTU is checked (its firewall flow is refreshed); the inbound half
+/// commits nothing (no new firewall state or mapping, no hairpin or inbound
+/// translation is counted).
+/// Exactly the MTU hairpins.
+#[test]
+fn hairpinned_datagram_above_the_inside_mtu_commits_no_inbound_half() {
+    for rules in [None, Some(outbound_only_rules())] {
+        let with_firewall = rules.is_some();
+        let mut world = World::new(Nat44Filtering::EndpointIndependent, true, rules);
+        let public1 = world.establish(H1, P1, false);
+        let public2 = world.establish(H2, P2, false);
+        if with_firewall {
+            // The M1 firewall admits the H1 -> H2 hairpin once H2 has sent
+            // to H1's external endpoint (the hole punching exchange).
+            let first = udp_frame(H1, PUBLIC, P1, public2);
+            world.run(LAN, first.clone());
+            assert_drop(&mut world, DropReason::FirewallDefaultDenied, &first);
+            let reply = udp_frame(H2, PUBLIC, P2, public1);
+            world.run(LAN, reply.clone());
+            assert_hairpin(&mut world, &reply, H1_MAC, (PUBLIC, public2), (H1, P1));
+        }
+        let state = world.state();
+        let counters = world.udp.counters();
+        let packet = long_udp_frame(H1, PUBLIC, P1, public2, 1501);
+        world.run(LAN, packet.clone());
+        assert_drop(&mut world, DropReason::Ipv4FragmentationNeeded, &packet);
+        let after = world.state();
+        let occupied = |state: &State| {
+            state
+                .firewall
+                .iter()
+                .filter(|slot| slot.is_occupied())
+                .count()
+        };
+        assert_eq!(occupied(&after), occupied(&state));
+        assert_eq!(after.tcp_sessions, state.tcp_sessions);
+        let udp = world.udp.counters();
+        assert_eq!(udp.hairpin_translated, counters.hairpin_translated);
+        assert_eq!(udp.inbound_translated, counters.inbound_translated);
+        assert_eq!(udp.mappings_created, counters.mappings_created);
+        let packet = long_udp_frame(H1, PUBLIC, P1, public2, 1500);
+        world.run(LAN, packet.clone());
+        assert_hairpin(&mut world, &packet, H2_MAC, (PUBLIC, public1), (H2, P2));
+    }
 }
