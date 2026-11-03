@@ -2503,13 +2503,16 @@ monomorphizeします。`backend.kind`による分岐は起動時の一回だけ
 coreへはRX blockのzero-copy leaseとTX ringのframeを貸すだけです（backend所有buffer）。
 
 - 起動: `CAP_NET_RAW`のpreflight（memlock、BPF teardown checkなし）→portごと（IfId順）に
-  rtnetlinkで名前→index解決とdevice facts、AF_XDPと同じkernel露出check、MTU =
-  `max-frame-len - 14`、upper device無し、GRO/LRO/hardware GRO off（`SIOCETHTOOL`、名前でfeature
+  rtnetlinkで名前→index解決とdevice facts、AF_XDPと同じkernel露出check、MTU ≤
+  `max-frame-len - 14`（MTU1のconfig MTU ≤ device MTUと合わせて混在MTU可）、upper device無し
+  （`IFLA_MASTER`と、namespaceのlink dumpで`IFLA_LINK`がportの積み上げdevice）、GRO/LRO/hardware GRO off（`SIOCETHTOOL`、名前でfeature
   bitを引く）→全port通過後に`AfPacketIo::open`一回（failure atomic）。session単位のclose/detachは
   無く、datapathのdropがmapping→socketの順に解放します。
 - run中: link watchのkernel露出conditionはAF_PACKETではfatal（kernelは全frameを並行に処理し、
   停止しても露出は変わらないので、warningで続けずfail closed。startupのoverrideで受理したものは
-  warning）。kickの`ENXIO`で`unbound`になったportは、SEND_REQUESTのframeが永久にin-flightで
+  warning）。upper deviceはrun中もlink roundで見てfatal。別namespaceからportに積まれたdevice
+  （`IFLA_LINK_NETNSID`付き）はこのnamespaceのdumpに出ないので検出できず、運用者の責任です。
+  kickの`ENXIO`で`unbound`になったportは、SEND_REQUESTのframeが永久にin-flightで
   quiescenceを妨げるので`DEVICE_REMOVED`のfatal。`PACKET_STATISTICS`は`Datapath::refresh`で
   health sample（500 ms）ごとに64-bitへfold。idle waitの`POLLERR`（`sk_err`はmmap ringでは
   読まれず残る）はadapterが`SO_ERROR`で消します。TX stallはport completion数が進まない間の

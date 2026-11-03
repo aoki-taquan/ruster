@@ -294,6 +294,11 @@ pub struct DeviceFacts {
     /// `IFLA_MASTER`: the upper device (bridge, bond, team, VRF) the port
     /// is enslaved to, if any (checked for AF_PACKET ports only).
     pub master: Option<u32>,
+    /// Devices of the namespace stacked on the port (`IFLA_LINK` is the
+    /// port, no `IFLA_LINK_NETNSID`: VLAN, macvlan, ipvlan, MACsec, a
+    /// same-namespace veth peer); `None` if the link dump failed (checked
+    /// for AF_PACKET ports only).
+    pub stacked: Option<u32>,
 }
 
 /// Kernel IPv6 facts of one port. `None` is unreadable; the default is
@@ -445,19 +450,17 @@ pub enum CheckFailure {
     /// the address-less port for any local IPv4 address of the host (weak
     /// host model, CLI-079).
     KernelIpv4WeakHost,
-    /// AF_PACKET: the device MTU plus the 14-byte Ethernet header is below
-    /// the configured `max-frame-len`: the router could forward frames the
-    /// kernel then drops on this egress (it has no egress MTU of its own).
-    /// `required` is the MTU the configuration needs (`max-frame-len -
-    /// 14`).
-    MtuBelowFrame { mtu: u32, required: u32 },
     /// AF_PACKET: the device merges received frames (GRO, LRO, or
     /// hardware GRO) into super-frames longer than the MTU, which the RX
     /// ring cannot hold ([`super::offload`]).
     ReceiveOffload(super::offload::Offload),
     /// AF_PACKET: the port is enslaved to an upper device (a bridge, bond,
-    /// team, or VRF), whose kernel handling sees every frame the packet
-    /// socket gets a copy of (a bridge forwards them around the router).
+    /// team, or VRF; `IFLA_MASTER`), or a device of the router's namespace
+    /// is stacked on it (a VLAN, macvlan, ipvlan, or MACsec device, or a
+    /// same-namespace veth peer: `IFLA_LINK` is the port without
+    /// `IFLA_LINK_NETNSID`). The kernel handles every frame the packet
+    /// socket gets a copy of through it (a bridge forwards them around the
+    /// router, a macvlan delivers them to its own stack).
     KernelUpperDevice,
     /// A fact could not be read or did not belong to the opened device.
     Unverifiable(Probe),
@@ -503,6 +506,8 @@ pub enum Probe {
     /// AF_PACKET: the active receive offloads could not be read
     /// (`SIOCETHTOOL`).
     Offloads,
+    /// AF_PACKET: the link dump for devices stacked on the port failed.
+    UpperDevices,
 }
 
 impl Probe {
@@ -522,6 +527,7 @@ impl Probe {
             Self::Ipv6Forwarding => "ipv6-forwarding",
             Self::RpFilter => "rp-filter",
             Self::Offloads => "offloads",
+            Self::UpperDevices => "upper-devices",
         }
     }
 }
@@ -565,9 +571,6 @@ impl fmt::Display for CheckFailure {
             ),
             Self::KernelIpv6Enabled => formatter.write_str("KERNEL_IPV6_ENABLED"),
             Self::KernelIpv4WeakHost => formatter.write_str("KERNEL_IPV4_WEAK_HOST"),
-            Self::MtuBelowFrame { mtu, required } => {
-                write!(formatter, "MTU_BELOW_FRAME mtu={mtu} required={required}")
-            }
             Self::ReceiveOffload(offload) => {
                 write!(formatter, "RECEIVE_OFFLOAD feature={offload}")
             }
@@ -771,15 +774,23 @@ pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warni
 /// in this order:
 ///
 /// - MTU: the MTU read when the device name was resolved must equal the
-///   rtnetlink MTU of the index (`probe=mtu` otherwise), and it must be
-///   exactly `max-frame-len - 14`: above it the RX ring truncates (and
-///   the backend drops) every longer frame (`MTU_ABOVE_FRAME`); below it
-///   the router could forward frames longer than this egress carries,
-///   which the kernel drops (`MTU_BELOW_FRAME`). The link watch keeps
-///   both true at run time (a change is fatal).
-/// - The port must not be enslaved to an upper device
-///   (`KERNEL_UPPER_DEVICE`): a bridge, bond, team, or VRF handles every
-///   frame the router gets a copy of.
+///   rtnetlink MTU of the index (`probe=mtu` otherwise), and it must be at
+///   most `max-frame-len - 14`: above it the RX ring truncates (and the
+///   backend drops) every longer frame (`MTU_ABOVE_FRAME`), at startup
+///   and, through the link watch, at run time. A smaller device MTU is
+///   fine: since MTU1 the core never sends a frame above the interface's
+///   configured MTU (Fragmentation Needed instead), the configured MTU may
+///   not exceed the device's (`MTU_BELOW_CONFIG`, checked after this), and
+///   a run-time decrease is fatal (`MTU_DECREASED`). So ports of mixed
+///   MTUs (a 9000-byte LAN and a 1500-byte WAN) share one
+///   `max-frame-len` of the largest.
+/// - The port must not be enslaved to an upper device, and no device of
+///   the namespace may be stacked on it (`KERNEL_UPPER_DEVICE`; the link
+///   dump failing is `UNVERIFIABLE probe=upper-devices`): a bridge, bond,
+///   team, VRF, VLAN, macvlan, ipvlan, or MACsec device handles every
+///   frame the router gets a copy of. A device stacked on the port from
+///   another namespace (it then carries `IFLA_LINK_NETNSID` and is not in
+///   this dump) cannot be seen: the operator's responsibility.
 /// - Receive offloads (`offload`, [`super::offload`]): GRO, LRO, or
 ///   hardware GRO active is refused (`RECEIVE_OFFLOAD feature=...`),
 ///   unreadable is `UNVERIFIABLE probe=offloads`.
@@ -798,14 +809,13 @@ pub fn evaluate_packet_device(
             limit,
         });
     }
-    if facts.link_mtu < limit {
-        return Err(CheckFailure::MtuBelowFrame {
-            mtu: facts.link_mtu,
-            required: limit,
-        });
-    }
     if facts.master.is_some() {
         return Err(CheckFailure::KernelUpperDevice);
+    }
+    match facts.stacked {
+        Some(0) => {}
+        Some(_) => return Err(CheckFailure::KernelUpperDevice),
+        None => return Err(CheckFailure::Unverifiable(Probe::UpperDevices)),
     }
     match offload {
         Ok(None) => {}
@@ -1378,6 +1388,7 @@ pub mod linux {
             weak_host: ipv4.weak_host,
             ipv6,
             master: link.master,
+            stacked: probe.count(Dump::StackedLinks, ifindex).ok(),
         })
     }
 
@@ -1582,6 +1593,7 @@ mod tests {
     fn device_checks_refuse_or_warn_as_documented() {
         let clean = DeviceFacts {
             master: None,
+            stacked: Some(0),
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -1693,6 +1705,7 @@ mod tests {
     fn kernel_forwarding_is_refused_unless_allowed() {
         let clean = DeviceFacts {
             master: None,
+            stacked: Some(0),
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -1768,6 +1781,7 @@ mod tests {
     fn ipv4_weak_host_is_refused_unless_allowed() {
         let clean = DeviceFacts {
             master: None,
+            stacked: Some(0),
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -2123,6 +2137,7 @@ mod tests {
     fn multicast_forwarding_refuses_and_weak_host_needs_its_own_override() {
         let clean = DeviceFacts {
             master: None,
+            stacked: Some(0),
             ipv6: Ipv6Facts::DISABLED,
             ..ipv6_clean()
         };
@@ -2194,6 +2209,7 @@ mod tests {
     fn mtu_must_match_the_session_and_fit_a_frame() {
         let clean = DeviceFacts {
             master: None,
+            stacked: Some(0),
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -2284,7 +2300,7 @@ mod tests {
         assert_eq!(parse_flag(""), None);
     }
 
-    /// AFPKT-015: an AF_PACKET port needs MTU exactly `max-frame-len - 14`,
+    /// AFPKT-015: an AF_PACKET port needs MTU at most `max-frame-len - 14`,
     /// no upper device, and no merging receive offload, checked before the
     /// kernel exposure (which is the AF_XDP rule unchanged); its RX queue
     /// count does not matter.
@@ -2304,6 +2320,7 @@ mod tests {
             weak_host: Some(false),
             ipv6: Ipv6Facts::DISABLED,
             master: None,
+            stacked: Some(0),
             ..DeviceFacts::default()
         };
         let policy = CheckPolicy::default();
@@ -2311,6 +2328,35 @@ mod tests {
             evaluate_packet_device(&clean, Ok(None), policy),
             Ok(Warnings::default()),
             "eight RX queues need no override"
+        );
+        // A device MTU below max-frame-len - 14 is fine (MTU1 bounds the
+        // core's TX by the configured MTU, which may not exceed it): a
+        // 1500-byte WAN next to a 9000-byte LAN under max-frame-len 9014.
+        for mtu in [1_499, 1_280, 68] {
+            let smaller = DeviceFacts {
+                link_mtu: mtu,
+                session_mtu: mtu,
+                ..clean
+            };
+            assert!(
+                evaluate_packet_device(&smaller, Ok(None), policy).is_ok(),
+                "{mtu}"
+            );
+        }
+        let jumbo = |mtu: u32| DeviceFacts {
+            link_mtu: mtu,
+            session_mtu: mtu,
+            frame_capacity: 9_014,
+            ..clean
+        };
+        assert!(evaluate_packet_device(&jumbo(9_000), Ok(None), policy).is_ok());
+        assert!(evaluate_packet_device(&jumbo(1_500), Ok(None), policy).is_ok());
+        assert_eq!(
+            evaluate_packet_device(&jumbo(9_001), Ok(None), policy),
+            Err(CheckFailure::MtuAboveFrame {
+                mtu: 9_001,
+                limit: 9_000
+            })
         );
         for (facts, offload, failure) in [
             (
@@ -2335,23 +2381,28 @@ mod tests {
             ),
             (
                 DeviceFacts {
-                    link_mtu: 1499,
-                    session_mtu: 1499,
-                    ..clean
-                },
-                Ok(None),
-                CheckFailure::MtuBelowFrame {
-                    mtu: 1499,
-                    required: 1500,
-                },
-            ),
-            (
-                DeviceFacts {
                     master: Some(3),
                     ..clean
                 },
                 Ok(Some(Offload::Gro)),
                 CheckFailure::KernelUpperDevice,
+            ),
+            (
+                // A VLAN or macvlan stacked on the port.
+                DeviceFacts {
+                    stacked: Some(1),
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::KernelUpperDevice,
+            ),
+            (
+                DeviceFacts {
+                    stacked: None,
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::Unverifiable(Probe::UpperDevices),
             ),
             (
                 clean,
@@ -2416,11 +2467,8 @@ mod tests {
         assert!(warnings.ipv6_enabled);
         for (failure, text) in [
             (
-                CheckFailure::MtuBelowFrame {
-                    mtu: 1400,
-                    required: 1500,
-                },
-                "MTU_BELOW_FRAME mtu=1400 required=1500",
+                CheckFailure::Unverifiable(Probe::UpperDevices),
+                "UNVERIFIABLE probe=upper-devices",
             ),
             (
                 CheckFailure::ReceiveOffload(Offload::Gro),

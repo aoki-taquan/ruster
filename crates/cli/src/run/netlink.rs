@@ -93,6 +93,12 @@ const IFLA_IFNAME: u16 = 3;
 pub const IFNAMSIZ: usize = 16;
 /// `IFLA_MTU` (`u32`).
 const IFLA_MTU: u16 = 4;
+/// `IFLA_LINK` (`u32`, the lower device of a stacked device or a veth
+/// peer).
+const IFLA_LINK: u16 = 5;
+/// `IFLA_LINK_NETNSID` (`s32`: `IFLA_LINK` is an index in that peer
+/// namespace).
+const IFLA_LINK_NETNSID: u16 = 37;
 /// `IFLA_MASTER` (`u32`, the upper device's index of an enslaved port:
 /// bridge, bond, team, VRF, ...).
 const IFLA_MASTER: u16 = 10;
@@ -201,6 +207,12 @@ pub enum Dump {
     /// `RTM_GETROUTE` of every table: routes out of the interface
     /// ([`route_matches`]).
     Routes(Family),
+    /// `RTM_GETLINK` of every link: devices stacked on the interface
+    /// ([`stacked_on`]: a VLAN, macvlan, ipvlan, or MACsec device, or a
+    /// same-namespace veth peer). The kernel cannot filter a link dump by
+    /// `IFLA_LINK`, so every link of the namespace is read and matched here
+    /// (no `NLM_F_DUMP_FILTERED` expected).
+    StackedLinks,
 }
 
 /// Longest dump request: header, `rtmsg`, and one `RTA_OIF`.
@@ -215,8 +227,10 @@ pub const REQUEST_LEN: usize = HEADER_LEN + RTMSG_LEN + 8;
 /// does not exist with `ENODEV`.
 pub fn dump_request(dump: Dump, sequence: u32, ifindex: u32) -> ([u8; REQUEST_LEN], usize) {
     let (kind, family, body) = match dump {
-        Dump::Addresses(family) => (RTM_GETADDR, family, IFADDRMSG_LEN),
-        Dump::Routes(family) => (RTM_GETROUTE, family, RTMSG_LEN + 8),
+        Dump::Addresses(family) => (RTM_GETADDR, family.af(), IFADDRMSG_LEN),
+        Dump::Routes(family) => (RTM_GETROUTE, family.af(), RTMSG_LEN + 8),
+        // ifinfomsg all zero (AF_UNSPEC, no index, no flags): every link.
+        Dump::StackedLinks => (RTM_GETLINK, 0, IFINFOMSG_LEN),
     };
     let mut request = [0_u8; REQUEST_LEN];
     let len = HEADER_LEN + body;
@@ -227,7 +241,7 @@ pub fn dump_request(dump: Dump, sequence: u32, ifindex: u32) -> ([u8; REQUEST_LE
     request[8..12].copy_from_slice(&sequence.to_ne_bytes());
     // nlmsg_pid 0: addressed to the kernel. The family is the first byte
     // of both `ifaddrmsg` and `rtmsg`.
-    request[HEADER_LEN] = family.af();
+    request[HEADER_LEN] = family;
     match dump {
         Dump::Addresses(_) => {
             request[HEADER_LEN + 4..HEADER_LEN + 8].copy_from_slice(&ifindex.to_ne_bytes());
@@ -238,6 +252,7 @@ pub fn dump_request(dump: Dump, sequence: u32, ifindex: u32) -> ([u8; REQUEST_LE
             request[at + 2..at + 4].copy_from_slice(&RTA_OIF.to_ne_bytes());
             request[at + 4..at + 8].copy_from_slice(&ifindex.to_ne_bytes());
         }
+        Dump::StackedLinks => {}
     }
     (request, len)
 }
@@ -339,6 +354,10 @@ pub fn parse_chunk(
                         }
                     }
                 }
+                RTM_NEWLINK if dump == Dump::StackedLinks => {
+                    let stacked = stacked_on(message, ifindex)?;
+                    chunk.count = chunk.count.saturating_add(u32::from(stacked));
+                }
                 _ => {}
             }
         }
@@ -371,6 +390,36 @@ fn attributes<'m>(
         at += attr_len.div_ceil(4) * 4;
     }
     Ok(())
+}
+
+/// Whether the `RTM_NEWLINK` `message` is a device stacked on `ifindex` in
+/// this namespace: another index whose `IFLA_LINK` is `ifindex` and that
+/// has no `IFLA_LINK_NETNSID` (with it, `IFLA_LINK` is an index of another
+/// namespace, as for a veth peer moved away). Such a device (VLAN,
+/// macvlan, ipvlan, MACsec, a veth peer in the same namespace) gets the
+/// port's frames, or puts frames on it, through the kernel. A short
+/// message, a duplicated or wrongly sized `IFLA_LINK`, or a duplicated
+/// `IFLA_LINK_NETNSID` fails closed.
+pub fn stacked_on(message: &[u8], ifindex: u32) -> Result<bool, NetlinkError> {
+    if message.len() < HEADER_LEN + IFINFOMSG_LEN {
+        return Err(NetlinkError::Malformed);
+    }
+    let index = u32_at(message, HEADER_LEN + 4).ok_or(NetlinkError::Malformed)?;
+    let mut link = None;
+    let mut netnsid = None;
+    attributes(
+        message,
+        HEADER_LEN + IFINFOMSG_LEN,
+        |kind, payload| match kind {
+            IFLA_LINK => once(&mut link, payload),
+            IFLA_LINK_NETNSID => once(&mut netnsid, payload),
+            _ => Ok(()),
+        },
+    )?;
+    let Some(link) = link else {
+        return Ok(false);
+    };
+    Ok(index != ifindex && u32_payload(link)? == ifindex && netnsid.is_none())
 }
 
 /// Stores `payload` in an empty `slot`: a second copy of the attribute
@@ -1015,7 +1064,9 @@ fn dump_once(
         let chunk = parse_chunk(&buffer[..received], sequence, port, dump, ifindex)?;
         total.count = total.count.saturating_add(chunk.count);
         total.interrupted |= chunk.interrupted;
-        total.filtered |= chunk.filtered;
+        // A link dump is never filtered by the kernel (the match is all
+        // userspace, [`stacked_on`]); every other dump must be.
+        total.filtered |= chunk.filtered || dump == Dump::StackedLinks;
         if chunk.done {
             return finish_dump(total);
         }
@@ -1967,6 +2018,54 @@ mod tests {
         }
     }
 
+    /// Devices stacked on index 5: `IFLA_LINK` 5 in this namespace, not
+    /// the port itself, not a peer in another namespace.
+    #[test]
+    fn a_link_dump_counts_the_devices_stacked_on_the_port() {
+        let (request, len) = dump_request(Dump::StackedLinks, 9, 5);
+        assert_eq!(len, 32);
+        assert_eq!(&request[0..4], &32_u32.to_ne_bytes());
+        assert_eq!(&request[4..6], &18_u16.to_ne_bytes());
+        assert_eq!(&request[6..8], &0x301_u16.to_ne_bytes());
+        assert!(request[16..].iter().all(|byte| *byte == 0), "every link");
+        let mtu = attribute(IFLA_MTU, &1500_u32.to_ne_bytes());
+        let on = |index: u32, lower: u32, netnsid: bool| {
+            let mut attributes = vec![mtu.clone(), attribute(IFLA_LINK, &lower.to_ne_bytes())];
+            if netnsid {
+                attributes.push(attribute(IFLA_LINK_NETNSID, &0_i32.to_ne_bytes()));
+            }
+            link(index, UP, &attributes)
+        };
+        let stacked = |message: &[u8]| stacked_on(message, 5);
+        assert_eq!(stacked(&on(6, 5, false)), Ok(true), "a VLAN on the port");
+        assert_eq!(stacked(&on(6, 5, true)), Ok(false), "a peer elsewhere");
+        assert_eq!(stacked(&on(6, 4, false)), Ok(false), "another lower");
+        assert_eq!(stacked(&on(5, 5, false)), Ok(false), "the port itself");
+        assert_eq!(stacked(&link(6, UP, std::slice::from_ref(&mtu))), Ok(false));
+        let doubled = link(
+            6,
+            UP,
+            &[
+                attribute(IFLA_LINK, &5_u32.to_ne_bytes()),
+                attribute(IFLA_LINK, &5_u32.to_ne_bytes()),
+            ],
+        );
+        assert_eq!(stacked(&doubled), Err(NetlinkError::Malformed));
+        let short = link(6, UP, &[attribute(IFLA_LINK, &[5, 0])]);
+        assert_eq!(stacked(&short), Err(NetlinkError::Malformed));
+        // A chunk counts the matches of its sequence; a link dump needs no
+        // NLM_F_DUMP_FILTERED (the dump loop marks it).
+        let mut chunk = on(6, 5, false);
+        chunk.extend(on(7, 5, true));
+        chunk.extend(on(8, 5, false));
+        chunk.extend(message(NLMSG_DONE, 0x2, 7, &0_i32.to_ne_bytes()));
+        let parsed = parse_chunk(&chunk, 7, PORT, Dump::StackedLinks, 5).expect("chunk");
+        assert_eq!((parsed.count, parsed.done), (2, true));
+        // Other dumps ignore link messages.
+        let parsed = parse_chunk(&chunk, 7, PORT, V4A, 5).expect("chunk");
+        assert_eq!(parsed.count, 0);
+    }
+
     #[test]
     fn hostile_link_replies_fail_closed() {
         let mtu = attribute(IFLA_MTU, &1500_u32.to_ne_bytes());
@@ -2088,6 +2187,8 @@ mod tests {
             .expect_err("no such device")
             .is_no_device());
         assert!(probe.ipv4_addresses(1).is_ok());
+        // Nothing is stacked on loopback; the dump reads every link.
+        assert_eq!(probe.count(Dump::StackedLinks, 1), Ok(0));
         // Strict checking: the kernel filters by index and refuses one
         // that does not exist.
         assert!(probe

@@ -137,6 +137,9 @@ pub struct PortRound {
     pub forwarding: Result<Forwarding, ()>,
     pub weak_host: Option<bool>,
     pub ipv6: Option<Ipv6Sample>,
+    /// AF_PACKET ports: devices stacked on the port (one bounded link
+    /// dump into the probe's reused buffer, no allocation).
+    pub uppers: Option<Result<u32, NetlinkError>>,
 }
 
 impl PortRound {
@@ -148,6 +151,7 @@ impl PortRound {
         forwarding: Err(()),
         weak_host: None,
         ipv6: None,
+        uppers: None,
     };
 }
 
@@ -183,6 +187,7 @@ pub fn probe_round<L: LinkMonitor>(links: &mut L, targets: &[LinkTarget], round:
         port.forwarding = links.forwarding(target);
         port.weak_host = links.ipv4_weak_host(target);
         port.ipv6 = linked.then(|| links.ipv6(target));
+        port.uppers = (linked && target.watch_uppers).then(|| links.stacked_links(target));
     }
 }
 

@@ -2024,7 +2024,7 @@ BPF privileges).
 kind = "af-packet"
 
 [backend.af-packet]
-max-frame-len = 1514            # optional, default 1514; every port's MTU must be exactly this - 14
+max-frame-len = 1514            # optional, default 1514; every port's device MTU must be at most this - 14
 
 [[backend.af-packet.ports]]     # one per [[interfaces]] entry
 interface = "lan"
@@ -2066,13 +2066,30 @@ as before and after it. So the kernel must have nothing to act on:
   (`--allow-kernel-forwarding`, `--allow-ipv4-weak-host`,
   `--allow-kernel-ipv6`). The RX queue count does not matter (a packet
   socket receives from every queue; no `--allow-multi-queue` needed).
-- In addition: the MTU must be exactly `max-frame-len - 14`
+- In addition: the device MTU must be at most `max-frame-len - 14`
   (`MTU_ABOVE_FRAME mtu= limit=`: longer frames would be truncated by the
-  RX ring and dropped; `MTU_BELOW_FRAME mtu= required=`: the router could
-  forward frames this egress cannot carry, which the kernel drops); the port
-  must not be enslaved to a bridge, bond, team, or VRF
-  (`KERNEL_UPPER_DEVICE`: a bridge would forward every frame around the
-  router); and no merging receive offload may be active
+  RX ring and dropped; a raise above it while running is fatal too). A
+  smaller device MTU is fine: the router never sends a frame above an
+  interface's configured `mtu` (MTU1: Fragmentation Needed instead), which
+  may not exceed the device MTU, and a decrease while running is fatal
+  (`MTU_DECREASED`). So mixed MTUs share one `max-frame-len`, the largest
+  port's MTU plus 14: a 9000-byte LAN and a 1500-byte WAN run with
+  `max-frame-len = 9014` (the rings then hold 9014-byte frames for both).
+  The port must not be enslaved to a bridge, bond, team, or VRF, and no
+  device of the router's namespace may be stacked on it: a VLAN, macvlan,
+  ipvlan, or MACsec device on the port, or the port's veth peer in the
+  same namespace (`KERNEL_UPPER_DEVICE`: a bridge forwards every frame
+  around the router, a macvlan delivers frames to its own stack). Devices
+  stacked on the port are found with one link dump of the namespace
+  (`IFLA_LINK` is the port and no `IFLA_LINK_NETNSID`; a failed dump is
+  `UNVERIFIABLE probe=upper-devices`), at startup and at every link round
+  while running, where one is fatal (`fatal: port=ifN
+  health=KERNEL_UPPER_DEVICE`), as is the port becoming enslaved. A device
+  stacked on the port *from another namespace* (a macvlan or ipvlan created
+  in, or moved to, a container's namespace) carries `IFLA_LINK_NETNSID`
+  and is not in this namespace's dump: the router cannot see it, so keeping
+  the ports free of such devices is the operator's responsibility. Finally,
+  no merging receive offload may be active
   (`RECEIVE_OFFLOAD feature=rx-gro|rx-lro|rx-gro-hw`; a packet socket sees
   frames after GRO, so merged super-frames would be truncated and dropped;
   `UNVERIFIABLE probe=offloads` if the features cannot be read). Fix:
@@ -2089,8 +2106,13 @@ as before and after it. So the kernel must have nothing to act on:
   every frame), but it makes the misconfiguration visible at once instead
   of letting the kernel answer, deliver, or forward in parallel. What an
   override accepted at startup stays a warning. A GRO toggle or a new
-  upper device at run time is not watched: keep them off (a GRO change
-  shows as growing `af_packet_port.rx_packet_faults`).
+  upper device at run time is fatal (above). Receive offloads are not
+  watched while running (the probe is an ioctl the syscall filter does not
+  allow): turning GRO or LRO back on shows as growing
+  `ifN.af_packet_port.rx_packet_faults` (merged super-frames truncated and
+  dropped) and TCP through the router stalling under load; turn it off
+  again (`ethtool -K <dev> gro off lro off`), and the next start refuses it
+  anyway.
 - The kernel sends nothing of its own on a correctly configured port: no
   IPv4 address means no ARP and no IGMP report source, `disable_ipv6=1`
   means no neighbor discovery or MLD, and forwarding off with `rp_filter`
@@ -2113,6 +2135,13 @@ up to `retire-timeout-ms` late; 1 to 2 ms suits a router (the timer runs in
 the kernel, not in the router thread). A growing `kernel_drops` means the
 RX ring is too small (more or larger blocks) or the router thread too slow.
 
+**Kernel memory.** The TPACKET rings are kernel pages allocated when the
+sockets open: up to 256 MiB per port and 1 GiB in all (the validation
+bounds, `ring-bytes=` in `ruster validate`). They are not charged to
+`RLIMIT_MEMLOCK` and, as `packet_mmap` ring pages, not to the memory cgroup
+of the service either, so a container or systemd `MemoryMax=` does not
+bound them: size the rings for the host, not for the cgroup.
+
 **Stats.** `af_packet.*` (sum) and `ifN.af_packet_port.*` (per port,
 OBS-028): RX packets and faults, TX published/copies/completed/ring full/
 oversize, kicks (deferred, link down, unbound, errors, retries,
@@ -2127,8 +2156,11 @@ kernel's `tp_packets`/`tp_drops`/`tp_freeze_q_cnt` as `kernel_packets`/
 | Symptom | Cause and fix |
 |---|---|
 | `stage=checks port=ifN code=RECEIVE_OFFLOAD feature=rx-gro` | GRO (or LRO, hardware GRO) on: `ethtool -K <dev> gro off lro off` |
-| `code=MTU_BELOW_FRAME mtu=M required=R` or `MTU_ABOVE_FRAME` | set the port MTU to `max-frame-len - 14`, or change `max-frame-len` (restart-required) |
-| `code=KERNEL_UPPER_DEVICE` | remove the port from its bridge/bond/team/VRF |
+| `code=MTU_ABOVE_FRAME mtu=M limit=L` | lower the port MTU to at most `max-frame-len - 14`, or raise `max-frame-len` (restart-required) |
+| `code=MTU_BELOW_CONFIG mtu=M config=C` | the interface's configured `mtu` is above the device MTU: raise the device MTU or lower `mtu` (MTU1) |
+| `code=KERNEL_UPPER_DEVICE` (startup or `fatal: ... health=KERNEL_UPPER_DEVICE`) | remove the port from its bridge/bond/team/VRF, and delete the VLAN/macvlan/ipvlan/MACsec devices on it (`ip -d link show` lists `@<port>`); a veth pair needs its peer in another namespace |
+| `code=UNVERIFIABLE probe=upper-devices` | the namespace's link dump failed (rtnetlink); retry, check the kernel log |
+| `af_packet_port.rx_packet_faults` grows, TCP stalls under load | GRO or LRO was turned on while running (not watched): `ethtool -K <dev> gro off lro off`; the next start refuses it |
 | `code=UNVERIFIABLE probe=link` at startup | the configured device does not exist in the router's network namespace |
 | `stage=open code=CONFIG.RING...` | the ring geometry does not fit this system's page size (a 16 or 64 KiB page needs blocks of at least that size) |
 | `stage=open code=SOCKET/ERRNO_1` | no `CAP_NET_RAW` in the namespace that opens the socket |
@@ -2318,8 +2350,9 @@ What it proves, on the runner's kernel only:
   configs validate with `ring-bytes=786432`; a firewall change plans
   reloadable, a ring change and af-xdp -> af-packet restart-required
   `BACKEND`), `priv_run_afpacket_refusals` (GRO on ra
-  `RECEIVE_OFFLOAD feature=rx-gro`, rb MTU 1400 `MTU_BELOW_FRAME`, a kernel
-  address on rb `KERNEL_IPV4_ADDRESSES`: exit 1, no packet socket in the
+  `RECEIVE_OFFLOAD feature=rx-gro`, rb MTU 1400 `MTU_BELOW_CONFIG`, a kernel
+  address on rb `KERNEL_IPV4_ADDRESSES`, a VLAN on ra
+  `KERNEL_UPPER_DEVICE`: exit 1, no packet socket in the
   namespace's `/proc/net/packet`), `priv_run_afpacket_forward` (UDP with
   NAT44 to host B, 3 of 3 pings of 192.168.1.1 answered, every thread
   dropped and under the kill filter, Landlock, two packet sockets open),
@@ -2332,6 +2365,8 @@ What it proves, on the runner's kernel only:
   (SIGTERM exit 0 with nothing in flight and `closed 2 port(s)`, no packet
   socket left, final `af_packet.*`, and on ra and rb no more frames
   transmitted than the router completed: the kernel sent none of its own)
+  `priv_run_afpacket_upper` (a bridge in the router namespace enslaving
+  rb while running: exit 1 `KERNEL_UPPER_DEVICE`, no packet socket left)
   and `priv_run_afpacket_removal` (`ip link del rb` while running: exit 1
   `DEVICE_REMOVED`, no packet socket left).
 - Nothing is left behind: a final step fails if any `ruster-*` namespace

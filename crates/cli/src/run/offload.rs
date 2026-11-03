@@ -82,10 +82,37 @@ pub enum OffloadError {
     UnknownFeature(Offload),
 }
 
+/// One `SIOCETHTOOL` command of the probe. The command buffer is built by
+/// [`Command::buffer`] from this value only, sized for everything the
+/// kernel writes back for it, so a caller cannot hand the ioctl a buffer
+/// that is too short.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Command {
+    /// `ETHTOOL_GSSET_INFO` for `ETH_SS_FEATURES`.
+    SsetInfo,
+    /// `ETHTOOL_GSTRINGS` of `count` feature strings (the count
+    /// `SsetInfo` returned, at most [`MAX_FEATURES`]).
+    Strings { count: usize },
+    /// `ETHTOOL_GFEATURES` of `words` feature words.
+    Features { words: usize },
+}
+
+impl Command {
+    /// The request buffer of this command (checked sizes; a count above
+    /// [`MAX_FEATURES`] is refused).
+    pub fn buffer(self) -> Result<Vec<u8>, OffloadError> {
+        match self {
+            Self::SsetInfo => Ok(sset_info_request().to_vec()),
+            Self::Strings { count } => strings_request(count),
+            Self::Features { words } => features_request(words),
+        }
+    }
+}
+
 /// The `ETHTOOL_GSSET_INFO` request for the feature string count: `cmd`,
 /// `reserved`, `sset_mask` (one bit, `ETH_SS_FEATURES`), and room for one
-/// `u32` count.
-pub fn sset_info_request() -> [u8; 20] {
+/// `u32` count (the kernel writes one per set mask bit).
+fn sset_info_request() -> [u8; 20] {
     let mut request = [0_u8; 20];
     request[0..4].copy_from_slice(&GSSET_INFO.to_ne_bytes());
     request[8..16].copy_from_slice(&(1_u64 << SS_FEATURES).to_ne_bytes());
@@ -94,7 +121,10 @@ pub fn sset_info_request() -> [u8; 20] {
 
 /// The feature string count from an answered [`sset_info_request`]: the
 /// kernel clears the mask bit of a set it does not know.
-pub fn sset_info_count(reply: &[u8; 20]) -> Result<usize, OffloadError> {
+pub fn sset_info_count(reply: &[u8]) -> Result<usize, OffloadError> {
+    if reply.len() != 20 {
+        return Err(OffloadError::Malformed);
+    }
     let mask = u64::from_ne_bytes(
         reply[8..16]
             .try_into()
@@ -116,20 +146,31 @@ pub fn sset_info_count(reply: &[u8; 20]) -> Result<usize, OffloadError> {
 }
 
 /// The `ETHTOOL_GSTRINGS` request for `count` feature strings: `cmd`,
-/// `string_set`, `len`, then `count * 32` bytes of room.
-pub fn strings_request(count: usize) -> Vec<u8> {
-    let mut request = vec![0_u8; 12 + count * GSTRING_LEN];
+/// `string_set`, `len`, then `count * 32` bytes of room. 1 to
+/// [`MAX_FEATURES`] strings.
+fn strings_request(count: usize) -> Result<Vec<u8>, OffloadError> {
+    if count == 0 || count > MAX_FEATURES {
+        return Err(OffloadError::Malformed);
+    }
+    let room = count
+        .checked_mul(GSTRING_LEN)
+        .and_then(|room| room.checked_add(12))
+        .ok_or(OffloadError::Malformed)?;
+    let mut request = vec![0_u8; room];
     request[0..4].copy_from_slice(&GSTRINGS.to_ne_bytes());
     request[4..8].copy_from_slice(&SS_FEATURES.to_ne_bytes());
-    let len = u32::try_from(count).unwrap_or(u32::MAX);
+    let len = u32::try_from(count).map_err(|_| OffloadError::Malformed)?;
     request[8..12].copy_from_slice(&len.to_ne_bytes());
-    request
+    Ok(request)
 }
 
 /// The feature bit of `name` in an answered [`strings_request`] of `count`
 /// strings (each NUL-padded to 32 bytes).
 pub fn feature_bit(reply: &[u8], count: usize, name: &str) -> Result<Option<usize>, OffloadError> {
-    if reply.len() != 12 + count * GSTRING_LEN {
+    let expected = count
+        .checked_mul(GSTRING_LEN)
+        .and_then(|room| room.checked_add(12));
+    if Some(reply.len()) != expected {
         return Err(OffloadError::Malformed);
     }
     let len = u32::from_ne_bytes(
@@ -156,20 +197,37 @@ pub const fn feature_words(count: usize) -> usize {
 
 /// The `ETHTOOL_GFEATURES` request for `words` feature words: `cmd`,
 /// `size`, then `words` blocks of `available`, `requested`, `active`,
-/// `never_changed`.
-pub fn features_request(words: usize) -> Vec<u8> {
-    let mut request = vec![0_u8; 8 + words * 16];
+/// `never_changed`. 1 to `feature_words(MAX_FEATURES)` words.
+fn features_request(words: usize) -> Result<Vec<u8>, OffloadError> {
+    if words == 0 || words > feature_words(MAX_FEATURES) {
+        return Err(OffloadError::Malformed);
+    }
+    let room = words
+        .checked_mul(16)
+        .and_then(|room| room.checked_add(8))
+        .ok_or(OffloadError::Malformed)?;
+    let mut request = vec![0_u8; room];
     request[0..4].copy_from_slice(&GFEATURES.to_ne_bytes());
-    let size = u32::try_from(words).unwrap_or(u32::MAX);
+    let size = u32::try_from(words).map_err(|_| OffloadError::Malformed)?;
     request[4..8].copy_from_slice(&size.to_ne_bytes());
-    request
+    Ok(request)
 }
 
-/// Whether feature `bit` is active in an answered [`features_request`]
-/// (`size` is then the kernel's word count, at least what was asked for
-/// when the strings covered `bit`).
+/// Whether feature `bit` is active in an answered [`Command::Features`]
+/// buffer. The kernel sets `size` to its own word count
+/// (`ETHTOOL_DEV_FEATURE_WORDS`) and copies at most the words asked for: a
+/// `size` that does not cover the bit's word, or a buffer without it, is
+/// malformed (never read as off).
 pub fn feature_active(reply: &[u8], bit: usize) -> Result<bool, OffloadError> {
     let word = bit / 32;
+    let size = reply
+        .get(4..8)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_ne_bytes)
+        .ok_or(OffloadError::Malformed)?;
+    if usize::try_from(size).map_or(true, |size| size <= word) {
+        return Err(OffloadError::Malformed);
+    }
     let offset = 8 + word * 16 + 8;
     let active = reply
         .get(offset..offset + 4)
@@ -199,23 +257,22 @@ pub fn first_active(
 /// Linux `SIOCETHTOOL` reader (cold, startup only).
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 pub mod linux {
-    use super::{
-        feature_words, features_request, first_active, sset_info_count, sset_info_request,
-        strings_request, Offload, OffloadError,
-    };
+    use super::{feature_words, first_active, sset_info_count, Command, Offload, OffloadError};
     use crate::run::netlink::IfName;
 
     /// The first active merging receive offload of `device`, `None` if
     /// all are off.
     pub fn active_receive_offload(device: IfName) -> Result<Option<Offload>, OffloadError> {
         let socket = sys::Socket::open()?;
-        let mut info = sset_info_request();
-        socket.ethtool(device, &mut info)?;
+        let info = socket.ethtool(device, Command::SsetInfo)?;
         let count = sset_info_count(&info)?;
-        let mut strings = strings_request(count);
-        socket.ethtool(device, &mut strings)?;
-        let mut features = features_request(feature_words(count));
-        socket.ethtool(device, &mut features)?;
+        let strings = socket.ethtool(device, Command::Strings { count })?;
+        let features = socket.ethtool(
+            device,
+            Command::Features {
+                words: feature_words(count),
+            },
+        )?;
         first_active(&strings, count, &features)
     }
 
@@ -224,7 +281,7 @@ pub mod linux {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         use std::os::raw::{c_int, c_void};
 
-        use super::super::OffloadError;
+        use super::super::{Command, OffloadError};
         use crate::run::netlink::{IfName, IFNAMSIZ};
 
         const AF_INET: c_int = 2;
@@ -282,25 +339,44 @@ pub mod linux {
                 })
             }
 
-            /// One `SIOCETHTOOL` on `device` with the command buffer
-            /// `command` (its first `u32` is the ethtool command); the
-            /// kernel writes the reply into it, never past its length:
-            /// every command's own size fields (set by the request
-            /// builders) bound what it copies back.
-            pub fn ethtool(&self, device: IfName, command: &mut [u8]) -> Result<(), OffloadError> {
+            /// One `SIOCETHTOOL` on `device` for `command`; returns the
+            /// command buffer the kernel answered into. The buffer is built
+            /// here from the typed command ([`Command::buffer`]), never
+            /// handed in, so its size always matches what the kernel
+            /// writes for that command.
+            pub fn ethtool(
+                &self,
+                device: IfName,
+                command: Command,
+            ) -> Result<Vec<u8>, OffloadError> {
+                let mut buffer = command.buffer()?;
                 let mut request = IfReq {
                     name: [0; IFNAMSIZ],
-                    data: command.as_mut_ptr().cast(),
+                    data: buffer.as_mut_ptr().cast(),
                     pad: [0; 16],
                 };
                 let name = device.as_bytes();
                 // At most IFNAMSIZ - 1 bytes: the name stays NUL-terminated.
                 request.name[..name.len()].copy_from_slice(name);
                 // SAFETY: `request` is a fully initialized C-layout `ifreq`
-                // whose data pointer refers to `command`, exclusively
-                // borrowed and live until the call returns; the kernel
-                // copies from and to it within the lengths the command
-                // states, which the builders sized `command` for.
+                // whose data pointer refers to `buffer`, owned here and
+                // live until the call returns. What the kernel writes into
+                // it (`net/ethtool/ioctl.c`) stays inside it:
+                // - `ETHTOOL_GSSET_INFO` writes the header and one `u32`
+                //   per set bit of the 64-bit mask; one bit is set and the
+                //   buffer is header plus one `u32` (20 bytes).
+                // - `ETHTOOL_GSTRINGS` ignores the `len` we pass: it writes
+                //   `len = count` and `count * ETH_GSTRING_LEN` bytes, where
+                //   `count` is the kernel's own `ETH_SS_FEATURES` count,
+                //   `NETDEV_FEATURE_COUNT`, a compile-time constant of the
+                //   running kernel, which is exactly the count the
+                //   `GSSET_INFO` before this returned and the buffer was
+                //   sized for (`Command::Strings { count }` from
+                //   `sset_info_count`; the ethtool user tool relies on the
+                //   same).
+                // - `ETHTOOL_GFEATURES` copies `min(size we pass,
+                //   ETHTOOL_DEV_FEATURE_WORDS)` blocks, at most what the
+                //   buffer holds.
                 let result = unsafe {
                     ioctl(
                         self.fd.as_raw_fd(),
@@ -311,7 +387,7 @@ pub mod linux {
                 if result < 0 {
                     return Err(last_errno());
                 }
-                Ok(())
+                Ok(buffer)
             }
         }
     }
@@ -322,7 +398,7 @@ mod tests {
     use super::*;
 
     fn strings(names: &[&str]) -> Vec<u8> {
-        let mut reply = strings_request(names.len());
+        let mut reply = strings_request(names.len()).unwrap();
         for (index, name) in names.iter().enumerate() {
             let at = 12 + index * GSTRING_LEN;
             reply[at..at + name.len()].copy_from_slice(name.as_bytes());
@@ -331,7 +407,7 @@ mod tests {
     }
 
     fn features(count: usize, active: &[usize]) -> Vec<u8> {
-        let mut reply = features_request(feature_words(count));
+        let mut reply = features_request(feature_words(count)).unwrap();
         for bit in active {
             let offset = 8 + (bit / 32) * 16 + 8;
             let mut word = u32::from_ne_bytes(reply[offset..offset + 4].try_into().unwrap());
@@ -343,16 +419,40 @@ mod tests {
 
     #[test]
     fn requests_have_the_uapi_layout() {
-        let info = sset_info_request();
+        let info = Command::SsetInfo.buffer().unwrap();
+        assert_eq!(info.len(), 20);
         assert_eq!(u32::from_ne_bytes(info[0..4].try_into().unwrap()), 0x37);
         assert_eq!(u64::from_ne_bytes(info[8..16].try_into().unwrap()), 16);
-        let request = strings_request(3);
+        let request = Command::Strings { count: 3 }.buffer().unwrap();
         assert_eq!(request.len(), 12 + 96);
         assert_eq!(u32::from_ne_bytes(request[0..4].try_into().unwrap()), 0x1b);
         assert_eq!(u32::from_ne_bytes(request[4..8].try_into().unwrap()), 4);
         assert_eq!(u32::from_ne_bytes(request[8..12].try_into().unwrap()), 3);
-        let request = features_request(3);
+        let request = Command::Features { words: 3 }.buffer().unwrap();
         assert_eq!(request.len(), 8 + 48);
+        // Sizes are checked: no empty or oversized command.
+        for command in [
+            Command::Strings { count: 0 },
+            Command::Strings {
+                count: MAX_FEATURES + 1,
+            },
+            Command::Strings { count: usize::MAX },
+            Command::Features { words: 0 },
+            Command::Features { words: 33 },
+            Command::Features { words: usize::MAX },
+        ] {
+            assert_eq!(
+                command.buffer(),
+                Err(OffloadError::Malformed),
+                "{command:?}"
+            );
+        }
+        assert!(Command::Strings {
+            count: MAX_FEATURES
+        }
+        .buffer()
+        .is_ok());
+        assert!(Command::Features { words: 32 }.buffer().is_ok());
         assert_eq!(u32::from_ne_bytes(request[0..4].try_into().unwrap()), 0x3a);
         assert_eq!(u32::from_ne_bytes(request[4..8].try_into().unwrap()), 3);
         assert_eq!(feature_words(1), 1);
@@ -442,5 +542,15 @@ mod tests {
             Err(OffloadError::Malformed)
         );
         assert_eq!(feature_active(&features(33, &[32]), 32), Ok(true));
+        // A reply whose `size` does not cover the word is malformed, even
+        // if the buffer holds it.
+        let mut short = features(64, &[33]);
+        short[4..8].copy_from_slice(&1_u32.to_ne_bytes());
+        assert_eq!(feature_active(&short, 33), Err(OffloadError::Malformed));
+        assert_eq!(feature_active(&short, 3), Ok(false));
+        // The kernel's larger word count is fine.
+        let mut larger = features(33, &[32]);
+        larger[4..8].copy_from_slice(&3_u32.to_ne_bytes());
+        assert_eq!(feature_active(&larger, 32), Ok(true));
     }
 }

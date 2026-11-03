@@ -168,6 +168,13 @@ impl PortHost for LinuxHost {
         let (ifindex, link) = probe
             .resolve(name)
             .map_err(|_| CheckFailure::Unverifiable(Probe::Link))?;
+        // The offload probe names the device (`SIOCETHTOOL` takes a name),
+        // so it runs between the name -> index lookup above and the index
+        // query of `device_facts`, whose name the startup then compares
+        // with the configured one (H10): a rename or a replacement of the
+        // device in between is refused (`probe=name`), so the offloads read
+        // are those of the index that is bound.
+        let offload = offload::linux::active_receive_offload(name).map_err(|_| ());
         let facts = checks::linux::SessionFacts {
             ifindex,
             mtu: link.mtu,
@@ -175,7 +182,6 @@ impl PortHost for LinuxHost {
         };
         let sysctls = PortSysctls::new(port.device());
         let device = checks::linux::device_facts(&sysctls, facts, Some(&mut probe))?;
-        let offload = offload::linux::active_receive_offload(name).map_err(|_| ());
         Ok(PacketFacts { device, offload })
     }
 
@@ -292,6 +298,10 @@ impl LinkMonitor for NetlinkLinks {
 
     fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool> {
         self.sysctls(target)?.ipv4().weak_host
+    }
+
+    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
+        self.probe.count(Dump::StackedLinks, target.ifindex)
     }
 
     /// `disable_ipv6` first: when set (or without IPv6 in the namespace)

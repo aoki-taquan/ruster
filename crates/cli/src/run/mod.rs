@@ -72,7 +72,7 @@
 //! only `CAP_NET_RAW` (nothing is pinned, no BPF object is loaded); per
 //! port in `IfId` order the device is resolved by name over rtnetlink and
 //! checked ([`checks::evaluate_packet_device`]: every kernel exposure
-//! refusal of AF_XDP, MTU exactly `max-frame-len - 14`, no upper device,
+//! refusal of AF_XDP, MTU at most `max-frame-len - 14`, no upper device,
 //! no GRO/LRO/hardware GRO, [`offload`]); then every packet socket is
 //! opened at once (`ruster-io-afpacket`, failure atomic). Steps 6 to 8 and
 //! the run loop are the same code over the AF_PACKET datapath (static
@@ -1026,9 +1026,13 @@ where
         }
     );
     let shutdown = shutdown_drain(&mut datapath, clock, stop, settings.drain_deadline_ms);
+    // The final block shows the kernel counters as of the drain.
+    datapath.refresh();
     finish_workers(workers, workers_deadline, err);
-    // The ports are about to be detached: whatever the kernel would do
-    // with their frames now matters.
+    // AF_XDP: the ports are about to be detached, so whatever the kernel
+    // would do with their frames now matters. AF_PACKET: the kernel acted
+    // on every frame all along and goes on after the router stops.
+    let packet = exposure.is_some();
     let exposure = control.watch.kernel_exposure();
     for (seen, line) in [
         (
@@ -1061,7 +1065,16 @@ where
         ),
     ] {
         if seen {
-            let _ = writeln!(err, "ruster run: warning: {line}");
+            if packet {
+                let condition = line.split(';').next().unwrap_or(line);
+                let _ = writeln!(
+                    err,
+                    "ruster run: warning: {condition}; the kernel acts on every frame of the \
+                     AF_PACKET ports, also now that the router stops"
+                );
+            } else {
+                let _ = writeln!(err, "ruster run: warning: {line}");
+            }
         }
     }
     let now = clock.now();

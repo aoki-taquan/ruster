@@ -138,7 +138,8 @@
 #             running and recovered when cleared (M2 S11)
 #   afpacket  (AFPKT-015, after removal, which it follows by recreating
 #             ra/pa) `ruster run` with `backend.kind = "af-packet"`: GRO on
-#             ra, rb MTU 1400, and a kernel address on rb are refused
+#             ra, rb MTU 1400 (below the configured MTU), a kernel address
+#             on rb, and a VLAN on ra are refused
 #             (exit 1, no packet socket left); one router forwards with
 #             NAT44, answers ICMP Echo, applies two reloads and refuses a
 #             restart-required one, survives a carrier loss on rb and an
@@ -146,8 +147,9 @@
 #             cleared: the idle wait keeps blocking instead of sleeping),
 #             transmits every frame on ra/rb itself (none by the kernel),
 #             and drains on SIGTERM (exit 0, both packet sockets closed);
-#             deleting rb ends a second router with DEVICE_REMOVED (exit 1),
-#             no packet socket left. Default drop, Landlock, seccomp kill.
+#             enslaving rb to a bridge ends a second router with
+#             KERNEL_UPPER_DEVICE, deleting rb a third with DEVICE_REMOVED
+#             (exit 1 each), no packet socket left. Default drop, Landlock, seccomp kill.
 #   removal   (last) `ip link del ra` inside the router namespace while
 #             running: exit 1 (DEVICE_REMOVED), nothing left attached
 #   rollback  a second port that fails to open (queue 1 of a one-queue
@@ -2896,15 +2898,22 @@ phase_afpacket() {
     packet_refused afpacket-gro "$work/packet-router.toml" \
         "stage=checks port=if1 code=RECEIVE_OFFLOAD feature=rx-gro"
     in_ns "$router" ethtool -K ra gro off
+    # A device MTU below max-frame-len - 14 passes the frame bound, but the
+    # configured interface MTU (1500) must fit it (MTU1).
     sudo -n ip -n "$router" link set rb mtu 1400
     packet_refused afpacket-mtu "$work/packet-router.toml" \
-        "stage=checks port=if2 code=MTU_BELOW_FRAME mtu=1400 required=1500"
+        "stage=checks port=if2 code=MTU_BELOW_CONFIG mtu=1400 config=1500"
     sudo -n ip -n "$router" link set rb mtu 1500
+    # A VLAN stacked on ra (in the router namespace).
+    sudo -n ip -n "$router" link add link ra name ra.10 type vlan id 10
+    packet_refused afpacket-vlan "$work/packet-router.toml" \
+        "stage=checks port=if1 code=KERNEL_UPPER_DEVICE"
+    sudo -n ip -n "$router" link del ra.10
     sudo -n ip -n "$router" address add 198.51.100.7/32 dev rb
     packet_refused afpacket-address "$work/packet-router.toml" \
         "stage=checks port=if2 code=KERNEL_IPV4_ADDRESSES count=1"
     sudo -n ip -n "$router" address del 198.51.100.7/32 dev rb
-    echo "priv_run_afpacket_refusals: GRO on ra (RECEIVE_OFFLOAD), rb MTU 1400 (MTU_BELOW_FRAME), a kernel address on rb refused with exit 1 and no packet socket left verified"
+    echo "priv_run_afpacket_refusals: GRO on ra (RECEIVE_OFFLOAD), rb MTU 1400 (MTU_BELOW_CONFIG), a kernel address on rb, a VLAN on ra (KERNEL_UPPER_DEVICE) refused with exit 1 and no packet socket left verified"
 
     ra_tx=$(tx_packets ra)
     rb_tx=$(tx_packets rb)
@@ -2982,6 +2991,24 @@ phase_afpacket() {
         [ "${kernel:-0}" -ge 1 ] || fail "afpacket: if$id kernel_packets ${kernel:-missing}"
     done
     echo "priv_run_afpacket_shutdown: SIGTERM exit 0 with nothing in flight, both packet sockets closed, every frame on ra/rb sent by the router (none by the kernel), PACKET_STATISTICS folded in verified"
+
+    # upper: rb enslaved to a bridge while running ends the router with
+    # KERNEL_UPPER_DEVICE (exit 1). The bridge (down, in the router
+    # namespace only) is deleted again, which releases rb.
+    start_ruster afpacket-upper "$work/packet-router.toml"
+    wait_ready afpacket-upper || fail "afpacket-upper: ruster exited during startup"
+    sudo -n ip -n "$router" link add rbr type bridge
+    sudo -n ip -n "$router" link set rb master rbr
+    wait_exit afpacket-upper
+    [ "$status" -eq 1 ] || fail "afpacket-upper: exit status $status after enslaving rb"
+    grep -q "fatal: port=if2 health=KERNEL_UPPER_DEVICE" "$work/afpacket-upper.err" ||
+        fail "afpacket-upper: no KERNEL_UPPER_DEVICE: $(cat "$work/afpacket-upper.err")"
+    grep -q "stopped after a fatal health event port=if2 code=KERNEL_UPPER_DEVICE; .*; closed 2 port(s)$" \
+        "$work/afpacket-upper.err" || fail "afpacket-upper: no fatal summary"
+    [ "$(packet_sockets)" -eq 0 ] || fail "afpacket-upper: a packet socket was left open"
+    sudo -n ip -n "$router" link del rbr
+    sudo -n ip -n "$router" link set rb up
+    echo "priv_run_afpacket_upper: rb enslaved to a bridge while running failed closed with exit 1 (KERNEL_UPPER_DEVICE), no packet socket left verified"
 
     # removal: deleting rb ends the router with DEVICE_REMOVED (exit 1).
     start_ruster afpacket-removal "$work/packet-router.toml"

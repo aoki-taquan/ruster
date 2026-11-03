@@ -10,6 +10,7 @@ const TX_STALL_WARN_MS: u64 = 1_000;
 const TX_STALL_FATAL_MS: u64 = 10_000;
 const KICK_ERRORS_FATAL_MS: u64 = 5_000;
 const TARGET: LinkTarget = LinkTarget {
+    watch_uppers: false,
     interface: PORT,
     ifindex: 7,
     name: IfName::literal(b"ra"),
@@ -894,6 +895,10 @@ fn late(watch: &mut Watch, now: u64, since: u64) -> Vec<WatchEvent> {
 struct Scripted(PortRound);
 
 impl LinkMonitor for Scripted {
+    fn stacked_links(&mut self, _: &LinkTarget) -> Result<u32, NetlinkError> {
+        self.0.uppers.unwrap_or(Ok(0))
+    }
+
     fn query(&mut self, _: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
         self.0.link
     }
@@ -929,6 +934,7 @@ fn port_round(link: Result<LinkFacts, NetlinkError>, addresses: u32, routes: u32
         forwarding: Ok(Forwarding::default()),
         weak_host: Some(false),
         ipv6: linked.then_some(Ipv6Sample::DISABLED),
+        uppers: None,
     }
 }
 
@@ -1167,4 +1173,106 @@ fn af_packet_kernel_exposure_is_fatal_unless_overridden() {
         ),
         [fatal(Fatal::DeviceRemoved)]
     );
+}
+
+/// AF_PACKET: an upper device appearing at run time (the port enslaved,
+/// `IFLA_MASTER` in the link query; or a device stacked on it, the link
+/// dump) is fatal `KERNEL_UPPER_DEVICE`; a failing dump counts as a failed
+/// query; an AF_XDP port is not asked.
+#[test]
+fn an_upper_device_at_run_time_ends_an_af_packet_run() {
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    packet.on_uppers(0, false, Ok(0), &mut |event| events.push(event));
+    assert!(events.is_empty());
+    for (master, stacked) in [(true, 0), (false, 1), (true, 2)] {
+        let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+        let mut events = Vec::new();
+        packet.on_uppers(0, master, Ok(stacked), &mut |event| events.push(event));
+        assert_eq!(
+            events,
+            [
+                warning(Condition::KernelUpperDevice),
+                fatal(Fatal::KernelExposure(Condition::KernelUpperDevice)),
+            ],
+            "{master} {stacked}"
+        );
+        assert_eq!(
+            Fatal::KernelExposure(Condition::KernelUpperDevice).code(),
+            "KERNEL_UPPER_DEVICE"
+        );
+    }
+    // Even with every override: no override accepts an upper device.
+    let all = ExposurePolicy {
+        allow_kernel_forwarding: true,
+        allow_kernel_ipv6: true,
+        allow_ipv4_weak_host: true,
+    };
+    assert!(all.is_fatal(Condition::KernelUpperDevice));
+    // A failing dump is a failed query (fatal LINK_UNVERIFIABLE after three).
+    let mut packet = watch().failing_on_kernel_exposure(ExposurePolicy::default());
+    let mut events = Vec::new();
+    for _ in 0..LINK_PROBE_FAILURES_FATAL {
+        packet.on_uppers(0, false, Err(NetlinkError::EndOfStream), &mut |event| {
+            events.push(event);
+        });
+    }
+    assert_eq!(
+        events,
+        [
+            warning(Condition::LinkProbe),
+            fatal(Fatal::LinkUnverifiable)
+        ]
+    );
+    // Through a whole round: the link query's master is used, and the
+    // dump only for a port that watches its uppers.
+    let enslaved = Ok(LinkFacts {
+        master: Some(9),
+        ..up(1500).expect("facts")
+    });
+    let packet_target = LinkTarget {
+        watch_uppers: true,
+        ..TARGET
+    };
+    let mut round = LinkRound::new(1);
+    probe_round(
+        &mut Scripted(port_round(enslaved, 0, 0)),
+        &[packet_target],
+        &mut round,
+    );
+    let mut packet = Watch::new(&[packet_target], Thresholds::default())
+        .failing_on_kernel_exposure(ExposurePolicy::default());
+    assert_eq!(
+        fold(&mut packet, &round),
+        [
+            warning(Condition::KernelUpperDevice),
+            fatal(Fatal::KernelExposure(Condition::KernelUpperDevice)),
+        ]
+    );
+    // A stacked device found by the dump of the same round.
+    let mut round = LinkRound::new(1);
+    probe_round(
+        &mut Scripted(PortRound {
+            uppers: Some(Ok(1)),
+            ..port_round(up(1500), 0, 0)
+        }),
+        &[packet_target],
+        &mut round,
+    );
+    assert_eq!(round.ports()[0].uppers, Some(Ok(1)));
+    let mut packet = Watch::new(&[packet_target], Thresholds::default())
+        .failing_on_kernel_exposure(ExposurePolicy::default());
+    assert_eq!(
+        fold(&mut packet, &round),
+        [
+            warning(Condition::KernelUpperDevice),
+            fatal(Fatal::KernelExposure(Condition::KernelUpperDevice)),
+        ]
+    );
+    // AF_XDP ports are not asked.
+    let round = round_of(PortRound {
+        uppers: Some(Ok(1)),
+        ..port_round(up(1500), 0, 0)
+    });
+    assert_eq!(round.ports()[0].uppers, None, "not asked for AF_XDP");
 }

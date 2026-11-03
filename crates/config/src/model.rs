@@ -631,7 +631,8 @@ pub struct BackendV1 {
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct AfPacketV1 {
     /// The longest Ethernet frame (header included, FCS excluded) of every
-    /// port; every port's MTU must be exactly this minus 14. Absent means
+    /// port; every port's device MTU must be at most this minus 14 (so the
+    /// largest port's MTU plus 14 for mixed MTUs). Absent means
     /// 1514 (MTU 1500).
     #[serde(default)]
     pub max_frame_len: Option<u32>,

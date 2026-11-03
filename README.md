@@ -1137,7 +1137,7 @@ TXはqdisc経由なのでAF_XDP copy modeより遅い想定）。
 kind = "af-packet"
 
 [backend.af-packet]
-max-frame-len = 1514             # 省略時1514（590..=9230）。全portのMTUはちょうど max-frame-len - 14
+max-frame-len = 1514             # 省略時1514（590..=9230）。全portのdevice MTUは max-frame-len - 14 以下
 
 [[backend.af-packet.ports]]      # interfaceごとに1つ
 interface = "wan"
@@ -1154,8 +1154,9 @@ tx = { block-size = 65536, block-count = 4 }
   `BACKEND_AF_PACKET_WITHOUT_KIND`、`af-packet`での`[[backend.ports]]`は`BACKEND_PORTS_WITHOUT_AF_XDP`。
 - AF_PACKETはframeをkernelから奪わずcopyを受け取るだけで、kernel stackはrun中も全frameを処理します。
   起動時のkernel露出拒否（IPv4 address/route、forwarding、weak host、IPv6、同じoverride）はAF_XDPと同じで、
-  RX queue数は問いません。加えてMTUが`max-frame-len - 14`と違う（`MTU_ABOVE_FRAME`/`MTU_BELOW_FRAME`）、
-  bridge/bond/team/VRFへの従属（`KERNEL_UPPER_DEVICE`）、GRO/LRO/hardware GROがon
+  RX queue数は問いません。加えてdevice MTUが`max-frame-len - 14`を超える（`MTU_ABOVE_FRAME`。小さいのは可で、
+  9000のLANと1500のWANは`max-frame-len = 9014`で動く）、bridge/bond/team/VRFへの従属や同じnamespaceで
+  portに積まれたVLAN/macvlan/ipvlan/MACsec/veth peer（`KERNEL_UPPER_DEVICE`、run中もfatal）、GRO/LRO/hardware GROがon
   （`RECEIVE_OFFLOAD feature=rx-gro`等、`ethtool -K <dev> gro off lro off`）を拒否します。
   `[[interfaces]] mtu`（MTU1）はAF_XDPと同じくdevice MTU超過が`MTU_BELOW_CONFIG`（拒否）、未満が
   `MTU_BELOW_DEVICE`（warning）です。

@@ -108,15 +108,16 @@ fn af_packet_run_checks_every_port_then_opens_all_at_once_and_closes_by_drop() {
     assert!(outcome.out.contains("fake.ports=2\n"), "{}", outcome.out);
     // Every health sample (here every tick) follows a backend refresh
     // (AF_PACKET folds PACKET_STATISTICS there).
+    // ... and the final block follows one more (after the drain).
     assert!(host.state.sampled.get() >= 3);
-    assert_eq!(host.state.refreshes.get(), host.state.sampled.get());
+    assert_eq!(host.state.refreshes.get(), host.state.sampled.get() + 1);
     assert!(!host.state.unrefreshed_sample.get());
 }
 
 #[test]
 fn af_packet_startup_refusals_open_nothing() {
     type Setup = fn(&mut FakeHost);
-    let cases: [(Setup, &str, u8); 11] = [
+    let cases: [(Setup, &str, u8); 12] = [
         (
             |host| host.packet_offload = Some(Ok(Offload::Gro)),
             "stage=checks port=if1 code=RECEIVE_OFFLOAD feature=rx-gro",
@@ -133,8 +134,10 @@ fn af_packet_startup_refusals_open_nothing() {
             EXIT_RUNTIME,
         ),
         (
+            // Below max-frame-len - 14 is fine for the frame bound, but
+            // the configured MTU (1500) must fit the device (MTU1).
             |host| host.packet_mtu = Some(1_400),
-            "stage=checks port=if1 code=MTU_BELOW_FRAME mtu=1400 required=1500",
+            "stage=checks port=if1 code=MTU_BELOW_CONFIG mtu=1400 config=1500",
             EXIT_RUNTIME,
         ),
         (
@@ -145,6 +148,11 @@ fn af_packet_startup_refusals_open_nothing() {
         (
             |host| host.packet_master = Some(WAN),
             "stage=checks port=if2 code=KERNEL_UPPER_DEVICE",
+            EXIT_RUNTIME,
+        ),
+        (
+            |host| host.packet_stacked = Some(LAN),
+            "stage=checks port=if1 code=KERNEL_UPPER_DEVICE",
             EXIT_RUNTIME,
         ),
         (
@@ -221,7 +229,7 @@ fn af_packet_startup_refusals_open_nothing() {
 
 /// MTU1 on AF_PACKET: a configured interface MTU above the device MTU is
 /// refused (`MTU_BELOW_CONFIG`), one below it only warned
-/// (`MTU_BELOW_DEVICE`); the device MTU itself stays `max-frame-len - 14`.
+/// (`MTU_BELOW_DEVICE`); the device MTU is at most `max-frame-len - 14`.
 #[test]
 fn af_packet_ports_follow_the_configured_interface_mtu() {
     let with_mtu = |mtu: u32| {
@@ -426,6 +434,16 @@ fn kernel_exposure_found_at_run_time_ends_an_af_packet_run() {
         "{}",
         outcome.err
     );
+    // The exit warning says what holds for AF_PACKET (nothing detaches).
+    assert!(
+        outcome.err.contains(
+            "ruster run: warning: kernel IPv4 addresses are on a port; the kernel acts on every \
+             frame of the AF_PACKET ports, also now that the router stops\n"
+        ),
+        "{}",
+        outcome.err
+    );
+    assert!(!outcome.err.contains("detached"), "{}", outcome.err);
     host.assert_released();
 
     // Accepted at startup through an override: only a warning at run time.
@@ -468,4 +486,82 @@ fn kernel_exposure_found_at_run_time_ends_an_af_packet_run() {
         outcome.err
     );
     assert!(!outcome.err.contains("fatal"), "{}", outcome.err);
+}
+
+/// Mixed MTUs (core M1): one `max-frame-len` of the largest port; a
+/// 9000-byte LAN and a 1500-byte WAN both start (the WAN's smaller device
+/// MTU bounds nothing the core sends: its configured MTU is 1500), and a
+/// device MTU above `max-frame-len - 14` is still refused.
+#[test]
+fn af_packet_ports_of_mixed_mtus_share_the_largest_frame() {
+    let jumbo = |lan_device_mtu: u32| {
+        let base = include_str!("../../../../fixtures/m1/router-v1.toml");
+        let marker = "name = \"lan\"\n";
+        assert_eq!(base.matches(marker).count(), 1);
+        let text = format!(
+            "{}{}",
+            base.replacen(marker, &format!("{marker}mtu = 9000\n"), 1),
+            PACKET_BACKEND.replacen("max-frame-len = 1514", "max-frame-len = 9014", 1)
+        );
+        let config = match crate::config_cmd::validate_bytes(text.as_bytes()) {
+            Ok(config) => config,
+            Err(error) => panic!("valid config: {}", error.render()),
+        };
+        let host = FakeHost {
+            packet_mtu: Some(1_500),
+            packet_lan_mtu: Some(lan_device_mtu),
+            ..FakeHost::default()
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let status = execute_with(
+            &host,
+            config,
+            FakeSource::default(),
+            settings(CheckPolicy::default(), 0),
+            &mut FakeClock {
+                step_us: 1_000,
+                ..FakeClock::default()
+            },
+            &FakeStop::after(PACKET_FIRST_LOOP_CHECK + 1),
+            &mut out,
+            &mut err,
+        );
+        host.assert_released();
+        (status, String::from_utf8(err).expect("utf-8"))
+    };
+    let (status, err) = jumbo(9_000);
+    assert_eq!(status, 0, "{err}");
+    assert!(!err.contains("MTU_"), "{err}");
+    let (status, err) = jumbo(9_001);
+    assert_eq!(status, EXIT_RUNTIME, "{err}");
+    assert!(
+        err.contains("stage=checks port=if1 code=MTU_ABOVE_FRAME mtu=9001 limit=9000\n"),
+        "{err}"
+    );
+}
+
+/// Core M2: a device stacked on an AF_PACKET port while it runs (a VLAN
+/// created on it) ends the run with `KERNEL_UPPER_DEVICE`.
+#[test]
+fn an_upper_device_at_run_time_ends_an_af_packet_run() {
+    let host = FakeHost::default();
+    host.state
+        .stacked
+        .borrow_mut()
+        .push_back((IfId(WAN), Ok(1)));
+    let outcome = run_packet(
+        &host,
+        CheckPolicy::default(),
+        &FakeStop::after(PACKET_FIRST_LOOP_CHECK + 40),
+    );
+    assert_eq!(outcome.status, EXIT_RUNTIME, "{}", outcome.err);
+    assert!(
+        outcome
+            .err
+            .contains("ruster run: fatal: port=if2 health=KERNEL_UPPER_DEVICE\n"),
+        "{}",
+        outcome.err
+    );
+    host.assert_released();
 }

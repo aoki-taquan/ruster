@@ -545,6 +545,7 @@ impl<H: PortHost> Drop for OpenedPorts<'_, H> {
 /// The link watch target of a port whose device facts passed the checks.
 pub const fn link_target(interface: IfId, facts: &DeviceFacts) -> LinkTarget {
     LinkTarget {
+        watch_uppers: false,
         interface,
         ifindex: facts.ifindex,
         name: facts.link_name,
@@ -594,6 +595,7 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
                 name: IfName::DEFAULT,
                 mtu: 0,
                 frame_capacity: 0,
+                watch_uppers: false,
             },
         });
         let Some(entry) = opened.ports.last_mut() else {
@@ -684,7 +686,10 @@ pub fn open_packet_ports<H: PortHost, S: StopSignal>(
             .map(InterfaceBindingV1::mtu)
             .ok_or_else(|| fail(CheckFailure::Unverifiable(Probe::Mtu)))?;
         warnings.mtu_below_device = evaluate_config_mtu(config_mtu, &facts.device).map_err(fail)?;
-        targets.push(link_target(interface, &facts.device));
+        targets.push(LinkTarget {
+            watch_uppers: true,
+            ..link_target(interface, &facts.device)
+        });
         warn(interface, &warnings);
     }
     Ok(targets)

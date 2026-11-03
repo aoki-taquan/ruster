@@ -11,6 +11,7 @@ use crate::run::tests::counting;
 
 const TARGETS: [LinkTarget; 2] = [
     LinkTarget {
+        watch_uppers: false,
         interface: IfId(1),
         ifindex: 11,
         name: crate::run::netlink::IfName::literal(b"veth0"),
@@ -18,6 +19,7 @@ const TARGETS: [LinkTarget; 2] = [
         frame_capacity: 1792,
     },
     LinkTarget {
+        watch_uppers: false,
         interface: IfId(2),
         ifindex: 12,
         name: crate::run::netlink::IfName::literal(b"veth0"),
@@ -48,6 +50,10 @@ impl Monitor {
 }
 
 impl LinkMonitor for Monitor {
+    fn stacked_links(&mut self, _: &LinkTarget) -> Result<u32, NetlinkError> {
+        Ok(0)
+    }
+
     fn query(&mut self, target: &LinkTarget) -> Result<LinkFacts, NetlinkError> {
         assert!(!self.panics, "watcher dies");
         self.threads

@@ -486,6 +486,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
 
     let host = FakeHost::default();
     let targets = [LAN, WAN].map(|id| LinkTarget {
+        watch_uppers: false,
         interface: IfId(id),
         ifindex: fake_ifindex(id),
         name: super::device_name(id),

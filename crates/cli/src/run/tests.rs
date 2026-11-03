@@ -146,6 +146,9 @@ struct State {
     weak_host: Shared<VecDeque<(IfId, Option<bool>)>>,
     /// IPv6 samples, consumed in order by the matching port.
     ipv6: Shared<VecDeque<(IfId, Ipv6Sample)>>,
+    /// Stacked-device dump results, consumed in order by the matching
+    /// port.
+    stacked: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
     /// The link watcher's queries block while this gate is closed.
     link_gate: Shared<Gate>,
     /// Quiescence probes refused before one succeeds.
@@ -187,6 +190,7 @@ struct State {
     /// came without a refresh right before it.
     refreshes: Cell<u32>,
     sampled: Cell<u32>,
+    refreshes_at_sample: Cell<u32>,
     unrefreshed_sample: Cell<bool>,
 }
 
@@ -248,11 +252,15 @@ struct FakeHost {
     preflight_policies: RefCell<Vec<PrivilegePolicy>>,
     /// AF_PACKET: the MTU of every port (`None`: `max-frame-len - 14`).
     packet_mtu: Option<u32>,
+    /// AF_PACKET: the MTU of the LAN port only (over `packet_mtu`).
+    packet_lan_mtu: Option<u32>,
     /// AF_PACKET: the active receive offload of every port (`Err`:
     /// unreadable).
     packet_offload: Option<Result<Offload, ()>>,
     /// AF_PACKET: the port enslaved to an upper device.
     packet_master: Option<u16>,
+    /// AF_PACKET: the port with a device stacked on it.
+    packet_stacked: Option<u16>,
 }
 
 /// State shared with a worker thread (test only).
@@ -442,11 +450,12 @@ impl Datapath for FakeDatapath<'_> {
     }
 
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
-        let sampled = self.state.sampled.get() + 1;
-        self.state.sampled.set(sampled);
-        if self.state.refreshes.get() != sampled {
+        self.state.sampled.set(self.state.sampled.get() + 1);
+        let refreshes = self.state.refreshes.get();
+        if refreshes == self.state.refreshes_at_sample.get() {
             self.state.unrefreshed_sample.set(true);
         }
+        self.state.refreshes_at_sample.set(refreshes);
         let round = self.state.samples.borrow_mut().pop_front();
         for sample in round.into_iter().flatten() {
             visit(sample);
@@ -564,6 +573,7 @@ struct FakeLinks {
     routes: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
     weak_host: Shared<VecDeque<(IfId, Option<bool>)>>,
     ipv6: Shared<VecDeque<(IfId, Ipv6Sample)>>,
+    stacked: Shared<VecDeque<(IfId, Result<u32, NetlinkError>)>>,
     gate: Shared<Gate>,
 }
 
@@ -577,6 +587,7 @@ impl FakeLinks {
             routes: state.routes.share(),
             weak_host: state.weak_host.share(),
             ipv6: state.ipv6.share(),
+            stacked: state.stacked.share(),
             gate: state.link_gate.share(),
         }
     }
@@ -644,6 +655,10 @@ impl LinkMonitor for FakeLinks {
 
     fn ipv6(&mut self, target: &LinkTarget) -> Ipv6Sample {
         scripted(&self.ipv6, target.interface).unwrap_or(Ipv6Sample::DISABLED)
+    }
+
+    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
+        scripted(&self.stacked, target.interface).unwrap_or(Ok(0))
     }
 }
 
@@ -807,6 +822,7 @@ impl PortHost for FakeHost {
             weak_host: Some(self.weak_host),
             ipv6: self.ipv6.unwrap_or(Ipv6Facts::DISABLED),
             master: None,
+            stacked: Some(0),
         })
     }
 
@@ -882,7 +898,10 @@ impl PortHost for FakeHost {
         if self.fails(Stage::Checks, Some(id)) {
             return Err(CheckFailure::Unverifiable(Probe::Link));
         }
-        let mtu = self.packet_mtu.unwrap_or(max_frame_len - 14);
+        let mtu = match self.packet_lan_mtu {
+            Some(mtu) if id == LAN => mtu,
+            _ => self.packet_mtu.unwrap_or(max_frame_len - 14),
+        };
         Ok(PacketFacts {
             device: DeviceFacts {
                 ifindex: fake_ifindex(id),
@@ -903,6 +922,11 @@ impl PortHost for FakeHost {
                 weak_host: Some(self.weak_host),
                 ipv6: self.ipv6.unwrap_or(Ipv6Facts::DISABLED),
                 master: (self.packet_master == Some(id)).then_some(99),
+                stacked: if self.packet_stacked == Some(id) {
+                    Some(1)
+                } else {
+                    Some(0)
+                },
             },
             offload: match self.packet_offload {
                 None => Ok(None),

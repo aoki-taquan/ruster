@@ -219,6 +219,11 @@ pub trait LinkMonitor {
     /// effective `rp_filter` is 0, `None` if
     /// unreadable. Cold path, no allocation.
     fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool>;
+
+    /// Devices of the namespace stacked on `target`'s interface index (a
+    /// link dump, [`super::netlink::stacked_on`]); AF_PACKET ports only.
+    /// Cold path, no allocation.
+    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError>;
 }
 
 /// Summed result of one drain call.
@@ -821,6 +826,9 @@ where
             && now.0.saturating_sub(last_stats.0) >= settings.stats_interval_ms;
         let on_demand = on_demand_stats.due(now, stop.take_stats());
         if periodic || on_demand {
+            // A block shows the backend's latest kernel counters (AF_PACKET
+            // folds PACKET_STATISTICS here as at a health sample).
+            datapath.refresh();
             let status = RunStatus {
                 reload: control.reloader.counters(),
                 watch: &control.watch,

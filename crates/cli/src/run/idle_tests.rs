@@ -129,6 +129,7 @@ fn the_watch_deadline_is_the_earlier_due_round() {
 
     let at = MonotonicMillis;
     let targets = [LAN, WAN].map(|id| LinkTarget {
+        watch_uppers: false,
         interface: IfId(id),
         ifindex: u32::from(id) + 10,
         name: crate::run::netlink::IfName::literal(b"sim0"),

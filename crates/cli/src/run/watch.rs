@@ -52,6 +52,7 @@
 //! | a forwarding sysctl is unreadable | a failed query (fatal after [`LINK_PROBE_FAILURES_FATAL`] in a row); with `--allow-kernel-forwarding` a warning `FORWARDING_UNVERIFIABLE` |
 //! | IPv4 `mc_forwarding` (of `all` or the device) turns on | counted with the forwarding sysctls: warning `KERNEL_FORWARDING_ENABLED` |
 //! | the effective `rp_filter` (the larger of `all` and the device) is 0, or unreadable | warning `IPV4_WEAK_HOST_EXPOSURE`, recovered when it is 1 or 2; never fatal, never a failed query (the startup refuses it as `KERNEL_IPV4_WEAK_HOST` unless `--allow-ipv4-weak-host`, CLI-079) |
+//! | AF_PACKET: the port is enslaved (`IFLA_MASTER`) or a device of the namespace is stacked on it (link dump: `IFLA_LINK` is the port, no `IFLA_LINK_NETNSID`) | fatal `KERNEL_UPPER_DEVICE` (after its warning); a failed dump is a failed query. Not queried for AF_XDP ports (XDP takes the frames first) |
 //! | `disable_ipv6` is 0 on the port (also when it flips while running) | warning `KERNEL_IPV6_ENABLED`, recovered when it is 1 again; not fatal |
 //! | with IPv6 enabled on the port: an IPv6 address outside `fe80::/10`, an IPv6 route out of the port beyond the automatic link-local and multicast ones, `net.ipv6.conf.all.forwarding`, `conf/<dev>/forwarding`, a `force_forwarding`, or an IPv6 `mc_forwarding` on | warnings `KERNEL_IPV6_ADDRESSES`, `KERNEL_IPV6_ROUTES`, `KERNEL_IPV6_FORWARDING_ENABLED`, each recovered when gone (or when `disable_ipv6` turns on); not fatal |
 //! | an IPv6 fact is unreadable (`disable_ipv6`/forwarding sysctls, address or route dump) | a failed query of its kind; with `--allow-kernel-ipv6` a warning `IPV6_UNVERIFIABLE` instead |
@@ -263,10 +264,12 @@ pub enum Query {
     Ipv6Sysctls = 4,
     Ipv6Addresses = 5,
     Ipv6Routes = 6,
+    /// AF_PACKET: the link dump for devices stacked on the port.
+    Uppers = 7,
 }
 
 impl Query {
-    const COUNT: usize = 7;
+    const COUNT: usize = 8;
 }
 
 /// The two kernel IPv4 forwarding sysctls of one port.
@@ -300,6 +303,9 @@ pub struct LinkTarget {
     pub mtu: u32,
     /// The longest frame a UMEM frame holds.
     pub frame_capacity: u32,
+    /// AF_PACKET: watch upper devices (`IFLA_MASTER`, and devices stacked
+    /// on the port, [`Query::Uppers`]); a found one ends the run.
+    pub watch_uppers: bool,
 }
 
 /// A non-fatal condition (warning and recovery lines).
@@ -336,6 +342,9 @@ pub enum Condition {
     /// The link watcher's outstanding round is older than the stale
     /// threshold (H7).
     LinkWatchStale,
+    /// AF_PACKET: the port is enslaved to an upper device, or a device of
+    /// the namespace is stacked on it (always fatal there).
+    KernelUpperDevice,
 }
 
 impl Condition {
@@ -358,6 +367,7 @@ impl Condition {
             Self::KernelIpv6Enabled => "KERNEL_IPV6_ENABLED",
             Self::Ipv4WeakHost => "IPV4_WEAK_HOST_EXPOSURE",
             Self::LinkWatchStale => "LINK_WATCH_STALE",
+            Self::KernelUpperDevice => "KERNEL_UPPER_DEVICE",
         }
     }
 }
@@ -420,7 +430,9 @@ impl ExposurePolicy {
     /// Whether `condition`, once warned, ends the run.
     pub const fn is_fatal(self, condition: Condition) -> bool {
         match condition {
-            Condition::KernelIpv4Addresses | Condition::KernelIpv4Routes => true,
+            Condition::KernelIpv4Addresses
+            | Condition::KernelIpv4Routes
+            | Condition::KernelUpperDevice => true,
             Condition::KernelForwardingEnabled => !self.allow_kernel_forwarding,
             Condition::Ipv4WeakHost => !self.allow_ipv4_weak_host,
             Condition::KernelIpv6Enabled
@@ -521,6 +533,7 @@ struct PortWatch {
     ipv6_enabled_warned: bool,
     weak_host_warned: bool,
     stale_warned: bool,
+    uppers_warned: bool,
     counters: PortHealth,
     /// AF_PACKET: the kernel exposure conditions that end the run.
     exposure_fatal: Option<ExposurePolicy>,
@@ -689,6 +702,7 @@ impl Watch {
                     ipv6_enabled_warned: false,
                     weak_host_warned: false,
                     stale_warned: false,
+                    uppers_warned: false,
                     exposure_fatal: None,
                     counters: PortHealth {
                         link_up: true,
@@ -765,6 +779,38 @@ impl Watch {
             self.on_weak_host(index, port.weak_host, emit);
             if let Some(ipv6) = port.ipv6 {
                 self.on_ipv6(index, ipv6, emit);
+            }
+            if let Some(uppers) = port.uppers {
+                let master = port.link.as_ref().is_ok_and(|link| link.master.is_some());
+                self.on_uppers(index, master, uppers, emit);
+            }
+        }
+    }
+
+    /// Folds the upper devices of AF_PACKET port `index` in this round
+    /// (`master`: the link query's `IFLA_MASTER`; `stacked`: the link
+    /// dump's count of devices stacked on it): any is the warning
+    /// `KERNEL_UPPER_DEVICE`, which [`ExposurePolicy`] makes fatal; a
+    /// failed dump is a failed query.
+    pub fn on_uppers(
+        &mut self,
+        index: usize,
+        master: bool,
+        stacked: Result<u32, NetlinkError>,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
+        if let Some(port) = self.ports.get_mut(index) {
+            match stacked {
+                Ok(count) => {
+                    port.probe_ok(Query::Uppers, emit);
+                    port.exposure(
+                        |port| &mut port.uppers_warned,
+                        Condition::KernelUpperDevice,
+                        master || count != 0,
+                        emit,
+                    );
+                }
+                Err(_) => port.probe_failed(Query::Uppers, emit),
             }
         }
     }
@@ -862,6 +908,7 @@ impl Watch {
                 || port.ipv6_enabled_warned
                 || port.weak_host_warned
                 || port.stale_warned
+                || port.uppers_warned
         })
     }
 

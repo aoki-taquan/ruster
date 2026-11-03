@@ -214,8 +214,9 @@ pub struct BackendChange {
     /// its bound device, so moving an interface to another device (or
     /// swapping two devices) is a port change, not just a label change.
     pub ports: Box<[Change<ValidatedAfXdpPortV1>]>,
-    /// The AF_PACKET maximum frame (`None` on a side without the AF_PACKET
-    /// backend).
+    /// The AF_PACKET `max-frame-len` before and after; a side whose backend
+    /// is not AF_PACKET has `None` (so a change of kind to or from
+    /// `af-packet` shows here too).
     pub af_packet_max_frame_len: Option<Delta<Option<u32>>>,
     /// AF_PACKET ports keyed by interface IfId, like [`Self::ports`]: a
     /// change of kind to or from `af-packet` adds or removes every port.
