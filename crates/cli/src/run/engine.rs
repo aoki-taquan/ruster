@@ -849,6 +849,9 @@ where
                     if let Some(warning) = control.reloader.share() {
                         let _ = writeln!(err, "ruster run: warning: {warning}");
                     }
+                    for warning in control.reloader.source_validation() {
+                        let _ = writeln!(err, "ruster run: warning: {warning}");
+                    }
                 }
             }
             budgets = control.reloader.budgets();

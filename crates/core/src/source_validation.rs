@@ -65,6 +65,11 @@ impl SourceValidation {
 
     /// Whether a datagram received on `ingress` whose source has
     /// `source_route` as its longest matching route passes this mode.
+    ///
+    /// TODO(URPF): the forwarding table has no null (blackhole) route yet.
+    /// When one is added, a source whose longest match is a null route must
+    /// fail both loose and strict (RFC 3704 §2.4: a route to a null
+    /// interface does not count), so this match has to learn about it.
     #[inline]
     #[must_use]
     pub(crate) fn admits(self, ingress: IfId, source_route: Option<Route>) -> bool {

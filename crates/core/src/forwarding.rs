@@ -906,6 +906,7 @@ const _: () = {
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum SnapshotError {
     DuplicateRoute,
     DuplicateInterface,
@@ -1917,10 +1918,11 @@ pub enum TraceEvent {
         reason: ConsumeReason,
     },
     /// A received IPv4 datagram failed the source validation `mode` of its
-    /// ingress interface (URPF); it is then dropped as
-    /// [`DropReason::Ipv4SourceValidationFailed`] (or, replayed from an ARP
-    /// hold, counted as the hold's `replay_dropped`), without any ICMP
-    /// error.
+    /// ingress interface (URPF) and is dropped as
+    /// [`DropReason::Ipv4SourceValidationFailed`], without any ICMP error.
+    /// Emitted only at RX: a datagram that fails is never held, and an ARP
+    /// hold replay decides against the snapshot it was received under (an
+    /// apply drops every hold), so a replay never fails the check.
     Ipv4SourceValidationFailed {
         ingress: IfId,
         source: crate::Ipv4Address,

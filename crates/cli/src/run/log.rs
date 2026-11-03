@@ -170,6 +170,11 @@ pub static EVENTS: &[Rule] = &[
         "FRAGMENT_SHARE_OVERCOMMITTED",
         Warn,
     )),
+    with_condition(rule(
+        Prefix("warning: SOURCE_VALIDATION_"),
+        "SOURCE_VALIDATION_WARNING",
+        Warn,
+    )),
     rule(
         Prefix("warning: reload preparation running"),
         "RELOAD_PREPARE_SLOW",

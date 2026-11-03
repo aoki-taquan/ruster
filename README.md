@@ -341,17 +341,35 @@ routeも数える。RFC 1812 §5.3.8、RFC 3704 §2.2）と`loose`（`/0`以外�
 `IPV4_SOURCE_VALIDATION_FAILED`（code 209）のsilent dropで、ICMP errorは一切返しません
 （RFC 1812 §5.3.8 "MUST silently discard"）。WAN（NAT outside）には`strict`が向きます: Internetの
 sourceはdefault routeで通りNATの応答も変換される一方、WANに来たinside sourceの詐称は落ち、
-ICMP4-023のclass 0 vectorが閉じます（default routeしか無いWANに`loose`を置くとInternet sourceが
-全部落ちる）。LANの`strict`はBCP 38（RFC 2827）のinside filteringです。判定はmartian検査が既に
+inside egressのclass 0 limiter（ICMP4-023）とLAN側のARP解決が守られます。WAN egressのclass 0は
+守られません: 詐称したInternet sourceやWAN subnet上のsourceはWANのstrictを通るので、WAN egressの
+class 0を使い切りon-linkのWAN addressへARP解決をさせることはまだできます。default routeしか
+無いWANに`loose`を置くとInternet sourceが全部落ちます。ここの`strict`はRFC 1812の字義どおり
+default routeも数えます（Cisco/Juniperのstrictは`allow-default`なしではdefault routeを数えない）。
+そのため`source-validation-allow-default`の意味も異なり、`loose`だけに効き§2.5を§2.4にします。
+LANの`strict`はBCP 38（RFC 2827）のinside filteringで、asymmetric routing（LANの裏に別経路がある等）
+では正当なtrafficを落とすので任意のhardeningです。upstreamが複数なら`loose`
+（+ allow-default）を使います。`validate`、起動時、適用したreloadごとに、`/0` routeのegressで
+allow-defaultなしの`loose`には`SOURCE_VALIDATION_DEFAULT_IGNORED interface=if<id>`、routeが一つも
+出ていないinterfaceの`strict`には`SOURCE_VALIDATION_NO_ROUTE interface=if<id>`の警告を出します
+（値なし、拒否はしない）。判定はmartian検査が既に
 行うsourceのroute lookupを再利用し（追加lookupなし、`off`ならbranch一つ）、reload可能で、
 storageは増えません。feasible-path（RFC 3704 §2.3、RFC 8704）はprefixごとに一つのpathしか無いので
 提供しません。詳細はrunbookの「Source address validation (URPF)」。
 
+推奨するhome/NAT edgeの設定（coordinatorの既定でowner異議待ち。built-in defaultと汎用fixtureは`off`のまま）:
+
 ```toml
 [[interfaces]]
+name = "lan"
+# ...
+# source-validation = "strict"  # 任意のBCP 38 hardening（asymmetric routingでは使わない）
+
+[[interfaces]]
+name = "wan"
 # ...
 source-validation = "strict"            # "off"（default）| "loose" | "strict"、reload可能
-# source-validation-allow-default = true  # "loose"のときだけ（RFC 3704 §2.4）
+# source-validation-allow-default = true  # "loose"のときだけ（RFC 3704 §2.4）。複数upstreamなら loose + これ
 ```
 
 interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は

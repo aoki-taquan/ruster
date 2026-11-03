@@ -1979,3 +1979,48 @@ fn held_tx_on_a_down_link_is_sent_later_by_default_and_refused_when_strict() {
     );
     assert!(!outcome.err.contains("reload applied"), "{}", outcome.err);
 }
+
+/// URPF sec L2: a reload prepares the source validation warnings of its
+/// document, and applying it makes them the ones printed after `reload
+/// applied` (the engine prints `Reloader::source_validation`).
+#[test]
+fn an_applied_reload_carries_its_source_validation_warnings() {
+    use super::super::reload::{Prepared, Preparer, Reloader, TickApply};
+    use crate::config_cmd::SourceValidationWarning;
+
+    let loose = edited(|text| {
+        text.replacen(
+            "device = \"sim1\"\n",
+            "device = \"sim1\"\nsource-validation = \"loose\"\n",
+            1,
+        )
+        .replacen(
+            "[[routes]]",
+            "[[routes]]\nprefix = \"0.0.0.0/0\"\negress = \"wan\"\nvia = \"203.0.113.1\"\n\n[[routes]]",
+            1,
+        )
+    });
+    let sequencer = ProductionSequencer::new(OsRandomKeySource::open().expect("urandom"));
+    let source = FakeSource::with([Ok(loose)]);
+    let mut preparer = Preparer::new(sequencer, config(), source);
+    let Prepared::Ready(ready) = preparer.prepare() else {
+        panic!("the loose document is reloadable");
+    };
+    assert_eq!(
+        ready.source_validation(),
+        [SourceValidationWarning::DefaultIgnored(IfId(2))]
+    );
+    let mut reloader = Reloader::without_worker(super::super::budgets(&config()));
+    assert!(reloader.source_validation().is_empty());
+    reloader.set_ready_for_test(ready);
+    let generation = std::num::NonZeroU64::new(2).expect("nonzero");
+    reloader.finish(generation, TickApply::Applied(None));
+    assert_eq!(
+        reloader
+            .source_validation()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["SOURCE_VALIDATION_DEFAULT_IGNORED interface=if2"]
+    );
+}

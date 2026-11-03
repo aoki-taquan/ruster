@@ -383,6 +383,16 @@ const SAMPLES: &[(&str, &str, &str)] = &[
         "warn",
     ),
     (
+        "ruster run: warning: SOURCE_VALIDATION_DEFAULT_IGNORED interface=if2",
+        "SOURCE_VALIDATION_WARNING",
+        "warn",
+    ),
+    (
+        "ruster run: warning: SOURCE_VALIDATION_NO_ROUTE interface=if1",
+        "SOURCE_VALIDATION_WARNING",
+        "warn",
+    ),
+    (
         "ruster run: warning: reload preparation running for 10 s; later SIGHUPs are held",
         "RELOAD_PREPARE_SLOW",
         "warn",
@@ -631,7 +641,8 @@ fn every_event_code_has_a_sample_and_classifies() {
         codes.join(" "),
         "READY RELOAD_REQUESTED RELOAD_CHECKED RELOAD_APPLIED RELOAD_REFUSED RELOAD_FAILED \
          WATCH_SETTINGS_APPLIED HEALTH_WARNING HEALTH_RECOVERED HEALTH_FATAL CHECK_WARNING \
-         SWEEP_SLOW FRAGMENT_SHARE_OVERCOMMITTED RELOAD_PREPARE_SLOW IDLE_POLL_FAILED \
+         SWEEP_SLOW FRAGMENT_SHARE_OVERCOMMITTED SOURCE_VALIDATION_WARNING RELOAD_PREPARE_SLOW \
+         IDLE_POLL_FAILED \
          WORKER_ABANDONED \
          KERNEL_EXPOSURE_AT_EXIT USER_NAMESPACE_NOT_INITIAL EXIT_PROTECTION_ARMED \
          EXIT_PROTECTION_FAILED EXIT_PROTECTION_APPLIED \

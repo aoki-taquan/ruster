@@ -2236,7 +2236,11 @@ applyは全holdを捨てる）。modeはsnapshotの一部なのでreloadableで�
 依存しません（`ApplyPlan::source_validation`）。FIBはprefixごとに一つのpathなので
 feasible-path（RFC 3704 §2.3、RFC 8704）はstrictと同じになり提供しません。WANをstrictに
 するとICMP4-023のclass 0 vector（WANに来た詐称inside sourceによるinside egressのerror
-limiter消費）が閉じます。
+limiter消費）が閉じます。WAN egressのclass 0と、on-linkのWAN addressへのARP解決は、strictを通る
+詐称Internet/WAN subnet sourceで使い切れるので守られません。strictはRFC 1812の字義どおりdefault
+routeを数えます（Cisco/Juniperのstrictとは違う）。`ruster`は`/0`のegressに置いたallow-defaultなしの
+`loose`と、routeが一つも出ないinterfaceの`strict`を値なしで警告します（validate、起動時、reload）。
+`SnapshotError`はURPFのvariantを足したので`#[non_exhaustive]`にしました。
 
 common Ethernet ingress admissionはprotocol parserより前にexact ingress MACを検証します。
 続くIPv4 structural/header-checksum検証後のIP admissionだけは、sourceとnonlocal destinationの

@@ -75,7 +75,9 @@ use ruster_core::{
 };
 use ruster_runtime::{ApplyCarryCounts, ApplyFlushCounts, TickBudgets};
 
-use crate::config_cmd::{self, FragmentShareOvercommitted, LoadError, SweepSlow};
+use crate::config_cmd::{
+    self, FragmentShareOvercommitted, LoadError, SourceValidationWarning, SweepSlow,
+};
 
 use super::ops::{Fallback, Ops};
 use super::output::SpawnError;
@@ -344,12 +346,23 @@ pub struct Ready {
     sweep: [Option<SweepSlow>; 2],
     /// The fragment share warning of its document, printed once applied.
     share: Option<FragmentShareOvercommitted>,
+    /// The source validation warnings of its document, printed once
+    /// applied (URPF).
+    source_validation: Box<[SourceValidationWarning]>,
     /// The watch settings of its document (OPS-LOG), applied with it.
     ops: Ops,
     /// Its `[reload] down-link-tx` is `refuse` (OPS-EXIT).
     refuse_held_tx: bool,
     /// TX frames held on down links when its candidate was taken.
     held_tx: u64,
+}
+
+impl Ready {
+    /// The source validation warnings of its document (URPF).
+    #[cfg(test)]
+    pub fn source_validation(&self) -> &[SourceValidationWarning] {
+        &self.source_validation
+    }
 }
 
 /// The preparer's answer to one request (formatted on the worker thread,
@@ -457,6 +470,7 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             counts: DocumentCounts::of(&next),
             sweep: config_cmd::sweep_warnings(&next),
             share: config_cmd::fragment_share_warning(&next),
+            source_validation: config_cmd::source_validation_warnings(&next),
             refuse_held_tx: next.reload_down_link_tx() == ruster_config::DownLinkTxV1::Refuse,
             held_tx: 0,
         };
@@ -609,6 +623,7 @@ pub struct Reloader {
     budgets: TickBudgets,
     sweep: [Option<SweepSlow>; 2],
     share: Option<FragmentShareOvercommitted>,
+    source_validation: Box<[SourceValidationWarning]>,
     counters: ReloadCounters,
     /// The watch settings of the active generation's document (OPS-LOG).
     ops: Ops,
@@ -623,6 +638,7 @@ impl Reloader {
             budgets,
             sweep: [None, None],
             share: None,
+            source_validation: Box::default(),
             counters: ReloadCounters::default(),
             ops: Ops::default(),
         }
@@ -650,6 +666,7 @@ impl Reloader {
             budgets,
             sweep: [None, None],
             share: None,
+            source_validation: Box::default(),
             counters: ReloadCounters::default(),
             ops: Ops::default(),
         }
@@ -672,6 +689,11 @@ impl Reloader {
     /// The fragment share warning of the last applied document.
     pub const fn share(&self) -> Option<FragmentShareOvercommitted> {
         self.share
+    }
+
+    /// The source validation warnings of the last applied document (URPF).
+    pub fn source_validation(&self) -> &[SourceValidationWarning] {
+        &self.source_validation
     }
 
     /// Whether a reload is in flight (preparing or pending): further
@@ -772,6 +794,16 @@ impl Reloader {
         }
     }
 
+    /// Makes `ready` the pending successor (tests of `finish`).
+    #[cfg(test)]
+    pub fn set_ready_for_test(&mut self, ready: Box<Ready>) {
+        self.counters.requested = self.counters.requested.saturating_add(1);
+        self.phase = Phase::Pending {
+            ready,
+            since: MonotonicMillis(0),
+        };
+    }
+
     /// Makes a successor with `budgets` pending without a candidate (tests
     /// of `finish`).
     #[cfg(test)]
@@ -784,6 +816,7 @@ impl Reloader {
                 counts: DocumentCounts::default(),
                 sweep: [None, None],
                 share: None,
+                source_validation: Box::default(),
                 ops: self.ops,
                 refuse_held_tx: false,
                 held_tx: 0,
@@ -829,6 +862,7 @@ impl Reloader {
                 self.budgets = ready.budgets;
                 self.sweep = ready.sweep;
                 self.share = ready.share;
+                self.source_validation = ready.source_validation;
                 self.ops = ready.ops;
                 if let Some(worker) = self.worker.as_mut() {
                     worker.applied();

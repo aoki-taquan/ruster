@@ -810,6 +810,74 @@ fn plan_prints_source_validation_as_a_reloadable_delta() {
     );
 }
 
+/// URPF sec L2: `validate` warns (value-free, exit 0) about `loose`
+/// without allow-default on the egress of a `/0` route and about `strict`
+/// on an interface no route leaves through; neither is refused, and a
+/// sensible setting (strict on the WAN, loose with allow-default) is quiet.
+#[test]
+fn validate_warns_about_suspicious_source_validation() {
+    let dir = scratch();
+    let source = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/urpf/router.toml"),
+    )
+    .unwrap();
+    let wan = "mac = \"02:00:00:00:00:02\"\nsource-validation = \"off\"\n";
+    // A third interface with no address and no route.
+    let spare = "[[interfaces]]\nid = 3\nname = \"spare\"\ndevice = \"sim2\"\n\
+                 mac = \"02:00:00:00:00:03\"\nsource-validation = \"strict\"\n\n[[addresses]]";
+    let write = |name: &str, text: String| {
+        let path = dir.join(name);
+        fs::write(&path, text).unwrap();
+        path
+    };
+    let cases = [
+        (
+            "urpf-loose.toml",
+            source.replacen(
+                wan,
+                "mac = \"02:00:00:00:00:02\"\nsource-validation = \"loose\"\n",
+                1,
+            ),
+            vec!["ruster: warning: SOURCE_VALIDATION_DEFAULT_IGNORED interface=if2"],
+        ),
+        (
+            "urpf-no-route.toml",
+            source.replacen("[[addresses]]", spare, 1),
+            vec!["ruster: warning: SOURCE_VALIDATION_NO_ROUTE interface=if3"],
+        ),
+        (
+            "urpf-quiet.toml",
+            source.replacen(
+                wan,
+                "mac = \"02:00:00:00:00:02\"\nsource-validation = \"strict\"\n",
+                1,
+            ),
+            vec![],
+        ),
+        (
+            "urpf-allowed.toml",
+            source.replacen(
+                wan,
+                "mac = \"02:00:00:00:00:02\"\nsource-validation = \"loose\"\n\
+                 source-validation-allow-default = true\n",
+                1,
+            ),
+            vec![],
+        ),
+    ];
+    for (name, document, expected) in cases {
+        let path = write(name, document);
+        let validated = ruster(&["validate".as_ref(), path.as_os_str()]);
+        assert_eq!(status(&validated), 0, "{name}: {}", text(&validated.stderr));
+        let warnings: Vec<String> = text(&validated.stderr)
+            .lines()
+            .filter(|line| line.contains("SOURCE_VALIDATION_"))
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(warnings, expected, "{name}");
+    }
+}
+
 #[test]
 fn plan_prints_nat_filtering_as_a_reloadable_typed_delta() {
     let dir = scratch();

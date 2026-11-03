@@ -568,6 +568,9 @@ where
     if let Some(warning) = crate::config_cmd::fragment_share_warning(&config) {
         let _ = writeln!(err, "ruster run: warning: {warning}");
     }
+    for warning in crate::config_cmd::source_validation_warnings(&config).iter() {
+        let _ = writeln!(err, "ruster run: warning: {warning}");
+    }
     // OPS-EXIT item 4: capabilities of a user namespace act only on what it
     // owns, though `CapEff` looks the same.
     if host.initial_user_namespace() != Some(true) {
