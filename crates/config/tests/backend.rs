@@ -638,3 +638,38 @@ fn backend_geometry_is_consistent_with_the_native_profile() {
         }
     }
 }
+
+/// MTU2 part B follow-up: with fragmentation on, a port's generated pool
+/// must leave a fragment set room for two fragments beyond the router
+/// reserve (`max(2, frames / 8)`), or every DF-clear datagram above an MTU
+/// would commit its state and then never be sent. Fewer than 4
+/// `generated-frames` fail closed at the port; fragmentation off accepts
+/// them.
+#[test]
+fn af_xdp_generated_pool_must_fit_a_fragment_set() {
+    // frame-count stays fill + tx + generated-frames.
+    let with = |frames: u32, extra: &str| {
+        edited(
+            "frame-count = 4608\ngenerated-frames = 512\n",
+            &format!(
+                "frame-count = {}\ngenerated-frames = {frames}\n",
+                4096 + frames
+            ),
+        ) + extra
+    };
+    for frames in [1, 2, 3] {
+        let error = reject(&with(frames, ""));
+        assert_eq!(
+            error.code(),
+            ValidationCode::FragmentationBackendRoomTooSmall,
+            "{frames}"
+        );
+        assert_eq!(error.code().code(), "FRAGMENTATION_BACKEND_ROOM_TOO_SMALL");
+        assert_eq!(
+            rendered(error.path().segments()),
+            "backend.ports[0].generated-frames"
+        );
+        check(&with(frames, "\n[fragmentation]\nenabled = false\n")).expect("off accepts it");
+    }
+    check(&with(4, "")).expect("two fragments beyond the reserve of two");
+}

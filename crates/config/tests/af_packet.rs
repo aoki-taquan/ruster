@@ -443,7 +443,9 @@ fn af_packet_limits_accept_exact_boundaries() {
         let text = two_ports(head).replacen(from, to, 1);
         assert!(check(&text).is_ok(), "{head} {to}");
     }
-    // The largest block count, filling the per-port ring bound exactly.
+    // The largest block count, filling the per-port ring bound exactly
+    // (its 2-frame TX ring cannot carry a fragment set, so fragmentation
+    // is off here; `af_packet_tx_ring_must_fit_a_fragment_set`).
     let full = two_ports("")
         .replacen(
             "rx = { block-size = 65536, block-count = 8",
@@ -454,7 +456,8 @@ fn af_packet_limits_accept_exact_boundaries() {
             "tx = { block-size = 65536, block-count = 4",
             "tx = { block-size = 4096, block-count = 1",
             1,
-        );
+        )
+        + "\n[fragmentation]\nenabled = false\n";
     let config = check(&full).unwrap();
     let port = &config.backend().af_packet().unwrap().ports()[1]; // `if1`, the edited entry
     assert_eq!(
@@ -574,4 +577,48 @@ fn af_packet_frames_size_the_fragmentation_slots() {
     assert_eq!(slot("max-frame-len = 3841\n"), Some(3841));
     assert_eq!(slot("max-frame-len = 9014\n"), Some(9014));
     assert_eq!(slot("max-frame-len = 9230\n"), Some(9230));
+}
+
+/// MTU2 part B follow-up: with fragmentation on, an AF_PACKET TX ring must
+/// leave a fragment set room for two fragments beyond the router reserve
+/// (`max(2, frames / 8)`): a ring of 2 frames (block-size 4096, one
+/// block, 2048-byte frames) fails closed at the port; 4 frames pass; with
+/// fragmentation off the small ring is accepted.
+#[test]
+fn af_packet_tx_ring_must_fit_a_fragment_set() {
+    let small = two_ports("").replacen(
+        "tx = { block-size = 65536, block-count = 4 }",
+        "tx = { block-size = 4096, block-count = 1 }",
+        1,
+    );
+    let error = reject(&small);
+    assert_eq!(
+        error.code(),
+        ValidationCode::FragmentationBackendRoomTooSmall
+    );
+    let segments = error.path().segments();
+    assert_eq!(
+        segments,
+        [
+            PathSegment::Field("backend".into()),
+            PathSegment::Field("af-packet".into()),
+            PathSegment::Field("ports".into()),
+            PathSegment::Index(0),
+            PathSegment::Field("tx".into()),
+        ]
+    );
+    check(&format!("{small}\n[fragmentation]\nenabled = false\n")).expect("off accepts it");
+    let four = two_ports("").replacen(
+        "tx = { block-size = 65536, block-count = 4 }",
+        "tx = { block-size = 4096, block-count = 2 }",
+        1,
+    );
+    let config = check(&four).expect("four frames");
+    let tx = config.backend().af_packet().unwrap().ports()[1]
+        .tx()
+        .frame_count();
+    let other = config.backend().af_packet().unwrap().ports()[0]
+        .tx()
+        .frame_count();
+    assert_eq!(tx.min(other), 4);
 }

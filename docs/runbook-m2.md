@@ -787,11 +787,19 @@ DF (that gets Fragmentation Needed, above).
   RX batch of fragmented datagrams if that is your traffic (a 1500-byte
   datagram over a 1280 or 1400 link needs 2 frames, over 576 3). The
   fragments one datagram can actually get are at most
-  min(`max-fragments-per-datagram`, ceil((slot - 34) / block), the free
-  generated frames of the egress minus the AF_XDP router reserve
-  (`max(2, generated-frames / 8)`), the TX ring room, `[tick]
-  generated-fragments`); a set larger than the egress pool can never be
-  sent and is counted `fragmentation.dropped_unavailable` every time.
+  min(`max-fragments-per-datagram`, ceil((slot - 34) / block), the room
+  the egress offers a set, `[tick] generated-fragments`). The room is, on
+  AF_XDP, min(free generated frames, TX submit room) minus the router
+  reserve `max(2, generated-frames / 8)`, and on AF_PACKET the free TX
+  frames from the producer head minus `max(2, TX ring frames / 8)`. A set
+  larger than that room is counted `fragmentation.dropped_unavailable`
+  (its state already committed). A port that could never offer room for
+  even two fragments (fewer than 4 `generated-frames` on AF_XDP, fewer
+  than 4 TX ring frames on AF_PACKET, for example `block-size = 4096,
+  block-count = 1`) is refused while fragmentation is on:
+  `stage=validate code=FRAGMENTATION_BACKEND_ROOM_TOO_SMALL
+  path=backend.ports[i].generated-frames` (AF_XDP) or
+  `path=backend.af-packet.ports[i].tx` (AF_PACKET).
 
 ```toml
 [fragmentation]
@@ -2703,6 +2711,7 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS` | — | a DF-clear datagram would need more fragments than `max-fragments-per-datagram` | raise the bound (default 1365), or raise the egress MTU |
 | `drop.IPV4_FRAGMENTATION_QUEUE_FULL` | — | more DF-clear datagrams above an egress MTU in one tick than `[fragmentation] datagrams` | raise `datagrams` to at least `[tick] rx` (restart) |
 | `drop.IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE` | — | a DF-clear datagram longer than a fragmentation slot (the largest of the interface `mtu`s, 3826, and the AF_PACKET `max-frame-len` - 14); no production port delivers one, so only the simulator can | none on AF_XDP or AF_PACKET; in a scenario, keep injected datagrams within the slot |
+| `stage=validate code=FRAGMENTATION_BACKEND_ROOM_TOO_SMALL` | 2 | fragmentation is on and a port has fewer than 4 AF_XDP `generated-frames` or AF_PACKET TX ring frames, so it could never send a fragment set (two fragments plus the router reserve of two) | raise that port's `generated-frames` (and `frame-count`) or TX ring, or set `[fragmentation] enabled = false` |
 | `fragmentation.dropped_budget` growing | — | more fragment frames per tick than `[tick] generated-fragments` | raise `generated-fragments` (and the egress `generated-frames` / TX ring with it) if the link carries much fragmented traffic |
 | `drop.IPV4_FRAGMENTATION_OFFSET_OVERFLOW` | — | a fragment whose offset plus data run past 65535 bytes (malformed, ping-of-death shape) | nothing to fix on the router; find the sender (the firewall normally refuses fragments first) |
 | `fragmentation.dropped_unavailable` growing | — | no generated-frame or TX room on the egress for a whole fragment set | raise `generated-frames` (AF_XDP) or the TX ring; check `tx_ring_full` and completion lag |

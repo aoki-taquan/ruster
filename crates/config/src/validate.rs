@@ -127,6 +127,10 @@ pub enum ValidationCode {
     FragmentationPolicy(Ipv4FragmentationPolicyError),
     /// `[fragmentation] datagrams` is 0 while fragmentation is enabled.
     FragmentationDatagramsZero,
+    /// Fragmentation is enabled but a backend port could never send a
+    /// fragment set: fewer than 4 AF_XDP `generated-frames` or AF_PACKET TX
+    /// ring frames (two fragments plus the router reserve of two).
+    FragmentationBackendRoomTooSmall,
     /// `[tick] generated-fragments` is 0 (no fragment could ever be sent).
     TickGeneratedFragmentsZero,
     InvalidAllocatorSeed,
@@ -288,6 +292,7 @@ impl ValidationCode {
             Self::Icmpv4ErrorPolicy(_) => "ICMPV4_ERROR_POLICY",
             Self::FragmentationPolicy(_) => "FRAGMENTATION_POLICY",
             Self::FragmentationDatagramsZero => "FRAGMENTATION_DATAGRAMS_ZERO",
+            Self::FragmentationBackendRoomTooSmall => "FRAGMENTATION_BACKEND_ROOM_TOO_SMALL",
             Self::TickGeneratedFragmentsZero => "TICK_GENERATED_FRAGMENTS_ZERO",
             Self::InvalidAllocatorSeed => "INVALID_ALLOCATOR_SEED",
             Self::NonCanonicalAllocatorSeed => "NON_CANONICAL_ALLOCATOR_SEED",
@@ -2013,7 +2018,29 @@ fn validate_v1(
 
     // Before the fragmentation slots, whose size depends on the largest
     // frame an AF_PACKET port receives.
-    let backend = validate_backend(config.backend.unwrap_or_default(), &interfaces)?;
+    let backend_source = config.backend.unwrap_or_default();
+    // Port order and interface names of the source, for the fragmentation
+    // room check below (the validated ports are sorted by IfId).
+    let backend_port_names: Vec<String> = match backend_source.kind {
+        BackendKindV1::AfXdp => backend_source
+            .ports
+            .iter()
+            .map(|port| port.interface.clone())
+            .collect(),
+        BackendKindV1::AfPacket => backend_source
+            .af_packet
+            .as_ref()
+            .map(|af_packet| {
+                af_packet
+                    .ports
+                    .iter()
+                    .map(|port| port.interface.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        BackendKindV1::Sim => Vec::new(),
+    };
+    let backend = validate_backend(backend_source, &interfaces)?;
 
     let fragmentation_source = config.fragmentation.unwrap_or_default();
     let fragmentation_path = |field: &str| path(&["fragmentation", field]);
@@ -2041,6 +2068,7 @@ fn validate_v1(
                 u64::from(fragmentation_source.datagrams),
             ));
         }
+        check_fragment_set_room(&backend, &interfaces, &backend_port_names)?;
         // A slot holds the longest datagram the router can receive. The
         // configured interface MTU is not enforced at ingress (a device MTU
         // may be larger, `MTU_BELOW_DEVICE`), so the bound is the largest of
@@ -2216,6 +2244,75 @@ const _: () = {
         largest as u64 - XDP_PACKET_HEADROOM as u64 - 14 == FRAGMENTATION_MIN_SLOT_DATAGRAM as u64
     );
 };
+
+/// The fewest frames of a fragment set: a fragmented datagram has at least
+/// two fragments.
+const FRAGMENT_SET_MIN_FRAMES: u32 = 2;
+
+/// The frames a backend keeps for the router's own single frames (ARP,
+/// ICMP errors) out of the room it offers a fragment set: `max(2, frames /
+/// 8)`, capped at `frames`. The AF_XDP adapter's `generated_reserve` and
+/// the AF_PACKET engine's `tx_router_reserve` use this formula.
+const fn router_reserve(frames: u32) -> u32 {
+    let eighth = frames / 8;
+    let reserve = if eighth > 2 { eighth } else { 2 };
+    if reserve < frames {
+        reserve
+    } else {
+        frames
+    }
+}
+
+/// With fragmentation on, every port must offer a fragment set room for at
+/// least two fragments beyond its router reserve; otherwise every DF-clear
+/// datagram above an MTU would commit its state and then be dropped
+/// (`dropped_unavailable`) every time. AF_XDP: `generated-frames` (the TX
+/// ring is at least 64). AF_PACKET: the TX ring frames. Both need at least
+/// 4 (`FRAGMENTATION_BACKEND_ROOM_TOO_SMALL`, fail closed at the port).
+fn check_fragment_set_room(
+    backend: &ValidatedBackendV1,
+    interfaces: &[InterfaceBindingV1],
+    port_names: &[String],
+) -> Result<(), ValidationError> {
+    let source_index = |interface: IfId| {
+        interfaces
+            .iter()
+            .find(|binding| binding.id() == interface)
+            .and_then(|binding| port_names.iter().position(|name| name == binding.name()))
+            .unwrap_or(0)
+    };
+    let too_small = |frames: u32| frames - router_reserve(frames) < FRAGMENT_SET_MIN_FRAMES;
+    match backend {
+        ValidatedBackendV1::Sim => Ok(()),
+        ValidatedBackendV1::AfXdp(af_xdp) => {
+            for port in af_xdp.ports() {
+                let frames = port.umem().generated_frames();
+                if too_small(frames) {
+                    let base =
+                        indexed_nested_path("backend", "ports", source_index(port.interface()));
+                    return Err(ValidationError::new(
+                        ValidationCode::FragmentationBackendRoomTooSmall,
+                        child_path(&base, "generated-frames"),
+                    ));
+                }
+            }
+            Ok(())
+        }
+        ValidatedBackendV1::AfPacket(af_packet) => {
+            for port in af_packet.ports() {
+                if too_small(port.tx().frame_count()) {
+                    let mut base = path(&["backend", "af-packet", "ports"]);
+                    base.push_index(source_index(port.interface()));
+                    return Err(ValidationError::new(
+                        ValidationCode::FragmentationBackendRoomTooSmall,
+                        child_path(&base, "tx"),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
 
 /// The longest IPv4 datagram an AF_PACKET port receives (its frame minus the
 /// Ethernet header); 0 for the other backends.
