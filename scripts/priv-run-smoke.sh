@@ -1960,7 +1960,8 @@ phase_urpf() {
     expect_plan router urpf-strict reloadable none
     cp "$work/urpf-strict.toml" "$work/urpf.toml"
     sudo -n ip -n "$host_b" addr add 192.168.1.99/32 dev pb
-    start_ruster urpf "$work/urpf.toml"
+    # As the invoking user, so the reload can read the work directory.
+    start_ruster urpf "$work/urpf.toml" --user "$smoke_uid" --group "$smoke_gid"
     wait_ready urpf || fail "urpf: ruster exited during startup"
     forward_once urpf
     in_ns "$host_b" ping -c 1 -W 2 203.0.113.2 >"$work/urpf-ping.txt" 2>&1 ||
