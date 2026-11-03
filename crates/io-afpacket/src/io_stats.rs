@@ -77,6 +77,13 @@ pub struct AfPacketCounters {
     pub kernel_freeze_q: u64,
     /// Failed `PACKET_STATISTICS` reads.
     pub kernel_stats_errors: u64,
+    /// Pending socket errors (`sk_err`, set by the kernel when the bound
+    /// device goes down or away) read and cleared with
+    /// `getsockopt(SO_ERROR)` after `poll` reported `POLLERR`, so the idle
+    /// wait can block again.
+    pub socket_errors: u64,
+    /// Failed `SO_ERROR` reads.
+    pub socket_error_reads_failed: u64,
 }
 
 impl AfPacketCounters {
@@ -117,6 +124,8 @@ impl AfPacketCounters {
             kernel_drops,
             kernel_freeze_q,
             kernel_stats_errors,
+            socket_errors,
+            socket_error_reads_failed,
         );
         self.tx_inflight_high_water = self
             .tx_inflight_high_water
@@ -160,6 +169,8 @@ impl AfPacketCounters {
             kernel_drops,
             kernel_freeze_q,
             kernel_stats_errors,
+            socket_errors,
+            socket_error_reads_failed,
         );
     }
 }

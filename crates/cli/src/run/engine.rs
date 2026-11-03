@@ -120,6 +120,12 @@ pub trait ClockedIo {
 
 /// A datapath the loop drives: the core-facing I/O plus the shutdown and
 /// stats operations of the backend.
+///
+/// Implemented once per backend (AF_XDP: `XdpDatapath`, AF_PACKET:
+/// `PacketDatapath`, both in `linux`) and used by static dispatch only: the
+/// loop, the shutdown drain, and the stats are generic over it, so each
+/// backend gets its own monomorphized loop and the per-packet path never
+/// goes through a trait object or an enum.
 pub trait Datapath {
     type Io: PacketIo + GeneratedPacketIo + PublicationQuiescence + ClockedIo;
 
@@ -162,6 +168,13 @@ pub trait Datapath {
     /// Hands each port's health counters to `visit` (cold path, no
     /// allocation).
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample));
+
+    /// Cold-path upkeep right before each health sample (at most every
+    /// [`super::watch::HEALTH_INTERVAL_MS`]); nothing by default. The
+    /// AF_PACKET datapath folds the kernel's `PACKET_STATISTICS` in here:
+    /// the kernel keeps them in 32-bit counters that reset on every read,
+    /// so they are read periodically, not only for a stats block.
+    fn refresh(&mut self) {}
 
     /// Whether a publication could be applied right now: the backend's
     /// own quiescence check (which reaps completions and kicks owed TX
@@ -206,6 +219,11 @@ pub trait LinkMonitor {
     /// effective `rp_filter` is 0, `None` if
     /// unreadable. Cold path, no allocation.
     fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool>;
+
+    /// Devices of the namespace stacked on `target`'s interface index (a
+    /// link dump, [`super::netlink::stacked_on`]); AF_PACKET ports only.
+    /// Cold path, no allocation.
+    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError>;
 }
 
 /// Summed result of one drain call.
@@ -808,6 +826,9 @@ where
             && now.0.saturating_sub(last_stats.0) >= settings.stats_interval_ms;
         let on_demand = on_demand_stats.due(now, stop.take_stats());
         if periodic || on_demand {
+            // A block shows the backend's latest kernel counters (AF_PACKET
+            // folds PACKET_STATISTICS here as at a health sample).
+            datapath.refresh();
             let status = RunStatus {
                 reload: control.reloader.counters(),
                 watch: &control.watch,
@@ -947,12 +968,12 @@ fn bump(counter: &mut u64) {
     *counter = counter.saturating_add(1);
 }
 
-/// The health sample when due, and the link round: a finished round is
-/// folded in, a due one is requested (or counted late, and stale past the
-/// threshold, while the previous one still runs). Returns the first fatal
-/// event as the loop end.
+/// The health sample when due (after [`Datapath::refresh`]), and the link
+/// round: a finished round is folded in, a due one is requested (or
+/// counted late, and stale past the threshold, while the previous one
+/// still runs). Returns the first fatal event as the loop end.
 pub(super) fn watch_step<D, E>(
-    datapath: &D,
+    datapath: &mut D,
     control: &mut Control,
     now: MonotonicMillis,
     settings: LoopSettings,
@@ -974,6 +995,7 @@ where
     };
     let watch = &mut control.watch;
     if watch.health_due(now, settings.health_interval_ms) {
+        datapath.refresh();
         datapath.sample_ports(&mut |sample| watch.on_sample(now, sample, &mut on_event));
     }
     if let Some(round) = control.links.poll() {

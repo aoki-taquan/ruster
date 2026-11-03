@@ -142,6 +142,20 @@
 #             then conf/ra/forwarding=1 with ip_forward=0: refused at
 #             startup with scope=device, warned on if1 (only) while
 #             running and recovered when cleared (M2 S11)
+#   afpacket  (AFPKT-015, after removal, which it follows by recreating
+#             ra/pa) `ruster run` with `backend.kind = "af-packet"`: GRO on
+#             ra, rb MTU 1400 (below the configured MTU), a kernel address
+#             on rb, and a VLAN on ra are refused
+#             (exit 1, no packet socket left); one router forwards with
+#             NAT44, answers ICMP Echo, applies two reloads and refuses a
+#             restart-required one, survives a carrier loss on rb and an
+#             administrative down/up of ra (its pending socket error is
+#             cleared: the idle wait keeps blocking instead of sleeping),
+#             transmits every frame on ra/rb itself (none by the kernel),
+#             and drains on SIGTERM (exit 0, both packet sockets closed);
+#             enslaving rb to a bridge ends a second router with
+#             KERNEL_UPPER_DEVICE, deleting rb a third with DEVICE_REMOVED
+#             (exit 1 each), no packet socket left. Default drop, Landlock, seccomp kill.
 #   removal   (last) `ip link del ra` inside the router namespace while
 #             running: exit 1 (DEVICE_REMOVED), nothing left attached
 #   rollback  a second port that fails to open (queue 1 of a one-queue
@@ -2909,6 +2923,229 @@ if sudo -n ip -n "$router" link show dev ra >/dev/null 2>&1; then
 fi
 cat "$work/removal.err"
 echo "priv_run_removal: deleted port device failed closed with exit 1, nothing left attached verified"
+
+# afpacket (AFPKT-015): `ruster run` with `backend.kind = "af-packet"` in the
+# same topology (after the AF_XDP removal phase, which deleted ra: it is
+# recreated first). Startup refusals open nothing; one router forwards
+# with NAT, answers ICMP Echo, applies and refuses reloads, survives a
+# carrier loss and an administrative down/up of a port (whose pending
+# socket error it clears, so the idle wait keeps blocking), adds no
+# kernel frame of its own, and drains on SIGTERM; deleting a port's
+# device ends a second router with DEVICE_REMOVED, leaving no packet
+# socket behind. Every run: default privilege drop, Landlock, and the
+# kill seccomp filter (the final no-violation check covers them).
+PACKET_BACKEND='
+[backend]
+kind = "af-packet"
+
+[backend.af-packet]
+max-frame-len = 1514
+
+[[backend.af-packet.ports]]
+interface = "lan"
+rx = { block-size = 65536, block-count = 4, retire-timeout-ms = 2 }
+tx = { block-size = 65536, block-count = 2 }
+
+[[backend.af-packet.ports]]
+interface = "wan"
+rx = { block-size = 65536, block-count = 4, retire-timeout-ms = 2 }
+tx = { block-size = 65536, block-count = 2 }
+'
+
+# The packet sockets of the router namespace (`/proc/net/packet` rows).
+packet_sockets() {
+    in_ns "$router" cat /proc/net/packet | sed 1d | grep -c . || true
+}
+
+# Transmitted frames of the router's device $1.
+tx_packets() {
+    in_ns "$router" cat "/sys/class/net/$1/statistics/tx_packets"
+}
+
+# Starts the AF_PACKET config $2 as phase $1 and expects the startup
+# refusal line $3 (exit 1), with no packet socket left.
+packet_refused() {
+    start_ruster "$1" "$2"
+    wait_ruster
+    [ "$status" -eq 1 ] || fail "$1: exit status $status: $(cat "$work/$1.err")"
+    grep -qxF "ruster run: startup failed: $3" "$work/$1.err" ||
+        fail "$1: no refusal \"$3\": $(cat "$work/$1.err")"
+    [ "$(packet_sockets)" -eq 0 ] || fail "$1: a packet socket was left open"
+}
+
+phase_afpacket() {
+    # ra/pa again, as the setup made them (IPv6 off before the link is up,
+    # so the kernel never sends a frame of its own on it).
+    sudo -n ip -n "$router" link add ra numtxqueues 1 numrxqueues 1 type veth \
+        peer name pa netns "$host_a" numtxqueues 1 numrxqueues 1
+    sudo -n ip -n "$router" link set ra address 02:00:00:00:00:01
+    for dev in ra rb; do
+        in_ns "$router" sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"
+        sudo -n ip -n "$router" link set "$dev" mtu 1500
+        sudo -n ip -n "$router" link set "$dev" up
+    done
+    sudo -n ip -n "$host_a" link set pa address 02:00:00:00:00:10
+    sudo -n ip -n "$host_a" address add 192.168.1.10/24 dev pa
+    sudo -n ip -n "$host_a" link set pa up
+    sudo -n ip -n "$host_a" route add default via 192.168.1.1
+    in_ns "$host_a" ethtool -K pa tx off >/dev/null
+    # The AF_PACKET requirement (runbook): no merging receive offload. veth
+    # starts with GRO off on current kernels; say so explicitly anyway.
+    for dev in ra rb; do
+        in_ns "$router" ethtool -K "$dev" gro off
+    done
+    for name in router deny; do
+        sed '/^\[backend\]$/,$d' "$work/$name.toml" >"$work/packet-$name-base.toml"
+        printf '%s' "$PACKET_BACKEND" | cat "$work/packet-$name-base.toml" - >"$work/packet-$name.toml"
+    done
+    sed 's/retire-timeout-ms = 2/retire-timeout-ms = 3/' "$work/packet-router.toml" \
+        >"$work/packet-reshape.toml"
+    for config in packet-router packet-deny packet-reshape; do
+        status=0
+        "$binary_path" validate "$work/$config.toml" >"$work/validate-$config.txt" 2>&1 || status=$?
+        [ "$status" -eq 0 ] || fail "afpacket: validate $config: $(cat "$work/validate-$config.txt")"
+        grep -q ' backend=af-packet ports=2 max-frame-len=1514 ring-bytes=786432$' \
+            "$work/validate-$config.txt" || fail "afpacket: validate $config: $(cat "$work/validate-$config.txt")"
+    done
+    expect_plan packet-router packet-deny reloadable none
+    expect_plan packet-router packet-reshape restart-required BACKEND
+    expect_plan router packet-router restart-required BACKEND
+    echo "priv_run_afpacket_config: af-packet configs valid (2 ports, 786432 ring bytes), firewall change reloadable, ring change and af-xdp -> af-packet restart-required BACKEND verified"
+
+    # Refusals: GRO on a port, a port MTU below max-frame-len - 14, a
+    # kernel IPv4 address on a port. Each opens no socket.
+    in_ns "$router" ethtool -K ra gro on
+    packet_refused afpacket-gro "$work/packet-router.toml" \
+        "stage=checks port=if1 code=RECEIVE_OFFLOAD feature=rx-gro"
+    in_ns "$router" ethtool -K ra gro off
+    # A device MTU below max-frame-len - 14 passes the frame bound, but the
+    # configured interface MTU (1500) must fit it (MTU1).
+    sudo -n ip -n "$router" link set rb mtu 1400
+    packet_refused afpacket-mtu "$work/packet-router.toml" \
+        "stage=checks port=if2 code=MTU_BELOW_CONFIG mtu=1400 config=1500"
+    sudo -n ip -n "$router" link set rb mtu 1500
+    # A VLAN stacked on ra (in the router namespace).
+    sudo -n ip -n "$router" link add link ra name ra.10 type vlan id 10
+    packet_refused afpacket-vlan "$work/packet-router.toml" \
+        "stage=checks port=if1 code=KERNEL_UPPER_DEVICE"
+    sudo -n ip -n "$router" link del ra.10
+    sudo -n ip -n "$router" address add 198.51.100.7/32 dev rb
+    packet_refused afpacket-address "$work/packet-router.toml" \
+        "stage=checks port=if2 code=KERNEL_IPV4_ADDRESSES count=1"
+    sudo -n ip -n "$router" address del 198.51.100.7/32 dev rb
+    echo "priv_run_afpacket_refusals: GRO on ra (RECEIVE_OFFLOAD), rb MTU 1400 (MTU_BELOW_CONFIG), a kernel address on rb, a VLAN on ra (KERNEL_UPPER_DEVICE) refused with exit 1 and no packet socket left verified"
+
+    ra_tx=$(tx_packets ra)
+    rb_tx=$(tx_packets rb)
+    cp "$work/packet-router.toml" "$work/packet-ops.toml"
+    # As the invoking user (who can read the work directory on reload).
+    start_ruster afpacket "$work/packet-ops.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready afpacket || fail "afpacket: ruster exited during startup: $(cat "$work/afpacket.err")"
+    assert_dropped afpacket "$smoke_uid $smoke_gid"
+    grep -Eqx "ruster run: seccomp filter installed: mode=kill threads=5 syscalls=[0-9]+ arch=x86_64" \
+        "$work/afpacket.err" || fail "afpacket: no seccomp line"
+    grep -Eqx "ruster run: filesystem confined: mode=landlock abi=[0-9]+ rules=4 threads=5" \
+        "$work/afpacket.err" || fail "afpacket: no filesystem confinement line"
+    [ "$(packet_sockets)" -eq 2 ] || fail "afpacket: not two packet sockets"
+    forward_once afpacket-forward
+    in_ns "$host_a" ping -c 3 -i 0.2 -W 2 -q 192.168.1.1 >"$work/afpacket-ping.txt" 2>&1 ||
+        fail "afpacket: no Echo Reply from the router: $(cat "$work/afpacket-ping.txt")"
+    grep -q "3 packets transmitted, 3 received" "$work/afpacket-ping.txt" ||
+        fail "afpacket: ping: $(cat "$work/afpacket-ping.txt")"
+    echo "priv_run_afpacket_forward: UDP host A -> host B through AF_PACKET with NAT44, ICMP Echo from the router, $threads threads dropped and switched to the invoking uid/gid, seccomp kill, Landlock verified"
+    reload_with "$work/packet-deny.toml" "$work/packet-ops.toml"
+    wait_line afpacket "reload applied: generation=2 previous=1"
+    forward_blocked afpacket-denied
+    reload_with "$work/packet-router.toml" "$work/packet-ops.toml"
+    wait_line afpacket "reload applied: generation=3 previous=2"
+    forward_once afpacket-allowed
+    reload_with "$work/packet-reshape.toml" "$work/packet-ops.toml"
+    wait_line afpacket "reload refused: code=RESTART_REQUIRED reasons=BACKEND; generation 3 keeps running"
+    forward_once afpacket-refused
+    echo "priv_run_afpacket_reload: two applied reloads changed the firewall outcome, a ring change refused as RESTART_REQUIRED while forwarding verified"
+    # Carrier loss on rb (its peer down), then rb's own administrative
+    # down: the kernel sets the bound socket's error, which the idle wait
+    # must read and clear.
+    sudo -n ip -n "$host_b" link set pb down
+    wait_line afpacket "warning: port=if2 health=LINK_DOWN"
+    sudo -n ip -n "$host_b" link set pb up
+    wait_line afpacket "recovered: port=if2 health=LINK_DOWN"
+    forward_once afpacket-carrier
+    sudo -n ip -n "$router" link set ra down
+    sudo -n ip -n "$router" link set ra up
+    wait_stat_ge afpacket if1.af_packet_port.socket_errors 1
+    latest_block afpacket
+    sleeps=$(stat_in "$work/afpacket.block" idle.sleeps)
+    waits=$(stat_in "$work/afpacket.block" idle.waits)
+    sleep 1.5
+    latest_block afpacket
+    sleeps_after=$(stat_in "$work/afpacket.block" idle.sleeps)
+    waits_after=$(stat_in "$work/afpacket.block" idle.waits)
+    [ $((sleeps_after - sleeps)) -le 20 ] ||
+        fail "afpacket: idle wait degraded to sleeps after the socket error ($sleeps -> $sleeps_after)"
+    [ $((waits_after - waits)) -ge 20 ] ||
+        fail "afpacket: idle waits stopped ($waits -> $waits_after)"
+    forward_once afpacket-admin
+    echo "priv_run_afpacket_link: carrier loss on rb warned and recovered, ra down/up socket error cleared (socket_errors>=1, idle waits $waits -> $waits_after, sleeps $sleeps -> $sleeps_after), forwarding recovered verified"
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "afpacket: exit status $status after SIGTERM: $(cat "$work/afpacket.err")"
+    grep -q "stopped by signal; .* tx-in-flight=0 .*; closed 2 port(s)$" "$work/afpacket.err" ||
+        fail "afpacket: no shutdown summary: $(cat "$work/afpacket.err")"
+    [ "$(packet_sockets)" -eq 0 ] || fail "afpacket: a packet socket survived the shutdown"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/afpacket.out" >"$work/afpacket.final"
+    block_has "$work/afpacket.final" af_packet.ports=2 af_packet.mode=copy af_packet.stopped=true \
+        af_packet.unbound_ports=0 observer.generation=3 watch.state=ok \
+        privileges.state=dropped privileges.identity=switched seccomp.mode=kill fs.confine=landlock
+    for port in 1:ra:"$ra_tx" 2:rb:"$rb_tx"; do
+        id=${port%%:*}
+        rest=${port#*:}
+        dev=${rest%%:*}
+        before=${rest#*:}
+        sent=$(stat_in "$work/afpacket.final" "if$id.af_packet_port.tx_completed")
+        kernel=$(stat_in "$work/afpacket.final" "if$id.af_packet_port.kernel_packets")
+        delta=$(($(tx_packets "$dev") - before))
+        [ "${sent:-0}" -ge 1 ] || fail "afpacket: if$id sent nothing"
+        [ "$delta" -le "$sent" ] ||
+            fail "afpacket: $dev transmitted $delta frames, the router only $sent: the kernel sent its own"
+        [ "${kernel:-0}" -ge 1 ] || fail "afpacket: if$id kernel_packets ${kernel:-missing}"
+    done
+    echo "priv_run_afpacket_shutdown: SIGTERM exit 0 with nothing in flight, both packet sockets closed, every frame on ra/rb sent by the router (none by the kernel), PACKET_STATISTICS folded in verified"
+
+    # upper: rb enslaved to a bridge while running ends the router with
+    # KERNEL_UPPER_DEVICE (exit 1). The bridge (down, in the router
+    # namespace only) is deleted again, which releases rb.
+    start_ruster afpacket-upper "$work/packet-router.toml"
+    wait_ready afpacket-upper || fail "afpacket-upper: ruster exited during startup"
+    sudo -n ip -n "$router" link add rbr type bridge
+    sudo -n ip -n "$router" link set rb master rbr
+    wait_exit afpacket-upper
+    [ "$status" -eq 1 ] || fail "afpacket-upper: exit status $status after enslaving rb"
+    grep -q "fatal: port=if2 health=KERNEL_UPPER_DEVICE" "$work/afpacket-upper.err" ||
+        fail "afpacket-upper: no KERNEL_UPPER_DEVICE: $(cat "$work/afpacket-upper.err")"
+    grep -q "stopped after a fatal health event port=if2 code=KERNEL_UPPER_DEVICE; .*; closed 2 port(s)$" \
+        "$work/afpacket-upper.err" || fail "afpacket-upper: no fatal summary"
+    [ "$(packet_sockets)" -eq 0 ] || fail "afpacket-upper: a packet socket was left open"
+    sudo -n ip -n "$router" link del rbr
+    sudo -n ip -n "$router" link set rb up
+    echo "priv_run_afpacket_upper: rb enslaved to a bridge while running failed closed with exit 1 (KERNEL_UPPER_DEVICE), no packet socket left verified"
+
+    # removal: deleting rb ends the router with DEVICE_REMOVED (exit 1).
+    start_ruster afpacket-removal "$work/packet-router.toml"
+    wait_ready afpacket-removal || fail "afpacket-removal: ruster exited during startup"
+    forward_once afpacket-removal-before
+    sudo -n ip -n "$router" link del rb
+    wait_exit afpacket-removal
+    [ "$status" -eq 1 ] || fail "afpacket-removal: exit status $status after deleting rb"
+    grep -q "fatal: port=if2 health=DEVICE_REMOVED" "$work/afpacket-removal.err" ||
+        fail "afpacket-removal: no DEVICE_REMOVED: $(cat "$work/afpacket-removal.err")"
+    grep -q "stopped after a fatal health event port=if2 code=DEVICE_REMOVED; .*; closed 2 port(s)$" \
+        "$work/afpacket-removal.err" || fail "afpacket-removal: no fatal summary"
+    [ "$(packet_sockets)" -eq 0 ] || fail "afpacket-removal: a packet socket was left open"
+    echo "priv_run_afpacket_removal: deleted port device failed closed with exit 1 (DEVICE_REMOVED), no packet socket left verified"
+}
+
+phase_afpacket
 
 # H8: no seccomp kill (or log record) of the ruster binary in the whole
 # smoke: every syscall the phases above made was on the allowlist.

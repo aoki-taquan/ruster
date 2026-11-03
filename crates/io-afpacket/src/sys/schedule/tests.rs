@@ -57,6 +57,9 @@ struct LiveState {
     polls: Vec<([PollFd; 2], c_int)>,
     poll_script: VecDeque<Result<i16, i32>>,
     stats_script: VecDeque<Result<TpacketStatsV3, i32>>,
+    /// `SO_ERROR` reads: the fd, and what the scripted read returned.
+    socket_errors: Vec<(RawFd, Result<i32, i32>)>,
+    socket_error_script: VecDeque<Result<i32, i32>>,
 }
 
 /// Scripted Linux stand-in. Kick records go into storage reserved up front,
@@ -137,6 +140,16 @@ impl PacketOps for LiveOps {
                 errno: Errno::new(errno),
             }),
         }
+    }
+
+    fn take_socket_error(&mut self, fd: RawFd) -> Result<i32, PlatformError> {
+        let mut state = self.0.borrow_mut();
+        let result = state.socket_error_script.pop_front().unwrap_or(Ok(0));
+        state.socket_errors.push((fd, result));
+        result.map_err(|errno| PlatformError::Syscall {
+            stage: SyscallStage::SocketError,
+            errno: Errno::new(errno),
+        })
     }
 
     fn unmap(&mut self, base: NonNull<u8>, len: usize) {
@@ -230,6 +243,7 @@ impl Live {
             next_fd: FIRST_FD,
             kicks: Vec::with_capacity(4_096),
             polls: Vec::with_capacity(4_096),
+            socket_errors: Vec::with_capacity(4_096),
             ..LiveState::default()
         })));
         let engine = AfPacketEngine::open_with_ops(config, ops.clone()).expect("engine");
@@ -983,6 +997,51 @@ fn af_packet_reclaim_progress_makes_the_next_retry_due_at_once() {
     let _ = live.engine.live_receive(1).expect("receive").finish();
     assert_eq!(live.kicks().len(), 1);
     assert_eq!(live.port(WAN).tx_inflight, 1);
+}
+
+#[test]
+fn af_packet_idle_wait_reads_and_clears_a_pending_socket_error() {
+    const POLLERR: i16 = 0x008;
+    let mut live = Live::new();
+    let script = |live: &Live, outcome| live.ops.0.borrow_mut().poll_script.push_back(outcome);
+    // The scripted poll reports `revents` on the WAN socket: POLLERR alone
+    // (what a mapped TPACKET socket shows after its device went down).
+    script(&live, Ok(POLLERR));
+    live.ops
+        .0
+        .borrow_mut()
+        .socket_error_script
+        .push_back(Ok(ENETDOWN));
+    assert_eq!(live.engine.wait_rx(25), Ok(RxWait::Ready));
+    assert_eq!(
+        live.ops.0.borrow().socket_errors,
+        [(WAN_FD, Ok(ENETDOWN))],
+        "exactly the erroring socket is read, once"
+    );
+    let wan = live.engine.port_stats(WAN).expect("wan");
+    assert_eq!(wan.counters.socket_errors, 1);
+    assert_eq!(wan.counters.socket_error_reads_failed, 0);
+    let lan = live.engine.port_stats(LAN).expect("lan");
+    assert_eq!(lan.counters.socket_errors, 0);
+    // Cleared: the next wait blocks again (the scripted poll times out).
+    assert_eq!(live.engine.wait_rx(25), Ok(RxWait::TimedOut));
+    assert_eq!(live.ops.0.borrow().socket_errors.len(), 1);
+    // POLLIN without POLLERR reads nothing.
+    script(&live, Ok(POLLIN));
+    assert_eq!(live.engine.wait_rx(25), Ok(RxWait::Ready));
+    assert_eq!(live.ops.0.borrow().socket_errors.len(), 1);
+    // A failed read is counted, and the wait still ends Ready.
+    script(&live, Ok(POLLERR | POLLIN));
+    live.ops
+        .0
+        .borrow_mut()
+        .socket_error_script
+        .push_back(Err(EIO));
+    assert_eq!(live.engine.wait_rx(25), Ok(RxWait::Ready));
+    let wan = live.engine.port_stats(WAN).expect("wan");
+    assert_eq!(wan.counters.socket_errors, 1);
+    assert_eq!(wan.counters.socket_error_reads_failed, 1);
+    assert_eq!(live.engine.backend_stats().counters.socket_errors, 1);
 }
 
 #[test]

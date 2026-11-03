@@ -149,6 +149,24 @@ pub enum Condition {
     Equal { index: u8, value: Value },
     /// `args[index] & mask == 0`.
     Clear { index: u8, mask: u32 },
+    /// `(args[first], args[second])` is one of `pairs` (a `getsockopt`
+    /// level and option name, say).
+    OneOf {
+        first: u8,
+        second: u8,
+        pairs: &'static [(u32, u32)],
+    },
+}
+
+impl Condition {
+    /// Instructions of the condition in [`program`]: a load and a test,
+    /// or two of each per pair.
+    const fn len(self) -> usize {
+        match self {
+            Self::Equal { .. } | Self::Clear { .. } => 2,
+            Self::OneOf { pairs, .. } => 4 * pairs.len(),
+        }
+    }
 }
 
 /// One allowed syscall: its x86_64 number and the conditions (all must
@@ -189,6 +207,18 @@ pub const NETLINK_ROUTE: u32 = 0;
 pub const SOL_NETLINK: u32 = 270;
 pub const NETLINK_GET_STRICT_CHK: u32 = 12;
 pub const BPF_MAP_DELETE_ELEM: u32 = 3;
+pub const SOL_SOCKET: u32 = 1;
+pub const SO_ERROR: u32 = 4;
+pub const SOL_PACKET: u32 = 263;
+pub const PACKET_STATISTICS: u32 = 6;
+pub const SOL_XDP: u32 = 283;
+pub const XDP_STATISTICS: u32 = 7;
+/// The `getsockopt` (level, option) pairs a run may read after startup.
+pub const GETSOCKOPT_ALLOWED: &[(u32, u32)] = &[
+    (SOL_XDP, XDP_STATISTICS),
+    (SOL_PACKET, PACKET_STATISTICS),
+    (SOL_SOCKET, SO_ERROR),
+];
 pub const PROT_EXEC: u32 = 0x4;
 pub const F_GETFD: u32 = 1;
 /// `O_WRONLY | O_RDWR | O_CREAT | O_TRUNC`: any of them makes an open
@@ -205,8 +235,18 @@ pub const ALLOWLIST: &[Rule] = &[
     allow("sendto", 44),
     // Router: the Fill-ring wakeup of the need-wakeup profile.
     allow("poll", 7),
-    // Router: `XDP_STATISTICS` of every stats sample.
-    allow("getsockopt", 55),
+    // Router: AF_XDP `XDP_STATISTICS` of every stats sample; AF_PACKET
+    // `PACKET_STATISTICS` of every health sample and `SO_ERROR` after a
+    // `POLLERR` (AFPKT-015). Nothing else.
+    only(
+        "getsockopt",
+        55,
+        &[Condition::OneOf {
+            first: 1,
+            second: 2,
+            pairs: GETSOCKOPT_ALLOWED,
+        }],
+    ),
     // Router idle backoff and every `thread::sleep` (std), and the restart
     // of an interrupted one after a signal; `nanosleep` where the C
     // library's sleep uses it (older glibc, musl).
@@ -327,6 +367,11 @@ pub const ALLOWLIST: &[Rule] = &[
     allow("rt_sigaction", 13),
 ];
 
+/// Instructions of `conditions` in [`program`].
+fn conditions_len(conditions: &[Condition]) -> usize {
+    conditions.iter().map(|condition| condition.len()).sum()
+}
+
 /// Number of allowed syscalls (for the startup line and the stats).
 pub const fn allowed_syscalls() -> u32 {
     ALLOWLIST.len() as u32
@@ -368,6 +413,10 @@ pub const fn violation(mode: SeccompMode) -> Option<u32> {
 ///      jeq #nr, 0, next           ; one block per conditional rule:
 ///      ld  [args[i] low]          ;   per condition, a load and a test
 ///      jeq #v, 0, deny | jset #m, deny, 0
+///      ld  [args[a] low]          ;   (a one-of condition: per pair,
+///      jeq #x, 0, pair'           ;    two loads and tests; a match
+///      ld  [args[b] low]          ;    goes on after the condition,
+///      jeq #y, end, pair'         ;    the last mismatch to deny)
 ///      ret #ALLOW
 /// deny:ret #action
 /// next:...
@@ -387,7 +436,7 @@ pub fn program(rules: &[Rule], action: u32, pid: u32) -> Result<Vec<SockFilter>,
         rules.iter().partition(|rule| rule.conditions.is_empty());
     let blocks: usize = conditional
         .iter()
-        .map(|rule| 1 + 2 * rule.conditions.len() + 2)
+        .map(|rule| 1 + conditions_len(rule.conditions) + 2)
         .sum();
     // Index of the final `ret #ALLOW`.
     let allow_at = out.len() + plain.len() + blocks + 1;
@@ -401,16 +450,18 @@ pub fn program(rules: &[Rule], action: u32, pid: u32) -> Result<Vec<SockFilter>,
         ));
     }
     for rule in &conditional {
-        let conditions = rule.conditions.len();
         out.push(SockFilter::jump(
             JEQ_K,
             rule.nr,
             0,
-            offset(2 * conditions + 2)?,
+            offset(conditions_len(rule.conditions) + 2)?,
         ));
         for (at, condition) in rule.conditions.iter().enumerate() {
-            // From the instruction after this test to the block's deny.
-            let deny = offset(2 * (conditions - at) - 1)?;
+            // Instructions after this condition up to the block's `ret
+            // #ALLOW`, inclusive; the deny follows it.
+            let rest = conditions_len(&rule.conditions[at + 1..]) + 1;
+            // From the instruction after a two-instruction test to deny.
+            let deny = offset(rest)?;
             match *condition {
                 Condition::Equal { index, value } => {
                     let value = match value {
@@ -423,6 +474,37 @@ pub fn program(rules: &[Rule], action: u32, pid: u32) -> Result<Vec<SockFilter>,
                 Condition::Clear { index, mask } => {
                     out.push(SockFilter::load(arg_low(index)));
                     out.push(SockFilter::jump(JSET_K, mask, deny, 0));
+                }
+                Condition::OneOf {
+                    first,
+                    second,
+                    pairs,
+                } => {
+                    let len = condition.len();
+                    for (pair, (a, b)) in pairs.iter().enumerate() {
+                        let last = pair + 1 == pairs.len();
+                        // Relative to the instruction after the first test
+                        // (`4 * pair + 2` into the condition): the next
+                        // pair, or the deny after the last.
+                        let miss_first = if last {
+                            offset(len + rest - 4 * pair - 2)?
+                        } else {
+                            2
+                        };
+                        // ... and after the second test: the next pair
+                        // (right there), or the deny; a match leaves the
+                        // condition.
+                        let miss_second = if last {
+                            offset(len + rest - 4 * pair - 4)?
+                        } else {
+                            0
+                        };
+                        let matched = offset(len - 4 * pair - 4)?;
+                        out.push(SockFilter::load(arg_low(first)));
+                        out.push(SockFilter::jump(JEQ_K, *a, 0, miss_first));
+                        out.push(SockFilter::load(arg_low(second)));
+                        out.push(SockFilter::jump(JEQ_K, *b, matched, miss_second));
+                    }
                 }
             }
         }

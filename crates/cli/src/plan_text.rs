@@ -22,7 +22,7 @@
 
 use std::fmt::Write as _;
 
-use ruster_config::ValidatedAfXdpPortV1;
+use ruster_config::{ValidatedAfPacketPortV1, ValidatedAfXdpPortV1};
 use ruster_control::{ApplyPlan, BackendChange, Change, Delta, FlushCount, NatChange, StateFlush};
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId, Interface,
@@ -296,6 +296,36 @@ fn backend(lines: &mut Vec<String>, change: &BackendChange) {
         ));
     }
     changes(lines, "backend-port", &change.ports, port);
+    if let Some(Delta { old, new }) = change.af_packet_max_frame_len {
+        let text = |value: Option<u32>| value.map_or_else(|| "none".to_owned(), |v| v.to_string());
+        lines.push(format!(
+            "backend af-packet max-frame-len ~ {} -> {}",
+            text(old),
+            text(new)
+        ));
+    }
+    changes(
+        lines,
+        "backend-af-packet-port",
+        &change.af_packet_ports,
+        packet_port,
+    );
+}
+
+fn packet_port(port: &ValidatedAfPacketPortV1) -> String {
+    let (rx, tx) = (port.rx(), port.tx());
+    format!(
+        "{} dev {} rx {}x{} frame {} retire {} ms tx {}x{} frame {}",
+        iface(port.interface()),
+        label(port.device()),
+        rx.block_count(),
+        rx.block_size(),
+        rx.frame_size(),
+        rx.retire_timeout_ms(),
+        tx.block_count(),
+        tx.block_size(),
+        tx.frame_size()
+    )
 }
 
 fn flush_lines(flush: StateFlush) -> [(&'static str, FlushCount); 13] {

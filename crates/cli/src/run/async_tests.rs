@@ -486,6 +486,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
 
     let host = FakeHost::default();
     let targets = [LAN, WAN].map(|id| LinkTarget {
+        watch_uppers: false,
         interface: IfId(id),
         ifindex: fake_ifindex(id),
         name: super::device_name(id),
@@ -509,11 +510,11 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
         reload_prepare_warn_ms: 10_000,
         idle_wait_ms: crate::args::DEFAULT_IDLE_WAIT_MS,
     };
-    let datapath = ForwardingDatapath { io: SimIo::new() };
+    let mut datapath = ForwardingDatapath { io: SimIo::new() };
     let mut err = Vec::new();
     // Due at 0: requested.
     assert!(watch_step(
-        &datapath,
+        &mut datapath,
         &mut control,
         MonotonicMillis(0),
         settings,
@@ -527,7 +528,7 @@ fn a_finished_round_is_folded_before_the_next_is_due() {
             "the round was never folded before the next due time"
         );
         assert!(watch_step(
-            &datapath,
+            &mut datapath,
             &mut control,
             MonotonicMillis(500),
             settings,

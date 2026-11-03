@@ -72,13 +72,14 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   [`fixtures/m1`](fixtures/m1)にあり、golden出力の再生成は
   `RUSTER_UPDATE_GOLDEN=1 cargo test -p ruster-sim-scenario --test driver`（CIでは拒否）。
 - `ruster-cli`: binary `ruster`。手書きarg parsingで`validate`/`plan`/`run-sim`と、M2 S10a/S10bの
-  `run`（x86_64 LinuxのAF_XDP static router、下の「`ruster run`」）を提供し、SIGINT/SIGTERMは
+  `run`（x86_64 LinuxのAF_XDP static router、AFPKT-015からAF_PACKETも、下の「`ruster run`」）を提供し、SIGINT/SIGTERMは
   private FFIのhandlerがstatic `AtomicBool`へswap/storeするだけです（二回目のsignalはforce
   flag。`run`のSIGHUPはreload flag、SIGUSR1はstats flagへstoreするだけ）。`unsafe`はそのhandler、`run`のrtnetlink
   query（IPv4/IPv6のaddress dump、全tableのroute dump、link）、起動後のprivilege drop
   （threadごとの`prctl`/`capset`/`setresuid`等のraw syscall）、filesystem confinement
   （`landlock_create_ruleset`/`landlock_add_rule`/`landlock_restrict_self`/`prctl`のraw syscall）と
-  seccomp filterのinstall（`prctl`/`seccomp`のraw syscall）、systemd reload通知の`clock_gettime(CLOCK_MONOTONIC)`だけです（下の「使い方」）。
+  seccomp filterのinstall（`prctl`/`seccomp`のraw syscall）、systemd reload通知の`clock_gettime(CLOCK_MONOTONIC)`、
+  AF_PACKET portのreceive offload確認（起動時の`SIOCETHTOOL` ioctl）だけです（下の「使い方」）。
   外部crateを直接には追加しません。
 - `ruster-bench`: NIC-freeなsim smoke/datapath benchmarkとhardware benchmark plan/
   measurement protocol/artifact v1のschema検証。sim結果からproduction性能を主張しない。
@@ -106,8 +107,11 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   AF_PACKETはAF_XDPと違いframeをkernelから奪わずcopyを受け取るだけなので、portにkernelの
   address/route/forwardingを持たせてはならない。TPACKET_V3のblock retireのため、idle時の単発
   frameは最大RX `retire_timeout_ms`遅れる。privileged smokeは`scripts/priv-afpacket-smoke.sh`
-  （専用netns内のveth二組、`RUSTER_PRIV_AFPACKET=1`）。`ruster run`からの選択
-  （`backend.kind = "af-packet"`、AFPKT-015）、実NIC E2E、throughputは次slice以降。
+  （専用netns内のveth二組、`RUSTER_PRIV_AFPACKET=1`）。AFPKT-015で`ruster run`から
+  `backend.kind = "af-packet"`として選べます（下の「AF_PACKET backend」）。kernelの
+  pending socket error（bind先deviceのdown/削除）は`wait_rx`が`POLLERR`を見たportだけ
+  `getsockopt(SO_ERROR)`で読んで消すので、idle waitはsleepへ劣化しません（`socket_errors`）。
+  実NIC E2Eとthroughputは未検証。
 - `ruster-io-xdp`: AF_XDP native接続より前に固定するpure-Rust ownership model。
   UMEM layout、descriptor境界、nonzero generation token、frame state ledger、
   fixed-storage ring、authoritative ledgerと結合したfinite fake kernelを持つ。
@@ -1123,6 +1127,51 @@ headroom = 0                     # 省略時 0。kernel固定256 bytesに加算
   deviceを含むので、af-xdpでinterfaceの`device`を変える（2つのdeviceを入れ替えるのも）と
   label変更に加えてrestart-requiredです（sim backendではlabel変更だけでreloadable）。`validate`の要約は末尾に
   `backend=sim`または`backend=af-xdp ports=2 umem-bytes=...`を出します。
+
+#### AF_PACKET backend（AFPKT-015）
+
+`kind = "af-packet"`は`ruster run`のAF_PACKET（TPACKET_V3）backendです。XDP program、`CAP_BPF`、
+`RLIMIT_MEMLOCK`、single-queue/RSS steeringが要らず`CAP_NET_RAW`だけで動くdebug/fallback用で、
+AF_XDPが主backendのままです（性能は未測定。forwardごとに一回copyし、kernel stackも同じframeを処理し、
+TXはqdisc経由なのでAF_XDP copy modeより遅い想定）。
+
+```toml
+[backend]
+kind = "af-packet"
+
+[backend.af-packet]
+max-frame-len = 1514             # 省略時1514（590..=9230）。全portのdevice MTUは max-frame-len - 14 以下
+
+[[backend.af-packet.ports]]      # interfaceごとに1つ
+interface = "wan"
+rx = { block-size = 65536, block-count = 8, retire-timeout-ms = 2 }  # 4096..=4MiBの2の冪、1..=65536、1..=1000
+tx = { block-size = 65536, block-count = 4 }
+```
+
+- frame slotは`max-frame-len`から導出（kernelのper-frame header込みの2の冪、1514なら2048）、TX ringは
+  `block-size / slot * block-count` frame。ring合計はportごと256 MiB、全体1 GiBまで。page sizeの倍数は
+  起動時に`ruster-io-afpacket`が再検査します。`validate`の要約は`backend=af-packet ports=2
+  max-frame-len=1514 ring-bytes=...`、`plan`は`backend af-packet max-frame-len ~ ...`、
+  `backend-af-packet-port + if1 dev eth0 rx 8x65536 frame 2048 retire 2 ms tx 4x65536 frame 2048`で常に
+  restart-required `BACKEND`。`af-packet`以外のkindでの`[backend.af-packet]`は
+  `BACKEND_AF_PACKET_WITHOUT_KIND`、`af-packet`での`[[backend.ports]]`は`BACKEND_PORTS_WITHOUT_AF_XDP`。
+- AF_PACKETはframeをkernelから奪わずcopyを受け取るだけで、kernel stackはrun中も全frameを処理します。
+  起動時のkernel露出拒否（IPv4 address/route、forwarding、weak host、IPv6、同じoverride）はAF_XDPと同じで、
+  RX queue数は問いません。加えてdevice MTUが`max-frame-len - 14`を超える（`MTU_ABOVE_FRAME`。小さいのは可で、
+  9000のLANと1500のWANは`max-frame-len = 9014`で動く）、bridge/bond/team/VRFへの従属や同じnamespaceで
+  portに積まれたVLAN/macvlan/ipvlan/MACsec/veth peer（`KERNEL_UPPER_DEVICE`、run中もfatal）、GRO/LRO/hardware GROがon
+  （`RECEIVE_OFFLOAD feature=rx-gro`等、`ethtool -K <dev> gro off lro off`）を拒否します。
+  `[[interfaces]] mtu`（MTU1）はAF_XDPと同じくdevice MTU超過が`MTU_BELOW_CONFIG`（拒否）、未満が
+  `MTU_BELOW_DEVICE`（warning）です。
+- run中はlink watchのkernel露出（address、route、forwarding、weak host、IPv6）がAF_XDPのwarningではなく
+  同じcodeのfatal（exit 1）です（overrideで受理したものはwarningのまま）。kickの`ENXIO`でbind先deviceが
+  消えたportは`DEVICE_REMOVED`、kernelの`PACKET_STATISTICS`（32-bit、読むとreset）はhealth sample
+  （500 ms）ごとにfoldします。shutdownはdrain後にsocketを閉じ`closed N port(s)`です。
+- seccompの`getsockopt`は(level, option)の組`(SOL_XDP, XDP_STATISTICS)`、`(SOL_PACKET,
+  PACKET_STATISTICS)`、`(SOL_SOCKET, SO_ERROR)`だけに限定しました（AF_XDPも同じfilter）。
+- 詳細とtroubleshootingは[runbook](docs/runbook-m2.md)の「AF_PACKET backend」、privileged smokeは
+  `scripts/priv-run-smoke.sh`の`priv_run_afpacket_*`（veth、NAT、ICMP、reload、link、socket error、
+  kernelが自frameを送らないこと、SIGTERM drain、device削除）。
 
 ## 開発
 

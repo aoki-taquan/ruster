@@ -11,7 +11,8 @@ pub const MAX_ADDRESSES: usize = 1024;
 pub const MAX_ROUTES: usize = 4096;
 pub const MAX_NEIGHBORS: usize = 4096;
 pub const MAX_FIREWALL_RULES: usize = 4096;
-/// Bound of `[[backend.ports]]`. M2 binds at most one queue per interface.
+/// Bound of `[[backend.ports]]` and `[[backend.af-packet.ports]]`. M2
+/// binds at most one queue (one packet socket) per interface.
 pub const MAX_BACKEND_PORTS: usize = MAX_INTERFACES;
 
 const FORBIDDEN_FIELDS: &[&str] = &[
@@ -47,9 +48,12 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "actions",
     "address",
     "addresses",
+    "af-packet",
     "allocator-seed",
     "arp",
     "backend",
+    "block-count",
+    "block-size",
     "burst",
     "capacity",
     "closing-idle-ttl-ms",
@@ -102,6 +106,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "mappings-per-host",
     "mtu",
     "max-attempts",
+    "max-frame-len",
     "mode",
     "name",
     "nat44",
@@ -125,6 +130,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "require-on-link-sender",
     "resolution",
     "resolution-timer-scans",
+    "retire-timeout-ms",
     "rings",
     "routes",
     "rules",
@@ -300,6 +306,12 @@ fn enforce_list_bounds(config: &ConfigV1) -> Result<(), Diagnostic> {
         let mut path = SourcePath::root_field("backend");
         path.push_field("ports");
         check_list_path(path, backend.ports.len(), MAX_BACKEND_PORTS)?;
+        if let Some(af_packet) = &backend.af_packet {
+            let mut path = SourcePath::root_field("backend");
+            path.push_field("af-packet");
+            path.push_field("ports");
+            check_list_path(path, af_packet.ports.len(), MAX_BACKEND_PORTS)?;
+        }
     }
     Ok(())
 }

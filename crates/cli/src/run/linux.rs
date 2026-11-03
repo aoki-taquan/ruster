@@ -1,10 +1,18 @@
 //! The live x86_64 Linux host of `ruster run`: native AF_XDP sessions,
-//! engines, and the core adapter of `ruster-io-xdp-native`.
+//! engines, and the core adapter of `ruster-io-xdp-native`; and the
+//! AF_PACKET adapter of `ruster-io-afpacket` (AFPKT-015).
 
 use std::num::{NonZeroU128, NonZeroU32};
 
-use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
+use ruster_config::{
+    AfPacketRingV1, ValidatedAfPacketPortV1, ValidatedAfPacketV1, ValidatedAfXdpPortV1,
+    ValidatedAfXdpV1, XdpAttachModeV1,
+};
 use ruster_core::{BackendStats, IfId, MonotonicMillis};
+use ruster_io_afpacket::{
+    AfPacketIo, AfPacketPlatform, PlatformError, PortConfig, RingGeometry, RxWait as PacketRxWait,
+    ValidatedConfig as PacketConfig,
+};
 use ruster_io_xdp_native::{
     NativeSession, RxFillConfig, RxFillEngine, RxWait, RxWaitError, SessionConfig, UmemDomainId,
     XdpAttachMode, XdpCounters, XdpIoError, XdpPacketIo, XdpPacketIoSetupError, XdpPort,
@@ -12,13 +20,16 @@ use ruster_io_xdp_native::{
 };
 
 use super::checks::linux::PortSysctls;
-use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure};
+use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure, Probe};
 use super::engine::{ClockedIo, Datapath, DrainProgress, IdleWake, LinkMonitor, WaitError};
 use super::fs_confine::{self, FsFailure, FsReport};
-use super::netlink::{Dump, Family, LinkFacts, LinkProbe, NetlinkError};
+use super::netlink::{Dump, Family, IfName, LinkFacts, LinkProbe, NetlinkError};
+use super::offload;
 use super::privileges::{self, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::seccomp::{self, ConfineFailure, ConfineReport, SeccompMode};
-use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
+use super::startup::{
+    CloseFailure, Failure, OpenPort, PacketFacts, PacketOpenError, PortHost, Stage, StartupError,
+};
 use super::stats::write_fields;
 use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
 
@@ -32,6 +43,7 @@ pub struct LinuxHost;
 impl PortHost for LinuxHost {
     type Session = NativeSession;
     type Datapath<'s> = XdpDatapath<'s>;
+    type Packet = PacketDatapath;
     type Links = NetlinkLinks;
 
     fn links(&self, devices: &[(IfId, &str)]) -> Result<NetlinkLinks, Failure> {
@@ -138,6 +150,84 @@ impl PortHost for LinuxHost {
     fn close(&self, session: NativeSession) -> Result<(), CloseFailure> {
         session.close().map_err(CloseFailure::Cleanup)
     }
+
+    fn preflight_packet(&self, policy: PrivilegePolicy) -> Result<(), PrivilegeFailure> {
+        checks::linux::check_packet_privileges(policy)
+    }
+
+    /// One rtnetlink socket per port: the name lookup, then the same facts
+    /// as an AF_XDP port of that index; then the receive offloads.
+    fn inspect_packet(
+        &self,
+        port: &ValidatedAfPacketPortV1,
+        max_frame_len: u32,
+    ) -> Result<PacketFacts, CheckFailure> {
+        let name =
+            IfName::new(port.device().as_bytes()).ok_or(CheckFailure::Unverifiable(Probe::Name))?;
+        let mut probe = LinkProbe::open().map_err(|_| CheckFailure::Unverifiable(Probe::Link))?;
+        let (ifindex, link) = probe
+            .resolve(name)
+            .map_err(|_| CheckFailure::Unverifiable(Probe::Link))?;
+        // The offload probe names the device (`SIOCETHTOOL` takes a name),
+        // so it runs between the name -> index lookup above and the index
+        // query of `device_facts`, whose name the startup then compares
+        // with the configured one (H10): a rename or a replacement of the
+        // device in between is refused (`probe=name`), so the offloads read
+        // are those of the index that is bound.
+        let offload = offload::linux::active_receive_offload(name).map_err(|_| ());
+        let facts = checks::linux::SessionFacts {
+            ifindex,
+            mtu: link.mtu,
+            frame_capacity: max_frame_len,
+        };
+        let sysctls = PortSysctls::new(port.device());
+        let device = checks::linux::device_facts(&sysctls, facts, Some(&mut probe))?;
+        Ok(PacketFacts { device, offload })
+    }
+
+    fn open_packet(
+        &self,
+        backend: &ValidatedAfPacketV1,
+        targets: &[LinkTarget],
+    ) -> Result<PacketDatapath, Failure> {
+        let fail = |error| Failure::Packet(error);
+        if targets.len() != backend.ports().len() {
+            return Err(fail(PacketOpenError::Ports));
+        }
+        let mut ports = Vec::with_capacity(targets.len());
+        for (port, target) in backend.ports().iter().zip(targets) {
+            if port.interface() != target.interface {
+                return Err(fail(PacketOpenError::Ports));
+            }
+            ports.push(PortConfig {
+                interface: port.interface(),
+                if_index: target.ifindex,
+                rx: geometry(port.rx()),
+                tx: geometry(port.tx()),
+            });
+        }
+        let page = AfPacketPlatform::page_size()
+            .map_err(|error| fail(PacketOpenError::Platform(error)))?;
+        let max_frame = usize::try_from(backend.max_frame_len()).unwrap_or(usize::MAX);
+        let config = PacketConfig::new(&ports, page, max_frame)
+            .map_err(|error| fail(PacketOpenError::Config(error)))?;
+        let io =
+            AfPacketIo::open(config).map_err(|error| fail(PacketOpenError::Platform(error)))?;
+        Ok(PacketDatapath { io })
+    }
+}
+
+/// The backend ring geometry of a validated AF_PACKET ring.
+fn geometry(ring: AfPacketRingV1) -> RingGeometry {
+    RingGeometry {
+        block_size: ring.block_size(),
+        block_count: ring.block_count(),
+        frame_size: ring.frame_size(),
+        frame_count: ring.frame_count(),
+        retire_timeout_ms: ring.retire_timeout_ms(),
+        private_size: 0,
+        feature_flags: 0,
+    }
 }
 
 /// The prologue of every thread but the router thread (the output threads
@@ -208,6 +298,10 @@ impl LinkMonitor for NetlinkLinks {
 
     fn ipv4_weak_host(&mut self, target: &LinkTarget) -> Option<bool> {
         self.sysctls(target)?.ipv4().weak_host
+    }
+
+    fn stacked_links(&mut self, target: &LinkTarget) -> Result<u32, NetlinkError> {
+        self.probe.count(Dump::StackedLinks, target.ifindex)
     }
 
     /// `disable_ipv6` first: when set (or without IPv6 in the namespace)
@@ -292,6 +386,7 @@ impl<'s> Datapath for XdpDatapath<'s> {
                     fill_starved: counters.fill_starved,
                     fill_ring_occupancy: counters.fill_ring_occupancy,
                     rx_packets: counters.rx_packets,
+                    device_gone: false,
                 });
             }
         }
@@ -320,6 +415,113 @@ impl<'s> Datapath for XdpDatapath<'s> {
             Ok(RxWait::Interrupted) => Ok(IdleWake::Interrupted),
             Err(RxWaitError::Errno(errno)) => Err(WaitError::Errno(errno)),
             Err(RxWaitError::Unsupported) => Err(WaitError::Unsupported),
+        }
+    }
+
+    fn tx_outstanding(&self) -> bool {
+        self.io.tx_outstanding()
+    }
+}
+
+impl ClockedIo for AfPacketIo {
+    fn set_clock(&mut self, now: MonotonicMillis) {
+        AfPacketIo::set_clock(self, now);
+    }
+}
+
+/// The AF_PACKET adapter over every port's socket (AFPKT-015). It owns the
+/// sockets and rings: dropping it unmaps and closes each port once.
+pub struct PacketDatapath {
+    io: AfPacketIo,
+}
+
+impl Datapath for PacketDatapath {
+    type Io = AfPacketIo;
+
+    fn io(&mut self) -> &mut AfPacketIo {
+        &mut self.io
+    }
+
+    /// `AfPacketIo::drain`: the first call stops RX and new TX for good,
+    /// every call kicks owed ports without backoff and reaps at most
+    /// `rounds` times. It cannot fail; frames the kernel still holds are
+    /// `tx_in_flight` (and the kernel frees them with the socket). There is
+    /// no Fill ring, no staged handoff, and no unlent RX frame to release
+    /// (an unreturned RX block goes back with the socket).
+    fn drain(&mut self, rounds: u32) -> Result<DrainProgress, XdpIoError> {
+        let before = self.io.backend_stats().counters.tx_completed;
+        let report = self.io.drain(rounds);
+        let completed = self
+            .io
+            .backend_stats()
+            .counters
+            .tx_completed
+            .saturating_sub(before);
+        Ok(DrainProgress {
+            completed: u32::try_from(completed).unwrap_or(u32::MAX),
+            rx_pending_released: 0,
+            tx_in_flight: u32::try_from(report.tx_in_flight).unwrap_or(u32::MAX),
+            fill_in_kernel: 0,
+            tx_handoffs: 0,
+            last_kick_error: None,
+        })
+    }
+
+    /// Per port: `polls` is the port's completed TX frames, so the TX stall
+    /// watch ([`super::watch`]) times frames in flight while no completion
+    /// arrives at all (`oldest_age_polls` 0: the stamp is the completion
+    /// count). There is no Fill ring to starve. `kick_errors` excludes
+    /// `ENETDOWN` already (the adapter counts it as `kicks_link_down`
+    /// only), and an `ENXIO` kick (the bound device unregistered) makes the
+    /// port `unbound`: `device_gone`, fatal `DEVICE_REMOVED`.
+    fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
+        for stats in self.io.ports() {
+            let counters = stats.counters;
+            visit(PortSample {
+                interface: stats.interface,
+                polls: counters.tx_completed,
+                tx_inflight: u64::from(stats.tx_inflight),
+                oldest_age_polls: 0,
+                kick_errors: counters.kick_errors,
+                kick_link_down: stats.link_down,
+                fill_starved: 0,
+                fill_ring_occupancy: 0,
+                rx_packets: counters.rx_packets,
+                device_gone: stats.unbound,
+            });
+        }
+    }
+
+    /// Folds the kernel's `PACKET_STATISTICS` (32-bit, reset on every read)
+    /// into the adapter's 64-bit counters at every health sample (500 ms),
+    /// so they never wrap; a failed read is counted
+    /// (`kernel_stats_errors`).
+    fn refresh(&mut self) {
+        let _ = self.io.refresh_kernel_stats();
+    }
+
+    fn write_stats(&self, out: &mut String) {
+        write_fields(out, None, &self.io.backend_stats());
+        for stats in self.io.ports() {
+            write_fields(out, Some(stats.interface), &stats);
+        }
+    }
+
+    fn port_count(&self) -> usize {
+        self.io.port_count()
+    }
+
+    /// One `poll(2)` over every port's packet socket (`POLLIN`), or none
+    /// while a port has RX work; a pending socket error is cleared there.
+    fn wait_rx(&mut self, timeout_ms: u32) -> Result<IdleWake, WaitError> {
+        match self.io.wait_rx(timeout_ms) {
+            Ok(PacketRxWait::Ready) => Ok(IdleWake::Ready),
+            Ok(PacketRxWait::TimedOut) => Ok(IdleWake::TimedOut),
+            Ok(PacketRxWait::Interrupted) => Ok(IdleWake::Interrupted),
+            Err(PlatformError::Syscall { errno, .. }) => Err(WaitError::Errno(
+                u16::try_from(errno.get()).unwrap_or(u16::MAX),
+            )),
+            Err(_) => Err(WaitError::Unsupported),
         }
     }
 

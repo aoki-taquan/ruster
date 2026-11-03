@@ -262,7 +262,8 @@ pub fn parse_effective_uid(status: &str) -> Option<u32> {
 
 /// Validation limits of a parsed document, chosen by the backend it
 /// selects, so `validate` and `plan` accept exactly what the command that
-/// runs that backend accepts: `af-xdp` (only `ruster run` drives it)
+/// runs that backend accepts: `af-xdp` and `af-packet` (only `ruster run`
+/// drives them)
 /// gets [`PRODUCTION_VALIDATION_LIMITS`]; `sim`, or no `[backend]` (only
 /// `run-sim` drives it), gets [`SIM_VALIDATION_LIMITS`]. A document for
 /// another schema version gets the simulator's (smaller) limits; the
@@ -270,7 +271,7 @@ pub fn parse_effective_uid(status: &str) -> Option<u32> {
 pub fn limits_for(parsed: &VersionedConfig) -> ValidationLimits {
     match parsed {
         VersionedConfig::V1(config) => match config.backend.as_ref().map(|backend| backend.kind) {
-            Some(BackendKindV1::AfXdp) => PRODUCTION_VALIDATION_LIMITS,
+            Some(BackendKindV1::AfXdp | BackendKindV1::AfPacket) => PRODUCTION_VALIDATION_LIMITS,
             Some(BackendKindV1::Sim) | None => SIM_VALIDATION_LIMITS,
         },
         _ => SIM_VALIDATION_LIMITS,
@@ -453,14 +454,21 @@ pub fn validate_loaded(
     let rules = config
         .firewall()
         .map_or(0, |firewall| firewall.rules().len());
-    let backend = match config.backend().af_xdp() {
-        None => format!("backend={}", config.backend().kind().config_name()),
-        Some(af_xdp) => format!(
+    let backend = match (config.backend().af_xdp(), config.backend().af_packet()) {
+        (Some(af_xdp), _) => format!(
             "backend={} ports={} umem-bytes={}",
             config.backend().kind().config_name(),
             af_xdp.ports().len(),
             af_xdp.umem_bytes()
         ),
+        (None, Some(af_packet)) => format!(
+            "backend={} ports={} max-frame-len={} ring-bytes={}",
+            config.backend().kind().config_name(),
+            af_packet.ports().len(),
+            af_packet.max_frame_len(),
+            af_packet.ring_bytes()
+        ),
+        (None, None) => format!("backend={}", config.backend().kind().config_name()),
     };
     // ICMP query NAT (N5) is the one optional service.
     let icmp = if config.nat44().and_then(|nat44| nat44.icmp()).is_some() {
@@ -482,9 +490,9 @@ pub fn validate_loaded(
     if out.write_all(summary.as_bytes()).is_err() {
         return EXIT_RUNTIME;
     }
-    // The sweep latency of `ruster run` (af-xdp only: the simulator has no
-    // idle backoff).
-    if config.backend().af_xdp().is_some() {
+    // The sweep latency of `ruster run` (af-xdp and af-packet only: the
+    // simulator has no idle backoff).
+    if config.backend().kind() != BackendKindV1::Sim {
         for warning in sweep_warnings(&config).into_iter().flatten() {
             let _ = writeln!(err, "ruster: warning: {warning}");
         }

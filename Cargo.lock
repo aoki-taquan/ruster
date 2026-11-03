@@ -62,6 +62,7 @@ dependencies = [
  "ruster-config",
  "ruster-control",
  "ruster-core",
+ "ruster-io-afpacket",
  "ruster-io-sim",
  "ruster-io-xdp-native",
  "ruster-runtime",
@@ -73,6 +74,7 @@ name = "ruster-config"
 version = "0.2.0"
 dependencies = [
  "ruster-core",
+ "ruster-io-afpacket",
  "ruster-io-xdp",
  "serde",
  "serde_path_to_error",
