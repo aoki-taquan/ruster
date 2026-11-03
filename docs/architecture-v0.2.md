@@ -646,8 +646,8 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   歩き（無ければO(1)）、next hopがstaticか生きたdynamic neighborになったものをreadyにし（その
   tickのfragmentation slotの空き数まで。最初のfragment（MF、offset 0）はそのdatagramのheld fragment
   の分も予約する: 許可されるとそれらが同じslotへreleaseされるので、NAT/firewallをcommitしたreplayが
-  必ず自分のslotを得る（review core #2）。予約はtableのheld数と一datagramの上限16の小さい方で、他の
-  datagramのheld fragmentがいくらあっても高々17 slotで済む（re-review L1）。残りは次のtick、`deferred`）、readyなものを`PacketBatch`として
+  必ず自分のslotを得る（review core #2）。予約はそのdatagram自身のheld数（`held_for`、変更なしの
+  lookup、高々16）で、他のdatagramのheld fragmentは数えない（re-review L1、#342 review L-1）。残りは次のtick、`deferred`）、readyなものを`PacketBatch`として
   通常の`forward_batch_tracked`へもう一度通します（holdはoff、二重holdは無い）。route、TTL、firewall、
   NAT、egress MTUとfragmentationはreplay時点で、同じpublicationの下で受信直後のように判定されcommit
   します。TTLはまだ減っておらず一回だけ減り、NAT/firewall stateはhold時には一つも作られていません。
@@ -673,11 +673,18 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   `[reload] state`によらず全holdを捨てます（`flushed`）。re-decideにすれば安全に送れますが、旧routeで
   選んだnext hopを待つholdを新しいroute/firewall/NATで判定することになるので、fail closedに捨てます
   （送信者の再送が拾う）。policyとstorageはshapeの一部（restart-required）。
-- **fragment**: holdした最初のfragmentはfragment association tableでdecideせず（`commit_deny`しない、
-  ticketを捨てるだけで何も変わらない）、その後続fragmentはtableのpending entryにheldされます。hold
-  がfailed/cancelled/expiredで捨てる最初のfragmentは、forwarding pathのdropと同じくtableで
-  `commit_deny`し、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。
-  per-neighbor置き換えで捨てる最初のfragmentも同じです。apply（`flushed`）では同じapplyでtable自体も
+- **fragment**: 最初のfragmentのadmissionはroomを計画するだけで、victimのevictはcommit
+  （`commit_allow`/`commit_deny`）の時です。ARP holdされた最初のfragmentはcommitしないので何もevict
+  しません（#341 re-review L4。replayのadmissionが改めて計画する）。holdした最初のfragmentは
+  decideせず、そのdatagramのpending entry（無ければevictなしで取れる時だけ新しく取る、`hold_first`）の
+  indexとgeneration（entryのpaddingに収まる1 byte、tableの挿入ごとに増える）をhold slotのpaddingへ
+  記録します（storageは増えない）。holdがfailed/cancelled/expiredやper-neighbor置き換えで捨てる最初の
+  fragmentは、その記録したentryが同じindex、generation、keyのままpendingの時だけ`deny_pending`で
+  Denyにし、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。
+  `deny_pending`はlookupもinsertもevictもせず、decided entryには触れずpoisonもしません。IDが一巡して
+  同じkeyの新しいdatagramが同じslotを取っていればgenerationが違うので触れません（#342 review M1。
+  同じslotで256の倍数の挿入を挟んだ時だけ一致し得る）。pending entryを取れなかった最初のfragmentは
+  記録が無く、後続はtableのtimeoutで解放されます。apply（`flushed`）では同じapplyでtable自体も
   flushされるので何もしません。replayで
   最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る
   ことがある。受信側のreassemblyには関係ない）。
@@ -699,8 +706,8 @@ AGENTS.mdのbackend所有buffer契約に反する）。(2) hold時にdecisionを
 残余: replayはそのtickのgenerated fragment phaseで出るので、同じRX batchでARP replyの後に届いた同じ
 flowの新しいdatagram（RXでcommit）が先に出ます（IPは順序を保証しない。TCPのSYN再送やping seqの入れ替わり
 程度）。holdしたdatagramとその再送は両方送られます（重複はTCP/UDPのapplicationが扱う）。最初の
-fragmentの予約は一datagramの上限（16）までで保守的で、fragmentation slotが17より少なくheldも多ければ
-その最初のfragmentは期限までreplayされません（何もcommitしない）。expiryは`interval × max-attempts`固定。
+fragmentの予約はそのdatagramのheld数なので、fragmentation slotがそれより少なければその最初の
+fragmentは期限までreplayされません（何もcommitせず、期限で上のdenyが後続も解放する）。expiryは`interval × max-attempts`固定。
 NAT inboundのneighbor missの前に出るNAT disposition trace（`Rejected(NeighborUnresolved)`）はhold
 されたdatagramにも出ます（traceだけで、counterは`ARP_HELD`）。multi-workerではworker間でholdを共有しない。
 
