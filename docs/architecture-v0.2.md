@@ -79,13 +79,14 @@ local bindingはMACを持ちません。ARP replyのlocal MACは対応する`Int
 一つのinterfaceへ設定するprofileは将来scopeです。
 
 routeに対応するneighborがまだ無いこと自体はvalidです。ARP解決前の通常状態として
-forwarding時に`NeighborUnresolved`でbytes不変recycleします。
+forwarding時に`NeighborUnresolved`でbytes不変recycleします（ARP holdが有効なfull compositionでは
+解決中のmissをdropせずholdし、解決後にreplayする。下の「unresolved next-hop hold and replay」）。
 
 static neighbor missでは、routeが選んだ`(egress, next-hopまたはdestination)`と、
 egress interfaceのMAC/local IPv4からtyped `ArpRequestAction`を作れます。RX処理中は
 caller提供の固定ringへactionを積むだけで、RX batchの`finish`後に独立したgenerated
-sessionを開始します。元packetは常にbyte不変`NeighborUnresolved`でrecycleし、hold
-しません。
+sessionを開始します。元packetはbyte不変`NeighborUnresolved`でrecycleするか、ARP hold
+（ARP-HOLD）が有効ならcore所有のslotへcopyして`ArpHeld`でconsumeします。
 
 generated sessionはbegin時にegressを固定し、最終Ethernet frame長ちょうどの
 backend-owned bufferをGAT/RAII leaseで借用します。coreにはheadroom、capacity全体、
@@ -171,15 +172,14 @@ RFC 1122 §2.3.2.1から採用する境界はARP cache invalidation adviceとReq
 preventionです。retry scheduling、max attempts、`Failed`、hold-downとそのdefault値は
 すべてlocal policyであり、RFC要件とは主張しません。RFC 1812 §3.3.2はfruitless
 resolutionを永遠に続けずdatagramを捨てる、より広いrouter behaviorの境界として扱います。
-packet bufferのhold/replayは実装しません。代わりにdirectly-connected destinationの最初の
-eligible missだけ、別caller-backed slotへvalidated metadataと元IPv4を最大548 bytes copy
-します。元RX leaseは直ちに`NeighborUnresolved`でrecycleされ、ARP成功後もreplayしません。
-generationの最後のcommitted attemptからfull interval経過し、同generationで少なくとも一つ
-ARP Requestがbackend acceptedだった場合だけType 3/Code 1候補へpromotionします。全Request
-reject、gateway next-hop failure、hold capacity不足では生成しません。RFC 1122 §2.3.2.2の
-「最新datagramを保存してresolution成功時に送る」SHOULDとは異なる、DoS耐性を優先した
-quote-only/first-eligible-wins deviationです。multi-worker resolution ownership/SPSCは
-未実装です。
+datagram自体のhold/replay（RFC 1122 §2.3.2.2の「最新datagramを保存してresolution成功時に
+送る」SHOULD）はARP-HOLD（下の「unresolved next-hop hold and replay」）が行います。それとは別に
+directly-connected destinationの最初のeligible missだけ、別caller-backed slotへvalidated
+metadataと元IPv4を最大548 bytes copyします（Host Unreachableのquote）。generationの最後の
+committed attemptからfull interval経過し、同generationで少なくとも一つARP Requestがbackend
+acceptedだった場合だけType 3/Code 1候補へpromotionします。全Request reject、gateway next-hop
+failure、hold capacity不足では生成しません。quoteはlatestでなくfirst-eligible-winsのままです
+（ICMP4-012H1）。multi-worker resolution ownership/SPSCは未実装です。
 
 ## IPv4 scope
 
@@ -528,7 +528,8 @@ in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの�
   DFの有無によらず生成し、datagramに一度だけ）の後、書き換えたframeからtemplate
   （egress、Ethernet destination/source、変換後source/destination、ID、transport header長）を
   読み、NAT/firewallのcommitと同じ点でentryを`Allow`にします。どの理由で落ちても（consumeも）
-  entryは`Deny`です。
+  entryは`Deny`です。例外はARP holdされた最初のfragmentで、entryは変えず（pending/無しのまま）、
+  replayで改めてdecideします（ARP-HOLD）。
 - **後続fragment**（offset≠0）: `decide_later_fragment`がL2/IPv4 ingress、options、構造、
   protocolの最小header内から始まらないこと（TCPはoffset 1と2、RFC 1858 §3.2）を確かめてtableを
   引きます。`Allow`ならtemplateのheader長の内から始まらないことを確かめ（`IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`）、
@@ -592,6 +593,75 @@ MAC変更の後もtimeoutまで残る、IDを当てた
 checksumが検出）、翻訳するICMPv4 errorのfragmentは引き続き拒否、releaseはtemplateのMACを再解決しない、
 R16Aのfragment targetは無い（io-simのbounded property testで代替）、multi-workerではworker間で
 tableを共有しない（flow affinityが要る）。
+
+### unresolved next-hop hold and replay（ARP-HOLD、RFC 1122 §2.3.2.2、RFC 1812 §3.3.2）
+
+RFC 1122 §2.3.2.2はlink layerに、同じ未解決IP addressへのdatagramのうち少なくとも一つ（最新）を
+捨てずに保存し、addressが解決したら送るようSHOULDで求め、RFC 1812 §3.3.2もrouterに同じことを
+求めます。holdしなければ新しいflowの最初のdatagramは必ず失われます（最初の`ping`が失敗し、TCP SYNは
+再送のtimeout（約1 s）を払い、DNS queryはretryする）。coreの`ArpHoldRuntime`（`arp_hold.rs`）は
+caller所有のslot record配列と`packets × fragmentation slotの大きさ`のbytesを借り、allocationもlockも
+持ちません（slotはfragmentation slotと同じ大きさなのでproduction portが受け取るどのframeも収まる）。
+
+- **hold**: next hopのneighbor missはdecisionの中、すべてのcommit（TTL decrement、NAT mapping/session/ID、
+  firewall state）より前で起き、frameはbyte不変です。forwardingの各miss site（通常のLPM、NAT inbound
+  UDP/TCP、hairpin、翻訳するICMPv4 errorのnext hop）は`schedule`の結果がqueued、retry queued、
+  suppressed（既にpending）のときだけ`note_forward_miss`で(egress, target)を記録し（datagramごとに
+  消す）、`forward_batch_tracked`のdrop branchが`NeighborUnresolved`でそれを見つけたら受信したままの
+  frameをslotへcopyし、`ConsumeReason::ArpHeld`（`ARP_HELD`）でbackendへ返します（backend所有buffer
+  はcommitかrecycleの契約のまま）。Failed hold-down中、forbidden target、state/action table満杯、
+  clock regression、local binding無しのmissはresolutionが進まないので従来どおり`NEIGHBOR_UNRESOLVED`。
+  `#[cold]`の関数だけで、missの無いframeのfast pathは「datagramごとにmiss記録を消す」一回のstoreだけ
+  （holdがbindされている時）。
+- **bound**: (egress, next hop)ごとに`per-neighbor`（default 3）。超えたらそのnext hopの最古を置き換え、
+  最新を残します（RFC 1122の「latest」、`replaced`）。(ingress, source)ごと（NAT-FRAGと同じく、WANから
+  inside addressを名乗るdatagramがinside hostの枠を使わない）に`per-host`（default 16、
+  `ARP_HOLD_HOST_LIMIT`、置き換える最古が同じhostのものならその分を数えない）。全体で`packets`
+  （default 64、`ARP_HOLD_FULL`）。slotより長いframe（production portからは起きない）は
+  `ARP_HOLD_TOO_LARGE`。全体上限では新しいdatagramを拒否し（fail closed）、他のnext hopのholdを
+  evictしないので、未解決addressへのfloodが他のnext hopの最新を消すことはありません。boundの確認は
+  held datagramのage listを一回歩くだけ（最大64、cold path）。
+- **replay**: `run_tick`はRX batchの直後（そのbatchのARP replyで解決したnext hopを同じtickで使う）、
+  generated phaseを止めるbackend failureが無ければ`replay_arp_holds`を呼びます。held datagramを古い順に
+  歩き（無ければO(1)）、next hopがstaticか生きたdynamic neighborになったものをreadyにし（その
+  tickのfragmentation slotの空き数まで。残りは次のtick、`deferred`）、readyなものを`PacketBatch`として
+  通常の`forward_batch_tracked`へもう一度通します（holdはoff、二重holdは無い）。route、TTL、firewall、
+  NAT、egress MTUとfragmentationはreplay時点で、同じpublicationの下で受信直後のように判定されcommit
+  します。TTLはまだ減っておらず一回だけ減り、NAT/firewall stateはhold時には一つも作られていません。
+  TXへcommitされたものは`Ipv4FragmentationRuntime::plan_forward`でfragmentation slotへ一frameのまま
+  stage（`replay_sent`）、DF=0でegress MTUを超えるものはforwarding pathがfragmentとしてstage
+  （`replay_fragmented`）、それ以外のdropはその理由で数えます（`replay_dropped`、drop counterにも出る）。
+  同じtickの最後の`GeneratedFragments` phaseがrouter自身のARPとICMPv4の後、`[tick]
+  generated-fragments`の範囲で送ります。新しいtick phaseもbackend APIも要りません。replayが作るICMPv4
+  error（DF付きMTU超過のFragmentation Needed、TTL）はRX直後なので同じtickのICMPv4 phaseで出ます。
+- **失敗**: 毎tickのwalkで、resolutionがfailed/cancelされた（stateがFailed、Cooldown、無い）ものは捨て
+  （`failed`）、hold時刻から`interval × max-attempts`（最初のRequestから最後のRequestの一interval後に
+  TimedOutになるresolutionの長さ）を過ぎたものも捨てます（`expired`）。Host Unreachable（Code 1）は
+  従来どおりresolutionのICMP4-012H（directly-connected targetの最初のeligible missのquote、
+  failed generationに一つ、per-egress limiter）で、held datagramごとには作りません（一つのfailureに
+  N個のerrorを返さない。RFC 1812 §4.3.2.8のrate limitの趣旨）。
+- **publication**: held datagramのnext hopとdecisionはholdした時のpublicationのものなので、applyは
+  `[reload] state`によらず全holdを捨てます（`flushed`）。re-decideにすれば安全に送れますが、旧routeで
+  選んだnext hopを待つholdを新しいroute/firewall/NATで判定することになるので、fail closedに捨てます
+  （送信者の再送が拾う）。policyとstorageはshapeの一部（restart-required）。
+- **fragment**: holdした最初のfragmentはfragment association tableでdecideせず（`commit_deny`しない、
+  ticketを捨てるだけで何も変わらない）、その後続fragmentはtableのpending entryにheldされます。replayで
+  最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る
+  ことがある。受信側のreassemblyには関係ない）。
+- **hairpin、翻訳ICMPv4 error、NAT inbound**: どれもmiss siteで記録され、replayが通常のpathで再判定します。
+- **switch**: `[resolution.hold] enabled = false`はstorageを持たず、ARP-HOLD前どおり
+  `NEIGHBOR_UNRESOLVED`。`[fragmentation] enabled = false`ではreplayの出口が無いのでholdしません。
+
+採らなかった案: (1) 受信RX leaseを保持する（backend frameを数秒占有し、AF_XDPのFill ringを枯らす。
+AGENTS.mdのbackend所有buffer契約に反する）。(2) hold時にdecisionをcommitしてMACだけ後で書く（解決しない
+かもしれないdatagramのためにNAT/firewall stateとIDを消費し、TTLも減る。failure時にstateを戻せない）。
+(3) 専用のreplay tick phaseとbudget（fragmentation slotとphaseで足り、MTU2の再fragmentもそのまま使える）。
+
+残余: replayはそのtickのgenerated fragment phaseで出るので、同じRX batchでARP replyの後に届いた同じ
+flowの新しいdatagram（RXでcommit）が先に出ます（IPは順序を保証しない。TCPのSYN再送やping seqの入れ替わり
+程度）。holdしたdatagramとその再送は両方送られます（重複はTCP/UDPのapplicationが扱う）。releaseされた
+held fragmentがfragmentation slotを使うと、同じtickの後のreplayが`replay_unstaged`（NAT/firewallは
+commit済み、backendのTX rejectと同じ）。multi-workerではworker間でholdを共有しない。
 
 ## ARP control scope
 
@@ -2458,6 +2528,10 @@ breakであり、runtime borrowはprivate fieldにしたためdownstream adapter
 各112 bytesで、full view全体を576 bytes以下に保ちます。1024 tickの回帰fixtureは各tickの
 `active`呼出しがexactly once、heap allocationとvalidation/fingerprint/hash/slice scan再実行が
 zeroであることを固定します。
+
+RX batchの直後、generated phaseを止めるbackend failureが無ければ、next hopが解決したheld datagramを
+`replay_arp_holds`で同じtickに再判定し、fragmentation slotへstageします（ARP-HOLD。tick phaseは
+増やさずRX phaseの一部。replayする数はfragmentation slotの空きまで）。
 
 `TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
 generated ICMPv4 action、generated fragment frame（`generated_fragments`、MTU2 part B）を
