@@ -1347,9 +1347,11 @@ fn victims_are_found_behind_any_number_of_allowing_entries() {
         allow(&mut tracker, id, 0);
     }
     hold(&mut tracker, SOURCE, 13, 0);
-    assert!(tracker
+    // Evicted when the first fragment commits (#341 re-review L4).
+    let ticket = tracker
         .admit_first(info(&fragment(14, MF, 64, 17, 16)), 0)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
     let counters = tracker.counters();
     assert_eq!((counters.entries_evicted, counters.held_evicted), (1, 1));
     // Same at the ingress share (8 of 16).
@@ -1360,9 +1362,11 @@ fn victims_are_found_behind_any_number_of_allowing_entries() {
         allow(&mut tracker, id, 0);
     }
     hold(&mut tracker, SOURCE, 8, 0);
-    assert!(tracker
+    // Evicted when the first fragment commits (#341 re-review L4).
+    let ticket = tracker
         .admit_first(info(&fragment(9, MF, 64, 17, 16)), 0)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
     assert_eq!(tracker.counters().entries_evicted, 1);
 }
 
@@ -1433,10 +1437,12 @@ fn a_datagram_in_progress_is_not_stalled_however_old() {
         tracker.admit_first(info(&fragment(4, MF, 64, 17, 16)), 600),
         Err(DropReason::Ipv4FragmentTableFull)
     );
-    // At 720 datagram 3 stalled (220 ms), 1 did not (170 ms).
-    assert!(tracker
+    // At 720 datagram 3 stalled (220 ms), 1 did not (170 ms). Evicted when
+    // the first fragment commits (#341 re-review L4).
+    let ticket = tracker
         .admit_first(info(&fragment(4, MF, 64, 17, 16)), 720)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 720);
     progress(&mut tracker, 1, 6, 720);
     assert_eq!(tracker.counters().entries_evicted, 2);
 }
@@ -1613,9 +1619,11 @@ fn an_evicted_poisoned_entry_leaves_a_tombstone() {
     // The host's quota (2) fills, and the next datagram evicts the
     // poisoned entry (it is refusing now).
     allow(&mut tracker, 2, 0);
-    assert!(tracker
+    // Evicted when the first fragment commits (#341 re-review L4).
+    let ticket = tracker
         .admit_first(info(&fragment(3, MF, 64, 17, 16)), 0)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 0);
     assert_eq!(tracker.counters().entries_evicted, 1);
     // The evicted datagram's late fragment is refused, not held for
     // another datagram on the key; a third first fragment is refused too.
@@ -1649,9 +1657,11 @@ fn duplicates_are_not_progress() {
         Ok(Ipv4FragmentFollow::Allow { .. })
     ));
     // 200 ms after the last progress (150): stalled, evicted.
-    assert!(tracker
+    // Evicted when the first fragment commits (#341 re-review L4).
+    let ticket = tracker
         .admit_first(info(&fragment(2, MF, 64, 17, 16)), 350)
-        .is_ok());
+        .unwrap();
+    tracker.commit_deny(ticket, 350);
     assert_eq!(tracker.counters().entries_evicted, 1);
 }
 

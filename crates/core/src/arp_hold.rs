@@ -187,6 +187,11 @@ pub struct ArpHoldSlot {
     frame_len: u32,
     older: u32,
     newer: u32,
+    /// A held first fragment's pending entry in the fragment association
+    /// table and that entry's generation (NONE: none), so a drop refuses
+    /// exactly its datagram. In the record's padding: no storage growth.
+    association: u32,
+    association_generation: u8,
 }
 
 impl ArpHoldSlot {
@@ -200,6 +205,8 @@ impl ArpHoldSlot {
         frame_len: 0,
         older: NONE,
         newer: NONE,
+        association: NONE,
+        association_generation: 0,
     };
 }
 
@@ -221,6 +228,22 @@ pub(crate) struct ArpHoldMiss {
     /// When the resolution can no longer succeed (`interval × max-attempts`
     /// after the miss).
     pub(crate) deadline_ms: u64,
+}
+
+/// What [`ArpHoldRuntime::mark_ready`] asks of the fragment association
+/// table.
+pub(crate) enum ArpHoldFragmentHook<'f> {
+    /// How many fragments the held first fragment `frame` from `ingress`
+    /// has waiting in the table (room its replay must reserve).
+    Reserve { frame: &'f [u8], ingress: IfId },
+    /// A held first fragment (`frame` from `ingress`) with this pending
+    /// entry was freed: refuse its datagram.
+    Dropped {
+        frame: &'f [u8],
+        ingress: IfId,
+        association: u32,
+        generation: u8,
+    },
 }
 
 /// What the resolution says about a held datagram's next hop.
@@ -456,7 +479,7 @@ impl<'a> ArpHoldRuntime<'a> {
         frame: &[u8],
         ingress: IfId,
         miss: ArpHoldMiss,
-        mut first_fragment_dropped: impl FnMut(&[u8], IfId),
+        mut association_dropped: impl FnMut(&[u8], IfId, u32, u8),
     ) -> Result<(), DropReason> {
         if frame.len() > self.slot_bytes && !self.slots.is_empty() {
             self.counters.refused_too_large += 1;
@@ -552,8 +575,14 @@ impl<'a> ArpHoldRuntime<'a> {
         }
         if let Some(victim) = victim {
             let victim = victim as usize;
-            if self.is_first_fragment(victim) {
-                first_fragment_dropped(&self.bytes[self.range(victim)], self.slots[victim].ingress);
+            let slot = self.slots[victim];
+            if slot.association != NONE {
+                association_dropped(
+                    &self.bytes[self.range(victim)],
+                    slot.ingress,
+                    slot.association,
+                    slot.association_generation,
+                );
             }
             self.release(victim);
             self.counters.replaced += 1;
@@ -577,6 +606,8 @@ impl<'a> ArpHoldRuntime<'a> {
             frame_len: u32::try_from(frame.len()).expect("bounded by the slot bytes"),
             older: self.newest,
             newer: NONE,
+            association: NONE,
+            association_generation: 0,
         };
         if self.newest == NONE {
             self.oldest = index;
@@ -589,22 +620,33 @@ impl<'a> ArpHoldRuntime<'a> {
         Ok(())
     }
 
+    /// Records the fragment association of the datagram just held (a first
+    /// fragment's pending entry and its generation).
+    pub(crate) fn set_newest_association(&mut self, association: (u32, u8)) {
+        if self.newest != NONE {
+            let slot = &mut self.slots[self.newest as usize];
+            slot.association = association.0;
+            slot.association_generation = association.1;
+        }
+    }
+
     /// Marks held datagrams whose next hop `probe` says is resolved as
     /// ready for this tick's replay (oldest first) while their room fits in
     /// `room` fragmentation slots, and frees those whose resolution is over
     /// or which passed their deadline. Returns how many are ready.
     ///
     /// A datagram takes one slot; a first fragment (MF set, offset 0) takes
-    /// one plus `fragment_reserve` (the fragments the association table
-    /// holds, which its allowed decision releases into the same slots), so
-    /// a replay whose NAT and firewall state commit always finds its slot.
+    /// one plus what `fragments` says its datagram holds in the association
+    /// table ([`ArpHoldFragmentHook::Reserve`]: its allowed decision
+    /// releases them into the same slots), so a replay whose NAT and
+    /// firewall state commit always finds its slot. A freed first fragment
+    /// with an association is reported ([`ArpHoldFragmentHook::Dropped`]).
     pub(crate) fn mark_ready(
         &mut self,
         now_ms: u64,
         mut room: usize,
-        fragment_reserve: usize,
         mut probe: impl FnMut(IfId, Ipv4Address) -> ArpHoldNextHop,
-        mut first_fragment_dropped: impl FnMut(&[u8], IfId),
+        mut fragments: impl FnMut(ArpHoldFragmentHook<'_>) -> usize,
     ) -> usize {
         let mut ready = 0;
         let mut cursor = self.oldest;
@@ -615,9 +657,11 @@ impl<'a> ArpHoldRuntime<'a> {
             if slot.state != HoldState::Held {
                 continue;
             }
-            let first_fragment = self.is_first_fragment(index);
-            let cost = if first_fragment {
-                1 + fragment_reserve
+            let cost = if self.is_first_fragment(index) {
+                1 + fragments(ArpHoldFragmentHook::Reserve {
+                    frame: &self.bytes[self.range(index)],
+                    ingress: slot.ingress,
+                })
             } else {
                 1
             };
@@ -650,8 +694,13 @@ impl<'a> ArpHoldRuntime<'a> {
                 // A dropped first fragment refuses its datagram at once, so
                 // the association table frees the later fragments it holds
                 // instead of keeping them until its timeout.
-                if first_fragment {
-                    first_fragment_dropped(&self.bytes[self.range(index)], slot.ingress);
+                if slot.association != NONE {
+                    fragments(ArpHoldFragmentHook::Dropped {
+                        frame: &self.bytes[self.range(index)],
+                        ingress: slot.ingress,
+                        association: slot.association,
+                        generation: slot.association_generation,
+                    });
                 }
                 self.release(index);
             }
@@ -804,5 +853,7 @@ impl PacketSlot for ArpHoldReplaySlot<'_, '_> {
     }
 }
 
+#[cfg(test)]
+mod association_tests;
 #[cfg(test)]
 mod tests;

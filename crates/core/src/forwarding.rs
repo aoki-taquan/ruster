@@ -1,4 +1,4 @@
-use crate::arp_hold::{ArpHoldMiss, ArpHoldNextHop};
+use crate::arp_hold::{ArpHoldFragmentHook, ArpHoldMiss, ArpHoldNextHop};
 use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError, FirewallRouteMissPacket};
 use crate::ipv4_fragment_tracking::{
     parse_fragment, Ipv4FragmentFirstTicket, Ipv4FragmentFollow, Ipv4FragmentInfo,
@@ -2945,23 +2945,12 @@ where
         return 0;
     }
     let room = fragmentation.free_slots();
-    // A replayed first fragment releases the fragments the association
-    // table holds for its datagram into the same slots: reserve them, so a
-    // replay that commits NAT and firewall state always finds its own slot.
-    // One datagram holds at most IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM,
-    // so other datagrams' held fragments cannot keep it waiting for ever.
-    let fragment_reserve = fragment_tracking.as_deref().map_or(0, |tracker| {
-        tracker
-            .held()
-            .min(usize::from(crate::IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM))
-    });
     let udp = Some(udp_config);
     let tcp = Some(tcp_config);
     let icmp_cfg = icmp.as_ref().map(|(config, _)| *config);
     let ready = arp_hold.mark_ready(
         now.0,
         room,
-        fragment_reserve,
         |egress, target| {
             if snapshot.static_neighbor(egress, target).is_some() {
                 ArpHoldNextHop::Known
@@ -2969,11 +2958,36 @@ where
                 resolution.arp_hold_next_hop(egress, target, now)
             }
         },
-        |frame, ingress| {
-            if let Some(tracker) = fragment_tracking.as_deref_mut() {
-                deny_dropped_first_fragment(
-                    frame, snapshot, ingress, udp, tcp, icmp_cfg, tracker, now.0,
-                );
+        |hook| {
+            let Some(tracker) = fragment_tracking.as_deref_mut() else {
+                return 0;
+            };
+            match hook {
+                // A replayed first fragment releases the fragments its
+                // datagram holds in the association table (at most
+                // IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM) into the same
+                // slots: reserve them, so a replay that commits NAT and
+                // firewall state always finds its own slot.
+                ArpHoldFragmentHook::Reserve { frame, ingress } => {
+                    tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
+                        .map_or(0, |(_, info)| tracker.held_for(info))
+                }
+                // A dropped held first fragment refuses exactly its own
+                // datagram's pending entry (lookup-free, never inserts or
+                // poisons), freeing its held later fragments at once.
+                ArpHoldFragmentHook::Dropped {
+                    frame,
+                    ingress,
+                    association,
+                    generation,
+                } => {
+                    if let Some((_, info)) =
+                        tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
+                    {
+                        tracker.deny_pending(association, generation, info, now.0);
+                    }
+                    0
+                }
             }
         },
     );
@@ -3050,36 +3064,6 @@ where
     )
 }
 
-/// Refuses the datagram of a held first fragment the hold dropped (its
-/// resolution failed, was cancelled, or ran out of time) in the association
-/// table, as the forwarding path does for any dropped first fragment: its
-/// held later fragments are freed now (`held_denied`) and later ones are
-/// refused, instead of waiting for the table's timeout. Cold path.
-#[cold]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn deny_dropped_first_fragment(
-    frame: &[u8],
-    snapshot: &ForwardingSnapshot<'_>,
-    ingress: IfId,
-    udp: Option<&Nat44UdpConfig>,
-    tcp: Option<&Nat44TcpConfig>,
-    icmp: Option<&Nat44IcmpConfig>,
-    tracker: &mut Ipv4FragmentTracker<'_>,
-    now_ms: u64,
-) {
-    let Some((ipv4, info)) = tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp) else {
-        return;
-    };
-    if !info.is_first() {
-        return;
-    }
-    if let Ok(ticket) = admit_first_fragment(frame, snapshot, ingress, ipv4, info, tracker, now_ms)
-    {
-        tracker.commit_deny(ticket, now_ms);
-    }
-}
-
 /// The trace of a replay: the replayed datagram was already counted when
 /// it was received (consumed as `ARP_HELD`), so its terminal events (drop,
 /// consume, fragmentation staging) are not passed on; the hold's own
@@ -3113,24 +3097,49 @@ impl<T: TraceSink> TraceSink for ReplayTrace<'_, T> {
 /// miss started no resolution that could end in a replay. Cold path.
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn hold_unresolved(
     hold: &mut ArpHoldRuntime<'_>,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     frame: &[u8],
     ingress: IfId,
-    first_fragment_dropped: impl FnOnce(&[u8], IfId),
+    mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
+    first_fragment: Option<Ipv4FragmentFirstTicket>,
+    snapshot: &ForwardingSnapshot<'_>,
+    (udp, tcp, icmp): (
+        Option<&Nat44UdpConfig>,
+        Option<&Nat44TcpConfig>,
+        Option<&Nat44IcmpConfig>,
+    ),
 ) -> Result<ArpHoldMiss, DropReason> {
     let Some((runtime, now)) = resolution.as_mut() else {
         return Err(NeighborUnresolved);
     };
     let miss = runtime.take_forward_miss(*now).ok_or(NeighborUnresolved)?;
-    let mut dropped = Some(first_fragment_dropped);
-    hold.hold(frame, ingress, miss, |held, held_ingress| {
-        if let Some(dropped) = dropped.take() {
-            dropped(held, held_ingress);
+    // A held first fragment replaced here (the latest is kept per next
+    // hop) refuses its own datagram's pending entry.
+    hold.hold(
+        frame,
+        ingress,
+        miss,
+        |held, held_ingress, association, generation| {
+            if let Some(tracker) = fragment_tracking.as_deref_mut() {
+                if let Some((_, info)) =
+                    tracked_fragment(held, snapshot, held_ingress, udp, tcp, icmp)
+                {
+                    tracker.deny_pending(association, generation, info, now.0);
+                }
+            }
+        },
+    )?;
+    // A held first fragment keeps (or takes, without evicting) a pending
+    // entry, recorded so a later drop refuses exactly its datagram.
+    if let (Some(tracker), Some(ticket)) = (fragment_tracking, first_fragment) {
+        if let Some(association) = tracker.hold_first(ticket, now.0) {
+            hold.set_newest_association(association);
         }
-    })
-    .map(|()| miss)
+    }
+    Ok(miss)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3536,29 +3545,15 @@ where
                 // held (nothing committed for it) instead of dropped.
                 let reason = match arp_hold.as_deref_mut() {
                     Some(hold) if reason == NeighborUnresolved => {
-                        // A held first fragment the hold replaces (the latest
-                        // is kept per next hop) refuses its datagram.
-                        let tracker = fragment_tracking.as_deref_mut();
-                        let dropped = |frame: &[u8], held_ingress: IfId| {
-                            if let Some(tracker) = tracker {
-                                deny_dropped_first_fragment(
-                                    frame,
-                                    snapshot,
-                                    held_ingress,
-                                    nat44_udp_config,
-                                    nat44_tcp_config,
-                                    nat44_icmp_config,
-                                    tracker,
-                                    nat_now_ms,
-                                );
-                            }
-                        };
                         match hold_unresolved(
                             hold,
                             &mut resolution,
                             packet.bytes_mut(),
                             ingress,
-                            dropped,
+                            fragment_tracking.as_deref_mut(),
+                            first_fragment,
+                            snapshot,
+                            (nat44_udp_config, nat44_tcp_config, nat44_icmp_config),
                         ) {
                             Ok(miss) => {
                                 // A held first fragment stays undecided: its

@@ -4,8 +4,9 @@
 //! firewall, fragments) is in `crates/io-sim/tests/arp_hold.rs`.
 
 use super::{
-    ArpHoldMiss, ArpHoldNextHop, ArpHoldPolicy, ArpHoldPolicyError, ArpHoldRuntime, ArpHoldSlot,
-    ArpHoldStorageError, HoldState, ARP_HOLD_MAX_PACKETS, ARP_HOLD_MAX_PER_NEIGHBOR, NONE,
+    ArpHoldFragmentHook, ArpHoldMiss, ArpHoldNextHop, ArpHoldPolicy, ArpHoldPolicyError,
+    ArpHoldRuntime, ArpHoldSlot, ArpHoldStorageError, HoldState, ARP_HOLD_MAX_PACKETS,
+    ARP_HOLD_MAX_PER_NEIGHBOR, NONE,
 };
 use crate::{
     ipv4_fragment_slot_bytes, ConsumeReason, DropReason, ForwardingSnapshot, IfId, Interface,
@@ -200,7 +201,7 @@ fn holds_copy_the_frame_and_record_the_next_hop() {
     let mut runtime = table.runtime(3, 16);
     let held = frame([192, 168, 1, 10], 60, 7);
     runtime
-        .hold(&held, LAN, miss(GW, 3_000), |_, _| {})
+        .hold(&held, LAN, miss(GW, 3_000), |_, _, _, _| {})
         .unwrap();
     assert_eq!(runtime.live(), 1);
     let slot = runtime.slots[runtime.oldest as usize];
@@ -239,7 +240,7 @@ fn the_latest_datagrams_per_next_hop_are_kept() {
                 &frame([192, 168, 1, 10], 60, tag),
                 LAN,
                 miss(GW, 3_000),
-                |_, _| {},
+                |_, _, _, _| {},
             )
             .unwrap();
     }
@@ -249,7 +250,7 @@ fn the_latest_datagrams_per_next_hop_are_kept() {
             &frame([192, 168, 1, 10], 60, 9),
             LAN,
             miss(OTHER, 3_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     runtime
@@ -257,7 +258,7 @@ fn the_latest_datagrams_per_next_hop_are_kept() {
             &frame([192, 168, 1, 10], 60, 6),
             LAN,
             miss(GW, 3_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     assert_eq!(tags(&runtime), [4, 5, 9, 6]);
@@ -275,7 +276,7 @@ fn one_per_next_hop_keeps_only_the_latest() {
                 &frame([192, 168, 1, 10], 60, tag),
                 LAN,
                 miss(GW, 3_000),
-                |_, _| {},
+                |_, _, _, _| {},
             )
             .unwrap();
         assert_eq!(tags(&runtime), [tag]);
@@ -288,26 +289,31 @@ fn the_per_host_bound_is_per_ingress_and_source() {
     let mut runtime = table.runtime(8, 2);
     let host = [192, 168, 1, 10];
     runtime
-        .hold(&frame(host, 60, 1), LAN, miss(GW, 3_000), |_, _| {})
+        .hold(&frame(host, 60, 1), LAN, miss(GW, 3_000), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&frame(host, 60, 2), LAN, miss(OTHER, 3_000), |_, _| {})
+        .hold(
+            &frame(host, 60, 2),
+            LAN,
+            miss(OTHER, 3_000),
+            |_, _, _, _| {},
+        )
         .unwrap();
     assert_eq!(
-        runtime.hold(&frame(host, 60, 3), LAN, miss(GW, 3_000), |_, _| {}),
+        runtime.hold(&frame(host, 60, 3), LAN, miss(GW, 3_000), |_, _, _, _| {}),
         Err(DropReason::ArpHoldHostLimit)
     );
     // The same source on another ingress, and another source, are other
     // hosts.
     runtime
-        .hold(&frame(host, 60, 4), WAN, miss(GW, 3_000), |_, _| {})
+        .hold(&frame(host, 60, 4), WAN, miss(GW, 3_000), |_, _, _, _| {})
         .unwrap();
     runtime
         .hold(
             &frame([192, 168, 1, 11], 60, 5),
             LAN,
             miss(GW, 3_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     assert_eq!(tags(&runtime), [1, 2, 4, 5]);
@@ -321,16 +327,21 @@ fn a_replacement_from_the_same_host_does_not_count_against_it() {
     let mut runtime = table.runtime(1, 1);
     let host = [192, 168, 1, 10];
     runtime
-        .hold(&frame(host, 60, 1), LAN, miss(GW, 3_000), |_, _| {})
+        .hold(&frame(host, 60, 1), LAN, miss(GW, 3_000), |_, _, _, _| {})
         .unwrap();
     // At its host bound, H may still replace its own datagram to GW...
     runtime
-        .hold(&frame(host, 60, 2), LAN, miss(GW, 3_000), |_, _| {})
+        .hold(&frame(host, 60, 2), LAN, miss(GW, 3_000), |_, _, _, _| {})
         .unwrap();
     assert_eq!(tags(&runtime), [2]);
     // ...but not hold one for another next hop.
     assert_eq!(
-        runtime.hold(&frame(host, 60, 3), LAN, miss(OTHER, 3_000), |_, _| {}),
+        runtime.hold(
+            &frame(host, 60, 3),
+            LAN,
+            miss(OTHER, 3_000),
+            |_, _, _, _| {}
+        ),
         Err(DropReason::ArpHoldHostLimit)
     );
     // And another host at its own bound cannot evict H's datagram through
@@ -339,13 +350,18 @@ fn a_replacement_from_the_same_host_does_not_count_against_it() {
     let mut runtime = table.runtime(1, 1);
     let other = [192, 168, 1, 11];
     runtime
-        .hold(&frame(host, 60, 1), LAN, miss(GW, 3_000), |_, _| {})
+        .hold(&frame(host, 60, 1), LAN, miss(GW, 3_000), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&frame(other, 60, 2), LAN, miss(OTHER, 3_000), |_, _| {})
+        .hold(
+            &frame(other, 60, 2),
+            LAN,
+            miss(OTHER, 3_000),
+            |_, _, _, _| {},
+        )
         .unwrap();
     assert_eq!(
-        runtime.hold(&frame(other, 60, 3), LAN, miss(GW, 3_000), |_, _| {}),
+        runtime.hold(&frame(other, 60, 3), LAN, miss(GW, 3_000), |_, _, _, _| {}),
         Err(DropReason::ArpHoldHostLimit)
     );
     assert_eq!(tags(&runtime), [1, 2]);
@@ -362,7 +378,7 @@ fn a_full_table_refuses_and_a_long_frame_is_refused() {
                 &frame([192, 168, 1, tag], 60, tag),
                 LAN,
                 miss(*target, 1),
-                |_, _| {},
+                |_, _, _, _| {},
             )
             .unwrap();
     }
@@ -371,7 +387,7 @@ fn a_full_table_refuses_and_a_long_frame_is_refused() {
             &frame([192, 168, 1, 3], 60, 3),
             LAN,
             miss(targets[2], 1),
-            |_, _| {}
+            |_, _, _, _| {}
         ),
         Err(DropReason::ArpHoldFull)
     );
@@ -379,18 +395,28 @@ fn a_full_table_refuses_and_a_long_frame_is_refused() {
     let mut table = Table::new(2);
     let mut runtime = table.runtime(1, 16);
     runtime
-        .hold(&frame([192, 168, 1, 1], 60, 1), LAN, miss(GW, 1), |_, _| {})
+        .hold(
+            &frame([192, 168, 1, 1], 60, 1),
+            LAN,
+            miss(GW, 1),
+            |_, _, _, _| {},
+        )
         .unwrap();
     runtime
         .hold(
             &frame([192, 168, 1, 2], 60, 2),
             LAN,
             miss(OTHER, 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     runtime
-        .hold(&frame([192, 168, 1, 3], 60, 3), LAN, miss(GW, 1), |_, _| {})
+        .hold(
+            &frame([192, 168, 1, 3], 60, 3),
+            LAN,
+            miss(GW, 1),
+            |_, _, _, _| {},
+        )
         .unwrap();
     assert_eq!(tags(&runtime), [2, 3]);
 
@@ -402,7 +428,7 @@ fn a_full_table_refuses_and_a_long_frame_is_refused() {
             &frame([192, 168, 1, 1], SLOT, 1),
             LAN,
             miss(GW, 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     assert_eq!(
@@ -410,7 +436,7 @@ fn a_full_table_refuses_and_a_long_frame_is_refused() {
             &frame([192, 168, 1, 1], SLOT + 1, 2),
             LAN,
             miss(GW, 1),
-            |_, _| {}
+            |_, _, _, _| {}
         ),
         Err(DropReason::ArpHoldTooLarge)
     );
@@ -421,7 +447,12 @@ fn a_full_table_refuses_and_a_long_frame_is_refused() {
     let mut none: [ArpHoldSlot; 0] = [];
     let mut runtime = ArpHoldRuntime::new(ArpHoldPolicy::DEFAULT, &mut none, &mut []).unwrap();
     assert_eq!(
-        runtime.hold(&frame([192, 168, 1, 1], 60, 1), LAN, miss(GW, 1), |_, _| {}),
+        runtime.hold(
+            &frame([192, 168, 1, 1], 60, 1),
+            LAN,
+            miss(GW, 1),
+            |_, _, _, _| {}
+        ),
         Err(DropReason::ArpHoldFull)
     );
     assert_eq!(runtime.counters().refused_full, 1);
@@ -431,13 +462,15 @@ fn a_full_table_refuses_and_a_long_frame_is_refused() {
 fn a_short_frame_without_a_source_is_held_under_the_zero_source() {
     let mut table = Table::new(2);
     let mut runtime = table.runtime(3, 1);
-    runtime.hold(&[0; 20], LAN, miss(GW, 1), |_, _| {}).unwrap();
+    runtime
+        .hold(&[0; 20], LAN, miss(GW, 1), |_, _, _, _| {})
+        .unwrap();
     assert_eq!(
         runtime.slots[runtime.oldest as usize].source,
         Ipv4Address::from_octets([0; 4])
     );
     assert_eq!(
-        runtime.hold(&[0; 20], LAN, miss(OTHER, 1), |_, _| {}),
+        runtime.hold(&[0; 20], LAN, miss(OTHER, 1), |_, _, _, _| {}),
         Err(DropReason::ArpHoldHostLimit)
     );
 }
@@ -453,7 +486,7 @@ fn releasing_any_slot_keeps_both_lists() {
                     &frame([192, 168, 1, tag], 60, tag),
                     LAN,
                     miss(Ipv4Address::from_octets([203, 0, 113, 10 + tag]), 1),
-                    |_, _| {},
+                    |_, _, _, _| {},
                 )
                 .unwrap();
         }
@@ -465,7 +498,12 @@ fn releasing_any_slot_keeps_both_lists() {
         assert_eq!(tags(&runtime), expected, "victim {victim}");
         // The freed slot is reused first.
         runtime
-            .hold(&frame([10, 0, 0, 1], 60, 9), LAN, miss(GW, 1), |_, _| {})
+            .hold(
+                &frame([10, 0, 0, 1], 60, 9),
+                LAN,
+                miss(GW, 1),
+                |_, _, _, _| {},
+            )
             .unwrap();
         assert_eq!(runtime.newest as usize, index);
         assert_eq!(tags(&runtime).last(), Some(&9));
@@ -482,7 +520,7 @@ fn flush_frees_everything_and_counts_it() {
                 &frame([192, 168, 1, 10], 60, tag),
                 LAN,
                 miss(GW, 1),
-                |_, _| {},
+                |_, _, _, _| {},
             )
             .unwrap();
     }
@@ -499,7 +537,7 @@ fn flush_frees_everything_and_counts_it() {
                 &frame([192, 168, 1, tag], 60, tag),
                 LAN,
                 miss(Ipv4Address::from_octets([203, 0, 113, tag]), 1),
-                |_, _| {},
+                |_, _, _, _| {},
             )
             .unwrap();
     }
@@ -527,7 +565,7 @@ fn mark_ready_replays_known_next_hops_within_room_and_frees_the_rest() {
                 &frame([192, 168, 1, tag], 60, tag),
                 LAN,
                 miss(target, deadline),
-                |_, _| {},
+                |_, _, _, _| {},
             )
             .unwrap();
     }
@@ -538,7 +576,7 @@ fn mark_ready_replays_known_next_hops_within_room_and_frees_the_rest() {
     };
     // Room for two at 1_000: 1 and 3 are ready; 6 is known but has no room
     // and its deadline passed; 7 is deferred; 5 expired; 4 failed; 2 waits.
-    assert_eq!(runtime.mark_ready(1_000, 2, 0, probe, |_, _| {}), 2);
+    assert_eq!(runtime.mark_ready(1_000, 2, probe, |_| 0), 2);
     let states: Vec<(u8, HoldState)> = {
         let mut out = Vec::new();
         let mut cursor = runtime.oldest;
@@ -564,9 +602,9 @@ fn mark_ready_replays_known_next_hops_within_room_and_frees_the_rest() {
         (2, 1, 1)
     );
     // A second pass skips the ready ones; one deadline exactly reached.
-    assert_eq!(runtime.mark_ready(4_999, 0, 0, probe, |_, _| {}), 0);
+    assert_eq!(runtime.mark_ready(4_999, 0, probe, |_| 0), 0);
     assert_eq!(runtime.counters().deferred, 2);
-    assert_eq!(runtime.mark_ready(5_000, 0, 0, probe, |_, _| {}), 0);
+    assert_eq!(runtime.mark_ready(5_000, 0, probe, |_| 0), 0);
     assert_eq!(tags(&runtime), [1, 3]);
     assert_eq!(runtime.counters().expired, 4);
 }
@@ -581,7 +619,7 @@ fn the_replay_batch_lends_ready_datagrams_and_settles_each_completion() {
                 &frame([192, 168, 1, 10], 60, tag),
                 LAN,
                 miss(GW, 9_000),
-                |_, _| {},
+                |_, _, _, _| {},
             )
             .unwrap();
     }
@@ -590,20 +628,19 @@ fn the_replay_batch_lends_ready_datagrams_and_settles_each_completion() {
             &frame([192, 168, 1, 10], 60, 6),
             WAN,
             miss(OTHER, 9_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     assert_eq!(
         runtime.mark_ready(
             0,
             5,
-            0,
             |_, target| if target == GW {
                 ArpHoldNextHop::Known
             } else {
                 ArpHoldNextHop::Resolving
             },
-            |_, _| {}
+            |_| 0
         ),
         5
     );
@@ -684,35 +721,34 @@ fn staging_sends_committed_datagrams_whole_and_returns_unreached_ones() {
     padded[16..18].copy_from_slice(&46_u16.to_be_bytes());
     padded.extend_from_slice(&[0; 4]);
     runtime
-        .hold(&padded, LAN, miss(GW, 9_000), |_, _| {})
+        .hold(&padded, LAN, miss(GW, 9_000), |_, _, _, _| {})
         .unwrap();
     runtime
         .hold(
             &frame([192, 168, 1, 10], 60, 2),
             LAN,
             miss(GW, 9_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     // DF set, so it cannot be cut either.
     let mut long = frame([192, 168, 1, 10], 600, 3);
     long[20] = 0x40;
     runtime
-        .hold(&long, LAN, miss(GW, 9_000), |_, _| {})
+        .hold(&long, LAN, miss(GW, 9_000), |_, _, _, _| {})
         .unwrap();
     runtime
         .hold(
             &frame([192, 168, 1, 10], 60, 4),
             LAN,
             miss(OTHER, 9_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     // Mark three ready (4's next hop resolves only later).
     runtime.mark_ready(
         0,
         3,
-        0,
         |_, target| {
             if target == GW {
                 ArpHoldNextHop::Known
@@ -720,7 +756,7 @@ fn staging_sends_committed_datagrams_whole_and_returns_unreached_ones() {
                 ArpHoldNextHop::Resolving
             }
         },
-        |_, _| {},
+        |_| 0,
     );
     {
         let mut batch = runtime.replay_batch();
@@ -752,10 +788,10 @@ fn staging_sends_committed_datagrams_whole_and_returns_unreached_ones() {
             &frame([192, 168, 1, 10], 60, 1),
             LAN,
             miss(GW, 9_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
-    runtime.mark_ready(0, 1, 0, |_, _| ArpHoldNextHop::Known, |_, _| {});
+    runtime.mark_ready(0, 1, |_, _| ArpHoldNextHop::Known, |_| 0);
     runtime.stage_committed(&snapshot, &mut fragmentation);
     assert_eq!(
         runtime.slots[runtime.oldest as usize].state,
@@ -785,7 +821,7 @@ fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
             &frame([198, 51, 100, 1], 60, 1),
             WAN,
             miss(target(10), 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     runtime
@@ -793,7 +829,7 @@ fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
             &frame([198, 51, 100, 2], 60, 2),
             WAN,
             miss(target(11), 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     assert_eq!(
@@ -801,7 +837,7 @@ fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
             &frame([198, 51, 100, 3], 60, 3),
             WAN,
             miss(target(12), 1),
-            |_, _| {}
+            |_, _, _, _| {}
         ),
         Err(DropReason::ArpHoldIngressLimit)
     );
@@ -811,7 +847,7 @@ fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
             &frame([198, 51, 100, 3], 60, 4),
             WAN,
             miss(target(11), 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     // The LAN still finds room.
@@ -820,7 +856,7 @@ fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
             &frame([192, 168, 1, 10], 60, 5),
             LAN,
             miss(target(13), 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     runtime
@@ -828,7 +864,7 @@ fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
             &frame([192, 168, 1, 11], 60, 6),
             LAN,
             miss(target(14), 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     assert_eq!(tags(&runtime), [1, 4, 5, 6]);
@@ -838,7 +874,7 @@ fn the_per_ingress_bound_refuses_and_a_full_table_is_full_first() {
             &frame([192, 168, 1, 12], 60, 7),
             LAN,
             miss(target(15), 1),
-            |_, _| {}
+            |_, _, _, _| {}
         ),
         Err(DropReason::ArpHoldFull)
     );
@@ -856,14 +892,14 @@ fn a_replacement_prefers_the_senders_own_datagram() {
     let a = [192, 168, 1, 10];
     let b = [192, 168, 1, 11];
     runtime
-        .hold(&frame(b, 60, 1), LAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(b, 60, 1), LAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&frame(a, 60, 2), LAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(a, 60, 2), LAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     // A's new datagram replaces A's own, not B's older one.
     runtime
-        .hold(&frame(a, 60, 3), LAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(a, 60, 3), LAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     assert_eq!(tags(&runtime), [1, 3]);
     // C has none there: the oldest goes.
@@ -872,7 +908,7 @@ fn a_replacement_prefers_the_senders_own_datagram() {
             &frame([192, 168, 1, 12], 60, 4),
             LAN,
             miss(GW, 1),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     assert_eq!(tags(&runtime), [3, 4]);
@@ -887,7 +923,7 @@ fn a_cancelled_resolution_is_counted_apart_from_a_failed_one() {
             &frame([192, 168, 1, 10], 60, 1),
             LAN,
             miss(GW, 9_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     runtime
@@ -895,13 +931,12 @@ fn a_cancelled_resolution_is_counted_apart_from_a_failed_one() {
             &frame([192, 168, 1, 10], 60, 2),
             LAN,
             miss(OTHER, 9_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     runtime.mark_ready(
         0,
         4,
-        0,
         |_, target| {
             if target == GW {
                 ArpHoldNextHop::Gone
@@ -909,7 +944,7 @@ fn a_cancelled_resolution_is_counted_apart_from_a_failed_one() {
                 ArpHoldNextHop::Failed
             }
         },
-        |_, _| {},
+        |_| 0,
     );
     let counters = runtime.counters();
     assert_eq!(
@@ -927,15 +962,15 @@ fn a_first_fragment_needs_room_for_the_held_fragments() {
     let mut later = frame([192, 168, 1, 10], 60, 2);
     later[20..22].copy_from_slice(&[0x20, 0x10]); // MF, offset 16
     runtime
-        .hold(&first, LAN, miss(GW, 9_000), |_, _| {})
+        .hold(&first, LAN, miss(GW, 9_000), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&later, LAN, miss(GW, 9_000), |_, _| {})
+        .hold(&later, LAN, miss(GW, 9_000), |_, _, _, _| {})
         .unwrap();
     let known = |_: IfId, _: Ipv4Address| ArpHoldNextHop::Known;
     // A first fragment costs 1 + 2 reserved: with 2 slots only the later
     // fragment (cost 1) is ready.
-    assert_eq!(runtime.mark_ready(0, 2, 2, known, |_, _| {}), 1);
+    assert_eq!(runtime.mark_ready(0, 2, known, |_| 2), 1);
     assert_eq!(runtime.counters().deferred, 1);
     runtime.stage_committed(&snapshot(), &mut {
         // Nothing committed: everything goes back to waiting.
@@ -943,7 +978,7 @@ fn a_first_fragment_needs_room_for_the_held_fragments() {
         let bytes = Box::leak(vec![0_u8; SLOT].into_boxed_slice());
         Ipv4FragmentationRuntime::new(Ipv4FragmentationPolicy::DEFAULT, slots, bytes).unwrap()
     });
-    assert_eq!(runtime.mark_ready(0, 4, 2, known, |_, _| {}), 2);
+    assert_eq!(runtime.mark_ready(0, 4, known, |_| 2), 2);
 }
 
 #[test]
@@ -956,17 +991,17 @@ fn a_replacement_takes_from_the_sender_then_the_ingress_then_the_busiest_ingress
     let mut table = Table::new(8);
     let mut runtime = table.runtime(2, 16);
     runtime
-        .hold(&frame(wan, 60, 1), WAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(wan, 60, 1), WAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&frame(lan_a, 60, 2), LAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(lan_a, 60, 2), LAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&frame(lan_b, 60, 3), LAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(lan_b, 60, 3), LAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     assert_eq!(tags(&runtime), [1, 3]);
     runtime
-        .hold(&frame(lan_b, 60, 4), LAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(lan_b, 60, 4), LAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     assert_eq!(tags(&runtime), [1, 4]);
 
@@ -975,13 +1010,13 @@ fn a_replacement_takes_from_the_sender_then_the_ingress_then_the_busiest_ingress
     let mut table = Table::new(8);
     let mut runtime = table.runtime(1, 16);
     runtime
-        .hold(&frame(lan_a, 60, 1), LAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(lan_a, 60, 1), LAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&frame(lan_a, 60, 2), LAN, miss(OTHER, 1), |_, _| {})
+        .hold(&frame(lan_a, 60, 2), LAN, miss(OTHER, 1), |_, _, _, _| {})
         .unwrap();
     runtime
-        .hold(&frame(wan, 60, 3), WAN, miss(GW, 1), |_, _| {})
+        .hold(&frame(wan, 60, 3), WAN, miss(GW, 1), |_, _, _, _| {})
         .unwrap();
     assert_eq!(tags(&runtime), [2, 3]);
 
@@ -999,7 +1034,12 @@ fn a_replacement_takes_from_the_sender_then_the_ingress_then_the_busiest_ingress
         target: Ipv4Address,
     ) {
         runtime
-            .hold(&frame(source, 60, tag), ingress, miss(target, 1), |_, _| {})
+            .hold(
+                &frame(source, 60, tag),
+                ingress,
+                miss(target, 1),
+                |_, _, _, _| {},
+            )
             .unwrap();
     }
     hold(&mut runtime, 1, [10, 0, 0, 1], dmz, GW);
@@ -1023,10 +1063,10 @@ fn a_parked_replay_is_counted_apart_and_dropped_first_fragments_are_reported() {
             &frame([192, 168, 1, 10], 60, 1),
             LAN,
             miss(GW, 9_000),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
-    runtime.mark_ready(0, 1, 0, |_, _| ArpHoldNextHop::Known, |_, _| {});
+    runtime.mark_ready(0, 1, |_, _| ArpHoldNextHop::Known, |_| 0);
     {
         let mut batch = runtime.replay_batch();
         batch
@@ -1037,27 +1077,39 @@ fn a_parked_replay_is_counted_apart_and_dropped_first_fragments_are_reported() {
     let counters = runtime.counters();
     assert_eq!((counters.replay_parked, counters.replay_dropped), (1, 0));
 
-    // A first fragment freed (expired here) is reported with its ingress;
-    // a whole datagram is not.
+    // A first fragment freed (expired here) with an association reports
+    // it; a datagram without one does not.
     let mut first = frame([192, 168, 1, 10], 60, 2);
     first[20] = 0x20;
-    runtime.hold(&first, WAN, miss(GW, 10), |_, _| {}).unwrap();
+    runtime
+        .hold(&first, WAN, miss(GW, 10), |_, _, _, _| {})
+        .unwrap();
+    runtime.set_newest_association((7, 3));
     runtime
         .hold(
             &frame([192, 168, 1, 10], 60, 3),
             LAN,
             miss(OTHER, 10),
-            |_, _| {},
+            |_, _, _, _| {},
         )
         .unwrap();
     let mut reported = Vec::new();
     runtime.mark_ready(
         10,
         0,
-        0,
         |_, _| ArpHoldNextHop::Resolving,
-        |frame, ingress| reported.push((frame[42], ingress)),
+        |hook| {
+            if let ArpHoldFragmentHook::Dropped {
+                association,
+                generation,
+                ..
+            } = hook
+            {
+                reported.push((association, generation));
+            }
+            0
+        },
     );
-    assert_eq!(reported, [(2, WAN)]);
+    assert_eq!(reported, [(7, 3)]);
     assert_eq!(runtime.live(), 0);
 }
