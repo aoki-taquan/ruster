@@ -537,7 +537,8 @@ fn announcements_without_a_generated_arp_budget_do_not_shorten_the_waits() {
     );
     assert_eq!(outcome.status, 0, "{}", outcome.err);
     let out = &outcome.out;
-    assert_eq!(stat(out, "arp_announce.requested"), 2, "{out}");
+    // Not even requested: the stats show no never-sent work.
+    assert_eq!(stat(out, "arp_announce.requested"), 0, "{out}");
     assert_eq!(stat(out, "arp_announce.committed"), 0, "{out}");
     let timeouts = timeouts(&host.state);
     assert!(timeouts.len() >= 50, "{timeouts:?}");

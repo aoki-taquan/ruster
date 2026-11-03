@@ -487,3 +487,61 @@ fn unavailable_retries_back_off_exponentially_up_to_the_cap() {
         Some(MonotonicMillis(next + ARP_ANNOUNCE_RETRY_MS))
     );
 }
+
+/// Fails the port's frames at 0, 10, 30, and 70 ms: its next retry is at
+/// 150 ms.
+fn back_off_to_150(
+    io: &mut Io,
+    runtime: &mut ResolutionRuntime<'_>,
+    snapshot: &ForwardingSnapshot<'_>,
+) {
+    for now in [0, 10, 30, 70] {
+        assert!(tick(io, runtime, snapshot, now).is_empty());
+    }
+    assert_eq!(
+        runtime.next_announcement_due(snapshot),
+        Some(MonotonicMillis(150))
+    );
+}
+
+/// A fresh trigger on a slot that only owes a (backing-off) defense is not
+/// delayed by that backoff (#352 review L-1): the defense and the first
+/// Announcement go out at once.
+#[test]
+fn a_fresh_trigger_resets_the_retry_backoff() {
+    world!(runtime, snapshot, ArpPolicy::RFC826);
+    let mut io = Io {
+        unavailable: vec![LAN],
+        ..Io::default()
+    };
+    conflict(&mut runtime, &snapshot, LAN, 0);
+    back_off_to_150(&mut io, &mut runtime, &snapshot);
+    io.unavailable.clear();
+    assert!(
+        tick(&mut io, &mut runtime, &snapshot, 100).is_empty(),
+        "backing off"
+    );
+    assert_eq!(runtime.request_announcements(&snapshot, Some(LAN)), 1);
+    assert_eq!(tick(&mut io, &mut runtime, &snapshot, 100), [LAN, LAN]);
+}
+
+/// A new defense is not delayed by the backoff of a failing sequence
+/// (#352 review L-1).
+#[test]
+fn a_new_defense_resets_the_retry_backoff() {
+    world!(runtime, snapshot, ArpPolicy::RFC826);
+    let mut io = Io {
+        unavailable: vec![LAN],
+        ..Io::default()
+    };
+    runtime.request_announcements(&snapshot, Some(LAN));
+    back_off_to_150(&mut io, &mut runtime, &snapshot);
+    io.unavailable.clear();
+    assert!(
+        tick(&mut io, &mut runtime, &snapshot, 100).is_empty(),
+        "backing off"
+    );
+    conflict(&mut runtime, &snapshot, LAN, 100);
+    assert_eq!(tick(&mut io, &mut runtime, &snapshot, 100), [LAN, LAN]);
+    assert_eq!(runtime.announce_counters().defended, 1);
+}

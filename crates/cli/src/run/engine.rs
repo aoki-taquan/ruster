@@ -921,8 +921,11 @@ where
         // RFC 5227 §2.1/§2.3 (ARP-033): a port whose link came back up
         // announces its address from the next tick, bounded per port by
         // `[arp] announce-min-interval-ms`.
+        // Not with a generated ARP budget of 0: nothing could be sent.
         for port in link_ups.drain(..) {
-            active.request_arp_announcements(Some(port));
+            if budgets.generated_arp != 0 {
+                active.request_arp_announcements(Some(port));
+            }
         }
         // Here, between ticks, so a router stuck anywhere stops pinging.
         control.notify.watchdog(now);

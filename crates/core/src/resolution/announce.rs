@@ -273,8 +273,11 @@ pub struct ArpAnnounceCounters {
     /// [`ARP_ANNOUNCE_RETRY_MS`], doubling for each failure in a row up to
     /// [`ARP_ANNOUNCE_RETRY_MAX_MS`].
     pub unavailable: u64,
-    /// Waiting or running sequences dropped because the interface had no
-    /// IPv4 address at send time or announcements were switched off.
+    /// Owed frames dropped unsent: waiting or running sequences because
+    /// the interface had no IPv4 address at send time or announcements
+    /// were switched off, and owed defenses because the interface had no
+    /// address or `conflict-defense` was switched off by a reload. A
+    /// dropped defense counts both here and in `defended`.
     pub cancelled: u64,
     /// Conflicting ARP packets (RFC 5227 §2.4), all interfaces.
     pub conflicts: u64,
@@ -494,8 +497,12 @@ impl<'a> ResolutionRuntime<'a> {
                 return false;
             }
         } else {
-            // Idle, or only a defense owed: a new trigger.
+            // Idle, or only a defense owed: a new trigger. Backoff left
+            // from earlier failures does not delay it (a link that came
+            // back up may well have room again).
             bump(&mut self.announce_counters.requested);
+            slot.retry_shift = 0;
+            slot.retry_at = 0;
         }
         if !slot.busy() {
             self.announce_busy += 1;
@@ -579,6 +586,10 @@ impl<'a> ResolutionRuntime<'a> {
             return;
         }
         slot.last_defense = now.0;
+        // A new defense is not delayed by backoff left from earlier
+        // failures.
+        slot.retry_shift = 0;
+        slot.retry_at = 0;
         bump(&mut self.announce_counters.defended);
         if !slot.busy() {
             self.announce_busy += 1;
@@ -745,7 +756,9 @@ impl<'a> ResolutionRuntime<'a> {
 ///
 /// Returns `Ok(None)` when none is due. An allocation or build failure
 /// keeps the Announcement due and holds that port back for
-/// [`ARP_ANNOUNCE_RETRY_MS`]; the other ports are not held back.
+/// [`ARP_ANNOUNCE_RETRY_MS`], doubling for each failure in a row up to
+/// [`ARP_ANNOUNCE_RETRY_MAX_MS`] (a committed frame, a fresh trigger, or a
+/// new defense resets it); the other ports are not held back.
 pub fn execute_one_arp_announcement<I, T>(
     io: &mut I,
     runtime: &mut ResolutionRuntime<'_>,

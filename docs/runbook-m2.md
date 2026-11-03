@@ -2812,11 +2812,14 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   (`ARP_ANNOUNCE_WITHOUT_GENERATED_ARP`). A port whose generated frame
   cannot be allocated (pool empty, AF_PACKET TX ring full on an admin-down
   port) retries after 10 ms, doubling up to 1 s while it keeps failing
-  (`arp_announce.unavailable`), without holding the other ports back. A
-  document without `[tick]` (every budget 0) never sends them, and the
-  run loop does not wait for them. `arp_announce.committed` counts frames handed to
-  the backend, `accepted` and `rejected` what it did with them (a rejected
-  one is not resent). `[arp] announce = false` turns them off
+  (`arp_announce.unavailable`), without holding the other ports back; a
+  fresh trigger or a new defense starts again at 10 ms. A document
+  without `[tick]` (every budget 0) never sends them: startup and link-up
+  do not request them, and the run loop does not wait for the ones a
+  reload or a conflict still marks (they stay in `arp_announce.requested`
+  and `defended` unsent). `arp_announce.committed` counts frames handed
+  to the backend, `accepted` and `rejected` what it did with them (a
+  rejected one is not resent). `[arp] announce = false` turns them off
   (reloadable; a sequence already running stops at once). Link-up is seen
   by the link watch round (the `[watch]` link interval, about 1 s), from
   the link's admin and carrier state: a flap that goes down and up
