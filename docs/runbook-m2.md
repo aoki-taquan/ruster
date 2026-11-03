@@ -1105,7 +1105,9 @@ the address resolves. With the default `[resolution.hold]` it does:
 [resolution.hold]      # optional; absent = these defaults; restart-required
 enabled = true         # false: drop as NEIGHBOR_UNRESOLVED (the behaviour before ARP-HOLD)
 per-neighbor = 3       # 1..=64 per (egress, next hop); a new one replaces the oldest
-per-host = 16          # >= 1 per (ingress, source); beyond: drop.ARP_HOLD_HOST_LIMIT
+per-host = 16          # 1..=packets per (ingress, source); beyond: drop.ARP_HOLD_HOST_LIMIT
+per-ingress = 32       # 1..=packets per ingress interface; beyond: drop.ARP_HOLD_INGRESS_LIMIT
+                       # (default: half of packets; = packets does not partition)
 packets = 64           # 1..=64 in all; beyond: drop.ARP_HOLD_FULL
 ```
 
@@ -1124,18 +1126,25 @@ addresses on a connected network can cause: each such datagram is copied
 once (cold path) and costs a walk of at most `packets` records.
 
 Counters (`ruster-run-stats`): `arp_hold.held` (= `consume.ARP_HELD`),
-`replaced`, `refused_full`/`refused_host_limit`/`refused_too_large`
-(= `drop.ARP_HOLD_FULL`/`ARP_HOLD_HOST_LIMIT`/`ARP_HOLD_TOO_LARGE`),
+`replaced`, `refused_full`/`refused_host_limit`/`refused_ingress_limit`/`refused_too_large`
+(= `drop.ARP_HOLD_FULL`/`ARP_HOLD_HOST_LIMIT`/`ARP_HOLD_INGRESS_LIMIT`/`ARP_HOLD_TOO_LARGE`),
 `replayed` (decided again), of which `replay_sent` (staged whole),
-`replay_fragmented`, `replay_dropped` (the drop reason is counted too, for
-example a NAT mapping that expired meanwhile), `replay_unstaged` (committed
-but no fragmentation slot left), `deferred`, `failed`, `expired`, and
-`flushed`.
+`replay_fragmented`, `replay_dropped` (for example a NAT mapping that
+expired meanwhile; a replay's drops are not counted again under `drop.*`:
+the frame was already counted as `consume.ARP_HELD`), `replay_unstaged`
+(committed but no fragmentation slot left; a first fragment reserves room
+for the fragments the association table holds, so this stays 0),
+`deferred`, `failed` (the resolution failed), `cancelled` (cancelled, or the
+learned neighbour expired while the replay waited for room), `expired`, and
+`flushed`. Every bound is checked also with `enabled = false`; a bound
+above `packets` is `ARP_HOLD_BOUND_ABOVE_PACKETS` (the defaults are capped
+at `packets`), and `enabled = true` written with `[fragmentation] enabled =
+false` is `ARP_HOLD_WITHOUT_FRAGMENTATION`.
 
 | Symptom | Counters | Meaning / action |
 |---|---|---|
 | first datagrams of new flows still lost | `drop.NEIGHBOR_UNRESOLVED` | the hold is off, there is no fragmentation, or the resolution could not start (`resolution.state_full`/`action_full`, a Failed hold-down) |
-| first datagrams lost under load | `drop.ARP_HOLD_FULL`, `drop.ARP_HOLD_HOST_LIMIT` | many unresolved next hops at once (a scan of a connected network?): raise `packets`/`per-host` or find the source |
+| first datagrams lost under load | `drop.ARP_HOLD_FULL`, `drop.ARP_HOLD_HOST_LIMIT`, `drop.ARP_HOLD_INGRESS_LIMIT` | many unresolved next hops at once (a scan of a connected network, or a flood from one interface?): raise `packets`/`per-host`/`per-ingress` or find the source |
 | only the last few of a burst arrive | `arp_hold.replaced` | `per-neighbor` datagrams per next hop are kept: raise it |
 | held datagrams sent late | `arp_hold.deferred` | not enough free fragmentation slots per tick: raise `[fragmentation] datagrams` |
 | held datagrams never sent | `arp_hold.failed`, `expired`, `resolution.timed_out` | the neighbour never answered ARP |
@@ -1145,13 +1154,18 @@ for configs without `[resolution.hold]`. Datagrams that were dropped as
 `drop.NEIGHBOR_UNRESOLVED` are now held and sent, so that counter falls to
 (near) 0 and `consume.ARP_HELD` rises; firewall and NAT state for them is
 created when they are sent, not dropped. The default table adds 248320
-bytes of storage (the maximal production config is 66865856 bytes). A
-config that just fitted 64 MiB may now fail with
-`RUNTIME_STORAGE_BYTES_EXCEEDED`: lower `packets` or set `enabled = false`.
+bytes of storage (the maximal production config is 66865856 bytes). **A
+config that just fitted 64 MiB fails after the upgrade with no change of
+its own**: `stage=validate code=RUNTIME_STORAGE_BYTES_EXCEEDED
+path=resolution.hold.packets` (the path is set when the document fits
+without the hold). Lower `[resolution.hold] packets` (each slot is about
+3.8 KiB) or set `enabled = false`, before upgrading a router whose
+`ruster validate` shows `storage-bytes=` above 66860000.
 New drop codes 201 `ARP_HOLD_FULL`, 202 `ARP_HOLD_HOST_LIMIT`, 203
-`ARP_HOLD_TOO_LARGE`; new consume code `ARP_HELD`; new stats section
-`arp_hold.*`; new validation codes `ARP_HOLD_POLICY` and
-`ARP_HOLD_PACKETS_ZERO`. To keep the old behaviour set
+`ARP_HOLD_TOO_LARGE`, 204 `ARP_HOLD_INGRESS_LIMIT`; new consume code
+`ARP_HELD`; new stats section `arp_hold.*`; new validation codes
+`ARP_HOLD_POLICY`, `ARP_HOLD_PACKETS_ZERO`, `ARP_HOLD_BOUND_ABOVE_PACKETS`,
+and `ARP_HOLD_WITHOUT_FRAGMENTATION`. To keep the old behaviour set
 `[resolution.hold] enabled = false` (restart).
 
 ### Startup retry (XDP-045)

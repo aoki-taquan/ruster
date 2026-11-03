@@ -243,7 +243,13 @@ next hopがstaticか生きたdynamic neighborになったものを、hold無し�
 MTU2のfragmentation slotへstageし、同じtickの最後のgenerated fragment phase（router自身のARP/ICMPの後、
 `[tick] generated-fragments`の範囲）が送ります。DF=0でMTUを超えるものはそこでfragmentします。
 next hopごとに`per-neighbor`（3）個まで（超えると最古を置き換え、最新を残す）、(ingress, source)ごとに
-`per-host`（16）個まで（`ARP_HOLD_HOST_LIMIT`）、全体で`packets`（64）個まで（`ARP_HOLD_FULL`）。
+`per-host`（16）個まで（`ARP_HOLD_HOST_LIMIT`）、ingress interfaceごとに`per-ingress`（32）個まで
+（`ARP_HOLD_INGRESS_LIMIT`。sourceを詐称した一つのinterfaceからのfloodが他のinterfaceのholdを奪わない）、
+全体で`packets`（64）個まで（`ARP_HOLD_FULL`）。boundは`enabled = false`でも検証し、`packets`を超えるboundは
+`ARP_HOLD_BOUND_ABOVE_PACKETS`、`[fragmentation]` offで`enabled = true`を明示すると
+`ARP_HOLD_WITHOUT_FRAGMENTATION`です。upgrade注意: default storageが248320 bytes増えるので、64 MiBぎりぎりの
+configは変更なしに`RUNTIME_STORAGE_BYTES_EXCEEDED path=resolution.hold.packets`になります（`packets`を下げるか
+`enabled = false`）。
 resolutionが失敗したもの、cancelされたもの、`interval × max-attempts`を過ぎたものは捨てます。
 directly-connected targetのfruitlessなresolutionには従来どおり、最初のeligible missの最大548-byte
 quote（別slot）から、少なくとも一つaccepted ARP Requestを含むgenerationの後にbounded dispatchで
@@ -254,7 +260,8 @@ apply（SIGHUP reload）はholdを全て捨てます。
 [resolution.hold]                   # 省略時は全項目default（on）。変更はrestart-required
 enabled = true                      # 省略時true（RFC 1122/1812のSHOULD）。falseはhold無しでNEIGHBOR_UNRESOLVED
 per-neighbor = 3                    # 省略時3、1〜64。(egress, next hop)ごと。超えると最古を置き換え
-per-host = 16                       # 省略時16、1以上。(ingress, source)ごと。超えるとARP_HOLD_HOST_LIMIT
+per-host = 16                       # 省略時16、1〜packets。(ingress, source)ごと。超えるとARP_HOLD_HOST_LIMIT
+per-ingress = 32                    # 省略時packetsの半分、1〜packets。ingress interfaceごと。超えるとARP_HOLD_INGRESS_LIMIT
 packets = 64                        # 省略時64、1〜64。全体。超えるとARP_HOLD_FULL。[fragmentation] offではholdしない
 ```
 
