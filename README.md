@@ -339,8 +339,11 @@ protocol, ID）に記録し、同じdatagramの後続fragmentは同じ書き換�
 `IPV4_FRAGMENT_HELD`でbackendへ返し、最初のfragmentの許可で同じtickのfragment phaseから送ります
 （拒否かtimeoutで破棄）。transport headerの中から始まるfragment（RFC 1858/3128）は
 `IPV4_FRAGMENT_TRANSPORT_HEADER_OVERLAP`、decided datagramの二つ目の最初のfragmentは
-`IPV4_FRAGMENT_DUPLICATE_FIRST`、RFC 791の構造違反は`IPV4_FRAGMENT_MALFORMED`、table/held/host上限は
-`IPV4_FRAGMENT_TABLE_FULL`、`HOST_LIMIT`、`HOLD_FULL`、`HOST_HOLD_LIMIT`、`HOLD_TOO_LARGE`です。
+`IPV4_FRAGMENT_DUPLICATE_FIRST`（byte一致の重複以外はassociationをpoisonし、同じkeyの両datagramの残りを拒否。
+keyはportを含まないのでIDの再利用や二hostへの同じIDの応答を混ぜない）、RFC 791の構造違反は`IPV4_FRAGMENT_MALFORMED`、table/held/host上限は
+`IPV4_FRAGMENT_TABLE_FULL`、`HOST_LIMIT`、`HOLD_FULL`、`HOST_HOLD_LIMIT`、`HOLD_TOO_LARGE`です
+（host単位は(ingress, source)。tableかhostの上限では最古のpending/deny associationをevictし、allowはevictしない。
+完了は0から終端までの全byteを重複なしに数え、終端と矛盾するfragmentは`IPV4_FRAGMENT_MALFORMED`でpoison）。
 routerのlocal address宛てのfragmentは対象外（reassembly未実装）。apply（SIGHUP reload）で全associationを
 破棄します。fragmentでないframeのfast pathはflags wordの一回の読みだけです。
 
@@ -1041,7 +1044,7 @@ sudo kill -HUP <pid>                                               # configをre
   directory、port poolを含む）は65536 slotまでです。packet pathでtable全体をscanする処理は
   ありません（PERF-001。NAT44はH4a、resolution/ICMPv4 errorはH4bでkeyed index化。想定traffic
   に合わせて設定する）。runtime storageの合計は64 MiBまで（`run-sim`と同じ）。全tableを
-  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`を含む）のstorageは62.59 MiBです。storageは
+  上限にしたconfig（`fixtures/limits/router-production-max.toml`、`[fragmentation] datagrams = 1024`と`[fragment-tracking] entries = 16384, held-fragments = 512`を含む）のstorageは63.41 MiBです。storageは
   通常のheap（memlockではない）で起動時に一度だけ確保し、`validate`の`storage-bytes=`がその量です。
   最悪のRAMはstorage 64 MiB + UMEM（最大1 GiB、memlock。`auto`のcopy fallback中は2倍で2 GiB）+
   config数MiB。超過は`stage=validate code=CAPACITY_LIMIT_EXCEEDED path=<field> limit=<上限>

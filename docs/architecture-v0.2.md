@@ -518,7 +518,8 @@ in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの�
   `admit_first_fragment`でL2/IPv4 ingressの検査、RFC 791の構造（MF付きのdataは8の倍数）と
   tableのroom（空きentry、`entries-per-host`）を確かめます（何も変えない。拒否は
   `IPV4_FRAGMENT_TABLE_FULL`/`HOST_LIMIT`）。decided datagramへの二つ目の最初のfragmentは
-  `IPV4_FRAGMENT_DUPLICATE_FIRST`（RFC 1858 §4のoverlapで判定後のheaderを差し替えさせない）。
+  `IPV4_FRAGMENT_DUPLICATE_FIRST`で、byte一致（長さと先頭8 data byte）の重複ならそれだけを捨て、
+  それ以外はentryをpoisonします（下の「同じkeyの二つのdatagram」）。
   その後は通常の`decide`を`ValidatedIpv4::first_fragment = true`で通し、firewallとNATのvalidatorは
   header（UDP 8、ICMP query 8、TCPはdata offset分のoptionsまで）だけを検証し、datagram全体を覆う
   transport checksumとUDP lengthの上限は見ません（UDP lengthはfragmentのdataより長くなければならない）。
@@ -550,8 +551,19 @@ in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの�
   順序の崩れた分だけをholdし、in-orderは一つもcopyしません。(c) dropはREQ-14のMUSTに反します。
   `[fragmentation] enabled = false`ではheld slotを持たず（releaseの出口が無い）、先に届いた後続
   fragmentは`IPV4_FRAGMENT_HOLD_FULL`です。
-- **bounds**: entry数（`entries`）、sourceごとのentry（`entries-per-host`）、held数
-  （`held-fragments`）、sourceごとのheld（`held-per-host`）、held slotの長さ（fragmentation slotと同じ。
+- **同じkeyの二つのdatagram**（review #337 M-A）: keyはportを含まないので、失われたfragmentの後に
+  IDを再利用したdatagramや、一つのpublic addressの裏の二hostへserverが同じIDで返す応答は一つの
+  keyになります。二つ目の別の最初のfragmentはentryをpoison（Denyに固定し早期解放しない）し、両
+  datagramの残りを全て拒否します（fail closed。templateとIDを他のdatagramへ流用しない）。
+- **完了判定**（review #337 M-B）: entryは最大4つの離れたdata範囲を保ち（RFC 815のhole listの裏返し、
+  重複とoverlapは一度だけ数える）、0から終端までを覆った時だけ早期解放します。終端はMF=0の最初の
+  fragmentで固定し、別の終端や終端を越えるdataは`IPV4_FRAGMENT_MALFORMED`でpoisonします。5つ以上に
+  分かれたdatagramはtimeoutまで解放しません。
+- **bounds**: entry数（`entries`）、(ingress, source)ごとのentry（`entries-per-host`）、held数
+  （`held-fragments`）、(ingress, source)ごとのheld（`held-per-host`）。tableかhostのquotaが満ちると
+  最古のpending/deny entryを（その全体かそのhostの）evict listからO(1)でevictし、allow entryは
+  evictしません（後続を転送するのはallow templateだけなので、evictは後続を拒否か新しいholdにするだけ）。
+  WANからのfloodが作れるのはevictできるentryだけなので、ingressごとのreservationは置きません。held slotの長さ（fragmentation slotと同じ。
   超過は`IPV4_FRAGMENT_HOLD_TOO_LARGE`、production portからは起きない）。entryは最初に見たfragmentから
   `timeout-ms`で失効し延長しません。全entryの寿命が同じなので作成順に失効し、age list（entryに
   intrusiveなdoubly-linked list）の先頭から失効させるだけでscanはありません（操作ごとに最大2件、
@@ -568,7 +580,9 @@ in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの�
 - **hardening switch**: `[fragment-tracking] mode = "refuse"`はtableを持たず、NAT-FRAG前どおり全受信
   fragmentを拒否します（`FIREWALL_FRAGMENT_UNSUPPORTED`が先）。
 
-残余: spoof可能なsourceによるtableとheldの占有（global上限が最後の防御、timeoutの間だけ）、IDを当てた
+残余: spoof可能なsourceによるheld slotの占有とpending entryのevict（global上限が最後の防御、timeoutの間だけ）、
+pending entryはheld fragmentがどのdatagramのものか区別できない、allow entryはfirewall stateの終了や
+MAC変更の後もtimeoutまで残る、IDを当てた
 第三者による後続fragmentの注入（header外のdataのみ。stateless routerと同じで受信側の再構成と
 checksumが検出）、翻訳するICMPv4 errorのfragmentは引き続き拒否、releaseはtemplateのMACを再解決しない、
 R16Aのfragment targetは無い（io-simのbounded property testで代替）、multi-workerではworker間で
