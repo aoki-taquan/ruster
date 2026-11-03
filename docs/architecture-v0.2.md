@@ -475,7 +475,9 @@ datagramも収め、DF=1と同じくDF=0も大きさで落とさない。AF_PACK
    `execute_one_ipv4_fragmentation`がslotごとにegressの`begin_generated`を開き、
    `GeneratedPacketBatch::check_capacity(n, 最初のfragment長)`でset全体のroomを確かめてから
    一枚ずつexact長でallocate、RFC 791どおり書き込み、commitします。roomが無ければ何も送らず
-   datagramを捨てます（`dropped_unavailable`。AF_XDPはrouter reserveをsetに渡さない）。
+   datagramを捨てます（`dropped_unavailable`。AF_XDPとAF_PACKETはrouter自身のsingle frame用の
+   reserveをpoolとTX roomからsetに渡さない）。tickのbudgetを超えるfragment数のdatagramは送れないので
+   RX phaseのadmissionで`TOO_MANY_FRAGMENTS`としてcommit前に拒否します。
    `[tick] generated-fragments`のframe budgetに収まらないsetはsessionを開かず丸ごと捨てます
    （`dropped_budget`）。generated phaseがskipされるtickはphaseをskipしてflushし、finish errorや
    accounting違反は残りをflushします。stageした
@@ -2263,10 +2265,13 @@ zeroであることを固定します。
 
 `TickBudgets`はRX packet数、resolution timer scan、failure dispatch scan、generated ARP action、
 generated ICMPv4 action、generated fragment frame（`generated_fragments`、MTU2 part B）を
-独立に制限します。generated fragment phaseはtickの最後（ARP/ICMPv4の後、review M）で、forwardした
-fragmentがrouter自身のframeのroomを奪いません。budgetに収まらないsetは丸ごと捨てて数えます
-（`dropped_budget`）。generated phaseがskipされるtickはskipしてstageをflushし、finish error/
-accounting違反は残りをflushします。RX batchはlexical scopeでwrapperへmoveし、
+独立に制限します。generated fragment phaseはtickの最後（ARP/ICMPv4の後、review M）で、tick内では
+router自身のframeが先に出ます。backendはrouter reserveをsetに渡さないので、in-flightのfragmentが
+次のtickのrouter frameの分まで取ることもありません。budgetは全sourceとegressで共有する一つのFIFO
+poolで（source単位のfairnessは無い）、収まらないsetは丸ごと捨てて数え（`dropped_budget`）、budget
+全体より大きいsetはRX phaseのadmissionで拒否します。それ以前のgenerated phaseがskipされたか
+backend failure（ICMPv4 phaseのfinish error、accounting違反、clock regressionを含む）で終わった
+tickはskipしてstageをflushし、自身のfinish error/accounting違反は残りをflushします。RX batchはlexical scopeでwrapperへmoveし、
 `finish`後にだけgenerated I/Oを再borrowします。generated allocation/build/finish errorは同じ
 tickで同じpending actionを再試行せず、そのphaseを一回で停止します。accounting invariant違反は
 backend contract failureとして以後のgenerated phaseを停止します。固定サイズreportとphase

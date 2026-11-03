@@ -317,7 +317,7 @@ fragmentationの上限とslotを確かめ（拒否は`IPV4_FRAGMENTATION_TOO_MAN
 同じtickの最後（router自身のARP/ICMPの後）のgenerated fragment phaseが、`[tick] generated-fragments`
 （省略時64 frame、1〜65536。収まらないsetは丸ごとdrop、`fragmentation.dropped_budget`）の範囲で、
 egressのgenerated sessionにset全体のroomを`check_capacity`で確かめてから（roomが無ければ一枚も送らない。
-AF_XDPはARP/ICMP用のrouter reserveをsetに渡さない）、RFC 791どおりのfragment（最後以外は
+AF_XDPとAF_PACKETはARP/ICMP用のrouter reserveをsetに渡さない）、RFC 791どおりのfragment（最後以外は
 8の倍数のdata、同じID、MF/offset、checksum再計算）を送ります。受信fragmentはfirewallが先に拒否し、
 optionsは従来どおり拒否なので再fragmentやoption copyは起きません。
 

@@ -749,12 +749,24 @@ DF (that gets Fragmentation Needed, above).
   the same backend-owned generated-frame path (`generated_fragments.*`, the
   frames show as `origin=generated`), at most `[tick]
   generated-fragments` frames per tick (default 64, 1 to 65536; a set that
-  does not fit what is left is dropped whole, `fragmentation.dropped_budget`).
-  It first asks the backend for room for the whole set (on AF_XDP leaving
-  the router reserve of the pool free for ARP and ICMP); without room it
+  does not fit what is left is dropped whole, `fragmentation.dropped_budget`;
+  a datagram needing more fragments than the whole budget can never be sent
+  and is refused before any commit as
+  `drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS`). The budget is one FIFO
+  pool per tick shared by every source and egress, with no per-source
+  fairness: one heavy sender can use it up (residual). A set that the
+  backend then refuses for room still used its share of the budget.
+  It first asks the backend for room for the whole set, leaving a router
+  reserve free for single router frames (ARP, ICMP errors): AF_XDP keeps
+  `max(2, generated-frames / 8)` generated frames and as many TX ring
+  slots, AF_PACKET `max(2, TX ring frames / 8)` TX frames. Without room it
   sends nothing (`fragmentation.dropped_unavailable`): the router never
-  sends a partial fragment set for lack of TX room, and forwarded
-  fragments never starve the router's own frames. The
+  sends a partial fragment set for lack of room. What is guaranteed: in a
+  tick the router's own ARP requests and ICMP errors go first, and
+  fragments in flight never take the reserve, so the next tick's router
+  frames find at least the reserve; beyond it, size the TX ring for
+  `rx` + `generated-arp` + `generated-icmpv4` + `generated-fragments` plus
+  headroom for completions that lag. The
   NAT and firewall state of such a datagram stays committed, as for a
   forwarded frame the backend refuses.
 - Layout: every fragment but the last carries the largest multiple of 8
@@ -795,13 +807,18 @@ datagrams = 64                      # default 64, 1..=1024; slots per tick
 - `max-fragments-per-datagram` bounds the fragments of one datagram
   (`drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS` above it). The default
   1365 is the most any IPv4 datagram can need (65535 bytes at the minimum
-  MTU 68), so by default every datagram RFC 1812 requires the router to
-  fragment is fragmented. Real links need far fewer: 1500 → 1280 or 1400
-  needs 2, 1500 → 576 3, 9000 → 1500 7. Lower it to bound the packet
-  amplification of an unusually small egress MTU.
+  MTU 68). The real ceiling per datagram is min(this, `[tick]
+  generated-fragments` (default 64), the slot, the egress room): with the
+  defaults a datagram needing more than 64 fragments (9000 → 140 or less,
+  for example) is refused, and raising `generated-fragments` raises it.
+  Real links need far fewer: 1500 → 1280 or 1400 needs 2, 1500 → 576 3,
+  9000 → 1500 7. Lower it to bound the packet amplification of an
+  unusually small egress MTU.
 - `datagrams` is the number of datagrams one tick can fragment
   (`drop.IPV4_FRAGMENTATION_QUEUE_FULL` beyond). Keep it at least `[tick]
-  rx` if most of your traffic needs fragmentation (a PPPoE or tunnel WAN
+  rx`, and `[tick] generated-fragments` at least `rx` × the fragments per
+  datagram of your links (2 for 1500 over 1280 or 1400), if most of your
+  traffic needs fragmentation (a PPPoE or tunnel WAN
   link below 1500 with senders that do not use PMTUD). Each slot holds the
   longest datagram the router can receive: the largest of the largest
   interface `mtu`, 3826 bytes (the most a 4096-byte AF_XDP frame
