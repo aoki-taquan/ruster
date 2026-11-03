@@ -1823,6 +1823,22 @@ fn validate_v1(
                             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
                             generate.fragmentation_needed,
                         )
+                        .with_generation(
+                            Icmpv4ErrorKind::DestinationUnreachableProtocol,
+                            generate.protocol_unreachable,
+                        )
+                        .with_generation(
+                            Icmpv4ErrorKind::DestinationUnreachableLocalPort,
+                            generate.udp_port_unreachable,
+                        )
+                        .with_generation(
+                            Icmpv4ErrorKind::ParameterProblem,
+                            generate.parameter_problem,
+                        )
+                        .with_generation(
+                            Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+                            generate.admin_prohibited,
+                        )
                 })
                 .map_err(|error| {
                     ValidationError::new(

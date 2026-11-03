@@ -124,6 +124,42 @@ pub fn validate_ipv4_frame(frame: &[u8]) -> Result<ValidatedIpv4, DropReason> {
     })
 }
 
+/// The header of an IPv4 frame that [`validate_ipv4_frame`] refused only as
+/// [`DropReason::Ipv4TotalLengthExceedsPacket`]: version 4, IHL at least 5
+/// and within the frame, Total Length at least the header, and a valid
+/// header checksum (checked here: [`validate_ipv4_frame`] stops at the
+/// length). `total_len` is the claimed Total Length, longer than the frame
+/// carries. Cold: only the Parameter Problem about a truncated datagram
+/// (RFC 1812 §5.2.2, ICMP-ERR) uses it.
+pub(crate) fn validate_truncated_ipv4_header(frame: &[u8]) -> Option<ValidatedIpv4> {
+    let first = *frame.get(ETHERNET_HEADER_LEN)?;
+    if first >> 4 != 4 || first & 0x0f < 5 {
+        return None;
+    }
+    let header_len = usize::from(first & 0x0f) * 4;
+    let header = frame.get(ETHERNET_HEADER_LEN..ETHERNET_HEADER_LEN + header_len)?;
+    let total_len = usize::from(read_u16(frame, ETHERNET_HEADER_LEN + 2)?);
+    if total_len < header_len
+        || total_len <= frame.len() - ETHERNET_HEADER_LEN
+        || crate::ipv4_header_checksum(header) != 0
+    {
+        return None;
+    }
+    Some(ValidatedIpv4 {
+        header_offset: ETHERNET_HEADER_LEN,
+        header_len,
+        total_len,
+        ttl: header[8],
+        protocol: header[9],
+        source: crate::Ipv4Address::from_octets([header[12], header[13], header[14], header[15]]),
+        destination: crate::Ipv4Address::from_octets([
+            header[16], header[17], header[18], header[19],
+        ]),
+        checksum: read_u16(header, 10)?,
+        first_fragment: false,
+    })
+}
+
 /// Validates the common Ethernet/IPv4 ARP Request/Reply profile.
 ///
 /// The target hardware address is intentionally ignored as required by

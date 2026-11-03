@@ -600,6 +600,27 @@ pub struct Icmpv4ErrorGenerateV1 {
     /// off black-holes Path MTU Discovery (RFC 1191) through the router.
     #[serde(default = "enabled")]
     pub fragmentation_needed: bool,
+    /// Destination Unreachable, Protocol Unreachable (Type 3/Code 2) for a
+    /// datagram addressed to the router whose IP protocol it does not
+    /// implement (ICMP-ERR).
+    #[serde(default = "enabled")]
+    pub protocol_unreachable: bool,
+    /// Destination Unreachable, Port Unreachable (Type 3/Code 3) for a UDP
+    /// datagram addressed to the router (no UDP port is open). The TCP
+    /// NAT's Port Unreachable for unsolicited SYNs is
+    /// `[nat44.tcp.policy] unsolicited-syn-icmp`, not this switch.
+    #[serde(default = "enabled")]
+    pub udp_port_unreachable: bool,
+    /// Parameter Problem (Type 12/Code 0) for a truncated datagram (Total
+    /// Length past the frame) or malformed IPv4 options (ICMP-ERR).
+    #[serde(default = "enabled")]
+    pub parameter_problem: bool,
+    /// Destination Unreachable, Communication Administratively Prohibited
+    /// (Type 3/Code 13) for a datagram the forward firewall denies. Default
+    /// `false`: a deny stays a silent drop (RFC 1812 §5.2.7.1 allows this
+    /// option; owner decision).
+    #[serde(default)]
+    pub admin_prohibited: bool,
 }
 
 impl Default for Icmpv4ErrorGenerateV1 {
@@ -609,6 +630,10 @@ impl Default for Icmpv4ErrorGenerateV1 {
             net_unreachable: true,
             host_unreachable: true,
             fragmentation_needed: true,
+            protocol_unreachable: true,
+            udp_port_unreachable: true,
+            parameter_problem: true,
+            admin_prohibited: false,
         }
     }
 }

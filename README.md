@@ -32,7 +32,7 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   TTL/checksum/MAC rewrite、local IPv4向けARP reply、static neighbor miss時の
   ARP Request生成action、解決中のnext hopへのdatagramの有界なholdとreplay（ARP-HOLD）、
   fixed-capacity dynamic ARP cache、local ICMPv4 Echo
-  responder、ICMPv4 Time Exceeded / Destination Unreachable生成、opt-inの
+  responder、ICMPv4 Time Exceeded / Destination Unreachable / Parameter Problem生成、opt-inの
   single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
   stateful forward firewall、forwardしたDF=0 datagramのfragmentation（MTU2 part B）、受信fragmentを
   最初のfragmentの判定へ結びつけるfragment association（NAT-FRAG）と、それらを一workerへbindする
@@ -290,8 +290,11 @@ staticまたはfresh dynamic neighborが無い場合はARPだけを開始し、�
 所有し、link paddingを含みません。
 
 routerが自身で生成するICMPv4（Echo Reply、Time Exceeded、Destination Unreachable
-Network/Host）はすべてdefaultでRFC 1812どおり生成し、security上の理由でclassごとにoffに
-できます（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。offにしたerror class
+Network/Host/Fragmentation Needed、ICMP-ERRのProtocol Unreachable、router宛てUDPのPort
+Unreachable、Parameter Problem）はすべてdefaultでRFC 1812どおり生成し、security上の理由で
+classごとにoffにできます（RFC 1812 §1.1.3はdefaultが準拠するoptionを許す）。firewall denyへの
+Communication Administratively Prohibited（Type 3/Code 13）だけはdefault offです（RFC 1812
+§5.2.7.1が生成しないoptionをMAYで認める。denyはsilent dropのまま、owner決定待ち）。offにしたerror class
 （Time Exceeded、Network/Host Unreachable）は元packetのbyte不変drop reasonを変えず、ICMPも
 reverse ARPも生成せず、rate limiterとclockにも触れずに専用counterだけを加算します。Echoをoffに
 すると、valid Echo Requestは新しいreason `ICMPV4_ECHO_DISABLED`でdropされます。
@@ -306,7 +309,22 @@ time-exceeded = true       # Type 11/Code 0  -> icmpv4_errors.disabled_time_exce
 net-unreachable = true     # Type 3/Code 0   -> icmpv4_errors.disabled_destination_unreachable
 host-unreachable = true    # Type 3/Code 1   -> icmpv4_errors.disabled_host_unreachable
 fragmentation-needed = true # Type 3/Code 4  -> icmpv4_errors.disabled_fragmentation_needed
+protocol-unreachable = true # Type 3/Code 2  router宛ての未実装protocol（ICMP-ERR）
+udp-port-unreachable = true # Type 3/Code 3  router宛てUDP（routerにUDP serviceは無い）
+parameter-problem = true   # Type 12/Code 0 Total Length > frame（pointer 2）、壊れたIPv4 option
+admin-prohibited = false   # Type 3/Code 13 firewall deny（default off: silent drop）
 ```
+
+ICMP-ERRで、router宛て（ingress interfaceのaddress）のfragmentでないdatagramは、UDPなら
+`IPV4_LOCAL_UDP_PORT_UNREACHABLE`（header/checksumが壊れていれば無応答の`IPV4_LOCAL_UDP_INVALID`）、
+TCPなら無応答の`IPV4_LOCAL_TCP_UNSUPPORTED`（closed portへの応答はRSTでICMPではなく、routerは
+TCPを生成しない）、ICMP/TCP/UDP以外は`IPV4_LOCAL_PROTOCOL_UNREACHABLE`でdropします（以前は
+`IPV4_LOCAL_UNSUPPORTED`でconsume）。Parameter ProblemはTotal Lengthがframeより長いdatagram
+（header checksumが正しいときだけ、RFC 1812 §5.2.2）と壊れたoption・二つ目のsource route・router宛て
+でないstrict source route（drop reasonは`IPV4_OPTIONS_UNSUPPORTED`のまま）に返します。どれも
+既存kindと同じlimiter class 0、suppression、reverse route、quote規則を使い、storageは増えません。
+errorは受信したままのdatagramを引用してsenderの側へ返るのでNAT翻訳は不要です。詳細は
+runbookの「Errors about datagrams for the router and bad headers (ICMP-ERR)」。
 
 interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は
 `INTERFACES`のrestart-required）です。forwardingはTTL判定とfirewallの後、NAT/firewall stateを

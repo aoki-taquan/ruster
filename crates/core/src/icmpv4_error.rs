@@ -39,51 +39,98 @@ pub enum Icmpv4ErrorKind {
     /// ([`Icmpv4ErrorPolicy::with_fragmentation_needed_interval_ms`]), so a
     /// flood of other errors (a TTL sweep) never starves Path MTU Discovery.
     DestinationUnreachableFragmentationNeeded,
+    /// Destination Unreachable, Protocol Unreachable (Type 3, Code 2): a
+    /// datagram addressed to the router carries an IP protocol the router
+    /// does not implement (RFC 1812 §5.2.7.1, RFC 1122 §3.2.2.1). Shares
+    /// limiter class 0.
+    DestinationUnreachableProtocol,
+    /// Destination Unreachable, Port Unreachable (Type 3, Code 3) about a
+    /// UDP datagram addressed to the router: no UDP port is open on the
+    /// router (RFC 1812 §5.2.7.1, RFC 1122 §§3.2.2.1, 4.1.3.1). Separate
+    /// from [`Self::DestinationUnreachablePort`] (the TCP NAT's delayed
+    /// answer), so each has its own switch and counters. Shares limiter
+    /// class 0.
+    DestinationUnreachableLocalPort,
+    /// Parameter Problem, pointer indicates the error (Type 12, Code 0): a
+    /// datagram whose IPv4 header the router cannot process (RFC 1812
+    /// §§4.3.3.5, 5.2.2, 5.2.4.1). The action carries the pointer to the
+    /// offending octet in the first octet of the second ICMP header word
+    /// (RFC 792). Shares limiter class 0.
+    ParameterProblem,
+    /// Destination Unreachable, Communication Administratively Prohibited
+    /// (Type 3, Code 13): the forward firewall denied the datagram (RFC
+    /// 1812 §5.2.7.1). Off by default (RFC 1812 §5.2.7.1 allows the option
+    /// that suppresses it; owner decision). Shares limiter class 0.
+    DestinationUnreachableAdministrativelyProhibited,
 }
 
 impl Icmpv4ErrorKind {
     const fn icmp_type(self) -> u8 {
         match self {
             Self::TimeExceededTtl => 11,
+            Self::ParameterProblem => 12,
             Self::DestinationUnreachableNetwork
             | Self::DestinationUnreachableHost
             | Self::DestinationUnreachablePort
-            | Self::DestinationUnreachableFragmentationNeeded => 3,
+            | Self::DestinationUnreachableFragmentationNeeded
+            | Self::DestinationUnreachableProtocol
+            | Self::DestinationUnreachableLocalPort
+            | Self::DestinationUnreachableAdministrativelyProhibited => 3,
         }
     }
 
     const fn icmp_code(self) -> u8 {
         match self {
             Self::DestinationUnreachableHost => 1,
-            Self::DestinationUnreachablePort => 3,
+            Self::DestinationUnreachableProtocol => 2,
+            Self::DestinationUnreachablePort | Self::DestinationUnreachableLocalPort => 3,
             Self::DestinationUnreachableFragmentationNeeded => 4,
-            Self::TimeExceededTtl | Self::DestinationUnreachableNetwork => 0,
+            Self::DestinationUnreachableAdministrativelyProhibited => 13,
+            Self::TimeExceededTtl
+            | Self::DestinationUnreachableNetwork
+            | Self::ParameterProblem => 0,
         }
     }
 
     /// The limiter class: a limiter state is keyed by egress and class.
     /// Port Unreachable (1) and Fragmentation Needed (2) have their own
-    /// classes; every other kind shares class 0.
+    /// classes; every other kind shares class 0 (so the ICMP-ERR kinds add
+    /// no limiter state and no `states` capacity requirement).
     const fn limiter_class(self) -> u8 {
         match self {
             Self::DestinationUnreachablePort => 1,
             Self::DestinationUnreachableFragmentationNeeded => 2,
             Self::TimeExceededTtl
             | Self::DestinationUnreachableNetwork
-            | Self::DestinationUnreachableHost => 0,
+            | Self::DestinationUnreachableHost
+            | Self::DestinationUnreachableProtocol
+            | Self::DestinationUnreachableLocalPort
+            | Self::ParameterProblem
+            | Self::DestinationUnreachableAdministrativelyProhibited => 0,
         }
     }
 
-    const fn generation_bit(self) -> u8 {
+    const fn generation_bit(self) -> u16 {
         match self {
             Self::TimeExceededTtl => 1,
             Self::DestinationUnreachableNetwork => 1 << 1,
             Self::DestinationUnreachableHost => 1 << 2,
             Self::DestinationUnreachablePort => 1 << 3,
             Self::DestinationUnreachableFragmentationNeeded => 1 << 4,
+            Self::DestinationUnreachableProtocol => 1 << 5,
+            Self::DestinationUnreachableLocalPort => 1 << 6,
+            Self::ParameterProblem => 1 << 7,
+            Self::DestinationUnreachableAdministrativelyProhibited => 1 << 8,
         }
     }
 }
+
+/// Kinds a default policy does not generate: only Communication
+/// Administratively Prohibited (RFC 1812 §5.2.7.1 allows an option that
+/// suppresses it; a firewall deny stays a silent drop unless the operator
+/// opts in).
+const DEFAULT_DISABLED: u16 =
+    Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited.generation_bit();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Icmpv4ErrorPolicyError {
@@ -97,8 +144,10 @@ pub enum Icmpv4ErrorPolicyError {
 /// Rate-limit policy and per-kind generation switches for router-originated
 /// ICMPv4 errors.
 ///
-/// Every kind is generated by default, which is the RFC 1812 behavior
-/// (§5.3.1 Time Exceeded and §5.2.7.1 Destination Unreachable are MUSTs).
+/// Every kind except Communication Administratively Prohibited is generated
+/// by default, which is the RFC 1812 behavior (§5.3.1 Time Exceeded and
+/// §5.2.7.1 Destination Unreachable are MUSTs; §5.2.7.1 explicitly allows
+/// the option that suppresses Code 13, which is the default here).
 /// RFC 1812 §1.1.3 allows an operator option that violates a MUST only when
 /// its default conforms, so [`Self::with_generation`] can turn one kind off
 /// for security reasons. A disabled kind is suppressed before the limiter,
@@ -109,7 +158,7 @@ pub struct Icmpv4ErrorPolicy {
     port_unreachable_interval_ms: u64,
     fragmentation_needed_interval_ms: u64,
     state_ttl_ms: u64,
-    disabled: u8,
+    disabled: u16,
     translated_rate_per_second: u32,
     translated_burst: u32,
 }
@@ -139,7 +188,7 @@ impl Icmpv4ErrorPolicy {
             port_unreachable_interval_ms: ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
             fragmentation_needed_interval_ms: ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS,
             state_ttl_ms,
-            disabled: 0,
+            disabled: DEFAULT_DISABLED,
             translated_rate_per_second: ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
             translated_burst: ICMPV4_DEFAULT_TRANSLATED_BURST,
         })
@@ -287,7 +336,8 @@ impl Icmpv4ErrorPolicy {
         }
     }
 
-    /// Whether errors of `kind` are generated (default: every kind).
+    /// Whether errors of `kind` are generated (default: every kind but
+    /// [`Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited`]).
     #[must_use]
     pub const fn generates(self, kind: Icmpv4ErrorKind) -> bool {
         self.disabled & kind.generation_bit() == 0
@@ -311,7 +361,7 @@ impl Default for Icmpv4ErrorPolicy {
             port_unreachable_interval_ms: ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
             fragmentation_needed_interval_ms: ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS,
             state_ttl_ms: 60_000,
-            disabled: 0,
+            disabled: DEFAULT_DISABLED,
             translated_rate_per_second: ICMPV4_DEFAULT_TRANSLATED_RATE_PER_SECOND,
             translated_burst: ICMPV4_DEFAULT_TRANSLATED_BURST,
         }
@@ -328,10 +378,13 @@ pub struct Icmpv4ErrorAction {
     pub destination_ip: Ipv4Address,
     pub outer_tos: u8,
     pub outer_ttl: u8,
-    /// Next-Hop MTU (RFC 1191 §4) written to bytes 6..8 of the ICMP header
-    /// of [`Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded`];
-    /// 0 (the RFC 792 unused field) for every other kind.
-    next_hop_mtu: u16,
+    /// The kind-specific value of the second ICMP header word: the Next-Hop
+    /// MTU (RFC 1191 §4, bytes 6..8) of
+    /// [`Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded`], the
+    /// pointer (RFC 792, byte 4) of [`Icmpv4ErrorKind::ParameterProblem`];
+    /// 0 (the RFC 792 unused field) for every other kind. One field for
+    /// both keeps the action slot size unchanged.
+    header_value: u16,
     /// [`Self::fit_egress_mtu`] could not keep the RFC 792 minimum quote
     /// (the original IPv4 header and 8 data bytes); the runtime suppresses
     /// the action ([`Icmpv4ErrorDisposition::QuoteBelowMinimum`]).
@@ -389,7 +442,7 @@ impl Icmpv4ErrorAction {
             destination_ip,
             outer_tos: (original_tos & 0x1e) | 0xc0,
             outer_ttl,
-            next_hop_mtu: 0,
+            header_value: 0,
             quote_below_minimum: false,
             quote_len: quote_len as u16,
             quote,
@@ -405,7 +458,7 @@ impl Icmpv4ErrorAction {
             self.kind,
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded
         ) {
-            self.next_hop_mtu = mtu;
+            self.header_value = mtu;
         }
         self
     }
@@ -414,7 +467,37 @@ impl Icmpv4ErrorAction {
     /// Fragmentation Needed).
     #[must_use]
     pub const fn next_hop_mtu(&self) -> u16 {
-        self.next_hop_mtu
+        if matches!(
+            self.kind,
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded
+        ) {
+            self.header_value
+        } else {
+            0
+        }
+    }
+
+    /// Returns this action with `pointer` (the offset of the offending
+    /// octet in the quoted IPv4 header, RFC 792) as the Parameter Problem
+    /// pointer. Only [`Icmpv4ErrorKind::ParameterProblem`] carries one; for
+    /// every other kind it is ignored.
+    #[must_use]
+    pub const fn with_pointer(mut self, pointer: u8) -> Self {
+        if matches!(self.kind, Icmpv4ErrorKind::ParameterProblem) {
+            self.header_value = pointer as u16;
+        }
+        self
+    }
+
+    /// The Parameter Problem pointer written to the ICMP header (0 for
+    /// other kinds).
+    #[must_use]
+    pub const fn pointer(&self) -> u8 {
+        if matches!(self.kind, Icmpv4ErrorKind::ParameterProblem) {
+            self.header_value as u8
+        } else {
+            0
+        }
     }
 
     /// Returns this action with the quote shortened so that the generated
@@ -543,6 +626,29 @@ pub enum Icmpv4ErrorDisposition {
         quote_len: usize,
         next_hop_mtu: u16,
     },
+    /// A Protocol Unreachable error (Type 3, Code 2) was queued.
+    ProtocolUnreachableQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
+    /// A Port Unreachable error (Type 3, Code 3) about a UDP datagram
+    /// addressed to the router was queued.
+    LocalPortUnreachableQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
+    /// A Parameter Problem error (Type 12, Code 0) was queued.
+    ParameterProblemQueued {
+        egress: IfId,
+        quote_len: usize,
+        pointer: u8,
+    },
+    /// A Communication Administratively Prohibited error (Type 3, Code 13)
+    /// was queued.
+    AdministrativelyProhibitedQueued {
+        egress: IfId,
+        quote_len: usize,
+    },
     Pending {
         egress: IfId,
     },
@@ -600,6 +706,10 @@ pub struct Icmpv4ErrorCounters {
     pub queued_host_unreachable: usize,
     pub queued_port_unreachable: usize,
     pub queued_fragmentation_needed: usize,
+    pub queued_protocol_unreachable: usize,
+    pub queued_udp_port_unreachable: usize,
+    pub queued_parameter_problem: usize,
+    pub queued_admin_prohibited: usize,
     pub pending: usize,
     pub rate_limited: usize,
     pub disabled_time_exceeded: usize,
@@ -607,6 +717,10 @@ pub struct Icmpv4ErrorCounters {
     pub disabled_host_unreachable: usize,
     pub disabled_port_unreachable: usize,
     pub disabled_fragmentation_needed: usize,
+    pub disabled_protocol_unreachable: usize,
+    pub disabled_udp_port_unreachable: usize,
+    pub disabled_parameter_problem: usize,
+    pub disabled_admin_prohibited: usize,
     pub quote_below_minimum: usize,
     pub state_full: usize,
     pub action_full: usize,
@@ -632,6 +746,10 @@ pub struct Icmpv4ErrorCounters {
     pub dequeued_host_unreachable: usize,
     pub dequeued_port_unreachable: usize,
     pub dequeued_fragmentation_needed: usize,
+    pub dequeued_protocol_unreachable: usize,
+    pub dequeued_udp_port_unreachable: usize,
+    pub dequeued_parameter_problem: usize,
+    pub dequeued_admin_prohibited: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -942,6 +1060,22 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 self.counters.queued += 1;
                 self.counters.queued_fragmentation_needed += 1;
             }
+            Icmpv4ErrorDisposition::ProtocolUnreachableQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_protocol_unreachable += 1;
+            }
+            Icmpv4ErrorDisposition::LocalPortUnreachableQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_udp_port_unreachable += 1;
+            }
+            Icmpv4ErrorDisposition::ParameterProblemQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_parameter_problem += 1;
+            }
+            Icmpv4ErrorDisposition::AdministrativelyProhibitedQueued { .. } => {
+                self.counters.queued += 1;
+                self.counters.queued_admin_prohibited += 1;
+            }
             Icmpv4ErrorDisposition::Pending { .. } => self.counters.pending += 1,
             Icmpv4ErrorDisposition::RateLimited { .. } => {
                 self.counters.rate_limited += 1;
@@ -959,6 +1093,18 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 }
                 Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
                     self.counters.disabled_fragmentation_needed += 1;
+                }
+                Icmpv4ErrorKind::DestinationUnreachableProtocol => {
+                    self.counters.disabled_protocol_unreachable += 1;
+                }
+                Icmpv4ErrorKind::DestinationUnreachableLocalPort => {
+                    self.counters.disabled_udp_port_unreachable += 1;
+                }
+                Icmpv4ErrorKind::ParameterProblem => {
+                    self.counters.disabled_parameter_problem += 1;
+                }
+                Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited => {
+                    self.counters.disabled_admin_prohibited += 1;
                 }
             },
             Icmpv4ErrorDisposition::QuoteBelowMinimum { .. } => {
@@ -1127,7 +1273,30 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                 Icmpv4ErrorDisposition::FragmentationNeededQueued {
                     egress: action.egress,
                     quote_len: action.quote_len(),
-                    next_hop_mtu: action.next_hop_mtu,
+                    next_hop_mtu: action.next_hop_mtu(),
+                }
+            }
+            Icmpv4ErrorKind::DestinationUnreachableProtocol => {
+                Icmpv4ErrorDisposition::ProtocolUnreachableQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
+            Icmpv4ErrorKind::DestinationUnreachableLocalPort => {
+                Icmpv4ErrorDisposition::LocalPortUnreachableQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
+                }
+            }
+            Icmpv4ErrorKind::ParameterProblem => Icmpv4ErrorDisposition::ParameterProblemQueued {
+                egress: action.egress,
+                quote_len: action.quote_len(),
+                pointer: action.pointer(),
+            },
+            Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited => {
+                Icmpv4ErrorDisposition::AdministrativelyProhibitedQueued {
+                    egress: action.egress,
+                    quote_len: action.quote_len(),
                 }
             }
         };
@@ -1181,6 +1350,16 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             }
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
                 self.counters.dequeued_fragmentation_needed += 1;
+            }
+            Icmpv4ErrorKind::DestinationUnreachableProtocol => {
+                self.counters.dequeued_protocol_unreachable += 1;
+            }
+            Icmpv4ErrorKind::DestinationUnreachableLocalPort => {
+                self.counters.dequeued_udp_port_unreachable += 1;
+            }
+            Icmpv4ErrorKind::ParameterProblem => self.counters.dequeued_parameter_problem += 1,
+            Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited => {
+                self.counters.dequeued_admin_prohibited += 1;
             }
         }
         if let Some(state) = self.states[..self.occupied_prefix]
@@ -1297,6 +1476,30 @@ pub enum GeneratedIcmpv4Trace {
         accepted: usize,
         rejected: usize,
     },
+    /// The events of the ICMP-ERR kinds (Protocol Unreachable, the router's
+    /// own UDP Port Unreachable, Parameter Problem, Communication
+    /// Administratively Prohibited) carry their kind.
+    KindAllocationFailed {
+        kind: Icmpv4ErrorKind,
+        error: GeneratedAllocationError,
+    },
+    KindBuildFailed {
+        kind: Icmpv4ErrorKind,
+        error: Icmpv4ErrorBuildError,
+    },
+    KindClockRegression {
+        kind: Icmpv4ErrorKind,
+    },
+    KindTxRequested {
+        kind: Icmpv4ErrorKind,
+        egress: IfId,
+        destination: Ipv4Address,
+    },
+    KindBatchCompleted {
+        kind: Icmpv4ErrorKind,
+        accepted: usize,
+        rejected: usize,
+    },
 }
 
 pub trait GeneratedIcmpv4TraceSink {
@@ -1359,6 +1562,7 @@ where
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
                 GeneratedIcmpv4Trace::FragmentationNeededClockRegression
             }
+            kind => GeneratedIcmpv4Trace::KindClockRegression { kind },
         };
         trace.record_generated_icmpv4(event);
         return Err(ExecuteIcmpv4TimeExceededError::ClockRegression);
@@ -1394,9 +1598,14 @@ where
                     GeneratedIcmpv4Trace::FragmentationNeededTxRequested {
                         egress: queued.action.egress,
                         destination: queued.action.destination_ip,
-                        next_hop_mtu: queued.action.next_hop_mtu,
+                        next_hop_mtu: queued.action.next_hop_mtu(),
                     }
                 }
+                kind => GeneratedIcmpv4Trace::KindTxRequested {
+                    kind,
+                    egress: queued.action.egress,
+                    destination: queued.action.destination_ip,
+                },
             };
             trace.record_generated_icmpv4(event);
             (None, None)
@@ -1416,6 +1625,7 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
                     GeneratedIcmpv4Trace::FragmentationNeededAllocationFailed(error)
                 }
+                kind => GeneratedIcmpv4Trace::KindAllocationFailed { kind, error },
             };
             trace.record_generated_icmpv4(event);
             (Some(error), None)
@@ -1435,6 +1645,7 @@ where
                 Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded => {
                     GeneratedIcmpv4Trace::FragmentationNeededBuildFailed(error)
                 }
+                kind => GeneratedIcmpv4Trace::KindBuildFailed { kind, error },
             };
             trace.record_generated_icmpv4(event);
             (None, Some(error))
@@ -1470,6 +1681,11 @@ where
                 rejected: completion.rejected,
             }
         }
+        kind => GeneratedIcmpv4Trace::KindBatchCompleted {
+            kind,
+            accepted: completion.accepted,
+            rejected: completion.rejected,
+        },
     };
     trace.record_generated_icmpv4(event);
     Ok(Some(GeneratedIcmpv4Report {
@@ -1525,7 +1741,11 @@ fn build_icmpv4_error(frame: &mut [u8], action: &Icmpv4ErrorAction) {
     frame[24..26].copy_from_slice(&header_checksum.to_be_bytes());
     frame[34] = action.kind.icmp_type();
     frame[35] = action.kind.icmp_code();
-    frame[40..42].copy_from_slice(&action.next_hop_mtu.to_be_bytes());
+    // Second ICMP header word: the Parameter Problem pointer in its first
+    // octet (RFC 792), the Next-Hop MTU in its low-order 16 bits (RFC 1191
+    // §4), zero otherwise.
+    frame[38] = action.pointer();
+    frame[40..42].copy_from_slice(&action.next_hop_mtu().to_be_bytes());
     frame[42..icmp_end].copy_from_slice(action.quote());
     let icmp_checksum = internet_checksum(&frame[34..icmp_end]);
     frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
@@ -1930,21 +2150,85 @@ mod tests {
         }
     }
 
+    const ALL_KINDS: [Icmpv4ErrorKind; 9] = [
+        Icmpv4ErrorKind::TimeExceededTtl,
+        Icmpv4ErrorKind::DestinationUnreachableNetwork,
+        Icmpv4ErrorKind::DestinationUnreachableHost,
+        Icmpv4ErrorKind::DestinationUnreachablePort,
+        Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
+        Icmpv4ErrorKind::DestinationUnreachableProtocol,
+        Icmpv4ErrorKind::DestinationUnreachableLocalPort,
+        Icmpv4ErrorKind::ParameterProblem,
+        Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+    ];
+
     #[test]
     fn every_kind_has_its_own_generation_switch() {
-        let kinds = [
-            Icmpv4ErrorKind::TimeExceededTtl,
-            Icmpv4ErrorKind::DestinationUnreachableNetwork,
-            Icmpv4ErrorKind::DestinationUnreachableHost,
-            Icmpv4ErrorKind::DestinationUnreachablePort,
-            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
-        ];
-        for off in kinds {
-            let policy = Icmpv4ErrorPolicy::default().with_generation(off, false);
-            for kind in kinds {
+        let all_on = Icmpv4ErrorPolicy::default().with_generation(
+            Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+            true,
+        );
+        for off in ALL_KINDS {
+            let policy = all_on.with_generation(off, false);
+            for kind in ALL_KINDS {
                 assert_eq!(policy.generates(kind), kind != off, "{off:?} off, {kind:?}");
             }
         }
+        let default = Icmpv4ErrorPolicy::default();
+        for kind in ALL_KINDS {
+            assert_eq!(
+                default.generates(kind),
+                kind != Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn icmp_err_kinds_have_their_type_code_and_header_word() {
+        let mut frame = [0xa5; 82];
+        for (kind, type_code) in [
+            (Icmpv4ErrorKind::DestinationUnreachableProtocol, [3, 2]),
+            (Icmpv4ErrorKind::DestinationUnreachableLocalPort, [3, 3]),
+            (Icmpv4ErrorKind::ParameterProblem, [12, 0]),
+            (
+                Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+                [3, 13],
+            ),
+        ] {
+            assert_eq!(kind.limiter_class(), 0, "{kind:?}");
+            let action = action_kind(kind, 1, 40)
+                .with_pointer(21)
+                .with_next_hop_mtu(1400);
+            build_icmpv4_error(&mut frame, &action);
+            assert_eq!(&frame[34..36], &type_code, "{kind:?}");
+            // RFC 792: the Parameter Problem pointer is the first octet of
+            // the second word, the rest unused; zero for the others.
+            let word = if kind == Icmpv4ErrorKind::ParameterProblem {
+                [21, 0, 0, 0]
+            } else {
+                [0; 4]
+            };
+            assert_eq!(&frame[38..42], &word, "{kind:?}");
+            assert_eq!(action.next_hop_mtu(), 0, "{kind:?}");
+            assert_eq!(internet_checksum(&frame[34..]), 0);
+        }
+        // Only Parameter Problem takes a pointer.
+        let mtu = action_kind(
+            Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
+            1,
+            40,
+        )
+        .with_next_hop_mtu(1400)
+        .with_pointer(21);
+        assert_eq!((mtu.next_hop_mtu(), mtu.pointer()), (1400, 0));
+    }
+
+    #[test]
+    fn the_action_slot_size_is_unchanged() {
+        // ICMP-ERR keeps the pointer in the Next-Hop MTU field: the slot
+        // stays 592 bytes (storage bound, CLI-083/CLI-086).
+        assert_eq!(std::mem::size_of::<Icmpv4ErrorActionSlot>(), 592);
     }
 
     #[test]

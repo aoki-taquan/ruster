@@ -264,8 +264,9 @@ admission profileとして、replyを生成する前に次を要求します。
 - local policyとしてEthernet destinationがingress Interface MACと完全一致する。
   broadcast、multicast、foreign unicast宛てのIP-local frameには応答しない。
 
-validなlocal non-ICMPと、checksum-validなunfragmented non-Echo ICMPは
-`Ipv4LocalUnsupported`でbyte不変consumeし、routing/ARPへ流しません。malformed/truncated
+checksum-validなunfragmented non-Echo ICMPと、local non-ICMPのfragment（reassemblyなし）は
+`Ipv4LocalUnsupported`でbyte不変consumeし、routing/ARPへ流しません。fragmentでないlocal
+non-ICMPはICMP-ERR（下の「ICMP-ERR」）でprotocolごとにdropしerrorを生成します。malformed/truncated
 Echo、invalid checksum、nonzero Echo code、source/L2 admission failureはstable
 `DropReason`でbyte不変dropします。このconsumeはpacket ownershipを確実に終端するarchitecture
 behaviorであり、RFC準拠のupper-layer deliveryを主張しません。RFC 1122 §3.2.2とRFC 1812
@@ -279,9 +280,8 @@ reserved IPv4 flagがnonzeroであることだけを理由に受信packetをdrop
 IPv4 options付きlocal Echoもbyte不変dropします。RFC 1122 §3.2.2.6、RFC 1812
 §4.3.3.6および§§5.3.13.4–5.3.13.6がsource-route reversalとSource Route/Record
 Route/Timestamp処理を要求しているため、これは明示deviationです。Timestamp等の他ICMP
-query、options処理、Destination UnreachableのCode 0以外、Parameter Problem、Redirect、
-PMTU処理は
-deferredです。
+query、options処理、Redirectはdeferredです（Destination Unreachableの他code、Parameter
+Problem、PMTUはMTU1とICMP-ERRで実装、ICMP4-012I）。
 
 ## ICMPv4 generated error scope
 
@@ -297,7 +297,7 @@ worker-localであり、共有lock、packet clone、backend buffer pointerを持
 
 ### router-originated ICMPv4 inventoryとoperator switch
 
-routerが自身の名前で生成または応答するICMPv4は次の5 class（とB3のPort Unreachable）だけです（NAT44のICMPv4 error変換は
+routerが自身の名前で生成または応答するICMPv4は次の9 class（とB3のPort Unreachable）だけです（NAT44のICMPv4 error変換は
 受信errorのtranslationで生成ではなく、`nat44.*.icmpv4-errors`で別途設定します）。owner方針
 （2026-11-01）により既定値はすべてRFC動作で、security上offにしたい運用者向けにclassごとの
 switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である限り、SHOULDに反するoption
@@ -310,9 +310,16 @@ switchを持ちます。RFC 1812 §1.1.3は、default設定がRFC準拠である
 | Destination Unreachable Network（Type 3/Code 0） | LPM miss（firewall有効時はegress-free permitのみ） | RFC 1812 §§4.3.3.1, 5.2.7.1 MUST | `net-unreachable`（`true`） | `ROUTE_MISS`/`FIREWALL_ROUTE_UNAVAILABLE`のまま、`icmpv4_errors.disabled_destination_unreachable` | restart-required |
 | Destination Unreachable Host（Type 3/Code 1） | direct targetのfruitless ARP | RFC 1812 §5.2.7.1（MUST be able to generate、最も近いcodeをSHOULD） | `host-unreachable`（`true`） | holdをreverse route/reverse ARP前にretire、`icmpv4_errors.disabled_host_unreachable`と`ResolutionFailureCounters::generation_disabled` | restart-required |
 | Destination Unreachable Fragmentation Needed（Type 3/Code 4） | DF付きでegress MTU超過（MTU1、下の「egress MTU」） | RFC 1812 §§4.2.2.7, 5.2.7.1 MUST、RFC 1191 §4 MUST（Next-Hop MTU） | `fragmentation-needed`（`true`） | `IPV4_FRAGMENTATION_NEEDED`のまま、`icmpv4_errors.disabled_fragmentation_needed`。PMTUDをblack holeにする | restart-required |
+| Destination Unreachable Protocol（Type 3/Code 2） | router宛ての、ICMP/TCP/UDP以外のprotocol（ICMP-ERR） | RFC 1812 §5.2.7.1、RFC 1122 §3.2.2.1 | `protocol-unreachable`（`true`） | `IPV4_LOCAL_PROTOCOL_UNREACHABLE`のまま、`icmpv4_errors.disabled_protocol_unreachable` | restart-required |
+| Destination Unreachable Port（Type 3/Code 3、router宛てUDP） | router宛ての正しいUDP（UDP serviceなし、ICMP-ERR） | RFC 1122 §4.1.3.1 SHOULD、RFC 1812 §5.2.7.1 | `udp-port-unreachable`（`true`） | `IPV4_LOCAL_UDP_PORT_UNREACHABLE`のまま、`icmpv4_errors.disabled_udp_port_unreachable` | restart-required |
+| Parameter Problem（Type 12/Code 0） | Total Lengthがframeより長い（pointer 2）、壊れたIPv4 option（ICMP-ERR） | RFC 1812 §§4.3.3.5 MUST, 5.2.2 SHOULD | `parameter-problem`（`true`） | `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`/`IPV4_OPTIONS_UNSUPPORTED`のまま、`icmpv4_errors.disabled_parameter_problem` | restart-required |
+| Destination Unreachable Communication Administratively Prohibited（Type 3/Code 13） | forward firewallのrule/default deny（ICMP-ERR） | RFC 1812 §5.2.7.1 SHOULD use Code 13、出さないoptionはMAY | `admin-prohibited`（**`false`**、owner決定待ち） | denyのdrop reasonのまま、`icmpv4_errors.disabled_admin_prohibited` | restart-required |
 
 security上の理由は、Echoがhost discovery、Time Exceededがtraceroute topology disclosure、
-Network Unreachableがroute table probing、Host UnreachableがLAN host enumerationに使えることです。
+Network Unreachableがroute table probing、Host UnreachableがLAN host enumeration、Protocol/Port
+UnreachableとParameter Problemがrouter自身のfingerprint、Code 13がfirewall policyの観測に使える
+ことです。Code 13だけはRFC 1812 §5.2.7.1自身が生成しないoptionをMAYで認めており、firewall denyの
+silent dropが慣行なので、default offにしています（default offもRFC準拠、owner決定待ち）。
 rate limit（RFC 1812 §4.3.2.8のSHOULD settable）は既存の`interval-ms`/`state-ttl-ms`で、switchは
 limiterを変更しません。disabled kindは`decide_icmpv4_error`先頭（および`schedule`と
 failure dispatch）で判定し、clock watermark、per-egress limiter state、reverse LPM、reverse ARPに
@@ -398,6 +405,46 @@ state/action fullとclock regressionはphantom state/action/deadlineを作りま
 stateだけ再利用します。multi-worker共通limit、packet hold/replay、RFC 4884 extension、
 generated errorのfragmentation（errorは常にMTUに収める）、interface別disableはdeferredです。MTU別quote縮小はMTU1で実装しました
 （下）。
+
+### ICMP-ERR（RFC 1812 §§4.3.3.5, 5.2.2, 5.2.7.1）
+
+ICMP-ERRは同じ`Icmpv4ErrorRuntime`（action FIFO、builder、generated ICMPv4 phaseとそのframe
+budget）に4 kindを足します。すべてlimiter class 0（Time Exceeded/Network/Host Unreachableと共有、
+egressごとに一件queued、`interval-ms`）なので、新しいlimiter stateも`states`容量の下限も増えません。
+RFC 1812 §4.3.2.7のsuppression、reverse route/neighbor、source address（reverse egressの
+interface address、§4.3.2.4）、TTL、TOS、quote（受信したdatagramの最大548 bytes、egress MTUに
+収める）は既存kindと同じ`decide_icmpv4_error`/`schedule_reverse_icmpv4_error`を通ります。判定は
+すべてdropと決まった後のcold pathで、fast pathに分岐を足すのはlocal宛てnon-ICMPのprotocol分岐
+（以前はconsumeしていた）だけです。
+
+- router宛て（ingress-scoped、ICMP4-001）でoption無し、fragmentでないdatagram: UDPはheaderと
+  checksumを検証して（壊れていれば無応答`IPV4_LOCAL_UDP_INVALID`）`IPV4_LOCAL_UDP_PORT_UNREACHABLE`と
+  Port Unreachable（3/3、TCP NATのB3 Port Unreachableとは別kind）。TCPは無応答
+  `IPV4_LOCAL_TCP_UNSUPPORTED`（closed portへの応答はRSTでICMPではなく、routerはTCPを生成しない）。
+  ICMPは従来どおり（Echo応答、他はconsume）。それ以外のprotocolは`IPV4_LOCAL_PROTOCOL_UNREACHABLE`と
+  Protocol Unreachable（3/2）。fragmentは従来どおりconsume。
+- Parameter Problem（12/0、pointerはICMP header 2語目の先頭octet）: parserがTotal Lengthで止めた
+  datagramはcold pathでheader checksumを検証し、正しければpointer 2（§5.2.2 SHOULD）。option付き
+  datagramは従来どおり`IPV4_OPTIONS_UNSUPPORTED`で落としつつoptionを走査し、length不正は
+  length octet（octetが無ければtype octet）、二つ目のsource routeはその先頭（§5.2.4.1）、router宛て
+  でないSSRRはdestination（pointer 16、§5.2.2）。well-formedなsource routeの後ろの問題はerrorに
+  逆順routeが要る（§4.3.2.6）のでsilent。checksum不正、IHL/Total Lengthが小さすぎるheaderは
+  silent（§5.2.2のMUST/MAY）。
+- Communication Administratively Prohibited（3/13）: route hitしたforward datagramのfirewall
+  rule/default denyで、`admin-prohibited = true`のときだけ。firewall判定はTTLより前なので
+  denyされたTTL 1のdatagramにはTime Exceededでなくこれを返します。
+
+transit datagramについてのParameter ProblemとCode 13は、errorがrouteやNATの隠すものを漏らさない
+ようにします。Parameter Problemはrouteがあり、NATのoutside→inside横断でなく、forward firewallが
+無いとき（firewallはoption付きや切れたdatagramを評価できないので、そのときはsilent）だけです。
+NATとの関係: errorはすべて受信したままの（翻訳前の）datagramを引用し、ingress側のsourceへreverse
+routeで返るので翻訳は不要です（outbound NATのinside hostもinbound到着のoutside hostも自分の送った
+datagramを受け取る）。router宛てのerrorはNAT public address宛てのUDP/TCPには出ません（それらは
+NAT44 inboundの判定のまま）。NAT inbound/hairpin/ICMP query NATの経路のfirewall denyはCode 13を
+出さずsilentのままです（residual）。
+
+pointerはFragmentation NeededのNext-Hop MTUと同じaction field（`header_value`）に入るので、action
+slotは592 bytesのまま、最大production configのstorage（67050176 bytes）は変わりません。
 
 ### egress MTU（MTU1、RFC 1812 §4.2.2.7、RFC 1191 §4）
 

@@ -687,6 +687,79 @@ after the handshake. Leave it on unless every sender behind the router
 clamps its MSS. Every router-generated error is cut to fit the MTU of the
 interface it leaves (at most 576 bytes of IPv4 as before).
 
+### Errors about datagrams for the router and bad headers (ICMP-ERR)
+
+The router answers datagrams addressed to its own interface addresses (on
+the interface they arrive on) and datagrams with headers it cannot process
+the way RFC 1812 asks, each with a switch in `[icmpv4-errors.generate]`:
+
+| datagram | drop | error | switch (default) |
+|---|---|---|---|
+| UDP to a router address (no UDP port is open on the router) | `IPV4_LOCAL_UDP_PORT_UNREACHABLE` | Destination Unreachable, Port Unreachable (3/3) | `udp-port-unreachable` (`true`) |
+| UDP to a router address with a short header, a bad UDP length, or a bad nonzero checksum | `IPV4_LOCAL_UDP_INVALID` | none (RFC 1122 4.1.3.4) | — |
+| TCP to a router address | `IPV4_LOCAL_TCP_UNSUPPORTED` | none: a closed TCP port answers with a RST, which the router does not send | — |
+| any other protocol (GRE, SCTP, ...) to a router address | `IPV4_LOCAL_PROTOCOL_UNREACHABLE` | Destination Unreachable, Protocol Unreachable (3/2) | `protocol-unreachable` (`true`) |
+| a fragment of a non-ICMP datagram to a router address | consumed as `IPV4_LOCAL_UNSUPPORTED` (no reassembly) | none | — |
+| a datagram whose Total Length is longer than the frame (link truncation), valid header checksum | `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET` | Parameter Problem (12/0), pointer 2 | `parameter-problem` (`true`) |
+| malformed IPv4 options, a second source route, or a strict source route not for the router | `IPV4_OPTIONS_UNSUPPORTED` | Parameter Problem, pointer at the offending octet (16 for the strict source route) | `parameter-problem` |
+| a forwarded datagram the firewall denies by rule or by default | `FIREWALL_RULE_DENIED` / `FIREWALL_DEFAULT_DENIED` | Destination Unreachable, Communication Administratively Prohibited (3/13) | `admin-prohibited` (**`false`**) |
+
+```toml
+[icmpv4-errors.generate]
+protocol-unreachable = true   # 3/2 for protocols the router does not implement
+udp-port-unreachable = true   # 3/3 for UDP to a router address
+parameter-problem = true      # 12/0 for truncated datagrams and bad options
+admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
+```
+
+- UDP and TCP to the NAT public address are not "for the router": they go
+  to the NAT as before (no mapping: `NAT44_UDP_MAPPING_MISS`; for TCP see
+  `unsolicited-syn-icmp`). `udp-port-unreachable` does not touch the TCP
+  NAT's Port Unreachable either (that one is `[nat44.tcp.policy]
+  unsolicited-syn-icmp`, counted as `queued_port_unreachable`).
+- Every error goes through the same limiter as Time Exceeded and Network/Host
+  Unreachable (`interval-ms`, default 100 ms, one per egress at a time):
+  they add no limiter state, so `icmpv4-errors.capacity.states` needs no
+  change. A UDP flood to a router address therefore also delays Time
+  Exceeded toward the same interface (`icmpv4_errors.rate_limited`,
+  `pending`); turn `udp-port-unreachable` off if that matters more than
+  answering UDP probes.
+- Never answered (RFC 1812 4.3.2.7): ICMP errors, non-initial fragments,
+  broadcast/multicast destinations or link frames, non-host sources.
+  Parameter Problem about a datagram not for the router is sent only when
+  the router has a route for it, the NAT would not refuse it as an
+  outside-to-inside crossing, and there is no forward firewall (the
+  firewall refuses option-bearing datagrams first,
+  `FIREWALL_IPV4_OPTIONS_UNSUPPORTED`). Bad header checksums are always
+  silent.
+- `admin-prohibited` is off by default: a deny stays a silent drop, the
+  usual firewall behaviour, and RFC 1812 5.2.7.1 allows the option not to
+  send Code 13. Turning it on makes denied senders fail fast (on Linux
+  `connect` fails with `EHOSTUNREACH` instead of timing out) at the cost of
+  telling them the firewall exists. It answers only plain forwarded
+  traffic; denies on the NAT inbound, hairpin, and ICMP query paths stay
+  silent. With it off, `icmpv4_errors.disabled_admin_prohibited` counts the
+  denies that would have been answered.
+- Errors are about the datagram as received and go back to its sender on
+  the side it came from, so nothing needs NAT translation: an inside host
+  sees its own datagram, an outside host the one it sent.
+- Counters: `icmpv4_errors.queued_*`/`dequeued_*`/`disabled_*` with
+  `protocol_unreachable`, `udp_port_unreachable`, `parameter_problem`,
+  `admin_prohibited`. All four switches are part of the ICMPv4 error policy:
+  changing one is restart-required (`plan` says `ICMPV4_ERROR_POLICY`).
+
+Upgrade note (ICMP-ERR, behaviour change): UDP and other non-TCP, non-ICMP
+datagrams to a router address used to be consumed silently
+(`consume.IPV4_LOCAL_UNSUPPORTED`); they are now dropped with the reasons
+above and answered with Port or Protocol Unreachable, and truncated
+datagrams and bad options get Parameter Problem. New drop codes 205
+`IPV4_LOCAL_PROTOCOL_UNREACHABLE`, 206 `IPV4_LOCAL_UDP_PORT_UNREACHABLE`,
+207 `IPV4_LOCAL_UDP_INVALID`, 208 `IPV4_LOCAL_TCP_UNSUPPORTED`; twelve new
+`icmpv4_errors.*` counters. To keep the old silence set
+`protocol-unreachable = false`, `udp-port-unreachable = false`, and
+`parameter-problem = false` (the drops keep their new reasons). Storage is
+unchanged (67050176 bytes for the maximal production config).
+
 ### DF-clear datagrams through the NAT (MTU2 part A)
 
 NAT44 translates every whole datagram (More Fragments clear, fragment
@@ -3417,6 +3490,9 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=validate code=ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED path=icmpv4-errors.capacity.states` | 2 | fewer than two ICMPv4 error limiter states per interface while Fragmentation Needed is on | raise `states` to at least 2 × interfaces (+1 with delayed Port Unreachable) |
 | `drop.IPV4_FRAME_EXCEEDS_MTU` | — | frames carry bytes after the IPv4 datagram beyond the egress MTU | find the sender appending trailers; the datagrams themselves fit |
 | `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
+| `drop.IPV4_LOCAL_UDP_PORT_UNREACHABLE` / `IPV4_LOCAL_PROTOCOL_UNREACHABLE` growing | — | UDP or another protocol sent to a router address (scans, misconfigured clients, a service expected on the router) | normal at a low rate; `udp-port-unreachable = false` / `protocol-unreachable = false` to stop answering (ICMP-ERR) |
+| `drop.IPV4_LOCAL_TCP_UNSUPPORTED` growing | — | TCP to a router address (scans, a client expecting a service on the router); not answered | nothing runs on the router; point clients at the right host |
+| `icmpv4_errors.queued_parameter_problem` growing | — | truncated datagrams (a link or device shortening frames) or malformed IP options from a sender | find the link or sender; `parameter-problem = false` to stop answering |
 | `drop.IPV4_FRAGMENTATION_NEEDED` growing | — | DF datagrams above an egress MTU; senders get Fragmentation Needed | normal for PMTUD; persistent growth from one sender means it ignores the error (check `icmpv4_errors.rate_limited`, firewalls in front of the sender) |
 | `drop.IPV4_FRAGMENTATION_REQUIRED` | — | DF-clear datagrams above an egress MTU with `[fragmentation] enabled = false` | turn fragmentation on (the default), raise the egress MTU, or have the senders use PMTUD (DF) or a smaller MTU |
 | `drop.IPV4_FRAGMENTATION_TOO_MANY_FRAGMENTS` | — | a DF-clear datagram would need more fragments than `max-fragments-per-datagram` | raise the bound (default 1365), or raise the egress MTU |

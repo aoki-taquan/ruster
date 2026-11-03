@@ -63,9 +63,9 @@ fn sim_tick_observer_counts_match_backend_recycle_causes() {
         unsupported_ethertype(),
         unsupported_ethertype(),
         bad_ipv4_checksum(),
-        local_udp(),
-        local_udp(),
-        local_udp(),
+        local_unsupported(),
+        local_unsupported(),
+        local_unsupported(),
         echo_request(),
     ] {
         io.inject(LAN, frame);
@@ -419,7 +419,7 @@ fn service_counters_render_in_fixed_order(
     );
     for (section, fields) in [
         ("resolution", 13),
-        ("icmpv4_errors", 38),
+        ("icmpv4_errors", 50),
         ("nat44_udp", 19),
         ("nat44_tcp", 40),
         ("nat44_icmp", 16),
