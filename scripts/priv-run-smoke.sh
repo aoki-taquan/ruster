@@ -44,7 +44,7 @@
 #             through /etc/passwd gets past the read (the control)
 #   limits   (H3) a config with every runtime table at its production
 #             limit (failure holds and ICMPv4 error actions 4096, every
-#             other table 65536, NAT44 pool 1-65535, 63.53 MiB of storage) is
+#             other table 65536, NAT44 pool 1-65535, 63.77 MiB of storage) is
 #             accepted by `validate`; one more failure hold (4097) is
 #             refused by `validate` and `ruster run` (exit 2) although the
 #             simulator's limits accept it as a sim document; `ruster run`
@@ -139,6 +139,16 @@
 #             fragment_tracking.held = consume.IPV4_FRAGMENT_HELD, released,
 #             nothing refused. With `[fragment-tracking] mode = "refuse"` the
 #             same fragments never arrive (drop.FIREWALL_FRAGMENT_UNSUPPORTED)
+#   arphold   (ARP-HOLD, RFC 1122 2.3.2.2, RFC 1812 3.3.2) every neighbour
+#             cache empty (a fresh router, host caches flushed): `ping -c1`
+#             from host A to host B succeeds on the first try (the first
+#             Echo Request is held while the router resolves host B and sent
+#             on its ARP reply), and on another fresh router the first TCP
+#             SYN to host B gets through with no retransmission (connect in
+#             well under the 1 s initial RTO, tcpi_total_retrans 0); final
+#             counters arp_hold.held = replayed = replay_sent = 1, no
+#             NEIGHBOR_UNRESOLVED. With `[resolution.hold] enabled = false`
+#             the single ping is lost (drop.NEIGHBOR_UNRESOLVED=1)
 #   reload_carry  (RELOAD-CARRY, AF_XDP and again inside the afpacket phase
 #             over AF_PACKET) a long-lived TCP connection and a UDP flow (a
 #             fixed source port) from host A to host B through NAT44 keep
@@ -500,7 +510,7 @@ write_config "$work/router-v2.toml" ra 0 router-v2
 # a cross-port forward is copied into an egress generated frame, so with
 # more of those than TX entries the 128-entry TX ring is what fills.
 write_config "$work/txfull.toml" ra 0 router-v1 256
-# H3: every runtime table at its production limit (63.53 MiB of storage),
+# H3: every runtime table at its production limit (63.77 MiB of storage),
 # without the fixture's own backend; and one more failure hold (above the
 # production 4096, within the simulator's 65536), as af-xdp and as sim.
 sed -e '/^\[backend\]$/,$d' -e 's/device = "rusternodev0"/device = "sim0"/' \
@@ -1314,7 +1324,7 @@ phase_idle
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=66617536 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=66865856 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -1338,7 +1348,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 66617536 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 66865856 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
@@ -2860,6 +2870,109 @@ EOF
     echo "priv_run_icmp_query: with [nat44.icmp] host A -> host B ping (3/3 replies translated back, one mapping) and host A -> public address (answered by the router), exit 0 verified"
 }
 phase_icmp_query
+
+# arphold (ARP-HOLD, RFC 1122 2.3.2.2, RFC 1812 3.3.2): every neighbour
+# cache empty (a fresh router; host A's and host B's caches flushed), the
+# first datagram of a new flow is held while the router resolves host B and
+# sent when host B answers. `ping -c1` from host A to host B succeeds on the
+# first try (the icmp-query config: ICMP query NAT and an icmp rule), and on
+# a second fresh router the first TCP SYN of a connection to host B gets
+# through without its 1 s retransmission: the connection completes well
+# under the initial RTO. The final counters show arp_hold.held = replayed =
+# replay_sent and no NEIGHBOR_UNRESOLVED drop. With `[resolution.hold]
+# enabled = false` the same single ping is lost (drop.NEIGHBOR_UNRESOLVED).
+TCP_LISTEN='
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(1)
+s.settimeout(float(sys.argv[2]))
+print("ready", flush=True)
+c, (host, port) = s.accept()
+print(host, port, flush=True)
+c.close()
+'
+TCP_CONNECT='
+import socket, sys, time
+start = time.monotonic()
+s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=5)
+elapsed = time.monotonic() - start
+# struct tcp_info: tcpi_total_retrans is the u32 at byte offset 100.
+info = s.getsockopt(socket.IPPROTO_TCP, socket.TCP_INFO, 104)
+retrans = int.from_bytes(info[100:104], sys.byteorder)
+s.close()
+print("%.3f %d" % (elapsed, retrans), flush=True)
+'
+
+arphold_fresh_caches() {
+    in_ns "$host_a" ip neigh flush all
+    in_ns "$host_b" ip neigh flush all
+}
+
+phase_arphold() {
+    # The icmp_query phase wrote icmp-query.toml (router-v1 with [nat44.icmp]
+    # and an icmp rule); the hold is the default.
+    cp "$work/icmp-query.toml" "$work/arphold.toml"
+    grep -q '^\[resolution.hold\]' "$work/arphold.toml" &&
+        fail "arphold: the base config already sets [resolution.hold]"
+
+    arphold_fresh_caches
+    start_ruster arphold "$work/arphold.toml"
+    wait_ready arphold || fail "arphold: ruster exited during startup"
+    in_ns "$host_a" ping -n -c 1 -W 3 203.0.113.1 >"$work/arphold-ping.txt" 2>&1 ||
+        fail "arphold: the first ping was lost: $(cat "$work/arphold-ping.txt")"
+    grep -q "1 packets transmitted, 1 received" "$work/arphold-ping.txt" ||
+        fail "arphold: ping -c1: $(cat "$work/arphold-ping.txt")"
+    natfrag_stop arphold
+    block_has "$work/arphold.final" arp_hold.held=1 arp_hold.replayed=1 \
+        arp_hold.replay_sent=1 consume.ARP_HELD=1 drop.NEIGHBOR_UNRESOLVED=0 \
+        nat44_icmp.outbound_translated=1 nat44_icmp.inbound_translated=1
+    echo "priv_run_arphold_ping: $(sed -n '/transmitted/p' "$work/arphold-ping.txt") on the first try with every neighbour cache empty; arp_hold.held=replayed=replay_sent=1, drop.NEIGHBOR_UNRESOLVED=0, exit 0, detached verified"
+
+    arphold_fresh_caches
+    start_ruster arphold-tcp "$work/arphold.toml"
+    wait_ready arphold-tcp || fail "arphold: ruster exited during startup (tcp)"
+    in_ns "$host_b" python3 -I -c "$TCP_LISTEN" 9100 10 >"$work/arphold-listen.out" 2>&1 &
+    listener=$!
+    tries=0
+    while ! grep -q ready "$work/arphold-listen.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "arphold: host B listener not ready"
+        sleep 0.05
+    done
+    in_ns "$host_a" python3 -I -c "$TCP_CONNECT" 203.0.113.1 9100 >"$work/arphold-connect.out" 2>&1 ||
+        fail "arphold: TCP connect failed: $(cat "$work/arphold-connect.out")"
+    status=0
+    wait "$listener" || status=$?
+    [ "$status" -eq 0 ] || fail "arphold: host B accepted nothing: $(cat "$work/arphold-listen.out")"
+    read -r elapsed retrans <"$work/arphold-connect.out"
+    # The first SYN went through: no retransmission, and the handshake took
+    # far less than Linux's 1 s initial RTO.
+    [ "$retrans" -eq 0 ] || fail "arphold: the SYN was retransmitted ($retrans): $elapsed s"
+    awk -v t="$elapsed" 'BEGIN { exit !(t < 0.5) }' ||
+        fail "arphold: the handshake took $elapsed s"
+    natfrag_stop arphold-tcp
+    block_has "$work/arphold-tcp.final" arp_hold.held=1 arp_hold.replayed=1 \
+        arp_hold.replay_sent=1 drop.NEIGHBOR_UNRESOLVED=0 nat44_tcp.sessions_created=1
+    echo "priv_run_arphold_tcp: with every neighbour cache empty the first SYN was held and sent (connect ${elapsed} s, tcpi_total_retrans=$retrans), host B accepted from $(sed -n 2p "$work/arphold-listen.out"), exit 0 verified"
+
+    # The switch: without the hold the first ping is lost.
+    sed 's/^\[nat44.icmp\]$/[resolution.hold]\nenabled = false\n\n[nat44.icmp]/' \
+        "$work/arphold.toml" >"$work/arphold-off.toml"
+    grep -q '^enabled = false$' "$work/arphold-off.toml" || fail "arphold: no off config"
+    arphold_fresh_caches
+    start_ruster arphold-off "$work/arphold-off.toml"
+    wait_ready arphold-off || fail "arphold: ruster exited during startup (off)"
+    if in_ns "$host_a" ping -n -c 1 -W 2 203.0.113.1 >"$work/arphold-off-ping.txt" 2>&1; then
+        fail "arphold: the first ping crossed without the hold: $(cat "$work/arphold-off-ping.txt")"
+    fi
+    natfrag_stop arphold-off
+    block_has "$work/arphold-off.final" drop.NEIGHBOR_UNRESOLVED=1 consume.ARP_HELD=0 \
+        arp_hold.held=0
+    echo "priv_run_arphold_off: with [resolution.hold] enabled = false the first ping is lost (drop.NEIGHBOR_UNRESOLVED=1) verified"
+}
+phase_arphold
 
 # txfull: the WAN TX ring driven full and recovered.
 start_ruster txfull "$work/txfull.toml" --tx-stall-warn-secs 1 --tx-stall-fatal-secs 2 \
