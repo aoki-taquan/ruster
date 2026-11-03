@@ -437,44 +437,57 @@ pub fn sweep_warnings(config: &ValidatedConfigV1) -> [Option<SweepSlow>; 2] {
 }
 
 /// `[fragment-tracking] ingress-share-percent` is a cap, not a
-/// reservation: each ingress may take `floor(entries × share / 100)`
-/// entries (at least one), so when that times `interfaces − 1` reaches
-/// `entries`, the other ingresses can take every entry and leave none to
-/// the last (a share of at most 100/N leaves each an equal part).
-/// Value-free.
+/// reservation, on the entries and on the held fragments alike: each
+/// ingress may take `floor(slots × share / 100)` of either (at least one),
+/// so when that times `interfaces − 1` reaches the table's size, the other
+/// ingresses can take every slot and leave none to the last (a share of at
+/// most 100/N leaves each an equal part, up to rounding on a small table).
+/// `held` is 0 without held slots (no fragmentation). Value-free.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FragmentShareOvercommitted {
     pub share_percent: u8,
     pub interfaces: usize,
     pub entries: u32,
+    pub held: u32,
 }
 
 impl std::fmt::Display for FragmentShareOvercommitted {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "FRAGMENT_INGRESS_SHARE_OVERCOMMITTED share-percent={} interfaces={} entries={}",
-            self.share_percent, self.interfaces, self.entries
+            "FRAGMENT_INGRESS_SHARE_OVERCOMMITTED share-percent={} interfaces={} entries={} \
+             held={}",
+            self.share_percent, self.interfaces, self.entries, self.held
         )
     }
 }
 
 /// The fragment share warning of `config` (associate mode with a share
-/// below 100: 100 does not partition the table), computed on the share the
-/// table enforces (`ipv4_fragment_tracking_ingress_cap`).
+/// below 100: 100 does not partition the tables), computed on the shares
+/// the table enforces (`ipv4_fragment_tracking_ingress_cap`, rounded down,
+/// at least one) for the entries and for the held slots.
 #[must_use]
 pub fn fragment_share_warning(config: &ValidatedConfigV1) -> Option<FragmentShareOvercommitted> {
     let tracking = config.fragment_tracking();
     let share = tracking.policy()?.ingress_share_percent();
-    let entries = tracking.storage()?.entries;
+    let storage = tracking.storage()?;
     let interfaces = config.interfaces().len();
-    let total = usize::try_from(entries).ok()?;
-    let cap = ruster_core::ipv4_fragment_tracking_ingress_cap(total, share);
-    (share < 100 && interfaces > 1 && cap.saturating_mul(interfaces - 1) >= total).then_some(
+    if share >= 100 || interfaces < 2 {
+        return None;
+    }
+    let overcommitted = |slots: u32| {
+        let slots = usize::try_from(slots).unwrap_or(usize::MAX);
+        slots != 0
+            && ruster_core::ipv4_fragment_tracking_ingress_cap(slots, share)
+                .saturating_mul(interfaces - 1)
+                >= slots
+    };
+    (overcommitted(storage.entries) || overcommitted(storage.held)).then_some(
         FragmentShareOvercommitted {
             share_percent: share,
             interfaces,
-            entries,
+            entries: storage.entries,
+            held: storage.held,
         },
     )
 }

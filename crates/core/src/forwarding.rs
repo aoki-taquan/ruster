@@ -3733,8 +3733,10 @@ fn decide_later_fragment(
     info.check_structure()?;
     info.check_static_overlap()?;
     // Before the table: a fragment that could never leave neither holds a
-    // slot nor counts as its datagram's progress.
+    // slot nor counts as its datagram's progress; a refused datagram still
+    // records its data so that its entry can complete early.
     if ipv4.ttl <= 1 {
+        tracker.ttl_expired(info, now_ms);
         return Err(Ipv4TtlExpired);
     }
     let frame_len = ipv4.header_offset + ipv4.total_len;

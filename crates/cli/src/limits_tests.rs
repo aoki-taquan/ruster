@@ -331,7 +331,7 @@ fn validate_warns_about_an_overcommitted_fragment_share() {
         (
             "",
             "ruster: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED \
-             share-percent=50 interfaces=3 entries=256\n",
+             share-percent=50 interfaces=3 entries=256 held=64\n",
         ),
         ("ingress-share-percent = 34\n", ""),
         ("ingress-share-percent = 33\n", ""),
@@ -352,7 +352,9 @@ fn validate_warns_about_an_overcommitted_fragment_share() {
     // The rule uses the share the table enforces: 3 entries at 50 % give
     // each ingress one, and two leave the third one entry (no warning);
     // at 67 % each takes two, and two take all three.
-    let small = three.replacen("entries = 256\n", "entries = 3\n", 1);
+    let small = three
+        .replacen("entries = 256\n", "entries = 3\n", 1)
+        .replacen("held-fragments = 64\n", "held-fragments = 3\n", 1);
     assert_ne!(small, three);
     assert_eq!(validate_text(&small).2, "");
     let small = small.replacen(
@@ -363,8 +365,24 @@ fn validate_warns_about_an_overcommitted_fragment_share() {
     assert_eq!(
         validate_text(&small).2,
         "ruster: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED \
-         share-percent=67 interfaces=3 entries=3\n"
+         share-percent=67 interfaces=3 entries=3 held=3\n"
+    ); // The held slots round the same way: at 34 % the entries leave room
+       // (87 × 2 < 256), but 2 held slots give each ingress one, and two take
+       // both; 3 leave one.
+    let held = three
+        .replacen(
+            "timeout-ms = 1000\n",
+            "timeout-ms = 1000\ningress-share-percent = 34\n",
+            1,
+        )
+        .replacen("held-fragments = 64\n", "held-fragments = 2\n", 1);
+    assert_eq!(
+        validate_text(&held).2,
+        "ruster: warning: FRAGMENT_INGRESS_SHARE_OVERCOMMITTED \
+         share-percent=34 interfaces=3 entries=256 held=2\n"
     );
+    let held = held.replacen("held-fragments = 2\n", "held-fragments = 3\n", 1);
+    assert_eq!(validate_text(&held).2, "");
 }
 
 /// `plan` loads both sides with the limits of their own backend.

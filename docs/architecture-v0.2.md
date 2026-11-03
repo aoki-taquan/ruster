@@ -564,14 +564,14 @@ in-orderとout-of-orderのfragmentの受信をMUSTとし、実traffic（EDNSの�
   （`held-fragments`）、(ingress, source)ごとのheld（`held-per-host`）。tableかhostのquotaが満ちると
   そのscope（host、ingress、table）の古いentryからevictします: pending/denyが先（scopeごとに
   pending/denyだけのlistを持ちその先頭、O(1)）、無ければ最後のprogressが最古のallow entry（allowの
-  listはprogress順）がtimeoutの1/5（default 1 s）progressしていなければそれ。evictしたallowとpoisonedのkeyは
+  listはprogress順）がtimeoutの1/5（default 1 s）progressしていなければそれ。evictした、一度allowしたentry（poisonedを含む）のkeyは
   timeoutまでtombstone（caller所有、entry 16件ごとに1、最低16、keyed directory）として覚え、そのkeyの最初のfragmentと後続は拒否します（遅れた後続が
   同じkeyの別datagramのtemplateに従わない）。後続を転送するのはallow templateだけなので、pending/denyのevictは後続を拒否か新しい
   holdにするだけです。mappingを持つpeerを詐称した最初のfragmentはreturn trafficとして許可されallow entryに
   なるので（re-review M-D）、さらに一つのingressのentryをtableの`ingress-share-percent`（default 50）までに
   制限し、あるinterfaceのfloodが他のinterfaceのdatagramのentryを取れないようにします
   （`IPV4_FRAGMENT_INGRESS_LIMIT`。shareは上限で予約ではないので、等分するには100/n以下。
-  `validate`/`run`/reloadはfloor(entries × share / 100) × (n − 1) ≥ entriesを警告）。ingressはopen
+  `validate`/`run`/reloadはentryとheld slotのそれぞれでfloor(数 × share / 100) × (n − 1) ≥ 数を警告）。ingressはopen
   addressingのmapでO(1)に引きます。held slotが尽きるとingressごとのholdを持つpendingのlistから、
   holdするdatagram自身以外をevictします: held slotのshare以上をholdするingressは自分の最古、未満なら
   shareを超えたingressの最古、無ければ自分の最古。victimは全て選んでからadmissionが成り立つ時だけ
