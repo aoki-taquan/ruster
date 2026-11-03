@@ -2,6 +2,16 @@ use std::{marker::PhantomData, rc::Rc};
 
 use crate::{ForwardingSnapshot, IfId, Ipv4Address, OccupancyCounter, TableOccupancy};
 
+mod input;
+
+pub(crate) use input::{
+    check_input_firewall_rules, evaluate_input_firewall, InputFirewallPacket, InputFirewallVerdict,
+};
+pub use input::{
+    validate_input_firewall_rules, InputFirewallAction, InputFirewallError, InputFirewallProtocol,
+    InputFirewallRule,
+};
+
 pub const FIREWALL_UDP_MIN_IDLE_TTL_MS: u64 = 120_000;
 pub const FIREWALL_UDP_DEFAULT_IDLE_TTL_MS: u64 = 300_000;
 pub const FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS: u64 = 240_000;

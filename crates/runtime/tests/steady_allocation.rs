@@ -271,8 +271,9 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         // URPF added the per-interface source validation bindings (a
         // borrowed slice, 16 bytes) to the by-value snapshot; ARP-033 the
         // flattened RFC 5227 announcement policy (8 bytes past the ARP and
-        // IPv4 origin policies' padding).
-        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 112);
+        // IPv4 origin policies' padding); INPUT-FW the input firewall rules
+        // (a borrowed slice, 16 bytes; the default action sits in padding).
+        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 128);
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
         // N1 added the opening and closing idle TTLs to the TCP policy, and
@@ -286,8 +287,9 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
             size_of::<ruster_runtime::Nat44IcmpServiceView<'static, 'static>>(),
             120
         );
-        // URPF: +16 bytes, the source validation slice of the snapshot.
-        assert!(size_of::<FullServiceView<'static, 'static>>() <= 712);
+        // URPF: +16 bytes, the source validation slice of the snapshot;
+        // INPUT-FW: +16 bytes, the input firewall rules slice.
+        assert!(size_of::<FullServiceView<'static, 'static>>() <= 728);
     }
 
     counting::self_check();

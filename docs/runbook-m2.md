@@ -714,20 +714,26 @@ parameter-problem = true      # 12/0 for truncated datagrams and bad options
 admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
 ```
 
-- **The forward firewall does not cover router addresses.** Datagrams
-  addressed to the router (Echo, and these errors) are never evaluated by
-  `[firewall]`, which judges forwarded traffic only; there is no input
-  firewall yet. With a default-deny firewall the WAN address still
-  answers every UDP port with Port Unreachable (so a scanner learns that
-  all are closed and that the router is there) and every unimplemented
-  protocol with Protocol Unreachable (a working protocol scan). For a
-  silent WAN address set `protocol-unreachable = false`,
-  `udp-port-unreachable = false`, `parameter-problem = false`, and
-  `[ipv4-origin] echo-reply = false`; without a firewall, and with the
-  public address = WAN address, also set `[nat44.tcp]
-  unsolicited-syn-icmp = false` (the TCP NAT's delayed Port Unreachable to
-  unsolicited SYNs). The switches are router-wide: per-interface or
-  per-zone scoping is not implemented yet.
+- **The forward firewall does not cover router addresses; the input
+  firewall does.** Datagrams addressed to the router (Echo, and these
+  errors) are never evaluated by the forward rules `[[firewall.rules]]`,
+  which judge forwarded traffic only. They are judged by the input
+  firewall `[firewall.input]` (INPUT-FW, "Input firewall" below), whose
+  default is `accept`: without the table a default-deny forward firewall
+  still lets the WAN address answer every UDP port with Port Unreachable
+  (so a scanner learns that all are closed and that the router is there)
+  and every unimplemented protocol with Protocol Unreachable (a working
+  protocol scan). For a silent WAN address use the recommended WAN
+  stealth policy (input `default-action = "deny"` with an `accept` rule
+  for the LAN, and optionally Echo from a management prefix): it is per
+  interface and leaves the LAN answered. The router-wide switches
+  (`protocol-unreachable = false`, `udp-port-unreachable = false`,
+  `parameter-problem = false`, `[ipv4-origin] echo-reply = false`) still
+  work but silence every interface. Neither covers the NAT: with the
+  public address = WAN address, TCP to the public address is NAT traffic,
+  so also set `[nat44.tcp] unsolicited-syn-icmp = false` (the TCP NAT's
+  delayed Port Unreachable to unsolicited SYNs) unless the forward
+  firewall already keeps it silent.
 - UDP and TCP to the NAT public address are not "for the router": they go
   to the NAT as before (no mapping: `NAT44_UDP_MAPPING_MISS`; for TCP see
   `unsolicited-syn-icmp`). `udp-port-unreachable` does not touch the TCP
@@ -913,6 +919,107 @@ does not use, which `strict` drops.
   appended after 208, so stats and JSONL gain one `drop.*` field at the
   end (0 while every interface is `off`); nothing else changes for a
   config without the keys.
+
+### Input firewall (INPUT-FW)
+
+`[firewall.input]` is a stateless first-match policy for datagrams
+addressed to one of the router's own addresses (the ingress interface's
+address, ICMP4-001): Echo, the ICMP-ERR answers above, ICMP messages the
+router consumes, and anything else for the router. The default is
+`default-action = "accept"`, the RFC behavior, so a config without the
+table behaves exactly as before.
+
+```toml
+[firewall.input]
+default-action = "deny"          # absent: "accept"
+
+[[firewall.input.rules]]         # first match wins, document order
+id = 10                          # nonzero, unique among input rules
+ingress = "lan"                  # every selector is optional ("any")
+action = "accept"
+
+[[firewall.input.rules]]
+id = 20
+ingress = "wan"
+source = "198.51.100.0/24"       # a management prefix
+protocol = "icmp"                # "icmp", "tcp", "udp"; absent: any protocol
+icmp-type = 8                    # Echo; only with protocol = "icmp"
+action = "accept"
+
+# For a future local service: destination-ports only with tcp/udp.
+# [[firewall.input.rules]]
+# id = 30
+# ingress = "lan"
+# protocol = "udp"
+# destination-ports = { first = 53, last = 53 }
+# destination = "192.168.1.1/32"
+# action = "accept"
+```
+
+That is the recommended WAN stealth policy: the LAN is answered as
+before (Echo, Port/Protocol Unreachable, Parameter Problem), the WAN
+answers Echo from the management prefix only, and nothing else on the WAN
+gets any answer. Drop rule 20 for a WAN that answers nothing. The
+built-in default and the fixtures stay `accept` (owner policy: RFC by
+default, hardening configurable).
+
+- A denied datagram is silently discarded before any local decision:
+  `drop.IPV4_INPUT_FIREWALL_RULE_DENIED` (code 210) for a `deny` rule,
+  `drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED` (code 211) for the `deny`
+  default, trace event `Ipv4InputFirewallDenied{ingress, source, rule}`.
+  No Echo Reply and no ICMP error of any kind (Port/Protocol Unreachable,
+  Parameter Problem). Input deny wins: the `[icmpv4-errors.generate]`
+  switches and `[ipv4-origin] echo-reply` are never reached, so their
+  `disabled_*` counters and `ICMPV4_ECHO_DISABLED` do not count denied
+  datagrams. An accepted datagram is decided as without the table, the
+  switches included.
+- Selectors: `ingress` (interface name), `source` and `destination`
+  (CIDR), `protocol` (`icmp`, `tcp`, `udp`), `icmp-type` (0-255, ICMP
+  only), and `destination-ports` (TCP/UDP only). Validation codes:
+  `FIREWALL_INPUT_ICMP_TYPE_NOT_ICMP`, `FIREWALL_INPUT_PORTS_NOT_TCP_UDP`,
+  `FIREWALL_INPUT_RULES` (zero or repeated id), and the forward rules'
+  `UNKNOWN_INTERFACE`, `FIREWALL_PREFIX`, `FIREWALL_PORT_RANGE`. At most
+  4096 rules (`LIST_TOO_LONG`). Input and forward rule ids are separate.
+- Stateless on purpose: the router originates no TCP or UDP session and
+  no ICMP query, so nothing addressed to it is a reply to something it
+  started; its own ICMP errors are never answered, and replies to NAT
+  traffic take the NAT path. A flow table would hold nothing a rule cannot
+  say. There is no `allow-stateful`.
+- NAT traffic is not local delivery and stays with the NAT and the
+  forward firewall, even when the public address is the WAN address: UDP
+  and TCP to the public address, Echo Replies and ICMP errors for NAT
+  mappings, and fragments to the public address (NAT-FRAG). A deny-all WAN
+  input policy does not break NAT. Echo Requests and other protocols to
+  the public address are for the router and are judged here.
+- Order: the L2 checks, the martian source/destination checks, and URPF
+  run first and keep their reasons; then the input firewall; then the
+  local decision and its errors. Transit pays nothing (the check is on the
+  local path only); without rules and with `accept` the local path pays
+  one branch; otherwise one walk of at most 4096 rules, no allocation.
+- Fragments for the router (consumed without reassembly, ICMP4-006) are
+  judged one by one. A first fragment carries its transport header; a
+  later fragment does not, and neither does a datagram the link truncated.
+  Without a transport header a rule with `icmp-type` or a partial
+  `destination-ports` range matches only if it denies (fail closed): an
+  Echo `accept` rule never admits an unknown type, a `deny` rule for a port
+  refuses it. A truncated datagram denied this way gets no Parameter
+  Problem and keeps its drop `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`.
+- The address of another interface (for example the LAN address arriving
+  on the WAN) is not local delivery (ICMP4-001): it is transit, judged by
+  the NAT and the forward firewall. Limited and directed broadcasts are
+  refused as martians before this point and never reach it. ARP is not
+  covered.
+- Reload: every change is reloadable (`ruster plan` shows
+  `firewall-input-rule + id 20 icmp type 8 if2 198.51.100.0/24 ->
+  0.0.0.0/0 accept`, `firewall-input-rule-order ~ changed`, and
+  `firewall-input-default ~ accept -> deny`); no state is flushed or
+  re-evaluated for it (the forward flows carry as before).
+- Storage is unchanged (67050272 bytes for the maximal production config,
+  67106224 with the per-host limits): the rules live in the forwarding
+  snapshot like the forward rules, not in runtime storage.
+- Upgrade note: drop codes 210 `IPV4_INPUT_FIREWALL_RULE_DENIED` and 211
+  `IPV4_INPUT_FIREWALL_DEFAULT_DENIED` are appended after 209, so stats and
+  JSONL gain two `drop.*` fields at the end (0 without the table).
 
 ### DF-clear datagrams through the NAT (MTU2 part A)
 
@@ -3430,6 +3537,13 @@ What it proves, on the runner's kernel only:
   from host B's extra inside address 192.168.1.99/32 gets no reply and
   counts `drop.IPV4_SOURCE_VALIDATION_FAILED`; a SIGHUP reload to `off`
   (generation 2) answers it again; exit 0, nothing attached.
+  Added by INPUT-FW (`priv_run_inputfw`): with `[firewall.input]
+  default-action = "deny"` and one rule accepting the LAN, host A -> host
+  B is still forwarded and translated and host A's Echo to 192.168.1.1 is
+  answered, while host B's Echo to 203.0.113.2 gets no reply and counts
+  `drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED`; a SIGHUP reload adding a rule
+  for Echo from 203.0.113.1/32 on the WAN (generation 2) answers it; exit
+  0, nothing attached.
   Added by MTU2 part B (`priv_run_frag*`): with the WAN link (rb, pb, and
   the wan `mtu`) at 1400, a DF-clear 1500-byte UDP datagram from host A
   arrives at host B's pb as exactly the RFC 791 pair of fragments from
@@ -3707,6 +3821,7 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `drop.IPV4_FRAME_EXCEEDS_MTU` | — | frames carry bytes after the IPv4 datagram beyond the egress MTU | find the sender appending trailers; the datagrams themselves fit |
 | `stage=checks code=MTU_BELOW_CONFIG mtu=M config=C` | 1 | the device MTU M is below the interface's configured `mtu` C (default 1500) | set the interface `mtu` to the link's MTU (at most M), or raise the device MTU (section 5, "Interface MTU") |
 | `drop.IPV4_LOCAL_UDP_PORT_UNREACHABLE` / `IPV4_LOCAL_PROTOCOL_UNREACHABLE` growing | — | UDP or another protocol sent to a router address (scans, misconfigured clients, a service expected on the router) | normal at a low rate; `udp-port-unreachable = false` / `protocol-unreachable = false` to stop answering (ICMP-ERR) |
+| `drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED` / `IPV4_INPUT_FIREWALL_RULE_DENIED` growing | — | datagrams for a router address refused by `[firewall.input]` (scans of the WAN address, or a host whose traffic to the router you meant to allow) | normal for a stealth WAN; otherwise add an `accept` rule before the deny (first match) and reload (INPUT-FW) |
 | `drop.IPV4_LOCAL_TCP_UNSUPPORTED` growing | — | TCP to a router address (scans, a client expecting a service on the router); not answered | nothing runs on the router; point clients at the right host |
 | `icmpv4_errors.queued_parameter_problem` growing | — | truncated datagrams (a link or device shortening frames) or malformed IP options from a sender | find the link or sender; `parameter-problem = false` to stop answering |
 | `drop.IPV4_FRAGMENTATION_NEEDED` growing | — | DF datagrams above an egress MTU; senders get Fragmentation Needed | normal for PMTUD; persistent growth from one sender means it ignores the error (check `icmpv4_errors.rate_limited`, firewalls in front of the sender) |

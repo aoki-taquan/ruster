@@ -117,6 +117,12 @@ fn only(plan: &ApplyPlan, aspects: &[&str]) {
         ("ipv4_origin", plan.ipv4_origin_changed()),
         ("arp", plan.arp_policy_changed()),
         ("source_validation", !plan.source_validation().is_empty()),
+        (
+            "input_firewall",
+            !plan.input_firewall_rules().is_empty()
+                || plan.input_firewall_rule_order_changed()
+                || plan.input_firewall_default().is_some(),
+        ),
         ("nat44_udp", !plan.nat44_udp().is_empty()),
         ("nat44_tcp", !plan.nat44_tcp().is_empty()),
         ("backend", !plan.backend().is_empty()),
@@ -1502,5 +1508,100 @@ fn source_validation_changes_are_reloadable_per_interface_deltas() {
     assert_eq!(
         candidate.authority().snapshot().source_validation(IfId(2)),
         SourceValidation::Off
+    );
+}
+
+/// INPUT-FW: `[firewall.input]` edits are reloadable (no restart, no
+/// storage shape change) and carry every stateful family: rule changes by
+/// id, a first-match order change, and a default-action change are listed,
+/// spelling out the defaults is no change at all, and the successor's
+/// forwarding snapshot carries the new policy.
+#[test]
+fn input_firewall_changes_are_reloadable_and_stateless() {
+    use ruster_core::{InputFirewallAction, InputFirewallProtocol};
+
+    const ANCHOR: &str = "[firewall.capacity]\nstates = 16";
+    let with = |table: &'static str| -> (&'static str, String) {
+        (ANCHOR, format!("{ANCHOR}\n\n{table}"))
+    };
+    let edit = |table: &'static str| {
+        let (from, to) = with(table);
+        config(&[(from, Box::leak(to.into_boxed_str()))])
+    };
+    let input_only = |plan: &ApplyPlan| {
+        let changed = !plan.input_firewall_rules().is_empty()
+            || plan.input_firewall_rule_order_changed()
+            || plan.input_firewall_default().is_some();
+        only(plan, if changed { &["input_firewall"] } else { &[] });
+        assert!(plan.restart_required().is_empty());
+        let carry = plan.carry();
+        assert_eq!(carry.firewall, StateCarryOutcome::Carried);
+        assert!(!carry.firewall_reevaluated);
+        assert_eq!(plan.flush().firewall_flows, FlushCount::Exact(0));
+    };
+
+    let base = config(&[]);
+    let defaults = edit("[firewall.input]\ndefault-action = \"accept\"\n");
+    let unchanged = ApplyPlan::between(&base, &defaults).expect("plan");
+    input_only(&unchanged);
+    assert!(unchanged.input_firewall_rules().is_empty());
+    assert_eq!(unchanged.input_firewall_default(), None);
+
+    let stealth = edit(
+        "[firewall.input]\ndefault-action = \"deny\"\n\n\
+         [[firewall.input.rules]]\nid = 1\ningress = \"lan\"\naction = \"accept\"\n\n\
+         [[firewall.input.rules]]\nid = 2\nprotocol = \"icmp\"\nicmp-type = 8\naction = \"accept\"\n",
+    );
+    let added = ApplyPlan::between(&base, &stealth).expect("plan");
+    input_only(&added);
+    assert_eq!(
+        added.input_firewall_default(),
+        Some(Delta {
+            old: InputFirewallAction::Accept,
+            new: InputFirewallAction::Deny,
+        })
+    );
+    assert_eq!(added.input_firewall_rules().len(), 2);
+    assert!(added
+        .input_firewall_rules()
+        .iter()
+        .all(|change| matches!(change, Change::Added(_))));
+    assert!(!added.input_firewall_rule_order_changed());
+
+    let reordered = edit(
+        "[firewall.input]\ndefault-action = \"deny\"\n\n\
+         [[firewall.input.rules]]\nid = 2\nprotocol = \"icmp\"\nicmp-type = 0\naction = \"accept\"\n\n\
+         [[firewall.input.rules]]\nid = 1\ningress = \"lan\"\naction = \"accept\"\n",
+    );
+    let changed = ApplyPlan::between(&stealth, &reordered).expect("plan");
+    input_only(&changed);
+    assert!(changed.input_firewall_rule_order_changed());
+    assert_eq!(changed.input_firewall_default(), None);
+    let [Change::Changed(Delta { old, new })] = changed.input_firewall_rules() else {
+        panic!("{:?}", changed.input_firewall_rules());
+    };
+    assert_eq!(
+        (old.protocol(), new.protocol()),
+        (
+            InputFirewallProtocol::Icmp { icmp_type: Some(8) },
+            InputFirewallProtocol::Icmp { icmp_type: Some(0) }
+        )
+    );
+
+    let removed = ApplyPlan::between(&stealth, &base).expect("plan");
+    input_only(&removed);
+    assert!(removed
+        .input_firewall_rules()
+        .iter()
+        .all(|change| matches!(change, Change::Removed(_))));
+
+    // The successor carries the policy into its forwarding snapshot.
+    let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(SEED));
+    let candidate = sequencer.candidate(&stealth).expect("candidate");
+    let snapshot = candidate.authority().snapshot();
+    assert_eq!(snapshot.input_firewall_default(), InputFirewallAction::Deny);
+    assert_eq!(
+        snapshot.input_firewall_rules(),
+        stealth.firewall().unwrap().input_rules()
     );
 }

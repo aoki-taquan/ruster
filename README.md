@@ -34,7 +34,7 @@ Serde/TOML parserを最小featureで直接利用します（`ruster-control`と`
   fixed-capacity dynamic ARP cache、local ICMPv4 Echo
   responder、ICMPv4 Time Exceeded / Destination Unreachable / Parameter Problem生成、opt-inの
   single-domain UDP NAT44/NAPT、outbound-initiated TCP NAT44/NAPT、最小IPv4
-  stateful forward firewall、forwardしたDF=0 datagramのfragmentation（MTU2 part B）、受信fragmentを
+  stateful forward firewall、router宛てdatagramのstateless input firewall（INPUT-FW）、forwardしたDF=0 datagramのfragmentation（MTU2 part B）、受信fragmentを
   最初のfragmentの判定へ結びつけるfragment association（NAT-FRAG）と、それらを一workerへbindする
   full composition wrapperを扱う。
 - `ruster-runtime`: genericなpublication seamから一つのactive generationを借用し、
@@ -344,13 +344,51 @@ TCPを生成しない）、ICMP/TCP/UDP以外は`IPV4_LOCAL_PROTOCOL_UNREACHABLE
 でないstrict source route（drop reasonは`IPV4_OPTIONS_UNSUPPORTED`のまま）に返します。どれも
 既存kindと同じlimiter class 0、suppression、reverse route、quote規則を使い、storageは増えません。
 errorは受信したままのdatagramを引用してsenderの側へ返るのでNAT翻訳は不要です。
-**注意**: router宛てのdatagramはforward firewall（`[firewall]`）を通りません（input firewallは
-未実装）。default-denyでもWAN addressはUDPの全portにPort Unreachable、未実装protocolに
-Protocol Unreachableを返し、外からport/protocol scanとrouterの存在確認ができます。WANを
-黙らせるには`protocol-unreachable`/`udp-port-unreachable`/`parameter-problem`を`false`、
-`[ipv4-origin] echo-reply = false`にします（firewallが無くpublic address = WAN addressなら
-`[nat44.tcp] unsolicited-syn-icmp = false`も。switchはrouter全体、interface別は未実装）。詳細は
-runbookの「Errors about datagrams for the router and bad headers (ICMP-ERR)」。
+**注意**: router宛てのdatagramはforward firewallのrule（`[[firewall.rules]]`）を通りません。
+判定するのはinput firewall（`[firewall.input]`、下記）で、そのdefaultは`accept`（RFCどおり）です。
+tableが無ければdefault-denyのforward firewallでもWAN addressはUDPの全portにPort Unreachable、
+未実装protocolにProtocol Unreachableを返し、外からport/protocol scanとrouterの存在確認ができます。
+WANを黙らせるには下の推奨WAN stealth設定（interface別、LANは従来どおり答える）を使います。
+router全体のswitch（`protocol-unreachable`/`udp-port-unreachable`/`parameter-problem`を`false`、
+`[ipv4-origin] echo-reply = false`）も効きますが全interfaceが黙ります。NAT public address宛ての
+TCPはNATの経路なので、public address = WAN addressでforward firewallが黙らせない構成なら
+`[nat44.tcp] unsolicited-syn-icmp = false`も要ります。詳細はrunbookの「Errors about datagrams for
+the router and bad headers (ICMP-ERR)」と「Input firewall (INPUT-FW)」。
+
+input firewall（INPUT-FW）`[firewall.input]`はrouter自身のaddress（ingress interfaceのaddress、
+ICMP4-001）宛てdatagramのstatelessなfirst-match policyです。selectorはingress interface、source/
+destination prefix、protocol（`icmp`/`tcp`/`udp`、省略でany）、ICMP type、TCP/UDPのdestination
+port（将来のlocal service用）で、forward ruleと同じprefix/port range/interface/rule idの型と
+matcherを使います。denyはlocal判定の前のsilent drop（`IPV4_INPUT_FIREWALL_RULE_DENIED` code 210、
+`IPV4_INPUT_FIREWALL_DEFAULT_DENIED` code 211）で、Echo ReplyもPort/Protocol Unreachableも
+Parameter Problemも返さず、`[icmpv4-errors.generate]`と`echo-reply`より優先します（input deny wins）。
+routerはTCP/UDP sessionもICMP queryも自分から始めないのでrouter宛てに「応答」は無く、stateは持ちません。
+martian検査とURPFの後、local errorの前に判定し、transitは追加costなし（local経路だけ）、rule無し+
+`accept`ならbranch一つ。NAT public address宛てのNAT traffic（UDP/TCP、mappingへのEcho Reply/ICMP
+error、public address宛てfragment）はpublic address = WAN addressでもlocal deliveryではなくNATの
+経路のまま。router宛てfragment（reassemblyなし）とtruncated datagramはtransport headerなしで判定し、
+ICMP typeやportを要るruleは`deny`のときだけmatchします（fail closed）。reload可能で、ruleは
+forwarding snapshotにありruntime storageは増えません。
+
+推奨するWAN stealth設定（built-in defaultとfixtureは`accept`のまま）:
+
+```toml
+[firewall.input]
+default-action = "deny"          # 省略時 "accept"（RFCどおり）
+
+[[firewall.input.rules]]
+id = 10
+ingress = "lan"                  # LANは従来どおり全部答える
+action = "accept"
+
+[[firewall.input.rules]]
+id = 20
+ingress = "wan"
+source = "198.51.100.0/24"       # 管理prefixからのEchoだけ（不要なら消す）
+protocol = "icmp"
+icmp-type = 8
+action = "accept"
+```
 
 IPv4 source address validation (URPF)は`[[interfaces]]`ごとの`source-validation`です。
 RFC 1812 §5.3.8（"If this feature is implemented, it MUST be disabled by default"）に従いdefaultは
@@ -1489,7 +1527,7 @@ directory外の読めるfileへのsymlinkにatomicに置き換えると`stage=re
 directory内へ置くとapply。uid 0では`/etc/shadow`、`/etc/passwd`、`/proc/1/status`、
 `/proc/<pid>/root/etc/shadow`へのsymlinkが全て`PERMISSION_DENIED`。対照として`--fs-confine off`では
 同じ`/etc/passwd`がreadを通る）、
-RELOAD-CARRYのreload_carry phase（host Aからhost BへのNAT越しの長寿命TCP接続と固定source portのUDP flowが、無関係なfirewall ruleを足すSIGHUP reloadの後も同じsocket・同じpublic portで通り（reload行は全family `carried`、revoke 0）、両方を拒否するruleへのreloadでrevokeされ以後通らない（`firewall-revoked=2`）。AF_PACKET phaseの中でも同じ確認をする）、B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、NAT-FRAGのnatfrag phase（firewall on、host Bのkernelがfragmentした3000-byte UDPがNATを通ってhost Aで再構成され、host Aのraw socketから最後のfragmentを先に送ったoutboundもrouterがholdとreleaseしてhost Bで再構成される。`mode = "refuse"`では届かない）、ARP-HOLDのarphold phase（全neighbor cacheが空の新しいrouterでhost Aの`ping -c1`がhost Bへ一回目で通り、別の新しいrouterで最初のTCP SYNが再送なし（`tcpi_total_retrans` 0、1 sの初期RTOより十分短いconnect）で通る。`arp_hold.held = replayed = replay_sent = 1`、`NEIGHBOR_UNRESOLVED`なし。`[resolution.hold] enabled = false`では同じpingが失われる）、
+RELOAD-CARRYのreload_carry phase（host Aからhost BへのNAT越しの長寿命TCP接続と固定source portのUDP flowが、無関係なfirewall ruleを足すSIGHUP reloadの後も同じsocket・同じpublic portで通り（reload行は全family `carried`、revoke 0）、両方を拒否するruleへのreloadでrevokeされ以後通らない（`firewall-revoked=2`）。AF_PACKET phaseの中でも同じ確認をする）、B3のunsolicited_syn phase（WAN→LANのnew TCP flowを全destinationへ許可するruleを足すと、host BのTCP SYNが未mappingのpublic portへ届いて6秒以上後に一つだけICMP 3/3、reloadでswitch offにすると何も返らず、router-v1のdefault deny firewallへreloadしても何も返らない）、N5のicmp_query phase（`[nat44.icmp]`の無いrouter-v1ではhost Aからhost Bへの`ping`が届かず`NAT44_UDP_UNSUPPORTED_TRANSPORT`、`[nat44.icmp]`と`icmp` firewall ruleを足した構成（planは`nat44-icmp ~ off -> on`でrestart-required）ではhost Bへのpingが3/3返り（host Bには192.168.1.0/24への経路が無いので、replyが返ること自体が変換の証拠）、public addressへのpingはrouter自身が答え、`nat44_icmp.outbound_translated=3`と`inbound_translated=3`、mapping 1つ）、MTU2 part Aのdf_clear phase（host Aのraw socketから同じIPv4 IDのDF=0 UDP二つとDF=1一つをhost Bへ送ると、host Bでは三つとも203.0.113.2から届き、DF=0の二つはDF=0のまま連続した生成ID、DF=1は送ったIDのまま）、MTU2 part Bのfrag phase（WANを1400にするとhost AのDF=0 1500-byte UDPがNAT後にRFC 791どおりの2 fragmentでhost Bに届き再構成され、LANを1280にするとhost BのDF=0 1400-byte UDPがinboundで2 fragmentになりhost Aで再構成される）、NAT-FRAGのnatfrag phase（firewall on、host Bのkernelがfragmentした3000-byte UDPがNATを通ってhost Aで再構成され、host Aのraw socketから最後のfragmentを先に送ったoutboundもrouterがholdとreleaseしてhost Bで再構成される。`mode = "refuse"`では届かない）、ARP-HOLDのarphold phase（全neighbor cacheが空の新しいrouterでhost Aの`ping -c1`がhost Bへ一回目で通り、別の新しいrouterで最初のTCP SYNが再送なし（`tcpi_total_retrans` 0、1 sの初期RTOより十分短いconnect）で通る。`arp_hold.held = replayed = replay_sent = 1`、`NEIGHBOR_UNRESOLVED`なし。`[resolution.hold] enabled = false`では同じpingが失われる）、INPUT-FWのinputfw phase（`[firewall.input] default-action = "deny"`とLANを許可するruleでhost A→host BのNAT転送とhost Aの192.168.1.1へのpingは通り、host Bの203.0.113.2へのpingは無応答で`drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED`、WANのEcho ruleを足すSIGHUP reload後は応答）、
 M2 S10bのops phase（一つの稼働中routerでSIGHUP reloadによりUDP ruleをdenyにして届かなくなり、
 戻して再び届く。generation 2/3でrestartなし。UMEM shapeを変えたreloadは`RESTART_REQUIRED`で
 拒否され転送は継続。router netns内の`ip link set ra down/up`でwarningとrecovered、転送回復。rbの

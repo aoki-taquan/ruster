@@ -1,19 +1,20 @@
 use std::{fmt, mem::size_of, net::Ipv4Addr, num::ParseIntError};
 
 use ruster_core::{
-    port_free_bitmap_words, validate_firewall_rules, ArpHoldPolicy, ArpHoldPolicyError,
-    ArpHoldSlot, ArpPolicy, DirectoryBucket, DirectoryNode, DynamicNeighborSlot, FirewallAction,
-    FirewallConfigError, FirewallInterface, FirewallIpv4Prefix, FirewallIpv4PrefixError,
-    FirewallPolicy, FirewallPolicyError, FirewallPortRange, FirewallPortRangeError,
-    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallStateSlot, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4FragmentEntrySlot,
-    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
-    Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError, Ipv4FragmentationPolicy,
-    Ipv4FragmentationPolicyError, Ipv4OriginPolicy, Ipv4OriginPolicyError, LocalIpv4Binding,
-    MacAddress, Nat44Filtering, Nat44HostLink, Nat44IcmpConfig, Nat44IcmpConfigError,
-    Nat44IcmpPolicy, Nat44IcmpPolicyError, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpConfigError, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
+    port_free_bitmap_words, validate_firewall_rules, validate_input_firewall_rules, ArpHoldPolicy,
+    ArpHoldPolicyError, ArpHoldSlot, ArpPolicy, DirectoryBucket, DirectoryNode,
+    DynamicNeighborSlot, FirewallAction, FirewallConfigError, FirewallInterface,
+    FirewallIpv4Prefix, FirewallIpv4PrefixError, FirewallPolicy, FirewallPolicyError,
+    FirewallPortRange, FirewallPortRangeError, FirewallProtocol, FirewallRule, FirewallRuleId,
+    FirewallStateSlot, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
+    Icmpv4ErrorPolicy, Icmpv4ErrorPolicyError, Icmpv4ErrorStateSlot, IfId, InputFirewallAction,
+    InputFirewallError, InputFirewallProtocol, InputFirewallRule, Interface, Ipv4Address,
+    Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot,
+    Ipv4FragmentTombstoneSlot, Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError,
+    Ipv4FragmentationPolicy, Ipv4FragmentationPolicyError, Ipv4OriginPolicy, Ipv4OriginPolicyError,
+    LocalIpv4Binding, MacAddress, Nat44Filtering, Nat44HostLink, Nat44IcmpConfig,
+    Nat44IcmpConfigError, Nat44IcmpPolicy, Nat44IcmpPolicyError, Nat44Icmpv4ErrorPolicy,
+    Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpPolicyError,
     Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig, Nat44UdpConfigError,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Neighbor,
     PortOwnerSlot, ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionPolicy,
@@ -191,6 +192,15 @@ pub enum ValidationCode {
     FirewallPortRange(FirewallPortRangeError),
     FirewallPolicy(FirewallPolicyError),
     FirewallRules(FirewallConfigError),
+    /// An input firewall rule (`[[firewall.input.rules]]`, INPUT-FW) with
+    /// `icmp-type` whose `protocol` is not `icmp`.
+    FirewallInputIcmpTypeNotIcmp,
+    /// An input firewall rule with `destination-ports` whose `protocol` is
+    /// neither `tcp` nor `udp`.
+    FirewallInputPortsNotTransport,
+    /// Input firewall rules with a zero or repeated id, or an ingress
+    /// interface the snapshot does not have.
+    FirewallInputRules(InputFirewallError),
     CapacityLimitExceeded,
     CapacityNotRepresentable,
     CapacityArithmeticOverflow,
@@ -365,6 +375,9 @@ impl ValidationCode {
             Self::FirewallPortRange(_) => "FIREWALL_PORT_RANGE",
             Self::FirewallPolicy(_) => "FIREWALL_POLICY",
             Self::FirewallRules(_) => "FIREWALL_RULES",
+            Self::FirewallInputIcmpTypeNotIcmp => "FIREWALL_INPUT_ICMP_TYPE_NOT_ICMP",
+            Self::FirewallInputPortsNotTransport => "FIREWALL_INPUT_PORTS_NOT_TCP_UDP",
+            Self::FirewallInputRules(_) => "FIREWALL_INPUT_RULES",
             Self::CapacityLimitExceeded => "CAPACITY_LIMIT_EXCEEDED",
             Self::CapacityNotRepresentable => "CAPACITY_NOT_REPRESENTABLE",
             Self::CapacityArithmeticOverflow => "CAPACITY_ARITHMETIC_OVERFLOW",
@@ -915,12 +928,26 @@ pub struct ValidatedFirewallV1 {
     rules: Box<[FirewallRule]>,
     policy: FirewallPolicy,
     state_slots: u32,
+    input_rules: Box<[InputFirewallRule]>,
+    input_default: InputFirewallAction,
 }
 
 impl ValidatedFirewallV1 {
     #[must_use]
     pub fn rules(&self) -> &[FirewallRule] {
         &self.rules
+    }
+
+    /// The `[[firewall.input.rules]]` (INPUT-FW), in first-match order.
+    #[must_use]
+    pub fn input_rules(&self) -> &[InputFirewallRule] {
+        &self.input_rules
+    }
+
+    /// `[firewall.input] default-action` (INPUT-FW); `accept` when absent.
+    #[must_use]
+    pub const fn input_default(&self) -> InputFirewallAction {
+        self.input_default
     }
 
     #[must_use]
@@ -2267,9 +2294,27 @@ fn validate_v1(
                 path(&["firewall", "rules"]),
             )
         })?;
+        let input = source.input.unwrap_or_default();
+        let input_default = input_action(input.default_action);
+        let mut input_rules = Vec::with_capacity(input.rules.len());
+        for (index, source_rule) in input.rules.into_iter().enumerate() {
+            let mut base = path(&["firewall", "input", "rules"]);
+            base.push_index(index);
+            input_rules.push(validate_input_rule(source_rule, &base, &find_interface)?);
+        }
+        validate_input_firewall_rules(&snapshot, &input_rules).map_err(|error| {
+            ValidationError::new(
+                ValidationCode::FirewallInputRules(error),
+                path(&["firewall", "input", "rules"]),
+            )
+        })?;
         firewall_policy = Some(policy);
         firewall_capacity = Some(source.capacity.states);
-        firewall_rules = Some(rules.into_boxed_slice());
+        firewall_rules = Some((
+            rules.into_boxed_slice(),
+            input_rules.into_boxed_slice(),
+            input_default,
+        ));
     }
 
     // Before the fragmentation slots, whose size depends on the largest
@@ -2438,11 +2483,15 @@ fn validate_v1(
     let firewall = firewall_policy
         .zip(firewall_rules)
         .zip(firewall_capacity)
-        .map(|((policy, rules), state_slots)| ValidatedFirewallV1 {
-            rules,
-            policy,
-            state_slots,
-        });
+        .map(
+            |((policy, (rules, input_rules, input_default)), state_slots)| ValidatedFirewallV1 {
+                rules,
+                policy,
+                state_slots,
+                input_rules,
+                input_default,
+            },
+        );
     let tick = config
         .tick
         .map_or_else(TickBudgetsV1::default, |tick| TickBudgetsV1 {
@@ -3388,6 +3437,13 @@ fn preflight_public_dto(config: &ConfigV1) -> Result<(), ValidationError> {
             firewall.rules.len(),
             crate::MAX_FIREWALL_RULES,
         )?;
+        if let Some(input) = &firewall.input {
+            check_list_bound(
+                path(&["firewall", "input", "rules"]),
+                input.rules.len(),
+                crate::MAX_FIREWALL_RULES,
+            )?;
+        }
     }
     if let Some(backend) = &config.backend {
         check_list_bound(
@@ -4119,6 +4175,100 @@ fn parse_ipv4(value: &str, path: SourcePath) -> Result<Ipv4Address, ValidationEr
         return Err(ValidationError::new(ValidationCode::NonCanonicalIpv4, path));
     }
     Ok(Ipv4Address::from_octets(parsed.octets()))
+}
+
+const fn input_action(action: crate::FirewallInputActionV1) -> InputFirewallAction {
+    match action {
+        crate::FirewallInputActionV1::Accept => InputFirewallAction::Accept,
+        crate::FirewallInputActionV1::Deny => InputFirewallAction::Deny,
+    }
+}
+
+/// One `[[firewall.input.rules]]` entry (INPUT-FW). Absent selectors are
+/// "any"; `icmp-type` only with `icmp`, `destination-ports` only with
+/// `tcp`/`udp`. Field order of the errors: ingress, source, destination,
+/// icmp-type, destination-ports.
+fn validate_input_rule(
+    source_rule: crate::FirewallInputRuleV1,
+    base: &SourcePath,
+    find_interface: &impl Fn(&str) -> Option<IfId>,
+) -> Result<InputFirewallRule, ValidationError> {
+    let ingress = source_rule
+        .ingress
+        .as_deref()
+        .map(|name| {
+            find_interface(name)
+                .map(FirewallInterface::Interface)
+                .ok_or_else(|| {
+                    ValidationError::new(
+                        ValidationCode::UnknownInterface,
+                        child_path(base, "ingress"),
+                    )
+                })
+        })
+        .transpose()?
+        .unwrap_or(FirewallInterface::Any);
+    let prefix = |value: Option<&str>, field: &str| match value {
+        None => Ok(FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0)
+            .expect("0.0.0.0/0 is a prefix")),
+        Some(value) => {
+            let parsed = parse_cidr(value, child_path(base, field))?;
+            FirewallIpv4Prefix::new(parsed.address, parsed.prefix_len).map_err(|error| {
+                ValidationError::new(
+                    ValidationCode::FirewallPrefix(error),
+                    child_path(base, field),
+                )
+            })
+        }
+    };
+    let source = prefix(source_rule.source.as_deref(), "source")?;
+    let destination = prefix(source_rule.destination.as_deref(), "destination")?;
+    if source_rule.icmp_type.is_some() && source_rule.protocol != Some(FirewallProtocolV1::Icmp) {
+        return Err(ValidationError::new(
+            ValidationCode::FirewallInputIcmpTypeNotIcmp,
+            child_path(base, "icmp-type"),
+        ));
+    }
+    let ports = || match source_rule.destination_ports {
+        None => Ok(FirewallPortRange::new(0, u16::MAX).expect("the full range is ordered")),
+        Some(range) => FirewallPortRange::new(range.first, range.last).map_err(|error| {
+            ValidationError::new(
+                ValidationCode::FirewallPortRange(error),
+                child_path(base, "destination-ports"),
+            )
+        }),
+    };
+    let protocol = match source_rule.protocol {
+        Some(FirewallProtocolV1::Tcp) => InputFirewallProtocol::Tcp {
+            destination_ports: ports()?,
+        },
+        Some(FirewallProtocolV1::Udp) => InputFirewallProtocol::Udp {
+            destination_ports: ports()?,
+        },
+        protocol @ (Some(FirewallProtocolV1::Icmp) | None) => {
+            if source_rule.destination_ports.is_some() {
+                return Err(ValidationError::new(
+                    ValidationCode::FirewallInputPortsNotTransport,
+                    child_path(base, "destination-ports"),
+                ));
+            }
+            if protocol.is_some() {
+                InputFirewallProtocol::Icmp {
+                    icmp_type: source_rule.icmp_type,
+                }
+            } else {
+                InputFirewallProtocol::Any
+            }
+        }
+    };
+    Ok(InputFirewallRule::new(
+        FirewallRuleId(source_rule.id),
+        ingress,
+        source,
+        destination,
+        protocol,
+        input_action(source_rule.action),
+    ))
 }
 
 fn parse_cidr(value: &str, path: SourcePath) -> Result<ParsedCidr, ValidationError> {

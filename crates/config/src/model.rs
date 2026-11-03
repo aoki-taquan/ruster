@@ -988,6 +988,61 @@ pub struct FirewallV1 {
     pub capacity: FirewallCapacityV1,
     #[serde(default)]
     pub rules: Vec<FirewallRuleV1>,
+    /// The input (local-delivery) firewall for datagrams addressed to the
+    /// router itself (INPUT-FW). Absent means no rules and
+    /// `default-action = "accept"` (the RFC behavior). Stateless, no
+    /// storage; reloadable.
+    pub input: Option<FirewallInputV1>,
+}
+
+/// `[firewall.input]`: a stateless first-match policy for datagrams
+/// addressed to one of the router's own addresses (INPUT-FW). NAT traffic
+/// to the public address is not local delivery and stays with the forward
+/// firewall, even when the public address is the WAN address.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FirewallInputV1 {
+    /// The action for a local datagram no rule matches; absent means
+    /// `accept`.
+    #[serde(default)]
+    pub default_action: FirewallInputActionV1,
+    #[serde(default)]
+    pub rules: Vec<FirewallInputRuleV1>,
+}
+
+/// One `[[firewall.input.rules]]` entry. Every selector is optional and
+/// absent means "any".
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct FirewallInputRuleV1 {
+    pub id: u32,
+    /// The ingress interface name.
+    pub ingress: Option<String>,
+    /// Source prefix (CIDR).
+    pub source: Option<String>,
+    /// Destination prefix (CIDR), one of the router's addresses or a
+    /// prefix covering some of them.
+    pub destination: Option<String>,
+    /// `icmp`, `tcp`, or `udp`; absent matches every IPv4 protocol.
+    pub protocol: Option<FirewallProtocolV1>,
+    /// One ICMP message type (0-255); only with `protocol = "icmp"`.
+    pub icmp_type: Option<u8>,
+    /// Destination port range; only with `tcp` or `udp`, absent means
+    /// every port.
+    pub destination_ports: Option<Nat44PortRangeV1>,
+    pub action: FirewallInputActionV1,
+}
+
+/// The action of an input rule or the input default (INPUT-FW).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FirewallInputActionV1 {
+    /// Go on to the router's local decision (Echo Reply, the ICMP-ERR
+    /// errors, consume).
+    #[default]
+    Accept,
+    /// Drop silently, without any ICMP error.
+    Deny,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]

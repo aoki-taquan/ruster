@@ -449,6 +449,16 @@ pub enum DropReason {
     /// Silently discarded: no ICMP error (RFC 1812 §5.3.8 "MUST silently
     /// discard"), for transit and router-addressed datagrams alike.
     Ipv4SourceValidationFailed = 209,
+    /// A datagram addressed to the router matched a `deny` rule of the
+    /// input firewall (`[firewall.input]`, INPUT-FW). Silently discarded
+    /// before any local decision: no Echo Reply and no ICMP error of any
+    /// kind, whatever the `[icmpv4-errors.generate]` switches and
+    /// `[ipv4-origin] echo-reply` say.
+    Ipv4InputFirewallRuleDenied = 210,
+    /// A datagram addressed to the router matched no input rule and the
+    /// input firewall's `default-action` is `deny` (INPUT-FW). Silently
+    /// discarded like [`DropReason::Ipv4InputFirewallRuleDenied`].
+    Ipv4InputFirewallDefaultDenied = 211,
 }
 
 use DropReason::*;
@@ -456,7 +466,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 209] = [
+    pub const ALL: [Self; 211] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -666,6 +676,8 @@ impl DropReason {
         Ipv4LocalUdpInvalid,
         Ipv4LocalTcpUnsupported,
         Ipv4SourceValidationFailed,
+        Ipv4InputFirewallRuleDenied,
+        Ipv4InputFirewallDefaultDenied,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -892,6 +904,8 @@ impl DropReason {
             Ipv4LocalUdpInvalid => "IPV4_LOCAL_UDP_INVALID",
             Ipv4LocalTcpUnsupported => "IPV4_LOCAL_TCP_UNSUPPORTED",
             Ipv4SourceValidationFailed => "IPV4_SOURCE_VALIDATION_FAILED",
+            Ipv4InputFirewallRuleDenied => "IPV4_INPUT_FIREWALL_RULE_DENIED",
+            Ipv4InputFirewallDefaultDenied => "IPV4_INPUT_FIREWALL_DEFAULT_DENIED",
         }
     }
 }
@@ -926,6 +940,9 @@ pub enum SnapshotError {
     /// Borrowed source validation bindings are not sorted by interface
     /// (URPF; [`ValidatedForwardingOwner::with_source_validation`] sorts).
     SourceValidationUnsorted,
+    /// An input firewall rule (INPUT-FW) has id 0, repeats an id, or
+    /// names an ingress interface the snapshot does not have.
+    InputFirewall(crate::InputFirewallError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1114,6 +1131,14 @@ pub struct ForwardingSnapshot<'a> {
     /// mode other than [`SourceValidation::Off`]. Empty (the RFC 1812
     /// §5.3.8 default) costs the packet path one branch.
     source_validation: &'a [SourceValidationBinding],
+    /// Input firewall rules (INPUT-FW), first match, judged only for
+    /// datagrams addressed to the router. Empty with an `Accept` default
+    /// (the RFC behavior) costs the local path one branch and transit
+    /// nothing.
+    input_firewall_rules: &'a [crate::InputFirewallRule],
+    /// The input firewall action of a local datagram no rule matches. In
+    /// the padding after the ARP and IPv4 origin policies.
+    input_firewall_default: crate::InputFirewallAction,
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
     /// Without it every lookup uses the linear reference (PERF-002).
@@ -1134,6 +1159,8 @@ impl std::fmt::Debug for ForwardingSnapshot<'_> {
             .field("ipv4_origin", &self.ipv4_origin)
             .field("arp", &self.arp)
             .field("source_validation_len", &self.source_validation.len())
+            .field("input_firewall_rules_len", &self.input_firewall_rules.len())
+            .field("input_firewall_default", &self.input_firewall_default)
             .finish_non_exhaustive()
     }
 }
@@ -1162,6 +1189,8 @@ pub struct ValidatedForwardingOwner {
     ipv4_origin: Ipv4OriginPolicy,
     arp: ArpPolicy,
     source_validation: Box<[SourceValidationBinding]>,
+    input_firewall_rules: Box<[crate::InputFirewallRule]>,
+    input_firewall_default: crate::InputFirewallAction,
     index: ForwardingIndex,
     authority: u64,
 }
@@ -1184,6 +1213,8 @@ impl std::fmt::Debug for ValidatedForwardingOwner {
             .field("ipv4_origin", &self.ipv4_origin)
             .field("arp", &self.arp)
             .field("source_validation_len", &self.source_validation.len())
+            .field("input_firewall_rules_len", &self.input_firewall_rules.len())
+            .field("input_firewall_default", &self.input_firewall_default)
             .finish_non_exhaustive()
     }
 }
@@ -1294,6 +1325,8 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv4_origin,
             arp: ArpPolicy::RFC826,
             source_validation: &[],
+            input_firewall_rules: &[],
+            input_firewall_default: crate::InputFirewallAction::Accept,
             index: None,
             authority: calculate_snapshot_authority(
                 routes,
@@ -1303,6 +1336,8 @@ impl<'a> ForwardingSnapshot<'a> {
                 ipv4_origin,
                 ArpPolicy::RFC826,
                 &[],
+                &[],
+                crate::InputFirewallAction::Accept,
             ),
         })
     }
@@ -1329,6 +1364,8 @@ impl<'a> ForwardingSnapshot<'a> {
                 self.ipv4_origin,
                 arp,
                 self.source_validation,
+                self.input_firewall_rules,
+                self.input_firewall_default,
             )
         } else {
             self.authority
@@ -1376,6 +1413,8 @@ impl<'a> ForwardingSnapshot<'a> {
                 self.ipv4_origin,
                 self.arp,
                 bindings,
+                self.input_firewall_rules,
+                self.input_firewall_default,
             )
         } else {
             self.authority
@@ -1397,6 +1436,56 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub const fn source_validation_bindings(&self) -> &'a [SourceValidationBinding] {
         self.source_validation
+    }
+
+    /// Returns this snapshot with `rules` and `default` as its input
+    /// firewall (INPUT-FW; default: no rules, accept). Rule ids must be
+    /// nonzero and unique, and every ingress interface one of this
+    /// snapshot's. A snapshot not borrowed from a
+    /// [`ValidatedForwardingOwner`] recomputes its authority.
+    ///
+    /// For tests and benches that borrow tables directly. Production code
+    /// sets the policy on the owner
+    /// ([`ValidatedForwardingOwner::with_input_firewall`]).
+    pub fn with_input_firewall(
+        self,
+        rules: &'a [crate::InputFirewallRule],
+        default: crate::InputFirewallAction,
+    ) -> Result<Self, SnapshotError> {
+        check_input_firewall(self.interfaces, rules)?;
+        let authority = if self.authority & VALIDATED_OWNER_AUTHORITY_BIT == 0 {
+            calculate_snapshot_authority(
+                self.routes,
+                self.interfaces,
+                self.neighbors,
+                self.local_ipv4,
+                self.ipv4_origin,
+                self.arp,
+                self.source_validation,
+                rules,
+                default,
+            )
+        } else {
+            self.authority
+        };
+        Ok(Self {
+            input_firewall_rules: rules,
+            input_firewall_default: default,
+            authority,
+            ..self
+        })
+    }
+
+    /// The input firewall rules (INPUT-FW), in first-match order.
+    #[must_use]
+    pub const fn input_firewall_rules(&self) -> &'a [crate::InputFirewallRule] {
+        self.input_firewall_rules
+    }
+
+    /// The input firewall default action (INPUT-FW).
+    #[must_use]
+    pub const fn input_firewall_default(&self) -> crate::InputFirewallAction {
+        self.input_firewall_default
     }
 
     pub(crate) const fn authority(&self) -> u64 {
@@ -1626,9 +1715,40 @@ impl ValidatedForwardingOwner {
             ipv4_origin,
             arp: ArpPolicy::RFC826,
             source_validation: Box::default(),
+            input_firewall_rules: Box::default(),
+            input_firewall_default: crate::InputFirewallAction::Accept,
             index,
             authority,
         })
+    }
+
+    /// Returns this owner with `rules` and `default` as the input firewall
+    /// (INPUT-FW) of every snapshot it lends (default: no rules, accept,
+    /// the RFC behavior). Rule ids must be nonzero and unique, and every
+    /// ingress interface one of this owner's. Cold path, nothing is
+    /// reindexed.
+    pub fn with_input_firewall(
+        mut self,
+        rules: Box<[crate::InputFirewallRule]>,
+        default: crate::InputFirewallAction,
+    ) -> Result<Self, ValidatedForwardingOwnerError> {
+        check_input_firewall(&self.interfaces, &rules)
+            .map_err(ValidatedForwardingOwnerError::Snapshot)?;
+        self.input_firewall_rules = rules;
+        self.input_firewall_default = default;
+        Ok(self)
+    }
+
+    /// The input firewall rules (INPUT-FW), in first-match order.
+    #[must_use]
+    pub fn input_firewall_rules(&self) -> &[crate::InputFirewallRule] {
+        &self.input_firewall_rules
+    }
+
+    /// The input firewall default action (INPUT-FW).
+    #[must_use]
+    pub const fn input_firewall_default(&self) -> crate::InputFirewallAction {
+        self.input_firewall_default
     }
 
     /// Returns this owner with `bindings` as the per-interface source
@@ -1679,6 +1799,8 @@ impl ValidatedForwardingOwner {
             ipv4_origin: self.ipv4_origin,
             arp: self.arp,
             source_validation: &self.source_validation,
+            input_firewall_rules: &self.input_firewall_rules,
+            input_firewall_default: self.input_firewall_default,
             index: Some(&self.index),
             authority: self.authority,
         }
@@ -1739,6 +1861,7 @@ fn next_publication_nonce_from(counter: &std::sync::atomic::AtomicU64) -> Option
         .filter(|nonce| *nonce != 0)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn calculate_snapshot_authority(
     routes: &[Route],
     interfaces: &[Interface],
@@ -1747,6 +1870,8 @@ fn calculate_snapshot_authority(
     ipv4_origin: Ipv4OriginPolicy,
     arp: ArpPolicy,
     source_validation: &[SourceValidationBinding],
+    input_firewall_rules: &[crate::InputFirewallRule],
+    input_firewall_default: crate::InputFirewallAction,
 ) -> u64 {
     fn mix(hash: u64, value: u64) -> u64 {
         (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
@@ -1810,7 +1935,59 @@ fn calculate_snapshot_authority(
         hash = mix(hash, 0x5f_0000 | u64::from(binding.interface.0));
         hash = mix(hash, binding.mode as u64);
     }
+    // No rules and accept (the default) mix nothing, so existing
+    // publications keep their authority values.
+    if input_firewall_default == crate::InputFirewallAction::Deny {
+        hash = mix(hash, 0x1f_0000);
+    }
+    for rule in input_firewall_rules {
+        let prefix = |prefix: crate::FirewallIpv4Prefix| {
+            u64::from(u32::from_be_bytes(prefix.address().octets())) << 8
+                | u64::from(prefix.prefix_len())
+        };
+        hash = mix(hash, 0x1e_0000_0000 | u64::from(rule.id().0));
+        hash = mix(
+            hash,
+            match rule.ingress() {
+                crate::FirewallInterface::Any => u64::MAX,
+                crate::FirewallInterface::Interface(id) => u64::from(id.0),
+            },
+        );
+        hash = mix(hash, prefix(rule.source()));
+        hash = mix(hash, prefix(rule.destination()));
+        let ports = |range: crate::FirewallPortRange| {
+            u64::from(range.first()) << 16 | u64::from(range.last())
+        };
+        hash = mix(
+            hash,
+            match rule.protocol() {
+                crate::InputFirewallProtocol::Any => u64::MAX,
+                crate::InputFirewallProtocol::Icmp { icmp_type } => {
+                    1 << 40 | icmp_type.map_or(0x100, u64::from)
+                }
+                crate::InputFirewallProtocol::Tcp { destination_ports } => {
+                    6 << 40 | ports(destination_ports)
+                }
+                crate::InputFirewallProtocol::Udp { destination_ports } => {
+                    17 << 40 | ports(destination_ports)
+                }
+            },
+        );
+        hash = mix(hash, rule.action() as u64);
+    }
     hash & !VALIDATED_OWNER_AUTHORITY_BIT
+}
+
+/// Every input firewall rule has a nonzero unique id and a known ingress
+/// interface (INPUT-FW).
+fn check_input_firewall(
+    interfaces: &[Interface],
+    rules: &[crate::InputFirewallRule],
+) -> Result<(), SnapshotError> {
+    crate::firewall::check_input_firewall_rules(rules, |id| {
+        interfaces.iter().any(|interface| interface.id == id)
+    })
+    .map_err(SnapshotError::InputFirewall)
 }
 
 /// Every binding names a known interface, at most once (URPF).
@@ -2018,6 +2195,18 @@ pub enum TraceEvent {
         ingress: IfId,
         source: crate::Ipv4Address,
         mode: SourceValidation,
+    },
+    /// A datagram addressed to the router was denied by the input firewall
+    /// (INPUT-FW): by the rule `rule`, or by the `deny` default when
+    /// `None`. Dropped as [`DropReason::Ipv4InputFirewallRuleDenied`] or
+    /// [`DropReason::Ipv4InputFirewallDefaultDenied`], without any ICMP
+    /// error. Also emitted for a truncated datagram the input policy
+    /// denies: its Parameter Problem is suppressed and its drop stays
+    /// `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`.
+    Ipv4InputFirewallDenied {
+        ingress: IfId,
+        source: crate::Ipv4Address,
+        rule: Option<crate::FirewallRuleId>,
     },
     /// A datagram held for ARP was dropped with `reason` when it was
     /// replayed (ARP-HOLD). Not a received frame's drop: the frame was
@@ -7808,16 +7997,107 @@ fn reverse_target_forbidden(
         || snapshot.is_connected_boundary(egress, target)
 }
 
+/// The input firewall (INPUT-FW) for a datagram addressed to the router:
+/// `Ok` to go on to the local decision, else the silent drop. One branch
+/// without rules and with the `accept` default (the RFC behavior); never
+/// reached by transit or NAT traffic.
+#[inline]
+fn input_firewall_admits<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    transport_readable: bool,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    if snapshot.input_firewall_rules.is_empty()
+        && snapshot.input_firewall_default == crate::InputFirewallAction::Accept
+    {
+        return Ok(());
+    }
+    judge_input_firewall(frame, snapshot, ingress, ipv4, transport_readable, trace)
+}
+
+/// Walks the input rules (at most 4096 tests, no allocation). The
+/// transport selector is the ICMP type or the TCP/UDP destination port of
+/// a whole datagram or a first fragment; a later fragment, a datagram the
+/// link truncated (`transport_readable` false), or a header too short to
+/// hold it has none (only deny rules then match a transport selector).
+#[cold]
+#[inline(never)]
+fn judge_input_firewall<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    transport_readable: bool,
+    trace: &mut T,
+) -> Result<(), DropReason> {
+    let transport = if transport_readable {
+        input_firewall_transport(frame, ipv4)
+    } else {
+        None
+    };
+    let packet = crate::firewall::InputFirewallPacket {
+        ingress,
+        source: ipv4.source,
+        destination: ipv4.destination,
+        protocol: ipv4.protocol,
+        transport,
+    };
+    let (rule, reason) = match crate::firewall::evaluate_input_firewall(
+        snapshot.input_firewall_rules,
+        snapshot.input_firewall_default,
+        &packet,
+    ) {
+        crate::firewall::InputFirewallVerdict::Accept => return Ok(()),
+        crate::firewall::InputFirewallVerdict::DeniedByRule(rule) => {
+            (Some(rule), Ipv4InputFirewallRuleDenied)
+        }
+        crate::firewall::InputFirewallVerdict::DeniedByDefault => {
+            (None, Ipv4InputFirewallDefaultDenied)
+        }
+    };
+    trace.record(TraceEvent::Ipv4InputFirewallDenied {
+        ingress,
+        source: ipv4.source,
+        rule,
+    });
+    Err(reason)
+}
+
+/// The ICMP type or TCP/UDP destination port of a whole datagram or first
+/// fragment, inside its Total Length; `None` for a later fragment, a short
+/// header, or another protocol.
+fn input_firewall_transport(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Option<u16> {
+    let flags_fragment = packet::read_u16(frame, ipv4.header_offset + 6)?;
+    if flags_fragment & 0x1fff != 0 {
+        return None;
+    }
+    let start = ipv4.header_offset.checked_add(ipv4.header_len)?;
+    let end = ipv4.header_offset.checked_add(ipv4.total_len)?;
+    let transport = frame.get(start..end)?;
+    match ipv4.protocol {
+        1 => transport.first().map(|&kind| u16::from(kind)),
+        6 | 17 => transport
+            .get(2..4)
+            .map(|port| u16::from_be_bytes([port[0], port[1]])),
+        _ => None,
+    }
+}
+
 /// [`decide_local_ipv4`], then the ICMP-ERR error its drop asks for:
 /// Protocol Unreachable, the router's own UDP Port Unreachable, or a
 /// Parameter Problem about malformed options (RFC 1812 §§4.3.3.5,
 /// 5.2.7.1). Every RFC 1812 §4.3.2.7 suppression, the per-kind switch, the
 /// reverse route and neighbor, and the class-0 limiter apply as for every
 /// other generated error. A datagram addressed to the router passes no
-/// forward firewall (there is no input firewall yet): these errors answer
-/// on every router address however the forward policy is set, so they
-/// show the router's presence and its (lack of) services to anyone who
-/// can reach an address. Their switches are the only control.
+/// forward firewall; the input firewall (`[firewall.input]`, INPUT-FW)
+/// judges it first, and a denied datagram gets no Echo Reply and no error
+/// whatever the switches say (input deny wins). With the default input
+/// policy (accept) these errors answer on every router address, so they
+/// show the router's presence and its (lack of) services to anyone who can
+/// reach an address.
 #[allow(clippy::too_many_arguments)]
 fn decide_local_ipv4_with_errors<T: TraceSink>(
     frame: &[u8],
@@ -7828,6 +8108,7 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
+    input_firewall_admits(frame, snapshot, ingress, ipv4, true, trace)?;
     // Without a Port Unreachable to send, the UDP checksum is not read: a
     // flood of UDP to a router address costs no payload pass.
     let udp_checksum = icmpv4_errors.as_ref().is_some_and(|(runtime, _)| {
@@ -8071,6 +8352,12 @@ fn truncated_parameter_problem<T: TraceSink>(
         return;
     }
     let local = snapshot.is_local_ipv4_on(ingress, ipv4.destination);
+    // INPUT-FW: a truncated datagram has no reliable transport header, so
+    // the input policy judges it without one; a deny is silent (the drop
+    // stays `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`).
+    if local && input_firewall_admits(frame, snapshot, ingress, ipv4, false, trace).is_err() {
+        return;
+    }
     let selected_route = if local {
         None
     } else {
@@ -8778,7 +9065,8 @@ mod tests {
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
              arp: ArpPolicy { require_on_link_sender: false, defend_conflicts: true, \
              announce_count: 2, announce_interval_ms: 2000, announce_min_interval_ms: 10000 }, \
-             source_validation_len: 0, .. }"
+             source_validation_len: 0, input_firewall_rules_len: 0, \
+             input_firewall_default: Accept, .. }"
         );
         assert_eq!(
             format!("{first:?}"),
@@ -8786,7 +9074,8 @@ mod tests {
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
              arp: ArpPolicy { require_on_link_sender: false, defend_conflicts: true, \
              announce_count: 2, announce_interval_ms: 2000, announce_min_interval_ms: 10000 }, \
-             source_validation_len: 0, .. }"
+             source_validation_len: 0, input_firewall_rules_len: 0, \
+             input_firewall_default: Accept, .. }"
         );
     }
 
@@ -9699,6 +9988,8 @@ mod tests {
             (207, "IPV4_LOCAL_UDP_INVALID"),
             (208, "IPV4_LOCAL_TCP_UNSUPPORTED"),
             (209, "IPV4_SOURCE_VALIDATION_FAILED"),
+            (210, "IPV4_INPUT_FIREWALL_RULE_DENIED"),
+            (211, "IPV4_INPUT_FIREWALL_DEFAULT_DENIED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9708,7 +9999,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(210), None);
+        assert_eq!(DropReason::from_code(212), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

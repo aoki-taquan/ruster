@@ -59,6 +59,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "capacity",
     "closing-idle-ttl-ms",
     "completion",
+    "default-action",
     "default-ttl",
     "destination",
     "destination-ports",
@@ -96,6 +97,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "hold",
     "host-unreachable",
     "icmp",
+    "icmp-type",
     "icmpv4-errors",
     "id",
     "identifier-preservation",
@@ -105,6 +107,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "inbound-sessions-per-remote",
     "ingress-share-percent",
     "ingress",
+    "input",
     "inside",
     "interface",
     "interfaces",
@@ -345,6 +348,12 @@ fn enforce_list_bounds(config: &ConfigV1) -> Result<(), Diagnostic> {
         let mut path = SourcePath::root_field("firewall");
         path.push_field("rules");
         check_list_path(path, firewall.rules.len(), MAX_FIREWALL_RULES)?;
+        if let Some(input) = &firewall.input {
+            let mut path = SourcePath::root_field("firewall");
+            path.push_field("input");
+            path.push_field("rules");
+            check_list_path(path, input.rules.len(), MAX_FIREWALL_RULES)?;
+        }
     }
     if let Some(backend) = &config.backend {
         let mut path = SourcePath::root_field("backend");

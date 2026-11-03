@@ -358,6 +358,7 @@ pub fn candidate_from_config<S: PublicationKeySource>(
     )
     .with_arp_policy(config.arp())
     .with_source_validation(config.source_validation().into())
+    .with_input_firewall(firewall.input_rules().into(), firewall.input_default())
     .with_nat44_udp(Nat44UdpPublicationInput::new(
         udp.inside(),
         udp.outside(),

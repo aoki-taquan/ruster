@@ -122,6 +122,14 @@
 #             192.168.1.99 is silently dropped
 #             (drop.IPV4_SOURCE_VALIDATION_FAILED, no reply); a SIGHUP
 #             reload to `off` (generation 2) answers it again; exit 0
+#   inputfw   (INPUT-FW) `[firewall.input] default-action = "deny"` with
+#             one rule accepting everything from the LAN: host A -> host B
+#             still forwards and translates and host A's Echo to
+#             192.168.1.1 is answered, while host B's Echo to the WAN
+#             address 203.0.113.2 is silently dropped
+#             (drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED, no reply); a SIGHUP
+#             reload adding a rule for Echo from 203.0.113.1/32 on the WAN
+#             (generation 2) answers it again; exit 0
 #   frag      (MTU2 part B, RFC 791 3.2, RFC 1812 4.2.2.7) rb and pb at
 #             1400 and wan `mtu = 1400`: a 1500-byte DF-clear UDP datagram
 #             from host A (IP_PMTUDISC_DONT) reaches host B as exactly two
@@ -1995,6 +2003,60 @@ phase_urpf() {
     echo "priv_run_urpf: strict lan/wan forwards, answers host B, drops $dropped spoofed inside-source Echo(s) silently, reload to off answers them, exit 0 verified"
 }
 phase_urpf
+
+# inputfw (INPUT-FW): the input firewall denies every datagram for the
+# router except from the LAN; NAT traffic to the public address (which is
+# the WAN address) is not local delivery and keeps working.
+INPUTFW_TABLE='
+[firewall.input]
+default-action = "deny"
+
+[[firewall.input.rules]]
+id = 1
+ingress = "lan"
+action = "accept"
+'
+INPUTFW_ECHO_RULE='
+[[firewall.input.rules]]
+id = 2
+ingress = "wan"
+source = "203.0.113.1/32"
+protocol = "icmp"
+icmp-type = 8
+action = "accept"
+'
+phase_inputfw() {
+    { cat "$work/router.toml"; printf '%s' "$INPUTFW_TABLE"; } >"$work/inputfw-deny.toml"
+    { cat "$work/inputfw-deny.toml"; printf '%s' "$INPUTFW_ECHO_RULE"; } >"$work/inputfw-echo.toml"
+    expect_plan router inputfw-deny reloadable none
+    expect_plan inputfw-deny inputfw-echo reloadable none
+    cp "$work/inputfw-deny.toml" "$work/inputfw.toml"
+    # As the invoking user, so the reload can read the work directory.
+    start_ruster inputfw "$work/inputfw.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready inputfw || fail "inputfw: ruster exited during startup"
+    forward_once inputfw
+    in_ns "$host_a" ping -c 1 -W 2 192.168.1.1 >"$work/inputfw-lan.txt" 2>&1 ||
+        fail "inputfw: host A's Echo to the LAN address was not answered: $(cat "$work/inputfw-lan.txt")"
+    if in_ns "$host_b" ping -c 2 -W 1 203.0.113.2 >"$work/inputfw-wan.txt" 2>&1; then
+        fail "inputfw: host B's Echo to the WAN address was answered"
+    fi
+    wait_stat_ge inputfw drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED 2
+    reload_with "$work/inputfw-echo.toml" "$work/inputfw.toml"
+    wait_line inputfw "reload applied: generation=2 previous=1"
+    in_ns "$host_b" ping -c 1 -W 2 203.0.113.2 >"$work/inputfw-echo.txt" 2>&1 ||
+        fail "inputfw: with the Echo rule host B was not answered: $(cat "$work/inputfw-echo.txt")"
+    forward_once inputfw-reloaded
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "inputfw: exit status $status after SIGTERM"
+    assert_detached "the inputfw run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/inputfw.out" >"$work/inputfw.final"
+    dropped=$(stat_in "$work/inputfw.final" drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED)
+    [ "${dropped:-0}" -ge 2 ] ||
+        fail "inputfw: final drop.IPV4_INPUT_FIREWALL_DEFAULT_DENIED=${dropped:-missing}"
+    echo "priv_run_inputfw: default deny with a LAN accept rule forwards and answers host A, drops $dropped WAN Echo(s) silently, reload with a WAN Echo rule answers host B, exit 0 verified"
+}
+phase_inputfw
 
 # reload_carry (RELOAD-CARRY): a long-lived TCP connection and a UDP flow
 # from host A to host B through the NAT survive an applied SIGHUP reload

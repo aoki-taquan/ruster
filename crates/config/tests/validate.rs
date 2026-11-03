@@ -2848,3 +2848,178 @@ fn source_validation_is_off_by_default_and_maps_onto_core_modes() {
         );
     }
 }
+
+/// INPUT-FW: `[firewall.input]` is accept with no rules when absent (the
+/// RFC behavior), maps every selector onto the core rule in document
+/// (first-match) order, and refuses `icmp-type` without `icmp`,
+/// `destination-ports` without `tcp`/`udp`, unknown interfaces, bad
+/// prefixes, reversed ranges, and zero or repeated ids at their own paths.
+/// The rule list is bounded like the forward rules.
+#[test]
+fn input_firewall_defaults_to_accept_and_maps_onto_core_rules() {
+    use ruster_config::{FirewallInputV1, ValidationCode, MAX_FIREWALL_RULES};
+    use ruster_core::{
+        FirewallInterface, FirewallRuleId, IfId, InputFirewallAction, InputFirewallError,
+        InputFirewallProtocol,
+    };
+
+    let config = validated(VALID);
+    let firewall = config.firewall().unwrap();
+    assert!(firewall.input_rules().is_empty());
+    assert_eq!(firewall.input_default(), InputFirewallAction::Accept);
+
+    let with = |table: &str| VALID.replacen("[tick]", &format!("{table}\n[tick]"), 1);
+    let config = validated(&with(
+        "[firewall.input]\ndefault-action = \"deny\"\n\n\
+         [[firewall.input.rules]]\nid = 9\ningress = \"wan\"\nsource = \"198.51.100.0/24\"\n\
+         protocol = \"icmp\"\nicmp-type = 8\naction = \"accept\"\n\n\
+         [[firewall.input.rules]]\nid = 3\ndestination = \"192.0.2.1/32\"\nprotocol = \"udp\"\n\
+         destination-ports = { first = 53, last = 54 }\naction = \"deny\"\n\n\
+         [[firewall.input.rules]]\nid = 4\nprotocol = \"tcp\"\naction = \"accept\"\n\n\
+         [[firewall.input.rules]]\nid = 5\ningress = \"lan\"\naction = \"accept\"\n",
+    ));
+    let firewall = config.firewall().unwrap();
+    assert_eq!(firewall.input_default(), InputFirewallAction::Deny);
+    let rules = firewall.input_rules();
+    assert_eq!(
+        rules.iter().map(|rule| rule.id()).collect::<Vec<_>>(),
+        [9, 3, 4, 5].map(FirewallRuleId),
+        "first-match order is the document order"
+    );
+    assert_eq!(rules[0].ingress(), FirewallInterface::Interface(IfId(2)));
+    assert_eq!(
+        (
+            rules[0].source().address().octets(),
+            rules[0].source().prefix_len()
+        ),
+        ([198, 51, 100, 0], 24)
+    );
+    assert_eq!(rules[0].destination().prefix_len(), 0);
+    assert_eq!(
+        rules[0].protocol(),
+        InputFirewallProtocol::Icmp { icmp_type: Some(8) }
+    );
+    assert_eq!(rules[0].action(), InputFirewallAction::Accept);
+    assert_eq!(rules[1].ingress(), FirewallInterface::Any);
+    assert_eq!(rules[1].destination().prefix_len(), 32);
+    let InputFirewallProtocol::Udp { destination_ports } = rules[1].protocol() else {
+        panic!("udp rule");
+    };
+    assert_eq!(
+        (destination_ports.first(), destination_ports.last()),
+        (53, 54)
+    );
+    assert_eq!(rules[1].action(), InputFirewallAction::Deny);
+    let InputFirewallProtocol::Tcp { destination_ports } = rules[2].protocol() else {
+        panic!("tcp rule");
+    };
+    assert_eq!(
+        (destination_ports.first(), destination_ports.last()),
+        (0, 65_535)
+    );
+    assert_eq!(rules[3].protocol(), InputFirewallProtocol::Any);
+    assert_eq!(rules[3].ingress(), FirewallInterface::Interface(IfId(1)));
+
+    // An empty table is the default.
+    let config = validated(&with("[firewall.input]\n"));
+    assert_eq!(
+        config.firewall().unwrap().input_default(),
+        InputFirewallAction::Accept
+    );
+
+    let rule = |body: &str| with(&format!("[[firewall.input.rules]]\n{body}"));
+    for (body, code, at) in [
+        (
+            "id = 1\nprotocol = \"udp\"\nicmp-type = 3\naction = \"deny\"\n",
+            ValidationCode::FirewallInputIcmpTypeNotIcmp,
+            "firewall.input.rules[0].icmp-type",
+        ),
+        (
+            "id = 1\nicmp-type = 3\naction = \"deny\"\n",
+            ValidationCode::FirewallInputIcmpTypeNotIcmp,
+            "firewall.input.rules[0].icmp-type",
+        ),
+        (
+            "id = 1\nprotocol = \"icmp\"\ndestination-ports = { first = 1, last = 2 }\n\
+             action = \"deny\"\n",
+            ValidationCode::FirewallInputPortsNotTransport,
+            "firewall.input.rules[0].destination-ports",
+        ),
+        (
+            "id = 1\ndestination-ports = { first = 1, last = 2 }\naction = \"deny\"\n",
+            ValidationCode::FirewallInputPortsNotTransport,
+            "firewall.input.rules[0].destination-ports",
+        ),
+        (
+            "id = 1\nprotocol = \"tcp\"\ndestination-ports = { first = 2, last = 1 }\n\
+             action = \"deny\"\n",
+            ValidationCode::FirewallPortRange(ruster_core::FirewallPortRangeError::Reversed),
+            "firewall.input.rules[0].destination-ports",
+        ),
+        (
+            "id = 1\ningress = \"dmz\"\naction = \"deny\"\n",
+            ValidationCode::UnknownInterface,
+            "firewall.input.rules[0].ingress",
+        ),
+        (
+            "id = 1\nsource = \"192.0.2.1/24\"\naction = \"deny\"\n",
+            ValidationCode::FirewallPrefix(ruster_core::FirewallIpv4PrefixError::HostBitsSet),
+            "firewall.input.rules[0].source",
+        ),
+        (
+            "id = 0\naction = \"deny\"\n",
+            ValidationCode::FirewallInputRules(InputFirewallError::RuleIdZero),
+            "firewall.input.rules",
+        ),
+        (
+            "id = 2\naction = \"deny\"\n\n[[firewall.input.rules]]\nid = 2\naction = \"accept\"\n",
+            ValidationCode::FirewallInputRules(InputFirewallError::DuplicateRuleId),
+            "firewall.input.rules",
+        ),
+    ] {
+        let rejected = error(&rule(body));
+        assert_eq!(rejected.code(), code, "{body}");
+        assert_eq!(dotted(rejected.path()), at, "{body}");
+    }
+    assert_eq!(
+        ValidationCode::FirewallInputIcmpTypeNotIcmp.code(),
+        "FIREWALL_INPUT_ICMP_TYPE_NOT_ICMP"
+    );
+    assert_eq!(
+        ValidationCode::FirewallInputPortsNotTransport.code(),
+        "FIREWALL_INPUT_PORTS_NOT_TCP_UDP"
+    );
+    // Forward and input ids are separate namespaces (VALID has forward
+    // rule 1).
+    validated(&rule("id = 1\naction = \"deny\"\n"));
+
+    for bad in [
+        "[firewall.input]\ndefault-action = \"drop\"\n",
+        "[firewall.input]\nstateful = true\n",
+        "[[firewall.input.rules]]\nid = 1\nicmp-type = 300\nprotocol = \"icmp\"\naction = \"deny\"\n",
+        "[[firewall.input.rules]]\nid = 1\naction = \"allow-stateful\"\n",
+        "[[firewall.input.rules]]\nid = 1\n",
+    ] {
+        assert!(parse(with(bad).as_bytes()).is_err(), "{bad}");
+    }
+
+    let mut bounded = dto();
+    let firewall = bounded.firewall.as_mut().unwrap();
+    let mut input = FirewallInputV1::default();
+    let one = ruster_config::FirewallInputRuleV1 {
+        id: 1,
+        ingress: None,
+        source: None,
+        destination: None,
+        protocol: None,
+        icmp_type: None,
+        destination_ports: None,
+        action: ruster_config::FirewallInputActionV1::Deny,
+    };
+    input.rules = vec![one; MAX_FIREWALL_RULES + 1];
+    firewall.input = Some(input);
+    let rejected = dto_error(bounded);
+    assert_eq!(rejected.code(), ValidationCode::ListTooLong);
+    assert_eq!(rejected.limit(), Some(MAX_FIREWALL_RULES as u64));
+    assert_eq!(dotted(rejected.path()), "firewall.input.rules");
+}
