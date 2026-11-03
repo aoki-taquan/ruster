@@ -149,6 +149,8 @@ struct Setup {
     entries: usize,
     held: usize,
     fragmentation_slots: usize,
+    /// ICMP query NAT in the composition.
+    icmp_nat: bool,
 }
 
 impl Default for Setup {
@@ -161,6 +163,7 @@ impl Default for Setup {
             entries: 16,
             held: 8,
             fragmentation_slots: 16,
+            icmp_nat: true,
         }
     }
 }
@@ -179,6 +182,7 @@ struct World {
     errors: Icmpv4ErrorRuntime<'static>,
     fragmentation: Ipv4FragmentationRuntime<'static>,
     tracker: Option<Ipv4FragmentTracker<'static>>,
+    icmp_nat: bool,
     io: SimIo,
     trace: VecTrace,
 }
@@ -310,6 +314,7 @@ impl World {
             tracker: setup
                 .tracking
                 .map(|policy| tracker(policy, setup.entries, setup.held)),
+            icmp_nat: setup.icmp_nat,
             io,
             trace: VecTrace::default(),
         }
@@ -333,7 +338,8 @@ impl World {
                 Some(&mut self.udp),
                 &self.tcp_config,
                 Some(&mut self.tcp),
-                Some((&self.icmp_config, Some(&mut self.icmp))),
+                self.icmp_nat
+                    .then_some((&self.icmp_config, Some(&mut self.icmp))),
                 &self.firewall_config,
                 Some(&mut self.firewall),
                 None,
@@ -758,6 +764,49 @@ fn nat_inbound_udp_fragments_reach_the_inside_host_in_and_out_of_order() {
         assert_eq!(reassemble(&out), expected, "{order:?}");
     }
     assert_eq!(world.occupancy(), (0, 0));
+}
+
+/// The NAT public address is one of the router's own addresses: fragments
+/// to it are associated whichever NAT protocols the composition has (here
+/// without ICMP query NAT).
+#[test]
+fn fragments_to_the_public_address_are_associated_without_icmp_nat() {
+    let mut world = World::new(Setup {
+        icmp_nat: false,
+        ..Setup::default()
+    });
+    let request = udp_segment(H1, REMOTE, (P1, 53), 32);
+    let outcome = world.run(&lan(&[ipv4_frame(
+        (LAN_MAC, H1_MAC),
+        H1,
+        REMOTE,
+        1,
+        DF,
+        64,
+        UDP,
+        &request,
+    )]));
+    assert_eq!(outcome.tx.len(), 1);
+    let answer = udp_segment(REMOTE, PUBLIC, (53, P1), UDP_DATA);
+    let sent = ipv4_frame(
+        (WAN_MAC, GW_MAC),
+        REMOTE,
+        PUBLIC,
+        0x7878,
+        0,
+        60,
+        UDP,
+        &answer,
+    );
+    let outcome = world.run(&wan(&cut(&sent, &SIZES)));
+    assert!(outcome.drops.is_empty(), "{:?}", outcome.drops);
+    let out = frames_to(&outcome, LAN);
+    let translated = udp_segment(REMOTE, H1, (53, P1), UDP_DATA);
+    let expected = with_id(
+        &ipv4_frame((H1_MAC, LAN_MAC), REMOTE, H1, 0, 0, 59, UDP, &translated),
+        one_id(&out),
+    );
+    assert_eq!(out, cut(&expected, &SIZES));
 }
 
 #[test]
