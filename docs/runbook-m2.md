@@ -1159,11 +1159,13 @@ Counters (`ruster-run-stats`): `arp_hold.held` (= `consume.ARP_HELD`),
 `replaced`, `refused_full`/`refused_host_limit`/`refused_ingress_limit`/`refused_too_large`
 (= `drop.ARP_HOLD_FULL`/`ARP_HOLD_HOST_LIMIT`/`ARP_HOLD_INGRESS_LIMIT`/`ARP_HOLD_TOO_LARGE`),
 `replayed` (decided again), of which `replay_sent` (staged whole),
-`replay_fragmented`, `replay_dropped` (for example a NAT mapping that
+`replay_fragmented`, `replay_parked` (held by the fragment association
+table instead of decided; not expected), `replay_dropped` (for example a NAT mapping that
 expired meanwhile; a replay's drops are not counted again under `drop.*`:
 the frame was already counted as `consume.ARP_HELD`), `replay_unstaged`
 (committed but no fragmentation slot left; a first fragment reserves room
-for the fragments the association table holds, so this stays 0),
+for up to 16 fragments its datagram may hold in the association table, so
+this stays 0),
 `deferred`, `failed` (the resolution failed), `cancelled` (cancelled, or the
 learned neighbour expired while the replay waited for room), `expired`, and
 `flushed`. Every bound is checked also with `enabled = false`; a bound

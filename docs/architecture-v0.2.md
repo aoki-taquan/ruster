@@ -624,7 +624,10 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   （holdがbindされている時）。
 - **bound**: (egress, next hop)ごとに`per-neighbor`（default 3）。超えたらそのnext hopの古いものを
   置き換え、最新を残します（RFC 1122の「latest」、`replaced`）。置き換えるのは送信者自身((ingress,
-  source))の最古があればそれ、無ければ最古（一つのhostが別hostのholdを押し出さない、review sec L2）。
+  source))の最古があればそれ、無ければ同じingressの最古、それも無ければ別ingressの最古ですが、
+  それは新しいdatagramのingressの方がholdが少ない時だけで、そうでなければ`ARP_HOLD_INGRESS_LIMIT`
+  （一つのhostやinterfaceが別のもののholdを押し出さない。少ない側だけが多い側から取れる、
+  review sec L2、re-review L2。RFC 1122の「latest」は自分のingress内では常に保たれる）。
   (ingress, source)ごと（NAT-FRAGと同じく、WANからinside addressを名乗るdatagramがinside hostの枠を
   使わない）に`per-host`（default 16、`ARP_HOLD_HOST_LIMIT`、置き換えるものが同じhostならその分を
   数えない）。ingress interfaceごとに`per-ingress`（default `packets`の半分、32、
@@ -640,9 +643,10 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
 - **replay**: `run_tick`はRX batchの直後（そのbatchのARP replyで解決したnext hopを同じtickで使う）、
   generated phaseを止めるbackend failureが無ければ`replay_arp_holds`を呼びます。held datagramを古い順に
   歩き（無ければO(1)）、next hopがstaticか生きたdynamic neighborになったものをreadyにし（その
-  tickのfragmentation slotの空き数まで。最初のfragment（MF、offset 0）はfragment association tableが
-  holdしているfragmentの数も予約する: 許可されるとそれらが同じslotへreleaseされるので、NAT/firewallを
-  commitしたreplayが必ず自分のslotを得る（review core #2）。残りは次のtick、`deferred`）、readyなものを`PacketBatch`として
+  tickのfragmentation slotの空き数まで。最初のfragment（MF、offset 0）はそのdatagramのheld fragment
+  の分も予約する: 許可されるとそれらが同じslotへreleaseされるので、NAT/firewallをcommitしたreplayが
+  必ず自分のslotを得る（review core #2）。予約はtableのheld数と一datagramの上限16の小さい方で、他の
+  datagramのheld fragmentがいくらあっても高々17 slotで済む（re-review L1）。残りは次のtick、`deferred`）、readyなものを`PacketBatch`として
   通常の`forward_batch_tracked`へもう一度通します（holdはoff、二重holdは無い）。route、TTL、firewall、
   NAT、egress MTUとfragmentationはreplay時点で、同じpublicationの下で受信直後のように判定されcommit
   します。TTLはまだ減っておらず一回だけ減り、NAT/firewall stateはhold時には一つも作られていません。
@@ -650,7 +654,9 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   stage（`replay_sent`）、DF=0でegress MTUを超えるものはforwarding pathがfragmentとしてstage
   （`replay_fragmented`）、それ以外のdropは`replay_dropped`で数えます。replayのdrop/consume/staging
   のtrace eventはobserverへ渡しません（受信時に`ARP_HELD`として一度数えたframeなので、drop/consume
-  counterに二重に出さない。NAT、firewall、ICMP、resolutionのeventは渡す。firewallの
+  counterに二重に出さない。dropは理由付きの`TraceEvent::ArpHoldReplayDropped`としてtraceへ出し、
+  理由別のcounterは持たない。fragment association tableにparkされたもの（`IPV4_FRAGMENT_HELD`、
+  起きない想定）は`replay_parked`。NAT、firewall、ICMP、resolutionのeventは渡す。firewallの
   `rule_evaluations`のような作業量のcounterは判定を二回すれば二回数える）。
   同じtickの最後の`GeneratedFragments` phaseがrouter自身のARPとICMPv4の後、`[tick]
   generated-fragments`の範囲で送ります。新しいtick phaseもbackend APIも要りません。replayが作るICMPv4
@@ -667,7 +673,10 @@ caller所有のslot record配列と`packets × fragmentation slotの大きさ`�
   選んだnext hopを待つholdを新しいroute/firewall/NATで判定することになるので、fail closedに捨てます
   （送信者の再送が拾う）。policyとstorageはshapeの一部（restart-required）。
 - **fragment**: holdした最初のfragmentはfragment association tableでdecideせず（`commit_deny`しない、
-  ticketを捨てるだけで何も変わらない）、その後続fragmentはtableのpending entryにheldされます。replayで
+  ticketを捨てるだけで何も変わらない）、その後続fragmentはtableのpending entryにheldされます。hold
+  がfailed/cancelled/expiredで捨てる最初のfragmentは、forwarding pathのdropと同じくtableで
+  `commit_deny`し、held後続をその場で解放します（tableのtimeoutまで待たない、re-review L4）。apply
+  （`flushed`）ではtable自体もflushされます。replayで
   最初のfragmentが許可されるとheld分がreleaseされ同じ生成IDで出ます（後続が最初のfragmentより先に出る
   ことがある。受信側のreassemblyには関係ない）。
 - **hairpin、翻訳ICMPv4 error、NAT inbound**: どれもmiss siteで記録され、replayが通常のpathで再判定します。
@@ -688,8 +697,8 @@ AGENTS.mdのbackend所有buffer契約に反する）。(2) hold時にdecisionを
 残余: replayはそのtickのgenerated fragment phaseで出るので、同じRX batchでARP replyの後に届いた同じ
 flowの新しいdatagram（RXでcommit）が先に出ます（IPは順序を保証しない。TCPのSYN再送やping seqの入れ替わり
 程度）。holdしたdatagramとその再送は両方送られます（重複はTCP/UDPのapplicationが扱う）。最初の
-fragmentの予約はtable全体のheld数で数えるので保守的で、fragmentation slotがそれより少なければその
-最初のfragmentは期限までreplayされません（何もcommitしない）。expiryは`interval × max-attempts`固定。
+fragmentの予約は一datagramの上限（16）までで保守的で、fragmentation slotが17より少なくheldも多ければ
+その最初のfragmentは期限までreplayされません（何もcommitしない）。expiryは`interval × max-attempts`固定。
 NAT inboundのneighbor missの前に出るNAT disposition trace（`Rejected(NeighborUnresolved)`）はhold
 されたdatagramにも出ます（traceだけで、counterは`ARP_HELD`）。multi-workerではworker間でholdを共有しない。
 
