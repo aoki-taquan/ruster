@@ -712,6 +712,17 @@ parameter-problem = true      # 12/0 for truncated datagrams and bad options
 admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
 ```
 
+- **The forward firewall does not cover router addresses.** Datagrams
+  addressed to the router (Echo, and these errors) are never evaluated by
+  `[firewall]`, which judges forwarded traffic only; there is no input
+  firewall yet. With a default-deny firewall the WAN address still
+  answers every UDP port with Port Unreachable (so a scanner learns that
+  all are closed and that the router is there) and every unimplemented
+  protocol with Protocol Unreachable (a working protocol scan). For a
+  silent WAN address set `protocol-unreachable = false`,
+  `udp-port-unreachable = false`, `parameter-problem = false`, and
+  `[ipv4-origin] echo-reply = false`. The switches are router-wide:
+  per-interface or per-zone scoping is not implemented yet.
 - UDP and TCP to the NAT public address are not "for the router": they go
   to the NAT as before (no mapping: `NAT44_UDP_MAPPING_MISS`; for TCP see
   `unsolicited-syn-icmp`). `udp-port-unreachable` does not touch the TCP
@@ -723,7 +734,18 @@ admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
   change. A UDP flood to a router address therefore also delays Time
   Exceeded toward the same interface (`icmpv4_errors.rate_limited`,
   `pending`); turn `udp-port-unreachable` off if that matters more than
-  answering UDP probes.
+  answering UDP probes. Sources are not authenticated and there is no
+  ingress (uRPF) source filtering yet: UDP to a router address with a
+  spoofed inside source uses up the limiter of the inside interface and
+  delays errors to the real inside hosts.
+- With `udp-port-unreachable = false` the UDP checksum of router-addressed
+  datagrams is not read (a flood costs no payload pass); such datagrams
+  are all `IPV4_LOCAL_UDP_PORT_UNREACHABLE`, a broken header still
+  `IPV4_LOCAL_UDP_INVALID`.
+- TCP to the router is a deliberate silent drop (no RST). The option check
+  comes first, so TCP with malformed IPv4 options still gets a Parameter
+  Problem. Router addresses are ingress-scoped: UDP to the address of
+  another interface is not answered with Port Unreachable.
 - Never answered (RFC 1812 4.3.2.7): ICMP errors, non-initial fragments,
   broadcast/multicast destinations or link frames, non-host sources.
   Parameter Problem about a datagram not for the router is sent only when
@@ -736,9 +758,10 @@ admin-prohibited = false      # 3/13 for firewall denies (off: silent drop)
   usual firewall behaviour, and RFC 1812 5.2.7.1 allows the option not to
   send Code 13. Turning it on makes denied senders fail fast (on Linux
   `connect` fails with `EHOSTUNREACH` instead of timing out) at the cost of
-  telling them the firewall exists. It answers only plain forwarded
-  traffic; denies on the NAT inbound, hairpin, and ICMP query paths stay
-  silent. With it off, `icmpv4_errors.disabled_admin_prohibited` counts the
+  telling them the firewall exists. It answers only denies of the plain
+  forward plan, which includes inside-to-outside NAT traffic (judged
+  before translation; the inside host gets its own datagram back); denies
+  on the NAT inbound, hairpin, and ICMP query paths stay silent. With it off, `icmpv4_errors.disabled_admin_prohibited` counts the
   denies that would have been answered.
 - Errors are about the datagram as received and go back to its sender on
   the side it came from, so nothing needs NAT translation: an inside host
@@ -757,7 +780,15 @@ datagrams and bad options get Parameter Problem. New drop codes 205
 207 `IPV4_LOCAL_UDP_INVALID`, 208 `IPV4_LOCAL_TCP_UNSUPPORTED`; twelve new
 `icmpv4_errors.*` counters. To keep the old silence set
 `protocol-unreachable = false`, `udp-port-unreachable = false`, and
-`parameter-problem = false` (the drops keep their new reasons). Storage is
+`parameter-problem = false` (the drops keep their new reasons). Router
+addresses are not protected by `[firewall]` (see above): with these on,
+a default-deny router answers UDP and protocol probes on its WAN address.
+Monitoring: router-addressed UDP now counts in `drop.*` (and the
+`rx.dropped` total), no longer in `consume.*`, so a drop-rate alert can
+fire on ordinary UDP probes of the router; alert on the forwarding drop
+reasons instead, or exclude the four new codes. The twelve new
+`icmpv4_errors.*` counters are appended after the existing ones, so the
+order of the earlier fields in stats and JSONL is unchanged. Storage is
 unchanged (67050176 bytes for the maximal production config).
 
 ### DF-clear datagrams through the NAT (MTU2 part A)

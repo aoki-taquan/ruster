@@ -4406,7 +4406,9 @@ fn decide_ipv4<T: TraceSink>(
         // (`FIREWALL_IPV4_OPTIONS_UNSUPPORTED`), so this is the path
         // without one. Malformed options keep the drop reason; the
         // Parameter Problem disposition and counters tell them apart.
-        if let Ipv4OptionCheck::Invalid { pointer } = ipv4_option_check(frame, ipv4, false) {
+        if let Ipv4OptionCheck::Invalid { pointer } =
+            ipv4_option_check(frame, snapshot, ipv4, false)
+        {
             if let (Some(pointer), Some((runtime, now))) = (pointer, icmpv4_errors.as_mut()) {
                 if transit_error_allowed(
                     ingress,
@@ -7516,7 +7518,11 @@ fn reverse_target_forbidden(
 /// 5.2.7.1). Every RFC 1812 §4.3.2.7 suppression, the per-kind switch, the
 /// reverse route and neighbor, and the class-0 limiter apply as for every
 /// other generated error. A datagram addressed to the router passes no
-/// forward firewall, so the error discloses no policy.
+/// forward firewall (there is no input firewall yet): these errors answer
+/// on every router address however the forward policy is set, so they
+/// show the router's presence and its (lack of) services to anyone who
+/// can reach an address. Their switches are the only control.
+#[allow(clippy::too_many_arguments)]
 fn decide_local_ipv4_with_errors<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
@@ -7526,7 +7532,14 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let decided = decide_local_ipv4(frame, snapshot, ingress, ipv4, trace);
+    // Without a Port Unreachable to send, the UDP checksum is not read: a
+    // flood of UDP to a router address costs no payload pass.
+    let udp_checksum = icmpv4_errors.as_ref().is_some_and(|(runtime, _)| {
+        runtime
+            .policy()
+            .generates(Icmpv4ErrorKind::DestinationUnreachableLocalPort)
+    });
+    let decided = decide_local_ipv4(frame, snapshot, ingress, ipv4, udp_checksum, trace);
     let Err(reason) = decided else {
         return decided;
     };
@@ -7536,7 +7549,7 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
     let (kind, header_value) = match reason {
         Ipv4LocalProtocolUnreachable => (Icmpv4ErrorKind::DestinationUnreachableProtocol, 0),
         Ipv4LocalUdpPortUnreachable => (Icmpv4ErrorKind::DestinationUnreachableLocalPort, 0),
-        Ipv4OptionsUnsupported => match ipv4_option_check(frame, ipv4, true) {
+        Ipv4OptionsUnsupported => match ipv4_option_check(frame, snapshot, ipv4, true) {
             Ipv4OptionCheck::Invalid {
                 pointer: Some(pointer),
             } => (Icmpv4ErrorKind::ParameterProblem, u16::from(pointer)),
@@ -7577,14 +7590,18 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
 ///   an error (the protocol port of a later fragment is unknown);
 /// - UDP is checked like a host would (RFC 1122 §4.1.3.4: a truncated
 ///   header, a length outside the IPv4 payload, or a nonzero invalid
-///   checksum is a silent drop) and then refused as Port Unreachable;
-/// - TCP is a silent drop (a closed TCP port answers with RST, RFC 793,
-///   which the router does not originate);
+///   checksum is a silent drop) and then refused as Port Unreachable. The
+///   checksum is verified only when `udp_checksum` (a Port Unreachable can
+///   be sent): otherwise every UDP datagram with a valid header is
+///   `IPV4_LOCAL_UDP_PORT_UNREACHABLE`, answered or not;
+/// - TCP is a silent drop, a deliberate deviation (a closed TCP port
+///   answers with RST, RFC 793 §3.4, which the router does not originate);
 /// - every other protocol is Protocol Unreachable.
 fn decide_local_transport(
     frame: &[u8],
     ipv4: packet::ValidatedIpv4,
     flags_fragment: u16,
+    udp_checksum: bool,
 ) -> Result<PacketDecision, DropReason> {
     if flags_fragment & 0x3fff != 0 {
         return Ok(PacketDecision::ConsumeIpv4Local);
@@ -7593,7 +7610,7 @@ fn decide_local_transport(
         6 => Err(Ipv4LocalTcpUnsupported),
         17 => {
             let udp = validate_nat44_udp(frame, ipv4).map_err(|_| Ipv4LocalUdpInvalid)?;
-            if udp.checksum != 0 && !udp_checksum_valid(frame, ipv4, udp.offset) {
+            if udp_checksum && udp.checksum != 0 && !udp_checksum_valid(frame, ipv4, udp.offset) {
                 return Err(Ipv4LocalUdpInvalid);
             }
             Err(Ipv4LocalUdpPortUnreachable)
@@ -7622,11 +7639,25 @@ enum Ipv4OptionCheck {
 /// - an option without room for its length octet: pointer at the option
 ///   type; a length below 2 or past the header: pointer at the length
 ///   (RFC 791 §3.1, RFC 1812 §4.3.3.5);
+/// - Record Route (7), Loose (131) or Strict (137) Source Route whose
+///   length is below 3 or not 3 plus whole addresses: pointer at the
+///   length; whose pointer octet is below 4: pointer at it. Timestamp (68)
+///   shorter than 4 octets: pointer at the length; with a pointer octet
+///   below 5: pointer at it (RFC 791 §3.1);
 /// - a second source route option: pointer at its first octet (RFC 1812
 ///   §5.2.4.1);
-/// - a Strict Source and Record Route in a datagram not addressed to the
-///   router: pointer at the destination address, 16 (RFC 1812 §5.2.2).
-fn ipv4_option_check(frame: &[u8], ipv4: packet::ValidatedIpv4, local: bool) -> Ipv4OptionCheck {
+/// - a Strict Source and Record Route in a datagram whose destination is
+///   none of the router's addresses (on any interface): pointer at the
+///   destination address, 16 (RFC 1812 §5.2.2). `local` is the ingress
+///   scoped local decision (ICMP4-001); a destination that is a router
+///   address on another interface counts as the router too.
+fn ipv4_option_check(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ipv4: packet::ValidatedIpv4,
+    local: bool,
+) -> Ipv4OptionCheck {
+    let for_router = local || snapshot.is_local_ipv4(ipv4.destination);
     let Some(header) = frame.get(ipv4.header_offset..ipv4.header_offset + ipv4.header_len) else {
         return Ipv4OptionCheck::WellFormed;
     };
@@ -7652,13 +7683,29 @@ fn ipv4_option_check(frame: &[u8], ipv4: packet::ValidatedIpv4, local: bool) -> 
         if length < 2 || offset + length > header.len() {
             return invalid(offset + 1, source_route);
         }
+        if matches!(option, 7 | 131 | 137) {
+            if length < 3 || (length - 3) % 4 != 0 {
+                return invalid(offset + 1, source_route);
+            }
+            if header[offset + 2] < 4 {
+                return invalid(offset + 2, source_route);
+            }
+        }
+        if option == 68 {
+            if length < 4 {
+                return invalid(offset + 1, source_route);
+            }
+            if header[offset + 2] < 5 {
+                return invalid(offset + 2, source_route);
+            }
+        }
         if matches!(option, 131 | 137) {
             if source_route {
                 return Ipv4OptionCheck::Invalid {
                     pointer: Some(offset as u8),
                 };
             }
-            if option == 137 && !local {
+            if option == 137 && !for_router {
                 return Ipv4OptionCheck::Invalid { pointer: Some(16) };
             }
             source_route = true;
@@ -7716,6 +7763,14 @@ fn truncated_parameter_problem<T: TraceSink>(
     if validate_ipv4_ingress(snapshot, ipv4).is_err() {
         return;
     }
+    // A datagram to the NAT public address with a firewall would be a NAT
+    // inbound candidate the firewall judges: stay silent like transit.
+    if firewall
+        && (nat44_udp_config.is_some_and(|config| ipv4.destination == config.public_address())
+            || nat44_tcp_config.is_some_and(|config| ipv4.destination == config.public_address()))
+    {
+        return;
+    }
     let local = snapshot.is_local_ipv4_on(ingress, ipv4.destination);
     let selected_route = if local {
         None
@@ -7752,6 +7807,7 @@ fn decide_local_ipv4<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
+    udp_checksum: bool,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     if ipv4.header_len > 20 {
@@ -7760,7 +7816,7 @@ fn decide_local_ipv4<T: TraceSink>(
     let flags_fragment =
         packet::read_u16(frame, ipv4.header_offset + 6).ok_or(Ipv4HeaderLengthExceedsPacket)?;
     if ipv4.protocol != 1 {
-        return decide_local_transport(frame, ipv4, flags_fragment);
+        return decide_local_transport(frame, ipv4, flags_fragment, udp_checksum);
     }
 
     if flags_fragment & 0x3fff != 0 {

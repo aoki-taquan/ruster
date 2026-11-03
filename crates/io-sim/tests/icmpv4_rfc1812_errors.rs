@@ -508,6 +508,153 @@ fn well_formed_options_and_problems_after_a_source_route_stay_silent() {
     }
 }
 
+/// `frame` with its IPv4 source replaced (header checksum recomputed).
+fn from_source(mut frame: Vec<u8>, source: Ipv4Address) -> Vec<u8> {
+    let header_len = usize::from(frame[14] & 0x0f) * 4;
+    frame[26..30].copy_from_slice(&source.octets());
+    frame[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&frame[14..14 + header_len]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+#[test]
+fn broadcast_destinations_never_get_port_unreachable() {
+    let limited = udp(Ipv4Address::from_octets([255; 4]), 9, true);
+    let directed = udp(Ipv4Address::from_octets([192, 0, 2, 255]), 9, true);
+    let mut link_broadcast = udp(LAN_IP, 9, true);
+    link_broadcast[0..6].fill(0xff);
+    for (received, reason) in [
+        (limited, DropReason::Ipv4DestinationLimitedBroadcast),
+        (directed, DropReason::Ipv4DestinationDirectedBroadcast),
+        (link_broadcast, DropReason::Ipv4EthernetDestinationBroadcast),
+    ] {
+        let outcome = one(received, Icmpv4ErrorPolicy::default());
+        assert_dropped(&outcome, reason);
+        assert_eq!(outcome.disposition, None);
+        assert_eq!(outcome.counters, Icmpv4ErrorCounters::default());
+        assert!(outcome.generated.is_none());
+    }
+}
+
+#[test]
+fn non_host_sources_never_get_an_icmp_err_error() {
+    let sources = [
+        (
+            Ipv4Address::from_octets([0, 1, 2, 3]),
+            DropReason::Ipv4SourceUnspecifiedNetwork,
+        ),
+        (
+            Ipv4Address::from_octets([127, 0, 0, 1]),
+            DropReason::Ipv4SourceLoopback,
+        ),
+        (
+            Ipv4Address::from_octets([240, 0, 0, 1]),
+            DropReason::Ipv4SourceClassE,
+        ),
+        (
+            Ipv4Address::from_octets([224, 0, 0, 1]),
+            DropReason::Ipv4SourceMulticast,
+        ),
+        (
+            Ipv4Address::from_octets([192, 0, 2, 255]),
+            DropReason::Ipv4SourceDirectedBroadcast,
+        ),
+    ];
+    for (source, reason) in sources {
+        let datagrams = [
+            (udp(LAN_IP, 9, false), reason),
+            (frame(LAN_IP, 47, 0, &[], &[0; 8], 0), reason),
+            (
+                frame(LAN_IP, 17, 0x4000, &[7, 36, 4, 0], &[0; 12], 0),
+                reason,
+            ),
+            (
+                frame(ROUTED, 17, 0x4000, &[7, 36, 4, 0], &[0; 12], 0),
+                reason,
+            ),
+        ];
+        for (received, reason) in datagrams {
+            let outcome = one(from_source(received, source), Icmpv4ErrorPolicy::default());
+            assert_dropped(&outcome, reason);
+            assert_eq!(
+                outcome.counters,
+                Icmpv4ErrorCounters::default(),
+                "{source:?}"
+            );
+        }
+        // A truncated datagram is refused for its length; the source check
+        // still keeps it silent.
+        let truncated = truncated(from_source(udp(LAN_IP, 9, false), source), 8, false);
+        let outcome = one(truncated, Icmpv4ErrorPolicy::default());
+        assert_dropped(&outcome, DropReason::Ipv4TotalLengthExceedsPacket);
+        assert_eq!(
+            outcome.counters,
+            Icmpv4ErrorCounters::default(),
+            "{source:?}"
+        );
+    }
+}
+
+#[test]
+fn source_route_and_record_route_bodies_are_checked() {
+    let address = ROUTED.octets();
+    let cases: [(Vec<u8>, u8); 5] = [
+        // Record Route of length 4 (not 3 plus whole addresses): the length.
+        (vec![7, 4, 4, 0], 21),
+        // Loose source route with pointer 3: the pointer.
+        (
+            vec![131, 7, 3, address[0], address[1], address[2], address[3], 0],
+            22,
+        ),
+        // Record Route of length 2: the length.
+        (vec![7, 2, 1, 0], 21),
+        // Timestamp with pointer 4: the pointer.
+        (vec![68, 4, 4, 0], 22),
+        // Timestamp of length 3: the length.
+        (vec![68, 3, 5, 0], 21),
+    ];
+    for (options, pointer) in cases {
+        let received = frame(LAN_IP, 17, 0x4000, &options, &[0; 12], 0);
+        let outcome = one(received.clone(), Icmpv4ErrorPolicy::default());
+        assert_dropped(&outcome, DropReason::Ipv4OptionsUnsupported);
+        assert_eq!(
+            outcome.generated.unwrap(),
+            expected_error(12, 0, [pointer, 0, 0, 0], datagram(&received)),
+            "options {options:?}"
+        );
+    }
+}
+
+#[test]
+fn a_strict_source_route_to_another_router_address_is_for_the_router() {
+    // WAN_IP is the router's, though not on the LAN ingress (ICMP4-001):
+    // no "not for the router" Parameter Problem, a well-formed option.
+    let address = ROUTED.octets();
+    let options = vec![137, 7, 4, address[0], address[1], address[2], address[3], 0];
+    let outcome = one(
+        frame(WAN_IP, 17, 0x4000, &options, &[0; 12], 0),
+        Icmpv4ErrorPolicy::default(),
+    );
+    assert_dropped(&outcome, DropReason::Ipv4OptionsUnsupported);
+    assert_eq!(outcome.counters, Icmpv4ErrorCounters::default());
+}
+
+#[test]
+fn without_port_unreachable_the_udp_checksum_is_not_read() {
+    let mut bad_checksum = udp(LAN_IP, 53, true);
+    bad_checksum[41] ^= 1;
+    let policy = Icmpv4ErrorPolicy::default()
+        .with_generation(Icmpv4ErrorKind::DestinationUnreachableLocalPort, false);
+    let outcome = one(bad_checksum, policy);
+    assert_dropped(&outcome, DropReason::Ipv4LocalUdpPortUnreachable);
+    assert_eq!(outcome.counters.disabled_udp_port_unreachable, 1);
+    assert!(outcome.generated.is_none());
+    // A broken header is still refused as invalid.
+    let header_only = frame(LAN_IP, 17, 0, &[], &[0, 1, 0, 2], 0);
+    assert_dropped(&one(header_only, policy), DropReason::Ipv4LocalUdpInvalid);
+}
+
 #[test]
 fn admin_prohibited_is_the_only_kind_off_by_default() {
     let policy = Icmpv4ErrorPolicy::default();

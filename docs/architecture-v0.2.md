@@ -439,7 +439,11 @@ transit datagramについてのParameter ProblemとCode 13は、errorがrouteや
 無いとき（firewallはoption付きや切れたdatagramを評価できないので、そのときはsilent）だけです。
 NATとの関係: errorはすべて受信したままの（翻訳前の）datagramを引用し、ingress側のsourceへreverse
 routeで返るので翻訳は不要です（outbound NATのinside hostもinbound到着のoutside hostも自分の送った
-datagramを受け取る）。router宛てのerrorはNAT public address宛てのUDP/TCPには出ません（それらは
+datagramを受け取る）。router宛てdatagramはforward firewallを通らない（input firewallは未実装、
+ICMP4-028）ので、Protocol/Port Unreachableはfirewall policyに関係なくrouterのどのaddressでも返り、
+外部からのprotocol/port scanに答えます。黙らせる手段はrouter全体のswitchだけです（interface/zone
+別はICMP4-027でdeferred）。Admin Prohibitedはplainなforward plan（翻訳前に判定するNAT outboundを
+含む）のdenyだけが対象です。router宛てのerrorはNAT public address宛てのUDP/TCPには出ません（それらは
 NAT44 inboundの判定のまま）。NAT inbound/hairpin/ICMP query NATの経路のfirewall denyはCode 13を
 出さずsilentのままです（residual）。
 

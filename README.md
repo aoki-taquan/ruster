@@ -323,7 +323,12 @@ TCPを生成しない）、ICMP/TCP/UDP以外は`IPV4_LOCAL_PROTOCOL_UNREACHABLE
 （header checksumが正しいときだけ、RFC 1812 §5.2.2）と壊れたoption・二つ目のsource route・router宛て
 でないstrict source route（drop reasonは`IPV4_OPTIONS_UNSUPPORTED`のまま）に返します。どれも
 既存kindと同じlimiter class 0、suppression、reverse route、quote規則を使い、storageは増えません。
-errorは受信したままのdatagramを引用してsenderの側へ返るのでNAT翻訳は不要です。詳細は
+errorは受信したままのdatagramを引用してsenderの側へ返るのでNAT翻訳は不要です。
+**注意**: router宛てのdatagramはforward firewall（`[firewall]`）を通りません（input firewallは
+未実装）。default-denyでもWAN addressはUDPの全portにPort Unreachable、未実装protocolに
+Protocol Unreachableを返し、外からport/protocol scanとrouterの存在確認ができます。WANを
+黙らせるには`protocol-unreachable`/`udp-port-unreachable`/`parameter-problem`を`false`、
+`[ipv4-origin] echo-reply = false`にします（switchはrouter全体、interface別は未実装）。詳細は
 runbookの「Errors about datagrams for the router and bad headers (ICMP-ERR)」。
 
 interfaceごとのIPv4 MTU（MTU1）は`[[interfaces]] mtu`（省略時1500、68〜65535、変更は
