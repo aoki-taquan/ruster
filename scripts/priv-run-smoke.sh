@@ -99,7 +99,8 @@
 #   pmtu      (MTU1, RFC 1812 4.2.2.7/5.2.7.1, RFC 1191) rb and pb at MTU
 #             1400: the default config (wan mtu 1500) is refused before
 #             attach (MTU_BELOW_CONFIG mtu=1400 config=1500); with
-#             `mtu = 1400` a 1500-byte DF UDP datagram from host A
+#             `mtu = 1400` on both interfaces (warning MTU_BELOW_DEVICE for
+#             ra at 1500 only) a 1500-byte DF UDP datagram from host A
 #             (IP_PMTUDISC_DO) is answered with Fragmentation Needed (3/4,
 #             Next-Hop MTU 1400, from 192.168.1.1, quoting 548 bytes of the
 #             untranslated datagram), host A's kernel learns PMTU 1400 and
@@ -1673,10 +1674,17 @@ phase_pmtu() {
     assert_detached "the MTU_BELOW_CONFIG refusal"
     echo "priv_run_pmtu_refused: wan mtu 1500 (default) on a 1400-byte rb refused before attach (MTU_BELOW_CONFIG mtu=1400 config=1500), exit 1, detached verified"
 
-    sed '/^mac = "02:00:00:00:00:02"$/a mtu = 1400' "$work/router.toml" >"$work/pmtu.toml"
-    grep -qx "mtu = 1400" "$work/pmtu.toml" || fail "pmtu: config edit"
+    # wan at the link's 1400; lan at 1400 too, below ra's 1500: started
+    # with the MTU_BELOW_DEVICE warning for if1 only.
+    sed -e '/^mac = "02:00:00:00:00:02"$/a mtu = 1400' \
+        -e '/^mac = "02:00:00:00:00:01"$/a mtu = 1400' "$work/router.toml" >"$work/pmtu.toml"
+    [ "$(grep -cx "mtu = 1400" "$work/pmtu.toml")" -eq 2 ] || fail "pmtu: config edit"
     start_ruster pmtu "$work/pmtu.toml"
     wait_ready pmtu || fail "pmtu: ruster exited during startup"
+    grep -q "warning: port=if1 MTU_BELOW_DEVICE mtu=1500 config=1400" "$work/pmtu.err" ||
+        fail "pmtu: no MTU_BELOW_DEVICE warning for if1"
+    ! grep -q "port=if2 MTU_BELOW_DEVICE" "$work/pmtu.err" ||
+        fail "pmtu: MTU_BELOW_DEVICE warning for if2 at equal MTUs"
     in_ns "$host_a" ip route flush cache
     marker="ruster-pmtu-fit-$suffix"
     rm -f "$work/recv-pmtu.out"
@@ -1718,7 +1726,7 @@ phase_pmtu() {
         fail "pmtu: queued_fragmentation_needed $queued, dequeued $sent"
     sudo -n ip -n "$router" link set rb mtu 1500
     sudo -n ip -n "$host_b" link set pb mtu 1500
-    echo "priv_run_pmtu: drop.IPV4_FRAGMENTATION_NEEDED=$needed, queued_fragmentation_needed=dequeued=$queued, exit 0, detached verified"
+    echo "priv_run_pmtu: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1400) only; drop.IPV4_FRAGMENTATION_NEEDED=$needed, queued_fragmentation_needed=dequeued=$queued, exit 0, detached verified"
 }
 phase_pmtu
 

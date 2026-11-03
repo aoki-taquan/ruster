@@ -129,7 +129,7 @@ interval-ms = {icmp_interval}
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 4
+states = 5
 actions = 4
 
 [nat44.realm]

@@ -71,7 +71,7 @@ interval-ms = 100
 state-ttl-ms = 60000
 
 [icmpv4-errors.capacity]
-states = 3
+states = 5
 actions = 3
 
 [nat44.realm]
@@ -244,7 +244,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
                 failure_holds: 5,
             }),
             icmpv4_errors: Some(ruster_config::Icmpv4ErrorStorageShapeV1 {
-                states: 3,
+                states: 5,
                 actions: 3,
             }),
             nat44_udp: Some(ruster_config::Nat44UdpStorageShapeV1 {
@@ -278,7 +278,7 @@ fn complete_storage_shape_counts_every_runtime_and_index_array() {
         + 3 * size_of::<ResolutionActionSlot>()
         + 4 * size_of::<DynamicNeighborSlot>()
         + 5 * size_of::<ResolutionFailureHoldSlot>()
-        + 3 * size_of::<Icmpv4ErrorStateSlot>()
+        + 5 * size_of::<Icmpv4ErrorStateSlot>()
         + 3 * size_of::<Icmpv4ErrorActionSlot>()
         + 3 * size_of::<Nat44UdpMappingSlot>()
         + 5 * size_of::<Nat44UdpPeerSlot>()
@@ -1361,16 +1361,17 @@ fn nat44_unsolicited_syn_switch_and_holds_map_onto_core_and_storage() {
 #[test]
 fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
     const TCP: &str = "icmpv4-errors = \"disabled\"\n";
-    // VALID has two interfaces.
+    // VALID has two interfaces: two classes each (MTU1: Fragmentation
+    // Needed has its own) plus the Port Unreachable class.
     let states = |source: &str, value: u32| {
         source.replacen(
-            "[icmpv4-errors.capacity]\nstates = 3\n",
+            "[icmpv4-errors.capacity]\nstates = 5\n",
             &format!("[icmpv4-errors.capacity]\nstates = {value}\n"),
             1,
         )
     };
-    validated(&states(VALID, 3));
-    let refused = error(&states(VALID, 2));
+    validated(&states(VALID, 5));
+    let refused = error(&states(VALID, 4));
     assert_eq!(
         refused.code(),
         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
@@ -1385,15 +1386,43 @@ fn icmpv4_states_must_cover_every_interface_plus_port_unreachable() {
             .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
     );
     assert_eq!((refused.limit(), refused.actual()), (None, None));
-    // No Port Unreachable can be sent: the interface count is enough.
+    // Fewer than two per interface: refused for Fragmentation Needed.
+    let refused = error(&states(VALID, 3));
+    assert_eq!(
+        refused.code(),
+        ValidationCode::Icmpv4ErrorStatesTooFewForFragmentationNeeded
+    );
+    assert_eq!(
+        refused.code().code(),
+        "ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED"
+    );
+    assert_eq!(
+        refused.path().segments(),
+        ["icmpv4-errors", "capacity", "states"]
+            .map(|field| ruster_config::PathSegment::Field(field.to_owned()))
+    );
+    // No Port Unreachable can be sent: two per interface are enough.
     let off = VALID.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
-    validated(&states(&off, 2));
+    validated(&states(&off, 4));
     let no_holds = VALID.replacen(
         "unsolicited-syn-holds = 7\n",
         "unsolicited-syn-holds = 0\n",
         1,
     );
-    validated(&states(&no_holds, 2));
+    validated(&states(&no_holds, 4));
+    // Fragmentation Needed off: one per interface plus Port Unreachable.
+    let frag_off = VALID.replacen(
+        "[icmpv4-errors.capacity]",
+        "[icmpv4-errors.generate]\nfragmentation-needed = false\n\n[icmpv4-errors.capacity]",
+        1,
+    );
+    validated(&states(&frag_off, 3));
+    assert_eq!(
+        error(&states(&frag_off, 2)).code(),
+        ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable
+    );
+    let both_off = frag_off.replacen(TCP, &format!("{TCP}unsolicited-syn-icmp = false\n"), 1);
+    validated(&states(&both_off, 2));
 }
 
 #[test]
@@ -1821,4 +1850,38 @@ fn interface_mtu_defaults_to_1500_and_is_bounded_by_rfc791() {
     assert!(!policy.generates(Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded));
     assert!(policy.generates(Icmpv4ErrorKind::TimeExceededTtl));
     assert!(policy.generates(Icmpv4ErrorKind::DestinationUnreachableHost));
+
+    // Review M1: its own limiter interval, default 10 ms, never 0.
+    assert_eq!(
+        defaults
+            .icmpv4_errors()
+            .unwrap()
+            .policy()
+            .fragmentation_needed_interval_ms(),
+        ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS
+    );
+    let interval = |value: u64| {
+        VALID.replacen(
+            "state-ttl-ms = 60000\n\n[icmpv4-errors.capacity]",
+            &format!(
+                "state-ttl-ms = 60000\nfragmentation-needed-interval-ms = {value}\n\n\
+                 [icmpv4-errors.capacity]"
+            ),
+            1,
+        )
+    };
+    assert_eq!(
+        validated(&interval(250))
+            .icmpv4_errors()
+            .unwrap()
+            .policy()
+            .fragmentation_needed_interval_ms(),
+        250
+    );
+    let rejected = error(&interval(0));
+    assert_eq!(
+        rejected.code(),
+        ValidationCode::Icmpv4ErrorPolicy(ruster_core::Icmpv4ErrorPolicyError::IntervalZero)
+    );
+    assert_eq!(dotted(rejected.path()), "icmpv4-errors.policy");
 }

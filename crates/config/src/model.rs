@@ -160,6 +160,17 @@ pub struct Icmpv4ErrorPolicyV1 {
     /// [`ruster_core::ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS`] (1 s).
     #[serde(default = "default_port_unreachable_interval_ms")]
     pub port_unreachable_interval_ms: u64,
+    /// Minimum interval between two ICMP Fragmentation Needed errors
+    /// (MTU1, Path MTU Discovery) on one egress. Fragmentation Needed has
+    /// its own limiter, so other errors never use it up. Must not be 0.
+    /// Default [`ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS`]
+    /// (10 ms).
+    #[serde(default = "default_fragmentation_needed_interval_ms")]
+    pub fragmentation_needed_interval_ms: u64,
+}
+
+const fn default_fragmentation_needed_interval_ms() -> u64 {
+    ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS
 }
 
 const fn default_port_unreachable_interval_ms() -> u64 {

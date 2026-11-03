@@ -76,8 +76,9 @@ pub use icmpv4_error::{
     Icmpv4ErrorPolicyError, Icmpv4ErrorPublicationError, Icmpv4ErrorPublicationPermit,
     Icmpv4ErrorPublicationReport, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot,
     Icmpv4TimeExceededAction, Icmpv4TimeExceededBuildError, Icmpv4TimeExceededDisposition,
-    NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS,
-    ICMPV4_ERROR_MAX_FRAME_LEN, ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
+    NoGeneratedIcmpv4Trace, ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS,
+    ICMPV4_DEFAULT_PORT_UNREACHABLE_INTERVAL_MS, ICMPV4_ERROR_MAX_FRAME_LEN,
+    ICMPV4_ERROR_MAX_QUOTE_LEN, ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN,
     ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN,
 };
 pub use icmpv4_translated_limit::{

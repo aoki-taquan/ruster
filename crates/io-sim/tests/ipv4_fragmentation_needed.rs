@@ -414,7 +414,7 @@ fn suppression_rules_apply_to_fragmentation_needed() {
 /// The generation switch (RFC 1812 §1.1.3 option) suppresses the error
 /// before the limiter; with it on, the per-egress limiter (RFC 1812
 /// §4.3.2.8) holds a second error while one is queued and rate limits one
-/// inside the interval.
+/// inside its own interval (`fragmentation-needed-interval-ms`, 100 here).
 #[test]
 fn switch_and_limiter_govern_fragmentation_needed() {
     let net = Net::new(1500, 576);
@@ -460,7 +460,10 @@ fn switch_and_limiter_govern_fragmentation_needed() {
         &mut storage.resolution_actions,
     );
     let mut errors = Icmpv4ErrorRuntime::new(
-        Icmpv4ErrorPolicy::new(100, 60_000).unwrap(),
+        Icmpv4ErrorPolicy::new(100, 60_000)
+            .unwrap()
+            .with_fragmentation_needed_interval_ms(100)
+            .unwrap(),
         &mut storage.error_states,
         &mut storage.error_actions,
     );
@@ -612,4 +615,129 @@ fn snapshot_refuses_an_mtu_below_68() {
         ForwardingSnapshot::new(&net.routes, &net.interfaces, &net.neighbors, &net.bindings)
             .is_ok()
     );
+}
+
+/// MTU1 review M1: Fragmentation Needed has its own limiter class, so a TTL
+/// sweep toward the same reverse egress (a Time Exceeded every 10 ms,
+/// faster than the shared 100 ms interval) never starves Path MTU
+/// Discovery: every oversized DF datagram 10 ms apart (the default
+/// Fragmentation Needed interval) gets its error, and the Time Exceeded
+/// errors are limited only by their own class.
+#[test]
+fn a_ttl_flood_on_the_same_egress_does_not_starve_fragmentation_needed() {
+    use ruster_core::ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS;
+    assert_eq!(ICMPV4_DEFAULT_FRAGMENTATION_NEEDED_INTERVAL_MS, 10);
+    let net = Net::new(1500, 576);
+    let snapshot = net.snapshot();
+    let mut storage = Runtimes::new();
+    let mut resolution = ResolutionRuntime::new(
+        ResolutionPolicy::new(1_000, 60_000).unwrap(),
+        &mut storage.resolution_states,
+        &mut storage.resolution_actions,
+    );
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut storage.error_states,
+        &mut storage.error_actions,
+    );
+    let mut io = SimIo::new();
+    let mut expired = datagram(100, DF, 17, 0);
+    expired[22] = 1;
+    expired[24..26].fill(0);
+    let header = checksum(&expired[14..34]);
+    expired[24..26].copy_from_slice(&header.to_be_bytes());
+    let oversized = datagram(577, DF, 17, 0);
+    let rounds = 50;
+    let mut sent = 0;
+    for round in 0..rounds {
+        let now = round * 10;
+        // The expiring datagram first, so its error takes the shared state.
+        forward(
+            &mut io,
+            &snapshot,
+            &mut resolution,
+            &mut errors,
+            &[expired.clone(), oversized.clone()],
+            now,
+        );
+        while let Some(report) = execute_one_icmpv4_error(
+            &mut io,
+            &mut errors,
+            MonotonicMillis(now),
+            &mut VecGeneratedIcmpv4Trace::default(),
+        )
+        .unwrap()
+        {
+            if report.action.kind == Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded {
+                sent += 1;
+            }
+        }
+        while io.pop_tx().is_some() {}
+        while io.pop_recycled().is_some() {}
+    }
+    let counters = errors.counters();
+    assert_eq!(sent, rounds);
+    assert_eq!(counters.queued_fragmentation_needed, 50);
+    assert_eq!(counters.dequeued_fragmentation_needed, 50);
+    // Time Exceeded: one per 100 ms of its own class, the rest limited.
+    assert_eq!(counters.queued_time_exceeded, 5);
+    assert_eq!(counters.rate_limited, 45);
+}
+
+/// MTU1 review L1: the backend sends the whole frame, so a datagram within
+/// the egress MTU whose frame carries bytes after its Total Length beyond
+/// that MTU is IPV4_FRAME_EXCEEDS_MTU, byte-unchanged and without an error;
+/// up to exactly the MTU of Ethernet payload, and minimum Ethernet padding,
+/// it is forwarded.
+#[test]
+fn trailing_bytes_beyond_the_egress_mtu_are_a_typed_drop() {
+    let net = Net::new(1500, 576);
+    let snapshot = net.snapshot();
+    let mut storage = Runtimes::new();
+    let mut resolution = ResolutionRuntime::new(
+        ResolutionPolicy::new(1_000, 60_000).unwrap(),
+        &mut storage.resolution_states,
+        &mut storage.resolution_actions,
+    );
+    let mut errors = Icmpv4ErrorRuntime::new(
+        Icmpv4ErrorPolicy::default(),
+        &mut storage.error_states,
+        &mut storage.error_actions,
+    );
+    let mut io = SimIo::new();
+    let mut trailing = datagram(500, DF, 17, 0);
+    trailing.resize(14 + 577, 0xee);
+    let trace = forward(
+        &mut io,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        std::slice::from_ref(&trailing),
+        0,
+    );
+    assert_dropped(&mut io, DropReason::Ipv4FrameExceedsMtu, &trailing);
+    assert!(dispositions(&trace).is_empty());
+    assert_eq!(errors.counters(), Default::default());
+    trailing.truncate(14 + 576);
+    forward(
+        &mut io,
+        &snapshot,
+        &mut resolution,
+        &mut errors,
+        std::slice::from_ref(&trailing),
+        0,
+    );
+    assert_eq!(io.pop_tx().unwrap().bytes.len(), 14 + 576);
+    let mut padded = datagram(28, DF, 17, 0);
+    padded.resize(60, 0);
+    let tiny = Net::new(1500, 68);
+    forward(
+        &mut io,
+        &tiny.snapshot(),
+        &mut resolution,
+        &mut errors,
+        std::slice::from_ref(&padded),
+        0,
+    );
+    assert_eq!(io.pop_tx().unwrap().bytes.len(), 60);
 }

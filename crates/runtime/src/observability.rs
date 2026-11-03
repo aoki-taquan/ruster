@@ -1294,7 +1294,7 @@ impl ObservableFields for ServiceCounters {
             queued_host_unreachable, queued_port_unreachable, queued_fragmentation_needed,
             pending, rate_limited, disabled_time_exceeded, disabled_destination_unreachable,
             disabled_host_unreachable, disabled_port_unreachable, disabled_fragmentation_needed,
-            state_full, action_full,
+            quote_below_minimum, state_full, action_full,
             clock_regressions, source_not_unicast, source_is_local, destination_multicast,
             destination_limited_broadcast, destination_network_address,
             destination_directed_broadcast, ethernet_destination_group, noninitial_fragment,

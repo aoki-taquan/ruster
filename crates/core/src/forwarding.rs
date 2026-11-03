@@ -307,6 +307,13 @@ pub enum DropReason {
     /// above the configured interface MTU). It is not sent; the router does
     /// not fragment its own datagrams.
     Icmpv4EchoReplyExceedsMtu = 184,
+    /// A datagram within the egress MTU arrived in a frame whose Ethernet
+    /// payload (the datagram plus bytes after its Total Length) is longer
+    /// than that MTU. The backend sends the whole frame, so it would exceed
+    /// the link MTU; it is discarded without an ICMP error (the datagram
+    /// itself fits). Minimum Ethernet padding (to 60 bytes) never trips it,
+    /// since every MTU is at least 68 (MTU1 review).
+    Ipv4FrameExceedsMtu = 185,
 }
 
 use DropReason::*;
@@ -314,7 +321,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 184] = [
+    pub const ALL: [Self; 185] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -499,6 +506,7 @@ impl DropReason {
         Ipv4FragmentationNeeded,
         Ipv4FragmentationRequired,
         Icmpv4EchoReplyExceedsMtu,
+        Ipv4FrameExceedsMtu,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -700,6 +708,7 @@ impl DropReason {
             Ipv4FragmentationNeeded => "IPV4_FRAGMENTATION_NEEDED",
             Ipv4FragmentationRequired => "IPV4_FRAGMENTATION_REQUIRED",
             Icmpv4EchoReplyExceedsMtu => "ICMPV4_ECHO_REPLY_EXCEEDS_MTU",
+            Ipv4FrameExceedsMtu => "IPV4_FRAME_EXCEEDS_MTU",
         }
     }
 }
@@ -2793,6 +2802,10 @@ where
 ///   (NAT44-019L, MTU2).
 /// - A local Echo Reply: [`DropReason::Icmpv4EchoReplyExceedsMtu`]; the
 ///   router does not fragment its own datagrams.
+///
+/// A datagram within the MTU in a frame that carries bytes after its Total
+/// Length beyond the MTU is [`DropReason::Ipv4FrameExceedsMtu`]: the
+/// backend sends the whole frame, which must fit the link.
 #[allow(clippy::too_many_arguments)]
 fn check_egress_mtu<T: TraceSink>(
     frame: &[u8],
@@ -2817,7 +2830,12 @@ fn check_egress_mtu<T: TraceSink>(
         .mtu;
     let total_len =
         packet::read_u16(frame, packet::ETHERNET_HEADER_LEN + 2).ok_or(Ipv4HeaderTruncated)?;
+    // The backend sends the whole frame: bytes after Total Length count too.
+    let payload_len = frame.len() - packet::ETHERNET_HEADER_LEN;
     if total_len <= mtu {
+        if payload_len > usize::from(mtu) {
+            return Err(Ipv4FrameExceedsMtu);
+        }
         return Ok(());
     }
     exceeds_egress_mtu(
@@ -7843,6 +7861,7 @@ mod tests {
             (182, "IPV4_FRAGMENTATION_NEEDED"),
             (183, "IPV4_FRAGMENTATION_REQUIRED"),
             (184, "ICMPV4_ECHO_REPLY_EXCEEDS_MTU"),
+            (185, "IPV4_FRAME_EXCEEDS_MTU"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -7852,7 +7871,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(185), None);
+        assert_eq!(DropReason::from_code(186), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

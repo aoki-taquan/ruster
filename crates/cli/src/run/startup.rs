@@ -528,7 +528,7 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
                 Failure::Check(CheckFailure::Unverifiable(Probe::Name)),
             ));
         }
-        let warnings = evaluate_device(&facts, policy)
+        let mut warnings = evaluate_device(&facts, policy)
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
         // Validation binds every port to a configured interface; a miss
         // fails closed.
@@ -542,7 +542,7 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
                     Failure::Check(CheckFailure::Unverifiable(Probe::Mtu)),
                 )
             })?;
-        evaluate_config_mtu(config_mtu, &facts)
+        warnings.mtu_below_device = evaluate_config_mtu(config_mtu, &facts)
             .map_err(|failure| fail(Stage::Checks, Failure::Check(failure)))?;
         entry.link = link_target(interface, &facts);
         warn(interface, &warnings);

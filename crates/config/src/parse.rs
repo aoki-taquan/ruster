@@ -66,6 +66,7 @@ const SAFE_PATH_FIELDS: &[&str] = &[
     "failure-holds",
     "fill",
     "fragmentation-needed",
+    "fragmentation-needed-interval-ms",
     "firewall",
     "first",
     "failure-dispatch-scans",

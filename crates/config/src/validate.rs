@@ -193,6 +193,15 @@ pub enum ValidationCode {
     /// which would silently suppress its Time Exceeded and Destination
     /// Unreachable errors.
     Icmpv4ErrorStatesTooFewForPortUnreachable,
+    /// `icmpv4-errors.capacity.states` is below twice the number of
+    /// interfaces while Fragmentation Needed is generated
+    /// (`generate.fragmentation-needed`, MTU1). Fragmentation Needed has its
+    /// own limiter class on every egress besides the class of the other
+    /// errors, so up to two states per interface can be in use at once.
+    /// With fewer, a flood of one class could leave another egress
+    /// `StateFull` and silently suppress its errors (Path MTU Discovery
+    /// included).
+    Icmpv4ErrorStatesTooFewForFragmentationNeeded,
     /// One socket's UMEM exceeds [`MAX_AF_XDP_UMEM_BYTES_PER_PORT`].
     BackendUmemTooLarge,
     /// The UMEM of all sockets exceeds [`MAX_AF_XDP_UMEM_BYTES`].
@@ -279,6 +288,9 @@ impl ValidationCode {
             Self::BackendFrameCountTooSmall => "BACKEND_FRAME_COUNT_TOO_SMALL",
             Self::Icmpv4ErrorStatesTooFewForPortUnreachable => {
                 "ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE"
+            }
+            Self::Icmpv4ErrorStatesTooFewForFragmentationNeeded => {
+                "ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED"
             }
             Self::BackendUmemTooLarge => "BACKEND_UMEM_TOO_LARGE",
             Self::BackendTotalUmemTooLarge => "BACKEND_TOTAL_UMEM_TOO_LARGE",
@@ -1369,6 +1381,11 @@ fn validate_v1(
                         source.policy.port_unreachable_interval_ms,
                     )
                 })
+                .and_then(|policy| {
+                    policy.with_fragmentation_needed_interval_ms(
+                        source.policy.fragmentation_needed_interval_ms,
+                    )
+                })
                 .map(|policy| {
                     policy
                         .with_generation(Icmpv4ErrorKind::TimeExceededTtl, generate.time_exceeded)
@@ -1406,6 +1423,24 @@ fn validate_v1(
                 })
         })
         .transpose()?;
+    // Fragmentation Needed has its own limiter class on every egress
+    // (MTU1): room for both classes on every interface, so neither can make
+    // another egress StateFull.
+    let fragmentation_needed_states = match (icmp_source, icmp_policy) {
+        (Some(source), Some(policy))
+            if policy.generates(Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded) =>
+        {
+            let needed = core_interfaces.len() as u64;
+            if u64::from(source.capacity.states) < 2 * needed {
+                return Err(ValidationError::new(
+                    ValidationCode::Icmpv4ErrorStatesTooFewForFragmentationNeeded,
+                    path(&["icmpv4-errors", "capacity", "states"]),
+                ));
+            }
+            needed
+        }
+        _ => 0,
+    };
 
     let nat_source = config.nat44;
     let mut validated_udp = None;
@@ -1533,12 +1568,13 @@ fn validate_v1(
             })?;
             // Delayed Port Unreachable (RFC 5382 REQ-4) uses its own
             // limiter state on the outside egress besides the one per
-            // egress of the other kinds: require room for both so a SYN
-            // flood can never make another egress StateFull.
+            // egress of the other kinds (and of Fragmentation Needed):
+            // require room for all so a SYN flood can never make another
+            // egress StateFull.
             if let Some(icmp) = icmp_source {
                 let sends_port_unreachable =
                     policy.unsolicited_syn_icmp() && source.capacity.unsolicited_syn_holds > 0;
-                let needed = core_interfaces.len() as u64 + 1;
+                let needed = core_interfaces.len() as u64 + fragmentation_needed_states + 1;
                 if sends_port_unreachable && u64::from(icmp.capacity.states) < needed {
                     return Err(ValidationError::new(
                         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,

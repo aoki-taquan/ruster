@@ -60,6 +60,9 @@ failure-holds = 8
 [icmpv4-errors.policy]
 interval-ms = 100
 state-ttl-ms = 60000
+# Fragmentation Needed has its own per-egress limiter (MTU1); absent means
+# 10 ms. 20 here so that the scenario can show one rate-limited error.
+fragmentation-needed-interval-ms = 20
 
 [icmpv4-errors.capacity]
 states = 8

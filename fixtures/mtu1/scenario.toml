@@ -78,8 +78,8 @@ drops = [
   { reason = "IPV4_FRAGMENTATION_NEEDED", count = 1 },
 ]
 
-# --- 4. The same 10 ms later is discarded but rate limited (100 ms per
-# egress). Without DF the NAT refuses the datagram before any MTU check
+# --- 4. The same 10 ms later is discarded but rate limited (its own 20 ms
+# limiter of this router, per egress). Without DF the NAT refuses the datagram before any MTU check
 # (it translates only atomic datagrams); a DF-clear datagram routed
 # without NAT would be IPV4_FRAGMENTATION_REQUIRED (NAT44-019L).
 [[step]]
