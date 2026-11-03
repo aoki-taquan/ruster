@@ -1289,25 +1289,21 @@ where
     // phases do not run (staged datagrams would be flushed), so the replay
     // waits for a later tick.
     if generated_skip.is_none() {
-        if let (Some(hold), Some(fragmentation)) =
-            (arp_hold.as_deref_mut(), fragmentation.as_deref_mut())
-        {
+        if let (Some(hold), Some(fragmentation)) = (arp_hold, fragmentation.as_deref_mut()) {
             replay_arp_holds(
                 hold,
                 &snapshot,
                 resolution,
                 icmpv4_errors,
                 &udp_config,
-                nat44_udp.as_deref_mut(),
+                nat44_udp,
                 &tcp_config,
                 nat44_tcp.as_deref_mut(),
-                icmp_config
-                    .as_ref()
-                    .map(|config| (config, nat44_icmp.as_deref_mut())),
+                icmp_config.as_ref().map(|config| (config, nat44_icmp)),
                 &firewall_config,
                 firewall.as_deref_mut(),
                 fragmentation,
-                fragment_tracking.as_deref_mut(),
+                fragment_tracking,
                 now,
                 trace,
             );
