@@ -1227,7 +1227,7 @@ stats block and summary can then be lost (the teardown itself completed).
 
    | line | meaning |
    |---|---|
-   | `reload applied: generation=N previous=P; interfaces=.. addresses=.. routes=.. neighbors=.. firewall-rules=.. nat44-ports=..; flushed dynamic-neighbors=.. resolution-states=.. nat44-udp-mappings=.. nat44-tcp-sessions=.. firewall-flows=..` | active from this tick on. Compare the counts with what you meant to load (a truncated file that still validates shows fewer rules or routes; `routes` includes connected routes) |
+   | `reload applied: generation=N previous=P; interfaces=.. addresses=.. routes=.. neighbors=.. firewall-rules=.. nat44-ports=..; flushed dynamic-neighbors=.. resolution-states=.. nat44-udp-mappings=.. nat44-tcp-sessions=.. firewall-flows=..; carried dynamic-neighbors=.. nat44-udp-mappings=.. nat44-tcp-sessions=.. nat44-icmp-mappings=.. firewall-flows=.. firewall-revoked=..; state arp=.. nat44-udp=.. nat44-tcp=.. nat44-icmp=.. firewall=..` | active from this tick on. Compare the counts with what you meant to load (a truncated file that still validates shows fewer rules or routes; `routes` includes connected routes). `state` says per family what happened to its state (item 5): `carried`, `flushed` (`[reload] state = "flush"`), or `flushed:<reason>`; `nat44-icmp=none` without `[nat44.icmp]` |
    | `reload refused: code=RESTART_REQUIRED reasons=<R>[,<R>...]; generation P keeps running` | the change needs a restart; nothing changed |
    | `reload failed: stage=<stage> code=<code>[ path=...]; generation P keeps running` | nothing changed. Stages: `read`, `permissions`, `parse`, `version`, `validate`, `candidate`, `plan`, `dry-run`, `apply`, `quiesce` (`code=TIMEOUT`: not quiescent within 200 ms; `code=STOPPED`: the run stopped while the reload waited) |
 
@@ -1239,12 +1239,42 @@ stats block and summary can then be lost (the teardown itself completed).
    addresses, firewall rules and policy, NAT realm, port range shift,
    filtering and hairpinning, `[ipv4-origin]` and `[tick]` budgets reload in
    place (`ruster plan` shows which).
-5. State: an applied reload flushes ARP learning, pending resolution and
-   ICMPv4 errors, and every NAT44 mapping and firewall flow (their hash
-   keys rotate with each generation; established TCP through NAT must
-   reconnect). Cumulative counters are kept. Every reload request consumes
-   a generation number, so after a refusal or failure the next applied
+5. State (RELOAD-CARRY): what an applied reload does with runtime state is
+   set by `[reload] state` in the **new** document:
+
+   ```toml
+   [reload]
+   state = "carry"   # default; "flush": flush everything, as before
+   ```
+
+   Every reload flushes pending ARP resolution, failure holds, queued
+   ICMPv4 errors and their rate limiter, and TCP unsolicited-SYN holds
+   (all short-lived and bound to the old tables). With `carry` (the default)
+   it keeps, per family, the state the new document does not invalidate,
+   with its hash key, so established connections through the NAT continue:
+
+   | family | carried when | otherwise (`state` value) |
+   |---|---|---|
+   | NAT44 UDP, TCP, ICMP query mappings, peers, sessions | same inside/outside interface, public address, port (identifier) pool, and filtering mode; for TCP also the same `idle-ttl-ms`, `opening-idle-ttl-ms`, `closing-idle-ttl-ms` | that family is flushed: `flushed:interfaces`, `flushed:public-address`, `flushed:port-range` (also a same-size shift), `flushed:filtering`, `flushed:timers` |
+   | firewall flows | always; when the rules changed, every flow is re-evaluated at the apply as if its first packet arrived now, and the flows the new rules deny are revoked (`firewall-revoked`): nothing of them passes after the reload | `flushed:reevaluation-budget` when `flows x rules` exceeds 4194304 rule tests (about 25 ms on the development host): the firewall table is flushed instead of stalling the router |
+   | learned ARP neighbors | the interface's own IPv4 address is unchanged, no new static neighbor replaces it, and, with `[arp] require-on-link-sender = true`, it is on-link | that entry is dropped (`flushed dynamic-neighbors`) and learned again on demand |
+
+   A changed UDP/ICMP or firewall idle timeout applies to carried state
+   from its last activity (a shorter one can expire it at once). A lowered
+   per-host limit keeps every live mapping, peer, or session; the host gets
+   no new one until it is below the limit. Use `ruster plan current.toml
+   new.toml` before the reload: its `state:` block names each family's
+   expected outcome (`firewall carried reevaluate` when rules change). With
+   `state = "flush"` every family is flushed and every hash key rotates
+   (established TCP through the NAT must reconnect); a restart always
+   flushes. Cumulative counters are kept. Every reload request consumes a
+   generation number, so after a refusal or failure the next applied
    generation skips one.
+
+   Upgrade note: before RELOAD-CARRY every applied reload flushed all of
+   this state. A config without `[reload]` now carries it; add
+   `[reload] state = "flush"` to keep the old behavior (for example to
+   rotate the hash keys without a restart).
 6. Timing: reading, validating, building the candidate (fresh keys from
    the production sequencer) and planning run on the reload worker thread
    (`ruster-reload`, section 7), while the router keeps forwarding; a large
@@ -1581,7 +1611,7 @@ Sections, in this order:
 
 | prefix | content |
 |---|---|
-| `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome and flush counts, NAT/FW/ICMP limiter occupancy and high-water |
+| `observer.*`, `tick.*`, `rx.*`, `generated_arp.*`, `generated_icmpv4.*`, `phase_skip.*`, `drop.<REASON>`, `consume.<REASON>`, `apply.*`, `flushed.*`, `carried.*`, `occupancy.*` | worker observability: health state (`observer.state`: `healthy`, `degraded`, `stale`, `stopped`, `not_started`), active generation, tick totals, RX totals (`rx.received`, `rx.tx_accepted`, `rx.tx_rejected`, `rx.dropped`, `rx.consumed`, ...), drop/consume reason counts, last apply outcome, its flush counts (`apply.flush.*`), carry counts (`apply.carry.*`, including `firewall_flows_revoked`) and per-family outcome (`apply.state.<family>`: `carried`, `flushed`, `flushed:<reason>`, RELOAD-CARRY), cumulative `flushed.*` and `carried.*`, NAT/FW/ICMP limiter occupancy and high-water. `firewall.states_revoked` counts the flows reloads revoked |
 | `resolution.*`, `icmpv4_errors.*`, `nat44_udp.*`, `nat44_tcp.*`, `nat44_icmp.*`, `firewall.*` | the service runtimes' cumulative counters (`nat44_icmp.*` is all zero without `[nat44.icmp]`) |
 | `af_xdp.*` | all ports: `mode` (`copy`, `zero_copy`, `mixed`), `ports`, `copy_ports`, `zero_copy_ports`, `fill_need_wakeup_ports`, `tx_need_wakeup_ports`, `link_down_ports`, `kick_owed_ports`, `kernel_stats_ports`, `generated_unknown_egress`, `stopped`, and the summed port counters |
 | `if<id>.af_xdp_port.*` | per port: `interface`, `queue`, `mode`, `mtu`, `max_frame`, need-wakeup now, `draining`, `link_down`, `kick_owed`, `copy_reserve`, ring gauges (`fill_ring_occupancy`, `rx_ring_occupancy`, `tx_ring_unconsumed`), `fill_starved`, invalid RX descriptors and quarantines, TX (`tx_completed`, `tx_inflight`, `tx_inflight_highwater`, `tx_blocked`, `tx_over_mtu`, `tx_invalid_completions`), kicks (`tx_kicks`, `fill_kicks`, `kicks_deferred`, `kick_errors`, `kicks_link_down`, `kick_retries_suppressed`; `kick_errors` counts every failed kick and so includes `kicks_link_down`, while the `KICK_ERRORS` health code times `kick_errors - kicks_link_down` only; `kick_retries_suppressed` counts settles on a down port that skipped a retry not yet due, which made no syscall), generated frames, `cross_port_copies`, and the kernel `XDP_STATISTICS` (`kernel_rx_dropped`, `kernel_rx_invalid_descs`, `kernel_tx_invalid_descs`, `kernel_rx_ring_full`, `kernel_rx_fill_ring_empty_descs`, `kernel_tx_ring_empty_descs`) |
@@ -1730,8 +1760,10 @@ session with spoofed segments.
 floor) or above `idle-ttl-ms` as `stage=validate code=NAT44_TCP_POLICY
 path=nat44.tcp.opening-idle-ttl-ms` (or `closing-idle-ttl-ms`). Like
 `idle-ttl-ms`, a change is reloadable (`plan` shows `nat44-tcp policy ~
-changed`) and the apply flushes the NAT state, so established TCP through
-the NAT breaks at that reload.
+changed`). TCP mappings keep their expiry as absolute deadlines, so a
+changed TCP timeout cannot carry: the apply flushes the TCP NAT state
+(`state ... nat44-tcp=flushed:timers`) and established TCP through the NAT
+breaks at that reload; UDP and ICMP keep theirs.
 
 Watch `nat44_tcp.sessions_established`, `sessions_closed` (FIN both ways),
 `sessions_reset` (RSTs that moved a session to the closing timeout), and
@@ -1819,9 +1851,18 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
 - A port that is administratively down with TX queued holds those frames
   in the kernel's ring, so a reload while it is down fails with
   `stage=quiesce code=TIMEOUT`; bring the link up first.
-- Every reload rotates the NAT44 and firewall hash keys and flushes their
-  state (PUB-006): reloading during busy NAT traffic drops established TCP
-  sessions through NAT.
+- With the default `[reload] state = "carry"` a reload keeps NAT44,
+  firewall, and ARP state the new document does not invalidate, with its
+  hash keys (section 6). The keys rotate only when a family is flushed
+  (`state = "flush"`, an incompatible change, the firewall re-evaluation
+  budget) or on restart; there is no periodic rotation while state is
+  carried (RELOAD-016). A NAT realm, pool, or filtering change, a TCP
+  timeout change, and `state = "flush"` still drop established
+  connections of that family. The firewall re-evaluation of a changed rule
+  set runs on the router thread at the switch (bounded at 4194304 rule
+  tests, about 25 ms); above the bound it flushes the firewall flows
+  instead. Route changes do not re-evaluate flows: a flow whose route now
+  leaves another way stops matching its state and is decided as new.
 - The `FILL_STARVED` delay (1 s), the 3 failed queries, the watch
   intervals (500 ms health, 1 s link), and the 500 ms worker stop bound are
   fixed; the TX stall, kick error and stale-round thresholds are flags
@@ -1940,7 +1981,8 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   remotes still send to it). With `false`, the port comes from the
   victim-independent keyed search, and an expired port is reused only by
   its own returning endpoint or by a keyed takeover when the pool is
-  full. Like every NAT change, the apply flushes the NAT state.
+  full. The switch is reloadable and carries the NAT state (port
+  preservation only affects new mappings).
 - Translated ICMPv4 errors (NAT44-065, NAT44-099). The per-path limit
   bounds how many forged errors reach an inside host about one remote
   (a host with flows to many remotes can receive that many budgets); it
@@ -2057,8 +2099,9 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   power-of-two capacity, 9961472 bytes for both at 65536 slots; it still
   fits the 64 MiB production bound), so changing between `0` and a limit is restart-required
   (`STORAGE_SHAPE`); changing one limit to another is reloadable (`ruster
-  plan` shows `nat44-udp mappings-per-host ~ 64 -> 128`; the apply flushes
-  the NAT state like every NAT change). Limits:
+  plan` shows `nat44-udp mappings-per-host ~ 64 -> 128`; the apply carries
+  the NAT state: a host already above a lowered limit keeps its live
+  mappings and gets no new one until it is below it). Limits:
   - The quota covers mappings (public ports) only. One host can still
     fill the `peers` or `sessions` table with many remotes on its few
     mappings unless the per-host peer and session limits below are set.
@@ -2142,7 +2185,8 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     at 65536). Switching storage on or off is restart-required
     (`STORAGE_SHAPE`), changing one nonzero limit to another reloadable
     (`ruster plan` shows `nat44-tcp sessions-per-host ~ 32 -> 64`; the apply
-    flushes the NAT state). At the production maximum (every table at
+    carries the NAT state, and a lowered limit refuses new state without
+    evicting live state). At the production maximum (every table at
     65536 slots, with the 1024 fragmentation slots of MTU2 part B)
     `sessions-per-host` alone fits the 64 MiB bound (67072192 bytes), both
     mapping limits fit only with at most 12 fragmentation slots (67106128
@@ -2669,6 +2713,10 @@ Startup codes are printed as `stage=<stage> [port=if<id>] code=<code>`
 | `stage=seccomp code=NO_NEW_PRIVS\|ACTION_AVAIL\|INSTALL/ERRNO_<n>`, `code=ACTION_UNAVAILABLE`, `code=TSYNC_CONFLICT`, `code=PROGRAM_TOO_LONG`, `code=STATUS_UNREADABLE`, `code=NOT_CONFINED/MODE\|FILTERS\|NO_NEW_PRIVS` | 1 | the syscall filter could not be installed or verified (everything was rolled back): `INSTALL/ERRNO_13` no `no_new_privs`, `INSTALL/ERRNO_22` a kernel without seccomp filters, `INSTALL/ERRNO_1` a supervisor's filter refused `seccomp`, `TSYNC_CONFLICT` a thread with a filter of its own, `ACTION_UNAVAILABLE` a kernel before 4.14, `STATUS_UNREADABLE` no procfs or no `Seccomp_filters` row (before 5.9) | allow `seccomp` and `prctl` in the supervisor's filter, use Linux 5.9 or newer, or knowingly `--seccomp off` (section 3) |
 | the process died with SIGSYS (shell status 159, systemd `status=31/SYS`) | — | the seccomp filter killed it for a syscall outside the allowlist; the links detached | `journalctl -k \| grep type=1326` names the syscall and thread; run with `--seccomp log` meanwhile and report it (section 5, "Syscall filter") |
 | `reload failed: stage=read code=PERMISSION_DENIED` after a clean start | — | after the drop the config is read without `CAP_DAC_OVERRIDE` (section 5) | make the config and its directories readable by the process's user (root: a root-owned path such as `/etc/ruster`) |
+| `reload applied: ... state ... nat44-udp=flushed:<reason>` (or `nat44-tcp`, `nat44-icmp`) | — | the new document changed what that NAT state means (interfaces, public address, pool, filtering, or a TCP timeout), so that family was flushed with a fresh key and its connections must reconnect (RELOAD-CARRY) | expected for such a change; make it when the NAT is quiet, or keep those settings and change the rest |
+| `reload applied: ... firewall-revoked=N` with N > 0 | — | the new firewall rules deny N live flows; they were revoked at the switch and pass nothing more | intended when the rules were tightened; otherwise check `ruster plan` (`firewall carried reevaluate`) and the rule order |
+| `reload applied: ... state ... firewall=flushed:reevaluation-budget` | — | re-evaluating every live flow against the changed rules would take more than 4194304 rule tests, so all firewall flows were flushed instead of stalling the router | reload when fewer flows are live, or with fewer rules (`flows x rules` is the cost) |
+| established TCP through the NAT drops at every reload | — | `[reload] state = "flush"` in the new document (`state ... =flushed` for every family), or a TCP timeout or NAT realm/pool/filtering change | remove `state = "flush"` (the default carries) or leave those settings unchanged |
 | `stage=open code=INTERFACE_LOOKUP/NO_SUCH_DEVICE` | 1 | the `device` does not exist in this namespace | fix `device`, or run in the right namespace |
 | `stage=open code=TX_QUEUE_CHECK/NO_TX_QUEUE`, `BIND/INVALID_ARGUMENT` | 1 | `queue` is not a queue of the device | use queue 0, or a queue that has RX and TX |
 | `stage=open code=BIND/BUSY` | 1 | another AF_XDP socket owns the queue (retried first) | stop the other user; after a crash, wait and start again |
