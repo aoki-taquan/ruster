@@ -17,8 +17,9 @@ use ruster_core::{
     Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
     LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering, Nat44UdpConfig,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor,
-    NoGeneratedIcmpv4Trace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route, TraceEvent,
+    NoGeneratedIcmpv4Trace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionResult,
+    ResolutionRuntime, ResolutionStateSlot, Route, SourceValidation, SourceValidationBinding,
+    TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -45,6 +46,9 @@ const OFF_LINK_SOURCE: [u8; 4] = [10, 5, 5, 5];
 /// On an interface route of the LAN that is not its connected subnet.
 const OTHER_LAN_PREFIX: [u8; 4] = [172, 16, 0, 5];
 const REMOTE: [u8; 4] = [8, 8, 8, 8];
+/// A host on the WAN subnet.
+const WAN_HOST: [u8; 4] = [198, 51, 100, 50];
+const WAN_HOST_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 0x50]);
 const TOS: u8 = 0x2e;
 const DF: u16 = 0x4000;
 const MF: u16 = 0x2000;
@@ -134,7 +138,9 @@ fn forwarded(received: &[u8], next_hop_mac: MacAddress) -> Vec<u8> {
 /// `gateway`, quoting `received`'s datagram as it arrived (RFC 792; RFC
 /// 1812 §4.3.2.5 TOS, DF, TTL 64).
 fn expected_redirect(gateway: [u8; 4], received: &[u8]) -> Vec<u8> {
-    let quote = &received[14..];
+    // RFC 1812 §4.3.2.3: at most 576 bytes of error datagram, so at most
+    // 548 quoted bytes.
+    let quote = &received[14..received.len().min(14 + 548)];
     let total_len = 28 + quote.len();
     let mut frame = vec![0_u8; (14 + total_len).max(60)];
     frame[0..6].copy_from_slice(&A_MAC.0);
@@ -162,7 +168,17 @@ fn expected_redirect(gateway: [u8; 4], received: &[u8]) -> Vec<u8> {
 // --------------------------------------------------------------- world ----
 
 fn snapshot() -> ForwardingSnapshot<'static> {
-    let routes = leak([
+    snapshot_with(&[], &[], 1500)
+}
+
+/// The base topology plus `extra_routes` and `extra_neighbors`, with the
+/// LAN MTU `lan_mtu`.
+fn snapshot_with(
+    extra_routes: &[Route],
+    extra_neighbors: &[Neighbor],
+    lan_mtu: u16,
+) -> ForwardingSnapshot<'static> {
+    let mut routes = vec![
         Route::new(ip([192, 0, 2, 0]), 24, LAN, None).unwrap(),
         Route::new(ip([198, 51, 100, 0]), 24, WAN, None).unwrap(),
         Route::new(ip([203, 0, 113, 0]), 24, LAN, Some(ip(G))).unwrap(),
@@ -171,12 +187,14 @@ fn snapshot() -> ForwardingSnapshot<'static> {
         // A's logical subnet.
         Route::new(ip([172, 16, 0, 0]), 24, LAN, None).unwrap(),
         Route::new(ip([0; 4]), 0, WAN, Some(ip(W))).unwrap(),
-    ]);
+    ];
+    routes.extend_from_slice(extra_routes);
+    let routes = routes.leak();
     let interfaces = leak([
         Interface {
             id: LAN,
             mac: LAN_MAC,
-            mtu: 1500,
+            mtu: lan_mtu,
         },
         Interface {
             id: WAN,
@@ -184,7 +202,7 @@ fn snapshot() -> ForwardingSnapshot<'static> {
             mtu: 1500,
         },
     ]);
-    let neighbors = leak([
+    let mut neighbors = vec![
         Neighbor {
             interface: LAN,
             target: ip(A),
@@ -210,7 +228,14 @@ fn snapshot() -> ForwardingSnapshot<'static> {
             target: ip(W),
             mac: W_MAC,
         },
-    ]);
+        Neighbor {
+            interface: WAN,
+            target: ip(WAN_HOST),
+            mac: WAN_HOST_MAC,
+        },
+    ];
+    neighbors.extend_from_slice(extra_neighbors);
+    let neighbors = neighbors.leak();
     let bindings = leak([
         LocalIpv4Binding {
             interface: LAN,
@@ -243,8 +268,12 @@ struct World {
 
 impl World {
     fn new(policy: Icmpv4ErrorPolicy) -> Self {
+        Self::on(snapshot(), policy)
+    }
+
+    fn on(snapshot: ForwardingSnapshot<'static>, policy: Icmpv4ErrorPolicy) -> Self {
         Self {
-            snapshot: snapshot(),
+            snapshot,
             resolution: ResolutionRuntime::new(
                 ResolutionPolicy::new(1_000, 60_000).unwrap(),
                 leak([ResolutionStateSlot::EMPTY; 4]),
@@ -360,7 +389,7 @@ impl World {
 fn queued(gateway: [u8; 4], received: &[u8]) -> Option<Icmpv4ErrorDisposition> {
     Some(Icmpv4ErrorDisposition::RedirectQueued {
         egress: LAN,
-        quote_len: received.len() - 14,
+        quote_len: (received.len() - 14).min(548),
         gateway: ip(gateway),
     })
 }
@@ -516,11 +545,13 @@ fn nat_traffic_never_gets_a_redirect() {
     assert_eq!(step.redirect, queued(B, &plain));
 }
 
-/// Redirects share the per-egress class 0 limiter with the other errors
-/// (default 100 ms): a second one inside the interval is rate limited
-/// while both datagrams are forwarded, and one after the interval is sent.
+/// Redirects have their own per-egress limiter class 3 (interval
+/// `interval-ms`, default 100 ms): a second one inside the interval is rate
+/// limited while both datagrams are forwarded, a Time Exceeded inside that
+/// interval is not (it is class 0), and a Redirect after the interval is
+/// sent.
 #[test]
-fn redirects_are_rate_limited_on_class_zero() {
+fn redirects_have_their_own_limiter_class() {
     let mut world = World::new(Icmpv4ErrorPolicy::default());
     let first = from_a(B);
     assert_eq!(world.forward(LAN, &first, 10).redirect, queued(B, &first));
@@ -533,19 +564,213 @@ fn redirects_are_rate_limited_on_class_zero() {
         step.redirect,
         Some(Icmpv4ErrorDisposition::RateLimited { egress: LAN })
     );
-    // The class is shared: a Time Exceeded inside the interval is limited
-    // too.
     let expired = frame(A_MAC, A, BEHIND_G, DF, 1, 17, &udp_payload());
-    assert_eq!(
+    assert!(matches!(
         world.forward(LAN, &expired, 60).time_exceeded,
-        Some(Icmpv4ErrorDisposition::RateLimited { egress: LAN })
-    );
-    assert!(world.generated(60).is_empty());
+        Some(Icmpv4ErrorDisposition::Queued { .. })
+    ));
+    assert_eq!(world.generated(60).len(), 1, "the Time Exceeded");
 
     let third = from_a(BEHIND_G);
     assert_eq!(world.forward(LAN, &third, 110).redirect, queued(G, &third));
     assert_eq!(world.generated(110), [(LAN, expected_redirect(G, &third))]);
-    assert_eq!(world.counters().rate_limited, 2);
+    assert_eq!(world.counters().rate_limited, 1);
+}
+
+/// Review sec M1: a LAN host that ignores Redirects (accept_redirects=0)
+/// and keeps sending to a LAN peer through the router gets one Redirect per
+/// interval, and never delays another LAN host's Time Exceeded (traceroute
+/// keeps working on that LAN).
+#[test]
+fn a_host_that_ignores_redirects_never_starves_time_exceeded_for_another_host() {
+    let mut world = World::new(Icmpv4ErrorPolicy::default());
+    let mut redirects = 0;
+    let mut time_exceeded = 0;
+    for now in (10..=1_000).step_by(10) {
+        let step = world.forward(LAN, &from_a(B), now);
+        assert!(step.sent.is_some(), "A's datagram is forwarded");
+        // B's traceroute probe once per interval, 50 ms after each
+        // Redirect (TTL 1, through the router): with a shared class every
+        // one would be RateLimited.
+        if now % 100 == 50 {
+            let probe = frame(B_MAC, B, REMOTE, DF, 1, 17, &udp_payload());
+            let step = world.forward(LAN, &probe, now);
+            assert!(
+                matches!(
+                    step.time_exceeded,
+                    Some(Icmpv4ErrorDisposition::Queued { .. })
+                ),
+                "B's probe at {now} ms: {:?}",
+                step.time_exceeded
+            );
+        }
+        for (_, generated) in world.generated(now) {
+            match generated[34] {
+                5 => redirects += 1,
+                11 => time_exceeded += 1,
+                other => panic!("unexpected ICMP type {other}"),
+            }
+        }
+    }
+    assert_eq!(time_exceeded, 10, "every probe answered");
+    assert_eq!(redirects, 10, "one Redirect per 100 ms interval");
+}
+
+/// Review sec L1: the Redirect limiter is read before any reverse route
+/// or neighbor work: a pending Redirect makes a second one `Pending` even
+/// when its source is unknown, and a Redirect whose source has no known
+/// neighbor entry is suppressed without an ARP Request.
+#[test]
+fn the_limiter_comes_first_and_a_redirect_never_starts_arp() {
+    let unknown = [192, 0, 2, 50];
+    let mut world = World::new(Icmpv4ErrorPolicy::default());
+    let first = from_a(B);
+    assert_eq!(world.forward(LAN, &first, 10).redirect, queued(B, &first));
+    let other = frame(B_MAC, unknown, B, DF, 64, 17, &udp_payload());
+    assert_eq!(
+        world.forward(LAN, &other, 11).redirect,
+        Some(Icmpv4ErrorDisposition::Pending { egress: LAN })
+    );
+    assert_eq!(world.counters().reverse_neighbor_unresolved, 0);
+
+    let mut world = World::new(Icmpv4ErrorPolicy::default());
+    let step = world.forward(LAN, &other, 10);
+    assert_eq!(step.sent, Some((LAN, forwarded(&other, B_MAC))));
+    assert_eq!(
+        step.redirect,
+        Some(Icmpv4ErrorDisposition::ReverseNeighborUnresolved {
+            egress: LAN,
+            target: ip(unknown),
+            resolution: ResolutionResult::Suppressed,
+        })
+    );
+    assert_eq!(world.resolution.counters().queued, 0, "no ARP Request");
+    assert!(world.generated(10).is_empty());
+}
+
+/// Review sec L2: a datagram that arrives on the NAT outside interface and
+/// leaves through it gets no Redirect (the router never tells the outside
+/// about first hops); without NAT the same datagram gets one.
+#[test]
+fn no_redirect_on_the_nat_outside_interface() {
+    let mut wan = frame(WAN_HOST_MAC, WAN_HOST, W, DF, 64, 17, &udp_payload());
+    wan[0..6].copy_from_slice(&WAN_MAC.0);
+    let mut world = World::new(Icmpv4ErrorPolicy::default());
+    let step = world.forward(WAN, &wan, 10);
+    assert_eq!(step.sent.map(|(egress, _)| egress), Some(WAN));
+    assert!(matches!(
+        step.redirect,
+        Some(Icmpv4ErrorDisposition::RedirectQueued { egress: WAN, .. })
+    ));
+
+    let mut world = World::with_nat();
+    let step = world.forward(WAN, &wan, 10);
+    assert_eq!(step.sent.map(|(egress, _)| egress), Some(WAN));
+    assert_eq!(step.redirect, None);
+    assert_eq!(world.counters(), Icmpv4ErrorCounters::default());
+}
+
+/// Review core L1: the source's route must be the ingress interface's own
+/// connected route. A wider direct route on the LAN (192.0.0.0/16) that
+/// covers the router's address is not the source's logical subnet, and a
+/// more specific route for the source through another interface means the
+/// source is not on the LAN subnet at all: neither gets a Redirect.
+#[test]
+fn only_the_connected_subnet_counts_as_the_sources_subnet() {
+    let snapshot = snapshot_with(
+        &[
+            Route::new(ip([192, 0, 0, 0]), 16, LAN, None).unwrap(),
+            Route::new(ip([192, 0, 2, 128]), 25, WAN, Some(ip(W))).unwrap(),
+        ],
+        &[],
+        1500,
+    );
+    let mut world = World::on(snapshot, Icmpv4ErrorPolicy::default());
+    for source in [[192, 0, 5, 5], [192, 0, 2, 130]] {
+        let received = frame(A_MAC, source, B, DF, 64, 17, &udp_payload());
+        let step = world.forward(LAN, &received, 10);
+        assert_eq!(step.sent, Some((LAN, forwarded(&received, B_MAC))));
+        assert_eq!(step.redirect, None, "{source:?}");
+    }
+    // A itself (on the connected /24) still gets one.
+    let received = from_a(B);
+    assert_eq!(
+        world.forward(LAN, &received, 10).redirect,
+        queued(B, &received)
+    );
+    assert_eq!(world.counters().queued, 1);
+}
+
+/// Review core L2: a route whose gateway is one of the router's own
+/// addresses never yields a Redirect naming the router.
+#[test]
+fn no_redirect_naming_a_router_address() {
+    let snapshot = snapshot_with(
+        &[Route::new(ip([100, 64, 0, 0]), 24, LAN, Some(ip(LAN_IP))).unwrap()],
+        &[Neighbor {
+            interface: LAN,
+            target: ip(LAN_IP),
+            mac: G_MAC,
+        }],
+        1500,
+    );
+    let mut world = World::on(snapshot, Icmpv4ErrorPolicy::default());
+    let received = from_a([100, 64, 0, 7]);
+    let step = world.forward(LAN, &received, 10);
+    assert_eq!(step.sent, Some((LAN, forwarded(&received, G_MAC))));
+    assert_eq!(step.redirect, None);
+    assert_eq!(world.counters(), Icmpv4ErrorCounters::default());
+}
+
+/// The quote of a Redirect about a large datagram stops at 548 bytes
+/// (RFC 1812 §4.3.2.3: the error datagram is at most 576 bytes).
+#[test]
+fn a_large_datagram_is_quoted_up_to_548_bytes() {
+    let mut world = World::new(Icmpv4ErrorPolicy::default());
+    let received = frame(A_MAC, A, B, DF, 64, 17, &[0x5a; 1400]);
+    let step = world.forward(LAN, &received, 10);
+    assert_eq!(step.sent, Some((LAN, forwarded(&received, B_MAC))));
+    assert_eq!(step.redirect, queued(B, &received));
+    let generated = world.generated(10);
+    assert_eq!(generated, [(LAN, expected_redirect(B, &received))]);
+    assert_eq!(generated[0].1.len(), 14 + 576);
+}
+
+/// A datagram the router drops never gets a Redirect: URPF (strict on the
+/// LAN, a spoofed source routed out of the WAN), DF above the egress MTU
+/// (Fragmentation Needed instead), DF clear above it without a
+/// fragmentation runtime.
+#[test]
+fn dropped_datagrams_never_get_a_redirect() {
+    let bindings = leak([SourceValidationBinding {
+        interface: LAN,
+        mode: SourceValidation::Strict,
+    }]);
+    let strict = snapshot().with_source_validation(&bindings[..]).unwrap();
+    let mut world = World::on(strict, Icmpv4ErrorPolicy::default());
+    let spoofed = frame(A_MAC, [10, 9, 9, 9], B, DF, 64, 17, &udp_payload());
+    let step = world.forward(LAN, &spoofed, 10);
+    assert_eq!(step.drop, Some(DropReason::Ipv4SourceValidationFailed));
+    assert_eq!(step.redirect, None);
+    // A on the LAN still passes strict and gets its Redirect.
+    let received = from_a(B);
+    assert_eq!(
+        world.forward(LAN, &received, 20).redirect,
+        queued(B, &received)
+    );
+
+    let mut world = World::on(snapshot_with(&[], &[], 576), Icmpv4ErrorPolicy::default());
+    for (flags, reason) in [
+        (DF, DropReason::Ipv4FragmentationNeeded),
+        (0, DropReason::Ipv4FragmentationRequired),
+    ] {
+        let large = frame(A_MAC, A, B, flags, 64, 17, &[0x5a; 1000]);
+        let step = world.forward(LAN, &large, 10);
+        assert_eq!(step.drop, Some(reason));
+        assert_eq!(step.redirect, None);
+    }
+    assert_eq!(world.counters().queued_redirect, 0);
+    assert_eq!(world.counters().queued_fragmentation_needed, 1);
 }
 
 /// TTL 1 (and 0): the datagram is not forwarded, so it gets Time Exceeded

@@ -261,6 +261,13 @@ pub enum ValidationCode {
     /// `StateFull` and silently suppress its errors (Path MTU Discovery
     /// included).
     Icmpv4ErrorStatesTooFewForFragmentationNeeded,
+    /// `icmpv4-errors.capacity.states` has no room for the Redirect limiter
+    /// class on every interface while Redirects are generated
+    /// (`generate.redirect`, ICMP-REDIRECT): one state per interface for
+    /// the shared class, one more per interface for Fragmentation Needed
+    /// when it is on, and one more per interface for Redirect. With fewer,
+    /// Redirects could leave another egress `StateFull`.
+    Icmpv4ErrorStatesTooFewForRedirect,
     /// One socket's UMEM exceeds [`MAX_AF_XDP_UMEM_BYTES_PER_PORT`].
     BackendUmemTooLarge,
     /// The UMEM of all sockets exceeds [`MAX_AF_XDP_UMEM_BYTES`].
@@ -403,6 +410,7 @@ impl ValidationCode {
             Self::Icmpv4ErrorStatesTooFewForFragmentationNeeded => {
                 "ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED"
             }
+            Self::Icmpv4ErrorStatesTooFewForRedirect => "ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT",
             Self::BackendUmemTooLarge => "BACKEND_UMEM_TOO_LARGE",
             Self::BackendTotalUmemTooLarge => "BACKEND_TOTAL_UMEM_TOO_LARGE",
             Self::BackendNativeProfile => "BACKEND_NATIVE_PROFILE",
@@ -1982,6 +1990,21 @@ fn validate_v1(
         }
         _ => 0,
     };
+    // Redirect has its own limiter class on every egress too
+    // (ICMP-REDIRECT): room for it on every interface besides the others.
+    let redirect_states = match (icmp_source, icmp_policy) {
+        (Some(source), Some(policy)) if policy.generates(Icmpv4ErrorKind::RedirectHost) => {
+            let needed = core_interfaces.len() as u64;
+            if u64::from(source.capacity.states) < needed + fragmentation_needed_states + needed {
+                return Err(ValidationError::new(
+                    ValidationCode::Icmpv4ErrorStatesTooFewForRedirect,
+                    path(&["icmpv4-errors", "capacity", "states"]),
+                ));
+            }
+            needed
+        }
+        _ => 0,
+    };
 
     let nat_source = config.nat44;
     let mut validated_udp = None;
@@ -2115,7 +2138,10 @@ fn validate_v1(
             if let Some(icmp) = icmp_source {
                 let sends_port_unreachable =
                     policy.unsolicited_syn_icmp() && source.capacity.unsolicited_syn_holds > 0;
-                let needed = core_interfaces.len() as u64 + fragmentation_needed_states + 1;
+                let needed = core_interfaces.len() as u64
+                    + fragmentation_needed_states
+                    + redirect_states
+                    + 1;
                 if sends_port_unreachable && u64::from(icmp.capacity.states) < needed {
                     return Err(ValidationError::new(
                         ValidationCode::Icmpv4ErrorStatesTooFewForPortUnreachable,

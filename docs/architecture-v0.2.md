@@ -456,14 +456,16 @@ slotは592 bytesのまま、最大production configのstorage（67050176 bytes�
 ### ICMP-REDIRECT（RFC 1812 §§4.3.3.2, 5.2.7.2）
 
 Redirect for Host（5/1）は`Icmpv4ErrorKind::RedirectHost`として同じ`Icmpv4ErrorRuntime`、
-limiter class 0、builder、generated ICMPv4 phaseを使います。Redirectはdropではなくforwardに付く
+builder、generated ICMPv4 phaseを使い、limiterは専用class 3（間隔は`interval-ms`の値）です。Redirectはdropではなくforwardに付く
 errorなので、判定は`forward_batch_tracked`で`check_egress_mtu`が通った後、frame rewriteの前です。
 fast pathの追加は「decisionが`PacketDecision::Ipv4`（plain forward）でegress == ingress」の一比較
 だけで、条件を満たすdatagramだけが`#[cold]`の`redirect_to_better_first_hop`に入ります。cold pathは
-受信frameを再検証し、destinationとsourceを各1回LPMし、sourceのrouteがingressのdirect routeで
-ingress interface address、next hop（routeのgatewayかdestination自身）をすべて含み、next hopが
-source自身でないときだけ`decide_icmpv4_error`（switch、§4.3.2.7のsuppression、limiter、reverse
-route/neighbor）へ進みます。source route optionを持つdatagramはforwardされない
+受信frameを再検証し、ingressがNAT outsideでなく、destination、source、ingress addressを各1回
+LPMして、sourceのrouteがingressのconnected route（ingress addressが選ぶdirect route）そのもので、
+next hop（routeのgatewayかdestination自身）がそのrouteに含まれ、sourceでもrouterのaddressでも
+ないときだけ進みます。次にclass 3のlimiter状態を読み（Pending/RateLimitedならここで抑止）、それから
+`decide_icmpv4_error`（switch、§4.3.2.7のsuppression、reverse route/neighbor）です。reverse
+neighbor（source）が既知でなければARPを始めずに抑止します。source route optionを持つdatagramはforwardされない
 （`IPV4_OPTIONS_UNSUPPORTED`）のでこの経路には来ません。gatewayはICMP header 2語目全体で、
 `header_value`をu16からu32に広げて入れます（Next-Hop MTUとpointerは同じfieldの下位bit）。actionは
 578から580 bytesになりますが既存のpaddingに収まり、action slotは592 bytesのまま、runtime storageは
@@ -474,10 +476,15 @@ fragmentation slot不足のdropにはRedirectは付きません。NAT（outbound
 ICMP error、ICMP query NAT、later fragmentの`FragmentFollow`は別variantなので対象外です。ARP-HOLDの
 holdはdecisionが`NEIGHBOR_UNRESOLVED`なのでRedirectを出さず、replayが同じ経路で改めて判定して
 forwardと一緒に送ります（replayの送信はtick最後のfragment phaseなので、Redirectが先に出ます）。
-limiterは共有class 0です。新classは`states`容量の下限を上げ、default onなので既存configを通らなく
-するため足しません。代償として、Redirectを無視するLAN hostの同一subnet宛てtrafficは、そのLAN egressの
-class 0を`interval-ms`ごとに一件使い、他のclass 0 errorを遅らせます。interface別のswitchはありません
-（`[icmpv4-errors.generate] redirect`はrouter全体）。
+limiterは専用class 3です（review sec M1）。共有class 0では、Redirectを無視するLAN host
+（`accept_redirects=0`）の同一subnet宛てtrafficがそのLAN egressのclass 0を`interval-ms`ごとに使い、
+他hostのTime Exceeded/Unreachableを止めてしまうためです。代わりに`states`容量の下限が
+interfaceあたり1増え（`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`）、default onなので`states`が
+ちょうど2 × interface数（+ 1）の既存configは`states`を増やすか`redirect = false`が要ります。
+stateは容量の内側なのでstorageは増えません。(source, gateway)ごとのbackoffはstateあたり8 bytesが要り
+per-host configの余裕（2640 bytes）を超えるので入れません。interface別のswitchはありません
+（`[icmpv4-errors.generate] redirect`はrouter全体、ICMP4-035）。Redirectに従ったhostはnext hopへ直接
+送るので、ruster上のLAN→LAN forward firewallを通らなくなります。
 
 ### egress MTU（MTU1、RFC 1812 §4.2.2.7、RFC 1191 §4）
 
@@ -1288,7 +1295,8 @@ NAT planがfirewallより先に走るため、NATが許可しfirewallが拒否�
   （`ICMPV4_ERROR_STATES_TOO_FEW_FOR_PORT_UNREACHABLE`、path `icmpv4-errors.capacity.states`、値は
   出さない）。key (egress, class)は最大interface数 + 1種類なので、これで`StateFull`は起きない
   （MTU1以降、Fragmentation Neededを生成するときはclass 2がinterfaceごとに加わり、下限は
-  2 × interface数（+ 1）。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`）。
+  2 × interface数（+ 1）。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_FRAGMENTATION_NEEDED`。ICMP-REDIRECT以降、
+  Redirectを生成するときはclass 3がさらに加わる。`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`）。
   1 slotをreserveする案はegressが3つ以上だと他egressを守れないため採らない。remote単位のfairnessはdeferred（NAT44-077）。
 - **Config/plan.** `[nat44.tcp] unsolicited-syn-icmp`（default true、`Nat44TcpPolicy`の一部、
   reloadable、`NatChange::unsolicited_syn_icmp`はtyped delta）と`[nat44.tcp.capacity]

@@ -15,6 +15,8 @@ pub const ICMPV4_ERROR_MAX_FRAME_LEN: usize = 590;
 pub const ICMPV4_TIME_EXCEEDED_MAX_QUOTE_LEN: usize = ICMPV4_ERROR_MAX_QUOTE_LEN;
 pub const ICMPV4_TIME_EXCEEDED_MAX_FRAME_LEN: usize = ICMPV4_ERROR_MAX_FRAME_LEN;
 const ETHERNET_MIN_FRAME_LEN: usize = 60;
+/// The limiter class of [`Icmpv4ErrorKind::RedirectHost`] (ICMP-REDIRECT).
+const REDIRECT_LIMITER_CLASS: u8 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Icmpv4ErrorKind {
@@ -69,7 +71,9 @@ pub enum Icmpv4ErrorKind {
     /// MUST NOT send the Network Redirects (codes 0 and 2) and MUST be able
     /// to send this one. The action carries the gateway (the next hop) as
     /// the whole second ICMP header word. The datagram is still forwarded.
-    /// Shares limiter class 0 (ICMP4-033).
+    /// Has its own limiter class 3 (interval `interval-ms`), so a host that
+    /// ignores Redirects never starves the class 0 errors of its egress
+    /// (ICMP4-033).
     RedirectHost,
 }
 
@@ -103,21 +107,22 @@ impl Icmpv4ErrorKind {
     }
 
     /// The limiter class: a limiter state is keyed by egress and class.
-    /// Port Unreachable (1) and Fragmentation Needed (2) have their own
-    /// classes; every other kind shares class 0 (so the ICMP-ERR kinds add
-    /// no limiter state and no `states` capacity requirement).
-    const fn limiter_class(self) -> u8 {
+    /// Port Unreachable (1), Fragmentation Needed (2), and Redirect (3)
+    /// have their own classes; every other kind shares class 0 (so the
+    /// ICMP-ERR kinds add no limiter state and no `states` capacity
+    /// requirement).
+    pub(crate) const fn limiter_class(self) -> u8 {
         match self {
             Self::DestinationUnreachablePort => 1,
             Self::DestinationUnreachableFragmentationNeeded => 2,
+            Self::RedirectHost => REDIRECT_LIMITER_CLASS,
             Self::TimeExceededTtl
             | Self::DestinationUnreachableNetwork
             | Self::DestinationUnreachableHost
             | Self::DestinationUnreachableProtocol
             | Self::DestinationUnreachableLocalPort
             | Self::ParameterProblem
-            | Self::DestinationUnreachableAdministrativelyProhibited
-            | Self::RedirectHost => 0,
+            | Self::DestinationUnreachableAdministrativelyProhibited => 0,
         }
     }
 
@@ -316,9 +321,11 @@ impl Icmpv4ErrorPolicy {
 
     const fn class_interval_ms(self, class: u8) -> u64 {
         match class {
-            0 => self.interval_ms,
             1 => self.port_unreachable_interval_ms,
-            _ => self.fragmentation_needed_interval_ms,
+            2 => self.fragmentation_needed_interval_ms,
+            // Class 0 and the Redirect class 3 share the interval value,
+            // not the state.
+            _ => self.interval_ms,
         }
     }
 
@@ -1375,6 +1382,29 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.record_suppression(disposition)
     }
 
+    /// The limiter refusal (`Pending` or `RateLimited`) an error of `kind`
+    /// out of `egress` would get now, read without touching any state, so
+    /// a caller can stop before reverse route and neighbor work
+    /// (ICMP-REDIRECT). `None` when the limiter would admit it (or has no
+    /// state for it yet).
+    pub(crate) fn limiter_refusal(
+        &self,
+        kind: Icmpv4ErrorKind,
+        egress: IfId,
+        now: MonotonicMillis,
+    ) -> Option<Icmpv4ErrorDisposition> {
+        let class = kind.limiter_class();
+        let state = self.states[..self.occupied_prefix]
+            .iter()
+            .find(|state| state.occupied && state.egress == egress && state.class == class)?;
+        if state.action_queued {
+            return Some(Icmpv4ErrorDisposition::Pending { egress });
+        }
+        (state.has_requested
+            && now.0.saturating_sub(state.requested_at.0) < self.policy.class_interval_ms(class))
+        .then_some(Icmpv4ErrorDisposition::RateLimited { egress })
+    }
+
     pub(crate) fn observe_decision(&mut self, now: MonotonicMillis) -> bool {
         self.observe_now(now)
     }
@@ -2306,7 +2336,7 @@ mod tests {
         assert_eq!((mtu.next_hop_mtu(), mtu.pointer()), (1400, 0));
     }
 
-    /// ICMP-REDIRECT: Redirect for Host is type 5, code 1, limiter class 0,
+    /// ICMP-REDIRECT: Redirect for Host is type 5, code 1, limiter class 3,
     /// on by default, and carries the gateway as the whole second word
     /// (RFC 792). No other kind takes a gateway, and the gateway does not
     /// leak into the pointer or Next-Hop MTU.
@@ -2314,7 +2344,7 @@ mod tests {
     fn redirect_has_type_five_code_one_and_the_gateway_word() {
         let kind = Icmpv4ErrorKind::RedirectHost;
         assert_eq!((kind.icmp_type(), kind.icmp_code()), (5, 1));
-        assert_eq!(kind.limiter_class(), 0);
+        assert_eq!(kind.limiter_class(), 3);
         assert!(Icmpv4ErrorPolicy::default().generates(kind));
         let gateway = Ipv4Address::from_octets([192, 0, 2, 254]);
         let action = action_kind(kind, 1, 40)

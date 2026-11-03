@@ -842,7 +842,13 @@ fn validate_warns_about_suspicious_source_validation() {
         ),
         (
             "urpf-no-route.toml",
-            source.replacen("[[addresses]]", spare, 1),
+            // Three interfaces need three ICMPv4 limiter states each (the
+            // shared class, Fragmentation Needed, Redirect) plus one.
+            source.replacen("[[addresses]]", spare, 1).replacen(
+                "[icmpv4-errors.capacity]\nstates = 8\n",
+                "[icmpv4-errors.capacity]\nstates = 10\n",
+                1,
+            ),
             vec!["ruster: warning: SOURCE_VALIDATION_NO_ROUTE interface=if3"],
         ),
         (

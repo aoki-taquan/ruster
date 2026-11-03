@@ -3864,6 +3864,12 @@ where
                                     &*frame,
                                     snapshot,
                                     ingress,
+                                    is_nat_outside(
+                                        ingress,
+                                        nat44_udp_config,
+                                        nat44_tcp_config,
+                                        nat44_icmp_config,
+                                    ),
                                     &mut resolution,
                                     &mut icmpv4_errors,
                                     trace,
@@ -7926,6 +7932,17 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
                     },
                 );
             }
+            // A Redirect never starts an ARP Request: its source just
+            // sent the datagram, and an unknown one gets no Redirect.
+            DynamicLookup::Miss if kind == Icmpv4ErrorKind::RedirectHost => {
+                return runtime.record_suppression(
+                    Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
+                        egress: reverse_egress,
+                        target,
+                        resolution: ResolutionResult::Suppressed,
+                    },
+                );
+            }
             DynamicLookup::Miss => {
                 let result = resolution_runtime.schedule(
                     ArpRequestAction {
@@ -7982,35 +7999,60 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     )
 }
 
+/// Whether `ingress` is the outside interface of a NAT realm (cold).
+#[cold]
+#[inline(never)]
+fn is_nat_outside(
+    ingress: IfId,
+    udp: Option<&Nat44UdpConfig>,
+    tcp: Option<&Nat44TcpConfig>,
+    icmp: Option<&Nat44IcmpConfig>,
+) -> bool {
+    udp.is_some_and(|config| config.outside() == ingress)
+        || tcp.is_some_and(|config| config.outside() == ingress)
+        || icmp.is_some_and(|config| config.outside() == ingress)
+}
+
 /// RFC 1812 §5.2.7.2 Redirect for Host (Type 5, Code 1) about a plain
 /// forward that leaves through its ingress interface (the caller checked).
 /// A Redirect is sent only when all of these hold:
 ///
-/// - the source's route is the direct (connected) route of the ingress
-///   interface, and that route also covers the ingress interface's own
-///   address, so the source and the router share one logical subnet and
-///   the error's source address (the ingress address, chosen by the reverse
-///   route) belongs to the destination's subnet as §5.2.7.2 requires;
+/// - the ingress interface is not a NAT realm's outside interface (the
+///   router never tells the outside about first hops behind it);
+/// - the source's route is the ingress interface's own connected route
+///   (the route the ingress address itself selects, with no gateway), so
+///   the source and the router share one logical subnet and the error's
+///   source address (the ingress address, chosen by the reverse route)
+///   belongs to the destination's subnet as §5.2.7.2 requires; a wider
+///   direct route that merely covers the address does not count;
 /// - the next hop (the route's gateway, or the destination of a direct
-///   route) is on that same subnet, and is not the source itself;
+///   route) is on that same subnet, is not the source itself, and is not
+///   one of the router's own addresses;
 /// - the datagram has no source route option: a datagram with any IPv4
 ///   option is never forwarded (`IPV4_OPTIONS_UNSUPPORTED`), so this path
 ///   only sees option-free headers;
-/// - the generic error rules (switch, suppression of §4.3.2.7, limiter
-///   class 0, reverse route and neighbor) admit it.
+/// - the Redirect limiter (class 3 of the ingress egress) admits it, read
+///   before any reverse route or neighbor work; then the generic error
+///   rules (switch, suppression of §4.3.2.7, reverse route and a *known*
+///   reverse neighbor: a Redirect never starts an ARP Request).
 ///
 /// The gateway field is the next hop. The datagram is forwarded as usual.
-/// Cold: only same-interface forwards pay the two route lookups.
+/// Cold: only same-interface forwards pay the route lookups.
 #[cold]
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn redirect_to_better_first_hop<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
+    nat_outside: bool,
     resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) {
+    if nat_outside {
+        return;
+    }
     let Some((runtime, now)) = icmpv4_errors.as_mut() else {
         return;
     };
@@ -8033,24 +8075,29 @@ fn redirect_to_better_first_hop<T: TraceSink>(
     if route.egress() != ingress
         || source_subnet.egress() != ingress
         || source_subnet.next_hop().is_some()
-        || !source_subnet.matches(binding.address)
+        || snapshot.route_lookup(binding.address) != Some(source_subnet)
         || !source_subnet.matches(gateway)
         || gateway == ipv4.source
+        || snapshot.is_local_ipv4(gateway)
     {
         return;
     }
-    let disposition = decide_icmpv4_error(
-        frame,
-        snapshot,
-        ipv4,
-        Some(route),
-        Icmpv4ErrorKind::RedirectHost,
-        u32::from_be_bytes(gateway.octets()),
-        resolution,
-        runtime,
-        *now,
-        trace,
-    );
+    let kind = Icmpv4ErrorKind::RedirectHost;
+    let disposition = match runtime.limiter_refusal(kind, ingress, *now) {
+        Some(refusal) if runtime.policy().generates(kind) => runtime.record_suppression(refusal),
+        _ => decide_icmpv4_error(
+            frame,
+            snapshot,
+            ipv4,
+            Some(route),
+            kind,
+            u32::from_be_bytes(gateway.octets()),
+            resolution,
+            runtime,
+            *now,
+            trace,
+        ),
+    };
     trace.record(TraceEvent::Icmpv4RedirectDisposition {
         ingress,
         disposition,

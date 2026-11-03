@@ -322,7 +322,13 @@ fn validate_warns_about_an_overcommitted_fragment_share() {
     const NATFRAG: &str = include_str!("../../../fixtures/natfrag/router.toml");
     let third = "[[interfaces]]\nid = 3\nname = \"dmz\"\ndevice = \"sim2\"\n\
                  mac = \"02:00:00:00:00:03\"\n\n[[addresses]]\n";
-    let three = NATFRAG.replacen("[[addresses]]\n", third, 1);
+    // Three interfaces need three ICMPv4 limiter states each (the shared
+    // class, Fragmentation Needed, Redirect) plus Port Unreachable.
+    let three = NATFRAG.replacen("[[addresses]]\n", third, 1).replacen(
+        "[icmpv4-errors.capacity]\nstates = 8\n",
+        "[icmpv4-errors.capacity]\nstates = 10\n",
+        1,
+    );
     assert_ne!(three, NATFRAG);
     // Two interfaces at the default 50: no warning.
     assert_eq!(validate_text(NATFRAG).2, "");

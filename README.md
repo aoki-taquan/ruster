@@ -340,9 +340,13 @@ ICMP-REDIRECTで、plainなforwardがingress interfaceから出て、sourceとne
 connected subnet上なら、datagramはそのままforwardしつつsourceへRedirect for Host（5/1、RFC 1812
 §5.2.7.2、gateway fieldはnext hop）を送ります。Network Redirect（code 0/2）は送りません。NAT、
 firewall deny、TTL切れ、later fragment、ICMP errorには付かず、ARP-HOLDのdatagramはreplayで送ります。
-limiterはclass 0を共有し、storageは増えません。Redirectはsubnet上の別routerの存在を明かし、
-詐称sourceで第三者宛てに誘発できるので、別routerの無いsubnetや信頼できないsegmentでは
-`redirect = false`を推奨します（router全体のswitch、詳細はrunbookの「ICMP Redirect」）。
+NAT outside interfaceとrouter自身のaddressをgatewayにする場合は送らず、sourceのneighborが既知で
+なければ送りません（ARPを始めない）。limiterは専用class 3（Redirectを無視するhostが他hostの
+Time Exceededを止めない）で、`icmpv4-errors.capacity.states`はinterfaceあたり1多く要ります
+（不足は`ICMPV4_ERROR_STATES_TOO_FEW_FOR_REDIRECT`）。storageは増えません。Redirectはsubnet上の別routerの
+存在を明かし、詐称sourceで第三者宛てに誘発でき、従ったhostはrusterのLAN→LAN firewallを通らなく
+なるので、別routerの無いsubnetや信頼できないsegmentでは`redirect = false`を推奨します（router全体の
+switch、詳細はrunbookの「ICMP Redirect」）。
 
 ICMP-ERRで、router宛て（ingress interfaceのaddress）のfragmentでないdatagramは、UDPなら
 `IPV4_LOCAL_UDP_PORT_UNREACHABLE`（header/checksumが壊れていれば無応答の`IPV4_LOCAL_UDP_INVALID`）、
