@@ -15,7 +15,7 @@
 mod support;
 
 use ruster_core::{
-    execute_one_ipv4_fragmentation,
+    execute_one_icmpv4_error, execute_one_ipv4_fragmentation,
     forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking,
     ipv4_fragment_slot_bytes, ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_tombstones,
     ConsumeReason, DirectoryBucket, DirectoryNode, DropReason, FirewallAction, FirewallConfig,
@@ -29,8 +29,9 @@ use ruster_core::{
     LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering, Nat44IcmpConfig,
     Nat44IcmpPolicy, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy,
     Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, PacketIo, ResolutionActionSlot, ResolutionHashKey,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+    Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoGeneratedIcmpv4Trace, PacketIo,
+    ResolutionActionSlot, ResolutionHashKey, ResolutionPolicy, ResolutionRuntime,
+    ResolutionStateSlot, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -2099,6 +2100,31 @@ fn expiring_fragments_complete_their_refused_datagram() {
     let outcome = world.run(&lan(&cut(&sent, &SIZES)));
     assert!(frames_to(&outcome, WAN).is_empty());
     assert!(outcome.drops.contains(&DropReason::Ipv4TtlExpired));
+    // The router's errors leave in the tick's generated ICMPv4 phase: one
+    // Time Exceeded, about the first fragment only, none about a
+    // non-initial fragment (RFC 1812 §4.3.2.7).
+    assert!(frames_to(&outcome, LAN).is_empty());
+    while execute_one_icmpv4_error(
+        &mut world.io,
+        &mut world.errors,
+        MonotonicMillis(NOW),
+        &mut NoGeneratedIcmpv4Trace,
+    )
+    .unwrap()
+    .is_some()
+    {}
+    let mut errors = Vec::new();
+    while let Some(tx) = world.io.pop_tx() {
+        assert_eq!(tx.egress, LAN);
+        errors.push(tx.bytes);
+    }
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    for error in &errors {
+        // Ethernet 14 + IPv4 20: ICMP type 11; the quoted header at 42.
+        assert_eq!((error[23], error[34]), (1, 11));
+        let quoted_word = u16::from_be_bytes([error[42 + 6], error[42 + 7]]);
+        assert_eq!(quoted_word & 0x1fff, 0, "quotes the first fragment");
+    }
     assert_eq!(world.occupancy(), (0, 0));
     let counters = world.counters();
     assert_eq!((counters.first_denied, counters.entries_completed), (1, 1));

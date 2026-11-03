@@ -2041,9 +2041,10 @@ fn a_refusing_entry_leaves_no_tombstone() {
 }
 
 /// Re-review L2: once a datagram arrives in more than four disjoint pieces
-/// its coverage is no longer tracked, but a fragment outside the ranges
-/// tracked so far is still progress (a heavily reordered datagram does not
-/// look stalled); one inside them is a duplicate.
+/// its coverage is no longer tracked exactly, but a fragment adding bytes
+/// is still progress (a heavily reordered datagram does not look stalled);
+/// the over-approximated ranges make every replay a duplicate (follow-up
+/// L-1: frozen ranges counted each replay of an outside piece).
 #[test]
 fn an_untracked_datagram_still_progresses() {
     let mut storage = Storage::new(1, 0, 0);
@@ -2054,10 +2055,14 @@ fn an_untracked_datagram_still_progresses() {
     for word in [4, 6, 8, 12] {
         progress(&mut tracker, 1, word, 10);
     }
-    // A gap below the largest end: progress at 150.
+    // The ranges over-approximate: [0,16) [32,56) [64,72) [96,104) (the
+    // smallest gap closed). A gap below the largest end: progress at 150.
     progress(&mut tracker, 1, 3, 150);
-    // A duplicate of a tracked range: no progress.
-    progress(&mut tracker, 1, 4, 300);
+    // Replays are no progress: a piece inside a range, the piece that made
+    // the datagram untracked, and the one that just progressed.
+    for word in [4, 12, 3] {
+        progress(&mut tracker, 1, word, 300);
+    }
     assert_eq!(
         tracker.admit_first(info(&fragment(2, MF, 64, 17, 16)), 340),
         Err(DropReason::Ipv4FragmentTableFull)
@@ -2096,4 +2101,52 @@ fn an_expired_ttl_fragment_completes_a_refused_datagram() {
     tracker.ttl_expired(info(&fragment(4, 1, 1, 17, 8)), 0);
     assert_eq!(tracker.counters().poisoned, 1);
     tracker.check_invariants().unwrap();
+}
+
+/// `record` directly: touching ranges merge at both ends; past four pieces
+/// a piece spanning several ranges merges them, replays are duplicates, a
+/// gap inside an over-approximated range is a duplicate too (the
+/// trade-off), and an untracked entry never completes even when its
+/// ranges look full.
+#[test]
+fn record_merges_touching_ranges_and_over_approximates() {
+    let ranges =
+        |entry: &Ipv4FragmentEntrySlot| entry.ranges[..usize::from(entry.ranges_len)].to_vec();
+    // Touching at both ends: [0,8) and [16,24) joined by [8,16).
+    let mut entry = Ipv4FragmentEntrySlot::EMPTY;
+    assert_eq!(entry.record(0, 8, true), Ok(true));
+    assert_eq!(entry.record(16, 8, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 8], [16, 24]]);
+    assert_eq!(entry.record(8, 8, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 24]]);
+    assert_eq!(entry.record(8, 8, true), Ok(false), "a replay");
+    assert_eq!(entry.record(24, 8, false), Ok(true), "touching the end");
+    assert_eq!(ranges(&entry), [[0, 32]]);
+    assert!(entry.complete());
+
+    // Five pieces: the smallest gap closes (all equal: the first).
+    let mut entry = Ipv4FragmentEntrySlot::EMPTY;
+    for offset in [0, 16, 32, 48] {
+        assert_eq!(entry.record(offset, 8, true), Ok(true));
+    }
+    assert!(!entry.untracked);
+    assert_eq!(entry.record(64, 8, false), Ok(true));
+    assert!(entry.untracked);
+    assert_eq!(ranges(&entry), [[0, 24], [32, 40], [48, 56], [64, 72]]);
+    // A piece spanning several ranges merges them; its replay is a
+    // duplicate.
+    assert_eq!(entry.record(24, 32, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 56], [64, 72]]);
+    assert_eq!(entry.record(24, 32, true), Ok(false));
+    // The ranges now look full, but [8,16) was never seen: no completion.
+    assert_eq!(entry.record(56, 8, true), Ok(true));
+    assert_eq!(ranges(&entry), [[0, 72]]);
+    assert_eq!(entry.total, 72);
+    assert!(!entry.complete());
+    // The never-seen gap [8,16) lies inside the over-approximated range: a
+    // duplicate, so it does not refresh the stall timer (the trade-off).
+    assert_eq!(entry.record(8, 8, true), Ok(false));
+    assert!(!entry.complete());
+    // The end still holds: data past it is a contradiction.
+    assert_eq!(entry.record(72, 8, true), Err(()));
 }
