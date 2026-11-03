@@ -44,7 +44,7 @@
 #             through /etc/passwd gets past the read (the control)
 #   limits   (H3) a config with every runtime table at its production
 #             limit (failure holds and ICMPv4 error actions 4096, every
-#             other table 65536, NAT44 pool 1-65535, 51.11 MiB of storage) is
+#             other table 65536, NAT44 pool 1-65535, 58.22 MiB of storage) is
 #             accepted by `validate`; one more failure hold (4097) is
 #             refused by `validate` and `ruster run` (exit 2) although the
 #             simulator's limits accept it as a sim document; `ruster run`
@@ -113,6 +113,21 @@
 #             socket sees all three translated (source 203.0.113.2), the
 #             DF-clear ones still without DF and with consecutive generated
 #             IDs, the DF one with the ID host A sent; every checksum valid
+#   frag      (MTU2 part B, RFC 791 3.2, RFC 1812 4.2.2.7) rb and pb at
+#             1400 and wan `mtu = 1400`: a 1500-byte DF-clear UDP datagram
+#             from host A (IP_PMTUDISC_DONT) reaches host B as exactly two
+#             fragments from 203.0.113.2 seen on pb with AF_PACKET (total
+#             lengths 1396+124, offsets 0/172, MF 1/0, one ID, DF clear,
+#             TTL 63, valid checksums) and is reassembled to the exact
+#             payload; with `[fragmentation] enabled = false` it does not
+#             arrive (drop.IPV4_FRAGMENTATION_REQUIRED). Then lan
+#             `mtu = 1280` (MTU_BELOW_DEVICE for if1, ra at 1500): host
+#             B's 1400-byte DF-clear reply to host A's NAT mapping
+#             reaches host A as two fragments 203.0.113.1 -> 192.168.1.10
+#             (1276+144, offsets 0/157) and is reassembled. The final
+#             counters show fragmentation.fragmented =
+#             consume.IPV4_FRAGMENTED, fragments = generated_fragments
+#             tx_accepted, nothing dropped or incomplete
 #   unsolicited_syn  (B3, RFC 5382 REQ-4) with a firewall rule that admits
 #             new WAN -> LAN TCP flows to every destination, host B sends a
 #             TCP SYN to a public port without a mapping: nothing for 6 s,
@@ -440,7 +455,7 @@ write_config "$work/router-v2.toml" ra 0 router-v2
 # a cross-port forward is copied into an egress generated frame, so with
 # more of those than TX entries the 128-entry TX ring is what fills.
 write_config "$work/txfull.toml" ra 0 router-v1 256
-# H3: every runtime table at its production limit (54.45 MiB of storage),
+# H3: every runtime table at its production limit (58.22 MiB of storage),
 # without the fixture's own backend; and one more failure hold (above the
 # production 4096, within the simulator's 65536), as af-xdp and as sim.
 sed -e '/^\[backend\]$/,$d' -e 's/device = "rusternodev0"/device = "sim0"/' \
@@ -1254,7 +1269,7 @@ phase_idle
 status=0
 "$binary_path" validate "$work/production-max.toml" >"$work/validate-production-max.txt" 2>&1 || status=$?
 [ "$status" -eq 0 ] || fail "limits: validate exit status $status: $(cat "$work/validate-production-max.txt")"
-grep -q " storage-bytes=57098432 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
+grep -q " storage-bytes=61042880 backend=af-xdp ports=2 " "$work/validate-production-max.txt" ||
     fail "limits: validate: $(cat "$work/validate-production-max.txt")"
 above_detail="stage=validate code=CAPACITY_LIMIT_EXCEEDED path=resolution.capacity.failure-holds limit=4096 actual=4097"
 status=0
@@ -1278,7 +1293,7 @@ signal_ruster TERM
 wait_ruster
 [ "$status" -eq 0 ] || fail "limits: exit status $status after SIGTERM"
 assert_detached "the limits phase"
-echo "priv_run_limits: every table at its production limit (storage 57098432 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
+echo "priv_run_limits: every table at its production limit (storage 61042880 bytes) started, forwarded, and stopped with exit 0; 4097 failure holds refused by validate and run (exit 2, limit=4096), accepted as sim verified"
 
 # ops: SIGHUP reload, a refused restart-required reload, and link down/up,
 # all on one running router (M2 S10b).
@@ -1849,6 +1864,303 @@ phase_df_clear() {
     echo "priv_run_df_clear: $(sed -n 2p "$work/df-clear-recv.out"), exit 0 verified"
 }
 phase_df_clear
+
+# frag (MTU2 part B, RFC 791 3.2, RFC 1812 4.2.2.7): the router fragments
+# forwarded DF-clear IPv4 datagrams above the egress MTU (after NAT44, so
+# every fragment carries the one generated ID). Separate runs: outbound
+# with the WAN at 1400 (rb, pb, wan `mtu = 1400`), the same with
+# `[fragmentation] enabled = false`, and inbound with lan `mtu = 1280`
+# (ra stays 1500: MTU_BELOW_DEVICE for if1). Separate runs keep each
+# direction's MTUs simple; a slot holds max(largest interface MTU, 3826)
+# bytes, so a 1500-byte datagram received above every configured MTU is
+# fragmented too (crates/io-sim/tests/ipv4_fragmentation_tick.rs).
+# FRAG_RECV: argv mode (expect|absent),
+# capture interface, bound UDP port, IPv4 source and destination of the
+# fragments, UDP source port range (first-last), egress MTU, payload
+# length, marker, deadline seconds, and optionally a poke target address,
+# port, and marker. It binds the UDP port, opens an AF_PACKET (ETH_P_IP)
+# socket on the interface, prints ready, and pokes the target from the
+# bound port every 0.2 s (creating the NAT mapping and firewall state).
+# For `expect`, the UDP socket must receive exactly the payload
+# (frag_payload of the marker and length), and every complete fragment
+# set seen on the wire must be exactly the RFC 791 layout for the MTU
+# (data per fragment the largest multiple of 8 that fits, MF on all but
+# the last, offsets in 8-byte units), one ID, DF clear, TTL 63, valid
+# header checksums, total lengths as on the wire, and the reassembled UDP
+# datagram must carry the ports and a valid checksum. For `absent`,
+# neither the payload nor any fragment may arrive before the deadline.
+# FRAG_SEND: argv target, port, payload length, marker, stop file, and an
+# optional reply marker; sends the payload DF-clear (IP_MTU_DISCOVER =
+# IP_PMTUDISC_DONT) every 0.1 s (10 s at most) until the stop file
+# exists, to the target, or (reply marker given) from the bound port to
+# the source of the first datagram carrying the reply marker.
+FRAG_PAYLOAD='
+def frag_payload(marker, length):
+    return marker + bytes((i * 7 + 3) & 0xFF for i in range(length - len(marker)))
+'
+FRAG_RECV="$FRAG_PAYLOAD"'
+import socket, struct, sys, time
+
+def fold(data):
+    if len(data) % 2:
+        data += b"\0"
+    total = sum(struct.unpack("!%dH" % (len(data) // 2), data))
+    while total >> 16:
+        total = (total & 0xFFFF) + (total >> 16)
+    return total
+
+def check(ok, what):
+    if not ok:
+        sys.exit("frag %s: %s" % (mode, what))
+
+mode, iface, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
+src, dst = socket.inet_aton(sys.argv[4]), socket.inet_aton(sys.argv[5])
+sport_first, sport_last = (int(p) for p in sys.argv[6].split("-"))
+mtu, length, marker = int(sys.argv[7]), int(sys.argv[8]), sys.argv[9].encode()
+deadline = time.monotonic() + float(sys.argv[10])
+poke = (sys.argv[11], int(sys.argv[12]), sys.argv[13].encode()) if len(sys.argv) > 13 else None
+expected = frag_payload(marker, length)
+per = (mtu - 20) // 8 * 8
+layout, offset = [], 0
+while offset < 8 + length:
+    size = min(per, 8 + length - offset)
+    layout.append((offset // 8, offset + size < 8 + length, size))
+    offset += size
+udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp.bind(("0.0.0.0", port))
+udp.setblocking(False)
+cap = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
+cap.bind((iface, 0x0800))
+cap.settimeout(0.05)
+print("ready", flush=True)
+sets, done, received, next_poke = {}, [], False, 0.0
+while time.monotonic() < deadline and not (mode == "expect" and received and done):
+    if poke is not None and time.monotonic() >= next_poke:
+        udp.sendto(poke[2], poke[:2])
+        next_poke = time.monotonic() + 0.2
+    try:
+        data = udp.recv(4096)
+        check(mode == "expect", "the %d-byte payload arrived with fragmentation off" % len(data))
+        if marker in data:
+            check(data == expected, "reassembled payload differs (%d bytes)" % len(data))
+            received = True
+    except BlockingIOError:
+        pass
+    try:
+        pkt, addr = cap.recvfrom(65535)
+    except socket.timeout:
+        continue
+    if addr[2] == socket.PACKET_OUTGOING or len(pkt) < 20 or pkt[9] != 17:
+        continue
+    if pkt[12:16] != src or pkt[16:20] != dst:
+        continue
+    ident, flags = struct.unpack("!HH", pkt[4:8])
+    if not flags & 0x3FFF:
+        continue
+    check(mode == "expect", "a fragment arrived with fragmentation off")
+    check(pkt[0] == 0x45, "fragment version/IHL 0x%02x" % pkt[0])
+    check(fold(pkt[:20]) == 0xFFFF, "fragment header checksum (id 0x%04x)" % ident)
+    check(not flags & 0xC000, "fragment flags 0x%04x (reserved or DF set)" % flags)
+    check(pkt[8] == 63, "fragment TTL %d" % pkt[8])
+    total = struct.unpack("!H", pkt[2:4])[0]
+    check(total == len(pkt), "fragment total length %d on a %d-byte packet" % (total, len(pkt)))
+    frags = sets.setdefault(ident, {})
+    frags[flags & 0x1FFF] = (bool(flags & 0x2000), pkt[20:])
+    if len(frags) < len(layout) or ident in [d[0] for d in done]:
+        continue
+    seen = sorted((off, mf, len(body)) for off, (mf, body) in frags.items())
+    check(seen == layout, "fragments of id 0x%04x %s, not %s" % (ident, seen, layout))
+    whole = b"".join(frags[off][1] for off, _, _ in layout)
+    sp, dp, ulen = struct.unpack("!HHH", whole[:6])
+    check(sport_first <= sp <= sport_last and dp == port, "UDP ports %d -> %d" % (sp, dp))
+    check(ulen == 8 + length and whole[8:] == expected, "reassembled UDP datagram")
+    check(fold(src + dst + struct.pack("!BBH", 0, 17, ulen) + whole) == 0xFFFF, "UDP checksum")
+    done.append((ident, sp, [20 + size for _, _, size in layout]))
+if mode == "absent":
+    print("neither the %d-byte DF-clear datagram nor a fragment of it reached %s within %s s" % (20 + 8 + length, sys.argv[5], sys.argv[10]))
+    sys.exit(0)
+check(received, "the %d-byte payload never arrived" % length)
+check(done, "no complete fragment set on %s" % iface)
+ident, sp, totals = done[0]
+print("%d-byte DF-clear UDP %s:%d -> %s:%d arrived as %d fragments (id 0x%04x, total lengths %s, data %s, offsets %s, MF %s, DF clear, TTL 63, checksums valid; %d complete set(s), one ID each) and reassembled to the exact %d-byte payload" % (
+    20 + 8 + length, sys.argv[4], sp, sys.argv[5], port, len(layout), ident,
+    "+".join(map(str, totals)), "+".join(str(s) for _, _, s in layout),
+    ",".join(str(o) for o, _, _ in layout), ",".join(str(int(m)) for _, m, _ in layout),
+    len(done), length))
+'
+FRAG_SEND="$FRAG_PAYLOAD"'
+import os, socket, sys, time
+target, port, length = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+marker, stop = sys.argv[4].encode(), sys.argv[5]
+reply = sys.argv[6].encode() if len(sys.argv) > 6 else None
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.IPPROTO_IP, 10, 0)  # IP_MTU_DISCOVER = IP_PMTUDISC_DONT
+s.settimeout(0.1)
+if reply is not None:
+    s.bind(("0.0.0.0", port))
+print("ready", flush=True)
+peer = None if reply is not None else (target, port)
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline and not os.path.exists(stop):
+    if peer is None:
+        try:
+            data, source = s.recvfrom(4096)
+        except socket.timeout:
+            continue
+        if reply in data:
+            peer = source
+        continue
+    s.sendto(frag_payload(marker, length), peer)
+    time.sleep(0.1)
+'
+
+# Starts FRAG_RECV (output file $work/$1, then its argv) in the namespace
+# $frag_ns and waits until it is ready; sets `frag_receiver`.
+frag_receiver_start() {
+    out="$work/$1"
+    shift
+    : >"$out"
+    in_ns "$frag_ns" python3 -I -c "$FRAG_RECV" "$@" >"$out" 2>&1 &
+    frag_receiver=$!
+    tries=0
+    while ! grep -q ready "$out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "frag: $out not ready: $(cat "$out")"
+        sleep 0.05
+    done
+}
+
+# Host A -> host B: the 1500-byte DF-clear datagram (1472-byte payload)
+# to port 9004, captured on pb. $1 tag, $2 mode (expect|absent), $3
+# deadline seconds.
+frag_outbound() {
+    rm -f "$stopfile"
+    frag_ns=$host_b
+    frag_receiver_start "frag-$1.out" "$2" pb 9004 203.0.113.2 203.0.113.1 40000-40015 \
+        1400 1472 "ruster-frag-$1-$suffix" "$3"
+    in_ns "$host_a" python3 -I -c "$FRAG_SEND" 203.0.113.1 9004 1472 \
+        "ruster-frag-$1-$suffix" "$stopfile" >"$work/frag-send-$1.out" 2>&1 &
+    sender=$!
+    status=0
+    wait "$frag_receiver" || status=$?
+    : >"$stopfile"
+    wait "$sender" || true
+    [ "$status" -eq 0 ] || fail "$1: $(cat "$work/frag-$1.out")"
+}
+
+# Stops the run $1 with SIGTERM (exit 0, nothing attached), writes its
+# final stats block to $work/$1.final, and checks the fragmentation
+# counters: at least $2 datagrams fragmented into two fragments each,
+# every one consumed as IPV4_FRAGMENTED and accepted by TX, nothing
+# dropped, rejected, or left incomplete, and no fragment from a host
+# (FIREWALL_FRAGMENT_UNSUPPORTED: the hosts send whole datagrams).
+frag_stop() {
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "$1: exit status $status after SIGTERM"
+    assert_detached "the $1 run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/$1.out" >"$work/$1.final"
+    block_has "$work/$1.final" drop.IPV4_FRAGMENTATION_REQUIRED=0 \
+        fragmentation.dropped_unavailable=0 fragmentation.dropped_frame_too_large=0 \
+        fragmentation.incomplete=0 generated_fragments.tx_rejected=0 \
+        drop.FIREWALL_FRAGMENT_UNSUPPORTED=0 drop.IPV4_FRAGMENTATION_DATAGRAM_TOO_LARGE=0
+    fragmented=$(stat_in "$work/$1.final" fragmentation.fragmented)
+    fragments=$(stat_in "$work/$1.final" fragmentation.fragments)
+    consumed=$(stat_in "$work/$1.final" consume.IPV4_FRAGMENTED)
+    accepted=$(stat_in "$work/$1.final" generated_fragments.tx_accepted)
+    [ "${fragmented:-0}" -ge "$2" ] ||
+        fail "$1: fragmentation.fragmented is ${fragmented:-missing}"
+    [ "${consumed:-x}" = "$fragmented" ] ||
+        fail "$1: consume.IPV4_FRAGMENTED ${consumed:-missing}, fragmented $fragmented"
+    [ "${fragments:-0}" -eq $((fragmented * 2)) ] && [ "${accepted:-x}" = "$fragments" ] ||
+        fail "$1: fragments ${fragments:-missing}, tx_accepted ${accepted:-missing}, fragmented $fragmented"
+}
+
+phase_frag() {
+    # Outbound: the WAN at 1400 (rb, pb, wan `mtu = 1400`), lan at its
+    # default 1500.
+    sudo -n ip -n "$router" link set rb mtu 1400
+    sudo -n ip -n "$host_b" link set pb mtu 1400
+    sed -e '/^mac = "02:00:00:00:00:02"$/a mtu = 1400' "$work/router.toml" >"$work/frag-out.toml"
+    [ "$(grep -cx "mtu = 1400" "$work/frag-out.toml")" -eq 1 ] || fail "frag: config edit"
+    printf '\n[fragmentation]\nenabled = false\n' |
+        cat "$work/frag-out.toml" - >"$work/frag-off.toml"
+    sed -e '/^mac = "02:00:00:00:00:01"$/a mtu = 1280' "$work/router.toml" >"$work/frag-in.toml"
+    [ "$(grep -cx "mtu = 1280" "$work/frag-in.toml")" -eq 1 ] || fail "frag: config edit"
+    # The pmtu phase left host A with a learned PMTU 1400 for host B, by
+    # which its kernel would fragment the DF-clear datagram itself (the
+    # router drops fragments: FIREWALL_FRAGMENT_UNSUPPORTED). The hosts
+    # send whole datagrams at their device MTUs.
+    in_ns "$host_a" ip route flush cache
+    in_ns "$host_b" ip route flush cache
+    start_ruster frag-out "$work/frag-out.toml"
+    wait_ready frag-out || fail "frag-out: ruster exited during startup"
+    ! grep -q "MTU_BELOW_DEVICE" "$work/frag-out.err" ||
+        fail "frag-out: MTU_BELOW_DEVICE warning at equal MTUs"
+    forward_once frag_out_resolve
+    frag_outbound frag_out expect 10
+    echo "priv_run_frag_outbound: $(sed -n 2p "$work/frag-frag_out.out") verified"
+    frag_stop frag-out 1
+    echo "priv_run_frag_outbound_stats: fragmentation.fragmented=consume.IPV4_FRAGMENTED=$fragmented, fragments=generated_fragments.tx_accepted=$fragments, nothing dropped or incomplete, exit 0, detached verified"
+
+    # The off switch: the same outbound datagram is dropped
+    # (IPV4_FRAGMENTATION_REQUIRED, the MTU1 behaviour).
+    start_ruster frag-off "$work/frag-off.toml"
+    wait_ready frag-off || fail "frag-off: ruster exited during startup"
+    forward_once frag_off_resolve
+    frag_outbound frag_off absent 3
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "frag-off: exit status $status after SIGTERM"
+    assert_detached "the frag-off run"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/frag-off.out" >"$work/frag-off.final"
+    block_has "$work/frag-off.final" fragmentation.fragmented=0 consume.IPV4_FRAGMENTED=0 \
+        drop.FIREWALL_FRAGMENT_UNSUPPORTED=0
+    required=$(stat_in "$work/frag-off.final" drop.IPV4_FRAGMENTATION_REQUIRED)
+    [ "${required:-0}" -ge 1 ] ||
+        fail "frag-off: drop.IPV4_FRAGMENTATION_REQUIRED is ${required:-missing}"
+    echo "priv_run_frag_off: with [fragmentation] enabled = false $(sed -n 2p "$work/frag-frag_off.out"); drop.IPV4_FRAGMENTATION_REQUIRED=$required, fragmentation.fragmented=0, exit 0, detached verified"
+    sudo -n ip -n "$router" link set rb mtu 1500
+    sudo -n ip -n "$host_b" link set pb mtu 1500
+
+    # Inbound: lan `mtu = 1280` (ra stays 1500: MTU_BELOW_DEVICE for
+    # if1), the WAN at 1500. Host B answers a poke from host A port 33300
+    # (NAT mapping and firewall state) with a 1400-byte DF-clear datagram
+    # (1372-byte payload) from port 9005; the router translates it back
+    # and fragments it for lan's 1280; captured on pa.
+    start_ruster frag-in "$work/frag-in.toml"
+    wait_ready frag-in || fail "frag-in: ruster exited during startup"
+    grep -q "warning: port=if1 MTU_BELOW_DEVICE mtu=1500 config=1280" "$work/frag-in.err" ||
+        fail "frag-in: no MTU_BELOW_DEVICE warning for if1"
+    forward_once frag_in_resolve
+    # As for host A (setup): full UDP checksums from host B's socket, or
+    # the router drops the reply (FIREWALL_UDP_CHECKSUM_INVALID).
+    in_ns "$host_b" ethtool -K pb tx off >/dev/null
+    rm -f "$stopfile"
+    in_ns "$host_b" python3 -I -c "$FRAG_SEND" 0.0.0.0 9005 1372 \
+        "ruster-frag-in-$suffix" "$stopfile" "ruster-frag-poke-$suffix" \
+        >"$work/frag-send-in.out" 2>&1 &
+    sender=$!
+    tries=0
+    while ! grep -q ready "$work/frag-send-in.out" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 200 ] || fail "frag-in: host B replier not ready"
+        sleep 0.05
+    done
+    frag_ns=$host_a
+    frag_receiver_start frag-recv-in.out expect pa 33300 203.0.113.1 192.168.1.10 9005-9005 \
+        1280 1372 "ruster-frag-in-$suffix" 10 203.0.113.1 9005 "ruster-frag-poke-$suffix"
+    status=0
+    wait "$frag_receiver" || status=$?
+    : >"$stopfile"
+    wait "$sender" || true
+    in_ns "$host_b" ethtool -K pb tx on >/dev/null
+    [ "$status" -eq 0 ] || fail "frag-in: $(cat "$work/frag-recv-in.out")"
+    echo "priv_run_frag_inbound: $(sed -n 2p "$work/frag-recv-in.out") verified"
+    frag_stop frag-in 1
+    echo "priv_run_frag: MTU_BELOW_DEVICE warned for if1 (ra 1500, config 1280); inbound fragmentation.fragmented=consume.IPV4_FRAGMENTED=$fragmented, fragments=generated_fragments.tx_accepted=$fragments, nothing dropped or incomplete, drop.IPV4_FRAGMENTATION_REQUIRED=0, exit 0, detached verified"
+}
+phase_frag
 
 # unsolicited_syn (B3): host B's raw-socket view of the RFC 5382 REQ-4
 # delayed ICMP Port Unreachable. argv: mode (icmp|absent), public port,
