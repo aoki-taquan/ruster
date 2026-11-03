@@ -907,6 +907,70 @@ fn plan_text_renders_the_per_host_mapping_limit_and_its_storage_switch() {
     assert!(!stdout.contains("policy ~ changed"), "{stdout}");
 }
 
+/// N6: the UDP peer and TCP session limits render as typed deltas; turning
+/// the TCP session limit on adds per-session storage (restart-required),
+/// changing it between two limits is reloadable.
+#[test]
+fn plan_text_renders_the_per_host_peer_and_session_limits() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let with = |name: &str, peers: u16, sessions: u16| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            source
+                .replacen(
+                    "allocator-seed = \"1\"\n",
+                    &format!("allocator-seed = \"1\"\npeers-per-host = {peers}\n"),
+                    1,
+                )
+                .replacen(
+                    "allocator-seed = \"2\"\n",
+                    &format!("allocator-seed = \"2\"\nsessions-per-host = {sessions}\n"),
+                    1,
+                ),
+        )
+        .unwrap();
+        path
+    };
+    let current = fixtures().join("router-v1.toml");
+    let limited = with("limits-16-32.toml", 16, 32);
+    let changed = with("limits-8-64.toml", 8, 64);
+    assert_eq!(
+        status(&ruster(&["validate".as_ref(), limited.as_os_str()])),
+        0
+    );
+    let on = ruster(&["plan".as_ref(), current.as_os_str(), limited.as_os_str()]);
+    assert_eq!(status(&on), 0);
+    let stdout = text(&on.stdout);
+    assert!(stdout.starts_with("plan: restart-required\n"), "{stdout}");
+    assert!(
+        stdout.contains("restart-required: STORAGE_SHAPE\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  nat44-udp peers-per-host ~ unlimited -> 16\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  nat44-tcp sessions-per-host ~ unlimited -> 32\n"),
+        "{stdout}"
+    );
+    let change = ruster(&["plan".as_ref(), limited.as_os_str(), changed.as_os_str()]);
+    assert_eq!(status(&change), 0);
+    let stdout = text(&change.stdout);
+    assert!(stdout.starts_with("plan: reloadable\n"), "{stdout}");
+    assert!(
+        stdout.contains("  nat44-udp peers-per-host ~ 16 -> 8\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("  nat44-tcp sessions-per-host ~ 32 -> 64\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("policy ~ changed"), "{stdout}");
+}
+
 /// The TCP per-remote inbound session limit is a reloadable typed delta;
 /// `0` renders as `unlimited`, and out-of-range values are rejected with a
 /// value-free code and path.

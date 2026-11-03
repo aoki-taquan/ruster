@@ -1028,6 +1028,69 @@ fn nat44_mappings_per_host_defaults_to_unlimited_per_protocol_and_is_exact() {
     }
 }
 
+/// N6 (RFC 6888 REQ-5): `[nat44.udp] peers-per-host` and `[nat44.tcp]
+/// sessions-per-host` default to `0` (no limit), take any `u16`, refuse
+/// other types as `INVALID_TYPE` at their own path, and exist only on their
+/// own protocol (a TCP `peers-per-host` or UDP `sessions-per-host`, or
+/// either in a capacity table, is an `UNKNOWN_FIELD`).
+#[test]
+fn nat44_peer_and_session_limits_default_to_unlimited_and_are_exact() {
+    const UDP: &str = "icmpv4-errors = \"external-only\"\n";
+    const TCP: &str = "icmpv4-errors = \"disabled\"\n";
+    let nat = |source: &str| {
+        let VersionedConfig::V1(config) = parse(source.as_bytes()).unwrap() else {
+            panic!("schema version 1");
+        };
+        let nat = config.nat44.unwrap();
+        (
+            nat.udp.unwrap().peers_per_host,
+            nat.tcp.unwrap().sessions_per_host,
+        )
+    };
+    assert_eq!(nat(VALID_V1), (0, 0));
+    for value in [0_u16, 1, 4_096, u16::MAX] {
+        let udp = VALID_V1.replacen(UDP, &format!("{UDP}peers-per-host = {value}\n"), 1);
+        assert_eq!(nat(&udp), (value, 0));
+        let tcp = VALID_V1.replacen(TCP, &format!("{TCP}sessions-per-host = {value}\n"), 1);
+        assert_eq!(nat(&tcp), (0, value));
+    }
+    for (anchor, section, field, value) in [
+        (UDP, "udp", "peers-per-host", "-1"),
+        (UDP, "udp", "peers-per-host", "65536"),
+        (UDP, "udp", "peers-per-host", "\"8\""),
+        (TCP, "tcp", "sessions-per-host", "1.5"),
+        (TCP, "tcp", "sessions-per-host", "true"),
+    ] {
+        let source = VALID_V1.replacen(anchor, &format!("{anchor}{field} = {value}\n"), 1);
+        let diagnostic = parse(source.as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{value}");
+        let expected: Vec<PathSegment> = ["nat44", section, field]
+            .iter()
+            .map(|field| PathSegment::Field((*field).to_owned()))
+            .collect();
+        assert_eq!(diagnostic.path().segments(), expected.as_slice());
+    }
+    for (anchor, field) in [
+        (UDP, "sessions-per-host"),
+        (TCP, "peers-per-host"),
+        ("[nat44.realm.ports]", "peers-per-host"),
+        ("peers = ", "peers-per-host"),
+        ("sessions = ", "sessions-per-host"),
+    ] {
+        let misplaced = parse(
+            VALID_V1
+                .replacen(anchor, &format!("{field} = 4\n{anchor}"), 1)
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            misplaced.code(),
+            DiagnosticCode::UnknownField,
+            "{anchor} {field}"
+        );
+    }
+}
+
 /// B3 (RFC 5382 REQ-4): `[nat44.tcp] unsolicited-syn-icmp` defaults to
 /// `true` and `[nat44.tcp.capacity] unsolicited-syn-holds` to
 /// `DEFAULT_UNSOLICITED_SYN_HOLDS` (64); both are exact and TCP-only.

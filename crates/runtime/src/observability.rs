@@ -1307,7 +1307,7 @@ impl ObservableFields for ServiceCounters {
             outbound_translated, inbound_translated, mapping_misses, filter_denied,
             mapping_full, peer_full, port_exhausted, clock_regressions, config_mismatches,
             reconciliations, hairpin_translated, hairpin_inbound_refused, hairpin_disabled,
-            host_quota_exceeded,
+            host_quota_exceeded, host_peer_quota_exceeded,
         }}
         visit_counts! {v, "nat44_tcp", self.nat44_tcp, Nat44TcpCounters {
             mappings_created, mappings_reused, mappings_expired, sessions_created,
@@ -1322,13 +1322,13 @@ impl ObservableFields for ServiceCounters {
             unsolicited_syn_icmp_suppressed, unsolicited_syn_firewall_denied,
             unsolicited_syn_index_corrupt, sessions_established, sessions_closed, sessions_reset,
             sessions_expired_opening, sessions_expired_established, sessions_expired_closing,
-            host_quota_exceeded,
+            host_quota_exceeded, host_session_quota_exceeded,
         }}
         visit_counts! {v, "nat44_icmp", self.nat44_icmp, Nat44IcmpCounters {
             mappings_created, mappings_reused, mappings_expired, peers_created,
             outbound_translated, inbound_translated, mapping_misses, filter_denied,
             mapping_full, peer_full, identifier_exhausted, clock_regressions,
-            config_mismatches, reconciliations, host_quota_exceeded,
+            config_mismatches, reconciliations, host_quota_exceeded, host_peer_quota_exceeded,
         }}
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,

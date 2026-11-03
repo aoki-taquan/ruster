@@ -405,17 +405,37 @@ hostが保っているもの（自分の開いたconnectionかestablished connec
 進める）で、remoteがSYNを送り続けてもhostを上限に留められません。hostごとの
 intrusive listとkeyed host directoryでO(1)、scanもtimerもありません。defaultの`0`は無制限で、
 host storageも確保しません。非zeroにするとmapping capacity分のhost storage（mapping slotごとに
-UDP約64、TCP約76 bytes）を確保するので、`0`と非zeroの切り替えはrestart-required
+UDP約76、TCP約76 bytes）を確保するので、`0`と非zeroの切り替えはrestart-required
 （`STORAGE_SHAPE`）、非zero同士の変更はreloadableなので、値は最初から決めておくのが安全です。
-推奨値（pool size ÷ inside host数など）と限界（LAN上のsource address詐称、hostごとのpeer/session
-は無制限）はrunbookの「Known limits」にあります。
+推奨値（pool size ÷ inside host数など）と限界（LAN上のsource address詐称）はrunbookの
+「Known limits」にあります。
+
+internal hostごとのpeer/session上限（N6、NAT44-119〜125。RFC 6888 REQ-5はsubscriberごとの
+state memory（session数、filter数など）の制限をsupportすることをSHOULDで求める）:
+`[nat44.udp]`/`[nat44.icmp]`の`peers-per-host`はhostのlive mappingが持つfilter peer（話している
+remote）の合計、`[nat44.tcp]`の`sessions-per-host`はhostがoutbound SYNで開き、自分で保っている
+sessionの数を制限します。上限では新しいpeer/session（それを運ぶ新mappingも）をbyte不変の
+`NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED`/`NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED`/
+`NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED`（counter `nat44_{udp,icmp}.host_peer_quota_exceeded`、
+`nat44_tcp.host_session_quota_exceeded`）でdropし、何もevictしません。これで一つのhostが共有の
+`peers`/`sessions` tableを使い切って他hostを`PEER_TABLE_FULL`/`SESSION_TABLE_FULL`にすることを
+防ぎます。inbound SYNが作るsession（remoteが開くconnection、hairpinのinbound半分）は数えないので、
+remoteがvictimのTCP予算を使い切ることはできず（UDPはEIFでresponderを動かすhostなら応答先の
+remoteに使い切られうるので、その組み合わせは避ける。runbook）、remoteのsegmentやそれへのhostのRST/TIME-WAIT ACKは
+countを延ばしません。数えなくなったsessionをhostが再び動かすと上限内で数え直します。hostがFINを送ったconnectionは4分（transitory）で数えなくなります（N3の
+mapping quotaも同じ。NAT44-124）。回復はO(1)で、UDPはmappingのexpiry、TCPはhostがsessionを
+4分（opening/閉じたもの）またはestablished timeout動かさなかった時点です。default `0`は無制限。
+UDP/ICMPは`mappings-per-host`と同じhost storageを使い、TCPはsession slotごとに約92 bytesを
+確保するので、storageの有無が変わる切り替えはrestart-required、非zero同士はreloadableです。
 
 ```toml
 [nat44.udp]
 mappings-per-host = 1024   # 省略時0（無制限）。u16
+peers-per-host = 2048      # 省略時0（無制限）。u16
 
 [nat44.tcp]
 mappings-per-host = 1024
+sessions-per-host = 1024   # 省略時0（無制限）。u16
 ```
 
 ICMP query NAT（N5、NAT44-100〜118。RFC 5508 §3）: `[nat44.icmp]`があるとき、insideからの
@@ -452,6 +472,7 @@ filtering = "address-dependent"    # | "endpoint-independent"（reloadable）
 identifier-preservation = true     # false: 常にkeyed identifier（reloadable）
 icmpv4-errors = "bidirectional"    # queryを引用するerrorの変換（reloadable）
 mappings-per-host = 0              # 0=無制限。0⇔非0はrestart-required
+peers-per-host = 0                 # 0=無制限（N6）。mappings-per-hostとstorageを共有
 
 [nat44.icmp.identifiers]           # 省略時[nat44.realm.ports]の数値（identifierごとに32 byte）
 first = 40000

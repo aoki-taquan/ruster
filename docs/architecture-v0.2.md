@@ -1617,16 +1617,75 @@ MUST）を、internal IPv4 addressごとのmapping上限`[nat44.udp]`/`[nat44.tc
   とcommitが同じstateから再計算でき（planの大きさは変わらない）、commitはinfallibleです。
 - **storageとclassification**: `mappings-per-host = 0`ならhost storageを確保せずhost処理もしま
   せん（hot pathのcostもmemoryも従来どおり）。非zeroなら上記をmapping capacity分確保し
-  `required_bytes`が数えます（production最大tableで両protocolなら+9175040 bytes、計66240704
-  bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
+  `required_bytes`が数えます（production最大tableで両protocolなら+9961472 bytes（N6のUDP peer
+  counterを含む）、計67027136 bytesで64 MiBの上限内）。したがって0と非zeroの切り替えはstorage shape変更（restart-required）、
   非zero同士の変更はreloadable（他のNAT変更と同じくapplyでNAT stateをflush）。planは
   `NatChange::mappings_per_host`のtyped deltaです。
 - **限界**（NAT44-096）: 上限はaddress単位です。reverse-path checkがinside sourceをinside-routed
   prefixに限りますが、ARP/MACとの結び付けは無いので、LAN上のhostはそのprefix内の詐称address
   ごとに上限まで作れ、victimのaddressを詐称してそのquotaを使い切ることもできます（inside routeは
-  狭く保つ）。hostごとのpeer/sessionは制限しません（RFC 6888 REQ-5）。RFC 6888 REQ-11の
+  狭く保つ）。hostごとのpeer/sessionはN6（下）が制限します。RFC 6888 REQ-11の
   ICMP Host Unreachableは送らず（他のresource拒否と同じsilent drop）、hostごとの使用数の
   観測もありません。
+
+#### Per-host peer and session limits (N6)
+
+N6（NAT44-119〜125）はRFC 6888 REQ-5（mappingごと・subscriberごとのstate memoryの制限をsupport:
+SHOULD）を、internal IPv4 addressごとのUDP/ICMP query filter peer上限`peers-per-host`とTCP
+session上限`sessions-per-host`（u16、default `0`=無制限）として実装します。上限では新しい
+peer/session（それを運ぶ新mappingも）をstateを変えずに`NAT44_{UDP,ICMP}_HOST_PEER_QUOTA_EXCEEDED`
+/`NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED`でdropし、evictしません（REQ-11 a/d）。plan時の判定順は
+N3のmapping quota、N6、table満杯です。
+
+- **UDP/ICMP（mapping単位の集計）**: peerはmappingのgenerationと生死を共にし、mappingは
+  outboundだけがrefreshするので、remoteはhostの予算を保てません。N3のhost tableを
+  *member-counting*にし、mapping slotごとのlink word（そのmappingのchainのpeer数）とhostごとの
+  counter（合計と*cursor*）をcaller-backed配列で持ちます。hostのlistはactivity順のままで、
+  先頭からpeerを数えないexpired mappingの接頭部、cursorから数えるmapping（liveなものは全て
+  ここ）が続きます。peer追加で+1、park（peerをstale chainへ）、retire、slot再利用、flushで
+  そのmappingの数だけ−（O(1)）。parkされるのは常にhostのcursorか既に数えないmappingです
+  （global LRUの先頭が数えるmappingならそのhostで最も古い数えるmapping）。上限ではcursorだけを
+  見て、liveなら拒否、expiredならcursorを進めて（そのmappingのpeerは死んでいる）受理します。
+  mappingはportとchainを持ったままN3のmapping数に残り、tableのpark/再利用を待ちます。数える
+  mappingはactivity listにあり1 peer以上持つので、count ≤ limitは保たれます。hostのoutboundが
+  作るpeerは応答でも数えるので、EIFではUDP responderのhostの予算を応答先のremoteが使い切れます
+  （review sec M1、NAT44-125。runbookはその組み合わせを避けるよう勧める）。
+- **TCP（session単位、host開始だけ）**: 数えるのはoutboundのinitial SYN（hairpinのoutbound半分を
+  含む）が作ったsessionだけです。inbound SYNが作るsessionを数えると、remoteがvictimのpublic port
+  へSYNを送るだけでvictimの予算を使い切れる（N3 M1と同じtargeted DoS）ので数えません（per-remote
+  inbound limitとfilteringの担当）。session slotと並ぶ二つ目のhost table（session slotごとの
+  link 12 bytesとlink word、3本のlistを持つhost slot 48 bytes、domain `TcpSessionHost`のkeyed
+  directory）で、各counted sessionは*host-driven expiry*を持ちます: N3のmapping規則をsessionごとに
+  適用し（hostが送り、closingに置かず、自分が開いたかestablishedのsessionのsegmentが`now`+phase
+  TTLに進める。hostがFINを送ったestablishedはtransitory）、毎commitでsession自身のexpiryで
+  capします。値は常に`now`+三つのphase TTLのどれかなので、hostごとの3本のlist（TTLの種類別）は
+  expiry順で、link wordにはsessionのlast activityからのoffsetを置きます（saturateしても既に
+  過ぎた期限がさらに早くなるだけ）。上限では3つの先頭の最小を見て、host-liveなら全てhost-live
+  （capによりlive）で拒否、過ぎていればそのsessionを数えるのをやめて受理します。session自体は
+  消さないので、remoteだけが保つsessionはremoteに任され、REQ-11 dを満たします。数えるのは
+  sessionの`host_initiated`（outbound SYNで作るかrestart）で、数えなくなったhost開始sessionは
+  hostの次のhost-driven segmentで新sessionと同じく上限内で数え直し（上限では拒否）、remoteが
+  restartしたsessionは数えなくなります（review core M、sec L1/L2）。
+- **TCPの不変条件**: (J1) hostのcount = 数えるsession数 ≤ limit（commitは+1と同時に1つ外す）。
+  (J2) 数えるsessionのhost-driven expiry ≤ session自身のexpiry（毎commit cap）。(J3) 数える
+  sessionのhost-driven expiry ≤ そのmappingの`host_expires_ms`（同じsegmentに同じ規則、両方cap）。
+  N3が引き継ぐmapping（host-driven expiry過ぎ）やexpired/retireされたmappingのsessionはJ3により
+  過ぎているので、generationが変わったsessionがhost-liveのまま残ることはなく、拒否 ⇔
+  host-liveなsession ≥ limitです。sessionの作成はslotの前のsessionの数えを終えます（inbound作成も）。
+- **half-close（NAT44-124）**: hostがFINを送ったestablished sessionのhost-driven refreshは、
+  sessionはtransitory TTL、mapping（N3）は同じmappingに他のestablished sessionが無ければ
+  transitory TTLにします。FINを返さないserverが閉じたconnectionをestablishedに保っても、host
+  quotaに数えさせられるのはhostの最後のsegmentから4分です。
+- **storageとclassification**: UDP/ICMPはN3のhost storageにlink word（4）とhost counter（8）を
+  加え、`mappings-per-host`か`peers-per-host`があれば確保します（TCPのmapping host tableは不変）。
+  TCPは`sessions-per-host`があればsession slot分（92 bytes/slot）。storageの有無の切り替えは
+  restart-required、非zero同士はreloadable、planは`NatChange::peers_per_host`/
+  `sessions_per_host`のtyped deltaです。production最大tableでは全てのper-host limitを同時に
+  有効にすると64 MiBを超え`RUNTIME_STORAGE_BYTES_EXCEEDED`でfail closedします（runbookの
+  sizing）。
+- **cost**: UDPの拒否はmappingのlinkからhostを引くのでhost lookup無しでcursorのliveness確認
+  1回、TCPはsession host lookup 1回と先頭3つ、受理はplan・再検証・commitのlookupと一回のO(1)
+  uncount。allocationは無く、65536 slotのtestで一定です。
 
 ### Resolution bounded indexes
 

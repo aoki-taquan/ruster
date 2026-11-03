@@ -143,10 +143,10 @@ pub struct NatPortRange {
 }
 
 /// Difference of one NAT44 protocol. The filtering behavior, the
-/// hairpinning switch, the port preservation switch, the per-host mapping
-/// limit, the TCP per-remote inbound session limit, the TCP unsolicited-SYN
-/// ICMP switch, and the TCP inbound-RST policy are not secret and are
-/// reported as typed deltas. The
+/// hairpinning switch, the port preservation switch, the per-host mapping,
+/// peer, and session limits, the TCP per-remote inbound session limit, the
+/// TCP unsolicited-SYN ICMP switch, and the TCP inbound-RST policy are not
+/// secret and are reported as typed deltas. The
 /// rest of the policy (which includes the allocator seed) is never exposed,
 /// only whether it changed: `policy_changed` ignores changes of only those
 /// values.
@@ -163,6 +163,15 @@ pub struct NatChange {
     /// limit. Switching between `0` and a limit also changes the storage
     /// shape (restart-required); a change between two limits is reloadable.
     pub mappings_per_host: Option<Delta<u16>>,
+    /// UDP and ICMP queries only (always `None` for TCP): the per-host
+    /// filter peer limit (`peers-per-host`, N6); `0` means no limit. It
+    /// shares the per-host storage of `mappings-per-host`, so it changes
+    /// the storage shape only when it switches that storage on or off.
+    pub peers_per_host: Option<Delta<u16>>,
+    /// TCP only (always `None` for UDP and ICMP): the per-host session
+    /// limit (`sessions-per-host`, N6); `0` means no limit. Switching
+    /// between `0` and a limit also changes the storage shape.
+    pub sessions_per_host: Option<Delta<u16>>,
     /// TCP only (always `None` for UDP); `0` means no limit.
     pub inbound_sessions_per_remote: Option<Delta<u8>>,
     /// TCP only (always `None` for UDP): the RFC 5382 REQ-4 delayed ICMP
@@ -183,6 +192,8 @@ impl NatChange {
             && self.hairpinning.is_none()
             && self.port_preservation.is_none()
             && self.mappings_per_host.is_none()
+            && self.peers_per_host.is_none()
+            && self.sessions_per_host.is_none()
             && self.inbound_sessions_per_remote.is_none()
             && self.unsolicited_syn_icmp.is_none()
             && self.inbound_rst.is_none()
@@ -633,15 +644,15 @@ fn nat_change(
 ) -> NatChange {
     let (old_realm, old_ports) = nat_parts(old, protocol);
     let (new_realm, new_ports) = nat_parts(new, protocol);
-    // Filtering, hairpinning, port preservation, the per-host limit, the TCP
-    // inbound limit, the TCP unsolicited-SYN ICMP switch, and the TCP
+    // Filtering, hairpinning, port preservation, the per-host limits, the
+    // TCP inbound limit, the TCP unsolicited-SYN ICMP switch, and the TCP
     // inbound-RST policy are reported separately, so compare the rest of the
     // policy with the new values substituted into the old one.
     let (
         filtering,
         hairpinning,
         port_preservation,
-        mappings_per_host,
+        (mappings_per_host, peers_per_host, sessions_per_host),
         inbound_sessions_per_remote,
         unsolicited_syn_icmp,
         inbound_rst,
@@ -653,7 +664,11 @@ fn nat_change(
                 delta(old.filtering(), new.filtering()),
                 delta(old.hairpinning(), new.hairpinning()),
                 delta(old.port_preservation(), new.port_preservation()),
-                delta(old.mappings_per_host(), new.mappings_per_host()),
+                (
+                    delta(old.mappings_per_host(), new.mappings_per_host()),
+                    delta(old.peers_per_host(), new.peers_per_host()),
+                    None,
+                ),
                 None,
                 None,
                 None,
@@ -661,6 +676,7 @@ fn nat_change(
                     .with_hairpinning(new.hairpinning())
                     .with_port_preservation(new.port_preservation())
                     .with_mappings_per_host(new.mappings_per_host())
+                    .with_peers_per_host(new.peers_per_host())
                     != new,
             )
         }
@@ -670,7 +686,11 @@ fn nat_change(
                 delta(old.filtering(), new.filtering()),
                 delta(old.hairpinning(), new.hairpinning()),
                 delta(old.port_preservation(), new.port_preservation()),
-                delta(old.mappings_per_host(), new.mappings_per_host()),
+                (
+                    delta(old.mappings_per_host(), new.mappings_per_host()),
+                    None,
+                    delta(old.sessions_per_host(), new.sessions_per_host()),
+                ),
                 delta(
                     old.inbound_sessions_per_remote(),
                     new.inbound_sessions_per_remote(),
@@ -681,6 +701,7 @@ fn nat_change(
                     .with_hairpinning(new.hairpinning())
                     .with_port_preservation(new.port_preservation())
                     .with_mappings_per_host(new.mappings_per_host())
+                    .with_sessions_per_host(new.sessions_per_host())
                     .with_unsolicited_syn_icmp(new.unsolicited_syn_icmp())
                     .with_inbound_rst(new.inbound_rst())
                     .with_inbound_sessions_per_remote(new.inbound_sessions_per_remote())
@@ -696,6 +717,8 @@ fn nat_change(
         hairpinning,
         port_preservation,
         mappings_per_host,
+        peers_per_host,
+        sessions_per_host,
         inbound_sessions_per_remote,
         unsolicited_syn_icmp,
         inbound_rst,
@@ -711,6 +734,8 @@ fn icmp_change(old: &RequiredServices<'_>, new: &RequiredServices<'_>) -> NatCha
         hairpinning: None,
         port_preservation: None,
         mappings_per_host: None,
+        peers_per_host: None,
+        sessions_per_host: None,
         inbound_sessions_per_remote: None,
         unsolicited_syn_icmp: None,
         inbound_rst: None,
@@ -736,7 +761,8 @@ fn icmp_change(old: &RequiredServices<'_>, new: &RequiredServices<'_>) -> NatCha
         .with_filtering(new_policy.filtering())
         .expect("a validated filtering is supported")
         .with_identifier_preservation(new_policy.identifier_preservation())
-        .with_mappings_per_host(new_policy.mappings_per_host());
+        .with_mappings_per_host(new_policy.mappings_per_host())
+        .with_peers_per_host(new_policy.peers_per_host());
     NatChange {
         realm: delta(realm(old), realm(new)),
         ports: delta(range(old), range(new)),
@@ -749,6 +775,7 @@ fn icmp_change(old: &RequiredServices<'_>, new: &RequiredServices<'_>) -> NatCha
             old_policy.mappings_per_host(),
             new_policy.mappings_per_host(),
         ),
+        peers_per_host: delta(old_policy.peers_per_host(), new_policy.peers_per_host()),
         policy_changed: rest != new_policy,
         ..empty
     }

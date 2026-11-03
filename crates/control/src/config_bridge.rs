@@ -459,7 +459,8 @@ pub(crate) fn required_services(
             tcp_shape.port_owners,
         )
         .with_unsolicited_syn_hold_slots(tcp_shape.unsolicited_syn_holds)
-        .with_host_slots(tcp_shape.hosts),
+        .with_host_slots(tcp_shape.hosts)
+        .with_session_host_slots(tcp_shape.session_hosts),
         firewall_states,
     );
     let icmp = nat44.and_then(|nat44| nat44.icmp());

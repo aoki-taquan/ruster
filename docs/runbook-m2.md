@@ -209,7 +209,7 @@ whole-document storage, which has no path.
 |---|---|---|---|
 | quote tables (`max_quote_slots_per_table`): `resolution.capacity.failure-holds`, `icmpv4-errors.capacity.actions`, `nat44.tcp.capacity.unsolicited-syn-holds` | 65536 | 4096 | each slot holds a quoted datagram (656, 584, and 592 bytes), so the bound is memory: at 65536 these three alone would need 114.5 MiB. Until H4b this limit (then `max_scanned_slots_per_table`) covered every resolution and ICMPv4 error table because their packet paths scanned |
 | other tables (`max_slots_per_table`): `resolution.capacity.{states,actions,dynamic-neighbors}`, `icmpv4-errors.capacity.states`, `nat44.{udp,tcp}.capacity.*`, `firewall.capacity.states`, each NAT44 directory (next power of two), the NAT44 port owner table (pool size) | 65536 | 65536 | no packet path scans them (table below); home NAT needs many sessions; also the largest port pool (1-65535) |
-| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.42 MiB (63.17 MiB with `mappings-per-host` set on both NAT44 protocols, N3), so the per-table limits bind; the byte limit fails closed only if a slot type grows |
+| runtime storage bytes (`max_runtime_bytes`) | 64 MiB | 64 MiB | every table at its production limit needs 54.42 MiB (63.92 MiB with `mappings-per-host` set on both NAT44 protocols, N3, and 60.17 MiB with only `sessions-per-host`, N6), so the per-table limits bind; all four per-host limits at the maximal tables need 69.67 MiB and fail closed here (size a table down); otherwise the byte limit fails closed only if a slot type grows |
 | config file | 1 MiB | 1 MiB | parse stage, every backend (CONFIG-001) |
 | `[[interfaces]]` / `[[backend.ports]]` | 256 / 256 | 256 / 256 | parse stage |
 | `[[addresses]]` | 1024 | 1024 | parse stage |
@@ -247,7 +247,7 @@ reload path.
 | resolution `actions` (56 B) | FIFO list; a state removes its own queued action in O(1) | O(1) | — | like `states` |
 | ICMPv4 error `states` (24 B) | every generated error (TTL expiry, unreachable) | only the occupied states, which are a prefix of the table and at most two per egress interface in use (one per limiter class: Port Unreachable has its own) | — | at least the number of interfaces plus one (the WAN's Port Unreachable class; `validate` requires it while delayed Port Unreachable is on) |
 | ICMPv4 error `actions` (584 B) | O(1) ring; one per state | O(1) | — | like `states` (one queued error per state; fewer only means `action_full` refusals while the queue is full) |
-| NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories; with `mappings-per-host` also 64/76 B per mapping slot of per-host storage) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
+| NAT44 `mappings`/`peers`/`sessions` (UDP 64/48 B, TCP 80/64 B + directories; with `mappings-per-host` or `peers-per-host` also 76/76 B per mapping slot of per-host storage, with `sessions-per-host` 92 B per TCP session slot) | none since H4a: lookups are keyed; a reusable mapping, peer, or session is the head of an activity-ordered list (one list per TTL, so its head is the first to expire; TCP since N1 has one session list per phase and two mapping lists) or the next never-used slot, and a free public port comes from a free-port bitmap (at most 34 words read at the widest pool), so a new flow does O(1) work however full the tables are. An external inbound SYN keeps its 16-probe window | O(1): under 1 µs per new flow in a release build with 64500 of 65536 slots live (was about 430 µs per TCP SYN and 350 µs per UDP flow before H4a) | same (65536) | the expected concurrent flows; leave headroom |
 | `nat44.icmp.capacity` `mappings`/`peers` (64/48 B + directories), `nat44.icmp.identifiers` (32 B per identifier plus the free bitmap) | the same O(1) mapping engine as UDP (N5) on its own tables and key | O(1) per query; a full table refuses without eviction (`NAT44_ICMP_MAPPING_TABLE_FULL`) | same (65536) | one mapping per running ping per host and one peer per pinged remote; the pool defaults to the realm port numbers |
 | `nat44.tcp.capacity.unsolicited-syn-holds` (592 B) | an unsolicited inbound TCP SYN (no mapping for its public port, or refused by the filtering) is held for the RFC 5382 REQ-4 delayed ICMP Port Unreachable; a translated outbound SYN cancels the hold of its connection | one keyed chain of at most 16 holds (`NAT44_TCP_SYN_HOLD_CHAIN_LIMIT`, secret NAT key) plus O(1) list heads; a full table or chain drops silently. Matured holds are taken in deadline order by the failure-dispatch phase, at most `tick.failure-dispatch-scans` per tick (the same budget value as the resolution failure dispatch, applied separately, so the phase does up to twice that), never scanning unmatured ones; each matured hold walks the firewall rules once. An inconsistent table is flushed (`unsolicited_syn_index_corrupt`) | — | default 64. The Port Unreachable limiter sends at most 1 per second per egress by default, so a bigger table does not send more ICMP; it only holds more SYNs that the limiter will refuse. 0 frees the 37 KiB when the switch is off |
 | `firewall.capacity.states` (56 B) | keyed SipHash probe with occupancy capped near 75% (`usable_state_capacity`), so a full table cannot occur; only the amortized expiry sweep (`reclaim_one_expired`) is linear | — (amortized) | — | the expected concurrent flows |
@@ -1720,11 +1720,12 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     and peer tables (one mapping per identifier, one peer per pinged
     address; a ping sweep makes many peers). Set a nonzero
     `mappings-per-host` (for example `capacity.mappings / expected hosts`)
-    and size `peers` for sweeps; peers per host are not limited (as for
-    UDP, NAT44-096).
+    and size `peers` for sweeps; `peers-per-host` (N6) limits the pinged
+    addresses per host as for UDP.
   - Counters: `nat44_icmp.*` (for example `outbound_translated`,
     `inbound_translated`, `mapping_misses`, `filter_denied`,
-    `identifier_exhausted`, `host_quota_exceeded`) and
+    `identifier_exhausted`, `host_quota_exceeded`,
+    `host_peer_quota_exceeded`) and
     `occupancy.nat44_icmp_{mappings,peers}`; drop reasons
     `NAT44_ICMP_*` and `FIREWALL_ICMP_QUERY_INVALID`.
 - Per-host mapping quota (`[nat44.udp]`/`[nat44.tcp]` `mappings-per-host`,
@@ -1763,18 +1764,16 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   refused. If unsure, enable it with a generous value (for example 4096)
   and lower it by reload. Watch the counters: a steadily rising count on a
   well-behaved host means the limit is too low. Enabling it allocates
-  per-host storage sized from `capacity.mappings` (64 bytes per UDP
-  mapping slot and 76 per TCP slot at a power-of-two capacity, 9175040
-  bytes for both at 65536 slots; it still fits the 64 MiB production
-  bound), so changing between `0` and a limit is restart-required
+  per-host storage sized from `capacity.mappings` (76 bytes per UDP
+  mapping slot, including the N6 peer counters, and 76 per TCP slot at a
+  power-of-two capacity, 9961472 bytes for both at 65536 slots; it still
+  fits the 64 MiB production bound), so changing between `0` and a limit is restart-required
   (`STORAGE_SHAPE`); changing one limit to another is reloadable (`ruster
   plan` shows `nat44-udp mappings-per-host ~ 64 -> 128`; the apply flushes
   the NAT state like every NAT change). Limits:
-  - The quota covers mappings (public ports) only. Per-host UDP peers and
-    TCP sessions are not limited (RFC 6888 REQ-5 is deferred), so one host
-    can still fill the `peers` or `sessions` table with many remotes on
-    its few mappings, even with the quota on (NAT44-096). Size those
-    tables with headroom and use the firewall against untrusted hosts.
+  - The quota covers mappings (public ports) only. One host can still
+    fill the `peers` or `sessions` table with many remotes on its few
+    mappings unless the per-host peer and session limits below are set.
   - The limit is per inside IPv4 address. The router's reverse-path check
     accepts an inside source only if its address routes back out of the
     inside interface, so spoofing is bounded to the inside-routed
@@ -1791,6 +1790,80 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
     is short, and other source ports of the host are not affected.
   - No ICMP is sent for a refusal, and there is no per-host usage report
     (NAT44-096).
+- Per-host peer and session limits (`[nat44.udp]`/`[nat44.icmp]`
+  `peers-per-host`, `[nat44.tcp]` `sessions-per-host`, N6, NAT44-119;
+  default `0`, no limit; RFC 6888 REQ-5 SHOULD). Without them one inside
+  host can fill the shared `peers` or `sessions` table by talking to many
+  remotes from a few mappings, and every other host then gets
+  `PEER_TABLE_FULL` / `SESSION_TABLE_FULL`. With a limit, a host's next new
+  UDP or ICMP query filter peer (a remote address, or address and port under
+  address-and-port-dependent filtering) or its next new outbound TCP
+  connection is dropped as `NAT44_UDP_HOST_PEER_QUOTA_EXCEEDED` /
+  `NAT44_ICMP_HOST_PEER_QUOTA_EXCEEDED` /
+  `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` (counters
+  `nat44_{udp,icmp}.host_peer_quota_exceeded`,
+  `nat44_tcp.host_session_quota_exceeded`) while it holds that many; nothing
+  is evicted and existing flows and inbound traffic are unaffected. What
+  counts:
+  - UDP/ICMP: the peers of the host's live mappings. Peers live as long as
+    their mapping, which only the host's outbound packets refresh, so a
+    host recovers one idle TTL after it stops using a mapping. Every peer
+    the host's own packets create counts, including its answers to
+    remotes that reached it first. Under `filtering =
+    "endpoint-independent"` any remote (or spoofed source) can reach a
+    host's mapped port, so a host that runs a UDP responder (a game or SIP
+    server, a P2P node) can have its whole budget spent by the remotes it
+    answers, after which its own new peers (its DNS client too) are
+    refused while it keeps answering. Do not combine endpoint-independent
+    filtering with `peers-per-host` for hosts that run UDP services; under
+    the default address-dependent filtering such packets are filtered
+    before the host sees them (NAT44-125).
+  - TCP: only sessions the host opened with an outbound SYN (the outbound
+    half of a hairpin too). Connections remotes open to the host (inbound
+    SYNs, the inbound half of a hairpin) never count, so an attacker cannot
+    spend a victim's budget; bound those with `inbound-sessions-per-remote`
+    and filtering. A counted session counts while the host keeps it alive
+    by the same rule as the mapping quota above (its own segments, never a
+    RST or an ACK from TIME-WAIT, and only the 4-minute transitory timeout
+    once the host has sent its FIN), so a closed connection stops counting
+    4 minutes after the host's last segment (an opening one after the
+    opening timeout, an idle established one after the established
+    timeout) even if the remote keeps it alive; it is then left to the
+    remote and is no longer counted. If the host resumes such a session,
+    its next segment counts it again within the limit like a new session
+    (dropped as `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` while every counted
+    session is still driven), so letting sessions lapse and resuming them
+    cannot exceed the limit. A connection the remote reopens after a FIN
+    close (the host answers its SYN) is remote-opened and stops counting;
+    one the host reopens with its own SYN counts. A host at
+    `sessions-per-host` that resumes a connection after more than its idle
+    timeout of its own silence may see that connection's segments dropped
+    as `NAT44_TCP_HOST_SESSION_QUOTA_EXCEEDED` until one of its other
+    sessions goes idle. Size the limit with headroom above the host's
+    normal number of concurrent connections.
+  - Sizing: like the mapping quota, `capacity.peers` or `capacity.sessions`
+    divided by the expected inside hosts keeps every host able to work
+    (for example 65536 sessions / 64 hosts = 1024). Browsers open tens to a
+    few hundred connections; P2P clients and scanners thousands. Start
+    generous (for example 2048) and lower by reload while watching the
+    counters.
+  - Storage and classification: a UDP or ICMP `peers-per-host` uses the
+    same per-host storage as `mappings-per-host` (76 bytes per mapping
+    slot), so it is a storage change only when neither was set before; a
+    TCP `sessions-per-host` adds 92 bytes per session slot (6029312 bytes
+    at 65536). Switching storage on or off is restart-required
+    (`STORAGE_SHAPE`), changing one nonzero limit to another reloadable
+    (`ruster plan` shows `nat44-tcp sessions-per-host ~ 32 -> 64`; the apply
+    flushes the NAT state). At the production maximum (every table at
+    65536 slots) `sessions-per-host` alone fits the 64 MiB bound (63094976
+    bytes) and both mapping limits fit (67027136 bytes), but all four
+    per-host limits together do not: validation fails closed with
+    `RUNTIME_STORAGE_BYTES_EXCEEDED`; lower a capacity (for example
+    `capacity.sessions = 32768`) instead.
+  - Limits: no rate limit on state creation (REQ-5 b), no ICMP or
+    notification for a refusal, a host colluding with a remote can still
+    add inbound-created TCP sessions, and the endpoint-independent UDP
+    responder case above (NAT44-125).
 - Debug builds validate every NAT44 index after each UDP commit (O(M+P)
   and more per packet). Use only release builds (`cargo build --release`)
   in production.

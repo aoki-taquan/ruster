@@ -51,6 +51,7 @@ pub struct Nat44IcmpPolicy {
     filtering: Nat44Filtering,
     identifier_preservation: bool,
     mappings_per_host: u16,
+    peers_per_host: u16,
 }
 
 impl std::fmt::Debug for Nat44IcmpPolicy {
@@ -63,6 +64,7 @@ impl std::fmt::Debug for Nat44IcmpPolicy {
             .field("filtering", &self.filtering)
             .field("identifier_preservation", &self.identifier_preservation)
             .field("mappings_per_host", &self.mappings_per_host)
+            .field("peers_per_host", &self.peers_per_host)
             .finish()
     }
 }
@@ -93,6 +95,7 @@ impl Nat44IcmpPolicy {
             filtering: Nat44Filtering::AddressDependent,
             identifier_preservation: true,
             mappings_per_host: NAT44_DEFAULT_MAPPINGS_PER_HOST,
+            peers_per_host: NAT44_DEFAULT_STATE_PER_HOST,
         })
     }
 
@@ -166,6 +169,21 @@ impl Nat44IcmpPolicy {
         self.mappings_per_host
     }
 
+    /// Limits the filter peers (remote addresses queried) the live query
+    /// mappings of one internal IPv4 address may hold together (N6, RFC
+    /// 6888 REQ-5; [`Nat44UdpPolicy::with_peers_per_host`] applied to
+    /// queries). `0` is no limit; a nonzero limit needs per-host storage.
+    #[must_use]
+    pub const fn with_peers_per_host(mut self, limit: u16) -> Self {
+        self.peers_per_host = limit;
+        self
+    }
+
+    #[must_use]
+    pub const fn peers_per_host(self) -> u16 {
+        self.peers_per_host
+    }
+
     /// The mapping-engine policy. Hairpinning is off: no inbound query
     /// session can exist, so the engine never sees a hairpin plan.
     const fn engine(self) -> Nat44UdpPolicy {
@@ -177,6 +195,7 @@ impl Nat44IcmpPolicy {
             hairpinning: false,
             port_preservation: self.identifier_preservation,
             mappings_per_host: self.mappings_per_host,
+            peers_per_host: self.peers_per_host,
         }
     }
 
@@ -188,6 +207,7 @@ impl Nat44IcmpPolicy {
             filtering: policy.filtering,
             identifier_preservation: policy.port_preservation,
             mappings_per_host: policy.mappings_per_host,
+            peers_per_host: policy.peers_per_host,
         }
     }
 }
@@ -201,6 +221,7 @@ impl Default for Nat44IcmpPolicy {
             filtering: Nat44Filtering::AddressDependent,
             identifier_preservation: true,
             mappings_per_host: NAT44_DEFAULT_MAPPINGS_PER_HOST,
+            peers_per_host: NAT44_DEFAULT_STATE_PER_HOST,
         }
     }
 }
@@ -379,6 +400,9 @@ pub struct Nat44IcmpCounters {
     pub config_mismatches: u64,
     pub reconciliations: u64,
     pub host_quota_exceeded: u64,
+    /// New query peers (or the new query mappings that would carry them)
+    /// refused at the per-host peer limit (N6).
+    pub host_peer_quota_exceeded: u64,
 }
 
 impl Nat44IcmpCounters {
@@ -399,6 +423,7 @@ impl Nat44IcmpCounters {
             config_mismatches: counters.config_mismatches,
             reconciliations: counters.reconciliations,
             host_quota_exceeded: counters.host_quota_exceeded,
+            host_peer_quota_exceeded: counters.host_peer_quota_exceeded,
         }
     }
 }
@@ -422,6 +447,9 @@ pub enum Nat44IcmpDisposition {
     PeerFull,
     IdentifierExhausted,
     HostQuotaExceeded,
+    /// The internal address already holds the per-host limit of query
+    /// peers on live mappings (N6).
+    HostPeerQuotaExceeded,
     ClockRegression,
     ConfigMismatch,
     Rejected {
@@ -464,6 +492,7 @@ impl Nat44IcmpDisposition {
             Nat44UdpDisposition::PeerFull => Self::PeerFull,
             Nat44UdpDisposition::PortExhausted => Self::IdentifierExhausted,
             Nat44UdpDisposition::HostQuotaExceeded => Self::HostQuotaExceeded,
+            Nat44UdpDisposition::HostPeerQuotaExceeded => Self::HostPeerQuotaExceeded,
             Nat44UdpDisposition::ClockRegression => Self::ClockRegression,
             Nat44UdpDisposition::ConfigMismatch => Self::ConfigMismatch,
             Nat44UdpDisposition::Rejected { reason } => Self::Rejected { reason },

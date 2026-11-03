@@ -190,6 +190,7 @@ pub struct Nat44TcpStoragePlan {
     port_owner_slots: u32,
     unsolicited_syn_hold_slots: u32,
     host_slots: u32,
+    session_host_slots: u32,
 }
 
 impl Nat44TcpStoragePlan {
@@ -214,6 +215,33 @@ impl Nat44TcpStoragePlan {
             port_owner_slots,
             unsolicited_syn_hold_slots: 0,
             host_slots: 0,
+            session_host_slots: 0,
+        }
+    }
+
+    /// This plan with `slots` host slots of the per-host session accounting
+    /// (N6; `0` from [`Self::new`]): `0`, or the session slot count. Each
+    /// comes with a host link and a host directory node, and that directory
+    /// has the session directory's bucket count.
+    #[must_use]
+    pub const fn with_session_host_slots(mut self, slots: u32) -> Self {
+        self.session_host_slots = slots;
+        self
+    }
+
+    #[must_use]
+    pub const fn session_host_slots(self) -> u32 {
+        self.session_host_slots
+    }
+
+    /// Buckets of the session host directory: the session directory's, or
+    /// `0` without session host slots.
+    #[must_use]
+    pub const fn session_host_buckets(self) -> u32 {
+        if self.session_host_slots == 0 {
+            0
+        } else {
+            self.session_buckets
         }
     }
 
@@ -646,7 +674,7 @@ pub enum StorageShapeError {
     UdpPeerDirectory,
     UdpPortOwnerCount,
     /// UDP host slots (N3) are neither `0` nor the mapping slot count, or
-    /// are `0` while the policy sets a per-host mapping limit.
+    /// are `0` while the policy sets a per-host mapping or peer limit.
     UdpHostSlotCount,
     TcpMappingNodeCount,
     TcpSessionNodeCount,
@@ -655,6 +683,9 @@ pub enum StorageShapeError {
     TcpPortOwnerCount,
     /// TCP host slots (N3), as for UDP.
     TcpHostSlotCount,
+    /// TCP session host slots (N6) are neither `0` nor the session slot
+    /// count, or are `0` while the policy sets a per-host session limit.
+    TcpSessionHostSlotCount,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1114,6 +1145,11 @@ fn validate_structural_shapes(shape: FullServiceStorageShape) -> Result<(), Stor
     {
         return Err(StorageShapeError::TcpHostSlotCount);
     }
+    if shape.nat44_tcp.session_host_slots != 0
+        && shape.nat44_tcp.session_host_slots != shape.nat44_tcp.session_slots
+    {
+        return Err(StorageShapeError::TcpSessionHostSlotCount);
+    }
     Ok(())
 }
 
@@ -1130,8 +1166,9 @@ fn validate_port_owner_shapes(
     if shape.nat44_tcp.port_owner_slots != tcp_ports {
         return Err(StorageShapeError::TcpPortOwnerCount);
     }
-    // A per-host mapping limit (N3) needs the per-host storage.
-    if udp.policy().mappings_per_host() != 0
+    // A per-host mapping (N3) or peer (N6) limit needs the per-host
+    // storage, a per-host session limit (N6) the per-session one.
+    if (udp.policy().mappings_per_host() != 0 || udp.policy().peers_per_host() != 0)
         && shape.nat44_udp.host_slots != shape.nat44_udp.mapping_slots
     {
         return Err(StorageShapeError::UdpHostSlotCount);
@@ -1140,6 +1177,11 @@ fn validate_port_owner_shapes(
         && shape.nat44_tcp.host_slots != shape.nat44_tcp.mapping_slots
     {
         return Err(StorageShapeError::TcpHostSlotCount);
+    }
+    if tcp.policy().sessions_per_host() != 0
+        && shape.nat44_tcp.session_host_slots != shape.nat44_tcp.session_slots
+    {
+        return Err(StorageShapeError::TcpSessionHostSlotCount);
     }
     Ok(())
 }
@@ -1166,7 +1208,8 @@ fn validate_icmp_shape(
         return Err(StorageShapeError::IcmpIdentifierOwnerCount);
     }
     if (plan.host_slots != 0 && plan.host_slots != plan.mapping_slots)
-        || (config.policy().mappings_per_host() != 0 && plan.host_slots != plan.mapping_slots)
+        || ((config.policy().mappings_per_host() != 0 || config.policy().peers_per_host() != 0)
+            && plan.host_slots != plan.mapping_slots)
     {
         return Err(StorageShapeError::IcmpHostSlotCount);
     }
