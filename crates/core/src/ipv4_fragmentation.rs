@@ -64,7 +64,7 @@ use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
     ipv4_header_checksum, packet, DropReason, GeneratedAllocationError, GeneratedBatchCompletion,
-    GeneratedPacketBatch, GeneratedPacketIo, IfId,
+    GeneratedPacketBatch, GeneratedPacketIo, HighWaterMark, IfId, TableOccupancy,
 };
 
 /// IPv4 header length of every fragmented datagram (no options).
@@ -281,6 +281,8 @@ pub struct Ipv4FragmentationRuntime<'a> {
     head: usize,
     /// Staged slots are `slots[head..len]`.
     len: usize,
+    /// Largest `len` since construction (OBS-017).
+    len_high_water: HighWaterMark,
     counters: Ipv4FragmentationCounters,
     /// Fragment frames one tick may send (`[tick] generated-fragments`): a
     /// datagram needing more can never be sent, so `plan` refuses it.
@@ -323,6 +325,7 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
             slot_bytes,
             head: 0,
             len: 0,
+            len_high_water: HighWaterMark::default(),
             counters: Ipv4FragmentationCounters::default(),
             tick_frame_budget: usize::MAX,
             _worker_local: PhantomData,
@@ -348,6 +351,17 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
     #[must_use]
     pub const fn slot_capacity(&self) -> usize {
         self.slots.len()
+    }
+
+    /// Slots in use (staged, sent ones included until the queue drains),
+    /// their high-water mark since construction, and the slot count
+    /// (OBS-017). O(1). Nothing staged outlives its tick, so between ticks
+    /// `occupied` is 0 and only the high-water mark shows how full a tick's
+    /// queue got. Neither [`Self::flush`] nor a publication resets the mark:
+    /// a flush happens inside a tick, after the slots it frees were counted.
+    #[must_use]
+    pub const fn occupancy(&self) -> TableOccupancy {
+        self.len_high_water.snapshot(self.len, self.slots.len())
     }
 
     /// Slots a datagram can still be staged in this tick (ARP-HOLD sizes
@@ -493,6 +507,7 @@ impl<'a> Ipv4FragmentationRuntime<'a> {
             frame_len: u32::try_from(plan.frame_len).expect("bounded by the slot bytes"),
         };
         self.len += 1;
+        self.len_high_water.observe(self.len);
         self.counters.queued += 1;
     }
 

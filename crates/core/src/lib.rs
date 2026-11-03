@@ -112,8 +112,8 @@ pub use ipv4_fragment_tracking::{
     ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_ingress_cap,
     ipv4_fragment_tracking_tombstones, Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot,
     Ipv4FragmentHostSlot, Ipv4FragmentTombstoneSlot, Ipv4FragmentTracker,
-    Ipv4FragmentTrackingCounters, Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingPolicyError,
-    Ipv4FragmentTrackingStorage, Ipv4FragmentTrackingStorageError,
+    Ipv4FragmentTrackingCounters, Ipv4FragmentTrackingOccupancy, Ipv4FragmentTrackingPolicy,
+    Ipv4FragmentTrackingPolicyError, Ipv4FragmentTrackingStorage, Ipv4FragmentTrackingStorageError,
     IPV4_FRAGMENT_TRACKING_DEFAULT_INGRESS_SHARE_PERCENT,
     IPV4_FRAGMENT_TRACKING_DEFAULT_TIMEOUT_MS, IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM,
     IPV4_FRAGMENT_TRACKING_MAX_INGRESSES, IPV4_FRAGMENT_TRACKING_MAX_TIMEOUT_MS,
@@ -159,10 +159,10 @@ pub use nat44_syn_hold::{
     NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
 };
 pub use nat44_tcp_state::{Nat44TcpInboundRst, Nat44TcpSessionPhase};
-pub(crate) use observability::OccupancyCounter;
 pub use observability::{
     BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields, TableOccupancy,
 };
+pub(crate) use observability::{HighWaterMark, OccupancyCounter};
 pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
@@ -178,15 +178,15 @@ pub use resolution::{
     ResolutionFailureCounters, ResolutionFailureDispatchError, ResolutionFailureDispatchReport,
     ResolutionFailureHoldPhase, ResolutionFailureHoldSlot, ResolutionFailureTrace,
     ResolutionFailureTraceSink, ResolutionGenerationToken, ResolutionHashKey,
-    ResolutionHashKeyError, ResolutionIndexCounters, ResolutionPhase, ResolutionPolicy,
-    ResolutionPolicyError, ResolutionPublicationError, ResolutionPublicationPermit,
-    ResolutionPublicationReport, ResolutionResult, ResolutionRuntime, ResolutionStateSlot,
-    ResolutionStatus, ResolutionTimerError, ResolutionTimerReport, ResolutionTimerTrace,
-    ResolutionTimerTraceSink, StaticReconcileReport, ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS,
-    ARP_ANNOUNCE_INTERVAL_MS, ARP_ANNOUNCE_MAX_COUNT, ARP_ANNOUNCE_MAX_INTERVAL_MS,
-    ARP_ANNOUNCE_MIN_INTERVAL_MS, ARP_ANNOUNCE_NUM, ARP_ANNOUNCE_RETRY_MAX_MS,
-    ARP_ANNOUNCE_RETRY_MS, ARP_DEFEND_INTERVAL_MS, ARP_REQUEST_FRAME_LEN,
-    RESOLUTION_INDEX_CHAIN_LIMIT,
+    ResolutionHashKeyError, ResolutionIndexCounters, ResolutionOccupancy, ResolutionPhase,
+    ResolutionPolicy, ResolutionPolicyError, ResolutionPublicationError,
+    ResolutionPublicationPermit, ResolutionPublicationReport, ResolutionResult, ResolutionRuntime,
+    ResolutionStateSlot, ResolutionStatus, ResolutionTimerError, ResolutionTimerReport,
+    ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport,
+    ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS, ARP_ANNOUNCE_INTERVAL_MS, ARP_ANNOUNCE_MAX_COUNT,
+    ARP_ANNOUNCE_MAX_INTERVAL_MS, ARP_ANNOUNCE_MIN_INTERVAL_MS, ARP_ANNOUNCE_NUM,
+    ARP_ANNOUNCE_RETRY_MAX_MS, ARP_ANNOUNCE_RETRY_MS, ARP_DEFEND_INTERVAL_MS,
+    ARP_REQUEST_FRAME_LEN, RESOLUTION_INDEX_CHAIN_LIMIT,
 };
 pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError,

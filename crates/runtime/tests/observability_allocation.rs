@@ -247,6 +247,7 @@ fn observability_sink_is_allocation_free_in_steady_state() {
             ));
         }
         observer.record_occupancy(ServiceOccupancy::capture(
+            publication.resolution,
             publication.icmpv4_errors,
             &nat44_udp,
             &nat44_tcp,

@@ -12,8 +12,9 @@ use crate::{
     },
     slot_list::{Linked, SlotLinks, SlotList},
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
-    Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, IfId,
-    Ipv4Address, MacAddress, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN, IPV4_ETHERTYPE,
+    HighWaterMark, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime,
+    IfId, Ipv4Address, MacAddress, TableOccupancy, ARP_ETHERTYPE, ICMPV4_ERROR_MAX_QUOTE_LEN,
+    IPV4_ETHERTYPE,
 };
 
 // RFC 5227 announcements of the router's own addresses and address
@@ -461,6 +462,38 @@ pub struct ResolutionCounters {
     pub timed_out: usize,
     pub failed_hits: usize,
     pub failures_expired: usize,
+}
+
+/// Occupancy of the bounded resolution tables (OBS-017); see
+/// [`ResolutionRuntime::occupancy`].
+///
+/// - `states`: pending resolutions (initial or retry queued, or waiting
+///   for a reply); cooldown states, which a later miss may reuse, are not
+///   counted.
+/// - `actions`: the generated ARP request queue.
+/// - `dynamic_neighbors`: learned neighbors, expired ones included until
+///   their slot is reused or removed.
+/// - `failure_holds`: datagrams held for a Host Unreachable error.
+///
+/// `high_water` is the largest count since construction or the last
+/// publication commit: a commit flushes the first three and the failure
+/// holds, so their marks restart at zero; a carrying commit restarts the
+/// learned neighbors' mark at the carried count.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ResolutionOccupancy {
+    pub states: TableOccupancy,
+    pub actions: TableOccupancy,
+    pub dynamic_neighbors: TableOccupancy,
+    pub failure_holds: TableOccupancy,
+}
+
+/// High-water marks behind [`ResolutionOccupancy`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ResolutionHighWater {
+    states: HighWaterMark,
+    actions: HighWaterMark,
+    dynamic_neighbors: HighWaterMark,
+    failure_holds: HighWaterMark,
 }
 
 /// Fail-closed outcomes of the hashed indexes (H4b).
@@ -1005,6 +1038,7 @@ pub struct ResolutionRuntime<'a> {
     counters: ResolutionCounters,
     failure_counters: ResolutionFailureCounters,
     index_counters: ResolutionIndexCounters,
+    high_water: ResolutionHighWater,
     /// The neighbour miss of the datagram being decided that started or
     /// joined an ARP resolution (ARP-HOLD): set at a forwarding miss,
     /// cleared before each datagram when holding is on.
@@ -1143,6 +1177,7 @@ impl<'a> ResolutionRuntime<'a> {
             counters: ResolutionCounters::default(),
             failure_counters: ResolutionFailureCounters::default(),
             index_counters: ResolutionIndexCounters::default(),
+            high_water: ResolutionHighWater::default(),
             forward_miss: None,
             announce: &mut [],
             announce_busy: 0,
@@ -1199,6 +1234,27 @@ impl<'a> ResolutionRuntime<'a> {
         self.failure_holds.len()
     }
 
+    /// Occupancy and high-water marks of the bounded tables (OBS-017), in
+    /// O(1): every count is maintained at its slot transitions.
+    #[must_use]
+    pub const fn occupancy(&self) -> ResolutionOccupancy {
+        let high_water = self.high_water;
+        ResolutionOccupancy {
+            states: high_water
+                .states
+                .snapshot(self.pending_state_count, self.states.len()),
+            actions: high_water
+                .actions
+                .snapshot(self.action_queue.len(), self.actions.len()),
+            dynamic_neighbors: high_water
+                .dynamic_neighbors
+                .snapshot(self.dynamic_count, self.dynamic_neighbors.len()),
+            failure_holds: high_water
+                .failure_holds
+                .snapshot(self.pending_failure_hold_count, self.failure_holds.len()),
+        }
+    }
+
     /// Fail-closed outcomes of the hashed indexes.
     #[must_use]
     pub const fn index_counters(&self) -> ResolutionIndexCounters {
@@ -1236,6 +1292,7 @@ impl<'a> ResolutionRuntime<'a> {
             && self.counters == ResolutionCounters::default()
             && self.failure_counters == ResolutionFailureCounters::default()
             && self.index_counters == ResolutionIndexCounters::default()
+            && self.high_water == ResolutionHighWater::default()
     }
 
     /// Validates queue/accounting/index invariants and previews one
@@ -1939,6 +1996,9 @@ impl<'a> ResolutionRuntime<'a> {
         set_used::<HoldBits>(self.failure_holds, index, true);
         debug_assert!(self.pending_failure_hold_count < self.failure_holds.len());
         self.pending_failure_hold_count += 1;
+        self.high_water
+            .failure_holds
+            .observe(self.pending_failure_hold_count);
         self.failure_counters.captured += 1;
         ResolutionFailureCapture::Captured(token)
     }
@@ -2288,6 +2348,9 @@ impl<'a> ResolutionRuntime<'a> {
         let linked = link::<DynamicChain>(self.dynamic_neighbors, index, lookup.bucket);
         self.index_result(linked);
         self.dynamic_count += 1;
+        self.high_water
+            .dynamic_neighbors
+            .observe(self.dynamic_count);
         self.touch_dynamic(index);
         self.clear_resolution(interface, sender);
         ControlDisposition::Inserted
@@ -2579,6 +2642,7 @@ impl<'a> ResolutionRuntime<'a> {
         if !was_pending {
             debug_assert!(self.pending_state_count < self.states.len());
             self.pending_state_count += 1;
+            self.high_water.states.observe(self.pending_state_count);
         }
     }
 
@@ -2612,6 +2676,7 @@ impl<'a> ResolutionRuntime<'a> {
         self.actions[action_slot].state = u32::try_from(index).expect("validated capacity");
         set_used::<ActionBits>(self.actions, action_slot, true);
         self.action_queue.push_back(self.actions, action_slot);
+        self.high_water.actions.observe(self.action_queue.len());
         self.states[index].action_slot = u32::try_from(action_slot).expect("validated capacity");
     }
 
@@ -2965,6 +3030,7 @@ impl ResolutionPublicationPermit<'_, '_> {
         runtime.hash_key = hash_key;
         runtime.dynamic_order = SlotList::EMPTY;
         runtime.dynamic_count = 0;
+        runtime.high_water.dynamic_neighbors.reset(0);
         self.preview
     }
 
@@ -3026,6 +3092,10 @@ impl ResolutionPublicationPermit<'_, '_> {
                 dropped += 1;
             }
         }
+        runtime
+            .high_water
+            .dynamic_neighbors
+            .reset(runtime.dynamic_count);
         ResolutionPublicationReport {
             dynamic_neighbors_flushed: dropped,
             dynamic_neighbors_carried: runtime.dynamic_count,
@@ -3068,6 +3138,9 @@ impl ResolutionRuntime<'_> {
         self.request_order = SlotList::EMPTY;
         self.pending_state_count = 0;
         self.pending_failure_hold_count = 0;
+        self.high_water.states.reset(0);
+        self.high_water.actions.reset(0);
+        self.high_water.failure_holds.reset(0);
         self.poll_cursor = 0;
         self.failure_cursor = 0;
         self.publication_epoch = next_runtime_epoch;
@@ -3718,6 +3791,8 @@ mod tests {
     // `resolution/tests/carry.rs`: learned neighbors carried across a
     // publication (RELOAD-CARRY).
     mod carry;
+    // `resolution/tests/occupancy.rs`: table high-water marks (OBS-017).
+    mod occupancy;
 
     const WAN: IfId = IfId(2);
     const SOURCE_IP: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 1]);

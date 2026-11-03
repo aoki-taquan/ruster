@@ -714,6 +714,15 @@ fn a_backend_fault_after_the_check_is_counted_incomplete() {
     assert_eq!(counters.fragmented, 0);
 }
 
+fn occupancy(runtime: &Ipv4FragmentationRuntime<'_>) -> (usize, usize, usize) {
+    let occupancy = runtime.occupancy();
+    (
+        occupancy.occupied(),
+        occupancy.high_water(),
+        occupancy.capacity(),
+    )
+}
+
 #[test]
 fn datagrams_leave_in_order_and_the_table_is_reused() {
     let first = datagram(700, 0);
@@ -724,11 +733,16 @@ fn datagrams_leave_in_order_and_the_table_is_reused() {
     runtime.stage(&first, plan, IfId(1));
     let plan = runtime.plan(&second, 576).unwrap();
     runtime.stage(&second, plan, IfId(3));
+    assert_eq!(occupancy(&runtime), (2, 2, 2));
     let mut sink = io();
     execute_one_ipv4_fragmentation(&mut sink, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(runtime.pending(), 1);
+    // A sent slot stays in use until the queue drains.
+    assert_eq!(occupancy(&runtime), (2, 2, 2));
     execute_one_ipv4_fragmentation(&mut sink, &mut runtime, &mut { usize::MAX }).unwrap();
     assert_eq!(runtime.pending(), 0);
+    // OBS-017: drained, the mark keeps the tick's peak.
+    assert_eq!(occupancy(&runtime), (0, 2, 2));
     assert_eq!(
         sink.sent,
         [
@@ -747,6 +761,7 @@ fn datagrams_leave_in_order_and_the_table_is_reused() {
     assert_eq!(runtime.flush(), 2);
     assert_eq!(runtime.pending(), 0);
     assert_eq!(runtime.flush(), 0);
+    assert_eq!(occupancy(&runtime), (0, 2, 2), "a flush keeps the mark");
     assert_eq!(runtime.counters().flushed, 2);
     assert_eq!(runtime.counters().queued, 4);
     assert!(execute_one_ipv4_fragmentation(&mut sink, &mut runtime, &mut { usize::MAX }).is_none());

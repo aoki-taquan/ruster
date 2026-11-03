@@ -510,6 +510,59 @@ fn releasing_any_slot_keeps_both_lists() {
     }
 }
 
+fn occupancy(runtime: &ArpHoldRuntime<'_>) -> (usize, usize, usize) {
+    let occupancy = runtime.occupancy();
+    assert_eq!(occupancy.occupied(), runtime.live());
+    (
+        occupancy.occupied(),
+        occupancy.high_water(),
+        occupancy.capacity(),
+    )
+}
+
+/// OBS-017: the held-datagram high-water mark follows each hold, stays
+/// through a replacement at the per-neighbor limit, and keeps the peak
+/// after a slot is freed.
+#[test]
+fn held_high_water_follows_holds_and_survives_releases() {
+    let mut table = Table::new(3);
+    let mut runtime = table.runtime(2, 16);
+    assert_eq!(occupancy(&runtime), (0, 0, 3));
+    for tag in 1..=2 {
+        runtime
+            .hold(
+                &frame([192, 168, 1, 10], 60, tag),
+                LAN,
+                miss(GW, 1),
+                |_, _, _, _| {},
+            )
+            .unwrap();
+    }
+    assert_eq!(occupancy(&runtime), (2, 2, 3));
+    // The per-neighbor limit replaces the oldest: the count is unchanged.
+    runtime
+        .hold(
+            &frame([192, 168, 1, 10], 60, 3),
+            LAN,
+            miss(GW, 1),
+            |_, _, _, _| {},
+        )
+        .unwrap();
+    assert_eq!(occupancy(&runtime), (2, 2, 3));
+    runtime
+        .hold(
+            &frame([192, 168, 1, 11], 60, 4),
+            LAN,
+            miss(OTHER, 1),
+            |_, _, _, _| {},
+        )
+        .unwrap();
+    assert_eq!(occupancy(&runtime), (3, 3, 3));
+    let oldest = runtime.oldest as usize;
+    runtime.release(oldest);
+    assert_eq!(occupancy(&runtime), (2, 3, 3));
+}
+
 #[test]
 fn flush_frees_everything_and_counts_it() {
     let mut table = Table::new(3);
@@ -524,7 +577,9 @@ fn flush_frees_everything_and_counts_it() {
             )
             .unwrap();
     }
+    assert_eq!(occupancy(&runtime), (2, 2, 3));
     assert_eq!(runtime.flush(), 2);
+    assert_eq!(occupancy(&runtime), (0, 0, 3), "a flush restarts the mark");
     assert_eq!(runtime.live(), 0);
     assert!(tags(&runtime).is_empty());
     assert_eq!(runtime.counters().flushed, 2);

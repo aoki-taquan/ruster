@@ -342,40 +342,73 @@ fn with_service_runtimes(
 
 #[test]
 fn service_occupancy_capture_copies_every_runtime_accessor() {
-    with_service_runtimes(|_, icmpv4_errors, nat44_udp, nat44_tcp, firewall| {
-        let occupancy = ServiceOccupancy::capture(icmpv4_errors, nat44_udp, nat44_tcp, firewall);
-        let udp = nat44_udp.occupancy();
-        let tcp = nat44_tcp.occupancy();
-        assert_eq!(
-            occupancy,
-            ServiceOccupancy {
-                nat44_udp_mappings: udp.mappings,
-                nat44_udp_peers: udp.peers,
-                nat44_tcp_mappings: tcp.mappings,
-                nat44_tcp_sessions: tcp.sessions,
-                nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
-                nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
-                nat44_icmp_mappings: Default::default(),
-                nat44_icmp_peers: Default::default(),
-                firewall_states: firewall.occupancy(),
-                icmpv4_error_states: icmpv4_errors.state_occupancy(),
-            }
-        );
-        // Capacities come from each runtime's own storage shape.
-        assert_eq!(occupancy.icmpv4_error_states.capacity(), 1);
-        assert_eq!(
-            occupancy.firewall_states.capacity(),
-            firewall.usable_capacity()
-        );
-        assert_eq!(occupancy.firewall_states.capacity(), 3);
-        assert_eq!(occupancy.nat44_udp_mappings.capacity(), 0);
-        let mut observer = TickObserver::default();
-        observer.record_occupancy(occupancy);
-        let observed = observer.snapshot(MonotonicMillis(0)).occupancy;
-        assert_eq!(observed.samples, 1);
-        assert_eq!(observed.firewall_states.capacity, 3);
-        assert_eq!(observed.icmpv4_error_states.capacity, 1);
-    });
+    with_service_runtimes(
+        |resolution, icmpv4_errors, nat44_udp, nat44_tcp, firewall| {
+            let occupancy = ServiceOccupancy::capture(
+                resolution,
+                icmpv4_errors,
+                nat44_udp,
+                nat44_tcp,
+                firewall,
+            );
+            let udp = nat44_udp.occupancy();
+            let tcp = nat44_tcp.occupancy();
+            let resolved = resolution.occupancy();
+            assert_eq!(
+                occupancy,
+                ServiceOccupancy {
+                    nat44_udp_mappings: udp.mappings,
+                    nat44_udp_peers: udp.peers,
+                    nat44_tcp_mappings: tcp.mappings,
+                    nat44_tcp_sessions: tcp.sessions,
+                    nat44_tcp_external_inbound_sessions: tcp.external_inbound_sessions,
+                    nat44_tcp_unsolicited_syn_holds: tcp.unsolicited_syn_holds,
+                    nat44_icmp_mappings: Default::default(),
+                    nat44_icmp_peers: Default::default(),
+                    firewall_states: firewall.occupancy(),
+                    icmpv4_error_states: icmpv4_errors.state_occupancy(),
+                    resolution_states: resolved.states,
+                    resolution_actions: resolved.actions,
+                    resolution_dynamic_neighbors: resolved.dynamic_neighbors,
+                    resolution_failure_holds: resolved.failure_holds,
+                    icmpv4_error_actions: icmpv4_errors.action_occupancy(),
+                    arp_hold_packets: Default::default(),
+                    fragment_tracking_entries: Default::default(),
+                    fragment_tracking_held: Default::default(),
+                    fragmentation_slots: Default::default(),
+                }
+            );
+            // OBS-017: the resolution and ICMPv4 action tables' capacities.
+            assert_eq!(occupancy.resolution_states.capacity(), 1);
+            assert_eq!(occupancy.resolution_actions.capacity(), 1);
+            assert_eq!(occupancy.resolution_dynamic_neighbors.capacity(), 0);
+            assert_eq!(occupancy.icmpv4_error_actions.capacity(), 1);
+            // Optional tables stay empty without their runtime.
+            assert_eq!(
+                occupancy
+                    .with_arp_hold(None)
+                    .with_fragment_tracking(None)
+                    .with_fragmentation(None),
+                occupancy
+            );
+            // Capacities come from each runtime's own storage shape.
+            assert_eq!(occupancy.icmpv4_error_states.capacity(), 1);
+            assert_eq!(
+                occupancy.firewall_states.capacity(),
+                firewall.usable_capacity()
+            );
+            assert_eq!(occupancy.firewall_states.capacity(), 3);
+            assert_eq!(occupancy.nat44_udp_mappings.capacity(), 0);
+            let mut observer = TickObserver::default();
+            observer.record_occupancy(occupancy);
+            let observed = observer.snapshot(MonotonicMillis(0)).occupancy;
+            assert_eq!(observed.samples, 1);
+            assert_eq!(observed.firewall_states.capacity, 3);
+            assert_eq!(observed.icmpv4_error_states.capacity, 1);
+            assert_eq!(observed.resolution_actions.capacity, 1);
+            assert_eq!(observed.icmpv4_error_actions.capacity, 1);
+        },
+    );
 }
 
 #[test]
