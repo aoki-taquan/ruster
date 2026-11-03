@@ -2,7 +2,7 @@ use super::*;
 use crate::{GeneratedArpFailure, GeneratedFragmentsStop, GeneratedPhaseReport};
 use ruster_core::{
     BatchCompletion, BatchReport, ResolutionFailureDispatchReport, ResolutionTimerError,
-    ResolutionTimerReport,
+    ResolutionTimerReport, StateCarryConflict,
 };
 
 #[derive(Default)]
@@ -393,26 +393,71 @@ fn generation_and_apply_outcome_are_reflected_once() {
     );
     assert_eq!(snapshot.last_apply, None);
 
+    let resolution = ResolutionPublicationReport {
+        states_flushed: 1,
+        actions_flushed: 2,
+        dynamic_neighbors_flushed: 3,
+        failure_holds_flushed: 4,
+        dynamic_neighbors_carried: 12,
+        outcome: StateCarryOutcome::Carried,
+    };
+    let udp = Nat44UdpReconcileReport {
+        mappings_flushed: 7,
+        peers_flushed: 8,
+        mappings_carried: 13,
+        peers_carried: 14,
+        outcome: StateCarryOutcome::FlushIncompatible(StateCarryConflict::PortRange),
+    };
+    let tcp = Nat44TcpReconcileReport {
+        mappings_flushed: 9,
+        sessions_flushed: 10,
+        mappings_carried: 15,
+        sessions_carried: 16,
+        outcome: StateCarryOutcome::Carried,
+    };
+    let firewall = FirewallReconcileReport {
+        states_flushed: 11,
+        states_carried: 17,
+        states_revoked: 18,
+        outcome: StateCarryOutcome::Carried,
+    };
     let flush = ApplyFlushCounts::from_reports(
-        ResolutionPublicationReport {
-            states_flushed: 1,
-            actions_flushed: 2,
-            dynamic_neighbors_flushed: 3,
-            failure_holds_flushed: 4,
-        },
+        resolution,
         Icmpv4ErrorPublicationReport {
             states_flushed: 5,
             actions_flushed: 6,
         },
-        Nat44UdpReconcileReport {
-            mappings_flushed: 7,
-            peers_flushed: 8,
-        },
-        Nat44TcpReconcileReport {
-            mappings_flushed: 9,
-            sessions_flushed: 10,
-        },
-        FirewallReconcileReport { states_flushed: 11 },
+        udp,
+        tcp,
+        firewall,
+    );
+    let carry = ApplyCarryCounts::from_reports(resolution, udp, tcp, firewall).with_nat44_icmp(
+        Some(Nat44UdpReconcileReport {
+            mappings_carried: 19,
+            peers_carried: 20,
+            ..udp
+        }),
+    );
+    assert_eq!(
+        carry,
+        ApplyCarryCounts {
+            dynamic_neighbors: 12,
+            nat44_udp_mappings: 13,
+            nat44_udp_peers: 14,
+            nat44_tcp_mappings: 15,
+            nat44_tcp_sessions: 16,
+            nat44_icmp_mappings: 19,
+            nat44_icmp_peers: 20,
+            firewall_flows: 17,
+            firewall_flows_revoked: 18,
+            outcomes: ApplyCarryOutcomes {
+                resolution: StateCarryOutcome::Carried,
+                nat44_udp: udp.outcome,
+                nat44_tcp: StateCarryOutcome::Carried,
+                nat44_icmp: Some(udp.outcome),
+                firewall: StateCarryOutcome::Carried,
+            },
+        }
     );
     assert_eq!(
         flush,
@@ -433,7 +478,7 @@ fn generation_and_apply_outcome_are_reflected_once() {
         }
     );
     assert!(
-        !observer.record_apply_flush(one, flush),
+        !observer.record_apply_flush(one, flush, carry),
         "no apply observed yet"
     );
 
@@ -442,9 +487,15 @@ fn generation_and_apply_outcome_are_reflected_once() {
         ..healthy()
     };
     observer.observe_tick(MonotonicMillis(2), Some(two), &applied);
-    assert!(!observer.record_apply_flush(one, flush), "wrong generation");
-    assert!(observer.record_apply_flush(two, flush));
-    assert!(!observer.record_apply_flush(two, flush), "no double count");
+    assert!(
+        !observer.record_apply_flush(one, flush, carry),
+        "wrong generation"
+    );
+    assert!(observer.record_apply_flush(two, flush, carry));
+    assert!(
+        !observer.record_apply_flush(two, flush, carry),
+        "no double count"
+    );
     let snapshot = observer.snapshot(MonotonicMillis(2));
     assert_eq!(
         (snapshot.generation, snapshot.generation_changes),
@@ -457,9 +508,18 @@ fn generation_and_apply_outcome_are_reflected_once() {
             at: MonotonicMillis(2),
             active_generation: Some(two),
             flush: Some(flush),
+            carry: Some(carry),
         })
     );
     assert_eq!(snapshot.flushed, flush);
+    assert_eq!(
+        snapshot.carried,
+        ApplyCarryCounts {
+            outcomes: ApplyCarryOutcomes::default(),
+            ..carry
+        },
+        "cumulative carry counts, without outcomes"
+    );
     assert_eq!(snapshot.totals.publications_applied, 1);
     assert_eq!(snapshot.totals.apply_flushes_recorded, 1);
 
@@ -469,7 +529,7 @@ fn generation_and_apply_outcome_are_reflected_once() {
     };
     observer.observe_tick(MonotonicMillis(3), Some(two), &rejected);
     assert!(
-        !observer.record_apply_flush(two, flush),
+        !observer.record_apply_flush(two, flush, carry),
         "rejected apply flushes nothing"
     );
     let snapshot = observer.snapshot(MonotonicMillis(3));
@@ -508,8 +568,12 @@ fn missed_apply_flush_is_exposed_by_recorded_counter() {
         firewall_flows: 1,
         ..ApplyFlushCounts::default()
     };
-    assert!(!observer.record_apply_flush(three, flush), "too late");
-    assert!(observer.record_apply_flush(four, flush));
+    let carry = ApplyCarryCounts::default();
+    assert!(
+        !observer.record_apply_flush(three, flush, carry),
+        "too late"
+    );
+    assert!(observer.record_apply_flush(four, flush, carry));
     let totals = observer.snapshot(MonotonicMillis(2)).totals;
     assert_eq!(
         (totals.publications_applied, totals.apply_flushes_recorded),
@@ -557,7 +621,14 @@ fn snapshot_rendering_is_stable_and_ordered() {
         .iter()
         .position(|line| *line == "occupancy.samples=0")
         .unwrap();
-    assert_eq!(lines[occupancy - 1], "flushed.firewall_flows=0");
+    assert_eq!(lines[occupancy - 1], "carried.firewall_flows_revoked=0");
+    let carried = lines
+        .iter()
+        .position(|line| *line == "carried.dynamic_neighbors=0")
+        .unwrap();
+    assert_eq!(lines[carried - 1], "flushed.firewall_flows=0");
+    assert!(lines.contains(&"apply.state.firewall=flushed"));
+    assert!(lines.contains(&"apply.state.nat44_icmp=none"));
     assert_eq!(lines.len() - occupancy, OCCUPANCY_FIELDS);
     assert_eq!(lines.last(), Some(&"occupancy.icmpv4_error_states.peak=0"));
     let keys = |text: &str| -> Vec<String> {
@@ -580,7 +651,11 @@ fn snapshot_rendering_is_stable_and_ordered() {
         ..healthy()
     };
     observer.observe_tick(MonotonicMillis(6), Some(two), &applied);
-    assert!(observer.record_apply_flush(two, ApplyFlushCounts::default()));
+    assert!(observer.record_apply_flush(
+        two,
+        ApplyFlushCounts::default(),
+        ApplyCarryCounts::default()
+    ));
     let busy = FieldsDisplay(&observer.snapshot(MonotonicMillis(6))).to_string();
     assert!(busy.contains("apply.flush_recorded=true\n"));
     assert_eq!(keys(&idle), keys(&busy));

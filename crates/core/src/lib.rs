@@ -18,6 +18,7 @@ mod nat44_syn_hold;
 mod nat44_tcp_state;
 mod observability;
 mod packet;
+mod reload_state;
 mod resolution;
 #[cfg(test)]
 mod resolution_reference;
@@ -38,7 +39,8 @@ pub use firewall::{
     FirewallPortRangeError, FirewallProtocol, FirewallReconcileError, FirewallReconcilePermit,
     FirewallReconcileReport, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRule,
     FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
-    ValidatedFirewallOwner, FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
+    ValidatedFirewallOwner, FIREWALL_CARRY_REEVALUATION_BUDGET, FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT,
+    FIREWALL_MAX_IDLE_TTL_MS, FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS, FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
     FIREWALL_TCP_OPENING_MIN_IDLE_TTL_MS, FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
     FIREWALL_UDP_MIN_IDLE_TTL_MS,
@@ -110,22 +112,23 @@ pub use ipv4_fragmentation::{
     IPV4_FRAGMENTATION_MIN_MAX_FRAGMENTS,
 };
 pub use nat44::{
-    Nat44Filtering, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpCounters, Nat44IcmpDisposition,
-    Nat44IcmpHashKey, Nat44IcmpHashKeyError, Nat44IcmpIndexStorage, Nat44IcmpMappingSlot,
-    Nat44IcmpOccupancy, Nat44IcmpPeerSlot, Nat44IcmpPolicy, Nat44IcmpPolicyError,
-    Nat44IcmpReconcileError, Nat44IcmpReconcilePermit, Nat44IcmpReconcileReport, Nat44IcmpRuntime,
-    Nat44IcmpRuntimeConfigError, Nat44IcmpStorageShape, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpConfigError, Nat44TcpCounters, Nat44TcpDisposition, Nat44TcpHashKey,
-    Nat44TcpHashKeyError, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpOccupancy,
-    Nat44TcpPolicy, Nat44TcpPolicyError, Nat44TcpReconcileError, Nat44TcpReconcilePermit,
-    Nat44TcpReconcileReport, Nat44TcpRuntime, Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot,
-    Nat44TcpStorageShape, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpCounters,
-    Nat44UdpDisposition, Nat44UdpHashKey, Nat44UdpHashKeyError, Nat44UdpIndexStorage,
-    Nat44UdpMappingSlot, Nat44UdpOccupancy, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError,
-    Nat44UdpReconcileError, Nat44UdpReconcilePermit, Nat44UdpReconcileReport, Nat44UdpRuntime,
-    Nat44UdpRuntimeConfigError, Nat44UdpStorageShape, NAT44_DEFAULT_MAPPINGS_PER_HOST,
-    NAT44_DEFAULT_STATE_PER_HOST, NAT44_ICMP_DEFAULT_IDLE_TTL_MS, NAT44_ICMP_MAX_IDLE_TTL_MS,
-    NAT44_ICMP_MIN_IDLE_TTL_MS, NAT44_PORT_TAKEOVER_PROBES, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
+    Nat44CarryIdentity, Nat44Filtering, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpCounters,
+    Nat44IcmpDisposition, Nat44IcmpHashKey, Nat44IcmpHashKeyError, Nat44IcmpIndexStorage,
+    Nat44IcmpMappingSlot, Nat44IcmpOccupancy, Nat44IcmpPeerSlot, Nat44IcmpPolicy,
+    Nat44IcmpPolicyError, Nat44IcmpReconcileError, Nat44IcmpReconcilePermit,
+    Nat44IcmpReconcileReport, Nat44IcmpRuntime, Nat44IcmpRuntimeConfigError, Nat44IcmpStorageShape,
+    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpCounters,
+    Nat44TcpDisposition, Nat44TcpHashKey, Nat44TcpHashKeyError, Nat44TcpIndexStorage,
+    Nat44TcpMappingSlot, Nat44TcpOccupancy, Nat44TcpPolicy, Nat44TcpPolicyError,
+    Nat44TcpReconcileError, Nat44TcpReconcilePermit, Nat44TcpReconcileReport, Nat44TcpRuntime,
+    Nat44TcpRuntimeConfigError, Nat44TcpSessionSlot, Nat44TcpStorageShape, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpCounters, Nat44UdpDisposition, Nat44UdpHashKey,
+    Nat44UdpHashKeyError, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpOccupancy,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpPolicyError, Nat44UdpReconcileError,
+    Nat44UdpReconcilePermit, Nat44UdpReconcileReport, Nat44UdpRuntime, Nat44UdpRuntimeConfigError,
+    Nat44UdpStorageShape, NAT44_DEFAULT_MAPPINGS_PER_HOST, NAT44_DEFAULT_STATE_PER_HOST,
+    NAT44_ICMP_DEFAULT_IDLE_TTL_MS, NAT44_ICMP_MAX_IDLE_TTL_MS, NAT44_ICMP_MIN_IDLE_TTL_MS,
+    NAT44_PORT_TAKEOVER_PROBES, NAT44_TCP_DEFAULT_IDLE_TTL_MS,
     NAT44_TCP_DEFAULT_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_DEFAULT_TRANSITORY_IDLE_TTL_MS,
     NAT44_TCP_INBOUND_SLOT_PROBES, NAT44_TCP_MAX_IDLE_TTL_MS,
     NAT44_TCP_MAX_INBOUND_SESSIONS_PER_REMOTE, NAT44_TCP_MIN_IDLE_TTL_MS,
@@ -149,6 +152,7 @@ pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
 };
+pub use reload_state::{StateCarryConflict, StateCarryOutcome};
 pub use resolution::{
     dispatch_host_unreachable_failures, execute_one_arp_request, poll_resolution_timers,
     ArpRequestAction, ArpRequestBuildError, ControlDisposition, DynamicNeighborSlot,

@@ -20,10 +20,11 @@ use std::{marker::PhantomData, num::NonZeroU64};
 mod observability;
 
 pub use observability::{
-    ApplyFlushCounts, ApplyOutcomeKind, ConsumeReasonCounters, DropReasonCounters, FieldsDisplay,
-    GeneratedTotals, Health, HealthPolicy, HealthState, LastApply, ObservabilitySnapshot,
-    ObservedTable, OccupancyTotals, PhaseSkipCounters, RxTotals, ServiceCounters, ServiceOccupancy,
-    TickObserver, TickTotals, DROP_REASON_CODE_LIMIT, TICK_PHASE_SKIPS,
+    ApplyCarryCounts, ApplyCarryOutcomes, ApplyFlushCounts, ApplyOutcomeKind,
+    ConsumeReasonCounters, DropReasonCounters, FieldsDisplay, GeneratedTotals, Health,
+    HealthPolicy, HealthState, LastApply, ObservabilitySnapshot, ObservedTable, OccupancyTotals,
+    PhaseSkipCounters, RxTotals, ServiceCounters, ServiceOccupancy, TickObserver, TickTotals,
+    DROP_REASON_CODE_LIMIT, TICK_PHASE_SKIPS,
 };
 /// Backend-facing observability vocabulary, defined in `ruster-core` so packet
 /// backends depend only on core.

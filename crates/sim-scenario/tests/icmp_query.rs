@@ -31,6 +31,16 @@ fn n5_scenario_translates_answers_filters_and_reloads() {
         applied.contains("\"nat44_icmp_mappings\":1,\"nat44_icmp_peers\":1,"),
         "{applied}"
     );
+    // The filtering change keys filter peers differently, so ICMP query
+    // state cannot carry (RELOAD-CARRY); the rest of the router carries.
+    assert!(
+        applied.contains(
+            "\"carry\":{\"resolution\":\"carried\",\"nat44_udp\":\"carried\",\
+             \"nat44_tcp\":\"carried\",\"nat44_icmp\":\"flushed:filtering\",\
+             \"firewall\":\"carried\","
+        ),
+        "{applied}"
+    );
     let rejected = output
         .lines()
         .find(|line| line.contains("\"outcome\":\"rejected\""))
@@ -40,8 +50,10 @@ fn n5_scenario_translates_answers_filters_and_reloads() {
         "{rejected}"
     );
     let last = output.lines().last().expect("final event");
+    // The carried ARP neighbor lets the first post-reload query through
+    // (RELOAD-CARRY), so three queries are translated.
     for (key, value) in [
-        ("nat44_icmp.outbound_translated", 2),
+        ("nat44_icmp.outbound_translated", 3),
         ("nat44_icmp.inbound_translated", 1),
         ("nat44_icmp.mappings_created", 2),
         ("nat44_icmp.mapping_misses", 1),

@@ -44,12 +44,13 @@ use ruster_control::{
 };
 use ruster_core::{
     BackendStats, ConsumeReason, DropReason, IfId, MonotonicMillis, PublicationQuiescence,
+    StateCarryOutcome,
 };
 use ruster_io_sim::{FrameOrigin, SimIo, SimPublicationQuiescenceError};
 use ruster_runtime::{
-    run_tick, ApplyFlushCounts, HealthPolicy, ObservabilitySnapshot, PhaseReport,
-    PublicationOutcome, RxPhaseReport, ServiceCounters, ServiceOccupancy, TickBudgets,
-    TickObserver,
+    run_tick, ApplyCarryCounts, ApplyCarryOutcomes, ApplyFlushCounts, HealthPolicy,
+    ObservabilitySnapshot, PhaseReport, PublicationOutcome, RxPhaseReport, ServiceCounters,
+    ServiceOccupancy, TickBudgets, TickObserver,
 };
 
 use crate::output::{hex_string, Line};
@@ -462,7 +463,7 @@ pub struct SimRun<'s> {
 
 enum TickPublication {
     Unchanged,
-    Applied(ApplyFlushCounts),
+    Applied(ApplyFlushCounts, ApplyCarryCounts),
     Rejected(ApplyError),
     Deferred,
 }
@@ -659,8 +660,15 @@ impl SimRun<'_> {
                     r.firewall,
                 )
                 .with_nat44_icmp(r.nat44_icmp);
-                self.observer.record_apply_flush(generation, flush);
-                TickPublication::Applied(flush)
+                let carry = ApplyCarryCounts::from_reports(
+                    r.resolution,
+                    r.nat44_udp,
+                    r.nat44_tcp,
+                    r.firewall,
+                )
+                .with_nat44_icmp(r.nat44_icmp);
+                self.observer.record_apply_flush(generation, flush, carry);
+                TickPublication::Applied(flush, carry)
             }
             PublicationOutcome::Rejected(error) => TickPublication::Rejected(error),
             PublicationOutcome::Deferred { .. } => TickPublication::Deferred,
@@ -694,7 +702,7 @@ impl SimRun<'_> {
             "publication",
             match publication {
                 TickPublication::Unchanged => "unchanged",
-                TickPublication::Applied(_) => "applied",
+                TickPublication::Applied(..) => "applied",
                 TickPublication::Rejected(_) => "rejected",
                 TickPublication::Deferred => "deferred",
             },
@@ -772,8 +780,8 @@ impl SimRun<'_> {
                     candidate_generation = Some(candidate.generation());
                     let publication = self.tick(Some(step), Some(candidate), out)?;
                     let (class, code) = classify_publication(step, &publication)?;
-                    if let TickPublication::Applied(counts) = publication {
-                        flush = Some(counts);
+                    if let TickPublication::Applied(counts, carry) = publication {
+                        flush = Some((counts, carry));
                         self.budgets = budgets(&config);
                         self.config = config;
                     }
@@ -810,8 +818,14 @@ impl SimRun<'_> {
         );
         line.u64("generation", self.generation().get());
         match flush {
-            Some(flush) => write_flush(&mut line, flush),
-            None => line.null("flush"),
+            Some((flush, carry)) => {
+                write_flush(&mut line, flush);
+                write_carry(&mut line, carry);
+            }
+            None => {
+                line.null("flush");
+                line.null("carry");
+            }
         }
         emit(out, line)?;
 
@@ -1058,6 +1072,50 @@ fn write_flush(line: &mut Line, flush: ApplyFlushCounts) {
     line.close();
 }
 
+/// Writes committed apply carry counts and per-runtime outcomes as an
+/// object named `carry` (RELOAD-CARRY). Exhaustive like [`write_flush`].
+fn write_carry(line: &mut Line, carry: ApplyCarryCounts) {
+    let ApplyCarryCounts {
+        dynamic_neighbors,
+        nat44_udp_mappings,
+        nat44_udp_peers,
+        nat44_tcp_mappings,
+        nat44_tcp_sessions,
+        nat44_icmp_mappings,
+        nat44_icmp_peers,
+        firewall_flows,
+        firewall_flows_revoked,
+        outcomes:
+            ApplyCarryOutcomes {
+                resolution,
+                nat44_udp,
+                nat44_tcp,
+                nat44_icmp,
+                firewall,
+            },
+    } = carry;
+    line.open("carry");
+    line.str("resolution", resolution.label());
+    line.str("nat44_udp", nat44_udp.label());
+    line.str("nat44_tcp", nat44_tcp.label());
+    line.opt_str("nat44_icmp", nat44_icmp.map(StateCarryOutcome::label));
+    line.str("firewall", firewall.label());
+    for (key, value) in [
+        ("dynamic_neighbors", dynamic_neighbors),
+        ("nat44_udp_mappings", nat44_udp_mappings),
+        ("nat44_udp_peers", nat44_udp_peers),
+        ("nat44_tcp_mappings", nat44_tcp_mappings),
+        ("nat44_tcp_sessions", nat44_tcp_sessions),
+        ("nat44_icmp_mappings", nat44_icmp_mappings),
+        ("nat44_icmp_peers", nat44_icmp_peers),
+        ("firewall_flows", firewall_flows),
+        ("firewall_flows_revoked", firewall_flows_revoked),
+    ] {
+        line.u64(key, value);
+    }
+    line.close();
+}
+
 /// Classifies the publication outcome of an apply tick. Restart-required
 /// codes come from control's exhaustive
 /// [`ruster_control::RestartRequired::code`]; every
@@ -1068,7 +1126,7 @@ fn classify_publication(
     publication: &TickPublication,
 ) -> Result<(ApplyClass, Option<&'static str>), DriverError> {
     match publication {
-        TickPublication::Applied(_) => Ok((ApplyClass::Applied, None)),
+        TickPublication::Applied(..) => Ok((ApplyClass::Applied, None)),
         TickPublication::Rejected(ApplyError::RestartRequired(reason)) => {
             Ok((ApplyClass::RestartRequired, Some(reason.code())))
         }

@@ -176,7 +176,7 @@ fn validate_never_prints_allocator_seeds() {
     assert!(!text(&plan.stdout).contains(secret_tcp));
 }
 
-const FLUSH_ALL: &str = "expected-flush:
+const EXPECT_ALL: &str = "expected-flush:
   resolution_states all
   resolution_actions all
   dynamic_neighbors all
@@ -192,39 +192,85 @@ const FLUSH_ALL: &str = "expected-flush:
   firewall_flows all
 ";
 
+const FLUSHED: &str = "  arp flushed
+  nat44-udp flushed
+  nat44-tcp flushed
+  firewall flushed
+";
+
+/// A restart-required plan: a restart flushes everything.
+fn restart_all() -> String {
+    format!("{EXPECT_ALL}state: restart\n{FLUSHED}")
+}
+
+/// A reloadable plan to a `[reload] state = "flush"` document.
+fn flush_all() -> String {
+    format!("{EXPECT_ALL}state: flush\n{FLUSHED}")
+}
+
+/// A reloadable plan that carries every family (RELOAD-CARRY, the default)
+/// with unchanged rules: only learned neighbors the successor invalidates
+/// drop, and pending resolution and ICMPv4 error work flushes.
+const CARRY_ALL: &str = "expected-flush:
+  resolution_states all
+  resolution_actions all
+  dynamic_neighbors invalidated
+  failure_holds all
+  icmpv4_error_states all
+  icmpv4_error_actions all
+  nat44_udp_mappings 0
+  nat44_udp_peers 0
+  nat44_tcp_mappings 0
+  nat44_tcp_sessions 0
+  nat44_icmp_mappings all
+  nat44_icmp_peers all
+  firewall_flows 0
+state: carry
+  arp carried
+  nat44-udp carried
+  nat44-tcp carried
+  firewall carried
+";
+
 #[test]
 fn plan_output_is_deterministic_and_reports_restart_reasons() {
     let cases = [
         (
             "router-v2.toml",
-            "plan: reloadable\nrestart-required: none\nchanges: 2\n  \
+            "plan: reloadable\nrestart-required: none\nchanges: 3\n  \
              route + 192.0.2.0/24 dev if2 via 203.0.113.1\n  \
              firewall-rule + id 40 udp if1 -> any 192.168.1.0/24 -> 0.0.0.0/0 \
-             sport 1-65535 dport 1-65535 allow-stateful\n",
+             sport 1-65535 dport 1-65535 allow-stateful\n  \
+             reload-state ~ carry -> flush\n",
+            flush_all(),
         ),
         (
             "router-capacity.toml",
             "plan: restart-required\nrestart-required: STORAGE_SHAPE\nchanges: 0\n",
+            restart_all(),
         ),
         (
             "router-interface.toml",
             "plan: restart-required\nrestart-required: INTERFACES\nchanges: 1\n  \
              interface ~ if2 mac 02:00:00:00:00:02 mtu 1500 -> if2 mac 02:00:00:00:00:22 mtu 1500\n",
+            restart_all(),
         ),
         (
             "router-relabel.toml",
             "plan: reloadable\nrestart-required: none\nchanges: 1\n  \
              interface-label ~ if2 name wan device sim1 -> name uplink device sim1\n",
+            CARRY_ALL.to_owned(),
         ),
         (
             "router-v1.toml",
             "plan: reloadable\nrestart-required: none\nchanges: 0\n",
+            CARRY_ALL.to_owned(),
         ),
     ];
-    for (next, head) in cases {
+    for (next, head, state) in cases {
         let first = run(&["plan", &fixture("router-v1.toml"), &fixture(next)]);
         assert_eq!(status(&first), 0, "{next}");
-        assert_eq!(text(&first.stdout), format!("{head}{FLUSH_ALL}"), "{next}");
+        assert_eq!(text(&first.stdout), format!("{head}{state}"), "{next}");
         assert!(first.stderr.is_empty(), "{next}");
         let second = run(&["plan", &fixture("router-v1.toml"), &fixture(next)]);
         assert_eq!(first.stdout, second.stdout, "{next}");
@@ -584,7 +630,7 @@ fn plan_classifies_icmpv4_switches_like_their_policy_tables() {
         text(&echo.stdout),
         format!(
             "plan: reloadable\nrestart-required: none\nchanges: 1\n  ipv4-origin ~ changed\n\
-             {FLUSH_ALL}"
+             {CARRY_ALL}"
         )
     );
     // An ICMPv4 error generation switch belongs to the restart-required
@@ -594,8 +640,8 @@ fn plan_classifies_icmpv4_switches_like_their_policy_tables() {
     assert_eq!(
         text(&ttl.stdout),
         format!(
-            "plan: restart-required\nrestart-required: ICMPV4_ERROR_POLICY\nchanges: 0\n\
-             {FLUSH_ALL}"
+            "plan: restart-required\nrestart-required: ICMPV4_ERROR_POLICY\nchanges: 0\n{}",
+            restart_all()
         )
     );
 }
@@ -629,15 +675,15 @@ fn plan_classifies_the_translated_icmpv4_limit_as_restart_required() {
     assert_eq!(status(&plan), 0);
     assert_eq!(
         text(&plan.stdout),
-        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{FLUSH_ALL}")
+        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{CARRY_ALL}")
     );
     let plan = ruster(&["plan".as_ref(), current.as_os_str(), slower.as_os_str()]);
     assert_eq!(status(&plan), 0);
     assert_eq!(
         text(&plan.stdout),
         format!(
-            "plan: restart-required\nrestart-required: ICMPV4_ERROR_POLICY\nchanges: 0\n\
-             {FLUSH_ALL}"
+            "plan: restart-required\nrestart-required: ICMPV4_ERROR_POLICY\nchanges: 0\n{}",
+            restart_all()
         )
     );
     let invalid = ruster(&["validate".as_ref(), zero.as_os_str()]);
@@ -680,7 +726,7 @@ fn plan_prints_the_arp_policy_as_reloadable() {
     assert_eq!(
         text(&plan.stdout),
         format!(
-            "plan: reloadable\nrestart-required: none\nchanges: 1\n  arp ~ changed\n{FLUSH_ALL}"
+            "plan: reloadable\nrestart-required: none\nchanges: 1\n  arp ~ changed\n{CARRY_ALL}"
         )
     );
     let plan = ruster(&[
@@ -691,7 +737,7 @@ fn plan_prints_the_arp_policy_as_reloadable() {
     assert_eq!(status(&plan), 0);
     assert_eq!(
         text(&plan.stdout),
-        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{FLUSH_ALL}")
+        format!("plan: reloadable\nrestart-required: none\nchanges: 0\n{CARRY_ALL}")
     );
 }
 
@@ -733,7 +779,14 @@ fn plan_prints_nat_filtering_as_a_reloadable_typed_delta() {
             "plan: reloadable\nrestart-required: none\nchanges: 2\n  \
              nat44-udp filtering ~ address-dependent -> endpoint-independent\n  \
              nat44-tcp filtering ~ address-dependent -> address-and-port-dependent\n\
-             {FLUSH_ALL}"
+             {}",
+            CARRY_ALL
+                .replace("nat44_udp_mappings 0", "nat44_udp_mappings all")
+                .replace("nat44_udp_peers 0", "nat44_udp_peers all")
+                .replace("nat44_tcp_mappings 0", "nat44_tcp_mappings all")
+                .replace("nat44_tcp_sessions 0", "nat44_tcp_sessions all")
+                .replace("nat44-udp carried", "nat44-udp flushed:filtering")
+                .replace("nat44-tcp carried", "nat44-tcp flushed:filtering")
         )
     );
     // router-v2.toml omits the key: the absent default plans as no change.
@@ -1730,4 +1783,39 @@ fn run_validates_the_systemd_notification_environment() {
         listener.recv(&mut buffer).is_err(),
         "notified before readiness"
     );
+}
+
+/// Core L1: a firewall that flushes (a longer idle timeout) is not reported
+/// as re-evaluated even when its rules and routes change too.
+#[test]
+fn plan_shows_a_flushed_firewall_without_reevaluate() {
+    let dir = scratch();
+    let source = fs::read_to_string(fixtures().join("router-v1.toml")).unwrap();
+    let current = fixtures().join("router-v1.toml");
+    let next = dir.join("longer.toml");
+    fs::write(
+        &next,
+        source
+            .replacen("udp-idle-ttl-ms = 300000", "udp-idle-ttl-ms = 600000", 1)
+            .replacen("first = 23\nlast = 23", "first = 25\nlast = 25", 1)
+            + "\n[[routes]]\nprefix = \"192.0.2.0/24\"\negress = \"wan\"\nvia = \"203.0.113.1\"\n",
+    )
+    .unwrap();
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), next.as_os_str()]);
+    assert_eq!(status(&plan), 0, "{}", text(&plan.stderr));
+    let out = text(&plan.stdout);
+    assert!(out.contains("  firewall flushed:timers\n"), "{out}");
+    assert!(!out.contains("reevaluate"), "{out}");
+    assert!(out.contains("  firewall_flows all\n"), "{out}");
+    // Without the longer timeout the same changes re-evaluate.
+    fs::write(
+        &next,
+        source.replacen("first = 23\nlast = 23", "first = 25\nlast = 25", 1)
+            + "\n[[routes]]\nprefix = \"192.0.2.0/24\"\negress = \"wan\"\nvia = \"203.0.113.1\"\n",
+    )
+    .unwrap();
+    let plan = ruster(&["plan".as_ref(), current.as_os_str(), next.as_os_str()]);
+    let out = text(&plan.stdout);
+    assert!(out.contains("  firewall carried reevaluate\n"), "{out}");
+    assert!(out.contains("  firewall_flows invalidated\n"), "{out}");
 }

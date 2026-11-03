@@ -30,15 +30,16 @@ pub use config_bridge::{
 pub use key_source::{OsRandomKeySource, ProductionKeySource};
 
 pub use plan::{
-    ApplyPlan, BackendChange, Change, Delta, FlushCount, InterfaceLabels, NatChange, NatPortRange,
-    NatRealm, PlanError, PlanSide, ProductionSequencer, PublicationSequencer, SequencerError,
-    StateFlush, SuccessorCheck,
+    ApplyPlan, BackendChange, CarriedCounts, Change, Delta, FlushCount, InterfaceLabels, NatChange,
+    NatPortRange, NatRealm, PlanError, PlanSide, ProductionSequencer, PublicationSequencer,
+    SequencerError, StateCarry, StateFlush, SuccessorCheck,
 };
 
 pub use publication::{
     FirewallPublicationInput, FragmentTrackingStoragePlan, FragmentationStoragePlan,
     FullServiceStorageShape, Icmpv4ErrorStorageShape, Nat44IcmpPublicationInput,
     Nat44IcmpStoragePlan, Nat44TcpPublicationInput, Nat44TcpStoragePlan, Nat44UdpPublicationInput,
-    Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan, ResolutionStorageShape,
-    RuntimeService, StorageShapeError, SuccessorError, ValidatedAuthority, ValidatedCandidate,
+    Nat44UdpStoragePlan, PublicationCandidateError, PublicationPlan, ReloadState,
+    ResolutionStorageShape, RuntimeService, StorageShapeError, SuccessorError, ValidatedAuthority,
+    ValidatedCandidate,
 };

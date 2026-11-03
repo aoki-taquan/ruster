@@ -82,8 +82,8 @@ use ruster_core::{
 };
 use ruster_io_xdp_native::{KickError, XdpIoError};
 use ruster_runtime::{
-    run_tick_reclocked, ApplyFlushCounts, PhaseReport, PublicationOutcome, RxPhaseReport,
-    ServiceOccupancy, TickObserver, TickPhaseSkip, TickReport,
+    run_tick_reclocked, ApplyCarryCounts, ApplyFlushCounts, PhaseReport, PublicationOutcome,
+    RxPhaseReport, ServiceOccupancy, TickObserver, TickPhaseSkip, TickReport,
 };
 
 use super::netlink::{LinkFacts, NetlinkError};
@@ -770,7 +770,14 @@ where
                                 apply.firewall,
                             )
                             .with_nat44_icmp(apply.nat44_icmp);
-                            (apply.previous_generation, flush)
+                            let carry = ApplyCarryCounts::from_reports(
+                                apply.resolution,
+                                apply.nat44_udp,
+                                apply.nat44_tcp,
+                                apply.firewall,
+                            )
+                            .with_nat44_icmp(apply.nat44_icmp);
+                            (apply.previous_generation, flush, carry)
                         });
                     // Tests drop the report here to reach the invariant path.
                     #[cfg(test)]
@@ -782,8 +789,8 @@ where
                     TickApply::NotApplied
                 }
             };
-            if let TickApply::Applied(Some((_, flush))) = result {
-                observer.record_apply_flush(generation, flush);
+            if let TickApply::Applied(Some((_, flush, carry))) = result {
+                observer.record_apply_flush(generation, flush, carry);
             }
             if let Some(outcome) = control.reloader.finish(generation, result) {
                 let _ = writeln!(err, "ruster run: {outcome}");

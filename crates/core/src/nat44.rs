@@ -272,6 +272,10 @@ mod tcp_tests {
     // and the half-close host-driven expiry (N6).
     mod host_session_quota;
 
+    // `nat44/tcp_tests/carry.rs`: sessions carried across a publication
+    // (RELOAD-CARRY).
+    mod carry;
+
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
     const PUBLIC: Ipv4Address = Ipv4Address::from_octets([203, 0, 113, 10]);
@@ -584,6 +588,9 @@ mod tcp_tests {
                     Nat44TcpReconcileReport {
                         mappings_flushed: 1,
                         sessions_flushed: 1,
+                        mappings_carried: 0,
+                        sessions_carried: 0,
+                        outcome: crate::StateCarryOutcome::FlushRequested,
                     }
                 );
                 assert!(runtime.mappings().iter().all(|slot| !slot.is_occupied()));
@@ -2099,6 +2106,9 @@ mod tcp_tests {
                 Nat44TcpReconcileReport {
                     mappings_flushed: 0,
                     sessions_flushed: 0,
+                    mappings_carried: 0,
+                    sessions_carried: 0,
+                    outcome: crate::StateCarryOutcome::FlushRequested,
                 }
             );
             assert!(replacement.publication_binding_matches(config, rotated_test_tcp_hash_key()));
@@ -3315,6 +3325,22 @@ impl Nat44UdpConfig {
         })
     }
 
+    /// The fields that must stay equal for state to carry across a
+    /// publication (RELOAD-CARRY).
+    #[must_use]
+    pub const fn carry_identity(self) -> Nat44CarryIdentity {
+        Nat44CarryIdentity::new(
+            self.inside,
+            self.outside,
+            self.public_address,
+            self.first_port,
+            self.last_port,
+            self.policy.filtering,
+        )
+        .with_idle_ttl(self.policy.idle_ttl_ms)
+        .with_host_limits([self.policy.mappings_per_host, self.policy.peers_per_host])
+    }
+
     #[must_use]
     pub const fn inside(self) -> IfId {
         self.inside
@@ -3709,6 +3735,118 @@ pub enum Nat44UdpDisposition {
 pub struct Nat44UdpReconcileReport {
     pub mappings_flushed: usize,
     pub peers_flushed: usize,
+    /// Allocated mapping and peer slots kept by a carry (RELOAD-CARRY),
+    /// counted like the flushed ones: expired slots not yet reclaimed count.
+    pub mappings_carried: usize,
+    pub peers_carried: usize,
+    pub outcome: crate::StateCarryOutcome,
+}
+
+/// The part of a NAT44 configuration that NAT state depends on
+/// (RELOAD-CARRY): mappings store internal and public endpoints and filter
+/// peers are keyed by the filtering mode, so state carries across a
+/// publication only when these are equal. TCP mappings also store absolute
+/// expiry deadlines, so the TCP phase timeouts must be equal too. The UDP and
+/// ICMP idle timeout, quotas, the allocator seed, hairpinning, port
+/// preservation, and the ICMPv4 error policy apply to carried state exactly
+/// as to new state, so they may change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Nat44CarryIdentity {
+    inside: IfId,
+    outside: IfId,
+    public_address: Ipv4Address,
+    first_port: u16,
+    last_port: u16,
+    filtering: Nat44Filtering,
+    /// TCP (established, opening, closing) idle timeouts; zero for UDP and
+    /// ICMP, whose liveness is computed from the bound timeout.
+    timers: [u64; 3],
+    /// UDP/ICMP idle timeout; zero for TCP. A carry may lower it but not
+    /// raise it: a longer timeout would make mappings that already expired
+    /// (and may already be parked or retired) live again.
+    idle_ttl_ceiling: u64,
+    /// Per-host limits (mappings, then peers or sessions; `0` = none). A
+    /// carry may raise or remove a limit but not lower or add one: the
+    /// reclaim paths take over a host's expired slot one for one, so a host
+    /// above a lowered limit would never come down to it.
+    host_limits: [u16; 2],
+}
+
+impl Nat44CarryIdentity {
+    /// `first_port..=last_port` is the public port pool, or the ICMP
+    /// identifier pool.
+    #[must_use]
+    pub const fn new(
+        inside: IfId,
+        outside: IfId,
+        public_address: Ipv4Address,
+        first_port: u16,
+        last_port: u16,
+        filtering: Nat44Filtering,
+    ) -> Self {
+        Self {
+            inside,
+            outside,
+            public_address,
+            first_port,
+            last_port,
+            filtering,
+            timers: [0; 3],
+            idle_ttl_ceiling: 0,
+            host_limits: [0; 2],
+        }
+    }
+
+    /// This identity with the UDP or ICMP idle timeout, which a carry may
+    /// lower but not raise.
+    #[must_use]
+    pub const fn with_idle_ttl(mut self, idle_ttl_ms: u64) -> Self {
+        self.idle_ttl_ceiling = idle_ttl_ms;
+        self
+    }
+
+    /// This identity with the per-host limits (mappings, then peers or
+    /// sessions; `0` = none), which a carry may raise but not lower.
+    #[must_use]
+    pub const fn with_host_limits(mut self, limits: [u16; 2]) -> Self {
+        self.host_limits = limits;
+        self
+    }
+
+    /// This identity with the TCP (established, opening, closing) idle
+    /// timeouts, which must stay equal for TCP state to carry.
+    #[must_use]
+    pub const fn with_tcp_timers(mut self, timers: [u64; 3]) -> Self {
+        self.timers = timers;
+        self
+    }
+
+    /// Why state created under `self` cannot carry into `next`, in this
+    /// order: interfaces, public address, pool, filtering, timers (any TCP
+    /// timeout change, a longer UDP/ICMP timeout), per-host limits (a lower
+    /// or new limit).
+    #[must_use]
+    pub fn carry_conflict(self, next: Self) -> Option<crate::StateCarryConflict> {
+        use crate::StateCarryConflict;
+        if (self.inside, self.outside) != (next.inside, next.outside) {
+            Some(StateCarryConflict::Interfaces)
+        } else if self.public_address != next.public_address {
+            Some(StateCarryConflict::PublicAddress)
+        } else if (self.first_port, self.last_port) != (next.first_port, next.last_port) {
+            Some(StateCarryConflict::PortRange)
+        } else if self.filtering != next.filtering {
+            Some(StateCarryConflict::Filtering)
+        } else if self.timers != next.timers || next.idle_ttl_ceiling > self.idle_ttl_ceiling {
+            Some(StateCarryConflict::Timers)
+        } else if (0..2).any(|list| {
+            let (old, new) = (self.host_limits[list], next.host_limits[list]);
+            new != 0 && (old == 0 || new < old)
+        }) {
+            Some(StateCarryConflict::Quota)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -4168,16 +4306,30 @@ pub struct Nat44UdpReconcilePermit<'runtime, 'storage> {
     config: Nat44UdpConfig,
     hash_key: Nat44UdpHashKey,
     next_runtime_epoch: u128,
+    /// `Carried` keeps every slot, index, the hash key, the epoch, and the
+    /// clock watermark; anything else flushes and rotates the key.
+    outcome: crate::StateCarryOutcome,
 }
 
 impl Nat44UdpReconcilePermit<'_, '_> {
     /// Consumes this one-shot permit and applies its prevalidated reconcile.
     pub fn commit(self) -> Nat44UdpReconcileReport {
-        self.runtime.commit_prevalidated_reconcile(
+        if self.outcome.carried() {
+            return self.runtime.commit_prevalidated_carry(self.config);
+        }
+        let mut report = self.runtime.commit_prevalidated_reconcile(
             self.config,
             self.hash_key,
             self.next_runtime_epoch,
-        )
+        );
+        report.outcome = self.outcome;
+        report
+    }
+
+    /// What [`Self::commit`] will do with the state.
+    #[must_use]
+    pub const fn outcome(&self) -> crate::StateCarryOutcome {
+        self.outcome
     }
 }
 
@@ -4552,7 +4704,76 @@ impl<'a> Nat44UdpRuntime<'a> {
             config,
             hash_key,
             next_runtime_epoch,
+            outcome: crate::StateCarryOutcome::FlushRequested,
         })
+    }
+
+    /// Why `config` cannot carry this runtime's state, if it cannot
+    /// (RELOAD-CARRY); see [`Self::preflight_reconcile_carrying`].
+    #[must_use]
+    pub fn carry_conflict(&self, config: Nat44UdpConfig) -> Option<crate::StateCarryConflict> {
+        self.config
+            .carry_identity()
+            .carry_conflict(config.carry_identity())
+    }
+
+    /// Preflights a successor that keeps this runtime's state when it can
+    /// (RELOAD-CARRY).
+    ///
+    /// When [`Self::carry_conflict`] finds nothing, the permit carries: its
+    /// commit only binds `config` and keeps every mapping, peer, index,
+    /// port owner, per-host count, the hash key, the runtime epoch, and the
+    /// clock watermark, in O(1). A shorter idle timeout and the rest of the
+    /// policy then apply to carried state exactly as to new state: liveness
+    /// is always the last activity plus the bound TTL, which only makes
+    /// more mappings expired. A longer timeout or a lowered or new per-host
+    /// limit is a conflict (it would revive parked or retired mappings, or
+    /// never take effect for a churning host), so state that expired under
+    /// the old policy never becomes live again. `hash_key` is not used by a
+    /// carry; the old key stays secret and keeps keying the indexes.
+    ///
+    /// Otherwise this is [`Self::preflight_reconcile`] (flush and key
+    /// rotation), reported as [`crate::StateCarryOutcome::FlushIncompatible`].
+    pub fn preflight_reconcile_carrying<'runtime>(
+        &'runtime mut self,
+        config: Nat44UdpConfig,
+        hash_key: Nat44UdpHashKey,
+    ) -> Result<Nat44UdpReconcilePermit<'runtime, 'a>, Nat44UdpReconcileError> {
+        if let Some(conflict) = self.carry_conflict(config) {
+            let mut permit = self.preflight_reconcile(config, hash_key)?;
+            permit.outcome = crate::StateCarryOutcome::FlushIncompatible(conflict);
+            return Ok(permit);
+        }
+        if config.policy.per_host_accounting() && !self.mappings.is_empty() && !self.hosts.enabled()
+        {
+            return Err(Nat44UdpReconcileError::HostTableMissing);
+        }
+        let next_runtime_epoch = self.runtime_epoch;
+        Ok(Nat44UdpReconcilePermit {
+            runtime: self,
+            config,
+            hash_key,
+            next_runtime_epoch,
+            outcome: crate::StateCarryOutcome::Carried,
+        })
+    }
+
+    fn commit_prevalidated_carry(&mut self, config: Nat44UdpConfig) -> Nat44UdpReconcileReport {
+        let mappings_carried = self
+            .mappings
+            .iter()
+            .filter(|mapping| mapping.occupied)
+            .count();
+        let peers_carried = self.peers.iter().filter(|peer| peer.occupied).count();
+        self.config = config;
+        self.counters.reconciliations = self.counters.reconciliations.saturating_add(1);
+        Nat44UdpReconcileReport {
+            mappings_flushed: 0,
+            peers_flushed: 0,
+            mappings_carried,
+            peers_carried,
+            outcome: crate::StateCarryOutcome::Carried,
+        }
     }
 
     fn commit_prevalidated_reconcile(
@@ -4592,6 +4813,9 @@ impl<'a> Nat44UdpRuntime<'a> {
         Nat44UdpReconcileReport {
             mappings_flushed,
             peers_flushed,
+            mappings_carried: 0,
+            peers_carried: 0,
+            outcome: crate::StateCarryOutcome::FlushRequested,
         }
     }
 
@@ -6572,6 +6796,17 @@ pub enum Nat44TcpPolicyError {
 }
 
 impl Nat44TcpPolicy {
+    /// (established, opening, closing) idle timeouts, which TCP state
+    /// needs unchanged to carry across a publication (RELOAD-CARRY).
+    #[must_use]
+    pub const fn carry_timers(self) -> [u64; 3] {
+        [
+            self.idle_ttl_ms,
+            self.opening_idle_ttl_ms,
+            self.closing_idle_ttl_ms,
+        ]
+    }
+
     /// A policy with established connection idle timeout `idle_ttl_ms`
     /// (RFC 5382 REQ-5: at least [`NAT44_TCP_MIN_IDLE_TTL_MS`], 2h4m) and
     /// the default opening and closing idle timeouts
@@ -7037,6 +7272,22 @@ impl Nat44TcpConfig {
             authority: snapshot_authority(snapshot),
             snapshot_identity: snapshot.identity(),
         })
+    }
+
+    /// The fields that must stay equal for state to carry across a
+    /// publication (RELOAD-CARRY).
+    #[must_use]
+    pub const fn carry_identity(self) -> Nat44CarryIdentity {
+        Nat44CarryIdentity::new(
+            self.inside,
+            self.outside,
+            self.public_address,
+            self.first_port,
+            self.last_port,
+            self.policy.filtering,
+        )
+        .with_tcp_timers(self.policy.carry_timers())
+        .with_host_limits([self.policy.mappings_per_host, self.policy.sessions_per_host])
     }
 
     #[must_use]
@@ -7559,6 +7810,11 @@ pub enum Nat44TcpDisposition {
 pub struct Nat44TcpReconcileReport {
     pub mappings_flushed: usize,
     pub sessions_flushed: usize,
+    /// Allocated mapping and session slots kept by a carry (RELOAD-CARRY),
+    /// counted like the flushed ones.
+    pub mappings_carried: usize,
+    pub sessions_carried: usize,
+    pub outcome: crate::StateCarryOutcome,
 }
 
 #[derive(Clone, Copy)]
@@ -8070,15 +8326,29 @@ pub struct Nat44TcpReconcilePermit<'runtime, 'storage> {
     config: Nat44TcpConfig,
     hash_key: Nat44TcpHashKey,
     next_runtime_epoch: u128,
+    /// `Carried` keeps every mapping, session, index, the hash key, the
+    /// epoch, and the clock watermark; anything else flushes and rotates.
+    outcome: crate::StateCarryOutcome,
 }
 
 impl Nat44TcpReconcilePermit<'_, '_> {
     pub fn commit(self) -> Nat44TcpReconcileReport {
-        self.runtime.commit_prevalidated_reconcile(
+        if self.outcome.carried() {
+            return self.runtime.commit_prevalidated_carry(self.config);
+        }
+        let mut report = self.runtime.commit_prevalidated_reconcile(
             self.config,
             self.hash_key,
             self.next_runtime_epoch,
-        )
+        );
+        report.outcome = self.outcome;
+        report
+    }
+
+    /// What [`Self::commit`] will do with the state.
+    #[must_use]
+    pub const fn outcome(&self) -> crate::StateCarryOutcome {
+        self.outcome
     }
 }
 
@@ -8446,6 +8716,17 @@ impl<'a> Nat44TcpRuntime<'a> {
         {
             return Err(Nat44TcpReconcileError::PortOwnerTableInvalid);
         }
+        self.check_host_tables(config)?;
+        Ok(Nat44TcpReconcilePermit {
+            runtime: self,
+            config,
+            hash_key,
+            next_runtime_epoch,
+            outcome: crate::StateCarryOutcome::FlushRequested,
+        })
+    }
+
+    fn check_host_tables(&self, config: Nat44TcpConfig) -> Result<(), Nat44TcpReconcileError> {
         if config.policy.mappings_per_host != 0
             && !self.mappings.is_empty()
             && !self.hosts.enabled()
@@ -8458,12 +8739,64 @@ impl<'a> Nat44TcpRuntime<'a> {
         {
             return Err(Nat44TcpReconcileError::SessionHostTableMissing);
         }
+        Ok(())
+    }
+
+    /// Why `config` cannot carry this runtime's state, if it cannot
+    /// (RELOAD-CARRY); see [`Self::preflight_reconcile_carrying`].
+    #[must_use]
+    pub fn carry_conflict(&self, config: Nat44TcpConfig) -> Option<crate::StateCarryConflict> {
+        self.config
+            .carry_identity()
+            .carry_conflict(config.carry_identity())
+    }
+
+    /// Preflights a successor that keeps this runtime's state when it can
+    /// (RELOAD-CARRY); the TCP counterpart of
+    /// [`Nat44UdpRuntime::preflight_reconcile_carrying`].
+    ///
+    /// A carry keeps every mapping, session (with its RFC 7857 phase),
+    /// index, port owner, per-host and per-remote count, the hash key, the
+    /// runtime epoch, and the clock watermark, in O(1). The phase timeouts
+    /// must be unchanged (mappings keep absolute deadlines) and the per-host
+    /// limits not lowered or added; otherwise this flushes. Unsolicited-SYN
+    /// holds (RFC 5382 REQ-4) are always dropped:
+    /// each was admitted by the old firewall and switch for an ICMP error
+    /// at most 6 s later, so none is sent on the old authority.
+    pub fn preflight_reconcile_carrying<'runtime>(
+        &'runtime mut self,
+        config: Nat44TcpConfig,
+        hash_key: Nat44TcpHashKey,
+    ) -> Result<Nat44TcpReconcilePermit<'runtime, 'a>, Nat44TcpReconcileError> {
+        if let Some(conflict) = self.carry_conflict(config) {
+            let mut permit = self.preflight_reconcile(config, hash_key)?;
+            permit.outcome = crate::StateCarryOutcome::FlushIncompatible(conflict);
+            return Ok(permit);
+        }
+        self.check_host_tables(config)?;
+        let next_runtime_epoch = self.runtime_epoch;
         Ok(Nat44TcpReconcilePermit {
             runtime: self,
             config,
             hash_key,
             next_runtime_epoch,
+            outcome: crate::StateCarryOutcome::Carried,
         })
+    }
+
+    fn commit_prevalidated_carry(&mut self, config: Nat44TcpConfig) -> Nat44TcpReconcileReport {
+        let mappings_carried = self.mappings.iter().filter(|slot| slot.occupied).count();
+        let sessions_carried = self.sessions.iter().filter(|slot| slot.occupied).count();
+        self.syn_holds.flush();
+        self.config = config;
+        self.counters.reconciliations = self.counters.reconciliations.saturating_add(1);
+        Nat44TcpReconcileReport {
+            mappings_flushed: 0,
+            sessions_flushed: 0,
+            mappings_carried,
+            sessions_carried,
+            outcome: crate::StateCarryOutcome::Carried,
+        }
     }
 
     fn commit_prevalidated_reconcile(
@@ -8501,6 +8834,9 @@ impl<'a> Nat44TcpRuntime<'a> {
         Nat44TcpReconcileReport {
             mappings_flushed,
             sessions_flushed,
+            mappings_carried: 0,
+            sessions_carried: 0,
+            outcome: crate::StateCarryOutcome::FlushRequested,
         }
     }
 
@@ -11326,6 +11662,10 @@ mod tests {
     // `nat44/tests/host_peer_quota.rs`: the per-host peer limit (N6).
     mod host_peer_quota;
 
+    // `nat44/tests/carry.rs`: state carried across a publication
+    // (RELOAD-CARRY).
+    mod carry;
+
     const INSIDE: IfId = IfId(1);
     const OUTSIDE: IfId = IfId(2);
     const INTERNAL: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 10]);
@@ -12014,11 +12354,23 @@ mod tests {
         );
         assert_eq!(
             public_field_names(nat_source, "pub struct Nat44UdpReconcileReport"),
-            ["mappings_flushed", "peers_flushed"]
+            [
+                "mappings_flushed",
+                "peers_flushed",
+                "mappings_carried",
+                "peers_carried",
+                "outcome"
+            ]
         );
         assert_eq!(
             public_field_names(nat_source, "pub struct Nat44TcpReconcileReport"),
-            ["mappings_flushed", "sessions_flushed"]
+            [
+                "mappings_flushed",
+                "sessions_flushed",
+                "mappings_carried",
+                "sessions_carried",
+                "outcome"
+            ]
         );
         assert_eq!(
             type_block(nat_source, "pub struct Nat44UdpStorageShape")
@@ -12656,6 +13008,9 @@ mod tests {
                 Nat44UdpReconcileReport {
                     mappings_flushed: 1,
                     peers_flushed: 1,
+                    mappings_carried: 0,
+                    peers_carried: 0,
+                    outcome: crate::StateCarryOutcome::FlushRequested,
                 }
             );
             assert!(runtime.mappings().iter().all(|slot| !slot.occupied));
@@ -12854,6 +13209,9 @@ mod tests {
                 Nat44UdpReconcileReport {
                     mappings_flushed: 0,
                     peers_flushed: 0,
+                    mappings_carried: 0,
+                    peers_carried: 0,
+                    outcome: crate::StateCarryOutcome::FlushRequested,
                 }
             );
             assert!(replacement.publication_binding_matches(config, rotated_udp_hash_key()));

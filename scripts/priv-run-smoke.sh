@@ -139,6 +139,15 @@
 #             fragment_tracking.held = consume.IPV4_FRAGMENT_HELD, released,
 #             nothing refused. With `[fragment-tracking] mode = "refuse"` the
 #             same fragments never arrive (drop.FIREWALL_FRAGMENT_UNSUPPORTED)
+#   reload_carry  (RELOAD-CARRY, AF_XDP and again inside the afpacket phase
+#             over AF_PACKET) a long-lived TCP connection and a UDP flow (a
+#             fixed source port) from host A to host B through NAT44 keep
+#             working, on the same socket and from the same public port,
+#             across an applied SIGHUP reload that adds an unrelated firewall
+#             rule (the reload line shows every family carried and no flow
+#             revoked; `ruster plan` predicted carry with re-evaluation);
+#             a second reload whose rules deny both revokes the two flows
+#             (firewall-revoked=2) and neither passes afterwards
 #   unsolicited_syn  (B3, RFC 5382 REQ-4) with a firewall rule that admits
 #             new WAN -> LAN TCP flows to every destination, host B sends a
 #             TCP SYN to a public port without a mapping: nothing for 6 s,
@@ -1892,6 +1901,254 @@ phase_df_clear() {
 }
 phase_df_clear
 
+# reload_carry (RELOAD-CARRY): a long-lived TCP connection and a UDP flow
+# from host A to host B through the NAT survive an applied SIGHUP reload
+# that adds an unrelated firewall rule (both on the same socket, the UDP
+# flow from the same public port), and an applied reload whose rules deny
+# both kills them (the carry revokes the two flows). Host A's clients do one
+# exchange per step file $work/$name-step-<n>; host B echoes.
+# The servers (argv: port, stop file) echo until the stop file exists. Both
+# TCP ends close with SO_LINGER 0: one RST, no FIN retransmitted into later
+# phases (the revoked flow cannot carry a FIN through the router).
+CARRY_TCP_SERVER='
+import os, socket, struct, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.listen(1)
+s.settimeout(30)
+print("ready", flush=True)
+conn, peer = s.accept()
+print(peer[0], peer[1], flush=True)
+conn.settimeout(0.2)
+while not os.path.exists(sys.argv[2]):
+    try:
+        data = conn.recv(4096)
+        if not data:
+            break
+        conn.sendall(data)
+    except socket.timeout:
+        continue
+    except OSError:
+        break
+conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+conn.close()
+'
+CARRY_UDP_SERVER='
+import os, socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("0.0.0.0", int(sys.argv[1])))
+s.settimeout(0.2)
+print("ready", flush=True)
+while not os.path.exists(sys.argv[2]):
+    try:
+        data, peer = s.recvfrom(2048)
+    except socket.timeout:
+        continue
+    print(peer[0], peer[1], flush=True)
+    s.sendto(data, peer)
+'
+# argv: tcp|udp, server address, server port, step file prefix, steps.
+# Prints "connected" (TCP) and then "ok <n>" or "fail <n>" per step; a
+# failed step is not retried on the TCP connection (its data stays queued).
+CARRY_CLIENT='
+import os, socket, struct, sys, time
+kind, address, port, prefix, steps = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4], int(sys.argv[5])
+if kind == "tcp":
+    s = socket.create_connection((address, port), timeout=10)
+    print("connected", flush=True)
+else:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("0.0.0.0", 5300))
+for step in range(1, steps + 1):
+    deadline = time.monotonic() + 60
+    while not os.path.exists(prefix + str(step)):
+        if time.monotonic() > deadline:
+            print("timeout", step, flush=True)
+            sys.exit(1)
+        time.sleep(0.05)
+    message = ("%s-%d" % (kind, step)).encode()
+    ok = False
+    if kind == "tcp":
+        s.settimeout(3)
+        try:
+            s.sendall(message)
+            got = b""
+            while len(got) < len(message):
+                chunk = s.recv(len(message) - len(got))
+                if not chunk:
+                    break
+                got += chunk
+            ok = got == message
+        except OSError:
+            ok = False
+    else:
+        s.settimeout(0.5)
+        for _ in range(6):
+            s.sendto(message, (address, port))
+            try:
+                data, _ = s.recvfrom(2048)
+                if data == message:
+                    ok = True
+                    break
+            except OSError:
+                pass
+    print("ok" if ok else "fail", step, flush=True)
+if kind == "tcp":
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+s.close()
+'
+
+# Waits (15 s) until $1 has the exact line $2.
+wait_file_line() {
+    tries=0
+    while ! grep -qxF -- "$2" "$1" 2>/dev/null; do
+        tries=$((tries + 1))
+        [ "$tries" -le 300 ] || fail "no \"$2\" in $1: $(cat "$1" 2>/dev/null)"
+        sleep 0.05
+    done
+}
+
+# $1: phase name, $2: base config (the router-v1 fixture with a backend).
+phase_reload_carry() {
+    name=$1
+    base=$2
+    # The unrelated rule (TCP/25 deny) and the deny of both flows (TCP/9100
+    # and UDP/9200), each inserted ahead of the UDP allow (rule 20).
+    python3 -I -c '
+import sys
+base, out, rules = sys.argv[1], sys.argv[2], sys.argv[3:]
+text = open(base).read()
+anchor = "[[firewall.rules]]\nid = 20\n"
+assert text.count(anchor) == 1
+block = ""
+for rule in rules:
+    rule_id, protocol, port = rule.split(":")
+    block += ("[[firewall.rules]]\nid = %s\ningress = \"lan\"\negress = \"wan\"\n"
+              "source = \"192.168.1.0/24\"\ndestination = \"0.0.0.0/0\"\n"
+              "protocol = \"%s\"\naction = \"deny\"\n\n"
+              "[firewall.rules.source-ports]\nfirst = 0\nlast = 65535\n\n"
+              "[firewall.rules.destination-ports]\nfirst = %s\nlast = %s\n\n"
+              % (rule_id, protocol, port, port))
+open(out, "w").write(text.replace(anchor, block + anchor))
+' "$base" "$work/$name-rule.toml" 15:tcp:25 || fail "$name: rule config"
+    python3 -I -c '
+import sys
+text = open(sys.argv[1]).read()
+anchor = "[[firewall.rules]]\nid = 20\n"
+deny = "".join(
+    "[[firewall.rules]]\nid = %d\ningress = \"lan\"\negress = \"wan\"\n"
+    "source = \"192.168.1.0/24\"\ndestination = \"0.0.0.0/0\"\n"
+    "protocol = \"%s\"\naction = \"deny\"\n\n"
+    "[firewall.rules.source-ports]\nfirst = 0\nlast = 65535\n\n"
+    "[firewall.rules.destination-ports]\nfirst = %d\nlast = %d\n\n" % (i, p, port, port)
+    for i, p, port in ((16, "tcp", 9100), (17, "udp", 9200)))
+open(sys.argv[2], "w").write(text.replace(anchor, deny + anchor))
+' "$work/$name-rule.toml" "$work/$name-deny.toml" || fail "$name: deny config"
+    for config in rule deny; do
+        status=0
+        "$binary_path" validate "$work/$name-$config.toml" >"$work/$name-validate-$config.txt" 2>&1 ||
+            status=$?
+        [ "$status" -eq 0 ] || fail "$name: validate $config: $(cat "$work/$name-validate-$config.txt")"
+    done
+    status=0
+    "$binary_path" plan "$base" "$work/$name-rule.toml" >"$work/$name-plan.txt" 2>&1 || status=$?
+    [ "$status" -eq 0 ] || fail "$name: plan: $(cat "$work/$name-plan.txt")"
+    for line in "state: carry" "  nat44-udp carried" "  nat44-tcp carried" \
+        "  firewall carried reevaluate"; do
+        grep -qxF -- "$line" "$work/$name-plan.txt" || fail "$name: plan lacks \"$line\": $(cat "$work/$name-plan.txt")"
+    done
+
+    # Host B answers this time (TCP and UDP from its own stack): full
+    # checksums there too, as on host A (a veth leaves them partial).
+    in_ns "$host_b" ethtool -K pb tx off >/dev/null
+    cp "$base" "$work/$name-ops.toml"
+    start_ruster "$name" "$work/$name-ops.toml" --user "$smoke_uid" --group "$smoke_gid"
+    wait_ready "$name" || fail "$name: ruster exited during startup: $(cat "$work/$name.err")"
+    rm -f "$work/$name"-step-* "$work/$name"-tcp-*.out "$work/$name"-udp-*.out "$work/$name-stop"
+    in_ns "$host_b" python3 -I -c "$CARRY_TCP_SERVER" 9100 "$work/$name-stop" \
+        >"$work/$name-tcp-server.out" 2>&1 &
+    tcp_server=$!
+    in_ns "$host_b" python3 -I -c "$CARRY_UDP_SERVER" 9200 "$work/$name-stop" \
+        >"$work/$name-udp-server.out" 2>&1 &
+    udp_server=$!
+    wait_file_line "$work/$name-tcp-server.out" ready
+    wait_file_line "$work/$name-udp-server.out" ready
+    in_ns "$host_a" python3 -I -c "$CARRY_CLIENT" tcp 203.0.113.1 9100 "$work/$name-step-" 3 \
+        >"$work/$name-tcp-client.out" 2>&1 &
+    tcp_client=$!
+    in_ns "$host_a" python3 -I -c "$CARRY_CLIENT" udp 203.0.113.1 9200 "$work/$name-step-" 3 \
+        >"$work/$name-udp-client.out" 2>&1 &
+    udp_client=$!
+    wait_file_line "$work/$name-tcp-client.out" connected
+    : >"$work/$name-step-1"
+    wait_file_line "$work/$name-tcp-client.out" "ok 1"
+    wait_file_line "$work/$name-udp-client.out" "ok 1"
+    tcp_peer=$(sed -n 2p "$work/$name-tcp-server.out")
+    case $tcp_peer in
+    "203.0.113.2 "*) ;;
+    *) fail "$name: TCP connection not translated by NAT44 (peer $tcp_peer)" ;;
+    esac
+    udp_peer=$(sed -n 2p "$work/$name-udp-server.out")
+    case $udp_peer in
+    "203.0.113.2 "*) ;;
+    *) fail "$name: UDP flow not translated by NAT44 (peer $udp_peer)" ;;
+    esac
+
+    # An unrelated rule: every flow is re-evaluated and carried.
+    reload_with "$work/$name-rule.toml" "$work/$name-ops.toml"
+    wait_line "$name" "reload applied: generation=2 previous=1"
+    applied=$(grep -F "reload applied: generation=2 previous=1" "$work/$name.err")
+    for part in "nat44-udp-mappings=1 nat44-tcp-sessions=1 nat44-icmp-mappings=0 firewall-flows=2 firewall-revoked=0;" \
+        "state arp=carried nat44-udp=carried nat44-tcp=carried nat44-icmp=none firewall=carried" \
+        "flushed dynamic-neighbors=0 resolution-states=" \
+        " nat44-udp-mappings=0 nat44-tcp-sessions=0 firewall-flows=0; carried dynamic-neighbors=1 "; do
+        case $applied in
+        *"$part"*) ;;
+        *) fail "$name: reload line lacks \"$part\": $applied" ;;
+        esac
+    done
+    : >"$work/$name-step-2"
+    wait_file_line "$work/$name-tcp-client.out" "ok 2"
+    wait_file_line "$work/$name-udp-client.out" "ok 2"
+    [ "$(sed -n 2p "$work/$name-tcp-server.out")" = "$tcp_peer" ] || fail "$name: TCP peer changed"
+    [ "$(tail -n 1 "$work/$name-udp-server.out")" = "$udp_peer" ] ||
+        fail "$name: the UDP flow's public port changed: $udp_peer -> $(tail -n 1 "$work/$name-udp-server.out")"
+    echo "priv_run_${name}_unrelated: the TCP connection ($tcp_peer) and the UDP flow ($udp_peer) survived a reload adding an unrelated firewall rule (generation 2, every family carried, no flow revoked) verified"
+
+    # Rules that deny both flows: the carry revokes them at the apply.
+    reload_with "$work/$name-deny.toml" "$work/$name-ops.toml"
+    wait_line "$name" "reload applied: generation=3 previous=2"
+    applied=$(grep -F "reload applied: generation=3 previous=2" "$work/$name.err")
+    case $applied in
+    *"firewall-flows=0 firewall-revoked=2; state arp=carried nat44-udp=carried nat44-tcp=carried nat44-icmp=none firewall=carried"*) ;;
+    *) fail "$name: deny reload did not revoke both flows: $applied" ;;
+    esac
+    : >"$work/$name-step-3"
+    wait_file_line "$work/$name-tcp-client.out" "fail 3"
+    wait_file_line "$work/$name-udp-client.out" "fail 3"
+    status=0
+    wait "$tcp_client" || status=$?
+    [ "$status" -eq 0 ] || fail "$name: TCP client: $(cat "$work/$name-tcp-client.out")"
+    wait "$udp_client" || status=$?
+    [ "$status" -eq 0 ] || fail "$name: UDP client: $(cat "$work/$name-udp-client.out")"
+    : >"$work/$name-stop"
+    status=0
+    wait "$tcp_server" || status=$?
+    [ "$status" -eq 0 ] || fail "$name: TCP server: $(cat "$work/$name-tcp-server.out")"
+    wait "$udp_server" || status=$?
+    [ "$status" -eq 0 ] || fail "$name: UDP server: $(cat "$work/$name-udp-server.out")"
+
+    signal_ruster TERM
+    wait_ruster
+    [ "$status" -eq 0 ] || fail "$name: exit status $status after SIGTERM: $(cat "$work/$name.err")"
+    sed -n "/^ruster-run-stats kind=final/,/^end$/p" "$work/$name.out" >"$work/$name.final"
+    block_has "$work/$name.final" observer.generation=3 firewall.states_revoked=2 \
+        carried.firewall_flows_revoked=2 apply.state.firewall=carried
+    echo "priv_run_${name}_deny: a reload denying both flows revoked them (generation 3, firewall-revoked=2) and neither the TCP connection nor the UDP flow passed afterwards, exit 0 verified"
+}
+phase_reload_carry carry "$work/router.toml"
+
 # frag (MTU2 part B, RFC 791 3.2, RFC 1812 4.2.2.7): the router fragments
 # forwarded DF-clear IPv4 datagrams above the egress MTU (after NAT44, so
 # every fragment carries the one generated ID). Separate runs: outbound
@@ -3625,6 +3882,10 @@ phase_afpacket() {
         [ "${kernel:-0}" -ge 1 ] || fail "afpacket: if$id kernel_packets ${kernel:-missing}"
     done
     echo "priv_run_afpacket_shutdown: SIGTERM exit 0 with nothing in flight, both packet sockets closed, every frame on ra/rb sent by the router (none by the kernel), PACKET_STATISTICS folded in verified"
+    # RELOAD-CARRY over AF_PACKET: the same flows survive an unrelated
+    # reload and die with a denying one.
+    phase_reload_carry afpacket-carry "$work/packet-router.toml"
+    [ "$(packet_sockets)" -eq 0 ] || fail "afpacket-carry: a packet socket survived the shutdown"
 
     # upper: rb enslaved to a bridge while running ends the router with
     # KERNEL_UPPER_DEVICE (exit 1). The bridge (down, in the router

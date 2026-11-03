@@ -16,8 +16,8 @@ use ruster_core::{
 };
 use ruster_io_sim::SimIo;
 use ruster_runtime::{
-    run_tick, ApplyFlushCounts, BackendStats, HealthState, PublicationOutcome, ServiceOccupancy,
-    TickBudgets, TickObserver,
+    run_tick, ApplyCarryCounts, ApplyFlushCounts, BackendStats, HealthState, PublicationOutcome,
+    ServiceOccupancy, TickBudgets, TickObserver,
 };
 
 /// Counts the allocations of the measuring thread while it is armed.
@@ -240,7 +240,11 @@ fn observability_sink_is_allocation_free_in_steady_state() {
         let generation = publication.generation;
         observer.observe_tick(now, Some(generation), &report);
         if report.publication == PublicationOutcome::Applied {
-            assert!(observer.record_apply_flush(generation, ApplyFlushCounts::default()));
+            assert!(observer.record_apply_flush(
+                generation,
+                ApplyFlushCounts::default(),
+                ApplyCarryCounts::default()
+            ));
         }
         observer.record_occupancy(ServiceOccupancy::capture(
             publication.icmpv4_errors,

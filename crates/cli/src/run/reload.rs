@@ -44,12 +44,15 @@
 //!
 //! Every outcome is failure atomic: on a refusal or failure the old
 //! generation, its runtimes, and its state keep running unchanged. An
-//! applied reload follows the control-plane contract (PUB-006): the new
-//! generation flushes publication-bound state (ARP learning, pending
-//! resolution and ICMPv4 errors, every NAT44 mapping and firewall flow,
-//! because their hash keys rotate) and keeps cumulative counters; the
-//! flush counts are printed. The tick budgets of the new document apply
-//! from the next tick.
+//! applied reload follows the control-plane contract (PUB-006,
+//! RELOAD-CARRY): the new generation flushes pending resolution and ICMPv4
+//! errors, carries NAT44 mappings and sessions, firewall flows (re-evaluated
+//! against changed rules), and learned ARP neighbors that the new document
+//! does not invalidate (`[reload] state = "carry"`, the default), or flushes
+//! all of them with fresh hash keys (`state = "flush"`), and keeps
+//! cumulative counters; the flushed and carried counts and each family's
+//! outcome are printed. The tick budgets of the new document apply from the
+//! next tick.
 //!
 //! A reload still preparing when the run ends is not waited for: it fails
 //! as `stage=prepare code=STOPPED` (`stage=quiesce code=STOPPED` while
@@ -70,7 +73,7 @@ use ruster_control::{
 use ruster_core::{
     FieldValue, FieldVisitor, MonotonicMillis, ObservableFields, PublicationQuiescence,
 };
-use ruster_runtime::{ApplyFlushCounts, TickBudgets};
+use ruster_runtime::{ApplyCarryCounts, ApplyFlushCounts, TickBudgets};
 
 use crate::config_cmd::{self, LoadError, SweepSlow};
 
@@ -142,6 +145,8 @@ pub enum ReloadOutcome {
         previous: Option<NonZeroU64>,
         generation: NonZeroU64,
         flush: Option<ApplyFlushCounts>,
+        /// Boxed (cold path, once per applied reload) to keep the enum small.
+        carry: Option<Box<ApplyCarryCounts>>,
         counts: DocumentCounts,
     },
     /// Restart-required reasons, in plan order.
@@ -154,6 +159,12 @@ pub enum ReloadOutcome {
         detail: String,
         generation: NonZeroU64,
     },
+    /// The live dry run passed; the successor waits for quiescence. Not an
+    /// end of the reload: `Applied`, `Refused`, or `Failed` follows.
+    Checked {
+        generation: NonZeroU64,
+        carried: ruster_control::CarriedCounts,
+    },
 }
 
 impl fmt::Display for ReloadOutcome {
@@ -163,6 +174,7 @@ impl fmt::Display for ReloadOutcome {
                 previous,
                 generation,
                 flush,
+                carry,
                 counts,
             } => {
                 write!(
@@ -184,17 +196,40 @@ impl fmt::Display for ReloadOutcome {
                     counts.firewall_rules,
                     counts.nat44_ports,
                 )?;
-                match flush {
-                    Some(flush) => write!(
-                        formatter,
-                        "flushed dynamic-neighbors={} resolution-states={} \
-                         nat44-udp-mappings={} nat44-tcp-sessions={} firewall-flows={}",
-                        flush.dynamic_neighbors,
-                        flush.resolution_states,
-                        flush.nat44_udp_mappings,
-                        flush.nat44_tcp_sessions,
-                        flush.firewall_flows,
-                    ),
+                match flush.zip(carry.as_deref().copied()) {
+                    Some((flush, carry)) => {
+                        write!(
+                            formatter,
+                            "flushed dynamic-neighbors={} resolution-states={} \
+                             nat44-udp-mappings={} nat44-tcp-sessions={} firewall-flows={}; ",
+                            flush.dynamic_neighbors,
+                            flush.resolution_states,
+                            flush.nat44_udp_mappings,
+                            flush.nat44_tcp_sessions,
+                            flush.firewall_flows,
+                        )?;
+                        let outcomes = carry.outcomes;
+                        write!(
+                            formatter,
+                            "carried dynamic-neighbors={} nat44-udp-mappings={} \
+                             nat44-tcp-sessions={} nat44-icmp-mappings={} firewall-flows={} \
+                             firewall-revoked={}; state arp={} nat44-udp={} nat44-tcp={} \
+                             nat44-icmp={} firewall={}",
+                            carry.dynamic_neighbors,
+                            carry.nat44_udp_mappings,
+                            carry.nat44_tcp_sessions,
+                            carry.nat44_icmp_mappings,
+                            carry.firewall_flows,
+                            carry.firewall_flows_revoked,
+                            outcomes.resolution.label(),
+                            outcomes.nat44_udp.label(),
+                            outcomes.nat44_tcp.label(),
+                            outcomes
+                                .nat44_icmp
+                                .map_or("none", ruster_core::StateCarryOutcome::label),
+                            outcomes.firewall.label(),
+                        )
+                    }
                     None => formatter.write_str("code=APPLY_REPORT_MISSING"),
                 }
             }
@@ -215,6 +250,29 @@ impl fmt::Display for ReloadOutcome {
                 formatter,
                 "reload failed: {detail}; generation {generation} keeps running"
             ),
+            Self::Checked {
+                generation,
+                carried,
+            } => {
+                // `<=` when the commit re-evaluates the firewall flows and
+                // may revoke some (the dry run does not repeat that pass).
+                write!(
+                    formatter,
+                    "reload checked: generation {generation} keeps running until the switch; \
+                     would carry dynamic-neighbors={} nat44-udp-mappings={} nat44-tcp-sessions={} \
+                     nat44-icmp-mappings={} firewall-flows{}{}",
+                    carried.dynamic_neighbors,
+                    carried.nat44_udp_mappings,
+                    carried.nat44_tcp_sessions,
+                    carried.nat44_icmp_mappings,
+                    if carried.firewall_flows_upper_bound {
+                        "<="
+                    } else {
+                        "="
+                    },
+                    carried.firewall_flows,
+                )
+            }
         }
     }
 }
@@ -222,9 +280,9 @@ impl fmt::Display for ReloadOutcome {
 /// The publication result of the tick that carried a reload candidate.
 #[derive(Clone, Copy, Debug)]
 pub enum TickApply {
-    /// Committed; the commit's report (previous generation, flush), if it
-    /// matched the new generation.
-    Applied(Option<(NonZeroU64, ApplyFlushCounts)>),
+    /// Committed; the commit's report (previous generation, flush, carry),
+    /// if it matched the new generation.
+    Applied(Option<(NonZeroU64, ApplyFlushCounts, ApplyCarryCounts)>),
     Rejected(ApplyError),
     /// Neither (the backend deferred it).
     NotApplied,
@@ -627,11 +685,18 @@ impl Reloader {
                     .candidate
                     .as_ref()
                     .map(|candidate| active.check_successor(candidate));
-                if let Some(Err(error)) = check {
-                    return Some(self.failed("dry-run", apply_code(error), generation));
-                }
+                let checked = match check {
+                    Some(Err(error)) => {
+                        return Some(self.failed("dry-run", apply_code(error), generation));
+                    }
+                    Some(Ok(check)) => Some(ReloadOutcome::Checked {
+                        generation,
+                        carried: check.carried,
+                    }),
+                    None => None,
+                };
                 self.phase = Phase::Pending { ready, since: now };
-                None
+                checked
             }
         }
     }
@@ -681,9 +746,10 @@ impl Reloader {
                 }
                 self.counters.applied = self.counters.applied.saturating_add(1);
                 ReloadOutcome::Applied {
-                    previous: report.map(|(previous, _)| previous),
+                    previous: report.map(|(previous, _, _)| previous),
                     generation,
-                    flush: report.map(|(_, flush)| flush),
+                    flush: report.map(|(_, flush, _)| flush),
+                    carry: report.map(|(_, _, carry)| Box::new(carry)),
                     counts: ready.counts,
                 }
             }
@@ -747,5 +813,33 @@ pub fn apply_code(error: ApplyError) -> String {
     match error {
         ApplyError::RestartRequired(reason) => format!("RESTART_REQUIRED.{}", reason.code()),
         other => token(&other),
+    }
+}
+
+#[cfg(test)]
+mod checked_tests {
+    use std::num::NonZeroU64;
+
+    use super::ReloadOutcome;
+
+    /// Sec Nit: a re-evaluating dry run shows the firewall count as a bound.
+    #[test]
+    fn a_reevaluating_dry_run_prints_the_firewall_count_as_a_bound() {
+        let mut carried = ruster_control::CarriedCounts::default();
+        carried.firewall_flows = 7;
+        carried.firewall_flows_upper_bound = true;
+        let line = ReloadOutcome::Checked {
+            generation: NonZeroU64::new(3).unwrap(),
+            carried,
+        }
+        .to_string();
+        assert!(line.ends_with(" firewall-flows<=7"), "{line}");
+        carried.firewall_flows_upper_bound = false;
+        let line = ReloadOutcome::Checked {
+            generation: NonZeroU64::new(3).unwrap(),
+            carried,
+        }
+        .to_string();
+        assert!(line.ends_with(" firewall-flows=7"), "{line}");
     }
 }

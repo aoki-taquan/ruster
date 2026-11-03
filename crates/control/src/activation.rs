@@ -32,8 +32,31 @@
 //! 2. preflight of all five runtimes, holding all five exclusive permits at
 //!    once (resolution, ICMPv4 errors, NAT44 UDP, NAT44 TCP, firewall);
 //! 3. one commit point: the five permit commits and the candidate swap. Each
-//!    of these is infallible in the core API (slot fills, scalar stores, and
-//!    saturating counters only), so no partial application can be observed.
+//!    of these is infallible in the core API (slot fills, scalar stores,
+//!    bounded in-place re-evaluation, and saturating counters only), so no
+//!    partial application can be observed.
+//!
+//! What a commit does with live state is chosen per family by the
+//! successor's [`ReloadState`] (RELOAD-CARRY). `Flush` flushes everything and
+//! rotates every hash key. `Carry` keeps, with its hash key:
+//!
+//! - NAT44 UDP, TCP, and ICMP query mappings, peers, and sessions when the
+//!   successor keeps the realm (interfaces, public address), the port or
+//!   identifier pool, and the filtering mode; otherwise that family flushes
+//!   with a fresh key ([`ruster_core::StateCarryConflict`]). O(1).
+//! - Firewall flows; when the rules changed, every flow is re-evaluated
+//!   against the new rules and the ones they no longer admit are revoked,
+//!   within [`ruster_core::FIREWALL_CARRY_REEVALUATION_BUDGET`] rule tests
+//!   (a flush above it).
+//! - Learned ARP neighbors whose interface binding is unchanged, not
+//!   shadowed by a new static neighbor, and on-link when the ARP-031
+//!   hardening is on.
+//!
+//! Pending resolution work, queued ICMPv4 errors and their limiter, TCP
+//! unsolicited-SYN holds, staged fragmentation slots, and the IPv4 fragment
+//! association table (NAT-FRAG: its templates name the old egress and
+//! neighbor MACs; it is rekeyed with the successor's resolution key) always
+//! flush: they carry the old snapshot's authority and are short-lived.
 //!
 //! A failure at any stage before the commit point drops the already-acquired
 //! permits, which leaves every runtime byte unchanged, and keeps the old
@@ -194,8 +217,8 @@ use ruster_runtime::{
 };
 
 use crate::{
-    plan::{FlushCount, StateFlush, SuccessorCheck},
-    FullServiceStorageShape, RuntimeService, SuccessorError, ValidatedCandidate,
+    plan::{CarriedCounts, FlushCount, StateCarry, StateFlush, SuccessorCheck},
+    FullServiceStorageShape, ReloadState, RuntimeService, SuccessorError, ValidatedCandidate,
 };
 
 /// Typed, value-free failure to allocate one runtime table.
@@ -668,12 +691,13 @@ impl From<SuccessorError> for ApplyError {
     }
 }
 
-/// What one committed successor flushed in each runtime.
+/// What one committed successor flushed and carried in each runtime.
 ///
-/// Every runtime flushes publication-bound state on a new generation:
-/// resolution states/actions/learned neighbors/failure holds, the ICMPv4
-/// error limiter and queue, and all NAT44 UDP/TCP and firewall flow state
-/// (their hash keys rotate). Cumulative counters are preserved.
+/// Every runtime flushes the pending resolution and ICMPv4 error work. With
+/// [`ReloadState::Flush`] it also flushes learned neighbors, all NAT44 and
+/// firewall state, and every hash key rotates; with [`ReloadState::Carry`]
+/// each report's `outcome` and `*_carried` fields say what was kept.
+/// Cumulative counters are preserved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct ApplyReport {
@@ -734,14 +758,17 @@ struct LiveRuntimes<'storage> {
     fragment_tracking: Option<Ipv4FragmentTracker<'storage>>,
 }
 
-/// All exclusive permits of one successor, held at once.
-struct Permits<'runtime, 'storage> {
+/// All exclusive permits of one successor, held at once. `'rules` is the
+/// successor's borrow (the firewall re-evaluates against its rules).
+struct Permits<'runtime, 'storage, 'rules> {
     resolution: ResolutionPublicationPermit<'runtime, 'storage>,
     icmpv4_errors: Icmpv4ErrorPublicationPermit<'runtime, 'storage>,
     nat44_udp: Nat44UdpReconcilePermit<'runtime, 'storage>,
     nat44_tcp: Nat44TcpReconcilePermit<'runtime, 'storage>,
     nat44_icmp: Option<Nat44IcmpReconcilePermit<'runtime, 'storage>>,
-    firewall: FirewallReconcilePermit<'runtime, 'storage>,
+    firewall: FirewallReconcilePermit<'runtime, 'storage, 'rules>,
+    /// The successor carries state ([`ReloadState::Carry`]).
+    carry: bool,
 }
 
 impl<'storage> LiveRuntimes<'storage> {
@@ -751,12 +778,12 @@ impl<'storage> LiveRuntimes<'storage> {
     ///
     /// `fault` is a test seam evaluated after each stage succeeded and while
     /// that stage's permit (and every earlier one) is still held.
-    fn preflight<'runtime, F>(
+    fn preflight<'runtime, 'rules, F>(
         &'runtime mut self,
-        current: &ValidatedCandidate,
-        successor: &ValidatedCandidate,
+        current: &'rules ValidatedCandidate,
+        successor: &'rules ValidatedCandidate,
         fault: &mut F,
-    ) -> Result<Permits<'runtime, 'storage>, ApplyError>
+    ) -> Result<Permits<'runtime, 'storage, 'rules>, ApplyError>
     where
         F: FnMut(ApplyStage) -> Option<ApplyError>,
     {
@@ -764,6 +791,7 @@ impl<'storage> LiveRuntimes<'storage> {
         if let Some(error) = fault(ApplyStage::Successor) {
             return Err(error);
         }
+        let carry = successor.reload_state() == ReloadState::Carry;
         let authority = successor.authority();
         let resolution = self
             .resolution
@@ -779,17 +807,25 @@ impl<'storage> LiveRuntimes<'storage> {
         if let Some(error) = fault(ApplyStage::Icmpv4Errors) {
             return Err(error);
         }
-        let nat44_udp = self
-            .nat44_udp
-            .preflight_reconcile(authority.nat44_udp_config(), authority.nat44_udp_hash_key())
-            .map_err(ApplyError::Nat44Udp)?;
+        let (udp_config, udp_key) = (authority.nat44_udp_config(), authority.nat44_udp_hash_key());
+        let nat44_udp = if carry {
+            self.nat44_udp
+                .preflight_reconcile_carrying(udp_config, udp_key)
+        } else {
+            self.nat44_udp.preflight_reconcile(udp_config, udp_key)
+        }
+        .map_err(ApplyError::Nat44Udp)?;
         if let Some(error) = fault(ApplyStage::Nat44Udp) {
             return Err(error);
         }
-        let nat44_tcp = self
-            .nat44_tcp
-            .preflight_reconcile(authority.nat44_tcp_config(), authority.nat44_tcp_hash_key())
-            .map_err(ApplyError::Nat44Tcp)?;
+        let (tcp_config, tcp_key) = (authority.nat44_tcp_config(), authority.nat44_tcp_hash_key());
+        let nat44_tcp = if carry {
+            self.nat44_tcp
+                .preflight_reconcile_carrying(tcp_config, tcp_key)
+        } else {
+            self.nat44_tcp.preflight_reconcile(tcp_config, tcp_key)
+        }
+        .map_err(ApplyError::Nat44Tcp)?;
         if let Some(error) = fault(ApplyStage::Nat44Tcp) {
             return Err(error);
         }
@@ -804,9 +840,12 @@ impl<'storage> LiveRuntimes<'storage> {
         ) {
             (None, None) => None,
             (Some(runtime), Some((config, key))) => Some(
-                runtime
-                    .preflight_reconcile(config, key)
-                    .map_err(ApplyError::Nat44Icmp)?,
+                if carry {
+                    runtime.preflight_reconcile_carrying(config, key)
+                } else {
+                    runtime.preflight_reconcile(config, key)
+                }
+                .map_err(ApplyError::Nat44Icmp)?,
             ),
             (Some(_), None) | (None, Some(_)) => {
                 return Err(ApplyError::RestartRequired(RestartRequired::StorageShape));
@@ -815,10 +854,18 @@ impl<'storage> LiveRuntimes<'storage> {
         if let Some(error) = fault(ApplyStage::Nat44Icmp) {
             return Err(error);
         }
-        let firewall = self
-            .firewall
-            .preflight_reconcile(authority.firewall_config())
-            .map_err(ApplyError::Firewall)?;
+        let firewall = if carry {
+            self.firewall.preflight_reconcile_carrying(
+                current.authority().firewall_config(),
+                authority.firewall_config(),
+                current.authority().snapshot(),
+                authority.snapshot(),
+            )
+        } else {
+            self.firewall
+                .preflight_reconcile(authority.firewall_config())
+        }
+        .map_err(ApplyError::Firewall)?;
         if let Some(error) = fault(ApplyStage::Firewall) {
             return Err(error);
         }
@@ -829,6 +876,7 @@ impl<'storage> LiveRuntimes<'storage> {
             nat44_tcp,
             nat44_icmp,
             firewall,
+            carry,
         })
     }
 
@@ -1124,22 +1172,91 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
         successor: &ValidatedCandidate,
     ) -> Result<SuccessorCheck, ApplyError> {
         let flush = self.runtimes.flush_counts();
-        // The permits are discarded at the end of this statement without a
+        let current = self.candidate.authority().snapshot();
+        let next = successor.authority().snapshot();
+        // The permits are discarded at the end of this block without a
         // commit, which leaves every runtime unchanged.
-        let preview = self
-            .runtimes
-            .preflight(&self.candidate, successor, &mut |_| None)?
-            .resolution
-            .preview();
+        let (resolution, firewall, firewall_reevaluates, udp, tcp, icmp) = {
+            let permits = self
+                .runtimes
+                .preflight(&self.candidate, successor, &mut |_| None)?;
+            let resolution = if permits.carry {
+                permits.resolution.preview_carrying(&current, &next)
+            } else {
+                permits.resolution.preview()
+            };
+            (
+                resolution,
+                permits.firewall.preview(),
+                permits.firewall.reevaluates(),
+                permits.nat44_udp.outcome(),
+                permits.nat44_tcp.outcome(),
+                permits
+                    .nat44_icmp
+                    .as_ref()
+                    .map(Nat44IcmpReconcilePermit::outcome),
+            )
+        };
+        let kept = |outcome: ruster_core::StateCarryOutcome, live: FlushCount| {
+            if outcome.carried() {
+                (FlushCount::Exact(0), live)
+            } else {
+                (live, FlushCount::Exact(0))
+            }
+        };
+        let (udp_mappings, udp_mappings_kept) = kept(udp, flush.nat44_udp_mappings);
+        let (udp_peers, udp_peers_kept) = kept(udp, flush.nat44_udp_peers);
+        let (tcp_mappings, tcp_mappings_kept) = kept(tcp, flush.nat44_tcp_mappings);
+        let (tcp_sessions, tcp_sessions_kept) = kept(tcp, flush.nat44_tcp_sessions);
+        let icmp_outcome = icmp.unwrap_or_default();
+        let (icmp_mappings, icmp_mappings_kept) = kept(icmp_outcome, flush.nat44_icmp_mappings);
+        let (icmp_peers, icmp_peers_kept) = kept(icmp_outcome, flush.nat44_icmp_peers);
+        let exact = |count: FlushCount| match count {
+            FlushCount::Exact(count) => count,
+            FlushCount::All | FlushCount::Invalidated => 0,
+        };
         Ok(SuccessorCheck {
             previous_generation: self.candidate.generation(),
             generation: successor.generation(),
             flush: StateFlush {
-                resolution_states: FlushCount::Exact(preview.states_flushed),
-                resolution_actions: FlushCount::Exact(preview.actions_flushed),
-                dynamic_neighbors: FlushCount::Exact(preview.dynamic_neighbors_flushed),
-                failure_holds: FlushCount::Exact(preview.failure_holds_flushed),
+                resolution_states: FlushCount::Exact(resolution.states_flushed),
+                resolution_actions: FlushCount::Exact(resolution.actions_flushed),
+                dynamic_neighbors: FlushCount::Exact(resolution.dynamic_neighbors_flushed),
+                failure_holds: FlushCount::Exact(resolution.failure_holds_flushed),
+                nat44_udp_mappings: udp_mappings,
+                nat44_udp_peers: udp_peers,
+                nat44_tcp_mappings: tcp_mappings,
+                nat44_tcp_sessions: tcp_sessions,
+                nat44_icmp_mappings: icmp_mappings,
+                nat44_icmp_peers: icmp_peers,
+                // The re-evaluation runs only in the commit, so a dry run
+                // never stalls the worker with it a second time.
+                firewall_flows: if firewall_reevaluates {
+                    FlushCount::Invalidated
+                } else {
+                    FlushCount::Exact(firewall.states_flushed)
+                },
                 ..flush
+            },
+            carry: StateCarry {
+                mode: successor.reload_state(),
+                resolution: resolution.outcome,
+                nat44_udp: udp,
+                nat44_tcp: tcp,
+                nat44_icmp: icmp,
+                firewall: firewall.outcome,
+                firewall_reevaluated: firewall_reevaluates,
+            },
+            carried: CarriedCounts {
+                dynamic_neighbors: resolution.dynamic_neighbors_carried,
+                nat44_udp_mappings: exact(udp_mappings_kept),
+                nat44_udp_peers: exact(udp_peers_kept),
+                nat44_tcp_mappings: exact(tcp_mappings_kept),
+                nat44_tcp_sessions: exact(tcp_sessions_kept),
+                nat44_icmp_mappings: exact(icmp_mappings_kept),
+                nat44_icmp_peers: exact(icmp_peers_kept),
+                firewall_flows: firewall.states_carried,
+                firewall_flows_upper_bound: firewall_reevaluates,
             },
         })
     }
@@ -1163,20 +1280,30 @@ impl<'storage, I: PublicationQuiescence> ActivePublication<'storage, I> {
             nat44_tcp,
             nat44_icmp,
             firewall,
+            carry,
         } = self
             .runtimes
             .preflight(&self.candidate, &successor, &mut fault)?;
 
         let resolution_hash_key = successor.authority().resolution_hash_key();
         // Commit point. Nothing below can fail: every permit commit is a
-        // total core operation, the permits retain no borrow of `successor`,
-        // and the boxed forwarding/firewall owners keep their addresses when
-        // the candidate is moved into place, so the firewall binding stays
-        // equal to the moved candidate's config.
+        // total core operation, the firewall permit's borrow of the
+        // successor's rules ends with its commit, and the boxed
+        // forwarding/firewall owners keep their addresses when the candidate
+        // is moved into place, so the firewall binding stays equal to the
+        // moved candidate's config.
+        let resolution = if carry {
+            resolution.commit_carrying(
+                &self.candidate.authority().snapshot(),
+                &successor.authority().snapshot(),
+            )
+        } else {
+            resolution.commit_with_hash_key(resolution_hash_key)
+        };
         let report = ApplyReport {
             previous_generation: self.candidate.generation(),
             generation: successor.generation(),
-            resolution: resolution.commit_with_hash_key(resolution_hash_key),
+            resolution,
             icmpv4_errors: icmpv4_errors.commit_with_translated_limit_key(resolution_hash_key),
             nat44_udp: nat44_udp.commit(),
             nat44_tcp: nat44_tcp.commit(),
