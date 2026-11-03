@@ -25,7 +25,8 @@ use ruster_io_xdp::native_profile::{
 use crate::{
     AfPacketPortV1, AfPacketV1, AfXdpModeV1, AfXdpPortV1, BackendKindV1, BackendV1, ConfigV1,
     ExistingXdpProgramV1, FirewallActionV1, FirewallProtocolV1, Nat44FilteringV1,
-    Nat44Icmpv4ErrorsV1, Nat44TcpInboundRstV1, SourcePath, VersionedConfig, XdpAttachModeV1,
+    Nat44Icmpv4ErrorsV1, Nat44TcpInboundRstV1, ReloadStateV1, SourcePath, VersionedConfig,
+    XdpAttachModeV1,
 };
 
 /// Caller-selected cold-path bounds for runtime storage requested by V1.
@@ -1134,9 +1135,17 @@ pub struct ValidatedConfigV1 {
     fragmentation: ValidatedFragmentationV1,
     storage: RuntimeStorageShapeV1,
     backend: ValidatedBackendV1,
+    reload_state: ReloadStateV1,
 }
 
 impl ValidatedConfigV1 {
+    /// `[reload] state` ([`ReloadStateV1::Carry`] when absent): what an
+    /// applied reload to this document does with runtime state.
+    #[must_use]
+    pub const fn reload_state(&self) -> ReloadStateV1 {
+        self.reload_state
+    }
+
     #[must_use]
     pub fn interfaces(&self) -> &[InterfaceBindingV1] {
         &self.interfaces
@@ -2221,6 +2230,7 @@ fn validate_v1(
         },
         storage,
         backend,
+        reload_state: config.reload.unwrap_or_default().state,
     })
 }
 

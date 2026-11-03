@@ -17,11 +17,15 @@
 //!   the oracle's typed error and leaves generation, last apply report, every
 //!   NAT/firewall slot, and the forwarding behavior unchanged;
 //! - `check_successor` mutates nothing, agrees with the following apply, and
-//!   reports exact live flush counts; `ApplyPlan::between` lists exactly the
-//!   oracle's restart-required reasons;
+//!   reports exact live flush and carry counts; `ApplyPlan::between` lists
+//!   exactly the oracle's restart-required reasons;
 //! - an applied successor (including a rollback, which is a new generation)
-//!   flushes all NAT/firewall state, and its routes, firewall rules, and NAT
-//!   port range govern the next packets;
+//!   with `[reload] state = "flush"` flushes all NAT/firewall state; with the
+//!   default carry (RELOAD-CARRY) it keeps every NAT mapping and peer slot
+//!   byte for byte and every firewall flow, revokes exactly the flows its
+//!   rules deny (the UDP/53 flows when it adds the DNS deny rule), carried
+//!   flows keep translating replies and revoked ones never do, and its
+//!   routes, firewall rules, and NAT port range govern the next packets;
 //! - re-activation on the same storage refuses a different storage shape
 //!   and a generation that is not above the storage floor.
 
@@ -35,7 +39,8 @@ use ruster_control::{
     SuccessorError, ValidatedCandidate,
 };
 use ruster_core::{
-    FirewallHashKey, IfId, Ipv4Address, MonotonicMillis, Nat44TcpHashKey, Nat44UdpHashKey,
+    FirewallHashKey, FirewallStateSlot, IfId, Ipv4Address, MonotonicMillis, Nat44TcpHashKey,
+    Nat44UdpHashKey, Nat44UdpMappingSlot,
 };
 use ruster_io_sim::{FrameOrigin, SimIo};
 use ruster_runtime::{run_tick, PublicationOutcome, RxPhaseReport, TickBudgets, TickObserver};
@@ -44,6 +49,7 @@ use super::envelope::{CaseEnvelope, Expected, InvariantFlags, Target};
 use super::packets::{source_port, Proto, Segment, SYN};
 use super::router::{
     host, host_mac, remote, RouterParams, GATEWAY_MAC, LAN_MAC, PORT_FIRST, PUBLIC,
+    UDP_VARIANT_DENIED_PORT,
 };
 use super::targets::{CaseFailure, V1Rng};
 
@@ -51,7 +57,7 @@ pub const HEADER_LEN: usize = 12;
 pub const OP_LEN: usize = 2;
 pub const MAX_OPS: usize = 64;
 pub const MAX_PENDING: usize = 4;
-pub const VARIANTS: u8 = 12;
+pub const VARIANTS: u8 = 13;
 const TICK_MS: u64 = 10;
 type Forwarded = Vec<(IfId, Vec<u8>)>;
 type TickOutcome = PublicationOutcome<ApplyError, ruster_io_sim::SimPublicationQuiescenceError>;
@@ -113,6 +119,11 @@ fn variant(index: u8) -> Option<RouterParams> {
         },
         10 => RouterParams {
             include_nat: false,
+            ..base
+        },
+        11 => RouterParams {
+            deny_dns: true,
+            reload_flush: true,
             ..base
         },
         _ => return None,
@@ -287,6 +298,10 @@ pub struct PublicationCoverage {
     pub replies_translated: u64,
     pub flushed_replies_refused: u64,
     pub probes_filtered: u64,
+    /// Applies that carried NAT/firewall state (RELOAD-CARRY).
+    pub carried_applies: u64,
+    /// Carried flows revoked because the successor's rules deny them.
+    pub flows_revoked: u64,
 }
 
 impl PublicationCoverage {
@@ -310,6 +325,8 @@ impl PublicationCoverage {
                 other.flushed_replies_refused,
             ),
             (&mut self.probes_filtered, other.probes_filtered),
+            (&mut self.carried_applies, other.carried_applies),
+            (&mut self.flows_revoked, other.flows_revoked),
         ];
         for (total, value) in pairs {
             *total += value;
@@ -531,6 +548,51 @@ impl World<'_> {
         self.history.push(variant);
         self.flushed.append(&mut self.flows);
         Ok(())
+    }
+
+    /// Like [`Self::record_activation`] for a carrying apply: only the
+    /// flows that `params` denies stop (their firewall state is revoked).
+    fn record_carry(
+        &mut self,
+        generation: NonZeroU64,
+        variant: u8,
+        params: RouterParams,
+    ) -> Result<(), CaseFailure> {
+        let mut flows = std::mem::take(&mut self.flows);
+        // `self.flows` is empty here, so this flushes nothing.
+        self.record_activation(generation, variant)?;
+        let (revoked, kept): (Vec<_>, Vec<_>) = flows
+            .drain(..)
+            .partition(|flow| Self::denied(params, *flow));
+        self.flushed.extend(revoked);
+        self.flows = kept;
+        Ok(())
+    }
+
+    /// Whether `params`' rules deny the UDP flow `flow` (the variant DNS
+    /// deny rule; the always-denied port never has a flow).
+    fn denied(params: RouterParams, flow: ProbeFlow) -> bool {
+        params.deny_dns && flow.remote_port == UDP_VARIANT_DENIED_PORT
+    }
+
+    /// Live (not revoked) firewall flows of `slots` that `params` denies.
+    fn revoked_by(params: RouterParams, slots: &[FirewallStateSlot]) -> usize {
+        slots
+            .iter()
+            .filter(|slot| {
+                slot.is_occupied()
+                    && slot.config_generation() != 0
+                    && params.deny_dns
+                    && slot.responder_port() == UDP_VARIANT_DENIED_PORT
+            })
+            .count()
+    }
+
+    fn live_flows(slots: &[FirewallStateSlot]) -> usize {
+        slots
+            .iter()
+            .filter(|slot| slot.is_occupied() && slot.config_generation() != 0)
+            .count()
     }
 
     /// Restart-required reasons of `next` against the active document, in
@@ -760,16 +822,48 @@ impl World<'_> {
                     FlushCount::Exact(slots.iter().filter(|slot| occupied(**slot)).count())
                 }
                 let flush = check.flush;
-                if flush.nat44_udp_mappings
-                    != exact(&before.udp_mappings, |slot| slot.is_occupied())
-                    || flush.nat44_udp_peers != exact(&before.udp_peers, |slot| slot.is_occupied())
-                    || flush.nat44_tcp_mappings
-                        != exact(&before.tcp_mappings, |slot| slot.is_occupied())
-                    || flush.nat44_tcp_sessions
-                        != exact(&before.tcp_sessions, |slot| slot.is_occupied())
-                    || flush.firewall_flows != exact(&before.firewall, |slot| slot.is_occupied())
-                {
-                    return Err(self.fail("dry-run flush counts are not the live counts"));
+                if built.params.reload_flush {
+                    if flush.nat44_udp_mappings
+                        != exact(&before.udp_mappings, |slot| slot.is_occupied())
+                        || flush.nat44_udp_peers
+                            != exact(&before.udp_peers, |slot| slot.is_occupied())
+                        || flush.nat44_tcp_mappings
+                            != exact(&before.tcp_mappings, |slot| slot.is_occupied())
+                        || flush.nat44_tcp_sessions
+                            != exact(&before.tcp_sessions, |slot| slot.is_occupied())
+                        || flush.firewall_flows
+                            != exact(&before.firewall, |slot| slot.is_occupied())
+                    {
+                        return Err(self.fail("dry-run flush counts are not the live counts"));
+                    }
+                } else {
+                    let count = |slots: FlushCount| match slots {
+                        FlushCount::Exact(count) => count,
+                        FlushCount::All | FlushCount::Invalidated => usize::MAX,
+                    };
+                    let occupied = |slots: &[Nat44UdpMappingSlot]| {
+                        slots.iter().filter(|slot| slot.is_occupied()).count()
+                    };
+                    let revoked = Self::revoked_by(built.params, &before.firewall);
+                    let carried = check.carried;
+                    if [
+                        flush.nat44_udp_mappings,
+                        flush.nat44_udp_peers,
+                        flush.nat44_tcp_mappings,
+                        flush.nat44_tcp_sessions,
+                    ]
+                    .map(count)
+                        != [0; 4]
+                        || count(flush.firewall_flows) != revoked
+                        || carried.nat44_udp_mappings != occupied(&before.udp_mappings)
+                        || carried.firewall_flows + revoked != Self::live_flows(&before.firewall)
+                        || !check.carry.nat44_udp.carried()
+                        || !check.carry.firewall.carried()
+                    {
+                        return Err(self.fail(format!(
+                            "dry-run carry counts are not the live counts: {flush:?} {carried:?}"
+                        )));
+                    }
                 }
                 self.coverage.dry_run_ok += 1;
                 Ok(())
@@ -859,18 +953,50 @@ impl World<'_> {
                 {
                     return Err(self.fail("applied generation/report mismatch"));
                 }
-                if after.udp_mappings.iter().any(|slot| slot.is_occupied())
-                    || after.udp_peers.iter().any(|slot| slot.is_occupied())
-                    || after.tcp_mappings.iter().any(|slot| slot.is_occupied())
-                    || after.tcp_sessions.iter().any(|slot| slot.is_occupied())
-                    || after.firewall.iter().any(|slot| slot.is_occupied())
-                {
-                    return Err(self.fail("applied successor kept NAT/firewall state"));
+                if built.params.reload_flush {
+                    if after.udp_mappings.iter().any(|slot| slot.is_occupied())
+                        || after.udp_peers.iter().any(|slot| slot.is_occupied())
+                        || after.tcp_mappings.iter().any(|slot| slot.is_occupied())
+                        || after.tcp_sessions.iter().any(|slot| slot.is_occupied())
+                        || after.firewall.iter().any(|slot| slot.is_occupied())
+                    {
+                        return Err(self.fail("applied successor kept NAT/firewall state"));
+                    }
+                } else {
+                    let revoked = Self::revoked_by(built.params, &before.firewall);
+                    if after.udp_mappings != before.udp_mappings
+                        || after.udp_peers != before.udp_peers
+                        || after.tcp_mappings != before.tcp_mappings
+                        || after.tcp_sessions != before.tcp_sessions
+                        || after
+                            .firewall
+                            .iter()
+                            .filter(|slot| slot.is_occupied())
+                            .count()
+                            != before
+                                .firewall
+                                .iter()
+                                .filter(|slot| slot.is_occupied())
+                                .count()
+                        || report.firewall.states_revoked != revoked
+                        || Self::live_flows(&after.firewall) + revoked
+                            != Self::live_flows(&before.firewall)
+                        || !report.nat44_udp.outcome.carried()
+                        || !report.firewall.outcome.carried()
+                    {
+                        return Err(self.fail("carrying successor did not keep NAT/firewall state"));
+                    }
+                    self.coverage.carried_applies += 1;
+                    self.coverage.flows_revoked += revoked as u64;
                 }
                 self.active_params = built.params;
                 self.active_config = Some(built.config);
                 self.coverage.applied += 1;
-                self.record_activation(generation, built.variant)
+                if built.params.reload_flush {
+                    self.record_activation(generation, built.variant)
+                } else {
+                    self.record_carry(generation, built.variant, built.params)
+                }
             }
             (outcome, expected) => Err(self.fail(format!(
                 "apply of variant {} produced {outcome:?}, oracle expected {expected:?}",

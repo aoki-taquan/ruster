@@ -34,8 +34,8 @@ use ruster_core::{
     Nat44UdpReconcileReport, Nat44UdpRuntime, ObservableFields, PublicationQuiescenceDisposition,
     ResolutionCounters, ResolutionFailureDispatchError, ResolutionFailureTrace,
     ResolutionFailureTraceSink, ResolutionPublicationReport, ResolutionRuntime,
-    ResolutionTimerError, ResolutionTimerTrace, ResolutionTimerTraceSink, TableOccupancy,
-    TraceEvent, TraceSink,
+    ResolutionTimerError, ResolutionTimerTrace, ResolutionTimerTraceSink, StateCarryOutcome,
+    TableOccupancy, TraceEvent, TraceSink,
 };
 
 use crate::{
@@ -575,6 +575,133 @@ impl ApplyFlushCounts {
     }
 }
 
+/// State carried by one committed publication (RELOAD-CARRY), and what
+/// each runtime did with its state.
+///
+/// Built from the same core per-runtime publication reports as
+/// [`ApplyFlushCounts`]. Counts are zero for a family that flushed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ApplyCarryCounts {
+    pub dynamic_neighbors: u64,
+    pub nat44_udp_mappings: u64,
+    pub nat44_udp_peers: u64,
+    pub nat44_tcp_mappings: u64,
+    pub nat44_tcp_sessions: u64,
+    /// ICMP query NAT (N5); zero when ICMP query NAT is not configured.
+    pub nat44_icmp_mappings: u64,
+    pub nat44_icmp_peers: u64,
+    /// Firewall flows kept after re-evaluation.
+    pub firewall_flows: u64,
+    /// Firewall flows a carry revoked because the new rules deny them.
+    pub firewall_flows_revoked: u64,
+    /// Per-runtime outcome of the publication (not accumulated).
+    pub outcomes: ApplyCarryOutcomes,
+}
+
+/// What one committed publication did with each runtime's state.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ApplyCarryOutcomes {
+    pub resolution: StateCarryOutcome,
+    pub nat44_udp: StateCarryOutcome,
+    pub nat44_tcp: StateCarryOutcome,
+    /// `None` without ICMP query NAT (N5).
+    pub nat44_icmp: Option<StateCarryOutcome>,
+    pub firewall: StateCarryOutcome,
+}
+
+impl ApplyCarryCounts {
+    #[must_use]
+    pub fn from_reports(
+        resolution: ResolutionPublicationReport,
+        nat44_udp: Nat44UdpReconcileReport,
+        nat44_tcp: Nat44TcpReconcileReport,
+        firewall: FirewallReconcileReport,
+    ) -> Self {
+        let s = saturating_u64;
+        Self {
+            dynamic_neighbors: s(resolution.dynamic_neighbors_carried),
+            nat44_udp_mappings: s(nat44_udp.mappings_carried),
+            nat44_udp_peers: s(nat44_udp.peers_carried),
+            nat44_tcp_mappings: s(nat44_tcp.mappings_carried),
+            nat44_tcp_sessions: s(nat44_tcp.sessions_carried),
+            nat44_icmp_mappings: 0,
+            nat44_icmp_peers: 0,
+            firewall_flows: s(firewall.states_carried),
+            firewall_flows_revoked: s(firewall.states_revoked),
+            outcomes: ApplyCarryOutcomes {
+                resolution: resolution.outcome,
+                nat44_udp: nat44_udp.outcome,
+                nat44_tcp: nat44_tcp.outcome,
+                nat44_icmp: None,
+                firewall: firewall.outcome,
+            },
+        }
+    }
+
+    /// Adds the ICMP query NAT carry (N5) of a publication that has one.
+    #[must_use]
+    pub fn with_nat44_icmp(mut self, nat44_icmp: Option<Nat44IcmpReconcileReport>) -> Self {
+        if let Some(report) = nat44_icmp {
+            self.nat44_icmp_mappings = saturating_u64(report.mappings_carried);
+            self.nat44_icmp_peers = saturating_u64(report.peers_carried);
+            self.outcomes.nat44_icmp = Some(report.outcome);
+        }
+        self
+    }
+
+    fn visit_counts<V: FieldVisitor>(&self, section: &'static str, v: &mut V) {
+        visit_counts! {v, section, *self, ApplyCarryCounts {
+            dynamic_neighbors, nat44_udp_mappings, nat44_udp_peers, nat44_tcp_mappings,
+            nat44_tcp_sessions, nat44_icmp_mappings, nat44_icmp_peers, firewall_flows,
+            firewall_flows_revoked; outcomes
+        }}
+    }
+
+    fn visit_outcomes<V: FieldVisitor>(&self, section: &'static str, v: &mut V) {
+        let ApplyCarryOutcomes {
+            resolution,
+            nat44_udp,
+            nat44_tcp,
+            nat44_icmp,
+            firewall,
+        } = self.outcomes;
+        v.field(section, "resolution", FieldValue::Label(resolution.label()));
+        v.field(section, "nat44_udp", FieldValue::Label(nat44_udp.label()));
+        v.field(section, "nat44_tcp", FieldValue::Label(nat44_tcp.label()));
+        v.field(
+            section,
+            "nat44_icmp",
+            FieldValue::Label(nat44_icmp.map_or("none", StateCarryOutcome::label)),
+        );
+        v.field(section, "firewall", FieldValue::Label(firewall.label()));
+    }
+
+    fn accumulate(&mut self, other: &Self) {
+        let Self {
+            dynamic_neighbors,
+            nat44_udp_mappings,
+            nat44_udp_peers,
+            nat44_tcp_mappings,
+            nat44_tcp_sessions,
+            nat44_icmp_mappings,
+            nat44_icmp_peers,
+            firewall_flows,
+            firewall_flows_revoked,
+            outcomes: _,
+        } = *other;
+        let add = |total: &mut u64, value: u64| *total = total.saturating_add(value);
+        add(&mut self.dynamic_neighbors, dynamic_neighbors);
+        add(&mut self.nat44_udp_mappings, nat44_udp_mappings);
+        add(&mut self.nat44_udp_peers, nat44_udp_peers);
+        add(&mut self.nat44_tcp_mappings, nat44_tcp_mappings);
+        add(&mut self.nat44_tcp_sessions, nat44_tcp_sessions);
+        add(&mut self.nat44_icmp_mappings, nat44_icmp_mappings);
+        add(&mut self.nat44_icmp_peers, nat44_icmp_peers);
+        add(&mut self.firewall_flows, firewall_flows);
+        add(&mut self.firewall_flows_revoked, firewall_flows_revoked);
+    }
+}
+
 /// The most recent publication attempt seen by the observer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LastApply {
@@ -586,6 +713,8 @@ pub struct LastApply {
     pub active_generation: Option<NonZeroU64>,
     /// Flushed state, attached by [`TickObserver::record_apply_flush`].
     pub flush: Option<ApplyFlushCounts>,
+    /// Carried state, attached with the flush counts.
+    pub carry: Option<ApplyCarryCounts>,
 }
 
 /// One state table's occupancy as sampled at tick boundaries (OBS-015).
@@ -772,6 +901,8 @@ pub struct ObservabilitySnapshot {
     pub last_apply: Option<LastApply>,
     /// Cumulative state flushed by every recorded apply.
     pub flushed: ApplyFlushCounts,
+    /// Cumulative state carried by every recorded apply (outcomes unset).
+    pub carried: ApplyCarryCounts,
     /// State-table occupancy as of the last recorded sample.
     pub occupancy: OccupancyTotals,
 }
@@ -793,6 +924,7 @@ pub struct TickObserver {
     phase_skips: PhaseSkipCounters,
     last_apply: Option<LastApply>,
     flushed: ApplyFlushCounts,
+    carried: ApplyCarryCounts,
     occupancy: OccupancyTotals,
 }
 
@@ -874,6 +1006,7 @@ impl TickObserver {
                 at,
                 active_generation: generation,
                 flush: None,
+                carry: None,
             });
         }
 
@@ -1006,16 +1139,21 @@ impl TickObserver {
         }
     }
 
-    /// Attaches the flush counts of the apply committed in the last observed
-    /// tick. Returns `false` (and records nothing) unless the last attempt
-    /// was `Applied` at `generation` and has no flush counts yet, so a
-    /// duplicate call cannot double count.
+    /// Attaches the flush and carry counts of the apply committed in the
+    /// last observed tick. Returns `false` (and records nothing) unless the
+    /// last attempt was `Applied` at `generation` and has no flush counts
+    /// yet, so a duplicate call cannot double count.
     ///
     /// Contract: call this after every tick whose report was `Applied` and
     /// before observing the next tick that carries a publication outcome;
     /// otherwise that apply's flush is lost. A loss is never silent: it shows
     /// as `publications_applied > apply_flushes_recorded`.
-    pub fn record_apply_flush(&mut self, generation: NonZeroU64, flush: ApplyFlushCounts) -> bool {
+    pub fn record_apply_flush(
+        &mut self,
+        generation: NonZeroU64,
+        flush: ApplyFlushCounts,
+        carry: ApplyCarryCounts,
+    ) -> bool {
         match &mut self.last_apply {
             Some(last)
                 if last.outcome == ApplyOutcomeKind::Applied
@@ -1023,7 +1161,9 @@ impl TickObserver {
                     && last.flush.is_none() =>
             {
                 last.flush = Some(flush);
+                last.carry = Some(carry);
                 self.flushed.accumulate(&flush);
+                self.carried.accumulate(&carry);
                 incr(&mut self.totals.apply_flushes_recorded);
                 true
             }
@@ -1059,6 +1199,7 @@ impl TickObserver {
             phase_skips: self.phase_skips,
             last_apply: self.last_apply,
             flushed: self.flushed,
+            carried: self.carried,
             occupancy: self.occupancy,
         }
     }
@@ -1253,7 +1394,11 @@ impl ObservableFields for ObservabilitySnapshot {
         let flush = last.and_then(|last| last.flush);
         v.field("apply", "flush_recorded", FieldValue::Flag(flush.is_some()));
         flush.unwrap_or_default().visit("apply.flush", v);
+        let carry = last.and_then(|last| last.carry).unwrap_or_default();
+        carry.visit_counts("apply.carry", v);
+        carry.visit_outcomes("apply.state", v);
         self.flushed.visit("flushed", v);
+        self.carried.visit_counts("carried", v);
         self.occupancy.visit(v);
     }
 }
@@ -1371,7 +1516,7 @@ impl ObservableFields for ServiceCounters {
         visit_counts! {v, "firewall", self.firewall, FirewallCounters {
             allowed_new, allowed_established, denied_by_rule, denied_default, invalid_packets,
             state_full, clock_regressions, config_mismatches, reconciliations, states_expired,
-            state_probes, maintenance_steps, rule_evaluations,
+            state_probes, maintenance_steps, rule_evaluations, states_revoked,
         }}
         visit_counts! {v, "fragmentation", self.fragmentation, Ipv4FragmentationCounters {
             queued, fragmented, fragments, dropped_unavailable, dropped_frame_too_large,

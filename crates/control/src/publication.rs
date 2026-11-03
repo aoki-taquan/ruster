@@ -617,6 +617,38 @@ pub struct PublicationPlan {
     nat44_tcp: Option<Nat44TcpPublicationInput>,
     nat44_icmp: Option<Nat44IcmpPublicationInput>,
     firewall: Option<FirewallPublicationInput>,
+    reload_state: ReloadState,
+}
+
+/// What applying a candidate does with the live runtimes' state
+/// (RELOAD-CARRY).
+///
+/// The state family that a successor does not invalidate is carried with its
+/// hash key; the rest flushes with a fresh key. See
+/// [`ActivePublication`](crate::ActivePublication) for the per-family rules.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReloadState {
+    /// Keep NAT44 mappings/sessions, firewall flows (re-evaluated against
+    /// changed rules), and learned ARP neighbors whose meaning the
+    /// successor does not change. `[reload] state = "carry"`, the config
+    /// default.
+    Carry,
+    /// Flush every family and rotate every hash key, the behavior before
+    /// RELOAD-CARRY. `[reload] state = "flush"`, and the default of a
+    /// [`PublicationPlan`] built without
+    /// [`PublicationPlan::with_reload_state`].
+    Flush,
+}
+
+impl ReloadState {
+    /// Stable lowercase label (`carry`, `flush`).
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Carry => "carry",
+            Self::Flush => "flush",
+        }
+    }
 }
 
 impl PublicationPlan {
@@ -649,7 +681,16 @@ impl PublicationPlan {
             nat44_tcp: None,
             nat44_icmp: None,
             firewall: None,
+            reload_state: ReloadState::Flush,
         }
+    }
+
+    /// Sets what applying this candidate does with live state (default
+    /// [`ReloadState::Flush`]; the config bridge passes `[reload] state`).
+    #[must_use]
+    pub fn with_reload_state(mut self, reload_state: ReloadState) -> Self {
+        self.reload_state = reload_state;
+        self
     }
 
     /// Adds the optional ICMP query NAT (N5). Its storage must be in the
@@ -791,6 +832,7 @@ pub struct ValidatedCandidate {
     nat44_icmp: Option<(Nat44IcmpConfig, Nat44IcmpHashKey)>,
     firewall: ValidatedFirewallOwner,
     forwarding: ValidatedForwardingOwner,
+    reload_state: ReloadState,
 }
 
 impl ValidatedCandidate {
@@ -811,6 +853,7 @@ impl ValidatedCandidate {
             nat44_tcp,
             nat44_icmp,
             firewall,
+            reload_state,
         } = plan;
         let resolution_hash_key = resolution_hash_key.ok_or(
             PublicationCandidateError::MissingService(RuntimeService::Resolution),
@@ -914,12 +957,19 @@ impl ValidatedCandidate {
             nat44_icmp,
             firewall: firewall_owner,
             forwarding,
+            reload_state,
         })
     }
 
     #[must_use]
     pub const fn generation(&self) -> NonZeroU64 {
         self.generation
+    }
+
+    /// What applying this candidate does with live state.
+    #[must_use]
+    pub const fn reload_state(&self) -> ReloadState {
+        self.reload_state
     }
 
     #[must_use]

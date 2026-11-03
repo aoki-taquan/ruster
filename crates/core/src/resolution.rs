@@ -381,6 +381,11 @@ pub struct ResolutionPublicationReport {
     pub actions_flushed: usize,
     pub dynamic_neighbors_flushed: usize,
     pub failure_holds_flushed: usize,
+    /// Learned neighbors kept by a carrying commit (RELOAD-CARRY).
+    pub dynamic_neighbors_carried: usize,
+    /// `Carried` for a carrying commit, which still flushes pending
+    /// resolution states, actions, and failure holds.
+    pub outcome: crate::StateCarryOutcome,
 }
 
 /// Exclusive proof that old resolution authority can be flushed totally.
@@ -1213,6 +1218,8 @@ impl<'a> ResolutionRuntime<'a> {
             actions_flushed: self.action_queue.len(),
             dynamic_neighbors_flushed: self.dynamic_count,
             failure_holds_flushed: self.pending_failure_hold_count,
+            dynamic_neighbors_carried: 0,
+            outcome: crate::StateCarryOutcome::FlushRequested,
         };
         Ok(ResolutionPublicationPermit {
             runtime: self,
@@ -2834,21 +2841,117 @@ impl ResolutionPublicationPermit<'_, '_> {
 
     fn commit_keyed(self, hash_key: DirectoryHashKey) -> ResolutionPublicationReport {
         let runtime = self.runtime;
-        runtime.states.fill(ResolutionStateSlot::EMPTY);
-        runtime.actions.fill(ResolutionActionSlot::EMPTY);
+        runtime.flush_pending(self.next_runtime_epoch);
         runtime.dynamic_neighbors.fill(DynamicNeighborSlot::EMPTY);
-        runtime.failure_holds.fill(ResolutionFailureHoldSlot::EMPTY);
         runtime.hash_key = hash_key;
-        runtime.action_queue = SlotList::EMPTY;
-        runtime.request_order = SlotList::EMPTY;
         runtime.dynamic_order = SlotList::EMPTY;
         runtime.dynamic_count = 0;
-        runtime.pending_state_count = 0;
-        runtime.pending_failure_hold_count = 0;
-        runtime.poll_cursor = 0;
-        runtime.failure_cursor = 0;
-        runtime.publication_epoch = self.next_runtime_epoch;
         self.preview
+    }
+
+    /// The report [`Self::commit_carrying`] would return for the same
+    /// snapshots, computed without mutation.
+    #[must_use]
+    pub fn preview_carrying(
+        &self,
+        current: &crate::ForwardingSnapshot<'_>,
+        next: &crate::ForwardingSnapshot<'_>,
+    ) -> ResolutionPublicationReport {
+        let runtime = &*self.runtime;
+        let dropped = runtime
+            .dynamic_neighbors
+            .iter()
+            .filter(|slot| {
+                slot.entry.occupied && !dynamic_neighbor_carries(current, next, slot.entry)
+            })
+            .count();
+        ResolutionPublicationReport {
+            dynamic_neighbors_flushed: dropped,
+            dynamic_neighbors_carried: runtime.dynamic_count - dropped,
+            outcome: crate::StateCarryOutcome::Carried,
+            ..self.preview
+        }
+    }
+
+    /// Flushes pending resolution work like [`Self::commit_with_hash_key`]
+    /// but keeps the learned neighbors that `next` still binds the same way
+    /// as `current` (RELOAD-CARRY), with the index key.
+    ///
+    /// Pending states, queued ARP actions, and failure holds always flush:
+    /// they carry the old snapshot's authority and restart from the next
+    /// packet. A learned neighbor `(interface, target)` is kept only when
+    ///
+    /// - the interface's local IPv4 binding (the address ARP is answered
+    ///   and learned for) is the same in both snapshots,
+    /// - `next` has no static neighbor for it (static wins, as on
+    ///   [`ResolutionRuntime::reconcile_static`]), and
+    /// - when `next` enables the ARP-031 on-link sender hardening, the
+    ///   target is on the interface's link in `next` (an entry learned
+    ///   under the RFC 826 default does not outlive the switch).
+    ///
+    /// The MAC address cannot change (an interface MAC change is restart
+    /// required). O(learned neighbors) with O(1) snapshot lookups and index
+    /// removals; no allocation.
+    pub fn commit_carrying(
+        self,
+        current: &crate::ForwardingSnapshot<'_>,
+        next: &crate::ForwardingSnapshot<'_>,
+    ) -> ResolutionPublicationReport {
+        let runtime = self.runtime;
+        runtime.flush_pending(self.next_runtime_epoch);
+        let mut dropped = 0usize;
+        for index in 0..runtime.dynamic_neighbors.len() {
+            let entry = runtime.dynamic_neighbors[index].entry;
+            if entry.occupied && !dynamic_neighbor_carries(current, next, entry) {
+                runtime.remove_dynamic(index);
+                dropped += 1;
+            }
+        }
+        ResolutionPublicationReport {
+            dynamic_neighbors_flushed: dropped,
+            dynamic_neighbors_carried: runtime.dynamic_count,
+            outcome: crate::StateCarryOutcome::Carried,
+            ..self.preview
+        }
+    }
+}
+
+/// Whether the learned neighbor `entry` keeps its meaning from `current`
+/// to `next`; see [`ResolutionPublicationPermit::commit_carrying`].
+fn dynamic_neighbor_carries(
+    current: &crate::ForwardingSnapshot<'_>,
+    next: &crate::ForwardingSnapshot<'_>,
+    entry: DynamicEntry,
+) -> bool {
+    let binding = |snapshot: &crate::ForwardingSnapshot<'_>| {
+        snapshot
+            .local_binding_on(entry.interface)
+            .map(|binding| binding.address)
+    };
+    let bound = binding(current);
+    bound.is_some()
+        && bound == binding(next)
+        && next
+            .static_neighbor(entry.interface, entry.target)
+            .is_none()
+        && (!next.arp.require_on_link_sender()
+            || next.sender_on_link(entry.interface, entry.target))
+}
+
+impl ResolutionRuntime<'_> {
+    /// Empties every pending state, queued action, and failure hold and
+    /// their lists; learned neighbors and the index key are untouched.
+    fn flush_pending(&mut self, next_runtime_epoch: u128) {
+        self.states.fill(ResolutionStateSlot::EMPTY);
+        self.actions.fill(ResolutionActionSlot::EMPTY);
+        self.failure_holds.fill(ResolutionFailureHoldSlot::EMPTY);
+        self.action_queue = SlotList::EMPTY;
+        self.request_order = SlotList::EMPTY;
+        self.pending_state_count = 0;
+        self.pending_failure_hold_count = 0;
+        self.poll_cursor = 0;
+        self.failure_cursor = 0;
+        self.publication_epoch = next_runtime_epoch;
     }
 }
 
@@ -3493,6 +3596,10 @@ mod tests {
     use super::*;
     use crate::{ForwardingSnapshot, Interface, LocalIpv4Binding, Neighbor, Route};
 
+    // `resolution/tests/carry.rs`: learned neighbors carried across a
+    // publication (RELOAD-CARRY).
+    mod carry;
+
     const WAN: IfId = IfId(2);
     const SOURCE_IP: Ipv4Address = Ipv4Address::from_octets([192, 0, 2, 1]);
     const SOURCE_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 1]);
@@ -3771,6 +3878,7 @@ mod tests {
                 actions_flushed: 2,
                 dynamic_neighbors_flushed: 1,
                 failure_holds_flushed: 1,
+                ..ResolutionPublicationReport::default()
             }
         );
         drop(permit);
@@ -3786,6 +3894,7 @@ mod tests {
                 actions_flushed: 2,
                 dynamic_neighbors_flushed: 1,
                 failure_holds_flushed: 1,
+                ..ResolutionPublicationReport::default()
             }
         );
         assert!(runtime

@@ -21,9 +21,9 @@ pub use model::{
     Icmpv4ErrorGenerateV1, Icmpv4ErrorPolicyV1, Icmpv4ErrorTranslatedV1, Icmpv4ErrorV1,
     InterfaceV1, Ipv4OriginV1, Nat44FilteringV1, Nat44IcmpCapacityV1, Nat44IcmpV1,
     Nat44Icmpv4ErrorsV1, Nat44PortRangeV1, Nat44RealmV1, Nat44TcpCapacityV1, Nat44TcpInboundRstV1,
-    Nat44TcpV1, Nat44UdpCapacityV1, Nat44UdpV1, Nat44V1, NeighborV1, ResolutionCapacityV1,
-    ResolutionPolicyV1, ResolutionV1, RouteV1, TickBudgetV1, VersionedConfig, XdpAttachModeV1,
-    DEFAULT_FRAGMENTATION_DATAGRAMS, DEFAULT_TICK_GENERATED_FRAGMENTS,
+    Nat44TcpV1, Nat44UdpCapacityV1, Nat44UdpV1, Nat44V1, NeighborV1, ReloadStateV1, ReloadV1,
+    ResolutionCapacityV1, ResolutionPolicyV1, ResolutionV1, RouteV1, TickBudgetV1, VersionedConfig,
+    XdpAttachModeV1, DEFAULT_FRAGMENTATION_DATAGRAMS, DEFAULT_TICK_GENERATED_FRAGMENTS,
     DEFAULT_UNSOLICITED_SYN_HOLDS, MAX_FRAGMENTATION_DATAGRAMS, MAX_TICK_GENERATED_FRAGMENTS,
 };
 pub use parse::{

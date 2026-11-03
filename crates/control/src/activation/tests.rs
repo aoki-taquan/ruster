@@ -52,6 +52,10 @@ pub(crate) struct Variant {
     resolution_interval_ms: u32,
     icmp_interval_ms: u32,
     firewall_states: u32,
+    /// Appended `[reload]` table; empty for the default (`carry`).
+    reload: &'static str,
+    /// Action of rule 1 (LAN->WAN UDP).
+    udp_action: &'static str,
 }
 
 pub(crate) const V1: Variant = Variant {
@@ -60,11 +64,30 @@ pub(crate) const V1: Variant = Variant {
     resolution_interval_ms: 1000,
     icmp_interval_ms: 100,
     firewall_states: 16,
+    reload: "",
+    udp_action: "allow-stateful",
 };
 
 const V2: Variant = Variant {
     gateway: "198.51.100.2",
     ..V1
+};
+
+/// `[reload] state = "flush"`: the behavior before RELOAD-CARRY, which the
+/// PUB-006 flush tests pin.
+const FLUSH: &str = "\n[reload]\nstate = \"flush\"\n";
+const V1_FLUSH: Variant = Variant {
+    reload: FLUSH,
+    ..V1
+};
+const V2_FLUSH: Variant = Variant {
+    reload: FLUSH,
+    ..V2
+};
+/// V2 whose rule 1 denies LAN->WAN UDP: a carry revokes those flows.
+const V2_DENY_UDP: Variant = Variant {
+    udp_action: "deny",
+    ..V2
 };
 
 pub(crate) fn config_text(variant: &Variant) -> String {
@@ -174,7 +197,7 @@ egress = "wan"
 source = "192.0.2.0/24"
 destination = "0.0.0.0/0"
 protocol = "udp"
-action = "allow-stateful"
+action = "{udp_action}"
 
 [firewall.rules.source-ports]
 first = 0
@@ -217,7 +240,9 @@ last = 65535
 [firewall.rules.destination-ports]
 first = 0
 last = 65535
-"#,
+{reload}"#,
+        reload = variant.reload,
+        udp_action = variant.udp_action,
         gateway = variant.gateway,
         wan_mac = variant.wan_mac,
         resolution_interval = variant.resolution_interval_ms,
@@ -631,7 +656,9 @@ fn failure_at_every_apply_stage_leaves_live_runtimes_unchanged() {
     let mut io = SimIo::new();
     let live = populate(&mut active, &mut io);
 
-    for stage in [
+    // Every stage, for a carrying successor, a carrying successor whose
+    // changed rules re-evaluate flows (RELOAD-CARRY), and a flushing one.
+    let stages = [
         ApplyStage::Successor,
         ApplyStage::Resolution,
         ApplyStage::Icmpv4Errors,
@@ -639,10 +666,15 @@ fn failure_at_every_apply_stage_leaves_live_runtimes_unchanged() {
         ApplyStage::Nat44Tcp,
         ApplyStage::Nat44Icmp,
         ApplyStage::Firewall,
-    ] {
+    ];
+    let successors = [&V2, &V2_DENY_UDP, &V2_FLUSH];
+    for (stage, successor) in stages
+        .into_iter()
+        .flat_map(|stage| successors.map(move |successor| (stage, successor)))
+    {
         let before = observe(&active);
         let mut reached = Vec::new();
-        let result = active.apply_with(candidate(&V2, 2), |at| {
+        let result = active.apply_with(candidate(successor, 2), |at| {
             reached.push(at);
             (at == stage).then(|| injected(stage))
         });
@@ -777,7 +809,7 @@ fn natural_successor_rejections_are_typed_and_leave_state_unchanged() {
 
 #[test]
 fn run_tick_applies_successor_at_tick_boundary_with_reconcile_semantics() {
-    let first = candidate(&V1, 1);
+    let first = candidate(&V1_FLUSH, 1);
     let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
     let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
     let mut io = SimIo::new();
@@ -786,7 +818,7 @@ fn run_tick_applies_successor_at_tick_boundary_with_reconcile_semantics() {
 
     // A rejected candidate continues the old generation in the same tick.
     io.inject(LAN, lan_udp(5_000, REMOTE, 64));
-    let report = tick(&mut active, &mut io, 1_010, Some(candidate(&V2, 1)));
+    let report = tick(&mut active, &mut io, 1_010, Some(candidate(&V2_FLUSH, 1)));
     assert_eq!(
         report.publication,
         PublicationOutcome::Rejected(ApplyError::Successor(
@@ -802,7 +834,7 @@ fn run_tick_applies_successor_at_tick_boundary_with_reconcile_semantics() {
     io.inject(LAN, lan_udp(5_000, REMOTE, 64));
     tick(&mut active, &mut io, 1_011, None);
     assert_eq!(io.pending_tx(), 1);
-    let report = tick(&mut active, &mut io, 1_012, Some(candidate(&V2, 2)));
+    let report = tick(&mut active, &mut io, 1_012, Some(candidate(&V2_FLUSH, 2)));
     assert!(matches!(
         report.publication,
         PublicationOutcome::Deferred {
@@ -818,7 +850,7 @@ fn run_tick_applies_successor_at_tick_boundary_with_reconcile_semantics() {
     // new route.
     io.inject(WAN, wan_udp_reply(live.public_udp_port));
     io.inject(LAN, lan_udp(5_000, REMOTE, 64));
-    let report = tick(&mut active, &mut io, 1_020, Some(candidate(&V2, 2)));
+    let report = tick(&mut active, &mut io, 1_020, Some(candidate(&V2_FLUSH, 2)));
     assert_eq!(report.publication, PublicationOutcome::Applied);
     assert_eq!(active.generation().get(), 2);
     let sent = drain(&mut io);
@@ -858,7 +890,7 @@ fn run_tick_applies_successor_at_tick_boundary_with_reconcile_semantics() {
     assert!(observe(&active).bindings.iter().all(|matches| *matches));
     assert!(!active
         .icmpv4_errors()
-        .translated_limit_key_matches(candidate(&V1, 1).authority().resolution_hash_key()));
+        .translated_limit_key_matches(candidate(&V1_FLUSH, 1).authority().resolution_hash_key()));
     assert_eq!(occupied(active.nat44_tcp().mappings()), 0);
     assert_eq!(occupied(active.nat44_udp().mappings()), 1, "fresh mapping");
     assert!(active.nat44_udp().counters().reconciliations >= 1);
@@ -926,7 +958,7 @@ fn check_successor_is_a_side_effect_free_dry_run_that_predicts_apply() {
         assert!(ActivePublication::<SimIo>::new(&mut storage, candidate(&V1, 2)).is_ok());
     }
 
-    let first = candidate(&V1, 1);
+    let first = candidate(&V1_FLUSH, 1);
     let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
     let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
     let mut io = SimIo::new();
@@ -956,7 +988,7 @@ fn check_successor_is_a_side_effect_free_dry_run_that_predicts_apply() {
 
     // Repeated successful dry-runs hold and drop all five permits without
     // committing anything.
-    let successor = candidate(&V2, 2);
+    let successor = candidate(&V2_FLUSH, 2);
     let check = active.check_successor(&successor).expect("dry-run");
     for _ in 0..64 {
         assert_eq!(active.check_successor(&successor), Ok(check));
@@ -1148,11 +1180,11 @@ fn backend_only_plan_for_active_is_never_live_applicable() {
 
 #[test]
 fn rollback_reapplies_old_document_as_new_generation_with_new_keys() {
-    use crate::plan::tests::{config, ROUTE_CHANGE};
+    use crate::plan::tests::{config, FLUSH_MODE, ROUTE_CHANGE};
     use crate::{ApplyPlan, PublicationSequencer};
 
-    let a = config(&[]);
-    let b = config(&[ROUTE_CHANGE]);
+    let a = config(&[FLUSH_MODE]);
+    let b = config(&[ROUTE_CHANGE, FLUSH_MODE]);
     let mut sequencer = PublicationSequencer::new(SimDeterministicKeySource::new(SEED));
     let first = sequencer.candidate(&a).unwrap();
     let keys = |active: &ActivePublication<'_, SimIo>| {
@@ -1226,4 +1258,228 @@ fn storage_reactivation_requires_generation_above_every_served_one() {
     assert_eq!(active.generation().get(), 8);
     drop(active);
     assert_eq!(storage.generation_floor().map(NonZeroU64::get), Some(8));
+}
+
+/// Counts the firewall flows of `slots` with IPv4 protocol `protocol`.
+fn flows(slots: &[FirewallStateSlot], protocol: ruster_core::FirewallProtocol) -> usize {
+    slots
+        .iter()
+        .filter(|slot| slot.is_occupied() && slot.protocol() == protocol)
+        .count()
+}
+
+/// RELOAD-CARRY: a route change (V1 -> V2, the default `carry`) keeps the
+/// UDP and TCP mappings, the firewall flows, and the learned neighbor with
+/// their keys, so established flows keep working across the apply; pending
+/// resolution and ICMPv4 error work still flushes, and the dry run predicts
+/// exactly what the apply does.
+#[test]
+fn carry_keeps_live_flows_and_learned_neighbors_across_a_route_reload() {
+    use ruster_core::StateCarryOutcome::Carried;
+
+    let first = candidate(&V1, 1);
+    let old_keys = (
+        first.authority().nat44_udp_hash_key(),
+        first.authority().nat44_tcp_hash_key(),
+    );
+    let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
+    let mut io = SimIo::new();
+    let live = populate(&mut active, &mut io);
+    let before = observe(&active);
+
+    let successor = candidate(&V2, 2);
+    let check = active.check_successor(&successor).expect("dry run");
+    assert!(observe(&active) == before, "the dry run changed state");
+    let report = tick(&mut active, &mut io, 1_020, Some(successor));
+    assert_eq!(report.publication, PublicationOutcome::Applied);
+    let applied = active.last_apply().expect("apply report");
+    let outcomes = (
+        applied.resolution.outcome,
+        applied.nat44_udp.outcome,
+        applied.nat44_tcp.outcome,
+        applied.firewall.outcome,
+    );
+    assert_eq!(outcomes, (Carried, Carried, Carried, Carried));
+    assert_eq!(applied.nat44_icmp, None);
+    assert_eq!(
+        (
+            applied.nat44_udp.mappings_flushed,
+            applied.nat44_udp.mappings_carried
+        ),
+        (0, occupied(&before.udp.1))
+    );
+    assert_eq!(applied.nat44_udp.peers_carried, occupied(&before.udp.2));
+    assert_eq!(
+        (
+            applied.nat44_tcp.mappings_carried,
+            applied.nat44_tcp.sessions_carried
+        ),
+        (1, occupied(&before.tcp.2))
+    );
+    assert_eq!(
+        (
+            applied.firewall.states_flushed,
+            applied.firewall.states_carried,
+            applied.firewall.states_revoked
+        ),
+        (0, occupied(&before.firewall.1), 0)
+    );
+    assert_eq!(
+        (
+            applied.resolution.dynamic_neighbors_carried,
+            applied.resolution.dynamic_neighbors_flushed
+        ),
+        (1, 0)
+    );
+    assert_eq!(
+        applied.resolution.actions_flushed,
+        before.resolution_occupancy[0]
+    );
+    assert_eq!(applied.icmpv4_errors.actions_flushed, before.icmpv4.1);
+
+    // The dry run predicted the flush, the carry, and every outcome.
+    let flush = check.flush;
+    assert_eq!(
+        [
+            flush.dynamic_neighbors,
+            flush.resolution_actions,
+            flush.nat44_udp_mappings,
+            flush.nat44_tcp_sessions,
+            flush.firewall_flows,
+        ],
+        [0, applied.resolution.actions_flushed, 0, 0, 0].map(exact)
+    );
+    assert_eq!(
+        [
+            check.carried.dynamic_neighbors,
+            check.carried.nat44_udp_mappings,
+            check.carried.nat44_udp_peers,
+            check.carried.nat44_tcp_mappings,
+            check.carried.nat44_tcp_sessions,
+            check.carried.firewall_flows,
+        ],
+        [
+            applied.resolution.dynamic_neighbors_carried,
+            applied.nat44_udp.mappings_carried,
+            applied.nat44_udp.peers_carried,
+            applied.nat44_tcp.mappings_carried,
+            applied.nat44_tcp.sessions_carried,
+            applied.firewall.states_carried,
+        ]
+    );
+    assert_eq!(
+        (
+            check.carry.mode,
+            check.carry.nat44_udp,
+            check.carry.firewall,
+            check.carry.firewall_reevaluated
+        ),
+        (crate::ReloadState::Carry, Carried, Carried, false)
+    );
+
+    // The NAT runtimes kept their secret keys (the new candidate's keys
+    // stay unused) and are bound to the new configuration.
+    let authority = active.candidate.authority();
+    assert!(active
+        .nat44_udp()
+        .publication_binding_matches(authority.nat44_udp_config(), old_keys.0));
+    assert!(active
+        .nat44_tcp()
+        .publication_binding_matches(authority.nat44_tcp_config(), old_keys.1));
+    assert!(active
+        .firewall()
+        .config_matches(&authority.firewall_config()));
+
+    // Established flows keep working: the UDP reply and the TCP SYN-ACK to
+    // the pre-reload mappings are translated to the host.
+    assert!(reply_reaches_host(
+        &mut active,
+        &mut io,
+        1_021,
+        live.public_udp_port
+    ));
+    io.inject(WAN, wan_tcp_syn_ack(live.public_tcp_port));
+    tick(&mut active, &mut io, 1_022, None);
+    let sent = drain(&mut io);
+    assert!(
+        sent.iter().any(|frame| frame.egress == LAN
+            && frame.bytes[23] == 6
+            && frame.bytes[30..34] == HOST
+            && frame.bytes[36..38] == 6_000_u16.to_be_bytes()),
+        "the carried TCP session translates its reply"
+    );
+    // The learned LAN neighbor is used without a new ARP request.
+    let queued = active.resolution().counters().queued;
+    io.inject(
+        LAN,
+        udp((LAN_MAC, HOST_MAC), (HOST, 7_000), (LEARNED_HOST, 9), 64),
+    );
+    tick(&mut active, &mut io, 1_023, None);
+    let sent = drain(&mut io);
+    assert_eq!(
+        (sent.len(), sent[0].egress, &sent[0].bytes[0..6]),
+        (1, LAN, &LEARNED_MAC[..])
+    );
+    assert_eq!(active.resolution().counters().queued, queued);
+    // The outbound flow keeps its public port and takes the new route.
+    assert_eq!(
+        forward_once(&mut active, &mut io, 1_024, 5_000),
+        (WAN, GATEWAY_B_MAC, live.public_udp_port)
+    );
+}
+
+/// RELOAD-CARRY, fail closed: a carrying successor whose rules now deny
+/// LAN->WAN UDP revokes exactly the UDP flows at the apply, so no packet of
+/// them passes afterwards, while the TCP flow it still admits continues.
+#[test]
+fn carry_revokes_the_flows_the_new_rules_deny() {
+    use ruster_core::FirewallProtocol::{Tcp, Udp};
+
+    let first = candidate(&V1, 1);
+    let mut storage = FullServiceStorage::new(first.storage_shape()).unwrap();
+    let mut active = ActivePublication::<SimIo>::new(&mut storage, first).unwrap();
+    let mut io = SimIo::new();
+    let live = populate(&mut active, &mut io);
+    let before = observe(&active);
+    let udp_flows = flows(&before.firewall.1, Udp);
+    let tcp_flows = flows(&before.firewall.1, Tcp);
+    assert!(udp_flows >= 1 && tcp_flows == 1);
+
+    let successor = candidate(&V2_DENY_UDP, 2);
+    let check = active.check_successor(&successor).expect("dry run");
+    assert_eq!(check.flush.firewall_flows, exact(udp_flows));
+    assert_eq!(check.carried.firewall_flows, tcp_flows);
+    assert!(check.carry.firewall_reevaluated);
+    let report = tick(&mut active, &mut io, 1_020, Some(successor));
+    assert_eq!(report.publication, PublicationOutcome::Applied);
+    let applied = active.last_apply().unwrap();
+    assert_eq!(
+        (
+            applied.firewall.states_revoked,
+            applied.firewall.states_carried
+        ),
+        (udp_flows, tcp_flows)
+    );
+    assert_eq!(
+        active.firewall().counters().states_revoked,
+        udp_flows as u64
+    );
+    // The UDP NAT mapping itself is carried, but the firewall no longer
+    // admits its reply, nor new outbound UDP.
+    assert!(!reply_reaches_host(
+        &mut active,
+        &mut io,
+        1_021,
+        live.public_udp_port
+    ));
+    io.inject(LAN, lan_udp(5_000, REMOTE, 64));
+    tick(&mut active, &mut io, 1_022, None);
+    assert!(drain(&mut io).is_empty(), "new UDP is denied too");
+    // The TCP flow, still admitted by rule 2, continues.
+    io.inject(WAN, wan_tcp_syn_ack(live.public_tcp_port));
+    tick(&mut active, &mut io, 1_023, None);
+    assert!(drain(&mut io)
+        .iter()
+        .any(|frame| frame.egress == LAN && frame.bytes[23] == 6));
 }

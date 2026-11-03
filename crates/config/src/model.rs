@@ -35,6 +35,31 @@ pub struct ConfigV1 {
     pub fragmentation: Option<FragmentationV1>,
     /// Packet backend; absent means [`BackendKindV1::Sim`].
     pub backend: Option<BackendV1>,
+    /// What an applied reload does with runtime state; absent means
+    /// [`ReloadStateV1::Carry`].
+    pub reload: Option<ReloadV1>,
+}
+
+/// Reload behavior (`[reload]`, RELOAD-CARRY). Read from the document being
+/// applied, so a reload can switch it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct ReloadV1 {
+    #[serde(default)]
+    pub state: ReloadStateV1,
+}
+
+/// `[reload] state`: whether an applied reload keeps NAT44 mappings and
+/// sessions, firewall flows, and learned ARP neighbors that the new
+/// document does not invalidate (`carry`, the default), or flushes all of
+/// them and rotates every hash key (`flush`, the behavior before
+/// RELOAD-CARRY).
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReloadStateV1 {
+    #[default]
+    Carry,
+    Flush,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]

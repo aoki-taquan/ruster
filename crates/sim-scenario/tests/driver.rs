@@ -466,7 +466,7 @@ generation = 3
         "{\"event\":\"apply\",\"step\":0,\"at_ms\":0,\"config\":\"router-missing-nat.toml\",\
          \"outcome\":\"rejected\",\"reason\":\"invalid\",\"stage\":\"bridge\",\
          \"code\":\"MISSING_SERVICE_NAT44_UDP\",\"candidate_generation\":2,\"generation\":1,\
-         \"flush\":null}"
+         \"flush\":null,\"carry\":null}"
     );
     assert!(lines[2].starts_with("{\"event\":\"tick\",\"step\":1,"));
     assert!(lines[3].contains("\"candidate_generation\":3,\"generation\":3"));
@@ -569,7 +569,7 @@ generation = 2
         "{\"event\":\"apply\",\"step\":0,\"at_ms\":0,\"config\":\"router-af-xdp.toml\",\
          \"outcome\":\"rejected\",\"reason\":\"invalid\",\"stage\":\"backend\",\
          \"code\":\"UNSUPPORTED_BACKEND\",\"candidate_generation\":null,\"generation\":1,\
-         \"flush\":null}"
+         \"flush\":null,\"carry\":null}"
     );
     let _ = fs::remove_dir_all(&dir);
 }

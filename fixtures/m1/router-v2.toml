@@ -178,3 +178,10 @@ resolution-timer-scans = 16
 failure-dispatch-scans = 16
 generated-arp = 8
 generated-icmpv4 = 8
+
+# Reload behavior (RELOAD-CARRY). The mode of the document being applied
+# decides. v2 pins the M1 behavior, "flush": applying it flushes learned ARP
+# neighbors and every NAT44/firewall state and rotates every hash key. v1
+# omits the table, so the rollback to v1 uses the default "carry".
+[reload]
+state = "flush"

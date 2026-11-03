@@ -72,6 +72,8 @@ pub struct RouterParams {
     pub wan_mac_last: u8,
     pub include_nat: bool,
     pub offlink_route: bool,
+    /// `[reload] state = "flush"` instead of the default carry.
+    pub reload_flush: bool,
 }
 
 impl RouterParams {
@@ -89,6 +91,7 @@ impl RouterParams {
         wan_mac_last: 0x02,
         include_nat: true,
         offlink_route: false,
+        reload_flush: false,
     };
 
     pub fn port_last(self) -> u16 {
@@ -193,6 +196,9 @@ impl RouterParams {
             "[tick]\nrx = 32\nresolution-timer-scans = 16\nfailure-dispatch-scans = 16\n\
              generated-arp = 8\ngenerated-icmpv4 = 8\n",
         );
+        if self.reload_flush {
+            out.push_str("\n[reload]\nstate = \"flush\"\n");
+        }
         out
     }
 

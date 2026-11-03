@@ -164,6 +164,17 @@ fn a_reload_applies_at_a_tick_boundary_and_changes_the_traffic_outcome() {
         "{}",
         outcome.err
     );
+    // RELOAD-CARRY: the default mode carries every family of an Echo switch
+    // reload, and the line says so per family.
+    assert!(
+        outcome.err.contains(
+            "; carried dynamic-neighbors=0 nat44-udp-mappings=0 nat44-tcp-sessions=0 \
+             nat44-icmp-mappings=0 firewall-flows=0 firewall-revoked=0; state arp=carried \
+             nat44-udp=carried nat44-tcp=carried nat44-icmp=none firewall=carried\n"
+        ),
+        "{}",
+        outcome.err
+    );
     // The first echo was answered under generation 1, the second dropped
     // under generation 2 without a restart.
     let out = &outcome.out;

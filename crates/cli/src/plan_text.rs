@@ -10,7 +10,9 @@
 //!   <kind> <+|-|~> <rendered item>[ -> <rendered item>]
 //!   (backend changes last: `backend ~ sim -> af-xdp`, `backend-port + ...`)
 //! expected-flush:
-//!   <counter> all|<n>
+//!   <counter> all|<n>|invalidated
+//! state: carry|flush|restart
+//!   <family> carried|flushed[:<reason>][ reevaluate]
 //! ```
 //!
 //! Interfaces are written as `if<id>`. No allocator seed or hash key is part
@@ -383,6 +385,9 @@ pub fn render(plan: &ApplyPlan) -> String {
         lines.push(format!("nat44-icmp ~ {} -> {}", switch(old), switch(new)));
     }
     nat(&mut lines, "nat44-icmp", plan.nat44_icmp());
+    if let Some(Delta { old, new }) = plan.reload_state() {
+        lines.push(format!("reload-state ~ {} -> {}", old.label(), new.label()));
+    }
     backend(&mut lines, plan.backend());
 
     let mut text = String::new();
@@ -414,8 +419,35 @@ pub fn render(plan: &ApplyPlan) -> String {
         let _ = match count {
             FlushCount::All => writeln!(text, "  {name} all"),
             FlushCount::Exact(count) => writeln!(text, "  {name} {count}"),
+            FlushCount::Invalidated => writeln!(text, "  {name} invalidated"),
         };
     }
+    let carry = plan.carry();
+    let _ = writeln!(
+        text,
+        "state: {}",
+        if plan.requires_restart() {
+            "restart"
+        } else {
+            carry.mode.label()
+        }
+    );
+    let _ = writeln!(text, "  arp {}", carry.resolution.label());
+    let _ = writeln!(text, "  nat44-udp {}", carry.nat44_udp.label());
+    let _ = writeln!(text, "  nat44-tcp {}", carry.nat44_tcp.label());
+    if let Some(icmp) = carry.nat44_icmp {
+        let _ = writeln!(text, "  nat44-icmp {}", icmp.label());
+    }
+    let _ = writeln!(
+        text,
+        "  firewall {}{}",
+        carry.firewall.label(),
+        if carry.firewall_reevaluated {
+            " reevaluate"
+        } else {
+            ""
+        }
+    );
     text
 }
 

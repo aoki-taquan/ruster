@@ -3,7 +3,9 @@ use std::num::NonZeroU64;
 use ruster_config::{
     parse, validate, AfXdpModeV1, BackendKindV1, ValidatedConfig, ValidatedConfigV1,
 };
-use ruster_core::{FirewallAction, IfId, Ipv4Address, MacAddress};
+use ruster_core::{
+    FirewallAction, IfId, Ipv4Address, MacAddress, StateCarryConflict, StateCarryOutcome,
+};
 
 use super::{
     ApplyPlan, Change, Delta, FlushCount, NatPortRange, NatRealm, PlanError, PlanSide,
@@ -12,7 +14,7 @@ use super::{
 use crate::{
     activation::tests::{config_text, LIMITS, SEED, V1},
     ConfigBridgeError, KeySourceError, KeySourceKind, PublicationKeySource, PublicationKeys,
-    RestartRequired, RuntimeService, SimDeterministicKeySource, ValidatedCandidate,
+    ReloadState, RestartRequired, RuntimeService, SimDeterministicKeySource, ValidatedCandidate,
 };
 
 /// The S2 fixture document with exact textual replacements applied.
@@ -117,15 +119,91 @@ fn only(plan: &ApplyPlan, aspects: &[&str]) {
     for (name, is_present) in present {
         assert_eq!(is_present, aspects.contains(&name), "aspect {name}");
     }
-    assert_eq!(plan.flush(), StateFlush::ALL);
+    // Pending resolution and ICMPv4 error work always flushes; the other
+    // families follow the plan's carry expectation.
+    let flush = plan.flush();
+    for pending in [
+        flush.resolution_states,
+        flush.resolution_actions,
+        flush.failure_holds,
+        flush.icmpv4_error_states,
+        flush.icmpv4_error_actions,
+    ] {
+        assert_eq!(pending, FlushCount::All);
+    }
+    if plan.carry().mode == ReloadState::Flush {
+        assert_eq!(flush, StateFlush::ALL);
+    }
     assert_eq!(plan.dry_run(), None);
 }
 
+/// `[reload] state = "flush"` appended to a document.
+pub(crate) const FLUSH_MODE: (&str, &str) = (
+    "[resolution.policy]",
+    "[reload]\nstate = \"flush\"\n\n[resolution.policy]",
+);
+
 #[test]
-fn identical_documents_plan_no_change_but_still_flush_everything() {
+fn identical_documents_plan_no_change_and_carry_every_family() {
     let plan = plan(&[]);
     only(&plan, &[]);
-    assert_eq!(plan.flush().nat44_udp_mappings, FlushCount::All);
+    let carry = plan.carry();
+    assert_eq!(carry.mode, ReloadState::Carry);
+    for outcome in [
+        carry.resolution,
+        carry.nat44_udp,
+        carry.nat44_tcp,
+        carry.firewall,
+    ] {
+        assert_eq!(outcome, StateCarryOutcome::Carried);
+    }
+    assert_eq!(carry.nat44_icmp, None);
+    assert!(!carry.firewall_reevaluated);
+    let flush = plan.flush();
+    assert_eq!(flush.nat44_udp_mappings, FlushCount::Exact(0));
+    assert_eq!(flush.nat44_tcp_sessions, FlushCount::Exact(0));
+    assert_eq!(flush.firewall_flows, FlushCount::Exact(0));
+    assert_eq!(flush.dynamic_neighbors, FlushCount::Invalidated);
+}
+
+#[test]
+fn flush_mode_plans_a_full_flush_and_carry_mode_names_each_conflict() {
+    // The successor's mode decides, so switching it is itself reloadable.
+    let flush = ApplyPlan::between(&config(&[]), &config(&[FLUSH_MODE])).expect("plan");
+    only(&flush, &[]);
+    assert_eq!(flush.flush(), StateFlush::ALL);
+    assert_eq!(flush.carry(), crate::StateCarry::flush(false));
+    let back = ApplyPlan::between(&config(&[FLUSH_MODE]), &config(&[])).expect("plan");
+    assert_eq!(back.carry().mode, ReloadState::Carry);
+
+    // A same-size port shift flushes NAT with the pool as the reason; a
+    // filtering change flushes with filtering; a rule change keeps the
+    // firewall but re-evaluates it.
+    let shift = plan(&[PORT_SHIFT]);
+    let conflict = |reason| StateCarryOutcome::FlushIncompatible(reason);
+    assert_eq!(
+        shift.carry().nat44_udp,
+        conflict(StateCarryConflict::PortRange)
+    );
+    assert_eq!(shift.flush().nat44_udp_mappings, FlushCount::All);
+    let filtering = plan(&NAT_FILTERING_CHANGE);
+    assert_eq!(
+        (filtering.carry().nat44_udp, filtering.carry().nat44_tcp),
+        (
+            conflict(StateCarryConflict::Filtering),
+            conflict(StateCarryConflict::Filtering)
+        )
+    );
+    let rules = plan(&[(
+        "destination = \"192.0.2.0/24\"",
+        "destination = \"192.0.2.0/25\"",
+    )]);
+    assert_eq!(rules.carry().firewall, StateCarryOutcome::Carried);
+    assert!(rules.carry().firewall_reevaluated);
+    assert_eq!(rules.flush().firewall_flows, FlushCount::Invalidated);
+    // A timer or quota change carries everything.
+    let ttl = plan(&[TCP_INBOUND_LIMIT_CHANGE]);
+    assert_eq!(ttl.carry().nat44_tcp, StateCarryOutcome::Carried);
 }
 
 #[test]

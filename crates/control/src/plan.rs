@@ -35,15 +35,15 @@ use ruster_config::{
 };
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    Nat44Filtering, Nat44TcpHashKey, Nat44TcpInboundRst, Nat44UdpHashKey, Neighbor,
-    PublicationQuiescence, ResolutionHashKey, Route,
+    Nat44CarryIdentity, Nat44Filtering, Nat44TcpHashKey, Nat44TcpInboundRst, Nat44UdpHashKey,
+    Neighbor, PublicationQuiescence, ResolutionHashKey, Route, StateCarryOutcome,
 };
 
 use crate::{
     candidate_from_config,
     config_bridge::{required_services, RequiredServices},
     ActivePublication, ApplyError, ConfigBridgeError, ProductionKeySource, PublicationKeySource,
-    RestartRequired, RuntimeService, ValidatedCandidate,
+    ReloadState, RestartRequired, RuntimeService, ValidatedCandidate,
 };
 
 /// How many entries of one kind of publication-bound state an apply flushes.
@@ -53,14 +53,21 @@ pub enum FlushCount {
     All,
     /// Exactly this many live entries are flushed.
     Exact(usize),
+    /// The state is carried and only the entries the successor invalidates
+    /// are dropped (RELOAD-CARRY); how many is known only against live
+    /// state (a live dry run or the apply report).
+    Invalidated,
 }
 
 /// Expected flush of publication-bound state on apply.
 ///
-/// Every reload flushes ARP learning and pending resolution/ICMPv4 work and,
-/// because NAT and firewall hash keys rotate on every generation, all NAT
-/// mappings/peers/sessions and all firewall flows. Cumulative counters are
-/// preserved.
+/// Every reload flushes pending resolution/ICMPv4 work. With
+/// [`ReloadState::Flush`] it also flushes ARP learning, all NAT
+/// mappings/peers/sessions, and all firewall flows (every hash key
+/// rotates); with [`ReloadState::Carry`] those families flush only when the
+/// successor is incompatible ([`StateCarry`]). `firewall_flows` counts the
+/// flows the apply drops, flushed or revoked by re-evaluation. Cumulative
+/// counters are preserved.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct StateFlush {
@@ -99,6 +106,56 @@ impl StateFlush {
     };
 }
 
+/// What an apply does with each state family (RELOAD-CARRY).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct StateCarry {
+    /// The successor's `[reload] state`.
+    pub mode: ReloadState,
+    /// `Carried` keeps learned neighbors (pending resolution work always
+    /// flushes).
+    pub resolution: StateCarryOutcome,
+    pub nat44_udp: StateCarryOutcome,
+    pub nat44_tcp: StateCarryOutcome,
+    /// `None` when the successor has no ICMP query NAT (N5).
+    pub nat44_icmp: Option<StateCarryOutcome>,
+    pub firewall: StateCarryOutcome,
+    /// Carried firewall flows are re-evaluated against changed rules.
+    pub firewall_reevaluated: bool,
+}
+
+impl StateCarry {
+    /// Every family flushes (`[reload] state = "flush"`).
+    #[must_use]
+    pub const fn flush(nat44_icmp: bool) -> Self {
+        let flushed = StateCarryOutcome::FlushRequested;
+        Self {
+            mode: ReloadState::Flush,
+            resolution: flushed,
+            nat44_udp: flushed,
+            nat44_tcp: flushed,
+            nat44_icmp: if nat44_icmp { Some(flushed) } else { None },
+            firewall: flushed,
+            firewall_reevaluated: false,
+        }
+    }
+}
+
+/// Live state a successor would carry, from a dry run (RELOAD-CARRY).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct CarriedCounts {
+    pub dynamic_neighbors: usize,
+    pub nat44_udp_mappings: usize,
+    pub nat44_udp_peers: usize,
+    pub nat44_tcp_mappings: usize,
+    pub nat44_tcp_sessions: usize,
+    pub nat44_icmp_mappings: usize,
+    pub nat44_icmp_peers: usize,
+    /// Flows kept after re-evaluation.
+    pub firewall_flows: usize,
+}
+
 /// Result of a successful guard-free dry-run of one successor.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -108,6 +165,10 @@ pub struct SuccessorCheck {
     /// Live flush counts at the time of the check. Traffic between the check
     /// and the apply tick can change them; the apply report is authoritative.
     pub flush: StateFlush,
+    /// What the apply does with each family (exact, from the live permits).
+    pub carry: StateCarry,
+    /// Live counts the apply would carry, like `flush`.
+    pub carried: CarriedCounts,
 }
 
 /// An old and a new value of one keyed item.
@@ -340,7 +401,9 @@ pub struct ApplyPlan {
     nat44_icmp: NatChange,
     backend: BackendChange,
     restart_required: Box<[RestartRequired]>,
+    reload_state: Option<Delta<ReloadState>>,
     flush: StateFlush,
+    carry: StateCarry,
     dry_run: Option<Result<SuccessorCheck, ApplyError>>,
 }
 
@@ -348,7 +411,11 @@ impl ApplyPlan {
     /// Plans `next` against `current` from the documents alone.
     ///
     /// No live state is consulted, so every flush count is
-    /// [`FlushCount::All`].
+    /// [`FlushCount::All`] for a family that flushes, `Exact(0)` for a NAT
+    /// family that carries, and [`FlushCount::Invalidated`] for carried
+    /// learned neighbors and for carried firewall flows that changed rules
+    /// re-evaluate. The firewall re-evaluation budget needs the live flow
+    /// count, so only a live dry run can report its flush.
     pub fn between(
         current: &ValidatedConfigV1,
         next: &ValidatedConfigV1,
@@ -381,6 +448,13 @@ impl ApplyPlan {
 
         let old_rules = old.firewall.rules();
         let new_rules = new.firewall.rules();
+        // A restart flushes everything regardless of `[reload] state`.
+        let carry = if restart_required.is_empty() {
+            document_carry(&old, &new, next.reload_state())
+        } else {
+            StateCarry::flush(new.icmp.is_some())
+        };
+        let flush = document_flush(carry);
         Ok(Self {
             routes: diff(current.routes(), next.routes(), |route| {
                 (route.prefix(), route.prefix_len())
@@ -404,7 +478,12 @@ impl ApplyPlan {
             nat44_icmp: icmp_change(&old, &new),
             backend,
             restart_required: restart_required.into_boxed_slice(),
-            flush: StateFlush::ALL,
+            reload_state: delta(
+                reload_state(current.reload_state()),
+                reload_state(next.reload_state()),
+            ),
+            flush,
+            carry,
             dry_run: None,
         })
     }
@@ -442,6 +521,7 @@ impl ApplyPlan {
         let check = active.check_successor(successor);
         if let Ok(check) = check {
             plan.flush = check.flush;
+            plan.carry = check.carry;
         }
         plan.dry_run = Some(check);
         Ok(plan)
@@ -562,10 +642,125 @@ impl ApplyPlan {
         self.flush
     }
 
+    /// `[reload] state` change between the documents. Reloadable: the
+    /// successor's mode decides what its own apply does with state.
+    #[must_use]
+    pub const fn reload_state(&self) -> Option<Delta<ReloadState>> {
+        self.reload_state
+    }
+
+    /// What the apply does with each state family (RELOAD-CARRY): from
+    /// the documents, or exact after a successful live dry run.
+    #[must_use]
+    pub const fn carry(&self) -> StateCarry {
+        self.carry
+    }
+
     /// Outcome of the live dry-run, if the plan was built with one.
     #[must_use]
     pub const fn dry_run(&self) -> Option<Result<SuccessorCheck, ApplyError>> {
         self.dry_run
+    }
+}
+
+const fn reload_state(state: ruster_config::ReloadStateV1) -> ReloadState {
+    match state {
+        ruster_config::ReloadStateV1::Carry => ReloadState::Carry,
+        ruster_config::ReloadStateV1::Flush => ReloadState::Flush,
+    }
+}
+
+/// Per-family carry expectation from the documents alone (RELOAD-CARRY),
+/// with the same compatibility rules as the core runtimes.
+fn document_carry(
+    old: &RequiredServices<'_>,
+    new: &RequiredServices<'_>,
+    mode: ruster_config::ReloadStateV1,
+) -> StateCarry {
+    if mode == ruster_config::ReloadStateV1::Flush {
+        return StateCarry::flush(new.icmp.is_some());
+    }
+    let outcome = |old: Nat44CarryIdentity, new: Nat44CarryIdentity| match old.carry_conflict(new) {
+        Some(conflict) => StateCarryOutcome::FlushIncompatible(conflict),
+        None => StateCarryOutcome::Carried,
+    };
+    let udp = |udp: &ruster_config::ValidatedNat44UdpV1| {
+        Nat44CarryIdentity::new(
+            udp.inside(),
+            udp.outside(),
+            udp.public_address(),
+            udp.first_port(),
+            udp.last_port(),
+            udp.policy().filtering(),
+        )
+    };
+    let tcp = |tcp: &ruster_config::ValidatedNat44TcpV1| {
+        Nat44CarryIdentity::new(
+            tcp.inside(),
+            tcp.outside(),
+            tcp.public_address(),
+            tcp.first_port(),
+            tcp.last_port(),
+            tcp.policy().filtering(),
+        )
+        .with_tcp_timers(tcp.policy().carry_timers())
+    };
+    let icmp = |icmp: &ruster_config::ValidatedNat44IcmpV1| {
+        Nat44CarryIdentity::new(
+            icmp.inside(),
+            icmp.outside(),
+            icmp.public_address(),
+            icmp.first_identifier(),
+            icmp.last_identifier(),
+            icmp.policy().filtering(),
+        )
+    };
+    StateCarry {
+        mode: ReloadState::Carry,
+        resolution: StateCarryOutcome::Carried,
+        nat44_udp: outcome(udp(old.udp), udp(new.udp)),
+        nat44_tcp: outcome(tcp(old.tcp), tcp(new.tcp)),
+        // Adding or removing ICMP query NAT is a storage-shape change, so
+        // both sides have it whenever the plan is applicable.
+        nat44_icmp: new.icmp.map(|next| {
+            old.icmp
+                .map_or(StateCarryOutcome::FlushRequested, |previous| {
+                    outcome(icmp(previous), icmp(next))
+                })
+        }),
+        firewall: StateCarryOutcome::Carried,
+        firewall_reevaluated: old.firewall.rules() != new.firewall.rules(),
+    }
+}
+
+/// The flush a document-only plan expects for `carry`.
+fn document_flush(carry: StateCarry) -> StateFlush {
+    let nat = |outcome: StateCarryOutcome| {
+        if outcome.carried() {
+            FlushCount::Exact(0)
+        } else {
+            FlushCount::All
+        }
+    };
+    let carried =
+        |outcome: StateCarryOutcome, invalidated: bool| match (outcome.carried(), invalidated) {
+            (false, _) => FlushCount::All,
+            (true, true) => FlushCount::Invalidated,
+            (true, false) => FlushCount::Exact(0),
+        };
+    let icmp = carry
+        .nat44_icmp
+        .unwrap_or(StateCarryOutcome::FlushRequested);
+    StateFlush {
+        dynamic_neighbors: carried(carry.resolution, true),
+        nat44_udp_mappings: nat(carry.nat44_udp),
+        nat44_udp_peers: nat(carry.nat44_udp),
+        nat44_tcp_mappings: nat(carry.nat44_tcp),
+        nat44_tcp_sessions: nat(carry.nat44_tcp),
+        nat44_icmp_mappings: nat(icmp),
+        nat44_icmp_peers: nat(icmp),
+        firewall_flows: carried(carry.firewall, carry.firewall_reevaluated),
+        ..StateFlush::ALL
     }
 }
 

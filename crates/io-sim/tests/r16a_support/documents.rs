@@ -221,6 +221,7 @@ fn random_router(rng: &mut V1Rng) -> RouterParams {
         wan_mac_last: 2 + u8::try_from(rng.below(200)).unwrap(),
         include_nat: true,
         offlink_route: false,
+        reload_flush: false,
     }
 }
 

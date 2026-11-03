@@ -9,6 +9,22 @@ pub const FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS: u64 = 240_000;
 pub const FIREWALL_TCP_ACTIVE_MIN_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_MAX_IDLE_TTL_MS: u64 = 604_800_000;
+/// Most rule evaluations one carrying publication may spend re-evaluating
+/// carried flows against changed rules (RELOAD-CARRY): the work bound is
+/// `carried flows x rules`, checked before any evaluation. Above it the
+/// publication flushes the flow table instead
+/// ([`crate::StateCarryConflict::ReevaluationBudget`]), so an apply never
+/// stalls the worker for longer than this many first-match rule tests.
+/// 2^22 tests took about 25 ms in a release build on the development host
+/// (about 6 ns per test; the architecture document records the
+/// measurement), which is below the 200 ms reload quiescence bound, and
+/// cover every flow of a full 2^16-slot table (49152 usable) against 85
+/// rules, or 4096 flows against 1024 rules.
+pub const FIREWALL_CARRY_REEVALUATION_BUDGET: u64 = 1 << 22;
+/// `FirewallStateSlot::config_generation` of a flow that a carrying
+/// publication revoked: never a table generation (those are nonzero), so
+/// the slot is dead and reclaimed like an expired one.
+const REVOKED_TABLE_GENERATION: u64 = 0;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct FirewallRuleId(pub u32);
@@ -857,6 +873,9 @@ pub struct FirewallCounters {
     pub state_probes: u64,
     pub maintenance_steps: u64,
     pub rule_evaluations: u64,
+    /// Flows revoked by carrying publications whose new rules no longer
+    /// admit them (RELOAD-CARRY).
+    pub states_revoked: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1299,6 +1318,24 @@ const fn usable_state_capacity(capacity: usize) -> usize {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirewallReconcileReport {
     pub states_flushed: usize,
+    /// Flows kept by a carry (RELOAD-CARRY), after re-evaluation.
+    pub states_carried: usize,
+    /// Flows a carry revoked because the new rules no longer admit their
+    /// initiating packet. A revoked flow passes no further packet and its
+    /// slot is reclaimed like an expired one.
+    pub states_revoked: usize,
+    pub outcome: crate::StateCarryOutcome,
+}
+
+impl FirewallReconcileReport {
+    const fn flushed(states_flushed: usize, outcome: crate::StateCarryOutcome) -> Self {
+        Self {
+            states_flushed,
+            states_carried: 0,
+            states_revoked: 0,
+            outcome,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1308,6 +1345,21 @@ pub enum FirewallReconcileError {
     IdentityCollision,
     HashKeyNotRotated,
     RuntimeEpochExhausted,
+    /// A carrying preflight was given a `current` configuration that is not
+    /// the one this runtime is bound to.
+    CurrentConfigMismatch,
+}
+
+/// What a firewall permit does on commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FirewallPermitMode {
+    /// Same generation and identity: nothing changes.
+    Unchanged,
+    /// Flush every flow and rotate the table key.
+    Flush,
+    /// Keep the flows and the table key; with `Some(rules)`, revoke the
+    /// flows that `rules` no longer admit.
+    Carry,
 }
 
 /// Exclusive proof that one firewall publication can be committed totally.
@@ -1328,11 +1380,14 @@ pub enum FirewallReconcileError {
 /// }
 /// ```
 #[must_use]
-pub struct FirewallReconcilePermit<'runtime, 'state> {
+pub struct FirewallReconcilePermit<'runtime, 'state, 'rules> {
     runtime: &'runtime mut FirewallRuntime<'state>,
     next: FirewallConfigBinding,
     next_runtime_epoch: u64,
-    advance: bool,
+    mode: FirewallPermitMode,
+    /// The new rules a carry re-evaluates every carried flow against, or
+    /// `None` when the rules did not change (no evaluation needed).
+    reevaluate: Option<&'rules [FirewallRule]>,
     report: FirewallReconcileReport,
 }
 
@@ -1354,6 +1409,12 @@ pub struct FirewallReconcilePermit<'runtime, 'state> {
 /// ```
 pub struct FirewallRuntime<'state> {
     binding: FirewallConfigBinding,
+    /// Secret key and generation that home every flow in `states`. They
+    /// equal the bound publication's after construction or a flush; a carry
+    /// (RELOAD-CARRY) binds a new publication but keeps them, so carried
+    /// flows stay where their probes find them.
+    table_key: FirewallHashKey,
+    table_generation: u64,
     states: &'state mut [FirewallStateSlot],
     watermark_ms: Option<u64>,
     runtime_epoch: u64,
@@ -1387,6 +1448,8 @@ impl<'state> FirewallRuntime<'state> {
         states.fill(FirewallStateSlot::default());
         Self {
             binding: config.binding(),
+            table_key: config.hash_key,
+            table_generation: config.generation,
             states,
             watermark_ms: None,
             runtime_epoch: 1,
@@ -1458,7 +1521,7 @@ impl<'state> FirewallRuntime<'state> {
     pub fn preflight_reconcile<'runtime>(
         &'runtime mut self,
         config: FirewallConfig<'_>,
-    ) -> Result<FirewallReconcilePermit<'runtime, 'state>, FirewallReconcileError> {
+    ) -> Result<FirewallReconcilePermit<'runtime, 'state, 'static>, FirewallReconcileError> {
         let next = config.binding();
         if next.generation < self.binding.generation {
             return Err(FirewallReconcileError::GenerationRegression);
@@ -1472,11 +1535,23 @@ impl<'state> FirewallRuntime<'state> {
                 runtime: self,
                 next,
                 next_runtime_epoch,
-                advance: false,
-                report: FirewallReconcileReport { states_flushed: 0 },
+                mode: FirewallPermitMode::Unchanged,
+                reevaluate: None,
+                report: FirewallReconcileReport::flushed(
+                    0,
+                    crate::StateCarryOutcome::FlushRequested,
+                ),
             });
         }
-        if next.hash_key == self.binding.hash_key {
+        self.preflight_flush(next, crate::StateCarryOutcome::FlushRequested)
+    }
+
+    fn preflight_flush<'runtime>(
+        &'runtime mut self,
+        next: FirewallConfigBinding,
+        outcome: crate::StateCarryOutcome,
+    ) -> Result<FirewallReconcilePermit<'runtime, 'state, 'static>, FirewallReconcileError> {
+        if next.hash_key == self.binding.hash_key || next.hash_key == self.table_key {
             return Err(FirewallReconcileError::HashKeyNotRotated);
         }
         let next_runtime_epoch = self
@@ -1488,9 +1563,141 @@ impl<'state> FirewallRuntime<'state> {
             runtime: self,
             next,
             next_runtime_epoch,
-            advance: true,
-            report: FirewallReconcileReport { states_flushed },
+            mode: FirewallPermitMode::Flush,
+            reevaluate: None,
+            report: FirewallReconcileReport::flushed(states_flushed, outcome),
         })
+    }
+
+    /// Preflights a successor that keeps the flow table when it can
+    /// (RELOAD-CARRY).
+    ///
+    /// `current` must be the configuration this runtime is bound to. When
+    /// `next` has the same rules, every flow is carried without any
+    /// evaluation (a timer change applies to carried flows from their last
+    /// activity). When the rules changed, every carried flow is re-evaluated
+    /// at commit: its initiating packet (the stored origin tuple and
+    /// interfaces, as a TCP SYN or an ICMP request) is matched first-match
+    /// against `next`'s rules, and a flow that the new rules would not admit
+    /// as new is revoked, so no further packet of it passes on the old
+    /// verdict. The work is bounded by
+    /// [`FIREWALL_CARRY_REEVALUATION_BUDGET`] rule tests; a larger
+    /// `occupied flows x rules` product flushes instead
+    /// ([`crate::StateCarryConflict::ReevaluationBudget`]), which is also
+    /// fail closed. A carry keeps the table's secret key and generation, so
+    /// carried flows need no rehash.
+    ///
+    /// Routes are not consulted: a flow's state matches only its exact
+    /// origin interfaces, so a packet whose route now leaves another way
+    /// misses it and is decided as a new attempt, and a route miss never
+    /// consults state (FW-025).
+    pub fn preflight_reconcile_carrying<'runtime, 'rules>(
+        &'runtime mut self,
+        current: FirewallConfig<'_>,
+        next: FirewallConfig<'rules>,
+    ) -> Result<FirewallReconcilePermit<'runtime, 'state, 'rules>, FirewallReconcileError> {
+        if !self.config_matches(&current) {
+            return Err(FirewallReconcileError::CurrentConfigMismatch);
+        }
+        let binding = next.binding();
+        if binding.generation <= self.binding.generation {
+            let permit = self.preflight_reconcile(next)?;
+            return Ok(FirewallReconcilePermit {
+                runtime: permit.runtime,
+                next: permit.next,
+                next_runtime_epoch: permit.next_runtime_epoch,
+                mode: permit.mode,
+                reevaluate: None,
+                report: permit.report,
+            });
+        }
+        let carried = self
+            .states
+            .iter()
+            .filter(|slot| slot.occupied && slot.config_generation == self.table_generation)
+            .count();
+        let reevaluate = (current.rules != next.rules).then_some(next.rules);
+        if let Some(rules) = reevaluate {
+            let work = (carried as u64).saturating_mul(rules.len() as u64);
+            if work > FIREWALL_CARRY_REEVALUATION_BUDGET {
+                let permit = self.preflight_flush(
+                    binding,
+                    crate::StateCarryOutcome::FlushIncompatible(
+                        crate::StateCarryConflict::ReevaluationBudget,
+                    ),
+                )?;
+                return Ok(FirewallReconcilePermit {
+                    runtime: permit.runtime,
+                    next: permit.next,
+                    next_runtime_epoch: permit.next_runtime_epoch,
+                    mode: permit.mode,
+                    reevaluate: None,
+                    report: permit.report,
+                });
+            }
+        }
+        let next_runtime_epoch = self.runtime_epoch;
+        Ok(FirewallReconcilePermit {
+            runtime: self,
+            next: binding,
+            next_runtime_epoch,
+            mode: FirewallPermitMode::Carry,
+            reevaluate,
+            report: FirewallReconcileReport {
+                states_flushed: 0,
+                states_carried: carried,
+                states_revoked: 0,
+                outcome: crate::StateCarryOutcome::Carried,
+            },
+        })
+    }
+
+    /// First-match verdict of `rules` on the initiating packet of `slot`:
+    /// the matching allow rule, or `None` for a deny or the default deny.
+    fn admits_origin(rules: &[FirewallRule], slot: FirewallStateSlot) -> Option<FirewallRuleId> {
+        let packet = slot_packet(slot);
+        rules
+            .iter()
+            .find(|rule| rule.matches(packet))
+            .filter(|rule| rule.action == FirewallAction::AllowStateful)
+            .map(|rule| rule.id)
+    }
+
+    /// Re-evaluates every carried flow against `rules` in place: an
+    /// admitted flow records the rule that admits it now, any other is
+    /// revoked. Returns (carried, revoked). At most `flows x rules` rule
+    /// tests, which preflight bounded; no allocation.
+    fn reevaluate_carried(&mut self, rules: &[FirewallRule]) -> (usize, usize) {
+        let (mut carried, mut revoked) = (0usize, 0usize);
+        let mut evaluations = 0u64;
+        for index in 0..self.states.len() {
+            let slot = self.states[index];
+            if !slot.occupied || slot.config_generation != self.table_generation {
+                continue;
+            }
+            let packet = slot_packet(slot);
+            let position = rules.iter().position(|rule| rule.matches(packet));
+            evaluations =
+                evaluations.saturating_add(position.map_or(rules.len(), |at| at + 1) as u64);
+            match position.map(|at| rules[at]) {
+                Some(rule) if rule.action == FirewallAction::AllowStateful => {
+                    self.states[index].origin_rule_id = rule.id;
+                    carried += 1;
+                }
+                Some(_) | None => {
+                    self.states[index].config_generation = REVOKED_TABLE_GENERATION;
+                    revoked += 1;
+                }
+            }
+        }
+        self.counters.rule_evaluations = self.counters.rule_evaluations.saturating_add(evaluations);
+        self.counters.states_revoked = self.counters.states_revoked.saturating_add(revoked as u64);
+        if revoked != 0 {
+            // Revoked slots are dead now: let the refusal-path sweep find
+            // them without waiting for the old earliest deadline.
+            self.reclaim_not_before_ms = 0;
+        }
+        (carried, revoked)
     }
 
     /// Binds a validated publication and flushes state on a fresh generation.
@@ -1644,7 +1851,7 @@ impl<'state> FirewallRuntime<'state> {
             replacement: FirewallStateSlot {
                 occupied: true,
                 slot_generation,
-                config_generation: self.binding.generation,
+                config_generation: self.table_generation,
                 protocol: packet.protocol,
                 origin_ingress: packet.ingress,
                 origin_egress: packet.egress,
@@ -1831,8 +2038,7 @@ impl<'state> FirewallRuntime<'state> {
 
         let packet = flow.packet();
         let capacity = self.states.len();
-        let start =
-            flow_hash(packet, self.binding.generation, self.binding.hash_key) as usize % capacity;
+        let start = flow_hash(packet, self.table_generation, self.table_key) as usize % capacity;
         for distance in 0..capacity {
             let slot = self.states[(start + distance) % capacity];
             if !slot.occupied {
@@ -1908,8 +2114,7 @@ impl<'state> FirewallRuntime<'state> {
             };
         }
         let capacity = self.states.len();
-        let start =
-            flow_hash(packet, self.binding.generation, self.binding.hash_key) as usize % capacity;
+        let start = flow_hash(packet, self.table_generation, self.table_key) as usize % capacity;
         let mut probes = 0;
         let mut cleanup_allowed = true;
         for _pass in 0..2 {
@@ -2048,10 +2253,14 @@ impl<'state> FirewallRuntime<'state> {
 
     fn delete_expired_and_shift(&mut self, index: usize) {
         let capacity = self.states.len();
+        // A revoked flow was counted in `states_revoked` when it was revoked.
+        let revoked = self.states[index].config_generation == REVOKED_TABLE_GENERATION;
         self.states[index] = FirewallStateSlot::default();
         self.occupancy.remove();
         self.runtime_epoch = self.runtime_epoch.wrapping_add(1).max(1);
-        self.counters.states_expired = self.counters.states_expired.saturating_add(1);
+        if !revoked {
+            self.counters.states_expired = self.counters.states_expired.saturating_add(1);
+        }
         self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
         let mut hole = index;
         let mut scan = (index + 1) % capacity;
@@ -2062,11 +2271,7 @@ impl<'state> FirewallRuntime<'state> {
                 break;
             }
             self.counters.maintenance_steps = self.counters.maintenance_steps.saturating_add(1);
-            let home = flow_hash(
-                slot_packet(slot),
-                self.binding.generation,
-                self.binding.hash_key,
-            ) as usize
+            let home = flow_hash(slot_packet(slot), self.table_generation, self.table_key) as usize
                 % capacity;
             if probe_distance(home, hole, capacity) < probe_distance(home, scan, capacity) {
                 self.states[hole] = slot;
@@ -2080,7 +2285,7 @@ impl<'state> FirewallRuntime<'state> {
 
     fn slot_live(&self, slot: FirewallStateSlot, now_ms: u64) -> bool {
         if !slot.occupied
-            || slot.config_generation != self.binding.generation
+            || slot.config_generation != self.table_generation
             || now_ms < slot.last_activity_ms
         {
             return false;
@@ -2089,20 +2294,70 @@ impl<'state> FirewallRuntime<'state> {
     }
 }
 
-impl FirewallReconcilePermit<'_, '_> {
+impl FirewallReconcilePermit<'_, '_, '_> {
+    /// What [`Self::commit`] will do with the flows.
+    #[must_use]
+    pub const fn outcome(&self) -> crate::StateCarryOutcome {
+        self.report.outcome
+    }
+
+    /// The report [`Self::commit`] would return, computed without mutation.
+    ///
+    /// For a carry with changed rules this re-evaluates every carried flow
+    /// read-only, the same bounded work as the commit.
+    #[must_use]
+    pub fn preview(&self) -> FirewallReconcileReport {
+        let mut report = self.report;
+        if let (FirewallPermitMode::Carry, Some(rules)) = (self.mode, self.reevaluate) {
+            let runtime = &*self.runtime;
+            let revoked = runtime
+                .states
+                .iter()
+                .filter(|slot| {
+                    slot.occupied
+                        && slot.config_generation == runtime.table_generation
+                        && FirewallRuntime::admits_origin(rules, **slot).is_none()
+                })
+                .count();
+            report.states_carried -= revoked;
+            report.states_revoked = revoked;
+        }
+        report
+    }
+
     /// Commits the preflighted publication without validation or failure.
     pub fn commit(self) -> FirewallReconcileReport {
-        if self.advance {
-            self.runtime.states.fill(FirewallStateSlot::default());
-            self.runtime.occupancy.flush();
-            self.runtime.reclaim_not_before_ms = 0;
-            self.runtime.reclaim_cursor = 0;
-            self.runtime.binding = self.next;
-            self.runtime.runtime_epoch = self.next_runtime_epoch;
-            self.runtime.counters.reconciliations =
-                self.runtime.counters.reconciliations.saturating_add(1);
+        let runtime = self.runtime;
+        let mut report = self.report;
+        match self.mode {
+            FirewallPermitMode::Unchanged => {}
+            FirewallPermitMode::Flush => {
+                runtime.states.fill(FirewallStateSlot::default());
+                runtime.occupancy.flush();
+                runtime.reclaim_not_before_ms = 0;
+                runtime.reclaim_cursor = 0;
+                runtime.binding = self.next;
+                runtime.table_key = self.next.hash_key;
+                runtime.table_generation = self.next.generation;
+                runtime.runtime_epoch = self.next_runtime_epoch;
+                runtime.counters.reconciliations =
+                    runtime.counters.reconciliations.saturating_add(1);
+            }
+            FirewallPermitMode::Carry => {
+                if let Some(rules) = self.reevaluate {
+                    let (carried, revoked) = runtime.reevaluate_carried(rules);
+                    report.states_carried = carried;
+                    report.states_revoked = revoked;
+                }
+                runtime.binding = self.next;
+                // A shorter idle timeout can bring deadlines before the
+                // old earliest-deadline bound; recompute it lazily.
+                runtime.reclaim_not_before_ms = 0;
+                runtime.counters.reconciliations =
+                    runtime.counters.reconciliations.saturating_add(1);
+            }
         }
-        self.report
+        report
     }
 }
 
@@ -2118,6 +2373,10 @@ mod tests {
     const WAN: IfId = IfId(2);
     const INTERNAL: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 10]);
     const REMOTE: Ipv4Address = Ipv4Address::from_octets([198, 51, 100, 20]);
+
+    // `firewall/tests/carry.rs`: flows carried and re-evaluated across a
+    // publication (RELOAD-CARRY).
+    mod carry;
 
     fn with_snapshot<T>(test: impl FnOnce(&ForwardingSnapshot<'_>) -> T) -> T {
         let routes = [
@@ -2260,6 +2519,8 @@ mod tests {
     #[derive(Debug, Eq, PartialEq)]
     struct RuntimeImage {
         binding: FirewallConfigBinding,
+        table_key: FirewallHashKey,
+        table_generation: u64,
         states: Vec<FirewallStateSlot>,
         watermark_ms: Option<u64>,
         runtime_epoch: u64,
@@ -2273,6 +2534,8 @@ mod tests {
     fn runtime_image(runtime: &FirewallRuntime<'_>) -> RuntimeImage {
         RuntimeImage {
             binding: runtime.binding,
+            table_key: runtime.table_key,
+            table_generation: runtime.table_generation,
             states: runtime.states.to_vec(),
             watermark_ms: runtime.watermark_ms,
             runtime_epoch: runtime.runtime_epoch,
@@ -2446,13 +2709,16 @@ mod tests {
 
         let before = runtime_image(&runtime);
         let permit = runtime.preflight_reconcile(next).unwrap();
-        assert_eq!(permit.report, FirewallReconcileReport { states_flushed: 1 });
+        assert_eq!(
+            permit.report,
+            FirewallReconcileReport::flushed(1, crate::StateCarryOutcome::FlushRequested)
+        );
         drop(permit);
         assert_eq!(runtime_image(&runtime), before);
 
         assert_eq!(
             runtime.preflight_reconcile(next).unwrap().commit(),
-            FirewallReconcileReport { states_flushed: 1 }
+            FirewallReconcileReport::flushed(1, crate::StateCarryOutcome::FlushRequested)
         );
         assert!(runtime
             .states
@@ -2476,7 +2742,7 @@ mod tests {
         let before = runtime_image(&runtime);
         assert_eq!(
             runtime.preflight_reconcile(config).unwrap().commit(),
-            FirewallReconcileReport { states_flushed: 0 }
+            FirewallReconcileReport::flushed(0, crate::StateCarryOutcome::FlushRequested)
         );
         assert_eq!(runtime_image(&runtime), before);
         runtime.states[0].slot_generation = 9;
@@ -3676,7 +3942,7 @@ mod tests {
             // A same-generation reconcile keeps state and counts.
             assert_eq!(
                 runtime.reconcile(config).unwrap(),
-                FirewallReconcileReport { states_flushed: 0 }
+                FirewallReconcileReport::flushed(0, crate::StateCarryOutcome::FlushRequested)
             );
             assert_eq!(exact_occupancy(&runtime), (6, 6, 6));
             // A flushing reconcile resets the count and the high-water mark.
@@ -3690,7 +3956,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 runtime.reconcile(next).unwrap(),
-                FirewallReconcileReport { states_flushed: 6 }
+                FirewallReconcileReport::flushed(6, crate::StateCarryOutcome::FlushRequested)
             );
             assert_eq!(exact_occupancy(&runtime), (0, 0, 6));
             let plan = runtime.plan_packet(&next, flow(3_000), expired_at).unwrap();

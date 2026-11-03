@@ -129,7 +129,9 @@ tx = [
 drops = [{ reason = "NEIGHBOR_UNRESOLVED", count = 1 }, { reason = "NAT44_TCP_MAPPING_MISS", count = 2 }]
 
 # --- 4. With unsolicited-syn-icmp = false (reloadable) the SYN is only
-# dropped silently (REQ-4 a), even with G resolved again.
+# dropped silently (REQ-4 a), even with G resolved. The reload carries the
+# learned gateway and H's UDP mapping (RELOAD-CARRY), so query-2 leaves at
+# once from the same public port.
 [[step]]
 kind = "apply"
 config = "router-off.toml"
@@ -152,11 +154,6 @@ at-ms = 21000
 [[step]]
 kind = "inject"
 interface = "wan"
-frame = { kind = "arp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, op = "reply", sender-mac = "02:00:00:00:00:fe", sender-ip = "203.0.113.1", target-mac = "02:00:00:00:00:02", target-ip = "203.0.113.2", pad-to-min = true }
-
-[[step]]
-kind = "inject"
-interface = "wan"
 frame = { kind = "tcp", eth = { src = "02:00:00:00:00:fe", dst = "02:00:00:00:00:02" }, ip = { src = "198.51.100.20", dst = "203.0.113.2", id = 42 }, src-port = 5555, dst-port = 40003, seq = 777, flags = ["syn"], window = 8192 }
 
 [[step]]
@@ -175,6 +172,6 @@ at-ms = 40000
 kind = "expect"
 generation = 2
 tx = [
-  { interface = "wan", frame = { kind = "arp", eth = { src = "02:00:00:00:00:02", dst = "ff:ff:ff:ff:ff:ff" }, op = "request", sender-mac = "02:00:00:00:00:02", sender-ip = "203.0.113.2", target-ip = "203.0.113.1", pad-to-min = true } },
+  { interface = "wan", frame = { kind = "udp", eth = { src = "02:00:00:00:00:02", dst = "02:00:00:00:00:fe" }, ip = { src = "203.0.113.2", dst = "198.51.100.20", id = 41, ttl = 63 }, src-port = 40007, dst-port = 53, payload-ascii = "query-2" } },
 ]
-drops = [{ reason = "NEIGHBOR_UNRESOLVED", count = 2 }, { reason = "NAT44_TCP_MAPPING_MISS", count = 3 }]
+drops = [{ reason = "NEIGHBOR_UNRESOLVED", count = 1 }, { reason = "NAT44_TCP_MAPPING_MISS", count = 3 }]
