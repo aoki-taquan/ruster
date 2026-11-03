@@ -1136,3 +1136,69 @@ fn one_ingress_takes_at_most_its_share() {
     assert_eq!(world.live(), 2);
     assert_eq!(world.hold().refused_ingress_limit, 1);
 }
+
+/// The room a replayed first fragment reserves is for its own datagram's
+/// held fragments (at most 16): other datagrams' held fragments in the
+/// association table cannot keep it waiting for ever.
+#[test]
+fn other_datagrams_held_fragments_do_not_starve_a_held_first_fragment() {
+    let text = ROUTER.replacen("[tick]", "[fragmentation]\ndatagrams = 20\n\n[tick]", 1);
+    let mut world = World::new(&text);
+    let mut frames = Vec::new();
+    // Two other LAN hosts' datagrams: only their 10 later fragments each,
+    // held by the association table waiting for first fragments that never
+    // come.
+    for (host, id) in [([192, 168, 1, 30], 0x7001_u16), ([192, 168, 1, 40], 0x7002)] {
+        let payload = vec![0x11; 2972];
+        let datagram = ethernet(
+            LAN_MAC,
+            J_MAC,
+            0x0800,
+            &ipv4(host, S, id, 0, 64, 17, &udp(host, S, (7000, 7), &payload)),
+        );
+        let pieces = cut(&datagram, 300);
+        assert_eq!(pieces.len(), 11);
+        frames.extend(pieces.into_iter().skip(1).map(|f| (LAN, f)));
+    }
+    let payload: Vec<u8> = (0..2972_u32).map(|i| (i % 251) as u8).collect();
+    let datagram = from_h(S, 0x4242, 0, 64, 17, &udp(H, S, (5000, 4789), &payload));
+    frames.extend(cut(&datagram, 1500).into_iter().map(|f| (LAN, f)));
+    world.tick(0, &frames);
+    assert_eq!(world.active.fragment_tracking().unwrap().held(), 22);
+    assert_eq!(world.live(), 1);
+    // 22 held in the table, 20 free slots: the reserve is 16, not 22.
+    let sent = world.tick(10, &[(WAN, g_reply())]);
+    assert_eq!(
+        sent.len(),
+        3,
+        "the first fragment and its two released ones"
+    );
+    let counters = world.hold();
+    assert_eq!((counters.replay_sent, counters.replay_unstaged), (1, 0));
+}
+
+/// A held first fragment whose resolution runs out refuses its datagram in
+/// the association table at once: the later fragments it holds are freed
+/// then, not at the table's 5 s timeout.
+#[test]
+fn a_dropped_held_first_fragment_frees_its_later_fragments_at_once() {
+    let mut world = World::new(ROUTER);
+    let payload: Vec<u8> = (0..2972_u32).map(|i| (i % 251) as u8).collect();
+    let datagram = from_h(S, 0x4343, 0, 64, 17, &udp(H, S, (5000, 4789), &payload));
+    let frames: Vec<_> = cut(&datagram, 1500).into_iter().map(|f| (LAN, f)).collect();
+    world.tick(0, &frames);
+    let tracker = |world: &World| {
+        let tracker = world.active.fragment_tracking().unwrap();
+        (tracker.held(), tracker.counters().held_denied)
+    };
+    assert_eq!(tracker(&world), (2, 0));
+    for now in [1_000, 2_000] {
+        world.tick(now, &[]);
+    }
+    assert_eq!(world.live(), 1);
+    // G never answered: the hold expires at 3 s, well before the table's
+    // 5 s timeout, and takes the held later fragments with it.
+    world.tick(3_000, &[]);
+    assert_eq!(world.live(), 0);
+    assert_eq!(tracker(&world), (0, 2));
+}

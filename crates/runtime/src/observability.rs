@@ -1562,7 +1562,8 @@ impl ObservableFields for ServiceCounters {
         }}
         visit_counts! {v, "arp_hold", self.arp_hold, ArpHoldCounters {
             held, replaced, refused_full, refused_host_limit, refused_ingress_limit,
-            refused_too_large, replayed, replay_sent, replay_fragmented, replay_dropped,
+            refused_too_large, replayed, replay_sent, replay_fragmented, replay_parked,
+            replay_dropped,
             replay_unstaged, deferred, failed, cancelled, expired, flushed,
         }}
     }

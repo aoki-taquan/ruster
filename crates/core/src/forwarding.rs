@@ -1730,6 +1730,13 @@ pub enum TraceEvent {
         target: crate::Ipv4Address,
         reason: ConsumeReason,
     },
+    /// A datagram held for ARP was dropped with `reason` when it was
+    /// replayed (ARP-HOLD). Not a received frame's drop: the frame was
+    /// counted as `ARP_HELD`; the hold counts it as `replay_dropped`.
+    ArpHoldReplayDropped {
+        ingress: IfId,
+        reason: DropReason,
+    },
     BatchCompleted {
         tx_accepted: usize,
         tx_rejected: usize,
@@ -2927,7 +2934,7 @@ pub fn replay_arp_holds<T>(
     firewall_config: &FirewallConfig<'_>,
     firewall: Option<&mut FirewallRuntime<'_>>,
     fragmentation: &mut Ipv4FragmentationRuntime<'_>,
-    fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
+    mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
     now: MonotonicMillis,
     trace: &mut T,
 ) -> usize
@@ -2938,19 +2945,38 @@ where
         return 0;
     }
     let room = fragmentation.free_slots();
-    // A replayed first fragment releases the association table's held
-    // fragments into the same slots: reserve them, so a replay that commits
-    // NAT and firewall state always finds its own slot.
-    let fragment_reserve = fragment_tracking
-        .as_deref()
-        .map_or(0, Ipv4FragmentTracker::held);
-    let ready = arp_hold.mark_ready(now.0, room, fragment_reserve, |egress, target| {
-        if snapshot.static_neighbor(egress, target).is_some() {
-            ArpHoldNextHop::Known
-        } else {
-            resolution.arp_hold_next_hop(egress, target, now)
-        }
+    // A replayed first fragment releases the fragments the association
+    // table holds for its datagram into the same slots: reserve them, so a
+    // replay that commits NAT and firewall state always finds its own slot.
+    // One datagram holds at most IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM,
+    // so other datagrams' held fragments cannot keep it waiting for ever.
+    let fragment_reserve = fragment_tracking.as_deref().map_or(0, |tracker| {
+        tracker
+            .held()
+            .min(usize::from(crate::IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM))
     });
+    let udp = Some(udp_config);
+    let tcp = Some(tcp_config);
+    let icmp_cfg = icmp.as_ref().map(|(config, _)| *config);
+    let ready = arp_hold.mark_ready(
+        now.0,
+        room,
+        fragment_reserve,
+        |egress, target| {
+            if snapshot.static_neighbor(egress, target).is_some() {
+                ArpHoldNextHop::Known
+            } else {
+                resolution.arp_hold_next_hop(egress, target, now)
+            }
+        },
+        |frame, ingress| {
+            if let Some(tracker) = fragment_tracking.as_deref_mut() {
+                deny_dropped_first_fragment(
+                    frame, snapshot, ingress, udp, tcp, icmp_cfg, tracker, now.0,
+                );
+            }
+        },
+    );
     if ready == 0 {
         return 0;
     }
@@ -3024,6 +3050,36 @@ where
     )
 }
 
+/// Refuses the datagram of a held first fragment the hold dropped (its
+/// resolution failed, was cancelled, or ran out of time) in the association
+/// table, as the forwarding path does for any dropped first fragment: its
+/// held later fragments are freed now (`held_denied`) and later ones are
+/// refused, instead of waiting for the table's timeout. Cold path.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn deny_dropped_first_fragment(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    udp: Option<&Nat44UdpConfig>,
+    tcp: Option<&Nat44TcpConfig>,
+    icmp: Option<&Nat44IcmpConfig>,
+    tracker: &mut Ipv4FragmentTracker<'_>,
+    now_ms: u64,
+) {
+    let Some((ipv4, info)) = tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp) else {
+        return;
+    };
+    if !info.is_first() {
+        return;
+    }
+    if let Ok(ticket) = admit_first_fragment(frame, snapshot, ingress, ipv4, info, tracker, now_ms)
+    {
+        tracker.commit_deny(ticket, now_ms);
+    }
+}
+
 /// The trace of a replay: the replayed datagram was already counted when
 /// it was received (consumed as `ARP_HELD`), so its terminal events (drop,
 /// consume, fragmentation staging) are not passed on; the hold's own
@@ -3033,6 +3089,11 @@ struct ReplayTrace<'t, T>(&'t mut T);
 
 impl<T: TraceSink> TraceSink for ReplayTrace<'_, T> {
     fn record(&mut self, event: TraceEvent) {
+        if let TraceEvent::Dropped { ingress, reason } = event {
+            self.0
+                .record(TraceEvent::ArpHoldReplayDropped { ingress, reason });
+            return;
+        }
         if !matches!(
             event,
             TraceEvent::Dropped { .. }

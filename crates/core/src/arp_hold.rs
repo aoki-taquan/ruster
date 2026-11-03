@@ -265,6 +265,12 @@ pub struct ArpHoldCounters {
     /// Replayed datagrams the forwarding path fragmented (staged as
     /// fragments, MTU2 part B).
     pub replay_fragmented: usize,
+    /// Replayed datagrams the fragment association table parked
+    /// (`IPV4_FRAGMENT_HELD`, waiting for their first fragment) instead of
+    /// deciding them. Not expected (only first fragments and whole
+    /// datagrams are ever held here); kept apart from `replay_dropped` so
+    /// it never hides there.
+    pub replay_parked: usize,
     /// Replayed datagrams the forwarding path dropped or consumed (not
     /// counted again under the drop and consume reasons: the frame was
     /// counted as `ARP_HELD` when it was received).
@@ -452,6 +458,7 @@ impl<'a> ArpHoldRuntime<'a> {
         let mut neighbor_count = 0_usize;
         let mut neighbor_oldest = NONE;
         let mut neighbor_oldest_own = NONE;
+        let mut neighbor_oldest_same_ingress = NONE;
         let mut host_count = 0_usize;
         let mut ingress_count = 0_usize;
         let mut cursor = self.oldest;
@@ -465,6 +472,9 @@ impl<'a> ArpHoldRuntime<'a> {
                 if own && neighbor_oldest_own == NONE {
                     neighbor_oldest_own = cursor;
                 }
+                if slot.ingress == ingress && neighbor_oldest_same_ingress == NONE {
+                    neighbor_oldest_same_ingress = cursor;
+                }
                 neighbor_count += 1;
             }
             host_count += usize::from(own);
@@ -472,16 +482,34 @@ impl<'a> ArpHoldRuntime<'a> {
             cursor = slot.newer;
         }
         // RFC 1122 §2.3.2.2 keeps the latest datagram: at the next-hop bound
-        // an older datagram of that next hop makes room, the sender's own
-        // oldest one when it has one there (so one host cannot push out
-        // another's), else the oldest.
-        let victim = (neighbor_count >= usize::from(self.policy.per_neighbor)).then_some(
-            if neighbor_oldest_own == NONE {
-                neighbor_oldest
-            } else {
-                neighbor_oldest_own
-            },
-        );
+        // an older datagram of that next hop makes room. Which one: the
+        // sender's own oldest there, else the oldest from the same ingress
+        // (one host, or one interface, cannot push out another's), else the
+        // oldest from another ingress, but only when the new datagram's
+        // ingress holds fewer datagrams than that one (the smaller user may
+        // take from the larger; a flood from one interface cannot evict
+        // another's datagrams, it is ARP_HOLD_INGRESS_LIMIT instead).
+        let victim = if neighbor_count < usize::from(self.policy.per_neighbor) {
+            None
+        } else if neighbor_oldest_own != NONE {
+            Some(neighbor_oldest_own)
+        } else if neighbor_oldest_same_ingress != NONE {
+            Some(neighbor_oldest_same_ingress)
+        } else {
+            let other = self.slots[neighbor_oldest as usize].ingress;
+            let mut other_count = 0_usize;
+            let mut cursor = self.oldest;
+            while cursor != NONE {
+                let slot = &self.slots[cursor as usize];
+                other_count += usize::from(slot.ingress == other);
+                cursor = slot.newer;
+            }
+            if ingress_count >= other_count {
+                self.counters.refused_ingress_limit += 1;
+                return Err(DropReason::ArpHoldIngressLimit);
+            }
+            Some(neighbor_oldest)
+        };
         let (freed_for_host, freed_for_ingress) = victim.map_or((false, false), |victim| {
             let slot = &self.slots[victim as usize];
             (
@@ -551,6 +579,7 @@ impl<'a> ArpHoldRuntime<'a> {
         mut room: usize,
         fragment_reserve: usize,
         mut probe: impl FnMut(IfId, Ipv4Address) -> ArpHoldNextHop,
+        mut first_fragment_dropped: impl FnMut(&[u8], IfId),
     ) -> usize {
         let mut ready = 0;
         let mut cursor = self.oldest;
@@ -577,26 +606,39 @@ impl<'a> ArpHoldRuntime<'a> {
             } else {
                 1
             };
-            match probe(slot.egress, slot.target) {
+            let freed = match probe(slot.egress, slot.target) {
                 ArpHoldNextHop::Known if room >= cost => {
                     room -= cost;
                     ready += 1;
                     self.slots[index].state = HoldState::Ready;
+                    false
                 }
                 _ if now_ms >= slot.deadline_ms => {
                     self.counters.expired += 1;
-                    self.release(index);
+                    true
                 }
-                ArpHoldNextHop::Known => self.counters.deferred += 1,
-                ArpHoldNextHop::Resolving => {}
+                ArpHoldNextHop::Known => {
+                    self.counters.deferred += 1;
+                    false
+                }
+                ArpHoldNextHop::Resolving => false,
                 ArpHoldNextHop::Failed => {
                     self.counters.failed += 1;
-                    self.release(index);
+                    true
                 }
                 ArpHoldNextHop::Gone => {
                     self.counters.cancelled += 1;
-                    self.release(index);
+                    true
                 }
+            };
+            if freed {
+                // A dropped first fragment refuses its datagram at once, so
+                // the association table frees the later fragments it holds
+                // instead of keeping them until its timeout.
+                if first_fragment {
+                    first_fragment_dropped(&self.bytes[self.range(index)], slot.ingress);
+                }
+                self.release(index);
             }
         }
         ready
@@ -728,6 +770,11 @@ impl PacketSlot for ArpHoldReplaySlot<'_, '_> {
             }
             SlotCompletion::Consume(ConsumeReason::Ipv4Fragmented) => {
                 runtime.counters.replay_fragmented += 1;
+                runtime.release(self.index);
+                self.tally.recycled += 1;
+            }
+            SlotCompletion::Consume(ConsumeReason::Ipv4FragmentHeld) => {
+                runtime.counters.replay_parked += 1;
                 runtime.release(self.index);
                 self.tally.recycled += 1;
             }
