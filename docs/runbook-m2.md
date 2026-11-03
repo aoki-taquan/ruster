@@ -1246,8 +1246,12 @@ Schema `ruster-run-log/v1`, keys in this order:
 Strings are escaped per RFC 8259 and the output is pure ASCII (`"`, `\`,
 control characters, DEL and every non-ASCII character as `\uXXXX`), so a
 value can never end the line or add a key or an event. The messages are
-value-free by design anyway (interface ids, codes, counts; no device name,
-address, or config path).
+value-free by design anyway (interface ids, codes, counts, fixed names; no
+device name, address, or path from the config or the command line: the
+`directory=` of `FS_CONFINE_WARNING` is one of the fixed broad directories
+such as `/etc`, never the `--config` path). Numbers are exact unsigned
+64-bit values; a consumer that reads JSON numbers as doubles (JavaScript,
+`jq` before 1.7) loses precision above 2^53.
 
 Event codes (one per message form; a renamed code is a breaking change,
 so new messages get new codes):
@@ -1441,8 +1445,8 @@ holds.
 | `TX_STALL` | TX is in flight and the oldest in-flight frame has not completed, while the link is up | after `tx-stall-warn-ms` (1000) | after `tx-stall-fatal-ms` (10000; 0 never) |
 | `FILL_STARVED` | no Fill frame with the kernel, no RX, and the free list was empty when refilling | after `fill-starved-warn-ms` (1000) | never (the frames are held by TX, which `TX_STALL` covers) |
 | `KICK_ERRORS` | kick failures other than `ENETDOWN` grew in every sample | at the first growth | after `kick-errors-fatal-ms` (5000; 0 never) of growth in every sample |
-| `FRAMES_QUARANTINED` | AF_XDP: the port quarantined frames since the last sample (a kernel descriptor broke the frame ownership contract: a completion at another address, an RX descriptor with options, inside the headroom, or past its frame; the frame never returns to the pool, so the UMEM shrinks by one each time) | at each growth (recovered at a sample without growth) | when the port's count since startup reaches `frames-quarantined-fatal` (64; 0 never) |
-| `TX_INVALID_DESCS` | AF_XDP: the kernel's `XDP_STATISTICS` `tx_invalid_descs` of the port grew (it consumed a TX descriptor without sending or completing it; that frame stays in flight for good, so `TX_STALL` follows within `tx-stall-fatal-ms` unless the fatal stall is off) | at each growth (recovered at a sample without growth) | when the count since startup reaches `tx-invalid-descs-fatal` (64; 0 never) |
+| `FRAMES_QUARANTINED` | AF_XDP: the port quarantined frames since the last sample (a kernel descriptor broke the frame ownership contract: a completion at another address, an RX descriptor with options, inside the headroom, or past its frame; the frame never returns to the pool, so the UMEM shrinks by one each time) | at the first growth of an episode (recovered after 10 s without growth) | when the port's count since startup reaches `frames-quarantined-fatal` (64; 0 never) |
+| `TX_INVALID_DESCS` | AF_XDP: the kernel's `XDP_STATISTICS` `tx_invalid_descs` of the port grew (it consumed a TX descriptor without sending or completing it; that frame stays in flight for good, so `TX_STALL` follows within `tx-stall-fatal-ms` unless the fatal stall is off) | at the first growth of an episode (recovered after 10 s without growth) | when the count since startup reaches `tx-invalid-descs-fatal` (64; 0 never) |
 
 The names in the table are the `[health]` keys below (defaults in
 parentheses). Neither integrity condition exists on AF_PACKET (no frame
@@ -1472,16 +1476,31 @@ frames-quarantined-fatal = 64       # 0 (never) to 1000000, per port since start
 tx-invalid-descs-fatal = 64         # 0 (never) to 1000000, per port since startup
 
 [watch]
-health-interval-ms = 500            # 10 to 60000: backend health sample
+health-interval-ms = 500            # 100 to 60000: backend health sample
 link-interval-ms = 1000             # 100 to 60000: link round (link, addresses,
                                     # routes, forwarding, IPv6, rp_filter: every
                                     # kernel exposure probe of section 8)
 link-stale-ms = 5000                # 1000 to 3600000 (section 8, stale rounds)
 ```
 
-The values shown are the defaults, which are the fixed values and flag
-defaults before OPS-LOG: a config without the tables behaves exactly as
-before. Errors: `HEALTH_VALUE_OUT_OF_RANGE` or `WATCH_INTERVAL_OUT_OF_RANGE`
+The values shown are the defaults. For the keys that existed as fixed
+values or flags before OPS-LOG they are those values. Behaviour change on
+upgrade: `FRAMES_QUARANTINED` and `TX_INVALID_DESCS` are new, so a config
+without the tables now also warns on those counters and ends the run when a
+port reaches 64 of either (set `frames-quarantined-fatal = 0` and
+`tx-invalid-descs-fatal = 0` to keep the old never-fatal behaviour). The
+kernel's `tx_invalid_descs` also counts TX descriptors it dropped in copy
+(generic) mode because it could not build the packet (for example
+`-EOVERFLOW`), not only malformed ones; a port that sees those regularly
+needs a higher threshold or 0.
+
+`health-interval-ms` is coupled to the conditions it samples:
+`KICK_ERRORS` needs growth in every sample and `FILL_STARVED` a sample
+without RX, so a shorter interval sees fewer of them (a sample can fall
+between two kick retries or two arrivals) and a longer one reacts later.
+The minimum is 100 ms for that reason; the time thresholds are in
+milliseconds but act at sample granularity (a 1000 ms warning fires at the
+first sample at or after 1 s). Errors: `HEALTH_VALUE_OUT_OF_RANGE` or `WATCH_INTERVAL_OUT_OF_RANGE`
 with `path=health.<key>` (or `watch.<key>`), `limit=` the bound crossed and
 `actual=` the value; `HEALTH_FATAL_BELOW_WARNING` when both TX stall keys
 are set and the fatal one (not 0) is below the warning.
@@ -1493,7 +1512,8 @@ flag thus stays the fallback at every reload of a config without the key.
 A flag given with a value other than its default under a config that sets
 its key is overridden, with one startup warning: `warning:
 --tx-stall-warn-secs is overridden by [health] tx-stall-warn-ms of the
-config`. After the merge the fatal TX stall bound (when not 0) must still
+config`. The override warning is given at startup only (a reload applies
+the key without repeating it). After the merge the fatal TX stall bound (when not 0) must still
 be at least the warning: a config `tx-stall-warn-ms = 20000` without
 `tx-stall-fatal-ms` under the default flag (10 s) is refused at startup
 (`invalid config: stage=health code=HEALTH_FATAL_BELOW_WARNING
@@ -1514,8 +1534,15 @@ next sample; a raised one gives it more time. Lowering
 `link-probe-failures-fatal` below a port's current failure count makes
 its next failed query fatal. `ruster plan` does not list `[health]` or
 `[watch]` changes (they are no publication state); a reload that changes
-only them still publishes a new generation (state carried by default,
-section 6).
+only them still publishes a new generation, so its state follows `[reload]
+state` of the new document like every reload (section 6): carried by
+default, but under `state = "flush"` a reload made only to change a
+threshold also flushes every NAT44 mapping and session, firewall flow, and
+learned ARP neighbor. Keep `state = "carry"` (the default) when tuning
+thresholds on a busy router. (Applying watch-only changes without a
+publication would be a second reload path with its own failure and
+counter semantics; one atomic path is simpler to reason about, so it is
+not done.)
 
 A busy healthy link never trips these: completions retire the oldest
 frame, RX keeps arriving, kicks succeed. A link that is down holds its TX

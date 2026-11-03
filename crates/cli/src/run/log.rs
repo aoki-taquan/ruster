@@ -30,10 +30,17 @@
 //! `\`, every control character, DEL, and every non-ASCII character are
 //! escaped (`\uXXXX`, surrogate pairs above the BMP), invalid UTF-8
 //! becomes U+FFFD. A value can therefore never end the line or forge
-//! another event (log injection); the messages are value-free by design
-//! anyway (interface ids, codes, and counts; no device name, address, or
-//! config path).
+//! another event (log injection). The messages are value-free by design
+//! anyway: interface ids, codes, counts, and fixed names; no device name,
+//! address, or path from the config or the command line (the one directory
+//! named, in `FS_CONFINE_WARNING`, is one of the fixed
+//! [`super::fs_confine::BROAD_DIRECTORIES`], a `&'static str` by type).
+//!
+//! Numbers are unsigned 64-bit counters written exactly; a consumer that
+//! parses JSON numbers as IEEE doubles (JavaScript, `jq` before 1.7) loses
+//! precision above 2^53 (a counter that large takes years at line rate).
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -474,18 +481,21 @@ pub fn stats_object(header: &str, lines: &[String], truncated: bool, millis: u64
         out.push_str(",\"truncated\":true");
     }
     out.push_str(",\"stats\":{");
-    let mut seen: Vec<&str> = Vec::with_capacity(lines.len());
+    // Linear in the block (a 256-port block has about 28k lines): the keys
+    // are unique by construction, the set only keeps a duplicate from
+    // making invalid JSON.
+    let mut seen: HashSet<&str> = HashSet::with_capacity(lines.len());
     for line in lines {
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if !is_key(key) || seen.contains(&key) {
+        if !is_key(key) || seen.contains(key) {
             continue;
         }
         if !seen.is_empty() {
             out.push(',');
         }
-        seen.push(key);
+        seen.insert(key);
         push_json_string(&mut out, key);
         out.push(':');
         push_value(&mut out, value, true);
@@ -589,14 +599,24 @@ impl<W: Write> JsonLines<W> {
 }
 
 impl<W: Write> Write for JsonLines<W> {
+    /// Linear in the bytes written: one scan with a cursor over the
+    /// pending bytes, one drain of the translated lines at the end.
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.pending.extend_from_slice(bytes);
-        while let Some(end) = self.pending.iter().position(|byte| *byte == b'\n') {
-            let rest = self.pending.split_off(end + 1);
-            let mut line = std::mem::replace(&mut self.pending, rest);
-            line.pop();
-            self.line(&line)?;
+        let pending = std::mem::take(&mut self.pending);
+        let mut start = 0;
+        let mut result = Ok(());
+        while let Some(end) = pending[start..].iter().position(|byte| *byte == b'\n') {
+            let line = &pending[start..start + end];
+            start += end + 1;
+            if let Err(error) = self.line(line) {
+                result = Err(error);
+                break;
+            }
         }
+        self.pending = pending;
+        self.pending.drain(..start);
+        result?;
         // A runaway partial line is translated in pieces (bounded).
         if self.pending.len() > MAX_MSG_BYTES {
             let line = std::mem::take(&mut self.pending);

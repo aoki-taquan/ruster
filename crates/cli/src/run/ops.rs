@@ -320,7 +320,7 @@ mod tests {
              frames-quarantined-fatal = 0\ntx-invalid-descs-fatal = 5\n\
              fill-starved-warn-ms = 200\nlink-probe-failures-fatal = 7\n\
              link-dump-interrupted-fatal = 11\n\n\
-             [watch]\nhealth-interval-ms = 50\nlink-interval-ms = 250\nlink-stale-ms = 1000",
+             [watch]\nhealth-interval-ms = 150\nlink-interval-ms = 250\nlink-stale-ms = 1000",
         );
         let ops = Ops::resolve(&keyed, flags).expect("resolves");
         assert_eq!(
@@ -339,7 +339,7 @@ mod tests {
                     frames_quarantined_fatal: None,
                     tx_invalid_descs_fatal: Some(5),
                 },
-                health_interval_ms: 50,
+                health_interval_ms: 150,
                 link_interval_ms: 250,
                 link_stale_ms: 1_000,
             }

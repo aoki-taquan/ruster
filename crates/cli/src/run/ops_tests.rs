@@ -1714,7 +1714,7 @@ fn a_document_key_overrides_its_flag_with_a_warning() {
 }
 
 /// OPS-LOG: quarantined frames and kernel-refused TX descriptors are
-/// health conditions: growth warns, a sample without growth recovers, and
+/// health conditions: growth warns once per episode, and
 /// the count since startup at the `[health]` threshold is fatal (exit 1,
 /// drained and closed like every fatal event).
 #[test]
@@ -1750,8 +1750,8 @@ fn quarantined_frames_and_invalid_tx_descriptors_warn_and_become_fatal() {
     assert_eq!(
         lines,
         [
-            "ruster run: warning: port=if2 health=FRAMES_QUARANTINED",
-            "ruster run: recovered: port=if2 health=FRAMES_QUARANTINED",
+            // One episode: the samples 100 ms apart never stay quiet for
+            // INTEGRITY_QUIET_MS, so no recovered/warning pair in between.
             "ruster run: warning: port=if2 health=FRAMES_QUARANTINED",
             "ruster run: fatal: port=if2 health=FRAMES_QUARANTINED",
         ],

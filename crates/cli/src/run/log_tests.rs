@@ -95,6 +95,7 @@ impl Parser<'_> {
     fn object(&mut self) -> Result<Json, String> {
         self.expect(b'{')?;
         let mut members: Vec<(String, Json)> = Vec::new();
+        let mut names = std::collections::HashSet::new();
         self.skip_space();
         if self.peek() == Some(b'}') {
             self.at += 1;
@@ -103,7 +104,7 @@ impl Parser<'_> {
         loop {
             self.skip_space();
             let key = self.string()?;
-            if members.iter().any(|(name, _)| *name == key) {
+            if !names.insert(key.clone()) {
                 return Err(format!("duplicate key {key:?}"));
             }
             self.skip_space();
@@ -194,11 +195,20 @@ impl Parser<'_> {
                     }
                 }
                 0..=0x1f => return Err(format!("raw control byte at {}", self.at - 1)),
+                0x20..=0x7f => text.push(char::from(byte)),
                 _ => {
-                    // Copy one UTF-8 character.
+                    // Copy one UTF-8 character (at most 4 bytes; checking
+                    // the whole rest would make the parser quadratic).
                     let start = self.at - 1;
-                    let rest =
-                        std::str::from_utf8(&self.bytes[start..]).map_err(|_| "invalid UTF-8")?;
+                    let end = (start + 4).min(self.bytes.len());
+                    let rest = match std::str::from_utf8(&self.bytes[start..end]) {
+                        Ok(rest) => rest,
+                        Err(error) if error.valid_up_to() > 0 => {
+                            std::str::from_utf8(&self.bytes[start..start + error.valid_up_to()])
+                                .map_err(|_| "invalid UTF-8")?
+                        }
+                        Err(_) => return Err("invalid UTF-8".into()),
+                    };
                     let character = rest.chars().next().ok_or("empty")?;
                     self.at = start + character.len_utf8();
                     text.push(character);
@@ -796,4 +806,44 @@ fn the_test_parser_is_strict() {
         assert!(parse_json(bad).is_err(), "{bad}");
     }
     assert!(parse_json("{\"a\":[1,-2.5e3,true,null,{}]}").is_ok());
+}
+
+/// M1 (PR #339 review): the translation is linear in the block size. A
+/// block of 30000 lines (a 256-port run has about 28k), in one write and
+/// again line by line, becomes one object well within a generous budget
+/// (the quadratic version took about 2.6 s for 28k lines; this takes
+/// milliseconds). Before the fix the output thread fell behind and the
+/// final block could miss the 1 s exit wait.
+#[test]
+fn a_large_stats_block_translates_in_linear_time() {
+    let mut block = String::from("ruster-run-stats kind=final uptime-ms=1\n");
+    for index in 0..30_000 {
+        block.push_str(&format!(
+            "if{}.watch.counter_{index}={index}\n",
+            index % 256
+        ));
+    }
+    block.push_str("end\n");
+    let started = std::time::Instant::now();
+    let mut whole = JsonLines::with_clock(Vec::new(), || 0);
+    whole.write_all(block.as_bytes()).expect("vec");
+    whole.flush().expect("vec");
+    let mut chunked = JsonLines::with_clock(Vec::new(), || 0);
+    for line in block.split_inclusive('\n') {
+        chunked.write_all(line.as_bytes()).expect("vec");
+    }
+    chunked.flush().expect("vec");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(2),
+        "30000-line block took {elapsed:?}"
+    );
+    for bytes in [whole.into_inner(), chunked.into_inner()] {
+        let objects = parse_lines(&bytes);
+        let [stats] = objects.as_slice() else {
+            panic!("{} objects", objects.len());
+        };
+        assert_eq!(stats.get("stats").expect("stats").keys().len(), 30_000);
+        assert!(stats.get("truncated").is_none());
+    }
 }

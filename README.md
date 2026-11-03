@@ -1112,13 +1112,13 @@ sudo kill -HUP <pid>                                               # configをre
   `kick-errors-fatal-ms` 5000、`fill-starved-warn-ms` 1000、`link-probe-failures-fatal` 3、
   `link-dump-interrupted-fatal` 10、`frames-quarantined-fatal` 64、`tx-invalid-descs-fatal` 64）と
   `[watch]`（`health-interval-ms` 500、`link-interval-ms` 1000、`link-stale-ms` 5000）のconfig key。既定は
-  従来値、範囲外は`HEALTH_VALUE_OUT_OF_RANGE`/`WATCH_INTERVAL_OUT_OF_RANGE`でfail closed、fatalの0は
+  従来値（ただし下のquarantine/`tx_invalid_descs`のfatalは新しい挙動）、範囲外は`HEALTH_VALUE_OUT_OF_RANGE`/`WATCH_INTERVAL_OUT_OF_RANGE`でfail closed、fatalの0は
   warningだけ。すべてreload可能で、適用されたreloadの次のsampleから効き、値が変わると
   `watch settings applied: ...`。優先順位はkeyごとにconfig → 旧flag（`--tx-stall-warn-secs`、
   `--tx-stall-fatal-secs`、`--kick-errors-fatal-secs`、`--link-stale-secs`。deprecated、keyの無い時の
   fallback）→ 既定。merge後にfatalがwarning未満なら`stage=health code=HEALTH_FATAL_BELOW_WARNING`
   （起動はexit 2、reloadは失敗して旧設定のまま）。AF_XDPのframe quarantineとkernelの`tx_invalid_descs`は
-  health condition `FRAMES_QUARANTINED`/`TX_INVALID_DESCS`（増加でwarning、起動後の累計が閾値でfatal）。
+  health condition `FRAMES_QUARANTINED`/`TX_INVALID_DESCS`（増加でwarning、10 s増えなければrecovered、起動後の累計が閾値（既定64、0で無効）でfatal。upgrade時の挙動変更）。
 - structured log（OPS-LOG）: `--log-format json`で`ruster run`の全行を一行一つのJSON object（schema
   `ruster-run-log/v1`: `schema`、`ts`（UTC、RFC 3339 ms）、`level`、`event`（stable code）、`msg`、
   `fields`（`key=value`を型付き）、stats blockは`event: STATS`の`stats` object）にします。既定の`text`は

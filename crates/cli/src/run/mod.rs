@@ -570,6 +570,7 @@ where
             candidate,
             &mut storage,
             settings,
+            (fallback, ops),
             notify,
             clock,
             stop,
@@ -689,6 +690,7 @@ fn execute_packet<H, K, R, C, S, O, E>(
     candidate: ValidatedCandidate,
     storage: &mut FullServiceStorage,
     settings: Settings,
+    (fallback, resolved): (ops::Fallback, ops::Ops),
     notify: Notifier,
     clock: &mut C,
     stop: &S,
@@ -705,11 +707,6 @@ where
     E: Write,
 {
     let Some(backend) = config.backend().af_packet() else {
-        return EXIT_INVALID;
-    };
-    // Resolved once already by `execute` (same inputs).
-    let fallback = ops::Fallback::from(&settings);
-    let Ok(resolved) = ops::Ops::resolve(&config, fallback) else {
         return EXIT_INVALID;
     };
     if let Err(error) = host.preflight_packet(settings.privileges) {

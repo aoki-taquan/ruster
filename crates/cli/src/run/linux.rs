@@ -21,6 +21,7 @@ use ruster_io_xdp_native::{
 
 use super::checks::linux::PortSysctls;
 use super::checks::{self, CheckFailure, DeviceFacts, PrivilegeFailure, Probe};
+use super::engine::HealthSample;
 use super::engine::{ClockedIo, Datapath, DrainProgress, IdleWake, LinkMonitor, WaitError};
 use super::fs_confine::{self, FsFailure, FsReport};
 use super::netlink::{Dump, Family, IfName, LinkFacts, LinkProbe, NetlinkError};
@@ -377,11 +378,22 @@ impl<'s> Datapath for XdpDatapath<'s> {
     }
 
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
+        self.sample(&mut |sample| {
+            if let HealthSample::Port(sample) = sample {
+                visit(sample);
+            }
+        });
+    }
+
+    /// Both samples of each port, the health counters and the integrity
+    /// counters (quarantined frames and the kernel's `tx_invalid_descs`,
+    /// OPS-LOG), from ONE `getsockopt(XDP_STATISTICS)` per port; no
+    /// allocation.
+    fn sample(&self, visit: &mut impl FnMut(HealthSample)) {
         for interface in self.io.interfaces() {
-            // One getsockopt(XDP_STATISTICS) per port; no allocation.
             if let Some(stats) = self.io.port_stats(interface) {
                 let counters = stats.counters;
-                visit(PortSample {
+                visit(HealthSample::Port(PortSample {
                     interface,
                     polls: counters.polls,
                     tx_inflight: counters.tx_inflight,
@@ -392,22 +404,12 @@ impl<'s> Datapath for XdpDatapath<'s> {
                     fill_ring_occupancy: counters.fill_ring_occupancy,
                     rx_packets: counters.rx_packets,
                     device_gone: false,
-                });
-            }
-        }
-    }
-
-    /// The quarantined frames and the kernel's `tx_invalid_descs` of each
-    /// port (one more `getsockopt(XDP_STATISTICS)` per port per health
-    /// sample; no allocation).
-    fn sample_integrity(&self, visit: &mut impl FnMut(IntegritySample)) {
-        for interface in self.io.interfaces() {
-            if let Some(stats) = self.io.port_stats(interface) {
-                visit(IntegritySample {
+                }));
+                visit(HealthSample::Integrity(IntegritySample {
                     interface,
-                    frames_quarantined: stats.counters.frames_quarantined,
-                    tx_invalid_descs: stats.counters.kernel_tx_invalid_descs,
-                });
+                    frames_quarantined: counters.frames_quarantined,
+                    tx_invalid_descs: counters.kernel_tx_invalid_descs,
+                }));
             }
         }
     }

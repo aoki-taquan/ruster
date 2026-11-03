@@ -2060,12 +2060,12 @@ fn health_and_watch_keys_are_optional_and_bounded() {
     );
     let watch = validated(&with(
         "watch",
-        "health-interval-ms = 10\nlink-interval-ms = 60000\nlink-stale-ms = 1000",
+        "health-interval-ms = 100\nlink-interval-ms = 60000\nlink-stale-ms = 1000",
     ));
     assert_eq!(
         watch.watch(),
         WatchV1 {
-            health_interval_ms: Some(10),
+            health_interval_ms: Some(100),
             link_interval_ms: Some(60_000),
             link_stale_ms: Some(1_000),
         }
@@ -2153,9 +2153,9 @@ fn health_and_watch_keys_are_optional_and_bounded() {
         (
             "watch",
             "health-interval-ms",
-            9,
+            99,
             "WATCH_INTERVAL_OUT_OF_RANGE",
-            10,
+            100,
         ),
         (
             "watch",

@@ -371,7 +371,7 @@ pub struct Preparer<K: ProductionKeySource, C> {
     source: C,
     /// The document of the last `Ready` answer, until it is applied or the
     /// next request.
-    next: Option<ValidatedConfigV1>,
+    next: Option<(ValidatedConfigV1, Ops)>,
     /// What a `[health]`/`[watch]` key falls back to (OPS-LOG).
     fallback: Fallback,
     /// The watch settings of the current document.
@@ -418,6 +418,13 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             Ok(next) => next,
             Err(error) => return Prepared::Failed(error.render()),
         };
+        // The merged watch settings first (the document validator bounded
+        // each key): a disagreement with a flag fails the reload before a
+        // generation is drawn.
+        let ops = match Ops::resolve(&next, self.fallback) {
+            Ok(ops) => ops,
+            Err(error) => return Prepared::Failed(error.to_string()),
+        };
         let candidate = match self.sequencer.candidate(&next) {
             Ok(candidate) => candidate,
             Err(SequencerError::Bridge(error)) => {
@@ -432,12 +439,6 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
         if plan.requires_restart() {
             return Prepared::Refused(plan.restart_required().into());
         }
-        // The merged watch settings (the document validator bounded each
-        // key): a disagreement with a flag fails the reload.
-        let ops = match Ops::resolve(&next, self.fallback) {
-            Ok(ops) => ops,
-            Err(error) => return Prepared::Failed(error.to_string()),
-        };
         let ready = Ready {
             ops,
             candidate: Some(candidate),
@@ -445,16 +446,14 @@ impl<K: ProductionKeySource, C: ConfigSource> Preparer<K, C> {
             counts: DocumentCounts::of(&next),
             sweep: config_cmd::sweep_warnings(&next),
         };
-        self.next = Some(next);
+        self.next = Some((next, ops));
         Prepared::Ready(Box::new(ready))
     }
 
     /// The last prepared document was applied.
     pub fn applied(&mut self) {
-        if let Some(next) = self.next.take() {
-            if let Ok(ops) = Ops::resolve(&next, self.fallback) {
-                self.ops = ops;
-            }
+        if let Some((next, ops)) = self.next.take() {
+            self.ops = ops;
             self.current = next;
         }
     }

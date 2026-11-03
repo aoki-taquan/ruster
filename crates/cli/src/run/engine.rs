@@ -173,12 +173,20 @@ pub trait Datapath {
     /// allocation).
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample));
 
-    /// Hands each port's integrity counters to `visit` right after
-    /// [`Self::sample_ports`] (cold path, no allocation; OPS-LOG). AF_XDP
-    /// only: nothing by default (AF_PACKET has no frame ownership ledger
-    /// and no `XDP_STATISTICS`).
+    /// Hands each port's integrity counters to `visit` (cold path, no
+    /// allocation; OPS-LOG). AF_XDP only: nothing by default (AF_PACKET
+    /// has no frame ownership ledger and no `XDP_STATISTICS`).
     fn sample_integrity(&self, visit: &mut impl FnMut(IntegritySample)) {
         let _ = visit;
+    }
+
+    /// Every health sample of one round: by default
+    /// [`Self::sample_ports`] then [`Self::sample_integrity`]. A backend
+    /// that reads both from one kernel call per port overrides this (the
+    /// AF_XDP datapath: one `getsockopt(XDP_STATISTICS)` per port).
+    fn sample(&self, visit: &mut impl FnMut(HealthSample)) {
+        self.sample_ports(&mut |sample| visit(HealthSample::Port(sample)));
+        self.sample_integrity(&mut |sample| visit(HealthSample::Integrity(sample)));
     }
 
     /// Cold-path upkeep right before each health sample (at most every
@@ -203,6 +211,14 @@ pub trait Datapath {
             }
         }
     }
+}
+
+/// One health sample of one port (cold path).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HealthSample {
+    Port(PortSample),
+    /// AF_XDP integrity counters (OPS-LOG).
+    Integrity(IntegritySample),
 }
 
 /// rtnetlink link queries of the ports (cold path; the link watcher
@@ -1028,8 +1044,10 @@ where
     let watch = &mut control.watch;
     if watch.health_due(now, settings.health_interval_ms) {
         datapath.refresh();
-        datapath.sample_ports(&mut |sample| watch.on_sample(now, sample, &mut on_event));
-        datapath.sample_integrity(&mut |sample| watch.on_integrity(sample, &mut on_event));
+        datapath.sample(&mut |sample| match sample {
+            HealthSample::Port(sample) => watch.on_sample(now, sample, &mut on_event),
+            HealthSample::Integrity(sample) => watch.on_integrity(now, sample, &mut on_event),
+        });
     }
     if let Some(round) = control.links.poll() {
         watch.on_round(round, &mut on_event);

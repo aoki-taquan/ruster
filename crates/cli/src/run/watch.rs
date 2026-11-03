@@ -19,8 +19,8 @@
 //! | `TX_STALL` | TX is in flight and the oldest in-flight frame stays the same (no completion of it), while the link is up | [`Thresholds::tx_stall_warn_ms`] (default 1 s) | [`Thresholds::tx_stall_fatal_ms`] (default 10 s, `None`: never) |
 //! | `FILL_STARVED` | Fill holds no frame in the kernel, no RX arrived, and the engine found its free list empty (`fill_starved` grew) since the last sample | [`Limits::fill_starved_warn_ms`] (default [`FILL_STARVED_WARN_MS`]) | never (a symptom; the frames are held by TX, which `TX_STALL` covers) |
 //! | `KICK_ERRORS` | `kick_errors` (kick failures other than `ENETDOWN`) grew in every sample | first growth | [`Thresholds::kick_errors_fatal_ms`] (default 5 s, `None`: never) of growth in every sample |
-//! | `FRAMES_QUARANTINED` | AF_XDP: the port's quarantined frames grew since the last sample ([`IntegritySample`]) | each growth (recovered without growth) | the count since startup at [`Limits::frames_quarantined_fatal`] (default 64, `None`: never) |
-//! | `TX_INVALID_DESCS` | AF_XDP: the kernel's `tx_invalid_descs` of the port grew | each growth (recovered without growth) | the count since startup at [`Limits::tx_invalid_descs_fatal`] (default 64, `None`: never) |
+//! | `FRAMES_QUARANTINED` | AF_XDP: the port's quarantined frames grew since the last sample ([`IntegritySample`]) | first growth of an episode (recovered after [`INTEGRITY_QUIET_MS`] without growth) | the count since startup at [`Limits::frames_quarantined_fatal`] (default 64, `None`: never) |
+//! | `TX_INVALID_DESCS` | AF_XDP: the kernel's `tx_invalid_descs` of the port grew | first growth of an episode (recovered after [`INTEGRITY_QUIET_MS`] without growth) | the count since startup at [`Limits::tx_invalid_descs_fatal`] (default 64, `None`: never) |
 //!
 //! The thresholds and both intervals come from the config's `[health]` and
 //! `[watch]` keys, falling back to `--tx-stall-warn-secs`,
@@ -601,6 +601,20 @@ impl Timed {
     }
 }
 
+/// A counted condition's episode (OPS-LOG): warned, and when its counter
+/// last grew.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct Episode {
+    warned: bool,
+    last_growth: Option<MonotonicMillis>,
+}
+
+/// A warned integrity condition recovers only after its counter did not
+/// grow for this long, so a slow trickle (one quarantined frame every few
+/// seconds under a disabled fatal exit) is one episode, not a
+/// warning/recovered pair per sample.
+pub const INTEGRITY_QUIET_MS: u64 = 10_000;
+
 /// Watch state of one port.
 #[derive(Clone, Copy, Debug)]
 struct PortWatch {
@@ -631,8 +645,8 @@ struct PortWatch {
     uppers_warned: bool,
     /// The last integrity sample (OPS-LOG).
     integrity: Option<IntegritySample>,
-    quarantine_warned: bool,
-    invalid_descs_warned: bool,
+    quarantine: Episode,
+    invalid_descs: Episode,
     limits: Limits,
     counters: PortHealth,
     /// AF_PACKET: the kernel exposure conditions that end the run.
@@ -819,8 +833,8 @@ impl Watch {
                     stale_warned: false,
                     uppers_warned: false,
                     integrity: None,
-                    quarantine_warned: false,
-                    invalid_descs_warned: false,
+                    quarantine: Episode::default(),
+                    invalid_descs: Episode::default(),
                     limits: Limits::default(),
                     exposure_fatal: None,
                     counters: PortHealth {
@@ -880,17 +894,23 @@ impl Watch {
         )
     }
 
-    /// Folds one integrity sample of `sample.interface` (AF_XDP, OPS-LOG):
-    /// growth since the last sample warns (`FRAMES_QUARANTINED`,
-    /// `TX_INVALID_DESCS`), a sample without growth recovers, and a count
-    /// since startup at the [`Limits`] threshold is fatal.
-    pub fn on_integrity(&mut self, sample: IntegritySample, emit: &mut impl FnMut(WatchEvent)) {
+    /// Folds one integrity sample of `sample.interface` at `now` (AF_XDP,
+    /// OPS-LOG): growth warns once per episode (`FRAMES_QUARANTINED`,
+    /// `TX_INVALID_DESCS`), the episode recovers once the counter has not
+    /// grown for [`INTEGRITY_QUIET_MS`], and a count since startup at the
+    /// [`Limits`] threshold is fatal.
+    pub fn on_integrity(
+        &mut self,
+        now: MonotonicMillis,
+        sample: IntegritySample,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
         if let Some(port) = self
             .ports
             .iter_mut()
             .find(|port| port.target.interface == sample.interface)
         {
-            port.integrity(sample, emit);
+            port.integrity(now, sample, emit);
         }
     }
 
@@ -1080,8 +1100,8 @@ impl Watch {
                 || port.weak_host_warned
                 || port.stale_warned
                 || port.uppers_warned
-                || port.quarantine_warned
-                || port.invalid_descs_warned
+                || port.quarantine.warned
+                || port.invalid_descs.warned
         })
     }
 
@@ -1397,7 +1417,12 @@ impl PortWatch {
     }
 
     /// See [`Watch::on_integrity`].
-    fn integrity(&mut self, sample: IntegritySample, emit: &mut impl FnMut(WatchEvent)) {
+    fn integrity(
+        &mut self,
+        now: MonotonicMillis,
+        sample: IntegritySample,
+        emit: &mut impl FnMut(WatchEvent),
+    ) {
         // Counted from 0: the port opened at startup with both at 0. Never
         // backwards: a sample whose kernel statistics could not be read
         // reports 0 for them, which must not look like growth afterwards.
@@ -1415,42 +1440,54 @@ impl PortWatch {
         self.counters.frames_quarantined = sample.frames_quarantined;
         self.counters.tx_invalid_descs = sample.tx_invalid_descs;
         self.counted(
+            now,
             sample.frames_quarantined,
             last.frames_quarantined,
-            |port| &mut port.quarantine_warned,
+            |port| &mut port.quarantine,
             (Condition::FramesQuarantined, Fatal::FramesQuarantined),
             self.limits.frames_quarantined_fatal,
             emit,
         );
         self.counted(
+            now,
             sample.tx_invalid_descs,
             last.tx_invalid_descs,
-            |port| &mut port.invalid_descs_warned,
+            |port| &mut port.invalid_descs,
             (Condition::TxInvalidDescs, Fatal::TxInvalidDescs),
             self.limits.tx_invalid_descs_fatal,
             emit,
         );
     }
 
-    /// A cumulative counter condition: growth warns once per episode, a
-    /// sample without growth recovers, and `count` at `fatal` or above
-    /// ends the run.
+    /// A cumulative counter condition: growth warns once per episode, the
+    /// episode recovers after [`INTEGRITY_QUIET_MS`] without growth, and
+    /// `count` at `fatal` or above ends the run.
+    #[allow(clippy::too_many_arguments)]
     fn counted(
         &mut self,
+        now: MonotonicMillis,
         count: u64,
         last: u64,
-        flag: fn(&mut Self) -> &mut bool,
+        episode: fn(&mut Self) -> &mut Episode,
         (condition, cause): (Condition, Fatal),
         fatal: Option<u64>,
         emit: &mut impl FnMut(WatchEvent),
     ) {
         if count > last {
-            if !*flag(self) {
-                *flag(self) = true;
+            let state = episode(self);
+            state.last_growth = Some(now);
+            if !std::mem::replace(&mut state.warned, true) {
                 self.warn(condition, emit);
             }
-        } else if std::mem::take(flag(self)) {
-            self.recover(condition, emit);
+        } else {
+            let state = episode(self);
+            let quiet = state
+                .last_growth
+                .is_none_or(|grew| now.0.saturating_sub(grew.0) >= INTEGRITY_QUIET_MS);
+            if state.warned && quiet {
+                state.warned = false;
+                self.recover(condition, emit);
+            }
         }
         // Also without growth: a threshold lowered by a reload below the
         // count acts at once.

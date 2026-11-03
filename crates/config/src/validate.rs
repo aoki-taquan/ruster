@@ -2275,8 +2275,11 @@ pub const HEALTH_LINK_DUMP_INTERRUPTED_RANGE: (u64, u64) = (1, 1_000);
 /// Largest `[health] frames-quarantined-fatal` and
 /// `tx-invalid-descs-fatal` (0 disables the fatal exit).
 pub const HEALTH_INTEGRITY_FATAL_MAX: u64 = 1_000_000;
-/// Bounds of `[watch] health-interval-ms`.
-pub const WATCH_HEALTH_INTERVAL_RANGE: (u64, u64) = (10, 60_000);
+/// Bounds of `[watch] health-interval-ms`. At least 100 ms: `KICK_ERRORS`
+/// needs growth in every sample and `FILL_STARVED` a sample without RX,
+/// so a much shorter interval would sample between kick retries and
+/// arrivals and rarely see either (PR #339 review L4).
+pub const WATCH_HEALTH_INTERVAL_RANGE: (u64, u64) = (100, 60_000);
 /// Bounds of `[watch] link-interval-ms`.
 pub const WATCH_LINK_INTERVAL_RANGE: (u64, u64) = (100, 60_000);
 /// Bounds of `[watch] link-stale-ms`.

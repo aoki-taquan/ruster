@@ -1332,9 +1332,10 @@ fn an_interrupted_upper_device_dump_fails_closed_only_after_its_own_threshold() 
     );
 }
 
-fn integrity(watch: &mut Watch, frames: u64, descs: u64) -> Vec<WatchEvent> {
+fn integrity(watch: &mut Watch, at: u64, frames: u64, descs: u64) -> Vec<WatchEvent> {
     let mut events = Vec::new();
     watch.on_integrity(
+        MonotonicMillis(at),
         IntegritySample {
             interface: PORT,
             frames_quarantined: frames,
@@ -1346,10 +1347,10 @@ fn integrity(watch: &mut Watch, frames: u64, descs: u64) -> Vec<WatchEvent> {
 }
 
 /// OPS-LOG: growth of the quarantine or the kernel's invalid TX
-/// descriptors warns once per episode, a sample without growth recovers,
-/// the count since startup at the threshold is fatal, `None` never is,
-/// and a reading that went back (an unreadable `XDP_STATISTICS`) is not
-/// growth afterwards.
+/// descriptors warns once per episode, the episode recovers after
+/// `INTEGRITY_QUIET_MS` without growth, the count since startup at the
+/// threshold is fatal, `None` never is, and a reading that went back (an
+/// unreadable `XDP_STATISTICS`) is not growth afterwards.
 #[test]
 fn integrity_counters_warn_recover_and_become_fatal_at_the_threshold() {
     let mut watch = watch().with_limits(Limits {
@@ -1357,31 +1358,34 @@ fn integrity_counters_warn_recover_and_become_fatal_at_the_threshold() {
         tx_invalid_descs_fatal: None,
         ..Limits::default()
     });
-    assert_eq!(integrity(&mut watch, 0, 0), []);
+    assert_eq!(integrity(&mut watch, 0, 0, 0), []);
     assert_eq!(
-        integrity(&mut watch, 1, 0),
+        integrity(&mut watch, 500, 1, 0),
         [warning(Condition::FramesQuarantined)]
     );
     assert!(watch.warning());
-    assert_eq!(integrity(&mut watch, 2, 0), []);
+    assert_eq!(integrity(&mut watch, 1_000, 2, 0), []);
+    // Quiet for less than INTEGRITY_QUIET_MS: still the same episode.
+    assert_eq!(integrity(&mut watch, 10_999, 2, 0), []);
+    assert!(watch.warning());
     assert_eq!(
-        integrity(&mut watch, 2, 0),
+        integrity(&mut watch, 11_000, 2, 0),
         [recovered(Condition::FramesQuarantined)]
     );
     assert!(!watch.warning());
     // TX descriptors: warning only (no threshold), however many.
     assert_eq!(
-        integrity(&mut watch, 2, 1_000_000),
+        integrity(&mut watch, 11_500, 2, 1_000_000),
         [warning(Condition::TxInvalidDescs)]
     );
     // The kernel statistics unreadable (0), then back: no new growth.
+    assert_eq!(integrity(&mut watch, 12_000, 2, 0), []);
     assert_eq!(
-        integrity(&mut watch, 2, 0),
+        integrity(&mut watch, 21_500, 2, 1_000_000),
         [recovered(Condition::TxInvalidDescs)]
     );
-    assert_eq!(integrity(&mut watch, 2, 1_000_000), []);
     assert_eq!(
-        integrity(&mut watch, 3, 1_000_000),
+        integrity(&mut watch, 22_000, 3, 1_000_000),
         [
             warning(Condition::FramesQuarantined),
             fatal(Fatal::FramesQuarantined)
@@ -1395,6 +1399,7 @@ fn integrity_counters_warn_recover_and_become_fatal_at_the_threshold() {
     // Another port's sample changes nothing.
     let mut events = Vec::new();
     watch.on_integrity(
+        MonotonicMillis(30_000),
         IntegritySample {
             interface: IfId(9),
             frames_quarantined: 99,
@@ -1406,10 +1411,24 @@ fn integrity_counters_warn_recover_and_become_fatal_at_the_threshold() {
     // Defaults: 64 each, the first growth warns.
     let mut watch = Watch::new(&[TARGET], Thresholds::default());
     assert_eq!(
-        integrity(&mut watch, 0, 63),
+        integrity(&mut watch, 0, 0, 63),
         [warning(Condition::TxInvalidDescs)]
     );
-    assert_eq!(integrity(&mut watch, 0, 64), [fatal(Fatal::TxInvalidDescs)]);
+    assert_eq!(
+        integrity(&mut watch, 500, 0, 64),
+        [fatal(Fatal::TxInvalidDescs)]
+    );
+    // A slow trickle under a disabled fatal exit (one frame every 3 s for a
+    // minute) is one episode: one warning, no recovered/warning flapping.
+    let mut watch = Watch::new(&[TARGET], Thresholds::default()).with_limits(Limits {
+        frames_quarantined_fatal: None,
+        ..Limits::default()
+    });
+    let mut events = Vec::new();
+    for step in 0..=120_u64 {
+        events.extend(integrity(&mut watch, step * 500, step / 6, 0));
+    }
+    assert_eq!(events, [warning(Condition::FramesQuarantined)]);
     assert_eq!(Condition::FramesQuarantined.code(), "FRAMES_QUARANTINED");
     assert_eq!(Fatal::TxInvalidDescs.code(), "TX_INVALID_DESCS");
     // Never fatal by kernel exposure policy (AF_PACKET has no such
