@@ -17,23 +17,41 @@
 //! is still empty until then, which the kernel counts as
 //! `rx_fill_ring_empty_descs` drops (the same as an engine that falls
 //! behind), never as frames reaching the kernel stack.
+//!
+//! # AF_PACKET (AFPKT-015)
+//!
+//! An AF_PACKET backend has no per-port session to attach: per port, in
+//! `IfId` order, [`open_packet_ports`] resolves the configured device by
+//! name in the router's namespace, reads its facts, and runs the AF_PACKET
+//! device checks ([`evaluate_packet_device`]); only then does
+//! [`PortHost::open_packet`] open every packet socket at once, a
+//! failure-atomic transaction of `ruster-io-afpacket` that releases
+//! whatever it acquired. The opened datapath owns the sockets and rings;
+//! dropping it (after the drain) unmaps and closes them, so there is
+//! nothing to close port by port and nothing that can stay attached.
 
 use std::fmt;
 
-use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, XdpAttachModeV1};
+use ruster_config::{
+    ValidatedAfPacketPortV1, ValidatedAfPacketV1, ValidatedAfXdpPortV1, ValidatedAfXdpV1,
+    XdpAttachModeV1,
+};
 use ruster_control::{ActivationError, SequencerError, StorageAllocationError};
 use ruster_core::IfId;
+use ruster_io_afpacket::{ConfigError as PacketConfigError, PlatformError};
 use ruster_io_xdp_native::{
     AttachError, CleanupError, DatapathError, RxFillSetupError, SessionConfigError, SessionError,
     SessionFailure, SessionStage, XdpPacketIoSetupError,
 };
 
 use super::checks::{
-    evaluate_device, CheckFailure, CheckPolicy, DeviceFacts, PrivilegeFailure, Probe, Warnings,
+    evaluate_device, evaluate_packet_device, CheckFailure, CheckPolicy, DeviceFacts,
+    PrivilegeFailure, Probe, Warnings,
 };
 use super::engine::{port_label, Datapath, LinkMonitor, StopSignal};
 use super::fs_confine::{FsFailure, FsReport};
 use super::netlink::{IfName, NetlinkError};
+use super::offload::Offload;
 use super::privileges::{DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::seccomp::{ConfineFailure, ConfineReport, SeccompMode};
 use super::watch::LinkTarget;
@@ -121,6 +139,8 @@ pub enum Failure {
     Seccomp(ConfineFailure),
     /// A worker thread could not be spawned.
     Spawn,
+    /// The AF_PACKET backend could not be opened (AFPKT-015).
+    Packet(PacketOpenError),
     /// A failure injected by a test host.
     #[cfg(test)]
     Injected,
@@ -207,10 +227,37 @@ impl fmt::Display for Failure {
             Self::FsConfine(error) => write!(formatter, "{error}"),
             Self::Seccomp(error) => write!(formatter, "{error}"),
             Self::Spawn => formatter.write_str("code=THREAD_SPAWN"),
+            Self::Packet(error) => write!(formatter, "code={error}"),
             #[cfg(test)]
             Self::Injected => formatter.write_str("code=INJECTED"),
             #[cfg(test)]
             Self::InjectedTransient => formatter.write_str("code=INJECTED_TRANSIENT"),
+        }
+    }
+}
+
+/// Why the AF_PACKET backend could not be opened. Value-free.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PacketOpenError {
+    /// The page size could not be read, or the compiled TPACKET_V3 layout
+    /// is not the kernel's ([`PlatformError`]).
+    Platform(PlatformError),
+    /// The backend refused the configured geometry at this page size (or
+    /// an interface index) before acquiring anything.
+    Config(PacketConfigError),
+    /// The resolved ports do not match the configuration (internal).
+    Ports,
+}
+
+impl fmt::Display for PacketOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Platform(PlatformError::Syscall { stage, errno }) => {
+                write!(formatter, "{}/ERRNO_{}", token(stage), errno.get())
+            }
+            Self::Platform(error) => formatter.write_str(&token(error)),
+            Self::Config(error) => write!(formatter, "CONFIG.{}", token(error)),
+            Self::Ports => formatter.write_str("PORTS"),
         }
     }
 }
@@ -344,12 +391,26 @@ pub struct OpenPort<S> {
     pub link: LinkTarget,
 }
 
+/// What [`PortHost::inspect_packet`] reads of one AF_PACKET port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PacketFacts {
+    /// The device facts of the index the name resolved to (`session_mtu`
+    /// is the MTU of that answer, `frame_capacity` the configured
+    /// `max-frame-len`).
+    pub device: DeviceFacts,
+    /// The first active merging receive offload, `None` if all are off;
+    /// `Err` if unreadable.
+    pub offload: Result<Option<Offload>, ()>,
+}
+
 /// The operations startup and teardown need from the platform.
 pub trait PortHost {
     type Session;
     type Datapath<'s>: Datapath
     where
         Self: 's;
+    /// The AF_PACKET datapath (AFPKT-015): owns its sockets and rings.
+    type Packet: Datapath;
     /// Moved to the link watcher thread (H7), hence `Send`.
     type Links: LinkMonitor + Send + 'static;
 
@@ -412,6 +473,29 @@ pub trait PortHost {
     /// Detaches (if attached) and closes one session, releasing every
     /// resource even when a step reports an error.
     fn close(&self, session: Self::Session) -> Result<(), CloseFailure>;
+
+    /// AF_PACKET: `CAP_NET_RAW` and the preconditions of the privilege
+    /// drop of `policy`, before any resource.
+    fn preflight_packet(&self, policy: PrivilegePolicy) -> Result<(), PrivilegeFailure>;
+
+    /// AF_PACKET: resolves `port`'s device by name in the router's network
+    /// namespace and reads its facts (`frame_capacity` is
+    /// `max_frame_len`) and receive offloads. Acquires nothing that
+    /// outlives the call.
+    fn inspect_packet(
+        &self,
+        port: &ValidatedAfPacketPortV1,
+        max_frame_len: u32,
+    ) -> Result<PacketFacts, CheckFailure>;
+
+    /// AF_PACKET: opens every port of `backend` at once, each bound to the
+    /// interface index of its checked target (`targets` in `IfId` order,
+    /// one per port). Failure atomic: on error nothing stays open.
+    fn open_packet(
+        &self,
+        backend: &ValidatedAfPacketV1,
+        targets: &[LinkTarget],
+    ) -> Result<Self::Packet, Failure>;
 }
 
 /// Sessions opened so far, closed in reverse order by [`Self::close_all`]
@@ -535,4 +619,44 @@ pub fn open_ports<H: PortHost, S: StopSignal>(
             .map_err(|failure| fail(Stage::Attach, failure))?;
     }
     Ok(())
+}
+
+/// Resolves and checks every AF_PACKET port of `backend` in `IfId` order
+/// ([`evaluate_packet_device`], with the device name check of H10) and
+/// returns their link watch targets. Nothing is opened: on `Err` there is
+/// nothing to roll back. `warn` receives each port's non-fatal findings.
+pub fn open_packet_ports<H: PortHost, S: StopSignal>(
+    host: &H,
+    backend: &ValidatedAfPacketV1,
+    policy: CheckPolicy,
+    stop: &S,
+    mut warn: impl FnMut(IfId, &Warnings),
+) -> Result<Vec<LinkTarget>, Interrupt> {
+    let mut targets = Vec::with_capacity(backend.ports().len());
+    for port in backend.ports() {
+        let interface = port.interface();
+        let fail = |failure| {
+            Interrupt::Failed(StartupError::new(
+                Stage::Checks,
+                Some(interface),
+                Failure::Check(failure),
+            ))
+        };
+        if stop.stop() {
+            return Err(Interrupt::Signalled);
+        }
+        let facts = host
+            .inspect_packet(port, backend.max_frame_len())
+            .map_err(fail)?;
+        // The resolved index must carry the configured name: the sysctl
+        // paths of the checks and of the link watch name the device (H10).
+        if IfName::new(port.device().as_bytes()) != Some(facts.device.link_name) {
+            return Err(fail(CheckFailure::Unverifiable(Probe::Name)));
+        }
+        let warnings =
+            evaluate_packet_device(&facts.device, facts.offload, policy).map_err(fail)?;
+        targets.push(link_target(interface, &facts.device));
+        warn(interface, &warnings);
+    }
+    Ok(targets)
 }

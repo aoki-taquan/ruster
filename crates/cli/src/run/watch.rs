@@ -39,7 +39,7 @@
 //!
 //! | event | outcome |
 //! |---|---|
-//! | the interface index is gone (`ENODEV`) | fatal `DEVICE_REMOVED` |
+//! | the interface index is gone (`ENODEV`), or the backend found its bound device gone (AF_PACKET `ENXIO`, [`PortSample::device_gone`]) | fatal `DEVICE_REMOVED` |
 //! | the interface index carries another name than the configured device (`IFLA_IFNAME`, H10) | fatal `DEVICE_RENAMED` |
 //! | MTU below the startup MTU (TX is bounded by the startup MTU, so longer frames than the device now carries could be published and stranded) | fatal `MTU_DECREASED` |
 //! | MTU above what a UMEM frame holds ([`super::checks::mtu_limit`]) | fatal `MTU_ABOVE_FRAME` |
@@ -56,8 +56,13 @@
 //! | with IPv6 enabled on the port: an IPv6 address outside `fe80::/10`, an IPv6 route out of the port beyond the automatic link-local and multicast ones, `net.ipv6.conf.all.forwarding`, `conf/<dev>/forwarding`, a `force_forwarding`, or an IPv6 `mc_forwarding` on | warnings `KERNEL_IPV6_ADDRESSES`, `KERNEL_IPV6_ROUTES`, `KERNEL_IPV6_FORWARDING_ENABLED`, each recovered when gone (or when `disable_ipv6` turns on); not fatal |
 //! | an IPv6 fact is unreadable (`disable_ipv6`/forwarding sysctls, address or route dump) | a failed query of its kind; with `--allow-kernel-ipv6` a warning `IPV6_UNVERIFIABLE` instead |
 //!
+//! On an AF_PACKET port (AFPKT-015) these kernel exposure conditions are
+//! fatal instead, each under the code of its warning, unless the startup
+//! accepted it through an override ([`ExposurePolicy`]): the kernel
+//! processes every frame of an AF_PACKET port while the router runs.
+//!
 //! Kernel forwarding, port addresses, and routes found at run time only
-//! warn: while XDP is attached the kernel sees none of the ports' frames,
+//! warn (AF_XDP): while XDP is attached the kernel sees none of the ports' frames,
 //! so they change nothing, and a fatal exit would detach XDP, which is
 //! exactly what lets the kernel forward around the firewall (and the
 //! supervised restart would then refuse to start). The next startup still
@@ -241,6 +246,10 @@ pub struct PortSample {
     pub fill_ring_occupancy: u64,
     /// Valid RX frames so far.
     pub rx_packets: u64,
+    /// The backend found the port's bound device gone (AF_PACKET: a kick
+    /// failed with `ENXIO`, so the port is unbound for good and its
+    /// in-flight TX never completes): fatal `DEVICE_REMOVED`.
+    pub device_gone: bool,
 }
 
 /// The queries of one link round, each with its own failure count.
@@ -364,6 +373,9 @@ pub enum Fatal {
     MtuDecreased,
     MtuAboveFrame,
     LinkUnverifiable,
+    /// A kernel exposure condition found at run time on an AF_PACKET port
+    /// ([`ExposurePolicy`]); the code is the condition's.
+    KernelExposure(Condition),
 }
 
 impl Fatal {
@@ -376,6 +388,54 @@ impl Fatal {
             Self::MtuDecreased => "MTU_DECREASED",
             Self::MtuAboveFrame => "MTU_ABOVE_FRAME",
             Self::LinkUnverifiable => "LINK_UNVERIFIABLE",
+            Self::KernelExposure(condition) => condition.code(),
+        }
+    }
+}
+
+/// Which kernel exposure conditions end an AF_PACKET run (AFPKT-015).
+///
+/// Under AF_XDP an exposure found at run time only warns: the kernel sees
+/// none of the attached ports' frames, and exiting would detach XDP and
+/// create the exposure. AF_PACKET takes nothing away from the kernel: the
+/// kernel stack processes every frame of the port while the router runs,
+/// so a kernel address, route, forwarding, weak host, or IPv6 stack on the
+/// port is live exposure (the kernel answers, delivers, or forwards around
+/// the firewall and NAT in parallel with the router), and stopping changes
+/// none of it. The run therefore stops (fail closed, exit 1) when one
+/// appears, exactly where the startup would have refused it, so the
+/// operator sees it at once and a supervised restart refuses to start
+/// until it is gone. What the startup accepted through an override stays a
+/// warning: forwarding with `--allow-kernel-forwarding`, the weak host
+/// with `--allow-ipv4-weak-host`, and every IPv6 condition with
+/// `--allow-kernel-ipv6`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExposurePolicy {
+    pub allow_kernel_forwarding: bool,
+    pub allow_kernel_ipv6: bool,
+    pub allow_ipv4_weak_host: bool,
+}
+
+impl ExposurePolicy {
+    /// Whether `condition`, once warned, ends the run.
+    pub const fn is_fatal(self, condition: Condition) -> bool {
+        match condition {
+            Condition::KernelIpv4Addresses | Condition::KernelIpv4Routes => true,
+            Condition::KernelForwardingEnabled => !self.allow_kernel_forwarding,
+            Condition::Ipv4WeakHost => !self.allow_ipv4_weak_host,
+            Condition::KernelIpv6Enabled
+            | Condition::KernelIpv6Addresses
+            | Condition::KernelIpv6Routes
+            | Condition::KernelIpv6ForwardingEnabled => !self.allow_kernel_ipv6,
+            Condition::TxStall
+            | Condition::FillStarved
+            | Condition::KickErrors
+            | Condition::LinkDown
+            | Condition::MtuRaised
+            | Condition::LinkProbe
+            | Condition::ForwardingUnverifiable
+            | Condition::Ipv6Unverifiable
+            | Condition::LinkWatchStale => false,
         }
     }
 }
@@ -462,6 +522,8 @@ struct PortWatch {
     weak_host_warned: bool,
     stale_warned: bool,
     counters: PortHealth,
+    /// AF_PACKET: the kernel exposure conditions that end the run.
+    exposure_fatal: Option<ExposurePolicy>,
 }
 
 /// Cold-path health fields of one port (`if<id>.watch.*`).
@@ -627,6 +689,7 @@ impl Watch {
                     ipv6_enabled_warned: false,
                     weak_host_warned: false,
                     stale_warned: false,
+                    exposure_fatal: None,
                     counters: PortHealth {
                         link_up: true,
                         mtu: target.mtu,
@@ -649,6 +712,16 @@ impl Watch {
     #[must_use]
     pub const fn with_link_stale_ms(mut self, stale_ms: u64) -> Self {
         self.link_stale_ms = stale_ms;
+        self
+    }
+
+    /// AF_PACKET (AFPKT-015): the kernel exposure conditions of `policy`
+    /// end the run instead of only warning ([`ExposurePolicy`]).
+    #[must_use]
+    pub fn failing_on_kernel_exposure(mut self, policy: ExposurePolicy) -> Self {
+        for port in self.ports.iter_mut() {
+            port.exposure_fatal = Some(policy);
+        }
         self
     }
 
@@ -980,6 +1053,12 @@ impl PortWatch {
             port: self.target.interface,
             condition,
         });
+        if self
+            .exposure_fatal
+            .is_some_and(|policy| policy.is_fatal(condition))
+        {
+            self.fatal(Fatal::KernelExposure(condition), emit);
+        }
     }
 
     fn recover(&mut self, condition: Condition, emit: &mut impl FnMut(WatchEvent)) {
@@ -1012,6 +1091,10 @@ impl PortWatch {
         thresholds: Thresholds,
         emit: &mut impl FnMut(WatchEvent),
     ) {
+        if sample.device_gone {
+            self.fatal(Fatal::DeviceRemoved, emit);
+            return;
+        }
         let last = self.last.replace(sample);
         // TX stall: the same oldest frame in flight, with the link up.
         let stamp =

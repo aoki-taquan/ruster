@@ -302,6 +302,7 @@ fn waits_end_at_the_earliest_of_the_loop_deadlines() {
             fill_starved: 0,
             fill_ring_occupancy: 8,
             rx_packets: step,
+            device_gone: false,
         }]
     });
     host.state.samples.borrow_mut().extend(rounds);

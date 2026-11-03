@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use ruster_config::{ValidatedAfXdpPortV1, ValidatedAfXdpV1, ValidatedConfigV1, XdpAttachModeV1};
+use ruster_config::{
+    ValidatedAfPacketPortV1, ValidatedAfPacketV1, ValidatedAfXdpPortV1, ValidatedAfXdpV1,
+    ValidatedConfigV1, XdpAttachModeV1,
+};
 use ruster_control::{OsRandomKeySource, ProductionSequencer};
 use ruster_core::{IfId, MonotonicMillis};
 use ruster_io_sim::SimIo;
@@ -25,10 +28,13 @@ use super::engine::{
 };
 use super::fs_confine::{FsConfineMode, FsFailure, FsReport};
 use super::netlink::{LinkFacts, NetlinkError};
+use super::offload::Offload;
 use super::privileges::{Bounding, DropFailure, DropReport, Identity, PrivilegePolicy};
 use super::reload::ConfigSource;
 use super::seccomp::{ConfineFailure, ConfineReport, SeccompMode};
-use super::startup::{CloseFailure, Failure, OpenPort, PortHost, Stage, StartupError};
+use super::startup::{
+    CloseFailure, Failure, OpenPort, PacketFacts, PacketOpenError, PortHost, Stage, StartupError,
+};
 use super::watch::{Forwarding, Ipv6Sample, LinkTarget, PortSample};
 use super::{execute, Settings, EXIT_DRAIN_INCOMPLETE, EXIT_PRIVILEGE, READY};
 use crate::config_cmd::LoadError;
@@ -86,7 +92,14 @@ enum Event {
     Engine(u16),
     Adapter,
     Drain(u32),
-    Close { port: u16, attached: bool },
+    Close {
+        port: u16,
+        attached: bool,
+    },
+    /// AF_PACKET: every port opened at once, with these interface indexes.
+    OpenPacket([u32; 2]),
+    /// AF_PACKET: the datapath (and with it every socket) dropped.
+    ClosePacket,
 }
 
 #[derive(Default)]
@@ -170,6 +183,11 @@ struct State {
     signal: Cell<bool>,
     /// What `tx_outstanding` reports.
     tx_outstanding: Cell<bool>,
+    /// `Datapath::refresh` calls, health samples, and whether a sample
+    /// came without a refresh right before it.
+    refreshes: Cell<u32>,
+    sampled: Cell<u32>,
+    unrefreshed_sample: Cell<bool>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +240,13 @@ struct FakeHost {
     renamed: Option<u16>,
     /// The policy each `preflight` call was given.
     preflight_policies: RefCell<Vec<PrivilegePolicy>>,
+    /// AF_PACKET: the MTU of every port (`None`: `max-frame-len - 14`).
+    packet_mtu: Option<u32>,
+    /// AF_PACKET: the active receive offload of every port (`Err`:
+    /// unreadable).
+    packet_offload: Option<Result<Offload, ()>>,
+    /// AF_PACKET: the port enslaved to an upper device.
+    packet_master: Option<u16>,
 }
 
 /// State shared with a worker thread (test only).
@@ -341,9 +366,23 @@ fn the_provided_set_clock_forwards_to_the_io() {
 }
 
 struct FakeDatapath<'s> {
-    ports: &'s mut [OpenPort<FakeSession>],
+    /// The AF_XDP sessions the datapath borrows (none for AF_PACKET).
+    _sessions: std::marker::PhantomData<&'s mut [OpenPort<FakeSession>]>,
+    ports: usize,
+    /// AF_PACKET: the datapath owns its sockets; dropping it closes them.
+    packet: bool,
     state: Rc<State>,
     io: SimIo,
+}
+
+impl Drop for FakeDatapath<'_> {
+    fn drop(&mut self) {
+        if self.packet {
+            self.state.push(Event::ClosePacket);
+            let ports = u32::try_from(self.ports).expect("few ports");
+            self.state.live.set(self.state.live.get() - ports);
+        }
+    }
 }
 
 impl Datapath for FakeDatapath<'_> {
@@ -382,7 +421,16 @@ impl Datapath for FakeDatapath<'_> {
         state.last_clock.set(now.0);
     }
 
+    fn refresh(&mut self) {
+        self.state.refreshes.set(self.state.refreshes.get() + 1);
+    }
+
     fn sample_ports(&self, visit: &mut impl FnMut(PortSample)) {
+        let sampled = self.state.sampled.get() + 1;
+        self.state.sampled.set(sampled);
+        if self.state.refreshes.get() != sampled {
+            self.state.unrefreshed_sample.set(true);
+        }
         let round = self.state.samples.borrow_mut().pop_front();
         for sample in round.into_iter().flatten() {
             visit(sample);
@@ -429,11 +477,11 @@ impl Datapath for FakeDatapath<'_> {
     }
 
     fn write_stats(&self, out: &mut String) {
-        out.push_str(&format!("fake.ports={}\n", self.ports.len()));
+        out.push_str(&format!("fake.ports={}\n", self.ports));
     }
 
     fn port_count(&self) -> usize {
-        self.ports.len()
+        self.ports
     }
 
     /// Simulated when [`State::waits`] is set: ready at once with a frame
@@ -540,6 +588,7 @@ impl LinkMonitor for FakeLinks {
             rx_queues: Some(1),
             admin_up: true,
             lower_up: true,
+            master: None,
         })
     }
 
@@ -600,6 +649,7 @@ const fn fake_ifindex(id: u16) -> u32 {
 impl PortHost for FakeHost {
     type Session = FakeSession;
     type Datapath<'s> = FakeDatapath<'s>;
+    type Packet = FakeDatapath<'static>;
     type Links = FakeLinks;
 
     fn links(&self, devices: &[(IfId, &str)]) -> Result<FakeLinks, Failure> {
@@ -740,6 +790,7 @@ impl PortHost for FakeHost {
             forwarding_multicast: Some(false),
             weak_host: Some(self.weak_host),
             ipv6: self.ipv6.unwrap_or(Ipv6Facts::DISABLED),
+            master: None,
         })
     }
 
@@ -791,7 +842,86 @@ impl PortHost for FakeHost {
             io.inject(ingress, bytes);
         }
         Ok(FakeDatapath {
+            _sessions: std::marker::PhantomData,
+            ports: ports.len(),
+            packet: false,
+            state: Rc::clone(&self.state),
+            io,
+        })
+    }
+
+    fn preflight_packet(&self, policy: PrivilegePolicy) -> Result<(), PrivilegeFailure> {
+        self.state.push(Event::Preflight);
+        self.preflight_policies.borrow_mut().push(policy);
+        self.privilege.map_or(Ok(()), Err)
+    }
+
+    fn inspect_packet(
+        &self,
+        port: &ValidatedAfPacketPortV1,
+        max_frame_len: u32,
+    ) -> Result<PacketFacts, CheckFailure> {
+        let id = port.interface().0;
+        self.state.push(Event::Inspect(id));
+        if self.fails(Stage::Checks, Some(id)) {
+            return Err(CheckFailure::Unverifiable(Probe::Link));
+        }
+        let mtu = self.packet_mtu.unwrap_or(max_frame_len - 14);
+        Ok(PacketFacts {
+            device: DeviceFacts {
+                ifindex: fake_ifindex(id),
+                link_name: if self.renamed == Some(id) {
+                    super::netlink::IfName::literal(b"renamed0")
+                } else {
+                    super::netlink::IfName::new(port.device().as_bytes()).expect("device name")
+                },
+                rx_queues: if self.multi_queue == Some(id) { 4 } else { 1 },
+                link_mtu: mtu,
+                session_mtu: mtu,
+                frame_capacity: max_frame_len,
+                ipv4_addresses: 0,
+                ipv4_routes: self.ipv4_routes,
+                forwarding_global: Some(self.forwarding_on),
+                forwarding_device: Some(false),
+                forwarding_multicast: Some(false),
+                weak_host: Some(self.weak_host),
+                ipv6: self.ipv6.unwrap_or(Ipv6Facts::DISABLED),
+                master: (self.packet_master == Some(id)).then_some(99),
+            },
+            offload: match self.packet_offload {
+                None => Ok(None),
+                Some(Ok(offload)) => Ok(Some(offload)),
+                Some(Err(())) => Err(()),
+            },
+        })
+    }
+
+    fn open_packet(
+        &self,
+        backend: &ValidatedAfPacketV1,
+        targets: &[LinkTarget],
+    ) -> Result<FakeDatapath<'static>, Failure> {
+        assert_eq!(backend.ports().len(), targets.len());
+        let mut indexes = [0; 2];
+        for (slot, target) in indexes.iter_mut().zip(targets) {
+            *slot = target.ifindex;
+        }
+        self.state.push(Event::OpenPacket(indexes));
+        if self.fails(Stage::Open, None) {
+            return Err(Failure::Packet(PacketOpenError::Ports));
+        }
+        let ports = targets.len();
+        self.state
+            .live
+            .set(self.state.live.get() + u32::try_from(ports).expect("few"));
+        let mut io = SimIo::new();
+        for (ingress, bytes) in self.state.inject.borrow_mut().drain(..) {
+            io.inject(ingress, bytes);
+        }
+        Ok(FakeDatapath {
+            _sessions: std::marker::PhantomData,
             ports,
+            packet: true,
             state: Rc::clone(&self.state),
             io,
         })
@@ -1743,6 +1873,7 @@ fn ticks_do_not_allocate_with(waits: bool, watchdog: bool) {
             fill_starved: 0,
             fill_ring_occupancy: 8,
             rx_packets: step,
+            device_gone: false,
         }]
     });
     host.state.samples.borrow_mut().extend(rounds);
@@ -1818,7 +1949,7 @@ fn a_backend_stop_ends_the_run_with_exit_1() {
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     assert_eq!(
-        super::finished(&ran, 2, &[], &mut out, &mut err),
+        super::finished(&ran, 2, &[], true, &mut out, &mut err),
         EXIT_RUNTIME
     );
     let err = String::from_utf8(err).expect("utf-8");
@@ -2818,3 +2949,6 @@ mod reclock;
 
 #[path = "idle_tests.rs"]
 mod idle;
+
+#[path = "packet_tests.rs"]
+mod packet;

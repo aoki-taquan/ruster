@@ -30,8 +30,8 @@
 use std::{cmp::Ordering, fmt, num::NonZeroU64};
 
 use ruster_config::{
-    BackendKindV1, ExistingXdpProgramV1, InterfaceBindingV1, ValidatedAfXdpPortV1,
-    ValidatedBackendV1, ValidatedConfigV1,
+    BackendKindV1, ExistingXdpProgramV1, InterfaceBindingV1, ValidatedAfPacketPortV1,
+    ValidatedAfXdpPortV1, ValidatedBackendV1, ValidatedConfigV1,
 };
 use ruster_core::{
     FirewallHashKey, FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, LocalIpv4Binding,
@@ -203,6 +203,12 @@ pub struct BackendChange {
     /// its bound device, so moving an interface to another device (or
     /// swapping two devices) is a port change, not just a label change.
     pub ports: Box<[Change<ValidatedAfXdpPortV1>]>,
+    /// The AF_PACKET maximum frame (`None` on a side without the AF_PACKET
+    /// backend).
+    pub af_packet_max_frame_len: Option<Delta<Option<u32>>>,
+    /// AF_PACKET ports keyed by interface IfId, like [`Self::ports`]: a
+    /// change of kind to or from `af-packet` adds or removes every port.
+    pub af_packet_ports: Box<[Change<ValidatedAfPacketPortV1>]>,
 }
 
 impl BackendChange {
@@ -222,16 +228,37 @@ impl BackendChange {
             (Some(old), Some(new)) => delta(old, new),
             _ => None,
         };
+        let packet_ports = |backend: &ValidatedBackendV1| {
+            backend
+                .af_packet()
+                .map_or(&[][..], ruster_config::ValidatedAfPacketV1::ports)
+                .to_vec()
+        };
+        let max_frame = |backend: &ValidatedBackendV1| {
+            backend
+                .af_packet()
+                .map(ruster_config::ValidatedAfPacketV1::max_frame_len)
+        };
         Self {
             kind: delta(old.kind(), new.kind()),
             existing_xdp_program,
             ports: diff(&ports(old), &ports(new), ValidatedAfXdpPortV1::interface),
+            af_packet_max_frame_len: delta(max_frame(old), max_frame(new)),
+            af_packet_ports: diff(
+                &packet_ports(old),
+                &packet_ports(new),
+                ValidatedAfPacketPortV1::interface,
+            ),
         }
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.kind.is_none() && self.existing_xdp_program.is_none() && self.ports.is_empty()
+        self.kind.is_none()
+            && self.existing_xdp_program.is_none()
+            && self.ports.is_empty()
+            && self.af_packet_max_frame_len.is_none()
+            && self.af_packet_ports.is_empty()
     }
 }
 

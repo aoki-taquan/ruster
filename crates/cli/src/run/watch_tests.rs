@@ -44,6 +44,7 @@ fn sample() -> PortSample {
         fill_starved: 0,
         fill_ring_occupancy: 64,
         rx_packets: 0,
+        device_gone: false,
     }
 }
 
@@ -54,6 +55,7 @@ fn up(mtu: u32) -> Result<LinkFacts, NetlinkError> {
         rx_queues: Some(1),
         admin_up: true,
         lower_up: true,
+        master: None,
     })
 }
 
@@ -1076,5 +1078,93 @@ fn a_renamed_port_is_fatal_and_its_round_is_not_read() {
         fold(&mut watch(), &round_of(exposed(up(1500)))).len(),
         4,
         "addresses, routes, forwarding, weak host"
+    );
+}
+
+/// AFPKT-015: on an AF_PACKET port a kernel exposure condition found at
+/// run time is fatal under its own code, unless the startup accepted it
+/// through an override; the device found gone by the backend is
+/// `DEVICE_REMOVED`; AF_XDP keeps warning only.
+#[test]
+fn af_packet_kernel_exposure_is_fatal_unless_overridden() {
+    let strict = ExposurePolicy::default();
+    let mut packet = watch().failing_on_kernel_exposure(strict);
+    let mut events = Vec::new();
+    packet.on_addresses(0, Ok(1), &mut |event| events.push(event));
+    assert_eq!(
+        events,
+        [
+            warning(Condition::KernelIpv4Addresses),
+            fatal(Fatal::KernelExposure(Condition::KernelIpv4Addresses)),
+        ]
+    );
+    assert_eq!(
+        Fatal::KernelExposure(Condition::KernelIpv4Addresses).code(),
+        "KERNEL_IPV4_ADDRESSES"
+    );
+    for (condition, fatal_by_default) in [
+        (Condition::KernelIpv4Addresses, true),
+        (Condition::KernelIpv4Routes, true),
+        (Condition::KernelForwardingEnabled, true),
+        (Condition::Ipv4WeakHost, true),
+        (Condition::KernelIpv6Enabled, true),
+        (Condition::KernelIpv6Addresses, true),
+        (Condition::KernelIpv6Routes, true),
+        (Condition::KernelIpv6ForwardingEnabled, true),
+        (Condition::TxStall, false),
+        (Condition::LinkDown, false),
+        (Condition::LinkProbe, false),
+        (Condition::ForwardingUnverifiable, false),
+        (Condition::Ipv6Unverifiable, false),
+        (Condition::LinkWatchStale, false),
+        (Condition::MtuRaised, false),
+        (Condition::KickErrors, false),
+        (Condition::FillStarved, false),
+    ] {
+        assert_eq!(
+            strict.is_fatal(condition),
+            fatal_by_default,
+            "{condition:?}"
+        );
+    }
+    let allowed = ExposurePolicy {
+        allow_kernel_forwarding: true,
+        allow_kernel_ipv6: true,
+        allow_ipv4_weak_host: true,
+    };
+    for condition in [
+        Condition::KernelForwardingEnabled,
+        Condition::Ipv4WeakHost,
+        Condition::KernelIpv6Enabled,
+        Condition::KernelIpv6Addresses,
+        Condition::KernelIpv6Routes,
+        Condition::KernelIpv6ForwardingEnabled,
+    ] {
+        assert!(!allowed.is_fatal(condition), "{condition:?}");
+    }
+    assert!(allowed.is_fatal(Condition::KernelIpv4Addresses));
+    assert!(allowed.is_fatal(Condition::KernelIpv4Routes));
+    // The weak host with its override: a warning only.
+    let mut packet = watch().failing_on_kernel_exposure(allowed);
+    let mut events = Vec::new();
+    packet.on_weak_host(0, Some(true), &mut |event| events.push(event));
+    assert_eq!(events, [warning(Condition::Ipv4WeakHost)]);
+    // AF_XDP: an address only warns.
+    let mut xdp = watch();
+    let mut events = Vec::new();
+    xdp.on_addresses(0, Ok(1), &mut |event| events.push(event));
+    assert_eq!(events, [warning(Condition::KernelIpv4Addresses)]);
+    // The backend's unbound port.
+    let mut packet = watch().failing_on_kernel_exposure(strict);
+    assert_eq!(
+        run(
+            &mut packet,
+            10,
+            PortSample {
+                device_gone: true,
+                ..sample()
+            }
+        ),
+        [fatal(Fatal::DeviceRemoved)]
     );
 }

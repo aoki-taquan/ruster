@@ -249,6 +249,10 @@ impl PacketOps for ConformanceOps {
         Ok(crate::sys::TpacketStatsV3::default())
     }
 
+    fn take_socket_error(&mut self, _fd: RawFd) -> Result<i32, PlatformError> {
+        Ok(0)
+    }
+
     fn unmap(&mut self, base: NonNull<u8>, len: usize) {
         let layout = Layout::from_size_align(len, PAGE).expect("mapping layout");
         // SAFETY: the engine's mapping owner unmaps exactly once with the

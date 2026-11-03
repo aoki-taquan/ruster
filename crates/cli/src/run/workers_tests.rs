@@ -70,6 +70,7 @@ impl LinkMonitor for Monitor {
             rx_queues: Some(1),
             admin_up: true,
             lower_up: true,
+            master: None,
         })
     }
 

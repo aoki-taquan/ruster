@@ -1,11 +1,13 @@
 //! `ruster run --config <path>`: the AF_XDP static router (M2 S10a/S10b,
-//! X04b). x86_64 Linux only.
+//! X04b), or with `backend.kind = "af-packet"` the AF_PACKET one
+//! (AFPKT-015, see below). x86_64 Linux only.
 //!
 //! # Startup (failure atomic)
 //!
 //! 1. Load and validate the config without the service bridge. `[backend]`
-//!    must be `kind = "af-xdp"`; `sim` is refused (`stage=backend
-//!    code=SIM_BACKEND`, exit 2) and points to `ruster run-sim`.
+//!    must be `kind = "af-xdp"` or `"af-packet"`; `sim` is refused
+//!    (`stage=backend code=SIM_BACKEND`, exit 2) and points to `ruster
+//!    run-sim`.
 //! 2. Install the SIGINT/SIGTERM and SIGHUP handlers, open `/dev/urandom` as the
 //!    [`ruster_control::OsRandomKeySource`] and wrap it in a [`ProductionSequencer`]. The
 //!    whole live path is generic over `K: ProductionKeySource`, a sealed
@@ -62,6 +64,24 @@
 //! rolled back K port(s), retrying in P ms`. Every other failure is
 //! final at once. The candidate, storage, and privilege preflight are not
 //! repeated.
+//!
+//! # AF_PACKET (AFPKT-015)
+//!
+//! With `backend.kind = "af-packet"` steps 4 and 5 differ
+//! ([`startup::open_packet_ports`], `execute_packet`): the preflight needs
+//! only `CAP_NET_RAW` (nothing is pinned, no BPF object is loaded); per
+//! port in `IfId` order the device is resolved by name over rtnetlink and
+//! checked ([`checks::evaluate_packet_device`]: every kernel exposure
+//! refusal of AF_XDP, MTU exactly `max-frame-len - 14`, no upper device,
+//! no GRO/LRO/hardware GRO, [`offload`]); then every packet socket is
+//! opened at once (`ruster-io-afpacket`, failure atomic). Steps 6 to 8 and
+//! the run loop are the same code over the AF_PACKET datapath (static
+//! dispatch, [`engine::Datapath`]). Differences while running: the kernel
+//! exposure conditions of the link watch are fatal ([`watch::ExposurePolicy`]),
+//! a port whose device the backend found gone is fatal `DEVICE_REMOVED`, and
+//! the kernel's `PACKET_STATISTICS` are folded in at every health sample.
+//! The shutdown drains, then drops the datapath, which closes the sockets
+//! ("closed N port(s)"; nothing to detach).
 //!
 //! # Run loop
 //!
@@ -130,6 +150,15 @@ mod linux;
 )]
 mod netlink;
 mod notify;
+#[cfg_attr(
+    not(all(
+        target_os = "linux",
+        target_arch = "x86_64",
+        target_pointer_width = "64"
+    )),
+    allow(dead_code)
+)]
+mod offload;
 mod output;
 mod privileges;
 mod reload;
@@ -165,11 +194,14 @@ use fs_confine::{FsConfineMode, FsState};
 use notify::Notifier;
 use privileges::{DropFailure, Identity, PrivilegePolicy, PrivilegeState};
 use reload::{ConfigSource, Preparer, ReloadWorker, Reloader};
+use ruster_config::BackendKindV1;
 use seccomp::{SeccompMode, SeccompState};
 use startup::{
-    open_ports, CloseFailure, Failure, Interrupt, OpenedPorts, PortHost, Stage, StartupError,
+    open_packet_ports, open_ports, CloseFailure, Failure, Interrupt, OpenedPorts, PortHost, Stage,
+    StartupError,
 };
 use stats::BlockKind;
+use watch::{ExposurePolicy, LinkTarget};
 use watch::{Thresholds, Watch, HEALTH_INTERVAL_MS, LINK_INTERVAL_MS};
 use workers::{LinkWatcher, Worker, WORKER_STOP_MS};
 
@@ -274,7 +306,7 @@ pub fn run(args: &RunArgs, err: &mut impl Write) -> u8 {
         Ok(config) => config,
         Err(error) => return config_cmd::report_load(err, "", &error),
     };
-    if config.backend().af_xdp().is_none() {
+    if config.backend().kind() == BackendKindV1::Sim {
         let _ = writeln!(
             err,
             "ruster run: invalid config: stage=backend code=SIM_BACKEND \
@@ -293,7 +325,7 @@ pub fn run(args: &RunArgs, err: &mut impl Write) -> u8 {
 fn live(_: &RunArgs, _: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     let _ = writeln!(
         err,
-        "ruster run: unsupported platform: the AF_XDP backend needs x86_64 Linux"
+        "ruster run: unsupported platform: `ruster run` needs x86_64 Linux"
     );
     EXIT_RUNTIME
 }
@@ -343,7 +375,7 @@ fn live(args: &RunArgs, config: ValidatedConfigV1, err: &mut impl Write) -> u8 {
     // The output threads drop their privileges (and switch identity) at
     // spawn, so what that needs is checked before they start.
     let policy = settings.privileges;
-    if let Err(error) = checks::linux::check_identity_switch(policy) {
+    if let Err(error) = checks::linux::check_identity_switch(policy, config.backend().kind()) {
         let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
         return startup_failed(err, error, &[]);
     }
@@ -470,13 +502,9 @@ where
     O: Write,
     E: Write,
 {
-    let Some(ports) = config
-        .backend()
-        .af_xdp()
-        .map(|backend| backend.ports().len())
-    else {
+    if config.backend().kind() == BackendKindV1::Sim {
         return EXIT_INVALID;
-    };
+    }
     for warning in crate::config_cmd::sweep_warnings(&config)
         .into_iter()
         .flatten()
@@ -497,6 +525,26 @@ where
             return startup_failed(err, error, &[]);
         }
     };
+    if config.backend().af_packet().is_some() {
+        return execute_packet(
+            host,
+            config,
+            sequencer,
+            source,
+            candidate,
+            &mut storage,
+            settings,
+            notify,
+            clock,
+            stop,
+            out,
+            err,
+        );
+    }
+    let ports = config
+        .backend()
+        .af_xdp()
+        .map_or(0, |backend| backend.ports().len());
     if let Some(backend) = config.backend().af_xdp() {
         if let Err(error) = host.preflight(backend, settings.privileges) {
             let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
@@ -585,7 +633,119 @@ where
                 EXIT_RUNTIME
             }
         }
-        Ok(ran) => finished(&ran, ports, &cleanup, out, err),
+        Ok(ran) => finished(&ran, ports, &cleanup, true, out, err),
+    }
+}
+
+/// The AF_PACKET startup, run, shutdown, and teardown (AFPKT-015): the
+/// preflight (`CAP_NET_RAW`), the per-port device checks
+/// ([`open_packet_ports`]), one failure-atomic open of every packet
+/// socket, then the same run as AF_XDP ([`serve`]). Dropping the datapath
+/// after the drain closes every socket; there is no session to close or
+/// detach, and no transient open failure to retry.
+#[allow(clippy::too_many_arguments)]
+fn execute_packet<H, K, R, C, S, O, E>(
+    host: &H,
+    config: ValidatedConfigV1,
+    sequencer: ProductionSequencer<K>,
+    source: R,
+    candidate: ValidatedCandidate,
+    storage: &mut FullServiceStorage,
+    settings: Settings,
+    notify: Notifier,
+    clock: &mut C,
+    stop: &S,
+    out: &mut O,
+    err: &mut E,
+) -> u8
+where
+    H: PortHost,
+    K: ProductionKeySource + Send + 'static,
+    R: ConfigSource + Send + 'static,
+    C: Clock,
+    S: StopSignal,
+    O: Write,
+    E: Write,
+{
+    let Some(backend) = config.backend().af_packet() else {
+        return EXIT_INVALID;
+    };
+    if let Err(error) = host.preflight_packet(settings.privileges) {
+        let error = StartupError::new(Stage::Privileges, None, Failure::Privileges(error));
+        return startup_failed(err, error, &[]);
+    }
+    let ports = backend.ports().len();
+    let targets = match open_packet_ports(host, backend, settings.policy, stop, |port, warnings| {
+        for code in warnings.codes() {
+            let _ = writeln!(err, "ruster run: warning: port={} {code}", port_label(port));
+        }
+    }) {
+        Ok(targets) => targets,
+        Err(Interrupt::Failed(error)) => return startup_failed(err, error, &[]),
+        Err(Interrupt::Signalled) => {
+            let _ = writeln!(
+                err,
+                "ruster run: startup cancelled by signal; rolled back 0 port(s)"
+            );
+            return 0;
+        }
+    };
+    let devices: Vec<(IfId, &str)> = backend
+        .ports()
+        .iter()
+        .map(|port| (port.interface(), port.device()))
+        .collect();
+    let links = match host.links(&devices) {
+        Ok(links) => links,
+        Err(failure) => {
+            return startup_failed(err, StartupError::new(Stage::Watch, None, failure), &[]);
+        }
+    };
+    if stop.stop() {
+        let _ = writeln!(
+            err,
+            "ruster run: startup cancelled by signal; rolled back 0 port(s)"
+        );
+        return 0;
+    }
+    let datapath = match host.open_packet(backend, &targets) {
+        Ok(datapath) => datapath,
+        Err(failure) => {
+            return startup_failed(err, StartupError::new(Stage::Open, None, failure), &[]);
+        }
+    };
+    drop(devices);
+    let exposure = ExposurePolicy {
+        allow_kernel_forwarding: settings.policy.allow_kernel_forwarding,
+        allow_kernel_ipv6: settings.policy.allow_kernel_ipv6,
+        allow_ipv4_weak_host: settings.policy.allow_ipv4_weak_host,
+    };
+    let outcome = serve(
+        host,
+        datapath,
+        links,
+        &targets,
+        Some(exposure),
+        candidate,
+        storage,
+        Preparer::new(sequencer, config, source),
+        settings,
+        notify,
+        clock,
+        stop,
+        out,
+        err,
+    );
+    match outcome {
+        Err(Interrupt::Failed(error)) => startup_failed(err, error, &[]),
+        Err(Interrupt::Signalled) => {
+            let _ = writeln!(
+                err,
+                "ruster run: startup cancelled by signal; rolled back {ports} port(s)"
+            );
+            0
+        }
+        Ok(ran) => finished(&ran, ports, &[], false, out, err),
     }
 }
 
@@ -618,7 +778,7 @@ fn run_ports<'h, H, K, R, C, S, O, E>(
     storage: &mut FullServiceStorage,
     preparer: Preparer<K, R>,
     settings: Settings,
-    mut notify: Notifier,
+    notify: Notifier,
     clock: &mut C,
     stop: &S,
     out: &mut O,
@@ -633,7 +793,6 @@ where
     O: Write,
     E: Write,
 {
-    let budgets = budgets(preparer.current());
     let devices: Vec<(IfId, &str)> = preparer
         .current()
         .backend()
@@ -650,7 +809,47 @@ where
         .links(&devices)
         .map_err(|failure| Interrupt::Failed(StartupError::new(Stage::Watch, None, failure)))?;
     let targets: Vec<_> = opened.ports_mut().iter().map(|port| port.link).collect();
-    let mut datapath = host.build(opened.ports_mut()).map_err(Interrupt::Failed)?;
+    let datapath = host.build(opened.ports_mut()).map_err(Interrupt::Failed)?;
+    serve(
+        host, datapath, links, &targets, None, candidate, storage, preparer, settings, notify,
+        clock, stop, out, err,
+    )
+}
+
+/// Activation, the workers, the privilege drop, the filesystem and syscall
+/// confinement, readiness, the run loop, the shutdown drain, and the final
+/// stats over a built `datapath` of either backend (static dispatch: one
+/// instance per backend). `exposure` makes the link watch's kernel
+/// exposure conditions fatal (AF_PACKET, [`ExposurePolicy`]). The
+/// datapath is dropped before returning, after the drain.
+#[allow(clippy::too_many_arguments)]
+fn serve<H, D, K, R, C, S, O, E>(
+    host: &H,
+    mut datapath: D,
+    links: H::Links,
+    targets: &[LinkTarget],
+    exposure: Option<ExposurePolicy>,
+    candidate: ValidatedCandidate,
+    storage: &mut FullServiceStorage,
+    preparer: Preparer<K, R>,
+    settings: Settings,
+    mut notify: Notifier,
+    clock: &mut C,
+    stop: &S,
+    out: &mut O,
+    err: &mut E,
+) -> Result<Ran, Interrupt>
+where
+    H: PortHost,
+    D: Datapath,
+    K: ProductionKeySource + Send + 'static,
+    R: ConfigSource + Send + 'static,
+    C: Clock,
+    S: StopSignal,
+    O: Write,
+    E: Write,
+{
+    let budgets = budgets(preparer.current());
     if stop.stop() {
         return Err(Interrupt::Signalled);
     }
@@ -675,7 +874,7 @@ where
     })?;
     // The cold-path workers (H7) start before the drop and drop their own
     // privileges first, so the process-wide check below covers them.
-    let (links, reloads) = spawn_workers(host, links, &targets, preparer, settings.privileges)
+    let (links, reloads) = spawn_workers(host, links, targets, preparer, settings.privileges)
         .map_err(Interrupt::Failed)?;
     #[cfg(test)]
     let (links, reloads) = {
@@ -749,12 +948,16 @@ where
         reload_prepare_warn_ms: settings.reload_prepare_warn_ms,
         idle_wait_ms: settings.idle_wait_ms,
     };
+    let mut watch = Watch::new(targets, settings.thresholds)
+        .allowing_kernel_forwarding(settings.policy.allow_kernel_forwarding)
+        .allowing_kernel_ipv6(settings.policy.allow_kernel_ipv6)
+        .with_link_stale_ms(settings.link_stale_ms);
+    if let Some(exposure) = exposure {
+        watch = watch.failing_on_kernel_exposure(exposure);
+    }
     let mut control = Control {
         reloader,
-        watch: Watch::new(&targets, settings.thresholds)
-            .allowing_kernel_forwarding(settings.policy.allow_kernel_forwarding)
-            .allowing_kernel_ipv6(settings.policy.allow_kernel_ipv6)
-            .with_link_stale_ms(settings.link_stale_ms),
+        watch,
         links,
         idle: engine::IdleCounters {
             max_wait_ms: settings.idle_wait_ms,
@@ -1002,7 +1205,11 @@ fn startup_failed(
     let _ = writeln!(err, "ruster run: startup failed: {error}");
     match error.failure {
         Failure::Privileges(PrivilegeFailure::MissingCapabilities(missing)) => {
-            if missing & !checks::SWITCH_CAPABILITIES != 0 {
+            let startup = missing & !checks::SWITCH_CAPABILITIES;
+            if startup == 1 << checks::cap::NET_RAW {
+                // All an AF_PACKET run needs (and all an AF_XDP run lacks).
+                let _ = writeln!(err, "ruster run: run as root or grant CAP_NET_RAW");
+            } else if startup != 0 {
                 let _ = writeln!(
                     err,
                     "ruster run: run as root or grant CAP_NET_ADMIN, CAP_NET_RAW, CAP_BPF, and CAP_PERFMON"
@@ -1028,13 +1235,21 @@ fn startup_failed(
     startup_status(&error)
 }
 
+/// The final stats block and summary line; `detached`: the ports were
+/// AF_XDP sessions (detached and closed), not AF_PACKET sockets (closed).
 fn finished(
     ran: &Ran,
     ports: usize,
     cleanup: &[(IfId, CloseFailure)],
+    detached: bool,
     out: &mut impl Write,
     err: &mut impl Write,
 ) -> u8 {
+    let closing = if detached {
+        "detached and closed"
+    } else {
+        "closed"
+    };
     let _ = out.write_all(ran.final_block.as_bytes());
     let _ = out.flush();
     report_cleanup(err, cleanup);
@@ -1073,9 +1288,9 @@ fn finished(
         shutdown.timed_out,
         engine::last_kick_label(shutdown.last_kick_error),
         if cleanup.is_empty() {
-            format!("detached and closed {ports} port(s)")
+            format!("{closing} {ports} port(s)")
         } else {
-            format!("detached and closed {closed} of {ports} port(s); see close failed")
+            format!("{closing} {closed} of {ports} port(s); see close failed")
         },
     );
     if !cleanup.is_empty()

@@ -93,6 +93,9 @@ const IFLA_IFNAME: u16 = 3;
 pub const IFNAMSIZ: usize = 16;
 /// `IFLA_MTU` (`u32`).
 const IFLA_MTU: u16 = 4;
+/// `IFLA_MASTER` (`u32`, the upper device's index of an enslaved port:
+/// bridge, bond, team, VRF, ...).
+const IFLA_MASTER: u16 = 10;
 /// `IFLA_NUM_RX_QUEUES` (`u32`, `dev->num_rx_queues`; absent without
 /// `CONFIG_RPS`).
 const IFLA_NUM_RX_QUEUES: u16 = 32;
@@ -627,6 +630,9 @@ pub struct LinkFacts {
     pub admin_up: bool,
     /// `IFF_LOWER_UP` (carrier).
     pub lower_up: bool,
+    /// `IFLA_MASTER`: the index of the upper device the link is enslaved
+    /// to (a bridge, bond, team, or VRF), `None` if it is not.
+    pub master: Option<u32>,
 }
 
 impl LinkFacts {
@@ -652,6 +658,54 @@ pub fn link_request(sequence: u32, ifindex: u32) -> [u8; HEADER_LEN + IFINFOMSG_
     request
 }
 
+/// Largest [`link_name_request`]: the header, `ifinfomsg`, and one
+/// `IFLA_IFNAME` attribute of at most `IFNAMSIZ` bytes (4-byte aligned).
+pub const LINK_NAME_REQUEST_MAX: usize = HEADER_LEN + IFINFOMSG_LEN + 4 + IFNAMSIZ;
+
+/// The `RTM_GETLINK` request for the device named `name` (index 0 and an
+/// `IFLA_IFNAME` attribute: the kernel looks the name up in the socket's
+/// network namespace and answers with exactly one `RTM_NEWLINK`, or
+/// `ENODEV`), and its length: the message ends right after the aligned
+/// attribute, since strict checking refuses trailing bytes. Used once per
+/// AF_PACKET port at startup to resolve the configured device to its
+/// interface index.
+pub fn link_name_request(sequence: u32, name: IfName) -> ([u8; LINK_NAME_REQUEST_MAX], usize) {
+    let mut request = [0_u8; LINK_NAME_REQUEST_MAX];
+    let bytes = name.as_bytes();
+    // The name with its NUL, then padding to four bytes.
+    let attribute_len = 4 + bytes.len() + 1;
+    let message_len = HEADER_LEN + IFINFOMSG_LEN + attribute_len.div_ceil(4) * 4;
+    let len = u32::try_from(message_len).unwrap_or(u32::MAX);
+    request[0..4].copy_from_slice(&len.to_ne_bytes());
+    request[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());
+    request[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+    request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    let attribute = HEADER_LEN + IFINFOMSG_LEN;
+    let attribute_len = u16::try_from(attribute_len).unwrap_or(u16::MAX);
+    request[attribute..attribute + 2].copy_from_slice(&attribute_len.to_ne_bytes());
+    request[attribute + 2..attribute + 4].copy_from_slice(&IFLA_IFNAME.to_ne_bytes());
+    request[attribute + 4..attribute + 4 + bytes.len()].copy_from_slice(bytes);
+    (request, message_len)
+}
+
+/// Parses one datagram answering the [`link_name_request`] `sequence` for
+/// `name`: like [`parse_link_reply`], but the reply's index is what is
+/// looked up, and its `IFLA_IFNAME` must be `name`
+/// ([`NetlinkError::UnexpectedLink`] otherwise). Returns the index and
+/// the facts.
+pub fn parse_link_name_reply(
+    datagram: &[u8],
+    sequence: u32,
+    port: u32,
+    name: IfName,
+) -> Result<Option<(u32, LinkFacts)>, NetlinkError> {
+    let reply = parse_reply(datagram, sequence, port, parse_any_link)?;
+    match reply {
+        Some((_, facts)) if facts.name != name => Err(NetlinkError::UnexpectedLink),
+        reply => Ok(reply),
+    }
+}
+
 /// Parses one datagram answering the `RTM_GETLINK` request `sequence` for
 /// `ifindex` on the socket with port id `port`. `Ok(None)` if the datagram
 /// holds no message of this request (a late answer to an earlier one).
@@ -672,6 +726,19 @@ pub fn parse_link_reply(
     port: u32,
     ifindex: u32,
 ) -> Result<Option<LinkFacts>, NetlinkError> {
+    parse_reply(datagram, sequence, port, |message| {
+        parse_link(message, ifindex)
+    })
+}
+
+/// The single reply of the request `sequence` in `datagram`, its
+/// `RTM_NEWLINK` read by `link` (see [`parse_link_reply`]).
+fn parse_reply<T>(
+    datagram: &[u8],
+    sequence: u32,
+    port: u32,
+    link: impl FnOnce(&[u8]) -> Result<T, NetlinkError>,
+) -> Result<Option<T>, NetlinkError> {
     let mut at = 0;
     while at < datagram.len() {
         let rest = &datagram[at..];
@@ -705,7 +772,7 @@ pub fn parse_link_reply(
                         _ => NetlinkError::Malformed,
                     })
                 }
-                RTM_NEWLINK => parse_link(message, ifindex).map(Some),
+                RTM_NEWLINK => link(message).map(Some),
                 _ => Err(NetlinkError::Malformed),
             };
         }
@@ -720,16 +787,26 @@ pub fn parse_link_reply(
 
 /// One `RTM_NEWLINK` message: `ifinfomsg`, then attributes.
 fn parse_link(message: &[u8], ifindex: u32) -> Result<LinkFacts, NetlinkError> {
+    let (index, facts) = parse_any_link(message)?;
+    if index != ifindex {
+        return Err(NetlinkError::UnexpectedLink);
+    }
+    Ok(facts)
+}
+
+/// One `RTM_NEWLINK` message of any index: the index and the facts.
+fn parse_any_link(message: &[u8]) -> Result<(u32, LinkFacts), NetlinkError> {
     if message.len() < HEADER_LEN + IFINFOMSG_LEN {
         return Err(NetlinkError::Malformed);
     }
     let index = u32_at(message, HEADER_LEN + 4).ok_or(NetlinkError::Malformed)?;
-    if index != ifindex {
+    if index == 0 {
         return Err(NetlinkError::UnexpectedLink);
     }
     let flags = u32_at(message, HEADER_LEN + 8).ok_or(NetlinkError::Malformed)?;
     let mut mtu = None;
     let mut rx_queues = None;
+    let mut master = None;
     let mut name = None;
     attributes(message, HEADER_LEN + IFINFOMSG_LEN, |kind, payload| {
         if kind == IFLA_IFNAME {
@@ -741,6 +818,7 @@ fn parse_link(message: &[u8], ifindex: u32) -> Result<LinkFacts, NetlinkError> {
         let slot = match kind {
             IFLA_MTU => &mut mtu,
             IFLA_NUM_RX_QUEUES => &mut rx_queues,
+            IFLA_MASTER => &mut master,
             _ => return Ok(()),
         };
         if slot.replace(u32_payload(payload)?).is_some() {
@@ -748,13 +826,18 @@ fn parse_link(message: &[u8], ifindex: u32) -> Result<LinkFacts, NetlinkError> {
         }
         Ok(())
     })?;
-    Ok(LinkFacts {
-        name: name.ok_or(NetlinkError::Malformed)?,
-        mtu: mtu.ok_or(NetlinkError::Malformed)?,
-        rx_queues,
-        admin_up: flags & IFF_UP != 0,
-        lower_up: flags & IFF_LOWER_UP != 0,
-    })
+    Ok((
+        index,
+        LinkFacts {
+            name: name.ok_or(NetlinkError::Malformed)?,
+            mtu: mtu.ok_or(NetlinkError::Malformed)?,
+            rx_queues,
+            admin_up: flags & IFF_UP != 0,
+            lower_up: flags & IFF_LOWER_UP != 0,
+            // The kernel sends IFLA_MASTER only for an enslaved link, never 0.
+            master: master.filter(|index| *index != 0),
+        },
+    ))
 }
 
 /// Datagrams read per link query before giving up: earlier queries' late
@@ -857,6 +940,31 @@ impl LinkProbe {
     fn query_once(&mut self, ifindex: u32) -> Result<LinkFacts, NetlinkError> {
         let sequence = self.next_sequence();
         self.socket.send(&link_request(sequence, ifindex))?;
+        self.answer(|datagram, port| parse_link_reply(datagram, sequence, port, ifindex))
+    }
+
+    /// The interface index and link facts of the device named `name` in
+    /// this socket's (the caller's) network namespace (cold, startup:
+    /// AF_PACKET ports are bound by index). `ENODEV`
+    /// ([`NetlinkError::is_no_device`]) means no such device.
+    pub fn resolve(&mut self, name: IfName) -> Result<(u32, LinkFacts), NetlinkError> {
+        let result = self.resolve_once(name);
+        self.recover(result)
+    }
+
+    fn resolve_once(&mut self, name: IfName) -> Result<(u32, LinkFacts), NetlinkError> {
+        let sequence = self.next_sequence();
+        let (request, len) = link_name_request(sequence, name);
+        self.socket.send(&request[..len])?;
+        self.answer(|datagram, port| parse_link_name_reply(datagram, sequence, port, name))
+    }
+
+    /// Receives until `parse` finds the answer (at most
+    /// [`LINK_DATAGRAMS`] datagrams, non-blocking).
+    fn answer<T>(
+        &mut self,
+        mut parse: impl FnMut(&[u8], u32) -> Result<Option<T>, NetlinkError>,
+    ) -> Result<T, NetlinkError> {
         let port = match self.port {
             Some(port) => port,
             None => {
@@ -873,10 +981,8 @@ impl LinkProbe {
             if received > self.buffer.len() {
                 return Err(NetlinkError::Truncated);
             }
-            if let Some(facts) =
-                parse_link_reply(&self.buffer[..received], sequence, port, ifindex)?
-            {
-                return Ok(facts);
+            if let Some(answer) = parse(&self.buffer[..received], port)? {
+                return Ok(answer);
             }
         }
         Err(NetlinkError::EndOfStream)
@@ -1715,6 +1821,7 @@ mod tests {
                 rx_queues: Some(4),
                 admin_up: true,
                 lower_up: true,
+                master: None,
             }))
         );
         // Administratively up without carrier, and down: not up.
@@ -1786,6 +1893,78 @@ mod tests {
         assert_eq!(IfName::new(b"a\0b"), None);
         assert_eq!(IfName::new(&[b'a'; IFNAMSIZ]), None);
         assert_eq!(name(b"wan0").as_bytes(), b"wan0");
+    }
+
+    #[test]
+    fn link_name_request_is_exact_and_replies_must_carry_the_name() {
+        let name = IfName::new(b"ra").expect("name");
+        let (request, len) = link_name_request(9, name);
+        // Header, ifinfomsg with index 0, one 8-byte IFLA_IFNAME ("ra\0"
+        // padded): nothing after it (strict checking refuses leftovers).
+        assert_eq!(len, 16 + 16 + 8);
+        assert_eq!(&request[0..4], &40_u32.to_ne_bytes());
+        assert_eq!(&request[4..6], &18_u16.to_ne_bytes());
+        assert_eq!(&request[6..8], &1_u16.to_ne_bytes(), "no dump, no ack");
+        assert_eq!(&request[8..12], &9_u32.to_ne_bytes());
+        assert_eq!(&request[16..32], &[0; 16], "AF_UNSPEC, index 0");
+        assert_eq!(&request[32..34], &7_u16.to_ne_bytes());
+        assert_eq!(&request[34..36], &IFLA_IFNAME.to_ne_bytes());
+        assert_eq!(&request[36..40], b"ra\0\0");
+        assert!(request[len..].iter().all(|byte| *byte == 0));
+        // The longest name fills the slot: 4 + 15 + 1 = 20 bytes.
+        let long = IfName::new(b"abcdefghijklmno").expect("name");
+        let (request, len) = link_name_request(9, long);
+        assert_eq!(len, LINK_NAME_REQUEST_MAX);
+        assert_eq!(&request[32..34], &20_u16.to_ne_bytes());
+        assert_eq!(&request[36..51], b"abcdefghijklmno");
+        assert_eq!(request[51], 0);
+        // The reply's index is the answer; its name must be the one asked.
+        let mtu = attribute(IFLA_MTU, &1500_u32.to_ne_bytes());
+        let reply = link(5, UP, std::slice::from_ref(&mtu));
+        let (index, facts) = parse_link_name_reply(&reply, 7, PORT, name)
+            .expect("parsed")
+            .expect("answer");
+        assert_eq!((index, facts.mtu, facts.name), (5, 1500, name));
+        assert_eq!(
+            parse_link_name_reply(&reply, 7, PORT, IfName::new(b"rb").expect("name")),
+            Err(NetlinkError::UnexpectedLink)
+        );
+        assert_eq!(
+            parse_link_name_reply(&link(0, UP, std::slice::from_ref(&mtu)), 7, PORT, name),
+            Err(NetlinkError::UnexpectedLink),
+            "index 0 is no device"
+        );
+        let enodev = message(NLMSG_ERROR, 0, 7, &(-19_i32).to_ne_bytes());
+        assert!(parse_link_name_reply(&enodev, 7, PORT, name)
+            .expect_err("error")
+            .is_no_device());
+        assert_eq!(parse_link_name_reply(&[], 7, PORT, name), Ok(None));
+    }
+
+    #[test]
+    fn an_enslaved_link_reports_its_master() {
+        let mtu = attribute(IFLA_MTU, &1500_u32.to_ne_bytes());
+        let master = attribute(IFLA_MASTER, &9_u32.to_ne_bytes());
+        let reply = link(5, UP, &[mtu.clone(), master.clone()]);
+        let facts = parse_link_reply(&reply, 7, PORT, 5)
+            .expect("parsed")
+            .expect("facts");
+        assert_eq!(facts.master, Some(9));
+        // Zero is no master; a duplicate or short one is malformed.
+        let zero = attribute(IFLA_MASTER, &0_u32.to_ne_bytes());
+        let facts = parse_link_reply(&link(5, UP, &[mtu.clone(), zero]), 7, PORT, 5)
+            .expect("parsed")
+            .expect("facts");
+        assert_eq!(facts.master, None);
+        for bad in [
+            vec![mtu.clone(), master.clone(), master.clone()],
+            vec![mtu.clone(), attribute(IFLA_MASTER, &[9, 0])],
+        ] {
+            assert_eq!(
+                parse_link_reply(&link(5, UP, &bad), 7, PORT, 5),
+                Err(NetlinkError::Malformed)
+            );
+        }
     }
 
     #[test]
@@ -1899,6 +2078,15 @@ mod tests {
         // kernel); loopback's 127.0.0.1 may have been removed, so only
         // success is asserted, and a missing index has no address.
         assert_eq!(probe.query(1).map(|facts| facts.mtu), Ok(facts.mtu));
+        // By name: loopback is `lo` with index 1, never enslaved; an
+        // unknown name does not exist.
+        let lo = IfName::new(b"lo").expect("name");
+        assert_eq!(probe.resolve(lo), Ok((1, facts)));
+        assert_eq!(facts.master, None);
+        assert!(probe
+            .resolve(IfName::new(b"rusternodev9").expect("name"))
+            .expect_err("no such device")
+            .is_no_device());
         assert!(probe.ipv4_addresses(1).is_ok());
         // Strict checking: the kernel filters by index and refuses one
         // that does not exist.

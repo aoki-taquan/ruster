@@ -75,7 +75,8 @@ workspaceは12 crateからなる。data-planeとI/Oのlibrary crate（`ruster-co
     live adapter `AfPacketIo`（failure-atomic open、TX completion schedulingと分類済み借りkick
     retry、TX ringから直接貸すgenerated frame、quiescence、poll idle wait、`BackendStats`
     （OBS-028）、drain。AFPKT-008〜014）とnetns/veth privileged smoke。debug/fallback backendで、
-    `ruster run`からの選択（AFPKT-015）と実NIC E2Eは無い
+    AFPKT-015で`ruster run`から`backend.kind = "af-packet"`として選べる（CONFIG-008、
+    CLI-128〜131、AFPKT-016）。実NIC E2Eと性能測定は無い
   - `ruster-io-xdp`/`ruster-io-xdp-native`: AF_XDP ownership model、safe native profile
     （`ruster-io-xdp::native_profile`、configと共有）、native ABI/ring scaffold、private syscall
     RAII seam（XDP rows）、一socketのnative session（X00C）、XDP program/`bpf_link`
@@ -106,7 +107,7 @@ partially met 3、not met 1（X05）である。M2b（multi-queue S12、zero-cop
 
 ### Partialまたは欠落
 
-- 実NIC（hardware）で検証したproduction backendは無い。AF_PACKETはnetns/veth smokeまでのlive adapter（AP3、`ruster run`未接続のAFPKT-015）、AF_XDPは
+- 実NIC（hardware）で検証したproduction backendは無い。AF_PACKETはnetns/veth smokeまで（AP3のadapterとAFPKT-015の`ruster run`）、AF_XDPは
   M2aのcopy-mode router（一socketのsession、XDP program attach、RX/Fill engine、same-frame
   TX/Completion、generated frame、複数portのcore `PacketIo` adapter、configからのport構築と
   `ruster run`の起動/停止、reload、health/stall、link event、起動retry）までで、multi-queue worker
@@ -724,8 +725,9 @@ incremental/full checksum一致、generation/clock/capacityを含む。
 XDP attachをvethで検証するjobはX04が別workflow（`xdp-veth.yml`、M2 S11）として所有し、
 AF_PACKETの`netns.yml`を並列編集しない。AP3のAF_PACKET adapter smoke
 （`scripts/priv-afpacket-smoke.sh`、AFPKT-014）は当面専用workflowを作らず、同じhosted runnerの
-`XDP veth` jobの一stepとして実行する（`netns.yml`の分離は`ruster run`のAF_PACKET E2E、AFPKT-015と
-合わせて再検討）。`XDP veth` jobは最初のprobe（`scripts/priv-xdp-probe.sh`）が
+`XDP veth` jobの一stepとして実行する。`ruster run`のAF_PACKET E2E（AFPKT-015）も
+`scripts/priv-run-smoke.sh`の最後のphase（`priv_run_afpacket_*`）として同じjobで動かし、`netns.yml`は
+まだ分離しない（AF_PACKET単独のjobが要るのはAF_XDPを使えないrunnerを対象にするとき）。`XDP veth` jobは最初のprobe（`scripts/priv-xdp-probe.sh`）が
 AF_XDP/veth/netnsの不足をtypedなfailureにし、smokeは`RUSTER_REQUIRE_PRIV=1`でskip経路を持たない。
 hosted runnerのkernel一つだけを検証し（5.9〜6.xの網羅はXDP-062）、required checkではない
 （owner決定2e「当面は任意のまま」）。

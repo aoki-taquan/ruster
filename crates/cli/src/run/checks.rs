@@ -152,6 +152,14 @@ pub fn required_memlock(backend: &ValidatedAfXdpV1) -> u64 {
     })
 }
 
+/// The only capability an AF_PACKET run needs at startup: `CAP_NET_RAW`
+/// (the packet sockets). Nothing is pinned against `RLIMIT_MEMLOCK` (the
+/// kernel allocates the TPACKET rings without charging it), and no BPF
+/// object is loaded.
+pub fn missing_packet_capabilities(effective: u64) -> u64 {
+    bit(cap::NET_RAW) & !effective
+}
+
 /// Capabilities the effective set must hold: `CAP_NET_RAW` (AF_XDP socket),
 /// `CAP_NET_ADMIN` (XSKMAP, XDP link), and either `CAP_BPF` with
 /// `CAP_PERFMON` or `CAP_SYS_ADMIN` (program and map load). Root holds all
@@ -283,6 +291,9 @@ pub struct DeviceFacts {
     pub weak_host: Option<bool>,
     /// The kernel IPv6 stack on the device.
     pub ipv6: Ipv6Facts,
+    /// `IFLA_MASTER`: the upper device (bridge, bond, team, VRF) the port
+    /// is enslaved to, if any (checked for AF_PACKET ports only).
+    pub master: Option<u32>,
 }
 
 /// Kernel IPv6 facts of one port. `None` is unreadable; the default is
@@ -429,6 +440,20 @@ pub enum CheckFailure {
     /// the address-less port for any local IPv4 address of the host (weak
     /// host model, CLI-079).
     KernelIpv4WeakHost,
+    /// AF_PACKET: the device MTU plus the 14-byte Ethernet header is below
+    /// the configured `max-frame-len`: the router could forward frames the
+    /// kernel then drops on this egress (it has no egress MTU of its own).
+    /// `required` is the MTU the configuration needs (`max-frame-len -
+    /// 14`).
+    MtuBelowFrame { mtu: u32, required: u32 },
+    /// AF_PACKET: the device merges received frames (GRO, LRO, or
+    /// hardware GRO) into super-frames longer than the MTU, which the RX
+    /// ring cannot hold ([`super::offload`]).
+    ReceiveOffload(super::offload::Offload),
+    /// AF_PACKET: the port is enslaved to an upper device (a bridge, bond,
+    /// team, or VRF), whose kernel handling sees every frame the packet
+    /// socket gets a copy of (a bridge forwards them around the router).
+    KernelUpperDevice,
     /// A fact could not be read or did not belong to the opened device.
     Unverifiable(Probe),
 }
@@ -470,6 +495,9 @@ pub enum Probe {
     /// device name (`IFLA_IFNAME`): renamed after the session resolved
     /// it, so the device's sysctl paths would name another device (H10).
     Name,
+    /// AF_PACKET: the active receive offloads could not be read
+    /// (`SIOCETHTOOL`).
+    Offloads,
 }
 
 impl Probe {
@@ -488,6 +516,7 @@ impl Probe {
             Self::Ipv6Routes => "ipv6-routes",
             Self::Ipv6Forwarding => "ipv6-forwarding",
             Self::RpFilter => "rp-filter",
+            Self::Offloads => "offloads",
         }
     }
 }
@@ -528,6 +557,13 @@ impl fmt::Display for CheckFailure {
             ),
             Self::KernelIpv6Enabled => formatter.write_str("KERNEL_IPV6_ENABLED"),
             Self::KernelIpv4WeakHost => formatter.write_str("KERNEL_IPV4_WEAK_HOST"),
+            Self::MtuBelowFrame { mtu, required } => {
+                write!(formatter, "MTU_BELOW_FRAME mtu={mtu} required={required}")
+            }
+            Self::ReceiveOffload(offload) => {
+                write!(formatter, "RECEIVE_OFFLOAD feature={offload}")
+            }
+            Self::KernelUpperDevice => formatter.write_str("KERNEL_UPPER_DEVICE"),
         }
     }
 }
@@ -705,6 +741,74 @@ pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warni
         }
         warnings.multi_queue = Some(facts.rx_queues);
     }
+    evaluate_exposure(facts, policy, &mut warnings)?;
+    Ok(warnings)
+}
+
+/// AFPKT-015 decision for one AF_PACKET port. AF_PACKET does not take
+/// frames away from the kernel: the kernel stack keeps receiving every
+/// frame of the port while the router gets a copy, during the run as well
+/// as before and after it. So every kernel exposure refusal of
+/// [`evaluate_device`] applies unchanged (addresses, routes, forwarding,
+/// weak host, IPv6, with the same overrides), and the RX queue count does
+/// not matter (a packet socket receives from every queue). In addition,
+/// in this order:
+///
+/// - MTU: the MTU read when the device name was resolved must equal the
+///   rtnetlink MTU of the index (`probe=mtu` otherwise), and it must be
+///   exactly `max-frame-len - 14`: above it the RX ring truncates (and
+///   the backend drops) every longer frame (`MTU_ABOVE_FRAME`); below it
+///   the router could forward frames longer than this egress carries,
+///   which the kernel drops (`MTU_BELOW_FRAME`). The link watch keeps
+///   both true at run time (a change is fatal).
+/// - The port must not be enslaved to an upper device
+///   (`KERNEL_UPPER_DEVICE`): a bridge, bond, team, or VRF handles every
+///   frame the router gets a copy of.
+/// - Receive offloads (`offload`, [`super::offload`]): GRO, LRO, or
+///   hardware GRO active is refused (`RECEIVE_OFFLOAD feature=...`),
+///   unreadable is `UNVERIFIABLE probe=offloads`.
+pub fn evaluate_packet_device(
+    facts: &DeviceFacts,
+    offload: Result<Option<super::offload::Offload>, ()>,
+    policy: CheckPolicy,
+) -> Result<Warnings, CheckFailure> {
+    if facts.link_mtu != facts.session_mtu {
+        return Err(CheckFailure::Unverifiable(Probe::Mtu));
+    }
+    let limit = mtu_limit(facts.frame_capacity);
+    if facts.link_mtu > limit {
+        return Err(CheckFailure::MtuAboveFrame {
+            mtu: facts.link_mtu,
+            limit,
+        });
+    }
+    if facts.link_mtu < limit {
+        return Err(CheckFailure::MtuBelowFrame {
+            mtu: facts.link_mtu,
+            required: limit,
+        });
+    }
+    if facts.master.is_some() {
+        return Err(CheckFailure::KernelUpperDevice);
+    }
+    match offload {
+        Ok(None) => {}
+        Ok(Some(offload)) => return Err(CheckFailure::ReceiveOffload(offload)),
+        Err(()) => return Err(CheckFailure::Unverifiable(Probe::Offloads)),
+    }
+    let mut warnings = Warnings::default();
+    evaluate_exposure(facts, policy, &mut warnings)?;
+    Ok(warnings)
+}
+
+/// The kernel exposure part of [`evaluate_device`] and
+/// [`evaluate_packet_device`]: kernel IPv4 addresses and routes,
+/// forwarding, the weak host, and IPv6.
+fn evaluate_exposure(
+    facts: &DeviceFacts,
+    policy: CheckPolicy,
+    warnings: &mut Warnings,
+) -> Result<(), CheckFailure> {
     if facts.ipv4_addresses != 0 {
         return Err(CheckFailure::KernelIpv4Addresses {
             count: facts.ipv4_addresses,
@@ -741,8 +845,7 @@ pub fn evaluate_device(facts: &DeviceFacts, policy: CheckPolicy) -> Result<Warni
         Some(true) => return Err(CheckFailure::KernelIpv4WeakHost),
         None => return Err(CheckFailure::Unverifiable(Probe::RpFilter)),
     }
-    evaluate_ipv6(&facts.ipv6, policy.allow_kernel_ipv6, &mut warnings)?;
-    Ok(warnings)
+    evaluate_ipv6(&facts.ipv6, policy.allow_kernel_ipv6, warnings)
 }
 
 /// The IPv6 part of [`evaluate_device`].
@@ -864,10 +967,11 @@ pub mod linux {
     use super::super::netlink::{Dump, Family, LinkProbe};
     use super::super::privileges::{teardown_without_capabilities, PrivilegePolicy};
     use super::{
-        evaluate_drop, evaluate_privileges, missing_capabilities, parse_cap_eff, parse_flag,
-        parse_memlock, CheckFailure, DeviceFacts, Ipv6Facts, PrivilegeFailure, Probe, ProcSource,
-        SWITCH_CAPABILITIES,
+        evaluate_drop, evaluate_privileges, missing_capabilities, missing_packet_capabilities,
+        parse_cap_eff, parse_flag, parse_memlock, CheckFailure, DeviceFacts, Ipv6Facts,
+        PrivilegeFailure, Probe, ProcSource, SWITCH_CAPABILITIES,
     };
+    use ruster_config::BackendKindV1;
 
     fn effective_capabilities() -> Result<u64, PrivilegeFailure> {
         fs::read_to_string("/proc/self/status")
@@ -894,15 +998,38 @@ pub mod linux {
         check_drop(effective, policy)
     }
 
+    /// The AF_PACKET preflight: `CAP_NET_RAW`, no memlock check (nothing
+    /// is pinned), then the preconditions of the privilege drop of
+    /// `policy` without its teardown check (the AF_PACKET teardown is the
+    /// `munmap` and `close` of what this process owns, which needs no
+    /// capability).
+    pub fn check_packet_privileges(policy: PrivilegePolicy) -> Result<(), PrivilegeFailure> {
+        let effective = effective_capabilities()?;
+        let missing = missing_packet_capabilities(effective);
+        if missing != 0 {
+            return Err(PrivilegeFailure::MissingCapabilities(missing));
+        }
+        evaluate_drop(effective, policy, || Ok(true))
+    }
+
     /// Before the output threads start (they switch identity at spawn):
-    /// with `--user`/`--group`, every startup capability and `CAP_SETUID`
-    /// + `CAP_SETGID` must be effective. Nothing is read otherwise.
-    pub fn check_identity_switch(policy: PrivilegePolicy) -> Result<(), PrivilegeFailure> {
+    /// with `--user`/`--group`, every startup capability of `backend`
+    /// and `CAP_SETUID` + `CAP_SETGID` must be effective. Nothing is read
+    /// otherwise.
+    pub fn check_identity_switch(
+        policy: PrivilegePolicy,
+        backend: BackendKindV1,
+    ) -> Result<(), PrivilegeFailure> {
         if !matches!(policy, PrivilegePolicy::Drop { identity: Some(_) }) {
             return Ok(());
         }
         let effective = effective_capabilities()?;
-        let missing = missing_capabilities(effective) | (SWITCH_CAPABILITIES & !effective);
+        let startup = if backend == BackendKindV1::AfPacket {
+            missing_packet_capabilities(effective)
+        } else {
+            missing_capabilities(effective)
+        };
+        let missing = startup | (SWITCH_CAPABILITIES & !effective);
         if missing != 0 {
             return Err(PrivilegeFailure::MissingCapabilities(missing));
         }
@@ -1207,6 +1334,7 @@ pub mod linux {
             forwarding_multicast: ipv4.forwarding_multicast,
             weak_host: ipv4.weak_host,
             ipv6,
+            master: link.master,
         })
     }
 
@@ -1410,6 +1538,7 @@ mod tests {
     #[test]
     fn device_checks_refuse_or_warn_as_documented() {
         let clean = DeviceFacts {
+            master: None,
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -1520,6 +1649,7 @@ mod tests {
     #[test]
     fn kernel_forwarding_is_refused_unless_allowed() {
         let clean = DeviceFacts {
+            master: None,
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -1594,6 +1724,7 @@ mod tests {
     #[test]
     fn ipv4_weak_host_is_refused_unless_allowed() {
         let clean = DeviceFacts {
+            master: None,
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -1948,6 +2079,7 @@ mod tests {
     #[test]
     fn multicast_forwarding_refuses_and_weak_host_needs_its_own_override() {
         let clean = DeviceFacts {
+            master: None,
             ipv6: Ipv6Facts::DISABLED,
             ..ipv6_clean()
         };
@@ -2018,6 +2150,7 @@ mod tests {
     #[test]
     fn mtu_must_match_the_session_and_fit_a_frame() {
         let clean = DeviceFacts {
+            master: None,
             ifindex: 7,
             link_name: IfName::literal(b"ra"),
             rx_queues: 1,
@@ -2079,5 +2212,164 @@ mod tests {
         assert_eq!(parse_flag("0"), Some(false));
         assert_eq!(parse_flag("2"), None);
         assert_eq!(parse_flag(""), None);
+    }
+
+    /// AFPKT-015: an AF_PACKET port needs MTU exactly `max-frame-len - 14`,
+    /// no upper device, and no merging receive offload, checked before the
+    /// kernel exposure (which is the AF_XDP rule unchanged); its RX queue
+    /// count does not matter.
+    #[test]
+    fn af_packet_ports_need_the_exact_mtu_no_master_and_no_receive_offload() {
+        use super::super::offload::Offload;
+        let clean = DeviceFacts {
+            ifindex: 7,
+            link_name: IfName::literal(b"ra"),
+            rx_queues: 8,
+            link_mtu: 1500,
+            session_mtu: 1500,
+            frame_capacity: 1514,
+            forwarding_global: Some(false),
+            forwarding_device: Some(false),
+            forwarding_multicast: Some(false),
+            weak_host: Some(false),
+            ipv6: Ipv6Facts::DISABLED,
+            master: None,
+            ..DeviceFacts::default()
+        };
+        let policy = CheckPolicy::default();
+        assert_eq!(
+            evaluate_packet_device(&clean, Ok(None), policy),
+            Ok(Warnings::default()),
+            "eight RX queues need no override"
+        );
+        for (facts, offload, failure) in [
+            (
+                DeviceFacts {
+                    session_mtu: 1499,
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::Unverifiable(Probe::Mtu),
+            ),
+            (
+                DeviceFacts {
+                    link_mtu: 1501,
+                    session_mtu: 1501,
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::MtuAboveFrame {
+                    mtu: 1501,
+                    limit: 1500,
+                },
+            ),
+            (
+                DeviceFacts {
+                    link_mtu: 1499,
+                    session_mtu: 1499,
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::MtuBelowFrame {
+                    mtu: 1499,
+                    required: 1500,
+                },
+            ),
+            (
+                DeviceFacts {
+                    master: Some(3),
+                    ..clean
+                },
+                Ok(Some(Offload::Gro)),
+                CheckFailure::KernelUpperDevice,
+            ),
+            (
+                clean,
+                Ok(Some(Offload::Lro)),
+                CheckFailure::ReceiveOffload(Offload::Lro),
+            ),
+            (clean, Err(()), CheckFailure::Unverifiable(Probe::Offloads)),
+            (
+                // Offloads come before the exposure checks.
+                DeviceFacts {
+                    ipv4_addresses: 1,
+                    ..clean
+                },
+                Ok(Some(Offload::GroHw)),
+                CheckFailure::ReceiveOffload(Offload::GroHw),
+            ),
+            (
+                DeviceFacts {
+                    ipv4_addresses: 2,
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::KernelIpv4Addresses { count: 2 },
+            ),
+            (
+                DeviceFacts {
+                    weak_host: None,
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::Unverifiable(Probe::RpFilter),
+            ),
+            (
+                DeviceFacts {
+                    ipv6: Ipv6Facts::CLEAN,
+                    ..clean
+                },
+                Ok(None),
+                CheckFailure::KernelIpv6Enabled,
+            ),
+        ] {
+            assert_eq!(
+                evaluate_packet_device(&facts, offload, policy),
+                Err(failure),
+                "{facts:?} {offload:?}"
+            );
+        }
+        // The exposure overrides work as for AF_XDP.
+        let allowed = CheckPolicy {
+            allow_kernel_ipv6: true,
+            ..CheckPolicy::default()
+        };
+        let warnings = evaluate_packet_device(
+            &DeviceFacts {
+                ipv6: Ipv6Facts::CLEAN,
+                ..clean
+            },
+            Ok(None),
+            allowed,
+        )
+        .expect("allowed");
+        assert!(warnings.ipv6_enabled);
+        for (failure, text) in [
+            (
+                CheckFailure::MtuBelowFrame {
+                    mtu: 1400,
+                    required: 1500,
+                },
+                "MTU_BELOW_FRAME mtu=1400 required=1500",
+            ),
+            (
+                CheckFailure::ReceiveOffload(Offload::Gro),
+                "RECEIVE_OFFLOAD feature=rx-gro",
+            ),
+            (CheckFailure::KernelUpperDevice, "KERNEL_UPPER_DEVICE"),
+            (
+                CheckFailure::Unverifiable(Probe::Offloads),
+                "UNVERIFIABLE probe=offloads",
+            ),
+        ] {
+            assert_eq!(failure.to_string(), text);
+        }
+        // Only CAP_NET_RAW.
+        assert_eq!(missing_packet_capabilities(0), 1 << cap::NET_RAW);
+        assert_eq!(missing_packet_capabilities(1 << cap::NET_RAW), 0);
+        assert_eq!(
+            missing_packet_capabilities(!(1 << cap::NET_RAW)),
+            1 << cap::NET_RAW
+        );
     }
 }

@@ -2379,6 +2379,29 @@ drop）、AF_PACKETはframeのcopyを受け取るだけで、kernel stackは同�
 `ruster run`接続（AFPKT-015）のstartup checkで行います。性能はframeごとの一回copy、block
 retire latency、kernel stackとの二重処理のため、AF_XDP copy modeより低いと見込みます（未計測）。
 
+### `ruster run` over AF_PACKET (AFPKT-015)
+
+`ruster run`のrun loop、shutdown drain、stats、health/link watchは`Datapath` traitにgenericで、
+backendごとの実装（AF_XDP `XdpDatapath`、AF_PACKET `PacketDatapath`）をstatic dispatchで
+monomorphizeします。`backend.kind`による分岐は起動時の一回だけで、per-packet pathにtrait object
+もenum dispatchも入りません（`dyn PacketIo`なし）。AF_PACKETのdatapathは`AfPacketIo`を所有し、
+coreへはRX blockのzero-copy leaseとTX ringのframeを貸すだけです（backend所有buffer）。
+
+- 起動: `CAP_NET_RAW`のpreflight（memlock、BPF teardown checkなし）→portごと（IfId順）に
+  rtnetlinkで名前→index解決とdevice facts、AF_XDPと同じkernel露出check、MTU =
+  `max-frame-len - 14`、upper device無し、GRO/LRO/hardware GRO off（`SIOCETHTOOL`、名前でfeature
+  bitを引く）→全port通過後に`AfPacketIo::open`一回（failure atomic）。session単位のclose/detachは
+  無く、datapathのdropがmapping→socketの順に解放します。
+- run中: link watchのkernel露出conditionはAF_PACKETではfatal（kernelは全frameを並行に処理し、
+  停止しても露出は変わらないので、warningで続けずfail closed。startupのoverrideで受理したものは
+  warning）。kickの`ENXIO`で`unbound`になったportは、SEND_REQUESTのframeが永久にin-flightで
+  quiescenceを妨げるので`DEVICE_REMOVED`のfatal。`PACKET_STATISTICS`は`Datapath::refresh`で
+  health sample（500 ms）ごとに64-bitへfold。idle waitの`POLLERR`（`sk_err`はmmap ringでは
+  読まれず残る）はadapterが`SO_ERROR`で消します。TX stallはport completion数が進まない間の
+  in-flightで観測します。
+- seccomp: `getsockopt`を(level, option)の三組（`XDP_STATISTICS`、`PACKET_STATISTICS`、
+  `SO_ERROR`）に限定するone-of conditionをBPF assemblerへ追加しました。Landlockは不変です。
+
 `ruster-io-xdp`の最初のsliceは、native AF_XDP backendではなく、全targetでcompileできる
 pure-Rust ownership/ring modelです。socket、native ring、libxdp FFI、XDP program、core
 `PacketIo` adapterを持たず、`unsafe`をcrate全体で禁止します。従ってIO-009のreal generated

@@ -48,13 +48,19 @@
 //! `poll(2)` with `POLLIN` over every port's socket, kept in a fixed
 //! `pollfd` array allocated at open. TPACKET_V3 makes a block visible only
 //! when it is full or its retire timer fires, so an idle router sees a lone
-//! frame up to the RX `retire_timeout_ms` after it arrived.
+//! frame up to the RX `retire_timeout_ms` after it arrived. A `POLLERR`
+//! (the kernel's pending socket error after the bound device went down or
+//! away) is read and cleared with `getsockopt(SO_ERROR)` before the wait
+//! returns `Ready`; otherwise it would stay set, every later wait would
+//! return at once, and the idle wait would degrade to a sleep.
 //!
 //! Nothing here allocates, locks, or uses a trait object.
 
 use ruster_core::{IfId, MonotonicMillis, PublicationQuiescenceDisposition};
 
-use super::{bump, AfPacketEngine, PacketOps, PacketRingResources, TxCompletionError, POLLNVAL};
+use super::{
+    bump, AfPacketEngine, PacketOps, PacketRingResources, TxCompletionError, POLLERR, POLLNVAL,
+};
 use crate::{
     io_stats::add_faults, AfPacketBackendStats, AfPacketCounters, AfPacketPortStats,
     BackendStatsSnapshot, Errno, PlatformError, RxWait, SyscallStage, TP_STATUS_SEND_REQUEST,
@@ -425,6 +431,21 @@ impl<O: PacketOps> AfPacketEngine<O> {
                         stage: SyscallStage::Poll,
                         errno: Errno::new(EBADF),
                     });
+                }
+                // A pending socket error (`sk_err`: the kernel sets it when
+                // the bound device goes down or is unregistered) keeps
+                // `POLLERR` set until it is read, since the ring is never
+                // `recv`ed: read and clear it here (cold, at most one
+                // `getsockopt` per port and wait), so the next wait can
+                // block again instead of degrading to a sleep.
+                for (port, entry) in self.ports.iter_mut().zip(self.poll_fds.iter()) {
+                    if entry.revents & POLLERR != 0 {
+                        let fd = port.socket.fd;
+                        match port.socket.ops.take_socket_error(fd) {
+                            Ok(_) => bump(&mut port.counters.socket_errors),
+                            Err(_) => bump(&mut port.counters.socket_error_reads_failed),
+                        }
+                    }
                 }
                 // POLLERR/POLLHUP also end the wait; the next tick observes
                 // the socket. A readiness that RX cannot consume is turned
