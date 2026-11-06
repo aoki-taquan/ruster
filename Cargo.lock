@@ -136,6 +136,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-proto"
+version = "0.2.0"
+
+[[package]]
 name = "ruster-runtime"
 version = "0.2.0"
 dependencies = [
