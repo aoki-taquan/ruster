@@ -11,8 +11,8 @@
 ## 作業の単位
 
 - 1 PRに目的は一つ。テストを除く差分はおおむね500行まで。超えそうなら先に分け方を提案する。
-- 機能追加のPRはownerがapproveしてからmergeする。fix、test、docs、choreはCIが通れば
-  agentがmergeしてよい。
+- CIが通り、独立レビューが要る変更ではCriticalとHighの指摘が無ければ、agentが自分の判断でmergeしてよい
+  （2026-11-06 owner決定）。charterや設計図の方針を変えるPRは、mergeの前にownerに確認する。
 - PRのタイトルと本文は人が読む前提で、普通の言葉で書く。要件IDは本文の末尾に一行だけ。
 
 ## 実装とレビュー
