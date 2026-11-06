@@ -70,6 +70,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-confd"
+version = "0.2.0"
+dependencies = [
+ "ruster-proto",
+]
+
+[[package]]
 name = "ruster-config"
 version = "0.2.0"
 dependencies = [
@@ -94,6 +101,19 @@ dependencies = [
 [[package]]
 name = "ruster-core"
 version = "0.2.0"
+
+[[package]]
+name = "ruster-e2e"
+version = "0.2.0"
+dependencies = [
+ "ruster-confd",
+ "ruster-core",
+ "ruster-fe",
+ "ruster-io-sim",
+ "ruster-neighd",
+ "ruster-proto",
+ "ruster-ribd",
+]
 
 [[package]]
 name = "ruster-fe"

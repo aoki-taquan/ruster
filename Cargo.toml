@@ -2,9 +2,11 @@
 members = [
     "crates/bench",
     "crates/cli",
+    "crates/confd",
     "crates/config",
     "crates/control",
     "crates/core",
+    "crates/e2e",
     "crates/fe",
     "crates/io-afpacket",
     "crates/io-conformance",

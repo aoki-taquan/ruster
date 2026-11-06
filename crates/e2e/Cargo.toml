@@ -1,0 +1,15 @@
+[package]
+name = "ruster-e2e"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+ruster-confd = { path = "../confd" }
+ruster-core = { path = "../core" }
+ruster-fe = { path = "../fe" }
+ruster-io-sim = { path = "../io-sim" }
+ruster-neighd = { path = "../neighd" }
+ruster-proto = { path = "../proto" }
+ruster-ribd = { path = "../ribd" }
