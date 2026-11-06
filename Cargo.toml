@@ -5,6 +5,7 @@ members = [
     "crates/config",
     "crates/control",
     "crates/core",
+    "crates/fe",
     "crates/io-afpacket",
     "crates/io-conformance",
     "crates/io-sim",

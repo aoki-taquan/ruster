@@ -1,0 +1,13 @@
+[package]
+name = "ruster-fe"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ruster-core = { path = "../core" }
+ruster-proto = { path = "../proto" }
+
+[dev-dependencies]
+ruster-io-sim = { path = "../io-sim" }

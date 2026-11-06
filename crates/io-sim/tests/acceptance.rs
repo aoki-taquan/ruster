@@ -1237,6 +1237,7 @@ fn arp_reply_does_not_learn_or_generate_for_unresolved_neighbor() {
             TraceEvent::ArpReplyRequested { egress: LAN, .. },
             TraceEvent::TxRequested { egress: LAN },
             TraceEvent::Ipv4Validated { ingress: LAN, .. },
+            TraceEvent::NeighborMissing { egress: LAN, .. },
             TraceEvent::Dropped {
                 ingress: LAN,
                 reason: DropReason::NeighborUnresolved
