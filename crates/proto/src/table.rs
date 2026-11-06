@@ -19,6 +19,9 @@ use std::net::Ipv4Addr;
 use crate::cbor::{DecodeError, Decoder, Encoder, Kind};
 use crate::sid;
 
+/// The smallest IPv4 MTU (RFC 791, the `ietf-ip` range).
+pub const MIN_MTU: u16 = 68;
+
 /// The key of one entry: which table, and which row.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Key {
@@ -143,7 +146,61 @@ impl Change {
         Self { key, value: None }
     }
 
-    pub fn encode(&self, e: &mut Encoder<'_>) {
+    /// Checks what [`Change::decode`] checks, so that everything encoded can be decoded.
+    pub fn validate(&self) -> Result<(), ModelError> {
+        let name = |text: &str| {
+            if text.is_empty() {
+                Err(ModelError::Invalid("empty name"))
+            } else {
+                Ok(())
+            }
+        };
+        match &self.key {
+            Key::Interface { name: n } => name(n)?,
+            Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
+            Key::Route { vrf, prefix, len } => {
+                name(vrf)?;
+                parse_prefix(&format!("{prefix}/{len}"))?;
+            }
+        }
+        match &self.value {
+            None => {}
+            Some(value) => {
+                let table_matches = matches!(
+                    (&self.key, value),
+                    (Key::Interface { .. }, Value::Interface { .. })
+                        | (Key::Address { .. }, Value::Address { .. })
+                        | (Key::Route { .. }, Value::Route(_))
+                        | (Key::Neighbor { .. }, Value::Neighbor { .. })
+                );
+                if !table_matches {
+                    return Err(ModelError::WrongTable);
+                }
+                match value {
+                    Value::Interface { mtu, .. } if *mtu < MIN_MTU => {
+                        return Err(ModelError::Invalid("mtu"));
+                    }
+                    Value::Address { prefix_len } if *prefix_len > 32 => {
+                        return Err(ModelError::Invalid("prefix length"));
+                    }
+                    Value::Route(RouteAction::Forward(hops)) => {
+                        if hops.is_empty() {
+                            return Err(ModelError::Missing("next-hop"));
+                        }
+                        for hop in hops {
+                            name(&hop.interface)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the change after [`Change::validate`]; nothing is written on error.
+    pub fn encode(&self, e: &mut Encoder<'_>) -> Result<(), ModelError> {
+        self.validate()?;
         e.map(1);
         encode_key(&self.key, e);
         match &self.value {
@@ -152,6 +209,7 @@ impl Change {
             }
             Some(value) => encode_value(value, e),
         }
+        Ok(())
     }
 
     pub fn decode(d: &mut Decoder<'_>) -> Result<Self, ModelError> {
@@ -165,7 +223,9 @@ impl Change {
         } else {
             Some(decode_value(key.table(), d)?)
         };
-        Ok(Self { key, value })
+        let change = Self { key, value };
+        change.validate()?;
+        Ok(change)
     }
 }
 
@@ -296,36 +356,43 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             .checked_add(d.u64()?)
             .ok_or(ModelError::Invalid("member SID"))?;
         match member {
-            sid::INTERFACE_ENABLED if table == sid::INTERFACE => enabled = Some(d.bool()?),
+            sid::INTERFACE_ENABLED if table == sid::INTERFACE => put(&mut enabled, d.bool()?)?,
             sid::INTERFACE_PHYS_ADDRESS if table == sid::INTERFACE => {
-                mac = Some(parse_mac(d.text()?)?);
+                put(&mut mac, parse_mac(d.text()?)?)?;
             }
             sid::INTERFACE_MTU if table == sid::INTERFACE => {
-                mtu = Some(u16::try_from(d.u64()?).map_err(|_| ModelError::Invalid("mtu"))?);
+                put(
+                    &mut mtu,
+                    u16::try_from(d.u64()?).map_err(|_| ModelError::Invalid("mtu"))?,
+                )?;
             }
             sid::ADDRESS_PREFIX_LENGTH if table == sid::ADDRESS => {
-                prefix_len = Some(
+                put(
+                    &mut prefix_len,
                     u8::try_from(d.u64()?)
                         .ok()
                         .filter(|&len| len <= 32)
                         .ok_or(ModelError::Invalid("prefix length"))?,
-                );
+                )?;
             }
             sid::ROUTE_NEXT_HOP if table == sid::ROUTE => {
-                action = Some(RouteAction::Forward(decode_next_hops(d)?));
+                put(&mut action, RouteAction::Forward(decode_next_hops(d)?))?;
             }
             sid::ROUTE_LOCAL | sid::ROUTE_DISCARD | sid::ROUTE_REJECT if table == sid::ROUTE => {
                 if !d.bool()? {
                     return Err(ModelError::Invalid("route action flag"));
                 }
-                action = Some(match member {
-                    sid::ROUTE_LOCAL => RouteAction::Local,
-                    sid::ROUTE_DISCARD => RouteAction::Discard,
-                    _ => RouteAction::Reject,
-                });
+                put(
+                    &mut action,
+                    match member {
+                        sid::ROUTE_LOCAL => RouteAction::Local,
+                        sid::ROUTE_DISCARD => RouteAction::Discard,
+                        _ => RouteAction::Reject,
+                    },
+                )?;
             }
             sid::NEIGHBOR_LINK_LAYER_ADDRESS if table == sid::NEIGHBOR => {
-                mac = Some(parse_mac(d.text()?)?);
+                put(&mut mac, parse_mac(d.text()?)?)?;
             }
             other => return Err(ModelError::UnknownMember(other)),
         }
@@ -364,8 +431,8 @@ fn decode_next_hops(d: &mut Decoder<'_>) -> Result<Vec<NextHop>, ModelError> {
                 .checked_add(d.u64()?)
                 .ok_or(ModelError::Invalid("member SID"))?;
             match member {
-                sid::NEXT_HOP_INTERFACE => interface = Some(d.text()?.to_owned()),
-                sid::NEXT_HOP_ADDRESS => address = Some(parse_ipv4(d.text()?)?),
+                sid::NEXT_HOP_INTERFACE => put(&mut interface, d.text()?.to_owned())?,
+                sid::NEXT_HOP_ADDRESS => put(&mut address, parse_ipv4(d.text()?)?)?,
                 other => return Err(ModelError::UnknownMember(other)),
             }
         }
@@ -377,6 +444,16 @@ fn decode_next_hops(d: &mut Decoder<'_>) -> Result<Vec<NextHop>, ModelError> {
     Ok(hops)
 }
 
+/// Stores a member, refusing a second value for the same member (RFC 8949
+/// section 5.6: duplicate map keys) or a second route action.
+fn put<T>(slot: &mut Option<T>, value: T) -> Result<(), ModelError> {
+    if slot.is_some() {
+        return Err(ModelError::Invalid("duplicate member"));
+    }
+    *slot = Some(value);
+    Ok(())
+}
+
 fn parse_ipv4(text: &str) -> Result<Ipv4Addr, ModelError> {
     text.parse()
         .map_err(|_| ModelError::Invalid("IPv4 address"))
@@ -385,6 +462,12 @@ fn parse_ipv4(text: &str) -> Result<Ipv4Addr, ModelError> {
 fn parse_prefix(text: &str) -> Result<(Ipv4Addr, u8), ModelError> {
     let (address, len) = text.split_once('/').ok_or(ModelError::Invalid("prefix"))?;
     let address = parse_ipv4(address)?;
+    let canonical = !len.is_empty()
+        && len.bytes().all(|b| b.is_ascii_digit())
+        && (len == "0" || !len.starts_with('0'));
+    if !canonical {
+        return Err(ModelError::Invalid("prefix length"));
+    }
     let len: u8 = len
         .parse()
         .ok()
@@ -409,7 +492,7 @@ pub fn parse_mac(text: &str) -> Result<[u8; 6], ModelError> {
     let mut parts = text.split(':');
     for byte in &mut mac {
         let part = parts.next().ok_or(invalid)?;
-        if part.len() != 2 {
+        if part.len() != 2 || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(invalid);
         }
         *byte = u8::from_str_radix(part, 16).map_err(|_| invalid)?;

@@ -10,7 +10,7 @@ use ruster_proto::table::{
 
 fn round_trip(change: &Change) -> Change {
     let mut out = Vec::new();
-    change.encode(&mut Encoder::new(&mut out));
+    change.encode(&mut Encoder::new(&mut out)).unwrap();
     let mut d = Decoder::new(&out);
     let back = Change::decode(&mut d).unwrap();
     assert!(d.is_empty());
@@ -94,7 +94,7 @@ fn a_change_is_one_map_with_the_instance_identifier_as_key() {
         Value::Address { prefix_len: 8 },
     );
     let mut out = Vec::new();
-    change.encode(&mut Encoder::new(&mut out));
+    change.encode(&mut Encoder::new(&mut out)).unwrap();
     // {[60020, "e", "10.0.0.1"]: {1: 8}}
     let mut expected = vec![0xa1, 0x83, 0x19, 0xea, 0x74, 0x61, b'e', 0x68];
     expected.extend_from_slice(b"10.0.0.1");
@@ -124,6 +124,11 @@ fn sid_file_matches_the_constants() {
     values.sort_unstable();
     values.dedup();
     assert_eq!(values.len(), sid::ALL.len(), "SIDs must be unique");
+    assert_eq!(
+        text.matches("\"identifier\"").count(),
+        sid::ALL.len(),
+        "the .sid file has items the code does not"
+    );
     assert!(values.iter().all(|v| (60_000..100_000).contains(v)));
 }
 
@@ -214,4 +219,151 @@ fn mac_text_round_trips_and_rejects_bad_forms() {
     ] {
         assert!(parse_mac(bad).is_err(), "{bad}");
     }
+}
+
+#[test]
+fn duplicate_members_and_two_route_actions_are_rejected() {
+    let two_macs = encoded(|e| {
+        e.map(1)
+            .array(3)
+            .u64(sid::NEIGHBOR)
+            .text("eth0")
+            .text("10.0.0.1")
+            .map(2)
+            .u64(1)
+            .text("02:00:00:00:00:01")
+            .u64(1)
+            .text("02:00:00:00:00:02");
+    });
+    assert_eq!(
+        decode_bytes(&two_macs),
+        Err(ModelError::Invalid("duplicate member"))
+    );
+
+    let two_actions = encoded(|e| {
+        e.map(1)
+            .array(3)
+            .u64(sid::ROUTE)
+            .text("default")
+            .text("0.0.0.0/0")
+            .map(2)
+            .u64(sid::ROUTE_NEXT_HOP - sid::ROUTE)
+            .array(1)
+            .map(1)
+            .u64(1)
+            .text("eth0")
+            .u64(sid::ROUTE_LOCAL - sid::ROUTE)
+            .bool(true);
+    });
+    assert_eq!(
+        decode_bytes(&two_actions),
+        Err(ModelError::Invalid("duplicate member"))
+    );
+}
+
+#[test]
+fn encode_refuses_what_decode_would_refuse() {
+    let bad = [
+        Change::delete(Key::Interface {
+            name: String::new(),
+        }),
+        Change::delete(Key::Route {
+            vrf: "default".into(),
+            prefix: ip([10, 0, 0, 1]),
+            len: 8,
+        }),
+        Change::delete(Key::Route {
+            vrf: "default".into(),
+            prefix: ip([0, 0, 0, 0]),
+            len: 33,
+        }),
+        Change::set(
+            Key::Address {
+                interface: "eth0".into(),
+                address: ip([10, 0, 0, 1]),
+            },
+            Value::Address { prefix_len: 40 },
+        ),
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: ip([0, 0, 0, 0]),
+                len: 0,
+            },
+            Value::Route(RouteAction::Forward(vec![])),
+        ),
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: ip([0, 0, 0, 0]),
+                len: 0,
+            },
+            Value::Route(RouteAction::Forward(vec![NextHop {
+                interface: String::new(),
+                address: None,
+            }])),
+        ),
+        Change::set(
+            Key::Interface {
+                name: "eth0".into(),
+            },
+            Value::Interface {
+                enabled: true,
+                mac: [2, 0, 0, 0, 0, 1],
+                mtu: 0,
+            },
+        ),
+        Change::set(
+            Key::Interface {
+                name: "eth0".into(),
+            },
+            Value::Neighbor {
+                mac: [2, 0, 0, 0, 0, 1],
+            },
+        ),
+    ];
+    for change in &bad {
+        let mut out = Vec::new();
+        assert!(
+            change.encode(&mut Encoder::new(&mut out)).is_err(),
+            "{change:?}"
+        );
+        assert!(out.is_empty());
+    }
+}
+
+#[test]
+fn non_canonical_text_is_rejected() {
+    for prefix in [
+        "10.0.0.0/+8",
+        "10.0.0.0/008",
+        "10.0.0.0/",
+        "1.0.0.0/33",
+        "1.0.0.0/0",
+    ] {
+        let bytes = encoded(|e| {
+            e.map(1)
+                .array(3)
+                .u64(sid::ROUTE)
+                .text("default")
+                .text(prefix)
+                .null();
+        });
+        assert!(decode_bytes(&bytes).is_err(), "{prefix}");
+    }
+    assert!(parse_mac("+f:00:00:00:00:00").is_err());
+}
+
+#[test]
+fn member_delta_overflow_is_rejected() {
+    let bytes = encoded(|e| {
+        e.map(1)
+            .array(2)
+            .u64(sid::INTERFACE)
+            .text("eth0")
+            .map(1)
+            .u64(u64::MAX)
+            .bool(true);
+    });
+    assert!(decode_bytes(&bytes).is_err());
 }
