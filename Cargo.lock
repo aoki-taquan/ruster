@@ -145,6 +145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-neighd"
+version = "0.2.0"
+dependencies = [
+ "ruster-core",
+ "ruster-fe",
+ "ruster-io-sim",
+ "ruster-proto",
+]
+
+[[package]]
 name = "ruster-proto"
 version = "0.2.0"
 
