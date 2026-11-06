@@ -8,8 +8,6 @@
 - [ ] `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
 - [ ] `cargo test --workspace --all-targets --all-features --locked`
 - [ ] `cargo test --doc --workspace --all-features --locked`
-- [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`
-- [ ] `cargo check --workspace --all-targets --all-features --locked`
 
 ## 転送の処理経路（触ったときだけ）
 

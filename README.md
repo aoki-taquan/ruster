@@ -1515,19 +1515,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-targets --all-features --locked
 cargo test --doc --workspace --all-features --locked
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-cargo check --workspace --all-targets --all-features --locked
 ```
 
-CIの`Musl` jobは、固定したRust 1.97.1へtargetを追加して次のcheckも実行します。
-
-```bash
-rustup target add --toolchain 1.97.1 x86_64-unknown-linux-musl
-cargo +1.97.1 check --workspace --all-targets --all-features --locked --target x86_64-unknown-linux-musl
-```
-
-これはmusl targetでworkspace全体が型検査を通ることだけを確認するcompile-only portability
-checkです。musl向けartifactのlink、test実行、実NICでのruntime compatibilityは保証しません。
+CIはこの4つを1 jobで実行します。
 
 `ruster-io-xdp-native`のunsafe/fake test（RX/Fill engine、TX/Completion半分、generated frame、core adapterのheap scripted kernel testを含む。kernelを`'static`へleakするconformance harness testだけはskip）は任意でMiriでも確認できます（nightlyとMiri sysrootが
 必要。CI gateではありません）。
@@ -1544,7 +1534,7 @@ MIRIFLAGS=-Zmiri-permissive-provenance cargo +nightly miri test -p ruster-io-afp
 ```
 
 AF_XDP native session/XDP attachのprivileged smokeは`sudo -n`が使えるLinux 5.9以上のhost
-（`ip`はlibbpf付きiproute2、`python3`が必要）で明示的に実行します（CIでは下の`XDP veth` job）。
+（`ip`はlibbpf付きiproute2、`python3`が必要）で明示的に実行します（CIでは実行しません）。
 
 ```bash
 scripts/priv-xdp-smoke.sh

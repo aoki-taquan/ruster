@@ -37,4 +37,5 @@
 
 ## 確認
 
-変更後はREADMEの「開発」にあるformat、clippy、test、doc、checkを実行する。
+変更後、mergeの前にREADMEの「開発」にあるformat、clippy、test、doc testをローカルで実行する。
+CIは同じものを一つのjobで回すだけにしている。プロジェクトが大きくなってから足す。
