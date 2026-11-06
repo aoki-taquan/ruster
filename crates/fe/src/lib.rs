@@ -51,6 +51,13 @@ const EVENTS_PER_BATCH: usize = 64;
 const INJECT_PER_STEP: usize = 64;
 /// One resolve request per next hop per this many milliseconds.
 const RESOLVE_INTERVAL_MS: u64 = 1_000;
+/// Next hops remembered for the rate limit. Older ones are forgotten first; when all
+/// are recent, further requests wait (and are counted).
+const RESOLVE_REMEMBERED: usize = 1_024;
+/// The largest frame accepted from the punt socket (Ethernet with a 1500-byte payload
+/// and a VLAN tag, plus the punt header).
+const PUNT_MAX: usize = 1_522 + 300;
+const ETHERNET_HEADER: usize = 14;
 
 /// Counters for things the FE dropped on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,6 +68,7 @@ pub struct FeCounters {
     pub arp_to_control: u64,
     pub arp_to_control_dropped: u64,
     pub resolve_requests: u64,
+    pub resolve_requests_dropped: u64,
     pub injected: u64,
     pub inject_dropped: u64,
 }
@@ -69,6 +77,8 @@ pub struct Fe<B> {
     io: B,
     builder: Builder,
     owner: ValidatedForwardingOwner,
+    /// The interfaces enabled in the current tables.
+    active: Vec<IfId>,
     server: Server,
     punt: Option<UnixDatagram>,
     last_resolve: BTreeMap<(IfId, Ipv4Addr), u64>,
@@ -92,13 +102,14 @@ where
     /// so nothing is forwarded until a writer adds interfaces and routes.
     pub fn new(io: B, ports: Vec<String>) -> Self {
         let builder = Builder { ports, built: None };
-        let owner = builder
+        let (owner, active) = builder
             .build(&Store::default())
             .expect("empty tables build");
         Self {
             io,
             builder,
             owner,
+            active,
             server: Server::new(),
             punt: None,
             last_resolve: BTreeMap::new(),
@@ -189,6 +200,14 @@ where
         let Some(name) = self.builder.ports.get(usize::from(egress.0)) else {
             return;
         };
+        if self.last_resolve.len() >= RESOLVE_REMEMBERED {
+            self.last_resolve
+                .retain(|_, at| now_ms.saturating_sub(*at) < RESOLVE_INTERVAL_MS);
+            if self.last_resolve.len() >= RESOLVE_REMEMBERED {
+                self.counters.resolve_requests_dropped += 1;
+                return;
+            }
+        }
         self.last_resolve.insert((egress, address), now_ms);
         let mut payload = Vec::new();
         ResolveRequest {
@@ -205,11 +224,13 @@ where
         let Some(socket) = &self.punt else {
             return false;
         };
-        let mut buf = vec![0_u8; 2048];
+        // One byte more than accepted, to see a datagram that was cut short.
+        let mut buf = vec![0_u8; PUNT_MAX + 1];
         let mut frames = Vec::new();
         for _ in 0..INJECT_PER_STEP {
             match socket.recv(&mut buf) {
-                Ok(n) => frames.push(buf[..n].to_vec()),
+                Ok(n) if n <= PUNT_MAX => frames.push(buf[..n].to_vec()),
+                Ok(_) => self.counters.inject_dropped += 1,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
@@ -220,10 +241,15 @@ where
                 self.counters.inject_dropped += 1;
                 continue;
             };
-            let port = self.builder.ports.iter().position(|p| p == punt.interface);
-            match (punt.direction, port) {
-                (Direction::FromControl, Some(port)) => {
-                    let egress = IfId(u16::try_from(port).expect("ports fit in u16"));
+            // Only out of an interface the current tables have enabled.
+            let egress = self
+                .builder
+                .port(punt.interface)
+                .filter(|id| self.active.contains(id));
+            match (punt.direction, punt.reason, egress) {
+                (Direction::FromControl, punt::reason::ARP, Some(egress))
+                    if punt.frame.len() >= ETHERNET_HEADER =>
+                {
                     if self.send_generated(egress, punt.frame) {
                         self.counters.injected += 1;
                     } else {
@@ -257,8 +283,9 @@ where
 {
     fn step(&mut self, now_ms: u64) -> Progress {
         let control = self.server.step(&mut self.builder);
-        if let Some(owner) = self.builder.built.take() {
+        if let Some((owner, active)) = self.builder.built.take() {
             self.owner = owner;
+            self.active = active;
         }
         let worked = self.worker(now_ms);
         let injected = self.inject();
@@ -272,7 +299,7 @@ where
 struct Builder {
     ports: Vec<String>,
     /// The owner built for the last accepted tables, until the FE takes it.
-    built: Option<ValidatedForwardingOwner>,
+    built: Option<(ValidatedForwardingOwner, Vec<IfId>)>,
 }
 
 impl Builder {
@@ -284,7 +311,7 @@ impl Builder {
     /// Entries that point at something missing (a port the FE does not have, a
     /// disabled interface, another VRF, an action the skeleton lacks) are kept in the
     /// tables but left out here.
-    fn build(&self, store: &Store) -> Result<ValidatedForwardingOwner, String> {
+    fn build(&self, store: &Store) -> Result<(ValidatedForwardingOwner, Vec<IfId>), String> {
         let mut interfaces = Vec::new();
         let mut bindings: Vec<LocalIpv4Binding> = Vec::new();
         let mut routes = Vec::new();
@@ -349,6 +376,7 @@ impl Builder {
                 _ => {}
             }
         }
+        let enabled = interfaces.iter().map(|i: &Interface| i.id).collect();
         ValidatedForwardingOwner::new(
             routes.into(),
             interfaces.into(),
@@ -356,6 +384,7 @@ impl Builder {
             bindings.into(),
             Ipv4OriginPolicy::default(),
         )
+        .map(|owner| (owner, enabled))
         .map_err(|error| format!("{error:?}"))
     }
 }

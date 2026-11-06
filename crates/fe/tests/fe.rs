@@ -330,3 +330,79 @@ fn forwarding_continues_after_every_writer_disconnects() {
     bench.fe.step(10);
     assert!(bench.fe.io_mut().pop_tx().is_some());
 }
+
+#[test]
+fn frames_from_the_neighbor_process_only_leave_enabled_interfaces() {
+    let mut bench = Bench::new();
+    let mut config = bench.connect(writers::CONFIG);
+    bench.patch(&mut config, &[iface("lan", LAN_MAC)]);
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    bench.fe.attach_punt(fe_end).unwrap();
+    let frame = vec![0xab_u8; 42];
+    for interface in ["wan", "nope", "lan"] {
+        let mut message = Vec::new();
+        Punt {
+            direction: Direction::FromControl,
+            reason: punt::reason::ARP,
+            interface,
+            frame: &frame,
+        }
+        .encode(&mut message)
+        .unwrap();
+        neighd_end.send(&message).unwrap();
+    }
+    // Too short to be Ethernet.
+    let mut runt = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &[1, 2, 3],
+    }
+    .encode(&mut runt)
+    .unwrap();
+    neighd_end.send(&runt).unwrap();
+    // Longer than the FE accepts.
+    neighd_end.send(&[1_u8; 4_000]).unwrap();
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("lan only");
+    assert_eq!(tx.egress, IfId(0));
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    assert_eq!(bench.fe.counters().inject_dropped, 4);
+}
+
+#[test]
+fn the_resolve_rate_limit_forgets_old_next_hops_and_stays_bounded() {
+    let mut bench = Bench::new();
+    let (_config, mut routes) = configure(&mut bench);
+    bench.patch(&mut routes, &[route([10, 0, 0, 0], 16, "wan", None)]);
+    let destination = |n: u32| {
+        let [_, _, c, d] = (u32::from_be_bytes([10, 0, 0, 0]) + n).to_be_bytes();
+        [10, 0, c, d]
+    };
+
+    // Spread out: every next hop gets its request, because old ones are forgotten.
+    for n in 1..=2_000_u32 {
+        bench.now = u64::from(n) * 2;
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), udp_from_host(destination(n)));
+        bench.fe.step(bench.now);
+    }
+    assert_eq!(bench.fe.counters().resolve_requests, 2_000);
+    assert_eq!(bench.fe.counters().resolve_requests_dropped, 0);
+
+    // All at one moment: at most 1 024 are remembered, the rest wait.
+    bench.now = 1_000_000;
+    for n in 10_000..12_000_u32 {
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), udp_from_host(destination(n)));
+        bench.fe.step(bench.now);
+    }
+    let counters = bench.fe.counters();
+    assert_eq!(counters.resolve_requests, 2_000 + 1_024);
+    assert_eq!(counters.resolve_requests_dropped, 2_000 - 1_024);
+}
