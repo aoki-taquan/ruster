@@ -1206,7 +1206,7 @@ pub struct ForwardingSnapshot<'a> {
     input_firewall_indexed: bool,
     /// Whether every valid ARP packet goes to the control side instead of
     /// being learned or answered here
-    /// ([`ForwardingSnapshot::with_arp_to_control`]). Also in the padding.
+    /// ([`ForwardingSnapshot::with_arp_to_control`]).
     arp_to_control: bool,
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].

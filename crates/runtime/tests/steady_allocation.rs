@@ -275,8 +275,9 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         // (a borrowed slice, 16 bytes; the default action sits in padding);
         // ARP-040 the per-interface announce/defense overrides (a borrowed
         // slice, 16 bytes; the router-wide announce switch sits in the ARP
-        // policy's padding).
-        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 144);
+        // policy's padding); the ARP-to-control switch for the FE/CE split
+        // one more byte, which rounds the snapshot up by 8.
+        assert_eq!(size_of::<ForwardingSnapshot<'static>>(), 152);
         assert_eq!(size_of::<FirewallConfig<'static>>(), 160);
         assert_eq!(size_of::<Nat44UdpConfig>(), 112);
         // N1 added the opening and closing idle TTLs to the TCP policy, and
