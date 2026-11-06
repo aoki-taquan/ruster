@@ -28,8 +28,8 @@ YANGで「何を送れるか」が決まり、CEのどのプロセスも同じ�
 
 | 表 | YANGモジュール | SID | 書き手 | socket |
 |---|---|---|---|---|
-| インターフェース | `ietf-interfaces`（RFC 8343） | IANA割り当て済み（1500から100個） | `ruster-confd` | `/run/ruster/fe/config.sock` |
-| アドレス、MTU | `ietf-ip`（RFC 8344）のipv4/ipv6のうちaddressとmtu | IANA割り当て済み（1600から100個） | `ruster-confd` | 同上 |
+| インターフェース | `ietf-interfaces`（RFC 8343） | IANAの範囲は1500から。項目は当面ローカルの番号 | `ruster-confd` | `/run/ruster/fe/config.sock` |
+| アドレス、MTU | `ietf-ip`（RFC 8344）のipv4/ipv6のうちaddressとmtu | IANAの範囲は1600から。項目は当面ローカルの番号 | `ruster-confd` | 同上 |
 | 経路（FIB） | `ruster-fib`（独自） | 独自の範囲（下） | `ruster-ribd` | `/run/ruster/fe/route.sock` |
 | 近隣 | `ruster-neighbor`（独自） | 独自の範囲（下） | `ruster-neighd` | `/run/ruster/fe/neigh.sock` |
 
@@ -181,7 +181,9 @@ frame     ...
 
 ## SIDの割り当て
 
-- 標準モジュールはIANAが割り当てたSIDを使う（`ietf-interfaces`は1500から、`ietf-ip`は1600から）。
+- 標準モジュールはIANAが割り当てた範囲がある（`ietf-interfaces`は1500から、`ietf-ip`は1600から）。ただし
+  項目ごとの`.sid`ファイルは公開されていない（2026-11-06に確認）。公開されるまでは、使う項目も実験用の範囲で
+  自分で番号を付ける（`crates/proto/sid/ruster-fe.sid`）。
 - 独自モジュールは、登録なしで使える実験用の範囲（60000〜99999、RFC 9595）を使う。PENは取らない。
   - RFC 9595はこの範囲を「世界で一意ではないので運用で使ってはいけない」としている。rusterのFEとCEは
     自分たちの間でしか話さないので、衝突しても困らない。他者のYANGモジュールと混ぜて使う必要が

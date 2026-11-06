@@ -1,0 +1,124 @@
+{
+  "ietf-sid-file:sid-file": {
+    "module-name": "ruster-fe",
+    "sid-file-version": 0,
+    "sid-file-status": "unpublished",
+    "description": "Locally numbered SIDs for the ruster skeleton tables (experimental range, RFC 9595 section 6.4.2).",
+    "assignment-range": [
+      {
+        "entry-point": 60000,
+        "size": 100
+      }
+    ],
+    "item": [
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface",
+        "sid": 60010,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/enabled",
+        "sid": 60011,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/phys-address",
+        "sid": 60012,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/mtu",
+        "sid": 60013,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",
+        "sid": 60020,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address/prefix-length",
+        "sid": 60021,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route",
+        "sid": 60030,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/next-hop",
+        "sid": 60031,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/next-hop/outgoing-interface",
+        "sid": 60032,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/next-hop/address",
+        "sid": 60033,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/local",
+        "sid": 60035,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/discard",
+        "sid": 60036,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/reject",
+        "sid": 60037,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-neighbor:neighbors/neighbor",
+        "sid": 60040,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-neighbor:neighbors/neighbor/link-layer-address",
+        "sid": 60041,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-neighbor:resolve-request",
+        "sid": 60050,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-neighbor:resolve-request/interface",
+        "sid": 60051,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-neighbor:resolve-request/address",
+        "sid": 60052,
+        "status": "unstable"
+      }
+    ]
+  }
+}
