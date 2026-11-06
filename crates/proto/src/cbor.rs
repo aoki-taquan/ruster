@@ -213,6 +213,8 @@ impl<'a> Decoder<'a> {
         Ok(self.expect(Kind::Unsigned)?.value)
     }
 
+    /// Reads an unsigned or negative integer. On a wrong kind, the error names
+    /// [`Kind::Unsigned`] as the expected kind, though [`Kind::Negative`] is accepted too.
     pub fn i64(&mut self) -> Result<i64, DecodeError> {
         let start = self.pos;
         let head = self.read_head()?;
@@ -245,13 +247,21 @@ impl<'a> Decoder<'a> {
     }
 
     /// Reads an array head and returns how many items follow.
+    ///
+    /// The count is never larger than the bytes left, because every item takes at least
+    /// one byte. A caller may size a buffer from it without trusting the sender.
     pub fn array(&mut self) -> Result<u64, DecodeError> {
-        Ok(self.expect(Kind::Array)?.value)
+        let head = self.expect(Kind::Array)?;
+        self.check_count(head.value, 1)
     }
 
     /// Reads a map head and returns how many key and value pairs follow.
+    ///
+    /// The count is never larger than half the bytes left (a key and a value take at
+    /// least two bytes).
     pub fn map(&mut self) -> Result<u64, DecodeError> {
-        Ok(self.expect(Kind::Map)?.value)
+        let head = self.expect(Kind::Map)?;
+        self.check_count(head.value, 2)
     }
 
     pub fn bool(&mut self) -> Result<bool, DecodeError> {
@@ -298,6 +308,14 @@ impl<'a> Decoder<'a> {
         Ok(head)
     }
 
+    fn check_count(&self, count: u64, bytes_per_entry: u64) -> Result<u64, DecodeError> {
+        let remaining = (self.input.len() - self.pos) as u64;
+        match count.checked_mul(bytes_per_entry) {
+            Some(needed) if needed <= remaining => Ok(count),
+            _ => Err(DecodeError::UnexpectedEnd),
+        }
+    }
+
     fn take(&mut self, len: u64) -> Result<&'a [u8], DecodeError> {
         let remaining = self.input.len() - self.pos;
         let len = usize::try_from(len)
@@ -316,6 +334,15 @@ impl<'a> Decoder<'a> {
         let major = first >> 5;
         let info = first & 0x1f;
         let unsupported = |what| DecodeError::Unsupported { at, what };
+
+        // Refuse tags and floats before reading their argument, so a truncated one is
+        // reported as what it is rather than as a short input.
+        if major == MAJOR_TAG && info != 31 {
+            return Err(unsupported(Unsupported::Tag));
+        }
+        if major == MAJOR_SIMPLE && matches!(info, 25..=27) {
+            return Err(unsupported(Unsupported::Float));
+        }
 
         let value = match info {
             0..=23 => u64::from(info),
@@ -337,7 +364,6 @@ impl<'a> Decoder<'a> {
             MAJOR_MAP => Kind::Map,
             MAJOR_TAG => return Err(unsupported(Unsupported::Tag)),
             _ => match (info, value) {
-                (25..=27, _) => return Err(unsupported(Unsupported::Float)),
                 (_, SIMPLE_FALSE | SIMPLE_TRUE) if info < 24 => Kind::Bool,
                 (_, SIMPLE_NULL) if info < 24 => Kind::Null,
                 _ => return Err(unsupported(Unsupported::SimpleValue)),

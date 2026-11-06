@@ -253,3 +253,79 @@ fn invalid_utf8_is_rejected() {
         Err(DecodeError::InvalidUtf8 { at: 0 })
     );
 }
+
+#[test]
+fn container_counts_larger_than_the_input_are_rejected() {
+    for bytes in ["9bffffffffffffffff", "bbffffffffffffffff", "8301", "a20101"] {
+        let input = hex(bytes);
+        let mut d = Decoder::new(&input);
+        let result = if bytes.starts_with('9') || bytes.starts_with('8') {
+            d.array()
+        } else {
+            d.map()
+        };
+        assert_eq!(result, Err(DecodeError::UnexpectedEnd), "{bytes}");
+        assert_eq!(
+            Decoder::new(&input).skip(),
+            Err(DecodeError::UnexpectedEnd),
+            "{bytes}"
+        );
+    }
+}
+
+#[test]
+fn truncated_tags_and_floats_are_named() {
+    for (bytes, what) in [("d8", Unsupported::Tag), ("f93c", Unsupported::Float)] {
+        let input = hex(bytes);
+        assert_eq!(
+            Decoder::new(&input).skip(),
+            Err(DecodeError::Unsupported { at: 0, what }),
+            "{bytes}"
+        );
+    }
+}
+
+#[test]
+fn every_reader_consumes_nothing_on_wrong_kind() {
+    let input = hex("00");
+    let mut d = Decoder::new(&input);
+    assert!(d.bytes().is_err());
+    assert!(d.text().is_err());
+    assert!(d.array().is_err());
+    assert!(d.map().is_err());
+    assert!(d.bool().is_err());
+    assert!(d.null().is_err());
+    assert_eq!(d.position(), 0);
+    let input = hex("6161");
+    let mut d = Decoder::new(&input);
+    assert!(d.i64().is_err());
+    assert_eq!(d.position(), 0);
+}
+
+#[test]
+fn heads_round_trip_at_every_size_boundary() {
+    for value in [
+        23u64,
+        24,
+        255,
+        256,
+        65_535,
+        65_536,
+        u64::from(u32::MAX),
+        1 << 32,
+    ] {
+        let bytes = encode(|e| {
+            e.u64(value).array(value).map(value);
+        });
+        let mut d = Decoder::new(&bytes);
+        assert_eq!(d.u64(), Ok(value));
+        // The container heads are read raw; their counts exceed the input on purpose.
+        assert_eq!(d.peek_kind(), Ok(Kind::Array));
+    }
+}
+
+#[test]
+fn truncated_head_inside_a_container_is_rejected() {
+    let input = hex("8218");
+    assert_eq!(Decoder::new(&input).skip(), Err(DecodeError::UnexpectedEnd));
+}
