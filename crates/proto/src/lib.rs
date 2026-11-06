@@ -5,11 +5,13 @@
 //! every process shares: the CBOR subset ([`cbor`]), CoAP framing for byte
 //! streams ([`coap`]), the SIDs ([`sid`]), the table entries ([`table`]), one
 //! connection over a Unix stream ([`conn`]), the table server and client
-//! ([`session`]) and the task interface ([`task`]).
+//! ([`session`]), frames passed to and from the CE ([`punt`]) and the task
+//! interface ([`task`]).
 
 pub mod cbor;
 pub mod coap;
 pub mod conn;
+pub mod punt;
 pub mod session;
 pub mod sid;
 pub mod table;

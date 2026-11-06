@@ -502,3 +502,46 @@ pub fn parse_mac(text: &str) -> Result<[u8; 6], ModelError> {
     }
     Ok(mac)
 }
+
+/// The notification the FE sends when a packet's next hop is not in the neighbor
+/// table: `{RESOLVE_REQUEST: {1: interface, 2: address}}`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolveRequest {
+    pub interface: String,
+    pub address: Ipv4Addr,
+}
+
+impl ResolveRequest {
+    pub fn encode(&self, e: &mut Encoder<'_>) {
+        e.map(1)
+            .u64(sid::RESOLVE_REQUEST)
+            .map(2)
+            .u64(sid::RESOLVE_REQUEST_INTERFACE - sid::RESOLVE_REQUEST)
+            .text(&self.interface)
+            .u64(sid::RESOLVE_REQUEST_ADDRESS - sid::RESOLVE_REQUEST)
+            .text(&self.address.to_string());
+    }
+
+    pub fn decode(d: &mut Decoder<'_>) -> Result<Self, ModelError> {
+        if d.map()? != 1 || d.u64()? != sid::RESOLVE_REQUEST {
+            return Err(ModelError::Invalid("resolve request"));
+        }
+        let members = d.map()?;
+        let mut interface = None;
+        let mut address = None;
+        for _ in 0..members {
+            match sid::RESOLVE_REQUEST.checked_add(d.u64()?) {
+                Some(sid::RESOLVE_REQUEST_INTERFACE) => {
+                    put(&mut interface, d.text()?.to_owned())?;
+                }
+                Some(sid::RESOLVE_REQUEST_ADDRESS) => put(&mut address, parse_ipv4(d.text()?)?)?,
+                Some(other) => return Err(ModelError::UnknownMember(other)),
+                None => return Err(ModelError::Invalid("member SID")),
+            }
+        }
+        Ok(Self {
+            interface: interface.ok_or(ModelError::Missing("interface"))?,
+            address: address.ok_or(ModelError::Missing("address"))?,
+        })
+    }
+}

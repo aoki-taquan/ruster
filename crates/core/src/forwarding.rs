@@ -2351,6 +2351,14 @@ pub enum TraceEvent {
         target: crate::Ipv4Address,
         result: ResolutionResult,
     },
+    /// A forwarded packet's next hop is not in the neighbor table and there
+    /// is no resolution runtime; the packet is dropped as
+    /// [`DropReason::NeighborUnresolved`] and the caller may ask the control
+    /// side to resolve `target`.
+    NeighborMissing {
+        egress: IfId,
+        target: crate::Ipv4Address,
+    },
     /// The packet was handed to the backend, not necessarily accepted by TX.
     TxRequested {
         egress: IfId,
@@ -5430,6 +5438,11 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
     } else {
+        // No resolution runtime: the control side resolves (FE/CE split).
+        trace.record(TraceEvent::NeighborMissing {
+            egress: route.egress(),
+            target,
+        });
         return Err(NeighborUnresolved);
     };
     let ttl_offset = ipv4

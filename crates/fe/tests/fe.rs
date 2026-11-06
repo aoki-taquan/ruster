@@ -1,0 +1,332 @@
+//! FE skeleton tests: tables arrive over real sockets, packets go through `SimIo`.
+
+use std::net::Ipv4Addr;
+use std::os::unix::net::{UnixDatagram, UnixStream};
+
+use ruster_core::{ipv4_header_checksum, IfId};
+use ruster_fe::{writers, Fe};
+use ruster_io_sim::SimIo;
+use ruster_proto::cbor::Decoder;
+use ruster_proto::coap::Code;
+use ruster_proto::punt::{self, Direction, Punt};
+use ruster_proto::session::{Client, Event};
+use ruster_proto::table::{Change, Key, NextHop, ResolveRequest, RouteAction, Value};
+use ruster_proto::task::Task;
+
+const LAN_MAC: [u8; 6] = [2, 0, 0, 0, 0, 1];
+const WAN_MAC: [u8; 6] = [2, 0, 0, 0, 0, 2];
+const HOST_MAC: [u8; 6] = [2, 0, 0, 0, 0, 0x10];
+const GATEWAY_MAC: [u8; 6] = [2, 0, 0, 0, 0, 0xfe];
+const GATEWAY: [u8; 4] = [198, 51, 100, 1];
+
+struct Bench {
+    fe: Fe<SimIo>,
+    now: u64,
+}
+
+impl Bench {
+    fn new() -> Self {
+        Self {
+            fe: Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]),
+            now: 0,
+        }
+    }
+
+    fn connect(&mut self, writes: &[u64]) -> Client {
+        let (a, b) = UnixStream::pair().unwrap();
+        self.fe.attach(a, writes).unwrap();
+        Client::new(b).unwrap()
+    }
+
+    /// Steps the FE and the clients until quiet. Returns each client's events.
+    fn settle(&mut self, clients: &mut [&mut Client]) -> Vec<Vec<Event>> {
+        let mut events = vec![Vec::new(); clients.len()];
+        for _ in 0..1_000 {
+            let mut busy = self.fe.step(self.now).busy;
+            for (client, got) in clients.iter_mut().zip(&mut events) {
+                let (progress, mut new) = client.poll();
+                busy |= progress.busy;
+                got.append(&mut new);
+            }
+            if !busy {
+                return events;
+            }
+        }
+        panic!("never settled");
+    }
+
+    fn patch(&mut self, client: &mut Client, changes: &[Change]) -> Code {
+        let token = client.patch(changes).unwrap();
+        let events = self.settle(&mut [client]).remove(0);
+        events
+            .iter()
+            .find_map(|event| match event {
+                Event::Response { token: t, code, .. } if *t == token => Some(*code),
+                _ => None,
+            })
+            .expect("response")
+    }
+}
+
+fn iface(name: &str, mac: [u8; 6]) -> Change {
+    Change::set(
+        Key::Interface { name: name.into() },
+        Value::Interface {
+            enabled: true,
+            mac,
+            mtu: 1500,
+        },
+    )
+}
+
+fn address(interface: &str, address: [u8; 4], prefix_len: u8) -> Change {
+    Change::set(
+        Key::Address {
+            interface: interface.into(),
+            address: Ipv4Addr::from(address),
+        },
+        Value::Address { prefix_len },
+    )
+}
+
+fn route(prefix: [u8; 4], len: u8, interface: &str, via: Option<[u8; 4]>) -> Change {
+    Change::set(
+        Key::Route {
+            vrf: "default".into(),
+            prefix: Ipv4Addr::from(prefix),
+            len,
+        },
+        Value::Route(RouteAction::Forward(vec![NextHop {
+            interface: interface.into(),
+            address: via.map(Ipv4Addr::from),
+        }])),
+    )
+}
+
+fn neighbor(interface: &str, address: [u8; 4], mac: [u8; 6]) -> Change {
+    Change::set(
+        Key::Neighbor {
+            interface: interface.into(),
+            address: Ipv4Addr::from(address),
+        },
+        Value::Neighbor { mac },
+    )
+}
+
+/// The tables of a two-port router: LAN 192.0.2.0/24, WAN 198.51.100.0/24, default via
+/// the WAN gateway.
+fn configure(bench: &mut Bench) -> (Client, Client) {
+    let mut config = bench.connect(writers::CONFIG);
+    let code = bench.patch(
+        &mut config,
+        &[
+            iface("lan", LAN_MAC),
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut routes = bench.connect(writers::ROUTE);
+    let code = bench.patch(
+        &mut routes,
+        &[
+            route([192, 0, 2, 0], 24, "lan", None),
+            route([198, 51, 100, 0], 24, "wan", None),
+            route([0, 0, 0, 0], 0, "wan", Some(GATEWAY)),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    (config, routes)
+}
+
+/// An Ethernet/IPv4/UDP frame from the LAN host to `destination`.
+fn udp_from_host(destination: [u8; 4]) -> Vec<u8> {
+    let mut frame = vec![0_u8; 60];
+    frame[0..6].copy_from_slice(&LAN_MAC);
+    frame[6..12].copy_from_slice(&HOST_MAC);
+    frame[12..14].copy_from_slice(&0x0800_u16.to_be_bytes());
+    let ip = 14;
+    frame[ip] = 0x45;
+    frame[ip + 2..ip + 4].copy_from_slice(&46_u16.to_be_bytes());
+    frame[ip + 8] = 64;
+    frame[ip + 9] = 17;
+    frame[ip + 12..ip + 16].copy_from_slice(&[192, 0, 2, 10]);
+    frame[ip + 16..ip + 20].copy_from_slice(&destination);
+    let checksum = ipv4_header_checksum(&frame[ip..ip + 20]);
+    frame[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
+    frame[ip + 20..ip + 22].copy_from_slice(&1000_u16.to_be_bytes());
+    frame[ip + 22..ip + 24].copy_from_slice(&2000_u16.to_be_bytes());
+    frame[ip + 24..ip + 26].copy_from_slice(&26_u16.to_be_bytes());
+    frame
+}
+
+const INTERNET: [u8; 4] = [203, 0, 113, 7];
+
+#[test]
+fn empty_tables_forward_nothing() {
+    let mut bench = Bench::new();
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(0);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+}
+
+#[test]
+fn tables_from_three_writers_forward_a_packet() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(code, Code::CHANGED);
+
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("forwarded");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+    assert_eq!(&tx.bytes[6..12], &WAN_MAC);
+    assert_eq!(tx.bytes[14 + 8], 63, "TTL decremented");
+}
+
+#[test]
+fn a_neighbor_miss_becomes_one_resolve_request_per_second() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut watcher = bench.connect(writers::NEIGHBOR);
+    watcher.observe();
+    bench.settle(&mut [&mut watcher]);
+
+    for now in [0, 10, 500, 1_000] {
+        bench.now = now;
+        bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+        bench.settle(&mut [&mut watcher]);
+    }
+    let events = bench.settle(&mut [&mut watcher]).remove(0);
+    assert!(events.is_empty());
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "the packets were dropped"
+    );
+    assert_eq!(
+        bench.fe.counters().resolve_requests,
+        2,
+        "at 0 and at 1000 ms"
+    );
+}
+
+#[test]
+fn resolve_request_names_the_interface_and_next_hop() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut watcher = bench.connect(writers::NEIGHBOR);
+    watcher.observe();
+    bench.settle(&mut [&mut watcher]);
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    let events = bench.settle(&mut [&mut watcher]).remove(0);
+    let payload = events
+        .iter()
+        .find_map(|e| match e {
+            Event::Notification { payload } => Some(payload.clone()),
+            Event::Response { .. } => None,
+        })
+        .expect("notification");
+    let request = ResolveRequest::decode(&mut Decoder::new(&payload)).unwrap();
+    assert_eq!(
+        request,
+        ResolveRequest {
+            interface: "wan".into(),
+            address: Ipv4Addr::from(GATEWAY),
+        }
+    );
+}
+
+fn arp_request(target: [u8; 4]) -> Vec<u8> {
+    let mut frame = vec![0_u8; 42];
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    frame[6..12].copy_from_slice(&HOST_MAC);
+    frame[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
+    frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&1_u16.to_be_bytes());
+    frame[22..28].copy_from_slice(&HOST_MAC);
+    frame[28..32].copy_from_slice(&[192, 0, 2, 10]);
+    frame[38..42].copy_from_slice(&target);
+    frame
+}
+
+#[test]
+fn arp_goes_to_the_neighbor_socket_and_frames_come_back() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    bench.fe.attach_punt(fe_end).unwrap();
+
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), arp_request([192, 0, 2, 1]));
+    bench.fe.step(0);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "the FE does not answer ARP"
+    );
+
+    let mut buf = [0_u8; 256];
+    let n = neighd_end.recv(&mut buf).unwrap();
+    let punt = Punt::decode(&buf[..n]).unwrap();
+    assert_eq!(punt.direction, Direction::ToControl);
+    assert_eq!(punt.reason, punt::reason::ARP);
+    assert_eq!(punt.interface, "lan");
+    assert_eq!(punt.frame.len(), 28);
+    assert_eq!(&punt.frame[8..14], &HOST_MAC, "sender MAC");
+    assert_eq!(&punt.frame[24..28], &[192, 0, 2, 1], "target IP");
+
+    let reply = vec![0xab_u8; 42];
+    let mut message = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &reply,
+    }
+    .encode(&mut message)
+    .unwrap();
+    neighd_end.send(&message).unwrap();
+    bench.fe.step(1);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(tx.bytes, reply);
+}
+
+#[test]
+fn rejected_tables_leave_the_old_ones_forwarding() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+
+    // The same address on both interfaces is refused by the core.
+    let code = bench.patch(&mut config, &[address("wan", [192, 0, 2, 1], 24)]);
+    assert_eq!(code, Code::BAD_REQUEST);
+
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(0);
+    assert!(bench.fe.io_mut().pop_tx().is_some());
+}
+
+#[test]
+fn forwarding_continues_after_every_writer_disconnects() {
+    let mut bench = Bench::new();
+    let (config, routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    drop((config, routes, neighbors));
+    for now in 0..10 {
+        bench.fe.step(now);
+    }
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(10);
+    assert!(bench.fe.io_mut().pop_tx().is_some());
+}

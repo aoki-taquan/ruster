@@ -163,17 +163,20 @@ CORECONFの`ietf-coreconf:error`（`error-tag`、`error-app-tag`、`error-data-n
 ARP、ND、DHCP、DHCPv6、PPPoEのフレームの受け渡しは、上のメッセージ形式を使わない。CBORで包む意味が
 無く、量も多いため。
 
-- プロトコルごとにSOCK_SEQPACKETを分ける（例: `/run/ruster/fe/punt/arp-nd.sock`）。
-- 1メッセージ = 固定ヘッダ + フレーム一つ。
+- プロトコルごとにUnix datagram socketを分ける（例: `/run/ruster/fe/punt/arp-nd.sock`）。SOCK_SEQPACKETは
+  標準libraryだけでは扱えないので、境界を保つdatagramにした（Linuxでは詰まると送信が失敗し、送り手が数える）。
+- 1メッセージ = 小さなヘッダ + フレーム一つ。
 
 ```
-version   u8    = 1
-kind      u8    受け取り(1) / 送り出し(2)
-reason    u16   受け取った理由（プロトコル、解決依頼への応答など）
-if_index  u32   FEのif-index（state.sockのietf-interfacesで名前と対応）
-length    u32   フレームの長さ
-frame     ...
+version    u8    = 1
+direction  u8    FEからCEへ(1) / CEからFEへ(2)
+reason     u16   受け渡しの理由（ARPなど）
+name_len   u8    インターフェース名の長さ（1〜255）
+name       ...   インターフェース名
+frame      ...
 ```
+
+インターフェースは番号ではなく名前で示す。CEがFEのポートの番号付けを知らなくてよい。
 
 - FEは種類ごとに流量の上限を付け、溢れた分は捨てて数える（[`fe-ce-split.md`](fe-ce-split.md)の
   「ルータ宛て通信の保護」）。
