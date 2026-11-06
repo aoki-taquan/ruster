@@ -1,0 +1,269 @@
+//! One CoAP connection over a non-blocking Unix stream socket.
+//!
+//! [`Connection`] buffers both directions so that no call waits:
+//! [`Connection::pump`] moves bytes between the socket and the buffers, and
+//! [`Connection::next_message`] hands out whole messages. Signaling messages
+//! (RFC 8323 section 5) are handled here: each side sends a CSM with its
+//! Max-Message-Size first, a Ping is answered with a Pong, and an Abort closes the
+//! connection.
+//!
+//! Messages are copied into [`Incoming`] values. This is the control path, where
+//! a copy is cheaper than tying the caller to the buffer.
+
+use std::fmt;
+use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::net::UnixStream;
+
+use crate::coap::{self, option, Code, Decoded, EncodeError, FrameError};
+
+/// The largest message either side accepts, announced in the CSM.
+pub const DEFAULT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// At most this many bytes are read from the socket in one [`Connection::pump`].
+const READ_CHUNK: usize = 64 * 1024;
+
+/// A request or response this side received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incoming {
+    pub code: Code,
+    pub token: Vec<u8>,
+    /// The Uri-Path segments, in order.
+    pub path: Vec<String>,
+    pub observe: Option<u32>,
+    pub payload: Vec<u8>,
+}
+
+/// A request or response to send.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Outgoing<'a> {
+    pub code: Option<Code>,
+    pub token: &'a [u8],
+    pub path: &'a [&'a str],
+    pub observe: Option<u32>,
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug)]
+pub enum ConnError {
+    Io(io::Error),
+    /// The peer sent something that is not a valid message. The stream cannot be
+    /// read further.
+    Frame(FrameError),
+}
+
+impl fmt::Display for ConnError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(f, "{error}"),
+            Self::Frame(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for ConnError {}
+
+impl From<io::Error> for ConnError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+pub struct Connection {
+    stream: UnixStream,
+    limit: usize,
+    inbuf: Vec<u8>,
+    outbuf: Vec<u8>,
+    closed: bool,
+    peer_limit: Option<usize>,
+}
+
+impl fmt::Debug for Connection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Connection")
+            .field("buffered_in", &self.inbuf.len())
+            .field("buffered_out", &self.outbuf.len())
+            .field("closed", &self.closed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Connection {
+    /// Takes over `stream`, makes it non-blocking and queues this side's CSM.
+    pub fn new(stream: UnixStream, limit: usize) -> io::Result<Self> {
+        stream.set_nonblocking(true)?;
+        let mut conn = Self {
+            stream,
+            limit,
+            inbuf: Vec::new(),
+            outbuf: Vec::new(),
+            closed: false,
+            peer_limit: None,
+        };
+        let mut size = [0; 4];
+        let size = coap::uint_option(u32::try_from(limit).unwrap_or(u32::MAX), &mut size);
+        coap::encode(
+            &mut conn.outbuf,
+            Code::CSM,
+            &[],
+            &[(option::MAX_MESSAGE_SIZE, size)],
+            &[],
+        )
+        .expect("a CSM always encodes");
+        Ok(conn)
+    }
+
+    /// True once the peer closed the stream or sent an Abort, or after an error.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// The Max-Message-Size from the peer's CSM, once it has arrived.
+    pub fn peer_limit(&self) -> Option<usize> {
+        self.peer_limit
+    }
+
+    /// Queues one message. Nothing is sent until [`Connection::pump`].
+    pub fn send(&mut self, message: &Outgoing<'_>) -> Result<(), EncodeError> {
+        let mut observe = [0; 4];
+        let mut options: Vec<(u16, &[u8])> = Vec::new();
+        if let Some(value) = message.observe {
+            options.push((option::OBSERVE, coap::uint_option(value, &mut observe)));
+        }
+        for segment in message.path {
+            options.push((option::URI_PATH, segment.as_bytes()));
+        }
+        coap::encode(
+            &mut self.outbuf,
+            message.code.unwrap_or(Code::CONTENT),
+            message.token,
+            &options,
+            message.payload,
+        )
+    }
+
+    /// Writes what it can and reads what is there, without waiting.
+    ///
+    /// Returns whether any byte moved. After an error the connection is closed.
+    pub fn pump(&mut self) -> Result<bool, ConnError> {
+        if self.closed {
+            return Ok(false);
+        }
+        let result = self.pump_inner();
+        if result.is_err() {
+            self.closed = true;
+        }
+        result
+    }
+
+    fn pump_inner(&mut self) -> Result<bool, ConnError> {
+        let mut moved = false;
+        while !self.outbuf.is_empty() {
+            match self.stream.write(&self.outbuf) {
+                Ok(0) => {
+                    self.closed = true;
+                    return Ok(moved);
+                }
+                Ok(n) => {
+                    self.outbuf.drain(..n);
+                    moved = true;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::BrokenPipe => {
+                    self.closed = true;
+                    return Ok(moved);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let start = self.inbuf.len();
+        self.inbuf.resize(start + READ_CHUNK, 0);
+        let read = loop {
+            match self.stream.read(&mut self.inbuf[start..]) {
+                Ok(n) => break n,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break usize::MAX,
+                Err(error) if error.kind() == ErrorKind::ConnectionReset => break 0,
+                Err(error) => {
+                    self.inbuf.truncate(start);
+                    return Err(error.into());
+                }
+            }
+        };
+        match read {
+            usize::MAX => self.inbuf.truncate(start),
+            0 => {
+                self.inbuf.truncate(start);
+                self.closed = true;
+            }
+            n => {
+                self.inbuf.truncate(start + n);
+                moved = true;
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Returns the next whole request or response, handling signaling messages on
+    /// the way. `Ok(None)` means no whole message is buffered yet.
+    pub fn next_message(&mut self) -> Result<Option<Incoming>, ConnError> {
+        loop {
+            let decoded = match coap::decode(&self.inbuf, self.limit) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    self.closed = true;
+                    return Err(ConnError::Frame(error));
+                }
+            };
+            let (message, used) = match decoded {
+                Decoded::NeedMore(_) => return Ok(None),
+                Decoded::Message(message, used) => (message, used),
+            };
+            let code = message.code;
+            let incoming = Incoming {
+                code,
+                token: message.token.to_vec(),
+                path: message
+                    .options()
+                    .filter(|&(number, _)| number == option::URI_PATH)
+                    .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
+                    .collect(),
+                observe: message
+                    .option(option::OBSERVE)
+                    .and_then(coap::read_uint_option),
+                payload: message.payload.to_vec(),
+            };
+            let max_size = message
+                .option(option::MAX_MESSAGE_SIZE)
+                .and_then(coap::read_uint_option);
+            self.inbuf.drain(..used);
+            match code {
+                Code::CSM => {
+                    if let Some(size) = max_size {
+                        self.peer_limit = Some(size as usize);
+                    }
+                }
+                Code::PING => {
+                    let token = incoming.token.clone();
+                    self.send(&Outgoing {
+                        code: Some(Code::PONG),
+                        token: &token,
+                        ..Outgoing::default()
+                    })
+                    .expect("a Pong always encodes");
+                }
+                Code::PONG | Code::RELEASE => {}
+                Code::ABORT => {
+                    self.closed = true;
+                    return Ok(None);
+                }
+                _ => return Ok(Some(incoming)),
+            }
+        }
+    }
+
+    /// True when nothing is waiting to be written.
+    pub fn flushed(&self) -> bool {
+        self.outbuf.is_empty()
+    }
+}
