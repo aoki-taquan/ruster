@@ -227,6 +227,45 @@ interfaces = [
     assert!(!format!("{diagnostic:?}").contains("DO_NOT_ECHO_TYPE_VALUE"));
 }
 
+/// ARP-034, ARP-040: a wrong-type `[arp]` switch or `[[interfaces]]`
+/// override reports its full value-free path, not just its table.
+#[test]
+fn arp_switch_type_errors_report_the_full_path() {
+    let field = |name: &str| PathSegment::Field(name.to_owned());
+    let interface = |key: &str| {
+        format!(
+            "schema-version = 1\n[[interfaces]]\nid = 1\nname = \"lan\"\ndevice = \"eth0\"\n\
+             mac = \"02:00:00:00:00:01\"\n{key} = \"DO_NOT_ECHO\"\n"
+        )
+    };
+    for key in ["arp-announce", "arp-conflict-defense"] {
+        let diagnostic = parse(interface(key).as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{key}");
+        assert_eq!(
+            diagnostic.path().segments(),
+            &[field("interfaces"), PathSegment::Index(0), field(key)],
+            "{key}"
+        );
+        assert!(!format!("{diagnostic:?}").contains("DO_NOT_ECHO"));
+    }
+    for key in [
+        "announce",
+        "conflict-defense",
+        "announce-count",
+        "announce-interval-ms",
+        "announce-min-interval-ms",
+    ] {
+        let text = format!("schema-version = 1\n[arp]\n{key} = \"DO_NOT_ECHO\"\n");
+        let diagnostic = parse(text.as_bytes()).unwrap_err();
+        assert_eq!(diagnostic.code(), DiagnosticCode::InvalidType, "{key}");
+        assert_eq!(
+            diagnostic.path().segments(),
+            &[field("arp"), field(key)],
+            "{key}"
+        );
+    }
+}
+
 #[test]
 fn input_and_every_v1_list_are_bounded() {
     let oversized = vec![b' '; MAX_CONFIG_BYTES + 1];

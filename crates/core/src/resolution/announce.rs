@@ -1,5 +1,5 @@
 //! RFC 5227 ARP Announcements of the router's own addresses and address
-//! conflict detection and defense (ARP-016, ARP-033..ARP-039).
+//! conflict detection and defense (ARP-016, ARP-033..ARP-040).
 //!
 //! RFC 5227 §1.3: "Where this document uses the term 'host', it applies
 //! equally to interfaces on routers". Each interface of the forwarding
@@ -29,6 +29,13 @@
 //!   conflict after DEFEND_INTERVAL (10 s) without a defense queues one
 //!   extra Announcement (§2.4 (c)), apart from any sequence; later ones
 //!   within the interval do not.
+//!
+//! Both switches, `announce` and `conflict-defense`, are router-wide
+//! ([`crate::ArpPolicy`]) with per-interface overrides
+//! ([`ArpInterfacePolicy`], ARP-040) in the forwarding snapshot; every
+//! decision reads the switch of the slot's interface
+//! ([`ForwardingSnapshot::announce_on`],
+//! [`ForwardingSnapshot::defend_conflicts_on`]). The slots hold no policy.
 //!
 //! Every frame goes through the generated-ARP phase and its frame budget
 //! (the runtime gives the first frame of each tick to a due Announcement,
@@ -171,6 +178,23 @@ impl ArpAnnouncePolicy {
     pub const fn min_interval_ms(self) -> u64 {
         self.min_interval_ms as u64
     }
+}
+
+/// Per-interface overrides of the router-wide `[arp] announce` and
+/// `[arp] conflict-defense` switches (ARP-040, `[[interfaces]]
+/// arp-announce` and `arp-conflict-defense`). `None` inherits the
+/// router-wide switch. Conflict detection and counting stay on either way.
+///
+/// 4 bytes; the forwarding snapshot borrows a sorted slice of them
+/// ([`ForwardingSnapshot::with_arp_interfaces`]), not the runtime slots.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArpInterfacePolicy {
+    pub interface: IfId,
+    /// RFC 5227 §2.3 Announcements on this interface.
+    pub announce: Option<bool>,
+    /// The RFC 5227 §2.4 (c) defense on this interface. `Some(false)` is
+    /// an operator-selected §2.4 deviation (ARP-038).
+    pub conflict_defense: Option<bool>,
 }
 
 const NEVER: u64 = u64::MAX;
@@ -393,9 +417,9 @@ impl<'a> ResolutionRuntime<'a> {
 
     /// Marks `interface` (every interface when `None`) to announce its
     /// address (startup, link-up). Returns the interfaces newly marked.
-    /// Interfaces without an IPv4 address in `snapshot` are skipped; with
-    /// announcements off in `snapshot` nothing is marked (counted
-    /// `disabled`).
+    /// Interfaces without an IPv4 address in `snapshot` are skipped; one
+    /// with announcements off in `snapshot` (router-wide or by its
+    /// override, ARP-040) is not marked (counted `disabled`).
     pub fn request_announcements(
         &mut self,
         snapshot: &ForwardingSnapshot<'_>,
@@ -416,25 +440,25 @@ impl<'a> ResolutionRuntime<'a> {
 
     /// After a publication: rebinds the slots to `next`'s interface order
     /// (the interface set itself is restart-required, so only the order
-    /// can differ); with announcements off in `next`, cancels every waiting
-    /// trigger and the rest of every running sequence at once; with
-    /// `conflict-defense` off in `next`, drops every owed defense (so a
-    /// switched-off feature owes nothing); and marks every interface whose
-    /// IPv4 address in `next` is new or differs from `current`. Returns the
-    /// interfaces newly marked.
+    /// can differ); on every interface with announcements off in `next`
+    /// (router-wide or by its override, ARP-040), cancels the waiting
+    /// trigger and the rest of a running sequence at once; on every
+    /// interface with `conflict-defense` off in `next`, drops the owed
+    /// defense (so a switched-off feature owes nothing); and marks every
+    /// interface whose IPv4 address in `next` is new or differs from
+    /// `current`. Returns the interfaces newly marked.
     pub fn announce_changed_bindings(
         &mut self,
         current: &ForwardingSnapshot<'_>,
         next: &ForwardingSnapshot<'_>,
     ) -> usize {
         self.rebind_announce_slots(next);
-        if next.arp.announce().is_none() {
-            for index in 0..self.announce.len() {
+        for index in 0..self.announce.len() {
+            let id = self.announce[index].interface;
+            if next.announce_on(id).is_none() {
                 self.cancel_sequence(index);
             }
-        }
-        if !next.arp.defend_conflicts() {
-            for index in 0..self.announce.len() {
+            if !next.defend_conflicts_on(id) {
                 self.cancel_defense(index);
             }
         }
@@ -486,7 +510,10 @@ impl<'a> ResolutionRuntime<'a> {
     }
 
     fn request_at(&mut self, index: usize, snapshot: &ForwardingSnapshot<'_>) -> bool {
-        if snapshot.arp.announce().is_none() {
+        if snapshot
+            .announce_on(self.announce[index].interface)
+            .is_none()
+        {
             bump(&mut self.announce_counters.disabled);
             return false;
         }
@@ -553,7 +580,8 @@ impl<'a> ResolutionRuntime<'a> {
     /// RX path: an ARP packet on `ingress` whose sender IP is the
     /// interface's own address. A sender MAC other than the interface's is
     /// a conflicting ARP packet (RFC 5227 §2.4): counted, and with defense
-    /// on, defended by one extra Announcement unless one was decided within
+    /// on for `ingress` (router-wide or by its override, ARP-040), defended
+    /// by one extra Announcement unless one was decided within
     /// DEFEND_INTERVAL. The defense leaves a running sequence's timing
     /// alone. O(log interfaces), no allocation.
     pub(crate) fn observe_local_sender(
@@ -581,7 +609,7 @@ impl<'a> ResolutionRuntime<'a> {
         slot.conflicts = slot.conflicts.saturating_add(1);
         let recent = slot.last_defense != NEVER
             && now.0.saturating_sub(slot.last_defense) < ARP_DEFEND_INTERVAL_MS;
-        if !snapshot.arp.defend_conflicts() || recent {
+        if !snapshot.defend_conflicts_on(ingress) || recent {
             bump(&mut self.announce_counters.defense_suppressed);
             return;
         }
@@ -610,7 +638,6 @@ impl<'a> ResolutionRuntime<'a> {
         if self.announce_busy == 0 {
             return None;
         }
-        let policy = snapshot.arp.announce();
         let len = self.announce.len();
         for step in 0..len {
             let index = (self.announce_cursor + step) % len;
@@ -618,6 +645,7 @@ impl<'a> ResolutionRuntime<'a> {
             if !slot.busy() {
                 continue;
             }
+            let policy = snapshot.announce_on(slot.interface);
             let binding = snapshot.local_binding_on(slot.interface);
             let interface = snapshot.interface(slot.interface);
             let (Some(binding), Some(interface)) = (binding, interface) else {
@@ -728,13 +756,13 @@ impl<'a> ResolutionRuntime<'a> {
         if self.announce_busy == 0 {
             return None;
         }
-        let policy = snapshot.arp.announce();
-        let min_interval = policy.map_or(0, ArpAnnouncePolicy::min_interval_ms);
+        let min_interval = snapshot.arp.announce_timing().min_interval_ms();
         self.announce
             .iter()
             .filter(|slot| slot.busy())
             .map(|slot| {
-                let due = if slot.has(DEFEND) || policy.is_none() {
+                let off = snapshot.announce_on(slot.interface).is_none();
+                let due = if slot.has(DEFEND) || off {
                     0
                 } else if slot.remaining != 0 {
                     slot.next_due
@@ -777,10 +805,7 @@ where
         trace.record_generated(GeneratedArpTrace::ClockRegression);
         return Err(ExecuteArpRequestError::ClockRegression);
     }
-    let interval = snapshot
-        .arp
-        .announce()
-        .map_or(ARP_ANNOUNCE_INTERVAL_MS, ArpAnnouncePolicy::interval_ms);
+    let interval = snapshot.arp.announce_timing().interval_ms();
     let Some((index, kind, action)) = runtime.due_announcement(snapshot, now) else {
         return Ok(None);
     };

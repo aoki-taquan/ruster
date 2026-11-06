@@ -940,6 +940,14 @@ pub enum SnapshotError {
     /// Borrowed source validation bindings are not sorted by interface
     /// (URPF; [`ValidatedForwardingOwner::with_source_validation`] sorts).
     SourceValidationUnsorted,
+    /// A per-interface ARP override names an interface the snapshot does
+    /// not have (ARP-040).
+    ArpInterfaceUnknownInterface,
+    /// Two per-interface ARP overrides name the same interface (ARP-040).
+    DuplicateArpInterface,
+    /// Borrowed per-interface ARP overrides are not sorted by interface
+    /// (ARP-040; [`ValidatedForwardingOwner::with_arp_interfaces`] sorts).
+    ArpInterfaceUnsorted,
     /// An input firewall rule (INPUT-FW) has id 0, repeats an id, or
     /// names an ingress interface the snapshot does not have.
     InputFirewall(crate::InputFirewallError),
@@ -1018,13 +1026,19 @@ impl Default for Ipv4OriginPolicy {
 /// apart when an address becomes active (§2.3), and the §2.4 (c) defense
 /// of an address the router never gives up: at most one Announcement per
 /// DEFEND_INTERVAL (10 s) after a conflicting ARP packet. Both can be
-/// switched off; conflict detection and its counters stay on.
+/// switched off, router-wide here and per interface with
+/// [`ForwardingSnapshot::with_arp_interfaces`] (ARP-040); conflict
+/// detection and its counters stay on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpPolicy {
     require_on_link_sender: bool,
     defend_conflicts: bool,
-    // The announcement policy, flattened so the by-value snapshot grows by
-    // 8 bytes only (RT-002): `announce_count` 0 means announcements off.
+    /// Whether announcements are on router-wide (in the padding before the
+    /// timing, so the policy stays 12 bytes). The timing is kept when
+    /// they are off, for interfaces that switch them back on (ARP-040).
+    announce: bool,
+    // The announcement timing, flattened so the by-value snapshot grows by
+    // 8 bytes only (RT-002). Always a validated policy (count nonzero).
     announce_count: u8,
     announce_interval_ms: u32,
     announce_min_interval_ms: u32,
@@ -1043,26 +1057,49 @@ impl ArpPolicy {
     pub const RFC826: Self = Self {
         require_on_link_sender: false,
         defend_conflicts: true,
+        announce: true,
         announce_count: crate::ArpAnnouncePolicy::RFC5227.count(),
         announce_interval_ms: crate::ArpAnnouncePolicy::RFC5227.interval_ms_u32(),
         announce_min_interval_ms: crate::ArpAnnouncePolicy::RFC5227.min_interval_ms_u32(),
     };
 
     /// Returns this policy with RFC 5227 §2.3 announcements of the router's
-    /// own addresses set to `announce` (`None`: never announce).
+    /// own addresses set to `announce` (`None`: never announce, router-wide;
+    /// the timing is kept for interfaces that switch announcements on,
+    /// ARP-040).
     #[must_use]
     pub const fn with_announce(self, announce: Option<crate::ArpAnnouncePolicy>) -> Self {
         match announce {
             Some(policy) => Self {
+                announce: true,
                 announce_count: policy.count(),
                 announce_interval_ms: policy.interval_ms_u32(),
                 announce_min_interval_ms: policy.min_interval_ms_u32(),
                 ..self
             },
             None => Self {
-                announce_count: 0,
+                announce: false,
                 ..self
             },
+        }
+    }
+
+    /// Returns this policy with `timing` as the announcement timing and
+    /// announcements on router-wide when `enabled` (the timing is kept
+    /// either way, for the interfaces that switch announcements on,
+    /// ARP-040).
+    #[must_use]
+    pub const fn with_announce_timing(
+        self,
+        timing: crate::ArpAnnouncePolicy,
+        enabled: bool,
+    ) -> Self {
+        Self {
+            announce: enabled,
+            announce_count: timing.count(),
+            announce_interval_ms: timing.interval_ms_u32(),
+            announce_min_interval_ms: timing.min_interval_ms_u32(),
+            ..self
         }
     }
 
@@ -1077,17 +1114,36 @@ impl ArpPolicy {
         }
     }
 
-    /// The announcement policy, `None` when announcements are off.
+    /// The router-wide announcement policy, `None` when announcements are
+    /// off router-wide. An interface can override it
+    /// ([`ForwardingSnapshot::announce_on`], ARP-040).
     #[must_use]
     pub const fn announce(self) -> Option<crate::ArpAnnouncePolicy> {
-        crate::ArpAnnouncePolicy::from_parts(
+        if self.announce {
+            Some(self.announce_timing())
+        } else {
+            None
+        }
+    }
+
+    /// The announcement timing, whether announcements are on or off
+    /// router-wide (ARP-040: an interface may switch them on).
+    #[must_use]
+    pub const fn announce_timing(self) -> crate::ArpAnnouncePolicy {
+        match crate::ArpAnnouncePolicy::from_parts(
             self.announce_count,
             self.announce_interval_ms,
             self.announce_min_interval_ms,
-        )
+        ) {
+            Some(policy) => policy,
+            // Not reachable: every constructor stores a validated policy.
+            None => crate::ArpAnnouncePolicy::RFC5227,
+        }
     }
 
-    /// Whether a conflicting ARP packet is defended (RFC 5227 §2.4 (c)).
+    /// Whether a conflicting ARP packet is defended router-wide (RFC 5227
+    /// §2.4 (c)). An interface can override it
+    /// ([`ForwardingSnapshot::defend_conflicts_on`], ARP-040).
     #[must_use]
     pub const fn defend_conflicts(self) -> bool {
         self.defend_conflicts
@@ -1131,6 +1187,10 @@ pub struct ForwardingSnapshot<'a> {
     /// mode other than [`SourceValidation::Off`]. Empty (the RFC 1812
     /// §5.3.8 default) costs the packet path one branch.
     source_validation: &'a [SourceValidationBinding],
+    /// Per-interface overrides of the `[arp]` announce and conflict-defense
+    /// switches (ARP-040), sorted by interface, each with at least one
+    /// override. Empty (every interface inherits `arp`) costs one branch.
+    arp_interfaces: &'a [crate::ArpInterfacePolicy],
     /// Input firewall rules (INPUT-FW), first match, judged only for
     /// datagrams addressed to the router. Empty with an `Accept` default
     /// (the RFC behavior) costs the local path one branch and transit
@@ -1164,6 +1224,7 @@ impl std::fmt::Debug for ForwardingSnapshot<'_> {
             .field("ipv4_origin", &self.ipv4_origin)
             .field("arp", &self.arp)
             .field("source_validation_len", &self.source_validation.len())
+            .field("arp_interfaces_len", &self.arp_interfaces.len())
             .field("input_firewall_rules_len", &self.input_firewall_rules.len())
             .field("input_firewall_default", &self.input_firewall_default)
             .finish_non_exhaustive()
@@ -1194,6 +1255,7 @@ pub struct ValidatedForwardingOwner {
     ipv4_origin: Ipv4OriginPolicy,
     arp: ArpPolicy,
     source_validation: Box<[SourceValidationBinding]>,
+    arp_interfaces: Box<[crate::ArpInterfacePolicy]>,
     input_firewall_rules: Box<[crate::InputFirewallRule]>,
     input_firewall_default: crate::InputFirewallAction,
     index: ForwardingIndex,
@@ -1218,6 +1280,7 @@ impl std::fmt::Debug for ValidatedForwardingOwner {
             .field("ipv4_origin", &self.ipv4_origin)
             .field("arp", &self.arp)
             .field("source_validation_len", &self.source_validation.len())
+            .field("arp_interfaces_len", &self.arp_interfaces.len())
             .field("input_firewall_rules_len", &self.input_firewall_rules.len())
             .field("input_firewall_default", &self.input_firewall_default)
             .finish_non_exhaustive()
@@ -1330,6 +1393,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv4_origin,
             arp: ArpPolicy::RFC826,
             source_validation: &[],
+            arp_interfaces: &[],
             input_firewall_rules: &[],
             input_firewall_default: crate::InputFirewallAction::Accept,
             input_firewall_indexed: false,
@@ -1442,6 +1506,77 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub const fn source_validation_bindings(&self) -> &'a [SourceValidationBinding] {
         self.source_validation
+    }
+
+    /// Returns this snapshot with `overrides` as its per-interface
+    /// overrides of the `[arp]` announce and conflict-defense switches
+    /// (ARP-040; default: none, every interface inherits the
+    /// [`ArpPolicy`]). `overrides` must be sorted by interface, name only
+    /// interfaces of this snapshot, and name each at most once. The
+    /// overrides only steer the router's own RFC 5227 frames, not a
+    /// forwarding or ARP receive decision, so like the announce switches of
+    /// [`ArpPolicy`] they are not part of the authority.
+    ///
+    /// For tests and benches that borrow tables directly. Production code
+    /// sets them on the owner
+    /// ([`ValidatedForwardingOwner::with_arp_interfaces`]).
+    pub fn with_arp_interfaces(
+        self,
+        overrides: &'a [crate::ArpInterfacePolicy],
+    ) -> Result<Self, SnapshotError> {
+        check_arp_interfaces(self.interfaces, overrides)?;
+        if overrides
+            .windows(2)
+            .any(|pair| pair[0].interface >= pair[1].interface)
+        {
+            return Err(SnapshotError::ArpInterfaceUnsorted);
+        }
+        Ok(Self {
+            arp_interfaces: overrides,
+            ..self
+        })
+    }
+
+    /// The per-interface ARP overrides (ARP-040), sorted by interface.
+    #[must_use]
+    pub const fn arp_interface_policies(&self) -> &'a [crate::ArpInterfacePolicy] {
+        self.arp_interfaces
+    }
+
+    /// The override of `interface`, if any. One branch when no interface
+    /// overrides, else a binary search (at most 256 interfaces).
+    #[inline]
+    fn arp_interface(&self, interface: IfId) -> Option<crate::ArpInterfacePolicy> {
+        if self.arp_interfaces.is_empty() {
+            return None;
+        }
+        self.arp_interfaces
+            .binary_search_by_key(&interface, |policy| policy.interface)
+            .ok()
+            .map(|index| self.arp_interfaces[index])
+    }
+
+    /// The RFC 5227 §2.3 announcement policy of `interface`: its
+    /// `arp-announce` override, else the router-wide `[arp] announce`
+    /// (ARP-040). `None` when announcements are off there.
+    #[must_use]
+    pub fn announce_on(&self, interface: IfId) -> Option<crate::ArpAnnouncePolicy> {
+        let enabled = self
+            .arp_interface(interface)
+            .and_then(|policy| policy.announce)
+            .unwrap_or(self.arp.announce().is_some());
+        enabled.then(|| self.arp.announce_timing())
+    }
+
+    /// Whether a conflicting ARP packet on `interface` is defended (RFC
+    /// 5227 §2.4 (c)): its `arp-conflict-defense` override, else the
+    /// router-wide `[arp] conflict-defense` (ARP-040). Detection and
+    /// counting do not depend on it.
+    #[must_use]
+    pub fn defend_conflicts_on(&self, interface: IfId) -> bool {
+        self.arp_interface(interface)
+            .and_then(|policy| policy.conflict_defense)
+            .unwrap_or(self.arp.defend_conflicts())
     }
 
     /// Returns this snapshot with `rules` and `default` as its input
@@ -1724,6 +1859,7 @@ impl ValidatedForwardingOwner {
             ipv4_origin,
             arp: ArpPolicy::RFC826,
             source_validation: Box::default(),
+            arp_interfaces: Box::default(),
             input_firewall_rules: Box::default(),
             input_firewall_default: crate::InputFirewallAction::Accept,
             index,
@@ -1790,6 +1926,34 @@ impl ValidatedForwardingOwner {
         &self.source_validation
     }
 
+    /// Returns this owner with `overrides` as the per-interface overrides
+    /// of the `[arp]` announce and conflict-defense switches (ARP-040) of
+    /// every snapshot it lends. An interface without an override inherits
+    /// the [`ArpPolicy`]. Overrides may come in any order and are sorted
+    /// here; one that overrides nothing is dropped, so an owner without
+    /// overrides allocates nothing. Cold path, nothing is reindexed.
+    pub fn with_arp_interfaces(
+        mut self,
+        overrides: &[crate::ArpInterfacePolicy],
+    ) -> Result<Self, ValidatedForwardingOwnerError> {
+        check_arp_interfaces(&self.interfaces, overrides)
+            .map_err(ValidatedForwardingOwnerError::Snapshot)?;
+        let mut sorted: Vec<crate::ArpInterfacePolicy> = overrides
+            .iter()
+            .copied()
+            .filter(|policy| policy.announce.is_some() || policy.conflict_defense.is_some())
+            .collect();
+        sorted.sort_by_key(|policy| policy.interface);
+        self.arp_interfaces = sorted.into_boxed_slice();
+        Ok(self)
+    }
+
+    /// The per-interface ARP overrides (ARP-040), sorted by interface.
+    #[must_use]
+    pub fn arp_interfaces(&self) -> &[crate::ArpInterfacePolicy] {
+        &self.arp_interfaces
+    }
+
     /// Returns this owner with `arp` as the ARP receive policy of every
     /// snapshot it lends (default [`ArpPolicy::RFC826`]). The policy is
     /// not a table, so nothing is revalidated or reindexed.
@@ -1810,6 +1974,7 @@ impl ValidatedForwardingOwner {
             ipv4_origin: self.ipv4_origin,
             arp: self.arp,
             source_validation: &self.source_validation,
+            arp_interfaces: &self.arp_interfaces,
             input_firewall_rules: &self.input_firewall_rules,
             input_firewall_default: self.input_firewall_default,
             input_firewall_indexed: true,
@@ -2021,6 +2186,28 @@ fn check_source_validation(
             .any(|candidate| candidate.interface == binding.interface)
         {
             return Err(SnapshotError::DuplicateSourceValidation);
+        }
+    }
+    Ok(())
+}
+
+/// Every ARP override names a known interface, at most once (ARP-040).
+fn check_arp_interfaces(
+    interfaces: &[Interface],
+    overrides: &[crate::ArpInterfacePolicy],
+) -> Result<(), SnapshotError> {
+    for (index, policy) in overrides.iter().enumerate() {
+        if !interfaces
+            .iter()
+            .any(|interface| interface.id == policy.interface)
+        {
+            return Err(SnapshotError::ArpInterfaceUnknownInterface);
+        }
+        if overrides[..index]
+            .iter()
+            .any(|candidate| candidate.interface == policy.interface)
+        {
+            return Err(SnapshotError::DuplicateArpInterface);
         }
     }
     Ok(())
@@ -9284,8 +9471,9 @@ mod tests {
             "ForwardingSnapshot { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
              arp: ArpPolicy { require_on_link_sender: false, defend_conflicts: true, \
-             announce_count: 2, announce_interval_ms: 2000, announce_min_interval_ms: 10000 }, \
-             source_validation_len: 0, input_firewall_rules_len: 0, \
+             announce: true, announce_count: 2, announce_interval_ms: 2000, \
+             announce_min_interval_ms: 10000 }, \
+             source_validation_len: 0, arp_interfaces_len: 0, input_firewall_rules_len: 0, \
              input_firewall_default: Accept, .. }"
         );
         assert_eq!(
@@ -9293,8 +9481,9 @@ mod tests {
             "ValidatedForwardingOwner { routes_len: 0, interfaces_len: 0, neighbors_len: 0, \
              local_ipv4_len: 0, ipv4_origin: Ipv4OriginPolicy { default_ttl: 64, echo_reply: true }, \
              arp: ArpPolicy { require_on_link_sender: false, defend_conflicts: true, \
-             announce_count: 2, announce_interval_ms: 2000, announce_min_interval_ms: 10000 }, \
-             source_validation_len: 0, input_firewall_rules_len: 0, \
+             announce: true, announce_count: 2, announce_interval_ms: 2000, \
+             announce_min_interval_ms: 10000 }, \
+             source_validation_len: 0, arp_interfaces_len: 0, input_firewall_rules_len: 0, \
              input_firewall_default: Accept, .. }"
         );
     }

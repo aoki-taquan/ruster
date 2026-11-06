@@ -1068,8 +1068,9 @@ where
     let _ = err.flush();
     notify.ready(active.generation().get());
     // RFC 5227 §2.3 (ARP-033): the ports are open, so every interface
-    // address becomes active now; the first tick announces it (a no-op with
-    // `[arp] announce = false`). Not with a generated ARP budget of 0 (a
+    // address becomes active now; the first tick announces it (not on an
+    // interface with announcements off, `[arp] announce = false` or its
+    // `arp-announce = false`, ARP-040). Not with a generated ARP budget of 0 (a
     // document without `[tick]`): nothing could be sent, and the stats would
     // show never-sent work.
     if control_budgets_send_arp(reloader.budgets()) {

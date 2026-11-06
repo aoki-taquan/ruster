@@ -27,9 +27,9 @@ use std::fmt::Write as _;
 use ruster_config::{ValidatedAfPacketPortV1, ValidatedAfXdpPortV1};
 use ruster_control::{ApplyPlan, BackendChange, Change, Delta, FlushCount, NatChange, StateFlush};
 use ruster_core::{
-    FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId, InputFirewallProtocol,
-    InputFirewallRule, Interface, Ipv4Address, LocalIpv4Binding, MacAddress, Neighbor, Route,
-    SourceValidationBinding,
+    ArpInterfacePolicy, FirewallAction, FirewallInterface, FirewallProtocol, FirewallRule, IfId,
+    InputFirewallProtocol, InputFirewallRule, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    Neighbor, Route, SourceValidationBinding,
 };
 
 fn ip(address: Ipv4Address) -> String {
@@ -87,6 +87,20 @@ fn neighbor(neighbor: &Neighbor) -> String {
 
 fn source_validation(binding: &SourceValidationBinding) -> String {
     format!("{} {}", iface(binding.interface), binding.mode.label())
+}
+
+fn arp_interface(policy: &ArpInterfacePolicy) -> String {
+    let switch = |value: Option<bool>| match value {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "inherit",
+    };
+    format!(
+        "{} announce {} conflict-defense {}",
+        iface(policy.interface),
+        switch(policy.announce),
+        switch(policy.conflict_defense)
+    )
 }
 
 fn local(binding: &LocalIpv4Binding) -> String {
@@ -437,6 +451,12 @@ pub fn render(plan: &ApplyPlan) -> String {
         "source-validation",
         plan.source_validation(),
         source_validation,
+    );
+    changes(
+        &mut lines,
+        "arp-interface",
+        plan.arp_interfaces(),
+        arp_interface,
     );
     nat(&mut lines, "nat44-udp", plan.nat44_udp());
     nat(&mut lines, "nat44-tcp", plan.nat44_tcp());

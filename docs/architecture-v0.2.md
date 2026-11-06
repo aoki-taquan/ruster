@@ -825,7 +825,7 @@ MAC/refresh時刻やpending resolutionを変更しません。
 - local SPA claimの保護はlink scopedで、`(ingress IfId, SPA)`がlocal bindingと一致する場合
   だけ学習しない。同じIPv4値が別interfaceのlocal bindingでも、ingress上では通常peerとして
   学習できる。
-- RFC 5227 Announcement（GARP、ARP-033〜ARP-039）: resolution runtimeはforwarding snapshotの
+- RFC 5227 Announcement（GARP、ARP-033〜ARP-040）: resolution runtimeはforwarding snapshotの
   interfaceごとに一つの`ArpAnnounceSlot`（48 bytes、caller storage、slot iはsnapshotのi番目の
   interface）を持つ。trigger（`ruster run`の起動とlink-up、publication commit後のaddress追加・
   変更）はslotに印を付けるだけで、generated ARP phaseが同じframe budgetで（最初の1 frameは
@@ -839,6 +839,15 @@ MAC/refresh時刻やpending resolutionを変更しません。
   indexの二分探索、u64）、`conflict-defense`ならDEFEND_INTERVAL（10 s）に一度だけ、sequenceとは
   別の1 frameとしてAnnouncementを予約する。policyはforwarding snapshotの`ArpPolicy`にflatten
   して持ち（by-value snapshotはURPF後の104→112 bytes）、slot数はinterface数で固定なのでon/offはreloadできる。Probe（§2.1）は送らない。
+  ARP-040: `announce`と`conflict-defense`のinterfaceごとの上書き（`[[interfaces]] arp-announce`、
+  `arp-conflict-defense`、無ければ`[arp]`を継承）は`ArpInterfacePolicy`（4 bytes、`Option<bool>`二つ）の
+  interface順sliceとしてforwarding snapshotが借用し（ownerがsortし、何も上書きしない要素は捨てる）、
+  判定は常にslotのinterfaceの`ForwardingSnapshot::announce_on`/`defend_conflicts_on`で行う（上書きが
+  無ければ1 branch、あれば最大256要素の二分探索）。runtime slotはpolicyを持たない（48 bytesのまま、
+  flagsも増やさない）。router-wideのannounce offでもtimingを`ArpPolicy`のpaddingのflagと分けて保持し、
+  上書きでonにしたinterfaceが使う。reloadのcommitはinterfaceごとにoffになったsequenceとdefenseを
+  捨てる（router-wideと同じ意味）。overrideはforwardingやARP受信の判定を変えないので、announce
+  switchと同じくauthorityへmixしない。
 - SPAのon-link条件（ARP-031）はopt-inです（`[arp] require-on-link-sender`、既定`false`）。
   既定はRFC 826どおりで、mergeとreplyはsender addressに条件を課さず、off-linkのsenderも
   routerがtargetなら学習してreplyし、既知なら更新する（ARP-032）。H4c（#311）では無条件の
@@ -2264,7 +2273,8 @@ sortだけです。snapshotは`identity`（8 word）を保持せず借用slice�
 （O(1)）、index参照を足しても`ForwardingSnapshot`は144→88 bytesです（RT-002）。URPFで
 source validation bindingの借用slice（16 bytes）を足し104 bytes、ARP-033で112 bytes、INPUT-FWで
 input firewall ruleの借用slice（16 bytes、default actionはARP/IPv4 origin policyのpaddingに入る）を
-足し128 bytesになりました（`FullServiceView`の上限は712→728 bytes）。
+足し128 bytes、ARP-040でper-interface ARP overrideの借用slice（16 bytes、router-wideのannounce flagは
+`ArpPolicy`のpaddingに入る）を足し144 bytesになりました（`FullServiceView`の上限は712→728→744 bytes）。
 
 ### IPv4 source address validation (URPF)
 
@@ -2478,7 +2488,7 @@ NATを伴わないplain forwarded ICMPv4 RELATEDは、引用tupleからorigin in
 `FirewallRelatedIcmpv4Unsupported = 114`は互換性のため予約し、renumberしません。
 
 eager dynamic-cache scan/flush、unresolved packet hold queue、ARP Probe生成（Announcement/GARPとAddress Conflict
-Detectionは実装済み、ARP-033〜ARP-039）、proxy ARP、VLAN、実装済み
+Detectionは実装済み、ARP-033〜ARP-040）、proxy ARP、VLAN、実装済み
 Echo Reply/Time Exceeded/Destination Unreachable Network以外のICMP生成、
 firewall conntrack helper/application inspection、config parser、pcap、AF_XDP、DPDK、binary、thread、
 benchmarkはこの

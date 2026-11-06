@@ -199,6 +199,14 @@ pub struct InterfaceV1 {
     /// route is a default route (RFC 3704 §2.4 instead of §2.5). Only
     /// valid with `loose`; absent means false.
     pub source_validation_allow_default: Option<bool>,
+    /// RFC 5227 §2.3 ARP Announcements on this interface, overriding
+    /// `[arp] announce` (ARP-040); absent inherits it. Reloadable.
+    pub arp_announce: Option<bool>,
+    /// The RFC 5227 §2.4 (c) conflict defense on this interface, overriding
+    /// `[arp] conflict-defense` (ARP-040); absent inherits it. `false` is an
+    /// operator-selected §2.4 deviation (ARP-038); detection and counters
+    /// stay on. Reloadable.
+    pub arp_conflict_defense: Option<bool>,
 }
 
 /// `[[interfaces]] source-validation` (URPF).

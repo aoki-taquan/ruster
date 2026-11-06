@@ -1883,6 +1883,129 @@ fn announcements_need_a_generated_arp_budget() {
     assert_eq!(off.tick().generated_arp, 0);
 }
 
+/// `VALID` with `wan` and `lan` interface keys appended.
+fn with_interface_arp(source: &str, wan: &str, lan: &str) -> String {
+    source
+        .replacen(
+            "mac = \"02:00:00:00:00:02\"\n",
+            &format!("mac = \"02:00:00:00:00:02\"\n{wan}"),
+            1,
+        )
+        .replacen(
+            "mac = \"02:00:00:00:00:01\"\n",
+            &format!("mac = \"02:00:00:00:00:01\"\n{lan}"),
+            1,
+        )
+}
+
+/// ARP-040: `[[interfaces]] arp-announce` and `arp-conflict-defense`
+/// override `[arp] announce` and `conflict-defense` per interface; an
+/// absent key inherits (`None`). Only interfaces that set a key are listed,
+/// sorted by interface, and the storage shape does not change.
+#[test]
+fn per_interface_arp_switches_override_the_router_wide_ones() {
+    use ruster_core::{ArpInterfacePolicy, IfId};
+
+    let defaults = validated(VALID);
+    assert!(defaults.arp_interfaces().is_empty());
+    let config = validated(&with_interface_arp(
+        VALID,
+        "arp-announce = false\n",
+        "arp-conflict-defense = false\narp-announce = true\n",
+    ));
+    assert_eq!(
+        config.arp_interfaces(),
+        [
+            ArpInterfacePolicy {
+                interface: IfId(1),
+                announce: Some(true),
+                conflict_defense: Some(false),
+            },
+            ArpInterfacePolicy {
+                interface: IfId(2),
+                announce: Some(false),
+                conflict_defense: None,
+            },
+        ]
+    );
+    assert_eq!(config.arp(), defaults.arp(), "the [arp] switches stay");
+    assert_eq!(config.storage_shape(), defaults.storage_shape());
+    let only_wan = validated(&with_interface_arp(
+        VALID,
+        "arp-conflict-defense = true\n",
+        "",
+    ));
+    assert_eq!(
+        only_wan.arp_interfaces(),
+        [ArpInterfacePolicy {
+            interface: IfId(2),
+            announce: None,
+            conflict_defense: Some(true),
+        }]
+    );
+    // Not a string or an unknown key.
+    for wan in ["arp-announce = \"off\"\n", "arp-announce-count = 3\n"] {
+        let text = with_interface_arp(VALID, wan, "");
+        assert!(parse(text.as_bytes()).is_err(), "{wan}");
+    }
+}
+
+/// ARP-040 with ARP-034: `[tick] generated-arp = 0` is refused while any
+/// interface could owe a frame, router-wide or by an override, and
+/// accepted when every interface has both switches off, whichever way.
+#[test]
+fn per_interface_arp_switches_steer_the_generated_arp_budget_check() {
+    let zero = VALID.replacen("generated-arp = 4", "generated-arp = 0", 1);
+    let with_arp = |body: &str| {
+        zero.replacen(
+            "[resolution.policy]",
+            &format!("[arp]\n{body}\n[resolution.policy]"),
+            1,
+        )
+    };
+    let both_off = "arp-announce = false\narp-conflict-defense = false\n";
+    // Every interface off by its overrides, the [arp] defaults on.
+    let off = validated(&with_interface_arp(&zero, both_off, both_off));
+    assert_eq!(off.tick().generated_arp, 0);
+    // The router-wide switches off; one interface switches one back on.
+    let global_off = with_arp("announce = false\nconflict-defense = false");
+    assert_eq!(validated(&global_off).tick().generated_arp, 0);
+    for (wan, lan) in [
+        (both_off, ""),
+        ("arp-announce = false\n", both_off),
+        ("arp-conflict-defense = false\n", both_off),
+    ] {
+        let rejected = error(&with_interface_arp(&zero, wan, lan));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::ArpAnnounceWithoutGeneratedArp,
+            "{wan}{lan}"
+        );
+        assert_eq!(dotted(rejected.path()), "tick.generated-arp");
+    }
+    for (wan, lan) in [
+        ("arp-announce = true\n", ""),
+        ("", "arp-conflict-defense = true\n"),
+    ] {
+        let rejected = error(&with_interface_arp(&global_off, wan, lan));
+        assert_eq!(
+            rejected.code(),
+            ValidationCode::ArpAnnounceWithoutGeneratedArp,
+            "{wan}{lan}"
+        );
+    }
+    assert_eq!(
+        validated(&with_interface_arp(
+            &global_off,
+            "arp-announce = false\n",
+            ""
+        ))
+        .tick()
+        .generated_arp,
+        0
+    );
+}
+
 /// N5: `[nat44.icmp]` maps onto the core ICMP query policy with RFC 5508
 /// defaults (60 s, address-dependent, identifier preservation, errors
 /// bidirectional), the identifier pool defaults to the realm ports, and its

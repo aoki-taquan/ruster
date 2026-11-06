@@ -3082,7 +3082,7 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   that interface). Off (default), such hosts are learned and answered as
   before H4c; the counter stays 0. The option is reloadable (`ruster plan`
   shows `arp ~ changed`).
-- **ARP Announcements (GARP, ARP-033..ARP-039).** The router announces
+- **ARP Announcements (GARP, ARP-033..ARP-040).** The router announces
   each interface address with RFC 5227 ARP Announcements (an ARP Request,
   broadcast, sender IP = target IP = the address, target MAC zero): at
   startup once the ports are open, after a port's link comes back up
@@ -3116,6 +3116,32 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   between two rounds is not seen and announces nothing. The router does
   not send RFC 5227 Probes before using its static addresses (ARP-036):
   it could not pick another address anyway.
+- **Per-interface switches (ARP-040).** `[[interfaces]] arp-announce` and
+  `arp-conflict-defense` (`true`/`false`) override `[arp] announce` and
+  `[arp] conflict-defense` on that interface; without the key the
+  interface inherits the `[arp]` value. Typical use: a WAN port on an ISP
+  segment shared with other customers, where the provider does not want
+  gratuitous ARP, gets `arp-announce = false` (and, if the provider
+  insists, `arp-conflict-defense = false`). Both are reloadable and take
+  effect at the commit, exactly like the `[arp]` switches: switching one
+  off cancels that port's running sequence or drops its owed defense
+  (`arp_announce.cancelled`), and a link-up or startup trigger on a port
+  with announcements off counts `arp_announce.disabled`. Switching
+  announcements on by reload (`[arp] announce` or `arp-announce`) does not
+  by itself re-announce an unchanged address: it takes effect at the
+  port's next trigger (startup, link-up, or a reload that adds or changes
+  its address). Conflict
+  detection, `arp_announce.conflicts`, `ifN.watch.arp_address_conflicts`
+  and the `ARP_ADDRESS_CONFLICT` warning stay on for every port.
+  `arp-conflict-defense = false` is the same operator-selected RFC 5227
+  §2.4 deviation as the `[arp]` switch, on that port only (record it in
+  the change ticket for that port). `[tick] generated-arp = 0` is refused
+  only while some interface has either switch on, after the overrides.
+  `ruster plan` shows each change as `arp-interface + ifN announce off
+  conflict-defense inherit` (`~` changed, `-` back to inheriting); a
+  change of `[arp]` itself stays `arp ~ changed`. The overrides live in
+  the forwarding snapshot, not in runtime storage, so `storage-bytes` is
+  unchanged.
 - **Address conflicts (ARP-038, ARP-039).** An ARP Request or Reply on a
   port whose sender IP is the port's address and whose sender MAC is not
   the port's MAC is a conflict: another host uses the router's address.

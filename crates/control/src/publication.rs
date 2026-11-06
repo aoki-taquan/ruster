@@ -1,14 +1,14 @@
 use std::num::NonZeroU64;
 
 use ruster_core::{
-    ArpHoldPolicy, ArpPolicy, FirewallConfig, FirewallConfigError, FirewallHashKey, FirewallPolicy,
-    FirewallRule, ForwardingSnapshot, Icmpv4ErrorPolicy, IfId, InputFirewallAction,
-    InputFirewallRule, Interface, Ipv4Address, Ipv4FragmentTrackingPolicy, Ipv4FragmentationPolicy,
-    Ipv4OriginPolicy, LocalIpv4Binding, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpHashKey,
-    Nat44IcmpPolicy, Nat44TcpConfig, Nat44TcpConfigError, Nat44TcpHashKey, Nat44TcpPolicy,
-    Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpHashKey, Nat44UdpPolicy, Neighbor,
-    ResolutionHashKey, ResolutionPolicy, Route, SourceValidationBinding, ValidatedFirewallOwner,
-    ValidatedForwardingOwner, ValidatedForwardingOwnerError,
+    ArpHoldPolicy, ArpInterfacePolicy, ArpPolicy, FirewallConfig, FirewallConfigError,
+    FirewallHashKey, FirewallPolicy, FirewallRule, ForwardingSnapshot, Icmpv4ErrorPolicy, IfId,
+    InputFirewallAction, InputFirewallRule, Interface, Ipv4Address, Ipv4FragmentTrackingPolicy,
+    Ipv4FragmentationPolicy, Ipv4OriginPolicy, LocalIpv4Binding, Nat44IcmpConfig,
+    Nat44IcmpConfigError, Nat44IcmpHashKey, Nat44IcmpPolicy, Nat44TcpConfig, Nat44TcpConfigError,
+    Nat44TcpHashKey, Nat44TcpPolicy, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpHashKey,
+    Nat44UdpPolicy, Neighbor, ResolutionHashKey, ResolutionPolicy, Route, SourceValidationBinding,
+    ValidatedFirewallOwner, ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -754,6 +754,7 @@ pub struct PublicationPlan {
     ipv4_origin: Ipv4OriginPolicy,
     arp_policy: ArpPolicy,
     source_validation: Box<[SourceValidationBinding]>,
+    arp_interfaces: Box<[ArpInterfacePolicy]>,
     input_firewall: (Box<[InputFirewallRule]>, InputFirewallAction),
     resolution_policy: ResolutionPolicy,
     icmpv4_error_policy: Icmpv4ErrorPolicy,
@@ -820,6 +821,7 @@ impl PublicationPlan {
             ipv4_origin,
             arp_policy: ArpPolicy::RFC826,
             source_validation: Box::default(),
+            arp_interfaces: Box::default(),
             input_firewall: (Box::default(), InputFirewallAction::Accept),
             resolution_policy,
             icmpv4_error_policy,
@@ -873,6 +875,17 @@ impl PublicationPlan {
     #[must_use]
     pub fn with_source_validation(mut self, bindings: Box<[SourceValidationBinding]>) -> Self {
         self.source_validation = bindings;
+        self
+    }
+
+    /// Sets the per-interface overrides of the `[arp]` announce and
+    /// conflict-defense switches of the forwarding snapshot (ARP-040;
+    /// default: none, every interface inherits the [`ArpPolicy`]). An
+    /// override naming an unknown interface, or one interface twice,
+    /// rejects the candidate as a forwarding error.
+    #[must_use]
+    pub fn with_arp_interfaces(mut self, overrides: Box<[ArpInterfacePolicy]>) -> Self {
+        self.arp_interfaces = overrides;
         self
     }
 
@@ -1022,6 +1035,7 @@ impl ValidatedCandidate {
             ipv4_origin,
             arp_policy,
             source_validation,
+            arp_interfaces,
             input_firewall,
             resolution_policy,
             icmpv4_error_policy,
@@ -1055,6 +1069,8 @@ impl ValidatedCandidate {
                 .map_err(PublicationCandidateError::Forwarding)?
                 .with_arp_policy(arp_policy)
                 .with_source_validation(&source_validation)
+                .map_err(PublicationCandidateError::Forwarding)?
+                .with_arp_interfaces(&arp_interfaces)
                 .map_err(PublicationCandidateError::Forwarding)?
                 .with_input_firewall(input_firewall.0, input_firewall.1)
                 .map_err(PublicationCandidateError::Forwarding)?;

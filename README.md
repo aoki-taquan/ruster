@@ -276,7 +276,7 @@ coordinatorの解釈。H4c（#311）では無条件dropでした）。有効に�
 addressで動的cacheを埋められなくなる一方、linkを共有する別prefixのhost（secondary subnet）は
 direct `[[routes]]`（`via`なし）を足すまで解決されません。
 
-routerは自分のaddressをRFC 5227のARP Announcement（GARP）で知らせます（ARP-033〜ARP-039）。
+routerは自分のaddressをRFC 5227のARP Announcement（GARP）で知らせます（ARP-033〜ARP-040）。
 `ruster run`の起動でportを開いた後、portのlink-up、IPv4 addressを追加・変更したreloadのときに、
 そのinterfaceからsender IP = target IP = 自分のaddressのbroadcast ARP RequestをANNOUNCE_NUM（2）回、
 ANNOUNCE_INTERVAL（2 s）間隔で送ります（RFC 5227 §2.3。§1.3は「host」がrouterのinterfaceにも
@@ -288,7 +288,29 @@ episodeごとに一度出し、§2.4 (c)に従いDEFEND_INTERVAL（10 s）に高
 defenseします（sequenceとは別の1 frame）。`watch.state`は`ok`のままで、episode中は
 `ifN.watch.arp_address_conflict`が立ちます。Probe（§2.1）は静的addressのrouterでは送りません
 （ARP-036）。`[tick] generated-arp = 0`でannounceかdefenseがonなら
-`ARP_ANNOUNCE_WITHOUT_GENERATED_ARP`で拒否します。interfaceごとの切り替えは未実装です（ARP-040）。
+`ARP_ANNOUNCE_WITHOUT_GENERATED_ARP`で拒否します（ARP-040の上書きを含め、どれかのinterfaceで
+どちらかがonのときだけ。全interfaceで両方offなら0でよい）。
+
+`announce`と`conflict-defense`はinterfaceごとに`[[interfaces]] arp-announce`と
+`arp-conflict-defense`（true/false）で上書きできます（ARP-040）。keyが無ければ`[arp]`の値を
+継承します。主な用途はISPと共有するL2 segmentのWAN portでAnnouncementだけ（または両方）を
+止めることです。reload可能で、commitで即時に効きます（offにすると実行中のsequenceを止め、
+未送信のdefenseを捨てる。`[arp]`と同じ）。reloadでonにしても（`[arp] announce`でも`arp-announce`でも）
+変わらないaddressをそれだけでは再announceせず、次のtrigger（起動、link-up、addressの追加・変更）から
+効きます。conflictの検出・計数・warningは両方offでも続きます。
+`arp-conflict-defense = false`はそのinterfaceだけのoperatorが選ぶRFC 5227 §2.4のdeviationです
+（ARP-038）。`ruster plan`は`arp-interface + if2 announce off conflict-defense inherit`の
+ように表示します。
+
+```toml
+[[interfaces]]
+id = 2
+name = "wan"
+device = "eth1"
+mac = "02:00:00:00:00:02"
+arp-announce = false            # このportだけAnnouncementを送らない（省略: [arp] announceを継承）
+# arp-conflict-defense = false  # このportだけdefenseしない（§2.4 deviation。検出と計数は続く）
+```
 
 ```toml
 [arp]                           # table/keyとも省略可能、すべてreload可能
