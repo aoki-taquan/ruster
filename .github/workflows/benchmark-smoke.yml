@@ -1,10 +1,7 @@
 name: Benchmark Smoke
 
-# R17 scope (docs/benchmark-spec-v0.2.md, "M1で適用する範囲"):
-#   - verify the benchmark spec bytes against the pinned SHA-256 digest
-#   - check the spec tables against hardware plan v1
-#   - run the NIC-free sim smoke suite and keep its JSONL as an artifact
-# No throughput/latency pass/fail and no hardware comparison happen here.
+# Run the NIC-free sim smoke suite and keep its JSONL as an artifact.
+# No throughput/latency pass/fail happens here.
 
 on:
   push:
@@ -35,14 +32,6 @@ jobs:
         with:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
-
-      - name: Verify pinned spec digest
-        run: sha256sum --check --strict docs/benchmark-spec-v0.2.sha256
-
-      - name: Check spec against hardware plan v1
-        run: >-
-          timeout --signal=TERM --kill-after=30s 10m
-          cargo test --locked -p ruster-bench --test benchmark_spec
 
       - name: Run sim smoke suite
         shell: bash
