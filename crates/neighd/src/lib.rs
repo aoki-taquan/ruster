@@ -31,6 +31,12 @@ const RETRY_MS: u64 = 1_000;
 const ATTEMPTS: u32 = 3;
 const PUNTS_PER_STEP: usize = 64;
 const ARP_BODY_LEN: usize = 28;
+/// Ethernet, IPv4, 6-byte and 4-byte addresses (RFC 826).
+const ARP_ETHERNET_IPV4: [u8; 6] = [0, 1, 8, 0, 6, 4];
+/// Neighbors remembered at most; further new ones are not learned.
+const KNOWN_MAX: usize = 4_096;
+/// How long to wait for the FE's neighbor table before going on without it.
+const ADOPT_TIMEOUT_MS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NeighdCounters {
@@ -40,6 +46,7 @@ pub struct NeighdCounters {
     pub adopted: u64,
     pub given_up: u64,
     pub bad_punts: u64,
+    pub not_learned: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -52,13 +59,16 @@ struct Pending {
 enum FeState {
     /// Waiting for the answer to the GET of the FE's neighbor table.
     Adopting(u32),
-    Running,
+    Running {
+        observe: u32,
+    },
 }
 
 pub struct Neighd {
     local: Server,
     fe: Client,
     fe_state: FeState,
+    adopt_since: Option<u64>,
     punt: UnixDatagram,
     known: BTreeMap<(String, Ipv4Addr), [u8; 6]>,
     pending: BTreeMap<(String, Ipv4Addr), Pending>,
@@ -97,6 +107,7 @@ impl Neighd {
             local: Server::new(),
             fe,
             fe_state: FeState::Adopting(token),
+            adopt_since: None,
             punt,
             known: BTreeMap::new(),
             pending: BTreeMap::new(),
@@ -128,14 +139,49 @@ impl Neighd {
         }
     }
 
-    fn local_address(&self, interface: &str) -> Option<Ipv4Addr> {
-        self.local.store().iter().find_map(|(key, _)| match key {
-            Key::Address {
-                interface: name,
-                address,
-            } if name == interface => Some(*address),
-            _ => None,
-        })
+    /// The router's addresses on `interface` with their prefix lengths.
+    fn local_addresses(&self, interface: &str) -> Vec<(Ipv4Addr, u8)> {
+        self.local
+            .store()
+            .iter()
+            .filter_map(|(key, value)| match (key, value) {
+                (
+                    Key::Address {
+                        interface: name,
+                        address,
+                    },
+                    Value::Address { prefix_len },
+                ) if name == interface => Some((*address, *prefix_len)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The address to ask from: the one whose prefix holds `target`, else the first.
+    fn local_address(&self, interface: &str, target: Ipv4Addr) -> Option<Ipv4Addr> {
+        let addresses = self.local_addresses(interface);
+        addresses
+            .iter()
+            .find(|&&(address, len)| same_subnet(address, target, len))
+            .or(addresses.first())
+            .map(|&(address, _)| address)
+    }
+
+    /// A host address on one of the interface's subnets (not its network or broadcast
+    /// address), so a neighbor there is possible.
+    fn on_link_host(&self, interface: &str, sender: Ipv4Addr) -> bool {
+        self.local_addresses(interface)
+            .iter()
+            .any(|&(address, len)| {
+                if !same_subnet(address, sender, len) {
+                    return false;
+                }
+                if len >= 31 {
+                    return true;
+                }
+                let host = u32::from(sender) & !mask(len);
+                host != 0 && host != !mask(len)
+            })
     }
 
     fn is_local(&self, interface: &str, address: Ipv4Addr) -> bool {
@@ -168,8 +214,7 @@ impl Neighd {
                             }
                         }
                     }
-                    self.fe_state = FeState::Running;
-                    self.fe.observe();
+                    self.start_running();
                 }
                 Event::Notification { payload } => {
                     let mut d = Decoder::new(&payload);
@@ -177,9 +222,21 @@ impl Neighd {
                         self.resolve(request.interface, request.address, now_ms);
                     }
                 }
+                // A refused Observe registration is tried again.
+                Event::Response { token, code, .. }
+                    if self.fe_state == (FeState::Running { observe: token })
+                        && code.class() != 2 =>
+                {
+                    self.start_running();
+                }
                 Event::Response { .. } => {}
             }
         }
+    }
+
+    fn start_running(&mut self) {
+        let observe = self.fe.observe();
+        self.fe_state = FeState::Running { observe };
     }
 
     fn resolve(&mut self, interface: String, address: Ipv4Addr, now_ms: u64) {
@@ -212,9 +269,10 @@ impl Neighd {
                 continue;
             }
             let (interface, target) = &key;
-            if let (Some(mac), Some(source)) =
-                (self.local_mac(interface), self.local_address(interface))
-            {
+            if let (Some(mac), Some(source)) = (
+                self.local_mac(interface),
+                self.local_address(interface, *target),
+            ) {
                 let frame = arp_frame(1, mac, source, [0xff; 6], [0; 6], *target);
                 self.send(interface, &frame);
                 self.counters.requests_sent += 1;
@@ -244,7 +302,7 @@ impl Neighd {
                 Ok(punt)
                     if punt.direction == Direction::ToControl
                         && punt.reason == punt::reason::ARP
-                        && punt.frame.len() >= ARP_BODY_LEN =>
+                        && valid_arp_body(punt.frame) =>
                 {
                     let interface = punt.interface.to_owned();
                     self.arp(&interface, punt.frame);
@@ -262,12 +320,22 @@ impl Neighd {
         let sender = Ipv4Addr::new(body[14], body[15], body[16], body[17]);
         let target = Ipv4Addr::new(body[24], body[25], body[26], body[27]);
         let for_us = self.is_local(interface, target);
+        // Our own address as sender is a conflict, not a neighbor; do not answer it.
+        if self.is_local(interface, sender) {
+            self.counters.not_learned += 1;
+            return;
+        }
 
         // RFC 826: update a neighbor we know or are resolving; add one that is asking
-        // for us.
+        // for us, if it can be a neighbor on this link.
         let key = (interface.to_owned(), sender);
-        let wanted = self.known.contains_key(&key) || self.pending.contains_key(&key) || for_us;
-        if wanted && !sender.is_unspecified() && self.known.get(&key) != Some(&sender_mac) {
+        let known = self.known.contains_key(&key) || self.pending.contains_key(&key);
+        let addable =
+            for_us && self.on_link_host(interface, sender) && self.known.len() < KNOWN_MAX;
+        if !known && for_us && !addable {
+            self.counters.not_learned += 1;
+        }
+        if (known || addable) && self.known.get(&key) != Some(&sender_mac) {
             self.known.insert(key.clone(), sender_mac);
             self.pending.remove(&key);
             let _ = self.fe.patch(&[Change::set(
@@ -309,9 +377,16 @@ impl Task for Neighd {
         let (fe, events) = self.fe.poll();
         let had_events = !events.is_empty();
         self.handle_fe(events, now_ms);
+        if let FeState::Adopting(_) = self.fe_state {
+            let since = *self.adopt_since.get_or_insert(now_ms);
+            if now_ms.saturating_sub(since) >= ADOPT_TIMEOUT_MS {
+                self.start_running();
+            }
+        }
         let punts = self.receive_punts();
         let timers = self.retry(now_ms);
-        let (flushed, _) = self.fe.poll();
+        let (flushed, late) = self.fe.poll();
+        self.handle_fe(late, now_ms);
         local
             .and(fe)
             .and(timers)
@@ -343,4 +418,22 @@ fn arp_frame(
     frame[32..38].copy_from_slice(&target_mac);
     frame[38..42].copy_from_slice(&target.octets());
     frame
+}
+
+/// An Ethernet/IPv4 ARP request or reply from a unicast sender MAC.
+fn valid_arp_body(body: &[u8]) -> bool {
+    if body.len() < ARP_BODY_LEN || body[0..6] != ARP_ETHERNET_IPV4 {
+        return false;
+    }
+    let opcode = u16::from_be_bytes([body[6], body[7]]);
+    let sender_mac = &body[8..14];
+    matches!(opcode, 1 | 2) && sender_mac != [0; 6] && sender_mac[0] & 1 == 0
+}
+
+fn mask(len: u8) -> u32 {
+    u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0)
+}
+
+fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, len: u8) -> bool {
+    (u32::from(a) ^ u32::from(b)) & mask(len) == 0
 }
