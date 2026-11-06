@@ -163,9 +163,26 @@ impl Server {
         self.peers.len()
     }
 
+    /// The largest number of bytes queued for any one connection.
+    pub fn max_backlog(&self) -> usize {
+        self.peers
+            .iter()
+            .map(|peer| peer.conn.backlog())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Accepts a connection that may write `writes` (table SIDs). An empty list makes
     /// it read-only.
+    ///
+    /// A table has one writer. An older connection that writes any of the same tables
+    /// is closed, because a new connection for them means the writer restarted.
     pub fn attach(&mut self, stream: UnixStream, writes: &[u64]) -> io::Result<()> {
+        for peer in &mut self.peers {
+            if peer.writes.iter().any(|table| writes.contains(table)) {
+                peer.conn.close();
+            }
+        }
         self.peers.push(Peer {
             conn: Connection::new(stream, DEFAULT_LIMIT)?,
             writes: writes.to_vec(),
@@ -176,12 +193,24 @@ impl Server {
     }
 
     /// Queues a notification for every connection that observes `s`.
+    ///
+    /// An observer that has fallen a whole message limit behind is closed rather than
+    /// queued for without bound.
     pub fn notify(&mut self, payload: &[u8]) {
         for peer in &mut self.peers {
             let Some(token) = peer.observe_token.clone() else {
                 continue;
             };
-            peer.observe_seq = peer.observe_seq.wrapping_add(1) & 0x00ff_ffff;
+            if peer.conn.backlog() >= peer.conn.limit() {
+                peer.conn.close();
+                continue;
+            }
+            // Observe numbers are 24 bits; 0 is the registration, so wrap to 1.
+            peer.observe_seq = if peer.observe_seq >= 0x00ff_ffff {
+                1
+            } else {
+                peer.observe_seq + 1
+            };
             let _ = peer.conn.send(&Outgoing {
                 code: Some(Code::CONTENT),
                 token: &token,
@@ -199,6 +228,11 @@ impl Server {
         while index < self.peers.len() {
             busy |= self.peers[index].conn.pump().unwrap_or(false);
             for _ in 0..REQUESTS_PER_STEP {
+                // Backpressure: a peer that does not read its replies gets no more
+                // handled until it does.
+                if self.peers[index].conn.backlog() >= self.peers[index].conn.limit() {
+                    break;
+                }
                 match self.peers[index].conn.next_message() {
                     Ok(Some(request)) => {
                         busy = true;
@@ -221,6 +255,9 @@ impl Server {
         let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
         let writes = self.peers[index].writes.clone();
         let (code, payload): (Code, Vec<u8>) = match (request.code, path.as_slice()) {
+            (Code::IPATCH, ["c"]) if writes.is_empty() => {
+                (Code::FORBIDDEN, b"read-only connection".to_vec())
+            }
             (Code::IPATCH, ["c"]) => match decode_changes(&request.payload) {
                 Err(error) => (Code::BAD_REQUEST, error.to_string().into_bytes()),
                 Ok(changes) => {
@@ -239,7 +276,13 @@ impl Server {
                     .filter(|(key, _)| writes.is_empty() || writes.contains(&key.table()))
                     .map(|(key, value)| Change::set(key.clone(), value.clone()))
                     .collect();
+                let limit = self.peers[index].conn.peer_limit().unwrap_or(DEFAULT_LIMIT);
                 match encode_changes(&changes) {
+                    // Leave room for the header and token.
+                    Ok(payload) if payload.len() + 64 > limit => (
+                        Code::REQUEST_ENTITY_TOO_LARGE,
+                        b"tables larger than the peer's message limit".to_vec(),
+                    ),
                     Ok(payload) => (Code::CONTENT, payload),
                     Err(error) => (Code::INTERNAL_SERVER_ERROR, error.to_string().into_bytes()),
                 }
@@ -373,11 +416,13 @@ impl Client {
                 .try_into()
                 .map(u32::from_be_bytes)
                 .unwrap_or(0);
-            if Some(token) == self.observe_token && message.observe.is_some_and(|n| n > 0) {
+            let observing = Some(token) == self.observe_token;
+            if observing && message.observe.is_some_and(|n| n > 0) {
                 events.push(Event::Notification {
                     payload: message.payload,
                 });
-            } else if Some(token) != self.observe_token {
+            } else if !(observing && message.observe == Some(0)) {
+                // Ordinary responses, and an error answer to the registration.
                 events.push(Event::Response {
                     token,
                     code: message.code,

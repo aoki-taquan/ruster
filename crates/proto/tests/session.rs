@@ -213,3 +213,93 @@ fn read_only_connections_cannot_write_or_resync() {
     assert_eq!(response(&events, patch).0, Code::FORBIDDEN);
     assert_eq!(response(&events, resync).0, Code::NOT_FOUND);
 }
+
+#[test]
+fn a_new_writer_for_the_same_tables_replaces_the_old_one() {
+    let mut bench = Bench::new();
+    let mut old = bench.connect(&[sid::INTERFACE]);
+    old.patch(&[iface("eth0", 1)]).unwrap();
+    bench.settle(&mut old);
+    let mut new = bench.connect(&[sid::INTERFACE]);
+    bench.settle(&mut new);
+    assert_eq!(bench.server.peers(), 1, "the old writer is closed");
+    for _ in 0..10 {
+        old.poll();
+    }
+    assert!(old.is_closed());
+    assert_eq!(bench.server.store().len(), 1, "its entries stay");
+}
+
+#[test]
+fn empty_patch_from_a_read_only_connection_is_forbidden() {
+    let mut bench = Bench::new();
+    let mut client = bench.connect(&[]);
+    let token = client.patch(&[]).unwrap();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, token).0, Code::FORBIDDEN);
+    assert_eq!(bench.hook.commits, 0);
+}
+
+#[test]
+fn a_peer_that_never_reads_does_not_grow_the_server_without_bound() {
+    use ruster_proto::coap::{self, Code as C};
+    use ruster_proto::conn::DEFAULT_LIMIT;
+    use std::io::Write;
+
+    let mut bench = Bench::new();
+    let (server_end, raw) = UnixStream::pair().unwrap();
+    bench.server.attach(server_end, &[]).unwrap();
+    raw.set_nonblocking(true).unwrap();
+    // Fill the store so every GET reply is large.
+    let mut writer = bench.connect(&[sid::INTERFACE]);
+    let many: Vec<Change> = (0..200)
+        .map(|n| iface(&format!("if{n}"), n as u8))
+        .collect();
+    writer.patch(&many).unwrap();
+    bench.settle(&mut writer);
+
+    // Send many GETs and never read the replies.
+    let mut get = Vec::new();
+    coap::encode(&mut get, C::GET, &[1], &[(11, b"c")], &[]).unwrap();
+    let mut requests = Vec::new();
+    for _ in 0..20_000 {
+        requests.extend_from_slice(&get);
+    }
+    let mut sent = 0;
+    for _ in 0..2_000 {
+        if sent < requests.len() {
+            if let Ok(n) = (&raw).write(&requests[sent..]) {
+                sent += n;
+            }
+        }
+        bench.server.step(&mut bench.hook);
+        // At most one reply is queued past the limit.
+        assert!(bench.server.max_backlog() <= DEFAULT_LIMIT + 64 * 1024);
+    }
+    // Each queued reply is a few KiB; without backpressure 20 000 of them would be
+    // tens of MiB. The test only checks the server stays alive and responsive.
+    let token = writer.get_all();
+    let events = bench.settle(&mut writer);
+    assert_eq!(response(&events, token).0, Code::CONTENT);
+}
+
+#[test]
+fn flooding_peer_is_read_no_further_than_the_message_limit() {
+    use ruster_proto::conn::{Connection, DEFAULT_LIMIT};
+    use std::io::Write;
+
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut conn = Connection::new(a, DEFAULT_LIMIT).unwrap();
+    b.set_nonblocking(true).unwrap();
+    // 2-byte empty messages (code 0.00), about 40 MiB in total.
+    let chunk = [0x00_u8, 0x00].repeat(32 * 1024);
+    let mut written = 0_usize;
+    for _ in 0..4_000 {
+        if let Ok(n) = (&b).write(&chunk) {
+            written += n;
+        }
+        let _ = conn.pump();
+        assert!(conn.buffered_in() <= DEFAULT_LIMIT + 64 * 1024);
+    }
+    assert!(written > 0);
+}

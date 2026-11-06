@@ -72,6 +72,8 @@ pub struct Connection {
     stream: UnixStream,
     limit: usize,
     inbuf: Vec<u8>,
+    /// Bytes at the front of `inbuf` already handed out; removed once per pump.
+    consumed: usize,
     outbuf: Vec<u8>,
     closed: bool,
     peer_limit: Option<usize>,
@@ -80,7 +82,7 @@ pub struct Connection {
 impl fmt::Debug for Connection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Connection")
-            .field("buffered_in", &self.inbuf.len())
+            .field("buffered_in", &self.buffered_in())
             .field("buffered_out", &self.outbuf.len())
             .field("closed", &self.closed)
             .finish_non_exhaustive()
@@ -95,6 +97,7 @@ impl Connection {
             stream,
             limit,
             inbuf: Vec::new(),
+            consumed: 0,
             outbuf: Vec::new(),
             closed: false,
             peer_limit: None,
@@ -157,6 +160,9 @@ impl Connection {
 
     fn pump_inner(&mut self) -> Result<bool, ConnError> {
         let mut moved = false;
+        // Remove what was handed out, once per pump instead of once per message.
+        self.inbuf.drain(..self.consumed);
+        self.consumed = 0;
         while !self.outbuf.is_empty() {
             match self.stream.write(&self.outbuf) {
                 Ok(0) => {
@@ -175,6 +181,11 @@ impl Connection {
                 }
                 Err(error) => return Err(error.into()),
             }
+        }
+        // Backpressure: stop reading while a whole message's worth is unread, so a
+        // peer that sends faster than this side handles cannot grow the buffer.
+        if self.inbuf.len() >= self.limit {
+            return Ok(moved);
         }
         let start = self.inbuf.len();
         self.inbuf.resize(start + READ_CHUNK, 0);
@@ -208,7 +219,7 @@ impl Connection {
     /// the way. `Ok(None)` means no whole message is buffered yet.
     pub fn next_message(&mut self) -> Result<Option<Incoming>, ConnError> {
         loop {
-            let decoded = match coap::decode(&self.inbuf, self.limit) {
+            let decoded = match coap::decode(&self.inbuf[self.consumed..], self.limit) {
                 Ok(decoded) => decoded,
                 Err(error) => {
                     self.closed = true;
@@ -236,7 +247,7 @@ impl Connection {
             let max_size = message
                 .option(option::MAX_MESSAGE_SIZE)
                 .and_then(coap::read_uint_option);
-            self.inbuf.drain(..used);
+            self.consumed += used;
             match code {
                 Code::CSM => {
                     if let Some(size) = max_size {
@@ -265,5 +276,26 @@ impl Connection {
     /// True when nothing is waiting to be written.
     pub fn flushed(&self) -> bool {
         self.outbuf.is_empty()
+    }
+
+    /// Bytes queued but not yet written.
+    pub fn backlog(&self) -> usize {
+        self.outbuf.len()
+    }
+
+    /// Bytes received but not yet handed out.
+    pub fn buffered_in(&self) -> usize {
+        self.inbuf.len() - self.consumed
+    }
+
+    /// The largest message this side accepts.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Stops using the connection. The peer sees the socket close when it is dropped.
+    pub fn close(&mut self) {
+        self.closed = true;
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }
