@@ -50,7 +50,7 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
 
 ## 今の段階
 
-理想の設計図を描く段階。コードは書かない。設計図が揃い、ownerが実装へ進むと決めてから作る。
+設計図（[`design/`](design/)）を描き終え、実装に進んだ。順番は[`design/implementation-plan.md`](design/implementation-plan.md)に従う。
 
 ## 作業を選ぶ基準
 

@@ -1,0 +1,81 @@
+# 実装計画
+
+状態: 2026-11-06。設計図（この directory の他の文書）を、今のコードを土台にして実現する順番。
+
+## 方針
+
+- 今のコードを土台に作り変える。作り直しはしない。I/O層とパケット処理（NAT、firewall、ICMP、
+  フラグメント）は設計のFEとほぼ重なり、実績がある。
+- 最初に「骨組み」を作る。sim上で、FE、confd、ribd、neighdがメッセージでつながり、IPv4が端から端まで
+  転送できるところまで。設計の中心（メッセージ形式、表の版の差し替え、受け渡し、プロセスの分け方）を
+  ここで確かめる。
+- 機能は骨組みに一つずつ載せる。骨組みができる前に機能を足さない。
+- 進め方はAGENTS.mdのとおり。1 PRは非テストで500行程度まで。機能のPRはownerがapproveしてからmerge。
+- 実装は一つのagentが通しで行う。独立レビューを頼むのは、unsafe、メッセージ形式、表の版の差し替え、
+  NAT/firewallの状態に触るPRだけ。
+
+## 今のコードの行き先
+
+| 今のコード | 行き先 |
+|---|---|
+| `ruster-core`のパケット処理（`forwarding`、`nat44*`、`firewall*`、`icmpv4_error`、`ipv4_fragment*`など） | FE。そのまま使う |
+| `ruster-core`のARP（`resolution.rs`、`resolution/announce.rs`、`arp_hold.rs`と、`forwarding.rs`内の学習、待たせ、再送） | neighdへ移す。FEには静的な近隣の表と解決依頼だけを残す |
+| `ruster-core`の`io.rs`、`generated.rs` | FE。`PublicationQuiescence`は版の差し替え方が変わるので外す |
+| `ruster-runtime` | FE。ARPの段階を外し、仕事と実行役の形へ |
+| `ruster-control`の`activation.rs`、`publication.rs` | FE。設定全体からではなく、メッセージから表の版を作る形へ |
+| `ruster-control`の`plan.rs`、`config_bridge.rs`と、`ruster-config` | confd |
+| `ruster-config`の直結経路と静的経路の組み立て | ribd |
+| `ruster-cli`の`run/`のうち起動、権限、seccomp、Landlock、systemd通知など | FEの実行ファイル |
+| `ruster-cli`の`run/reload.rs`、`config_cmd.rs`、`plan_text.rs` | confdとCLI（制御のsocketに置き換わる） |
+| `ruster-io-*` | FEのI/O層。そのまま使う |
+| `ruster-io-sim`、`ruster-io-conformance`、`ruster-sim-scenario` | 試験の土台。`sim-scenario`の`apply`はメッセージに置き換える |
+| `ruster-bench`の`hardware_protocol`、`hardware_artifact`、`hardware_plan`（約5,900行） | 削除候補（性能は北極星に入れないため） |
+
+## 段階
+
+### 段階0: 片付け（動作は変えない）
+
+1. READMEを200行以内に縮める。crateごとの詳細は消すか各crateへ移す。
+2. 古い計画の文書（`development-plan-v0.2.md`など）の先頭に「設計図に置き換わった」と書き、
+   進み具合の記述は`docs/status.md`の一か所にまとめる。
+3. `ruster-bench`のhardware benchmark一式を削除する（ownerの確認後）。
+4. 要件ID台帳（`requirements-v0.2.md`、842 ID）と`check-requirements.sh`の扱いを決める（ownerの確認後）。
+
+### 段階1: 骨組み
+
+| 順 | PR | 中身 |
+|---|---|---|
+| 1-1 | CBOR | 使う範囲（整数、バイト列、文字列、配列、マップ、null、真偽値）の読み書き。新しいcrate `ruster-proto` |
+| 1-2 | CoAPの枠組み | RFC 8323の枠組みの読み書き。最大メッセージ長の交換 |
+| 1-3 | SIDと`.sid`ファイル | 最初の四つの表（`ietf-interfaces`、`ietf-ip`、`ruster-fib`、`ruster-neighbor`）のSIDと、`.sid`ファイルとの突き合わせの試験 |
+| 1-4 | 表の版 | iPATCHの中身を、今の`Interface`、`LocalIpv4Binding`、`Route`、`Neighbor`へ変換し、表の版を作る。参照先が無いエントリは無効として持つ |
+| 1-5 | 仕事と実行役 | `進める(時刻)`の形と実行役。workerを最初の仕事にする |
+| 1-6 | FEの制御の口 | Unix socketでiPATCH、FETCH、PUT、resyncを受け、版を差し替える。差し替えで送信の完了を待たないようにする |
+| 1-7 | 受け渡し | 受け渡しの役割、SOCK_SEQPACKETの固定ヘッダ、近隣の解決依頼の通知 |
+| 1-8 | neighd（ARPだけ） | 解決依頼を受けてARP Requestを送り、応答を近隣の表へ書く。ルータのアドレスへのARPに応答する |
+| 1-9 | ribd（静的と直結だけ） | 送り手からの経路の受け取り、選択、FIBへの書き込み、「送り終わった」 |
+| 1-10 | confd（インターフェースとアドレスだけ） | 今のTOMLの読み込みをそのまま入力に使う（人が書く書き方は後で決める）。静的経路をribdへ渡す |
+| 1-11 | 端から端までの試験 | 全プロセスを一つの実行役に載せ、socketpairでつないでsim上でIPv4を転送する。CEの再起動とFEの表の保持も確かめる |
+
+### 段階2: 置き換え
+
+骨組みが動いたら、今の作りを新しい作りに置き換える。
+
+- `ruster run`を新しいFEの実行ファイルに替える（AF_XDP、AF_PACKET）。FEは設定ファイルを読まない。
+- `ruster-core`からARPの処理を消す（neighdへ移した後）。
+- SIGHUPでのTOMLの再読み込みを消す（confdへの反映に替わる）。
+
+### 段階3以降: 機能
+
+骨組みの上に[`tables.md`](tables.md)の表を一つずつ載せる。順番は段階2が終わった時点でownerが決める。
+候補: IPv6とND、NATとfirewallの表（今の処理を`ietf-nat`、`ietf-access-control-list`の形でつなぐ）、
+VLAN、トンネル（DS-Lite、MAP-E）、PPPoE、WireGuard、複数workerと状態の持ち主、経路の表の木。
+
+## 気をつけること
+
+- 今のパケットのleaseは`Rc`で`Send`できない。workerごとのqueueには問題ないが、workerの間でbufferを
+  移すことはできない。複数workerの段階で、コピーで渡すか、I/O層を変えるかを決める。
+- `forwarding.rs`には約20個の`forward_batch_with_*`の入口がある。ARPを外すときに一つにまとめる。
+- ARPは、待たせたパケットを通じてフラグメントやNATの状態とも絡んでいる。外す順番を間違えると
+  転送が壊れるので、段階2で外す前に試験を揃える。
+- 設計図と食い違う実装上の事情が出たら、コードを合わせるのではなく、まず設計図を直してownerに確認する。
