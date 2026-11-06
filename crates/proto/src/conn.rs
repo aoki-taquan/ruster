@@ -22,6 +22,9 @@ pub const DEFAULT_LIMIT: usize = 16 * 1024 * 1024;
 /// At most this many bytes are read from the socket in one [`Connection::pump`].
 const READ_CHUNK: usize = 64 * 1024;
 
+/// At most this many signaling messages are handled in one [`Connection::next_message`].
+const SIGNALS_PER_CALL: usize = 64;
+
 /// A request or response this side received.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Incoming {
@@ -77,6 +80,7 @@ pub struct Connection {
     outbuf: Vec<u8>,
     closed: bool,
     peer_limit: Option<usize>,
+    more: bool,
 }
 
 impl fmt::Debug for Connection {
@@ -101,6 +105,7 @@ impl Connection {
             outbuf: Vec::new(),
             closed: false,
             peer_limit: None,
+            more: false,
         };
         let mut size = [0; 4];
         let size = coap::uint_option(u32::try_from(limit).unwrap_or(u32::MAX), &mut size);
@@ -218,7 +223,8 @@ impl Connection {
     /// Returns the next whole request or response, handling signaling messages on
     /// the way. `Ok(None)` means no whole message is buffered yet.
     pub fn next_message(&mut self) -> Result<Option<Incoming>, ConnError> {
-        loop {
+        // Bound the signaling messages handled in one call; the rest wait for the next.
+        for _ in 0..SIGNALS_PER_CALL {
             let decoded = match coap::decode(&self.inbuf[self.consumed..], self.limit) {
                 Ok(decoded) => decoded,
                 Err(error) => {
@@ -254,7 +260,7 @@ impl Connection {
                         self.peer_limit = Some(size as usize);
                     }
                 }
-                Code::PING => {
+                Code::PING if self.outbuf.len() < self.limit => {
                     let token = incoming.token.clone();
                     self.send(&Outgoing {
                         code: Some(Code::PONG),
@@ -263,7 +269,7 @@ impl Connection {
                     })
                     .expect("a Pong always encodes");
                 }
-                Code::PONG | Code::RELEASE => {}
+                Code::PING | Code::PONG | Code::RELEASE => {}
                 Code::ABORT => {
                     self.closed = true;
                     return Ok(None);
@@ -271,6 +277,14 @@ impl Connection {
                 _ => return Ok(Some(incoming)),
             }
         }
+        self.more = true;
+        Ok(None)
+    }
+
+    /// True once after [`Connection::next_message`] stopped early with whole messages
+    /// still buffered, so the caller steps again instead of waiting for the socket.
+    pub fn take_more(&mut self) -> bool {
+        std::mem::take(&mut self.more)
     }
 
     /// True when nothing is waiting to be written.
@@ -296,6 +310,8 @@ impl Connection {
     /// Stops using the connection. The peer sees the socket close when it is dropped.
     pub fn close(&mut self) {
         self.closed = true;
+        // Requests the peer had already sent are not handed out any more.
+        self.consumed = self.inbuf.len();
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
 }

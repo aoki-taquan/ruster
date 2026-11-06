@@ -303,3 +303,22 @@ fn flooding_peer_is_read_no_further_than_the_message_limit() {
     }
     assert!(written > 0);
 }
+
+#[test]
+fn a_replaced_writers_buffered_requests_are_not_handled() {
+    let mut bench = Bench::new();
+    let mut old = bench.connect(&[sid::INTERFACE]);
+    old.patch(&[iface("eth0", 1)]).unwrap();
+    bench.settle(&mut old);
+    // The old writer sends a change but the server has not read it yet.
+    old.patch(&[iface("stale", 9)]).unwrap();
+    for _ in 0..5 {
+        old.poll();
+    }
+    let mut new = bench.connect(&[sid::INTERFACE]);
+    bench.settle(&mut new);
+    for _ in 0..10 {
+        bench.server.step(&mut bench.hook);
+    }
+    assert!(bench.server.store().get(&iface_key("stale")).is_none());
+}

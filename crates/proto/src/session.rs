@@ -242,6 +242,7 @@ impl Server {
                 }
             }
             busy |= self.peers[index].conn.pump().unwrap_or(false);
+            busy |= self.peers[index].conn.take_more();
             if self.peers[index].conn.is_closed() {
                 self.peers.swap_remove(index);
             } else {
@@ -430,6 +431,7 @@ impl Client {
                 });
             }
         }
+        busy |= self.conn.take_more();
         busy |= self.conn.pump().unwrap_or(false);
         (Progress::busy(busy), events)
     }
