@@ -322,3 +322,14 @@ fn a_replaced_writers_buffered_requests_are_not_handled() {
     }
     assert!(bench.server.store().get(&iface_key("stale")).is_none());
 }
+
+#[test]
+fn sync_done_is_remembered() {
+    let mut bench = Bench::new();
+    let mut client = bench.connect(&[sid::ROUTE]);
+    assert!(!bench.server.sync_done());
+    let token = client.sync_done();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, token).0, Code::CHANGED);
+    assert!(bench.server.sync_done());
+}
