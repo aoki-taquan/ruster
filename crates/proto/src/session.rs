@@ -9,6 +9,7 @@
 //! | GET `c` | the entries of the tables this connection writes (all tables if it writes none) |
 //! | POST `c/resync-begin` | mark this writer's entries as not yet sent again |
 //! | POST `c/resync-end` | delete this writer's entries that were not sent again |
+//! | POST `c/sync-done` | the writer has sent everything it has (see [`Server::sync_done`]) |
 //! | GET `s` with Observe 0 | send notifications to this connection from now on |
 //!
 //! The owner of the server decides whether a new set of tables is acceptable through
@@ -139,6 +140,7 @@ struct Peer {
 pub struct Server {
     store: Store,
     peers: Vec<Peer>,
+    sync_done: bool,
 }
 
 impl std::fmt::Debug for Server {
@@ -161,6 +163,13 @@ impl Server {
 
     pub fn peers(&self) -> usize {
         self.peers.len()
+    }
+
+    /// True once a writer said it has sent everything it has (`POST c/sync-done`).
+    /// A receiver that restarted waits for this before deleting what was not sent
+    /// again (docs/design/ce-processes.md, "起動し直したとき").
+    pub fn sync_done(&self) -> bool {
+        self.sync_done
     }
 
     /// The largest number of bytes queued for any one connection.
@@ -292,6 +301,10 @@ impl Server {
                 self.store.mark_stale(&writes);
                 (Code::CHANGED, Vec::new())
             }
+            (Code::POST, ["c", "sync-done"]) if !writes.is_empty() => {
+                self.sync_done = true;
+                (Code::CHANGED, Vec::new())
+            }
             (Code::POST, ["c", "resync-end"]) if !writes.is_empty() => {
                 let next = self.store.without_stale(&writes);
                 self.commit(next, hook)
@@ -396,6 +409,11 @@ impl Client {
 
     pub fn resync_end(&mut self) -> u32 {
         self.request(Code::POST, &["c", "resync-end"], None, &[])
+    }
+
+    /// Tells the server this writer has sent everything it has.
+    pub fn sync_done(&mut self) -> u32 {
+        self.request(Code::POST, &["c", "sync-done"], None, &[])
     }
 
     /// Asks for notifications. They arrive as [`Event::Notification`].
