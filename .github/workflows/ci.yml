@@ -54,8 +54,6 @@ jobs:
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae
       - run: cargo test --workspace --all-targets --all-features --locked
       - run: cargo test --doc --workspace --all-features --locked
-      - run: scripts/check-requirements.sh
-      - run: scripts/test-check-requirements.sh
 
   clippy:
     name: Clippy

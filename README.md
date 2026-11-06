@@ -1517,8 +1517,6 @@ cargo test --workspace --all-targets --all-features --locked
 cargo test --doc --workspace --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
 cargo check --workspace --all-targets --all-features --locked
-scripts/check-requirements.sh
-scripts/test-check-requirements.sh
 ```
 
 CIの`Musl` jobは、固定したRust 1.97.1へtargetを追加して次のcheckも実行します。
@@ -1652,6 +1650,5 @@ RUSTER_REQUIRE_PRIV=1 scripts/priv-run-smoke.sh
 検証するのはhosted runnerのkernel一つとveth copy/native modeだけで、zero-copy NICや5.9〜6.xの
 網羅、性能は対象外です（runbookの「CI and E2E」）。
 
-設計契約と非対象は[architecture v0.2](docs/architecture-v0.2.md)、要件とRFC根拠は
-[requirements](docs/requirements-v0.2.md)、production backendから自宅ラボ運用までの
+設計契約と非対象は[architecture v0.2](docs/architecture-v0.2.md)、production backendから自宅ラボ運用までの
 優先順位とmilestoneは[development plan](docs/development-plan-v0.2.md)を参照してください。

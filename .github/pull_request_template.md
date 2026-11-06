@@ -1,22 +1,8 @@
-## Summary
+## 何を変えたか
 
-## Scope
+## なぜ
 
-- Requirement IDs:
-- Explicitly deferred:
-
-## RFC evidence
-
-- RFC and section:
-- Deviation ledger update (or `none`):
-
-## Ownership / hot-path review
-
-- [ ] Backend buffers remain borrowed and are commit/recycled exactly once
-- [ ] No shared Mutex, packet clone, per-packet String, or dyn PacketIo was added
-- [ ] Every drop path before mutation preserves packet bytes
-
-## Validation
+## 確認
 
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`
@@ -24,5 +10,8 @@
 - [ ] `cargo test --doc --workspace --all-features --locked`
 - [ ] `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked`
 - [ ] `cargo check --workspace --all-targets --all-features --locked`
-- [ ] `scripts/check-requirements.sh`
-- [ ] `scripts/test-check-requirements.sh`
+
+## 転送の処理経路（触ったときだけ）
+
+- [ ] パケットのbufferは借りるだけで、送信か返却で必ず一度だけ終える
+- [ ] 共有`Mutex`、パケットのclone、パケットごとの`String`、`dyn PacketIo`を入れていない
