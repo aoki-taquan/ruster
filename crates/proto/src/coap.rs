@@ -47,6 +47,7 @@ impl Code {
     pub const RELEASE: Self = Self::new(7, 4);
     pub const ABORT: Self = Self::new(7, 5);
 
+    /// `class` must be 0 to 7 and `detail` 0 to 31; higher bits are dropped.
     pub const fn new(class: u8, detail: u8) -> Self {
         Self((class << 5) | (detail & 0x1f))
     }

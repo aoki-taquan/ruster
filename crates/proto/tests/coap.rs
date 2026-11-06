@@ -190,3 +190,46 @@ fn uint_options_have_no_leading_zeros() {
     assert_eq!(read_uint_option(&[1, 0]), Some(256));
     assert_eq!(read_uint_option(&[1, 0, 0, 0, 0]), None);
 }
+
+#[test]
+fn more_malformed_shapes_are_rejected() {
+    let cases: &[(&[u8], FrameError)] = &[
+        // One option whose delta alone is 65804.
+        (
+            &[0x30, 0x01, 0xe0, 0xff, 0xff],
+            FrameError::OptionNumberOverflow,
+        ),
+        // Option headers cut inside their extension bytes.
+        (&[0x10, 0x01, 0xd0], FrameError::TruncatedOption),
+        (&[0x20, 0x01, 0xe0, 0x00], FrameError::TruncatedOption),
+    ];
+    for &(bytes, error) in cases {
+        assert_eq!(decode(bytes, LIMIT), Err(error), "{bytes:02x?}");
+    }
+}
+
+#[test]
+fn payload_without_options_decodes() {
+    let (message, used) = whole(&[0x20, 0x01, 0xff, 0x41]);
+    assert_eq!(used, 4);
+    assert_eq!(message.options().count(), 0);
+    assert_eq!(message.payload, b"A");
+}
+
+#[test]
+fn limit_is_inclusive() {
+    let bytes = encoded(Code::CONTENT, &[], &[], b"abc");
+    assert!(matches!(
+        decode(&bytes, bytes.len()),
+        Ok(Decoded::Message(..))
+    ));
+    assert!(matches!(
+        decode(&bytes, bytes.len() - 1),
+        Err(FrameError::TooLarge { .. })
+    ));
+}
+
+#[test]
+fn partial_four_byte_length_asks_for_the_rest() {
+    assert_eq!(decode(&[0xf0, 0x00], LIMIT), Ok(Decoded::NeedMore(3)));
+}
