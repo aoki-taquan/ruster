@@ -102,6 +102,13 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
 - TAPではなくTUNを使い、kernelにARP/NDをさせない。
 - kernelは専用のnetnsに置き、フォワーディングは無効にする。kernelの経路は「全部TUNへ」だけ。
 - アドレスはCEからkernelへ一方向に設定する。kernelからrusterへ情報を取り込まない。
+- VRFごとにTUNを一つ持つ。FEはパケットのVRFでTUNを選び、TUNから読んだパケットはどのTUNから来たかで
+  VRFが決まる。パケットにVRFの印は付けない。
+- kernel側は、一つのnetnsの中にLinuxのVRFデバイス（l3mdev）をVRFごとに作り、そのVRFのTUNをぶら下げる。
+  デーモンはsocketをVRFデバイスへ結び付ける（`SO_BINDTODEVICE`）。業界の主流でFRRの既定と同じ。
+  - VRFごとにnetnsを分ける方式も、`ruster-confd`の選択肢として残す。VRFの間に強い分離が要るときに使う。
+    どちらにしてもFEは変わらない。
+  - 非常に多いVRF数（数千以上）での限界は確かめていない。そこまでの規模は今は目指さない。
 - kernelとの出入口は差し替えられる形で作る。必要になった環境でだけ、速い方式
   （複数キューのTUN、virtio-user/vhost-net）やユーザー空間スタックに替える。
 
@@ -124,5 +131,4 @@ FEが転送として処理する。DPUのホスト宛て通信もFEの普通の�
 
 - メッセージの形式と最初の表は[`control-protocol.md`](control-protocol.md)で叩き台を作った。
 - FEとkernelの間で、ルータ自身が送る通信の送信元アドレスをどう選ぶか。
-- VRFごとのルータ宛て通信をkernel側でどう分けるか（VRFは基本機能として最初から持つ。[`overview.md`](overview.md)）。
 - 今のコードのうち、FEに残すもの、CEへ移すもの、捨てるものの分類。
