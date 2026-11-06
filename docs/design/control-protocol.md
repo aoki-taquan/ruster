@@ -66,6 +66,7 @@ module ruster-fib {
         case local   { leaf local   { type empty; } }  // ルータ宛て
         case discard { leaf discard { type empty; } }  // 黙って捨てる
         case reject  { leaf reject  { type empty; } }  // ICMP Unreachableを返す
+        case lookup-vrf { leaf lookup-vrf { type string; } }  // 別のVRFで引き直す
       }
     }
    }

@@ -96,7 +96,7 @@ threadは「実行役」で、仕事の並びを受け取り、順に`進める`
  │   └ それ以外 → firewall input → 受け渡し（5.）
  ├ 戻りの通信の変換: NATの対応に当たれば宛先を戻す（外 → 内）。ポート開放（dst-nat）もここ
  ├ TTL / Hop Limitを減らす。0ならICMP Time Exceeded
- ├ FIBを引く（VRFごと）。discardなら捨て、rejectならICMP Unreachable
+ ├ FIBを引く（VRFごと）。discardなら捨て、rejectならICMP Unreachable、lookup-vrfなら別のVRFで引き直す
  ├ firewall forward（状態を追う）
  ├ 送信元の変換: NAPT（MAP-Eならポート範囲の中で選ぶ）、NPTv6
  ├ 出口のMTU: IPv4でDF=0なら分割、そうでなければICMP Fragmentation Needed / Packet Too Big
@@ -107,7 +107,7 @@ threadは「実行役」で、仕事の並びを受け取り、順に`進める`
 - 順番はLinuxのnetfilterと同じ考え方にする（宛先の変換 → 経路 → firewall → 送信元の変換）。
   firewallは「宛先を戻した後、送信元を変える前」のアドレスを見る。慣れた順番なので説明しやすい。
 - トンネルを外したり包んだりした後の「受信し直し」「引き直し」は同じworkerの中で行う。
-  段数に上限（2段）を設け、超えたら捨てる。
+  別のVRFでの引き直しも同じ扱い。段数に上限（トンネルと合わせて2段）を設け、超えたら捨てる。
 - IPv6ではルータは分割しない。Packet Too Bigを返すだけ。
 
 ### ルータ自身が送るパケット（kernelからTUNで出てきたもの）

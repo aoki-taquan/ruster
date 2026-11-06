@@ -72,7 +72,7 @@ VRF（一つのルータの中に、互いに独立した経路表を複数持�
 
 - インターフェースはどれか一つのVRFに属する。何も指定しなければ`default`。
 - FIB、NAT、firewallの表はVRFごとに分かれる。近隣の表はインターフェースに属するので、VRFを持たない。
-- `ruster-ribd`はVRFごとに経路を選ぶ。VRFの間で経路を漏らす仕組みは後で考える。
+- `ruster-ribd`はVRFごとに経路を選ぶ。VRFの間で経路を漏らすのもribdで、FEは「別のVRFのインターフェースへ送る」と「別のVRFで引き直す」だけを持つ。
 - ルータ宛ての通信もVRFを保つ。VRFごとにTUNを持ち、kernel側はLinuxのVRFデバイスで分ける（[`fe-ce-split.md`](fe-ce-split.md)）。
 - VRFの定義には標準の`ietf-network-instance`（RFC 8529）の形を使う。
 
