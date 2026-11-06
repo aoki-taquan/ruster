@@ -1204,6 +1204,10 @@ pub struct ForwardingSnapshot<'a> {
     /// [`Self::with_input_firewall`], whose rules the owner's lists do not
     /// describe, so those walk linearly. Also in the padding.
     input_firewall_indexed: bool,
+    /// Whether every valid ARP packet goes to the control side instead of
+    /// being learned or answered here
+    /// ([`ForwardingSnapshot::with_arp_to_control`]).
+    arp_to_control: bool,
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
     /// Without it every lookup uses the linear reference (PERF-002).
@@ -1397,6 +1401,7 @@ impl<'a> ForwardingSnapshot<'a> {
             input_firewall_rules: &[],
             input_firewall_default: crate::InputFirewallAction::Accept,
             input_firewall_indexed: false,
+            arp_to_control: false,
             index: None,
             authority: calculate_snapshot_authority(
                 routes,
@@ -1443,6 +1448,21 @@ impl<'a> ForwardingSnapshot<'a> {
         Self {
             arp,
             authority,
+            ..self
+        }
+    }
+
+    /// Returns this snapshot with ARP handed to the control side when `on`.
+    ///
+    /// Each valid ARP packet (after the sender hardware address checks) is
+    /// consumed as [`ConsumeReason::ArpControl`] without learning or a
+    /// reply, and reported as [`TraceEvent::ArpToControl`] so the caller
+    /// can pass it to the neighbor process (docs/design/fe-ce-split.md:
+    /// ARP/ND belongs to the control side).
+    #[must_use]
+    pub fn with_arp_to_control(self, on: bool) -> Self {
+        Self {
+            arp_to_control: on,
             ..self
         }
     }
@@ -1615,6 +1635,7 @@ impl<'a> ForwardingSnapshot<'a> {
             // The owner's lists (if any) were built from its own rules,
             // not from `rules`: walk these linearly.
             input_firewall_indexed: false,
+            arp_to_control: false,
             authority,
             ..self
         })
@@ -1978,6 +1999,7 @@ impl ValidatedForwardingOwner {
             input_firewall_rules: &self.input_firewall_rules,
             input_firewall_default: self.input_firewall_default,
             input_firewall_indexed: true,
+            arp_to_control: false,
             index: Some(&self.index),
             authority: self.authority,
         }
@@ -2310,6 +2332,15 @@ pub enum TraceEvent {
     ArpControl {
         ingress: IfId,
         disposition: ControlDisposition,
+    },
+    /// A valid ARP packet consumed for the control side
+    /// ([`ForwardingSnapshot::with_arp_to_control`]).
+    ArpToControl {
+        ingress: IfId,
+        opcode: ArpOpcode,
+        sender_hardware: crate::MacAddress,
+        sender_protocol: crate::Ipv4Address,
+        target_protocol: crate::Ipv4Address,
     },
     Routed {
         egress: IfId,
@@ -8927,6 +8958,16 @@ fn decide_arp<T: TraceSink>(
     }
     if sha[0] & 1 != 0 {
         return Err(ArpSenderHardwareMulticast);
+    }
+    if snapshot.arp_to_control {
+        trace.record(TraceEvent::ArpToControl {
+            ingress,
+            opcode: arp.opcode,
+            sender_hardware: arp.sender_hardware,
+            sender_protocol: arp.sender_protocol,
+            target_protocol: arp.target_protocol,
+        });
+        return Ok(PacketDecision::ConsumeArp(ControlDisposition::Ignored));
     }
     let target_local = snapshot.is_local_ipv4_on(ingress, arp.target_protocol);
     let sender_local = snapshot.is_local_ipv4_on(ingress, arp.sender_protocol);
