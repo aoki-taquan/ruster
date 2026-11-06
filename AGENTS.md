@@ -1,13 +1,40 @@
 # Agent policy
 
-このrepositoryで作業するagentは次を守る。
+作業の前に[`docs/charter.md`](docs/charter.md)を読む。何を作るかの判断はcharterに従う。
 
-- main agentは調整、計画、成果統合だけを担当し、コードを書かない。
-- 実装とレビューは別々のsubagentへ委譲する。実装者は自分の変更を検証するが、
-  独立レビューの代わりにはしない。
-- agentは安全かつscope内ならcommit、push、PR作成、check監視、mergeを自動で進めてよい。
-- prototype-v0.1からRust実装をcopyまたは改変しない。RFC根拠とblack-boxの
-  入力/期待値だけを再利用できる。
-- fast pathへ共有`Mutex`、packet clone、packet単位`String`、`dyn PacketIo`を入れない。
-- 新しいbackendはbackend所有bufferをcoreへ借用させ、完了slotをcommitまたはrecycleする。
-- 変更後はREADMEに記載したformat、clippy、test、doc、checkを実行する。
+## 判断
+
+- 新機能、scope、順序、milestoneはownerが決める。agentは提案までで、自分の判断で進めない。
+- 今の利用目標に必要ない機能は作らない。RFCに書いてある、レビューで指摘された、は
+  それだけでは作業の理由にならない。
+
+## 作業の単位
+
+- 1 PRに目的は一つ。テストを除く差分はおおむね500行まで。超えそうなら先に分け方を提案する。
+- 機能追加のPRはownerがapproveしてからmergeする。fix、test、docs、choreはCIが通れば
+  agentがmergeしてよい。
+- PRのタイトルと本文は人が読む前提で、普通の言葉で書く。要件IDは本文の末尾に一行だけ。
+
+## 実装とレビュー
+
+- 実装は一つのagentが通しで行い、下の確認を自分で通す。
+- 独立レビューを別agentに頼むのは、unsafe/FFI/syscall、NATやfirewallの状態、
+  設定の反映や再読み込みに触る変更だけ。
+- mergeを止めるのはCriticalとHighの指摘だけ。Medium以下は`docs/backlog.md`に一行で残し、
+  そのためだけのPRは作らない。
+
+## 守ること
+
+- `prototype-v0.1`のRust実装をcopyしたり改変して使ったりしない。RFCと、入力と期待値の例だけ使える。
+- 転送の処理経路に、共有`Mutex`、パケットのclone、パケットごとの`String`、`dyn PacketIo`を入れない。
+- パケットのbufferはI/O層が持ち、転送部はそれを借りるだけ。借りたbufferは必ず送信か返却で終える。
+
+## 書き方
+
+- 普通の言葉で書く。新しい造語を作らない。
+- READMEは200行以内。現在の進み具合は一か所だけに書く。
+- 文書は追記より書き換えと削除を優先する。
+
+## 確認
+
+変更後はREADMEの「開発」にあるformat、clippy、test、doc、checkを実行する。
