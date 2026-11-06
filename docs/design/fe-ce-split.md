@@ -124,5 +124,5 @@ FEが転送として処理する。DPUのホスト宛て通信もFEの普通の�
 
 - メッセージの形式と最初の表は[`control-protocol.md`](control-protocol.md)で叩き台を作った。
 - FEとkernelの間で、ルータ自身が送る通信の送信元アドレスをどう選ぶか。
-- VRFや複数テナントをどう表すか（router as a serviceの段階で決める）。
+- VRFごとのルータ宛て通信をkernel側でどう分けるか（VRFは基本機能として最初から持つ。[`overview.md`](overview.md)）。
 - 今のコードのうち、FEに残すもの、CEへ移すもの、捨てるものの分類。

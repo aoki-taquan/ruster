@@ -50,6 +50,9 @@ YANGで「何を送れるか」が決まり、CEのどのプロセスも同じ�
 ```yang
 module ruster-fib {
   container fib {
+   list vrf {
+    key "name";                        // ietf-network-instanceの名前。既定は"default"
+    leaf name { type string; }
     list route {
       key "destination-prefix";        // 例: "192.0.2.0/24"、"2001:db8::/32"
       choice action {
@@ -65,11 +68,12 @@ module ruster-fib {
         case reject  { leaf reject  { type empty; } }  // ICMP Unreachableを返す
       }
     }
+   }
   }
 }
 ```
 
-VRFはまだ入れない。router as a serviceの段階で`fib`をVRFごとのリストにする。
+経路はVRFごとに分かれる（[`overview.md`](overview.md)の「VRF」）。
 
 ### `ruster-neighbor`の形（案）
 
