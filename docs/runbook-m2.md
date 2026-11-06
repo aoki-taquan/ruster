@@ -3126,7 +3126,11 @@ traceroute. Raise the limit only if a legitimate tool is being cut off.
   effect at the commit, exactly like the `[arp]` switches: switching one
   off cancels that port's running sequence or drops its owed defense
   (`arp_announce.cancelled`), and a link-up or startup trigger on a port
-  with announcements off counts `arp_announce.disabled`. Conflict
+  with announcements off counts `arp_announce.disabled`. Switching
+  announcements on by reload (`[arp] announce` or `arp-announce`) does not
+  by itself re-announce an unchanged address: it takes effect at the
+  port's next trigger (startup, link-up, or a reload that adds or changes
+  its address). Conflict
   detection, `arp_announce.conflicts`, `ifN.watch.arp_address_conflicts`
   and the `ARP_ADDRESS_CONFLICT` warning stay on for every port.
   `arp-conflict-defense = false` is the same operator-selected RFC 5227

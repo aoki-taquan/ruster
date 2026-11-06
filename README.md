@@ -295,7 +295,9 @@ defenseします（sequenceとは別の1 frame）。`watch.state`は`ok`のま�
 `arp-conflict-defense`（true/false）で上書きできます（ARP-040）。keyが無ければ`[arp]`の値を
 継承します。主な用途はISPと共有するL2 segmentのWAN portでAnnouncementだけ（または両方）を
 止めることです。reload可能で、commitで即時に効きます（offにすると実行中のsequenceを止め、
-未送信のdefenseを捨てる。`[arp]`と同じ）。conflictの検出・計数・warningは両方offでも続きます。
+未送信のdefenseを捨てる。`[arp]`と同じ）。reloadでonにしても（`[arp] announce`でも`arp-announce`でも）
+変わらないaddressをそれだけでは再announceせず、次のtrigger（起動、link-up、addressの追加・変更）から
+効きます。conflictの検出・計数・warningは両方offでも続きます。
 `arp-conflict-defense = false`はそのinterfaceだけのoperatorが選ぶRFC 5227 §2.4のdeviationです
 （ARP-038）。`ruster plan`は`arp-interface + if2 announce off conflict-defense inherit`の
 ように表示します。
