@@ -28,10 +28,10 @@ YANGで「何を送れるか」が決まり、CEのどのプロセスも同じ�
 
 | 表 | YANGモジュール | SID | 書き手 | socket |
 |---|---|---|---|---|
-| インターフェース | `ietf-interfaces`（RFC 8343） | IANA割り当て済み（1500から100個） | 設定管理 | `/run/ruster/fe/config.sock` |
-| アドレス、MTU | `ietf-ip`（RFC 8344）のipv4/ipv6のうちaddressとmtu | IANA割り当て済み（1600から100個） | 設定管理 | 同上 |
-| 経路（FIB） | `ruster-fib`（独自） | 独自の範囲（下） | 経路デーモン | `/run/ruster/fe/route.sock` |
-| 近隣 | `ruster-neighbor`（独自） | 独自の範囲（下） | 近隣デーモン | `/run/ruster/fe/neigh.sock` |
+| インターフェース | `ietf-interfaces`（RFC 8343） | IANA割り当て済み（1500から100個） | `ruster-confd` | `/run/ruster/fe/config.sock` |
+| アドレス、MTU | `ietf-ip`（RFC 8344）のipv4/ipv6のうちaddressとmtu | IANA割り当て済み（1600から100個） | `ruster-confd` | 同上 |
+| 経路（FIB） | `ruster-fib`（独自） | 独自の範囲（下） | `ruster-ribd` | `/run/ruster/fe/route.sock` |
+| 近隣 | `ruster-neighbor`（独自） | 独自の範囲（下） | `ruster-neighd` | `/run/ruster/fe/neigh.sock` |
 
 読み取り専用の`/run/ruster/fe/state.sock`では、全部の表と運用状態（カウンタ、リンク状態、FEが割り当てた
 `if-index`）を読める。`show`はここを使う。
@@ -115,7 +115,7 @@ CORECONFと同じく、FEには設定と状態をまとめた一つの「デー�
 
 ### 大きい表の再同期
 
-経路デーモンが再起動すると、BGPのフルルート（約100万経路）を送り直すことがある。一回のメッセージには
+`ruster-ribd`が再起動すると、BGPのフルルート（約100万経路）を送り直すことがある。一回のメッセージには
 収まらないので、次の手順にする。
 
 1. POST `resync-begin`: FEはその書き手の全エントリに「未確認」の印を付ける。転送は今の表のまま続く。
