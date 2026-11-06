@@ -10,6 +10,7 @@ members = [
     "crates/io-sim",
     "crates/io-xdp",
     "crates/io-xdp-native",
+    "crates/proto",
     "crates/runtime",
     "crates/sim-scenario",
 ]
