@@ -293,8 +293,9 @@ fn by_value_active_view_is_bounded_tick_local_and_steady_o1() {
         );
         // URPF: +16 bytes, the source validation slice of the snapshot;
         // INPUT-FW: +16 bytes, the input firewall rules slice; ARP-040: +16
-        // bytes, the per-interface ARP override slice.
-        assert!(size_of::<FullServiceView<'static, 'static>>() <= 744);
+        // bytes, the per-interface ARP override slice; +8 bytes, the
+        // ARP-to-control flag rounding the snapshot up.
+        assert!(size_of::<FullServiceView<'static, 'static>>() <= 752);
     }
 
     counting::self_check();
