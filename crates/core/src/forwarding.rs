@@ -3061,8 +3061,8 @@ where
         firewall_config,
         firewall,
         None,
-        None,
-        None,
+        services.fragmentation,
+        services.fragment_tracking,
         None,
         Some(control),
         trace,
@@ -3079,6 +3079,13 @@ pub struct Services<'s, 'c, 'r> {
     pub nat44_tcp: Option<(&'s Nat44TcpConfig, &'s mut Nat44TcpRuntime<'r>)>,
     pub nat44_icmp: Option<(&'s Nat44IcmpConfig, &'s mut Nat44IcmpRuntime<'r>)>,
     pub firewall: Option<(&'s FirewallConfig<'c>, &'s mut FirewallRuntime<'r>)>,
+    /// Cuts datagrams longer than the egress MTU that may be fragmented (RFC 791);
+    /// without it they are dropped. Its fragments are sent with
+    /// [`crate::execute_one_ipv4_fragmentation`] after the batch.
+    pub fragmentation: Option<&'s mut Ipv4FragmentationRuntime<'r>>,
+    /// Associates the fragments of a datagram with its first fragment, so NAT
+    /// and the firewall treat them as it (NAT-FRAG); without it NAT drops them.
+    pub fragment_tracking: Option<&'s mut Ipv4FragmentTracker<'r>>,
 }
 
 /// Forwards RX packets and queues resolution actions without allocating TX
