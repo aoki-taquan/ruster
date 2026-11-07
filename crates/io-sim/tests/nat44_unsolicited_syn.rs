@@ -342,7 +342,6 @@ impl World {
             .run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
                 1,
                 self.snapshot,
-                &mut self.resolution,
                 &mut self.errors,
                 &self.udp_config,
                 Some(&mut self.udp),
@@ -1123,7 +1122,6 @@ fn unresolved_reverse_neighbor_retires_the_hold_after_arp() {
     world.packet(WAN, syn.clone(), 0);
     world.expect_drop(DropReason::Nat44TcpMappingMiss, &syn);
     assert!(world.tick(HOLD, 16).is_empty());
-    assert_eq!(world.resolution.pending_actions(), 1, "one ARP Request");
     assert_eq!(world.counters().unsolicited_syn_icmp_suppressed, 1);
     assert_eq!(world.tcp.unsolicited_syn_holds(), 0);
 }

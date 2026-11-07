@@ -11,8 +11,7 @@ use ruster_core::{
     Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
     MonotonicMillis, Nat44Filtering, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy,
     Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy,
-    Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route,
+    Neighbor, NoTrace, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -83,17 +82,6 @@ fn topology() -> (
                 address: PUBLIC,
             },
         ],
-    )
-}
-
-fn resolution<'a>(
-    states: &'a mut [ResolutionStateSlot],
-    actions: &'a mut [ResolutionActionSlot],
-) -> ResolutionRuntime<'a> {
-    ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 2_000).unwrap(),
-        states,
-        actions,
     )
 }
 
@@ -262,16 +250,12 @@ fn udp_filtering_modes_admit_and_reject_inbound_per_rfc4787() {
         let mut peers = [Nat44UdpPeerSlot::default(); 4];
         let mut indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
         let mut nat = indexes.runtime(config, &mut mappings, &mut peers);
-        let mut states = [ResolutionStateSlot::EMPTY; 1];
-        let mut actions = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = resolution(&mut states, &mut actions);
         let mut io = SimIo::new();
-        let mut run = |io: &mut SimIo, nat: &mut _, packet: Vec<u8>, ingress: IfId, now: u64| {
+        let run = |io: &mut SimIo, nat: &mut _, packet: Vec<u8>, ingress: IfId, now: u64| {
             io.inject(ingress, packet);
             io.run_nat44_udp_once(
                 1,
                 &snapshot,
-                &mut resolution,
                 &config,
                 Some(nat),
                 MonotonicMillis(now),
@@ -349,16 +333,12 @@ fn tcp_filtering_modes_gate_inbound_initial_syn_per_rfc5382() {
         let mut mappings = [Nat44TcpMappingSlot::default(); 1];
         let mut sessions = [Nat44TcpSessionSlot::default(); 4];
         let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
-        let mut states = [ResolutionStateSlot::EMPTY; 1];
-        let mut actions = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = resolution(&mut states, &mut actions);
         let mut io = SimIo::new();
-        let mut run = |io: &mut SimIo, nat: &mut _, packet: Vec<u8>, ingress: IfId, now: u64| {
+        let run = |io: &mut SimIo, nat: &mut _, packet: Vec<u8>, ingress: IfId, now: u64| {
             io.inject(ingress, packet);
             io.run_nat44_tcp_once(
                 1,
                 &snapshot,
-                &mut resolution,
                 &config,
                 Some(nat),
                 MonotonicMillis(now),
@@ -465,16 +445,12 @@ fn tcp_address_dependent_admission_requires_a_live_session_with_the_address() {
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 4];
     let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     let mut run = |io: &mut SimIo, packet: Vec<u8>, ingress: IfId, now: u64| {
         io.inject(ingress, packet);
         io.run_nat44_tcp_once(
             1,
             &snapshot,
-            &mut resolution,
             &config,
             Some(&mut nat),
             MonotonicMillis(now),
@@ -505,9 +481,6 @@ fn tcp_inbound_initiation_respects_session_capacity_without_eviction() {
     let mut mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     io.inject(LAN, tcp(HOST, REMOTE1, PORT, 443, SYN));
     let syn = tcp(REMOTE2, PUBLIC, 443, PORT, SYN);
@@ -515,7 +488,6 @@ fn tcp_inbound_initiation_respects_session_capacity_without_eviction() {
     io.run_nat44_tcp_once(
         2,
         &snapshot,
-        &mut resolution,
         &config,
         Some(&mut nat),
         MonotonicMillis(0),
@@ -565,9 +537,6 @@ fn truncated_datagram_to_the_public_address_is_silent_with_a_firewall() {
         let mut tcp_nat = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
         let mut firewall_slots = [FirewallStateSlot::default(); 4];
         let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
-        let mut states = [ResolutionStateSlot::EMPTY; 1];
-        let mut actions = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = resolution(&mut states, &mut actions);
         let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 4];
         let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 4];
         let mut errors = Icmpv4ErrorRuntime::new(
@@ -581,7 +550,6 @@ fn truncated_datagram_to_the_public_address_is_silent_with_a_firewall() {
             io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
                 1,
                 &snapshot,
-                &mut resolution,
                 &mut errors,
                 &udp_config,
                 Some(&mut udp_nat),
@@ -597,7 +565,6 @@ fn truncated_datagram_to_the_public_address_is_silent_with_a_firewall() {
             io.run_nat44_udp_and_tcp_with_icmpv4_errors_once(
                 1,
                 &snapshot,
-                &mut resolution,
                 &mut errors,
                 &udp_config,
                 Some(&mut udp_nat),
@@ -739,21 +706,17 @@ fn looser_nat_filtering_never_bypasses_the_firewall() {
             let firewall_config = firewall_config(&snapshot, rules);
             let mut firewall_slots = [FirewallStateSlot::default(); 8];
             let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
-            let mut states = [ResolutionStateSlot::EMPTY; 1];
-            let mut actions = [ResolutionActionSlot::EMPTY; 1];
-            let mut resolution = resolution(&mut states, &mut actions);
             let mut io = SimIo::new();
-            let mut run = |io: &mut SimIo,
-                           udp_nat: &mut _,
-                           tcp_nat: &mut _,
-                           firewall: &mut _,
-                           packet: Vec<u8>,
-                           ingress: IfId| {
+            let run = |io: &mut SimIo,
+                       udp_nat: &mut _,
+                       tcp_nat: &mut _,
+                       firewall: &mut _,
+                       packet: Vec<u8>,
+                       ingress: IfId| {
                 io.inject(ingress, packet);
                 io.run_nat44_udp_and_tcp_with_firewall_once(
                     1,
                     &snapshot,
-                    &mut resolution,
                     &udp_config,
                     Some(udp_nat),
                     &tcp_config,
@@ -857,9 +820,6 @@ fn endpoint_independent_filtering_keeps_the_external_to_internal_bypass_closed()
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp_nat = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     for outbound in [
         udp(HOST, REMOTE1, PORT, 53),
@@ -870,7 +830,6 @@ fn endpoint_independent_filtering_keeps_the_external_to_internal_bypass_closed()
     io.run_nat44_udp_and_tcp_once(
         2,
         &snapshot,
-        &mut resolution,
         &udp_config,
         Some(&mut udp_nat),
         &tcp_config,
@@ -889,7 +848,6 @@ fn endpoint_independent_filtering_keeps_the_external_to_internal_bypass_closed()
         io.run_nat44_udp_and_tcp_once(
             1,
             &snapshot,
-            &mut resolution,
             &udp_config,
             Some(&mut udp_nat),
             &tcp_config,
@@ -900,7 +858,6 @@ fn endpoint_independent_filtering_keeps_the_external_to_internal_bypass_closed()
         .unwrap();
         assert_drop(&mut io, DropReason::Nat44ExternalToInternalBypass, &direct);
     }
-    assert_eq!(resolution.pending_actions(), 0);
     assert_eq!(tcp_nat.counters().inbound_sessions_created, 0);
 }
 
@@ -949,9 +906,6 @@ fn unsolicited_inbound_syn_is_silently_dropped_by_the_full_worker() {
     let firewall_config = firewall_config(&snapshot, &rules);
     let mut firewall_slots = [FirewallStateSlot::default(); 4];
     let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = resolution(&mut states, &mut actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 4];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 4];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -970,7 +924,6 @@ fn unsolicited_inbound_syn_is_silently_dropped_by_the_full_worker() {
         io.run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
             1,
             &snapshot,
-            &mut resolution,
             errors,
             &udp_config,
             Some(&mut udp_nat),
@@ -1021,7 +974,6 @@ fn unsolicited_inbound_syn_is_silently_dropped_by_the_full_worker() {
     );
     assert_tx(&mut io, WAN, (PUBLIC, PORT), (REMOTE1, 443));
     assert_eq!(errors.pending_actions(), 0);
-    assert_eq!(resolution.pending_actions(), 0);
     assert!(io.pop_tx().is_none());
     assert_eq!(tcp_nat.counters().inbound_sessions_created, 0);
 }
@@ -1057,16 +1009,12 @@ fn spoofed_syns_are_capped_per_remote_and_inside_hosts_keep_capacity() {
         let mut mappings = [Nat44TcpMappingSlot::default(); 1];
         let mut sessions = [Nat44TcpSessionSlot::default(); 16];
         let mut nat = support::tcp_runtime(config, &mut mappings, &mut sessions);
-        let mut states = [ResolutionStateSlot::EMPTY; 1];
-        let mut actions = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = resolution(&mut states, &mut actions);
         let mut io = SimIo::new();
-        let mut run = |io: &mut SimIo, nat: &mut _, packet: Vec<u8>, ingress: IfId, now: u64| {
+        let run = |io: &mut SimIo, nat: &mut _, packet: Vec<u8>, ingress: IfId, now: u64| {
             io.inject(ingress, packet);
             io.run_nat44_tcp_once(
                 1,
                 &snapshot,
-                &mut resolution,
                 &config,
                 Some(nat),
                 MonotonicMillis(now),

@@ -826,7 +826,6 @@ impl World {
             self.io.run_nat44_udp_once(
                 1,
                 &self.snapshot,
-                &mut self.resolution,
                 &self.udp_config,
                 Some(&mut self.udp),
                 now,
@@ -836,7 +835,6 @@ impl World {
             self.io.run_nat44_tcp_once(
                 1,
                 &self.snapshot,
-                &mut self.resolution,
                 &self.tcp_config,
                 Some(&mut self.tcp),
                 now,

@@ -1012,7 +1012,6 @@ struct Routed {
     snapshot: ForwardingSnapshot<'static>,
     config: FirewallConfig<'static>,
     firewall: FirewallRuntime<'static>,
-    resolution: ResolutionRuntime<'static>,
     io: SimIo,
     now: u64,
 }
@@ -1037,11 +1036,6 @@ impl Routed {
             snapshot,
             config,
             firewall: FirewallRuntime::new(config, leak([FirewallStateSlot::default(); 16])),
-            resolution: ResolutionRuntime::new(
-                ResolutionPolicy::new(1_000, 2_000).unwrap(),
-                leak([ResolutionStateSlot::EMPTY; 2]),
-                leak([ResolutionActionSlot::EMPTY; 2]),
-            ),
             io: SimIo::new(),
             now: 1_000,
         }
@@ -1054,7 +1048,6 @@ impl Routed {
             .run_firewall_once(
                 1,
                 &self.snapshot,
-                &mut self.resolution,
                 &self.config,
                 Some(&mut self.firewall),
                 MonotonicMillis(self.now),

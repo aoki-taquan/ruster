@@ -165,7 +165,6 @@ struct World {
     tcp: Nat44TcpRuntime<'static>,
     firewall_config: Option<FirewallConfig<'static>>,
     firewall: Option<FirewallRuntime<'static>>,
-    resolution: ResolutionRuntime<'static>,
     io: SimIo,
     now: u64,
 }
@@ -263,7 +262,7 @@ impl World {
             }
             None => (None, None),
         };
-        let resolution = ResolutionRuntime::new(
+        let _resolution = ResolutionRuntime::new(
             ResolutionPolicy::new(1_000, 2_000).unwrap(),
             leak([ResolutionStateSlot::EMPTY; 2]),
             leak([ResolutionActionSlot::EMPTY; 2]),
@@ -276,7 +275,6 @@ impl World {
             tcp,
             firewall_config,
             firewall,
-            resolution,
             io: SimIo::new(),
             now: 0,
         }
@@ -291,7 +289,6 @@ impl World {
                 .run_nat44_udp_and_tcp_with_firewall_once(
                     1,
                     &self.snapshot,
-                    &mut self.resolution,
                     &self.udp_config,
                     Some(&mut self.udp),
                     &self.tcp_config,
@@ -307,7 +304,6 @@ impl World {
                 .run_nat44_udp_and_tcp_once(
                     1,
                     &self.snapshot,
-                    &mut self.resolution,
                     &self.udp_config,
                     Some(&mut self.udp),
                     &self.tcp_config,
@@ -332,7 +328,6 @@ impl World {
             .run_nat44_udp_and_tcp_with_firewall_audited_once(
                 1,
                 &self.snapshot,
-                &mut self.resolution,
                 &self.udp_config,
                 Some(&mut self.udp),
                 &self.tcp_config,

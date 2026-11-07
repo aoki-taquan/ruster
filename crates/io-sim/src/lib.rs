@@ -11,7 +11,7 @@ use ruster_core::{
     GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId, MonotonicMillis,
     Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch, PacketIo,
     PacketLease, PacketSlot, PublicationQuiescence, PublicationQuiescenceDisposition,
-    PublicationQuiescenceGuard, ResolutionRuntime, Services, SlotCompletion, TraceEvent, TraceSink,
+    PublicationQuiescenceGuard, Services, SlotCompletion, TraceEvent, TraceSink,
 };
 use ruster_core::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
 
@@ -268,13 +268,11 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         config: &Nat44UdpConfig,
         nat44_udp: Option<&mut Nat44UdpRuntime<'r>>,
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_udp: nat44_udp.map(|runtime| (config, runtime)),
             ..Services::default()
@@ -287,13 +285,11 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         config: &Nat44TcpConfig,
         nat44_tcp: Option<&mut Nat44TcpRuntime<'r>>,
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_tcp: nat44_tcp.map(|runtime| (config, runtime)),
             ..Services::default()
@@ -306,7 +302,6 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         udp_config: &Nat44UdpConfig,
         nat44_udp: Option<&mut Nat44UdpRuntime<'r>>,
         tcp_config: &Nat44TcpConfig,
@@ -314,7 +309,6 @@ impl SimIo {
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_udp: nat44_udp.map(|runtime| (udp_config, runtime)),
             nat44_tcp: nat44_tcp.map(|runtime| (tcp_config, runtime)),
@@ -330,7 +324,6 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         icmpv4_errors: &mut ruster_core::Icmpv4ErrorRuntime<'r>,
         udp_config: &Nat44UdpConfig,
         nat44_udp: Option<&mut Nat44UdpRuntime<'r>>,
@@ -339,7 +332,6 @@ impl SimIo {
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_udp: nat44_udp.map(|runtime| (udp_config, runtime)),
             nat44_tcp: nat44_tcp.map(|runtime| (tcp_config, runtime)),
@@ -354,13 +346,11 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         config: &FirewallConfig<'_>,
         firewall: Option<&mut FirewallRuntime<'r>>,
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             firewall: firewall.map(|runtime| (config, runtime)),
             ..Services::default()
@@ -373,14 +363,12 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         config: &FirewallConfig<'_>,
         firewall: Option<&mut FirewallRuntime<'r>>,
         audit: &mut FirewallAuditBuffer<'r>,
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             firewall: firewall.map(|runtime| (config, runtime)),
             firewall_audit: Some(audit),
@@ -394,14 +382,12 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         icmpv4_errors: &mut ruster_core::Icmpv4ErrorRuntime<'r>,
         config: &FirewallConfig<'_>,
         firewall: Option<&mut FirewallRuntime<'r>>,
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             firewall: firewall.map(|runtime| (config, runtime)),
             icmpv4_errors: Some(icmpv4_errors),
@@ -415,7 +401,6 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         udp_config: &Nat44UdpConfig,
         nat44_udp: Option<&mut Nat44UdpRuntime<'r>>,
         tcp_config: &Nat44TcpConfig,
@@ -425,7 +410,6 @@ impl SimIo {
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_udp: nat44_udp.map(|runtime| (udp_config, runtime)),
             nat44_tcp: nat44_tcp.map(|runtime| (tcp_config, runtime)),
@@ -440,7 +424,6 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         udp_config: &Nat44UdpConfig,
         nat44_udp: Option<&mut Nat44UdpRuntime<'r>>,
         tcp_config: &Nat44TcpConfig,
@@ -451,7 +434,6 @@ impl SimIo {
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_udp: nat44_udp.map(|runtime| (udp_config, runtime)),
             nat44_tcp: nat44_tcp.map(|runtime| (tcp_config, runtime)),
@@ -467,7 +449,6 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         icmpv4_errors: &mut ruster_core::Icmpv4ErrorRuntime<'r>,
         udp_config: &Nat44UdpConfig,
         nat44_udp: Option<&mut Nat44UdpRuntime<'r>>,
@@ -478,7 +459,6 @@ impl SimIo {
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_udp: nat44_udp.map(|runtime| (udp_config, runtime)),
             nat44_tcp: nat44_tcp.map(|runtime| (tcp_config, runtime)),
@@ -494,7 +474,6 @@ impl SimIo {
         &mut self,
         budget: usize,
         snapshot: &ForwardingSnapshot<'_>,
-        resolution: &mut ResolutionRuntime<'_>,
         icmpv4_errors: &mut ruster_core::Icmpv4ErrorRuntime<'r>,
         udp_config: &Nat44UdpConfig,
         nat44_udp: Option<&mut Nat44UdpRuntime<'r>>,
@@ -506,7 +485,6 @@ impl SimIo {
         now: MonotonicMillis,
         trace: &mut T,
     ) -> Result<BatchReport<Infallible>, Infallible> {
-        let _ = resolution;
         let services = Services {
             nat44_udp: nat44_udp.map(|runtime| (udp_config, runtime)),
             nat44_tcp: nat44_tcp.map(|runtime| (tcp_config, runtime)),
