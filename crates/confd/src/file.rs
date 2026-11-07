@@ -10,6 +10,12 @@
 //! ipv6 = ["2001:db8:1::1/64"]  # optional; a link-local address is added by itself
 //! vrf = "red"                  # optional, "default" when left out
 //!
+//! [[interface]]                # a VLAN sub-interface of lan, after lan
+//! name = "lan.10"
+//! parent = "lan"
+//! vlan = 10                    # 1 to 4094; mac is lan's when left out
+//! ipv4 = "10.10.0.1/24"
+//!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
 //! interface = "wan"
@@ -66,7 +72,10 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct InterfaceEntry {
     name: String,
-    mac: String,
+    /// Optional for a VLAN sub-interface, which then has its parent's.
+    mac: Option<String>,
+    parent: Option<String>,
+    vlan: Option<u16>,
     #[serde(default = "default_mtu")]
     mtu: u16,
     #[serde(default = "default_enabled")]
@@ -178,8 +187,37 @@ pub fn parse(text: &str) -> Result<Config, String> {
             return Err(format!("{at}: vrf must not be empty"));
         }
         seen.vrf_of.insert(entry.name.clone(), entry.vrf.clone());
-        let mac =
-            mac(&entry.mac).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?;
+        let vlan = match (&entry.parent, entry.vlan) {
+            (Some(parent), Some(id)) => {
+                if !(1..=4094).contains(&id) {
+                    return Err(format!("{at}: vlan must be 1 to 4094"));
+                }
+                let Some(parent_entry) = interfaces
+                    .iter()
+                    .find(|i: &&InterfaceConfig| i.name == *parent && i.vlan.is_none())
+                else {
+                    return Err(format!(
+                        "{at}: parent {parent:?} must be an interface given before it, not a VLAN"
+                    ));
+                };
+                let taken = interfaces
+                    .iter()
+                    .any(|i| i.vlan.as_ref() == Some(&(parent.clone(), id)));
+                if taken {
+                    return Err(format!("{at}: vlan {id} on {parent:?} is given twice"));
+                }
+                Some((parent.clone(), id, parent_entry.mac))
+            }
+            (None, None) => None,
+            _ => return Err(format!("{at}: give parent and vlan together")),
+        };
+        let mac = match (&entry.mac, &vlan) {
+            (Some(text), _) => {
+                mac(text).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?
+            }
+            (None, Some((_, _, parent_mac))) => *parent_mac,
+            (None, None) => return Err(format!("{at}: mac is missing")),
+        };
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(format!("{at}: mac must be a unicast address"));
         }
@@ -228,6 +266,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ipv4,
             ipv6,
             vrf: entry.vrf,
+            vlan: vlan.map(|(parent, id, _)| (parent, id)),
         });
     }
     let mut static_routes = Vec::with_capacity(file.route.len());

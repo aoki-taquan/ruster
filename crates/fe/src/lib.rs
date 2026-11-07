@@ -32,7 +32,7 @@ use ruster_core::{
     execute_one_icmpv4_error, forward_batch_with_control, ArpOpcode, ControlKind, ControlQueue,
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
-    MonotonicMillis, PacketIo, TraceEvent, TraceSink,
+    MonotonicMillis, PacketIo, TraceEvent, TraceSink, VlanBinding,
 };
 use ruster_proto::cbor::Encoder;
 use ruster_proto::punt::{self, Direction, Punt};
@@ -110,6 +110,9 @@ pub struct Fe<B> {
     by_ingress: Vec<u16>,
     /// The VRF names, in the order of `vrfs`.
     names: Vec<String>,
+    /// Every interface's name by id: the ports, then VLAN sub-interfaces.
+    interface_names: Vec<String>,
+    vlans: Vec<VlanBinding>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
     limiter: local::Limiter,
@@ -151,6 +154,8 @@ where
             vrfs: built.vrfs,
             by_ingress: built.by_ingress,
             names: built.names,
+            interface_names: built.interface_names,
+            vlans: built.vlans,
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
             active: built.active,
@@ -228,7 +233,9 @@ where
                     .with_local_to_control(self.local.contains_key(name))
             })
             .collect();
-        let snapshot = snapshots[0].with_vrfs(&snapshots, &self.by_ingress);
+        let snapshot = snapshots[0]
+            .with_vrfs(&snapshots, &self.by_ingress)
+            .with_vlans(&self.vlans);
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
             return false;
         };
@@ -288,7 +295,7 @@ where
 
     /// Sends `frame` to the neighbor process; counted with the ARP counters.
     fn punt_frame(&mut self, ingress: IfId, reason: u16, frame: &[u8]) {
-        let Some(name) = self.builder.ports.get(usize::from(ingress.0)) else {
+        let Some(name) = self.interface_names.get(usize::from(ingress.0)) else {
             return;
         };
         let Some(socket) = &self.punt else {
@@ -319,7 +326,7 @@ where
         if last.is_some_and(|at| now_ms.saturating_sub(at) < RESOLVE_INTERVAL_MS) {
             return;
         }
-        let Some(name) = self.builder.ports.get(usize::from(egress.0)) else {
+        let Some(name) = self.interface_names.get(usize::from(egress.0)) else {
             return;
         };
         if self.last_resolve.len() >= RESOLVE_REMEMBERED {
@@ -373,9 +380,7 @@ where
                 continue;
             };
             // Only out of an interface the current tables have enabled.
-            let egress = self
-                .builder
-                .port(punt.interface)
+            let egress = interface_id(&self.interface_names, punt.interface)
                 .filter(|id| self.active.contains(id));
             match (punt.direction, punt.reason, egress) {
                 (Direction::FromControl, reason, Some(egress))
@@ -463,11 +468,31 @@ where
         busy
     }
 
+    /// Sends `frame` out of `egress`; out of a VLAN sub-interface's parent, tagged,
+    /// for a sub-interface.
     fn send_generated(&mut self, egress: IfId, frame: &[u8]) -> bool {
-        let mut batch = self.io.begin_generated(egress);
-        let sent = match batch.allocate(frame.len()) {
+        let vlan = self.vlans.iter().find(|b| b.sub == egress).copied();
+        let (port, tag) = match vlan {
+            Some(binding) => (binding.parent, Some(binding.vid)),
+            None => (egress, None),
+        };
+        if frame.len() < ETHERNET_HEADER {
+            return false;
+        }
+        let extra = if tag.is_some() { 4 } else { 0 };
+        let mut batch = self.io.begin_generated(port);
+        let sent = match batch.allocate(frame.len() + extra) {
             Ok(mut lease) => {
-                lease.bytes_mut().copy_from_slice(frame);
+                let bytes = lease.bytes_mut();
+                match tag {
+                    Some(vid) => {
+                        bytes[..12].copy_from_slice(&frame[..12]);
+                        bytes[12..14].copy_from_slice(&[0x81, 0x00]);
+                        bytes[14..16].copy_from_slice(&(vid & 0x0fff).to_be_bytes());
+                        bytes[16..].copy_from_slice(&frame[12..]);
+                    }
+                    None => bytes.copy_from_slice(frame),
+                }
                 lease.commit();
                 true
             }
@@ -488,6 +513,8 @@ where
             self.vrfs = built.vrfs;
             self.by_ingress = built.by_ingress;
             self.names = built.names;
+            self.interface_names = built.interface_names;
+            self.vlans = built.vlans;
             self.active = built.active;
         }
         let worked = self.worker(now_ms);
@@ -528,11 +555,10 @@ struct Builder {
     built: Option<build::Built>,
 }
 
-impl Builder {
-    fn port(&self, name: &str) -> Option<IfId> {
-        let index = self.ports.iter().position(|port| port == name)?;
-        u16::try_from(index).ok().map(IfId)
-    }
+/// The id of the interface `name` (a port or a VLAN sub-interface) in `names`.
+fn interface_id(names: &[String], name: &str) -> Option<IfId> {
+    let index = names.iter().position(|n| n == name)?;
+    u16::try_from(index).ok().map(IfId)
 }
 
 impl Hook for Builder {
