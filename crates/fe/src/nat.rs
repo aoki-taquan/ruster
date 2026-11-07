@@ -63,37 +63,33 @@ impl Publication {
             inside,
             outside,
             public,
-            first,
-            last,
+            ports,
         } = nat;
         Ok(Self {
-            udp: Nat44UdpConfig::new(
+            udp: Nat44UdpConfig::with_port_set(
                 snapshot,
                 inside,
                 outside,
                 public,
-                first,
-                last,
+                ports,
                 Nat44UdpPolicy::default(),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
-            tcp: Nat44TcpConfig::new(
+            tcp: Nat44TcpConfig::with_port_set(
                 snapshot,
                 inside,
                 outside,
                 public,
-                first,
-                last,
+                ports,
                 Nat44TcpPolicy::default(),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
-            icmp: Nat44IcmpConfig::new(
+            icmp: Nat44IcmpConfig::with_port_set(
                 snapshot,
                 inside,
                 outside,
                 public,
-                first,
-                last,
+                ports,
                 Nat44IcmpPolicy::default(),
             )
             .map_err(|e| failed(format!("{e:?}")))?,

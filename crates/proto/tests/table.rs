@@ -600,8 +600,7 @@ fn nat_and_firewall_entries_round_trip_and_are_checked() {
                 inside: inside.into(),
                 outside: "wan".into(),
                 external: None,
-                first_port: first,
-                last_port: last,
+                ports: ruster_proto::table::NatPorts::Range { first, last },
             }),
         )
     };
@@ -686,4 +685,48 @@ fn tunnel_interfaces_round_trip_and_are_checked() {
         }),
     );
     assert!(both.validate().is_err());
+}
+
+#[test]
+fn a_nat_with_a_psid_port_set_round_trips_and_is_checked() {
+    use ruster_proto::table::{Nat, NatPorts};
+    let nat = |ports: NatPorts| {
+        Change::set(
+            Key::Nat {
+                vrf: "default".into(),
+            },
+            Value::Nat(Nat {
+                inside: "lan".into(),
+                outside: "map".into(),
+                external: None,
+                ports,
+            }),
+        )
+    };
+    let good = nat(NatPorts::Psid {
+        offset: 6,
+        length: 6,
+        psid: 0x34,
+    });
+    assert!(good.validate().is_ok());
+    assert_eq!(round_trip(&good), good);
+    for bad in [
+        NatPorts::Psid {
+            offset: 6,
+            length: 0,
+            psid: 0,
+        },
+        NatPorts::Psid {
+            offset: 8,
+            length: 8,
+            psid: 1,
+        },
+        NatPorts::Psid {
+            offset: 6,
+            length: 6,
+            psid: 64,
+        },
+    ] {
+        assert!(nat(bad).validate().is_err(), "{bad:?}");
+    }
 }

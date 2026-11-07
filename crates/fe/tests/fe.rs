@@ -1005,8 +1005,10 @@ fn nat(first_port: u16, last_port: u16) -> Change {
             inside: "lan".into(),
             outside: "wan".into(),
             external: None,
-            first_port,
-            last_port,
+            ports: ruster_proto::table::NatPorts::Range {
+                first: first_port,
+                last: last_port,
+            },
         }),
     )
 }
@@ -1368,4 +1370,27 @@ fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
     );
     assert_eq!(u16::from_be_bytes([icmp[26], icmp[27]]), 1460);
     assert_eq!(&icmp[28..48], &big[..20], "the quoted header");
+}
+
+#[test]
+fn nat_with_a_psid_port_set_uses_its_ports() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    let mut change = nat(1, 1);
+    if let Some(Value::Nat(nat)) = &mut change.value {
+        nat.ports = ruster_proto::table::NatPorts::Psid {
+            offset: 6,
+            length: 6,
+            psid: 0x34,
+        };
+    }
+    assert_eq!(bench.patch(&mut config, &[change]), Code::CHANGED);
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(bench.now);
+    let out = bench.fe.io_mut().pop_tx().expect("translated");
+    let port = u16::from_be_bytes([out.bytes[34], out.bytes[35]]);
+    assert_eq!((port >> 4) & 0x3f, 0x34, "the PSID bits of {port}");
+    assert!(port >> 10 != 0, "not a well-known port");
 }

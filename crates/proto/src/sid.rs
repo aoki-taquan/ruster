@@ -50,6 +50,10 @@ pub const NAT_OUTSIDE: u64 = 60062;
 pub const NAT_EXTERNAL: u64 = 60063;
 pub const NAT_FIRST_PORT: u64 = 60064;
 pub const NAT_LAST_PORT: u64 = 60065;
+/// `ietf-nat` `port-set-restrict/port-set`: a MAP-E port set (RFC 7597 section 5.1).
+pub const NAT_PSID_OFFSET: u64 = 60066;
+pub const NAT_PSID_LENGTH: u64 = 60067;
+pub const NAT_PSID: u64 = 60068;
 
 /// One forward firewall rule (`ietf-access-control-list` ace, `ruster-firewall`).
 pub const FIREWALL_RULE: u64 = 60070;
@@ -137,6 +141,9 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ietf-nat:nat/instances/instance/policy/external-ip-address-pool/external-ip-pool", NAT_EXTERNAL),
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-range/start-port-number", NAT_FIRST_PORT),
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-range/end-port-number", NAT_LAST_PORT),
+    ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-offset", NAT_PSID_OFFSET),
+    ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-len", NAT_PSID_LENGTH),
+    ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid", NAT_PSID),
     ("/ietf-access-control-list:acls/acl/aces/ace", FIREWALL_RULE),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/ingress-interface", FIREWALL_INGRESS),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/egress-interface", FIREWALL_EGRESS),

@@ -98,7 +98,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Deserialize;
 
-use ruster_proto::table::{FirewallAction, FirewallRule, Nat, Protocol, DEFAULT_VRF};
+use ruster_proto::table::{FirewallAction, FirewallRule, Nat, NatPorts, Protocol, DEFAULT_VRF};
 
 use crate::{Config, InterfaceConfig, RouteTarget, StaticRoute};
 
@@ -625,8 +625,10 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
         inside: entry.inside,
         outside: entry.outside,
         external,
-        first_port,
-        last_port,
+        ports: NatPorts::Range {
+            first: first_port,
+            last: last_port,
+        },
     })
 }
 

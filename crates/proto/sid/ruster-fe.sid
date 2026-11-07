@@ -175,6 +175,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-offset",
+        "sid": 60066,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-len",
+        "sid": 60067,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid",
+        "sid": 60068,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-access-control-list:acls/acl/aces/ace",
         "sid": 60070,
         "status": "unstable"
