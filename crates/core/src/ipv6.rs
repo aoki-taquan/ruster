@@ -24,17 +24,17 @@
 //!   that is not one host; at most 1280 bytes; a token bucket limits the rate (a
 //!   burst of 10, then one per 10 ms); the source is a global address of the router,
 //!   one on the interface toward the source when there is one.
+//! - RFC 8200 section 3: the Hop Limit is decremented when a packet is forwarded. A
+//!   packet from the kernel's interface ([`with_kernel_ingress`]) is the router's own,
+//!   so its Hop Limit stays.
 //!
 //! Deviations: no Destination Unreachable for an unresolvable neighbor (address
 //! unreachable) or for traffic to the router, no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
 //! to the kernel. Routes are searched linearly, longest prefix first.
-//!
-//! Packets from the kernel's interface ([`with_kernel_ingress`]) are the router's own:
-//! RFC 8200 section 3 decrements the Hop Limit only when forwarding, so it stays. An
-//! error about one goes back to the kernel's interface with the packet's destination
-//! as its source, not a router address, because the kernel discards a packet from one
-//! of its own addresses.
+//! An ICMPv6 error about a packet from the kernel's interface has the packet's
+//! destination as its source, not an address of the router (RFC 4443 section 2.2),
+//! because the kernel discards a packet from one of its own addresses.
 //!
 //! [`with_kernel_ingress`]: crate::ForwardingSnapshot::with_kernel_ingress
 

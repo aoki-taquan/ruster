@@ -1,3 +1,20 @@
+//! The IPv4 forwarding path and the batch loop.
+//!
+//! # Standards
+//!
+//! Only what this module adds for the router's own packets is listed here; the
+//! rest is still described on the items.
+//!
+//! - RFC 1812 section 5.3.1: the TTL is decremented when a datagram is forwarded.
+//!   A datagram from the kernel's interface
+//!   ([`ForwardingSnapshot::with_kernel_ingress`]) is the router's own, not
+//!   forwarded, so its TTL stays (section 4.2.2.9 lets a router originate any TTL).
+//!
+//! Deviations: an ICMP error about the router's own datagram has the datagram's
+//! destination as its source, not a router address (RFC 1812 section 4.3.2.4),
+//! because every router address is the kernel's own and Linux discards a packet
+//! from one of them.
+
 use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError, FirewallRouteMissPacket};
 use crate::ipv4_fragment_tracking::{
     parse_fragment, Ipv4FragmentFirstTicket, Ipv4FragmentFollow, Ipv4FragmentInfo,
@@ -1677,11 +1694,8 @@ impl<'a> ForwardingSnapshot<'a> {
     /// valid sources, and ICMP errors about them go back to the router
     /// (`docs/design/fe-ce-split.md`, "IPの通信: kernelは内側のホスト").
     ///
-    /// RFC 1812 section 5.3.1 decrements the TTL of forwarded datagrams only, and
-    /// section 4.2.2.9 lets a router originate them with any TTL. Deviation: an ICMP
-    /// error about one has the datagram's destination as its source (RFC 1812
-    /// section 4.3.2.4 wants a router address), because every router address is the
-    /// kernel's own and Linux discards a packet from one of them.
+    /// Set it on every VRF's snapshot given to [`Self::with_vrfs`] as well: each
+    /// packet is decided with its ingress VRF's snapshot.
     #[must_use]
     pub fn with_kernel_ingress(self, kernel_ingress: &'a [IfId]) -> Self {
         Self {
@@ -3514,8 +3528,13 @@ where
                             // MACs, and the ID generated above) is what every later
                             // fragment of its datagram gets.
                             if first_fragment.is_some() {
-                                first_template =
-                                    Ipv4FragmentTemplate::capture(frame, decision.egress());
+                                first_template = Ipv4FragmentTemplate::capture(
+                                    frame,
+                                    decision.egress(),
+                                )
+                                .map(|template| {
+                                    template.keeping_ttl(snapshot.is_kernel_ingress(ingress))
+                                });
                             }
                             // The last fallible step is above: staging cannot fail
                             // for a plan admitted by check_egress_mtu.
@@ -7548,7 +7567,8 @@ fn redirect_to_better_first_hop<T: TraceSink>(
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) {
-    if nat_outside {
+    // The router's own packets get no Redirect: the kernel has one route, the TUN.
+    if nat_outside || snapshot.is_kernel_ingress(ingress) {
         return;
     }
     let Some((runtime, now)) = icmpv4_errors.as_mut() else {

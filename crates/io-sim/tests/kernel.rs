@@ -237,3 +237,79 @@ fn the_router_s_own_ipv6_keeps_its_hop_limit_and_hears_packet_too_big() {
         u32::from(WAN_MTU)
     );
 }
+
+/// A later fragment of the router's own datagram keeps its TTL too, even 1.
+#[test]
+fn the_router_s_own_fragments_keep_their_ttl() {
+    let tables = tables();
+    let kernel_ingress = [KERNEL];
+    let snapshot = ForwardingSnapshot::new(
+        &tables.routes,
+        &tables.interfaces,
+        &tables.neighbors,
+        &tables.bindings,
+    )
+    .unwrap()
+    .with_kernel_ingress(&kernel_ingress)
+    .with_now(MonotonicMillis(1));
+    let fragment = |offset: u16, more: bool| {
+        let mut frame = ipv4([192, 0, 2, 9], 1, 28);
+        frame[18..20].copy_from_slice(&0x1234_u16.to_be_bytes());
+        let flags = (u16::from(more) << 13) | (offset / 8);
+        frame[20..22].copy_from_slice(&flags.to_be_bytes());
+        frame[24..26].copy_from_slice(&[0, 0]);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    };
+    let mut tracking = tracker();
+    let mut io = SimIo::new();
+    io.inject(KERNEL, fragment(0, true));
+    io.inject(KERNEL, fragment(8, false));
+    let batch = io.receive(2).unwrap();
+    let mut control = ControlQueue::new(4);
+    forward_batch_with_control(
+        batch,
+        &snapshot,
+        &mut control,
+        Services {
+            fragment_tracking: Some(&mut tracking),
+            ..Services::default()
+        },
+        &mut NoTrace,
+    );
+    for _ in 0..2 {
+        let tx = io.pop_tx().expect("both fragments are sent");
+        assert_eq!(tx.egress, WAN);
+        assert_eq!(tx.bytes[22], 1, "TTL 1 stays");
+        assert_eq!(ipv4_header_checksum(&tx.bytes[14..34]), 0);
+    }
+}
+
+fn tracker() -> ruster_core::Ipv4FragmentTracker<'static> {
+    use ruster_core::*;
+    let (entries, held) = (4, 4);
+    let buckets = ipv4_fragment_tracking_buckets(entries);
+    let tombstones = ipv4_fragment_tracking_tombstones(entries);
+    Ipv4FragmentTracker::new(
+        Ipv4FragmentTrackingPolicy::new(5_000, 4, 4).unwrap(),
+        Ipv4FragmentTrackingStorage {
+            entries: Vec::leak(vec![Ipv4FragmentEntrySlot::EMPTY; entries]),
+            entry_buckets: Vec::leak(vec![DirectoryBucket::default(); buckets]),
+            entry_nodes: Vec::leak(vec![DirectoryNode::default(); entries]),
+            hosts: Vec::leak(vec![Ipv4FragmentHostSlot::EMPTY; entries]),
+            host_buckets: Vec::leak(vec![DirectoryBucket::default(); buckets]),
+            host_nodes: Vec::leak(vec![DirectoryNode::default(); entries]),
+            tombstones: Vec::leak(vec![Ipv4FragmentTombstoneSlot::EMPTY; tombstones]),
+            tombstone_buckets: Vec::leak(vec![
+                DirectoryBucket::default();
+                ipv4_fragment_tracking_buckets(tombstones)
+            ]),
+            tombstone_nodes: Vec::leak(vec![DirectoryNode::default(); tombstones]),
+            held: Vec::leak(vec![Ipv4FragmentHeldSlot::EMPTY; held]),
+            held_bytes: Vec::leak(vec![0; held * ipv4_fragment_slot_bytes(1500)]),
+        },
+        ResolutionHashKey::new(0x1111, 0x2222).unwrap(),
+    )
+    .unwrap()
+}

@@ -76,6 +76,7 @@ fn template(header: u8) -> Ipv4FragmentTemplate {
         destination: DESTINATION,
         id: 0xbeef,
         transport_header_len: header,
+        keeps_ttl: false,
     }
 }
 

@@ -574,7 +574,7 @@ pub(super) fn apply_nat44_icmp_rewrite(
     }
     frame[0..6].copy_from_slice(&decision.forwarding.destination_mac);
     frame[6..12].copy_from_slice(&decision.forwarding.source_mac);
-    frame[decision.forwarding.ttl_offset] -= 1;
+    frame[decision.forwarding.ttl_offset] = decision.forwarding.new_ttl_protocol.to_be_bytes()[0];
     frame[decision.forwarding.checksum_offset..decision.forwarding.checksum_end]
         .copy_from_slice(&decision.ipv4_checksum.to_be_bytes());
     frame[decision.address_offset..decision.address_offset + 4]
