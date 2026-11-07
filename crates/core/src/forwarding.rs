@@ -1320,6 +1320,9 @@ pub struct ForwardingSnapshot<'a> {
     /// Whether IPv6 forwarded into or within this VRF is dropped
     /// ([`ForwardingSnapshot::with_ipv6_forwarding_blocked`]).
     pub(crate) ipv6_forwarding_blocked: bool,
+    /// Interfaces whose packets the router's own stack sent
+    /// ([`ForwardingSnapshot::with_kernel_ingress`]).
+    pub(crate) kernel_ingress: &'a [IfId],
     /// IPv4 in IPv6 tunnels ([`ForwardingSnapshot::with_tunnels`]).
     pub(crate) tunnels: &'a [crate::Ipv4InIpv6Tunnel],
     /// PPPoE sessions ([`ForwardingSnapshot::with_pppoe`]).
@@ -1529,6 +1532,7 @@ impl<'a> ForwardingSnapshot<'a> {
             local_to_control: false,
             ipv6: None,
             ipv6_forwarding_blocked: false,
+            kernel_ingress: &[],
             tunnels: &[],
             pppoe: &[],
             vlans: &[],
@@ -1665,6 +1669,30 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: on,
             ..self
         }
+    }
+
+    /// Marks the interfaces through which the router's own stack (the kernel behind
+    /// a TUN) sends. Their packets are the router's own, not forwarded ones: TTL and
+    /// Hop Limit are neither checked nor decreased, the router's addresses are
+    /// valid sources, and ICMP errors about them go back to the router
+    /// (`docs/design/fe-ce-split.md`, "IPの通信: kernelは内側のホスト").
+    ///
+    /// RFC 1812 section 5.3.1 decrements the TTL of forwarded datagrams only, and
+    /// section 4.2.2.9 lets a router originate them with any TTL. Deviation: an ICMP
+    /// error about one has the datagram's destination as its source (RFC 1812
+    /// section 4.3.2.4 wants a router address), because every router address is the
+    /// kernel's own and Linux discards a packet from one of them.
+    #[must_use]
+    pub fn with_kernel_ingress(self, kernel_ingress: &'a [IfId]) -> Self {
+        Self {
+            kernel_ingress,
+            ..self
+        }
+    }
+
+    /// Whether `ingress` is one of [`Self::with_kernel_ingress`].
+    pub(crate) fn is_kernel_ingress(&self, ingress: IfId) -> bool {
+        self.kernel_ingress.contains(&ingress)
     }
 
     /// Sends IPv4 routed to a tunnel's interface inside IPv6 and unwraps the
@@ -1865,6 +1893,7 @@ impl<'a> ForwardingSnapshot<'a> {
             local_to_control: false,
             ipv6: None,
             ipv6_forwarding_blocked: false,
+            kernel_ingress: &[],
             tunnels: &[],
             pppoe: &[],
             vlans: &[],
@@ -2239,6 +2268,7 @@ impl ValidatedForwardingOwner {
             local_to_control: false,
             ipv6: None,
             ipv6_forwarding_blocked: false,
+            kernel_ingress: &[],
             tunnels: &[],
             pppoe: &[],
             vlans: &[],
@@ -3891,6 +3921,7 @@ fn exceeds_egress_mtu<T: TraceSink>(
         let disposition = decide_icmpv4_error(
             frame,
             snapshot,
+            ingress,
             ipv4,
             snapshot.route_lookup(ipv4.destination),
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
@@ -3992,7 +4023,7 @@ fn decide_later_fragment(
     // Before the table: a fragment that could never leave neither holds a
     // slot nor counts as its datagram's progress; a refused datagram still
     // records its data so that its entry can complete early.
-    if ipv4.ttl <= 1 {
+    if ipv4.ttl <= 1 && !snapshot.is_kernel_ingress(ingress) {
         tracker.ttl_expired(info, now_ms);
         return Err(Ipv4TtlExpired);
     }
@@ -4138,7 +4169,7 @@ fn validate_ipv4_ingress(
         240..=255 => return Err(Ipv4SourceClassE),
         _ => {}
     }
-    if snapshot.is_local_ipv4(ipv4.source) {
+    if snapshot.is_local_ipv4(ipv4.source) && !snapshot.is_kernel_ingress(ingress) {
         return Err(Ipv4SourceLocalAddress);
     }
     let source_route = snapshot.route_lookup(ipv4.source);
@@ -4562,6 +4593,7 @@ fn decide_ipv4<T: TraceSink>(
                     let disposition = decide_icmpv4_error(
                         frame,
                         snapshot,
+                        ingress,
                         ipv4,
                         selected_route,
                         Icmpv4ErrorKind::ParameterProblem,
@@ -4619,6 +4651,7 @@ fn decide_ipv4<T: TraceSink>(
             let disposition = decide_icmpv4_error(
                 frame,
                 snapshot,
+                ingress,
                 ipv4,
                 None,
                 Icmpv4ErrorKind::DestinationUnreachableNetwork,
@@ -4714,6 +4747,7 @@ fn decide_ipv4<T: TraceSink>(
                         let disposition = decide_icmpv4_error(
                             frame,
                             snapshot,
+                            ingress,
                             ipv4,
                             Some(route),
                             Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
@@ -4732,11 +4766,14 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
     }
-    if ipv4.ttl <= 1 {
+    // The router's own packets are not forwarded: their TTL stays.
+    let hop = u8::from(!snapshot.is_kernel_ingress(ingress));
+    if ipv4.ttl <= hop {
         if let Some((runtime, now)) = icmpv4_errors.as_mut() {
             let disposition = decide_icmpv4_error(
                 frame,
                 snapshot,
+                ingress,
                 ipv4,
                 Some(route),
                 Icmpv4ErrorKind::TimeExceededTtl,
@@ -4794,7 +4831,7 @@ fn decide_ipv4<T: TraceSink>(
         checksum_offset,
         checksum_end,
         old_ttl_protocol: u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
-        new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
+        new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - hop, ipv4.protocol]),
         old_checksum: ipv4.checksum,
     };
     if let Some(config) = nat44_icmp_config {
@@ -7242,6 +7279,7 @@ fn observe_nat44_tcp_candidate_if_present<T: TraceSink>(
 fn decide_icmpv4_error<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
     ipv4: packet::ValidatedIpv4,
     selected_destination_route: Option<Route>,
     kind: Icmpv4ErrorKind,
@@ -7259,7 +7297,9 @@ fn decide_icmpv4_error<T: TraceSink>(
     if !icmp_error_source_is_host(snapshot, ipv4.source) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::SourceNotUnicast);
     }
-    if snapshot.is_local_ipv4(ipv4.source) {
+    // An error about the router's own packet goes back to it only through the
+    // kernel's interface; anything else claiming a local source is not answered.
+    if snapshot.is_local_ipv4(ipv4.source) && !snapshot.is_kernel_ingress(ingress) {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::SourceIsLocal);
     }
 
@@ -7307,6 +7347,19 @@ fn decide_icmpv4_error<T: TraceSink>(
     // A datagram the link truncated (Parameter Problem about its Total
     // Length) is quoted as far as it was received.
     let quote_end = (ipv4.header_offset + ipv4.total_len).min(frame.len());
+    if snapshot.is_kernel_ingress(ingress) {
+        return schedule_kernel_icmpv4_error(
+            snapshot,
+            ingress,
+            frame,
+            ipv4,
+            &frame[ipv4.header_offset..quote_end],
+            kind,
+            header_value,
+            runtime,
+            now,
+        );
+    }
     schedule_reverse_icmpv4_error(
         snapshot,
         ipv4.source,
@@ -7393,6 +7446,49 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
             original_tos,
             snapshot.ipv4_origin.default_ttl(),
             original_ipv4,
+        )
+        .with_next_hop_mtu(header_value as u16)
+        .with_pointer(header_value as u8)
+        .with_gateway(crate::Ipv4Address::from_octets(header_value.to_be_bytes()))
+        .fit_egress_mtu(interface.mtu),
+        now,
+    )
+}
+
+/// Queues an ICMPv4 error about a packet the router's own stack sent, back through
+/// the kernel's interface it came from. Its source is the packet's destination:
+/// every router address is the kernel's own, and Linux discards a packet from one
+/// of its own addresses.
+#[allow(clippy::too_many_arguments)]
+fn schedule_kernel_icmpv4_error(
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    quote: &[u8],
+    kind: Icmpv4ErrorKind,
+    header_value: u32,
+    runtime: &mut Icmpv4ErrorRuntime<'_>,
+    now: MonotonicMillis,
+) -> Icmpv4ErrorDisposition {
+    let Some(interface) = snapshot.interface(ingress) else {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseInterfaceMiss {
+            egress: ingress,
+        });
+    };
+    let mut kernel_mac = [0; 6];
+    kernel_mac.copy_from_slice(&frame[6..12]);
+    runtime.schedule(
+        Icmpv4ErrorAction::new_with_kind(
+            kind,
+            ingress,
+            interface.mac,
+            crate::MacAddress(kernel_mac),
+            ipv4.destination,
+            ipv4.source,
+            frame[ipv4.header_offset + 1],
+            snapshot.ipv4_origin.default_ttl(),
+            quote,
         )
         .with_next_hop_mtu(header_value as u16)
         .with_pointer(header_value as u8)
@@ -7501,6 +7597,7 @@ fn redirect_to_better_first_hop<T: TraceSink>(
         _ => decide_icmpv4_error(
             frame,
             snapshot,
+            ingress,
             ipv4,
             Some(route),
             kind,
@@ -7756,6 +7853,7 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
     let disposition = decide_icmpv4_error(
         frame,
         snapshot,
+        ingress,
         ipv4,
         None,
         kind,
@@ -7994,6 +8092,7 @@ fn truncated_parameter_problem<T: TraceSink>(
     let disposition = decide_icmpv4_error(
         frame,
         snapshot,
+        ingress,
         ipv4,
         selected_route,
         Icmpv4ErrorKind::ParameterProblem,
@@ -8393,7 +8492,7 @@ fn apply_nat44_tcp_rewrite(
     }
     frame[0..6].copy_from_slice(&decision.forwarding.destination_mac);
     frame[6..12].copy_from_slice(&decision.forwarding.source_mac);
-    frame[decision.forwarding.ttl_offset] -= 1;
+    frame[decision.forwarding.ttl_offset] = decision.forwarding.new_ttl_protocol.to_be_bytes()[0];
     frame[decision.forwarding.checksum_offset..decision.forwarding.checksum_end]
         .copy_from_slice(&decision.ipv4_checksum.to_be_bytes());
     frame[decision.address_offset..decision.address_end].copy_from_slice(&decision.new_address);
@@ -8431,7 +8530,7 @@ fn apply_nat44_udp_rewrite(
     }
     frame[0..6].copy_from_slice(&decision.forwarding.destination_mac);
     frame[6..12].copy_from_slice(&decision.forwarding.source_mac);
-    frame[decision.forwarding.ttl_offset] -= 1;
+    frame[decision.forwarding.ttl_offset] = decision.forwarding.new_ttl_protocol.to_be_bytes()[0];
     frame[decision.forwarding.checksum_offset..decision.forwarding.checksum_end]
         .copy_from_slice(&decision.ipv4_checksum.to_be_bytes());
     frame[decision.address_offset..decision.address_end].copy_from_slice(&decision.new_address);
@@ -8457,7 +8556,7 @@ fn apply_ipv4_rewrite(frame: &mut [u8], decision: Ipv4RewriteDecision) -> Result
     }
     frame[0..6].copy_from_slice(&decision.destination_mac);
     frame[6..12].copy_from_slice(&decision.source_mac);
-    frame[decision.ttl_offset] -= 1;
+    frame[decision.ttl_offset] = decision.new_ttl_protocol.to_be_bytes()[0];
     let checksum = rfc1624_update(
         decision.old_checksum,
         decision.old_ttl_protocol,
