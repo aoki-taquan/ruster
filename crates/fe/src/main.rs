@@ -8,11 +8,13 @@
 //! kernel address or route, and the kernel must not forward on them.
 
 use std::process::ExitCode;
+use std::thread;
 
 use ruster_core::MonotonicMillis;
 use ruster_fe::{writers, Fe};
 use ruster_io_afpacket::{
-    AfPacketIo, AfPacketPlatform, PortConfig, RingGeometry, ValidatedConfig, DEFAULT_MAX_FRAME_LEN,
+    AfPacketIo, AfPacketPlatform, PortConfig, RingGeometry, RxWait, ValidatedConfig,
+    DEFAULT_MAX_FRAME_LEN,
 };
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
@@ -86,26 +88,39 @@ fn run() -> Result<(), String> {
     let clock = Clock::new();
     let mut last_report = 0;
     let mut reported = fe.counters();
+    let mut ready_unused = false;
     loop {
         let now = clock.now_ms();
         fe.io_mut().set_clock(MonotonicMillis(now));
         for (listener, writes) in &listeners {
-            for stream in daemon::accept(listener).map_err(|error| error.to_string())? {
+            for stream in daemon::accept(listener) {
                 fe.attach(stream, writes)
                     .map_err(|error| error.to_string())?;
             }
         }
         let progress = fe.step(now);
+        if fe.io_mut().is_stopped() {
+            return Err("the packet backend stopped".into());
+        }
         if now.saturating_sub(last_report) >= 5_000 && fe.counters() != reported {
             reported = fe.counters();
             last_report = now;
             eprintln!("ruster-fe: {reported:?}");
         }
-        if !progress.busy {
+        if progress.busy {
+            ready_unused = false;
+        } else if ready_unused {
+            // The last wait said ready but the step found nothing (for example a
+            // socket condition RX cannot consume): sleep instead of spinning.
+            ready_unused = false;
+            thread::sleep(daemon::IDLE_MAX);
+        } else {
             let wait = u32::try_from(daemon::IDLE_MAX.as_millis()).unwrap_or(1);
-            fe.io_mut()
+            let woke = fe
+                .io_mut()
                 .wait_rx(wait)
                 .map_err(|error| format!("waiting for packets: {error:?}"))?;
+            ready_unused = woke == RxWait::Ready;
         }
     }
 }

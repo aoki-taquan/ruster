@@ -4,7 +4,7 @@
 //! Every socket lives under one directory (`/run/ruster` by default), at the paths in
 //! [`socket`] (`docs/design/control-protocol.md`). The process that serves a table
 //! listens; the processes that write or read it connect. A listener creates the
-//! directories it needs and removes a socket file left behind by an earlier run before
+//! directories it needs (readable by the owner only) and removes a socket file left behind by an earlier run before
 //! it binds. Whoever may open these sockets may change the tables, so the directory
 //! must be reachable only by the router's processes.
 
@@ -65,7 +65,11 @@ impl Clock {
 fn remove_stale(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
     }
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
@@ -94,15 +98,15 @@ pub fn bind_datagram(path: &Path) -> io::Result<UnixDatagram> {
     Ok(socket)
 }
 
-/// Every connection waiting on `listener`.
-pub fn accept(listener: &UnixListener) -> io::Result<Vec<UnixStream>> {
+/// Every connection waiting on `listener`. An error (for example too many open files)
+/// ends this round; the listener is tried again on the next one.
+pub fn accept(listener: &UnixListener) -> Vec<UnixStream> {
     let mut streams = Vec::new();
     loop {
         match listener.accept() {
             Ok((stream, _)) => streams.push(stream),
-            Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(streams),
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
+            Err(_) => return streams,
         }
     }
 }
@@ -155,18 +159,10 @@ pub fn connect_datagram(socket: &UnixDatagram, path: &Path, wait: Duration) -> i
 /// are noticed soon.
 pub const IDLE_MAX: Duration = Duration::from_millis(1);
 
-/// Sleeps when the last step found nothing to do, up to [`IDLE_MAX`] or the step's wake
-/// time, whichever is sooner.
-pub fn idle(progress: Progress, now_ms: u64) {
-    if progress.busy {
-        return;
-    }
-    let mut wait = IDLE_MAX;
-    if let Some(at) = progress.wake_at {
-        wait = wait.min(Duration::from_millis(at.saturating_sub(now_ms)));
-    }
-    if !wait.is_zero() {
-        thread::sleep(wait);
+/// Sleeps [`IDLE_MAX`] when the last step found nothing to do.
+pub fn idle(progress: Progress) {
+    if !progress.busy {
+        thread::sleep(IDLE_MAX);
     }
 }
 

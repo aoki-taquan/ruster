@@ -36,7 +36,7 @@ fn run() -> Result<(), String> {
     let mut reported = neighd.counters();
     loop {
         let now = clock.now_ms();
-        for stream in daemon::accept(&config).map_err(|error| error.to_string())? {
+        for stream in daemon::accept(&config) {
             neighd
                 .attach_config(stream)
                 .map_err(|error| error.to_string())?;
@@ -47,7 +47,7 @@ fn run() -> Result<(), String> {
             last_report = now;
             eprintln!("ruster-neighd: {reported:?}");
         }
-        daemon::idle(progress, now);
+        daemon::idle(progress);
     }
 }
 

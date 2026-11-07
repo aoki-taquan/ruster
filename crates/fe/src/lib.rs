@@ -59,6 +59,7 @@ const RESOLVE_REMEMBERED: usize = 1_024;
 /// and a VLAN tag, plus the punt header).
 const PUNT_MAX: usize = 1_522 + 300;
 const ETHERNET_HEADER: usize = 14;
+const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
 
 /// Counters for things the FE dropped on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -247,8 +248,17 @@ where
         let mut buf = vec![0_u8; PUNT_MAX + 1];
         let mut frames = Vec::new();
         for _ in 0..INJECT_PER_STEP {
-            match socket.recv(&mut buf) {
-                Ok(n) if n <= PUNT_MAX => frames.push(buf[..n].to_vec()),
+            match socket.recv_from(&mut buf) {
+                // With a fixed peer path, only frames from that path are taken.
+                Ok((_, from))
+                    if self
+                        .punt_peer
+                        .as_deref()
+                        .is_some_and(|peer| from.as_pathname() != Some(peer)) =>
+                {
+                    self.counters.inject_dropped += 1;
+                }
+                Ok((n, _)) if n <= PUNT_MAX => frames.push(buf[..n].to_vec()),
                 Ok(_) => self.counters.inject_dropped += 1,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -267,7 +277,8 @@ where
                 .filter(|id| self.active.contains(id));
             match (punt.direction, punt.reason, egress) {
                 (Direction::FromControl, punt::reason::ARP, Some(egress))
-                    if punt.frame.len() >= ETHERNET_HEADER =>
+                    if punt.frame.len() >= ETHERNET_HEADER
+                        && punt.frame[12..14] == ETHERTYPE_ARP =>
                 {
                     if self.send_generated(egress, punt.frame) {
                         self.counters.injected += 1;

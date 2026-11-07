@@ -23,12 +23,12 @@ fn a_listener_replaces_a_socket_left_by_an_earlier_run() {
     let listener = daemon::listen(&path).unwrap();
     let mut client = daemon::connect(&path, Duration::ZERO).unwrap();
     client.write_all(b"hi").unwrap();
-    let mut accepted = daemon::accept(&listener).unwrap();
+    let mut accepted = daemon::accept(&listener);
     assert_eq!(accepted.len(), 1);
     let mut buf = [0_u8; 2];
     accepted[0].read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"hi");
-    assert!(daemon::accept(&listener).unwrap().is_empty());
+    assert!(daemon::accept(&listener).is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
 

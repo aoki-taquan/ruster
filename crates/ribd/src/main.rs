@@ -69,7 +69,7 @@ fn run() -> Result<(), String> {
     loop {
         let now = clock.now_ms();
         for (listener, name) in &listeners {
-            for stream in daemon::accept(listener).map_err(|error| error.to_string())? {
+            for stream in daemon::accept(listener) {
                 ribd.attach_source(name, stream)
                     .map_err(|error| error.to_string())?;
             }
@@ -79,7 +79,7 @@ fn run() -> Result<(), String> {
             synced = true;
             eprintln!("ruster-ribd: routes sent to the FE");
         }
-        daemon::idle(progress, now);
+        daemon::idle(progress);
     }
 }
 

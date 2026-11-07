@@ -283,7 +283,8 @@ fn arp_goes_to_the_neighbor_socket_and_frames_come_back() {
     assert_eq!(&punt.frame[8..14], &HOST_MAC, "sender MAC");
     assert_eq!(&punt.frame[24..28], &[192, 0, 2, 1], "target IP");
 
-    let reply = vec![0xab_u8; 42];
+    let mut reply = vec![0xab_u8; 42];
+    reply[12..14].copy_from_slice(&[0x08, 0x06]);
     let mut message = Vec::new();
     Punt {
         direction: Direction::FromControl,
@@ -338,7 +339,18 @@ fn frames_from_the_neighbor_process_only_leave_enabled_interfaces() {
     bench.patch(&mut config, &[iface("lan", LAN_MAC)]);
     let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
     bench.fe.attach_punt(fe_end).unwrap();
-    let frame = vec![0xab_u8; 42];
+    let mut frame = vec![0xab_u8; 42];
+    frame[12..14].copy_from_slice(&[0x08, 0x06]);
+    let mut not_arp = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &[0xab_u8; 42],
+    }
+    .encode(&mut not_arp)
+    .unwrap();
+    neighd_end.send(&not_arp).unwrap();
     for interface in ["wan", "nope", "lan"] {
         let mut message = Vec::new();
         Punt {
@@ -368,7 +380,7 @@ fn frames_from_the_neighbor_process_only_leave_enabled_interfaces() {
     let tx = bench.fe.io_mut().pop_tx().expect("lan only");
     assert_eq!(tx.egress, IfId(0));
     assert!(bench.fe.io_mut().pop_tx().is_none());
-    assert_eq!(bench.fe.counters().inject_dropped, 4);
+    assert_eq!(bench.fe.counters().inject_dropped, 5);
 }
 
 #[test]
@@ -438,7 +450,8 @@ fn a_punt_socket_at_a_fixed_path_sends_to_whoever_binds_the_peer_path() {
         let n = neighd_end.recv(&mut buf).unwrap();
         assert_eq!(Punt::decode(&buf[..n]).unwrap().interface, "lan");
 
-        let reply = vec![0xab_u8; 42];
+        let mut reply = vec![0xab_u8; 42];
+        reply[12..14].copy_from_slice(&[0x08, 0x06]);
         let mut message = Vec::new();
         Punt {
             direction: Direction::FromControl,
@@ -449,9 +462,14 @@ fn a_punt_socket_at_a_fixed_path_sends_to_whoever_binds_the_peer_path() {
         .encode(&mut message)
         .unwrap();
         neighd_end.send_to(&message, dir.join("fe")).unwrap();
+        // The same message from anyone else is not sent.
+        let stranger = UnixDatagram::unbound().unwrap();
+        stranger.send_to(&message, dir.join("fe")).unwrap();
         bench.fe.step(round);
         assert_eq!(bench.fe.io_mut().pop_tx().expect("sent").bytes, reply);
     }
+    assert!(bench.fe.io_mut().pop_tx().is_none());
     assert_eq!(bench.fe.counters().arp_to_control, 2);
+    assert_eq!(bench.fe.counters().inject_dropped, 2);
     std::fs::remove_dir_all(dir).unwrap();
 }
