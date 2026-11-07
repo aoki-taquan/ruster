@@ -115,13 +115,25 @@ all_running || fail "a router process exited"
 echo "ok: IPv4 crosses the router both ways (four separate processes)"
 
 # A control process that dies does not stop forwarding, and comes back by itself.
+# Counts the lines of a log that say a connection was made again.
+again() { grep -c "again" "$work/$1.log" || true; }
 for name in ruster-ribd ruster-neighd ruster-confd; do
+  before_confd=$(again ruster-confd)
   stop_named "$name"
   both_ways || fail "forwarding stopped while $name was down"
   start_named "$name"
-  sleep 2
+  # Longer than ribd's 5 s wait for its sources, so a ribd that never got confd's
+  # routes back would have deleted them by now.
+  sleep 6
   both_ways || fail "forwarding stopped after $name restarted"
   all_running || fail "a router process exited after $name restarted"
+  case $name in
+    ruster-ribd | ruster-neighd)
+      (( $(again ruster-confd) > before_confd )) || fail "confd did not connect to $name again" ;;
+    ruster-confd)
+      grep -q "sent $work/router.toml" <(tail -n 3 "$work/ruster-confd.log") \
+        || fail "the restarted confd did not send its configuration" ;;
+  esac
   echo "ok: $name restarted without stopping forwarding"
 done
 
@@ -129,6 +141,9 @@ done
 stop_named ruster-fe
 start_named ruster-fe
 comes_up || fail "forwarding did not come back after the FE restarted"
+for name in ruster-ribd ruster-neighd; do
+  grep -q "connected to the FE again" "$work/$name.log" || fail "$name did not connect to the FE again"
+done
 all_running || fail "a router process exited after the FE restarted"
 echo "ok: the control processes refilled a restarted FE"
 
