@@ -9,11 +9,24 @@ use ruster_proto::table::{Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::Task;
 use ruster_ribd::{Ribd, SourceSpec};
 
-struct Accept;
+/// A stand-in FE check: refuses any table with a route through `refuse`.
+struct Check<'a> {
+    refuse: Option<&'a str>,
+}
 
-impl Hook for Accept {
-    fn check(&mut self, _next: &Store) -> Result<(), String> {
-        Ok(())
+impl Hook for Check<'_> {
+    fn check(&mut self, next: &Store) -> Result<(), String> {
+        let bad = self.refuse.is_some_and(|refuse| {
+            next.iter().any(|(_, value)| {
+                matches!(value, Value::Route(RouteAction::Forward(hops))
+                    if hops.iter().any(|hop| hop.interface == refuse))
+            })
+        });
+        if bad {
+            Err("refused".into())
+        } else {
+            Ok(())
+        }
     }
     fn committed(&mut self, _store: &Store) {}
 }
@@ -50,6 +63,7 @@ struct Lab {
     ribd: Ribd,
     sources: Vec<Client>,
     now: u64,
+    refuse: Option<&'static str>,
 }
 
 impl Lab {
@@ -59,6 +73,7 @@ impl Lab {
             ribd: Ribd::new(UnixStream::pair().unwrap().0, vec![]).unwrap(),
             sources: Vec::new(),
             now: 0,
+            refuse: None,
         };
         lab.restart(specs);
         lab
@@ -80,7 +95,10 @@ impl Lab {
 
     fn settle(&mut self) {
         for _ in 0..1_000 {
-            let mut busy = self.fe.step(&mut Accept).busy;
+            let mut check = Check {
+                refuse: self.refuse,
+            };
+            let mut busy = self.fe.step(&mut check).busy;
             busy |= self.ribd.step(self.now).busy;
             for source in &mut self.sources {
                 busy |= source.poll().0.busy;
@@ -182,4 +200,67 @@ fn a_silent_source_is_waited_for_only_until_its_hold_time() {
     lab.settle();
     assert!(lab.ribd.synced());
     assert!(lab.fe.store().is_empty());
+}
+
+#[test]
+fn a_refused_full_send_after_a_restart_does_not_delete_the_fe_routes() {
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[
+            route([0, 0, 0, 0], 0, "wan"),
+            route([10, 0, 0, 0], 8, "lan"),
+        ])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+    assert_eq!(lab.fe.store().len(), 2);
+
+    // The restarted ribd's source now also has a route the FE refuses.
+    lab.refuse = Some("bad");
+    lab.restart(vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[
+            route([0, 0, 0, 0], 0, "wan"),
+            route([10, 0, 0, 0], 8, "lan"),
+            route([172, 16, 0, 0], 12, "bad"),
+        ])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+    lab.now = 10_000;
+    lab.settle();
+    assert_eq!(lab.ribd.counters().patches_refused, 1);
+    assert_eq!(lab.fe_route([0, 0, 0, 0], 0), Some(&via("wan")), "kept");
+    assert_eq!(lab.fe_route([10, 0, 0, 0], 8), Some(&via("lan")), "kept");
+
+    // Once the source drops the bad route, ribd sends again and finishes the resync.
+    lab.sources[0]
+        .patch(&[Change::delete(key([172, 16, 0, 0], 12))])
+        .unwrap();
+    lab.settle();
+    assert_eq!(lab.fe.store().len(), 2);
+    assert_eq!(lab.fe_route([0, 0, 0, 0], 0), Some(&via("wan")));
+}
+
+#[test]
+fn a_refused_change_is_sent_again_with_the_next_one() {
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1)]);
+    lab.sources[0].sync_done();
+    lab.settle();
+    lab.refuse = Some("bad");
+    lab.sources[0]
+        .patch(&[route([172, 16, 0, 0], 12, "bad")])
+        .unwrap();
+    lab.settle();
+    assert!(lab.fe.store().is_empty());
+    lab.refuse = None;
+    lab.sources[0]
+        .patch(&[route([10, 0, 0, 0], 8, "lan")])
+        .unwrap();
+    lab.settle();
+    assert_eq!(
+        lab.fe.store().len(),
+        2,
+        "the earlier route went with the next change"
+    );
 }

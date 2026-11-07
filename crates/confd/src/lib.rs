@@ -69,12 +69,54 @@ pub enum PeerKind {
     Neighd,
 }
 
-/// One process confd writes to, and what it was sent.
+/// One process confd writes to, and what it accepted.
 struct Peer {
     client: Client,
+    /// What the peer holds from confd, as far as its answers tell.
     sent: BTreeMap<Key, Value>,
-    /// ribd wants `sync-done` after each full send.
+    /// Patches waiting for an answer, each with what the peer holds once it is accepted.
+    in_flight: Vec<(u32, BTreeMap<Key, Value>)>,
+    /// resync-begin was sent; resync-end follows once a full send is accepted, so a
+    /// refused send never deletes what the peer holds.
+    resync_open: bool,
+    /// ribd wants `sync-done` after each accepted send.
     says_done: bool,
+}
+
+impl Peer {
+    /// What the peer will hold once every patch in flight is accepted.
+    fn expected(&self) -> &BTreeMap<Key, Value> {
+        self.in_flight.last().map_or(&self.sent, |(_, held)| held)
+    }
+
+    /// Handles one answer from the peer.
+    fn answer(&mut self, token: u32, accepted: bool) {
+        let Some(at) = self.in_flight.iter().position(|(t, _)| *t == token) else {
+            return;
+        };
+        let (_, held) = self.in_flight.remove(at);
+        if accepted {
+            self.sent = held;
+            if self.in_flight.is_empty() {
+                if self.resync_open {
+                    self.client.resync_end();
+                    self.resync_open = false;
+                }
+                if self.says_done {
+                    self.client.sync_done();
+                }
+            }
+        } else {
+            // Unknown what the peer holds now: send everything with the next change
+            // and remove the rest then.
+            self.in_flight.clear();
+            self.sent.clear();
+            if !self.resync_open {
+                self.client.resync_begin();
+                self.resync_open = true;
+            }
+        }
+    }
 }
 
 pub struct Confd {
@@ -170,25 +212,23 @@ impl Confd {
         let mut client = Client::new(stream)?;
         let desired = desired(self);
         client.resync_begin();
-        let changes: Vec<Change> = desired
-            .iter()
-            .map(|(key, value)| Change::set(key.clone(), value.clone()))
-            .collect();
-        if !changes.is_empty() {
-            client
-                .patch(&changes)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            self.counters.patches_sent += 1;
-        }
-        client.resync_end();
-        if says_done {
-            client.sync_done();
-        }
-        Ok(Peer {
+        let mut peer = Peer {
             client,
-            sent: desired,
+            sent: BTreeMap::new(),
+            in_flight: Vec::new(),
+            resync_open: true,
             says_done,
-        })
+        };
+        if desired.is_empty() {
+            peer.client.resync_end();
+            peer.resync_open = false;
+            if says_done {
+                peer.client.sync_done();
+            }
+        } else {
+            send_diff(&mut peer, &desired, &mut self.counters);
+        }
+        Ok(peer)
     }
 
     fn interface_tables(&self) -> BTreeMap<Key, Value> {
@@ -255,13 +295,14 @@ fn route_key(prefix: Ipv4Addr, len: u8) -> Key {
 }
 
 fn send_diff(peer: &mut Peer, desired: &BTreeMap<Key, Value>, counters: &mut ConfdCounters) {
+    let expected = peer.expected();
     let mut changes = Vec::new();
     for (key, value) in desired {
-        if peer.sent.get(key) != Some(value) {
+        if expected.get(key) != Some(value) {
             changes.push(Change::set(key.clone(), value.clone()));
         }
     }
-    for key in peer.sent.keys() {
+    for key in expected.keys() {
         if !desired.contains_key(key) {
             changes.push(Change::delete(key.clone()));
         }
@@ -269,12 +310,9 @@ fn send_diff(peer: &mut Peer, desired: &BTreeMap<Key, Value>, counters: &mut Con
     if changes.is_empty() {
         return;
     }
-    if peer.client.patch(&changes).is_ok() {
+    if let Ok(token) = peer.client.patch(&changes) {
         counters.patches_sent += 1;
-        peer.sent = desired.clone();
-        if peer.says_done {
-            peer.client.sync_done();
-        }
+        peer.in_flight.push((token, desired.clone()));
     }
 }
 
@@ -288,10 +326,12 @@ impl Task for Confd {
             let (polled, events) = peer.client.poll();
             progress = progress.and(polled);
             for event in events {
-                if let Event::Response { code, .. } = event {
-                    if code.class() != 2 {
+                if let Event::Response { token, code, .. } = event {
+                    let accepted = code.class() == 2;
+                    if !accepted {
                         self.counters.patches_refused += 1;
                     }
+                    peer.answer(token, accepted);
                 }
             }
         }
