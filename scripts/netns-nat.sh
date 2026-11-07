@@ -60,7 +60,7 @@ ipv4 = "198.51.100.1/24"
 [nat]
 inside = "r-lan"
 outside = "r-wan"
-ports = "40000-40999"
+ports = "20000-20999"
 
 [[firewall]]
 action = "accept"
@@ -108,7 +108,7 @@ print(s.recv(100).decode().strip())
 ') || fail "TCP from the LAN"
 read -r address port <<<"$seen"
 [[ "$address" == 198.51.100.1 ]] || fail "the WAN host saw $address"
-(( port >= 40000 && port <= 40999 )) || fail "the WAN host saw port $port"
+(( port >= 20000 && port <= 20999 )) || fail "the WAN host saw port $port"
 echo "ok: TCP from the LAN arrives from $address port $port"
 
 if nsx "$wan" ping -c 2 -i 0.2 -W 1 192.0.2.10 >/dev/null 2>&1; then

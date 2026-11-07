@@ -41,8 +41,13 @@
 //! [nat]                        # NAPT of the default VRF
 //! inside = "lan"
 //! outside = "wan"              # must have an ipv4 address: the public one
-//! ports = "1024-65535"         # optional, 1024-65535 when left out
+//! ports = "1024-32767"         # optional, 1024-32767 when left out
 //! ```
+//!
+//! The NAT pool must not overlap the ports the router's kernel picks for its own
+//! connections (`net.ipv4.ip_local_port_range`, 32768-60999 by default): UDP and TCP
+//! to the public address on a port outside the pool are the router's own, and those
+//! in it are NAT's.
 //!
 //! With any `firewall` rule, what no rule accepts is dropped. The interfaces a rule
 //! or `nat` names must be in the default VRF.
@@ -475,7 +480,10 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
         ));
     }
     let (first_port, last_port) = match &entry.ports {
-        None => (1_024, u16::MAX),
+        // Below Linux's default ephemeral ports (32768-60999), which the router's
+        // own connections use: UDP and TCP to the public address outside the pool
+        // are the router's.
+        None => (1_024, 32_767),
         Some(text) => match port_range(text) {
             Some((first, last)) if first > 0 => (first, last),
             _ => {
