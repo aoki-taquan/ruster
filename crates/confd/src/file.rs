@@ -57,6 +57,12 @@
 //! - RFC 4291 section 2.5: IPv6 interface addresses and next hops must not be
 //!   unspecified, loopback or multicast. A link-local next hop is allowed: it is on
 //!   the route's interface.
+//! - RFC 8519 (`ietf-access-control-list`): a `firewall` rule is an ACE with IPv4,
+//!   protocol, port range and interface matches, checked in order, first match wins.
+//!   Deviations: IPv4 only (while there are rules, the FE does not forward IPv6
+//!   through the default VRF); an accepted flow's replies pass too (stateful, not in
+//!   RFC 8519); what no rule accepts is dropped; one rule list for the default VRF,
+//!   not ACLs attached per interface.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -457,8 +463,15 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Firewall
             return Err(format!("{at}: {what} are for tcp and udp only"));
         }
         let (first, last) = text.split_once('-').unwrap_or((text, text));
-        match (first.trim().parse::<u16>(), last.trim().parse::<u16>()) {
-            (Ok(first), Ok(last)) if first <= last => Ok((first, last)),
+        let port = |text: &str| {
+            let text = text.trim();
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            text.parse::<u16>().ok()
+        };
+        match (port(first), port(last)) {
+            (Some(first), Some(last)) if first <= last => Ok((first, last)),
             _ => Err(format!(
                 "{at}: {what} must be a port or a range such as 1024-65535"
             )),

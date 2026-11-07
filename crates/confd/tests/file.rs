@@ -561,6 +561,10 @@ fn firewall_mistakes_are_refused() {
             rule("action = \"accept\"\nprotocol = \"tcp\"\ndestination-ports = \"80-22\"\n"),
             "a port or a range",
         ),
+        (
+            rule("action = \"accept\"\nprotocol = \"tcp\"\ndestination-ports = \"+53\"\n"),
+            "a port or a range",
+        ),
     ] {
         let got = error(&text);
         assert!(got.contains(expected), "{text}: {got}");

@@ -5,7 +5,7 @@
 //!
 //! | To | What |
 //! |---|---|
-//! | FE | interfaces and addresses |
+//! | FE | interfaces, addresses and the default VRF's firewall rules |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
 //! | ribd | static routes and the connected routes of the addresses, as source `confd` |
 //!
