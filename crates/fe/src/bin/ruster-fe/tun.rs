@@ -2,9 +2,9 @@
 //! minimal private FFI (`ioctl(TUNSETIFF)`).
 //!
 //! The device of VRF `name` is `rt-<name>`. It carries bare IP packets (`IFF_TUN`
-//! with `IFF_NO_PI`). The FE only attaches to a device that exists: it never creates
-//! one, so the kernel's addresses and routes on it (set by confd) outlive an FE
-//! restart.
+//! with `IFF_NO_PI`). The FE only attaches to a persistent device (one confd made):
+//! when TUNSETIFF made a new one instead, the FE closes it again, which removes it.
+//! So the kernel's addresses and routes on the device outlive an FE restart.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -48,8 +48,11 @@ mod imp {
     /// `_IOW('T', 202, int)`, the same on every Linux architecture ruster builds for
     /// (x86_64 and aarch64).
     const TUNSETIFF: c_ulong = 0x4004_54ca;
+    /// `_IOR('T', 210, unsigned int)`.
+    const TUNGETIFF: c_ulong = 0x8004_54d2;
     const IFF_TUN: c_short = 0x0001;
     const IFF_NO_PI: c_short = 0x1000;
+    const IFF_PERSIST: c_short = 0x0800;
 
     /// `struct ifreq` as TUNSETIFF reads it: the name, then the flags at the start
     /// of the 24-byte union.
@@ -88,6 +91,25 @@ mod imp {
         let status = unsafe { ioctl(file.as_raw_fd(), TUNSETIFF, std::ptr::addr_of_mut!(request)) };
         if status < 0 {
             return Err(io::Error::last_os_error());
+        }
+        // TUNSETIFF creates a device when none is there; only a persistent one,
+        // made by confd, is attached to. The caller drops `file` otherwise, which
+        // removes a device created here.
+        let mut current = IfReq {
+            name: [0; 16],
+            flags: 0,
+            _pad: [0; 22],
+        };
+        // SAFETY: as above; TUNGETIFF writes one `struct ifreq` through the pointer.
+        let status = unsafe { ioctl(file.as_raw_fd(), TUNGETIFF, std::ptr::addr_of_mut!(current)) };
+        if status < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if current.flags & IFF_PERSIST == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "not a persistent TUN device made by confd",
+            ));
         }
         Ok(())
     }
