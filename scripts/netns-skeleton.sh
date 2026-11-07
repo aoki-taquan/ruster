@@ -149,4 +149,17 @@ done
 all_running || fail "a router process exited after the FE restarted"
 echo "ok: the control processes refilled a restarted FE"
 
+# SIGTERM stops the FE: it drains and exits by itself.
+kill -TERM "${pid_of[ruster-fe]}"
+status=0
+for _ in $(seq 1 30); do
+  kill -0 "${pid_of[ruster-fe]}" 2>/dev/null || break
+  sleep 0.1
+done
+kill -0 "${pid_of[ruster-fe]}" 2>/dev/null && fail "the FE did not stop on SIGTERM"
+wait "${pid_of[ruster-fe]}" || status=$?
+(( status == 0 )) || fail "the FE exited with $status on SIGTERM"
+grep -q "ruster-fe: stopped" "$work/ruster-fe.log" || fail "the FE did not report stopping"
+echo "ok: SIGTERM stops the FE"
+
 echo "PASS ($backend)"

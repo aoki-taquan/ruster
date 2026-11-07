@@ -155,6 +155,26 @@ pub fn connect_datagram(socket: &UnixDatagram, path: &Path, wait: Duration) -> i
     }
 }
 
+/// Tells systemd (a `Type=notify` service) that the process is ready, or is stopping:
+/// one datagram to `$NOTIFY_SOCKET` (sd_notify(3)). Without that variable it does
+/// nothing. An address starting with `@` is in the abstract namespace.
+pub fn notify(state: &str) {
+    let Some(address) = std::env::var_os("NOTIFY_SOCKET") else {
+        return;
+    };
+    let Ok(socket) = UnixDatagram::unbound() else {
+        return;
+    };
+    let bytes = address.as_encoded_bytes();
+    let _ = if let Some(name) = bytes.strip_prefix(b"@") {
+        use std::os::linux::net::SocketAddrExt;
+        std::os::unix::net::SocketAddr::from_abstract_name(name)
+            .and_then(|to| socket.send_to_addr(state.as_bytes(), &to))
+    } else {
+        socket.send_to(state.as_bytes(), Path::new(&address))
+    };
+}
+
 /// How often a closed connection is tried again.
 pub const RECONNECT_EVERY_MS: u64 = 1_000;
 

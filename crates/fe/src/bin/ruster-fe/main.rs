@@ -12,6 +12,7 @@
 
 mod af_packet;
 mod af_xdp;
+mod signal;
 
 use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
@@ -27,7 +28,13 @@ pub trait Backend<B> {
     fn set_clock(&mut self, io: &mut B, now: MonotonicMillis);
     /// Waits for input when the step found nothing to do; fails when the backend stopped.
     fn after_step(&mut self, io: &mut B, busy: bool) -> Result<(), String>;
+    /// One round of the shutdown drain: stops I/O for good, and returns whether every
+    /// frame handed to the kernel came back.
+    fn drain(&mut self, io: &mut B) -> bool;
 }
+
+/// How long a stopping FE waits for frames still in the kernel.
+const DRAIN_MS: u64 = 1_000;
 
 /// The interface index of `device` in this network namespace.
 pub fn if_index(device: &str) -> Result<u32, String> {
@@ -82,6 +89,7 @@ fn args() -> Result<Args, String> {
 
 fn run() -> Result<(), String> {
     let args = args()?;
+    signal::install().map_err(|name| format!("installing the {name} handler"))?;
     if args.af_packet {
         let io = af_packet::open(&args.devices)?;
         serve(io, af_packet::Waiter::default(), &args)
@@ -136,8 +144,19 @@ where
     let clock = Clock::new();
     let mut last_report = 0;
     let mut reported = fe.counters();
+    daemon::notify("READY=1");
     loop {
         let now = clock.now_ms();
+        if signal::stop_requested() {
+            daemon::notify("STOPPING=1");
+            let until = now.saturating_add(DRAIN_MS);
+            while !waiter.drain(fe.io_mut()) && clock.now_ms() < until && !signal::force_requested()
+            {
+                std::thread::sleep(daemon::IDLE_MAX);
+            }
+            eprintln!("ruster-fe: stopped ({:?})", fe.counters());
+            return Ok(());
+        }
         waiter.set_clock(fe.io_mut(), MonotonicMillis(now));
         for (listener, writes) in listeners {
             for stream in daemon::accept(listener) {

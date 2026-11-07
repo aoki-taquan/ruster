@@ -33,6 +33,7 @@ fn run() -> Result<(), String> {
         .connect_neighd(connect(socket::NEIGHD_CONFIG)?)
         .map_err(|error| error.to_string())?;
     eprintln!("ruster-confd: sent {path}");
+    daemon::notify("READY=1");
 
     let clock = Clock::new();
     let mut refused = 0;

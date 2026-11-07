@@ -14,6 +14,8 @@ use crate::{if_index, Backend};
 /// Room for the kernel's per-frame header and the largest frame.
 const FRAME_SIZE: u32 = 2_048;
 const BLOCK_SIZE: u32 = 65_536;
+/// Kick-and-reap rounds per drain call.
+const DRAIN_ROUNDS: u32 = 8;
 
 fn ring(block_count: u32, retire_timeout_ms: u32) -> RingGeometry {
     RingGeometry {
@@ -75,5 +77,9 @@ impl Backend<AfPacketIo> for Waiter {
             self.ready_unused = woke == RxWait::Ready;
         }
         Ok(())
+    }
+
+    fn drain(&mut self, io: &mut AfPacketIo) -> bool {
+        io.drain(DRAIN_ROUNDS).is_drained()
     }
 }
