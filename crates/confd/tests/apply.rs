@@ -235,3 +235,17 @@ fn confd_stops_waiting_after_a_while() {
     assert!(rig.answers().is_empty());
     assert_eq!(rig.apply.counters().gave_up, 1);
 }
+
+#[test]
+fn a_process_already_down_is_not_waited_for() {
+    let mut rig = Rig::new();
+    drop(std::mem::take(&mut rig.fe));
+    rig.answers();
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    assert!(
+        answers[0].1.contains("the FE is not connected"),
+        "{answers:?}"
+    );
+}

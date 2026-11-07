@@ -13,7 +13,8 @@
 //! | 5.04 Gateway Timeout | a process has not answered in time |
 //!
 //! After 5.04 confd keeps waiting: if the answer is a refusal, it puts the configuration
-//! before back then. A process that disconnects meanwhile is waited for too: confd sends
+//! before back then. A process that disconnects meanwhile (one already disconnected
+//! when the file came is not waited for) is waited for too: confd sends
 //! it everything when it connects again, and its answer counts. confd stops waiting after
 //! [`GIVE_UP_MS`] and logs it. A new file is taken only when every process has answered
 //! everything sent to it; until then it gets 5.03.
@@ -44,7 +45,7 @@ use ruster_proto::coap::Code;
 use ruster_proto::conn::{Connection, Outgoing};
 use ruster_proto::task::Progress;
 
-use crate::{file, Confd, Config};
+use crate::{file, Confd, Config, PeerKind};
 
 /// The largest configuration file accepted.
 const LIMIT: usize = 1 << 20;
@@ -96,6 +97,8 @@ struct Pending {
     /// [`Confd::generation`] of the new configuration.
     generation: u64,
     started_ms: u64,
+    /// Processes not connected when the file came: like absent ones, not waited for.
+    closed_at_start: Vec<PeerKind>,
     notes: Vec<String>,
     /// 5.04 went out; the answer still decides whether to go back.
     timed_out: bool,
@@ -169,6 +172,7 @@ impl Apply {
                                 previous,
                                 generation: confd.generation(),
                                 started_ms: now_ms,
+                                closed_at_start: confd.closed(),
                                 notes,
                                 timed_out: false,
                             });
@@ -210,7 +214,11 @@ impl Apply {
             .refused_since(pending.generation)
             .map(|(kind, reason)| format!("{kind} refused it: {reason}"));
         let waited = now_ms.saturating_sub(pending.started_ms);
-        let answered = confd.settled() && confd.closed().is_empty();
+        let answered = confd.settled()
+            && confd
+                .closed()
+                .iter()
+                .all(|kind| pending.closed_at_start.contains(kind));
         if refusal.is_none() && !answered && waited >= GIVE_UP_MS && pending.timed_out {
             self.pending = None;
             self.counters.gave_up += 1;
@@ -223,8 +231,8 @@ impl Apply {
             pending.timed_out = true;
             let (conn, token) = (pending.conn, pending.token.clone());
             let lines = vec![
-                "a process has not answered in time; confd keeps waiting and goes back to \
-                 the configuration before if it is refused"
+                "a process has not answered in time; confd keeps waiting up to 30 s and \
+                 goes back to the configuration before if it is refused"
                     .to_owned(),
             ];
             self.reply(conn, &token, Code::GATEWAY_TIMEOUT, absent(confd, lines));
@@ -238,7 +246,10 @@ impl Apply {
                 if pending.timed_out {
                     self.counters.late_rollbacks += 1;
                 }
-                let mut lines = vec![why, "the configuration before it is applied again".into()];
+                let mut lines = vec![
+                    why,
+                    "the configuration before it is being sent again".into(),
+                ];
                 lines.extend(prepare(&pending.previous));
                 confd.set_config(pending.previous);
                 (Code::BAD_REQUEST, lines)
