@@ -194,7 +194,11 @@ pub(crate) fn origin(
             egress: underlying,
             source_mac: interface.mac,
             next_hop,
-            destination_mac: fib.neighbor(underlying, next_hop),
+            destination_mac: fib.neighbor(underlying, next_hop).or(crate::pppoe::of(
+                outer.pppoe,
+                underlying,
+            )
+            .map(|session| session.peer)),
             header,
         })
     })())
@@ -214,7 +218,11 @@ pub(crate) fn transmit<S: PacketSlot, T: TraceSink>(
         .next_hop(tunnel.remote)
         .ok_or(DropReason::TunnelNoRoute)?;
     let interface = outer.interface(egress).ok_or(DropReason::InterfaceMiss)?;
-    let Some(mac) = fib.neighbor(egress, next_hop) else {
+    let session = crate::pppoe::of(outer.pppoe, egress).is_some();
+    let Some(mac) = fib
+        .neighbor(egress, next_hop)
+        .or(session.then_some(crate::MacAddress([0; 6])))
+    else {
         trace.record(TraceEvent::Ipv6NeighborMissing {
             egress,
             target: next_hop,
