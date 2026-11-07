@@ -784,6 +784,22 @@ impl PacketSlot for SimSlot<'_> {
         self.slot.as_ref().expect("live sim slot").ingress
     }
 
+    fn resize_front(&mut self, delta: isize) -> bool {
+        let bytes = &mut self.slot.as_mut().expect("live sim slot").bytes;
+        match usize::try_from(delta) {
+            Ok(drop) if drop <= bytes.len() => {
+                bytes.drain(..drop);
+                true
+            }
+            Ok(_) => false,
+            Err(_) => {
+                let add = delta.unsigned_abs();
+                bytes.splice(0..0, std::iter::repeat_n(0, add));
+                true
+            }
+        }
+    }
+
     fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.slot.as_mut().expect("live sim slot").bytes
     }

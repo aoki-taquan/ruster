@@ -481,6 +481,10 @@ pub enum DropReason {
     Ipv6LocalUnsupported = 221,
     /// Neighbor Discovery for the control side with no room in the control queue, or no queue.
     Ipv6ControlQueueFull = 222,
+    /// A tagged frame whose VLAN ID is no sub-interface of its port.
+    VlanUnknown = 223,
+    /// The backend cannot take a tag off or put one on.
+    VlanNoRoom = 224,
 }
 
 use DropReason::*;
@@ -488,7 +492,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 222] = [
+    pub const ALL: [Self; 224] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -711,6 +715,8 @@ impl DropReason {
         Ipv6PacketTooBig,
         Ipv6LocalUnsupported,
         Ipv6ControlQueueFull,
+        VlanUnknown,
+        VlanNoRoom,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -950,6 +956,8 @@ impl DropReason {
             Ipv6PacketTooBig => "IPV6_PACKET_TOO_BIG",
             Ipv6LocalUnsupported => "IPV6_LOCAL_UNSUPPORTED",
             Ipv6ControlQueueFull => "IPV6_CONTROL_QUEUE_FULL",
+            VlanUnknown => "VLAN_UNKNOWN",
+            VlanNoRoom => "VLAN_NO_ROOM",
         }
     }
 }
@@ -1258,6 +1266,8 @@ pub struct ForwardingSnapshot<'a> {
     /// The IPv6 tables ([`ForwardingSnapshot::with_ipv6`]); without them IPv6
     /// frames are dropped as an unsupported Ethernet type.
     pub(crate) ipv6: Option<&'a crate::Ipv6Fib>,
+    /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
+    pub(crate) vlans: &'a [crate::VlanBinding],
     /// Per-VRF snapshots and which one each ingress interface uses
     /// ([`ForwardingSnapshot::with_vrfs`]).
     vrfs: Option<VrfSnapshots<'a>>,
@@ -1464,6 +1474,7 @@ impl<'a> ForwardingSnapshot<'a> {
             arp_to_control: false,
             local_to_control: false,
             ipv6: None,
+            vlans: &[],
             vrfs: None,
             index: None,
             authority: calculate_snapshot_authority(
@@ -1567,6 +1578,14 @@ impl<'a> ForwardingSnapshot<'a> {
             local_to_control: on,
             ..self
         }
+    }
+
+    /// Takes VLAN tags off received frames and puts them on sent ones, by `vlans`
+    /// (see [`crate::VlanBinding`]). Only the outer snapshot's bindings count when
+    /// [`ForwardingSnapshot::with_vrfs`] is used.
+    #[must_use]
+    pub fn with_vlans(self, vlans: &'a [crate::VlanBinding]) -> Self {
+        Self { vlans, ..self }
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1749,6 +1768,7 @@ impl<'a> ForwardingSnapshot<'a> {
             arp_to_control: false,
             local_to_control: false,
             ipv6: None,
+            vlans: &[],
             vrfs: None,
             authority,
             ..self
@@ -2147,6 +2167,7 @@ impl ValidatedForwardingOwner {
             arp_to_control: false,
             local_to_control: false,
             ipv6: None,
+            vlans: &[],
             vrfs: None,
             index: Some(&self.index),
             authority: self.authority,
@@ -4124,12 +4145,29 @@ where
     let mut dropped = 0;
     let mut consumed = 0;
     let all_vrfs = snapshot;
+    let vlans = all_vrfs.vlans;
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
+        if !vlans.is_empty() {
+            if let Err(reason) = crate::vlan::receive(&mut packet, vlans) {
+                let ingress = packet.ingress();
+                packet.recycle(reason);
+                dropped += 1;
+                trace.record(TraceEvent::Dropped { ingress, reason });
+                continue;
+            }
+        }
         let snapshot = all_vrfs.for_ingress(packet.ingress());
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
-                match crate::ipv6::complete(packet, snapshot, fib, control.as_deref_mut(), trace) {
+                match crate::ipv6::complete(
+                    packet,
+                    snapshot,
+                    fib,
+                    control.as_deref_mut(),
+                    vlans,
+                    trace,
+                ) {
                     crate::ipv6::Completed::Transmitted => tx_requested += 1,
                     crate::ipv6::Completed::Dropped => dropped += 1,
                     crate::ipv6::Completed::Consumed => consumed += 1,
@@ -4519,8 +4557,18 @@ where
                     });
                     continue;
                 }
-                packet.commit(egress);
-                tx_requested += 1;
+                match crate::vlan::transmit(&mut packet, egress, vlans) {
+                    Ok(port) => {
+                        packet.commit(port);
+                        tx_requested += 1;
+                    }
+                    Err(reason) => {
+                        packet.recycle(reason);
+                        dropped += 1;
+                        trace.record(TraceEvent::Dropped { ingress, reason });
+                        continue;
+                    }
+                }
                 if let PacketDecision::ArpReply(arp) = decision {
                     trace.record(TraceEvent::ArpReplyRequested {
                         egress,
@@ -10686,6 +10734,8 @@ mod tests {
             (220, "IPV6_PACKET_TOO_BIG"),
             (221, "IPV6_LOCAL_UNSUPPORTED"),
             (222, "IPV6_CONTROL_QUEUE_FULL"),
+            (223, "VLAN_UNKNOWN"),
+            (224, "VLAN_NO_ROOM"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10695,7 +10745,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(223), None);
+        assert_eq!(DropReason::from_code(225), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
