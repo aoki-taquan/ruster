@@ -1956,7 +1956,7 @@ impl<'a> ForwardingSnapshot<'a> {
         &self,
         egress: IfId,
         packet: &[u8],
-    ) -> Option<Result<crate::TunnelOrigin, DropReason>> {
+    ) -> Option<Result<crate::TunnelOrigin, crate::TunnelOriginError>> {
         crate::tunnel::origin(self, egress, packet)
     }
 

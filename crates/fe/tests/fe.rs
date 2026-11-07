@@ -1344,4 +1344,28 @@ fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
     assert_eq!(&tx.bytes[12..14], &[0x86, 0xdd]);
     assert_eq!(tx.bytes[14 + 6], 4);
     assert_eq!(&tx.bytes[14 + 40..], &own[..]);
+
+    // Too big for the tunnel with DF set: not sent, and the kernel is told the
+    // tunnel's MTU.
+    kernel.set_nonblocking(true).unwrap();
+    let mut big = own.clone();
+    big.resize(1500, 0);
+    big[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+    big[6] = 0x40;
+    big[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&big[..20]);
+    big[10..12].copy_from_slice(&checksum.to_be_bytes());
+    kernel.send(&big).unwrap();
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("an ICMP error back");
+    let icmp = &buf[..n];
+    assert_eq!(
+        (icmp[9], icmp[20], icmp[21]),
+        (1, 3, 4),
+        "Fragmentation Needed"
+    );
+    assert_eq!(u16::from_be_bytes([icmp[26], icmp[27]]), 1460);
+    assert_eq!(&icmp[28..48], &big[..20], "the quoted header");
 }

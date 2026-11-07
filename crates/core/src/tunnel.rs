@@ -25,6 +25,10 @@
 //! - No tunnel encapsulation limit option (RFC 2473 4.1.1) and no ICMPv6 errors
 //!   from the tunnel path are relayed as ICMPv4 errors (RFC 2473 8).
 //! - The outer packets are always routed in the default VRF.
+//! - A tunnel's packets are unwrapped only when they arrive on the interface the
+//!   default VRF routes the remote end through (a strict reverse-path check), so
+//!   with two uplinks and asymmetric routing, those arriving on the other one are
+//!   dropped.
 
 use crate::{DropReason, IfId, PacketLease, PacketSlot, TraceEvent, TraceSink};
 
@@ -154,20 +158,29 @@ pub(crate) fn origin(
     outer: &crate::ForwardingSnapshot<'_>,
     egress: IfId,
     packet: &[u8],
-) -> Option<Result<crate::TunnelOrigin, DropReason>> {
+) -> Option<Result<crate::TunnelOrigin, crate::TunnelOriginError>> {
+    use crate::TunnelOriginError::{Dropped, TooBig};
     let tunnel = of(outer.tunnels, egress)?;
     Some((|| {
-        let fib = outer.ipv6.ok_or(DropReason::TunnelNoRoute)?;
+        if packet.first().map(|b| b >> 4) != Some(4) {
+            return Err(Dropped(DropReason::TunnelInnerInvalid));
+        }
+        let mtu = outer
+            .interface(tunnel.interface)
+            .ok_or(Dropped(DropReason::InterfaceMiss))?
+            .mtu;
+        let fib = outer.ipv6.ok_or(Dropped(DropReason::TunnelNoRoute))?;
         let (underlying, next_hop) = fib
             .next_hop(tunnel.remote)
-            .ok_or(DropReason::TunnelNoRoute)?;
+            .ok_or(Dropped(DropReason::TunnelNoRoute))?;
         let interface = outer
             .interface(underlying)
-            .ok_or(DropReason::InterfaceMiss)?;
-        if IPV6_HEADER + packet.len() > usize::from(interface.mtu) {
-            return Err(DropReason::TunnelMtuExceeded);
+            .ok_or(Dropped(DropReason::InterfaceMiss))?;
+        let fits = mtu.min(interface.mtu.saturating_sub(IPV6_HEADER as u16));
+        if packet.len() > usize::from(fits) {
+            return Err(TooBig { mtu: fits });
         }
-        let payload = u16::try_from(packet.len()).map_err(|_| DropReason::TunnelMtuExceeded)?;
+        let payload = u16::try_from(packet.len()).map_err(|_| TooBig { mtu: fits })?;
         let tos = packet.get(1).copied().unwrap_or(0);
         let mut header = [0_u8; IPV6_HEADER];
         header[0] = 0x60 | (tos >> 4);

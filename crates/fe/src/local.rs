@@ -130,3 +130,38 @@ mod tests {
         assert!(!limiter.take(Class::Udp, 1));
     }
 }
+
+/// For an IPv4 `packet` from the kernel that a tunnel of `mtu` cannot carry and
+/// that may not be fragmented (DF set): an ICMP Destination Unreachable,
+/// Fragmentation Needed (RFC 792, RFC 1191 section 4, the Next-Hop MTU), back to
+/// the kernel, so its path MTU discovery lowers the size. Its source is the
+/// packet's destination: the kernel matches it by the quoted header only.
+pub(crate) fn fragmentation_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    if packet.len() < 20 || packet[0] >> 4 != 4 {
+        return None;
+    }
+    let header = usize::from(packet[0] & 0x0f) * 4;
+    let flags = u16::from_be_bytes([packet[6], packet[7]]);
+    let df = flags & 0x4000 != 0;
+    if !df || flags & 0x1fff != 0 || packet.len() < header {
+        return None;
+    }
+    let quote = &packet[..(header + 8).min(packet.len())];
+    let total = 20 + 8 + quote.len();
+    let mut out = vec![0_u8; total];
+    out[0] = 0x45;
+    out[2..4].copy_from_slice(&u16::try_from(total).ok()?.to_be_bytes());
+    out[8] = 64;
+    out[9] = 1;
+    out[12..16].copy_from_slice(&packet[16..20]);
+    out[16..20].copy_from_slice(&packet[12..16]);
+    let checksum = ruster_core::ipv4_header_checksum(&out[..20]);
+    out[10..12].copy_from_slice(&checksum.to_be_bytes());
+    out[20] = 3;
+    out[21] = 4;
+    out[26..28].copy_from_slice(&mtu.to_be_bytes());
+    out[28..].copy_from_slice(quote);
+    let checksum = ruster_core::internet_checksum(&out[20..]);
+    out[22..24].copy_from_slice(&checksum.to_be_bytes());
+    Some(out)
+}

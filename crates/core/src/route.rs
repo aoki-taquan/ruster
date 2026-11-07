@@ -241,3 +241,14 @@ pub struct TunnelOrigin {
     /// The IPv6 header (40 bytes) to put before the IPv4 packet.
     pub header: [u8; 40],
 }
+
+/// Why a packet of the router itself cannot go into a tunnel
+/// ([`crate::ForwardingSnapshot::tunnel_origin`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TunnelOriginError {
+    /// Longer than `mtu`, the most the tunnel carries.
+    TooBig {
+        mtu: u16,
+    },
+    Dropped(crate::DropReason),
+}

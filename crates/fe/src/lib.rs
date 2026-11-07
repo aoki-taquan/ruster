@@ -531,7 +531,17 @@ where
                             false
                         }
                     },
-                    Err(_) => false,
+                    Err(ruster_core::TunnelOriginError::TooBig { mtu }) => {
+                        // Too big for the tunnel and DF set: the kernel learns the
+                        // tunnel's MTU, as from a router on the path.
+                        if let Some(error) = local::fragmentation_needed(&packet, mtu) {
+                            if let Some(pipe) = self.local.get(&self.names[at]) {
+                                let _ = pipe.send(&error);
+                            }
+                        }
+                        false
+                    }
+                    Err(ruster_core::TunnelOriginError::Dropped(_)) => false,
                 };
                 if sent {
                     self.counters.from_kernel += 1;
