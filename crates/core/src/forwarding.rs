@@ -531,6 +531,26 @@ pub enum DropReason {
     PppoeNotIp = 234,
     /// The backend cannot add or remove the PPPoE header in place.
     PppoeNoRoom = 235,
+    /// A WireGuard packet whose outer headers are malformed, with options, or a
+    /// fragment.
+    WireguardOuterInvalid = 236,
+    /// A WireGuard data message of no session of the interface.
+    WireguardUnknownSession = 237,
+    /// A WireGuard data message from an address or port that is not its peer's.
+    WireguardWrongEndpoint = 238,
+    /// A WireGuard data message that is invalid or whose tag is wrong.
+    WireguardAuthentication = 239,
+    /// A WireGuard data message with a repeated or too old counter.
+    WireguardReplay = 240,
+    /// A WireGuard data message whose decrypted packet is not a whole IPv4 packet.
+    WireguardInnerInvalid = 241,
+    /// A WireGuard data message whose inner source is outside its peer's allowed
+    /// addresses.
+    WireguardNotAllowed = 242,
+    /// The backend cannot take the WireGuard headers off in place.
+    WireguardNoRoom = 243,
+    /// An authenticated WireGuard keepalive: the peer is alive, nothing to forward.
+    WireguardKeepalive = 244,
 }
 
 use DropReason::*;
@@ -538,7 +558,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 235] = [
+    pub const ALL: [Self; 244] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -774,6 +794,15 @@ impl DropReason {
         PppoeUnknownSession,
         PppoeNotIp,
         PppoeNoRoom,
+        WireguardOuterInvalid,
+        WireguardUnknownSession,
+        WireguardWrongEndpoint,
+        WireguardAuthentication,
+        WireguardReplay,
+        WireguardInnerInvalid,
+        WireguardNotAllowed,
+        WireguardNoRoom,
+        WireguardKeepalive,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1026,6 +1055,15 @@ impl DropReason {
             PppoeUnknownSession => "PPPOE_UNKNOWN_SESSION",
             PppoeNotIp => "PPPOE_NOT_IP",
             PppoeNoRoom => "PPPOE_NO_ROOM",
+            WireguardOuterInvalid => "WIREGUARD_OUTER_INVALID",
+            WireguardUnknownSession => "WIREGUARD_UNKNOWN_SESSION",
+            WireguardWrongEndpoint => "WIREGUARD_WRONG_ENDPOINT",
+            WireguardAuthentication => "WIREGUARD_AUTHENTICATION",
+            WireguardReplay => "WIREGUARD_REPLAY",
+            WireguardInnerInvalid => "WIREGUARD_INNER_INVALID",
+            WireguardNotAllowed => "WIREGUARD_NOT_ALLOWED",
+            WireguardNoRoom => "WIREGUARD_NO_ROOM",
+            WireguardKeepalive => "WIREGUARD_KEEPALIVE",
         }
     }
 }
@@ -1346,6 +1384,8 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) pppoe: &'a [crate::PppoeSession],
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
     pub(crate) vlans: &'a [crate::VlanBinding],
+    /// WireGuard interfaces ([`ForwardingSnapshot::with_wireguard`]).
+    pub(crate) wireguard: &'a [crate::wireguard::WireguardInterface<'a>],
     /// The time NAT, firewall and ICMP limits count by when no ARP resolution
     /// runtime gives one ([`ForwardingSnapshot::with_now`]).
     pub(crate) now: MonotonicMillis,
@@ -1553,6 +1593,7 @@ impl<'a> ForwardingSnapshot<'a> {
             tunnels: &[],
             pppoe: &[],
             vlans: &[],
+            wireguard: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             index: None,
@@ -1724,6 +1765,16 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub fn with_pppoe(self, pppoe: &'a [crate::PppoeSession]) -> Self {
         Self { pppoe, ..self }
+    }
+
+    /// Takes the WireGuard data messages addressed to the router out of their
+    /// outer packets, as packets arriving on the WireGuard interface (see
+    /// [`crate::wireguard::WireguardInterface`]); the peers' state is
+    /// [`Services::wireguard`]. Only the outer snapshot's interfaces count with
+    /// [`ForwardingSnapshot::with_vrfs`].
+    #[must_use]
+    pub fn with_wireguard(self, wireguard: &'a [crate::wireguard::WireguardInterface<'a>]) -> Self {
+        Self { wireguard, ..self }
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1911,6 +1962,7 @@ impl<'a> ForwardingSnapshot<'a> {
             tunnels: &[],
             pppoe: &[],
             vlans: &[],
+            wireguard: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             authority,
@@ -2286,6 +2338,7 @@ impl ValidatedForwardingOwner {
             tunnels: &[],
             pppoe: &[],
             vlans: &[],
+            wireguard: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             index: Some(&self.index),
@@ -3123,6 +3176,7 @@ where
         services.firewall_audit,
         services.fragmentation,
         services.fragment_tracking,
+        services.wireguard,
         Some(control),
         trace,
     )
@@ -3147,6 +3201,10 @@ pub struct Services<'s, 'c, 'r> {
     pub fragment_tracking: Option<&'s mut Ipv4FragmentTracker<'r>>,
     /// Records the firewall's decisions.
     pub firewall_audit: Option<&'s mut FirewallAuditBuffer<'r>>,
+    /// The state of every WireGuard peer of the snapshot's interfaces, in the
+    /// order of [`crate::wireguard::WireguardInterface::first_peer`]; without it
+    /// WireGuard messages are not opened.
+    pub wireguard: Option<&'s mut [crate::wireguard::PeerState]>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3184,6 +3242,7 @@ where
         firewall,
         firewall_audit,
         fragmentation,
+        None,
         None,
         None,
         trace,
@@ -3226,6 +3285,7 @@ fn forward_batch_tracked<B, T>(
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
     mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
     mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
+    mut wireguard: Option<&mut [crate::wireguard::PeerState]>,
     mut control: Option<&mut crate::ControlQueue>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -3253,8 +3313,12 @@ where
         // A PPPoE session's frame arrives again, out of its session, on the
         // session's interface; a tunnel's IPv6 packet, unwrapped, on its tunnel
         // interface.
+        // WireGuard's data messages come out of their UDP packets the same way.
         if let Err(reason) = crate::pppoe::receive(&mut packet, all_vrfs)
             .and_then(|()| crate::tunnel::receive(&mut packet, all_vrfs).map(|_| ()))
+            .and_then(|()| {
+                crate::wireguard::receive(&mut packet, all_vrfs, wireguard.as_deref_mut())
+            })
         {
             let ingress = packet.ingress();
             packet.recycle(reason);
@@ -9568,6 +9632,15 @@ mod tests {
             (233, "PPPOE_UNKNOWN_SESSION"),
             (234, "PPPOE_NOT_IP"),
             (235, "PPPOE_NO_ROOM"),
+            (236, "WIREGUARD_OUTER_INVALID"),
+            (237, "WIREGUARD_UNKNOWN_SESSION"),
+            (238, "WIREGUARD_WRONG_ENDPOINT"),
+            (239, "WIREGUARD_AUTHENTICATION"),
+            (240, "WIREGUARD_REPLAY"),
+            (241, "WIREGUARD_INNER_INVALID"),
+            (242, "WIREGUARD_NOT_ALLOWED"),
+            (243, "WIREGUARD_NO_ROOM"),
+            (244, "WIREGUARD_KEEPALIVE"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9577,7 +9650,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(236), None);
+        assert_eq!(DropReason::from_code(245), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
