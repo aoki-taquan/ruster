@@ -43,4 +43,6 @@
 ## 確認
 
 変更後、mergeの前にREADMEの「開発」にあるformat、clippy、test、doc testをローカルで実行する。
-CIは同じものを一つのjobで回すだけにしている。プロジェクトが大きくなってから足す。
+netnsの試験（`sudo scripts/netns-skeleton.sh`）もmergeの前にローカルで回す。
+CIは上の4つを一つのjobで回すだけにしている。CIに何かを足すかは、プロジェクトが十分に成熟してから
+ownerが決める。agentはCIを足さない。

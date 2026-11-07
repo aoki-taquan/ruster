@@ -97,7 +97,7 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 | 番号 | 作業 |
 |---|---|
 | 2-1 | 相手が落ちたときのつなぎ直し。CEの実行ファイルを再起動しても転送が止まらないことをnetnsで確かめる |
-| 2-2 | netnsの試験をCIで回す |
+| 2-2 | （外した。CIに足すかは、プロジェクトが成熟してからownerが決める） |
 | 2-3 | FEの実行ファイルをAF_XDPでも動かす。起動、権限、seccompなど`ruster run`の運用の部品をFEへ移す |
 | 2-4 | `ruster-core`からARPの処理を消す。`forward_batch_with_*`の入口を一つにまとめる |
 | 2-5 | 見直し前の`ruster`コマンド（`run`、`run-sim`、SIGHUPの再読み込み）と、それだけが使うcrateを消す。NAT、firewall、フラグメントの処理はcoreに残す |
