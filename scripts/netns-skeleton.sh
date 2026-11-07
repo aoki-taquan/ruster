@@ -67,35 +67,69 @@ TOML
 
 run_dir="$work/run"
 mkdir -m 0700 "$run_dir"
+declare -A pid_of
 start() {
   local name=$1; shift
-  nsx "$router" "$bin/$name" --run-dir "$run_dir" "$@" >"$work/$name.log" 2>&1 &
+  # Not through nsx: a function would run in a subshell, and $! would not be the process.
+  ip netns exec "$router" "$bin/$name" --run-dir "$run_dir" "$@" >>"$work/$name.log" 2>&1 &
   pids+=("$!")
+  pid_of[$name]=$!
 }
-start ruster-fe ra rb
-start ruster-ribd
-start ruster-neighd
-start ruster-confd "$work/router.toml"
+args_of() {
+  case $1 in
+    ruster-fe) echo "ra rb" ;;
+    ruster-confd) echo "$work/router.toml" ;;
+    *) echo "" ;;
+  esac
+}
+start_named() { local name=$1; # shellcheck disable=SC2046
+  start "$name" $(args_of "$name"); }
+stop_named() { kill -9 "${pid_of[$1]}"; wait "${pid_of[$1]}" 2>/dev/null || true; }
 
-ping_ok() { nsx "$1" ping -c 1 -W 1 "$2" >/dev/null 2>&1; }
-
-ok=0
-for _ in $(seq 1 20); do
-  if ping_ok "$host_a" 198.51.100.10; then ok=1; break; fi
-done
-if [[ $ok == 1 ]] && nsx "$host_a" ping -c 5 -i 0.2 -W 1 198.51.100.10 >/dev/null \
-  && nsx "$host_b" ping -c 5 -i 0.2 -W 1 192.0.2.10 >/dev/null; then
-  for pid in "${pids[@]}"; do
-    kill -0 "$pid" || { echo "FAIL: a router process exited" >&2; ok=0; }
-  done
-else
-  ok=0
-fi
-
-if [[ $ok == 1 ]]; then
-  echo "PASS: IPv4 crosses the router both ways (fe, ribd, neighd, confd as separate processes)"
-else
-  echo "FAIL" >&2
+fail() {
+  echo "FAIL: $*" >&2
   for log in "$work"/*.log; do echo "== $log"; cat "$log"; done >&2
   exit 1
-fi
+}
+ping_ok() { nsx "$1" ping -c 1 -W 1 "$2" >/dev/null 2>&1; }
+# Each host pings the other a few times; every reply must come back.
+both_ways() {
+  nsx "$host_a" ping -c 3 -i 0.2 -W 1 198.51.100.10 >/dev/null \
+    && nsx "$host_b" ping -c 3 -i 0.2 -W 1 192.0.2.10 >/dev/null
+}
+# Waits up to 20 seconds for forwarding, then checks both ways.
+comes_up() {
+  for _ in $(seq 1 20); do
+    if ping_ok "$host_a" 198.51.100.10; then both_ways; return; fi
+  done
+  return 1
+}
+all_running() {
+  local name
+  for name in "${!pid_of[@]}"; do kill -0 "${pid_of[$name]}" 2>/dev/null || return 1; done
+}
+
+for name in ruster-fe ruster-ribd ruster-neighd ruster-confd; do start_named "$name"; done
+comes_up || fail "IPv4 does not cross the router"
+all_running || fail "a router process exited"
+echo "ok: IPv4 crosses the router both ways (four separate processes)"
+
+# A control process that dies does not stop forwarding, and comes back by itself.
+for name in ruster-ribd ruster-neighd ruster-confd; do
+  stop_named "$name"
+  both_ways || fail "forwarding stopped while $name was down"
+  start_named "$name"
+  sleep 2
+  both_ways || fail "forwarding stopped after $name restarted"
+  all_running || fail "a router process exited after $name restarted"
+  echo "ok: $name restarted without stopping forwarding"
+done
+
+# A restarted FE starts empty; the control processes connect again and fill it.
+stop_named ruster-fe
+start_named ruster-fe
+comes_up || fail "forwarding did not come back after the FE restarted"
+all_running || fail "a router process exited after the FE restarted"
+echo "ok: the control processes refilled a restarted FE"
+
+echo "PASS"

@@ -74,6 +74,8 @@ pub struct Ribd {
     /// unrefreshed routes were deleted.
     waiting_since: Option<Option<u64>>,
     dirty: bool,
+    /// A new FE connection got resync-begin; resync-end follows the next push.
+    resync_pending: bool,
     counters: RibdCounters,
 }
 
@@ -104,6 +106,7 @@ impl Ribd {
             sent: BTreeMap::new(),
             waiting_since: Some(None),
             dirty: false,
+            resync_pending: false,
             counters: RibdCounters::default(),
         })
     }
@@ -117,6 +120,24 @@ impl Ribd {
             .find(|s| s.spec.name == name)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown route source"))?;
         source.server.attach(stream, &[sid::ROUTE])
+    }
+
+    /// True once the FE connection closed (the FE stopped or restarted).
+    pub fn fe_closed(&self) -> bool {
+        self.fe.is_closed()
+    }
+
+    /// Replaces a closed FE connection and sends the FE every selected route again.
+    /// Routes the FE holds that are no longer selected are deleted, unless ribd is
+    /// still waiting for its sources after start-up.
+    pub fn reconnect_fe(&mut self, stream: UnixStream) -> io::Result<()> {
+        let mut fe = Client::new(stream)?;
+        fe.resync_begin();
+        self.fe = fe;
+        self.sent.clear();
+        self.dirty = true;
+        self.resync_pending = self.waiting_since.is_none();
+        Ok(())
     }
 
     pub fn counters(&self) -> RibdCounters {
@@ -185,6 +206,10 @@ impl Task for Ribd {
         self.count_refusals(&events);
         if std::mem::take(&mut self.dirty) {
             self.push();
+            progress.busy = true;
+        }
+        if std::mem::take(&mut self.resync_pending) {
+            self.fe.resync_end();
             progress.busy = true;
         }
         if let Some(waiting) = &mut self.waiting_since {

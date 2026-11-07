@@ -61,6 +61,14 @@ pub struct ConfdCounters {
     pub patches_refused: u64,
 }
 
+/// A process confd writes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerKind {
+    Fe,
+    Ribd,
+    Neighd,
+}
+
 /// One process confd writes to, and what it was sent.
 struct Peer {
     client: Client,
@@ -113,6 +121,19 @@ impl Confd {
     pub fn connect_neighd(&mut self, stream: UnixStream) -> io::Result<()> {
         self.neighd = Some(self.full_send(stream, Self::interface_tables, false)?);
         Ok(())
+    }
+
+    /// The peers whose connection closed. Connecting again sends everything again.
+    pub fn closed(&self) -> Vec<PeerKind> {
+        [
+            (PeerKind::Fe, &self.fe),
+            (PeerKind::Ribd, &self.ribd),
+            (PeerKind::Neighd, &self.neighd),
+        ]
+        .into_iter()
+        .filter(|(_, peer)| peer.as_ref().is_some_and(|peer| peer.client.is_closed()))
+        .map(|(kind, _)| kind)
+        .collect()
     }
 
     pub fn config(&self) -> &Config {
