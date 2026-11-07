@@ -48,23 +48,33 @@ nsx "$router" ip link set lo up
 # hosts compute their own.
 nsx "$host_a" ethtool -K a0 tx off >/dev/null
 nsx "$host_b" ethtool -K b0 tx off >/dev/null
+# No duplicate address detection on the hosts, so their IPv6 addresses work at once.
+nsx "$host_a" sysctl -qw net.ipv6.conf.default.accept_dad=0 net.ipv6.conf.all.accept_dad=0
+nsx "$host_b" sysctl -qw net.ipv6.conf.default.accept_dad=0 net.ipv6.conf.all.accept_dad=0
 nsx "$host_a" ip link set a0 up
 nsx "$host_a" ip addr add 192.0.2.10/24 dev a0
 nsx "$host_a" ip route add default via 192.0.2.1
+nsx "$host_a" ip addr add 2001:db8:1::10/64 dev a0 nodad
+# The router's link-local addresses come from its MAC addresses (modified EUI-64).
+nsx "$host_a" ip -6 route add default via fe80::ff:fe00:1 dev a0
 nsx "$host_b" ip link set b0 up
 nsx "$host_b" ip addr add 198.51.100.10/24 dev b0
 nsx "$host_b" ip route add default via 198.51.100.1
+nsx "$host_b" ip addr add 2001:db8:2::10/64 dev b0 nodad
+nsx "$host_b" ip -6 route add default via fe80::ff:fe00:2 dev b0
 
 cat > "$work/router.toml" <<'TOML'
 [[interface]]
 name = "ra"
 mac = "02:00:00:00:00:01"
 ipv4 = "192.0.2.1/24"
+ipv6 = ["2001:db8:1::1/64"]
 
 [[interface]]
 name = "rb"
 mac = "02:00:00:00:00:02"
 ipv4 = "198.51.100.1/24"
+ipv6 = ["2001:db8:2::1/64"]
 TOML
 
 run_dir="$work/run"
@@ -97,12 +107,17 @@ ping_ok() { nsx "$1" ping -c 1 -W 1 "$2" >/dev/null 2>&1; }
 # Each host pings the other a few times; every reply must come back.
 both_ways() {
   nsx "$host_a" ping -c 3 -i 0.2 -W 1 198.51.100.10 >/dev/null \
-    && nsx "$host_b" ping -c 3 -i 0.2 -W 1 192.0.2.10 >/dev/null
+    && nsx "$host_b" ping -c 3 -i 0.2 -W 1 192.0.2.10 >/dev/null \
+    && nsx "$host_a" ping -6 -c 3 -i 0.2 -W 1 2001:db8:2::10 >/dev/null \
+    && nsx "$host_b" ping -6 -c 3 -i 0.2 -W 1 2001:db8:1::10 >/dev/null
 }
 # Waits up to 20 seconds for forwarding, then checks both ways.
 comes_up() {
   for _ in $(seq 1 20); do
-    if ping_ok "$host_a" 198.51.100.10; then both_ways; return; fi
+    if ping_ok "$host_a" 198.51.100.10 && ping_ok "$host_a" 2001:db8:2::10; then
+      both_ways
+      return
+    fi
   done
   return 1
 }
@@ -114,7 +129,7 @@ all_running() {
 for name in ruster-fe ruster-ribd ruster-neighd ruster-confd; do start_named "$name"; done
 comes_up || fail "IPv4 does not cross the router"
 all_running || fail "a router process exited"
-echo "ok: IPv4 crosses the router both ways (four separate processes)"
+echo "ok: IPv4 and IPv6 cross the router both ways (four separate processes)"
 
 # A control process that dies does not stop forwarding, and comes back by itself.
 # Counts the lines of a log that say a connection was made again.
