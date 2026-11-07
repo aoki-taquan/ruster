@@ -45,6 +45,8 @@ pub struct InterfaceConfig {
     pub vrf: String,
     /// For a VLAN sub-interface: its parent interface and VLAN ID.
     pub vlan: Option<(String, u16)>,
+    /// For an IPv4 in IPv6 tunnel: its local and remote IPv6 addresses.
+    pub tunnel: Option<(Ipv6Addr, Ipv6Addr)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,7 +300,9 @@ impl Confd {
                             parent: parent.clone(),
                             id: *id,
                         }),
-                    tunnel: None,
+                    tunnel: interface
+                        .tunnel
+                        .map(|(local, remote)| ruster_proto::table::Tunnel { local, remote }),
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);

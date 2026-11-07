@@ -42,6 +42,7 @@ fn a_file_becomes_the_configuration() {
                 ipv6: Vec::new(),
                 vrf: "default".into(),
                 vlan: None,
+                tunnel: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -52,6 +53,7 @@ fn a_file_becomes_the_configuration() {
                 ipv6: Vec::new(),
                 vrf: "default".into(),
                 vlan: None,
+                tunnel: None,
             },
         ]
     );
@@ -641,5 +643,66 @@ fn an_interface_address_is_not_its_network_or_broadcast() {
         "10.0.0.1/32",
     ] {
         assert!(parse(&with(good)).is_ok(), "{good}");
+    }
+}
+
+#[test]
+fn a_tunnel_interface_needs_no_mac_and_sends_from_a_router_address() {
+    let wan = "[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv6 = [\"2001:db8:1::2/64\"]\n";
+    let dslite = |local: &str, extra: &str| {
+        format!("{wan}[[interface]]\nname = \"dslite\"\ntunnel = {{ local = \"{local}\", remote = \"2001:db8:ff::1\" }}\n{extra}")
+    };
+    let config = parse(&dslite("2001:db8:1::2", "ipv4 = \"192.0.0.2/29\"\n")).unwrap();
+    let tunnel = &config.interfaces[1];
+    assert_eq!(tunnel.mtu, 1460);
+    assert_eq!(
+        tunnel.tunnel,
+        Some((
+            "2001:db8:1::2".parse().unwrap(),
+            "2001:db8:ff::1".parse().unwrap()
+        ))
+    );
+    for (text, expected) in [
+        (
+            dslite("2001:db8:9::9", ""),
+            "must be an IPv6 address of an interface",
+        ),
+        (dslite("fe80::1", ""), "global unicast"),
+        (dslite("192.0.2.1", ""), "IPv6 address"),
+        (dslite("2001:db8:1::2", "mtu = 1500\n"), "mtu must be"),
+        (
+            dslite("2001:db8:1::2", "parent = \"wan\"\nvlan = 10\n"),
+            "not both",
+        ),
+        (
+            dslite("2001:db8:1::2", "ipv6 = [\"2001:db8:5::1/64\"]\n"),
+            "IPv4 only",
+        ),
+        (
+            dslite("2001:db8:1::2", "[[route]]\nprefix = \"2001:db8:9::/48\"\ninterface = \"dslite\"\n"),
+            "carries IPv4 only",
+        ),
+        (
+            dslite("2001:db8:1::2", "")
+                .replace("ipv6 = [\"2001:db8:1::2/64\"]", "mtu = 1454\nipv6 = [\"2001:db8:1::2/64\"]"),
+            "at most 1414",
+        ),
+        (
+            format!(
+                "{}[[interface]]\nname = \"other\"\ntunnel = {{ local = \"2001:db8:1::2\", remote = \"2001:db8:ff::1\" }}\n",
+                dslite("2001:db8:1::2", "")
+            ),
+            "same local and remote",
+        ),
+        (
+            format!(
+                "{}[[interface]]\nname = \"d.10\"\nparent = \"dslite\"\nvlan = 10\n",
+                dslite("2001:db8:1::2", "")
+            ),
+            "parent",
+        ),
+    ] {
+        let got = error(&text);
+        assert!(got.contains(expected), "{text}: {got}");
     }
 }
