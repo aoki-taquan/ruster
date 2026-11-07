@@ -1444,6 +1444,21 @@ impl<'memory> RxFillEngine<'memory> {
         true
     }
 
+    /// Cuts a lease's visible bytes to the first `len` (see
+    /// `ruster_core::PacketSlot::truncate`). The frame only gets shorter, so its
+    /// geometry stays valid.
+    pub(crate) fn lease_truncate(&mut self, lease: &mut RawLease, len: usize) -> bool {
+        self.check_lease(lease);
+        let Some(cut) = u32::try_from(len)
+            .ok()
+            .and_then(|len| lease.descriptor.truncated(len))
+        else {
+            return false;
+        };
+        lease.descriptor = cut;
+        true
+    }
+
     /// Whether a lease's visible bytes start inside the frame's headroom (its front
     /// was grown there): such a frame cannot be sent in place.
     pub(crate) fn lease_before_headroom(&self, lease: &RawLease) -> bool {

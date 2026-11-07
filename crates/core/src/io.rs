@@ -229,6 +229,15 @@ pub trait PacketSlot {
         let _ = delta;
         false
     }
+
+    /// Cuts the frame to its first `len` bytes (`0 < len <= ` the current length;
+    /// the bytes cut off are never read again). Returns `false`, changing nothing,
+    /// when `len` is not so or the backend cannot. A transmit sends the frame as it
+    /// is after the cut. The default cannot.
+    fn truncate(&mut self, len: usize) -> bool {
+        let _ = len;
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -392,6 +401,11 @@ impl<S: PacketSlot> PacketLease<S> {
             .as_mut()
             .expect("live packet lease")
             .resize_front(delta)
+    }
+
+    /// See [`PacketSlot::truncate`].
+    pub fn truncate(&mut self, len: usize) -> bool {
+        self.slot.as_mut().expect("live packet lease").truncate(len)
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {

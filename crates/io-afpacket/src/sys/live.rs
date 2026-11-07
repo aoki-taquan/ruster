@@ -347,6 +347,10 @@ impl PacketSlot for AfPacketRxSlot<'_, '_> {
         self.0.resize_front(delta)
     }
 
+    fn truncate(&mut self, len: usize) -> bool {
+        self.0.truncate(len)
+    }
+
     fn bytes_mut(&mut self) -> &mut [u8] {
         self.0.bytes_mut()
     }

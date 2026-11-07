@@ -92,6 +92,15 @@ impl ValidatedDescriptor {
         })
     }
 
+    /// The same packet cut to its first `len` bytes: shorter than now and not empty.
+    #[must_use]
+    pub fn truncated(self, len: u32) -> Option<Self> {
+        if len == 0 || len > self.len {
+            return None;
+        }
+        Some(Self { len, ..self })
+    }
+
     pub(crate) fn belongs_to(self, domain: DomainIdentity) -> bool {
         self.domain == domain
     }

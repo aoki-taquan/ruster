@@ -522,3 +522,21 @@ fn test_generation_hook_refuses_to_move_backward() {
     ledger.cancel_fill(token).expect("cancel");
     ledger.set_free_generation_for_test(0, 0);
 }
+
+#[test]
+fn a_descriptor_can_only_be_cut_shorter_and_not_to_nothing() {
+    let layout = layout(1, 4, 2048, 256);
+    let descriptor = layout
+        .validate_descriptor(RawDescriptor {
+            addr: 256,
+            len: 100,
+            options: 0,
+        })
+        .unwrap();
+    let cut = descriptor.truncated(60).unwrap();
+    assert_eq!((cut.data_offset(), cut.len()), (256, 60));
+    assert_eq!(cut.frame(), descriptor.frame());
+    assert_eq!(descriptor.truncated(100), Some(descriptor));
+    assert_eq!(descriptor.truncated(101), None);
+    assert_eq!(descriptor.truncated(0), None);
+}

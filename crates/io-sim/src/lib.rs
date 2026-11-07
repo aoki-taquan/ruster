@@ -767,6 +767,15 @@ impl PacketSlot for SimSlot<'_> {
         }
     }
 
+    fn truncate(&mut self, len: usize) -> bool {
+        let bytes = &mut self.slot.as_mut().expect("live sim slot").bytes;
+        if len == 0 || len > bytes.len() {
+            return false;
+        }
+        bytes.truncate(len);
+        true
+    }
+
     fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.slot.as_mut().expect("live sim slot").bytes
     }
