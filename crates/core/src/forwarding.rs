@@ -2928,8 +2928,10 @@ impl PacketDecision {
     }
 }
 
-/// Whether `frame` is an unfragmented IPv4 UDP or TCP packet to a NAT's public
-/// address on a port outside that NAT's pool.
+/// Whether `frame` is the router's own traffic on a NAT's public address, which NAT
+/// leaves alone: an unfragmented IPv4 UDP or TCP packet to the public address on a
+/// port outside that NAT's pool, or an ICMPv4 error to it quoting such a packet
+/// that the router sent (from the public address, from a port outside the pool).
 fn outside_nat_pool(
     frame: &[u8],
     udp: Option<&Nat44UdpConfig>,
@@ -2941,19 +2943,51 @@ fn outside_nat_pool(
     }
     let header = usize::from(frame[IP] & 0x0f) * 4;
     let unfragmented = packet::read_u16(frame, IP + 6).is_some_and(|flags| flags & 0x3fff == 0);
-    let Some(port) = packet::read_u16(frame, IP + header + 2) else {
-        return false;
-    };
-    if !unfragmented {
+    if !unfragmented || header < 20 {
         return false;
     }
-    let destination = &frame[IP + 16..IP + 20];
-    let outside = |public: crate::Ipv4Address, first: u16, last: u16| {
-        public.octets() == destination && !(first..=last).contains(&port)
+    // The router's address, protocol and port of the packet NAT would look at.
+    let (address, protocol, port) = match frame[IP + 9] {
+        protocol @ (6 | 17) => (IP + 16, protocol, packet::read_u16(frame, IP + header + 2)),
+        1 => {
+            // Destination Unreachable, Time Exceeded and Parameter Problem quote
+            // the packet that caused them: the router's own when it came from the
+            // public address.
+            let icmp = IP + header;
+            if !matches!(frame.get(icmp), Some(3 | 11 | 12)) {
+                return false;
+            }
+            let quoted = icmp + 8;
+            let Some(&first) = frame.get(quoted) else {
+                return false;
+            };
+            let quoted_header = usize::from(first & 0x0f) * 4;
+            if first >> 4 != 4 || quoted_header < 20 || frame.len() < quoted + 20 {
+                return false;
+            }
+            let destination = &frame[IP + 16..IP + 20];
+            if &frame[quoted + 12..quoted + 16] != destination {
+                return false;
+            }
+            (
+                quoted + 12,
+                frame[quoted + 9],
+                packet::read_u16(frame, quoted + quoted_header),
+            )
+        }
+        _ => return false,
     };
-    match frame[IP + 9] {
-        17 => udp.is_some_and(|c| outside(c.public_address(), c.first_port(), c.last_port())),
-        6 => tcp.is_some_and(|c| outside(c.public_address(), c.first_port(), c.last_port())),
+    let Some(port) = port else {
+        return false;
+    };
+    let ours = |public: crate::Ipv4Address, first: u16, last: u16| {
+        frame.get(address..address + 4) == Some(&public.octets()[..])
+            && frame[IP + 16..IP + 20] == public.octets()
+            && !(first..=last).contains(&port)
+    };
+    match protocol {
+        17 => udp.is_some_and(|c| ours(c.public_address(), c.first_port(), c.last_port())),
+        6 => tcp.is_some_and(|c| ours(c.public_address(), c.first_port(), c.last_port())),
         _ => false,
     }
 }

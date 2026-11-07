@@ -1122,4 +1122,30 @@ fn with_nat_the_router_s_own_ports_on_the_wan_address_still_reach_the_kernel() {
     bench.fe.step(bench.now);
     assert!(kernel.recv(&mut buf).is_err());
     assert!(bench.fe.io_mut().pop_tx().is_none());
+
+    // An ICMP Fragmentation Needed about the router's own UDP from port 53 is the
+    // router's too; one about a pool port is NAT's (and has no mapping).
+    let frag_needed = |port: u16| {
+        let mut quoted = to_wan(2000)[14..42].to_vec();
+        quoted[12..16].copy_from_slice(&[198, 51, 100, 2]);
+        quoted[16..20].copy_from_slice(&INTERNET);
+        quoted[20..22].copy_from_slice(&port.to_be_bytes());
+        let mut frame = to_wan(0)[..34].to_vec();
+        frame[14 + 9] = 1;
+        frame[16..18].copy_from_slice(&(20 + 8 + 28_u16).to_be_bytes());
+        frame.extend_from_slice(&[3, 4, 0, 0, 0, 0, 0x05, 0x00]);
+        frame.extend_from_slice(&quoted);
+        let icmp_checksum = ipv4_header_checksum(&frame[34..]);
+        frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    };
+    bench.fe.io_mut().inject(IfId(1), frag_needed(53));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_ok(), "the router's own");
+    bench.fe.io_mut().inject(IfId(1), frag_needed(40_003));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_err(), "NAT's");
 }
