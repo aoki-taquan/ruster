@@ -145,6 +145,7 @@ sudo scripts/netns-skeleton.sh target/debug                       # AF_XDP
 sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 sudo scripts/netns-vrf.sh target/debug       # VRF: 同じアドレスの2つのVRFと、片方だけの漏らし
 sudo scripts/netns-vlan.sh target/debug      # VLAN: 同じポートの2つのVLANとタグなしの上流（AF_XDPだけ）
+sudo scripts/netns-wireguard.sh target/debug # WireGuard: 対向はPythonのOpenSSL（鍵交換なし、固定のセッション鍵）
 ```
 
 ## 開発
