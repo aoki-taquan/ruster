@@ -71,11 +71,21 @@ Unix socketのメッセージでつながり、IPv4が両方向に転送され�
 - neighdは再起動したときresyncせず、FEの近隣の表を引き継ぐ。
 - 送り手の「送り終わった」は`POST c/sync-done`。
 
-骨組みに入っていないもの（段階2以降）:
+骨組みに入っていないもの:
 
-- 各プロセスの実行ファイル。今は試験の中で同じプロセスに載せ、本物のsocketでつないでいる。
-- 人が書く設定ファイルの書き方（confdは今Rustの値を受け取る）。
 - 学習した近隣の確かめ直しと期限切れ、FEやribdへの再接続、表の一部を共有する構造。
+
+#### 実際のLinuxの上の骨組み（2026-11-07）
+
+各プロセスは実行ファイルになった（`ruster-fe`、`ruster-ribd`、`ruster-neighd`、`ruster-confd`）。
+FEはAF_PACKETの上で動き、confdはTOMLの設定ファイル（`crates/confd/src/file.rs`）を読む。
+socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の置き場所（`--run-dir`で変えられる）。
+`sudo scripts/netns-skeleton.sh`が、netnsとvethでつないだ2台のホストの間をIPv4が両方向に
+転送されることを確かめる。CIでは回していない。
+
+- 起動の順番はFEが先。ほかのプロセスは相手のsocketができるまで10秒待つ。相手が落ちたときの
+  つなぎ直しはまだ無い。
+- FEは暇なとき1ms待つだけで回り続ける。待ち方はAF_XDPに替えるときに見直す。
 
 ### 段階2: 置き換え
 

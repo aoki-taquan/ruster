@@ -74,6 +74,8 @@ name = "ruster-confd"
 version = "0.2.0"
 dependencies = [
  "ruster-proto",
+ "serde",
+ "toml",
 ]
 
 [[package]]
