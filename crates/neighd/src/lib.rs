@@ -1,16 +1,19 @@
 #![forbid(unsafe_code)]
-//! The neighbor process: ARP for IPv4 (`docs/design/ce-processes.md`).
+//! The neighbor process: ARP for IPv4 and Neighbor Discovery for IPv6
+//! (`docs/design/ce-processes.md`).
 //!
 //! - It learns the router's own interfaces and addresses from confd, which writes them
 //!   to neighd's own small table server.
-//! - It answers ARP requests for those addresses.
+//! - It answers ARP requests and Neighbor Solicitations for those addresses.
 //! - When the FE reports a next hop missing from its neighbor table, neighd sends ARP
-//!   requests (three, one second apart) and writes the answer to the FE.
+//!   requests or Neighbor Solicitations (three, one second apart) and writes the
+//!   answer to the FE.
 //! - On start it reads the neighbor table the FE already holds and keeps it, so a
 //!   restart does not remove a single neighbor from forwarding.
 //!
-//! Skeleton limits: no aging or re-checking of learned neighbors, no ND (IPv6), no
-//! announcements or duplicate address detection.
+//! Skeleton limits: no aging or re-checking of learned neighbors (no Neighbor
+//! Unreachability Detection), no announcements or duplicate address detection of our
+//! own addresses. Router Solicitations and Advertisements are not neighd's.
 //!
 //! # Standards
 //!
@@ -19,23 +22,35 @@
 //! - RFC 1122 section 2.3.2.1: at most one request per second per next hop.
 //! - RFC 5227 section 2.4: a packet whose sender claims our own address is not learned
 //!   or answered.
+//! - RFC 4861 section 7.2.3: a Neighbor Solicitation's Source Link-Layer Address is
+//!   recorded, and one for our address is answered with a solicited Advertisement
+//!   (to all nodes, unsolicited, when the asker is doing duplicate address detection).
+//!   Section 7.2.5: an Advertisement updates a neighbor neighd is resolving or knows.
+//!   Section 7.2.2: three solicitations one second apart (MAX_MULTICAST_SOLICIT,
+//!   RETRANS_TIMER) to the target's solicited-node group. Message checks in `nd.rs`.
 //!
 //! Deviations from RFC 826: a sender that targets us is added only if it is a host on
 //! that interface's subnet, and at most 4096 neighbors are kept. A packet waiting for a
 //! next hop is dropped, not queued (RFC 1122 section 2.3.2.2 says to keep at least
-//! one). Conflicts are not announced or defended (RFC 5227 section 2.4).
+//! one). Conflicts are not announced or defended (RFC 5227 section 2.4). Deviations
+//! from RFC 4861: no neighbor states (INCOMPLETE, STALE, REACHABLE...) or reachability
+//! confirmation; an Advertisement always replaces the link-layer address regardless
+//! of its Override flag; a solicitation's source is recorded only if it is link-local
+//! or on one of the interface's prefixes.
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 
 use ruster_proto::cbor::Decoder;
 use ruster_proto::coap::Code;
 use ruster_proto::punt::{self, Direction, Punt};
 use ruster_proto::session::{decode_changes, Client, Event, Hook, Server, Store};
-use ruster_proto::table::{Change, Key, ResolveRequest, Value};
+use ruster_proto::table::{network, Change, Key, ResolveRequest, Value};
 use ruster_proto::task::{Progress, Task};
+
+mod nd;
 
 /// The tables confd writes to neighd.
 pub const CONFIG_TABLES: &[u64] = &[ruster_proto::sid::INTERFACE, ruster_proto::sid::ADDRESS];
@@ -60,6 +75,8 @@ pub struct NeighdCounters {
     pub given_up: u64,
     pub bad_punts: u64,
     pub not_learned: u64,
+    /// Router Solicitations and Advertisements and Redirects, which are not neighd's.
+    pub not_for_neighd: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -83,8 +100,8 @@ pub struct Neighd {
     fe_state: FeState,
     adopt_since: Option<u64>,
     punt: UnixDatagram,
-    known: BTreeMap<(String, Ipv4Addr), [u8; 6]>,
-    pending: BTreeMap<(String, Ipv4Addr), Pending>,
+    known: BTreeMap<(String, IpAddr), [u8; 6]>,
+    pending: BTreeMap<(String, IpAddr), Pending>,
     counters: NeighdCounters,
 }
 
@@ -151,7 +168,7 @@ impl Neighd {
                 Change::set(
                     Key::Neighbor {
                         interface: interface.clone(),
-                        address: (*address).into(),
+                        address: *address,
                     },
                     Value::Neighbor { mac: *mac },
                 )
@@ -220,6 +237,59 @@ impl Neighd {
             .map(|&(address, _)| address)
     }
 
+    /// The IPv6 address to ask from: link-local for a link-local target, else one on
+    /// the target's prefix, else link-local, else any (RFC 6724 in its simplest form).
+    fn local_address_v6(&self, interface: &str, target: Ipv6Addr) -> Option<Ipv6Addr> {
+        let addresses: Vec<(Ipv6Addr, u8)> = self
+            .local
+            .store()
+            .iter()
+            .filter_map(|(key, value)| match (key, value) {
+                (
+                    Key::Address {
+                        interface: name,
+                        address: IpAddr::V6(address),
+                    },
+                    Value::Address { prefix_len },
+                ) if name == interface => Some((*address, *prefix_len)),
+                _ => None,
+            })
+            .collect();
+        let link_local = addresses
+            .iter()
+            .map(|&(a, _)| a)
+            .find(Ipv6Addr::is_unicast_link_local);
+        if target.is_unicast_link_local() {
+            return link_local;
+        }
+        let on_prefix = addresses
+            .iter()
+            .find(|&&(a, len)| network(IpAddr::V6(a), len) == network(IpAddr::V6(target), len));
+        on_prefix
+            .map(|&(a, _)| a)
+            .or(link_local)
+            .or(addresses.first().map(|&(a, _)| a))
+    }
+
+    /// Link-local, or on one of the interface's IPv6 prefixes.
+    fn on_link_v6(&self, interface: &str, address: Ipv6Addr) -> bool {
+        address.is_unicast_link_local()
+            || self.local.store().iter().any(|(key, value)| {
+                matches!(
+                    (key, value),
+                    (
+                        Key::Address {
+                            interface: name,
+                            address: IpAddr::V6(local),
+                        },
+                        Value::Address { prefix_len },
+                    ) if name == interface
+                        && network(IpAddr::V6(*local), *prefix_len)
+                            == network(IpAddr::V6(address), *prefix_len)
+                )
+            })
+    }
+
     /// A host address on one of the interface's subnets (not its network or broadcast
     /// address), so a neighbor there is possible.
     fn on_link_host(&self, interface: &str, sender: Ipv4Addr) -> bool {
@@ -237,7 +307,7 @@ impl Neighd {
             })
     }
 
-    fn is_local(&self, interface: &str, address: Ipv4Addr) -> bool {
+    fn is_local(&self, interface: &str, address: impl Into<IpAddr>) -> bool {
         self.local
             .store()
             .get(&Key::Address {
@@ -258,10 +328,7 @@ impl Neighd {
                     if code == Code::CONTENT {
                         for change in decode_changes(&payload).unwrap_or_default() {
                             if let (
-                                Key::Neighbor {
-                                    interface,
-                                    address: IpAddr::V4(address),
-                                },
+                                Key::Neighbor { interface, address },
                                 Some(Value::Neighbor { mac }),
                             ) = (change.key, change.value)
                             {
@@ -274,12 +341,8 @@ impl Neighd {
                 }
                 Event::Notification { payload } => {
                     let mut d = Decoder::new(&payload);
-                    if let Ok(ResolveRequest {
-                        interface,
-                        address: IpAddr::V4(address),
-                    }) = ResolveRequest::decode(&mut d)
-                    {
-                        self.resolve(interface, address, now_ms);
+                    if let Ok(request) = ResolveRequest::decode(&mut d) {
+                        self.resolve(request.interface, request.address, now_ms);
                     }
                 }
                 // A refused Observe registration is tried again.
@@ -299,7 +362,7 @@ impl Neighd {
         self.fe_state = FeState::Running { observe };
     }
 
-    fn resolve(&mut self, interface: String, address: Ipv4Addr, now_ms: u64) {
+    fn resolve(&mut self, interface: String, address: IpAddr, now_ms: u64) {
         let key = (interface, address);
         if self.known.contains_key(&key) || self.pending.contains_key(&key) {
             return;
@@ -314,7 +377,7 @@ impl Neighd {
     }
 
     fn retry(&mut self, now_ms: u64) -> Progress {
-        let due: Vec<(String, Ipv4Addr)> = self
+        let due: Vec<(String, IpAddr)> = self
             .pending
             .iter()
             .filter(|(_, p)| p.next_at <= now_ms)
@@ -329,12 +392,20 @@ impl Neighd {
                 continue;
             }
             let (interface, target) = &key;
-            if let (Some(mac), Some(source)) = (
-                self.local_mac(interface),
-                self.local_address(interface, *target),
-            ) {
-                let frame = arp_frame(1, mac, source, [0xff; 6], [0; 6], *target);
-                self.send(interface, &frame);
+            let request = match (self.local_mac(interface), *target) {
+                (Some(mac), IpAddr::V4(target)) => {
+                    self.local_address(interface, target).map(|source| {
+                        let frame = arp_frame(1, mac, source, [0xff; 6], [0; 6], target);
+                        (punt::reason::ARP, frame.to_vec())
+                    })
+                }
+                (Some(mac), IpAddr::V6(target)) => self
+                    .local_address_v6(interface, target)
+                    .map(|source| (punt::reason::ND, nd::solicitation(mac, source, target))),
+                (None, _) => None,
+            };
+            if let Some((reason, frame)) = request {
+                self.send(interface, reason, &frame);
                 self.counters.requests_sent += 1;
             }
             let pending = self.pending.get_mut(&key).expect("still pending");
@@ -348,7 +419,7 @@ impl Neighd {
     }
 
     fn receive_punts(&mut self) -> bool {
-        let mut buf = [0_u8; 512];
+        let mut buf = [0_u8; 2_048];
         let mut busy = false;
         for _ in 0..PUNTS_PER_STEP {
             let n = match self.punt.recv(&mut buf) {
@@ -366,6 +437,17 @@ impl Neighd {
                 {
                     let interface = punt.interface.to_owned();
                     self.arp(&interface, punt.frame);
+                }
+                Ok(punt)
+                    if punt.direction == Direction::ToControl
+                        && punt.reason == punt::reason::ND =>
+                {
+                    let interface = punt.interface.to_owned();
+                    match nd::parse(punt.frame) {
+                        Ok(message) => self.nd(&interface, message),
+                        Err(nd::Refused::NotForNeighd) => self.counters.not_for_neighd += 1,
+                        Err(nd::Refused::Invalid) => self.counters.bad_punts += 1,
+                    }
                 }
                 _ => self.counters.bad_punts += 1,
             }
@@ -388,7 +470,7 @@ impl Neighd {
 
         // RFC 826: update a neighbor we know or are resolving; add one that is asking
         // for us, if it can be a neighbor on this link.
-        let key = (interface.to_owned(), sender);
+        let key = (interface.to_owned(), IpAddr::V4(sender));
         let known = self.known.contains_key(&key) || self.pending.contains_key(&key);
         let addable =
             for_us && self.on_link_host(interface, sender) && self.known.len() < KNOWN_MAX;
@@ -411,17 +493,97 @@ impl Neighd {
         if opcode == 1 && for_us {
             if let Some(mac) = self.local_mac(interface) {
                 let frame = arp_frame(2, mac, target, sender_mac, sender_mac, sender);
-                self.send(interface, &frame);
+                self.send(interface, punt::reason::ARP, &frame);
                 self.counters.replies_sent += 1;
             }
         }
     }
 
-    fn send(&mut self, interface: &str, frame: &[u8]) {
+    /// Records `mac` for a neighbor and writes it to the FE if it changed.
+    fn learn(&mut self, key: (String, IpAddr), mac: [u8; 6]) {
+        self.pending.remove(&key);
+        if self.known.get(&key) == Some(&mac) {
+            return;
+        }
+        let _ = self.fe.patch(&[Change::set(
+            Key::Neighbor {
+                interface: key.0.clone(),
+                address: key.1,
+            },
+            Value::Neighbor { mac },
+        )]);
+        self.known.insert(key, mac);
+        self.counters.learned += 1;
+    }
+
+    /// RFC 4861 sections 7.2.3 to 7.2.5, for a router with no Neighbor Unreachability
+    /// Detection yet.
+    fn nd(&mut self, interface: &str, message: nd::Message) {
+        let Some(mac) = self.local_mac(interface) else {
+            return;
+        };
+        match message.kind {
+            nd::Kind::Solicitation {
+                target,
+                source_link_layer,
+            } => {
+                // Our own address as source is a duplicate, not a neighbor.
+                if self.is_local(interface, message.source) {
+                    self.counters.not_learned += 1;
+                    return;
+                }
+                if let Some(link_layer) = source_link_layer {
+                    if !message.source.is_unspecified()
+                        && self.on_link_v6(interface, message.source)
+                    {
+                        let key = (interface.to_owned(), IpAddr::V6(message.source));
+                        if self.known.contains_key(&key) || self.known.len() < KNOWN_MAX {
+                            self.learn(key, link_layer);
+                        } else {
+                            self.counters.not_learned += 1;
+                        }
+                    }
+                }
+                if !self.is_local(interface, target) {
+                    return;
+                }
+                let to = if message.source.is_unspecified() {
+                    None
+                } else {
+                    Some((
+                        message.source,
+                        source_link_layer.unwrap_or(message.source_mac),
+                    ))
+                };
+                let frame = nd::advertisement(mac, target, to);
+                self.send(interface, punt::reason::ND, &frame);
+                self.counters.replies_sent += 1;
+            }
+            nd::Kind::Advertisement {
+                target,
+                target_link_layer,
+                ..
+            } => {
+                if self.is_local(interface, target) {
+                    // Someone else claims our address.
+                    self.counters.not_learned += 1;
+                    return;
+                }
+                let key = (interface.to_owned(), IpAddr::V6(target));
+                let wanted = self.pending.contains_key(&key) || self.known.contains_key(&key);
+                match target_link_layer {
+                    Some(link_layer) if wanted => self.learn(key, link_layer),
+                    _ => self.counters.not_learned += 1,
+                }
+            }
+        }
+    }
+
+    fn send(&mut self, interface: &str, reason: u16, frame: &[u8]) {
         let mut message = Vec::with_capacity(frame.len() + 16);
         let punt = Punt {
             direction: Direction::FromControl,
-            reason: punt::reason::ARP,
+            reason,
             interface,
             frame,
         };
