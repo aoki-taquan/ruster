@@ -6,11 +6,12 @@
 //! streams ([`coap`]), the SIDs ([`sid`]), the table entries ([`table`]), one
 //! connection over a Unix stream ([`conn`]), the table server and client
 //! ([`session`]), frames passed to and from the CE ([`punt`]) and the task
-//! interface ([`task`]).
+//! interface ([`task`]), and what each process's `main` shares ([`daemon`]).
 
 pub mod cbor;
 pub mod coap;
 pub mod conn;
+pub mod daemon;
 pub mod punt;
 pub mod session;
 pub mod sid;

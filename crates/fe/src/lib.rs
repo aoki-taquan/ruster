@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
 use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::path::PathBuf;
 
 use ruster_core::{
     forward_batch, ArpOpcode, GeneratedPacketBatch, GeneratedPacketIo, IfId, Interface,
@@ -81,6 +82,8 @@ pub struct Fe<B> {
     active: Vec<IfId>,
     server: Server,
     punt: Option<UnixDatagram>,
+    /// Where ARP goes when the punt socket is not connected to one peer.
+    punt_peer: Option<PathBuf>,
     last_resolve: BTreeMap<(IfId, Ipv4Addr), u64>,
     counters: FeCounters,
 }
@@ -112,6 +115,7 @@ where
             active,
             server: Server::new(),
             punt: None,
+            punt_peer: None,
             last_resolve: BTreeMap::new(),
             counters: FeCounters::default(),
         }
@@ -127,6 +131,17 @@ where
     pub fn attach_punt(&mut self, socket: UnixDatagram) -> io::Result<()> {
         socket.set_nonblocking(true)?;
         self.punt = Some(socket);
+        self.punt_peer = None;
+        Ok(())
+    }
+
+    /// Like [`Fe::attach_punt`] for a socket bound at a fixed path that is not
+    /// connected: ARP is sent to the socket at `peer`, and frames are taken from
+    /// whoever sends them. A neighbor process that restarts binds the same path again.
+    pub fn attach_punt_to(&mut self, socket: UnixDatagram, peer: PathBuf) -> io::Result<()> {
+        socket.set_nonblocking(true)?;
+        self.punt = Some(socket);
+        self.punt_peer = Some(peer);
         Ok(())
     }
 
@@ -185,7 +200,11 @@ where
         }
         .encode(&mut message)
         .expect("port names are short and non-empty");
-        match socket.send(&message) {
+        let sent = match &self.punt_peer {
+            Some(peer) => socket.send_to(&message, peer),
+            None => socket.send(&message),
+        };
+        match sent {
             Ok(_) => self.counters.arp_to_control += 1,
             Err(_) => self.counters.arp_to_control_dropped += 1,
         }

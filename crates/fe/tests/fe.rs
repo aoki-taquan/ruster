@@ -406,3 +406,52 @@ fn the_resolve_rate_limit_forgets_old_next_hops_and_stays_bounded() {
     assert_eq!(counters.resolve_requests, 2_000 + 1_024);
     assert_eq!(counters.resolve_requests_dropped, 2_000 - 1_024);
 }
+
+#[test]
+fn a_punt_socket_at_a_fixed_path_sends_to_whoever_binds_the_peer_path() {
+    let dir = std::env::temp_dir().join(format!("ruster-fe-punt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let fe_end = UnixDatagram::bind(dir.join("fe")).unwrap();
+    bench.fe.attach_punt_to(fe_end, dir.join("neighd")).unwrap();
+
+    // Nobody at the peer path yet: the ARP packet is counted as dropped.
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), arp_request([192, 0, 2, 1]));
+    bench.fe.step(0);
+    assert_eq!(bench.fe.counters().arp_to_control_dropped, 1);
+
+    // Each neighbor process that binds the path gets the next ones.
+    for round in 1..=2 {
+        let _ = std::fs::remove_file(dir.join("neighd"));
+        let neighd_end = UnixDatagram::bind(dir.join("neighd")).unwrap();
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), arp_request([192, 0, 2, 1]));
+        bench.fe.step(round);
+        let mut buf = [0_u8; 256];
+        let n = neighd_end.recv(&mut buf).unwrap();
+        assert_eq!(Punt::decode(&buf[..n]).unwrap().interface, "lan");
+
+        let reply = vec![0xab_u8; 42];
+        let mut message = Vec::new();
+        Punt {
+            direction: Direction::FromControl,
+            reason: punt::reason::ARP,
+            interface: "lan",
+            frame: &reply,
+        }
+        .encode(&mut message)
+        .unwrap();
+        neighd_end.send_to(&message, dir.join("fe")).unwrap();
+        bench.fe.step(round);
+        assert_eq!(bench.fe.io_mut().pop_tx().expect("sent").bytes, reply);
+    }
+    assert_eq!(bench.fe.counters().arp_to_control, 2);
+    std::fs::remove_dir_all(dir).unwrap();
+}

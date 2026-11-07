@@ -120,6 +120,7 @@ name = "ruster-fe"
 version = "0.2.0"
 dependencies = [
  "ruster-core",
+ "ruster-io-afpacket",
  "ruster-io-sim",
  "ruster-proto",
 ]
