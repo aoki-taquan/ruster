@@ -495,6 +495,14 @@ pub enum DropReason {
     /// IPv6 that would be forwarded within or into a VRF whose IPv6 forwarding is
     /// blocked ([`ForwardingSnapshot::with_ipv6_forwarding_blocked`]).
     Ipv6ForwardingBlocked = 226,
+    /// A tunnel's IPv6 packet whose payload is not an IPv4 packet.
+    TunnelInnerInvalid = 227,
+    /// The backend cannot add or remove the tunnel's IPv6 header in place.
+    TunnelNoRoom = 228,
+    /// No IPv6 route to the tunnel's remote end.
+    TunnelNoRoute = 229,
+    /// The wrapped packet is longer than the underlying interface's MTU.
+    TunnelMtuExceeded = 230,
 }
 
 use DropReason::*;
@@ -502,7 +510,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 226] = [
+    pub const ALL: [Self; 230] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -729,6 +737,10 @@ impl DropReason {
         VlanNoRoom,
         VrfLeakIntoServices,
         Ipv6ForwardingBlocked,
+        TunnelInnerInvalid,
+        TunnelNoRoom,
+        TunnelNoRoute,
+        TunnelMtuExceeded,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -972,6 +984,10 @@ impl DropReason {
             VlanNoRoom => "VLAN_NO_ROOM",
             VrfLeakIntoServices => "VRF_LEAK_INTO_SERVICES",
             Ipv6ForwardingBlocked => "IPV6_FORWARDING_BLOCKED",
+            TunnelInnerInvalid => "TUNNEL_INNER_INVALID",
+            TunnelNoRoom => "TUNNEL_NO_ROOM",
+            TunnelNoRoute => "TUNNEL_NO_ROUTE",
+            TunnelMtuExceeded => "TUNNEL_MTU_EXCEEDED",
         }
     }
 }
@@ -1283,6 +1299,8 @@ pub struct ForwardingSnapshot<'a> {
     /// Whether IPv6 forwarded into or within this VRF is dropped
     /// ([`ForwardingSnapshot::with_ipv6_forwarding_blocked`]).
     pub(crate) ipv6_forwarding_blocked: bool,
+    /// IPv4 in IPv6 tunnels ([`ForwardingSnapshot::with_tunnels`]).
+    pub(crate) tunnels: &'a [crate::Ipv4InIpv6Tunnel],
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
     pub(crate) vlans: &'a [crate::VlanBinding],
     /// The time NAT, firewall and ICMP limits count by when no ARP resolution
@@ -1488,6 +1506,7 @@ impl<'a> ForwardingSnapshot<'a> {
             local_to_control: false,
             ipv6: None,
             ipv6_forwarding_blocked: false,
+            tunnels: &[],
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -1622,6 +1641,15 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: on,
             ..self
         }
+    }
+
+    /// Sends IPv4 routed to a tunnel's interface inside IPv6 and unwraps the
+    /// tunnels' IPv6 packets (see [`crate::Ipv4InIpv6Tunnel`]). With
+    /// [`ForwardingSnapshot::with_vrfs`], the outer snapshot's count, and the outer
+    /// packets are routed by its IPv6 table.
+    #[must_use]
+    pub fn with_tunnels(self, tunnels: &'a [crate::Ipv4InIpv6Tunnel]) -> Self {
+        Self { tunnels, ..self }
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1805,6 +1833,7 @@ impl<'a> ForwardingSnapshot<'a> {
             local_to_control: false,
             ipv6: None,
             ipv6_forwarding_blocked: false,
+            tunnels: &[],
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -2148,6 +2177,7 @@ impl ValidatedForwardingOwner {
             local_to_control: false,
             ipv6: None,
             ipv6_forwarding_blocked: false,
+            tunnels: &[],
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -3113,6 +3143,14 @@ where
                 continue;
             }
         }
+        // A tunnel's IPv6 packet arrives again, unwrapped, on its tunnel interface.
+        if let Err(reason) = crate::tunnel::receive(&mut packet, all_vrfs) {
+            let ingress = packet.ingress();
+            packet.recycle(reason);
+            dropped += 1;
+            trace.record(TraceEvent::Dropped { ingress, reason });
+            continue;
+        }
         // Every VRF runs on the outer snapshot's clock.
         let snapshot = &all_vrfs
             .for_ingress(packet.ingress())
@@ -3564,6 +3602,20 @@ where
                         });
                         break 'packet;
                     }
+                    let egress = match crate::tunnel::of(all_vrfs.tunnels, egress) {
+                        Some(tunnel) => {
+                            match crate::tunnel::transmit(&mut packet, tunnel, all_vrfs, trace) {
+                                Ok(underlying) => underlying,
+                                Err(reason) => {
+                                    packet.recycle(reason);
+                                    dropped += 1;
+                                    trace.record(TraceEvent::Dropped { ingress, reason });
+                                    break 'packet;
+                                }
+                            }
+                        }
+                        None => egress,
+                    };
                     match crate::vlan::transmit(&mut packet, egress, vlans) {
                         Ok(port) => {
                             packet.commit(port);
@@ -4624,6 +4676,10 @@ fn decide_ipv4<T: TraceSink>(
     let static_neighbor = snapshot.static_neighbor(route.egress(), target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
+    } else if crate::tunnel::of(snapshot.tunnels, route.egress()).is_some() {
+        // A tunnel has no neighbors: the Ethernet header is replaced when the
+        // packet is wrapped.
+        crate::MacAddress([0; 6])
     } else {
         // No resolution runtime: the control side resolves (FE/CE split).
         trace.record(TraceEvent::NeighborMissing {
@@ -9301,6 +9357,10 @@ mod tests {
             (224, "VLAN_NO_ROOM"),
             (225, "VRF_LEAK_INTO_SERVICES"),
             (226, "IPV6_FORWARDING_BLOCKED"),
+            (227, "TUNNEL_INNER_INVALID"),
+            (228, "TUNNEL_NO_ROOM"),
+            (229, "TUNNEL_NO_ROUTE"),
+            (230, "TUNNEL_MTU_EXCEEDED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9310,7 +9370,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(227), None);
+        assert_eq!(DropReason::from_code(231), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
