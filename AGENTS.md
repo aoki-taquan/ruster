@@ -20,7 +20,7 @@
 - 実装は一つのagentが通しで行い、下の確認を自分で通す。
 - 独立レビューを別agentに頼むのは、unsafe/FFI/syscall、NATやfirewallの状態、
   設定の反映や再読み込みに触る変更だけ。
-- mergeを止めるのはCriticalとHighの指摘だけ。Medium以下は`docs/backlog.md`に一行で残し、
+- mergeを止めるのはCriticalとHighの指摘だけ。Medium以下は`backlog`ラベルのGitHub issueに残し、
   そのためだけのPRは作らない。
 
 ## 守ること

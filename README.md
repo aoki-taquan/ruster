@@ -122,7 +122,7 @@ cargo test --doc --workspace --all-features --locked
 ```
 
 - 進め方の決まりは[`AGENTS.md`](AGENTS.md)にあります。
-- レビューで出たMedium以下の指摘は[`docs/backlog.md`](docs/backlog.md)に書いています。
+- レビューで出たMedium以下の指摘は、`backlog`ラベルの[issue](https://github.com/aoki-taquan/ruster/issues?q=label%3Abacklog)にしています。
 
 ### crate
 
