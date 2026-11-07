@@ -816,6 +816,14 @@ fn a_pppoe_interface_runs_on_its_parent() {
             ppp("").replace("parent = \"wan\"", "parent = \"dmz\""),
             "port or VLAN",
         ),
+        (
+            ppp("[[interface]]\nname = \"ppp2\"\npppoe = { parent = \"wan\", session = 4660, peer = \"02:00:00:00:00:ac\" }\n"),
+            "given twice",
+        ),
+        (
+            ppp("[[interface]]\nname = \"v\"\nparent = \"ppp\"\nvlan = 10\n"),
+            "not a VLAN",
+        ),
     ] {
         let got = error(&text);
         assert!(got.contains(expected), "{text}: {got}");

@@ -338,7 +338,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                     return Err(format!("{at}: vlan must be 1 to 4094"));
                 }
                 let Some(parent_entry) = interfaces.iter().find(|i: &&InterfaceConfig| {
-                    i.name == *parent && i.vlan.is_none() && i.tunnel.is_none()
+                    i.name == *parent && i.vlan.is_none() && i.tunnel.is_none() && i.pppoe.is_none()
                 }) else {
                     return Err(format!(
                         "{at}: parent {parent:?} must be an interface given before it, not a VLAN"
@@ -402,6 +402,17 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 };
                 if session.session == 0 || session.session == 0xffff {
                     return Err(format!("{at}: PPPoE session must be 1 to 65534"));
+                }
+                let taken = interfaces.iter().any(|i| {
+                    i.pppoe
+                        .as_ref()
+                        .is_some_and(|(p, id, _)| *p == parent.name && *id == session.session)
+                });
+                if taken {
+                    return Err(format!(
+                        "{at}: PPPoE session {} on {:?} is given twice",
+                        session.session, parent.name
+                    ));
                 }
                 let peer = mac(&session.peer)
                     .filter(|m| m[0] & 1 == 0 && *m != [0; 6])
