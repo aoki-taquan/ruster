@@ -37,6 +37,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ietf-network-instance:bind-ni-name",
+        "sid": 60014,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",
         "sid": 60020,
         "status": "unstable"
@@ -87,6 +93,12 @@
         "namespace": "data",
         "identifier": "/ruster-fib:fib/vrf/route/reject",
         "sid": 60037,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/lookup-vrf",
+        "sid": 60038,
         "status": "unstable"
       },
       {

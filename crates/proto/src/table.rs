@@ -22,6 +22,8 @@
 //!   new value, or to `null` to delete.
 //! - RFC 8343 (`ietf-interfaces`) and RFC 8344 (`ietf-ip`): the interface and address
 //!   entries follow their leaves (enabled, phys-address, mtu, prefix-length).
+//! - RFC 8529 (`ietf-network-instance`): an interface names its VRF with
+//!   `bind-ni-name`; `default` when left out.
 //! - RFC 5952 section 4: an IPv6 address is accepted only in its canonical text, so
 //!   one address is one key.
 //!
@@ -65,6 +67,9 @@ pub enum Value {
         enabled: bool,
         mac: [u8; 6],
         mtu: u16,
+        /// The VRF (`ietf-network-instance` `bind-ni-name`) the interface belongs to;
+        /// [`DEFAULT_VRF`] when not given.
+        vrf: String,
     },
     Address {
         prefix_len: u8,
@@ -84,7 +89,12 @@ pub enum RouteAction {
     Discard,
     /// Dropped with an ICMP Destination Unreachable.
     Reject,
+    /// Looked up again in another VRF.
+    LookupVrf(String),
 }
+
+/// The VRF of an interface that names none.
+pub const DEFAULT_VRF: &str = "default";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NextHop {
@@ -195,6 +205,8 @@ impl Change {
                     Value::Interface { mtu, .. } if *mtu < MIN_MTU => {
                         return Err(ModelError::Invalid("mtu"));
                     }
+                    Value::Interface { vrf, .. } => name(vrf)?,
+                    Value::Route(RouteAction::LookupVrf(vrf)) => name(vrf)?,
                     Value::Address { prefix_len } => {
                         let Key::Address { address, .. } = &self.key else {
                             unreachable!("checked above");
@@ -320,14 +332,24 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
 
 fn encode_value(value: &Value, e: &mut Encoder<'_>) {
     match value {
-        Value::Interface { enabled, mac, mtu } => {
-            e.map(3)
+        Value::Interface {
+            enabled,
+            mac,
+            mtu,
+            vrf,
+        } => {
+            let named = vrf != DEFAULT_VRF;
+            e.map(if named { 4 } else { 3 })
                 .u64(sid::INTERFACE_ENABLED - sid::INTERFACE)
                 .bool(*enabled)
                 .u64(sid::INTERFACE_PHYS_ADDRESS - sid::INTERFACE)
                 .text(&format_mac(mac))
                 .u64(sid::INTERFACE_MTU - sid::INTERFACE)
                 .u64(u64::from(*mtu));
+            if named {
+                e.u64(sid::INTERFACE_BIND_NI_NAME - sid::INTERFACE)
+                    .text(vrf);
+            }
         }
         Value::Address { prefix_len } => {
             e.map(1)
@@ -360,6 +382,9 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 RouteAction::Reject => {
                     e.u64(sid::ROUTE_REJECT - sid::ROUTE).bool(true);
                 }
+                RouteAction::LookupVrf(vrf) => {
+                    e.u64(sid::ROUTE_LOOKUP_VRF - sid::ROUTE).text(vrf);
+                }
             }
         }
         Value::Neighbor { mac } => {
@@ -375,6 +400,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     let mut enabled = None;
     let mut mac = None;
     let mut mtu = None;
+    let mut vrf = None;
     let mut prefix_len = None;
     let mut action = None;
     for _ in 0..members {
@@ -391,6 +417,12 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
                     &mut mtu,
                     u16::try_from(d.u64()?).map_err(|_| ModelError::Invalid("mtu"))?,
                 )?;
+            }
+            sid::INTERFACE_BIND_NI_NAME if table == sid::INTERFACE => {
+                put(&mut vrf, d.text()?.to_owned())?;
+            }
+            sid::ROUTE_LOOKUP_VRF if table == sid::ROUTE => {
+                put(&mut action, RouteAction::LookupVrf(d.text()?.to_owned()))?;
             }
             sid::ADDRESS_PREFIX_LENGTH if table == sid::ADDRESS => {
                 put(
@@ -428,6 +460,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             enabled: enabled.unwrap_or(true),
             mac: mac.ok_or(ModelError::Missing("phys-address"))?,
             mtu: mtu.unwrap_or(1500),
+            vrf: vrf.unwrap_or_else(|| DEFAULT_VRF.to_owned()),
         }),
         sid::ADDRESS => Ok(Value::Address {
             prefix_len: prefix_len.ok_or(ModelError::Missing("prefix-length"))?,

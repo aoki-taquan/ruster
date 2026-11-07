@@ -433,7 +433,12 @@ impl Builder {
         let mut active = BTreeMap::new();
 
         for (key, value) in store.iter() {
-            if let (Key::Interface { name }, Value::Interface { enabled, mac, mtu }) = (key, value)
+            if let (
+                Key::Interface { name },
+                Value::Interface {
+                    enabled, mac, mtu, ..
+                },
+            ) = (key, value)
             {
                 if let Some(id) = self.port(name).filter(|_| *enabled) {
                     interfaces.push(Interface {
