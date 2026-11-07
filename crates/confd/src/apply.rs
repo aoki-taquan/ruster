@@ -7,18 +7,26 @@
 //!
 //! | Answer | Meaning |
 //! |---|---|
-//! | 2.04 Changed | every connected process took the new configuration |
+//! | 2.04 Changed | every connected process answered yes |
 //! | 4.00 Bad Request | the file has an error, or a process refused the change; in the second case confd puts the configuration it had before back |
-//! | 5.03 Service Unavailable | another new configuration is still being applied |
-//! | 5.04 Gateway Timeout | a process did not answer in time; confd keeps the new configuration |
+//! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers |
+//! | 5.04 Gateway Timeout | a process has not answered in time |
+//!
+//! After 5.04 confd keeps waiting: if the answer is a refusal, it puts the configuration
+//! before back then, and until the answer comes another file gets 5.03. So a refusal
+//! always ends with every process on the configuration before.
 //!
 //! The payload of an answer is text for a person: the error, or what the answer needs
 //! to add (a process that is not connected gets the configuration when it connects
-//! again).
+//! again; errors setting up the kernel side).
 //!
-//! Limits: the new configuration lives only in confd's memory, so confd started again
-//! reads its file. There is no preview of the changes, no confirm-or-revert and no list
-//! of earlier versions yet.
+//! Limits:
+//! - Static routes go through ribd, which takes any route; a route the FE then refuses
+//!   is not seen here.
+//! - The new configuration lives only in confd's memory, so confd started again reads
+//!   its file.
+//! - There is no preview of the changes, no confirm-or-revert and no list of earlier
+//!   versions yet.
 //!
 //! # Standards
 //!
@@ -39,8 +47,14 @@ use crate::{file, Confd, Config};
 /// The largest configuration file accepted.
 const LIMIT: usize = 1 << 20;
 
-/// How long a new configuration waits for the processes' answers.
+/// How long a new configuration waits for the processes' answers before 5.04.
 pub const ANSWER_WAIT_MS: u64 = 3_000;
+
+/// At most this many connections at once; more are closed straight away.
+pub const MAX_CONNECTIONS: usize = 8;
+
+/// At most this many requests are handled per connection in one step.
+const REQUESTS_PER_STEP: usize = 16;
 
 /// The connections of `ruster apply` and the one change being applied.
 #[derive(Default)]
@@ -64,9 +78,12 @@ struct Pending {
     conn: u64,
     token: Vec<u8>,
     previous: Config,
-    refused: u64,
+    /// [`Confd::generation`] of the new configuration.
+    generation: u64,
     deadline_ms: u64,
     notes: Vec<String>,
+    /// 5.04 went out; the answer still decides whether to go back.
+    timed_out: bool,
 }
 
 impl Apply {
@@ -74,7 +91,11 @@ impl Apply {
         Self::default()
     }
 
+    /// Takes a connection, or closes it if [`MAX_CONNECTIONS`] are open.
     pub fn attach(&mut self, stream: UnixStream) -> std::io::Result<()> {
+        if self.conns.len() >= MAX_CONNECTIONS {
+            return Err(std::io::Error::other("too many connections"));
+        }
         self.conns
             .push((self.next_id, Connection::new(stream, LIMIT)?));
         self.next_id += 1;
@@ -94,14 +115,23 @@ impl Apply {
         let mut busy = self.finish(confd, now_ms, prepare);
         let mut index = 0;
         while index < self.conns.len() {
+            let id = self.conns[index].0;
             busy |= self.conns[index].1.pump().unwrap_or(false);
-            while let Ok(Some(request)) = self.conns[index].1.next_message() {
+            for _ in 0..REQUESTS_PER_STEP {
+                let conn = &mut self.conns[index].1;
+                // A client that does not read its answers gets no more handled.
+                if conn.backlog() >= conn.limit() {
+                    break;
+                }
+                let Ok(Some(request)) = conn.next_message() else {
+                    break;
+                };
                 busy = true;
                 let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
                 let answer = match (request.code, path.as_slice()) {
                     (Code::POST, ["config"]) if self.pending.is_some() => Some((
                         Code::SERVICE_UNAVAILABLE,
-                        "another configuration is being applied".to_owned(),
+                        "an earlier configuration is still waiting for answers".to_owned(),
                     )),
                     (Code::POST, ["config"]) => match std::str::from_utf8(&request.payload)
                         .map_err(|_| "the file is not UTF-8".to_owned())
@@ -110,15 +140,17 @@ impl Apply {
                         Err(error) => Some((Code::BAD_REQUEST, error)),
                         Ok(config) => {
                             let notes = prepare(&config);
+                            let previous = confd.config().clone();
+                            confd.set_config(config);
                             self.pending = Some(Pending {
-                                conn: self.conns[index].0,
+                                conn: id,
                                 token: request.token.clone(),
-                                previous: confd.config().clone(),
-                                refused: confd.counters().patches_refused,
+                                previous,
+                                generation: confd.generation(),
                                 deadline_ms: now_ms.saturating_add(ANSWER_WAIT_MS),
                                 notes,
+                                timed_out: false,
                             });
-                            confd.set_config(config);
                             None
                         }
                     },
@@ -129,9 +161,10 @@ impl Apply {
                     send(&mut self.conns[index].1, &request.token, code, &text);
                 }
             }
-            busy |= self.conns[index].1.pump().unwrap_or(false);
-            busy |= self.conns[index].1.take_more();
-            if self.conns[index].1.is_closed() {
+            let conn = &mut self.conns[index].1;
+            busy |= conn.pump().unwrap_or(false);
+            busy |= conn.take_more();
+            if conn.is_closed() {
                 self.conns.swap_remove(index);
             } else {
                 index += 1;
@@ -141,52 +174,68 @@ impl Apply {
         Progress::busy(busy)
     }
 
-    /// Answers the pending change if the processes have answered or the wait is over.
+    /// Answers the pending change if the processes have answered or the wait is over,
+    /// and goes back if one refused it.
     fn finish(
         &mut self,
         confd: &mut Confd,
         now_ms: u64,
         prepare: &mut dyn FnMut(&Config) -> Vec<String>,
     ) -> bool {
-        let Some(pending) = &self.pending else {
+        let Some(pending) = &mut self.pending else {
             return false;
         };
-        let refused = confd.counters().patches_refused != pending.refused;
-        if !refused && !confd.settled() && now_ms < pending.deadline_ms {
-            return false;
+        let refusal = confd
+            .refused_since(pending.generation)
+            .map(|(kind, reason)| format!("{kind} refused it: {reason}"));
+        if refusal.is_none() && !confd.settled() {
+            if now_ms < pending.deadline_ms || pending.timed_out {
+                return false;
+            }
+            pending.timed_out = true;
+            let (conn, token) = (pending.conn, pending.token.clone());
+            let lines = vec![
+                "a process has not answered in time; confd keeps waiting and goes back to \
+                 the configuration before if it is refused"
+                    .to_owned(),
+            ];
+            self.reply(conn, &token, Code::GATEWAY_TIMEOUT, absent(confd, lines));
+            return true;
         }
-        let Some(mut pending) = self.pending.take() else {
+        let Some(pending) = self.pending.take() else {
             return false;
         };
-        let (code, mut lines) = if refused {
-            let why = confd.last_refusal().map_or_else(
-                || "a process refused it".to_owned(),
-                |(kind, reason)| format!("{kind} refused it: {reason}"),
-            );
-            let notes = prepare(&pending.previous);
-            confd.set_config(pending.previous);
-            let mut lines = vec![why, "the configuration before it is applied again".into()];
-            lines.extend(notes);
-            (Code::BAD_REQUEST, lines)
-        } else if confd.settled() {
-            (Code::CHANGED, Vec::new())
-        } else {
-            (
-                Code::GATEWAY_TIMEOUT,
-                vec!["a process did not answer in time; the new configuration stays".into()],
-            )
+        let (code, lines) = match refusal {
+            Some(why) => {
+                let mut lines = vec![why, "the configuration before it is applied again".into()];
+                lines.extend(prepare(&pending.previous));
+                confd.set_config(pending.previous);
+                (Code::BAD_REQUEST, lines)
+            }
+            None => (Code::CHANGED, pending.notes),
         };
-        lines.append(&mut pending.notes);
-        for kind in confd.absent() {
-            lines.push(format!(
-                "{kind} is not connected; it gets the configuration when it connects"
-            ));
-        }
-        if let Some((_, conn)) = self.conns.iter_mut().find(|(id, _)| *id == pending.conn) {
-            send(conn, &pending.token, code, &lines.join("\n"));
+        // After 5.04 the answer went out already.
+        if !pending.timed_out {
+            self.reply(pending.conn, &pending.token, code, absent(confd, lines));
         }
         true
     }
+
+    fn reply(&mut self, conn: u64, token: &[u8], code: Code, lines: Vec<String>) {
+        if let Some((_, conn)) = self.conns.iter_mut().find(|(id, _)| *id == conn) {
+            send(conn, token, code, &lines.join("\n"));
+        }
+    }
+}
+
+/// `lines`, and a line for each process that is not connected.
+fn absent(confd: &Confd, mut lines: Vec<String>) -> Vec<String> {
+    for kind in confd.absent() {
+        lines.push(format!(
+            "{kind} is not connected; it gets the configuration when it connects"
+        ));
+    }
+    lines
 }
 
 fn send(conn: &mut Connection, token: &[u8], code: Code, text: &str) {

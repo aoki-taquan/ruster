@@ -175,3 +175,27 @@ fn a_second_file_waits_and_a_silent_process_times_out() {
     rig.answers();
     assert_eq!(rig.mtu(), Some(1400));
 }
+
+#[test]
+fn a_refusal_after_the_timeout_still_puts_the_configuration_before_back() {
+    let mut rig = Rig::new();
+    let mut fe = std::mem::take(&mut rig.fe);
+    rig.check.refuse_mtu = Some(1400);
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    assert!(rig.answers().is_empty());
+    rig.now_ms = ANSWER_WAIT_MS;
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::GATEWAY_TIMEOUT, "{answers:?}");
+
+    // The FE answers late, and refuses: every process goes back.
+    std::mem::swap(&mut rig.fe, &mut fe);
+    assert!(rig.answers().is_empty(), "nothing more to the CLI");
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1500);
+    assert_eq!(rig.mtu(), Some(1500));
+
+    // The late refusal does not count against the next file.
+    rig.cli.post(&["config"], text(1280).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    assert_eq!(rig.mtu(), Some(1280));
+}
