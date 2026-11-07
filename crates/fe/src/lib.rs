@@ -29,7 +29,7 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
 
 use ruster_core::{
-    execute_one_icmpv4_error, forward_batch_with_control, ArpOpcode, ControlQueue,
+    execute_one_icmpv4_error, forward_batch_with_control, ArpOpcode, ControlKind, ControlQueue,
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
     MonotonicMillis, PacketIo, TraceEvent, TraceSink,
@@ -42,6 +42,9 @@ use ruster_proto::table::ResolveRequest;
 use ruster_proto::task::{Progress, Task};
 
 mod build;
+mod local;
+
+pub use local::LocalPipe;
 
 /// The tables each kind of writer may change (one writer per table).
 pub mod writers {
@@ -88,6 +91,14 @@ pub struct FeCounters {
     pub inject_dropped: u64,
     /// ICMP errors generated (rate limited per egress interface).
     pub icmp_errors_sent: u64,
+    /// Packets addressed to the router written to the kernel, and those dropped
+    /// (rate limit, no pipe for the VRF, or the pipe full).
+    pub to_kernel: u64,
+    pub to_kernel_dropped: u64,
+    /// Packets from the kernel sent out, and those dropped (no route, no neighbor
+    /// yet, or no room).
+    pub from_kernel: u64,
+    pub from_kernel_dropped: u64,
 }
 
 pub struct Fe<B> {
@@ -97,6 +108,11 @@ pub struct Fe<B> {
     vrfs: Vec<build::Vrf>,
     /// For each port, the index in `vrfs` of its VRF.
     by_ingress: Vec<u16>,
+    /// The VRF names, in the order of `vrfs`.
+    names: Vec<String>,
+    /// Each VRF's pipe to the kernel, for traffic addressed to the router.
+    local: BTreeMap<String, Box<dyn LocalPipe>>,
+    limiter: local::Limiter,
     /// The interfaces enabled in the current tables.
     active: Vec<IfId>,
     server: Server,
@@ -134,6 +150,9 @@ where
             builder,
             vrfs: built.vrfs,
             by_ingress: built.by_ingress,
+            names: built.names,
+            local: BTreeMap::new(),
+            limiter: local::Limiter::default(),
             active: built.active,
             server: Server::new(),
             punt: None,
@@ -169,6 +188,18 @@ where
         Ok(())
     }
 
+    /// Uses `pipe` to hand the traffic addressed to the router in `vrf` to the kernel,
+    /// and to send the kernel's packets out. Without a pipe, core answers Echo
+    /// Requests itself and drops the rest.
+    pub fn attach_local(&mut self, vrf: &str, pipe: Box<dyn LocalPipe>) {
+        self.local.insert(vrf.to_owned(), pipe);
+    }
+
+    /// The VRFs of the current tables, the default VRF first.
+    pub fn vrfs(&self) -> &[String] {
+        &self.names
+    }
+
     pub fn io_mut(&mut self) -> &mut B {
         &mut self.io
     }
@@ -188,11 +219,13 @@ where
         let snapshots: Vec<_> = self
             .vrfs
             .iter()
-            .map(|vrf| {
+            .zip(&self.names)
+            .map(|(vrf, name)| {
                 vrf.owner
                     .snapshot()
                     .with_arp_to_control(true)
                     .with_ipv6(&vrf.ipv6)
+                    .with_local_to_control(self.local.contains_key(name))
             })
             .collect();
         let snapshot = snapshots[0].with_vrfs(&snapshots, &self.by_ingress);
@@ -234,8 +267,13 @@ where
         }
         for index in 0..self.control.frames().len() {
             let frame = &self.control.frames()[index];
-            let (ingress, bytes) = (frame.ingress, frame.bytes().to_vec());
-            self.punt_frame(ingress, punt::reason::ND, &bytes);
+            let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
+            match kind {
+                ControlKind::Neighbor => self.punt_frame(ingress, punt::reason::ND, &bytes),
+                ControlKind::Local => {
+                    self.send_to_kernel(ingress, &bytes[ETHERNET_HEADER..], now_ms)
+                }
+            }
         }
         for &(egress, target) in &trace.misses {
             self.resolve_request(egress, target, now_ms);
@@ -359,6 +397,72 @@ where
         busy
     }
 
+    /// Writes a packet addressed to the router to its VRF's kernel pipe.
+    fn send_to_kernel(&mut self, ingress: IfId, packet: &[u8], now_ms: u64) {
+        let vrf = self
+            .by_ingress
+            .get(usize::from(ingress.0))
+            .and_then(|&at| self.names.get(usize::from(at)));
+        let pipe = vrf.and_then(|name| self.local.get(name));
+        let admitted = self.limiter.take(local::class(packet), now_ms);
+        match pipe {
+            Some(pipe) if admitted && pipe.send(packet).is_ok() => self.counters.to_kernel += 1,
+            _ => self.counters.to_kernel_dropped += 1,
+        }
+    }
+
+    /// Sends what the kernel wrote to each VRF's pipe out of the route's interface.
+    fn receive_from_kernel(&mut self, now_ms: u64) -> bool {
+        let mut buf = vec![0_u8; ETHERNET_HEADER + PUNT_MAX];
+        let mut packets = Vec::new();
+        for (at, name) in self.names.iter().enumerate() {
+            let Some(pipe) = self.local.get(name) else {
+                continue;
+            };
+            for _ in 0..INJECT_PER_STEP {
+                match pipe.recv(&mut buf[ETHERNET_HEADER..]) {
+                    Ok(n) if n > 0 => {
+                        packets.push((at, buf[ETHERNET_HEADER..ETHERNET_HEADER + n].to_vec()))
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let busy = !packets.is_empty();
+        for (at, packet) in packets {
+            let snapshot = self.vrfs[at]
+                .owner
+                .snapshot()
+                .with_ipv6(&self.vrfs[at].ipv6);
+            let origin = local::destination(&packet).and_then(|d| snapshot.origin(d));
+            let Some(origin) = origin else {
+                self.counters.from_kernel_dropped += 1;
+                continue;
+            };
+            let Some(destination_mac) = origin.destination_mac else {
+                self.counters.from_kernel_dropped += 1;
+                self.resolve_request(origin.egress, origin.next_hop, now_ms);
+                continue;
+            };
+            let ethertype: [u8; 2] = if packet[0] >> 4 == 4 {
+                [0x08, 0x00]
+            } else {
+                ETHERTYPE_IPV6
+            };
+            let mut frame = Vec::with_capacity(ETHERNET_HEADER + packet.len());
+            frame.extend_from_slice(&destination_mac.0);
+            frame.extend_from_slice(&origin.source_mac.0);
+            frame.extend_from_slice(&ethertype);
+            frame.extend_from_slice(&packet);
+            if self.send_generated(origin.egress, &frame) {
+                self.counters.from_kernel += 1;
+            } else {
+                self.counters.from_kernel_dropped += 1;
+            }
+        }
+        busy
+    }
+
     fn send_generated(&mut self, egress: IfId, frame: &[u8]) -> bool {
         let mut batch = self.io.begin_generated(egress);
         let sent = match batch.allocate(frame.len()) {
@@ -383,13 +487,17 @@ where
         if let Some(built) = self.builder.built.take() {
             self.vrfs = built.vrfs;
             self.by_ingress = built.by_ingress;
+            self.names = built.names;
             self.active = built.active;
         }
         let worked = self.worker(now_ms);
         let injected = self.inject();
+        let from_kernel = self.receive_from_kernel(now_ms);
         // Notifications queued by the worker go out now.
         let flushed = self.server.step(&mut self.builder);
-        control.and(flushed).and(Progress::busy(worked || injected))
+        control
+            .and(flushed)
+            .and(Progress::busy(worked || injected || from_kernel))
     }
 }
 
