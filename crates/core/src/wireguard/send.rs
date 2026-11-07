@@ -220,7 +220,11 @@ pub(crate) fn stage<S: PacketSlot, T: crate::TraceSink>(
         Ok((_, length)) => length,
         Err(SendError::NoPeer) => return Err(DropReason::WireguardNoPeer),
         Err(SendError::NoSession | SendError::Exhausted) => {
-            return Err(DropReason::WireguardNoSession)
+            trace.record(crate::TraceEvent::WireguardNoSession {
+                interface: wireguard.interface,
+                peer,
+            });
+            return Err(DropReason::WireguardNoSession);
         }
         Err(SendError::NoRoom) => return Err(DropReason::WireguardNoRoom),
         Err(SendError::InnerInvalid) => return Err(DropReason::WireguardInnerInvalid),

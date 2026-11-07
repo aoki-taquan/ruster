@@ -349,6 +349,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-wireguard:key-exchange-needed",
+        "sid": 60130,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-wireguard:key-exchange-needed/interface",
+        "sid": 60131,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-wireguard:key-exchange-needed/peer",
+        "sid": 60132,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"

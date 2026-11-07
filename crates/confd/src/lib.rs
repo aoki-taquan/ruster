@@ -110,7 +110,12 @@ pub struct Config {
 pub struct ConfdCounters {
     pub patches_sent: u64,
     pub patches_refused: u64,
+    /// Notifications from the FE that a WireGuard peer needs its key exchange.
+    pub key_exchange_requests: u64,
 }
+
+/// The most key exchange requests confd keeps for whoever does the exchange.
+const KEY_REQUESTS_KEPT: usize = 64;
 
 /// A process confd writes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -193,6 +198,8 @@ pub struct Confd {
     generation: u64,
     /// The last refused patch: its process, reason and generation.
     last_refusal: Option<(PeerKind, String, u64)>,
+    /// WireGuard peers the FE says need a key exchange, until taken.
+    key_requests: Vec<ruster_proto::table::KeyExchangeRequest>,
 }
 
 impl std::fmt::Debug for Confd {
@@ -214,12 +221,16 @@ impl Confd {
             counters: ConfdCounters::default(),
             generation: 0,
             last_refusal: None,
+            key_requests: Vec::new(),
         }
     }
 
     /// Connects to the FE as the writer of interfaces, addresses, firewall rules and NAT.
     pub fn connect_fe(&mut self, stream: UnixStream) -> io::Result<()> {
-        self.fe = Some(self.full_send(stream, Self::fe_tables, false)?);
+        let mut peer = self.full_send(stream, Self::fe_tables, false)?;
+        // The FE tells when a WireGuard peer needs its key exchange.
+        peer.client.observe();
+        self.fe = Some(peer);
         Ok(())
     }
 
@@ -254,6 +265,12 @@ impl Confd {
 
     pub fn counters(&self) -> ConfdCounters {
         self.counters
+    }
+
+    /// The WireGuard peers the FE has asked a key exchange for since the last call.
+    /// A key exchange daemon outside ruster does it and gives confd the session.
+    pub fn take_key_exchange_requests(&mut self) -> Vec<ruster_proto::table::KeyExchangeRequest> {
+        std::mem::take(&mut self.key_requests)
     }
 
     /// The generation of the configuration now held; each [`Confd::set_config`] adds one.
@@ -563,6 +580,18 @@ impl Task for Confd {
             let (polled, events) = peer.client.poll();
             progress = progress.and(polled);
             for event in events {
+                if let (PeerKind::Fe, Event::Notification { payload }) = (kind, &event) {
+                    let mut d = ruster_proto::cbor::Decoder::new(payload);
+                    if let Ok(request) = ruster_proto::table::KeyExchangeRequest::decode(&mut d) {
+                        self.counters.key_exchange_requests += 1;
+                        if self.key_requests.len() < KEY_REQUESTS_KEPT
+                            && !self.key_requests.contains(&request)
+                        {
+                            self.key_requests.push(request);
+                        }
+                    }
+                    continue;
+                }
                 if let Event::Response {
                     token,
                     code,

@@ -88,6 +88,11 @@ pub const WIREGUARD_SESSION_RECEIVE: u64 = 60122;
 pub const WIREGUARD_SESSION_PEER_INDEX: u64 = 60123;
 pub const WIREGUARD_SESSION_LOCAL_INDEX: u64 = 60124;
 
+/// Notification: the FE has a packet for a WireGuard peer that has no session.
+pub const WIREGUARD_KEY_REQUEST: u64 = 60130;
+pub const WIREGUARD_KEY_REQUEST_INTERFACE: u64 = 60131;
+pub const WIREGUARD_KEY_REQUEST_PEER: u64 = 60132;
+
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
 pub const RESOLVE_REQUEST_INTERFACE: u64 = 60051;
@@ -234,6 +239,18 @@ pub const ALL: &[(&str, u64)] = &[
     (
         "/ruster-wireguard:sessions/session/local-index",
         WIREGUARD_SESSION_LOCAL_INDEX,
+    ),
+    (
+        "/ruster-wireguard:key-exchange-needed",
+        WIREGUARD_KEY_REQUEST,
+    ),
+    (
+        "/ruster-wireguard:key-exchange-needed/interface",
+        WIREGUARD_KEY_REQUEST_INTERFACE,
+    ),
+    (
+        "/ruster-wireguard:key-exchange-needed/peer",
+        WIREGUARD_KEY_REQUEST_PEER,
     ),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (

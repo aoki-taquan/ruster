@@ -941,3 +941,30 @@ mod wireguard {
         ));
     }
 }
+
+#[test]
+fn a_key_exchange_request_round_trips_and_refuses_a_missing_member() {
+    use ruster_proto::table::KeyExchangeRequest;
+    let request = KeyExchangeRequest {
+        interface: "wg0".into(),
+        peer: "branch".into(),
+    };
+    let mut out = Vec::new();
+    request.encode(&mut Encoder::new(&mut out));
+    assert_eq!(
+        KeyExchangeRequest::decode(&mut Decoder::new(&out)),
+        Ok(request)
+    );
+    // {60130: {1: "wg0"}}: no peer.
+    let mut short = Vec::new();
+    Encoder::new(&mut short)
+        .map(1)
+        .u64(sid::WIREGUARD_KEY_REQUEST)
+        .map(1)
+        .u64(1)
+        .text("wg0");
+    assert_eq!(
+        KeyExchangeRequest::decode(&mut Decoder::new(&short)),
+        Err(ModelError::Missing("peer"))
+    );
+}

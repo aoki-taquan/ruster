@@ -70,8 +70,12 @@ struct Router {
 
 impl Router {
     fn start() -> Self {
+        Self::start_with(FILE)
+    }
+
+    fn start_with(text: &str) -> Self {
         let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
-        let mut confd = Confd::new(file::parse(FILE).expect("the file reads"));
+        let mut confd = Confd::new(file::parse(text).expect("the file reads"));
         let (a, b) = UnixStream::pair().unwrap();
         fe.attach(a, writers::CONFIG).unwrap();
         confd.connect_fe(b).unwrap();
@@ -284,4 +288,40 @@ fn the_file_makes_a_router_that_seals_to_the_peer_and_opens_from_it() {
     assert_eq!(forwarded[0].0, LAN);
     assert_eq!(&forwarded[0].1[0..6], &HOST_MAC);
     assert_eq!(&forwarded[0].1[26..30], &[10, 9, 0, 7]);
+}
+
+#[test]
+fn a_peer_without_a_session_makes_the_fe_ask_for_a_key_exchange() {
+    // The same file without the peer's session line.
+    let without: String = FILE
+        .lines()
+        .filter(|line| !line.starts_with("session = "))
+        .map(|line| format!("{line}\n"))
+        .collect();
+    let mut router = Router::start_with(&without);
+    let to_peer = frame(LAN_MAC, HOST_MAC, &ipv4(HOST, [10, 9, 0, 5]));
+
+    // The gateway is resolved first (the packet is dropped for it).
+    router.fe.io_mut().inject(LAN, to_peer.clone());
+    router.settle();
+    let requests = router.tx();
+    router.answer_arp(&requests);
+    assert!(router.confd.take_key_exchange_requests().is_empty());
+
+    // Now it is the session that is missing: the FE tells confd, once.
+    for _ in 0..3 {
+        router.fe.io_mut().inject(LAN, to_peer.clone());
+    }
+    router.settle();
+    assert!(router.tx().is_empty(), "nothing is sent without a session");
+    let asked = router.confd.take_key_exchange_requests();
+    assert_eq!(
+        asked,
+        [ruster_proto::table::KeyExchangeRequest {
+            interface: "wg0".into(),
+            peer: "branch".into(),
+        }]
+    );
+    assert_eq!(router.fe.counters().key_exchange_requests, 1);
+    assert_eq!(router.confd.counters().key_exchange_requests, 1);
 }
