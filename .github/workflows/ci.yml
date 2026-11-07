@@ -35,3 +35,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - run: cargo test --workspace --all-targets --all-features --locked
       - run: cargo test --doc --workspace --all-features --locked
+      - run: cargo build --workspace --locked
+      - name: netns test (AF_XDP and AF_PACKET)
+        run: |
+          command -v ethtool >/dev/null || sudo apt-get install -y ethtool
+          sudo FE_BACKEND=af-xdp scripts/netns-skeleton.sh target/debug
+          sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug
