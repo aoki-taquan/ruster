@@ -84,3 +84,22 @@ fn a_listener_creates_the_directories_above_its_socket() {
     assert!(path.exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn notify_sends_the_state_to_the_notify_socket() {
+    let dir = dir("notify");
+    let path = dir.join("notify.sock");
+    let systemd = std::os::unix::net::UnixDatagram::bind(&path).unwrap();
+    systemd.set_nonblocking(true).unwrap();
+    // The only test that sets the variable; others never read it.
+    std::env::set_var("NOTIFY_SOCKET", &path);
+    daemon::notify("READY=1");
+    std::env::remove_var("NOTIFY_SOCKET");
+    let mut buf = [0_u8; 32];
+    let n = systemd.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], b"READY=1");
+    // Without the variable nothing is sent.
+    daemon::notify("READY=1");
+    assert!(systemd.recv(&mut buf).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
