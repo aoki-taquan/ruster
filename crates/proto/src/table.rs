@@ -83,6 +83,8 @@ pub enum Value {
         vrf: String,
         /// For a VLAN sub-interface, its parent and VLAN ID.
         vlan: Option<Vlan>,
+        /// For an IPv4 in IPv6 tunnel, its outer addresses.
+        tunnel: Option<Tunnel>,
     },
     Address {
         prefix_len: u8,
@@ -157,6 +159,14 @@ pub struct Vlan {
     pub parent: String,
     /// 1 to 4094.
     pub id: u16,
+}
+
+/// An IPv4 in IPv6 tunnel (`ruster-if-tunnel`, a DS-Lite softwire): its packets
+/// leave in IPv6 from `local` to `remote`, routed in the default VRF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tunnel {
+    pub local: std::net::Ipv6Addr,
+    pub remote: std::net::Ipv6Addr,
 }
 
 /// The VRF of an interface that names none.
@@ -275,6 +285,25 @@ impl Change {
                 match value {
                     Value::Interface { mtu, .. } if *mtu < MIN_MTU => {
                         return Err(ModelError::Invalid("mtu"));
+                    }
+                    Value::Interface {
+                        vlan: Some(_),
+                        tunnel: Some(_),
+                        ..
+                    } => {
+                        return Err(ModelError::Invalid("both a VLAN and a tunnel"));
+                    }
+                    Value::Interface {
+                        tunnel: Some(tunnel),
+                        ..
+                    } if [tunnel.local, tunnel.remote].iter().any(|a| {
+                        a.is_unspecified()
+                            || a.is_loopback()
+                            || a.is_multicast()
+                            || a.is_unicast_link_local()
+                    }) =>
+                    {
+                        return Err(ModelError::Invalid("tunnel address"));
                     }
                     Value::Interface { vrf, vlan, .. } => {
                         name(vrf)?;
@@ -459,9 +488,13 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             mtu,
             vrf,
             vlan,
+            tunnel,
         } => {
             let named = vrf != DEFAULT_VRF;
-            let members = 3 + u64::from(named) + if vlan.is_some() { 2 } else { 0 };
+            let members = 3
+                + u64::from(named)
+                + if vlan.is_some() { 2 } else { 0 }
+                + if tunnel.is_some() { 2 } else { 0 };
             e.map(members)
                 .u64(sid::INTERFACE_ENABLED - sid::INTERFACE)
                 .bool(*enabled)
@@ -478,6 +511,12 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                     .text(&vlan.parent)
                     .u64(sid::INTERFACE_VLAN_ID - sid::INTERFACE)
                     .u64(u64::from(vlan.id));
+            }
+            if let Some(tunnel) = tunnel {
+                e.u64(sid::INTERFACE_TUNNEL_LOCAL - sid::INTERFACE)
+                    .text(&tunnel.local.to_string())
+                    .u64(sid::INTERFACE_TUNNEL_REMOTE - sid::INTERFACE)
+                    .text(&tunnel.remote.to_string());
             }
         }
         Value::Address { prefix_len } => {
@@ -584,6 +623,8 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     let mut vrf = None;
     let mut parent = None;
     let mut vlan_id = None;
+    let mut tunnel_local = None;
+    let mut tunnel_remote = None;
     let mut prefix_len = None;
     let mut action = None;
     for _ in 0..members {
@@ -612,6 +653,12 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
                     &mut vlan_id,
                     u16::try_from(d.u64()?).map_err(|_| ModelError::Invalid("VLAN ID"))?,
                 )?;
+            }
+            sid::INTERFACE_TUNNEL_LOCAL if table == sid::INTERFACE => {
+                put(&mut tunnel_local, parse_ipv6(d.text()?)?)?;
+            }
+            sid::INTERFACE_TUNNEL_REMOTE if table == sid::INTERFACE => {
+                put(&mut tunnel_remote, parse_ipv6(d.text()?)?)?;
             }
             sid::ROUTE_LOOKUP_VRF if table == sid::ROUTE => {
                 put(&mut action, RouteAction::LookupVrf(d.text()?.to_owned()))?;
@@ -657,6 +704,11 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
                 (Some(parent), Some(id)) => Some(Vlan { parent, id }),
                 (None, None) => None,
                 _ => return Err(ModelError::Missing("VLAN parent and ID together")),
+            },
+            tunnel: match (tunnel_local, tunnel_remote) {
+                (Some(local), Some(remote)) => Some(Tunnel { local, remote }),
+                (None, None) => None,
+                _ => return Err(ModelError::Missing("tunnel local and remote together")),
             },
         }),
         sid::ADDRESS => Ok(Value::Address {
@@ -747,6 +799,13 @@ fn parse_ip(text: &str) -> Result<IpAddr, ModelError> {
         return Err(ModelError::Invalid("IP address (not canonical)"));
     }
     Ok(address)
+}
+
+fn parse_ipv6(text: &str) -> Result<std::net::Ipv6Addr, ModelError> {
+    match parse_ip(text)? {
+        IpAddr::V6(address) => Ok(address),
+        IpAddr::V4(_) => Err(ModelError::Invalid("IPv6 address")),
+    }
 }
 
 fn parse_prefix(text: &str) -> Result<(IpAddr, u8), ModelError> {

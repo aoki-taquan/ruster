@@ -14,8 +14,8 @@ use std::net::IpAddr;
 
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallIpv4Prefix, FirewallPortRange, FirewallProtocol,
-    FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib,
-    Ipv6Local, Ipv6Neighbor, Ipv6Route, LocalIpv4Binding, MacAddress, Neighbor, Route,
+    FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, Ipv4InIpv6Tunnel, Ipv4OriginPolicy,
+    Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, LocalIpv4Binding, MacAddress, Neighbor, Route,
     ValidatedForwardingOwner, VlanBinding,
 };
 use ruster_proto::session::Store;
@@ -41,6 +41,8 @@ pub(crate) struct Built {
     pub(crate) interface_names: Vec<String>,
     /// The VLAN sub-interfaces of enabled ports.
     pub(crate) vlans: Vec<VlanBinding>,
+    /// The enabled IPv4 in IPv6 tunnels.
+    pub(crate) tunnels: Vec<Ipv4InIpv6Tunnel>,
     /// The default VRF's forward firewall rules, in rule id order, without those
     /// naming an interface that is missing or disabled.
     pub(crate) firewall: Vec<FirewallRule>,
@@ -203,6 +205,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 mtu,
                 vrf,
                 vlan: None,
+                tunnel: None,
             },
         ) = (key, value)
         {
@@ -228,6 +231,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 mtu,
                 vrf,
                 vlan: Some(vlan),
+                ..
             },
         ) = (key, value)
         {
@@ -260,6 +264,41 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 parent,
                 vid: vlan.id,
                 sub: id,
+            });
+            active.insert(name.as_str(), (id, vrf.as_str()));
+        }
+    }
+    // Tunnel interfaces get the ids after those.
+    let mut tunnels = Vec::new();
+    for (key, value) in store.iter() {
+        if let (
+            Key::Interface { name },
+            Value::Interface {
+                enabled: true,
+                mac,
+                mtu,
+                vrf,
+                tunnel: Some(tunnel),
+                ..
+            },
+        ) = (key, value)
+        {
+            if ports.iter().any(|port| port == name) {
+                return Err(format!("tunnel {name} has the name of a port"));
+            }
+            let id = u16::try_from(interface_names.len())
+                .map(IfId)
+                .map_err(|_| "too many interfaces".to_owned())?;
+            interface_names.push(name.clone());
+            interfaces.push(Interface {
+                id,
+                mac: MacAddress(*mac),
+                mtu: *mtu,
+            });
+            tunnels.push(Ipv4InIpv6Tunnel {
+                interface: id,
+                local: tunnel.local.octets(),
+                remote: tunnel.remote.octets(),
             });
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
@@ -438,6 +477,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         active: enabled,
         interface_names,
         vlans,
+        tunnels,
         firewall,
         firewall_on,
         nat,

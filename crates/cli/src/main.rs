@@ -79,13 +79,18 @@ fn line(change: &Change) -> String {
                 mtu,
                 vrf,
                 vlan,
+                tunnel,
             },
         ) => format!(
-            "interface {name} {} mac {} mtu {mtu} vrf {vrf}{}",
+            "interface {name} {} mac {} mtu {mtu} vrf {vrf}{}{}",
             if *enabled { "up" } else { "down" },
             format_mac(mac),
             vlan.as_ref()
                 .map(|v| format!(" vlan {} on {}", v.id, v.parent))
+                .unwrap_or_default(),
+            tunnel
+                .as_ref()
+                .map(|t| format!(" tunnel {} to {}", t.local, t.remote))
                 .unwrap_or_default()
         ),
         (Key::Address { interface, address }, Value::Address { prefix_len }) => {

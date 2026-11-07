@@ -298,6 +298,7 @@ impl Confd {
                             parent: parent.clone(),
                             id: *id,
                         }),
+                    tunnel: None,
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);
