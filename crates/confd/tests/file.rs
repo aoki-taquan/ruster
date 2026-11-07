@@ -679,6 +679,10 @@ fn a_tunnel_interface_needs_no_mac_and_sends_from_a_router_address() {
             "IPv4 only",
         ),
         (
+            dslite("2001:db8:1::2", "[[route]]\nprefix = \"2001:db8:9::/48\"\ninterface = \"dslite\"\n"),
+            "carries IPv4 only",
+        ),
+        (
             dslite("2001:db8:1::2", "")
                 .replace("ipv6 = [\"2001:db8:1::2/64\"]", "mtu = 1454\nipv6 = [\"2001:db8:1::2/64\"]"),
             "at most 1414",

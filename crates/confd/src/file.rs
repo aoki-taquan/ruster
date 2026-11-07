@@ -475,6 +475,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if !seen.names.contains(&interface) {
             return Err(format!("{at}: no interface {interface:?}"));
         }
+        let tunnel = interfaces
+            .iter()
+            .any(|i| i.name == interface && i.tunnel.is_some());
+        if tunnel && address.is_ipv6() {
+            return Err(format!("{at}: tunnel {interface:?} carries IPv4 only"));
+        }
         let via = match &entry.via {
             Some(text) => {
                 let via = text
