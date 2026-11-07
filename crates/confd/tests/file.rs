@@ -749,6 +749,12 @@ fn map_e_follows_rfc_7597_appendix_a() {
         .static_routes
         .iter()
         .any(|r| r.len == 0 && r.prefix == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    let rule =
+        format!("{text}[[firewall]]\naction = \"accept\"\nprotocol = \"tcp\"\negress = \"map\"\n");
+    assert!(
+        parse(&rule).is_ok(),
+        "a firewall rule may name the MAP-E tunnel"
+    );
 
     for (bad, expected) in [
         (
@@ -758,6 +764,14 @@ fn map_e_follows_rfc_7597_appendix_a() {
         (
             text.replace("ea-length = 16", "ea-length = 4"),
             "ea-length must cover",
+        ),
+        (text.replace("192.0.2.0/24", "224.0.2.0/24"), "unicast"),
+        (
+            text.replace(
+                "[map-e]",
+                "[[interface]]\nname = \"dmz\"\nmac = \"02:00:00:00:00:03\"\nipv4 = \"192.0.2.18/24\"\n[map-e]",
+            ),
+            "given twice",
         ),
         (
             text.replace("2001:db8:12:3400::/56", "2001:db8:12::/48"),

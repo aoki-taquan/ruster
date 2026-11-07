@@ -31,6 +31,7 @@
 //! ea-length = 16
 //! psid-offset = 6              # optional, 6 when left out
 //! br = "2001:db8:ffff::1"
+//! mtu = 1460                   # optional, 1460 when left out
 //!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
@@ -90,8 +91,11 @@
 //!   prefix with subnet ID 0), and makes a tunnel to the BR, NAPT on the PSID's
 //!   port set (section 5.1) and the default IPv4 route through the tunnel.
 //!   Deviations: one Basic Mapping Rule, no Forwarding Mapping Rules (all traffic
-//!   goes through the BR, hub and spoke); the IPv4 address with no sharing
-//!   (`ea-length` equal to the IPv4 suffix) uses ports 1024 to 65535.
+//!   goes through the BR, hub and spoke); an `ea-length` shorter than the IPv4
+//!   suffix (an IPv4 prefix per CE) is refused; the IPv4 address with no sharing
+//!   (`ea-length` equal to the IPv4 suffix) uses ports 1024 to 32767, below the
+//!   kernel's; the router's own IPv4 (from the kernel) is not translated into the
+//!   port set, so it does not work over MAP-E yet.
 //! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
 //!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
@@ -448,12 +452,38 @@ pub fn parse(text: &str) -> Result<Config, String> {
             tunnel,
         });
     }
-    // A tunnel is sent from one of the router's own addresses, in the default VRF.
+    // A MAP-E CE's tunnel is an interface like the others for what follows.
+    let map_e = match file.map_e {
+        Some(entry) => {
+            let (tunnel, mapped) = map_e(entry, &seen)?;
+            let at = format!("map-e interface {:?}", tunnel.name);
+            if tunnel.name.is_empty() || tunnel.name.len() > 255 {
+                return Err(format!("{at}: the name must be 1 to 255 bytes"));
+            }
+            seen.names.insert(tunnel.name.clone());
+            seen.vrf_of
+                .insert(tunnel.name.clone(), DEFAULT_VRF.to_owned());
+            let (address, len) = tunnel.ipv4.expect("a MAP-E tunnel has its IPv4 address");
+            seen.address(&at, &tunnel.name, address.into(), len)?;
+            let name = tunnel.name.clone();
+            interfaces.push(tunnel);
+            Some((name, mapped))
+        }
+        None => None,
+    };
+    // A tunnel is sent from one of the router's own addresses, in the default VRF
+    // (a MAP-E CE's from its own address, which needs none).
     let mut pairs = BTreeSet::new();
     for interface in &interfaces {
         let Some((local, remote)) = interface.tunnel else {
             continue;
         };
+        if map_e
+            .as_ref()
+            .is_some_and(|(name, _)| *name == interface.name)
+        {
+            continue;
+        }
         let at = format!("interface {:?}", interface.name);
         let owner = interfaces.iter().find(|i| {
             i.tunnel.is_none() && i.vrf == DEFAULT_VRF && i.ipv6.iter().any(|&(a, _)| a == local)
@@ -581,11 +611,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
         .nat
         .map(|entry| nat(entry, &seen, &interfaces))
         .transpose()?;
-    if let Some(entry) = file.map_e {
+    if let Some((tunnel, mapped)) = map_e {
         if nat.is_some() {
             return Err("map-e: it makes the NAT itself; give no [nat]".into());
         }
-        let (tunnel, mapped) = map_e(entry, &seen)?;
         if static_routes.iter().any(|r| {
             r.vrf == DEFAULT_VRF && r.prefix == IpAddr::V4(Ipv4Addr::UNSPECIFIED) && r.len == 0
         }) {
@@ -596,12 +625,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
             prefix: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             len: 0,
             target: RouteTarget::Next {
-                interface: tunnel.name.clone(),
+                interface: tunnel,
                 via: None,
             },
         });
         nat = Some(mapped);
-        interfaces.push(tunnel);
     }
     Ok(Config {
         interfaces,
@@ -628,6 +656,9 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String
         }
         _ => return Err(format!("{at}: rule-ipv4 must be an IPv4 prefix")),
     };
+    if !unicast_v4(rule4) {
+        return Err(format!("{at}: rule-ipv4 must be a unicast prefix"));
+    }
     let br: Ipv6Addr = entry
         .br
         .parse()
@@ -665,10 +696,14 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String
     let psid = (ea & ((1_u64 << psid_length) - 1)) as u16;
     let ipv4 = Ipv4Addr::from(u32::from(rule4) | (ea >> psid_length) as u32);
     let offset = entry.psid_offset.unwrap_or(6);
+    if !(1..=15).contains(&offset) {
+        return Err(format!("{at}: psid-offset must be 1 to 15"));
+    }
     let ports = if psid_length == 0 {
         NatPorts::Range {
+            // Below the kernel's ephemeral ports, as for [nat].
             first: 1_024,
-            last: u16::MAX,
+            last: 32_767,
         }
     } else {
         if offset == 0 || u16::from(offset) + u16::from(psid_length) >= 16 {

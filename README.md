@@ -57,7 +57,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 default VRFの転送のfirewallは、設定ファイルの規則でFEが使います。IPv4だけで、規則があるあいだdefault VRFを通るIPv6は転送しません。
 default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFEが使います。
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます（AF_XDPのみ）。
-MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます（AF_XDPのみ）。
+MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます（AF_XDPのみ。ルータ自身のIPv4はまだMAP-Eを通りません）。
 FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don't Fragmentが無いもの）、NATはフラグメントになったdatagramも変換します。
 
 ## 動かす
