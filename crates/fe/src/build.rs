@@ -47,6 +47,19 @@ pub(crate) struct Built {
     /// Whether the tables have any firewall rule. Then the firewall is on even if
     /// none of them is in `firewall`, and drops everything.
     pub(crate) firewall_on: bool,
+    /// The default VRF's NAPT, when the tables have one and both its interfaces
+    /// are enabled.
+    pub(crate) nat: Option<Nat>,
+}
+
+/// NAPT from `inside` to `outside`, with `public` and the ports `first..=last`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Nat {
+    pub(crate) inside: IfId,
+    pub(crate) outside: IfId,
+    pub(crate) public: Ipv4Address,
+    pub(crate) first: u16,
+    pub(crate) last: u16,
 }
 
 /// One forwarding route before it becomes core's.
@@ -271,6 +284,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
     let mut firewall = Vec::new();
     let mut firewall_on = false;
+    let mut nat_entry = None;
     for (key, value) in store.iter() {
         match (key, value) {
             (Key::Address { interface, address }, Value::Address { .. }) => {
@@ -337,6 +351,12 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                     }),
                 }
             }
+            (Key::Nat { vrf }, Value::Nat(nat)) => {
+                if vrf != DEFAULT_VRF {
+                    return Err(format!("nat in {vrf}: only the default VRF has NAT"));
+                }
+                nat_entry = Some(nat);
+            }
             (Key::FirewallRule { vrf, id }, Value::FirewallRule(rule)) => {
                 if vrf != DEFAULT_VRF {
                     return Err(format!(
@@ -355,6 +375,10 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     }
 
     firewall.sort_by_key(|rule| rule.id());
+    let nat = match nat_entry {
+        Some(entry) => nat(entry, &active, &bindings[0])?,
+        None => None,
+    };
     let routes = expand_lookups(&entries);
     let mut vrfs = Vec::with_capacity(order.len());
     for (at, name) in order.iter().enumerate() {
@@ -416,7 +440,43 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         vlans,
         firewall,
         firewall_on,
+        nat,
     })
+}
+
+/// Core's NAPT for the table's entry, or `None` when one of its interfaces is
+/// missing or disabled (no traffic then crosses it).
+fn nat(
+    entry: &table::Nat,
+    active: &BTreeMap<&str, (IfId, &str)>,
+    bindings: &[LocalIpv4Binding],
+) -> Result<Option<Nat>, String> {
+    let interface = |name: &str| -> Result<Option<IfId>, String> {
+        match active.get(name) {
+            None => Ok(None),
+            Some(&(id, vrf)) if vrf == DEFAULT_VRF => Ok(Some(id)),
+            Some(&(_, vrf)) => Err(format!("nat: interface {name} is in {vrf}, not default")),
+        }
+    };
+    let (Some(inside), Some(outside)) = (interface(&entry.inside)?, interface(&entry.outside)?)
+    else {
+        return Ok(None);
+    };
+    let public = match entry.external {
+        Some(address) => Ipv4Address::from_octets(address.octets()),
+        None => bindings
+            .iter()
+            .find(|b| b.interface == outside)
+            .map(|b| b.address)
+            .ok_or_else(|| format!("nat: {} has no IPv4 address", entry.outside))?,
+    };
+    Ok(Some(Nat {
+        inside,
+        outside,
+        public,
+        first: entry.first_port,
+        last: entry.last_port,
+    }))
 }
 
 /// Core's rule for the table's rule `id`, or `None` when it names an interface that

@@ -44,6 +44,7 @@ use ruster_proto::task::{Progress, Task};
 mod build;
 mod firewall;
 mod local;
+mod nat;
 
 pub use local::LocalPipe;
 
@@ -51,7 +52,7 @@ pub use local::LocalPipe;
 pub mod writers {
     use ruster_proto::sid;
 
-    pub const CONFIG: &[u64] = &[sid::INTERFACE, sid::ADDRESS, sid::FIREWALL_RULE];
+    pub const CONFIG: &[u64] = &[sid::INTERFACE, sid::ADDRESS, sid::NAT, sid::FIREWALL_RULE];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
     pub const READ_ONLY: &[u64] = &[];
@@ -130,6 +131,8 @@ pub struct Fe<B> {
     icmpv4_errors: Icmpv4ErrorRuntime<'static>,
     /// The default VRF's forward firewall, once a rule has arrived.
     firewall: Option<firewall::Firewall>,
+    /// The default VRF's NAPT, once the tables have had one.
+    nat: Option<nat::Nat>,
     counters: FeCounters,
 }
 
@@ -157,7 +160,7 @@ where
         builder
             .check(&Store::default())
             .expect("empty tables build");
-        let (built, _) = builder.built.take().expect("built");
+        let (built, _, _) = builder.built.take().expect("built");
         Self {
             io,
             builder,
@@ -176,6 +179,7 @@ where
             control: ControlQueue::new(EVENTS_PER_BATCH).with_icmpv6_errors(EVENTS_PER_BATCH),
             icmpv4_errors: icmpv4_error_runtime(),
             firewall: None,
+            nat: None,
             counters: FeCounters::default(),
         }
     }
@@ -259,19 +263,18 @@ where
         self.control.clear();
         let now = MonotonicMillis(now_ms);
         self.control.set_clock(now);
-        let report = forward_batch_with_control(
-            batch,
-            &snapshot,
-            &mut self.control,
-            Services {
-                icmpv4_errors: Some(&mut self.icmpv4_errors),
-                firewall: firewall
-                    .as_mut()
-                    .map(|(config, runtime)| (&*config, &mut **runtime)),
-                ..Services::default()
-            },
-            &mut trace,
-        );
+        let mut services = Services {
+            icmpv4_errors: Some(&mut self.icmpv4_errors),
+            firewall: firewall
+                .as_mut()
+                .map(|(config, runtime)| (&*config, &mut **runtime)),
+            ..Services::default()
+        };
+        if let Some(nat) = self.nat.as_mut() {
+            nat.services(&mut services);
+        }
+        let report =
+            forward_batch_with_control(batch, &snapshot, &mut self.control, services, &mut trace);
         if report.received == 0 {
             return false;
         }
@@ -543,7 +546,12 @@ where
 {
     fn step(&mut self, now_ms: u64) -> Progress {
         let control = self.server.step(&mut self.builder);
-        if let Some((built, publication)) = self.builder.built.take() {
+        if let Some((built, publication, nat)) = self.builder.built.take() {
+            // As for the firewall: a NAT that cannot move stays bound to the old
+            // tables, and core drops what it would have translated.
+            if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {
+                eprintln!("ruster-fe: {error}");
+            }
             // Until a move succeeds the old firewall stays, bound to the old tables:
             // core then drops what it would have checked.
             if let Err(error) = firewall::Firewall::publish(
@@ -597,7 +605,11 @@ struct Builder {
     ports: Vec<String>,
     /// The tables built for the last accepted store and their firewall, until the
     /// FE takes them.
-    built: Option<(build::Built, firewall::Publication)>,
+    built: Option<(
+        build::Built,
+        firewall::Publication,
+        Option<nat::Publication>,
+    )>,
     /// Of the last firewall publication.
     generation: u64,
 }
@@ -619,7 +631,11 @@ impl Hook for Builder {
             built.firewall_on,
             self.generation,
         )?;
-        self.built = Some((built, publication));
+        let nat = built
+            .nat
+            .map(|nat| nat::Publication::new(&default.owner.snapshot(), nat))
+            .transpose()?;
+        self.built = Some((built, publication, nat));
         Ok(())
     }
 
