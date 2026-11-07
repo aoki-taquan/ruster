@@ -24,11 +24,19 @@
 //!   that is not one host; at most 1280 bytes; a token bucket limits the rate (a
 //!   burst of 10, then one per 10 ms); the source is a global address of the router,
 //!   one on the interface toward the source when there is one.
+//! - RFC 8200 section 3: the Hop Limit is decremented when a packet is forwarded. A
+//!   packet from the kernel's interface ([`with_kernel_ingress`]) is the router's own,
+//!   so its Hop Limit stays.
 //!
 //! Deviations: no Destination Unreachable for an unresolvable neighbor (address
 //! unreachable) or for traffic to the router, no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
 //! to the kernel. Routes are searched linearly, longest prefix first.
+//! An ICMPv6 error about a packet from the kernel's interface has the packet's
+//! destination as its source, not an address of the router (RFC 4443 section 2.2),
+//! because the kernel discards a packet from one of its own addresses.
+//!
+//! [`with_kernel_ingress`]: crate::ForwardingSnapshot::with_kernel_ingress
 
 use crate::{IfId, MacAddress, TraceEvent, TraceSink};
 
@@ -350,6 +358,7 @@ impl ControlQueue {
         invoking: &[u8],
         snapshot: &crate::ForwardingSnapshot<'_>,
         fib: &Ipv6Fib,
+        ingress: IfId,
         (kind, code, parameter): (u8, u8, u32),
     ) {
         if self.errors_len >= self.errors.len() {
@@ -360,6 +369,7 @@ impl ControlQueue {
             invoking,
             snapshot,
             fib,
+            ingress,
             (kind, code, parameter),
         ) else {
             return;
@@ -455,7 +465,9 @@ pub(crate) fn decide<T: TraceSink>(
     if is_link_local(source) || is_unspecified_or_loopback(source) {
         return Outcome::Drop(Ipv6SourceInvalid);
     }
-    if hop_limit <= 1 {
+    // The router's own packets are not forwarded: their Hop Limit stays.
+    let hop = u8::from(!snapshot.is_kernel_ingress(ingress));
+    if hop_limit <= hop {
         return Outcome::Error(Ipv6HopLimitExpired, TIME_EXCEEDED, 0, 0);
     }
     let Some(route) = fib.route(destination) else {
@@ -481,7 +493,7 @@ pub(crate) fn decide<T: TraceSink>(
     };
     frame[0..6].copy_from_slice(&mac.0);
     frame[6..12].copy_from_slice(&egress.mac.0);
-    frame[ip + 7] = hop_limit - 1;
+    frame[ip + 7] = hop_limit - hop;
     Outcome::Transmit(egress.id)
 }
 
@@ -527,7 +539,13 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
         }
         Outcome::Error(reason, kind, code, parameter) => {
             if let Some(queue) = control {
-                queue.error(packet.bytes_mut(), snapshot, fib, (kind, code, parameter));
+                queue.error(
+                    packet.bytes_mut(),
+                    snapshot,
+                    fib,
+                    ingress,
+                    (kind, code, parameter),
+                );
             }
             packet.recycle(reason);
             trace.record(TraceEvent::Dropped { ingress, reason });
@@ -589,6 +607,7 @@ fn build_error(
     invoking: &[u8],
     snapshot: &crate::ForwardingSnapshot<'_>,
     fib: &Ipv6Fib,
+    ingress: IfId,
     (kind, code, parameter): (u8, u8, u32),
 ) -> Option<(IfId, usize)> {
     let ip = ETHERNET_HEADER;
@@ -606,16 +625,25 @@ fn build_error(
     {
         return None;
     }
-    let route = fib.route(source)?;
-    let egress = snapshot.interface(route.egress)?;
-    let mac = fib.neighbor(egress.id, route.next_hop.unwrap_or(source))?;
-    // An address of the router: on the egress interface if it has a global one.
-    let from = fib
-        .local
-        .iter()
-        .filter(|l| !is_link_local(l.address))
-        .min_by_key(|l| l.interface != egress.id)?
-        .address;
+    let (egress, mac, from) = if snapshot.is_kernel_ingress(ingress) {
+        // About the router's own packet: back through the kernel's interface, from
+        // the packet's destination (every router address is the kernel's own).
+        let mut mac = [0; 6];
+        mac.copy_from_slice(&invoking[6..12]);
+        (snapshot.interface(ingress)?, MacAddress(mac), destination)
+    } else {
+        let route = fib.route(source)?;
+        let egress = snapshot.interface(route.egress)?;
+        let mac = fib.neighbor(egress.id, route.next_hop.unwrap_or(source))?;
+        // An address of the router: on the egress interface if it has a global one.
+        let from = fib
+            .local
+            .iter()
+            .filter(|l| !is_link_local(l.address))
+            .min_by_key(|l| l.interface != egress.id)?
+            .address;
+        (egress, mac, from)
+    };
     let limit = ERROR_MAX.min(usize::from(egress.mtu));
     let quoted = (invoking.len() - ip).min(limit - IPV6_HEADER - 8);
     let icmp_len = 8 + quoted;

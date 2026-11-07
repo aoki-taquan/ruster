@@ -222,6 +222,9 @@ pub(crate) struct Ipv4FragmentTemplate {
     /// Bytes of the first fragment's transport header: no later fragment
     /// may start inside it.
     transport_header_len: u8,
+    /// The datagram is the router's own (from the kernel's interface): its TTL
+    /// stays, as the first fragment's did.
+    keeps_ttl: bool,
 }
 
 impl Ipv4FragmentTemplate {
@@ -246,23 +249,31 @@ impl Ipv4FragmentTemplate {
             destination: ipv4[16..20].try_into().ok()?,
             id: u16::from_be_bytes([ipv4[4], ipv4[5]]),
             transport_header_len,
+            keeps_ttl: false,
         })
     }
 
-    /// Rewrites a later fragment (validated, 20-byte header, TTL above 1)
-    /// like its first fragment: Ethernet addresses, ID, addresses, TTL - 1,
-    /// and a recomputed header checksum.
+    /// The same template for a datagram whose TTL stays (the router's own).
+    pub(crate) const fn keeping_ttl(self, keeps_ttl: bool) -> Self {
+        Self { keeps_ttl, ..self }
+    }
+
+    /// Rewrites a later fragment (validated, 20-byte header, TTL above 1
+    /// unless it keeps its TTL) like its first fragment: Ethernet addresses, ID,
+    /// addresses, TTL - 1 (unchanged for the router's own), and a recomputed
+    /// header checksum.
     pub(crate) fn apply(self, frame: &mut [u8]) -> Result<(), DropReason> {
         let header = packet::ETHERNET_HEADER_LEN;
         if frame.len() < header + IPV4_HEADER_LEN {
             return Err(DropReason::Ipv4HeaderTruncated);
         }
-        if frame[header + 8] <= 1 {
+        let hop = u8::from(!self.keeps_ttl);
+        if frame[header + 8] <= hop {
             return Err(DropReason::Ipv4TtlExpired);
         }
         frame[0..12].copy_from_slice(&self.macs);
         frame[header + 4..header + 6].copy_from_slice(&self.id.to_be_bytes());
-        frame[header + 8] -= 1;
+        frame[header + 8] -= hop;
         frame[header + 12..header + 16].copy_from_slice(&self.source);
         frame[header + 16..header + 20].copy_from_slice(&self.destination);
         frame[header + 10..header + 12].copy_from_slice(&[0, 0]);
@@ -516,6 +527,7 @@ impl Ipv4FragmentEntrySlot {
             destination: [0; 4],
             id: 0,
             transport_header_len: 0,
+            keeps_ttl: false,
         },
         created_ms: 0,
         progress_ms: 0,
