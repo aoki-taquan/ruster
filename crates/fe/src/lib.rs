@@ -270,7 +270,9 @@ where
             let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
             match kind {
                 ControlKind::Neighbor => self.punt_frame(ingress, punt::reason::ND, &bytes),
-                ControlKind::Local => self.to_kernel(ingress, &bytes[ETHERNET_HEADER..], now_ms),
+                ControlKind::Local => {
+                    self.send_to_kernel(ingress, &bytes[ETHERNET_HEADER..], now_ms)
+                }
             }
         }
         for &(egress, target) in &trace.misses {
@@ -396,7 +398,7 @@ where
     }
 
     /// Writes a packet addressed to the router to its VRF's kernel pipe.
-    fn to_kernel(&mut self, ingress: IfId, packet: &[u8], now_ms: u64) {
+    fn send_to_kernel(&mut self, ingress: IfId, packet: &[u8], now_ms: u64) {
         let vrf = self
             .by_ingress
             .get(usize::from(ingress.0))
@@ -410,7 +412,7 @@ where
     }
 
     /// Sends what the kernel wrote to each VRF's pipe out of the route's interface.
-    fn from_kernel(&mut self, now_ms: u64) -> bool {
+    fn receive_from_kernel(&mut self, now_ms: u64) -> bool {
         let mut buf = vec![0_u8; ETHERNET_HEADER + PUNT_MAX];
         let mut packets = Vec::new();
         for (at, name) in self.names.iter().enumerate() {
@@ -490,7 +492,7 @@ where
         }
         let worked = self.worker(now_ms);
         let injected = self.inject();
-        let from_kernel = self.from_kernel(now_ms);
+        let from_kernel = self.receive_from_kernel(now_ms);
         // Notifications queued by the worker go out now.
         let flushed = self.server.step(&mut self.builder);
         control
