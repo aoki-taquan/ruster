@@ -10,6 +10,9 @@
 //! - RFC 2473 (Generic Packet Tunneling in IPv6): the encapsulating header, Next
 //!   Header 4, the inner packet unchanged after its own forwarding (TTL already
 //!   decremented).
+//! - RFC 8200 section 4: Hop-by-Hop and Destination Options headers before the
+//!   inner packet (such as RFC 2473 4.1.1's Tunnel Encapsulation Limit) are
+//!   stepped over when unwrapping; other extension headers are not.
 //! - RFC 2983 (uniform model): the inner IPv4 TOS byte is copied to the outer
 //!   Traffic Class.
 //!
@@ -31,6 +34,10 @@ const IPV6_ETHERTYPE: [u8; 2] = [0x86, 0xdd];
 const IPV4_ETHERTYPE: [u8; 2] = [0x08, 0x00];
 /// IP protocol number of IPv4 (IP in IP), as IPv6 Next Header.
 const IPV4_IN_IP: u8 = 4;
+const HOP_BY_HOP: u8 = 0;
+const DESTINATION_OPTIONS: u8 = 60;
+/// Option headers stepped over before the inner packet, at most.
+const MAX_OPTION_HEADERS: usize = 2;
 /// Hop Limit of the outer header.
 const HOP_LIMIT: u8 = 64;
 
@@ -71,7 +78,24 @@ pub(crate) fn receive<S: PacketSlot>(
         return Ok(false);
     }
     let ip = ETHERNET;
-    if bytes[ip] >> 4 != 6 || bytes[ip + 6] != IPV4_IN_IP {
+    if bytes[ip] >> 4 != 6 {
+        return Ok(false);
+    }
+    // Hop-by-Hop and Destination Options headers (such as RFC 2473's Tunnel
+    // Encapsulation Limit) may come before the inner packet; they are stepped over.
+    let mut next = bytes[ip + 6];
+    let mut header = IPV6_HEADER;
+    for _ in 0..MAX_OPTION_HEADERS {
+        if !matches!(next, HOP_BY_HOP | DESTINATION_OPTIONS) {
+            break;
+        }
+        let Some(&[following, length]) = bytes.get(ip + header..ip + header + 2) else {
+            return Ok(false);
+        };
+        next = following;
+        header += (usize::from(length) + 1) * 8;
+    }
+    if next != IPV4_IN_IP {
         return Ok(false);
     }
     let source = &bytes[ip + 8..ip + 24];
@@ -94,7 +118,7 @@ pub(crate) fn receive<S: PacketSlot>(
     if ip + IPV6_HEADER + payload > bytes.len() {
         return Err(DropReason::Ipv6PayloadLengthExceedsPacket);
     }
-    if payload == 0 || bytes[ip + IPV6_HEADER] >> 4 != 4 {
+    if payload <= header - IPV6_HEADER || bytes[ip + header] >> 4 != 4 {
         return Err(DropReason::TunnelInnerInvalid);
     }
     let tunnel_mac = snapshot
@@ -103,10 +127,10 @@ pub(crate) fn receive<S: PacketSlot>(
         .mac;
     // The source MAC stays (as the previous hop's), the destination becomes the
     // tunnel interface's so the inner packet passes its Ethernet check.
-    bytes.copy_within(6..12, 6 + IPV6_HEADER);
-    bytes[IPV6_HEADER..IPV6_HEADER + 6].copy_from_slice(&tunnel_mac.0);
-    bytes[IPV6_HEADER + 12..IPV6_HEADER + 14].copy_from_slice(&IPV4_ETHERTYPE);
-    if !packet.resize_front(IPV6_HEADER as isize) {
+    bytes.copy_within(6..12, 6 + header);
+    bytes[header..header + 6].copy_from_slice(&tunnel_mac.0);
+    bytes[header + 12..header + 14].copy_from_slice(&IPV4_ETHERTYPE);
+    if !packet.resize_front(header as isize) {
         return Err(DropReason::TunnelNoRoom);
     }
     packet.set_ingress(tunnel.interface);

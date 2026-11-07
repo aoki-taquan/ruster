@@ -215,3 +215,21 @@ fn a_datagram_longer_than_the_tunnel_mtu_is_not_sent() {
     frame[24..26].copy_from_slice(&checksum.to_be_bytes());
     assert!(run(&tables, LAN, frame).is_none_or(|(egress, _)| egress != WAN));
 }
+
+#[test]
+fn a_destination_options_header_before_the_inner_packet_is_stepped_over() {
+    let tables = tables();
+    let inner = ipv4(SOFTWIRE_MAC, REMOTE, HOST, 0);
+    let mut frame = from_aftr(&inner, aftr(), b4());
+    // Next Header 60, then an 8-byte Destination Options header with RFC 2473's
+    // Tunnel Encapsulation Limit option (type 4, length 1, limit 4) and a PadN.
+    frame[14 + 6] = 60;
+    let options = [4, 0, 4, 1, 4, 1, 0, 0];
+    frame.splice(54..54, options);
+    let payload = u16::from_be_bytes([frame[18], frame[19]]) + 8;
+    frame[18..20].copy_from_slice(&payload.to_be_bytes());
+    let (egress, out) = run(&tables, WAN, frame).expect("sent");
+    assert_eq!(egress, LAN);
+    assert_eq!(&out[12..14], &[0x08, 0x00]);
+    assert_eq!(&out[26..30], &REMOTE);
+}
