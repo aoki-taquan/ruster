@@ -410,6 +410,7 @@ pub(crate) mod linear {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn gateway(routes: &[Route], interface: IfId, next_hop: Ipv4Address) -> bool {
         routes
             .iter()

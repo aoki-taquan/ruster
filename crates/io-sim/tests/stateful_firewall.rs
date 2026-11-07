@@ -11,8 +11,7 @@ use ruster_core::{
     MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpMappingSlot,
     Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
     Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoGeneratedIcmpv4Trace, NoTrace,
-    PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
-    Route,
+    PacketIo, Route,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -94,17 +93,6 @@ fn topology() -> (
                 address: WAN_LOCAL,
             },
         ],
-    )
-}
-
-fn resolution<'a>(
-    states: &'a mut [ResolutionStateSlot],
-    actions: &'a mut [ResolutionActionSlot],
-) -> ResolutionRuntime<'a> {
-    ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 2_000).unwrap(),
-        states,
-        actions,
     )
 }
 
@@ -359,9 +347,6 @@ fn ordered_rules_cidr_ports_default_deny_and_runtime_authority_are_exact() {
     let allowed = udp_frame(HOST, REMOTE, 12_346, 53, 0x4000, false);
     let mut slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     io.inject(LAN, denied.clone());
     io.inject(LAN, allowed);
@@ -409,9 +394,6 @@ fn cidr_protocol_and_port_predicates_match_independently_at_wire_boundaries() {
     let config = firewall_config(&snapshot, &rules, 1);
     let mut slots = [FirewallStateSlot::default(); 2];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
     for allowed in [
@@ -486,9 +468,6 @@ fn firewall_runtime_config_and_snapshot_mismatches_fail_closed() {
     .unwrap();
     let mut slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     let packet = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
     io.inject(LAN, packet.clone());
@@ -536,9 +515,6 @@ fn reconciled_runtime_borrows_only_the_current_rules_and_releases_old_storage() 
     let old_config = firewall_config(&snapshot, &old_rules, 1);
     let mut slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(old_config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     let packet = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
 
@@ -608,9 +584,6 @@ fn udp_pseudo_session_exact_reverse_checksum_df_and_padding_are_enforced() {
     .unwrap();
     let mut slots = [FirewallStateSlot::default(); 2];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
     let outbound = udp_frame(HOST, REMOTE, 12_345, 53, 0x8000, true);
@@ -712,9 +685,6 @@ fn tcp_initial_syn_same_batch_reverse_phase_fin_and_rst_refresh_are_exact() {
     .unwrap();
     let mut slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
     let syn = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0xc000);
@@ -817,9 +787,6 @@ fn firewall_transport_options_ports_checksums_and_ttl_fail_closed_before_state()
     .unwrap();
     let mut slots = [FirewallStateSlot::default(); 2];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
     let source_zero = udp_frame(HOST, REMOTE, 0, 53, 0, false);
@@ -967,9 +934,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 2];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 2];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let resolution_runtime = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -1000,7 +964,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     .unwrap();
     assert_drop(&mut io, DropReason::Ipv4TtlExpired, &ttl);
     assert_eq!(errors.pending_actions(), 1);
-    assert_eq!(resolution_runtime.pending_actions(), 0);
     assert!(udp.mappings().iter().all(|slot| !slot.is_occupied()));
     assert!(udp.peers().iter().all(|slot| !slot.is_occupied()));
     assert!(tcp.mappings().iter().all(|slot| !slot.is_occupied()));
@@ -1058,8 +1021,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     .unwrap();
     assert_drop(&mut io, DropReason::Ipv4TtlExpired, &audited_ttl);
     assert_eq!(errors.pending_actions(), 1);
-    assert_eq!(resolution_runtime.pending_actions(), 0);
-    assert_eq!(resolution_runtime.pending_states(), 0);
     assert_eq!(
         combined_state_snapshot(&udp, &tcp, &firewall),
         audited_state_before
@@ -1125,8 +1086,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallRuleDenied, &denied);
     assert_eq!(errors.pending_actions(), 0);
-    assert_eq!(resolution_runtime.pending_actions(), 0);
-    assert_eq!(resolution_runtime.pending_states(), 0);
     assert_eq!(
         combined_state_snapshot(&udp, &tcp, &deny_firewall),
         denied_state_before
@@ -1158,8 +1117,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallConfigMismatch, &authority);
     assert_eq!(errors.pending_actions(), 0);
-    assert_eq!(resolution_runtime.pending_actions(), 0);
-    assert_eq!(resolution_runtime.pending_states(), 0);
     assert_eq!(
         combined_state_snapshot(&udp, &tcp, &firewall),
         authority_state_before
@@ -1211,9 +1168,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
         &mut route_tcp_mappings,
         &mut route_tcp_sessions,
     );
-    let mut route_resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut route_resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let route_resolution = resolution(&mut route_resolution_states, &mut route_resolution_actions);
     let mut no_route = udp_frame(HOST, REMOTE, 12_348, 53, 0x4000, false);
     set_ttl(&mut no_route, 1);
     let route_state_before = combined_state_snapshot(&route_udp, &route_tcp, &route_firewall);
@@ -1236,8 +1190,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     // silent.
     assert_drop(&mut io, DropReason::FirewallRouteUnavailable, &no_route);
     assert_eq!(errors.pending_actions(), 0);
-    assert_eq!(route_resolution.pending_actions(), 0);
-    assert_eq!(route_resolution.pending_states(), 0);
     assert_eq!(
         combined_state_snapshot(&route_udp, &route_tcp, &route_firewall),
         route_state_before
@@ -1268,7 +1220,6 @@ fn full_nat_firewall_composition_queues_and_dispatches_only_authorized_icmpv4_er
     .unwrap();
     assert_drop(&mut io, DropReason::RouteMiss, &no_route);
     assert_eq!(errors.pending_actions(), 1);
-    assert_eq!(route_resolution.pending_actions(), 0);
     assert_eq!(
         combined_state_snapshot(&route_udp, &route_tcp, &open_firewall),
         open_state_before
@@ -1316,9 +1267,6 @@ fn deny_is_silent_and_precedes_ttl_neighbor_and_resolution_mutation() {
     .unwrap();
     let mut slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let resolution = resolution(&mut states, &mut actions);
     let mut packet = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
     packet[22] = 1;
     packet[24..26].fill(0);
@@ -1336,7 +1284,6 @@ fn deny_is_silent_and_precedes_ttl_neighbor_and_resolution_mutation() {
     )
     .unwrap();
     assert_drop(&mut io, DropReason::FirewallRuleDenied, &packet);
-    assert_eq!(resolution.pending_states(), 0);
     assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
 }
 
@@ -1381,9 +1328,6 @@ fn plain_natless_code4_preserves_legacy_and_firewall_deferred_behavior() {
     let config = firewall_config(&snapshot, &rules, 1);
     let mut firewall_slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut protected = SimIo::new();
     protected.inject(WAN, local.clone());
     let protected_local = protected
@@ -1474,9 +1418,6 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 2];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 2];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
 
     let outbound_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
@@ -1801,9 +1742,6 @@ fn related_icmpv4_requires_both_nat_mapping_and_firewall_origin_state() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut audit_storage = [FirewallAuditRecord::default(); 1];
     let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
     let mut io = SimIo::new();
@@ -1971,9 +1909,6 @@ fn nat_and_firewall_capacity_failures_leave_the_other_state_uncommitted() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     let packet = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
     io.inject(LAN, packet.clone());
@@ -2050,9 +1985,6 @@ fn nat_inbound_mapping_without_exact_firewall_reverse_state_is_denied() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     let outbound = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
     io.inject(LAN, outbound);
@@ -2174,9 +2106,6 @@ fn typed_audit_preserves_first_match_rule_default_and_established_identity() {
     let config = firewall_config(&snapshot, &rules, 1);
     let mut firewall_slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut audit_storage = [FirewallAuditRecord::default(); 4];
     let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
     let mut io = SimIo::new();
@@ -2265,9 +2194,6 @@ fn typed_audit_reports_terminal_failures_and_buffer_lifecycle() {
     let config = firewall_config(&snapshot, &rules, 1);
     let mut firewall_slots = [];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut audit_storage = [FirewallAuditRecord::default(); 1];
     let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
     let mut io = SimIo::new();
@@ -2363,9 +2289,6 @@ fn future_denies_make_plain_udp_and_tcp_old_time_fail_closed_without_state_chang
     let config = firewall_config(&snapshot, &rules, 1);
     let mut firewall_slots = [FirewallStateSlot::default(); 2];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
 
     for (frame, now, reason) in [
@@ -2410,9 +2333,6 @@ fn future_denies_make_plain_udp_and_tcp_old_time_fail_closed_without_state_chang
 fn exact_expiry_then_old_time_cannot_resurrect_plain_udp_or_tcp_state() {
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
 
     for (protocol, initial, reverse, exact_expiry) in [
@@ -2537,9 +2457,6 @@ fn future_combined_denies_advance_udp_and_tcp_nat_security_watermarks_only() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
 
     let future_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
@@ -2643,9 +2560,6 @@ fn exact_nat_expiry_then_old_time_cannot_resurrect_udp_or_tcp_mappings() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
     let outbound_udp = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
     let outbound_tcp = tcp_frame(HOST, REMOTE, 12_346, 443, 0x02, 0x4000);
@@ -2783,9 +2697,6 @@ fn firewall_preflight_hides_route_oracles_and_never_queues_icmp_or_arp_on_failur
     let config2 = firewall_config(&snapshot, &rules, 2);
     let mut firewall_slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 2];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 2];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 2];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 2];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -2920,9 +2831,6 @@ fn unfragmented_transport_boundary_matrix_is_typed_and_byte_atomic() {
     let config = firewall_config(&snapshot, &rules, 1);
     let mut firewall_slots = [FirewallStateSlot::default(); 1];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
 
     let mut udp_len_seven = udp_frame(HOST, REMOTE, 12_345, 53, 0, false);
@@ -3008,9 +2916,6 @@ fn nat_outbound_and_exact_reverse_are_visible_in_the_same_batch() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
     io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0xc000, false));
     io.inject(WAN, udp_frame(REMOTE, WAN_LOCAL, 53, 40_000, 0xc000, false));
@@ -3074,9 +2979,6 @@ fn tcp_nat_and_firewall_state_is_same_batch_visible_despite_backend_rejection() 
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut io = SimIo::new();
     io.set_received_accept_budget(0);
     let outbound = tcp_frame(HOST, REMOTE, 12_345, 443, 0x02, 0xc000);
@@ -3146,9 +3048,6 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         let mut peers = [Nat44UdpPeerSlot::default(); 1];
         let mut nat_indexes = UdpTestIndexes::new(udp_config, mappings.len(), peers.len());
         let mut nat = nat_indexes.runtime(udp_config, &mut mappings, &mut peers);
-        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-        let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
         let before_nat_counters = nat.counters();
         let mut rejected = udp_frame(HOST, REMOTE, 12_345, 53, 0x4000, false);
         rejected[0..6].copy_from_slice(&[0x02, 9, 9, 9, 9, 9]);
@@ -3189,9 +3088,6 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
     {
         let mut firewall_slots = [FirewallStateSlot::default(); 2];
         let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
-        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-        let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
         let mut audit_storage = [FirewallAuditRecord::default(); 2];
         let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
         let before_firewall_counters = firewall.counters();
@@ -3243,9 +3139,6 @@ fn ipv4_ingress_admission_precedes_nat_firewall_time_state_audit_and_actions() {
         let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
         let mut firewall_slots = [FirewallStateSlot::default(); 2];
         let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_slots);
-        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-        let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
         let mut audit_storage = [FirewallAuditRecord::default(); 4];
         let mut audit = FirewallAuditBuffer::new(&mut audit_storage);
         let before_udp_counters = udp.counters();
@@ -3332,9 +3225,6 @@ fn any_egress_allow(id: u32, protocol: FirewallProtocol) -> FirewallRule {
 fn plain_route_miss_icmpv4(frame: &[u8], routes: &[Route]) -> Vec<u8> {
     let (_, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(routes, &interfaces, &neighbors, &bindings).unwrap();
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -3379,9 +3269,6 @@ fn route_miss_permitted_toward_every_egress_generates_the_plain_type3_code0() {
     let config = firewall_config(&snapshot, &rules, 1);
     let mut firewall_slots = [FirewallStateSlot::default(); 2];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -3491,9 +3378,6 @@ fn route_miss_denied_toward_some_egress_stays_silent() {
     let (all_routes, interfaces, neighbors, bindings) = topology();
     let routes = [all_routes[0]];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let error_states = Box::leak(Box::new([Icmpv4ErrorStateSlot::EMPTY; 1]));
     let error_actions = Box::leak(Box::new([Icmpv4ErrorActionSlot::EMPTY; 1]));
     let mut errors =
@@ -3610,9 +3494,6 @@ fn nat_outside_route_miss_stays_silent_like_the_external_to_internal_bypass() {
     let mut tcp_mappings = [Nat44TcpMappingSlot::default(); 1];
     let mut tcp_sessions = [Nat44TcpSessionSlot::default(); 1];
     let mut tcp = support::tcp_runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -3662,9 +3543,6 @@ fn route_miss_net_unreachable_switch_keeps_the_firewall_verdict_and_drop_reason(
     let config = firewall_config(&snapshot, &rules, 1);
     let mut firewall_slots = [FirewallStateSlot::default(); 2];
     let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -3711,9 +3589,6 @@ fn firewall_deny_gets_admin_prohibited_only_when_enabled() {
     for enabled in [false, true] {
         let mut firewall_slots = [FirewallStateSlot::default(); 2];
         let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-        let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
         let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
         let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
         let policy = Icmpv4ErrorPolicy::default().with_generation(
@@ -3815,9 +3690,6 @@ fn transit_header_problems_stay_silent_with_a_firewall() {
     ] {
         let mut firewall_slots = [FirewallStateSlot::default(); 2];
         let mut firewall = FirewallRuntime::new(config, &mut firewall_slots);
-        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-        let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
         let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
         let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
         let mut errors = Icmpv4ErrorRuntime::new(
@@ -3857,9 +3729,6 @@ fn withdrawn_route_flow_is_flushed_so_route_hit_and_miss_stay_equally_silent() {
     let first_config = firewall_config(&first, &rules, 1);
     let mut firewall_slots = [FirewallStateSlot::default(); 4];
     let mut firewall = FirewallRuntime::new(first_config, &mut firewall_slots);
-    let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-    let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 2];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 2];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -3951,9 +3820,6 @@ fn carried_flow_never_admits_a_reverse_packet_from_a_router_address() {
     .unwrap();
     let mut slots = [FirewallStateSlot::default(); 4];
     let mut firewall = FirewallRuntime::new(config, &mut slots);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut states, &mut actions);
     let mut io = SimIo::new();
     io.inject(LAN, udp_frame(HOST, REMOTE, 12_345, 53, 0, true));
     io.run_firewall_once(

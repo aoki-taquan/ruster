@@ -6,11 +6,11 @@ use std::{collections::VecDeque, convert::Infallible};
 use ruster_core::{
     forward_batch, forward_batch_with_control, BatchCompletion, BatchReport, ConsumeReason,
     DropReason, FirewallAuditBuffer, FirewallConfig, FirewallRuntime, ForwardingSnapshot,
-    GeneratedAllocationError, GeneratedArpTrace, GeneratedBatchCompletion, GeneratedIcmpv4Trace,
+    GeneratedAllocationError, GeneratedBatchCompletion, GeneratedIcmpv4Trace,
     GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo, GeneratedPacketLease,
-    GeneratedPacketSlot, GeneratedSlotCompletion, GeneratedTraceSink, IfId, MonotonicMillis,
-    Nat44TcpConfig, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch, PacketIo,
-    PacketLease, PacketSlot, PublicationQuiescence, PublicationQuiescenceDisposition,
+    GeneratedPacketSlot, GeneratedSlotCompletion, IfId, MonotonicMillis, Nat44TcpConfig,
+    Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpRuntime, PacketBatch, PacketIo, PacketLease,
+    PacketSlot, PublicationQuiescence, PublicationQuiescenceDisposition,
     PublicationQuiescenceGuard, Services, SlotCompletion, TraceEvent, TraceSink,
 };
 use ruster_core::{BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields};
@@ -1080,24 +1080,6 @@ impl VecTrace {
 
 impl TraceSink for VecTrace {
     fn record(&mut self, event: TraceEvent) {
-        self.events.push(event);
-    }
-}
-
-#[derive(Debug, Default, Eq, PartialEq)]
-pub struct VecGeneratedTrace {
-    events: Vec<GeneratedArpTrace>,
-}
-
-impl VecGeneratedTrace {
-    #[must_use]
-    pub fn events(&self) -> &[GeneratedArpTrace] {
-        &self.events
-    }
-}
-
-impl GeneratedTraceSink for VecGeneratedTrace {
-    fn record_generated(&mut self, event: GeneratedArpTrace) {
         self.events.push(event);
     }
 }

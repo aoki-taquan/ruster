@@ -742,7 +742,6 @@ pub enum Icmpv4ErrorDisposition {
     ReverseNeighborUnresolved {
         egress: IfId,
         target: Ipv4Address,
-        resolution: crate::ResolutionResult,
     },
 }
 

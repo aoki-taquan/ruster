@@ -258,43 +258,6 @@ fn indexed_route_lookup_matches_the_linear_reference_on_large_tables() {
     }
 }
 
-#[test]
-fn resolution_authority_is_identical_for_indexed_and_linear_snapshots() {
-    let mut rng = Rng(0xa070_0001);
-    for _ in 0..200 {
-        let tables = random_tables(&mut rng, 40);
-        let owner = owner(&tables);
-        let indexed = owner.snapshot();
-        let linear = ForwardingSnapshot::new(
-            &tables.routes,
-            &tables.interfaces,
-            &tables.neighbors,
-            &tables.local_ipv4,
-        )
-        .unwrap();
-        assert!(linear.index.is_none());
-        for target in probe_addresses(&mut rng, &tables) {
-            for interface in &tables.interfaces {
-                let source_ip = tables
-                    .local_ipv4
-                    .iter()
-                    .find(|binding| binding.interface == interface.id)
-                    .map_or(ip(rng.address()), |binding| binding.address);
-                let action = ArpRequestAction {
-                    egress: interface.id,
-                    source_mac: interface.mac,
-                    source_ip,
-                    target_ip: target,
-                };
-                assert_eq!(
-                    indexed.resolution_action_authority(action),
-                    linear.resolution_action_authority(action)
-                );
-            }
-        }
-    }
-}
-
 /// Duplicate `(prefix, length)` pairs never pass validation, but the
 /// builder must still reproduce `max_by_key`'s last-maximum rule.
 #[test]

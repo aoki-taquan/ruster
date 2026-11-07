@@ -1,7 +1,6 @@
 use ruster_core::{
-    validate_ipv4_frame, DropReason, DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo,
-    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+    validate_ipv4_frame, DropReason, ForwardingSnapshot, IfId, Interface, Ipv4Address,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo, Route,
     ETHERNET_HEADER_LEN,
 };
 mod support;
@@ -552,15 +551,6 @@ fn reserved_fragment_ttl_and_checksum_forwarding_match_wire_model() {
 fn parser_and_ingress_rejections_are_byte_and_resolution_state_atomic() {
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = snapshot(&routes, &interfaces, &neighbors, &bindings);
-    let mut states = [ResolutionStateSlot::EMPTY; 2];
-    let mut actions = [ResolutionActionSlot::EMPTY; 2];
-    let mut dynamic = [DynamicNeighborSlot::EMPTY; 2];
-    let _runtime = ResolutionRuntime::with_dynamic_neighbors(
-        ResolutionPolicy::new(1_000, 2_000).unwrap(),
-        &mut states,
-        &mut actions,
-        &mut dynamic,
-    );
 
     let base = ipv4_frame(5, 8, 3, 0x4000, 64, PEER_IP, DESTINATION);
     let mut explicit_cases = Vec::new();
@@ -729,15 +719,6 @@ fn exact_ingress_mac_accepts_individual_source_and_arp_broadcast_only_exception(
     assert_eq!(io.pop_tx().unwrap().bytes, expected);
 
     for (case, destination) in [LAN_MAC, MacAddress([0xff; 6])].into_iter().enumerate() {
-        let mut states = [ResolutionStateSlot::EMPTY; 1];
-        let mut actions = [ResolutionActionSlot::EMPTY; 1];
-        let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
-        let _runtime = ResolutionRuntime::with_dynamic_neighbors(
-            ResolutionPolicy::new(1_000, 2_000).unwrap(),
-            &mut states,
-            &mut actions,
-            &mut dynamic,
-        );
         let mut io = SimIo::new();
         io.inject(LAN, arp_request(destination));
         let batch = io.receive(1).unwrap();
