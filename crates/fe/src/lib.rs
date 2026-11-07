@@ -7,11 +7,20 @@
 //! [`ValidatedForwardingOwner`] and the worker uses the new one from its next batch.
 //!
 //! ARP goes to the neighbor process: core hands each ARP packet over
-//! ([`ForwardingSnapshot::with_arp_to_control`]) and the FE sends it on the punt
+//! ([`ForwardingSnapshot::with_arp_to_control`](ruster_core::ForwardingSnapshot::with_arp_to_control)) and the FE sends it on the punt
 //! socket. A packet whose next hop is not in the neighbor table is dropped and turned
 //! into a resolve request notification, at most one per next hop per second.
 //! Frames the neighbor process sends back go out through the backend's generated
 //! frames.
+//!
+//! # Standards
+//!
+//! - Forwarding decisions are `ruster-core`'s (RFC 1812 sections 5.2.2 and 5.3.1:
+//!   header checks and the TTL).
+//! - RFC 1122 section 2.3.2.1: at most one resolve request per second per next hop.
+//!
+//! Deviations: ARP is not answered in the FE; every ARP packet goes to the neighbor
+//! process.
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};

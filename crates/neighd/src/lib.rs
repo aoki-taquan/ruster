@@ -11,6 +11,19 @@
 //!
 //! Skeleton limits: no aging or re-checking of learned neighbors, no ND (IPv6), no
 //! announcements or duplicate address detection.
+//!
+//! # Standards
+//!
+//! - RFC 826: the packet format and the receive rules (update a known sender, add the
+//!   sender when the target is us, answer requests for our addresses).
+//! - RFC 1122 section 2.3.2.1: at most one request per second per next hop.
+//! - RFC 5227 section 2.4: a packet whose sender claims our own address is not learned
+//!   or answered.
+//!
+//! Deviations from RFC 826: a sender that targets us is added only if it is a host on
+//! that interface's subnet, and at most 4096 neighbors are kept. A packet waiting for a
+//! next hop is dropped, not queued (RFC 1122 section 2.3.2.2 says to keep at least
+//! one). Conflicts are not announced or defended (RFC 5227 section 2.4).
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};

@@ -18,6 +18,16 @@
 //!
 //! The store is copied for each change. That is fine for the skeleton's small tables;
 //! large tables (a full BGP table) need a structure that shares unchanged parts.
+//!
+//! # Standards
+//!
+//! - draft-ietf-core-comi-21: the CORECONF operations (iPATCH to change, GET to read, GET
+//!   with Observe for notifications) on the datastore resource `c` and the stream `s`.
+//! - RFC 8132: iPATCH. RFC 7641: Observe.
+//!
+//! Deviations: `c/resync-begin`, `c/resync-end` and `c/sync-done` are ruster's own (a
+//! writer resending everything after a restart). GET `c` answers only the tables the
+//! connection writes.
 
 use std::collections::BTreeMap;
 use std::io;
