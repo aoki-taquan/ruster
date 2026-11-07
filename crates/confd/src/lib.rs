@@ -13,7 +13,7 @@
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
 //! sends only what changed.
 //!
-//! The configuration file is TOML ([`file`]). Skeleton limits: IPv4 only, one address
+//! The configuration file is TOML ([`file`](mod@file)). Skeleton limits: IPv4 only, one address
 //! per interface, no dynamic values from other daemons yet.
 
 use std::collections::BTreeMap;

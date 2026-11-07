@@ -10,6 +10,11 @@
 //! The interface is named, not numbered, so the CE does not need the FE's port
 //! numbering. Unix datagram sockets keep message boundaries and, on Linux, do not
 //! drop silently: a full socket refuses the send, and the sender counts the drop.
+//!
+//! # Standards
+//!
+//! None: the format is ruster's own. The frames it carries keep their own standards
+//! (ARP is RFC 826).
 
 use std::fmt;
 

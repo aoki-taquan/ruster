@@ -12,6 +12,18 @@
 //! Inside a value, members are keyed by their SID minus the SID of the entry, as in
 //! RFC 9254. Addresses, prefixes and MAC addresses are text, as YANG types them.
 //! Only IPv4 is here; IPv6 comes after the skeleton.
+//!
+//! # Standards
+//!
+//! - RFC 9254: the YANG-to-CBOR encoding (SID keys, delta SIDs inside an entry,
+//!   instance identifiers as an array of the SID and the keys).
+//! - draft-ietf-core-comi-21: a change maps an instance identifier to the
+//!   new value, or to `null` to delete.
+//! - RFC 8343 (`ietf-interfaces`) and RFC 8344 (`ietf-ip`): the interface and address
+//!   entries follow their leaves (enabled, phys-address, mtu, prefix-length).
+//!
+//! Deviations: the route and neighbor tables are ruster's own models, and the SIDs are
+//! local (see [`crate::sid`]).
 
 use std::fmt;
 use std::net::Ipv4Addr;

@@ -4,6 +4,13 @@
 //! `ietf-interfaces` and `ietf-ip` ranges, but no per-item `.sid` files are published,
 //! so the items used here are numbered locally for now. The source of truth is
 //! `crates/proto/sid/ruster-fe.sid`; a test checks that it matches these constants.
+//!
+//! # Standards
+//!
+//! - RFC 9595: SIDs and the `.sid` file format.
+//!
+//! Deviations: items of standard modules use local numbers in the experimental range
+//! until per-item `.sid` files are published.
 
 pub const INTERFACE: u64 = 60010;
 pub const INTERFACE_ENABLED: u64 = 60011;

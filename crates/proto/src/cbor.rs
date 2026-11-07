@@ -12,6 +12,15 @@
 //!
 //! A message body is a CBOR sequence (RFC 8742): items written one after another.
 //! [`Decoder`] reads them in order until [`Decoder::is_empty`].
+//!
+//! # Standards
+//!
+//! - RFC 8949 section 3: the encoding of the supported major types.
+//! - RFC 8949 section 4.2.1: the encoder writes the shortest head.
+//! - RFC 8742: a message body is a CBOR sequence.
+//!
+//! Deviations: only the subset above is decoded. Tags, floats, other simple values and
+//! indefinite lengths are refused.
 
 use std::fmt;
 

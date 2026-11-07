@@ -13,6 +13,12 @@
 //! interface = "wan"
 //! via = "198.51.100.1"         # optional; left out for an on-link route
 //! ```
+//!
+//! # Standards
+//!
+//! - RFC 791: the smallest MTU is 68.
+//! - RFC 6890 and RFC 1122 section 3.2.1.3: interface addresses and next hops must be
+//!   usable unicast addresses (not 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4 or 240.0.0.0/4).
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;

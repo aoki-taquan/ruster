@@ -9,6 +9,15 @@
 //!
 //! Messages are copied into [`Incoming`] values. This is the control path, where
 //! a copy is cheaper than tying the caller to the buffer.
+//!
+//! # Standards
+//!
+//! - RFC 8323 section 5.3: each side sends a CSM first, with Max-Message-Size.
+//! - RFC 8323 section 5.4: a Ping is answered with a Pong.
+//! - RFC 8323 section 5.6: an Abort closes the connection.
+//!
+//! Deviations: a Release (section 5.5) is ignored instead of draining the connection,
+//! and the Block-Wise-Transfer CSM option is not offered.
 
 use std::fmt;
 use std::io::{self, ErrorKind, Read, Write};

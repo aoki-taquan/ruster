@@ -14,6 +14,14 @@
 //! [`decode`] reads one message from the front of a buffer without copying. It says
 //! how many more bytes it needs when the buffer holds only part of a message, so a
 //! reader can keep appending from the socket and call it again.
+//!
+//! # Standards
+//!
+//! - RFC 8323 section 3.2: framing over a reliable byte stream (Len, TKL, extended length).
+//! - RFC 7252 section 3.1: option encoding (delta and length nibbles, extensions).
+//! - RFC 7252 section 12.1: method and response codes; RFC 8323 section 5: signaling codes.
+//!
+//! Deviations: Unix stream sockets carry the framing instead of TCP.
 
 use std::fmt;
 

@@ -13,6 +13,13 @@
 //!
 //! Skeleton limits: next hops are passed through as given (no recursive resolution),
 //! no route leaking between VRFs, no metric or ECMP across sources.
+//!
+//! # Standards
+//!
+//! - RFC 8349 (`ietf-routing`): routes per VRF and prefix, chosen by route preference
+//!   (lower is preferred) between sources.
+//!
+//! Deviations: a preference is set per source, not per route.
 
 use std::collections::BTreeMap;
 use std::io;
