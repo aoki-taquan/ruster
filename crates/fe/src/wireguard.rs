@@ -56,6 +56,11 @@ pub(crate) struct Wireguard {
     applied: Vec<(String, String, Option<SessionKeys>)>,
     /// The states of sessions that stopped, the oldest first.
     retired: Vec<PeerState>,
+    /// Every send key a session was started with in this process. A send key whose
+    /// counter is no longer known (its state was forgotten) is never started again:
+    /// it would seal with counters it used before. One entry per session for the
+    /// life of the process.
+    used: std::collections::BTreeSet<[u8; 32]>,
     pub(crate) send: WireguardSendRuntime<'static>,
 }
 
@@ -69,6 +74,7 @@ impl Wireguard {
             states: Vec::new(),
             applied: Vec::new(),
             retired: Vec::new(),
+            used: std::collections::BTreeSet::new(),
             send: WireguardSendRuntime::new(slots, bytes).expect("WireGuard staging storage"),
         }
     }
@@ -104,17 +110,27 @@ impl Wireguard {
                         if let Some(keys) = peer.keys {
                             let candidates =
                                 old.iter().map(|(_, _, _, s)| s).chain(self.retired.iter());
-                            let (mut counter, mut replay) = (0, None);
-                            for earlier in candidates {
+                            let (mut counter, mut known, mut replay) = (0, false, None);
+                            // The newest state of a receive key has its newest window.
+                            let candidates: Vec<&PeerState> = candidates.collect();
+                            for earlier in candidates.iter().rev() {
                                 let Some(used) = earlier.keys() else { continue };
                                 if used.send == keys.send {
                                     counter = counter.max(earlier.send_counter());
+                                    known = true;
                                 }
                                 if used.receive == keys.receive && replay.is_none() {
                                     replay = Some(earlier.replay_window().clone());
                                 }
                             }
-                            state.set_keys_continuing(keys, counter, replay);
+                            if known || self.used.insert(keys.send) {
+                                state.set_keys_continuing(keys, counter, replay);
+                            } else {
+                                eprintln!(
+                                    "ruster-fe: WireGuard {} of {}: its send key was used before and its counter is lost; not used again",
+                                    peer.name, interface.name
+                                );
+                            }
                         }
                         state
                     }
@@ -182,4 +198,65 @@ pub(crate) fn interfaces<'a>(
             view
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(send: u8) -> SessionKeys {
+        SessionKeys {
+            send: [send; 32],
+            receive: [send ^ 0xff; 32],
+            peer_index: 1,
+            local_index: 2,
+        }
+    }
+
+    fn one_peer(name: &str, keys: Option<SessionKeys>) -> Vec<InterfaceBuilt> {
+        vec![InterfaceBuilt {
+            interface: IfId(2),
+            name: "wg0".into(),
+            local: [192, 0, 2, 1],
+            listen_port: 51820,
+            peers: vec![PeerBuilt {
+                name: name.into(),
+                endpoint: [198, 51, 100, 7],
+                port: 51820,
+                allowed: Vec::new(),
+                keys,
+            }],
+        }]
+    }
+
+    #[test]
+    fn a_send_key_whose_counter_was_forgotten_is_not_started_again() {
+        let mut wireguard = Wireguard::new();
+        wireguard.publish(one_peer("a", Some(keys(1))));
+        // As if 5 messages were sealed.
+        wireguard.states[0].set_keys_continuing(keys(1), 5, None);
+        // 64 later sessions push its state out of what is remembered.
+        for send in 2..=66 {
+            wireguard.publish(one_peer("a", Some(keys(send))));
+        }
+        wireguard.publish(one_peer("a", Some(keys(1))));
+        assert!(
+            !wireguard.states[0].has_session(),
+            "the key would seal from counter 0 again"
+        );
+        // A key never used starts.
+        wireguard.publish(one_peer("a", Some(keys(100))));
+        assert!(wireguard.states[0].has_session());
+        assert_eq!(wireguard.states[0].send_counter(), 0);
+    }
+
+    #[test]
+    fn a_remembered_send_key_goes_on_from_its_counter() {
+        let mut wireguard = Wireguard::new();
+        wireguard.publish(one_peer("a", Some(keys(1))));
+        wireguard.states[0].set_keys_continuing(keys(1), 5, None);
+        wireguard.publish(one_peer("a", None));
+        wireguard.publish(one_peer("b", Some(keys(1))));
+        assert_eq!(wireguard.states[0].send_counter(), 5);
+    }
 }

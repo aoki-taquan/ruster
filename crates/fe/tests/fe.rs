@@ -1798,4 +1798,42 @@ mod wireguard {
         assert_eq!(bench.patch(&mut config, &[wg0(true)]), Code::CHANGED);
         assert_eq!(sent_counter(&mut bench), 1);
     }
+
+    #[test]
+    fn two_peers_with_one_send_key_or_one_local_index_are_refused() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        let mut config = bench.connect(writers::CONFIG);
+        let second = |send: u8, local_index: u32| {
+            vec![
+                Change::set(
+                    Key::WireguardPeer {
+                        interface: "wg0".into(),
+                        peer: "other".into(),
+                    },
+                    Value::WireguardPeer(WireguardPeer {
+                        endpoint: Ipv4Addr::new(203, 0, 113, 10),
+                        port: 51821,
+                        allowed: vec![(Ipv4Addr::new(10, 8, 0, 0), 16)],
+                    }),
+                ),
+                Change::set(
+                    Key::WireguardSession {
+                        interface: "wg0".into(),
+                        peer: "other".into(),
+                    },
+                    Value::WireguardSession(WireguardSession {
+                        send: [send; 32],
+                        receive: [9; 32],
+                        peer_index: 5,
+                        local_index,
+                    }),
+                ),
+            ]
+        };
+        // The first peer's send key is [1; 32] and its local index 11.
+        assert_ne!(bench.patch(&mut config, &second(1, 12)), Code::CHANGED);
+        assert_ne!(bench.patch(&mut config, &second(7, 11)), Code::CHANGED);
+        assert_eq!(bench.patch(&mut config, &second(7, 12)), Code::CHANGED);
+    }
 }

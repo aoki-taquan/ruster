@@ -193,6 +193,38 @@ fn v6(address: IpAddr) -> Option<[u8; 16]> {
     }
 }
 
+/// Refuses WireGuard tables that would make two sessions seal with one key and
+/// counter, or that make messages reach the wrong session.
+fn check_wireguard(interfaces: &[InterfaceBuilt]) -> Result<(), String> {
+    let mut send_keys = BTreeMap::new();
+    for (at, interface) in interfaces.iter().enumerate() {
+        if interfaces[..at]
+            .iter()
+            .any(|i| i.local == interface.local && i.listen_port == interface.listen_port)
+        {
+            return Err(format!(
+                "WireGuard interface {}: another one has the same address and port",
+                interface.name
+            ));
+        }
+        let mut indexes = BTreeSet::new();
+        for peer in &interface.peers {
+            let Some(keys) = peer.keys else { continue };
+            if !indexes.insert(keys.local_index) {
+                return Err(format!(
+                    "WireGuard {} of {}: its local index is another peer's",
+                    peer.name, interface.name
+                ));
+            }
+            let name = format!("{} of {}", peer.name, interface.name);
+            if let Some(other) = send_keys.insert(keys.send, name.clone()) {
+                return Err(format!("WireGuard {name}: its send key is also {other}'s"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let port = |name: &str| {
         let index = ports.iter().position(|p| p == name)?;
@@ -449,6 +481,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         });
         active.insert(name.as_str(), (id, vrf.as_str()));
     }
+    check_wireguard(&wireguard)?;
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
     for (key, _) in store.iter() {
         if let Key::Route { vrf, .. } = key {
