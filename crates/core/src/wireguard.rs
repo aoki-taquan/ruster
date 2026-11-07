@@ -22,12 +22,18 @@ use crate::chacha20poly1305::{self, TAG_LEN};
 
 mod peer;
 mod receive;
+mod send;
 pub use peer::{
     decapsulate, encapsulate, AllowedPrefix, InterfaceConfig, PeerConfig, PeerState, ReceiveError,
     Received, SendError, SessionKeys, OUTER_HEADERS_LEN,
 };
 pub(crate) use receive::receive;
 pub use receive::WireguardInterface;
+pub use send::{
+    execute_one_wireguard_send, GeneratedWireguardReport, WireguardSendCounters,
+    WireguardSendRuntime, WireguardStagedFrame, WireguardStorageError,
+};
+pub(crate) use send::{of, stage};
 
 /// Message type of a transport data message.
 pub const MESSAGE_TYPE_DATA: u8 = 4;

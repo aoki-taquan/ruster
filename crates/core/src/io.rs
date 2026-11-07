@@ -281,11 +281,15 @@ pub enum ConsumeReason {
     /// A packet addressed to the router copied into the caller's control queue for
     /// the kernel (`ForwardingSnapshot::with_local_to_control`).
     LocalToControl,
+    /// A packet routed to a WireGuard interface was sealed into a frame in the
+    /// send runtime's staging area; it is sent as a generated frame after the
+    /// batch. The received frame is recycled.
+    WireguardQueued,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
@@ -293,6 +297,7 @@ impl ConsumeReason {
         Self::ArpHeld,
         Self::Ipv6Control,
         Self::LocalToControl,
+        Self::WireguardQueued,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -307,6 +312,7 @@ impl ConsumeReason {
             Self::ArpHeld => 4,
             Self::Ipv6Control => 5,
             Self::LocalToControl => 6,
+            Self::WireguardQueued => 7,
         }
     }
 
@@ -320,6 +326,7 @@ impl ConsumeReason {
             Self::ArpHeld => "ARP_HELD",
             Self::Ipv6Control => "IPV6_CONTROL",
             Self::LocalToControl => "LOCAL_TO_CONTROL",
+            Self::WireguardQueued => "WIREGUARD_QUEUED",
         }
     }
 }
@@ -514,7 +521,8 @@ mod tests {
                 "IPV4_FRAGMENT_HELD",
                 "ARP_HELD",
                 "IPV6_CONTROL",
-                "LOCAL_TO_CONTROL"
+                "LOCAL_TO_CONTROL",
+                "WIREGUARD_QUEUED"
             ]
         );
     }

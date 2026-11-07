@@ -551,6 +551,19 @@ pub enum DropReason {
     WireguardNoRoom = 243,
     /// An authenticated WireGuard keepalive: the peer is alive, nothing to forward.
     WireguardKeepalive = 244,
+    /// No WireGuard peer's allowed addresses hold the packet's destination.
+    WireguardNoPeer = 245,
+    /// The peer has no session (or its counter is used up): the key exchange is
+    /// due.
+    WireguardNoSession = 246,
+    /// No IPv4 route to the peer's endpoint.
+    WireguardNoRoute = 247,
+    /// The send runtime's staging area is full.
+    WireguardQueueFull = 248,
+    /// The endpoint is reached through a VLAN sub-interface or a PPPoE session.
+    WireguardUnderlyingUnsupported = 249,
+    /// The sealed outer packet is longer than the underlying interface's MTU.
+    WireguardMtuExceeded = 250,
 }
 
 use DropReason::*;
@@ -558,7 +571,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 244] = [
+    pub const ALL: [Self; 250] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -803,6 +816,12 @@ impl DropReason {
         WireguardNotAllowed,
         WireguardNoRoom,
         WireguardKeepalive,
+        WireguardNoPeer,
+        WireguardNoSession,
+        WireguardNoRoute,
+        WireguardQueueFull,
+        WireguardUnderlyingUnsupported,
+        WireguardMtuExceeded,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1064,6 +1083,12 @@ impl DropReason {
             WireguardNotAllowed => "WIREGUARD_NOT_ALLOWED",
             WireguardNoRoom => "WIREGUARD_NO_ROOM",
             WireguardKeepalive => "WIREGUARD_KEEPALIVE",
+            WireguardNoPeer => "WIREGUARD_NO_PEER",
+            WireguardNoSession => "WIREGUARD_NO_SESSION",
+            WireguardNoRoute => "WIREGUARD_NO_ROUTE",
+            WireguardQueueFull => "WIREGUARD_QUEUE_FULL",
+            WireguardUnderlyingUnsupported => "WIREGUARD_UNDERLYING_UNSUPPORTED",
+            WireguardMtuExceeded => "WIREGUARD_MTU_EXCEEDED",
         }
     }
 }
@@ -3177,6 +3202,7 @@ where
         services.fragmentation,
         services.fragment_tracking,
         services.wireguard,
+        services.wireguard_send,
         Some(control),
         trace,
     )
@@ -3205,6 +3231,10 @@ pub struct Services<'s, 'c, 'r> {
     /// order of [`crate::wireguard::WireguardInterface::first_peer`]; without it
     /// WireGuard messages are not opened.
     pub wireguard: Option<&'s mut [crate::wireguard::PeerState]>,
+    /// Where packets routed to a WireGuard interface are sealed to; the caller sends
+    /// them after the batch ([`crate::wireguard::execute_one_wireguard_send`]).
+    /// Without it, they are dropped.
+    pub wireguard_send: Option<&'s mut crate::wireguard::WireguardSendRuntime<'r>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3242,6 +3272,7 @@ where
         firewall,
         firewall_audit,
         fragmentation,
+        None,
         None,
         None,
         None,
@@ -3286,6 +3317,7 @@ fn forward_batch_tracked<B, T>(
     mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
     mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
     mut wireguard: Option<&mut [crate::wireguard::PeerState]>,
+    mut wireguard_send: Option<&mut crate::wireguard::WireguardSendRuntime<'_>>,
     mut control: Option<&mut crate::ControlQueue>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -3780,6 +3812,31 @@ where
                             fragments,
                             reason: ConsumeReason::Ipv4Fragmented,
                         });
+                        break 'packet;
+                    }
+                    if let Some(interface) = crate::wireguard::of(all_vrfs.wireguard, egress) {
+                        let staged = match (wireguard.as_deref_mut(), wireguard_send.as_deref_mut())
+                        {
+                            (Some(states), Some(runtime)) => crate::wireguard::stage(
+                                &mut packet,
+                                interface,
+                                all_vrfs,
+                                states,
+                                runtime,
+                            ),
+                            _ => Err(DropReason::WireguardNoSession),
+                        };
+                        match staged {
+                            Ok(()) => {
+                                packet.consume(ConsumeReason::WireguardQueued);
+                                consumed += 1;
+                            }
+                            Err(reason) => {
+                                packet.recycle(reason);
+                                dropped += 1;
+                                trace.record(TraceEvent::Dropped { ingress, reason });
+                            }
+                        }
                         break 'packet;
                     }
                     let egress = match crate::tunnel::of(all_vrfs.tunnels, egress) {
@@ -4879,9 +4936,10 @@ fn decide_ipv4<T: TraceSink>(
         neighbor.mac
     } else if crate::tunnel::of(snapshot.tunnels, route.egress()).is_some()
         || crate::pppoe::of(snapshot.pppoe, route.egress()).is_some()
+        || crate::wireguard::of(snapshot.wireguard, route.egress()).is_some()
     {
-        // A tunnel or PPPoE session has no neighbors: the Ethernet header is
-        // replaced when the packet is wrapped.
+        // A tunnel, PPPoE session or WireGuard interface has no neighbors: the
+        // Ethernet header is replaced when the packet is wrapped.
         crate::MacAddress([0; 6])
     } else {
         // No resolution runtime: the control side resolves (FE/CE split).
@@ -9641,6 +9699,12 @@ mod tests {
             (242, "WIREGUARD_NOT_ALLOWED"),
             (243, "WIREGUARD_NO_ROOM"),
             (244, "WIREGUARD_KEEPALIVE"),
+            (245, "WIREGUARD_NO_PEER"),
+            (246, "WIREGUARD_NO_SESSION"),
+            (247, "WIREGUARD_NO_ROUTE"),
+            (248, "WIREGUARD_QUEUE_FULL"),
+            (249, "WIREGUARD_UNDERLYING_UNSUPPORTED"),
+            (250, "WIREGUARD_MTU_EXCEEDED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9650,7 +9714,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(245), None);
+        assert_eq!(DropReason::from_code(251), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

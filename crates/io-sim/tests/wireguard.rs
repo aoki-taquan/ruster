@@ -2,8 +2,9 @@
 //! forwarded like any packet that arrived on the WireGuard interface.
 
 use ruster_core::wireguard::{
-    encapsulate, AllowedPrefix, InterfaceConfig, PeerConfig, PeerState, SessionKeys,
-    WireguardInterface,
+    decapsulate, encapsulate, execute_one_wireguard_send, AllowedPrefix, InterfaceConfig,
+    PeerConfig, PeerState, SessionKeys, WireguardInterface, WireguardSendRuntime,
+    WireguardStagedFrame,
 };
 use ruster_core::{
     forward_batch_with_control, internet_checksum, ipv4_header_checksum, ControlQueue, DropReason,
@@ -98,6 +99,13 @@ impl Peer {
 }
 
 fn run(frames: Vec<Vec<u8>>) -> (SimIo, Drops, Vec<PeerState>) {
+    run_on(frames.into_iter().map(|f| (WAN, f)).collect(), None)
+}
+
+fn run_on(
+    frames: Vec<(IfId, Vec<u8>)>,
+    send: Option<&mut WireguardSendRuntime<'_>>,
+) -> (SimIo, Drops, Vec<PeerState>) {
     let interfaces = [
         Interface {
             id: WAN,
@@ -115,14 +123,22 @@ fn run(frames: Vec<Vec<u8>>) -> (SimIo, Drops, Vec<PeerState>) {
             mtu: 1420,
         },
     ];
-    let neighbors = [Neighbor {
-        interface: LAN,
-        target: a([10, 2, 0, 5]),
-        mac: mac(0x55),
-    }];
+    let neighbors = [
+        Neighbor {
+            interface: LAN,
+            target: a([10, 2, 0, 5]),
+            mac: mac(0x55),
+        },
+        Neighbor {
+            interface: WAN,
+            target: a(PEER),
+            mac: mac(0x77),
+        },
+    ];
     let routes = [
         Route::new(a([10, 2, 0, 0]), 24, LAN, None).unwrap(),
         Route::new(a([10, 1, 0, 0]), 16, WG, None).unwrap(),
+        Route::new(a([198, 51, 100, 0]), 24, WAN, None).unwrap(),
     ];
     let bindings = [LocalIpv4Binding {
         interface: WAN,
@@ -157,14 +173,15 @@ fn run(frames: Vec<Vec<u8>>) -> (SimIo, Drops, Vec<PeerState>) {
         local_index: 11,
     });
     let mut io = SimIo::new();
-    for frame in frames {
-        io.inject(WAN, frame);
+    for (port, frame) in frames {
+        io.inject(port, frame);
     }
     let mut drops = Drops::default();
     let mut queue = ControlQueue::new(4);
     let batch = io.receive(16).unwrap();
     let services = Services {
         wireguard: Some(&mut states),
+        wireguard_send: send,
         ..Services::default()
     };
     forward_batch_with_control(batch, &snapshot, &mut queue, services, &mut drops);
@@ -264,4 +281,107 @@ fn a_keepalive_is_taken_and_a_handshake_goes_on_as_local_traffic() {
         "{:?}",
         drops.0
     );
+}
+
+fn lan_frame(destination: [u8; 4]) -> Vec<u8> {
+    let inner = inner_packet([10, 2, 0, 5], destination);
+    let mut frame = vec![0u8; 14];
+    frame[0..6].copy_from_slice(&mac(2).0);
+    frame[6..12].copy_from_slice(&mac(0x55).0);
+    frame[12..14].copy_from_slice(&[0x08, 0x00]);
+    frame.extend_from_slice(&inner);
+    frame
+}
+
+#[test]
+fn a_packet_routed_to_the_interface_is_sealed_and_sent_to_the_peer() {
+    let mut slots = [WireguardStagedFrame::default(); 4];
+    let mut bytes = [0u8; 4 * 256];
+    let mut runtime = WireguardSendRuntime::new(&mut slots, &mut bytes).unwrap();
+    let (mut io, drops, _) = run_on(vec![(LAN, lan_frame([10, 1, 0, 9]))], Some(&mut runtime));
+    assert!(drops.0.is_empty(), "{:?}", drops.0);
+    assert!(
+        io.pop_tx().is_none(),
+        "nothing leaves before the staged frame is sent"
+    );
+    assert_eq!(runtime.pending(), 1);
+
+    let mut budget = 8;
+    let report = execute_one_wireguard_send(&mut io, &mut runtime, &mut budget).unwrap();
+    assert!(report.sent);
+    assert_eq!(budget, 7);
+    assert!(execute_one_wireguard_send(&mut io, &mut runtime, &mut budget).is_none());
+    let tx = io.pop_tx().expect("sent");
+    assert_eq!(tx.egress, WAN);
+    assert_eq!(&tx.bytes[0..6], &mac(0x77).0);
+    assert_eq!(&tx.bytes[6..12], &mac(1).0);
+    assert_eq!(&tx.bytes[12..14], &[0x08, 0x00]);
+    // Outer IPv4: router to peer, UDP, a valid header.
+    assert_eq!(&tx.bytes[26..30], &ROUTER);
+    assert_eq!(&tx.bytes[30..34], &PEER);
+    assert_eq!(tx.bytes[23], 17);
+    assert_eq!(internet_checksum(&tx.bytes[14..34]), 0);
+
+    // The peer opens it and finds the packet, one hop on.
+    let mut peer = Peer::new();
+    let allowed = [AllowedPrefix {
+        address: [10, 2, 0, 0],
+        len: 16,
+    }];
+    let peers = [PeerConfig {
+        endpoint: ROUTER,
+        endpoint_port: 51820,
+        allowed: &allowed,
+    }];
+    let interface = InterfaceConfig {
+        local: PEER,
+        listen_port: 51820,
+        peers: &peers,
+    };
+    let mut wire = tx.bytes[14..].to_vec();
+    let received = decapsulate(&interface, &mut peer.state, &mut wire).unwrap();
+    let ruster_core::wireguard::Received::Data { inner, .. } = received else {
+        panic!("{received:?}")
+    };
+    let want = inner_packet([10, 2, 0, 5], [10, 1, 0, 9]);
+    assert_eq!(wire[inner.clone()][..8], want[..8]);
+    assert_eq!(wire[inner.start + 8], 63);
+    assert_eq!(wire[inner.start + 12..inner.end], want[12..]);
+}
+
+#[test]
+fn without_a_session_a_runtime_or_room_the_packet_is_dropped() {
+    // No send runtime.
+    let (mut io, drops, _) = run_on(vec![(LAN, lan_frame([10, 1, 0, 9]))], None);
+    assert!(io.pop_tx().is_none());
+    assert_eq!(drops.0, [DropReason::WireguardNoSession]);
+
+    // A full staging area.
+    let mut slots = [WireguardStagedFrame::default(); 1];
+    let mut bytes = [0u8; 256];
+    let mut runtime = WireguardSendRuntime::new(&mut slots, &mut bytes).unwrap();
+    let frames = vec![
+        (LAN, lan_frame([10, 1, 0, 9])),
+        (LAN, lan_frame([10, 1, 0, 10])),
+    ];
+    let (_, drops, _) = run_on(frames, Some(&mut runtime));
+    assert_eq!(drops.0, [DropReason::WireguardQueueFull]);
+    assert_eq!(runtime.pending(), 1);
+
+    // The over-budget frame is dropped, not sent.
+    let mut io = SimIo::new();
+    let mut budget = 0;
+    let report = execute_one_wireguard_send(&mut io, &mut runtime, &mut budget).unwrap();
+    assert!(!report.sent && report.completion.is_none());
+    assert_eq!(runtime.counters().dropped_over_budget, 1);
+    assert!(io.pop_tx().is_none());
+}
+
+#[test]
+fn the_staging_storage_must_be_equal_slots_that_fit_a_frame() {
+    let mut slots = [WireguardStagedFrame::default(); 2];
+    let mut odd = [0u8; 2 * 256 + 1];
+    assert!(WireguardSendRuntime::new(&mut slots, &mut odd).is_err());
+    let mut small = [0u8; 2 * 40];
+    assert!(WireguardSendRuntime::new(&mut slots, &mut small).is_err());
 }
