@@ -29,10 +29,11 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
 
 use ruster_core::{
-    execute_one_icmpv4_error, forward_batch_with_control, ArpOpcode, ControlKind, ControlQueue,
-    GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
-    MonotonicMillis, PacketIo, Services, TraceEvent, TraceSink, VlanBinding,
+    execute_one_icmpv4_error, execute_one_ipv4_fragmentation, forward_batch_with_control,
+    ArpOpcode, ControlKind, ControlQueue, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
+    GeneratedPacketBatch, GeneratedPacketIo, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, MonotonicMillis, PacketIo, Services,
+    TraceEvent, TraceSink, VlanBinding,
 };
 use ruster_proto::cbor::Encoder;
 use ruster_proto::punt::{self, Direction, Punt};
@@ -43,6 +44,7 @@ use ruster_proto::task::{Progress, Task};
 
 mod build;
 mod firewall;
+mod fragments;
 mod local;
 mod nat;
 
@@ -101,6 +103,10 @@ pub struct FeCounters {
     /// yet, or no room).
     pub from_kernel: u64,
     pub from_kernel_dropped: u64,
+    /// Fragments sent for datagrams longer than the egress MTU, and datagrams whose
+    /// fragments could not be sent.
+    pub fragments_sent: u64,
+    pub fragmentation_dropped: u64,
 }
 
 pub struct Fe<B> {
@@ -133,6 +139,8 @@ pub struct Fe<B> {
     firewall: Option<firewall::Firewall>,
     /// The default VRF's NAPT, once the tables have had one.
     nat: Option<nat::Nat>,
+    fragmentation: ruster_core::Ipv4FragmentationRuntime<'static>,
+    fragment_tracking: ruster_core::Ipv4FragmentTracker<'static>,
     counters: FeCounters,
 }
 
@@ -180,6 +188,8 @@ where
             icmpv4_errors: icmpv4_error_runtime(),
             firewall: None,
             nat: None,
+            fragmentation: fragments::fragmentation(),
+            fragment_tracking: fragments::tracker(),
             counters: FeCounters::default(),
         }
     }
@@ -268,6 +278,8 @@ where
             firewall: firewall
                 .as_mut()
                 .map(|(config, runtime)| (&*config, &mut **runtime)),
+            fragmentation: Some(&mut self.fragmentation),
+            fragment_tracking: Some(&mut self.fragment_tracking),
             ..Services::default()
         };
         if let Some(nat) = self.nat.as_mut() {
@@ -298,6 +310,16 @@ where
                 break;
             }
             self.counters.icmp_errors_sent += 1;
+        }
+        let mut budget = fragments::FRAMES_PER_BATCH;
+        while let Some(report) =
+            execute_one_ipv4_fragmentation(&mut self.io, &mut self.fragmentation, &mut budget)
+        {
+            if matches!(report.outcome, ruster_core::Ipv4FragmentOutcome::Sent) {
+                self.counters.fragments_sent += u64::from(report.fragments);
+            } else {
+                self.counters.fragmentation_dropped += 1;
+            }
         }
         for arp in &trace.arp {
             self.punt_arp(arp);
