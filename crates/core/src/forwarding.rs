@@ -9,17 +9,16 @@ use crate::nat44::{
     Nat44UdpOutboundPlan, Nat44UdpPlanError,
 };
 use crate::{
-    packet, rfc1624_update, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
-    BatchCompletion, ConsumeReason, ControlDisposition, FirewallAction, FirewallAuditBuffer,
-    FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
-    FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
-    FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
-    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4FragmentTracker,
-    Ipv4FragmentationRuntime, LocalIpv4Binding, MonotonicMillis, Nat44IcmpConfig,
-    Nat44IcmpDisposition, Nat44IcmpRuntime, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime,
-    Neighbor, PacketBatch, ResolutionResult, Route, SourceValidation, SourceValidationBinding,
-    ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    packet, rfc1624_update, validate_arp, validate_ipv4_frame, ArpOpcode, BatchCompletion,
+    ConsumeReason, FirewallAction, FirewallAuditBuffer, FirewallConfig, FirewallConnectionClass,
+    FirewallDisposition, FirewallFailure, FirewallPolicySource, FirewallProtocol,
+    FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow, FirewallRuntime, FirewallVerdict,
+    Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime,
+    Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4FragmentTracker, Ipv4FragmentationRuntime,
+    LocalIpv4Binding, MonotonicMillis, Nat44IcmpConfig, Nat44IcmpDisposition, Nat44IcmpRuntime,
+    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig,
+    Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, Route, SourceValidation,
+    SourceValidationBinding, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
 use lookup::{linear, ForwardingIndex};
@@ -1395,13 +1394,6 @@ pub fn take_full_forwarding_validation_count() -> usize {
     FULL_FORWARDING_VALIDATIONS.with(|count| count.replace(0))
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResolutionActionAuthority {
-    Valid,
-    StaticResolved,
-    Invalid,
-}
-
 impl<'a> ForwardingSnapshot<'a> {
     pub fn new(
         routes: &'a [Route],
@@ -1880,26 +1872,6 @@ impl<'a> ForwardingSnapshot<'a> {
         }
     }
 
-    /// The position of the interface `id` in the snapshot's interface
-    /// table (bounded binary search over the owner index; linear
-    /// reference without one).
-    #[inline]
-    #[allow(dead_code)] // Only for resolution's announce, which goes (#441).
-    pub(crate) fn interface_slot(&self, id: IfId) -> Option<usize> {
-        match self.index {
-            Some(index) => index.interface(id).0,
-            None => self
-                .interfaces
-                .iter()
-                .position(|interface| interface.id == id),
-        }
-    }
-
-    /// The interfaces of the snapshot, in table order.
-    pub(crate) const fn interfaces(&self) -> &'a [Interface] {
-        self.interfaces
-    }
-
     /// The local IPv4 binding of `interface` (at most one per interface).
     #[inline]
     pub(crate) fn local_binding_on(&self, interface: IfId) -> Option<&'a LocalIpv4Binding> {
@@ -2004,6 +1976,7 @@ impl<'a> ForwardingSnapshot<'a> {
 
     /// Whether some route out of `interface` names `next_hop` as gateway.
     #[inline]
+    #[cfg(test)]
     pub(crate) fn is_gateway(&self, interface: IfId, next_hop: crate::Ipv4Address) -> bool {
         match self.index {
             Some(index) => index.gateway(interface, next_hop).0,
@@ -2020,46 +1993,6 @@ impl<'a> ForwardingSnapshot<'a> {
         match self.index {
             Some(index) => index.sender_on_link(interface, sender).0,
             None => linear::sender_on_link(self.routes, interface, sender),
-        }
-    }
-
-    pub(crate) fn resolution_action_authority(
-        &self,
-        action: ArpRequestAction,
-    ) -> ResolutionActionAuthority {
-        if self
-            .static_neighbor(action.egress, action.target_ip)
-            .is_some()
-        {
-            return ResolutionActionAuthority::StaticResolved;
-        }
-        if !self
-            .interface(action.egress)
-            .is_some_and(|interface| interface.mac == action.source_mac)
-            || !self.is_local_ipv4_on(action.egress, action.source_ip)
-        {
-            return ResolutionActionAuthority::Invalid;
-        }
-        let target = action.target_ip;
-        let octets = target.octets();
-        if target == action.source_ip
-            || octets[0] == 0
-            || octets[0] == 127
-            || octets[0] >= 224
-            || octets == [255; 4]
-            || self.is_local_ipv4(target)
-            || self.is_connected_boundary(action.egress, target)
-        {
-            return ResolutionActionAuthority::Invalid;
-        }
-        let route_still_authorizes = self.is_gateway(action.egress, target)
-            || self
-                .route_lookup(target)
-                .is_some_and(|route| route.egress() == action.egress && route.next_hop().is_none());
-        if route_still_authorizes {
-            ResolutionActionAuthority::Valid
-        } else {
-            ResolutionActionAuthority::Invalid
         }
     }
 }
@@ -2564,11 +2497,6 @@ pub enum TraceEvent {
         egress: IfId,
         neighbor_target: crate::Ipv4Address,
     },
-    NeighborResolution {
-        egress: IfId,
-        target: crate::Ipv4Address,
-        result: ResolutionResult,
-    },
     /// A forwarded packet's next hop is not in the neighbor table and there
     /// is no resolution runtime; the packet is dropped as
     /// [`DropReason::NeighborUnresolved`] and the caller may ask the control
@@ -2861,6 +2789,16 @@ struct Nat44Icmpv4RewriteDecision {
     transport_checksum: Option<u16>,
     icmp_checksum: u16,
     disposition: Nat44Icmpv4Disposition,
+}
+
+/// What core did with an ARP packet it consumed (without an ARP runtime it learns
+/// nothing: neighd does).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ControlDisposition {
+    /// Not about a static neighbor; left to the control side.
+    Ignored,
+    /// About a static neighbor, which core keeps as it is.
+    StaticPreserved,
 }
 
 #[derive(Clone, Copy)]
@@ -7301,7 +7239,6 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
             Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
                 egress: reverse_egress,
                 target,
-                resolution: ResolutionResult::StateFull,
             },
         );
     };
@@ -8449,8 +8386,7 @@ mod tests {
         Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy,
         Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
         Nat44UdpPeerSlot, Nat44UdpPolicy, NoTrace, PacketBatch, PacketLease, PacketSlot,
-        PortOwnerSlot, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-        ResolutionStateSlot, Route, SlotCompletion, TraceEvent, TraceSink,
+        PortOwnerSlot, Route, SlotCompletion, TraceEvent, TraceSink,
     };
     use std::{
         cell::Cell,
@@ -8937,8 +8873,6 @@ mod tests {
         let mut owners = [PortOwnerSlot::default(); 1];
         let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(1)];
         let mut firewall_states = [FirewallStateSlot::default(); 1];
-        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
         let before_mappings = mappings;
         let before_sessions = sessions;
         let before_mapping_buckets = mapping_buckets;
@@ -8947,8 +8881,6 @@ mod tests {
         let before_session_nodes = session_nodes;
         let before_owners = owners;
         let before_firewall_states = firewall_states;
-        let before_resolution_states = resolution_states;
-        let before_resolution_actions = resolution_actions;
         let mut frame = tcp_syn_frame();
         let original = frame.clone();
         let completion = Cell::new(None);
@@ -8976,11 +8908,6 @@ mod tests {
             let before_tcp_counters = tcp.counters();
             let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_states);
             let before_firewall_counters = firewall.counters();
-            let _resolution = ResolutionRuntime::new(
-                ResolutionPolicy::new(1_000, 2_000).unwrap(),
-                &mut resolution_states,
-                &mut resolution_actions,
-            );
             let mut control = crate::ControlQueue::new(4);
             let report = crate::forward_batch_with_control(
                 OnePacketBatch {
@@ -9028,8 +8955,6 @@ mod tests {
         assert_eq!(session_nodes, before_session_nodes);
         assert_eq!(owners, before_owners);
         assert_eq!(firewall_states, before_firewall_states);
-        assert_eq!(resolution_states, before_resolution_states);
-        assert_eq!(resolution_actions, before_resolution_actions);
     }
 
     fn frag_needed_frame() -> Vec<u8> {

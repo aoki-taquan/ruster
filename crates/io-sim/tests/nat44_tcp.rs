@@ -254,10 +254,7 @@ fn assert_external_non_transport_boundary_isolated(
     assert!(!trace.events().iter().any(|event| {
         matches!(
             event,
-            TraceEvent::Nat44Udp { .. }
-                | TraceEvent::Nat44Tcp { .. }
-                | TraceEvent::Routed { .. }
-                | TraceEvent::NeighborResolution { .. }
+            TraceEvent::Nat44Udp { .. } | TraceEvent::Nat44Tcp { .. } | TraceEvent::Routed { .. }
         )
     }));
     assert_eq!(udp.counters(), Default::default());
@@ -712,10 +709,7 @@ fn combined_realm_mismatch_non_tcp_udp_outbound_is_isolated_and_fail_closed() {
     assert!(!trace.events().iter().any(|event| {
         matches!(
             event,
-            TraceEvent::Nat44Udp { .. }
-                | TraceEvent::Nat44Tcp { .. }
-                | TraceEvent::Routed { .. }
-                | TraceEvent::NeighborResolution { .. }
+            TraceEvent::Nat44Udp { .. } | TraceEvent::Nat44Tcp { .. } | TraceEvent::Routed { .. }
         )
     }));
     assert_eq!(udp.counters(), Default::default());
@@ -800,10 +794,7 @@ fn matching_combined_non_tcp_udp_outbound_fails_before_neighbor_without_nat_stat
     assert!(!trace.events().iter().any(|event| {
         matches!(
             event,
-            TraceEvent::Nat44Udp { .. }
-                | TraceEvent::Nat44Tcp { .. }
-                | TraceEvent::Routed { .. }
-                | TraceEvent::NeighborResolution { .. }
+            TraceEvent::Nat44Udp { .. } | TraceEvent::Nat44Tcp { .. } | TraceEvent::Routed { .. }
         )
     }));
     assert_eq!(udp.counters(), Default::default());

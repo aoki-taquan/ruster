@@ -216,23 +216,7 @@ pub(crate) fn unlink<C: Chain>(slots: &mut [C::Slot], index: usize) -> Result<()
     Ok(())
 }
 
-/// The bucket a node is linked in.
-pub(crate) fn chain_bucket(node: ChainNode) -> Option<usize> {
-    node.is_linked().then_some(node.bucket as usize)
-}
-
-/// First node of the chain of `bucket` (a link outside the table ends it).
-pub(crate) fn chain_head<C: Chain>(slots: &[C::Slot], bucket: usize) -> Option<usize> {
-    slots
-        .get(bucket)
-        .and_then(|slot| decode(C::head(slot), slots.len()))
-}
-
-/// Successor of node `index` (a link outside the table ends the chain).
-pub(crate) fn chain_next<C: Chain>(slots: &[C::Slot], index: usize) -> Option<usize> {
-    decode(C::node(&slots[index]).next, slots.len())
-}
-
+#[cfg(test)]
 /// Puts the unlinked slot `new` in the chain position of the linked slot
 /// `old`, which becomes unlinked. Every neighbour is checked first; on
 /// `IndexCorrupt` nothing changes.
@@ -288,6 +272,7 @@ pub(crate) fn replace<C: Chain>(
     Ok(())
 }
 
+#[cfg(test)]
 /// Checks every chain of the table: each bucket head walks a well-formed
 /// chain of its own bucket, every linked node is reached exactly once, and
 /// `expected_bucket(i)` (the bucket slot `i` must be linked in, or `None`)
@@ -315,6 +300,7 @@ pub(crate) fn validate<C: Chain>(
     reached == linked
 }
 
+#[cfg(test)]
 /// Access to the one bitmap word stored in each slot.
 pub(crate) trait UsedBits {
     type Slot;
@@ -322,10 +308,12 @@ pub(crate) trait UsedBits {
     fn word_mut(slot: &mut Self::Slot) -> &mut u64;
 }
 
+#[cfg(test)]
 pub(crate) const fn leaf_words(slots: usize) -> usize {
     slots.div_ceil(64)
 }
 
+#[cfg(test)]
 pub(crate) const fn summary_words(slots: usize) -> usize {
     let leaves = leaf_words(slots);
     if leaves <= 1 {
@@ -335,6 +323,7 @@ pub(crate) const fn summary_words(slots: usize) -> usize {
     }
 }
 
+#[cfg(test)]
 /// Valid bits of leaf word `word`.
 fn leaf_mask(slots: usize, word: usize) -> u64 {
     let remaining = slots - word * 64;
@@ -345,6 +334,7 @@ fn leaf_mask(slots: usize, word: usize) -> u64 {
     }
 }
 
+#[cfg(test)]
 /// Valid bits of summary word `word`.
 fn summary_mask(slots: usize, word: usize) -> u64 {
     let remaining = leaf_words(slots) - word * 64;
@@ -355,6 +345,7 @@ fn summary_mask(slots: usize, word: usize) -> u64 {
     }
 }
 
+#[cfg(test)]
 /// Marks slot `index` used or unused and keeps the summary in step.
 pub(crate) fn set_used<B: UsedBits>(slots: &mut [B::Slot], index: usize, used: bool) {
     let word = index / 64;
@@ -378,6 +369,7 @@ pub(crate) fn set_used<B: UsedBits>(slots: &mut [B::Slot], index: usize, used: b
     }
 }
 
+#[cfg(test)]
 /// Lowest unused slot and the number of bitmap words read, or `None` when
 /// every slot is used. A summary that claims a free leaf word whose bits are
 /// all set is `IndexCorrupt`.
@@ -416,6 +408,7 @@ pub(crate) fn first_unused<B: UsedBits>(
     Ok(((free != 0).then(|| free.trailing_zeros() as usize), 1))
 }
 
+#[cfg(test)]
 /// Checks that the bitmap marks exactly the slots `used(i)` says are used,
 /// that every summary bit matches its leaf word, and that no bit past the
 /// table is set. O(n); validation only.

@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 #![doc = "A small, allocation-free IPv4 and ARP packet-processing core."]
 
+mod arp_policy;
 mod checksum;
 mod firewall;
 mod fixed_directory;
 mod forwarding;
 mod generated;
+mod hash_key;
 mod icmpv4_error;
 mod icmpv4_translated_limit;
 mod io;
@@ -20,17 +22,19 @@ mod nat44_tcp_state;
 mod observability;
 mod packet;
 mod reload_state;
-// ARP resolution: no longer used by forwarding; removed with its types moved (#441).
-#[allow(dead_code)]
-mod resolution;
-#[cfg(test)]
-mod resolution_reference;
 mod route;
 mod slot_index;
 mod slot_list;
 mod source_validation;
+mod time;
 mod vlan;
 
+pub use arp_policy::{
+    ArpAnnouncePolicy, ArpAnnouncePolicyError, ArpInterfacePolicy,
+    ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS, ARP_ANNOUNCE_INTERVAL_MS, ARP_ANNOUNCE_MAX_COUNT,
+    ARP_ANNOUNCE_MAX_INTERVAL_MS, ARP_ANNOUNCE_MIN_INTERVAL_MS, ARP_ANNOUNCE_NUM,
+    ARP_DEFEND_INTERVAL_MS,
+};
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[cfg(feature = "validation-test-hooks")]
 #[doc(hidden)]
@@ -57,7 +61,7 @@ pub use fixed_directory::{port_free_bitmap_words, DirectoryBucket, DirectoryNode
 #[doc(hidden)]
 pub use forwarding::take_full_forwarding_validation_count;
 pub use forwarding::{
-    dispatch_nat44_tcp_unsolicited_syns, Nat44TcpUnsolicitedSynDispatchError,
+    dispatch_nat44_tcp_unsolicited_syns, ControlDisposition, Nat44TcpUnsolicitedSynDispatchError,
     Nat44TcpUnsolicitedSynDispatchReport, Nat44TcpUnsolicitedSynDisposition,
 };
 pub use forwarding::{
@@ -70,6 +74,7 @@ pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,
     GeneratedPacketLease, GeneratedPacketSlot, GeneratedSlotCompletion,
 };
+pub use hash_key::{ResolutionHashKey, ResolutionHashKeyError};
 pub use icmpv4_error::{
     execute_one_icmpv4_error, execute_one_icmpv4_time_exceeded, ExecuteIcmpv4Error,
     ExecuteIcmpv4TimeExceededError, GeneratedIcmpv4Report, GeneratedIcmpv4Trace,
@@ -156,29 +161,10 @@ pub use packet::{
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
 };
 pub use reload_state::{StateCarryConflict, StateCarryOutcome};
-pub use resolution::{
-    dispatch_host_unreachable_failures, execute_one_arp_announcement, execute_one_arp_request,
-    poll_resolution_timers, ArpAnnounceCounters, ArpAnnouncePolicy, ArpAnnouncePolicyError,
-    ArpAnnounceSlot, ArpInterfacePolicy, ArpRequestAction, ArpRequestBuildError,
-    ControlDisposition, DynamicNeighborSlot, ExecuteArpRequestError, GeneratedArpReport,
-    GeneratedArpTrace, GeneratedTraceSink, MonotonicMillis, NoGeneratedTrace,
-    NoResolutionFailureTrace, NoResolutionTimerTrace, ResolutionActionSlot, ResolutionCounters,
-    ResolutionFailureCapture, ResolutionFailureCounters, ResolutionFailureDispatchError,
-    ResolutionFailureDispatchReport, ResolutionFailureHoldPhase, ResolutionFailureHoldSlot,
-    ResolutionFailureTrace, ResolutionFailureTraceSink, ResolutionGenerationToken,
-    ResolutionHashKey, ResolutionHashKeyError, ResolutionIndexCounters, ResolutionOccupancy,
-    ResolutionPhase, ResolutionPolicy, ResolutionPolicyError, ResolutionPublicationError,
-    ResolutionPublicationPermit, ResolutionPublicationReport, ResolutionResult, ResolutionRuntime,
-    ResolutionStateSlot, ResolutionStatus, ResolutionTimerError, ResolutionTimerReport,
-    ResolutionTimerTrace, ResolutionTimerTraceSink, StaticReconcileReport,
-    ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS, ARP_ANNOUNCE_INTERVAL_MS, ARP_ANNOUNCE_MAX_COUNT,
-    ARP_ANNOUNCE_MAX_INTERVAL_MS, ARP_ANNOUNCE_MIN_INTERVAL_MS, ARP_ANNOUNCE_NUM,
-    ARP_ANNOUNCE_RETRY_MAX_MS, ARP_ANNOUNCE_RETRY_MS, ARP_DEFEND_INTERVAL_MS,
-    ARP_REQUEST_FRAME_LEN, RESOLUTION_INDEX_CHAIN_LIMIT,
-};
 pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Origin, Route, RouteError,
     ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
 pub use source_validation::{SourceValidation, SourceValidationBinding};
+pub use time::MonotonicMillis;
 pub use vlan::VlanBinding;

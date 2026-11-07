@@ -74,11 +74,6 @@ impl SlotList {
         decode(self.tail)
     }
 
-    #[cfg(test)]
-    pub(crate) const fn from_raw_for_test(head: u32, tail: u32, len: u32) -> Self {
-        Self { head, tail, len }
-    }
-
     pub(crate) const fn len(self) -> usize {
         self.len as usize
     }

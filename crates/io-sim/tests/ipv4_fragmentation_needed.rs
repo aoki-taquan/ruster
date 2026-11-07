@@ -13,8 +13,7 @@ use ruster_core::{
     execute_one_icmpv4_error, DropReason, ForwardingSnapshot, GeneratedIcmpv4Trace,
     Icmpv4ErrorActionSlot, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
     Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Neighbor, PacketIo, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route, SnapshotError, TraceEvent,
+    MacAddress, MonotonicMillis, Neighbor, PacketIo, Route, SnapshotError, TraceEvent,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo, VecGeneratedIcmpv4Trace, VecTrace};
 
@@ -160,8 +159,6 @@ fn expected_error(original: &[u8], next_hop_mtu: u16, lan_mtu: u16, outer_ttl: u
 }
 
 struct Runtimes {
-    resolution_states: [ResolutionStateSlot; 2],
-    resolution_actions: [ResolutionActionSlot; 2],
     error_states: [Icmpv4ErrorStateSlot; 4],
     error_actions: [Icmpv4ErrorActionSlot; 4],
 }
@@ -169,8 +166,6 @@ struct Runtimes {
 impl Runtimes {
     fn new() -> Self {
         Self {
-            resolution_states: [ResolutionStateSlot::EMPTY; 2],
-            resolution_actions: [ResolutionActionSlot::EMPTY; 2],
             error_states: [Icmpv4ErrorStateSlot::EMPTY; 4],
             error_actions: [Icmpv4ErrorActionSlot::EMPTY; 4],
         }
@@ -181,7 +176,6 @@ impl Runtimes {
 fn forward(
     io: &mut SimIo,
     snapshot: &ForwardingSnapshot<'_>,
-    _resolution: &mut ResolutionRuntime<'_>,
     errors: &mut Icmpv4ErrorRuntime<'_>,
     frames: &[Vec<u8>],
     now: u64,
@@ -229,11 +223,6 @@ fn df_datagram_above_the_egress_mtu_gets_exact_fragmentation_needed() {
     let net = Net::new(1500, 1400);
     let snapshot = net.snapshot();
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let mut errors = Icmpv4ErrorRuntime::new(
         Icmpv4ErrorPolicy::default(),
         &mut storage.error_states,
@@ -245,7 +234,6 @@ fn df_datagram_above_the_egress_mtu_gets_exact_fragmentation_needed() {
     forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&fits),
         0,
@@ -258,7 +246,6 @@ fn df_datagram_above_the_egress_mtu_gets_exact_fragmentation_needed() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&original),
         10,
@@ -321,11 +308,6 @@ fn df_clear_datagram_above_the_egress_mtu_is_a_typed_drop_without_error() {
     let net = Net::new(1500, 576);
     let snapshot = net.snapshot();
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let mut errors = Icmpv4ErrorRuntime::new(
         Icmpv4ErrorPolicy::default(),
         &mut storage.error_states,
@@ -337,7 +319,6 @@ fn df_clear_datagram_above_the_egress_mtu_is_a_typed_drop_without_error() {
         let trace = forward(
             &mut io,
             &snapshot,
-            &mut resolution,
             &mut errors,
             std::slice::from_ref(&original),
             0,
@@ -346,7 +327,7 @@ fn df_clear_datagram_above_the_egress_mtu_is_a_typed_drop_without_error() {
         assert!(dispositions(&trace).is_empty());
     }
     let fits = datagram(576, 0, 17, 0);
-    forward(&mut io, &snapshot, &mut resolution, &mut errors, &[fits], 0);
+    forward(&mut io, &snapshot, &mut errors, &[fits], 0);
     assert_eq!(io.pop_tx().unwrap().egress, WAN);
     assert_eq!(errors.counters(), Default::default());
     assert_eq!(errors.pending_actions(), 0);
@@ -360,11 +341,6 @@ fn suppression_rules_apply_to_fragmentation_needed() {
     let net = Net::new(1500, 576);
     let snapshot = net.snapshot();
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let mut errors = Icmpv4ErrorRuntime::new(
         Icmpv4ErrorPolicy::default(),
         &mut storage.error_states,
@@ -384,7 +360,6 @@ fn suppression_rules_apply_to_fragmentation_needed() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         &[time_exceeded.clone(), fragment.clone(), echo.clone()],
         0,
@@ -417,11 +392,6 @@ fn switch_and_limiter_govern_fragmentation_needed() {
     let original = datagram(577, DF, 17, 0);
 
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let off = Icmpv4ErrorPolicy::default().with_generation(
         Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
         false,
@@ -433,7 +403,6 @@ fn switch_and_limiter_govern_fragmentation_needed() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&original),
         0,
@@ -449,11 +418,6 @@ fn switch_and_limiter_govern_fragmentation_needed() {
     assert_eq!(errors.pending_actions(), 0);
 
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let mut errors = Icmpv4ErrorRuntime::new(
         Icmpv4ErrorPolicy::new(100, 60_000)
             .unwrap()
@@ -465,7 +429,6 @@ fn switch_and_limiter_govern_fragmentation_needed() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         &[original.clone(), original.clone()],
         0,
@@ -488,7 +451,6 @@ fn switch_and_limiter_govern_fragmentation_needed() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&original),
         99,
@@ -500,7 +462,6 @@ fn switch_and_limiter_govern_fragmentation_needed() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&original),
         100,
@@ -528,11 +489,6 @@ fn errors_are_cut_to_the_mtu_of_the_reverse_egress() {
     let net = Net::new(100, 200);
     let snapshot = net.snapshot();
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let mut errors = Icmpv4ErrorRuntime::new(
         Icmpv4ErrorPolicy::default(),
         &mut storage.error_states,
@@ -543,7 +499,6 @@ fn errors_are_cut_to_the_mtu_of_the_reverse_egress() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&original),
         0,
@@ -574,14 +529,7 @@ fn errors_are_cut_to_the_mtu_of_the_reverse_egress() {
     expired[24..26].fill(0);
     let header = checksum(&expired[14..34]);
     expired[24..26].copy_from_slice(&header.to_be_bytes());
-    let trace = forward(
-        &mut io,
-        &snapshot,
-        &mut resolution,
-        &mut errors,
-        &[expired.clone()],
-        1_000,
-    );
+    let trace = forward(&mut io, &snapshot, &mut errors, &[expired.clone()], 1_000);
     assert_dropped(&mut io, DropReason::Ipv4TtlExpired, &expired);
     assert!(trace.events().iter().any(|event| matches!(
         event,
@@ -625,11 +573,6 @@ fn a_ttl_flood_on_the_same_egress_does_not_starve_fragmentation_needed() {
     let net = Net::new(1500, 576);
     let snapshot = net.snapshot();
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let mut errors = Icmpv4ErrorRuntime::new(
         Icmpv4ErrorPolicy::default(),
         &mut storage.error_states,
@@ -650,7 +593,6 @@ fn a_ttl_flood_on_the_same_egress_does_not_starve_fragmentation_needed() {
         forward(
             &mut io,
             &snapshot,
-            &mut resolution,
             &mut errors,
             &[expired.clone(), oversized.clone()],
             now,
@@ -689,11 +631,6 @@ fn trailing_bytes_beyond_the_egress_mtu_are_a_typed_drop() {
     let net = Net::new(1500, 576);
     let snapshot = net.snapshot();
     let mut storage = Runtimes::new();
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut storage.resolution_states,
-        &mut storage.resolution_actions,
-    );
     let mut errors = Icmpv4ErrorRuntime::new(
         Icmpv4ErrorPolicy::default(),
         &mut storage.error_states,
@@ -705,7 +642,6 @@ fn trailing_bytes_beyond_the_egress_mtu_are_a_typed_drop() {
     let trace = forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&trailing),
         0,
@@ -717,7 +653,6 @@ fn trailing_bytes_beyond_the_egress_mtu_are_a_typed_drop() {
     forward(
         &mut io,
         &snapshot,
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&trailing),
         0,
@@ -729,7 +664,6 @@ fn trailing_bytes_beyond_the_egress_mtu_are_a_typed_drop() {
     forward(
         &mut io,
         &tiny.snapshot(),
-        &mut resolution,
         &mut errors,
         std::slice::from_ref(&padded),
         0,

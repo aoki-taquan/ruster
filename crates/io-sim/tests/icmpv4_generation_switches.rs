@@ -6,13 +6,11 @@
 mod support;
 
 use ruster_core::{
-    execute_one_arp_request, execute_one_icmpv4_error, internet_checksum, ipv4_header_checksum,
-    DropReason, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorCounters,
-    Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoGeneratedTrace, NoTrace,
-    PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
-    Route, TraceEvent,
+    execute_one_icmpv4_error, internet_checksum, ipv4_header_checksum, DropReason,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorCounters, Icmpv4ErrorDisposition,
+    Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface,
+    Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
+    NoGeneratedIcmpv4Trace, NoTrace, PacketIo, Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
@@ -135,13 +133,6 @@ fn forward_one(frame: Vec<u8>, policy: Icmpv4ErrorPolicy) -> Outcome {
     let bindings = bindings();
     let neighbors = neighbors();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut rs,
-        &mut ra,
-    );
     let mut es = [Icmpv4ErrorStateSlot::EMPTY; 2];
     let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 2];
     let mut errors = Icmpv4ErrorRuntime::new(policy, &mut es, &mut ea);
@@ -296,13 +287,6 @@ fn disabled_kind_does_not_consume_the_shared_limiter() {
     let bindings = bindings();
     let neighbors = neighbors();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut rs,
-        &mut ra,
-    );
     let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -410,13 +394,6 @@ fn disabled_kind_never_starts_reverse_arp_or_moves_the_clock() {
         let bindings = bindings();
         // No neighbor for SOURCE: the reverse next-hop is unresolved.
         let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
-        let mut rs = [ResolutionStateSlot::EMPTY; 2];
-        let mut ra = [ResolutionActionSlot::EMPTY; 2];
-        let mut resolution = ResolutionRuntime::new(
-            ResolutionPolicy::new(1_000, 60_000).unwrap(),
-            &mut rs,
-            &mut ra,
-        );
         let mut es = [Icmpv4ErrorStateSlot::EMPTY; 2];
         let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 2];
         let mut errors = Icmpv4ErrorRuntime::new(policy_with(disabled, false), &mut es, &mut ea);
@@ -447,19 +424,6 @@ fn disabled_kind_never_starts_reverse_arp_or_moves_the_clock() {
             [Icmpv4ErrorDisposition::GenerationDisabled { kind: disabled }],
             "{disabled:?}"
         );
-        assert!(!trace
-            .events()
-            .iter()
-            .any(|event| matches!(event, TraceEvent::NeighborResolution { .. })));
-        assert_eq!(resolution.pending_actions(), 0, "{disabled:?}");
-        assert!(execute_one_arp_request(
-            &mut io,
-            &mut resolution,
-            MonotonicMillis(10),
-            &mut NoGeneratedTrace,
-        )
-        .unwrap()
-        .is_none());
         assert!(execute_one_icmpv4_error(
             &mut io,
             &mut errors,
