@@ -36,6 +36,7 @@ fn config(mtu: u16) -> Config {
             mtu,
             enabled: true,
             ipv4: Some((Ipv4Addr::new(192, 0, 2, 1), 24)),
+            ipv6: Vec::new(),
         }],
         static_routes: Vec::new(),
     }
@@ -72,7 +73,7 @@ fn a_refused_full_send_leaves_what_the_fe_holds() {
     confd.connect_fe(b).unwrap();
     settle(&mut fe, &mut confd, &mut check);
     assert_eq!(mtu(&fe), Some(1500));
-    assert_eq!(fe.store().len(), 2);
+    assert_eq!(fe.store().len(), 3);
 
     // confd restarts with a configuration the FE refuses: the FE keeps the old one.
     check.refuse_mtu = Some(1400);
@@ -83,13 +84,13 @@ fn a_refused_full_send_leaves_what_the_fe_holds() {
     settle(&mut fe, &mut confd, &mut check);
     assert_eq!(confd.counters().patches_refused, 1);
     assert_eq!(mtu(&fe), Some(1500), "the old interface stays");
-    assert_eq!(fe.store().len(), 2, "and so does its address");
+    assert_eq!(fe.store().len(), 3, "and so does its address");
 
     // A configuration the FE accepts goes through.
     confd.set_config(config(1280));
     settle(&mut fe, &mut confd, &mut check);
     assert_eq!(mtu(&fe), Some(1280));
-    assert_eq!(fe.store().len(), 2);
+    assert_eq!(fe.store().len(), 3);
 }
 
 #[test]
@@ -116,8 +117,8 @@ fn a_refused_change_is_retried_with_the_next_one_and_leftovers_are_removed() {
     assert_eq!(mtu(&fe), Some(1280));
     assert_eq!(
         fe.store().len(),
-        1,
-        "the address removed in the refused change is gone too"
+        2,
+        "the IPv4 address removed in the refused change is gone too (the link-local stays)"
     );
 }
 
@@ -139,6 +140,7 @@ fn what_is_accepted_after_a_refused_send_is_cleaned_up_later() {
         mtu: 1500,
         enabled: true,
         ipv4: None,
+        ipv6: Vec::new(),
     });
     confd.set_config(with_wan);
     settle(&mut fe, &mut confd, &mut check);
@@ -152,5 +154,5 @@ fn what_is_accepted_after_a_refused_send_is_cleaned_up_later() {
         .store()
         .get(&Key::Interface { name: "wan".into() })
         .is_none());
-    assert_eq!(fe.store().len(), 2);
+    assert_eq!(fe.store().len(), 3);
 }

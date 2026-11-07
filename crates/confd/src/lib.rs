@@ -13,16 +13,18 @@
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
 //! sends only what changed.
 //!
-//! The configuration file is TOML ([`file`](mod@file)). Skeleton limits: IPv4 only, one address
-//! per interface, no dynamic values from other daemons yet.
+//! The configuration file is TOML ([`file`](mod@file)). Every interface also gets an IPv6
+//! link-local address from its MAC address ([`link_local`]). Connected routes come from
+//! the IPv4 and global IPv6 prefixes of enabled interfaces. Limits: one IPv4 address per
+//! interface, no dynamic values from other daemons yet.
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::UnixStream;
 
 use ruster_proto::session::{Client, Event};
-use ruster_proto::table::{Change, Key, NextHop, RouteAction, Value};
+use ruster_proto::table::{network, Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
 pub mod file;
@@ -38,15 +40,18 @@ pub struct InterfaceConfig {
     pub enabled: bool,
     /// The interface's IPv4 address and prefix length.
     pub ipv4: Option<(Ipv4Addr, u8)>,
+    /// The interface's IPv6 addresses and prefix lengths, besides the link-local
+    /// address confd adds from the MAC address.
+    pub ipv6: Vec<(Ipv6Addr, u8)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaticRoute {
-    pub prefix: Ipv4Addr,
+    pub prefix: IpAddr,
     pub len: u8,
     pub interface: String,
     /// `None` for an on-link route.
-    pub via: Option<Ipv4Addr>,
+    pub via: Option<IpAddr>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -244,11 +249,18 @@ impl Confd {
                     mtu: interface.mtu,
                 },
             );
-            if let Some((address, prefix_len)) = interface.ipv4 {
+            let link_local = (IpAddr::V6(link_local(interface.mac)), 64);
+            let addresses = interface
+                .ipv4
+                .map(|(a, len)| (IpAddr::V4(a), len))
+                .into_iter()
+                .chain(std::iter::once(link_local))
+                .chain(interface.ipv6.iter().map(|&(a, len)| (IpAddr::V6(a), len)));
+            for (address, prefix_len) in addresses {
                 out.insert(
                     Key::Address {
                         interface: interface.name.clone(),
-                        address: address.into(),
+                        address,
                     },
                     Value::Address { prefix_len },
                 );
@@ -262,10 +274,21 @@ impl Confd {
     fn routes(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
         for interface in self.config.interfaces.iter().filter(|i| i.enabled) {
-            if let Some((address, len)) = interface.ipv4 {
-                let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            // Link-local prefixes are on every link and never forwarded.
+            let prefixes = interface
+                .ipv4
+                .map(|(a, len)| (IpAddr::V4(a), len))
+                .into_iter()
+                .chain(
+                    interface
+                        .ipv6
+                        .iter()
+                        .filter(|(a, _)| !a.is_unicast_link_local())
+                        .map(|&(a, len)| (IpAddr::V6(a), len)),
+                );
+            for (address, len) in prefixes {
                 out.insert(
-                    route_key(Ipv4Addr::from(u32::from(address) & mask), len),
+                    route_key(network(address, len), len),
                     Value::Route(RouteAction::Forward(vec![NextHop {
                         interface: interface.name.clone(),
                         address: None,
@@ -278,7 +301,7 @@ impl Confd {
                 route_key(route.prefix, route.len),
                 Value::Route(RouteAction::Forward(vec![NextHop {
                     interface: route.interface.clone(),
-                    address: route.via.map(Into::into),
+                    address: route.via,
                 }])),
             );
         }
@@ -286,12 +309,35 @@ impl Confd {
     }
 }
 
-fn route_key(prefix: Ipv4Addr, len: u8) -> Key {
+fn route_key(prefix: IpAddr, len: u8) -> Key {
     Key::Route {
         vrf: VRF.into(),
-        prefix: prefix.into(),
+        prefix,
         len,
     }
+}
+
+/// The link-local address of an interface: fe80::/64 with the modified EUI-64 interface
+/// identifier of its MAC address (RFC 4291 appendix A, RFC 4862 section 5.3).
+pub fn link_local(mac: [u8; 6]) -> Ipv6Addr {
+    Ipv6Addr::from([
+        0xfe,
+        0x80,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        mac[0] ^ 0x02,
+        mac[1],
+        mac[2],
+        0xff,
+        0xfe,
+        mac[3],
+        mac[4],
+        mac[5],
+    ])
 }
 
 fn send_diff(peer: &mut Peer, desired: &BTreeMap<Key, Value>, counters: &mut ConfdCounters) {
