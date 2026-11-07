@@ -674,6 +674,29 @@ fn a_tunnel_interface_needs_no_mac_and_sends_from_a_router_address() {
             dslite("2001:db8:1::2", "parent = \"wan\"\nvlan = 10\n"),
             "not both",
         ),
+        (
+            dslite("2001:db8:1::2", "ipv6 = [\"2001:db8:5::1/64\"]\n"),
+            "IPv4 only",
+        ),
+        (
+            dslite("2001:db8:1::2", "")
+                .replace("ipv6 = [\"2001:db8:1::2/64\"]", "mtu = 1454\nipv6 = [\"2001:db8:1::2/64\"]"),
+            "at most 1414",
+        ),
+        (
+            format!(
+                "{}[[interface]]\nname = \"other\"\ntunnel = {{ local = \"2001:db8:1::2\", remote = \"2001:db8:ff::1\" }}\n",
+                dslite("2001:db8:1::2", "")
+            ),
+            "same local and remote",
+        ),
+        (
+            format!(
+                "{}[[interface]]\nname = \"d.10\"\nparent = \"dslite\"\nvlan = 10\n",
+                dslite("2001:db8:1::2", "")
+            ),
+            "parent",
+        ),
     ] {
         let got = error(&text);
         assert!(got.contains(expected), "{text}: {got}");

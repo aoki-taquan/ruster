@@ -276,10 +276,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 if !(1..=4094).contains(&id) {
                     return Err(format!("{at}: vlan must be 1 to 4094"));
                 }
-                let Some(parent_entry) = interfaces
-                    .iter()
-                    .find(|i: &&InterfaceConfig| i.name == *parent && i.vlan.is_none())
-                else {
+                let Some(parent_entry) = interfaces.iter().find(|i: &&InterfaceConfig| {
+                    i.name == *parent && i.vlan.is_none() && i.tunnel.is_none()
+                }) else {
                     return Err(format!(
                         "{at}: parent {parent:?} must be an interface given before it, not a VLAN"
                     ));
@@ -301,6 +300,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 return Err(format!(
                     "{at}: an interface is a VLAN or a tunnel, not both"
                 ))
+            }
+            Some(_) if !entry.ipv6.is_empty() => {
+                return Err(format!("{at}: a tunnel carries IPv4 only; give it no ipv6"))
             }
             Some(tunnel) => {
                 let address = |text: &str, what: &str| -> Result<Ipv6Addr, String> {
@@ -408,17 +410,32 @@ pub fn parse(text: &str) -> Result<Config, String> {
         });
     }
     // A tunnel is sent from one of the router's own addresses, in the default VRF.
+    let mut pairs = BTreeSet::new();
     for interface in &interfaces {
-        if let Some((local, _)) = interface.tunnel {
-            if !seen
-                .addresses
-                .contains(&(DEFAULT_VRF.to_owned(), IpAddr::V6(local)))
-            {
-                return Err(format!(
-                    "interface {:?}: tunnel local {local} must be an IPv6 address of an interface in the default VRF",
-                    interface.name
-                ));
-            }
+        let Some((local, remote)) = interface.tunnel else {
+            continue;
+        };
+        let at = format!("interface {:?}", interface.name);
+        let owner = interfaces.iter().find(|i| {
+            i.tunnel.is_none() && i.vrf == DEFAULT_VRF && i.ipv6.iter().any(|&(a, _)| a == local)
+        });
+        let Some(owner) = owner else {
+            return Err(format!(
+                "{at}: tunnel local {local} must be an IPv6 address of an interface in the default VRF"
+            ));
+        };
+        // Its packets carry a 40-byte IPv6 header on the owner's link.
+        if interface.mtu > owner.mtu.saturating_sub(40) {
+            return Err(format!(
+                "{at}: mtu must be at most {} ({:?}'s less the IPv6 header)",
+                owner.mtu.saturating_sub(40),
+                owner.name
+            ));
+        }
+        if !pairs.insert((local, remote)) {
+            return Err(format!(
+                "{at}: another tunnel has the same local and remote"
+            ));
         }
     }
     let mut static_routes = Vec::with_capacity(file.route.len());
