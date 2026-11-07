@@ -3,7 +3,7 @@
 use std::net::Ipv4Addr;
 
 use ruster_confd::file::parse;
-use ruster_confd::{InterfaceConfig, StaticRoute};
+use ruster_confd::{InterfaceConfig, RouteTarget, StaticRoute};
 
 const GOOD: &str = r#"
 [[interface]]
@@ -40,6 +40,7 @@ fn a_file_becomes_the_configuration() {
                 enabled: true,
                 ipv4: Some((Ipv4Addr::new(192, 0, 2, 1), 24)),
                 ipv6: Vec::new(),
+                vrf: "default".into(),
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -48,6 +49,7 @@ fn a_file_becomes_the_configuration() {
                 enabled: false,
                 ipv4: None,
                 ipv6: Vec::new(),
+                vrf: "default".into(),
             },
         ]
     );
@@ -55,16 +57,22 @@ fn a_file_becomes_the_configuration() {
         config.static_routes,
         vec![
             StaticRoute {
+                vrf: "default".into(),
                 prefix: Ipv4Addr::UNSPECIFIED.into(),
                 len: 0,
-                interface: "wan".into(),
-                via: Some(Ipv4Addr::new(198, 51, 100, 1).into()),
+                target: RouteTarget::Next {
+                    interface: "wan".into(),
+                    via: Some(Ipv4Addr::new(198, 51, 100, 1).into()),
+                },
             },
             StaticRoute {
+                vrf: "default".into(),
                 prefix: Ipv4Addr::new(10, 0, 0, 0).into(),
                 len: 8,
-                interface: "lan".into(),
-                via: None,
+                target: RouteTarget::Next {
+                    interface: "lan".into(),
+                    via: None,
+                },
             },
         ]
     );
@@ -192,7 +200,13 @@ interface = "lan"
         vec![(v6("2001:db8:1::1"), 64), (v6("2001:db8:2::1"), 64)]
     );
     assert_eq!(config.static_routes[0].prefix, v6("::"));
-    assert_eq!(config.static_routes[0].via, Some(v6("fe80::1").into()));
+    assert_eq!(
+        config.static_routes[0].target,
+        RouteTarget::Next {
+            interface: "lan".into(),
+            via: Some(v6("fe80::1").into())
+        }
+    );
     assert_eq!(config.static_routes[1].len, 48);
 }
 
@@ -271,4 +285,77 @@ fn the_router_s_own_link_local_address_is_not_a_next_hop() {
     let shared = "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv6 = [\"fe80::1/64\"]\n\
                   [[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv6 = [\"fe80::1/64\"]\n";
     assert!(parse(shared).is_ok());
+}
+
+#[test]
+fn vrfs_may_reuse_addresses_and_routes_may_look_up_another_vrf() {
+    let config = parse(
+        r#"
+[[interface]]
+name = "red0"
+mac = "02:00:00:00:00:01"
+ipv4 = "10.0.0.1/24"
+vrf = "red"
+
+[[interface]]
+name = "blue0"
+mac = "02:00:00:00:00:02"
+ipv4 = "10.0.0.1/24"
+vrf = "blue"
+
+[[interface]]
+name = "wan"
+mac = "02:00:00:00:00:03"
+ipv4 = "198.51.100.2/24"
+
+[[route]]
+prefix = "0.0.0.0/0"
+interface = "wan"
+via = "198.51.100.1"
+
+[[route]]
+vrf = "red"
+prefix = "0.0.0.0/0"
+lookup-vrf = "default"
+"#,
+    )
+    .unwrap();
+    assert_eq!(config.interfaces[0].vrf, "red");
+    assert_eq!(config.interfaces[2].vrf, "default");
+    assert_eq!(config.static_routes[1].vrf, "red");
+    assert_eq!(
+        config.static_routes[1].target,
+        RouteTarget::LookupVrf("default".into())
+    );
+}
+
+#[test]
+fn vrf_mistakes_are_refused() {
+    let one = |extra: &str| {
+        format!(
+            "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv4 = \"10.0.0.1/24\"\n{extra}"
+        )
+    };
+    for (text, expected) in [
+        (one("vrf = \"\"\n"), "must not be empty"),
+        (
+            one("[[route]]\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\n"),
+            "another VRF",
+        ),
+        (
+            one("[[route]]\nprefix = \"0.0.0.0/0\"\n"),
+            "either interface or lookup-vrf",
+        ),
+        (
+            one("[[route]]\nprefix = \"0.0.0.0/0\"\ninterface = \"lan\"\nlookup-vrf = \"red\"\n"),
+            "either interface or lookup-vrf",
+        ),
+        (
+            one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\nvia = \"10.0.0.9\"\n"),
+            "has no via",
+        ),
+    ] {
+        let got = error(&text);
+        assert!(got.contains(expected), "{text:?}: {got}");
+    }
 }

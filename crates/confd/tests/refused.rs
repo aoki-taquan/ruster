@@ -37,6 +37,7 @@ fn config(mtu: u16) -> Config {
             enabled: true,
             ipv4: Some((Ipv4Addr::new(192, 0, 2, 1), 24)),
             ipv6: Vec::new(),
+            vrf: "default".into(),
         }],
         static_routes: Vec::new(),
     }
@@ -141,6 +142,7 @@ fn what_is_accepted_after_a_refused_send_is_cleaned_up_later() {
         enabled: true,
         ipv4: None,
         ipv6: Vec::new(),
+        vrf: "default".into(),
     });
     confd.set_config(with_wan);
     settle(&mut fe, &mut confd, &mut check);

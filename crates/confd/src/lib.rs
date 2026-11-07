@@ -29,9 +29,6 @@ use ruster_proto::task::{Progress, Task};
 
 pub mod file;
 
-/// The VRF of everything in the skeleton.
-pub const VRF: &str = "default";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {
     pub name: String,
@@ -43,15 +40,30 @@ pub struct InterfaceConfig {
     /// The interface's IPv6 addresses and prefix lengths, besides the link-local
     /// address confd adds from the MAC address.
     pub ipv6: Vec<(Ipv6Addr, u8)>,
+    /// The VRF the interface belongs to; its connected routes are in it.
+    pub vrf: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StaticRoute {
+    /// The VRF the route is in.
+    pub vrf: String,
     pub prefix: IpAddr,
     pub len: u8,
-    pub interface: String,
-    /// `None` for an on-link route.
-    pub via: Option<IpAddr>,
+    pub target: RouteTarget,
+}
+
+/// Where a static route sends its packets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RouteTarget {
+    /// Out of `interface` (which may be in another VRF), to `via` or, when it is
+    /// `None`, to the destination on the link.
+    Next {
+        interface: String,
+        via: Option<IpAddr>,
+    },
+    /// Looked up again in another VRF.
+    LookupVrf(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -247,7 +259,7 @@ impl Confd {
                     enabled: interface.enabled,
                     mac: interface.mac,
                     mtu: interface.mtu,
-                    vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                    vrf: interface.vrf.clone(),
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);
@@ -289,7 +301,7 @@ impl Confd {
                 );
             for (address, len) in prefixes {
                 out.insert(
-                    route_key(network(address, len), len),
+                    route_key(&interface.vrf, network(address, len), len),
                     Value::Route(RouteAction::Forward(vec![NextHop {
                         interface: interface.name.clone(),
                         address: None,
@@ -298,21 +310,25 @@ impl Confd {
             }
         }
         for route in &self.config.static_routes {
+            let action = match &route.target {
+                RouteTarget::Next { interface, via } => RouteAction::Forward(vec![NextHop {
+                    interface: interface.clone(),
+                    address: *via,
+                }]),
+                RouteTarget::LookupVrf(vrf) => RouteAction::LookupVrf(vrf.clone()),
+            };
             out.insert(
-                route_key(route.prefix, route.len),
-                Value::Route(RouteAction::Forward(vec![NextHop {
-                    interface: route.interface.clone(),
-                    address: route.via,
-                }])),
+                route_key(&route.vrf, route.prefix, route.len),
+                Value::Route(action),
             );
         }
         out
     }
 }
 
-fn route_key(prefix: IpAddr, len: u8) -> Key {
+fn route_key(vrf: &str, prefix: IpAddr, len: u8) -> Key {
     Key::Route {
-        vrf: VRF.into(),
+        vrf: vrf.to_owned(),
         prefix,
         len,
     }
