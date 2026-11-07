@@ -1243,3 +1243,33 @@ fn nat_translates_every_fragment_of_a_datagram() {
     }
     assert_eq!(sent, 2);
 }
+
+#[test]
+fn a_table_change_between_fragments_drops_the_later_ones() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let datagram = udp_datagram(64, false);
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), fragment_of(&datagram, 0, 40, true));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_some(), "the first fragment");
+    let code = bench.patch(
+        &mut routes,
+        &[route([10, 0, 0, 0], 8, "wan", Some(GATEWAY))],
+    );
+    assert_eq!(code, Code::CHANGED);
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), fragment_of(&datagram, 40, 72, false));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "no stale rewrite");
+}

@@ -3,7 +3,10 @@
 //! fragment so NAT and the firewall treat a fragmented datagram as one (core's
 //! NAT-FRAG; RFC 4787 REQ-14 and RFC 5508 section 6 ask NAT to handle fragments).
 //!
-//! Both are core's; the FE only gives them storage, allocated once.
+//! Both are core's; the FE only gives them storage, allocated once. Every table
+//! change empties the tracker (its entries name the old tables' egress and
+//! translations), so the later fragments of a datagram cut across a change are
+//! dropped.
 //!
 //! # Standards
 //!
@@ -50,12 +53,6 @@ pub(crate) fn fragmentation() -> Ipv4FragmentationRuntime<'static> {
 pub(crate) fn tracker() -> Ipv4FragmentTracker<'static> {
     let buckets = ipv4_fragment_tracking_buckets(ENTRIES);
     let tombstones = ipv4_fragment_tracking_tombstones(ENTRIES);
-    let key = loop {
-        let (a, b) = crate::nat::words();
-        if let Ok(key) = ResolutionHashKey::new(a, b) {
-            break key;
-        }
-    };
     Ipv4FragmentTracker::new(
         Ipv4FragmentTrackingPolicy::new(TIMEOUT_MS, ENTRIES_PER_HOST, HELD_PER_HOST)
             .expect("fragment tracking policy"),
@@ -75,9 +72,19 @@ pub(crate) fn tracker() -> Ipv4FragmentTracker<'static> {
             held: leak(HELD, Ipv4FragmentHeldSlot::EMPTY),
             held_bytes: leak(HELD * ipv4_fragment_slot_bytes(MTU), 0_u8),
         },
-        key,
+        key(),
     )
     .expect("fragment tracking storage")
+}
+
+/// A new key for the tracker's tables.
+pub(crate) fn key() -> ResolutionHashKey {
+    loop {
+        let (a, b) = crate::nat::words();
+        if let Ok(key) = ResolutionHashKey::new(a, b) {
+            return key;
+        }
+    }
 }
 
 fn leak<T: Clone>(count: usize, value: T) -> &'static mut [T] {

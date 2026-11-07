@@ -569,6 +569,9 @@ where
     fn step(&mut self, now_ms: u64) -> Progress {
         let control = self.server.step(&mut self.builder);
         if let Some((built, publication, nat)) = self.builder.built.take() {
+            // The tracker's entries name the old tables' egress, neighbors and
+            // translations: later fragments of those datagrams are dropped.
+            self.fragment_tracking.flush_with_key(fragments::key());
             // As for the firewall: a NAT that cannot move stays bound to the old
             // tables, and core drops what it would have translated.
             if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {

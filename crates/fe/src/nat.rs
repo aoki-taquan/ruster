@@ -24,7 +24,8 @@
 //! - No per-host limits: one inside host may take every mapping.
 //! - Unsolicited inbound SYNs are dropped at once; RFC 5382 REQ-4's hold before an
 //!   ICMP error needs storage the FE does not give yet.
-//! - Fragments are not translated (no fragment tracking yet).
+//! - Fragments whose datagram started before a table change are dropped
+//!   (`fragments.rs`).
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 
