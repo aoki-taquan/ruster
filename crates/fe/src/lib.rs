@@ -32,16 +32,16 @@ use ruster_core::{
     execute_one_icmpv4_error, forward_batch_with_control, ArpOpcode, ControlQueue,
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
-    Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, PacketIo, Route, TraceEvent,
-    TraceSink, ValidatedForwardingOwner,
+    MonotonicMillis, PacketIo, TraceEvent, TraceSink,
 };
 use ruster_proto::cbor::Encoder;
 use ruster_proto::punt::{self, Direction, Punt};
 use ruster_proto::session::{Hook, Server, Store};
 use ruster_proto::sid;
-use ruster_proto::table::{Key, ResolveRequest, RouteAction, Value};
+use ruster_proto::table::ResolveRequest;
 use ruster_proto::task::{Progress, Task};
+
+mod build;
 
 /// The tables each kind of writer may change (one writer per table).
 pub mod writers {
@@ -54,7 +54,7 @@ pub mod writers {
 }
 
 /// The only VRF of the skeleton.
-pub const DEFAULT_VRF: &str = "default";
+pub const DEFAULT_VRF: &str = ruster_proto::table::DEFAULT_VRF;
 
 /// Packets taken from the backend in one step.
 const RX_BUDGET: usize = 64;
@@ -93,7 +93,10 @@ pub struct FeCounters {
 pub struct Fe<B> {
     io: B,
     builder: Builder,
-    owner: ValidatedForwardingOwner,
+    /// Core's tables per VRF, the default VRF first.
+    vrfs: Vec<build::Vrf>,
+    /// For each port, the index in `vrfs` of its VRF.
+    by_ingress: Vec<u16>,
     /// The interfaces enabled in the current tables.
     active: Vec<IfId>,
     server: Server,
@@ -101,7 +104,6 @@ pub struct Fe<B> {
     /// Where ARP goes when the punt socket is not connected to one peer.
     punt_peer: Option<PathBuf>,
     last_resolve: BTreeMap<(IfId, IpAddr), u64>,
-    ipv6: Ipv6Fib,
     /// Neighbor Discovery frames core copied out of the last batch.
     control: ControlQueue,
     /// ICMPv4 errors core queued in the last batch, and their rate limits.
@@ -126,19 +128,17 @@ where
     /// so nothing is forwarded until a writer adds interfaces and routes.
     pub fn new(io: B, ports: Vec<String>) -> Self {
         let builder = Builder { ports, built: None };
-        let (owner, active, _) = builder
-            .build(&Store::default())
-            .expect("empty tables build");
+        let built = build::build(&builder.ports, &Store::default()).expect("empty tables build");
         Self {
             io,
             builder,
-            owner,
-            active,
+            vrfs: built.vrfs,
+            by_ingress: built.by_ingress,
+            active: built.active,
             server: Server::new(),
             punt: None,
             punt_peer: None,
             last_resolve: BTreeMap::new(),
-            ipv6: Ipv6Fib::default(),
             control: ControlQueue::new(EVENTS_PER_BATCH).with_icmpv6_errors(EVENTS_PER_BATCH),
             icmpv4_errors: icmpv4_error_runtime(),
             counters: FeCounters::default(),
@@ -184,11 +184,18 @@ where
 
     fn worker(&mut self, now_ms: u64) -> bool {
         let mut trace = FeTrace::default();
-        let snapshot = self
-            .owner
-            .snapshot()
-            .with_arp_to_control(true)
-            .with_ipv6(&self.ipv6);
+        // One snapshot per VRF; each packet uses its ingress interface's.
+        let snapshots: Vec<_> = self
+            .vrfs
+            .iter()
+            .map(|vrf| {
+                vrf.owner
+                    .snapshot()
+                    .with_arp_to_control(true)
+                    .with_ipv6(&vrf.ipv6)
+            })
+            .collect();
+        let snapshot = snapshots[0].with_vrfs(&snapshots, &self.by_ingress);
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
             return false;
         };
@@ -373,10 +380,10 @@ where
 {
     fn step(&mut self, now_ms: u64) -> Progress {
         let control = self.server.step(&mut self.builder);
-        if let Some((owner, active, ipv6)) = self.builder.built.take() {
-            self.owner = owner;
-            self.active = active;
-            self.ipv6 = ipv6;
+        if let Some(built) = self.builder.built.take() {
+            self.vrfs = built.vrfs;
+            self.by_ingress = built.by_ingress;
+            self.active = built.active;
         }
         let worked = self.worker(now_ms);
         let injected = self.inject();
@@ -406,14 +413,11 @@ impl GeneratedIcmpv4TraceSink for NoTrace {
     fn record_generated_icmpv4(&mut self, _event: GeneratedIcmpv4Trace) {}
 }
 
-/// The core's tables built from the store: IPv4 owner, enabled ports, IPv6 tables.
-type Built = (ValidatedForwardingOwner, Vec<IfId>, Ipv6Fib);
-
-/// Turns the tables into the core's forwarding owner.
+/// Turns the tables into core's tables.
 struct Builder {
     ports: Vec<String>,
-    /// The owner built for the last accepted tables, until the FE takes it.
-    built: Option<Built>,
+    /// The tables built for the last accepted store, until the FE takes them.
+    built: Option<build::Built>,
 }
 
 impl Builder {
@@ -421,159 +425,11 @@ impl Builder {
         let index = self.ports.iter().position(|port| port == name)?;
         u16::try_from(index).ok().map(IfId)
     }
-
-    /// Entries that point at something missing (a port the FE does not have, a
-    /// disabled interface, another VRF, an action the skeleton lacks) are kept in the
-    /// tables but left out here.
-    fn build(&self, store: &Store) -> Result<Built, String> {
-        let mut interfaces = Vec::new();
-        let mut bindings: Vec<LocalIpv4Binding> = Vec::new();
-        let mut routes = Vec::new();
-        let mut neighbors = Vec::new();
-        let mut active = BTreeMap::new();
-
-        for (key, value) in store.iter() {
-            if let (
-                Key::Interface { name },
-                Value::Interface {
-                    enabled, mac, mtu, ..
-                },
-            ) = (key, value)
-            {
-                if let Some(id) = self.port(name).filter(|_| *enabled) {
-                    interfaces.push(Interface {
-                        id,
-                        mac: MacAddress(*mac),
-                        mtu: *mtu,
-                    });
-                    active.insert(name.as_str(), id);
-                }
-            }
-        }
-        for (key, value) in store.iter() {
-            match (key, value) {
-                (Key::Address { interface, address }, Value::Address { .. }) => {
-                    let (Some(&id), Some(address)) = (active.get(interface.as_str()), v4(address))
-                    else {
-                        continue;
-                    };
-                    // The core keeps one IPv4 address per interface for now.
-                    if bindings.iter().all(|b| b.interface != id) {
-                        bindings.push(LocalIpv4Binding {
-                            interface: id,
-                            address,
-                        });
-                    }
-                }
-                (Key::Route { vrf, prefix, len }, Value::Route(RouteAction::Forward(hops)))
-                    if vrf == DEFAULT_VRF && prefix.is_ipv4() =>
-                {
-                    let Some((id, hop)) = hops
-                        .iter()
-                        .find_map(|hop| active.get(hop.interface.as_str()).map(|&id| (id, hop)))
-                    else {
-                        continue;
-                    };
-                    let next_hop = hop.address.as_ref().and_then(v4);
-                    let route = Route::new(v4(prefix).expect("checked above"), *len, id, next_hop)
-                        .map_err(|error| format!("route {prefix}/{len}: {error:?}"))?;
-                    routes.push(route);
-                }
-                (Key::Neighbor { interface, address }, Value::Neighbor { mac }) => {
-                    if let (Some(&id), Some(target)) = (active.get(interface.as_str()), v4(address))
-                    {
-                        neighbors.push(Neighbor {
-                            interface: id,
-                            target,
-                            mac: MacAddress(*mac),
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-        let ipv6 = build_ipv6(store, &active)?;
-        let enabled = interfaces.iter().map(|i: &Interface| i.id).collect();
-        ValidatedForwardingOwner::new(
-            routes.into(),
-            interfaces.into(),
-            neighbors.into(),
-            bindings.into(),
-            Ipv4OriginPolicy::default(),
-        )
-        .map(|owner| (owner, enabled, ipv6))
-        .map_err(|error| format!("{error:?}"))
-    }
-}
-
-/// The IPv6 tables: addresses, forward routes of the default VRF through an enabled
-/// port, and neighbors, as for IPv4.
-fn build_ipv6(store: &Store, active: &BTreeMap<&str, IfId>) -> Result<Ipv6Fib, String> {
-    let mut routes = Vec::new();
-    let mut neighbors = Vec::new();
-    let mut local = Vec::new();
-    for (key, value) in store.iter() {
-        match (key, value) {
-            (
-                Key::Address {
-                    interface,
-                    address: IpAddr::V6(address),
-                },
-                Value::Address { .. },
-            ) => {
-                if let Some(&id) = active.get(interface.as_str()) {
-                    local.push(Ipv6Local {
-                        interface: id,
-                        address: address.octets(),
-                    });
-                }
-            }
-            (
-                Key::Route {
-                    vrf,
-                    prefix: IpAddr::V6(prefix),
-                    len,
-                },
-                Value::Route(RouteAction::Forward(hops)),
-            ) if vrf == DEFAULT_VRF => {
-                let Some((id, hop)) = hops
-                    .iter()
-                    .find_map(|hop| active.get(hop.interface.as_str()).map(|&id| (id, hop)))
-                else {
-                    continue;
-                };
-                let next_hop = match hop.address {
-                    Some(IpAddr::V6(address)) => Some(address.octets()),
-                    _ => None,
-                };
-                let route = Ipv6Route::new(prefix.octets(), *len, id, next_hop)
-                    .map_err(|error| format!("route {prefix}/{len}: {error:?}"))?;
-                routes.push(route);
-            }
-            (
-                Key::Neighbor {
-                    interface,
-                    address: IpAddr::V6(address),
-                },
-                Value::Neighbor { mac },
-            ) => {
-                if let Some(&id) = active.get(interface.as_str()) {
-                    neighbors.push(Ipv6Neighbor {
-                        interface: id,
-                        target: address.octets(),
-                        mac: MacAddress(*mac),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    Ipv6Fib::new(routes, neighbors, local).map_err(|error| format!("IPv6: {error:?}"))
 }
 
 impl Hook for Builder {
     fn check(&mut self, next: &Store) -> Result<(), String> {
-        self.built = Some(self.build(next)?);
+        self.built = Some(build::build(&self.ports, next)?);
         Ok(())
     }
 
@@ -662,12 +518,3 @@ impl FeTrace {
 
 /// The SIDs a neighbor process writes, for callers that build their own writer sets.
 pub const NEIGHBOR_TABLE: u64 = sid::NEIGHBOR;
-
-/// The core's form of an IPv4 address; `None` for IPv6, which the core does not
-/// forward yet.
-fn v4(address: &IpAddr) -> Option<Ipv4Address> {
-    match address {
-        IpAddr::V4(a) => Some(Ipv4Address::from_octets(a.octets())),
-        IpAddr::V6(_) => None,
-    }
-}
