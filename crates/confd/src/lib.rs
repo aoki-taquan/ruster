@@ -47,6 +47,8 @@ pub struct InterfaceConfig {
     pub vlan: Option<(String, u16)>,
     /// For an IPv4 in IPv6 tunnel: its local and remote IPv6 addresses.
     pub tunnel: Option<(Ipv6Addr, Ipv6Addr)>,
+    /// For a PPPoE session: its parent interface, session ID and peer MAC.
+    pub pppoe: Option<(String, u16, [u8; 6])>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,7 +305,13 @@ impl Confd {
                     tunnel: interface
                         .tunnel
                         .map(|(local, remote)| ruster_proto::table::Tunnel { local, remote }),
-                    pppoe: None,
+                    pppoe: interface.pppoe.as_ref().map(|(parent, session, peer)| {
+                        ruster_proto::table::Pppoe {
+                            parent: parent.clone(),
+                            session: *session,
+                            peer: *peer,
+                        }
+                    }),
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);

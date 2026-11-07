@@ -58,6 +58,7 @@ default VRFの転送のfirewallは、設定ファイルの規則でFEが使い�
 default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFEが使います。
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます（AF_XDPのみ）。
 MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます（AF_XDPのみ。ルータ自身のIPv4はまだMAP-Eを通りません）。
+PPPoEのセッション（RFC 2516）を、設定ファイルの`pppoe`のインターフェースで使えます。セッションの確立は外のデーモンの仕事で、FEは包むのと外すのだけを行います。
 FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don't Fragmentが無いもの）、NATはフラグメントになったdatagramも変換します。
 
 ## 動かす

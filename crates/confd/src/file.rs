@@ -22,6 +22,12 @@
 //! ipv4 = "192.0.0.2/29"        # optional; RFC 6333 5.7's B4 address
 //! # mtu is 1460 when left out; mac is not needed
 //!
+//! [[interface]]                # a PPPoE session (set up by a daemon outside ruster)
+//! name = "ppp"
+//! pppoe = { parent = "wan", session = 4660, peer = "02:00:00:00:00:ac" }
+//! ipv4 = "198.51.100.2/32"     # optional
+//! # mac is the parent's and mtu its less 8 when left out
+//!
 //! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
 //! interface = "map"            # the tunnel interface it makes
 //! inside = "lan"               # the NAT's inside
@@ -96,6 +102,9 @@
 //!   (`ea-length` equal to the IPv4 suffix) uses ports 1024 to 32767, below the
 //!   kernel's; the router's own IPv4 (from the kernel) is not translated into the
 //!   port set, so it does not work over MAP-E yet.
+//! - RFC 2516: a `pppoe` interface is one PPPoE session on its parent (a port or
+//!   VLAN given before it), with the session ID and the access concentrator's MAC
+//!   that the session's daemon found; its MTU is at most the parent's less 8.
 //! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
 //!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
@@ -205,6 +214,15 @@ struct InterfaceEntry {
     #[serde(default = "default_vrf")]
     vrf: String,
     tunnel: Option<TunnelEntry>,
+    pppoe: Option<PppoeEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PppoeEntry {
+    parent: String,
+    session: u16,
+    peer: String,
 }
 
 #[derive(Deserialize)]
@@ -320,7 +338,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                     return Err(format!("{at}: vlan must be 1 to 4094"));
                 }
                 let Some(parent_entry) = interfaces.iter().find(|i: &&InterfaceConfig| {
-                    i.name == *parent && i.vlan.is_none() && i.tunnel.is_none()
+                    i.name == *parent && i.vlan.is_none() && i.tunnel.is_none() && i.pppoe.is_none()
                 }) else {
                     return Err(format!(
                         "{at}: parent {parent:?} must be an interface given before it, not a VLAN"
@@ -365,6 +383,49 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 ))
             }
         };
+        // A PPPoE session on a port or VLAN sub-interface given before it.
+        let pppoe = match &entry.pppoe {
+            None => None,
+            Some(_) if vlan.is_some() || tunnel.is_some() => {
+                return Err(format!(
+                    "{at}: an interface is one of a VLAN, a tunnel and a PPPoE session"
+                ))
+            }
+            Some(session) => {
+                let Some(parent) = interfaces.iter().find(|i: &&InterfaceConfig| {
+                    i.name == session.parent && i.tunnel.is_none() && i.pppoe.is_none()
+                }) else {
+                    return Err(format!(
+                        "{at}: PPPoE parent {:?} must be a port or VLAN given before it",
+                        session.parent
+                    ));
+                };
+                if session.session == 0 || session.session == 0xffff {
+                    return Err(format!("{at}: PPPoE session must be 1 to 65534"));
+                }
+                let taken = interfaces.iter().any(|i| {
+                    i.pppoe
+                        .as_ref()
+                        .is_some_and(|(p, id, _)| *p == parent.name && *id == session.session)
+                });
+                if taken {
+                    return Err(format!(
+                        "{at}: PPPoE session {} on {:?} is given twice",
+                        session.session, parent.name
+                    ));
+                }
+                let peer = mac(&session.peer)
+                    .filter(|m| m[0] & 1 == 0 && *m != [0; 6])
+                    .ok_or_else(|| format!("{at}: PPPoE peer must be a unicast MAC address"))?;
+                Some((
+                    parent.name.clone(),
+                    session.session,
+                    peer,
+                    parent.mac,
+                    parent.mtu,
+                ))
+            }
+        };
         let mac = match (&entry.mac, &vlan) {
             (Some(text), _) => {
                 mac(text).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?
@@ -372,6 +433,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
             (None, Some((_, _, parent_mac))) => *parent_mac,
             // A tunnel has no link; its MAC address only names it inside the FE.
             (None, None) if tunnel.is_some() => TUNNEL_MAC,
+            // A session's frames go out with its parent's address.
+            (None, None) if pppoe.is_some() => pppoe.as_ref().map(|p| p.3).unwrap(),
             (None, None) => return Err(format!("{at}: mac is missing")),
         };
         if mac[0] & 1 != 0 || mac == [0; 6] {
@@ -388,10 +451,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
         } else {
             max_mtu
         };
+        // A session's packets carry 8 bytes of PPPoE header on the parent's link.
+        let max_mtu = pppoe.as_ref().map_or(max_mtu, |p| p.4 - 8);
         let mtu = match (entry.mtu, &vlan) {
             (Some(mtu), _) => mtu,
             (None, Some(_)) => max_mtu,
-            (None, None) if tunnel.is_some() => max_mtu,
+            (None, None) if tunnel.is_some() || pppoe.is_some() => max_mtu,
             (None, None) => default_mtu(),
         };
         if !(MIN_MTU..=max_mtu).contains(&mtu) {
@@ -450,6 +515,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             vrf: entry.vrf,
             vlan: vlan.map(|(parent, id, _)| (parent, id)),
             tunnel,
+            pppoe: pppoe.map(|(parent, session, peer, _, _)| (parent, session, peer)),
         });
     }
     // A MAP-E CE's tunnel is an interface like the others for what follows.
@@ -748,6 +814,7 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String
         vrf: DEFAULT_VRF.to_owned(),
         vlan: None,
         tunnel: Some((local, br)),
+        pppoe: None,
     };
     let nat = Nat {
         inside: entry.inside,

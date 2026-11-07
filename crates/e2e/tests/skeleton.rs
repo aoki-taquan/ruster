@@ -42,6 +42,7 @@ fn config() -> Config {
                 vrf: "default".into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -53,6 +54,7 @@ fn config() -> Config {
                 vrf: "default".into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
         ],
         static_routes: vec![StaticRoute {
