@@ -107,11 +107,13 @@ FEは、ルータ宛ての通信を分類し、種類ごとに上限を付けて
 | 種類 | 渡し先 | 通り道 |
 |---|---|---|
 | ARP、ND | `ruster-neighd` | 専用のUnix datagram socket |
-| DHCP、DHCPv6、RS/RA、PPPoE | 担当の外のデーモン | 専用のUnix datagram socket |
+| DHCP、DHCPv6、RS/RA、PPPoEのDiscoveryとセッションの制御 | 担当の外のデーモン | 専用のUnix datagram socket |
 | それ以外のTCP/UDP、ICMPのEcho | kernel | TUN |
 | トンネルの中身（MAP-E、DS-Lite、WireGuard） | 渡さない | FEがトンネルを外して転送する |
 
-kernelから外へ出るパケットはTUNからFEへ戻り、FEが経路を引いて送り出す。kernelはフォワーディングをしない。
+渡し先は種類ごとの表で決める。kernelはFEの内側にいるホストの一つとして扱う。kernelから外へ出るパケットは
+TUNからFEへ戻り、ほかのホストのパケットと同じ転送の処理（NAT、トンネル、フラグメント、ICMPエラー）を通る。
+kernelはフォワーディングをしない（[`fe-ce-split.md`](fe-ce-split.md)「ルータ宛ての通信」）。
 
 ## 起動と障害
 
