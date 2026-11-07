@@ -24,7 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
 
@@ -241,7 +241,7 @@ where
         let mut payload = Vec::new();
         ResolveRequest {
             interface: name.clone(),
-            address,
+            address: address.into(),
         }
         .encode(&mut Encoder::new(&mut payload));
         self.server.notify(&payload);
@@ -373,19 +373,20 @@ impl Builder {
         for (key, value) in store.iter() {
             match (key, value) {
                 (Key::Address { interface, address }, Value::Address { .. }) => {
-                    let Some(&id) = active.get(interface.as_str()) else {
+                    let (Some(&id), Some(address)) = (active.get(interface.as_str()), v4(address))
+                    else {
                         continue;
                     };
                     // The core keeps one IPv4 address per interface for now.
                     if bindings.iter().all(|b| b.interface != id) {
                         bindings.push(LocalIpv4Binding {
                             interface: id,
-                            address: Ipv4Address::from_octets(address.octets()),
+                            address,
                         });
                     }
                 }
                 (Key::Route { vrf, prefix, len }, Value::Route(RouteAction::Forward(hops)))
-                    if vrf == DEFAULT_VRF =>
+                    if vrf == DEFAULT_VRF && prefix.is_ipv4() =>
                 {
                     let Some((id, hop)) = hops
                         .iter()
@@ -393,21 +394,17 @@ impl Builder {
                     else {
                         continue;
                     };
-                    let next_hop = hop.address.map(|a| Ipv4Address::from_octets(a.octets()));
-                    let route = Route::new(
-                        Ipv4Address::from_octets(prefix.octets()),
-                        *len,
-                        id,
-                        next_hop,
-                    )
-                    .map_err(|error| format!("route {prefix}/{len}: {error:?}"))?;
+                    let next_hop = hop.address.as_ref().and_then(v4);
+                    let route = Route::new(v4(prefix).expect("checked above"), *len, id, next_hop)
+                        .map_err(|error| format!("route {prefix}/{len}: {error:?}"))?;
                     routes.push(route);
                 }
                 (Key::Neighbor { interface, address }, Value::Neighbor { mac }) => {
-                    if let Some(&id) = active.get(interface.as_str()) {
+                    if let (Some(&id), Some(target)) = (active.get(interface.as_str()), v4(address))
+                    {
                         neighbors.push(Neighbor {
                             interface: id,
-                            target: Ipv4Address::from_octets(address.octets()),
+                            target,
                             mac: MacAddress(*mac),
                         });
                     }
@@ -510,3 +507,12 @@ impl TraceSink for FeTrace {
 
 /// The SIDs a neighbor process writes, for callers that build their own writer sets.
 pub const NEIGHBOR_TABLE: u64 = sid::NEIGHBOR;
+
+/// The core's form of an IPv4 address; `None` for IPv6, which the core does not
+/// forward yet.
+fn v4(address: &IpAddr) -> Option<Ipv4Address> {
+    match address {
+        IpAddr::V4(a) => Some(Ipv4Address::from_octets(a.octets())),
+        IpAddr::V6(_) => None,
+    }
+}

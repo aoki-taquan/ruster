@@ -48,7 +48,7 @@ fn config() -> Config {
             },
         ],
         static_routes: vec![StaticRoute {
-            prefix: Ipv4Addr::UNSPECIFIED,
+            prefix: Ipv4Addr::UNSPECIFIED.into(),
             len: 0,
             interface: "wan".into(),
             via: Some(Ipv4Addr::from(GATEWAY)),
@@ -398,7 +398,7 @@ fn configuration_changes_still_apply_after_restarts() {
     // A new static route, sent after both restarts.
     let mut config = router.config.clone();
     config.static_routes.push(StaticRoute {
-        prefix: Ipv4Addr::new(10, 99, 0, 0),
+        prefix: Ipv4Addr::new(10, 99, 0, 0).into(),
         len: 16,
         interface: "lan".into(),
         via: Some(Ipv4Addr::from(HOST)),

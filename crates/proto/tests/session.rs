@@ -46,7 +46,7 @@ fn neighbor(address: [u8; 4]) -> Change {
     Change::set(
         Key::Neighbor {
             interface: "eth0".into(),
-            address: Ipv4Addr::from(address),
+            address: Ipv4Addr::from(address).into(),
         },
         Value::Neighbor {
             mac: [2, 0, 0, 0, 1, 1],
