@@ -8392,6 +8392,13 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseRouteMiss);
     };
     let reverse_egress = reverse_route.egress();
+    // A VLAN sub-interface is not a port of the generated-frame backend: errors out
+    // of one are not sent (yet).
+    if snapshot.vlans.iter().any(|b| b.sub == reverse_egress) {
+        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseInterfaceMiss {
+            egress: reverse_egress,
+        });
+    }
     let Some(interface) = snapshot.interface(reverse_egress) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseInterfaceMiss {
             egress: reverse_egress,

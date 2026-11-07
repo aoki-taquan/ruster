@@ -41,6 +41,7 @@ fn a_file_becomes_the_configuration() {
                 ipv4: Some((Ipv4Addr::new(192, 0, 2, 1), 24)),
                 ipv6: Vec::new(),
                 vrf: "default".into(),
+                vlan: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -50,6 +51,7 @@ fn a_file_becomes_the_configuration() {
                 ipv4: None,
                 ipv6: Vec::new(),
                 vrf: "default".into(),
+                vlan: None,
             },
         ]
     );
@@ -418,4 +420,57 @@ fn a_vrf_s_kernel_table_depends_only_on_its_name() {
     assert_eq!(table("red"), table("red"));
     assert_ne!(table("red"), table("blue"));
     assert!(table("red") >= 1_000);
+}
+
+#[test]
+fn vlan_sub_interfaces_are_read_and_checked() {
+    let lan = "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\n";
+    let config = parse(&format!(
+        "{lan}[[interface]]\nname = \"lan.10\"\nparent = \"lan\"\nvlan = 10\nipv4 = \"10.10.0.1/24\"\n"
+    ))
+    .unwrap();
+    assert_eq!(config.interfaces[1].vlan, Some(("lan".into(), 10)));
+    assert_eq!(config.interfaces[1].mac, [2, 0, 0, 0, 0, 1], "the parent's");
+    for (text, expected) in [
+        (
+            format!("{lan}[[interface]]\nname = \"x\"\nparent = \"lan\"\nvlan = 0\n"),
+            "1 to 4094",
+        ),
+        (
+            format!("{lan}[[interface]]\nname = \"x\"\nparent = \"nope\"\nvlan = 10\n"),
+            "must be an interface given before it",
+        ),
+        (
+            format!("{lan}[[interface]]\nname = \"x\"\nparent = \"lan\"\n"),
+            "parent and vlan together",
+        ),
+        (
+            format!(
+                "{lan}[[interface]]\nname = \"a\"\nparent = \"lan\"\nvlan = 10\n\
+                 [[interface]]\nname = \"b\"\nparent = \"lan\"\nvlan = 10\n"
+            ),
+            "given twice",
+        ),
+        (
+            "[[interface]]\nname = \"lan\"\n".to_owned(),
+            "mac is missing",
+        ),
+    ] {
+        let got = error(&text);
+        assert!(got.contains(expected), "{text:?}: {got}");
+    }
+}
+
+#[test]
+fn a_sub_interface_mtu_leaves_room_for_the_tag() {
+    let lan = "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\n";
+    let config = parse(&format!(
+        "{lan}[[interface]]\nname = \"lan.10\"\nparent = \"lan\"\nvlan = 10\n"
+    ))
+    .unwrap();
+    assert_eq!(config.interfaces[1].mtu, 1496);
+    let got = error(&format!(
+        "{lan}[[interface]]\nname = \"lan.10\"\nparent = \"lan\"\nvlan = 10\nmtu = 1500\n"
+    ));
+    assert!(got.contains("68 to 1496"), "{got}");
 }

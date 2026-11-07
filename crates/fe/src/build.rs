@@ -14,7 +14,7 @@ use std::net::IpAddr;
 
 use ruster_core::{
     IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route,
-    LocalIpv4Binding, MacAddress, Neighbor, Route, ValidatedForwardingOwner,
+    LocalIpv4Binding, MacAddress, Neighbor, Route, ValidatedForwardingOwner, VlanBinding,
 };
 use ruster_proto::session::Store;
 use ruster_proto::table::{network, Key, RouteAction, Value, DEFAULT_VRF};
@@ -33,8 +33,12 @@ pub(crate) struct Built {
     pub(crate) names: Vec<String>,
     /// For each port, the index in `vrfs` of its interface's VRF.
     pub(crate) by_ingress: Vec<u16>,
-    /// The enabled ports.
+    /// The enabled ports and sub-interfaces.
     pub(crate) active: Vec<IfId>,
+    /// The name of every interface by id: the ports, then the VLAN sub-interfaces.
+    pub(crate) interface_names: Vec<String>,
+    /// The VLAN sub-interfaces of enabled ports.
+    pub(crate) vlans: Vec<VlanBinding>,
 }
 
 /// One forwarding route before it becomes core's.
@@ -191,6 +195,54 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             }
         }
     }
+    // VLAN sub-interfaces of enabled ports get the ids after the ports, by name.
+    let mut interface_names: Vec<String> = ports.to_vec();
+    let mut vlans = Vec::new();
+    for (key, value) in store.iter() {
+        if let (
+            Key::Interface { name },
+            Value::Interface {
+                enabled: true,
+                mac,
+                mtu,
+                vrf,
+                vlan: Some(vlan),
+            },
+        ) = (key, value)
+        {
+            if ports.iter().any(|port| port == name) {
+                return Err(format!("VLAN sub-interface {name} has the name of a port"));
+            }
+            let parent = active.get(vlan.parent.as_str()).map(|&(id, _)| id);
+            let Some(parent) = parent.filter(|id| usize::from(id.0) < ports.len()) else {
+                continue;
+            };
+            if vlans
+                .iter()
+                .any(|b: &VlanBinding| b.parent == parent && b.vid == vlan.id)
+            {
+                return Err(format!(
+                    "VLAN {} on {} is given twice",
+                    vlan.id, vlan.parent
+                ));
+            }
+            let id = u16::try_from(interface_names.len())
+                .map(IfId)
+                .map_err(|_| "too many interfaces".to_owned())?;
+            interface_names.push(name.clone());
+            interfaces.push(Interface {
+                id,
+                mac: MacAddress(*mac),
+                mtu: *mtu,
+            });
+            vlans.push(VlanBinding {
+                parent,
+                vid: vlan.id,
+                sub: id,
+            });
+            active.insert(name.as_str(), (id, vrf.as_str()));
+        }
+    }
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
     for (key, _) in store.iter() {
         if let Key::Route { vrf, .. } = key {
@@ -320,7 +372,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             .map_err(|error| format!("{name}: IPv6: {error:?}"))?;
         vrfs.push(Vrf { owner, ipv6 });
     }
-    let by_ingress = (0..ports.len())
+    let by_ingress = (0..interface_names.len())
         .map(|index| {
             active
                 .values()
@@ -336,6 +388,8 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         names: order.iter().map(|v| (*v).to_owned()).collect(),
         by_ingress,
         active: enabled,
+        interface_names,
+        vlans,
     })
 }
 

@@ -43,6 +43,8 @@ pub struct InterfaceConfig {
     pub ipv6: Vec<(Ipv6Addr, u8)>,
     /// The VRF the interface belongs to; its connected routes are in it.
     pub vrf: String,
+    /// For a VLAN sub-interface: its parent interface and VLAN ID.
+    pub vlan: Option<(String, u16)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -261,7 +263,13 @@ impl Confd {
                     mac: interface.mac,
                     mtu: interface.mtu,
                     vrf: interface.vrf.clone(),
-                    vlan: None,
+                    vlan: interface
+                        .vlan
+                        .as_ref()
+                        .map(|(parent, id)| ruster_proto::table::Vlan {
+                            parent: parent.clone(),
+                            id: *id,
+                        }),
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);

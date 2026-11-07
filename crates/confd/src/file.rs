@@ -10,6 +10,12 @@
 //! ipv6 = ["2001:db8:1::1/64"]  # optional; a link-local address is added by itself
 //! vrf = "red"                  # optional, "default" when left out
 //!
+//! [[interface]]                # a VLAN sub-interface of lan, after lan
+//! name = "lan.10"
+//! parent = "lan"
+//! vlan = 10                    # 1 to 4094; mac is lan's when left out
+//! ipv4 = "10.10.0.1/24"
+//!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
 //! interface = "wan"
@@ -66,9 +72,12 @@ struct File {
 #[serde(deny_unknown_fields)]
 struct InterfaceEntry {
     name: String,
-    mac: String,
-    #[serde(default = "default_mtu")]
-    mtu: u16,
+    /// Optional for a VLAN sub-interface, which then has its parent's.
+    mac: Option<String>,
+    parent: Option<String>,
+    vlan: Option<u16>,
+    /// 1500 when left out; for a sub-interface, its parent's less the 4-byte tag.
+    mtu: Option<u16>,
     #[serde(default = "default_enabled")]
     enabled: bool,
     ipv4: Option<String>,
@@ -178,13 +187,52 @@ pub fn parse(text: &str) -> Result<Config, String> {
             return Err(format!("{at}: vrf must not be empty"));
         }
         seen.vrf_of.insert(entry.name.clone(), entry.vrf.clone());
-        let mac =
-            mac(&entry.mac).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?;
+        let vlan = match (&entry.parent, entry.vlan) {
+            (Some(parent), Some(id)) => {
+                if !(1..=4094).contains(&id) {
+                    return Err(format!("{at}: vlan must be 1 to 4094"));
+                }
+                let Some(parent_entry) = interfaces
+                    .iter()
+                    .find(|i: &&InterfaceConfig| i.name == *parent && i.vlan.is_none())
+                else {
+                    return Err(format!(
+                        "{at}: parent {parent:?} must be an interface given before it, not a VLAN"
+                    ));
+                };
+                let taken = interfaces
+                    .iter()
+                    .any(|i| i.vlan.as_ref() == Some(&(parent.clone(), id)));
+                if taken {
+                    return Err(format!("{at}: vlan {id} on {parent:?} is given twice"));
+                }
+                Some((parent.clone(), id, parent_entry.mac))
+            }
+            (None, None) => None,
+            _ => return Err(format!("{at}: give parent and vlan together")),
+        };
+        let mac = match (&entry.mac, &vlan) {
+            (Some(text), _) => {
+                mac(text).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?
+            }
+            (None, Some((_, _, parent_mac))) => *parent_mac,
+            (None, None) => return Err(format!("{at}: mac is missing")),
+        };
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(format!("{at}: mac must be a unicast address"));
         }
-        if !(MIN_MTU..=MAX_MTU).contains(&entry.mtu) {
-            return Err(format!("{at}: mtu must be {MIN_MTU} to {MAX_MTU}"));
+        // A sub-interface's frames carry a 4-byte tag on its parent's link.
+        let max_mtu = vlan
+            .as_ref()
+            .and_then(|(parent, _, _)| interfaces.iter().find(|i| i.name == *parent))
+            .map_or(MAX_MTU, |parent| parent.mtu - 4);
+        let mtu = match (entry.mtu, &vlan) {
+            (Some(mtu), _) => mtu,
+            (None, Some(_)) => max_mtu,
+            (None, None) => default_mtu(),
+        };
+        if !(MIN_MTU..=max_mtu).contains(&mtu) {
+            return Err(format!("{at}: mtu must be {MIN_MTU} to {max_mtu}"));
         }
         let ipv4 = match &entry.ipv4 {
             Some(text) => {
@@ -223,11 +271,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
         interfaces.push(InterfaceConfig {
             name: entry.name,
             mac,
-            mtu: entry.mtu,
+            mtu,
             enabled: entry.enabled,
             ipv4,
             ipv6,
             vrf: entry.vrf,
+            vlan: vlan.map(|(parent, id, _)| (parent, id)),
         });
     }
     let mut static_routes = Vec::with_capacity(file.route.len());

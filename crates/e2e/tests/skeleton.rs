@@ -40,6 +40,7 @@ fn config() -> Config {
                 ipv4: Some((Ipv4Addr::from(LAN_IP), 24)),
                 ipv6: Vec::new(),
                 vrf: "default".into(),
+                vlan: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -49,6 +50,7 @@ fn config() -> Config {
                 ipv4: Some((Ipv4Addr::from(WAN_IP), 24)),
                 ipv6: Vec::new(),
                 vrf: "default".into(),
+                vlan: None,
             },
         ],
         static_routes: vec![StaticRoute {
