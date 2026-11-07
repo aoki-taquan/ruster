@@ -60,6 +60,15 @@ pub enum Key {
         interface: String,
         address: IpAddr,
     },
+    /// The NAT of a VRF (one per VRF).
+    Nat {
+        vrf: String,
+    },
+    /// One forward firewall rule of a VRF; lower ids are matched first.
+    FirewallRule {
+        vrf: String,
+        id: u32,
+    },
 }
 
 /// The value of one entry.
@@ -82,6 +91,51 @@ pub enum Value {
     Neighbor {
         mac: [u8; 6],
     },
+    Nat(Nat),
+    FirewallRule(FirewallRule),
+}
+
+/// Source NAPT44 (`ietf-nat` type `napt44`): traffic from `inside` leaving through
+/// `outside` gets the `external` address (the outside interface's IPv4 address when
+/// `None`) and a port from `first_port..=last_port`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Nat {
+    pub inside: String,
+    pub outside: String,
+    pub external: Option<std::net::Ipv4Addr>,
+    pub first_port: u16,
+    pub last_port: u16,
+}
+
+/// The protocols a firewall rule matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+/// What a firewall rule does: let the flow through and track it (its replies pass
+/// too), or drop it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FirewallAction {
+    Accept,
+    Drop,
+}
+
+/// One forward rule (`ietf-access-control-list` matches, stateful by `ruster-firewall`).
+/// A VRF with any rule drops what no rule accepts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FirewallRule {
+    /// `None` for any interface.
+    pub ingress: Option<String>,
+    pub egress: Option<String>,
+    pub source: (std::net::Ipv4Addr, u8),
+    pub destination: (std::net::Ipv4Addr, u8),
+    pub protocol: Protocol,
+    pub source_ports: (u16, u16),
+    pub destination_ports: (u16, u16),
+    pub action: FirewallAction,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -130,6 +184,8 @@ impl Key {
             Self::Address { .. } => sid::ADDRESS,
             Self::Route { .. } => sid::ROUTE,
             Self::Neighbor { .. } => sid::NEIGHBOR,
+            Self::Nat { .. } => sid::NAT,
+            Self::FirewallRule { .. } => sid::FIREWALL_RULE,
         }
     }
 }
@@ -194,6 +250,7 @@ impl Change {
         };
         match &self.key {
             Key::Interface { name: n } => name(n)?,
+            Key::Nat { vrf } | Key::FirewallRule { vrf, .. } => name(vrf)?,
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
@@ -209,6 +266,8 @@ impl Change {
                         | (Key::Address { .. }, Value::Address { .. })
                         | (Key::Route { .. }, Value::Route(_))
                         | (Key::Neighbor { .. }, Value::Neighbor { .. })
+                        | (Key::Nat { .. }, Value::Nat(_))
+                        | (Key::FirewallRule { .. }, Value::FirewallRule(_))
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -232,6 +291,29 @@ impl Change {
                         }
                     }
                     Value::Route(RouteAction::LookupVrf(vrf)) => name(vrf)?,
+                    Value::Nat(nat) => {
+                        name(&nat.inside)?;
+                        name(&nat.outside)?;
+                        if nat.inside == nat.outside {
+                            return Err(ModelError::Invalid("NAT inside equals outside"));
+                        }
+                        if nat.first_port == 0 || nat.first_port > nat.last_port {
+                            return Err(ModelError::Invalid("NAT port range"));
+                        }
+                    }
+                    Value::FirewallRule(rule) => {
+                        for interface in [&rule.ingress, &rule.egress].into_iter().flatten() {
+                            name(interface)?;
+                        }
+                        for (address, len) in [rule.source, rule.destination] {
+                            parse_prefix(&format!("{address}/{len}"))?;
+                        }
+                        for (first, last) in [rule.source_ports, rule.destination_ports] {
+                            if first > last {
+                                return Err(ModelError::Invalid("firewall port range"));
+                            }
+                        }
+                    }
                     Value::Address { prefix_len } => {
                         let Key::Address { address, .. } = &self.key else {
                             unreachable!("checked above");
@@ -316,6 +398,15 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
                 .text(interface)
                 .text(&address.to_string());
         }
+        Key::Nat { vrf } => {
+            e.array(2).u64(sid::NAT).text(vrf);
+        }
+        Key::FirewallRule { vrf, id } => {
+            e.array(3)
+                .u64(sid::FIREWALL_RULE)
+                .text(vrf)
+                .u64(u64::from(*id));
+        }
     }
 }
 
@@ -323,8 +414,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     let len = d.array()?;
     let table = d.u64()?;
     let expected = match table {
-        sid::INTERFACE => 2,
-        sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR => 3,
+        sid::INTERFACE | sid::NAT => 2,
+        sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
     if len != expected {
@@ -336,6 +427,11 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     }
     Ok(match table {
         sid::INTERFACE => Key::Interface { name: first },
+        sid::NAT => Key::Nat { vrf: first },
+        sid::FIREWALL_RULE => Key::FirewallRule {
+            vrf: first,
+            id: u32::try_from(d.u64()?).map_err(|_| ModelError::Invalid("rule id"))?,
+        },
         sid::ADDRESS => Key::Address {
             interface: first,
             address: parse_ip(d.text()?)?,
@@ -425,10 +521,62 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::NEIGHBOR_LINK_LAYER_ADDRESS - sid::NEIGHBOR)
                 .text(&format_mac(mac));
         }
+        Value::Nat(nat) => {
+            let d = |member: u64| member - sid::NAT;
+            e.map(4 + u64::from(nat.external.is_some()))
+                .u64(d(sid::NAT_INSIDE))
+                .text(&nat.inside)
+                .u64(d(sid::NAT_OUTSIDE))
+                .text(&nat.outside)
+                .u64(d(sid::NAT_FIRST_PORT))
+                .u64(u64::from(nat.first_port))
+                .u64(d(sid::NAT_LAST_PORT))
+                .u64(u64::from(nat.last_port));
+            if let Some(external) = nat.external {
+                e.u64(d(sid::NAT_EXTERNAL)).text(&external.to_string());
+            }
+        }
+        Value::FirewallRule(rule) => {
+            let d = |member: u64| member - sid::FIREWALL_RULE;
+            let members = 8 + u64::from(rule.ingress.is_some()) + u64::from(rule.egress.is_some());
+            e.map(members)
+                .u64(d(sid::FIREWALL_SOURCE))
+                .text(&format!("{}/{}", rule.source.0, rule.source.1))
+                .u64(d(sid::FIREWALL_DESTINATION))
+                .text(&format!("{}/{}", rule.destination.0, rule.destination.1))
+                .u64(d(sid::FIREWALL_PROTOCOL))
+                .text(match rule.protocol {
+                    Protocol::Tcp => "tcp",
+                    Protocol::Udp => "udp",
+                    Protocol::Icmp => "icmp",
+                })
+                .u64(d(sid::FIREWALL_SOURCE_PORT_LOW))
+                .u64(u64::from(rule.source_ports.0))
+                .u64(d(sid::FIREWALL_SOURCE_PORT_HIGH))
+                .u64(u64::from(rule.source_ports.1))
+                .u64(d(sid::FIREWALL_DESTINATION_PORT_LOW))
+                .u64(u64::from(rule.destination_ports.0))
+                .u64(d(sid::FIREWALL_DESTINATION_PORT_HIGH))
+                .u64(u64::from(rule.destination_ports.1))
+                .u64(d(sid::FIREWALL_ACTION))
+                .text(match rule.action {
+                    FirewallAction::Accept => "accept",
+                    FirewallAction::Drop => "drop",
+                });
+            if let Some(ingress) = &rule.ingress {
+                e.u64(d(sid::FIREWALL_INGRESS)).text(ingress);
+            }
+            if let Some(egress) = &rule.egress {
+                e.u64(d(sid::FIREWALL_EGRESS)).text(egress);
+            }
+        }
     }
 }
 
 fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
+    if table == sid::NAT || table == sid::FIREWALL_RULE {
+        return decode_policy_value(table, d);
+    }
     let members = d.map()?;
     let mut enabled = None;
     let mut mac = None;
@@ -684,5 +832,130 @@ impl ResolveRequest {
             interface: interface.ok_or(ModelError::Missing("interface"))?,
             address: address.ok_or(ModelError::Missing("address"))?,
         })
+    }
+}
+
+/// A member of a NAT or firewall value: text or an unsigned integer.
+enum Member {
+    Text(String),
+    Uint(u64),
+}
+
+fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
+    let members = d.map()?;
+    let mut got: std::collections::BTreeMap<u64, Member> = std::collections::BTreeMap::new();
+    for _ in 0..members {
+        let member = table
+            .checked_add(d.u64()?)
+            .ok_or(ModelError::Invalid("member SID"))?;
+        let value = match d.peek_kind()? {
+            Kind::Text => Member::Text(d.text()?.to_owned()),
+            Kind::Unsigned => Member::Uint(d.u64()?),
+            _ => return Err(ModelError::Invalid("member value")),
+        };
+        if got.insert(member, value).is_some() {
+            return Err(ModelError::Invalid("duplicate member"));
+        }
+    }
+    let mut text = |sid: u64, what: &'static str| match got.remove(&sid) {
+        Some(Member::Text(t)) => Ok(Some(t)),
+        Some(Member::Uint(_)) => Err(ModelError::Invalid(what)),
+        None => Ok(None),
+    };
+    let value = if table == sid::NAT {
+        let inside = text(sid::NAT_INSIDE, "inside")?.ok_or(ModelError::Missing("inside"))?;
+        let outside = text(sid::NAT_OUTSIDE, "outside")?.ok_or(ModelError::Missing("outside"))?;
+        let external = match text(sid::NAT_EXTERNAL, "external")? {
+            Some(t) => Some(
+                t.parse()
+                    .map_err(|_| ModelError::Invalid("external address"))?,
+            ),
+            None => None,
+        };
+        let first_port =
+            port(&mut got, sid::NAT_FIRST_PORT)?.ok_or(ModelError::Missing("first port"))?;
+        let last_port =
+            port(&mut got, sid::NAT_LAST_PORT)?.ok_or(ModelError::Missing("last port"))?;
+        Value::Nat(Nat {
+            inside,
+            outside,
+            external,
+            first_port,
+            last_port,
+        })
+    } else {
+        let ingress = text(sid::FIREWALL_INGRESS, "ingress")?;
+        let egress = text(sid::FIREWALL_EGRESS, "egress")?;
+        let prefix4 = |t: Option<String>,
+                       what: &'static str|
+         -> Result<(std::net::Ipv4Addr, u8), ModelError> {
+            let t = t.ok_or(ModelError::Missing(what))?;
+            match parse_prefix(&t)? {
+                (IpAddr::V4(a), len) => Ok((a, len)),
+                _ => Err(ModelError::Invalid(what)),
+            }
+        };
+        let source = prefix4(text(sid::FIREWALL_SOURCE, "source")?, "source")?;
+        let destination = prefix4(
+            text(sid::FIREWALL_DESTINATION, "destination")?,
+            "destination",
+        )?;
+        let protocol = match text(sid::FIREWALL_PROTOCOL, "protocol")?.as_deref() {
+            Some("tcp") => Protocol::Tcp,
+            Some("udp") => Protocol::Udp,
+            Some("icmp") => Protocol::Icmp,
+            _ => return Err(ModelError::Invalid("protocol")),
+        };
+        let action = match text(sid::FIREWALL_ACTION, "action")?.as_deref() {
+            Some("accept") => FirewallAction::Accept,
+            Some("drop") => FirewallAction::Drop,
+            _ => return Err(ModelError::Invalid("action")),
+        };
+        let range = |got: &mut std::collections::BTreeMap<u64, Member>,
+                     low,
+                     high|
+         -> Result<(u16, u16), ModelError> {
+            Ok((
+                port(got, low)?.ok_or(ModelError::Missing("port"))?,
+                port(got, high)?.ok_or(ModelError::Missing("port"))?,
+            ))
+        };
+        let source_ports = range(
+            &mut got,
+            sid::FIREWALL_SOURCE_PORT_LOW,
+            sid::FIREWALL_SOURCE_PORT_HIGH,
+        )?;
+        let destination_ports = range(
+            &mut got,
+            sid::FIREWALL_DESTINATION_PORT_LOW,
+            sid::FIREWALL_DESTINATION_PORT_HIGH,
+        )?;
+        Value::FirewallRule(FirewallRule {
+            ingress,
+            egress,
+            source,
+            destination,
+            protocol,
+            source_ports,
+            destination_ports,
+            action,
+        })
+    };
+    if let Some((&unknown, _)) = got.iter().next() {
+        return Err(ModelError::UnknownMember(unknown));
+    }
+    Ok(value)
+}
+
+fn port(
+    got: &mut std::collections::BTreeMap<u64, Member>,
+    sid: u64,
+) -> Result<Option<u16>, ModelError> {
+    match got.remove(&sid) {
+        Some(Member::Uint(n)) => u16::try_from(n)
+            .map(Some)
+            .map_err(|_| ModelError::Invalid("port")),
+        Some(Member::Text(_)) => Err(ModelError::Invalid("port")),
+        None => Ok(None),
     }
 }

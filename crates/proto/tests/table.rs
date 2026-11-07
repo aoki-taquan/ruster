@@ -582,3 +582,64 @@ fn vlan_sub_interfaces_round_trip_and_are_checked() {
         assert!(bad.validate().is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn nat_and_firewall_entries_round_trip_and_are_checked() {
+    use ruster_proto::table::{FirewallAction, FirewallRule, Nat, Protocol};
+    let nat = |inside: &str, first: u16, last: u16| {
+        Change::set(
+            Key::Nat {
+                vrf: "default".into(),
+            },
+            Value::Nat(Nat {
+                inside: inside.into(),
+                outside: "wan".into(),
+                external: None,
+                first_port: first,
+                last_port: last,
+            }),
+        )
+    };
+    let rule = |source_ports: (u16, u16), ingress: Option<&str>| {
+        Change::set(
+            Key::FirewallRule {
+                vrf: "default".into(),
+                id: 10,
+            },
+            Value::FirewallRule(FirewallRule {
+                ingress: ingress.map(Into::into),
+                egress: Some("wan".into()),
+                source: (Ipv4Addr::new(10, 0, 0, 0), 8),
+                destination: (Ipv4Addr::UNSPECIFIED, 0),
+                protocol: Protocol::Tcp,
+                source_ports,
+                destination_ports: (443, 443),
+                action: FirewallAction::Accept,
+            }),
+        )
+    };
+    let mut with_external = nat("lan", 1024, 65535);
+    if let Some(Value::Nat(n)) = &mut with_external.value {
+        n.external = Some(Ipv4Addr::new(203, 0, 113, 10));
+    }
+    for change in [
+        nat("lan", 1024, 65535),
+        with_external,
+        rule((1, 65535), Some("lan")),
+        rule((0, 65535), None),
+        Change::delete(Key::FirewallRule {
+            vrf: "red".into(),
+            id: 7,
+        }),
+    ] {
+        assert_eq!(round_trip(&change), change);
+    }
+    for bad in [
+        nat("wan", 1024, 65535),
+        nat("lan", 0, 10),
+        nat("lan", 20, 10),
+        rule((10, 1), None),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}

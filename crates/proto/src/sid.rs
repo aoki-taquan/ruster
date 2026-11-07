@@ -38,6 +38,27 @@ pub const ROUTE_LOOKUP_VRF: u64 = 60038;
 pub const NEIGHBOR: u64 = 60040;
 pub const NEIGHBOR_LINK_LAYER_ADDRESS: u64 = 60041;
 
+/// `ietf-nat` instance of a VRF (`napt44`).
+pub const NAT: u64 = 60060;
+pub const NAT_INSIDE: u64 = 60061;
+pub const NAT_OUTSIDE: u64 = 60062;
+pub const NAT_EXTERNAL: u64 = 60063;
+pub const NAT_FIRST_PORT: u64 = 60064;
+pub const NAT_LAST_PORT: u64 = 60065;
+
+/// One forward firewall rule (`ietf-access-control-list` ace, `ruster-firewall`).
+pub const FIREWALL_RULE: u64 = 60070;
+pub const FIREWALL_INGRESS: u64 = 60071;
+pub const FIREWALL_EGRESS: u64 = 60072;
+pub const FIREWALL_SOURCE: u64 = 60073;
+pub const FIREWALL_DESTINATION: u64 = 60074;
+pub const FIREWALL_PROTOCOL: u64 = 60075;
+pub const FIREWALL_SOURCE_PORT_LOW: u64 = 60076;
+pub const FIREWALL_SOURCE_PORT_HIGH: u64 = 60077;
+pub const FIREWALL_DESTINATION_PORT_LOW: u64 = 60078;
+pub const FIREWALL_DESTINATION_PORT_HIGH: u64 = 60079;
+pub const FIREWALL_ACTION: u64 = 60080;
+
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
 pub const RESOLVE_REQUEST_INTERFACE: u64 = 60051;
@@ -97,6 +118,23 @@ pub const ALL: &[(&str, u64)] = &[
         "/ruster-neighbor:neighbors/neighbor/link-layer-address",
         NEIGHBOR_LINK_LAYER_ADDRESS,
     ),
+    ("/ietf-nat:nat/instances/instance", NAT),
+    ("/ietf-nat:nat/instances/instance/ruster-nat:inside-interface", NAT_INSIDE),
+    ("/ietf-nat:nat/instances/instance/ruster-nat:outside-interface", NAT_OUTSIDE),
+    ("/ietf-nat:nat/instances/instance/policy/external-ip-address-pool/external-ip-pool", NAT_EXTERNAL),
+    ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-range/start-port-number", NAT_FIRST_PORT),
+    ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-range/end-port-number", NAT_LAST_PORT),
+    ("/ietf-access-control-list:acls/acl/aces/ace", FIREWALL_RULE),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/ingress-interface", FIREWALL_INGRESS),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/egress-interface", FIREWALL_EGRESS),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/ipv4/source-ipv4-network", FIREWALL_SOURCE),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/ipv4/destination-ipv4-network", FIREWALL_DESTINATION),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/ipv4/protocol", FIREWALL_PROTOCOL),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/source-port/lower-port", FIREWALL_SOURCE_PORT_LOW),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/source-port/upper-port", FIREWALL_SOURCE_PORT_HIGH),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/lower-port", FIREWALL_DESTINATION_PORT_LOW),
+    ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/upper-port", FIREWALL_DESTINATION_PORT_HIGH),
+    ("/ietf-access-control-list:acls/acl/aces/ace/actions/forwarding", FIREWALL_ACTION),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",
