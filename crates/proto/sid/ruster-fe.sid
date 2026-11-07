@@ -127,6 +127,108 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance",
+        "sid": 60060,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/ruster-nat:inside-interface",
+        "sid": 60061,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/ruster-nat:outside-interface",
+        "sid": 60062,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/external-ip-address-pool/external-ip-pool",
+        "sid": 60063,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-range/start-port-number",
+        "sid": 60064,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-range/end-port-number",
+        "sid": 60065,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace",
+        "sid": 60070,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/ingress-interface",
+        "sid": 60071,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/egress-interface",
+        "sid": 60072,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/ipv4/source-ipv4-network",
+        "sid": 60073,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/ipv4/destination-ipv4-network",
+        "sid": 60074,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/ipv4/protocol",
+        "sid": 60075,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/l4/source-port/lower-port",
+        "sid": 60076,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/l4/source-port/upper-port",
+        "sid": 60077,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/lower-port",
+        "sid": 60078,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/upper-port",
+        "sid": 60079,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-access-control-list:acls/acl/aces/ace/actions/forwarding",
+        "sid": 60080,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"
