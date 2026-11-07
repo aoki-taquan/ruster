@@ -1474,3 +1474,219 @@ fn a_route_to_a_pppoe_interface_sends_in_its_session() {
     assert_eq!(u16::from_be_bytes([buf[26], buf[27]]), 1492);
     let _ = n;
 }
+
+mod wireguard {
+    use super::*;
+    use ruster_core::wireguard::{
+        decapsulate, encapsulate, AllowedPrefix, InterfaceConfig, PeerConfig, PeerState, Received,
+        SessionKeys,
+    };
+    use ruster_proto::table::{Wireguard, WireguardPeer, WireguardSession};
+
+    const ENDPOINT: [u8; 4] = [203, 0, 113, 9];
+    const ROUTER: [u8; 4] = [198, 51, 100, 2];
+
+    fn session() -> Change {
+        Change::set(
+            Key::WireguardSession {
+                interface: "wg0".into(),
+                peer: "branch".into(),
+            },
+            Value::WireguardSession(WireguardSession {
+                send: [1; 32],
+                receive: [2; 32],
+                peer_index: 22,
+                local_index: 11,
+            }),
+        )
+    }
+
+    /// The router with a WireGuard interface `wg0` to a peer behind 10.9.0.0/16.
+    fn setup(bench: &mut Bench, with_session: bool) {
+        let (mut config, mut routes) = configure(bench);
+        let mut neighbors = bench.connect(writers::NEIGHBOR);
+        assert_eq!(
+            bench.patch(
+                &mut neighbors,
+                &[
+                    neighbor("wan", GATEWAY, GATEWAY_MAC),
+                    neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+                ],
+            ),
+            Code::CHANGED
+        );
+        let mut changes = vec![
+            Change::set(
+                Key::Interface { name: "wg0".into() },
+                Value::Interface {
+                    enabled: true,
+                    mac: [2, 0, 0, 0, 0, 9],
+                    mtu: 1420,
+                    vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                    vlan: None,
+                    tunnel: None,
+                    pppoe: None,
+                },
+            ),
+            Change::set(
+                Key::Wireguard {
+                    interface: "wg0".into(),
+                },
+                Value::Wireguard(Wireguard {
+                    listen_port: 51820,
+                    local: Ipv4Addr::from(ROUTER),
+                }),
+            ),
+            Change::set(
+                Key::WireguardPeer {
+                    interface: "wg0".into(),
+                    peer: "branch".into(),
+                },
+                Value::WireguardPeer(WireguardPeer {
+                    endpoint: Ipv4Addr::from(ENDPOINT),
+                    port: 51821,
+                    allowed: vec![(Ipv4Addr::new(10, 9, 0, 0), 16)],
+                }),
+            ),
+        ];
+        if with_session {
+            changes.push(session());
+        }
+        assert_eq!(bench.patch(&mut config, &changes), Code::CHANGED);
+        assert_eq!(
+            bench.patch(&mut routes, &[route([10, 9, 0, 0], 16, "wg0", None)]),
+            Code::CHANGED
+        );
+    }
+
+    /// The peer's end of the session, as the daemon on the other router has it.
+    struct Remote {
+        allowed: Vec<AllowedPrefix>,
+        state: Vec<PeerState>,
+    }
+
+    impl Remote {
+        fn new() -> Self {
+            let mut state = vec![PeerState::default()];
+            state[0].set_keys(SessionKeys {
+                send: [2; 32],
+                receive: [1; 32],
+                peer_index: 11,
+                local_index: 22,
+            });
+            Self {
+                allowed: vec![AllowedPrefix {
+                    address: [192, 0, 2, 0],
+                    len: 24,
+                }],
+                state,
+            }
+        }
+    }
+
+    fn remote_config<'a>(peers: &'a [PeerConfig<'a>]) -> InterfaceConfig<'a> {
+        InterfaceConfig {
+            local: ENDPOINT,
+            listen_port: 51821,
+            peers,
+        }
+    }
+
+    fn peer_of(allowed: &[AllowedPrefix]) -> [PeerConfig<'_>; 1] {
+        [PeerConfig {
+            endpoint: ROUTER,
+            endpoint_port: 51820,
+            allowed,
+        }]
+    }
+
+    fn inner(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
+        let mut p = vec![0_u8; 40];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&40_u16.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&source);
+        p[16..20].copy_from_slice(&destination);
+        let checksum = ipv4_header_checksum(&p[..20]);
+        p[10..12].copy_from_slice(&checksum.to_be_bytes());
+        p
+    }
+
+    #[test]
+    fn a_route_to_a_wireguard_interface_sends_sealed_to_the_peer() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), udp_from_host([10, 9, 0, 5]));
+        bench.fe.step(bench.now);
+        let tx = bench.fe.io_mut().pop_tx().expect("sent");
+        assert_eq!(tx.egress, IfId(1));
+        assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+        assert_eq!(&tx.bytes[6..12], &WAN_MAC);
+        assert_eq!(&tx.bytes[26..30], &ROUTER);
+        assert_eq!(&tx.bytes[30..34], &ENDPOINT);
+        assert_eq!(&tx.bytes[34..36], &51820_u16.to_be_bytes());
+        assert_eq!(&tx.bytes[36..38], &51821_u16.to_be_bytes());
+        assert_eq!(bench.fe.counters().wireguard_sent, 1);
+
+        let mut remote = Remote::new();
+        let peers = peer_of(&remote.allowed);
+        let config = remote_config(&peers);
+        let mut wire = tx.bytes[14..].to_vec();
+        let got = decapsulate(&config, &mut remote.state, &mut wire).unwrap();
+        let Received::Data { inner, .. } = got else {
+            panic!("{got:?}")
+        };
+        assert_eq!(&wire[inner.start + 16..inner.start + 20], &[10, 9, 0, 5]);
+        assert_eq!(wire[inner.start + 8], 63, "one hop on");
+    }
+
+    #[test]
+    fn a_sealed_packet_from_the_peer_is_opened_and_forwarded() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        let mut remote = Remote::new();
+        let peers = peer_of(&remote.allowed);
+        let config = remote_config(&peers);
+        let mut out = vec![0_u8; 14 + 28 + 16 + 64 + 16];
+        let packet = inner([10, 9, 0, 7], [192, 0, 2, 10]);
+        let (_, len) = encapsulate(&config, &mut remote.state, &packet, &mut out[14..]).unwrap();
+        out.truncate(14 + len);
+        out[0..6].copy_from_slice(&WAN_MAC);
+        out[6..12].copy_from_slice(&GATEWAY_MAC);
+        out[12..14].copy_from_slice(&[0x08, 0x00]);
+        bench.fe.io_mut().inject(IfId(1), out);
+        bench.fe.step(bench.now);
+        let tx = bench.fe.io_mut().pop_tx().expect("forwarded");
+        assert_eq!(tx.egress, IfId(0));
+        assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+        assert_eq!(&tx.bytes[26..30], &[10, 9, 0, 7]);
+        assert_eq!(tx.bytes[22], 63);
+        assert_eq!(tx.bytes.len(), 14 + 40);
+    }
+
+    #[test]
+    fn without_a_session_nothing_is_sent_and_a_later_session_starts_it() {
+        let mut bench = Bench::new();
+        setup(&mut bench, false);
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), udp_from_host([10, 9, 0, 5]));
+        bench.fe.step(bench.now);
+        assert!(bench.fe.io_mut().pop_tx().is_none());
+        assert_eq!(bench.fe.counters().wireguard_sent, 0);
+
+        let mut config = bench.connect(writers::CONFIG);
+        assert_eq!(bench.patch(&mut config, &[session()]), Code::CHANGED);
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), udp_from_host([10, 9, 0, 5]));
+        bench.fe.step(bench.now);
+        assert!(bench.fe.io_mut().pop_tx().is_some());
+    }
+}
