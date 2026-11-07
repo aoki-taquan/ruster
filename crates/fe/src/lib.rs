@@ -32,7 +32,7 @@ use ruster_core::{
     execute_one_icmpv4_error, forward_batch_with_control, ArpOpcode, ControlKind, ControlQueue,
     GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
     Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
-    MonotonicMillis, PacketIo, TraceEvent, TraceSink, VlanBinding,
+    MonotonicMillis, PacketIo, Services, TraceEvent, TraceSink, VlanBinding,
 };
 use ruster_proto::cbor::Encoder;
 use ruster_proto::punt::{self, Direction, Punt};
@@ -235,6 +235,7 @@ where
             })
             .collect();
         let snapshot = snapshots[0]
+            .with_now(MonotonicMillis(now_ms))
             .with_vrfs(&snapshots, &self.by_ingress)
             .with_vlans(&self.vlans);
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
@@ -247,7 +248,10 @@ where
             batch,
             &snapshot,
             &mut self.control,
-            Some((&mut self.icmpv4_errors, now)),
+            Services {
+                icmpv4_errors: Some(&mut self.icmpv4_errors),
+                ..Services::default()
+            },
             &mut trace,
         );
         if report.received == 0 {

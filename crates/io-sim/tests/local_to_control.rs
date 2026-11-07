@@ -4,7 +4,7 @@
 use ruster_core::{
     forward_batch_with_control, ipv4_header_checksum, ConsumeReason, ControlKind, ControlQueue,
     ForwardingSnapshot, IfId, Interface, Ipv4Address, Ipv6Fib, Ipv6Local, LocalIpv4Binding,
-    MacAddress, NoTrace, PacketIo,
+    MacAddress, NoTrace, PacketIo, Services,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 
@@ -90,7 +90,13 @@ fn run(local_to_control: bool, frames: &[Vec<u8>]) -> (SimIo, ControlQueue) {
     }
     let mut queue = ControlQueue::new(8);
     let batch = io.receive(16).unwrap();
-    forward_batch_with_control(batch, &snapshot, &mut queue, None, &mut NoTrace);
+    forward_batch_with_control(
+        batch,
+        &snapshot,
+        &mut queue,
+        Services::default(),
+        &mut NoTrace,
+    );
     (io, queue)
 }
 

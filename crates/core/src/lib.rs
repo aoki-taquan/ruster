@@ -82,7 +82,7 @@ pub use forwarding::{
     forward_batch_with_nat44_udp_and_tcp_and_icmpv4_errors, forward_batch_with_resolution,
     forward_batch_with_resolution_and_icmpv4_errors, replay_arp_holds, ArpPolicy, BatchReport,
     DropReason, ForwardingSnapshot, Ipv4OriginPolicy, Ipv4OriginPolicyError,
-    Nat44Icmpv4Disposition, NoTrace, SnapshotError, TraceEvent, TraceSink,
+    Nat44Icmpv4Disposition, NoTrace, Services, SnapshotError, TraceEvent, TraceSink,
     ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 pub use generated::{

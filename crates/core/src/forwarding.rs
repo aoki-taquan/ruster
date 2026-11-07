@@ -1268,6 +1268,9 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) ipv6: Option<&'a crate::Ipv6Fib>,
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
     pub(crate) vlans: &'a [crate::VlanBinding],
+    /// The time NAT, firewall and ICMP limits count by when no ARP resolution
+    /// runtime gives one ([`ForwardingSnapshot::with_now`]).
+    pub(crate) now: MonotonicMillis,
     /// Per-VRF snapshots and which one each ingress interface uses
     /// ([`ForwardingSnapshot::with_vrfs`]).
     vrfs: Option<VrfSnapshots<'a>>,
@@ -1475,6 +1478,7 @@ impl<'a> ForwardingSnapshot<'a> {
             local_to_control: false,
             ipv6: None,
             vlans: &[],
+            now: MonotonicMillis(0),
             vrfs: None,
             index: None,
             authority: calculate_snapshot_authority(
@@ -1586,6 +1590,13 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub fn with_vlans(self, vlans: &'a [crate::VlanBinding]) -> Self {
         Self { vlans, ..self }
+    }
+
+    /// The time of this batch, for NAT, firewall and ICMP error state when no ARP
+    /// resolution runtime is given.
+    #[must_use]
+    pub fn with_now(self, now: MonotonicMillis) -> Self {
+        Self { now, ..self }
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1769,6 +1780,7 @@ impl<'a> ForwardingSnapshot<'a> {
             local_to_control: false,
             ipv6: None,
             vlans: &[],
+            now: MonotonicMillis(0),
             vrfs: None,
             authority,
             ..self
@@ -2168,6 +2180,7 @@ impl ValidatedForwardingOwner {
             local_to_control: false,
             ipv6: None,
             vlans: &[],
+            now: MonotonicMillis(0),
             vrfs: None,
             index: Some(&self.index),
             authority: self.authority,
@@ -2920,26 +2933,39 @@ pub fn forward_batch_with_control<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
     control: &mut crate::ControlQueue,
-    icmpv4_errors: Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    services: Services<'_, '_, '_>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
     B: PacketBatch,
     T: TraceSink,
 {
+    let now = snapshot.now;
+    let (udp_config, udp) = services
+        .nat44_udp
+        .map_or((None, None), |(c, r)| (Some(c), Some(r)));
+    let (tcp_config, tcp) = services
+        .nat44_tcp
+        .map_or((None, None), |(c, r)| (Some(c), Some(r)));
+    let (icmp_config, icmp) = services
+        .nat44_icmp
+        .map_or((None, None), |(c, r)| (Some(c), Some(r)));
+    let (firewall_config, firewall) = services
+        .firewall
+        .map_or((None, None), |(c, r)| (Some(c), Some(r)));
     forward_batch_tracked(
         batch,
         snapshot,
         None,
-        icmpv4_errors,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
+        services.icmpv4_errors.map(|runtime| (runtime, now)),
+        udp_config,
+        udp,
+        tcp_config,
+        tcp,
+        icmp_config,
+        icmp,
+        firewall_config,
+        firewall,
         None,
         None,
         None,
@@ -2947,6 +2973,18 @@ where
         Some(control),
         trace,
     )
+}
+
+/// The stateful services [`forward_batch_with_control`] runs with each packet. Each
+/// is optional; a NAT or firewall runtime comes with the configuration it was made
+/// for. Their clock is the snapshot's ([`ForwardingSnapshot::with_now`]).
+#[derive(Default)]
+pub struct Services<'s, 'c, 'r> {
+    pub icmpv4_errors: Option<&'s mut Icmpv4ErrorRuntime<'r>>,
+    pub nat44_udp: Option<(&'s Nat44UdpConfig, &'s mut Nat44UdpRuntime<'r>)>,
+    pub nat44_tcp: Option<(&'s Nat44TcpConfig, &'s mut Nat44TcpRuntime<'r>)>,
+    pub nat44_icmp: Option<(&'s Nat44IcmpConfig, &'s mut Nat44IcmpRuntime<'r>)>,
+    pub firewall: Option<(&'s FirewallConfig<'c>, &'s mut FirewallRuntime<'r>)>,
 }
 
 /// Forwards RX packets and queues resolution actions without allocating TX
@@ -4176,7 +4214,7 @@ where
             }
         }
         let ingress = packet.ingress();
-        let nat_now_ms = resolution.as_ref().map_or(0, |(_, now)| now.0);
+        let nat_now_ms = resolution.as_ref().map_or(all_vrfs.now.0, |(_, now)| now.0);
         // ARP-HOLD: the miss a hold waits on is the one this datagram's
         // decision records, never a previous datagram's.
         if arp_hold.is_some() {
@@ -5127,9 +5165,7 @@ fn decide_ipv4<T: TraceSink>(
     if !local {
         validate_ipv4_forward_destination(ipv4, selected_route)?;
     }
-    let nat_now = resolution
-        .as_ref()
-        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let nat_now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
     let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp))
         || nat44_icmp_config.is_some_and(|icmp| {
             nat44_udp_config.is_some_and(|udp| {
@@ -5768,9 +5804,7 @@ fn decide_ipv4<T: TraceSink>(
                 config,
                 nat44_udp,
                 firewall_config.is_some(),
-                resolution
-                    .as_ref()
-                    .map_or(MonotonicMillis(0), |(_, now)| *now),
+                resolution.as_ref().map_or(snapshot.now, |(_, now)| *now),
                 trace,
             );
         }
@@ -7251,9 +7285,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution
-        .as_ref()
-        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
     let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
     if firewall_config.is_none() {
         if let Err(error) = runtime.observe_now(now.0) {
@@ -7519,9 +7551,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution
-        .as_ref()
-        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
     let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
     if firewall_config.is_none() {
         if let Err(error) = runtime.observe_now(now.0) {
