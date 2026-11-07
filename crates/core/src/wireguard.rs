@@ -123,8 +123,11 @@ pub fn seal(
 /// returns the range of `message` that holds the decrypted, still padded, packet:
 /// the receiver finds the real length from the inner IP header. An empty range is
 /// a keepalive. Returns `None` if the message is malformed, its counter is at the
-/// limit, its length is not a multiple of 16 plus the header and tag, or the tag is
-/// wrong (then `message` is unchanged).
+/// limit, or the tag is wrong (then `message` is unchanged).
+///
+/// The encrypted part need not be a multiple of 16: senders cap the padding at
+/// their MTU (Linux and wireguard-go pad to `min(mtu, ALIGN(len, 16))`), so a
+/// packet of an MTU like 1420 arrives unpadded.
 ///
 /// This does not look at the replay window: update it with [`ReplayWindow::accept`]
 /// only after this succeeds, so that forged messages cannot move it.
@@ -132,8 +135,7 @@ pub fn seal(
 pub fn open(key: &[u8; 32], message: &mut [u8]) -> Option<core::ops::Range<usize>> {
     let header = parse_header(message)?;
     let body = message.len() - TAG_LEN;
-    if header.counter >= REJECT_AFTER_MESSAGES || !(body - HEADER_LEN).is_multiple_of(PADDING_STEP)
-    {
+    if header.counter >= REJECT_AFTER_MESSAGES {
         return None;
     }
     let (data, tag) = message.split_at_mut(body);
@@ -230,6 +232,29 @@ mod tests {
         assert_eq!(range, 16..48);
         assert_eq!(msg[16..36], inner[..]);
         assert_eq!(msg[36..48], [0; 12]);
+    }
+
+    #[test]
+    fn a_message_padded_short_of_16_is_opened() {
+        // As Linux sends a 1420-byte packet on a 1420 MTU: 1420 is not a multiple
+        // of 16 and the padding stops at the MTU.
+        let inner: Vec<u8> = (0..1420).map(|i| i as u8).collect();
+        let mut msg = vec![0u8; HEADER_LEN + inner.len() + TAG_LEN];
+        msg[0] = MESSAGE_TYPE_DATA;
+        msg[4..8].copy_from_slice(&7u32.to_le_bytes());
+        msg[8..16].copy_from_slice(&3u64.to_le_bytes());
+        msg[HEADER_LEN..HEADER_LEN + inner.len()].copy_from_slice(&inner);
+        let nonce = chacha20poly1305::wireguard_nonce(3);
+        let tag = chacha20poly1305::seal(
+            &KEY,
+            &nonce,
+            &[],
+            &mut msg[HEADER_LEN..HEADER_LEN + inner.len()],
+        );
+        let end = msg.len();
+        msg[end - TAG_LEN..].copy_from_slice(&tag);
+        let range = open(&KEY, &mut msg).unwrap();
+        assert_eq!(msg[range], inner[..]);
     }
 
     #[test]
