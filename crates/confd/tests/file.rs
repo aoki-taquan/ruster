@@ -574,3 +574,72 @@ fn firewall_mistakes_are_refused() {
     ))
     .is_ok());
 }
+
+#[test]
+fn nat_takes_the_outside_address_and_a_port_range() {
+    let wan =
+        "[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv4 = \"198.51.100.2/24\"\n";
+    let nat =
+        |extra: &str| format!("{LAN}{wan}[nat]\ninside = \"lan\"\noutside = \"wan\"\n{extra}");
+    assert_eq!(
+        parse(&nat("")).unwrap().nat,
+        Some(ruster_proto::table::Nat {
+            inside: "lan".into(),
+            outside: "wan".into(),
+            external: None,
+            first_port: 1_024,
+            last_port: 32_767,
+        })
+    );
+    let got = parse(&nat(
+        "ports = \"40000-40999\"\nexternal = \"198.51.100.2\"\n",
+    ))
+    .unwrap()
+    .nat
+    .unwrap();
+    assert_eq!((got.first_port, got.last_port), (40_000, 40_999));
+    assert_eq!(got.external, Some(Ipv4Addr::new(198, 51, 100, 2)));
+    for (text, expected) in [
+        (nat("ports = \"0-100\"\n"), "not 0"),
+        (nat("ports = \"9-1\"\n"), "a range"),
+        (nat("external = \"203.0.113.1\"\n"), "external must be"),
+        (
+            format!("{LAN}{wan}[nat]\ninside = \"lan\"\noutside = \"lan\"\n"),
+            "different",
+        ),
+        (
+            format!("{LAN}{wan}[nat]\ninside = \"dmz\"\noutside = \"wan\"\n"),
+            "no interface",
+        ),
+        (
+            format!("{LAN}{wan}[nat]\ninside = \"wan\"\noutside = \"lan\"\n"),
+            "has no ipv4 address",
+        ),
+    ] {
+        let got = error(&text);
+        assert!(got.contains(expected), "{text}: {got}");
+    }
+}
+
+#[test]
+fn an_interface_address_is_not_its_network_or_broadcast() {
+    let with = |ipv4: &str| {
+        format!("[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv4 = \"{ipv4}\"\n")
+    };
+    for bad in [
+        "198.51.100.0/24",
+        "198.51.100.255/24",
+        "10.0.0.4/30",
+        "10.0.0.7/30",
+    ] {
+        assert!(error(&with(bad)).contains("network or broadcast"), "{bad}");
+    }
+    for good in [
+        "198.51.100.1/24",
+        "10.0.0.5/30",
+        "10.0.0.0/31",
+        "10.0.0.1/32",
+    ] {
+        assert!(parse(&with(good)).is_ok(), "{good}");
+    }
+}

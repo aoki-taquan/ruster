@@ -5,7 +5,7 @@
 //!
 //! | To | What |
 //! |---|---|
-//! | FE | interfaces, addresses and the default VRF's firewall rules |
+//! | FE | interfaces, addresses, and the default VRF's firewall rules and NAT |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
 //! | ribd | static routes and the connected routes of the addresses, as source `confd` |
 //!
@@ -75,6 +75,8 @@ pub struct Config {
     pub static_routes: Vec<StaticRoute>,
     /// The default VRF's forward firewall rules, in order.
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
+    /// The default VRF's NAPT.
+    pub nat: Option<ruster_proto::table::Nat>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -169,7 +171,7 @@ impl Confd {
         }
     }
 
-    /// Connects to the FE as the writer of interfaces, addresses and firewall rules.
+    /// Connects to the FE as the writer of interfaces, addresses, firewall rules and NAT.
     pub fn connect_fe(&mut self, stream: UnixStream) -> io::Result<()> {
         self.fe = Some(self.full_send(stream, Self::fe_tables, false)?);
         Ok(())
@@ -254,7 +256,7 @@ impl Confd {
         Ok(peer)
     }
 
-    /// The interface tables and the firewall rules, numbered from 1 in order.
+    /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
         for (id, rule) in (1..).zip(&self.config.firewall) {
@@ -264,6 +266,14 @@ impl Confd {
                     id,
                 },
                 Value::FirewallRule(rule.clone()),
+            );
+        }
+        if let Some(nat) = &self.config.nat {
+            out.insert(
+                Key::Nat {
+                    vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
+                },
+                Value::Nat(nat.clone()),
             );
         }
         out

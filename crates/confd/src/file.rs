@@ -36,10 +36,22 @@
 //! destination = "0.0.0.0/0"    # optional
 //! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
 //! destination-ports = "53"     # optional
+//!
+//! [nat]                        # NAPT of the default VRF
+//! inside = "lan"
+//! outside = "wan"              # must have an ipv4 address: the public one
+//! ports = "1024-32767"         # optional, 1024-32767 when left out
+//! external = "198.51.100.2"    # optional; for now only the outside's own address
 //! ```
 //!
+//! The NAT pool must not overlap the ports the router's kernel picks for its own
+//! connections (`net.ipv4.ip_local_port_range`, 32768-60999 by default): UDP and TCP
+//! to the public address on a port outside the pool are the router's own, and those
+//! in it are NAT's (so is a router service listening on a port in the pool). NAT is
+//! inactive while `inside` or `outside` is disabled.
+//!
 //! With any `firewall` rule, what no rule accepts is dropped. The interfaces a rule
-//! names must be in the default VRF.
+//! or `nat` names must be in the default VRF.
 //!
 //! An address, and the prefix of an interface address, must be unique within a VRF;
 //! two VRFs may use the same ones. A static route for an interface's prefix replaces
@@ -51,6 +63,8 @@
 //! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
 //!   when not named.
 //! - RFC 791: the smallest MTU is 68.
+//! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
+//!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
 //!   must be usable unicast addresses (not 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4 or
 //!   240.0.0.0/4).
@@ -63,13 +77,17 @@
 //!   through the default VRF); an accepted flow's replies pass too (stateful, not in
 //!   RFC 8519); what no rule accepts is dropped; one rule list for the default VRF,
 //!   not ACLs attached per interface.
+//! - RFC 4787, RFC 5382 and RFC 5508: `nat` is NAPT for UDP, TCP and ICMP queries
+//!   with core's behaviour (endpoint-independent mapping, address-dependent
+//!   filtering); see `ruster_core`'s NAT modules for its deviations. One inside and
+//!   one outside interface, and the outside interface's address as the public one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Deserialize;
 
-use ruster_proto::table::{FirewallAction, FirewallRule, Protocol, DEFAULT_VRF};
+use ruster_proto::table::{FirewallAction, FirewallRule, Nat, Protocol, DEFAULT_VRF};
 
 use crate::{Config, InterfaceConfig, RouteTarget, StaticRoute};
 
@@ -87,6 +105,16 @@ struct File {
     route: Vec<RouteEntry>,
     #[serde(default)]
     firewall: Vec<FirewallEntry>,
+    nat: Option<NatEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NatEntry {
+    inside: String,
+    outside: String,
+    ports: Option<String>,
+    external: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -280,6 +308,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 if !unicast_v4(address) {
                     return Err(format!("{at}: ipv4 must be a unicast address"));
                 }
+                // RFC 922 and RFC 919: in a prefix of /30 or shorter, the all-zeros
+                // and all-ones host numbers are the network and its broadcast.
+                let mask = u32::MAX.checked_shr(u32::from(len)).unwrap_or(0);
+                let host = u32::from(address) & mask;
+                if len <= 30 && (host == 0 || host == mask) {
+                    return Err(format!(
+                        "{at}: ipv4 must not be the network or broadcast address of its prefix"
+                    ));
+                }
                 seen.address(&at, &entry.name, address.into(), len)?;
                 Some((address, len))
             }
@@ -408,10 +445,95 @@ pub fn parse(text: &str) -> Result<Config, String> {
         .enumerate()
         .map(|(at, entry)| firewall_rule(&format!("firewall rule {}", at + 1), entry, &seen))
         .collect::<Result<_, _>>()?;
+    let nat = file
+        .nat
+        .map(|entry| nat(entry, &seen, &interfaces))
+        .transpose()?;
     Ok(Config {
         interfaces,
         static_routes,
         firewall,
+        nat,
+    })
+}
+
+/// `"53"` or `"1024-65535"`.
+fn port_range(text: &str) -> Option<(u16, u16)> {
+    let (first, last) = text.split_once('-').unwrap_or((text, text));
+    let port = |text: &str| {
+        let text = text.trim();
+        if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        text.parse::<u16>().ok()
+    };
+    match (port(first)?, port(last)?) {
+        (first, last) if first <= last => Some((first, last)),
+        _ => None,
+    }
+}
+
+fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<Nat, String> {
+    let at = "nat";
+    for name in [&entry.inside, &entry.outside] {
+        match seen.vrf_of.get(name) {
+            None => return Err(format!("{at}: no interface {name:?}")),
+            Some(vrf) if vrf != DEFAULT_VRF => {
+                return Err(format!(
+                    "{at}: interface {name:?} is in VRF {vrf:?}; NAT is for the default VRF"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    if entry.inside == entry.outside {
+        return Err(format!(
+            "{at}: inside and outside must be different interfaces"
+        ));
+    }
+    let (first_port, last_port) = match &entry.ports {
+        // Below Linux's default ephemeral ports (32768-60999), which the router's
+        // own connections use: UDP and TCP to the public address outside the pool
+        // are the router's.
+        None => (1_024, 32_767),
+        Some(text) => match port_range(text) {
+            Some((first, last)) if first > 0 => (first, last),
+            _ => {
+                return Err(format!(
+                    "{at}: ports must be a range such as 1024-65535, not 0"
+                ))
+            }
+        },
+    };
+    let outside_address = interfaces
+        .iter()
+        .find(|i| i.name == entry.outside)
+        .and_then(|i| i.ipv4)
+        .map(|(address, _)| address);
+    if outside_address.is_none() {
+        return Err(format!("{at}: {:?} has no ipv4 address", entry.outside));
+    }
+    let external = match &entry.external {
+        None => None,
+        Some(text) => {
+            let address: Ipv4Addr = text
+                .parse()
+                .map_err(|_| format!("{at}: external must be an IPv4 address"))?;
+            if Some(address) != outside_address {
+                return Err(format!(
+                    "{at}: external must be the ipv4 address of {:?} for now",
+                    entry.outside
+                ));
+            }
+            Some(address)
+        }
+    };
+    Ok(Nat {
+        inside: entry.inside,
+        outside: entry.outside,
+        external,
+        first_port,
+        last_port,
     })
 }
 
@@ -462,20 +584,8 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Firewall
         if protocol == Protocol::Icmp {
             return Err(format!("{at}: {what} are for tcp and udp only"));
         }
-        let (first, last) = text.split_once('-').unwrap_or((text, text));
-        let port = |text: &str| {
-            let text = text.trim();
-            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
-                return None;
-            }
-            text.parse::<u16>().ok()
-        };
-        match (port(first), port(last)) {
-            (Some(first), Some(last)) if first <= last => Ok((first, last)),
-            _ => Err(format!(
-                "{at}: {what} must be a port or a range such as 1024-65535"
-            )),
-        }
+        port_range(text)
+            .ok_or_else(|| format!("{at}: {what} must be a port or a range such as 1024-65535"))
     };
     Ok(FirewallRule {
         source: ipv4(&entry.source, "source")?,

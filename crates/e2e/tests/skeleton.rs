@@ -63,6 +63,7 @@ fn config() -> Config {
             },
         }],
         firewall: Vec::new(),
+        nat: None,
     }
 }
 
