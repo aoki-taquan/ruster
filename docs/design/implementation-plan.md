@@ -83,8 +83,10 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 `sudo scripts/netns-skeleton.sh`が、netnsとvethでつないだ2台のホストの間をIPv4が両方向に
 転送されることを確かめる。CIでは回していない。
 
-- 起動の順番はFEが先。ほかのプロセスは相手のsocketができるまで10秒待つ。相手が落ちたときの
-  つなぎ直しはまだ無い。
+- 起動の順番はFEが先。ほかのプロセスは相手のsocketができるまで10秒待つ。
+- 接続が切れた書き手は1秒ごとにつなぎ直し、自分の表を全部送り直す（2-1）。netnsの試験で、
+  ribd、neighd、confdを`kill -9`して起動し直しても転送が止まらないこと、FEを起動し直すと
+  三つが表を埋め直すことを確かめている。
 - FEは暇なとき1ms待つだけで回り続ける。待ち方はAF_XDPに替えるときに見直す。
 
 ### 段階2: 置き換え

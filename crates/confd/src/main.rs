@@ -4,7 +4,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::{file, Confd};
+use ruster_confd::{file, Confd, PeerKind};
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
 
@@ -36,8 +36,29 @@ fn run() -> Result<(), String> {
 
     let clock = Clock::new();
     let mut refused = 0;
+    let mut retry = daemon::Retry::default();
     loop {
         let now = clock.now_ms();
+        let closed = confd.closed();
+        if !closed.is_empty() && retry.due(now) {
+            for kind in closed {
+                let name = match kind {
+                    PeerKind::Fe => socket::FE_CONFIG.to_owned(),
+                    PeerKind::Ribd => socket::ribd_source("confd"),
+                    PeerKind::Neighd => socket::NEIGHD_CONFIG.to_owned(),
+                };
+                let Some(stream) = daemon::try_connect(&run_dir.join(&name)) else {
+                    continue;
+                };
+                match kind {
+                    PeerKind::Fe => confd.connect_fe(stream),
+                    PeerKind::Ribd => confd.connect_ribd(stream),
+                    PeerKind::Neighd => confd.connect_neighd(stream),
+                }
+                .map_err(|error| error.to_string())?;
+                eprintln!("ruster-confd: connected to {name} again");
+            }
+        }
         let progress = confd.step(now);
         if confd.counters().patches_refused != refused {
             refused = confd.counters().patches_refused;

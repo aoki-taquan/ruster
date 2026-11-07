@@ -8,11 +8,12 @@
 use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 
-use ruster_confd::{Confd, Config, InterfaceConfig, StaticRoute};
+use ruster_confd::{Confd, Config, InterfaceConfig, PeerKind, StaticRoute};
 use ruster_core::{ipv4_header_checksum, IfId};
 use ruster_fe::{writers, Fe};
 use ruster_io_sim::SimIo;
 use ruster_neighd::Neighd;
+use ruster_proto::table::Key;
 use ruster_proto::task::Task;
 use ruster_ribd::{Ribd, SourceSpec};
 
@@ -136,6 +137,34 @@ impl Router {
             confd.connect_neighd(b).unwrap();
         }
         self.neighd = Some(neighd);
+    }
+
+    /// Replaces the FE with a new, empty one, and lets each control process notice
+    /// its closed connection and connect again, as their programs do.
+    fn restart_fe(&mut self) {
+        self.fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+        self.settle();
+        if let Some(confd) = &mut self.confd {
+            assert_eq!(confd.closed(), vec![PeerKind::Fe]);
+            let (fe_end, confd_end) = UnixStream::pair().unwrap();
+            self.fe.attach(fe_end, writers::CONFIG).unwrap();
+            confd.connect_fe(confd_end).unwrap();
+        }
+        if let Some(ribd) = &mut self.ribd {
+            assert!(ribd.fe_closed());
+            let (fe_end, ribd_end) = UnixStream::pair().unwrap();
+            self.fe.attach(fe_end, writers::ROUTE).unwrap();
+            ribd.reconnect_fe(ribd_end).unwrap();
+        }
+        if let Some(neighd) = &mut self.neighd {
+            assert!(neighd.fe_closed());
+            let (fe_end, neighd_end) = UnixStream::pair().unwrap();
+            self.fe.attach(fe_end, writers::NEIGHBOR).unwrap();
+            let (fe_punt, neighd_punt) = UnixDatagram::pair().unwrap();
+            self.fe.attach_punt(fe_punt).unwrap();
+            neighd.reconnect_fe(neighd_end, neighd_punt).unwrap();
+        }
+        self.settle();
     }
 
     /// Steps everything that runs until nothing is busy.
@@ -402,4 +431,48 @@ fn configuration_changes_still_apply_after_restarts() {
         "10.99/16 now follows the default route back out: {tx:?}"
     );
     router.assert_forwards();
+}
+
+#[test]
+fn a_restarted_fe_is_filled_again_by_the_control_processes() {
+    let mut router = running_router();
+    let requests = router.neighd.as_ref().unwrap().counters().requests_sent;
+    router.restart_fe();
+    router.assert_forwards();
+    assert_eq!(
+        router.neighd.as_ref().unwrap().counters().requests_sent,
+        requests,
+        "neighd gave the new FE the neighbors it knew"
+    );
+    assert!(
+        router.fe.store().len() >= 7,
+        "interfaces, addresses, routes and neighbors"
+    );
+}
+
+#[test]
+fn routes_removed_while_the_fe_was_down_are_gone_from_the_new_fe() {
+    let mut router = running_router();
+    let routes_before = router
+        .fe
+        .store()
+        .iter()
+        .filter(|(key, _)| matches!(key, Key::Route { .. }))
+        .count();
+    router.fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut config = router.config.clone();
+    config.static_routes.clear();
+    router.confd.as_mut().unwrap().set_config(config);
+    router.restart_fe();
+    let routes_after = router
+        .fe
+        .store()
+        .iter()
+        .filter(|(key, _)| matches!(key, Key::Route { .. }))
+        .count();
+    assert_eq!(
+        routes_after,
+        routes_before - 1,
+        "only the static route is gone"
+    );
 }

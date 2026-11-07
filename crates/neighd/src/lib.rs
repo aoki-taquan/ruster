@@ -133,6 +133,43 @@ impl Neighd {
         self.local.attach(stream, CONFIG_TABLES)
     }
 
+    /// True once the FE connection closed (the FE stopped or restarted).
+    pub fn fe_closed(&self) -> bool {
+        self.fe.is_closed()
+    }
+
+    /// Replaces a closed FE connection and its punt socket, and gives the FE every
+    /// neighbor neighd knows again (a restarted FE starts with an empty table).
+    pub fn reconnect_fe(&mut self, fe: UnixStream, punt: UnixDatagram) -> io::Result<()> {
+        punt.set_nonblocking(true)?;
+        let mut fe = Client::new(fe)?;
+        fe.resync_begin();
+        let changes: Vec<Change> = self
+            .known
+            .iter()
+            .map(|((interface, address), mac)| {
+                Change::set(
+                    Key::Neighbor {
+                        interface: interface.clone(),
+                        address: *address,
+                    },
+                    Value::Neighbor { mac: *mac },
+                )
+            })
+            .collect();
+        if !changes.is_empty() {
+            fe.patch(&changes).map_err(|error| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("{error:?}"))
+            })?;
+        }
+        fe.resync_end();
+        self.fe = fe;
+        self.punt = punt;
+        self.adopt_since = None;
+        self.start_running();
+        Ok(())
+    }
+
     pub fn counters(&self) -> NeighdCounters {
         self.counters
     }
