@@ -411,6 +411,11 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         let (Key::Wireguard { interface: name }, Value::Wireguard(settings)) = (key, value) else {
             continue;
         };
+        // What a resync has not sent again is on its way out: it must not count
+        // against the new tables, nor keep a session next to one that took its key.
+        if store.is_stale(key) {
+            continue;
+        }
         let Some(Value::Interface {
             enabled: true,
             mac,
@@ -445,16 +450,19 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             if interface != name {
                 continue;
             }
-            let keys = match store.get(&Key::WireguardSession {
+            let session_key = Key::WireguardSession {
                 interface: name.clone(),
                 peer: peer.clone(),
-            }) {
-                Some(Value::WireguardSession(session)) => Some(SessionKeys {
-                    send: session.send,
-                    receive: session.receive,
-                    peer_index: session.peer_index,
-                    local_index: session.local_index,
-                }),
+            };
+            let keys = match store.get(&session_key) {
+                Some(Value::WireguardSession(session)) if !store.is_stale(&session_key) => {
+                    Some(SessionKeys {
+                        send: session.send,
+                        receive: session.receive,
+                        peer_index: session.peer_index,
+                        local_index: session.local_index,
+                    })
+                }
                 _ => None,
             };
             peers.push(PeerBuilt {
