@@ -258,17 +258,21 @@ pub enum ConsumeReason {
     /// An IPv6 Neighbor Discovery message copied into the caller's control queue
     /// for the neighbor process. The received frame is recycled.
     Ipv6Control,
+    /// A packet addressed to the router copied into the caller's control queue for
+    /// the kernel (`ForwardingSnapshot::with_local_to_control`).
+    LocalToControl,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
         Self::Ipv4FragmentHeld,
         Self::ArpHeld,
         Self::Ipv6Control,
+        Self::LocalToControl,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -282,6 +286,7 @@ impl ConsumeReason {
             Self::Ipv4FragmentHeld => 3,
             Self::ArpHeld => 4,
             Self::Ipv6Control => 5,
+            Self::LocalToControl => 6,
         }
     }
 
@@ -294,6 +299,7 @@ impl ConsumeReason {
             Self::Ipv4FragmentHeld => "IPV4_FRAGMENT_HELD",
             Self::ArpHeld => "ARP_HELD",
             Self::Ipv6Control => "IPV6_CONTROL",
+            Self::LocalToControl => "LOCAL_TO_CONTROL",
         }
     }
 }
@@ -458,7 +464,8 @@ mod tests {
                 "IPV4_FRAGMENTED",
                 "IPV4_FRAGMENT_HELD",
                 "ARP_HELD",
-                "IPV6_CONTROL"
+                "IPV6_CONTROL",
+                "LOCAL_TO_CONTROL"
             ]
         );
     }
