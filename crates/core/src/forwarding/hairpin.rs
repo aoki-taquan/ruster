@@ -101,39 +101,12 @@ fn inside_forwarding<T: TraceSink>(
     ipv4: packet::ValidatedIpv4,
     route: Route,
     internal_address: crate::Ipv4Address,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<Ipv4RewriteDecision, DropReason> {
     let target = route.next_hop().unwrap_or(internal_address);
     let interface = snapshot.interface(route.egress()).ok_or(InterfaceMiss)?;
     let destination_mac = if let Some(neighbor) = snapshot.static_neighbor(route.egress(), target) {
         neighbor.mac
-    } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
-        match resolution_runtime.lookup_dynamic(route.egress(), target, *resolution_now) {
-            DynamicLookup::Hit(mac) => mac,
-            DynamicLookup::ClockRegression => return Err(NeighborUnresolved),
-            DynamicLookup::Miss => {
-                if let Some(binding) = snapshot.local_binding_on(route.egress()) {
-                    let result = resolution_runtime.schedule(
-                        ArpRequestAction {
-                            egress: route.egress(),
-                            source_mac: interface.mac,
-                            source_ip: binding.address,
-                            target_ip: target,
-                        },
-                        *resolution_now,
-                        false,
-                    );
-                    trace.record(TraceEvent::NeighborResolution {
-                        egress: route.egress(),
-                        target,
-                        result,
-                    });
-                    resolution_runtime.note_forward_miss(route.egress(), target, result);
-                }
-                return Err(NeighborUnresolved);
-            }
-        }
     } else {
         return Err(NeighborUnresolved);
     };
@@ -212,7 +185,6 @@ pub(super) fn decide_nat44_udp_hairpin<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44UdpConfig,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
@@ -222,7 +194,7 @@ pub(super) fn decide_nat44_udp_hairpin<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
+    let now = snapshot.now;
     // With a bound firewall the combined preflight already observed time.
     let read_only = firewall_config.is_some();
     let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
@@ -361,7 +333,6 @@ pub(super) fn decide_nat44_udp_hairpin<T: TraceSink>(
         ingress,
         ipv4,
         udp,
-        resolution,
         config,
         runtime,
         read_only,
@@ -386,7 +357,6 @@ fn udp_hairpin_inbound_half<T: TraceSink>(
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
     udp: ValidatedNat44Udp,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44UdpConfig,
     runtime: &mut Nat44UdpRuntime<'_>,
     read_only: bool,
@@ -462,14 +432,8 @@ fn udp_hairpin_inbound_half<T: TraceSink>(
             now,
         )?);
     }
-    let forwarding = match inside_forwarding(
-        snapshot,
-        ipv4,
-        route,
-        tuples.internal_address,
-        resolution,
-        trace,
-    ) {
+    let forwarding = match inside_forwarding(snapshot, ipv4, route, tuples.internal_address, trace)
+    {
         Ok(forwarding) => forwarding,
         Err(reason) => return nat44_udp_drop(ingress, reason, trace),
     };
@@ -553,7 +517,6 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44TcpConfig,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
@@ -563,7 +526,7 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
+    let now = snapshot.now;
     let read_only = firewall_config.is_some();
     let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
     if !read_only {
@@ -700,7 +663,6 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
         ipv4,
         tcp,
         segment,
-        resolution,
         config,
         runtime,
         read_only,
@@ -726,7 +688,6 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
     ipv4: packet::ValidatedIpv4,
     tcp: ValidatedNat44Tcp,
     segment: crate::nat44_tcp_state::Nat44TcpSegment,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44TcpConfig,
     runtime: &mut Nat44TcpRuntime<'_>,
     read_only: bool,
@@ -804,14 +765,8 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
             now,
         )?);
     }
-    let forwarding = match inside_forwarding(
-        snapshot,
-        ipv4,
-        route,
-        tuples.internal_address,
-        resolution,
-        trace,
-    ) {
+    let forwarding = match inside_forwarding(snapshot, ipv4, route, tuples.internal_address, trace)
+    {
         Ok(forwarding) => forwarding,
         Err(reason) => return nat44_tcp_drop(ingress, reason, trace),
     };

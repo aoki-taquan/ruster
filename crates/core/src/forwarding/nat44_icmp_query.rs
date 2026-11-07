@@ -399,7 +399,6 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44IcmpConfig,
     nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
@@ -409,7 +408,7 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
+    let now = snapshot.now;
     let runtime = require_nat44_icmp_runtime(snapshot, config, nat44_icmp, ingress, trace)?;
     if firewall_config.is_none() {
         observe(runtime, ingress, now, trace)?;
@@ -486,16 +485,11 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
         return nat44_icmp_drop(ingress, Ipv4TtlExpired, trace);
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
-    let (interface, destination_mac) = match resolve_nat44_icmpv4_next_hop(
-        snapshot,
-        reverse_route.egress(),
-        target,
-        resolution,
-        trace,
-    ) {
-        Ok(resolved) => resolved,
-        Err(reason) => return nat44_icmp_drop(ingress, reason, trace),
-    };
+    let (interface, destination_mac) =
+        match resolve_nat44_icmpv4_next_hop(snapshot, reverse_route.egress(), target, trace) {
+            Ok(resolved) => resolved,
+            Err(reason) => return nat44_icmp_drop(ingress, reason, trace),
+        };
     let checksum_offset = ipv4.header_offset + 10;
     let forwarding = Ipv4RewriteDecision {
         egress: reverse_route.egress(),

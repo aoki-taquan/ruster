@@ -8,7 +8,6 @@ use crate::nat44::{
     Nat44TcpInboundPlan, Nat44TcpOutboundPlan, Nat44TcpPlanError, Nat44UdpInboundPlan,
     Nat44UdpOutboundPlan, Nat44UdpPlanError,
 };
-use crate::resolution::DynamicLookup;
 use crate::{
     packet, rfc1624_update, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
     BatchCompletion, ConsumeReason, ControlDisposition, FirewallAction, FirewallAuditBuffer,
@@ -19,8 +18,8 @@ use crate::{
     Ipv4FragmentationRuntime, LocalIpv4Binding, MonotonicMillis, Nat44IcmpConfig,
     Nat44IcmpDisposition, Nat44IcmpRuntime, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
     Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime,
-    Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route, SourceValidation,
-    SourceValidationBinding, ARP_ETHERTYPE, IPV4_ETHERTYPE,
+    Neighbor, PacketBatch, ResolutionResult, Route, SourceValidation, SourceValidationBinding,
+    ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
 use lookup::{linear, ForwardingIndex};
@@ -1885,6 +1884,7 @@ impl<'a> ForwardingSnapshot<'a> {
     /// table (bounded binary search over the owner index; linear
     /// reference without one).
     #[inline]
+    #[allow(dead_code)] // Only for resolution's announce, which goes (#441).
     pub(crate) fn interface_slot(&self, id: IfId) -> Option<usize> {
         match self.index {
             Some(index) => index.interface(id).0,
@@ -2998,8 +2998,7 @@ where
     T: TraceSink,
 {
     forward_batch_inner(
-        batch, snapshot, None, None, None, None, None, None, None, None, None, None, None, None,
-        trace,
+        batch, snapshot, None, None, None, None, None, None, None, None, None, None, None, trace,
     )
 }
 
@@ -3037,7 +3036,6 @@ where
     forward_batch_tracked(
         batch,
         snapshot,
-        None,
         services.icmpv4_errors.map(|runtime| (runtime, now)),
         udp_config,
         udp,
@@ -3080,7 +3078,6 @@ pub struct Services<'s, 'c, 'r> {
 fn forward_batch_inner<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
-    resolution: Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
@@ -3101,7 +3098,6 @@ where
     forward_batch_tracked(
         batch,
         snapshot,
-        resolution,
         icmpv4_errors,
         nat44_udp_config,
         nat44_udp,
@@ -3143,7 +3139,6 @@ fn trace_source_validation_failure<T: TraceSink>(
 fn forward_batch_tracked<B, T>(
     mut batch: B,
     snapshot: &ForwardingSnapshot<'_>,
-    mut resolution: Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     mut icmpv4_errors: Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     mut nat44_udp_config: Option<&Nat44UdpConfig>,
     mut nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
@@ -3246,7 +3241,7 @@ where
         };
         'packet: {
             let ingress = packet.ingress();
-            let nat_now_ms = resolution.as_ref().map_or(all_vrfs.now.0, |(_, now)| now.0);
+            let nat_now_ms = all_vrfs.now.0;
             let mut firewall_plan = None;
             // NAT-FRAG: a first fragment admitted by the association table
             // before its decision, and the rewrite it left with.
@@ -3281,7 +3276,6 @@ where
                             snapshot,
                             ingress,
                             true,
-                            &mut resolution,
                             &mut icmpv4_errors,
                             nat44_udp_config,
                             &mut nat44_udp,
@@ -3301,7 +3295,6 @@ where
                         snapshot,
                         ingress,
                         false,
-                        &mut resolution,
                         &mut icmpv4_errors,
                         nat44_udp_config,
                         &mut nat44_udp,
@@ -3402,7 +3395,6 @@ where
                                 snapshot,
                                 ingress,
                                 decision,
-                                &mut resolution,
                                 &mut icmpv4_errors,
                                 fragmentation.as_deref(),
                                 trace,
@@ -3427,7 +3419,6 @@ where
                                             nat44_tcp_config,
                                             nat44_icmp_config,
                                         ),
-                                        &mut resolution,
                                         &mut icmpv4_errors,
                                         trace,
                                     );
@@ -3759,7 +3750,6 @@ fn check_egress_mtu<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     decision: PacketDecision,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     fragmentation: Option<&Ipv4FragmentationRuntime<'_>>,
     trace: &mut T,
@@ -3793,7 +3783,6 @@ fn check_egress_mtu<T: TraceSink>(
         ingress,
         decision,
         mtu,
-        resolution,
         icmpv4_errors,
         fragmentation,
         trace,
@@ -3812,7 +3801,6 @@ fn exceeds_egress_mtu<T: TraceSink>(
     ingress: IfId,
     decision: PacketDecision,
     mtu: u16,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     fragmentation: Option<&Ipv4FragmentationRuntime<'_>>,
     trace: &mut T,
@@ -3836,7 +3824,6 @@ fn exceeds_egress_mtu<T: TraceSink>(
             snapshot.route_lookup(ipv4.destination),
             Icmpv4ErrorKind::DestinationUnreachableFragmentationNeeded,
             u32::from(mtu),
-            resolution,
             runtime,
             *now,
             trace,
@@ -3957,7 +3944,6 @@ fn decide<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     first_fragment: bool,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
@@ -3979,7 +3965,6 @@ fn decide<T: TraceSink>(
             snapshot,
             ingress,
             first_fragment,
-            resolution,
             icmpv4_errors,
             nat44_udp_config,
             nat44_udp,
@@ -3993,7 +3978,7 @@ fn decide<T: TraceSink>(
             firewall_plan,
             trace,
         ),
-        ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, resolution, trace),
+        ARP_ETHERTYPE => decide_arp(frame, snapshot, ingress, trace),
         _ => Err(UnsupportedEtherType),
     }
 }
@@ -4138,7 +4123,6 @@ fn decide_ipv4<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     first_fragment: bool,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
@@ -4165,7 +4149,6 @@ fn decide_ipv4<T: TraceSink>(
                     firewall_config.is_some(),
                     nat44_udp_config,
                     nat44_tcp_config,
-                    resolution,
                     runtime,
                     *now,
                     firewall.as_deref_mut(),
@@ -4193,7 +4176,7 @@ fn decide_ipv4<T: TraceSink>(
     if !local {
         validate_ipv4_forward_destination(ipv4, selected_route)?;
     }
-    let nat_now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
+    let nat_now = snapshot.now;
     let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp))
         || nat44_icmp_config.is_some_and(|icmp| {
             nat44_udp_config.is_some_and(|udp| {
@@ -4224,7 +4207,6 @@ fn decide_ipv4<T: TraceSink>(
             ingress,
             ipv4,
             selected_route,
-            resolution,
             nat44_udp_config,
             nat44_udp,
             nat44_tcp_config,
@@ -4253,7 +4235,6 @@ fn decide_ipv4<T: TraceSink>(
             snapshot,
             ingress,
             ipv4,
-            resolution,
             icmpv4_errors,
             nat44_udp_config,
             nat44_udp,
@@ -4285,7 +4266,6 @@ fn decide_ipv4<T: TraceSink>(
                     snapshot,
                     ingress,
                     ipv4,
-                    resolution,
                     icmpv4_errors,
                     firewall.as_deref_mut(),
                     trace,
@@ -4370,7 +4350,6 @@ fn decide_ipv4<T: TraceSink>(
                 snapshot,
                 ingress,
                 ipv4,
-                resolution,
                 config,
                 nat44_udp,
                 firewall_config,
@@ -4401,7 +4380,6 @@ fn decide_ipv4<T: TraceSink>(
                 snapshot,
                 ingress,
                 ipv4,
-                resolution,
                 config,
                 nat44_udp,
                 firewall_config,
@@ -4423,7 +4401,6 @@ fn decide_ipv4<T: TraceSink>(
                 snapshot,
                 ingress,
                 ipv4,
-                resolution,
                 config,
                 nat44_tcp,
                 firewall_config,
@@ -4456,7 +4433,6 @@ fn decide_ipv4<T: TraceSink>(
                 snapshot,
                 ingress,
                 ipv4,
-                resolution,
                 config,
                 nat44_tcp,
                 firewall_config,
@@ -4475,7 +4451,6 @@ fn decide_ipv4<T: TraceSink>(
                 snapshot,
                 ingress,
                 ipv4,
-                resolution,
                 config,
                 nat44_icmp,
                 firewall_config,
@@ -4493,7 +4468,6 @@ fn decide_ipv4<T: TraceSink>(
             snapshot,
             ingress,
             ipv4,
-            resolution,
             icmpv4_errors,
             firewall.as_deref_mut(),
             trace,
@@ -4521,7 +4495,6 @@ fn decide_ipv4<T: TraceSink>(
                         selected_route,
                         Icmpv4ErrorKind::ParameterProblem,
                         u32::from(pointer),
-                        resolution,
                         runtime,
                         *now,
                         trace,
@@ -4579,7 +4552,6 @@ fn decide_ipv4<T: TraceSink>(
                 None,
                 Icmpv4ErrorKind::DestinationUnreachableNetwork,
                 0,
-                resolution,
                 runtime,
                 *now,
                 trace,
@@ -4675,7 +4647,6 @@ fn decide_ipv4<T: TraceSink>(
                             Some(route),
                             Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
                             0,
-                            resolution,
                             runtime,
                             *now,
                             trace,
@@ -4699,7 +4670,6 @@ fn decide_ipv4<T: TraceSink>(
                 Some(route),
                 Icmpv4ErrorKind::TimeExceededTtl,
                 0,
-                resolution,
                 runtime,
                 *now,
                 trace,
@@ -4716,58 +4686,6 @@ fn decide_ipv4<T: TraceSink>(
     let static_neighbor = snapshot.static_neighbor(route.egress(), target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
-    } else if let Some((runtime, now)) = resolution.as_mut() {
-        match runtime.lookup_dynamic(route.egress(), target, *now) {
-            DynamicLookup::Hit(mac) => mac,
-            DynamicLookup::ClockRegression => {
-                trace.record(TraceEvent::NeighborResolution {
-                    egress: route.egress(),
-                    target,
-                    result: ResolutionResult::ClockRegression,
-                });
-                return Err(NeighborUnresolved);
-            }
-            DynamicLookup::Miss => {
-                if let Some(binding) = snapshot.local_binding_on(route.egress()) {
-                    let result = runtime.schedule(
-                        ArpRequestAction {
-                            egress: route.egress(),
-                            source_mac: interface.mac,
-                            source_ip: binding.address,
-                            target_ip: target,
-                        },
-                        *now,
-                        snapshot.is_local_ipv4(target)
-                            || snapshot.is_connected_boundary(route.egress(), target),
-                    );
-                    trace.record(TraceEvent::NeighborResolution {
-                        egress: route.egress(),
-                        target,
-                        result,
-                    });
-                    runtime.note_forward_miss(route.egress(), target, result);
-                    if route.next_hop().is_none()
-                        && target == ipv4.destination
-                        && icmp_error_candidate_eligible(frame, snapshot, ipv4, Some(route))
-                    {
-                        let quote_end = ipv4.header_offset + ipv4.total_len;
-                        let _ = runtime.capture_failure_candidate(
-                            route.egress(),
-                            target,
-                            ipv4.source,
-                            ipv4.destination,
-                            interface.mac,
-                            binding.address,
-                            route.prefix(),
-                            route.prefix_len(),
-                            frame[ipv4.header_offset + 1],
-                            &frame[ipv4.header_offset..quote_end],
-                        );
-                    }
-                }
-                return Err(NeighborUnresolved);
-            }
-        }
     } else {
         // No resolution runtime: the control side resolves (FE/CE split).
         trace.record(TraceEvent::NeighborMissing {
@@ -4832,7 +4750,7 @@ fn decide_ipv4<T: TraceSink>(
                 config,
                 nat44_udp,
                 firewall_config.is_some(),
-                resolution.as_ref().map_or(snapshot.now, |(_, now)| *now),
+                snapshot.now,
                 trace,
             );
         }
@@ -5147,46 +5065,11 @@ fn resolve_nat44_icmpv4_next_hop<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     egress: IfId,
     target: crate::Ipv4Address,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<(Interface, crate::MacAddress), DropReason> {
     let interface = *snapshot.interface(egress).ok_or(InterfaceMiss)?;
     let destination_mac = if let Some(neighbor) = snapshot.static_neighbor(egress, target) {
         neighbor.mac
-    } else if let Some((runtime, resolution_now)) = resolution.as_mut() {
-        match runtime.lookup_dynamic(egress, target, *resolution_now) {
-            DynamicLookup::Hit(mac) => mac,
-            DynamicLookup::ClockRegression => {
-                trace.record(TraceEvent::NeighborResolution {
-                    egress,
-                    target,
-                    result: ResolutionResult::ClockRegression,
-                });
-                return Err(NeighborUnresolved);
-            }
-            DynamicLookup::Miss => {
-                if let Some(binding) = snapshot.local_binding_on(egress) {
-                    let result = runtime.schedule(
-                        ArpRequestAction {
-                            egress,
-                            source_mac: interface.mac,
-                            source_ip: binding.address,
-                            target_ip: target,
-                        },
-                        *resolution_now,
-                        snapshot.is_local_ipv4(target)
-                            || snapshot.is_connected_boundary(egress, target),
-                    );
-                    trace.record(TraceEvent::NeighborResolution {
-                        egress,
-                        target,
-                        result,
-                    });
-                    runtime.note_forward_miss(egress, target, result);
-                }
-                return Err(NeighborUnresolved);
-            }
-        }
     } else {
         return Err(NeighborUnresolved);
     };
@@ -5203,7 +5086,6 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     outer: packet::ValidatedIpv4,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
@@ -5434,7 +5316,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     }
     let target = route.next_hop().unwrap_or(internal_address);
     let (interface, destination_mac) =
-        resolve_nat44_icmpv4_next_hop(snapshot, inside, target, resolution, trace)?;
+        resolve_nat44_icmpv4_next_hop(snapshot, inside, target, trace)?;
     Ok(build_nat44_icmpv4_rewrite(
         outer,
         quote,
@@ -6303,7 +6185,6 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44UdpConfig,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
@@ -6313,7 +6194,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
+    let now = snapshot.now;
     let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
     if firewall_config.is_none() {
         if let Err(error) = runtime.observe_now(now.0) {
@@ -6397,41 +6278,12 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     let interface = snapshot
         .interface(reverse_route.egress())
         .ok_or(InterfaceMiss)?;
-    let destination_mac = if let Some(neighbor) =
-        snapshot.static_neighbor(reverse_route.egress(), target)
-    {
-        neighbor.mac
-    } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
-        match resolution_runtime.lookup_dynamic(reverse_route.egress(), target, *resolution_now) {
-            DynamicLookup::Hit(mac) => mac,
-            DynamicLookup::ClockRegression => {
-                return nat44_udp_drop(ingress, NeighborUnresolved, trace);
-            }
-            DynamicLookup::Miss => {
-                if let Some(binding) = snapshot.local_binding_on(reverse_route.egress()) {
-                    let result = resolution_runtime.schedule(
-                        ArpRequestAction {
-                            egress: reverse_route.egress(),
-                            source_mac: interface.mac,
-                            source_ip: binding.address,
-                            target_ip: target,
-                        },
-                        *resolution_now,
-                        false,
-                    );
-                    trace.record(TraceEvent::NeighborResolution {
-                        egress: reverse_route.egress(),
-                        target,
-                        result,
-                    });
-                    resolution_runtime.note_forward_miss(reverse_route.egress(), target, result);
-                }
-                return nat44_udp_drop(ingress, NeighborUnresolved, trace);
-            }
-        }
-    } else {
-        return nat44_udp_drop(ingress, NeighborUnresolved, trace);
-    };
+    let destination_mac =
+        if let Some(neighbor) = snapshot.static_neighbor(reverse_route.egress(), target) {
+            neighbor.mac
+        } else {
+            return nat44_udp_drop(ingress, NeighborUnresolved, trace);
+        };
     let ttl_offset = ipv4.header_offset + 8;
     let checksum_offset = ipv4.header_offset + 10;
     let forwarding = Ipv4RewriteDecision {
@@ -6569,7 +6421,6 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     config: &Nat44TcpConfig,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     firewall_config: Option<&FirewallConfig<'_>>,
@@ -6579,7 +6430,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
+    let now = snapshot.now;
     let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
     if firewall_config.is_none() {
         if let Err(error) = runtime.observe_now(now.0) {
@@ -6705,41 +6556,12 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     let interface = snapshot
         .interface(reverse_route.egress())
         .ok_or(InterfaceMiss)?;
-    let destination_mac = if let Some(neighbor) =
-        snapshot.static_neighbor(reverse_route.egress(), target)
-    {
-        neighbor.mac
-    } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
-        match resolution_runtime.lookup_dynamic(reverse_route.egress(), target, *resolution_now) {
-            DynamicLookup::Hit(mac) => mac,
-            DynamicLookup::ClockRegression => {
-                return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
-            }
-            DynamicLookup::Miss => {
-                if let Some(binding) = snapshot.local_binding_on(reverse_route.egress()) {
-                    let result = resolution_runtime.schedule(
-                        ArpRequestAction {
-                            egress: reverse_route.egress(),
-                            source_mac: interface.mac,
-                            source_ip: binding.address,
-                            target_ip: target,
-                        },
-                        *resolution_now,
-                        false,
-                    );
-                    trace.record(TraceEvent::NeighborResolution {
-                        egress: reverse_route.egress(),
-                        target,
-                        result,
-                    });
-                    resolution_runtime.note_forward_miss(reverse_route.egress(), target, result);
-                }
-                return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
-            }
-        }
-    } else {
-        return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
-    };
+    let destination_mac =
+        if let Some(neighbor) = snapshot.static_neighbor(reverse_route.egress(), target) {
+            neighbor.mac
+        } else {
+            return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
+        };
     let ttl_offset = ipv4.header_offset + 8;
     let checksum_offset = ipv4.header_offset + 10;
     let forwarding = Ipv4RewriteDecision {
@@ -7347,7 +7169,6 @@ fn decide_icmpv4_error<T: TraceSink>(
     selected_destination_route: Option<Route>,
     kind: Icmpv4ErrorKind,
     header_value: u32,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
     trace: &mut T,
@@ -7416,7 +7237,6 @@ fn decide_icmpv4_error<T: TraceSink>(
         &frame[ipv4.header_offset..quote_end],
         kind,
         header_value,
-        resolution,
         runtime,
         now,
         trace,
@@ -7440,10 +7260,9 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     original_ipv4: &[u8],
     kind: Icmpv4ErrorKind,
     header_value: u32,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
-    trace: &mut T,
+    _trace: &mut T,
 ) -> Icmpv4ErrorDisposition {
     let Some(reverse_route) = snapshot.route_lookup(original_source) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseRouteMiss);
@@ -7477,60 +7296,6 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     let static_neighbor = snapshot.static_neighbor(reverse_egress, target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
-    } else if let Some((resolution_runtime, resolution_now)) = resolution.as_mut() {
-        match resolution_runtime.lookup_dynamic(reverse_egress, target, *resolution_now) {
-            DynamicLookup::Hit(mac) => mac,
-            DynamicLookup::ClockRegression => {
-                trace.record(TraceEvent::NeighborResolution {
-                    egress: reverse_egress,
-                    target,
-                    result: ResolutionResult::ClockRegression,
-                });
-                return runtime.record_suppression(
-                    Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
-                        egress: reverse_egress,
-                        target,
-                        resolution: ResolutionResult::ClockRegression,
-                    },
-                );
-            }
-            // A Redirect never starts an ARP Request: its source just
-            // sent the datagram, and an unknown one gets no Redirect.
-            DynamicLookup::Miss if kind == Icmpv4ErrorKind::RedirectHost => {
-                return runtime.record_suppression(
-                    Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
-                        egress: reverse_egress,
-                        target,
-                        resolution: ResolutionResult::Suppressed,
-                    },
-                );
-            }
-            DynamicLookup::Miss => {
-                let result = resolution_runtime.schedule(
-                    ArpRequestAction {
-                        egress: reverse_egress,
-                        source_mac: interface.mac,
-                        source_ip: binding.address,
-                        target_ip: target,
-                    },
-                    *resolution_now,
-                    snapshot.is_local_ipv4(target)
-                        || snapshot.is_connected_boundary(reverse_egress, target),
-                );
-                trace.record(TraceEvent::NeighborResolution {
-                    egress: reverse_egress,
-                    target,
-                    result,
-                });
-                return runtime.record_suppression(
-                    Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
-                        egress: reverse_egress,
-                        target,
-                        resolution: result,
-                    },
-                );
-            }
-        }
     } else {
         return runtime.record_suppression(
             Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
@@ -7608,7 +7373,6 @@ fn redirect_to_better_first_hop<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     nat_outside: bool,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) {
@@ -7665,7 +7429,6 @@ fn redirect_to_better_first_hop<T: TraceSink>(
             Some(route),
             kind,
             u32::from_be_bytes(gateway.octets()),
-            resolution,
             runtime,
             *now,
             trace,
@@ -7881,7 +7644,6 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     firewall: Option<&mut FirewallRuntime<'_>>,
     trace: &mut T,
@@ -7922,7 +7684,6 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
         None,
         kind,
         header_value,
-        resolution,
         runtime,
         *now,
         trace,
@@ -8110,7 +7871,6 @@ fn truncated_parameter_problem<T: TraceSink>(
     firewall: bool,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
     input_firewall: Option<&mut FirewallRuntime<'_>>,
@@ -8162,7 +7922,6 @@ fn truncated_parameter_problem<T: TraceSink>(
         selected_route,
         Icmpv4ErrorKind::ParameterProblem,
         2,
-        resolution,
         runtime,
         now,
         trace,
@@ -8280,7 +8039,6 @@ fn decide_arp<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     let arp = validate_arp(frame)?;
@@ -8339,49 +8097,8 @@ fn decide_arp<T: TraceSink>(
     {
         return Err(ArpSenderNotOnLink);
     }
-    let has_runtime = resolution.is_some();
-    let disposition = if let Some((runtime, now)) = resolution.as_mut() {
-        if static_key {
-            runtime.merge_dynamic(
-                ingress,
-                arp.sender_protocol,
-                arp.sender_hardware,
-                target_local,
-                true,
-                *now,
-            )
-        } else if arp.sender_protocol.is_unspecified() {
-            if runtime.observe_control(*now) {
-                ControlDisposition::Probe
-            } else {
-                ControlDisposition::ClockRegression
-            }
-        } else if sender_local {
-            if runtime.observe_control(*now) {
-                // RFC 5227 §2.4: another MAC claiming this address is a
-                // conflicting ARP packet (counted, defended when on).
-                runtime.observe_local_sender(snapshot, ingress, arp.sender_hardware, *now);
-                ControlDisposition::LocalAddressPreserved
-            } else {
-                ControlDisposition::ClockRegression
-            }
-        } else if !sender_host {
-            if runtime.observe_control(*now) {
-                ControlDisposition::SenderNotHost
-            } else {
-                ControlDisposition::ClockRegression
-            }
-        } else {
-            runtime.merge_dynamic(
-                ingress,
-                arp.sender_protocol,
-                arp.sender_hardware,
-                target_local,
-                false,
-                *now,
-            )
-        }
-    } else if static_key {
+    let has_runtime = false;
+    let disposition = if static_key {
         ControlDisposition::StaticPreserved
     } else {
         ControlDisposition::Ignored
@@ -9392,14 +9109,6 @@ mod tests {
         let before_mapping = nat.mappings()[0];
         let before_peer = nat.peers()[0];
         let before_counters = nat.counters();
-        let mut states = [ResolutionStateSlot::EMPTY; 1];
-        let mut actions = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = ResolutionRuntime::new(
-            ResolutionPolicy::new(1_000, 2_000).unwrap(),
-            &mut states,
-            &mut actions,
-        );
-        let mut resolution = Some((&mut resolution, MonotonicMillis(0)));
         let mut generated_errors = None;
         let mut udp = Some(&mut nat);
         let mut tcp = None;
@@ -9411,7 +9120,6 @@ mod tests {
             &snapshot,
             WAN,
             false,
-            &mut resolution,
             &mut generated_errors,
             Some(&config),
             &mut udp,

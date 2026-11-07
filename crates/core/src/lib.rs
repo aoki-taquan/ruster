@@ -20,6 +20,8 @@ mod nat44_tcp_state;
 mod observability;
 mod packet;
 mod reload_state;
+// ARP resolution: no longer used by forwarding; removed with its types moved (#441).
+#[allow(dead_code)]
 mod resolution;
 #[cfg(test)]
 mod resolution_reference;
