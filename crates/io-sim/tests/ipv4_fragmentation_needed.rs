@@ -7,13 +7,14 @@
 //! Expected wire bytes are built here from the RFC field layout with a
 //! local checksum, not with the router's builders.
 
+mod support;
+
 use ruster_core::{
-    execute_one_icmpv4_error, forward_batch_with_resolution_and_icmpv4_errors, DropReason,
-    ForwardingSnapshot, GeneratedIcmpv4Trace, Icmpv4ErrorActionSlot, Icmpv4ErrorDisposition,
-    Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, PacketIo,
-    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-    SnapshotError, TraceEvent,
+    execute_one_icmpv4_error, DropReason, ForwardingSnapshot, GeneratedIcmpv4Trace,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+    MacAddress, MonotonicMillis, Neighbor, PacketIo, ResolutionActionSlot, ResolutionPolicy,
+    ResolutionRuntime, ResolutionStateSlot, Route, SnapshotError, TraceEvent,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo, VecGeneratedIcmpv4Trace, VecTrace};
 
@@ -180,7 +181,7 @@ impl Runtimes {
 fn forward(
     io: &mut SimIo,
     snapshot: &ForwardingSnapshot<'_>,
-    resolution: &mut ResolutionRuntime<'_>,
+    _resolution: &mut ResolutionRuntime<'_>,
     errors: &mut Icmpv4ErrorRuntime<'_>,
     frames: &[Vec<u8>],
     now: u64,
@@ -190,14 +191,8 @@ fn forward(
     }
     let mut trace = VecTrace::default();
     let batch = io.receive(frames.len()).unwrap();
-    let report = forward_batch_with_resolution_and_icmpv4_errors(
-        batch,
-        snapshot,
-        resolution,
-        errors,
-        MonotonicMillis(now),
-        &mut trace,
-    );
+    let report =
+        support::forward_with_errors(batch, snapshot, errors, MonotonicMillis(now), &mut trace);
     assert_eq!(report.received, frames.len());
     trace
 }

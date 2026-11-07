@@ -11,14 +11,12 @@
 mod support;
 
 use ruster_core::{
-    execute_one_icmpv4_error, forward_batch_with_resolution_and_icmpv4_errors, DropReason,
-    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorCounters, Icmpv4ErrorDisposition,
-    Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface,
-    Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering, Nat44UdpConfig,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor,
-    NoGeneratedIcmpv4Trace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionResult,
-    ResolutionRuntime, ResolutionStateSlot, Route, SourceValidation, SourceValidationBinding,
-    TraceEvent,
+    execute_one_icmpv4_error, DropReason, ForwardingSnapshot, Icmpv4ErrorActionSlot,
+    Icmpv4ErrorCounters, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+    MacAddress, MonotonicMillis, Nat44Filtering, Nat44UdpConfig, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoGeneratedIcmpv4Trace, PacketIo,
+    Route, SourceValidation, SourceValidationBinding, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -259,7 +257,6 @@ struct Step {
 
 struct World {
     snapshot: ForwardingSnapshot<'static>,
-    resolution: ResolutionRuntime<'static>,
     errors: Icmpv4ErrorRuntime<'static>,
     nat: Option<(Nat44UdpConfig, Nat44UdpRuntime<'static>)>,
     io: SimIo,
@@ -273,11 +270,6 @@ impl World {
     fn on(snapshot: ForwardingSnapshot<'static>, policy: Icmpv4ErrorPolicy) -> Self {
         Self {
             snapshot,
-            resolution: ResolutionRuntime::new(
-                ResolutionPolicy::new(1_000, 60_000).unwrap(),
-                leak([ResolutionStateSlot::EMPTY; 4]),
-                leak([ResolutionActionSlot::EMPTY; 4]),
-            ),
             errors: Icmpv4ErrorRuntime::new(
                 policy,
                 leak([Icmpv4ErrorStateSlot::EMPTY; 4]),
@@ -330,10 +322,9 @@ impl World {
                 },
                 &mut trace,
             ),
-            None => forward_batch_with_resolution_and_icmpv4_errors(
+            None => support::forward_with_errors(
                 batch,
                 &self.snapshot,
-                &mut self.resolution,
                 &mut self.errors,
                 MonotonicMillis(now),
                 &mut trace,
@@ -614,45 +605,6 @@ fn a_host_that_ignores_redirects_never_starves_time_exceeded_for_another_host() 
     }
     assert_eq!(time_exceeded, 10, "every probe answered");
     assert_eq!(redirects, 10, "one Redirect per 100 ms interval");
-}
-
-/// Review sec L1: the Redirect limiter is read before any reverse route
-/// or neighbor work: a pending Redirect makes a second one `Pending` even
-/// when its source is unknown, and a Redirect whose source has no known
-/// neighbor entry is suppressed without an ARP Request.
-#[test]
-fn the_limiter_comes_first_and_a_redirect_never_starts_arp() {
-    let unknown = [192, 0, 2, 50];
-    let mut world = World::new(Icmpv4ErrorPolicy::default());
-    let first = from_a(B);
-    assert_eq!(world.forward(LAN, &first, 10).redirect, queued(B, &first));
-    let other = frame(B_MAC, unknown, B, DF, 64, 17, &udp_payload());
-    assert_eq!(
-        world.forward(LAN, &other, 11).redirect,
-        Some(Icmpv4ErrorDisposition::Pending { egress: LAN })
-    );
-    assert_eq!(world.counters().reverse_neighbor_unresolved, 0);
-    // The §4.3.2.7 header rules come before the pre-check: a later
-    // fragment is counted as such, not as Pending.
-    let later = frame(A_MAC, A, B, 2, 64, 17, b"later fragment..");
-    assert_eq!(
-        world.forward(LAN, &later, 12).redirect,
-        Some(Icmpv4ErrorDisposition::NonInitialFragment)
-    );
-
-    let mut world = World::new(Icmpv4ErrorPolicy::default());
-    let step = world.forward(LAN, &other, 10);
-    assert_eq!(step.sent, Some((LAN, forwarded(&other, B_MAC))));
-    assert_eq!(
-        step.redirect,
-        Some(Icmpv4ErrorDisposition::ReverseNeighborUnresolved {
-            egress: LAN,
-            target: ip(unknown),
-            resolution: ResolutionResult::Suppressed,
-        })
-    );
-    assert_eq!(world.resolution.counters().queued, 0, "no ARP Request");
-    assert!(world.generated(10).is_empty());
 }
 
 /// Review sec L2: a datagram that arrives on the NAT outside interface and

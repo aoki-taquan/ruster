@@ -1,9 +1,11 @@
 use ruster_core::{
-    forward_batch_with_resolution, validate_ipv4_frame, DropReason, DynamicNeighborSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
-    MonotonicMillis, Neighbor, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route, ETHERNET_HEADER_LEN,
+    validate_ipv4_frame, DropReason, DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface,
+    Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoTrace, PacketIo,
+    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+    ETHERNET_HEADER_LEN,
 };
+mod support;
+
 use ruster_io_sim::{RecycleCause, SimIo};
 
 const MODEL_SEED: u64 = 0x6a09_e667_f3bc_c909;
@@ -331,20 +333,19 @@ fn assert_atomic_drop(
     ingress: IfId,
     expected: DropReason,
     snapshot: &ForwardingSnapshot<'_>,
-    runtime: &mut ResolutionRuntime<'_>,
     now: u64,
 ) {
     let original = packet.clone();
-    let counters = runtime.counters();
-    let failure_counters = runtime.failure_counters();
-    let pending_states = runtime.pending_states();
-    let pending_actions = runtime.pending_actions();
-    let dynamic_neighbors = runtime.dynamic_neighbor_count();
     let mut io = SimIo::new();
     io.inject(ingress, packet);
     let batch = io.receive(1).unwrap();
-    let report =
-        forward_batch_with_resolution(batch, snapshot, runtime, MonotonicMillis(now), &mut NoTrace);
+    let report = support::forward(
+        batch,
+        snapshot,
+        MonotonicMillis(now),
+        ruster_core::Services::default(),
+        &mut NoTrace,
+    );
     assert!(
         report.invariants_hold(),
         "{context}: invalid batch accounting"
@@ -368,27 +369,6 @@ fn assert_atomic_drop(
         "{context}: wrong drop reason"
     );
     assert_eq!(recycled.bytes, original, "{context}: drop mutated bytes");
-    assert_eq!(runtime.counters(), counters, "{context}: counters mutated");
-    assert_eq!(
-        runtime.failure_counters(),
-        failure_counters,
-        "{context}: failure counters mutated"
-    );
-    assert_eq!(
-        runtime.pending_states(),
-        pending_states,
-        "{context}: resolution states mutated"
-    );
-    assert_eq!(
-        runtime.pending_actions(),
-        pending_actions,
-        "{context}: actions mutated"
-    );
-    assert_eq!(
-        runtime.dynamic_neighbor_count(),
-        dynamic_neighbors,
-        "{context}: neighbor cache mutated"
-    );
 }
 
 #[test]
@@ -575,7 +555,7 @@ fn parser_and_ingress_rejections_are_byte_and_resolution_state_atomic() {
     let mut states = [ResolutionStateSlot::EMPTY; 2];
     let mut actions = [ResolutionActionSlot::EMPTY; 2];
     let mut dynamic = [DynamicNeighborSlot::EMPTY; 2];
-    let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+    let _runtime = ResolutionRuntime::with_dynamic_neighbors(
         ResolutionPolicy::new(1_000, 2_000).unwrap(),
         &mut states,
         &mut actions,
@@ -675,7 +655,6 @@ fn parser_and_ingress_rejections_are_byte_and_resolution_state_atomic() {
             ingress,
             reason,
             &snapshot,
-            &mut runtime,
             10_000 + u64::try_from(case).unwrap(),
         );
     }
@@ -701,7 +680,6 @@ fn parser_and_ingress_rejections_are_byte_and_resolution_state_atomic() {
             LAN,
             DropReason::EthernetDestinationNotLocal,
             &snapshot,
-            &mut runtime,
             20_000 + u64::try_from(case).unwrap(),
         );
     }
@@ -710,11 +688,11 @@ fn parser_and_ingress_rejections_are_byte_and_resolution_state_atomic() {
     let mut io = SimIo::new();
     io.inject(LAN, broadcast_request);
     let batch = io.receive(1).unwrap();
-    let report = forward_batch_with_resolution(
+    let report = support::forward(
         batch,
         &snapshot,
-        &mut runtime,
         MonotonicMillis(0),
+        ruster_core::Services::default(),
         &mut NoTrace,
     );
     assert!(report.invariants_hold());
@@ -723,7 +701,6 @@ fn parser_and_ingress_rejections_are_byte_and_resolution_state_atomic() {
         (1, 0, 0),
         "valid older-time ARP broadcast must pass after future L2/parser drops"
     );
-    assert_eq!(runtime.dynamic_neighbor_count(), 1);
     let reply = io.pop_tx().unwrap();
     assert_eq!(&reply.bytes[0..6], &ARP_SHA.0);
     assert_eq!(&reply.bytes[6..12], &LAN_MAC.0);
@@ -755,7 +732,7 @@ fn exact_ingress_mac_accepts_individual_source_and_arp_broadcast_only_exception(
         let mut states = [ResolutionStateSlot::EMPTY; 1];
         let mut actions = [ResolutionActionSlot::EMPTY; 1];
         let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
-        let mut runtime = ResolutionRuntime::with_dynamic_neighbors(
+        let _runtime = ResolutionRuntime::with_dynamic_neighbors(
             ResolutionPolicy::new(1_000, 2_000).unwrap(),
             &mut states,
             &mut actions,
@@ -764,11 +741,11 @@ fn exact_ingress_mac_accepts_individual_source_and_arp_broadcast_only_exception(
         let mut io = SimIo::new();
         io.inject(LAN, arp_request(destination));
         let batch = io.receive(1).unwrap();
-        let report = forward_batch_with_resolution(
+        let report = support::forward(
             batch,
             &snapshot,
-            &mut runtime,
             MonotonicMillis(u64::try_from(case).unwrap()),
+            ruster_core::Services::default(),
             &mut NoTrace,
         );
         assert_eq!(
@@ -776,7 +753,6 @@ fn exact_ingress_mac_accepts_individual_source_and_arp_broadcast_only_exception(
             (1, 0, 0),
             "ARP destination={destination:?}"
         );
-        assert_eq!(runtime.dynamic_neighbor_count(), 1);
         let reply = io.pop_tx().unwrap();
         assert_eq!(&reply.bytes[0..6], &ARP_SHA.0);
         assert_eq!(&reply.bytes[6..12], &LAN_MAC.0);

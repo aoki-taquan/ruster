@@ -1,11 +1,10 @@
 mod support;
 
 use ruster_core::{
-    internet_checksum, ipv4_header_checksum, rfc1624_update, DropReason, DynamicNeighborSlot,
-    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
-    MonotonicMillis, Nat44UdpConfig, Nat44UdpConfigError, Nat44UdpDisposition, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent, NAT44_UDP_MIN_IDLE_TTL_MS,
+    internet_checksum, ipv4_header_checksum, rfc1624_update, DropReason, ForwardingSnapshot, IfId,
+    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44UdpConfig,
+    Nat44UdpConfigError, Nat44UdpDisposition, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpPolicy, Neighbor, NoTrace, Route, TraceEvent, NAT44_UDP_MIN_IDLE_TTL_MS,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -101,17 +100,6 @@ fn config(snapshot: &ForwardingSnapshot<'_>, first: u16, last: u16) -> Nat44UdpC
         Nat44UdpPolicy::default(),
     )
     .unwrap()
-}
-
-fn resolution<'a>(
-    states: &'a mut [ResolutionStateSlot],
-    actions: &'a mut [ResolutionActionSlot],
-) -> ResolutionRuntime<'a> {
-    ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 2_000).unwrap(),
-        states,
-        actions,
-    )
 }
 
 #[derive(Clone, Copy)]
@@ -269,9 +257,6 @@ fn nat_with_errors(
     let mut peers = [Nat44UdpPeerSlot::default(); 4];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut es = [ruster_core::Icmpv4ErrorStateSlot::EMPTY; 2];
     let mut ea = [ruster_core::Icmpv4ErrorActionSlot::EMPTY; 2];
     let mut errors = ruster_core::Icmpv4ErrorRuntime::new(
@@ -373,9 +358,6 @@ fn exact_bidirectional_wire_and_same_batch_visibility() {
     let mut peers = [Nat44UdpPeerSlot::default(); 4];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let outbound = udp_frame(
         HOST,
         REMOTE1,
@@ -479,9 +461,6 @@ fn eim_reuses_public_tuple_and_adf_keys_only_remote_address() {
     let mut peers = [Nat44UdpPeerSlot::default(); 2];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     for (remote, port) in [(REMOTE1, 53), (REMOTE2, 4_444)] {
         io.inject(
@@ -578,9 +557,6 @@ fn allocator_preserves_then_falls_back_without_overload_and_exhausts() {
     let mut peers = [Nat44UdpPeerSlot::default(); 3];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     for host in [HOST, HOST2] {
         io.inject(
@@ -652,9 +628,6 @@ fn port_preservation_off_translates_to_a_keyed_port_and_back() {
     let mut peers = [Nat44UdpPeerSlot::default(); 2];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     let run = |io: &mut SimIo, nat: &mut _, now| {
         io.run_nat44_udp_once(
@@ -743,9 +716,6 @@ fn host_at_its_mapping_limit_is_refused_while_another_host_is_served() {
     let mut peers = [Nat44UdpPeerSlot::default(); 8];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     let run = |io: &mut SimIo, nat: &mut _, now| {
         io.run_nat44_udp_once(
@@ -875,9 +845,6 @@ fn host_at_its_peer_limit_is_refused_while_another_host_is_served() {
     let mut peers = [Nat44UdpPeerSlot::default(); 8];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     let run = |io: &mut SimIo, nat: &mut _, now| {
         io.run_nat44_udp_once(
@@ -962,9 +929,6 @@ fn exact_idle_expiry_outbound_refresh_and_inbound_no_refresh() {
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let outbound = || {
         udp_frame(
             HOST,
@@ -1083,9 +1047,6 @@ fn structural_and_policy_failures_are_byte_and_state_atomic() {
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
     let mut nat_indexes = UdpTestIndexes::new(base_config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(base_config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let cases = [
         (
             udp_frame(
@@ -1190,9 +1151,6 @@ fn checksum_zero_invalid_nonzero_and_odd_or_padded_udp_are_algebraic() {
     let mut peers = [Nat44UdpPeerSlot::default(); 5];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     for (host, port, mode, payload, padding) in [
         (HOST, 40_000, UdpChecksum::Zero, &[1][..], &[9, 9][..]),
@@ -1308,9 +1266,6 @@ fn absent_runtime_and_stale_snapshot_authority_fail_closed() {
         &[],
         UdpChecksum::Zero,
     );
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
 
     let mut changed_neighbors = neighbors;
@@ -1343,9 +1298,6 @@ fn backend_reject_keeps_tx_request_mapping_and_filter_state() {
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     io.set_received_accept_budget(0);
     io.inject(
@@ -1415,9 +1367,6 @@ fn malformed_udp_options_and_unsupported_transport_never_create_state() {
     let mut peers = [Nat44UdpPeerSlot::default(); 2];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let template = udp_frame(
         HOST,
         REMOTE1,
@@ -1478,9 +1427,6 @@ fn wrong_ingress_unrelated_traffic_and_icmp_are_explicitly_non_nat() {
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     let mut wrong = udp_frame(
         REMOTE1,
@@ -1568,9 +1514,6 @@ fn outside_to_inside_lpm_bypass_is_always_fail_closed_before_neighbor_work() {
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 2];
-    let mut ra = [ResolutionActionSlot::EMPTY; 2];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
 
     let empty_runtime = udp_frame(
@@ -1696,15 +1639,6 @@ fn route_ttl_neighbor_and_reverse_authority_fail_before_nat_state() {
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
     let mut nat_indexes = UdpTestIndexes::new(base_config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(base_config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let mut cache = [DynamicNeighborSlot::EMPTY; 1];
-    let _resolution = ResolutionRuntime::with_dynamic_neighbors(
-        ResolutionPolicy::new(1_000, 2_000).unwrap(),
-        &mut rs,
-        &mut ra,
-        &mut cache,
-    );
     let ttl = udp_frame(
         HOST,
         REMOTE1,
@@ -1819,9 +1753,6 @@ fn later_forwarding_and_structural_failures_still_advance_nat_time() {
     let mut peers = [Nat44UdpPeerSlot::default(); 1];
     let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut rs = [ResolutionStateSlot::EMPTY; 2];
-    let mut ra = [ResolutionActionSlot::EMPTY; 2];
-    let _resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
     let outbound = || {
         udp_frame(

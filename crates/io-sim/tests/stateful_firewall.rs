@@ -1,18 +1,18 @@
 mod support;
 
 use ruster_core::{
-    execute_one_icmpv4_error, forward_batch_with_resolution_and_icmpv4_errors, internet_checksum,
-    ipv4_header_checksum, DropReason, FirewallAction, FirewallAuditBuffer, FirewallAuditRecord,
-    FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure, FirewallHashKey,
-    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPolicySource, FirewallPortRange,
-    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
-    FirewallTcpPhase, FirewallVerdict, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind,
-    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor,
-    NoGeneratedIcmpv4Trace, NoTrace, PacketIo, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route,
+    execute_one_icmpv4_error, internet_checksum, ipv4_header_checksum, DropReason, FirewallAction,
+    FirewallAuditBuffer, FirewallAuditRecord, FirewallConfig, FirewallConnectionClass,
+    FirewallDisposition, FirewallFailure, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
+    FirewallPolicy, FirewallPolicySource, FirewallPortRange, FirewallProtocol, FirewallRule,
+    FirewallRuleId, FirewallRuntime, FirewallStateSlot, FirewallTcpPhase, FirewallVerdict,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
+    MacAddress, MonotonicMillis, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpMappingSlot,
+    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoGeneratedIcmpv4Trace, NoTrace,
+    PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
+    Route,
 };
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo};
 use support::UdpTestIndexes;
@@ -3334,7 +3334,7 @@ fn plain_route_miss_icmpv4(frame: &[u8], routes: &[Route]) -> Vec<u8> {
     let snapshot = ForwardingSnapshot::new(routes, &interfaces, &neighbors, &bindings).unwrap();
     let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
     let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let _resolution = resolution(&mut resolution_states, &mut resolution_actions);
     let mut error_states = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut error_actions = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -3345,10 +3345,9 @@ fn plain_route_miss_icmpv4(frame: &[u8], routes: &[Route]) -> Vec<u8> {
     let mut io = SimIo::new();
     io.inject(LAN, frame.to_vec());
     let batch = io.receive(1).unwrap();
-    forward_batch_with_resolution_and_icmpv4_errors(
+    support::forward_with_errors(
         batch,
         &snapshot,
-        &mut resolution,
         &mut errors,
         MonotonicMillis(1),
         &mut NoTrace,

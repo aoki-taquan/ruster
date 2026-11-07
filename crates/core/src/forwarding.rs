@@ -1,4 +1,3 @@
-use crate::arp_hold::{ArpHoldFragmentHook, ArpHoldMiss, ArpHoldNextHop};
 use crate::firewall::{FirewallPacket, FirewallPlan, FirewallPlanError, FirewallRouteMissPacket};
 use crate::ipv4_fragment_tracking::{
     parse_fragment, Ipv4FragmentFirstTicket, Ipv4FragmentFollow, Ipv4FragmentInfo,
@@ -11,18 +10,17 @@ use crate::nat44::{
 };
 use crate::resolution::DynamicLookup;
 use crate::{
-    packet, rfc1624_update, validate_arp, validate_ipv4_frame, ArpHoldRuntime, ArpOpcode,
-    ArpRequestAction, BatchCompletion, ConsumeReason, ControlDisposition, FirewallAction,
-    FirewallAuditBuffer, FirewallConfig, FirewallConnectionClass, FirewallDisposition,
-    FirewallFailure, FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error,
-    FirewallRelatedIcmpv4Flow, FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction,
-    Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition,
-    IfId, Interface, Ipv4FragmentTracker, Ipv4FragmentationRuntime, LocalIpv4Binding,
-    MonotonicMillis, Nat44IcmpConfig, Nat44IcmpDisposition, Nat44IcmpRuntime,
-    Nat44Icmpv4ErrorPolicy, Nat44TcpConfig, Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig,
-    Nat44UdpDisposition, Nat44UdpRuntime, Neighbor, PacketBatch, ResolutionResult,
-    ResolutionRuntime, Route, SourceValidation, SourceValidationBinding, ARP_ETHERTYPE,
-    IPV4_ETHERTYPE,
+    packet, rfc1624_update, validate_arp, validate_ipv4_frame, ArpOpcode, ArpRequestAction,
+    BatchCompletion, ConsumeReason, ControlDisposition, FirewallAction, FirewallAuditBuffer,
+    FirewallConfig, FirewallConnectionClass, FirewallDisposition, FirewallFailure,
+    FirewallPolicySource, FirewallProtocol, FirewallRelatedIcmpv4Error, FirewallRelatedIcmpv4Flow,
+    FirewallRuntime, FirewallVerdict, Icmpv4ErrorAction, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
+    Icmpv4ErrorRuntime, Icmpv4TimeExceededDisposition, IfId, Interface, Ipv4FragmentTracker,
+    Ipv4FragmentationRuntime, LocalIpv4Binding, MonotonicMillis, Nat44IcmpConfig,
+    Nat44IcmpDisposition, Nat44IcmpRuntime, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    Nat44TcpDisposition, Nat44TcpRuntime, Nat44UdpConfig, Nat44UdpDisposition, Nat44UdpRuntime,
+    Neighbor, PacketBatch, ResolutionResult, ResolutionRuntime, Route, SourceValidation,
+    SourceValidationBinding, ARP_ETHERTYPE, IPV4_ETHERTYPE,
 };
 use hairpin::{decide_nat44_tcp_hairpin, decide_nat44_udp_hairpin, Nat44HairpinDestinationRewrite};
 use lookup::{linear, ForwardingIndex};
@@ -409,19 +407,27 @@ pub enum DropReason {
     /// replay: every `[resolution.hold] packets` slot is taken by datagrams
     /// waiting for other next hops (ARP-HOLD, RFC 1122 §2.3.2.2). Nothing
     /// committed for it.
+    /// No longer produced: ARP-HOLD left core with ARP resolution (the FE
+    /// drops a datagram whose neighbor is unknown). The code stays reserved.
     ArpHoldFull = 201,
     /// A datagram whose next hop is being resolved could not be held: its
     /// (ingress, source) already has `[resolution.hold] per-host` datagrams
     /// held (ARP-HOLD).
+    /// No longer produced: ARP-HOLD left core with ARP resolution (the FE
+    /// drops a datagram whose neighbor is unknown). The code stays reserved.
     ArpHoldHostLimit = 202,
     /// A datagram whose next hop is being resolved is longer than a hold
     /// slot (sized like a fragmentation slot, so only a simulated frame can
     /// be) (ARP-HOLD).
+    /// No longer produced: ARP-HOLD left core with ARP resolution (the FE
+    /// drops a datagram whose neighbor is unknown). The code stays reserved.
     ArpHoldTooLarge = 203,
     /// A datagram whose next hop is being resolved could not be held: its
     /// ingress interface already has `[resolution.hold] per-ingress`
     /// datagrams held, so a flood arriving on one interface (with any
     /// sources) cannot take the slots of another's hosts (ARP-HOLD).
+    /// No longer produced: ARP-HOLD left core with ARP resolution (the FE
+    /// drops a datagram whose neighbor is unknown). The code stays reserved.
     ArpHoldIngressLimit = 204,
     /// A whole datagram addressed to the router carries an IP protocol the
     /// router does not implement (not ICMP, TCP, or UDP); a Protocol
@@ -2645,21 +2651,9 @@ pub enum TraceEvent {
         ingress: IfId,
         reason: ConsumeReason,
     },
-    /// A datagram whose next hop `target` on `egress` is being resolved was
-    /// held for replay; the received frame was consumed as `reason`
-    /// ([`ConsumeReason::ArpHeld`], ARP-HOLD).
-    ArpHeld {
-        ingress: IfId,
-        egress: IfId,
-        target: crate::Ipv4Address,
-        reason: ConsumeReason,
-    },
     /// A received IPv4 datagram failed the source validation `mode` of its
     /// ingress interface (URPF) and is dropped as
     /// [`DropReason::Ipv4SourceValidationFailed`], without any ICMP error.
-    /// Emitted only at RX: a datagram that fails is never held, and an ARP
-    /// hold replay decides against the snapshot it was received under (an
-    /// apply drops every hold), so a replay never fails the check.
     Ipv4SourceValidationFailed {
         ingress: IfId,
         source: crate::Ipv4Address,
@@ -2681,13 +2675,6 @@ pub enum TraceEvent {
         /// short transport header, or a protocol without one: a `rule`
         /// then needed no transport header or matched fail closed.
         transport_header: bool,
-    },
-    /// A datagram held for ARP was dropped with `reason` when it was
-    /// replayed (ARP-HOLD). Not a received frame's drop: the frame was
-    /// counted as `ARP_HELD`; the hold counts it as `replay_dropped`.
-    ArpHoldReplayDropped {
-        ingress: IfId,
-        reason: DropReason,
     },
     BatchCompleted {
         tx_accepted: usize,
@@ -3063,7 +3050,6 @@ where
         services.firewall_audit,
         services.fragmentation,
         services.fragment_tracking,
-        None,
         Some(control),
         trace,
     )
@@ -3088,260 +3074,6 @@ pub struct Services<'s, 'c, 'r> {
     pub fragment_tracking: Option<&'s mut Ipv4FragmentTracker<'r>>,
     /// Records the firewall's decisions.
     pub firewall_audit: Option<&'s mut FirewallAuditBuffer<'r>>,
-}
-
-/// Forwards RX packets and queues resolution actions without allocating TX
-/// frames. Generated execution must start only after this function returns.
-///
-/// The [`forward_batch`] fresh-batch precondition applies.
-pub fn forward_batch_with_resolution<B, T>(
-    batch: B,
-    snapshot: &ForwardingSnapshot<'_>,
-    runtime: &mut ResolutionRuntime<'_>,
-    now: MonotonicMillis,
-    trace: &mut T,
-) -> BatchReport<B::Error>
-where
-    B: PacketBatch,
-    T: TraceSink,
-{
-    forward_batch_inner(
-        batch,
-        snapshot,
-        Some((runtime, now)),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        trace,
-    )
-}
-
-/// Forwards RX packets while queueing ARP resolution and eligible ICMPv4 error
-/// actions into separate caller-backed worker-local runtimes.
-///
-/// Generated packet execution must happen after this function returns.
-///
-/// The [`forward_batch`] fresh-batch precondition applies.
-pub fn forward_batch_with_resolution_and_icmpv4_errors<B, T>(
-    batch: B,
-    snapshot: &ForwardingSnapshot<'_>,
-    resolution: &mut ResolutionRuntime<'_>,
-    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
-    now: MonotonicMillis,
-    trace: &mut T,
-) -> BatchReport<B::Error>
-where
-    B: PacketBatch,
-    T: TraceSink,
-{
-    forward_batch_inner(
-        batch,
-        snapshot,
-        Some((resolution, now)),
-        Some((icmpv4_errors, now)),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        trace,
-    )
-}
-
-/// [`forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking`]
-/// with bounded hold and replay of datagrams whose next hop is being
-/// resolved (ARP-HOLD, RFC 1122 §2.3.2.2, RFC 1812 §3.3.2): with `arp_hold`
-/// bound, a datagram whose decision ends at a neighbour miss that queued,
-/// retried, or joined an ARP request is copied unchanged into a hold slot
-/// and consumed as [`ConsumeReason::ArpHeld`] (or refused with a typed
-/// `ARP_HOLD_*` drop) instead of dropped as `NEIGHBOR_UNRESOLVED`; nothing
-/// commits for it. [`replay_arp_holds`] sends it once the next hop resolves.
-///
-/// The [`forward_batch`] fresh-batch precondition applies.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking_and_arp_hold<
-    B,
-    T,
->(
-    batch: B,
-    snapshot: &ForwardingSnapshot<'_>,
-    resolution: &mut ResolutionRuntime<'_>,
-    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
-    udp_config: &Nat44UdpConfig,
-    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
-    tcp_config: &Nat44TcpConfig,
-    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
-    icmp: Option<(&Nat44IcmpConfig, Option<&mut Nat44IcmpRuntime<'_>>)>,
-    firewall_config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_>>,
-    audit: Option<&mut FirewallAuditBuffer<'_>>,
-    fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
-    fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
-    arp_hold: Option<&mut ArpHoldRuntime<'_>>,
-    now: MonotonicMillis,
-    trace: &mut T,
-) -> BatchReport<B::Error>
-where
-    B: PacketBatch,
-    T: TraceSink,
-{
-    let (icmp_config, nat44_icmp) = match icmp {
-        Some((config, runtime)) => (Some(config), runtime),
-        None => (None, None),
-    };
-    forward_batch_tracked(
-        batch,
-        snapshot,
-        Some((resolution, now)),
-        Some((icmpv4_errors, now)),
-        Some(udp_config),
-        nat44_udp,
-        Some(tcp_config),
-        nat44_tcp,
-        icmp_config,
-        nat44_icmp,
-        Some(firewall_config),
-        firewall,
-        audit,
-        fragmentation,
-        fragment_tracking,
-        arp_hold,
-        None,
-        trace,
-    )
-}
-
-/// Replays the held datagrams whose next hop resolved (ARP-HOLD).
-///
-/// Walks the hold table (O(1) when it is empty): a datagram whose next hop
-/// is now a static or live dynamic neighbour is marked ready, at most as
-/// many as `fragmentation` has free slots, oldest first; one whose
-/// resolution failed, was cancelled, or can no longer succeed is freed and
-/// counted. The ready ones go through the whole forwarding path again with
-/// the hold off, as if just received: route, TTL, firewall, NAT, egress MTU,
-/// and fragmentation are decided at `now` and the NAT and firewall commit
-/// then. One committed for TX is staged whole in a fragmentation slot; one
-/// above a DF-clear egress MTU is staged as fragments by the forwarding path;
-/// a drop is counted by the hold (`replay_dropped`), and the replay's drop
-/// and consume events are not traced again (the frame was counted as
-/// `ARP_HELD`). A first fragment also needs room for the fragments the
-/// association table holds, which its allowed decision releases into the
-/// same slots. The tick's generated fragment
-/// phase sends them after the generated ARP and ICMPv4 phases. Returns how
-/// many datagrams were replayed.
-#[allow(clippy::too_many_arguments)]
-pub fn replay_arp_holds<T>(
-    arp_hold: &mut ArpHoldRuntime<'_>,
-    snapshot: &ForwardingSnapshot<'_>,
-    resolution: &mut ResolutionRuntime<'_>,
-    icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
-    udp_config: &Nat44UdpConfig,
-    nat44_udp: Option<&mut Nat44UdpRuntime<'_>>,
-    tcp_config: &Nat44TcpConfig,
-    nat44_tcp: Option<&mut Nat44TcpRuntime<'_>>,
-    icmp: Option<(&Nat44IcmpConfig, Option<&mut Nat44IcmpRuntime<'_>>)>,
-    firewall_config: &FirewallConfig<'_>,
-    firewall: Option<&mut FirewallRuntime<'_>>,
-    fragmentation: &mut Ipv4FragmentationRuntime<'_>,
-    mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
-    now: MonotonicMillis,
-    trace: &mut T,
-) -> usize
-where
-    T: TraceSink,
-{
-    if arp_hold.live() == 0 {
-        return 0;
-    }
-    let room = fragmentation.free_slots();
-    let udp = Some(udp_config);
-    let tcp = Some(tcp_config);
-    let icmp_cfg = icmp.as_ref().map(|(config, _)| *config);
-    let ready = arp_hold.mark_ready(
-        now.0,
-        room,
-        |egress, target| {
-            if snapshot.static_neighbor(egress, target).is_some() {
-                ArpHoldNextHop::Known
-            } else {
-                resolution.arp_hold_next_hop(egress, target, now)
-            }
-        },
-        |hook| {
-            let Some(tracker) = fragment_tracking.as_deref_mut() else {
-                return 0;
-            };
-            match hook {
-                // A replayed first fragment releases the fragments its
-                // datagram holds in the association table (at most
-                // IPV4_FRAGMENT_TRACKING_HELD_PER_DATAGRAM) into the same
-                // slots: reserve them, so a replay that commits NAT and
-                // firewall state always finds its own slot.
-                ArpHoldFragmentHook::Reserve { frame, ingress } => {
-                    tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
-                        .map_or(0, |(_, info)| tracker.held_for(info))
-                }
-                // A dropped held first fragment refuses exactly its own
-                // datagram's pending entry (lookup-free, never inserts or
-                // poisons), freeing its held later fragments at once.
-                ArpHoldFragmentHook::Dropped {
-                    frame,
-                    ingress,
-                    association,
-                    generation,
-                } => {
-                    if let Some((_, info)) =
-                        tracked_fragment(frame, snapshot, ingress, udp, tcp, icmp_cfg)
-                    {
-                        tracker.deny_pending(association, generation, info, now.0);
-                    }
-                    0
-                }
-            }
-        },
-    );
-    if ready == 0 {
-        return 0;
-    }
-    let (icmp_config, nat44_icmp) = match icmp {
-        Some((config, runtime)) => (Some(config), runtime),
-        None => (None, None),
-    };
-    let report = forward_batch_tracked(
-        arp_hold.replay_batch(),
-        snapshot,
-        Some((resolution, now)),
-        Some((icmpv4_errors, now)),
-        Some(udp_config),
-        nat44_udp,
-        Some(tcp_config),
-        nat44_tcp,
-        icmp_config,
-        nat44_icmp,
-        Some(firewall_config),
-        firewall,
-        None,
-        Some(&mut *fragmentation),
-        fragment_tracking,
-        None,
-        None,
-        &mut ReplayTrace(trace),
-    );
-    arp_hold.stage_committed(snapshot, fragmentation);
-    report.received
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3383,37 +3115,8 @@ where
         fragmentation,
         None,
         None,
-        None,
         trace,
     )
-}
-
-/// The trace of a replay: the replayed datagram was already counted when
-/// it was received (consumed as `ARP_HELD`), so its terminal events (drop,
-/// consume, fragmentation staging) are not passed on; the hold's own
-/// counters (`replay_dropped`, `replay_fragmented`) count them. Every other
-/// event (NAT, firewall, ICMP, resolution) is.
-struct ReplayTrace<'t, T>(&'t mut T);
-
-impl<T: TraceSink> TraceSink for ReplayTrace<'_, T> {
-    fn record(&mut self, event: TraceEvent) {
-        if let TraceEvent::Dropped { ingress, reason } = event {
-            self.0
-                .record(TraceEvent::ArpHoldReplayDropped { ingress, reason });
-            return;
-        }
-        if !matches!(
-            event,
-            TraceEvent::Dropped { .. }
-                | TraceEvent::Consumed { .. }
-                | TraceEvent::Ipv4LocalConsumed { .. }
-                | TraceEvent::Ipv4FragmentationQueued { .. }
-                | TraceEvent::Ipv4FragmentHeld { .. }
-                | TraceEvent::ArpHeld { .. }
-        ) {
-            self.0.record(event);
-        }
-    }
 }
 
 /// Records the source and mode of a URPF drop. Cold: only a failing
@@ -3436,56 +3139,6 @@ fn trace_source_validation_failure<T: TraceSink>(
     }
 }
 
-/// Holds a datagram whose decision ended at a resolving neighbour miss
-/// (ARP-HOLD); `Err` is the typed refusal, or `NEIGHBOR_UNRESOLVED` when the
-/// miss started no resolution that could end in a replay. Cold path.
-#[cold]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn hold_unresolved(
-    hold: &mut ArpHoldRuntime<'_>,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
-    frame: &[u8],
-    ingress: IfId,
-    mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
-    first_fragment: Option<Ipv4FragmentFirstTicket>,
-    snapshot: &ForwardingSnapshot<'_>,
-    (udp, tcp, icmp): (
-        Option<&Nat44UdpConfig>,
-        Option<&Nat44TcpConfig>,
-        Option<&Nat44IcmpConfig>,
-    ),
-) -> Result<ArpHoldMiss, DropReason> {
-    let Some((runtime, now)) = resolution.as_mut() else {
-        return Err(NeighborUnresolved);
-    };
-    let miss = runtime.take_forward_miss(*now).ok_or(NeighborUnresolved)?;
-    // A held first fragment replaced here (the latest is kept per next
-    // hop) refuses its own datagram's pending entry.
-    hold.hold(
-        frame,
-        ingress,
-        miss,
-        |held, held_ingress, association, generation| {
-            if let Some(tracker) = fragment_tracking.as_deref_mut() {
-                if let Some((_, info)) =
-                    tracked_fragment(held, snapshot, held_ingress, udp, tcp, icmp)
-                {
-                    tracker.deny_pending(association, generation, info, now.0);
-                }
-            }
-        },
-    )?;
-    // A held first fragment keeps (or takes, without evicting) a pending
-    // entry, recorded so a later drop refuses exactly its datagram.
-    if let (Some(tracker), Some(ticket)) = (fragment_tracking, first_fragment) {
-        if let Some(association) = tracker.hold_first(ticket, now.0) {
-            hold.set_newest_association(association);
-        }
-    }
-    Ok(miss)
-}
-
 #[allow(clippy::too_many_arguments)]
 fn forward_batch_tracked<B, T>(
     mut batch: B,
@@ -3503,7 +3156,6 @@ fn forward_batch_tracked<B, T>(
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
     mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
     mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
-    mut arp_hold: Option<&mut ArpHoldRuntime<'_>>,
     mut control: Option<&mut crate::ControlQueue>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -3595,13 +3247,6 @@ where
         'packet: {
             let ingress = packet.ingress();
             let nat_now_ms = resolution.as_ref().map_or(all_vrfs.now.0, |(_, now)| now.0);
-            // ARP-HOLD: the miss a hold waits on is the one this datagram's
-            // decision records, never a previous datagram's.
-            if arp_hold.is_some() {
-                if let Some((runtime, _)) = resolution.as_mut() {
-                    runtime.clear_forward_miss();
-                }
-            }
             let mut firewall_plan = None;
             // NAT-FRAG: a first fragment admitted by the association table
             // before its decision, and the rewrite it left with.
@@ -3953,9 +3598,8 @@ where
                             // After the first fragment's own staging when it
                             // is fragmented (its pieces go first, the held
                             // fragments follow). A first fragment sent whole
-                            // goes out before them from RX, but after them
-                            // when it is an ARP-HOLD replay (staged only after
-                            // the replay); receivers reassemble either way. The
+                            // goes out before them from RX; receivers
+                            // reassemble either way. The
                             // template is read from a frame the decision just
                             // rewrote, so it is always there; a missing one
                             // would fail closed (refusing the datagram).
@@ -4021,39 +3665,6 @@ where
                     trace.record(TraceEvent::TxRequested { egress });
                 }
                 Err(reason) => {
-                    // ARP-HOLD: a datagram whose next hop is being resolved is
-                    // held (nothing committed for it) instead of dropped.
-                    let reason = match arp_hold.as_deref_mut() {
-                        Some(hold) if reason == NeighborUnresolved => {
-                            match hold_unresolved(
-                                hold,
-                                &mut resolution,
-                                packet.bytes_mut(),
-                                ingress,
-                                fragment_tracking.as_deref_mut(),
-                                first_fragment,
-                                snapshot,
-                                (nat44_udp_config, nat44_tcp_config, nat44_icmp_config),
-                            ) {
-                                Ok(miss) => {
-                                    // A held first fragment stays undecided: its
-                                    // later fragments are held by the association
-                                    // table until the replay decides it.
-                                    packet.consume(ConsumeReason::ArpHeld);
-                                    consumed += 1;
-                                    trace.record(TraceEvent::ArpHeld {
-                                        ingress,
-                                        egress: miss.egress,
-                                        target: miss.target,
-                                        reason: ConsumeReason::ArpHeld,
-                                    });
-                                    break 'packet;
-                                }
-                                Err(reason) => reason,
-                            }
-                        }
-                        _ => reason,
-                    };
                     if let Some(ticket) = first_fragment {
                         if let Some(tracker) = fragment_tracking.as_deref_mut() {
                             tracker.commit_deny(ticket, nat_now_ms);

@@ -263,7 +263,8 @@ pub enum ConsumeReason {
     /// copied, unchanged, into a core-owned hold slot (ARP-HOLD, RFC 1122
     /// §2.3.2.2); it is decided and sent anew when the next hop resolves,
     /// and discarded (and counted) when the resolution fails. The received
-    /// frame is recycled.
+    /// frame is recycled. No longer produced (ARP-HOLD left core); the code
+    /// stays reserved.
     ArpHeld,
     /// An IPv6 Neighbor Discovery message copied into the caller's control queue
     /// for the neighbor process. The received frame is recycled.
