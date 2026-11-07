@@ -83,7 +83,7 @@ fn address(interface: &str, address: [u8; 4], prefix_len: u8) -> Change {
     Change::set(
         Key::Address {
             interface: interface.into(),
-            address: Ipv4Addr::from(address),
+            address: Ipv4Addr::from(address).into(),
         },
         Value::Address { prefix_len },
     )
@@ -93,12 +93,12 @@ fn route(prefix: [u8; 4], len: u8, interface: &str, via: Option<[u8; 4]>) -> Cha
     Change::set(
         Key::Route {
             vrf: "default".into(),
-            prefix: Ipv4Addr::from(prefix),
+            prefix: Ipv4Addr::from(prefix).into(),
             len,
         },
         Value::Route(RouteAction::Forward(vec![NextHop {
             interface: interface.into(),
-            address: via.map(Ipv4Addr::from),
+            address: via.map(|a| Ipv4Addr::from(a).into()),
         }])),
     )
 }
@@ -107,7 +107,7 @@ fn neighbor(interface: &str, address: [u8; 4], mac: [u8; 6]) -> Change {
     Change::set(
         Key::Neighbor {
             interface: interface.into(),
-            address: Ipv4Addr::from(address),
+            address: Ipv4Addr::from(address).into(),
         },
         Value::Neighbor { mac },
     )
@@ -235,7 +235,7 @@ fn resolve_request_names_the_interface_and_next_hop() {
         request,
         ResolveRequest {
             interface: "wan".into(),
-            address: Ipv4Addr::from(GATEWAY),
+            address: Ipv4Addr::from(GATEWAY).into(),
         }
     );
 }

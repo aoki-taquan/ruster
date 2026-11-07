@@ -36,7 +36,7 @@ fn local_tables() -> Vec<Change> {
         Change::set(
             Key::Address {
                 interface: name.into(),
-                address: Ipv4Addr::from(ip),
+                address: Ipv4Addr::from(ip).into(),
             },
             Value::Address { prefix_len: 24 },
         )
@@ -53,12 +53,12 @@ fn route(prefix: [u8; 4], len: u8, interface: &str, via: Option<[u8; 4]>) -> Cha
     Change::set(
         Key::Route {
             vrf: "default".into(),
-            prefix: Ipv4Addr::from(prefix),
+            prefix: Ipv4Addr::from(prefix).into(),
             len,
         },
         Value::Route(RouteAction::Forward(vec![NextHop {
             interface: interface.into(),
-            address: via.map(Ipv4Addr::from),
+            address: via.map(|a| Ipv4Addr::from(a).into()),
         }])),
     )
 }

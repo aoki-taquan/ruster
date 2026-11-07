@@ -1,6 +1,6 @@
 //! Table entry encoding tests.
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use ruster_proto::cbor::{Decoder, Encoder};
 use ruster_proto::sid;
@@ -17,8 +17,12 @@ fn round_trip(change: &Change) -> Change {
     back
 }
 
-fn ip(a: [u8; 4]) -> Ipv4Addr {
-    Ipv4Addr::from(a)
+fn ip(a: [u8; 4]) -> IpAddr {
+    Ipv4Addr::from(a).into()
+}
+
+fn ip6(text: &str) -> IpAddr {
+    text.parse().unwrap()
 }
 
 #[test]
@@ -366,4 +370,124 @@ fn member_delta_overflow_is_rejected() {
             .bool(true);
     });
     assert!(decode_bytes(&bytes).is_err());
+}
+
+#[test]
+fn ipv6_entries_round_trip() {
+    let changes = [
+        Change::set(
+            Key::Address {
+                interface: "eth0".into(),
+                address: ip6("2001:db8::1"),
+            },
+            Value::Address { prefix_len: 64 },
+        ),
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: ip6("::"),
+                len: 0,
+            },
+            Value::Route(RouteAction::Forward(vec![NextHop {
+                interface: "eth1".into(),
+                address: Some(ip6("fe80::1")),
+            }])),
+        ),
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: ip6("2001:db8:1::"),
+                len: 48,
+            },
+            Value::Route(RouteAction::Discard),
+        ),
+        Change::set(
+            Key::Neighbor {
+                interface: "eth1".into(),
+                address: ip6("fe80::1"),
+            },
+            Value::Neighbor {
+                mac: [2, 0, 0, 0, 0, 0xfe],
+            },
+        ),
+    ];
+    for change in &changes {
+        assert_eq!(&round_trip(change), change);
+    }
+}
+
+#[test]
+fn ipv6_entries_are_checked_for_their_family() {
+    let bad = [
+        // Host bits after the prefix length.
+        Change::delete(Key::Route {
+            vrf: "default".into(),
+            prefix: ip6("2001:db8::1"),
+            len: 64,
+        }),
+        // Longer than 128.
+        Change::delete(Key::Route {
+            vrf: "default".into(),
+            prefix: ip6("::"),
+            len: 129,
+        }),
+        // An IPv4 prefix length limit does not apply, but 129 does.
+        Change::set(
+            Key::Address {
+                interface: "eth0".into(),
+                address: ip6("2001:db8::1"),
+            },
+            Value::Address { prefix_len: 129 },
+        ),
+        // A next hop of the other family.
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: ip6("::"),
+                len: 0,
+            },
+            Value::Route(RouteAction::Forward(vec![NextHop {
+                interface: "eth1".into(),
+                address: Some(ip([192, 0, 2, 1])),
+            }])),
+        ),
+    ];
+    for change in &bad {
+        assert!(change.validate().is_err(), "{change:?}");
+    }
+    // 33 is fine for IPv6 but not for IPv4.
+    let ipv6_33 = Change::set(
+        Key::Address {
+            interface: "eth0".into(),
+            address: ip6("2001:db8::1"),
+        },
+        Value::Address { prefix_len: 33 },
+    );
+    assert!(ipv6_33.validate().is_ok());
+}
+
+#[test]
+fn an_address_not_in_its_canonical_text_is_refused() {
+    // RFC 5952: "2001:DB8::1" and "2001:db8:0::1" are the same address as
+    // "2001:db8::1"; only the canonical spelling is a key.
+    let encoded = |address: &str| {
+        let mut payload = Vec::new();
+        let mut e = Encoder::new(&mut payload);
+        e.map(1)
+            .array(3)
+            .u64(sid::ADDRESS)
+            .text("eth0")
+            .text(address)
+            .map(1)
+            .u64(sid::ADDRESS_PREFIX_LENGTH - sid::ADDRESS)
+            .u64(64);
+        payload
+    };
+    assert!(Change::decode(&mut Decoder::new(&encoded("2001:db8::1"))).is_ok());
+    for spelling in ["2001:DB8::1", "2001:db8:0::1", "2001:0db8::1"] {
+        assert!(
+            Change::decode(&mut Decoder::new(&encoded(spelling))).is_err(),
+            "{spelling}"
+        );
+    }
 }

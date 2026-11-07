@@ -10,8 +10,9 @@
 //! ```
 //!
 //! Inside a value, members are keyed by their SID minus the SID of the entry, as in
-//! RFC 9254. Addresses, prefixes and MAC addresses are text, as YANG types them.
-//! Only IPv4 is here; IPv6 comes after the skeleton.
+//! RFC 9254. Addresses, prefixes and MAC addresses are text, as YANG types them. An
+//! address is IPv4 or IPv6 (`inet:ip-address`); a prefix length is checked against its
+//! family, and a next hop must be of the route's family.
 //!
 //! # Standards
 //!
@@ -21,12 +22,14 @@
 //!   new value, or to `null` to delete.
 //! - RFC 8343 (`ietf-interfaces`) and RFC 8344 (`ietf-ip`): the interface and address
 //!   entries follow their leaves (enabled, phys-address, mtu, prefix-length).
+//! - RFC 5952 section 4: an IPv6 address is accepted only in its canonical text, so
+//!   one address is one key.
 //!
 //! Deviations: the route and neighbor tables are ruster's own models, and the SIDs are
 //! local (see [`crate::sid`]).
 
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 
 use crate::cbor::{DecodeError, Decoder, Encoder, Kind};
 use crate::sid;
@@ -42,16 +45,16 @@ pub enum Key {
     },
     Address {
         interface: String,
-        address: Ipv4Addr,
+        address: IpAddr,
     },
     Route {
         vrf: String,
-        prefix: Ipv4Addr,
+        prefix: IpAddr,
         len: u8,
     },
     Neighbor {
         interface: String,
-        address: Ipv4Addr,
+        address: IpAddr,
     },
 }
 
@@ -87,7 +90,7 @@ pub enum RouteAction {
 pub struct NextHop {
     pub interface: String,
     /// `None` for an on-link route, where the destination itself is the next hop.
-    pub address: Option<Ipv4Addr>,
+    pub address: Option<IpAddr>,
 }
 
 /// One change to a table: set `value`, or delete the entry when it is `None`.
@@ -192,15 +195,26 @@ impl Change {
                     Value::Interface { mtu, .. } if *mtu < MIN_MTU => {
                         return Err(ModelError::Invalid("mtu"));
                     }
-                    Value::Address { prefix_len } if *prefix_len > 32 => {
-                        return Err(ModelError::Invalid("prefix length"));
+                    Value::Address { prefix_len } => {
+                        let Key::Address { address, .. } = &self.key else {
+                            unreachable!("checked above");
+                        };
+                        if *prefix_len > max_len(address) {
+                            return Err(ModelError::Invalid("prefix length"));
+                        }
                     }
                     Value::Route(RouteAction::Forward(hops)) => {
                         if hops.is_empty() {
                             return Err(ModelError::Missing("next-hop"));
                         }
+                        let Key::Route { prefix, .. } = &self.key else {
+                            unreachable!("checked above");
+                        };
                         for hop in hops {
                             name(&hop.interface)?;
+                            if hop.address.is_some_and(|a| a.is_ipv4() != prefix.is_ipv4()) {
+                                return Err(ModelError::Invalid("next hop address family"));
+                            }
                         }
                     }
                     _ => {}
@@ -287,7 +301,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::INTERFACE => Key::Interface { name: first },
         sid::ADDRESS => Key::Address {
             interface: first,
-            address: parse_ipv4(d.text()?)?,
+            address: parse_ip(d.text()?)?,
         },
         sid::ROUTE => {
             let (prefix, len) = parse_prefix(d.text()?)?;
@@ -299,7 +313,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         }
         _ => Key::Neighbor {
             interface: first,
-            address: parse_ipv4(d.text()?)?,
+            address: parse_ip(d.text()?)?,
         },
     })
 }
@@ -383,7 +397,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
                     &mut prefix_len,
                     u8::try_from(d.u64()?)
                         .ok()
-                        .filter(|&len| len <= 32)
+                        .filter(|&len| len <= 128)
                         .ok_or(ModelError::Invalid("prefix length"))?,
                 )?;
             }
@@ -444,7 +458,7 @@ fn decode_next_hops(d: &mut Decoder<'_>) -> Result<Vec<NextHop>, ModelError> {
                 .ok_or(ModelError::Invalid("member SID"))?;
             match member {
                 sid::NEXT_HOP_INTERFACE => put(&mut interface, d.text()?.to_owned())?,
-                sid::NEXT_HOP_ADDRESS => put(&mut address, parse_ipv4(d.text()?)?)?,
+                sid::NEXT_HOP_ADDRESS => put(&mut address, parse_ip(d.text()?)?)?,
                 other => return Err(ModelError::UnknownMember(other)),
             }
         }
@@ -466,14 +480,48 @@ fn put<T>(slot: &mut Option<T>, value: T) -> Result<(), ModelError> {
     Ok(())
 }
 
-fn parse_ipv4(text: &str) -> Result<Ipv4Addr, ModelError> {
-    text.parse()
-        .map_err(|_| ModelError::Invalid("IPv4 address"))
+/// The longest prefix of the address's family.
+pub fn max_len(address: &IpAddr) -> u8 {
+    if address.is_ipv4() {
+        32
+    } else {
+        128
+    }
 }
 
-fn parse_prefix(text: &str) -> Result<(Ipv4Addr, u8), ModelError> {
+/// `address` with the bits after the first `len` cleared.
+pub fn network(address: IpAddr, len: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(a) => {
+            let mask = u32::MAX
+                .checked_shl(32 - u32::from(len.min(32)))
+                .unwrap_or(0);
+            IpAddr::V4((u32::from(a) & mask).into())
+        }
+        IpAddr::V6(a) => {
+            let mask = u128::MAX
+                .checked_shl(128 - u32::from(len.min(128)))
+                .unwrap_or(0);
+            IpAddr::V6((u128::from(a) & mask).into())
+        }
+    }
+}
+
+/// An IP address in the canonical text of RFC 5952 (for IPv6) or dotted decimal.
+fn parse_ip(text: &str) -> Result<IpAddr, ModelError> {
+    let address: IpAddr = text
+        .parse()
+        .map_err(|_| ModelError::Invalid("IP address"))?;
+    // One spelling per address, so that keys compare equal (RFC 5952 section 4).
+    if address.to_string() != text {
+        return Err(ModelError::Invalid("IP address (not canonical)"));
+    }
+    Ok(address)
+}
+
+fn parse_prefix(text: &str) -> Result<(IpAddr, u8), ModelError> {
     let (address, len) = text.split_once('/').ok_or(ModelError::Invalid("prefix"))?;
-    let address = parse_ipv4(address)?;
+    let address = parse_ip(address)?;
     let canonical = !len.is_empty()
         && len.bytes().all(|b| b.is_ascii_digit())
         && (len == "0" || !len.starts_with('0'));
@@ -483,10 +531,9 @@ fn parse_prefix(text: &str) -> Result<(Ipv4Addr, u8), ModelError> {
     let len: u8 = len
         .parse()
         .ok()
-        .filter(|&len| len <= 32)
+        .filter(|&len| len <= max_len(&address))
         .ok_or(ModelError::Invalid("prefix length"))?;
-    let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
-    if u32::from(address) & !mask != 0 {
+    if network(address, len) != address {
         return Err(ModelError::Invalid("prefix (host bits set)"));
     }
     Ok((address, len))
@@ -520,7 +567,7 @@ pub fn parse_mac(text: &str) -> Result<[u8; 6], ModelError> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolveRequest {
     pub interface: String,
-    pub address: Ipv4Addr,
+    pub address: IpAddr,
 }
 
 impl ResolveRequest {
@@ -546,7 +593,7 @@ impl ResolveRequest {
                 Some(sid::RESOLVE_REQUEST_INTERFACE) => {
                     put(&mut interface, d.text()?.to_owned())?;
                 }
-                Some(sid::RESOLVE_REQUEST_ADDRESS) => put(&mut address, parse_ipv4(d.text()?)?)?,
+                Some(sid::RESOLVE_REQUEST_ADDRESS) => put(&mut address, parse_ip(d.text()?)?)?,
                 Some(other) => return Err(ModelError::UnknownMember(other)),
                 None => return Err(ModelError::Invalid("member SID")),
             }

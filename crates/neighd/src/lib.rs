@@ -27,7 +27,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::net::{UnixDatagram, UnixStream};
 
 use ruster_proto::cbor::Decoder;
@@ -151,7 +151,7 @@ impl Neighd {
                 Change::set(
                     Key::Neighbor {
                         interface: interface.clone(),
-                        address: *address,
+                        address: (*address).into(),
                     },
                     Value::Neighbor { mac: *mac },
                 )
@@ -201,7 +201,10 @@ impl Neighd {
                         address,
                     },
                     Value::Address { prefix_len },
-                ) if name == interface => Some((*address, *prefix_len)),
+                ) if name == interface => match address {
+                    IpAddr::V4(address) => Some((*address, *prefix_len)),
+                    IpAddr::V6(_) => None,
+                },
                 _ => None,
             })
             .collect()
@@ -239,7 +242,7 @@ impl Neighd {
             .store()
             .get(&Key::Address {
                 interface: interface.to_owned(),
-                address,
+                address: address.into(),
             })
             .is_some()
     }
@@ -255,7 +258,10 @@ impl Neighd {
                     if code == Code::CONTENT {
                         for change in decode_changes(&payload).unwrap_or_default() {
                             if let (
-                                Key::Neighbor { interface, address },
+                                Key::Neighbor {
+                                    interface,
+                                    address: IpAddr::V4(address),
+                                },
                                 Some(Value::Neighbor { mac }),
                             ) = (change.key, change.value)
                             {
@@ -268,8 +274,12 @@ impl Neighd {
                 }
                 Event::Notification { payload } => {
                     let mut d = Decoder::new(&payload);
-                    if let Ok(request) = ResolveRequest::decode(&mut d) {
-                        self.resolve(request.interface, request.address, now_ms);
+                    if let Ok(ResolveRequest {
+                        interface,
+                        address: IpAddr::V4(address),
+                    }) = ResolveRequest::decode(&mut d)
+                    {
+                        self.resolve(interface, address, now_ms);
                     }
                 }
                 // A refused Observe registration is tried again.
@@ -391,7 +401,7 @@ impl Neighd {
             let _ = self.fe.patch(&[Change::set(
                 Key::Neighbor {
                     interface: key.0.clone(),
-                    address: sender,
+                    address: sender.into(),
                 },
                 Value::Neighbor { mac: sender_mac },
             )]);

@@ -248,7 +248,7 @@ impl Confd {
                 out.insert(
                     Key::Address {
                         interface: interface.name.clone(),
-                        address,
+                        address: address.into(),
                     },
                     Value::Address { prefix_len },
                 );
@@ -278,7 +278,7 @@ impl Confd {
                 route_key(route.prefix, route.len),
                 Value::Route(RouteAction::Forward(vec![NextHop {
                     interface: route.interface.clone(),
-                    address: route.via,
+                    address: route.via.map(Into::into),
                 }])),
             );
         }
@@ -289,7 +289,7 @@ impl Confd {
 fn route_key(prefix: Ipv4Addr, len: u8) -> Key {
     Key::Route {
         vrf: VRF.into(),
-        prefix,
+        prefix: prefix.into(),
         len,
     }
 }

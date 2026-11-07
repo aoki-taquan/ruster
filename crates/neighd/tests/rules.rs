@@ -55,7 +55,7 @@ impl Lab {
                 Change::set(
                     Key::Address {
                         interface: "lan".into(),
-                        address: Ipv4Addr::from(LAN_IP),
+                        address: Ipv4Addr::from(LAN_IP).into(),
                     },
                     Value::Address { prefix_len: 24 },
                 ),
@@ -194,7 +194,7 @@ fn a_silent_fe_does_not_stop_neighd_from_serving_resolve_requests() {
             Change::set(
                 Key::Address {
                     interface: "lan".into(),
-                    address: Ipv4Addr::from(LAN_IP),
+                    address: Ipv4Addr::from(LAN_IP).into(),
                 },
                 Value::Address { prefix_len: 24 },
             ),
@@ -215,7 +215,7 @@ fn a_silent_fe_does_not_stop_neighd_from_serving_resolve_requests() {
     let mut payload = Vec::new();
     ResolveRequest {
         interface: "lan".into(),
-        address: Ipv4Addr::new(192, 0, 2, 20),
+        address: Ipv4Addr::new(192, 0, 2, 20).into(),
     }
     .encode(&mut Encoder::new(&mut payload));
     fe.notify(&payload);

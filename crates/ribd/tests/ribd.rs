@@ -34,7 +34,7 @@ impl Hook for Check<'_> {
 fn key(prefix: [u8; 4], len: u8) -> Key {
     Key::Route {
         vrf: "default".into(),
-        prefix: Ipv4Addr::from(prefix),
+        prefix: Ipv4Addr::from(prefix).into(),
         len,
     }
 }
