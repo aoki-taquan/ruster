@@ -110,13 +110,8 @@ fn tcp_port_selection_uses_the_tcp_key_and_domains() {
         assert_eq!(tcp.start_domain, DirectoryHashDomain::TcpPortStart);
         assert_eq!(tcp.takeover_domain, DirectoryHashDomain::TcpPortTakeover);
         assert_eq!(
-            (
-                tcp.first_port,
-                tcp.last_port,
-                tcp.inside,
-                tcp.public_address
-            ),
-            (1, 65_535, LAN, PUBLIC)
+            (tcp.ports.bounds(), tcp.inside, tcp.public_address),
+            ((1, 65_535), LAN, PUBLIC)
         );
         assert_eq!(tcp.allocator_seed, 3);
         let udp = PortSelectionKey {

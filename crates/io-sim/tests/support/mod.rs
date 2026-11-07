@@ -34,7 +34,7 @@ pub fn tcp_runtime<'a>(
         Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice());
     let session_address_nodes =
         Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
-    let port_count = usize::from(config.last_port() - config.first_port()) + 1;
+    let port_count = config.ports().count();
     let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
     let port_free_bits =
         Box::leak(vec![0_u64; port_free_bitmap_words(port_count)].into_boxed_slice());
@@ -103,7 +103,7 @@ impl UdpTestIndexes {
         } else {
             peer_capacity.next_power_of_two()
         };
-        let port_count = usize::from(config.last_port() - config.first_port()) + 1;
+        let port_count = config.ports().count();
         Self {
             mapping_buckets: vec![DirectoryBucket::default(); mapping_bucket_count],
             mapping_nodes: vec![DirectoryNode::default(); mapping_capacity],
@@ -174,7 +174,7 @@ pub fn icmp_runtime(
     let nodes = |count: usize| -> &'static mut [DirectoryNode] {
         Box::leak(vec![DirectoryNode::default(); count].into_boxed_slice())
     };
-    let identifiers = usize::from(config.last_identifier() - config.first_identifier()) + 1;
+    let identifiers = config.identifiers().count();
     let storage = Nat44UdpIndexStorage::new(
         leak(bucket_count(mapping_capacity), DirectoryBucket::default()),
         nodes(mapping_capacity),

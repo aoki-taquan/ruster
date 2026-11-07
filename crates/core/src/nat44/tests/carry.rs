@@ -299,8 +299,7 @@ fn carry_identity_orders_the_conflicts_and_ignores_the_policy_knobs() {
         INSIDE,
         OUTSIDE,
         PUBLIC,
-        40_000,
-        40_015,
+        crate::PortSet::range(40_000, 40_015).unwrap(),
         Nat44Filtering::AddressDependent,
     );
     assert_eq!(base.carry_conflict(base), None);
@@ -308,8 +307,7 @@ fn carry_identity_orders_the_conflicts_and_ignores_the_policy_knobs() {
         OUTSIDE,
         INSIDE,
         Ipv4Address::from_octets([203, 0, 113, 11]),
-        40_001,
-        40_015,
+        crate::PortSet::range(40_001, 40_015).unwrap(),
         Nat44Filtering::EndpointIndependent,
     );
     assert_eq!(
@@ -334,8 +332,7 @@ fn carry_identity_orders_the_conflicts_and_ignores_the_policy_knobs() {
         Some(StateCarryConflict::PortRange)
     );
     let last = Nat44CarryIdentity {
-        first_port: 40_000,
-        last_port: 40_014,
+        ports: crate::PortSet::range(40_000, 40_014).unwrap(),
         ..ports
     };
     assert_eq!(
@@ -343,7 +340,7 @@ fn carry_identity_orders_the_conflicts_and_ignores_the_policy_knobs() {
         Some(StateCarryConflict::PortRange)
     );
     let filtering = Nat44CarryIdentity {
-        last_port: 40_015,
+        ports: crate::PortSet::range(40_000, 40_015).unwrap(),
         ..last
     };
     assert_eq!(

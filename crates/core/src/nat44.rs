@@ -319,7 +319,7 @@ mod tcp_tests {
             Box::leak(vec![DirectoryBucket::default(); session_bucket_count].into_boxed_slice());
         let session_address_nodes =
             Box::leak(vec![DirectoryNode::default(); sessions.len()].into_boxed_slice());
-        let port_count = usize::from(config.last_port - config.first_port) + 1;
+        let port_count = config.ports.count();
         let port_owners = Box::leak(vec![PortOwnerSlot::default(); port_count].into_boxed_slice());
         let port_free_bits =
             Box::leak(vec![0_u64; crate::port_free_bitmap_words(port_count)].into_boxed_slice());
@@ -2740,7 +2740,7 @@ mod tcp_tests {
                 })
             };
         if config.policy.port_preservation
-            && (config.first_port..=config.last_port).contains(&internal_port)
+            && config.ports.contains(internal_port)
             && owner_live(internal_port) != Some(true)
         {
             return Ok(Some(internal_port));
@@ -2748,17 +2748,17 @@ mod tcp_tests {
         if let Some(port) = previous {
             return Ok(Some(port));
         }
-        let pool = usize::from(config.last_port - config.first_port) + 1;
+        let pool = config.ports.count();
         let start = runtime
             .port_selection_key()
             .search_start(internal_address, internal_port);
         if let Some(port) = (0..pool)
-            .map(|step| config.first_port + ((start + step) % pool) as u16)
+            .map(|step| config.ports.port((start + step) % pool))
             .find(|port| owner_live(*port).is_none())
         {
             return Ok(Some(port));
         }
-        if (config.first_port..=config.last_port).any(|port| owner_live(port) == Some(false)) {
+        if (0..pool).any(|index| owner_live(config.ports.port(index)) == Some(false)) {
             Ok(None)
         } else {
             Err(())
@@ -3245,6 +3245,8 @@ pub struct Nat44UdpConfig {
     public_address: Ipv4Address,
     first_port: u16,
     last_port: u16,
+    /// The public ports; `first_port..=last_port` are its bounds.
+    ports: crate::PortSet,
     policy: Nat44UdpPolicy,
     authority: u64,
     snapshot_identity: [usize; 8],
@@ -3289,6 +3291,27 @@ impl Nat44UdpConfig {
         last_port: u16,
         policy: Nat44UdpPolicy,
     ) -> Result<Self, Nat44UdpConfigError> {
+        if first_port == 0 {
+            return Err(Nat44UdpConfigError::PortPoolIncludesZero);
+        }
+        if first_port > last_port {
+            return Err(Nat44UdpConfigError::PortPoolReversed);
+        }
+        let ports = crate::PortSet::range(first_port, last_port)
+            .map_err(|_| Nat44UdpConfigError::PortPoolReversed)?;
+        Self::with_port_set(snapshot, inside, outside, public_address, ports, policy)
+    }
+
+    /// Like [`Self::new`] with any port set, such as a MAP-E one
+    /// ([`crate::PortSet::psid`]).
+    pub fn with_port_set(
+        snapshot: &ForwardingSnapshot<'_>,
+        inside: IfId,
+        outside: IfId,
+        public_address: Ipv4Address,
+        ports: crate::PortSet,
+        policy: Nat44UdpPolicy,
+    ) -> Result<Self, Nat44UdpConfigError> {
         if inside == outside {
             return Err(Nat44UdpConfigError::InterfacesEqual);
         }
@@ -3307,18 +3330,14 @@ impl Nat44UdpConfig {
         if binding.interface != outside {
             return Err(Nat44UdpConfigError::PublicBindingWrongInterface);
         }
-        if first_port == 0 {
-            return Err(Nat44UdpConfigError::PortPoolIncludesZero);
-        }
-        if first_port > last_port {
-            return Err(Nat44UdpConfigError::PortPoolReversed);
-        }
+        let (first_port, last_port) = ports.bounds();
         Ok(Self {
             inside,
             outside,
             public_address,
             first_port,
             last_port,
+            ports,
             policy,
             authority: snapshot_authority(snapshot),
             snapshot_identity: snapshot.identity(),
@@ -3333,8 +3352,7 @@ impl Nat44UdpConfig {
             self.inside,
             self.outside,
             self.public_address,
-            self.first_port,
-            self.last_port,
+            self.ports,
             self.policy.filtering,
         )
         .with_idle_ttl(self.policy.idle_ttl_ms)
@@ -3364,6 +3382,12 @@ impl Nat44UdpConfig {
     #[must_use]
     pub const fn last_port(self) -> u16 {
         self.last_port
+    }
+
+    /// The public ports.
+    #[must_use]
+    pub const fn ports(self) -> crate::PortSet {
+        self.ports
     }
 
     #[must_use]
@@ -3755,8 +3779,7 @@ pub struct Nat44CarryIdentity {
     inside: IfId,
     outside: IfId,
     public_address: Ipv4Address,
-    first_port: u16,
-    last_port: u16,
+    ports: crate::PortSet,
     filtering: Nat44Filtering,
     /// TCP (established, opening, closing) idle timeouts; zero for UDP and
     /// ICMP, whose liveness is computed from the bound timeout.
@@ -3780,16 +3803,14 @@ impl Nat44CarryIdentity {
         inside: IfId,
         outside: IfId,
         public_address: Ipv4Address,
-        first_port: u16,
-        last_port: u16,
+        ports: crate::PortSet,
         filtering: Nat44Filtering,
     ) -> Self {
         Self {
             inside,
             outside,
             public_address,
-            first_port,
-            last_port,
+            ports,
             filtering,
             timers: [0; 3],
             idle_ttl_ceiling: 0,
@@ -3832,7 +3853,7 @@ impl Nat44CarryIdentity {
             Some(StateCarryConflict::Interfaces)
         } else if self.public_address != next.public_address {
             Some(StateCarryConflict::PublicAddress)
-        } else if (self.first_port, self.last_port) != (next.first_port, next.last_port) {
+        } else if self.ports != next.ports {
             Some(StateCarryConflict::PortRange)
         } else if self.filtering != next.filtering {
             Some(StateCarryConflict::Filtering)
@@ -4096,7 +4117,7 @@ impl TestNat44UdpIndexes {
         } else {
             peer_capacity.next_power_of_two()
         };
-        let port_count = usize::from(config.last_port - config.first_port) + 1;
+        let port_count = config.ports.count();
         Self {
             mapping_buckets: vec![DirectoryBucket::default(); mapping_bucket_count],
             mapping_nodes: vec![DirectoryNode::default(); mapping_capacity],
@@ -4487,8 +4508,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         PortOwnerTable::validate_config(
             indexes.port_owners.len(),
             indexes.port_free_bits.len(),
-            config.first_port,
-            config.last_port,
+            config.ports,
             mappings.len(),
         )
         .map_err(|_| Nat44UdpRuntimeConfigError::PortOwnerTableInvalid)?;
@@ -4512,8 +4532,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         let port_owners = PortOwnerTable::new(
             indexes.port_owners,
             indexes.port_free_bits,
-            config.first_port,
-            config.last_port,
+            config.ports,
             mappings.len(),
         )
         .expect("port owner dimensions were preflighted");
@@ -4687,8 +4706,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         if PortOwnerTable::validate_config(
             self.port_owners.slot_count(),
             port_free_bitmap_words(self.port_owners.slot_count()),
-            config.first_port,
-            config.last_port,
+            config.ports,
             self.mappings.len(),
         )
         .is_err()
@@ -4798,11 +4816,8 @@ impl<'a> Nat44UdpRuntime<'a> {
         self.mapping_directory.clear_with_key(hash_key.0);
         self.peer_directory.clear_with_key(hash_key.0);
         self.hosts.clear_with_key(hash_key.0);
-        self.port_owners.reconfigure_prevalidated_and_clear(
-            config.first_port,
-            config.last_port,
-            self.mappings.len(),
-        );
+        self.port_owners
+            .reconfigure_prevalidated_and_clear(config.ports, self.mappings.len());
         self.config = config;
         self.hash_key = hash_key;
         self.watermark_ms = None;
@@ -6483,8 +6498,7 @@ impl<'a> Nat44UdpRuntime<'a> {
             key: self.hash_key.0,
             start_domain: DirectoryHashDomain::UdpPortStart,
             takeover_domain: DirectoryHashDomain::UdpPortTakeover,
-            first_port: self.config.first_port,
-            last_port: self.config.last_port,
+            ports: self.config.ports,
             inside: self.config.inside,
             public_address: self.config.public_address,
             allocator_seed: self.config.policy.allocator_seed,
@@ -6517,9 +6531,7 @@ impl<'a> Nat44UdpRuntime<'a> {
         previous: Option<Nat44UdpMappingSlot>,
         now_ms: u64,
     ) -> Result<Option<Nat44UdpPortSelection>, Nat44UdpPlanError> {
-        if self.config.policy.port_preservation
-            && (self.config.first_port..=self.config.last_port).contains(&internal_port)
-        {
+        if self.config.policy.port_preservation && self.config.ports.contains(internal_port) {
             if let Some(selection) = self.select_port(internal_port, now_ms)? {
                 return Ok(Some(selection));
             }
@@ -6603,8 +6615,7 @@ struct PortSelectionKey {
     key: DirectoryHashKey,
     start_domain: DirectoryHashDomain,
     takeover_domain: DirectoryHashDomain,
-    first_port: u16,
-    last_port: u16,
+    ports: crate::PortSet,
     /// Inside interface, public address, and allocator seed; the internal
     /// endpoint completes [`Self::endpoint_words`].
     inside: IfId,
@@ -6631,7 +6642,7 @@ impl PortSelectionKey {
     /// `hash % pool`. The pool has at most 65535 ports, so the modulo bias
     /// of the 64-bit hash is below 2^-47.
     fn pool_offset(self, domain: DirectoryHashDomain, words: &[u64]) -> usize {
-        let pool_size = u64::from(self.last_port - self.first_port) + 1;
+        let pool_size = self.ports.count() as u64;
         usize::try_from(self.key.hash_words(domain, words) % pool_size)
             .expect("a pool offset fits usize")
     }
@@ -6679,7 +6690,7 @@ impl PortSelectionKey {
                 probe as u64,
             ],
         );
-        self.first_port + u16::try_from(offset).expect("a pool offset fits u16")
+        self.ports.port(offset)
     }
 }
 
@@ -7194,6 +7205,8 @@ pub struct Nat44TcpConfig {
     public_address: Ipv4Address,
     first_port: u16,
     last_port: u16,
+    /// The public ports; `first_port..=last_port` are its bounds.
+    ports: crate::PortSet,
     policy: Nat44TcpPolicy,
     authority: u64,
     snapshot_identity: [usize; 8],
@@ -7238,6 +7251,27 @@ impl Nat44TcpConfig {
         last_port: u16,
         policy: Nat44TcpPolicy,
     ) -> Result<Self, Nat44TcpConfigError> {
+        if first_port == 0 {
+            return Err(Nat44TcpConfigError::PortPoolIncludesZero);
+        }
+        if first_port > last_port {
+            return Err(Nat44TcpConfigError::PortPoolReversed);
+        }
+        let ports = crate::PortSet::range(first_port, last_port)
+            .map_err(|_| Nat44TcpConfigError::PortPoolReversed)?;
+        Self::with_port_set(snapshot, inside, outside, public_address, ports, policy)
+    }
+
+    /// Like [`Self::new`] with any port set, such as a MAP-E one
+    /// ([`crate::PortSet::psid`]).
+    pub fn with_port_set(
+        snapshot: &ForwardingSnapshot<'_>,
+        inside: IfId,
+        outside: IfId,
+        public_address: Ipv4Address,
+        ports: crate::PortSet,
+        policy: Nat44TcpPolicy,
+    ) -> Result<Self, Nat44TcpConfigError> {
         if inside == outside {
             return Err(Nat44TcpConfigError::InterfacesEqual);
         }
@@ -7256,18 +7290,14 @@ impl Nat44TcpConfig {
         if binding.interface != outside {
             return Err(Nat44TcpConfigError::PublicBindingWrongInterface);
         }
-        if first_port == 0 {
-            return Err(Nat44TcpConfigError::PortPoolIncludesZero);
-        }
-        if first_port > last_port {
-            return Err(Nat44TcpConfigError::PortPoolReversed);
-        }
+        let (first_port, last_port) = ports.bounds();
         Ok(Self {
             inside,
             outside,
             public_address,
             first_port,
             last_port,
+            ports,
             policy,
             authority: snapshot_authority(snapshot),
             snapshot_identity: snapshot.identity(),
@@ -7282,8 +7312,7 @@ impl Nat44TcpConfig {
             self.inside,
             self.outside,
             self.public_address,
-            self.first_port,
-            self.last_port,
+            self.ports,
             self.policy.filtering,
         )
         .with_tcp_timers(self.policy.carry_timers())
@@ -7313,6 +7342,12 @@ impl Nat44TcpConfig {
     #[must_use]
     pub const fn last_port(self) -> u16 {
         self.last_port
+    }
+
+    /// The public ports.
+    #[must_use]
+    pub const fn ports(self) -> crate::PortSet {
+        self.ports
     }
 
     #[must_use]
@@ -8461,8 +8496,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         PortOwnerTable::validate_config(
             indexes.port_owners.len(),
             indexes.port_free_bits.len(),
-            config.first_port,
-            config.last_port,
+            config.ports,
             mappings.len(),
         )
         .map_err(|_| Nat44TcpRuntimeConfigError::PortOwnerTableInvalid)?;
@@ -8500,8 +8534,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         let port_owners = PortOwnerTable::new(
             indexes.port_owners,
             indexes.port_free_bits,
-            config.first_port,
-            config.last_port,
+            config.ports,
             mappings.len(),
         )
         .expect("port owner dimensions were preflighted");
@@ -8708,8 +8741,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         if PortOwnerTable::validate_config(
             self.port_owners.slot_count(),
             port_free_bitmap_words(self.port_owners.slot_count()),
-            config.first_port,
-            config.last_port,
+            config.ports,
             self.mappings.len(),
         )
         .is_err()
@@ -8819,11 +8851,8 @@ impl<'a> Nat44TcpRuntime<'a> {
         self.session_address_directory.clear_with_key(hash_key.0);
         self.hosts.clear_with_key(hash_key.0);
         self.session_hosts.clear_with_key(hash_key.0);
-        self.port_owners.reconfigure_prevalidated_and_clear(
-            config.first_port,
-            config.last_port,
-            self.mappings.len(),
-        );
+        self.port_owners
+            .reconfigure_prevalidated_and_clear(config.ports, self.mappings.len());
         self.config = config;
         self.hash_key = hash_key;
         self.watermark_ms = None;
@@ -11574,8 +11603,7 @@ impl<'a> Nat44TcpRuntime<'a> {
             key: self.hash_key.0,
             start_domain: DirectoryHashDomain::TcpPortStart,
             takeover_domain: DirectoryHashDomain::TcpPortTakeover,
-            first_port: self.config.first_port,
-            last_port: self.config.last_port,
+            ports: self.config.ports,
             inside: self.config.inside,
             public_address: self.config.public_address,
             allocator_seed: self.config.policy.allocator_seed,
@@ -11604,9 +11632,7 @@ impl<'a> Nat44TcpRuntime<'a> {
         previous: Option<Nat44TcpMappingSlot>,
         now_ms: u64,
     ) -> Result<Option<Nat44TcpPortSelection>, Nat44TcpPlanError> {
-        if self.config.policy.port_preservation
-            && (self.config.first_port..=self.config.last_port).contains(&internal_port)
-        {
+        if self.config.policy.port_preservation && self.config.ports.contains(internal_port) {
             if let Some(selection) = self.select_port(internal_port, now_ms)? {
                 return Ok(Some(selection));
             }
@@ -11789,6 +11815,7 @@ mod tests {
                 public_address: udp_config.public_address,
                 first_port: udp_config.first_port,
                 last_port: udp_config.last_port,
+                ports: udp_config.ports,
                 policy: tcp_policy,
                 authority: udp_config.authority,
                 snapshot_identity: udp_config.snapshot_identity,
@@ -12979,7 +13006,7 @@ mod tests {
                 previous = current;
             }
             // The two-port pool, not the mapping table, bounds live mappings.
-            let pool = usize::from(config.last_port - config.first_port) + 1;
+            let pool = config.ports.count();
             assert_eq!(peak, pool.min(MAPPINGS), "the churn fills the port pool");
         });
     }
@@ -13699,7 +13726,7 @@ mod tests {
                 })
             };
         if config.policy.port_preservation
-            && (config.first_port..=config.last_port).contains(&internal_port)
+            && config.ports.contains(internal_port)
             && owner_live(internal_port) != Some(true)
         {
             return Ok(Some(internal_port));
@@ -13707,17 +13734,17 @@ mod tests {
         if let Some(port) = previous {
             return Ok(Some(port));
         }
-        let pool = usize::from(config.last_port - config.first_port) + 1;
+        let pool = config.ports.count();
         let start = runtime
             .port_selection_key()
             .search_start(internal_address, internal_port);
         if let Some(port) = (0..pool)
-            .map(|step| config.first_port + ((start + step) % pool) as u16)
+            .map(|step| config.ports.port((start + step) % pool))
             .find(|port| owner_live(*port).is_none())
         {
             return Ok(Some(port));
         }
-        if (config.first_port..=config.last_port).any(|port| owner_live(port) == Some(false)) {
+        if (0..pool).any(|index| owner_live(config.ports.port(index)) == Some(false)) {
             Ok(None)
         } else {
             Err(())

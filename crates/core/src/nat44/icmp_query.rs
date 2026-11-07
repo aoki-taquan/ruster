@@ -314,28 +314,60 @@ impl Nat44IcmpConfig {
             policy.engine(),
         )
         .map(Self)
-        .map_err(|error| match error {
-            Nat44UdpConfigError::InterfacesEqual => Nat44IcmpConfigError::InterfacesEqual,
-            Nat44UdpConfigError::InsideInterfaceMissing => {
-                Nat44IcmpConfigError::InsideInterfaceMissing
-            }
-            Nat44UdpConfigError::OutsideInterfaceMissing => {
-                Nat44IcmpConfigError::OutsideInterfaceMissing
-            }
-            Nat44UdpConfigError::PublicAddressNotHostUnicast => {
-                Nat44IcmpConfigError::PublicAddressNotHostUnicast
-            }
-            Nat44UdpConfigError::PublicBindingMissing => Nat44IcmpConfigError::PublicBindingMissing,
-            Nat44UdpConfigError::PublicBindingWrongInterface => {
-                Nat44IcmpConfigError::PublicBindingWrongInterface
-            }
-            Nat44UdpConfigError::PortPoolIncludesZero => {
-                Nat44IcmpConfigError::IdentifierPoolIncludesZero
-            }
-            Nat44UdpConfigError::PortPoolReversed => Nat44IcmpConfigError::IdentifierPoolReversed,
-        })
+        .map_err(icmp_config_error)
     }
 
+    /// Like [`Self::new`] with any identifier set, such as a MAP-E port set
+    /// (RFC 7597 section 5.1 uses the port set for ICMP identifiers too).
+    pub fn with_port_set(
+        snapshot: &ForwardingSnapshot<'_>,
+        inside: IfId,
+        outside: IfId,
+        public_address: Ipv4Address,
+        identifiers: crate::PortSet,
+        policy: Nat44IcmpPolicy,
+    ) -> Result<Self, Nat44IcmpConfigError> {
+        Nat44UdpConfig::with_port_set(
+            snapshot,
+            inside,
+            outside,
+            public_address,
+            identifiers,
+            policy.engine(),
+        )
+        .map(Self)
+        .map_err(icmp_config_error)
+    }
+
+    /// The identifiers.
+    #[must_use]
+    pub const fn identifiers(self) -> crate::PortSet {
+        self.0.ports()
+    }
+}
+
+fn icmp_config_error(error: Nat44UdpConfigError) -> Nat44IcmpConfigError {
+    match error {
+        Nat44UdpConfigError::InterfacesEqual => Nat44IcmpConfigError::InterfacesEqual,
+        Nat44UdpConfigError::InsideInterfaceMissing => Nat44IcmpConfigError::InsideInterfaceMissing,
+        Nat44UdpConfigError::OutsideInterfaceMissing => {
+            Nat44IcmpConfigError::OutsideInterfaceMissing
+        }
+        Nat44UdpConfigError::PublicAddressNotHostUnicast => {
+            Nat44IcmpConfigError::PublicAddressNotHostUnicast
+        }
+        Nat44UdpConfigError::PublicBindingMissing => Nat44IcmpConfigError::PublicBindingMissing,
+        Nat44UdpConfigError::PublicBindingWrongInterface => {
+            Nat44IcmpConfigError::PublicBindingWrongInterface
+        }
+        Nat44UdpConfigError::PortPoolIncludesZero => {
+            Nat44IcmpConfigError::IdentifierPoolIncludesZero
+        }
+        Nat44UdpConfigError::PortPoolReversed => Nat44IcmpConfigError::IdentifierPoolReversed,
+    }
+}
+
+impl Nat44IcmpConfig {
     #[must_use]
     pub const fn inside(self) -> IfId {
         self.0.inside

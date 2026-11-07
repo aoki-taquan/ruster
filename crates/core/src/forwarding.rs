@@ -2953,14 +2953,14 @@ fn outside_nat_pool(
     let Some(port) = port else {
         return false;
     };
-    let ours = |public: crate::Ipv4Address, first: u16, last: u16| {
+    let ours = |public: crate::Ipv4Address, ports: crate::PortSet| {
         frame.get(address..address + 4) == Some(&public.octets()[..])
             && frame[IP + 16..IP + 20] == public.octets()
-            && !(first..=last).contains(&port)
+            && !ports.contains(port)
     };
     match protocol {
-        17 => udp.is_some_and(|c| ours(c.public_address(), c.first_port(), c.last_port())),
-        6 => tcp.is_some_and(|c| ours(c.public_address(), c.first_port(), c.last_port())),
+        17 => udp.is_some_and(|c| ours(c.public_address(), c.ports())),
+        6 => tcp.is_some_and(|c| ours(c.public_address(), c.ports())),
         _ => false,
     }
 }

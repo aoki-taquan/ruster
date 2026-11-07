@@ -21,6 +21,7 @@ mod nat44_syn_hold;
 mod nat44_tcp_state;
 mod observability;
 mod packet;
+mod port_set;
 mod reload_state;
 mod route;
 mod slot_index;
@@ -161,6 +162,7 @@ pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
 };
+pub use port_set::{PortSet, PortSetError};
 pub use reload_state::{StateCarryConflict, StateCarryOutcome};
 pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Origin, Route, RouteError,
