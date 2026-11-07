@@ -1,6 +1,6 @@
 //! `PacketSlot::truncate`: a frame cut to its first bytes is sent as cut.
 
-use ruster_core::{IfId, PacketBatch, PacketIo, SlotCompletion};
+use ruster_core::{IfId, PacketBatch, PacketIo};
 use ruster_io_sim::SimIo;
 
 const PORT: IfId = IfId(0);
@@ -40,5 +40,4 @@ fn a_longer_or_empty_cut_is_refused_and_changes_nothing() {
         assert!(!cut, "len {len}");
         assert_eq!(sent, frame, "len {len}");
     }
-    let _ = SlotCompletion::LeaseAbandoned;
 }
