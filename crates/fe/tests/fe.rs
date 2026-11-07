@@ -700,3 +700,90 @@ fn an_expiring_ipv6_packet_gets_an_icmpv6_time_exceeded_back() {
     assert_eq!(tx.bytes[54], 3, "Time Exceeded");
     assert_eq!(bench.fe.counters().icmp_errors_sent, 1);
 }
+
+#[test]
+fn an_interface_in_another_vrf_uses_that_vrf_s_routes_and_a_lookup_reaches_default() {
+    let mut bench = Bench::new();
+    let mut config = bench.connect(writers::CONFIG);
+    let red_lan = Change::set(
+        Key::Interface { name: "lan".into() },
+        Value::Interface {
+            enabled: true,
+            mac: LAN_MAC,
+            mtu: 1500,
+            vrf: "red".into(),
+        },
+    );
+    let code = bench.patch(
+        &mut config,
+        &[
+            red_lan,
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut routes = bench.connect(writers::ROUTE);
+    let in_vrf = |vrf: &str, prefix: [u8; 4], len: u8, action: RouteAction| {
+        Change::set(
+            Key::Route {
+                vrf: vrf.into(),
+                prefix: Ipv4Addr::from(prefix).into(),
+                len,
+            },
+            Value::Route(action),
+        )
+    };
+    let via_gateway = RouteAction::Forward(vec![NextHop {
+        interface: "wan".into(),
+        address: Some(Ipv4Addr::from(GATEWAY).into()),
+    }]);
+    let code = bench.patch(
+        &mut routes,
+        &[
+            // The internet is in the default VRF only; red looks it up there.
+            in_vrf("default", [0, 0, 0, 0], 0, via_gateway),
+            in_vrf(
+                "red",
+                [0, 0, 0, 0],
+                0,
+                RouteAction::LookupVrf("default".into()),
+            ),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(code, Code::CHANGED);
+
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([203, 0, 113, 7]));
+    bench.fe.step(0);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("red reaches the internet");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+
+    // Without the lookup, red has no route.
+    let code = bench.patch(
+        &mut routes,
+        &[Change::delete(Key::Route {
+            vrf: "red".into(),
+            prefix: Ipv4Addr::UNSPECIFIED.into(),
+            len: 0,
+        })],
+    );
+    assert_eq!(code, Code::CHANGED);
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([203, 0, 113, 7]));
+    bench.fe.step(1);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+}
