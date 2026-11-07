@@ -24,14 +24,15 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
 
 use ruster_core::{
-    forward_batch, ArpOpcode, GeneratedPacketBatch, GeneratedPacketIo, IfId, Interface,
-    Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, PacketIo, Route,
-    TraceEvent, TraceSink, ValidatedForwardingOwner,
+    forward_batch_with_control, ArpOpcode, ControlQueue, GeneratedPacketBatch, GeneratedPacketIo,
+    IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route,
+    LocalIpv4Binding, MacAddress, Neighbor, PacketIo, Route, TraceEvent, TraceSink,
+    ValidatedForwardingOwner,
 };
 use ruster_proto::cbor::Encoder;
 use ruster_proto::punt::{self, Direction, Punt};
@@ -69,6 +70,7 @@ const RESOLVE_REMEMBERED: usize = 1_024;
 const PUNT_MAX: usize = 1_522 + 300;
 const ETHERNET_HEADER: usize = 14;
 const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
+const ETHERTYPE_IPV6: [u8; 2] = [0x86, 0xdd];
 
 /// Counters for things the FE dropped on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -94,7 +96,10 @@ pub struct Fe<B> {
     punt: Option<UnixDatagram>,
     /// Where ARP goes when the punt socket is not connected to one peer.
     punt_peer: Option<PathBuf>,
-    last_resolve: BTreeMap<(IfId, Ipv4Addr), u64>,
+    last_resolve: BTreeMap<(IfId, IpAddr), u64>,
+    ipv6: Ipv6Fib,
+    /// Neighbor Discovery frames core copied out of the last batch.
+    control: ControlQueue,
     counters: FeCounters,
 }
 
@@ -115,7 +120,7 @@ where
     /// so nothing is forwarded until a writer adds interfaces and routes.
     pub fn new(io: B, ports: Vec<String>) -> Self {
         let builder = Builder { ports, built: None };
-        let (owner, active) = builder
+        let (owner, active, _) = builder
             .build(&Store::default())
             .expect("empty tables build");
         Self {
@@ -127,6 +132,8 @@ where
             punt: None,
             punt_peer: None,
             last_resolve: BTreeMap::new(),
+            ipv6: Ipv6Fib::default(),
+            control: ControlQueue::new(EVENTS_PER_BATCH),
             counters: FeCounters::default(),
         }
     }
@@ -170,11 +177,16 @@ where
 
     fn worker(&mut self, now_ms: u64) -> bool {
         let mut trace = FeTrace::default();
-        let snapshot = self.owner.snapshot().with_arp_to_control(true);
+        let snapshot = self
+            .owner
+            .snapshot()
+            .with_arp_to_control(true)
+            .with_ipv6(&self.ipv6);
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
             return false;
         };
-        let report = forward_batch(batch, &snapshot, &mut trace);
+        self.control.clear();
+        let report = forward_batch_with_control(batch, &snapshot, &mut self.control, &mut trace);
         if report.received == 0 {
             return false;
         }
@@ -186,6 +198,11 @@ where
         for arp in &trace.arp {
             self.punt_arp(arp);
         }
+        for index in 0..self.control.frames().len() {
+            let frame = &self.control.frames()[index];
+            let (ingress, bytes) = (frame.ingress, frame.bytes().to_vec());
+            self.punt_frame(ingress, punt::reason::ND, &bytes);
+        }
         for &(egress, target) in &trace.misses {
             self.resolve_request(egress, target, now_ms);
         }
@@ -193,20 +210,25 @@ where
     }
 
     fn punt_arp(&mut self, arp: &ArpEvent) {
-        let Some(name) = self.builder.ports.get(usize::from(arp.ingress.0)) else {
+        let body = arp.body();
+        self.punt_frame(arp.ingress, punt::reason::ARP, &body);
+    }
+
+    /// Sends `frame` to the neighbor process; counted with the ARP counters.
+    fn punt_frame(&mut self, ingress: IfId, reason: u16, frame: &[u8]) {
+        let Some(name) = self.builder.ports.get(usize::from(ingress.0)) else {
             return;
         };
         let Some(socket) = &self.punt else {
             self.counters.arp_to_control_dropped += 1;
             return;
         };
-        let mut message = Vec::with_capacity(64);
-        let body = arp.body();
+        let mut message = Vec::with_capacity(frame.len() + 64);
         Punt {
             direction: Direction::ToControl,
-            reason: punt::reason::ARP,
+            reason,
             interface: name,
-            frame: &body,
+            frame,
         }
         .encode(&mut message)
         .expect("port names are short and non-empty");
@@ -220,8 +242,7 @@ where
         }
     }
 
-    fn resolve_request(&mut self, egress: IfId, target: Ipv4Address, now_ms: u64) {
-        let address = Ipv4Addr::from(target.octets());
+    fn resolve_request(&mut self, egress: IfId, address: IpAddr, now_ms: u64) {
         let last = self.last_resolve.get(&(egress, address)).copied();
         if last.is_some_and(|at| now_ms.saturating_sub(at) < RESOLVE_INTERVAL_MS) {
             return;
@@ -241,7 +262,7 @@ where
         let mut payload = Vec::new();
         ResolveRequest {
             interface: name.clone(),
-            address: address.into(),
+            address,
         }
         .encode(&mut Encoder::new(&mut payload));
         self.server.notify(&payload);
@@ -285,9 +306,12 @@ where
                 .port(punt.interface)
                 .filter(|id| self.active.contains(id));
             match (punt.direction, punt.reason, egress) {
-                (Direction::FromControl, punt::reason::ARP, Some(egress))
+                (Direction::FromControl, reason, Some(egress))
                     if punt.frame.len() >= ETHERNET_HEADER
-                        && punt.frame[12..14] == ETHERTYPE_ARP =>
+                        && ((reason == punt::reason::ARP
+                            && punt.frame[12..14] == ETHERTYPE_ARP)
+                            || (reason == punt::reason::ND
+                                && punt.frame[12..14] == ETHERTYPE_IPV6)) =>
                 {
                     if self.send_generated(egress, punt.frame) {
                         self.counters.injected += 1;
@@ -322,9 +346,10 @@ where
 {
     fn step(&mut self, now_ms: u64) -> Progress {
         let control = self.server.step(&mut self.builder);
-        if let Some((owner, active)) = self.builder.built.take() {
+        if let Some((owner, active, ipv6)) = self.builder.built.take() {
             self.owner = owner;
             self.active = active;
+            self.ipv6 = ipv6;
         }
         let worked = self.worker(now_ms);
         let injected = self.inject();
@@ -334,11 +359,14 @@ where
     }
 }
 
+/// The core's tables built from the store: IPv4 owner, enabled ports, IPv6 tables.
+type Built = (ValidatedForwardingOwner, Vec<IfId>, Ipv6Fib);
+
 /// Turns the tables into the core's forwarding owner.
 struct Builder {
     ports: Vec<String>,
     /// The owner built for the last accepted tables, until the FE takes it.
-    built: Option<(ValidatedForwardingOwner, Vec<IfId>)>,
+    built: Option<Built>,
 }
 
 impl Builder {
@@ -350,7 +378,7 @@ impl Builder {
     /// Entries that point at something missing (a port the FE does not have, a
     /// disabled interface, another VRF, an action the skeleton lacks) are kept in the
     /// tables but left out here.
-    fn build(&self, store: &Store) -> Result<(ValidatedForwardingOwner, Vec<IfId>), String> {
+    fn build(&self, store: &Store) -> Result<Built, String> {
         let mut interfaces = Vec::new();
         let mut bindings: Vec<LocalIpv4Binding> = Vec::new();
         let mut routes = Vec::new();
@@ -412,6 +440,7 @@ impl Builder {
                 _ => {}
             }
         }
+        let ipv6 = build_ipv6(store, &active)?;
         let enabled = interfaces.iter().map(|i: &Interface| i.id).collect();
         ValidatedForwardingOwner::new(
             routes.into(),
@@ -420,9 +449,74 @@ impl Builder {
             bindings.into(),
             Ipv4OriginPolicy::default(),
         )
-        .map(|owner| (owner, enabled))
+        .map(|owner| (owner, enabled, ipv6))
         .map_err(|error| format!("{error:?}"))
     }
+}
+
+/// The IPv6 tables: addresses, forward routes of the default VRF through an enabled
+/// port, and neighbors, as for IPv4.
+fn build_ipv6(store: &Store, active: &BTreeMap<&str, IfId>) -> Result<Ipv6Fib, String> {
+    let mut routes = Vec::new();
+    let mut neighbors = Vec::new();
+    let mut local = Vec::new();
+    for (key, value) in store.iter() {
+        match (key, value) {
+            (
+                Key::Address {
+                    interface,
+                    address: IpAddr::V6(address),
+                },
+                Value::Address { .. },
+            ) => {
+                if let Some(&id) = active.get(interface.as_str()) {
+                    local.push(Ipv6Local {
+                        interface: id,
+                        address: address.octets(),
+                    });
+                }
+            }
+            (
+                Key::Route {
+                    vrf,
+                    prefix: IpAddr::V6(prefix),
+                    len,
+                },
+                Value::Route(RouteAction::Forward(hops)),
+            ) if vrf == DEFAULT_VRF => {
+                let Some((id, hop)) = hops
+                    .iter()
+                    .find_map(|hop| active.get(hop.interface.as_str()).map(|&id| (id, hop)))
+                else {
+                    continue;
+                };
+                let next_hop = match hop.address {
+                    Some(IpAddr::V6(address)) => Some(address.octets()),
+                    _ => None,
+                };
+                let route = Ipv6Route::new(prefix.octets(), *len, id, next_hop)
+                    .map_err(|error| format!("route {prefix}/{len}: {error:?}"))?;
+                routes.push(route);
+            }
+            (
+                Key::Neighbor {
+                    interface,
+                    address: IpAddr::V6(address),
+                },
+                Value::Neighbor { mac },
+            ) => {
+                if let Some(&id) = active.get(interface.as_str()) {
+                    neighbors.push(Ipv6Neighbor {
+                        interface: id,
+                        target: address.octets(),
+                        mac: MacAddress(*mac),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ipv6Fib::new(routes, neighbors, local).map_err(|error| format!("IPv6: {error:?}"))
 }
 
 impl Hook for Builder {
@@ -468,7 +562,7 @@ impl ArpEvent {
 #[derive(Default)]
 struct FeTrace {
     arp: Vec<ArpEvent>,
-    misses: Vec<(IfId, Ipv4Address)>,
+    misses: Vec<(IfId, IpAddr)>,
     overflow: u64,
 }
 
@@ -495,12 +589,21 @@ impl TraceSink for FeTrace {
                 }
             }
             TraceEvent::NeighborMissing { egress, target } => {
-                let miss = (egress, target);
-                if self.misses.len() < EVENTS_PER_BATCH && !self.misses.contains(&miss) {
-                    self.misses.push(miss);
-                }
+                self.miss(egress, IpAddr::V4(target.octets().into()));
+            }
+            TraceEvent::Ipv6NeighborMissing { egress, target } => {
+                self.miss(egress, IpAddr::V6(target.into()));
             }
             _ => {}
+        }
+    }
+}
+
+impl FeTrace {
+    fn miss(&mut self, egress: IfId, target: IpAddr) {
+        let miss = (egress, target);
+        if self.misses.len() < EVENTS_PER_BATCH && !self.misses.contains(&miss) {
+            self.misses.push(miss);
         }
     }
 }

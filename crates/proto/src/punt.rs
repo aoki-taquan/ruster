@@ -34,6 +34,9 @@ pub mod reason {
     /// An ARP packet: the 28-byte ARP body (`ToControl`) or a whole Ethernet
     /// frame to send (`FromControl`).
     pub const ARP: u16 = 1;
+    /// IPv6 Neighbor Discovery (ICMPv6 types 133 to 137): a whole Ethernet frame in
+    /// both directions.
+    pub const ND: u16 = 2;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
