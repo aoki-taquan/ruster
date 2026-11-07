@@ -27,6 +27,11 @@ pub const INTERFACE_VLAN_ID: u64 = 60016;
 pub const INTERFACE_TUNNEL_LOCAL: u64 = 60017;
 /// `ruster-if-tunnel` `tunnel/remote-address`: the tunnel's other end.
 pub const INTERFACE_TUNNEL_REMOTE: u64 = 60018;
+/// `ruster-if-pppoe`: the interface a PPPoE session runs on, its session ID and
+/// its peer's (the access concentrator's) MAC address.
+pub const INTERFACE_PPPOE_PARENT: u64 = 60090;
+pub const INTERFACE_PPPOE_SESSION: u64 = 60091;
+pub const INTERFACE_PPPOE_PEER: u64 = 60092;
 
 pub const ADDRESS: u64 = 60020;
 pub const ADDRESS_PREFIX_LENGTH: u64 = 60021;
@@ -107,6 +112,18 @@ pub const ALL: &[(&str, u64)] = &[
     (
         "/ietf-interfaces:interfaces/interface/ruster-if-tunnel:tunnel/remote-address",
         INTERFACE_TUNNEL_REMOTE,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-pppoe:pppoe/parent",
+        INTERFACE_PPPOE_PARENT,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-pppoe:pppoe/session-id",
+        INTERFACE_PPPOE_SESSION,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-pppoe:pppoe/peer-address",
+        INTERFACE_PPPOE_PEER,
     ),
     (
         "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",

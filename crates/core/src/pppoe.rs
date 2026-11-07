@@ -94,6 +94,39 @@ pub(crate) fn receive<S: PacketSlot>(
     Ok(())
 }
 
+/// `frame` (Ethernet, IPv4 or IPv6) for the session interface `egress`, in its
+/// session: the parent to send it out of and the frame to send. `None` when
+/// `egress` is no session's. Cold path (generated frames).
+pub(crate) fn wrap(
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    egress: IfId,
+    frame: &[u8],
+) -> Option<Result<(IfId, Vec<u8>), DropReason>> {
+    let session = of(snapshot.pppoe, egress)?;
+    Some((|| {
+        let parent = snapshot
+            .interface(session.parent)
+            .ok_or(DropReason::InterfaceMiss)?;
+        let protocol = match frame.get(12..14) {
+            Some(&[0x08, 0x00]) => PPP_IPV4,
+            Some(&[0x86, 0xdd]) => PPP_IPV6,
+            _ => return Err(DropReason::PppoeNotIp),
+        };
+        let ip = &frame[ETHERNET..];
+        let length = u16::try_from(ip.len() + 2).map_err(|_| DropReason::PppoeMalformed)?;
+        let mut out = Vec::with_capacity(ETHERNET + HEADER + ip.len());
+        out.extend_from_slice(&session.peer.0);
+        out.extend_from_slice(&parent.mac.0);
+        out.extend_from_slice(&SESSION_ETHERTYPE);
+        out.extend_from_slice(&[0x11, 0]);
+        out.extend_from_slice(&session.session.to_be_bytes());
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&protocol);
+        out.extend_from_slice(ip);
+        Ok((session.parent, out))
+    })())
+}
+
 /// Puts the frame for `session`'s interface into the session; returns the
 /// interface to send it out of (the session's parent).
 pub(crate) fn transmit<S: PacketSlot>(

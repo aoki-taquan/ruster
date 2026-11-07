@@ -85,6 +85,8 @@ pub enum Value {
         vlan: Option<Vlan>,
         /// For an IPv4 in IPv6 tunnel, its outer addresses.
         tunnel: Option<Tunnel>,
+        /// For a PPPoE session, where it runs.
+        pppoe: Option<Pppoe>,
     },
     Address {
         prefix_len: u8,
@@ -176,6 +178,16 @@ pub struct Vlan {
 pub struct Tunnel {
     pub local: std::net::Ipv6Addr,
     pub remote: std::net::Ipv6Addr,
+}
+
+/// A PPPoE session (`ruster-if-pppoe`, RFC 2516) on `parent`, with the session ID
+/// and the peer's MAC address the session's daemon found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pppoe {
+    pub parent: String,
+    /// 1 to 0xfffe (RFC 2516 section 4: 0xffff is reserved, 0 is Discovery's).
+    pub session: u16,
+    pub peer: [u8; 6],
 }
 
 /// The VRF of an interface that names none.
@@ -296,11 +308,26 @@ impl Change {
                         return Err(ModelError::Invalid("mtu"));
                     }
                     Value::Interface {
-                        vlan: Some(_),
-                        tunnel: Some(_),
+                        vlan,
+                        tunnel,
+                        pppoe,
                         ..
-                    } => {
-                        return Err(ModelError::Invalid("both a VLAN and a tunnel"));
+                    } if u8::from(vlan.is_some())
+                        + u8::from(tunnel.is_some())
+                        + u8::from(pppoe.is_some())
+                        > 1 =>
+                    {
+                        return Err(ModelError::Invalid("more than one of VLAN, tunnel, PPPoE"));
+                    }
+                    Value::Interface {
+                        pppoe: Some(pppoe), ..
+                    } if pppoe.session == 0
+                        || pppoe.session == 0xffff
+                        || pppoe.peer[0] & 1 != 0
+                        || pppoe.peer == [0; 6]
+                        || name(&pppoe.parent).is_err() =>
+                    {
+                        return Err(ModelError::Invalid("PPPoE session, peer or parent"));
                     }
                     Value::Interface {
                         tunnel: Some(tunnel),
@@ -512,12 +539,14 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             vrf,
             vlan,
             tunnel,
+            pppoe,
         } => {
             let named = vrf != DEFAULT_VRF;
             let members = 3
                 + u64::from(named)
                 + if vlan.is_some() { 2 } else { 0 }
-                + if tunnel.is_some() { 2 } else { 0 };
+                + if tunnel.is_some() { 2 } else { 0 }
+                + if pppoe.is_some() { 3 } else { 0 };
             e.map(members)
                 .u64(sid::INTERFACE_ENABLED - sid::INTERFACE)
                 .bool(*enabled)
@@ -540,6 +569,14 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                     .text(&tunnel.local.to_string())
                     .u64(sid::INTERFACE_TUNNEL_REMOTE - sid::INTERFACE)
                     .text(&tunnel.remote.to_string());
+            }
+            if let Some(pppoe) = pppoe {
+                e.u64(sid::INTERFACE_PPPOE_PARENT - sid::INTERFACE)
+                    .text(&pppoe.parent)
+                    .u64(sid::INTERFACE_PPPOE_SESSION - sid::INTERFACE)
+                    .u64(u64::from(pppoe.session))
+                    .u64(sid::INTERFACE_PPPOE_PEER - sid::INTERFACE)
+                    .text(&format_mac(&pppoe.peer));
             }
         }
         Value::Address { prefix_len } => {
@@ -667,6 +704,9 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     let mut parent = None;
     let mut vlan_id = None;
     let mut tunnel_local = None;
+    let mut pppoe_parent = None;
+    let mut pppoe_session = None;
+    let mut pppoe_peer = None;
     let mut tunnel_remote = None;
     let mut prefix_len = None;
     let mut action = None;
@@ -696,6 +736,18 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
                     &mut vlan_id,
                     u16::try_from(d.u64()?).map_err(|_| ModelError::Invalid("VLAN ID"))?,
                 )?;
+            }
+            sid::INTERFACE_PPPOE_PARENT if table == sid::INTERFACE => {
+                put(&mut pppoe_parent, d.text()?.to_owned())?;
+            }
+            sid::INTERFACE_PPPOE_SESSION if table == sid::INTERFACE => {
+                put(
+                    &mut pppoe_session,
+                    u16::try_from(d.u64()?).map_err(|_| ModelError::Invalid("PPPoE session"))?,
+                )?;
+            }
+            sid::INTERFACE_PPPOE_PEER if table == sid::INTERFACE => {
+                put(&mut pppoe_peer, parse_mac(d.text()?)?)?;
             }
             sid::INTERFACE_TUNNEL_LOCAL if table == sid::INTERFACE => {
                 put(&mut tunnel_local, parse_ipv6(d.text()?)?)?;
@@ -752,6 +804,19 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
                 (Some(local), Some(remote)) => Some(Tunnel { local, remote }),
                 (None, None) => None,
                 _ => return Err(ModelError::Missing("tunnel local and remote together")),
+            },
+            pppoe: match (pppoe_parent, pppoe_session, pppoe_peer) {
+                (Some(parent), Some(session), Some(peer)) => Some(Pppoe {
+                    parent,
+                    session,
+                    peer,
+                }),
+                (None, None, None) => None,
+                _ => {
+                    return Err(ModelError::Missing(
+                        "PPPoE parent, session and peer together",
+                    ))
+                }
             },
         }),
         sid::ADDRESS => Ok(Value::Address {

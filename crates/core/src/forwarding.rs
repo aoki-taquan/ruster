@@ -1975,6 +1975,18 @@ impl<'a> ForwardingSnapshot<'a> {
             .is_some_and(|binding| binding.address == address)
     }
 
+    /// For a generated `frame` (Ethernet, IPv4 or IPv6) to the PPPoE session
+    /// interface `egress`: the parent to send it out of and the frame in the
+    /// session. `None` when `egress` is no session's.
+    #[must_use]
+    pub fn pppoe_frame(
+        &self,
+        egress: IfId,
+        frame: &[u8],
+    ) -> Option<Result<(IfId, Vec<u8>), DropReason>> {
+        crate::pppoe::wrap(self, egress, frame)
+    }
+
     /// For a packet of the router itself (`packet`, an IPv4 packet) routed to the
     /// tunnel interface `egress`: the underlying interface, next hop and the IPv6
     /// header to wrap it in, by this snapshot's tunnels and IPv6 table (the default
@@ -1998,7 +2010,10 @@ impl<'a> ForwardingSnapshot<'a> {
                 let target = crate::Ipv4Address::from_octets(address.octets());
                 let route = self.route_lookup(target)?;
                 let hop = route.next_hop().unwrap_or(target);
-                let mac = self.static_neighbor(route.egress(), hop).map(|n| n.mac);
+                let mac = self
+                    .static_neighbor(route.egress(), hop)
+                    .map(|n| n.mac)
+                    .or(crate::pppoe::of(self.pppoe, route.egress()).map(|s| s.peer));
                 (
                     route.egress(),
                     std::net::IpAddr::V4(hop.octets().into()),
@@ -2007,6 +2022,7 @@ impl<'a> ForwardingSnapshot<'a> {
             }
             std::net::IpAddr::V6(address) => {
                 let (egress, hop, mac) = self.ipv6?.origin(address.octets())?;
+                let mac = mac.or(crate::pppoe::of(self.pppoe, egress).map(|s| s.peer));
                 (egress, std::net::IpAddr::V6(hop.into()), mac)
             }
         };

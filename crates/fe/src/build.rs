@@ -16,7 +16,7 @@ use ruster_core::{
     FirewallAction, FirewallInterface, FirewallIpv4Prefix, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, Ipv4InIpv6Tunnel, Ipv4OriginPolicy,
     Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, LocalIpv4Binding, MacAddress, Neighbor, PortSet,
-    Route, ValidatedForwardingOwner, VlanBinding,
+    PppoeSession, Route, ValidatedForwardingOwner, VlanBinding,
 };
 use ruster_proto::session::Store;
 use ruster_proto::table::{self, network, Key, RouteAction, Value, DEFAULT_VRF};
@@ -43,6 +43,8 @@ pub(crate) struct Built {
     pub(crate) vlans: Vec<VlanBinding>,
     /// The enabled IPv4 in IPv6 tunnels.
     pub(crate) tunnels: Vec<Ipv4InIpv6Tunnel>,
+    /// The PPPoE sessions on enabled interfaces.
+    pub(crate) pppoe: Vec<PppoeSession>,
     /// The default VRF's forward firewall rules, in rule id order, without those
     /// naming an interface that is missing or disabled.
     pub(crate) firewall: Vec<FirewallRule>,
@@ -205,6 +207,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 vrf,
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
         ) = (key, value)
         {
@@ -298,6 +301,46 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 interface: id,
                 local: tunnel.local.octets(),
                 remote: tunnel.remote.octets(),
+            });
+            active.insert(name.as_str(), (id, vrf.as_str()));
+        }
+    }
+    // PPPoE sessions get the ids after those; their parent is an enabled port or
+    // VLAN sub-interface.
+    let mut pppoe = Vec::new();
+    for (key, value) in store.iter() {
+        if let (
+            Key::Interface { name },
+            Value::Interface {
+                enabled: true,
+                mac,
+                mtu,
+                vrf,
+                pppoe: Some(session),
+                ..
+            },
+        ) = (key, value)
+        {
+            if ports.iter().any(|port| port == name) {
+                return Err(format!("PPPoE interface {name} has the name of a port"));
+            }
+            let Some(&(parent, _)) = active.get(session.parent.as_str()) else {
+                continue;
+            };
+            let id = u16::try_from(interface_names.len())
+                .map(IfId)
+                .map_err(|_| "too many interfaces".to_owned())?;
+            interface_names.push(name.clone());
+            interfaces.push(Interface {
+                id,
+                mac: MacAddress(*mac),
+                mtu: *mtu,
+            });
+            pppoe.push(PppoeSession {
+                interface: id,
+                parent,
+                session: session.session,
+                peer: MacAddress(session.peer),
             });
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
@@ -477,6 +520,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         interface_names,
         vlans,
         tunnels,
+        pppoe,
         firewall,
         firewall_on,
         nat,

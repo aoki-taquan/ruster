@@ -41,6 +41,7 @@ fn iface(name: &str, last: u8) -> Change {
             vrf: ruster_proto::table::DEFAULT_VRF.into(),
             vlan: None,
             tunnel: None,
+            pppoe: None,
         },
     )
 }
