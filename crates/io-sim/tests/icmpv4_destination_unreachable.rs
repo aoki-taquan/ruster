@@ -1,14 +1,13 @@
 use ruster_core::{
-    execute_one_arp_request, execute_one_icmpv4_error, execute_one_icmpv4_time_exceeded,
-    forward_batch, forward_batch_with_resolution, forward_batch_with_resolution_and_icmpv4_errors,
-    internet_checksum, ipv4_header_checksum, DropReason, DynamicNeighborSlot, ExecuteIcmpv4Error,
-    ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4Trace, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoTrace, PacketIo,
-    ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-    TraceEvent,
+    execute_one_icmpv4_error, forward_batch, internet_checksum, ipv4_header_checksum, DropReason,
+    ExecuteIcmpv4Error, ForwardingSnapshot, GeneratedAllocationError, GeneratedIcmpv4Trace,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoTrace,
+    PacketIo, Route, TraceEvent,
 };
+mod support;
+
 use ruster_io_sim::{FrameOrigin, RecycleCause, SimIo, VecGeneratedIcmpv4Trace, VecTrace};
 
 const LAN: IfId = IfId(1);
@@ -113,25 +112,6 @@ fn options_frame() -> Vec<u8> {
     frame
 }
 
-fn arp_reply(target: Ipv4Address, mac: MacAddress) -> Vec<u8> {
-    let mut frame = vec![0; 60];
-    frame[0..6].copy_from_slice(&WAN_MAC.0);
-    frame[6..12].copy_from_slice(&mac.0);
-    frame[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
-    frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
-    frame[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
-    frame[18..22].copy_from_slice(&[6, 4, 0, 2]);
-    frame[22..28].copy_from_slice(&mac.0);
-    frame[28..32].copy_from_slice(&target.octets());
-    frame[32..38].copy_from_slice(&WAN_MAC.0);
-    frame[38..42].copy_from_slice(&WAN_IP.octets());
-    frame
-}
-
-fn resolution_policy() -> ResolutionPolicy {
-    ResolutionPolicy::new(1_000, 60_000).unwrap()
-}
-
 #[test]
 fn route_miss_is_atomic_and_generates_exact_type3_code0() {
     let interfaces = interfaces();
@@ -160,9 +140,6 @@ fn route_miss_is_atomic_and_generates_exact_type3_code0() {
         &[1, 2, 3, 4, 5, 6, 7, 8, 9],
         &[0xde, 0xad],
     );
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
     let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
@@ -170,10 +147,9 @@ fn route_miss_is_atomic_and_generates_exact_type3_code0() {
     io.inject(LAN, original.clone());
     let mut trace = VecTrace::default();
     let batch = io.receive(1).unwrap();
-    let report = forward_batch_with_resolution_and_icmpv4_errors(
+    let report = support::forward_with_errors(
         batch,
         &snapshot,
-        &mut resolution,
         &mut errors,
         MonotonicMillis(10),
         &mut trace,
@@ -280,9 +256,6 @@ fn destination_lookup_precedes_ttl_and_old_forwarding_apis_remain_opt_in() {
     ] {
         let snapshot = ForwardingSnapshot::new(routes, &interfaces, &neighbors, &bindings).unwrap();
         let original = ipv4_frame(SOURCE, MISSING, 1, 17, 0, 0, &[], &[]);
-        let mut rs = [ResolutionStateSlot::EMPTY; 1];
-        let mut ra = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
         let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
         let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
         let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
@@ -290,10 +263,9 @@ fn destination_lookup_precedes_ttl_and_old_forwarding_apis_remain_opt_in() {
         io.inject(LAN, original.clone());
         let mut trace = VecTrace::default();
         let batch = io.receive(1).unwrap();
-        forward_batch_with_resolution_and_icmpv4_errors(
+        support::forward_with_errors(
             batch,
             &snapshot,
-            &mut resolution,
             &mut errors,
             MonotonicMillis(0),
             &mut trace,
@@ -339,163 +311,18 @@ fn destination_lookup_precedes_ttl_and_old_forwarding_apis_remain_opt_in() {
         io.pop_recycled().unwrap().cause,
         RecycleCause::Forwarding(DropReason::RouteMiss)
     );
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
     io.inject(LAN, packet);
-    forward_batch_with_resolution(
+    support::forward(
         io.receive(1).unwrap(),
         &snapshot,
-        &mut resolution,
         MonotonicMillis(0),
+        ruster_core::Services::default(),
         &mut NoTrace,
     );
     assert_eq!(
         io.pop_recycled().unwrap().cause,
         RecycleCause::Forwarding(DropReason::RouteMiss)
     );
-}
-
-#[test]
-fn reverse_connected_static_and_gateway_dynamic_neighbors_are_authoritative() {
-    let interfaces = interfaces();
-    let bindings = bindings();
-    let connected_routes = [reverse_connected()];
-    let connected_neighbors = [Neighbor {
-        interface: WAN,
-        target: SOURCE,
-        mac: SOURCE_MAC,
-    }];
-    let connected = ForwardingSnapshot::new(
-        &connected_routes,
-        &interfaces,
-        &connected_neighbors,
-        &bindings,
-    )
-    .unwrap();
-    let mut rs = [ResolutionStateSlot::EMPTY; 2];
-    let mut ra = [ResolutionActionSlot::EMPTY; 2];
-    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
-    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
-    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
-    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
-    let mut io = SimIo::new();
-    io.inject(LAN, ipv4_frame(SOURCE, MISSING, 64, 17, 0, 0, &[], &[]));
-    forward_batch_with_resolution_and_icmpv4_errors(
-        io.receive(1).unwrap(),
-        &connected,
-        &mut resolution,
-        &mut errors,
-        MonotonicMillis(0),
-        &mut NoTrace,
-    );
-    execute_one_icmpv4_error(
-        &mut io,
-        &mut errors,
-        MonotonicMillis(0),
-        &mut NoGeneratedIcmpv4Trace,
-    )
-    .unwrap();
-    assert_eq!(&io.pop_tx().unwrap().bytes[0..6], &SOURCE_MAC.0);
-
-    let gateway_routes = [reverse_gateway()];
-    let gateway = ForwardingSnapshot::new(&gateway_routes, &interfaces, &[], &bindings).unwrap();
-    let mut rs = [ResolutionStateSlot::EMPTY; 2];
-    let mut ra = [ResolutionActionSlot::EMPTY; 2];
-    let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::with_dynamic_neighbors(
-        resolution_policy(),
-        &mut rs,
-        &mut ra,
-        &mut dynamic,
-    );
-    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
-    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
-    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
-    let mut io = SimIo::new();
-    io.inject(WAN, arp_reply(GATEWAY, GATEWAY_MAC));
-    io.inject(LAN, ipv4_frame(SOURCE, MISSING, 64, 17, 0, 0, &[], &[]));
-    forward_batch_with_resolution_and_icmpv4_errors(
-        io.receive(2).unwrap(),
-        &gateway,
-        &mut resolution,
-        &mut errors,
-        MonotonicMillis(0),
-        &mut NoTrace,
-    );
-    assert_eq!(errors.pending_actions(), 1);
-    execute_one_icmpv4_time_exceeded(
-        &mut io,
-        &mut errors,
-        MonotonicMillis(0),
-        &mut NoGeneratedIcmpv4Trace,
-    )
-    .unwrap();
-    assert_eq!(&io.pop_tx().unwrap().bytes[0..6], &GATEWAY_MAC.0);
-}
-
-#[test]
-fn unresolved_reverse_neighbor_only_schedules_arp_and_fresh_packet_is_required() {
-    let interfaces = interfaces();
-    let bindings = bindings();
-    let routes = [reverse_gateway()];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
-    let mut rs = [ResolutionStateSlot::EMPTY; 2];
-    let mut ra = [ResolutionActionSlot::EMPTY; 2];
-    let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::with_dynamic_neighbors(
-        resolution_policy(),
-        &mut rs,
-        &mut ra,
-        &mut dynamic,
-    );
-    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
-    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
-    let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
-    let mut io = SimIo::new();
-    io.inject(LAN, ipv4_frame(SOURCE, MISSING, 64, 17, 0, 0, &[], &[]));
-    forward_batch_with_resolution_and_icmpv4_errors(
-        io.receive(1).unwrap(),
-        &snapshot,
-        &mut resolution,
-        &mut errors,
-        MonotonicMillis(0),
-        &mut NoTrace,
-    );
-    assert_eq!(
-        (errors.pending_actions(), resolution.pending_actions()),
-        (0, 1)
-    );
-    execute_one_arp_request(
-        &mut io,
-        &mut resolution,
-        MonotonicMillis(0),
-        &mut ruster_core::NoGeneratedTrace,
-    )
-    .unwrap();
-    let arp = io.pop_tx().unwrap();
-    assert_eq!(&arp.bytes[38..42], &GATEWAY.octets());
-
-    io.inject(WAN, arp_reply(GATEWAY, GATEWAY_MAC));
-    forward_batch_with_resolution_and_icmpv4_errors(
-        io.receive(1).unwrap(),
-        &snapshot,
-        &mut resolution,
-        &mut errors,
-        MonotonicMillis(1),
-        &mut NoTrace,
-    );
-    assert_eq!(errors.pending_actions(), 0, "learning is not retroactive");
-    io.inject(LAN, ipv4_frame(SOURCE, MISSING, 64, 17, 0, 0, &[], &[]));
-    forward_batch_with_resolution_and_icmpv4_errors(
-        io.receive(1).unwrap(),
-        &snapshot,
-        &mut resolution,
-        &mut errors,
-        MonotonicMillis(2),
-        &mut NoTrace,
-    );
-    assert_eq!(errors.pending_actions(), 1);
 }
 
 #[test]
@@ -587,19 +414,15 @@ fn route_miss_suppression_matrix_and_options_are_atomic() {
             }
             _ => None,
         };
-        let mut rs = [ResolutionStateSlot::EMPTY; 1];
-        let mut ra = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
         let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
         let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
         let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
         let mut io = SimIo::new();
         io.inject(LAN, original.clone());
         let mut trace = VecTrace::default();
-        forward_batch_with_resolution_and_icmpv4_errors(
+        support::forward_with_errors(
             io.receive(1).unwrap(),
             &snapshot,
-            &mut resolution,
             &mut errors,
             MonotonicMillis(0),
             &mut trace,
@@ -628,18 +451,14 @@ fn route_miss_suppression_matrix_and_options_are_atomic() {
         (first, 1, DropReason::RouteMiss),
         (options, 0, DropReason::Ipv4OptionsUnsupported),
     ] {
-        let mut rs = [ResolutionStateSlot::EMPTY; 1];
-        let mut ra = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
         let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
         let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
         let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
         let mut io = SimIo::new();
         io.inject(LAN, original.clone());
-        forward_batch_with_resolution_and_icmpv4_errors(
+        support::forward_with_errors(
             io.receive(1).unwrap(),
             &snapshot,
-            &mut resolution,
             &mut errors,
             MonotonicMillis(0),
             &mut NoTrace,
@@ -672,18 +491,14 @@ fn destination_unreachable_quote_bounds_exclude_padding_and_checksum_odd_lengths
         let body = vec![0x5a; total_len - 20];
         let padding = vec![0xee; padding_len];
         let original = ipv4_frame(SOURCE, MISSING, 64, 17, 0, 0, &body, &padding);
-        let mut rs = [ResolutionStateSlot::EMPTY; 1];
-        let mut ra = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
         let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
         let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
         let mut errors = Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), &mut es, &mut ea);
         let mut io = SimIo::new();
         io.inject(LAN, original.clone());
-        forward_batch_with_resolution_and_icmpv4_errors(
+        support::forward_with_errors(
             io.receive(1).unwrap(),
             &snapshot,
-            &mut resolution,
             &mut errors,
             MonotonicMillis(0),
             &mut NoTrace,
@@ -721,9 +536,6 @@ fn destination_unreachable_allocation_reject_finish_and_clock_lifecycle_is_exact
     }];
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let packet = ipv4_frame(SOURCE, MISSING, 64, 17, 0, 0, &[], &[]);
-    let mut rs = [ResolutionStateSlot::EMPTY; 1];
-    let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::new(resolution_policy(), &mut rs, &mut ra);
     let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
     let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
     let mut errors = Icmpv4ErrorRuntime::new(
@@ -733,10 +545,9 @@ fn destination_unreachable_allocation_reject_finish_and_clock_lifecycle_is_exact
     );
     let mut io = SimIo::new();
     io.inject(LAN, packet.clone());
-    forward_batch_with_resolution_and_icmpv4_errors(
+    support::forward_with_errors(
         io.receive(1).unwrap(),
         &snapshot,
-        &mut resolution,
         &mut errors,
         MonotonicMillis(10),
         &mut NoTrace,
@@ -803,10 +614,9 @@ fn destination_unreachable_allocation_reject_finish_and_clock_lifecycle_is_exact
 
     for (now, expected_pending) in [(109, 0), (110, 1)] {
         io.inject(LAN, packet.clone());
-        forward_batch_with_resolution_and_icmpv4_errors(
+        support::forward_with_errors(
             io.receive(1).unwrap(),
             &snapshot,
-            &mut resolution,
             &mut errors,
             MonotonicMillis(now),
             &mut NoTrace,

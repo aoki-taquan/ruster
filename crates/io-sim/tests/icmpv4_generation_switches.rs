@@ -3,17 +3,16 @@
 //! class drops byte-unchanged with a distinguishable counter or reason and
 //! emits nothing on the wire.
 
+mod support;
+
 use ruster_core::{
-    dispatch_host_unreachable_failures, execute_one_arp_request, execute_one_icmpv4_error,
-    forward_batch_with_resolution_and_icmpv4_errors, internet_checksum, ipv4_header_checksum,
-    poll_resolution_timers, DropReason, DynamicNeighborSlot, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorCounters, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
-    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor,
-    NoGeneratedIcmpv4Trace, NoGeneratedTrace, NoResolutionTimerTrace, NoTrace, PacketIo,
-    ResolutionActionSlot, ResolutionFailureHoldSlot, ResolutionFailureTrace,
-    ResolutionFailureTraceSink, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
-    TraceEvent,
+    execute_one_arp_request, execute_one_icmpv4_error, internet_checksum, ipv4_header_checksum,
+    DropReason, ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorCounters,
+    Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding,
+    MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, NoGeneratedTrace, NoTrace,
+    PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot,
+    Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
@@ -138,7 +137,7 @@ fn forward_one(frame: Vec<u8>, policy: Icmpv4ErrorPolicy) -> Outcome {
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let mut rs = [ResolutionStateSlot::EMPTY; 1];
     let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::new(
+    let _resolution = ResolutionRuntime::new(
         ResolutionPolicy::new(1_000, 60_000).unwrap(),
         &mut rs,
         &mut ra,
@@ -149,10 +148,9 @@ fn forward_one(frame: Vec<u8>, policy: Icmpv4ErrorPolicy) -> Outcome {
     let mut io = SimIo::new();
     io.inject(LAN, frame.clone());
     let mut trace = VecTrace::default();
-    let report = forward_batch_with_resolution_and_icmpv4_errors(
+    let report = support::forward_with_errors(
         io.receive(1).unwrap(),
         &snapshot,
-        &mut resolution,
         &mut errors,
         MonotonicMillis(10),
         &mut trace,
@@ -300,7 +298,7 @@ fn disabled_kind_does_not_consume_the_shared_limiter() {
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let mut rs = [ResolutionStateSlot::EMPTY; 1];
     let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::new(
+    let _resolution = ResolutionRuntime::new(
         ResolutionPolicy::new(1_000, 60_000).unwrap(),
         &mut rs,
         &mut ra,
@@ -317,10 +315,9 @@ fn disabled_kind_does_not_consume_the_shared_limiter() {
     // disabled Time Exceeded must not occupy it.
     io.inject(LAN, udp_frame(ROUTED, 1));
     io.inject(LAN, udp_frame(MISSING, 64));
-    forward_batch_with_resolution_and_icmpv4_errors(
+    support::forward_with_errors(
         io.receive(2).unwrap(),
         &snapshot,
-        &mut resolution,
         &mut errors,
         MonotonicMillis(10),
         &mut NoTrace,
@@ -336,156 +333,6 @@ fn disabled_kind_does_not_consume_the_shared_limiter() {
         (1, 1, 0, 0)
     );
     assert_eq!(errors.pending_actions(), 1);
-}
-
-#[derive(Default)]
-struct FailureTrace {
-    events: Vec<ResolutionFailureTrace>,
-}
-
-impl ResolutionFailureTraceSink for FailureTrace {
-    fn record_resolution_failure(&mut self, event: ResolutionFailureTrace) {
-        self.events.push(event);
-    }
-}
-
-/// Runs a directly connected WAN host through a fruitless ARP generation
-/// and one failure dispatch; returns the dispatch outcome.
-fn host_unreachable_with(
-    policy: Icmpv4ErrorPolicy,
-) -> (
-    ruster_core::ResolutionFailureDispatchReport,
-    Vec<ResolutionFailureTrace>,
-    Icmpv4ErrorCounters,
-    usize,
-    usize,
-) {
-    let routes = routes();
-    let interfaces = interfaces();
-    let bindings = bindings();
-    let neighbors = neighbors();
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-    let mut states = [ResolutionStateSlot::EMPTY; 2];
-    let mut actions = [ResolutionActionSlot::EMPTY; 2];
-    let mut dynamic = [DynamicNeighborSlot::EMPTY; 2];
-    let mut holds = [ResolutionFailureHoldSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::with_dynamic_neighbors_and_failure_holds(
-        ResolutionPolicy::with_retry(1_000, 60_000, 1).unwrap(),
-        &mut states,
-        &mut actions,
-        &mut dynamic,
-        &mut holds,
-    );
-    let mut es = [Icmpv4ErrorStateSlot::EMPTY; 1];
-    let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 1];
-    let mut errors = Icmpv4ErrorRuntime::new(policy, &mut es, &mut ea);
-    let mut io = SimIo::new();
-    io.inject(LAN, udp_frame(ROUTED, 64));
-    forward_batch_with_resolution_and_icmpv4_errors(
-        io.receive(1).unwrap(),
-        &snapshot,
-        &mut resolution,
-        &mut errors,
-        MonotonicMillis(0),
-        &mut NoTrace,
-    );
-    assert_eq!(
-        io.pop_recycled().unwrap().cause,
-        RecycleCause::Forwarding(DropReason::NeighborUnresolved)
-    );
-    execute_one_arp_request(
-        &mut io,
-        &mut resolution,
-        MonotonicMillis(0),
-        &mut NoGeneratedTrace,
-    )
-    .unwrap()
-    .unwrap();
-    assert!(io.pop_tx().is_some(), "forward ARP Request");
-    poll_resolution_timers(
-        &mut resolution,
-        MonotonicMillis(1_000),
-        2,
-        &mut NoResolutionTimerTrace,
-    )
-    .unwrap();
-    let mut trace = FailureTrace::default();
-    let report = dispatch_host_unreachable_failures(
-        &mut resolution,
-        &mut errors,
-        &snapshot,
-        MonotonicMillis(1_000),
-        1,
-        &mut trace,
-    )
-    .unwrap();
-    let pending = errors.pending_actions();
-    let generated = execute_one_icmpv4_error(
-        &mut io,
-        &mut errors,
-        MonotonicMillis(1_000),
-        &mut NoGeneratedIcmpv4Trace,
-    )
-    .unwrap();
-    assert_eq!(generated.is_some(), pending == 1);
-    let mut emitted = 0;
-    while io.pop_tx().is_some() {
-        emitted += 1;
-    }
-    let mut arp_emitted = 0;
-    while execute_one_arp_request(
-        &mut io,
-        &mut resolution,
-        MonotonicMillis(1_000),
-        &mut NoGeneratedTrace,
-    )
-    .unwrap()
-    .is_some()
-    {
-        arp_emitted += 1;
-    }
-    assert_eq!(resolution.pending_failure_holds(), 0);
-    (
-        report,
-        trace.events,
-        errors.counters(),
-        pending,
-        emitted + arp_emitted,
-    )
-}
-
-#[test]
-fn host_unreachable_switch_retires_the_hold_without_reverse_work() {
-    let (on, on_trace, on_counters, on_pending, on_emitted) =
-        host_unreachable_with(Icmpv4ErrorPolicy::default());
-    assert_eq!(
-        (on.queued, on.retired, on_pending, on_emitted),
-        (1, 0, 1, 1)
-    );
-    assert!(matches!(
-        on_trace.as_slice(),
-        [ResolutionFailureTrace::Queued { .. }]
-    ));
-    assert_eq!(on_counters.disabled_host_unreachable, 0);
-
-    let (off, off_trace, off_counters, off_pending, off_emitted) = host_unreachable_with(
-        policy_with(Icmpv4ErrorKind::DestinationUnreachableHost, false),
-    );
-    assert_eq!(
-        (off.queued, off.retired, off_pending, off_emitted),
-        (0, 1, 0, 0)
-    );
-    assert!(matches!(
-        off_trace.as_slice(),
-        [ResolutionFailureTrace::GenerationDisabled { .. }]
-    ));
-    assert_eq!(
-        off_counters,
-        Icmpv4ErrorCounters {
-            disabled_host_unreachable: 1,
-            ..Icmpv4ErrorCounters::default()
-        }
-    );
 }
 
 fn echo_with(origin: Ipv4OriginPolicy, frame: Vec<u8>) -> (SimIo, usize) {
@@ -576,10 +423,9 @@ fn disabled_kind_never_starts_reverse_arp_or_moves_the_clock() {
         let mut io = SimIo::new();
         io.inject(LAN, frame.clone());
         let mut trace = VecTrace::default();
-        forward_batch_with_resolution_and_icmpv4_errors(
+        support::forward_with_errors(
             io.receive(1).unwrap(),
             &snapshot,
-            &mut resolution,
             &mut errors,
             MonotonicMillis(10),
             &mut trace,
@@ -642,10 +488,9 @@ fn disabled_kind_never_starts_reverse_arp_or_moves_the_clock() {
         // earlier instant is not a clock regression.
         io.inject(LAN, other);
         let mut trace = VecTrace::default();
-        forward_batch_with_resolution_and_icmpv4_errors(
+        support::forward_with_errors(
             io.receive(1).unwrap(),
             &snapshot,
-            &mut resolution,
             &mut errors,
             MonotonicMillis(5),
             &mut trace,

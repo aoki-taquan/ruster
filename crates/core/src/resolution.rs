@@ -3,7 +3,6 @@ use std::cell::Cell;
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
-    arp_hold::{ArpHoldMiss, ArpHoldNextHop},
     fixed_directory::{DirectoryHashDomain, DirectoryHashKey},
     slot_index::{
         bucket_of, chain_bucket, chain_head, chain_next, first_unused, key_bucket, link, replace,
@@ -2185,54 +2184,6 @@ impl<'a> ResolutionRuntime<'a> {
         };
         if pending {
             self.forward_miss = Some(ResolutionKey { egress, target });
-        }
-    }
-
-    /// Forgets the previous datagram's miss (ARP-HOLD).
-    #[inline]
-    pub(crate) fn clear_forward_miss(&mut self) {
-        self.forward_miss = None;
-    }
-
-    /// The current datagram's resolving miss, with the time after which its
-    /// resolution can no longer succeed: `interval × max-attempts` from now
-    /// (the last request goes out at most `(max-attempts - 1) × interval`
-    /// after the first and fails a full interval later).
-    pub(crate) fn take_forward_miss(&mut self, now: MonotonicMillis) -> Option<ArpHoldMiss> {
-        let key = self.forward_miss.take()?;
-        Some(ArpHoldMiss {
-            egress: key.egress,
-            target: key.target,
-            deadline_ms: now.0.saturating_add(
-                self.policy
-                    .interval_ms
-                    .saturating_mul(u64::from(self.policy.max_attempts)),
-            ),
-        })
-    }
-
-    /// What a held datagram's next hop is now (ARP-HOLD): known when a live
-    /// dynamic neighbour exists, resolving while its request generation is
-    /// queued or waiting, over otherwise (failed, cancelled, gone, or a
-    /// clock regression).
-    pub(crate) fn arp_hold_next_hop(
-        &mut self,
-        egress: IfId,
-        target: Ipv4Address,
-        now: MonotonicMillis,
-    ) -> ArpHoldNextHop {
-        match self.lookup_dynamic(egress, target, now) {
-            DynamicLookup::Hit(_) => ArpHoldNextHop::Known,
-            DynamicLookup::ClockRegression => ArpHoldNextHop::Resolving,
-            DynamicLookup::Miss => match self.status(egress, target).map(|status| status.phase) {
-                Some(
-                    ResolutionPhase::InitialQueued
-                    | ResolutionPhase::Waiting
-                    | ResolutionPhase::RetryQueued,
-                ) => ArpHoldNextHop::Resolving,
-                Some(ResolutionPhase::Failed) => ArpHoldNextHop::Failed,
-                Some(ResolutionPhase::Cooldown) | None => ArpHoldNextHop::Gone,
-            },
         }
     }
 
