@@ -1,5 +1,6 @@
-//! `ruster-confd [--run-dir DIR] FILE`: reads the configuration file and sends it to
-//! the FE, ribd (as route source `confd`) and neighd.
+//! `ruster-confd [--run-dir DIR] [--kernel] FILE`: reads the configuration file and
+//! sends it to the FE, ribd (as route source `confd`) and neighd. With `--kernel` it
+//! also sets up the kernel side of traffic to the router ([`ruster_confd::kernel`]).
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -13,11 +14,18 @@ const PEER_WAIT: Duration = Duration::from_secs(10);
 
 fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
+    let kernel = rest.iter().any(|a| a == "--kernel");
+    let rest: Vec<&String> = rest.iter().filter(|a| *a != "--kernel").collect();
     let [path] = rest.as_slice() else {
         return Err("give one configuration file".into());
     };
     let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
     let config = file::parse(&text).map_err(|error| format!("{path}: {error}"))?;
+    if kernel {
+        for error in ruster_confd::kernel::apply(&config) {
+            eprintln!("ruster-confd: kernel: {error}");
+        }
+    }
     let mut confd = Confd::new(config);
     let connect = |name: &str| {
         daemon::connect(&run_dir.join(name), PEER_WAIT)

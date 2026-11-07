@@ -43,6 +43,13 @@ done
 nsx "$router" ip link set ra address 02:00:00:00:00:01 up
 nsx "$router" ip link set rb address 02:00:00:00:00:02 up
 nsx "$router" ip link set lo up
+# The FE's ports sit in a VRF with no addresses, so the kernel never takes their
+# frames (AF_PACKET gives it copies) as its own; it sees the router's addresses only
+# on the TUN devices confd makes.
+nsx "$router" ip link add vrf-ports type vrf table 999
+nsx "$router" ip link set vrf-ports up
+nsx "$router" ip link set ra master vrf-ports
+nsx "$router" ip link set rb master vrf-ports
 
 # veth leaves checksums to the receiver; the FE forwards frames as they are, so the
 # hosts compute their own.
@@ -90,7 +97,7 @@ start() {
 args_of() {
   case $1 in
     ruster-fe) echo "--backend $backend ra rb" ;;
-    ruster-confd) echo "$work/router.toml" ;;
+    ruster-confd) echo "--kernel $work/router.toml" ;;
     *) echo "" ;;
   esac
 }
@@ -137,6 +144,19 @@ grep -qi "time to live exceeded" <<<"$out" || fail "no ICMP Time Exceeded from t
 out=$(nsx "$host_a" ping -6 -c 1 -W 1 -t 1 2001:db8:2::10 2>&1 || true)
 grep -qi "time exceeded" <<<"$out" || fail "no ICMPv6 Time Exceeded from the router: $out"
 echo "ok: the router answers expiring packets with ICMP and ICMPv6 Time Exceeded"
+
+# Traffic addressed to the router reaches its kernel through the TUN devices.
+nsx "$host_a" ping -c 3 -i 0.2 -W 1 192.0.2.1 >/dev/null || fail "no answer to ping 192.0.2.1"
+nsx "$host_a" ping -6 -c 3 -i 0.2 -W 1 2001:db8:1::1 >/dev/null \
+  || fail "no answer to ping 2001:db8:1::1"
+nsx "$host_b" ping -c 3 -i 0.2 -W 1 198.51.100.1 >/dev/null || fail "no answer to ping 198.51.100.1"
+nsx "$router" timeout 5 nc -l 8080 >"$work/tcp.out" &
+pids+=("$!")
+sleep 0.5
+echo hello-router | nsx "$host_a" timeout 5 nc -N 192.0.2.1 8080 || fail "no TCP to the router"
+sleep 0.2
+grep -q hello-router "$work/tcp.out" || fail "the router's kernel did not get the TCP data"
+echo "ok: ping and TCP to the router reach its kernel (IPv4 and IPv6)"
 
 # A control process that dies does not stop forwarding, and comes back by itself.
 # Counts the lines of a log that say a connection was made again.

@@ -45,7 +45,8 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 
 今動いている範囲は次のとおりです。
 
-- IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPとICMPv6のエラーを返す。ルータ宛ての通信はまだ無い。
+- IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPとICMPv6のエラーを返す。
+- ルータ宛ての通信は、種類ごとに数を抑えてVRFごとのTUNでkernelに渡す。
 - VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。
 - 経路は静的なものと直結だけ。
 
@@ -91,13 +92,17 @@ via = "198.51.100.1"          # 省略すると直結の経路
 sudo ruster-fe lan wan &         # 転送するデバイスを並べる。rootが要る
 ruster-ribd &                    # 送り手を省略すると confd:1
 ruster-neighd &
-ruster-confd router.toml &
+ruster-confd --kernel router.toml &   # --kernel: ルータ宛ての通信のTUNとアドレスも作る
 ```
 
 FEは既定でAF_XDPを使い、各デバイスのqueue 0にXDPのプログラムを付けます（`--xdp-attach native|generic`、
 `--zero-copy`）。`--backend af-packet`ではAF_PACKETを使います。AF_PACKETはkernelからフレームを取り上げないので、
 FEに渡すデバイスにはkernelのアドレスや経路を付けず、kernelでの転送も切っておきます。
 どちらでも、FEのポートのMACはデバイスのMACと同じにします。
+
+ルータ宛ての通信（ping、SSH、DNSなど）は、VRFごとのTUN（`rt-<VRF名>`）でルータのkernelに渡ります。
+`confd --kernel`がTUNとVRFデバイスを作り、ルータのアドレスを付けます。AF_PACKETでは、FEのポートを
+アドレスの無いVRFに入れておきます（kernelがポートで受けた写しを自分宛てとして扱わないように）。
 
 どのプロセスも準備ができるとsystemdに知らせるので、unitは`Type=notify`にできます。FEはSIGTERMかSIGINTで、
 kernelに渡したフレームが戻るのを最大1秒待ってから止まります（二度目のシグナルですぐ止まる）。
