@@ -112,7 +112,12 @@ pub fn apply(config: &Config) -> Vec<String> {
             }
         }
     }
-    for args in &commands {
+    // Devices first, then the addresses no longer configured are removed, and only
+    // then the configured ones and the routes are put in: removing an old primary
+    // address after adding a new one in the same subnet would take the new one (a
+    // secondary) with it, and the routes too.
+    let is_device = |w: &[&str]| matches!(w, ["tuntap", ..] | ["link", ..]);
+    let run = |args: &Vec<String>, errors: &mut Vec<String>| {
         let w = words(args);
         let creates = matches!(w.as_slice(), ["tuntap", "add", ..] | ["link", "add", ..]);
         if let Err(stderr) = ip(&w) {
@@ -122,8 +127,13 @@ pub fn apply(config: &Config) -> Vec<String> {
                 errors.push(format!("ip {}: {}", args.join(" "), stderr.trim()));
             }
         }
+    };
+    for args in commands.iter().filter(|a| is_device(&words(a))) {
+        run(args, &mut errors);
     }
     for (tun, wanted) in wanted_addresses(&commands) {
+        let promote = format!("/proc/sys/net/ipv4/conf/{tun}/promote_secondaries");
+        let _ = std::fs::write(promote, "1");
         for present in addresses_of(&tun) {
             if !wanted.contains(&present) && !present.starts_with("fe80:") {
                 if let Err(stderr) = ip(&["address", "del", &present, "dev", &tun]) {
@@ -134,6 +144,9 @@ pub fn apply(config: &Config) -> Vec<String> {
                 }
             }
         }
+    }
+    for args in commands.iter().filter(|a| !is_device(&words(a))) {
+        run(args, &mut errors);
     }
     errors
 }
