@@ -74,8 +74,10 @@ pub struct Ribd {
     /// unrefreshed routes were deleted.
     waiting_since: Option<Option<u64>>,
     dirty: bool,
-    /// A new FE connection got resync-begin; resync-end follows the next push.
+    /// resync-begin was sent; resync-end follows once the FE accepted the full send.
     resync_pending: bool,
+    /// The patch waiting for the FE's answer, and the routes it would make the FE hold.
+    in_flight: Option<(u32, BTreeMap<Key, Value>)>,
     counters: RibdCounters,
 }
 
@@ -107,6 +109,7 @@ impl Ribd {
             waiting_since: Some(None),
             dirty: false,
             resync_pending: false,
+            in_flight: None,
             counters: RibdCounters::default(),
         })
     }
@@ -135,6 +138,7 @@ impl Ribd {
         fe.resync_begin();
         self.fe = fe;
         self.sent.clear();
+        self.in_flight = None;
         self.dirty = true;
         self.resync_pending = self.waiting_since.is_none();
         Ok(())
@@ -164,7 +168,15 @@ impl Ribd {
         selected
     }
 
-    fn push(&mut self) {
+    /// Sends the FE what changed since what it accepted. One patch at a time: what
+    /// the FE holds is only known once it answered.
+    /// Returns whether a patch was sent.
+    fn push(&mut self) -> bool {
+        if self.in_flight.is_some() {
+            // Sent after the answer; the answer wakes the next step.
+            self.dirty = true;
+            return false;
+        }
         let selected = self.selected();
         let mut changes = Vec::new();
         for (key, value) in &selected {
@@ -178,12 +190,34 @@ impl Ribd {
             }
         }
         if changes.is_empty() {
-            return;
+            return false;
         }
-        if self.fe.patch(&changes).is_ok() {
-            self.counters.patches_sent += 1;
-            self.sent = selected;
+        match self.fe.patch(&changes) {
+            Ok(token) => {
+                self.counters.patches_sent += 1;
+                self.in_flight = Some((token, selected));
+                true
+            }
+            Err(_) => false,
         }
+    }
+
+    /// resync-end deletes what the FE holds from ribd but was not sent again, so it
+    /// goes only after the full send was accepted.
+    ///
+    /// `sent` is cleared at resync-begin and holds only what the FE accepted since, so
+    /// once it equals the selection the FE holds everything ribd wants.
+    fn finish_resync(&mut self) -> bool {
+        if self.resync_pending
+            && self.in_flight.is_none()
+            && !self.dirty
+            && self.sent == self.selected()
+        {
+            self.fe.resync_end();
+            self.resync_pending = false;
+            return true;
+        }
+        false
     }
 
     fn ready_to_sweep(&self, now_ms: u64, since: u64) -> bool {
@@ -203,22 +237,13 @@ impl Task for Ribd {
         }
         let (fe, events) = self.fe.poll();
         progress = progress.and(fe);
-        self.count_refusals(&events);
-        if std::mem::take(&mut self.dirty) {
-            self.push();
-            progress.busy = true;
-        }
-        if std::mem::take(&mut self.resync_pending) {
-            self.fe.resync_end();
-            progress.busy = true;
-        }
+        self.answers(&events);
         if let Some(waiting) = &mut self.waiting_since {
             let since = *waiting.get_or_insert(now_ms);
             if self.ready_to_sweep(now_ms, since) {
-                self.push();
-                self.fe.resync_end();
                 self.waiting_since = None;
-                progress.busy = true;
+                self.resync_pending = true;
+                self.dirty = true;
             } else {
                 let deadline = self
                     .sources
@@ -232,18 +257,44 @@ impl Task for Ribd {
                 });
             }
         }
+        if std::mem::take(&mut self.dirty) && self.push() {
+            progress.busy = true;
+        }
+        if self.finish_resync() {
+            progress.busy = true;
+        }
         let (flushed, events) = self.fe.poll();
-        self.count_refusals(&events);
+        self.answers(&events);
         progress.and(flushed)
     }
 }
 
 impl Ribd {
-    fn count_refusals(&mut self, events: &[Event]) {
+    /// Handles the FE's answers. An accepted patch makes its routes what the FE holds;
+    /// a refused one starts a resync, so routes the FE already has are kept until a
+    /// later full send is accepted. The refused routes go again with the next change.
+    fn answers(&mut self, events: &[Event]) {
         for event in events {
-            if let Event::Response { code, .. } = event {
-                if code.class() != 2 {
-                    self.counters.patches_refused += 1;
+            let Event::Response { token, code, .. } = event else {
+                continue;
+            };
+            let refused = code.class() != 2;
+            if refused {
+                self.counters.patches_refused += 1;
+            }
+            if self.in_flight.as_ref().is_some_and(|(t, _)| t == token) {
+                let (_, selected) = self.in_flight.take().expect("checked");
+                if refused {
+                    // What the FE holds from ribd is now unclear: start a resync, so
+                    // the next accepted full send is followed by resync-end. Routes
+                    // the FE holds stay until then.
+                    self.fe.resync_begin();
+                    self.sent.clear();
+                    if self.waiting_since.is_none() {
+                        self.resync_pending = true;
+                    }
+                } else {
+                    self.sent = selected;
                 }
             }
         }

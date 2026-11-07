@@ -30,6 +30,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("connecting to the FE: {error}"))?;
     let mut neighd = Neighd::new(fe, punt).map_err(|error| error.to_string())?;
     eprintln!("ruster-neighd: connected to the FE");
+    daemon::notify("READY=1");
 
     let clock = Clock::new();
     let mut last_report = 0;

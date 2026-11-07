@@ -20,6 +20,8 @@ const RING_ENTRIES: u32 = 2_048;
 const FRAME_SIZE: u32 = 4_096;
 const GENERATED_FRAMES: u32 = 512;
 const FRAME_COUNT: u32 = RING_ENTRIES * 2 + GENERATED_FRAMES;
+/// Kick-and-reap rounds per drain call.
+const DRAIN_ROUNDS: u32 = 8;
 
 /// How the XDP program is attached and the sockets bound.
 #[derive(Clone, Copy, Debug)]
@@ -121,5 +123,16 @@ impl Backend<XdpPacketIo<'_>> for Waiter {
             self.ready_unused = woke == RxWait::Ready;
         }
         Ok(())
+    }
+
+    fn drain(&mut self, io: &mut XdpPacketIo<'_>) -> bool {
+        match io.drain(DRAIN_ROUNDS) {
+            Ok(report) => report.is_drained(),
+            Err(error) => {
+                // A completion ring fault: what is still in flight cannot be reaped.
+                eprintln!("ruster-fe: drain fault: {error:?}");
+                true
+            }
+        }
     }
 }
