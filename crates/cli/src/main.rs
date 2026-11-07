@@ -2,10 +2,15 @@
 //!
 //! ```text
 //! ruster check FILE                       check a configuration file as confd reads it
+//! ruster [--run-dir DIR] apply FILE       check it, then make it confd's configuration
 //! ruster [--run-dir DIR] show             print every table the FE holds
 //! ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
 //! ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
 //! ```
+//!
+//! `apply` sends the file to confd, which sends what changed to the FE, ribd and neighd
+//! and answers once they have answered. If one of them refuses, confd puts the
+//! configuration it had before back ([`ruster_confd::apply`]).
 //!
 //! `route` writes to ribd as the route source NAME, the way a routing daemon does
 //! (ribd must have been started with that source). ribd picks between sources by
@@ -28,6 +33,7 @@ const WAIT: Duration = Duration::from_secs(5);
 
 const USAGE: &str = "usage:
   ruster check FILE
+  ruster [--run-dir DIR] apply FILE
   ruster [--run-dir DIR] show
   ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
   ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX";
@@ -215,11 +221,31 @@ fn check(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn apply(run_dir: &Path, path: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    ruster_confd::file::parse(&text).map_err(|e| format!("{path}: {e}"))?;
+    let socket = run_dir.join(socket::CONFD_CONFIG);
+    let (code, payload) = request(&socket, |c| Ok(c.post(&["config"], text.as_bytes())))?;
+    let said = String::from_utf8_lossy(&payload);
+    match code.class() {
+        2 => {}
+        4 => return Err(format!("{path}: not applied: {said}")),
+        // A timeout leaves the new configuration in confd; the text says so.
+        _ => return Err(format!("{path}: {said}")),
+    }
+    println!("{path}: applied");
+    if !said.is_empty() {
+        println!("{said}");
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
     match rest.split_first() {
         Some((command, args)) => match (command.as_str(), args) {
             ("check", [file]) => check(file),
+            ("apply", [file]) => apply(&run_dir, file),
             ("show", []) => show(&run_dir),
             ("route", args) => route(&run_dir, args),
             _ => Err(USAGE.into()),

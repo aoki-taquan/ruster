@@ -47,6 +47,8 @@ impl Code {
     pub const METHOD_NOT_ALLOWED: Self = Self::new(4, 5);
     pub const REQUEST_ENTITY_TOO_LARGE: Self = Self::new(4, 13);
     pub const INTERNAL_SERVER_ERROR: Self = Self::new(5, 0);
+    pub const SERVICE_UNAVAILABLE: Self = Self::new(5, 3);
+    pub const GATEWAY_TIMEOUT: Self = Self::new(5, 4);
 
     /// Signaling codes (RFC 8323 section 5).
     pub const CSM: Self = Self::new(7, 1);

@@ -35,6 +35,8 @@ pub mod socket {
     pub const NEIGHD_PUNT: &str = "neighd/punt.sock";
     /// neighd's table server for interfaces and addresses (written by confd).
     pub const NEIGHD_CONFIG: &str = "neighd/config.sock";
+    /// confd's socket for a new configuration file (from `ruster apply`).
+    pub const CONFD_CONFIG: &str = "confd/config.sock";
 
     /// ribd's table server for the route source `name`.
     pub fn ribd_source(name: &str) -> String {

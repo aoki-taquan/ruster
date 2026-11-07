@@ -426,6 +426,12 @@ impl Client {
         self.request(Code::POST, &["c", "sync-done"], None, &[])
     }
 
+    /// Sends POST to `path` with `payload`, for a resource outside the tables (confd's
+    /// `config`). Returns the token of the request.
+    pub fn post(&mut self, path: &[&str], payload: &[u8]) -> u32 {
+        self.request(Code::POST, path, None, payload)
+    }
+
     /// Asks for notifications. They arrive as [`Event::Notification`].
     pub fn observe(&mut self) -> u32 {
         let token = self.request(Code::GET, &["s"], Some(0), &[]);

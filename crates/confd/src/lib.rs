@@ -27,6 +27,7 @@ use ruster_proto::session::{Client, Event};
 use ruster_proto::table::{network, Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
+pub mod apply;
 pub mod file;
 pub mod kernel;
 
@@ -97,6 +98,16 @@ pub enum PeerKind {
     Neighd,
 }
 
+impl std::fmt::Display for PeerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fe => "the FE",
+            Self::Ribd => "ribd",
+            Self::Neighd => "neighd",
+        })
+    }
+}
+
 /// One process confd writes to, and what it accepted.
 struct Peer {
     client: Client,
@@ -153,6 +164,8 @@ pub struct Confd {
     ribd: Option<Peer>,
     neighd: Option<Peer>,
     counters: ConfdCounters,
+    /// The process that refused a change last, and its reason.
+    last_refusal: Option<(PeerKind, String)>,
 }
 
 impl std::fmt::Debug for Confd {
@@ -172,6 +185,7 @@ impl Confd {
             ribd: None,
             neighd: None,
             counters: ConfdCounters::default(),
+            last_refusal: None,
         }
     }
 
@@ -212,6 +226,32 @@ impl Confd {
 
     pub fn counters(&self) -> ConfdCounters {
         self.counters
+    }
+
+    /// The process that refused a change last, and the reason it gave.
+    pub fn last_refusal(&self) -> Option<&(PeerKind, String)> {
+        self.last_refusal.as_ref()
+    }
+
+    /// True when every connected process has answered every change sent to it.
+    pub fn settled(&self) -> bool {
+        [&self.fe, &self.ribd, &self.neighd]
+            .into_iter()
+            .flatten()
+            .all(|peer| peer.client.is_closed() || peer.in_flight.is_empty())
+    }
+
+    /// The processes that are not connected now.
+    pub fn absent(&self) -> Vec<PeerKind> {
+        [
+            (PeerKind::Fe, &self.fe),
+            (PeerKind::Ribd, &self.ribd),
+            (PeerKind::Neighd, &self.neighd),
+        ]
+        .into_iter()
+        .filter(|(_, peer)| peer.as_ref().is_none_or(|peer| peer.client.is_closed()))
+        .map(|(kind, _)| kind)
+        .collect()
     }
 
     /// Replaces the configuration; only the differences are sent.
@@ -434,17 +474,26 @@ fn send_diff(peer: &mut Peer, desired: &BTreeMap<Key, Value>, counters: &mut Con
 impl Task for Confd {
     fn step(&mut self, _now_ms: u64) -> Progress {
         let mut progress = Progress::IDLE;
-        for peer in [&mut self.fe, &mut self.ribd, &mut self.neighd]
-            .into_iter()
-            .flatten()
-        {
+        for (kind, peer) in [
+            (PeerKind::Fe, &mut self.fe),
+            (PeerKind::Ribd, &mut self.ribd),
+            (PeerKind::Neighd, &mut self.neighd),
+        ] {
+            let Some(peer) = peer else { continue };
             let (polled, events) = peer.client.poll();
             progress = progress.and(polled);
             for event in events {
-                if let Event::Response { token, code, .. } = event {
+                if let Event::Response {
+                    token,
+                    code,
+                    payload,
+                } = event
+                {
                     let accepted = code.class() == 2;
                     if !accepted {
                         self.counters.patches_refused += 1;
+                        self.last_refusal =
+                            Some((kind, String::from_utf8_lossy(&payload).into_owned()));
                     }
                     peer.answer(token, accepted);
                 }

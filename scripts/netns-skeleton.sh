@@ -176,6 +176,27 @@ sleep 0.5
 ping_ok "$host_a" 203.0.113.10 && fail "203.0.113.10 is still reachable after the route went"
 echo "ok: a route from an outside source is used, shown, and withdrawn"
 
+# A new configuration file through `ruster apply`: a static route comes and goes.
+{ cat "$work/router.toml"; cat <<'TOML'
+
+[[route]]
+prefix = "203.0.113.0/24"
+interface = "rb"
+via = "198.51.100.10"
+TOML
+} >"$work/with-route.toml"
+out=$(ruster apply "$work/with-route.toml") || fail "ruster apply: $out"
+grep -q "applied" <<<"$out" || fail "ruster apply said: $out"
+nsx "$host_a" ping -c 3 -i 0.2 -W 1 203.0.113.10 >/dev/null || fail "the applied route is not used"
+printf '[[route]]\nprefix = "203.0.113.0/24"\ninterface = "nowhere"\n' >>"$work/with-route.toml"
+ruster apply "$work/with-route.toml" >/dev/null 2>&1 && fail "ruster apply took a broken file"
+ping_ok "$host_a" 203.0.113.10 || fail "a broken file changed the configuration"
+out=$(ruster apply "$work/router.toml") || fail "ruster apply back: $out"
+sleep 0.5
+ping_ok "$host_a" 203.0.113.10 && fail "203.0.113.10 is still reachable after the file without it"
+both_ways || fail "forwarding stopped after ruster apply"
+echo "ok: ruster apply changes the running configuration and refuses a broken file"
+
 # A control process that dies does not stop forwarding, and comes back by itself.
 # Counts the lines of a log that say a connection was made again.
 again() { grep -c "again" "$work/$1.log" || true; }
