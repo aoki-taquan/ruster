@@ -354,6 +354,15 @@ fn vrf_mistakes_are_refused() {
             one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\nvia = \"10.0.0.9\"\n"),
             "has no via",
         ),
+        (
+            one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"defualt\"\n"),
+            "no interface or route is in VRF",
+        ),
+        (
+            one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"blue\"\n\
+                 [[route]]\nvrf = \"blue\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\n"),
+            "not followed",
+        ),
     ] {
         let got = error(&text);
         assert!(got.contains(expected), "{text:?}: {got}");

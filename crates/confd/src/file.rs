@@ -22,10 +22,15 @@
 //! lookup-vrf = "default"
 //! ```
 //!
-//! Addresses and prefixes must be unique within a VRF; two VRFs may use the same ones.
+//! An address, and the prefix of an interface address, must be unique within a VRF;
+//! two VRFs may use the same ones. A static route for an interface's prefix replaces
+//! the connected route. A `lookup-vrf` must name a VRF that an interface or a route is
+//! in, and that VRF's own `lookup-vrf` routes are not followed, so they are refused.
 //!
 //! # Standards
 //!
+//! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
+//!   when not named.
 //! - RFC 791: the smallest MTU is 68.
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
 //!   must be usable unicast addresses (not 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4 or
@@ -285,6 +290,33 @@ pub fn parse(text: &str) -> Result<Config, String> {
             len,
             target: RouteTarget::Next { interface, via },
         });
+    }
+    // A lookup must reach a VRF that exists, and is followed one level only.
+    let defined: BTreeSet<&str> = seen
+        .vrf_of
+        .values()
+        .map(String::as_str)
+        .chain(static_routes.iter().map(|r| r.vrf.as_str()))
+        .collect();
+    for route in &static_routes {
+        let RouteTarget::LookupVrf(other) = &route.target else {
+            continue;
+        };
+        let at = format!(
+            "route {}/{} in VRF {:?}",
+            route.prefix, route.len, route.vrf
+        );
+        if !defined.contains(other.as_str()) {
+            return Err(format!("{at}: no interface or route is in VRF {other:?}"));
+        }
+        let chained = static_routes
+            .iter()
+            .any(|r| r.vrf == *other && matches!(r.target, RouteTarget::LookupVrf(_)));
+        if chained {
+            return Err(format!(
+                "{at}: VRF {other:?} has lookup-vrf routes of its own, which are not followed"
+            ));
+        }
     }
     Ok(Config {
         interfaces,
