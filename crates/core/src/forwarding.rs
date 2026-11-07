@@ -1252,6 +1252,9 @@ pub struct ForwardingSnapshot<'a> {
     /// being learned or answered here
     /// ([`ForwardingSnapshot::with_arp_to_control`]).
     arp_to_control: bool,
+    /// Whether traffic addressed to the router goes to the control side whole
+    /// ([`ForwardingSnapshot::with_local_to_control`]).
+    pub(crate) local_to_control: bool,
     /// The IPv6 tables ([`ForwardingSnapshot::with_ipv6`]); without them IPv6
     /// frames are dropped as an unsupported Ethernet type.
     pub(crate) ipv6: Option<&'a crate::Ipv6Fib>,
@@ -1459,6 +1462,7 @@ impl<'a> ForwardingSnapshot<'a> {
             input_firewall_default: crate::InputFirewallAction::Accept,
             input_firewall_indexed: false,
             arp_to_control: false,
+            local_to_control: false,
             ipv6: None,
             vrfs: None,
             index: None,
@@ -1551,6 +1555,18 @@ impl<'a> ForwardingSnapshot<'a> {
                 vrfs.snapshots.get(usize::from(index))
             })
             .unwrap_or(self)
+    }
+
+    /// Copies every IPv4 and IPv6 packet addressed to the router, after the input
+    /// firewall, into the control queue of [`forward_batch_with_control`] as
+    /// [`crate::ControlKind::Local`], instead of answering it here (no Echo Reply, no
+    /// Port Unreachable): the kernel behind the control side terminates it.
+    #[must_use]
+    pub fn with_local_to_control(self, on: bool) -> Self {
+        Self {
+            local_to_control: on,
+            ..self
+        }
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1731,6 +1747,7 @@ impl<'a> ForwardingSnapshot<'a> {
             // not from `rules`: walk these linearly.
             input_firewall_indexed: false,
             arp_to_control: false,
+            local_to_control: false,
             ipv6: None,
             vrfs: None,
             authority,
@@ -2097,6 +2114,7 @@ impl ValidatedForwardingOwner {
             input_firewall_default: self.input_firewall_default,
             input_firewall_indexed: true,
             arp_to_control: false,
+            local_to_control: false,
             ipv6: None,
             vrfs: None,
             index: Some(&self.index),
@@ -4337,12 +4355,17 @@ where
                         tracker.commit_deny(ticket, nat_now_ms);
                     }
                 }
-                packet.consume(ConsumeReason::Ipv4LocalUnsupported);
+                let reason = if snapshot.local_to_control {
+                    if let Some(queue) = control.as_deref_mut() {
+                        queue.push_local(ingress, packet.bytes_mut());
+                    }
+                    ConsumeReason::LocalToControl
+                } else {
+                    ConsumeReason::Ipv4LocalUnsupported
+                };
+                packet.consume(reason);
                 consumed += 1;
-                trace.record(TraceEvent::Ipv4LocalConsumed {
-                    ingress,
-                    reason: ConsumeReason::Ipv4LocalUnsupported,
-                });
+                trace.record(TraceEvent::Ipv4LocalConsumed { ingress, reason });
             }
             Ok(planned) => {
                 let decision = planned.decision;
@@ -8721,6 +8744,9 @@ fn decide_local_ipv4_with_errors<T: TraceSink>(
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
     input_firewall_admits(frame, snapshot, ingress, ipv4, true, firewall, trace)?;
+    if snapshot.local_to_control {
+        return Ok(PacketDecision::ConsumeIpv4Local);
+    }
     // Without a Port Unreachable to send, the UDP checksum is not read: a
     // flood of UDP to a router address costs no payload pass.
     let udp_checksum = icmpv4_errors.as_ref().is_some_and(|(runtime, _)| {

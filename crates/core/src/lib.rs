@@ -129,8 +129,8 @@ pub use ipv4_fragmentation::{
     IPV4_FRAGMENTATION_MIN_MAX_FRAGMENTS,
 };
 pub use ipv6::{
-    ControlFrame, ControlQueue, Ipv6Fib, Ipv6FibError, Ipv6Local, Ipv6Neighbor, Ipv6Route,
-    CONTROL_FRAME_MAX, IPV6_ETHERTYPE,
+    ControlFrame, ControlKind, ControlQueue, Ipv6Fib, Ipv6FibError, Ipv6Local, Ipv6Neighbor,
+    Ipv6Route, CONTROL_FRAME_MAX, IPV6_ETHERTYPE,
 };
 pub use nat44::{
     Nat44CarryIdentity, Nat44Filtering, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpCounters,

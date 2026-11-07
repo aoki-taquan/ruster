@@ -221,9 +221,20 @@ impl ErrorLimiter {
     }
 }
 
+/// What a control frame is for.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ControlKind {
+    /// Neighbor Discovery, for the neighbor process.
+    #[default]
+    Neighbor,
+    /// A packet addressed to the router, for the kernel.
+    Local,
+}
+
 /// One frame for the control side, or one ICMPv6 error to send.
 #[derive(Clone, Debug)]
 pub struct ControlFrame {
+    pub kind: ControlKind,
     /// The interface the frame came in on; for an error, the one to send it out of.
     pub ingress: IfId,
     bytes: Box<[u8; CONTROL_FRAME_MAX]>,
@@ -240,6 +251,7 @@ impl ControlQueue {
     /// A queue of `capacity` slots; a full queue drops further frames.
     pub fn new(capacity: usize) -> Self {
         let slot = ControlFrame {
+            kind: ControlKind::Neighbor,
             ingress: IfId(0),
             bytes: Box::new([0; CONTROL_FRAME_MAX]),
             len: 0,
@@ -261,6 +273,7 @@ impl ControlQueue {
     #[must_use]
     pub fn with_icmpv6_errors(mut self, capacity: usize) -> Self {
         let slot = ControlFrame {
+            kind: ControlKind::Neighbor,
             ingress: IfId(0),
             bytes: Box::new([0; CONTROL_FRAME_MAX]),
             len: 0,
@@ -279,6 +292,15 @@ impl ControlQueue {
         &self.errors[..self.errors_len]
     }
 
+    /// Queues a packet addressed to the router; a full queue drops it.
+    pub(crate) fn push_local(&mut self, ingress: IfId, frame: &[u8]) -> bool {
+        let pushed = self.push(ingress, frame);
+        if pushed {
+            self.slots[self.len - 1].kind = ControlKind::Local;
+        }
+        pushed
+    }
+
     fn push(&mut self, ingress: IfId, frame: &[u8]) -> bool {
         let Some(slot) = self.slots.get_mut(self.len) else {
             return false;
@@ -286,6 +308,7 @@ impl ControlQueue {
         if frame.len() > CONTROL_FRAME_MAX {
             return false;
         }
+        slot.kind = ControlKind::Neighbor;
         slot.ingress = ingress;
         slot.bytes[..frame.len()].copy_from_slice(frame);
         slot.len = frame.len();
@@ -344,6 +367,8 @@ pub(crate) enum Outcome {
     Error(crate::DropReason, u8, u8, u32),
     /// Copy it to the control side and consume it.
     Control,
+    /// Addressed to the router: copy it to the control side for the kernel.
+    Local,
 }
 
 fn address(frame: &[u8], at: usize) -> [u8; 16] {
@@ -401,6 +426,8 @@ pub(crate) fn decide<T: TraceSink>(
             Outcome::Control
         } else if is_multicast(destination) {
             Outcome::Drop(Ipv6DestinationNotForwarded)
+        } else if snapshot.local_to_control {
+            Outcome::Local
         } else {
             Outcome::Drop(Ipv6LocalUnsupported)
         };
@@ -464,6 +491,13 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
             packet.recycle(reason);
             trace.record(TraceEvent::Dropped { ingress, reason });
             Completed::Dropped
+        }
+        Outcome::Local => {
+            if let Some(queue) = control {
+                queue.push_local(ingress, packet.bytes_mut());
+            }
+            packet.consume(crate::ConsumeReason::LocalToControl);
+            Completed::Consumed
         }
         Outcome::Control => {
             let queued = control.is_some_and(|queue| queue.push(ingress, packet.bytes_mut()));
