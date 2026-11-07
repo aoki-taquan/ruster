@@ -219,6 +219,16 @@ pub trait PacketSlot {
     fn ingress(&self) -> IfId;
     fn bytes_mut(&mut self) -> &mut [u8];
     fn complete(self, completion: SlotCompletion);
+
+    /// Moves the start of the frame: a positive `delta` drops that many bytes from
+    /// the front, a negative one adds that many (unspecified) bytes before it, from
+    /// the backend's headroom. Returns `false`, changing nothing, when the backend
+    /// cannot. A transmit sends the frame as it is after the move. The default
+    /// cannot.
+    fn resize_front(&mut self, delta: isize) -> bool {
+        let _ = delta;
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,6 +352,9 @@ const _: () = {
 /// ```
 pub struct PacketLease<S: PacketSlot> {
     slot: Option<S>,
+    /// The interface the frame counts as received on, when core changed it (a VLAN
+    /// sub-interface instead of its parent port).
+    ingress: Option<IfId>,
     _worker_local: PhantomData<Rc<()>>,
 }
 
@@ -350,13 +363,34 @@ impl<S: PacketSlot> PacketLease<S> {
     pub fn new(slot: S) -> Self {
         Self {
             slot: Some(slot),
+            ingress: None,
             _worker_local: PhantomData,
         }
     }
 
     #[must_use]
     pub fn ingress(&self) -> IfId {
+        self.ingress
+            .unwrap_or_else(|| self.slot.as_ref().expect("live packet lease").ingress())
+    }
+
+    /// The port the backend received the frame on, whatever [`Self::set_ingress`] says.
+    #[must_use]
+    pub fn port(&self) -> IfId {
         self.slot.as_ref().expect("live packet lease").ingress()
+    }
+
+    /// Makes the frame count as received on `ingress` from now on.
+    pub fn set_ingress(&mut self, ingress: IfId) {
+        self.ingress = Some(ingress);
+    }
+
+    /// See [`PacketSlot::resize_front`].
+    pub fn resize_front(&mut self, delta: isize) -> bool {
+        self.slot
+            .as_mut()
+            .expect("live packet lease")
+            .resize_front(delta)
     }
 
     pub fn bytes_mut(&mut self) -> &mut [u8] {

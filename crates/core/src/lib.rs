@@ -28,6 +28,7 @@ mod route;
 mod slot_index;
 mod slot_list;
 mod source_validation;
+mod vlan;
 
 pub use arp_hold::{
     ArpHoldCounters, ArpHoldPolicy, ArpHoldPolicyError, ArpHoldRuntime, ArpHoldSlot,
@@ -199,3 +200,4 @@ pub use route::{
     ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
 pub use source_validation::{SourceValidation, SourceValidationBinding};
+pub use vlan::VlanBinding;
