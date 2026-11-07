@@ -13,6 +13,7 @@
 mod af_packet;
 mod af_xdp;
 mod signal;
+mod tun;
 
 use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
@@ -144,6 +145,8 @@ where
     let clock = Clock::new();
     let mut last_report = 0;
     let mut reported = fe.counters();
+    let mut attached = std::collections::BTreeSet::new();
+    let mut last_tun_check = 0;
     daemon::notify("READY=1");
     loop {
         let now = clock.now_ms();
@@ -166,6 +169,10 @@ where
                     .map_err(|error| error.to_string())?;
             }
         }
+        if now.saturating_sub(last_tun_check) >= TUN_CHECK_MS {
+            last_tun_check = now;
+            attach_tuns(fe, &mut attached);
+        }
         let progress = fe.step(now);
         if now.saturating_sub(last_report) >= 5_000 && fe.counters() != reported {
             reported = fe.counters();
@@ -173,6 +180,36 @@ where
             eprintln!("ruster-fe: {reported:?}");
         }
         waiter.after_step(fe.io_mut(), progress.busy)?;
+    }
+}
+
+/// How often the FE looks for TUN devices of VRFs it has none for.
+const TUN_CHECK_MS: u64 = 1_000;
+
+/// Attaches each VRF that has no kernel pipe yet to its TUN device, once confd has
+/// created it.
+fn attach_tuns<B>(fe: &mut Fe<B>, attached: &mut std::collections::BTreeSet<String>)
+where
+    B: PacketIo + GeneratedPacketIo,
+{
+    for vrf in fe.vrfs().to_vec() {
+        if attached.contains(&vrf) {
+            continue;
+        }
+        let Some(device) = tun::device(&vrf) else {
+            continue;
+        };
+        if !tun::exists(&device) {
+            continue;
+        }
+        match tun::open(&device) {
+            Ok(file) => {
+                fe.attach_local(&vrf, Box::new(file));
+                eprintln!("ruster-fe: traffic to the router in VRF {vrf:?} goes to {device}");
+                attached.insert(vrf);
+            }
+            Err(error) => eprintln!("ruster-fe: {device}: {error}"),
+        }
     }
 }
 

@@ -28,6 +28,7 @@ use ruster_proto::table::{network, Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
 pub mod file;
+pub mod kernel;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {

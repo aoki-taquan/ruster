@@ -368,3 +368,54 @@ fn vrf_mistakes_are_refused() {
         assert!(got.contains(expected), "{text:?}: {got}");
     }
 }
+
+#[test]
+fn the_kernel_side_has_a_tun_device_per_vrf_with_its_addresses() {
+    let config = parse(
+        r#"
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+ipv4 = "192.0.2.1/24"
+ipv6 = ["2001:db8:1::1/64"]
+
+[[interface]]
+name = "red0"
+mac = "02:00:00:00:00:02"
+ipv4 = "10.0.0.1/24"
+vrf = "red"
+"#,
+    )
+    .unwrap();
+    let commands: Vec<String> = ruster_confd::kernel::commands(&config)
+        .iter()
+        .map(|args| args.join(" "))
+        .collect();
+    for expected in [
+        "tuntap add mode tun dev rt-default",
+        "address replace 192.0.2.1/24 dev rt-default",
+        "address replace 2001:db8:1::1/64 dev rt-default nodad",
+        "-4 route replace default dev rt-default",
+        "-6 route replace default dev rt-default",
+        "tuntap add mode tun dev rt-red",
+        "link add vrf-red type vrf table TABLE",
+        "link set rt-red master vrf-red",
+        "address replace 10.0.0.1/24 dev rt-red",
+        "-4 route replace default dev rt-red table TABLE",
+    ] {
+        let expected = expected.replace("TABLE", &ruster_confd::kernel::table("red").to_string());
+        assert!(commands.contains(&expected), "{expected}: {commands:#?}");
+    }
+    assert!(
+        !commands.iter().any(|c| c.contains("fe80")),
+        "no link-local addresses"
+    );
+}
+
+#[test]
+fn a_vrf_s_kernel_table_depends_only_on_its_name() {
+    use ruster_confd::kernel::table;
+    assert_eq!(table("red"), table("red"));
+    assert_ne!(table("red"), table("blue"));
+    assert!(table("red") >= 1_000);
+}
