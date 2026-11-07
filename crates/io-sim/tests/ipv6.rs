@@ -2,8 +2,8 @@
 
 use ruster_core::{
     forward_batch_with_control, ConsumeReason, ControlQueue, DropReason, ForwardingSnapshot, IfId,
-    Interface, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, MacAddress, PacketIo, TraceEvent,
-    TraceSink,
+    Interface, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, MacAddress, PacketIo, Services,
+    TraceEvent, TraceSink,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
 
@@ -119,7 +119,7 @@ fn run(io: &mut SimIo, fib: &Ipv6Fib, queue: &mut ControlQueue) -> Recorder {
         .with_ipv6(fib);
     let mut trace = Recorder::default();
     let batch = io.receive(16).unwrap();
-    forward_batch_with_control(batch, &snapshot, queue, None, &mut trace);
+    forward_batch_with_control(batch, &snapshot, queue, Services::default(), &mut trace);
     trace
 }
 
@@ -371,7 +371,13 @@ fn without_ipv6_tables_ipv6_is_an_unsupported_ethernet_type() {
     let mut trace = Recorder::default();
     let mut queue = ControlQueue::new(1);
     let batch = io.receive(16).unwrap();
-    forward_batch_with_control(batch, &snapshot, &mut queue, None, &mut trace);
+    forward_batch_with_control(
+        batch,
+        &snapshot,
+        &mut queue,
+        Services::default(),
+        &mut trace,
+    );
     assert_eq!(
         trace.0,
         [TraceEvent::Dropped {
