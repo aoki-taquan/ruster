@@ -27,6 +27,8 @@ pub mod socket {
     pub const FE_ROUTE: &str = "fe/route.sock";
     /// The FE's table server for neighbors (written by neighd).
     pub const FE_NEIGHBOR: &str = "fe/neigh.sock";
+    /// The FE's read-only socket: every table, and notifications.
+    pub const FE_STATE: &str = "fe/state.sock";
     /// The FE's datagram socket for frames to and from the CE.
     pub const FE_PUNT: &str = "fe/punt/arp-nd.sock";
     /// neighd's datagram socket for frames from the FE.

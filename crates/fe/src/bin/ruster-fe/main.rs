@@ -113,6 +113,7 @@ where
         (socket::FE_CONFIG, writers::CONFIG),
         (socket::FE_ROUTE, writers::ROUTE),
         (socket::FE_NEIGHBOR, writers::NEIGHBOR),
+        (socket::FE_STATE, writers::READ_ONLY),
     ] {
         let listener = daemon::listen(&path(name)).map_err(|error| format!("{name}: {error}"))?;
         listeners.push((listener, writes));

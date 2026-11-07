@@ -12,7 +12,7 @@ set -euo pipefail
 backend=${FE_BACKEND:-af-xdp}
 
 bin=$(realpath "${1:-target/debug}")
-for name in ruster-fe ruster-ribd ruster-neighd ruster-confd; do
+for name in ruster-fe ruster-ribd ruster-neighd ruster-confd ruster; do
   [[ -x "$bin/$name" ]] || { echo "missing $bin/$name (run cargo build)" >&2; exit 2; }
 done
 
@@ -69,6 +69,9 @@ nsx "$host_b" ip addr add 198.51.100.10/24 dev b0
 nsx "$host_b" ip route add default via 198.51.100.1
 nsx "$host_b" ip addr add 2001:db8:2::10/64 dev b0 nodad
 nsx "$host_b" ip -6 route add default via fe80::ff:fe00:2 dev b0
+# A network behind host-b that only an outside route source knows.
+nsx "$host_b" ip addr add 203.0.113.10/32 dev lo
+nsx "$host_b" ip link set lo up
 
 cat > "$work/router.toml" <<'TOML'
 [[interface]]
@@ -98,6 +101,7 @@ args_of() {
   case $1 in
     ruster-fe) echo "--backend $backend ra rb" ;;
     ruster-confd) echo "--kernel $work/router.toml" ;;
+    ruster-ribd) echo "confd:1 routed:20" ;;
     *) echo "" ;;
   esac
 }
@@ -157,6 +161,20 @@ echo hello-router | nsx "$host_a" timeout 5 nc -N 192.0.2.1 8080 || fail "no TCP
 sleep 0.2
 grep -q hello-router "$work/tcp.out" || fail "the router's kernel did not get the TCP data"
 echo "ok: ping and TCP to the router reach its kernel (IPv4 and IPv6)"
+
+# A route from an outside source (as a routing daemon would write it to ribd).
+ruster() { nsx "$router" "$bin/ruster" --run-dir "$run_dir" "$@"; }
+ping_ok "$host_a" 203.0.113.10 && fail "203.0.113.10 is reachable before the route"
+ruster route add --source routed 203.0.113.0/24 dev rb via 198.51.100.10 \
+  || fail "ruster route add"
+sleep 0.5
+nsx "$host_a" ping -c 3 -i 0.2 -W 1 203.0.113.10 >/dev/null || fail "the outside route is not used"
+ruster show | grep -q "route default 203.0.113.0/24 via 198.51.100.10 dev rb" \
+  || fail "ruster show does not list the route: $(ruster show)"
+ruster route del --source routed 203.0.113.0/24 || fail "ruster route del"
+sleep 0.5
+ping_ok "$host_a" 203.0.113.10 && fail "203.0.113.10 is still reachable after the route went"
+echo "ok: a route from an outside source is used, shown, and withdrawn"
 
 # A control process that dies does not stop forwarding, and comes back by itself.
 # Counts the lines of a log that say a connection was made again.
