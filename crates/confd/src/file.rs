@@ -23,6 +23,8 @@ use crate::{Config, InterfaceConfig, StaticRoute};
 
 /// The smallest MTU an IPv4 interface may have (RFC 791).
 const MIN_MTU: u16 = ruster_proto::table::MIN_MTU;
+/// The FE takes Ethernet frames of up to 1514 bytes.
+const MAX_MTU: u16 = 1_500;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -65,6 +67,8 @@ fn default_enabled() -> bool {
 pub fn parse(text: &str) -> Result<Config, String> {
     let file: File = toml::from_str(text).map_err(|error| error.to_string())?;
     let mut names = BTreeSet::new();
+    let mut addresses = BTreeSet::new();
+    let mut connected = BTreeSet::new();
     let mut interfaces = Vec::with_capacity(file.interface.len());
     for entry in file.interface {
         let at = format!("interface {:?}", entry.name);
@@ -79,8 +83,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(format!("{at}: mac must be a unicast address"));
         }
-        if entry.mtu < MIN_MTU {
-            return Err(format!("{at}: mtu must be at least {MIN_MTU}"));
+        if !(MIN_MTU..=MAX_MTU).contains(&entry.mtu) {
+            return Err(format!("{at}: mtu must be {MIN_MTU} to {MAX_MTU}"));
         }
         let ipv4 = match &entry.ipv4 {
             Some(text) => {
@@ -88,6 +92,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
                     prefix(text).ok_or_else(|| format!("{at}: ipv4 is not like 192.0.2.1/24"))?;
                 if len == 0 {
                     return Err(format!("{at}: ipv4 needs a prefix length of 1 to 32"));
+                }
+                if !unicast(address) {
+                    return Err(format!("{at}: ipv4 must be a unicast address"));
+                }
+                if !addresses.insert(address) {
+                    return Err(format!("{at}: {address} is on another interface too"));
+                }
+                if !connected.insert((network(address, len), len)) {
+                    return Err(format!("{at}: another interface has the same prefix"));
                 }
                 Some((address, len))
             }
@@ -107,8 +120,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         let at = format!("route {:?}", entry.prefix);
         let (address, len) =
             prefix(&entry.prefix).ok_or_else(|| format!("{at}: prefix is not like 10.0.0.0/8"))?;
-        let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
-        if u32::from(address) & !mask != 0 {
+        if network(address, len) != address {
             return Err(format!("{at}: bits are set after the prefix length"));
         }
         if !prefixes.insert((address, len)) {
@@ -120,7 +132,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
         let via = match &entry.via {
             Some(text) => Some(
                 text.parse::<Ipv4Addr>()
-                    .map_err(|_| format!("{at}: via is not an IPv4 address"))?,
+                    .ok()
+                    .filter(|via| unicast(*via) && !addresses.contains(via))
+                    .ok_or_else(|| {
+                        format!("{at}: via must be a unicast IPv4 address of another host")
+                    })?,
             ),
             None => None,
         };
@@ -158,4 +174,16 @@ fn prefix(text: &str) -> Option<(Ipv4Addr, u8)> {
     let len: u8 = len.parse().ok()?;
     (len <= 32).then_some(())?;
     Some((address.parse().ok()?, len))
+}
+
+fn network(address: Ipv4Addr, len: u8) -> Ipv4Addr {
+    let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+    Ipv4Addr::from(u32::from(address) & mask)
+}
+
+/// An address a host can have: not unspecified, loopback, multicast, broadcast or
+/// reserved (240.0.0.0/4).
+fn unicast(address: Ipv4Addr) -> bool {
+    let first = address.octets()[0];
+    first != 0 && !address.is_loopback() && first < 224
 }

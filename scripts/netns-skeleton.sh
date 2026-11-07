@@ -20,7 +20,7 @@ work=$(mktemp -d)
 pids=()
 
 cleanup() {
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in ${pids[@]+"${pids[@]}"}; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   for ns in "$host_a" "$host_b" "$router"; do ip netns del "$ns" 2>/dev/null || true; done
   if [[ "${keep_logs:-}" == 1 ]]; then echo "logs in $work"; else rm -rf "$work"; fi
@@ -42,6 +42,10 @@ nsx "$router" ip link set ra address 02:00:00:00:00:01 up
 nsx "$router" ip link set rb address 02:00:00:00:00:02 up
 nsx "$router" ip link set lo up
 
+# veth leaves checksums to the receiver; the FE forwards frames as they are, so the
+# hosts compute their own.
+nsx "$host_a" ethtool -K a0 tx off >/dev/null
+nsx "$host_b" ethtool -K b0 tx off >/dev/null
 nsx "$host_a" ip link set a0 up
 nsx "$host_a" ip addr add 192.0.2.10/24 dev a0
 nsx "$host_a" ip route add default via 192.0.2.1

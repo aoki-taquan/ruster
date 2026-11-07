@@ -99,7 +99,40 @@ fn mistakes_are_refused_with_what_is_wrong() {
             "[[interface]]\nname = \"lan\"\nmac = \"01:00:5e:00:00:01\"\n",
             "unicast",
         ),
-        (&format!("{LAN}mtu = 67\n"), "at least 68"),
+        (&format!("{LAN}mtu = 67\n"), "68 to 1500"),
+        (&format!("{LAN}mtu = 9000\n"), "68 to 1500"),
+        (&format!("{LAN}ipv4 = \"0.0.0.0/8\"\n"), "unicast"),
+        (&format!("{LAN}ipv4 = \"127.0.0.1/8\"\n"), "unicast"),
+        (&format!("{LAN}ipv4 = \"224.0.0.1/24\"\n"), "unicast"),
+        (&format!("{LAN}ipv4 = \"255.255.255.255/32\"\n"), "unicast"),
+        (
+            &format!(
+                "{LAN}ipv4 = \"192.0.2.1/24\"\n[[interface]]\nname = \"wan\"\n\
+                 mac = \"02:00:00:00:00:02\"\nipv4 = \"192.0.2.1/30\"\n"
+            ),
+            "on another interface",
+        ),
+        (
+            &format!(
+                "{LAN}ipv4 = \"192.0.2.1/24\"\n[[interface]]\nname = \"wan\"\n\
+                 mac = \"02:00:00:00:00:02\"\nipv4 = \"192.0.2.2/24\"\n"
+            ),
+            "same prefix",
+        ),
+        (
+            &format!(
+                "{LAN}ipv4 = \"192.0.2.1/24\"\n[[route]]\nprefix = \"10.0.0.0/8\"\n\
+                 interface = \"lan\"\nvia = \"192.0.2.1\"\n"
+            ),
+            "via must be",
+        ),
+        (
+            &format!(
+                "{LAN}[[route]]\nprefix = \"10.0.0.0/8\"\ninterface = \"lan\"\n\
+                 via = \"255.255.255.255\"\n"
+            ),
+            "via must be",
+        ),
         (&format!("{LAN}ipv4 = \"192.0.2.1\"\n"), "ipv4 is not like"),
         (
             &format!("{LAN}ipv4 = \"192.0.2.1/33\"\n"),
@@ -116,7 +149,7 @@ fn mistakes_are_refused_with_what_is_wrong() {
         ),
         (
             &format!("{LAN}[[route]]\nprefix = \"10.0.0.0/8\"\ninterface = \"lan\"\nvia = \"x\"\n"),
-            "via is not",
+            "via must be",
         ),
         (
             &format!(

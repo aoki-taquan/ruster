@@ -43,7 +43,7 @@ fn run() -> Result<(), String> {
             refused = confd.counters().patches_refused;
             eprintln!("ruster-confd: a process refused a change ({refused} so far)");
         }
-        daemon::idle(progress, now);
+        daemon::idle(progress);
     }
 }
 
