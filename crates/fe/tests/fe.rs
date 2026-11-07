@@ -1689,4 +1689,113 @@ mod wireguard {
         bench.fe.step(bench.now);
         assert!(bench.fe.io_mut().pop_tx().is_some());
     }
+
+    fn sent_counter(bench: &mut Bench) -> u64 {
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), udp_from_host([10, 9, 0, 5]));
+        bench.fe.step(bench.now);
+        let tx = bench.fe.io_mut().pop_tx().expect("sent");
+        u64::from_le_bytes(tx.bytes[14 + 28 + 8..14 + 28 + 16].try_into().unwrap())
+    }
+
+    fn session_key(key: u8, peer_index: u32) -> Change {
+        Change::set(
+            Key::WireguardSession {
+                interface: "wg0".into(),
+                peer: "branch".into(),
+            },
+            Value::WireguardSession(WireguardSession {
+                send: [key; 32],
+                receive: [2; 32],
+                peer_index,
+                local_index: 11,
+            }),
+        )
+    }
+
+    fn delete_session() -> Change {
+        Change::delete(Key::WireguardSession {
+            interface: "wg0".into(),
+            peer: "branch".into(),
+        })
+    }
+
+    #[test]
+    fn the_counter_goes_on_across_table_changes() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        assert_eq!(sent_counter(&mut bench), 0);
+        // A change that leaves the session alone.
+        let mut config = bench.connect(writers::CONFIG);
+        assert_eq!(
+            bench.patch(&mut config, &[address("lan", [192, 0, 2, 3], 24)]),
+            Code::CHANGED
+        );
+        assert_eq!(sent_counter(&mut bench), 1);
+    }
+
+    #[test]
+    fn a_send_key_never_seals_with_a_counter_it_used_before() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        assert_eq!(sent_counter(&mut bench), 0);
+        assert_eq!(sent_counter(&mut bench), 1);
+        let mut config = bench.connect(writers::CONFIG);
+
+        // The session is deleted: nothing is sent. The same keys come back: the
+        // counter goes on.
+        assert_eq!(bench.patch(&mut config, &[delete_session()]), Code::CHANGED);
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), udp_from_host([10, 9, 0, 5]));
+        bench.fe.step(bench.now);
+        assert!(bench.fe.io_mut().pop_tx().is_none());
+        assert_eq!(bench.patch(&mut config, &[session()]), Code::CHANGED);
+        assert_eq!(sent_counter(&mut bench), 2);
+
+        // The same send key with another index: it goes on too.
+        assert_eq!(
+            bench.patch(&mut config, &[session_key(1, 99)]),
+            Code::CHANGED
+        );
+        assert_eq!(sent_counter(&mut bench), 3);
+
+        // A new send key starts from 0.
+        assert_eq!(
+            bench.patch(&mut config, &[session_key(5, 99)]),
+            Code::CHANGED
+        );
+        assert_eq!(sent_counter(&mut bench), 0);
+        // And going back to the first key does not reset it either.
+        assert_eq!(bench.patch(&mut config, &[session()]), Code::CHANGED);
+        assert_eq!(sent_counter(&mut bench), 4);
+    }
+
+    #[test]
+    fn a_disabled_interface_that_comes_back_does_not_restart_the_counter() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        assert_eq!(sent_counter(&mut bench), 0);
+        let mut config = bench.connect(writers::CONFIG);
+        let wg0 = |enabled| {
+            Change::set(
+                Key::Interface { name: "wg0".into() },
+                Value::Interface {
+                    enabled,
+                    mac: [2, 0, 0, 0, 0, 9],
+                    mtu: 1420,
+                    vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                    vlan: None,
+                    tunnel: None,
+                    pppoe: None,
+                },
+            )
+        };
+        assert_eq!(bench.patch(&mut config, &[wg0(false)]), Code::CHANGED);
+        assert_eq!(bench.patch(&mut config, &[wg0(true)]), Code::CHANGED);
+        assert_eq!(sent_counter(&mut bench), 1);
+    }
 }
