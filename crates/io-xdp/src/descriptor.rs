@@ -71,6 +71,27 @@ impl ValidatedDescriptor {
         self.len == 0
     }
 
+    /// The same frame's bytes with the start moved: a positive `delta` drops that
+    /// many bytes from the front, a negative one takes that many more before it.
+    /// `None` when the result would leave the frame of `frame_size` bytes or be empty.
+    /// The result may start in the frame's headroom; such a frame is copied, not sent
+    /// in place.
+    #[must_use]
+    pub fn moved_front(self, delta: i64, frame_size: u64) -> Option<Self> {
+        let offset = i64::from(self.data_offset).checked_add(delta)?;
+        let len = i64::from(self.len).checked_sub(delta)?;
+        let offset = u32::try_from(offset).ok()?;
+        let len = u32::try_from(len).ok()?;
+        if len == 0 || u64::from(offset) + u64::from(len) > frame_size {
+            return None;
+        }
+        Some(Self {
+            data_offset: offset,
+            len,
+            ..self
+        })
+    }
+
     pub(crate) fn belongs_to(self, domain: DomainIdentity) -> bool {
         self.domain == domain
     }

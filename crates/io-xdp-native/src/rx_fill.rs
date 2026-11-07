@@ -1420,6 +1420,37 @@ impl<'memory> RxFillEngine<'memory> {
             .expect("a live lease of this engine owns its Leased frame")
     }
 
+    /// Moves the start of a lease's visible bytes within its own frame (see
+    /// `ruster_core::PacketSlot::resize_front`). The moved descriptor is checked
+    /// against the frame's geometry the same way every later use checks it.
+    pub(crate) fn lease_resize_front(&mut self, lease: &mut RawLease, delta: isize) -> bool {
+        self.check_lease(lease);
+        let Ok(delta) = i64::try_from(delta) else {
+            return false;
+        };
+        let frame_size = self.state.frames.frame_size();
+        let Some(moved) = lease.descriptor.moved_front(delta, frame_size) else {
+            return false;
+        };
+        if self
+            .state
+            .frames
+            .leased_bytes_mut(lease.token, moved)
+            .is_none()
+        {
+            return false;
+        }
+        lease.descriptor = moved;
+        true
+    }
+
+    /// Whether a lease's visible bytes start inside the frame's headroom (its front
+    /// was grown there): such a frame cannot be sent in place.
+    pub(crate) fn lease_before_headroom(&self, lease: &RawLease) -> bool {
+        self.check_lease(lease);
+        u64::from(lease.descriptor.data_offset()) < self.state.headroom
+    }
+
     /// Turns an RX lease back into the borrowing view that ends it.
     pub(crate) fn resume_rx(&mut self, lease: RawLease) -> RxFrame<'_, 'memory> {
         self.check_lease(&lease);
