@@ -120,6 +120,12 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
   kernelへ届く。ルータのアドレスでNATの対応が無いものは、input firewallで決める。
 - **送信元アドレス:** kernelは自分に設定されたアドレスを送信元に使う。出口で変換が要るかどうかは
   FEが決め、kernelはPSIDやトンネルを知らなくてよい。
+- **TTLとHop Limit:** ここだけはほかのホストと違う。TUNから読んだパケットと、TUNへ出すパケットは、
+  ルータ自身が送り、受けたものなので、TTLとHop Limitを減らさない。TTL 1で送る直結のeBGPや、
+  TTL 255で受けたことを確かめるGTSM（RFC 5082）がそのまま動く。
+- **wan側で待ち受けるサービス:** NATの外側のアドレスで待ち受けるポート（SSH、管理APIなど）は、
+  NATのポートの範囲から外して設定する。そのポートに届いたパケットは、NATの対応を探さずに
+  input firewallへ進む。MAP-Eでは、待ち受けもPSIDのポートの組の中から選ぶ。
 - TAPではなくTUNを使い、kernelにARP/NDをさせない。
 - kernelは専用のnetnsに置き、フォワーディングは無効にする。kernelの経路は「全部TUNへ」だけ。
 - アドレスはCEからkernelへ一方向に設定する。kernelからrusterへ情報を取り込まない。
