@@ -488,6 +488,9 @@ pub enum DropReason {
     /// Decided in another VRF and leaving through an interface of the VRF that has
     /// NAT or a firewall: dropped rather than let past them.
     VrfLeakIntoServices = 225,
+    /// IPv6 that would be forwarded within or into a VRF whose IPv6 forwarding is
+    /// blocked ([`ForwardingSnapshot::with_ipv6_forwarding_blocked`]).
+    Ipv6ForwardingBlocked = 226,
 }
 
 use DropReason::*;
@@ -495,7 +498,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 225] = [
+    pub const ALL: [Self; 226] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -721,6 +724,7 @@ impl DropReason {
         VlanUnknown,
         VlanNoRoom,
         VrfLeakIntoServices,
+        Ipv6ForwardingBlocked,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -963,6 +967,7 @@ impl DropReason {
             VlanUnknown => "VLAN_UNKNOWN",
             VlanNoRoom => "VLAN_NO_ROOM",
             VrfLeakIntoServices => "VRF_LEAK_INTO_SERVICES",
+            Ipv6ForwardingBlocked => "IPV6_FORWARDING_BLOCKED",
         }
     }
 }
@@ -1271,6 +1276,9 @@ pub struct ForwardingSnapshot<'a> {
     /// The IPv6 tables ([`ForwardingSnapshot::with_ipv6`]); without them IPv6
     /// frames are dropped as an unsupported Ethernet type.
     pub(crate) ipv6: Option<&'a crate::Ipv6Fib>,
+    /// Whether IPv6 forwarded into or within this VRF is dropped
+    /// ([`ForwardingSnapshot::with_ipv6_forwarding_blocked`]).
+    pub(crate) ipv6_forwarding_blocked: bool,
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
     pub(crate) vlans: &'a [crate::VlanBinding],
     /// The time NAT, firewall and ICMP limits count by when no ARP resolution
@@ -1482,6 +1490,7 @@ impl<'a> ForwardingSnapshot<'a> {
             arp_to_control: false,
             local_to_control: false,
             ipv6: None,
+            ipv6_forwarding_blocked: false,
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -1602,6 +1611,20 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub fn with_now(self, now: MonotonicMillis) -> Self {
         Self { now, ..self }
+    }
+
+    /// Drops every IPv6 packet that would be forwarded within this snapshot's VRF or
+    /// into it ([`DropReason::Ipv6ForwardingBlocked`]); Neighbor Discovery and traffic
+    /// to the router still go on. With [`ForwardingSnapshot::with_vrfs`], it is
+    /// the outer snapshot's that counts: a packet entering or leaving through one of
+    /// its VRF's interfaces is dropped. For a VRF with a firewall, which has no IPv6
+    /// rules yet: IPv6 is then not forwarded rather than forwarded unchecked.
+    #[must_use]
+    pub fn with_ipv6_forwarding_blocked(self, on: bool) -> Self {
+        Self {
+            ipv6_forwarding_blocked: on,
+            ..self
+        }
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1784,6 +1807,7 @@ impl<'a> ForwardingSnapshot<'a> {
             arp_to_control: false,
             local_to_control: false,
             ipv6: None,
+            ipv6_forwarding_blocked: false,
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -2184,6 +2208,7 @@ impl ValidatedForwardingOwner {
             arp_to_control: false,
             local_to_control: false,
             ipv6: None,
+            ipv6_forwarding_blocked: false,
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -4206,10 +4231,17 @@ where
             .with_now(all_vrfs.now);
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
+                let outer = all_vrfs.authority();
+                let blocked = |egress: IfId| {
+                    all_vrfs.ipv6_forwarding_blocked
+                        && (snapshot.authority() == outer
+                            || all_vrfs.for_ingress(egress).authority() == outer)
+                };
                 match crate::ipv6::complete(
                     packet,
                     snapshot,
                     fib,
+                    blocked,
                     control.as_deref_mut(),
                     vlans,
                     trace,
@@ -10843,6 +10875,7 @@ mod tests {
             (223, "VLAN_UNKNOWN"),
             (224, "VLAN_NO_ROOM"),
             (225, "VRF_LEAK_INTO_SERVICES"),
+            (226, "IPV6_FORWARDING_BLOCKED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10852,7 +10885,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(226), None);
+        assert_eq!(DropReason::from_code(227), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
