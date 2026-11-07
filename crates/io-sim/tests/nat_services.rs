@@ -143,3 +143,102 @@ fn napt44_runs_without_an_arp_runtime() {
     assert_eq!(&back.bytes[30..34], &HOST.octets());
     assert_eq!(u16::from_be_bytes([back.bytes[36], back.bytes[37]]), 5_000);
 }
+
+/// Another VRF's packets go without the default VRF's NAT, and those that would leave
+/// through the default VRF's interfaces are dropped instead of passing it.
+#[test]
+fn another_vrf_never_leaks_past_the_nat() {
+    const GUEST: IfId = IfId(2);
+    const GUEST_MAC: MacAddress = MacAddress([2, 0, 0, 0, 0, 3]);
+    const GUEST_HOST: Ipv4Address = Ipv4Address::from_octets([10, 9, 0, 20]);
+    let routes = [
+        Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+        Route::new(
+            Ipv4Address::from_octets([0, 0, 0, 0]),
+            0,
+            WAN,
+            Some(GATEWAY),
+        )
+        .unwrap(),
+    ];
+    // The guest VRF has its own subnet and a route leaked into the default VRF's LAN.
+    let guest_routes = [
+        Route::new(Ipv4Address::from_octets([10, 9, 0, 0]), 24, GUEST, None).unwrap(),
+        Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+    ];
+    let interfaces = [(LAN, LAN_MAC), (WAN, WAN_MAC), (GUEST, GUEST_MAC)]
+        .map(|(id, mac)| Interface { id, mac, mtu: 1500 });
+    let neighbors = [
+        Neighbor {
+            interface: LAN,
+            target: HOST,
+            mac: HOST_MAC,
+        },
+        Neighbor {
+            interface: WAN,
+            target: GATEWAY,
+            mac: GATEWAY_MAC,
+        },
+        Neighbor {
+            interface: GUEST,
+            target: GUEST_HOST,
+            mac: HOST_MAC,
+        },
+    ];
+    let bindings = [LocalIpv4Binding {
+        interface: WAN,
+        address: PUBLIC,
+    }];
+    let base = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let guest = ForwardingSnapshot::new(&guest_routes, &interfaces, &neighbors, &bindings).unwrap();
+    let config = Nat44UdpConfig::new(
+        &base,
+        LAN,
+        WAN,
+        PUBLIC,
+        40_000,
+        40_010,
+        Nat44UdpPolicy::default(),
+    )
+    .unwrap();
+    let mut indexes = UdpTestIndexes::new(config, 4, 4);
+    let mut mappings = [Nat44UdpMappingSlot::default(); 4];
+    let mut peers = [Nat44UdpPeerSlot::default(); 4];
+    let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+    let mut queue = ControlQueue::new(4);
+    let mut io = SimIo::new();
+
+    let vrfs = [base, guest];
+    let by_ingress = [0, 0, 1];
+    let snapshot = base
+        .with_now(MonotonicMillis(1_000))
+        .with_vrfs(&vrfs, &by_ingress);
+    // Default, guest leaking into the LAN, guest inside its VRF, default again: the
+    // NAT runtime is back for the last one.
+    io.inject(LAN, udp(LAN_MAC, HOST, REMOTE, 5_000, 53));
+    io.inject(GUEST, udp(GUEST_MAC, GUEST_HOST, HOST, 6_000, 53));
+    io.inject(GUEST, udp(GUEST_MAC, GUEST_HOST, GUEST_HOST, 6_000, 53));
+    io.inject(LAN, udp(LAN_MAC, HOST, REMOTE, 5_001, 53));
+    let batch = io.receive(8).unwrap();
+    let services = Services {
+        nat44_udp: Some((&config, &mut runtime)),
+        ..Services::default()
+    };
+    let report = forward_batch_with_control(batch, &snapshot, &mut queue, services, &mut NoTrace);
+    assert_eq!(report.dropped, 1, "the leak into the LAN");
+    assert_eq!(report.tx_requested, 3);
+    let mut sent = Vec::new();
+    while let Some(frame) = io.pop_tx() {
+        let mut source = [0; 4];
+        source.copy_from_slice(&frame.bytes[26..30]);
+        sent.push((frame.egress, source));
+    }
+    assert_eq!(
+        sent,
+        [
+            (WAN, PUBLIC.octets()),
+            (GUEST, GUEST_HOST.octets()),
+            (WAN, PUBLIC.octets()),
+        ]
+    );
+}

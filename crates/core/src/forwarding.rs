@@ -485,6 +485,9 @@ pub enum DropReason {
     VlanUnknown = 223,
     /// The backend cannot take a tag off or put one on.
     VlanNoRoom = 224,
+    /// Decided in another VRF and leaving through an interface of the VRF that has
+    /// NAT or a firewall: dropped rather than let past them.
+    VrfLeakIntoServices = 225,
 }
 
 use DropReason::*;
@@ -492,7 +495,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 224] = [
+    pub const ALL: [Self; 225] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -717,6 +720,7 @@ impl DropReason {
         Ipv6ControlQueueFull,
         VlanUnknown,
         VlanNoRoom,
+        VrfLeakIntoServices,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -958,6 +962,7 @@ impl DropReason {
             Ipv6ControlQueueFull => "IPV6_CONTROL_QUEUE_FULL",
             VlanUnknown => "VLAN_UNKNOWN",
             VlanNoRoom => "VLAN_NO_ROOM",
+            VrfLeakIntoServices => "VRF_LEAK_INTO_SERVICES",
         }
     }
 }
@@ -1547,7 +1552,7 @@ impl<'a> ForwardingSnapshot<'a> {
 
     /// Decides each received packet with the snapshot of its ingress interface's VRF:
     /// `snapshots[by_ingress[ingress]]`. An ingress outside `by_ingress`, or an index
-    /// outside `snapshots`, uses this snapshot. Each VRF's snapshot holds that VRF's
+    /// outside `snapshots`, uses this snapshot. Every VRF runs on this clock. Each VRF's snapshot holds that VRF's
     /// routes and local addresses, and every interface and neighbor, so a route may
     /// leave through an interface of another VRF.
     #[must_use]
@@ -4195,7 +4200,10 @@ where
                 continue;
             }
         }
-        let snapshot = all_vrfs.for_ingress(packet.ingress());
+        // Every VRF runs on the outer snapshot's clock.
+        let snapshot = &all_vrfs
+            .for_ingress(packet.ingress())
+            .with_now(all_vrfs.now);
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
                 match crate::ipv6::complete(
@@ -4214,8 +4222,15 @@ where
             }
         }
         // NAT and firewall configurations are bound to the outer snapshot's VRF;
-        // a packet decided with another VRF's snapshot goes without them.
+        // a packet decided with another VRF's snapshot goes without them, unless it
+        // would leave through that VRF's interfaces: then it is dropped (fail closed),
+        // never let past them.
         let foreign = snapshot.authority() != all_vrfs.authority();
+        let guarded = foreign
+            && (nat44_udp_config.is_some()
+                || nat44_tcp_config.is_some()
+                || nat44_icmp_config.is_some()
+                || firewall_config.is_some());
         let parked = if foreign {
             Some((
                 nat44_udp_config.take(),
@@ -4311,6 +4326,22 @@ where
                     ),
                 };
                 decided
+                    .and_then(|decision| {
+                        let leaves = !matches!(
+                            decision,
+                            PacketDecision::ConsumeArp(_)
+                                | PacketDecision::ConsumeIpv4Local
+                                | PacketDecision::ConsumeFragmentHeld
+                        );
+                        if guarded
+                            && leaves
+                            && all_vrfs.for_ingress(decision.egress()).authority()
+                                == all_vrfs.authority()
+                        {
+                            return Err(DropReason::VrfLeakIntoServices);
+                        }
+                        Ok(decision)
+                    })
                     .and_then(|decision| {
                         // Every NAT commit is checked before the packet is
                         // rewritten, so a plan the runtime would refuse (stale or
@@ -10811,6 +10842,7 @@ mod tests {
             (222, "IPV6_CONTROL_QUEUE_FULL"),
             (223, "VLAN_UNKNOWN"),
             (224, "VLAN_NO_ROOM"),
+            (225, "VRF_LEAK_INTO_SERVICES"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10820,7 +10852,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(225), None);
+        assert_eq!(DropReason::from_code(226), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
