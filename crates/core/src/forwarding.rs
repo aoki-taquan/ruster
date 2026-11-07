@@ -506,6 +506,14 @@ pub enum DropReason {
     /// A tunnel's IPv6 packet that did not arrive on the interface the default VRF
     /// routes the tunnel's remote end through.
     TunnelWrongIngress = 231,
+    /// A PPPoE session frame that is too short or not version 1, type 1, code 0.
+    PppoeMalformed = 232,
+    /// A PPPoE session frame of no known session (ID, parent and peer).
+    PppoeUnknownSession = 233,
+    /// A PPPoE session frame that is not IPv4 or IPv6 (LCP, IPCP, ...): not handled.
+    PppoeNotIp = 234,
+    /// The backend cannot add or remove the PPPoE header in place.
+    PppoeNoRoom = 235,
 }
 
 use DropReason::*;
@@ -513,7 +521,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 231] = [
+    pub const ALL: [Self; 235] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -745,6 +753,10 @@ impl DropReason {
         TunnelNoRoute,
         TunnelMtuExceeded,
         TunnelWrongIngress,
+        PppoeMalformed,
+        PppoeUnknownSession,
+        PppoeNotIp,
+        PppoeNoRoom,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -993,6 +1005,10 @@ impl DropReason {
             TunnelNoRoute => "TUNNEL_NO_ROUTE",
             TunnelMtuExceeded => "TUNNEL_MTU_EXCEEDED",
             TunnelWrongIngress => "TUNNEL_WRONG_INGRESS",
+            PppoeMalformed => "PPPOE_MALFORMED",
+            PppoeUnknownSession => "PPPOE_UNKNOWN_SESSION",
+            PppoeNotIp => "PPPOE_NOT_IP",
+            PppoeNoRoom => "PPPOE_NO_ROOM",
         }
     }
 }
@@ -1306,6 +1322,8 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) ipv6_forwarding_blocked: bool,
     /// IPv4 in IPv6 tunnels ([`ForwardingSnapshot::with_tunnels`]).
     pub(crate) tunnels: &'a [crate::Ipv4InIpv6Tunnel],
+    /// PPPoE sessions ([`ForwardingSnapshot::with_pppoe`]).
+    pub(crate) pppoe: &'a [crate::PppoeSession],
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
     pub(crate) vlans: &'a [crate::VlanBinding],
     /// The time NAT, firewall and ICMP limits count by when no ARP resolution
@@ -1512,6 +1530,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6: None,
             ipv6_forwarding_blocked: false,
             tunnels: &[],
+            pppoe: &[],
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -1655,6 +1674,14 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub fn with_tunnels(self, tunnels: &'a [crate::Ipv4InIpv6Tunnel]) -> Self {
         Self { tunnels, ..self }
+    }
+
+    /// Sends packets routed to a PPPoE session's interface in that session and
+    /// takes the sessions' frames out (see [`crate::PppoeSession`]); the outer
+    /// snapshot's count with [`ForwardingSnapshot::with_vrfs`].
+    #[must_use]
+    pub fn with_pppoe(self, pppoe: &'a [crate::PppoeSession]) -> Self {
+        Self { pppoe, ..self }
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1839,6 +1866,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6: None,
             ipv6_forwarding_blocked: false,
             tunnels: &[],
+            pppoe: &[],
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -2196,6 +2224,7 @@ impl ValidatedForwardingOwner {
             ipv6: None,
             ipv6_forwarding_blocked: false,
             tunnels: &[],
+            pppoe: &[],
             vlans: &[],
             now: MonotonicMillis(0),
             vrfs: None,
@@ -3161,8 +3190,12 @@ where
                 continue;
             }
         }
-        // A tunnel's IPv6 packet arrives again, unwrapped, on its tunnel interface.
-        if let Err(reason) = crate::tunnel::receive(&mut packet, all_vrfs) {
+        // A PPPoE session's frame arrives again, out of its session, on the
+        // session's interface; a tunnel's IPv6 packet, unwrapped, on its tunnel
+        // interface.
+        if let Err(reason) = crate::pppoe::receive(&mut packet, all_vrfs)
+            .and_then(|()| crate::tunnel::receive(&mut packet, all_vrfs).map(|_| ()))
+        {
             let ingress = packet.ingress();
             packet.recycle(reason);
             dropped += 1;
@@ -3624,6 +3657,20 @@ where
                         Some(tunnel) => {
                             match crate::tunnel::transmit(&mut packet, tunnel, all_vrfs, trace) {
                                 Ok(underlying) => underlying,
+                                Err(reason) => {
+                                    packet.recycle(reason);
+                                    dropped += 1;
+                                    trace.record(TraceEvent::Dropped { ingress, reason });
+                                    break 'packet;
+                                }
+                            }
+                        }
+                        None => egress,
+                    };
+                    let egress = match crate::pppoe::of(all_vrfs.pppoe, egress) {
+                        Some(session) => {
+                            match crate::pppoe::transmit(&mut packet, session, all_vrfs) {
+                                Ok(parent) => parent,
                                 Err(reason) => {
                                     packet.recycle(reason);
                                     dropped += 1;
@@ -4694,9 +4741,11 @@ fn decide_ipv4<T: TraceSink>(
     let static_neighbor = snapshot.static_neighbor(route.egress(), target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
-    } else if crate::tunnel::of(snapshot.tunnels, route.egress()).is_some() {
-        // A tunnel has no neighbors: the Ethernet header is replaced when the
-        // packet is wrapped.
+    } else if crate::tunnel::of(snapshot.tunnels, route.egress()).is_some()
+        || crate::pppoe::of(snapshot.pppoe, route.egress()).is_some()
+    {
+        // A tunnel or PPPoE session has no neighbors: the Ethernet header is
+        // replaced when the packet is wrapped.
         crate::MacAddress([0; 6])
     } else {
         // No resolution runtime: the control side resolves (FE/CE split).
@@ -9380,6 +9429,10 @@ mod tests {
             (229, "TUNNEL_NO_ROUTE"),
             (230, "TUNNEL_MTU_EXCEEDED"),
             (231, "TUNNEL_WRONG_INGRESS"),
+            (232, "PPPOE_MALFORMED"),
+            (233, "PPPOE_UNKNOWN_SESSION"),
+            (234, "PPPOE_NOT_IP"),
+            (235, "PPPOE_NO_ROOM"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9389,7 +9442,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(232), None);
+        assert_eq!(DropReason::from_code(236), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

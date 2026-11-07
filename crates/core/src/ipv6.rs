@@ -468,7 +468,11 @@ pub(crate) fn decide<T: TraceSink>(
         return Outcome::Error(Ipv6PacketTooBig, PACKET_TOO_BIG, 0, u32::from(egress.mtu));
     }
     let next_hop = route.next_hop.unwrap_or(destination);
-    let Some(mac) = fib.neighbor(egress.id, next_hop) else {
+    let session = crate::pppoe::of(snapshot.pppoe, egress.id).is_some();
+    let Some(mac) = fib
+        .neighbor(egress.id, next_hop)
+        .or(session.then_some(MacAddress([0; 6])))
+    else {
         trace.record(TraceEvent::Ipv6NeighborMissing {
             egress: egress.id,
             target: next_hop,
@@ -500,7 +504,12 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
         }
     }
     match outcome {
-        Outcome::Transmit(egress) => match crate::vlan::transmit(&mut packet, egress, vlans) {
+        Outcome::Transmit(egress) => match crate::pppoe::of(snapshot.pppoe, egress)
+            .map_or(Ok(egress), |session| {
+                crate::pppoe::transmit(&mut packet, session, snapshot)
+            })
+            .and_then(|egress| crate::vlan::transmit(&mut packet, egress, vlans))
+        {
             Ok(port) => {
                 packet.commit(port);
                 Completed::Transmitted
