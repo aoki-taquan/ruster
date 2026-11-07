@@ -3060,7 +3060,7 @@ where
         icmp,
         firewall_config,
         firewall,
-        None,
+        services.firewall_audit,
         services.fragmentation,
         services.fragment_tracking,
         None,
@@ -3086,6 +3086,8 @@ pub struct Services<'s, 'c, 'r> {
     /// Associates the fragments of a datagram with its first fragment, so NAT
     /// and the firewall treat them as it (NAT-FRAG); without it NAT drops them.
     pub fragment_tracking: Option<&'s mut Ipv4FragmentTracker<'r>>,
+    /// Records the firewall's decisions.
+    pub firewall_audit: Option<&'s mut FirewallAuditBuffer<'r>>,
 }
 
 /// Forwards RX packets and queues resolution actions without allocating TX
@@ -7799,10 +7801,9 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
                 disposition,
             });
             // RFC 5382 REQ-4: the unsolicited SYN is dropped silently now;
-            // a copy may be held for a delayed ICMP Port Unreachable. Only a
-            // worker with a clock (a resolution runtime) can time a hold.
+            // a copy may be held for a delayed ICMP Port Unreachable, timed by
+            // the batch's clock.
             if segment.is_initial_syn()
-                && resolution.is_some()
                 && matches!(
                     error,
                     Nat44TcpPlanError::MappingMiss | Nat44TcpPlanError::SessionMiss
@@ -10277,140 +10278,6 @@ mod tests {
         let ipv4_checksum = ipv4_header_checksum(&frame[14..34]);
         frame[24..26].copy_from_slice(&ipv4_checksum.to_be_bytes());
         frame
-    }
-
-    /// RFC 5382 REQ-4 hold timing needs a clock: a worker without a
-    /// resolution runtime (its `now` would be 0) never holds an unsolicited
-    /// SYN; with one it does.
-    #[test]
-    fn unsolicited_syns_are_held_only_with_a_worker_clock() {
-        let routes = [
-            Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
-            Route::new(
-                Ipv4Address::from_octets([0; 4]),
-                0,
-                WAN,
-                Some(Ipv4Address::from_octets([203, 0, 113, 1])),
-            )
-            .unwrap(),
-        ];
-        let interfaces = [
-            Interface {
-                id: LAN,
-                mac: MacAddress([2, 0, 0, 0, 0, 1]),
-                mtu: 1500,
-            },
-            Interface {
-                id: WAN,
-                mac: MacAddress([2, 0, 0, 0, 0, 2]),
-                mtu: 1500,
-            },
-        ];
-        let bindings = [
-            LocalIpv4Binding {
-                interface: LAN,
-                address: Ipv4Address::from_octets([10, 0, 0, 1]),
-            },
-            LocalIpv4Binding {
-                interface: WAN,
-                address: PUBLIC,
-            },
-        ];
-        let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &[], &bindings).unwrap();
-        let tcp_config = Nat44TcpConfig::new(
-            &snapshot,
-            LAN,
-            WAN,
-            PUBLIC,
-            40_000,
-            40_000,
-            Nat44TcpPolicy::default(),
-        )
-        .unwrap();
-        // REMOTE:443 -> PUBLIC:40000, an initial SYN arriving on WAN.
-        let mut frame = tcp_syn_frame();
-        frame[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 2]);
-        frame[6..12].copy_from_slice(&[2, 0, 0, 0, 0, 20]);
-        frame[26..30].copy_from_slice(&REMOTE.octets());
-        frame[30..34].copy_from_slice(&PUBLIC.octets());
-        frame[34..36].copy_from_slice(&443_u16.to_be_bytes());
-        frame[36..38].copy_from_slice(&40_000_u16.to_be_bytes());
-        frame[24..26].copy_from_slice(&[0, 0]);
-        frame[50..52].copy_from_slice(&[0, 0]);
-        let mut pseudo = Vec::with_capacity(32);
-        pseudo.extend_from_slice(&REMOTE.octets());
-        pseudo.extend_from_slice(&PUBLIC.octets());
-        pseudo.extend_from_slice(&[0, 6]);
-        pseudo.extend_from_slice(&20_u16.to_be_bytes());
-        pseudo.extend_from_slice(&frame[34..54]);
-        let tcp_checksum = internet_checksum(&pseudo);
-        frame[50..52].copy_from_slice(&tcp_checksum.to_be_bytes());
-        let ipv4_checksum = ipv4_header_checksum(&frame[14..34]);
-        frame[24..26].copy_from_slice(&ipv4_checksum.to_be_bytes());
-
-        let mut mappings = [Nat44TcpMappingSlot::default(); 1];
-        let mut sessions = [Nat44TcpSessionSlot::default(); 1];
-        let mut mapping_buckets = [DirectoryBucket::default(); 1];
-        let mut mapping_nodes = [DirectoryNode::default(); 1];
-        let mut session_buckets = [DirectoryBucket::default(); 1];
-        let mut session_nodes = [DirectoryNode::default(); 1];
-        let mut session_address_buckets = session_buckets;
-        let mut session_address_nodes = session_nodes;
-        let mut owners = [PortOwnerSlot::default(); 1];
-        let mut owner_bits = vec![0_u64; crate::port_free_bitmap_words(1)];
-        let mut holds = [crate::Nat44TcpSynHoldSlot::EMPTY; 2];
-        let mut tcp = Nat44TcpRuntime::new(
-            tcp_config,
-            &mut mappings,
-            &mut sessions,
-            Nat44TcpIndexStorage::new(
-                &mut mapping_buckets,
-                &mut mapping_nodes,
-                &mut session_buckets,
-                &mut session_nodes,
-                &mut session_address_buckets,
-                &mut session_address_nodes,
-                &mut owners,
-                &mut owner_bits,
-                crate::nat44_host_quota::leaked_host_storage(1),
-            ),
-            Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).unwrap(),
-        )
-        .unwrap()
-        .with_unsolicited_syn_holds(&mut holds)
-        .unwrap();
-        let mut resolution_states = [ResolutionStateSlot::EMPTY; 1];
-        let mut resolution_actions = [ResolutionActionSlot::EMPTY; 1];
-        let mut resolution_runtime = ResolutionRuntime::new(
-            ResolutionPolicy::new(1_000, 2_000).unwrap(),
-            &mut resolution_states,
-            &mut resolution_actions,
-        );
-        for with_clock in [false, true] {
-            let mut resolution =
-                with_clock.then_some((&mut resolution_runtime, MonotonicMillis(5)));
-            let decision = crate::forwarding::decide(
-                &frame,
-                &snapshot,
-                WAN,
-                false,
-                &mut resolution,
-                &mut None,
-                None,
-                &mut None,
-                Some(&tcp_config),
-                &mut Some(&mut tcp),
-                None,
-                &mut None,
-                None,
-                &mut None,
-                &mut None,
-                &mut None,
-                &mut NoTrace,
-            );
-            assert_eq!(decision.err(), Some(DropReason::Nat44TcpMappingMiss));
-            assert_eq!(tcp.unsolicited_syn_holds(), usize::from(with_clock));
-        }
     }
 
     #[test]

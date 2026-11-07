@@ -422,7 +422,12 @@ impl World {
         }
     }
 
-    fn run_audited(&mut self, ingress: IfId, packet: Vec<u8>, audit: &mut FirewallAuditBuffer<'_>) {
+    fn run_audited(
+        &mut self,
+        ingress: IfId,
+        packet: Vec<u8>,
+        audit: &mut FirewallAuditBuffer<'static>,
+    ) {
         self.io.inject(ingress, packet);
         let now = MonotonicMillis(self.now);
         self.now += 1;
@@ -1225,8 +1230,8 @@ fn firewall_requires_the_hairpin_senders_own_outbound_flow() {
     let mut never_sent = after_one_hop(&udp_frame(PUBLIC, H2, public1, P2));
     let mut frame = vec![0_u8; 14];
     frame.append(&mut never_sent);
-    let mut records = [FirewallAuditRecord::default(); 4];
-    let mut audit = FirewallAuditBuffer::new(&mut records);
+    let records = Box::leak(Box::new([FirewallAuditRecord::default(); 4]));
+    let mut audit = FirewallAuditBuffer::new(records);
     let error = icmp_error(H2, PUBLIC, 3, 3, &frame);
     let before = world.state();
     world.run_audited(LAN, error.clone(), &mut audit);
@@ -1297,8 +1302,8 @@ fn firewall_records_inside_errors_as_related_to_the_reverse_flow() {
     let mut world = World::new(true);
     let outbound = world.establish(H1, P1, false);
     let (_, delivered) = world.reply(public_source_port(&outbound), false);
-    let mut records = [FirewallAuditRecord::default(); 2];
-    let mut audit = FirewallAuditBuffer::new(&mut records);
+    let records = Box::leak(Box::new([FirewallAuditRecord::default(); 2]));
+    let mut audit = FirewallAuditBuffer::new(records);
     world.run_audited(LAN, icmp_error(H1, REMOTE, 3, 3, &delivered), &mut audit);
     assert!(world.io.pop_tx().is_some());
     let records = audit.records();
@@ -1318,8 +1323,8 @@ fn firewall_records_inside_errors_as_related_to_the_reverse_flow() {
     // peer) but no firewall flow: audited as a RELATED drop.
     let mut other_port = delivered.clone();
     other_port[34..36].copy_from_slice(&54_u16.to_be_bytes());
-    let mut records = [FirewallAuditRecord::default(); 2];
-    let mut audit = FirewallAuditBuffer::new(&mut records);
+    let records = Box::leak(Box::new([FirewallAuditRecord::default(); 2]));
+    let mut audit = FirewallAuditBuffer::new(records);
     let error = icmp_error(H1, REMOTE, 3, 3, &other_port);
     world.run_audited(LAN, error.clone(), &mut audit);
     world.assert_drop(DropReason::FirewallRelatedIcmpv4StateMiss, &error);
@@ -1739,26 +1744,6 @@ fn refused_errors_never_spend_the_translated_budget() {
     assert!(!deliver(&mut world, 1_000, &error));
     assert!(!deliver(&mut world, 1_999, &error));
     assert!(deliver(&mut world, 2_000, &error));
-}
-
-/// NAT44-065: the limit is checked before neighbor resolution, so a
-/// limited error toward an unresolved inside host never schedules ARP.
-#[test]
-fn a_limited_error_never_starts_neighbor_resolution() {
-    const H3: Ipv4Address = Ipv4Address::from_octets([10, 0, 0, 12]);
-    let policy = Icmpv4ErrorPolicy::default()
-        .with_translated_limit(1, 1)
-        .unwrap();
-    let mut world = World::limited(false, policy);
-    let error = icmp_error(ROUTER, PUBLIC, 3, 4, &world.establish(H3, P1, false));
-    world.now = 1_000;
-    world.assert_refused(WAN, error.clone(), DropReason::NeighborUnresolved);
-    let resolution = world.resolution.counters();
-    let pending = world.resolution.pending_actions();
-    assert_eq!(pending, 1, "the admitted error asked for ARP");
-    assert!(!deliver(&mut world, 1_000, &error));
-    assert_eq!(world.resolution.counters(), resolution);
-    assert_eq!(world.resolution.pending_actions(), pending);
 }
 
 /// NAT44-065 scope: only external errors toward the inside are limited.

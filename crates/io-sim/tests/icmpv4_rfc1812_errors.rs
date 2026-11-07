@@ -4,13 +4,14 @@
 //! (Parameter Problem). Every error is checked byte for byte against an
 //! independently built expected frame.
 
+mod support;
+
 use ruster_core::{
-    execute_one_icmpv4_error, forward_batch_with_resolution_and_icmpv4_errors, internet_checksum,
-    ipv4_header_checksum, ConsumeReason, DropReason, ForwardingSnapshot, Icmpv4ErrorActionSlot,
-    Icmpv4ErrorCounters, Icmpv4ErrorDisposition, Icmpv4ErrorKind, Icmpv4ErrorPolicy,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace, PacketIo, ResolutionActionSlot,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
+    execute_one_icmpv4_error, internet_checksum, ipv4_header_checksum, ConsumeReason, DropReason,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorCounters, Icmpv4ErrorDisposition,
+    Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface,
+    Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, NoGeneratedIcmpv4Trace,
+    PacketIo, Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 
@@ -188,13 +189,6 @@ fn run(frames: &[Vec<u8>], policy: Icmpv4ErrorPolicy) -> Vec<Outcome> {
     let bindings = bindings();
     let neighbors = neighbors();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-    let mut rs = [ResolutionStateSlot::EMPTY; 2];
-    let mut ra = [ResolutionActionSlot::EMPTY; 2];
-    let mut resolution = ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 60_000).unwrap(),
-        &mut rs,
-        &mut ra,
-    );
     let mut es = [Icmpv4ErrorStateSlot::EMPTY; 2];
     let mut ea = [Icmpv4ErrorActionSlot::EMPTY; 2];
     let mut errors = Icmpv4ErrorRuntime::new(policy, &mut es, &mut ea);
@@ -204,10 +198,9 @@ fn run(frames: &[Vec<u8>], policy: Icmpv4ErrorPolicy) -> Vec<Outcome> {
         let now = MonotonicMillis(10 + index as u64);
         io.inject(LAN, frame.clone());
         let mut trace = VecTrace::default();
-        let report = forward_batch_with_resolution_and_icmpv4_errors(
+        let report = support::forward_with_errors(
             io.receive(1).unwrap(),
             &snapshot,
-            &mut resolution,
             &mut errors,
             now,
             &mut trace,

@@ -74,6 +74,7 @@ pub fn tcp_runtime<'a>(
     .unwrap()
 }
 
+#[allow(dead_code)]
 pub struct UdpTestIndexes {
     mapping_buckets: Vec<DirectoryBucket>,
     mapping_nodes: Vec<DirectoryNode>,
@@ -89,6 +90,7 @@ pub struct UdpTestIndexes {
     host_counters: Vec<Nat44HostCounter>,
 }
 
+#[allow(dead_code)]
 impl UdpTestIndexes {
     pub fn new(config: Nat44UdpConfig, mapping_capacity: usize, peer_capacity: usize) -> Self {
         let mapping_bucket_count = if mapping_capacity == 0 {
@@ -199,4 +201,31 @@ pub fn icmp_runtime(
         ruster_core::Nat44IcmpHashKey::new(0x5eed_1c3b_0bad_f00d, 0x0fed_cba9_8765_4321).unwrap(),
     )
     .unwrap()
+}
+
+/// Forwards `batch` the way the FE does, with ICMPv4 errors and no ARP resolution:
+/// the clock is `now`, and a missing neighbor is a drop.
+#[allow(dead_code)]
+pub fn forward_with_errors<B, T>(
+    batch: B,
+    snapshot: &ruster_core::ForwardingSnapshot<'_>,
+    errors: &mut ruster_core::Icmpv4ErrorRuntime<'_>,
+    now: ruster_core::MonotonicMillis,
+    trace: &mut T,
+) -> ruster_core::BatchReport<B::Error>
+where
+    B: ruster_core::PacketBatch,
+    T: ruster_core::TraceSink,
+{
+    let mut control = ruster_core::ControlQueue::new(4);
+    ruster_core::forward_batch_with_control(
+        batch,
+        &snapshot.with_now(now),
+        &mut control,
+        ruster_core::Services {
+            icmpv4_errors: Some(errors),
+            ..ruster_core::Services::default()
+        },
+        trace,
+    )
 }

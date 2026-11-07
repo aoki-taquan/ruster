@@ -2,8 +2,8 @@ mod support;
 
 use ruster_core::{
     internet_checksum, ipv4_header_checksum, rfc1624_update, ConsumeReason, DropReason,
-    DynamicNeighborSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding,
-    MacAddress, MonotonicMillis, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
+    ForwardingSnapshot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy, Nat44TcpConfig,
     Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
     Nat44UdpPeerSlot, Nat44UdpPolicy, Neighbor, NoTrace, ResolutionActionSlot, ResolutionPolicy,
     ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent,
@@ -201,21 +201,6 @@ fn set_outer_source(frame: &mut [u8], source: Ipv4Address) {
 fn set_frag_needed_mtu(frame: &mut [u8], mtu: u16) {
     frame[40..42].copy_from_slice(&mtu.to_be_bytes());
     refresh_icmp_and_outer_checksums(frame);
-}
-
-fn arp_reply(sender: Ipv4Address, sender_mac: MacAddress) -> Vec<u8> {
-    let mut frame = vec![0_u8; 60];
-    frame[0..6].copy_from_slice(&LAN_MAC.0);
-    frame[6..12].copy_from_slice(&sender_mac.0);
-    frame[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
-    frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
-    frame[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
-    frame[18..22].copy_from_slice(&[6, 4, 0, 2]);
-    frame[22..28].copy_from_slice(&sender_mac.0);
-    frame[28..32].copy_from_slice(&sender.octets());
-    frame[32..38].copy_from_slice(&LAN_MAC.0);
-    frame[38..42].copy_from_slice(&LAN_LOCAL.octets());
-    frame
 }
 
 fn frag_needed(quote: &[u8], ttl: u8, flags_fragment: u16, trailing: &[u8]) -> Vec<u8> {
@@ -1061,19 +1046,6 @@ fn malformed_candidate_matrix_has_stable_atomic_reasons() {
     )
     .unwrap();
     assert_drop(&mut io, DropReason::Nat44UdpMappingMiss, &valid);
-
-    io.inject(WAN, valid.clone());
-    io.run_nat44_udp_once(
-        1,
-        &snapshot,
-        &mut resolution,
-        &config,
-        None,
-        MonotonicMillis(10),
-        &mut NoTrace,
-    )
-    .unwrap();
-    assert_drop(&mut io, DropReason::Nat44UdpRuntimeUnavailable, &valid);
 }
 
 #[test]
@@ -1689,106 +1661,4 @@ fn udp_tcp_runtime_config_and_snapshot_mismatches_fail_before_read_only_lookup()
     )
     .unwrap();
     assert_drop(&mut io, DropReason::Nat44TcpConfigMismatch, &tcp_error);
-
-    io.inject(WAN, tcp_error.clone());
-    io.run_nat44_tcp_once(
-        1,
-        &snapshot,
-        &mut resolution,
-        &tcp_config,
-        None,
-        MonotonicMillis(0),
-        &mut NoTrace,
-    )
-    .unwrap();
-    assert_drop(&mut io, DropReason::Nat44TcpRuntimeUnavailable, &tcp_error);
-}
-
-#[test]
-fn unresolved_inside_neighbor_schedules_arp_then_dynamic_learning_allows_translation() {
-    let (routes, interfaces, _, bindings) = topology();
-    let neighbors = [Neighbor {
-        interface: WAN,
-        target: GW,
-        mac: GW_MAC,
-    }];
-    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
-    let config = udp_config(&snapshot, true);
-    let mut mappings = [Nat44UdpMappingSlot::default(); 1];
-    let mut peers = [Nat44UdpPeerSlot::default(); 1];
-    let mut nat_indexes = UdpTestIndexes::new(config, mappings.len(), peers.len());
-    let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
-    let mut states = [ResolutionStateSlot::EMPTY; 1];
-    let mut actions = [ResolutionActionSlot::EMPTY; 1];
-    let mut dynamic = [DynamicNeighborSlot::EMPTY; 1];
-    let mut resolution = ResolutionRuntime::with_dynamic_neighbors(
-        ResolutionPolicy::new(1_000, 2_000).unwrap(),
-        &mut states,
-        &mut actions,
-        &mut dynamic,
-    );
-    let mut io = SimIo::new();
-    io.inject(LAN, udp_frame(REMOTE, 53, 0));
-    io.run_nat44_udp_once(
-        1,
-        &snapshot,
-        &mut resolution,
-        &config,
-        Some(&mut nat),
-        MonotonicMillis(0),
-        &mut NoTrace,
-    )
-    .unwrap();
-    let outbound = io.pop_tx().unwrap();
-    let error = frag_needed(&outbound.bytes[14..42], 64, 0, &[]);
-    let before_mapping = nat.mappings()[0];
-    let before_peer = nat.peers()[0];
-    let before_counters = nat.counters();
-    io.inject(WAN, error.clone());
-    io.run_nat44_udp_once(
-        1,
-        &snapshot,
-        &mut resolution,
-        &config,
-        Some(&mut nat),
-        MonotonicMillis(1),
-        &mut NoTrace,
-    )
-    .unwrap();
-    assert_drop(&mut io, DropReason::NeighborUnresolved, &error);
-    assert_eq!(resolution.pending_actions(), 1);
-    assert_eq!(nat.mappings()[0], before_mapping);
-    assert_eq!(nat.peers()[0], before_peer);
-    assert_eq!(nat.counters(), before_counters);
-
-    io.inject(LAN, arp_reply(HOST, HOST_MAC));
-    let learned = io
-        .run_nat44_udp_once(
-            1,
-            &snapshot,
-            &mut resolution,
-            &config,
-            Some(&mut nat),
-            MonotonicMillis(2),
-            &mut NoTrace,
-        )
-        .unwrap();
-    assert_eq!(learned.consumed, 1);
-    assert_eq!(resolution.dynamic_neighbor_count(), 1);
-    io.pop_recycled();
-
-    io.inject(WAN, error);
-    io.run_nat44_udp_once(
-        1,
-        &snapshot,
-        &mut resolution,
-        &config,
-        Some(&mut nat),
-        MonotonicMillis(2),
-        &mut NoTrace,
-    )
-    .unwrap();
-    let translated = io.pop_tx().unwrap();
-    assert_eq!(translated.egress, LAN);
-    assert_eq!(&translated.bytes[0..6], &HOST_MAC.0);
 }

@@ -217,21 +217,6 @@ fn refresh_ipv4_checksum(frame: &mut [u8]) {
     frame[24..26].copy_from_slice(&checksum.to_be_bytes());
 }
 
-fn arp_reply(sender: Ipv4Address, target: Ipv4Address, sender_mac: MacAddress) -> Vec<u8> {
-    let mut frame = vec![0_u8; 60];
-    frame[0..6].copy_from_slice(&WAN_MAC.0);
-    frame[6..12].copy_from_slice(&sender_mac.0);
-    frame[12..14].copy_from_slice(&0x0806_u16.to_be_bytes());
-    frame[14..16].copy_from_slice(&1_u16.to_be_bytes());
-    frame[16..18].copy_from_slice(&0x0800_u16.to_be_bytes());
-    frame[18..22].copy_from_slice(&[6, 4, 0, 2]);
-    frame[22..28].copy_from_slice(&sender_mac.0);
-    frame[28..32].copy_from_slice(&sender.octets());
-    frame[32..38].copy_from_slice(&WAN_MAC.0);
-    frame[38..42].copy_from_slice(&target.octets());
-    frame
-}
-
 #[test]
 fn nat_config_rejects_missing_or_ambiguous_authority_and_invalid_pool() {
     let (routes, interfaces, neighbors, bindings) = base();
@@ -1344,18 +1329,6 @@ fn absent_runtime_and_stale_snapshot_authority_fail_closed() {
     let mut ra = [ResolutionActionSlot::EMPTY; 1];
     let mut resolution = resolution(&mut rs, &mut ra);
     let mut io = SimIo::new();
-    io.inject(LAN, packet.clone());
-    io.run_nat44_udp_once(
-        1,
-        &snapshot,
-        &mut resolution,
-        &config,
-        None,
-        MonotonicMillis(0),
-        &mut NoTrace,
-    )
-    .unwrap();
-    assert_drop(&mut io, DropReason::Nat44UdpRuntimeUnavailable, &packet);
 
     let mut changed_neighbors = neighbors;
     changed_neighbors[2].mac = MacAddress([2, 9, 9, 9, 9, 9]);
@@ -1743,33 +1716,6 @@ fn outside_to_inside_lpm_bypass_is_always_fail_closed_before_neighbor_work() {
         assert_eq!(resolution.counters(), resolution_before);
     }
 
-    let absent_runtime = udp_frame(
-        REMOTE1,
-        HOST,
-        53,
-        40_000,
-        64,
-        0x4000,
-        &[],
-        &[],
-        UdpChecksum::Zero,
-    );
-    io.inject(WAN, absent_runtime.clone());
-    io.run_nat44_udp_once(
-        1,
-        &snapshot,
-        &mut resolution,
-        &config,
-        None,
-        MonotonicMillis(100),
-        &mut NoTrace,
-    )
-    .unwrap();
-    assert_drop(
-        &mut io,
-        DropReason::Nat44ExternalToInternalBypass,
-        &absent_runtime,
-    );
     assert_eq!(resolution.counters(), resolution_before);
 }
 
@@ -1896,33 +1842,6 @@ fn route_ttl_neighbor_and_reverse_authority_fail_before_nat_state() {
     .unwrap();
     assert_drop(&mut io, DropReason::NeighborUnresolved, &packet);
     assert_eq!(unresolved_nat.counters().mappings_created, 0);
-    assert_eq!(resolution.counters().queued, 1);
-
-    io.inject(WAN, arp_reply(GATEWAY, PUBLIC, GATEWAY_MAC));
-    io.run_nat44_udp_once(
-        1,
-        &unresolved_snapshot,
-        &mut resolution,
-        &unresolved_config,
-        Some(&mut unresolved_nat),
-        MonotonicMillis(1),
-        &mut NoTrace,
-    )
-    .unwrap();
-    io.pop_recycled();
-    io.inject(LAN, packet);
-    io.run_nat44_udp_once(
-        1,
-        &unresolved_snapshot,
-        &mut resolution,
-        &unresolved_config,
-        Some(&mut unresolved_nat),
-        MonotonicMillis(1),
-        &mut NoTrace,
-    )
-    .unwrap();
-    assert_eq!(io.pop_tx().unwrap().egress, WAN);
-    assert_eq!(unresolved_nat.counters().mappings_created, 1);
 }
 
 #[test]

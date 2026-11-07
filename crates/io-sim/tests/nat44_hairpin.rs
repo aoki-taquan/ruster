@@ -319,7 +319,12 @@ impl World {
         }
     }
 
-    fn run_audited(&mut self, ingress: IfId, packet: Vec<u8>, audit: &mut FirewallAuditBuffer<'_>) {
+    fn run_audited(
+        &mut self,
+        ingress: IfId,
+        packet: Vec<u8>,
+        audit: &mut FirewallAuditBuffer<'static>,
+    ) {
         self.io.inject(ingress, packet);
         let now = MonotonicMillis(self.now);
         self.now += 1;
