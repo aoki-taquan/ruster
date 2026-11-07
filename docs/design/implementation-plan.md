@@ -1,6 +1,7 @@
 # 実装計画
 
-状態: 2026-11-06。設計図（この directory の他の文書）を、今のコードを土台にして実現する順番。
+状態: 2026-11-07。設計図（この directory の他の文書）を、今のコードを土台にして実現し、
+[`charter.md`](../charter.md)の「完成の条件」を満たすまでの順番。
 
 ## 方針
 
@@ -91,17 +92,43 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 ### 段階2: 置き換え
 
-骨組みが動いたら、今の作りを新しい作りに置き換える。
+今の作りを新しい作りに置き換える。終わったら、見直し前の作りはリポジトリに残らない。
 
-- `ruster run`を新しいFEの実行ファイルに替える（AF_XDP、AF_PACKET）。FEは設定ファイルを読まない。
-- `ruster-core`からARPの処理を消す（neighdへ移した後）。
-- SIGHUPでのTOMLの再読み込みを消す（confdへの反映に替わる）。
+| 番号 | 作業 |
+|---|---|
+| 2-1 | 相手が落ちたときのつなぎ直し。CEの実行ファイルを再起動しても転送が止まらないことをnetnsで確かめる（済み、#384、#392） |
+| 2-2 | （外した。CIに足すかは、プロジェクトが成熟してからownerが決める） |
+| 2-3 | FEの実行ファイルをAF_XDPでも動かす。`ruster run`の運用の部品は、シグナルでの停止とsystemdへの通知だけ移す（owner決定。権限、seccomp、Landlockは移さない）（済み、#389、#395） |
+| 2-4 | （4-2へ移した: coreのNATとfirewallの入口はどれもARPの解決を必須にしていて、試験の大半がそれを使う。入口を一つにまとめるときに一緒に消す） |
+| 2-5 | 見直し前の`ruster`コマンド（`run`、`run-sim`、SIGHUPの再読み込み）と、それだけが使うcrateを消す。NAT、firewall、フラグメントの処理はcoreに残す（済み、#398） |
 
-### 段階3以降: 機能
+### 段階3: 土台
 
-骨組みの上に[`tables.md`](tables.md)の表を一つずつ載せる。順番は段階2が終わった時点でownerが決める。
-候補: IPv6とND、NATとfirewallの表（今の処理を`ietf-nat`、`ietf-access-control-list`の形でつなぐ）、
-VLAN、トンネル（DS-Lite、MAP-E）、PPPoE、WireGuard、複数workerと状態の持ち主、経路の表の木。
+どの機能も使う部分。形の違う構成で確かめる。
+
+| 番号 | 作業 |
+|---|---|
+| 3-1 | IPv6の転送と、neighdのND（RFC 4861） |
+| 3-2 | ICMPとICMPv6のエラー生成を新しいFEの経路につなぐ（RFC 1812、RFC 4443） |
+| 3-3 | 複数のVRFと、VRFの間で経路を漏らすこと（`ce-processes.md`） |
+| 3-4 | ルータ宛て通信の分類と流量制限、VRFごとのTUNでkernelへ渡す |
+| 3-5 | 外のプロセスからribdへ経路を入れる口と、読み出し専用の状態のsocket |
+| 3-6 | 試験: VRFの構成、外からの経路の構成、ルータ宛て通信の構成をnetnsで回す |
+
+### 段階4: 機能
+
+[`tables.md`](tables.md)の表として一つずつ載せる。
+
+| 番号 | 作業 |
+|---|---|
+| 4-1 | VLAN（サブインターフェース） |
+| 4-2 | NAT44と状態を持つfirewall（今の処理を`ietf-nat`、`ietf-access-control-list`の形の表でつなぐ）、フラグメント処理。`forward_batch_with_*`の入口を一つにまとめ、`ruster-core`からARPの処理を消す |
+| 4-3 | DS-Lite（RFC 6333のB4） |
+| 4-4 | MAP-E（RFC 7597）と、ポートの範囲を使うNAPT |
+| 4-5 | PPPoEのカプセル化（RFC 2516）。セッションの確立は外のデーモン |
+| 4-6 | WireGuard |
+
+段階4が終わると、charterの「作るもの」が揃う。
 
 ## 気をつけること
 
