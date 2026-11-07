@@ -41,6 +41,7 @@ fn config() -> Config {
                 ipv6: Vec::new(),
                 vrf: "default".into(),
                 vlan: None,
+                tunnel: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -51,6 +52,7 @@ fn config() -> Config {
                 ipv6: Vec::new(),
                 vrf: "default".into(),
                 vlan: None,
+                tunnel: None,
             },
         ],
         static_routes: vec![StaticRoute {

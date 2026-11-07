@@ -16,6 +16,12 @@
 //! vlan = 10                    # 1 to 4094; mac is lan's when left out
 //! ipv4 = "10.10.0.1/24"
 //!
+//! [[interface]]                # an IPv4 in IPv6 tunnel (DS-Lite softwire)
+//! name = "dslite"
+//! tunnel = { local = "2001:db8:1::2", remote = "2001:db8:ff::1" }
+//! ipv4 = "192.0.0.2/29"        # optional; RFC 6333 5.7's B4 address
+//! # mtu is 1460 when left out; mac is not needed
+//!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
 //! interface = "wan"
@@ -63,6 +69,11 @@
 //! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
 //!   when not named.
 //! - RFC 791: the smallest MTU is 68.
+//! - RFC 6333 section 5 (DS-Lite B4): a `tunnel` interface sends IPv4 inside IPv6
+//!   from `local`, which must be one of the router's IPv6 addresses in the default
+//!   VRF, to the AFTR at `remote`; the outer packets are routed in the default VRF.
+//!   Its MTU is at most 1460 (1500 less the IPv6 header), so the outer packets are
+//!   never fragmented (RFC 6333 5.3 lets the B4 fragment them instead).
 //! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
 //!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
@@ -95,6 +106,8 @@ use crate::{Config, InterfaceConfig, RouteTarget, StaticRoute};
 const MIN_MTU: u16 = ruster_proto::table::MIN_MTU;
 /// The FE takes Ethernet frames of up to 1514 bytes.
 const MAX_MTU: u16 = 1_500;
+/// The MAC address of a tunnel that names none.
+const TUNNEL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xfe];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -148,6 +161,14 @@ struct InterfaceEntry {
     ipv6: Vec<String>,
     #[serde(default = "default_vrf")]
     vrf: String,
+    tunnel: Option<TunnelEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TunnelEntry {
+    local: String,
+    remote: String,
 }
 
 #[derive(Deserialize)]
@@ -274,11 +295,38 @@ pub fn parse(text: &str) -> Result<Config, String> {
             (None, None) => None,
             _ => return Err(format!("{at}: give parent and vlan together")),
         };
+        let tunnel = match &entry.tunnel {
+            None => None,
+            Some(_) if vlan.is_some() => {
+                return Err(format!(
+                    "{at}: an interface is a VLAN or a tunnel, not both"
+                ))
+            }
+            Some(tunnel) => {
+                let address = |text: &str, what: &str| -> Result<Ipv6Addr, String> {
+                    let address: Ipv6Addr = text
+                        .parse()
+                        .map_err(|_| format!("{at}: tunnel {what} must be an IPv6 address"))?;
+                    if !unicast_v6(address) || address.is_unicast_link_local() {
+                        return Err(format!(
+                            "{at}: tunnel {what} must be a global unicast address"
+                        ));
+                    }
+                    Ok(address)
+                };
+                Some((
+                    address(&tunnel.local, "local")?,
+                    address(&tunnel.remote, "remote")?,
+                ))
+            }
+        };
         let mac = match (&entry.mac, &vlan) {
             (Some(text), _) => {
                 mac(text).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?
             }
             (None, Some((_, _, parent_mac))) => *parent_mac,
+            // A tunnel has no link; its MAC address only names it inside the FE.
+            (None, None) if tunnel.is_some() => TUNNEL_MAC,
             (None, None) => return Err(format!("{at}: mac is missing")),
         };
         if mac[0] & 1 != 0 || mac == [0; 6] {
@@ -289,9 +337,16 @@ pub fn parse(text: &str) -> Result<Config, String> {
             .as_ref()
             .and_then(|(parent, _, _)| interfaces.iter().find(|i| i.name == *parent))
             .map_or(MAX_MTU, |parent| parent.mtu - 4);
+        // A tunnel's packets carry a 40-byte IPv6 header on the link below.
+        let max_mtu = if tunnel.is_some() {
+            MAX_MTU - 40
+        } else {
+            max_mtu
+        };
         let mtu = match (entry.mtu, &vlan) {
             (Some(mtu), _) => mtu,
             (None, Some(_)) => max_mtu,
+            (None, None) if tunnel.is_some() => max_mtu,
             (None, None) => default_mtu(),
         };
         if !(MIN_MTU..=max_mtu).contains(&mtu) {
@@ -349,7 +404,22 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ipv6,
             vrf: entry.vrf,
             vlan: vlan.map(|(parent, id, _)| (parent, id)),
+            tunnel,
         });
+    }
+    // A tunnel is sent from one of the router's own addresses, in the default VRF.
+    for interface in &interfaces {
+        if let Some((local, _)) = interface.tunnel {
+            if !seen
+                .addresses
+                .contains(&(DEFAULT_VRF.to_owned(), IpAddr::V6(local)))
+            {
+                return Err(format!(
+                    "interface {:?}: tunnel local {local} must be an IPv6 address of an interface in the default VRF",
+                    interface.name
+                ));
+            }
+        }
     }
     let mut static_routes = Vec::with_capacity(file.route.len());
     let mut prefixes = BTreeSet::new();
