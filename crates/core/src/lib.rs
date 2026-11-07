@@ -32,6 +32,7 @@ mod source_validation;
 mod time;
 mod tunnel;
 mod vlan;
+pub mod wireguard;
 
 pub use arp_policy::{
     ArpAnnouncePolicy, ArpAnnouncePolicyError, ArpInterfacePolicy,
