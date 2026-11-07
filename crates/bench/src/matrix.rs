@@ -3,18 +3,15 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 use ruster_core::{
-    forward_batch, forward_batch_with_firewall, forward_batch_with_nat44_tcp,
-    forward_batch_with_nat44_udp, forward_batch_with_nat44_udp_and_tcp_and_firewall,
-    ipv4_header_checksum, validate_ipv4_frame, BatchReport, DirectoryBucket, DirectoryNode,
-    FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface, FirewallIpv4Prefix,
-    FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule, FirewallRuleId,
-    FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId, Interface, Ipv4Address,
-    Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig,
+    forward_batch, ipv4_header_checksum, validate_ipv4_frame, BatchReport, DirectoryBucket,
+    DirectoryNode, FirewallAction, FirewallConfig, FirewallHashKey, FirewallInterface,
+    FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol, FirewallRule,
+    FirewallRuleId, FirewallRuntime, FirewallStateSlot, ForwardingSnapshot, IfId, Interface,
+    Ipv4Address, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44TcpConfig,
     Nat44TcpHashKey, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
     Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpIndexStorage,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoTrace,
-    PacketIo, PortOwnerSlot, ResolutionActionSlot, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route, ValidatedForwardingOwner,
+    PacketIo, PortOwnerSlot, Route, ValidatedForwardingOwner,
 };
 
 use crate::backend::BenchBatch;
@@ -383,17 +380,6 @@ fn topology() -> (
     )
 }
 
-fn resolution<'a>(
-    states: &'a mut [ResolutionStateSlot],
-    actions: &'a mut [ResolutionActionSlot],
-) -> ResolutionRuntime<'a> {
-    ResolutionRuntime::new(
-        ResolutionPolicy::new(1_000, 2_000).expect("benchmark resolution policy"),
-        states,
-        actions,
-    )
-}
-
 fn nat_configs(snapshot: &ForwardingSnapshot<'_>) -> (Nat44UdpConfig, Nat44TcpConfig) {
     (
         Nat44UdpConfig::new(
@@ -484,9 +470,7 @@ fn run_nat_case(
     .expect("benchmark snapshot");
     let snapshot = owner.snapshot();
     let (udp_config, tcp_config) = nat_configs(&snapshot);
-    let mut resolution_states: [ResolutionStateSlot; 0] = [];
-    let mut resolution_actions: [ResolutionActionSlot; 0] = [];
-    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut control = ruster_core::ControlQueue::new(4);
     let template = timed_fixture(size, config.seed, case, true);
     let mut backend = BenchBackend::new(batch_size, case.direction.ingress(), &template);
 
@@ -499,13 +483,14 @@ fn run_nat_case(
             establish_udp(
                 case,
                 |batch| {
-                    forward_batch_with_nat44_udp(
+                    ruster_core::forward_batch_with_control(
                         batch,
-                        &snapshot,
-                        &mut resolution,
-                        &udp_config,
-                        Some(&mut runtime),
-                        NOW,
+                        &snapshot.with_now(NOW),
+                        &mut control,
+                        ruster_core::Services {
+                            nat44_udp: (Some(&mut runtime)).map(|runtime| (&udp_config, runtime)),
+                            ..ruster_core::Services::default()
+                        },
                         &mut NoTrace,
                     )
                 },
@@ -513,13 +498,14 @@ fn run_nat_case(
             )?;
             let row = {
                 let mut forward = |batch: BenchBatch<'_>| {
-                    forward_batch_with_nat44_udp(
+                    ruster_core::forward_batch_with_control(
                         batch,
-                        &snapshot,
-                        &mut resolution,
-                        &udp_config,
-                        Some(&mut runtime),
-                        NOW,
+                        &snapshot.with_now(NOW),
+                        &mut control,
+                        ruster_core::Services {
+                            nat44_udp: (Some(&mut runtime)).map(|runtime| (&udp_config, runtime)),
+                            ..ruster_core::Services::default()
+                        },
                         &mut NoTrace,
                     )
                 };
@@ -561,13 +547,14 @@ fn run_nat_case(
             establish_tcp(
                 case,
                 |batch| {
-                    forward_batch_with_nat44_tcp(
+                    ruster_core::forward_batch_with_control(
                         batch,
-                        &snapshot,
-                        &mut resolution,
-                        &tcp_config,
-                        Some(&mut runtime),
-                        NOW,
+                        &snapshot.with_now(NOW),
+                        &mut control,
+                        ruster_core::Services {
+                            nat44_tcp: (Some(&mut runtime)).map(|runtime| (&tcp_config, runtime)),
+                            ..ruster_core::Services::default()
+                        },
                         &mut NoTrace,
                     )
                 },
@@ -575,13 +562,14 @@ fn run_nat_case(
             )?;
             let row = {
                 let mut forward = |batch: BenchBatch<'_>| {
-                    forward_batch_with_nat44_tcp(
+                    ruster_core::forward_batch_with_control(
                         batch,
-                        &snapshot,
-                        &mut resolution,
-                        &tcp_config,
-                        Some(&mut runtime),
-                        NOW,
+                        &snapshot.with_now(NOW),
+                        &mut control,
+                        ruster_core::Services {
+                            nat44_tcp: (Some(&mut runtime)).map(|runtime| (&tcp_config, runtime)),
+                            ..ruster_core::Services::default()
+                        },
                         &mut NoTrace,
                     )
                 };
@@ -640,9 +628,7 @@ fn run_firewall_case(
     let firewall_config = firewall_config(&snapshot, &rules);
     let mut firewall_states = [FirewallStateSlot::default(); 4];
     let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_states);
-    let mut resolution_states: [ResolutionStateSlot; 0] = [];
-    let mut resolution_actions: [ResolutionActionSlot; 0] = [];
-    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut control = ruster_core::ControlQueue::new(4);
     let template = timed_fixture(size, config.seed, case, false);
     let mut backend = BenchBackend::new(batch_size, case.direction.ingress(), &template);
 
@@ -650,13 +636,14 @@ fn run_firewall_case(
         establish_tcp(
             case,
             |batch| {
-                forward_batch_with_firewall(
+                ruster_core::forward_batch_with_control(
                     batch,
-                    &snapshot,
-                    &mut resolution,
-                    &firewall_config,
-                    Some(&mut firewall),
-                    NOW,
+                    &snapshot.with_now(NOW),
+                    &mut control,
+                    ruster_core::Services {
+                        firewall: (Some(&mut firewall)).map(|runtime| (&firewall_config, runtime)),
+                        ..ruster_core::Services::default()
+                    },
                     &mut NoTrace,
                 )
             },
@@ -666,13 +653,14 @@ fn run_firewall_case(
         establish_udp(
             case,
             |batch| {
-                forward_batch_with_firewall(
+                ruster_core::forward_batch_with_control(
                     batch,
-                    &snapshot,
-                    &mut resolution,
-                    &firewall_config,
-                    Some(&mut firewall),
-                    NOW,
+                    &snapshot.with_now(NOW),
+                    &mut control,
+                    ruster_core::Services {
+                        firewall: (Some(&mut firewall)).map(|runtime| (&firewall_config, runtime)),
+                        ..ruster_core::Services::default()
+                    },
                     &mut NoTrace,
                 )
             },
@@ -681,13 +669,14 @@ fn run_firewall_case(
     }
     let row = {
         let mut forward = |batch: BenchBatch<'_>| {
-            forward_batch_with_firewall(
+            ruster_core::forward_batch_with_control(
                 batch,
-                &snapshot,
-                &mut resolution,
-                &firewall_config,
-                Some(&mut firewall),
-                NOW,
+                &snapshot.with_now(NOW),
+                &mut control,
+                ruster_core::Services {
+                    firewall: (Some(&mut firewall)).map(|runtime| (&firewall_config, runtime)),
+                    ..ruster_core::Services::default()
+                },
                 &mut NoTrace,
             )
         };
@@ -752,9 +741,7 @@ fn run_combined_case(
     let mut udp = udp_indexes.runtime(udp_config, &mut udp_mappings, &mut udp_peers);
     let mut tcp = tcp_indexes.runtime(tcp_config, &mut tcp_mappings, &mut tcp_sessions);
     let mut firewall = FirewallRuntime::new(firewall_config, &mut firewall_states);
-    let mut resolution_states: [ResolutionStateSlot; 0] = [];
-    let mut resolution_actions: [ResolutionActionSlot; 0] = [];
-    let mut resolution = resolution(&mut resolution_states, &mut resolution_actions);
+    let mut control = ruster_core::ControlQueue::new(4);
     let template = timed_fixture(size, config.seed, case, true);
     let mut backend = BenchBackend::new(batch_size, case.direction.ingress(), &template);
 
@@ -762,17 +749,16 @@ fn run_combined_case(
         establish_tcp(
             case,
             |batch| {
-                forward_batch_with_nat44_udp_and_tcp_and_firewall(
+                ruster_core::forward_batch_with_control(
                     batch,
-                    &snapshot,
-                    &mut resolution,
-                    &udp_config,
-                    Some(&mut udp),
-                    &tcp_config,
-                    Some(&mut tcp),
-                    &firewall_config,
-                    Some(&mut firewall),
-                    NOW,
+                    &snapshot.with_now(NOW),
+                    &mut control,
+                    ruster_core::Services {
+                        nat44_udp: (Some(&mut udp)).map(|runtime| (&udp_config, runtime)),
+                        nat44_tcp: (Some(&mut tcp)).map(|runtime| (&tcp_config, runtime)),
+                        firewall: (Some(&mut firewall)).map(|runtime| (&firewall_config, runtime)),
+                        ..ruster_core::Services::default()
+                    },
                     &mut NoTrace,
                 )
             },
@@ -782,17 +768,16 @@ fn run_combined_case(
         establish_udp(
             case,
             |batch| {
-                forward_batch_with_nat44_udp_and_tcp_and_firewall(
+                ruster_core::forward_batch_with_control(
                     batch,
-                    &snapshot,
-                    &mut resolution,
-                    &udp_config,
-                    Some(&mut udp),
-                    &tcp_config,
-                    Some(&mut tcp),
-                    &firewall_config,
-                    Some(&mut firewall),
-                    NOW,
+                    &snapshot.with_now(NOW),
+                    &mut control,
+                    ruster_core::Services {
+                        nat44_udp: (Some(&mut udp)).map(|runtime| (&udp_config, runtime)),
+                        nat44_tcp: (Some(&mut tcp)).map(|runtime| (&tcp_config, runtime)),
+                        firewall: (Some(&mut firewall)).map(|runtime| (&firewall_config, runtime)),
+                        ..ruster_core::Services::default()
+                    },
                     &mut NoTrace,
                 )
             },
@@ -801,17 +786,16 @@ fn run_combined_case(
     }
     let row = {
         let mut forward = |batch: BenchBatch<'_>| {
-            forward_batch_with_nat44_udp_and_tcp_and_firewall(
+            ruster_core::forward_batch_with_control(
                 batch,
-                &snapshot,
-                &mut resolution,
-                &udp_config,
-                Some(&mut udp),
-                &tcp_config,
-                Some(&mut tcp),
-                &firewall_config,
-                Some(&mut firewall),
-                NOW,
+                &snapshot.with_now(NOW),
+                &mut control,
+                ruster_core::Services {
+                    nat44_udp: (Some(&mut udp)).map(|runtime| (&udp_config, runtime)),
+                    nat44_tcp: (Some(&mut tcp)).map(|runtime| (&tcp_config, runtime)),
+                    firewall: (Some(&mut firewall)).map(|runtime| (&firewall_config, runtime)),
+                    ..ruster_core::Services::default()
+                },
                 &mut NoTrace,
             )
         };

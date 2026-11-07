@@ -11,11 +11,10 @@
 mod support;
 
 use ruster_core::{
-    execute_one_icmpv4_error, forward_batch_with_nat44_udp_and_icmpv4_errors,
-    forward_batch_with_resolution_and_icmpv4_errors, DropReason, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorCounters, Icmpv4ErrorDisposition, Icmpv4ErrorKind,
-    Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering, Nat44UdpConfig,
+    execute_one_icmpv4_error, forward_batch_with_resolution_and_icmpv4_errors, DropReason,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorCounters, Icmpv4ErrorDisposition,
+    Icmpv4ErrorKind, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, Interface,
+    Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering, Nat44UdpConfig,
     Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor,
     NoGeneratedIcmpv4Trace, PacketIo, ResolutionActionSlot, ResolutionPolicy, ResolutionResult,
     ResolutionRuntime, ResolutionStateSlot, Route, SourceValidation, SourceValidationBinding,
@@ -320,14 +319,15 @@ impl World {
         let mut trace = VecTrace::default();
         let batch = self.io.receive(1).unwrap();
         let report = match self.nat.as_mut() {
-            Some((config, runtime)) => forward_batch_with_nat44_udp_and_icmpv4_errors(
+            Some((config, runtime)) => support::forward(
                 batch,
                 &self.snapshot,
-                &mut self.resolution,
-                &mut self.errors,
-                config,
-                Some(runtime),
                 MonotonicMillis(now),
+                ruster_core::Services {
+                    icmpv4_errors: Some(&mut self.errors),
+                    nat44_udp: Some((&*config, runtime)),
+                    ..ruster_core::Services::default()
+                },
                 &mut trace,
             ),
             None => forward_batch_with_resolution_and_icmpv4_errors(
