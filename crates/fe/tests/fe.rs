@@ -1697,6 +1697,9 @@ mod wireguard {
             .inject(IfId(0), udp_from_host([10, 9, 0, 5]));
         bench.fe.step(bench.now);
         let tx = bench.fe.io_mut().pop_tx().expect("sent");
+        assert_eq!(&tx.bytes[30..34], &ENDPOINT, "to the peer's endpoint");
+        assert_eq!(&tx.bytes[36..38], &51821_u16.to_be_bytes());
+        assert_eq!(tx.bytes[14 + 28], 4, "a WireGuard data message");
         u64::from_le_bytes(tx.bytes[14 + 28 + 8..14 + 28 + 16].try_into().unwrap())
     }
 
@@ -1797,5 +1800,138 @@ mod wireguard {
         assert_eq!(bench.patch(&mut config, &[wg0(false)]), Code::CHANGED);
         assert_eq!(bench.patch(&mut config, &[wg0(true)]), Code::CHANGED);
         assert_eq!(sent_counter(&mut bench), 1);
+    }
+
+    #[test]
+    fn two_peers_with_one_send_key_or_one_local_index_are_refused() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        let mut config = bench.connect(writers::CONFIG);
+        let second = |send: u8, local_index: u32| {
+            vec![
+                Change::set(
+                    Key::WireguardPeer {
+                        interface: "wg0".into(),
+                        peer: "other".into(),
+                    },
+                    Value::WireguardPeer(WireguardPeer {
+                        endpoint: Ipv4Addr::new(203, 0, 113, 10),
+                        port: 51821,
+                        allowed: vec![(Ipv4Addr::new(10, 8, 0, 0), 16)],
+                    }),
+                ),
+                Change::set(
+                    Key::WireguardSession {
+                        interface: "wg0".into(),
+                        peer: "other".into(),
+                    },
+                    Value::WireguardSession(WireguardSession {
+                        send: [send; 32],
+                        receive: [9; 32],
+                        peer_index: 5,
+                        local_index,
+                    }),
+                ),
+            ]
+        };
+        // The first peer's send key is [1; 32] and its local index 11.
+        assert_ne!(bench.patch(&mut config, &second(1, 12)), Code::CHANGED);
+        assert_ne!(bench.patch(&mut config, &second(7, 11)), Code::CHANGED);
+        assert_eq!(bench.patch(&mut config, &second(7, 12)), Code::CHANGED);
+    }
+
+    #[test]
+    fn a_resync_may_move_a_key_to_a_peer_of_another_name() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        assert_eq!(sent_counter(&mut bench), 0);
+        let mut config = bench.connect(writers::CONFIG);
+        config.resync_begin();
+        bench.settle(&mut [&mut config]);
+        // The whole new tables come in one patch; only the old peer stays stale.
+        let renamed = [
+            iface("lan", LAN_MAC),
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+            Change::set(
+                Key::Interface { name: "wg0".into() },
+                Value::Interface {
+                    enabled: true,
+                    mac: [2, 0, 0, 0, 0, 9],
+                    mtu: 1420,
+                    vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                    vlan: None,
+                    tunnel: None,
+                    pppoe: None,
+                },
+            ),
+            Change::set(
+                Key::Wireguard {
+                    interface: "wg0".into(),
+                },
+                Value::Wireguard(Wireguard {
+                    listen_port: 51820,
+                    local: Ipv4Addr::from(ROUTER),
+                }),
+            ),
+            Change::set(
+                Key::WireguardPeer {
+                    interface: "wg0".into(),
+                    peer: "renamed".into(),
+                },
+                Value::WireguardPeer(WireguardPeer {
+                    endpoint: Ipv4Addr::from(ENDPOINT),
+                    port: 51821,
+                    allowed: vec![(Ipv4Addr::new(10, 9, 0, 0), 16)],
+                }),
+            ),
+            Change::set(
+                Key::WireguardSession {
+                    interface: "wg0".into(),
+                    peer: "renamed".into(),
+                },
+                Value::WireguardSession(WireguardSession {
+                    send: [1; 32],
+                    receive: [2; 32],
+                    peer_index: 22,
+                    local_index: 11,
+                }),
+            ),
+        ];
+        assert_eq!(bench.patch(&mut config, &renamed), Code::CHANGED);
+        // The key goes on from its counter, under the new name.
+        assert_eq!(sent_counter(&mut bench), 1);
+    }
+
+    #[test]
+    fn two_interfaces_with_one_address_and_port_are_refused() {
+        let mut bench = Bench::new();
+        setup(&mut bench, true);
+        let mut config = bench.connect(writers::CONFIG);
+        let second = [
+            Change::set(
+                Key::Interface { name: "wg1".into() },
+                Value::Interface {
+                    enabled: true,
+                    mac: [2, 0, 0, 0, 0, 10],
+                    mtu: 1420,
+                    vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                    vlan: None,
+                    tunnel: None,
+                    pppoe: None,
+                },
+            ),
+            Change::set(
+                Key::Wireguard {
+                    interface: "wg1".into(),
+                },
+                Value::Wireguard(Wireguard {
+                    listen_port: 51820,
+                    local: Ipv4Addr::from(ROUTER),
+                }),
+            ),
+        ];
+        assert_ne!(bench.patch(&mut config, &second), Code::CHANGED);
     }
 }

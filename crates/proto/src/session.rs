@@ -64,6 +64,12 @@ impl Store {
         self.entries.iter().map(|(key, slot)| (key, &slot.value))
     }
 
+    /// Whether `key` is an entry its writer has not sent again since a resync began:
+    /// it goes when the resync ends.
+    pub fn is_stale(&self, key: &Key) -> bool {
+        self.entries.get(key).is_some_and(|slot| slot.stale)
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
