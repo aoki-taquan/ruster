@@ -2030,54 +2030,6 @@ impl<'a> ForwardingSnapshot<'a> {
         crate::pppoe::wrap(self, egress, frame)
     }
 
-    /// For a packet of the router itself (`packet`, an IPv4 packet) routed to the
-    /// tunnel interface `egress`: the underlying interface, next hop and the IPv6
-    /// header to wrap it in, by this snapshot's tunnels and IPv6 table (the default
-    /// VRF's). `None` when `egress` is no tunnel's.
-    #[must_use]
-    pub fn tunnel_origin(
-        &self,
-        egress: IfId,
-        packet: &[u8],
-    ) -> Option<Result<crate::TunnelOrigin, crate::TunnelOriginError>> {
-        crate::tunnel::origin(self, egress, packet)
-    }
-
-    /// Where a packet the router itself sends to `destination` goes: the route's
-    /// egress interface and its MAC, the next hop, and the next hop's MAC when the
-    /// neighbor table has it. `None` without a route (or IPv6 tables, for IPv6).
-    #[must_use]
-    pub fn origin(&self, destination: std::net::IpAddr) -> Option<crate::Origin> {
-        let (egress, next_hop, destination_mac) = match destination {
-            std::net::IpAddr::V4(address) => {
-                let target = crate::Ipv4Address::from_octets(address.octets());
-                let route = self.route_lookup(target)?;
-                let hop = route.next_hop().unwrap_or(target);
-                let mac = self
-                    .static_neighbor(route.egress(), hop)
-                    .map(|n| n.mac)
-                    .or(crate::pppoe::of(self.pppoe, route.egress()).map(|s| s.peer));
-                (
-                    route.egress(),
-                    std::net::IpAddr::V4(hop.octets().into()),
-                    mac,
-                )
-            }
-            std::net::IpAddr::V6(address) => {
-                let (egress, hop, mac) = self.ipv6?.origin(address.octets())?;
-                let mac = mac.or(crate::pppoe::of(self.pppoe, egress).map(|s| s.peer));
-                (egress, std::net::IpAddr::V6(hop.into()), mac)
-            }
-        };
-        let source_mac = self.interface(egress)?.mac;
-        Some(crate::Origin {
-            egress,
-            source_mac,
-            next_hop,
-            destination_mac,
-        })
-    }
-
     /// The static neighbor for `(interface, target)`.
     #[inline]
     pub(crate) fn static_neighbor(
@@ -3269,8 +3221,12 @@ where
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
                 let outer = all_vrfs.authority();
+                // The router's own packets are not forwarded ones: the forward
+                // firewall (and so this block) does not apply to them.
+                let own = snapshot.is_kernel_ingress(packet.ingress());
                 let blocked = |egress: IfId| {
                     all_vrfs.ipv6_forwarding_blocked
+                        && !own
                         && (snapshot.authority() == outer
                             || all_vrfs.for_ingress(egress).authority() == outer)
                 };
@@ -4717,7 +4673,9 @@ fn decide_ipv4<T: TraceSink>(
             Nat44TcpUnsupportedTransport
         });
     }
-    if let Some(config) = firewall_config {
+    // The forward firewall judges forwarded datagrams; the router's own (from the
+    // kernel's interface) are not forwarded ones.
+    if let Some(config) = firewall_config.filter(|_| !snapshot.is_kernel_ingress(ingress)) {
         if let Some(udp_config) = nat44_udp_config {
             if ingress == udp_config.inside()
                 && route.egress() == udp_config.outside()

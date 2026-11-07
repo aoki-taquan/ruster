@@ -112,8 +112,10 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
 - VRFごとのTUNは、FEから見るとそのVRFの内側のインターフェースの一つで、その先にkernelという
   ホストが一台いる。
 - **kernelから出るパケット:** TUNから読んだパケットは、LANのポートで受けたパケットと同じ転送の
-  処理を通る。firewall、NAT、トンネルやPPPoEの包み、フラグメント、出口に入らないときのICMPエラー
-  （kernelへ返る）がそのまま効く。たとえばMAP-Eでは、ルータ自身のDNSやNTPも共有のIPv4 addressと
+  処理を通る。NAT、トンネルやPPPoEの包み、フラグメント、出口に入らないときのICMPエラー
+  （kernelへ返る）がそのまま効く。forward firewallは転送される通信を判断するもので、ルータ自身の
+  通信には効かない（Linuxのnftablesでも、ルータ自身の通信はforwardではなくoutputを通る）。
+  ルータ自身の通信を絞る規則が要るときは、outputの規則として別に足す。たとえばMAP-Eでは、ルータ自身のDNSやNTPも共有のIPv4 addressと
   PSIDのポートに変換される。
 - **kernelへ入るパケット:** トンネルを外し、NATを逆に変換した結果の宛先がルータのアドレスなら、
   FEはパケットをTUNのインターフェースへ転送する。ルータ自身が始めた通信の戻りは、NATの対応で

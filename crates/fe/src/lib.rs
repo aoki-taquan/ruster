@@ -45,6 +45,7 @@ use ruster_proto::task::{Progress, Task};
 mod build;
 mod firewall;
 mod fragments;
+mod kernel;
 mod local;
 mod nat;
 
@@ -123,6 +124,8 @@ pub struct Fe<B> {
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
     pppoe: Vec<ruster_core::PppoeSession>,
+    /// Each VRF's kernel interface, in the order of `vrfs`.
+    kernel: Vec<IfId>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
     limiter: local::Limiter,
@@ -181,6 +184,7 @@ where
             vlans: built.vlans,
             tunnels: built.tunnels,
             pppoe: built.pppoe,
+            kernel: built.kernel,
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
             active: built.active,
@@ -249,6 +253,8 @@ where
 
     fn worker(&mut self, now_ms: u64) -> bool {
         let mut trace = FeTrace::default();
+        // The kernel's packets join the ports' in one batch, after them.
+        let kernel_frames = self.read_kernel();
         // One snapshot per VRF; each packet uses its ingress interface's.
         let snapshots: Vec<_> = self
             .vrfs
@@ -260,6 +266,7 @@ where
                     .with_arp_to_control(true)
                     .with_ipv6(&vrf.ipv6)
                     .with_local_to_control(self.local.contains_key(name))
+                    .with_kernel_ingress(&self.kernel)
                     .with_vlans(&self.vlans)
                     .with_tunnels(&self.tunnels)
                     .with_pppoe(&self.pppoe)
@@ -274,9 +281,18 @@ where
             .with_vlans(&self.vlans)
             .with_tunnels(&self.tunnels)
             .with_pppoe(&self.pppoe)
+            .with_kernel_ingress(&self.kernel)
             .with_ipv6_forwarding_blocked(firewall.is_some());
-        let Ok(batch) = self.io.receive(RX_BUDGET) else {
+        let Ok(ports) = self.io.receive(RX_BUDGET) else {
+            self.counters.from_kernel_dropped += kernel_frames.len() as u64;
             return false;
+        };
+        let mut from_kernel = kernel::Outcome::default();
+        let batch = kernel::Joined {
+            ports,
+            kernel: kernel_frames.into_iter(),
+            outcome: &mut from_kernel,
+            kernel_done: 0,
         };
         self.control.clear();
         let now = MonotonicMillis(now_ms);
@@ -302,11 +318,33 @@ where
         self.counters.forwarded += report.tx_requested as u64;
         self.counters.dropped += report.dropped as u64;
         self.counters.arp_to_control_dropped += trace.overflow;
+        self.counters.from_kernel_dropped += from_kernel.dropped;
+        for (egress, frame) in from_kernel.sent {
+            let sent = if self.kernel.contains(&egress) {
+                self.write_kernel(egress, frame.bytes())
+            } else {
+                self.send_port(egress, None, frame.bytes())
+            };
+            if sent {
+                self.counters.from_kernel += 1;
+            } else {
+                self.counters.from_kernel_dropped += 1;
+            }
+        }
 
         // Until one cannot be built or allocated (it stays queued for the next batch).
-        while let Ok(Some(report)) =
-            execute_one_icmpv4_error(&mut self.io, &mut self.icmpv4_errors, now, &mut NoTrace)
-        {
+        // Errors about the kernel's packets are for its pipe.
+        let mut caught = Vec::new();
+        while let Ok(Some(report)) = execute_one_icmpv4_error(
+            &mut kernel::WithKernel {
+                io: &mut self.io,
+                kernel: &self.kernel,
+                caught: &mut caught,
+            },
+            &mut self.icmpv4_errors,
+            now,
+            &mut NoTrace,
+        ) {
             if report.allocation_error.is_some() || report.build_error.is_some() {
                 // One for an egress the backend does not have would stay at the front
                 // and block every later error: drop it. Others wait for the next batch.
@@ -318,6 +356,9 @@ where
                 break;
             }
             self.counters.icmp_errors_sent += 1;
+        }
+        for (egress, frame) in caught {
+            self.write_kernel(egress, &frame);
         }
         let mut budget = fragments::FRAMES_PER_BATCH;
         while let Some(report) =
@@ -483,122 +524,46 @@ where
         }
     }
 
-    /// Sends what the kernel wrote to each VRF's pipe out of the route's interface.
-    fn receive_from_kernel(&mut self, now_ms: u64) -> bool {
-        let mut buf = vec![0_u8; ETHERNET_HEADER + PUNT_MAX];
-        let mut packets = Vec::new();
+    /// The packets the kernel wrote to each VRF's pipe, as frames from its kernel
+    /// interface.
+    fn read_kernel(&self) -> Vec<kernel::Frame> {
+        let mut buf = vec![0_u8; PUNT_MAX];
+        let mut frames = Vec::new();
         for (at, name) in self.names.iter().enumerate() {
-            let Some(pipe) = self.local.get(name) else {
+            let (Some(pipe), Some(&ingress)) = (self.local.get(name), self.kernel.get(at)) else {
                 continue;
             };
             for _ in 0..INJECT_PER_STEP {
-                match pipe.recv(&mut buf[ETHERNET_HEADER..]) {
-                    Ok(n) if n > 0 => {
-                        packets.push((at, buf[ETHERNET_HEADER..ETHERNET_HEADER + n].to_vec()))
-                    }
+                match pipe.recv(&mut buf) {
+                    Ok(n) if n > 0 => frames.push(kernel::Frame::new(ingress, at, &buf[..n])),
                     _ => break,
                 }
             }
         }
-        let busy = !packets.is_empty();
-        for (at, packet) in packets {
-            let snapshot = self.vrfs[at]
-                .owner
-                .snapshot()
-                .with_ipv6(&self.vrfs[at].ipv6)
-                .with_pppoe(&self.pppoe);
-            let origin = local::destination(&packet).and_then(|d| snapshot.origin(d));
-            let Some(origin) = origin else {
-                self.counters.from_kernel_dropped += 1;
-                continue;
-            };
-            // To a tunnel interface: inside IPv6, out of the interface below it.
-            let outer = self.vrfs[0]
-                .owner
-                .snapshot()
-                .with_ipv6(&self.vrfs[0].ipv6)
-                .with_tunnels(&self.tunnels)
-                .with_pppoe(&self.pppoe);
-            if let Some(wrapped) = outer.tunnel_origin(origin.egress, &packet) {
-                let sent = match wrapped {
-                    Ok(tunnel) => match tunnel.destination_mac {
-                        Some(mac) => {
-                            let mut frame = Vec::with_capacity(ETHERNET_HEADER + 40 + packet.len());
-                            frame.extend_from_slice(&mac.0);
-                            frame.extend_from_slice(&tunnel.source_mac.0);
-                            frame.extend_from_slice(&ETHERTYPE_IPV6);
-                            frame.extend_from_slice(&tunnel.header);
-                            frame.extend_from_slice(&packet);
-                            self.send_generated(tunnel.egress, &frame)
-                        }
-                        None => {
-                            let hop = IpAddr::V6(tunnel.next_hop.into());
-                            self.resolve_request(tunnel.egress, hop, now_ms);
-                            false
-                        }
-                    },
-                    Err(ruster_core::TunnelOriginError::TooBig { mtu }) => {
-                        // Too big for the tunnel and DF set: the kernel learns the
-                        // tunnel's MTU, as from a router on the path.
-                        if let Some(error) = local::fragmentation_needed(&packet, mtu) {
-                            if let Some(pipe) = self.local.get(&self.names[at]) {
-                                let _ = pipe.send(&error);
-                            }
-                        }
-                        false
-                    }
-                    Err(ruster_core::TunnelOriginError::Dropped(_)) => false,
-                };
-                if sent {
-                    self.counters.from_kernel += 1;
-                } else {
-                    self.counters.from_kernel_dropped += 1;
-                }
-                continue;
-            }
-            let Some(destination_mac) = origin.destination_mac else {
-                self.counters.from_kernel_dropped += 1;
-                self.resolve_request(origin.egress, origin.next_hop, now_ms);
-                continue;
-            };
-            let ethertype: [u8; 2] = if packet[0] >> 4 == 4 {
-                [0x08, 0x00]
-            } else {
-                ETHERTYPE_IPV6
-            };
-            let mut frame = Vec::with_capacity(ETHERNET_HEADER + packet.len());
-            frame.extend_from_slice(&destination_mac.0);
-            frame.extend_from_slice(&origin.source_mac.0);
-            frame.extend_from_slice(&ethertype);
-            frame.extend_from_slice(&packet);
-            // Too big for a PPPoE session: the kernel learns its MTU, as from a
-            // router on the path.
-            if let Some(Err(ruster_core::TunnelOriginError::TooBig { mtu })) =
-                snapshot.pppoe_frame(origin.egress, &frame)
-            {
-                let error = if packet[0] >> 4 == 4 {
-                    local::fragmentation_needed(&packet, mtu)
-                } else {
-                    local::packet_too_big(&packet, mtu)
-                };
-                if let (Some(error), Some(pipe)) = (error, self.local.get(&self.names[at])) {
-                    let _ = pipe.send(&error);
-                }
-                self.counters.from_kernel_dropped += 1;
-                continue;
-            }
-            if self.send_generated(origin.egress, &frame) {
-                self.counters.from_kernel += 1;
-            } else {
-                self.counters.from_kernel_dropped += 1;
-            }
+        frames
+    }
+
+    /// Writes `frame` (Ethernet) for kernel interface `egress` to its VRF's pipe,
+    /// without the Ethernet header.
+    fn write_kernel(&mut self, egress: IfId, frame: &[u8]) -> bool {
+        let pipe = self
+            .kernel
+            .iter()
+            .position(|&id| id == egress)
+            .and_then(|at| self.names.get(at))
+            .and_then(|name| self.local.get(name));
+        match (pipe, frame.get(ETHERNET_HEADER..)) {
+            (Some(pipe), Some(packet)) => pipe.send(packet).is_ok(),
+            _ => false,
         }
-        busy
     }
 
     /// Sends `frame` out of `egress`; out of a VLAN sub-interface's parent, tagged,
     /// for a sub-interface.
     fn send_generated(&mut self, egress: IfId, frame: &[u8]) -> bool {
+        if self.kernel.contains(&egress) {
+            return self.write_kernel(egress, frame);
+        }
         // Into a PPPoE session, then out of its parent.
         let outer = self.vrfs[0].owner.snapshot().with_pppoe(&self.pppoe);
         match outer.pppoe_frame(egress, frame) {
@@ -611,6 +576,11 @@ where
             Some(binding) => (binding.parent, Some(binding.vid)),
             None => (egress, None),
         };
+        self.send_port(port, tag, frame)
+    }
+
+    /// Sends `frame` out of port `port` as it is, with VLAN tag `tag` put in.
+    fn send_port(&mut self, port: IfId, tag: Option<u16>, frame: &[u8]) -> bool {
         if frame.len() < ETHERNET_HEADER {
             return false;
         }
@@ -670,16 +640,14 @@ where
             self.vlans = built.vlans;
             self.tunnels = built.tunnels;
             self.pppoe = built.pppoe;
+            self.kernel = built.kernel;
             self.active = built.active;
         }
         let worked = self.worker(now_ms);
         let injected = self.inject();
-        let from_kernel = self.receive_from_kernel(now_ms);
         // Notifications queued by the worker go out now.
         let flushed = self.server.step(&mut self.builder);
-        control
-            .and(flushed)
-            .and(Progress::busy(worked || injected || from_kernel))
+        control.and(flushed).and(Progress::busy(worked || injected))
     }
 }
 

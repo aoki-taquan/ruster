@@ -839,6 +839,9 @@ fn traffic_to_the_router_goes_to_the_kernel_pipe_and_the_kernel_s_packets_go_out
     observer.observe();
     bench.settle(&mut [&mut observer]);
     reply[16..20].copy_from_slice(&[192, 0, 2, 99]);
+    reply[10..12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&reply[..20]);
+    reply[10..12].copy_from_slice(&checksum.to_be_bytes());
     kernel.send(&reply).unwrap();
     let events = bench.settle(&mut [&mut observer]).remove(0);
     assert!(bench.fe.io_mut().pop_tx().is_none());
@@ -1336,7 +1339,7 @@ fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
     let (fe_end, kernel) = UnixDatagram::pair().unwrap();
     fe_end.set_nonblocking(true).unwrap();
     bench.fe.attach_local("default", Box::new(fe_end));
-    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
     own[12..16].copy_from_slice(&[192, 0, 2, 1]);
     own[10..12].fill(0);
     let checksum = ipv4_header_checksum(&own[..20]);
@@ -1443,7 +1446,7 @@ fn a_route_to_a_pppoe_interface_sends_in_its_session() {
     let (fe_end, kernel) = UnixDatagram::pair().unwrap();
     fe_end.set_nonblocking(true).unwrap();
     bench.fe.attach_local("default", Box::new(fe_end));
-    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
     own[12..16].copy_from_slice(&[192, 0, 2, 1]);
     own[10..12].fill(0);
     let checksum = ipv4_header_checksum(&own[..20]);

@@ -386,6 +386,18 @@ impl<S: PacketSlot> PacketLease<S> {
         self.ingress = Some(ingress);
     }
 
+    /// The same lease over `f(slot)`, for a backend that joins others' slots into
+    /// its own (the FE's kernel frames after its ports').
+    #[must_use]
+    pub fn map_slot<T: PacketSlot>(mut self, f: impl FnOnce(S) -> T) -> PacketLease<T> {
+        let slot = self.slot.take().expect("live packet lease");
+        PacketLease {
+            slot: Some(f(slot)),
+            ingress: self.ingress,
+            _worker_local: PhantomData,
+        }
+    }
+
     /// See [`PacketSlot::resize_front`].
     pub fn resize_front(&mut self, delta: isize) -> bool {
         self.slot

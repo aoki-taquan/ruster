@@ -45,6 +45,9 @@ pub(crate) struct Built {
     pub(crate) tunnels: Vec<Ipv4InIpv6Tunnel>,
     /// The PPPoE sessions on enabled interfaces.
     pub(crate) pppoe: Vec<PppoeSession>,
+    /// Each VRF's kernel interface, in the order of `vrfs`: the router's own
+    /// packets come in through it ([`crate::kernel`]).
+    pub(crate) kernel: Vec<IfId>,
     /// The default VRF's forward firewall rules, in rule id order, without those
     /// naming an interface that is missing or disabled.
     pub(crate) firewall: Vec<FirewallRule>,
@@ -188,6 +191,9 @@ fn v6(address: IpAddr) -> Option<[u8; 16]> {
         IpAddr::V4(_) => None,
     }
 }
+
+/// The MTU of a kernel interface: that of the TUN devices confd makes.
+const KERNEL_MTU: u16 = 1500;
 
 pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let port = |name: &str| {
@@ -377,6 +383,20 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     names.remove(DEFAULT_VRF);
     let order: Vec<&str> = std::iter::once(DEFAULT_VRF).chain(names).collect();
     let index_of = |vrf: &str| order.iter().position(|v| *v == vrf);
+    // Each VRF's kernel interface, after every other one.
+    let mut kernel = Vec::with_capacity(order.len());
+    for (at, vrf) in order.iter().enumerate() {
+        let id = u16::try_from(interface_names.len())
+            .map(IfId)
+            .map_err(|_| "too many interfaces".to_owned())?;
+        interface_names.push(format!("rt-{vrf}"));
+        interfaces.push(Interface {
+            id,
+            mac: crate::kernel::interface_mac(at),
+            mtu: KERNEL_MTU,
+        });
+        kernel.push(id);
+    }
 
     let mut entries: BTreeMap<String, Vec<Entry>> = order
         .iter()
@@ -533,8 +553,16 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 .and_then(|at| u16::try_from(at).ok())
                 .unwrap_or(0)
         })
+        .collect::<Vec<u16>>();
+    let mut by_ingress = by_ingress;
+    for (at, id) in kernel.iter().enumerate() {
+        by_ingress[usize::from(id.0)] = u16::try_from(at).unwrap_or(0);
+    }
+    let enabled = interfaces
+        .iter()
+        .map(|i| i.id)
+        .filter(|id| !kernel.contains(id))
         .collect();
-    let enabled = interfaces.iter().map(|i| i.id).collect();
     Ok(Built {
         vrfs,
         names: order.iter().map(|v| (*v).to_owned()).collect(),
@@ -544,6 +572,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         vlans,
         tunnels,
         pppoe,
+        kernel,
         firewall,
         firewall_on,
         nat,

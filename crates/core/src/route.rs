@@ -218,32 +218,8 @@ mod tests {
     }
 }
 
-/// Where a packet the router itself sends goes
-/// ([`crate::ForwardingSnapshot::origin`]).
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Origin {
-    pub egress: IfId,
-    pub source_mac: MacAddress,
-    pub next_hop: std::net::IpAddr,
-    /// `None` when the next hop is not in the neighbor table.
-    pub destination_mac: Option<MacAddress>,
-}
-
-/// Where a packet of the router itself for a tunnel interface goes
-/// ([`crate::ForwardingSnapshot::tunnel_origin`]): out of `egress` toward the IPv6
-/// `next_hop` (its MAC when the neighbor table has it), behind `header`.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TunnelOrigin {
-    pub egress: IfId,
-    pub source_mac: MacAddress,
-    pub next_hop: [u8; 16],
-    pub destination_mac: Option<MacAddress>,
-    /// The IPv6 header (40 bytes) to put before the IPv4 packet.
-    pub header: [u8; 40],
-}
-
-/// Why a packet of the router itself cannot go into a tunnel
-/// ([`crate::ForwardingSnapshot::tunnel_origin`]).
+/// Why a frame the router generates cannot go into a PPPoE session
+/// ([`crate::ForwardingSnapshot::pppoe_frame`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TunnelOriginError {
     /// Longer than `mtu`, the most the tunnel carries.
