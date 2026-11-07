@@ -210,6 +210,7 @@ impl<'a, O: PacketOps> AfPacketBatch<'a, O> {
             token: leased.token,
             data: leased.data,
             len: leased.len,
+            front: crate::TPACKET_V3_ETHERNET_MAC_OFFSET - crate::TPACKET_V3_HDRLEN,
             completed: false,
         })
     }
@@ -367,6 +368,10 @@ pub(crate) struct AfPacketSlot<'b, 'a, O: PacketOps = LinuxOps> {
     token: RxPacketToken,
     data: NonNull<u8>,
     len: usize,
+    /// Bytes before `data` that the view may grow into: the padding between the
+    /// TPACKET_V3 header and the frame (`tp_mac - TPACKET3_HDRLEN`), plus what was
+    /// dropped from the front.
+    front: usize,
     completed: bool,
 }
 
@@ -376,14 +381,41 @@ impl<O: PacketOps> PacketSlot for AfPacketSlot<'_, '_, O> {
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
-        // SAFETY: `data..data + len` was proved by `ring_address` to lie in
-        // the RX extent of the live mapping and inside this packet's validated
-        // data range. The block stays USER-owned, so the kernel does not write
-        // it, until this packet completes. The slot exclusively borrows the
-        // batch and therefore the engine, so no other lease or engine access
-        // exists, sibling packet ranges are disjoint, and `&mut self` makes
-        // this the only live view. The mapping is writable (`PROT_WRITE`).
+        // SAFETY: the leased `data..data + len` was proved by `ring_address` to
+        // lie in the RX extent of the live mapping and inside this packet's
+        // validated data range, which starts at `tp_mac` (82, checked by
+        // `PacketDescriptor::validate`) after the packet's TPACKET_V3 header (68
+        // bytes). `resize_front` moves the start back at most into the 14 bytes
+        // between them, which belong to this packet, are no header field, and
+        // are read by nothing else, and never past the end it was given: the
+        // view stays inside this packet's own bytes of the block. The block
+        // stays USER-owned, so the kernel does not write it, until this packet
+        // completes. The slot exclusively borrows the batch and therefore the
+        // engine, so no other lease or engine access exists, sibling packets'
+        // bytes are disjoint, and `&mut self` makes this the only live view. The
+        // mapping is writable (`PROT_WRITE`).
         unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
+    }
+
+    fn resize_front(&mut self, delta: isize) -> bool {
+        let moved = if let Ok(drop) = usize::try_from(delta) {
+            if drop > self.len {
+                return false;
+            }
+            self.front += drop;
+            self.len -= drop;
+            self.data.as_ptr().wrapping_add(drop)
+        } else {
+            let add = delta.unsigned_abs();
+            if add > self.front {
+                return false;
+            }
+            self.front -= add;
+            self.len += add;
+            self.data.as_ptr().wrapping_sub(add)
+        };
+        self.data = NonNull::new(moved).expect("inside the mapping, not null");
+        true
     }
 
     fn complete(mut self, completion: SlotCompletion) {

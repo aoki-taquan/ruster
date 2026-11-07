@@ -1420,6 +1420,12 @@ impl PacketSlot for XdpRxSlot<'_, '_, '_> {
         self.batch.io.ports[*port].config.interface
     }
 
+    fn resize_front(&mut self, delta: isize) -> bool {
+        let io = &mut *self.batch.io;
+        let (port, lease) = io.rx_outstanding.as_mut().expect("live RX slot");
+        io.ports[*port].engine.lease_resize_front(lease, delta)
+    }
+
     fn bytes_mut(&mut self) -> &mut [u8] {
         let io = &mut *self.batch.io;
         let (port, lease) = io.rx_outstanding.as_ref().expect("live RX slot");
