@@ -672,3 +672,30 @@ fn an_expiring_packet_gets_an_icmp_time_exceeded_back() {
     assert!(bench.fe.io_mut().pop_tx().is_none());
     assert_eq!(bench.fe.counters().icmp_errors_sent, 1);
 }
+
+#[test]
+fn an_expiring_ipv6_packet_gets_an_icmpv6_time_exceeded_back() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "lan".into(),
+                address: ip6("2001:db8:1::10"),
+            },
+            Value::Neighbor { mac: HOST_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut expiring = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+    expiring[14 + 7] = 1;
+    bench.fe.io_mut().inject(IfId(0), expiring);
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("an error goes back");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!(tx.bytes[54], 3, "Time Exceeded");
+    assert_eq!(bench.fe.counters().icmp_errors_sent, 1);
+}

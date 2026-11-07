@@ -17,8 +17,16 @@
 //!   group go to the control side unchanged; neighd checks the rest of RFC 4861.
 //! - RFC 2464 section 7: IPv6 multicast is sent to 33:33 Ethernet addresses.
 //!
-//! Deviations: no ICMPv6 errors yet (Time Exceeded, Packet Too Big, Destination
-//! Unreachable of RFC 4443 are silent drops), no extension headers before an ND
+//! - RFC 4443 section 3: Destination Unreachable (no route), Packet Too Big (with the
+//!   egress MTU) and Time Exceeded (Hop Limit), built into a [`ControlQueue`] made
+//!   [`with_icmpv6_errors`](ControlQueue::with_icmpv6_errors). Section 2.4: no error
+//!   about an ICMPv6 error, about multicast (except Packet Too Big), or to a source
+//!   that is not one host; at most 1280 bytes; a token bucket limits the rate (a
+//!   burst of 10, then one per 10 ms); the source is a global address of the router,
+//!   one on the interface toward the source when there is one.
+//!
+//! Deviations: no Destination Unreachable for an unresolvable neighbor (address
+//! unreachable) or for traffic to the router, no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
 //! to the kernel. Routes are searched linearly, longest prefix first.
 
@@ -30,6 +38,11 @@ pub const IPV6_ETHERTYPE: u16 = 0x86dd;
 const ETHERNET_HEADER: usize = 14;
 const IPV6_HEADER: usize = 40;
 const ICMPV6: u8 = 58;
+const DESTINATION_UNREACHABLE: u8 = 1;
+const PACKET_TOO_BIG: u8 = 2;
+const TIME_EXCEEDED: u8 = 3;
+/// The largest ICMPv6 error, so that it fits the IPv6 minimum MTU (RFC 4443 2.4 (c)).
+const ERROR_MAX: usize = 1_280;
 /// The largest frame a [`ControlQueue`] slot holds: Ethernet with a 1500-byte payload.
 pub const CONTROL_FRAME_MAX: usize = ETHERNET_HEADER + 1_500;
 
@@ -172,11 +185,46 @@ fn is_unspecified_or_loopback(address: [u8; 16]) -> bool {
 pub struct ControlQueue {
     slots: Box<[ControlFrame]>,
     len: usize,
+    /// ICMPv6 errors built in the last batch, ready to send.
+    errors: Box<[ControlFrame]>,
+    errors_len: usize,
+    limiter: ErrorLimiter,
 }
 
-/// One frame for the control side.
+/// A token bucket for ICMPv6 errors (RFC 4443 section 2.4 (f)): a burst of
+/// [`ERROR_BURST`], refilled at one error per [`ERROR_INTERVAL_MS`].
+#[derive(Clone, Copy, Debug)]
+struct ErrorLimiter {
+    tokens: u32,
+    refilled_at: u64,
+    now: u64,
+}
+
+/// Errors that may be sent at once.
+pub const ERROR_BURST: u32 = 10;
+/// One more error may be sent after this many milliseconds.
+pub const ERROR_INTERVAL_MS: u64 = 10;
+
+impl ErrorLimiter {
+    fn take(&mut self) -> bool {
+        let earned = self.now.saturating_sub(self.refilled_at) / ERROR_INTERVAL_MS;
+        if earned > 0 {
+            let earned = u32::try_from(earned).unwrap_or(u32::MAX);
+            self.tokens = self.tokens.saturating_add(earned).min(ERROR_BURST);
+            self.refilled_at = self.now;
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
+/// One frame for the control side, or one ICMPv6 error to send.
 #[derive(Clone, Debug)]
 pub struct ControlFrame {
+    /// The interface the frame came in on; for an error, the one to send it out of.
     pub ingress: IfId,
     bytes: Box<[u8; CONTROL_FRAME_MAX]>,
     len: usize,
@@ -197,9 +245,38 @@ impl ControlQueue {
             len: 0,
         };
         Self {
-            slots: vec![slot; capacity].into(),
+            slots: vec![slot.clone(); capacity].into(),
             len: 0,
+            errors: Box::new([]),
+            errors_len: 0,
+            limiter: ErrorLimiter {
+                tokens: ERROR_BURST,
+                refilled_at: 0,
+                now: 0,
+            },
         }
+    }
+
+    /// Also builds up to `capacity` ICMPv6 errors per batch.
+    #[must_use]
+    pub fn with_icmpv6_errors(mut self, capacity: usize) -> Self {
+        let slot = ControlFrame {
+            ingress: IfId(0),
+            bytes: Box::new([0; CONTROL_FRAME_MAX]),
+            len: 0,
+        };
+        self.errors = vec![slot; capacity].into();
+        self
+    }
+
+    /// The time the error limiter counts by; call before each batch.
+    pub fn set_clock(&mut self, now: crate::MonotonicMillis) {
+        self.limiter.now = now.0;
+    }
+
+    /// The ICMPv6 errors built since the last [`ControlQueue::clear`].
+    pub fn errors(&self) -> &[ControlFrame] {
+        &self.errors[..self.errors_len]
     }
 
     fn push(&mut self, ingress: IfId, frame: &[u8]) -> bool {
@@ -223,6 +300,37 @@ impl ControlQueue {
 
     pub fn clear(&mut self) {
         self.len = 0;
+        self.errors_len = 0;
+    }
+
+    /// Builds an ICMPv6 error about `invoking` toward its source, if RFC 4443 allows
+    /// one, there is room and the limiter has a token.
+    fn error(
+        &mut self,
+        invoking: &[u8],
+        snapshot: &crate::ForwardingSnapshot<'_>,
+        fib: &Ipv6Fib,
+        (kind, code, parameter): (u8, u8, u32),
+    ) {
+        if self.errors_len >= self.errors.len() {
+            return;
+        }
+        let Some((egress, frame_len)) = build_error(
+            &mut self.errors[self.errors_len].bytes,
+            invoking,
+            snapshot,
+            fib,
+            (kind, code, parameter),
+        ) else {
+            return;
+        };
+        if !self.limiter.take() {
+            return;
+        }
+        let slot = &mut self.errors[self.errors_len];
+        slot.ingress = egress;
+        slot.len = frame_len;
+        self.errors_len += 1;
     }
 }
 
@@ -232,6 +340,8 @@ pub(crate) enum Outcome {
     /// Rewritten in place; send it out of the interface.
     Transmit(IfId),
     Drop(crate::DropReason),
+    /// Dropped, and worth an ICMPv6 error (RFC 4443) of this type, code and parameter.
+    Error(crate::DropReason, u8, u8, u32),
     /// Copy it to the control side and consume it.
     Control,
 }
@@ -302,16 +412,16 @@ pub(crate) fn decide<T: TraceSink>(
         return Outcome::Drop(Ipv6SourceInvalid);
     }
     if hop_limit <= 1 {
-        return Outcome::Drop(Ipv6HopLimitExpired);
+        return Outcome::Error(Ipv6HopLimitExpired, TIME_EXCEEDED, 0, 0);
     }
     let Some(route) = fib.route(destination) else {
-        return Outcome::Drop(RouteMiss);
+        return Outcome::Error(RouteMiss, DESTINATION_UNREACHABLE, 0, 0);
     };
     let Some(egress) = snapshot.interface(route.egress) else {
         return Outcome::Drop(InterfaceMiss);
     };
     if IPV6_HEADER + payload_len > usize::from(egress.mtu) {
-        return Outcome::Drop(Ipv6PacketTooBig);
+        return Outcome::Error(Ipv6PacketTooBig, PACKET_TOO_BIG, 0, u32::from(egress.mtu));
     }
     let next_hop = route.next_hop.unwrap_or(destination);
     let Some(mac) = fib.neighbor(egress.id, next_hop) else {
@@ -347,6 +457,14 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
             trace.record(TraceEvent::Dropped { ingress, reason });
             Completed::Dropped
         }
+        Outcome::Error(reason, kind, code, parameter) => {
+            if let Some(queue) = control {
+                queue.error(packet.bytes_mut(), snapshot, fib, (kind, code, parameter));
+            }
+            packet.recycle(reason);
+            trace.record(TraceEvent::Dropped { ingress, reason });
+            Completed::Dropped
+        }
         Outcome::Control => {
             let queued = control.is_some_and(|queue| queue.push(ingress, packet.bytes_mut()));
             if queued {
@@ -367,4 +485,82 @@ pub(crate) enum Completed {
     Transmitted,
     Dropped,
     Consumed,
+}
+
+/// The ICMPv6 checksum of `icmp` between `source` and `destination` (RFC 4443 2.3).
+fn icmpv6_checksum(source: [u8; 16], destination: [u8; 16], icmp: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut add = |bytes: &[u8]| {
+        for pair in bytes.chunks(2) {
+            sum += u32::from(u16::from_be_bytes([pair[0], *pair.get(1).unwrap_or(&0)]));
+        }
+    };
+    add(&source);
+    add(&destination);
+    add(&u32::try_from(icmp.len()).unwrap_or(0).to_be_bytes());
+    add(&[0, 0, 0, ICMPV6]);
+    add(icmp);
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Writes into `out` the Ethernet frame of an ICMPv6 error about `invoking` and returns
+/// the interface to send it out of and its length. `None` when RFC 4443 section 2.4 (e)
+/// forbids one, or there is no route, neighbor or router address to send it with.
+fn build_error(
+    out: &mut [u8; CONTROL_FRAME_MAX],
+    invoking: &[u8],
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    fib: &Ipv6Fib,
+    (kind, code, parameter): (u8, u8, u32),
+) -> Option<(IfId, usize)> {
+    let ip = ETHERNET_HEADER;
+    let source = address(invoking, ip + 8);
+    let destination = address(invoking, ip + 24);
+    // (e.1) no error about an ICMPv6 error; (e.2, e.3) none about multicast, except
+    // Packet Too Big; (e.5) none to a source that is not one host.
+    let is_error =
+        invoking[ip + 6] == ICMPV6 && invoking.get(ip + IPV6_HEADER).is_some_and(|&t| t < 128);
+    let multicast = is_multicast(destination) || invoking[0] & 1 != 0;
+    if is_error
+        || (multicast && kind != PACKET_TOO_BIG)
+        || is_multicast(source)
+        || is_unspecified_or_loopback(source)
+    {
+        return None;
+    }
+    let route = fib.route(source)?;
+    let egress = snapshot.interface(route.egress)?;
+    let mac = fib.neighbor(egress.id, route.next_hop.unwrap_or(source))?;
+    // An address of the router: on the egress interface if it has a global one.
+    let from = fib
+        .local
+        .iter()
+        .filter(|l| !is_link_local(l.address))
+        .min_by_key(|l| l.interface != egress.id)?
+        .address;
+    let limit = ERROR_MAX.min(usize::from(egress.mtu));
+    let quoted = (invoking.len() - ip).min(limit - IPV6_HEADER - 8);
+    let icmp_len = 8 + quoted;
+    let frame_len = ip + IPV6_HEADER + icmp_len;
+    out[0..6].copy_from_slice(&mac.0);
+    out[6..12].copy_from_slice(&egress.mac.0);
+    out[12..14].copy_from_slice(&IPV6_ETHERTYPE.to_be_bytes());
+    out[ip..ip + 4].copy_from_slice(&[0x60, 0, 0, 0]);
+    out[ip + 4..ip + 6].copy_from_slice(&u16::try_from(icmp_len).ok()?.to_be_bytes());
+    out[ip + 6] = ICMPV6;
+    out[ip + 7] = 64;
+    out[ip + 8..ip + 24].copy_from_slice(&from);
+    out[ip + 24..ip + 40].copy_from_slice(&source);
+    let icmp = ip + IPV6_HEADER;
+    out[icmp] = kind;
+    out[icmp + 1] = code;
+    out[icmp + 2..icmp + 4].copy_from_slice(&[0, 0]);
+    out[icmp + 4..icmp + 8].copy_from_slice(&parameter.to_be_bytes());
+    out[icmp + 8..icmp + 8 + quoted].copy_from_slice(&invoking[ip..ip + quoted]);
+    let sum = icmpv6_checksum(from, source, &out[icmp..frame_len]);
+    out[icmp + 2..icmp + 4].copy_from_slice(&sum.to_be_bytes());
+    Some((egress.id, frame_len))
 }

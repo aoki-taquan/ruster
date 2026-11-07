@@ -388,3 +388,109 @@ fn routes_are_checked() {
     let route = Ipv6Route::new(ip("2001:db8::"), 32, LAN, None).unwrap();
     assert!(Ipv6Fib::new(vec![route, route], vec![], vec![]).is_err());
 }
+
+fn run_with_errors(io: &mut SimIo, fib: &Ipv6Fib, queue: &mut ControlQueue, now: u64) {
+    queue.clear();
+    queue.set_clock(ruster_core::MonotonicMillis(now));
+    run(io, fib, queue);
+}
+
+fn icmpv6_checksum_ok(frame: &[u8]) -> bool {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&frame[22..54]);
+    let len = frame.len() - 54;
+    bytes.extend_from_slice(&u32::try_from(len).unwrap().to_be_bytes());
+    bytes.extend_from_slice(&[0, 0, 0, 58]);
+    bytes.extend_from_slice(&frame[54..]);
+    if bytes.len() % 2 == 1 {
+        bytes.push(0);
+    }
+    let mut sum: u32 = bytes
+        .chunks(2)
+        .map(|p| u32::from(u16::from_be_bytes([p[0], p[1]])))
+        .sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum == 0xffff
+}
+
+#[test]
+fn icmpv6_errors_go_back_to_the_source() {
+    let fib = fib(true);
+    let mut queue = ControlQueue::new(4).with_icmpv6_errors(4);
+    let mut io = SimIo::new();
+    let expiring = udp_out(1, "2001:db8:99::7");
+    io.inject(LAN, expiring.clone());
+    run_with_errors(&mut io, &fib, &mut queue, 0);
+    assert!(io.pop_tx().is_none(), "the packet itself is not sent");
+    let errors = queue.errors();
+    assert_eq!(errors.len(), 1);
+    let error = errors[0].bytes();
+    assert_eq!(errors[0].ingress, LAN, "out toward the source");
+    assert_eq!(&error[0..6], &HOST_MAC);
+    assert_eq!(&error[6..12], &LAN_MAC);
+    assert_eq!(
+        &error[22..38],
+        &ip("2001:db8:1::1"),
+        "from the router's LAN address"
+    );
+    assert_eq!(&error[38..54], &ip("2001:db8:1::10"));
+    assert_eq!(error[20], 58);
+    assert_eq!((error[54], error[55]), (3, 0), "Time Exceeded, hop limit");
+    assert_eq!(&error[62..], &expiring[14..], "the invoking packet");
+    assert!(icmpv6_checksum_ok(error));
+
+    // Packet Too Big says the egress MTU.
+    io.inject(
+        LAN,
+        ipv6(
+            LAN_MAC,
+            HOST_MAC,
+            "2001:db8:1::10",
+            "2001:db8:99::7",
+            17,
+            64,
+            &[0; 1300],
+        ),
+    );
+    run_with_errors(&mut io, &fib, &mut queue, 1_000);
+    let error = queue.errors()[0].bytes();
+    assert_eq!(error[54], 2);
+    assert_eq!(&error[58..62], &1280_u32.to_be_bytes());
+    assert!(error.len() <= 14 + 1280, "within the minimum MTU");
+    assert!(icmpv6_checksum_ok(error));
+}
+
+#[test]
+fn no_icmpv6_error_about_an_error_and_the_rate_is_limited() {
+    let fib = fib(true);
+    let mut queue = ControlQueue::new(4).with_icmpv6_errors(32);
+    let mut io = SimIo::new();
+    // An ICMPv6 error (type 1) that cannot be forwarded gets no error back.
+    io.inject(
+        LAN,
+        ipv6(
+            LAN_MAC,
+            HOST_MAC,
+            "2001:db8:1::10",
+            "2001:db8:99::7",
+            58,
+            1,
+            &[1, 0, 0, 0, 0, 0, 0, 0],
+        ),
+    );
+    run_with_errors(&mut io, &fib, &mut queue, 0);
+    assert!(queue.errors().is_empty());
+
+    // A burst of 20 expiring packets: 10 errors, then one more 10 ms later.
+    for _ in 0..20 {
+        io.inject(LAN, udp_out(1, "2001:db8:99::7"));
+    }
+    run_with_errors(&mut io, &fib, &mut queue, 1_000);
+    assert_eq!(queue.errors().len(), 10);
+    io.inject(LAN, udp_out(1, "2001:db8:99::7"));
+    io.inject(LAN, udp_out(1, "2001:db8:99::7"));
+    run_with_errors(&mut io, &fib, &mut queue, 1_010);
+    assert_eq!(queue.errors().len(), 1);
+}
