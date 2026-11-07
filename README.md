@@ -56,7 +56,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 `ruster-core`には、見直し前の作りのARPの処理がまだ残っています（neighdへ移した後に消す）。
 default VRFの転送のfirewallは、設定ファイルの規則でFEが使います。IPv4だけで、規則があるあいだdefault VRFを通るIPv6は転送しません。
 default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFEが使います。
-フラグメントの処理はcoreにあり、表としてFEにつなぐのはこれからです。
+FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don't Fragmentが無いもの）、NATはフラグメントになったdatagramも変換します。
 
 ## 動かす
 

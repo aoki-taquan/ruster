@@ -1149,3 +1149,127 @@ fn with_nat_the_router_s_own_ports_on_the_wan_address_still_reach_the_kernel() {
     bench.fe.step(bench.now);
     assert!(kernel.recv(&mut buf).is_err(), "NAT's");
 }
+
+/// A UDP datagram from the LAN host to `INTERNET` with `payload` bytes, with or
+/// without Don't Fragment.
+fn udp_datagram(payload: usize, df: bool) -> Vec<u8> {
+    let mut frame = udp_from_host(INTERNET);
+    frame.truncate(42);
+    frame.resize(42 + payload, 0xab);
+    let total = u16::try_from(28 + payload).unwrap();
+    frame[16..18].copy_from_slice(&total.to_be_bytes());
+    frame[20..22].copy_from_slice(&(if df { 0x4000_u16 } else { 0 }).to_be_bytes());
+    frame[38..40].copy_from_slice(&u16::try_from(8 + payload).unwrap().to_be_bytes());
+    frame[40..42].fill(0);
+    frame[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&frame[14..34]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+/// The IPv4 fragment of `datagram` holding its IP payload bytes `start..end`.
+fn fragment_of(datagram: &[u8], start: usize, end: usize, more: bool) -> Vec<u8> {
+    let mut frame = datagram[..34].to_vec();
+    frame.extend_from_slice(&datagram[34 + start..34 + end]);
+    frame[16..18].copy_from_slice(&u16::try_from(20 + end - start).unwrap().to_be_bytes());
+    let flags = u16::try_from(start / 8).unwrap() | if more { 0x2000 } else { 0 };
+    frame[20..22].copy_from_slice(&flags.to_be_bytes());
+    frame[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&frame[14..34]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+#[test]
+fn a_datagram_longer_than_the_egress_mtu_is_fragmented() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    let mut wan = iface("wan", WAN_MAC);
+    if let Some(Value::Interface { mtu, .. }) = &mut wan.value {
+        *mtu = 1_000;
+    }
+    assert_eq!(bench.patch(&mut config, &[wan]), Code::CHANGED);
+
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_datagram(1_400, false));
+    bench.fe.step(bench.now);
+    let mut sent = Vec::new();
+    while let Some(tx) = bench.fe.io_mut().pop_tx() {
+        assert_eq!(tx.egress, IfId(1));
+        assert!(tx.bytes.len() - 14 <= 1_000);
+        sent.push(u16::from_be_bytes([tx.bytes[20], tx.bytes[21]]));
+    }
+    assert_eq!(sent.len(), 2, "{sent:x?}");
+    assert_eq!(sent[0] & 0x2000, 0x2000, "more fragments");
+    assert_eq!(sent[1] & 0x2000, 0);
+    assert_eq!(bench.fe.counters().fragments_sent, 2);
+
+    // Don't Fragment: nothing goes out on the WAN.
+    bench.fe.io_mut().inject(IfId(0), udp_datagram(1_400, true));
+    bench.fe.step(bench.now);
+    while let Some(tx) = bench.fe.io_mut().pop_tx() {
+        assert_eq!(tx.egress, IfId(0), "only an error back to the host");
+    }
+}
+
+#[test]
+fn nat_translates_every_fragment_of_a_datagram() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+
+    let datagram = udp_datagram(64, false);
+    for frame in [
+        fragment_of(&datagram, 0, 40, true),
+        fragment_of(&datagram, 40, 72, false),
+    ] {
+        bench.fe.io_mut().inject(IfId(0), frame);
+    }
+    bench.fe.step(bench.now);
+    let mut sent = 0;
+    while let Some(tx) = bench.fe.io_mut().pop_tx() {
+        assert_eq!(tx.egress, IfId(1));
+        assert_eq!(&tx.bytes[26..30], &[198, 51, 100, 2], "translated");
+        sent += 1;
+    }
+    assert_eq!(sent, 2);
+}
+
+#[test]
+fn a_table_change_between_fragments_drops_the_later_ones() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let datagram = udp_datagram(64, false);
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), fragment_of(&datagram, 0, 40, true));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_some(), "the first fragment");
+    let code = bench.patch(
+        &mut routes,
+        &[route([10, 0, 0, 0], 8, "wan", Some(GATEWAY))],
+    );
+    assert_eq!(code, Code::CHANGED);
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), fragment_of(&datagram, 40, 72, false));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "no stale rewrite");
+}
