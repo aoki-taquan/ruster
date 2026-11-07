@@ -47,6 +47,7 @@ mod firewall;
 mod fragments;
 mod local;
 mod nat;
+mod wireguard;
 
 pub use local::LocalPipe;
 
@@ -54,7 +55,15 @@ pub use local::LocalPipe;
 pub mod writers {
     use ruster_proto::sid;
 
-    pub const CONFIG: &[u64] = &[sid::INTERFACE, sid::ADDRESS, sid::NAT, sid::FIREWALL_RULE];
+    pub const CONFIG: &[u64] = &[
+        sid::INTERFACE,
+        sid::ADDRESS,
+        sid::NAT,
+        sid::FIREWALL_RULE,
+        sid::WIREGUARD,
+        sid::WIREGUARD_PEER,
+        sid::WIREGUARD_SESSION,
+    ];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
     pub const READ_ONLY: &[u64] = &[];
@@ -107,6 +116,9 @@ pub struct FeCounters {
     /// fragments could not be sent.
     pub fragments_sent: u64,
     pub fragmentation_dropped: u64,
+    /// WireGuard packets sealed and sent, and sealed ones that could not be sent.
+    pub wireguard_sent: u64,
+    pub wireguard_send_dropped: u64,
 }
 
 pub struct Fe<B> {
@@ -123,6 +135,7 @@ pub struct Fe<B> {
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
     pppoe: Vec<ruster_core::PppoeSession>,
+    wireguard: wireguard::Wireguard,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
     limiter: local::Limiter,
@@ -181,6 +194,11 @@ where
             vlans: built.vlans,
             tunnels: built.tunnels,
             pppoe: built.pppoe,
+            wireguard: {
+                let mut wireguard = wireguard::Wireguard::new();
+                wireguard.publish(built.wireguard);
+                wireguard
+            },
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
             active: built.active,
@@ -249,6 +267,11 @@ where
 
     fn worker(&mut self, now_ms: u64) -> bool {
         let mut trace = FeTrace::default();
+        // Core's views of the WireGuard interfaces: made for each batch, and only
+        // when there is one.
+        let wireguard_on = !self.wireguard.is_empty();
+        let wg_peers = wireguard::peer_configs(&self.wireguard.config);
+        let wg_views = wireguard::interfaces(&self.wireguard.config, &wg_peers);
         // One snapshot per VRF; each packet uses its ingress interface's.
         let snapshots: Vec<_> = self
             .vrfs
@@ -263,6 +286,7 @@ where
                     .with_vlans(&self.vlans)
                     .with_tunnels(&self.tunnels)
                     .with_pppoe(&self.pppoe)
+                    .with_wireguard(&wg_views)
             })
             .collect();
         let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
@@ -274,6 +298,7 @@ where
             .with_vlans(&self.vlans)
             .with_tunnels(&self.tunnels)
             .with_pppoe(&self.pppoe)
+            .with_wireguard(&wg_views)
             .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
             return false;
@@ -288,6 +313,8 @@ where
                 .map(|(config, runtime)| (&*config, &mut **runtime)),
             fragmentation: Some(&mut self.fragmentation),
             fragment_tracking: Some(&mut self.fragment_tracking),
+            wireguard: wireguard_on.then_some(&mut self.wireguard.states[..]),
+            wireguard_send: wireguard_on.then_some(&mut self.wireguard.send),
             ..Services::default()
         };
         if let Some(nat) = self.nat.as_mut() {
@@ -318,6 +345,18 @@ where
                 break;
             }
             self.counters.icmp_errors_sent += 1;
+        }
+        let mut wireguard_budget = wireguard::FRAMES_PER_BATCH;
+        while let Some(report) = ruster_core::wireguard::execute_one_wireguard_send(
+            &mut self.io,
+            &mut self.wireguard.send,
+            &mut wireguard_budget,
+        ) {
+            if report.sent {
+                self.counters.wireguard_sent += 1;
+            } else {
+                self.counters.wireguard_send_dropped += 1;
+            }
         }
         let mut budget = fragments::FRAMES_PER_BATCH;
         while let Some(report) =
@@ -670,6 +709,7 @@ where
             self.vlans = built.vlans;
             self.tunnels = built.tunnels;
             self.pppoe = built.pppoe;
+            self.wireguard.publish(built.wireguard);
             self.active = built.active;
         }
         let worked = self.worker(now_ms);

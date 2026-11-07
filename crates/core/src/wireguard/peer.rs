@@ -86,6 +86,38 @@ impl PeerState {
         };
     }
 
+    /// Like [`Self::set_keys`], for keys that may be ones used before: the send
+    /// counter starts at `send_counter` (the next one the same send key has not used)
+    /// and the replay window is `replay` when given. A send key must never seal two
+    /// messages with the same counter.
+    pub fn set_keys_continuing(
+        &mut self,
+        keys: SessionKeys,
+        send_counter: u64,
+        replay: Option<ReplayWindow>,
+    ) {
+        *self = Self {
+            keys: Some(keys),
+            send_counter,
+            replay: replay.unwrap_or_default(),
+        };
+    }
+
+    /// The session in use.
+    pub fn keys(&self) -> Option<SessionKeys> {
+        self.keys
+    }
+
+    /// The counter the next sent message uses.
+    pub fn send_counter(&self) -> u64 {
+        self.send_counter
+    }
+
+    /// The counters received so far.
+    pub fn replay_window(&self) -> &ReplayWindow {
+        &self.replay
+    }
+
     /// Stops using the session (it expired).
     pub fn clear_keys(&mut self) {
         *self = Self::default();
@@ -641,6 +673,27 @@ mod tests {
             receive(&mut keepalive, &mut states, &p),
             Ok(Received::Keepalive { peer: 0 })
         );
+    }
+
+    #[test]
+    fn continuing_keeps_the_counter_and_the_window_it_is_given() {
+        let mut earlier = PeerState::default();
+        earlier.set_keys(keys(1));
+        earlier.send_counter = 40;
+        assert!(earlier.replay.accept(9));
+        let mut state = PeerState::default();
+        state.set_keys_continuing(
+            keys(2),
+            earlier.send_counter(),
+            Some(earlier.replay_window().clone()),
+        );
+        assert_eq!(state.send_counter(), 40);
+        assert_eq!(state.keys(), Some(keys(2)));
+        assert!(!state.replay.accept(9), "a counter seen is still refused");
+        assert!(state.replay.accept(10));
+        // Without a window, a new one.
+        state.set_keys_continuing(keys(3), 5, None);
+        assert!(state.replay.accept(9));
     }
 
     #[test]
