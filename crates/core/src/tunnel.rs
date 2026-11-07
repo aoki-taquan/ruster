@@ -25,6 +25,10 @@
 //! - No tunnel encapsulation limit option (RFC 2473 4.1.1) and no ICMPv6 errors
 //!   from the tunnel path are relayed as ICMPv4 errors (RFC 2473 8).
 //! - The outer packets are always routed in the default VRF.
+//! - A tunnel's packets are unwrapped only when they arrive on the interface the
+//!   default VRF routes the remote end through (a strict reverse-path check), so
+//!   with two uplinks and asymmetric routing, those arriving on the other one are
+//!   dropped.
 
 use crate::{DropReason, IfId, PacketLease, PacketSlot, TraceEvent, TraceSink};
 
@@ -107,6 +111,16 @@ pub(crate) fn receive<S: PacketSlot>(
         return Ok(false);
     };
     let tunnel = *tunnel;
+    // Only from where the tunnel's remote end is: the interface the default VRF
+    // routes it through (a strict reverse-path check), so no other link or VRF can
+    // pass packets off as the remote end's.
+    let through = snapshot
+        .ipv6
+        .and_then(|fib| fib.next_hop(tunnel.remote))
+        .map(|(egress, _)| egress);
+    if through != Some(ingress) {
+        return Err(DropReason::TunnelWrongIngress);
+    }
     // Only a frame sent to the receiving interface itself.
     let interface = snapshot
         .interface(ingress)
@@ -135,6 +149,55 @@ pub(crate) fn receive<S: PacketSlot>(
     }
     packet.set_ingress(tunnel.interface);
     Ok(true)
+}
+
+/// Where a packet of the router itself (from the kernel) for the tunnel interface
+/// `egress` goes, and the IPv6 header to put before it; `None` when `egress` is no
+/// tunnel's. Cold path: the header is built for every such packet.
+pub(crate) fn origin(
+    outer: &crate::ForwardingSnapshot<'_>,
+    egress: IfId,
+    packet: &[u8],
+) -> Option<Result<crate::TunnelOrigin, crate::TunnelOriginError>> {
+    use crate::TunnelOriginError::{Dropped, TooBig};
+    let tunnel = of(outer.tunnels, egress)?;
+    Some((|| {
+        if packet.first().map(|b| b >> 4) != Some(4) {
+            return Err(Dropped(DropReason::TunnelInnerInvalid));
+        }
+        let mtu = outer
+            .interface(tunnel.interface)
+            .ok_or(Dropped(DropReason::InterfaceMiss))?
+            .mtu;
+        let fib = outer.ipv6.ok_or(Dropped(DropReason::TunnelNoRoute))?;
+        let (underlying, next_hop) = fib
+            .next_hop(tunnel.remote)
+            .ok_or(Dropped(DropReason::TunnelNoRoute))?;
+        let interface = outer
+            .interface(underlying)
+            .ok_or(Dropped(DropReason::InterfaceMiss))?;
+        let fits = mtu.min(interface.mtu.saturating_sub(IPV6_HEADER as u16));
+        if packet.len() > usize::from(fits) {
+            return Err(TooBig { mtu: fits });
+        }
+        let payload = u16::try_from(packet.len()).map_err(|_| TooBig { mtu: fits })?;
+        let tos = packet.get(1).copied().unwrap_or(0);
+        let mut header = [0_u8; IPV6_HEADER];
+        header[0] = 0x60 | (tos >> 4);
+        header[1] = tos << 4;
+        header[4..6].copy_from_slice(&payload.to_be_bytes());
+        header[6] = IPV4_IN_IP;
+        header[7] = HOP_LIMIT;
+        header[8..24].copy_from_slice(&tunnel.local);
+        header[24..40].copy_from_slice(&tunnel.remote);
+        Ok(crate::TunnelOrigin {
+            egress: underlying,
+            source_mac: interface.mac,
+            next_hop,
+            destination_mac: fib.neighbor(underlying, next_hop),
+            header,
+        })
+    })())
 }
 
 /// Wraps the forwarded IPv4 `packet` (already rewritten for `tunnel`'s interface)
