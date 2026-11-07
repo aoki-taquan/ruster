@@ -1417,6 +1417,22 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         true
     }
 
+    /// Drops the error at the front of the queue without sending it, for one the
+    /// caller cannot send (its egress is no port of the backend). Returns whether
+    /// there was one.
+    pub fn discard_front(&mut self) -> bool {
+        let Some(slot) = self.actions.get_mut(self.head) else {
+            return false;
+        };
+        if slot.0.take().is_none() {
+            return false;
+        }
+        self.head = (self.head + 1) % self.actions.len();
+        self.len -= 1;
+        self.counters.dequeued += 1;
+        true
+    }
+
     fn front(&self) -> Option<QueuedAction> {
         self.actions.get(self.head).and_then(|slot| slot.0)
     }

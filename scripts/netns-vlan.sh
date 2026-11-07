@@ -116,4 +116,7 @@ echo "ok: tags come off toward the uplink and go on toward a VLAN"
 nsx "$a" ping -c 3 -i 0.2 -W 1 -t 1 198.51.100.10 >/dev/null 2>&1 || true
 nsx "$a" ping -c 3 -i 0.2 -W 1 10.20.0.10 >/dev/null || fail "forwarding stopped after expiring packets"
 echo "ok: expiring packets from a VLAN do not stop forwarding"
+out=$(nsx "$c" ping -c 1 -W 1 -t 1 10.20.0.10 2>&1 || true)
+grep -qi "time to live exceeded" <<<"$out" || fail "no ICMP Time Exceeded on the uplink afterwards: $out"
+echo "ok: ICMP errors still go out of ports afterwards"
 echo "PASS ($backend)"

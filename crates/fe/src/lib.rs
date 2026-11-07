@@ -231,6 +231,7 @@ where
                     .with_arp_to_control(true)
                     .with_ipv6(&vrf.ipv6)
                     .with_local_to_control(self.local.contains_key(name))
+                    .with_vlans(&self.vlans)
             })
             .collect();
         let snapshot = snapshots[0]
@@ -262,6 +263,13 @@ where
             execute_one_icmpv4_error(&mut self.io, &mut self.icmpv4_errors, now, &mut NoTrace)
         {
             if report.allocation_error.is_some() || report.build_error.is_some() {
+                // One for an egress the backend does not have would stay at the front
+                // and block every later error: drop it. Others wait for the next batch.
+                let unknown = usize::from(report.action.egress.0) >= self.builder.ports.len();
+                if unknown {
+                    self.icmpv4_errors.discard_front();
+                    continue;
+                }
                 break;
             }
             self.counters.icmp_errors_sent += 1;
