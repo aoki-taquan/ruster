@@ -13,6 +13,9 @@
 //!
 //! Deviations:
 //!
+//! - No endpoint roaming (whitepaper 2.1): a message from an address or port that
+//!   is not the configured endpoint is dropped before it is opened, so a peer
+//!   whose NAT changes its port is not reached until the configuration changes.
 //! - Only IPv4 inside and outside for now.
 //! - The outer ECN field is always 0 (the inner one is not copied).
 //! - Outer packets with IPv4 options, or that are fragments, are not accepted.

@@ -7,6 +7,7 @@
 #   lan (192.168.0.10) -- [r-lan | router | r-wan 198.51.100.2] -- [a0 peer 198.51.100.1, 10.9.0.9]
 #
 # Run as root, after `cargo build`:  sudo scripts/netns-wireguard.sh [target/debug]
+# The peer needs python3's cryptography module.
 # FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
 set -euo pipefail
 backend=${FE_BACKEND:-af-xdp}
@@ -53,14 +54,19 @@ nsx "$peer" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
 nsx "$peer" ethtool -K a0 tx off >/dev/null
 nsx "$peer" ip link set a0 address 02:00:00:00:00:ac up
 nsx "$peer" ip addr add 198.51.100.1/24 dev a0
+# Strict reverse path: a packet for 10.9.0.9 that arrives on a0, not sealed through
+# wg0, is dropped instead of answered.
+nsx "$peer" sysctl -qw net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.a0.rp_filter=1
 
 send=0202020202020202020202020202020202020202020202020202020202020202   # the router receives with this
 receive=0101010101010101010101010101010101010101010101010101010101010101 # the router sends with this
-nsx "$peer" python3 "$here/wg-peer.py" 198.51.100.1 51821 198.51.100.2 51820 wg0 \
-  "$send" "$receive" 11 22 >"$work/peer.log" 2>&1 &
+# Started directly (not through nsx), so that the pid is python's and cleanup stops it.
+ip netns exec "$peer" python3 "$here/wg-peer.py" 198.51.100.1 51821 198.51.100.2 51820 wg0 \
+  "$send" "$receive" 11 22 1420 >"$work/peer.log" 2>&1 &
 pids+=("$!")
 for _ in $(seq 1 50); do grep -q ready "$work/peer.log" 2>/dev/null && break; sleep 0.1; done
-nsx "$peer" ip link set wg0 up
+grep -q ready "$work/peer.log" || fail "the peer did not start"
+nsx "$peer" ip link set wg0 mtu 1420 up
 nsx "$peer" ip addr add 10.9.0.9/32 dev wg0
 nsx "$peer" ip route add 192.168.0.0/24 dev wg0
 
@@ -108,11 +114,13 @@ for _ in $(seq 1 20); do
   if nsx "$lan" ping -c 1 -W 1 10.9.0.9 >/dev/null 2>&1; then ok=1; break; fi
 done
 (( ok == 1 )) || fail "the LAN does not reach the peer through the WireGuard interface"
-nsx "$lan" ping -c 5 -i 0.2 -W 1 -s 1000 10.9.0.9 >/dev/null || fail "1028-byte pings"
-nsx "$lan" ping -c 3 -i 0.2 -W 1 -s 1392 10.9.0.9 >/dev/null || fail "1420-byte pings"
+# With -w, ping fails unless every one of the -c pings is answered.
+nsx "$lan" ping -c 5 -i 0.2 -w 5 -s 1000 10.9.0.9 >/dev/null || fail "1028-byte pings"
+# 1420 bytes, the MTU: the peer sends it unpadded (1420 is no multiple of 16).
+nsx "$lan" ping -c 3 -i 0.2 -w 5 -s 1392 10.9.0.9 >/dev/null || fail "1420-byte pings"
 echo "ok: the LAN pings the peer through the WireGuard interface (up to its 1420-byte MTU)"
 
-nsx "$peer" python3 -c '
+ip netns exec "$peer" python3 -c '
 import socket
 s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 s.bind(("10.9.0.9", 8080)); s.listen(1); s.settimeout(10)
@@ -131,5 +139,7 @@ print(s.recv(100).decode())
 [[ "$seen" == 192.168.0.10 ]] || fail "the peer saw $seen"
 echo "ok: TCP through the WireGuard interface arrives from the LAN host"
 
-grep -q "bad tag" "$work/peer.log" && fail "the peer refused a packet the router sealed"
+grep -q "^drop" "$work/peer.log" && fail "the peer refused what the router sent"
+opened=$(grep -c "^opened" "$work/peer.log")
+(( opened >= 9 )) || fail "the peer opened only $opened messages"
 echo "PASS ($backend)"
