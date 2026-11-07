@@ -2802,10 +2802,15 @@ where
 /// Like [`forward_batch`], and copies the IPv6 Neighbor Discovery messages the
 /// snapshot's IPv6 tables send to the control side into `control`
 /// ([`ForwardingSnapshot::with_ipv6`]). The caller empties `control` between batches.
+///
+/// With `icmpv4_errors`, the eligible ICMPv4 errors (Time Exceeded, Destination
+/// Unreachable, Fragmentation Needed) are queued there; the caller sends them after
+/// this returns ([`crate::execute_one_icmpv4_error`]).
 pub fn forward_batch_with_control<B, T>(
     batch: B,
     snapshot: &ForwardingSnapshot<'_>,
     control: &mut crate::ControlQueue,
+    icmpv4_errors: Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -2816,7 +2821,7 @@ where
         batch,
         snapshot,
         None,
-        None,
+        icmpv4_errors,
         None,
         None,
         None,

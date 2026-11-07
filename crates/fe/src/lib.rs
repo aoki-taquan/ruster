@@ -29,10 +29,12 @@ use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
 
 use ruster_core::{
-    forward_batch_with_control, ArpOpcode, ControlQueue, GeneratedPacketBatch, GeneratedPacketIo,
-    IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route,
-    LocalIpv4Binding, MacAddress, Neighbor, PacketIo, Route, TraceEvent, TraceSink,
-    ValidatedForwardingOwner,
+    execute_one_icmpv4_error, forward_batch_with_control, ArpOpcode, ControlQueue,
+    GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink, GeneratedPacketBatch, GeneratedPacketIo,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
+    Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route,
+    LocalIpv4Binding, MacAddress, MonotonicMillis, Neighbor, PacketIo, Route, TraceEvent,
+    TraceSink, ValidatedForwardingOwner,
 };
 use ruster_proto::cbor::Encoder;
 use ruster_proto::punt::{self, Direction, Punt};
@@ -84,6 +86,8 @@ pub struct FeCounters {
     pub resolve_requests_dropped: u64,
     pub injected: u64,
     pub inject_dropped: u64,
+    /// ICMP errors generated (rate limited per egress interface).
+    pub icmp_errors_sent: u64,
 }
 
 pub struct Fe<B> {
@@ -100,6 +104,8 @@ pub struct Fe<B> {
     ipv6: Ipv6Fib,
     /// Neighbor Discovery frames core copied out of the last batch.
     control: ControlQueue,
+    /// ICMPv4 errors core queued in the last batch, and their rate limits.
+    icmpv4_errors: Icmpv4ErrorRuntime<'static>,
     counters: FeCounters,
 }
 
@@ -134,6 +140,7 @@ where
             last_resolve: BTreeMap::new(),
             ipv6: Ipv6Fib::default(),
             control: ControlQueue::new(EVENTS_PER_BATCH),
+            icmpv4_errors: icmpv4_error_runtime(),
             counters: FeCounters::default(),
         }
     }
@@ -186,7 +193,14 @@ where
             return false;
         };
         self.control.clear();
-        let report = forward_batch_with_control(batch, &snapshot, &mut self.control, &mut trace);
+        let now = MonotonicMillis(now_ms);
+        let report = forward_batch_with_control(
+            batch,
+            &snapshot,
+            &mut self.control,
+            Some((&mut self.icmpv4_errors, now)),
+            &mut trace,
+        );
         if report.received == 0 {
             return false;
         }
@@ -195,6 +209,11 @@ where
         self.counters.dropped += report.dropped as u64;
         self.counters.arp_to_control_dropped += trace.overflow;
 
+        while let Ok(Some(_)) =
+            execute_one_icmpv4_error(&mut self.io, &mut self.icmpv4_errors, now, &mut NoTrace)
+        {
+            self.counters.icmp_errors_sent += 1;
+        }
         for arp in &trace.arp {
             self.punt_arp(arp);
         }
@@ -357,6 +376,26 @@ where
         let flushed = self.server.step(&mut self.builder);
         control.and(flushed).and(Progress::busy(worked || injected))
     }
+}
+
+/// ICMPv4 error slots: limiter states and queued errors, enough for one batch.
+const ICMPV4_ERROR_SLOTS: usize = 64;
+
+/// The ICMPv4 error runtime with the default policy (RFC 1812 section 4.3.2.8 rate
+/// limits). Its slots are allocated once for the life of the process.
+fn icmpv4_error_runtime() -> Icmpv4ErrorRuntime<'static> {
+    let states =
+        Box::leak(vec![Icmpv4ErrorStateSlot::EMPTY; ICMPV4_ERROR_SLOTS].into_boxed_slice());
+    let actions =
+        Box::leak(vec![Icmpv4ErrorActionSlot::EMPTY; ICMPV4_ERROR_SLOTS].into_boxed_slice());
+    Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), states, actions)
+}
+
+/// Generated ICMPv4 frames are counted, not traced.
+struct NoTrace;
+
+impl GeneratedIcmpv4TraceSink for NoTrace {
+    fn record_generated_icmpv4(&mut self, _event: GeneratedIcmpv4Trace) {}
 }
 
 /// The core's tables built from the store: IPv4 owner, enabled ports, IPv6 tables.

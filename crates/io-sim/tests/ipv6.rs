@@ -119,7 +119,7 @@ fn run(io: &mut SimIo, fib: &Ipv6Fib, queue: &mut ControlQueue) -> Recorder {
         .with_ipv6(fib);
     let mut trace = Recorder::default();
     let batch = io.receive(16).unwrap();
-    forward_batch_with_control(batch, &snapshot, queue, &mut trace);
+    forward_batch_with_control(batch, &snapshot, queue, None, &mut trace);
     trace
 }
 
@@ -371,7 +371,7 @@ fn without_ipv6_tables_ipv6_is_an_unsupported_ethernet_type() {
     let mut trace = Recorder::default();
     let mut queue = ControlQueue::new(1);
     let batch = io.receive(16).unwrap();
-    forward_batch_with_control(batch, &snapshot, &mut queue, &mut trace);
+    forward_batch_with_control(batch, &snapshot, &mut queue, None, &mut trace);
     assert_eq!(
         trace.0,
         [TraceEvent::Dropped {
