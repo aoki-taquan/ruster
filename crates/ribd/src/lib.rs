@@ -204,8 +204,15 @@ impl Ribd {
 
     /// resync-end deletes what the FE holds from ribd but was not sent again, so it
     /// goes only after the full send was accepted.
+    ///
+    /// `sent` is cleared at resync-begin and holds only what the FE accepted since, so
+    /// once it equals the selection the FE holds everything ribd wants.
     fn finish_resync(&mut self) -> bool {
-        if self.resync_pending && self.in_flight.is_none() && !self.dirty {
+        if self.resync_pending
+            && self.in_flight.is_none()
+            && !self.dirty
+            && self.sent == self.selected()
+        {
             self.fe.resync_end();
             self.resync_pending = false;
             return true;
@@ -264,8 +271,8 @@ impl Task for Ribd {
 
 impl Ribd {
     /// Handles the FE's answers. An accepted patch makes its routes what the FE holds;
-    /// a refused one leaves that unchanged and cancels a pending resync-end, so routes
-    /// the FE already has are not deleted because a new set was refused.
+    /// a refused one starts a resync, so routes the FE already has are kept until a
+    /// later full send is accepted. The refused routes go again with the next change.
     fn answers(&mut self, events: &[Event]) {
         for event in events {
             let Event::Response { token, code, .. } = event else {
@@ -278,7 +285,14 @@ impl Ribd {
             if self.in_flight.as_ref().is_some_and(|(t, _)| t == token) {
                 let (_, selected) = self.in_flight.take().expect("checked");
                 if refused {
-                    self.resync_pending = false;
+                    // What the FE holds from ribd is now unclear: start a resync, so
+                    // the next accepted full send is followed by resync-end. Routes
+                    // the FE holds stay until then.
+                    self.fe.resync_begin();
+                    self.sent.clear();
+                    if self.waiting_since.is_none() {
+                        self.resync_pending = true;
+                    }
                 } else {
                     self.sent = selected;
                 }

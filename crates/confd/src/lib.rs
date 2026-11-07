@@ -109,12 +109,12 @@ impl Peer {
         } else {
             // Unknown what the peer holds now: send everything with the next change
             // and remove the rest then.
+            // resync-begin again even if one is open: patches sent after the refused
+            // one may have been accepted, and this marks what they wrote as stale.
             self.in_flight.clear();
             self.sent.clear();
-            if !self.resync_open {
-                self.client.resync_begin();
-                self.resync_open = true;
-            }
+            self.client.resync_begin();
+            self.resync_open = true;
         }
     }
 }

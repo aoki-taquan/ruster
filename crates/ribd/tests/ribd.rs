@@ -209,13 +209,15 @@ fn a_refused_full_send_after_a_restart_does_not_delete_the_fe_routes() {
         .patch(&[
             route([0, 0, 0, 0], 0, "wan"),
             route([10, 0, 0, 0], 8, "lan"),
+            route([192, 168, 0, 0], 16, "old"),
         ])
         .unwrap();
     lab.sources[0].sync_done();
     lab.settle();
-    assert_eq!(lab.fe.store().len(), 2);
+    assert_eq!(lab.fe.store().len(), 3);
 
-    // The restarted ribd's source now also has a route the FE refuses.
+    // The restarted ribd's source no longer has the old route, and has one the FE
+    // refuses.
     lab.refuse = Some("bad");
     lab.restart(vec![spec("static", 1)]);
     lab.sources[0]
@@ -232,14 +234,52 @@ fn a_refused_full_send_after_a_restart_does_not_delete_the_fe_routes() {
     assert_eq!(lab.ribd.counters().patches_refused, 1);
     assert_eq!(lab.fe_route([0, 0, 0, 0], 0), Some(&via("wan")), "kept");
     assert_eq!(lab.fe_route([10, 0, 0, 0], 8), Some(&via("lan")), "kept");
+    assert!(
+        lab.fe_route([192, 168, 0, 0], 16).is_some(),
+        "kept until a full send is accepted"
+    );
 
     // Once the source drops the bad route, ribd sends again and finishes the resync.
     lab.sources[0]
         .patch(&[Change::delete(key([172, 16, 0, 0], 12))])
         .unwrap();
     lab.settle();
-    assert_eq!(lab.fe.store().len(), 2);
     assert_eq!(lab.fe_route([0, 0, 0, 0], 0), Some(&via("wan")));
+    assert_eq!(lab.fe_route([192, 168, 0, 0], 16), None, "the resync ended");
+    assert_eq!(lab.fe.store().len(), 2);
+}
+
+#[test]
+fn a_change_refused_in_steady_state_is_cleaned_up_by_the_next_one() {
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[
+            route([10, 0, 0, 0], 8, "lan"),
+            route([192, 168, 0, 0], 16, "lan"),
+        ])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+    // Refused: adds a bad route and removes 192.168/16.
+    lab.refuse = Some("bad");
+    lab.sources[0]
+        .patch(&[
+            route([172, 16, 0, 0], 12, "bad"),
+            Change::delete(key([192, 168, 0, 0], 16)),
+        ])
+        .unwrap();
+    lab.settle();
+    assert!(
+        lab.fe_route([192, 168, 0, 0], 16).is_some(),
+        "refused, so still there"
+    );
+    lab.refuse = None;
+    lab.sources[0]
+        .patch(&[Change::delete(key([172, 16, 0, 0], 12))])
+        .unwrap();
+    lab.settle();
+    assert_eq!(lab.fe_route([192, 168, 0, 0], 16), None);
+    assert_eq!(lab.fe.store().len(), 1);
 }
 
 #[test]

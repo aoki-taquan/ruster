@@ -120,3 +120,37 @@ fn a_refused_change_is_retried_with_the_next_one_and_leftovers_are_removed() {
         "the address removed in the refused change is gone too"
     );
 }
+
+#[test]
+fn what_is_accepted_after_a_refused_send_is_cleaned_up_later() {
+    let mut fe = Server::new();
+    let mut check = Check {
+        refuse_mtu: Some(1400),
+    };
+    // The full send is refused; before its answer, a change adds "wan" and is accepted.
+    let mut confd = Confd::new(config(1400));
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    confd.connect_fe(b).unwrap();
+    let mut with_wan = config(1500);
+    with_wan.interfaces.push(InterfaceConfig {
+        name: "wan".into(),
+        mac: [2, 0, 0, 0, 0, 2],
+        mtu: 1500,
+        enabled: true,
+        ipv4: None,
+    });
+    confd.set_config(with_wan);
+    settle(&mut fe, &mut confd, &mut check);
+    assert_eq!(confd.counters().patches_refused, 1);
+
+    // A later configuration without "wan" removes it.
+    confd.set_config(config(1500));
+    settle(&mut fe, &mut confd, &mut check);
+    assert_eq!(mtu(&fe), Some(1500));
+    assert!(fe
+        .store()
+        .get(&Key::Interface { name: "wan".into() })
+        .is_none());
+    assert_eq!(fe.store().len(), 2);
+}
