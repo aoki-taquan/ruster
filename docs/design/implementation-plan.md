@@ -35,9 +35,9 @@
 
 ### 段階0: 片付け（動作は変えない）
 
-1. READMEを200行以内に縮める。crateごとの詳細は消すか各crateへ移す。
-2. 古い計画の文書（`development-plan-v0.2.md`など）の先頭に「設計図に置き換わった」と書き、
-   進み具合の記述は`docs/status.md`の一か所にまとめる。
+1. READMEを200行以内に縮める（済み）。
+2. 見直し前の計画と運用の文書（`architecture-v0.2.md`、`development-plan-v0.2.md`、`runbook-m2.md`、
+   `release-evidence/`）を削除する（済み）。進み具合はこの文書の一か所に書く。
 3. `ruster-bench`のhardware benchmark一式を削除する（済み）。
 4. 要件ID台帳（`requirements-v0.2.md`、842 ID）と`check-requirements.sh`を削除する（済み）。試験の名前と設計図で足りるようにする。
 

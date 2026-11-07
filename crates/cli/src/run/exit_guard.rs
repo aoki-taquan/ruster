@@ -48,7 +48,7 @@
 //! A startup that fails or is cancelled never arms them: the ports keep
 //! the operator's state. A process killed outright (`SIGKILL`, a syscall
 //! the filter kills, the OOM killer) runs nothing; a supervisor's
-//! post-stop hook covers that (`docs/runbook-m2.md`).
+//! post-stop hook covers that.
 //!
 //! # Failure
 //!
