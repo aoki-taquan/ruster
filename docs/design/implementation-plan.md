@@ -99,7 +99,7 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 | 2-1 | 相手が落ちたときのつなぎ直し。CEの実行ファイルを再起動しても転送が止まらないことをnetnsで確かめる |
 | 2-2 | （外した。CIに足すかは、プロジェクトが成熟してからownerが決める） |
 | 2-3 | FEの実行ファイルをAF_XDPでも動かす。起動、権限、seccompなど`ruster run`の運用の部品をFEへ移す |
-| 2-4 | `ruster-core`からARPの処理を消す。`forward_batch_with_*`の入口を一つにまとめる |
+| 2-4 | （4-2へ移した: coreのNATとfirewallの入口はどれもARPの解決を必須にしていて、試験の大半がそれを使う。入口を一つにまとめるときに一緒に消す） |
 | 2-5 | 見直し前の`ruster`コマンド（`run`、`run-sim`、SIGHUPの再読み込み）と、それだけが使うcrateを消す。NAT、firewall、フラグメントの処理はcoreに残す |
 
 ### 段階3: 土台
@@ -122,7 +122,7 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 | 番号 | 作業 |
 |---|---|
 | 4-1 | VLAN（サブインターフェース） |
-| 4-2 | NAT44と状態を持つfirewall（今の処理を`ietf-nat`、`ietf-access-control-list`の形の表でつなぐ）、フラグメント処理 |
+| 4-2 | NAT44と状態を持つfirewall（今の処理を`ietf-nat`、`ietf-access-control-list`の形の表でつなぐ）、フラグメント処理。`forward_batch_with_*`の入口を一つにまとめ、`ruster-core`からARPの処理を消す |
 | 4-3 | DS-Lite（RFC 6333のB4） |
 | 4-4 | MAP-E（RFC 7597）と、ポートの範囲を使うNAPT |
 | 4-5 | PPPoEのカプセル化（RFC 2516）。セッションの確立は外のデーモン |
