@@ -29,6 +29,7 @@ fn local_tables() -> Vec<Change> {
                 enabled: true,
                 mac,
                 mtu: 1500,
+                vrf: ruster_proto::table::DEFAULT_VRF.into(),
             },
         )
     };

@@ -38,6 +38,7 @@ fn iface(name: &str, last: u8) -> Change {
             enabled: true,
             mac: [2, 0, 0, 0, 0, last],
             mtu: 1500,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
         },
     )
 }

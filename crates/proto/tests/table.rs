@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use ruster_proto::cbor::{Decoder, Encoder};
 use ruster_proto::sid;
 use ruster_proto::table::{
-    format_mac, parse_mac, Change, Key, ModelError, NextHop, RouteAction, Value,
+    format_mac, parse_mac, Change, Key, ModelError, NextHop, RouteAction, Value, DEFAULT_VRF,
 };
 
 fn round_trip(change: &Change) -> Change {
@@ -36,6 +36,7 @@ fn every_table_round_trips() {
                 enabled: true,
                 mac: [2, 0, 0, 0, 0, 1],
                 mtu: 1500,
+                vrf: ruster_proto::table::DEFAULT_VRF.into(),
             },
         ),
         Change::set(
@@ -315,6 +316,7 @@ fn encode_refuses_what_decode_would_refuse() {
                 enabled: true,
                 mac: [2, 0, 0, 0, 0, 1],
                 mtu: 0,
+                vrf: ruster_proto::table::DEFAULT_VRF.into(),
             },
         ),
         Change::set(
@@ -490,4 +492,58 @@ fn an_address_not_in_its_canonical_text_is_refused() {
             "{spelling}"
         );
     }
+}
+
+#[test]
+fn vrf_binding_and_lookup_vrf_round_trip() {
+    let changes = [
+        Change::set(
+            Key::Interface {
+                name: "cust0".into(),
+            },
+            Value::Interface {
+                enabled: true,
+                mac: [2, 0, 0, 0, 0, 9],
+                mtu: 1500,
+                vrf: "customer".into(),
+            },
+        ),
+        Change::set(
+            Key::Route {
+                vrf: "customer".into(),
+                prefix: ip([0, 0, 0, 0]),
+                len: 0,
+            },
+            Value::Route(RouteAction::LookupVrf("default".into())),
+        ),
+    ];
+    for change in &changes {
+        assert_eq!(&round_trip(change), change);
+    }
+    // The default VRF is left out on the wire and read back as "default".
+    let default = Change::set(
+        Key::Interface { name: "lan".into() },
+        Value::Interface {
+            enabled: true,
+            mac: [2, 0, 0, 0, 0, 1],
+            mtu: 1500,
+            vrf: DEFAULT_VRF.into(),
+        },
+    );
+    let mut payload = Vec::new();
+    default.encode(&mut Encoder::new(&mut payload)).unwrap();
+    assert!(!payload
+        .windows(b"default".len())
+        .any(|window| window == b"default"));
+    assert_eq!(round_trip(&default), default);
+    // An empty VRF name is refused.
+    let empty = Change::set(
+        Key::Route {
+            vrf: "default".into(),
+            prefix: ip([0, 0, 0, 0]),
+            len: 0,
+        },
+        Value::Route(RouteAction::LookupVrf(String::new())),
+    );
+    assert!(empty.validate().is_err());
 }

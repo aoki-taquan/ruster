@@ -247,6 +247,7 @@ impl Confd {
                     enabled: interface.enabled,
                     mac: interface.mac,
                     mtu: interface.mtu,
+                    vrf: ruster_proto::table::DEFAULT_VRF.into(),
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);
