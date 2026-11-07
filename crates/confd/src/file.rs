@@ -8,15 +8,29 @@
 //! enabled = true               # optional, true when left out
 //! ipv4 = "192.0.2.1/24"        # optional
 //! ipv6 = ["2001:db8:1::1/64"]  # optional; a link-local address is added by itself
+//! vrf = "red"                  # optional, "default" when left out
 //!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
 //! interface = "wan"
 //! via = "198.51.100.1"         # optional; left out for an on-link route
+//! vrf = "default"              # optional; the interface may be in another VRF
+//!
+//! [[route]]                    # look the destination up again in another VRF
+//! vrf = "red"
+//! prefix = "0.0.0.0/0"
+//! lookup-vrf = "default"
 //! ```
+//!
+//! An address, and the prefix of an interface address, must be unique within a VRF;
+//! two VRFs may use the same ones. A static route for an interface's prefix replaces
+//! the connected route. A `lookup-vrf` must name a VRF that an interface or a route is
+//! in, and that VRF's own `lookup-vrf` routes are not followed, so they are refused.
 //!
 //! # Standards
 //!
+//! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
+//!   when not named.
 //! - RFC 791: the smallest MTU is 68.
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
 //!   must be usable unicast addresses (not 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4 or
@@ -25,12 +39,14 @@
 //!   unspecified, loopback or multicast. A link-local next hop is allowed: it is on
 //!   the route's interface.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Deserialize;
 
-use crate::{Config, InterfaceConfig, StaticRoute};
+use ruster_proto::table::DEFAULT_VRF;
+
+use crate::{Config, InterfaceConfig, RouteTarget, StaticRoute};
 
 /// The smallest MTU an IPv4 interface may have (RFC 791).
 const MIN_MTU: u16 = ruster_proto::table::MIN_MTU;
@@ -58,14 +74,24 @@ struct InterfaceEntry {
     ipv4: Option<String>,
     #[serde(default)]
     ipv6: Vec<String>,
+    #[serde(default = "default_vrf")]
+    vrf: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 struct RouteEntry {
+    #[serde(default = "default_vrf")]
+    vrf: String,
     prefix: String,
-    interface: String,
+    interface: Option<String>,
     via: Option<String>,
+    lookup_vrf: Option<String>,
+}
+
+fn default_vrf() -> String {
+    DEFAULT_VRF.to_owned()
 }
 
 fn default_mtu() -> u16 {
@@ -80,13 +106,15 @@ fn default_enabled() -> bool {
 #[derive(Default)]
 struct Seen {
     names: BTreeSet<String>,
-    /// The router's addresses other than link-local ones.
-    addresses: BTreeSet<IpAddr>,
+    /// Each interface's VRF.
+    vrf_of: BTreeMap<String, String>,
+    /// The router's addresses other than link-local ones, per VRF.
+    addresses: BTreeSet<(String, IpAddr)>,
     /// Link-local addresses belong to one link: kept per interface, the automatic one
     /// included.
     link_local: BTreeSet<(String, Ipv6Addr)>,
     /// Connected prefixes (link-local ones are on every interface and not counted).
-    connected: BTreeSet<(IpAddr, u8)>,
+    connected: BTreeSet<(String, IpAddr, u8)>,
 }
 
 impl Seen {
@@ -104,12 +132,16 @@ impl Seen {
                 return Ok(());
             }
         }
-        if !self.addresses.insert(address) {
-            return Err(format!("{at}: {address} is given twice"));
+        let vrf = self.vrf_of.get(interface).cloned().unwrap_or_default();
+        if !self.addresses.insert((vrf.clone(), address)) {
+            return Err(format!("{at}: {address} is given twice in VRF {vrf:?}"));
         }
-        if !self.connected.insert((network(address, len), len)) {
+        if !self
+            .connected
+            .insert((vrf.clone(), network(address, len), len))
+        {
             return Err(format!(
-                "{at}: the prefix of {address} is already on an interface"
+                "{at}: the prefix of {address} is already on an interface of VRF {vrf:?}"
             ));
         }
         Ok(())
@@ -121,7 +153,10 @@ impl Seen {
             IpAddr::V6(v) if v.is_unicast_link_local() => {
                 self.link_local.contains(&(interface.to_owned(), v))
             }
-            _ => self.addresses.contains(&via),
+            _ => {
+                let vrf = self.vrf_of.get(interface).cloned().unwrap_or_default();
+                self.addresses.contains(&(vrf, via))
+            }
         }
     }
 }
@@ -139,6 +174,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if !seen.names.insert(entry.name.clone()) {
             return Err(format!("{at}: given twice"));
         }
+        if entry.vrf.is_empty() {
+            return Err(format!("{at}: vrf must not be empty"));
+        }
+        seen.vrf_of.insert(entry.name.clone(), entry.vrf.clone());
         let mac =
             mac(&entry.mac).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?;
         if mac[0] & 1 != 0 || mac == [0; 6] {
@@ -188,6 +227,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             enabled: entry.enabled,
             ipv4,
             ipv6,
+            vrf: entry.vrf,
         });
     }
     let mut static_routes = Vec::with_capacity(file.route.len());
@@ -199,11 +239,33 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if network(address, len) != address {
             return Err(format!("{at}: bits are set after the prefix length"));
         }
-        if !prefixes.insert((address, len)) {
-            return Err(format!("{at}: given twice"));
+        if entry.vrf.is_empty() {
+            return Err(format!("{at}: vrf must not be empty"));
         }
-        if !seen.names.contains(&entry.interface) {
-            return Err(format!("{at}: no interface {:?}", entry.interface));
+        if !prefixes.insert((entry.vrf.clone(), address, len)) {
+            return Err(format!("{at}: given twice in VRF {:?}", entry.vrf));
+        }
+        let interface = match (entry.interface, entry.lookup_vrf) {
+            (None, Some(other)) => {
+                if other.is_empty() || other == entry.vrf {
+                    return Err(format!("{at}: lookup-vrf must name another VRF"));
+                }
+                if entry.via.is_some() {
+                    return Err(format!("{at}: a lookup-vrf route has no via"));
+                }
+                static_routes.push(StaticRoute {
+                    vrf: entry.vrf,
+                    prefix: address,
+                    len,
+                    target: RouteTarget::LookupVrf(other),
+                });
+                continue;
+            }
+            (Some(interface), None) => interface,
+            _ => return Err(format!("{at}: give either interface or lookup-vrf")),
+        };
+        if !seen.names.contains(&interface) {
+            return Err(format!("{at}: no interface {interface:?}"));
         }
         let via = match &entry.via {
             Some(text) => {
@@ -215,7 +277,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                         IpAddr::V4(v) => unicast_v4(*v),
                         IpAddr::V6(v) => unicast_v6(*v),
                     })
-                    .filter(|via| !seen.is_ours(&entry.interface, *via));
+                    .filter(|via| !seen.is_ours(&interface, *via));
                 Some(via.ok_or_else(|| {
                     format!("{at}: via must be a unicast address of another host, of the prefix's family")
                 })?)
@@ -223,11 +285,38 @@ pub fn parse(text: &str) -> Result<Config, String> {
             None => None,
         };
         static_routes.push(StaticRoute {
+            vrf: entry.vrf,
             prefix: address,
             len,
-            interface: entry.interface,
-            via,
+            target: RouteTarget::Next { interface, via },
         });
+    }
+    // A lookup must reach a VRF that exists, and is followed one level only.
+    let defined: BTreeSet<&str> = seen
+        .vrf_of
+        .values()
+        .map(String::as_str)
+        .chain(static_routes.iter().map(|r| r.vrf.as_str()))
+        .collect();
+    for route in &static_routes {
+        let RouteTarget::LookupVrf(other) = &route.target else {
+            continue;
+        };
+        let at = format!(
+            "route {}/{} in VRF {:?}",
+            route.prefix, route.len, route.vrf
+        );
+        if !defined.contains(other.as_str()) {
+            return Err(format!("{at}: no interface or route is in VRF {other:?}"));
+        }
+        let chained = static_routes
+            .iter()
+            .any(|r| r.vrf == *other && matches!(r.target, RouteTarget::LookupVrf(_)));
+        if chained {
+            return Err(format!(
+                "{at}: VRF {other:?} has lookup-vrf routes of its own, which are not followed"
+            ));
+        }
     }
     Ok(Config {
         interfaces,
