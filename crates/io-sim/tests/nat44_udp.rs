@@ -1177,8 +1177,8 @@ fn structural_and_policy_failures_are_byte_and_state_atomic() {
             udp_frame(
                 HOST,
                 PUBLIC,
+                40_001,
                 40_000,
-                53,
                 64,
                 0x4000,
                 &[],

@@ -993,3 +993,159 @@ fn ipv6_is_not_forwarded_while_the_firewall_is_on() {
     );
     assert!(!send(&mut bench));
 }
+
+fn nat(first_port: u16, last_port: u16) -> Change {
+    Change::set(
+        Key::Nat {
+            vrf: "default".into(),
+        },
+        Value::Nat(ruster_proto::table::Nat {
+            inside: "lan".into(),
+            outside: "wan".into(),
+            external: None,
+            first_port,
+            last_port,
+        }),
+    )
+}
+
+#[test]
+fn nat_translates_out_and_back_across_table_changes() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+        ],
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+
+    let send = |bench: &mut Bench, ingress: u16, frame: Vec<u8>| {
+        bench.now += 10;
+        bench.fe.io_mut().inject(IfId(ingress), frame);
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx()
+    };
+    let out = send(&mut bench, 0, udp_from_host(INTERNET)).expect("translated");
+    assert_eq!(out.egress, IfId(1));
+    assert_eq!(&out.bytes[26..30], &[198, 51, 100, 2], "the WAN address");
+    let port = u16::from_be_bytes([out.bytes[34], out.bytes[35]]);
+    assert!((40_000..=40_009).contains(&port), "{port}");
+
+    let reply = |port: u16| {
+        let mut frame = udp_reply_to_host();
+        frame[30..34].copy_from_slice(&[198, 51, 100, 2]);
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame[36..38].copy_from_slice(&port.to_be_bytes());
+        frame
+    };
+    let back = send(&mut bench, 1, reply(port)).expect("translated back");
+    assert_eq!(back.egress, IfId(0));
+    assert_eq!(&back.bytes[30..34], &[192, 0, 2, 10]);
+    assert_eq!(u16::from_be_bytes([back.bytes[36], back.bytes[37]]), 1000);
+
+    // Another route: the mapping is carried to the new tables.
+    let code = bench.patch(
+        &mut routes,
+        &[route([10, 0, 0, 0], 8, "wan", Some(GATEWAY))],
+    );
+    assert_eq!(code, Code::CHANGED);
+    assert!(send(&mut bench, 1, reply(port)).is_some());
+
+    // A port range of another size: new storage, the mapping is gone.
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_019)]),
+        Code::CHANGED
+    );
+    assert!(send(&mut bench, 1, reply(port)).is_none());
+
+    // No NAT: the LAN address leaves as it is.
+    let code = bench.patch(
+        &mut config,
+        &[Change::delete(Key::Nat {
+            vrf: "default".into(),
+        })],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let out = send(&mut bench, 0, udp_from_host(INTERNET)).expect("forwarded");
+    assert_eq!(&out.bytes[26..30], &[192, 0, 2, 10]);
+}
+
+#[test]
+fn a_nat_address_other_than_the_outside_interface_s_is_refused() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    // An external address that is not the outside interface's.
+    let mut other = nat(1_000, 2_000);
+    if let Some(Value::Nat(nat)) = &mut other.value {
+        nat.external = Some(Ipv4Addr::new(203, 0, 113, 99));
+    }
+    assert_eq!(bench.patch(&mut config, &[other]), Code::BAD_REQUEST);
+}
+
+#[test]
+fn with_nat_the_router_s_own_ports_on_the_wan_address_still_reach_the_kernel() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let to_wan = |port: u16| {
+        let mut frame = udp_reply_to_host();
+        frame[30..34].copy_from_slice(&[198, 51, 100, 2]);
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame[36..38].copy_from_slice(&port.to_be_bytes());
+        frame
+    };
+    let mut buf = [0_u8; 2048];
+    // Outside the pool: the router's own.
+    bench.fe.io_mut().inject(IfId(1), to_wan(53));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_ok());
+    // In the pool, with no mapping: NAT drops it.
+    bench.fe.io_mut().inject(IfId(1), to_wan(40_003));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_err());
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+
+    // An ICMP Fragmentation Needed about the router's own UDP from port 53 is the
+    // router's too; one about a pool port is NAT's (and has no mapping).
+    let frag_needed = |port: u16| {
+        let mut quoted = to_wan(2000)[14..42].to_vec();
+        quoted[12..16].copy_from_slice(&[198, 51, 100, 2]);
+        quoted[16..20].copy_from_slice(&INTERNET);
+        quoted[20..22].copy_from_slice(&port.to_be_bytes());
+        let mut frame = to_wan(0)[..34].to_vec();
+        frame[14 + 9] = 1;
+        frame[16..18].copy_from_slice(&(20 + 8 + 28_u16).to_be_bytes());
+        frame.extend_from_slice(&[3, 4, 0, 0, 0, 0, 0x05, 0x00]);
+        frame.extend_from_slice(&quoted);
+        let icmp_checksum = ipv4_header_checksum(&frame[34..]);
+        frame[36..38].copy_from_slice(&icmp_checksum.to_be_bytes());
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame
+    };
+    bench.fe.io_mut().inject(IfId(1), frag_needed(53));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_ok(), "the router's own");
+    bench.fe.io_mut().inject(IfId(1), frag_needed(40_003));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_err(), "NAT's");
+}

@@ -242,3 +242,65 @@ fn another_vrf_never_leaks_past_the_nat() {
         ]
     );
 }
+
+/// UDP to the public address on a port outside the pool is the router's own: it goes
+/// to the control side like traffic to any router address. A port in the pool that
+/// no mapping owns is a NAT mapping miss.
+#[test]
+fn the_router_s_own_ports_on_the_public_address_are_not_nat_s() {
+    let routes = [
+        Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+        Route::new(
+            Ipv4Address::from_octets([0, 0, 0, 0]),
+            0,
+            WAN,
+            Some(GATEWAY),
+        )
+        .unwrap(),
+    ];
+    let interfaces =
+        [(LAN, LAN_MAC), (WAN, WAN_MAC)].map(|(id, mac)| Interface { id, mac, mtu: 1500 });
+    let neighbors = [Neighbor {
+        interface: WAN,
+        target: GATEWAY,
+        mac: GATEWAY_MAC,
+    }];
+    let bindings = [LocalIpv4Binding {
+        interface: WAN,
+        address: PUBLIC,
+    }];
+    let base = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let config = Nat44UdpConfig::new(
+        &base,
+        LAN,
+        WAN,
+        PUBLIC,
+        40_000,
+        40_010,
+        Nat44UdpPolicy::default(),
+    )
+    .unwrap();
+    let mut indexes = UdpTestIndexes::new(config, 4, 4);
+    let mut mappings = [Nat44UdpMappingSlot::default(); 4];
+    let mut peers = [Nat44UdpPeerSlot::default(); 4];
+    let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+    let mut queue = ControlQueue::new(4);
+    let mut io = SimIo::new();
+    let snapshot = base
+        .with_now(MonotonicMillis(1_000))
+        .with_local_to_control(true);
+    io.inject(WAN, udp(WAN_MAC, REMOTE, PUBLIC, 53, 33_000));
+    io.inject(WAN, udp(WAN_MAC, REMOTE, PUBLIC, 53, 40_005));
+    let batch = io.receive(8).unwrap();
+    let services = Services {
+        nat44_udp: Some((&config, &mut runtime)),
+        ..Services::default()
+    };
+    let report = forward_batch_with_control(batch, &snapshot, &mut queue, services, &mut NoTrace);
+    assert_eq!(report.dropped, 1, "the pool port without a mapping");
+    assert_eq!(queue.frames().len(), 1);
+    assert_eq!(
+        &queue.frames()[0].bytes()[36..38],
+        &33_000_u16.to_be_bytes()
+    );
+}

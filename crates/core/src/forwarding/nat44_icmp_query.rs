@@ -409,9 +409,7 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution
-        .as_ref()
-        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
     let runtime = require_nat44_icmp_runtime(snapshot, config, nat44_icmp, ingress, trace)?;
     if firewall_config.is_none() {
         observe(runtime, ingress, now, trace)?;
