@@ -139,7 +139,7 @@ where
             punt_peer: None,
             last_resolve: BTreeMap::new(),
             ipv6: Ipv6Fib::default(),
-            control: ControlQueue::new(EVENTS_PER_BATCH),
+            control: ControlQueue::new(EVENTS_PER_BATCH).with_icmpv6_errors(EVENTS_PER_BATCH),
             icmpv4_errors: icmpv4_error_runtime(),
             counters: FeCounters::default(),
         }
@@ -194,6 +194,7 @@ where
         };
         self.control.clear();
         let now = MonotonicMillis(now_ms);
+        self.control.set_clock(now);
         let report = forward_batch_with_control(
             batch,
             &snapshot,
@@ -216,6 +217,13 @@ where
         }
         for arp in &trace.arp {
             self.punt_arp(arp);
+        }
+        for index in 0..self.control.errors().len() {
+            let error = &self.control.errors()[index];
+            let (egress, bytes) = (error.ingress, error.bytes().to_vec());
+            if self.send_generated(egress, &bytes) {
+                self.counters.icmp_errors_sent += 1;
+            }
         }
         for index in 0..self.control.frames().len() {
             let frame = &self.control.frames()[index];

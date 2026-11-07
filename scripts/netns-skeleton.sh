@@ -131,6 +131,13 @@ comes_up || fail "IPv4 does not cross the router"
 all_running || fail "a router process exited"
 echo "ok: IPv4 and IPv6 cross the router both ways (four separate processes)"
 
+# A packet that would expire at the router gets a time exceeded error from it.
+out=$(nsx "$host_a" ping -c 1 -W 1 -t 1 198.51.100.10 2>&1 || true)
+grep -qi "time to live exceeded" <<<"$out" || fail "no ICMP Time Exceeded from the router: $out"
+out=$(nsx "$host_a" ping -6 -c 1 -W 1 -t 1 2001:db8:2::10 2>&1 || true)
+grep -qi "time exceeded" <<<"$out" || fail "no ICMPv6 Time Exceeded from the router: $out"
+echo "ok: the router answers expiring packets with ICMP and ICMPv6 Time Exceeded"
+
 # A control process that dies does not stop forwarding, and comes back by itself.
 # Counts the lines of a log that say a connection was made again.
 again() { grep -c "again" "$work/$1.log" || true; }

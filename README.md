@@ -45,7 +45,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 
 今動いている範囲は次のとおりです。
 
-- IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPのエラーとルータ宛ての通信はまだ無い。
+- IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPとICMPv6のエラーを返す。ルータ宛ての通信はまだ無い。
 - VRFは`default`の一つだけ。
 - 経路は静的なものと直結だけ。
 
