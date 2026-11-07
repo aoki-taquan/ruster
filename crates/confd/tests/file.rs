@@ -714,3 +714,64 @@ fn a_tunnel_interface_needs_no_mac_and_sends_from_a_router_address() {
         assert!(got.contains(expected), "{text}: {got}");
     }
 }
+
+/// RFC 7597 Appendix A, example 1.
+#[test]
+fn map_e_follows_rfc_7597_appendix_a() {
+    let text = format!(
+        "{LAN}[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv6 = [\"2001:db8:ffff:1::2/64\"]\n\
+         [map-e]\ninterface = \"map\"\ninside = \"lan\"\nprefix = \"2001:db8:12:3400::/56\"\n\
+         rule-ipv6 = \"2001:db8::/40\"\nrule-ipv4 = \"192.0.2.0/24\"\nea-length = 16\npsid-offset = 6\n\
+         br = \"2001:db8:ffff::1\"\n"
+    );
+    let config = parse(&text).unwrap();
+    let map = config.interfaces.iter().find(|i| i.name == "map").unwrap();
+    assert_eq!(map.ipv4, Some((Ipv4Addr::new(192, 0, 2, 18), 32)));
+    assert_eq!(
+        map.tunnel,
+        Some((
+            "2001:db8:12:3400:0:c000:212:34".parse().unwrap(),
+            "2001:db8:ffff::1".parse().unwrap()
+        ))
+    );
+    assert_eq!(map.mtu, 1460);
+    let nat = config.nat.unwrap();
+    assert_eq!((nat.inside.as_str(), nat.outside.as_str()), ("lan", "map"));
+    assert_eq!(
+        nat.ports,
+        ruster_proto::table::NatPorts::Psid {
+            offset: 6,
+            length: 8,
+            psid: 0x34
+        }
+    );
+    assert!(config
+        .static_routes
+        .iter()
+        .any(|r| r.len == 0 && r.prefix == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+
+    for (bad, expected) in [
+        (
+            text.replace("2001:db8:12:3400::/56", "2001:db9:12:3400::/56"),
+            "inside rule-ipv6",
+        ),
+        (
+            text.replace("ea-length = 16", "ea-length = 4"),
+            "ea-length must cover",
+        ),
+        (
+            text.replace("2001:db8:12:3400::/56", "2001:db8:12::/48"),
+            "hold the ea-length",
+        ),
+        (
+            format!("{text}[nat]\ninside = \"lan\"\noutside = \"wan\"\n").replace(
+                "ipv6 = [\"2001:db8:ffff:1::2/64\"]",
+                "ipv4 = \"198.51.100.2/24\"\nipv6 = [\"2001:db8:ffff:1::2/64\"]",
+            ),
+            "give no [nat]",
+        ),
+    ] {
+        let got = error(&bad);
+        assert!(got.contains(expected), "{got}");
+    }
+}

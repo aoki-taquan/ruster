@@ -22,6 +22,16 @@
 //! ipv4 = "192.0.0.2/29"        # optional; RFC 6333 5.7's B4 address
 //! # mtu is 1460 when left out; mac is not needed
 //!
+//! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
+//! interface = "map"            # the tunnel interface it makes
+//! inside = "lan"               # the NAT's inside
+//! prefix = "2001:db8:12:3400::/56"  # the delegated (end-user) IPv6 prefix
+//! rule-ipv6 = "2001:db8::/40"  # the Basic Mapping Rule
+//! rule-ipv4 = "192.0.2.0/24"
+//! ea-length = 16
+//! psid-offset = 6              # optional, 6 when left out
+//! br = "2001:db8:ffff::1"
+//!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
 //! interface = "wan"
@@ -74,6 +84,14 @@
 //!   VRF, to the AFTR at `remote`; the outer packets are routed in the default VRF.
 //!   Its MTU is at most 1460 (1500 less the IPv6 header), so the outer packets are
 //!   never fragmented (RFC 6333 5.3 lets the B4 fragment them instead).
+//! - RFC 7597 (MAP-E), the CE: `[map-e]` derives the shared IPv4 address and the
+//!   PSID from the EA bits of the delegated prefix (section 5.2), the CE's IPv6
+//!   address from them (section 6, interface ID `0:IPv4:PSID` on the delegated
+//!   prefix with subnet ID 0), and makes a tunnel to the BR, NAPT on the PSID's
+//!   port set (section 5.1) and the default IPv4 route through the tunnel.
+//!   Deviations: one Basic Mapping Rule, no Forwarding Mapping Rules (all traffic
+//!   goes through the BR, hub and spoke); the IPv4 address with no sharing
+//!   (`ea-length` equal to the IPv4 suffix) uses ports 1024 to 65535.
 //! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
 //!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
@@ -119,6 +137,27 @@ struct File {
     #[serde(default)]
     firewall: Vec<FirewallEntry>,
     nat: Option<NatEntry>,
+    #[serde(rename = "map-e")]
+    map_e: Option<MapEEntry>,
+}
+
+/// A MAP-E CE (RFC 7597): one Basic Mapping Rule, the delegated prefix, the BR.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+struct MapEEntry {
+    /// The tunnel interface confd makes.
+    interface: String,
+    /// The NAT's inside interface.
+    inside: String,
+    /// The end-user IPv6 prefix (the one delegated to the CE).
+    prefix: String,
+    rule_ipv6: String,
+    rule_ipv4: String,
+    ea_length: u8,
+    psid_offset: Option<u8>,
+    br: String,
+    mtu: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -538,16 +577,150 @@ pub fn parse(text: &str) -> Result<Config, String> {
         .enumerate()
         .map(|(at, entry)| firewall_rule(&format!("firewall rule {}", at + 1), entry, &seen))
         .collect::<Result<_, _>>()?;
-    let nat = file
+    let mut nat = file
         .nat
         .map(|entry| nat(entry, &seen, &interfaces))
         .transpose()?;
+    if let Some(entry) = file.map_e {
+        if nat.is_some() {
+            return Err("map-e: it makes the NAT itself; give no [nat]".into());
+        }
+        let (tunnel, mapped) = map_e(entry, &seen)?;
+        if static_routes.iter().any(|r| {
+            r.vrf == DEFAULT_VRF && r.prefix == IpAddr::V4(Ipv4Addr::UNSPECIFIED) && r.len == 0
+        }) {
+            return Err("map-e: it makes the default IPv4 route itself; give none".into());
+        }
+        static_routes.push(StaticRoute {
+            vrf: DEFAULT_VRF.to_owned(),
+            prefix: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            len: 0,
+            target: RouteTarget::Next {
+                interface: tunnel.name.clone(),
+                via: None,
+            },
+        });
+        nat = Some(mapped);
+        interfaces.push(tunnel);
+    }
     Ok(Config {
         interfaces,
         static_routes,
         firewall,
         nat,
     })
+}
+
+/// The tunnel interface and NAT of a MAP-E CE (RFC 7597 sections 5.2 and 6).
+fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String> {
+    let at = "map-e";
+    let v6 = |text: &str, what: &str| match prefix(text) {
+        Some((IpAddr::V6(address), len)) => Ok((address, len)),
+        _ => Err(format!("{at}: {what} must be an IPv6 prefix")),
+    };
+    let (delegated, delegated_len) = v6(&entry.prefix, "prefix")?;
+    let (rule6, rule6_len) = v6(&entry.rule_ipv6, "rule-ipv6")?;
+    let (rule4, rule4_len) = match prefix(&entry.rule_ipv4) {
+        Some((IpAddr::V4(address), len))
+            if network(IpAddr::V4(address), len) == IpAddr::V4(address) =>
+        {
+            (address, len)
+        }
+        _ => return Err(format!("{at}: rule-ipv4 must be an IPv4 prefix")),
+    };
+    let br: Ipv6Addr = entry
+        .br
+        .parse()
+        .map_err(|_| format!("{at}: br must be an IPv6 address"))?;
+    if !unicast_v6(br) || br.is_unicast_link_local() {
+        return Err(format!("{at}: br must be a global unicast address"));
+    }
+    let ea_length = entry.ea_length;
+    let suffix = 32 - rule4_len;
+    // The EA bits follow the rule IPv6 prefix in the delegated prefix; they hold
+    // the IPv4 suffix and then the PSID (RFC 7597 section 5.2).
+    if network(IpAddr::V6(delegated), rule6_len) != IpAddr::V6(rule6) {
+        return Err(format!("{at}: prefix must be inside rule-ipv6"));
+    }
+    if ea_length > 48
+        || u16::from(rule6_len) + u16::from(ea_length) > u16::from(delegated_len)
+        || delegated_len > 64
+    {
+        return Err(format!(
+            "{at}: prefix must be at most /64 and hold the ea-length bits after rule-ipv6"
+        ));
+    }
+    if ea_length < suffix {
+        return Err(format!(
+            "{at}: ea-length must cover the {suffix} IPv4 suffix bits of rule-ipv4"
+        ));
+    }
+    let bits = u128::from(delegated);
+    let ea = if ea_length == 0 {
+        0
+    } else {
+        ((bits << rule6_len) >> (128 - u32::from(ea_length))) as u64
+    };
+    let psid_length = ea_length - suffix;
+    let psid = (ea & ((1_u64 << psid_length) - 1)) as u16;
+    let ipv4 = Ipv4Addr::from(u32::from(rule4) | (ea >> psid_length) as u32);
+    let offset = entry.psid_offset.unwrap_or(6);
+    let ports = if psid_length == 0 {
+        NatPorts::Range {
+            first: 1_024,
+            last: u16::MAX,
+        }
+    } else {
+        if offset == 0 || u16::from(offset) + u16::from(psid_length) >= 16 {
+            return Err(format!(
+                "{at}: psid-offset plus the {psid_length} PSID bits must be 1 to 15"
+            ));
+        }
+        NatPorts::Psid {
+            offset,
+            length: psid_length,
+            psid,
+        }
+    };
+    // The CE's address: the delegated prefix with subnet ID 0, and the interface
+    // ID 0 : IPv4 address : PSID (RFC 7597 section 6).
+    let upper = (bits >> 64) << 64;
+    let upper = upper & !(u128::MAX >> delegated_len);
+    let interface_id = (u128::from(u32::from(ipv4)) << 16) | u128::from(psid);
+    let local = Ipv6Addr::from(upper | interface_id);
+    let mtu = entry.mtu.unwrap_or(MAX_MTU - 40);
+    if !(MIN_MTU..=MAX_MTU - 40).contains(&mtu) {
+        return Err(format!("{at}: mtu must be {MIN_MTU} to {}", MAX_MTU - 40));
+    }
+    if seen.names.contains(&entry.interface) {
+        return Err(format!(
+            "{at}: interface {:?} is given twice",
+            entry.interface
+        ));
+    }
+    match seen.vrf_of.get(&entry.inside) {
+        Some(vrf) if vrf == DEFAULT_VRF => {}
+        Some(_) => return Err(format!("{at}: inside must be in the default VRF")),
+        None => return Err(format!("{at}: no interface {:?}", entry.inside)),
+    }
+    let tunnel = InterfaceConfig {
+        name: entry.interface.clone(),
+        mac: TUNNEL_MAC,
+        mtu,
+        enabled: true,
+        ipv4: Some((ipv4, 32)),
+        ipv6: Vec::new(),
+        vrf: DEFAULT_VRF.to_owned(),
+        vlan: None,
+        tunnel: Some((local, br)),
+    };
+    let nat = Nat {
+        inside: entry.inside,
+        outside: entry.interface,
+        external: None,
+        ports,
+    };
+    Ok((tunnel, nat))
 }
 
 /// `"53"` or `"1024-65535"`.
