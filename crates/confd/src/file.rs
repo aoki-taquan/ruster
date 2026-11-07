@@ -26,7 +26,20 @@
 //! vrf = "red"
 //! prefix = "0.0.0.0/0"
 //! lookup-vrf = "default"
+//!
+//! [[firewall]]                 # forward rules of the default VRF, first match wins
+//! action = "accept"            # or "drop"; an accepted flow's replies pass too
+//! protocol = "udp"             # "tcp", "udp" or "icmp"
+//! ingress = "lan"              # optional, any interface when left out
+//! egress = "wan"               # optional
+//! source = "192.0.2.0/24"      # optional, any address when left out
+//! destination = "0.0.0.0/0"    # optional
+//! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
+//! destination-ports = "53"     # optional
 //! ```
+//!
+//! With any `firewall` rule, what no rule accepts is dropped. The interfaces a rule
+//! names must be in the default VRF.
 //!
 //! An address, and the prefix of an interface address, must be unique within a VRF;
 //! two VRFs may use the same ones. A static route for an interface's prefix replaces
@@ -44,13 +57,19 @@
 //! - RFC 4291 section 2.5: IPv6 interface addresses and next hops must not be
 //!   unspecified, loopback or multicast. A link-local next hop is allowed: it is on
 //!   the route's interface.
+//! - RFC 8519 (`ietf-access-control-list`): a `firewall` rule is an ACE with IPv4,
+//!   protocol, port range and interface matches, checked in order, first match wins.
+//!   Deviations: IPv4 only (while there are rules, the FE does not forward IPv6
+//!   through the default VRF); an accepted flow's replies pass too (stateful, not in
+//!   RFC 8519); what no rule accepts is dropped; one rule list for the default VRF,
+//!   not ACLs attached per interface.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Deserialize;
 
-use ruster_proto::table::DEFAULT_VRF;
+use ruster_proto::table::{FirewallAction, FirewallRule, Protocol, DEFAULT_VRF};
 
 use crate::{Config, InterfaceConfig, RouteTarget, StaticRoute};
 
@@ -66,6 +85,22 @@ struct File {
     interface: Vec<InterfaceEntry>,
     #[serde(default)]
     route: Vec<RouteEntry>,
+    #[serde(default)]
+    firewall: Vec<FirewallEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+struct FirewallEntry {
+    action: String,
+    protocol: String,
+    ingress: Option<String>,
+    egress: Option<String>,
+    source: Option<String>,
+    destination: Option<String>,
+    source_ports: Option<String>,
+    destination_ports: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -367,9 +402,90 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ));
         }
     }
+    let firewall = file
+        .firewall
+        .into_iter()
+        .enumerate()
+        .map(|(at, entry)| firewall_rule(&format!("firewall rule {}", at + 1), entry, &seen))
+        .collect::<Result<_, _>>()?;
     Ok(Config {
         interfaces,
         static_routes,
+        firewall,
+    })
+}
+
+fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<FirewallRule, String> {
+    let action = match entry.action.as_str() {
+        "accept" => FirewallAction::Accept,
+        "drop" => FirewallAction::Drop,
+        _ => return Err(format!("{at}: action must be \"accept\" or \"drop\"")),
+    };
+    let protocol = match entry.protocol.as_str() {
+        "tcp" => Protocol::Tcp,
+        "udp" => Protocol::Udp,
+        "icmp" => Protocol::Icmp,
+        _ => {
+            return Err(format!(
+                "{at}: protocol must be \"tcp\", \"udp\" or \"icmp\""
+            ))
+        }
+    };
+    for name in [&entry.ingress, &entry.egress].into_iter().flatten() {
+        match seen.vrf_of.get(name) {
+            None => return Err(format!("{at}: no interface {name:?}")),
+            Some(vrf) if vrf != DEFAULT_VRF => {
+                return Err(format!(
+                    "{at}: interface {name:?} is in VRF {vrf:?}; rules are for the default VRF"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    let ipv4 = |text: &Option<String>, what: &str| match text {
+        None => Ok((Ipv4Addr::UNSPECIFIED, 0)),
+        Some(text) => match prefix(text) {
+            Some((IpAddr::V4(address), len))
+                if network(IpAddr::V4(address), len) == IpAddr::V4(address) =>
+            {
+                Ok((address, len))
+            }
+            _ => Err(format!(
+                "{at}: {what} must be an IPv4 prefix with no host bits"
+            )),
+        },
+    };
+    let ports = |text: &Option<String>, what: &str| {
+        let Some(text) = text else {
+            return Ok((0, u16::MAX));
+        };
+        if protocol == Protocol::Icmp {
+            return Err(format!("{at}: {what} are for tcp and udp only"));
+        }
+        let (first, last) = text.split_once('-').unwrap_or((text, text));
+        let port = |text: &str| {
+            let text = text.trim();
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            text.parse::<u16>().ok()
+        };
+        match (port(first), port(last)) {
+            (Some(first), Some(last)) if first <= last => Ok((first, last)),
+            _ => Err(format!(
+                "{at}: {what} must be a port or a range such as 1024-65535"
+            )),
+        }
+    };
+    Ok(FirewallRule {
+        source: ipv4(&entry.source, "source")?,
+        destination: ipv4(&entry.destination, "destination")?,
+        source_ports: ports(&entry.source_ports, "source-ports")?,
+        destination_ports: ports(&entry.destination_ports, "destination-ports")?,
+        ingress: entry.ingress,
+        egress: entry.egress,
+        protocol,
+        action,
     })
 }
 
