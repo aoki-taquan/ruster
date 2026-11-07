@@ -20,6 +20,12 @@
 
 use crate::chacha20poly1305::{self, TAG_LEN};
 
+mod peer;
+pub use peer::{
+    decapsulate, encapsulate, AllowedPrefix, InterfaceConfig, PeerConfig, PeerState, ReceiveError,
+    Received, SendError, SessionKeys, OUTER_HEADERS_LEN,
+};
+
 /// Message type of a transport data message.
 pub const MESSAGE_TYPE_DATA: u8 = 4;
 /// Bytes before the encrypted part: type, three reserved bytes, receiver index,
