@@ -46,7 +46,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 今動いている範囲は次のとおりです。
 
 - IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPとICMPv6のエラーを返す。ルータ宛ての通信はまだ無い。
-- VRFは`default`の一つだけ。
+- VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。
 - 経路は静的なものと直結だけ。
 
 実際のNICや回線ではまだ試していません。
@@ -114,6 +114,7 @@ rootが要るのでCIでは回していません。
 cargo build --workspace --locked
 sudo scripts/netns-skeleton.sh target/debug                       # AF_XDP
 sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
+sudo scripts/netns-vrf.sh target/debug       # VRF: 同じアドレスの2つのVRFと、片方だけの漏らし
 ```
 
 ## 開発
