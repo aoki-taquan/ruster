@@ -496,6 +496,9 @@ fn send_diff(
 impl Task for Confd {
     fn step(&mut self, _now_ms: u64) -> Progress {
         let mut progress = Progress::IDLE;
+        // Peers that refused a patch older than the configuration now held: a refusal
+        // drops every patch in flight, the newer ones too, so they get it all again.
+        let mut resend = Vec::new();
         for (kind, peer) in [
             (PeerKind::Fe, &mut self.fe),
             (PeerKind::Ribd, &mut self.ribd),
@@ -517,15 +520,35 @@ impl Task for Confd {
                         if let Some(&(_, generation, _)) =
                             peer.in_flight.iter().find(|(t, _, _)| *t == token)
                         {
-                            self.last_refusal = Some((
-                                kind,
-                                String::from_utf8_lossy(&payload).into_owned(),
-                                generation,
-                            ));
+                            let newer = self
+                                .last_refusal
+                                .as_ref()
+                                .is_some_and(|(_, _, g)| *g > generation);
+                            if !newer {
+                                self.last_refusal = Some((
+                                    kind,
+                                    String::from_utf8_lossy(&payload).into_owned(),
+                                    generation,
+                                ));
+                            }
+                            if generation < self.generation && !resend.contains(&kind) {
+                                resend.push(kind);
+                            }
                         }
                     }
                     peer.answer(token, accepted);
                 }
+            }
+        }
+        for kind in resend {
+            let (desired, peer) = match kind {
+                PeerKind::Fe => (self.fe_tables(), &mut self.fe),
+                PeerKind::Ribd => (self.routes(), &mut self.ribd),
+                PeerKind::Neighd => (self.interface_tables(), &mut self.neighd),
+            };
+            if let Some(peer) = peer {
+                send_diff(peer, &desired, self.generation, &mut self.counters);
+                progress = progress.and(Progress::busy(true));
             }
         }
         progress

@@ -61,6 +61,7 @@ fn run() -> Result<(), String> {
 
     let clock = Clock::new();
     let mut refused = 0;
+    let mut apply_seen = apply.counters();
     let mut retry = daemon::Retry::default();
     loop {
         let now = clock.now_ms();
@@ -92,6 +93,16 @@ fn run() -> Result<(), String> {
         let progress = confd
             .step(now)
             .and(apply.step(&mut confd, now, &mut prepare));
+        if apply.counters() != apply_seen {
+            let (now, was) = (apply.counters(), apply_seen);
+            if now.late_rollbacks != was.late_rollbacks {
+                eprintln!("ruster-confd: a late refusal put the configuration before back");
+            }
+            if now.gave_up != was.gave_up {
+                eprintln!("ruster-confd: stopped waiting for answers to a new configuration");
+            }
+            apply_seen = now;
+        }
         if confd.counters().patches_refused != refused {
             refused = confd.counters().patches_refused;
             eprintln!("ruster-confd: a process refused a change ({refused} so far)");

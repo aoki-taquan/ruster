@@ -2,7 +2,7 @@
 
 use std::os::unix::net::UnixStream;
 
-use ruster_confd::apply::{Apply, ANSWER_WAIT_MS};
+use ruster_confd::apply::{Apply, ANSWER_WAIT_MS, GIVE_UP_MS};
 use ruster_confd::{file, Confd};
 use ruster_proto::coap::Code;
 use ruster_proto::session::{Client, Event, Hook, Server, Store};
@@ -198,4 +198,40 @@ fn a_refusal_after_the_timeout_still_puts_the_configuration_before_back() {
     let answers = rig.answers();
     assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
     assert_eq!(rig.mtu(), Some(1280));
+}
+
+#[test]
+fn a_process_that_reconnects_and_refuses_still_puts_the_configuration_before_back() {
+    let mut rig = Rig::new();
+    rig.check.refuse_mtu = Some(1400);
+    // The FE goes away with the change in flight.
+    let silent = std::mem::take(&mut rig.fe);
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    assert!(rig.answers().is_empty());
+    drop(silent);
+    assert!(rig.answers().is_empty(), "waits for the FE to come back");
+
+    // A new FE: confd connects and sends everything; the FE refuses it.
+    let (a, b) = UnixStream::pair().unwrap();
+    rig.fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    rig.confd.connect_fe(b).unwrap();
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1500);
+    assert_eq!(rig.mtu(), Some(1500));
+}
+
+#[test]
+fn confd_stops_waiting_after_a_while() {
+    let mut rig = Rig::new();
+    let _silent = std::mem::take(&mut rig.fe);
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    assert!(rig.answers().is_empty());
+    rig.now_ms = ANSWER_WAIT_MS;
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::GATEWAY_TIMEOUT, "{answers:?}");
+    assert_eq!(rig.apply.counters().gave_up, 0);
+    rig.now_ms = GIVE_UP_MS;
+    assert!(rig.answers().is_empty());
+    assert_eq!(rig.apply.counters().gave_up, 1);
 }

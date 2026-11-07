@@ -13,8 +13,10 @@
 //! | 5.04 Gateway Timeout | a process has not answered in time |
 //!
 //! After 5.04 confd keeps waiting: if the answer is a refusal, it puts the configuration
-//! before back then, and until the answer comes another file gets 5.03. So a refusal
-//! always ends with every process on the configuration before.
+//! before back then. A process that disconnects meanwhile is waited for too: confd sends
+//! it everything when it connects again, and its answer counts. confd stops waiting after
+//! [`GIVE_UP_MS`] and logs it. A new file is taken only when every process has answered
+//! everything sent to it; until then it gets 5.03.
 //!
 //! The payload of an answer is text for a person: the error, or what the answer needs
 //! to add (a process that is not connected gets the configuration when it connects
@@ -50,6 +52,9 @@ const LIMIT: usize = 1 << 20;
 /// How long a new configuration waits for the processes' answers before 5.04.
 pub const ANSWER_WAIT_MS: u64 = 3_000;
 
+/// How long confd waits at most for the answers to one new configuration.
+pub const GIVE_UP_MS: u64 = 30_000;
+
 /// At most this many connections at once; more are closed straight away.
 pub const MAX_CONNECTIONS: usize = 8;
 
@@ -62,6 +67,16 @@ pub struct Apply {
     conns: Vec<(u64, Connection)>,
     next_id: u64,
     pending: Option<Pending>,
+    counters: ApplyCounters,
+}
+
+/// What happened after an answer had gone out, for the log.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ApplyCounters {
+    /// A refusal came after 5.04 and the configuration before was put back.
+    pub late_rollbacks: u64,
+    /// confd stopped waiting after [`GIVE_UP_MS`].
+    pub gave_up: u64,
 }
 
 impl std::fmt::Debug for Apply {
@@ -80,7 +95,7 @@ struct Pending {
     previous: Config,
     /// [`Confd::generation`] of the new configuration.
     generation: u64,
-    deadline_ms: u64,
+    started_ms: u64,
     notes: Vec<String>,
     /// 5.04 went out; the answer still decides whether to go back.
     timed_out: bool,
@@ -89,6 +104,10 @@ struct Pending {
 impl Apply {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn counters(&self) -> ApplyCounters {
+        self.counters
     }
 
     /// Takes a connection, or closes it if [`MAX_CONNECTIONS`] are open.
@@ -129,10 +148,12 @@ impl Apply {
                 busy = true;
                 let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
                 let answer = match (request.code, path.as_slice()) {
-                    (Code::POST, ["config"]) if self.pending.is_some() => Some((
-                        Code::SERVICE_UNAVAILABLE,
-                        "an earlier configuration is still waiting for answers".to_owned(),
-                    )),
+                    (Code::POST, ["config"]) if self.pending.is_some() || !confd.settled() => {
+                        Some((
+                            Code::SERVICE_UNAVAILABLE,
+                            "an earlier configuration is still waiting for answers".to_owned(),
+                        ))
+                    }
                     (Code::POST, ["config"]) => match std::str::from_utf8(&request.payload)
                         .map_err(|_| "the file is not UTF-8".to_owned())
                         .and_then(file::parse)
@@ -147,7 +168,7 @@ impl Apply {
                                 token: request.token.clone(),
                                 previous,
                                 generation: confd.generation(),
-                                deadline_ms: now_ms.saturating_add(ANSWER_WAIT_MS),
+                                started_ms: now_ms,
                                 notes,
                                 timed_out: false,
                             });
@@ -188,8 +209,15 @@ impl Apply {
         let refusal = confd
             .refused_since(pending.generation)
             .map(|(kind, reason)| format!("{kind} refused it: {reason}"));
-        if refusal.is_none() && !confd.settled() {
-            if now_ms < pending.deadline_ms || pending.timed_out {
+        let waited = now_ms.saturating_sub(pending.started_ms);
+        let answered = confd.settled() && confd.closed().is_empty();
+        if refusal.is_none() && !answered && waited >= GIVE_UP_MS && pending.timed_out {
+            self.pending = None;
+            self.counters.gave_up += 1;
+            return true;
+        }
+        if refusal.is_none() && !answered {
+            if waited < ANSWER_WAIT_MS || pending.timed_out {
                 return false;
             }
             pending.timed_out = true;
@@ -207,6 +235,9 @@ impl Apply {
         };
         let (code, lines) = match refusal {
             Some(why) => {
+                if pending.timed_out {
+                    self.counters.late_rollbacks += 1;
+                }
                 let mut lines = vec![why, "the configuration before it is applied again".into()];
                 lines.extend(prepare(&pending.previous));
                 confd.set_config(pending.previous);
