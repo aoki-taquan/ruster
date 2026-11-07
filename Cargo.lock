@@ -124,6 +124,8 @@ dependencies = [
  "ruster-core",
  "ruster-io-afpacket",
  "ruster-io-sim",
+ "ruster-io-xdp",
+ "ruster-io-xdp-native",
  "ruster-proto",
 ]
 

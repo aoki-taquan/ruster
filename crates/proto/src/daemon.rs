@@ -155,9 +155,36 @@ pub fn connect_datagram(socket: &UnixDatagram, path: &Path, wait: Duration) -> i
     }
 }
 
+/// How often a closed connection is tried again.
+pub const RECONNECT_EVERY_MS: u64 = 1_000;
+
+/// Paces attempts to connect again after a connection closed.
+#[derive(Debug, Default)]
+pub struct Retry {
+    next_at: u64,
+}
+
+impl Retry {
+    /// True when an attempt is due at `now_ms`; the next one is then a second later.
+    pub fn due(&mut self, now_ms: u64) -> bool {
+        if now_ms < self.next_at {
+            return false;
+        }
+        self.next_at = now_ms.saturating_add(RECONNECT_EVERY_MS);
+        true
+    }
+}
+
+/// One attempt to connect to `path`, without waiting.
+pub fn try_connect(path: &Path) -> Option<UnixStream> {
+    UnixStream::connect(path).ok()
+}
+
 /// The longest a process sleeps while idle, so that new connections and socket input
 /// are noticed soon.
-pub const IDLE_MAX: Duration = Duration::from_millis(1);
+pub const IDLE_MAX: Duration = Duration::from_millis(IDLE_MAX_MS as u64);
+/// [`IDLE_MAX`] in milliseconds.
+pub const IDLE_MAX_MS: u32 = 1;
 
 /// Sleeps [`IDLE_MAX`] when the last step found nothing to do.
 pub fn idle(progress: Progress) {
