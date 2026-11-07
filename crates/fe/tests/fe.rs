@@ -473,3 +473,167 @@ fn a_punt_socket_at_a_fixed_path_sends_to_whoever_binds_the_peer_path() {
     assert_eq!(bench.fe.counters().inject_dropped, 2);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn ip6(text: &str) -> std::net::IpAddr {
+    text.parse().unwrap()
+}
+
+/// IPv6 tables on top of `configure`: addresses, a LAN route, a default route via a
+/// link-local gateway, and the gateway's neighbor entry.
+fn configure_ipv6(bench: &mut Bench, config: &mut Client, routes: &mut Client) -> Client {
+    let address6 = |interface: &str, address: &str| {
+        Change::set(
+            Key::Address {
+                interface: interface.into(),
+                address: ip6(address),
+            },
+            Value::Address { prefix_len: 64 },
+        )
+    };
+    let code = bench.patch(
+        config,
+        &[address6("lan", "2001:db8:1::1"), address6("wan", "fe80::2")],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let route6 = |prefix: &str, len: u8, interface: &str, via: Option<&str>| {
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: ip6(prefix),
+                len,
+            },
+            Value::Route(RouteAction::Forward(vec![NextHop {
+                interface: interface.into(),
+                address: via.map(ip6),
+            }])),
+        )
+    };
+    let code = bench.patch(
+        routes,
+        &[
+            route6("2001:db8:1::", 64, "lan", None),
+            route6("::", 0, "wan", Some("fe80::1")),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    bench.connect(writers::NEIGHBOR)
+}
+
+fn ipv6_frame(dst_mac: [u8; 6], destination: &str, next_header: u8, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&HOST_MAC);
+    frame.extend_from_slice(&0x86dd_u16.to_be_bytes());
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&[next_header, 64]);
+    frame.extend_from_slice(
+        &"2001:db8:1::10"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets(),
+    );
+    frame.extend_from_slice(&destination.parse::<std::net::Ipv6Addr>().unwrap().octets());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+#[test]
+fn ipv6_is_forwarded_by_the_tables_and_a_missing_next_hop_is_asked_for() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let mut observer = bench.connect(writers::READ_ONLY);
+    observer.observe();
+    bench.settle(&mut [&mut observer]);
+
+    // No gateway neighbor yet: a resolve request for fe80::1 on wan.
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]));
+    let events = bench.settle(&mut [&mut observer]).remove(0);
+    let requests: Vec<ResolveRequest> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Notification { payload } => {
+                ResolveRequest::decode(&mut Decoder::new(payload)).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        requests,
+        [ResolveRequest {
+            interface: "wan".into(),
+            address: ip6("fe80::1"),
+        }]
+    );
+
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "wan".into(),
+                address: ip6("fe80::1"),
+            },
+            Value::Neighbor { mac: GATEWAY_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("forwarded");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+    assert_eq!(tx.bytes[14 + 7], 63);
+}
+
+#[test]
+fn neighbor_discovery_goes_to_the_neighbor_socket_and_frames_come_back() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let _neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    bench.fe.attach_punt(fe_end).unwrap();
+
+    let solicitation = ipv6_frame(
+        [0x33, 0x33, 0xff, 0, 0, 1],
+        "ff02::1:ff00:1",
+        58,
+        &[135, 0, 0, 0, 0, 0, 0, 0],
+    );
+    bench.fe.io_mut().inject(IfId(0), solicitation.clone());
+    bench.fe.step(0);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    let mut buf = [0_u8; 512];
+    let n = neighd_end.recv(&mut buf).unwrap();
+    let punt = Punt::decode(&buf[..n]).unwrap();
+    assert_eq!(punt.direction, Direction::ToControl);
+    assert_eq!(punt.reason, punt::reason::ND);
+    assert_eq!(punt.interface, "lan");
+    assert_eq!(punt.frame, &solicitation[..], "the whole frame");
+
+    // An advertisement back goes out; an IPv4 frame under the ND reason does not.
+    let advertisement = ipv6_frame(HOST_MAC, "2001:db8:1::10", 58, &[136, 0, 0, 0]);
+    for (frame, sent) in [
+        (advertisement.clone(), true),
+        (udp_from_host(GATEWAY), false),
+    ] {
+        let mut message = Vec::new();
+        Punt {
+            direction: Direction::FromControl,
+            reason: punt::reason::ND,
+            interface: "lan",
+            frame: &frame,
+        }
+        .encode(&mut message)
+        .unwrap();
+        neighd_end.send(&message).unwrap();
+        bench.fe.step(1);
+        assert_eq!(bench.fe.io_mut().pop_tx().is_some(), sent);
+    }
+}
