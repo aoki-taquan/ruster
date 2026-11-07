@@ -166,3 +166,39 @@ fn what_is_accepted_after_a_refused_send_is_cleaned_up_later() {
         .is_none());
     assert_eq!(fe.store().len(), 3);
 }
+
+#[test]
+fn a_refused_older_change_does_not_lose_the_newer_one() {
+    let mut fe = Server::new();
+    let mut check = Check {
+        refuse_mtu: Some(1400),
+    };
+    let mut confd = Confd::new(config(1500));
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    confd.connect_fe(b).unwrap();
+    settle(&mut fe, &mut confd, &mut check);
+
+    // Two changes in flight; the FE refuses the first, which drops the second too.
+    // The second is sent as a difference from the first (the address already moved),
+    // so on its own it would leave the old address in the FE.
+    let moved = |mtu| {
+        let mut config = config(mtu);
+        config.interfaces[0].ipv4 = Some((Ipv4Addr::new(192, 0, 2, 2), 24));
+        config
+    };
+    confd.set_config(moved(1400));
+    confd.set_config(moved(1280));
+    settle(&mut fe, &mut confd, &mut check);
+    assert_eq!(mtu(&fe), Some(1280));
+    let address = |last| Key::Address {
+        interface: "lan".into(),
+        address: Ipv4Addr::new(192, 0, 2, last).into(),
+    };
+    assert!(
+        fe.store().get(&address(2)).is_some(),
+        "the newer one is sent again"
+    );
+    assert!(fe.store().get(&address(1)).is_none());
+    assert!(confd.settled());
+}

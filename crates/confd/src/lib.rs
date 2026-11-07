@@ -27,6 +27,7 @@ use ruster_proto::session::{Client, Event};
 use ruster_proto::table::{network, Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
+pub mod apply;
 pub mod file;
 pub mod kernel;
 
@@ -97,13 +98,24 @@ pub enum PeerKind {
     Neighd,
 }
 
+impl std::fmt::Display for PeerKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Fe => "the FE",
+            Self::Ribd => "ribd",
+            Self::Neighd => "neighd",
+        })
+    }
+}
+
 /// One process confd writes to, and what it accepted.
 struct Peer {
     client: Client,
     /// What the peer holds from confd, as far as its answers tell.
     sent: BTreeMap<Key, Value>,
-    /// Patches waiting for an answer, each with what the peer holds once it is accepted.
-    in_flight: Vec<(u32, BTreeMap<Key, Value>)>,
+    /// Patches waiting for an answer, each with the configuration generation it came
+    /// from and what the peer holds once it is accepted.
+    in_flight: Vec<(u32, u64, BTreeMap<Key, Value>)>,
     /// resync-begin was sent; resync-end follows once a full send is accepted, so a
     /// refused send never deletes what the peer holds.
     resync_open: bool,
@@ -114,15 +126,17 @@ struct Peer {
 impl Peer {
     /// What the peer will hold once every patch in flight is accepted.
     fn expected(&self) -> &BTreeMap<Key, Value> {
-        self.in_flight.last().map_or(&self.sent, |(_, held)| held)
+        self.in_flight
+            .last()
+            .map_or(&self.sent, |(_, _, held)| held)
     }
 
     /// Handles one answer from the peer.
     fn answer(&mut self, token: u32, accepted: bool) {
-        let Some(at) = self.in_flight.iter().position(|(t, _)| *t == token) else {
+        let Some(at) = self.in_flight.iter().position(|(t, _, _)| *t == token) else {
             return;
         };
-        let (_, held) = self.in_flight.remove(at);
+        let (_, _, held) = self.in_flight.remove(at);
         if accepted {
             self.sent = held;
             if self.in_flight.is_empty() {
@@ -153,6 +167,10 @@ pub struct Confd {
     ribd: Option<Peer>,
     neighd: Option<Peer>,
     counters: ConfdCounters,
+    /// Counts [`Confd::set_config`] calls; each patch carries the one it came from.
+    generation: u64,
+    /// The last refused patch: its process, reason and generation.
+    last_refusal: Option<(PeerKind, String, u64)>,
 }
 
 impl std::fmt::Debug for Confd {
@@ -172,6 +190,8 @@ impl Confd {
             ribd: None,
             neighd: None,
             counters: ConfdCounters::default(),
+            generation: 0,
+            last_refusal: None,
         }
     }
 
@@ -214,9 +234,46 @@ impl Confd {
         self.counters
     }
 
+    /// The generation of the configuration now held; each [`Confd::set_config`] adds one.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The process that last refused a patch of generation `generation` or later, and
+    /// the reason it gave.
+    pub fn refused_since(&self, generation: u64) -> Option<(PeerKind, &str)> {
+        self.last_refusal
+            .as_ref()
+            .filter(|(_, _, g)| *g >= generation)
+            .map(|(kind, reason, _)| (*kind, reason.as_str()))
+    }
+
+    /// True when every connected process has answered every change sent to it.
+    pub fn settled(&self) -> bool {
+        [&self.fe, &self.ribd, &self.neighd]
+            .into_iter()
+            .flatten()
+            .all(|peer| peer.client.is_closed() || peer.in_flight.is_empty())
+    }
+
+    /// The processes that are not connected now.
+    pub fn absent(&self) -> Vec<PeerKind> {
+        [
+            (PeerKind::Fe, &self.fe),
+            (PeerKind::Ribd, &self.ribd),
+            (PeerKind::Neighd, &self.neighd),
+        ]
+        .into_iter()
+        .filter(|(_, peer)| peer.as_ref().is_none_or(|peer| peer.client.is_closed()))
+        .map(|(kind, _)| kind)
+        .collect()
+    }
+
     /// Replaces the configuration; only the differences are sent.
     pub fn set_config(&mut self, config: Config) {
         self.config = config;
+        self.generation += 1;
+        let generation = self.generation;
         let interfaces = self.interface_tables();
         let fe = self.fe_tables();
         let routes = self.routes();
@@ -227,7 +284,7 @@ impl Confd {
             (&mut self.ribd, &routes),
         ] {
             if let Some(peer) = peer {
-                send_diff(peer, desired, counters);
+                send_diff(peer, desired, generation, counters);
             }
         }
     }
@@ -255,7 +312,7 @@ impl Confd {
                 peer.client.sync_done();
             }
         } else {
-            send_diff(&mut peer, &desired, &mut self.counters);
+            send_diff(&mut peer, &desired, self.generation, &mut self.counters);
         }
         Ok(peer)
     }
@@ -409,7 +466,12 @@ pub fn link_local(mac: [u8; 6]) -> Ipv6Addr {
     ])
 }
 
-fn send_diff(peer: &mut Peer, desired: &BTreeMap<Key, Value>, counters: &mut ConfdCounters) {
+fn send_diff(
+    peer: &mut Peer,
+    desired: &BTreeMap<Key, Value>,
+    generation: u64,
+    counters: &mut ConfdCounters,
+) {
     let expected = peer.expected();
     let mut changes = Vec::new();
     for (key, value) in desired {
@@ -427,27 +489,66 @@ fn send_diff(peer: &mut Peer, desired: &BTreeMap<Key, Value>, counters: &mut Con
     }
     if let Ok(token) = peer.client.patch(&changes) {
         counters.patches_sent += 1;
-        peer.in_flight.push((token, desired.clone()));
+        peer.in_flight.push((token, generation, desired.clone()));
     }
 }
 
 impl Task for Confd {
     fn step(&mut self, _now_ms: u64) -> Progress {
         let mut progress = Progress::IDLE;
-        for peer in [&mut self.fe, &mut self.ribd, &mut self.neighd]
-            .into_iter()
-            .flatten()
-        {
+        // Peers that refused a patch older than the configuration now held: a refusal
+        // drops every patch in flight, the newer ones too, so they get it all again.
+        let mut resend = Vec::new();
+        for (kind, peer) in [
+            (PeerKind::Fe, &mut self.fe),
+            (PeerKind::Ribd, &mut self.ribd),
+            (PeerKind::Neighd, &mut self.neighd),
+        ] {
+            let Some(peer) = peer else { continue };
             let (polled, events) = peer.client.poll();
             progress = progress.and(polled);
             for event in events {
-                if let Event::Response { token, code, .. } = event {
+                if let Event::Response {
+                    token,
+                    code,
+                    payload,
+                } = event
+                {
                     let accepted = code.class() == 2;
                     if !accepted {
                         self.counters.patches_refused += 1;
+                        if let Some(&(_, generation, _)) =
+                            peer.in_flight.iter().find(|(t, _, _)| *t == token)
+                        {
+                            let newer = self
+                                .last_refusal
+                                .as_ref()
+                                .is_some_and(|(_, _, g)| *g > generation);
+                            if !newer {
+                                self.last_refusal = Some((
+                                    kind,
+                                    String::from_utf8_lossy(&payload).into_owned(),
+                                    generation,
+                                ));
+                            }
+                            if generation < self.generation && !resend.contains(&kind) {
+                                resend.push(kind);
+                            }
+                        }
                     }
                     peer.answer(token, accepted);
                 }
+            }
+        }
+        for kind in resend {
+            let (desired, peer) = match kind {
+                PeerKind::Fe => (self.fe_tables(), &mut self.fe),
+                PeerKind::Ribd => (self.routes(), &mut self.ribd),
+                PeerKind::Neighd => (self.interface_tables(), &mut self.neighd),
+            };
+            if let Some(peer) = peer {
+                send_diff(peer, &desired, self.generation, &mut self.counters);
+                progress = progress.and(Progress::busy(true));
             }
         }
         progress

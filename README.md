@@ -121,10 +121,14 @@ CEのプロセスが落ちている間も、FEは持っている表で転送を�
 
 ```bash
 ruster check router.toml                     # confdと同じ読み方で設定ファイルを確かめる
+ruster apply router.toml                     # 確かめてから、動いているconfdの設定を置き換える
 ruster show                                  # FEが持っている表を全部表示する
 ruster route add --source routed 203.0.113.0/24 dev wan via 198.51.100.1
 ruster route del --source routed 203.0.113.0/24
 ```
+
+`apply`は、confdが変わった分をFE、ribd、neighdへ送り、全部が受け取ってから答えます。どれかが断ると
+confdは前の設定に戻します。新しい設定はconfdのメモリにだけあり、confdを起動し直すと起動時のファイルを読みます。
 
 `route`は、ルーティングデーモンと同じように、ribdの送り手（ここでは`routed`。ribdを`confd:1 routed:20`の
 ように起動しておく）として経路を書きます。ribdは送り手の優先度で選んでFEへ渡します。

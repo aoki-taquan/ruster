@@ -1,11 +1,13 @@
 //! `ruster-confd [--run-dir DIR] [--kernel] FILE`: reads the configuration file and
 //! sends it to the FE, ribd (as route source `confd`) and neighd. With `--kernel` it
 //! also sets up the kernel side of traffic to the router ([`ruster_confd::kernel`]).
+//! `ruster apply` gives it a new file later ([`ruster_confd::apply`]).
 
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::{file, Confd, PeerKind};
+use ruster_confd::apply::Apply;
+use ruster_confd::{file, Confd, Config, PeerKind};
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
 
@@ -21,11 +23,25 @@ fn run() -> Result<(), String> {
     };
     let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
     let config = file::parse(&text).map_err(|error| format!("{path}: {error}"))?;
-    if kernel {
-        for error in ruster_confd::kernel::apply(&config) {
-            eprintln!("ruster-confd: kernel: {error}");
+    // Sets up the kernel side before a configuration is sent; the errors are also
+    // reported to `ruster apply`.
+    let mut prepare = |config: &Config| -> Vec<String> {
+        if !kernel {
+            return Vec::new();
         }
-    }
+        let errors: Vec<String> = ruster_confd::kernel::apply(config)
+            .into_iter()
+            .map(|error| format!("kernel: {error}"))
+            .collect();
+        for error in &errors {
+            eprintln!("ruster-confd: {error}");
+        }
+        errors
+    };
+    prepare(&config);
+    let listener = daemon::listen(&run_dir.join(socket::CONFD_CONFIG))
+        .map_err(|error| format!("{}: {error}", socket::CONFD_CONFIG))?;
+    let mut apply = Apply::new();
     let mut confd = Confd::new(config);
     let connect = |name: &str| {
         daemon::connect(&run_dir.join(name), PEER_WAIT)
@@ -45,6 +61,7 @@ fn run() -> Result<(), String> {
 
     let clock = Clock::new();
     let mut refused = 0;
+    let mut apply_seen = apply.counters();
     let mut retry = daemon::Retry::default();
     loop {
         let now = clock.now_ms();
@@ -68,7 +85,24 @@ fn run() -> Result<(), String> {
                 eprintln!("ruster-confd: connected to {name} again");
             }
         }
-        let progress = confd.step(now);
+        for stream in daemon::accept(&listener) {
+            if let Err(error) = apply.attach(stream) {
+                eprintln!("ruster-confd: {}: {error}", socket::CONFD_CONFIG);
+            }
+        }
+        let progress = confd
+            .step(now)
+            .and(apply.step(&mut confd, now, &mut prepare));
+        if apply.counters() != apply_seen {
+            let (now, was) = (apply.counters(), apply_seen);
+            if now.late_rollbacks != was.late_rollbacks {
+                eprintln!("ruster-confd: a late refusal put the configuration before back");
+            }
+            if now.gave_up != was.gave_up {
+                eprintln!("ruster-confd: stopped waiting for answers to a new configuration");
+            }
+            apply_seen = now;
+        }
         if confd.counters().patches_refused != refused {
             refused = confd.counters().patches_refused;
             eprintln!("ruster-confd: a process refused a change ({refused} so far)");
