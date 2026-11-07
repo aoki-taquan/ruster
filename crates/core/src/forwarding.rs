@@ -1255,6 +1255,9 @@ pub struct ForwardingSnapshot<'a> {
     /// The IPv6 tables ([`ForwardingSnapshot::with_ipv6`]); without them IPv6
     /// frames are dropped as an unsupported Ethernet type.
     pub(crate) ipv6: Option<&'a crate::Ipv6Fib>,
+    /// Per-VRF snapshots and which one each ingress interface uses
+    /// ([`ForwardingSnapshot::with_vrfs`]).
+    vrfs: Option<VrfSnapshots<'a>>,
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
     /// Without it every lookup uses the linear reference (PERF-002).
@@ -1263,6 +1266,13 @@ pub struct ForwardingSnapshot<'a> {
 }
 
 const VALIDATED_OWNER_AUTHORITY_BIT: u64 = 1 << 63;
+
+/// See [`ForwardingSnapshot::with_vrfs`].
+#[derive(Clone, Copy)]
+struct VrfSnapshots<'a> {
+    snapshots: &'a [ForwardingSnapshot<'a>],
+    by_ingress: &'a [u16],
+}
 
 impl std::fmt::Debug for ForwardingSnapshot<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1450,6 +1460,7 @@ impl<'a> ForwardingSnapshot<'a> {
             input_firewall_indexed: false,
             arp_to_control: false,
             ipv6: None,
+            vrfs: None,
             index: None,
             authority: calculate_snapshot_authority(
                 routes,
@@ -1513,6 +1524,33 @@ impl<'a> ForwardingSnapshot<'a> {
             arp_to_control: on,
             ..self
         }
+    }
+
+    /// Decides each received packet with the snapshot of its ingress interface's VRF:
+    /// `snapshots[by_ingress[ingress]]`. An ingress outside `by_ingress`, or an index
+    /// outside `snapshots`, uses this snapshot. Each VRF's snapshot holds that VRF's
+    /// routes and local addresses, and every interface and neighbor, so a route may
+    /// leave through an interface of another VRF.
+    #[must_use]
+    pub fn with_vrfs(self, snapshots: &'a [ForwardingSnapshot<'a>], by_ingress: &'a [u16]) -> Self {
+        Self {
+            vrfs: Some(VrfSnapshots {
+                snapshots,
+                by_ingress,
+            }),
+            ..self
+        }
+    }
+
+    /// The snapshot a packet received on `ingress` is decided with.
+    pub(crate) fn for_ingress(&self, ingress: IfId) -> &ForwardingSnapshot<'a> {
+        self.vrfs
+            .as_ref()
+            .and_then(|vrfs| {
+                let index = *vrfs.by_ingress.get(usize::from(ingress.0))?;
+                vrfs.snapshots.get(usize::from(index))
+            })
+            .unwrap_or(self)
     }
 
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
@@ -1694,6 +1732,7 @@ impl<'a> ForwardingSnapshot<'a> {
             input_firewall_indexed: false,
             arp_to_control: false,
             ipv6: None,
+            vrfs: None,
             authority,
             ..self
         })
@@ -2059,6 +2098,7 @@ impl ValidatedForwardingOwner {
             input_firewall_indexed: true,
             arp_to_control: false,
             ipv6: None,
+            vrfs: None,
             index: Some(&self.index),
             authority: self.authority,
         }
@@ -4034,8 +4074,10 @@ where
     let mut tx_requested = 0;
     let mut dropped = 0;
     let mut consumed = 0;
+    let all_vrfs = snapshot;
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
+        let snapshot = all_vrfs.for_ingress(packet.ingress());
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
                 match crate::ipv6::complete(packet, snapshot, fib, control.as_deref_mut(), trace) {
