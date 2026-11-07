@@ -14,6 +14,9 @@ use ruster_core::{ipv4_header_checksum, IfId};
 use ruster_fe::{writers, Fe};
 use ruster_io_sim::SimIo;
 use ruster_neighd::Neighd;
+use ruster_proto::cbor::Decoder;
+use ruster_proto::session::{Client, Event};
+use ruster_proto::table::{Change, Key, KeyExchangeRequest, Value, WireguardSession};
 use ruster_proto::task::Task;
 use ruster_ribd::{Ribd, SourceSpec};
 
@@ -49,7 +52,6 @@ interface = "wg0"
 name = "branch"
 endpoint = "203.0.113.9:51821"
 allowed = ["10.9.0.0/16"]
-session = { send = "0101010101010101010101010101010101010101010101010101010101010101", receive = "0202020202020202020202020202020202020202020202020202020202020202", peer-index = 22, local-index = 11 }
 
 [[route]]
 prefix = "0.0.0.0/0"
@@ -66,16 +68,16 @@ struct Router {
     confd: Confd,
     ribd: Ribd,
     neighd: Neighd,
+    /// The key exchange daemon's connection to confd.
+    keys: Client,
+    /// What the daemon got from confd.
+    key_events: Vec<Event>,
 }
 
 impl Router {
     fn start() -> Self {
-        Self::start_with(FILE)
-    }
-
-    fn start_with(text: &str) -> Self {
         let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
-        let mut confd = Confd::new(file::parse(text).expect("the file reads"));
+        let mut confd = Confd::new(file::parse(FILE).expect("the file reads"));
         let (a, b) = UnixStream::pair().unwrap();
         fe.attach(a, writers::CONFIG).unwrap();
         confd.connect_fe(b).unwrap();
@@ -104,11 +106,18 @@ impl Router {
         neighd.attach_config(a).unwrap();
         confd.connect_neighd(b).unwrap();
 
+        let (a, b) = UnixStream::pair().unwrap();
+        confd.attach_keys(a).unwrap();
+        let mut keys = Client::new(b).unwrap();
+        keys.observe();
+
         let mut router = Self {
             fe,
             confd,
             ribd,
             neighd,
+            keys,
+            key_events: Vec::new(),
         };
         router.settle();
         router
@@ -120,11 +129,50 @@ impl Router {
                 | self.confd.step(0).busy
                 | self.ribd.step(0).busy
                 | self.neighd.step(0).busy;
-            if !busy {
+            let (progress, mut events) = self.keys.poll();
+            self.key_events.append(&mut events);
+            if !(busy | progress.busy) {
                 return;
             }
         }
         panic!("the router never settled");
+    }
+
+    /// Gives confd a session, as the key exchange daemon does.
+    fn give_session(&mut self, send: u8, receive: u8) {
+        let change = Change::set(
+            Key::WireguardSession {
+                interface: "wg0".into(),
+                peer: "branch".into(),
+            },
+            Value::WireguardSession(WireguardSession {
+                send: [send; 32],
+                receive: [receive; 32],
+                peer_index: 22,
+                local_index: 11,
+            }),
+        );
+        self.keys.patch(&[change]).unwrap();
+        self.settle();
+    }
+
+    /// Replaces the FE with a new, empty one that knows nothing of what it sealed,
+    /// and connects the control processes to it again.
+    fn restart_fe(&mut self) {
+        self.fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+        self.settle();
+        let (a, b) = UnixStream::pair().unwrap();
+        self.fe.attach(a, writers::CONFIG).unwrap();
+        self.confd.connect_fe(b).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        self.fe.attach(a, writers::ROUTE).unwrap();
+        self.ribd.reconnect_fe(b).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        self.fe.attach(a, writers::NEIGHBOR).unwrap();
+        let (fe_punt, neighd_punt) = UnixDatagram::pair().unwrap();
+        self.fe.attach_punt(fe_punt).unwrap();
+        self.neighd.reconnect_fe(b, neighd_punt).unwrap();
+        self.settle();
     }
 
     fn tx(&mut self) -> Vec<(IfId, Vec<u8>)> {
@@ -212,6 +260,7 @@ impl Remote {
 #[test]
 fn the_file_makes_a_router_that_seals_to_the_peer_and_opens_from_it() {
     let mut router = Router::start();
+    router.give_session(1, 2);
 
     // Out: the first packet finds the endpoint's next hop unknown; neighd asks for it.
     let to_peer = frame(LAN_MAC, HOST_MAC, &ipv4(HOST, [10, 9, 0, 5]));
@@ -290,38 +339,90 @@ fn the_file_makes_a_router_that_seals_to_the_peer_and_opens_from_it() {
     assert_eq!(&forwarded[0].1[26..30], &[10, 9, 0, 7]);
 }
 
-#[test]
-fn a_peer_without_a_session_makes_the_fe_ask_for_a_key_exchange() {
-    // The same file without the peer's session line.
-    let without: String = FILE
-        .lines()
-        .filter(|line| !line.starts_with("session = "))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let mut router = Router::start_with(&without);
-    let to_peer = frame(LAN_MAC, HOST_MAC, &ipv4(HOST, [10, 9, 0, 5]));
-
-    // The gateway is resolved first (the packet is dropped for it).
-    router.fe.io_mut().inject(LAN, to_peer.clone());
+/// Makes the FE resolve the gateway, with the packet that asks for it dropped.
+fn resolve_gateway(router: &mut Router, packet: &[u8]) {
+    router.fe.io_mut().inject(LAN, packet.to_vec());
     router.settle();
     let requests = router.tx();
     router.answer_arp(&requests);
-    assert!(router.confd.take_key_exchange_requests().is_empty());
+}
 
-    // Now it is the session that is missing: the FE tells confd, once.
+/// The key exchange requests that reached the daemon.
+fn asked(router: &mut Router) -> Vec<KeyExchangeRequest> {
+    std::mem::take(&mut router.key_events)
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Notification { payload } => {
+                KeyExchangeRequest::decode(&mut Decoder::new(&payload)).ok()
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn branch() -> KeyExchangeRequest {
+    KeyExchangeRequest {
+        interface: "wg0".into(),
+        peer: "branch".into(),
+    }
+}
+
+#[test]
+fn a_peer_without_a_session_makes_the_fe_ask_the_daemon_for_a_key_exchange() {
+    let mut router = Router::start();
+    let to_peer = frame(LAN_MAC, HOST_MAC, &ipv4(HOST, [10, 9, 0, 5]));
+    resolve_gateway(&mut router, &to_peer);
+    assert!(asked(&mut router).is_empty());
+
+    // Now it is the session that is missing: the FE tells confd, once, and confd
+    // tells the daemon.
     for _ in 0..3 {
         router.fe.io_mut().inject(LAN, to_peer.clone());
     }
     router.settle();
     assert!(router.tx().is_empty(), "nothing is sent without a session");
-    let asked = router.confd.take_key_exchange_requests();
-    assert_eq!(
-        asked,
-        [ruster_proto::table::KeyExchangeRequest {
-            interface: "wg0".into(),
-            peer: "branch".into(),
-        }]
-    );
+    assert_eq!(asked(&mut router), [branch()]);
     assert_eq!(router.fe.counters().key_exchange_requests, 1);
-    assert_eq!(router.confd.counters().key_exchange_requests, 1);
+    assert_eq!(router.confd.take_key_exchange_requests(), [branch()]);
+
+    // The daemon's session makes it go.
+    router.give_session(1, 2);
+    router.fe.io_mut().inject(LAN, to_peer);
+    router.settle();
+    assert_eq!(router.tx().len(), 1);
+}
+
+#[test]
+fn a_restarted_fe_does_not_get_the_old_session_and_never_seals_with_its_counters() {
+    let mut router = Router::start();
+    router.give_session(1, 2);
+    let to_peer = frame(LAN_MAC, HOST_MAC, &ipv4(HOST, [10, 9, 0, 5]));
+    resolve_gateway(&mut router, &to_peer);
+    router.fe.io_mut().inject(LAN, to_peer.clone());
+    router.settle();
+    let first = router.tx();
+    assert_eq!(first.len(), 1, "sealed with the session");
+
+    // The FE starts again: its counter is gone. It must not seal with that key.
+    router.restart_fe();
+    resolve_gateway(&mut router, &to_peer);
+    router.fe.io_mut().inject(LAN, to_peer.clone());
+    router.settle();
+    assert!(router.tx().is_empty(), "the old session is not used");
+    assert_eq!(asked(&mut router), [branch()]);
+
+    // Even if the daemon repeats the same session.
+    router.give_session(1, 2);
+    router.fe.io_mut().inject(LAN, to_peer.clone());
+    router.settle();
+    assert!(router.tx().is_empty(), "the same key stays unused");
+
+    // A new session works, from counter 0 with a new key.
+    router.give_session(3, 4);
+    router.fe.io_mut().inject(LAN, to_peer);
+    router.settle();
+    let sent = router.tx();
+    assert_eq!(sent.len(), 1);
+    let counter = &sent[0].1[14 + 28 + 8..14 + 28 + 16];
+    assert_eq!(counter, 0_u64.to_le_bytes());
 }

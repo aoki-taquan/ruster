@@ -37,6 +37,9 @@ pub mod socket {
     pub const NEIGHD_CONFIG: &str = "neighd/config.sock";
     /// confd's socket for a new configuration file (from `ruster apply`).
     pub const CONFD_CONFIG: &str = "confd/config.sock";
+    /// confd's table server for WireGuard sessions, written by the key exchange
+    /// daemon (the source kind `wireguard-keys` of `docs/design/ce-processes.md`).
+    pub const CONFD_WIREGUARD_KEYS: &str = "confd/source/wireguard-keys.sock";
 
     /// ribd's table server for the route source `name`.
     pub fn ribd_source(name: &str) -> String {

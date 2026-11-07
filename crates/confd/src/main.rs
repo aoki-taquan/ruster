@@ -39,6 +39,8 @@ fn run() -> Result<(), String> {
         errors
     };
     prepare(&config);
+    let keys_listener = daemon::listen(&run_dir.join(socket::CONFD_WIREGUARD_KEYS))
+        .map_err(|error| error.to_string())?;
     let listener = daemon::listen(&run_dir.join(socket::CONFD_CONFIG))
         .map_err(|error| format!("{}: {error}", socket::CONFD_CONFIG))?;
     let mut apply = Apply::new();
@@ -83,6 +85,11 @@ fn run() -> Result<(), String> {
                 }
                 .map_err(|error| error.to_string())?;
                 eprintln!("ruster-confd: connected to {name} again");
+            }
+        }
+        for stream in daemon::accept(&keys_listener) {
+            if let Err(error) = confd.attach_keys(stream) {
+                eprintln!("ruster-confd: {}: {error}", socket::CONFD_WIREGUARD_KEYS);
             }
         }
         for stream in daemon::accept(&listener) {

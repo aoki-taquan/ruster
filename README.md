@@ -59,7 +59,7 @@ default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFE�
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます（AF_XDPのみ）。
 MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます（AF_XDPのみ。ルータ自身のIPv4はまだMAP-Eを通りません）。
 PPPoEのセッション（RFC 2516）を、設定ファイルの`pppoe`のインターフェースで使えます。セッションの確立は外のデーモンの仕事で、FEは包むのと外すのだけを行います。
-WireGuard（IPv4の内側と外側）のデータを、設定ファイルの`wireguard`のインターフェースとピアで暗号化して送り、開いて転送します。鍵交換は外のデーモンの仕事で、今は設定ファイルに書いたセッション鍵を使います。
+WireGuard（IPv4の内側と外側）のデータを、設定ファイルの`wireguard`のインターフェースとピアで暗号化して送り、開いて転送します。鍵交換は外のデーモンの仕事で、できたセッションは`confd/source/wireguard-keys.sock`（`ruster wireguard session`）でconfdへ渡します。セッションは使い捨てで、FEが起動し直すと鍵交換からやり直します。
 FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don't Fragmentが無いもの）、NATはフラグメントになったdatagramも変換します。
 
 ## 動かす
@@ -126,6 +126,7 @@ ruster apply router.toml                     # 確かめてから、動いてい
 ruster show                                  # FEが持っている表を全部表示する
 ruster route add --source routed 203.0.113.0/24 dev wan via 198.51.100.1
 ruster route del --source routed 203.0.113.0/24
+ruster wireguard session add wg0 branch 22 11 < keys    # 鍵交換デーモンの代わり。鍵は標準入力から2行
 ```
 
 `apply`は、confdが変わった分をFE、ribd、neighdへ送り、全部が受け取ってから答えます。どれかが断ると

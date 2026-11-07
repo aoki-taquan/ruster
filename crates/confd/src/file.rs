@@ -39,8 +39,8 @@
 //! name = "branch"
 //! endpoint = "203.0.113.9:51821"
 //! allowed = ["10.9.0.0/16"]    # what the peer may send from and be sent to
-//! # The session the key exchange made, until a daemon hands it to confd:
-//! session = { send = "<64 hex digits>", receive = "<64 hex digits>", peer-index = 22, local-index = 11 }
+//! # The session keys are not here: the key exchange daemon gives them to confd
+//! # (`confd/source/wireguard-keys.sock`, or `ruster wireguard session`).
 //!
 //! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
 //! interface = "map"            # the tunnel interface it makes
@@ -187,17 +187,6 @@ struct WireguardPeerEntry {
     name: String,
     endpoint: String,
     allowed: Vec<String>,
-    session: Option<WireguardSessionEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "kebab-case")]
-struct WireguardSessionEntry {
-    send: String,
-    receive: String,
-    peer_index: u32,
-    local_index: u32,
 }
 
 /// A MAP-E CE (RFC 7597): one Basic Mapping Rule, the delegated prefix, the BR.
@@ -817,32 +806,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             allowed.push((address, len));
         }
-        let session = match &entry.session {
-            None => None,
-            Some(session) => {
-                let key = |text: &str, what: &str| {
-                    hex32(text).ok_or_else(|| format!("{at}: session {what} must be 64 hex digits"))
-                };
-                let (send, receive) = (
-                    key(&session.send, "send")?,
-                    key(&session.receive, "receive")?,
-                );
-                if send == [0; 32] || receive == [0; 32] {
-                    return Err(format!("{at}: a session key must not be all zeros"));
-                }
-                Some(ruster_proto::table::WireguardSession {
-                    send,
-                    receive,
-                    peer_index: session.peer_index,
-                    local_index: session.local_index,
-                })
-            }
-        };
         wireguard.peers.push(WireguardPeerConfig {
             name: entry.name,
             endpoint: (*endpoint.ip(), endpoint.port()),
             allowed,
-            session,
         });
     }
     // The outer packets are sent from one of the router's own addresses in the
@@ -1131,18 +1098,6 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Firewall
         protocol,
         action,
     })
-}
-
-/// 32 bytes from 64 hex digits.
-fn hex32(text: &str) -> Option<[u8; 32]> {
-    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return None;
-    }
-    let mut out = [0_u8; 32];
-    for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks(2)) {
-        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(out)
 }
 
 fn mac(text: &str) -> Option<[u8; 6]> {

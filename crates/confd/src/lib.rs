@@ -23,7 +23,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::UnixStream;
 
-use ruster_proto::session::{Client, Event};
+use ruster_proto::session::{Client, Event, Hook, Server, Store};
 use ruster_proto::table::{network, Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
@@ -90,9 +90,6 @@ pub struct WireguardPeerConfig {
     pub name: String,
     pub endpoint: (Ipv4Addr, u16),
     pub allowed: Vec<(Ipv4Addr, u8)>,
-    /// The session the key-exchange daemon made. Until it hands sessions to confd,
-    /// a file may carry one.
-    pub session: Option<ruster_proto::table::WireguardSession>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -200,6 +197,39 @@ pub struct Confd {
     last_refusal: Option<(PeerKind, String, u64)>,
     /// WireGuard peers the FE says need a key exchange, until taken.
     key_requests: Vec<ruster_proto::table::KeyExchangeRequest>,
+    /// The table server the key exchange daemon writes sessions to.
+    keys: Server,
+    /// The sessions there when the FE last connected: not sent to it.
+    stale_sessions: BTreeMap<Key, Value>,
+}
+
+/// Takes only sessions of configured WireGuard peers from the key exchange daemon.
+struct KeysHook<'a> {
+    config: &'a Config,
+    changed: bool,
+}
+
+impl Hook for KeysHook<'_> {
+    fn check(&mut self, next: &Store) -> Result<(), String> {
+        for (key, _) in next.iter() {
+            let Key::WireguardSession { interface, peer } = key else {
+                return Err("only WireGuard sessions are taken here".to_owned());
+            };
+            let known = self
+                .config
+                .wireguard
+                .iter()
+                .any(|w| w.name == *interface && w.peers.iter().any(|p| p.name == *peer));
+            if !known {
+                return Err(format!("no WireGuard peer {peer} of {interface}"));
+            }
+        }
+        Ok(())
+    }
+
+    fn committed(&mut self, _store: &Store) {
+        self.changed = true;
+    }
 }
 
 impl std::fmt::Debug for Confd {
@@ -222,16 +252,32 @@ impl Confd {
             generation: 0,
             last_refusal: None,
             key_requests: Vec::new(),
+            keys: Server::new(),
+            stale_sessions: BTreeMap::new(),
         }
     }
 
     /// Connects to the FE as the writer of interfaces, addresses, firewall rules and NAT.
     pub fn connect_fe(&mut self, stream: UnixStream) -> io::Result<()> {
+        // What the FE held may be gone: it must not get the old sessions again.
+        self.stale_sessions = self
+            .keys
+            .store()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
         let mut peer = self.full_send(stream, Self::fe_tables, false)?;
         // The FE tells when a WireGuard peer needs its key exchange.
         peer.client.observe();
         self.fe = Some(peer);
         Ok(())
+    }
+
+    /// Accepts the connection of the key exchange daemon, which writes WireGuard
+    /// sessions and observes the requests for a key exchange.
+    pub fn attach_keys(&mut self, stream: UnixStream) -> io::Result<()> {
+        self.keys
+            .attach(stream, &[ruster_proto::sid::WIREGUARD_SESSION])
     }
 
     /// Connects to ribd as the route source `confd`.
@@ -390,15 +436,22 @@ impl Confd {
                         allowed: peer.allowed.clone(),
                     }),
                 );
-                if let Some(session) = peer.session {
-                    out.insert(
-                        Key::WireguardSession {
-                            interface: wireguard.name.clone(),
-                            peer: peer.name.clone(),
-                        },
-                        Value::WireguardSession(session),
-                    );
-                }
+            }
+        }
+        // Sessions the key exchange daemon gave since the FE connected. One given
+        // before is not sent: a FE that started again has lost its counter, and the
+        // same key would seal with counters it used before.
+        for (key, value) in self.keys.store().iter() {
+            let Key::WireguardSession { interface, peer } = key else {
+                continue;
+            };
+            let known = self
+                .config
+                .wireguard
+                .iter()
+                .any(|w| w.name == *interface && w.peers.iter().any(|p| p.name == *peer));
+            if known && self.stale_sessions.get(key) != Some(value) {
+                out.insert(key.clone(), value.clone());
             }
         }
         if let Some(nat) = &self.config.nat {
@@ -568,6 +621,17 @@ fn send_diff(
 impl Task for Confd {
     fn step(&mut self, _now_ms: u64) -> Progress {
         let mut progress = Progress::IDLE;
+        let mut hook = KeysHook {
+            config: &self.config,
+            changed: false,
+        };
+        progress = progress.and(self.keys.step(&mut hook));
+        if hook.changed {
+            let desired = self.fe_tables();
+            if let Some(peer) = &mut self.fe {
+                send_diff(peer, &desired, self.generation, &mut self.counters);
+            }
+        }
         // Peers that refused a patch older than the configuration now held: a refusal
         // drops every patch in flight, the newer ones too, so they get it all again.
         let mut resend = Vec::new();
@@ -584,6 +648,7 @@ impl Task for Confd {
                     let mut d = ruster_proto::cbor::Decoder::new(payload);
                     if let Ok(request) = ruster_proto::table::KeyExchangeRequest::decode(&mut d) {
                         self.counters.key_exchange_requests += 1;
+                        self.keys.notify(payload);
                         if self.key_requests.len() < KEY_REQUESTS_KEPT
                             && !self.key_requests.contains(&request)
                         {

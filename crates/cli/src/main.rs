@@ -26,7 +26,7 @@ use ruster_proto::coap::Code;
 use ruster_proto::daemon::{self, socket};
 use ruster_proto::session::{decode_changes, Client, Event};
 use ruster_proto::table::{
-    format_mac, network, Change, Key, NextHop, RouteAction, Value, DEFAULT_VRF,
+    format_mac, network, Change, Key, NextHop, RouteAction, Value, WireguardSession, DEFAULT_VRF,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -36,7 +36,10 @@ const USAGE: &str = "usage:
   ruster [--run-dir DIR] apply FILE
   ruster [--run-dir DIR] show
   ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
-  ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX";
+  ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
+  ruster [--run-dir DIR] wireguard session add IFACE PEER PEER_INDEX LOCAL_INDEX
+      (the send and receive keys come from standard input: two lines of 64 hex digits)
+  ruster [--run-dir DIR] wireguard session del IFACE PEER";
 
 /// Sends one request and waits for its answer.
 fn request(
@@ -210,6 +213,69 @@ fn route(run_dir: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// 32 bytes from 64 hex digits.
+fn hex32(text: &str) -> Result<[u8; 32], String> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("a key must be 64 hex digits".to_owned());
+    }
+    let mut out = [0_u8; 32];
+    for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks(2)) {
+        let pair = std::str::from_utf8(pair).map_err(|e| e.to_string())?;
+        *byte = u8::from_str_radix(pair, 16).map_err(|e| e.to_string())?;
+    }
+    Ok(out)
+}
+
+/// Writes or deletes a WireGuard session, as the key exchange daemon does. The keys
+/// come from standard input, so that they are not on a command line.
+fn wireguard(run_dir: &Path, args: &[String]) -> Result<(), String> {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let change = match words[..] {
+        ["session", "add", interface, peer, peer_index, local_index] => {
+            let index = |text: &str| {
+                text.parse::<u32>()
+                    .map_err(|_| format!("{text}: not an index"))
+            };
+            let mut lines = std::io::stdin().lines();
+            let mut key = || -> Result<[u8; 32], String> {
+                let line = lines
+                    .next()
+                    .ok_or("the keys come from standard input")?
+                    .map_err(|e| e.to_string())?;
+                hex32(line.trim())
+            };
+            let (send, receive) = (key()?, key()?);
+            Change::set(
+                Key::WireguardSession {
+                    interface: interface.to_owned(),
+                    peer: peer.to_owned(),
+                },
+                Value::WireguardSession(WireguardSession {
+                    send,
+                    receive,
+                    peer_index: index(peer_index)?,
+                    local_index: index(local_index)?,
+                }),
+            )
+        }
+        ["session", "del", interface, peer] => Change::delete(Key::WireguardSession {
+            interface: interface.to_owned(),
+            peer: peer.to_owned(),
+        }),
+        _ => return Err(USAGE.into()),
+    };
+    change.validate().map_err(|e| e.to_string())?;
+    let path = run_dir.join(socket::CONFD_WIREGUARD_KEYS);
+    let (code, payload) = request(&path, |c| c.patch(&[change]).map_err(|e| e.to_string()))?;
+    if code.class() != 2 {
+        return Err(format!(
+            "confd refused the session: {}",
+            String::from_utf8_lossy(&payload)
+        ));
+    }
+    Ok(())
+}
+
 fn check(path: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let config = ruster_confd::file::parse(&text).map_err(|e| format!("{path}: {e}"))?;
@@ -248,6 +314,7 @@ fn run() -> Result<(), String> {
             ("apply", [file]) => apply(&run_dir, file),
             ("show", []) => show(&run_dir),
             ("route", args) => route(&run_dir, args),
+            ("wireguard", args) => wireguard(&run_dir, args),
             _ => Err(USAGE.into()),
         },
         None => Err(USAGE.into()),

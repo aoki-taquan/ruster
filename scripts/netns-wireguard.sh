@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # WireGuard on real Linux: a LAN host reaches a peer behind the router's WireGuard
-# interface (10.9.0.0/16); scripts/wg-peer.py plays the peer's data plane with the
-# session keys the router's file gives (no handshake: the key exchange is a daemon's
-# job, which ruster does not have yet).
+# interface (10.9.0.0/16); scripts/wg-peer.py plays the peer's data plane. There is no
+# handshake: the key exchange is a daemon's job, outside ruster. This script plays the
+# daemon, with new random keys every run, given to confd with `ruster wireguard session`.
 #
 #   lan (192.168.0.10) -- [r-lan | router | r-wan 198.51.100.2] -- [a0 peer 198.51.100.1, 10.9.0.9]
 #
@@ -58,8 +58,9 @@ nsx "$peer" ip addr add 198.51.100.1/24 dev a0
 # wg0, is dropped instead of answered.
 nsx "$peer" sysctl -qw net.ipv4.conf.all.rp_filter=1 net.ipv4.conf.a0.rp_filter=1
 
-send=0202020202020202020202020202020202020202020202020202020202020202   # the router receives with this
-receive=0101010101010101010101010101010101010101010101010101010101010101 # the router sends with this
+# New keys every run: a key must never seal two messages with one counter.
+send=$(python3 -c 'import secrets; print(secrets.token_hex(32))')     # the peer's, the router receives with it
+receive=$(python3 -c 'import secrets; print(secrets.token_hex(32))')  # the router's, the peer receives with it
 # Started directly (not through nsx), so that the pid is python's and cleanup stops it.
 ip netns exec "$peer" python3 "$here/wg-peer.py" 198.51.100.1 51821 198.51.100.2 51820 wg0 \
   "$send" "$receive" 11 22 1420 >"$work/peer.log" 2>&1 &
@@ -90,7 +91,6 @@ interface = "wg0"
 name = "branch"
 endpoint = "198.51.100.1:51821"
 allowed = ["10.9.0.0/16"]
-session = { send = "$receive", receive = "$send", peer-index = 22, local-index = 11 }
 
 [[route]]
 prefix = "10.9.0.0/16"
@@ -108,6 +108,10 @@ start ruster-fe --backend "$backend" r-lan r-wan
 start ruster-ribd
 start ruster-neighd
 start ruster-confd "$work/router.toml"
+for _ in $(seq 1 50); do [[ -S "$run_dir/confd/source/wireguard-keys.sock" ]] && break; sleep 0.1; done
+sleep 0.5
+printf '%s\n%s\n' "$receive" "$send" | nsx "$router" "$bin/ruster" --run-dir "$run_dir" \
+  wireguard session add wg0 branch 22 11 || fail "confd did not take the session"
 
 ok=0
 for _ in $(seq 1 20); do
