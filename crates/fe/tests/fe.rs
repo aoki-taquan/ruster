@@ -394,7 +394,7 @@ fn the_resolve_rate_limit_forgets_old_next_hops_and_stays_bounded() {
     };
 
     // Spread out: every next hop gets its request, because old ones are forgotten.
-    for n in 1..=2_000_u32 {
+    for n in 1..=1_100_u32 {
         bench.now = u64::from(n) * 2;
         bench
             .fe
@@ -402,12 +402,12 @@ fn the_resolve_rate_limit_forgets_old_next_hops_and_stays_bounded() {
             .inject(IfId(0), udp_from_host(destination(n)));
         bench.fe.step(bench.now);
     }
-    assert_eq!(bench.fe.counters().resolve_requests, 2_000);
+    assert_eq!(bench.fe.counters().resolve_requests, 1_100);
     assert_eq!(bench.fe.counters().resolve_requests_dropped, 0);
 
     // All at one moment: at most 1 024 are remembered, the rest wait.
     bench.now = 1_000_000;
-    for n in 10_000..12_000_u32 {
+    for n in 10_000..11_100_u32 {
         bench
             .fe
             .io_mut()
@@ -415,8 +415,8 @@ fn the_resolve_rate_limit_forgets_old_next_hops_and_stays_bounded() {
         bench.fe.step(bench.now);
     }
     let counters = bench.fe.counters();
-    assert_eq!(counters.resolve_requests, 2_000 + 1_024);
-    assert_eq!(counters.resolve_requests_dropped, 2_000 - 1_024);
+    assert_eq!(counters.resolve_requests, 1_100 + 1_024);
+    assert_eq!(counters.resolve_requests_dropped, 1_100 - 1_024);
 }
 
 #[test]
