@@ -193,12 +193,12 @@ impl<'memory> UmemFrames<'memory> {
         Some(unsafe { std::slice::from_raw_parts(pointer, len) })
     }
 
-    /// Exclusive view of a leased frame's visible bytes.
     /// The size of one UMEM frame.
     pub(crate) const fn frame_size(&self) -> u64 {
         self.frame_size
     }
 
+    /// Exclusive view of a leased frame's visible bytes.
     pub(crate) fn leased_bytes_mut(
         &mut self,
         token: FrameToken,

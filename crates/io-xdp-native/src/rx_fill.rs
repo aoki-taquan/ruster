@@ -1444,6 +1444,13 @@ impl<'memory> RxFillEngine<'memory> {
         true
     }
 
+    /// Whether a lease's visible bytes start inside the frame's headroom (its front
+    /// was grown there): such a frame cannot be sent in place.
+    pub(crate) fn lease_before_headroom(&self, lease: &RawLease) -> bool {
+        self.check_lease(lease);
+        u64::from(lease.descriptor.data_offset()) < self.state.headroom
+    }
+
     /// Turns an RX lease back into the borrowing view that ends it.
     pub(crate) fn resume_rx(&mut self, lease: RawLease) -> RxFrame<'_, 'memory> {
         self.check_lease(&lease);

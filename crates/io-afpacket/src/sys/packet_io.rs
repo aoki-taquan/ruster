@@ -399,7 +399,7 @@ impl<O: PacketOps> PacketSlot for AfPacketSlot<'_, '_, O> {
 
     fn resize_front(&mut self, delta: isize) -> bool {
         let moved = if let Ok(drop) = usize::try_from(delta) {
-            if drop > self.len {
+            if drop >= self.len {
                 return false;
             }
             self.front += drop;

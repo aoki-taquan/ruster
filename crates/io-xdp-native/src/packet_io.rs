@@ -990,7 +990,13 @@ impl<'memory> XdpPacketIo<'memory> {
             return false;
         }
         if out == ingress {
-            self.transmit_in_place(out, lease, error)
+            // A frame grown into the headroom cannot go out as it is (TX
+            // descriptors keep the headroom free); it is copied instead.
+            if self.ports[out].engine.lease_before_headroom(&lease) {
+                self.transmit_copy_same_port(out, lease, error)
+            } else {
+                self.transmit_in_place(out, lease, error)
+            }
         } else {
             self.transmit_copy(ingress, out, lease, error)
         }
@@ -1047,6 +1053,51 @@ impl<'memory> XdpPacketIo<'memory> {
         }
     }
 
+    /// A frame for its own port that grew into the headroom: staged on the stack,
+    /// its RX frame returned, and sent from a generated frame of the same port.
+    fn transmit_copy_same_port(
+        &mut self,
+        port: usize,
+        lease: RawLease,
+        error: &mut Option<XdpIoError>,
+    ) -> bool {
+        #[cfg(test)]
+        let snapshot = self.test_rx_snapshot(port, &lease);
+        let state = &mut self.ports[port];
+        #[cfg(test)]
+        let interface = state.config.interface;
+        let len = lease.len() as usize;
+        let mut staged = [0_u8; SAME_PORT_COPY_MAX];
+        let fits = len <= staged.len();
+        if fits {
+            staged[..len].copy_from_slice(state.engine.lease_bytes(&lease));
+        } else {
+            bump(&mut state.counters.tx_over_mtu);
+        }
+        state.engine.resume_rx(lease).recycle();
+        let (accepted, blocked, failure) = if fits {
+            copy_into(state, &staged[..len])
+        } else {
+            (false, false, None)
+        };
+        if let Some(failure) = failure {
+            let failure = if matches!(failure, XdpIoError::Submit { .. }) {
+                self.fault(failure)
+            } else {
+                failure
+            };
+            error.get_or_insert(failure);
+        }
+        if blocked {
+            self.relieve(port, error);
+        }
+        #[cfg(test)]
+        if !accepted {
+            self.test_rx_rejected(port, snapshot, interface, Some(port));
+        }
+        accepted
+    }
+
     fn transmit_copy(
         &mut self,
         ingress: usize,
@@ -1060,71 +1111,9 @@ impl<'memory> XdpPacketIo<'memory> {
             .ports
             .get_disjoint_mut([ingress, out])
             .expect("distinct ports in range");
+        #[cfg(test)]
         let interface = target.config.interface;
-        let len = lease.len() as usize;
-        let mut failure = None;
-        let mut blocked = false;
-        let free = target.engine.generated_free_frames();
-        let accepted = if free != 0 && free <= target.copy_reserve {
-            bump(&mut target.counters.cross_port_copy_reserved);
-            false
-        } else {
-            match target
-                .engine
-                .allocate_generated_raw(len, ZeroFill::Overwritten)
-            {
-                Ok(copy) => {
-                    // Every visible byte is overwritten here, before the
-                    // lease can end or be observed (the engine skipped
-                    // zeroing).
-                    target
-                        .engine
-                        .lease_bytes_mut(&copy)
-                        .copy_from_slice(source.engine.lease_bytes(&lease));
-                    match target.engine.resume_generated(copy).commit() {
-                        Ok(_) => {
-                            target.kick_owed = true;
-                            bump(&mut target.counters.cross_port_copies);
-                            true
-                        }
-                        Err(rejected) => {
-                            let reason = rejected.reason();
-                            let cancelled =
-                                target.engine.cancel_tx_handoff(rejected.into_handoff());
-                            assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
-                            if let TxRejection::Blocked(_) = reason {
-                                bump(&mut target.counters.tx_blocked);
-                                blocked = true;
-                            } else {
-                                failure = Some(XdpIoError::Submit {
-                                    interface,
-                                    rejection: reason,
-                                });
-                            }
-                            false
-                        }
-                    }
-                }
-                Err(GeneratedAllocError::Unavailable) => {
-                    bump(&mut target.counters.cross_port_copy_unavailable);
-                    false
-                }
-                Err(GeneratedAllocError::Rejected(_)) => {
-                    // Only `Draining` is reachable (the length is within the
-                    // MTU bound, itself capped by the frame capacity), and a
-                    // draining engine belongs to a stopped adapter.
-                    bump(&mut target.counters.tx_blocked);
-                    false
-                }
-                Err(GeneratedAllocError::Ledger(ledger)) => {
-                    failure = Some(XdpIoError::GeneratedLedger {
-                        interface,
-                        error: ledger,
-                    });
-                    false
-                }
-            }
-        };
+        let (accepted, blocked, failure) = copy_into(target, source.engine.lease_bytes(&lease));
         // The source frame's job ended with the copy (or the refusal).
         source.engine.resume_rx(lease).recycle();
         if let Some(failure) = failure {
@@ -2511,3 +2500,70 @@ impl BackendStats for XdpPacketIo<'_> {
 #[cfg(test)]
 #[path = "packet_io_hooks.rs"]
 pub(crate) mod test_hooks;
+
+/// The largest frame copied back out of its own port (a jumbo frame and a tag).
+const SAME_PORT_COPY_MAX: usize = 9_216 + 64;
+
+/// Copies `bytes` into a generated frame of `target` and commits it. Returns whether
+/// it was accepted, whether TX was blocked, and a failure to report.
+fn copy_into(target: &mut PortState<'_>, bytes: &[u8]) -> (bool, bool, Option<XdpIoError>) {
+    let interface = target.config.interface;
+    let mut failure = None;
+    let mut blocked = false;
+    let free = target.engine.generated_free_frames();
+    let accepted = if free != 0 && free <= target.copy_reserve {
+        bump(&mut target.counters.cross_port_copy_reserved);
+        false
+    } else {
+        match target
+            .engine
+            .allocate_generated_raw(bytes.len(), ZeroFill::Overwritten)
+        {
+            Ok(copy) => {
+                // Every visible byte is overwritten here, before the lease can end
+                // or be observed (the engine skipped zeroing).
+                target.engine.lease_bytes_mut(&copy).copy_from_slice(bytes);
+                match target.engine.resume_generated(copy).commit() {
+                    Ok(_) => {
+                        target.kick_owed = true;
+                        bump(&mut target.counters.cross_port_copies);
+                        true
+                    }
+                    Err(rejected) => {
+                        let reason = rejected.reason();
+                        let cancelled = target.engine.cancel_tx_handoff(rejected.into_handoff());
+                        assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
+                        if let TxRejection::Blocked(_) = reason {
+                            bump(&mut target.counters.tx_blocked);
+                            blocked = true;
+                        } else {
+                            failure = Some(XdpIoError::Submit {
+                                interface,
+                                rejection: reason,
+                            });
+                        }
+                        false
+                    }
+                }
+            }
+            Err(GeneratedAllocError::Unavailable) => {
+                bump(&mut target.counters.cross_port_copy_unavailable);
+                false
+            }
+            Err(GeneratedAllocError::Rejected(_)) => {
+                // `Draining`, or a frame shorter than the Ethernet minimum after its
+                // front was moved: counted as blocked.
+                bump(&mut target.counters.tx_blocked);
+                false
+            }
+            Err(GeneratedAllocError::Ledger(ledger)) => {
+                failure = Some(XdpIoError::GeneratedLedger {
+                    interface,
+                    error: ledger,
+                });
+                false
+            }
+        }
+    };
+    (accepted, blocked, failure)
+}
