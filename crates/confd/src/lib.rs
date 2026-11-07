@@ -13,9 +13,8 @@
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
 //! sends only what changed.
 //!
-//! Skeleton limits: the configuration is a Rust value (the human-facing file format is
-//! not decided yet), IPv4 only, one address per interface, no dynamic values from other
-//! daemons yet.
+//! The configuration file is TOML ([`file`]). Skeleton limits: IPv4 only, one address
+//! per interface, no dynamic values from other daemons yet.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -25,6 +24,8 @@ use std::os::unix::net::UnixStream;
 use ruster_proto::session::{Client, Event};
 use ruster_proto::table::{Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
+
+pub mod file;
 
 /// The VRF of everything in the skeleton.
 pub const VRF: &str = "default";
