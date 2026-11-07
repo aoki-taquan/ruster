@@ -80,21 +80,49 @@ fn default_enabled() -> bool {
 #[derive(Default)]
 struct Seen {
     names: BTreeSet<String>,
+    /// The router's addresses other than link-local ones.
     addresses: BTreeSet<IpAddr>,
+    /// Link-local addresses belong to one link: kept per interface, the automatic one
+    /// included.
+    link_local: BTreeSet<(String, Ipv6Addr)>,
     /// Connected prefixes (link-local ones are on every interface and not counted).
     connected: BTreeSet<(IpAddr, u8)>,
 }
 
 impl Seen {
-    fn address(&mut self, at: &str, address: IpAddr, len: u8) -> Result<(), String> {
-        if !self.addresses.insert(address) {
-            return Err(format!("{at}: {address} is on another interface too"));
+    fn address(
+        &mut self,
+        at: &str,
+        interface: &str,
+        address: IpAddr,
+        len: u8,
+    ) -> Result<(), String> {
+        if let IpAddr::V6(a) = address {
+            if a.is_unicast_link_local() {
+                // The automatic link-local address may be given again; that is the same entry.
+                self.link_local.insert((interface.to_owned(), a));
+                return Ok(());
+            }
         }
-        let link_local = matches!(address, IpAddr::V6(a) if a.is_unicast_link_local());
-        if !link_local && !self.connected.insert((network(address, len), len)) {
-            return Err(format!("{at}: another interface has the same prefix"));
+        if !self.addresses.insert(address) {
+            return Err(format!("{at}: {address} is given twice"));
+        }
+        if !self.connected.insert((network(address, len), len)) {
+            return Err(format!(
+                "{at}: the prefix of {address} is already on an interface"
+            ));
         }
         Ok(())
+    }
+
+    /// Whether `via` is one of the router's own addresses, for a route out of `interface`.
+    fn is_ours(&self, interface: &str, via: IpAddr) -> bool {
+        match via {
+            IpAddr::V6(v) if v.is_unicast_link_local() => {
+                self.link_local.contains(&(interface.to_owned(), v))
+            }
+            _ => self.addresses.contains(&via),
+        }
     }
 }
 
@@ -130,7 +158,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 if !unicast_v4(address) {
                     return Err(format!("{at}: ipv4 must be a unicast address"));
                 }
-                seen.address(&at, address.into(), len)?;
+                seen.address(&at, &entry.name, address.into(), len)?;
                 Some((address, len))
             }
             None => None,
@@ -148,9 +176,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
             if !unicast_v6(address) {
                 return Err(format!("{at}: ipv6 {text:?} must be a unicast address"));
             }
-            seen.address(&at, address.into(), len)?;
+            seen.address(&at, &entry.name, address.into(), len)?;
             ipv6.push((address, len));
         }
+        seen.link_local
+            .insert((entry.name.clone(), crate::link_local(mac)));
         interfaces.push(InterfaceConfig {
             name: entry.name,
             mac,
@@ -185,7 +215,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
                         IpAddr::V4(v) => unicast_v4(*v),
                         IpAddr::V6(v) => unicast_v6(*v),
                     })
-                    .filter(|via| !seen.addresses.contains(via));
+                    .filter(|via| !seen.is_ours(&entry.interface, *via));
                 Some(via.ok_or_else(|| {
                     format!("{at}: via must be a unicast address of another host, of the prefix's family")
                 })?)
@@ -220,7 +250,11 @@ fn mac(text: &str) -> Option<[u8; 6]> {
 
 fn prefix(text: &str) -> Option<(IpAddr, u8)> {
     let (address, len) = text.split_once('/')?;
-    if len.is_empty() || len.len() > 3 || !len.bytes().all(|b| b.is_ascii_digit()) {
+    let canonical = !len.is_empty()
+        && len.len() <= 3
+        && len.bytes().all(|b| b.is_ascii_digit())
+        && (len == "0" || !len.starts_with('0'));
+    if !canonical {
         return None;
     }
     let len: u8 = len.parse().ok()?;

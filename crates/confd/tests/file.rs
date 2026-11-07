@@ -112,14 +112,14 @@ fn mistakes_are_refused_with_what_is_wrong() {
                 "{LAN}ipv4 = \"192.0.2.1/24\"\n[[interface]]\nname = \"wan\"\n\
                  mac = \"02:00:00:00:00:02\"\nipv4 = \"192.0.2.1/30\"\n"
             ),
-            "on another interface",
+            "given twice",
         ),
         (
             &format!(
                 "{LAN}ipv4 = \"192.0.2.1/24\"\n[[interface]]\nname = \"wan\"\n\
                  mac = \"02:00:00:00:00:02\"\nipv4 = \"192.0.2.2/24\"\n"
             ),
-            "same prefix",
+            "already on an interface",
         ),
         (
             &format!(
@@ -208,9 +208,10 @@ fn ipv6_mistakes_are_refused() {
         (lan6("\"2001:db8::1/0\""), "1 to 128"),
         (lan6("\"ff02::1/64\""), "unicast"),
         (lan6("\"::1/128\""), "unicast"),
+        (lan6("\"2001:db8::1/064\""), "is not like"),
         (
             lan6("\"2001:db8::1/64\", \"2001:db8::2/64\""),
-            "same prefix",
+            "already on an interface",
         ),
         (
             format!(
@@ -253,4 +254,21 @@ fn the_link_local_address_comes_from_the_mac_address() {
         ruster_confd::link_local([0x02, 0, 0, 0, 0, 1]),
         "fe80::ff:fe00:1".parse::<std::net::Ipv6Addr>().unwrap()
     );
+}
+
+#[test]
+fn the_router_s_own_link_local_address_is_not_a_next_hop() {
+    // lan's automatic link-local address is fe80::ff:fe00:1.
+    let text = "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\n\
+                [[route]]\nprefix = \"::/0\"\ninterface = \"lan\"\nvia = \"fe80::ff:fe00:1\"\n";
+    assert!(error(text).contains("via must be"));
+    // The same link-local address on another link is another host.
+    let two = "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\n\
+               [[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\n\
+               [[route]]\nprefix = \"::/0\"\ninterface = \"wan\"\nvia = \"fe80::ff:fe00:1\"\n";
+    assert!(parse(two).is_ok());
+    // A link-local address may be given on two interfaces.
+    let shared = "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv6 = [\"fe80::1/64\"]\n\
+                  [[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv6 = [\"fe80::1/64\"]\n";
+    assert!(parse(shared).is_ok());
 }
