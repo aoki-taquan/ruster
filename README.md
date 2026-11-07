@@ -111,6 +111,18 @@ kernelに渡したフレームが戻るのを最大1秒待ってから止まり�
 相手のプロセスが落ちると、残ったプロセスは1秒ごとにつなぎ直し、自分の表を全部送り直します。
 CEのプロセスが落ちている間も、FEは持っている表で転送を続けます。
 
+### `ruster`コマンド
+
+```bash
+ruster check router.toml                     # confdと同じ読み方で設定ファイルを確かめる
+ruster show                                  # FEが持っている表を全部表示する
+ruster route add --source routed 203.0.113.0/24 dev wan via 198.51.100.1
+ruster route del --source routed 203.0.113.0/24
+```
+
+`route`は、ルーティングデーモンと同じように、ribdの送り手（ここでは`routed`。ribdを`confd:1 routed:20`の
+ように起動しておく）として経路を書きます。ribdは送り手の優先度で選んでFEへ渡します。
+
 ### netnsでの試験
 
 2台のホストとルータを別々のnetnsに作り、vethでつないで、IPv4とIPv6の両方向にpingが通ること、各プロセスを起動し直しても転送が戻ることを確かめます。
@@ -143,6 +155,7 @@ cargo test --doc --workspace --all-features --locked
 |---|---|
 | `fe` | FE（`ruster-fe`） |
 | `confd`、`ribd`、`neighd` | CEのプロセス |
+| `cli` | `ruster`コマンド |
 | `proto` | プロセス間のメッセージ（CBOR、CoAPの枠組み、表、接続、起動まわり） |
 | `core` | パケットの検証と転送の判断。packet bufferは借りるだけで、割り当てをしない |
 | `io-afpacket`、`io-xdp`、`io-xdp-native`、`io-sim` | FEのI/O層（AF_PACKET、AF_XDP、試験用のsim） |
