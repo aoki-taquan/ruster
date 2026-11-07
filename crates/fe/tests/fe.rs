@@ -637,3 +637,38 @@ fn neighbor_discovery_goes_to_the_neighbor_socket_and_frames_come_back() {
         assert_eq!(bench.fe.io_mut().pop_tx().is_some(), sent);
     }
 }
+
+#[test]
+fn an_expiring_packet_gets_an_icmp_time_exceeded_back() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut expiring = udp_from_host([203, 0, 113, 7]);
+    expiring[14 + 8] = 1;
+    expiring[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&expiring[14..34]);
+    expiring[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+    bench.fe.io_mut().inject(IfId(0), expiring);
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("an error goes back");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!(
+        &tx.bytes[14 + 12..14 + 16],
+        &[192, 0, 2, 1],
+        "from the LAN address"
+    );
+    assert_eq!(&tx.bytes[14 + 16..14 + 20], &[192, 0, 2, 10]);
+    assert_eq!(tx.bytes[14 + 9], 1, "ICMP");
+    assert_eq!(tx.bytes[34], 11, "Time Exceeded");
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    assert_eq!(bench.fe.counters().icmp_errors_sent, 1);
+}
