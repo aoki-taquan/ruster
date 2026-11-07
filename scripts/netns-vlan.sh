@@ -111,4 +111,9 @@ echo "ok: VLAN 10 reaches VLAN 20 through the same port"
 nsx "$a" ping -c 3 -i 0.2 -W 1 198.51.100.10 >/dev/null || fail "VLAN 10 to the uplink"
 nsx "$c" ping -c 3 -i 0.2 -W 1 10.20.0.10 >/dev/null || fail "the uplink to VLAN 20"
 echo "ok: tags come off toward the uplink and go on toward a VLAN"
+# An expiring packet from a VLAN: its ICMP error would leave a sub-interface, which is
+# not sent yet; the FE must go on forwarding.
+nsx "$a" ping -c 3 -i 0.2 -W 1 -t 1 198.51.100.10 >/dev/null 2>&1 || true
+nsx "$a" ping -c 3 -i 0.2 -W 1 10.20.0.10 >/dev/null || fail "forwarding stopped after expiring packets"
+echo "ok: expiring packets from a VLAN do not stop forwarding"
 echo "PASS ($backend)"

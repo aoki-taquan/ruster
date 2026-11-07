@@ -257,9 +257,13 @@ where
         self.counters.dropped += report.dropped as u64;
         self.counters.arp_to_control_dropped += trace.overflow;
 
-        while let Ok(Some(_)) =
+        // Until one cannot be built or allocated (it stays queued for the next batch).
+        while let Ok(Some(report)) =
             execute_one_icmpv4_error(&mut self.io, &mut self.icmpv4_errors, now, &mut NoTrace)
         {
+            if report.allocation_error.is_some() || report.build_error.is_some() {
+                break;
+            }
             self.counters.icmp_errors_sent += 1;
         }
         for arp in &trace.arp {

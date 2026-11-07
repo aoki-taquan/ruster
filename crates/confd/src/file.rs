@@ -76,8 +76,8 @@ struct InterfaceEntry {
     mac: Option<String>,
     parent: Option<String>,
     vlan: Option<u16>,
-    #[serde(default = "default_mtu")]
-    mtu: u16,
+    /// 1500 when left out; for a sub-interface, its parent's less the 4-byte tag.
+    mtu: Option<u16>,
     #[serde(default = "default_enabled")]
     enabled: bool,
     ipv4: Option<String>,
@@ -221,8 +221,18 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(format!("{at}: mac must be a unicast address"));
         }
-        if !(MIN_MTU..=MAX_MTU).contains(&entry.mtu) {
-            return Err(format!("{at}: mtu must be {MIN_MTU} to {MAX_MTU}"));
+        // A sub-interface's frames carry a 4-byte tag on its parent's link.
+        let max_mtu = vlan
+            .as_ref()
+            .and_then(|(parent, _, _)| interfaces.iter().find(|i| i.name == *parent))
+            .map_or(MAX_MTU, |parent| parent.mtu - 4);
+        let mtu = match (entry.mtu, &vlan) {
+            (Some(mtu), _) => mtu,
+            (None, Some(_)) => max_mtu,
+            (None, None) => default_mtu(),
+        };
+        if !(MIN_MTU..=max_mtu).contains(&mtu) {
+            return Err(format!("{at}: mtu must be {MIN_MTU} to {max_mtu}"));
         }
         let ipv4 = match &entry.ipv4 {
             Some(text) => {
@@ -261,7 +271,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         interfaces.push(InterfaceConfig {
             name: entry.name,
             mac,
-            mtu: entry.mtu,
+            mtu,
             enabled: entry.enabled,
             ipv4,
             ipv6,

@@ -210,6 +210,9 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             },
         ) = (key, value)
         {
+            if ports.iter().any(|port| port == name) {
+                return Err(format!("VLAN sub-interface {name} has the name of a port"));
+            }
             let parent = active.get(vlan.parent.as_str()).map(|&(id, _)| id);
             let Some(parent) = parent.filter(|id| usize::from(id.0) < ports.len()) else {
                 continue;

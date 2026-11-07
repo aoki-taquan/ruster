@@ -460,3 +460,17 @@ fn vlan_sub_interfaces_are_read_and_checked() {
         assert!(got.contains(expected), "{text:?}: {got}");
     }
 }
+
+#[test]
+fn a_sub_interface_mtu_leaves_room_for_the_tag() {
+    let lan = "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\n";
+    let config = parse(&format!(
+        "{lan}[[interface]]\nname = \"lan.10\"\nparent = \"lan\"\nvlan = 10\n"
+    ))
+    .unwrap();
+    assert_eq!(config.interfaces[1].mtu, 1496);
+    let got = error(&format!(
+        "{lan}[[interface]]\nname = \"lan.10\"\nparent = \"lan\"\nvlan = 10\nmtu = 1500\n"
+    ));
+    assert!(got.contains("68 to 1496"), "{got}");
+}
