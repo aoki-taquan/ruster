@@ -121,6 +121,7 @@ pub struct Fe<B> {
     /// Every interface's name by id: the ports, then VLAN sub-interfaces.
     interface_names: Vec<String>,
     vlans: Vec<VlanBinding>,
+    tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
     limiter: local::Limiter,
@@ -177,6 +178,7 @@ where
             names: built.names,
             interface_names: built.interface_names,
             vlans: built.vlans,
+            tunnels: built.tunnels,
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
             active: built.active,
@@ -257,6 +259,7 @@ where
                     .with_ipv6(&vrf.ipv6)
                     .with_local_to_control(self.local.contains_key(name))
                     .with_vlans(&self.vlans)
+                    .with_tunnels(&self.tunnels)
             })
             .collect();
         let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
@@ -266,6 +269,7 @@ where
             .with_now(MonotonicMillis(now_ms))
             .with_vrfs(&snapshots, &self.by_ingress)
             .with_vlans(&self.vlans)
+            .with_tunnels(&self.tunnels)
             .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
             return false;
@@ -592,6 +596,7 @@ where
             self.names = built.names;
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;
+            self.tunnels = built.tunnels;
             self.active = built.active;
         }
         let worked = self.worker(now_ms);

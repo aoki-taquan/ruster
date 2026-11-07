@@ -22,6 +22,11 @@ pub const INTERFACE_BIND_NI_NAME: u64 = 60014;
 pub const INTERFACE_PARENT: u64 = 60015;
 /// `ietf-if-vlan-encapsulation` `dot1q-vlan/outer-tag/vlan-id`.
 pub const INTERFACE_VLAN_ID: u64 = 60016;
+/// `ruster-if-tunnel` `tunnel/local-address`: the IPv6 address an IPv4 in IPv6
+/// tunnel is sent from.
+pub const INTERFACE_TUNNEL_LOCAL: u64 = 60017;
+/// `ruster-if-tunnel` `tunnel/remote-address`: the tunnel's other end.
+pub const INTERFACE_TUNNEL_REMOTE: u64 = 60018;
 
 pub const ADDRESS: u64 = 60020;
 pub const ADDRESS_PREFIX_LENGTH: u64 = 60021;
@@ -90,6 +95,14 @@ pub const ALL: &[(&str, u64)] = &[
     (
         "/ietf-interfaces:interfaces/interface/ietf-if-extensions:encapsulation/ietf-if-vlan-encapsulation:dot1q-vlan/outer-tag/vlan-id",
         INTERFACE_VLAN_ID,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-tunnel:tunnel/local-address",
+        INTERFACE_TUNNEL_LOCAL,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-tunnel:tunnel/remote-address",
+        INTERFACE_TUNNEL_REMOTE,
     ),
     (
         "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",

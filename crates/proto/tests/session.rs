@@ -40,6 +40,7 @@ fn iface(name: &str, last: u8) -> Change {
             mtu: 1500,
             vrf: ruster_proto::table::DEFAULT_VRF.into(),
             vlan: None,
+            tunnel: None,
         },
     )
 }

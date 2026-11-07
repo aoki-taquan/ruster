@@ -55,6 +55,18 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ruster-if-tunnel:tunnel/local-address",
+        "sid": 60017,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ruster-if-tunnel:tunnel/remote-address",
+        "sid": 60018,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",
         "sid": 60020,
         "status": "unstable"

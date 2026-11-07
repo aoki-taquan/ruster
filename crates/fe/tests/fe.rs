@@ -77,6 +77,7 @@ fn iface(name: &str, mac: [u8; 6]) -> Change {
             mtu: 1500,
             vrf: ruster_proto::table::DEFAULT_VRF.into(),
             vlan: None,
+            tunnel: None,
         },
     )
 }
@@ -714,6 +715,7 @@ fn an_interface_in_another_vrf_uses_that_vrf_s_routes_and_a_lookup_reaches_defau
             mtu: 1500,
             vrf: "red".into(),
             vlan: None,
+            tunnel: None,
         },
     );
     let code = bench.patch(
@@ -1272,4 +1274,56 @@ fn a_table_change_between_fragments_drops_the_later_ones() {
         .inject(IfId(0), fragment_of(&datagram, 40, 72, false));
     bench.fe.step(bench.now);
     assert!(bench.fe.io_mut().pop_tx().is_none(), "no stale rewrite");
+}
+
+#[test]
+fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let gateway = Change::set(
+        Key::Neighbor {
+            interface: "wan".into(),
+            address: ip6("fe80::1"),
+        },
+        Value::Neighbor { mac: GATEWAY_MAC },
+    );
+    assert_eq!(bench.patch(&mut neighbors, &[gateway]), Code::CHANGED);
+    let tunnel = Change::set(
+        Key::Interface {
+            name: "dslite".into(),
+        },
+        Value::Interface {
+            enabled: true,
+            mac: [2, 0, 0, 0, 0, 9],
+            mtu: 1460,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
+            tunnel: Some(ruster_proto::table::Tunnel {
+                local: "2001:db8:1::1".parse().unwrap(),
+                remote: "2001:db8:ff::1".parse().unwrap(),
+            }),
+        },
+    );
+    assert_eq!(bench.patch(&mut config, &[tunnel]), Code::CHANGED);
+    let to_tunnel = Change::set(
+        Key::Route {
+            vrf: "default".into(),
+            prefix: Ipv4Addr::from(INTERNET).into(),
+            len: 32,
+        },
+        Value::Route(RouteAction::Forward(vec![NextHop {
+            interface: "dslite".into(),
+            address: None,
+        }])),
+    );
+    assert_eq!(bench.patch(&mut routes, &[to_tunnel]), Code::CHANGED);
+
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[12..14], &[0x86, 0xdd]);
+    assert_eq!(tx.bytes[14 + 6], 4, "IPv4 in IPv6");
+    assert_eq!(&tx.bytes[14 + 40 + 16..14 + 40 + 20], &INTERNET);
 }

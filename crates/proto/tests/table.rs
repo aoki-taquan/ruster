@@ -38,6 +38,7 @@ fn every_table_round_trips() {
                 mtu: 1500,
                 vrf: ruster_proto::table::DEFAULT_VRF.into(),
                 vlan: None,
+                tunnel: None,
             },
         ),
         Change::set(
@@ -319,6 +320,7 @@ fn encode_refuses_what_decode_would_refuse() {
                 mtu: 0,
                 vrf: ruster_proto::table::DEFAULT_VRF.into(),
                 vlan: None,
+                tunnel: None,
             },
         ),
         Change::set(
@@ -509,6 +511,7 @@ fn vrf_binding_and_lookup_vrf_round_trip() {
                 mtu: 1500,
                 vrf: "customer".into(),
                 vlan: None,
+                tunnel: None,
             },
         ),
         Change::set(
@@ -532,6 +535,7 @@ fn vrf_binding_and_lookup_vrf_round_trip() {
             mtu: 1500,
             vrf: DEFAULT_VRF.into(),
             vlan: None,
+            tunnel: None,
         },
     );
     let mut payload = Vec::new();
@@ -568,6 +572,7 @@ fn vlan_sub_interfaces_round_trip_and_are_checked() {
                     parent: parent.into(),
                     id,
                 }),
+                tunnel: None,
             },
         )
     };
@@ -642,4 +647,43 @@ fn nat_and_firewall_entries_round_trip_and_are_checked() {
     ] {
         assert!(bad.validate().is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn tunnel_interfaces_round_trip_and_are_checked() {
+    use ruster_proto::table::Tunnel;
+    let tunnel = |local: &str, remote: &str, vlan: Option<Vlan>| {
+        Change::set(
+            Key::Interface {
+                name: "dslite".into(),
+            },
+            Value::Interface {
+                enabled: true,
+                mac: [2, 0, 0, 0, 0, 1],
+                mtu: 1460,
+                vrf: DEFAULT_VRF.into(),
+                vlan,
+                tunnel: Some(Tunnel {
+                    local: local.parse().unwrap(),
+                    remote: remote.parse().unwrap(),
+                }),
+            },
+        )
+    };
+    let good = tunnel("2001:db8:1::2", "2001:db8:ff::1", None);
+    assert!(good.validate().is_ok());
+    assert_eq!(round_trip(&good), good);
+    assert!(tunnel("fe80::1", "2001:db8:ff::1", None)
+        .validate()
+        .is_err());
+    assert!(tunnel("2001:db8:1::2", "ff02::1", None).validate().is_err());
+    let both = tunnel(
+        "2001:db8:1::2",
+        "2001:db8:ff::1",
+        Some(Vlan {
+            parent: "eth0".into(),
+            id: 10,
+        }),
+    );
+    assert!(both.validate().is_err());
 }
