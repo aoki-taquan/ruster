@@ -13,11 +13,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use ruster_core::{
-    IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route,
-    LocalIpv4Binding, MacAddress, Neighbor, Route, ValidatedForwardingOwner, VlanBinding,
+    FirewallAction, FirewallInterface, FirewallIpv4Prefix, FirewallPortRange, FirewallProtocol,
+    FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, Ipv4OriginPolicy, Ipv6Fib,
+    Ipv6Local, Ipv6Neighbor, Ipv6Route, LocalIpv4Binding, MacAddress, Neighbor, Route,
+    ValidatedForwardingOwner, VlanBinding,
 };
 use ruster_proto::session::Store;
-use ruster_proto::table::{network, Key, RouteAction, Value, DEFAULT_VRF};
+use ruster_proto::table::{self, network, Key, RouteAction, Value, DEFAULT_VRF};
 
 /// Core's tables of one VRF.
 pub(crate) struct Vrf {
@@ -39,6 +41,9 @@ pub(crate) struct Built {
     pub(crate) interface_names: Vec<String>,
     /// The VLAN sub-interfaces of enabled ports.
     pub(crate) vlans: Vec<VlanBinding>,
+    /// The default VRF's forward firewall rules, in rule id order. Empty for no
+    /// firewall.
+    pub(crate) firewall: Vec<FirewallRule>,
 }
 
 /// One forwarding route before it becomes core's.
@@ -261,6 +266,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let mut neighbors6 = Vec::new();
     let mut bindings: Vec<Vec<LocalIpv4Binding>> = vec![Vec::new(); order.len()];
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
+    let mut firewall = Vec::new();
     for (key, value) in store.iter() {
         match (key, value) {
             (Key::Address { interface, address }, Value::Address { .. }) => {
@@ -327,10 +333,23 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                     }),
                 }
             }
+            (Key::FirewallRule { vrf, id }, Value::FirewallRule(rule)) => {
+                if vrf != DEFAULT_VRF {
+                    return Err(format!(
+                        "firewall rule {id} in {vrf}: only the default VRF has a firewall"
+                    ));
+                }
+                // A rule naming an interface that is missing or disabled matches no
+                // packet, so leaving it out changes nothing.
+                if let Some(rule) = firewall_rule(*id, rule, &active)? {
+                    firewall.push(rule);
+                }
+            }
             _ => {}
         }
     }
 
+    firewall.sort_by_key(|rule| rule.id());
     let routes = expand_lookups(&entries);
     let mut vrfs = Vec::with_capacity(order.len());
     for (at, name) in order.iter().enumerate() {
@@ -390,7 +409,53 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         active: enabled,
         interface_names,
         vlans,
+        firewall,
     })
+}
+
+/// Core's rule for the table's rule `id`, or `None` when it names an interface that
+/// is missing or disabled.
+fn firewall_rule(
+    id: u32,
+    rule: &table::FirewallRule,
+    active: &BTreeMap<&str, (IfId, &str)>,
+) -> Result<Option<FirewallRule>, String> {
+    let interface = |name: &Option<String>| match name {
+        None => Some(FirewallInterface::Any),
+        Some(name) => active
+            .get(name.as_str())
+            .map(|&(id, _)| FirewallInterface::Interface(id)),
+    };
+    let (Some(ingress), Some(egress)) = (interface(&rule.ingress), interface(&rule.egress)) else {
+        return Ok(None);
+    };
+    let failed = |error: String| format!("firewall rule {id}: {error}");
+    let prefix = |(address, len): (std::net::Ipv4Addr, u8)| {
+        FirewallIpv4Prefix::new(Ipv4Address::from_octets(address.octets()), len)
+            .map_err(|e| failed(format!("{address}/{len}: {e:?}")))
+    };
+    let ports = |(first, last): (u16, u16)| {
+        FirewallPortRange::new(first, last)
+            .map_err(|e| failed(format!("ports {first}-{last}: {e:?}")))
+    };
+    Ok(Some(FirewallRule::new(
+        FirewallRuleId(id),
+        ingress,
+        egress,
+        prefix(rule.source)?,
+        prefix(rule.destination)?,
+        match rule.protocol {
+            table::Protocol::Tcp => FirewallProtocol::Tcp,
+            table::Protocol::Udp => FirewallProtocol::Udp,
+            table::Protocol::Icmp => FirewallProtocol::Icmp,
+        },
+        ports(rule.source_ports)?,
+        ports(rule.destination_ports)?,
+        match rule.action {
+            table::FirewallAction::Accept => FirewallAction::AllowStateful,
+            table::FirewallAction::Drop => FirewallAction::Deny,
+        },
+    )))
 }
 
 #[cfg(test)]

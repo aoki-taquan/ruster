@@ -844,3 +844,103 @@ fn traffic_to_the_router_goes_to_the_kernel_pipe_and_the_kernel_s_packets_go_out
     assert_eq!(bench.fe.counters().from_kernel, 1);
     assert_eq!(bench.fe.counters().from_kernel_dropped, 1);
 }
+
+fn accept_udp_from_lan(id: u32) -> Change {
+    Change::set(
+        Key::FirewallRule {
+            vrf: "default".into(),
+            id,
+        },
+        Value::FirewallRule(ruster_proto::table::FirewallRule {
+            ingress: Some("lan".into()),
+            egress: None,
+            source: (Ipv4Addr::UNSPECIFIED, 0),
+            destination: (Ipv4Addr::UNSPECIFIED, 0),
+            protocol: ruster_proto::table::Protocol::Udp,
+            source_ports: (0, 65_535),
+            destination_ports: (0, 65_535),
+            action: ruster_proto::table::FirewallAction::Accept,
+        }),
+    )
+}
+
+/// A UDP frame from the internet host to the LAN host, as the reply to
+/// `udp_from_host`.
+fn udp_reply_to_host() -> Vec<u8> {
+    let mut frame = udp_from_host([192, 0, 2, 10]);
+    frame[0..6].copy_from_slice(&WAN_MAC);
+    frame[6..12].copy_from_slice(&GATEWAY_MAC);
+    let ip = 14;
+    frame[ip + 12..ip + 16].copy_from_slice(&INTERNET);
+    frame[ip + 10..ip + 12].fill(0);
+    let checksum = ipv4_header_checksum(&frame[ip..ip + 20]);
+    frame[ip + 10..ip + 12].copy_from_slice(&checksum.to_be_bytes());
+    frame[ip + 20..ip + 22].copy_from_slice(&2000_u16.to_be_bytes());
+    frame[ip + 22..ip + 24].copy_from_slice(&1000_u16.to_be_bytes());
+    frame
+}
+
+#[test]
+fn firewall_rules_let_the_lan_out_and_only_replies_in_across_table_changes() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+        ],
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(10)]),
+        Code::CHANGED
+    );
+
+    let send = |bench: &mut Bench, ingress: u16, frame: Vec<u8>| {
+        bench.now += 10;
+        bench.fe.io_mut().inject(IfId(ingress), frame);
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().map(|tx| tx.egress)
+    };
+    assert_eq!(
+        send(&mut bench, 1, udp_reply_to_host()),
+        None,
+        "unsolicited"
+    );
+    assert_eq!(send(&mut bench, 0, udp_from_host(INTERNET)), Some(IfId(1)));
+    assert_eq!(send(&mut bench, 1, udp_reply_to_host()), Some(IfId(0)));
+
+    // Another route: the flow is carried to the new tables.
+    let code = bench.patch(
+        &mut routes,
+        &[route([10, 0, 0, 0], 8, "wan", Some(GATEWAY))],
+    );
+    assert_eq!(code, Code::CHANGED);
+    assert_eq!(send(&mut bench, 1, udp_reply_to_host()), Some(IfId(0)));
+
+    // No rules: no firewall.
+    let code = bench.patch(
+        &mut config,
+        &[Change::delete(Key::FirewallRule {
+            vrf: "default".into(),
+            id: 10,
+        })],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut other = udp_reply_to_host();
+    other[14 + 20..14 + 22].copy_from_slice(&3000_u16.to_be_bytes());
+    assert_eq!(send(&mut bench, 1, other), Some(IfId(0)));
+}
+
+#[test]
+fn a_firewall_rule_outside_the_default_vrf_is_refused() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut change = accept_udp_from_lan(1);
+    change.key = Key::FirewallRule {
+        vrf: "red".into(),
+        id: 1,
+    };
+    assert_eq!(bench.patch(&mut config, &[change]), Code::BAD_REQUEST);
+}

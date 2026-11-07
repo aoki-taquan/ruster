@@ -42,6 +42,7 @@ use ruster_proto::table::ResolveRequest;
 use ruster_proto::task::{Progress, Task};
 
 mod build;
+mod firewall;
 mod local;
 
 pub use local::LocalPipe;
@@ -50,7 +51,7 @@ pub use local::LocalPipe;
 pub mod writers {
     use ruster_proto::sid;
 
-    pub const CONFIG: &[u64] = &[sid::INTERFACE, sid::ADDRESS];
+    pub const CONFIG: &[u64] = &[sid::INTERFACE, sid::ADDRESS, sid::NAT, sid::FIREWALL_RULE];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
     pub const READ_ONLY: &[u64] = &[];
@@ -127,6 +128,8 @@ pub struct Fe<B> {
     control: ControlQueue,
     /// ICMPv4 errors core queued in the last batch, and their rate limits.
     icmpv4_errors: Icmpv4ErrorRuntime<'static>,
+    /// The default VRF's forward firewall, once a rule has arrived.
+    firewall: Option<firewall::Firewall>,
     counters: FeCounters,
 }
 
@@ -146,8 +149,15 @@ where
     /// `ports` names the backend's ports; port `i` is `IfId(i)`. The tables start empty,
     /// so nothing is forwarded until a writer adds interfaces and routes.
     pub fn new(io: B, ports: Vec<String>) -> Self {
-        let builder = Builder { ports, built: None };
-        let built = build::build(&builder.ports, &Store::default()).expect("empty tables build");
+        let mut builder = Builder {
+            ports,
+            built: None,
+            generation: 0,
+        };
+        builder
+            .check(&Store::default())
+            .expect("empty tables build");
+        let (built, _) = builder.built.take().expect("built");
         Self {
             io,
             builder,
@@ -165,6 +175,7 @@ where
             last_resolve: BTreeMap::new(),
             control: ControlQueue::new(EVENTS_PER_BATCH).with_icmpv6_errors(EVENTS_PER_BATCH),
             icmpv4_errors: icmpv4_error_runtime(),
+            firewall: None,
             counters: FeCounters::default(),
         }
     }
@@ -244,12 +255,16 @@ where
         self.control.clear();
         let now = MonotonicMillis(now_ms);
         self.control.set_clock(now);
+        let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
         let report = forward_batch_with_control(
             batch,
             &snapshot,
             &mut self.control,
             Services {
                 icmpv4_errors: Some(&mut self.icmpv4_errors),
+                firewall: firewall
+                    .as_mut()
+                    .map(|(config, runtime)| (&*config, &mut **runtime)),
                 ..Services::default()
             },
             &mut trace,
@@ -525,7 +540,17 @@ where
 {
     fn step(&mut self, now_ms: u64) -> Progress {
         let control = self.server.step(&mut self.builder);
-        if let Some(built) = self.builder.built.take() {
+        if let Some((built, publication)) = self.builder.built.take() {
+            // Until a move succeeds the old firewall stays, bound to the old tables:
+            // core then drops what it would have checked.
+            if let Err(error) = firewall::Firewall::publish(
+                &mut self.firewall,
+                publication,
+                self.vrfs[0].owner.snapshot(),
+                built.vrfs[0].owner.snapshot(),
+            ) {
+                eprintln!("ruster-fe: {error}");
+            }
             self.vrfs = built.vrfs;
             self.by_ingress = built.by_ingress;
             self.names = built.names;
@@ -567,8 +592,11 @@ impl GeneratedIcmpv4TraceSink for NoTrace {
 /// Turns the tables into core's tables.
 struct Builder {
     ports: Vec<String>,
-    /// The tables built for the last accepted store, until the FE takes them.
-    built: Option<build::Built>,
+    /// The tables built for the last accepted store and their firewall, until the
+    /// FE takes them.
+    built: Option<(build::Built, firewall::Publication)>,
+    /// Of the last firewall publication.
+    generation: u64,
 }
 
 /// The id of the interface `name` (a port or a VLAN sub-interface) in `names`.
@@ -579,7 +607,15 @@ fn interface_id(names: &[String], name: &str) -> Option<IfId> {
 
 impl Hook for Builder {
     fn check(&mut self, next: &Store) -> Result<(), String> {
-        self.built = Some(build::build(&self.ports, next)?);
+        let built = build::build(&self.ports, next)?;
+        self.generation += 1;
+        let default = built.vrfs.first().ok_or("no default VRF")?;
+        let publication = firewall::Publication::new(
+            &default.owner.snapshot(),
+            &built.firewall,
+            self.generation,
+        )?;
+        self.built = Some((built, publication));
         Ok(())
     }
 
