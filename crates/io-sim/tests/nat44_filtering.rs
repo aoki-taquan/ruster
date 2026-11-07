@@ -961,7 +961,7 @@ fn unsolicited_inbound_syn_is_silently_dropped_by_the_full_worker() {
     );
     let mut io = SimIo::new();
     let mut run = |io: &mut SimIo,
-                   errors: &mut Icmpv4ErrorRuntime<'_>,
+                   errors: &mut _,
                    tcp_nat: &mut _,
                    packet: Vec<u8>,
                    ingress: IfId,
