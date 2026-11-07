@@ -73,6 +73,21 @@ pub const FIREWALL_DESTINATION_PORT_LOW: u64 = 60078;
 pub const FIREWALL_DESTINATION_PORT_HIGH: u64 = 60079;
 pub const FIREWALL_ACTION: u64 = 60080;
 
+/// WireGuard (`ruster-if-wireguard` on an interface, and `ruster-wireguard` sessions): an
+/// interface's listen port and address, its peers, and the session keys of a peer.
+pub const WIREGUARD: u64 = 60100;
+pub const WIREGUARD_LISTEN_PORT: u64 = 60101;
+pub const WIREGUARD_LOCAL: u64 = 60102;
+pub const WIREGUARD_PEER: u64 = 60110;
+pub const WIREGUARD_PEER_ENDPOINT: u64 = 60111;
+pub const WIREGUARD_PEER_PORT: u64 = 60112;
+pub const WIREGUARD_PEER_ALLOWED: u64 = 60113;
+pub const WIREGUARD_SESSION: u64 = 60120;
+pub const WIREGUARD_SESSION_SEND: u64 = 60121;
+pub const WIREGUARD_SESSION_RECEIVE: u64 = 60122;
+pub const WIREGUARD_SESSION_PEER_INDEX: u64 = 60123;
+pub const WIREGUARD_SESSION_LOCAL_INDEX: u64 = 60124;
+
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
 pub const RESOLVE_REQUEST_INTERFACE: u64 = 60051;
@@ -172,6 +187,54 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/lower-port", FIREWALL_DESTINATION_PORT_LOW),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/upper-port", FIREWALL_DESTINATION_PORT_HIGH),
     ("/ietf-access-control-list:acls/acl/aces/ace/actions/forwarding", FIREWALL_ACTION),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-wireguard:wireguard",
+        WIREGUARD,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-wireguard:wireguard/listen-port",
+        WIREGUARD_LISTEN_PORT,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-wireguard:wireguard/local-address",
+        WIREGUARD_LOCAL,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-wireguard:wireguard/peer",
+        WIREGUARD_PEER,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-wireguard:wireguard/peer/endpoint-address",
+        WIREGUARD_PEER_ENDPOINT,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-wireguard:wireguard/peer/endpoint-port",
+        WIREGUARD_PEER_PORT,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ruster-if-wireguard:wireguard/peer/allowed-ips",
+        WIREGUARD_PEER_ALLOWED,
+    ),
+    (
+        "/ruster-wireguard:sessions/session",
+        WIREGUARD_SESSION,
+    ),
+    (
+        "/ruster-wireguard:sessions/session/send-key",
+        WIREGUARD_SESSION_SEND,
+    ),
+    (
+        "/ruster-wireguard:sessions/session/receive-key",
+        WIREGUARD_SESSION_RECEIVE,
+    ),
+    (
+        "/ruster-wireguard:sessions/session/peer-index",
+        WIREGUARD_SESSION_PEER_INDEX,
+    ),
+    (
+        "/ruster-wireguard:sessions/session/local-index",
+        WIREGUARD_SESSION_LOCAL_INDEX,
+    ),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",
