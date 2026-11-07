@@ -1415,6 +1415,12 @@ impl PacketSlot for XdpRxSlot<'_, '_, '_> {
         io.ports[*port].engine.lease_resize_front(lease, delta)
     }
 
+    fn truncate(&mut self, len: usize) -> bool {
+        let io = &mut *self.batch.io;
+        let (port, lease) = io.rx_outstanding.as_mut().expect("live RX slot");
+        io.ports[*port].engine.lease_truncate(lease, len)
+    }
+
     fn bytes_mut(&mut self) -> &mut [u8] {
         let io = &mut *self.batch.io;
         let (port, lease) = io.rx_outstanding.as_ref().expect("live RX slot");

@@ -418,6 +418,15 @@ impl<O: PacketOps> PacketSlot for AfPacketSlot<'_, '_, O> {
         true
     }
 
+    fn truncate(&mut self, len: usize) -> bool {
+        // Only shortens the view: it stays inside the bytes it was given.
+        if len == 0 || len > self.len {
+            return false;
+        }
+        self.len = len;
+        true
+    }
+
     fn complete(mut self, completion: SlotCompletion) {
         self.completed = true;
         let end = match completion {
