@@ -503,6 +503,9 @@ pub enum DropReason {
     TunnelNoRoute = 229,
     /// The wrapped packet is longer than the underlying interface's MTU.
     TunnelMtuExceeded = 230,
+    /// A tunnel's IPv6 packet that did not arrive on the interface the default VRF
+    /// routes the tunnel's remote end through.
+    TunnelWrongIngress = 231,
 }
 
 use DropReason::*;
@@ -510,7 +513,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 230] = [
+    pub const ALL: [Self; 231] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -741,6 +744,7 @@ impl DropReason {
         TunnelNoRoom,
         TunnelNoRoute,
         TunnelMtuExceeded,
+        TunnelWrongIngress,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -988,6 +992,7 @@ impl DropReason {
             TunnelNoRoom => "TUNNEL_NO_ROOM",
             TunnelNoRoute => "TUNNEL_NO_ROUTE",
             TunnelMtuExceeded => "TUNNEL_MTU_EXCEEDED",
+            TunnelWrongIngress => "TUNNEL_WRONG_INGRESS",
         }
     }
 }
@@ -1940,6 +1945,19 @@ impl<'a> ForwardingSnapshot<'a> {
     pub(crate) fn is_local_ipv4_on(&self, interface: IfId, address: crate::Ipv4Address) -> bool {
         self.local_binding_on(interface)
             .is_some_and(|binding| binding.address == address)
+    }
+
+    /// For a packet of the router itself (`packet`, an IPv4 packet) routed to the
+    /// tunnel interface `egress`: the underlying interface, next hop and the IPv6
+    /// header to wrap it in, by this snapshot's tunnels and IPv6 table (the default
+    /// VRF's). `None` when `egress` is no tunnel's.
+    #[must_use]
+    pub fn tunnel_origin(
+        &self,
+        egress: IfId,
+        packet: &[u8],
+    ) -> Option<Result<crate::TunnelOrigin, DropReason>> {
+        crate::tunnel::origin(self, egress, packet)
     }
 
     /// Where a packet the router itself sends to `destination` goes: the route's
@@ -9361,6 +9379,7 @@ mod tests {
             (228, "TUNNEL_NO_ROOM"),
             (229, "TUNNEL_NO_ROUTE"),
             (230, "TUNNEL_MTU_EXCEEDED"),
+            (231, "TUNNEL_WRONG_INGRESS"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9370,7 +9389,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(231), None);
+        assert_eq!(DropReason::from_code(232), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

@@ -507,6 +507,39 @@ where
                 self.counters.from_kernel_dropped += 1;
                 continue;
             };
+            // To a tunnel interface: inside IPv6, out of the interface below it.
+            let outer = self.vrfs[0]
+                .owner
+                .snapshot()
+                .with_ipv6(&self.vrfs[0].ipv6)
+                .with_tunnels(&self.tunnels);
+            if let Some(wrapped) = outer.tunnel_origin(origin.egress, &packet) {
+                let sent = match wrapped {
+                    Ok(tunnel) => match tunnel.destination_mac {
+                        Some(mac) => {
+                            let mut frame = Vec::with_capacity(ETHERNET_HEADER + 40 + packet.len());
+                            frame.extend_from_slice(&mac.0);
+                            frame.extend_from_slice(&tunnel.source_mac.0);
+                            frame.extend_from_slice(&ETHERTYPE_IPV6);
+                            frame.extend_from_slice(&tunnel.header);
+                            frame.extend_from_slice(&packet);
+                            self.send_generated(tunnel.egress, &frame)
+                        }
+                        None => {
+                            let hop = IpAddr::V6(tunnel.next_hop.into());
+                            self.resolve_request(tunnel.egress, hop, now_ms);
+                            false
+                        }
+                    },
+                    Err(_) => false,
+                };
+                if sent {
+                    self.counters.from_kernel += 1;
+                } else {
+                    self.counters.from_kernel_dropped += 1;
+                }
+                continue;
+            }
             let Some(destination_mac) = origin.destination_mac else {
                 self.counters.from_kernel_dropped += 1;
                 self.resolve_request(origin.egress, origin.next_hop, now_ms);

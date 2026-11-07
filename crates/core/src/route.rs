@@ -228,3 +228,16 @@ pub struct Origin {
     /// `None` when the next hop is not in the neighbor table.
     pub destination_mac: Option<MacAddress>,
 }
+
+/// Where a packet of the router itself for a tunnel interface goes
+/// ([`crate::ForwardingSnapshot::tunnel_origin`]): out of `egress` toward the IPv6
+/// `next_hop` (its MAC when the neighbor table has it), behind `header`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TunnelOrigin {
+    pub egress: IfId,
+    pub source_mac: MacAddress,
+    pub next_hop: [u8; 16],
+    pub destination_mac: Option<MacAddress>,
+    /// The IPv6 header (40 bytes) to put before the IPv4 packet.
+    pub header: [u8; 40],
+}

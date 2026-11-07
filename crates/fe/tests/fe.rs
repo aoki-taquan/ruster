@@ -1326,4 +1326,22 @@ fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
     assert_eq!(&tx.bytes[12..14], &[0x86, 0xdd]);
     assert_eq!(tx.bytes[14 + 6], 4, "IPv4 in IPv6");
     assert_eq!(&tx.bytes[14 + 40 + 16..14 + 40 + 20], &INTERNET);
+
+    // The router's own IPv4 (from the kernel) to the tunnel leaves the same way.
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    own[12..16].copy_from_slice(&[192, 0, 2, 1]);
+    own[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&own[..20]);
+    own[10..12].copy_from_slice(&checksum.to_be_bytes());
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent from the kernel");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+    assert_eq!(&tx.bytes[12..14], &[0x86, 0xdd]);
+    assert_eq!(tx.bytes[14 + 6], 4);
+    assert_eq!(&tx.bytes[14 + 40..], &own[..]);
 }
