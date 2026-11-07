@@ -37,17 +37,18 @@
 //! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
 //! destination-ports = "53"     # optional
 //!
-//!
 //! [nat]                        # NAPT of the default VRF
 //! inside = "lan"
 //! outside = "wan"              # must have an ipv4 address: the public one
 //! ports = "1024-32767"         # optional, 1024-32767 when left out
+//! external = "198.51.100.2"    # optional; for now only the outside's own address
 //! ```
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
 //! connections (`net.ipv4.ip_local_port_range`, 32768-60999 by default): UDP and TCP
 //! to the public address on a port outside the pool are the router's own, and those
-//! in it are NAT's.
+//! in it are NAT's (so is a router service listening on a port in the pool). NAT is
+//! inactive while `inside` or `outside` is disabled.
 //!
 //! With any `firewall` rule, what no rule accepts is dropped. The interfaces a rule
 //! or `nat` names must be in the default VRF.
@@ -62,6 +63,8 @@
 //! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
 //!   when not named.
 //! - RFC 791: the smallest MTU is 68.
+//! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
+//!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
 //!   must be usable unicast addresses (not 0.0.0.0/8, 127.0.0.0/8, 224.0.0.0/4 or
 //!   240.0.0.0/4).
@@ -305,6 +308,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 if !unicast_v4(address) {
                     return Err(format!("{at}: ipv4 must be a unicast address"));
                 }
+                // RFC 922 and RFC 919: in a prefix of /30 or shorter, the all-zeros
+                // and all-ones host numbers are the network and its broadcast.
+                let mask = u32::MAX.checked_shr(u32::from(len)).unwrap_or(0);
+                let host = u32::from(address) & mask;
+                if len <= 30 && (host == 0 || host == mask) {
+                    return Err(format!(
+                        "{at}: ipv4 must not be the network or broadcast address of its prefix"
+                    ));
+                }
                 seen.address(&at, &entry.name, address.into(), len)?;
                 Some((address, len))
             }
@@ -498,6 +510,9 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
         .find(|i| i.name == entry.outside)
         .and_then(|i| i.ipv4)
         .map(|(address, _)| address);
+    if outside_address.is_none() {
+        return Err(format!("{at}: {:?} has no ipv4 address", entry.outside));
+    }
     let external = match &entry.external {
         None => None,
         Some(text) => {
@@ -513,9 +528,6 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
             Some(address)
         }
     };
-    if outside_address.is_none() {
-        return Err(format!("{at}: {:?} has no ipv4 address", entry.outside));
-    }
     Ok(Nat {
         inside: entry.inside,
         outside: entry.outside,

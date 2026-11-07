@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # NAPT and the firewall on real Linux. The router translates the LAN to its WAN
-# address, and its firewall lets the LAN out and only replies in.
+# address; its firewall lets ICMP and TCP from the LAN out (and their replies in),
+# and drops the rest, such as UDP.
 #
 #   lan (192.0.2.10) -- [r-lan | router | r-wan 198.51.100.1] -- wan (198.51.100.10)
 #
-# The WAN host has a route back to the LAN, so only the firewall keeps it out.
+# The WAN host has a route back to the LAN; NAT, not routing, keeps it out.
 # Run as root, after `cargo build`:  sudo scripts/netns-nat.sh [target/debug]
 # FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
 set -euo pipefail
@@ -29,6 +30,14 @@ fail() {
   exit 1
 }
 nsx() { ip netns exec "$@"; }
+# Waits until something in namespace $1 listens on $2 port $3 (ss -ltn or -lun).
+listening() {
+  for _ in $(seq 1 50); do
+    nsx "$1" ss -Hln"$2" "sport = :$3" | grep -q . && return 0
+    sleep 0.1
+  done
+  fail "nothing listens on $3 in $1"
+}
 
 for ns in "$lan" "$wan" "$router"; do ip netns add "$ns"; done
 link() { # host-ns router-dev router-mac host-ip/len gateway
@@ -100,7 +109,7 @@ s.bind(("198.51.100.10", 8080)); s.listen(1); s.settimeout(10)
 c, peer = s.accept(); c.sendall(b"%s %d\n" % (peer[0].encode(), peer[1])); c.close()
 ' >"$work/peer.txt" 2>"$work/server.log" &
 pids+=("$!")
-sleep 0.3
+listening "$wan" t 8080
 seen=$(nsx "$lan" python3 -c '
 import socket
 s = socket.create_connection(("198.51.100.10", 8080), timeout=5)
@@ -122,11 +131,33 @@ s.bind(("192.0.2.10", 2222)); s.listen(4); s.settimeout(15)
 while True: s.accept()[0].close()
 ' >/dev/null 2>"$work/lan-server.log" &
 pids+=("$!")
-sleep 0.3
+listening "$lan" t 2222
 nsx "$lan" timeout 2 bash -c 'exec 3<>/dev/tcp/192.0.2.10/2222' || fail "the LAN listener"
 if nsx "$wan" timeout 2 bash -c 'exec 3<>/dev/tcp/192.0.2.10/2222' 2>/dev/null; then
   fail "the WAN host opens TCP into the LAN"
 fi
-echo "ok: the firewall keeps the WAN host out of the LAN"
+echo "ok: the WAN host cannot reach into the LAN"
+
+# No rule accepts UDP: the firewall drops it, though NAT would translate it.
+nsx "$wan" python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(("198.51.100.10", 9999))
+s.settimeout(3)
+try:
+    s.recvfrom(100); print("got")
+except socket.timeout:
+    print("none")
+' >"$work/udp.txt" 2>"$work/udp-server.log" &
+udp_server=$!
+pids+=("$udp_server")
+listening "$wan" u 9999
+for _ in 1 2 3; do
+  nsx "$lan" python3 -c '
+import socket
+socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b"x", ("198.51.100.10", 9999))'
+done
+wait "$udp_server" || true
+[[ "$(cat "$work/udp.txt")" == none ]] || fail "UDP from the LAN passed the firewall"
+echo "ok: the firewall drops LAN UDP, which no rule accepts"
 
 echo "PASS ($backend)"

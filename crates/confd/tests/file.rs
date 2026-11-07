@@ -620,3 +620,26 @@ fn nat_takes_the_outside_address_and_a_port_range() {
         assert!(got.contains(expected), "{text}: {got}");
     }
 }
+
+#[test]
+fn an_interface_address_is_not_its_network_or_broadcast() {
+    let with = |ipv4: &str| {
+        format!("[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv4 = \"{ipv4}\"\n")
+    };
+    for bad in [
+        "198.51.100.0/24",
+        "198.51.100.255/24",
+        "10.0.0.4/30",
+        "10.0.0.7/30",
+    ] {
+        assert!(error(&with(bad)).contains("network or broadcast"), "{bad}");
+    }
+    for good in [
+        "198.51.100.1/24",
+        "10.0.0.5/30",
+        "10.0.0.0/31",
+        "10.0.0.1/32",
+    ] {
+        assert!(parse(&with(good)).is_ok(), "{good}");
+    }
+}
