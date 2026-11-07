@@ -21,8 +21,7 @@ use ruster_core::{
     MonotonicMillis, Nat44Filtering, Nat44Icmpv4Disposition, Nat44Icmpv4ErrorPolicy,
     Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot,
     Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
-    Neighbor, ResolutionActionSlot, ResolutionHashKey, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route, TraceEvent,
+    Neighbor, ResolutionHashKey, Route, TraceEvent,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -310,11 +309,6 @@ impl World {
         } else {
             (None, None)
         };
-        let _resolution = ResolutionRuntime::new(
-            ResolutionPolicy::new(1_000, 2_000).unwrap(),
-            leak([ResolutionStateSlot::EMPTY; 2]),
-            leak([ResolutionActionSlot::EMPTY; 2]),
-        );
         Self {
             snapshot,
             udp_config,

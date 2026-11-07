@@ -271,7 +271,7 @@ fn nat_with_errors(
     let mut nat = nat_indexes.runtime(config, &mut mappings, &mut peers);
     let mut rs = [ResolutionStateSlot::EMPTY; 1];
     let mut ra = [ResolutionActionSlot::EMPTY; 1];
-    let mut resolution = resolution(&mut rs, &mut ra);
+    let _resolution = resolution(&mut rs, &mut ra);
     let mut es = [ruster_core::Icmpv4ErrorStateSlot::EMPTY; 2];
     let mut ea = [ruster_core::Icmpv4ErrorActionSlot::EMPTY; 2];
     let mut errors = ruster_core::Icmpv4ErrorRuntime::new(
@@ -281,14 +281,15 @@ fn nat_with_errors(
     );
     let mut io = SimIo::new();
     io.inject(ingress, frame.to_vec());
-    let report = ruster_core::forward_batch_with_nat44_udp_and_icmpv4_errors(
+    let report = support::forward(
         ruster_core::PacketIo::receive(&mut io, 1).unwrap(),
         &snapshot,
-        &mut resolution,
-        &mut errors,
-        &config,
-        Some(&mut nat),
         MonotonicMillis(0),
+        ruster_core::Services {
+            icmpv4_errors: Some(&mut errors),
+            nat44_udp: (Some(&mut nat)).map(|runtime| (&config, runtime)),
+            ..ruster_core::Services::default()
+        },
         &mut NoTrace,
     );
     assert_eq!(report.tx_requested, 0);

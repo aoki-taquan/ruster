@@ -229,3 +229,26 @@ where
         trace,
     )
 }
+
+/// Forwards `batch` the way the FE does, with `services`, on the clock `now`.
+#[allow(dead_code)]
+pub fn forward<B, T>(
+    batch: B,
+    snapshot: &ruster_core::ForwardingSnapshot<'_>,
+    now: ruster_core::MonotonicMillis,
+    services: ruster_core::Services<'_, '_, '_>,
+    trace: &mut T,
+) -> ruster_core::BatchReport<B::Error>
+where
+    B: ruster_core::PacketBatch,
+    T: ruster_core::TraceSink,
+{
+    let mut control = ruster_core::ControlQueue::new(4);
+    ruster_core::forward_batch_with_control(
+        batch,
+        &snapshot.with_now(now),
+        &mut control,
+        services,
+        trace,
+    )
+}

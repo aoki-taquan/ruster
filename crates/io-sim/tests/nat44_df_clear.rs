@@ -13,17 +13,15 @@
 mod support;
 
 use ruster_core::{
-    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors,
-    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_icmpv4_errors, internet_checksum,
-    ipv4_header_checksum, DropReason, FirewallAction, FirewallConfig, FirewallHashKey,
-    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
-    FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, ForwardingSnapshot,
-    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
-    Interface, Ipv4Address, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering,
-    Nat44IcmpConfig, Nat44IcmpPolicy, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpMappingSlot,
-    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
-    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, PacketIo, ResolutionActionSlot,
-    ResolutionPolicy, ResolutionRuntime, ResolutionStateSlot, Route,
+    internet_checksum, ipv4_header_checksum, DropReason, FirewallAction, FirewallConfig,
+    FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange,
+    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
+    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
+    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, LocalIpv4Binding, MacAddress,
+    MonotonicMillis, Nat44Filtering, Nat44IcmpConfig, Nat44IcmpPolicy, Nat44IcmpRuntime,
+    Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot,
+    Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
+    Neighbor, PacketIo, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -127,7 +125,6 @@ struct World {
     icmp: Nat44IcmpRuntime<'static>,
     firewall_config: Option<FirewallConfig<'static>>,
     firewall: Option<FirewallRuntime<'static>>,
-    resolution: ResolutionRuntime<'static>,
     errors: Icmpv4ErrorRuntime<'static>,
     io: SimIo,
     trace: VecTrace,
@@ -210,11 +207,6 @@ impl World {
             icmp,
             firewall_config,
             firewall,
-            resolution: ResolutionRuntime::new(
-                ResolutionPolicy::new(1_000, 2_000).unwrap(),
-                leak([ResolutionStateSlot::EMPTY; 2]),
-                leak([ResolutionActionSlot::EMPTY; 2]),
-            ),
             errors: Icmpv4ErrorRuntime::new(
                 Icmpv4ErrorPolicy::default(),
                 leak([Icmpv4ErrorStateSlot::EMPTY; 4]),
@@ -230,35 +222,34 @@ impl World {
         let now = MonotonicMillis(1_000);
         let batch = self.io.receive(1).unwrap();
         let report = if let Some(firewall_config) = &self.firewall_config {
-            forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors(
+            support::forward(
                 batch,
                 &self.snapshot,
-                &mut self.resolution,
-                &mut self.errors,
-                &self.udp_config,
-                Some(&mut self.udp),
-                &self.tcp_config,
-                Some(&mut self.tcp),
-                Some((&self.icmp_config, Some(&mut self.icmp))),
-                firewall_config,
-                self.firewall.as_mut(),
-                None,
                 now,
+                ruster_core::Services {
+                    icmpv4_errors: Some(&mut self.errors),
+                    nat44_udp: (Some(&mut self.udp)).map(|runtime| (&self.udp_config, runtime)),
+                    nat44_tcp: (Some(&mut self.tcp)).map(|runtime| (&self.tcp_config, runtime)),
+                    nat44_icmp: (Some((&self.icmp_config, Some(&mut self.icmp))))
+                        .and_then(|(config, runtime)| runtime.map(|runtime| (config, runtime))),
+                    firewall: (self.firewall.as_mut()).map(|runtime| (firewall_config, runtime)),
+                    firewall_audit: None,
+                    ..ruster_core::Services::default()
+                },
                 &mut self.trace,
             )
         } else {
-            forward_batch_with_nat44_udp_and_tcp_and_icmp_and_icmpv4_errors(
+            support::forward(
                 batch,
                 &self.snapshot,
-                &mut self.resolution,
-                &mut self.errors,
-                &self.udp_config,
-                Some(&mut self.udp),
-                &self.tcp_config,
-                Some(&mut self.tcp),
-                &self.icmp_config,
-                Some(&mut self.icmp),
                 now,
+                ruster_core::Services {
+                    icmpv4_errors: Some(&mut self.errors),
+                    nat44_udp: (Some(&mut self.udp)).map(|runtime| (&self.udp_config, runtime)),
+                    nat44_tcp: (Some(&mut self.tcp)).map(|runtime| (&self.tcp_config, runtime)),
+                    nat44_icmp: (Some(&mut self.icmp)).map(|runtime| (&self.icmp_config, runtime)),
+                    ..ruster_core::Services::default()
+                },
                 &mut self.trace,
             )
         };

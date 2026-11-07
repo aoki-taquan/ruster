@@ -15,23 +15,20 @@
 mod support;
 
 use ruster_core::{
-    execute_one_icmpv4_error, execute_one_ipv4_fragmentation,
-    forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking,
-    ipv4_fragment_slot_bytes, ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_tombstones,
-    ConsumeReason, DirectoryBucket, DirectoryNode, DropReason, FirewallAction, FirewallConfig,
-    FirewallHashKey, FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange,
-    FirewallProtocol, FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot,
-    ForwardingSnapshot, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime,
-    Icmpv4ErrorStateSlot, IfId, Interface, Ipv4Address, Ipv4FragmentEntrySlot,
-    Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot, Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot,
-    Ipv4FragmentTracker, Ipv4FragmentTrackingCounters, Ipv4FragmentTrackingPolicy,
-    Ipv4FragmentTrackingStorage, Ipv4FragmentationPolicy, Ipv4FragmentationRuntime,
-    LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering, Nat44IcmpConfig,
-    Nat44IcmpPolicy, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpMappingSlot, Nat44TcpPolicy,
-    Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoGeneratedIcmpv4Trace, PacketIo,
-    ResolutionActionSlot, ResolutionHashKey, ResolutionPolicy, ResolutionRuntime,
-    ResolutionStateSlot, Route,
+    execute_one_icmpv4_error, execute_one_ipv4_fragmentation, ipv4_fragment_slot_bytes,
+    ipv4_fragment_tracking_buckets, ipv4_fragment_tracking_tombstones, ConsumeReason,
+    DirectoryBucket, DirectoryNode, DropReason, FirewallAction, FirewallConfig, FirewallHashKey,
+    FirewallInterface, FirewallIpv4Prefix, FirewallPolicy, FirewallPortRange, FirewallProtocol,
+    FirewallRule, FirewallRuleId, FirewallRuntime, FirewallStateSlot, ForwardingSnapshot,
+    Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy, Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId,
+    Interface, Ipv4Address, Ipv4FragmentEntrySlot, Ipv4FragmentHeldSlot, Ipv4FragmentHostSlot,
+    Ipv4FragmentSlot, Ipv4FragmentTombstoneSlot, Ipv4FragmentTracker, Ipv4FragmentTrackingCounters,
+    Ipv4FragmentTrackingPolicy, Ipv4FragmentTrackingStorage, Ipv4FragmentationPolicy,
+    Ipv4FragmentationRuntime, LocalIpv4Binding, MacAddress, MonotonicMillis, Nat44Filtering,
+    Nat44IcmpConfig, Nat44IcmpPolicy, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpMappingSlot,
+    Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, Neighbor, NoGeneratedIcmpv4Trace, PacketIo,
+    ResolutionHashKey, Route,
 };
 use ruster_io_sim::{RecycleCause, SimIo, VecTrace};
 use support::UdpTestIndexes;
@@ -180,7 +177,6 @@ struct World {
     icmp: Nat44IcmpRuntime<'static>,
     firewall_config: FirewallConfig<'static>,
     firewall: FirewallRuntime<'static>,
-    resolution: ResolutionRuntime<'static>,
     errors: Icmpv4ErrorRuntime<'static>,
     fragmentation: Ipv4FragmentationRuntime<'static>,
     tracker: Option<Ipv4FragmentTracker<'static>>,
@@ -311,11 +307,6 @@ impl World {
             icmp,
             firewall_config,
             firewall,
-            resolution: ResolutionRuntime::new(
-                ResolutionPolicy::new(1_000, 2_000).unwrap(),
-                leak([ResolutionStateSlot::EMPTY; 2]),
-                leak([ResolutionActionSlot::EMPTY; 2]),
-            ),
             errors: Icmpv4ErrorRuntime::new(
                 Icmpv4ErrorPolicy::default(),
                 leak([Icmpv4ErrorStateSlot::EMPTY; 6]),
@@ -339,26 +330,26 @@ impl World {
             self.io.inject(*ingress, frame.clone());
         }
         let batch = self.io.receive(frames.len()).unwrap();
-        let report =
-            forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking(
-                batch,
-                &self.snapshot,
-                &mut self.resolution,
-                &mut self.errors,
-                &self.udp_config,
-                Some(&mut self.udp),
-                &self.tcp_config,
-                Some(&mut self.tcp),
-                self.icmp_nat
-                    .then_some((&self.icmp_config, Some(&mut self.icmp))),
-                &self.firewall_config,
-                Some(&mut self.firewall),
-                None,
-                Some(&mut self.fragmentation),
-                self.tracker.as_mut(),
-                MonotonicMillis(now),
-                &mut self.trace,
-            );
+        let report = support::forward(
+            batch,
+            &self.snapshot,
+            MonotonicMillis(now),
+            ruster_core::Services {
+                icmpv4_errors: Some(&mut self.errors),
+                nat44_udp: (Some(&mut self.udp)).map(|runtime| (&self.udp_config, runtime)),
+                nat44_tcp: (Some(&mut self.tcp)).map(|runtime| (&self.tcp_config, runtime)),
+                nat44_icmp: (self
+                    .icmp_nat
+                    .then_some((&self.icmp_config, Some(&mut self.icmp))))
+                .and_then(|(config, runtime)| runtime.map(|runtime| (config, runtime))),
+                firewall: (Some(&mut self.firewall))
+                    .map(|runtime| (&self.firewall_config, runtime)),
+                firewall_audit: None,
+                fragmentation: Some(&mut self.fragmentation),
+                fragment_tracking: self.tracker.as_mut(),
+            },
+            &mut self.trace,
+        );
         assert!(report.invariants_hold());
         let mut outcome = Outcome::default();
         while let Some(recycled) = self.io.pop_recycled() {
@@ -1471,32 +1462,33 @@ mod counting {
 #[test]
 fn the_fragment_paths_do_not_allocate() {
     let mut world = World::new(Setup::default());
-    let forward = |world: &mut World, frames: &[(IfId, Vec<u8>)], measure: bool| {
+    // Allocated once, before anything is measured.
+    let mut control = ruster_core::ControlQueue::new(4);
+    let mut forward = |world: &mut World, frames: &[(IfId, Vec<u8>)], measure: bool| {
         for (ingress, frame) in frames {
             world.io.inject(*ingress, frame.clone());
         }
         let mut allocations = 0;
         let mut call = || {
             let batch = world.io.receive(frames.len()).unwrap();
-            let report =
-                forward_batch_with_nat44_udp_and_tcp_and_icmp_and_firewall_and_icmpv4_errors_and_fragment_tracking(
-                    batch,
-                    &world.snapshot,
-                    &mut world.resolution,
-                    &mut world.errors,
-                    &world.udp_config,
-                    Some(&mut world.udp),
-                    &world.tcp_config,
-                    Some(&mut world.tcp),
-                    Some((&world.icmp_config, Some(&mut world.icmp))),
-                    &world.firewall_config,
-                    Some(&mut world.firewall),
-                    None,
-                    Some(&mut world.fragmentation),
-                    world.tracker.as_mut(),
-                    MonotonicMillis(NOW),
-                    &mut ruster_core::NoTrace,
-                );
+            let report = ruster_core::forward_batch_with_control(
+                batch,
+                &world.snapshot.with_now(MonotonicMillis(NOW)),
+                &mut control,
+                ruster_core::Services {
+                    icmpv4_errors: Some(&mut world.errors),
+                    nat44_udp: (Some(&mut world.udp)).map(|runtime| (&world.udp_config, runtime)),
+                    nat44_tcp: (Some(&mut world.tcp)).map(|runtime| (&world.tcp_config, runtime)),
+                    nat44_icmp: (Some((&world.icmp_config, Some(&mut world.icmp))))
+                        .and_then(|(config, runtime)| runtime.map(|runtime| (config, runtime))),
+                    firewall: (Some(&mut world.firewall))
+                        .map(|runtime| (&world.firewall_config, runtime)),
+                    firewall_audit: None,
+                    fragmentation: Some(&mut world.fragmentation),
+                    fragment_tracking: world.tracker.as_mut(),
+                },
+                &mut ruster_core::NoTrace,
+            );
             assert!(report.invariants_hold());
         };
         if measure {
