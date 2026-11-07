@@ -8,7 +8,23 @@
 //! appears and kept for the life of the process. Only a port range of another size
 //! needs new storage, and then the old one is not given back: a range is resized by
 //! hand, rarely.
-
+//!
+//! # Standards
+//!
+//! - RFC 4787 (UDP), RFC 5382 (TCP) and RFC 5508 (ICMP queries and errors), as
+//!   core's NAT44 implements them, with its default policies (endpoint-independent
+//!   mapping, address-dependent filtering, hairpinning).
+//!
+//! Deviations:
+//!
+//! - UDP and TCP to the public address on a port outside the pool are the router's
+//!   own and are not translated. The pool must therefore not overlap the ports the
+//!   router's kernel picks for its own connections, or their replies are taken for
+//!   NAT's.
+//! - No per-host limits: one inside host may take every mapping.
+//! - Unsolicited inbound SYNs are dropped at once; RFC 5382 REQ-4's hold before an
+//!   ICMP error needs storage the FE does not give yet.
+//! - Fragments are not translated (no fragment tracking yet).
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 
@@ -109,6 +125,10 @@ impl Nat {
         };
         match nat {
             Some(this) if this.current.ports() == next.ports() => {
+                // On before the move: if it fails, the old configurations stay
+                // bound to the old tables and core drops what NAT would take,
+                // rather than letting it out untranslated.
+                this.on = true;
                 let failed = |error: String| format!("nat: {error}");
                 // Each is checked before any is committed, so a refusal leaves all
                 // three as they were.
@@ -128,7 +148,6 @@ impl Nat {
                 tcp.commit();
                 icmp.commit();
                 this.current = next;
-                this.on = true;
             }
             _ => *nat = Some(Self::allocate(next)?),
         }
@@ -238,7 +257,7 @@ fn buckets(count: usize) -> &'static mut [DirectoryBucket] {
 
 /// Two random words, from the standard library's `RandomState` (seeded from the
 /// operating system), for a key that is new for every publication.
-fn words() -> (u64, u64) {
+pub(crate) fn words() -> (u64, u64) {
     let state = RandomState::new();
     (state.hash_one(1_u8), state.hash_one(2_u8))
 }

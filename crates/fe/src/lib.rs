@@ -590,7 +590,16 @@ fn icmpv4_error_runtime() -> Icmpv4ErrorRuntime<'static> {
         Box::leak(vec![Icmpv4ErrorStateSlot::EMPTY; ICMPV4_ERROR_SLOTS].into_boxed_slice());
     let actions =
         Box::leak(vec![Icmpv4ErrorActionSlot::EMPTY; ICMPV4_ERROR_SLOTS].into_boxed_slice());
+    // A secret key for the limiter of NAT-translated errors, so no one outside can
+    // aim at its buckets.
+    let key = loop {
+        let (a, b) = nat::words();
+        if let Ok(key) = ruster_core::ResolutionHashKey::new(a, b) {
+            break key;
+        }
+    };
     Icmpv4ErrorRuntime::new(Icmpv4ErrorPolicy::default(), states, actions)
+        .with_translated_limit_key(key)
 }
 
 /// Generated ICMPv4 frames are counted, not traced.

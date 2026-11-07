@@ -199,6 +199,9 @@ struct Setup {
     inbound: Inbound,
     static_gateway: bool,
     inbound_sessions_per_remote: u8,
+    /// The pool is `PORT..=last_port`. A port in it that no mapping owns is a
+    /// NAT mapping miss; one outside it is the router's own.
+    last_port: u16,
 }
 
 impl Default for Setup {
@@ -211,6 +214,7 @@ impl Default for Setup {
             inbound: Inbound::AllowAll,
             static_gateway: true,
             inbound_sessions_per_remote: 0,
+            last_port: PORT,
         }
     }
 }
@@ -267,8 +271,16 @@ impl World {
             .with_unsolicited_syn_icmp(setup.unsolicited_syn_icmp)
             .with_inbound_sessions_per_remote(setup.inbound_sessions_per_remote)
             .unwrap();
-        let tcp_config =
-            Nat44TcpConfig::new(snapshot, LAN, WAN, PUBLIC, PORT, PORT, tcp_policy).unwrap();
+        let tcp_config = Nat44TcpConfig::new(
+            snapshot,
+            LAN,
+            WAN,
+            PUBLIC,
+            PORT,
+            setup.last_port,
+            tcp_policy,
+        )
+        .unwrap();
         let tcp = support::tcp_runtime(
             tcp_config,
             leak_slice(Nat44TcpMappingSlot::default(), 1),
@@ -754,6 +766,7 @@ fn port_unreachable_does_not_starve_other_icmp_errors_on_the_same_egress() {
     let mut world = World::new(Setup {
         filtering: Nat44Filtering::EndpointIndependent,
         inbound: Inbound::AllowAnyEgress,
+        last_port: PORT + 1,
         ..Setup::default()
     });
     world.packet(LAN, tcp(HOST, REMOTE1, PORT, 443, SYN), 0);
@@ -913,7 +926,10 @@ fn spoofed_inside_sources_are_never_held() {
 /// unsolicited SYN in the REQ-4 sense and stays a silent drop.
 #[test]
 fn hairpin_and_quota_refusals_are_not_held() {
-    let mut world = World::new(Setup::default());
+    let mut world = World::new(Setup {
+        last_port: PORT + 1,
+        ..Setup::default()
+    });
     // No mapping owns PUBLIC:PORT+1: the inbound half is a mapping miss.
     let hairpin = tcp(HOST, PUBLIC, 5555, PORT + 1, SYN);
     world.packet(LAN, hairpin, 0);

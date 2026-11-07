@@ -222,9 +222,7 @@ pub(super) fn decide_nat44_udp_hairpin<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution
-        .as_ref()
-        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
     // With a bound firewall the combined preflight already observed time.
     let read_only = firewall_config.is_some();
     let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
@@ -565,9 +563,7 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
     firewall_plan: &mut Option<FirewallPlan>,
     trace: &mut T,
 ) -> Result<PacketDecision, DropReason> {
-    let now = resolution
-        .as_ref()
-        .map_or(MonotonicMillis(0), |(_, now)| *now);
+    let now = resolution.as_ref().map_or(snapshot.now, |(_, now)| *now);
     let read_only = firewall_config.is_some();
     let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
     if !read_only {

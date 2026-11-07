@@ -1090,3 +1090,36 @@ fn a_nat_address_other_than_the_outside_interface_s_is_refused() {
     }
     assert_eq!(bench.patch(&mut config, &[other]), Code::BAD_REQUEST);
 }
+
+#[test]
+fn with_nat_the_router_s_own_ports_on_the_wan_address_still_reach_the_kernel() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let to_wan = |port: u16| {
+        let mut frame = udp_reply_to_host();
+        frame[30..34].copy_from_slice(&[198, 51, 100, 2]);
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame[36..38].copy_from_slice(&port.to_be_bytes());
+        frame
+    };
+    let mut buf = [0_u8; 2048];
+    // Outside the pool: the router's own.
+    bench.fe.io_mut().inject(IfId(1), to_wan(53));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_ok());
+    // In the pool, with no mapping: NAT drops it.
+    bench.fe.io_mut().inject(IfId(1), to_wan(40_003));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_err());
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+}
