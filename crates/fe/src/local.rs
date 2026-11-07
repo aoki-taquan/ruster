@@ -113,24 +113,6 @@ pub(crate) fn destination(packet: &[u8]) -> Option<std::net::IpAddr> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn each_class_has_its_own_bucket() {
-        let mut limiter = Limiter::default();
-        for _ in 0..LOCAL_BURST {
-            assert!(limiter.take(Class::Udp, 0));
-        }
-        assert!(!limiter.take(Class::Udp, 0), "UDP is used up");
-        assert!(limiter.take(Class::Tcp, 0), "TCP is not");
-        assert!(limiter.take(Class::Udp, 1), "two more after a millisecond");
-        assert!(limiter.take(Class::Udp, 1));
-        assert!(!limiter.take(Class::Udp, 1));
-    }
-}
-
 /// For an IPv4 `packet` from the kernel that a tunnel of `mtu` cannot carry and
 /// that may not be fragmented (DF set): an ICMP Destination Unreachable,
 /// Fragmentation Needed (RFC 792, RFC 1191 section 4, the Next-Hop MTU), back to
@@ -164,4 +146,22 @@ pub(crate) fn fragmentation_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
     let checksum = ruster_core::internet_checksum(&out[20..]);
     out[22..24].copy_from_slice(&checksum.to_be_bytes());
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_class_has_its_own_bucket() {
+        let mut limiter = Limiter::default();
+        for _ in 0..LOCAL_BURST {
+            assert!(limiter.take(Class::Udp, 0));
+        }
+        assert!(!limiter.take(Class::Udp, 0), "UDP is used up");
+        assert!(limiter.take(Class::Tcp, 0), "TCP is not");
+        assert!(limiter.take(Class::Udp, 1), "two more after a millisecond");
+        assert!(limiter.take(Class::Udp, 1));
+        assert!(!limiter.take(Class::Udp, 1));
+    }
 }
