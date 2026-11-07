@@ -474,3 +474,99 @@ fn a_sub_interface_mtu_leaves_room_for_the_tag() {
     ));
     assert!(got.contains("68 to 1496"), "{got}");
 }
+
+#[test]
+fn firewall_rules_keep_their_order_and_default_to_any() {
+    let text = format!(
+        "{LAN}[[firewall]]\naction = \"accept\"\nprotocol = \"udp\"\ningress = \"lan\"\n\
+         destination = \"203.0.113.0/24\"\ndestination-ports = \"53\"\n\
+         [[firewall]]\naction = \"drop\"\nprotocol = \"icmp\"\n\
+         [[firewall]]\naction = \"accept\"\nprotocol = \"tcp\"\nsource-ports = \"1024-65535\"\n"
+    );
+    let config = parse(&text).unwrap();
+    use ruster_proto::table::{FirewallAction, FirewallRule, Protocol};
+    let any = (Ipv4Addr::UNSPECIFIED, 0);
+    assert_eq!(
+        config.firewall,
+        vec![
+            FirewallRule {
+                ingress: Some("lan".into()),
+                egress: None,
+                source: any,
+                destination: (Ipv4Addr::new(203, 0, 113, 0), 24),
+                protocol: Protocol::Udp,
+                source_ports: (0, 65_535),
+                destination_ports: (53, 53),
+                action: FirewallAction::Accept,
+            },
+            FirewallRule {
+                ingress: None,
+                egress: None,
+                source: any,
+                destination: any,
+                protocol: Protocol::Icmp,
+                source_ports: (0, 65_535),
+                destination_ports: (0, 65_535),
+                action: FirewallAction::Drop,
+            },
+            FirewallRule {
+                ingress: None,
+                egress: None,
+                source: any,
+                destination: any,
+                protocol: Protocol::Tcp,
+                source_ports: (1_024, 65_535),
+                destination_ports: (0, 65_535),
+                action: FirewallAction::Accept,
+            },
+        ]
+    );
+}
+
+#[test]
+fn firewall_mistakes_are_refused() {
+    let rule = |extra: &str| {
+        format!("{LAN}vrf = \"red\"\n[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\n[[firewall]]\n{extra}")
+    };
+    for (text, expected) in [
+        (
+            rule("action = \"allow\"\nprotocol = \"udp\"\n"),
+            "action must be",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"sctp\"\n"),
+            "protocol must be",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"udp\"\ningress = \"dmz\"\n"),
+            "no interface \"dmz\"",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"udp\"\ningress = \"lan\"\n"),
+            "is in VRF \"red\"",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"udp\"\nsource = \"10.0.0.1/8\"\n"),
+            "no host bits",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"udp\"\nsource = \"2001:db8::/32\"\n"),
+            "IPv4 prefix",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"icmp\"\ndestination-ports = \"53\"\n"),
+            "tcp and udp only",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"tcp\"\ndestination-ports = \"80-22\"\n"),
+            "a port or a range",
+        ),
+    ] {
+        let got = error(&text);
+        assert!(got.contains(expected), "{text}: {got}");
+    }
+    assert!(parse(&rule(
+        "action = \"accept\"\nprotocol = \"udp\"\negress = \"wan\"\n"
+    ))
+    .is_ok());
+}

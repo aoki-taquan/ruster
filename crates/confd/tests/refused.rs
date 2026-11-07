@@ -41,6 +41,7 @@ fn config(mtu: u16) -> Config {
             vlan: None,
         }],
         static_routes: Vec::new(),
+        firewall: Vec::new(),
     }
 }
 

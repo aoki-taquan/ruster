@@ -73,6 +73,8 @@ pub enum RouteTarget {
 pub struct Config {
     pub interfaces: Vec<InterfaceConfig>,
     pub static_routes: Vec<StaticRoute>,
+    /// The default VRF's forward firewall rules, in order.
+    pub firewall: Vec<ruster_proto::table::FirewallRule>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -167,9 +169,9 @@ impl Confd {
         }
     }
 
-    /// Connects to the FE as the writer of interfaces and addresses.
+    /// Connects to the FE as the writer of interfaces, addresses and firewall rules.
     pub fn connect_fe(&mut self, stream: UnixStream) -> io::Result<()> {
-        self.fe = Some(self.full_send(stream, Self::interface_tables, false)?);
+        self.fe = Some(self.full_send(stream, Self::fe_tables, false)?);
         Ok(())
     }
 
@@ -209,12 +211,13 @@ impl Confd {
     /// Replaces the configuration; only the differences are sent.
     pub fn set_config(&mut self, config: Config) {
         self.config = config;
-        let fe = self.interface_tables();
+        let interfaces = self.interface_tables();
+        let fe = self.fe_tables();
         let routes = self.routes();
         let counters = &mut self.counters;
         for (peer, desired) in [
             (&mut self.fe, &fe),
-            (&mut self.neighd, &fe),
+            (&mut self.neighd, &interfaces),
             (&mut self.ribd, &routes),
         ] {
             if let Some(peer) = peer {
@@ -249,6 +252,21 @@ impl Confd {
             send_diff(&mut peer, &desired, &mut self.counters);
         }
         Ok(peer)
+    }
+
+    /// The interface tables and the firewall rules, numbered from 1 in order.
+    fn fe_tables(&self) -> BTreeMap<Key, Value> {
+        let mut out = self.interface_tables();
+        for (id, rule) in (1..).zip(&self.config.firewall) {
+            out.insert(
+                Key::FirewallRule {
+                    vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
+                    id,
+                },
+                Value::FirewallRule(rule.clone()),
+            );
+        }
+        out
     }
 
     fn interface_tables(&self) -> BTreeMap<Key, Value> {

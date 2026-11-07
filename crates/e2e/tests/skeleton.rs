@@ -62,6 +62,7 @@ fn config() -> Config {
                 via: Some(Ipv4Addr::from(GATEWAY).into()),
             },
         }],
+        firewall: Vec::new(),
     }
 }
 
