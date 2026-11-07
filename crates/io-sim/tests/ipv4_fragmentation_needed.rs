@@ -2,7 +2,7 @@
 //! translated) IPv4 and the ICMP Destination Unreachable, Fragmentation
 //! Needed and DF Set error of RFC 1812 §5.2.7.1 with the Next-Hop MTU of
 //! RFC 1191 §4. NAT, hairpin, firewall, and the config path are covered by
-//! `fixtures/mtu1` (sim-scenario) and `nat44_hairpin`.
+//! `nat44_hairpin`.
 //!
 //! Expected wire bytes are built here from the RFC field layout with a
 //! local checksum, not with the router's builders.

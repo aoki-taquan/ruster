@@ -51,8 +51,8 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 
 実際のNICや回線ではまだ試していません。
 
-見直し前の作り（`ruster`コマンドの`run`と`run-sim`、`ruster-core`の中のARP、NAT、firewall）は、
-新しい作りへ置き換えるまでリポジトリに残っています。
+`ruster-core`には、見直し前の作りのARPの処理がまだ残っています（neighdへ移した後に消す）。
+NAT、firewall、フラグメントの処理もcoreにあり、表としてFEにつなぐのはこれからです。
 
 ## 動かす
 
@@ -141,7 +141,6 @@ cargo test --doc --workspace --all-features --locked
 | `io-conformance` | I/O層が共通に満たす試験 |
 | `e2e` | sim上で4つのプロセスをつないだ試験 |
 | `bench` | NICなしで`core`の性能を測る |
-| `cli`、`config`、`control`、`runtime`、`sim-scenario` | 見直し前の`ruster`コマンドとその設定。置き換えたら消す |
 
 2026年3月の試作はGit tag
 [`prototype-v0.1`](https://github.com/aoki-taquan/ruster/tree/prototype-v0.1)に残しています。

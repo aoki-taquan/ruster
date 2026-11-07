@@ -83,8 +83,7 @@ impl AfPacketIo {
     /// kernel route, or a forwarding role, that `rp_filter` and IPv6
     /// (`disable_ipv6=1`) leave the kernel nothing to answer, and that the
     /// configured maximum frame does not exceed the device MTU plus 14.
-    /// `ruster run` (`backend.kind = "af-packet"`, AFPKT-015) enforces this
-    /// before it calls `open` and watches it while it runs.
+    /// The caller sets up the devices that way before it calls `open`.
     pub fn open(config: ValidatedConfig) -> Result<Self, PlatformError> {
         super::validated_uapi_layout()?;
         Ok(Self {

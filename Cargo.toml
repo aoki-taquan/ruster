@@ -1,10 +1,7 @@
 [workspace]
 members = [
     "crates/bench",
-    "crates/cli",
     "crates/confd",
-    "crates/config",
-    "crates/control",
     "crates/core",
     "crates/e2e",
     "crates/fe",
@@ -16,8 +13,6 @@ members = [
     "crates/neighd",
     "crates/proto",
     "crates/ribd",
-    "crates/runtime",
-    "crates/sim-scenario",
 ]
 resolver = "2"
 
