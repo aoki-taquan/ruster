@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use ruster_proto::cbor::{Decoder, Encoder};
 use ruster_proto::sid;
 use ruster_proto::table::{
-    format_mac, parse_mac, Change, Key, ModelError, NextHop, RouteAction, Value, DEFAULT_VRF,
+    format_mac, parse_mac, Change, Key, ModelError, NextHop, RouteAction, Value, Vlan, DEFAULT_VRF,
 };
 
 fn round_trip(change: &Change) -> Change {
@@ -37,6 +37,7 @@ fn every_table_round_trips() {
                 mac: [2, 0, 0, 0, 0, 1],
                 mtu: 1500,
                 vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                vlan: None,
             },
         ),
         Change::set(
@@ -317,6 +318,7 @@ fn encode_refuses_what_decode_would_refuse() {
                 mac: [2, 0, 0, 0, 0, 1],
                 mtu: 0,
                 vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                vlan: None,
             },
         ),
         Change::set(
@@ -506,6 +508,7 @@ fn vrf_binding_and_lookup_vrf_round_trip() {
                 mac: [2, 0, 0, 0, 0, 9],
                 mtu: 1500,
                 vrf: "customer".into(),
+                vlan: None,
             },
         ),
         Change::set(
@@ -528,6 +531,7 @@ fn vrf_binding_and_lookup_vrf_round_trip() {
             mac: [2, 0, 0, 0, 0, 1],
             mtu: 1500,
             vrf: DEFAULT_VRF.into(),
+            vlan: None,
         },
     );
     let mut payload = Vec::new();
@@ -546,4 +550,35 @@ fn vrf_binding_and_lookup_vrf_round_trip() {
         Value::Route(RouteAction::LookupVrf(String::new())),
     );
     assert!(empty.validate().is_err());
+}
+
+#[test]
+fn vlan_sub_interfaces_round_trip_and_are_checked() {
+    let sub = |parent: &str, id: u16| {
+        Change::set(
+            Key::Interface {
+                name: "eth0.10".into(),
+            },
+            Value::Interface {
+                enabled: true,
+                mac: [2, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                vrf: DEFAULT_VRF.into(),
+                vlan: Some(Vlan {
+                    parent: parent.into(),
+                    id,
+                }),
+            },
+        )
+    };
+    let good = sub("eth0", 10);
+    assert_eq!(round_trip(&good), good);
+    for bad in [
+        sub("eth0", 0),
+        sub("eth0", 4095),
+        sub("", 10),
+        sub("eth0.10", 10),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
 }

@@ -43,6 +43,18 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ietf-if-extensions:parent-interface",
+        "sid": 60015,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ietf-if-extensions:encapsulation/ietf-if-vlan-encapsulation:dot1q-vlan/outer-tag/vlan-id",
+        "sid": 60016,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",
         "sid": 60020,
         "status": "unstable"

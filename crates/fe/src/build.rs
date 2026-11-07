@@ -177,6 +177,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 mac,
                 mtu,
                 vrf,
+                vlan: None,
             },
         ) = (key, value)
         {

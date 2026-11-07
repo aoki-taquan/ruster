@@ -24,6 +24,8 @@
 //!   entries follow their leaves (enabled, phys-address, mtu, prefix-length).
 //! - RFC 8529 (`ietf-network-instance`): an interface names its VRF with
 //!   `bind-ni-name`; `default` when left out.
+//! - `draft-ietf-netmod-sub-intf-vlan-model`: a sub-interface names its
+//!   `parent-interface` and the VLAN ID of its outer 802.1Q tag.
 //! - RFC 5952 section 4: an IPv6 address is accepted only in its canonical text, so
 //!   one address is one key.
 //!
@@ -70,6 +72,8 @@ pub enum Value {
         /// The VRF (`ietf-network-instance` `bind-ni-name`) the interface belongs to;
         /// [`DEFAULT_VRF`] when not given.
         vrf: String,
+        /// For a VLAN sub-interface, its parent and VLAN ID.
+        vlan: Option<Vlan>,
     },
     Address {
         prefix_len: u8,
@@ -91,6 +95,14 @@ pub enum RouteAction {
     Reject,
     /// Looked up again in another VRF.
     LookupVrf(String),
+}
+
+/// A VLAN sub-interface: frames on `parent` tagged `id` (802.1Q outer tag).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Vlan {
+    pub parent: String,
+    /// 1 to 4094.
+    pub id: u16,
 }
 
 /// The VRF of an interface that names none.
@@ -205,7 +217,20 @@ impl Change {
                     Value::Interface { mtu, .. } if *mtu < MIN_MTU => {
                         return Err(ModelError::Invalid("mtu"));
                     }
-                    Value::Interface { vrf, .. } => name(vrf)?,
+                    Value::Interface { vrf, vlan, .. } => {
+                        name(vrf)?;
+                        if let Some(vlan) = vlan {
+                            name(&vlan.parent)?;
+                            if !(1..=4094).contains(&vlan.id) {
+                                return Err(ModelError::Invalid("VLAN ID"));
+                            }
+                            if let Key::Interface { name: own } = &self.key {
+                                if *own == vlan.parent {
+                                    return Err(ModelError::Invalid("VLAN parent (itself)"));
+                                }
+                            }
+                        }
+                    }
                     Value::Route(RouteAction::LookupVrf(vrf)) => name(vrf)?,
                     Value::Address { prefix_len } => {
                         let Key::Address { address, .. } = &self.key else {
@@ -337,9 +362,11 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             mac,
             mtu,
             vrf,
+            vlan,
         } => {
             let named = vrf != DEFAULT_VRF;
-            e.map(if named { 4 } else { 3 })
+            let members = 3 + u64::from(named) + if vlan.is_some() { 2 } else { 0 };
+            e.map(members)
                 .u64(sid::INTERFACE_ENABLED - sid::INTERFACE)
                 .bool(*enabled)
                 .u64(sid::INTERFACE_PHYS_ADDRESS - sid::INTERFACE)
@@ -349,6 +376,12 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             if named {
                 e.u64(sid::INTERFACE_BIND_NI_NAME - sid::INTERFACE)
                     .text(vrf);
+            }
+            if let Some(vlan) = vlan {
+                e.u64(sid::INTERFACE_PARENT - sid::INTERFACE)
+                    .text(&vlan.parent)
+                    .u64(sid::INTERFACE_VLAN_ID - sid::INTERFACE)
+                    .u64(u64::from(vlan.id));
             }
         }
         Value::Address { prefix_len } => {
@@ -401,6 +434,8 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     let mut mac = None;
     let mut mtu = None;
     let mut vrf = None;
+    let mut parent = None;
+    let mut vlan_id = None;
     let mut prefix_len = None;
     let mut action = None;
     for _ in 0..members {
@@ -420,6 +455,15 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             }
             sid::INTERFACE_BIND_NI_NAME if table == sid::INTERFACE => {
                 put(&mut vrf, d.text()?.to_owned())?;
+            }
+            sid::INTERFACE_PARENT if table == sid::INTERFACE => {
+                put(&mut parent, d.text()?.to_owned())?;
+            }
+            sid::INTERFACE_VLAN_ID if table == sid::INTERFACE => {
+                put(
+                    &mut vlan_id,
+                    u16::try_from(d.u64()?).map_err(|_| ModelError::Invalid("VLAN ID"))?,
+                )?;
             }
             sid::ROUTE_LOOKUP_VRF if table == sid::ROUTE => {
                 put(&mut action, RouteAction::LookupVrf(d.text()?.to_owned()))?;
@@ -461,6 +505,11 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             mac: mac.ok_or(ModelError::Missing("phys-address"))?,
             mtu: mtu.unwrap_or(1500),
             vrf: vrf.unwrap_or_else(|| DEFAULT_VRF.to_owned()),
+            vlan: match (parent, vlan_id) {
+                (Some(parent), Some(id)) => Some(Vlan { parent, id }),
+                (None, None) => None,
+                _ => return Err(ModelError::Missing("VLAN parent and ID together")),
+            },
         }),
         sid::ADDRESS => Ok(Value::Address {
             prefix_len: prefix_len.ok_or(ModelError::Missing("prefix-length"))?,

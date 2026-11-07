@@ -261,6 +261,7 @@ impl Confd {
                     mac: interface.mac,
                     mtu: interface.mtu,
                     vrf: interface.vrf.clone(),
+                    vlan: None,
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);

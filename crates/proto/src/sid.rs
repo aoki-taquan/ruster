@@ -18,6 +18,10 @@ pub const INTERFACE_PHYS_ADDRESS: u64 = 60012;
 pub const INTERFACE_MTU: u64 = 60013;
 /// `ietf-network-instance` (RFC 8529) `bind-ni-name`: the interface's VRF.
 pub const INTERFACE_BIND_NI_NAME: u64 = 60014;
+/// `ietf-if-extensions` `parent-interface`, of a VLAN sub-interface.
+pub const INTERFACE_PARENT: u64 = 60015;
+/// `ietf-if-vlan-encapsulation` `dot1q-vlan/outer-tag/vlan-id`.
+pub const INTERFACE_VLAN_ID: u64 = 60016;
 
 pub const ADDRESS: u64 = 60020;
 pub const ADDRESS_PREFIX_LENGTH: u64 = 60021;
@@ -57,6 +61,14 @@ pub const ALL: &[(&str, u64)] = &[
     (
         "/ietf-interfaces:interfaces/interface/ietf-network-instance:bind-ni-name",
         INTERFACE_BIND_NI_NAME,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ietf-if-extensions:parent-interface",
+        INTERFACE_PARENT,
+    ),
+    (
+        "/ietf-interfaces:interfaces/interface/ietf-if-extensions:encapsulation/ietf-if-vlan-encapsulation:dot1q-vlan/outer-tag/vlan-id",
+        INTERFACE_VLAN_ID,
     ),
     (
         "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",
