@@ -255,16 +255,20 @@ pub enum ConsumeReason {
     /// and discarded (and counted) when the resolution fails. The received
     /// frame is recycled.
     ArpHeld,
+    /// An IPv6 Neighbor Discovery message copied into the caller's control queue
+    /// for the neighbor process. The received frame is recycled.
+    Ipv6Control,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
         Self::Ipv4FragmentHeld,
         Self::ArpHeld,
+        Self::Ipv6Control,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -277,6 +281,7 @@ impl ConsumeReason {
             Self::Ipv4Fragmented => 2,
             Self::Ipv4FragmentHeld => 3,
             Self::ArpHeld => 4,
+            Self::Ipv6Control => 5,
         }
     }
 
@@ -288,6 +293,7 @@ impl ConsumeReason {
             Self::Ipv4Fragmented => "IPV4_FRAGMENTED",
             Self::Ipv4FragmentHeld => "IPV4_FRAGMENT_HELD",
             Self::ArpHeld => "ARP_HELD",
+            Self::Ipv6Control => "IPV6_CONTROL",
         }
     }
 }
@@ -451,7 +457,8 @@ mod tests {
                 "IPV4_LOCAL_UNSUPPORTED",
                 "IPV4_FRAGMENTED",
                 "IPV4_FRAGMENT_HELD",
-                "ARP_HELD"
+                "ARP_HELD",
+                "IPV6_CONTROL"
             ]
         );
     }
