@@ -20,7 +20,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 
 | プロセス | 役目 | 書く表 |
 |---|---|---|
-| `ruster-fe` | パケットの転送。今はAF_PACKETの上で動く | — |
+| `ruster-fe` | パケットの転送。AF_XDPかAF_PACKETの上で動く | — |
 | `ruster-confd` | 設定ファイルを読み、各プロセスへ渡す | インターフェース、アドレス |
 | `ruster-ribd` | 送り手（confdや外のデーモン）の経路から選び、FEへ渡す | 経路 |
 | `ruster-neighd` | ARP。FEから受け取って答え、問い合わせる | 近隣 |
@@ -87,15 +87,16 @@ via = "198.51.100.1"          # 省略すると直結の経路
 `/run/ruster`の下にでき、`--run-dir`で場所を変えられます。
 
 ```bash
-sudo ruster-fe lan wan &         # 転送するデバイスを並べる。CAP_NET_RAWが要る
+sudo ruster-fe lan wan &         # 転送するデバイスを並べる。rootが要る
 ruster-ribd &                    # 送り手を省略すると confd:1
 ruster-neighd &
 ruster-confd router.toml &
 ```
 
-AF_PACKETはkernelからフレームを取り上げません。そのため、FEに渡すデバイスにはkernelの
-アドレスや経路を付けないでください。kernelでの転送も切っておきます。
-FEのポートのMACは、デバイスのMACと同じにします。
+FEは既定でAF_XDPを使い、各デバイスのqueue 0にXDPのプログラムを付けます（`--xdp-attach native|generic`、
+`--zero-copy`）。`--backend af-packet`ではAF_PACKETを使います。AF_PACKETはkernelからフレームを取り上げないので、
+FEに渡すデバイスにはkernelのアドレスや経路を付けず、kernelでの転送も切っておきます。
+どちらでも、FEのポートのMACはデバイスのMACと同じにします。
 
 相手のプロセスが落ちると、残ったプロセスは1秒ごとにつなぎ直し、自分の表を全部送り直します。
 CEのプロセスが落ちている間も、FEは持っている表で転送を続けます。
@@ -107,7 +108,8 @@ rootが要るのでCIでは回していません。
 
 ```bash
 cargo build --workspace --locked
-sudo scripts/netns-skeleton.sh target/debug
+sudo scripts/netns-skeleton.sh target/debug                       # AF_XDP
+sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 ```
 
 ## 開発

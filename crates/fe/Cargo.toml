@@ -11,6 +11,8 @@ ruster-proto = { path = "../proto" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ruster-io-afpacket = { path = "../io-afpacket" }
+ruster-io-xdp = { path = "../io-xdp" }
+ruster-io-xdp-native = { path = "../io-xdp-native" }
 
 [dev-dependencies]
 ruster-io-sim = { path = "../io-sim" }

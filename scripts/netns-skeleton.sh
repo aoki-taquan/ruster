@@ -7,7 +7,9 @@
 #   host-a (192.0.2.10) -- [ra | router | rb] -- host-b (198.51.100.10)
 #
 # Run as root, after `cargo build`:  sudo scripts/netns-skeleton.sh [target/debug]
+# FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
 set -euo pipefail
+backend=${FE_BACKEND:-af-xdp}
 
 bin=$(realpath "${1:-target/debug}")
 for name in ruster-fe ruster-ribd ruster-neighd ruster-confd; do
@@ -77,7 +79,7 @@ start() {
 }
 args_of() {
   case $1 in
-    ruster-fe) echo "ra rb" ;;
+    ruster-fe) echo "--backend $backend ra rb" ;;
     ruster-confd) echo "$work/router.toml" ;;
     *) echo "" ;;
   esac
@@ -147,4 +149,4 @@ done
 all_running || fail "a router process exited after the FE restarted"
 echo "ok: the control processes refilled a restarted FE"
 
-echo "PASS"
+echo "PASS ($backend)"
