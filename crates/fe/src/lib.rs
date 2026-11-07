@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
 use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
+use std::path::PathBuf;
 
 use ruster_core::{
     forward_batch, ArpOpcode, GeneratedPacketBatch, GeneratedPacketIo, IfId, Interface,
@@ -58,6 +59,7 @@ const RESOLVE_REMEMBERED: usize = 1_024;
 /// and a VLAN tag, plus the punt header).
 const PUNT_MAX: usize = 1_522 + 300;
 const ETHERNET_HEADER: usize = 14;
+const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
 
 /// Counters for things the FE dropped on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -81,6 +83,8 @@ pub struct Fe<B> {
     active: Vec<IfId>,
     server: Server,
     punt: Option<UnixDatagram>,
+    /// Where ARP goes when the punt socket is not connected to one peer.
+    punt_peer: Option<PathBuf>,
     last_resolve: BTreeMap<(IfId, Ipv4Addr), u64>,
     counters: FeCounters,
 }
@@ -112,6 +116,7 @@ where
             active,
             server: Server::new(),
             punt: None,
+            punt_peer: None,
             last_resolve: BTreeMap::new(),
             counters: FeCounters::default(),
         }
@@ -127,6 +132,17 @@ where
     pub fn attach_punt(&mut self, socket: UnixDatagram) -> io::Result<()> {
         socket.set_nonblocking(true)?;
         self.punt = Some(socket);
+        self.punt_peer = None;
+        Ok(())
+    }
+
+    /// Like [`Fe::attach_punt`] for a socket bound at a fixed path that is not
+    /// connected: ARP is sent to the socket at `peer`, and frames are taken from
+    /// whoever sends them. A neighbor process that restarts binds the same path again.
+    pub fn attach_punt_to(&mut self, socket: UnixDatagram, peer: PathBuf) -> io::Result<()> {
+        socket.set_nonblocking(true)?;
+        self.punt = Some(socket);
+        self.punt_peer = Some(peer);
         Ok(())
     }
 
@@ -185,7 +201,11 @@ where
         }
         .encode(&mut message)
         .expect("port names are short and non-empty");
-        match socket.send(&message) {
+        let sent = match &self.punt_peer {
+            Some(peer) => socket.send_to(&message, peer),
+            None => socket.send(&message),
+        };
+        match sent {
             Ok(_) => self.counters.arp_to_control += 1,
             Err(_) => self.counters.arp_to_control_dropped += 1,
         }
@@ -228,8 +248,17 @@ where
         let mut buf = vec![0_u8; PUNT_MAX + 1];
         let mut frames = Vec::new();
         for _ in 0..INJECT_PER_STEP {
-            match socket.recv(&mut buf) {
-                Ok(n) if n <= PUNT_MAX => frames.push(buf[..n].to_vec()),
+            match socket.recv_from(&mut buf) {
+                // With a fixed peer path, only frames from that path are taken.
+                Ok((_, from))
+                    if self
+                        .punt_peer
+                        .as_deref()
+                        .is_some_and(|peer| from.as_pathname() != Some(peer)) =>
+                {
+                    self.counters.inject_dropped += 1;
+                }
+                Ok((n, _)) if n <= PUNT_MAX => frames.push(buf[..n].to_vec()),
                 Ok(_) => self.counters.inject_dropped += 1,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -248,7 +277,8 @@ where
                 .filter(|id| self.active.contains(id));
             match (punt.direction, punt.reason, egress) {
                 (Direction::FromControl, punt::reason::ARP, Some(egress))
-                    if punt.frame.len() >= ETHERNET_HEADER =>
+                    if punt.frame.len() >= ETHERNET_HEADER
+                        && punt.frame[12..14] == ETHERTYPE_ARP =>
                 {
                     if self.send_generated(egress, punt.frame) {
                         self.counters.injected += 1;

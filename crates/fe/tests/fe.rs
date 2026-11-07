@@ -283,7 +283,8 @@ fn arp_goes_to_the_neighbor_socket_and_frames_come_back() {
     assert_eq!(&punt.frame[8..14], &HOST_MAC, "sender MAC");
     assert_eq!(&punt.frame[24..28], &[192, 0, 2, 1], "target IP");
 
-    let reply = vec![0xab_u8; 42];
+    let mut reply = vec![0xab_u8; 42];
+    reply[12..14].copy_from_slice(&[0x08, 0x06]);
     let mut message = Vec::new();
     Punt {
         direction: Direction::FromControl,
@@ -338,7 +339,18 @@ fn frames_from_the_neighbor_process_only_leave_enabled_interfaces() {
     bench.patch(&mut config, &[iface("lan", LAN_MAC)]);
     let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
     bench.fe.attach_punt(fe_end).unwrap();
-    let frame = vec![0xab_u8; 42];
+    let mut frame = vec![0xab_u8; 42];
+    frame[12..14].copy_from_slice(&[0x08, 0x06]);
+    let mut not_arp = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &[0xab_u8; 42],
+    }
+    .encode(&mut not_arp)
+    .unwrap();
+    neighd_end.send(&not_arp).unwrap();
     for interface in ["wan", "nope", "lan"] {
         let mut message = Vec::new();
         Punt {
@@ -368,7 +380,7 @@ fn frames_from_the_neighbor_process_only_leave_enabled_interfaces() {
     let tx = bench.fe.io_mut().pop_tx().expect("lan only");
     assert_eq!(tx.egress, IfId(0));
     assert!(bench.fe.io_mut().pop_tx().is_none());
-    assert_eq!(bench.fe.counters().inject_dropped, 4);
+    assert_eq!(bench.fe.counters().inject_dropped, 5);
 }
 
 #[test]
@@ -405,4 +417,59 @@ fn the_resolve_rate_limit_forgets_old_next_hops_and_stays_bounded() {
     let counters = bench.fe.counters();
     assert_eq!(counters.resolve_requests, 2_000 + 1_024);
     assert_eq!(counters.resolve_requests_dropped, 2_000 - 1_024);
+}
+
+#[test]
+fn a_punt_socket_at_a_fixed_path_sends_to_whoever_binds_the_peer_path() {
+    let dir = std::env::temp_dir().join(format!("ruster-fe-punt-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let fe_end = UnixDatagram::bind(dir.join("fe")).unwrap();
+    bench.fe.attach_punt_to(fe_end, dir.join("neighd")).unwrap();
+
+    // Nobody at the peer path yet: the ARP packet is counted as dropped.
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), arp_request([192, 0, 2, 1]));
+    bench.fe.step(0);
+    assert_eq!(bench.fe.counters().arp_to_control_dropped, 1);
+
+    // Each neighbor process that binds the path gets the next ones.
+    for round in 1..=2 {
+        let _ = std::fs::remove_file(dir.join("neighd"));
+        let neighd_end = UnixDatagram::bind(dir.join("neighd")).unwrap();
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), arp_request([192, 0, 2, 1]));
+        bench.fe.step(round);
+        let mut buf = [0_u8; 256];
+        let n = neighd_end.recv(&mut buf).unwrap();
+        assert_eq!(Punt::decode(&buf[..n]).unwrap().interface, "lan");
+
+        let mut reply = vec![0xab_u8; 42];
+        reply[12..14].copy_from_slice(&[0x08, 0x06]);
+        let mut message = Vec::new();
+        Punt {
+            direction: Direction::FromControl,
+            reason: punt::reason::ARP,
+            interface: "lan",
+            frame: &reply,
+        }
+        .encode(&mut message)
+        .unwrap();
+        neighd_end.send_to(&message, dir.join("fe")).unwrap();
+        // The same message from anyone else is not sent.
+        let stranger = UnixDatagram::unbound().unwrap();
+        stranger.send_to(&message, dir.join("fe")).unwrap();
+        bench.fe.step(round);
+        assert_eq!(bench.fe.io_mut().pop_tx().expect("sent").bytes, reply);
+    }
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    assert_eq!(bench.fe.counters().arp_to_control, 2);
+    assert_eq!(bench.fe.counters().inject_dropped, 2);
+    std::fs::remove_dir_all(dir).unwrap();
 }
