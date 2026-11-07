@@ -217,3 +217,14 @@ mod tests {
         }
     }
 }
+
+/// Where a packet the router itself sends goes
+/// ([`crate::ForwardingSnapshot::origin`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Origin {
+    pub egress: IfId,
+    pub source_mac: MacAddress,
+    pub next_hop: std::net::IpAddr,
+    /// `None` when the next hop is not in the neighbor table.
+    pub destination_mac: Option<MacAddress>,
+}

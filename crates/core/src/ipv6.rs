@@ -154,6 +154,17 @@ impl Ipv6Fib {
             .map(|n| n.mac)
     }
 
+    /// The egress, next hop and (when known) next hop MAC for a packet the router
+    /// sends to `destination`.
+    pub(crate) fn origin(
+        &self,
+        destination: [u8; 16],
+    ) -> Option<(IfId, [u8; 16], Option<MacAddress>)> {
+        let route = self.route(destination)?;
+        let hop = route.next_hop.unwrap_or(destination);
+        Some((route.egress, hop, self.neighbor(route.egress, hop)))
+    }
+
     fn is_local(&self, address: [u8; 16]) -> bool {
         self.local.iter().any(|l| l.address == address)
     }

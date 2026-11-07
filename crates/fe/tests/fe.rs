@@ -787,3 +787,58 @@ fn an_interface_in_another_vrf_uses_that_vrf_s_routes_and_a_lookup_reaches_defau
     bench.fe.step(1);
     assert!(bench.fe.io_mut().pop_tx().is_none());
 }
+
+#[test]
+fn traffic_to_the_router_goes_to_the_kernel_pipe_and_the_kernel_s_packets_go_out() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(
+        &mut neighbors,
+        &[neighbor("lan", [192, 0, 2, 10], HOST_MAC)],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    // A packet to the router's LAN address goes to the kernel without Ethernet.
+    let mut to_router = udp_from_host([192, 0, 2, 1]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&to_router[14..34]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+    bench.fe.io_mut().inject(IfId(0), to_router.clone());
+    bench.fe.step(0);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "core does not answer");
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], &to_router[14..]);
+    assert_eq!(bench.fe.counters().to_kernel, 1);
+
+    // The kernel's answer goes out of the route's interface to the neighbor.
+    let mut reply = to_router[14..].to_vec();
+    reply[12..16].copy_from_slice(&[192, 0, 2, 1]);
+    reply[16..20].copy_from_slice(&[192, 0, 2, 10]);
+    kernel.send(&reply).unwrap();
+    bench.fe.step(1);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent out");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!(&tx.bytes[6..12], &LAN_MAC);
+    assert_eq!(&tx.bytes[12..14], &[0x08, 0x00]);
+    assert_eq!(&tx.bytes[14..], &reply[..]);
+
+    // To a host without a neighbor entry: dropped, and the neighbor is asked for.
+    let mut observer = bench.connect(writers::READ_ONLY);
+    observer.observe();
+    bench.settle(&mut [&mut observer]);
+    reply[16..20].copy_from_slice(&[192, 0, 2, 99]);
+    kernel.send(&reply).unwrap();
+    let events = bench.settle(&mut [&mut observer]).remove(0);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::Notification { .. })));
+    assert_eq!(bench.fe.counters().from_kernel, 1);
+    assert_eq!(bench.fe.counters().from_kernel_dropped, 1);
+}

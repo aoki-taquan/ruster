@@ -195,7 +195,7 @@ pub use resolution::{
     ARP_REQUEST_FRAME_LEN, RESOLUTION_INDEX_CHAIN_LIMIT,
 };
 pub use route::{
-    IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route, RouteError,
+    IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Origin, Route, RouteError,
     ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
 pub use source_validation::{SourceValidation, SourceValidationBinding};

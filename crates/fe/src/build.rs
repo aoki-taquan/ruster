@@ -29,6 +29,8 @@ pub(crate) struct Vrf {
 pub(crate) struct Built {
     /// The default VRF first.
     pub(crate) vrfs: Vec<Vrf>,
+    /// The VRF names, in the order of `vrfs`.
+    pub(crate) names: Vec<String>,
     /// For each port, the index in `vrfs` of its interface's VRF.
     pub(crate) by_ingress: Vec<u16>,
     /// The enabled ports.
@@ -330,6 +332,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let enabled = interfaces.iter().map(|i| i.id).collect();
     Ok(Built {
         vrfs,
+        names: order.iter().map(|v| (*v).to_owned()).collect(),
         by_ingress,
         active: enabled,
     })

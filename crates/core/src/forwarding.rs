@@ -1874,6 +1874,37 @@ impl<'a> ForwardingSnapshot<'a> {
             .is_some_and(|binding| binding.address == address)
     }
 
+    /// Where a packet the router itself sends to `destination` goes: the route's
+    /// egress interface and its MAC, the next hop, and the next hop's MAC when the
+    /// neighbor table has it. `None` without a route (or IPv6 tables, for IPv6).
+    #[must_use]
+    pub fn origin(&self, destination: std::net::IpAddr) -> Option<crate::Origin> {
+        let (egress, next_hop, destination_mac) = match destination {
+            std::net::IpAddr::V4(address) => {
+                let target = crate::Ipv4Address::from_octets(address.octets());
+                let route = self.route_lookup(target)?;
+                let hop = route.next_hop().unwrap_or(target);
+                let mac = self.static_neighbor(route.egress(), hop).map(|n| n.mac);
+                (
+                    route.egress(),
+                    std::net::IpAddr::V4(hop.octets().into()),
+                    mac,
+                )
+            }
+            std::net::IpAddr::V6(address) => {
+                let (egress, hop, mac) = self.ipv6?.origin(address.octets())?;
+                (egress, std::net::IpAddr::V6(hop.into()), mac)
+            }
+        };
+        let source_mac = self.interface(egress)?.mac;
+        Some(crate::Origin {
+            egress,
+            source_mac,
+            next_hop,
+            destination_mac,
+        })
+    }
+
     /// The static neighbor for `(interface, target)`.
     #[inline]
     pub(crate) fn static_neighbor(
