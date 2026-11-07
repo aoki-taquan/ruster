@@ -43,6 +43,7 @@ fn a_file_becomes_the_configuration() {
                 vrf: "default".into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -54,6 +55,7 @@ fn a_file_becomes_the_configuration() {
                 vrf: "default".into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
         ]
     );
@@ -787,5 +789,35 @@ fn map_e_follows_rfc_7597_appendix_a() {
     ] {
         let got = error(&bad);
         assert!(got.contains(expected), "{got}");
+    }
+}
+
+#[test]
+fn a_pppoe_interface_runs_on_its_parent() {
+    let wan = "[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\n";
+    let ppp = |extra: &str| {
+        format!("{wan}[[interface]]\nname = \"ppp\"\npppoe = {{ parent = \"wan\", session = 4660, peer = \"02:00:00:00:00:ac\" }}\n{extra}")
+    };
+    let config = parse(&ppp("ipv4 = \"198.51.100.2/32\"\n")).unwrap();
+    let session = &config.interfaces[1];
+    assert_eq!((session.mtu, session.mac), (1492, [2, 0, 0, 0, 0, 2]));
+    assert_eq!(
+        session.pppoe,
+        Some(("wan".into(), 4660, [2, 0, 0, 0, 0, 0xac]))
+    );
+    for (text, expected) in [
+        (ppp("mtu = 1500\n"), "mtu must be"),
+        (ppp("").replace("4660", "0"), "1 to 65534"),
+        (
+            ppp("").replace("02:00:00:00:00:ac", "ff:ff:ff:ff:ff:ff"),
+            "unicast",
+        ),
+        (
+            ppp("").replace("parent = \"wan\"", "parent = \"dmz\""),
+            "port or VLAN",
+        ),
+    ] {
+        let got = error(&text);
+        assert!(got.contains(expected), "{text}: {got}");
     }
 }
