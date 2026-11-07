@@ -10,7 +10,7 @@
 | エンコード | YANGのデータをCBORで表す方法（RFC 9254）と、名前の代わりの数値ID「SID」（RFC 9595） | RFC |
 | 操作 | CORECONF（draft-ietf-core-comi-21）のFETCH、iPATCH、PUT、POST、Observeに合わせる | draft。下の「CORECONFとの違い」を除いて従う |
 | 通り道 | Unix stream socketの上に、TCP向けのCoAPの枠組み（RFC 8323）を載せる | CORECONFからの逸脱 |
-| パケットの受け渡し | 上とは別。固定ヘッダ付きのSOCK_SEQPACKET | 独自 |
+| パケットの受け渡し | 上とは別。固定ヘッダ付きのUnix datagram | 独自 |
 
 YANGで「何を送れるか」が決まり、CEのどのプロセスも同じ形式を使う。文字列の項目名は使わない。
 
