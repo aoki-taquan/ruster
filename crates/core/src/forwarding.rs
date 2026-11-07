@@ -2763,6 +2763,13 @@ pub enum TraceEvent {
     Ipv6ToControl {
         ingress: IfId,
     },
+    /// A packet for a WireGuard peer was dropped because the peer has no session (or
+    /// its counter is used up): the key exchange is due. `peer` is the peer's index
+    /// among the interface's peers.
+    WireguardNoSession {
+        interface: IfId,
+        peer: usize,
+    },
     /// An IPv6 packet's next hop is not in the IPv6 neighbor table.
     Ipv6NeighborMissing {
         egress: IfId,

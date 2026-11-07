@@ -1119,6 +1119,50 @@ pub fn parse_mac(text: &str) -> Result<[u8; 6], ModelError> {
     Ok(mac)
 }
 
+/// The notification the FE sends when a packet is for a WireGuard peer that has no
+/// session: `{KEY_REQUEST: {1: interface, 2: peer}}`. The key exchange for that
+/// peer is due.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyExchangeRequest {
+    pub interface: String,
+    pub peer: String,
+}
+
+impl KeyExchangeRequest {
+    pub fn encode(&self, e: &mut Encoder<'_>) {
+        e.map(1)
+            .u64(sid::WIREGUARD_KEY_REQUEST)
+            .map(2)
+            .u64(sid::WIREGUARD_KEY_REQUEST_INTERFACE - sid::WIREGUARD_KEY_REQUEST)
+            .text(&self.interface)
+            .u64(sid::WIREGUARD_KEY_REQUEST_PEER - sid::WIREGUARD_KEY_REQUEST)
+            .text(&self.peer);
+    }
+
+    pub fn decode(d: &mut Decoder<'_>) -> Result<Self, ModelError> {
+        if d.map()? != 1 || d.u64()? != sid::WIREGUARD_KEY_REQUEST {
+            return Err(ModelError::Invalid("key exchange request"));
+        }
+        let members = d.map()?;
+        let mut interface = None;
+        let mut peer = None;
+        for _ in 0..members {
+            match sid::WIREGUARD_KEY_REQUEST.checked_add(d.u64()?) {
+                Some(sid::WIREGUARD_KEY_REQUEST_INTERFACE) => {
+                    put(&mut interface, d.text()?.to_owned())?;
+                }
+                Some(sid::WIREGUARD_KEY_REQUEST_PEER) => put(&mut peer, d.text()?.to_owned())?,
+                Some(other) => return Err(ModelError::UnknownMember(other)),
+                None => return Err(ModelError::Invalid("member SID")),
+            }
+        }
+        Ok(Self {
+            interface: interface.ok_or(ModelError::Missing("interface"))?,
+            peer: peer.ok_or(ModelError::Missing("peer"))?,
+        })
+    }
+}
+
 /// The notification the FE sends when a packet's next hop is not in the neighbor
 /// table: `{RESOLVE_REQUEST: {1: interface, 2: address}}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
