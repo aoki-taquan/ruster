@@ -14,8 +14,8 @@
 //!   port: an endpoint reached through a VLAN sub-interface or a PPPoE session is
 //!   not supported yet.
 //! - An outer packet longer than the egress MTU is dropped (it carries DF).
-//! - An endpoint whose MAC address is not in the neighbor table is dropped: the
-//!   resolution request for it is not sent yet.
+//! - A packet for an endpoint whose next hop is not in the neighbor table is dropped
+//!   (and the control side asked to resolve it): it is not held until it resolves.
 
 use core::marker::PhantomData;
 use std::rc::Rc;
@@ -155,12 +155,13 @@ pub(crate) fn of<'s, 'a>(
 /// Seals the forwarded IPv4 `packet` (already rewritten for the WireGuard
 /// interface) into an outer frame in `runtime`. The received frame is then the
 /// caller's to consume.
-pub(crate) fn stage<S: PacketSlot>(
+pub(crate) fn stage<S: PacketSlot, T: crate::TraceSink>(
     packet: &mut PacketLease<S>,
     wireguard: &WireguardInterface<'_>,
     snapshot: &crate::ForwardingSnapshot<'_>,
     states: &mut [PeerState],
     runtime: &mut WireguardSendRuntime<'_>,
+    trace: &mut T,
 ) -> Result<(), DropReason> {
     let bytes = packet.bytes_mut();
     if bytes.len() < ETHERNET + 20 || bytes[12..14] != IPV4_ETHERTYPE {
@@ -188,9 +189,15 @@ pub(crate) fn stage<S: PacketSlot>(
     {
         return Err(DropReason::WireguardUnderlyingUnsupported);
     }
-    let mac = origin
-        .destination_mac
-        .ok_or(DropReason::NeighborUnresolved)?;
+    let Some(mac) = origin.destination_mac else {
+        if let std::net::IpAddr::V4(next_hop) = origin.next_hop {
+            trace.record(crate::TraceEvent::NeighborMissing {
+                egress: origin.egress,
+                target: crate::Ipv4Address::from_octets(next_hop.octets()),
+            });
+        }
+        return Err(DropReason::NeighborUnresolved);
+    };
     let mtu = snapshot
         .interface(origin.egress)
         .ok_or(DropReason::InterfaceMiss)?

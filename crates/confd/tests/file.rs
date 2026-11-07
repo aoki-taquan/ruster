@@ -829,3 +829,87 @@ fn a_pppoe_interface_runs_on_its_parent() {
         assert!(got.contains(expected), "{text}: {got}");
     }
 }
+
+mod wireguard {
+    use super::*;
+
+    const KEY_A: &str = "0101010101010101010101010101010101010101010101010101010101010101";
+    const KEY_B: &str = "0202020202020202020202020202020202020202020202020202020202020202";
+
+    fn file(interface: &str, peers: &str) -> String {
+        format!(
+            "[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv4 = \"198.51.100.2/24\"\n\n\
+             [[interface]]\nname = \"wg0\"\n{interface}\n{peers}"
+        )
+    }
+
+    const WG: &str =
+        "wireguard = { listen-port = 51820, local = \"198.51.100.2\" }\nipv4 = \"10.9.0.1/32\"";
+
+    fn peer_text(extra: &str) -> String {
+        format!(
+            "[[wireguard-peer]]\ninterface = \"wg0\"\nname = \"branch\"\nendpoint = \"203.0.113.9:51821\"\nallowed = [\"10.9.0.0/16\"]\n{extra}\n"
+        )
+    }
+
+    #[test]
+    fn a_wireguard_interface_with_a_peer_and_a_session() {
+        let session = format!(
+            "session = {{ send = \"{KEY_A}\", receive = \"{KEY_B}\", peer-index = 22, local-index = 11 }}"
+        );
+        let config = parse(&file(WG, &peer_text(&session))).unwrap();
+        let wg = &config.interfaces[1];
+        assert_eq!((wg.name.as_str(), wg.mtu), ("wg0", 1420));
+        assert_eq!(wg.mac, [2, 0, 0, 0, 0, 0xfe]);
+        assert_eq!(config.wireguard.len(), 1);
+        let wireguard = &config.wireguard[0];
+        assert_eq!(wireguard.listen_port, 51820);
+        assert_eq!(wireguard.local, Ipv4Addr::new(198, 51, 100, 2));
+        let peer = &wireguard.peers[0];
+        assert_eq!(peer.endpoint, (Ipv4Addr::new(203, 0, 113, 9), 51821));
+        assert_eq!(peer.allowed, [(Ipv4Addr::new(10, 9, 0, 0), 16)]);
+        let session = peer.session.unwrap();
+        assert_eq!((session.send, session.receive), ([1; 32], [2; 32]));
+        assert_eq!((session.peer_index, session.local_index), (22, 11));
+        // A peer without a session is fine: the key exchange comes later.
+        assert!(
+            parse(&file(WG, &peer_text(""))).unwrap().wireguard[0].peers[0]
+                .session
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn what_is_wrong_is_refused() {
+        let bad_wg = |settings: &str| parse(&file(settings, &peer_text("")));
+        for settings in [
+            "wireguard = { listen-port = 0, local = \"198.51.100.2\" }",
+            "wireguard = { listen-port = 1, local = \"127.0.0.1\" }",
+            "wireguard = { listen-port = 1, local = \"198.51.100.77\" }",
+            "wireguard = { listen-port = 1, local = \"198.51.100.2\" }\nmtu = 1441",
+            "wireguard = { listen-port = 1, local = \"198.51.100.2\" }\nvlan = 5\nparent = \"wan\"",
+        ] {
+            assert!(bad_wg(settings).is_err(), "{settings}");
+        }
+        let bad_peer = |text: &str| parse(&file(WG, text));
+        let wrong = |from: &str, to: &str| peer_text("").replace(from, to);
+        for text in [
+            wrong("interface = \"wg0\"", "interface = \"wan\""),
+            wrong("203.0.113.9:51821", "203.0.113.9"),
+            wrong("203.0.113.9:51821", "203.0.113.9:0"),
+            wrong("203.0.113.9:51821", "0.0.0.0:5"),
+            wrong("[\"10.9.0.0/16\"]", "[]"),
+            wrong("[\"10.9.0.0/16\"]", "[\"10.9.0.1/16\"]"),
+            wrong("[\"10.9.0.0/16\"]", "[\"2001:db8::/32\"]"),
+            wrong("name = \"branch\"", "name = \"\""),
+            format!("{}{}", peer_text(""), peer_text("")),
+            peer_text("session = { send = \"01\", receive = \"02\", peer-index = 1, local-index = 2 }"),
+            peer_text(&format!(
+                "session = {{ send = \"{}\", receive = \"{KEY_B}\", peer-index = 1, local-index = 2 }}",
+                "00".repeat(32)
+            )),
+        ] {
+            assert!(bad_peer(&text).is_err(), "{text}");
+        }
+    }
+}

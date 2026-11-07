@@ -74,9 +74,31 @@ pub enum RouteTarget {
     LookupVrf(String),
 }
 
+/// A WireGuard interface (also an entry of `interfaces`, which has its MAC address,
+/// MTU and addresses).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireguardConfig {
+    pub name: String,
+    pub listen_port: u16,
+    /// The IPv4 address the outer packets are sent from.
+    pub local: Ipv4Addr,
+    pub peers: Vec<WireguardPeerConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireguardPeerConfig {
+    pub name: String,
+    pub endpoint: (Ipv4Addr, u16),
+    pub allowed: Vec<(Ipv4Addr, u8)>,
+    /// The session the key-exchange daemon made. Until it hands sessions to confd,
+    /// a file may carry one.
+    pub session: Option<ruster_proto::table::WireguardSession>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub interfaces: Vec<InterfaceConfig>,
+    pub wireguard: Vec<WireguardConfig>,
     pub static_routes: Vec<StaticRoute>,
     /// The default VRF's forward firewall rules, in order.
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
@@ -328,6 +350,39 @@ impl Confd {
                 },
                 Value::FirewallRule(rule.clone()),
             );
+        }
+        for wireguard in &self.config.wireguard {
+            out.insert(
+                Key::Wireguard {
+                    interface: wireguard.name.clone(),
+                },
+                Value::Wireguard(ruster_proto::table::Wireguard {
+                    listen_port: wireguard.listen_port,
+                    local: wireguard.local,
+                }),
+            );
+            for peer in &wireguard.peers {
+                out.insert(
+                    Key::WireguardPeer {
+                        interface: wireguard.name.clone(),
+                        peer: peer.name.clone(),
+                    },
+                    Value::WireguardPeer(ruster_proto::table::WireguardPeer {
+                        endpoint: peer.endpoint.0,
+                        port: peer.endpoint.1,
+                        allowed: peer.allowed.clone(),
+                    }),
+                );
+                if let Some(session) = peer.session {
+                    out.insert(
+                        Key::WireguardSession {
+                            interface: wireguard.name.clone(),
+                            peer: peer.name.clone(),
+                        },
+                        Value::WireguardSession(session),
+                    );
+                }
+            }
         }
         if let Some(nat) = &self.config.nat {
             out.insert(

@@ -28,6 +28,20 @@
 //! ipv4 = "198.51.100.2/32"     # optional
 //! # mac is the parent's and mtu its less 8 when left out
 //!
+//! [[interface]]                # a WireGuard interface
+//! name = "wg0"
+//! wireguard = { listen-port = 51820, local = "198.51.100.2" }
+//! ipv4 = "10.9.0.1/32"         # optional
+//! # mtu is 1420 when left out; mac is not needed
+//!
+//! [[wireguard-peer]]
+//! interface = "wg0"
+//! name = "branch"
+//! endpoint = "203.0.113.9:51821"
+//! allowed = ["10.9.0.0/16"]    # what the peer may send from and be sent to
+//! # The session the key exchange made, until a daemon hands it to confd:
+//! session = { send = "<64 hex digits>", receive = "<64 hex digits>", peer-index = 22, local-index = 11 }
+//!
 //! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
 //! interface = "map"            # the tunnel interface it makes
 //! inside = "lan"               # the NAT's inside
@@ -131,7 +145,9 @@ use serde::Deserialize;
 
 use ruster_proto::table::{FirewallAction, FirewallRule, Nat, NatPorts, Protocol, DEFAULT_VRF};
 
-use crate::{Config, InterfaceConfig, RouteTarget, StaticRoute};
+use crate::{
+    Config, InterfaceConfig, RouteTarget, StaticRoute, WireguardConfig, WireguardPeerConfig,
+};
 
 /// The smallest MTU an IPv4 interface may have (RFC 791).
 const MIN_MTU: u16 = ruster_proto::table::MIN_MTU;
@@ -152,6 +168,36 @@ struct File {
     nat: Option<NatEntry>,
     #[serde(rename = "map-e")]
     map_e: Option<MapEEntry>,
+    #[serde(default, rename = "wireguard-peer")]
+    wireguard_peer: Vec<WireguardPeerEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+struct WireguardEntry {
+    listen_port: u16,
+    local: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WireguardPeerEntry {
+    interface: String,
+    name: String,
+    endpoint: String,
+    allowed: Vec<String>,
+    session: Option<WireguardSessionEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+struct WireguardSessionEntry {
+    send: String,
+    receive: String,
+    peer_index: u32,
+    local_index: u32,
 }
 
 /// A MAP-E CE (RFC 7597): one Basic Mapping Rule, the delegated prefix, the BR.
@@ -215,6 +261,7 @@ struct InterfaceEntry {
     vrf: String,
     tunnel: Option<TunnelEntry>,
     pppoe: Option<PppoeEntry>,
+    wireguard: Option<WireguardEntry>,
 }
 
 #[derive(Deserialize)]
@@ -320,6 +367,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     let file: File = toml::from_str(text).map_err(|error| error.to_string())?;
     let mut seen = Seen::default();
     let mut interfaces = Vec::with_capacity(file.interface.len());
+    let mut wireguard_interfaces: Vec<WireguardConfig> = Vec::new();
     for entry in file.interface {
         let at = format!("interface {:?}", entry.name);
         if entry.name.is_empty() || entry.name.len() > 255 {
@@ -426,13 +474,34 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 ))
             }
         };
+        // A WireGuard interface is a plain interface that also has WireGuard settings.
+        let wireguard = match &entry.wireguard {
+            None => None,
+            Some(_) if vlan.is_some() || tunnel.is_some() || pppoe.is_some() => {
+                return Err(format!(
+                    "{at}: an interface is one of a VLAN, a tunnel, a PPPoE session and a WireGuard interface"
+                ))
+            }
+            Some(settings) => {
+                let local: Ipv4Addr = settings
+                    .local
+                    .parse()
+                    .ok()
+                    .filter(|a| unicast_v4(*a))
+                    .ok_or_else(|| format!("{at}: wireguard local must be a unicast IPv4 address"))?;
+                if settings.listen_port == 0 {
+                    return Err(format!("{at}: wireguard listen-port must be 1 to 65535"));
+                }
+                Some((settings.listen_port, local))
+            }
+        };
         let mac = match (&entry.mac, &vlan) {
             (Some(text), _) => {
                 mac(text).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?
             }
             (None, Some((_, _, parent_mac))) => *parent_mac,
             // A tunnel has no link; its MAC address only names it inside the FE.
-            (None, None) if tunnel.is_some() => TUNNEL_MAC,
+            (None, None) if tunnel.is_some() || wireguard.is_some() => TUNNEL_MAC,
             // A session's frames go out with its parent's address.
             (None, None) if pppoe.is_some() => pppoe.as_ref().map(|p| p.3).unwrap(),
             (None, None) => return Err(format!("{at}: mac is missing")),
@@ -453,10 +522,18 @@ pub fn parse(text: &str) -> Result<Config, String> {
         };
         // A session's packets carry 8 bytes of PPPoE header on the parent's link.
         let max_mtu = pppoe.as_ref().map_or(max_mtu, |p| p.4 - 8);
+        // A WireGuard packet carries 60 bytes (IPv4, UDP and WireGuard's header and
+        // tag) on the link below.
+        let max_mtu = if wireguard.is_some() {
+            MAX_MTU - 60
+        } else {
+            max_mtu
+        };
         let mtu = match (entry.mtu, &vlan) {
             (Some(mtu), _) => mtu,
             (None, Some(_)) => max_mtu,
             (None, None) if tunnel.is_some() || pppoe.is_some() => max_mtu,
+            (None, None) if wireguard.is_some() => 1_420,
             (None, None) => default_mtu(),
         };
         if !(MIN_MTU..=max_mtu).contains(&mtu) {
@@ -505,6 +582,14 @@ pub fn parse(text: &str) -> Result<Config, String> {
         }
         seen.link_local
             .insert((entry.name.clone(), crate::link_local(mac)));
+        if let Some((listen_port, local)) = wireguard {
+            wireguard_interfaces.push(WireguardConfig {
+                name: entry.name.clone(),
+                listen_port,
+                local,
+                peers: Vec::new(),
+            });
+        }
         interfaces.push(InterfaceConfig {
             name: entry.name,
             mac,
@@ -697,8 +782,87 @@ pub fn parse(text: &str) -> Result<Config, String> {
         });
         nat = Some(mapped);
     }
+    for entry in file.wireguard_peer {
+        let at = format!("wireguard-peer {:?} of {:?}", entry.name, entry.interface);
+        let Some(wireguard) = wireguard_interfaces
+            .iter_mut()
+            .find(|w| w.name == entry.interface)
+        else {
+            return Err(format!("{at}: the interface has no wireguard settings"));
+        };
+        if entry.name.is_empty() || entry.name.len() > 255 {
+            return Err(format!("{at}: the name must be 1 to 255 bytes"));
+        }
+        if wireguard.peers.iter().any(|p| p.name == entry.name) {
+            return Err(format!("{at}: given twice"));
+        }
+        let endpoint: std::net::SocketAddrV4 = entry
+            .endpoint
+            .parse()
+            .ok()
+            .filter(|e: &std::net::SocketAddrV4| unicast_v4(*e.ip()) && e.port() != 0)
+            .ok_or_else(|| format!("{at}: endpoint is not like 203.0.113.9:51820"))?;
+        if entry.allowed.is_empty()
+            || entry.allowed.len() > ruster_proto::table::WIREGUARD_MAX_ALLOWED
+        {
+            return Err(format!("{at}: allowed needs 1 to 64 prefixes"));
+        }
+        let mut allowed = Vec::new();
+        for text in &entry.allowed {
+            let Some((IpAddr::V4(address), len)) = prefix(text) else {
+                return Err(format!("{at}: allowed {text:?} is not like 10.9.0.0/16"));
+            };
+            if network(address.into(), len) != IpAddr::V4(address) {
+                return Err(format!("{at}: allowed {text:?} has host bits set"));
+            }
+            allowed.push((address, len));
+        }
+        let session = match &entry.session {
+            None => None,
+            Some(session) => {
+                let key = |text: &str, what: &str| {
+                    hex32(text).ok_or_else(|| format!("{at}: session {what} must be 64 hex digits"))
+                };
+                let (send, receive) = (
+                    key(&session.send, "send")?,
+                    key(&session.receive, "receive")?,
+                );
+                if send == [0; 32] || receive == [0; 32] {
+                    return Err(format!("{at}: a session key must not be all zeros"));
+                }
+                Some(ruster_proto::table::WireguardSession {
+                    send,
+                    receive,
+                    peer_index: session.peer_index,
+                    local_index: session.local_index,
+                })
+            }
+        };
+        wireguard.peers.push(WireguardPeerConfig {
+            name: entry.name,
+            endpoint: (*endpoint.ip(), endpoint.port()),
+            allowed,
+            session,
+        });
+    }
+    // The outer packets are sent from one of the router's own addresses in the
+    // default VRF.
+    for wireguard in &wireguard_interfaces {
+        let owned = interfaces.iter().any(|i| {
+            i.vrf == DEFAULT_VRF
+                && i.ipv4.is_some_and(|(a, _)| a == wireguard.local)
+                && !wireguard_interfaces.iter().any(|w| w.name == i.name)
+        });
+        if !owned {
+            return Err(format!(
+                "interface {:?}: wireguard local {} must be the IPv4 address of an interface in the default VRF",
+                wireguard.name, wireguard.local
+            ));
+        }
+    }
     Ok(Config {
         interfaces,
+        wireguard: wireguard_interfaces,
         static_routes,
         firewall,
         nat,
@@ -967,6 +1131,18 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Firewall
         protocol,
         action,
     })
+}
+
+/// 32 bytes from 64 hex digits.
+fn hex32(text: &str) -> Option<[u8; 32]> {
+    if text.len() != 64 || !text.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (byte, pair) in out.iter_mut().zip(text.as_bytes().chunks(2)) {
+        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+    }
+    Some(out)
 }
 
 fn mac(text: &str) -> Option<[u8; 6]> {

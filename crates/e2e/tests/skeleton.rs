@@ -31,6 +31,7 @@ const INTERNET: [u8; 4] = [203, 0, 113, 7];
 
 fn config() -> Config {
     Config {
+        wireguard: Vec::new(),
         interfaces: vec![
             InterfaceConfig {
                 name: "lan".into(),
