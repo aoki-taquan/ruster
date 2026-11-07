@@ -228,7 +228,6 @@ struct World {
     tcp: Nat44TcpRuntime<'static>,
     firewall_config: Option<FirewallConfig<'static>>,
     firewall: Option<FirewallRuntime<'static>>,
-    resolution: ResolutionRuntime<'static>,
     /// The generated-error runtime, which limits translated external
     /// errors (NAT44-065); `None` runs the NAT-only composition.
     icmpv4: Option<Icmpv4ErrorRuntime<'static>>,
@@ -311,7 +310,7 @@ impl World {
         } else {
             (None, None)
         };
-        let resolution = ResolutionRuntime::new(
+        let _resolution = ResolutionRuntime::new(
             ResolutionPolicy::new(1_000, 2_000).unwrap(),
             leak([ResolutionStateSlot::EMPTY; 2]),
             leak([ResolutionActionSlot::EMPTY; 2]),
@@ -324,7 +323,6 @@ impl World {
             tcp,
             firewall_config,
             firewall,
-            resolution,
             icmpv4: None,
             io: SimIo::new(),
             trace: VecTrace::default(),
@@ -361,7 +359,6 @@ impl World {
                     .run_nat44_udp_and_tcp_with_firewall_and_icmpv4_errors_once(
                         1,
                         &self.snapshot,
-                        &mut self.resolution,
                         icmpv4,
                         &self.udp_config,
                         Some(&mut self.udp),
@@ -378,7 +375,6 @@ impl World {
                     .run_nat44_udp_and_tcp_with_icmpv4_errors_once(
                         1,
                         &self.snapshot,
-                        &mut self.resolution,
                         icmpv4,
                         &self.udp_config,
                         Some(&mut self.udp),
@@ -394,7 +390,6 @@ impl World {
                 .run_nat44_udp_and_tcp_with_firewall_once(
                     1,
                     &self.snapshot,
-                    &mut self.resolution,
                     &self.udp_config,
                     Some(&mut self.udp),
                     &self.tcp_config,
@@ -410,7 +405,6 @@ impl World {
                 .run_nat44_udp_and_tcp_once(
                     1,
                     &self.snapshot,
-                    &mut self.resolution,
                     &self.udp_config,
                     Some(&mut self.udp),
                     &self.tcp_config,
@@ -435,7 +429,6 @@ impl World {
             .run_nat44_udp_and_tcp_with_firewall_audited_once(
                 1,
                 &self.snapshot,
-                &mut self.resolution,
                 &self.udp_config,
                 Some(&mut self.udp),
                 &self.tcp_config,
