@@ -10,6 +10,10 @@
 //!   `(A << (k + m)) | (p << m) | j` for `A` in `1..2^a` (`0` when `a` is 0) and
 //!   `j` in `0..2^m`. With `a > 0` the ports below `2^(16 - a)` (A = 0) are left
 //!   out, as the RFC asks for the well-known ports.
+//!
+//! Deviations: a PSID offset of 0 (contiguous blocks, as lw4o6 uses), a PSID
+//! length of 0 (no sharing) and `a + k = 16` (one port per PSID per block) are
+//! refused, although RFC 7597 allows them; MAP-E's default offset is 6.
 
 /// The public ports of a NAT.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -48,7 +52,8 @@ impl PortSet {
     /// The MAP-E port set of PSID `psid` with PSID offset `offset` (RFC 7597's
     /// `a`, 6 by default) and length `length` (`k`).
     pub const fn psid(offset: u8, length: u8, psid: u16) -> Result<Self, PortSetError> {
-        if length == 0 || offset as u16 + length as u16 >= 16 || psid >> length != 0 {
+        if offset == 0 || length == 0 || offset as u16 + length as u16 >= 16 || psid >> length != 0
+        {
             return Err(PortSetError::Psid);
         }
         Ok(Self {
@@ -128,6 +133,7 @@ impl PortSet {
         }
     }
 
+    /// Whether `port` is in the set.
     #[must_use]
     pub const fn contains(self, port: u16) -> bool {
         self.index(port).is_some()
@@ -174,5 +180,6 @@ mod tests {
         assert!(PortSet::psid(6, 0, 0).is_err());
         assert!(PortSet::psid(6, 6, 64).is_err());
         assert!(PortSet::psid(8, 8, 1).is_err());
+        assert!(PortSet::psid(0, 6, 5).is_err(), "offset 0 is refused");
     }
 }

@@ -3796,7 +3796,7 @@ pub struct Nat44CarryIdentity {
 }
 
 impl Nat44CarryIdentity {
-    /// `first_port..=last_port` is the public port pool, or the ICMP
+    /// `ports` is the public port pool, or the ICMP
     /// identifier pool.
     #[must_use]
     pub const fn new(
