@@ -143,11 +143,17 @@ impl Ipv6Fib {
         })
     }
 
-    fn route(&self, destination: [u8; 16]) -> Option<&Ipv6Route> {
+    /// The interface and the address of the next hop toward `destination`.
+    pub(crate) fn next_hop(&self, destination: [u8; 16]) -> Option<(IfId, [u8; 16])> {
+        self.route(destination)
+            .map(|route| (route.egress, route.next_hop.unwrap_or(destination)))
+    }
+
+    pub(crate) fn route(&self, destination: [u8; 16]) -> Option<&Ipv6Route> {
         self.routes.iter().find(|route| route.contains(destination))
     }
 
-    fn neighbor(&self, interface: IfId, target: [u8; 16]) -> Option<MacAddress> {
+    pub(crate) fn neighbor(&self, interface: IfId, target: [u8; 16]) -> Option<MacAddress> {
         self.neighbors
             .iter()
             .find(|n| n.interface == interface && n.target == target)

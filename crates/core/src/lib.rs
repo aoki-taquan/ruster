@@ -27,6 +27,7 @@ mod slot_index;
 mod slot_list;
 mod source_validation;
 mod time;
+mod tunnel;
 mod vlan;
 
 pub use arp_policy::{
@@ -167,4 +168,5 @@ pub use route::{
 };
 pub use source_validation::{SourceValidation, SourceValidationBinding};
 pub use time::MonotonicMillis;
+pub use tunnel::Ipv4InIpv6Tunnel;
 pub use vlan::VlanBinding;
