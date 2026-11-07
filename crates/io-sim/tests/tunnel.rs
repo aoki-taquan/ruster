@@ -233,3 +233,13 @@ fn a_destination_options_header_before_the_inner_packet_is_stepped_over() {
     assert_eq!(&out[12..14], &[0x08, 0x00]);
     assert_eq!(&out[26..30], &REMOTE);
 }
+
+#[test]
+fn a_tunnel_packet_from_another_link_is_not_unwrapped() {
+    let tables = tables();
+    let inner = ipv4(SOFTWIRE_MAC, REMOTE, HOST, 0);
+    // From the LAN, passing itself off as the AFTR.
+    let mut frame = from_aftr(&inner, aftr(), b4());
+    frame[0..6].copy_from_slice(&LAN_MAC.0);
+    assert!(run(&tables, LAN, frame).is_none());
+}
