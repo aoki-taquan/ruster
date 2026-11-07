@@ -120,13 +120,8 @@ fn udp_port_selection_uses_the_udp_key_and_domains() {
         assert_eq!(udp.start_domain, DirectoryHashDomain::UdpPortStart);
         assert_eq!(udp.takeover_domain, DirectoryHashDomain::UdpPortTakeover);
         assert_eq!(
-            (
-                udp.first_port,
-                udp.last_port,
-                udp.inside,
-                udp.public_address
-            ),
-            (1, 65_535, INSIDE, PUBLIC)
+            (udp.ports.bounds(), udp.inside, udp.public_address),
+            ((1, 65_535), INSIDE, PUBLIC)
         );
         assert_eq!(udp.allocator_seed, 3);
         runtime.reconcile(config, rotated_udp_hash_key()).unwrap();
@@ -144,8 +139,7 @@ fn takeover_probes_depend_on_generation_time_probe_and_endpoint() {
         key,
         start_domain: DirectoryHashDomain::UdpPortStart,
         takeover_domain: DirectoryHashDomain::UdpPortTakeover,
-        first_port: 1,
-        last_port: 65_535,
+        ports: crate::PortSet::range(1, 65_535).unwrap(),
         inside: INSIDE,
         public_address: PUBLIC,
         allocator_seed: 7,
@@ -176,8 +170,7 @@ fn port_selection_domains_are_separated() {
         key,
         start_domain,
         takeover_domain,
-        first_port: 1,
-        last_port: 65_535,
+        ports: crate::PortSet::range(1, 65_535).unwrap(),
         inside: INSIDE,
         public_address: PUBLIC,
         allocator_seed: 7,

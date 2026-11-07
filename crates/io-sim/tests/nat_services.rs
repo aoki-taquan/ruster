@@ -304,3 +304,64 @@ fn the_router_s_own_ports_on_the_public_address_are_not_nat_s() {
         &33_000_u16.to_be_bytes()
     );
 }
+
+/// With a MAP-E port set (RFC 7597 section 5.1), the public port is one of the
+/// set's, even for an inside port outside it.
+#[test]
+fn napt44_takes_its_ports_from_a_psid_port_set() {
+    use ruster_core::PortSet;
+    let routes = [
+        Route::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24, LAN, None).unwrap(),
+        Route::new(
+            Ipv4Address::from_octets([0, 0, 0, 0]),
+            0,
+            WAN,
+            Some(GATEWAY),
+        )
+        .unwrap(),
+    ];
+    let interfaces =
+        [(LAN, LAN_MAC), (WAN, WAN_MAC)].map(|(id, mac)| Interface { id, mac, mtu: 1500 });
+    let neighbors = [Neighbor {
+        interface: WAN,
+        target: GATEWAY,
+        mac: GATEWAY_MAC,
+    }];
+    let bindings = [LocalIpv4Binding {
+        interface: WAN,
+        address: PUBLIC,
+    }];
+    let base = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    let ports = PortSet::psid(6, 6, 0x34).unwrap();
+    let config =
+        Nat44UdpConfig::with_port_set(&base, LAN, WAN, PUBLIC, ports, Nat44UdpPolicy::default())
+            .unwrap();
+    assert_eq!(config.ports().count(), 63 * 16);
+    let mut indexes = UdpTestIndexes::new(config, 4, 4);
+    let mut mappings = [Nat44UdpMappingSlot::default(); 4];
+    let mut peers = [Nat44UdpPeerSlot::default(); 4];
+    let mut runtime = indexes.runtime(config, &mut mappings, &mut peers);
+    let mut queue = ControlQueue::new(4);
+    let mut io = SimIo::new();
+    for inside_port in [5_000, 1_860] {
+        io.inject(LAN, udp(LAN_MAC, HOST, REMOTE, inside_port, 53));
+        let batch = io.receive(8).unwrap();
+        let services = Services {
+            nat44_udp: Some((&config, &mut runtime)),
+            ..Services::default()
+        };
+        forward_batch_with_control(
+            batch,
+            &base.with_now(MonotonicMillis(1_000)),
+            &mut queue,
+            services,
+            &mut NoTrace,
+        );
+        let out = io.pop_tx().expect("translated");
+        let port = u16::from_be_bytes([out.bytes[34], out.bytes[35]]);
+        assert!(ports.contains(port), "{inside_port} -> {port}");
+        if inside_port == 1_860 {
+            assert_eq!(port, 1_860, "an inside port in the set is kept");
+        }
+    }
+}

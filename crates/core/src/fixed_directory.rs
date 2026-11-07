@@ -1089,8 +1089,6 @@ impl PortOwnerSlot {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PortOwnerConfigError {
-    ZeroPort,
-    InvalidRange,
     SlotCountMismatch,
     StateCapacityTooLarge,
     BitmapSizeMismatch,
@@ -1173,8 +1171,7 @@ pub(crate) enum PortOwnerSemanticError {
 pub(crate) struct PortOwnerTable<'a> {
     slots: &'a mut [PortOwnerSlot],
     free: PortFreeBitmap<'a>,
-    first_port: u16,
-    last_port: u16,
+    ports: crate::PortSet,
     state_capacity: usize,
 }
 
@@ -1182,11 +1179,10 @@ impl<'a> PortOwnerTable<'a> {
     pub(crate) fn validate_config(
         slot_count: usize,
         bitmap_words: usize,
-        first_port: u16,
-        last_port: u16,
+        ports: crate::PortSet,
         state_capacity: usize,
     ) -> Result<(), PortOwnerConfigError> {
-        validate_port_owner_dimensions(slot_count, first_port, last_port, state_capacity)?;
+        validate_port_owner_dimensions(slot_count, ports, state_capacity)?;
         if bitmap_words != port_free_bitmap_words(slot_count) {
             return Err(PortOwnerConfigError::BitmapSizeMismatch);
         }
@@ -1196,24 +1192,16 @@ impl<'a> PortOwnerTable<'a> {
     pub(crate) fn new(
         slots: &'a mut [PortOwnerSlot],
         free_words: &'a mut [u64],
-        first_port: u16,
-        last_port: u16,
+        ports: crate::PortSet,
         state_capacity: usize,
     ) -> Result<Self, PortOwnerConfigError> {
-        Self::validate_config(
-            slots.len(),
-            free_words.len(),
-            first_port,
-            last_port,
-            state_capacity,
-        )?;
+        Self::validate_config(slots.len(), free_words.len(), ports, state_capacity)?;
         slots.fill(PortOwnerSlot::default());
         let free = PortFreeBitmap::new(free_words, slots.len());
         Ok(Self {
             slots,
             free,
-            first_port,
-            last_port,
+            ports,
             state_capacity,
         })
     }
@@ -1236,9 +1224,7 @@ impl<'a> PortOwnerTable<'a> {
     pub(crate) fn first_unowned_port_from(&self, start_offset: usize) -> Option<u16> {
         let offset = self.free.first_free_from(start_offset)?;
         debug_assert!(self.slots[offset] == PortOwnerSlot::default());
-        u16::try_from(offset)
-            .ok()
-            .and_then(|offset| self.first_port.checked_add(offset))
+        (offset < self.ports.count()).then(|| self.ports.port(offset))
     }
 
     /// Bitmap words read by [`Self::first_unowned_port_from`] since the last
@@ -1265,13 +1251,11 @@ impl<'a> PortOwnerTable<'a> {
 
     pub(crate) fn reconfigure_prevalidated_and_clear(
         &mut self,
-        first_port: u16,
-        last_port: u16,
+        ports: crate::PortSet,
         state_capacity: usize,
     ) {
         self.clear();
-        self.first_port = first_port;
-        self.last_port = last_port;
+        self.ports = ports;
         self.state_capacity = state_capacity;
     }
 
@@ -1482,7 +1466,7 @@ impl<'a> PortOwnerTable<'a> {
                 ));
             }
             report.assigned_ports += 1;
-            let port = self.first_port + offset as u16;
+            let port = self.ports.port(offset);
             let Some(expected) = expected_owner(owner.state_index()) else {
                 return Err(PortOwnerSemanticError::OwnerForDeadState {
                     port,
@@ -1533,27 +1517,16 @@ impl<'a> PortOwnerTable<'a> {
     }
 
     fn offset(&self, port: u16) -> Result<usize, PortOwnerError> {
-        if !(self.first_port..=self.last_port).contains(&port) {
-            return Err(PortOwnerError::PortOutOfRange);
-        }
-        Ok(usize::from(port - self.first_port))
+        self.ports.index(port).ok_or(PortOwnerError::PortOutOfRange)
     }
 }
 
 fn validate_port_owner_dimensions(
     slot_count: usize,
-    first_port: u16,
-    last_port: u16,
+    ports: crate::PortSet,
     state_capacity: usize,
 ) -> Result<(), PortOwnerConfigError> {
-    if first_port == 0 {
-        return Err(PortOwnerConfigError::ZeroPort);
-    }
-    if first_port > last_port {
-        return Err(PortOwnerConfigError::InvalidRange);
-    }
-    let required = (u32::from(last_port) - u32::from(first_port) + 1) as usize;
-    if slot_count != required {
+    if slot_count != ports.count() {
         return Err(PortOwnerConfigError::SlotCountMismatch);
     }
     if state_capacity > u32::MAX as usize {
@@ -2135,7 +2108,13 @@ mod tests {
     fn port_owner_range_assignment_conditional_clear_and_validation_are_exact() {
         let mut slots = [PortOwnerSlot::default(); 3];
         let mut words = [0_u64; 2];
-        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_002, 2).unwrap();
+        let mut owners = PortOwnerTable::new(
+            &mut slots,
+            &mut words,
+            crate::PortSet::range(40_000, 40_002).unwrap(),
+            2,
+        )
+        .unwrap();
         let owner0 = PortOwnerToken::new(0, 7, 11).unwrap();
         let owner1 = PortOwnerToken::new(1, 8, 11).unwrap();
         assert_eq!(owners.owner(40_000), Ok(None));
@@ -2160,7 +2139,13 @@ mod tests {
     fn stale_port_owner_tokens_cannot_clear_or_claim_reused_state_index() {
         let mut slots = [PortOwnerSlot::default(); 1];
         let mut words = [0_u64; 2];
-        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_000, 1).unwrap();
+        let mut owners = PortOwnerTable::new(
+            &mut slots,
+            &mut words,
+            crate::PortSet::range(40_000, 40_000).unwrap(),
+            1,
+        )
+        .unwrap();
         let generation_a = PortOwnerToken::new(0, 1, 100).unwrap();
         let generation_b = PortOwnerToken::new(0, 2, 100).unwrap();
         let epoch_b = PortOwnerToken::new(0, 2, 101).unwrap();
@@ -2182,7 +2167,13 @@ mod tests {
     fn prepared_port_claim_and_move_are_exact_and_nofail_after_recheck() {
         let mut slots = [PortOwnerSlot::default(); 2];
         let mut words = [0_u64; 2];
-        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2).unwrap();
+        let mut owners = PortOwnerTable::new(
+            &mut slots,
+            &mut words,
+            crate::PortSet::range(40_000, 40_001).unwrap(),
+            2,
+        )
+        .unwrap();
         let first = PortOwnerToken::new(0, 1, 10).unwrap();
         let second = PortOwnerToken::new(1, 1, 10).unwrap();
         let replacement = PortOwnerToken::new(0, 2, 10).unwrap();
@@ -2212,7 +2203,13 @@ mod tests {
     fn port_owner_semantics_cover_live_dead_missing_and_mismatched_owners() {
         let mut slots = [PortOwnerSlot::default(); 2];
         let mut words = [0_u64; 2];
-        let mut owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2).unwrap();
+        let mut owners = PortOwnerTable::new(
+            &mut slots,
+            &mut words,
+            crate::PortSet::range(40_000, 40_001).unwrap(),
+            2,
+        )
+        .unwrap();
         let owner = PortOwnerToken::new(0, 7, 31).unwrap();
         let expected = PortOwnerExpectation {
             port: 40_000,
@@ -2267,23 +2264,14 @@ mod tests {
             state_generation: 8,
             runtime_epoch: 9,
         };
-        let mut zero = [occupied; 1];
-        assert!(matches!(
-            PortOwnerTable::new(&mut zero, &mut [0_u64; 2], 0, 0, 1),
-            Err(PortOwnerConfigError::ZeroPort)
-        ));
-        assert_eq!(zero, [occupied; 1]);
-
-        let mut reversed = [occupied; 1];
-        assert!(matches!(
-            PortOwnerTable::new(&mut reversed, &mut [0_u64; 2], 40_001, 40_000, 1),
-            Err(PortOwnerConfigError::InvalidRange)
-        ));
-        assert_eq!(reversed, [occupied; 1]);
-
         let mut wrong_len = [occupied; 1];
         assert!(matches!(
-            PortOwnerTable::new(&mut wrong_len, &mut [0_u64; 2], 40_000, 40_001, 1),
+            PortOwnerTable::new(
+                &mut wrong_len,
+                &mut [0_u64; 2],
+                crate::PortSet::range(40_000, 40_001).unwrap(),
+                1
+            ),
             Err(PortOwnerConfigError::SlotCountMismatch)
         ));
         assert_eq!(wrong_len, [occupied; 1]);
@@ -2293,7 +2281,13 @@ mod tests {
     fn corrupt_port_owner_is_reported_without_mutation() {
         let mut slots = [PortOwnerSlot::default(); 1];
         let mut words = [0_u64; 2];
-        let owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_000, 1).unwrap();
+        let owners = PortOwnerTable::new(
+            &mut slots,
+            &mut words,
+            crate::PortSet::range(40_000, 40_000).unwrap(),
+            1,
+        )
+        .unwrap();
         owners.slots[0].state_index_plus_one = 2;
         let before = owners.slots[0];
         assert_eq!(owners.owner(40_000), Err(PortOwnerError::CorruptOwner));
@@ -2315,7 +2309,7 @@ mod tests {
         (0..count)
             .map(|step| (start + step) % count)
             .find(|offset| owners.slots[*offset] == PortOwnerSlot::default())
-            .map(|offset| owners.first_port + offset as u16)
+            .map(|offset| owners.ports.port(offset))
     }
 
     #[test]
@@ -2331,7 +2325,12 @@ mod tests {
         let mut slots = [PortOwnerSlot::default(); 2];
         let mut words = [0_u64; 3];
         assert!(matches!(
-            PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2),
+            PortOwnerTable::new(
+                &mut slots,
+                &mut words,
+                crate::PortSet::range(40_000, 40_001).unwrap(),
+                2
+            ),
             Err(PortOwnerConfigError::BitmapSizeMismatch)
         ));
         assert_eq!(words, [0; 3]);
@@ -2354,8 +2353,13 @@ mod tests {
             let count = usize::from(last - first) + 1;
             let mut slots = vec![PortOwnerSlot::default(); count];
             let mut words = vec![0_u64; port_free_bitmap_words(count)];
-            let mut owners =
-                PortOwnerTable::new(&mut slots, &mut words, first, last, count).unwrap();
+            let mut owners = PortOwnerTable::new(
+                &mut slots,
+                &mut words,
+                crate::PortSet::range(first, last).unwrap(),
+                count,
+            )
+            .unwrap();
             let summary_words = port_free_bitmap_words(count) - count.div_ceil(64);
             let read_bound = 2 + 2 * summary_words;
             for round in 0..64 {
@@ -2413,7 +2417,13 @@ mod tests {
     fn bitmap_mismatch_is_reported_by_semantic_validation() {
         let mut slots = [PortOwnerSlot::default(); 2];
         let mut words = [0_u64; 2];
-        let owners = PortOwnerTable::new(&mut slots, &mut words, 40_000, 40_001, 2).unwrap();
+        let owners = PortOwnerTable::new(
+            &mut slots,
+            &mut words,
+            crate::PortSet::range(40_000, 40_001).unwrap(),
+            2,
+        )
+        .unwrap();
         assert_eq!(
             owners.validate_semantics(|_| None),
             Ok(PortOwnerConservation::default())

@@ -101,7 +101,7 @@ impl Publication {
     }
 
     fn ports(&self) -> usize {
-        usize::from(self.udp.last_port() - self.udp.first_port()) + 1
+        self.udp.ports().count()
     }
 }
 
