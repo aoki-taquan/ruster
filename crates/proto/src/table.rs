@@ -99,14 +99,23 @@ pub enum Value {
 
 /// Source NAPT44 (`ietf-nat` type `napt44`): traffic from `inside` leaving through
 /// `outside` gets the `external` address (the outside interface's IPv4 address when
-/// `None`) and a port from `first_port..=last_port`.
+/// `None`) and a port from `ports`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Nat {
     pub inside: String,
     pub outside: String,
     pub external: Option<std::net::Ipv4Addr>,
-    pub first_port: u16,
-    pub last_port: u16,
+    pub ports: NatPorts,
+}
+
+/// The public ports of a NAT (`ietf-nat` `port-set-restrict`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NatPorts {
+    /// `first..=last`.
+    Range { first: u16, last: u16 },
+    /// A MAP-E port set (RFC 7597 section 5.1): PSID offset `offset` (`a`), PSID
+    /// length `length` (`k`), and the PSID.
+    Psid { offset: u8, length: u8, psid: u16 },
 }
 
 /// The protocols a firewall rule matches.
@@ -326,8 +335,22 @@ impl Change {
                         if nat.inside == nat.outside {
                             return Err(ModelError::Invalid("NAT inside equals outside"));
                         }
-                        if nat.first_port == 0 || nat.first_port > nat.last_port {
-                            return Err(ModelError::Invalid("NAT port range"));
+                        match nat.ports {
+                            NatPorts::Range { first, last } if first == 0 || first > last => {
+                                return Err(ModelError::Invalid("NAT port range"));
+                            }
+                            NatPorts::Psid {
+                                offset,
+                                length,
+                                psid,
+                            } if offset == 0
+                                || length == 0
+                                || u16::from(offset) + u16::from(length) >= 16
+                                || psid >> length != 0 =>
+                            {
+                                return Err(ModelError::Invalid("NAT PSID"));
+                            }
+                            _ => {}
                         }
                     }
                     Value::FirewallRule(rule) => {
@@ -562,15 +585,35 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
         }
         Value::Nat(nat) => {
             let d = |member: u64| member - sid::NAT;
-            e.map(4 + u64::from(nat.external.is_some()))
+            let ports = match nat.ports {
+                NatPorts::Range { .. } => 2,
+                NatPorts::Psid { .. } => 3,
+            };
+            e.map(2 + ports + u64::from(nat.external.is_some()))
                 .u64(d(sid::NAT_INSIDE))
                 .text(&nat.inside)
                 .u64(d(sid::NAT_OUTSIDE))
-                .text(&nat.outside)
-                .u64(d(sid::NAT_FIRST_PORT))
-                .u64(u64::from(nat.first_port))
-                .u64(d(sid::NAT_LAST_PORT))
-                .u64(u64::from(nat.last_port));
+                .text(&nat.outside);
+            match nat.ports {
+                NatPorts::Range { first, last } => {
+                    e.u64(d(sid::NAT_FIRST_PORT))
+                        .u64(u64::from(first))
+                        .u64(d(sid::NAT_LAST_PORT))
+                        .u64(u64::from(last));
+                }
+                NatPorts::Psid {
+                    offset,
+                    length,
+                    psid,
+                } => {
+                    e.u64(d(sid::NAT_PSID_OFFSET))
+                        .u64(u64::from(offset))
+                        .u64(d(sid::NAT_PSID_LENGTH))
+                        .u64(u64::from(length))
+                        .u64(d(sid::NAT_PSID))
+                        .u64(u64::from(psid));
+                }
+            }
             if let Some(external) = nat.external {
                 e.u64(d(sid::NAT_EXTERNAL)).text(&external.to_string());
             }
@@ -931,16 +974,29 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             ),
             None => None,
         };
-        let first_port =
-            port(&mut got, sid::NAT_FIRST_PORT)?.ok_or(ModelError::Missing("first port"))?;
-        let last_port =
-            port(&mut got, sid::NAT_LAST_PORT)?.ok_or(ModelError::Missing("last port"))?;
+        let range = (
+            port(&mut got, sid::NAT_FIRST_PORT)?,
+            port(&mut got, sid::NAT_LAST_PORT)?,
+        );
+        let set = (
+            port(&mut got, sid::NAT_PSID_OFFSET)?,
+            port(&mut got, sid::NAT_PSID_LENGTH)?,
+            port(&mut got, sid::NAT_PSID)?,
+        );
+        let ports = match (range, set) {
+            ((Some(first), Some(last)), (None, None, None)) => NatPorts::Range { first, last },
+            ((None, None), (Some(offset), Some(length), Some(psid))) => NatPorts::Psid {
+                offset: u8::try_from(offset).map_err(|_| ModelError::Invalid("PSID offset"))?,
+                length: u8::try_from(length).map_err(|_| ModelError::Invalid("PSID length"))?,
+                psid,
+            },
+            _ => return Err(ModelError::Missing("a port range or a PSID")),
+        };
         Value::Nat(Nat {
             inside,
             outside,
             external,
-            first_port,
-            last_port,
+            ports,
         })
     } else {
         let ingress = text(sid::FIREWALL_INGRESS, "ingress")?;

@@ -589,8 +589,10 @@ fn nat_takes_the_outside_address_and_a_port_range() {
             inside: "lan".into(),
             outside: "wan".into(),
             external: None,
-            first_port: 1_024,
-            last_port: 32_767,
+            ports: ruster_proto::table::NatPorts::Range {
+                first: 1_024,
+                last: 32_767,
+            },
         })
     );
     let got = parse(&nat(
@@ -599,7 +601,13 @@ fn nat_takes_the_outside_address_and_a_port_range() {
     .unwrap()
     .nat
     .unwrap();
-    assert_eq!((got.first_port, got.last_port), (40_000, 40_999));
+    assert_eq!(
+        got.ports,
+        ruster_proto::table::NatPorts::Range {
+            first: 40_000,
+            last: 40_999
+        }
+    );
     assert_eq!(got.external, Some(Ipv4Addr::new(198, 51, 100, 2)));
     for (text, expected) in [
         (nat("ports = \"0-100\"\n"), "not 0"),

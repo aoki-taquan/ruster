@@ -15,8 +15,8 @@ use std::net::IpAddr;
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallIpv4Prefix, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, Ipv4InIpv6Tunnel, Ipv4OriginPolicy,
-    Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, LocalIpv4Binding, MacAddress, Neighbor, Route,
-    ValidatedForwardingOwner, VlanBinding,
+    Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, LocalIpv4Binding, MacAddress, Neighbor, PortSet,
+    Route, ValidatedForwardingOwner, VlanBinding,
 };
 use ruster_proto::session::Store;
 use ruster_proto::table::{self, network, Key, RouteAction, Value, DEFAULT_VRF};
@@ -54,14 +54,13 @@ pub(crate) struct Built {
     pub(crate) nat: Option<Nat>,
 }
 
-/// NAPT from `inside` to `outside`, with `public` and the ports `first..=last`.
+/// NAPT from `inside` to `outside`, with `public` and `ports`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Nat {
     pub(crate) inside: IfId,
     pub(crate) outside: IfId,
     pub(crate) public: Ipv4Address,
-    pub(crate) first: u16,
-    pub(crate) last: u16,
+    pub(crate) ports: PortSet,
 }
 
 /// One forwarding route before it becomes core's.
@@ -514,8 +513,15 @@ fn nat(
         inside,
         outside,
         public,
-        first: entry.first_port,
-        last: entry.last_port,
+        ports: match entry.ports {
+            table::NatPorts::Range { first, last } => PortSet::range(first, last),
+            table::NatPorts::Psid {
+                offset,
+                length,
+                psid,
+            } => PortSet::psid(offset, length, psid),
+        }
+        .map_err(|e| format!("nat ports: {e:?}"))?,
     }))
 }
 
