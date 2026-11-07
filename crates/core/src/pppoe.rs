@@ -101,19 +101,28 @@ pub(crate) fn wrap(
     snapshot: &crate::ForwardingSnapshot<'_>,
     egress: IfId,
     frame: &[u8],
-) -> Option<Result<(IfId, Vec<u8>), DropReason>> {
+) -> Option<Result<(IfId, Vec<u8>), crate::TunnelOriginError>> {
+    use crate::TunnelOriginError::{Dropped, TooBig};
     let session = of(snapshot.pppoe, egress)?;
     Some((|| {
         let parent = snapshot
             .interface(session.parent)
-            .ok_or(DropReason::InterfaceMiss)?;
+            .ok_or(Dropped(DropReason::InterfaceMiss))?;
+        let mtu = snapshot
+            .interface(session.interface)
+            .ok_or(Dropped(DropReason::InterfaceMiss))?
+            .mtu
+            .min(parent.mtu.saturating_sub(HEADER as u16));
         let protocol = match frame.get(12..14) {
             Some(&[0x08, 0x00]) => PPP_IPV4,
             Some(&[0x86, 0xdd]) => PPP_IPV6,
-            _ => return Err(DropReason::PppoeNotIp),
+            _ => return Err(Dropped(DropReason::PppoeNotIp)),
         };
-        let ip = &frame[ETHERNET..];
-        let length = u16::try_from(ip.len() + 2).map_err(|_| DropReason::PppoeMalformed)?;
+        let ip = frame.get(ETHERNET..).unwrap_or(&[]);
+        if ip.len() > usize::from(mtu) {
+            return Err(TooBig { mtu });
+        }
+        let length = u16::try_from(ip.len() + 2).map_err(|_| TooBig { mtu })?;
         let mut out = Vec::with_capacity(ETHERNET + HEADER + ip.len());
         out.extend_from_slice(&session.peer.0);
         out.extend_from_slice(&parent.mac.0);

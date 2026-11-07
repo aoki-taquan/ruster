@@ -148,6 +148,36 @@ pub(crate) fn fragmentation_needed(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// For an IPv6 `packet` from the kernel that a link of `mtu` cannot carry: an
+/// ICMPv6 Packet Too Big (RFC 4443 section 3.2) back to the kernel, quoting as much
+/// of the packet as fits in 1280 bytes. Its source is the packet's destination.
+pub(crate) fn packet_too_big(packet: &[u8], mtu: u16) -> Option<Vec<u8>> {
+    if packet.len() < 40 || packet[0] >> 4 != 6 {
+        return None;
+    }
+    let quote = &packet[..packet.len().min(1280 - 48)];
+    let payload = 8 + quote.len();
+    let mut out = vec![0_u8; 40 + payload];
+    out[0] = 0x60;
+    out[4..6].copy_from_slice(&u16::try_from(payload).ok()?.to_be_bytes());
+    out[6] = 58;
+    out[7] = 64;
+    out[8..24].copy_from_slice(&packet[24..40]);
+    out[24..40].copy_from_slice(&packet[8..24]);
+    out[40] = 2;
+    out[44..48].copy_from_slice(&u32::from(mtu).to_be_bytes());
+    out[48..].copy_from_slice(quote);
+    // The checksum covers the pseudo-header (RFC 8200 section 8.1).
+    let mut pseudo = Vec::with_capacity(40 + payload);
+    pseudo.extend_from_slice(&out[8..40]);
+    pseudo.extend_from_slice(&u32::try_from(payload).ok()?.to_be_bytes());
+    pseudo.extend_from_slice(&[0, 0, 0, 58]);
+    pseudo.extend_from_slice(&out[40..]);
+    let checksum = ruster_core::internet_checksum(&pseudo);
+    out[42..44].copy_from_slice(&checksum.to_be_bytes());
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -324,9 +324,32 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             if ports.iter().any(|port| port == name) {
                 return Err(format!("PPPoE interface {name} has the name of a port"));
             }
-            let Some(&(parent, _)) = active.get(session.parent.as_str()) else {
+            // Only a port or VLAN sub-interface carries a session.
+            let Some(&(parent, _)) = active.get(session.parent.as_str()).filter(|(id, _)| {
+                usize::from(id.0) < ports.len() || vlans.iter().any(|b| b.sub == *id)
+            }) else {
                 continue;
             };
+            if pppoe
+                .iter()
+                .any(|s: &PppoeSession| s.parent == parent && s.session == session.session)
+            {
+                return Err(format!(
+                    "PPPoE session {} on {} is given twice",
+                    session.session, session.parent
+                ));
+            }
+            let parent_mtu = interfaces
+                .iter()
+                .find(|i| i.id == parent)
+                .map_or(0, |i| i.mtu);
+            if *mtu > parent_mtu.saturating_sub(8) {
+                return Err(format!(
+                    "PPPoE interface {name}: mtu must be at most {} ({}'s less 8)",
+                    parent_mtu.saturating_sub(8),
+                    session.parent
+                ));
+            }
             let id = u16::try_from(interface_names.len())
                 .map(IfId)
                 .map_err(|_| "too many interfaces".to_owned())?;

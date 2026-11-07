@@ -571,6 +571,22 @@ where
             frame.extend_from_slice(&origin.source_mac.0);
             frame.extend_from_slice(&ethertype);
             frame.extend_from_slice(&packet);
+            // Too big for a PPPoE session: the kernel learns its MTU, as from a
+            // router on the path.
+            if let Some(Err(ruster_core::TunnelOriginError::TooBig { mtu })) =
+                snapshot.pppoe_frame(origin.egress, &frame)
+            {
+                let error = if packet[0] >> 4 == 4 {
+                    local::fragmentation_needed(&packet, mtu)
+                } else {
+                    local::packet_too_big(&packet, mtu)
+                };
+                if let (Some(error), Some(pipe)) = (error, self.local.get(&self.names[at])) {
+                    let _ = pipe.send(&error);
+                }
+                self.counters.from_kernel_dropped += 1;
+                continue;
+            }
             if self.send_generated(origin.egress, &frame) {
                 self.counters.from_kernel += 1;
             } else {

@@ -1983,7 +1983,7 @@ impl<'a> ForwardingSnapshot<'a> {
         &self,
         egress: IfId,
         frame: &[u8],
-    ) -> Option<Result<(IfId, Vec<u8>), DropReason>> {
+    ) -> Option<Result<(IfId, Vec<u8>), crate::TunnelOriginError>> {
         crate::pppoe::wrap(self, egress, frame)
     }
 

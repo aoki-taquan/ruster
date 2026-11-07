@@ -1455,4 +1455,22 @@ fn a_route_to_a_pppoe_interface_sends_in_its_session() {
     assert_eq!(&tx.bytes[12..14], &[0x88, 0x64]);
     assert_eq!(&tx.bytes[20..22], &[0x00, 0x21]);
     assert_eq!(&tx.bytes[22..], &own[..]);
+
+    // Too big for the session with DF set: the kernel is told its MTU.
+    kernel.set_nonblocking(true).unwrap();
+    let mut big = own.clone();
+    big.resize(1500, 0);
+    big[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+    big[6] = 0x40;
+    big[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&big[..20]);
+    big[10..12].copy_from_slice(&checksum.to_be_bytes());
+    kernel.send(&big).unwrap();
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("an ICMP error back");
+    assert_eq!((buf[20], buf[21]), (3, 4));
+    assert_eq!(u16::from_be_bytes([buf[26], buf[27]]), 1492);
+    let _ = n;
 }
