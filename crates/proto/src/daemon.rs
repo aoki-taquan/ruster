@@ -182,7 +182,9 @@ pub fn try_connect(path: &Path) -> Option<UnixStream> {
 
 /// The longest a process sleeps while idle, so that new connections and socket input
 /// are noticed soon.
-pub const IDLE_MAX: Duration = Duration::from_millis(1);
+pub const IDLE_MAX: Duration = Duration::from_millis(IDLE_MAX_MS as u64);
+/// [`IDLE_MAX`] in milliseconds.
+pub const IDLE_MAX_MS: u32 = 1;
 
 /// Sleeps [`IDLE_MAX`] when the last step found nothing to do.
 pub fn idle(progress: Progress) {
