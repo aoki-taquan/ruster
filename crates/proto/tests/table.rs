@@ -39,6 +39,7 @@ fn every_table_round_trips() {
                 vrf: ruster_proto::table::DEFAULT_VRF.into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
         ),
         Change::set(
@@ -321,6 +322,7 @@ fn encode_refuses_what_decode_would_refuse() {
                 vrf: ruster_proto::table::DEFAULT_VRF.into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
         ),
         Change::set(
@@ -512,6 +514,7 @@ fn vrf_binding_and_lookup_vrf_round_trip() {
                 vrf: "customer".into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
         ),
         Change::set(
@@ -536,6 +539,7 @@ fn vrf_binding_and_lookup_vrf_round_trip() {
             vrf: DEFAULT_VRF.into(),
             vlan: None,
             tunnel: None,
+            pppoe: None,
         },
     );
     let mut payload = Vec::new();
@@ -573,6 +577,7 @@ fn vlan_sub_interfaces_round_trip_and_are_checked() {
                     id,
                 }),
                 tunnel: None,
+                pppoe: None,
             },
         )
     };
@@ -666,6 +671,7 @@ fn tunnel_interfaces_round_trip_and_are_checked() {
                     local: local.parse().unwrap(),
                     remote: remote.parse().unwrap(),
                 }),
+                pppoe: None,
             },
         )
     };
@@ -729,4 +735,33 @@ fn a_nat_with_a_psid_port_set_round_trips_and_is_checked() {
     ] {
         assert!(nat(bad).validate().is_err(), "{bad:?}");
     }
+}
+
+#[test]
+fn a_pppoe_interface_round_trips_and_is_checked() {
+    use ruster_proto::table::Pppoe;
+    let ppp = |session: u16, peer: [u8; 6]| {
+        Change::set(
+            Key::Interface { name: "ppp".into() },
+            Value::Interface {
+                enabled: true,
+                mac: [2, 0, 0, 0, 0, 8],
+                mtu: 1492,
+                vrf: DEFAULT_VRF.into(),
+                vlan: None,
+                tunnel: None,
+                pppoe: Some(Pppoe {
+                    parent: "wan".into(),
+                    session,
+                    peer,
+                }),
+            },
+        )
+    };
+    let good = ppp(0x1234, [2, 0, 0, 0, 0, 0xac]);
+    assert!(good.validate().is_ok());
+    assert_eq!(round_trip(&good), good);
+    assert!(ppp(0, [2, 0, 0, 0, 0, 0xac]).validate().is_err());
+    assert!(ppp(0xffff, [2, 0, 0, 0, 0, 0xac]).validate().is_err());
+    assert!(ppp(1, [0xff; 6]).validate().is_err());
 }

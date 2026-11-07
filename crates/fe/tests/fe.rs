@@ -78,6 +78,7 @@ fn iface(name: &str, mac: [u8; 6]) -> Change {
             vrf: ruster_proto::table::DEFAULT_VRF.into(),
             vlan: None,
             tunnel: None,
+            pppoe: None,
         },
     )
 }
@@ -716,6 +717,7 @@ fn an_interface_in_another_vrf_uses_that_vrf_s_routes_and_a_lookup_reaches_defau
             vrf: "red".into(),
             vlan: None,
             tunnel: None,
+            pppoe: None,
         },
     );
     let code = bench.patch(
@@ -1305,6 +1307,7 @@ fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
                 local: "2001:db8:1::1".parse().unwrap(),
                 remote: "2001:db8:ff::1".parse().unwrap(),
             }),
+            pppoe: None,
         },
     );
     assert_eq!(bench.patch(&mut config, &[tunnel]), Code::CHANGED);
@@ -1393,4 +1396,81 @@ fn nat_with_a_psid_port_set_uses_its_ports() {
     let port = u16::from_be_bytes([out.bytes[34], out.bytes[35]]);
     assert_eq!((port >> 4) & 0x3f, 0x34, "the PSID bits of {port}");
     assert!(port >> 10 != 0, "not a well-known port");
+}
+
+#[test]
+fn a_route_to_a_pppoe_interface_sends_in_its_session() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let ppp = Change::set(
+        Key::Interface { name: "ppp".into() },
+        Value::Interface {
+            enabled: true,
+            mac: [2, 0, 0, 0, 0, 8],
+            mtu: 1492,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: Some(ruster_proto::table::Pppoe {
+                parent: "wan".into(),
+                session: 0x1234,
+                peer: GATEWAY_MAC,
+            }),
+        },
+    );
+    assert_eq!(bench.patch(&mut config, &[ppp]), Code::CHANGED);
+    let to_ppp = Change::set(
+        Key::Route {
+            vrf: "default".into(),
+            prefix: Ipv4Addr::from(INTERNET).into(),
+            len: 32,
+        },
+        Value::Route(RouteAction::Forward(vec![NextHop {
+            interface: "ppp".into(),
+            address: None,
+        }])),
+    );
+    assert_eq!(bench.patch(&mut routes, &[to_ppp]), Code::CHANGED);
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+    assert_eq!(&tx.bytes[12..14], &[0x88, 0x64]);
+    assert_eq!(u16::from_be_bytes([tx.bytes[16], tx.bytes[17]]), 0x1234);
+
+    // The router's own IPv4 goes the same way.
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    own[12..16].copy_from_slice(&[192, 0, 2, 1]);
+    own[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&own[..20]);
+    own[10..12].copy_from_slice(&checksum.to_be_bytes());
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent from the kernel");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[12..14], &[0x88, 0x64]);
+    assert_eq!(&tx.bytes[20..22], &[0x00, 0x21]);
+    assert_eq!(&tx.bytes[22..], &own[..]);
+
+    // Too big for the session with DF set: the kernel is told its MTU.
+    kernel.set_nonblocking(true).unwrap();
+    let mut big = own.clone();
+    big.resize(1500, 0);
+    big[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+    big[6] = 0x40;
+    big[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&big[..20]);
+    big[10..12].copy_from_slice(&checksum.to_be_bytes());
+    kernel.send(&big).unwrap();
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("an ICMP error back");
+    assert_eq!((buf[20], buf[21]), (3, 4));
+    assert_eq!(u16::from_be_bytes([buf[26], buf[27]]), 1492);
+    let _ = n;
 }

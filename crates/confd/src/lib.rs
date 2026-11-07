@@ -303,6 +303,7 @@ impl Confd {
                     tunnel: interface
                         .tunnel
                         .map(|(local, remote)| ruster_proto::table::Tunnel { local, remote }),
+                    pppoe: None,
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);

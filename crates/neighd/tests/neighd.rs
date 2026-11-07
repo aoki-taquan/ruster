@@ -32,6 +32,7 @@ fn local_tables() -> Vec<Change> {
                 vrf: ruster_proto::table::DEFAULT_VRF.into(),
                 vlan: None,
                 tunnel: None,
+                pppoe: None,
             },
         )
     };

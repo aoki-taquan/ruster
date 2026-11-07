@@ -122,6 +122,7 @@ pub struct Fe<B> {
     interface_names: Vec<String>,
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
+    pppoe: Vec<ruster_core::PppoeSession>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
     limiter: local::Limiter,
@@ -179,6 +180,7 @@ where
             interface_names: built.interface_names,
             vlans: built.vlans,
             tunnels: built.tunnels,
+            pppoe: built.pppoe,
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
             active: built.active,
@@ -260,6 +262,7 @@ where
                     .with_local_to_control(self.local.contains_key(name))
                     .with_vlans(&self.vlans)
                     .with_tunnels(&self.tunnels)
+                    .with_pppoe(&self.pppoe)
             })
             .collect();
         let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
@@ -270,6 +273,7 @@ where
             .with_vrfs(&snapshots, &self.by_ingress)
             .with_vlans(&self.vlans)
             .with_tunnels(&self.tunnels)
+            .with_pppoe(&self.pppoe)
             .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
             return false;
@@ -501,7 +505,8 @@ where
             let snapshot = self.vrfs[at]
                 .owner
                 .snapshot()
-                .with_ipv6(&self.vrfs[at].ipv6);
+                .with_ipv6(&self.vrfs[at].ipv6)
+                .with_pppoe(&self.pppoe);
             let origin = local::destination(&packet).and_then(|d| snapshot.origin(d));
             let Some(origin) = origin else {
                 self.counters.from_kernel_dropped += 1;
@@ -512,7 +517,8 @@ where
                 .owner
                 .snapshot()
                 .with_ipv6(&self.vrfs[0].ipv6)
-                .with_tunnels(&self.tunnels);
+                .with_tunnels(&self.tunnels)
+                .with_pppoe(&self.pppoe);
             if let Some(wrapped) = outer.tunnel_origin(origin.egress, &packet) {
                 let sent = match wrapped {
                     Ok(tunnel) => match tunnel.destination_mac {
@@ -565,6 +571,22 @@ where
             frame.extend_from_slice(&origin.source_mac.0);
             frame.extend_from_slice(&ethertype);
             frame.extend_from_slice(&packet);
+            // Too big for a PPPoE session: the kernel learns its MTU, as from a
+            // router on the path.
+            if let Some(Err(ruster_core::TunnelOriginError::TooBig { mtu })) =
+                snapshot.pppoe_frame(origin.egress, &frame)
+            {
+                let error = if packet[0] >> 4 == 4 {
+                    local::fragmentation_needed(&packet, mtu)
+                } else {
+                    local::packet_too_big(&packet, mtu)
+                };
+                if let (Some(error), Some(pipe)) = (error, self.local.get(&self.names[at])) {
+                    let _ = pipe.send(&error);
+                }
+                self.counters.from_kernel_dropped += 1;
+                continue;
+            }
             if self.send_generated(origin.egress, &frame) {
                 self.counters.from_kernel += 1;
             } else {
@@ -577,6 +599,13 @@ where
     /// Sends `frame` out of `egress`; out of a VLAN sub-interface's parent, tagged,
     /// for a sub-interface.
     fn send_generated(&mut self, egress: IfId, frame: &[u8]) -> bool {
+        // Into a PPPoE session, then out of its parent.
+        let outer = self.vrfs[0].owner.snapshot().with_pppoe(&self.pppoe);
+        match outer.pppoe_frame(egress, frame) {
+            Some(Ok((parent, wrapped))) => return self.send_generated(parent, &wrapped),
+            Some(Err(_)) => return false,
+            None => {}
+        }
         let vlan = self.vlans.iter().find(|b| b.sub == egress).copied();
         let (port, tag) = match vlan {
             Some(binding) => (binding.parent, Some(binding.vid)),
@@ -640,6 +669,7 @@ where
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;
             self.tunnels = built.tunnels;
+            self.pppoe = built.pppoe;
             self.active = built.active;
         }
         let worked = self.worker(now_ms);

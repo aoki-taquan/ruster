@@ -67,6 +67,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ruster-if-pppoe:pppoe/parent",
+        "sid": 60090,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ruster-if-pppoe:pppoe/session-id",
+        "sid": 60091,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ietf-interfaces:interfaces/interface/ruster-if-pppoe:pppoe/peer-address",
+        "sid": 60092,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-interfaces:interfaces/interface/ietf-ip:ipv4/address",
         "sid": 60020,
         "status": "unstable"

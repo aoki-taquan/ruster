@@ -80,9 +80,10 @@ fn line(change: &Change) -> String {
                 vrf,
                 vlan,
                 tunnel,
+                pppoe,
             },
         ) => format!(
-            "interface {name} {} mac {} mtu {mtu} vrf {vrf}{}{}",
+            "interface {name} {} mac {} mtu {mtu} vrf {vrf}{}{}{}",
             if *enabled { "up" } else { "down" },
             format_mac(mac),
             vlan.as_ref()
@@ -91,6 +92,15 @@ fn line(change: &Change) -> String {
             tunnel
                 .as_ref()
                 .map(|t| format!(" tunnel {} to {}", t.local, t.remote))
+                .unwrap_or_default(),
+            pppoe
+                .as_ref()
+                .map(|p| format!(
+                    " pppoe session {} on {} to {}",
+                    p.session,
+                    p.parent,
+                    format_mac(&p.peer)
+                ))
                 .unwrap_or_default()
         ),
         (Key::Address { interface, address }, Value::Address { prefix_len }) => {

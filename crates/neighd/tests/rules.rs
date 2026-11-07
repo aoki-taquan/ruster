@@ -53,6 +53,7 @@ impl Lab {
                         vrf: ruster_proto::table::DEFAULT_VRF.into(),
                         vlan: None,
                         tunnel: None,
+                        pppoe: None,
                     },
                 ),
                 Change::set(
@@ -195,6 +196,7 @@ fn a_silent_fe_does_not_stop_neighd_from_serving_resolve_requests() {
                     vrf: ruster_proto::table::DEFAULT_VRF.into(),
                     vlan: None,
                     tunnel: None,
+                    pppoe: None,
                 },
             ),
             Change::set(
