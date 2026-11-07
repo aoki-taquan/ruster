@@ -96,11 +96,11 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 | 番号 | 作業 |
 |---|---|
-| 2-1 | 相手が落ちたときのつなぎ直し。CEの実行ファイルを再起動しても転送が止まらないことをnetnsで確かめる |
+| 2-1 | 相手が落ちたときのつなぎ直し。CEの実行ファイルを再起動しても転送が止まらないことをnetnsで確かめる（済み、#384、#392） |
 | 2-2 | （外した。CIに足すかは、プロジェクトが成熟してからownerが決める） |
-| 2-3 | FEの実行ファイルをAF_XDPでも動かす。起動、権限、seccompなど`ruster run`の運用の部品をFEへ移す |
+| 2-3 | FEの実行ファイルをAF_XDPでも動かす。`ruster run`の運用の部品は、シグナルでの停止とsystemdへの通知だけ移す（owner決定。権限、seccomp、Landlockは移さない）（済み、#389、#395） |
 | 2-4 | （4-2へ移した: coreのNATとfirewallの入口はどれもARPの解決を必須にしていて、試験の大半がそれを使う。入口を一つにまとめるときに一緒に消す） |
-| 2-5 | 見直し前の`ruster`コマンド（`run`、`run-sim`、SIGHUPの再読み込み）と、それだけが使うcrateを消す。NAT、firewall、フラグメントの処理はcoreに残す |
+| 2-5 | 見直し前の`ruster`コマンド（`run`、`run-sim`、SIGHUPの再読み込み）と、それだけが使うcrateを消す。NAT、firewall、フラグメントの処理はcoreに残す（済み、#398） |
 
 ### 段階3: 土台
 
