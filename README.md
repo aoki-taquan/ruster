@@ -104,7 +104,7 @@ CEのプロセスが落ちている間も、FEは持っている表で転送を�
 ### netnsでの試験
 
 2台のホストとルータを別々のnetnsに作り、vethでつないで、両方向にpingが通ること、各プロセスを起動し直しても転送が戻ることを確かめます。
-CIでも、AF_XDPとAF_PACKETの両方で回しています。
+rootが要るのでCIでは回していません。
 
 ```bash
 cargo build --workspace --locked
@@ -114,7 +114,7 @@ sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 
 ## 開発
 
-stable Rustだけで確かめられます。mergeの前に次の4つを実行します。CIはこの4つとnetnsの試験を1つのjobで回します。
+stable Rustだけで確かめられます。mergeの前に次の4つを実行します。CIも同じものを1つのjobで回します。
 
 ```bash
 cargo fmt --all -- --check

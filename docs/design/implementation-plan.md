@@ -81,7 +81,7 @@ Unix socketのメッセージでつながり、IPv4が両方向に転送され�
 FEはAF_PACKETの上で動き、confdはTOMLの設定ファイル（`crates/confd/src/file.rs`）を読む。
 socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の置き場所（`--run-dir`で変えられる）。
 `sudo scripts/netns-skeleton.sh`が、netnsとvethでつないだ2台のホストの間をIPv4が両方向に
-転送されることを確かめる。CIでもAF_XDPとAF_PACKETの両方で回す（2-2）。
+転送されることを確かめる。CIでは回していない。
 
 - 起動の順番はFEが先。ほかのプロセスは相手のsocketができるまで10秒待つ。
 - 接続が切れた書き手は1秒ごとにつなぎ直し、自分の表を全部送り直す（2-1）。netnsの試験で、
