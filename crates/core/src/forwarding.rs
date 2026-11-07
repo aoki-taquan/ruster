@@ -459,6 +459,28 @@ pub enum DropReason {
     /// input firewall's `default-action` is `deny` (INPUT-FW). Silently
     /// discarded like [`DropReason::Ipv4InputFirewallRuleDenied`].
     Ipv4InputFirewallDefaultDenied = 211,
+    /// Shorter than an IPv6 header.
+    Ipv6HeaderTruncated = 212,
+    /// An IPv6 Ethernet type with a version other than 6.
+    Ipv6VersionUnsupported = 213,
+    /// The Payload Length runs past the frame.
+    Ipv6PayloadLengthExceedsPacket = 214,
+    /// Received on an interface the tables do not have.
+    Ipv6IngressInterfaceUnknown = 215,
+    /// A multicast or zero Ethernet source, or a unicast destination that is not the interface's.
+    Ipv6EthernetAddressInvalid = 216,
+    /// A multicast source (RFC 4291 section 2.7), or a link-local, unspecified or loopback source of a packet to forward.
+    Ipv6SourceInvalid = 217,
+    /// A link-local, unspecified or loopback destination, or multicast other than Neighbor Discovery (RFC 4291 section 2.5.6).
+    Ipv6DestinationNotForwarded = 218,
+    /// The Hop Limit would reach 0 (RFC 8200 section 3). No Time Exceeded yet.
+    Ipv6HopLimitExpired = 219,
+    /// Longer than the egress MTU. No Packet Too Big yet.
+    Ipv6PacketTooBig = 220,
+    /// Addressed to the router and not Neighbor Discovery: not handled yet.
+    Ipv6LocalUnsupported = 221,
+    /// Neighbor Discovery for the control side with no room in the control queue, or no queue.
+    Ipv6ControlQueueFull = 222,
 }
 
 use DropReason::*;
@@ -466,7 +488,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 211] = [
+    pub const ALL: [Self; 222] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -678,6 +700,17 @@ impl DropReason {
         Ipv4SourceValidationFailed,
         Ipv4InputFirewallRuleDenied,
         Ipv4InputFirewallDefaultDenied,
+        Ipv6HeaderTruncated,
+        Ipv6VersionUnsupported,
+        Ipv6PayloadLengthExceedsPacket,
+        Ipv6IngressInterfaceUnknown,
+        Ipv6EthernetAddressInvalid,
+        Ipv6SourceInvalid,
+        Ipv6DestinationNotForwarded,
+        Ipv6HopLimitExpired,
+        Ipv6PacketTooBig,
+        Ipv6LocalUnsupported,
+        Ipv6ControlQueueFull,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -906,6 +939,17 @@ impl DropReason {
             Ipv4SourceValidationFailed => "IPV4_SOURCE_VALIDATION_FAILED",
             Ipv4InputFirewallRuleDenied => "IPV4_INPUT_FIREWALL_RULE_DENIED",
             Ipv4InputFirewallDefaultDenied => "IPV4_INPUT_FIREWALL_DEFAULT_DENIED",
+            Ipv6HeaderTruncated => "IPV6_HEADER_TRUNCATED",
+            Ipv6VersionUnsupported => "IPV6_VERSION_UNSUPPORTED",
+            Ipv6PayloadLengthExceedsPacket => "IPV6_PAYLOAD_LENGTH_EXCEEDS_PACKET",
+            Ipv6IngressInterfaceUnknown => "IPV6_INGRESS_INTERFACE_UNKNOWN",
+            Ipv6EthernetAddressInvalid => "IPV6_ETHERNET_ADDRESS_INVALID",
+            Ipv6SourceInvalid => "IPV6_SOURCE_INVALID",
+            Ipv6DestinationNotForwarded => "IPV6_DESTINATION_NOT_FORWARDED",
+            Ipv6HopLimitExpired => "IPV6_HOP_LIMIT_EXPIRED",
+            Ipv6PacketTooBig => "IPV6_PACKET_TOO_BIG",
+            Ipv6LocalUnsupported => "IPV6_LOCAL_UNSUPPORTED",
+            Ipv6ControlQueueFull => "IPV6_CONTROL_QUEUE_FULL",
         }
     }
 }
@@ -1208,6 +1252,9 @@ pub struct ForwardingSnapshot<'a> {
     /// being learned or answered here
     /// ([`ForwardingSnapshot::with_arp_to_control`]).
     arp_to_control: bool,
+    /// The IPv6 tables ([`ForwardingSnapshot::with_ipv6`]); without them IPv6
+    /// frames are dropped as an unsupported Ethernet type.
+    pub(crate) ipv6: Option<&'a crate::Ipv6Fib>,
     /// Publication-time lookup indexes over exactly these slices, present
     /// only for snapshots borrowed from a [`ValidatedForwardingOwner`].
     /// Without it every lookup uses the linear reference (PERF-002).
@@ -1402,6 +1449,7 @@ impl<'a> ForwardingSnapshot<'a> {
             input_firewall_default: crate::InputFirewallAction::Accept,
             input_firewall_indexed: false,
             arp_to_control: false,
+            ipv6: None,
             index: None,
             authority: calculate_snapshot_authority(
                 routes,
@@ -1463,6 +1511,15 @@ impl<'a> ForwardingSnapshot<'a> {
     pub fn with_arp_to_control(self, on: bool) -> Self {
         Self {
             arp_to_control: on,
+            ..self
+        }
+    }
+
+    /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
+    #[must_use]
+    pub fn with_ipv6(self, fib: &'a crate::Ipv6Fib) -> Self {
+        Self {
+            ipv6: Some(fib),
             ..self
         }
     }
@@ -1636,6 +1693,7 @@ impl<'a> ForwardingSnapshot<'a> {
             // not from `rules`: walk these linearly.
             input_firewall_indexed: false,
             arp_to_control: false,
+            ipv6: None,
             authority,
             ..self
         })
@@ -2000,6 +2058,7 @@ impl ValidatedForwardingOwner {
             input_firewall_default: self.input_firewall_default,
             input_firewall_indexed: true,
             arp_to_control: false,
+            ipv6: None,
             index: Some(&self.index),
             authority: self.authority,
         }
@@ -2398,6 +2457,15 @@ pub enum TraceEvent {
         ingress: IfId,
         reason: DropReason,
     },
+    /// An IPv6 Neighbor Discovery message went to the control queue.
+    Ipv6ToControl {
+        ingress: IfId,
+    },
+    /// An IPv6 packet's next hop is not in the IPv6 neighbor table.
+    Ipv6NeighborMissing {
+        egress: IfId,
+        target: [u8; 16],
+    },
     Consumed {
         ingress: IfId,
         reason: ConsumeReason,
@@ -2727,6 +2795,41 @@ where
 {
     forward_batch_inner(
         batch, snapshot, None, None, None, None, None, None, None, None, None, None, None, None,
+        trace,
+    )
+}
+
+/// Like [`forward_batch`], and copies the IPv6 Neighbor Discovery messages the
+/// snapshot's IPv6 tables send to the control side into `control`
+/// ([`ForwardingSnapshot::with_ipv6`]). The caller empties `control` between batches.
+pub fn forward_batch_with_control<B, T>(
+    batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    control: &mut crate::ControlQueue,
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    forward_batch_tracked(
+        batch,
+        snapshot,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(control),
         trace,
     )
 }
@@ -3567,6 +3670,7 @@ where
         fragmentation,
         fragment_tracking,
         None,
+        None,
         trace,
     )
 }
@@ -3629,6 +3733,7 @@ where
         fragmentation,
         fragment_tracking,
         arp_hold,
+        None,
         trace,
     )
 }
@@ -3746,6 +3851,7 @@ where
         Some(&mut *fragmentation),
         fragment_tracking,
         None,
+        None,
         &mut ReplayTrace(trace),
     );
     arp_hold.stage_committed(snapshot, fragmentation);
@@ -3789,6 +3895,7 @@ where
         firewall,
         firewall_audit,
         fragmentation,
+        None,
         None,
         None,
         trace,
@@ -3911,6 +4018,7 @@ fn forward_batch_tracked<B, T>(
     mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
     mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
     mut arp_hold: Option<&mut ArpHoldRuntime<'_>>,
+    mut control: Option<&mut crate::ControlQueue>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -3923,6 +4031,16 @@ where
     let mut consumed = 0;
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
+        if let Some(fib) = snapshot.ipv6 {
+            if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
+                match crate::ipv6::complete(packet, snapshot, fib, control.as_deref_mut(), trace) {
+                    crate::ipv6::Completed::Transmitted => tx_requested += 1,
+                    crate::ipv6::Completed::Dropped => dropped += 1,
+                    crate::ipv6::Completed::Consumed => consumed += 1,
+                }
+                continue;
+            }
+        }
         let ingress = packet.ingress();
         let nat_now_ms = resolution.as_ref().map_or(0, |(_, now)| now.0);
         // ARP-HOLD: the miss a hold waits on is the one this datagram's
@@ -10453,6 +10571,17 @@ mod tests {
             (209, "IPV4_SOURCE_VALIDATION_FAILED"),
             (210, "IPV4_INPUT_FIREWALL_RULE_DENIED"),
             (211, "IPV4_INPUT_FIREWALL_DEFAULT_DENIED"),
+            (212, "IPV6_HEADER_TRUNCATED"),
+            (213, "IPV6_VERSION_UNSUPPORTED"),
+            (214, "IPV6_PAYLOAD_LENGTH_EXCEEDS_PACKET"),
+            (215, "IPV6_INGRESS_INTERFACE_UNKNOWN"),
+            (216, "IPV6_ETHERNET_ADDRESS_INVALID"),
+            (217, "IPV6_SOURCE_INVALID"),
+            (218, "IPV6_DESTINATION_NOT_FORWARDED"),
+            (219, "IPV6_HOP_LIMIT_EXPIRED"),
+            (220, "IPV6_PACKET_TOO_BIG"),
+            (221, "IPV6_LOCAL_UNSUPPORTED"),
+            (222, "IPV6_CONTROL_QUEUE_FULL"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10462,7 +10591,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(212), None);
+        assert_eq!(DropReason::from_code(223), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

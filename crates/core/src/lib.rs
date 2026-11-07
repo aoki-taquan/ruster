@@ -12,6 +12,7 @@ mod icmpv4_translated_limit;
 mod io;
 mod ipv4_fragment_tracking;
 mod ipv4_fragmentation;
+mod ipv6;
 mod nat44;
 mod nat44_host_quota;
 mod nat44_ipv4_id;
@@ -63,7 +64,8 @@ pub use forwarding::{
     Nat44TcpUnsolicitedSynDispatchReport, Nat44TcpUnsolicitedSynDisposition,
 };
 pub use forwarding::{
-    forward_batch, forward_batch_with_firewall, forward_batch_with_firewall_and_icmpv4_errors,
+    forward_batch, forward_batch_with_control, forward_batch_with_firewall,
+    forward_batch_with_firewall_and_icmpv4_errors,
     forward_batch_with_firewall_and_icmpv4_errors_audited, forward_batch_with_firewall_audited,
     forward_batch_with_nat44_tcp, forward_batch_with_nat44_tcp_and_icmpv4_errors,
     forward_batch_with_nat44_udp, forward_batch_with_nat44_udp_and_icmpv4_errors,
@@ -125,6 +127,10 @@ pub use ipv4_fragmentation::{
     Ipv4FragmentationPolicyError, Ipv4FragmentationRuntime, Ipv4FragmentationStorageError,
     IPV4_FRAGMENTATION_DEFAULT_MAX_FRAGMENTS, IPV4_FRAGMENTATION_MAX_FRAGMENTS,
     IPV4_FRAGMENTATION_MIN_MAX_FRAGMENTS,
+};
+pub use ipv6::{
+    ControlFrame, ControlQueue, Ipv6Fib, Ipv6FibError, Ipv6Local, Ipv6Neighbor, Ipv6Route,
+    CONTROL_FRAME_MAX, IPV6_ETHERTYPE,
 };
 pub use nat44::{
     Nat44CarryIdentity, Nat44Filtering, Nat44IcmpConfig, Nat44IcmpConfigError, Nat44IcmpCounters,
