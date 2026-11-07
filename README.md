@@ -54,7 +54,8 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 実際のNICや回線ではまだ試していません。
 
 `ruster-core`には、見直し前の作りのARPの処理がまだ残っています（neighdへ移した後に消す）。
-NAT、firewall、フラグメントの処理もcoreにあり、表としてFEにつなぐのはこれからです。
+default VRFの転送のfirewallは、設定ファイルの規則でFEが使います。IPv4だけで、規則があるあいだdefault VRFを通るIPv6は転送しません。
+NATとフラグメントの処理もcoreにあり、表としてFEにつなぐのはこれからです。
 
 ## 動かす
 

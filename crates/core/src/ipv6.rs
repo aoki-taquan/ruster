@@ -481,12 +481,19 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
     mut packet: crate::PacketLease<S>,
     snapshot: &crate::ForwardingSnapshot<'_>,
     fib: &Ipv6Fib,
+    blocked: impl Fn(IfId) -> bool,
     control: Option<&mut ControlQueue>,
     vlans: &[crate::VlanBinding],
     trace: &mut T,
 ) -> Completed {
     let ingress = packet.ingress();
-    match decide(packet.bytes_mut(), snapshot, fib, ingress, trace) {
+    let mut outcome = decide(packet.bytes_mut(), snapshot, fib, ingress, trace);
+    if let Outcome::Transmit(egress) = outcome {
+        if blocked(egress) {
+            outcome = Outcome::Drop(crate::DropReason::Ipv6ForwardingBlocked);
+        }
+    }
+    match outcome {
         Outcome::Transmit(egress) => match crate::vlan::transmit(&mut packet, egress, vlans) {
             Ok(port) => {
                 packet.commit(port);

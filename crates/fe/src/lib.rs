@@ -51,7 +51,7 @@ pub use local::LocalPipe;
 pub mod writers {
     use ruster_proto::sid;
 
-    pub const CONFIG: &[u64] = &[sid::INTERFACE, sid::ADDRESS, sid::NAT, sid::FIREWALL_RULE];
+    pub const CONFIG: &[u64] = &[sid::INTERFACE, sid::ADDRESS, sid::FIREWALL_RULE];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
     pub const READ_ONLY: &[u64] = &[];
@@ -245,17 +245,20 @@ where
                     .with_vlans(&self.vlans)
             })
             .collect();
+        let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
+        // The firewall has no IPv6 rules yet: while it is on, IPv6 is not forwarded
+        // through the default VRF rather than forwarded unchecked.
         let snapshot = snapshots[0]
             .with_now(MonotonicMillis(now_ms))
             .with_vrfs(&snapshots, &self.by_ingress)
-            .with_vlans(&self.vlans);
+            .with_vlans(&self.vlans)
+            .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(batch) = self.io.receive(RX_BUDGET) else {
             return false;
         };
         self.control.clear();
         let now = MonotonicMillis(now_ms);
         self.control.set_clock(now);
-        let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
         let report = forward_batch_with_control(
             batch,
             &snapshot,
@@ -613,6 +616,7 @@ impl Hook for Builder {
         let publication = firewall::Publication::new(
             &default.owner.snapshot(),
             &built.firewall,
+            built.firewall_on,
             self.generation,
         )?;
         self.built = Some((built, publication));

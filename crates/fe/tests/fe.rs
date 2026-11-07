@@ -944,3 +944,52 @@ fn a_firewall_rule_outside_the_default_vrf_is_refused() {
     };
     assert_eq!(bench.patch(&mut config, &[change]), Code::BAD_REQUEST);
 }
+
+#[test]
+fn a_firewall_whose_rules_all_name_a_disabled_interface_drops_everything() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    let mut dmz_off = iface("dmz", [2, 0, 0, 0, 0, 3]);
+    if let Some(Value::Interface { enabled, .. }) = &mut dmz_off.value {
+        *enabled = false;
+    }
+    let mut rule = accept_udp_from_lan(1);
+    if let Some(Value::FirewallRule(rule)) = &mut rule.value {
+        rule.ingress = Some("dmz".into());
+    }
+    assert_eq!(bench.patch(&mut config, &[dmz_off, rule]), Code::CHANGED);
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+}
+
+#[test]
+fn ipv6_is_not_forwarded_while_the_firewall_is_on() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let gateway = Change::set(
+        Key::Neighbor {
+            interface: "wan".into(),
+            address: ip6("fe80::1"),
+        },
+        Value::Neighbor { mac: GATEWAY_MAC },
+    );
+    assert_eq!(bench.patch(&mut neighbors, &[gateway]), Code::CHANGED);
+    let send = |bench: &mut Bench| {
+        bench
+            .fe
+            .io_mut()
+            .inject(IfId(0), ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]));
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(send(&mut bench));
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(1)]),
+        Code::CHANGED
+    );
+    assert!(!send(&mut bench));
+}

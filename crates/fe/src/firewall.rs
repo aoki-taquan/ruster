@@ -21,16 +21,18 @@ const STATES: usize = 1 << 14;
 /// A firewall publication made for one set of tables.
 pub(crate) struct Publication {
     owner: ValidatedFirewallOwner,
-    /// Whether it has any rule. With none, no firewall is applied.
+    /// Whether the firewall applies. Off when the tables have no rule.
     rules: bool,
 }
 
 impl Publication {
     /// The publication of `rules` for tables whose default VRF is `snapshot` (the
     /// snapshot of a `ValidatedForwardingOwner`). `generation` grows with each one.
+    /// With `on`, the firewall applies even with no rules, and then drops everything.
     pub(crate) fn new(
         snapshot: &ForwardingSnapshot<'_>,
         rules: &[FirewallRule],
+        on: bool,
         generation: u64,
     ) -> Result<Self, String> {
         let owner = ValidatedFirewallOwner::new(
@@ -41,10 +43,7 @@ impl Publication {
             hash_key(),
         )
         .map_err(|error| format!("firewall: {error:?}"))?;
-        Ok(Self {
-            owner,
-            rules: !rules.is_empty(),
-        })
+        Ok(Self { owner, rules: on })
     }
 }
 

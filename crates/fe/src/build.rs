@@ -41,9 +41,12 @@ pub(crate) struct Built {
     pub(crate) interface_names: Vec<String>,
     /// The VLAN sub-interfaces of enabled ports.
     pub(crate) vlans: Vec<VlanBinding>,
-    /// The default VRF's forward firewall rules, in rule id order. Empty for no
-    /// firewall.
+    /// The default VRF's forward firewall rules, in rule id order, without those
+    /// naming an interface that is missing or disabled.
     pub(crate) firewall: Vec<FirewallRule>,
+    /// Whether the tables have any firewall rule. Then the firewall is on even if
+    /// none of them is in `firewall`, and drops everything.
+    pub(crate) firewall_on: bool,
 }
 
 /// One forwarding route before it becomes core's.
@@ -267,6 +270,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let mut bindings: Vec<Vec<LocalIpv4Binding>> = vec![Vec::new(); order.len()];
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
     let mut firewall = Vec::new();
+    let mut firewall_on = false;
     for (key, value) in store.iter() {
         match (key, value) {
             (Key::Address { interface, address }, Value::Address { .. }) => {
@@ -339,8 +343,9 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                         "firewall rule {id} in {vrf}: only the default VRF has a firewall"
                     ));
                 }
+                firewall_on = true;
                 // A rule naming an interface that is missing or disabled matches no
-                // packet, so leaving it out changes nothing.
+                // packet, so it is left out.
                 if let Some(rule) = firewall_rule(*id, rule, &active)? {
                     firewall.push(rule);
                 }
@@ -410,6 +415,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         interface_names,
         vlans,
         firewall,
+        firewall_on,
     })
 }
 
@@ -430,6 +436,9 @@ fn firewall_rule(
         return Ok(None);
     };
     let failed = |error: String| format!("firewall rule {id}: {error}");
+    if id == 0 {
+        return Err(failed("the id must not be 0".into()));
+    }
     let prefix = |(address, len): (std::net::Ipv4Addr, u8)| {
         FirewallIpv4Prefix::new(Ipv4Address::from_octets(address.octets()), len)
             .map_err(|e| failed(format!("{address}/{len}: {e:?}")))
