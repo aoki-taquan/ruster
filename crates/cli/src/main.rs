@@ -78,11 +78,15 @@ fn line(change: &Change) -> String {
                 mac,
                 mtu,
                 vrf,
+                vlan,
             },
         ) => format!(
-            "interface {name} {} mac {} mtu {mtu} vrf {vrf}",
+            "interface {name} {} mac {} mtu {mtu} vrf {vrf}{}",
             if *enabled { "up" } else { "down" },
-            format_mac(mac)
+            format_mac(mac),
+            vlan.as_ref()
+                .map(|v| format!(" vlan {} on {}", v.id, v.parent))
+                .unwrap_or_default()
         ),
         (Key::Address { interface, address }, Value::Address { prefix_len }) => {
             format!("address {interface} {address}/{prefix_len}")

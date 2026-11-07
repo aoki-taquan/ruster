@@ -76,6 +76,7 @@ fn iface(name: &str, mac: [u8; 6]) -> Change {
             mac,
             mtu: 1500,
             vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
         },
     )
 }
@@ -712,6 +713,7 @@ fn an_interface_in_another_vrf_uses_that_vrf_s_routes_and_a_lookup_reaches_defau
             mac: LAN_MAC,
             mtu: 1500,
             vrf: "red".into(),
+            vlan: None,
         },
     );
     let code = bench.patch(
