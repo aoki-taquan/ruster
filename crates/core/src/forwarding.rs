@@ -3823,6 +3823,7 @@ where
                                 all_vrfs,
                                 states,
                                 runtime,
+                                trace,
                             ),
                             _ => Err(DropReason::WireguardNoSession),
                         };
