@@ -150,11 +150,13 @@ where
         if signal::stop_requested() {
             daemon::notify("STOPPING=1");
             let until = now.saturating_add(DRAIN_MS);
-            while !waiter.drain(fe.io_mut()) && clock.now_ms() < until && !signal::force_requested()
-            {
+            let mut drained = waiter.drain(fe.io_mut());
+            while !drained && clock.now_ms() < until && !signal::force_requested() {
                 std::thread::sleep(daemon::IDLE_MAX);
+                drained = waiter.drain(fe.io_mut());
             }
-            eprintln!("ruster-fe: stopped ({:?})", fe.counters());
+            let how = if drained { "drained" } else { "not drained" };
+            eprintln!("ruster-fe: stopped, {how} ({:?})", fe.counters());
             return Ok(());
         }
         waiter.set_clock(fe.io_mut(), MonotonicMillis(now));

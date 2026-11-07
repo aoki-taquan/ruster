@@ -126,8 +126,13 @@ impl Backend<XdpPacketIo<'_>> for Waiter {
     }
 
     fn drain(&mut self, io: &mut XdpPacketIo<'_>) -> bool {
-        // An error means the adapter already stopped: nothing more can come back.
-        io.drain(DRAIN_ROUNDS)
-            .map_or(true, |report| report.is_drained())
+        match io.drain(DRAIN_ROUNDS) {
+            Ok(report) => report.is_drained(),
+            Err(error) => {
+                // A completion ring fault: what is still in flight cannot be reaped.
+                eprintln!("ruster-fe: drain fault: {error:?}");
+                true
+            }
+        }
     }
 }
