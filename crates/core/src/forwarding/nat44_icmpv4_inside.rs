@@ -132,7 +132,6 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     ingress: IfId,
     outer: packet::ValidatedIpv4,
     selected_route: Option<Route>,
-    resolution: &mut Option<(&mut ResolutionRuntime<'_>, MonotonicMillis)>,
     nat44_udp_config: Option<&Nat44UdpConfig>,
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp_config: Option<&Nat44TcpConfig>,
@@ -425,7 +424,7 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
         _ => unreachable!("a hairpin error has a sender and an external one a route"),
     };
     let (interface, destination_mac) =
-        resolve_nat44_icmpv4_next_hop(snapshot, egress, target, resolution, trace)?;
+        resolve_nat44_icmpv4_next_hop(snapshot, egress, target, trace)?;
     Ok(build_nat44_icmpv4_rewrite(
         outer,
         quote,

@@ -19,8 +19,7 @@ use ruster_core::{
     Nat44TcpConfig, Nat44TcpCounters, Nat44TcpHashKey, Nat44TcpMappingSlot, Nat44TcpPolicy,
     Nat44TcpRuntime, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44TcpUnsolicitedSynDisposition,
     Nat44UdpConfig, Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime,
-    Neighbor, NoGeneratedIcmpv4Trace, NoTrace, ResolutionActionSlot, ResolutionPolicy,
-    ResolutionRuntime, ResolutionStateSlot, Route, TraceEvent, TraceSink,
+    Neighbor, NoGeneratedIcmpv4Trace, NoTrace, Route, TraceEvent, TraceSink,
     NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS, NAT44_TCP_UNSOLICITED_SYN_HOLD_MS,
 };
 use ruster_io_sim::{RecycleCause, SimIo};
@@ -221,7 +220,6 @@ impl Default for Setup {
 
 struct World {
     snapshot: &'static ForwardingSnapshot<'static>,
-    resolution: ResolutionRuntime<'static>,
     errors: Icmpv4ErrorRuntime<'static>,
     udp_config: Nat44UdpConfig,
     udp: Nat44UdpRuntime<'static>,
@@ -293,11 +291,6 @@ impl World {
             firewall_config,
             leak_slice(FirewallStateSlot::default(), 16),
         );
-        let resolution = ResolutionRuntime::new(
-            ResolutionPolicy::new(1_000, 2_000).unwrap(),
-            leak_slice(ResolutionStateSlot::EMPTY, 4),
-            leak_slice(ResolutionActionSlot::EMPTY, 4),
-        );
         let errors = Icmpv4ErrorRuntime::new(
             Icmpv4ErrorPolicy::default(),
             leak_slice(Icmpv4ErrorStateSlot::EMPTY, 4),
@@ -305,7 +298,6 @@ impl World {
         );
         Self {
             snapshot,
-            resolution,
             errors,
             udp_config,
             udp,
@@ -370,7 +362,6 @@ impl World {
         dispatch_nat44_tcp_unsolicited_syns(
             &mut self.tcp,
             &mut self.errors,
-            &mut self.resolution,
             self.snapshot,
             Some(&self.firewall_config),
             Some(&mut self.firewall),
@@ -1034,7 +1025,6 @@ fn an_unusable_firewall_fails_closed_at_maturity() {
         let report = dispatch_nat44_tcp_unsolicited_syns(
             &mut world.tcp,
             &mut world.errors,
-            &mut world.resolution,
             world.snapshot,
             Some(&other),
             runtime_present.then_some(&mut world.firewall),

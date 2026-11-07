@@ -85,9 +85,8 @@ pub enum Nat44TcpUnsolicitedSynDispatchError {
 
 /// Packet path: offers an unsolicited inbound initial SYN that the TCP NAT
 /// just refused (mapping miss or filtering refusal) to the hold table. The
-/// caller drops the SYN in every case, and calls this only when the worker
-/// has a clock (a resolution runtime): without one `now` would be 0 and the
-/// hold could never be timed.
+/// caller drops the SYN in every case. The hold is timed by the batch's
+/// clock (`ForwardingSnapshot::with_now`).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn hold_unsolicited_syn<T: TraceSink>(
     frame: &[u8],
@@ -248,7 +247,6 @@ fn remote_routes_outside(
 pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
     nat44_tcp: &mut Nat44TcpRuntime<'_>,
     icmpv4_errors: &mut Icmpv4ErrorRuntime<'_>,
-    resolution: &mut ResolutionRuntime<'_>,
     snapshot: &ForwardingSnapshot<'_>,
     firewall_config: Option<&FirewallConfig<'_>>,
     mut firewall: Option<&mut FirewallRuntime<'_>>,
@@ -275,7 +273,6 @@ pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
         }
         Err(_) => return Err(Nat44TcpUnsolicitedSynDispatchError::Inconsistent),
     }
-    let mut resolution = Some((resolution, now));
     for _ in 0..budget {
         let hold = match nat44_tcp.pop_matured_unsolicited_syn(now.0) {
             Ok(Some(hold)) => hold,
@@ -331,7 +328,6 @@ pub fn dispatch_nat44_tcp_unsolicited_syns<T: TraceSink>(
                         hold.quote(),
                         Icmpv4ErrorKind::DestinationUnreachablePort,
                         0,
-                        &mut resolution,
                         icmpv4_errors,
                         now,
                         trace,
