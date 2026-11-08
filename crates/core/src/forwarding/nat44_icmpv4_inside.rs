@@ -44,7 +44,8 @@
 use super::*;
 
 /// Whether an inside-ingress ICMPv4 message is a REQ-5/REQ-7 candidate: a
-/// supported error from the inside interface of a protocol whose policy
+/// supported error from the inside interface (or, from one of the router's own
+/// addresses that route to the inside, the kernel's interface) of a protocol whose policy
 /// translates inside errors, addressed to the public address (hairpin) or
 /// routed toward the outside.
 #[allow(clippy::too_many_arguments)]
@@ -192,8 +193,12 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     if combined_realm_mismatch {
         return nat44_icmpv4_drop(ingress, Nat44CombinedRealmMismatch, trace);
     }
-    // From the inside, or from the router itself about its own translated flow.
-    if !nat_inside(snapshot, ingress, outer.source, owner.inside) {
+    // From the inside, or from the router itself (from one of its own addresses)
+    // about its own translated flow.
+    let kernel = snapshot.is_kernel_ingress(ingress);
+    if !nat_inside(snapshot, ingress, outer.source, owner.inside)
+        || (kernel && !snapshot.is_local_ipv4(outer.source))
+    {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
     }
     // The interface the flow's inside end is on: the inside, or the kernel's.
@@ -207,6 +212,11 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     }
 
     let hairpin = outer.destination == owner.public_address;
+    // The router's own packets are never hairpinned (a router address is no
+    // hairpin sender), so no error of its is about one.
+    if hairpin && kernel {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
+    }
     let egress_route = if hairpin {
         if !owner.hairpinning {
             return nat44_icmpv4_drop(ingress, owner.hairpin_disabled, trace);
@@ -376,7 +386,7 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
             // The hairpin's outbound half as X1 sent it: pre-SNAT, ingress
             // inside, egress outside.
             let sent = FirewallPacket {
-                ingress: inside_end,
+                ingress: owner.inside,
                 egress: owner.outside,
                 source: sender_address.into(),
                 destination: owner.public_address.into(),
