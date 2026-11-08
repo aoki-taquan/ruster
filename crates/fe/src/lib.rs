@@ -793,6 +793,10 @@ where
             // whose numbers may now be another interface's: they are dropped.
             self.fragmentation.flush();
             while self.icmpv4_errors.discard_front() {}
+            // So do the tunnel packets put back together and the neighbors' "used"
+            // marks.
+            self.reassembled.clear();
+            self.used.clear();
             // As for the firewall: a NAT that cannot move stays bound to the old
             // tables, and core drops what it would have translated.
             if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {

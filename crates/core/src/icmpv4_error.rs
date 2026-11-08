@@ -1439,12 +1439,26 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         let Some(slot) = self.actions.get_mut(self.head) else {
             return false;
         };
-        if slot.0.take().is_none() {
+        let Some(queued) = slot.0.take() else {
             return false;
-        }
+        };
         self.head = (self.head + 1) % self.actions.len();
         self.len -= 1;
         self.counters.dequeued += 1;
+        // Its limiter state no longer waits for it: later errors of its kind out of
+        // its egress may be queued again (none was sent, so the interval does not
+        // start).
+        if let Some(state) = self.states[..self.occupied_prefix]
+            .iter_mut()
+            .find(|state| {
+                state.occupied
+                    && state.egress == queued.action.egress
+                    && state.class == queued.action.kind.limiter_class()
+                    && state.generation == queued.generation
+            })
+        {
+            state.action_queued = false;
+        }
         true
     }
 
@@ -2505,6 +2519,32 @@ mod tests {
             runtime.schedule(action(1, 20), MonotonicMillis(100)),
             Icmpv4TimeExceededDisposition::Queued { .. }
         ));
+    }
+
+    /// A discarded error frees its egress for the next one, and the runtime still
+    /// moves to a new publication.
+    #[test]
+    fn a_discarded_error_does_not_keep_its_egress_waiting() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut runtime = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::new(100, 1_000).unwrap(),
+            &mut states,
+            &mut slots,
+        );
+        let time = action_kind(Icmpv4ErrorKind::TimeExceededTtl, 1, 20);
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        assert!(runtime.discard_front());
+        assert!(!runtime.discard_front());
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(1)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        assert!(runtime.discard_front());
+        assert!(runtime.preflight_publication().is_ok());
     }
 
     #[test]
