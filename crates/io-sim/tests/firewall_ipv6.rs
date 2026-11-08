@@ -24,14 +24,22 @@ fn ip(text: &str) -> [u8; 16] {
 }
 
 #[derive(Default)]
-struct Drops(Vec<DropReason>);
+struct Drops(Vec<DropReason>, usize);
 
 impl TraceSink for Drops {
     fn record(&mut self, event: TraceEvent) {
-        if let TraceEvent::Dropped { reason, .. } = event {
-            self.0.push(reason);
+        match event {
+            TraceEvent::Dropped { reason, .. } => self.0.push(reason),
+            TraceEvent::Ipv6NeighborMissing { .. } => self.1 += 1,
+            _ => {}
         }
     }
+}
+
+thread_local! {
+    /// What the router did besides forwarding in this test: ICMPv6 errors queued
+    /// and neighbor resolutions asked for, over all batches.
+    static SIDE_EFFECTS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 fn interfaces() -> [Interface; 2] {
@@ -172,6 +180,8 @@ fn run(
             ..Services::default()
         };
         forward_batch_with_control(batch, &snapshot, &mut queue, services, &mut drops);
+        let (errors, requests) = SIDE_EFFECTS.get();
+        SIDE_EFFECTS.set((errors + queue.errors().len(), requests + drops.1));
         let mut sent = Vec::new();
         while let Some(tx) = io.pop_tx() {
             sent.push(tx.egress);
@@ -305,4 +315,52 @@ fn ipv4_rules_do_not_let_ipv6_through() {
         )]],
     );
     assert_eq!(result[0], (vec![], vec![DropReason::FirewallDefaultDenied]));
+}
+
+#[test]
+fn an_error_to_another_host_than_the_quoted_sender_does_not_pass() {
+    let rules = [rule(1, FirewallProtocol::Tcp, true)];
+    let out = tcp(4000, 80, 0x02);
+    let mut quoted = ipv6_header(HOST, REMOTE, 6, out.len());
+    quoted.extend_from_slice(&out);
+    let mut icmp = vec![1, 0, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&quoted);
+    icmp.extend_from_slice(&[0xab; 64]);
+    // To another LAN host, quoting HOST's flow.
+    let forged = ipv6(true, "2001:db8:99::1", "2001:db8:1::77", 58, &icmp);
+    let result = run(
+        &rules,
+        vec![
+            vec![(LAN, ipv6(false, HOST, REMOTE, 6, &out))],
+            vec![(WAN, forged)],
+        ],
+    );
+    assert_eq!(
+        result[1],
+        (vec![], vec![DropReason::FirewallIcmpv6Unrelated])
+    );
+}
+
+#[test]
+fn a_packet_the_firewall_drops_makes_no_icmpv6_error_and_no_neighbor_request() {
+    let rules = [rule(1, FirewallProtocol::Tcp, true)];
+    let mut expiring = ipv6(true, REMOTE, HOST, 6, &tcp(80, 4000, 0x02));
+    expiring[14 + 7] = 1; // Hop Limit 1: would be a Time Exceeded
+                          // To a LAN address no neighbor entry has: would be a neighbor request.
+    let unknown = ipv6(true, REMOTE, "2001:db8:1::99", 6, &tcp(80, 4000, 0x02));
+    let before = SIDE_EFFECTS.get();
+    let result = run(&rules, vec![vec![(WAN, expiring), (WAN, unknown)]]);
+    let after = SIDE_EFFECTS.get();
+    assert_eq!(
+        result[0],
+        (
+            vec![],
+            vec![
+                DropReason::FirewallDefaultDenied,
+                DropReason::FirewallDefaultDenied
+            ]
+        )
+    );
+    assert_eq!(after.0 - before.0, 0, "no ICMPv6 error");
+    assert_eq!(after.1 - before.1, 0, "no neighbor request");
 }

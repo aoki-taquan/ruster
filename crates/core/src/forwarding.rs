@@ -1749,8 +1749,8 @@ impl<'a> ForwardingSnapshot<'a> {
     /// into it ([`DropReason::Ipv6ForwardingBlocked`]); Neighbor Discovery and traffic
     /// to the router still go on. With [`ForwardingSnapshot::with_vrfs`], it is
     /// the outer snapshot's that counts: a packet entering or leaving through one of
-    /// its VRF's interfaces is dropped. For a VRF with a firewall, which has no IPv6
-    /// rules yet: IPv6 is then not forwarded rather than forwarded unchecked.
+    /// its VRF's interfaces is dropped. It counts only when no firewall configuration
+    /// is given for the batch: with one, IPv6 goes through the firewall's rules.
     #[must_use]
     pub fn with_ipv6_forwarding_blocked(self, on: bool) -> Self {
         Self {

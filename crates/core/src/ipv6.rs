@@ -406,13 +406,24 @@ fn address(frame: &[u8], at: usize) -> [u8; 16] {
 
 /// Decides one IPv6 frame and, for [`Outcome::Transmit`], rewrites it: Ethernet
 /// addresses for the next hop and the Hop Limit.
-pub(crate) fn decide<T: TraceSink>(
+///
+/// `admit` is the forward firewall: it sees a packet to be forwarded right after its
+/// route is found, before anything else is decided for it, so that a packet it drops
+/// makes no ICMPv6 error and no neighbor resolution. With `silent_route_miss`, a
+/// packet with no route is dropped without an error (the firewall guards it, and
+/// cannot say whether it would have let it through).
+pub(crate) fn decide<T: TraceSink, A>(
     frame: &mut [u8],
     snapshot: &crate::ForwardingSnapshot<'_>,
     fib: &Ipv6Fib,
     ingress: IfId,
+    admit: &mut A,
+    silent_route_miss: bool,
     trace: &mut T,
-) -> Outcome {
+) -> Outcome
+where
+    A: FnMut(&[u8], IfId) -> Result<(), crate::DropReason>,
+{
     use crate::DropReason::*;
     let ip = ETHERNET_HEADER;
     if frame.len() < ip + IPV6_HEADER {
@@ -465,17 +476,23 @@ pub(crate) fn decide<T: TraceSink>(
     if is_link_local(source) || is_unspecified_or_loopback(source) {
         return Outcome::Drop(Ipv6SourceInvalid);
     }
-    // The router's own packets are not forwarded: their Hop Limit stays.
-    let hop = u8::from(!snapshot.is_kernel_ingress(ingress));
-    if hop_limit <= hop {
-        return Outcome::Error(Ipv6HopLimitExpired, TIME_EXCEEDED, 0, 0);
-    }
     let Some(route) = fib.route(destination) else {
+        if silent_route_miss {
+            return Outcome::Drop(FirewallDefaultDenied);
+        }
         return Outcome::Error(RouteMiss, DESTINATION_UNREACHABLE, 0, 0);
     };
     let Some(egress) = snapshot.interface(route.egress) else {
         return Outcome::Drop(InterfaceMiss);
     };
+    if let Err(reason) = admit(frame, egress.id) {
+        return Outcome::Drop(reason);
+    }
+    // The router's own packets are not forwarded: their Hop Limit stays.
+    let hop = u8::from(!snapshot.is_kernel_ingress(ingress));
+    if hop_limit <= hop {
+        return Outcome::Error(Ipv6HopLimitExpired, TIME_EXCEEDED, 0, 0);
+    }
     if IPV6_HEADER + payload_len > usize::from(egress.mtu) {
         return Outcome::Error(Ipv6PacketTooBig, PACKET_TOO_BIG, 0, u32::from(egress.mtu));
     }
@@ -524,34 +541,50 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
     trace: &mut T,
 ) -> Completed {
     let ingress = packet.ingress();
-    let mut outcome = decide(packet.bytes_mut(), snapshot, fib, ingress, trace);
-    if let Outcome::Transmit(egress) = outcome {
-        if guarded(egress) {
-            let verdict = match firewall.config {
-                Some(config) => crate::forwarding::require_firewall_runtime(
-                    firewall.outer,
-                    config,
-                    firewall.runtime,
-                )
+    // Decided in another VRF: the firewall's rules are the default VRF's, so such a
+    // packet does not go through them (as for IPv4).
+    let foreign = snapshot.authority() != firewall.outer.authority();
+    let FirewallService {
+        outer,
+        config,
+        runtime,
+        audit,
+        blocked,
+    } = firewall;
+    let mut admit = |frame: &[u8], egress: IfId| -> Result<(), crate::DropReason> {
+        if !guarded(egress) {
+            return Ok(());
+        }
+        match config {
+            // Into the default VRF's interfaces from another VRF while the default
+            // VRF has a firewall: dropped rather than let past it.
+            Some(_) if foreign => Err(crate::DropReason::VrfLeakIntoServices),
+            Some(config) => crate::forwarding::require_firewall_runtime(outer, config, runtime)
                 .and_then(|runtime| {
                     crate::firewall6::check(
-                        packet.bytes_mut(),
+                        frame,
                         ingress,
                         egress,
                         config,
                         runtime,
-                        firewall.audit,
-                        firewall.outer.now.0,
+                        audit,
+                        outer.now.0,
                     )
                 }),
-                None if firewall.blocked => Err(crate::DropReason::Ipv6ForwardingBlocked),
-                None => Ok(()),
-            };
-            if let Err(reason) = verdict {
-                outcome = Outcome::Drop(reason);
-            }
+            None if blocked => Err(crate::DropReason::Ipv6ForwardingBlocked),
+            None => Ok(()),
         }
-    }
+    };
+    let silent_route_miss = config.is_some() && !foreign;
+    let outcome = decide(
+        packet.bytes_mut(),
+        snapshot,
+        fib,
+        ingress,
+        &mut admit,
+        silent_route_miss,
+        trace,
+    );
     match outcome {
         Outcome::Transmit(egress) => match crate::pppoe::of(snapshot.pppoe, egress)
             .map_or(Ok(egress), |session| {

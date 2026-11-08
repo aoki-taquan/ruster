@@ -19,7 +19,10 @@
 //! - A fragment that is not the first is dropped (IPv4 tracks them; IPv6 does not
 //!   yet). At most eight extension headers are stepped over; AH, ESP and "No Next
 //!   Header" are not looked into and are dropped.
-//! - TCP and UDP checksums are not checked here (the destination does).
+//! - TCP and UDP checksums, port 0 and a TCP data offset past the payload are not
+//!   checked here (the destination does).
+//! - With the firewall on, a packet from the default VRF with no route is dropped
+//!   without a Destination Unreachable (IPv4 asks the rules whether it would pass).
 //! - ICMPv6 other than Echo and the four errors is dropped (ND is not forwarded).
 
 use crate::firewall::{FirewallAddress, FirewallPacket, FIREWALL_ICMP_REPLY};
@@ -72,7 +75,8 @@ fn walk(frame: &[u8], ip: usize, end: usize) -> Result<Upper, DropReason> {
         .ok_or(DropReason::FirewallUnsupportedProtocol)?;
     let mut next = header[6];
     let mut offset = ip + IPV6_HEADER;
-    for _ in 0..MAX_EXTENSION_HEADERS {
+    // Up to MAX_EXTENSION_HEADERS headers, then the upper-layer one.
+    for _ in 0..=MAX_EXTENSION_HEADERS {
         match next {
             HOP_BY_HOP | ROUTING | DESTINATION_OPTIONS => {
                 let ext = frame
@@ -175,7 +179,8 @@ fn transport(
 
 /// Lets the forwarded IPv6 packet in `frame` (an Ethernet frame) from `ingress` to
 /// `egress` through the firewall, or says why not. A new flow is written to the
-/// state table at once (the IPv6 path has no later stage that could refuse it).
+/// state table at once; if a later stage (PPPoE, VLAN) cannot send the packet, the
+/// flow stays, as for IPv4.
 pub(crate) fn check(
     frame: &[u8],
     ingress: IfId,
@@ -255,10 +260,16 @@ fn related(
             _ => return Err(unrelated),
         },
     };
+    // An error goes to the sender of the packet it quotes (RFC 4443 2.4): one to any
+    // other host is not about that flow, whatever it quotes.
+    let quoted_source = address(frame, quoted + 8);
+    if quoted_source != address(frame, ETHERNET + 24) {
+        return Err(unrelated);
+    }
     let packet = FirewallPacket {
         ingress: egress,
         egress: ingress,
-        source: address(frame, quoted + 8),
+        source: quoted_source,
         destination: address(frame, quoted + 24),
         protocol,
         source_port,
