@@ -715,7 +715,9 @@ fn build_error(
     } else {
         let route = fib.route(source)?;
         let egress = snapshot.interface(route.egress)?;
-        let mac = fib.neighbor(egress.id, route.next_hop.unwrap_or(source))?;
+        let mac = fib
+            .neighbor(egress.id, route.next_hop.unwrap_or(source))
+            .or(crate::pppoe::of(snapshot.pppoe, egress.id).map(|_| MacAddress([0; 6])))?;
         // An address of the router: on the egress interface if it has a global one.
         let from = fib
             .local

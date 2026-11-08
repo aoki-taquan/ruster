@@ -229,8 +229,11 @@ impl<S: PacketSlot> PacketSlot for Slot<'_, S> {
 /// The ports' generated frames, with the kernel interfaces' caught for their pipes.
 pub(crate) struct WithKernel<'a, I> {
     pub(crate) io: &'a mut I,
-    pub(crate) kernel: &'a [IfId],
-    /// Caught frames, with the kernel interface they are for.
+    /// The backend's ports are the interfaces below this; the others (the kernel's,
+    /// VLAN sub-interfaces, PPPoE sessions, tunnels) are caught, for the FE to
+    /// send in its own way.
+    pub(crate) ports: usize,
+    /// Caught frames, with the interface they are for.
     pub(crate) caught: &'a mut Vec<(IfId, Vec<u8>)>,
 }
 
@@ -261,7 +264,7 @@ impl<I: GeneratedPacketIo> GeneratedPacketIo for WithKernel<'_, I> {
         Self: 'a;
 
     fn begin_generated(&mut self, egress: IfId) -> Self::Batch<'_> {
-        if self.kernel.contains(&egress) {
+        if usize::from(egress.0) >= self.ports {
             Batch::Kernel {
                 egress,
                 caught: self.caught,

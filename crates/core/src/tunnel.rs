@@ -20,8 +20,9 @@
 //!
 //! - The outer packet is never fragmented (RFC 6333 5.3 allows the B4 to): a
 //!   tunnel's MTU is at most the underlying link's less 40, and an inner datagram
-//!   longer than it is handled by the IPv4 MTU rule on the tunnel interface. A DF
-//!   clear datagram that would need fragmenting into the tunnel is dropped.
+//!   longer than it is handled by the IPv4 MTU rule on the tunnel interface: with
+//!   DF clear it is fragmented first and each fragment goes in its own IPv6 packet
+//!   (RFC 2473 7.2 lets the inner packet be fragmented).
 //! - No tunnel encapsulation limit option (RFC 2473 4.1.1) and no ICMPv6 errors
 //!   from the tunnel path are relayed as ICMPv4 errors (RFC 2473 8).
 //! - The outer packets are always routed in the default VRF.
@@ -204,4 +205,52 @@ pub(crate) fn transmit<S: PacketSlot, T: TraceSink>(
     bytes[ip + 8..ip + 24].copy_from_slice(&tunnel.local);
     bytes[ip + 24..ip + 40].copy_from_slice(&tunnel.remote);
     Ok(egress)
+}
+
+/// The generated IPv4 `frame` (Ethernet) for the tunnel interface `egress`, inside
+/// the tunnel's IPv6 as [`transmit`] puts a forwarded one: the interface to send it
+/// out of and the frame. `None` when `egress` is no tunnel's. Cold path.
+pub(crate) fn wrap(
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    egress: IfId,
+    frame: &[u8],
+) -> Option<Result<(IfId, Vec<u8>), crate::TunnelOriginError>> {
+    use crate::TunnelOriginError::{Dropped, TooBig};
+    let tunnel = of(snapshot.tunnels, egress)?;
+    Some((|| {
+        if frame.get(12..14) != Some(&IPV4_ETHERTYPE[..]) {
+            return Err(Dropped(DropReason::Ipv4HeaderTruncated));
+        }
+        let inner = &frame[ETHERNET..];
+        let fib = snapshot.ipv6.ok_or(Dropped(DropReason::TunnelNoRoute))?;
+        let (out, next_hop) = fib
+            .next_hop(tunnel.remote)
+            .ok_or(Dropped(DropReason::TunnelNoRoute))?;
+        let interface = snapshot
+            .interface(out)
+            .ok_or(Dropped(DropReason::InterfaceMiss))?;
+        let session = crate::pppoe::of(snapshot.pppoe, out).is_some();
+        let mac = fib
+            .neighbor(out, next_hop)
+            .or(session.then_some(crate::MacAddress([0; 6])))
+            .ok_or(Dropped(DropReason::NeighborUnresolved))?;
+        if IPV6_HEADER + inner.len() > usize::from(interface.mtu) {
+            return Err(TooBig {
+                mtu: interface.mtu.saturating_sub(IPV6_HEADER as u16),
+            });
+        }
+        let payload = u16::try_from(inner.len()).map_err(|_| TooBig { mtu: u16::MAX })?;
+        let tos = inner.get(1).copied().unwrap_or(0);
+        let mut out_frame = Vec::with_capacity(ETHERNET + IPV6_HEADER + inner.len());
+        out_frame.extend_from_slice(&mac.0);
+        out_frame.extend_from_slice(&interface.mac.0);
+        out_frame.extend_from_slice(&IPV6_ETHERTYPE);
+        out_frame.extend_from_slice(&[0x60 | (tos >> 4), tos << 4, 0, 0]);
+        out_frame.extend_from_slice(&payload.to_be_bytes());
+        out_frame.extend_from_slice(&[IPV4_IN_IP, HOP_LIMIT]);
+        out_frame.extend_from_slice(&tunnel.local);
+        out_frame.extend_from_slice(&tunnel.remote);
+        out_frame.extend_from_slice(inner);
+        Ok((out, out_frame))
+    })())
 }

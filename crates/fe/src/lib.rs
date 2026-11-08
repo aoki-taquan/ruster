@@ -379,12 +379,14 @@ where
         }
 
         // Until one cannot be built or allocated (it stays queued for the next batch).
-        // Errors about the kernel's packets are for its pipe.
+        // Those for an interface that is not a port (the kernel's, a VLAN
+        // sub-interface, a PPPoE session, a tunnel) are caught and sent after.
+        let ports = self.builder.ports.len();
         let mut caught = Vec::new();
         while let Ok(Some(report)) = execute_one_icmpv4_error(
             &mut kernel::WithKernel {
                 io: &mut self.io,
-                kernel: &self.kernel,
+                ports,
                 caught: &mut caught,
             },
             &mut self.icmpv4_errors,
@@ -415,18 +417,24 @@ where
                 self.counters.wireguard_send_dropped += 1;
             }
         }
-        for (egress, frame) in caught {
-            self.write_kernel(egress, &frame);
-        }
         let mut budget = fragments::FRAMES_PER_BATCH;
-        while let Some(report) =
-            execute_one_ipv4_fragmentation(&mut self.io, &mut self.fragmentation, &mut budget)
-        {
+        while let Some(report) = execute_one_ipv4_fragmentation(
+            &mut kernel::WithKernel {
+                io: &mut self.io,
+                ports,
+                caught: &mut caught,
+            },
+            &mut self.fragmentation,
+            &mut budget,
+        ) {
             if matches!(report.outcome, ruster_core::Ipv4FragmentOutcome::Sent) {
                 self.counters.fragments_sent += u64::from(report.fragments);
             } else {
                 self.counters.fragmentation_dropped += 1;
             }
+        }
+        for (egress, frame) in caught {
+            self.send_generated(egress, &frame);
         }
         for arp in &trace.arp {
             self.punt_arp(arp);
@@ -662,8 +670,18 @@ where
         if self.kernel.contains(&egress) {
             return self.write_kernel(egress, frame);
         }
-        // Into a PPPoE session, then out of its parent.
-        let outer = self.vrfs[0].owner.snapshot().with_pppoe(&self.pppoe);
+        // Into a tunnel or a PPPoE session, then out of the interface below it.
+        let outer = self.vrfs[0]
+            .owner
+            .snapshot()
+            .with_ipv6(&self.vrfs[0].ipv6)
+            .with_tunnels(&self.tunnels)
+            .with_pppoe(&self.pppoe);
+        match outer.tunnel_frame(egress, frame) {
+            Some(Ok((below, wrapped))) => return self.send_generated(below, &wrapped),
+            Some(Err(_)) => return false,
+            None => {}
+        }
         match outer.pppoe_frame(egress, frame) {
             Some(Ok((parent, wrapped))) => return self.send_generated(parent, &wrapped),
             Some(Err(_)) => return false,
