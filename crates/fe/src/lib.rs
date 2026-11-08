@@ -357,7 +357,9 @@ where
         self.counters.arp_to_control_dropped += trace.overflow;
         self.counters.from_kernel_dropped += from_kernel.dropped;
         for (egress, frame) in from_kernel.to_kernel {
-            if self.write_kernel(egress, &frame) {
+            let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
+            let admitted = self.limiter.take(local::class(packet), now_ms);
+            if admitted && self.write_kernel(egress, &frame) {
                 self.counters.to_kernel += 1;
             } else {
                 self.counters.to_kernel_dropped += 1;

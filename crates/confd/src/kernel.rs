@@ -80,7 +80,12 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
         let nat_source = (*vrf == DEFAULT_VRF)
             .then_some(config.nat.as_ref())
             .flatten()
-            .and_then(|nat| config.interfaces.iter().find(|i| i.name == nat.inside))
+            .and_then(|nat| {
+                config
+                    .interfaces
+                    .iter()
+                    .find(|i| i.name == nat.inside && i.enabled)
+            })
             .and_then(|inside| inside.ipv4)
             .map(|(address, _)| address.to_string());
         for family in ["-4", "-6"] {

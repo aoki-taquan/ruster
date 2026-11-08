@@ -461,7 +461,7 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
     // out of the kernel's interface, as to a host behind the inside interface.
     let kernel = snapshot
         .is_local_ipv4(internal_address)
-        .then(|| snapshot.kernel_ingress.first().copied())
+        .then(|| snapshot.kernel_interface_of(snapshot))
         .flatten();
     let egress = kernel.unwrap_or(reverse_route.egress());
     if let Some(firewall_config) = firewall_config {
@@ -490,9 +490,16 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
             now.0,
         )?);
     }
-    if ipv4.ttl <= 1 {
+    // A packet for the router is not forwarded: its TTL is neither checked nor
+    // decreased (RFC 1812 section 5.3.1).
+    if kernel.is_none() && ipv4.ttl <= 1 {
         return nat44_icmp_drop(ingress, Ipv4TtlExpired, trace);
     }
+    let new_ttl = if kernel.is_some() {
+        ipv4.ttl
+    } else {
+        ipv4.ttl - 1
+    };
     let target = reverse_route.next_hop().unwrap_or(internal_address);
     let (interface, destination_mac) = match kernel {
         Some(kernel) => {
@@ -513,7 +520,7 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
         checksum_offset,
         checksum_end: checksum_offset + 2,
         old_ttl_protocol: u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
-        new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
+        new_ttl_protocol: u16::from_be_bytes([new_ttl, ipv4.protocol]),
         old_checksum: ipv4.checksum,
     };
     Ok(build_nat44_icmp_rewrite(
