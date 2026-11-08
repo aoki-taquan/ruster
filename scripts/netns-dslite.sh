@@ -142,4 +142,41 @@ print(s.recv(100).decode())
 [[ "$seen" == 192.168.0.10 ]] || fail "the IPv4 host saw $seen"
 echo "ok: TCP through the softwire arrives from the LAN host"
 
+# An AFTR may fragment the IPv6 packet a big datagram goes in (Linux's ip6tnl does
+# not, so the fragments are sent by hand); the router puts it back together
+# (RFC 6333 5.3).
+nsx "$lan" python3 -c '
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(("192.168.0.10", 9999)); s.settimeout(5)
+data, peer = s.recvfrom(4000); print(len(data))
+' >"$work/big.out" 2>"$work/big.log" &
+receiver=$!
+sleep 0.5
+nsx "$aftr" python3 -c '
+import socket, struct
+def checksum(b):
+    s = sum(struct.unpack("!%dH" % (len(b) // 2), b))
+    while s >> 16: s = (s & 0xffff) + (s >> 16)
+    return ~s & 0xffff
+payload = b"x" * 1450
+udp = struct.pack("!HHHH", 5000, 9999, 8 + len(payload), 0) + payload
+ip = bytearray(struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 1, 0, 63, 17, 0,
+    socket.inet_aton("198.51.100.10"), socket.inet_aton("192.168.0.10")))
+ip[10:12] = struct.pack("!H", checksum(bytes(ip)))
+inner = bytes(ip) + udp
+src = socket.inet_pton(socket.AF_INET6, "2001:db8:ff::1")
+dst = socket.inet_pton(socket.AF_INET6, "2001:db8:1::2")
+mac = bytes.fromhex(open("/sys/class/net/a0/address").read().strip().replace(":", ""))
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind(("a0", 0))
+for offset, more, part in ((0, 1, inner[:1000]), (1000, 0, inner[1000:])):
+    frag = struct.pack("!BBHI", 4, 0, (offset // 8) << 3 | more, 0x5eed)
+    ip6 = struct.pack("!IHBB", 0x60000000, 8 + len(part), 44, 64) + src + dst
+    s.send(bytes.fromhex("020000000002") + mac + b"\x86\xdd" + ip6 + frag + part)
+'
+wait "$receiver" || fail "the big datagram did not arrive: $(cat "$work/big.log")"
+[[ "$(cat "$work/big.out")" == 1450 ]] || fail "the LAN host got $(cat "$work/big.out") bytes"
+echo "ok: a datagram the AFTR sent in IPv6 fragments arrives whole"
+
 echo "PASS ($backend)"

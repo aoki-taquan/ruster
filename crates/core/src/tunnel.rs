@@ -19,6 +19,10 @@
 //!   the IPv6 path to the remote end carries (the egress interface's MTU, less
 //!   PPPoE's header for a session) less the 40-byte IPv6 header. Fragmentation
 //!   Needed reports that.
+//! - RFC 6333 section 5.3 and RFC 2473 section 7.2: a fragment of a tunnel's
+//!   packet (a Fragment header with IPv4 next) is passed up through the control
+//!   queue, and the FE puts the packet back together before it is unwrapped
+//!   (`ruster-fe`'s `reassembly`).
 //!
 //! Deviations:
 //!
@@ -45,6 +49,7 @@ const IPV4_ETHERTYPE: [u8; 2] = [0x08, 0x00];
 const IPV4_IN_IP: u8 = 4;
 const HOP_BY_HOP: u8 = 0;
 const DESTINATION_OPTIONS: u8 = 60;
+const FRAGMENT: u8 = 44;
 /// Option headers stepped over before the inner packet, at most.
 const MAX_OPTION_HEADERS: usize = 2;
 /// Hop Limit of the outer header.
@@ -76,19 +81,19 @@ pub(crate) fn of(tunnels: &[Ipv4InIpv6Tunnel], egress: IfId) -> Option<&Ipv4InIp
 pub(crate) fn receive<S: PacketSlot>(
     packet: &mut PacketLease<S>,
     snapshot: &crate::ForwardingSnapshot<'_>,
-) -> Result<bool, DropReason> {
+) -> Result<Received, DropReason> {
     let tunnels = snapshot.tunnels;
     if tunnels.is_empty() {
-        return Ok(false);
+        return Ok(Received::NotTunnel);
     }
     let ingress = packet.ingress();
     let bytes = packet.bytes_mut();
     if bytes.len() < ETHERNET + IPV6_HEADER || bytes[12..14] != IPV6_ETHERTYPE {
-        return Ok(false);
+        return Ok(Received::NotTunnel);
     }
     let ip = ETHERNET;
     if bytes[ip] >> 4 != 6 {
-        return Ok(false);
+        return Ok(Received::NotTunnel);
     }
     // Hop-by-Hop and Destination Options headers (such as RFC 2473's Tunnel
     // Encapsulation Limit) may come before the inner packet; they are stepped over.
@@ -99,13 +104,18 @@ pub(crate) fn receive<S: PacketSlot>(
             break;
         }
         let Some(&[following, length]) = bytes.get(ip + header..ip + header + 2) else {
-            return Ok(false);
+            return Ok(Received::NotTunnel);
         };
         next = following;
         header += (usize::from(length) + 1) * 8;
     }
-    if next != IPV4_IN_IP {
-        return Ok(false);
+    // A fragment of the tunnel's packet (its Fragment header carries IPv4 next):
+    // the FE puts it back together (RFC 2473 7.2) and passes it in again.
+    let fragment = next == FRAGMENT
+        && bytes.get(ip + header) == Some(&IPV4_IN_IP)
+        && bytes.len() >= ip + header + 8;
+    if next != IPV4_IN_IP && !fragment {
+        return Ok(Received::NotTunnel);
     }
     let source = &bytes[ip + 8..ip + 24];
     let destination = &bytes[ip + 24..ip + 40];
@@ -113,7 +123,7 @@ pub(crate) fn receive<S: PacketSlot>(
         .iter()
         .find(|t| t.remote == source && t.local == destination)
     else {
-        return Ok(false);
+        return Ok(Received::NotTunnel);
     };
     let tunnel = *tunnel;
     // Only from where the tunnel's remote end is: the interface the default VRF
@@ -137,6 +147,9 @@ pub(crate) fn receive<S: PacketSlot>(
     if ip + IPV6_HEADER + payload > bytes.len() {
         return Err(DropReason::Ipv6PayloadLengthExceedsPacket);
     }
+    if fragment {
+        return Ok(Received::Fragment);
+    }
     if payload <= header - IPV6_HEADER || bytes[ip + header] >> 4 != 4 {
         return Err(DropReason::TunnelInnerInvalid);
     }
@@ -153,7 +166,19 @@ pub(crate) fn receive<S: PacketSlot>(
         return Err(DropReason::TunnelNoRoom);
     }
     packet.set_ingress(tunnel.interface);
-    Ok(true)
+    Ok(Received::Unwrapped)
+}
+
+/// What [`receive`] did with a packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Received {
+    /// Not a tunnel's packet: left as it was.
+    NotTunnel,
+    /// Unwrapped: the inner IPv4 packet arrives on the tunnel interface.
+    Unwrapped,
+    /// A fragment of a tunnel's packet, left as it was, for the FE to put back
+    /// together.
+    Fragment,
 }
 
 /// Wraps the forwarded IPv4 `packet` (already rewritten for `tunnel`'s interface)

@@ -2721,3 +2721,98 @@ fn a_tunnel_s_mtu_is_what_the_link_below_carries() {
     );
     assert!(bench.fe.io_mut().pop_tx().is_none());
 }
+
+/// The AFTR fragmented a tunnel's IPv6 packet: the FE puts it back together and
+/// the IPv4 packet inside reaches the LAN host (RFC 6333 5.3, RFC 2473 7.2).
+#[test]
+fn a_tunnel_s_fragmented_packet_is_put_back_together() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let tunnel = Change::set(
+        Key::Interface {
+            name: "dslite".into(),
+        },
+        Value::Interface {
+            enabled: true,
+            mac: [2, 0, 0, 0, 0, 9],
+            mtu: 1460,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
+            tunnel: Some(ruster_proto::table::Tunnel {
+                local: "2001:db8:1::1".parse().unwrap(),
+                remote: "2001:db8:ff::1".parse().unwrap(),
+            }),
+            pppoe: None,
+        },
+    );
+    assert_eq!(bench.patch(&mut config, &[tunnel]), Code::CHANGED);
+    let gateway = Change::set(
+        Key::Neighbor {
+            interface: "wan".into(),
+            address: ip6("fe80::1"),
+        },
+        Value::Neighbor { mac: GATEWAY_MAC },
+    );
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[gateway, neighbor("lan", [192, 0, 2, 10], HOST_MAC)]
+        ),
+        Code::CHANGED
+    );
+
+    let mut inner = udp_packet(INTERNET, [192, 0, 2, 10], (53, 5_000));
+    inner.resize(1000, 7);
+    inner[2..4].copy_from_slice(&1000_u16.to_be_bytes());
+    inner[24..26].copy_from_slice(&980_u16.to_be_bytes());
+    let inner = ipv4_checksummed(inner);
+    let piece = |offset: usize, more: bool, data: &[u8]| {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&WAN_MAC);
+        frame.extend_from_slice(&GATEWAY_MAC);
+        frame.extend_from_slice(&[0x86, 0xdd]);
+        frame.extend_from_slice(&[0x60, 0, 0, 0]);
+        frame.extend_from_slice(&((8 + data.len()) as u16).to_be_bytes());
+        frame.extend_from_slice(&[44, 64]);
+        frame.extend_from_slice(
+            &"2001:db8:ff::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        frame.extend_from_slice(
+            &"2001:db8:1::1"
+                .parse::<std::net::Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
+        let field = ((offset / 8) as u16) << 3 | u16::from(more);
+        frame.extend_from_slice(&[4, 0]);
+        frame.extend_from_slice(&field.to_be_bytes());
+        frame.extend_from_slice(&0x1234_5678_u32.to_be_bytes());
+        frame.extend_from_slice(data);
+        frame
+    };
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(1), piece(0, true, &inner[..512]));
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(1), piece(512, false, &inner[512..]));
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "the fragments are held"
+    );
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("the inner packet");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!(&tx.bytes[12..14], &[0x08, 0x00]);
+    assert_eq!(tx.bytes.len(), 14 + 1000);
+    assert_eq!(&tx.bytes[14 + 20..], &inner[20..], "the payload as sent");
+    assert_eq!(tx.bytes[14 + 8], 63, "forwarded once");
+}

@@ -3424,12 +3424,29 @@ where
         // session's interface; a tunnel's IPv6 packet, unwrapped, on its tunnel
         // interface.
         // WireGuard's data messages come out of their UDP packets the same way.
-        if let Err(reason) = crate::pppoe::receive(&mut packet, all_vrfs)
-            .and_then(|()| crate::tunnel::receive(&mut packet, all_vrfs).map(|_| ()))
-            .and_then(|()| {
+        let received = crate::pppoe::receive(&mut packet, all_vrfs)
+            .and_then(|()| crate::tunnel::receive(&mut packet, all_vrfs))
+            .and_then(|received| {
                 crate::wireguard::receive(&mut packet, all_vrfs, wireguard.as_deref_mut())
-            })
-        {
+                    .map(|()| received)
+            });
+        let reason = match received {
+            Ok(crate::tunnel::Received::Fragment) => {
+                let ingress = packet.ingress();
+                let queued = control
+                    .as_deref_mut()
+                    .is_some_and(|queue| queue.push_tunnel_fragment(ingress, packet.bytes_mut()));
+                if queued {
+                    packet.consume(crate::ConsumeReason::TunnelFragmentToControl);
+                    consumed += 1;
+                    continue;
+                }
+                Some(DropReason::Ipv6ControlQueueFull)
+            }
+            Ok(_) => None,
+            Err(reason) => Some(reason),
+        };
+        if let Some(reason) = reason {
             let ingress = packet.ingress();
             packet.recycle(reason);
             dropped += 1;
