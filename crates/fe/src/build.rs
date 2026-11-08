@@ -747,8 +747,8 @@ fn firewall_rule(
         FirewallRuleId(id),
         ingress,
         egress,
-        prefix(rule.source)?,
-        prefix(rule.destination)?,
+        prefix(rule.source)?.into(),
+        prefix(rule.destination)?.into(),
         match rule.protocol {
             table::Protocol::Tcp => FirewallProtocol::Tcp,
             table::Protocol::Udp => FirewallProtocol::Udp,
