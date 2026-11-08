@@ -68,6 +68,10 @@ pub enum Key {
     FirewallPolicy {
         vrf: String,
     },
+    /// The rate limits of the ICMP errors the FE generates (one, `default`).
+    IcmpErrors {
+        vrf: String,
+    },
     /// One forward firewall rule of a VRF; lower ids are matched first.
     FirewallRule {
         vrf: String,
@@ -116,6 +120,13 @@ pub enum Value {
     Nat(Nat),
     /// Which outside endpoints may reach an inside endpoint with a flow out, where
     /// no rule decides. Left out of the message when it is the default.
+    /// ICMPv4 errors at most one per `ipv4_interval_ms` per egress and kind; ICMPv6
+    /// errors `ipv6_burst` at once and one more every `ipv6_interval_ms`.
+    IcmpErrors {
+        ipv4_interval_ms: u32,
+        ipv6_burst: u32,
+        ipv6_interval_ms: u32,
+    },
     FirewallPolicy {
         filtering: NatFiltering,
         /// The interfaces outside the network the firewall guards (RFC 6092's
@@ -321,6 +332,7 @@ impl Key {
             Self::Neighbor { .. } => sid::NEIGHBOR,
             Self::Nat { .. } => sid::NAT,
             Self::FirewallPolicy { .. } => sid::FIREWALL_POLICY,
+            Self::IcmpErrors { .. } => sid::ICMP_ERRORS,
             Self::FirewallRule { .. } => sid::FIREWALL_RULE,
             Self::Wireguard { .. } => sid::WIREGUARD,
             Self::WireguardPeer { .. } => sid::WIREGUARD_PEER,
@@ -389,9 +401,10 @@ impl Change {
         };
         match &self.key {
             Key::Interface { name: n } => name(n)?,
-            Key::Nat { vrf } | Key::FirewallPolicy { vrf } | Key::FirewallRule { vrf, .. } => {
-                name(vrf)?
-            }
+            Key::Nat { vrf }
+            | Key::FirewallPolicy { vrf }
+            | Key::IcmpErrors { vrf }
+            | Key::FirewallRule { vrf, .. } => name(vrf)?,
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
             Key::Wireguard { interface } => name(interface)?,
             Key::WireguardPeer { interface, peer } | Key::WireguardSession { interface, peer } => {
@@ -414,6 +427,7 @@ impl Change {
                         | (Key::Neighbor { .. }, Value::Neighbor { .. })
                         | (Key::Nat { .. }, Value::Nat(_))
                         | (Key::FirewallPolicy { .. }, Value::FirewallPolicy { .. })
+                        | (Key::IcmpErrors { .. }, Value::IcmpErrors { .. })
                         | (Key::FirewallRule { .. }, Value::FirewallRule(_))
                         | (Key::Wireguard { .. }, Value::Wireguard(_))
                         | (Key::WireguardPeer { .. }, Value::WireguardPeer(_))
@@ -630,6 +644,9 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::FirewallPolicy { vrf } => {
             e.array(2).u64(sid::FIREWALL_POLICY).text(vrf);
         }
+        Key::IcmpErrors { vrf } => {
+            e.array(2).u64(sid::ICMP_ERRORS).text(vrf);
+        }
         Key::Wireguard { interface } => {
             e.array(2).u64(sid::WIREGUARD).text(interface);
         }
@@ -658,7 +675,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     let len = d.array()?;
     let table = d.u64()?;
     let expected = match table {
-        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::WIREGUARD => 2,
+        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::WIREGUARD => 2,
         sid::ADDRESS
         | sid::ROUTE
         | sid::NEIGHBOR
@@ -678,6 +695,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::INTERFACE => Key::Interface { name: first },
         sid::NAT => Key::Nat { vrf: first },
         sid::FIREWALL_POLICY => Key::FirewallPolicy { vrf: first },
+        sid::ICMP_ERRORS => Key::IcmpErrors { vrf: first },
         sid::WIREGUARD => Key::Wireguard { interface: first },
         sid::WIREGUARD_PEER | sid::WIREGUARD_SESSION => {
             let peer = d.text()?.to_owned();
@@ -836,6 +854,20 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::WIREGUARD_SESSION_LOCAL_INDEX - sid::WIREGUARD_SESSION)
                 .u64(u64::from(session.local_index));
         }
+        Value::IcmpErrors {
+            ipv4_interval_ms,
+            ipv6_burst,
+            ipv6_interval_ms,
+        } => {
+            let d = |member: u64| member - sid::ICMP_ERRORS;
+            e.map(3)
+                .u64(d(sid::ICMP_ERRORS_IPV4_INTERVAL))
+                .u64(u64::from(*ipv4_interval_ms))
+                .u64(d(sid::ICMP_ERRORS_IPV6_BURST))
+                .u64(u64::from(*ipv6_burst))
+                .u64(d(sid::ICMP_ERRORS_IPV6_INTERVAL))
+                .u64(u64::from(*ipv6_interval_ms));
+        }
         Value::FirewallPolicy { filtering, outside } => {
             let default = *filtering == NatFiltering::default();
             e.map(u64::from(!default) + u64::from(!outside.is_empty()));
@@ -933,6 +965,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
         table,
         sid::NAT
             | sid::FIREWALL_POLICY
+            | sid::ICMP_ERRORS
             | sid::FIREWALL_RULE
             | sid::WIREGUARD
             | sid::WIREGUARD_PEER
@@ -1389,6 +1422,20 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             peer_index,
             local_index,
         })
+    } else if table == sid::ICMP_ERRORS {
+        let mut number = |member: u64, what: &'static str| match got.remove(&member) {
+            Some(Member::Uint(n)) => u32::try_from(n)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or(ModelError::Invalid(what)),
+            Some(_) => Err(ModelError::Invalid(what)),
+            None => Err(ModelError::Missing(what)),
+        };
+        Value::IcmpErrors {
+            ipv4_interval_ms: number(sid::ICMP_ERRORS_IPV4_INTERVAL, "ipv4-interval")?,
+            ipv6_burst: number(sid::ICMP_ERRORS_IPV6_BURST, "ipv6-burst")?,
+            ipv6_interval_ms: number(sid::ICMP_ERRORS_IPV6_INTERVAL, "ipv6-interval")?,
+        }
     } else if table == sid::FIREWALL_POLICY {
         let filtering = match text(sid::FIREWALL_POLICY_FILTERING, "filtering-type")? {
             Some(name) => {
