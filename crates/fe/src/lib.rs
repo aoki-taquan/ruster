@@ -453,7 +453,11 @@ where
             self.send_generated(egress, &frame);
         }
         for arp in &trace.arp {
-            self.punt_arp(arp);
+            if self.limiter.take(local::Class::Arp, now_ms) {
+                self.punt_arp(arp);
+            } else {
+                self.counters.arp_to_control_dropped += 1;
+            }
         }
         for index in 0..self.control.errors().len() {
             let error = &self.control.errors()[index];
@@ -466,7 +470,13 @@ where
             let frame = &self.control.frames()[index];
             let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
             match kind {
-                ControlKind::Neighbor => self.punt_frame(ingress, punt::reason::ND, &bytes),
+                ControlKind::Neighbor => {
+                    if self.limiter.take(local::Class::Nd, now_ms) {
+                        self.punt_frame(ingress, punt::reason::ND, &bytes);
+                    } else {
+                        self.counters.arp_to_control_dropped += 1;
+                    }
+                }
                 ControlKind::Local => {
                     self.send_to_kernel(ingress, &bytes[ETHERNET_HEADER..], now_ms)
                 }
