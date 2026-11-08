@@ -79,7 +79,8 @@
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
 //! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
-//! ingress = "lan"              # optional, any interface when left out;
+//! ingress = "lan"              # optional, any interface when left out (and then
+//!                              # also what other VRFs look up in this one);
 //!                              # "rt-default" is the router itself: as ingress its own
 //!                              # packets, as egress the packets to it (SSH, ping, ...)
 //! egress = "wan"               # optional

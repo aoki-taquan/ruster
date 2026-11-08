@@ -20,11 +20,12 @@
 //!   to the live flow it quotes, whose source must be the error's destination; it
 //!   is not judged by the rules and makes no state.
 //!
-//! Deviations: with NAT or the firewall on, an IPv4 datagram decided in another VRF
-//! that would leave through an interface of the default VRF (which they belong to)
-//! is dropped as `VRF_LEAK_INTO_SERVICES`, not judged by them (IPv6's are judged
-//! by the firewall); so route leaking between VRFs works for IPv4 only without
-//! them. IPv4 options are not forwarded (see `packet`); a later fragment
+//! Deviations: with NAT on, an IPv4 datagram decided in another VRF that would leave
+//! through an interface of the default VRF (NAT's) is dropped as
+//! `VRF_LEAK_INTO_SERVICES`, not translated; with only the firewall on, the
+//! firewall judges it as one of the default VRF's, except that a leaked ICMP error
+//! or fragment is dropped. Rules can name only the default VRF's interfaces, so a
+//! rule with no ingress also admits what other VRFs leak. IPv4 options are not forwarded (see `packet`); a later fragment
 //! that starts at offset 1 or 2 is dropped for every protocol, not only TCP (RFC
 //! 1858); transit fragments go through the fragment association table, whose
 //! limits (entries, per source, held per source) drop what goes past them.
@@ -3538,7 +3539,7 @@ where
         } else {
             None
         };
-        let parked = if foreign {
+        let mut parked = if foreign {
             Some((
                 firewall_config.take(),
                 firewall.take(),
@@ -3630,7 +3631,23 @@ where
                             && all_vrfs.for_ingress(decision.egress()).authority()
                                 == all_vrfs.authority()
                         {
-                            return Err(DropReason::VrfLeakIntoServices);
+                            // Into the default VRF: its firewall judges the datagram
+                            // as one of its own; NAT does not translate another
+                            // VRF's, so with NAT on it is dropped.
+                            let nat_on = parked_nat.as_ref().is_some_and(|nat| {
+                                nat.0.is_some() || nat.2.is_some() || nat.4.is_some()
+                            });
+                            let services = parked.as_mut().filter(|_| !nat_on);
+                            let Some((Some(config), Some(runtime), audit)) = services else {
+                                return Err(DropReason::VrfLeakIntoServices);
+                            };
+                            let ipv4 = validate_ipv4_frame(frame)?;
+                            let validated = validate_firewall_transport(frame, ipv4)?;
+                            let packet =
+                                firewall_packet(ingress, decision.egress(), ipv4, validated, None);
+                            firewall_plan = Some(plan_firewall_packet(
+                                packet, config, runtime, audit, nat_now_ms,
+                            )?);
                         }
                         Ok(decision)
                     })
@@ -3920,8 +3937,12 @@ where
                         });
                     }
                     if let Some(plan) = planned.firewall {
+                        // Another VRF's datagram into the default VRF: the firewall
+                        // set aside for it planned it.
+                        let parked_runtime = parked.as_mut().and_then(|p| p.1.as_deref_mut());
                         firewall
                             .as_deref_mut()
+                            .or(parked_runtime)
                             .expect("firewall plan requires a bound runtime")
                             .commit(plan)
                             .expect("sequential packet path keeps firewall plan authority stable");
