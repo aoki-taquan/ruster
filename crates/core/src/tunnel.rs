@@ -221,7 +221,15 @@ pub(crate) fn wrap(
         if frame.get(12..14) != Some(&IPV4_ETHERTYPE[..]) {
             return Err(Dropped(DropReason::Ipv4HeaderTruncated));
         }
-        let inner = &frame[ETHERNET..];
+        // The IPv4 packet itself, without any padding after its Total Length.
+        let total = frame
+            .get(ETHERNET + 2..ETHERNET + 4)
+            .map(|len| usize::from(u16::from_be_bytes([len[0], len[1]])))
+            .ok_or(Dropped(DropReason::Ipv4HeaderTruncated))?;
+        let inner = frame
+            .get(ETHERNET..ETHERNET + total)
+            .filter(|ip| ip.len() >= 20 && ip[0] >> 4 == 4)
+            .ok_or(Dropped(DropReason::Ipv4HeaderTruncated))?;
         let fib = snapshot.ipv6.ok_or(Dropped(DropReason::TunnelNoRoute))?;
         let (out, next_hop) = fib
             .next_hop(tunnel.remote)

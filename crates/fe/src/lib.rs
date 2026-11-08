@@ -697,7 +697,9 @@ where
 
     /// Sends `frame` out of port `port` as it is, with VLAN tag `tag` put in.
     fn send_port(&mut self, port: IfId, tag: Option<u16>, frame: &[u8]) -> bool {
-        if frame.len() < ETHERNET_HEADER {
+        // An all-zero destination is what core puts on a frame to be wrapped (a
+        // tunnel's, a session's): one that was not wrapped never leaves a port.
+        if frame.len() < ETHERNET_HEADER || frame[..6] == [0; 6] {
             return false;
         }
         let extra = if tag.is_some() { 4 } else { 0 };
