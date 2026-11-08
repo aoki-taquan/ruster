@@ -1433,6 +1433,9 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) kernel_ingress: &'a [IfId],
     /// IPv4 in IPv6 tunnels ([`ForwardingSnapshot::with_tunnels`]).
     pub(crate) tunnels: &'a [crate::Ipv4InIpv6Tunnel],
+    /// Next hops the control side could not resolve (interface, address): a
+    /// datagram to one gets Host Unreachable (RFC 1812 5.2.7.1).
+    pub(crate) unreachable: &'a [(IfId, crate::Ipv4Address)],
     /// PPPoE sessions ([`ForwardingSnapshot::with_pppoe`]).
     pub(crate) pppoe: &'a [crate::PppoeSession],
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
@@ -1645,6 +1648,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            unreachable: &[],
             pppoe: &[],
             vlans: &[],
             wireguard: &[],
@@ -1845,6 +1849,26 @@ impl<'a> ForwardingSnapshot<'a> {
     /// Whether `ingress` is one of [`Self::with_kernel_ingress`].
     pub(crate) fn is_kernel_ingress(&self, ingress: IfId) -> bool {
         self.kernel_ingress.contains(&ingress)
+    }
+
+    /// Next hops the control side could not resolve (interface, address): a
+    /// datagram to one gets Host Unreachable instead of a resolve request.
+    #[must_use]
+    pub fn with_unreachable_neighbors(self, unreachable: &'a [(IfId, crate::Ipv4Address)]) -> Self {
+        Self {
+            unreachable,
+            ..self
+        }
+    }
+
+    /// Next hops the control side could not resolve; see
+    /// [`ForwardingSnapshot::with_unreachable_neighbors`].
+    pub(crate) fn is_unreachable_neighbor(
+        &self,
+        interface: IfId,
+        target: crate::Ipv4Address,
+    ) -> bool {
+        self.unreachable.contains(&(interface, target))
     }
 
     /// Sends IPv4 routed to a tunnel's interface inside IPv6 and unwraps the
@@ -2057,6 +2081,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            unreachable: &[],
             pppoe: &[],
             vlans: &[],
             wireguard: &[],
@@ -2448,6 +2473,7 @@ impl ValidatedForwardingOwner {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            unreachable: &[],
             pppoe: &[],
             vlans: &[],
             wireguard: &[],
@@ -5166,6 +5192,28 @@ fn decide_ipv4<T: TraceSink>(
         // A tunnel, PPPoE session or WireGuard interface has no neighbors: the
         // Ethernet header is replaced when the packet is wrapped.
         crate::MacAddress([0; 6])
+    } else if snapshot.is_unreachable_neighbor(route.egress(), target) {
+        // The control side gave up resolving it: Host Unreachable, and no new
+        // resolve request until it tries again.
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ingress,
+                ipv4,
+                Some(route),
+                Icmpv4ErrorKind::DestinationUnreachableHost,
+                0,
+                runtime,
+                *now,
+                trace,
+            );
+            trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                ingress,
+                disposition,
+            });
+        }
+        return Err(NeighborUnresolved);
     } else {
         // No resolution runtime: the control side resolves (FE/CE split).
         trace.record(TraceEvent::NeighborMissing {

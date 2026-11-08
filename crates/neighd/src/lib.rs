@@ -38,7 +38,10 @@
 //!   A solicitation for another node's address is discarded, not learned from.
 //!   Section 7.2.5: an Advertisement updates a neighbor neighd is resolving or knows.
 //!   Section 7.2.2: three solicitations one second apart (MAX_MULTICAST_SOLICIT,
-//!   RETRANS_TIMER) to the target's solicited-node group. Message checks in `nd.rs`.
+//!   RETRANS_TIMER) to the target's solicited-node group; one that does not answer
+//!   is written to the FE with an all-zero MAC address for [`FAILED_MS`], so that
+//!   its datagrams get Host Unreachable or Address Unreachable (RFC 1812 5.2.7.1,
+//!   RFC 4443 3.1), then may be asked for again. Message checks in `nd.rs`.
 //!
 //! - RFC 1122 section 2.3.2.1 and RFC 4861 section 7.3: learned neighbors time out;
 //!   one still in use is confirmed by a unicast request (ARP's "unicast poll", ND's
@@ -88,6 +91,9 @@ pub const CHECK_MS: u64 = 5_000;
 pub const REACHABLE_MS: u64 = 30_000;
 /// A neighbor no packet went to for this long is forgotten.
 pub const UNUSED_MS: u64 = 600_000;
+/// A next hop that did not answer is reported unreachable for this long, then may
+/// be asked for again.
+pub const FAILED_MS: u64 = 20_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NeighdCounters {
@@ -136,6 +142,9 @@ pub struct Neighd {
     used: BTreeMap<(String, IpAddr), u64>,
     /// Known neighbors being probed.
     probing: BTreeMap<(String, IpAddr), Pending>,
+    /// Next hops that did not answer, written to the FE with an all-zero MAC
+    /// address so that it answers their datagrams with Host Unreachable, and when.
+    failed: BTreeMap<(String, IpAddr), u64>,
     next_check: u64,
     /// When the marks were last asked for: the FE's answers say a packet went to
     /// the neighbor by then.
@@ -183,6 +192,7 @@ impl Neighd {
             confirmed: BTreeMap::new(),
             used: BTreeMap::new(),
             probing: BTreeMap::new(),
+            failed: BTreeMap::new(),
             next_check: 0,
             asked_at: 0,
             now_ms: 0,
@@ -378,6 +388,10 @@ impl Neighd {
                             ) = (change.key, change.value)
                             {
                                 let key = (interface, address);
+                                if mac == [0; 6] {
+                                    self.failed.insert(key, now_ms);
+                                    continue;
+                                }
                                 self.confirmed.insert(key.clone(), now_ms);
                                 self.known.insert(key, mac);
                                 self.counters.adopted += 1;
@@ -411,7 +425,10 @@ impl Neighd {
 
     fn resolve(&mut self, interface: String, address: IpAddr, now_ms: u64) {
         let key = (interface, address);
-        if self.known.contains_key(&key) || self.pending.contains_key(&key) {
+        if self.known.contains_key(&key)
+            || self.pending.contains_key(&key)
+            || self.failed.contains_key(&key)
+        {
             return;
         }
         self.pending.insert(
@@ -436,6 +453,15 @@ impl Neighd {
             if attempts >= ATTEMPTS {
                 self.pending.remove(&key);
                 self.counters.given_up += 1;
+                // The FE answers its datagrams with Host Unreachable for a while.
+                let _ = self.fe.patch(&[Change::set(
+                    Key::Neighbor {
+                        interface: key.0.clone(),
+                        address: key.1,
+                    },
+                    Value::Neighbor { mac: [0; 6] },
+                )]);
+                self.failed.insert(key, now_ms);
                 continue;
             }
             let (interface, target) = &key;
@@ -516,6 +542,23 @@ impl Neighd {
                 }
             }
         }
+        // Unreachable next hops may be asked for again after a while.
+        let expired: Vec<_> = self
+            .failed
+            .iter()
+            .filter(|(_, at)| now_ms.saturating_sub(**at) >= FAILED_MS)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            busy = true;
+            self.failed.remove(&key);
+            if !self.known.contains_key(&key) {
+                let _ = self.fe.patch(&[Change::delete(Key::Neighbor {
+                    interface: key.0.clone(),
+                    address: key.1,
+                })]);
+            }
+        }
         let due: Vec<_> = self
             .probing
             .iter()
@@ -558,6 +601,11 @@ impl Neighd {
         }
         let wake = self.probing.values().map(|p| p.next_at).min();
         let check_at = (!self.known.is_empty()).then_some(self.next_check);
+        let unfail_at = self.failed.values().map(|at| at + FAILED_MS).min();
+        let wake = match (wake, unfail_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         Progress {
             busy,
             wake_at: match (wake, check_at) {
@@ -674,6 +722,7 @@ impl Neighd {
     /// Records `mac` for a neighbor and writes it to the FE if it changed.
     fn learn(&mut self, key: (String, IpAddr), mac: [u8; 6]) {
         self.pending.remove(&key);
+        self.failed.remove(&key);
         self.confirm(&key);
         if self.known.get(&key) == Some(&mac) {
             return;

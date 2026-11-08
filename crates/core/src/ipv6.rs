@@ -35,9 +35,9 @@
 //! section 2.6.1) is not the router's; extension headers are stepped over only to tell whether a packet is itself an
 //! ICMPv6 error (RFC 4443 2.4(e.1)); one ICMPv6 error limiter for every source,
 //! with one for Packet Too Big and one
-//! for the others, and fixed values (RFC 4443 2.4(f) asks them configurable); no
-//! Destination Unreachable for an unresolvable neighbor (address
-//! unreachable) or for traffic to the router, no extension headers before an ND
+//! for the others, and fixed values (RFC 4443 2.4(f) asks them configurable);
+//! Address Unreachable (RFC 4443 3.1 code 3) only for a next hop the neighbor
+//! process gave up on, none for traffic to the router; no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
 //! to the kernel. Routes are searched linearly, longest prefix first.
 //! An ICMPv6 error about a packet from the kernel's interface has the packet's
@@ -131,6 +131,8 @@ pub struct Ipv6Fib {
     routes: Box<[Ipv6Route]>,
     neighbors: Box<[Ipv6Neighbor]>,
     local: Box<[Ipv6Local]>,
+    /// Next hops the control side could not resolve: Address Unreachable.
+    unreachable: Box<[(IfId, [u8; 16])]>,
 }
 
 impl Ipv6Fib {
@@ -156,6 +158,7 @@ impl Ipv6Fib {
             routes: routes.into(),
             neighbors: neighbors.into(),
             local: local.into(),
+            unreachable: Box::new([]),
         })
     }
 
@@ -178,6 +181,14 @@ impl Ipv6Fib {
 
     pub(crate) fn route(&self, destination: [u8; 16]) -> Option<&Ipv6Route> {
         self.routes.iter().find(|route| route.contains(destination))
+    }
+
+    /// The same table with `unreachable` as the next hops the control side could
+    /// not resolve.
+    #[must_use]
+    pub fn with_unreachable(mut self, unreachable: Vec<(IfId, [u8; 16])>) -> Self {
+        self.unreachable = unreachable.into();
+        self
     }
 
     pub(crate) fn neighbor(&self, interface: IfId, target: [u8; 16]) -> Option<MacAddress> {
@@ -559,6 +570,11 @@ where
         .neighbor(egress.id, next_hop)
         .or(session.then_some(MacAddress([0; 6])))
     else {
+        // The control side gave up resolving it: Address Unreachable (RFC 4443 3.1
+        // code 3), and no new request until it tries again.
+        if fib.unreachable.contains(&(egress.id, next_hop)) {
+            return Outcome::Error(NeighborUnresolved, DESTINATION_UNREACHABLE, 3, 0);
+        }
         trace.record(TraceEvent::Ipv6NeighborMissing {
             egress: egress.id,
             target: next_hop,

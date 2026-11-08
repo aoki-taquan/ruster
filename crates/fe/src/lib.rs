@@ -152,6 +152,7 @@ pub struct Fe<B> {
     interface_names: Vec<String>,
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
+    unreachable: Vec<(IfId, ruster_core::Ipv4Address)>,
     pppoe: Vec<ruster_core::PppoeSession>,
     wireguard: wireguard::Wireguard,
     /// Each VRF's kernel interface, in the order of `vrfs`.
@@ -220,6 +221,7 @@ where
             interface_names: built.interface_names,
             vlans: built.vlans,
             tunnels: built.tunnels,
+            unreachable: built.unreachable,
             pppoe: built.pppoe,
             wireguard: {
                 let mut wireguard = wireguard::Wireguard::new();
@@ -321,6 +323,7 @@ where
                     .with_kernel_ingress(&self.kernel)
                     .with_vlans(&self.vlans)
                     .with_tunnels(&self.tunnels)
+                    .with_unreachable_neighbors(&self.unreachable)
                     .with_pppoe(&self.pppoe)
                     .with_wireguard(&wg_views)
             })
@@ -822,6 +825,7 @@ where
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;
             self.tunnels = built.tunnels;
+            self.unreachable = built.unreachable;
             self.pppoe = built.pppoe;
             self.wireguard.publish(built.wireguard);
             self.kernel = built.kernel;

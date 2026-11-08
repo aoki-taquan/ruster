@@ -10,9 +10,12 @@
 //!   in all and cut to the egress MTU (section 4.3.2.3); precedence 6 (section
 //!   4.3.2.5); a rate limit per kind and egress (section 4.3.2.8).
 //!
-//! Deviations: no Destination Unreachable (Host) for an unresolved neighbor (the
-//! packet is dropped silently, RFC 1812 section 5.2.7.1 says SHOULD); no Source
-//! Quench (RFC 6633 deprecates it).
+//! - RFC 1812 section 5.2.7.1: Destination Unreachable (Host) for a next hop the
+//!   neighbor process gave up resolving.
+//!
+//! Deviations: while a next hop is still being resolved its datagrams are dropped
+//! silently, not queued (RFC 1122 section 2.3.2.2); no Source Quench (RFC 6633
+//! deprecates it).
 
 use std::{marker::PhantomData, rc::Rc};
 

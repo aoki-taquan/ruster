@@ -490,3 +490,42 @@ fn an_unused_neighbor_is_forgotten() {
     assert_eq!(lab.neighd.counters().forgotten, 1);
     assert_eq!(lab.neighd.known(), 0);
 }
+
+/// A next hop that never answers: after three solicitations neighd gives up, and the
+/// FE answers datagrams to it with Address Unreachable (RFC 4443 3.1 code 3) until
+/// neighd asks again.
+#[test]
+fn an_unanswered_next_hop_gets_address_unreachable_for_a_while() {
+    let mut lab = Lab::new();
+    learned_and_used(&mut lab);
+    let to_far = udp_from_host("2001:db8:99::7");
+    // The gateway fe80::fe is not known: solicited, three times, then given up.
+    let mut far = to_far.clone();
+    far[0..6].copy_from_slice(&LAN_MAC);
+    lab.fe.io_mut().inject(IfId(0), far.clone());
+    lab.settle();
+    for _ in 0..4 {
+        lab.now += 1_000;
+        lab.settle();
+    }
+    lab.tx();
+    assert_eq!(lab.neighd.counters().given_up, 1);
+    lab.fe.io_mut().inject(IfId(0), far.clone());
+    lab.settle();
+    let tx = lab.tx();
+    assert_eq!(tx.len(), 1, "an error back, no solicitation");
+    assert_eq!(tx[0].0, IfId(0));
+    assert_eq!((tx[0].1[54], tx[0].1[55]), (1, 3), "Address Unreachable");
+
+    // After a while it may be asked for again.
+    lab.now += ruster_neighd::FAILED_MS;
+    lab.settle();
+    lab.fe.io_mut().inject(IfId(0), far);
+    lab.settle();
+    let tx = lab.tx();
+    assert!(
+        tx.iter()
+            .any(|(egress, frame)| *egress == IfId(1) && frame[54] == 135),
+        "solicited again"
+    );
+}
