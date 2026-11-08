@@ -130,6 +130,10 @@ pub struct FeCounters {
     /// fragments could not be sent.
     pub fragments_sent: u64,
     pub fragmentation_dropped: u64,
+    /// ICMP errors and fragments for an interface that is not a port (a tunnel, a
+    /// PPPoE session, a VLAN sub-interface) that could not be sent after they were
+    /// counted.
+    pub generated_dropped: u64,
     /// WireGuard packets sealed and sent, and sealed ones that could not be sent.
     pub wireguard_sent: u64,
     pub wireguard_send_dropped: u64,
@@ -450,7 +454,9 @@ where
             }
         }
         for (egress, frame) in caught {
-            self.send_generated(egress, &frame);
+            if !self.send_generated(egress, &frame) {
+                self.counters.generated_dropped += 1;
+            }
         }
         for arp in &trace.arp {
             if self.limiter.take(local::Class::Arp, now_ms) {
@@ -783,6 +789,14 @@ where
             // The tracker's entries name the old tables' egress, neighbors and
             // translations: later fragments of those datagrams are dropped.
             self.fragment_tracking.flush_with_key(fragments::key());
+            // Queued ICMP errors and staged fragments name the old tables' interfaces,
+            // whose numbers may now be another interface's: they are dropped.
+            self.fragmentation.flush();
+            while self.icmpv4_errors.discard_front() {}
+            // So do the tunnel packets put back together and the neighbors' "used"
+            // marks.
+            self.reassembled.clear();
+            self.used.clear();
             // As for the firewall: a NAT that cannot move stays bound to the old
             // tables, and core drops what it would have translated.
             if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {
