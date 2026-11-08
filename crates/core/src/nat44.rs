@@ -4632,9 +4632,11 @@ impl<'a> Nat44UdpRuntime<'a> {
         source: [u8; 4],
         destination: [u8; 4],
         protocol: u8,
-    ) -> u16 {
+        now_ms: u64,
+    ) -> Option<u16> {
         let public = self.config.public_address().octets();
-        self.ipv4_ids.next(source, destination, protocol, public)
+        self.ipv4_ids
+            .next(source, destination, protocol, public, now_ms)
     }
 
     #[must_use]
@@ -8663,9 +8665,11 @@ impl<'a> Nat44TcpRuntime<'a> {
         source: [u8; 4],
         destination: [u8; 4],
         protocol: u8,
-    ) -> u16 {
+        now_ms: u64,
+    ) -> Option<u16> {
         let public = self.config.public_address().octets();
-        self.ipv4_ids.next(source, destination, protocol, public)
+        self.ipv4_ids
+            .next(source, destination, protocol, public, now_ms)
     }
 
     #[must_use]

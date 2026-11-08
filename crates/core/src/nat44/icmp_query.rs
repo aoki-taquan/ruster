@@ -630,8 +630,10 @@ impl<'a> Nat44IcmpRuntime<'a> {
         source: [u8; 4],
         destination: [u8; 4],
         protocol: u8,
-    ) -> u16 {
-        self.engine.next_ipv4_id(source, destination, protocol)
+        now_ms: u64,
+    ) -> Option<u16> {
+        self.engine
+            .next_ipv4_id(source, destination, protocol, now_ms)
     }
 
     #[must_use]

@@ -30,11 +30,17 @@
 //! only by inside hosts (like outbound), and its tuples (public address,
 //! inside host) never equal an outbound tuple (public address, outside
 //! host), so it neither collides with outbound sequences nor lets the
-//! outside reach them. Inside hosts still share the outbound array: one
-//! inside host sending about 2.2 kpps (65536 in 30 s; about 550 pps at the
-//! 120 s maximum datagram lifetime, MDL) of DF-clear datagrams to one destination wraps the
-//! shared (public, destination, protocol) tuple within the MDL, for every
-//! inside host using it; no per-host packet rate limit exists yet.
+//! outside reach them. Inside hosts still share the outbound array.
+//!
+//! **Rate limit.** Each counter's 65536 values are in four quarters, and the
+//! time each quarter was last used is kept. A counter enters a quarter only
+//! when that quarter was last used at least the maximum datagram lifetime
+//! (MDL, 120 s) ago; otherwise the datagram is dropped
+//! (`NAT44_IPV4_ID_RATE_EXCEEDED`). So no ID of a tuple repeats within the
+//! MDL, and a bucket carries at most 65536 non-atomic datagrams per MDL
+//! (about 550 per second on average, more in bursts). The tuples sharing a
+//! bucket share its rate: one inside host sending DF-clear datagrams to one
+//! destination that fast holds back the others in that bucket.
 //!
 //! The split stops outside traffic from advancing an outbound sequence
 //! *directly*. It can still do so indirectly: an outside host that elicits
@@ -63,7 +69,8 @@
 //! outside observer no longer sees inbound volume; what remains observable
 //! is outbound volume of tuples in the observer's own outbound bucket.
 //!
-//! The arrays are inline (no allocation), owned by one worker's runtime (no
+//! The arrays are inline (no allocation; with the times of the quarters,
+//! about 72 KiB per direction), owned by one worker's runtime (no
 //! lock), and never reset by reconcile or flush, so a configuration apply
 //! does not restart the sequence of a tuple. The key is the NAT runtime's
 //! construction key and is fixed for the runtime's lifetime (not rotated on
@@ -82,19 +89,19 @@
 //!   datagrams it translates follow the rules for a source, and generates it
 //!   rather than copying it.
 //! - RFC 6864 section 4.3: the ID of a non-atomic datagram does not repeat
-//!   within the MDL for one (source, destination, protocol) tuple, as far as
-//!   the counters allow (above). Section 4.1: an atomic datagram's ID may be
-//!   any value, so it is kept.
+//!   within the MDL for one (source, destination, protocol) tuple. Section 5.2:
+//!   the rate of non-atomic datagrams is limited so that it holds (the rate
+//!   limit above). Section 4.1: an atomic datagram's ID may be any value, so
+//!   it is kept.
 //! - RFC 791: every fragment of a datagram has the same ID; RFC 1812 section
 //!   4.2.2.7: a DF-clear datagram larger than the egress MTU is fragmented.
 //! - RFC 7739 section 5 (written for IPv6, applied here): the IDs cannot be
 //!   predicted without the key.
 //! - RFC 4963 section 2 describes the misassembly the IDs avoid.
 //!
-//! Deviations: RFC 6864 section 5.2 says a source of non-atomic datagrams
-//! MUST limit its rate to keep the IDs unique; the NAT does not, so an inside
-//! host can make a tuple it shares with the other inside hosts wrap within
-//! the MDL. Tuples that share a bucket count together, so they wrap sooner.
+//! Deviations: the limit is per bucket, not per tuple, so tuples that share a
+//! bucket share the rate. The time is kept in whole seconds, and with more
+//! than one worker the generators would need disjoint ranges (above).
 
 use crate::fixed_directory::{DirectoryHashDomain, DirectoryHashKey};
 
@@ -105,21 +112,62 @@ use crate::fixed_directory::{DirectoryHashDomain, DirectoryHashKey};
 /// DF-clear datagram as before.
 pub(crate) const IPV4_ID_BUCKETS: usize = 4096;
 
+/// The maximum datagram lifetime the IDs stay unique within, in seconds.
+pub(crate) const IPV4_ID_MDL_S: u64 = 120;
+
+/// Each bucket's 65536 IDs in this many parts; the time each part was last
+/// used is kept.
+const QUARTERS: usize = 4;
+
+/// One direction's counters, and when each quarter of each counter was last
+/// used (seconds + 1; 0 for never).
+struct Counters {
+    next: [u16; IPV4_ID_BUCKETS],
+    used_at: [[u32; QUARTERS]; IPV4_ID_BUCKETS],
+}
+
+impl Counters {
+    const fn new() -> Self {
+        Self {
+            next: [0; IPV4_ID_BUCKETS],
+            used_at: [[0; QUARTERS]; IPV4_ID_BUCKETS],
+        }
+    }
+
+    /// The bucket's next counter value, or `None` when it would enter a
+    /// quarter used less than the MDL ago (the rate limit).
+    fn take(&mut self, bucket: usize, now_ms: u64) -> Option<u16> {
+        let counter = self.next[bucket];
+        let quarter = usize::from(counter >> 14);
+        let now = u32::try_from(now_ms / 1_000).unwrap_or(u32::MAX - 1) + 1;
+        let used_at = self.used_at[bucket][quarter];
+        if counter & 0x3fff == 0
+            && used_at != 0
+            && u64::from(now.saturating_sub(used_at)) < IPV4_ID_MDL_S
+        {
+            return None;
+        }
+        self.used_at[bucket][quarter] = now;
+        self.next[bucket] = counter.wrapping_add(1);
+        Some(counter)
+    }
+}
+
 /// Per-worker generator of the IDs of translated non-atomic datagrams.
 pub(crate) struct Ipv4IdGenerator {
     key: DirectoryHashKey,
     /// Tuples whose source is the public address (outbound, hairpin).
-    outbound: [u16; IPV4_ID_BUCKETS],
+    outbound: Counters,
     /// Every other tuple (inbound: destination rewritten to an inside host).
-    inbound: [u16; IPV4_ID_BUCKETS],
+    inbound: Counters,
 }
 
 impl Ipv4IdGenerator {
     pub(crate) const fn new(key: DirectoryHashKey) -> Self {
         Self {
             key,
-            outbound: [0; IPV4_ID_BUCKETS],
-            inbound: [0; IPV4_ID_BUCKETS],
+            outbound: Counters::new(),
+            inbound: Counters::new(),
         }
     }
 
@@ -131,7 +179,8 @@ impl Ipv4IdGenerator {
         destination: [u8; 4],
         protocol: u8,
         public: [u8; 4],
-    ) -> u16 {
+        now_ms: u64,
+    ) -> Option<u16> {
         let addresses = (u64::from(u32::from_be_bytes(source)) << 32)
             | u64::from(u32::from_be_bytes(destination));
         let hash = self.key.hash_words(
@@ -144,9 +193,8 @@ impl Ipv4IdGenerator {
             &mut self.inbound
         };
         let bucket = (hash as usize) & (IPV4_ID_BUCKETS - 1);
-        let counter = counters[bucket];
-        counters[bucket] = counter.wrapping_add(1);
-        counter.wrapping_add((hash >> 48) as u16)
+        let counter = counters.take(bucket, now_ms)?;
+        Some(counter.wrapping_add((hash >> 48) as u16))
     }
 }
 
@@ -165,34 +213,59 @@ mod tests {
     fn one_tuple_never_repeats_an_id_within_65536_datagrams() {
         let mut ids = generator(7);
         let mut seen = vec![false; 65_536];
-        let first = ids.next(P, D, 17, P);
+        let first = ids.next(P, D, 17, P, 0).unwrap();
         seen[usize::from(first)] = true;
         for step in 1..65_536_u32 {
-            let id = ids.next(P, D, 17, P);
+            let id = ids.next(P, D, 17, P, 0).unwrap();
             assert_eq!(id, first.wrapping_add(step as u16), "consecutive per tuple");
             assert!(!seen[usize::from(id)], "repeated at {step}");
             seen[usize::from(id)] = true;
         }
-        // The 65537th wraps to the first ID (RFC 6864 §5.2 rate residual).
-        assert_eq!(ids.next(P, D, 17, P), first);
+        // The 65537th waits for the MDL (the rate limit), then wraps to the first ID.
+        assert_eq!(ids.next(P, D, 17, P, 0), None);
+        assert_eq!(ids.next(P, D, 17, P, IPV4_ID_MDL_S * 1_000).unwrap(), first);
+    }
+
+    /// The rate limit: a quarter of a bucket's IDs is used again only once
+    /// the MDL has passed since its last use, so no ID repeats within it.
+    #[test]
+    fn a_quarter_is_used_again_only_after_the_mdl() {
+        let mut ids = generator(7);
+        let mdl = IPV4_ID_MDL_S * 1_000;
+        // Three quarters at t = 0, the last at t = 10 s.
+        for _ in 0..3 * 16_384 {
+            ids.next(P, D, 17, P, 0).unwrap();
+        }
+        for _ in 0..16_384 {
+            ids.next(P, D, 17, P, 10_000).unwrap();
+        }
+        // The first quarter was last used at 0: refused until the MDL.
+        assert_eq!(ids.next(P, D, 17, P, mdl - 1_000), None);
+        assert!(ids.next(P, D, 17, P, mdl).is_some());
+        for _ in 1..3 * 16_384 {
+            ids.next(P, D, 17, P, mdl).unwrap();
+        }
+        // The fourth quarter was last used at 10 s.
+        assert_eq!(ids.next(P, D, 17, P, mdl + 9_000), None);
+        assert!(ids.next(P, D, 17, P, mdl + 10_000).is_some());
     }
 
     #[test]
     fn tuples_are_independent_and_keyed() {
         let mut ids = generator(7);
-        let udp = ids.next(P, D, 17, P);
+        let udp = ids.next(P, D, 17, P, 0).unwrap();
         // Other tuples (protocol, destination, source) do not consume the
         // UDP tuple's sequence unless they share its bucket.
-        let tcp = ids.next(P, D, 6, P);
-        let other_destination = ids.next(P, [198, 51, 100, 8], 17, P);
-        let other_source = ids.next([203, 0, 113, 2], D, 17, P);
+        let tcp = ids.next(P, D, 6, P, 0).unwrap();
+        let other_destination = ids.next(P, [198, 51, 100, 8], 17, P, 0).unwrap();
+        let other_source = ids.next([203, 0, 113, 2], D, 17, P, 0).unwrap();
         assert_ne!(udp, tcp);
         assert_ne!(udp, other_destination);
         assert_ne!(udp, other_source);
-        assert_eq!(ids.next(P, D, 17, P), udp.wrapping_add(1));
+        assert_eq!(ids.next(P, D, 17, P, 0).unwrap(), udp.wrapping_add(1));
         // A different key gives a different (unpredictable) start.
         let mut other_key = generator(8);
-        assert_ne!(other_key.next(P, D, 17, P), udp);
+        assert_ne!(other_key.next(P, D, 17, P, 0).unwrap(), udp);
     }
 
     #[test]
@@ -206,11 +279,14 @@ mod tests {
             ],
         );
         let mut ids = Ipv4IdGenerator::new(key);
-        assert_eq!(ids.next(P, D, 17, P), (hash >> 48) as u16);
+        assert_eq!(ids.next(P, D, 17, P, 0).unwrap(), (hash >> 48) as u16);
         let bucket = (hash as usize) & (IPV4_ID_BUCKETS - 1);
-        assert_eq!(ids.outbound[bucket], 1);
-        assert_eq!(ids.outbound.iter().map(|&c| u32::from(c)).sum::<u32>(), 1);
-        assert!(ids.inbound.iter().all(|&c| c == 0));
+        assert_eq!(ids.outbound.next[bucket], 1);
+        assert_eq!(
+            ids.outbound.next.iter().map(|&c| u32::from(c)).sum::<u32>(),
+            1
+        );
+        assert!(ids.inbound.next.iter().all(|&c| c == 0));
     }
 
     /// Review M1/L1: inbound translations (source not the public address)
@@ -219,7 +295,7 @@ mod tests {
     #[test]
     fn inbound_volume_never_advances_an_outbound_sequence() {
         let mut ids = generator(7);
-        let first = ids.next(P, D, 17, P);
+        let first = ids.next(P, D, 17, P, 0).unwrap();
         let key = DirectoryHashKey::new(7, 0x0123_4567_89ab_cdef).unwrap();
         let bucket = |source: [u8; 4], destination: [u8; 4]| {
             let hash = key.hash_words(
@@ -239,15 +315,19 @@ mod tests {
             .flat_map(|a| (0..=u8::MAX).map(move |b| [198, 51, a, b]))
             .find(|&source| bucket(source, [10, 0, 0, 10]) == target)
             .expect("some outside source shares the bucket");
-        for _ in 0..70_000 {
-            ids.next(colliding, [10, 0, 0, 10], 17, P);
+        // Spread over time, so that the rate limit lets the counter wrap.
+        for i in 0..70_000_u64 {
+            ids.next(colliding, [10, 0, 0, 10], 17, P, i * 10).unwrap();
         }
-        assert_eq!(ids.inbound[target], (70_000_u32 % 65_536) as u16);
-        assert_eq!(ids.outbound[target], 1);
-        assert_eq!(ids.next(P, D, 17, P), first.wrapping_add(1));
+        assert_eq!(ids.inbound.next[target], (70_000_u32 % 65_536) as u16);
+        assert_eq!(ids.outbound.next[target], 1);
+        assert_eq!(ids.next(P, D, 17, P, 0).unwrap(), first.wrapping_add(1));
         // Hairpin (source the public address, destination inside) counts
         // with outbound.
-        ids.next(P, [10, 0, 0, 11], 17, P);
-        assert_eq!(ids.outbound.iter().map(|&c| u32::from(c)).sum::<u32>(), 3);
+        ids.next(P, [10, 0, 0, 11], 17, P, 0).unwrap();
+        assert_eq!(
+            ids.outbound.next.iter().map(|&c| u32::from(c)).sum::<u32>(),
+            3
+        );
     }
 }
