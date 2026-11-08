@@ -442,7 +442,7 @@ fn a_changed_route_revokes_the_flows_it_moves() {
         let mut states = [FirewallStateSlot::default(); 8];
         let mut runtime = FirewallRuntime::new(current, &mut states);
         let other = FirewallPacket {
-            destination: Ipv4Address::from_octets([203, 0, 113, 50]),
+            destination: Ipv4Address::from_octets([203, 0, 113, 50]).into(),
             ..udp_flow(1_001)
         };
         pass(&mut runtime, &current, udp_flow(1_000), 10).unwrap();
@@ -548,8 +548,8 @@ fn a_route_change_toward_a_router_address_keeps_the_flow() {
         let mut states = [FirewallStateSlot::default(); 8];
         let mut runtime = FirewallRuntime::new(current, &mut states);
         let toward = |last: u8, port: u16| FirewallPacket {
-            source: Ipv4Address::from_octets([10, 0, 0, 77]),
-            destination: Ipv4Address::from_octets([10, 0, 0, last]),
+            source: Ipv4Address::from_octets([10, 0, 0, 77]).into(),
+            destination: Ipv4Address::from_octets([10, 0, 0, last]).into(),
             ..udp_flow(port)
         };
         pass(&mut runtime, &current, toward(1, 1_000), 10).unwrap();
@@ -591,7 +591,7 @@ fn worst_case_reevaluation_at_the_budget_takes_milliseconds() {
         let usable = runtime.usable_capacity();
         for flow in 0..usable {
             let packet = FirewallPacket {
-                source: Ipv4Address::from_octets([10, 0, (flow >> 8) as u8, flow as u8]),
+                source: Ipv4Address::from_octets([10, 0, (flow >> 8) as u8, flow as u8]).into(),
                 ..udp_flow(1_000)
             };
             pass(&mut runtime, &current, packet, 10).unwrap();
@@ -695,13 +695,14 @@ fn worst_case_with_rules_and_routes_changed_stays_within_the_bound() {
     );
     // Flows to remotes spread over every /24 (cache misses in the index).
     let flow = |flow: usize| FirewallPacket {
-        source: Ipv4Address::from_octets([10, 0, (flow >> 8) as u8, flow as u8]),
+        source: Ipv4Address::from_octets([10, 0, (flow >> 8) as u8, flow as u8]).into(),
         destination: Ipv4Address::from_octets([
             100 + ((flow % 4_095) >> 8) as u8,
             (flow % 4_095) as u8,
             0,
             7,
-        ]),
+        ])
+        .into(),
         ..udp_flow(1_000)
     };
     let run = |next_rules: &[FirewallRule], next_snapshot| {

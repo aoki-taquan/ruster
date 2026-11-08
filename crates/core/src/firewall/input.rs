@@ -147,8 +147,8 @@ impl InputFirewallRule {
 
     fn matches(self, packet: &InputFirewallPacket) -> bool {
         if !(self.ingress.matches(packet.ingress)
-            && self.source.matches(packet.source)
-            && self.destination.matches(packet.destination))
+            && self.source.matches(packet.source.into())
+            && self.destination.matches(packet.destination.into()))
         {
             return false;
         }

@@ -49,10 +49,10 @@ pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[doc(hidden)]
 pub use firewall::take_full_firewall_validation_count;
 pub use firewall::{
-    validate_firewall_rules, validate_input_firewall_rules, FirewallAction, FirewallAuditBuffer,
-    FirewallAuditRecord, FirewallCommitError, FirewallConfig, FirewallConfigError,
-    FirewallConnectionClass, FirewallCounters, FirewallDisposition, FirewallFailure,
-    FirewallHashKey, FirewallHashKeyError, FirewallInterface, FirewallIpv4Prefix,
+    validate_firewall_rules, validate_input_firewall_rules, FirewallAction, FirewallAddress,
+    FirewallAuditBuffer, FirewallAuditRecord, FirewallCommitError, FirewallConfig,
+    FirewallConfigError, FirewallConnectionClass, FirewallCounters, FirewallDisposition,
+    FirewallFailure, FirewallHashKey, FirewallHashKeyError, FirewallInterface, FirewallIpv4Prefix,
     FirewallIpv4PrefixError, FirewallPlanError, FirewallPolicy, FirewallPolicyError,
     FirewallPolicySource, FirewallPortRange, FirewallPortRangeError, FirewallProtocol,
     FirewallReconcileError, FirewallReconcilePermit, FirewallReconcileReport,

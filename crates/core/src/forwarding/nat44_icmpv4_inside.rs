@@ -355,8 +355,8 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
         let received = FirewallPacket {
             ingress: owner.outside,
             egress: owner.inside,
-            source: quote.source_address,
-            destination: internal,
+            source: quote.source_address.into(),
+            destination: internal.into(),
             protocol,
             source_port,
             destination_port,
@@ -372,8 +372,8 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
             let sent = FirewallPacket {
                 ingress: owner.inside,
                 egress: owner.outside,
-                source: sender_address,
-                destination: owner.public_address,
+                source: sender_address.into(),
+                destination: owner.public_address.into(),
                 protocol,
                 source_port: sender_port,
                 destination_port: authority.public_port,
