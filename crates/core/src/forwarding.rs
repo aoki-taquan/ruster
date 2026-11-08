@@ -2164,6 +2164,33 @@ impl<'a> ForwardingSnapshot<'a> {
             .is_some_and(|binding| binding.address == address)
     }
 
+    /// The most an IP packet out of `egress` (whose own MTU is `mtu`) may be once
+    /// it is wrapped: for a tunnel, also what the IPv6 path to its remote end
+    /// carries less the IPv6 header (RFC 2473 6.7); for a PPPoE session, also its
+    /// parent's MTU less the PPPoE header (RFC 2516). `self` is the outer snapshot,
+    /// whose IPv6 table routes the tunnels.
+    pub(crate) fn carried_mtu(&self, egress: IfId, mtu: u16) -> u16 {
+        if let Some(tunnel) = crate::tunnel::of(self.tunnels, egress) {
+            let below = self
+                .ipv6
+                .and_then(|fib| fib.next_hop(tunnel.remote))
+                .and_then(|(out, _)| {
+                    let link = self.interface(out)?.mtu;
+                    Some(self.carried_mtu(out, link))
+                });
+            return match below {
+                Some(below) => mtu.min(below.saturating_sub(40)),
+                None => mtu,
+            };
+        }
+        if let Some(session) = crate::pppoe::of(self.pppoe, egress) {
+            if let Some(parent) = self.interface(session.parent) {
+                return mtu.min(parent.mtu.saturating_sub(8));
+            }
+        }
+        mtu
+    }
+
     /// Whether frames out of `egress` are wrapped (a tunnel, PPPoE session or
     /// WireGuard interface): it has no neighbors, and its Ethernet header is replaced
     /// when the frame is wrapped.
@@ -3636,6 +3663,7 @@ where
                             let fragment = check_egress_mtu(
                                 &*frame,
                                 snapshot,
+                                all_vrfs,
                                 ingress,
                                 decision,
                                 &mut icmpv4_errors,
@@ -4078,6 +4106,7 @@ where
 fn check_egress_mtu<T: TraceSink>(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
+    outer: &ForwardingSnapshot<'_>,
     ingress: IfId,
     decision: PacketDecision,
     icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
@@ -4097,6 +4126,7 @@ fn check_egress_mtu<T: TraceSink>(
         .interface(decision.egress())
         .ok_or(InterfaceMiss)?
         .mtu;
+    let mtu = outer.carried_mtu(decision.egress(), mtu);
     let total_len =
         packet::read_u16(frame, packet::ETHERNET_HEADER_LEN + 2).ok_or(Ipv4HeaderTruncated)?;
     // The backend sends the whole frame: bytes after Total Length count too.

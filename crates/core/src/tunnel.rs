@@ -15,6 +15,10 @@
 //!   stepped over when unwrapping; other extension headers are not.
 //! - RFC 2983 (uniform model): the inner IPv4 TOS byte is copied to the outer
 //!   Traffic Class.
+//! - RFC 2473 6.7: the IPv4 MTU of a tunnel interface is its own, and at most what
+//!   the IPv6 path to the remote end carries (the egress interface's MTU, less
+//!   PPPoE's header for a session) less the 40-byte IPv6 header. Fragmentation
+//!   Needed reports that.
 //!
 //! Deviations:
 //!

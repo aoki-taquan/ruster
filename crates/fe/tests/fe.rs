@@ -2632,3 +2632,92 @@ fn an_icmp_error_to_a_vlan_host_leaves_tagged() {
     assert_eq!((tx.bytes[18 + 20], tx.bytes[18 + 21]), (11, 0));
     assert_eq!(&tx.bytes[18 + 16..18 + 20], &host);
 }
+
+/// A tunnel carries no more than the link below it, less the IPv6 header: a
+/// datagram that fits the tunnel's own MTU but not that gets Fragmentation Needed
+/// with what the path carries (RFC 2473 6.7, RFC 1191).
+#[test]
+fn a_tunnel_s_mtu_is_what_the_link_below_carries() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let mut narrow_wan = iface("wan", WAN_MAC);
+    if let Change {
+        value: Some(Value::Interface { mtu, .. }),
+        ..
+    } = &mut narrow_wan
+    {
+        *mtu = 1400;
+    }
+    let tunnel = Change::set(
+        Key::Interface {
+            name: "dslite".into(),
+        },
+        Value::Interface {
+            enabled: true,
+            mac: [2, 0, 0, 0, 0, 9],
+            mtu: 1460,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
+            tunnel: Some(ruster_proto::table::Tunnel {
+                local: "2001:db8:1::1".parse().unwrap(),
+                remote: "2001:db8:ff::1".parse().unwrap(),
+            }),
+            pppoe: None,
+        },
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[narrow_wan, tunnel]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut routes, &[route(INTERNET, 32, "dslite", None)]),
+        Code::CHANGED
+    );
+    let gateway = Change::set(
+        Key::Neighbor {
+            interface: "wan".into(),
+            address: ip6("fe80::1"),
+        },
+        Value::Neighbor { mac: GATEWAY_MAC },
+    );
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[gateway, neighbor("lan", [192, 0, 2, 10], HOST_MAC)]
+        ),
+        Code::CHANGED
+    );
+
+    let sized = |len: usize, df: bool| {
+        let mut p = udp_packet([192, 0, 2, 10], INTERNET, (5_000, 53));
+        p.resize(len, 0);
+        p[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        p[6] = if df { 0x40 } else { 0 };
+        p[24..26].copy_from_slice(&((len - 20) as u16).to_be_bytes());
+        ipv4_checksummed(p)
+    };
+    // 1360 bytes go in one IPv6 packet of 1400.
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), from_lan(&sized(1360, true)));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent");
+    assert_eq!(tx.bytes.len(), 14 + 1400);
+
+    // 1361 with DF set: Fragmentation Needed with 1360, nothing into the tunnel.
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), from_lan(&sized(1361, true)));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("an ICMP error");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!((tx.bytes[14 + 20], tx.bytes[14 + 21]), (3, 4));
+    assert_eq!(
+        u16::from_be_bytes([tx.bytes[14 + 26], tx.bytes[14 + 27]]),
+        1360
+    );
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+}
