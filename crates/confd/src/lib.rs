@@ -153,6 +153,9 @@ struct Peer {
     resync_open: bool,
     /// ribd wants `sync-done` after each accepted send.
     says_done: bool,
+    /// The resync-end waiting for an answer. When it is refused, what the peer holds
+    /// stays marked stale, and resync-end goes again after the next accepted change.
+    resync_end: Option<u32>,
 }
 
 impl Peer {
@@ -165,6 +168,11 @@ impl Peer {
 
     /// Handles one answer from the peer.
     fn answer(&mut self, token: u32, accepted: bool) {
+        if self.resync_end == Some(token) {
+            self.resync_end = None;
+            self.resync_open |= !accepted;
+            return;
+        }
         let Some(at) = self.in_flight.iter().position(|(t, _, _)| *t == token) else {
             return;
         };
@@ -173,7 +181,7 @@ impl Peer {
             self.sent = held;
             if self.in_flight.is_empty() {
                 if self.resync_open {
-                    self.client.resync_end();
+                    self.resync_end = Some(self.client.resync_end());
                     self.resync_open = false;
                 }
                 if self.says_done {
@@ -292,12 +300,15 @@ impl Confd {
             .map(|(kind, reason, _)| (*kind, reason.as_str()))
     }
 
-    /// True when every connected process has answered every change sent to it.
+    /// True when every connected process has answered every change sent to it, and
+    /// the resync-end after them.
     pub fn settled(&self) -> bool {
         [&self.fe, &self.ribd, &self.neighd]
             .into_iter()
             .flatten()
-            .all(|peer| peer.client.is_closed() || peer.in_flight.is_empty())
+            .all(|peer| {
+                peer.client.is_closed() || (peer.in_flight.is_empty() && peer.resync_end.is_none())
+            })
     }
 
     /// The processes that are not connected now.
@@ -348,9 +359,10 @@ impl Confd {
             in_flight: Vec::new(),
             resync_open: true,
             says_done,
+            resync_end: None,
         };
         if desired.is_empty() {
-            peer.client.resync_end();
+            peer.resync_end = Some(peer.client.resync_end());
             peer.resync_open = false;
             if says_done {
                 peer.client.sync_done();
@@ -686,6 +698,14 @@ impl Task for Confd {
                             if generation < self.generation && !resend.contains(&kind) {
                                 resend.push(kind);
                             }
+                        } else if peer.resync_end == Some(token) {
+                            // It follows the latest patches, so it counts for the
+                            // latest configuration.
+                            self.last_refusal = Some((
+                                kind,
+                                String::from_utf8_lossy(&payload).into_owned(),
+                                self.generation,
+                            ));
                         }
                     }
                     peer.answer(token, accepted);

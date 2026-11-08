@@ -9,9 +9,11 @@ use ruster_proto::table::{Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::Task;
 use ruster_ribd::{Ribd, SourceSpec};
 
-/// A stand-in FE check: refuses any table with a route through `refuse`.
+/// A stand-in FE check: refuses any table with a route through `refuse`, or
+/// without the route `keep`.
 struct Check<'a> {
     refuse: Option<&'a str>,
+    keep: Option<&'a Key>,
 }
 
 impl Hook for Check<'_> {
@@ -22,7 +24,8 @@ impl Hook for Check<'_> {
                     if hops.iter().any(|hop| hop.interface == refuse))
             })
         });
-        if bad {
+        let lost = self.keep.is_some_and(|keep| next.get(keep).is_none());
+        if bad || lost {
             Err("refused".into())
         } else {
             Ok(())
@@ -64,6 +67,7 @@ struct Lab {
     sources: Vec<Client>,
     now: u64,
     refuse: Option<&'static str>,
+    keep: Option<Key>,
 }
 
 impl Lab {
@@ -74,6 +78,7 @@ impl Lab {
             sources: Vec::new(),
             now: 0,
             refuse: None,
+            keep: None,
         };
         lab.restart(specs);
         lab
@@ -97,6 +102,7 @@ impl Lab {
         for _ in 0..1_000 {
             let mut check = Check {
                 refuse: self.refuse,
+                keep: self.keep.as_ref(),
             };
             let mut busy = self.fe.step(&mut check).busy;
             busy |= self.ribd.step(self.now).busy;
@@ -245,6 +251,42 @@ fn a_refused_full_send_after_a_restart_does_not_delete_the_fe_routes() {
         .unwrap();
     lab.settle();
     assert_eq!(lab.fe_route([0, 0, 0, 0], 0), Some(&via("wan")));
+    assert_eq!(lab.fe_route([192, 168, 0, 0], 16), None, "the resync ended");
+    assert_eq!(lab.fe.store().len(), 2);
+}
+
+#[test]
+fn a_refused_resync_end_is_sent_again_after_the_next_change() {
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[
+            route([10, 0, 0, 0], 8, "lan"),
+            route([192, 168, 0, 0], 16, "old"),
+        ])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+
+    // The FE refuses to delete the old route, so the restarted ribd's resync-end is
+    // refused. settle() also checks that ribd does not send it again every step.
+    lab.keep = Some(key([192, 168, 0, 0], 16));
+    lab.restart(vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[route([10, 0, 0, 0], 8, "lan")])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+    assert_eq!(lab.ribd.counters().patches_refused, 1);
+    assert!(
+        lab.fe_route([192, 168, 0, 0], 16).is_some(),
+        "refused, so kept"
+    );
+
+    lab.keep = None;
+    lab.sources[0]
+        .patch(&[route([10, 1, 0, 0], 16, "lan")])
+        .unwrap();
+    lab.settle();
     assert_eq!(lab.fe_route([192, 168, 0, 0], 16), None, "the resync ended");
     assert_eq!(lab.fe.store().len(), 2);
 }
