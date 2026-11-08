@@ -655,9 +655,26 @@ fn df_clear_errors_quoting_df_clear_datagrams_are_translated() {
         &icmp,
     );
     assert_eq!(delivered, expected);
-    // A quote that is a fragment stays refused.
+    // A quote that is a first fragment has its ports: translated too (RFC 5508
+    // REQ-4); one that is a later fragment is refused.
+    let mut first = quote.clone();
+    first[6..8].copy_from_slice(&MF.to_be_bytes());
+    first[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&first[..20]);
+    first[10..12].copy_from_slice(&checksum.to_be_bytes());
+    let mut icmp = vec![11, 0, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&first);
+    let checksum = internet_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    let (egress, _) = world
+        .run(
+            WAN,
+            ipv4_frame(WAN_MAC, GW_MAC, ROUTER, PUBLIC, 0x7776, 0, 64, 1, &icmp),
+        )
+        .expect("an error about a first fragment is translated");
+    assert_eq!(egress, LAN);
     let mut fragment = quote;
-    fragment[6..8].copy_from_slice(&MF.to_be_bytes());
+    fragment[6..8].copy_from_slice(&(MF | 1).to_be_bytes());
     fragment[10..12].fill(0);
     let checksum = ipv4_header_checksum(&fragment[..20]);
     fragment[10..12].copy_from_slice(&checksum.to_be_bytes());

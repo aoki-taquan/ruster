@@ -69,7 +69,7 @@ fn error_matrix() -> Vec<(u8, u8, bool)> {
         matrix.push((3, code, !matches!(code, 5 | 8 | 16)));
     }
     for code in 0..=2_u8 {
-        matrix.push((11, code, code == 0));
+        matrix.push((11, code, code <= 1));
     }
     for code in 0..=3_u8 {
         matrix.push((12, code, code <= 2));
@@ -798,8 +798,10 @@ fn external_errors_of_every_supported_type_reach_the_inside_host() {
             let outbound = world.establish(H1, P1, tcp);
             let expected_quote = after_one_hop(&original);
             for (icmp_type, code, supported) in error_matrix() {
-                // Protocol/Port Unreachable come only from the end host.
-                let end_host_only = icmp_type == 3 && matches!(code, 2 | 3);
+                // Protocol/Port Unreachable and reassembly Time Exceeded come only
+                // from the end host.
+                let end_host_only =
+                    (icmp_type == 3 && matches!(code, 2 | 3)) || (icmp_type == 11 && code == 1);
                 if end_host_only {
                     world.assert_refused(
                         WAN,
@@ -1019,7 +1021,7 @@ fn malformed_inside_errors_are_refused_atomically() {
     world.assert_refused(LAN, ttl_one, DropReason::Nat44Icmpv4OuterTtlExpired);
 
     let mut fragment = delivered.clone();
-    fragment[20..22].copy_from_slice(&0x2000_u16.to_be_bytes());
+    fragment[20..22].copy_from_slice(&0x2001_u16.to_be_bytes());
     fragment[24..26].fill(0);
     let checksum = ipv4_header_checksum(&fragment[14..34]);
     fragment[24..26].copy_from_slice(&checksum.to_be_bytes());

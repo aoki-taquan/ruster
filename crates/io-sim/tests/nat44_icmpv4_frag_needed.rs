@@ -336,7 +336,8 @@ fn udp_frag_needed_translates_cascade_and_keeps_nat_state_read_only() {
             internal_port: 12_345,
         },
     }));
-    for flags_fragment in [0xe000_u16, 0xc001] {
+    // Later fragments: a first fragment's quote has its ports and is translated.
+    for flags_fragment in [0xe001_u16, 0xc001] {
         let mut fragmented_quote = quote.clone();
         fragmented_quote[6..8].copy_from_slice(&flags_fragment.to_be_bytes());
         refresh_inner_checksum(&mut fragmented_quote);
@@ -588,7 +589,8 @@ fn tcp_quote_boundaries_and_exact_session_authority_are_enforced() {
     assert_eq!(nat.sessions()[0], before_session);
     assert_eq!(nat.counters(), before_counters);
 
-    for flags_fragment in [0xe000_u16, 0xc001] {
+    // Later fragments: a first fragment's quote has its ports and is translated.
+    for flags_fragment in [0xe001_u16, 0xc001] {
         let mut fragmented_quote = complete_quote[..28].to_vec();
         fragmented_quote[6..8].copy_from_slice(&flags_fragment.to_be_bytes());
         refresh_inner_checksum(&mut fragmented_quote);
@@ -748,9 +750,9 @@ fn disabled_policy_preserves_local_consume_and_candidate_drops_are_atomic() {
     }
 
     let mut bad_quote = outbound.bytes[14..42].to_vec();
-    // MF with DF clear: a fragment (a whole DF-clear quote is translated,
-    // MTU2).
-    bad_quote[6..8].copy_from_slice(&0x2000_u16.to_be_bytes());
+    // A later fragment with DF clear (a whole or first-fragment DF-clear quote is
+    // translated, MTU2).
+    bad_quote[6..8].copy_from_slice(&0x2001_u16.to_be_bytes());
     refresh_inner_checksum(&mut bad_quote);
     let malformed = frag_needed(&bad_quote, 64, 0, &[]);
     io.inject(WAN, malformed.clone());
