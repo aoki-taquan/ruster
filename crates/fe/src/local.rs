@@ -2,10 +2,10 @@
 //! kernel's packets sent back out.
 //!
 //! A pipe carries one IP packet per message, as a TUN device without packet
-//! information does. Packets to the kernel are limited per class (ICMP errors,
-//! other ICMP, TCP SYNs, other TCP, UDP, other) by a token bucket, so a flood of one kind does not crowd out the others or
-//! the forwarding; ARP and Neighbor Discovery to the neighbor process have their own
-//! buckets too.
+//! information does. Packets to the kernel are limited per VRF and per class (ICMP
+//! errors, other ICMP, TCP SYNs, other TCP, UDP, other) by a token bucket, so a flood
+//! of one kind, or in one VRF, does not crowd out the others or the forwarding; ARP
+//! and Neighbor Discovery to the neighbor process have their own buckets too.
 
 use std::io;
 use std::os::unix::net::UnixDatagram;
