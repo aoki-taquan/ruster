@@ -2010,6 +2010,15 @@ fn tcp_packet(source: [u8; 4], destination: [u8; 4], ports: (u16, u16), flags: u
     p
 }
 
+fn from_lan(packet: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&LAN_MAC);
+    frame.extend_from_slice(&HOST_MAC);
+    frame.extend_from_slice(&0x0800_u16.to_be_bytes());
+    frame.extend_from_slice(packet);
+    frame
+}
+
 fn from_wan(packet: &[u8]) -> Vec<u8> {
     let mut frame = Vec::new();
     frame.extend_from_slice(&WAN_MAC);
@@ -2224,4 +2233,120 @@ fn fragments_for_the_router_reach_it_when_the_rules_let_the_first_in() {
             .expect("the fragment reached the kernel");
         assert_eq!(&buf[..n], &packet[..]);
     }
+}
+
+fn udp_packet(source: [u8; 4], destination: [u8; 4], ports: (u16, u16)) -> Vec<u8> {
+    let mut p = vec![0_u8; 36];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&36_u16.to_be_bytes());
+    p[8] = 64;
+    p[9] = 17;
+    p[12..16].copy_from_slice(&source);
+    p[16..20].copy_from_slice(&destination);
+    p[20..22].copy_from_slice(&ports.0.to_be_bytes());
+    p[22..24].copy_from_slice(&ports.1.to_be_bytes());
+    p[24..26].copy_from_slice(&16_u16.to_be_bytes());
+    ipv4_checksummed(p)
+}
+
+/// The router's own IPv4 from NAT's inside address goes through NAT as a LAN host's,
+/// and the reply comes back to the kernel (`fe-ce-split.md`, "kernelは内側のホスト").
+#[test]
+fn nat_translates_the_router_s_own_packets_and_brings_the_reply_back_to_it() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    // From the router's LAN address (the kernel's source with NAT).
+    let own = udp_packet([192, 0, 2, 1], INTERNET, (5_353, 53));
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("translated and sent");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[26..30], &[198, 51, 100, 2], "the public address");
+    let port = u16::from_be_bytes([tx.bytes[34], tx.bytes[35]]);
+    assert!((40_000..=40_009).contains(&port), "{port}");
+
+    // The reply goes back to the kernel, to the router's address and port.
+    let reply = udp_packet(INTERNET, [198, 51, 100, 2], (53, port));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&reply));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("the reply reached the kernel");
+    assert_eq!(&buf[16..20], &[192, 0, 2, 1]);
+    assert_eq!(u16::from_be_bytes([buf[22], buf[23]]), 5_353);
+    assert!(n >= 28);
+    assert_eq!(buf[8], 64, "the router is not a hop: the TTL stays");
+    assert_eq!(ruster_core::internet_checksum(&buf[..20]), 0);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "not sent to the LAN");
+
+    // A Fragmentation Needed about that packet reaches the kernel too, turned back.
+    let error = frag_needed([203, 0, 113, 99], [198, 51, 100, 2], &tx.bytes[14..]);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&error));
+    bench.fe.step(bench.now);
+    let n = kernel.recv(&mut buf).expect("the error reached the kernel");
+    assert_eq!(&buf[16..20], &[192, 0, 2, 1], "to the router's own address");
+    assert_eq!(
+        &buf[40..44],
+        &[192, 0, 2, 1],
+        "about the router's own packet"
+    );
+    assert_eq!(u16::from_be_bytes([buf[48], buf[49]]), 5_353);
+    assert_eq!(buf[8], error[8], "the TTL stays");
+    assert_eq!(ruster_core::internet_checksum(&buf[..20]), 0);
+    assert_eq!(ruster_core::internet_checksum(&buf[20..n]), 0);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "not sent to the LAN");
+}
+
+/// With NAT, the router's packets from its outside address (its services' replies
+/// to the internet, such as SSH) pass NAT by and leave as they are.
+#[test]
+fn nat_lets_the_router_s_packets_from_its_outside_address_pass_as_they_are() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    let syn_ack = tcp_packet([198, 51, 100, 2], INTERNET, (22, 50_000), 0x12);
+    let own_udp = udp_packet([198, 51, 100, 2], INTERNET, (5_353, 53));
+    for packet in [syn_ack, own_udp] {
+        kernel.send(&packet).unwrap();
+        bench.fe.step(bench.now);
+        let tx = bench.fe.io_mut().pop_tx().expect("sent");
+        assert_eq!(tx.egress, IfId(1));
+        assert_eq!(&tx.bytes[26..30], &[198, 51, 100, 2]);
+        assert_eq!(&tx.bytes[34..36], &packet[20..22], "the port stays");
+    }
+
+    // A LAN host still cannot send as the router.
+    let spoofed = udp_packet([192, 0, 2, 1], INTERNET, (5_353, 53));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&spoofed));
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "the spoofed packet is dropped"
+    );
 }

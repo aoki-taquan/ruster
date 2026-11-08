@@ -2990,6 +2990,7 @@ struct Nat44Icmpv4RewriteDecision {
     source_mac: [u8; 6],
     destination_mac: [u8; 6],
     outer_ttl_offset: usize,
+    outer_ttl: u8,
     outer_checksum_offset: usize,
     outer_source_offset: usize,
     inner_checksum_offset: usize,
@@ -4545,7 +4546,7 @@ fn decide_ipv4<T: TraceSink>(
     });
     if let Some(config) = nat44_icmp_config {
         if ipv4.destination == config.public_address() {
-            if ingress == config.inside()
+            if nat_inside(snapshot, ingress, ipv4.source, config.inside())
                 && peek_icmp_type(frame, ipv4).is_some_and(is_query_request)
             {
                 return decide_local_ipv4_with_errors(
@@ -4618,7 +4619,8 @@ fn decide_ipv4<T: TraceSink>(
     }
     if let Some(config) = nat44_tcp_config {
         if ipv4.protocol == 6
-            && (ingress == config.inside() || ipv4.destination == config.public_address())
+            && (nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                || ipv4.destination == config.public_address())
             && !combined_realm_mismatch
             && firewall_config.is_none()
         {
@@ -4628,7 +4630,7 @@ fn decide_ipv4<T: TraceSink>(
         }
     }
     if let Some(config) = nat44_udp_config {
-        if ingress == config.inside()
+        if nat_inside(snapshot, ingress, ipv4.source, config.inside())
             && ipv4.destination == config.public_address()
             && ipv4.protocol == 17
         {
@@ -4647,7 +4649,7 @@ fn decide_ipv4<T: TraceSink>(
                 trace,
             );
         }
-        if ingress == config.inside()
+        if nat_inside(snapshot, ingress, ipv4.source, config.inside())
             && ipv4.destination == config.public_address()
             && ipv4.protocol == 6
             && nat44_tcp_config.is_none()
@@ -4679,7 +4681,7 @@ fn decide_ipv4<T: TraceSink>(
         }
     }
     if let Some(config) = nat44_tcp_config {
-        if ingress == config.inside()
+        if nat_inside(snapshot, ingress, ipv4.source, config.inside())
             && ipv4.destination == config.public_address()
             && ipv4.protocol == 6
         {
@@ -4698,7 +4700,7 @@ fn decide_ipv4<T: TraceSink>(
                 trace,
             );
         }
-        if ingress == config.inside()
+        if nat_inside(snapshot, ingress, ipv4.source, config.inside())
             && ipv4.destination == config.public_address()
             && ipv4.protocol == 17
             && nat44_udp_config.is_none()
@@ -4806,6 +4808,7 @@ fn decide_ipv4<T: TraceSink>(
             if route_miss_may_hit_nat_reject(
                 snapshot,
                 ingress,
+                ipv4.source,
                 ipv4.protocol,
                 combined_realm_mismatch,
                 nat44_udp_config,
@@ -4855,10 +4858,12 @@ fn decide_ipv4<T: TraceSink>(
     let icmp_nat = nat44_icmp_config.is_some() && ipv4.protocol == 1;
     if combined_realm_mismatch && (matches!(ipv4.protocol, 6 | 17) || icmp_nat) {
         let crosses_mismatched_realm = nat44_udp_config.is_some_and(|config| {
-            (ingress == config.inside() && route.egress() == config.outside())
+            (nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                && route.egress() == config.outside())
                 || (ingress == config.outside() && route.egress() == config.inside())
         }) || nat44_tcp_config.is_some_and(|config| {
-            (ingress == config.inside() && route.egress() == config.outside())
+            (nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                && route.egress() == config.outside())
                 || (ingress == config.outside() && route.egress() == config.inside())
         });
         if crosses_mismatched_realm {
@@ -4872,10 +4877,13 @@ fn decide_ipv4<T: TraceSink>(
     if crosses_external_to_internal {
         return Err(Nat44ExternalToInternalBypass);
     }
-    let crosses_internal_to_external = nat44_udp_config
-        .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside())
-        || nat44_tcp_config
-            .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+    let crosses_internal_to_external = nat44_udp_config.is_some_and(|config| {
+        nat_inside(snapshot, ingress, ipv4.source, config.inside())
+            && route.egress() == config.outside()
+    }) || nat44_tcp_config.is_some_and(|config| {
+        nat_inside(snapshot, ingress, ipv4.source, config.inside())
+            && route.egress() == config.outside()
+    });
     if crosses_internal_to_external && !matches!(ipv4.protocol, 6 | 17) && !icmp_nat {
         return Err(if nat44_udp_config.is_some() {
             Nat44UdpUnsupportedTransport
@@ -4887,7 +4895,7 @@ fn decide_ipv4<T: TraceSink>(
     // firewall like a host's from a port: rules name that interface `rt-default`.
     if let Some(config) = firewall_config {
         if let Some(udp_config) = nat44_udp_config {
-            if ingress == udp_config.inside()
+            if nat_inside(snapshot, ingress, ipv4.source, udp_config.inside())
                 && route.egress() == udp_config.outside()
                 && ipv4.protocol == 17
             {
@@ -4895,7 +4903,7 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
         if let Some(tcp_config) = nat44_tcp_config {
-            if ingress == tcp_config.inside()
+            if nat_inside(snapshot, ingress, ipv4.source, tcp_config.inside())
                 && route.egress() == tcp_config.outside()
                 && ipv4.protocol == 6
             {
@@ -4903,7 +4911,7 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
         if let Some(icmp_config) = nat44_icmp_config {
-            if ingress == icmp_config.inside()
+            if nat_inside(snapshot, ingress, ipv4.source, icmp_config.inside())
                 && route.egress() == icmp_config.outside()
                 && ipv4.protocol == 1
             {
@@ -5023,7 +5031,10 @@ fn decide_ipv4<T: TraceSink>(
         old_checksum: ipv4.checksum,
     };
     if let Some(config) = nat44_icmp_config {
-        if ingress == config.inside() && route.egress() == config.outside() && ipv4.protocol == 1 {
+        if nat_inside(snapshot, ingress, ipv4.source, config.inside())
+            && route.egress() == config.outside()
+            && ipv4.protocol == 1
+        {
             return decide_nat44_icmp_outbound(
                 frame,
                 snapshot,
@@ -5039,7 +5050,7 @@ fn decide_ipv4<T: TraceSink>(
         }
     }
     if let Some(config) = nat44_udp_config {
-        if ingress == config.inside()
+        if nat_inside(snapshot, ingress, ipv4.source, config.inside())
             && route.egress() == config.outside()
             && (ipv4.protocol == 17 || (ipv4.protocol == 6 && nat44_tcp_config.is_none()))
         {
@@ -5058,7 +5069,7 @@ fn decide_ipv4<T: TraceSink>(
         }
     }
     if let Some(config) = nat44_tcp_config {
-        if ingress == config.inside()
+        if nat_inside(snapshot, ingress, ipv4.source, config.inside())
             && route.egress() == config.outside()
             && (ipv4.protocol == 6 || (ipv4.protocol == 17 && nat44_udp_config.is_none()))
         {
@@ -5078,12 +5089,16 @@ fn decide_ipv4<T: TraceSink>(
     }
     let crosses_udp_only = nat44_tcp_config.is_none()
         && ipv4.protocol == 6
-        && nat44_udp_config
-            .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+        && nat44_udp_config.is_some_and(|config| {
+            nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                && route.egress() == config.outside()
+        });
     let crosses_tcp_only = nat44_udp_config.is_none()
         && ipv4.protocol == 17
-        && nat44_tcp_config
-            .is_some_and(|config| ingress == config.inside() && route.egress() == config.outside());
+        && nat44_tcp_config.is_some_and(|config| {
+            nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                && route.egress() == config.outside()
+        });
     if crosses_tcp_only {
         return nat44_tcp_drop(ingress, Nat44TcpUnsupportedTransport, trace);
     }
@@ -5590,13 +5605,19 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
         }
     };
 
+    // An error about the router's own packet goes to its host, out of the kernel's
+    // interface, which is where that packet came in.
+    let kernel = snapshot
+        .is_local_ipv4(internal_address)
+        .then(|| snapshot.kernel_interface_of(snapshot))
+        .flatten();
     if let Some(runtime) = related_firewall.as_deref() {
         let protocol = FirewallProtocol::from_ipv4(quote.protocol)
             .expect("the NAT ICMPv4 parser accepts only ICMP, UDP, and TCP quotes");
         let (source_port, destination_port) =
             quote.firewall_ports(internal_port, quote.destination_port);
         let packet = FirewallPacket {
-            ingress: inside,
+            ingress: kernel.unwrap_or(inside),
             egress: outside,
             source: internal_address.into(),
             destination: quote.destination_address.into(),
@@ -5622,12 +5643,20 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
         }
     }
     let target = route.next_hop().unwrap_or(internal_address);
-    let (interface, destination_mac) =
-        resolve_nat44_icmpv4_next_hop(snapshot, inside, target, trace)?;
-    Ok(build_nat44_icmpv4_rewrite(
+    let (egress, (interface, destination_mac)) = match kernel {
+        Some(kernel) => {
+            let interface = *snapshot.interface(kernel).ok_or(InterfaceMiss)?;
+            (kernel, (interface, interface.mac))
+        }
+        None => (
+            inside,
+            resolve_nat44_icmpv4_next_hop(snapshot, inside, target, trace)?,
+        ),
+    };
+    let mut decision = build_nat44_icmpv4_rewrite(
         outer,
         quote,
-        inside,
+        egress,
         interface.mac.0,
         destination_mac.0,
         Nat44Icmpv4Rewrite {
@@ -5641,7 +5670,17 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
             internal_address,
             internal_port,
         },
-    ))
+    );
+    // The router's host is not a hop: its TTL stays as it came (RFC 1812 5.3.1).
+    if let (Some(_), PacketDecision::Nat44Icmpv4(rewrite)) = (kernel, &mut decision) {
+        rewrite.outer_checksum = rfc1624_update(
+            rewrite.outer_checksum,
+            u16::from_be_bytes([outer.ttl - 1, outer.protocol]),
+            u16::from_be_bytes([outer.ttl, outer.protocol]),
+        );
+        rewrite.outer_ttl = outer.ttl;
+    }
+    Ok(decision)
 }
 
 /// Parses and validates a candidate ICMPv4 error and its quote (RFC 5508
@@ -5959,6 +5998,7 @@ fn build_nat44_icmpv4_rewrite(
         source_mac,
         destination_mac,
         outer_ttl_offset: outer.header_offset + 8,
+        outer_ttl: outer.ttl - 1,
         outer_checksum_offset: outer.header_offset + 10,
         outer_source_offset: outer.header_offset + 12,
         inner_checksum_offset: quote.inner_checksum_offset,
@@ -6017,7 +6057,9 @@ fn observe_combined_nat_security_time<T: TraceSink>(
             let Some(config) = nat44_icmp_config else {
                 return Ok(());
             };
-            if ingress != config.inside() && ipv4.destination != config.public_address() {
+            if !nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                && ipv4.destination != config.public_address()
+            {
                 return Ok(());
             }
             observe_nat44_icmp_security_time(snapshot, config, nat44_icmp, ingress, now, trace)?;
@@ -6028,7 +6070,9 @@ fn observe_combined_nat_security_time<T: TraceSink>(
             let Some(config) = nat44_udp_config else {
                 return Ok(());
             };
-            if ingress != config.inside() && ipv4.destination != config.public_address() {
+            if !nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                && ipv4.destination != config.public_address()
+            {
                 return Ok(());
             }
             let runtime = require_nat44_udp_runtime(snapshot, config, nat44_udp, ingress, trace)?;
@@ -6045,7 +6089,9 @@ fn observe_combined_nat_security_time<T: TraceSink>(
             let Some(config) = nat44_tcp_config else {
                 return Ok(());
             };
-            if ingress != config.inside() && ipv4.destination != config.public_address() {
+            if !nat_inside(snapshot, ingress, ipv4.source, config.inside())
+                && ipv4.destination != config.public_address()
+            {
                 return Ok(());
             }
             let runtime = require_nat44_tcp_runtime(snapshot, config, nat44_tcp, ingress, trace)?;
@@ -6174,6 +6220,7 @@ pub(crate) fn plan_firewall_packet(
 fn route_miss_may_hit_nat_reject(
     snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
+    source: crate::Ipv4Address,
     protocol: u8,
     combined_realm_mismatch: bool,
     nat44_udp_config: Option<&Nat44UdpConfig>,
@@ -6188,8 +6235,10 @@ fn route_miss_may_hit_nat_reject(
     if udp_outside || tcp_outside {
         return true;
     }
-    let udp_inside = nat44_udp_config.is_some_and(|config| ingress == config.inside());
-    let tcp_inside = nat44_tcp_config.is_some_and(|config| ingress == config.inside());
+    let udp_inside = nat44_udp_config
+        .is_some_and(|config| nat_inside(snapshot, ingress, source, config.inside()));
+    let tcp_inside = nat44_tcp_config
+        .is_some_and(|config| nat_inside(snapshot, ingress, source, config.inside()));
     let icmp_nat = nat44_icmp_config.is_some() && protocol == 1;
     if combined_realm_mismatch
         && (matches!(protocol, 6 | 17) || icmp_nat)
@@ -6197,7 +6246,8 @@ fn route_miss_may_hit_nat_reject(
     {
         return true;
     }
-    if let Some(config) = nat44_icmp_config.filter(|config| icmp_nat && ingress == config.inside())
+    if let Some(config) = nat44_icmp_config
+        .filter(|config| icmp_nat && nat_inside(snapshot, ingress, source, config.inside()))
     {
         let usable = config.authority_matches(snapshot)
             && nat44_icmp
@@ -6355,6 +6405,26 @@ fn admit_icmpv4_error_to_kernel(
         .inspect_related_packet(packet, true, now_ms)
         .map(|_| ())
         .map_err(|_| unrelated)
+}
+
+/// Whether a packet from `ingress` is on NAT's inside: from the inside interface, or
+/// from the router itself (the kernel's interface), whose own packets NAT translates
+/// as a host's (`docs/design/fe-ce-split.md`, "kernelは内側のホスト").
+///
+/// The router's own packets are inside only when they leave from its address on the
+/// inside (the kernel's source with NAT): those from another of its addresses, such
+/// as the outside one its services listen on, pass NAT by as before.
+fn nat_inside(
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    source: crate::Ipv4Address,
+    inside: IfId,
+) -> bool {
+    ingress == inside
+        || (snapshot.is_kernel_ingress(ingress)
+            && snapshot
+                .route_lookup(source)
+                .is_some_and(|route| route.egress() == inside))
 }
 
 fn validate_firewall_transport(
@@ -6544,8 +6614,10 @@ fn decide_nat44_udp_outbound<T: TraceSink>(
     if udp.source_port == 0 {
         return nat44_udp_drop(ingress, Nat44UdpSourcePortZero, trace);
     }
+    // The router's own address is a source only for its own packets (from the
+    // kernel's interface); from anywhere else it is spoofed.
     if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot.is_local_ipv4(ipv4.source)
+        || (snapshot.is_local_ipv4(ipv4.source) && !snapshot.is_kernel_ingress(ingress))
         || ipv4.source == config.public_address()
     {
         return nat44_udp_drop(ingress, Nat44UdpSourceForbidden, trace);
@@ -6670,10 +6742,17 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
     if reverse_route.egress() != config.inside() {
         return nat44_udp_drop(ingress, Nat44UdpWrongEgress, trace);
     }
+    // NAT turned it back to the router's own address: it goes to the router's host,
+    // out of the kernel's interface, as to a host behind the inside interface.
+    let kernel = snapshot
+        .is_local_ipv4(internal_address)
+        .then(|| snapshot.kernel_interface_of(snapshot))
+        .flatten();
+    let egress = kernel.unwrap_or(reverse_route.egress());
     if let Some(firewall_config) = firewall_config {
         let firewall_packet = FirewallPacket {
             ingress,
-            egress: reverse_route.egress(),
+            egress,
             source: ipv4.source.into(),
             destination: internal_address.into(),
             protocol: FirewallProtocol::Udp,
@@ -6684,7 +6763,7 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         let firewall_runtime = require_firewall_runtime(snapshot, firewall_config, firewall)?;
         *firewall_plan = Some(plan_firewall(
             ingress,
-            reverse_route.egress(),
+            egress,
             ipv4,
             firewall_validated.expect("inbound firewall packet was preflight validated"),
             Some(firewall_packet),
@@ -6694,34 +6773,40 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
             now.0,
         )?);
     }
-    if ipv4.ttl <= 1 {
+    // A packet for the router is not forwarded: its TTL is neither checked nor
+    // decreased (RFC 1812 section 5.3.1).
+    if kernel.is_none() && ipv4.ttl <= 1 {
         return nat44_udp_drop(ingress, Ipv4TtlExpired, trace);
     }
+    let new_ttl = if kernel.is_some() {
+        ipv4.ttl
+    } else {
+        ipv4.ttl - 1
+    };
     let target = reverse_route.next_hop().unwrap_or(internal_address);
-    let interface = snapshot
-        .interface(reverse_route.egress())
-        .ok_or(InterfaceMiss)?;
-    let destination_mac =
-        if let Some(neighbor) = snapshot.static_neighbor(reverse_route.egress(), target) {
-            neighbor.mac
-        } else {
-            return nat44_udp_drop(ingress, NeighborUnresolved, trace);
-        };
+    let interface = snapshot.interface(egress).ok_or(InterfaceMiss)?;
+    let destination_mac = if kernel.is_some() {
+        interface.mac
+    } else if let Some(neighbor) = snapshot.static_neighbor(egress, target) {
+        neighbor.mac
+    } else {
+        return nat44_udp_drop(ingress, NeighborUnresolved, trace);
+    };
     let ttl_offset = ipv4.header_offset + 8;
     let checksum_offset = ipv4.header_offset + 10;
     let forwarding = Ipv4RewriteDecision {
-        egress: reverse_route.egress(),
+        egress,
         source_mac: interface.mac.0,
         destination_mac: destination_mac.0,
         ttl_offset,
         checksum_offset,
         checksum_end: checksum_offset + 2,
         old_ttl_protocol: u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
-        new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
+        new_ttl_protocol: u16::from_be_bytes([new_ttl, ipv4.protocol]),
         old_checksum: ipv4.checksum,
     };
     trace.record(TraceEvent::Routed {
-        egress: reverse_route.egress(),
+        egress,
         neighbor_target: target,
     });
     build_nat44_udp_rewrite(
@@ -6777,8 +6862,10 @@ fn decide_nat44_tcp_outbound<T: TraceSink>(
     if tcp.source_port == 0 {
         return nat44_tcp_drop(ingress, Nat44TcpSourcePortZero, trace);
     }
+    // The router's own address is a source only for its own packets (from the
+    // kernel's interface); from anywhere else it is spoofed.
     if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot.is_local_ipv4(ipv4.source)
+        || (snapshot.is_local_ipv4(ipv4.source) && !snapshot.is_kernel_ingress(ingress))
         || ipv4.source == config.public_address()
     {
         return nat44_tcp_drop(ingress, Nat44TcpSourceForbidden, trace);
@@ -6948,10 +7035,17 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
     if reverse_route.egress() != config.inside() {
         return nat44_tcp_drop(ingress, Nat44TcpWrongEgress, trace);
     }
+    // NAT turned it back to the router's own address: it goes to the router's host,
+    // out of the kernel's interface, as to a host behind the inside interface.
+    let kernel = snapshot
+        .is_local_ipv4(internal_address)
+        .then(|| snapshot.kernel_interface_of(snapshot))
+        .flatten();
+    let egress = kernel.unwrap_or(reverse_route.egress());
     if let Some(firewall_config) = firewall_config {
         let firewall_packet = FirewallPacket {
             ingress,
-            egress: reverse_route.egress(),
+            egress,
             source: ipv4.source.into(),
             destination: internal_address.into(),
             protocol: FirewallProtocol::Tcp,
@@ -6962,7 +7056,7 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
         let firewall_runtime = require_firewall_runtime(snapshot, firewall_config, firewall)?;
         *firewall_plan = Some(plan_firewall(
             ingress,
-            reverse_route.egress(),
+            egress,
             ipv4,
             firewall_validated.expect("inbound firewall packet was preflight validated"),
             Some(firewall_packet),
@@ -6972,34 +7066,40 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
             now.0,
         )?);
     }
-    if ipv4.ttl <= 1 {
+    // A packet for the router is not forwarded: its TTL is neither checked nor
+    // decreased (RFC 1812 section 5.3.1).
+    if kernel.is_none() && ipv4.ttl <= 1 {
         return nat44_tcp_drop(ingress, Ipv4TtlExpired, trace);
     }
+    let new_ttl = if kernel.is_some() {
+        ipv4.ttl
+    } else {
+        ipv4.ttl - 1
+    };
     let target = reverse_route.next_hop().unwrap_or(internal_address);
-    let interface = snapshot
-        .interface(reverse_route.egress())
-        .ok_or(InterfaceMiss)?;
-    let destination_mac =
-        if let Some(neighbor) = snapshot.static_neighbor(reverse_route.egress(), target) {
-            neighbor.mac
-        } else {
-            return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
-        };
+    let interface = snapshot.interface(egress).ok_or(InterfaceMiss)?;
+    let destination_mac = if kernel.is_some() {
+        interface.mac
+    } else if let Some(neighbor) = snapshot.static_neighbor(egress, target) {
+        neighbor.mac
+    } else {
+        return nat44_tcp_drop(ingress, NeighborUnresolved, trace);
+    };
     let ttl_offset = ipv4.header_offset + 8;
     let checksum_offset = ipv4.header_offset + 10;
     let forwarding = Ipv4RewriteDecision {
-        egress: reverse_route.egress(),
+        egress,
         source_mac: interface.mac.0,
         destination_mac: destination_mac.0,
         ttl_offset,
         checksum_offset,
         checksum_end: checksum_offset + 2,
         old_ttl_protocol: u16::from_be_bytes([ipv4.ttl, ipv4.protocol]),
-        new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
+        new_ttl_protocol: u16::from_be_bytes([new_ttl, ipv4.protocol]),
         old_checksum: ipv4.checksum,
     };
     trace.record(TraceEvent::Routed {
-        egress: reverse_route.egress(),
+        egress,
         neighbor_target: target,
     });
     build_nat44_tcp_rewrite(
@@ -8751,7 +8851,7 @@ fn apply_nat44_icmpv4_rewrite(
     }
     frame[0..6].copy_from_slice(&decision.destination_mac);
     frame[6..12].copy_from_slice(&decision.source_mac);
-    frame[decision.outer_ttl_offset] -= 1;
+    frame[decision.outer_ttl_offset] = decision.outer_ttl;
     frame[decision.outer_checksum_offset..decision.outer_checksum_offset + 2]
         .copy_from_slice(&decision.outer_checksum.to_be_bytes());
     let outer = decision.outer_source_offset;
