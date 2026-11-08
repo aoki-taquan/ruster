@@ -106,8 +106,12 @@ fn outbound_rule(id: u32, protocol: FirewallProtocol) -> FirewallRule {
         FirewallRuleId(id),
         FirewallInterface::Interface(LAN),
         FirewallInterface::Interface(WAN),
-        FirewallIpv4Prefix::new(Ipv4Address::from_octets([10, 0, 0, 0]), 8).unwrap(),
-        FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap(),
+        FirewallIpv4Prefix::new(Ipv4Address::from_octets([10, 0, 0, 0]), 8)
+            .unwrap()
+            .into(),
+        FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0)
+            .unwrap()
+            .into(),
         protocol,
         full,
         full,

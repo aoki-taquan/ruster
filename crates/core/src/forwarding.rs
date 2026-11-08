@@ -5983,6 +5983,8 @@ fn observe_combined_nat_security_time<T: TraceSink>(
             }
             observe_nat44_icmp_security_time(snapshot, config, nat44_icmp, ingress, now, trace)?;
         }
+        // An IPv4 packet is never ICMPv6.
+        FirewallProtocol::Icmpv6 => {}
         FirewallProtocol::Udp => {
             let Some(config) = nat44_udp_config else {
                 return Ok(());
@@ -6232,6 +6234,8 @@ fn validate_firewall_transport(
                 tcp_flags,
             }
         }
+        // `from_ipv4` never gives ICMPv6.
+        FirewallProtocol::Icmpv6 => return Err(FirewallUnsupportedProtocol),
         FirewallProtocol::Tcp => {
             let tcp = validate_nat44_tcp(frame, ipv4).map_err(|reason| match reason {
                 Nat44TcpHeaderTruncated => FirewallTcpHeaderTruncated,
@@ -9239,8 +9243,12 @@ mod tests {
             FirewallRuleId(1),
             FirewallInterface::Interface(LAN),
             FirewallInterface::Interface(WAN),
-            FirewallIpv4Prefix::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24).unwrap(),
-            FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap(),
+            FirewallIpv4Prefix::new(Ipv4Address::from_octets([10, 0, 0, 0]), 24)
+                .unwrap()
+                .into(),
+            FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0)
+                .unwrap()
+                .into(),
             FirewallProtocol::Tcp,
             FirewallPortRange::new(1, u16::MAX).unwrap(),
             FirewallPortRange::new(1, u16::MAX).unwrap(),

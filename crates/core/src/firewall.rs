@@ -137,6 +137,105 @@ impl FirewallIpv4Prefix {
     }
 }
 
+/// An IPv6 prefix of a firewall rule.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FirewallIpv6Prefix {
+    address: [u8; 16],
+    prefix_len: u8,
+}
+
+impl FirewallIpv6Prefix {
+    pub fn new(address: [u8; 16], prefix_len: u8) -> Result<Self, FirewallIpv4PrefixError> {
+        if prefix_len > 128 {
+            return Err(FirewallIpv4PrefixError::InvalidPrefixLength);
+        }
+        let value = u128::from_be_bytes(address);
+        if value & !ipv6_mask(prefix_len) != 0 {
+            return Err(FirewallIpv4PrefixError::HostBitsSet);
+        }
+        Ok(Self {
+            address,
+            prefix_len,
+        })
+    }
+
+    #[must_use]
+    pub const fn address(self) -> [u8; 16] {
+        self.address
+    }
+
+    #[must_use]
+    pub const fn prefix_len(self) -> u8 {
+        self.prefix_len
+    }
+
+    fn matches(self, address: FirewallAddress) -> bool {
+        // An IPv6 prefix matches IPv6 addresses only.
+        let FirewallAddress::V6(address) = address else {
+            return false;
+        };
+        u128::from_be_bytes(address) & ipv6_mask(self.prefix_len)
+            == u128::from_be_bytes(self.address)
+    }
+}
+
+fn ipv6_mask(prefix_len: u8) -> u128 {
+    match prefix_len {
+        0 => 0,
+        len => u128::MAX << (128 - u32::from(len.min(128))),
+    }
+}
+
+/// A prefix a rule names: IPv4 or IPv6. A rule's source and destination are of one
+/// family, and it matches packets of that family only.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FirewallPrefix {
+    V4(FirewallIpv4Prefix),
+    V6(FirewallIpv6Prefix),
+}
+
+impl From<FirewallIpv4Prefix> for FirewallPrefix {
+    fn from(prefix: FirewallIpv4Prefix) -> Self {
+        Self::V4(prefix)
+    }
+}
+
+impl From<FirewallIpv6Prefix> for FirewallPrefix {
+    fn from(prefix: FirewallIpv6Prefix) -> Self {
+        Self::V6(prefix)
+    }
+}
+
+impl FirewallPrefix {
+    #[must_use]
+    pub const fn prefix_len(self) -> u8 {
+        match self {
+            Self::V4(prefix) => prefix.prefix_len,
+            Self::V6(prefix) => prefix.prefix_len,
+        }
+    }
+
+    /// The IPv4 prefix, for an IPv4 rule.
+    #[must_use]
+    pub const fn ipv4(self) -> Option<FirewallIpv4Prefix> {
+        match self {
+            Self::V4(prefix) => Some(prefix),
+            Self::V6(_) => None,
+        }
+    }
+
+    const fn is_ipv6(self) -> bool {
+        matches!(self, Self::V6(_))
+    }
+
+    fn matches(self, address: FirewallAddress) -> bool {
+        match self {
+            Self::V4(prefix) => prefix.matches(address),
+            Self::V6(prefix) => prefix.matches(address),
+        }
+    }
+}
+
 fn prefix_mask(prefix_len: u8) -> Option<u32> {
     match prefix_len {
         0 => Some(0),
@@ -201,7 +300,10 @@ impl FirewallPortRange {
 pub enum FirewallProtocol {
     Tcp,
     Udp,
+    /// ICMPv4 queries.
     Icmp,
+    /// ICMPv6 queries (Echo).
+    Icmpv6,
 }
 
 /// Flag of an ICMP query reply in a firewall packet's flags (N5). It is
@@ -217,7 +319,9 @@ const fn icmp_direction_allows(
     reverse: bool,
 ) -> bool {
     match protocol {
-        FirewallProtocol::Icmp => (packet_flags & FIREWALL_ICMP_REPLY != 0) == reverse,
+        FirewallProtocol::Icmp | FirewallProtocol::Icmpv6 => {
+            (packet_flags & FIREWALL_ICMP_REPLY != 0) == reverse
+        }
         FirewallProtocol::Tcp | FirewallProtocol::Udp => true,
     }
 }
@@ -232,13 +336,14 @@ impl FirewallProtocol {
         }
     }
 
-    /// The IPv4 protocol number.
+    /// The IPv4 protocol number, or the IPv6 Next Header value (58 for ICMPv6).
     #[must_use]
     pub const fn ipv4_protocol(self) -> u8 {
         match self {
             Self::Icmp => 1,
             Self::Tcp => 6,
             Self::Udp => 17,
+            Self::Icmpv6 => 58,
         }
     }
 }
@@ -254,8 +359,8 @@ pub struct FirewallRule {
     id: FirewallRuleId,
     ingress: FirewallInterface,
     egress: FirewallInterface,
-    source: FirewallIpv4Prefix,
-    destination: FirewallIpv4Prefix,
+    source: FirewallPrefix,
+    destination: FirewallPrefix,
     protocol: FirewallProtocol,
     source_ports: FirewallPortRange,
     destination_ports: FirewallPortRange,
@@ -268,8 +373,8 @@ impl FirewallRule {
         id: FirewallRuleId,
         ingress: FirewallInterface,
         egress: FirewallInterface,
-        source: FirewallIpv4Prefix,
-        destination: FirewallIpv4Prefix,
+        source: FirewallPrefix,
+        destination: FirewallPrefix,
         protocol: FirewallProtocol,
         source_ports: FirewallPortRange,
         destination_ports: FirewallPortRange,
@@ -304,12 +409,12 @@ impl FirewallRule {
     }
 
     #[must_use]
-    pub const fn source(self) -> FirewallIpv4Prefix {
+    pub const fn source(self) -> FirewallPrefix {
         self.source
     }
 
     #[must_use]
-    pub const fn destination(self) -> FirewallIpv4Prefix {
+    pub const fn destination(self) -> FirewallPrefix {
         self.destination
     }
 
@@ -529,6 +634,9 @@ pub enum FirewallConfigError {
     GenerationZero,
     RuleIdZero,
     DuplicateRuleId,
+    /// A rule's source and destination are of two families, or its protocol is
+    /// ICMPv4 in an IPv6 rule or ICMPv6 in an IPv4 one.
+    MixedFamilies,
     IngressInterfaceMissing,
     EgressInterfaceMissing,
     PublicationOwnerRequired,
@@ -558,6 +666,13 @@ pub fn validate_firewall_rules(
             .any(|candidate| candidate.id == rule.id)
         {
             return Err(FirewallConfigError::DuplicateRuleId);
+        }
+        let ipv6 = rule.source.is_ipv6();
+        if rule.destination.is_ipv6() != ipv6
+            || (rule.protocol == FirewallProtocol::Icmp && ipv6)
+            || (rule.protocol == FirewallProtocol::Icmpv6 && !ipv6)
+        {
+            return Err(FirewallConfigError::MixedFamilies);
         }
         if let FirewallInterface::Interface(interface) = rule.ingress {
             if snapshot.interface(interface).is_none() {
@@ -772,17 +887,21 @@ fn rules_fingerprint(rules: &[FirewallRule]) -> u64 {
                 FirewallInterface::Interface(interface) => u64::from(interface.0),
             },
         );
-        hash = mix(
-            hash,
-            u64::from(u32::from_be_bytes(rule.source.address.octets())),
-        );
-        hash = mix(hash, u64::from(rule.source.prefix_len));
-        hash = mix(
-            hash,
-            u64::from(u32::from_be_bytes(rule.destination.address.octets())),
-        );
-        hash = mix(hash, u64::from(rule.destination.prefix_len));
-        hash = mix(hash, u64::from(rule.protocol.ipv4_protocol()));
+        for prefix in [rule.source, rule.destination] {
+            match prefix {
+                // IPv4 as before, so an IPv4 table's fingerprint does not change.
+                FirewallPrefix::V4(prefix) => {
+                    hash = mix(hash, u64::from(u32::from_be_bytes(prefix.address.octets())));
+                }
+                FirewallPrefix::V6(prefix) => {
+                    hash = mix(hash, 6);
+                    let value = u128::from_be_bytes(prefix.address);
+                    hash = mix(hash, (value >> 64) as u64);
+                    hash = mix(hash, value as u64);
+                }
+            }
+            hash = mix(hash, u64::from(prefix.prefix_len()));
+        }
         hash = mix(hash, u64::from(rule.source_ports.first));
         hash = mix(hash, u64::from(rule.source_ports.last));
         hash = mix(hash, u64::from(rule.destination_ports.first));
@@ -2166,7 +2285,9 @@ impl<'state> FirewallRuntime<'state> {
                 (FirewallInterface::Any, FirewallAction::AllowStateful) => {
                     let valid_initial = match packet.protocol {
                         FirewallProtocol::Tcp => packet.tcp_flags & 0x17 == 0x02,
-                        FirewallProtocol::Icmp => packet.tcp_flags & FIREWALL_ICMP_REPLY == 0,
+                        FirewallProtocol::Icmp | FirewallProtocol::Icmpv6 => {
+                            packet.tcp_flags & FIREWALL_ICMP_REPLY == 0
+                        }
                         FirewallProtocol::Udp => true,
                     };
                     return valid_initial.then_some(rule.id);
@@ -2490,7 +2611,7 @@ impl<'state> FirewallRuntime<'state> {
     fn slot_ttl(&self, slot: FirewallStateSlot) -> u64 {
         match (slot.protocol, slot.tcp_phase) {
             // ICMP query flows (N5) share the datagram idle TTL.
-            (FirewallProtocol::Udp | FirewallProtocol::Icmp, _) => {
+            (FirewallProtocol::Udp | FirewallProtocol::Icmp | FirewallProtocol::Icmpv6, _) => {
                 self.binding.policy.udp_idle_ttl_ms
             }
             (FirewallProtocol::Tcp, FirewallTcpPhase::Opening) => {
@@ -2607,6 +2728,11 @@ impl FirewallReconcilePermit<'_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::{
+        Interface, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, Route,
+        ValidatedForwardingOwner,
+    };
 
     #[test]
     fn an_ipv6_flow_hashes_the_same_both_ways_and_apart_from_ipv4() {
@@ -2651,16 +2777,73 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_prefix_checks_its_length_and_host_bits_and_matches_ipv6_only() {
+        let doc = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let prefix = FirewallIpv6Prefix::new(doc, 32).unwrap();
+        let mut inside = doc;
+        inside[15] = 1;
+        let mut outside = doc;
+        outside[3] = 0xb9;
+        assert!(prefix.matches(FirewallAddress::V6(inside)));
+        assert!(!prefix.matches(FirewallAddress::V6(outside)));
+        assert!(
+            !prefix.matches(FirewallAddress::V4(Ipv4Address::from_octets([
+                32, 1, 13, 184
+            ])))
+        );
+        assert_eq!(
+            FirewallIpv6Prefix::new(inside, 32),
+            Err(FirewallIpv4PrefixError::HostBitsSet)
+        );
+        assert_eq!(
+            FirewallIpv6Prefix::new(doc, 129),
+            Err(FirewallIpv4PrefixError::InvalidPrefixLength)
+        );
+        let all = FirewallIpv6Prefix::new([0; 16], 0).unwrap();
+        assert!(all.matches(FirewallAddress::V6([0xff; 16])));
+        assert!(FirewallIpv6Prefix::new(inside, 128)
+            .unwrap()
+            .matches(FirewallAddress::V6(inside)));
+    }
+
+    #[test]
+    fn a_rule_must_keep_to_one_family() {
+        let snapshot = ForwardingSnapshot::new(&[], &[], &[], &[]).unwrap();
+        let v6: FirewallPrefix = FirewallIpv6Prefix::new([0; 16], 0).unwrap().into();
+        let v4: FirewallPrefix = any().into();
+        let with = |source, destination, protocol| {
+            FirewallRule::new(
+                FirewallRuleId(1),
+                FirewallInterface::Any,
+                FirewallInterface::Any,
+                source,
+                destination,
+                protocol,
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallPortRange::new(0, u16::MAX).unwrap(),
+                FirewallAction::AllowStateful,
+            )
+        };
+        let ok = |rule| validate_firewall_rules(&snapshot, &[rule]);
+        assert_eq!(ok(with(v6, v6, FirewallProtocol::Tcp)), Ok(()));
+        assert_eq!(ok(with(v6, v6, FirewallProtocol::Icmpv6)), Ok(()));
+        assert_eq!(ok(with(v4, v4, FirewallProtocol::Icmp)), Ok(()));
+        for rule in [
+            with(v4, v6, FirewallProtocol::Udp),
+            with(v6, v4, FirewallProtocol::Udp),
+            with(v6, v6, FirewallProtocol::Icmp),
+            with(v4, v4, FirewallProtocol::Icmpv6),
+        ] {
+            assert_eq!(ok(rule), Err(FirewallConfigError::MixedFamilies));
+        }
+    }
+
+    #[test]
     fn an_ipv4_prefix_never_matches_an_ipv6_address() {
         let any = FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap();
         assert!(any.matches(FirewallAddress::V4(Ipv4Address::from_octets([10, 0, 0, 1]))));
         assert!(!any.matches(FirewallAddress::V6([0; 16])));
     }
-    use super::*;
-    use crate::{
-        Interface, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, Route,
-        ValidatedForwardingOwner,
-    };
 
     const LAN: IfId = IfId(1);
     const WAN: IfId = IfId(2);
@@ -2769,8 +2952,8 @@ mod tests {
             FirewallRuleId(id),
             FirewallInterface::Interface(LAN),
             FirewallInterface::Interface(WAN),
-            any(),
-            any(),
+            any().into(),
+            any().into(),
             protocol,
             FirewallPortRange::new(0, u16::MAX).unwrap(),
             FirewallPortRange::new(1, u16::MAX).unwrap(),
@@ -3100,8 +3283,8 @@ mod tests {
                 FirewallRuleId(3),
                 FirewallInterface::Interface(IfId(99)),
                 FirewallInterface::Any,
-                any(),
-                any(),
+                any().into(),
+                any().into(),
                 FirewallProtocol::Udp,
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
@@ -3149,8 +3332,8 @@ mod tests {
                 FirewallRuleId(0),
                 FirewallInterface::Interface(IfId(98)),
                 FirewallInterface::Interface(IfId(99)),
-                any(),
-                any(),
+                any().into(),
+                any().into(),
                 FirewallProtocol::Udp,
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
@@ -3162,8 +3345,8 @@ mod tests {
                     FirewallRuleId(7),
                     FirewallInterface::Interface(IfId(98)),
                     FirewallInterface::Interface(IfId(99)),
-                    any(),
-                    any(),
+                    any().into(),
+                    any().into(),
                     FirewallProtocol::Udp,
                     FirewallPortRange::new(0, u16::MAX).unwrap(),
                     FirewallPortRange::new(0, u16::MAX).unwrap(),
@@ -3174,8 +3357,8 @@ mod tests {
                 FirewallRuleId(8),
                 FirewallInterface::Interface(IfId(98)),
                 FirewallInterface::Interface(IfId(99)),
-                any(),
-                any(),
+                any().into(),
+                any().into(),
                 FirewallProtocol::Udp,
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
@@ -3185,8 +3368,8 @@ mod tests {
                 FirewallRuleId(9),
                 FirewallInterface::Any,
                 FirewallInterface::Interface(IfId(99)),
-                any(),
-                any(),
+                any().into(),
+                any().into(),
                 FirewallProtocol::Udp,
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
@@ -3532,8 +3715,8 @@ mod tests {
                 FirewallRuleId(9),
                 FirewallInterface::Any,
                 FirewallInterface::Any,
-                any(),
-                any(),
+                any().into(),
+                any().into(),
                 FirewallProtocol::Icmp,
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
                 FirewallPortRange::new(0, u16::MAX).unwrap(),
@@ -4651,8 +4834,8 @@ mod tests {
             FirewallRuleId(id),
             FirewallInterface::Interface(LAN),
             egress,
-            any(),
-            any(),
+            any().into(),
+            any().into(),
             protocol,
             FirewallPortRange::new(0, u16::MAX).unwrap(),
             FirewallPortRange::new(1, u16::MAX).unwrap(),
@@ -4699,8 +4882,8 @@ mod tests {
             FirewallRuleId(id),
             FirewallInterface::Interface(WAN),
             egress,
-            source,
-            destination,
+            source.into(),
+            destination.into(),
             FirewallProtocol::Tcp,
             FirewallPortRange::new(0, u16::MAX).unwrap(),
             FirewallPortRange::new(destination_ports.0, destination_ports.1).unwrap(),
