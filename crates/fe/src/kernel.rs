@@ -60,6 +60,18 @@ impl Frame {
         }
     }
 
+    /// `frame` (Ethernet) as it arrived on `ingress`: a packet the FE put back
+    /// together.
+    pub(crate) fn from_ethernet(ingress: IfId, frame: &[u8]) -> Self {
+        let mut buf = vec![0; HEADROOM + frame.len()];
+        buf[HEADROOM..].copy_from_slice(frame);
+        Self {
+            ingress,
+            buf,
+            start: HEADROOM,
+        }
+    }
+
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.buf[self.start..]
     }

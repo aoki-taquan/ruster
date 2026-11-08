@@ -254,6 +254,8 @@ pub enum ControlKind {
     Neighbor,
     /// A packet addressed to the router, for the kernel.
     Local,
+    /// A fragment of a tunnel's IPv6 packet, for the FE to put back together.
+    TunnelFragment,
 }
 
 /// One frame for the control side, or one ICMPv6 error to send.
@@ -315,6 +317,15 @@ impl ControlQueue {
     /// The ICMPv6 errors built since the last [`ControlQueue::clear`].
     pub fn errors(&self) -> &[ControlFrame] {
         &self.errors[..self.errors_len]
+    }
+
+    /// Queues a fragment of a tunnel's IPv6 packet; a full queue drops it.
+    pub(crate) fn push_tunnel_fragment(&mut self, ingress: IfId, frame: &[u8]) -> bool {
+        let pushed = self.push(ingress, frame);
+        if pushed {
+            self.slots[self.len - 1].kind = ControlKind::TunnelFragment;
+        }
+        pushed
     }
 
     /// Queues a packet addressed to the router; a full queue drops it.

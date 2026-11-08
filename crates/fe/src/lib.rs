@@ -48,6 +48,7 @@ mod fragments;
 mod kernel;
 mod local;
 mod nat;
+mod reassembly;
 mod wireguard;
 
 pub use local::LocalPipe;
@@ -120,6 +121,8 @@ pub struct FeCounters {
     /// yet, or no room).
     pub from_kernel: u64,
     pub from_kernel_dropped: u64,
+    /// Tunnels' IPv6 packets put back together from their fragments.
+    pub tunnel_reassembled: u64,
     /// Fragments sent for datagrams longer than the egress MTU, and datagrams whose
     /// fragments could not be sent.
     pub fragments_sent: u64,
@@ -166,6 +169,10 @@ pub struct Fe<B> {
     /// The default VRF's NAPT, once the tables have had one.
     nat: Option<nat::Nat>,
     fragmentation: ruster_core::Ipv4FragmentationRuntime<'static>,
+    /// Tunnels' fragmented IPv6 packets being put back together, and those put
+    /// together, for the next batch.
+    reassembly: reassembly::Reassembly,
+    reassembled: Vec<kernel::Frame>,
     fragment_tracking: ruster_core::Ipv4FragmentTracker<'static>,
     counters: FeCounters,
 }
@@ -224,6 +231,8 @@ where
             firewall: None,
             nat: None,
             fragmentation: fragments::fragmentation(),
+            reassembly: reassembly::Reassembly::default(),
+            reassembled: Vec::new(),
             fragment_tracking: fragments::tracker(),
             counters: FeCounters::default(),
         }
@@ -286,7 +295,8 @@ where
         let wg_peers = wireguard::peer_configs(&self.wireguard.config);
         let wg_views = wireguard::interfaces(&self.wireguard.config, &wg_peers);
         // The kernel's packets join the ports' in one batch, after them.
-        let kernel_frames = self.read_kernel();
+        let mut kernel_frames = self.read_kernel();
+        kernel_frames.append(&mut self.reassembled);
         // One snapshot per VRF; each packet uses its ingress interface's.
         let snapshots: Vec<_> = self
             .vrfs
@@ -453,6 +463,13 @@ where
                 ControlKind::Neighbor => self.punt_frame(ingress, punt::reason::ND, &bytes),
                 ControlKind::Local => {
                     self.send_to_kernel(ingress, &bytes[ETHERNET_HEADER..], now_ms)
+                }
+                ControlKind::TunnelFragment => {
+                    if let Some(whole) = self.reassembly.add(ingress, &bytes, now_ms) {
+                        self.counters.tunnel_reassembled += 1;
+                        self.reassembled
+                            .push(kernel::Frame::from_ethernet(ingress, &whole));
+                    }
                 }
             }
         }
