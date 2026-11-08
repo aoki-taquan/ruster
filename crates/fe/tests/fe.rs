@@ -3588,3 +3588,47 @@ fn a_flood_to_the_router_in_one_vrf_leaves_another_vrf_s_limit() {
         .expect("default is not limited by red");
     assert_eq!(&buf[..n], &packet[..]);
 }
+
+/// An IPv4 interval longer than a minute is used as it is, and the limits are only
+/// for the default VRF (they are the FE's, for every VRF).
+#[test]
+fn a_long_icmpv4_error_interval_is_used_and_another_vrf_s_limits_are_refused() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let limits = |vrf: &str, ipv4_interval_ms| {
+        Change::set(
+            Key::IcmpErrors { vrf: vrf.into() },
+            Value::IcmpErrors {
+                ipv4_interval_ms,
+                ipv6_burst: 10,
+                ipv6_interval_ms: 10,
+            },
+        )
+    };
+    assert_ne!(
+        bench.patch(&mut config, &[limits("red", 100)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[limits("default", 120_000)]),
+        Code::CHANGED
+    );
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(
+        &mut neighbors,
+        &[neighbor("lan", [192, 0, 2, 10], HOST_MAC)],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut sent = Vec::new();
+    for now in [0, 70_000] {
+        let mut expiring = udp_from_host([203, 0, 113, 7]);
+        expiring[14 + 8] = 1;
+        expiring[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+        let checksum = ipv4_header_checksum(&expiring[14..34]);
+        expiring[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+        bench.fe.io_mut().inject(IfId(0), expiring);
+        bench.fe.step(now);
+        sent.push(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count());
+    }
+    assert_eq!(sent, [1, 0], "the second is within 120 s of the first");
+}

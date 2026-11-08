@@ -1048,3 +1048,40 @@ fn a_nat_without_filtering_type_is_endpoint_independent() {
     assert!(longer.len() > bytes.len(), "only a non-default is written");
     assert_eq!(decode_changes(&longer).unwrap(), vec![strict]);
 }
+
+#[test]
+fn icmp_error_limits_round_trip_and_zero_or_a_missing_member_is_refused() {
+    let limits = |ipv4_interval_ms| {
+        Change::set(
+            Key::IcmpErrors {
+                vrf: DEFAULT_VRF.into(),
+            },
+            Value::IcmpErrors {
+                ipv4_interval_ms,
+                ipv6_burst: 10,
+                ipv6_interval_ms: 10,
+            },
+        )
+    };
+    assert_eq!(round_trip(&limits(100)), limits(100));
+    let mut zero = Vec::new();
+    if limits(0).encode(&mut Encoder::new(&mut zero)).is_ok() {
+        assert!(decode_bytes(&zero).is_err(), "an interval of 0");
+    }
+    // {[60150, "default"]: {1: 100, 2: 10}}: no ipv6-interval.
+    let missing = encoded(|e| {
+        e.map(1)
+            .array(2)
+            .u64(sid::ICMP_ERRORS)
+            .text(DEFAULT_VRF)
+            .map(2)
+            .u64(1)
+            .u64(100)
+            .u64(2)
+            .u64(10);
+    });
+    assert!(matches!(
+        decode_bytes(&missing),
+        Err(ModelError::Missing(_))
+    ));
+}
