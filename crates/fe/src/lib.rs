@@ -299,8 +299,8 @@ where
             })
             .collect();
         let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
-        // The firewall has no IPv6 rules yet: while it is on, IPv6 is not forwarded
-        // through the default VRF rather than forwarded unchecked.
+        // IPv6 goes through the firewall too; should its runtime be missing, IPv6 is
+        // not forwarded through the default VRF rather than forwarded unchecked.
         let snapshot = snapshots[0]
             .with_now(MonotonicMillis(now_ms))
             .with_vrfs(&snapshots, &self.by_ingress)
@@ -746,8 +746,12 @@ where
             if let Err(error) = firewall::Firewall::publish(
                 &mut self.firewall,
                 publication,
-                self.vrfs[0].owner.snapshot(),
-                built.vrfs[0].owner.snapshot(),
+                // With the IPv6 tables, so that IPv6 flows whose route moved go.
+                self.vrfs[0].owner.snapshot().with_ipv6(&self.vrfs[0].ipv6),
+                built.vrfs[0]
+                    .owner
+                    .snapshot()
+                    .with_ipv6(&built.vrfs[0].ipv6),
             ) {
                 eprintln!("ruster-fe: {error}");
             }

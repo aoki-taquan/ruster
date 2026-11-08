@@ -564,6 +564,9 @@ pub enum DropReason {
     WireguardUnderlyingUnsupported = 249,
     /// The sealed outer packet is longer than the underlying interface's MTU.
     WireguardMtuExceeded = 250,
+    /// An ICMPv6 error, while the forward firewall is on, whose quoted packet is no
+    /// flow the firewall lets through (or cannot be read).
+    FirewallIcmpv6Unrelated = 251,
 }
 
 use DropReason::*;
@@ -571,7 +574,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 250] = [
+    pub const ALL: [Self; 251] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -822,6 +825,7 @@ impl DropReason {
         WireguardQueueFull,
         WireguardUnderlyingUnsupported,
         WireguardMtuExceeded,
+        FirewallIcmpv6Unrelated,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1089,6 +1093,7 @@ impl DropReason {
             WireguardQueueFull => "WIREGUARD_QUEUE_FULL",
             WireguardUnderlyingUnsupported => "WIREGUARD_UNDERLYING_UNSUPPORTED",
             WireguardMtuExceeded => "WIREGUARD_MTU_EXCEEDED",
+            FirewallIcmpv6Unrelated => "FIREWALL_ICMPV6_UNRELATED",
         }
     }
 }
@@ -1744,8 +1749,8 @@ impl<'a> ForwardingSnapshot<'a> {
     /// into it ([`DropReason::Ipv6ForwardingBlocked`]); Neighbor Discovery and traffic
     /// to the router still go on. With [`ForwardingSnapshot::with_vrfs`], it is
     /// the outer snapshot's that counts: a packet entering or leaving through one of
-    /// its VRF's interfaces is dropped. For a VRF with a firewall, which has no IPv6
-    /// rules yet: IPv6 is then not forwarded rather than forwarded unchecked.
+    /// its VRF's interfaces is dropped. It counts only when no firewall configuration
+    /// is given for the batch: with one, IPv6 goes through the firewall's rules.
     #[must_use]
     pub fn with_ipv6_forwarding_blocked(self, on: bool) -> Self {
         Self {
@@ -3372,16 +3377,25 @@ where
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
                 let outer = all_vrfs.authority();
-                let blocked = |egress: IfId| {
-                    all_vrfs.ipv6_forwarding_blocked
-                        && (snapshot.authority() == outer
-                            || all_vrfs.for_ingress(egress).authority() == outer)
+                // The forward firewall is the default VRF's: it guards what enters or
+                // leaves through that VRF's interfaces.
+                let guarded = |egress: IfId| {
+                    snapshot.authority() == outer
+                        || all_vrfs.for_ingress(egress).authority() == outer
+                };
+                let firewall_service = crate::ipv6::FirewallService {
+                    outer: all_vrfs,
+                    config: firewall_config,
+                    runtime: &mut firewall,
+                    audit: &mut firewall_audit,
+                    blocked: all_vrfs.ipv6_forwarding_blocked,
                 };
                 match crate::ipv6::complete(
                     packet,
                     snapshot,
                     fib,
-                    blocked,
+                    guarded,
+                    firewall_service,
                     control.as_deref_mut(),
                     vlans,
                     trace,
@@ -6036,6 +6050,18 @@ fn plan_firewall(
     now_ms: u64,
 ) -> Result<FirewallPlan, DropReason> {
     let packet = firewall_packet(ingress, egress, ipv4, validated, canonical);
+    plan_firewall_packet(packet, config, runtime, audit, now_ms)
+}
+
+/// Plans `packet` (of either family) with the firewall, records the decision in
+/// the audit buffer, and turns a refusal into its drop reason.
+pub(crate) fn plan_firewall_packet(
+    packet: FirewallPacket,
+    config: &FirewallConfig<'_>,
+    runtime: &mut FirewallRuntime<'_>,
+    audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    now_ms: u64,
+) -> Result<FirewallPlan, DropReason> {
     match runtime.plan_packet(config, packet, now_ms) {
         Ok(plan) => {
             if let Some(audit) = audit.as_deref_mut() {
@@ -6177,7 +6203,7 @@ fn route_miss_may_hit_nat_reject(
     false
 }
 
-fn require_firewall_runtime<'runtime, 'state>(
+pub(crate) fn require_firewall_runtime<'runtime, 'state>(
     snapshot: &ForwardingSnapshot<'_>,
     config: &FirewallConfig<'_>,
     runtime: &'runtime mut Option<&mut FirewallRuntime<'state>>,
@@ -9726,6 +9752,7 @@ mod tests {
             (248, "WIREGUARD_QUEUE_FULL"),
             (249, "WIREGUARD_UNDERLYING_UNSUPPORTED"),
             (250, "WIREGUARD_MTU_EXCEEDED"),
+            (251, "FIREWALL_ICMPV6_UNRELATED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -9735,7 +9762,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(251), None);
+        assert_eq!(DropReason::from_code(252), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
