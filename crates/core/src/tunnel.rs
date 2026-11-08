@@ -206,6 +206,7 @@ pub(crate) fn transmit<S: PacketSlot, T: TraceSink>(
         });
         return Err(DropReason::NeighborUnresolved);
     };
+    trace.record(TraceEvent::Ipv6Routed { egress, next_hop });
     let bytes = packet.bytes_mut();
     let inner = bytes
         .get(ETHERNET + 2..ETHERNET + 4)

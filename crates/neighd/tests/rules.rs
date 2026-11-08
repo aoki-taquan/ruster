@@ -105,11 +105,15 @@ impl Lab {
         self.settle(true);
     }
 
+    /// The ARP frames neighd sent (not its reads of the "used" marks).
     fn frames_out(&self) -> usize {
         let mut buf = [0_u8; 512];
         let mut count = 0;
-        while self.fe_punt.recv(&mut buf).is_ok() {
-            count += 1;
+        while let Ok(n) = self.fe_punt.recv(&mut buf) {
+            let punt = Punt::decode(&buf[..n]).unwrap();
+            if punt.reason != punt::reason::NEIGHBOR_USED {
+                count += 1;
+            }
         }
         count
     }

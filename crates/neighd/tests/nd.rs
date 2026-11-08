@@ -72,6 +72,7 @@ struct Lab {
     fe: Fe<SimIo>,
     neighd: Neighd,
     writers: Vec<Client>,
+    now: u64,
 }
 
 impl Lab {
@@ -107,6 +108,7 @@ impl Lab {
             fe,
             neighd,
             writers,
+            now: 0,
         };
         lab.settle();
         lab
@@ -114,8 +116,8 @@ impl Lab {
 
     fn settle(&mut self) {
         for _ in 0..1_000 {
-            let mut busy = self.fe.step(0).busy;
-            busy |= self.neighd.step(0).busy;
+            let mut busy = self.fe.step(self.now).busy;
+            busy |= self.neighd.step(self.now).busy;
             for writer in &mut self.writers {
                 busy |= writer.poll().0.busy;
             }
@@ -392,5 +394,99 @@ fn unwanted_advertisements_and_off_link_askers_are_not_learned() {
     );
     lab.settle();
     assert_eq!(lab.neighd.counters().learned, 0);
+    assert_eq!(lab.neighd.known(), 0);
+}
+
+/// The host learned from its solicitation, and a packet sent to it.
+fn learned_and_used(lab: &mut Lab) {
+    let solicitation = nd(
+        [0x33, 0x33, 0xff, 0, 0, 1],
+        HOST_MAC,
+        ip("2001:db8:1::10"),
+        ip("ff02::1:ff00:1"),
+        135,
+        0,
+        ip("2001:db8:1::1"),
+        1,
+    );
+    lab.fe.io_mut().inject(IfId(0), solicitation);
+    lab.settle();
+    lab.tx();
+    let to_host = ipv6(
+        WAN_MAC,
+        GATEWAY_MAC,
+        ip("2001:db8:99::7"),
+        ip("2001:db8:1::10"),
+        17,
+        64,
+        &[0; 8],
+    );
+    lab.fe.io_mut().inject(IfId(1), to_host);
+    lab.settle();
+    assert_eq!(lab.tx().len(), 1, "forwarded to the host");
+    // neighd reads the "used" marks.
+    lab.now = ruster_neighd::CHECK_MS;
+    lab.settle();
+}
+
+/// A neighbor still in use is probed once it has not been confirmed for a while,
+/// with a solicitation to it alone; one that does not answer is forgotten
+/// (RFC 4861 7.3.3, `docs/design/ce-processes.md`).
+#[test]
+fn a_used_neighbor_that_stops_answering_is_forgotten() {
+    let mut lab = Lab::new();
+    learned_and_used(&mut lab);
+    lab.now = ruster_neighd::REACHABLE_MS + 2 * ruster_neighd::CHECK_MS;
+    lab.settle();
+    let tx = lab.tx();
+    assert_eq!(tx.len(), 1, "one probe");
+    let probe = &tx[0].1;
+    assert_eq!(&probe[0..6], &HOST_MAC, "to the neighbor alone");
+    assert_eq!(&probe[38..54], &ip("2001:db8:1::10").octets());
+    assert_eq!(probe[54], 135);
+    for _ in 0..3 {
+        lab.now += 1_000;
+        lab.settle();
+    }
+    assert_eq!(lab.neighd.counters().probes_sent, 3);
+    assert_eq!(lab.neighd.counters().forgotten, 1);
+    assert_eq!(lab.neighd.known(), 0);
+}
+
+#[test]
+fn a_used_neighbor_that_answers_the_probe_is_kept() {
+    let mut lab = Lab::new();
+    learned_and_used(&mut lab);
+    lab.now = ruster_neighd::REACHABLE_MS + 2 * ruster_neighd::CHECK_MS;
+    lab.settle();
+    assert_eq!(lab.tx().len(), 1, "one probe");
+    let answer = nd(
+        LAN_MAC,
+        HOST_MAC,
+        ip("2001:db8:1::10"),
+        ip("2001:db8:1::1"),
+        136,
+        0x60,
+        ip("2001:db8:1::10"),
+        2,
+    );
+    lab.fe.io_mut().inject(IfId(0), answer);
+    lab.settle();
+    for _ in 0..5 {
+        lab.now += 1_000;
+        lab.settle();
+    }
+    assert_eq!(lab.neighd.counters().forgotten, 0);
+    assert_eq!(lab.neighd.known(), 1);
+}
+
+/// A neighbor no packet goes to is forgotten after a while.
+#[test]
+fn an_unused_neighbor_is_forgotten() {
+    let mut lab = Lab::new();
+    learned_and_used(&mut lab);
+    lab.now = ruster_neighd::CHECK_MS + ruster_neighd::UNUSED_MS + ruster_neighd::CHECK_MS;
+    lab.settle();
+    assert_eq!(lab.neighd.counters().forgotten, 1);
     assert_eq!(lab.neighd.known(), 0);
 }

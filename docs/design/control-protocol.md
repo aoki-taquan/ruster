@@ -178,6 +178,10 @@ frame      ...
 
 インターフェースは番号ではなく名前で示す。CEがFEのポートの番号付けを知らなくてよい。
 
+近隣の「使われた」印（[`ce-processes.md`](ce-processes.md)）も、neighdとの間のこのsocketで読む。neighdが
+理由`NEIGHBOR_USED`のフレームの無いメッセージを送ると、FEは前に読まれてから使われた近隣ごとに、
+アドレス（4か16バイト）をフレームにして返し、印を消す。
+
 - FEは種類ごとに流量の上限を付け、溢れた分は捨てて数える（[`fe-ce-split.md`](fe-ce-split.md)の
   「ルータ宛て通信の保護」）。
 - ルータ宛てのTCP/UDPはここを通らず、TUNでkernelへ渡す。
