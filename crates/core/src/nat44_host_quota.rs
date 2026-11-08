@@ -1,8 +1,7 @@
 //! Per-internal-host accounting of NAT44 mappings (N3, NAT44-092) and of
 //! the state they hold (N6, NAT44-119).
 //!
-//! RFC 6888 REQ-4 asks a NAT to support limiting the external ports assigned
-//! per subscriber. A NAT44 runtime whose per-host mapping limit is set keeps,
+//! A NAT44 runtime whose per-host mapping limit is set keeps,
 //! for every internal IPv4 address that holds a public port, a host slot with
 //! intrusive lists of exactly those mappings. The number of public ports an
 //! internal host holds is then a list length read in O(1), and its mapping
@@ -31,8 +30,8 @@
 //! mapping slots, so a slot is always available (see
 //! [`HostTable::plan_assignment`]).
 //!
-//! The same table also serves the per-host state limits of N6 (RFC 6888
-//! REQ-5), with two optional caller-backed arrays. *Link words* give each
+//! The same table also serves the per-host state limits of N6, with two
+//! optional caller-backed arrays. *Link words* give each
 //! link one `u32` of data. In *member-counting* mode (the UDP and ICMP query
 //! runtimes, which also have *host counters*) a link word is the number of
 //! filter peers its mapping contributes to its host, and each host counter
@@ -44,6 +43,17 @@
 //! (one link per session slot, one list per idle-timeout kind); its link
 //! words are per-session data of the runtime. Neither array exists for the
 //! TCP mapping table, so N3 storage does not grow.
+//!
+//! # Standards
+//!
+//! - RFC 6888 section 3, REQ-4: the external ports (and ICMP identifiers)
+//!   assigned to one subscriber can be limited, by the administrator and per
+//!   protocol (REQ-4 a, b). A subscriber here is one internal IPv4 address.
+//! - RFC 6888 REQ-5 and REQ-5 a: the state one subscriber holds can be
+//!   limited: filter peers for UDP and ICMP queries, sessions for TCP.
+//!
+//! Every limit is off by default. Deviations: no limit on the rate at which a
+//! subscriber's mappings or state are made (REQ-5 b, a SHOULD).
 
 use crate::{
     fixed_directory::{DirectoryHashDomain, DirectoryHashKey, FixedDirectory},

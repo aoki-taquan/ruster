@@ -1,25 +1,21 @@
 //! IPv4 Identification of translated non-atomic datagrams (MTU2,
 //! NAT44-126).
 //!
-//! RFC 6864 §5.3.1: an address-sharing device MUST make the ID of the
-//! datagrams it translates obey the rules of a source, and generate the ID
-//! rather than copy it when it rewrites the source address, destination
-//! address, or protocol. A NAPT collapses many inside sources onto one public
-//! address, so two inside hosts can send the same ID toward one destination;
-//! if those non-atomic datagrams are fragmented downstream the destination
-//! can merge their fragments (RFC 6864 §5.3.1, RFC 4963 §2).
+//! A NAPT collapses many inside sources onto one public address, so two
+//! inside hosts can send the same ID toward one destination; if those
+//! non-atomic datagrams are fragmented downstream the destination can merge
+//! their fragments.
 //!
-//! The NAT therefore gives every translated non-atomic datagram (DF clear;
-//! the NAT only translates whole datagrams, so MF=0 and offset 0) a new ID
-//! from a fixed array of [`IPV4_ID_BUCKETS`] counters per direction. The bucket and a per
-//! tuple offset come from one keyed hash of the translated (source,
-//! destination, protocol) tuple (RFC 6864 §4.3: uniqueness is per tuple), so
+//! The NAT therefore gives every translated non-atomic datagram (DF clear,
+//! whole or the first fragment; the fragment association table gives later
+//! fragments the same ID) a new ID from a fixed array of [`IPV4_ID_BUCKETS`]
+//! counters per direction. The bucket and a per tuple offset come from one
+//! keyed hash of the translated (source, destination, protocol) tuple, so
 //! consecutive datagrams of one tuple get consecutive IDs and no ID of a
 //! tuple repeats before 65536 datagrams hash into its bucket. The key is
-//! secret, so the IDs are not predictable from outside (RFC 7739 §5, applied
-//! to IPv4), and one tuple observes only the datagrams that share its bucket.
-//! Atomic datagrams (DF set) keep their ID: RFC 6864 §4.1 lets a source use
-//! any value and every device MUST ignore it.
+//! secret, so the IDs are not predictable from outside, and one tuple
+//! observes only the datagrams that share its bucket. Atomic datagrams (DF
+//! set, MF clear, offset 0) keep their ID.
 //!
 //! Outbound and inbound translations count in separate arrays (MTU2 review
 //! M1/L1). A tuple whose source is the public address (outbound: the source
@@ -36,7 +32,7 @@
 //! host), so it neither collides with outbound sequences nor lets the
 //! outside reach them. Inside hosts still share the outbound array: one
 //! inside host sending about 2.2 kpps (65536 in 30 s; about 550 pps at the
-//! 120 s MDL of RFC 791) of DF-clear datagrams to one destination wraps the
+//! 120 s maximum datagram lifetime, MDL) of DF-clear datagrams to one destination wraps the
 //! shared (public, destination, protocol) tuple within the MDL, for every
 //! inside host using it; no per-host packet rate limit exists yet.
 //!
@@ -53,17 +49,17 @@
 //! can wrap another remote's inbound sequence (X, H, protocol): one bucket
 //! needs on average 65536 x B datagrams (about 2.7e8 at B = 4096, 6.7e7 at
 //! 1024) to wrap. Since MTU2 part B the router fragments inbound DF-clear
-//! datagrams toward a smaller LAN MTU with the generated ID (RFC 6864
-//! §5.3.1, RFC 791: one ID for every fragment), so a wrap within the inside
-//! host's reassembly time (Linux: 30 s, so about 9 Mpps) could make it
-//! misassemble (RFC 4963 §2). That rate is far beyond one worker and
-//! transport checksums catch most misassembly; it is a documented residual
-//! (NAT44-126 (7)), not special-cased: copying the received ID would break
-//! §5.3.1 and refusing to fragment would break RFC 1812 §4.2.2.7.
+//! datagrams toward a smaller LAN MTU with the generated ID (one ID for every
+//! fragment), so a wrap within the inside host's reassembly time (Linux:
+//! 30 s, so about 9 Mpps) could make it misassemble. That rate is far beyond
+//! one worker and transport checksums catch most misassembly; it is a
+//! documented residual (NAT44-126 (7)), not special-cased: copying the
+//! received ID or refusing to fragment would each break a standard (see
+//! # Standards).
 //!
 //! The counters advance by exactly 1. A random per-bucket increment (Linux
 //! `ip_idents`) is not used: it shortens the wrap period of every tuple
-//! (uniqueness is the RFC 6864 MUST), and with the direction split an
+//! (uniqueness is what the standard requires), and with the direction split an
 //! outside observer no longer sees inbound volume; what remains observable
 //! is outbound volume of tuples in the observer's own outbound bucket.
 //!
@@ -79,6 +75,26 @@
 //! derived key and disjoint ID ranges, or (source, destination,
 //! protocol)-affine sharding so that one tuple is always translated by one
 //! worker. Today the router has one worker.
+//!
+//! # Standards
+//!
+//! - RFC 6864 section 5.3.1: an address-sharing device makes the ID of the
+//!   datagrams it translates follow the rules for a source, and generates it
+//!   rather than copying it.
+//! - RFC 6864 section 4.3: the ID of a non-atomic datagram does not repeat
+//!   within the MDL for one (source, destination, protocol) tuple, as far as
+//!   the counters allow (above). Section 4.1: an atomic datagram's ID may be
+//!   any value, so it is kept.
+//! - RFC 791: every fragment of a datagram has the same ID; RFC 1812 section
+//!   4.2.2.7: a DF-clear datagram larger than the egress MTU is fragmented.
+//! - RFC 7739 section 5 (written for IPv6, applied here): the IDs cannot be
+//!   predicted without the key.
+//! - RFC 4963 section 2 describes the misassembly the IDs avoid.
+//!
+//! Deviations: RFC 6864 section 5.2 says a source of non-atomic datagrams
+//! MUST limit its rate to keep the IDs unique; the NAT does not, so an inside
+//! host can make a tuple it shares with the other inside hosts wrap within
+//! the MDL. Tuples that share a bucket count together, so they wrap sooner.
 
 use crate::fixed_directory::{DirectoryHashDomain, DirectoryHashKey};
 

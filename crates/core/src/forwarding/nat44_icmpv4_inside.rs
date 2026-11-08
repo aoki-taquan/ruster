@@ -1,5 +1,5 @@
-//! NAT44 translation of ICMPv4 errors that arrive from the inside realm
-//! (RFC 5508 §4.2 REQ-5 and §5 REQ-7).
+//! NAT44 translation of ICMPv4 errors that arrive from the inside realm, and
+//! of hairpinned errors (REQ-5 and REQ-7, see # Standards).
 //!
 //! **REQ-5.** An inside host X (or an inside router on the path to X)
 //! reports an error about an inbound packet `R:r -> X:x` that the NAT
@@ -40,6 +40,24 @@
 //!   inbound packet `R:r -> X:x` (ingress outside, egress inside). For
 //!   REQ-7, both the inbound half `P:x1' -> X2:x2` and the outbound half
 //!   `X1:x1 -> P:x2'` must match. No rule is scanned.
+//!
+//! # Standards
+//!
+//! - RFC 5508 section 4.2.2 (REQ-5): the quoted packet is reverted, type and
+//!   code are kept, and the outer source becomes the public address (REQ-5 c
+//!   for NAPT). The quote is checked as RFC 5508 section 4.1 (REQ-3) asks,
+//!   before this module (`parse_nat44_icmpv4_error`).
+//! - RFC 5508 section 5 (REQ-7, REQ-7 a): hairpinned errors are translated and
+//!   sent to the sender of the quoted packet.
+//! - RFC 5508 section 4.3 (REQ-6): no NAT state is refreshed or deleted.
+//!
+//! Deviations, as the local policy REQ-5 allows: an error is translated only
+//! from the quoted host or the router's next hop toward it, and Port
+//! Unreachable, Protocol Unreachable and Time Exceeded code 1 only from the
+//! quoted host; with a bound firewall the quoted flow must also be live in it.
+//! An error quoting an ICMP query is not hairpinned, since no hairpinned query
+//! session exists. An error with IPv4 options in its outer header, or a
+//! fragment of one, is dropped.
 
 use super::*;
 

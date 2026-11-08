@@ -1,3 +1,14 @@
+//! The Internet checksum of IPv4, ICMP, UDP and TCP, and its incremental update.
+//!
+//! # Standards
+//!
+//! - RFC 1071 section 1: the one's complement sum of 16-bit words, an odd last
+//!   byte padded with zero, and the end-around carry.
+//! - RFC 1624 section 3, Eqn. 3: the update after one 16-bit word changes,
+//!   `HC' = ~(~HC + ~m + m')`.
+//!
+//! Deviations: none.
+
 /// Computes the Internet checksum over an arbitrary byte slice.
 ///
 /// This is the checksum algorithm shared by IPv4 and ICMP. An odd final byte
@@ -23,7 +34,8 @@ pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
     internet_checksum(header)
 }
 
-/// Updates an Internet checksum after replacing one 16-bit word (RFC 1624 §4).
+/// Updates an Internet checksum after replacing one 16-bit word `old_word` with
+/// `new_word`.
 #[must_use]
 pub fn rfc1624_update(checksum: u16, old_word: u16, new_word: u16) -> u16 {
     let sum = u32::from(!checksum) + u32::from(!old_word) + u32::from(new_word);

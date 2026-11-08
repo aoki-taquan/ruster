@@ -1,10 +1,5 @@
-//! Bounded hold table for unsolicited inbound TCP SYNs (RFC 5382 REQ-4).
-//!
-//! RFC 5382 §5 REQ-4: a NAT MUST NOT respond to an unsolicited inbound SYN
-//! for at least 6 seconds after it is received. If during that interval the
-//! NAT receives and translates an outbound SYN for the connection, it MUST
-//! silently drop the original SYN; otherwise it SHOULD send an ICMP Port
-//! Unreachable (Type 3, Code 3).
+//! Bounded hold table for unsolicited inbound TCP SYNs, which are answered
+//! with ICMP Port Unreachable only after a wait (see `unsolicited_syn`).
 //!
 //! The table copies the original IPv4 datagram (at most
 //! [`ICMPV4_ERROR_MAX_QUOTE_LEN`] bytes) into a caller-backed slot, keyed by
@@ -30,6 +25,18 @@
 //!   the quoted sequence number against its connection accepts it.
 //! - **Free list.** Unoccupied slots form a second list; a new hold takes its
 //!   head.
+//!
+//! # Standards
+//!
+//! - RFC 5382 section 4.3 (REQ-4): a NAT does not answer an unsolicited inbound
+//!   SYN for at least 6 seconds after it is received, and drops it silently
+//!   when an outbound SYN for the connection is translated in that time. A hold
+//!   lasts [`NAT44_TCP_UNSOLICITED_SYN_HOLD_MS`] plus a clock margin, so it is
+//!   never released early.
+//!
+//! Deviations: a new SYN that finds the table full, or its keyed chain at the
+//! limit, is not held, so it is never answered. A SYN of a held connection
+//! restarts its wait.
 
 use crate::{
     fixed_directory::{DirectoryHashDomain, DirectoryHashKey},
@@ -39,8 +46,7 @@ use crate::{
 };
 
 /// Minimum time an unsolicited inbound TCP SYN is held before the NAT may
-/// answer it with ICMP Port Unreachable (RFC 5382 REQ-4: "at least 6
-/// seconds"). A hold is never released toward ICMP earlier.
+/// answer it with ICMP Port Unreachable (at least 6 seconds). A hold is never released toward ICMP earlier.
 pub const NAT44_TCP_UNSOLICITED_SYN_HOLD_MS: u64 = 6_000;
 
 /// Clock-granularity margin added to every unsolicited-SYN hold deadline so
