@@ -1,3 +1,12 @@
+//! The IPv4 route table: interfaces, routes and neighbors as the FE holds them.
+//!
+//! # Standards
+//!
+//! - RFC 1812 section 5.2.4.3: the longest matching prefix decides.
+//!
+//! Deviations: a route has one next hop; of several (ECMP) the FE keeps the first
+//! active one.
+
 use crate::MacAddress;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

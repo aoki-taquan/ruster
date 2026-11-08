@@ -1,3 +1,16 @@
+//! Reading and checking Ethernet, ARP and IPv4 headers.
+//!
+//! # Standards
+//!
+//! - RFC 791: the IPv4 header (version 4, IHL at least 5, Total Length within the
+//!   frame).
+//! - RFC 1812 section 5.2.2: the header checksum is verified, and a datagram whose
+//!   header is invalid is dropped silently.
+//! - RFC 826: the ARP packet for Ethernet and IPv4.
+//!
+//! Deviations: a transit IPv4 datagram with options is dropped (RFC 1812 section
+//! 5.2.4 and RFC 7126 ask to forward Router Alert, Record Route and Timestamp).
+
 use crate::DropReason;
 
 pub const ETHERNET_HEADER_LEN: usize = 14;

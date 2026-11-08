@@ -19,7 +19,11 @@
 //!   does not answer; one not used for [`UNUSED_MS`] is forgotten.
 //!
 //! Skeleton limits: no announcements or duplicate address detection of our own
-//! addresses. Router Solicitations and Advertisements are not neighd's.
+//! addresses (RFC 4862 section 5.4). Router Solicitations and Advertisements are not
+//! neighd's. No multicast group membership or MLD reports for the solicited-node
+//! groups (RFC 4861 section 7.2.1): multicast is not built for now (2026-11-08
+//! owner decision), so a switch that snoops MLD may not pass solicitations to the
+//! router.
 //!
 //! # Standards
 //!

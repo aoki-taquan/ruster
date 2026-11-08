@@ -59,6 +59,17 @@
 //! drops the staged datagrams and counts them. Staged datagrams therefore
 //! never outlive their tick or their publication. No allocation: the slot
 //! table and its bytes are caller-owned, sized once from the config.
+//!
+//! # Standards
+//!
+//! - RFC 791 section 3.2: the fragmentation algorithm (data in multiples of 8
+//!   octets, MF on all but the last).
+//! - RFC 1812 section 4.2.2.7: a forwarded datagram without Don't Fragment longer
+//!   than the egress MTU is fragmented; with it, Fragmentation Needed (section
+//!   5.2.7.1, RFC 1191).
+//!
+//! Deviations: a datagram that would need more fragments than
+//! `max-fragments-per-datagram`, or more than a slot holds, is dropped.
 
 use std::{marker::PhantomData, rc::Rc};
 

@@ -28,7 +28,12 @@
 //!   packet from the kernel's interface ([`with_kernel_ingress`]) is the router's own,
 //!   so its Hop Limit stays.
 //!
-//! Deviations: no Destination Unreachable for an unresolvable neighbor (address
+//! Deviations: the subnet-router anycast address of a connected prefix (RFC 4291
+//! section 2.6.1) is not the router's; a packet from outside whose source is one
+//! of the router's addresses is forwarded; a link-local source toward a global
+//! destination is dropped without Destination Unreachable code 2 (RFC 4443 3.1);
+//! one ICMPv6 error limiter for every kind and source (RFC 4443 2.4(f)); no
+//! Destination Unreachable for an unresolvable neighbor (address
 //! unreachable) or for traffic to the router, no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
 //! to the kernel. Routes are searched linearly, longest prefix first.

@@ -20,7 +20,11 @@
 //!   to the live flow it quotes, whose source must be the error's destination; it
 //!   is not judged by the rules and makes no state.
 //!
-//! Deviations: an ICMP error about the router's own datagram has the datagram's
+//! Deviations: IPv4 options are not forwarded (see `packet`); a later fragment
+//! that starts at offset 1 or 2 is dropped for every protocol, not only TCP (RFC
+//! 1858); transit fragments go through the fragment association table, whose
+//! limits (entries, per source, held per source) drop what goes past them.
+//! An ICMP error about the router's own datagram has the datagram's
 //! destination as its source, not a router address (RFC 1812 section 4.3.2.4),
 //! because every router address is the kernel's own and Linux discards a packet
 //! from one of them.
