@@ -918,3 +918,16 @@ mod wireguard {
         }
     }
 }
+
+#[test]
+fn a_firewall_rule_may_name_the_router_itself() {
+    let text = format!(
+        "{LAN}[[firewall]]\naction = \"accept\"\nprotocol = \"udp\"\ningress = \"rt-default\"\n"
+    );
+    let config = parse(&text).unwrap();
+    assert_eq!(config.firewall.len(), 2, "IPv4 and IPv6");
+    assert!(config
+        .firewall
+        .iter()
+        .all(|rule| rule.ingress.as_deref() == Some("rt-default")));
+}

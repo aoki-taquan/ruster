@@ -67,7 +67,8 @@
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
 //! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
-//! ingress = "lan"              # optional, any interface when left out
+//! ingress = "lan"              # optional, any interface when left out;
+//!                              # "rt-default" is the router itself (its own packets)
 //! egress = "wan"               # optional
 //! source = "192.0.2.0/24"      # optional, any address when left out; IPv4 or IPv6
 //! destination = "0.0.0.0/0"    # optional, of the source's family
@@ -154,6 +155,8 @@ use crate::{
 const MIN_MTU: u16 = ruster_proto::table::MIN_MTU;
 /// The FE takes Ethernet frames of up to 1514 bytes.
 const MAX_MTU: u16 = 1_500;
+/// The name rules give the router itself (the default VRF's kernel interface).
+const ROUTER_INTERFACE: &str = "rt-default";
 /// The MAC address of a tunnel that names none.
 const TUNNEL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xfe];
 
@@ -1062,6 +1065,11 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Vec<Fire
         }
     };
     for name in [&entry.ingress, &entry.egress].into_iter().flatten() {
+        // The router itself: its own packets come and go through the default VRF's
+        // kernel interface.
+        if name == ROUTER_INTERFACE {
+            continue;
+        }
         match seen.vrf_of.get(name) {
             None => return Err(format!("{at}: no interface {name:?}")),
             Some(vrf) if vrf != DEFAULT_VRF => {

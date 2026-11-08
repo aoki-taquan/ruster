@@ -49,6 +49,9 @@ pub(crate) struct Built {
     pub(crate) pppoe: Vec<PppoeSession>,
     /// The WireGuard interfaces that are enabled, with their peers and sessions.
     pub(crate) wireguard: Vec<InterfaceBuilt>,
+    /// Each VRF's kernel interface, in the order of `vrfs`: the router's own
+    /// packets come in through it ([`crate::kernel`]).
+    pub(crate) kernel: Vec<IfId>,
     /// The default VRF's forward firewall rules, in rule id order, without those
     /// naming an interface that is missing or disabled.
     pub(crate) firewall: Vec<FirewallRule>,
@@ -224,6 +227,11 @@ fn check_wireguard(interfaces: &[InterfaceBuilt]) -> Result<(), String> {
     }
     Ok(())
 }
+/// The name of the default VRF's kernel interface, for the firewall's rules.
+pub(crate) const KERNEL_INTERFACE: &str = "rt-default";
+
+/// The MTU of a kernel interface: that of the TUN devices confd makes.
+const KERNEL_MTU: u16 = 1500;
 
 pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let port = |name: &str| {
@@ -499,6 +507,20 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     names.remove(DEFAULT_VRF);
     let order: Vec<&str> = std::iter::once(DEFAULT_VRF).chain(names).collect();
     let index_of = |vrf: &str| order.iter().position(|v| *v == vrf);
+    // Each VRF's kernel interface, after every other one.
+    let mut kernel = Vec::with_capacity(order.len());
+    for (at, vrf) in order.iter().enumerate() {
+        let id = u16::try_from(interface_names.len())
+            .map(IfId)
+            .map_err(|_| "too many interfaces".to_owned())?;
+        interface_names.push(format!("rt-{vrf}"));
+        interfaces.push(Interface {
+            id,
+            mac: crate::kernel::interface_mac(at),
+            mtu: KERNEL_MTU,
+        });
+        kernel.push(id);
+    }
 
     let mut entries: BTreeMap<String, Vec<Entry>> = order
         .iter()
@@ -592,7 +614,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 firewall_on = true;
                 // A rule naming an interface that is missing or disabled matches no
                 // packet, so it is left out.
-                if let Some(rule) = firewall_rule(*id, rule, &active)? {
+                if let Some(rule) = firewall_rule(*id, rule, &active, kernel[0])? {
                     firewall.push(rule);
                 }
             }
@@ -655,8 +677,16 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 .and_then(|at| u16::try_from(at).ok())
                 .unwrap_or(0)
         })
+        .collect::<Vec<u16>>();
+    let mut by_ingress = by_ingress;
+    for (at, id) in kernel.iter().enumerate() {
+        by_ingress[usize::from(id.0)] = u16::try_from(at).unwrap_or(0);
+    }
+    let enabled = interfaces
+        .iter()
+        .map(|i| i.id)
+        .filter(|id| !kernel.contains(id))
         .collect();
-    let enabled = interfaces.iter().map(|i| i.id).collect();
     Ok(Built {
         vrfs,
         names: order.iter().map(|v| (*v).to_owned()).collect(),
@@ -667,6 +697,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         tunnels,
         pppoe,
         wireguard,
+        kernel,
         firewall,
         firewall_on,
         nat,
@@ -721,9 +752,13 @@ fn firewall_rule(
     id: u32,
     rule: &table::FirewallRule,
     active: &BTreeMap<&str, (IfId, &str)>,
+    kernel: IfId,
 ) -> Result<Option<FirewallRule>, String> {
     let interface = |name: &Option<String>| match name {
         None => Some(FirewallInterface::Any),
+        // The default VRF's kernel interface: the router's own packets come in and
+        // go out through it, as a host's through a port.
+        Some(name) if name == KERNEL_INTERFACE => Some(FirewallInterface::Interface(kernel)),
         Some(name) => active
             .get(name.as_str())
             .map(|&(id, _)| FirewallInterface::Interface(id)),

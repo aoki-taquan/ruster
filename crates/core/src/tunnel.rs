@@ -151,59 +151,6 @@ pub(crate) fn receive<S: PacketSlot>(
     Ok(true)
 }
 
-/// Where a packet of the router itself (from the kernel) for the tunnel interface
-/// `egress` goes, and the IPv6 header to put before it; `None` when `egress` is no
-/// tunnel's. Cold path: the header is built for every such packet.
-pub(crate) fn origin(
-    outer: &crate::ForwardingSnapshot<'_>,
-    egress: IfId,
-    packet: &[u8],
-) -> Option<Result<crate::TunnelOrigin, crate::TunnelOriginError>> {
-    use crate::TunnelOriginError::{Dropped, TooBig};
-    let tunnel = of(outer.tunnels, egress)?;
-    Some((|| {
-        if packet.first().map(|b| b >> 4) != Some(4) {
-            return Err(Dropped(DropReason::TunnelInnerInvalid));
-        }
-        let mtu = outer
-            .interface(tunnel.interface)
-            .ok_or(Dropped(DropReason::InterfaceMiss))?
-            .mtu;
-        let fib = outer.ipv6.ok_or(Dropped(DropReason::TunnelNoRoute))?;
-        let (underlying, next_hop) = fib
-            .next_hop(tunnel.remote)
-            .ok_or(Dropped(DropReason::TunnelNoRoute))?;
-        let interface = outer
-            .interface(underlying)
-            .ok_or(Dropped(DropReason::InterfaceMiss))?;
-        let fits = mtu.min(interface.mtu.saturating_sub(IPV6_HEADER as u16));
-        if packet.len() > usize::from(fits) {
-            return Err(TooBig { mtu: fits });
-        }
-        let payload = u16::try_from(packet.len()).map_err(|_| TooBig { mtu: fits })?;
-        let tos = packet.get(1).copied().unwrap_or(0);
-        let mut header = [0_u8; IPV6_HEADER];
-        header[0] = 0x60 | (tos >> 4);
-        header[1] = tos << 4;
-        header[4..6].copy_from_slice(&payload.to_be_bytes());
-        header[6] = IPV4_IN_IP;
-        header[7] = HOP_LIMIT;
-        header[8..24].copy_from_slice(&tunnel.local);
-        header[24..40].copy_from_slice(&tunnel.remote);
-        Ok(crate::TunnelOrigin {
-            egress: underlying,
-            source_mac: interface.mac,
-            next_hop,
-            destination_mac: fib.neighbor(underlying, next_hop).or(crate::pppoe::of(
-                outer.pppoe,
-                underlying,
-            )
-            .map(|session| session.peer)),
-            header,
-        })
-    })())
-}
-
 /// Wraps the forwarded IPv4 `packet` (already rewritten for `tunnel`'s interface)
 /// in IPv6 and routes it by the default VRF's IPv6 table. Returns the interface to
 /// send it out of.

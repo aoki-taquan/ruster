@@ -175,7 +175,7 @@ pub use pppoe::PppoeSession;
 pub use reload_state::{StateCarryConflict, StateCarryOutcome};
 pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Origin, Route, RouteError,
-    TunnelOrigin, TunnelOriginError, ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
+    TunnelOriginError, ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
 pub use source_validation::{SourceValidation, SourceValidationBinding};
 pub use time::MonotonicMillis;

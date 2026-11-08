@@ -130,6 +130,16 @@ impl<S: GeneratedPacketSlot> GeneratedPacketLease<S> {
         self.complete(GeneratedSlotCompletion::Transmit);
     }
 
+    /// The same lease over `f(slot)`, for a backend that wraps another's slots.
+    #[must_use]
+    pub fn map_slot<T: GeneratedPacketSlot>(
+        mut self,
+        f: impl FnOnce(S) -> T,
+    ) -> GeneratedPacketLease<T> {
+        let slot = self.slot.take().expect("live generated lease");
+        GeneratedPacketLease::new(f(slot))
+    }
+
     pub fn cancel(mut self) {
         self.complete(GeneratedSlotCompletion::Cancelled);
     }

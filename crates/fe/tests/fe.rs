@@ -839,6 +839,9 @@ fn traffic_to_the_router_goes_to_the_kernel_pipe_and_the_kernel_s_packets_go_out
     observer.observe();
     bench.settle(&mut [&mut observer]);
     reply[16..20].copy_from_slice(&[192, 0, 2, 99]);
+    reply[10..12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&reply[..20]);
+    reply[10..12].copy_from_slice(&checksum.to_be_bytes());
     kernel.send(&reply).unwrap();
     let events = bench.settle(&mut [&mut observer]).remove(0);
     assert!(bench.fe.io_mut().pop_tx().is_none());
@@ -1336,7 +1339,7 @@ fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
     let (fe_end, kernel) = UnixDatagram::pair().unwrap();
     fe_end.set_nonblocking(true).unwrap();
     bench.fe.attach_local("default", Box::new(fe_end));
-    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
     own[12..16].copy_from_slice(&[192, 0, 2, 1]);
     own[10..12].fill(0);
     let checksum = ipv4_header_checksum(&own[..20]);
@@ -1443,7 +1446,7 @@ fn a_route_to_a_pppoe_interface_sends_in_its_session() {
     let (fe_end, kernel) = UnixDatagram::pair().unwrap();
     fe_end.set_nonblocking(true).unwrap();
     bench.fe.attach_local("default", Box::new(fe_end));
-    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
     own[12..16].copy_from_slice(&[192, 0, 2, 1]);
     own[10..12].fill(0);
     let checksum = ipv4_header_checksum(&own[..20]);
@@ -1934,4 +1937,49 @@ mod wireguard {
         ];
         assert_ne!(bench.patch(&mut config, &second), Code::CHANGED);
     }
+}
+
+/// The router's own packets go through the forward firewall like a host's from a
+/// port: a rule names their interface `rt-default`.
+#[test]
+fn the_router_s_own_packets_need_a_rule_for_rt_default() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(1)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
+    own[12..16].copy_from_slice(&[198, 51, 100, 2]);
+    own[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&own[..20]);
+    own[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    // Only the LAN's UDP is accepted: the router's own does not leave.
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+
+    let mut from_router = accept_udp_from_lan(2);
+    if let Some(Value::FirewallRule(rule)) = &mut from_router.value {
+        rule.ingress = Some("rt-default".into());
+    }
+    assert_eq!(bench.patch(&mut config, &[from_router]), Code::CHANGED);
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("sent by the rule for rt-default");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
 }
