@@ -48,7 +48,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 - IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPとICMPv6のエラーを返す。
 - ルータ宛ての通信は、種類ごとに数を抑えてVRFごとのTUNでkernelに渡す。
 - VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。
-- VLAN（802.1Q）のサブインターフェースを持てる。今はAF_XDPのバックエンドだけ（AF_PACKETではkernelがタグを先に外す）。
+- VLAN（802.1Q）のサブインターフェースを持てる。AF_PACKETでは、kernelが外したタグをバックエンドがフレームに戻す。
 - 経路は静的なものと直結だけ。
 
 実際のNICや回線ではまだ試していません。
@@ -144,7 +144,7 @@ cargo build --workspace --locked
 sudo scripts/netns-skeleton.sh target/debug                       # AF_XDP
 sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 sudo scripts/netns-vrf.sh target/debug       # VRF: 同じアドレスの2つのVRFと、片方だけの漏らし
-sudo scripts/netns-vlan.sh target/debug      # VLAN: 同じポートの2つのVLANとタグなしの上流（AF_XDPだけ）
+sudo scripts/netns-vlan.sh target/debug      # VLAN: 同じポートの2つのVLANとタグなしの上流
 ```
 
 ## 開発

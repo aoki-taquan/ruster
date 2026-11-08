@@ -112,9 +112,6 @@ pub(crate) enum RxPacketFault {
     Truncated { snap_len: usize, wire_len: usize },
     /// The captured frame exceeds the configured maximum Ethernet frame.
     Oversize { length: usize, maximum: usize },
-    /// The kernel reported an offloaded VLAN tag that is absent from the
-    /// captured bytes.
-    VlanOffloaded { status: u32 },
     /// The checked data range could not be mapped inside the RX extent.
     Mapping(MappingAccessError),
 }
@@ -129,6 +126,9 @@ pub(crate) struct RxPacketMetadata {
     pub(crate) data_len: usize,
     pub(crate) next_offset: usize,
     pub(crate) fault: Option<RxPacketFault>,
+    /// The outer 802.1Q/802.1ad tag (TPID, TCI) the kernel took off the frame, to
+    /// be put back before core sees it.
+    pub(crate) vlan: Option<(u16, u16)>,
 }
 
 /// Per-block identity and userspace ownership mirror. `generation` is zero
