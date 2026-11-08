@@ -33,8 +33,7 @@
 //!   later descriptor. The cursor advances to the next block.
 //! - A descriptor whose link is safe but whose own content is invalid
 //!   (MAC/network offset, snapshot length, data range, truncation, a frame
-//!   above the configured maximum, or a VLAN tag the kernel removed from the
-//!   captured bytes): only that packet becomes a terminal fault. Its siblings
+//!   or above the configured maximum): only that packet becomes a terminal fault. Its siblings
 //!   are still delivered, and the block returns after the last sibling is
 //!   terminal. GRO/LRO superframes therefore arrive as truncated or oversize
 //!   faults and are dropped; the strict profile requires them disabled.
@@ -111,6 +110,8 @@ const _: [(); 16] = [(); PACKET_WIRE];
 const _: [(); 24] = [(); PACKET_MAC];
 const _: [(); 26] = [(); PACKET_NET];
 const _: [(); 20] = [(); PACKET_STATUS];
+const _: [(); 32] = [(); PACKET_VLAN_TCI];
+const _: [(); 36] = [(); PACKET_VLAN_TPID];
 
 /// Independent per-batch work limits.
 ///
