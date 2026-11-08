@@ -59,7 +59,7 @@ default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFE�
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます（AF_XDPのみ）。
 MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます（AF_XDPのみ。ルータ自身のIPv4はまだMAP-Eを通りません）。
 PPPoEのセッション（RFC 2516）を、設定ファイルの`pppoe`のインターフェースで使えます。セッションの確立は外のデーモンの仕事で、FEは包むのと外すのだけを行います。
-WireGuard（IPv4の内側と外側）のデータを、設定ファイルの`wireguard`のインターフェースとピアで暗号化して送り、開いて転送します。鍵交換は外のデーモンの仕事で、今は設定ファイルに書いたセッション鍵を使います。
+WireGuardは止めています。FEにデータの暗号化と復号の処理はありますが、セッション鍵を渡す口が無いので使えません。どこで暗号処理をするか（性能）と鍵交換のソフトを決めてから再開します。
 FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don't Fragmentが無いもの）、NATはフラグメントになったdatagramも変換します。
 
 ## 動かす
@@ -145,7 +145,6 @@ sudo scripts/netns-skeleton.sh target/debug                       # AF_XDP
 sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 sudo scripts/netns-vrf.sh target/debug       # VRF: 同じアドレスの2つのVRFと、片方だけの漏らし
 sudo scripts/netns-vlan.sh target/debug      # VLAN: 同じポートの2つのVLANとタグなしの上流（AF_XDPだけ）
-sudo scripts/netns-wireguard.sh target/debug # WireGuard: 対向はPythonのOpenSSL（鍵交換なし、固定のセッション鍵）
 ```
 
 ## 開発

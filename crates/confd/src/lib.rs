@@ -90,9 +90,6 @@ pub struct WireguardPeerConfig {
     pub name: String,
     pub endpoint: (Ipv4Addr, u16),
     pub allowed: Vec<(Ipv4Addr, u8)>,
-    /// The session the key-exchange daemon made. Until it hands sessions to confd,
-    /// a file may carry one.
-    pub session: Option<ruster_proto::table::WireguardSession>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -390,15 +387,6 @@ impl Confd {
                         allowed: peer.allowed.clone(),
                     }),
                 );
-                if let Some(session) = peer.session {
-                    out.insert(
-                        Key::WireguardSession {
-                            interface: wireguard.name.clone(),
-                            peer: peer.name.clone(),
-                        },
-                        Value::WireguardSession(session),
-                    );
-                }
             }
         }
         if let Some(nat) = &self.config.nat {
