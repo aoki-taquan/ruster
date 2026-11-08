@@ -8511,6 +8511,8 @@ fn truncated_parameter_problem<T: TraceSink>(
     let local = snapshot.is_ipv4_for_router(
         ingress,
         ipv4.destination,
+        // ICMP NAT has nothing to say about a truncated datagram: only UDP and TCP
+        // to the public address are NAT's here.
         nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, None),
     );
     // INPUT-FW: a truncated datagram has no reliable transport header, so

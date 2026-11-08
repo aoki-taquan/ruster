@@ -477,9 +477,18 @@ fn a_router_address_on_another_interface_is_for_the_router() {
 
     io.run_once(1, &snapshot, &mut NoTrace).unwrap();
 
-    while let Some(sent) = io.pop_tx() {
-        assert_ne!(sent.bytes[34], 8, "the echo request is not routed on");
-    }
+    let reply = io.pop_tx().expect("the router answers");
+    assert_eq!(reply.egress, LAN);
+    assert_eq!(
+        &reply.bytes[26..30],
+        &LOCAL_IP.octets(),
+        "from the router's address"
+    );
+    assert_eq!(
+        reply.bytes[34], 0,
+        "an echo reply, not the request routed on"
+    );
+    assert!(io.pop_tx().is_none());
 }
 
 #[test]
