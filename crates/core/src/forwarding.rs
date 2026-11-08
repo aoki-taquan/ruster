@@ -8733,6 +8733,13 @@ fn truncated_parameter_problem<T: TraceSink>(
         // to the public address are NAT's here.
         nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, None),
     );
+    // With the forward firewall on, the router's own addresses are behind it
+    // (`rt-default`) and a truncated datagram has no transport header to judge:
+    // stay silent, as for transit, so the answer does not tell which addresses
+    // are the router's.
+    if local && firewall {
+        return;
+    }
     // INPUT-FW: a truncated datagram has no reliable transport header, so
     // the input policy judges it without one; a deny is silent (the drop
     // stays `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`).
