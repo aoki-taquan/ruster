@@ -152,7 +152,10 @@ where
     let mut reported = fe.counters();
     let mut tuns = Tuns::default();
     let mut last_tun_check = 0;
-    daemon::notify("READY=1");
+    // A stop asked for while starting: the loop stops at once, without READY=1.
+    if !signal::stop_requested() {
+        daemon::notify("READY=1");
+    }
     loop {
         let now = clock.now_ms();
         if signal::stop_requested() {
