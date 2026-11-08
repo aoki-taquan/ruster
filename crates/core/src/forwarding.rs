@@ -4478,10 +4478,10 @@ fn validate_ipv4_ingress(
     }
     let source_route = snapshot.route_lookup(ipv4.source);
     if let Some(selected) = source_route {
-        if selected.is_prefix_network_address(ipv4.source) {
+        if selected.is_connected_network_address(ipv4.source) {
             return Err(Ipv4SourceNetworkAddress);
         }
-        if selected.is_prefix_directed_broadcast(ipv4.source) {
+        if selected.is_connected_directed_broadcast(ipv4.source) {
             return Err(Ipv4SourceDirectedBroadcast);
         }
     }
@@ -4513,10 +4513,10 @@ fn validate_ipv4_forward_destination(
     selected_route: Option<Route>,
 ) -> Result<(), DropReason> {
     if let Some(selected) = selected_route {
-        if selected.is_prefix_network_address(ipv4.destination) {
+        if selected.is_connected_network_address(ipv4.destination) {
             return Err(Ipv4DestinationNetworkAddress);
         }
-        if selected.is_prefix_directed_broadcast(ipv4.destination) {
+        if selected.is_connected_directed_broadcast(ipv4.destination) {
             return Err(Ipv4DestinationDirectedBroadcast);
         }
     }
@@ -7900,11 +7900,11 @@ fn decide_icmpv4_error<T: TraceSink>(
             .record_suppression(Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast);
     }
     if let Some(selected) = selected_destination_route {
-        if selected.is_prefix_network_address(ipv4.destination) {
+        if selected.is_connected_network_address(ipv4.destination) {
             return runtime
                 .record_suppression(Icmpv4TimeExceededDisposition::DestinationNetworkAddress);
         }
-        if selected.is_prefix_directed_broadcast(ipv4.destination) {
+        if selected.is_connected_directed_broadcast(ipv4.destination) {
             return runtime
                 .record_suppression(Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast);
         }
@@ -8208,8 +8208,8 @@ fn icmp_error_source_is_host(
         && octets[0] != 127
         && octets[0] < 224
         && !snapshot.route_lookup(source).is_some_and(|selected| {
-            selected.is_prefix_network_address(source)
-                || selected.is_prefix_directed_broadcast(source)
+            selected.is_connected_network_address(source)
+                || selected.is_connected_directed_broadcast(source)
         })
 }
 
@@ -8227,8 +8227,8 @@ fn icmp_error_candidate_eligible(
         return false;
     }
     if selected_destination_route.is_some_and(|route| {
-        route.is_prefix_network_address(ipv4.destination)
-            || route.is_prefix_directed_broadcast(ipv4.destination)
+        route.is_connected_network_address(ipv4.destination)
+            || route.is_connected_directed_broadcast(ipv4.destination)
     }) || frame.first().is_some_and(|first| first & 1 != 0)
     {
         return false;

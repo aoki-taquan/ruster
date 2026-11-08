@@ -181,9 +181,11 @@ fn assert_arp_control_consumed(packet: Vec<u8>, snapshot: &ForwardingSnapshot<'_
 
 #[test]
 fn ipv4_ingress_admission_matrix_is_typed_and_atomic() {
+    // Connected prefixes: only on a link does the router know the network and
+    // broadcast addresses (RFC 1812 5.3.5.2).
     let routes = [
-        route([192, 0, 2, 0], 24, WAN, Some(GATEWAY)),
-        route([198, 51, 100, 0], 24, WAN, Some(GATEWAY)),
+        route([192, 0, 2, 0], 24, WAN, None),
+        route([198, 51, 100, 0], 24, WAN, None),
     ];
     let interfaces = [local_interface(), interface()];
     let neighbors = [gateway_neighbor()];
@@ -1327,5 +1329,27 @@ impl PacketBatch for ArpPartialBatch {
             recycled: 0,
             error: Some(TestBackendError::RingFull),
         }
+    }
+}
+
+/// A remote prefix's network and broadcast addresses may be hosts of its smaller
+/// subnets: through a gateway they are forwarded (RFC 1812 5.3.5.2).
+#[test]
+fn a_remote_prefix_s_edge_addresses_are_forwarded_through_a_gateway() {
+    let routes = [route([198, 51, 100, 0], 24, WAN, Some(GATEWAY))];
+    let interfaces = [local_interface(), interface()];
+    let neighbors = [gateway_neighbor()];
+    let bindings = [local_binding()];
+    let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
+    for destination in [[198, 51, 100, 0], [198, 51, 100, 255]] {
+        let mut packet = frame(64, &[]);
+        packet[30..34].copy_from_slice(&destination);
+        packet[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&packet[14..34]);
+        packet[24..26].copy_from_slice(&checksum.to_be_bytes());
+        let mut io = SimIo::new();
+        io.inject(LAN, packet);
+        let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+        assert_eq!(report.tx_requested, 1, "{destination:?} is forwarded");
     }
 }

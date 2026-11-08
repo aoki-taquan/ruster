@@ -300,7 +300,9 @@ fn ttl_expiry_is_atomic_and_generates_exact_asymmetric_static_reply() {
 }
 
 #[test]
-fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win() {
+/// Through a gateway a prefix's edge addresses are hosts (RFC 1812 5.3.5.2): its
+/// datagrams are not refused as broadcasts, and longer host routes win anyway.
+fn a_gateway_prefix_s_edge_addresses_are_hosts_and_lpm_host_routes_win() {
     let interfaces = interfaces();
     let bindings = bindings();
     let neighbors = neighbors();
@@ -327,7 +329,7 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
                 &[],
             ),
         ),
-        DropReason::Ipv4DestinationDirectedBroadcast
+        DropReason::Ipv4TtlExpired
     );
     assert_eq!(
         forwarding_drop_reason(
@@ -343,7 +345,7 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
                 &[],
             ),
         ),
-        DropReason::Ipv4DestinationNetworkAddress
+        DropReason::Ipv4TtlExpired
     );
     for source in [
         Ipv4Address::from_octets([203, 0, 113, 0]),
@@ -363,11 +365,8 @@ fn selected_gateway_prefix_suppresses_remote_boundaries_but_lpm_host_routes_win(
                     &[],
                 ),
             ),
-            if source == Ipv4Address::from_octets([203, 0, 113, 0]) {
-                DropReason::Ipv4SourceNetworkAddress
-            } else {
-                DropReason::Ipv4SourceDirectedBroadcast
-            }
+            DropReason::Ipv4TtlExpired,
+            "{source:?} through a gateway is a host"
         );
     }
 

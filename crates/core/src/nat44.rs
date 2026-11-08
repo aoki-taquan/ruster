@@ -6732,8 +6732,8 @@ fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Addre
         return false;
     }
     !snapshot.route_lookup(address).is_some_and(|selected| {
-        selected.is_prefix_network_address(address)
-            || selected.is_prefix_directed_broadcast(address)
+        selected.is_connected_network_address(address)
+            || selected.is_connected_directed_broadcast(address)
     })
 }
 
