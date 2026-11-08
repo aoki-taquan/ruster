@@ -833,9 +833,6 @@ fn a_pppoe_interface_runs_on_its_parent() {
 mod wireguard {
     use super::*;
 
-    const KEY_A: &str = "0101010101010101010101010101010101010101010101010101010101010101";
-    const KEY_B: &str = "0202020202020202020202020202020202020202020202020202020202020202";
-
     fn file(interface: &str, peers: &str) -> String {
         format!(
             "[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv4 = \"198.51.100.2/24\"\n\n\
@@ -853,30 +850,23 @@ mod wireguard {
     }
 
     #[test]
-    fn a_wireguard_interface_with_a_peer_and_a_session() {
-        let session = format!(
-            "session = {{ send = \"{KEY_A}\", receive = \"{KEY_B}\", peer-index = 22, local-index = 11 }}"
-        );
-        let config = parse(&file(WG, &peer_text(&session))).unwrap();
+    fn a_wireguard_interface_with_a_peer() {
+        let config = parse(&file(WG, &peer_text(""))).unwrap();
         let wg = &config.interfaces[1];
         assert_eq!((wg.name.as_str(), wg.mtu), ("wg0", 1420));
-        assert_eq!(wg.mac, [2, 0, 0, 0, 0, 0xfe]);
-        assert_eq!(config.wireguard.len(), 1);
         let wireguard = &config.wireguard[0];
         assert_eq!(wireguard.listen_port, 51820);
         assert_eq!(wireguard.local, Ipv4Addr::new(198, 51, 100, 2));
         let peer = &wireguard.peers[0];
         assert_eq!(peer.endpoint, (Ipv4Addr::new(203, 0, 113, 9), 51821));
         assert_eq!(peer.allowed, [(Ipv4Addr::new(10, 9, 0, 0), 16)]);
-        let session = peer.session.unwrap();
-        assert_eq!((session.send, session.receive), ([1; 32], [2; 32]));
-        assert_eq!((session.peer_index, session.local_index), (22, 11));
-        // A peer without a session is fine: the key exchange comes later.
-        assert!(
-            parse(&file(WG, &peer_text(""))).unwrap().wireguard[0].peers[0]
-                .session
-                .is_none()
-        );
+    }
+
+    #[test]
+    fn a_session_key_is_not_taken_from_a_file() {
+        let session =
+            "session = { send = \"01\", receive = \"02\", peer-index = 1, local-index = 2 }";
+        assert!(parse(&file(WG, &peer_text(session))).is_err());
     }
 
     #[test]
@@ -903,11 +893,6 @@ mod wireguard {
             wrong("[\"10.9.0.0/16\"]", "[\"2001:db8::/32\"]"),
             wrong("name = \"branch\"", "name = \"\""),
             format!("{}{}", peer_text(""), peer_text("")),
-            peer_text("session = { send = \"01\", receive = \"02\", peer-index = 1, local-index = 2 }"),
-            peer_text(&format!(
-                "session = {{ send = \"{}\", receive = \"{KEY_B}\", peer-index = 1, local-index = 2 }}",
-                "00".repeat(32)
-            )),
         ] {
             assert!(bad_peer(&text).is_err(), "{text}");
         }
