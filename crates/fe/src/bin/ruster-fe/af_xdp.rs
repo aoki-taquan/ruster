@@ -8,8 +8,8 @@ use ruster_io_xdp::native_profile::{
     RingConfig, UmemConfig, ValidatedBindFlags, XDP_COPY, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
 };
 use ruster_io_xdp_native::{
-    NativeSession, RxFillConfig, RxFillEngine, RxWait, SessionConfig, UmemDomainId, XdpAttachMode,
-    XdpPacketIo, XdpPort, XdpPortConfig,
+    NativeSession, RxFillConfig, RxFillEngine, RxWait, SessionConfig, SessionError, SessionFailure,
+    SessionStage, UmemDomainId, XdpAttachMode, XdpPacketIo, XdpPort, XdpPortConfig,
 };
 use ruster_proto::daemon;
 
@@ -54,14 +54,38 @@ pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeS
     for device in devices {
         let config = SessionConfig::new(device, 0, bind_flags, rings, umem)
             .map_err(|error| format!("{device}: {error:?}"))?;
-        let mut session =
-            NativeSession::open(&config).map_err(|error| format!("{device}: {error:?}"))?;
+        let mut session = open_retrying(&config).map_err(|error| format!("{device}: {error:?}"))?;
         session
             .attach_xdp(options.attach)
             .map_err(|error| format!("{device}: attaching XDP: {error:?}"))?;
         sessions.push(session);
     }
     Ok(sessions)
+}
+
+/// Opens a session, trying again for a while when the failure can be transient: a
+/// previous FE's socket on the same queue (or its UMEM accounting) that Linux has
+/// not released yet right after it stopped.
+fn open_retrying(config: &SessionConfig) -> Result<NativeSession, SessionError> {
+    const ATTEMPTS: u32 = 20;
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut attempt = 1;
+    loop {
+        match NativeSession::open(config) {
+            Err(error)
+                if attempt < ATTEMPTS
+                    && matches!(
+                        (error.stage(), error.failure()),
+                        (SessionStage::Bind, SessionFailure::Busy)
+                            | (_, SessionFailure::MemlockLimit)
+                    ) =>
+            {
+                attempt += 1;
+                thread::sleep(WAIT);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn domain(interface: IfId) -> UmemDomainId {
