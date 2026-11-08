@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Runs every netns test on AF_XDP and on AF_PACKET and says which failed.
+# Run as root, after `cargo build`:  sudo scripts/netns-all.sh [target/debug]
+set -uo pipefail
+bin=${1:-target/debug}
+here=$(dirname "$(realpath "$0")")
+failed=()
+for backend in af-xdp af-packet; do
+  for test in "$here"/netns-*.sh; do
+    name=$(basename "$test" .sh)
+    [[ "$name" == netns-all ]] && continue
+    if FE_BACKEND=$backend bash "$test" "$bin" >/dev/null 2>&1; then
+      echo "pass  $backend $name"
+    else
+      echo "FAIL  $backend $name"
+      failed+=("$backend $name")
+    fi
+  done
+done
+(( ${#failed[@]} == 0 )) || { echo "failed: ${failed[*]}"; exit 1; }
+echo "all passed"
