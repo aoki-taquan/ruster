@@ -87,7 +87,7 @@
 //! outside = "wan"              # must have an ipv4 address: the public one
 //! ports = "1024-32767"         # optional, 1024-32767 when left out
 //! external = "198.51.100.2"    # optional; for now only the outside's own address
-//! filtering = "endpoint-independent"  # optional (RFC 4787 REQ-8's default), or
+//! filtering = "endpoint-independent"  # optional, the default, or
 //!                              # "address-dependent", "address-and-port-dependent"
 //! ```
 //!
@@ -152,8 +152,9 @@
 //!   protocol has both families is two ACEs, one per family.
 //! - RFC 4787, RFC 5382 and RFC 5508: `nat` is NAPT for UDP, TCP and ICMP queries
 //!   with core's behaviour (endpoint-independent mapping; filtering as `filtering`
-//!   names, endpoint-independent by default as RFC 4787 REQ-8 and RFC 6092 REC-17
-//!   and REC-33 recommend); see `ruster_core`'s NAT modules for its deviations. One inside and
+//!   names for UDP and TCP; endpoint-independent by default, which RFC 4787 REQ-8
+//!   and RFC 5382 REQ-3 recommend where application transparency matters most);
+//!   see `ruster_core`'s NAT modules for its deviations. One inside and
 //!   one outside interface, and the outside interface's address as the public one.
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -162,11 +162,11 @@ pub struct Nat {
     pub filtering: NatFiltering,
 }
 
-/// Which outside endpoints may reach a mapping (RFC 4787 section 5, `ietf-nat`
-/// `filtering-type`).
+/// Which outside endpoints may reach a mapping (`ietf-nat` `filtering-type`).
+/// Left out of the message when it is the default.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NatFiltering {
-    /// Any (RFC 4787 REQ-8 and RFC 6092 REC-17 and REC-33 recommend it by default).
+    /// Any.
     #[default]
     EndpointIndependent,
     /// Only addresses the mapping has sent to.
@@ -822,10 +822,12 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 NatPorts::Range { .. } => 2,
                 NatPorts::Psid { .. } => 3,
             };
-            e.map(3 + ports + u64::from(nat.external.is_some()))
-                .u64(d(sid::NAT_FILTERING))
-                .text(nat.filtering.name())
-                .u64(d(sid::NAT_INSIDE))
+            let filtering = nat.filtering != NatFiltering::default();
+            e.map(2 + ports + u64::from(nat.external.is_some()) + u64::from(filtering));
+            if filtering {
+                e.u64(d(sid::NAT_FILTERING)).text(nat.filtering.name());
+            }
+            e.u64(d(sid::NAT_INSIDE))
                 .text(&nat.inside)
                 .u64(d(sid::NAT_OUTSIDE))
                 .text(&nat.outside);
