@@ -57,8 +57,8 @@
 //! declared maximum Ethernet frame without truncation. TX frame capacity uses
 //! the kernel's 48-byte minimum data offset rather than the larger RX Ethernet
 //! offset. The strict profile requires GRO/LRO disabled (GSO superframes are
-//! dropped as truncated or oversize) and rejects frames whose VLAN tag the
-//! kernel removed. The maximum frame length must not exceed the device MTU
+//! dropped as truncated or oversize). A VLAN tag the kernel removed is put back
+//! into the frame before core sees it. The maximum frame length must not exceed the device MTU
 //! plus 14; `PACKET_LOSS` keeps a frame the kernel cannot send from stalling
 //! the TX ring.
 //!

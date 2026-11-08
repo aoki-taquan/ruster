@@ -33,8 +33,7 @@
 //!   later descriptor. The cursor advances to the next block.
 //! - A descriptor whose link is safe but whose own content is invalid
 //!   (MAC/network offset, snapshot length, data range, truncation, a frame
-//!   above the configured maximum, or a VLAN tag the kernel removed from the
-//!   captured bytes): only that packet becomes a terminal fault. Its siblings
+//!   or above the configured maximum): only that packet becomes a terminal fault. Its siblings
 //!   are still delivered, and the block returns after the last sibling is
 //!   terminal. GRO/LRO superframes therefore arrive as truncated or oversize
 //!   faults and are dropped; the strict profile requires them disabled.
@@ -84,9 +83,20 @@ const PACKET_WIRE: usize = offset_of!(Tpacket3Hdr, tp_len);
 const PACKET_MAC: usize = offset_of!(Tpacket3Hdr, tp_mac);
 const PACKET_NET: usize = offset_of!(Tpacket3Hdr, tp_net);
 const PACKET_STATUS: usize = offset_of!(Tpacket3Hdr, tp_status);
-/// Linux `TP_STATUS_VLAN_VALID` and `TP_STATUS_VLAN_TPID_VALID`: the kernel
-/// moved an offloaded 802.1Q/802.1ad tag out of the captured bytes.
-const TP_STATUS_VLAN_OFFLOADED: u32 = (1 << 4) | (1 << 6);
+/// Linux `TP_STATUS_VLAN_VALID`: the kernel took the outer 802.1Q/802.1ad tag out
+/// of the captured bytes (`skb_vlan_untag`) and put it in `tp_vlan_tci`.
+const TP_STATUS_VLAN_VALID: u32 = 1 << 4;
+/// Linux `TP_STATUS_VLAN_TPID_VALID`: `tp_vlan_tpid` holds the tag's TPID; without
+/// it the TPID is 802.1Q's.
+const TP_STATUS_VLAN_TPID_VALID: u32 = 1 << 6;
+const ETHERTYPE_8021Q: u16 = 0x8100;
+
+/// A packet's `tp_status`, and its `tp_vlan_tci` (low 16 bits) and `tp_vlan_tpid`.
+type PacketStatus = (u32, (u16, u16));
+const PACKET_VLAN_TCI: usize =
+    offset_of!(Tpacket3Hdr, hv1) + offset_of!(super::TpacketHdrVariant1, tp_vlan_tci);
+const PACKET_VLAN_TPID: usize =
+    offset_of!(Tpacket3Hdr, hv1) + offset_of!(super::TpacketHdrVariant1, tp_vlan_tpid);
 
 const _: [(); 0] = [(); BLOCK_VERSION];
 const _: [(); 4] = [(); BLOCK_PRIVATE];
@@ -100,6 +110,8 @@ const _: [(); 16] = [(); PACKET_WIRE];
 const _: [(); 24] = [(); PACKET_MAC];
 const _: [(); 26] = [(); PACKET_NET];
 const _: [(); 20] = [(); PACKET_STATUS];
+const _: [(); 32] = [(); PACKET_VLAN_TCI];
+const _: [(); 36] = [(); PACKET_VLAN_TPID];
 
 /// Independent per-batch work limits.
 ///
@@ -332,6 +344,8 @@ pub(super) enum Step {
         token: RxPacketToken,
         data: NonNull<u8>,
         len: usize,
+        /// The tag the kernel took off (TPID, TCI).
+        vlan: Option<(u16, u16)>,
     },
 }
 
@@ -550,7 +564,7 @@ impl<O: PacketOps> PacketRingResources<O> {
     fn rx_classify(
         &self,
         descriptor: PacketDescriptor,
-        status: u32,
+        (status, vlan): PacketStatus,
         block_len: usize,
         next: Option<usize>,
     ) -> RxPacketMetadata {
@@ -560,16 +574,12 @@ impl<O: PacketOps> PacketRingResources<O> {
             data_len: 0,
             next_offset,
             fault: Some(fault),
+            vlan: None,
         };
         let packet = match descriptor.validate(block_len) {
             Ok(packet) => packet,
             Err(error) => return fault(RxPacketFault::Descriptor(error)),
         };
-        if status & TP_STATUS_VLAN_OFFLOADED != 0 {
-            // The visible frame would look untagged although it was tagged on
-            // the wire; the strict profile does not forward VLAN traffic.
-            return fault(RxPacketFault::VlanOffloaded { status });
-        }
         if packet.is_truncated() {
             return fault(RxPacketFault::Truncated {
                 snap_len: descriptor.snap_len,
@@ -583,11 +593,22 @@ impl<O: PacketOps> PacketRingResources<O> {
             });
         }
         let data = packet.data();
+        // The frame was tagged on the wire: the tag is put back before the lease
+        // (the 14 bytes before the frame have room for it).
+        let vlan = (status & TP_STATUS_VLAN_VALID != 0).then(|| {
+            let tpid = if status & TP_STATUS_VLAN_TPID_VALID != 0 {
+                vlan.1
+            } else {
+                ETHERTYPE_8021Q
+            };
+            (tpid, vlan.0)
+        });
         RxPacketMetadata {
             data_offset: data.start,
             data_len: data.end - data.start,
             next_offset,
             fault: None,
+            vlan,
         }
     }
 
@@ -642,6 +663,7 @@ impl<O: PacketOps> PacketRingResources<O> {
                         token,
                         data,
                         len: metadata.data_len,
+                        vlan: metadata.vlan,
                     };
                 }
                 Err(error) => RxPacketFault::Mapping(error),
@@ -914,7 +936,7 @@ impl<O: PacketOps> PacketRingResources<O> {
         block_start: usize,
         packet_offset: usize,
         is_last: bool,
-    ) -> Result<(PacketDescriptor, u32), MappingAccessError> {
+    ) -> Result<(PacketDescriptor, PacketStatus), MappingAccessError> {
         let packet = block_start
             .checked_add(packet_offset)
             .ok_or(MappingAccessError::ArithmeticOverflow)?;
@@ -927,7 +949,11 @@ impl<O: PacketOps> PacketRingResources<O> {
             net_offset: usize::from(self.rx_read_u16(packet + PACKET_NET)?),
             is_last,
         };
-        Ok((descriptor, self.rx_read_u32(packet + PACKET_STATUS)?))
+        let status = self.rx_read_u32(packet + PACKET_STATUS)?;
+        // The TCI is the low 16 bits of `tp_vlan_tci`.
+        let tci = self.rx_read_u32(packet + PACKET_VLAN_TCI)? as u16;
+        let tpid = self.rx_read_u16(packet + PACKET_VLAN_TPID)?;
+        Ok((descriptor, (status, (tci, tpid))))
     }
 }
 
@@ -959,13 +985,19 @@ impl<O: PacketOps> RxBatch<'_, O> {
                     self.report.stop = Some(RxStop::Halted);
                     return Some(RxNext::Fault(fault));
                 }
-                Step::Lease { token, data, len } => {
+                Step::Lease {
+                    token,
+                    data,
+                    len,
+                    vlan,
+                } => {
                     return Some(RxNext::Packet(RxPacket {
                         port: &mut *self.port,
                         report: &mut self.report,
                         token,
                         data,
                         len,
+                        vlan,
                         completed: false,
                     }))
                 }
@@ -995,11 +1027,17 @@ pub(crate) struct RxPacket<'b, O: PacketOps = LinuxOps> {
     token: RxPacketToken,
     data: NonNull<u8>,
     len: usize,
+    vlan: Option<(u16, u16)>,
     completed: bool,
 }
 
 #[allow(dead_code)]
 impl<O: PacketOps> RxPacket<'_, O> {
+    /// The tag (TPID, TCI) the kernel took off the frame, if it was tagged.
+    pub(crate) const fn vlan(&self) -> Option<(u16, u16)> {
+        self.vlan
+    }
+
     pub(crate) const fn token(&self) -> RxPacketToken {
         self.token
     }

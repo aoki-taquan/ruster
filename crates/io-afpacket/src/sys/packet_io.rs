@@ -192,6 +192,7 @@ struct LeasedRx {
     token: RxPacketToken,
     data: NonNull<u8>,
     len: usize,
+    vlan: Option<(u16, u16)>,
 }
 
 #[allow(dead_code)]
@@ -204,7 +205,7 @@ impl<'a, O: PacketOps> AfPacketBatch<'a, O> {
     /// The next lease's backend slot (the public adapter wraps it).
     pub(crate) fn next_slot(&mut self) -> Option<AfPacketSlot<'_, 'a, O>> {
         let leased = self.next_rx()?;
-        Some(AfPacketSlot {
+        let mut slot = AfPacketSlot {
             batch: self,
             port: leased.port,
             token: leased.token,
@@ -212,7 +213,19 @@ impl<'a, O: PacketOps> AfPacketBatch<'a, O> {
             len: leased.len,
             front: crate::TPACKET_V3_ETHERNET_MAC_OFFSET - crate::TPACKET_V3_HDRLEN,
             completed: false,
-        })
+        };
+        // Put back the tag the kernel took off: 4 bytes into the room before the
+        // frame, the MAC addresses moved forward, the tag after them (as libpcap
+        // does). A frame shorter than its MAC addresses keeps no tag; core drops it.
+        if let Some((tpid, tci)) = leased.vlan {
+            if slot.len >= 12 && slot.resize_front(-4) {
+                let bytes = slot.bytes_mut();
+                bytes.copy_within(4..16, 0);
+                bytes[12..14].copy_from_slice(&tpid.to_be_bytes());
+                bytes[14..16].copy_from_slice(&tci.to_be_bytes());
+            }
+        }
+        Some(slot)
     }
 
     /// `finish` that the public adapter calls through its wrapper.
@@ -241,12 +254,18 @@ impl<'a, O: PacketOps> AfPacketBatch<'a, O> {
                 // A packet-local or whole-block fault is already terminal and
                 // counted in the port's BackendStats; delivery continues.
                 Step::Continue | Step::Fault(_) => {}
-                Step::Lease { token, data, len } => {
+                Step::Lease {
+                    token,
+                    data,
+                    len,
+                    vlan,
+                } => {
                     return Some(LeasedRx {
                         port,
                         token,
                         data,
                         len,
+                        vlan,
                     })
                 }
                 Step::Stop(RxStop::PacketBudget) => {

@@ -182,6 +182,8 @@ impl Fixture {
             self.write_u32(header + 20, packet.status);
             self.write_u16(header + 24, packet.mac_offset);
             self.write_u16(header + 26, 96);
+            self.write_u32(header + 32, packet.vlan.0);
+            self.write_u16(header + 36, packet.vlan.1);
             self.write(header + 82, packet.payload);
             offset += total;
         }
@@ -234,6 +236,8 @@ struct Packet<'p> {
     mac_offset: u16,
     next_offset: Option<u32>,
     status: u32,
+    /// `tp_vlan_tci` and `tp_vlan_tpid`.
+    vlan: (u32, u16),
 }
 
 const fn packet(payload: &[u8]) -> Packet<'_> {
@@ -244,6 +248,7 @@ const fn packet(payload: &[u8]) -> Packet<'_> {
         mac_offset: 82,
         next_offset: None,
         status: TP_STATUS_USER,
+        vlan: (0, 0),
     }
 }
 
@@ -804,26 +809,31 @@ fn rx_local_packet_faults_are_terminal_once_and_siblings_are_delivered() {
     assert_eq!(report.blocks_returned, 1);
     assert_eq!(fixture.status(0), TP_STATUS_KERNEL);
 
-    // An offloaded VLAN tag would make a tagged frame look untagged.
-    let mut vlan = packet(&[8; 60]);
-    vlan.status = TP_STATUS_USER | 0x10 | 0x40;
-    fixture.write_block(1, &[vlan, packet(&[9; 60])]);
+    // A tag the kernel took off comes with the packet: 802.1ad with its TPID,
+    // 802.1Q without one (TP_STATUS_VLAN_TPID_VALID clear).
+    let mut qinq = packet(&[8; 60]);
+    qinq.status = TP_STATUS_USER | 0x10 | 0x40;
+    qinq.vlan = (0xffff_200a, 0x88a8);
+    let mut dot1q = packet(&[9; 60]);
+    dot1q.status = TP_STATUS_USER | 0x10;
+    dot1q.vlan = (0x000a, 0);
+    fixture.write_block(1, &[qinq, dot1q]);
     let mut batch = fixture.port.begin_rx(UNLIMITED);
+    let first = expect_packet(batch.next());
     assert_eq!(
-        expect_fault(batch.next()),
-        RxFault::Packet {
-            token: token(1, 1, 0),
-            fault: RxPacketFault::VlanOffloaded {
-                status: TP_STATUS_USER | 0x50,
-            },
-            returned: None,
-        }
+        first.vlan(),
+        Some((0x88a8, 0x200a)),
+        "the TCI is the low 16 bits"
     );
-    assert_eq!(expect_packet(batch.next()).bytes()[0], 9);
+    drop(first);
+    let second = expect_packet(batch.next());
+    assert_eq!(second.vlan(), Some((0x8100, 0x000a)));
+    assert_eq!(second.bytes()[0], 9);
+    drop(second);
     drop(batch);
     assert_eq!(fixture.status(1), TP_STATUS_KERNEL);
     let stats = fixture.port.rx_stats();
-    assert_eq!(stats.descriptor_rejected, 6);
+    assert_eq!(stats.descriptor_rejected, 5);
     assert_eq!(stats.geometry_rejected, 0);
 }
 

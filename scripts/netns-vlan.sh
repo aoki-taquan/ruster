@@ -8,14 +8,11 @@
 #
 # a to b goes in and out of the same port with the tag changed; a to c loses its tag;
 # c to b gets one. Run as root after `cargo build`:
-#   sudo scripts/netns-vlan.sh [target/debug]       (AF_XDP only for now)
+#   sudo scripts/netns-vlan.sh [target/debug]
+# FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default); there
+# the kernel takes the tag off and the backend puts it back.
 set -euo pipefail
 backend=${FE_BACKEND:-af-xdp}
-if [[ $backend != af-xdp ]]; then
-  # Linux takes the tag off before AF_PACKET sees a frame (issue #423).
-  echo "VLANs need the AF_XDP backend for now" >&2
-  exit 2
-fi
 bin=$(realpath "${1:-target/debug}")
 tag=rsl$$
 a=$tag-a b=$tag-b c=$tag-c router=$tag-r

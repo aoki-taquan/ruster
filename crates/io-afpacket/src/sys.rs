@@ -68,7 +68,7 @@ const _: [(); 4] = [(); crate::TP_STATUS_WRONG_FORMAT as usize];
 const _: [(); 2] = [(); crate::TPACKET_V3_VERSION as usize];
 
 #[repr(C)]
-struct TpacketHdrVariant1 {
+pub(super) struct TpacketHdrVariant1 {
     tp_rxhash: u32,
     tp_vlan_tci: u32,
     tp_vlan_tpid: u16,
