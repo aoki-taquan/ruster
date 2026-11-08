@@ -50,7 +50,7 @@ impl RingGeometry {
             self.validate_common(page_size, max_frame_len, TPACKET_V3_ETHERNET_MAC_OFFSET)?;
         let kernel_minimum = layout
             .block_plus_private
-            .checked_add(TPACKET_V3_HDRLEN)
+            .checked_add(TPACKET_V3_HDRLEN + TPACKET_V3_RESERVE)
             .ok_or(GeometryError::ArithmeticOverflow)?;
         if kernel_minimum > layout.block_size {
             return Err(GeometryError::RxBlockBelowKernelMinimum {

@@ -404,9 +404,9 @@ impl<O: PacketOps> PacketSlot for AfPacketSlot<'_, '_, O> {
         // lie in the RX extent of the live mapping and inside this packet's
         // validated data range, which starts at `tp_mac` (146, checked by
         // `PacketDescriptor::validate`) after the packet's TPACKET_V3 header (68
-        // bytes). `resize_front` moves the start back at most into the 14 bytes
-        // between them, which belong to this packet, are no header field, and
-        // are read by nothing else, and never past the end it was given: the
+        // bytes). `resize_front` moves the start back at most into the 78 bytes
+        // between them (`tp_mac - TPACKET3_HDRLEN`, with `PACKET_RESERVE`), which
+        // belong to this packet, are no header field, and are read by nothing else, and never past the end it was given: the
         // view stays inside this packet's own bytes of the block. The block
         // stays USER-owned, so the kernel does not write it, until this packet
         // completes. The slot exclusively borrows the batch and therefore the
