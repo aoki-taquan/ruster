@@ -32,7 +32,9 @@
 //! section 2.6.1) is not the router's; a packet from outside whose source is one
 //! of the router's addresses is forwarded; a link-local source toward a global
 //! destination is dropped without Destination Unreachable code 2 (RFC 4443 3.1);
-//! one ICMPv6 error limiter for every source, with one for Packet Too Big and one
+//! extension headers are stepped over only to tell whether a packet is itself an
+//! ICMPv6 error (RFC 4443 2.4(e.1)); one ICMPv6 error limiter for every source,
+//! with one for Packet Too Big and one
 //! for the others, and fixed values (RFC 4443 2.4(f) asks them configurable); no
 //! Destination Unreachable for an unresolvable neighbor (address
 //! unreachable) or for traffic to the router, no extension headers before an ND
@@ -501,6 +503,11 @@ where
             Outcome::Drop(Ipv6LocalUnsupported)
         };
     }
+    // A unicast packet for someone else in an Ethernet multicast frame is not
+    // forwarded (every router on the link would).
+    if destination_mac[0] == 0x33 && destination_mac[1] == 0x33 {
+        return Outcome::Drop(Ipv6EthernetAddressInvalid);
+    }
     if is_link_local(destination) || is_unspecified_or_loopback(destination) {
         return Outcome::Drop(Ipv6DestinationNotForwarded);
     }
@@ -728,6 +735,34 @@ fn icmpv6_checksum(source: [u8; 16], destination: [u8; 16], icmp: &[u8]) -> u16 
 /// Writes into `out` the Ethernet frame of an ICMPv6 error about `invoking` and returns
 /// the interface to send it out of and its length. `None` when RFC 4443 section 2.4 (e)
 /// forbids one, or there is no route, neighbor or router address to send it with.
+/// The upper-layer header of the IPv6 packet in `frame` (Ethernet): its type and
+/// where it starts, past at most eight Hop-by-Hop, Routing, Destination Options and
+/// (first-fragment) Fragment headers.
+fn upper_layer(frame: &[u8]) -> Option<(u8, usize)> {
+    let ip = ETHERNET_HEADER;
+    let mut next = *frame.get(ip + 6)?;
+    let mut at = ip + IPV6_HEADER;
+    for _ in 0..8 {
+        match next {
+            0 | 43 | 60 => {
+                let header = frame.get(at..at + 2)?;
+                next = header[0];
+                at += (usize::from(header[1]) + 1) * 8;
+            }
+            44 => {
+                let header = frame.get(at..at + 8)?;
+                if u16::from_be_bytes([header[2], header[3]]) >> 3 != 0 {
+                    return None;
+                }
+                next = header[0];
+                at += 8;
+            }
+            _ => return Some((next, at)),
+        }
+    }
+    None
+}
+
 fn build_error(
     out: &mut [u8; CONTROL_FRAME_MAX],
     invoking: &[u8],
@@ -741,8 +776,8 @@ fn build_error(
     let destination = address(invoking, ip + 24);
     // (e.1) no error about an ICMPv6 error; (e.2, e.3) none about multicast, except
     // Packet Too Big; (e.5) none to a source that is not one host.
-    let is_error =
-        invoking[ip + 6] == ICMPV6 && invoking.get(ip + IPV6_HEADER).is_some_and(|&t| t < 128);
+    let is_error = upper_layer(invoking)
+        .is_some_and(|(next, at)| next == ICMPV6 && invoking.get(at).is_some_and(|&t| t < 128));
     let multicast = is_multicast(destination) || invoking[0] & 1 != 0;
     if is_error
         || (multicast && kind != PACKET_TOO_BIG)
@@ -773,7 +808,11 @@ fn build_error(
         (egress, mac, from)
     };
     let limit = ERROR_MAX.min(usize::from(egress.mtu));
-    let quoted = (invoking.len() - ip).min(limit - IPV6_HEADER - 8);
+    // The invoking packet itself: up to its Payload Length, not the frame's padding.
+    let payload_len = usize::from(u16::from_be_bytes([invoking[ip + 4], invoking[ip + 5]]));
+    let quoted = (invoking.len() - ip)
+        .min(IPV6_HEADER + payload_len)
+        .min(limit - IPV6_HEADER - 8);
     let icmp_len = 8 + quoted;
     let frame_len = ip + IPV6_HEADER + icmp_len;
     out[0..6].copy_from_slice(&mac.0);

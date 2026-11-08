@@ -3250,3 +3250,69 @@ fn many_icmpv6_errors_do_not_use_up_packet_too_big() {
     assert_eq!(tx.bytes[54], 2, "Packet Too Big");
     assert_eq!(&tx.bytes[58..62], &1_400_u32.to_be_bytes());
 }
+
+/// IPv6 details (RFC 4443 2.4): no forwarding of unicast in an Ethernet multicast
+/// frame, no error about an ICMPv6 error behind an extension header, and the quote
+/// is the packet, not the frame's padding.
+#[test]
+fn ipv6_errors_and_multicast_frames_follow_rfc_4443() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let code = bench.patch(
+        &mut neighbors,
+        &[
+            Change::set(
+                Key::Neighbor {
+                    interface: "lan".into(),
+                    address: ip6("2001:db8:1::10"),
+                },
+                Value::Neighbor { mac: HOST_MAC },
+            ),
+            Change::set(
+                Key::Neighbor {
+                    interface: "wan".into(),
+                    address: ip6("fe80::1"),
+                },
+                Value::Neighbor { mac: GATEWAY_MAC },
+            ),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let step = |bench: &mut Bench, frame: Vec<u8>| {
+        bench.fe.io_mut().inject(IfId(0), frame);
+        bench.fe.step(0);
+        std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        step(
+            &mut bench,
+            ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8])
+        )
+        .len(),
+        1,
+        "to the router's MAC it is forwarded"
+    );
+    let group = [0x33, 0x33, 0, 0, 0, 1];
+    assert!(
+        step(&mut bench, ipv6_frame(group, "2001:db8:99::7", 17, &[0; 8])).is_empty(),
+        "unicast in a multicast frame is not forwarded"
+    );
+    // An ICMPv6 Destination Unreachable behind a Destination Options header.
+    let mut payload = vec![58, 0, 1, 4, 0, 0, 0, 0];
+    payload.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+    let mut error = ipv6_frame(LAN_MAC, "2001:db8:99::7", 60, &payload);
+    error[14 + 7] = 1;
+    assert!(
+        step(&mut bench, error).is_empty(),
+        "no error about an error"
+    );
+    // An expiring packet with 20 bytes of padding after it.
+    let mut padded = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+    padded[14 + 7] = 1;
+    padded.extend_from_slice(&[0xee; 20]);
+    let tx = step(&mut bench, padded);
+    assert_eq!(tx.len(), 1, "Time Exceeded");
+    let payload_len = u16::from_be_bytes([tx[0].bytes[18], tx[0].bytes[19]]);
+    assert_eq!(payload_len, 8 + 48, "the quote is the 48-byte packet");
+}
