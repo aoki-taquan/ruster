@@ -249,35 +249,55 @@ pub const IDLE_MAX: Duration = Duration::from_millis(IDLE_MAX_MS as u64);
 /// [`IDLE_MAX`] in milliseconds.
 pub const IDLE_MAX_MS: u32 = 1;
 
-/// The longest a control-plane process sleeps while it has nothing to do.
-const CE_IDLE_LONGEST_MS: u64 = 8;
-
-/// How long a control-plane process sleeps between steps: nothing after a step
-/// with work, then 1 ms, doubling while it stays idle up to 8 ms. A process that
-/// waits for nothing does not wake a thousand times a second.
-#[derive(Debug, Default)]
+/// How long a process waits between steps while it has nothing to do: not at all
+/// after a step with work, then 1 ms, doubling while it stays idle up to a limit. A
+/// process that waits for nothing does not wake a thousand times a second.
+#[derive(Debug)]
 pub struct Idle {
-    next_ms: u64,
+    next_ms: u32,
+    longest_ms: u32,
+}
+
+impl Default for Idle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Idle {
+    /// For a control-plane process: up to 8 ms.
     pub fn new() -> Self {
-        Self::default()
+        Self::up_to(8)
+    }
+
+    /// Up to `longest_ms` (at least 1).
+    pub fn up_to(longest_ms: u32) -> Self {
+        Self {
+            next_ms: 0,
+            longest_ms: longest_ms.max(1),
+        }
+    }
+
+    /// How long to wait after a step, in milliseconds; `None` after a busy one.
+    pub fn after(&mut self, busy: bool) -> Option<u32> {
+        if busy {
+            self.next_ms = 0;
+            return None;
+        }
+        self.next_ms = self.next_ms();
+        Some(self.next_ms)
     }
 
     /// Sleeps when `progress` found nothing to do.
     pub fn wait(&mut self, progress: Progress) {
-        if progress.busy {
-            self.next_ms = 0;
-            return;
+        if let Some(ms) = self.after(progress.busy) {
+            thread::sleep(Duration::from_millis(u64::from(ms)));
         }
-        self.next_ms = (self.next_ms * 2).clamp(1, CE_IDLE_LONGEST_MS);
-        thread::sleep(Duration::from_millis(self.next_ms));
     }
 
-    /// The sleep the next idle step takes, in milliseconds.
-    pub fn next_ms(&self) -> u64 {
-        (self.next_ms * 2).clamp(1, CE_IDLE_LONGEST_MS)
+    /// The wait the next idle step takes, in milliseconds.
+    pub fn next_ms(&self) -> u32 {
+        self.next_ms.saturating_mul(2).clamp(1, self.longest_ms)
     }
 }
 

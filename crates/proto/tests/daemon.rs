@@ -144,4 +144,10 @@ fn an_idle_process_sleeps_longer_until_it_has_work() {
     assert_eq!(waits, [1, 2, 4, 8, 8]);
     idle.wait(busy);
     assert_eq!(idle.next_ms(), 1, "work starts over from 1 ms");
+
+    let mut fe = daemon::Idle::up_to(4);
+    let waits: Vec<_> = (0..4).map(|_| fe.after(false)).collect();
+    assert_eq!(waits, [Some(1), Some(2), Some(4), Some(4)]);
+    assert_eq!(fe.after(true), None);
+    assert_eq!(fe.after(false), Some(1));
 }
