@@ -641,13 +641,21 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 nat_entry = Some(nat);
             }
             (
-                Key::IcmpErrors { .. },
+                Key::IcmpErrors { vrf },
                 Value::IcmpErrors {
                     ipv4_interval_ms,
                     ipv6_burst,
                     ipv6_interval_ms,
                 },
-            ) => icmp_errors = Some((*ipv4_interval_ms, *ipv6_burst, *ipv6_interval_ms)),
+            ) => {
+                // The limits are the FE's, for every VRF.
+                if vrf != DEFAULT_VRF {
+                    return Err(format!(
+                        "icmp-errors in {vrf}: the limits are set in the default VRF for all"
+                    ));
+                }
+                icmp_errors = Some((*ipv4_interval_ms, *ipv6_burst, *ipv6_interval_ms));
+            }
             (Key::FirewallPolicy { vrf }, Value::FirewallPolicy { filtering, outside }) => {
                 if vrf != DEFAULT_VRF {
                     return Err(format!(

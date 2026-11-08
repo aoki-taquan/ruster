@@ -824,8 +824,9 @@ where
             // 100 ms for IPv4; 10 at once and one every 10 ms for IPv6).
             let (ipv4_interval, ipv6_burst, ipv6_interval) =
                 built.icmp_errors.unwrap_or((100, 10, 10));
-            if let Ok(policy) =
-                ruster_core::Icmpv4ErrorPolicy::new(u64::from(ipv4_interval), 60_000)
+            // A state lives at least as long as its interval, so any interval works.
+            let interval = u64::from(ipv4_interval);
+            if let Ok(policy) = ruster_core::Icmpv4ErrorPolicy::new(interval, interval.max(60_000))
             {
                 self.icmpv4_errors.set_policy(policy);
             }
