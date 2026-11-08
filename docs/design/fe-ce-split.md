@@ -127,7 +127,8 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
   TTL 255で受けたことを確かめるGTSM（RFC 5082）がそのまま動く。
 - **wan側で待ち受けるサービス:** NATの外側のアドレスで待ち受けるポート（SSH、管理APIなど）は、
   NATのポートの範囲から外して設定する。そのポートに届いたパケットは、NATの対応を探さずに
-  input firewallへ進む。MAP-Eでは、待ち受けもPSIDのポートの組の中から選ぶ。
+  input firewallへ進む。MAP-Eでは、待ち受けもPSIDのポートの組の中から選ぶ。UDPのサービスは、
+  受けたアドレスから返す（`IP_PKTINFO`などを使う）。NATがあるときkernelが選ぶ送信元は内側のアドレスなので。
 - TAPではなくTUNを使い、kernelにARP/NDをさせない。
 - kernelは専用のnetnsに置き、フォワーディングは無効にする。kernelの経路は「全部TUNへ」だけ。
 - アドレスはCEからkernelへ一方向に設定する。kernelからrusterへ情報を取り込まない。
