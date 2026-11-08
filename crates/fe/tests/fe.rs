@@ -839,6 +839,9 @@ fn traffic_to_the_router_goes_to_the_kernel_pipe_and_the_kernel_s_packets_go_out
     observer.observe();
     bench.settle(&mut [&mut observer]);
     reply[16..20].copy_from_slice(&[192, 0, 2, 99]);
+    reply[10..12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&reply[..20]);
+    reply[10..12].copy_from_slice(&checksum.to_be_bytes());
     kernel.send(&reply).unwrap();
     let events = bench.settle(&mut [&mut observer]).remove(0);
     assert!(bench.fe.io_mut().pop_tx().is_none());
@@ -1336,7 +1339,7 @@ fn a_route_to_a_tunnel_interface_sends_ipv4_inside_ipv6() {
     let (fe_end, kernel) = UnixDatagram::pair().unwrap();
     fe_end.set_nonblocking(true).unwrap();
     bench.fe.attach_local("default", Box::new(fe_end));
-    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
     own[12..16].copy_from_slice(&[192, 0, 2, 1]);
     own[10..12].fill(0);
     let checksum = ipv4_header_checksum(&own[..20]);
@@ -1443,7 +1446,7 @@ fn a_route_to_a_pppoe_interface_sends_in_its_session() {
     let (fe_end, kernel) = UnixDatagram::pair().unwrap();
     fe_end.set_nonblocking(true).unwrap();
     bench.fe.attach_local("default", Box::new(fe_end));
-    let mut own = udp_from_host(INTERNET)[14..42].to_vec();
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
     own[12..16].copy_from_slice(&[192, 0, 2, 1]);
     own[10..12].fill(0);
     let checksum = ipv4_header_checksum(&own[..20]);
@@ -1933,5 +1936,292 @@ mod wireguard {
             ),
         ];
         assert_ne!(bench.patch(&mut config, &second), Code::CHANGED);
+    }
+}
+
+/// The router's own packets go through the forward firewall like a host's from a
+/// port: a rule names their interface `rt-default`.
+#[test]
+fn the_router_s_own_packets_need_a_rule_for_rt_default() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(1)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let mut own = udp_from_host(INTERNET)[14..].to_vec();
+    own[12..16].copy_from_slice(&[198, 51, 100, 2]);
+    own[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&own[..20]);
+    own[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    // Only the LAN's UDP is accepted: the router's own does not leave.
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+
+    let mut from_router = accept_udp_from_lan(2);
+    if let Some(Value::FirewallRule(rule)) = &mut from_router.value {
+        rule.ingress = Some("rt-default".into());
+    }
+    assert_eq!(bench.patch(&mut config, &[from_router]), Code::CHANGED);
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("sent by the rule for rt-default");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+}
+
+/// An IPv4 TCP packet (no Ethernet header) from `source` to `destination`.
+fn tcp_packet(source: [u8; 4], destination: [u8; 4], ports: (u16, u16), flags: u8) -> Vec<u8> {
+    let mut p = vec![0_u8; 40];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&40_u16.to_be_bytes());
+    p[8] = 64;
+    p[9] = 6;
+    p[12..16].copy_from_slice(&source);
+    p[16..20].copy_from_slice(&destination);
+    let checksum = ipv4_header_checksum(&p[..20]);
+    p[10..12].copy_from_slice(&checksum.to_be_bytes());
+    p[20..22].copy_from_slice(&ports.0.to_be_bytes());
+    p[22..24].copy_from_slice(&ports.1.to_be_bytes());
+    p[32] = 0x50;
+    p[33] = flags;
+    // The TCP checksum over the pseudo-header and the segment (RFC 793).
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&source);
+    pseudo.extend_from_slice(&destination);
+    pseudo.extend_from_slice(&[0, 6, 0, 20]);
+    pseudo.extend_from_slice(&p[20..]);
+    let checksum = ruster_core::internet_checksum(&pseudo);
+    p[36..38].copy_from_slice(&checksum.to_be_bytes());
+    p
+}
+
+fn from_wan(packet: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&WAN_MAC);
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&0x0800_u16.to_be_bytes());
+    frame.extend_from_slice(packet);
+    frame
+}
+
+/// Traffic to the router is judged like traffic to a host behind a port: a rule with
+/// `egress = "rt-default"` lets a connection in, and its state lets the kernel's
+/// replies out.
+#[test]
+fn a_connection_to_the_router_needs_a_rule_and_its_replies_then_pass() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let router = [198, 51, 100, 2];
+    let syn = tcp_packet(INTERNET, router, (40_000, 22), 0x02);
+    let mut buf = [0_u8; 2048];
+
+    // A firewall with a rule for the LAN only: the SYN does not reach the kernel.
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(1)]),
+        Code::CHANGED
+    );
+    bench.fe.io_mut().inject(IfId(1), from_wan(&syn));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_err(), "nothing for the kernel");
+
+    // SSH to the router is allowed.
+    let ssh_in = Change::set(
+        Key::FirewallRule {
+            vrf: "default".into(),
+            id: 2,
+        },
+        Value::FirewallRule(ruster_proto::table::FirewallRule {
+            ingress: None,
+            egress: Some("rt-default".into()),
+            source: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            destination: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            protocol: ruster_proto::table::Protocol::Tcp,
+            source_ports: (0, 65_535),
+            destination_ports: (22, 22),
+            action: ruster_proto::table::FirewallAction::Accept,
+        }),
+    );
+    assert_eq!(bench.patch(&mut config, &[ssh_in]), Code::CHANGED);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&syn));
+    bench.fe.step(bench.now);
+    let n = kernel.recv(&mut buf).expect("the SYN reached the kernel");
+    assert_eq!(&buf[..n], &syn[..]);
+
+    // The kernel's SYN-ACK and later segments go out by the flow's state.
+    for flags in [0x12, 0x10] {
+        let reply = tcp_packet(router, INTERNET, (22, 40_000), flags);
+        kernel.send(&reply).unwrap();
+        bench.fe.step(bench.now);
+        let tx = bench.fe.io_mut().pop_tx().expect("the kernel's reply left");
+        assert_eq!(tx.egress, IfId(1));
+        assert_eq!(&tx.bytes[14..], &reply[..]);
+    }
+}
+
+fn ipv4_checksummed(mut p: Vec<u8>) -> Vec<u8> {
+    p[10..12].fill(0);
+    let checksum = ipv4_header_checksum(&p[..20]);
+    p[10..12].copy_from_slice(&checksum.to_be_bytes());
+    p
+}
+
+/// A Fragmentation Needed from `from` to `to`, quoting `quoted` (its header and 8
+/// bytes).
+fn frag_needed(from: [u8; 4], to: [u8; 4], quoted: &[u8]) -> Vec<u8> {
+    let mut icmp = vec![3, 4, 0, 0, 0, 0, 0x05, 0x00];
+    icmp.extend_from_slice(&quoted[..28]);
+    let checksum = ruster_core::internet_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    let mut p = vec![0_u8; 20];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
+    p[8] = 64;
+    p[9] = 1;
+    p[12..16].copy_from_slice(&from);
+    p[16..20].copy_from_slice(&to);
+    p.extend_from_slice(&icmp);
+    ipv4_checksummed(p)
+}
+
+fn router_with_firewall(rules: &[Change]) -> (Bench, UnixDatagram) {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(bench.patch(&mut config, rules), Code::CHANGED);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    (bench, kernel)
+}
+
+fn rule_for(
+    id: u32,
+    protocol: ruster_proto::table::Protocol,
+    ingress: Option<&str>,
+    egress: Option<&str>,
+) -> Change {
+    Change::set(
+        Key::FirewallRule {
+            vrf: "default".into(),
+            id,
+        },
+        Value::FirewallRule(ruster_proto::table::FirewallRule {
+            ingress: ingress.map(Into::into),
+            egress: egress.map(Into::into),
+            source: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            destination: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            protocol,
+            source_ports: (0, 65_535),
+            destination_ports: (0, 65_535),
+            action: ruster_proto::table::FirewallAction::Accept,
+        }),
+    )
+}
+
+/// The router learns the path MTU of its own connections through the firewall.
+#[test]
+fn a_frag_needed_about_the_router_s_own_flow_reaches_it_and_a_forged_one_does_not() {
+    use ruster_proto::table::Protocol;
+    let (mut bench, kernel) =
+        router_with_firewall(&[rule_for(1, Protocol::Tcp, Some("rt-default"), None)]);
+    let router = [198, 51, 100, 2];
+    let syn = tcp_packet(router, INTERNET, (40_000, 443), 0x02);
+    kernel.send(&syn).unwrap();
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_some(),
+        "the router's SYN left"
+    );
+
+    let mut buf = [0_u8; 2048];
+    let hop = [203, 0, 113, 99];
+    let about_it = frag_needed(hop, router, &syn);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&about_it));
+    bench.fe.step(bench.now);
+    let n = kernel.recv(&mut buf).expect("the error reached the kernel");
+    assert_eq!(&buf[..n], &about_it[..]);
+
+    let other = tcp_packet(router, INTERNET, (40_001, 443), 0x02);
+    let not_a_flow = frag_needed(hop, router, &other);
+    let forged_sender = frag_needed(
+        hop,
+        router,
+        &tcp_packet([198, 51, 100, 77], INTERNET, (40_000, 443), 0x02),
+    );
+    for forged in [not_a_flow, forged_sender] {
+        bench.fe.io_mut().inject(IfId(1), from_wan(&forged));
+        bench.fe.step(bench.now);
+        assert!(
+            kernel.recv(&mut buf).is_err(),
+            "a forged error does not reach the kernel"
+        );
+    }
+}
+
+/// A datagram for the router in fragments: the first is judged by the rules, the
+/// later ones go on to the kernel, which puts them together.
+#[test]
+fn fragments_for_the_router_reach_it_when_the_rules_let_the_first_in() {
+    use ruster_proto::table::Protocol;
+    let (mut bench, kernel) =
+        router_with_firewall(&[rule_for(1, Protocol::Udp, None, Some("rt-default"))]);
+    let router = [198, 51, 100, 2];
+    let fragment = |offset_units: u16, more: bool, payload: &[u8]| {
+        let mut p = vec![0_u8; 20];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&((20 + payload.len()) as u16).to_be_bytes());
+        p[4..6].copy_from_slice(&7_u16.to_be_bytes());
+        let flags = (u16::from(more) << 13) | offset_units;
+        p[6..8].copy_from_slice(&flags.to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
+        p[12..16].copy_from_slice(&INTERNET);
+        p[16..20].copy_from_slice(&router);
+        p.extend_from_slice(payload);
+        ipv4_checksummed(p)
+    };
+    let mut first_payload = vec![0_u8; 16];
+    first_payload[0..2].copy_from_slice(&5353_u16.to_be_bytes());
+    first_payload[2..4].copy_from_slice(&53_u16.to_be_bytes());
+    first_payload[4..6].copy_from_slice(&40_u16.to_be_bytes());
+    let first = fragment(0, true, &first_payload);
+    let later = fragment(2, false, &[0_u8; 24]);
+    let mut buf = [0_u8; 2048];
+    for packet in [&first, &later] {
+        bench.fe.io_mut().inject(IfId(1), from_wan(packet));
+        bench.fe.step(bench.now);
+        let n = kernel
+            .recv(&mut buf)
+            .expect("the fragment reached the kernel");
+        assert_eq!(&buf[..n], &packet[..]);
     }
 }

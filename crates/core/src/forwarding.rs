@@ -1775,6 +1775,49 @@ impl<'a> ForwardingSnapshot<'a> {
         }
     }
 
+    /// Where a packet the router itself sends to `destination` goes: the route's
+    /// egress interface and its MAC, the next hop, and the next hop's MAC when the
+    /// neighbor table has it. `None` without a route (or IPv6 tables, for IPv6).
+    #[must_use]
+    pub fn origin(&self, destination: std::net::IpAddr) -> Option<crate::Origin> {
+        let (egress, next_hop, destination_mac) = match destination {
+            std::net::IpAddr::V4(address) => {
+                let target = crate::Ipv4Address::from_octets(address.octets());
+                let route = self.route_lookup(target)?;
+                let hop = route.next_hop().unwrap_or(target);
+                let mac = self
+                    .static_neighbor(route.egress(), hop)
+                    .map(|n| n.mac)
+                    .or(crate::pppoe::of(self.pppoe, route.egress()).map(|s| s.peer));
+                (
+                    route.egress(),
+                    std::net::IpAddr::V4(hop.octets().into()),
+                    mac,
+                )
+            }
+            std::net::IpAddr::V6(address) => {
+                let (egress, hop, mac) = self.ipv6?.origin(address.octets())?;
+                let mac = mac.or(crate::pppoe::of(self.pppoe, egress).map(|s| s.peer));
+                (egress, std::net::IpAddr::V6(hop.into()), mac)
+            }
+        };
+        let source_mac = self.interface(egress)?.mac;
+        Some(crate::Origin {
+            egress,
+            source_mac,
+            next_hop,
+            destination_mac,
+        })
+    }
+
+    /// The kernel interface of `vrf`'s VRF, among [`Self::with_kernel_ingress`].
+    pub(crate) fn kernel_interface_of(&self, vrf: &ForwardingSnapshot<'_>) -> Option<IfId> {
+        self.kernel_ingress
+            .iter()
+            .copied()
+            .find(|&kernel| self.for_ingress(kernel).authority() == vrf.authority())
+    }
+
     /// Whether `ingress` is one of [`Self::with_kernel_ingress`].
     pub(crate) fn is_kernel_ingress(&self, ingress: IfId) -> bool {
         self.kernel_ingress.contains(&ingress)
@@ -2110,54 +2153,6 @@ impl<'a> ForwardingSnapshot<'a> {
         frame: &[u8],
     ) -> Option<Result<(IfId, Vec<u8>), crate::TunnelOriginError>> {
         crate::pppoe::wrap(self, egress, frame)
-    }
-
-    /// For a packet of the router itself (`packet`, an IPv4 packet) routed to the
-    /// tunnel interface `egress`: the underlying interface, next hop and the IPv6
-    /// header to wrap it in, by this snapshot's tunnels and IPv6 table (the default
-    /// VRF's). `None` when `egress` is no tunnel's.
-    #[must_use]
-    pub fn tunnel_origin(
-        &self,
-        egress: IfId,
-        packet: &[u8],
-    ) -> Option<Result<crate::TunnelOrigin, crate::TunnelOriginError>> {
-        crate::tunnel::origin(self, egress, packet)
-    }
-
-    /// Where a packet the router itself sends to `destination` goes: the route's
-    /// egress interface and its MAC, the next hop, and the next hop's MAC when the
-    /// neighbor table has it. `None` without a route (or IPv6 tables, for IPv6).
-    #[must_use]
-    pub fn origin(&self, destination: std::net::IpAddr) -> Option<crate::Origin> {
-        let (egress, next_hop, destination_mac) = match destination {
-            std::net::IpAddr::V4(address) => {
-                let target = crate::Ipv4Address::from_octets(address.octets());
-                let route = self.route_lookup(target)?;
-                let hop = route.next_hop().unwrap_or(target);
-                let mac = self
-                    .static_neighbor(route.egress(), hop)
-                    .map(|n| n.mac)
-                    .or(crate::pppoe::of(self.pppoe, route.egress()).map(|s| s.peer));
-                (
-                    route.egress(),
-                    std::net::IpAddr::V4(hop.octets().into()),
-                    mac,
-                )
-            }
-            std::net::IpAddr::V6(address) => {
-                let (egress, hop, mac) = self.ipv6?.origin(address.octets())?;
-                let mac = mac.or(crate::pppoe::of(self.pppoe, egress).map(|s| s.peer));
-                (egress, std::net::IpAddr::V6(hop.into()), mac)
-            }
-        };
-        let source_mac = self.interface(egress)?.mac;
-        Some(crate::Origin {
-            egress,
-            source_mac,
-            next_hop,
-            destination_mac,
-        })
     }
 
     /// The static neighbor for `(interface, target)`.
@@ -3703,17 +3698,45 @@ where
                             tracker.commit_deny(ticket, nat_now_ms);
                         }
                     }
-                    let reason = if snapshot.local_to_control {
-                        if let Some(queue) = control.as_deref_mut() {
-                            queue.push_local(ingress, packet.bytes_mut());
+                    // To the kernel, the router's host, as to a host behind a port: through
+                    // the forward firewall, out of the VRF's kernel interface.
+                    let admitted = match (
+                        snapshot.local_to_control,
+                        firewall_config,
+                        all_vrfs.kernel_interface_of(snapshot),
+                    ) {
+                        (true, Some(config), Some(kernel))
+                            if snapshot.authority() == all_vrfs.authority() =>
+                        {
+                            admit_ipv4_to_kernel(
+                                packet.bytes_mut(),
+                                ingress,
+                                kernel,
+                                all_vrfs,
+                                config,
+                                &mut firewall,
+                                &mut firewall_audit,
+                            )
                         }
-                        ConsumeReason::LocalToControl
-                    } else {
-                        ConsumeReason::Ipv4LocalUnsupported
+                        _ => Ok(()),
                     };
-                    packet.consume(reason);
-                    consumed += 1;
-                    trace.record(TraceEvent::Ipv4LocalConsumed { ingress, reason });
+                    if let Err(reason) = admitted {
+                        packet.recycle(reason);
+                        dropped += 1;
+                        trace.record(TraceEvent::Dropped { ingress, reason });
+                    } else {
+                        let reason = if snapshot.local_to_control {
+                            if let Some(queue) = control.as_deref_mut() {
+                                queue.push_local(ingress, packet.bytes_mut());
+                            }
+                            ConsumeReason::LocalToControl
+                        } else {
+                            ConsumeReason::Ipv4LocalUnsupported
+                        };
+                        packet.consume(reason);
+                        consumed += 1;
+                        trace.record(TraceEvent::Ipv4LocalConsumed { ingress, reason });
+                    }
                 }
                 Ok(planned) => {
                     let decision = planned.decision;
@@ -4860,6 +4883,8 @@ fn decide_ipv4<T: TraceSink>(
             Nat44TcpUnsupportedTransport
         });
     }
+    // The router's own packets (from the kernel's interface) go through the forward
+    // firewall like a host's from a port: rules name that interface `rt-default`.
     if let Some(config) = firewall_config {
         if let Some(udp_config) = nat44_udp_config {
             if ingress == udp_config.inside()
@@ -6230,6 +6255,106 @@ struct ValidatedFirewallTransport {
     source_port: u16,
     destination_port: u16,
     tcp_flags: u8,
+}
+
+/// Lets an IPv4 packet for the router through the forward firewall, as a packet
+/// forwarded out of the VRF's kernel interface `kernel` (rules name it `rt-default`):
+/// a flow it opens lets the kernel's replies back out.
+fn admit_ipv4_to_kernel(
+    frame: &[u8],
+    ingress: IfId,
+    kernel: IfId,
+    outer: &ForwardingSnapshot<'_>,
+    config: &FirewallConfig<'_>,
+    firewall: &mut Option<&mut FirewallRuntime<'_>>,
+    audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+) -> Result<(), DropReason> {
+    let mut ipv4 = packet::validate_ipv4_frame(frame)?;
+    let runtime = require_firewall_runtime(outer, config, firewall)?;
+    let flags_fragment =
+        packet::read_u16(frame, ipv4.header_offset + 6).ok_or(FirewallFragmentUnsupported)?;
+    if flags_fragment & 0x1fff != 0 {
+        // A later fragment: the kernel puts it together with its first fragment,
+        // which the rules judge, and drops it if that one did not come.
+        return Ok(());
+    }
+    // A first fragment has the whole transport header.
+    ipv4.first_fragment = flags_fragment & 0x2000 != 0;
+    if ipv4.protocol == 1 && ipv4.header_len == 20 && icmp_error_type(frame, ipv4).is_some() {
+        return admit_icmpv4_error_to_kernel(frame, ipv4, ingress, kernel, runtime, outer.now.0);
+    }
+    let validated = validate_firewall_transport(frame, ipv4)?;
+    let packet = firewall_packet(ingress, kernel, ipv4, validated, None);
+    let plan = plan_firewall_packet(packet, config, runtime, audit, outer.now.0)?;
+    runtime.commit(plan).map_err(|_| FirewallStateTableFull)
+}
+
+/// The type of an ICMPv4 error (Destination Unreachable, Time Exceeded, Parameter
+/// Problem) in `frame`, if it is one.
+fn icmp_error_type(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Option<u8> {
+    let kind = *frame.get(ipv4.header_offset + ipv4.header_len)?;
+    matches!(kind, 3 | 11 | 12).then_some(kind)
+}
+
+/// An ICMPv4 error for the router passes when it is about a flow the firewall lets
+/// through and is addressed to the quoted packet's sender (RFC 792; as for IPv6 and
+/// Linux's conntrack): the router learns the path MTU of its own connections.
+fn admit_icmpv4_error_to_kernel(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    ingress: IfId,
+    kernel: IfId,
+    runtime: &FirewallRuntime<'_>,
+    now_ms: u64,
+) -> Result<(), DropReason> {
+    let unrelated = FirewallRelatedIcmpv4Unsupported;
+    let end = ipv4.header_offset + ipv4.total_len;
+    let quoted = ipv4.header_offset + ipv4.header_len + 8;
+    let inner = frame.get(quoted..end.min(frame.len())).ok_or(unrelated)?;
+    if inner.len() < 20 || inner[0] >> 4 != 4 {
+        return Err(unrelated);
+    }
+    let inner_header = usize::from(inner[0] & 0x0f) * 4;
+    let source = crate::Ipv4Address::from_octets([inner[12], inner[13], inner[14], inner[15]]);
+    let destination = crate::Ipv4Address::from_octets([inner[16], inner[17], inner[18], inner[19]]);
+    if source != ipv4.destination {
+        return Err(unrelated);
+    }
+    let transport = inner.get(inner_header..inner_header + 8).ok_or(unrelated)?;
+    let port = |i: usize| u16::from_be_bytes([transport[i], transport[i + 1]]);
+    let (protocol, source_port, destination_port, tcp_flags) = match inner[9] {
+        6 => (FirewallProtocol::Tcp, port(0), port(2), 0),
+        17 => (FirewallProtocol::Udp, port(0), port(2), 0),
+        1 => match crate::forwarding::nat44_icmp_query::firewall_ports(transport[0], port(4)) {
+            Some((source_port, destination_port)) => (
+                FirewallProtocol::Icmp,
+                source_port,
+                destination_port,
+                if transport[0] == 0 || transport[0] == 14 {
+                    crate::firewall::FIREWALL_ICMP_REPLY
+                } else {
+                    0
+                },
+            ),
+            None => return Err(unrelated),
+        },
+        _ => return Err(unrelated),
+    };
+    // The quoted packet went the other way: from the kernel out of `ingress`.
+    let packet = FirewallPacket {
+        ingress: kernel,
+        egress: ingress,
+        source: source.into(),
+        destination: destination.into(),
+        protocol,
+        source_port,
+        destination_port,
+        tcp_flags,
+    };
+    runtime
+        .inspect_related_packet(packet, true, now_ms)
+        .map(|_| ())
+        .map_err(|_| unrelated)
 }
 
 fn validate_firewall_transport(

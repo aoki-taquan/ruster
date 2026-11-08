@@ -112,11 +112,12 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
   ホストが一台いる。
 - **kernelから出るパケット:** TUNから読んだパケットは、LANのポートで受けたパケットと同じ転送の
   処理を通る。firewall、NAT、トンネルやPPPoEの包み、フラグメント、出口に入らないときのICMPエラー
-  （kernelへ返る）がそのまま効く。たとえばMAP-Eでは、ルータ自身のDNSやNTPも共有のIPv4 addressと
+  （kernelへ返る）がそのまま効く。firewallの規則では、kernelのインターフェースを`rt-<VRF名>`
+  （default VRFなら`rt-default`）と名前で書く。たとえばMAP-Eでは、ルータ自身のDNSやNTPも共有のIPv4 addressと
   PSIDのポートに変換される。
 - **kernelへ入るパケット:** トンネルを外し、NATを逆に変換した結果の宛先がルータのアドレスなら、
   FEはパケットをTUNのインターフェースへ転送する。ルータ自身が始めた通信の戻りは、NATの対応で
-  kernelへ届く。ルータのアドレスでNATの対応が無いものは、input firewallで決める。
+  kernelへ届く。ルータ宛ての通信は、kernelのインターフェースへ出ていく通信としてforwardのfirewallで決める（規則では`egress = "rt-default"`）。
 - **送信元アドレス:** kernelは自分に設定されたアドレスを送信元に使う。出口で変換が要るかどうかは
   FEが決め、kernelはPSIDやトンネルを知らなくてよい。
 - **TTLとHop Limit:** ここだけはほかのホストと違う。TUNから読んだパケットと、TUNへ出すパケットは、
