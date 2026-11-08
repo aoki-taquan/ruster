@@ -34,12 +34,18 @@ impl Publication {
         rules: &[FirewallRule],
         on: bool,
         filtering: ruster_core::FirewallFiltering,
+        (inside, outside): (
+            ruster_core::FirewallInterfaceSet,
+            ruster_core::FirewallInterfaceSet,
+        ),
         generation: u64,
     ) -> Result<Self, String> {
         let owner = ValidatedFirewallOwner::new(
             snapshot,
             rules.into(),
-            FirewallPolicy::default().with_filtering(filtering),
+            FirewallPolicy::default()
+                .with_filtering(filtering)
+                .with_interfaces(inside, outside),
             generation,
             hash_key(),
         )

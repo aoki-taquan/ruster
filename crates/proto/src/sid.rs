@@ -62,10 +62,12 @@ pub const NAT_PSID: u64 = 60068;
 /// `ietf-nat` `policy/filtering-type` (RFC 4787 section 5).
 pub const NAT_FILTERING: u64 = 60069;
 
-/// One forward firewall rule (`ietf-access-control-list` ace, `ruster-firewall`).
-/// How the forward firewall of a VRF filters, and its `filtering-type`.
+/// How the forward firewall of a VRF filters: its `filtering-type` and its outside
+/// interfaces.
 pub const FIREWALL_POLICY: u64 = 60140;
 pub const FIREWALL_POLICY_FILTERING: u64 = 60141;
+pub const FIREWALL_POLICY_OUTSIDE: u64 = 60142;
+/// One forward firewall rule (`ietf-access-control-list` ace, `ruster-firewall`).
 pub const FIREWALL_RULE: u64 = 60070;
 pub const FIREWALL_INGRESS: u64 = 60071;
 pub const FIREWALL_EGRESS: u64 = 60072;
@@ -189,6 +191,7 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ietf-nat:nat/instances/instance/policy/filtering-type", NAT_FILTERING),
     ("/ruster-firewall:policy", FIREWALL_POLICY),
     ("/ruster-firewall:policy/filtering-type", FIREWALL_POLICY_FILTERING),
+    ("/ruster-firewall:policy/outside-interface", FIREWALL_POLICY_OUTSIDE),
     ("/ietf-access-control-list:acls/acl/aces/ace", FIREWALL_RULE),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/ingress-interface", FIREWALL_INGRESS),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/egress-interface", FIREWALL_EGRESS),

@@ -118,6 +118,9 @@ pub enum Value {
     /// no rule decides. Left out of the message when it is the default.
     FirewallPolicy {
         filtering: NatFiltering,
+        /// The interfaces outside the network the firewall guards (RFC 6092's
+        /// exterior), by name.
+        outside: Vec<String>,
     },
     FirewallRule(FirewallRule),
     Wireguard(Wireguard),
@@ -833,13 +836,19 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::WIREGUARD_SESSION_LOCAL_INDEX - sid::WIREGUARD_SESSION)
                 .u64(u64::from(session.local_index));
         }
-        Value::FirewallPolicy { filtering } => {
-            if *filtering == NatFiltering::default() {
-                e.map(0);
-            } else {
-                e.map(1)
-                    .u64(sid::FIREWALL_POLICY_FILTERING - sid::FIREWALL_POLICY)
+        Value::FirewallPolicy { filtering, outside } => {
+            let default = *filtering == NatFiltering::default();
+            e.map(u64::from(!default) + u64::from(!outside.is_empty()));
+            if !default {
+                e.u64(sid::FIREWALL_POLICY_FILTERING - sid::FIREWALL_POLICY)
                     .text(filtering.name());
+            }
+            if !outside.is_empty() {
+                e.u64(sid::FIREWALL_POLICY_OUTSIDE - sid::FIREWALL_POLICY)
+                    .array(outside.len() as u64);
+                for name in outside {
+                    e.text(name);
+                }
             }
         }
         Value::Nat(nat) => {
@@ -1387,7 +1396,12 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             }
             None => NatFiltering::default(),
         };
-        Value::FirewallPolicy { filtering }
+        let outside = match got.remove(&sid::FIREWALL_POLICY_OUTSIDE) {
+            Some(Member::List(list)) => list,
+            Some(_) => return Err(ModelError::Invalid("outside")),
+            None => Vec::new(),
+        };
+        Value::FirewallPolicy { filtering, outside }
     } else if table == sid::NAT {
         let inside = text(sid::NAT_INSIDE, "inside")?.ok_or(ModelError::Missing("inside"))?;
         let outside = text(sid::NAT_OUTSIDE, "outside")?.ok_or(ModelError::Missing("outside"))?;

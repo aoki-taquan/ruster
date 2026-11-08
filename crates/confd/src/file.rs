@@ -72,7 +72,9 @@
 //! firewall-filtering = "endpoint-independent"  # optional, at the top: who outside
 //!                              # may reach an inside host's UDP or TCP port that has a
 //!                              # flow out, where no rule decides; the default, or
-//!                              # "address-dependent", "address-and-port-dependent"
+//!                              # "address-dependent", "address-and-port-dependent".
+//!                              # Outside are NAT's outside and the interfaces of the
+//!                              # default routes; inside, the other interfaces
 //!
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too

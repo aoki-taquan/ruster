@@ -870,6 +870,7 @@ impl Hook for Builder {
             &built.firewall,
             built.firewall_on,
             built.firewall_filtering,
+            built.firewall_interfaces,
             self.generation,
         )?;
         let nat = built

@@ -5,8 +5,10 @@
 //! # Standards
 //!
 //! - RFC 6092 REC-11, REC-17 and REC-33, and RFC 4787 section 5: where no rule
-//!   decides, a UDP packet or a TCP SYN to an inside endpoint (an address and port
-//!   with a flow out that a rule opened) opens a flow of its own as
+//!   decides, a UDP packet from an outside interface or a TCP SYN to an inside
+//!   endpoint (the address and port of a flow a rule opened from an inside
+//!   interface out of an outside one, RFC 6092's interior and exterior; the
+//!   router's own interfaces are neither) opens a flow of its own as
 //!   [`FirewallFiltering`] says: endpoint-independent (the FE's default, as REC-17
 //!   and REC-33 recommend for unmanaged gateways), address-dependent, or
 //!   address-and-port-dependent (core's default). A rule, allow or deny, decides
@@ -477,6 +479,54 @@ pub struct FirewallPolicy {
     tcp_opening_idle_ttl_ms: u64,
     tcp_active_idle_ttl_ms: u64,
     filtering: FirewallFiltering,
+    /// The filtering's inside and outside interfaces (RFC 6092's interior and
+    /// exterior): only a flow from an inside interface out of an outside one makes
+    /// an inside endpoint, and only a packet from an outside interface to an
+    /// inside one may reach it. The router's own interfaces are neither.
+    inside: FirewallInterfaceSet,
+    outside: FirewallInterfaceSet,
+}
+
+/// A set of interfaces by id, below [`FirewallInterfaceSet::CAPACITY`].
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct FirewallInterfaceSet([u64; 16]);
+
+impl std::fmt::Debug for FirewallInterfaceSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_set()
+            .entries(
+                (0..Self::CAPACITY)
+                    .filter(|&id| self.0[id / 64] & (1 << (id % 64)) != 0)
+                    .map(|id| id as u16),
+            )
+            .finish()
+    }
+}
+
+impl FirewallInterfaceSet {
+    /// Interfaces with a lower id can be in a set.
+    pub const CAPACITY: usize = 16 * 64;
+
+    /// The set of `interfaces`; those with ids from [`Self::CAPACITY`] up are left
+    /// out.
+    #[must_use]
+    pub fn of(interfaces: &[IfId]) -> Self {
+        let mut set = Self::default();
+        for interface in interfaces {
+            let id = usize::from(interface.0);
+            if id < Self::CAPACITY {
+                set.0[id / 64] |= 1 << (id % 64);
+            }
+        }
+        set
+    }
+
+    #[must_use]
+    pub const fn contains(self, interface: IfId) -> bool {
+        let id = interface.0 as usize;
+        id < Self::CAPACITY && self.0[id / 64] & (1 << (id % 64)) != 0
+    }
 }
 
 /// Which outside endpoints may reach an inside endpoint that has a flow out, for
@@ -534,7 +584,21 @@ impl FirewallPolicy {
             tcp_opening_idle_ttl_ms,
             tcp_active_idle_ttl_ms,
             filtering: FirewallFiltering::AddressAndPortDependent,
+            inside: FirewallInterfaceSet([0; 16]),
+            outside: FirewallInterfaceSet([0; 16]),
         })
+    }
+
+    /// The same with `inside` and `outside` as the filtering's interfaces.
+    #[must_use]
+    pub const fn with_interfaces(
+        mut self,
+        inside: FirewallInterfaceSet,
+        outside: FirewallInterfaceSet,
+    ) -> Self {
+        self.inside = inside;
+        self.outside = outside;
+        self
     }
 
     /// The same timers with `filtering`.
@@ -572,6 +636,8 @@ impl Default for FirewallPolicy {
             tcp_opening_idle_ttl_ms: FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
             tcp_active_idle_ttl_ms: FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
             filtering: FirewallFiltering::AddressAndPortDependent,
+            inside: FirewallInterfaceSet([0; 16]),
+            outside: FirewallInterfaceSet([0; 16]),
         }
     }
 }
@@ -1139,6 +1205,9 @@ pub enum FirewallConnectionClass {
 pub enum FirewallPolicySource {
     Rule(FirewallRuleId),
     Default,
+    /// Let in by [`FirewallFiltering`] to an inside endpoint that has a flow out by
+    /// this rule.
+    Filtering(FirewallRuleId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2053,8 +2122,14 @@ impl<'state> FirewallRuntime<'state> {
             } else {
                 0
             };
+        let filtering_changed = new.filtering != old.filtering
+            || new.inside != old.inside
+            || new.outside != old.outside;
         let conflict = if longer {
             Some(crate::StateCarryConflict::Timers)
+        } else if filtering_changed {
+            // Flows the old filtering opened are not judged again: start over.
+            Some(crate::StateCarryConflict::Filtering)
         } else if (live as u64).saturating_mul(per_flow) > FIREWALL_CARRY_REEVALUATION_BUDGET {
             Some(crate::StateCarryConflict::ReevaluationBudget)
         } else {
@@ -2145,7 +2220,13 @@ impl<'state> FirewallRuntime<'state> {
                     Some(_) => None,
                     // A flow the filtering opened matches no rule; it stays unless
                     // a rule now denies it.
-                    None if slot.by_filtering => Some(slot.origin_rule_id),
+                    // A flow the filtering opened matches no rule: it stays while
+                    // the rule that let its inside endpoint out still allows.
+                    None if slot.by_filtering => rules
+                        .iter()
+                        .find(|rule| rule.id == slot.origin_rule_id)
+                        .filter(|rule| rule.action == FirewallAction::AllowStateful)
+                        .map(|rule| rule.id),
                     None => None,
                 }
             } else {
@@ -2284,7 +2365,7 @@ impl<'state> FirewallRuntime<'state> {
             Some(rule) => rule.id,
             // No rule decides: a packet to an inside endpoint with a flow out may
             // open a flow of its own, as the filtering lets it.
-            None => match self.endpoint_flow(config.policy.filtering, packet, now_ms) {
+            None => match self.endpoint_flow(config.policy, packet, now_ms) {
                 Some(rule_id) => {
                     by_filtering = true;
                     rule_id
@@ -2352,8 +2433,12 @@ impl<'state> FirewallRuntime<'state> {
             disposition: FirewallDisposition {
                 verdict: FirewallVerdict::Allow,
                 class: FirewallConnectionClass::New,
-                source: FirewallPolicySource::Rule(rule_id),
-                matched_action: Some(FirewallAction::AllowStateful),
+                source: if by_filtering {
+                    FirewallPolicySource::Filtering(rule_id)
+                } else {
+                    FirewallPolicySource::Rule(rule_id)
+                },
+                matched_action: (!by_filtering).then_some(FirewallAction::AllowStateful),
                 failure: None,
             },
         })
@@ -2626,9 +2711,12 @@ impl<'state> FirewallRuntime<'state> {
 
     /// Notes the inside endpoint of the flow at `index` (its origin).
     fn note_endpoint(&mut self, index: usize, slot: FirewallStateSlot) {
-        let filtering = self.binding.policy.filtering;
+        let policy = self.binding.policy;
+        let filtering = policy.filtering;
         if filtering == FirewallFiltering::AddressAndPortDependent
             || !matches!(slot.protocol, FirewallProtocol::Udp | FirewallProtocol::Tcp)
+            || !policy.inside.contains(slot.origin_ingress)
+            || !policy.outside.contains(slot.origin_egress)
         {
             return;
         }
@@ -2659,15 +2747,18 @@ impl<'state> FirewallRuntime<'state> {
     /// `filtering` lets `packet` (UDP, or a TCP SYN) open a flow of its own.
     fn endpoint_flow(
         &self,
-        filtering: FirewallFiltering,
+        policy: FirewallPolicy,
         packet: FirewallPacket,
         now_ms: u64,
     ) -> Option<FirewallRuleId> {
+        let filtering = policy.filtering;
         if filtering == FirewallFiltering::AddressAndPortDependent
             || !matches!(
                 packet.protocol,
                 FirewallProtocol::Udp | FirewallProtocol::Tcp
             )
+            || !policy.outside.contains(packet.ingress)
+            || !policy.inside.contains(packet.egress)
         {
             return None;
         }
@@ -3315,19 +3406,22 @@ mod tests {
         assert_eq!(
             format!("{first:?}"),
             "FirewallConfig { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
-             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent }, generation: 1, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent, \
+             inside: {}, outside: {} }, generation: 1, \
              hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
         );
         assert_eq!(
             format!("{owner:?}"),
             "ValidatedFirewallOwner { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
-             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent }, generation: 1, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent, \
+             inside: {}, outside: {} }, generation: 1, \
              hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
         );
         assert_eq!(
             format!("{:?}", first.binding()),
             "FirewallConfigBinding { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
-             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent }, generation: 1, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent, \
+             inside: {}, outside: {} }, generation: 1, \
              hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
         );
         let baseline = first.binding();

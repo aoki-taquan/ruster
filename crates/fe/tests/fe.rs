@@ -2920,9 +2920,9 @@ fn the_firewall_filters_packets_to_an_inside_endpoint_as_configured() {
     let peer = [203, 0, 113, 7];
     let other = [203, 0, 113, 99];
     for (filtering, other_address, other_port) in [
-        (None, true, true),
-        (Some(NatFiltering::AddressDependent), false, true),
-        (Some(NatFiltering::AddressAndPortDependent), false, false),
+        (NatFiltering::EndpointIndependent, true, true),
+        (NatFiltering::AddressDependent, false, true),
+        (NatFiltering::AddressAndPortDependent, false, false),
     ] {
         let mut bench = Bench::new();
         let (mut config, _routes) = configure(&mut bench);
@@ -2937,15 +2937,10 @@ fn the_firewall_filters_packets_to_an_inside_endpoint_as_configured() {
             ),
             Code::CHANGED
         );
-        let mut changes = vec![rule_for(1, Protocol::Udp, Some("lan"), None)];
-        if let Some(filtering) = filtering {
-            changes.push(Change::set(
-                Key::FirewallPolicy {
-                    vrf: "default".into(),
-                },
-                Value::FirewallPolicy { filtering },
-            ));
-        }
+        let changes = vec![
+            rule_for(1, Protocol::Udp, Some("lan"), None),
+            outside_wan(filtering),
+        ];
         assert_eq!(bench.patch(&mut config, &changes), Code::CHANGED);
         let out = udp_packet(host, peer, (5_000, 3_478));
         bench.fe.io_mut().inject(IfId(0), from_lan(&out));
@@ -3013,6 +3008,7 @@ fn a_deny_rule_wins_over_filtering_and_only_a_syn_opens_tcp() {
                 rule_for(1, Protocol::Udp, Some("lan"), None),
                 rule_for(2, Protocol::Tcp, Some("lan"), None),
                 deny,
+                outside_wan(ruster_proto::table::NatFiltering::EndpointIndependent),
             ]
         ),
         Code::CHANGED
@@ -3045,5 +3041,87 @@ fn a_deny_rule_wins_over_filtering_and_only_a_syn_opens_tcp() {
     assert!(
         sent(tcp_packet(other, host, (1, 6_000), 0x10)),
         "then its packets pass"
+    );
+}
+
+/// The firewall's policy: `filtering`, with "wan" outside.
+fn outside_wan(filtering: ruster_proto::table::NatFiltering) -> Change {
+    Change::set(
+        Key::FirewallPolicy {
+            vrf: "default".into(),
+        },
+        Value::FirewallPolicy {
+            filtering,
+            outside: vec!["wan".into()],
+        },
+    )
+}
+
+/// Only a flow from the inside out of the outside makes an inside endpoint: a flow
+/// an outside host opened by a rule does not let inside hosts reach it, and the
+/// router's own flows open none of its ports (RFC 6092's interior and exterior).
+#[test]
+fn filtering_opens_only_inside_endpoints_of_flows_out() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let attacker = [203, 0, 113, 66];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("wan"), Some("lan")),
+                rule_for(2, Protocol::Udp, Some("rt-default"), None),
+                outside_wan(NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    // The attacker's flow in, allowed by the rule.
+    let inbound = udp_packet(attacker, host, (9_999, 53));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&inbound));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_some(), "the rule lets it in");
+    // A LAN host from another port still cannot reach it: LAN to WAN is denied.
+    let out = udp_packet(host, attacker, (6_000, 9_999));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "no way out through it"
+    );
+
+    // The router's own flow out (from its port 123) opens nothing to others.
+    let own = udp_packet([198, 51, 100, 2], INTERNET, (123, 123));
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_some(),
+        "the router's packet left"
+    );
+    let stranger = udp_packet([203, 0, 113, 99], [198, 51, 100, 2], (5_555, 123));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&stranger));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    assert!(
+        kernel.recv(&mut buf).is_err(),
+        "a stranger does not reach it"
     );
 }

@@ -229,6 +229,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-firewall:policy/outside-interface",
+        "sid": 60142,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-access-control-list:acls/acl/aces/ace",
         "sid": 60070,
         "status": "unstable"

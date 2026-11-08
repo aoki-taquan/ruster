@@ -58,8 +58,13 @@ pub(crate) struct Built {
     /// Whether the tables have any firewall rule. Then the firewall is on even if
     /// none of them is in `firewall`, and drops everything.
     pub(crate) firewall_on: bool,
-    /// How the forward firewall filters where no rule decides.
+    /// How the forward firewall filters where no rule decides, and between which
+    /// interfaces (inside, outside).
     pub(crate) firewall_filtering: ruster_core::FirewallFiltering,
+    pub(crate) firewall_interfaces: (
+        ruster_core::FirewallInterfaceSet,
+        ruster_core::FirewallInterfaceSet,
+    ),
     /// The default VRF's NAPT, when the tables have one and both its interfaces
     /// are enabled.
     pub(crate) nat: Option<Nat>,
@@ -536,6 +541,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let mut firewall = Vec::new();
     let mut firewall_on = false;
     let mut firewall_filtering = table::NatFiltering::default();
+    let mut firewall_outside: Vec<String> = Vec::new();
     let mut nat_entry = None;
     for (key, value) in store.iter() {
         match (key, value) {
@@ -619,13 +625,14 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 }
                 nat_entry = Some(nat);
             }
-            (Key::FirewallPolicy { vrf }, Value::FirewallPolicy { filtering }) => {
+            (Key::FirewallPolicy { vrf }, Value::FirewallPolicy { filtering, outside }) => {
                 if vrf != DEFAULT_VRF {
                     return Err(format!(
                         "firewall policy in {vrf}: only the default VRF has a firewall"
                     ));
                 }
                 firewall_filtering = *filtering;
+                firewall_outside.clone_from(outside);
             }
             (Key::FirewallRule { vrf, id }, Value::FirewallRule(rule)) => {
                 if vrf != DEFAULT_VRF {
@@ -722,6 +729,23 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         kernel,
         firewall,
         firewall_on,
+        // Outside: the interfaces the configuration names. Inside: the default VRF's
+        // other interfaces (the router's own kernel interfaces are neither).
+        firewall_interfaces: {
+            let outside: Vec<IfId> = firewall_outside
+                .iter()
+                .filter_map(|name| active.get(name.as_str()).map(|&(id, _)| id))
+                .collect();
+            let inside: Vec<IfId> = active
+                .values()
+                .filter(|&&(id, vrf)| vrf == DEFAULT_VRF && !outside.contains(&id))
+                .map(|&(id, _)| id)
+                .collect();
+            (
+                ruster_core::FirewallInterfaceSet::of(&inside),
+                ruster_core::FirewallInterfaceSet::of(&outside),
+            )
+        },
         firewall_filtering: match firewall_filtering {
             table::NatFiltering::EndpointIndependent => {
                 ruster_core::FirewallFiltering::EndpointIndependent
