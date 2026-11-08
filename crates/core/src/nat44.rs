@@ -28,8 +28,6 @@
 //!   hairpinned.
 //! - No Destination Unreachable code 13 when a mapping cannot be made (RFC 5508
 //!   REQ-8); the packet is dropped.
-//! - An ICMP error that quotes a first fragment, and Time Exceeded code 1, are not
-//!   translated (RFC 5508 REQ-4 and REQ-5); the error is dropped.
 //! - ICMP query filtering is address-dependent whatever the UDP and TCP filtering.
 
 use std::{

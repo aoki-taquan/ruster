@@ -5261,9 +5261,8 @@ fn decide_ipv4<T: TraceSink>(
 ///   only packets without IPv4 options, so no translated packet can carry a
 ///   source route. Code 8 (Source Host Isolated) is obsolete (RFC 1812
 ///   §5.2.7.1: routers SHOULD NOT generate it).
-/// - Time Exceeded (Type 11, REQ-10 a.2): code 0 only. Code 1 (Fragment
-///   Reassembly) needs a fragment, and NAT44 translates only atomic
-///   datagrams (the quote must be DF=1/MF=0/offset=0).
+/// - Time Exceeded (Type 11, REQ-10 a.2): code 0, and code 1 (Fragment
+///   Reassembly) about a first fragment, from the end host only.
 /// - Parameter Problem (Type 12, REQ-10 b.5, MAY): codes 0–2. The pointer is
 ///   an offset into the quoted packet, which translation never moves.
 ///
@@ -5273,7 +5272,7 @@ fn decide_ipv4<T: TraceSink>(
 pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> bool {
     match icmp_type {
         3 => matches!(code, 0..=4 | 6 | 7 | 9..=15),
-        11 => code == 0,
+        11 => code <= 1,
         12 => code <= 2,
         _ => false,
     }
@@ -5281,7 +5280,8 @@ pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> boo
 
 /// Whether only the quoted destination host itself generates this error:
 /// Protocol Unreachable and Port Unreachable (RFC 1812 §5.2.7.1, RFC 792)
-/// report the absence of a transport or port at the destination host,
+/// report the absence of a transport or port at the destination host, and
+/// Time Exceeded code 1 that the host reassembling the datagram gave up,
 /// never a condition on the path.
 ///
 /// As a local policy ("unless explicitly overridden by local policy", RFC
@@ -5290,7 +5290,7 @@ pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> boo
 /// address could sweep public ports and tear down inside UDP flows with a
 /// hard error.
 pub(crate) const fn nat44_icmpv4_error_end_host_only(icmp_type: u8, code: u8) -> bool {
-    icmp_type == 3 && matches!(code, 2 | 3)
+    (icmp_type == 3 && matches!(code, 2 | 3)) || (icmp_type == 11 && code == 1)
 }
 
 /// Type, code, and quoted protocol of an ICMPv4 message, peeked within the
@@ -5903,9 +5903,10 @@ fn parse_nat44_icmpv4_error(
     let protocol = *inner_header
         .get(9)
         .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
-    // The quoted datagram must be whole, as every translated datagram
-    // (NAT44-008, NAT44-116): MF clear and offset 0, DF either way (MTU2).
-    if inner_flags & 0x3fff != 0 {
+    // The quoted datagram must start at offset 0 so that it has its ports: whole,
+    // or the first fragment of one NAT translated (RFC 5508 REQ-4 and REQ-5 with
+    // NAT-FRAG); DF either way (MTU2).
+    if inner_flags & 0x1fff != 0 {
         return Err(Nat44Icmpv4QuotedFragmentUnsupported);
     }
     if !matches!(protocol, 1 | 6 | 17) {
