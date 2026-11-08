@@ -12,7 +12,7 @@
 //!   and pops it on receive, pushes it on send.
 //!
 //! Deviations: S-tags (0x88a8) and stacked tags are not matched; sent frames carry
-//! priority 0; ICMPv4 errors core generates out of a sub-interface are not sent yet.
+//! priority 0.
 
 use crate::{DropReason, IfId, PacketLease, PacketSlot};
 

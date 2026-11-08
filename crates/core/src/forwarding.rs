@@ -2164,6 +2164,28 @@ impl<'a> ForwardingSnapshot<'a> {
             .is_some_and(|binding| binding.address == address)
     }
 
+    /// Whether frames out of `egress` are wrapped (a tunnel, PPPoE session or
+    /// WireGuard interface): it has no neighbors, and its Ethernet header is replaced
+    /// when the frame is wrapped.
+    #[inline]
+    pub(crate) fn wraps_frames(&self, egress: IfId) -> bool {
+        crate::tunnel::of(self.tunnels, egress).is_some()
+            || crate::pppoe::of(self.pppoe, egress).is_some()
+            || crate::wireguard::of(self.wireguard, egress).is_some()
+    }
+
+    /// For a generated IPv4 `frame` (Ethernet) to the tunnel interface `egress`:
+    /// the interface to send it out of and the frame inside the tunnel's IPv6.
+    /// `None` when `egress` is no tunnel's.
+    #[must_use]
+    pub fn tunnel_frame(
+        &self,
+        egress: IfId,
+        frame: &[u8],
+    ) -> Option<Result<(IfId, Vec<u8>), crate::TunnelOriginError>> {
+        crate::tunnel::wrap(self, egress, frame)
+    }
+
     /// For a generated `frame` (Ethernet, IPv4 or IPv6) to the PPPoE session
     /// interface `egress`: the parent to send it out of and the frame in the
     /// session. `None` when `egress` is no session's.
@@ -5045,10 +5067,7 @@ fn decide_ipv4<T: TraceSink>(
     let static_neighbor = snapshot.static_neighbor(route.egress(), target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
-    } else if crate::tunnel::of(snapshot.tunnels, route.egress()).is_some()
-        || crate::pppoe::of(snapshot.pppoe, route.egress()).is_some()
-        || crate::wireguard::of(snapshot.wireguard, route.egress()).is_some()
-    {
+    } else if snapshot.wraps_frames(route.egress()) {
         // A tunnel, PPPoE session or WireGuard interface has no neighbors: the
         // Ethernet header is replaced when the packet is wrapped.
         crate::MacAddress([0; 6])
@@ -5448,6 +5467,8 @@ fn resolve_nat44_icmpv4_next_hop<T: TraceSink>(
     let interface = *snapshot.interface(egress).ok_or(InterfaceMiss)?;
     let destination_mac = if let Some(neighbor) = snapshot.static_neighbor(egress, target) {
         neighbor.mac
+    } else if snapshot.wraps_frames(egress) {
+        crate::MacAddress([0; 6])
     } else {
         return Err(NeighborUnresolved);
     };
@@ -7894,13 +7915,6 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseRouteMiss);
     };
     let reverse_egress = reverse_route.egress();
-    // A VLAN sub-interface is not a port of the generated-frame backend: errors out
-    // of one are not sent (yet).
-    if snapshot.vlans.iter().any(|b| b.sub == reverse_egress) {
-        return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseInterfaceMiss {
-            egress: reverse_egress,
-        });
-    }
     let Some(interface) = snapshot.interface(reverse_egress) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseInterfaceMiss {
             egress: reverse_egress,
@@ -7922,6 +7936,10 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     let static_neighbor = snapshot.static_neighbor(reverse_egress, target);
     let destination_mac = if let Some(neighbor) = static_neighbor {
         neighbor.mac
+    } else if snapshot.wraps_frames(reverse_egress) {
+        // Wrapped when it is sent: the FE puts generated frames in the tunnel or
+        // session.
+        crate::MacAddress([0; 6])
     } else {
         return runtime.record_suppression(
             Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {

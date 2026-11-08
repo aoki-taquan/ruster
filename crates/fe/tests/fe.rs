@@ -2431,3 +2431,204 @@ fn the_firewall_passes_icmp_errors_about_a_forwarded_flow() {
         );
     }
 }
+
+/// The router's own packets for a PPPoE session (an ICMP error back to the
+/// internet, the fragments of a datagram too big for the session) go in the
+/// session, as forwarded ones do (RFC 1812 4.2.2.7 and 5.3.1, RFC 2516).
+#[test]
+fn errors_and_fragments_the_router_makes_go_in_the_pppoe_session() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let ppp = Change::set(
+        Key::Interface { name: "ppp".into() },
+        Value::Interface {
+            enabled: true,
+            mac: [2, 0, 0, 0, 0, 8],
+            mtu: 1492,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: Some(ruster_proto::table::Pppoe {
+                parent: "wan".into(),
+                session: 0x1234,
+                peer: GATEWAY_MAC,
+            }),
+        },
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[ppp, address("ppp", [100, 64, 0, 1], 32)]),
+        Code::CHANGED
+    );
+    let to_ppp = route(INTERNET, 32, "ppp", None);
+    assert_eq!(bench.patch(&mut routes, &[to_ppp]), Code::CHANGED);
+    let in_session = |frame: &[u8]| {
+        assert_eq!(&frame[12..14], &[0x88, 0x64], "a PPPoE session frame");
+        assert_eq!(u16::from_be_bytes([frame[16], frame[17]]), 0x1234);
+        assert_eq!(&frame[20..22], &[0x00, 0x21], "IPv4");
+        frame[22..].to_vec()
+    };
+
+    // A datagram from the internet whose TTL runs out: Time Exceeded goes back.
+    let mut expiring = udp_packet(INTERNET, [192, 0, 2, 10], (53, 5_000));
+    expiring[8] = 1;
+    let expiring = ipv4_checksummed(expiring);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&WAN_MAC);
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&[0x88, 0x64, 0x11, 0x00, 0x12, 0x34]);
+    frame.extend_from_slice(&((expiring.len() + 2) as u16).to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x21]);
+    frame.extend_from_slice(&expiring);
+    bench.fe.io_mut().inject(IfId(1), frame);
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("Time Exceeded sent");
+    assert_eq!(tx.egress, IfId(1));
+    let error = in_session(&tx.bytes);
+    assert_eq!(
+        &error[12..16],
+        &[100, 64, 0, 1],
+        "from the session's address"
+    );
+    assert_eq!(&error[16..20], &INTERNET);
+    assert_eq!((error[20], error[21]), (11, 0));
+
+    // A 1500-byte datagram with DF clear from the LAN: fragments in the session.
+    let mut big = udp_packet([192, 0, 2, 10], INTERNET, (5_000, 53));
+    big.resize(1500, 0);
+    big[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+    big[24..26].copy_from_slice(&1480_u16.to_be_bytes());
+    let big = ipv4_checksummed(big);
+    bench.fe.io_mut().inject(IfId(0), from_lan(&big));
+    bench.fe.step(bench.now);
+    let mut carried = 0;
+    while let Some(tx) = bench.fe.io_mut().pop_tx() {
+        assert_eq!(tx.egress, IfId(1));
+        let fragment = in_session(&tx.bytes);
+        assert!(fragment.len() <= 1492);
+        carried += fragment.len() - 20;
+    }
+    assert_eq!(carried, 1480, "every byte of the datagram");
+}
+
+/// The fragments of a datagram too big for a tunnel go into the tunnel, each in
+/// its own IPv6 packet, as forwarded packets do (RFC 1812 4.2.2.7, RFC 2473).
+#[test]
+fn fragments_the_router_makes_go_into_the_tunnel() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let gateway = Change::set(
+        Key::Neighbor {
+            interface: "wan".into(),
+            address: ip6("fe80::1"),
+        },
+        Value::Neighbor { mac: GATEWAY_MAC },
+    );
+    assert_eq!(bench.patch(&mut neighbors, &[gateway]), Code::CHANGED);
+    let tunnel = Change::set(
+        Key::Interface {
+            name: "dslite".into(),
+        },
+        Value::Interface {
+            enabled: true,
+            mac: [2, 0, 0, 0, 0, 9],
+            mtu: 1460,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
+            tunnel: Some(ruster_proto::table::Tunnel {
+                local: "2001:db8:1::1".parse().unwrap(),
+                remote: "2001:db8:ff::1".parse().unwrap(),
+            }),
+            pppoe: None,
+        },
+    );
+    assert_eq!(bench.patch(&mut config, &[tunnel]), Code::CHANGED);
+    assert_eq!(
+        bench.patch(&mut routes, &[route(INTERNET, 32, "dslite", None)]),
+        Code::CHANGED
+    );
+
+    let mut big = udp_packet([192, 0, 2, 10], INTERNET, (5_000, 53));
+    big.resize(1500, 0);
+    big[2..4].copy_from_slice(&1500_u16.to_be_bytes());
+    big[24..26].copy_from_slice(&1480_u16.to_be_bytes());
+    let big = ipv4_checksummed(big);
+    bench.fe.io_mut().inject(IfId(0), from_lan(&big));
+    bench.fe.step(bench.now);
+    let mut carried = 0;
+    let mut fragments = 0;
+    while let Some(tx) = bench.fe.io_mut().pop_tx() {
+        assert_eq!(tx.egress, IfId(1));
+        assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+        assert_eq!(&tx.bytes[12..14], &[0x86, 0xdd]);
+        assert_eq!(tx.bytes[14 + 6], 4, "IPv4 in IPv6");
+        let inner = &tx.bytes[14 + 40..];
+        let payload = u16::from_be_bytes([tx.bytes[18], tx.bytes[19]]);
+        assert_eq!(usize::from(payload), inner.len());
+        assert!(inner.len() <= 1460);
+        carried += inner.len() - 20;
+        fragments += 1;
+    }
+    assert_eq!((fragments, carried), (2, 1480));
+}
+
+/// An ICMP error back to a host behind a VLAN sub-interface leaves its parent
+/// tagged, as forwarded frames do.
+#[test]
+fn an_icmp_error_to_a_vlan_host_leaves_tagged() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let sub = Change::set(
+        Key::Interface {
+            name: "lan.10".into(),
+        },
+        Value::Interface {
+            enabled: true,
+            mac: LAN_MAC,
+            mtu: 1496,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: Some(ruster_proto::table::Vlan {
+                parent: "lan".into(),
+                id: 10,
+            }),
+            tunnel: None,
+            pppoe: None,
+        },
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[sub, address("lan.10", [10, 10, 0, 1], 24)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut routes, &[route([10, 10, 0, 0], 24, "lan.10", None)]),
+        Code::CHANGED
+    );
+    let host = [10, 10, 0, 5];
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("lan.10", host, HOST_MAC)]),
+        Code::CHANGED
+    );
+
+    let mut expiring = udp_packet(host, INTERNET, (5_000, 53));
+    expiring[8] = 1;
+    let expiring = ipv4_checksummed(expiring);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&LAN_MAC);
+    frame.extend_from_slice(&HOST_MAC);
+    frame.extend_from_slice(&[0x81, 0x00, 0x00, 10, 0x08, 0x00]);
+    frame.extend_from_slice(&expiring);
+    bench.fe.io_mut().inject(IfId(0), frame);
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("Time Exceeded sent");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!(
+        &tx.bytes[12..16],
+        &[0x81, 0x00, 0x00, 10],
+        "tagged for VLAN 10"
+    );
+    assert_eq!(&tx.bytes[16..18], &[0x08, 0x00]);
+    assert_eq!((tx.bytes[18 + 20], tx.bytes[18 + 21]), (11, 0));
+    assert_eq!(&tx.bytes[18 + 16..18 + 20], &host);
+}
