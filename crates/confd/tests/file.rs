@@ -623,8 +623,18 @@ fn nat_takes_the_outside_address_and_a_port_range() {
                 first: 1_024,
                 last: 32_767,
             },
+            filtering: ruster_proto::table::NatFiltering::EndpointIndependent,
         })
     );
+    assert_eq!(
+        parse(&nat("filtering = \"address-dependent\"\n"))
+            .unwrap()
+            .nat
+            .unwrap()
+            .filtering,
+        ruster_proto::table::NatFiltering::AddressDependent
+    );
+    assert!(error(&nat("filtering = \"strict\"\n")).contains("filtering must be"));
     let got = parse(&nat(
         "ports = \"40000-40999\"\nexternal = \"198.51.100.2\"\n",
     ))

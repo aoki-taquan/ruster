@@ -13,7 +13,8 @@
 //!
 //! - RFC 4787 (UDP), RFC 5382 (TCP) and RFC 5508 (ICMP queries and errors), as
 //!   core's NAT44 implements them, with its default policies (endpoint-independent
-//!   mapping, address-dependent filtering, hairpinning).
+//!   mapping, the filtering the configuration names, endpoint-independent by
+//!   default, and hairpinning).
 //!
 //! Deviations:
 //!
@@ -64,6 +65,7 @@ impl Publication {
             outside,
             public,
             ports,
+            filtering,
         } = nat;
         Ok(Self {
             udp: Nat44UdpConfig::with_port_set(
@@ -72,7 +74,7 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44UdpPolicy::default(),
+                Nat44UdpPolicy::default().with_filtering(filtering),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             tcp: Nat44TcpConfig::with_port_set(
@@ -81,7 +83,7 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44TcpPolicy::default(),
+                Nat44TcpPolicy::default().with_filtering(filtering),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             icmp: Nat44IcmpConfig::with_port_set(

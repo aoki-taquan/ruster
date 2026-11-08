@@ -606,6 +606,7 @@ fn nat_and_firewall_entries_round_trip_and_are_checked() {
                 outside: "wan".into(),
                 external: None,
                 ports: ruster_proto::table::NatPorts::Range { first, last },
+                filtering: ruster_proto::table::NatFiltering::AddressDependent,
             }),
         )
     };
@@ -706,6 +707,7 @@ fn a_nat_with_a_psid_port_set_round_trips_and_is_checked() {
                 outside: "map".into(),
                 external: None,
                 ports,
+                filtering: Default::default(),
             }),
         )
     };

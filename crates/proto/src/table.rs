@@ -159,6 +159,43 @@ pub struct Nat {
     pub outside: String,
     pub external: Option<std::net::Ipv4Addr>,
     pub ports: NatPorts,
+    pub filtering: NatFiltering,
+}
+
+/// Which outside endpoints may reach a mapping (RFC 4787 section 5, `ietf-nat`
+/// `filtering-type`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NatFiltering {
+    /// Any (RFC 4787 REQ-8 and RFC 6092 REC-17 and REC-33 recommend it by default).
+    #[default]
+    EndpointIndependent,
+    /// Only addresses the mapping has sent to.
+    AddressDependent,
+    /// Only the address and port the mapping has sent to.
+    AddressAndPortDependent,
+}
+
+impl NatFiltering {
+    /// The `ietf-nat` identity's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::EndpointIndependent => "endpoint-independent-filtering",
+            Self::AddressDependent => "address-dependent-filtering",
+            Self::AddressAndPortDependent => "address-and-port-dependent-filtering",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::EndpointIndependent,
+            Self::AddressDependent,
+            Self::AddressAndPortDependent,
+        ]
+        .into_iter()
+        .find(|f| f.name() == name)
+    }
 }
 
 /// The public ports of a NAT (`ietf-nat` `port-set-restrict`).
@@ -785,7 +822,9 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 NatPorts::Range { .. } => 2,
                 NatPorts::Psid { .. } => 3,
             };
-            e.map(2 + ports + u64::from(nat.external.is_some()))
+            e.map(3 + ports + u64::from(nat.external.is_some()))
+                .u64(d(sid::NAT_FILTERING))
+                .text(nat.filtering.name())
                 .u64(d(sid::NAT_INSIDE))
                 .text(&nat.inside)
                 .u64(d(sid::NAT_OUTSIDE))
@@ -1322,6 +1361,13 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             ),
             None => None,
         };
+        // Left out: endpoint-independent, the default.
+        let filtering = match text(sid::NAT_FILTERING, "filtering-type")? {
+            Some(name) => {
+                NatFiltering::from_name(&name).ok_or(ModelError::Invalid("filtering-type"))?
+            }
+            None => NatFiltering::default(),
+        };
         let range = (
             port(&mut got, sid::NAT_FIRST_PORT)?,
             port(&mut got, sid::NAT_LAST_PORT)?,
@@ -1345,6 +1391,7 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             outside,
             external,
             ports,
+            filtering,
         })
     } else {
         let ingress = text(sid::FIREWALL_INGRESS, "ingress")?;

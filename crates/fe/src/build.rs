@@ -70,6 +70,7 @@ pub(crate) struct Nat {
     pub(crate) outside: IfId,
     pub(crate) public: Ipv4Address,
     pub(crate) ports: PortSet,
+    pub(crate) filtering: ruster_core::Nat44Filtering,
 }
 
 /// One forwarding route before it becomes core's.
@@ -753,6 +754,15 @@ fn nat(
             } => PortSet::psid(offset, length, psid),
         }
         .map_err(|e| format!("nat ports: {e:?}"))?,
+        filtering: match entry.filtering {
+            table::NatFiltering::EndpointIndependent => {
+                ruster_core::Nat44Filtering::EndpointIndependent
+            }
+            table::NatFiltering::AddressDependent => ruster_core::Nat44Filtering::AddressDependent,
+            table::NatFiltering::AddressAndPortDependent => {
+                ruster_core::Nat44Filtering::AddressAndPortDependent
+            }
+        },
     }))
 }
 
