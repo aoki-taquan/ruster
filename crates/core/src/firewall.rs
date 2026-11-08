@@ -652,7 +652,7 @@ pub enum FirewallConfigError {
 /// [`FirewallPolicy::new`].
 ///
 /// Rules are checked in slice order. Within each rule, the stable error
-/// precedence is zero ID, duplicate ID, missing ingress, then missing egress.
+/// precedence is zero ID, duplicate ID, mixed families, missing ingress, then missing egress.
 pub fn validate_firewall_rules(
     snapshot: &ForwardingSnapshot<'_>,
     rules: &[FirewallRule],
@@ -902,6 +902,7 @@ fn rules_fingerprint(rules: &[FirewallRule]) -> u64 {
             }
             hash = mix(hash, u64::from(prefix.prefix_len()));
         }
+        hash = mix(hash, u64::from(rule.protocol.ipv4_protocol()));
         hash = mix(hash, u64::from(rule.source_ports.first));
         hash = mix(hash, u64::from(rule.source_ports.last));
         hash = mix(hash, u64::from(rule.destination_ports.first));
@@ -2188,7 +2189,10 @@ impl<'state> FirewallRuntime<'state> {
         if packet.protocol == FirewallProtocol::Tcp && packet.tcp_flags & 0x17 != 0x02 {
             return Err(FirewallPlanError::InvalidInitialTcp(rule_id));
         }
-        if packet.protocol == FirewallProtocol::Icmp && packet.tcp_flags & FIREWALL_ICMP_REPLY != 0
+        if matches!(
+            packet.protocol,
+            FirewallProtocol::Icmp | FirewallProtocol::Icmpv6
+        ) && packet.tcp_flags & FIREWALL_ICMP_REPLY != 0
         {
             return Err(FirewallPlanError::InvalidInitialIcmp(rule_id));
         }
@@ -2804,6 +2808,38 @@ mod tests {
         assert!(FirewallIpv6Prefix::new(inside, 128)
             .unwrap()
             .matches(FirewallAddress::V6(inside)));
+    }
+
+    #[test]
+    fn the_rules_fingerprint_keeps_its_ipv4_values_and_tells_protocols_and_families_apart() {
+        // The values before IPv6 rules: an IPv4 table's fingerprint does not change.
+        let udp = rule(1, FirewallAction::Deny, FirewallProtocol::Udp);
+        let tcp = rule(1, FirewallAction::Deny, FirewallProtocol::Tcp);
+        assert_eq!(rules_fingerprint(&[udp]), 625_161_217_356_610_800);
+        assert_eq!(rules_fingerprint(&[tcp]), 12_822_555_912_594_577_053);
+        let v6: FirewallPrefix = FirewallIpv6Prefix::new([0; 16], 0).unwrap().into();
+        let udp6 = FirewallRule::new(
+            udp.id,
+            udp.ingress,
+            udp.egress,
+            v6,
+            v6,
+            FirewallProtocol::Udp,
+            udp.source_ports,
+            udp.destination_ports,
+            udp.action,
+        );
+        let icmp6 = FirewallRule {
+            protocol: FirewallProtocol::Icmpv6,
+            ..udp6
+        };
+        let fingerprints = [
+            rules_fingerprint(&[udp]),
+            rules_fingerprint(&[udp6]),
+            rules_fingerprint(&[icmp6]),
+        ];
+        assert_ne!(fingerprints[0], fingerprints[1], "the family counts");
+        assert_ne!(fingerprints[1], fingerprints[2], "the protocol counts");
     }
 
     #[test]
