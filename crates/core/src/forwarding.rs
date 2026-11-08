@@ -5280,7 +5280,8 @@ pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> boo
 
 /// Whether only the quoted destination host itself generates this error:
 /// Protocol Unreachable and Port Unreachable (RFC 1812 §5.2.7.1, RFC 792)
-/// report the absence of a transport or port at the destination host,
+/// report the absence of a transport or port at the destination host, and
+/// Time Exceeded code 1 that the host reassembling the datagram gave up,
 /// never a condition on the path.
 ///
 /// As a local policy ("unless explicitly overridden by local policy", RFC

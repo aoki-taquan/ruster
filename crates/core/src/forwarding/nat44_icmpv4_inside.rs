@@ -224,8 +224,8 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     };
 
     // Source authority: the quoted internal destination itself, or the
-    // router's inside next hop toward it. Protocol and Port Unreachable come
-    // only from the host itself.
+    // router's inside next hop toward it. Protocol and Port Unreachable, and
+    // reassembly Time Exceeded, come only from the host itself.
     let internal = quote.destination_address;
     let on_path = outer.source == internal
         || (!nat44_icmpv4_error_end_host_only(quote.icmp_type, quote.icmp_code)
