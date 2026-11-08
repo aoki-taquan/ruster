@@ -25,6 +25,7 @@
 //! - RFC 4861 section 7.2.3: a Neighbor Solicitation's Source Link-Layer Address is
 //!   recorded, and one for our address is answered with a solicited Advertisement
 //!   (to all nodes, unsolicited, when the asker is doing duplicate address detection).
+//!   A solicitation for another node's address is discarded, not learned from.
 //!   Section 7.2.5: an Advertisement updates a neighbor neighd is resolving or knows.
 //!   Section 7.2.2: three solicitations one second apart (MAX_MULTICAST_SOLICIT,
 //!   RETRANS_TIMER) to the target's solicited-node group. Message checks in `nd.rs`.
@@ -75,7 +76,8 @@ pub struct NeighdCounters {
     pub given_up: u64,
     pub bad_punts: u64,
     pub not_learned: u64,
-    /// Router Solicitations and Advertisements and Redirects, which are not neighd's.
+    /// Router Solicitations and Advertisements and Redirects, which are not neighd's,
+    /// and Neighbor Solicitations for other nodes' addresses.
     pub not_for_neighd: u64,
 }
 
@@ -532,6 +534,12 @@ impl Neighd {
                     self.counters.not_learned += 1;
                     return;
                 }
+                // One for another node's address is not ours to learn from or answer
+                // (RFC 4861 7.2.3: silently discarded).
+                if !self.is_local(interface, target) {
+                    self.counters.not_for_neighd += 1;
+                    return;
+                }
                 if let Some(link_layer) = source_link_layer {
                     if !message.source.is_unspecified()
                         && self.on_link_v6(interface, message.source)
@@ -543,9 +551,6 @@ impl Neighd {
                             self.counters.not_learned += 1;
                         }
                     }
-                }
-                if !self.is_local(interface, target) {
-                    return;
                 }
                 let to = if message.source.is_unspecified() {
                     None
