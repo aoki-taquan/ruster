@@ -64,6 +64,10 @@ pub enum Key {
     Nat {
         vrf: String,
     },
+    /// How the forward firewall of a VRF filters (one per VRF).
+    FirewallPolicy {
+        vrf: String,
+    },
     /// One forward firewall rule of a VRF; lower ids are matched first.
     FirewallRule {
         vrf: String,
@@ -110,6 +114,11 @@ pub enum Value {
         mac: [u8; 6],
     },
     Nat(Nat),
+    /// Which outside endpoints may reach an inside endpoint with a flow out, where
+    /// no rule decides. Left out of the message when it is the default.
+    FirewallPolicy {
+        filtering: NatFiltering,
+    },
     FirewallRule(FirewallRule),
     Wireguard(Wireguard),
     WireguardPeer(WireguardPeer),
@@ -308,6 +317,7 @@ impl Key {
             Self::Route { .. } => sid::ROUTE,
             Self::Neighbor { .. } => sid::NEIGHBOR,
             Self::Nat { .. } => sid::NAT,
+            Self::FirewallPolicy { .. } => sid::FIREWALL_POLICY,
             Self::FirewallRule { .. } => sid::FIREWALL_RULE,
             Self::Wireguard { .. } => sid::WIREGUARD,
             Self::WireguardPeer { .. } => sid::WIREGUARD_PEER,
@@ -376,7 +386,9 @@ impl Change {
         };
         match &self.key {
             Key::Interface { name: n } => name(n)?,
-            Key::Nat { vrf } | Key::FirewallRule { vrf, .. } => name(vrf)?,
+            Key::Nat { vrf } | Key::FirewallPolicy { vrf } | Key::FirewallRule { vrf, .. } => {
+                name(vrf)?
+            }
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
             Key::Wireguard { interface } => name(interface)?,
             Key::WireguardPeer { interface, peer } | Key::WireguardSession { interface, peer } => {
@@ -398,6 +410,7 @@ impl Change {
                         | (Key::Route { .. }, Value::Route(_))
                         | (Key::Neighbor { .. }, Value::Neighbor { .. })
                         | (Key::Nat { .. }, Value::Nat(_))
+                        | (Key::FirewallPolicy { .. }, Value::FirewallPolicy { .. })
                         | (Key::FirewallRule { .. }, Value::FirewallRule(_))
                         | (Key::Wireguard { .. }, Value::Wireguard(_))
                         | (Key::WireguardPeer { .. }, Value::WireguardPeer(_))
@@ -611,6 +624,9 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::Nat { vrf } => {
             e.array(2).u64(sid::NAT).text(vrf);
         }
+        Key::FirewallPolicy { vrf } => {
+            e.array(2).u64(sid::FIREWALL_POLICY).text(vrf);
+        }
         Key::Wireguard { interface } => {
             e.array(2).u64(sid::WIREGUARD).text(interface);
         }
@@ -639,7 +655,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     let len = d.array()?;
     let table = d.u64()?;
     let expected = match table {
-        sid::INTERFACE | sid::NAT | sid::WIREGUARD => 2,
+        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::WIREGUARD => 2,
         sid::ADDRESS
         | sid::ROUTE
         | sid::NEIGHBOR
@@ -658,6 +674,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     Ok(match table {
         sid::INTERFACE => Key::Interface { name: first },
         sid::NAT => Key::Nat { vrf: first },
+        sid::FIREWALL_POLICY => Key::FirewallPolicy { vrf: first },
         sid::WIREGUARD => Key::Wireguard { interface: first },
         sid::WIREGUARD_PEER | sid::WIREGUARD_SESSION => {
             let peer = d.text()?.to_owned();
@@ -816,6 +833,15 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::WIREGUARD_SESSION_LOCAL_INDEX - sid::WIREGUARD_SESSION)
                 .u64(u64::from(session.local_index));
         }
+        Value::FirewallPolicy { filtering } => {
+            if *filtering == NatFiltering::default() {
+                e.map(0);
+            } else {
+                e.map(1)
+                    .u64(sid::FIREWALL_POLICY_FILTERING - sid::FIREWALL_POLICY)
+                    .text(filtering.name());
+            }
+        }
         Value::Nat(nat) => {
             let d = |member: u64| member - sid::NAT;
             let ports = match nat.ports {
@@ -897,6 +923,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     if matches!(
         table,
         sid::NAT
+            | sid::FIREWALL_POLICY
             | sid::FIREWALL_RULE
             | sid::WIREGUARD
             | sid::WIREGUARD_PEER
@@ -1353,6 +1380,14 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             peer_index,
             local_index,
         })
+    } else if table == sid::FIREWALL_POLICY {
+        let filtering = match text(sid::FIREWALL_POLICY_FILTERING, "filtering-type")? {
+            Some(name) => {
+                NatFiltering::from_name(&name).ok_or(ModelError::Invalid("filtering-type"))?
+            }
+            None => NatFiltering::default(),
+        };
+        Value::FirewallPolicy { filtering }
     } else if table == sid::NAT {
         let inside = text(sid::NAT_INSIDE, "inside")?.ok_or(ModelError::Missing("inside"))?;
         let outside = text(sid::NAT_OUTSIDE, "outside")?.ok_or(ModelError::Missing("outside"))?;

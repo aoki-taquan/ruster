@@ -103,6 +103,8 @@ pub struct Config {
     pub static_routes: Vec<StaticRoute>,
     /// The default VRF's forward firewall rules, in order.
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
+    /// How the default VRF's forward firewall filters where no rule decides.
+    pub firewall_filtering: ruster_proto::table::NatFiltering,
     /// The default VRF's NAPT.
     pub nat: Option<ruster_proto::table::Nat>,
 }
@@ -360,6 +362,16 @@ impl Confd {
     /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
+        if !self.config.firewall.is_empty() {
+            out.insert(
+                Key::FirewallPolicy {
+                    vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
+                },
+                Value::FirewallPolicy {
+                    filtering: self.config.firewall_filtering,
+                },
+            );
+        }
         for (id, rule) in (1..).zip(&self.config.firewall) {
             out.insert(
                 Key::FirewallRule {

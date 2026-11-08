@@ -1,3 +1,21 @@
+//! The stateful forward firewall: its rules, the flows it keeps, and how it lets
+//! outside endpoints reach an inside one. IPv6's packets are read by
+//! [`crate::firewall6`] and go through the same rules and flows.
+//!
+//! # Standards
+//!
+//! - RFC 6092 REC-11, REC-17 and REC-33, and RFC 4787 section 5: where no rule
+//!   decides, a UDP packet or a TCP SYN to an inside endpoint (an address and port
+//!   with a flow out that a rule opened) opens a flow of its own as
+//!   [`FirewallFiltering`] says: endpoint-independent (the FE's default, as REC-17
+//!   and REC-33 recommend for unmanaged gateways), address-dependent, or
+//!   address-and-port-dependent (core's default). A rule, allow or deny, decides
+//!   first.
+//!
+//! Deviations: the inside endpoints are noted in a fixed table by hash; of two
+//! that land on the same entry only the newer is kept, so the other filters
+//! address-and-port-dependent until it sends again.
+
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::{
@@ -458,6 +476,22 @@ pub struct FirewallPolicy {
     udp_idle_ttl_ms: u64,
     tcp_opening_idle_ttl_ms: u64,
     tcp_active_idle_ttl_ms: u64,
+    filtering: FirewallFiltering,
+}
+
+/// Which outside endpoints may reach an inside endpoint that has a flow out, for
+/// UDP and TCP, where no rule decides (RFC 6092 REC-11, REC-17 and REC-33; RFC 4787
+/// section 5). An explicit rule, allow or deny, always decides first.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FirewallFiltering {
+    /// Any: a packet to the endpoint opens a flow of its own.
+    EndpointIndependent,
+    /// Only addresses the endpoint has a flow with.
+    AddressDependent,
+    /// Only the exact flow's address and port (no packet opens a flow but by a
+    /// rule).
+    #[default]
+    AddressAndPortDependent,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -499,7 +533,20 @@ impl FirewallPolicy {
             udp_idle_ttl_ms,
             tcp_opening_idle_ttl_ms,
             tcp_active_idle_ttl_ms,
+            filtering: FirewallFiltering::AddressAndPortDependent,
         })
+    }
+
+    /// The same timers with `filtering`.
+    #[must_use]
+    pub const fn with_filtering(mut self, filtering: FirewallFiltering) -> Self {
+        self.filtering = filtering;
+        self
+    }
+
+    #[must_use]
+    pub const fn filtering(self) -> FirewallFiltering {
+        self.filtering
     }
 
     #[must_use]
@@ -524,6 +571,7 @@ impl Default for FirewallPolicy {
             udp_idle_ttl_ms: FIREWALL_UDP_DEFAULT_IDLE_TTL_MS,
             tcp_opening_idle_ttl_ms: FIREWALL_TCP_OPENING_DEFAULT_IDLE_TTL_MS,
             tcp_active_idle_ttl_ms: FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS,
+            filtering: FirewallFiltering::AddressAndPortDependent,
         }
     }
 }
@@ -941,6 +989,19 @@ pub struct FirewallStateSlot {
     tcp_forward_ack: bool,
     tcp_reverse_ack: bool,
     origin_rule_id: FirewallRuleId,
+    /// Opened by [`FirewallFiltering`] (a packet to an inside endpoint with a flow
+    /// out), not by a rule: its origin is the outside, so it notes no endpoint.
+    by_filtering: bool,
+}
+
+/// Where the flow that keeps an inside endpoint open is, for [`FirewallFiltering`]:
+/// a state slot and its generation. The state itself is checked on each use, so
+/// a stale or overwritten entry only leaves the filtering stricter.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FirewallEndpointSlot {
+    occupied: bool,
+    state_index: usize,
+    slot_generation: u64,
 }
 
 impl Default for FirewallStateSlot {
@@ -961,6 +1022,7 @@ impl Default for FirewallStateSlot {
             tcp_forward_ack: false,
             tcp_reverse_ack: false,
             origin_rule_id: FirewallRuleId(0),
+            by_filtering: false,
         }
     }
 }
@@ -1340,6 +1402,9 @@ pub(crate) struct FirewallPlan {
     created: bool,
     replaced_expired: bool,
     disposition: FirewallDisposition,
+    /// The packet came from the flow's inside endpoint (the origin of a flow a
+    /// rule opened): commit notes it for [`FirewallFiltering`].
+    notes_endpoint: bool,
 }
 
 impl FirewallPlan {
@@ -1737,6 +1802,8 @@ pub struct FirewallRuntime<'state> {
     table_key: FirewallHashKey,
     table_generation: u64,
     states: &'state mut [FirewallStateSlot],
+    /// Inside endpoints with a flow out ([`FirewallFiltering`]); none when empty.
+    endpoints: &'state mut [FirewallEndpointSlot],
     watermark_ms: Option<u64>,
     runtime_epoch: u64,
     next_slot_generation: u64,
@@ -1772,6 +1839,7 @@ impl<'state> FirewallRuntime<'state> {
             table_key: config.hash_key,
             table_generation: config.generation,
             states,
+            endpoints: &mut [],
             watermark_ms: None,
             runtime_epoch: 1,
             next_slot_generation: 1,
@@ -1781,6 +1849,16 @@ impl<'state> FirewallRuntime<'state> {
             counters: FirewallCounters::default(),
             _worker_local: PhantomData,
         }
+    }
+
+    /// Gives the runtime `endpoints` to note inside endpoints in, so that a
+    /// filtering other than address-and-port-dependent can let packets to them in
+    /// ([`FirewallFiltering`]). Without them it filters address-and-port-dependent.
+    #[must_use]
+    pub fn with_endpoints(mut self, endpoints: &'state mut [FirewallEndpointSlot]) -> Self {
+        endpoints.fill(FirewallEndpointSlot::default());
+        self.endpoints = endpoints;
+        self
     }
 
     /// Returns whether `config` is the exact publication currently bound.
@@ -2062,10 +2140,14 @@ impl<'state> FirewallRuntime<'state> {
                 let position = rules.iter().position(|rule| rule.matches(packet));
                 evaluations =
                     evaluations.saturating_add(position.map_or(rules.len(), |at| at + 1) as u64);
-                position
-                    .map(|at| rules[at])
-                    .filter(|rule| rule.action == FirewallAction::AllowStateful)
-                    .map(|rule| rule.id)
+                match position.map(|at| rules[at]) {
+                    Some(rule) if rule.action == FirewallAction::AllowStateful => Some(rule.id),
+                    Some(_) => None,
+                    // A flow the filtering opened matches no rule; it stays unless
+                    // a rule now denies it.
+                    None if slot.by_filtering => Some(slot.origin_rule_id),
+                    None => None,
+                }
             } else {
                 Some(slot.origin_rule_id)
             };
@@ -2175,6 +2257,7 @@ impl<'state> FirewallRuntime<'state> {
                 replacement,
                 created: false,
                 replaced_expired: false,
+                notes_endpoint: !reverse && !current.by_filtering,
                 disposition: FirewallDisposition {
                     verdict: FirewallVerdict::Allow,
                     class: FirewallConnectionClass::Established,
@@ -2193,14 +2276,22 @@ impl<'state> FirewallRuntime<'state> {
                 break;
             }
         }
-        match matched {
+        let mut by_filtering = false;
+        let rule_id = match matched {
             Some(rule) if rule.action == FirewallAction::Deny => {
                 return Err(FirewallPlanError::RuleDenied(rule.id));
             }
-            None => return Err(FirewallPlanError::DefaultDenied),
-            Some(_) => {}
-        }
-        let rule_id = matched.expect("allow branch requires a matching rule").id;
+            Some(rule) => rule.id,
+            // No rule decides: a packet to an inside endpoint with a flow out may
+            // open a flow of its own, as the filtering lets it.
+            None => match self.endpoint_flow(config.policy.filtering, packet, now_ms) {
+                Some(rule_id) => {
+                    by_filtering = true;
+                    rule_id
+                }
+                None => return Err(FirewallPlanError::DefaultDenied),
+            },
+        };
         if packet.protocol == FirewallProtocol::Tcp && packet.tcp_flags & 0x17 != 0x02 {
             return Err(FirewallPlanError::InvalidInitialTcp(rule_id));
         }
@@ -2253,9 +2344,11 @@ impl<'state> FirewallRuntime<'state> {
                 tcp_forward_ack: false,
                 tcp_reverse_ack: false,
                 origin_rule_id: rule_id,
+                by_filtering,
             },
             created: true,
             replaced_expired: current.occupied,
+            notes_endpoint: !by_filtering,
             disposition: FirewallDisposition {
                 verdict: FirewallVerdict::Allow,
                 class: FirewallConnectionClass::New,
@@ -2488,6 +2581,9 @@ impl<'state> FirewallRuntime<'state> {
             return Err(FirewallCommitError::UsableCapacityExceeded);
         }
         self.states[plan.index] = plan.replacement;
+        if plan.notes_endpoint {
+            self.note_endpoint(plan.index, plan.replacement);
+        }
         self.reclaim_not_before_ms = self
             .reclaim_not_before_ms
             .min(self.slot_deadline(plan.replacement));
@@ -2504,6 +2600,102 @@ impl<'state> FirewallRuntime<'state> {
             self.counters.allowed_established = self.counters.allowed_established.saturating_add(1);
         }
         Ok(())
+    }
+
+    /// Where the endpoint table keeps `endpoint` (its inside address and port, the
+    /// interfaces its flow goes between, the protocol, and for address-dependent
+    /// filtering the outside address).
+    fn endpoint_at(&self, endpoint: FirewallPacket, filtering: FirewallFiltering) -> Option<usize> {
+        if self.endpoints.is_empty() {
+            return None;
+        }
+        let mut key = endpoint;
+        key.destination_port = 0;
+        key.tcp_flags = 0;
+        if filtering == FirewallFiltering::EndpointIndependent {
+            key.destination = key.source;
+        }
+        // Keyed apart from the state table's own probes.
+        let hash = flow_hash(
+            key,
+            self.table_generation ^ 0x656e_6470_6f69_6e74,
+            self.table_key,
+        );
+        Some(hash as usize % self.endpoints.len())
+    }
+
+    /// Notes the inside endpoint of the flow at `index` (its origin).
+    fn note_endpoint(&mut self, index: usize, slot: FirewallStateSlot) {
+        let filtering = self.binding.policy.filtering;
+        if filtering == FirewallFiltering::AddressAndPortDependent
+            || !matches!(slot.protocol, FirewallProtocol::Udp | FirewallProtocol::Tcp)
+        {
+            return;
+        }
+        let endpoint = Self::origin_of(slot);
+        if let Some(at) = self.endpoint_at(endpoint, filtering) {
+            self.endpoints[at] = FirewallEndpointSlot {
+                occupied: true,
+                state_index: index,
+                slot_generation: slot.slot_generation,
+            };
+        }
+    }
+
+    fn origin_of(slot: FirewallStateSlot) -> FirewallPacket {
+        FirewallPacket {
+            ingress: slot.origin_ingress,
+            egress: slot.origin_egress,
+            source: slot.initiator_address,
+            destination: slot.responder_address,
+            protocol: slot.protocol,
+            source_port: slot.initiator_port,
+            destination_port: slot.responder_port,
+            tcp_flags: 0,
+        }
+    }
+
+    /// The rule of a live flow out of the inside endpoint `packet` goes to, when
+    /// `filtering` lets `packet` (UDP, or a TCP SYN) open a flow of its own.
+    fn endpoint_flow(
+        &self,
+        filtering: FirewallFiltering,
+        packet: FirewallPacket,
+        now_ms: u64,
+    ) -> Option<FirewallRuleId> {
+        if filtering == FirewallFiltering::AddressAndPortDependent
+            || !matches!(
+                packet.protocol,
+                FirewallProtocol::Udp | FirewallProtocol::Tcp
+            )
+        {
+            return None;
+        }
+        // The flow out of the endpoint, as its origin would look.
+        let endpoint = FirewallPacket {
+            ingress: packet.egress,
+            egress: packet.ingress,
+            source: packet.destination,
+            destination: packet.source,
+            protocol: packet.protocol,
+            source_port: packet.destination_port,
+            destination_port: packet.source_port,
+            tcp_flags: 0,
+        };
+        let entry = self.endpoints[self.endpoint_at(endpoint, filtering)?];
+        let state = *self.states.get(entry.state_index)?;
+        let same = entry.occupied
+            && state.slot_generation == entry.slot_generation
+            && !state.by_filtering
+            && self.slot_live(state, now_ms)
+            && state.protocol == packet.protocol
+            && state.origin_ingress == packet.egress
+            && state.origin_egress == packet.ingress
+            && state.initiator_address == packet.destination
+            && state.initiator_port == packet.destination_port
+            && (filtering == FirewallFiltering::EndpointIndependent
+                || state.responder_address == packet.source);
+        same.then_some(state.origin_rule_id)
     }
 
     fn probe(&mut self, packet: FirewallPacket, now_ms: u64) -> FirewallProbe {
@@ -3123,19 +3315,19 @@ mod tests {
         assert_eq!(
             format!("{first:?}"),
             "FirewallConfig { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
-             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent }, generation: 1, \
              hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
         );
         assert_eq!(
             format!("{owner:?}"),
             "ValidatedFirewallOwner { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
-             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent }, generation: 1, \
              hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
         );
         assert_eq!(
             format!("{:?}", first.binding()),
             "FirewallConfigBinding { policy: FirewallPolicy { udp_idle_ttl_ms: 300000, \
-             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000 }, generation: 1, \
+             tcp_opening_idle_ttl_ms: 240000, tcp_active_idle_ttl_ms: 7440000, filtering: AddressAndPortDependent }, generation: 1, \
              hash_key: FirewallHashKey([REDACTED]), rules_len: 1, .. }"
         );
         let baseline = first.binding();

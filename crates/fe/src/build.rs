@@ -58,6 +58,8 @@ pub(crate) struct Built {
     /// Whether the tables have any firewall rule. Then the firewall is on even if
     /// none of them is in `firewall`, and drops everything.
     pub(crate) firewall_on: bool,
+    /// How the forward firewall filters where no rule decides.
+    pub(crate) firewall_filtering: ruster_core::FirewallFiltering,
     /// The default VRF's NAPT, when the tables have one and both its interfaces
     /// are enabled.
     pub(crate) nat: Option<Nat>,
@@ -533,6 +535,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
     let mut firewall = Vec::new();
     let mut firewall_on = false;
+    let mut firewall_filtering = table::NatFiltering::default();
     let mut nat_entry = None;
     for (key, value) in store.iter() {
         match (key, value) {
@@ -615,6 +618,14 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                     return Err(format!("nat in {vrf}: only the default VRF has NAT"));
                 }
                 nat_entry = Some(nat);
+            }
+            (Key::FirewallPolicy { vrf }, Value::FirewallPolicy { filtering }) => {
+                if vrf != DEFAULT_VRF {
+                    return Err(format!(
+                        "firewall policy in {vrf}: only the default VRF has a firewall"
+                    ));
+                }
+                firewall_filtering = *filtering;
             }
             (Key::FirewallRule { vrf, id }, Value::FirewallRule(rule)) => {
                 if vrf != DEFAULT_VRF {
@@ -711,6 +722,17 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         kernel,
         firewall,
         firewall_on,
+        firewall_filtering: match firewall_filtering {
+            table::NatFiltering::EndpointIndependent => {
+                ruster_core::FirewallFiltering::EndpointIndependent
+            }
+            table::NatFiltering::AddressDependent => {
+                ruster_core::FirewallFiltering::AddressDependent
+            }
+            table::NatFiltering::AddressAndPortDependent => {
+                ruster_core::FirewallFiltering::AddressAndPortDependent
+            }
+        },
         nat,
     })
 }

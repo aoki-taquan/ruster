@@ -2909,3 +2909,141 @@ fn by_default_nat_lets_any_outside_endpoint_reach_a_mapping() {
     assert_eq!(&tx.bytes[30..34], &[192, 0, 2, 10]);
     assert_eq!(u16::from_be_bytes([tx.bytes[36], tx.bytes[37]]), 5_000);
 }
+
+/// Where no rule decides, the firewall lets outside endpoints reach an inside
+/// host's port that has a flow out as its filtering says: by default any
+/// (RFC 6092 REC-17), or only addresses it has a flow with, or only the exact flow.
+#[test]
+fn the_firewall_filters_packets_to_an_inside_endpoint_as_configured() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let peer = [203, 0, 113, 7];
+    let other = [203, 0, 113, 99];
+    for (filtering, other_address, other_port) in [
+        (None, true, true),
+        (Some(NatFiltering::AddressDependent), false, true),
+        (Some(NatFiltering::AddressAndPortDependent), false, false),
+    ] {
+        let mut bench = Bench::new();
+        let (mut config, _routes) = configure(&mut bench);
+        let mut neighbors = bench.connect(writers::NEIGHBOR);
+        assert_eq!(
+            bench.patch(
+                &mut neighbors,
+                &[
+                    neighbor("wan", GATEWAY, GATEWAY_MAC),
+                    neighbor("lan", host, HOST_MAC),
+                ]
+            ),
+            Code::CHANGED
+        );
+        let mut changes = vec![rule_for(1, Protocol::Udp, Some("lan"), None)];
+        if let Some(filtering) = filtering {
+            changes.push(Change::set(
+                Key::FirewallPolicy {
+                    vrf: "default".into(),
+                },
+                Value::FirewallPolicy { filtering },
+            ));
+        }
+        assert_eq!(bench.patch(&mut config, &changes), Code::CHANGED);
+        let out = udp_packet(host, peer, (5_000, 3_478));
+        bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+        bench.fe.step(bench.now);
+        assert!(bench.fe.io_mut().pop_tx().is_some(), "the flow out");
+
+        let mut reaches = |source: [u8; 4], port: u16, inside_port: u16| {
+            let packet = udp_packet(source, host, (port, inside_port));
+            bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+            bench.fe.step(bench.now);
+            bench.fe.io_mut().pop_tx().is_some()
+        };
+        assert!(
+            reaches(peer, 3_478, 5_000),
+            "{filtering:?}: the flow's own reply"
+        );
+        assert_eq!(
+            reaches(peer, 3_479, 5_000),
+            other_port,
+            "{filtering:?}: another port"
+        );
+        assert_eq!(
+            reaches(other, 3_478, 5_000),
+            other_address,
+            "{filtering:?}: another host"
+        );
+        assert!(
+            !reaches(peer, 3_478, 5_001),
+            "{filtering:?}: another inside port"
+        );
+    }
+}
+
+/// A rule decides before the filtering: a deny rule keeps outside endpoints out.
+/// For TCP, only a SYN may open a flow to the inside endpoint.
+#[test]
+fn a_deny_rule_wins_over_filtering_and_only_a_syn_opens_tcp() {
+    use ruster_proto::table::{FirewallAction, Protocol};
+    let host = [192, 0, 2, 10];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let mut deny = rule_for(3, Protocol::Udp, Some("wan"), None);
+    if let Change {
+        value: Some(Value::FirewallRule(rule)),
+        ..
+    } = &mut deny
+    {
+        rule.action = FirewallAction::Drop;
+    }
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("lan"), None),
+                rule_for(2, Protocol::Tcp, Some("lan"), None),
+                deny,
+            ]
+        ),
+        Code::CHANGED
+    );
+    let out = udp_packet(host, INTERNET, (5_000, 3_478));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    let syn = tcp_packet(host, INTERNET, (6_000, 443), 0x02);
+    bench.fe.io_mut().inject(IfId(0), from_lan(&syn));
+    bench.fe.step(bench.now);
+    assert_eq!(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count(), 2);
+
+    let other = [203, 0, 113, 99];
+    let mut sent = |packet: Vec<u8>| {
+        bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(
+        !sent(udp_packet(other, host, (1, 5_000))),
+        "the deny rule decides"
+    );
+    assert!(
+        !sent(tcp_packet(other, host, (1, 6_000), 0x10)),
+        "an ACK opens nothing"
+    );
+    assert!(
+        sent(tcp_packet(other, host, (1, 6_000), 0x02)),
+        "a SYN opens a flow"
+    );
+    assert!(
+        sent(tcp_packet(other, host, (1, 6_000), 0x10)),
+        "then its packets pass"
+    );
+}
