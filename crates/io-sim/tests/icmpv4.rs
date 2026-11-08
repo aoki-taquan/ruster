@@ -456,8 +456,10 @@ fn echo_requires_unicast_source_mac_and_exact_local_destination_mac() {
     }
 }
 
+/// A router address on another interface is the router's too (RFC 1812 5.2.3):
+/// the packet is not routed on.
 #[test]
-fn local_address_matching_is_strictly_ingress_scoped() {
+fn a_router_address_on_another_interface_is_for_the_router() {
     let interfaces = interfaces();
     let routes = [Route::new(LOCAL_IP, 32, LAN, None).unwrap()];
     let neighbors = [Neighbor {
@@ -473,15 +475,11 @@ fn local_address_matching_is_strictly_ingress_scoped() {
         ipv4_frame(LOCAL_IP, 1, 64, 0, &icmp_message(8, 0, &[1]), &[]),
     );
 
-    let report = io.run_once(1, &snapshot, &mut NoTrace).unwrap();
+    io.run_once(1, &snapshot, &mut NoTrace).unwrap();
 
-    assert_eq!(report.tx_requested, 1);
-    let forwarded = io.pop_tx().unwrap();
-    assert_eq!(forwarded.egress, LAN);
-    assert_eq!(&forwarded.bytes[0..6], &NEXT_HOP_MAC.0);
-    assert_eq!(&forwarded.bytes[6..12], &LOCAL_MAC.0);
-    assert_eq!(forwarded.bytes[22], 63);
-    assert_eq!(forwarded.bytes[34], 8, "nonlocal ICMP is not intercepted");
+    while let Some(sent) = io.pop_tx() {
+        assert_ne!(sent.bytes[34], 8, "the echo request is not routed on");
+    }
 }
 
 #[test]
