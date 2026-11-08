@@ -449,6 +449,48 @@ vrf = "red"
 }
 
 #[test]
+fn with_nat_the_router_s_own_ipv4_leaves_from_its_inside_address() {
+    let config = parse(
+        r#"
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+ipv4 = "192.0.2.1/24"
+
+[[interface]]
+name = "wan"
+mac = "02:00:00:00:00:02"
+ipv4 = "198.51.100.1/24"
+
+[nat]
+inside = "lan"
+outside = "wan"
+ports = "20000-20999"
+"#,
+    )
+    .unwrap();
+    let commands: Vec<String> = ruster_confd::kernel::commands(&config)
+        .iter()
+        .map(|args| args.join(" "))
+        .collect();
+    for expected in [
+        "-4 route replace 198.51.100.0/24 dev rt-default src 192.0.2.1",
+        "-4 route replace default dev rt-default src 192.0.2.1",
+    ] {
+        assert!(
+            commands.contains(&expected.to_string()),
+            "{expected}: {commands:#?}"
+        );
+    }
+    assert!(
+        !commands
+            .iter()
+            .any(|c| c.contains("route replace 192.0.2.0/24")),
+        "the inside prefix keeps the kernel's own route: {commands:#?}"
+    );
+}
+
+#[test]
 fn a_vrf_s_kernel_table_depends_only_on_its_name() {
     use ruster_confd::kernel::table;
     assert_eq!(table("red"), table("red"));

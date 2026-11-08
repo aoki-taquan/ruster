@@ -54,6 +54,13 @@ link() { # host-ns router-dev router-mac host-ip/len gateway
 nsx "$router" sysctl -qw net.ipv4.ip_forward=0
 link "$lan" r-lan 02:00:00:00:00:01 192.0.2.10/24 default
 link "$wan" r-wan 02:00:00:00:00:02 198.51.100.10/24 192.0.2.0/24
+# The ports sit in a VRF with no addresses; the router's kernel has its addresses
+# on the TUN device confd makes.
+nsx "$router" ip link set lo up
+nsx "$router" ip link add vrf-ports type vrf table 999
+nsx "$router" ip link set vrf-ports up
+nsx "$router" ip link set r-lan master vrf-ports
+nsx "$router" ip link set r-wan master vrf-ports
 
 cat > "$work/router.toml" <<'TOML'
 [[interface]]
@@ -80,6 +87,12 @@ ingress = "r-lan"
 action = "accept"
 protocol = "tcp"
 ingress = "r-lan"
+
+# The router's own pings, as a LAN host's.
+[[firewall]]
+action = "accept"
+protocol = "icmp"
+ingress = "rt-default"
 TOML
 
 run_dir="$work/run"
@@ -92,7 +105,7 @@ start() {
 start ruster-fe --backend "$backend" r-lan r-wan
 start ruster-ribd
 start ruster-neighd
-start ruster-confd "$work/router.toml"
+start ruster-confd --kernel "$work/router.toml"
 
 ok=0
 for _ in $(seq 1 20); do
@@ -100,6 +113,14 @@ for _ in $(seq 1 20); do
 done
 (( ok == 1 )) || fail "the LAN does not reach the WAN host"
 echo "ok: the LAN pings the WAN host"
+
+# The router itself reaches a host on the WAN's subnet through NAT, as a LAN host
+# does (from its inside address), with fragments too.
+for size in 56 3000; do
+  nsx "$router" ping -c 1 -W 2 -s "$size" 198.51.100.10 >/dev/null 2>&1 ||
+    fail "the router pings the WAN host ($size bytes)"
+done
+echo "ok: the router pings the WAN host through NAT, fragmented too"
 
 # The WAN host sees the router's address and a port of the range.
 nsx "$wan" python3 -c '

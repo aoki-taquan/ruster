@@ -89,6 +89,22 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
             })
             .and_then(|inside| inside.ipv4)
             .map(|(address, _)| address.to_string());
+        // The connected prefixes too: otherwise a host on the WAN's subnet (the ISP's
+        // gateway) is reached from the WAN address, which is NAT's public address, and
+        // its answers find no mapping there.
+        if let Some(source) = &nat_source {
+            for (address, len) in addresses {
+                if let IpAddr::V4(a) = address {
+                    if a.to_string() == *source {
+                        continue;
+                    }
+                    let prefix = format!("{}/{len}", ruster_proto::table::network(*address, *len));
+                    run(&[
+                        "-4", "route", "replace", &prefix, "dev", &tun, "src", source,
+                    ]);
+                }
+            }
+        }
         for family in ["-4", "-6"] {
             let mut args = vec![family, "route", "replace", "default", "dev", &tun];
             if *vrf != DEFAULT_VRF {

@@ -119,7 +119,9 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
   FEはパケットをTUNのインターフェースへ転送する。ルータ自身が始めた通信の戻りは、NATの対応で
   kernelへ届く。ルータ宛ての通信は、kernelのインターフェースへ出ていく通信としてforwardのfirewallで決める（規則では`egress = "rt-default"`）。
 - **送信元アドレス:** kernelは自分に設定されたアドレスを送信元に使う。出口で変換が要るかどうかは
-  FEが決め、kernelはPSIDやトンネルを知らなくてよい。
+  FEが決め、kernelはPSIDやトンネルを知らなくてよい。NATがあるときは、既定経路も直結の経路も
+  NATの内側のアドレスを送信元にする。WANと同じサブネットの相手（ISPのゲートウェイなど）へも、
+  LANのホストと同じくNATで変換されて出て、戻りがNATの対応で届く。
 - **TTLとHop Limit:** ここだけはほかのホストと違う。TUNから読んだパケットと、TUNへ出すパケットは、
   ルータ自身が送り、受けたものなので、TTLとHop Limitを減らさない。TTL 1で送る直結のeBGPや、
   TTL 255で受けたことを確かめるGTSM（RFC 5082）がそのまま動く。
