@@ -6269,12 +6269,101 @@ fn admit_ipv4_to_kernel(
     firewall: &mut Option<&mut FirewallRuntime<'_>>,
     audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
 ) -> Result<(), DropReason> {
-    let ipv4 = packet::validate_ipv4_frame(frame)?;
-    let validated = validate_firewall_transport(frame, ipv4)?;
+    let mut ipv4 = packet::validate_ipv4_frame(frame)?;
     let runtime = require_firewall_runtime(outer, config, firewall)?;
+    let flags_fragment =
+        packet::read_u16(frame, ipv4.header_offset + 6).ok_or(FirewallFragmentUnsupported)?;
+    if flags_fragment & 0x1fff != 0 {
+        // A later fragment: the kernel puts it together with its first fragment,
+        // which the rules judge, and drops it if that one did not come.
+        return Ok(());
+    }
+    // A first fragment has the whole transport header.
+    ipv4.first_fragment = flags_fragment & 0x2000 != 0;
+    if ipv4.protocol == 1 && ipv4.header_len == 20 {
+        if icmp_error_type(frame, ipv4).is_some() {
+            return admit_icmpv4_error_to_kernel(
+                frame,
+                ipv4,
+                ingress,
+                kernel,
+                runtime,
+                outer.now.0,
+            );
+        }
+    }
+    let validated = validate_firewall_transport(frame, ipv4)?;
     let packet = firewall_packet(ingress, kernel, ipv4, validated, None);
     let plan = plan_firewall_packet(packet, config, runtime, audit, outer.now.0)?;
     runtime.commit(plan).map_err(|_| FirewallStateTableFull)
+}
+
+/// The type of an ICMPv4 error (Destination Unreachable, Time Exceeded, Parameter
+/// Problem) in `frame`, if it is one.
+fn icmp_error_type(frame: &[u8], ipv4: packet::ValidatedIpv4) -> Option<u8> {
+    let kind = *frame.get(ipv4.header_offset + ipv4.header_len)?;
+    matches!(kind, 3 | 11 | 12).then_some(kind)
+}
+
+/// An ICMPv4 error for the router passes when it is about a flow the firewall lets
+/// through and is addressed to the quoted packet's sender (RFC 792; as for IPv6 and
+/// Linux's conntrack): the router learns the path MTU of its own connections.
+fn admit_icmpv4_error_to_kernel(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    ingress: IfId,
+    kernel: IfId,
+    runtime: &FirewallRuntime<'_>,
+    now_ms: u64,
+) -> Result<(), DropReason> {
+    let unrelated = FirewallRelatedIcmpv4Unsupported;
+    let end = ipv4.header_offset + ipv4.total_len;
+    let quoted = ipv4.header_offset + ipv4.header_len + 8;
+    let inner = frame.get(quoted..end.min(frame.len())).ok_or(unrelated)?;
+    if inner.len() < 20 || inner[0] >> 4 != 4 {
+        return Err(unrelated);
+    }
+    let inner_header = usize::from(inner[0] & 0x0f) * 4;
+    let source = crate::Ipv4Address::from_octets([inner[12], inner[13], inner[14], inner[15]]);
+    let destination = crate::Ipv4Address::from_octets([inner[16], inner[17], inner[18], inner[19]]);
+    if source != ipv4.destination {
+        return Err(unrelated);
+    }
+    let transport = inner.get(inner_header..inner_header + 8).ok_or(unrelated)?;
+    let port = |i: usize| u16::from_be_bytes([transport[i], transport[i + 1]]);
+    let (protocol, source_port, destination_port, tcp_flags) = match inner[9] {
+        6 => (FirewallProtocol::Tcp, port(0), port(2), 0),
+        17 => (FirewallProtocol::Udp, port(0), port(2), 0),
+        1 => match crate::forwarding::nat44_icmp_query::firewall_ports(transport[0], port(4)) {
+            Some((source_port, destination_port)) => (
+                FirewallProtocol::Icmp,
+                source_port,
+                destination_port,
+                if transport[0] == 0 || transport[0] == 14 {
+                    crate::firewall::FIREWALL_ICMP_REPLY
+                } else {
+                    0
+                },
+            ),
+            None => return Err(unrelated),
+        },
+        _ => return Err(unrelated),
+    };
+    // The quoted packet went the other way: from the kernel out of `ingress`.
+    let packet = FirewallPacket {
+        ingress: kernel,
+        egress: ingress,
+        source: source.into(),
+        destination: destination.into(),
+        protocol,
+        source_port,
+        destination_port,
+        tcp_flags,
+    };
+    runtime
+        .inspect_related_packet(packet, true, now_ms)
+        .map(|_| ())
+        .map_err(|_| unrelated)
 }
 
 fn validate_firewall_transport(
