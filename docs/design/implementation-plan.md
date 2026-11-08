@@ -105,14 +105,15 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 IPv4とIPv6の転送、VRF、VLAN、NAT44とMAP-EのNAPT、IPv4とIPv6のfirewall、フラグメント、
 ICMPとICMPv6のエラー、DS-Lite、MAP-E、PPPoE、ルータ宛て通信のTUN、confd、ribd、neighd、
-AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は12本で、機能を組み合わせた
-構成（VLANの上のNATとfirewall、PPPoEの上のNATとfirewall、PPPoEの上のMAP-E、VLANごとのVRF）を含み、
+AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は13本で、機能を組み合わせた
+構成（VLANの上のNATとfirewall、PPPoEの上のNATとfirewall、PPPoEの上のMAP-E、VLANごとのVRF、
+DS-LiteとIPv6のfirewall）を含み、
 どれもAF_XDPとAF_PACKETの両方で通る（`scripts/netns-all.sh`）。
 
 #### 残り（この順に作る）
 
 1. RFCとの見直し（2026-11-08、#506）で出た点のうち、残りのMediumとLow（#506と`backlog`のissue）。
-2. 形の違う構成の試験を足す: DS-Liteの上のIPv6のfirewall、VRFとfirewallの組み合わせ。
+2. 形の違う構成の試験を足す: VRFとfirewallの組み合わせ。
 
 ## 気をつけること
 
