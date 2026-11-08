@@ -21,7 +21,7 @@
 //! (incrementally); the IPv4 header checksum covers the TTL and the address.
 //!
 //! **State order.** The ICMP checksum and that the query is unfragmented
-//! (DF may be clear, unlike UDP/TCP; NAT44-116) are validated before any NAT
+//! (DF may be clear, as for UDP and TCP; NAT44-116) are validated before any NAT
 //! state changes, and every commit is prevalidated
 //! before the frame is rewritten, exactly as for UDP.
 //!

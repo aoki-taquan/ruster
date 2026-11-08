@@ -8,12 +8,11 @@
 //! decision, so a denied datagram is dropped without any ICMP error: no
 //! Echo Reply, Port or Protocol Unreachable, or Parameter Problem.
 //!
-//! The policy is stateless on purpose. The router originates no TCP or UDP
-//! session and no ICMP query, so nothing addressed to it is a reply to
-//! traffic it started; the ICMP errors it originates are never answered,
-//! and replies to NAT traffic go to the NAT path, which
-//! the forward firewall judges with its flow state. A flow table would
-//! therefore hold nothing a rule could not say, and costs storage.
+//! The policy is stateless. The FE gives it no rules: traffic to the router
+//! goes on to its kernel through the kernel's interface, where the forward
+//! firewall judges it, and the sessions the kernel starts (BGP, SSH, DNS) and
+//! their replies, with its flow state. Replies to NAT traffic go to the NAT
+//! path.
 //!
 //! The rules reuse the forward rule language: the rule id, interface,
 //! prefix, and port range types and their matchers. Selectors are the
