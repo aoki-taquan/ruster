@@ -76,13 +76,16 @@ fn run() -> Result<(), String> {
                 let Some(stream) = daemon::try_connect(&run_dir.join(&name)) else {
                     continue;
                 };
-                match kind {
+                // A failure is tried again at the next turn.
+                let connected = match kind {
                     PeerKind::Fe => confd.connect_fe(stream),
                     PeerKind::Ribd => confd.connect_ribd(stream),
                     PeerKind::Neighd => confd.connect_neighd(stream),
+                };
+                match connected {
+                    Ok(()) => eprintln!("ruster-confd: connected to {name} again"),
+                    Err(error) => eprintln!("ruster-confd: connecting to {name}: {error}"),
                 }
-                .map_err(|error| error.to_string())?;
-                eprintln!("ruster-confd: connected to {name} again");
             }
         }
         for stream in daemon::accept(&listener) {
