@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # VRFs and the firewall together on real Linux: two customers with the same
 # addresses in their own VRFs, a shared host in the default VRF, and the default
-# VRF's firewall, whose rules name only the default VRF's interfaces. With the
-# firewall on, IPv4 that red looks up in the default VRF is dropped rather than let
-# past the default VRF's firewall unchecked (fail closed); the default VRF's own
-# traffic is judged by the rules, and the VRFs stay apart.
+# VRF's firewall, whose rules name only the default VRF's interfaces: what red looks
+# up in the default VRF and sends out of its interfaces is judged by those rules
+# (red's TCP passes, its ping does not), the replies pass by its state, and the
+# VRFs stay apart.
 #
 #   red  (10.0.0.10) -- [r-red  vrf red ]
 #   blue (10.0.0.10) -- [r-blue vrf blue]  router  [r-up default] -- shared (198.51.100.10)
@@ -78,11 +78,17 @@ lookup-vrf = "default"
 prefix = "10.0.0.0/24"
 interface = "r-red"
 
-# Rules are the default VRF's: the shared host may ping the router.
+# Rules are the default VRF's: the shared host may ping the router, and red's
+# addresses may open TCP.
 [[firewall]]
 action = "accept"
 protocol = "icmp"
 ingress = "r-up"
+
+[[firewall]]
+action = "accept"
+protocol = "tcp"
+source = "10.0.0.0/24"
 TOML
 
 run_dir="$work/run"
@@ -124,11 +130,25 @@ done
 (( ok == 1 )) || fail "the shared host's ping, which a rule accepts, does not reach the router"
 echo "ok: the default VRF's rule lets the shared host ping the router"
 
-if connect "$red" >/dev/null; then fail "red's leak passed the default VRF's firewall"; fi
+seen=$(connect "$red") || fail "red's TCP, which a rule accepts, does not reach the shared host"
+[[ "$seen" == 10.0.0.10 ]] || fail "the shared host saw $seen"
+echo "ok: red's TCP into the default VRF passes its firewall by a rule, and the replies come back"
 if nsx "$red" ping -c 2 -i 0.2 -W 1 198.51.100.10 >/dev/null 2>&1; then
   fail "red's ping passed the default VRF's firewall"
 fi
-echo "ok: red's IPv4 looked up in the default VRF does not pass its firewall unchecked"
+echo "ok: red's ping, which no rule accepts, does not"
+nsx "$red" python3 -c '
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("10.0.0.10", 2222)); s.listen(4); s.settimeout(15)
+while True: s.accept()[0].close()
+' >/dev/null 2>"$work/red-server.log" &
+pids+=("$!")
+listening "$red" 2222
+if nsx "$shared" timeout 2 bash -c 'exec 3<>/dev/tcp/10.0.0.10/2222' 2>/dev/null; then
+  fail "the shared host opened TCP into red"
+fi
+echo "ok: the shared host cannot open TCP into red"
 
 if connect "$blue" >/dev/null; then fail "blue reaches the shared host"; fi
 echo "ok: blue cannot reach the shared host"
