@@ -152,7 +152,7 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 
 機能を組み合わせた構成の試験は、`netns-vlan-nat.sh`（VLANの上のNATとfirewall）、`netns-pppoe-nat.sh`
 （PPPoEの上のNATとfirewall）、`netns-map-e-pppoe.sh`（PPPoEの上のMAP-E）、`netns-vrf-vlan.sh`（VLANごとのVRF）、
-`netns-dslite-firewall6.sh`（DS-LiteとIPv6のfirewall）です。
+`netns-dslite-firewall6.sh`（DS-LiteとIPv6のfirewall）、`netns-vrf-firewall.sh`（VRFとfirewall）です。
 
 ## 開発
 
