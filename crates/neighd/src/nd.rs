@@ -224,6 +224,21 @@ pub fn solicitation(mac: [u8; 6], source: Ipv6Addr, target: Ipv6Addr) -> Vec<u8>
     frame(multicast_mac(group), mac, source, group, icmp)
 }
 
+/// A Neighbor Solicitation for `target` sent to it alone, at `target_mac`: the probe
+/// that confirms a neighbor is still reachable (RFC 4861 section 7.3.3, PROBE).
+pub fn solicitation_to(
+    mac: [u8; 6],
+    source: Ipv6Addr,
+    target: Ipv6Addr,
+    target_mac: [u8; 6],
+) -> Vec<u8> {
+    let mut icmp = vec![NEIGHBOR_SOLICITATION, 0, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&target.octets());
+    icmp.extend_from_slice(&[OPTION_SOURCE_LINK_LAYER, 1]);
+    icmp.extend_from_slice(&mac);
+    frame(target_mac, mac, source, target, icmp)
+}
+
 /// A Neighbor Advertisement for our `target` address, as a router, overriding.
 /// `to` is the asker; `None` (an asker doing duplicate address detection) sends it to
 /// all nodes, unsolicited (RFC 4861 section 7.2.4).

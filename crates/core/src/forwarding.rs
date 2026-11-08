@@ -2782,6 +2782,11 @@ pub enum TraceEvent {
         egress: IfId,
         neighbor_target: crate::Ipv4Address,
     },
+    /// An IPv6 packet goes to the neighbor `next_hop` out of `egress`.
+    Ipv6Routed {
+        egress: IfId,
+        next_hop: [u8; 16],
+    },
     /// A forwarded packet's next hop is not in the neighbor table and there
     /// is no resolution runtime; the packet is dropped as
     /// [`DropReason::NeighborUnresolved`] and the caller may ask the control

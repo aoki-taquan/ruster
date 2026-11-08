@@ -519,6 +519,10 @@ where
         });
         return Outcome::Drop(NeighborUnresolved);
     };
+    trace.record(TraceEvent::Ipv6Routed {
+        egress: egress.id,
+        next_hop,
+    });
     frame[0..6].copy_from_slice(&mac.0);
     frame[6..12].copy_from_slice(&egress.mac.0);
     frame[ip + 7] = hop_limit - hop;

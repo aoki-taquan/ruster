@@ -78,6 +78,8 @@ pub const DEFAULT_VRF: &str = ruster_proto::table::DEFAULT_VRF;
 const RX_BUDGET: usize = 64;
 /// ARP packets and resolve requests remembered per batch; more are dropped and counted.
 const EVENTS_PER_BATCH: usize = 64;
+/// Neighbors marked used at most between two reads of the marks.
+const USED_MAX: usize = 8_192;
 /// Frames read from the punt socket per step.
 const INJECT_PER_STEP: usize = 64;
 /// One resolve request per next hop per this many milliseconds.
@@ -173,6 +175,8 @@ pub struct Fe<B> {
     /// together, for the next batch.
     reassembly: reassembly::Reassembly,
     reassembled: Vec<kernel::Frame>,
+    /// The neighbors packets went to since the neighbor process last read them.
+    used: std::collections::HashSet<(u16, IpAddr)>,
     fragment_tracking: ruster_core::Ipv4FragmentTracker<'static>,
     counters: FeCounters,
 }
@@ -233,6 +237,7 @@ where
             fragmentation: fragments::fragmentation(),
             reassembly: reassembly::Reassembly::default(),
             reassembled: Vec::new(),
+            used: std::collections::HashSet::new(),
             fragment_tracking: fragments::tracker(),
             counters: FeCounters::default(),
         }
@@ -473,6 +478,9 @@ where
                 }
             }
         }
+        if self.used.len() < USED_MAX {
+            self.used.extend(trace.used.drain());
+        }
         for &(egress, target) in &trace.misses {
             self.resolve_request(egress, target, now_ms);
         }
@@ -614,6 +622,17 @@ where
             let egress = interface_id(&self.interface_names, punt.interface)
                 .filter(|id| self.active.contains(id));
             match (punt.direction, punt.reason, egress) {
+                // The neighbor process reads the "used" marks, which are then cleared.
+                (Direction::FromControl, punt::reason::NEIGHBOR_USED, _) => {
+                    let used: Vec<_> = self.used.drain().collect();
+                    for (interface, address) in used {
+                        let bytes = match address {
+                            IpAddr::V4(a) => a.octets().to_vec(),
+                            IpAddr::V6(a) => a.octets().to_vec(),
+                        };
+                        self.punt_frame(IfId(interface), punt::reason::NEIGHBOR_USED, &bytes);
+                    }
+                }
                 (Direction::FromControl, reason, Some(egress))
                     if punt.frame.len() >= ETHERNET_HEADER
                         && ((reason == punt::reason::ARP
@@ -897,6 +916,8 @@ impl ArpEvent {
 struct FeTrace {
     arp: Vec<ArpEvent>,
     misses: Vec<(IfId, IpAddr)>,
+    /// Next hops packets went to in this batch (the neighbors' "used" marks).
+    used: std::collections::HashSet<(u16, IpAddr)>,
     /// WireGuard peers (interface, index among its peers) that had a packet and no
     /// session.
     key_requests: Vec<(IfId, usize)>,
@@ -924,6 +945,16 @@ impl TraceSink for FeTrace {
                 } else {
                     self.overflow += 1;
                 }
+            }
+            TraceEvent::Routed {
+                egress,
+                neighbor_target,
+            } => {
+                self.used
+                    .insert((egress.0, IpAddr::V4(neighbor_target.octets().into())));
+            }
+            TraceEvent::Ipv6Routed { egress, next_hop } => {
+                self.used.insert((egress.0, IpAddr::V6(next_hop.into())));
             }
             TraceEvent::NeighborMissing { egress, target } => {
                 self.miss(egress, IpAddr::V4(target.octets().into()));
