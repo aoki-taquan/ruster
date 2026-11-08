@@ -20,7 +20,11 @@
 //!   to the live flow it quotes, whose source must be the error's destination; it
 //!   is not judged by the rules and makes no state.
 //!
-//! Deviations: IPv4 options are not forwarded (see `packet`); a later fragment
+//! Deviations: with NAT or the firewall on, an IPv4 datagram decided in another VRF
+//! that would leave through an interface of the default VRF (which they belong to)
+//! is dropped as `VRF_LEAK_INTO_SERVICES`, not judged by them (IPv6's are judged
+//! by the firewall); so route leaking between VRFs works for IPv4 only without
+//! them. IPv4 options are not forwarded (see `packet`); a later fragment
 //! that starts at offset 1 or 2 is dropped for every protocol, not only TCP (RFC
 //! 1858); transit fragments go through the fragment association table, whose
 //! limits (entries, per source, held per source) drop what goes past them.
