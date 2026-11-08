@@ -150,7 +150,7 @@ impl ArpAnnouncePolicy {
 /// router-wide switch. Conflict detection and counting stay on either way.
 ///
 /// 4 bytes; the forwarding snapshot borrows a sorted slice of them
-/// ([`ForwardingSnapshot::with_arp_interfaces`]), not the runtime slots.
+/// ([`crate::ForwardingSnapshot::with_arp_interfaces`]), not the runtime slots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpInterfacePolicy {
     pub interface: IfId,

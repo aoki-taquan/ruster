@@ -12,7 +12,7 @@
 //!   RFC 6479 (IPsec Anti-Replay Algorithm without Bit Shifting), which WireGuard
 //!   uses with a window of 8128 counters.
 //! - ChaCha20-Poly1305 with the nonce of RFC 8439 as WireGuard builds it:
-//!   [`crate::chacha20poly1305`].
+//!   the `chacha20poly1305` module.
 //!
 //! Deviations: none for the data messages. Rekey timers (the whitepaper's 6.1
 //! `REKEY_AFTER_*`) are the key-exchange daemon's job; the FE only refuses to
