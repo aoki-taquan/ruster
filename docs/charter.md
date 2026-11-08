@@ -38,7 +38,7 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
   - IPv4とIPv6の転送、VRF、VLAN
   - NAT（NAT44、MAP-Eのポートの範囲を使うNAPT）、状態を持つfirewall
   - フラグメント処理、ICMPとICMPv6のエラー生成
-  - トンネル（MAP-E、DS-Lite、WireGuard）のカプセル化と暗号処理、PPPoEのカプセル化
+  - トンネル（MAP-E、DS-Lite）のカプセル化、PPPoEのカプセル化
   - ルータ宛て通信の分類と流量制限、kernelへの受け渡し（TUN）
 - CE: 設定管理（`ruster-confd`）、経路の選択（`ruster-ribd`）、ARPとND（`ruster-neighd`）。
 - FEをいろいろな環境で動かすためのI/O層（AF_XDP、AF_PACKET、sim）。
