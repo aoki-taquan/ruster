@@ -32,7 +32,8 @@
 //! section 2.6.1) is not the router's; a packet from outside whose source is one
 //! of the router's addresses is forwarded; a link-local source toward a global
 //! destination is dropped without Destination Unreachable code 2 (RFC 4443 3.1);
-//! one ICMPv6 error limiter for every kind and source (RFC 4443 2.4(f)); no
+//! one ICMPv6 error limiter for every source, with one for Packet Too Big and one
+//! for the others, and fixed values (RFC 4443 2.4(f) asks them configurable); no
 //! Destination Unreachable for an unresolvable neighbor (address
 //! unreachable) or for traffic to the router, no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
@@ -219,6 +220,9 @@ pub struct ControlQueue {
     errors: Box<[ControlFrame]>,
     errors_len: usize,
     limiter: ErrorLimiter,
+    /// Packet Too Big has its own bucket, so that other errors cannot use up what
+    /// path MTU discovery needs.
+    too_big_limiter: ErrorLimiter,
 }
 
 /// A token bucket for ICMPv6 errors (RFC 4443 section 2.4 (f)): a burst of
@@ -298,6 +302,11 @@ impl ControlQueue {
                 refilled_at: 0,
                 now: 0,
             },
+            too_big_limiter: ErrorLimiter {
+                tokens: ERROR_BURST,
+                refilled_at: 0,
+                now: 0,
+            },
         }
     }
 
@@ -317,6 +326,7 @@ impl ControlQueue {
     /// The time the error limiter counts by; call before each batch.
     pub fn set_clock(&mut self, now: crate::MonotonicMillis) {
         self.limiter.now = now.0;
+        self.too_big_limiter.now = now.0;
     }
 
     /// The ICMPv6 errors built since the last [`ControlQueue::clear`].
@@ -390,7 +400,12 @@ impl ControlQueue {
         ) else {
             return;
         };
-        if !self.limiter.take() {
+        let limiter = if kind == PACKET_TOO_BIG {
+            &mut self.too_big_limiter
+        } else {
+            &mut self.limiter
+        };
+        if !limiter.take() {
             return;
         }
         let slot = &mut self.errors[self.errors_len];

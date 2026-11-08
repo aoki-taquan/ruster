@@ -3199,3 +3199,54 @@ fn a_flow_the_filtering_opened_ends_with_the_rule_that_let_its_host_out() {
         "no UDP out without a rule"
     );
 }
+
+/// Packet Too Big has its own rate limit: a burst of other ICMPv6 errors does not
+/// keep path MTU discovery from getting it (RFC 4443 2.4(f), RFC 8201).
+#[test]
+fn many_icmpv6_errors_do_not_use_up_packet_too_big() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let mut narrow_wan = iface("wan", WAN_MAC);
+    if let Change {
+        value: Some(Value::Interface { mtu, .. }),
+        ..
+    } = &mut narrow_wan
+    {
+        *mtu = 1_400;
+    }
+    assert_eq!(bench.patch(&mut config, &[narrow_wan]), Code::CHANGED);
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "lan".into(),
+                address: ip6("2001:db8:1::10"),
+            },
+            Value::Neighbor { mac: HOST_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    for _ in 0..30 {
+        let mut expiring = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+        expiring[14 + 7] = 1;
+        bench.fe.io_mut().inject(IfId(0), expiring);
+    }
+    bench.fe.step(0);
+    let time_exceeded = std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count();
+    assert!(
+        time_exceeded < 30,
+        "the errors are limited ({time_exceeded})"
+    );
+
+    let big = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 1_400]);
+    bench.fe.io_mut().inject(IfId(0), big);
+    bench.fe.step(0);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("Packet Too Big still goes back");
+    assert_eq!(tx.bytes[54], 2, "Packet Too Big");
+    assert_eq!(&tx.bytes[58..62], &1_400_u32.to_be_bytes());
+}
