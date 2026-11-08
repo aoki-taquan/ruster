@@ -107,15 +107,22 @@ s.bind((sys.argv[1], int(sys.argv[2]))); s.listen(1); s.settimeout(8)
 c, peer = s.accept(); c.sendall(peer[0].encode()); c.close()
 ' "$2" "$3" >/dev/null 2>"$work/server-$3.log" &
   pids+=("$!")
+  listening "$1" t "$3"
+}
+listening() { # namespace t|u port
   for _ in $(seq 1 50); do
-    nsx "$1" ss -Hltn "sport = :$3" | grep -q . && break
+    nsx "$1" ss -Hln"$2" "sport = :$3" | grep -q . && return 0
     sleep 0.1
   done
+  fail "nothing listens on $3 in $1"
 }
-connect() { # namespace address port
+connect() { # namespace address port; exits 2 when the attempt times out (dropped)
   nsx "$1" python3 -c '
 import socket, sys
-s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3)
+try:
+    s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3)
+except socket.timeout:
+    sys.exit(2)
 print(s.recv(100).decode())
 ' "$2" "$3"
 }
@@ -124,9 +131,12 @@ seen=$(connect "$host_a" 2001:db8:2::10 8080) || fail "TCP from the LAN out"
 [[ "$seen" == 2001:db8:1::10 ]] || fail "host-b saw $seen"
 echo "ok: TCP from the LAN goes out"
 serve "$host_a" 2001:db8:1::10 8081
-if connect "$host_b" 2001:db8:1::10 8081 >/dev/null 2>&1; then
-  fail "TCP from outside got in"
-fi
+# A server listens, so only the firewall can make the attempt time out (a refusal
+# would mean the SYN got in).
+status=0
+connect "$host_b" 2001:db8:1::10 8081 >/dev/null 2>&1 || status=$?
+(( status == 2 )) || fail "TCP from outside was not dropped (exit $status)"
+
 echo "ok: TCP from outside does not get in"
 
 # UDP: no rule accepts it.
@@ -139,7 +149,7 @@ except socket.timeout:
     print("none")
 ' >"$work/udp.out" 2>&1 &
 pids+=("$!")
-sleep 0.5
+listening "$host_b" u 5353
 nsx "$host_a" python3 -c '
 import socket
 s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)

@@ -103,18 +103,16 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 #### できたもの（2026-11-08）
 
-IPv4とIPv6の転送、VRF、VLAN（AF_XDP）、NAT44とMAP-EのNAPT、IPv4のfirewall、フラグメント、
+IPv4とIPv6の転送、VRF、VLAN（AF_XDP）、NAT44とMAP-EのNAPT、IPv4とIPv6のfirewall、フラグメント、
 ICMPとICMPv6のエラー、DS-Lite、MAP-E、PPPoE、ルータ宛て通信のTUN、confd、ribd、neighd、
-AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は7本。
+AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は8本。
 
 #### 残り（この順に作る）
 
-1. IPv6のfirewall。今は規則があるあいだIPv6を転送しないので、「IPv4とIPv6の転送」と
-   「状態を持つfirewall」が両立していない。一番大きい穴なので先に作る。
-2. ルータ自身の通信をホストと同じ転送の処理に通す（#470、設計図の変更はownerの確認待ち）と、
-   その上のMAP-Eのルータ自身のIPv4（#462）。
-3. AF_PACKETでVLANのタグを戻す（#423）。
-4. 「作るもの」の全部をRFCと突き合わせる見直しと、形の違う構成での試験をそろえる（完成の条件の確認）。
+1. ルータ自身の通信を、kernelのインターフェースから来たホストとしてLANと同じ転送の処理に通す
+   （#470）。firewallにも例外を作らず、代わりに規則でkernelのインターフェースを名前で書けるようにする
+   （2026-11-08 owner決定）。その上にMAP-Eのルータ自身のIPv4（#462）。
+2. 「作るもの」の全部をRFCと突き合わせる見直しと、形の違う構成での試験をそろえる（完成の条件の確認）。
 
 ## 気をつけること
 

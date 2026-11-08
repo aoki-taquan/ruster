@@ -968,3 +968,43 @@ fn a_key_exchange_request_round_trips_and_refuses_a_missing_member() {
         Err(ModelError::Missing("peer"))
     );
 }
+
+#[test]
+fn an_ipv6_firewall_rule_round_trips_and_a_mixed_one_is_refused() {
+    use ruster_proto::table::{FirewallAction, FirewallRule, Protocol};
+    let v6 = |text: &str| -> (IpAddr, u8) {
+        let (address, len) = text.split_once('/').unwrap();
+        (address.parse().unwrap(), len.parse().unwrap())
+    };
+    let rule = |source, destination, protocol| {
+        Change::set(
+            Key::FirewallRule {
+                vrf: DEFAULT_VRF.into(),
+                id: 1,
+            },
+            Value::FirewallRule(FirewallRule {
+                ingress: Some("lan".into()),
+                egress: None,
+                source,
+                destination,
+                protocol,
+                source_ports: (0, 65_535),
+                destination_ports: (0, 65_535),
+                action: FirewallAction::Accept,
+            }),
+        )
+    };
+    let icmpv6 = rule(v6("2001:db8:1::/48"), v6("::/0"), Protocol::Icmpv6);
+    assert_eq!(round_trip(&icmpv6), icmpv6);
+    for bad in [
+        rule(v6("2001:db8:1::/48"), (ip([0, 0, 0, 0]), 0), Protocol::Tcp),
+        rule(v6("::/0"), v6("::/0"), Protocol::Icmp),
+        rule(
+            (ip([0, 0, 0, 0]), 0),
+            (ip([0, 0, 0, 0]), 0),
+            Protocol::Icmpv6,
+        ),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}
