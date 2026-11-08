@@ -160,7 +160,11 @@ pub struct Fe<B> {
     kernel: Vec<IfId>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
+    /// ARP and Neighbor Discovery to the neighbor process.
     limiter: local::Limiter,
+    /// Each VRF's packets to its kernel, in the order of `vrfs`: a flood in one VRF
+    /// does not crowd out another's (BGP in another VRF, say).
+    kernel_limiters: Vec<local::Limiter>,
     /// The interfaces enabled in the current tables.
     active: Vec<IfId>,
     server: Server,
@@ -232,6 +236,7 @@ where
             kernel: built.kernel,
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
+            kernel_limiters: Vec::new(),
             active: built.active,
             server: Server::new(),
             punt: None,
@@ -382,7 +387,8 @@ where
         self.counters.from_kernel_dropped += from_kernel.dropped;
         for (egress, frame) in from_kernel.to_kernel {
             let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
-            let admitted = self.limiter.take(local::class(packet), now_ms);
+            let vrf = self.kernel.iter().position(|&kernel| kernel == egress);
+            let admitted = self.admit_to_kernel(vrf, packet, now_ms);
             if admitted && self.write_kernel(egress, &frame) {
                 self.counters.to_kernel += 1;
             } else {
@@ -673,14 +679,26 @@ where
         busy
     }
 
+    /// Whether `packet` to the kernel of the VRF at `vrf` (in the order of `vrfs`) is
+    /// within that VRF's limit for its class.
+    fn admit_to_kernel(&mut self, vrf: Option<usize>, packet: &[u8], now_ms: u64) -> bool {
+        if self.kernel_limiters.len() != self.names.len() {
+            self.kernel_limiters
+                .resize_with(self.names.len(), local::Limiter::default);
+        }
+        vrf.and_then(|at| self.kernel_limiters.get_mut(at))
+            .is_some_and(|limiter| limiter.take(local::class(packet), now_ms))
+    }
+
     /// Writes a packet addressed to the router to its VRF's kernel pipe.
     fn send_to_kernel(&mut self, ingress: IfId, packet: &[u8], now_ms: u64) {
-        let vrf = self
+        let at = self
             .by_ingress
             .get(usize::from(ingress.0))
-            .and_then(|&at| self.names.get(usize::from(at)));
+            .map(|&at| usize::from(at));
+        let admitted = self.admit_to_kernel(at, packet, now_ms);
+        let vrf = at.and_then(|at| self.names.get(at));
         let pipe = vrf.and_then(|name| self.local.get(name));
-        let admitted = self.limiter.take(local::class(packet), now_ms);
         match pipe {
             Some(pipe) if admitted && pipe.send(packet).is_ok() => self.counters.to_kernel += 1,
             _ => self.counters.to_kernel_dropped += 1,
@@ -833,6 +851,9 @@ where
             }
             self.vrfs = built.vrfs;
             self.by_ingress = built.by_ingress;
+            if self.names != built.names {
+                self.kernel_limiters.clear();
+            }
             self.names = built.names;
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;

@@ -3529,3 +3529,62 @@ fn the_icmp_error_limits_come_from_the_configuration() {
     bench.fe.step(0);
     assert_eq!(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count(), 2);
 }
+
+/// Each VRF has its own limit on packets to its kernel: a flood to the router in
+/// one VRF does not crowd out another VRF's traffic to the router.
+#[test]
+fn a_flood_to_the_router_in_one_vrf_leaves_another_vrf_s_limit() {
+    let mut bench = Bench::new();
+    let mut config = bench.connect(writers::CONFIG);
+    let red_lan = Change::set(
+        Key::Interface { name: "lan".into() },
+        Value::Interface {
+            enabled: true,
+            mac: LAN_MAC,
+            mtu: 1500,
+            vrf: "red".into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: None,
+        },
+    );
+    let code = bench.patch(
+        &mut config,
+        &[
+            red_lan,
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let (red_fe, red_kernel) = UnixDatagram::pair().unwrap();
+    let (default_fe, default_kernel) = UnixDatagram::pair().unwrap();
+    for socket in [&red_fe, &red_kernel, &default_fe, &default_kernel] {
+        socket.set_nonblocking(true).unwrap();
+    }
+    bench.fe.attach_local("red", Box::new(red_fe));
+    bench.fe.attach_local("default", Box::new(default_fe));
+
+    // More than a burst to the router in red, all at one moment.
+    for port in 0..300_u16 {
+        let packet = udp_packet([192, 0, 2, 10], [192, 0, 2, 1], (1_000 + port, 53));
+        bench.fe.io_mut().inject(IfId(0), from_lan(&packet));
+        bench.fe.step(0);
+    }
+    let mut buf = [0_u8; 2048];
+    let mut red = 0;
+    while red_kernel.recv(&mut buf).is_ok() {
+        red += 1;
+    }
+    assert!(red < 300, "red is limited: {red}");
+
+    // The default VRF's packet to the router still goes, at the same moment.
+    let packet = udp_packet(GATEWAY, [198, 51, 100, 2], (1_000, 53));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+    bench.fe.step(0);
+    let n = default_kernel
+        .recv(&mut buf)
+        .expect("default is not limited by red");
+    assert_eq!(&buf[..n], &packet[..]);
+}
