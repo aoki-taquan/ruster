@@ -309,6 +309,28 @@ fn a_solicitation_for_the_router_is_answered_and_the_asker_learned() {
     assert_eq!(&tx[0].1[0..6], &HOST_MAC);
 }
 
+/// Hosts resolving each other: a solicitation for another node's address is
+/// discarded, neither learned from nor answered (RFC 4861 7.2.3).
+#[test]
+fn a_solicitation_for_another_node_is_not_learned() {
+    let mut lab = Lab::new();
+    let solicitation = nd(
+        [0x33, 0x33, 0xff, 0, 0, 0x20],
+        HOST_MAC,
+        ip("2001:db8:1::10"),
+        ip("ff02::1:ff00:20"),
+        135,
+        0,
+        ip("2001:db8:1::20"),
+        1,
+    );
+    lab.fe.io_mut().inject(IfId(0), solicitation);
+    lab.settle();
+    assert!(lab.tx().is_empty(), "not answered");
+    assert_eq!(lab.neighd.counters().learned, 0);
+    assert_eq!(lab.neighd.known(), 0);
+}
+
 #[test]
 fn duplicate_address_detection_for_our_address_gets_an_all_nodes_advertisement() {
     let mut lab = Lab::new();
