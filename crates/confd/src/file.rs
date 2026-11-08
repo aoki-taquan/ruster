@@ -110,19 +110,26 @@
 //! - RFC 6333 section 5 (DS-Lite B4): a `tunnel` interface sends IPv4 inside IPv6
 //!   from `local`, which must be one of the router's IPv6 addresses in the default
 //!   VRF, to the AFTR at `remote`; the outer packets are routed in the default VRF.
-//!   Its MTU is at most 1460 (1500 less the IPv6 header), so the outer packets are
-//!   never fragmented (RFC 6333 5.3 lets the B4 fragment them instead).
+//!   Its MTU is at most 1460 (1500 less the IPv6 header), and at run time at most
+//!   what the link below carries less 40, so the outer packets are not fragmented
+//!   (RFC 6333 5.3 lets the B4 fragment them instead).
 //! - RFC 7597 (MAP-E), the CE: `[map-e]` derives the shared IPv4 address and the
 //!   PSID from the EA bits of the delegated prefix (section 5.2), the CE's IPv6
 //!   address from them (section 6, interface ID `0:IPv4:PSID` on the delegated
 //!   prefix with subnet ID 0), and makes a tunnel to the BR, NAPT on the PSID's
-//!   port set (section 5.1) and the default IPv4 route through the tunnel.
+//!   port set (section 5.1), the default IPv4 route through the tunnel, and a
+//!   discard route for the delegated prefix (RFC 7084 WPD-5). The router's own IPv4
+//!   from its LAN address is translated into the port set like a LAN host's.
 //!   Deviations: one Basic Mapping Rule, no Forwarding Mapping Rules (all traffic
 //!   goes through the BR, hub and spoke); an `ea-length` shorter than the IPv4
 //!   suffix (an IPv4 prefix per CE) is refused; the IPv4 address with no sharing
 //!   (`ea-length` equal to the IPv4 suffix) uses ports 1024 to 32767, below the
-//!   kernel's; the router's own IPv4 (from the kernel) is not translated into the
-//!   port set, so it does not work over MAP-E yet.
+//!   kernel's; a delegated prefix that is a link's on-link prefix is refused (no one
+//!   would answer Neighbor Discovery for the CE's address there); the
+//!   interface ID is RFC 7597's, not the older draft's; the unwrapped IPv4
+//!   destination is not checked against the CE's address (NAT drops what would go
+//!   from the tunnel to the inside without a mapping; one routed elsewhere is
+//!   forwarded).
 //! - RFC 2516: a `pppoe` interface is one PPPoE session on its parent (a port or
 //!   VLAN given before it), with the session ID and the access concentrator's MAC
 //!   that the session's daemon found; its MTU is at most the parent's less 8.
@@ -634,6 +641,28 @@ pub fn parse(text: &str) -> Result<Config, String> {
             .as_ref()
             .is_some_and(|(name, _, _)| *name == interface.name)
         {
+            // Sent from the CE's own address, which needs no owner; but no other
+            // tunnel may have the same ends.
+            if !pairs.insert((local, remote)) {
+                return Err(format!(
+                    "map-e interface {:?}: another tunnel has the same local and remote",
+                    interface.name
+                ));
+            }
+            // An address on an interface's own link would need answering there
+            // (Neighbor Discovery), which nothing does for the CE's address.
+            if let Some(on_link) = interfaces.iter().find(|i| {
+                i.tunnel.is_none()
+                    && i.ipv6.iter().any(|&(a, len)| {
+                        network(IpAddr::V6(a), len) == network(IpAddr::V6(local), len)
+                    })
+            }) {
+                return Err(format!(
+                    "map-e: prefix gives the CE address {local}, which is on {:?}'s link; \
+                     the delegated prefix must not be an on-link prefix",
+                    on_link.name
+                ));
+            }
             continue;
         }
         let at = format!("interface {:?}", interface.name);
@@ -918,12 +947,18 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
     let suffix = 32 - rule4_len;
     // The EA bits follow the rule IPv6 prefix in the delegated prefix; they hold
     // the IPv4 suffix and then the PSID (RFC 7597 section 5.2).
+    if network(IpAddr::V6(rule6), rule6_len) != IpAddr::V6(rule6) {
+        return Err(format!(
+            "{at}: rule-ipv6 has bits set after its prefix length"
+        ));
+    }
     if network(IpAddr::V6(delegated), rule6_len) != IpAddr::V6(rule6) {
         return Err(format!("{at}: prefix must be inside rule-ipv6"));
     }
-    if ea_length > 48
-        || u16::from(rule6_len) + u16::from(ea_length) > u16::from(delegated_len)
-        || delegated_len > 64
+    if ea_length > 48 {
+        return Err(format!("{at}: ea-length must be at most 48"));
+    }
+    if u16::from(rule6_len) + u16::from(ea_length) > u16::from(delegated_len) || delegated_len > 64
     {
         return Err(format!(
             "{at}: prefix must be at most /64 and hold the ea-length bits after rule-ipv6"
@@ -943,6 +978,11 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
     let psid_length = ea_length - suffix;
     let psid = (ea & ((1_u64 << psid_length) - 1)) as u16;
     let ipv4 = Ipv4Addr::from(u32::from(rule4) | (ea >> psid_length) as u32);
+    if !unicast_v4(ipv4) {
+        return Err(format!(
+            "{at}: the IPv4 address the prefix gives, {ipv4}, is not a unicast address"
+        ));
+    }
     let offset = entry.psid_offset.unwrap_or(6);
     if !(1..=15).contains(&offset) {
         return Err(format!("{at}: psid-offset must be 1 to 15"));
