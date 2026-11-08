@@ -345,8 +345,10 @@ pub(super) fn decide_nat44_icmp_outbound<T: TraceSink>(
         Ok(_) => return nat44_icmp_drop(ingress, Nat44IcmpTypeUnsupported, trace),
         Err(error) => return nat44_icmp_drop(ingress, nat_reason(error), trace),
     };
+    // The router's own address is a source only for its own packets (from the
+    // kernel's interface); from anywhere else it is spoofed.
     if !icmp_error_source_is_host(snapshot, ipv4.source)
-        || snapshot.is_local_ipv4(ipv4.source)
+        || (snapshot.is_local_ipv4(ipv4.source) && !snapshot.is_kernel_ingress(ingress))
         || ipv4.source == config.public_address()
     {
         return nat44_icmp_drop(ingress, Nat44IcmpSourceForbidden, trace);
@@ -455,12 +457,19 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
     if reverse_route.egress() != config.inside() {
         return nat44_icmp_drop(ingress, Nat44IcmpWrongEgress, trace);
     }
+    // NAT turned it back to the router's own address: it goes to the router's host,
+    // out of the kernel's interface, as to a host behind the inside interface.
+    let kernel = snapshot
+        .is_local_ipv4(internal_address)
+        .then(|| snapshot.kernel_ingress.first().copied())
+        .flatten();
+    let egress = kernel.unwrap_or(reverse_route.egress());
     if let Some(firewall_config) = firewall_config {
         let (source_port, destination_port) = firewall_ports(query.icmp_type, plan.internal_port())
             .expect("a validated query reply has firewall pseudo-ports");
         let canonical = FirewallPacket {
             ingress,
-            egress: reverse_route.egress(),
+            egress,
             source: ipv4.source.into(),
             destination: internal_address.into(),
             protocol: FirewallProtocol::Icmp,
@@ -471,7 +480,7 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
         let firewall_runtime = require_firewall_runtime(snapshot, firewall_config, firewall)?;
         *firewall_plan = Some(plan_firewall(
             ingress,
-            reverse_route.egress(),
+            egress,
             ipv4,
             firewall_validated.expect("inbound firewall packet was preflight validated"),
             Some(canonical),
@@ -485,14 +494,19 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
         return nat44_icmp_drop(ingress, Ipv4TtlExpired, trace);
     }
     let target = reverse_route.next_hop().unwrap_or(internal_address);
-    let (interface, destination_mac) =
-        match resolve_nat44_icmpv4_next_hop(snapshot, reverse_route.egress(), target, trace) {
+    let (interface, destination_mac) = match kernel {
+        Some(kernel) => {
+            let interface = *snapshot.interface(kernel).ok_or(InterfaceMiss)?;
+            (interface, interface.mac)
+        }
+        None => match resolve_nat44_icmpv4_next_hop(snapshot, egress, target, trace) {
             Ok(resolved) => resolved,
             Err(reason) => return nat44_icmp_drop(ingress, reason, trace),
-        };
+        },
+    };
     let checksum_offset = ipv4.header_offset + 10;
     let forwarding = Ipv4RewriteDecision {
-        egress: reverse_route.egress(),
+        egress,
         source_mac: interface.mac.0,
         destination_mac: destination_mac.0,
         ttl_offset: ipv4.header_offset + 8,

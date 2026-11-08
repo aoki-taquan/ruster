@@ -71,18 +71,27 @@ pub(crate) struct Outcome {
     /// Frames to send out of a port, with the port.
     pub(crate) sent: Vec<(IfId, Frame)>,
     pub(crate) dropped: u64,
+    /// Frames from the ports that core sent to a kernel interface (to the router's
+    /// host: replies NAT turned back to the router's address), with the interface.
+    pub(crate) to_kernel: Vec<(IfId, Vec<u8>)>,
 }
 
 /// A port batch followed by the kernel's frames.
 pub(crate) struct Joined<'o, B> {
     pub(crate) ports: B,
+    /// The kernel interfaces.
+    pub(crate) kernel_ids: &'o [IfId],
     pub(crate) kernel: std::vec::IntoIter<Frame>,
     pub(crate) outcome: &'o mut Outcome,
     pub(crate) kernel_done: usize,
 }
 
 pub(crate) enum Slot<'a, S> {
-    Port(S),
+    Port {
+        slot: S,
+        kernel_ids: &'a [IfId],
+        outcome: &'a mut Outcome,
+    },
     Kernel {
         frame: Option<Frame>,
         outcome: &'a mut Outcome,
@@ -99,8 +108,14 @@ impl<B: PacketBatch> PacketBatch for Joined<'_, B> {
 
     fn next_packet(&mut self) -> Option<PacketLease<Self::Slot<'_>>> {
         // Ports first; once they are empty, the kernel's frames.
+        let kernel_ids = self.kernel_ids;
         if let Some(lease) = self.ports.next_packet() {
-            return Some(lease.map_slot(Slot::Port));
+            let outcome = &mut *self.outcome;
+            return Some(lease.map_slot(|slot| Slot::Port {
+                slot,
+                kernel_ids,
+                outcome,
+            }));
         }
         let frame = self.kernel.next()?;
         Some(PacketLease::new(Slot::Kernel {
@@ -118,6 +133,12 @@ impl<B: PacketBatch> PacketBatch for Joined<'_, B> {
         completion.tx_requested += sent;
         completion.tx_accepted += sent;
         completion.recycled += self.kernel_done - sent;
+        // Port frames core sent to a kernel interface: the backend took them back as
+        // consumed (copied out), core counted them sent; the FE writes them.
+        let to_kernel = self.outcome.to_kernel.len();
+        completion.recycled -= to_kernel;
+        completion.tx_requested += to_kernel;
+        completion.tx_accepted += to_kernel;
         completion
     }
 }
@@ -125,14 +146,14 @@ impl<B: PacketBatch> PacketBatch for Joined<'_, B> {
 impl<S: PacketSlot> PacketSlot for Slot<'_, S> {
     fn ingress(&self) -> IfId {
         match self {
-            Self::Port(slot) => slot.ingress(),
+            Self::Port { slot, .. } => slot.ingress(),
             Self::Kernel { frame, .. } => frame.as_ref().expect("live kernel frame").ingress,
         }
     }
 
     fn bytes_mut(&mut self) -> &mut [u8] {
         match self {
-            Self::Port(slot) => slot.bytes_mut(),
+            Self::Port { slot, .. } => slot.bytes_mut(),
             Self::Kernel { frame, .. } => {
                 let frame = frame.as_mut().expect("live kernel frame");
                 &mut frame.buf[frame.start..]
@@ -142,7 +163,7 @@ impl<S: PacketSlot> PacketSlot for Slot<'_, S> {
 
     fn resize_front(&mut self, delta: isize) -> bool {
         match self {
-            Self::Port(slot) => slot.resize_front(delta),
+            Self::Port { slot, .. } => slot.resize_front(delta),
             Self::Kernel { frame, .. } => {
                 let frame = frame.as_mut().expect("live kernel frame");
                 let start = frame.start as isize + delta;
@@ -157,7 +178,7 @@ impl<S: PacketSlot> PacketSlot for Slot<'_, S> {
 
     fn truncate(&mut self, len: usize) -> bool {
         match self {
-            Self::Port(slot) => slot.truncate(len),
+            Self::Port { slot, .. } => slot.truncate(len),
             Self::Kernel { frame, .. } => {
                 let frame = frame.as_mut().expect("live kernel frame");
                 if len == 0 || frame.start + len > frame.buf.len() {
@@ -171,7 +192,20 @@ impl<S: PacketSlot> PacketSlot for Slot<'_, S> {
 
     fn complete(self, completion: SlotCompletion) {
         match self {
-            Self::Port(slot) => slot.complete(completion),
+            Self::Port {
+                mut slot,
+                kernel_ids,
+                outcome,
+            } => match completion {
+                // To the router's host: the FE writes it to the kernel's pipe.
+                SlotCompletion::Transmit(egress) if kernel_ids.contains(&egress) => {
+                    outcome.to_kernel.push((egress, slot.bytes_mut().to_vec()));
+                    slot.complete(SlotCompletion::Consume(
+                        ruster_core::ConsumeReason::LocalToControl,
+                    ));
+                }
+                completion => slot.complete(completion),
+            },
             Self::Kernel {
                 mut frame,
                 outcome,

@@ -49,6 +49,13 @@ for dev in r-lan r-wan; do
 done
 nsx "$router" ip link set r-lan address 02:00:00:00:00:01 up
 nsx "$router" ip link set r-wan address 02:00:00:00:00:02 up
+# confd --kernel gives the router's kernel its addresses on a TUN; the FE's ports sit
+# in a VRF with no addresses, so the kernel leaves their frames to the FE.
+nsx "$router" ip link set lo up
+nsx "$router" ip link add vrf-ports type vrf table 999
+nsx "$router" ip link set vrf-ports up
+nsx "$router" ip link set r-lan master vrf-ports
+nsx "$router" ip link set r-wan master vrf-ports
 nsx "$br" sysctl -qw net.ipv6.conf.default.accept_dad=0 net.ipv6.conf.all.accept_dad=0
 nsx "$br" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 nsx "$br" ethtool -K b0 tx off >/dev/null
@@ -106,7 +113,7 @@ start() {
 start ruster-fe --backend af-xdp r-lan r-wan
 start ruster-ribd
 start ruster-neighd
-start ruster-confd "$work/router.toml"
+start ruster-confd --kernel "$work/router.toml"
 
 ok=0
 for _ in $(seq 1 20); do
@@ -136,5 +143,28 @@ read -r address port <<<"$seen"
 # PSID 0x34 with offset 6 and 8 PSID bits: bits 2..9 of the port.
 (( ((port >> 2) & 0xff) == 0x34 && (port >> 10) != 0 )) || fail "port $port is not PSID 0x34's"
 echo "ok: TCP arrives from 192.0.2.18 port $port, one of PSID 0x34's"
+
+# The router's own IPv4 (from its kernel) goes the same way: NAT turns it into
+# 192.0.2.18 and a PSID port, so the BR takes it (RFC 7597 8.1).
+nsx "$net" python3 -c '
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("198.51.100.10", 8081)); s.listen(1); s.settimeout(10)
+c, peer = s.accept(); c.sendall(b"%s %d" % (peer[0].encode(), peer[1])); c.close()
+' >/dev/null 2>"$work/server2.log" &
+pids+=("$!")
+for _ in $(seq 1 50); do
+  nsx "$net" ss -Hltn "sport = :8081" | grep -q . && break
+  sleep 0.1
+done
+seen=$(nsx "$router" python3 -c '
+import socket
+s = socket.create_connection(("198.51.100.10", 8081), timeout=5)
+print(s.recv(100).decode())
+') || fail "the router's own TCP through MAP-E"
+read -r address port <<<"$seen"
+[[ "$address" == 192.0.2.18 ]] || fail "the IPv4 host saw the router as $address"
+(( ((port >> 2) & 0xff) == 0x34 && (port >> 10) != 0 )) || fail "the router's port $port is not PSID 0x34's"
+echo "ok: the router's own TCP arrives from 192.0.2.18 port $port, one of PSID 0x34's"
 
 echo "PASS (af-xdp)"

@@ -75,10 +75,21 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
                 run(&["address", "replace", &with_len, "dev", &tun]);
             }
         }
+        // With NAT, the router's own IPv4 leaves from its address on NAT's inside,
+        // so that NAT translates it as a host's there (`fe-ce-split.md`).
+        let nat_source = (*vrf == DEFAULT_VRF)
+            .then_some(config.nat.as_ref())
+            .flatten()
+            .and_then(|nat| config.interfaces.iter().find(|i| i.name == nat.inside))
+            .and_then(|inside| inside.ipv4)
+            .map(|(address, _)| address.to_string());
         for family in ["-4", "-6"] {
             let mut args = vec![family, "route", "replace", "default", "dev", &tun];
             if *vrf != DEFAULT_VRF {
                 args.extend(["table", &table_id]);
+            }
+            if let (Some(source), "-4") = (&nat_source, family) {
+                args.extend(["src", source]);
             }
             run(&args);
         }

@@ -324,6 +324,7 @@ where
         let mut from_kernel = kernel::Outcome::default();
         let batch = kernel::Joined {
             ports,
+            kernel_ids: &self.kernel,
             kernel: kernel_frames.into_iter(),
             outcome: &mut from_kernel,
             kernel_done: 0,
@@ -355,6 +356,13 @@ where
         self.counters.dropped += report.dropped as u64;
         self.counters.arp_to_control_dropped += trace.overflow;
         self.counters.from_kernel_dropped += from_kernel.dropped;
+        for (egress, frame) in from_kernel.to_kernel {
+            if self.write_kernel(egress, &frame) {
+                self.counters.to_kernel += 1;
+            } else {
+                self.counters.to_kernel_dropped += 1;
+            }
+        }
         for (egress, frame) in from_kernel.sent {
             let sent = if self.kernel.contains(&egress) {
                 self.write_kernel(egress, frame.bytes())
