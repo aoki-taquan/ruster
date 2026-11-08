@@ -23,8 +23,9 @@
 //! Deviations: with NAT on, an IPv4 datagram decided in another VRF that would leave
 //! through an interface of the default VRF (NAT's) is dropped as
 //! `VRF_LEAK_INTO_SERVICES`, not translated; with only the firewall on, the
-//! firewall judges it as one of the default VRF's (an ICMP error so leaked is
-//! dropped). IPv4 options are not forwarded (see `packet`); a later fragment
+//! firewall judges it as one of the default VRF's, except that a leaked ICMP error
+//! or fragment is dropped. Rules can name only the default VRF's interfaces, so a
+//! rule with no ingress also admits what other VRFs leak. IPv4 options are not forwarded (see `packet`); a later fragment
 //! that starts at offset 1 or 2 is dropped for every protocol, not only TCP (RFC
 //! 1858); transit fragments go through the fragment association table, whose
 //! limits (entries, per source, held per source) drop what goes past them.
