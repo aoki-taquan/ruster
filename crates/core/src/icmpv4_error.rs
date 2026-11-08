@@ -1446,8 +1446,7 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         self.len -= 1;
         self.counters.dequeued += 1;
         // Its limiter state no longer waits for it: later errors of its kind out of
-        // its egress may be queued again (none was sent, so the interval does not
-        // start).
+        // its egress may be queued again.
         if let Some(state) = self.states[..self.occupied_prefix]
             .iter_mut()
             .find(|state| {
@@ -1457,7 +1456,11 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
                     && state.generation == queued.generation
             })
         {
+            // Reusable for any interface, and long past: the next error is not
+            // held back by an interval no error started.
             state.action_queued = false;
+            state.has_requested = true;
+            state.requested_at = MonotonicMillis(0);
         }
         true
     }
