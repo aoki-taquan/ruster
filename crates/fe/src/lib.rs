@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 //! The forwarding element (FE): it holds the tables and forwards packets by them.
 //!
-//! See `docs/design/fe-internals.md`. This is the skeleton: one worker, IPv4 only,
-//! one VRF (`default`), one next hop per route. The tables arrive over the table
+//! See `docs/design/fe-internals.md`. One worker, IPv4 and IPv6, VRFs, and one next
+//! hop per route (the first active one of several). The tables arrive over the table
 //! server ([`ruster_proto::session`]); every accepted change rebuilds the core's
 //! [`ValidatedForwardingOwner`] and the worker uses the new one from its next batch.
 //!
