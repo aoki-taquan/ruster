@@ -622,6 +622,17 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
             Completed::Dropped
         }
         Outcome::Local => {
+            // To the kernel, the router's host, as to a host behind a port: through
+            // the forward firewall, out of the VRF's kernel interface.
+            let admitted = match outer.kernel_interface_of(snapshot) {
+                Some(kernel) => admit(packet.bytes_mut(), kernel),
+                None => Ok(()),
+            };
+            if let Err(reason) = admitted {
+                packet.recycle(reason);
+                trace.record(TraceEvent::Dropped { ingress, reason });
+                return Completed::Dropped;
+            }
             if let Some(queue) = control {
                 queue.push_local(ingress, packet.bytes_mut());
             }

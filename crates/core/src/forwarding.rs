@@ -1810,6 +1810,14 @@ impl<'a> ForwardingSnapshot<'a> {
         })
     }
 
+    /// The kernel interface of `vrf`'s VRF, among [`Self::with_kernel_ingress`].
+    pub(crate) fn kernel_interface_of(&self, vrf: &ForwardingSnapshot<'_>) -> Option<IfId> {
+        self.kernel_ingress
+            .iter()
+            .copied()
+            .find(|&kernel| self.for_ingress(kernel).authority() == vrf.authority())
+    }
+
     /// Whether `ingress` is one of [`Self::with_kernel_ingress`].
     pub(crate) fn is_kernel_ingress(&self, ingress: IfId) -> bool {
         self.kernel_ingress.contains(&ingress)
@@ -3690,17 +3698,45 @@ where
                             tracker.commit_deny(ticket, nat_now_ms);
                         }
                     }
-                    let reason = if snapshot.local_to_control {
-                        if let Some(queue) = control.as_deref_mut() {
-                            queue.push_local(ingress, packet.bytes_mut());
+                    // To the kernel, the router's host, as to a host behind a port: through
+                    // the forward firewall, out of the VRF's kernel interface.
+                    let admitted = match (
+                        snapshot.local_to_control,
+                        firewall_config,
+                        all_vrfs.kernel_interface_of(snapshot),
+                    ) {
+                        (true, Some(config), Some(kernel))
+                            if snapshot.authority() == all_vrfs.authority() =>
+                        {
+                            admit_ipv4_to_kernel(
+                                packet.bytes_mut(),
+                                ingress,
+                                kernel,
+                                all_vrfs,
+                                config,
+                                &mut firewall,
+                                &mut firewall_audit,
+                            )
                         }
-                        ConsumeReason::LocalToControl
-                    } else {
-                        ConsumeReason::Ipv4LocalUnsupported
+                        _ => Ok(()),
                     };
-                    packet.consume(reason);
-                    consumed += 1;
-                    trace.record(TraceEvent::Ipv4LocalConsumed { ingress, reason });
+                    if let Err(reason) = admitted {
+                        packet.recycle(reason);
+                        dropped += 1;
+                        trace.record(TraceEvent::Dropped { ingress, reason });
+                    } else {
+                        let reason = if snapshot.local_to_control {
+                            if let Some(queue) = control.as_deref_mut() {
+                                queue.push_local(ingress, packet.bytes_mut());
+                            }
+                            ConsumeReason::LocalToControl
+                        } else {
+                            ConsumeReason::Ipv4LocalUnsupported
+                        };
+                        packet.consume(reason);
+                        consumed += 1;
+                        trace.record(TraceEvent::Ipv4LocalConsumed { ingress, reason });
+                    }
                 }
                 Ok(planned) => {
                     let decision = planned.decision;
@@ -6219,6 +6255,26 @@ struct ValidatedFirewallTransport {
     source_port: u16,
     destination_port: u16,
     tcp_flags: u8,
+}
+
+/// Lets an IPv4 packet for the router through the forward firewall, as a packet
+/// forwarded out of the VRF's kernel interface `kernel` (rules name it `rt-default`):
+/// a flow it opens lets the kernel's replies back out.
+fn admit_ipv4_to_kernel(
+    frame: &[u8],
+    ingress: IfId,
+    kernel: IfId,
+    outer: &ForwardingSnapshot<'_>,
+    config: &FirewallConfig<'_>,
+    firewall: &mut Option<&mut FirewallRuntime<'_>>,
+    audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+) -> Result<(), DropReason> {
+    let ipv4 = packet::validate_ipv4_frame(frame)?;
+    let validated = validate_firewall_transport(frame, ipv4)?;
+    let runtime = require_firewall_runtime(outer, config, firewall)?;
+    let packet = firewall_packet(ingress, kernel, ipv4, validated, None);
+    let plan = plan_firewall_packet(packet, config, runtime, audit, outer.now.0)?;
+    runtime.commit(plan).map_err(|_| FirewallStateTableFull)
 }
 
 fn validate_firewall_transport(

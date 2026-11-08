@@ -1983,3 +1983,101 @@ fn the_router_s_own_packets_need_a_rule_for_rt_default() {
     assert_eq!(tx.egress, IfId(1));
     assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
 }
+
+/// An IPv4 TCP packet (no Ethernet header) from `source` to `destination`.
+fn tcp_packet(source: [u8; 4], destination: [u8; 4], ports: (u16, u16), flags: u8) -> Vec<u8> {
+    let mut p = vec![0_u8; 40];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&40_u16.to_be_bytes());
+    p[8] = 64;
+    p[9] = 6;
+    p[12..16].copy_from_slice(&source);
+    p[16..20].copy_from_slice(&destination);
+    let checksum = ipv4_header_checksum(&p[..20]);
+    p[10..12].copy_from_slice(&checksum.to_be_bytes());
+    p[20..22].copy_from_slice(&ports.0.to_be_bytes());
+    p[22..24].copy_from_slice(&ports.1.to_be_bytes());
+    p[32] = 0x50;
+    p[33] = flags;
+    // The TCP checksum over the pseudo-header and the segment (RFC 793).
+    let mut pseudo = Vec::new();
+    pseudo.extend_from_slice(&source);
+    pseudo.extend_from_slice(&destination);
+    pseudo.extend_from_slice(&[0, 6, 0, 20]);
+    pseudo.extend_from_slice(&p[20..]);
+    let checksum = ruster_core::internet_checksum(&pseudo);
+    p[36..38].copy_from_slice(&checksum.to_be_bytes());
+    p
+}
+
+fn from_wan(packet: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&WAN_MAC);
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&0x0800_u16.to_be_bytes());
+    frame.extend_from_slice(packet);
+    frame
+}
+
+/// Traffic to the router is judged like traffic to a host behind a port: a rule with
+/// `egress = "rt-default"` lets a connection in, and its state lets the kernel's
+/// replies out.
+#[test]
+fn a_connection_to_the_router_needs_a_rule_and_its_replies_then_pass() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let router = [198, 51, 100, 2];
+    let syn = tcp_packet(INTERNET, router, (40_000, 22), 0x02);
+    let mut buf = [0_u8; 2048];
+
+    // A firewall with a rule for the LAN only: the SYN does not reach the kernel.
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(1)]),
+        Code::CHANGED
+    );
+    bench.fe.io_mut().inject(IfId(1), from_wan(&syn));
+    bench.fe.step(bench.now);
+    assert!(kernel.recv(&mut buf).is_err(), "nothing for the kernel");
+
+    // SSH to the router is allowed.
+    let ssh_in = Change::set(
+        Key::FirewallRule {
+            vrf: "default".into(),
+            id: 2,
+        },
+        Value::FirewallRule(ruster_proto::table::FirewallRule {
+            ingress: None,
+            egress: Some("rt-default".into()),
+            source: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            destination: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            protocol: ruster_proto::table::Protocol::Tcp,
+            source_ports: (0, 65_535),
+            destination_ports: (22, 22),
+            action: ruster_proto::table::FirewallAction::Accept,
+        }),
+    );
+    assert_eq!(bench.patch(&mut config, &[ssh_in]), Code::CHANGED);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&syn));
+    bench.fe.step(bench.now);
+    let n = kernel.recv(&mut buf).expect("the SYN reached the kernel");
+    assert_eq!(&buf[..n], &syn[..]);
+
+    // The kernel's SYN-ACK and later segments go out by the flow's state.
+    for flags in [0x12, 0x10] {
+        let reply = tcp_packet(router, INTERNET, (22, 40_000), flags);
+        kernel.send(&reply).unwrap();
+        bench.fe.step(bench.now);
+        let tx = bench.fe.io_mut().pop_tx().expect("the kernel's reply left");
+        assert_eq!(tx.egress, IfId(1));
+        assert_eq!(&tx.bytes[14..], &reply[..]);
+    }
+}

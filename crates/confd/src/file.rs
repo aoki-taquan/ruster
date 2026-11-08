@@ -68,7 +68,8 @@
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
 //! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
 //! ingress = "lan"              # optional, any interface when left out;
-//!                              # "rt-default" is the router itself (its own packets)
+//!                              # "rt-default" is the router itself: as ingress its own
+//!                              # packets, as egress the packets to it (SSH, ping, ...)
 //! egress = "wan"               # optional
 //! source = "192.0.2.0/24"      # optional, any address when left out; IPv4 or IPv6
 //! destination = "0.0.0.0/0"    # optional, of the source's family
