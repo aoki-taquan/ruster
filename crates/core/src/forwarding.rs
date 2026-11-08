@@ -12,6 +12,9 @@
 //! - RFC 1812 section 5.2.3: an IPv4 datagram for any of the router's addresses is
 //!   for the router, whichever interface it came in on. A NAT public address that
 //!   came in from another interface than its own is left to NAT (hairpinning).
+//! - Discard and reject routes ([`IfId::DISCARD`], [`IfId::REJECT`]): a discard
+//!   route drops silently; a reject route is as no route, so the datagram gets
+//!   Destination Unreachable (Network) as RFC 1812 section 5.2.7.1 asks.
 //! - RFC 1191 and RFC 1812 section 5.2.7: with the firewall, a forwarded ICMPv4
 //!   Destination Unreachable, Time Exceeded or Parameter Problem passes as RELATED
 //!   to the live flow it quotes, whose source must be the error's destination; it
@@ -574,6 +577,8 @@ pub enum DropReason {
     /// An ICMPv6 error, while the forward firewall is on, whose quoted packet is no
     /// flow the firewall lets through (or cannot be read).
     FirewallIcmpv6Unrelated = 251,
+    /// The route holding the destination is a discard route.
+    RouteDiscard = 252,
 }
 
 use DropReason::*;
@@ -581,7 +586,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 251] = [
+    pub const ALL: [Self; 252] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -833,6 +838,7 @@ impl DropReason {
         WireguardUnderlyingUnsupported,
         WireguardMtuExceeded,
         FirewallIcmpv6Unrelated,
+        RouteDiscard,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1101,6 +1107,7 @@ impl DropReason {
             WireguardUnderlyingUnsupported => "WIREGUARD_UNDERLYING_UNSUPPORTED",
             WireguardMtuExceeded => "WIREGUARD_MTU_EXCEEDED",
             FirewallIcmpv6Unrelated => "FIREWALL_ICMPV6_UNRELATED",
+            RouteDiscard => "ROUTE_DISCARD",
         }
     }
 }
@@ -1566,6 +1573,7 @@ impl<'a> ForwardingSnapshot<'a> {
             if !interfaces
                 .iter()
                 .any(|interface| interface.id == route.egress())
+                && !matches!(route.egress(), IfId::DISCARD | IfId::REJECT)
             {
                 return Err(SnapshotError::RouteUnknownInterface);
             }
@@ -4571,6 +4579,12 @@ fn decide_ipv4<T: TraceSink>(
     } else {
         snapshot.route_lookup(ipv4.destination)
     };
+    // A discard route drops silently; a reject route is as no route (Destination
+    // Unreachable).
+    if selected_route.is_some_and(|route| route.egress() == IfId::DISCARD) {
+        return Err(RouteDiscard);
+    }
+    let selected_route = selected_route.filter(|route| route.egress() != IfId::REJECT);
     if !local {
         validate_ipv4_forward_destination(ipv4, selected_route)?;
     }
@@ -8653,6 +8667,10 @@ fn truncated_parameter_problem<T: TraceSink>(
         None
     } else {
         let selected_route = snapshot.route_lookup(ipv4.destination);
+        if selected_route.is_some_and(|route| route.egress() == IfId::DISCARD) {
+            return;
+        }
+        let selected_route = selected_route.filter(|route| route.egress() != IfId::REJECT);
         if firewall
             || validate_ipv4_forward_destination(ipv4, selected_route).is_err()
             || !transit_error_allowed(ingress, selected_route, nat44_udp_config, nat44_tcp_config)
@@ -10140,6 +10158,7 @@ mod tests {
             (249, "WIREGUARD_UNDERLYING_UNSUPPORTED"),
             (250, "WIREGUARD_MTU_EXCEEDED"),
             (251, "FIREWALL_ICMPV6_UNRELATED"),
+            (252, "ROUTE_DISCARD"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10149,7 +10168,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(252), None);
+        assert_eq!(DropReason::from_code(253), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

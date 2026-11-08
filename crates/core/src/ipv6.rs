@@ -493,6 +493,16 @@ where
         }
         return Outcome::Error(RouteMiss, DESTINATION_UNREACHABLE, 0, 0);
     };
+    if route.egress == IfId::DISCARD {
+        return Outcome::Drop(crate::DropReason::RouteDiscard);
+    }
+    if route.egress == IfId::REJECT {
+        if silent_route_miss {
+            return Outcome::Drop(FirewallDefaultDenied);
+        }
+        // RFC 4443 3.1 code 6: reject route to destination.
+        return Outcome::Error(RouteMiss, DESTINATION_UNREACHABLE, 6, 0);
+    }
     let Some(egress) = snapshot.interface(route.egress) else {
         return Outcome::Drop(InterfaceMiss);
     };
