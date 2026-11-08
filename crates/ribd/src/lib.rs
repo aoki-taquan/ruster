@@ -19,7 +19,10 @@
 //! - RFC 8349 (`ietf-routing`): routes per VRF and prefix, chosen by route preference
 //!   (lower is preferred) between sources.
 //!
-//! Deviations: a preference is set per source, not per route.
+//! Deviations: a preference is set per source, not per route. ribd does not know
+//! the interfaces, so a route out of a disabled interface may be chosen over a
+//! usable one (RFC 8349 chooses among usable routes), and the FE leaves it out;
+//! confd offers none of its own static routes out of one.
 
 use std::collections::BTreeMap;
 use std::io;
