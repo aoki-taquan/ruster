@@ -536,11 +536,17 @@ impl Confd {
         interface.enabled && parent.is_none_or(|parent| self.usable(parent))
     }
 
-    /// Connected routes of enabled interfaces, then static routes. A static route for
-    /// a connected prefix is left out: the connected route wins, as on most routers.
+    /// Connected routes of usable interfaces (enabled, on an enabled parent), then
+    /// static routes. A static route for a connected prefix is left out: the connected
+    /// route wins, as on most routers.
     fn routes(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
-        for interface in self.config.interfaces.iter().filter(|i| i.enabled) {
+        for interface in self
+            .config
+            .interfaces
+            .iter()
+            .filter(|i| self.usable(&i.name))
+        {
             // Link-local prefixes are on every link and never forwarded.
             let prefixes = interface
                 .ipv4
@@ -763,5 +769,55 @@ mod tests {
             routes.get(&key(25)),
             Some(&Value::Route(RouteAction::Discard))
         );
+    }
+
+    #[test]
+    fn routes_out_of_a_vlan_on_a_disabled_parent_are_not_offered() {
+        let interface = |name: &str, enabled, ipv4, vlan| InterfaceConfig {
+            name: name.into(),
+            mac: [2, 0, 0, 0, 0, 1],
+            mtu: 1500,
+            enabled,
+            ipv4,
+            ipv6: Vec::new(),
+            vrf: "default".into(),
+            vlan,
+            tunnel: None,
+            pppoe: None,
+        };
+        let config = |trunk_enabled| Config {
+            wireguard: Vec::new(),
+            interfaces: vec![
+                interface("trunk", trunk_enabled, None, None),
+                interface(
+                    "trunk.10",
+                    true,
+                    Some((Ipv4Addr::new(10, 0, 10, 1), 24)),
+                    Some(("trunk".into(), 10)),
+                ),
+            ],
+            static_routes: vec![StaticRoute {
+                vrf: "default".into(),
+                prefix: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)),
+                len: 24,
+                target: RouteTarget::Next {
+                    interface: "trunk.10".into(),
+                    via: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 10, 2))),
+                },
+            }],
+            firewall: Vec::new(),
+            firewall_filtering: Default::default(),
+            icmp_errors: None,
+            nat: None,
+        };
+        let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
+        let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);
+
+        let mut confd = Confd::new(config(false));
+        assert!(confd.routes().is_empty(), "{:?}", confd.routes());
+        confd.set_config(config(true));
+        let routes = confd.routes();
+        assert!(routes.contains_key(&connected));
+        assert!(routes.contains_key(&static_route));
     }
 }
