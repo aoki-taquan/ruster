@@ -50,7 +50,6 @@ FEに書く表は「設定」と「動的な値」から計算する。
 ```
 送り手 dhcp-wan0 { 種類 dhcp-client; インターフェース wan0; }
 送り手 pppoe-wan1 { 種類 pppoe; 親 eth1; }
-送り手 wg-handshake { 種類 wireguard-keys; インターフェース wg0; }
 ```
 
 - 送り手ごとに`/run/ruster/confd/source/<名前>.sock`ができる。外のデーモンはそこへ書く。
@@ -61,7 +60,6 @@ FEに書く表は「設定」と「動的な値」から計算する。
 | dhcp-client | 指定したインターフェースのIPv4アドレス |
 | dhcpv6-client | 指定したインターフェースのIPv6アドレス、委任されたプレフィックス、DS-LiteのAFTRのアドレス、MAP-Eのルール |
 | pppoe | PPPoEのセッション（ID、相手のMAC）、IPCPで得たアドレス |
-| wireguard-keys | 指定したWireGuardのインターフェースのセッション鍵 |
 
 経路はconfdではなく`ruster-ribd`へ渡す（DHCPのdefault経路など）。
 
@@ -200,11 +198,11 @@ CLIが特別な権限や裏口を持たないので、他の道具（監視、�
 
 | 送る側 | 受ける側 | 中身 |
 |---|---|---|
-| confd | FE | インターフェース、アドレス、NAT、firewall、トンネル、受け渡しの分類、WireGuardの鍵 |
+| confd | FE | インターフェース、アドレス、NAT、firewall、トンネル、受け渡しの分類 |
 | ribd | FE | 経路 |
 | neighd | FE | 近隣 |
 | FE | neighd | 解決依頼、「使われた」印、ARP/NDのフレーム |
-| FE | confd | リンク状態、WireGuardの鍵交換が要る、表の使用量 |
+| FE | confd | リンク状態、表の使用量 |
 | confd | ribd | 静的経路、直結経路 |
 | confd | neighd | 静的な近隣、DADの依頼 |
 | neighd | confd | DADの結果 |
@@ -212,12 +210,6 @@ CLIが特別な権限や裏口を持たないので、他の道具（監視、�
 | 外のデーモン | ribd | 送り手として、経路 |
 | 外のデーモン | FE | 受け渡しのsocketで、DHCP、PPPoE、RAなどのフレーム |
 | CLI | 全部 | 設定と表示 |
-
-## WireGuardの鍵の遅れ
-
-鍵交換のデーモンからconfdを通ってFEへ届くまでは、Unix socketを二回通るだけで、
-1ミリ秒もかからない見込み。鍵は2分ほどで入れ替わり、新しい鍵は古い鍵が切れる前に作られるので、
-この経由が問題になることは無いと考える。測って確かめるのは実装のとき。
 
 ## 未決事項
 

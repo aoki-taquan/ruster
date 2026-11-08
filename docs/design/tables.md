@@ -31,7 +31,6 @@
 | NAT | `ietf-nat`（RFC 8512）の一部 + VRFの結び付け | VRFごと | confd | 設定、MAP-E計算 |
 | firewall | `ietf-access-control-list`（RFC 8519）+ `ruster-firewall` | VRFごと | confd | 設定 |
 | ルータ宛て通信の分類 | `ruster-punt` | 全体で一つ | confd | 設定 |
-| WireGuardのセッション鍵 | `ruster-wireguard` | インターフェース経由 | confd | 鍵交換のデーモン |
 | FE全体の動作 | `ruster-fe` | 全体で一つ | confd | 設定 |
 
 `ietf-nat`、`ietf-access-control-list`、`ietf-network-instance`にIANAのSIDが割り当てられているかは
@@ -52,7 +51,6 @@
 | VLAN | `ietf-if-vlan-encapsulation`の形 | 親、タグ1つまたは2つ | 標準はまだdraft（draft-ietf-netmod-sub-intf-vlan-model-18）。形を合わせ、RFCになったら置き換える |
 | PPPoE | `ruster-if-pppoe` | 親、セッションID、相手のMAC | セッションの確立は外のデーモン。FEは包むのと外すのだけ |
 | IPトンネル | `ruster-if-tunnel` | 種類（IPv4 in IPv6、IPv6 in IPv4、GRE）、下側のVRF、送信元、宛先 | DS-Liteはこれ一つで表せる |
-| WireGuard | `ruster-if-wireguard` | 下側のVRF、待ち受けポート、相手（公開鍵、接続先、許可するアドレス） | 鍵交換は外のデーモン。暗号化と復号はFE |
 | loopback | — | — | 特定のポートに属さないルータのアドレス用 |
 
 VXLANなど他のトンネルは、使う場面が出たら同じ形で足す。
@@ -151,7 +149,7 @@ FEが作る状態（読むだけ）: 追っている通信の一覧、ルール�
 
 | 項目 | 内容 |
 |---|---|
-| 分類の名前 | 例: `arp`、`nd`、`dhcpv4`、`dhcpv6`、`ra`、`pppoe-discovery`、`ppp-control`、`wireguard-handshake`、`bgp`、`ssh`、`other` |
+| 分類の名前 | 例: `arp`、`nd`、`dhcpv4`、`dhcpv6`、`ra`、`pppoe-discovery`、`ppp-control`、`bgp`、`ssh`、`other` |
 | 一致条件 | 決まった種類（ARP、ND、PPPoEなど）か、IPのプロトコルとポート |
 | 渡し先 | CEのsocketの名前 / kernel（そのVRFのTUN） / 捨てる |
 | 上限 | 毎秒のパケット数と、まとめて許す数 |
@@ -161,15 +159,6 @@ FEが作る状態（読むだけ）: 追っている通信の一覧、ルール�
 - ルータ宛てでどの分類にも当たらないものは`other`としてkernelへ渡す（firewallのinputを通った後）。
 
 FEが作る状態（読むだけ）: 分類ごとの受け渡し数と捨てた数。
-
-## WireGuardのセッション鍵（`ruster-wireguard`）
-
-- 鍵交換は外のデーモンが行い、できたセッション鍵（送信用、受信用、番号、期限）をconfdへ渡す。
-  confdがFEへ書く。
-- FEは、送ろうとしたときに有効なセッションが無ければ「鍵交換が要る」と通知する。
-  近隣の解決依頼と同じ形。
-- WireGuardの鍵は2分ほどで入れ替わる。confdを経由する分の遅れが問題になるかは、
-  問題にならない見込み（[`ce-processes.md`](ce-processes.md)）。
 
 ## FE全体の動作（`ruster-fe`）
 
@@ -190,7 +179,6 @@ FEが作る状態（読むだけ）: 分類ごとの受け渡し数と捨てた�
 | NATのセッション | `ruster-nat`の状態 |
 | firewallで追っている通信、ルールごとの一致数 | `ruster-firewall`の状態、`ietf-access-control-list`の統計 |
 | ルータ宛て通信の受け渡し数と捨てた数 | `ruster-punt`の状態 |
-| WireGuardのセッションの状態 | `ruster-wireguard`の状態 |
 | 各表の使用量と容量 | `ruster-fe`の状態 |
 
 ## 通知
@@ -201,7 +189,6 @@ FEからCEへ、Observeで届く。
 |---|---|
 | 近隣の解決依頼 | neighd |
 | リンク状態の変化 | confd、ribd、neighd |
-| WireGuardの鍵交換が要る | confd（から鍵交換のデーモンへ） |
 | 表の使用量が上限に近い | confd |
 
 ## 未決事項

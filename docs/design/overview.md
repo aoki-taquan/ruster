@@ -32,7 +32,6 @@ FEとCEの全プロセスは、同じメッセージ形式のライブラリを�
 | リンクの確立 | PPPoE（PADI/PADO、LCP、IPCP、IPv6CP） | セッションを`ruster-confd`へ渡す。フレームはFEから直接受け取る |
 | LAN向けのサービス | DHCP server、RA | フレームをFEとやり取りするだけ |
 | アプリケーション | DNS、NTP、SSH、管理API | kernelのsocketで動く。FEとは直接話さない |
-| 鍵交換 | WireGuardのハンドシェイク、IKE | 鍵を`ruster-confd`へ渡す（暗号処理そのものはFE） |
 
 外のデーモンがFEの表へ直接書くことはない。経路は`ruster-ribd`、それ以外は`ruster-confd`を通す。
 これでFEの表の書き手はrusterの三つのプロセスだけになる。
@@ -54,7 +53,7 @@ FEとCEの全プロセスは、同じメッセージ形式のライブラリを�
                               ▼
  外のデーモン ──────────→ ruster-confd ───────────────┐
  （DHCP client、PPPoE、        │ 静的経路、直結経路     │ インターフェース、アドレス、
-   WireGuard鍵交換など）       ▼                       │ NAT、firewall、トンネル、分類
+   など）                      ▼                       │ NAT、firewall、トンネル、分類
  ルーティングデーモン ──→ ruster-ribd ──────── FIB ──┤
                                                        ▼
                           ruster-neighd ── 近隣 ──→ ruster-fe ⇄ NIC
@@ -109,7 +108,7 @@ FEは、ルータ宛ての通信を分類し、種類ごとに上限を付けて
 | ARP、ND | `ruster-neighd` | 専用のUnix datagram socket |
 | DHCP、DHCPv6、RS/RA、PPPoEのDiscoveryとセッションの制御 | 担当の外のデーモン | 専用のUnix datagram socket |
 | それ以外のTCP/UDP、ICMPのEcho | kernel | TUN |
-| トンネルの中身（MAP-E、DS-Lite、WireGuard） | 渡さない | FEがトンネルを外して転送する |
+| トンネルの中身（MAP-E、DS-Lite） | 渡さない | FEがトンネルを外して転送する |
 
 渡し先は種類ごとの表で決める。kernelはFEの内側にいるホストの一つとして扱う。kernelから外へ出るパケットは
 TUNからFEへ戻り、ほかのホストのパケットと同じ転送の処理（NAT、トンネル、フラグメント、ICMPエラー）を通る。

@@ -101,7 +101,7 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 骨組みの上に[`tables.md`](tables.md)の表を一つずつ載せる。順番は段階2が終わった時点でownerが決める。
 候補: IPv6とND、NATとfirewallの表（今の処理を`ietf-nat`、`ietf-access-control-list`の形でつなぐ）、
-VLAN、トンネル（DS-Lite、MAP-E）、PPPoE、WireGuard、複数workerと状態の持ち主、経路の表の木。
+VLAN、トンネル（DS-Lite、MAP-E）、PPPoE、複数workerと状態の持ち主、経路の表の木。
 
 ## 気をつけること
 
