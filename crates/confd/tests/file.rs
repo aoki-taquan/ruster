@@ -449,6 +449,53 @@ vrf = "red"
 }
 
 #[test]
+fn with_nat_the_router_s_own_ipv4_leaves_from_its_inside_address() {
+    let text = r#"
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+ipv4 = "192.0.2.1/24"
+
+[[interface]]
+name = "wan"
+mac = "02:00:00:00:00:02"
+ipv4 = "198.51.100.1/24"
+
+# A link that is neither NAT's inside nor its outside (a BGP peer).
+[[interface]]
+name = "peer"
+mac = "02:00:00:00:00:03"
+ipv4 = "10.9.0.1/30"
+"#;
+    let commands = |text: &str| -> Vec<String> {
+        ruster_confd::kernel::commands(&parse(text).unwrap())
+            .iter()
+            .map(|args| args.join(" "))
+            .collect()
+    };
+    let with_nat = commands(&format!(
+        "{text}\n[nat]\ninside = \"lan\"\noutside = \"wan\"\nports = \"20000-20999\"\n"
+    ));
+    for expected in [
+        "-4 route replace 198.51.100.0/24 dev rt-default src 192.0.2.1",
+        "-4 route replace 192.0.2.0/24 dev rt-default src 192.0.2.1",
+        "-4 route replace 10.9.0.0/30 dev rt-default src 10.9.0.1",
+        "-4 route replace default dev rt-default src 192.0.2.1",
+    ] {
+        assert!(
+            with_nat.contains(&expected.to_string()),
+            "{expected}: {with_nat:#?}"
+        );
+    }
+
+    // Without NAT (a reload that removed it), the WAN prefix leaves from its own
+    // address again.
+    let without = commands(text);
+    let expected = "-4 route replace 198.51.100.0/24 dev rt-default src 198.51.100.1";
+    assert!(without.contains(&expected.to_string()), "{without:#?}");
+}
+
+#[test]
 fn a_vrf_s_kernel_table_depends_only_on_its_name() {
     use ruster_confd::kernel::table;
     assert_eq!(table("red"), table("red"));

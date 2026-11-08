@@ -89,6 +89,34 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
             })
             .and_then(|inside| inside.ipv4)
             .map(|(address, _)| address.to_string());
+        // NAT's outside prefix too: otherwise a host on the WAN's subnet (the ISP's
+        // gateway) is reached from the WAN address, which is NAT's public address, and
+        // its answers find no mapping there. Every other IPv4 prefix leaves from its
+        // own address, so that each apply decides these routes (also after NAT is
+        // removed).
+        let nat_outside = (*vrf == DEFAULT_VRF)
+            .then_some(config.nat.as_ref())
+            .flatten()
+            .and_then(|nat| {
+                config
+                    .interfaces
+                    .iter()
+                    .find(|i| i.name == nat.outside && i.enabled)
+            })
+            .and_then(|outside| outside.ipv4)
+            .map(|(address, _)| IpAddr::V4(address));
+        for (address, len) in addresses {
+            if address.is_ipv4() {
+                let prefix = format!("{}/{len}", ruster_proto::table::network(*address, *len));
+                let source = match &nat_source {
+                    Some(inside) if Some(*address) == nat_outside => inside.clone(),
+                    _ => address.to_string(),
+                };
+                run(&[
+                    "-4", "route", "replace", &prefix, "dev", &tun, "src", &source,
+                ]);
+            }
+        }
         for family in ["-4", "-6"] {
             let mut args = vec![family, "route", "replace", "default", "dev", &tun];
             if *vrf != DEFAULT_VRF {
