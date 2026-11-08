@@ -12,7 +12,9 @@
 //!   with it; Packet Too Big is needed for path MTU discovery (RFC 8201). Echo
 //!   Request and Reply are a query flow, as ICMPv4's.
 //! - RFC 6092 (Simple Security in IPv6 CPE) as the model: state for outgoing flows,
-//!   replies and related errors pass, what no rule accepts is dropped.
+//!   replies and related errors pass, what no rule accepts is dropped, except
+//!   what the filtering lets reach an inside endpoint (REC-11, REC-17, REC-33; see
+//!   [`crate::firewall`]).
 //!
 //! Deviations:
 //!

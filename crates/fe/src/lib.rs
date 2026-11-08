@@ -61,6 +61,7 @@ pub mod writers {
         sid::INTERFACE,
         sid::ADDRESS,
         sid::NAT,
+        sid::FIREWALL_POLICY,
         sid::FIREWALL_RULE,
         sid::WIREGUARD,
         sid::WIREGUARD_PEER,
@@ -868,6 +869,8 @@ impl Hook for Builder {
             &default.owner.snapshot(),
             &built.firewall,
             built.firewall_on,
+            built.firewall_filtering,
+            built.firewall_interfaces,
             self.generation,
         )?;
         let nat = built

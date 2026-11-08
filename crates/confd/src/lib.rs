@@ -103,6 +103,8 @@ pub struct Config {
     pub static_routes: Vec<StaticRoute>,
     /// The default VRF's forward firewall rules, in order.
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
+    /// How the default VRF's forward firewall filters where no rule decides.
+    pub firewall_filtering: ruster_proto::table::NatFiltering,
     /// The default VRF's NAPT.
     pub nat: Option<ruster_proto::table::Nat>,
 }
@@ -357,9 +359,47 @@ impl Confd {
         Ok(peer)
     }
 
+    /// The interfaces outside the network the firewall guards: NAT's outside and
+    /// those the default VRF's default routes leave through (RFC 6092's exterior).
+    fn firewall_outside(&self) -> Vec<String> {
+        let mut outside: Vec<String> = self
+            .config
+            .nat
+            .iter()
+            .map(|nat| nat.outside.clone())
+            .chain(
+                self.config
+                    .static_routes
+                    .iter()
+                    .filter_map(|route| match &route.target {
+                        RouteTarget::Next { interface, .. }
+                            if route.vrf == ruster_proto::table::DEFAULT_VRF && route.len == 0 =>
+                        {
+                            Some(interface.clone())
+                        }
+                        _ => None,
+                    }),
+            )
+            .collect();
+        outside.sort();
+        outside.dedup();
+        outside
+    }
+
     /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
+        if !self.config.firewall.is_empty() {
+            out.insert(
+                Key::FirewallPolicy {
+                    vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
+                },
+                Value::FirewallPolicy {
+                    filtering: self.config.firewall_filtering,
+                    outside: self.firewall_outside(),
+                },
+            );
+        }
         for (id, rule) in (1..).zip(&self.config.firewall) {
             out.insert(
                 Key::FirewallRule {

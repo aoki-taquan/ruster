@@ -69,6 +69,13 @@
 //! prefix = "10.0.0.0/8"
 //! action = "discard"           # silently; "reject": with a Destination Unreachable
 //!
+//! firewall-filtering = "endpoint-independent"  # optional, at the top: who outside
+//!                              # may reach an inside host's UDP or TCP port that has a
+//!                              # flow out, where no rule decides; the default, or
+//!                              # "address-dependent", "address-and-port-dependent".
+//!                              # Outside are NAT's outside and the interfaces of the
+//!                              # default routes; inside, the other interfaces
+//!
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
 //! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
@@ -192,6 +199,8 @@ struct File {
     route: Vec<RouteEntry>,
     #[serde(default)]
     firewall: Vec<FirewallEntry>,
+    #[serde(rename = "firewall-filtering")]
+    firewall_filtering: Option<String>,
     nat: Option<NatEntry>,
     #[serde(rename = "map-e")]
     map_e: Option<MapEEntry>,
@@ -836,6 +845,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ));
         }
     }
+    let firewall_filtering = filtering("firewall-filtering", file.firewall_filtering.as_deref())?;
     let firewall = file
         .firewall
         .into_iter()
@@ -942,12 +952,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
         wireguard: wireguard_interfaces,
         static_routes,
         firewall,
+        firewall_filtering,
         nat,
     })
 }
 
-/// The tunnel interface and NAT of a MAP-E CE (RFC 7597 sections 5.2 and 6).
-/// The MAP-E CE's tunnel interface, its NAT, and the delegated prefix.
+/// The MAP-E CE's tunnel interface, its NAT, and the delegated prefix (RFC 7597
+/// sections 5.2 and 6).
 fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Addr, u8)), String> {
     let at = "map-e";
     let v6 = |text: &str, what: &str| match prefix(text) {

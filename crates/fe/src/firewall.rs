@@ -33,12 +33,19 @@ impl Publication {
         snapshot: &ForwardingSnapshot<'_>,
         rules: &[FirewallRule],
         on: bool,
+        filtering: ruster_core::FirewallFiltering,
+        (inside, outside): (
+            ruster_core::FirewallInterfaceSet,
+            ruster_core::FirewallInterfaceSet,
+        ),
         generation: u64,
     ) -> Result<Self, String> {
         let owner = ValidatedFirewallOwner::new(
             snapshot,
             rules.into(),
-            FirewallPolicy::default(),
+            FirewallPolicy::default()
+                .with_filtering(filtering)
+                .with_interfaces(inside, outside),
             generation,
             hash_key(),
         )
@@ -67,7 +74,11 @@ impl Firewall {
             if next.rules {
                 let states =
                     Box::leak(vec![FirewallStateSlot::default(); STATES].into_boxed_slice());
-                let runtime = FirewallRuntime::new(next.owner.config(), states);
+                let endpoints = Box::leak(
+                    vec![ruster_core::FirewallEndpointSlot::default(); STATES].into_boxed_slice(),
+                );
+                let runtime =
+                    FirewallRuntime::new(next.owner.config(), states).with_endpoints(endpoints);
                 *firewall = Some(Self {
                     current: next,
                     runtime,

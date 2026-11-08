@@ -975,3 +975,19 @@ fn an_ipv6_interface_needs_an_mtu_of_1280() {
     assert!(parse(&iface(1_280)).is_ok());
     assert!(error(&iface(1_279)).contains("at least 1280"));
 }
+
+#[test]
+fn the_firewall_filtering_is_endpoint_independent_unless_set() {
+    use ruster_proto::table::NatFiltering;
+    let rule = "[[firewall]]\naction = \"accept\"\nprotocol = \"udp\"\ningress = \"lan\"\n";
+    let config = parse(&format!("{LAN}{rule}")).unwrap();
+    assert_eq!(config.firewall_filtering, NatFiltering::EndpointIndependent);
+    let config = parse(&format!(
+        "firewall-filtering = \"address-dependent\"\n{LAN}{rule}"
+    ))
+    .unwrap();
+    assert_eq!(config.firewall_filtering, NatFiltering::AddressDependent);
+    assert!(
+        error(&format!("firewall-filtering = \"none\"\n{LAN}{rule}")).contains("filtering must be")
+    );
+}

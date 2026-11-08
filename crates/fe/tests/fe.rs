@@ -2909,3 +2909,293 @@ fn by_default_nat_lets_any_outside_endpoint_reach_a_mapping() {
     assert_eq!(&tx.bytes[30..34], &[192, 0, 2, 10]);
     assert_eq!(u16::from_be_bytes([tx.bytes[36], tx.bytes[37]]), 5_000);
 }
+
+/// Where no rule decides, the firewall lets outside endpoints reach an inside
+/// host's port that has a flow out as its filtering says: by default any
+/// (RFC 6092 REC-17), or only addresses it has a flow with, or only the exact flow.
+#[test]
+fn the_firewall_filters_packets_to_an_inside_endpoint_as_configured() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let peer = [203, 0, 113, 7];
+    let other = [203, 0, 113, 99];
+    for (filtering, other_address, other_port) in [
+        (NatFiltering::EndpointIndependent, true, true),
+        (NatFiltering::AddressDependent, false, true),
+        (NatFiltering::AddressAndPortDependent, false, false),
+    ] {
+        let mut bench = Bench::new();
+        let (mut config, _routes) = configure(&mut bench);
+        let mut neighbors = bench.connect(writers::NEIGHBOR);
+        assert_eq!(
+            bench.patch(
+                &mut neighbors,
+                &[
+                    neighbor("wan", GATEWAY, GATEWAY_MAC),
+                    neighbor("lan", host, HOST_MAC),
+                ]
+            ),
+            Code::CHANGED
+        );
+        let changes = vec![
+            rule_for(1, Protocol::Udp, Some("lan"), None),
+            outside_wan(filtering),
+        ];
+        assert_eq!(bench.patch(&mut config, &changes), Code::CHANGED);
+        let out = udp_packet(host, peer, (5_000, 3_478));
+        bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+        bench.fe.step(bench.now);
+        assert!(bench.fe.io_mut().pop_tx().is_some(), "the flow out");
+
+        let mut reaches = |source: [u8; 4], port: u16, inside_port: u16| {
+            let packet = udp_packet(source, host, (port, inside_port));
+            bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+            bench.fe.step(bench.now);
+            bench.fe.io_mut().pop_tx().is_some()
+        };
+        assert!(
+            reaches(peer, 3_478, 5_000),
+            "{filtering:?}: the flow's own reply"
+        );
+        assert_eq!(
+            reaches(peer, 3_479, 5_000),
+            other_port,
+            "{filtering:?}: another port"
+        );
+        assert_eq!(
+            reaches(other, 3_478, 5_000),
+            other_address,
+            "{filtering:?}: another host"
+        );
+        assert!(
+            !reaches(peer, 3_478, 5_001),
+            "{filtering:?}: another inside port"
+        );
+    }
+}
+
+/// A rule decides before the filtering: a deny rule keeps outside endpoints out.
+/// For TCP, only a SYN may open a flow to the inside endpoint.
+#[test]
+fn a_deny_rule_wins_over_filtering_and_only_a_syn_opens_tcp() {
+    use ruster_proto::table::{FirewallAction, Protocol};
+    let host = [192, 0, 2, 10];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let mut deny = rule_for(3, Protocol::Udp, Some("wan"), None);
+    if let Change {
+        value: Some(Value::FirewallRule(rule)),
+        ..
+    } = &mut deny
+    {
+        rule.action = FirewallAction::Drop;
+    }
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("lan"), None),
+                rule_for(2, Protocol::Tcp, Some("lan"), None),
+                deny,
+                outside_wan(ruster_proto::table::NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let out = udp_packet(host, INTERNET, (5_000, 3_478));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    let syn = tcp_packet(host, INTERNET, (6_000, 443), 0x02);
+    bench.fe.io_mut().inject(IfId(0), from_lan(&syn));
+    bench.fe.step(bench.now);
+    assert_eq!(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count(), 2);
+
+    let other = [203, 0, 113, 99];
+    let mut sent = |packet: Vec<u8>| {
+        bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(
+        !sent(udp_packet(other, host, (1, 5_000))),
+        "the deny rule decides"
+    );
+    assert!(
+        !sent(tcp_packet(other, host, (1, 6_000), 0x10)),
+        "an ACK opens nothing"
+    );
+    assert!(
+        sent(tcp_packet(other, host, (1, 6_000), 0x02)),
+        "a SYN opens a flow"
+    );
+    assert!(
+        sent(tcp_packet(other, host, (1, 6_000), 0x10)),
+        "then its packets pass"
+    );
+}
+
+/// The firewall's policy: `filtering`, with "wan" outside.
+fn outside_wan(filtering: ruster_proto::table::NatFiltering) -> Change {
+    Change::set(
+        Key::FirewallPolicy {
+            vrf: "default".into(),
+        },
+        Value::FirewallPolicy {
+            filtering,
+            outside: vec!["wan".into()],
+        },
+    )
+}
+
+/// Only a flow from the inside out of the outside makes an inside endpoint: a flow
+/// an outside host opened by a rule does not let inside hosts reach it, and the
+/// router's own flows open none of its ports (RFC 6092's interior and exterior).
+#[test]
+fn filtering_opens_only_inside_endpoints_of_flows_out() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let attacker = [203, 0, 113, 66];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("wan"), Some("lan")),
+                rule_for(2, Protocol::Udp, Some("rt-default"), None),
+                outside_wan(NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    // The attacker's flow in, allowed by the rule.
+    let inbound = udp_packet(attacker, host, (9_999, 53));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&inbound));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_some(), "the rule lets it in");
+    // A LAN host from another port still cannot reach it: LAN to WAN is denied.
+    let out = udp_packet(host, attacker, (6_000, 9_999));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "no way out through it"
+    );
+
+    // The router's own flow out (from its port 123) opens nothing to others.
+    let own = udp_packet([198, 51, 100, 2], INTERNET, (123, 123));
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_some(),
+        "the router's packet left"
+    );
+    let stranger = udp_packet([203, 0, 113, 99], [198, 51, 100, 2], (5_555, 123));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&stranger));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    assert!(
+        kernel.recv(&mut buf).is_err(),
+        "a stranger does not reach it"
+    );
+}
+
+/// A flow the filtering opened stays only while the rules still let its inside
+/// endpoint send to it: removing the rule (and renumbering the others) ends it.
+#[test]
+fn a_flow_the_filtering_opened_ends_with_the_rule_that_let_its_host_out() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let other = [203, 0, 113, 99];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("lan"), None),
+                rule_for(2, Protocol::Tcp, Some("lan"), None),
+                outside_wan(NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let send = |bench: &mut Bench, port: IfId, frame: Vec<u8>| {
+        bench.fe.io_mut().inject(port, frame);
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(send(
+        &mut bench,
+        IfId(0),
+        from_lan(&udp_packet(host, INTERNET, (5_000, 53)))
+    ));
+    assert!(send(
+        &mut bench,
+        IfId(1),
+        from_wan(&udp_packet(other, host, (7, 5_000)))
+    ));
+    assert!(send(
+        &mut bench,
+        IfId(0),
+        from_lan(&udp_packet(host, other, (5_000, 7)))
+    ));
+
+    // The UDP rule goes; the TCP one becomes rule 1.
+    let removed = Change::delete(Key::FirewallRule {
+        vrf: "default".into(),
+        id: 2,
+    });
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[rule_for(1, Protocol::Tcp, Some("lan"), None), removed]
+        ),
+        Code::CHANGED
+    );
+    assert!(
+        !send(
+            &mut bench,
+            IfId(0),
+            from_lan(&udp_packet(host, other, (5_000, 7)))
+        ),
+        "no UDP out without a rule"
+    );
+}
