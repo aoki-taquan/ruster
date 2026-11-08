@@ -26,6 +26,9 @@
 //! - With the firewall on, a packet from the default VRF with no route is dropped
 //!   without a Destination Unreachable (IPv4 asks the rules whether it would pass).
 //! - ICMPv6 other than Echo and the four errors is dropped (ND is not forwarded).
+//! - A Routing header of type 0 is stepped over like the others and its packet
+//!   forwarded (RFC 6092 REC-4 asks a CE to drop it; RFC 5095 forbids only
+//!   processing it at the destination, which the router is not).
 
 use crate::firewall::{FirewallAddress, FirewallPacket, FIREWALL_ICMP_REPLY};
 use crate::{
