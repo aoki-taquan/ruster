@@ -6280,17 +6280,8 @@ fn admit_ipv4_to_kernel(
     }
     // A first fragment has the whole transport header.
     ipv4.first_fragment = flags_fragment & 0x2000 != 0;
-    if ipv4.protocol == 1 && ipv4.header_len == 20 {
-        if icmp_error_type(frame, ipv4).is_some() {
-            return admit_icmpv4_error_to_kernel(
-                frame,
-                ipv4,
-                ingress,
-                kernel,
-                runtime,
-                outer.now.0,
-            );
-        }
+    if ipv4.protocol == 1 && ipv4.header_len == 20 && icmp_error_type(frame, ipv4).is_some() {
+        return admit_icmpv4_error_to_kernel(frame, ipv4, ingress, kernel, runtime, outer.now.0);
     }
     let validated = validate_firewall_transport(frame, ipv4)?;
     let packet = firewall_packet(ingress, kernel, ipv4, validated, None);
