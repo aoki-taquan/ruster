@@ -217,6 +217,21 @@ interface = "lan"
 }
 
 #[test]
+fn ipv6_addresses_that_are_close_to_the_refused_ones_are_read() {
+    for ipv6 in [
+        "2001:db8::/127",
+        "2001:db8::/128",
+        "fe80::1/64",
+        "2001:db8::1/64",
+    ] {
+        let text = format!(
+            "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv6 = [\"{ipv6}\"]\n"
+        );
+        assert!(parse(&text).is_ok(), "{ipv6}: {:?}", parse(&text).err());
+    }
+}
+
+#[test]
 fn ipv6_mistakes_are_refused() {
     let lan6 = |ipv6: &str| {
         format!("[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv6 = [{ipv6}]\n")
@@ -228,6 +243,11 @@ fn ipv6_mistakes_are_refused() {
         (lan6("\"2001:db8::1/0\""), "1 to 128"),
         (lan6("\"ff02::1/64\""), "unicast"),
         (lan6("\"::1/128\""), "unicast"),
+        (lan6("\"::ffff:192.0.2.1/128\""), "IPv4-mapped"),
+        (lan6("\"::192.0.2.1/128\""), "IPv4-compatible"),
+        (lan6("\"fec0::1/64\""), "site-local"),
+        (lan6("\"fe80::1/10\""), "prefix length 64"),
+        (lan6("\"2001:db8::/64\""), "Subnet-Router anycast"),
         (lan6("\"2001:db8::1/064\""), "is not like"),
         (
             lan6("\"2001:db8::1/64\", \"2001:db8::2/64\""),

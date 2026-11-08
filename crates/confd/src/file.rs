@@ -125,6 +125,10 @@
 //! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
 //!   when not named.
 //! - RFC 791: the smallest MTU is 68.
+//! - RFC 4291 sections 2.5.5 and 2.6.1, RFC 3879, RFC 6164: an interface's IPv6
+//!   address is not IPv4-mapped, IPv4-compatible, site-local (fec0::/10) or its
+//!   prefix's Subnet-Router anycast address (all zero after the prefix, except on a
+//!   /127), and a link-local one is a /64.
 //! - RFC 6333 section 5 (DS-Lite B4): a `tunnel` interface sends IPv4 inside IPv6
 //!   from `local`, which must be one of the router's IPv6 addresses in the default
 //!   VRF, to the AFTR at `remote`; the outer packets are routed in the default VRF.
@@ -642,6 +646,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             if !unicast_v6(address) {
                 return Err(format!("{at}: ipv6 {text:?} must be a unicast address"));
+            }
+            if let Some(why) = unusable_interface_v6(address, len) {
+                return Err(format!("{at}: ipv6 {text:?} {why}"));
             }
             seen.address(&at, &entry.name, address.into(), len)?;
             ipv6.push((address, len));
@@ -1345,6 +1352,28 @@ fn network(address: IpAddr, len: u8) -> IpAddr {
 fn unicast_v4(address: Ipv4Addr) -> bool {
     let first = address.octets()[0];
     first != 0 && !address.is_loopback() && first < 224
+}
+
+/// Why `address/len` cannot be an interface's address, if it cannot.
+fn unusable_interface_v6(address: Ipv6Addr, len: u8) -> Option<&'static str> {
+    let bits = u128::from(address);
+    if bits >> 32 == 0xffff {
+        return Some("is an IPv4-mapped address");
+    }
+    if bits >> 32 == 0 {
+        return Some("is an IPv4-compatible address");
+    }
+    if address.segments()[0] & 0xffc0 == 0xfec0 {
+        return Some("is a site-local address (fec0::/10)");
+    }
+    if address.is_unicast_link_local() {
+        return (len != 64).then_some("is link-local and needs the prefix length 64");
+    }
+    // A /127 has no Subnet-Router anycast address; a /128 has no subnet.
+    if len < 127 && bits & (u128::MAX >> len) == 0 {
+        return Some("is the Subnet-Router anycast address of its prefix");
+    }
+    None
 }
 
 fn unicast_v6(address: Ipv6Addr) -> bool {
