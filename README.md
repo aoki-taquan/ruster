@@ -145,6 +145,7 @@ sudo scripts/netns-skeleton.sh target/debug                       # AF_XDP
 sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 sudo scripts/netns-vrf.sh target/debug       # VRF: 同じアドレスの2つのVRFと、片方だけの漏らし
 sudo scripts/netns-vlan.sh target/debug      # VLAN: 同じポートの2つのVLANとタグなしの上流
+sudo scripts/netns-firewall6.sh target/debug # IPv6のfirewall: 外へ出るTCPとping6の戻りだけが入る
 ```
 
 ## 開発
