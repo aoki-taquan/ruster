@@ -1,17 +1,15 @@
 //! Minimal TCP connection tracking for the TCP NAT44 session timers.
 //!
-//! RFC 5382 §5 divides a TCP connection into three phases and REQ-5 gives
-//! each a floor for its idle timeout: the partially open phase ("initiated
-//! by the first SYN for the connection and extends until both endpoints
-//! have sent a packet with the ACK flag set") and the closing phase ("when
-//! both endpoints have terminated their half of the connection by sending a
-//! FIN packet") use the transitory connection idle-timeout (at least 4
-//! minutes); the established phase in between uses the established
-//! connection idle-timeout (at least 2 hours 4 minutes). RFC 7857 §2
-//! (Figure 1, adapted from RFC 6146 §3.5.2.2) gives the state machine and
-//! §2.2 the RST rule: translate the RST and keep the session for 4 minutes
-//! of idleness instead of deleting it; a later non-RST packet returns the
-//! connection to its previous phase (RFC 6146 TRANS state).
+//! A TCP connection has three phases, each with a floor for its idle timeout:
+//! the partially open phase ("initiated by the first SYN for the connection
+//! and extends until both endpoints have sent a packet with the ACK flag
+//! set") and the closing phase ("when both endpoints have terminated their
+//! half of the connection by sending a FIN packet") use the transitory
+//! connection idle-timeout (at least 4 minutes); the established phase in
+//! between uses the established connection idle-timeout (at least 2 hours 4
+//! minutes). A RST is translated and keeps the session for 4 minutes of
+//! idleness instead of deleting it; a later non-RST packet returns the
+//! connection to its previous phase.
 //!
 //! The session records which flags each direction has sent: SYN, ACK, and
 //! FIN outbound (inside to outside) and inbound, whether a RST is pending,
@@ -22,22 +20,41 @@
 //! - closing: a RST is pending, or FIN has been seen (and corroborated) in
 //!   both directions;
 //! - established: ACK seen in both directions and a SYN in at least one.
-//!   This is RFC 5382 §5's wording (the partially open phase ends when
-//!   "both endpoints have sent a packet with the ACK flag set"; a connection
-//!   starts with a SYN). It is deliberately weaker than RFC 7857 Figure 1's
-//!   "Server SYN": requiring a SYN from each side let an injected RST plus a
-//!   remote SYN (answered by a challenge ACK, RFC 5961 §4) leave an
-//!   established connection on the opening timer for good;
-//! - opening: anything else. A FIN in one direction keeps the phase, as RFC
-//!   6146's V4/V6 FIN RCV states do.
+//!   This is the wording quoted above (a connection starts with a SYN). It
+//!   is deliberately weaker than the state machine's "Server SYN" (see
+//!   # Standards): requiring a SYN from each side let an injected RST plus a
+//!   remote SYN (answered by a challenge ACK) leave an established
+//!   connection on the opening timer for good;
+//! - opening: anything else. A FIN in one direction keeps the phase, as the
+//!   state machine's V4/V6 FIN RCV states do.
 //!
 //! No sequence numbers are tracked, so no segment is validated beyond the
 //! exact session 5-tuple the NAT already requires. That is why the phase
 //! never drops a session at once: a RST, genuine or injected, only moves it
 //! to the closing timer (never below the transitory idle-timeout), and any
 //! later non-RST segment restores the phase its flags describe.
+//!
+//! # Standards
+//!
+//! - RFC 5382 section 5 (REQ-5): the three phases and their idle timeouts, in
+//!   the words quoted above. The floors are checked by the TCP NAT policy.
+//! - RFC 7857 section 2 (Figure 1, adapted from RFC 6146 section 3.5.2.2):
+//!   the state machine. Section 2.2: a RST moves the session to the
+//!   transitory timeout instead of deleting it, and a later non-RST packet
+//!   moves it back (RFC 6146's TRANS state).
+//! - RFC 5961 section 4: the challenge ACK that the established rule allows
+//!   for.
+//! - RFC 1122 section 4.2.2.13: a new connection on the 5-tuple of one closed
+//!   by FIN in both directions starts over.
+//!
+//! Deviations: a connection is established once both sides sent an ACK and
+//! one sent a SYN, not on Figure 1's "Server SYN". No sequence numbers are
+//! checked, so a RST is not checked against the window. A repeated RST
+//! restarts the closing timer, which RFC 6146 does not do in TRANS. Under
+//! [`Nat44TcpInboundRst::Corroborate`], an operator choice, inbound RSTs and
+//! FINs alone do not move a session toward closing.
 
-/// RFC 5382 §5 phase of a TCP NAT session, which selects its idle timeout.
+/// Phase of a TCP NAT session, which selects its idle timeout.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum Nat44TcpSessionPhase {
     /// Partially open: ACK not yet seen in both directions. Uses the
@@ -46,8 +63,8 @@ pub enum Nat44TcpSessionPhase {
     /// Established: ACK seen in both directions after a SYN, FIN in at most
     /// one, and no RST pending. Uses the established idle timeout.
     Established,
-    /// Closing: FIN seen in both directions, or a RST was the last segment
-    /// (RFC 7857 §2.2). Uses the closing (transitory) idle timeout.
+    /// Closing: FIN seen in both directions, or a RST was the last segment.
+    /// Uses the closing (transitory) idle timeout.
     Closing,
 }
 
@@ -71,7 +88,7 @@ impl Nat44TcpSessionPhase {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum Nat44TcpInboundRst {
-    /// RFC 7857 §2.2 (the default): an inbound RST moves the session to the
+    /// The standard behavior (the default): an inbound RST moves the session to the
     /// closing timeout and an inbound FIN counts toward the closing phase,
     /// exactly like outbound ones.
     #[default]
@@ -196,19 +213,19 @@ pub(crate) struct Nat44TcpTransition {
 /// The session state after `segment` from `direction` is committed on a
 /// session in `state` (`0` for a session this segment creates).
 ///
-/// - RST: sets the reset bit and nothing else (the closing timer; RFC 7857
-///   §2.2, RFC 6146 ESTABLISHED/TRANS). Other flags on a RST segment are
+/// - RST: sets the reset bit and nothing else (the closing timer; the
+///   ESTABLISHED to TRANS move). Other flags on a RST segment are
 ///   ignored, so a RST never establishes or closes a connection by itself.
 ///   A repeated RST keeps the reset bit and, as every committed segment,
-///   restarts the closing timer (RFC 6146 does not refresh TRANS on a RST;
-///   REQ-5 measures idle time, so a RST is activity). Under
+///   restarts the closing timer (TRANS is not refreshed by a RST in the
+///   state machine; REQ-5 measures idle time, so a RST is activity). Under
 ///   [`Nat44TcpInboundRst::Corroborate`] an inbound RST changes nothing.
-/// - Any other segment clears the reset bit (RFC 6146 TRANS: "If a packet
+/// - Any other segment clears the reset bit (TRANS: "If a packet
 ///   other than a RST packet is received ... The state is moved to
 ///   ESTABLISHED"; here: back to the phase the flags describe, SYN
 ///   included).
 /// - On a session closed by FIN in both directions, a new connection on
-///   the same 5-tuple (reopen from TIME-WAIT, RFC 1122 §4.2.2.13) clears
+///   the same 5-tuple (reopen from TIME-WAIT) clears
 ///   the flags first, but only on evidence from the inside host: an
 ///   outbound initial SYN (the inside reconnects), or an outbound SYN-ACK
 ///   (the inside accepted a new SYN from the remote; the remote's SYN is

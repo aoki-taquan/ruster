@@ -1,34 +1,49 @@
-//! NAT44 translation of ICMP queries on the packet path (RFC 5508 §3, N5).
+//! NAT44 translation of ICMP queries on the packet path (N5).
 //!
-//! **Which messages.** Echo Request/Reply (types 8/0, RFC 5508 REQ-10 a.3,
-//! MUST) and Timestamp/Timestamp Reply (13/14, REQ-10 b, MAY) are
-//! translated. Information Request/Reply (15/16, REQ-10 c, SHOULD NOT) and
-//! Address Mask Request/Reply (17/18, REQ-10 b, MAY) are not: both were
-//! deprecated by RFC 6918. Any other non-error ICMP message crossing the NAT
-//! is dropped (REQ-11 allows dropping non-query/error messages).
+//! **Which messages.** Echo Request/Reply (types 8/0) and Timestamp/Timestamp
+//! Reply (13/14) are translated. Information Request/Reply (15/16) and
+//! Address Mask Request/Reply (17/18) are not. Any other non-error ICMP
+//! message crossing the NAT is dropped.
 //!
 //! **Direction.** Only an inside host's request creates or refreshes a
-//! mapping (REQ-1: queries initiated from the private realm). A reply from
-//! the external realm to the public address is translated back when it
-//! names a live mapping and, under address-dependent filtering, comes from a
-//! remote address the mapping has queried. A request from either realm to
-//! the public address is for the router, which owns that address: the local
-//! Echo responder answers it (an inside host pinging the public address is
-//! answered by the router, not hairpinned, because a NAPT has no inbound
-//! query session to hairpin to; RFC 5508 REQ-7 is a Basic NAT requirement
-//! and RFC 7857 §12 ties query hairpinning to external-to-internal mappings
-//! that this NAT does not create).
+//! mapping. A reply from the external realm to the public address is
+//! translated back when it names a live mapping and, under address-dependent
+//! filtering, comes from a remote address the mapping has queried. A request
+//! from either realm to the public address is for the router, which owns that
+//! address: the local Echo responder answers it. An inside host pinging the
+//! public address is therefore answered by the router, not hairpinned: a NAPT
+//! has no inbound query session to hairpin to.
 //!
 //! **Rewrite.** Outbound: IPv4 source to the public address and the
 //! identifier to the public identifier. Inbound: IPv4 destination to the
 //! internal address and the identifier back. The ICMP checksum covers the
 //! identifier but no pseudo-header, so only the identifier change updates it
-//! (RFC 1624); the IPv4 header checksum covers the TTL and the address.
+//! (incrementally); the IPv4 header checksum covers the TTL and the address.
 //!
 //! **State order.** The ICMP checksum and that the query is unfragmented
 //! (DF may be clear, unlike UDP/TCP; NAT44-116) are validated before any NAT
 //! state changes, and every commit is prevalidated
 //! before the frame is rewritten, exactly as for UDP.
+//!
+//! # Standards
+//!
+//! - RFC 5508 section 3: queries initiated from the private realm and their
+//!   replies are translated (REQ-1); Echo is supported (REQ-10 a.3) and so is
+//!   Timestamp (REQ-10 b.2, a MAY). Information Request/Reply (REQ-10 c.2, a
+//!   SHOULD NOT) and Address Mask Request/Reply (REQ-10 b.4, a MAY) are not,
+//!   as RFC 6918 deprecates both; other non-error messages are dropped
+//!   (REQ-11).
+//! - RFC 5508 REQ-7 asks for hairpinned query sessions only of Basic NAT, and
+//!   RFC 7857 section 12 ties query hairpinning to mappings made from the
+//!   outside, which this NAT does not make.
+//! - RFC 792: the Echo and Timestamp formats (8 and 20 bytes); RFC 1624: the
+//!   incremental checksum update.
+//! - RFC 1812 section 5.3.1: a reply that NAT turns back to the router's own
+//!   address is not forwarded, so its TTL is neither checked nor decreased.
+//!
+//! Deviations: a query with IPv4 options, or a fragment of one, is dropped. No
+//! Destination Unreachable code 13 is sent when a mapping cannot be made
+//! (RFC 5508 REQ-8, a SHOULD).
 
 use super::*;
 
@@ -88,7 +103,7 @@ pub(super) enum IcmpQueryError {
 }
 
 /// Validates a translated ICMP query: an Echo or Timestamp message with
-/// its full header (8 bytes; 20 for Timestamp, RFC 792), code 0, and a
+/// its full header (8 bytes; 20 for Timestamp), code 0, and a
 /// valid checksum over the whole message within the IPv4 Total Length
 /// (link padding excluded).
 pub(super) fn validate_icmp_query(
@@ -491,7 +506,7 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
         )?);
     }
     // A packet for the router is not forwarded: its TTL is neither checked nor
-    // decreased (RFC 1812 section 5.3.1).
+    // decreased.
     if kernel.is_none() && ipv4.ttl <= 1 {
         return nat44_icmp_drop(ingress, Ipv4TtlExpired, trace);
     }

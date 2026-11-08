@@ -6,6 +6,20 @@
 //! errors, other ICMP, TCP SYNs, other TCP, UDP, other) by a token bucket, so a flood
 //! of one kind, or in one VRF, does not crowd out the others or the forwarding; ARP
 //! and Neighbor Discovery to the neighbor process have their own buckets too.
+//!
+//! # Standards
+//!
+//! - RFC 6192 section 3 (Informational, an example rather than a requirement):
+//!   traffic to the router is sorted into classes before it reaches the control
+//!   side, and each class is rate limited.
+//!
+//! Deviations: the rate is the same fixed [`LOCAL_INTERVAL_US`] and
+//! [`LOCAL_BURST`] for every class and VRF and cannot be configured, where
+//! section 3.2 leaves the rates to each deployment; no class is filtered by
+//! source or port, and fragments are not dropped (section 3.1). The class is
+//! read at a fixed place: an ICMPv6 packet behind an extension header is in
+//! the other class, and an IPv4 fragment after the first is classed by the
+//! bytes where its transport header would be.
 
 use std::io;
 use std::os::unix::net::UnixDatagram;
@@ -49,10 +63,10 @@ pub(crate) enum Class {
     Nd = 5,
     /// ICMP and ICMPv6 errors (Destination Unreachable, Packet Too Big, Time
     /// Exceeded, Parameter Problem): the router's own connections need them, so a
-    /// flood of echo requests does not take their place (RFC 6192 section 3).
+    /// flood of echo requests does not take their place.
     IcmpError = 6,
     /// TCP SYNs that open a connection: a flood of them does not take the place of
-    /// established connections (BGP, SSH) (RFC 6192 section 3).
+    /// established connections (BGP, SSH).
     TcpSyn = 7,
 }
 
