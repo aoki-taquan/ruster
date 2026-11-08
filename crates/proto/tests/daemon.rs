@@ -33,6 +33,26 @@ fn a_listener_replaces_a_socket_left_by_an_earlier_run() {
 }
 
 #[test]
+fn a_listener_stops_while_another_process_holds_the_path() {
+    let dir = dir("running");
+    for name in ["confd.sock", "punt.sock"] {
+        let path = dir.join(name);
+        // Another process's lock: a separate open of the same file.
+        let other = std::fs::File::create(dir.join(format!("{name}.lock"))).unwrap();
+        other.lock().unwrap();
+        let error = match name {
+            "confd.sock" => daemon::listen(&path).map(drop).unwrap_err(),
+            _ => daemon::bind_datagram(&path).map(drop).unwrap_err(),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        drop(other);
+        drop(daemon::bind_datagram(&path).unwrap());
+        // Binding again in the same process keeps the lock it holds.
+        drop(daemon::bind_datagram(&path).unwrap());
+    }
+}
+
+#[test]
 fn a_listener_does_not_remove_a_file_that_is_not_a_socket() {
     let dir = dir("file");
     let path = dir.join("x.sock");
