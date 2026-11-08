@@ -991,3 +991,11 @@ fn the_firewall_filtering_is_endpoint_independent_unless_set() {
         error(&format!("firewall-filtering = \"none\"\n{LAN}{rule}")).contains("filtering must be")
     );
 }
+
+#[test]
+fn the_icmp_error_limits_may_be_set() {
+    let config = parse(&format!("{LAN}[icmp-errors]\nipv6-burst = 5\n")).unwrap();
+    assert_eq!(config.icmp_errors, Some((100, 5, 10)));
+    assert_eq!(parse(LAN).unwrap().icmp_errors, None);
+    assert!(error(&format!("{LAN}[icmp-errors]\nipv4-interval-ms = 0\n")).contains("intervals"));
+}

@@ -34,8 +34,7 @@
 //! Deviations: the subnet-router anycast address of a connected prefix (RFC 4291
 //! section 2.6.1) is not the router's; extension headers are stepped over only to tell whether a packet is itself an
 //! ICMPv6 error (RFC 4443 2.4(e.1)); one ICMPv6 error limiter for every source,
-//! with one for Packet Too Big and one
-//! for the others, and fixed values (RFC 4443 2.4(f) asks them configurable);
+//! with one for Packet Too Big and one for the others;
 //! Address Unreachable (RFC 4443 3.1 code 3) only for a next hop the neighbor
 //! process gave up on, none for traffic to the router; no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
@@ -245,6 +244,8 @@ struct ErrorLimiter {
     tokens: u32,
     refilled_at: u64,
     now: u64,
+    burst: u32,
+    interval_ms: u64,
 }
 
 /// Errors that may be sent at once.
@@ -254,10 +255,10 @@ pub const ERROR_INTERVAL_MS: u64 = 10;
 
 impl ErrorLimiter {
     fn take(&mut self) -> bool {
-        let earned = self.now.saturating_sub(self.refilled_at) / ERROR_INTERVAL_MS;
+        let earned = self.now.saturating_sub(self.refilled_at) / self.interval_ms;
         if earned > 0 {
             let earned = u32::try_from(earned).unwrap_or(u32::MAX);
-            self.tokens = self.tokens.saturating_add(earned).min(ERROR_BURST);
+            self.tokens = self.tokens.saturating_add(earned).min(self.burst);
             self.refilled_at = self.now;
         }
         if self.tokens == 0 {
@@ -314,11 +315,15 @@ impl ControlQueue {
                 tokens: ERROR_BURST,
                 refilled_at: 0,
                 now: 0,
+                burst: ERROR_BURST,
+                interval_ms: ERROR_INTERVAL_MS,
             },
             too_big_limiter: ErrorLimiter {
                 tokens: ERROR_BURST,
                 refilled_at: 0,
                 now: 0,
+                burst: ERROR_BURST,
+                interval_ms: ERROR_INTERVAL_MS,
             },
         }
     }
@@ -334,6 +339,17 @@ impl ControlQueue {
         };
         self.errors = vec![slot; capacity].into();
         self
+    }
+
+    /// Limits ICMPv6 errors to `burst` at once and one more every `interval_ms`
+    /// (RFC 4443 2.4(f): the parameters are configurable), for Packet Too Big and
+    /// for the other errors each. `interval_ms` is at least 1.
+    pub fn set_error_limit(&mut self, burst: u32, interval_ms: u64) {
+        for limiter in [&mut self.limiter, &mut self.too_big_limiter] {
+            limiter.burst = burst;
+            limiter.interval_ms = interval_ms.max(1);
+            limiter.tokens = limiter.tokens.min(burst);
+        }
     }
 
     /// The time the error limiter counts by; call before each batch.

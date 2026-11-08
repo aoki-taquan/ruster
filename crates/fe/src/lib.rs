@@ -62,6 +62,7 @@ pub mod writers {
         sid::ADDRESS,
         sid::NAT,
         sid::FIREWALL_POLICY,
+        sid::ICMP_ERRORS,
         sid::FIREWALL_RULE,
         sid::WIREGUARD,
         sid::WIREGUARD_PEER,
@@ -796,6 +797,17 @@ where
             // whose numbers may now be another interface's: they are dropped.
             self.fragmentation.flush();
             while self.icmpv4_errors.discard_front() {}
+            // The ICMP error rate limits, or the defaults when none are set (core's:
+            // 100 ms for IPv4; 10 at once and one every 10 ms for IPv6).
+            let (ipv4_interval, ipv6_burst, ipv6_interval) =
+                built.icmp_errors.unwrap_or((100, 10, 10));
+            if let Ok(policy) =
+                ruster_core::Icmpv4ErrorPolicy::new(u64::from(ipv4_interval), 60_000)
+            {
+                self.icmpv4_errors.set_policy(policy);
+            }
+            self.control
+                .set_error_limit(ipv6_burst, u64::from(ipv6_interval));
             // So do the tunnel packets put back together and the neighbors' "used"
             // marks.
             self.reassembled.clear();

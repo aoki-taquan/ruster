@@ -3491,3 +3491,41 @@ fn with_the_firewall_a_truncated_datagram_to_the_router_gets_no_answer() {
     let mut buf = [0_u8; 2048];
     assert!(kernel.recv(&mut buf).is_err());
 }
+
+/// The ICMP error rate limits come from the configuration (RFC 4443 2.4(f), RFC
+/// 1812 4.3.2.8): a burst of 2 lets 2 ICMPv6 errors out at once.
+#[test]
+fn the_icmp_error_limits_come_from_the_configuration() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let limits = Change::set(
+        Key::IcmpErrors {
+            vrf: "default".into(),
+        },
+        Value::IcmpErrors {
+            ipv4_interval_ms: 100,
+            ipv6_burst: 2,
+            ipv6_interval_ms: 1_000,
+        },
+    );
+    assert_eq!(bench.patch(&mut config, &[limits]), Code::CHANGED);
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "lan".into(),
+                address: ip6("2001:db8:1::10"),
+            },
+            Value::Neighbor { mac: HOST_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    for _ in 0..10 {
+        let mut expiring = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+        expiring[14 + 7] = 1;
+        bench.fe.io_mut().inject(IfId(0), expiring);
+    }
+    bench.fe.step(0);
+    assert_eq!(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count(), 2);
+}

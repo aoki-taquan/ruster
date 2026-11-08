@@ -90,6 +90,11 @@
 //! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
 //! destination-ports = "53"     # optional
 //!
+//! [icmp-errors]                # optional: the rate limits of the ICMP errors the
+//! ipv4-interval-ms = 100       # router sends: one per this per egress and kind
+//! ipv6-burst = 10              # (RFC 1812 4.3.2.8), and for ICMPv6 this many at
+//! ipv6-interval-ms = 10        # once and one more every this (RFC 4443 2.4(f))
+//!
 //! [nat]                        # NAPT of the default VRF
 //! inside = "lan"
 //! outside = "wan"              # must have an ipv4 address: the public one
@@ -202,6 +207,8 @@ struct File {
     firewall: Vec<FirewallEntry>,
     #[serde(rename = "firewall-filtering")]
     firewall_filtering: Option<String>,
+    #[serde(rename = "icmp-errors")]
+    icmp_errors: Option<IcmpErrorsEntry>,
     nat: Option<NatEntry>,
     #[serde(rename = "map-e")]
     map_e: Option<MapEEntry>,
@@ -248,6 +255,16 @@ struct MapEEntry {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+struct IcmpErrorsEntry {
+    ipv4_interval_ms: Option<u32>,
+    ipv6_burst: Option<u32>,
+    ipv6_interval_ms: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 struct NatEntry {
     inside: String,
     outside: String,
@@ -948,12 +965,29 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ));
         }
     }
+    let icmp_errors = match file.icmp_errors {
+        None => None,
+        Some(entry) => {
+            let at = "icmp-errors";
+            let ipv4 = entry.ipv4_interval_ms.unwrap_or(100);
+            let burst = entry.ipv6_burst.unwrap_or(10);
+            let ipv6 = entry.ipv6_interval_ms.unwrap_or(10);
+            if !(1..=60_000).contains(&ipv4) || !(1..=60_000).contains(&ipv6) {
+                return Err(format!("{at}: intervals must be 1 to 60000 ms"));
+            }
+            if !(1..=10_000).contains(&burst) {
+                return Err(format!("{at}: ipv6-burst must be 1 to 10000"));
+            }
+            Some((ipv4, burst, ipv6))
+        }
+    };
     Ok(Config {
         interfaces,
         wireguard: wireguard_interfaces,
         static_routes,
         firewall,
         firewall_filtering,
+        icmp_errors,
         nat,
     })
 }

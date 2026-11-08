@@ -105,6 +105,8 @@ pub struct Config {
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
     /// How the default VRF's forward firewall filters where no rule decides.
     pub firewall_filtering: ruster_proto::table::NatFiltering,
+    /// The ICMP error rate limits (IPv4 interval, IPv6 burst and interval), when set.
+    pub icmp_errors: Option<(u32, u32, u32)>,
     /// The default VRF's NAPT.
     pub nat: Option<ruster_proto::table::Nat>,
 }
@@ -389,6 +391,18 @@ impl Confd {
     /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
+        if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.config.icmp_errors {
+            out.insert(
+                Key::IcmpErrors {
+                    vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
+                },
+                Value::IcmpErrors {
+                    ipv4_interval_ms,
+                    ipv6_burst,
+                    ipv6_interval_ms,
+                },
+            );
+        }
         if !self.config.firewall.is_empty() {
             out.insert(
                 Key::FirewallPolicy {

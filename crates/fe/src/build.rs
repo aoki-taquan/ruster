@@ -61,6 +61,9 @@ pub(crate) struct Built {
     /// Whether the tables have any firewall rule. Then the firewall is on even if
     /// none of them is in `firewall`, and drops everything.
     pub(crate) firewall_on: bool,
+    /// The ICMP error rate limits (IPv4 interval, IPv6 burst and interval), when
+    /// set.
+    pub(crate) icmp_errors: Option<(u32, u32, u32)>,
     /// How the forward firewall filters where no rule decides, and between which
     /// interfaces (inside, outside).
     pub(crate) firewall_filtering: ruster_core::FirewallFiltering,
@@ -547,6 +550,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     let mut firewall_on = false;
     let mut firewall_filtering = table::NatFiltering::default();
     let mut firewall_outside: Vec<String> = Vec::new();
+    let mut icmp_errors = None;
     let mut nat_entry = None;
     for (key, value) in store.iter() {
         match (key, value) {
@@ -636,6 +640,14 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 }
                 nat_entry = Some(nat);
             }
+            (
+                Key::IcmpErrors { .. },
+                Value::IcmpErrors {
+                    ipv4_interval_ms,
+                    ipv6_burst,
+                    ipv6_interval_ms,
+                },
+            ) => icmp_errors = Some((*ipv4_interval_ms, *ipv6_burst, *ipv6_interval_ms)),
             (Key::FirewallPolicy { vrf }, Value::FirewallPolicy { filtering, outside }) => {
                 if vrf != DEFAULT_VRF {
                     return Err(format!(
@@ -744,6 +756,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         firewall_on,
         // Outside: the interfaces the configuration names. Inside: the default VRF's
         // other interfaces (the router's own kernel interfaces are neither).
+        icmp_errors,
         firewall_interfaces: {
             let outside: Vec<IfId> = firewall_outside
                 .iter()

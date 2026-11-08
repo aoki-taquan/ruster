@@ -235,6 +235,30 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors",
+        "sid": 60150,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors/ipv4-interval",
+        "sid": 60151,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors/ipv6-burst",
+        "sid": 60152,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors/ipv6-interval",
+        "sid": 60153,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-access-control-list:acls/acl/aces/ace",
         "sid": 60070,
         "status": "unstable"

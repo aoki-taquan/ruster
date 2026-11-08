@@ -8,7 +8,8 @@
 //!   none about an ICMP error, a non-initial fragment, a broadcast or multicast,
 //!   or a source that is not a host (section 4.3.2.7); the quote at most 576 bytes
 //!   in all and cut to the egress MTU (section 4.3.2.3); precedence 6 (section
-//!   4.3.2.5); a rate limit per kind and egress (section 4.3.2.8).
+//!   4.3.2.5); a rate limit per kind and egress (section 4.3.2.8), which the
+//!   operator sets ([`Icmpv4ErrorRuntime::set_policy`]).
 //!
 //! - RFC 1812 section 5.2.7.1: Destination Unreachable (Host) for a next hop the
 //!   neighbor process gave up resolving.
@@ -1030,6 +1031,12 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             && self.state_occupancy == OccupancyCounter::default()
             && self.action_high_water == HighWaterMark::default()
             && self.translated.is_pristine()
+    }
+
+    /// Uses `policy` from now on, as the operator set it. Queued errors and their
+    /// states stay; later decisions use the new intervals.
+    pub fn set_policy(&mut self, policy: Icmpv4ErrorPolicy) {
+        self.policy = policy;
     }
 
     /// Validates the generated-action queue without changing runtime state.
