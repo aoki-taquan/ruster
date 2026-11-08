@@ -39,19 +39,23 @@ fn run() -> Result<(), String> {
     loop {
         let now = clock.now_ms();
         for stream in daemon::accept(&config) {
-            neighd
-                .attach_config(stream)
-                .map_err(|error| error.to_string())?;
+            // A connection that fails to set up is dropped; confd connects again.
+            if let Err(error) = neighd.attach_config(stream) {
+                eprintln!("ruster-neighd: confd's connection: {error}");
+            }
         }
+        // A failure while connecting again is tried again at the next turn.
         if neighd.fe_closed() && retry.due(now) {
             if let Some(stream) = daemon::try_connect(&path(socket::FE_NEIGHBOR)) {
-                let punt = daemon::bind_datagram(&path(socket::NEIGHD_PUNT))
-                    .map_err(|error| format!("{}: {error}", socket::NEIGHD_PUNT))?;
-                if punt.connect(path(socket::FE_PUNT)).is_ok() {
-                    neighd
-                        .reconnect_fe(stream, punt)
-                        .map_err(|error| error.to_string())?;
-                    eprintln!("ruster-neighd: connected to the FE again");
+                match daemon::bind_datagram(&path(socket::NEIGHD_PUNT)) {
+                    Ok(punt) if punt.connect(path(socket::FE_PUNT)).is_ok() => {
+                        match neighd.reconnect_fe(stream, punt) {
+                            Ok(()) => eprintln!("ruster-neighd: connected to the FE again"),
+                            Err(error) => eprintln!("ruster-neighd: connecting to the FE: {error}"),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => eprintln!("ruster-neighd: {}: {error}", socket::NEIGHD_PUNT),
                 }
             }
         }
