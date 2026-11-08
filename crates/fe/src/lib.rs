@@ -746,8 +746,12 @@ where
             if let Err(error) = firewall::Firewall::publish(
                 &mut self.firewall,
                 publication,
-                self.vrfs[0].owner.snapshot(),
-                built.vrfs[0].owner.snapshot(),
+                // With the IPv6 tables, so that IPv6 flows whose route moved go.
+                self.vrfs[0].owner.snapshot().with_ipv6(&self.vrfs[0].ipv6),
+                built.vrfs[0]
+                    .owner
+                    .snapshot()
+                    .with_ipv6(&built.vrfs[0].ipv6),
             ) {
                 eprintln!("ruster-fe: {error}");
             }

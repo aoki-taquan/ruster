@@ -1647,12 +1647,25 @@ impl CarryRoutes<'_> {
     /// `carried_flow_never_admits_a_reverse_packet_from_a_router_address`
     /// (io-sim) pins that assumption.
     fn moved(self, slot: FirewallStateSlot) -> bool {
-        // An IPv6 flow: the IPv6 routes are not compared yet, so it is taken as
-        // moved and revoked (the safe side).
+        // An IPv6 flow moves when the IPv6 route of one of its ends leaves through
+        // another interface (a snapshot without IPv6 tables has no route).
         let (Some(responder), Some(initiator)) =
             (slot.responder_address.ipv4(), slot.initiator_address.ipv4())
         else {
-            return true;
+            return [slot.responder_address, slot.initiator_address]
+                .into_iter()
+                .any(|address| {
+                    let FirewallAddress::V6(address) = address else {
+                        return true;
+                    };
+                    let egress = |snapshot: crate::ForwardingSnapshot<'_>| {
+                        snapshot
+                            .ipv6
+                            .and_then(|fib| fib.next_hop(address))
+                            .map(|(egress, _)| egress)
+                    };
+                    egress(self.current) != egress(self.next)
+                });
         };
         [responder, initiator]
             .into_iter()
@@ -1950,10 +1963,12 @@ impl<'state> FirewallRuntime<'state> {
             || new.tcp_active_idle_ttl_ms > old.tcp_active_idle_ttl_ms;
         let live = self.carry_live_flows();
         let reevaluate = (current.rules != next.rules).then_some(next.rules);
-        let routes = (current_snapshot.routes != next_snapshot.routes).then_some(CarryRoutes {
-            current: current_snapshot,
-            next: next_snapshot,
-        });
+        let routes = (current_snapshot.routes != next_snapshot.routes
+            || current_snapshot.ipv6 != next_snapshot.ipv6)
+            .then_some(CarryRoutes {
+                current: current_snapshot,
+                next: next_snapshot,
+            });
         let per_flow = reevaluate.map_or(0, |rules| rules.len() as u64)
             + if routes.is_some() {
                 4 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT
@@ -2402,6 +2417,17 @@ impl<'state> FirewallRuntime<'state> {
         allow_reply: bool,
         now_ms: u64,
     ) -> Result<FirewallRuleId, FirewallRelatedIcmpv4Error> {
+        self.inspect_related_packet(flow.packet(), allow_reply, now_ms)
+    }
+
+    /// Whether `packet` (a quoted packet of either family) is a live flow, or with
+    /// `allow_reply` its reply: an ICMP error about it is RELATED. Read-only.
+    pub(crate) fn inspect_related_packet(
+        &self,
+        packet: FirewallPacket,
+        allow_reply: bool,
+        now_ms: u64,
+    ) -> Result<FirewallRuleId, FirewallRelatedIcmpv4Error> {
         if self
             .watermark_ms
             .is_some_and(|watermark| now_ms < watermark)
@@ -2412,7 +2438,6 @@ impl<'state> FirewallRuntime<'state> {
             return Err(FirewallRelatedIcmpv4Error::StateMiss);
         }
 
-        let packet = flow.packet();
         let capacity = self.states.len();
         let start = flow_hash(packet, self.table_generation, self.table_key) as usize % capacity;
         for distance in 0..capacity {

@@ -5,6 +5,7 @@ mod arp_policy;
 mod chacha20poly1305;
 mod checksum;
 mod firewall;
+mod firewall6;
 mod fixed_directory;
 mod forwarding;
 mod generated;

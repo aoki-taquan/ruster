@@ -497,13 +497,28 @@ pub(crate) fn decide<T: TraceSink>(
     Outcome::Transmit(egress.id)
 }
 
+/// The forward firewall, for the IPv6 packets it guards.
+pub(crate) struct FirewallService<'f, 'a, 'c, 'r, 's, 'b, 't> {
+    /// The snapshot the firewall's configuration is bound to (the default VRF's).
+    pub(crate) outer: &'f crate::ForwardingSnapshot<'a>,
+    pub(crate) config: Option<&'f crate::FirewallConfig<'c>>,
+    pub(crate) runtime: &'f mut Option<&'s mut crate::FirewallRuntime<'r>>,
+    pub(crate) audit: &'f mut Option<&'t mut crate::FirewallAuditBuffer<'b>>,
+    /// Without a firewall, whether the guarded packets are dropped anyway (the
+    /// firewall has rules but no runtime here).
+    pub(crate) blocked: bool,
+}
+
 /// Handles an IPv6 frame in the batch loop: decides it and completes its lease.
+/// A packet `guarded` says the forward firewall guards goes through `firewall`.
 /// Returns how it ended, for the batch counters.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
     mut packet: crate::PacketLease<S>,
     snapshot: &crate::ForwardingSnapshot<'_>,
     fib: &Ipv6Fib,
-    blocked: impl Fn(IfId) -> bool,
+    guarded: impl Fn(IfId) -> bool,
+    firewall: FirewallService<'_, '_, '_, '_, '_, '_, '_>,
     control: Option<&mut ControlQueue>,
     vlans: &[crate::VlanBinding],
     trace: &mut T,
@@ -511,8 +526,30 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
     let ingress = packet.ingress();
     let mut outcome = decide(packet.bytes_mut(), snapshot, fib, ingress, trace);
     if let Outcome::Transmit(egress) = outcome {
-        if blocked(egress) {
-            outcome = Outcome::Drop(crate::DropReason::Ipv6ForwardingBlocked);
+        if guarded(egress) {
+            let verdict = match firewall.config {
+                Some(config) => crate::forwarding::require_firewall_runtime(
+                    firewall.outer,
+                    config,
+                    firewall.runtime,
+                )
+                .and_then(|runtime| {
+                    crate::firewall6::check(
+                        packet.bytes_mut(),
+                        ingress,
+                        egress,
+                        config,
+                        runtime,
+                        firewall.audit,
+                        firewall.outer.now.0,
+                    )
+                }),
+                None if firewall.blocked => Err(crate::DropReason::Ipv6ForwardingBlocked),
+                None => Ok(()),
+            };
+            if let Err(reason) = verdict {
+                outcome = Outcome::Drop(reason);
+            }
         }
     }
     match outcome {
