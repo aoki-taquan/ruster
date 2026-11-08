@@ -3316,3 +3316,67 @@ fn ipv6_errors_and_multicast_frames_follow_rfc_4443() {
     let payload_len = u16::from_be_bytes([tx[0].bytes[18], tx[0].bytes[19]]);
     assert_eq!(payload_len, 8 + 48, "the quote is the 48-byte packet");
 }
+
+/// IPv6 source checks: the router's own address from outside is forged and dropped;
+/// a link-local source toward a global destination gets Destination Unreachable
+/// code 2 back on its link (RFC 4443 3.1).
+#[test]
+fn ipv6_forged_and_link_local_sources_are_refused() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let lan_link_local = Change::set(
+        Key::Address {
+            interface: "lan".into(),
+            address: ip6("fe80::5"),
+        },
+        Value::Address { prefix_len: 64 },
+    );
+    assert_eq!(bench.patch(&mut config, &[lan_link_local]), Code::CHANGED);
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "wan".into(),
+                address: ip6("fe80::1"),
+            },
+            Value::Neighbor { mac: GATEWAY_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let with_source = |source: &str| {
+        let mut frame = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+        frame[22..38].copy_from_slice(&source.parse::<std::net::Ipv6Addr>().unwrap().octets());
+        frame
+    };
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), with_source("2001:db8:1::1"));
+    bench.fe.step(0);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "the router's own address is forged"
+    );
+
+    bench.fe.io_mut().inject(IfId(0), with_source("fe80::10"));
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("Destination Unreachable");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!(
+        (tx.bytes[54], tx.bytes[55]),
+        (1, 2),
+        "beyond scope of source address"
+    );
+    assert_eq!(
+        &tx.bytes[22..38],
+        &ip6_octets("fe80::5"),
+        "from the router's link-local"
+    );
+    assert_eq!(&tx.bytes[38..54], &ip6_octets("fe80::10"));
+}
+
+fn ip6_octets(text: &str) -> [u8; 16] {
+    text.parse::<std::net::Ipv6Addr>().unwrap().octets()
+}

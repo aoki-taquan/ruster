@@ -11,7 +11,10 @@
 //! - RFC 8200 section 3: the header fields read and the Hop Limit decrement; a packet
 //!   whose Hop Limit would reach 0 is not forwarded.
 //! - RFC 4291 section 2.5.6: link-local addresses, as source or destination, are not
-//!   forwarded. Section 2.7: a multicast source is invalid.
+//!   forwarded; a link-local source toward another link gets Destination
+//!   Unreachable code 2 back on its link (RFC 4443 section 3.1). Section 2.7: a
+//!   multicast source is invalid. A packet from outside with one of the router's
+//!   addresses as its source is dropped.
 //! - RFC 4861 section 4: Router and Neighbor Solicitation and Advertisement and
 //!   Redirect (ICMPv6 types 133 to 137) addressed to the router or to a multicast
 //!   group go to the control side unchanged; neighd checks the rest of RFC 4861.
@@ -29,10 +32,7 @@
 //!   so its Hop Limit stays.
 //!
 //! Deviations: the subnet-router anycast address of a connected prefix (RFC 4291
-//! section 2.6.1) is not the router's; a packet from outside whose source is one
-//! of the router's addresses is forwarded; a link-local source toward a global
-//! destination is dropped without Destination Unreachable code 2 (RFC 4443 3.1);
-//! extension headers are stepped over only to tell whether a packet is itself an
+//! section 2.6.1) is not the router's; extension headers are stepped over only to tell whether a packet is itself an
 //! ICMPv6 error (RFC 4443 2.4(e.1)); one ICMPv6 error limiter for every source,
 //! with one for Packet Too Big and one
 //! for the others, and fixed values (RFC 4443 2.4(f) asks them configurable); no
@@ -511,8 +511,17 @@ where
     if is_link_local(destination) || is_unspecified_or_loopback(destination) {
         return Outcome::Drop(Ipv6DestinationNotForwarded);
     }
-    if is_link_local(source) || is_unspecified_or_loopback(source) {
+    if is_unspecified_or_loopback(source) {
         return Outcome::Drop(Ipv6SourceInvalid);
+    }
+    // The router's own address as the source of a packet from outside is forged.
+    if fib.is_local(source) && !snapshot.is_kernel_ingress(ingress) {
+        return Outcome::Drop(Ipv6SourceInvalid);
+    }
+    // A link-local source cannot leave its link: Destination Unreachable code 2,
+    // beyond scope of source address (RFC 4443 3.1).
+    if is_link_local(source) {
+        return Outcome::Error(Ipv6SourceInvalid, DESTINATION_UNREACHABLE, 2, 0);
     }
     let Some(route) = fib.route(destination) else {
         if silent_route_miss {
@@ -786,7 +795,19 @@ fn build_error(
     {
         return None;
     }
-    let (egress, mac, from) = if snapshot.is_kernel_ingress(ingress) {
+    let (egress, mac, from) = if is_link_local(source) && !snapshot.is_kernel_ingress(ingress) {
+        // Back on its link, to the sender's MAC, from the router's link-local address
+        // there.
+        let egress = snapshot.interface(ingress)?;
+        let mut mac = [0; 6];
+        mac.copy_from_slice(&invoking[6..12]);
+        let from = fib
+            .local
+            .iter()
+            .find(|l| l.interface == ingress && is_link_local(l.address))?
+            .address;
+        (egress, MacAddress(mac), from)
+    } else if snapshot.is_kernel_ingress(ingress) {
         // About the router's own packet: back through the kernel's interface, from
         // the packet's destination (every router address is the kernel's own).
         let mut mac = [0; 6];
