@@ -9,9 +9,11 @@ use ruster_proto::sid;
 use ruster_proto::table::{Key, Value};
 use ruster_proto::task::Task;
 
-/// Refuses any table with an interface MTU of `refuse_mtu`.
+/// Refuses any table with an interface MTU of `refuse_mtu`, or without an
+/// interface named `keep`.
 struct Check {
     refuse_mtu: Option<u16>,
+    keep: Option<&'static str>,
 }
 
 impl Hook for Check {
@@ -19,7 +21,10 @@ impl Hook for Check {
         let bad = next.iter().any(|(_, value)| {
             matches!(value, Value::Interface { mtu, .. } if Some(*mtu) == self.refuse_mtu)
         });
-        if bad {
+        let lost = self
+            .keep
+            .is_some_and(|name| next.get(&Key::Interface { name: name.into() }).is_none());
+        if bad || lost {
             Err("refused".into())
         } else {
             Ok(())
@@ -75,7 +80,10 @@ fn mtu(fe: &Server) -> Option<u16> {
 #[test]
 fn a_refused_full_send_leaves_what_the_fe_holds() {
     let mut fe = Server::new();
-    let mut check = Check { refuse_mtu: None };
+    let mut check = Check {
+        refuse_mtu: None,
+        keep: None,
+    };
     let mut confd = Confd::new(config(1500));
     let (a, b) = UnixStream::pair().unwrap();
     fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
@@ -107,6 +115,7 @@ fn a_refused_change_is_retried_with_the_next_one_and_leftovers_are_removed() {
     let mut fe = Server::new();
     let mut check = Check {
         refuse_mtu: Some(1400),
+        keep: None,
     };
     let mut confd = Confd::new(config(1500));
     let (a, b) = UnixStream::pair().unwrap();
@@ -136,6 +145,7 @@ fn what_is_accepted_after_a_refused_send_is_cleaned_up_later() {
     let mut fe = Server::new();
     let mut check = Check {
         refuse_mtu: Some(1400),
+        keep: None,
     };
     // The full send is refused; before its answer, a change adds "wan" and is accepted.
     let mut confd = Confd::new(config(1400));
@@ -175,6 +185,7 @@ fn a_refused_older_change_does_not_lose_the_newer_one() {
     let mut fe = Server::new();
     let mut check = Check {
         refuse_mtu: Some(1400),
+        keep: None,
     };
     let mut confd = Confd::new(config(1500));
     let (a, b) = UnixStream::pair().unwrap();
@@ -204,4 +215,44 @@ fn a_refused_older_change_does_not_lose_the_newer_one() {
     );
     assert!(fe.store().get(&address(1)).is_none());
     assert!(confd.settled());
+}
+
+#[test]
+fn a_refused_resync_end_is_sent_again_after_the_next_change() {
+    let mut fe = Server::new();
+    let mut check = Check {
+        refuse_mtu: None,
+        keep: None,
+    };
+    let mut two = config(1500);
+    let mut wan = two.interfaces[0].clone();
+    wan.name = "wan".into();
+    wan.mac = [2, 0, 0, 0, 0, 2];
+    wan.ipv4 = None;
+    two.interfaces.push(wan);
+    let mut confd = Confd::new(two);
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    confd.connect_fe(b).unwrap();
+    settle(&mut fe, &mut confd, &mut check);
+    let wan = Key::Interface { name: "wan".into() };
+    assert!(fe.store().get(&wan).is_some());
+
+    // confd restarts without wan, and the FE refuses to delete it.
+    check.keep = Some("wan");
+    let mut confd = Confd::new(config(1500));
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    confd.connect_fe(b).unwrap();
+    settle(&mut fe, &mut confd, &mut check);
+    assert!(fe.store().get(&wan).is_some(), "refused, so kept");
+    assert!(confd.settled());
+    // Old entries that stay are not a refusal of the configuration just applied.
+    assert!(confd.refused_since(confd.generation()).is_none());
+
+    check.keep = None;
+    confd.set_config(config(1400));
+    settle(&mut fe, &mut confd, &mut check);
+    assert_eq!(mtu(&fe), Some(1400));
+    assert_eq!(fe.store().get(&wan), None, "the resync ended");
 }
