@@ -858,8 +858,8 @@ fn accept_udp_from_lan(id: u32) -> Change {
         Value::FirewallRule(ruster_proto::table::FirewallRule {
             ingress: Some("lan".into()),
             egress: None,
-            source: (Ipv4Addr::UNSPECIFIED, 0),
-            destination: (Ipv4Addr::UNSPECIFIED, 0),
+            source: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            destination: (Ipv4Addr::UNSPECIFIED.into(), 0),
             protocol: ruster_proto::table::Protocol::Udp,
             source_ports: (0, 65_535),
             destination_ports: (0, 65_535),

@@ -66,11 +66,12 @@
 //!
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
-//! protocol = "udp"             # "tcp", "udp" or "icmp"
+//! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
 //! ingress = "lan"              # optional, any interface when left out
 //! egress = "wan"               # optional
-//! source = "192.0.2.0/24"      # optional, any address when left out
-//! destination = "0.0.0.0/0"    # optional
+//! source = "192.0.2.0/24"      # optional, any address when left out; IPv4 or IPv6
+//! destination = "0.0.0.0/0"    # optional, of the source's family
+//! # A tcp or udp rule with neither source nor destination is for IPv4 and IPv6.
 //! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
 //! destination-ports = "53"     # optional
 //!
@@ -127,12 +128,12 @@
 //! - RFC 4291 section 2.5: IPv6 interface addresses and next hops must not be
 //!   unspecified, loopback or multicast. A link-local next hop is allowed: it is on
 //!   the route's interface.
-//! - RFC 8519 (`ietf-access-control-list`): a `firewall` rule is an ACE with IPv4,
-//!   protocol, port range and interface matches, checked in order, first match wins.
-//!   Deviations: IPv4 only (while there are rules, the FE does not forward IPv6
-//!   through the default VRF); an accepted flow's replies pass too (stateful, not in
-//!   RFC 8519); what no rule accepts is dropped; one rule list for the default VRF,
-//!   not ACLs attached per interface.
+//! - RFC 8519 (`ietf-access-control-list`): a `firewall` rule is an ACE with IPv4 or
+//!   IPv6, protocol, port range and interface matches, checked in order, first match
+//!   wins. Deviations: an accepted flow's replies, and ICMP errors about it, pass too
+//!   (stateful, not in RFC 8519); what no rule accepts is dropped; one rule list for
+//!   the default VRF, not ACLs attached per interface; a rule without addresses whose
+//!   protocol has both families is two ACEs, one per family.
 //! - RFC 4787, RFC 5382 and RFC 5508: `nat` is NAPT for UDP, TCP and ICMP queries
 //!   with core's behaviour (endpoint-independent mapping, address-dependent
 //!   filtering); see `ruster_core`'s NAT modules for its deviations. One inside and
@@ -746,7 +747,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
         .into_iter()
         .enumerate()
         .map(|(at, entry)| firewall_rule(&format!("firewall rule {}", at + 1), entry, &seen))
-        .collect::<Result<_, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect();
     let mut nat = file
         .nat
         .map(|entry| nat(entry, &seen, &interfaces))
@@ -1038,7 +1042,9 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
     })
 }
 
-fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<FirewallRule, String> {
+/// The table rules of one `[[firewall]]` entry: one for its family, or one for each
+/// when neither its addresses nor its protocol says which (IPv4 first).
+fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Vec<FirewallRule>, String> {
     let action = match entry.action.as_str() {
         "accept" => FirewallAction::Accept,
         "drop" => FirewallAction::Drop,
@@ -1048,9 +1054,10 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Firewall
         "tcp" => Protocol::Tcp,
         "udp" => Protocol::Udp,
         "icmp" => Protocol::Icmp,
+        "icmpv6" => Protocol::Icmpv6,
         _ => {
             return Err(format!(
-                "{at}: protocol must be \"tcp\", \"udp\" or \"icmp\""
+                "{at}: protocol must be \"tcp\", \"udp\", \"icmp\" or \"icmpv6\""
             ))
         }
     };
@@ -1065,39 +1072,66 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Firewall
             Some(_) => {}
         }
     }
-    let ipv4 = |text: &Option<String>, what: &str| match text {
-        None => Ok((Ipv4Addr::UNSPECIFIED, 0)),
+    let given = |text: &Option<String>, what: &str| match text {
+        None => Ok(None),
         Some(text) => match prefix(text) {
-            Some((IpAddr::V4(address), len))
-                if network(IpAddr::V4(address), len) == IpAddr::V4(address) =>
-            {
-                Ok((address, len))
-            }
-            _ => Err(format!(
-                "{at}: {what} must be an IPv4 prefix with no host bits"
-            )),
+            Some((address, len)) if network(address, len) == address => Ok(Some((address, len))),
+            _ => Err(format!("{at}: {what} must be a prefix with no host bits")),
         },
+    };
+    let source = given(&entry.source, "source")?;
+    let destination = given(&entry.destination, "destination")?;
+    // The family: the addresses', else the protocol's, else both.
+    let families: Vec<bool> = match (source, destination, protocol) {
+        (Some((a, _)), Some((b, _)), _) if a.is_ipv6() != b.is_ipv6() => {
+            return Err(format!(
+                "{at}: source and destination must be of one family"
+            ))
+        }
+        (Some((a, _)), _, _) | (None, Some((a, _)), _) => vec![a.is_ipv6()],
+        (None, None, Protocol::Icmp) => vec![false],
+        (None, None, Protocol::Icmpv6) => vec![true],
+        (None, None, Protocol::Tcp | Protocol::Udp) => vec![false, true],
+    };
+    if (protocol == Protocol::Icmp && families == [true])
+        || (protocol == Protocol::Icmpv6 && families == [false])
+    {
+        return Err(format!(
+            "{at}: icmp is for IPv4 prefixes and icmpv6 for IPv6 ones"
+        ));
+    }
+    let any = |ipv6: bool| -> (IpAddr, u8) {
+        if ipv6 {
+            (Ipv6Addr::UNSPECIFIED.into(), 0)
+        } else {
+            (Ipv4Addr::UNSPECIFIED.into(), 0)
+        }
     };
     let ports = |text: &Option<String>, what: &str| {
         let Some(text) = text else {
             return Ok((0, u16::MAX));
         };
-        if protocol == Protocol::Icmp {
+        if matches!(protocol, Protocol::Icmp | Protocol::Icmpv6) {
             return Err(format!("{at}: {what} are for tcp and udp only"));
         }
         port_range(text)
             .ok_or_else(|| format!("{at}: {what} must be a port or a range such as 1024-65535"))
     };
-    Ok(FirewallRule {
-        source: ipv4(&entry.source, "source")?,
-        destination: ipv4(&entry.destination, "destination")?,
-        source_ports: ports(&entry.source_ports, "source-ports")?,
-        destination_ports: ports(&entry.destination_ports, "destination-ports")?,
-        ingress: entry.ingress,
-        egress: entry.egress,
-        protocol,
-        action,
-    })
+    let source_ports = ports(&entry.source_ports, "source-ports")?;
+    let destination_ports = ports(&entry.destination_ports, "destination-ports")?;
+    Ok(families
+        .into_iter()
+        .map(|ipv6| FirewallRule {
+            source: source.unwrap_or(any(ipv6)),
+            destination: destination.unwrap_or(any(ipv6)),
+            source_ports,
+            destination_ports,
+            ingress: entry.ingress.clone(),
+            egress: entry.egress.clone(),
+            protocol,
+            action,
+        })
+        .collect())
 }
 
 fn mac(text: &str) -> Option<[u8; 6]> {

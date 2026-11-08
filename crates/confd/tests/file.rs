@@ -489,7 +489,8 @@ fn firewall_rules_keep_their_order_and_default_to_any() {
     );
     let config = parse(&text).unwrap();
     use ruster_proto::table::{FirewallAction, FirewallRule, Protocol};
-    let any = (Ipv4Addr::UNSPECIFIED, 0);
+    let any: (std::net::IpAddr, u8) = (Ipv4Addr::UNSPECIFIED.into(), 0);
+    let any6: (std::net::IpAddr, u8) = (std::net::Ipv6Addr::UNSPECIFIED.into(), 0);
     assert_eq!(
         config.firewall,
         vec![
@@ -497,7 +498,7 @@ fn firewall_rules_keep_their_order_and_default_to_any() {
                 ingress: Some("lan".into()),
                 egress: None,
                 source: any,
-                destination: (Ipv4Addr::new(203, 0, 113, 0), 24),
+                destination: (Ipv4Addr::new(203, 0, 113, 0).into(), 24),
                 protocol: Protocol::Udp,
                 source_ports: (0, 65_535),
                 destination_ports: (53, 53),
@@ -513,11 +514,22 @@ fn firewall_rules_keep_their_order_and_default_to_any() {
                 destination_ports: (0, 65_535),
                 action: FirewallAction::Drop,
             },
+            // Neither addresses nor the protocol name a family: one rule each.
             FirewallRule {
                 ingress: None,
                 egress: None,
                 source: any,
                 destination: any,
+                protocol: Protocol::Tcp,
+                source_ports: (1_024, 65_535),
+                destination_ports: (0, 65_535),
+                action: FirewallAction::Accept,
+            },
+            FirewallRule {
+                ingress: None,
+                egress: None,
+                source: any6,
+                destination: any6,
                 protocol: Protocol::Tcp,
                 source_ports: (1_024, 65_535),
                 destination_ports: (0, 65_535),
@@ -554,8 +566,16 @@ fn firewall_mistakes_are_refused() {
             "no host bits",
         ),
         (
-            rule("action = \"accept\"\nprotocol = \"udp\"\nsource = \"2001:db8::/32\"\n"),
-            "IPv4 prefix",
+            rule("action = \"accept\"\nprotocol = \"udp\"\nsource = \"2001:db8::/32\"\ndestination = \"10.0.0.0/8\"\n"),
+            "one family",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"icmp\"\nsource = \"2001:db8::/32\"\n"),
+            "icmp is for IPv4",
+        ),
+        (
+            rule("action = \"accept\"\nprotocol = \"icmpv6\"\ndestination = \"10.0.0.0/8\"\n"),
+            "icmp is for IPv4",
         ),
         (
             rule("action = \"accept\"\nprotocol = \"icmp\"\ndestination-ports = \"53\"\n"),

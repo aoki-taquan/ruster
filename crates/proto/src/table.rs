@@ -176,7 +176,10 @@ pub enum NatPorts {
 pub enum Protocol {
     Tcp,
     Udp,
+    /// ICMPv4 queries; IPv4 rules only.
     Icmp,
+    /// ICMPv6 Echo; IPv6 rules only.
+    Icmpv6,
 }
 
 /// What a firewall rule does: let the flow through and track it (its replies pass
@@ -194,8 +197,9 @@ pub struct FirewallRule {
     /// `None` for any interface.
     pub ingress: Option<String>,
     pub egress: Option<String>,
-    pub source: (std::net::Ipv4Addr, u8),
-    pub destination: (std::net::Ipv4Addr, u8),
+    /// IPv4 or IPv6, both of one family.
+    pub source: (IpAddr, u8),
+    pub destination: (IpAddr, u8),
     pub protocol: Protocol,
     pub source_ports: (u16, u16),
     pub destination_ports: (u16, u16),
@@ -469,6 +473,13 @@ impl Change {
                         }
                         for (address, len) in [rule.source, rule.destination] {
                             parse_prefix(&format!("{address}/{len}"))?;
+                        }
+                        let ipv6 = rule.source.0.is_ipv6();
+                        if rule.destination.0.is_ipv6() != ipv6
+                            || (rule.protocol == Protocol::Icmp && ipv6)
+                            || (rule.protocol == Protocol::Icmpv6 && !ipv6)
+                        {
+                            return Err(ModelError::Invalid("firewall rule families"));
                         }
                         for (first, last) in [rule.source_ports, rule.destination_ports] {
                             if first > last {
@@ -816,6 +827,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                     Protocol::Tcp => "tcp",
                     Protocol::Udp => "udp",
                     Protocol::Icmp => "icmp",
+                    Protocol::Icmpv6 => "icmpv6",
                 })
                 .u64(d(sid::FIREWALL_SOURCE_PORT_LOW))
                 .u64(u64::from(rule.source_ports.0))
@@ -1337,17 +1349,11 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
     } else {
         let ingress = text(sid::FIREWALL_INGRESS, "ingress")?;
         let egress = text(sid::FIREWALL_EGRESS, "egress")?;
-        let prefix4 = |t: Option<String>,
-                       what: &'static str|
-         -> Result<(std::net::Ipv4Addr, u8), ModelError> {
-            let t = t.ok_or(ModelError::Missing(what))?;
-            match parse_prefix(&t)? {
-                (IpAddr::V4(a), len) => Ok((a, len)),
-                _ => Err(ModelError::Invalid(what)),
-            }
+        let prefix = |t: Option<String>, what: &'static str| -> Result<(IpAddr, u8), ModelError> {
+            parse_prefix(&t.ok_or(ModelError::Missing(what))?)
         };
-        let source = prefix4(text(sid::FIREWALL_SOURCE, "source")?, "source")?;
-        let destination = prefix4(
+        let source = prefix(text(sid::FIREWALL_SOURCE, "source")?, "source")?;
+        let destination = prefix(
             text(sid::FIREWALL_DESTINATION, "destination")?,
             "destination",
         )?;
@@ -1355,6 +1361,7 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             Some("tcp") => Protocol::Tcp,
             Some("udp") => Protocol::Udp,
             Some("icmp") => Protocol::Icmp,
+            Some("icmpv6") => Protocol::Icmpv6,
             _ => return Err(ModelError::Invalid("protocol")),
         };
         let action = match text(sid::FIREWALL_ACTION, "action")?.as_deref() {
