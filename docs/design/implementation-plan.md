@@ -110,16 +110,20 @@ AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netns�
 #### 残り（この順に作る）
 
 1. RFCとの見直し（2026-11-08、#506）で出た点を直す。済んだもの: ルータのどのアドレス宛てもルータに
-   届ける、firewallで転送のICMPv4エラーを通す、ルータが作るパケットをPPPoE・トンネル・VLANから出す。
-   残りはこの順:
-   1. トンネルのMTUを下の回線で確かめる（#462）。
-   2. DS-LiteとMAP-Eの外側のIPv6のフラグメントと組み立て（RFC 6333 5.3）。
-   3. neighdの近隣を古くし、確かめ直す（RFC 4861 7.3）。ルータ宛てでないNSから学ばない。
-   4. MAP-Eの残り（#462: 外したあとの宛先、discard route、/64、unicastと重複の確認）。
-   5. #506のMediumとLow、`# Standards`の足りないモジュール。
+   届ける、firewallで転送のICMPv4エラーを通す、ルータが作るパケットをPPPoE・トンネル・VLANから出す、
+   トンネルのMTUを下の回線で確かめる、トンネルの外側のIPv6のフラグメントを組み立てる。残りはこの順:
+   1. neighdの近隣を古くし、確かめ直す（RFC 4861 7.3）。ルータ宛てでないNSから学ばない。
+   2. MAP-Eの残り（#462: 外したあとの宛先、discard route、/64、unicastと重複の確認）。
+   3. NATとfirewallの戻りの絞り方を、既定はRFCの勧めどおりにし、設定で選べるようにする
+      （2026-11-08 owner決定）。
+   4. #506のMediumとLow、`# Standards`の足りないモジュール。
 2. 形の違う構成での試験。機能を一つずつ試す今のnetnsの試験に加えて、機能を組み合わせた構成
    （VLANの上のNATとfirewall、PPPoEの上のMAP-E、VRFごとのNATなど）を、AF_XDPとAF_PACKETの両方で試す。
    今のnetnsの試験8本は、どれもAF_XDPとAF_PACKETの両方で通る。
+
+今は作らないもの（2026-11-08 owner決定）: PPPoEの制御（Discovery、LCP、認証、IPCP。セッションは
+外で張られている前提）、マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
+外れている点として、それぞれのモジュールの`# Standards`に書く。
 
 ## 気をつけること
 
