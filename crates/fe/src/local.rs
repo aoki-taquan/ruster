@@ -2,8 +2,8 @@
 //! kernel's packets sent back out.
 //!
 //! A pipe carries one IP packet per message, as a TUN device without packet
-//! information does. Packets to the kernel are limited per class (ICMP, TCP, UDP,
-//! other) by a token bucket, so a flood of one kind does not crowd out the others or
+//! information does. Packets to the kernel are limited per class (ICMP errors,
+//! other ICMP, TCP, UDP, other) by a token bucket, so a flood of one kind does not crowd out the others or
 //! the forwarding; ARP and Neighbor Discovery to the neighbor process have their own
 //! buckets too.
 
@@ -47,16 +47,23 @@ pub(crate) enum Class {
     Arp = 4,
     /// Neighbor Discovery to the neighbor process.
     Nd = 5,
+    /// ICMP and ICMPv6 errors (Destination Unreachable, Packet Too Big, Time
+    /// Exceeded, Parameter Problem): the router's own connections need them, so a
+    /// flood of echo requests does not take their place (RFC 6192 section 3).
+    IcmpError = 6,
 }
 
 /// The class of an IP packet (`packet` starts at the IP header).
 pub(crate) fn class(packet: &[u8]) -> Class {
-    let protocol = match packet.first().map(|b| b >> 4) {
-        Some(4) => packet.get(9).copied(),
-        Some(6) => packet.get(6).copied(),
-        _ => None,
+    let (protocol, header) = match packet.first().map(|b| b >> 4) {
+        Some(4) => (packet.get(9).copied(), usize::from(packet[0] & 0x0f) * 4),
+        Some(6) => (packet.get(6).copied(), 40),
+        _ => (None, 0),
     };
+    let icmp_type = packet.get(header).copied();
     match protocol {
+        Some(1) if matches!(icmp_type, Some(3 | 11 | 12)) => Class::IcmpError,
+        Some(58) if matches!(icmp_type, Some(1..=4)) => Class::IcmpError,
         Some(1 | 58) => Class::Icmp,
         Some(6) => Class::Tcp,
         Some(17) => Class::Udp,
@@ -72,15 +79,15 @@ pub const LOCAL_INTERVAL_US: u64 = 500;
 /// Token buckets, one per class.
 #[derive(Debug)]
 pub(crate) struct Limiter {
-    tokens: [u32; 6],
-    refilled_at_us: [u64; 6],
+    tokens: [u32; 7],
+    refilled_at_us: [u64; 7],
 }
 
 impl Default for Limiter {
     fn default() -> Self {
         Self {
-            tokens: [LOCAL_BURST; 6],
-            refilled_at_us: [0; 6],
+            tokens: [LOCAL_BURST; 7],
+            refilled_at_us: [0; 7],
         }
     }
 }
@@ -116,8 +123,25 @@ mod tests {
         assert!(limiter.take(Class::Tcp, 0), "TCP is not");
         assert!(limiter.take(Class::Arp, 0), "nor ARP");
         assert!(limiter.take(Class::Nd, 0), "nor ND");
+        assert!(limiter.take(Class::IcmpError, 0), "nor ICMP errors");
         assert!(limiter.take(Class::Udp, 1), "two more after a millisecond");
         assert!(limiter.take(Class::Udp, 1));
         assert!(!limiter.take(Class::Udp, 1));
+    }
+
+    #[test]
+    fn icmp_errors_are_their_own_class() {
+        let mut v4 = vec![0x45, 0, 0, 28, 0, 0, 0, 0, 64, 1];
+        v4.resize(28, 0);
+        v4[20] = 3;
+        assert_eq!(class(&v4), Class::IcmpError);
+        v4[20] = 8;
+        assert_eq!(class(&v4), Class::Icmp);
+        let mut v6 = vec![0x60, 0, 0, 0, 0, 8, 58, 64];
+        v6.resize(48, 0);
+        v6[40] = 2;
+        assert_eq!(class(&v6), Class::IcmpError);
+        v6[40] = 128;
+        assert_eq!(class(&v6), Class::Icmp);
     }
 }
