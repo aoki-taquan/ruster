@@ -218,7 +218,7 @@ fn a_refused_older_change_does_not_lose_the_newer_one() {
 }
 
 #[test]
-fn a_refused_resync_end_is_reported_and_sent_again_after_the_next_change() {
+fn a_refused_resync_end_is_sent_again_after_the_next_change() {
     let mut fe = Server::new();
     let mut check = Check {
         refuse_mtu: None,
@@ -247,10 +247,8 @@ fn a_refused_resync_end_is_reported_and_sent_again_after_the_next_change() {
     settle(&mut fe, &mut confd, &mut check);
     assert!(fe.store().get(&wan).is_some(), "refused, so kept");
     assert!(confd.settled());
-    assert!(
-        confd.refused_since(confd.generation()).is_some(),
-        "reported"
-    );
+    // Old entries that stay are not a refusal of the configuration just applied.
+    assert!(confd.refused_since(confd.generation()).is_none());
 
     check.keep = None;
     confd.set_config(config(1400));

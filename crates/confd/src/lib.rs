@@ -698,14 +698,6 @@ impl Task for Confd {
                             if generation < self.generation && !resend.contains(&kind) {
                                 resend.push(kind);
                             }
-                        } else if peer.resync_end == Some(token) {
-                            // It follows the latest patches, so it counts for the
-                            // latest configuration.
-                            self.last_refusal = Some((
-                                kind,
-                                String::from_utf8_lossy(&payload).into_owned(),
-                                self.generation,
-                            ));
                         }
                     }
                     peer.answer(token, accepted);
