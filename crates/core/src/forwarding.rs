@@ -12,6 +12,10 @@
 //! - RFC 1812 section 5.2.3: an IPv4 datagram for any of the router's addresses is
 //!   for the router, whichever interface it came in on. A NAT public address that
 //!   came in from another interface than its own is left to NAT (hairpinning).
+//! - RFC 1191 and RFC 1812 section 5.2.7: with the firewall, a forwarded ICMPv4
+//!   Destination Unreachable, Time Exceeded or Parameter Problem passes as RELATED
+//!   to the live flow it quotes, whose source must be the error's destination; it
+//!   is not judged by the rules and makes no state.
 //!
 //! Deviations: an ICMP error about the router's own datagram has the datagram's
 //! destination as its source, not a router address (RFC 1812 section 4.3.2.4),
@@ -4603,8 +4607,14 @@ fn decide_ipv4<T: TraceSink>(
         })
         || icmp_reply_to_public;
     let mut firewall_validated = None;
+    // A forwarded ICMPv4 error passes the firewall as RELATED to the flow it quotes
+    // (RFC 1191, RFC 1812 5.2.7), as IPv6's do (`firewall6`), not by the rules.
+    let related_error = firewall_config.is_some()
+        && !local
+        && !nat_inbound_candidate
+        && is_related_icmpv4_error_candidate(frame, ipv4);
     if let Some(config) = firewall_config {
-        if !local || nat_inbound_candidate {
+        if (!local || nat_inbound_candidate) && !related_error {
             let runtime = require_firewall_runtime(snapshot, config, firewall)?;
             let validated = match validate_firewall_transport(frame, ipv4) {
                 Ok(validated) => validated,
@@ -4837,6 +4847,9 @@ fn decide_ipv4<T: TraceSink>(
             // possible egress; anything else stays a silent drop so the error
             // never becomes a route oracle.
             let runtime = require_firewall_runtime(snapshot, config, firewall)?;
+            if related_error {
+                return Err(FirewallRouteUnavailable);
+            }
             if route_miss_may_hit_nat_reject(
                 snapshot,
                 ingress,
@@ -4952,44 +4965,55 @@ fn decide_ipv4<T: TraceSink>(
             }
         }
         let runtime = require_firewall_runtime(snapshot, config, firewall)?;
-        let planned = plan_firewall(
-            ingress,
-            route.egress(),
-            ipv4,
-            firewall_validated.expect("forward firewall packet was preflight validated"),
-            None,
-            config,
-            runtime,
-            firewall_audit,
-            nat_now.0,
-        );
-        match planned {
-            Ok(plan) => *firewall_plan = Some(plan),
-            Err(reason) => {
-                // RFC 1812 §5.2.7.1 Code 13 for an administrative deny,
-                // off unless `admin-prohibited = true` (ICMP-ERR). The
-                // datagram is quoted as received, before any translation.
-                if matches!(reason, FirewallRuleDenied | FirewallDefaultDenied) {
-                    if let Some((runtime, now)) = icmpv4_errors.as_mut() {
-                        let disposition = decide_icmpv4_error(
-                            frame,
-                            snapshot,
-                            ingress,
-                            ipv4,
-                            Some(route),
-                            Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
-                            0,
-                            runtime,
-                            *now,
-                            trace,
-                        );
-                        trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
-                            ingress,
-                            disposition,
-                        });
+        if related_error {
+            // The quoted packet went the other way: in from the error's egress.
+            let quoted = quoted_icmpv4_flow(frame, ipv4, route.egress(), ingress)?;
+            runtime
+                .inspect_related_packet(quoted, true, nat_now.0)
+                .map_err(|error| match error {
+                    FirewallRelatedIcmpv4Error::ClockRegression => FirewallClockRegression,
+                    _ => FirewallRelatedIcmpv4StateMiss,
+                })?;
+        } else {
+            let planned = plan_firewall(
+                ingress,
+                route.egress(),
+                ipv4,
+                firewall_validated.expect("forward firewall packet was preflight validated"),
+                None,
+                config,
+                runtime,
+                firewall_audit,
+                nat_now.0,
+            );
+            match planned {
+                Ok(plan) => *firewall_plan = Some(plan),
+                Err(reason) => {
+                    // RFC 1812 §5.2.7.1 Code 13 for an administrative deny,
+                    // off unless `admin-prohibited = true` (ICMP-ERR). The
+                    // datagram is quoted as received, before any translation.
+                    if matches!(reason, FirewallRuleDenied | FirewallDefaultDenied) {
+                        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                            let disposition = decide_icmpv4_error(
+                                frame,
+                                snapshot,
+                                ingress,
+                                ipv4,
+                                Some(route),
+                                Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+                                0,
+                                runtime,
+                                *now,
+                                trace,
+                            );
+                            trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                                ingress,
+                                disposition,
+                            });
+                        }
                     }
+                    return Err(reason);
                 }
-                return Err(reason);
             }
         }
     }
@@ -6389,6 +6413,27 @@ fn admit_icmpv4_error_to_kernel(
     runtime: &FirewallRuntime<'_>,
     now_ms: u64,
 ) -> Result<(), DropReason> {
+    // The quoted packet went the other way: from the kernel out of `ingress`.
+    let packet = quoted_icmpv4_flow(frame, ipv4, kernel, ingress)?;
+    runtime
+        .inspect_related_packet(packet, true, now_ms)
+        .map(|_| ())
+        .map_err(|error| match error {
+            FirewallRelatedIcmpv4Error::ClockRegression => FirewallClockRegression,
+            _ => FirewallRelatedIcmpv4Unsupported,
+        })
+}
+
+/// The packet an ICMPv4 error quotes, as the firewall sees it: it went from
+/// `quoted_ingress` out of `quoted_egress`, and it came from the error's
+/// destination (the quoted source must be it, so that a host cannot make an error
+/// about another host's flow).
+fn quoted_icmpv4_flow(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    quoted_ingress: IfId,
+    quoted_egress: IfId,
+) -> Result<FirewallPacket, DropReason> {
     let unrelated = FirewallRelatedIcmpv4Unsupported;
     let end = ipv4.header_offset + ipv4.total_len;
     let quoted = ipv4.header_offset + ipv4.header_len + 8;
@@ -6397,6 +6442,11 @@ fn admit_icmpv4_error_to_kernel(
         return Err(unrelated);
     }
     let inner_header = usize::from(inner[0] & 0x0f) * 4;
+    // A whole datagram or a first fragment: a later one has no ports to match.
+    let quoted_offset = u16::from_be_bytes([inner[6], inner[7]]) & 0x1fff;
+    if inner_header < 20 || quoted_offset != 0 {
+        return Err(unrelated);
+    }
     let source = crate::Ipv4Address::from_octets([inner[12], inner[13], inner[14], inner[15]]);
     let destination = crate::Ipv4Address::from_octets([inner[16], inner[17], inner[18], inner[19]]);
     if source != ipv4.destination {
@@ -6422,21 +6472,26 @@ fn admit_icmpv4_error_to_kernel(
         },
         _ => return Err(unrelated),
     };
-    // The quoted packet went the other way: from the kernel out of `ingress`.
-    let packet = FirewallPacket {
-        ingress: kernel,
-        egress: ingress,
+    Ok(FirewallPacket {
+        ingress: quoted_ingress,
+        egress: quoted_egress,
         source: source.into(),
         destination: destination.into(),
         protocol,
         source_port,
         destination_port,
         tcp_flags,
-    };
-    runtime
-        .inspect_related_packet(packet, true, now_ms)
-        .map(|_| ())
-        .map_err(|_| unrelated)
+    })
+}
+
+/// Whether `ipv4` is a whole ICMPv4 error the firewall passes as RELATED to the
+/// flow it quotes (Destination Unreachable, Time Exceeded, Parameter Problem),
+/// instead of judging it by the rules as a packet of its own.
+fn is_related_icmpv4_error_candidate(frame: &[u8], ipv4: packet::ValidatedIpv4) -> bool {
+    ipv4.protocol == 1
+        && ipv4.header_len == 20
+        && packet::read_u16(frame, ipv4.header_offset + 6).is_some_and(|flags| flags & 0x3fff == 0)
+        && peek_icmp_type(frame, ipv4).is_some_and(|kind| matches!(kind, 3 | 11 | 12))
 }
 
 /// Whether a packet from `ingress` is on NAT's inside: from the inside interface, or

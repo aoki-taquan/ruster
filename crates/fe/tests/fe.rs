@@ -2370,3 +2370,64 @@ fn a_lan_host_reaches_the_router_s_wan_address() {
     assert_eq!(&buf[..n], &to_wan_address[..]);
     assert!(bench.fe.io_mut().pop_tx().is_none(), "not routed on");
 }
+
+/// Without NAT, a Fragmentation Needed or Time Exceeded about a LAN host's flow
+/// goes through the firewall as RELATED to it (RFC 1191, RFC 1812 5.2.7), and one
+/// about no flow does not.
+#[test]
+fn the_firewall_passes_icmp_errors_about_a_forwarded_flow() {
+    use ruster_proto::table::Protocol;
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[rule_for(1, Protocol::Tcp, Some("lan"), None)]
+        ),
+        Code::CHANGED
+    );
+    let host = [192, 0, 2, 10];
+    let syn = tcp_packet(host, INTERNET, (40_000, 443), 0x02);
+    bench.fe.io_mut().inject(IfId(0), from_lan(&syn));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("the SYN left");
+    assert_eq!(tx.egress, IfId(1));
+
+    let hop = [203, 0, 113, 99];
+    let about_it = frag_needed(hop, host, &syn);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&about_it));
+    bench.fe.step(bench.now);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("the error reached the host");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[14 + 16..14 + 20], &host);
+
+    let not_a_flow = frag_needed(hop, host, &tcp_packet(host, INTERNET, (40_001, 443), 0x02));
+    let other_host = frag_needed(
+        hop,
+        host,
+        &tcp_packet([192, 0, 2, 11], INTERNET, (40_000, 443), 0x02),
+    );
+    for forged in [not_a_flow, other_host] {
+        bench.fe.io_mut().inject(IfId(1), from_wan(&forged));
+        bench.fe.step(bench.now);
+        assert!(
+            bench.fe.io_mut().pop_tx().is_none(),
+            "a forged error is dropped"
+        );
+    }
+}

@@ -1138,12 +1138,9 @@ fn hairpinned_icmp_errors_fail_closed_when_translation_is_disabled() {
             let error = hairpinned_icmp_error(code, public1);
             let state = world.state();
             world.run(LAN, error.clone());
-            let reason = if firewall {
-                DropReason::FirewallUnsupportedProtocol
-            } else {
-                DropReason::Nat44UdpUnsupportedTransport
-            };
-            assert_drop(&mut world, reason, &error);
+            // With the firewall too: an ICMP error is RELATED to a flow, not judged
+            // by the rules, and NAT refuses an untranslated one leaving outside.
+            assert_drop(&mut world, DropReason::Nat44UdpUnsupportedTransport, &error);
             assert_eq!(world.state(), state);
         }
     }

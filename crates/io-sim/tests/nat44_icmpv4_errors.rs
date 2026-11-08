@@ -764,14 +764,15 @@ fn inside_errors_of_every_supported_type_reach_the_sender_with_the_quote_reverte
                         "type {icmp_type} code {code}"
                     );
                 } else {
-                    let reason = if firewall {
+                    // The firewall passes Destination Unreachable, Time Exceeded
+                    // and Parameter Problem as RELATED, so NAT refuses those.
+                    let reason = if firewall && !matches!(icmp_type, 3 | 11 | 12) {
                         DropReason::FirewallUnsupportedProtocol
                     } else {
                         DropReason::Nat44UdpUnsupportedTransport
                     };
                     world.assert_drop(reason, &error);
-                    // The existing path is unchanged (with the firewall it
-                    // counts an invalid packet).
+                    // The existing path is unchanged.
                     continue;
                 }
                 // Read-only: no NAT or firewall slot, counter, or watermark.
@@ -1360,13 +1361,9 @@ fn inside_translation_has_per_protocol_off_switches() {
                 let mut world = World::shaped(firewall, shape);
                 let outbound = world.establish(H1, P1, tcp);
                 let (_, delivered) = world.reply(public_source_port(&outbound), tcp);
-                let reason = if firewall {
-                    DropReason::FirewallUnsupportedProtocol
-                } else {
-                    DropReason::Nat44UdpUnsupportedTransport
-                };
-                // The existing fail-closed path (with the firewall it counts
-                // an invalid packet; NAT state is untouched).
+                // The firewall passes an ICMP error as RELATED, so NAT refuses it either way.
+                let reason = DropReason::Nat44UdpUnsupportedTransport;
+                // The existing fail-closed path (NAT state is untouched).
                 let nat_before = (world.udp.mappings().to_vec(), world.udp.peers().to_vec());
                 let error = icmp_error(H1, REMOTE, 3, 3, &delivered);
                 world.run(LAN, error.clone());
