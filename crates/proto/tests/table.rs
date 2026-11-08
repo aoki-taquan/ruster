@@ -618,8 +618,8 @@ fn nat_and_firewall_entries_round_trip_and_are_checked() {
             Value::FirewallRule(FirewallRule {
                 ingress: ingress.map(Into::into),
                 egress: Some("wan".into()),
-                source: (Ipv4Addr::new(10, 0, 0, 0), 8),
-                destination: (Ipv4Addr::UNSPECIFIED, 0),
+                source: (Ipv4Addr::new(10, 0, 0, 0).into(), 8),
+                destination: (Ipv4Addr::UNSPECIFIED.into(), 0),
                 protocol: Protocol::Tcp,
                 source_ports,
                 destination_ports: (443, 443),

@@ -735,9 +735,16 @@ fn firewall_rule(
     if id == 0 {
         return Err(failed("the id must not be 0".into()));
     }
-    let prefix = |(address, len): (std::net::Ipv4Addr, u8)| {
-        FirewallIpv4Prefix::new(Ipv4Address::from_octets(address.octets()), len)
-            .map_err(|e| failed(format!("{address}/{len}: {e:?}")))
+    let prefix = |(address, len): (IpAddr, u8)| -> Result<ruster_core::FirewallPrefix, String> {
+        match address {
+            IpAddr::V4(v4) => {
+                FirewallIpv4Prefix::new(Ipv4Address::from_octets(v4.octets()), len).map(Into::into)
+            }
+            IpAddr::V6(v6) => {
+                ruster_core::FirewallIpv6Prefix::new(v6.octets(), len).map(Into::into)
+            }
+        }
+        .map_err(|e| failed(format!("{address}/{len}: {e:?}")))
     };
     let ports = |(first, last): (u16, u16)| {
         FirewallPortRange::new(first, last)
@@ -747,12 +754,13 @@ fn firewall_rule(
         FirewallRuleId(id),
         ingress,
         egress,
-        prefix(rule.source)?.into(),
-        prefix(rule.destination)?.into(),
+        prefix(rule.source)?,
+        prefix(rule.destination)?,
         match rule.protocol {
             table::Protocol::Tcp => FirewallProtocol::Tcp,
             table::Protocol::Udp => FirewallProtocol::Udp,
             table::Protocol::Icmp => FirewallProtocol::Icmp,
+            table::Protocol::Icmpv6 => FirewallProtocol::Icmpv6,
         },
         ports(rule.source_ports)?,
         ports(rule.destination_ports)?,

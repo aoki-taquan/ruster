@@ -54,7 +54,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 実際のNICや回線ではまだ試していません。
 
 `ruster-core`のARPの解決（学習、待たせ、再送、告知）は消しました。FEはARPをneighdへ渡します。coreには、ARPをneighdへ渡さない構成のための、自分のaddressへのARP要求に答える処理だけが残っています。
-default VRFの転送のfirewallは、設定ファイルの規則でFEが使います。IPv4だけで、規則があるあいだdefault VRFを通るIPv6は転送しません。
+default VRFの転送のfirewallは、設定ファイルの規則でFEが使います。IPv4とIPv6の両方で、状態を追います（IPv6の先頭でないフラグメントは落とします）。
 default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFEが使います。
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます（AF_XDPのみ）。
 MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます（AF_XDPのみ。ルータ自身のIPv4はまだMAP-Eを通りません）。
