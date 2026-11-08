@@ -4,7 +4,9 @@
 
 ## 判断
 
-- 新機能、scope、順序、milestoneはownerが決める。agentは提案までで、自分の判断で進めない。
+- 何を作るか（charterの「作るもの」）とscopeはownerが決める。その中で、何から作るかの順番は
+  agentが決め、`docs/design/implementation-plan.md`の「残り」に書く（2026-11-08 owner決定）。
+- 鍵交換のソフトのような、他のソフトや置き場所の選定は、作り始める前にownerに確認する。
 - charterの「作るもの」に無い機能は作らない。RFCに書いてある、レビューで指摘された、は
   それだけでは作業の理由にならない。
 
