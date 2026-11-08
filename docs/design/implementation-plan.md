@@ -99,9 +99,22 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 ### 段階3以降: 機能
 
-骨組みの上に[`tables.md`](tables.md)の表を一つずつ載せる。順番は段階2が終わった時点でownerが決める。
-候補: IPv6とND、NATとfirewallの表（今の処理を`ietf-nat`、`ietf-access-control-list`の形でつなぐ）、
-VLAN、トンネル（DS-Lite、MAP-E）、PPPoE、複数workerと状態の持ち主、経路の表の木。
+骨組みの上に[`tables.md`](tables.md)の表を一つずつ載せる。順番はagentが決める（AGENTS.md）。
+
+#### できたもの（2026-11-08）
+
+IPv4とIPv6の転送、VRF、VLAN（AF_XDP）、NAT44とMAP-EのNAPT、IPv4のfirewall、フラグメント、
+ICMPとICMPv6のエラー、DS-Lite、MAP-E、PPPoE、ルータ宛て通信のTUN、confd、ribd、neighd、
+AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は7本。
+
+#### 残り（この順に作る）
+
+1. IPv6のfirewall。今は規則があるあいだIPv6を転送しないので、「IPv4とIPv6の転送」と
+   「状態を持つfirewall」が両立していない。一番大きい穴なので先に作る。
+2. ルータ自身の通信をホストと同じ転送の処理に通す（#470、設計図の変更はownerの確認待ち）と、
+   その上のMAP-Eのルータ自身のIPv4（#462）。
+3. AF_PACKETでVLANのタグを戻す（#423）。
+4. 「作るもの」の全部をRFCと突き合わせる見直しと、形の違う構成での試験をそろえる（完成の条件の確認）。
 
 ## 気をつけること
 
