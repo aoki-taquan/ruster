@@ -200,6 +200,14 @@ ping_ok "$host_a" 203.0.113.10 && fail "203.0.113.10 is still reachable after th
 both_ways || fail "forwarding stopped after ruster apply"
 echo "ok: ruster apply changes the running configuration and refuses a broken file"
 
+# The kernel's TUN device is made again (deleted, then made by the next apply): the FE
+# lets go of the old one and attaches to the new one.
+nsx "$router" ip link del rt-default
+out=$(ruster apply "$work/router.toml") || fail "ruster apply after deleting rt-default: $out"
+for _ in $(seq 1 30); do ping_ok "$host_a" 192.0.2.1 && break; sleep 0.2; done
+ping_ok "$host_a" 192.0.2.1 || fail "the router's kernel is not reached through the new rt-default"
+echo "ok: a TUN device made again is attached again"
+
 # A control process that dies does not stop forwarding, and comes back by itself.
 # Counts the lines of a log that say a connection was made again.
 again() { grep -c "again" "$work/$1.log" || true; }

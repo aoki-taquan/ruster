@@ -150,7 +150,7 @@ where
     let clock = Clock::new();
     let mut last_report = 0;
     let mut reported = fe.counters();
-    let mut attached = std::collections::BTreeSet::new();
+    let mut tuns = Tuns::default();
     let mut last_tun_check = 0;
     daemon::notify("READY=1");
     loop {
@@ -176,7 +176,7 @@ where
         }
         if now.saturating_sub(last_tun_check) >= TUN_CHECK_MS {
             last_tun_check = now;
-            attach_tuns(fe, &mut attached);
+            tuns.check(fe);
         }
         let progress = fe.step(now);
         if now.saturating_sub(last_report) >= 5_000 && fe.counters() != reported {
@@ -188,32 +188,64 @@ where
     }
 }
 
-/// How often the FE looks for TUN devices of VRFs it has none for.
+/// How often the FE looks at the TUN devices of its VRFs.
 const TUN_CHECK_MS: u64 = 1_000;
 
-/// Attaches each VRF that has no kernel pipe yet to its TUN device, once confd has
-/// created it.
-fn attach_tuns<B>(fe: &mut Fe<B>, attached: &mut std::collections::BTreeSet<String>)
-where
-    B: PacketIo + GeneratedPacketIo,
-{
-    for vrf in fe.vrfs().to_vec() {
-        if attached.contains(&vrf) {
-            continue;
+/// The TUN devices the FE's VRFs are attached to.
+#[derive(Default)]
+struct Tuns {
+    /// For each attached VRF, the interface index of its device when it was opened.
+    attached: std::collections::BTreeMap<String, u32>,
+    /// The last error for each device, written once until it changes.
+    errors: std::collections::BTreeMap<String, String>,
+}
+
+impl Tuns {
+    /// Attaches each VRF to its TUN device once confd has created it, and again when
+    /// the device was made again (another index) or the VRF went away and came back.
+    fn check<B>(&mut self, fe: &mut Fe<B>)
+    where
+        B: PacketIo + GeneratedPacketIo,
+    {
+        let vrfs = fe.vrfs().to_vec();
+        let gone: Vec<String> = self
+            .attached
+            .iter()
+            .filter(|(vrf, &index)| {
+                !vrfs.contains(vrf) || tun::device(vrf).and_then(|d| tun::index(&d)) != Some(index)
+            })
+            .map(|(vrf, _)| vrf.clone())
+            .collect();
+        for vrf in gone {
+            self.attached.remove(&vrf);
+            fe.detach_local(&vrf);
+            eprintln!("ruster-fe: the TUN device of VRF {vrf:?} is gone or was made again");
         }
-        let Some(device) = tun::device(&vrf) else {
-            continue;
-        };
-        if !tun::exists(&device) {
-            continue;
-        }
-        match tun::open(&device) {
-            Ok(file) => {
-                fe.attach_local(&vrf, Box::new(file));
-                eprintln!("ruster-fe: traffic to the router in VRF {vrf:?} goes to {device}");
-                attached.insert(vrf);
+        for vrf in vrfs {
+            if self.attached.contains_key(&vrf) {
+                continue;
             }
-            Err(error) => eprintln!("ruster-fe: {device}: {error}"),
+            let Some(device) = tun::device(&vrf) else {
+                continue;
+            };
+            let Some(index) = tun::index(&device) else {
+                continue;
+            };
+            match tun::open(&device) {
+                Ok(file) => {
+                    fe.attach_local(&vrf, Box::new(file));
+                    eprintln!("ruster-fe: traffic to the router in VRF {vrf:?} goes to {device}");
+                    self.attached.insert(vrf, index);
+                    self.errors.remove(&device);
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    if self.errors.get(&device) != Some(&text) {
+                        eprintln!("ruster-fe: {device}: {text}");
+                        self.errors.insert(device, text);
+                    }
+                }
+            }
         }
     }
 }
