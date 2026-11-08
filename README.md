@@ -147,7 +147,11 @@ sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 sudo scripts/netns-vrf.sh target/debug       # VRF: 同じアドレスの2つのVRFと、片方だけの漏らし
 sudo scripts/netns-vlan.sh target/debug      # VLAN: 同じポートの2つのVLANとタグなしの上流
 sudo scripts/netns-firewall6.sh target/debug # IPv6のfirewall: 外へ出るTCPとping6の戻りだけが入る
+sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエンドで（組み合わせの構成も含む）
 ```
+
+機能を組み合わせた構成の試験は、`netns-vlan-nat.sh`（VLANの上のNATとfirewall）、`netns-pppoe-nat.sh`
+（PPPoEの上のNATとfirewall）、`netns-map-e-pppoe.sh`（PPPoEの上のMAP-E）、`netns-vrf-vlan.sh`（VLANごとのVRF）です。
 
 ## 開発
 
