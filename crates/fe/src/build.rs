@@ -45,6 +45,9 @@ pub(crate) struct Built {
     pub(crate) vlans: Vec<VlanBinding>,
     /// The enabled IPv4 in IPv6 tunnels.
     pub(crate) tunnels: Vec<Ipv4InIpv6Tunnel>,
+    /// IPv4 next hops the neighbor process could not resolve (written with an
+    /// all-zero MAC address).
+    pub(crate) unreachable: Vec<(IfId, Ipv4Address)>,
     /// The PPPoE sessions on enabled interfaces.
     pub(crate) pppoe: Vec<PppoeSession>,
     /// The WireGuard interfaces that are enabled, with their peers and sessions.
@@ -536,6 +539,8 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         .collect();
     let mut neighbors = Vec::new();
     let mut neighbors6 = Vec::new();
+    let mut unreachable = Vec::new();
+    let mut unreachable6 = Vec::new();
     let mut bindings: Vec<Vec<LocalIpv4Binding>> = vec![Vec::new(); order.len()];
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
     let mut firewall = Vec::new();
@@ -606,7 +611,13 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 let Some(&(id, _)) = active.get(interface.as_str()) else {
                     continue;
                 };
+                // An all-zero MAC address: the neighbor process gave up on it.
+                let failed = *mac == [0; 6];
                 match *address {
+                    IpAddr::V4(_) if failed => {
+                        unreachable.push((id, v4(*address).expect("IPv4")));
+                    }
+                    IpAddr::V6(a) if failed => unreachable6.push((id, a.octets())),
                     IpAddr::V4(_) => neighbors.push(Neighbor {
                         interface: id,
                         target: v4(*address).expect("IPv4"),
@@ -694,7 +705,8 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         )
         .map_err(|error| format!("{name}: {error:?}"))?;
         let ipv6 = Ipv6Fib::new(routes6, neighbors6.clone(), std::mem::take(&mut local6[at]))
-            .map_err(|error| format!("{name}: IPv6: {error:?}"))?;
+            .map_err(|error| format!("{name}: IPv6: {error:?}"))?
+            .with_unreachable(unreachable6.clone());
         vrfs.push(Vrf { owner, ipv6 });
     }
     let by_ingress = (0..interface_names.len())
@@ -724,6 +736,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         interface_names,
         vlans,
         tunnels,
+        unreachable,
         pppoe,
         wireguard,
         kernel,

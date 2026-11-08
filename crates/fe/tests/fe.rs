@@ -3380,3 +3380,30 @@ fn ipv6_forged_and_link_local_sources_are_refused() {
 fn ip6_octets(text: &str) -> [u8; 16] {
     text.parse::<std::net::Ipv6Addr>().unwrap().octets()
 }
+
+/// A next hop the neighbor process gave up on (written with an all-zero MAC): the
+/// datagram gets Host Unreachable back (RFC 1812 5.2.7.1), and no frame goes out to
+/// the all-zero address.
+#[test]
+fn an_unresolvable_next_hop_gets_host_unreachable() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, [0; 6]),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("Host Unreachable");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 1));
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+}
