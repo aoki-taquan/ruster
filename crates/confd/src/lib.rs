@@ -523,6 +523,18 @@ impl Confd {
             }
         }
         for route in &self.config.static_routes {
+            // A static route out of a disabled interface cannot be used: it is not
+            // offered, so that another source's route for the prefix is chosen.
+            if let RouteTarget::Next { interface, .. } = &route.target {
+                let enabled = self
+                    .config
+                    .interfaces
+                    .iter()
+                    .any(|i| i.name == *interface && i.enabled);
+                if !enabled {
+                    continue;
+                }
+            }
             let action = match &route.target {
                 RouteTarget::Next { interface, via } => RouteAction::Forward(vec![NextHop {
                     interface: interface.clone(),
