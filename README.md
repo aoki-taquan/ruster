@@ -138,6 +138,7 @@ confdは前の設定に戻します。新しい設定はconfdのメモリにだ�
 
 2台のホストとルータを別々のnetnsに作り、vethでつないで、IPv4とIPv6の両方向にpingが通ること、各プロセスを起動し直しても転送が戻ることを確かめます。
 rootが要るのでCIでは回していません。
+どのスクリプトも`FE_BACKEND=af-packet`を付けるとAF_PACKETで回ります。
 
 ```bash
 cargo build --workspace --locked

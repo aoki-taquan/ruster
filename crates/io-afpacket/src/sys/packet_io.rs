@@ -402,7 +402,7 @@ impl<O: PacketOps> PacketSlot for AfPacketSlot<'_, '_, O> {
     fn bytes_mut(&mut self) -> &mut [u8] {
         // SAFETY: the leased `data..data + len` was proved by `ring_address` to
         // lie in the RX extent of the live mapping and inside this packet's
-        // validated data range, which starts at `tp_mac` (82, checked by
+        // validated data range, which starts at `tp_mac` (146, checked by
         // `PacketDescriptor::validate`) after the packet's TPACKET_V3 header (68
         // bytes). `resize_front` moves the start back at most into the 14 bytes
         // between them, which belong to this packet, are no header field, and

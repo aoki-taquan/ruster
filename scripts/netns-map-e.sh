@@ -8,8 +8,9 @@
 #       -- [2001:db8:ffff:1::1 br ip6tnl 2001:db8:ffff::1 | 198.51.100.1] -- net
 #
 # Run as root, after `cargo build`:  sudo scripts/netns-map-e.sh [target/debug]
-# AF_XDP only: AF_PACKET has no room in front of a frame for the IPv6 header.
+# FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
 set -euo pipefail
+backend=${FE_BACKEND:-af-xdp}
 bin=$(realpath "${1:-target/debug}")
 
 tag=rsm$$
@@ -110,7 +111,7 @@ start() {
   ip netns exec "$router" "$bin/$name" --run-dir "$run_dir" "$@" >>"$work/$name.log" 2>&1 &
   pids+=("$!")
 }
-start ruster-fe --backend af-xdp r-lan r-wan
+start ruster-fe --backend "$backend" r-lan r-wan
 start ruster-ribd
 start ruster-neighd
 start ruster-confd --kernel "$work/router.toml"
@@ -167,4 +168,4 @@ read -r address port <<<"$seen"
 (( ((port >> 2) & 0xff) == 0x34 && (port >> 10) != 0 )) || fail "the router's port $port is not PSID 0x34's"
 echo "ok: the router's own TCP arrives from 192.0.2.18 port $port, one of PSID 0x34's"
 
-echo "PASS (af-xdp)"
+echo "PASS ($backend)"

@@ -48,9 +48,9 @@
 //! Linux builds are intentionally restricted to 64-bit targets until every
 //! supported 32-bit ABI is checked independently.
 //!
-//! The AP0 profile is deliberately narrow: `SOCK_RAW` Ethernet II, no
-//! `PACKET_RESERVE`, `TPACKET3_HDRLEN == 68`, RX `tp_mac == 82`, and
-//! `tp_net == 96`. RX alone may set retire timeout, private bytes, and
+//! The AP0 profile is deliberately narrow: `SOCK_RAW` Ethernet II,
+//! `PACKET_RESERVE` of [`TPACKET_V3_RESERVE`] (64), `TPACKET3_HDRLEN == 68`, RX
+//! `tp_mac == 146`, and `tp_net == 160`. RX alone may set retire timeout, private bytes, and
 //! `TP_FT_REQ_FILL_RXHASH`; all three corresponding TX request fields must be
 //! zero. RX block-private geometry uses the kernel's checked eight-byte
 //! `BLK_PLUS_PRIV` alignment and rejects configurations that cannot hold the
@@ -88,7 +88,8 @@ pub use config::{
     PortConfig, PortIndex, PortTable, RingGeometry, RingKind, RingLayout, ValidatedConfig,
     ValidatedPort, DEFAULT_MAX_FRAME_LEN, TPACKET_ALIGNMENT, TPACKET_BLOCK_HEADER_LEN,
     TPACKET_V3_ALIGNMENT, TPACKET_V3_ETHERNET_MAC_OFFSET, TPACKET_V3_ETHERNET_NETWORK_OFFSET,
-    TPACKET_V3_HDRLEN, TPACKET_V3_HEADER_LEN, TPACKET_V3_TX_DATA_OFFSET, TPACKET_V3_VERSION,
+    TPACKET_V3_HDRLEN, TPACKET_V3_HEADER_LEN, TPACKET_V3_RESERVE, TPACKET_V3_TX_DATA_OFFSET,
+    TPACKET_V3_VERSION,
 };
 pub use error::{
     ConfigError, Errno, GeometryError, MappingAccessError, OwnershipError, PlatformError,

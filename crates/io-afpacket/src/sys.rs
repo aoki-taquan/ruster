@@ -42,6 +42,7 @@ const PACKET_VERSION: c_int = 10;
 const PACKET_TX_RING: c_int = 13;
 const PACKET_IGNORE_OUTGOING: c_int = 23;
 const PACKET_LOSS: c_int = 14;
+const PACKET_RESERVE: c_int = 12;
 const PACKET_STATISTICS: c_int = 6;
 const SOL_SOCKET: c_int = 1;
 const SO_ERROR: c_int = 4;
@@ -233,7 +234,7 @@ pub(crate) fn validated_uapi_layout() -> Result<UapiLayout, PlatformError> {
             tpacket_request3: 28,
             sockaddr_ll: 20,
             tpacket3_hdrlen: 68,
-            ethernet_mac_offset: 82,
+            ethernet_mac_offset: 146,
         })
     {
         return Err(PlatformError::UapiLayoutMismatch);
@@ -543,6 +544,7 @@ impl<O: PacketOps> PacketRingResources<O> {
         // PACKET_LOSS must precede ring setup (the kernel refuses it with
         // EBUSY afterwards).
         socket.set_loss()?;
+        socket.set_reserve()?;
         socket.set_ring(
             PACKET_RX_RING,
             port.rx().geometry(),
@@ -1468,6 +1470,16 @@ impl<O: PacketOps> PacketSocket<O> {
             .set_socket_option(self.fd, PACKET_LOSS, &1_i32, SyscallStage::SetLoss)
     }
 
+    /// `PACKET_RESERVE`: the kernel leaves [`crate::TPACKET_V3_RESERVE`] more bytes
+    /// before each RX frame (`tp_mac` and `tp_net` move by it). The value is an
+    /// `unsigned int`, and the kernel refuses it once a ring exists.
+    fn set_reserve(&mut self) -> Result<(), PlatformError> {
+        let reserve =
+            u32::try_from(crate::TPACKET_V3_RESERVE).expect("the reserve fits an unsigned int");
+        self.ops
+            .set_socket_option(self.fd, PACKET_RESERVE, &reserve, SyscallStage::SetReserve)
+    }
+
     fn set_ring(
         &mut self,
         option: c_int,
@@ -2141,6 +2153,7 @@ mod tests {
             SyscallStage::SetVersion,
             SyscallStage::SetIgnoreOutgoing,
             SyscallStage::SetLoss,
+            SyscallStage::SetReserve,
             SyscallStage::SetRxRing,
             SyscallStage::SetTxRing,
             SyscallStage::Mmap,
@@ -2189,6 +2202,7 @@ mod tests {
                 ScriptedCall::Set(SyscallStage::SetIgnoreOutgoing),
                 // PACKET_LOSS before the rings: the kernel refuses it after.
                 ScriptedCall::Set(SyscallStage::SetLoss),
+                ScriptedCall::Set(SyscallStage::SetReserve),
                 ScriptedCall::Set(SyscallStage::SetRxRing),
                 ScriptedCall::Set(SyscallStage::SetTxRing),
                 ScriptedCall::Map(8_192),
