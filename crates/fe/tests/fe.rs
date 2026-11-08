@@ -2372,6 +2372,51 @@ fn a_lan_host_reaches_the_router_s_wan_address() {
     assert!(bench.fe.io_mut().pop_tx().is_none(), "not routed on");
 }
 
+/// With NAT, a LAN host still reaches the router's WAN address (NAT's public
+/// address) on a port outside NAT's range; with a firewall, a WAN host's packet to
+/// the router's LAN address is dropped when no rule lets it in.
+#[test]
+fn the_router_s_addresses_with_nat_and_with_a_firewall() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let mut buf = [0_u8; 2048];
+
+    let to_wan_address = udp_packet([192, 0, 2, 10], [198, 51, 100, 2], (5_000, 22));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&to_wan_address));
+    bench.fe.step(bench.now);
+    let n = kernel
+        .recv(&mut buf)
+        .expect("the LAN reaches the WAN address under NAT");
+    assert_eq!(&buf[..n], &to_wan_address[..]);
+
+    // A firewall with a rule for the LAN only.
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(1)]),
+        Code::CHANGED
+    );
+    let to_lan_address = udp_packet(INTERNET, [192, 0, 2, 1], (5_000, 22));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&to_lan_address));
+    bench.fe.step(bench.now);
+    assert!(
+        kernel.recv(&mut buf).is_err(),
+        "the LAN address is behind the firewall"
+    );
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "and nothing answers");
+}
+
 /// Without NAT, a Fragmentation Needed or Time Exceeded about a LAN host's flow
 /// goes through the firewall as RELATED to it (RFC 1191, RFC 1812 5.2.7), and one
 /// about no flow does not.
