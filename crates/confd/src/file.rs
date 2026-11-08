@@ -441,9 +441,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if !seen.names.insert(entry.name.clone()) {
             return Err(format!("{at}: given twice"));
         }
-        if entry.vrf.is_empty() {
-            return Err(format!("{at}: vrf must not be empty"));
-        }
+        vrf_name(&at, &entry.vrf)?;
         seen.vrf_of.insert(entry.name.clone(), entry.vrf.clone());
         let vlan = match (&entry.parent, entry.vlan) {
             (Some(parent), Some(id)) => {
@@ -762,9 +760,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if network(address, len) != address {
             return Err(format!("{at}: bits are set after the prefix length"));
         }
-        if entry.vrf.is_empty() {
-            return Err(format!("{at}: vrf must not be empty"));
-        }
+        vrf_name(&at, &entry.vrf)?;
         if !prefixes.insert((entry.vrf.clone(), address, len)) {
             return Err(format!("{at}: given twice in VRF {:?}", entry.vrf));
         }
@@ -1345,6 +1341,22 @@ fn prefix(text: &str) -> Option<(IpAddr, u8)> {
 
 fn network(address: IpAddr, len: u8) -> IpAddr {
     ruster_proto::table::network(address, len)
+}
+
+/// The longest VRF name: its kernel devices `vrf-<name>` and `rt-<name>` must fit
+/// Linux's 15-byte interface names.
+const VRF_NAME_MAX: usize = 11;
+
+fn vrf_name(at: &str, vrf: &str) -> Result<(), String> {
+    if vrf.is_empty() {
+        return Err(format!("{at}: vrf must not be empty"));
+    }
+    if vrf.len() > VRF_NAME_MAX || !vrf.bytes().all(|b| b.is_ascii_graphic() && b != b'/') {
+        return Err(format!(
+            "{at}: vrf {vrf:?} must be at most {VRF_NAME_MAX} letters, digits or signs other than /"
+        ));
+    }
+    Ok(())
 }
 
 /// An address a host can have: not unspecified, loopback, multicast, broadcast or

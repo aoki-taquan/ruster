@@ -364,6 +364,8 @@ fn vrf_mistakes_are_refused() {
     };
     for (text, expected) in [
         (one("vrf = \"\"\n"), "must not be empty"),
+        (one("vrf = \"twelve-bytes\"\n"), "at most 11"),
+        (one("vrf = \"a/b\"\n"), "at most 11"),
         (
             one("[[route]]\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\n"),
             "another VRF",

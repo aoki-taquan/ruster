@@ -68,6 +68,7 @@ fn run() -> Result<(), String> {
     let clock = Clock::new();
     let mut synced = false;
     let mut retry = daemon::Retry::default();
+    let mut idle = daemon::Idle::new();
     loop {
         let now = clock.now_ms();
         for (listener, name) in &listeners {
@@ -93,7 +94,7 @@ fn run() -> Result<(), String> {
             synced = true;
             eprintln!("ruster-ribd: routes sent to the FE");
         }
-        daemon::idle(progress);
+        idle.wait(progress);
     }
 }
 

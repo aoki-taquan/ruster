@@ -15,8 +15,9 @@
 //! Run it in the router's own network namespace: it replaces that namespace's
 //! default routes.
 //!
-//! Limits: link-local addresses are not put on the TUN devices; VRF names longer than
-//! 11 bytes have no kernel side; devices of a VRF that is removed stay.
+//! Limits: link-local addresses are not put on the TUN devices; devices of a VRF that
+//! is removed stay. The configuration file keeps VRF names to 11 bytes, so the device
+//! names fit.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;

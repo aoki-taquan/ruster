@@ -63,6 +63,7 @@ fn run() -> Result<(), String> {
     let mut refused = 0;
     let mut apply_seen = apply.counters();
     let mut retry = daemon::Retry::default();
+    let mut idle = daemon::Idle::new();
     loop {
         let now = clock.now_ms();
         let closed = confd.closed();
@@ -116,7 +117,7 @@ fn run() -> Result<(), String> {
             refused = confd.counters().patches_refused;
             eprintln!("ruster-confd: a process refused a change ({refused} so far)");
         }
-        daemon::idle(progress);
+        idle.wait(progress);
     }
 }
 
