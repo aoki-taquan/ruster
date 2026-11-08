@@ -1227,7 +1227,10 @@ fn firewall_requires_the_hairpin_senders_own_outbound_flow() {
     let records = audit.records();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].disposition.verdict, FirewallVerdict::Allow);
-    assert_eq!((records[1].source, records[1].destination), (H1, PUBLIC));
+    assert_eq!(
+        (records[1].source, records[1].destination),
+        (H1.into(), PUBLIC.into())
+    );
     assert_eq!(records[1].destination_port, public2);
     assert_eq!(records[1].disposition.verdict, FirewallVerdict::Drop);
     assert_eq!(
@@ -1297,8 +1300,14 @@ fn firewall_records_inside_errors_as_related_to_the_reverse_flow() {
     assert_eq!(records.len(), 1);
     let record = records[0];
     assert_eq!((record.ingress, record.egress), (WAN, LAN));
-    assert_eq!((record.source, record.source_port), (REMOTE, 53));
-    assert_eq!((record.destination, record.destination_port), (H1, P1));
+    assert_eq!(
+        (record.source.ipv4().unwrap(), record.source_port),
+        (REMOTE, 53)
+    );
+    assert_eq!(
+        (record.destination.ipv4().unwrap(), record.destination_port),
+        (H1, P1)
+    );
     assert_eq!(record.disposition.class, FirewallConnectionClass::Related);
     assert_eq!(record.disposition.verdict, FirewallVerdict::Allow);
     assert_eq!(

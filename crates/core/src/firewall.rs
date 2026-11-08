@@ -64,6 +64,31 @@ impl FirewallInterface {
     }
 }
 
+/// An address a firewall flow names: IPv4 or IPv6. One table holds the flows of
+/// both families.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FirewallAddress {
+    V4(Ipv4Address),
+    V6([u8; 16]),
+}
+
+impl From<Ipv4Address> for FirewallAddress {
+    fn from(address: Ipv4Address) -> Self {
+        Self::V4(address)
+    }
+}
+
+impl FirewallAddress {
+    /// The IPv4 address, for an IPv4 flow.
+    #[must_use]
+    pub const fn ipv4(self) -> Option<Ipv4Address> {
+        match self {
+            Self::V4(address) => Some(address),
+            Self::V6(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FirewallIpv4Prefix {
     address: Ipv4Address,
@@ -102,7 +127,11 @@ impl FirewallIpv4Prefix {
         self.prefix_len
     }
 
-    fn matches(self, address: Ipv4Address) -> bool {
+    fn matches(self, address: FirewallAddress) -> bool {
+        // An IPv4 prefix matches IPv4 addresses only.
+        let FirewallAddress::V4(address) = address else {
+            return false;
+        };
         let mask = prefix_mask(self.prefix_len).expect("prefix constructor validates length");
         u32::from_be_bytes(address.octets()) & mask == u32::from_be_bytes(self.address.octets())
     }
@@ -783,8 +812,8 @@ pub struct FirewallStateSlot {
     protocol: FirewallProtocol,
     origin_ingress: IfId,
     origin_egress: IfId,
-    initiator_address: Ipv4Address,
-    responder_address: Ipv4Address,
+    initiator_address: FirewallAddress,
+    responder_address: FirewallAddress,
     initiator_port: u16,
     responder_port: u16,
     last_activity_ms: u64,
@@ -803,8 +832,8 @@ impl Default for FirewallStateSlot {
             protocol: FirewallProtocol::Udp,
             origin_ingress: IfId(0),
             origin_egress: IfId(0),
-            initiator_address: Ipv4Address::from_octets([0; 4]),
-            responder_address: Ipv4Address::from_octets([0; 4]),
+            initiator_address: FirewallAddress::V4(Ipv4Address::from_octets([0; 4])),
+            responder_address: FirewallAddress::V4(Ipv4Address::from_octets([0; 4])),
             initiator_port: 0,
             responder_port: 0,
             last_activity_ms: 0,
@@ -857,12 +886,12 @@ impl FirewallStateSlot {
     }
 
     #[must_use]
-    pub const fn initiator_address(self) -> Ipv4Address {
+    pub const fn initiator_address(self) -> FirewallAddress {
         self.initiator_address
     }
 
     #[must_use]
-    pub const fn responder_address(self) -> Ipv4Address {
+    pub const fn responder_address(self) -> FirewallAddress {
         self.responder_address
     }
 
@@ -952,8 +981,8 @@ pub struct FirewallDisposition {
 pub struct FirewallAuditRecord {
     pub ingress: IfId,
     pub egress: IfId,
-    pub source: Ipv4Address,
-    pub destination: Ipv4Address,
+    pub source: FirewallAddress,
+    pub destination: FirewallAddress,
     pub protocol: FirewallProtocol,
     pub source_port: u16,
     pub destination_port: u16,
@@ -965,8 +994,8 @@ impl Default for FirewallAuditRecord {
         Self {
             ingress: IfId(0),
             egress: IfId(0),
-            source: Ipv4Address::from_octets([0; 4]),
-            destination: Ipv4Address::from_octets([0; 4]),
+            source: Ipv4Address::from_octets([0; 4]).into(),
+            destination: Ipv4Address::from_octets([0; 4]).into(),
             protocol: FirewallProtocol::Udp,
             source_port: 0,
             destination_port: 0,
@@ -1107,8 +1136,8 @@ impl FirewallRelatedIcmpv4Flow {
         FirewallPacket {
             ingress: self.ingress,
             egress: self.egress,
-            source: self.source,
-            destination: self.destination,
+            source: FirewallAddress::V4(self.source),
+            destination: FirewallAddress::V4(self.destination),
             protocol: self.protocol,
             source_port: self.source_port,
             destination_port: self.destination_port,
@@ -1132,8 +1161,8 @@ pub enum FirewallRelatedIcmpv4Error {
 pub(crate) struct FirewallPacket {
     pub ingress: IfId,
     pub egress: IfId,
-    pub source: Ipv4Address,
-    pub destination: Ipv4Address,
+    pub source: FirewallAddress,
+    pub destination: FirewallAddress,
     pub protocol: FirewallProtocol,
     pub source_port: u16,
     pub destination_port: u16,
@@ -1159,8 +1188,8 @@ impl FirewallPacket {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct FirewallRouteMissPacket {
     pub ingress: IfId,
-    pub source: Ipv4Address,
-    pub destination: Ipv4Address,
+    pub source: FirewallAddress,
+    pub destination: FirewallAddress,
     pub protocol: FirewallProtocol,
     pub source_port: u16,
     pub destination_port: u16,
@@ -1177,7 +1206,7 @@ pub(crate) struct FirewallUnsolicitedSynPacket {
     /// The NAT's inside interface (the egress of every translated inbound
     /// packet).
     pub egress: IfId,
-    pub source: Ipv4Address,
+    pub source: FirewallAddress,
     pub source_port: u16,
 }
 
@@ -1216,18 +1245,81 @@ struct FirewallProbe {
 }
 
 fn flow_hash(packet: FirewallPacket, config_generation: u64, hash_key: FirewallHashKey) -> u64 {
-    siphash24(hash_key, canonical_flow_words(packet, config_generation))
+    match (packet.source, packet.destination) {
+        (FirewallAddress::V4(source), FirewallAddress::V4(destination)) => siphash24(
+            hash_key,
+            canonical_flow_words(packet, source, destination, config_generation),
+        ),
+        _ => siphash24(hash_key, canonical_flow_words_v6(packet, config_generation)),
+    }
 }
 
-fn canonical_flow_words(packet: FirewallPacket, config_generation: u64) -> [u64; 8] {
+/// The 16 bytes of an address for the IPv6 hash: an IPv4 address in a flow of the
+/// other family (which does not happen) is IPv4-mapped, so the words stay defined.
+fn address_bytes(address: FirewallAddress) -> [u8; 16] {
+    match address {
+        FirewallAddress::V6(bytes) => bytes,
+        FirewallAddress::V4(address) => {
+            let mut bytes = [0; 16];
+            bytes[10..12].copy_from_slice(&[0xff, 0xff]);
+            bytes[12..].copy_from_slice(&address.octets());
+            bytes
+        }
+    }
+}
+
+/// The words of an IPv6 flow: as the IPv4 ones, with each address in two words
+/// and a word that keeps the two families apart.
+fn canonical_flow_words_v6(packet: FirewallPacket, config_generation: u64) -> [u64; 12] {
+    let words = |bytes: [u8; 16]| {
+        (
+            u64::from_be_bytes(bytes[..8].try_into().expect("8 bytes")),
+            u64::from_be_bytes(bytes[8..].try_into().expect("8 bytes")),
+        )
+    };
     let mut first = (
         packet.ingress.0,
-        u32::from_be_bytes(packet.source.octets()),
+        words(address_bytes(packet.source)),
         packet.source_port,
     );
     let mut second = (
         packet.egress.0,
-        u32::from_be_bytes(packet.destination.octets()),
+        words(address_bytes(packet.destination)),
+        packet.destination_port,
+    );
+    if second < first {
+        std::mem::swap(&mut first, &mut second);
+    }
+    [
+        config_generation,
+        6,
+        u64::from(packet.protocol.ipv4_protocol()),
+        u64::from(first.0),
+        (first.1).0,
+        (first.1).1,
+        u64::from(first.2),
+        u64::from(second.0),
+        (second.1).0,
+        (second.1).1,
+        u64::from(second.2),
+        0,
+    ]
+}
+
+fn canonical_flow_words(
+    packet: FirewallPacket,
+    source: Ipv4Address,
+    destination: Ipv4Address,
+    config_generation: u64,
+) -> [u64; 8] {
+    let mut first = (
+        packet.ingress.0,
+        u32::from_be_bytes(source.octets()),
+        packet.source_port,
+    );
+    let mut second = (
+        packet.egress.0,
+        u32::from_be_bytes(destination.octets()),
         packet.destination_port,
     );
     if second < first {
@@ -1435,7 +1527,14 @@ impl CarryRoutes<'_> {
     /// `carried_flow_never_admits_a_reverse_packet_from_a_router_address`
     /// (io-sim) pins that assumption.
     fn moved(self, slot: FirewallStateSlot) -> bool {
-        [slot.responder_address, slot.initiator_address]
+        // An IPv6 flow: the IPv6 routes are not compared yet, so it is taken as
+        // moved and revoked (the safe side).
+        let (Some(responder), Some(initiator)) =
+            (slot.responder_address.ipv4(), slot.initiator_address.ipv4())
+        else {
+            return true;
+        };
+        [responder, initiator]
             .into_iter()
             .filter(|address| {
                 !(self.current.is_local_ipv4(*address) && self.next.is_local_ipv4(*address))
@@ -2508,6 +2607,55 @@ impl FirewallReconcilePermit<'_, '_, '_> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_ipv6_flow_hashes_the_same_both_ways_and_apart_from_ipv4() {
+        let key = FirewallHashKey::new(1, 2).unwrap();
+        let a = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let b = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let out = FirewallPacket {
+            ingress: IfId(0),
+            egress: IfId(1),
+            source: FirewallAddress::V6(a),
+            destination: FirewallAddress::V6(b),
+            protocol: FirewallProtocol::Udp,
+            source_port: 1000,
+            destination_port: 53,
+            tcp_flags: 0,
+        };
+        let back = FirewallPacket {
+            ingress: IfId(1),
+            egress: IfId(0),
+            source: FirewallAddress::V6(b),
+            destination: FirewallAddress::V6(a),
+            source_port: 53,
+            destination_port: 1000,
+            ..out
+        };
+        assert_eq!(flow_hash(out, 7, key), flow_hash(back, 7, key));
+        let mut other = out;
+        other.destination = FirewallAddress::V6([0xfe; 16]);
+        assert_ne!(flow_hash(out, 7, key), flow_hash(other, 7, key));
+        // The same numbers in IPv4 are another flow.
+        let v4 = FirewallPacket {
+            source: FirewallAddress::V4(Ipv4Address::from_octets([0, 0, 0, 1])),
+            destination: FirewallAddress::V4(Ipv4Address::from_octets([0, 0, 0, 2])),
+            ..out
+        };
+        let mapped = FirewallPacket {
+            source: FirewallAddress::V6(address_bytes(v4.source)),
+            destination: FirewallAddress::V6(address_bytes(v4.destination)),
+            ..out
+        };
+        assert_ne!(flow_hash(v4, 7, key), flow_hash(mapped, 7, key));
+    }
+
+    #[test]
+    fn an_ipv4_prefix_never_matches_an_ipv6_address() {
+        let any = FirewallIpv4Prefix::new(Ipv4Address::from_octets([0; 4]), 0).unwrap();
+        assert!(any.matches(FirewallAddress::V4(Ipv4Address::from_octets([10, 0, 0, 1]))));
+        assert!(!any.matches(FirewallAddress::V6([0; 16])));
+    }
     use super::*;
     use crate::{
         Interface, Ipv4OriginPolicy, LocalIpv4Binding, MacAddress, Neighbor, Route,
@@ -2634,8 +2782,8 @@ mod tests {
         FirewallPacket {
             ingress: LAN,
             egress: WAN,
-            source: INTERNAL,
-            destination: REMOTE,
+            source: INTERNAL.into(),
+            destination: REMOTE.into(),
             protocol,
             source_port: 12_345,
             destination_port: 443,
@@ -2903,10 +3051,10 @@ mod tests {
             Err(FirewallHashKeyError::AllZero)
         );
         assert_eq!(format!("{:?}", hash_key()), "FirewallHashKey([REDACTED])");
-        assert!(any().matches(Ipv4Address::from_octets([255; 4])));
+        assert!(any().matches(Ipv4Address::from_octets([255; 4]).into()));
         let host = FirewallIpv4Prefix::new(INTERNAL, 32).unwrap();
-        assert!(host.matches(INTERNAL));
-        assert!(!host.matches(Ipv4Address::from_octets([10, 0, 0, 11])));
+        assert!(host.matches(INTERNAL.into()));
+        assert!(!host.matches(Ipv4Address::from_octets([10, 0, 0, 11]).into()));
         let endpoints = FirewallPortRange::new(53, 54).unwrap();
         assert!(endpoints.contains(53));
         assert!(endpoints.contains(54));
@@ -3116,7 +3264,12 @@ mod tests {
         );
 
         let candidate = packet(FirewallProtocol::Udp, 0);
-        let words = canonical_flow_words(candidate, 1);
+        let words = canonical_flow_words(
+            candidate,
+            candidate.source.ipv4().unwrap(),
+            candidate.destination.ipv4().unwrap(),
+            1,
+        );
         let mut layout = [0_u8; 64];
         for (word, chunk) in words.iter().zip(layout.chunks_exact_mut(8)) {
             chunk.copy_from_slice(&word.to_le_bytes());
@@ -3150,8 +3303,8 @@ mod tests {
             let mut reverse = packet(FirewallProtocol::Tcp, 0x12);
             reverse.ingress = WAN;
             reverse.egress = LAN;
-            reverse.source = REMOTE;
-            reverse.destination = INTERNAL;
+            reverse.source = REMOTE.into();
+            reverse.destination = INTERNAL.into();
             reverse.source_port = 443;
             reverse.destination_port = 12_345;
             let plan = runtime.plan_packet(&config, reverse, 1).unwrap();
@@ -3204,8 +3357,8 @@ mod tests {
             let flow = FirewallRelatedIcmpv4Flow::new(
                 origin.ingress,
                 origin.egress,
-                origin.source,
-                origin.destination,
+                origin.source.ipv4().unwrap(),
+                origin.destination.ipv4().unwrap(),
                 origin.protocol,
                 origin.source_port,
                 origin.destination_port,
@@ -3220,8 +3373,8 @@ mod tests {
             let wrong_remote_port = FirewallRelatedIcmpv4Flow::new(
                 origin.ingress,
                 origin.egress,
-                origin.source,
-                origin.destination,
+                origin.source.ipv4().unwrap(),
+                origin.destination.ipv4().unwrap(),
                 origin.protocol,
                 origin.source_port,
                 origin.destination_port + 1,
@@ -3233,8 +3386,8 @@ mod tests {
             let reverse = FirewallRelatedIcmpv4Flow::new(
                 origin.egress,
                 origin.ingress,
-                origin.destination,
-                origin.source,
+                origin.destination.ipv4().unwrap(),
+                origin.source.ipv4().unwrap(),
                 origin.protocol,
                 origin.destination_port,
                 origin.source_port,
@@ -3246,8 +3399,8 @@ mod tests {
             let wrong_egress = FirewallRelatedIcmpv4Flow::new(
                 origin.ingress,
                 IfId(99),
-                origin.source,
-                origin.destination,
+                origin.source.ipv4().unwrap(),
+                origin.destination.ipv4().unwrap(),
                 origin.protocol,
                 origin.source_port,
                 origin.destination_port,
@@ -3267,8 +3420,8 @@ mod tests {
             let half_reversed = FirewallRelatedIcmpv4Flow::new(
                 origin.ingress,
                 origin.egress,
-                origin.destination,
-                origin.source,
+                origin.destination.ipv4().unwrap(),
+                origin.source.ipv4().unwrap(),
                 origin.protocol,
                 origin.destination_port,
                 origin.source_port,
@@ -3340,8 +3493,8 @@ mod tests {
                 FirewallRelatedIcmpv4Flow::new(
                     ingress,
                     egress,
-                    origin.destination,
-                    origin.source,
+                    origin.destination.ipv4().unwrap(),
+                    origin.source.ipv4().unwrap(),
                     origin.protocol,
                     origin.destination_port,
                     origin.source_port,
@@ -3445,8 +3598,8 @@ mod tests {
                 let flow = FirewallRelatedIcmpv4Flow::new(
                     request.egress,
                     request.ingress,
-                    request.destination,
-                    request.source,
+                    request.destination.ipv4().unwrap(),
+                    request.source.ipv4().unwrap(),
                     FirewallProtocol::Icmp,
                     8,
                     8,
@@ -3469,8 +3622,8 @@ mod tests {
             let origin = FirewallRelatedIcmpv4Flow::new(
                 request.ingress,
                 request.egress,
-                request.source,
-                request.destination,
+                request.source.ipv4().unwrap(),
+                request.destination.ipv4().unwrap(),
                 FirewallProtocol::Icmp,
                 8,
                 8,
@@ -3548,8 +3701,8 @@ mod tests {
                 FirewallRelatedIcmpv4Flow::new(
                     candidate.ingress,
                     candidate.egress,
-                    candidate.source,
-                    candidate.destination,
+                    candidate.source.ipv4().unwrap(),
+                    candidate.destination.ipv4().unwrap(),
                     candidate.protocol,
                     candidate.source_port,
                     candidate.destination_port,
@@ -3748,8 +3901,8 @@ mod tests {
             let mut reverse_second = second;
             reverse_second.ingress = WAN;
             reverse_second.egress = LAN;
-            reverse_second.source = REMOTE;
-            reverse_second.destination = INTERNAL;
+            reverse_second.source = REMOTE.into();
+            reverse_second.destination = INTERNAL.into();
             reverse_second.source_port = second.destination_port;
             reverse_second.destination_port = second.source_port;
             let refresh = runtime
@@ -4568,7 +4721,7 @@ mod tests {
                 FirewallUnsolicitedSynPacket {
                     ingress: WAN,
                     egress: LAN,
-                    source: REMOTE,
+                    source: REMOTE.into(),
                     source_port: 443,
                 },
             );

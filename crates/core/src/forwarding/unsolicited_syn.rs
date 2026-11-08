@@ -194,7 +194,7 @@ fn firewall_permits_unsolicited_syn(
             FirewallUnsolicitedSynPacket {
                 ingress: config.outside(),
                 egress: config.inside(),
-                source: remote,
+                source: remote.into(),
                 source_port: remote_port,
             },
         )

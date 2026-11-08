@@ -4784,8 +4784,8 @@ fn decide_ipv4<T: TraceSink>(
                 firewall_validated.expect("forward firewall packet was preflight validated");
             let packet = FirewallRouteMissPacket {
                 ingress,
-                source: ipv4.source,
-                destination: ipv4.destination,
+                source: ipv4.source.into(),
+                destination: ipv4.destination.into(),
                 protocol: validated.protocol,
                 source_port: validated.source_port,
                 destination_port: validated.destination_port,
@@ -5256,11 +5256,16 @@ fn inspect_nat44_icmpv4_related<T: TraceSink>(
     now: MonotonicMillis,
     trace: &mut T,
 ) -> Result<(), DropReason> {
+    // The NAT44 paths quote IPv4 packets only.
+    let (Some(source), Some(destination)) = (packet.source.ipv4(), packet.destination.ipv4())
+    else {
+        return Err(DropReason::FirewallRelatedIcmpv4Unsupported);
+    };
     let flow = FirewallRelatedIcmpv4Flow::new(
         packet.ingress,
         packet.egress,
-        packet.source,
-        packet.destination,
+        source,
+        destination,
         packet.protocol,
         packet.source_port,
         packet.destination_port,
@@ -5554,8 +5559,8 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
         let packet = FirewallPacket {
             ingress: inside,
             egress: outside,
-            source: internal_address,
-            destination: quote.destination_address,
+            source: internal_address.into(),
+            destination: quote.destination_address.into(),
             protocol,
             source_port,
             destination_port,
@@ -6284,8 +6289,8 @@ fn firewall_packet(
     canonical.unwrap_or(FirewallPacket {
         ingress,
         egress,
-        source: ipv4.source,
-        destination: ipv4.destination,
+        source: ipv4.source.into(),
+        destination: ipv4.destination.into(),
         protocol: validated.protocol,
         source_port: validated.source_port,
         destination_port: validated.destination_port,
@@ -6514,8 +6519,8 @@ fn decide_nat44_udp_inbound<T: TraceSink>(
         let firewall_packet = FirewallPacket {
             ingress,
             egress: reverse_route.egress(),
-            source: ipv4.source,
-            destination: internal_address,
+            source: ipv4.source.into(),
+            destination: internal_address.into(),
             protocol: FirewallProtocol::Udp,
             source_port: udp.source_port,
             destination_port: plan.internal_port(),
@@ -6792,8 +6797,8 @@ fn decide_nat44_tcp_inbound<T: TraceSink>(
         let firewall_packet = FirewallPacket {
             ingress,
             egress: reverse_route.egress(),
-            source: ipv4.source,
-            destination: internal_address,
+            source: ipv4.source.into(),
+            destination: internal_address.into(),
             protocol: FirewallProtocol::Tcp,
             source_port: tcp.source_port,
             destination_port: plan.internal_port(),

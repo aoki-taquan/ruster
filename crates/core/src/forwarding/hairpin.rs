@@ -285,8 +285,8 @@ pub(super) fn decide_nat44_udp_hairpin<T: TraceSink>(
             FirewallPacket {
                 ingress,
                 egress: config.outside(),
-                source: ipv4.source,
-                destination: config.public_address(),
+                source: ipv4.source.into(),
+                destination: config.public_address().into(),
                 protocol: FirewallProtocol::Udp,
                 source_port: udp.source_port,
                 destination_port: udp.destination_port,
@@ -418,8 +418,8 @@ fn udp_hairpin_inbound_half<T: TraceSink>(
             FirewallPacket {
                 ingress: config.outside(),
                 egress: route.egress(),
-                source: tuples.public_address,
-                destination: tuples.internal_address,
+                source: tuples.public_address.into(),
+                destination: tuples.internal_address.into(),
                 protocol: FirewallProtocol::Udp,
                 source_port: tuples.sender_public_port,
                 destination_port: tuples.internal_port,
@@ -616,8 +616,8 @@ pub(super) fn decide_nat44_tcp_hairpin<T: TraceSink>(
             FirewallPacket {
                 ingress,
                 egress: config.outside(),
-                source: ipv4.source,
-                destination: config.public_address(),
+                source: ipv4.source.into(),
+                destination: config.public_address().into(),
                 protocol: FirewallProtocol::Tcp,
                 source_port: tcp.source_port,
                 destination_port: tcp.destination_port,
@@ -751,8 +751,8 @@ fn tcp_hairpin_inbound_half<T: TraceSink>(
             FirewallPacket {
                 ingress: config.outside(),
                 egress: route.egress(),
-                source: tuples.public_address,
-                destination: tuples.internal_address,
+                source: tuples.public_address.into(),
+                destination: tuples.internal_address.into(),
                 protocol: FirewallProtocol::Tcp,
                 source_port: tuples.sender_public_port,
                 destination_port: tuples.internal_port,

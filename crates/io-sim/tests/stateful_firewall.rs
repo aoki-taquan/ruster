@@ -1452,8 +1452,8 @@ fn nat_uses_canonical_pre_and_post_translation_tuples_and_commits_atomically() {
         .iter()
         .find(|slot| slot.protocol() == FirewallProtocol::Udp)
         .unwrap();
-    assert_eq!(udp_state.initiator_address(), HOST);
-    assert_eq!(udp_state.responder_address(), REMOTE);
+    assert_eq!(udp_state.initiator_address(), HOST.into());
+    assert_eq!(udp_state.responder_address(), REMOTE.into());
     assert_eq!(udp_state.initiator_port(), 12_345);
     assert!(firewall
         .states()

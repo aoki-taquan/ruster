@@ -461,8 +461,8 @@ pub(super) fn decide_nat44_icmp_inbound<T: TraceSink>(
         let canonical = FirewallPacket {
             ingress,
             egress: reverse_route.egress(),
-            source: ipv4.source,
-            destination: internal_address,
+            source: ipv4.source.into(),
+            destination: internal_address.into(),
             protocol: FirewallProtocol::Icmp,
             source_port,
             destination_port,

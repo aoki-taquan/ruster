@@ -822,17 +822,32 @@ fn firewall_evaluates_each_half_like_the_ordinary_traversal() {
     assert_eq!(records.len(), 2);
     let outbound = records[0];
     assert_eq!((outbound.ingress, outbound.egress), (LAN, WAN));
-    assert_eq!((outbound.source, outbound.source_port), (H1, P1));
     assert_eq!(
-        (outbound.destination, outbound.destination_port),
+        (outbound.source.ipv4().unwrap(), outbound.source_port),
+        (H1, P1)
+    );
+    assert_eq!(
+        (
+            outbound.destination.ipv4().unwrap(),
+            outbound.destination_port
+        ),
         (PUBLIC, public2)
     );
     assert_eq!(outbound.disposition.verdict, FirewallVerdict::Allow);
     assert_eq!(outbound.disposition.class, FirewallConnectionClass::New);
     let inbound = records[1];
     assert_eq!((inbound.ingress, inbound.egress), (WAN, LAN));
-    assert_eq!((inbound.source, inbound.source_port), (PUBLIC, public1));
-    assert_eq!((inbound.destination, inbound.destination_port), (H2, P2));
+    assert_eq!(
+        (inbound.source.ipv4().unwrap(), inbound.source_port),
+        (PUBLIC, public1)
+    );
+    assert_eq!(
+        (
+            inbound.destination.ipv4().unwrap(),
+            inbound.destination_port
+        ),
+        (H2, P2)
+    );
     assert_eq!(inbound.disposition.verdict, FirewallVerdict::Drop);
     let firewall = world.firewall.as_ref().unwrap().counters();
     assert_eq!(firewall.allowed_new, firewall_before.allowed_new + 1);
