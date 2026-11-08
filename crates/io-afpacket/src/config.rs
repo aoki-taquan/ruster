@@ -8,8 +8,13 @@ pub const TPACKET_V3_VERSION: u32 = 2;
 pub const TPACKET_V3_HEADER_LEN: usize = 48;
 pub const TPACKET_BLOCK_HEADER_LEN: usize = 48;
 pub const TPACKET_V3_HDRLEN: usize = 68;
-pub const TPACKET_V3_ETHERNET_MAC_OFFSET: usize = 82;
-pub const TPACKET_V3_ETHERNET_NETWORK_OFFSET: usize = 96;
+/// Room asked of the kernel (`PACKET_RESERVE`) between the RX TPACKET_V3 header and
+/// the frame, so that the forwarding path can put headers in front of a frame in
+/// place: an IPv6 header for MAP-E and DS-Lite (40 bytes), PPPoE (8) and a VLAN tag (4).
+/// A multiple of 16 keeps the network header 16-byte aligned.
+pub const TPACKET_V3_RESERVE: usize = 64;
+pub const TPACKET_V3_ETHERNET_MAC_OFFSET: usize = 82 + TPACKET_V3_RESERVE;
+pub const TPACKET_V3_ETHERNET_NETWORK_OFFSET: usize = 96 + TPACKET_V3_RESERVE;
 pub const TPACKET_V3_TX_DATA_OFFSET: usize = 48;
 pub const DEFAULT_MAX_FRAME_LEN: usize = 1_514;
 
@@ -45,7 +50,7 @@ impl RingGeometry {
             self.validate_common(page_size, max_frame_len, TPACKET_V3_ETHERNET_MAC_OFFSET)?;
         let kernel_minimum = layout
             .block_plus_private
-            .checked_add(TPACKET_V3_HDRLEN)
+            .checked_add(TPACKET_V3_HDRLEN + TPACKET_V3_RESERVE)
             .ok_or(GeometryError::ArithmeticOverflow)?;
         if kernel_minimum > layout.block_size {
             return Err(GeometryError::RxBlockBelowKernelMinimum {

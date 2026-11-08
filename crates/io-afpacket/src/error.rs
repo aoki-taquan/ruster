@@ -25,6 +25,7 @@ pub enum SyscallStage {
     SetVersion,
     SetIgnoreOutgoing,
     SetLoss,
+    SetReserve,
     SetRxRing,
     SetTxRing,
     Bind,

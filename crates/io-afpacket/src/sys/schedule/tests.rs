@@ -37,7 +37,7 @@ const RX_LEN: usize = 4_096;
 const TX_FRAME: usize = 2_048;
 const TX_FRAMES: usize = 4;
 const FIRST_PACKET: usize = 64;
-const MAC: usize = 82;
+const MAC: usize = 146;
 const FIRST_FD: RawFd = 100;
 const LAN: IfId = IfId(1);
 const WAN: IfId = IfId(2);
@@ -305,7 +305,7 @@ impl Live {
             raw_write_u32(header + 16, length);
             raw_write_u32(header + 20, TP_STATUS_USER);
             raw_write_u16(header + 24, u16::try_from(MAC).expect("small"));
-            raw_write_u16(header + 26, 96);
+            raw_write_u16(header + 26, 160);
             raw_write_bytes(header + MAC, payload);
             offset += total;
         }
