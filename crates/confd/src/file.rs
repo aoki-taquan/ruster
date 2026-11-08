@@ -64,6 +64,10 @@
 //! prefix = "0.0.0.0/0"
 //! lookup-vrf = "default"
 //!
+//! [[route]]                    # drop the prefix's packets (a longer route still wins)
+//! prefix = "10.0.0.0/8"
+//! action = "discard"           # silently; "reject": with a Destination Unreachable
+//!
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
 //! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
@@ -283,6 +287,9 @@ struct RouteEntry {
     interface: Option<String>,
     via: Option<String>,
     lookup_vrf: Option<String>,
+    /// `"discard"` (dropped silently) or `"reject"` (dropped with a Destination
+    /// Unreachable), instead of an interface.
+    action: Option<String>,
 }
 
 fn default_vrf() -> String {
@@ -600,7 +607,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     // A MAP-E CE's tunnel is an interface like the others for what follows.
     let map_e = match file.map_e {
         Some(entry) => {
-            let (tunnel, mapped) = map_e(entry, &seen)?;
+            let (tunnel, mapped, delegated) = map_e(entry, &seen)?;
             let at = format!("map-e interface {:?}", tunnel.name);
             if tunnel.name.is_empty() || tunnel.name.len() > 255 {
                 return Err(format!("{at}: the name must be 1 to 255 bytes"));
@@ -612,7 +619,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             seen.address(&at, &tunnel.name, address.into(), len)?;
             let name = tunnel.name.clone();
             interfaces.push(tunnel);
-            Some((name, mapped))
+            Some((name, mapped, delegated))
         }
         None => None,
     };
@@ -625,7 +632,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         };
         if map_e
             .as_ref()
-            .is_some_and(|(name, _)| *name == interface.name)
+            .is_some_and(|(name, _, _)| *name == interface.name)
         {
             continue;
         }
@@ -667,6 +674,25 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if !prefixes.insert((entry.vrf.clone(), address, len)) {
             return Err(format!("{at}: given twice in VRF {:?}", entry.vrf));
         }
+        if let Some(action) = &entry.action {
+            let target = match action.as_str() {
+                "discard" => RouteTarget::Discard,
+                "reject" => RouteTarget::Reject,
+                _ => return Err(format!("{at}: action must be \"discard\" or \"reject\"")),
+            };
+            if entry.interface.is_some() || entry.lookup_vrf.is_some() || entry.via.is_some() {
+                return Err(format!(
+                    "{at}: a {action} route has no interface, lookup-vrf or via"
+                ));
+            }
+            static_routes.push(StaticRoute {
+                vrf: entry.vrf,
+                prefix: address,
+                len,
+                target,
+            });
+            continue;
+        }
         let interface = match (entry.interface, entry.lookup_vrf) {
             (None, Some(other)) => {
                 if other.is_empty() || other == entry.vrf {
@@ -684,7 +710,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 continue;
             }
             (Some(interface), None) => interface,
-            _ => return Err(format!("{at}: give either interface or lookup-vrf")),
+            _ => {
+                return Err(format!(
+                    "{at}: give one of interface, lookup-vrf and action"
+                ))
+            }
         };
         if !seen.names.contains(&interface) {
             return Err(format!("{at}: no interface {interface:?}"));
@@ -759,7 +789,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         .nat
         .map(|entry| nat(entry, &seen, &interfaces))
         .transpose()?;
-    if let Some((tunnel, mapped)) = map_e {
+    if let Some((tunnel, mapped, (delegated, delegated_len))) = map_e {
         if nat.is_some() {
             return Err("map-e: it makes the NAT itself; give no [nat]".into());
         }
@@ -778,6 +808,18 @@ pub fn parse(text: &str) -> Result<Config, String> {
             },
         });
         nat = Some(mapped);
+        // What of the delegated prefix no more specific route holds is dropped, not sent
+        // back upstream (RFC 7084 WPD-5).
+        if !static_routes.iter().any(|r| {
+            r.vrf == DEFAULT_VRF && r.prefix == IpAddr::V6(delegated) && r.len == delegated_len
+        }) {
+            static_routes.push(StaticRoute {
+                vrf: DEFAULT_VRF.to_owned(),
+                prefix: IpAddr::V6(delegated),
+                len: delegated_len,
+                target: RouteTarget::Discard,
+            });
+        }
     }
     for entry in file.wireguard_peer {
         let at = format!("wireguard-peer {:?} of {:?}", entry.name, entry.interface);
@@ -845,7 +887,8 @@ pub fn parse(text: &str) -> Result<Config, String> {
 }
 
 /// The tunnel interface and NAT of a MAP-E CE (RFC 7597 sections 5.2 and 6).
-fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String> {
+/// The MAP-E CE's tunnel interface, its NAT, and the delegated prefix.
+fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Addr, u8)), String> {
     let at = "map-e";
     let v6 = |text: &str, what: &str| match prefix(text) {
         Some((IpAddr::V6(address), len)) => Ok((address, len)),
@@ -961,7 +1004,11 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String
         external: None,
         ports,
     };
-    Ok((tunnel, nat))
+    let delegated = match network(IpAddr::V6(delegated), delegated_len) {
+        IpAddr::V6(network) => network,
+        IpAddr::V4(_) => unreachable!("an IPv6 network"),
+    };
+    Ok((tunnel, nat, (delegated, delegated_len)))
 }
 
 /// `"53"` or `"1024-65535"`.

@@ -350,15 +350,23 @@ fn vrf_mistakes_are_refused() {
         ),
         (
             one("[[route]]\nprefix = \"0.0.0.0/0\"\n"),
-            "either interface or lookup-vrf",
+            "one of interface, lookup-vrf and action",
         ),
         (
             one("[[route]]\nprefix = \"0.0.0.0/0\"\ninterface = \"lan\"\nlookup-vrf = \"red\"\n"),
-            "either interface or lookup-vrf",
+            "one of interface, lookup-vrf and action",
         ),
         (
             one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\nvia = \"10.0.0.9\"\n"),
             "has no via",
+        ),
+        (
+            one("[[route]]\nprefix = \"10.0.0.0/8\"\naction = \"drop\"\n"),
+            "action must be",
+        ),
+        (
+            one("[[route]]\nprefix = \"10.0.0.0/8\"\naction = \"discard\"\ninterface = \"lan\"\n"),
+            "has no interface",
         ),
         (
             one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"defualt\"\n"),
@@ -771,6 +779,11 @@ fn map_e_follows_rfc_7597_appendix_a() {
         .static_routes
         .iter()
         .any(|r| r.len == 0 && r.prefix == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    // The delegated prefix is discarded where no more specific route holds it
+    // (RFC 7084 WPD-5).
+    assert!(config.static_routes.iter().any(|r| r.len == 56
+        && r.prefix == "2001:db8:12:3400::".parse::<std::net::IpAddr>().unwrap()
+        && r.target == ruster_confd::RouteTarget::Discard));
     let rule =
         format!("{text}[[firewall]]\naction = \"accept\"\nprotocol = \"tcp\"\negress = \"map\"\n");
     assert!(

@@ -118,7 +118,7 @@ fn within((inner, inner_len): (IpAddr, u8), (outer, outer_len): (IpAddr, u8)) ->
 ///   lookup prefix itself.
 ///
 /// Deviation: where the other VRF has no route, a lookup should drop the packet; here
-/// the packet falls to this VRF's shorter routes, since core has no discard route.
+/// the packet falls to this VRF's shorter routes (not yet made a discard route).
 fn expand_lookups(vrfs: &BTreeMap<String, Vec<Entry>>) -> BTreeMap<String, Vec<Forward>> {
     let forwards = |vrf: &str| -> Vec<Forward> {
         vrfs.get(vrf)
@@ -576,7 +576,17 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                         len: *len,
                         vrf: other.clone(),
                     },
-                    RouteAction::Local | RouteAction::Discard | RouteAction::Reject => continue,
+                    RouteAction::Discard | RouteAction::Reject => Entry::Forward(Forward {
+                        prefix: *prefix,
+                        len: *len,
+                        egress: if *action == RouteAction::Discard {
+                            IfId::DISCARD
+                        } else {
+                            IfId::REJECT
+                        },
+                        next_hop: None,
+                    }),
+                    RouteAction::Local => continue,
                 };
                 if let Some(list) = entries.get_mut(vrf) {
                     list.push(entry);

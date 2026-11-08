@@ -2816,3 +2816,58 @@ fn a_tunnel_s_fragmented_packet_is_put_back_together() {
     assert_eq!(&tx.bytes[14 + 20..], &inner[20..], "the payload as sent");
     assert_eq!(tx.bytes[14 + 8], 63, "forwarded once");
 }
+
+/// A discard route drops silently; a reject route answers Destination Unreachable,
+/// as if no route held the destination (RFC 1812 5.2.7.1, RFC 4443 3.1 code 6).
+#[test]
+fn discard_and_reject_routes_drop_what_they_hold() {
+    let mut bench = Bench::new();
+    let (_config, mut routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let action = |prefix: [u8; 4], action: RouteAction| {
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: Ipv4Addr::from(prefix).into(),
+                len: 8,
+            },
+            Value::Route(action),
+        )
+    };
+    assert_eq!(
+        bench.patch(
+            &mut routes,
+            &[
+                action([10, 0, 0, 0], RouteAction::Discard),
+                action([172, 0, 0, 0], RouteAction::Reject),
+            ]
+        ),
+        Code::CHANGED
+    );
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([10, 1, 2, 3]));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "discarded silently");
+
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([172, 1, 2, 3]));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("Destination Unreachable");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!((tx.bytes[14 + 20], tx.bytes[14 + 21]), (3, 0));
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "not sent upstream");
+}

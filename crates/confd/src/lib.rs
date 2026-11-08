@@ -72,6 +72,10 @@ pub enum RouteTarget {
     },
     /// Looked up again in another VRF.
     LookupVrf(String),
+    /// Dropped silently.
+    Discard,
+    /// Dropped with a Destination Unreachable.
+    Reject,
 }
 
 /// A WireGuard interface (also an entry of `interfaces`, which has its MAC address,
@@ -485,6 +489,8 @@ impl Confd {
                     address: *via,
                 }]),
                 RouteTarget::LookupVrf(vrf) => RouteAction::LookupVrf(vrf.clone()),
+                RouteTarget::Discard => RouteAction::Discard,
+                RouteTarget::Reject => RouteAction::Reject,
             };
             out.insert(
                 route_key(&route.vrf, route.prefix, route.len),
