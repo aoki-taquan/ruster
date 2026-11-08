@@ -3,6 +3,8 @@
 //! # Standards
 //!
 //! - RFC 1812 section 5.2.4.3: the longest matching prefix decides.
+//! - RFC 1812 section 5.3.5.2: a prefix's network and directed-broadcast addresses
+//!   are known only for a connected prefix; through a gateway they are hosts.
 //!
 //! Deviations: a route has one next hop; of several (ECMP) the FE keeps the first
 //! active one.
