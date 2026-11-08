@@ -3474,3 +3474,20 @@ fn nat_translates_the_router_s_own_icmp_errors_about_its_flows() {
         port
     );
 }
+
+/// With the firewall on, a truncated datagram to a router address gets no answer,
+/// so it does not tell which addresses are the router's.
+#[test]
+fn with_the_firewall_a_truncated_datagram_to_the_router_gets_no_answer() {
+    use ruster_proto::table::Protocol;
+    let (mut bench, kernel) =
+        router_with_firewall(&[rule_for(1, Protocol::Tcp, Some("lan"), None)]);
+    let mut truncated = udp_packet(INTERNET, [192, 0, 2, 1], (53, 5_000));
+    truncated[2..4].copy_from_slice(&200_u16.to_be_bytes());
+    let truncated = ipv4_checksummed(truncated);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&truncated));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "no Parameter Problem");
+    let mut buf = [0_u8; 2048];
+    assert!(kernel.recv(&mut buf).is_err());
+}
