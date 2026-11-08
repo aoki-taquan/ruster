@@ -1690,6 +1690,20 @@ fn slot_packet(slot: FirewallStateSlot) -> FirewallPacket {
     }
 }
 
+/// The reply direction of `slot`'s flow, as a first packet the other way.
+fn reply_packet(slot: FirewallStateSlot) -> FirewallPacket {
+    FirewallPacket {
+        ingress: slot.origin_egress,
+        egress: slot.origin_ingress,
+        source: slot.responder_address,
+        destination: slot.initiator_address,
+        protocol: slot.protocol,
+        source_port: slot.responder_port,
+        destination_port: slot.initiator_port,
+        tcp_flags: 0,
+    }
+}
+
 fn probe_distance(home: usize, position: usize, capacity: usize) -> usize {
     if position >= home {
         position - home
@@ -1843,6 +1857,8 @@ pub struct FirewallReconcilePermit<'runtime, 'state, 'rules> {
     reevaluate: Option<&'rules [FirewallRule]>,
     /// The snapshots of a carry whose routes changed.
     routes: Option<CarryRoutes<'rules>>,
+    /// The filtering or its interfaces changed: the flows it opened are revoked.
+    filtering_changed: bool,
     report: FirewallReconcileReport,
 }
 
@@ -2018,6 +2034,7 @@ impl<'state> FirewallRuntime<'state> {
                 mode: FirewallPermitMode::Unchanged,
                 reevaluate: None,
                 routes: None,
+                filtering_changed: false,
                 report: FirewallReconcileReport::flushed(
                     0,
                     crate::StateCarryOutcome::FlushRequested,
@@ -2047,6 +2064,7 @@ impl<'state> FirewallRuntime<'state> {
             mode: FirewallPermitMode::Flush,
             reevaluate: None,
             routes: None,
+            filtering_changed: false,
             report: FirewallReconcileReport::flushed(states_flushed, outcome),
         })
     }
@@ -2101,6 +2119,7 @@ impl<'state> FirewallRuntime<'state> {
                 mode: permit.mode,
                 reevaluate: None,
                 routes: None,
+                filtering_changed: false,
                 report: permit.report,
             });
         }
@@ -2127,9 +2146,6 @@ impl<'state> FirewallRuntime<'state> {
             || new.outside != old.outside;
         let conflict = if longer {
             Some(crate::StateCarryConflict::Timers)
-        } else if filtering_changed {
-            // Flows the old filtering opened are not judged again: start over.
-            Some(crate::StateCarryConflict::Filtering)
         } else if (live as u64).saturating_mul(per_flow) > FIREWALL_CARRY_REEVALUATION_BUDGET {
             Some(crate::StateCarryConflict::ReevaluationBudget)
         } else {
@@ -2147,6 +2163,7 @@ impl<'state> FirewallRuntime<'state> {
                 mode: permit.mode,
                 reevaluate: None,
                 routes: None,
+                filtering_changed: false,
                 report: permit.report,
             });
         }
@@ -2158,6 +2175,7 @@ impl<'state> FirewallRuntime<'state> {
             mode: FirewallPermitMode::Carry,
             reevaluate,
             routes,
+            filtering_changed,
             report: FirewallReconcileReport {
                 states_flushed: 0,
                 states_carried: live,
@@ -2195,6 +2213,7 @@ impl<'state> FirewallRuntime<'state> {
         &mut self,
         rules: Option<&[FirewallRule]>,
         routes: Option<CarryRoutes<'_>>,
+        filtering_changed: bool,
     ) -> (usize, usize) {
         let (mut carried, mut revoked, mut expired) = (0usize, 0usize, 0u64);
         let mut evaluations = 0u64;
@@ -2208,7 +2227,9 @@ impl<'state> FirewallRuntime<'state> {
                 expired += 1;
                 continue;
             }
-            let admitted = if routes.is_some_and(|routes| routes.moved(slot)) {
+            let admitted = if routes.is_some_and(|routes| routes.moved(slot))
+                || (slot.by_filtering && filtering_changed)
+            {
                 None
             } else if let Some(rules) = rules {
                 let packet = slot_packet(slot);
@@ -2221,12 +2242,17 @@ impl<'state> FirewallRuntime<'state> {
                     // A flow the filtering opened matches no rule; it stays unless
                     // a rule now denies it.
                     // A flow the filtering opened matches no rule: it stays while
-                    // the rule that let its inside endpoint out still allows.
-                    None if slot.by_filtering => rules
-                        .iter()
-                        .find(|rule| rule.id == slot.origin_rule_id)
-                        .filter(|rule| rule.action == FirewallAction::AllowStateful)
-                        .map(|rule| rule.id),
+                    // the new rules let its inside endpoint send to it.
+                    None if slot.by_filtering => {
+                        let out = reply_packet(slot);
+                        let position = rules.iter().position(|rule| rule.matches(out));
+                        evaluations = evaluations
+                            .saturating_add(position.map_or(rules.len(), |at| at + 1) as u64);
+                        position
+                            .map(|at| rules[at])
+                            .filter(|rule| rule.action == FirewallAction::AllowStateful)
+                            .map(|rule| rule.id)
+                    }
                     None => None,
                 }
             } else {
@@ -2365,7 +2391,7 @@ impl<'state> FirewallRuntime<'state> {
             Some(rule) => rule.id,
             // No rule decides: a packet to an inside endpoint with a flow out may
             // open a flow of its own, as the filtering lets it.
-            None => match self.endpoint_flow(config.policy, packet, now_ms) {
+            None => match self.endpoint_flow(&config.policy, packet, now_ms) {
                 Some(rule_id) => {
                     by_filtering = true;
                     rule_id
@@ -2711,7 +2737,7 @@ impl<'state> FirewallRuntime<'state> {
 
     /// Notes the inside endpoint of the flow at `index` (its origin).
     fn note_endpoint(&mut self, index: usize, slot: FirewallStateSlot) {
-        let policy = self.binding.policy;
+        let policy = &self.binding.policy;
         let filtering = policy.filtering;
         if filtering == FirewallFiltering::AddressAndPortDependent
             || !matches!(slot.protocol, FirewallProtocol::Udp | FirewallProtocol::Tcp)
@@ -2747,7 +2773,7 @@ impl<'state> FirewallRuntime<'state> {
     /// `filtering` lets `packet` (UDP, or a TCP SYN) open a flow of its own.
     fn endpoint_flow(
         &self,
-        policy: FirewallPolicy,
+        policy: &FirewallPolicy,
         packet: FirewallPacket,
         now_ms: u64,
     ) -> Option<FirewallRuleId> {
@@ -3023,7 +3049,8 @@ impl FirewallReconcilePermit<'_, '_, '_> {
                     runtime.counters.reconciliations.saturating_add(1);
             }
             FirewallPermitMode::Carry => {
-                let (carried, revoked) = runtime.carry_pass(self.reevaluate, self.routes);
+                let (carried, revoked) =
+                    runtime.carry_pass(self.reevaluate, self.routes, self.filtering_changed);
                 report.states_carried = carried;
                 report.states_revoked = revoked;
                 runtime.binding = self.next;

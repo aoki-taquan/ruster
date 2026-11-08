@@ -974,6 +974,7 @@ fn an_ipv6_interface_needs_an_mtu_of_1280() {
     };
     assert!(parse(&iface(1_280)).is_ok());
     assert!(error(&iface(1_279)).contains("at least 1280"));
+}
 
 #[test]
 fn the_firewall_filtering_is_endpoint_independent_unless_set() {

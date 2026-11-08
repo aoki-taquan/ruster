@@ -3125,3 +3125,77 @@ fn filtering_opens_only_inside_endpoints_of_flows_out() {
         "a stranger does not reach it"
     );
 }
+
+/// A flow the filtering opened stays only while the rules still let its inside
+/// endpoint send to it: removing the rule (and renumbering the others) ends it.
+#[test]
+fn a_flow_the_filtering_opened_ends_with_the_rule_that_let_its_host_out() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let other = [203, 0, 113, 99];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("lan"), None),
+                rule_for(2, Protocol::Tcp, Some("lan"), None),
+                outside_wan(NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let send = |bench: &mut Bench, port: IfId, frame: Vec<u8>| {
+        bench.fe.io_mut().inject(port, frame);
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(send(
+        &mut bench,
+        IfId(0),
+        from_lan(&udp_packet(host, INTERNET, (5_000, 53)))
+    ));
+    assert!(send(
+        &mut bench,
+        IfId(1),
+        from_wan(&udp_packet(other, host, (7, 5_000)))
+    ));
+    assert!(send(
+        &mut bench,
+        IfId(0),
+        from_lan(&udp_packet(host, other, (5_000, 7)))
+    ));
+
+    // The UDP rule goes; the TCP one becomes rule 1.
+    let removed = Change::delete(Key::FirewallRule {
+        vrf: "default".into(),
+        id: 2,
+    });
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[rule_for(1, Protocol::Tcp, Some("lan"), None), removed]
+        ),
+        Code::CHANGED
+    );
+    assert!(
+        !send(
+            &mut bench,
+            IfId(0),
+            from_lan(&udp_packet(host, other, (5_000, 7)))
+        ),
+        "no UDP out without a rule"
+    );
+}
