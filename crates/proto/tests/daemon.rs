@@ -123,3 +123,25 @@ fn notify_sends_the_state_to_the_notify_socket() {
     assert!(systemd.recv(&mut buf).is_err());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn an_idle_process_sleeps_longer_until_it_has_work() {
+    use ruster_proto::task::Progress;
+    let mut idle = daemon::Idle::new();
+    let quiet = Progress {
+        busy: false,
+        ..Progress::default()
+    };
+    let busy = Progress {
+        busy: true,
+        ..Progress::default()
+    };
+    let mut waits = Vec::new();
+    for _ in 0..5 {
+        waits.push(idle.next_ms());
+        idle.wait(quiet);
+    }
+    assert_eq!(waits, [1, 2, 4, 8, 8]);
+    idle.wait(busy);
+    assert_eq!(idle.next_ms(), 1, "work starts over from 1 ms");
+}
