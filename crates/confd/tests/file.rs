@@ -963,3 +963,15 @@ fn a_firewall_rule_may_name_the_router_itself() {
         .iter()
         .all(|rule| rule.ingress.as_deref() == Some("rt-default")));
 }
+
+/// RFC 8200 section 5: an interface with IPv6 addresses has an MTU of 1280 or more.
+#[test]
+fn an_ipv6_interface_needs_an_mtu_of_1280() {
+    let iface = |mtu: u16| {
+        format!(
+            "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nmtu = {mtu}\nipv6 = [\"2001:db8:1::1/64\"]\n"
+        )
+    };
+    assert!(parse(&iface(1_280)).is_ok());
+    assert!(error(&iface(1_279)).contains("at least 1280"));
+}

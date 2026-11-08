@@ -107,6 +107,8 @@
 //!
 //! # Standards
 //!
+//! - RFC 8200 section 5: an interface with IPv6 addresses has an MTU of at least
+//!   1280. Deviation: one with only its link-local address may have less.
 //! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
 //!   when not named.
 //! - RFC 791: the smallest MTU is 68.
@@ -172,6 +174,8 @@ use crate::{
 
 /// The smallest MTU an IPv4 interface may have (RFC 791).
 const MIN_MTU: u16 = ruster_proto::table::MIN_MTU;
+/// The least MTU of a link that carries IPv6.
+const IPV6_MIN_MTU: u16 = 1_280;
 /// The FE takes Ethernet frames of up to 1514 bytes.
 const MAX_MTU: u16 = 1_500;
 /// The name rules give the router itself (the default VRF's kernel interface).
@@ -594,6 +598,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             None => None,
         };
+        if !entry.ipv6.is_empty() && mtu < IPV6_MIN_MTU {
+            return Err(format!(
+                "{at}: mtu must be at least {IPV6_MIN_MTU} on an interface with ipv6 addresses"
+            ));
+        }
         let mut ipv6 = Vec::with_capacity(entry.ipv6.len());
         for text in &entry.ipv6 {
             let Some((IpAddr::V6(address), len)) = prefix(text) else {
