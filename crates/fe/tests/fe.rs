@@ -2350,3 +2350,23 @@ fn nat_lets_the_router_s_packets_from_its_outside_address_pass_as_they_are() {
         "the spoofed packet is dropped"
     );
 }
+
+/// A LAN host reaches the router's WAN address: any of the router's addresses is
+/// the router's, whichever interface the packet came in on (RFC 1812 5.2.3).
+#[test]
+fn a_lan_host_reaches_the_router_s_wan_address() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    let to_wan_address = udp_packet([192, 0, 2, 10], [198, 51, 100, 2], (5_000, 22));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&to_wan_address));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("it reached the kernel");
+    assert_eq!(&buf[..n], &to_wan_address[..]);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "not routed on");
+}

@@ -975,12 +975,18 @@ fn inside_errors_without_authority_are_refused_atomically() {
                     DropReason::FirewallRelatedIcmpv4StateMiss,
                 );
             }
-            // A router address as the quoted remote never reaches NAT state.
-            world.assert_refused(
-                LAN,
-                icmp_error(H1, DMZ_LOCAL, 3, 3, &quoted(DMZ_LOCAL, remote_port, H1, P1)),
-                DropReason::Nat44Icmpv4QuotedRemoteLocal,
+            // An error to a router address on another interface is the router's
+            // (RFC 1812 5.2.3): it goes to the router and never reaches NAT state.
+            let error = icmp_error(H1, DMZ_LOCAL, 3, 3, &quoted(DMZ_LOCAL, remote_port, H1, P1));
+            let before = world.state();
+            world.run(LAN, error.clone());
+            let recycled = world.io.pop_recycled().expect("consumed");
+            assert_eq!(
+                recycled.cause,
+                RecycleCause::Consumed(ruster_core::ConsumeReason::Ipv4LocalUnsupported)
             );
+            assert!(world.io.pop_tx().is_none());
+            assert_eq!(world.state(), before);
         }
     }
 }

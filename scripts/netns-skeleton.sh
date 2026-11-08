@@ -154,6 +154,9 @@ nsx "$host_a" ping -c 3 -i 0.2 -W 1 192.0.2.1 >/dev/null || fail "no answer to p
 nsx "$host_a" ping -6 -c 3 -i 0.2 -W 1 2001:db8:1::1 >/dev/null \
   || fail "no answer to ping 2001:db8:1::1"
 nsx "$host_b" ping -c 3 -i 0.2 -W 1 198.51.100.1 >/dev/null || fail "no answer to ping 198.51.100.1"
+# A router address on the far side is the router's too (RFC 1812 5.2.3).
+nsx "$host_a" ping -c 3 -i 0.2 -W 1 198.51.100.1 >/dev/null \
+  || fail "no answer from host-a to the router's other address 198.51.100.1"
 nsx "$router" timeout 5 nc -l 8080 >"$work/tcp.out" &
 pids+=("$!")
 sleep 0.5

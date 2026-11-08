@@ -9,6 +9,9 @@
 //!   A datagram from the kernel's interface
 //!   ([`ForwardingSnapshot::with_kernel_ingress`]) is the router's own, not
 //!   forwarded, so its TTL stays (section 4.2.2.9 lets a router originate any TTL).
+//! - RFC 1812 section 5.2.3: an IPv4 datagram for any of the router's addresses is
+//!   for the router, whichever interface it came in on. A NAT public address that
+//!   came in from another interface than its own is left to NAT (hairpinning).
 //!
 //! Deviations: an ICMP error about the router's own datagram has the datagram's
 //! destination as its source, not a router address (RFC 1812 section 4.3.2.4),
@@ -2136,6 +2139,20 @@ impl<'a> ForwardingSnapshot<'a> {
         self.local_binding_for(address).is_some()
     }
 
+    /// Whether an IPv4 packet for `destination` that came in on `ingress` is for
+    /// the router: any of its addresses, whichever interface it came in on
+    /// (RFC 1812 5.2.3). A NAT public address that came in from another interface
+    /// than its own is left to NAT (hairpinning), as when it is not local.
+    pub(crate) fn is_ipv4_for_router(
+        &self,
+        ingress: IfId,
+        destination: crate::Ipv4Address,
+        nat_public: bool,
+    ) -> bool {
+        self.is_local_ipv4_on(ingress, destination)
+            || (!nat_public && self.is_local_ipv4(destination))
+    }
+
     /// Whether `address` is the local binding of `interface` itself.
     #[inline]
     pub(crate) fn is_local_ipv4_on(&self, interface: IfId, address: crate::Ipv4Address) -> bool {
@@ -4135,9 +4152,21 @@ fn is_ipv4_fragment(frame: &[u8]) -> bool {
     )
 }
 
+/// Whether `ipv4` is for a NAT public address.
+fn nat_public_destination(
+    ipv4: packet::ValidatedIpv4,
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+) -> bool {
+    nat44_udp_config.is_some_and(|config| config.public_address() == ipv4.destination)
+        || nat44_tcp_config.is_some_and(|config| config.public_address() == ipv4.destination)
+        || nat44_icmp_config.is_some_and(|config| config.public_address() == ipv4.destination)
+}
+
 /// A valid IPv4 fragment the association table handles (NAT-FRAG): every
 /// fragment the router forwards or translates. A fragment for one of the
-/// router's own addresses on its ingress that is not a NAT public address
+/// router's own addresses that is not a NAT public address
 /// keeps the local path (no reassembly, ICMP4-006). `None` also for an
 /// invalid IPv4 header, which the normal decision refuses.
 #[cold]
@@ -4151,10 +4180,9 @@ fn tracked_fragment(
     nat44_icmp_config: Option<&Nat44IcmpConfig>,
 ) -> Option<(packet::ValidatedIpv4, Ipv4FragmentInfo)> {
     let ipv4 = validate_ipv4_frame(frame).ok()?;
-    let public = nat44_udp_config.is_some_and(|config| config.public_address() == ipv4.destination)
-        || nat44_tcp_config.is_some_and(|config| config.public_address() == ipv4.destination)
-        || nat44_icmp_config.is_some_and(|config| config.public_address() == ipv4.destination);
-    if !public && snapshot.is_local_ipv4_on(ingress, ipv4.destination) {
+    let public =
+        nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, nat44_icmp_config);
+    if !public && snapshot.is_local_ipv4(ipv4.destination) {
         return None;
     }
     parse_fragment(frame, ipv4, ingress).map(|info| (ipv4, info))
@@ -4455,7 +4483,11 @@ fn decide_ipv4<T: TraceSink>(
         destination: ipv4.destination,
     });
     validate_ipv4_ingress(snapshot, ingress, ipv4)?;
-    let local = snapshot.is_local_ipv4_on(ingress, ipv4.destination);
+    let local = snapshot.is_ipv4_for_router(
+        ingress,
+        ipv4.destination,
+        nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, nat44_icmp_config),
+    );
     let selected_route = if local {
         None
     } else {
@@ -8351,9 +8383,8 @@ enum Ipv4OptionCheck {
 ///   §5.2.4.1);
 /// - a Strict Source and Record Route in a datagram whose destination is
 ///   none of the router's addresses (on any interface): pointer at the
-///   destination address, 16 (RFC 1812 §5.2.2). `local` is the ingress
-///   scoped local decision (ICMP4-001); a destination that is a router
-///   address on another interface counts as the router too.
+///   destination address, 16 (RFC 1812 §5.2.2). `local` is the local
+///   decision; a NAT public address it leaves to NAT counts as the router too.
 fn ipv4_option_check(
     frame: &[u8],
     snapshot: &ForwardingSnapshot<'_>,
@@ -8477,7 +8508,13 @@ fn truncated_parameter_problem<T: TraceSink>(
     {
         return;
     }
-    let local = snapshot.is_local_ipv4_on(ingress, ipv4.destination);
+    let local = snapshot.is_ipv4_for_router(
+        ingress,
+        ipv4.destination,
+        // ICMP NAT has nothing to say about a truncated datagram: only UDP and TCP
+        // to the public address are NAT's here.
+        nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, None),
+    );
     // INPUT-FW: a truncated datagram has no reliable transport header, so
     // the input policy judges it without one; a deny is silent (the drop
     // stays `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`).
