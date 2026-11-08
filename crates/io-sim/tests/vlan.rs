@@ -146,3 +146,16 @@ fn an_unknown_vlan_is_dropped() {
     assert!(io.pop_tx().is_none());
     assert_eq!(drops.0, [DropReason::VlanUnknown]);
 }
+
+/// IEEE 802.1Q: a priority-tagged frame (VLAN ID 0) is the port's own, untagged.
+#[test]
+fn a_priority_tagged_frame_is_the_port_s_own() {
+    let (mut io, drops) = run(vec![(
+        UPLINK,
+        udp(mac(2), [203, 0, 113, 7], [10, 10, 0, 5], Some(0)),
+    )]);
+    assert!(drops.0.is_empty(), "{:?}", drops.0);
+    let tx = io.pop_tx().expect("forwarded as if untagged");
+    assert_eq!(tx.egress, TRUNK);
+    assert_eq!(&tx.bytes[12..16], &[0x81, 0x00, 0x00, 0x0a], "VLAN 10");
+}
