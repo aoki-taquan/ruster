@@ -1033,18 +1033,17 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             && self.translated.is_pristine()
     }
 
+    /// Uses `policy` from now on, as the operator set it. Queued errors and their
+    /// states stay; later decisions use the new intervals.
+    pub fn set_policy(&mut self, policy: Icmpv4ErrorPolicy) {
+        self.policy = policy;
+    }
+
     /// Validates the generated-action queue without changing runtime state.
     ///
     /// Successful commit clears all limiter and action state because queued
     /// actions contain publication-specific egress, MAC, and IPv4 authority.
     /// Cumulative operational counters are deliberately preserved.
-    /// Uses `policy` from now on (RFC 1812 4.3.2.8: the rate limit is set by the
-    /// operator). Queued errors and their states stay; later decisions use the new
-    /// intervals.
-    pub fn set_policy(&mut self, policy: Icmpv4ErrorPolicy) {
-        self.policy = policy;
-    }
-
     pub fn preflight_publication<'runtime>(
         &'runtime mut self,
     ) -> Result<Icmpv4ErrorPublicationPermit<'runtime, 'a>, Icmpv4ErrorPublicationError> {

@@ -118,8 +118,6 @@ pub enum Value {
         mac: [u8; 6],
     },
     Nat(Nat),
-    /// Which outside endpoints may reach an inside endpoint with a flow out, where
-    /// no rule decides. Left out of the message when it is the default.
     /// ICMPv4 errors at most one per `ipv4_interval_ms` per egress and kind; ICMPv6
     /// errors `ipv6_burst` at once and one more every `ipv6_interval_ms`.
     IcmpErrors {
@@ -127,6 +125,8 @@ pub enum Value {
         ipv6_burst: u32,
         ipv6_interval_ms: u32,
     },
+    /// Which outside endpoints may reach an inside endpoint with a flow out, where
+    /// no rule decides. Left out of the message when it is the default.
     FirewallPolicy {
         filtering: NatFiltering,
         /// The interfaces outside the network the firewall guards (RFC 6092's
