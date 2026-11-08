@@ -3,7 +3,7 @@
 //!
 //! A pipe carries one IP packet per message, as a TUN device without packet
 //! information does. Packets to the kernel are limited per class (ICMP errors,
-//! other ICMP, TCP, UDP, other) by a token bucket, so a flood of one kind does not crowd out the others or
+//! other ICMP, TCP SYNs, other TCP, UDP, other) by a token bucket, so a flood of one kind does not crowd out the others or
 //! the forwarding; ARP and Neighbor Discovery to the neighbor process have their own
 //! buckets too.
 
@@ -51,6 +51,9 @@ pub(crate) enum Class {
     /// Exceeded, Parameter Problem): the router's own connections need them, so a
     /// flood of echo requests does not take their place (RFC 6192 section 3).
     IcmpError = 6,
+    /// TCP SYNs that open a connection: a flood of them does not take the place of
+    /// established connections (BGP, SSH) (RFC 6192 section 3).
+    TcpSyn = 7,
 }
 
 /// The class of an IP packet (`packet` starts at the IP header).
@@ -65,6 +68,13 @@ pub(crate) fn class(packet: &[u8]) -> Class {
         Some(1) if matches!(icmp_type, Some(3 | 11 | 12)) => Class::IcmpError,
         Some(58) if matches!(icmp_type, Some(1..=4)) => Class::IcmpError,
         Some(1 | 58) => Class::Icmp,
+        Some(6)
+            if packet
+                .get(header + 13)
+                .is_some_and(|flags| flags & 0x12 == 0x02) =>
+        {
+            Class::TcpSyn
+        }
         Some(6) => Class::Tcp,
         Some(17) => Class::Udp,
         _ => Class::Other,
@@ -79,15 +89,15 @@ pub const LOCAL_INTERVAL_US: u64 = 500;
 /// Token buckets, one per class.
 #[derive(Debug)]
 pub(crate) struct Limiter {
-    tokens: [u32; 7],
-    refilled_at_us: [u64; 7],
+    tokens: [u32; 8],
+    refilled_at_us: [u64; 8],
 }
 
 impl Default for Limiter {
     fn default() -> Self {
         Self {
-            tokens: [LOCAL_BURST; 7],
-            refilled_at_us: [0; 7],
+            tokens: [LOCAL_BURST; 8],
+            refilled_at_us: [0; 8],
         }
     }
 }
@@ -143,5 +153,13 @@ mod tests {
         assert_eq!(class(&v6), Class::IcmpError);
         v6[40] = 128;
         assert_eq!(class(&v6), Class::Icmp);
+        let mut tcp = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 6];
+        tcp.resize(40, 0);
+        tcp[33] = 0x02;
+        assert_eq!(class(&tcp), Class::TcpSyn);
+        tcp[33] = 0x12;
+        assert_eq!(class(&tcp), Class::Tcp, "a SYN-ACK is a reply");
+        tcp[33] = 0x10;
+        assert_eq!(class(&tcp), Class::Tcp);
     }
 }
