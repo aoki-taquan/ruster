@@ -109,12 +109,17 @@ AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netns�
 
 #### 残り（この順に作る）
 
-1. 「作るもの」をRFCと突き合わせる見直し。機能のまとまりごとに行う（転送・VRF・VLAN、NAT44とNAPT、
-   firewall、フラグメントとICMPのエラー、トンネルとPPPoE、ルータ宛て通信、CE）。外れている点は直すか、
-   そのモジュールの`# Standards`のDeviationsに理由を書く。#462の残り（MAP-EのMTU、discard routeなど）も
-   ここで扱う。
+1. RFCとの見直し（2026-11-08、#506）で出た点を直す。済んだもの: ルータのどのアドレス宛てもルータに
+   届ける、firewallで転送のICMPv4エラーを通す、ルータが作るパケットをPPPoE・トンネル・VLANから出す。
+   残りはこの順:
+   1. トンネルのMTUを下の回線で確かめる（#462）。
+   2. DS-LiteとMAP-Eの外側のIPv6のフラグメントと組み立て（RFC 6333 5.3）。
+   3. neighdの近隣を古くし、確かめ直す（RFC 4861 7.3）。ルータ宛てでないNSから学ばない。
+   4. MAP-Eの残り（#462: 外したあとの宛先、discard route、/64、unicastと重複の確認）。
+   5. #506のMediumとLow、`# Standards`の足りないモジュール。
 2. 形の違う構成での試験。機能を一つずつ試す今のnetnsの試験に加えて、機能を組み合わせた構成
    （VLANの上のNATとfirewall、PPPoEの上のMAP-E、VRFごとのNATなど）を、AF_XDPとAF_PACKETの両方で試す。
+   今のnetnsの試験8本は、どれもAF_XDPとAF_PACKETの両方で通る。
 
 ## 気をつけること
 
