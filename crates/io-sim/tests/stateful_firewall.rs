@@ -1300,7 +1300,7 @@ fn legacy_forwarding_is_unchanged_when_firewall_api_is_not_selected() {
 }
 
 #[test]
-fn plain_natless_code4_preserves_legacy_and_firewall_deferred_behavior() {
+fn plain_natless_code4_preserves_legacy_and_the_firewall_wants_a_related_flow() {
     let (routes, interfaces, neighbors, bindings) = topology();
     let snapshot = ForwardingSnapshot::new(&routes, &interfaces, &neighbors, &bindings).unwrap();
     let quoted = udp_frame(WAN_LOCAL, REMOTE, 40_000, 53, 0x4000, false);
@@ -1382,17 +1382,15 @@ fn plain_natless_code4_preserves_legacy_and_firewall_deferred_behavior() {
             &mut NoTrace,
         )
         .unwrap();
+    // The firewall passes a forwarded error only as RELATED to a flow of the host
+    // it goes to: this one quotes another host's packet.
     assert_drop(
         &mut protected,
-        DropReason::FirewallUnsupportedProtocol,
+        DropReason::FirewallRelatedIcmpv4Unsupported,
         &forwarded,
     );
-    assert_ne!(
-        DropReason::FirewallUnsupportedProtocol,
-        DropReason::FirewallRelatedIcmpv4Unsupported
-    );
     assert!(firewall.states().iter().all(|slot| !slot.is_occupied()));
-    assert_eq!(firewall.counters().invalid_packets, 1);
+    assert_eq!(firewall.counters(), Default::default());
 }
 
 #[test]
