@@ -4657,6 +4657,7 @@ fn decide_ipv4<T: TraceSink>(
     // the public address as a wrong-ingress external error.
     if is_nat44_icmpv4_inside_candidate(
         frame,
+        snapshot,
         ingress,
         ipv4,
         local,

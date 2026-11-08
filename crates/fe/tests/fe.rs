@@ -3407,3 +3407,70 @@ fn an_unresolvable_next_hop_gets_host_unreachable() {
     assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 1));
     assert!(bench.fe.io_mut().pop_tx().is_none());
 }
+
+/// The router's own ICMP error about a flow NAT translated for it (Port Unreachable
+/// for a late reply) goes out translated too, from the public address (RFC 5508
+/// REQ-5).
+#[test]
+fn nat_translates_the_router_s_own_icmp_errors_about_its_flows() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    kernel
+        .send(&udp_packet([192, 0, 2, 1], INTERNET, (5_353, 53)))
+        .unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("translated and sent");
+    let port = u16::from_be_bytes([tx.bytes[34], tx.bytes[35]]);
+    let reply = udp_packet(INTERNET, [198, 51, 100, 2], (53, port));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&reply));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("the reply reached the kernel");
+    let delivered = buf[..n].to_vec();
+
+    // The kernel's socket is gone: Port Unreachable about the reply it got.
+    let mut icmp = vec![3, 3, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&delivered[..28]);
+    let sum = ruster_core::internet_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    let mut error = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0];
+    error.extend_from_slice(&[192, 0, 2, 1]);
+    error.extend_from_slice(&INTERNET);
+    error.extend_from_slice(&icmp);
+    let len = error.len() as u16;
+    error[2..4].copy_from_slice(&len.to_be_bytes());
+    kernel.send(&ipv4_checksummed(error)).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("the error went out");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(
+        &tx.bytes[26..30],
+        &[198, 51, 100, 2],
+        "from the public address"
+    );
+    assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 3));
+    let quoted = 14 + 20 + 8;
+    assert_eq!(
+        &tx.bytes[quoted + 16..quoted + 20],
+        &[198, 51, 100, 2],
+        "quote turned back"
+    );
+    assert_eq!(
+        u16::from_be_bytes([tx.bytes[quoted + 22], tx.bytes[quoted + 23]]),
+        port
+    );
+}
