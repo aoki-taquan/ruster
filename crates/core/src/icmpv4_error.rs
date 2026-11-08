@@ -1,3 +1,19 @@
+//! ICMPv4 errors the router generates about the datagrams it forwards or refuses.
+//!
+//! # Standards
+//!
+//! - RFC 1812 section 4.3.2: Time Exceeded, Destination Unreachable (Network,
+//!   Port, Protocol, Fragmentation Needed with the Next-Hop MTU of RFC 1191,
+//!   Administratively Prohibited when enabled), Parameter Problem and Redirect;
+//!   none about an ICMP error, a non-initial fragment, a broadcast or multicast,
+//!   or a source that is not a host (section 4.3.2.7); the quote at most 576 bytes
+//!   in all and cut to the egress MTU (section 4.3.2.3); precedence 6 (section
+//!   4.3.2.5); a rate limit per kind and egress (section 4.3.2.8).
+//!
+//! Deviations: no Destination Unreachable (Host) for an unresolved neighbor (the
+//! packet is dropped silently, RFC 1812 section 5.2.7.1 says SHOULD); no Source
+//! Quench (RFC 6633 deprecates it).
+
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::icmpv4_translated_limit::{

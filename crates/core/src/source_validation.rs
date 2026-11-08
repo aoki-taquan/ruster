@@ -26,6 +26,15 @@
 //! validation already performs for the martian source checks, so it adds no
 //! lookup; with every interface off the snapshot holds no binding and the
 //! check is a single empty-slice branch.
+//!
+//! # Standards
+//!
+//! - RFC 1812 section 5.3.8: strict reverse-path filtering, off by default.
+//! - RFC 3704 sections 2.4 and 2.5: loose reverse-path filtering, with and without
+//!   default routes.
+//!
+//! Deviations: no feasible-path reverse-path filtering (RFC 3704 section 2.3, RFC
+//! 8704): the table holds one path per prefix.
 
 use crate::{IfId, Route};
 

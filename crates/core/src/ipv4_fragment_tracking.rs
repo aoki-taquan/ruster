@@ -80,6 +80,19 @@
 //!
 //! The table is flushed at every publication apply (its templates name the
 //! previous publication's egress and neighbors), counting what it held.
+//!
+//! # Standards
+//!
+//! - RFC 4787 REQ-14, RFC 5382 section 5 and RFC 5508 section 5: every fragment of
+//!   a datagram gets its first fragment's NAT and firewall decision; fragments that
+//!   arrive before it are held, a bounded number.
+//! - RFC 1858 and RFC 3128: tiny and overlapping fragments are refused.
+//! - RFC 6864 section 5.3.1: a translated non-atomic datagram gets one new IPv4 ID.
+//!
+//! Deviations: a later fragment starting at offset 1 or 2 is refused for every
+//! protocol (RFC 1858 asks it for TCP); the table's limits (entries, per source,
+//! held per source) and its key's ingress interface drop fragments past them or
+//! from another interface.
 
 use std::{marker::PhantomData, rc::Rc};
 

@@ -13,7 +13,12 @@
 //!   link).
 //!
 //! Deviations: session frames that are not IPv4 or IPv6 (LCP, IPCP, ...) and
-//! Discovery frames are dropped; handing them to the daemon comes later.
+//! Discovery frames are dropped: PPPoE's control is not built for now (2026-11-08
+//! owner decision; the session is set up outside, and Echo-Request and PADT are
+//! not answered). The PPP protocol field is two bytes: a peer must not negotiate
+//! protocol-field compression (RFC 1661 6.5). A session's IPv6 link-local address
+//! comes from the interface's MAC, not the IPv6CP interface identifier (RFC 5072
+//! section 5).
 
 use crate::{DropReason, IfId, MacAddress, PacketLease, PacketSlot};
 
