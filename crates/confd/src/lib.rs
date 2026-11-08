@@ -7,7 +7,7 @@
 //! |---|---|
 //! | FE | interfaces, addresses, and the default VRF's firewall rules and NAT |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
-//! | ribd | static routes and the connected routes of the addresses, as source `confd` |
+//! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
 //!
 //! On every (re)connection confd sends everything between resync-begin and resync-end,
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
@@ -495,6 +495,21 @@ impl Confd {
         out
     }
 
+    /// Whether packets can leave through `name`: it is enabled, and so is the parent
+    /// a VLAN sub-interface or PPPoE session runs on.
+    fn usable(&self, name: &str) -> bool {
+        let find = |name: &str| self.config.interfaces.iter().find(|i| i.name == name);
+        let Some(interface) = find(name) else {
+            return false;
+        };
+        let parent = interface
+            .vlan
+            .as_ref()
+            .map(|(parent, _)| parent)
+            .or(interface.pppoe.as_ref().map(|(parent, _, _)| parent));
+        interface.enabled && parent.is_none_or(|parent| self.usable(parent))
+    }
+
     /// Connected routes of enabled interfaces, then static routes (a static route for
     /// the same prefix replaces the connected one).
     fn routes(&self) -> BTreeMap<Key, Value> {
@@ -526,12 +541,7 @@ impl Confd {
             // A static route out of a disabled interface cannot be used: it is not
             // offered, so that another source's route for the prefix is chosen.
             if let RouteTarget::Next { interface, .. } = &route.target {
-                let enabled = self
-                    .config
-                    .interfaces
-                    .iter()
-                    .any(|i| i.name == *interface && i.enabled);
-                if !enabled {
+                if !self.usable(interface) {
                     continue;
                 }
             }
