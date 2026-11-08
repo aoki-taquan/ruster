@@ -2543,7 +2543,7 @@ mod tests {
         assert!(runtime.discard_front());
         assert!(!runtime.discard_front());
         assert!(matches!(
-            runtime.schedule(time, MonotonicMillis(1)),
+            runtime.schedule(time, MonotonicMillis(1_000)),
             Icmpv4ErrorDisposition::Queued { .. }
         ));
         assert!(runtime.discard_front());
