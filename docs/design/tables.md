@@ -143,6 +143,22 @@ FEが作る状態（読むだけ）: 解決待ちの宛先と、その間待た�
 
 FEが作る状態（読むだけ）: 追っている通信の一覧、ルールごとの一致数。
 
+### IPv6
+
+IPv4とIPv6の転送に同じfirewallを使う。決めること（RFC 4890、RFC 6092を参考にする）:
+
+- 状態の表は一つで、IPv4とIPv6の通信を一緒に持つ。容量も共有する。
+- ルールは一つの家族（IPv4かIPv6）のprefixを持ち、その家族のパケットにだけ当たる。
+  プロトコルは`tcp`、`udp`、`icmp`（ICMPv4）、`icmpv6`。
+- IPv6の拡張ヘッダ（Hop-by-Hop、Routing、Destination Options、Fragment）は、決まった数まで
+  たどって上位のヘッダを見つける。見つからないものは落とす。
+- 先頭でないフラグメントは、firewallがあるあいだ落とす（IPv4のような追跡は後で足す）。
+- ICMPv6のEchoは、ICMPv4と同じくidで状態を追う。エラー（Destination Unreachable、
+  Packet Too Big、Time Exceeded、Parameter Problem）は、中身が追っている通信に当たるときだけ通す。
+  Packet Too Bigは経路のMTUを知るのに要る（RFC 4890 4.3.1）。
+- NDはリンクの外へ転送しないので、forwardのルールの対象にならない。
+- ルータ自身が作るICMPとICMPv6のエラーは、IPv4と同じくforwardのルールを通らない。
+
 ## ルータ宛て通信の分類（`ruster-punt`）
 
 ルータ宛て、またはCEが処理すべきパケットの分類と渡し先、上限を決める。
