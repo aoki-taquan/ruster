@@ -287,6 +287,11 @@ where
         self.local.insert(vrf.to_owned(), pipe);
     }
 
+    /// Stops handing VRF `vrf`'s traffic to the kernel (its device went away).
+    pub fn detach_local(&mut self, vrf: &str) {
+        self.local.remove(vrf);
+    }
+
     /// The VRFs of the current tables, the default VRF first.
     pub fn vrfs(&self) -> &[String] {
         &self.names
