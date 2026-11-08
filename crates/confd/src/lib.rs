@@ -524,8 +524,8 @@ impl Confd {
         interface.enabled && parent.is_none_or(|parent| self.usable(parent))
     }
 
-    /// Connected routes of enabled interfaces, then static routes (a static route for
-    /// the same prefix replaces the connected one).
+    /// Connected routes of enabled interfaces, then static routes. A static route for
+    /// a connected prefix is left out: the connected route wins, as on most routers.
     fn routes(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
         for interface in self.config.interfaces.iter().filter(|i| i.enabled) {
@@ -568,10 +568,8 @@ impl Confd {
                 RouteTarget::Discard => RouteAction::Discard,
                 RouteTarget::Reject => RouteAction::Reject,
             };
-            out.insert(
-                route_key(&route.vrf, route.prefix, route.len),
-                Value::Route(action),
-            );
+            out.entry(route_key(&route.vrf, route.prefix, route.len))
+                .or_insert(Value::Route(action));
         }
         out
     }
@@ -706,5 +704,52 @@ impl Task for Confd {
             }
         }
         progress
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_static_route_for_a_connected_prefix_does_not_replace_it() {
+        let lan = InterfaceConfig {
+            name: "lan".into(),
+            mac: [2, 0, 0, 0, 0, 1],
+            mtu: 1500,
+            enabled: true,
+            ipv4: Some((Ipv4Addr::new(192, 0, 2, 1), 24)),
+            ipv6: Vec::new(),
+            vrf: "default".into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: None,
+        };
+        let route = |len| StaticRoute {
+            vrf: "default".into(),
+            prefix: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)),
+            len,
+            target: RouteTarget::Discard,
+        };
+        let confd = Confd::new(Config {
+            wireguard: Vec::new(),
+            interfaces: vec![lan],
+            static_routes: vec![route(24), route(25)],
+            firewall: Vec::new(),
+            firewall_filtering: Default::default(),
+            icmp_errors: None,
+            nat: None,
+        });
+        let routes = confd.routes();
+        let connected = Value::Route(RouteAction::Forward(vec![NextHop {
+            interface: "lan".into(),
+            address: None,
+        }]));
+        let key = |len| route_key("default", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), len);
+        assert_eq!(routes.get(&key(24)), Some(&connected));
+        assert_eq!(
+            routes.get(&key(25)),
+            Some(&Value::Route(RouteAction::Discard))
+        );
     }
 }
