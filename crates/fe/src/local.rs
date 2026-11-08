@@ -4,7 +4,8 @@
 //! A pipe carries one IP packet per message, as a TUN device without packet
 //! information does. Packets to the kernel are limited per class (ICMP, TCP, UDP,
 //! other) by a token bucket, so a flood of one kind does not crowd out the others or
-//! the forwarding.
+//! the forwarding; ARP and Neighbor Discovery to the neighbor process have their own
+//! buckets too.
 
 use std::io;
 use std::os::unix::net::UnixDatagram;
@@ -42,6 +43,10 @@ pub(crate) enum Class {
     Tcp = 1,
     Udp = 2,
     Other = 3,
+    /// ARP to the neighbor process.
+    Arp = 4,
+    /// Neighbor Discovery to the neighbor process.
+    Nd = 5,
 }
 
 /// The class of an IP packet (`packet` starts at the IP header).
@@ -67,15 +72,15 @@ pub const LOCAL_INTERVAL_US: u64 = 500;
 /// Token buckets, one per class.
 #[derive(Debug)]
 pub(crate) struct Limiter {
-    tokens: [u32; 4],
-    refilled_at_us: [u64; 4],
+    tokens: [u32; 6],
+    refilled_at_us: [u64; 6],
 }
 
 impl Default for Limiter {
     fn default() -> Self {
         Self {
-            tokens: [LOCAL_BURST; 4],
-            refilled_at_us: [0; 4],
+            tokens: [LOCAL_BURST; 6],
+            refilled_at_us: [0; 6],
         }
     }
 }
@@ -109,6 +114,8 @@ mod tests {
         }
         assert!(!limiter.take(Class::Udp, 0), "UDP is used up");
         assert!(limiter.take(Class::Tcp, 0), "TCP is not");
+        assert!(limiter.take(Class::Arp, 0), "nor ARP");
+        assert!(limiter.take(Class::Nd, 0), "nor ND");
         assert!(limiter.take(Class::Udp, 1), "two more after a millisecond");
         assert!(limiter.take(Class::Udp, 1));
         assert!(!limiter.take(Class::Udp, 1));
