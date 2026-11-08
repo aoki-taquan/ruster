@@ -802,6 +802,15 @@ fn map_e_follows_rfc_7597_appendix_a() {
         ),
         (text.replace("192.0.2.0/24", "224.0.2.0/24"), "unicast"),
         (
+            text.replace("rule-ipv6 = \"2001:db8::/40\"", "rule-ipv6 = \"2001:db8::1/40\""),
+            "rule-ipv6 has bits set",
+        ),
+        (text.replace("ea-length = 16", "ea-length = 49"), "at most 48"),
+        (
+            text.replace("2001:db8:ffff:1::2/64", "2001:db8:12:3400::2/64"),
+            "must not be an on-link prefix",
+        ),
+        (
             text.replace(
                 "[map-e]",
                 "[[interface]]\nname = \"dmz\"\nmac = \"02:00:00:00:00:03\"\nipv4 = \"192.0.2.18/24\"\n[map-e]",
