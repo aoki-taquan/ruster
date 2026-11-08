@@ -1014,6 +1014,7 @@ fn nat(first_port: u16, last_port: u16) -> Change {
                 first: first_port,
                 last: last_port,
             },
+            filtering: Default::default(),
         }),
     )
 }
@@ -2870,4 +2871,41 @@ fn discard_and_reject_routes_drop_what_they_hold() {
     assert_eq!(tx.egress, IfId(0));
     assert_eq!((tx.bytes[14 + 20], tx.bytes[14 + 21]), (3, 0));
     assert!(bench.fe.io_mut().pop_tx().is_none(), "not sent upstream");
+}
+
+/// NAT's default filtering is endpoint-independent (RFC 4787 REQ-8): once a LAN
+/// host's UDP has gone out, a packet from another outside endpoint to its mapping
+/// reaches it too.
+#[test]
+fn by_default_nat_lets_any_outside_endpoint_reach_a_mapping() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let out = udp_packet([192, 0, 2, 10], INTERNET, (5_000, 3_478));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("translated");
+    let port = u16::from_be_bytes([tx.bytes[34], tx.bytes[35]]);
+
+    let other = udp_packet([203, 0, 113, 99], [198, 51, 100, 2], (3_479, port));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&other));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("reached the host");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[30..34], &[192, 0, 2, 10]);
+    assert_eq!(u16::from_be_bytes([tx.bytes[36], tx.bytes[37]]), 5_000);
 }

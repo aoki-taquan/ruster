@@ -52,6 +52,7 @@
 //! psid-offset = 6              # optional, 6 when left out
 //! br = "2001:db8:ffff::1"
 //! mtu = 1460                   # optional, 1460 when left out
+//! filtering = "endpoint-independent"  # optional, as for [nat]
 //!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
@@ -86,6 +87,8 @@
 //! outside = "wan"              # must have an ipv4 address: the public one
 //! ports = "1024-32767"         # optional, 1024-32767 when left out
 //! external = "198.51.100.2"    # optional; for now only the outside's own address
+//! filtering = "endpoint-independent"  # optional, the default, or
+//!                              # "address-dependent", "address-and-port-dependent"
 //! ```
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
@@ -148,8 +151,10 @@
 //!   the default VRF, not ACLs attached per interface; a rule without addresses whose
 //!   protocol has both families is two ACEs, one per family.
 //! - RFC 4787, RFC 5382 and RFC 5508: `nat` is NAPT for UDP, TCP and ICMP queries
-//!   with core's behaviour (endpoint-independent mapping, address-dependent
-//!   filtering); see `ruster_core`'s NAT modules for its deviations. One inside and
+//!   with core's behaviour (endpoint-independent mapping; filtering as `filtering`
+//!   names for UDP and TCP; endpoint-independent by default, which RFC 4787 REQ-8
+//!   and RFC 5382 REQ-3 recommend where application transparency matters most);
+//!   see `ruster_core`'s NAT modules for its deviations. One inside and
 //!   one outside interface, and the outside interface's address as the public one.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -157,7 +162,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Deserialize;
 
-use ruster_proto::table::{FirewallAction, FirewallRule, Nat, NatPorts, Protocol, DEFAULT_VRF};
+use ruster_proto::table::{
+    FirewallAction, FirewallRule, Nat, NatFiltering, NatPorts, Protocol, DEFAULT_VRF,
+};
 
 use crate::{
     Config, InterfaceConfig, RouteTarget, StaticRoute, WireguardConfig, WireguardPeerConfig,
@@ -222,6 +229,7 @@ struct MapEEntry {
     psid_offset: Option<u8>,
     br: String,
     mtu: Option<u16>,
+    filtering: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -231,6 +239,20 @@ struct NatEntry {
     outside: String,
     ports: Option<String>,
     external: Option<String>,
+    filtering: Option<String>,
+}
+
+/// `filtering = "..."` of `[nat]` or `[map-e]`; endpoint-independent when left out.
+fn filtering(at: &str, text: Option<&str>) -> Result<NatFiltering, String> {
+    match text {
+        None => Ok(NatFiltering::default()),
+        Some(text) => NatFiltering::from_name(&format!("{text}-filtering"))
+            .ok_or_else(|| {
+                format!(
+                    "{at}: filtering must be \"endpoint-independent\", \"address-dependent\" or \"address-and-port-dependent\""
+                )
+            }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -1039,6 +1061,7 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
         pppoe: None,
     };
     let nat = Nat {
+        filtering: filtering(at, entry.filtering.as_deref())?,
         inside: entry.inside,
         outside: entry.interface,
         external: None,
@@ -1123,6 +1146,7 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
         }
     };
     Ok(Nat {
+        filtering: filtering(at, entry.filtering.as_deref())?,
         inside: entry.inside,
         outside: entry.outside,
         external,

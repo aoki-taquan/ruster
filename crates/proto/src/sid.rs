@@ -59,6 +59,8 @@ pub const NAT_LAST_PORT: u64 = 60065;
 pub const NAT_PSID_OFFSET: u64 = 60066;
 pub const NAT_PSID_LENGTH: u64 = 60067;
 pub const NAT_PSID: u64 = 60068;
+/// `ietf-nat` `policy/filtering-type` (RFC 4787 section 5).
+pub const NAT_FILTERING: u64 = 60069;
 
 /// One forward firewall rule (`ietf-access-control-list` ace, `ruster-firewall`).
 pub const FIREWALL_RULE: u64 = 60070;
@@ -181,6 +183,7 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-offset", NAT_PSID_OFFSET),
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-len", NAT_PSID_LENGTH),
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid", NAT_PSID),
+    ("/ietf-nat:nat/instances/instance/policy/filtering-type", NAT_FILTERING),
     ("/ietf-access-control-list:acls/acl/aces/ace", FIREWALL_RULE),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/ingress-interface", FIREWALL_INGRESS),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/egress-interface", FIREWALL_EGRESS),

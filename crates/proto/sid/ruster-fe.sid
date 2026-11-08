@@ -211,6 +211,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/filtering-type",
+        "sid": 60069,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-access-control-list:acls/acl/aces/ace",
         "sid": 60070,
         "status": "unstable"
