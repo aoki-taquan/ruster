@@ -49,10 +49,20 @@ pub fn open(devices: &[String]) -> Result<AfPacketIo, String> {
 }
 
 /// Waiting for AF_PACKET input between steps.
-#[derive(Default)]
 pub struct Waiter {
+    /// How long to wait for input while idle, up to [`crate::IDLE_LONGEST_MS`].
+    idle: daemon::Idle,
     /// The last wait said ready, and the step after it found nothing.
     ready_unused: bool,
+}
+
+impl Default for Waiter {
+    fn default() -> Self {
+        Self {
+            idle: daemon::Idle::up_to(crate::IDLE_LONGEST_MS),
+            ready_unused: false,
+        }
+    }
 }
 
 impl Backend<AfPacketIo> for Waiter {
@@ -66,13 +76,14 @@ impl Backend<AfPacketIo> for Waiter {
         }
         if busy {
             self.ready_unused = false;
+            self.idle.after(true);
         } else if self.ready_unused {
             // A readiness RX cannot consume (a socket condition): sleep, do not spin.
             self.ready_unused = false;
             thread::sleep(daemon::IDLE_MAX);
         } else {
             let woke = io
-                .wait_rx(daemon::IDLE_MAX_MS)
+                .wait_rx(self.idle.after(false).unwrap_or(1))
                 .map_err(|error| format!("waiting for packets: {error:?}"))?;
             self.ready_unused = woke == RxWait::Ready;
         }

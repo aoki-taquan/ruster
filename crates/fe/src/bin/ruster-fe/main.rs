@@ -24,6 +24,10 @@ use ruster_io_xdp_native::XdpAttachMode;
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
 
+/// The longest the FE waits for frames while idle. A frame wakes it at once; the
+/// control sockets and the kernel's frames are seen at the end of the wait.
+const IDLE_LONGEST_MS: u32 = 4;
+
 /// What the loop needs from a backend beyond packet I/O.
 pub trait Backend<B> {
     fn set_clock(&mut self, io: &mut B, now: MonotonicMillis);
