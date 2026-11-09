@@ -31,7 +31,9 @@
 //!   NAT's.
 //! - The per-host limits are off unless the tables set them: then one inside host
 //!   may take every mapping. There is no limit on how fast a host makes mappings
-//!   or state (RFC 6888 REQ-4 c, REQ-5 b). With endpoint-independent filtering,
+//!   or state (RFC 6888 REQ-4 c, REQ-5 b): those ask a carrier-grade NAT to share
+//!   its CPU among many subscribers, and the FE already bounds the work of each
+//!   batch. With endpoint-independent filtering,
 //!   `state-per-host` does not limit UDP's outside endpoints (outside hosts could
 //!   use it up).
 //! - Fragments whose datagram started before a table change are dropped
