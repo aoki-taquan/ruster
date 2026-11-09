@@ -329,7 +329,7 @@ impl Task for Ribd {
 impl Ribd {
     /// Handles the FE's answers. An accepted patch makes its routes what the FE holds;
     /// a refused one starts a resync, so routes the FE already has are kept until a
-    /// later full send is accepted. The refused routes go again with the next change.
+    /// later full send is accepted. The refused routes go again with the next change, or after RESYNC_END_RETRY_MS.
     fn answers(&mut self, events: &[Event]) {
         for event in events {
             let Event::Response { token, code, .. } = event else {

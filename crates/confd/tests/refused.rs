@@ -345,16 +345,31 @@ fn a_refused_patch_stops_the_timed_resync_end() {
     settle(&mut fe, &mut confd, &mut check);
     assert_eq!(mtu(&fe), Some(1500), "refused");
 
+    // The reason for the resync-end refusal goes; the change is still refused. A
+    // timed resync-end now would delete everything confd wrote.
     check.keep = None;
-    check.refuse_mtu = None;
-    for now in [1, ruster_confd::RESYNC_END_RETRY_MS + 1] {
+    let step_at = |fe: &mut Server, confd: &mut Confd, check: &mut Check, now: u64| {
         for _ in 0..100 {
-            fe.step(&mut check);
+            fe.step(check);
             confd.step(now);
         }
-    }
-    // Nothing was wiped; the refused change went again after the wait, and the FE
-    // took it this time.
+    };
+    step_at(&mut fe, &mut confd, &mut check, 1);
+    step_at(
+        &mut fe,
+        &mut confd,
+        &mut check,
+        ruster_confd::RESYNC_END_RETRY_MS + 1,
+    );
+    assert_eq!(mtu(&fe), Some(1500), "nothing was deleted");
+    // Then the change is taken: it goes again after the wait.
+    check.refuse_mtu = None;
+    step_at(
+        &mut fe,
+        &mut confd,
+        &mut check,
+        2 * ruster_confd::RESYNC_END_RETRY_MS + 2,
+    );
     assert_eq!(mtu(&fe), Some(1400), "the refused change is sent again");
 }
 
