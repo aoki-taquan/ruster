@@ -897,3 +897,24 @@ fn the_wireguard_tables_are_gone() {
         Err(ModelError::UnknownTable(60_100))
     ));
 }
+
+#[test]
+fn a_nat_without_the_ipv4_id_rate_limit_round_trips() {
+    let change = Change::set(
+        Key::Nat {
+            vrf: DEFAULT_VRF.into(),
+        },
+        Value::Nat(ruster_proto::table::Nat {
+            inside: "lan".into(),
+            outside: "wan".into(),
+            external: None,
+            ports: ruster_proto::table::NatPorts::Range {
+                first: 1_024,
+                last: 2_047,
+            },
+            filtering: Default::default(),
+            ipv4_id_rate_limit: false,
+        }),
+    );
+    assert_eq!(round_trip(&change), change);
+}
