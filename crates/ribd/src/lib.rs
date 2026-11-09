@@ -84,10 +84,16 @@ pub struct Ribd {
     /// The resync-end waiting for the FE's answer.
     resync_end: Option<u32>,
     /// The FE refused resync-end: what it holds stays marked stale, and resync-end
-    /// goes again after the next change from a source (not every step).
+    /// goes again after the next change from a source (not every step), or
+    /// [`RESYNC_END_RETRY_MS`] after the refusal was seen (what the FE refused for
+    /// may have gone).
     resync_end_refused: bool,
+    refused_at: Option<u64>,
     counters: RibdCounters,
 }
+
+/// A refused resync-end is sent again at least this often.
+pub const RESYNC_END_RETRY_MS: u64 = 10_000;
 
 impl std::fmt::Debug for Ribd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -120,6 +126,7 @@ impl Ribd {
             in_flight: None,
             resync_end: None,
             resync_end_refused: false,
+            refused_at: None,
             counters: RibdCounters::default(),
         })
     }
@@ -151,6 +158,7 @@ impl Ribd {
         self.in_flight = None;
         self.resync_end = None;
         self.resync_end_refused = false;
+        self.refused_at = None;
         self.dirty = true;
         self.resync_pending = self.waiting_since.is_none();
         Ok(())
@@ -274,6 +282,21 @@ impl Task for Ribd {
         }
         if std::mem::take(&mut self.dirty) && self.push() {
             progress.busy = true;
+        }
+        if self.resync_end_refused {
+            let at = *self.refused_at.get_or_insert(now_ms);
+            let retry_at = at.saturating_add(RESYNC_END_RETRY_MS);
+            if now_ms >= retry_at {
+                self.resync_end_refused = false;
+            } else {
+                progress = progress.and(Progress {
+                    busy: false,
+                    wake_at: Some(retry_at),
+                });
+            }
+        }
+        if !self.resync_end_refused {
+            self.refused_at = None;
         }
         if self.finish_resync() {
             progress.busy = true;

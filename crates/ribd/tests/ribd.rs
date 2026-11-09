@@ -346,3 +346,37 @@ fn a_refused_change_is_sent_again_with_the_next_one() {
         "the earlier route went with the next change"
     );
 }
+
+/// A refused resync-end is also sent again after a while with no change from a
+/// source: what the FE refused for may have gone (#562).
+#[test]
+fn a_refused_resync_end_is_sent_again_after_a_while() {
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[
+            route([10, 0, 0, 0], 8, "lan"),
+            route([192, 168, 0, 0], 16, "old"),
+        ])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+    lab.keep = Some(key([192, 168, 0, 0], 16));
+    lab.restart(vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[route([10, 0, 0, 0], 8, "lan")])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+    assert!(
+        lab.fe_route([192, 168, 0, 0], 16).is_some(),
+        "refused, so kept"
+    );
+
+    lab.keep = None;
+    lab.now += ruster_ribd::RESYNC_END_RETRY_MS - 1;
+    lab.settle();
+    assert!(lab.fe_route([192, 168, 0, 0], 16).is_some(), "not yet");
+    lab.now += 1;
+    lab.settle();
+    assert_eq!(lab.fe_route([192, 168, 0, 0], 16), None, "sent again");
+}
