@@ -137,7 +137,12 @@ fn sid_file_matches_the_constants() {
         sid::ALL.len(),
         "the .sid file has items the code does not"
     );
-    assert!(values.iter().all(|v| (60_000..100_000).contains(v)));
+    // Inside the file's assignment range.
+    assert!(text.contains("\"entry-point\": 60000,\n        \"size\": 200"));
+    assert!(
+        values.iter().all(|v| (60_000..60_200).contains(v)),
+        "{values:?}"
+    );
 }
 
 fn decode_bytes(bytes: &[u8]) -> Result<Change, ModelError> {
