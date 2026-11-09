@@ -12,8 +12,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use crate::wireguard::{InterfaceBuilt, PeerBuilt};
-use ruster_core::wireguard::{AllowedPrefix, SessionKeys};
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallIpv4Prefix, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, Ipv4InIpv6Tunnel, Ipv4OriginPolicy,
@@ -50,8 +48,6 @@ pub(crate) struct Built {
     pub(crate) unreachable: Vec<(IfId, Ipv4Address)>,
     /// The PPPoE sessions on enabled interfaces.
     pub(crate) pppoe: Vec<PppoeSession>,
-    /// The WireGuard interfaces that are enabled, with their peers and sessions.
-    pub(crate) wireguard: Vec<InterfaceBuilt>,
     /// Each VRF's kernel interface, in the order of `vrfs`: the router's own
     /// packets come in through it ([`crate::kernel`]).
     pub(crate) kernel: Vec<IfId>,
@@ -210,37 +206,6 @@ fn v6(address: IpAddr) -> Option<[u8; 16]> {
     }
 }
 
-/// Refuses WireGuard tables that would make two sessions seal with one key and
-/// counter, or that make messages reach the wrong session.
-fn check_wireguard(interfaces: &[InterfaceBuilt]) -> Result<(), String> {
-    let mut send_keys = BTreeMap::new();
-    for (at, interface) in interfaces.iter().enumerate() {
-        if interfaces[..at]
-            .iter()
-            .any(|i| i.local == interface.local && i.listen_port == interface.listen_port)
-        {
-            return Err(format!(
-                "WireGuard interface {}: another one has the same address and port",
-                interface.name
-            ));
-        }
-        let mut indexes = BTreeSet::new();
-        for peer in &interface.peers {
-            let Some(keys) = peer.keys else { continue };
-            if !indexes.insert(keys.local_index) {
-                return Err(format!(
-                    "WireGuard {} of {}: its local index is another peer's",
-                    peer.name, interface.name
-                ));
-            }
-            let name = format!("{} of {}", peer.name, interface.name);
-            if let Some(other) = send_keys.insert(keys.send, name.clone()) {
-                return Err(format!("WireGuard {name}: its send key is also {other}'s"));
-            }
-        }
-    }
-    Ok(())
-}
 /// The name of the default VRF's kernel interface, for the firewall's rules.
 pub(crate) const KERNEL_INTERFACE: &str = "rt-default";
 
@@ -426,92 +391,6 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
     }
-    // WireGuard interfaces get the ids after those: a plain interface entry that has
-    // WireGuard settings and is no port.
-    let mut wireguard = Vec::new();
-    for (key, value) in store.iter() {
-        let (Key::Wireguard { interface: name }, Value::Wireguard(settings)) = (key, value) else {
-            continue;
-        };
-        // What a resync has not sent again is on its way out: it must not count
-        // against the new tables, nor keep a session next to one that took its key.
-        if store.is_stale(key) {
-            continue;
-        }
-        let Some(Value::Interface {
-            enabled: true,
-            mac,
-            mtu,
-            vrf,
-            vlan: None,
-            tunnel: None,
-            pppoe: None,
-        }) = store.get(&Key::Interface { name: name.clone() })
-        else {
-            continue;
-        };
-        if ports.iter().any(|port| port == name) {
-            return Err(format!("WireGuard interface {name} has the name of a port"));
-        }
-        let id = u16::try_from(interface_names.len())
-            .map(IfId)
-            .map_err(|_| "too many interfaces".to_owned())?;
-        interface_names.push(name.clone());
-        interfaces.push(Interface {
-            id,
-            mac: MacAddress(*mac),
-            mtu: *mtu,
-        });
-        let mut peers = Vec::new();
-        for (key, value) in store.iter() {
-            let (Key::WireguardPeer { interface, peer }, Value::WireguardPeer(config)) =
-                (key, value)
-            else {
-                continue;
-            };
-            if interface != name {
-                continue;
-            }
-            let session_key = Key::WireguardSession {
-                interface: name.clone(),
-                peer: peer.clone(),
-            };
-            let keys = match store.get(&session_key) {
-                Some(Value::WireguardSession(session)) if !store.is_stale(&session_key) => {
-                    Some(SessionKeys {
-                        send: session.send,
-                        receive: session.receive,
-                        peer_index: session.peer_index,
-                        local_index: session.local_index,
-                    })
-                }
-                _ => None,
-            };
-            peers.push(PeerBuilt {
-                name: peer.clone(),
-                endpoint: config.endpoint.octets(),
-                port: config.port,
-                allowed: config
-                    .allowed
-                    .iter()
-                    .map(|&(address, len)| AllowedPrefix {
-                        address: address.octets(),
-                        len,
-                    })
-                    .collect(),
-                keys,
-            });
-        }
-        wireguard.push(InterfaceBuilt {
-            interface: id,
-            name: name.clone(),
-            local: settings.local.octets(),
-            listen_port: settings.listen_port,
-            peers,
-        });
-        active.insert(name.as_str(), (id, vrf.as_str()));
-    }
-    check_wireguard(&wireguard)?;
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
     for (key, _) in store.iter() {
         if let Key::Route { vrf, .. } = key {
@@ -758,7 +637,6 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         tunnels,
         unreachable,
         pppoe,
-        wireguard,
         kernel,
         firewall,
         firewall_on,
