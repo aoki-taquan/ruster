@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 #![doc = "A small, allocation-free IPv4 and ARP packet-processing core."]
 
-mod arp_policy;
 mod checksum;
 mod firewall;
 mod firewall6;
@@ -34,12 +33,6 @@ mod time;
 mod tunnel;
 mod vlan;
 
-pub use arp_policy::{
-    ArpAnnouncePolicy, ArpAnnouncePolicyError, ArpInterfacePolicy,
-    ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS, ARP_ANNOUNCE_INTERVAL_MS, ARP_ANNOUNCE_MAX_COUNT,
-    ARP_ANNOUNCE_MAX_INTERVAL_MS, ARP_ANNOUNCE_MIN_INTERVAL_MS, ARP_ANNOUNCE_NUM,
-    ARP_DEFEND_INTERVAL_MS,
-};
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[cfg(feature = "validation-test-hooks")]
 #[doc(hidden)]
