@@ -1016,6 +1016,8 @@ fn nat(first_port: u16, last_port: u16) -> Change {
             },
             filtering: Default::default(),
             ipv4_id_rate_limit: true,
+            ports_per_host: 0,
+            state_per_host: 0,
         }),
     )
 }
@@ -3325,5 +3327,49 @@ fn the_nat_limits_the_ipv4_ids_and_the_limit_can_be_turned_off() {
     assert!(
         bench.fe.io_mut().pop_tx().is_some(),
         "without the limit it goes"
+    );
+}
+
+/// With `ports-per-host`, one LAN host holds at most that many public ports
+/// (RFC 6888 REQ-4): with 1, its second UDP flow is not translated.
+#[test]
+fn the_nat_limits_the_ports_of_one_host() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+        ],
+    );
+    let Change {
+        key,
+        value: Some(Value::Nat(mut limited)),
+    } = nat(40_000, 40_009)
+    else {
+        unreachable!()
+    };
+    limited.ports_per_host = 1;
+    assert_eq!(
+        bench.patch(&mut config, &[Change::set(key, Value::Nat(limited))]),
+        Code::CHANGED
+    );
+    let flow = |port: u16| from_lan(&udp_packet([192, 0, 2, 10], INTERNET, (port, 53)));
+    bench.fe.io_mut().inject(IfId(0), flow(5_000));
+    bench.fe.step(1_000);
+    assert!(bench.fe.io_mut().pop_tx().is_some(), "the first flow");
+    bench.fe.io_mut().inject(IfId(0), flow(5_001));
+    bench.fe.step(1_000);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "a second port is refused"
+    );
+    bench.fe.io_mut().inject(IfId(0), flow(5_000));
+    bench.fe.step(1_000);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_some(),
+        "the first flow goes on"
     );
 }

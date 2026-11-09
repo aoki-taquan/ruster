@@ -608,6 +608,8 @@ fn nat_and_firewall_entries_round_trip_and_are_checked() {
                 ports: ruster_proto::table::NatPorts::Range { first, last },
                 filtering: ruster_proto::table::NatFiltering::AddressDependent,
                 ipv4_id_rate_limit: true,
+                ports_per_host: 0,
+                state_per_host: 0,
             }),
         )
     };
@@ -710,6 +712,8 @@ fn a_nat_with_a_psid_port_set_round_trips_and_is_checked() {
                 ports,
                 filtering: Default::default(),
                 ipv4_id_rate_limit: true,
+                ports_per_host: 0,
+                state_per_host: 0,
             }),
         )
     };
@@ -825,6 +829,8 @@ fn a_nat_without_filtering_type_is_endpoint_independent() {
         },
         filtering: NatFiltering::EndpointIndependent,
         ipv4_id_rate_limit: true,
+        ports_per_host: 0,
+        state_per_host: 0,
     };
     let change = Change::set(
         Key::Nat {
@@ -899,7 +905,7 @@ fn the_wireguard_tables_are_gone() {
 }
 
 #[test]
-fn a_nat_without_the_ipv4_id_rate_limit_round_trips() {
+fn a_nat_without_the_ipv4_id_rate_limit_and_with_per_host_limits_round_trips() {
     let change = Change::set(
         Key::Nat {
             vrf: DEFAULT_VRF.into(),
@@ -914,6 +920,8 @@ fn a_nat_without_the_ipv4_id_rate_limit_round_trips() {
             },
             filtering: Default::default(),
             ipv4_id_rate_limit: false,
+            ports_per_host: 64,
+            state_per_host: 512,
         }),
     );
     assert_eq!(round_trip(&change), change);

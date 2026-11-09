@@ -140,6 +140,13 @@ pub struct Nat {
     /// (RFC 6864 section 5.2). Left out of the message when it is the default,
     /// `true`.
     pub ipv4_id_rate_limit: bool,
+    /// The most public ports one inside host may hold, for each of UDP, TCP and
+    /// ICMP (RFC 6888 REQ-4); 0 for no limit. Left out of the message when 0.
+    pub ports_per_host: u16,
+    /// The most state one inside host may hold: TCP sessions, and the outside
+    /// endpoints its UDP and ICMP mappings have sent to (RFC 6888 REQ-5); 0 for
+    /// no limit. Left out of the message when 0.
+    pub state_per_host: u16,
 }
 
 /// Which outside endpoints may reach a mapping (`ietf-nat` `filtering-type`).
@@ -755,13 +762,23 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 2 + ports
                     + u64::from(nat.external.is_some())
                     + u64::from(filtering)
-                    + u64::from(no_id_limit),
+                    + u64::from(no_id_limit)
+                    + u64::from(nat.ports_per_host != 0)
+                    + u64::from(nat.state_per_host != 0),
             );
             if filtering {
                 e.u64(d(sid::NAT_FILTERING)).text(nat.filtering.name());
             }
             if no_id_limit {
                 e.u64(d(sid::NAT_IPV4_ID_RATE_LIMIT)).bool(false);
+            }
+            if nat.ports_per_host != 0 {
+                e.u64(d(sid::NAT_PORTS_PER_HOST))
+                    .u64(u64::from(nat.ports_per_host));
+            }
+            if nat.state_per_host != 0 {
+                e.u64(d(sid::NAT_STATE_PER_HOST))
+                    .u64(u64::from(nat.state_per_host));
             }
             e.u64(d(sid::NAT_INSIDE))
                 .text(&nat.inside)
@@ -1233,6 +1250,9 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             Some(Member::Bool(on)) => on,
             Some(_) => return Err(ModelError::Invalid("ipv4-id-rate-limit")),
         };
+        // Left out: 0, no limit.
+        let ports_per_host = port(&mut got, sid::NAT_PORTS_PER_HOST)?.unwrap_or(0);
+        let state_per_host = port(&mut got, sid::NAT_STATE_PER_HOST)?.unwrap_or(0);
         let range = (
             port(&mut got, sid::NAT_FIRST_PORT)?,
             port(&mut got, sid::NAT_LAST_PORT)?,
@@ -1258,6 +1278,8 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             ports,
             filtering,
             ipv4_id_rate_limit,
+            ports_per_host,
+            state_per_host,
         })
     } else {
         let ingress = text(sid::FIREWALL_INGRESS, "ingress")?;

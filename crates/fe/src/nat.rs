@@ -18,6 +18,10 @@
 //!   address-dependent. With endpoint-independent filtering, any outside host may
 //!   reach a mapping the router's own traffic made too (its LAN address goes
 //!   through NAT); at most 8 TCP sessions are opened from one outside address.
+//! - RFC 6888 REQ-4 and REQ-5 a: the tables may limit the public ports and the
+//!   state one inside host holds (`ports-per-host`, `state-per-host`). RFC 6864
+//!   section 5.2: the IPv4 IDs of translated datagrams are rate limited outbound
+//!   unless the tables turn it off.
 //!
 //! Deviations:
 //!
@@ -25,9 +29,9 @@
 //!   own and are not translated. The pool must therefore not overlap the ports the
 //!   router's kernel picks for its own connections, or their replies are taken for
 //!   NAT's.
-//! - No per-host limits: one inside host may take every mapping.
-//! - Unsolicited inbound SYNs are dropped at once; RFC 5382 REQ-4's hold before an
-//!   ICMP error needs storage the FE does not give yet.
+//! - The per-host limits are off unless the tables set them: then one inside host
+//!   may take every mapping. There is no limit on how fast a host makes mappings
+//!   or state (RFC 6888 REQ-4 c, REQ-5 b).
 //! - Fragments whose datagram started before a table change are dropped
 //!   (`fragments.rs`).
 use std::collections::hash_map::RandomState;
@@ -76,6 +80,8 @@ impl Publication {
             ports,
             filtering,
             ipv4_id_rate_limit,
+            ports_per_host,
+            state_per_host,
         } = nat;
         Ok(Self {
             udp: Nat44UdpConfig::with_port_set(
@@ -84,7 +90,10 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44UdpPolicy::default().with_filtering(filtering),
+                Nat44UdpPolicy::default()
+                    .with_filtering(filtering)
+                    .with_mappings_per_host(ports_per_host)
+                    .with_peers_per_host(state_per_host),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             tcp: Nat44TcpConfig::with_port_set(
@@ -97,6 +106,8 @@ impl Publication {
                 // may open at most 8 sessions (it cannot fill the table alone).
                 Nat44TcpPolicy::default()
                     .with_filtering(filtering)
+                    .with_mappings_per_host(ports_per_host)
+                    .with_sessions_per_host(state_per_host)
                     .with_inbound_sessions_per_remote(8)
                     .expect("8 is within the limit"),
             )
@@ -107,7 +118,9 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44IcmpPolicy::default(),
+                Nat44IcmpPolicy::default()
+                    .with_mappings_per_host(ports_per_host)
+                    .with_peers_per_host(state_per_host),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             ipv4_id_rate_limit,
