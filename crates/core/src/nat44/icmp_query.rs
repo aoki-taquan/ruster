@@ -630,8 +630,21 @@ impl<'a> Nat44IcmpRuntime<'a> {
         source: [u8; 4],
         destination: [u8; 4],
         protocol: u8,
-    ) -> u16 {
-        self.engine.next_ipv4_id(source, destination, protocol)
+        now_ms: u64,
+    ) -> Option<u16> {
+        self.engine
+            .next_ipv4_id(source, destination, protocol, now_ms)
+    }
+
+    /// As [`crate::Nat44UdpRuntime::with_ipv4_id_rate_limit`], for the ICMP
+    /// queries and the translated ICMPv4 errors.
+    #[must_use]
+    pub fn with_ipv4_id_rate_limit(
+        mut self,
+        storage: &'a mut crate::Ipv4IdRateLimitStorage,
+    ) -> Self {
+        self.engine = self.engine.with_ipv4_id_rate_limit(storage);
+        self
     }
 
     #[must_use]

@@ -18,6 +18,7 @@ mod ipv6;
 mod nat44;
 mod nat44_host_quota;
 mod nat44_ipv4_id;
+pub use nat44_ipv4_id::{ipv4_id_rate_limit_storage, Ipv4IdRateLimitStorage, IPV4_ID_MDL_S};
 mod nat44_syn_hold;
 mod nat44_tcp_state;
 mod observability;

@@ -590,6 +590,10 @@ pub enum DropReason {
     FirewallIcmpv6Unrelated = 251,
     /// The route holding the destination is a discard route.
     RouteDiscard = 252,
+    /// A translated non-atomic datagram over the rate at which its tuple's IPv4
+    /// IDs stay unique within the maximum datagram lifetime (when the NAT limits
+    /// it).
+    Nat44Ipv4IdRateExceeded = 253,
 }
 
 use DropReason::*;
@@ -597,7 +601,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 252] = [
+    pub const ALL: [Self; 253] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -850,6 +854,7 @@ impl DropReason {
         WireguardMtuExceeded,
         FirewallIcmpv6Unrelated,
         RouteDiscard,
+        Nat44Ipv4IdRateExceeded,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1119,6 +1124,7 @@ impl DropReason {
             WireguardMtuExceeded => "WIREGUARD_MTU_EXCEEDED",
             FirewallIcmpv6Unrelated => "FIREWALL_ICMPV6_UNRELATED",
             RouteDiscard => "ROUTE_DISCARD",
+            Nat44Ipv4IdRateExceeded => "NAT44_IPV4_ID_RATE_EXCEEDED",
         }
     }
 }
@@ -3747,6 +3753,7 @@ where
                                 &mut nat44_udp,
                                 &mut nat44_tcp,
                                 &mut nat44_icmp,
+                                nat_now_ms,
                             )?;
                             // NAT-FRAG: the first fragment as it leaves (addresses,
                             // MACs, and the ID generated above) is what every later
@@ -8952,6 +8959,7 @@ fn rewrite_translated_non_atomic_id(
     nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
     nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
     nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
+    now_ms: u64,
 ) -> Result<(), DropReason> {
     if !matches!(
         decision,
@@ -8988,24 +8996,25 @@ fn rewrite_translated_non_atomic_id(
         PacketDecision::Nat44Udp(_) => nat44_udp
             .as_deref_mut()
             .ok_or(Nat44UdpRuntimeUnavailable)?
-            .next_ipv4_id(source, destination, protocol),
+            .next_ipv4_id(source, destination, protocol, now_ms),
         PacketDecision::Nat44Tcp(_) => nat44_tcp
             .as_deref_mut()
             .ok_or(Nat44TcpRuntimeUnavailable)?
-            .next_ipv4_id(source, destination, protocol),
+            .next_ipv4_id(source, destination, protocol, now_ms),
         _ => {
             if let Some(runtime) = nat44_icmp.as_deref_mut() {
-                runtime.next_ipv4_id(source, destination, protocol)
+                runtime.next_ipv4_id(source, destination, protocol, now_ms)
             } else if let Some(runtime) = nat44_udp.as_deref_mut() {
-                runtime.next_ipv4_id(source, destination, protocol)
+                runtime.next_ipv4_id(source, destination, protocol, now_ms)
             } else {
                 nat44_tcp
                     .as_deref_mut()
                     .ok_or(Nat44IcmpRuntimeUnavailable)?
-                    .next_ipv4_id(source, destination, protocol)
+                    .next_ipv4_id(source, destination, protocol, now_ms)
             }
         }
-    };
+    }
+    .ok_or(Nat44Ipv4IdRateExceeded)?;
     frame[header + 4..header + 6].copy_from_slice(&id.to_be_bytes());
     frame[header + 10..header + 12]
         .copy_from_slice(&rfc1624_update(checksum, old_id, id).to_be_bytes());
@@ -10183,6 +10192,7 @@ mod tests {
             (250, "WIREGUARD_MTU_EXCEEDED"),
             (251, "FIREWALL_ICMPV6_UNRELATED"),
             (252, "ROUTE_DISCARD"),
+            (253, "NAT44_IPV4_ID_RATE_EXCEEDED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10192,7 +10202,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(253), None);
+        assert_eq!(DropReason::from_code(254), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

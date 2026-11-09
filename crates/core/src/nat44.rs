@@ -4483,7 +4483,7 @@ pub struct Nat44UdpRuntime<'a> {
     hash_key: Nat44UdpHashKey,
     /// IDs of translated non-atomic datagrams (RFC 6864 §5.3.1), keyed by
     /// the construction key and kept across reconcile and flush.
-    ipv4_ids: Ipv4IdGenerator,
+    ipv4_ids: Ipv4IdGenerator<'a>,
     watermark_ms: Option<u64>,
     next_generation: u64,
     runtime_epoch: u128,
@@ -4632,9 +4632,24 @@ impl<'a> Nat44UdpRuntime<'a> {
         source: [u8; 4],
         destination: [u8; 4],
         protocol: u8,
-    ) -> u16 {
+        now_ms: u64,
+    ) -> Option<u16> {
         let public = self.config.public_address().octets();
-        self.ipv4_ids.next(source, destination, protocol, public)
+        self.ipv4_ids
+            .next(source, destination, protocol, public, now_ms)
+    }
+
+    /// Limits the rate of the translated non-atomic datagrams so that their
+    /// IPv4 IDs do not repeat within the maximum datagram lifetime (RFC 6864
+    /// section 5.2; see `nat44_ipv4_id`); `storage` is cleared. Without this
+    /// call the IDs are not rate limited.
+    #[must_use]
+    pub fn with_ipv4_id_rate_limit(
+        mut self,
+        storage: &'a mut crate::Ipv4IdRateLimitStorage,
+    ) -> Self {
+        self.ipv4_ids.limit_rate(storage);
+        self
     }
 
     #[must_use]
@@ -8461,7 +8476,7 @@ pub struct Nat44TcpRuntime<'a> {
     hash_key: Nat44TcpHashKey,
     /// IDs of translated non-atomic datagrams (RFC 6864 §5.3.1), keyed by
     /// the construction key and kept across reconcile and flush.
-    ipv4_ids: Ipv4IdGenerator,
+    ipv4_ids: Ipv4IdGenerator<'a>,
     watermark_ms: Option<u64>,
     runtime_epoch: u128,
     next_generation: u64,
@@ -8663,9 +8678,24 @@ impl<'a> Nat44TcpRuntime<'a> {
         source: [u8; 4],
         destination: [u8; 4],
         protocol: u8,
-    ) -> u16 {
+        now_ms: u64,
+    ) -> Option<u16> {
         let public = self.config.public_address().octets();
-        self.ipv4_ids.next(source, destination, protocol, public)
+        self.ipv4_ids
+            .next(source, destination, protocol, public, now_ms)
+    }
+
+    /// Limits the rate of the translated non-atomic datagrams so that their
+    /// IPv4 IDs do not repeat within the maximum datagram lifetime (RFC 6864
+    /// section 5.2; see `nat44_ipv4_id`); `storage` is cleared. Without this
+    /// call the IDs are not rate limited.
+    #[must_use]
+    pub fn with_ipv4_id_rate_limit(
+        mut self,
+        storage: &'a mut crate::Ipv4IdRateLimitStorage,
+    ) -> Self {
+        self.ipv4_ids.limit_rate(storage);
+        self
     }
 
     #[must_use]
