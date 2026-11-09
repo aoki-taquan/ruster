@@ -93,6 +93,13 @@
 //!                              # their IPv4 IDs stay unique for 120 s (about 550
 //!                              # a second to one destination, shared by the LAN);
 //!                              # false lets them go (also in [map-e])
+//! ports-per-host = 0           # optional: the most public ports one LAN host
+//!                              # holds for each of UDP, TCP and ICMP; 0 for none
+//! state-per-host = 0           # optional: the most TCP sessions, and outside
+//!                              # endpoints of its UDP (not with endpoint-
+//!                              # independent filtering) and ICMP, of one LAN host
+//!                              # (both also in [map-e]; setting or lowering one
+//!                              # drops every NAT flow)
 //! ```
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
@@ -226,6 +233,8 @@ struct MapEEntry {
     mtu: Option<u16>,
     filtering: Option<String>,
     ipv4_id_rate_limit: Option<bool>,
+    ports_per_host: Option<u16>,
+    state_per_host: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -247,6 +256,8 @@ struct NatEntry {
     external: Option<String>,
     filtering: Option<String>,
     ipv4_id_rate_limit: Option<bool>,
+    ports_per_host: Option<u16>,
+    state_per_host: Option<u16>,
 }
 
 /// `filtering = "..."` of `[nat]` or `[map-e]`; endpoint-independent when left out.
@@ -997,6 +1008,8 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
     let nat = Nat {
         filtering: filtering(at, entry.filtering.as_deref())?,
         ipv4_id_rate_limit: entry.ipv4_id_rate_limit.unwrap_or(true),
+        ports_per_host: entry.ports_per_host.unwrap_or(0),
+        state_per_host: entry.state_per_host.unwrap_or(0),
         inside: entry.inside,
         outside: entry.interface,
         external: None,
@@ -1083,6 +1096,8 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
     Ok(Nat {
         filtering: filtering(at, entry.filtering.as_deref())?,
         ipv4_id_rate_limit: entry.ipv4_id_rate_limit.unwrap_or(true),
+        ports_per_host: entry.ports_per_host.unwrap_or(0),
+        state_per_host: entry.state_per_host.unwrap_or(0),
         inside: entry.inside,
         outside: entry.outside,
         external,

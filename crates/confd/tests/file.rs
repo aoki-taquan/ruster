@@ -694,8 +694,15 @@ fn nat_takes_the_outside_address_and_a_port_range() {
             },
             filtering: ruster_proto::table::NatFiltering::EndpointIndependent,
             ipv4_id_rate_limit: true,
+            ports_per_host: 0,
+            state_per_host: 0,
         })
     );
+    let limited = parse(&nat("ports-per-host = 64\nstate-per-host = 512\n"))
+        .unwrap()
+        .nat
+        .unwrap();
+    assert_eq!((limited.ports_per_host, limited.state_per_host), (64, 512));
     assert!(
         !parse(&nat("ipv4-id-rate-limit = false\n"))
             .unwrap()

@@ -2,9 +2,9 @@
 //! and its mappings.
 //!
 //! Every accepted table change makes new configurations for the new tables. The
-//! runtimes take them over and keep their mappings when core allows it (same
-//! interfaces, public address and port range; see `preflight_reconcile_carrying`),
-//! and flush them otherwise. The runtimes' storage is allocated when NAT first
+//! runtimes take them over and keep their mappings when core allows it (see
+//! `preflight_reconcile_carrying`: for example the same interfaces, public address
+//! and port range, and no new or lower per-host limit), and flush them otherwise. The runtimes' storage is allocated when NAT first
 //! appears and kept for the life of the process. Only a port range of another size
 //! needs new storage, and then the old one is not given back: a range is resized by
 //! hand, rarely.
@@ -18,6 +18,10 @@
 //!   address-dependent. With endpoint-independent filtering, any outside host may
 //!   reach a mapping the router's own traffic made too (its LAN address goes
 //!   through NAT); at most 8 TCP sessions are opened from one outside address.
+//! - RFC 6888 REQ-4 and REQ-5 a: the tables may limit the public ports and the
+//!   state one inside host holds (`ports-per-host`, `state-per-host`). RFC 6864
+//!   section 5.2: the IPv4 IDs of translated datagrams are rate limited outbound
+//!   unless the tables turn it off.
 //!
 //! Deviations:
 //!
@@ -25,9 +29,11 @@
 //!   own and are not translated. The pool must therefore not overlap the ports the
 //!   router's kernel picks for its own connections, or their replies are taken for
 //!   NAT's.
-//! - No per-host limits: one inside host may take every mapping.
-//! - Unsolicited inbound SYNs are dropped at once; RFC 5382 REQ-4's hold before an
-//!   ICMP error needs storage the FE does not give yet.
+//! - The per-host limits are off unless the tables set them: then one inside host
+//!   may take every mapping. There is no limit on how fast a host makes mappings
+//!   or state (RFC 6888 REQ-4 c, REQ-5 b). With endpoint-independent filtering,
+//!   `state-per-host` does not limit UDP's outside endpoints (outside hosts could
+//!   use it up).
 //! - Fragments whose datagram started before a table change are dropped
 //!   (`fragments.rs`).
 use std::collections::hash_map::RandomState;
@@ -76,6 +82,8 @@ impl Publication {
             ports,
             filtering,
             ipv4_id_rate_limit,
+            ports_per_host,
+            state_per_host,
         } = nat;
         Ok(Self {
             udp: Nat44UdpConfig::with_port_set(
@@ -84,7 +92,19 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44UdpPolicy::default().with_filtering(filtering),
+                Nat44UdpPolicy::default()
+                    .with_filtering(filtering)
+                    .with_mappings_per_host(ports_per_host)
+                    // With endpoint-independent filtering every outside sender a
+                    // host answers counts, so outside hosts could use up its
+                    // budget: no peer limit then (core's NAT44-125).
+                    .with_peers_per_host(
+                        if filtering == ruster_core::Nat44Filtering::EndpointIndependent {
+                            0
+                        } else {
+                            state_per_host
+                        },
+                    ),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             tcp: Nat44TcpConfig::with_port_set(
@@ -97,6 +117,8 @@ impl Publication {
                 // may open at most 8 sessions (it cannot fill the table alone).
                 Nat44TcpPolicy::default()
                     .with_filtering(filtering)
+                    .with_mappings_per_host(ports_per_host)
+                    .with_sessions_per_host(state_per_host)
                     .with_inbound_sessions_per_remote(8)
                     .expect("8 is within the limit"),
             )
@@ -107,7 +129,9 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44IcmpPolicy::default(),
+                Nat44IcmpPolicy::default()
+                    .with_mappings_per_host(ports_per_host)
+                    .with_peers_per_host(state_per_host),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             ipv4_id_rate_limit,
