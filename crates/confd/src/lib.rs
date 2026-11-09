@@ -78,28 +78,9 @@ pub enum RouteTarget {
     Reject,
 }
 
-/// A WireGuard interface (also an entry of `interfaces`, which has its MAC address,
-/// MTU and addresses).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WireguardConfig {
-    pub name: String,
-    pub listen_port: u16,
-    /// The IPv4 address the outer packets are sent from.
-    pub local: Ipv4Addr,
-    pub peers: Vec<WireguardPeerConfig>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WireguardPeerConfig {
-    pub name: String,
-    pub endpoint: (Ipv4Addr, u16),
-    pub allowed: Vec<(Ipv4Addr, u8)>,
-}
-
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Config {
     pub interfaces: Vec<InterfaceConfig>,
-    pub wireguard: Vec<WireguardConfig>,
     pub static_routes: Vec<StaticRoute>,
     /// The default VRF's forward firewall rules, in order.
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
@@ -115,12 +96,7 @@ pub struct Config {
 pub struct ConfdCounters {
     pub patches_sent: u64,
     pub patches_refused: u64,
-    /// Notifications from the FE that a WireGuard peer needs its key exchange.
-    pub key_exchange_requests: u64,
 }
-
-/// The most key exchange requests confd keeps for whoever does the exchange.
-const KEY_REQUESTS_KEPT: usize = 64;
 
 /// A process confd writes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,8 +187,6 @@ pub struct Confd {
     generation: u64,
     /// The last refused patch: its process, reason and generation.
     last_refusal: Option<(PeerKind, String, u64)>,
-    /// WireGuard peers the FE says need a key exchange, until taken.
-    key_requests: Vec<ruster_proto::table::KeyExchangeRequest>,
 }
 
 impl std::fmt::Debug for Confd {
@@ -234,16 +208,12 @@ impl Confd {
             counters: ConfdCounters::default(),
             generation: 0,
             last_refusal: None,
-            key_requests: Vec::new(),
         }
     }
 
     /// Connects to the FE as the writer of interfaces, addresses, firewall rules and NAT.
     pub fn connect_fe(&mut self, stream: UnixStream) -> io::Result<()> {
-        let mut peer = self.full_send(stream, Self::fe_tables, false)?;
-        // The FE tells when a WireGuard peer needs its key exchange.
-        peer.client.observe();
-        self.fe = Some(peer);
+        self.fe = Some(self.full_send(stream, Self::fe_tables, false)?);
         Ok(())
     }
 
@@ -278,12 +248,6 @@ impl Confd {
 
     pub fn counters(&self) -> ConfdCounters {
         self.counters
-    }
-
-    /// The WireGuard peers the FE has asked a key exchange for since the last call.
-    /// A key exchange daemon outside ruster does it and gives confd the session.
-    pub fn take_key_exchange_requests(&mut self) -> Vec<ruster_proto::table::KeyExchangeRequest> {
-        std::mem::take(&mut self.key_requests)
     }
 
     /// The generation of the configuration now held; each [`Confd::set_config`] adds one.
@@ -434,30 +398,6 @@ impl Confd {
                 },
                 Value::FirewallRule(rule.clone()),
             );
-        }
-        for wireguard in &self.config.wireguard {
-            out.insert(
-                Key::Wireguard {
-                    interface: wireguard.name.clone(),
-                },
-                Value::Wireguard(ruster_proto::table::Wireguard {
-                    listen_port: wireguard.listen_port,
-                    local: wireguard.local,
-                }),
-            );
-            for peer in &wireguard.peers {
-                out.insert(
-                    Key::WireguardPeer {
-                        interface: wireguard.name.clone(),
-                        peer: peer.name.clone(),
-                    },
-                    Value::WireguardPeer(ruster_proto::table::WireguardPeer {
-                        endpoint: peer.endpoint.0,
-                        port: peer.endpoint.1,
-                        allowed: peer.allowed.clone(),
-                    }),
-                );
-            }
         }
         if let Some(nat) = &self.config.nat {
             out.insert(
@@ -666,18 +606,6 @@ impl Task for Confd {
             let (polled, events) = peer.client.poll();
             progress = progress.and(polled);
             for event in events {
-                if let (PeerKind::Fe, Event::Notification { payload }) = (kind, &event) {
-                    let mut d = ruster_proto::cbor::Decoder::new(payload);
-                    if let Ok(request) = ruster_proto::table::KeyExchangeRequest::decode(&mut d) {
-                        self.counters.key_exchange_requests += 1;
-                        if self.key_requests.len() < KEY_REQUESTS_KEPT
-                            && !self.key_requests.contains(&request)
-                        {
-                            self.key_requests.push(request);
-                        }
-                    }
-                    continue;
-                }
                 if let Event::Response {
                     token,
                     code,
@@ -750,7 +678,6 @@ mod tests {
             target: RouteTarget::Discard,
         };
         let confd = Confd::new(Config {
-            wireguard: Vec::new(),
             interfaces: vec![lan],
             static_routes: vec![route(24), route(25)],
             firewall: Vec::new(),
@@ -786,7 +713,6 @@ mod tests {
             pppoe: None,
         };
         let config = |trunk_enabled| Config {
-            wireguard: Vec::new(),
             interfaces: vec![
                 interface("trunk", trunk_enabled, None, None),
                 interface(
