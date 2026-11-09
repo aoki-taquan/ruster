@@ -3702,3 +3702,58 @@ fn raising_a_per_host_limit_keeps_flows_and_lowering_it_flushes_them() {
     assert_eq!(bench.patch(&mut config, &[limited(2)]), Code::CHANGED);
     assert!(!reply_gets_in(&mut bench), "a lower limit flushes it");
 }
+
+/// An error from outside about the router's own translated flow reaches the
+/// router's kernel even with TTL 1: it is not forwarded on.
+#[test]
+fn an_outside_error_with_ttl_1_about_the_router_s_flow_reaches_it() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    // The router's own UDP, from its LAN address, goes out through NAT.
+    kernel
+        .send(&udp_packet([192, 0, 2, 1], INTERNET, (5_353, 53)))
+        .unwrap();
+    bench.fe.step(bench.now);
+    let out = bench.fe.io_mut().pop_tx().expect("translated");
+    let translated = out.bytes[14..].to_vec();
+    assert_eq!(&translated[12..16], &[198, 51, 100, 2]);
+
+    let mut icmp = vec![3, 3, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&translated[..28]);
+    let checksum = ruster_core::internet_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+    let mut error = vec![0_u8; 20];
+    error[0] = 0x45;
+    error[2..4].copy_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
+    error[8] = 1;
+    error[9] = 1;
+    error[12..16].copy_from_slice(&INTERNET);
+    error[16..20].copy_from_slice(&[198, 51, 100, 2]);
+    error.extend_from_slice(&icmp);
+    let error = ipv4_checksummed(error);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&error));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("the error reached the router");
+    assert_eq!((buf[20], buf[21]), (3, 3));
+    assert_eq!(
+        &buf[16..20],
+        &[192, 0, 2, 1],
+        "addressed back to the LAN address"
+    );
+    let _ = n;
+}

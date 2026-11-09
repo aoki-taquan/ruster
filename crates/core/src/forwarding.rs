@@ -5545,6 +5545,11 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
         .is_local_ipv4(internal_address)
         .then(|| snapshot.kernel_interface_of(snapshot))
         .flatten();
+    // Forwarded to an inside host it goes one hop on; to the router's own host it
+    // is not forwarded, so its TTL does not matter.
+    if kernel.is_none() && outer.ttl <= 1 {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4OuterTtlExpired, trace);
+    }
     if let Some(runtime) = related_firewall.as_deref() {
         let protocol = FirewallProtocol::from_ipv4(quote.protocol)
             .expect("the NAT ICMPv4 parser accepts only ICMP, UDP, and TCP quotes");
@@ -5635,9 +5640,6 @@ fn parse_nat44_icmpv4_error(
         packet::read_u16(frame, outer.header_offset + 6).ok_or(Nat44Icmpv4HeaderTruncated)?;
     if outer_flags & 0x3fff != 0 {
         return Err(Nat44Icmpv4OuterFragmentUnsupported);
-    }
-    if outer.ttl <= 1 {
-        return Err(Nat44Icmpv4OuterTtlExpired);
     }
     let icmp_offset = outer.header_offset + outer.header_len;
     let icmp_end = outer.header_offset + outer.total_len;
