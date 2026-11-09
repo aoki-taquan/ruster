@@ -49,15 +49,24 @@ for dev in r-lan r-wan; do
 done
 nsx "$router" ip link set r-lan address 02:00:00:00:00:01 up
 nsx "$router" ip link set r-wan address 02:00:00:00:00:02 up
+# The ports sit in a VRF with no addresses; the router's kernel has its addresses
+# on the TUN device confd makes.
+nsx "$router" ip link set lo up
+nsx "$router" ip link add vrf-ports type vrf table 999
+nsx "$router" ip link set vrf-ports up
+nsx "$router" ip link set r-lan master vrf-ports
+nsx "$router" ip link set r-wan master vrf-ports
 nsx "$ac" sysctl -qw net.ipv6.conf.all.disable_ipv6=1
 nsx "$ac" ethtool -K a0 tx off >/dev/null
 nsx "$ac" ip link set a0 address 02:00:00:00:00:ac up
 nsx "$ac" python3 "$here/pppoe-ac.py" a0 ac0 0x1234 02:00:00:00:00:02 >"$work/ac.log" 2>&1 &
 pids+=("$!")
 for _ in $(seq 1 50); do grep -q ready "$work/ac.log" 2>/dev/null && break; sleep 0.1; done
-nsx "$ac" ip link set ac0 up
+# The session carries 1492 bytes: the AC's kernel fragments what is larger.
+nsx "$ac" ip link set ac0 mtu 1492 up
 nsx "$ac" ip addr add 198.51.100.1/32 dev ac0
 nsx "$ac" ip route add 192.168.0.0/24 dev ac0
+nsx "$ac" ip route add 198.51.100.2/32 dev ac0
 
 cat > "$work/router.toml" <<'TOML'
 [[interface]]
@@ -89,7 +98,7 @@ start() {
 start ruster-fe --backend "$backend" r-lan r-wan
 start ruster-ribd
 start ruster-neighd
-start ruster-confd "$work/router.toml"
+start ruster-confd --kernel "$work/router.toml"
 
 ok=0
 for _ in $(seq 1 20); do
@@ -98,6 +107,13 @@ done
 (( ok == 1 )) || fail "the LAN does not reach the AC through the PPPoE session"
 nsx "$lan" ping -c 3 -i 0.2 -W 1 -s 1400 198.51.100.1 >/dev/null || fail "1428-byte pings"
 echo "ok: the LAN pings through the PPPoE session (up to the 1492-byte MTU)"
+
+# The router itself too, with a datagram too big for the session: the FE cuts it.
+for size in 56 3000; do
+  nsx "$router" ping -c 1 -W 2 -M dont -s "$size" 198.51.100.1 >/dev/null ||
+    fail "the router pings the AC ($size bytes)"
+done
+echo "ok: the router pings through the session, fragmented too"
 
 nsx "$ac" python3 -c '
 import socket
