@@ -3252,3 +3252,21 @@ fn an_unsolicited_syn_gets_a_port_unreachable_after_six_seconds() {
     assert_eq!(&tx.bytes[ip + 28..ip + 48], &syn[..20], "it quotes the SYN");
     assert!(bench.fe.io_mut().pop_tx().is_none(), "once");
 }
+
+/// When the Port Unreachable for an unsolicited SYN is due and the neighbor it goes
+/// to is not known yet, the neighbor process is asked for it.
+#[test]
+fn a_due_syn_answer_to_an_unknown_neighbor_asks_for_it() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let syn = tcp_packet(INTERNET, [198, 51, 100, 2], (50_000, 40_005), 0x02);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&syn));
+    bench.fe.step(1_000);
+    let before = bench.fe.counters().resolve_requests;
+    bench.fe.step(7_100);
+    assert_eq!(bench.fe.counters().resolve_requests, before + 1);
+}
