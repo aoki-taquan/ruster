@@ -361,6 +361,7 @@ where
                     .as_mut()
                     .map(|(config, runtime)| (&*config, &mut **runtime)),
                 now,
+                &mut trace,
             )
         });
         if report.received == 0 && answered == 0 {

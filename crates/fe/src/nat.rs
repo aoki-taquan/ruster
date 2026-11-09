@@ -41,7 +41,7 @@ use ruster_core::{
     Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
     Nat44TcpSessionHostSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
     Nat44UdpHashKey, Nat44UdpHostSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpPolicy, Nat44UdpRuntime, NoTrace, PortOwnerSlot, Services,
+    Nat44UdpPolicy, Nat44UdpRuntime, PortOwnerSlot, Services, TraceSink,
 };
 
 use crate::build;
@@ -179,12 +179,13 @@ impl Nat {
     /// Answers the unsolicited inbound SYNs whose 6 seconds are over with a Port
     /// Unreachable, queued in `errors` (see `ruster_core::dispatch_nat44_tcp_unsolicited_syns`).
     /// Returns how many holds matured.
-    pub(crate) fn answer_unsolicited_syns(
+    pub(crate) fn answer_unsolicited_syns<T: TraceSink>(
         &mut self,
         errors: &mut Icmpv4ErrorRuntime<'_>,
         snapshot: &ForwardingSnapshot<'_>,
         firewall: Option<(&FirewallConfig<'_>, &mut FirewallRuntime<'_>)>,
         now: MonotonicMillis,
+        trace: &mut T,
     ) -> usize {
         if !self.on {
             return 0;
@@ -201,7 +202,7 @@ impl Nat {
             runtime,
             now,
             SYN_ANSWERS_PER_BATCH,
-            &mut NoTrace,
+            trace,
         )
         .map_or(0, |report| report.matured)
     }

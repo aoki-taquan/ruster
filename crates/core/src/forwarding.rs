@@ -7987,7 +7987,7 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
     header_value: u32,
     runtime: &mut Icmpv4ErrorRuntime<'_>,
     now: MonotonicMillis,
-    _trace: &mut T,
+    trace: &mut T,
 ) -> Icmpv4ErrorDisposition {
     let Some(reverse_route) = snapshot.route_lookup(original_source) else {
         return runtime.record_suppression(Icmpv4TimeExceededDisposition::ReverseRouteMiss);
@@ -8019,6 +8019,11 @@ pub(crate) fn schedule_reverse_icmpv4_error<T: TraceSink>(
         // session.
         crate::MacAddress([0; 6])
     } else {
+        // The control side may resolve it, so that a later error goes out.
+        trace.record(TraceEvent::NeighborMissing {
+            egress: reverse_egress,
+            target,
+        });
         return runtime.record_suppression(
             Icmpv4TimeExceededDisposition::ReverseNeighborUnresolved {
                 egress: reverse_egress,
