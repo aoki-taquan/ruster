@@ -77,20 +77,6 @@ pub enum Key {
         vrf: String,
         id: u32,
     },
-    /// The WireGuard settings of an interface (one per interface).
-    Wireguard {
-        interface: String,
-    },
-    /// One peer of a WireGuard interface.
-    WireguardPeer {
-        interface: String,
-        peer: String,
-    },
-    /// The session keys of a peer, as the key exchange left them.
-    WireguardSession {
-        interface: String,
-        peer: String,
-    },
 }
 
 /// The value of one entry.
@@ -134,44 +120,10 @@ pub enum Value {
         outside: Vec<String>,
     },
     FirewallRule(FirewallRule),
-    Wireguard(Wireguard),
-    WireguardPeer(WireguardPeer),
-    WireguardSession(WireguardSession),
 }
 
-/// An interface that is a WireGuard interface (`ruster-if-wireguard`): the UDP port
-/// it listens on and the IPv4 address its packets leave from. The interface entry
-/// of the same name gives its MAC address and MTU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Wireguard {
-    pub listen_port: u16,
-    pub local: std::net::Ipv4Addr,
-}
-
-/// A peer: where its packets go, and the addresses it may send from and be sent to
-/// (cryptokey routing).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WireguardPeer {
-    pub endpoint: std::net::Ipv4Addr,
-    pub port: u16,
-    pub allowed: Vec<(std::net::Ipv4Addr, u8)>,
-}
-
-/// The keys and indexes of a peer's current session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WireguardSession {
-    /// Seals what the router sends.
-    pub send: [u8; 32],
-    /// Opens what the router receives.
-    pub receive: [u8; 32],
-    /// The receiver index of what the router sends (the peer's own index).
-    pub peer_index: u32,
-    /// The receiver index of what the router receives (the router's own index).
-    pub local_index: u32,
-}
-
-/// The most allowed prefixes a peer has.
-pub const WIREGUARD_MAX_ALLOWED: usize = 64;
+/// The most entries a list member of a value has.
+const MEMBER_LIST_MAX: u64 = 64;
 
 /// Source NAPT44 (`ietf-nat` type `napt44`): traffic from `inside` leaving through
 /// `outside` gets the `external` address (the outside interface's IPv4 address when
@@ -334,9 +286,6 @@ impl Key {
             Self::FirewallPolicy { .. } => sid::FIREWALL_POLICY,
             Self::IcmpErrors { .. } => sid::ICMP_ERRORS,
             Self::FirewallRule { .. } => sid::FIREWALL_RULE,
-            Self::Wireguard { .. } => sid::WIREGUARD,
-            Self::WireguardPeer { .. } => sid::WIREGUARD_PEER,
-            Self::WireguardSession { .. } => sid::WIREGUARD_SESSION,
         }
     }
 }
@@ -406,11 +355,6 @@ impl Change {
             | Key::IcmpErrors { vrf }
             | Key::FirewallRule { vrf, .. } => name(vrf)?,
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
-            Key::Wireguard { interface } => name(interface)?,
-            Key::WireguardPeer { interface, peer } | Key::WireguardSession { interface, peer } => {
-                name(interface)?;
-                name(peer)?;
-            }
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 parse_prefix(&format!("{prefix}/{len}"))?;
@@ -429,9 +373,6 @@ impl Change {
                         | (Key::FirewallPolicy { .. }, Value::FirewallPolicy { .. })
                         | (Key::IcmpErrors { .. }, Value::IcmpErrors { .. })
                         | (Key::FirewallRule { .. }, Value::FirewallRule(_))
-                        | (Key::Wireguard { .. }, Value::Wireguard(_))
-                        | (Key::WireguardPeer { .. }, Value::WireguardPeer(_))
-                        | (Key::WireguardSession { .. }, Value::WireguardSession(_))
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -486,27 +427,6 @@ impl Change {
                                     return Err(ModelError::Invalid("VLAN parent (itself)"));
                                 }
                             }
-                        }
-                    }
-                    Value::Wireguard(wireguard) => {
-                        if wireguard.listen_port == 0 || !usable_ipv4(wireguard.local) {
-                            return Err(ModelError::Invalid("WireGuard port or address"));
-                        }
-                    }
-                    Value::WireguardPeer(peer) => {
-                        if peer.port == 0 || !usable_ipv4(peer.endpoint) {
-                            return Err(ModelError::Invalid("WireGuard endpoint"));
-                        }
-                        if peer.allowed.is_empty() || peer.allowed.len() > WIREGUARD_MAX_ALLOWED {
-                            return Err(ModelError::Invalid("WireGuard allowed addresses"));
-                        }
-                        for (address, len) in &peer.allowed {
-                            parse_prefix(&format!("{address}/{len}"))?;
-                        }
-                    }
-                    Value::WireguardSession(session) => {
-                        if session.send == [0; 32] || session.receive == [0; 32] {
-                            return Err(ModelError::Invalid("WireGuard session key"));
                         }
                     }
                     Value::Route(RouteAction::LookupVrf(vrf)) => name(vrf)?,
@@ -647,21 +567,6 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::IcmpErrors { vrf } => {
             e.array(2).u64(sid::ICMP_ERRORS).text(vrf);
         }
-        Key::Wireguard { interface } => {
-            e.array(2).u64(sid::WIREGUARD).text(interface);
-        }
-        Key::WireguardPeer { interface, peer } => {
-            e.array(3)
-                .u64(sid::WIREGUARD_PEER)
-                .text(interface)
-                .text(peer);
-        }
-        Key::WireguardSession { interface, peer } => {
-            e.array(3)
-                .u64(sid::WIREGUARD_SESSION)
-                .text(interface)
-                .text(peer);
-        }
         Key::FirewallRule { vrf, id } => {
             e.array(3)
                 .u64(sid::FIREWALL_RULE)
@@ -675,13 +580,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     let len = d.array()?;
     let table = d.u64()?;
     let expected = match table {
-        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::WIREGUARD => 2,
-        sid::ADDRESS
-        | sid::ROUTE
-        | sid::NEIGHBOR
-        | sid::FIREWALL_RULE
-        | sid::WIREGUARD_PEER
-        | sid::WIREGUARD_SESSION => 3,
+        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS => 2,
+        sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
     if len != expected {
@@ -696,21 +596,6 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::NAT => Key::Nat { vrf: first },
         sid::FIREWALL_POLICY => Key::FirewallPolicy { vrf: first },
         sid::ICMP_ERRORS => Key::IcmpErrors { vrf: first },
-        sid::WIREGUARD => Key::Wireguard { interface: first },
-        sid::WIREGUARD_PEER | sid::WIREGUARD_SESSION => {
-            let peer = d.text()?.to_owned();
-            if table == sid::WIREGUARD_PEER {
-                Key::WireguardPeer {
-                    interface: first,
-                    peer,
-                }
-            } else {
-                Key::WireguardSession {
-                    interface: first,
-                    peer,
-                }
-            }
-        }
         sid::FIREWALL_RULE => Key::FirewallRule {
             vrf: first,
             id: u32::try_from(d.u64()?).map_err(|_| ModelError::Invalid("rule id"))?,
@@ -824,36 +709,6 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::NEIGHBOR_LINK_LAYER_ADDRESS - sid::NEIGHBOR)
                 .text(&format_mac(mac));
         }
-        Value::Wireguard(wireguard) => {
-            e.map(2)
-                .u64(sid::WIREGUARD_LISTEN_PORT - sid::WIREGUARD)
-                .u64(u64::from(wireguard.listen_port))
-                .u64(sid::WIREGUARD_LOCAL - sid::WIREGUARD)
-                .text(&wireguard.local.to_string());
-        }
-        Value::WireguardPeer(peer) => {
-            e.map(3)
-                .u64(sid::WIREGUARD_PEER_ENDPOINT - sid::WIREGUARD_PEER)
-                .text(&peer.endpoint.to_string())
-                .u64(sid::WIREGUARD_PEER_PORT - sid::WIREGUARD_PEER)
-                .u64(u64::from(peer.port))
-                .u64(sid::WIREGUARD_PEER_ALLOWED - sid::WIREGUARD_PEER)
-                .array(peer.allowed.len() as u64);
-            for (address, len) in &peer.allowed {
-                e.text(&format!("{address}/{len}"));
-            }
-        }
-        Value::WireguardSession(session) => {
-            e.map(4)
-                .u64(sid::WIREGUARD_SESSION_SEND - sid::WIREGUARD_SESSION)
-                .bytes(&session.send)
-                .u64(sid::WIREGUARD_SESSION_RECEIVE - sid::WIREGUARD_SESSION)
-                .bytes(&session.receive)
-                .u64(sid::WIREGUARD_SESSION_PEER_INDEX - sid::WIREGUARD_SESSION)
-                .u64(u64::from(session.peer_index))
-                .u64(sid::WIREGUARD_SESSION_LOCAL_INDEX - sid::WIREGUARD_SESSION)
-                .u64(u64::from(session.local_index));
-        }
         Value::IcmpErrors {
             ipv4_interval_ms,
             ipv6_burst,
@@ -963,13 +818,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
 fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     if matches!(
         table,
-        sid::NAT
-            | sid::FIREWALL_POLICY
-            | sid::ICMP_ERRORS
-            | sid::FIREWALL_RULE
-            | sid::WIREGUARD
-            | sid::WIREGUARD_PEER
-            | sid::WIREGUARD_SESSION
+        sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::FIREWALL_RULE
     ) {
         return decode_policy_value(table, d);
     }
@@ -1175,11 +1024,6 @@ pub fn network(address: IpAddr, len: u8) -> IpAddr {
 }
 
 /// An IP address in the canonical text of RFC 5952 (for IPv6) or dotted decimal.
-/// An IPv4 address a WireGuard endpoint or local address may be.
-fn usable_ipv4(address: std::net::Ipv4Addr) -> bool {
-    !(address.is_unspecified() || address.is_loopback() || address.is_multicast())
-}
-
 fn parse_ip(text: &str) -> Result<IpAddr, ModelError> {
     let address: IpAddr = text
         .parse()
@@ -1241,50 +1085,6 @@ pub fn parse_mac(text: &str) -> Result<[u8; 6], ModelError> {
     Ok(mac)
 }
 
-/// The notification the FE sends when a packet is for a WireGuard peer that has no
-/// session: `{KEY_REQUEST: {1: interface, 2: peer}}`. The key exchange for that
-/// peer is due.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct KeyExchangeRequest {
-    pub interface: String,
-    pub peer: String,
-}
-
-impl KeyExchangeRequest {
-    pub fn encode(&self, e: &mut Encoder<'_>) {
-        e.map(1)
-            .u64(sid::WIREGUARD_KEY_REQUEST)
-            .map(2)
-            .u64(sid::WIREGUARD_KEY_REQUEST_INTERFACE - sid::WIREGUARD_KEY_REQUEST)
-            .text(&self.interface)
-            .u64(sid::WIREGUARD_KEY_REQUEST_PEER - sid::WIREGUARD_KEY_REQUEST)
-            .text(&self.peer);
-    }
-
-    pub fn decode(d: &mut Decoder<'_>) -> Result<Self, ModelError> {
-        if d.map()? != 1 || d.u64()? != sid::WIREGUARD_KEY_REQUEST {
-            return Err(ModelError::Invalid("key exchange request"));
-        }
-        let members = d.map()?;
-        let mut interface = None;
-        let mut peer = None;
-        for _ in 0..members {
-            match sid::WIREGUARD_KEY_REQUEST.checked_add(d.u64()?) {
-                Some(sid::WIREGUARD_KEY_REQUEST_INTERFACE) => {
-                    put(&mut interface, d.text()?.to_owned())?;
-                }
-                Some(sid::WIREGUARD_KEY_REQUEST_PEER) => put(&mut peer, d.text()?.to_owned())?,
-                Some(other) => return Err(ModelError::UnknownMember(other)),
-                None => return Err(ModelError::Invalid("member SID")),
-            }
-        }
-        Ok(Self {
-            interface: interface.ok_or(ModelError::Missing("interface"))?,
-            peer: peer.ok_or(ModelError::Missing("peer"))?,
-        })
-    }
-}
-
 /// The notification the FE sends when a packet's next hop is not in the neighbor
 /// table: `{RESOLVE_REQUEST: {1: interface, 2: address}}`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1332,7 +1132,6 @@ impl ResolveRequest {
 enum Member {
     Text(String),
     Uint(u64),
-    Bytes(Vec<u8>),
     List(Vec<String>),
 }
 
@@ -1346,10 +1145,9 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         let value = match d.peek_kind()? {
             Kind::Text => Member::Text(d.text()?.to_owned()),
             Kind::Unsigned => Member::Uint(d.u64()?),
-            Kind::Bytes => Member::Bytes(d.bytes()?.to_vec()),
             Kind::Array => {
                 let len = d.array()?;
-                if len > WIREGUARD_MAX_ALLOWED as u64 {
+                if len > MEMBER_LIST_MAX {
                     return Err(ModelError::Invalid("member list"));
                 }
                 let mut list = Vec::new();
@@ -1369,60 +1167,7 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         Some(_) => Err(ModelError::Invalid(what)),
         None => Ok(None),
     };
-    let value = if table == sid::WIREGUARD {
-        let local = text(sid::WIREGUARD_LOCAL, "local-address")?
-            .ok_or(ModelError::Missing("local-address"))?
-            .parse()
-            .map_err(|_| ModelError::Invalid("local-address"))?;
-        let listen_port = port(&mut got, sid::WIREGUARD_LISTEN_PORT)?
-            .ok_or(ModelError::Missing("listen-port"))?;
-        Value::Wireguard(Wireguard { listen_port, local })
-    } else if table == sid::WIREGUARD_PEER {
-        let endpoint = text(sid::WIREGUARD_PEER_ENDPOINT, "endpoint-address")?
-            .ok_or(ModelError::Missing("endpoint-address"))?
-            .parse()
-            .map_err(|_| ModelError::Invalid("endpoint-address"))?;
-        let port = port(&mut got, sid::WIREGUARD_PEER_PORT)?
-            .ok_or(ModelError::Missing("endpoint-port"))?;
-        let Some(Member::List(list)) = got.remove(&sid::WIREGUARD_PEER_ALLOWED) else {
-            return Err(ModelError::Missing("allowed-ips"));
-        };
-        let mut allowed = Vec::new();
-        for prefix in list {
-            match parse_prefix(&prefix)? {
-                (IpAddr::V4(address), len) => allowed.push((address, len)),
-                _ => return Err(ModelError::Invalid("allowed-ips")),
-            }
-        }
-        Value::WireguardPeer(WireguardPeer {
-            endpoint,
-            port,
-            allowed,
-        })
-    } else if table == sid::WIREGUARD_SESSION {
-        let mut key = |member: u64, what: &'static str| match got.remove(&member) {
-            Some(Member::Bytes(bytes)) => {
-                <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| ModelError::Invalid(what))
-            }
-            Some(_) => Err(ModelError::Invalid(what)),
-            None => Err(ModelError::Missing(what)),
-        };
-        let send = key(sid::WIREGUARD_SESSION_SEND, "send-key")?;
-        let receive = key(sid::WIREGUARD_SESSION_RECEIVE, "receive-key")?;
-        let mut index = |member: u64, what: &'static str| match got.remove(&member) {
-            Some(Member::Uint(n)) => u32::try_from(n).map_err(|_| ModelError::Invalid(what)),
-            Some(_) => Err(ModelError::Invalid(what)),
-            None => Err(ModelError::Missing(what)),
-        };
-        let peer_index = index(sid::WIREGUARD_SESSION_PEER_INDEX, "peer-index")?;
-        let local_index = index(sid::WIREGUARD_SESSION_LOCAL_INDEX, "local-index")?;
-        Value::WireguardSession(WireguardSession {
-            send,
-            receive,
-            peer_index,
-            local_index,
-        })
-    } else if table == sid::ICMP_ERRORS {
+    let value = if table == sid::ICMP_ERRORS {
         let mut number = |member: u64, what: &'static str| match got.remove(&member) {
             Some(Member::Uint(n)) => u32::try_from(n)
                 .ok()

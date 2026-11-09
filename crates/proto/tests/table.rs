@@ -768,209 +768,6 @@ fn a_pppoe_interface_round_trips_and_is_checked() {
     assert!(ppp(1, [0xff; 6]).validate().is_err());
 }
 
-mod wireguard {
-    use super::*;
-    use ruster_proto::table::{Wireguard, WireguardPeer, WireguardSession};
-
-    fn v4(a: [u8; 4]) -> Ipv4Addr {
-        Ipv4Addr::from(a)
-    }
-
-    fn settings() -> Change {
-        Change::set(
-            Key::Wireguard {
-                interface: "wg0".into(),
-            },
-            Value::Wireguard(Wireguard {
-                listen_port: 51820,
-                local: v4([192, 0, 2, 1]),
-            }),
-        )
-    }
-
-    fn peer() -> Change {
-        Change::set(
-            Key::WireguardPeer {
-                interface: "wg0".into(),
-                peer: "branch".into(),
-            },
-            Value::WireguardPeer(WireguardPeer {
-                endpoint: v4([198, 51, 100, 7]),
-                port: 51821,
-                allowed: vec![(v4([10, 2, 0, 0]), 16), (v4([10, 3, 0, 5]), 32)],
-            }),
-        )
-    }
-
-    fn session() -> Change {
-        Change::set(
-            Key::WireguardSession {
-                interface: "wg0".into(),
-                peer: "branch".into(),
-            },
-            Value::WireguardSession(WireguardSession {
-                send: [1; 32],
-                receive: [2; 32],
-                peer_index: 7,
-                local_index: 0xffff_ffff,
-            }),
-        )
-    }
-
-    #[test]
-    fn the_three_tables_round_trip_and_deletes_too() {
-        for change in [settings(), peer(), session()] {
-            assert_eq!(round_trip(&change), change);
-            let delete = Change::delete(change.key.clone());
-            assert_eq!(round_trip(&delete), delete);
-        }
-    }
-
-    #[test]
-    fn a_peer_is_encoded_with_its_allowed_addresses_as_an_array() {
-        let mut out = Vec::new();
-        peer().encode(&mut Encoder::new(&mut out)).unwrap();
-        // The leaf-list is a CBOR array of prefix texts (RFC 9254).
-        let at = out
-            .windows(10)
-            .position(|w| w == b"10.2.0.0/1")
-            .expect("prefix text");
-        assert_eq!(out[at - 1], 0x6b, "text of 11 bytes");
-        assert_eq!(out[at - 2], 0x82, "after an array of two");
-    }
-
-    #[test]
-    fn invalid_wireguard_values_are_refused() {
-        let wg = |port, local| {
-            Change::set(
-                Key::Wireguard {
-                    interface: "wg0".into(),
-                },
-                Value::Wireguard(Wireguard {
-                    listen_port: port,
-                    local,
-                }),
-            )
-        };
-        for bad in [
-            wg(0, v4([192, 0, 2, 1])),
-            wg(1, v4([0, 0, 0, 0])),
-            wg(1, v4([127, 0, 0, 1])),
-            wg(1, v4([224, 0, 0, 1])),
-        ] {
-            assert!(bad.validate().is_err(), "{bad:?}");
-        }
-        let peer = |endpoint, port, allowed: Vec<(Ipv4Addr, u8)>| {
-            Change::set(
-                Key::WireguardPeer {
-                    interface: "wg0".into(),
-                    peer: "p".into(),
-                },
-                Value::WireguardPeer(WireguardPeer {
-                    endpoint,
-                    port,
-                    allowed,
-                }),
-            )
-        };
-        let ok = vec![(v4([10, 0, 0, 0]), 8)];
-        for bad in [
-            peer(v4([0, 0, 0, 0]), 1, ok.clone()),
-            peer(v4([198, 51, 100, 7]), 0, ok.clone()),
-            peer(v4([198, 51, 100, 7]), 1, vec![]),
-            peer(v4([198, 51, 100, 7]), 1, vec![(v4([10, 0, 0, 0]), 33)]),
-            peer(v4([198, 51, 100, 7]), 1, vec![(v4([10, 0, 0, 0]), 8); 65]),
-        ] {
-            assert!(bad.validate().is_err(), "{bad:?}");
-        }
-        let zero_key = Change::set(
-            Key::WireguardSession {
-                interface: "wg0".into(),
-                peer: "p".into(),
-            },
-            Value::WireguardSession(WireguardSession {
-                send: [0; 32],
-                receive: [2; 32],
-                peer_index: 1,
-                local_index: 2,
-            }),
-        );
-        assert!(zero_key.validate().is_err());
-        assert!(Change::set(
-            Key::WireguardPeer {
-                interface: "".into(),
-                peer: "p".into()
-            },
-            peer_value(),
-        )
-        .validate()
-        .is_err());
-        // A value of another table under the key.
-        assert!(matches!(
-            Change::set(
-                Key::Wireguard {
-                    interface: "wg0".into()
-                },
-                peer_value(),
-            )
-            .validate(),
-            Err(ModelError::WrongTable)
-        ));
-    }
-
-    fn peer_value() -> Value {
-        let Some(value) = peer().value else {
-            unreachable!()
-        };
-        value
-    }
-
-    #[test]
-    fn a_session_key_of_the_wrong_length_or_a_missing_member_is_refused() {
-        // {[60120, "wg0", "p"]: {1: h'0102', 2: h'..', 3: 1, 4: 2}}: a short key.
-        let mut out = vec![0xa1, 0x83, 0x19, 0xea, 0xd8, 0x63];
-        out.extend_from_slice(b"wg0");
-        out.extend_from_slice(&[0x61, b'p', 0xa4, 0x01, 0x42, 1, 2, 0x02, 0x58, 32]);
-        out.extend_from_slice(&[2; 32]);
-        out.extend_from_slice(&[0x03, 0x01, 0x04, 0x02]);
-        assert_eq!(decode_bytes(&out), Err(ModelError::Invalid("send-key")));
-        let mut missing = vec![0xa1, 0x83, 0x19, 0xea, 0xd8, 0x63];
-        missing.extend_from_slice(b"wg0");
-        missing.extend_from_slice(&[0x61, b'p', 0xa1, 0x03, 0x01]);
-        assert!(matches!(
-            decode_bytes(&missing),
-            Err(ModelError::Missing(_))
-        ));
-    }
-}
-
-#[test]
-fn a_key_exchange_request_round_trips_and_refuses_a_missing_member() {
-    use ruster_proto::table::KeyExchangeRequest;
-    let request = KeyExchangeRequest {
-        interface: "wg0".into(),
-        peer: "branch".into(),
-    };
-    let mut out = Vec::new();
-    request.encode(&mut Encoder::new(&mut out));
-    assert_eq!(
-        KeyExchangeRequest::decode(&mut Decoder::new(&out)),
-        Ok(request)
-    );
-    // {60130: {1: "wg0"}}: no peer.
-    let mut short = Vec::new();
-    Encoder::new(&mut short)
-        .map(1)
-        .u64(sid::WIREGUARD_KEY_REQUEST)
-        .map(1)
-        .u64(1)
-        .text("wg0");
-    assert_eq!(
-        KeyExchangeRequest::decode(&mut Decoder::new(&short)),
-        Err(ModelError::Missing("peer"))
-    );
-}
-
 #[test]
 fn an_ipv6_firewall_rule_round_trips_and_a_mixed_one_is_refused() {
     use ruster_proto::table::{FirewallAction, FirewallRule, Protocol};
@@ -1083,5 +880,17 @@ fn icmp_error_limits_round_trip_and_zero_or_a_missing_member_is_refused() {
     assert!(matches!(
         decode_bytes(&missing),
         Err(ModelError::Missing(_))
+    ));
+}
+
+#[test]
+fn the_wireguard_tables_are_gone() {
+    // {[60100, "wg0"]: null}: WireGuard is not part of ruster.
+    let old = encoded(|e| {
+        e.map(1).array(2).u64(60_100).text("wg0").null();
+    });
+    assert!(matches!(
+        decode_bytes(&old),
+        Err(ModelError::UnknownTable(60_100))
     ));
 }
