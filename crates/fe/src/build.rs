@@ -37,7 +37,8 @@ pub(crate) struct Built {
     pub(crate) by_ingress: Vec<u16>,
     /// The enabled ports and sub-interfaces.
     pub(crate) active: Vec<IfId>,
-    /// The name of every interface by id: the ports, then the VLAN sub-interfaces.
+    /// The name of every interface by id: the ports, then the others, each keeping
+    /// its id across table changes; an empty name is an id no interface has.
     pub(crate) interface_names: Vec<String>,
     /// The VLAN sub-interfaces of enabled ports.
     pub(crate) vlans: Vec<VlanBinding>,
@@ -217,7 +218,43 @@ pub(crate) const KERNEL_INTERFACE: &str = "rt-default";
 /// The MTU of a kernel interface: that of the TUN devices confd makes.
 const KERNEL_MTU: u16 = 1500;
 
-pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
+/// The ids of the interfaces: the ports first, then the others, each where it was
+/// in `previous` when that is free, else in the first free place.
+struct Ids<'p> {
+    /// The name of each id; an empty name is a free id.
+    names: Vec<String>,
+    previous: &'p [String],
+    ports: usize,
+}
+
+impl Ids<'_> {
+    fn take(&mut self, name: &str) -> Result<IfId, String> {
+        let free = |names: &[String], at: usize| names.get(at).is_none_or(String::is_empty);
+        let kept = self
+            .previous
+            .iter()
+            .position(|n| n == name)
+            .filter(|&at| at >= self.ports && free(&self.names, at));
+        // Not one another interface had before, so that it can still take it.
+        let at = kept.unwrap_or_else(|| {
+            (self.ports..)
+                .find(|&at| {
+                    free(&self.names, at) && self.previous.get(at).is_none_or(String::is_empty)
+                })
+                .expect("an unbounded range")
+        });
+        let id = u16::try_from(at)
+            .map(IfId)
+            .map_err(|_| "too many interfaces".to_owned())?;
+        if self.names.len() <= at {
+            self.names.resize(at + 1, String::new());
+        }
+        self.names[at] = name.to_owned();
+        Ok(id)
+    }
+}
+
+pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Result<Built, String> {
     let port = |name: &str| {
         let index = ports.iter().position(|p| p == name)?;
         u16::try_from(index).ok().map(IfId)
@@ -249,8 +286,14 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             }
         }
     }
-    // VLAN sub-interfaces of enabled ports get the ids after the ports, by name.
-    let mut interface_names: Vec<String> = ports.to_vec();
+    // Interfaces that are not ports get ids after the ports, and keep the id they
+    // had in the tables before: flows carried across a table change name their
+    // interfaces by id.
+    let mut ids = Ids {
+        names: ports.to_vec(),
+        previous,
+        ports: ports.len(),
+    };
     let mut vlans = Vec::new();
     for (key, value) in store.iter() {
         if let (
@@ -281,10 +324,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                     vlan.id, vlan.parent
                 ));
             }
-            let id = u16::try_from(interface_names.len())
-                .map(IfId)
-                .map_err(|_| "too many interfaces".to_owned())?;
-            interface_names.push(name.clone());
+            let id = ids.take(name)?;
             interfaces.push(Interface {
                 id,
                 mac: MacAddress(*mac),
@@ -316,10 +356,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             if ports.iter().any(|port| port == name) {
                 return Err(format!("tunnel {name} has the name of a port"));
             }
-            let id = u16::try_from(interface_names.len())
-                .map(IfId)
-                .map_err(|_| "too many interfaces".to_owned())?;
-            interface_names.push(name.clone());
+            let id = ids.take(name)?;
             interfaces.push(Interface {
                 id,
                 mac: MacAddress(*mac),
@@ -378,10 +415,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                     session.parent
                 ));
             }
-            let id = u16::try_from(interface_names.len())
-                .map(IfId)
-                .map_err(|_| "too many interfaces".to_owned())?;
-            interface_names.push(name.clone());
+            let id = ids.take(name)?;
             interfaces.push(Interface {
                 id,
                 mac: MacAddress(*mac),
@@ -405,13 +439,10 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
     names.remove(DEFAULT_VRF);
     let order: Vec<&str> = std::iter::once(DEFAULT_VRF).chain(names).collect();
     let index_of = |vrf: &str| order.iter().position(|v| *v == vrf);
-    // Each VRF's kernel interface, after every other one.
+    // Each VRF's kernel interface.
     let mut kernel = Vec::with_capacity(order.len());
     for (at, vrf) in order.iter().enumerate() {
-        let id = u16::try_from(interface_names.len())
-            .map(IfId)
-            .map_err(|_| "too many interfaces".to_owned())?;
-        interface_names.push(format!("rt-{vrf}"));
+        let id = ids.take(&format!("rt-{vrf}"))?;
         interfaces.push(Interface {
             id,
             mac: crate::kernel::interface_mac(at),
@@ -613,6 +644,7 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
             .with_unreachable(unreachable6.clone());
         vrfs.push(Vrf { owner, ipv6 });
     }
+    let interface_names = ids.names;
     let by_ingress = (0..interface_names.len())
         .map(|index| {
             active

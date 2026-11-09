@@ -135,7 +135,9 @@ pub struct Fe<B> {
     by_ingress: Vec<u16>,
     /// The VRF names, in the order of `vrfs`.
     names: Vec<String>,
-    /// Every interface's name by id: the ports, then VLAN sub-interfaces.
+    /// Every interface's name by id: the ports, then the others (VLAN
+    /// sub-interfaces, tunnels, PPPoE sessions, the kernel's), each keeping its id
+    /// across table changes; an empty name is an id no interface has.
     interface_names: Vec<String>,
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
@@ -196,11 +198,13 @@ where
             ports,
             built: None,
             generation: 0,
+            names: Vec::new(),
         };
         builder
             .check(&Store::default())
             .expect("empty tables build");
         let (built, _, _) = builder.built.take().expect("built");
+        builder.names.clone_from(&built.interface_names);
         Self {
             io,
             builder,
@@ -496,7 +500,12 @@ where
 
     /// Sends `frame` to the neighbor process; counted with the ARP counters.
     fn punt_frame(&mut self, ingress: IfId, reason: u16, frame: &[u8]) {
-        let Some(name) = self.interface_names.get(usize::from(ingress.0)) else {
+        // An id no interface has now (a hole the tables left) is not sent.
+        let Some(name) = self
+            .interface_names
+            .get(usize::from(ingress.0))
+            .filter(|name| !name.is_empty())
+        else {
             return;
         };
         let Some(socket) = &self.punt else {
@@ -527,7 +536,11 @@ where
         if last.is_some_and(|at| now_ms.saturating_sub(at) < RESOLVE_INTERVAL_MS) {
             return;
         }
-        let Some(name) = self.interface_names.get(usize::from(egress.0)) else {
+        let Some(name) = self
+            .interface_names
+            .get(usize::from(egress.0))
+            .filter(|name| !name.is_empty())
+        else {
             return;
         };
         if self.last_resolve.len() >= RESOLVE_REMEMBERED {
@@ -743,6 +756,7 @@ where
     fn step(&mut self, now_ms: u64) -> Progress {
         let control = self.server.step(&mut self.builder);
         if let Some((built, publication, nat)) = self.builder.built.take() {
+            self.builder.names.clone_from(&built.interface_names);
             // The tracker's entries name the old tables' egress, neighbors and
             // translations: later fragments of those datagrams are dropped.
             self.fragment_tracking.flush_with_key(fragments::key());
@@ -848,6 +862,10 @@ struct Builder {
     )>,
     /// Of the last firewall publication.
     generation: u64,
+    /// The interface of each id in the tables the FE uses: a table change keeps the
+    /// ids of the interfaces that stay. Several changes checked in one step build
+    /// on these, not on each other, since the FE takes only the last.
+    names: Vec<String>,
 }
 
 /// The id of the interface `name` (a port or a VLAN sub-interface) in `names`.
@@ -858,7 +876,7 @@ fn interface_id(names: &[String], name: &str) -> Option<IfId> {
 
 impl Hook for Builder {
     fn check(&mut self, next: &Store) -> Result<(), String> {
-        let built = build::build(&self.ports, next)?;
+        let built = build::build(&self.ports, next, &self.names)?;
         self.generation += 1;
         let default = built.vrfs.first().ok_or("no default VRF")?;
         let publication = firewall::Publication::new(
