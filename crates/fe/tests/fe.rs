@@ -3216,3 +3216,39 @@ fn a_long_icmpv4_error_interval_is_used_and_another_vrf_s_limits_are_refused() {
     }
     assert_eq!(sent, [1, 0], "the second is within 120 s of the first");
 }
+
+/// With NAT, an unsolicited TCP SYN from outside is not answered at once; once its
+/// 6 seconds are over with no outbound SYN for it, a Port Unreachable goes back
+/// (RFC 5382 REQ-4), also when no packet arrives at that time.
+#[test]
+fn an_unsolicited_syn_gets_a_port_unreachable_after_six_seconds() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+
+    let syn = tcp_packet(INTERNET, [198, 51, 100, 2], (50_000, 40_005), 0x02);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&syn));
+    bench.fe.step(1_000);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "not answered at once");
+    bench.fe.step(6_000);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "nor within 6 seconds");
+
+    bench.fe.step(7_100);
+    let tx = bench.fe.io_mut().pop_tx().expect("a Port Unreachable");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+    let ip = 14;
+    assert_eq!(tx.bytes[ip + 9], 1, "ICMP");
+    assert_eq!(&tx.bytes[ip + 16..ip + 20], &INTERNET);
+    assert_eq!((tx.bytes[ip + 20], tx.bytes[ip + 21]), (3, 3));
+    assert_eq!(&tx.bytes[ip + 28..ip + 48], &syn[..20], "it quotes the SYN");
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "once");
+}
