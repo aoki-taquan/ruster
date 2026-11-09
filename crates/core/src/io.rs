@@ -281,6 +281,7 @@ pub enum ConsumeReason {
     /// A packet addressed to the router copied into the caller's control queue for
     /// the kernel (`ForwardingSnapshot::with_local_to_control`).
     LocalToControl,
+    // 7 was WireGuard's, which is no longer part of ruster; the code stays taken.
     /// A packet routed to a WireGuard interface was sealed into a frame in the
     /// send runtime's staging area; it is sent as a generated frame after the
     /// batch. The received frame is recycled.

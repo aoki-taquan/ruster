@@ -114,6 +114,10 @@ DS-LiteとIPv6のfirewall、VRFとfirewall）を含み、どれもAF_XDPとAF_PA
 
 1. `backlog`のissueに残したMediumとLow（#506の見直しと、各PRの見直しから）。
 
+今は作らないもの（2026-11-08 owner決定）: PPPoEの制御（Discovery、LCP、認証、IPCP。セッションは
+外で張られている前提）、マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
+外れている点として、それぞれのモジュールの`# Standards`に書く。
+
 ## 気をつけること
 
 - 今のパケットのleaseは`Rc`で`Send`できない。workerごとのqueueには問題ないが、workerの間でbufferを

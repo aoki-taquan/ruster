@@ -49,7 +49,6 @@ mod kernel;
 mod local;
 mod nat;
 mod reassembly;
-mod wireguard;
 
 pub use local::LocalPipe;
 
@@ -64,9 +63,6 @@ pub mod writers {
         sid::FIREWALL_POLICY,
         sid::ICMP_ERRORS,
         sid::FIREWALL_RULE,
-        sid::WIREGUARD,
-        sid::WIREGUARD_PEER,
-        sid::WIREGUARD_SESSION,
     ];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
@@ -86,10 +82,6 @@ const USED_MAX: usize = 8_192;
 const INJECT_PER_STEP: usize = 64;
 /// One resolve request per next hop per this many milliseconds.
 const RESOLVE_INTERVAL_MS: u64 = 1_000;
-/// A peer's key exchange is asked for again after this long (WireGuard's handshake
-/// retry is 5 seconds, whitepaper section 6.4).
-const KEY_REQUEST_INTERVAL_MS: u64 = 5_000;
-const KEY_REQUESTS_REMEMBERED: usize = 256;
 /// Next hops remembered for the rate limit. Older ones are forgotten first; when all
 /// are recent, further requests wait (and are counted).
 const RESOLVE_REMEMBERED: usize = 1_024;
@@ -110,9 +102,6 @@ pub struct FeCounters {
     pub arp_to_control_dropped: u64,
     pub resolve_requests: u64,
     pub resolve_requests_dropped: u64,
-    /// Key exchange notifications sent for WireGuard peers that had a packet and no
-    /// session.
-    pub key_exchange_requests: u64,
     pub injected: u64,
     pub inject_dropped: u64,
     /// ICMP errors generated (rate limited per egress interface).
@@ -135,9 +124,6 @@ pub struct FeCounters {
     /// PPPoE session, a VLAN sub-interface) that could not be sent after they were
     /// counted.
     pub generated_dropped: u64,
-    /// WireGuard packets sealed and sent, and sealed ones that could not be sent.
-    pub wireguard_sent: u64,
-    pub wireguard_send_dropped: u64,
 }
 
 pub struct Fe<B> {
@@ -155,7 +141,6 @@ pub struct Fe<B> {
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
     unreachable: Vec<(IfId, ruster_core::Ipv4Address)>,
     pppoe: Vec<ruster_core::PppoeSession>,
-    wireguard: wireguard::Wireguard,
     /// Each VRF's kernel interface, in the order of `vrfs`.
     kernel: Vec<IfId>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
@@ -172,7 +157,6 @@ pub struct Fe<B> {
     /// Where ARP goes when the punt socket is not connected to one peer.
     punt_peer: Option<PathBuf>,
     last_resolve: BTreeMap<(IfId, IpAddr), u64>,
-    last_key_request: BTreeMap<(String, String), u64>,
     /// Neighbor Discovery frames core copied out of the last batch.
     control: ControlQueue,
     /// ICMPv4 errors core queued in the last batch, and their rate limits.
@@ -228,11 +212,6 @@ where
             tunnels: built.tunnels,
             unreachable: built.unreachable,
             pppoe: built.pppoe,
-            wireguard: {
-                let mut wireguard = wireguard::Wireguard::new();
-                wireguard.publish(built.wireguard);
-                wireguard
-            },
             kernel: built.kernel,
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
@@ -242,7 +221,6 @@ where
             punt: None,
             punt_peer: None,
             last_resolve: BTreeMap::new(),
-            last_key_request: BTreeMap::new(),
             control: ControlQueue::new(EVENTS_PER_BATCH).with_icmpv6_errors(EVENTS_PER_BATCH),
             icmpv4_errors: icmpv4_error_runtime(),
             firewall: None,
@@ -312,11 +290,6 @@ where
 
     fn worker(&mut self, now_ms: u64) -> bool {
         let mut trace = FeTrace::default();
-        // Core's views of the WireGuard interfaces: made for each batch, and only
-        // when there is one.
-        let wireguard_on = !self.wireguard.is_empty();
-        let wg_peers = wireguard::peer_configs(&self.wireguard.config);
-        let wg_views = wireguard::interfaces(&self.wireguard.config, &wg_peers);
         // The kernel's packets join the ports' in one batch, after them.
         let mut kernel_frames = self.read_kernel();
         kernel_frames.append(&mut self.reassembled);
@@ -336,7 +309,6 @@ where
                     .with_tunnels(&self.tunnels)
                     .with_unreachable_neighbors(&self.unreachable)
                     .with_pppoe(&self.pppoe)
-                    .with_wireguard(&wg_views)
             })
             .collect();
         let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
@@ -348,7 +320,6 @@ where
             .with_vlans(&self.vlans)
             .with_tunnels(&self.tunnels)
             .with_pppoe(&self.pppoe)
-            .with_wireguard(&wg_views)
             .with_kernel_ingress(&self.kernel)
             .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(ports) = self.io.receive(RX_BUDGET) else {
@@ -373,8 +344,6 @@ where
                 .map(|(config, runtime)| (&*config, &mut **runtime)),
             fragmentation: Some(&mut self.fragmentation),
             fragment_tracking: Some(&mut self.fragment_tracking),
-            wireguard: wireguard_on.then_some(&mut self.wireguard.states[..]),
-            wireguard_send: wireguard_on.then_some(&mut self.wireguard.send),
             ..Services::default()
         };
         if let Some(nat) = self.nat.as_mut() {
@@ -452,18 +421,6 @@ where
             }
             self.counters.icmp_errors_sent += 1;
         }
-        let mut wireguard_budget = wireguard::FRAMES_PER_BATCH;
-        while let Some(report) = ruster_core::wireguard::execute_one_wireguard_send(
-            &mut self.io,
-            &mut self.wireguard.send,
-            &mut wireguard_budget,
-        ) {
-            if report.sent {
-                self.counters.wireguard_sent += 1;
-            } else {
-                self.counters.wireguard_send_dropped += 1;
-            }
-        }
         let mut budget = fragments::FRAMES_PER_BATCH;
         while let Some(report) = execute_one_ipv4_fragmentation(
             &mut kernel::WithKernel {
@@ -528,9 +485,6 @@ where
         for &(egress, target) in &trace.misses {
             self.resolve_request(egress, target, now_ms);
         }
-        for &(interface, peer) in &trace.key_requests {
-            self.key_exchange_request(interface, peer, now_ms);
-        }
         true
     }
 
@@ -592,43 +546,6 @@ where
         .encode(&mut Encoder::new(&mut payload));
         self.server.notify(&payload);
         self.counters.resolve_requests += 1;
-    }
-
-    /// Tells the observers that the key exchange with a peer is due, at most once
-    /// in [`KEY_REQUEST_INTERVAL_MS`] for each peer.
-    fn key_exchange_request(&mut self, interface: IfId, peer: usize, now_ms: u64) {
-        let Some(built) = self
-            .wireguard
-            .config
-            .iter()
-            .find(|i| i.interface == interface)
-        else {
-            return;
-        };
-        let Some(peer) = built.peers.get(peer) else {
-            return;
-        };
-        let key = (built.name.clone(), peer.name.clone());
-        let last = self.last_key_request.get(&key).copied();
-        if last.is_some_and(|at| now_ms.saturating_sub(at) < KEY_REQUEST_INTERVAL_MS) {
-            return;
-        }
-        if self.last_key_request.len() >= KEY_REQUESTS_REMEMBERED {
-            self.last_key_request
-                .retain(|_, at| now_ms.saturating_sub(*at) < KEY_REQUEST_INTERVAL_MS);
-            if self.last_key_request.len() >= KEY_REQUESTS_REMEMBERED {
-                return;
-            }
-        }
-        let mut payload = Vec::new();
-        ruster_proto::table::KeyExchangeRequest {
-            interface: key.0.clone(),
-            peer: key.1.clone(),
-        }
-        .encode(&mut Encoder::new(&mut payload));
-        self.last_key_request.insert(key, now_ms);
-        self.server.notify(&payload);
-        self.counters.key_exchange_requests += 1;
     }
 
     /// Sends the frames the neighbor process gave back.
@@ -878,7 +795,6 @@ where
             self.tunnels = built.tunnels;
             self.unreachable = built.unreachable;
             self.pppoe = built.pppoe;
-            self.wireguard.publish(built.wireguard);
             self.kernel = built.kernel;
             self.active = built.active;
         }
@@ -1000,9 +916,6 @@ struct FeTrace {
     misses: Vec<(IfId, IpAddr)>,
     /// Next hops packets went to in this batch (the neighbors' "used" marks).
     used: std::collections::HashSet<(u16, IpAddr)>,
-    /// WireGuard peers (interface, index among its peers) that had a packet and no
-    /// session.
-    key_requests: Vec<(IfId, usize)>,
     overflow: u64,
 }
 
@@ -1043,14 +956,6 @@ impl TraceSink for FeTrace {
             }
             TraceEvent::Ipv6NeighborMissing { egress, target } => {
                 self.miss(egress, IpAddr::V6(target.into()));
-            }
-            TraceEvent::WireguardNoSession { interface, peer } => {
-                let request = (interface, peer);
-                if self.key_requests.len() < EVENTS_PER_BATCH
-                    && !self.key_requests.contains(&request)
-                {
-                    self.key_requests.push(request);
-                }
             }
             _ => {}
         }

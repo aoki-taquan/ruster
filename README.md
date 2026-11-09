@@ -59,7 +59,7 @@ default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFE�
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます（AF_XDPのみ）。
 MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます（AF_XDPのみ。ルータ自身のIPv4はまだMAP-Eを通りません）。
 PPPoEのセッション（RFC 2516）を、設定ファイルの`pppoe`のインターフェースで使えます。セッションの確立は外のデーモンの仕事で、FEは包むのと外すのだけを行います。
-WireGuardは止めています。FEにデータの暗号化と復号の処理はありますが、セッション鍵を渡す口が無いので使えません。どこで暗号処理をするか（性能）と鍵交換のソフトを決めてから再開します。
+WireGuardは作りません（charterの「作るもの」に無い。2026-11-09 owner決定）。
 FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don't Fragmentが無いもの）、NATはフラグメントになったdatagramも変換します。
 
 ## 動かす
