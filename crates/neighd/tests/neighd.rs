@@ -126,13 +126,30 @@ impl Lab {
         self.settle();
     }
 
+    /// The frames sent, without the probes and announcements of the router's own
+    /// addresses ([`Lab::all_tx`] has them).
     fn tx(&mut self) -> Vec<(IfId, Vec<u8>)> {
+        self.all_tx()
+            .into_iter()
+            .filter(|(_, frame)| !is_claim(frame))
+            .collect()
+    }
+
+    fn all_tx(&mut self) -> Vec<(IfId, Vec<u8>)> {
         let mut out = Vec::new();
         while let Some(frame) = self.fe.io_mut().pop_tx() {
             out.push((frame.egress, frame.bytes));
         }
         out
     }
+}
+
+/// An ARP Probe or Announcement (RFC 5227): from no address, or with the sender as
+/// the target.
+fn is_claim(frame: &[u8]) -> bool {
+    frame.len() >= 42
+        && frame[12..14] == [0x08, 0x06]
+        && (frame[28..32] == [0; 4] || frame[28..32] == frame[38..42])
 }
 
 /// Connects a new neighd to the FE (neighbor writer and punt socket) and gives it the
@@ -293,4 +310,64 @@ fn a_restarted_neighd_keeps_the_fe_neighbors() {
     let tx = lab.tx();
     assert_eq!(tx.len(), 1, "forwarded, no new ARP");
     assert_eq!(&tx[0].1[0..6], &GATEWAY_MAC);
+}
+
+/// RFC 5227: each of the router's addresses is probed three times, one second
+/// apart, and two seconds later announced twice, two seconds apart.
+#[test]
+fn the_router_s_addresses_are_probed_and_announced() {
+    let mut lab = Lab::new();
+    let mut seen = Vec::new();
+    for now in (0..=8_000).step_by(500) {
+        lab.now = now;
+        lab.settle();
+        for (egress, frame) in lab.all_tx() {
+            if is_claim(&frame) && egress == IfId(0) {
+                assert_eq!(&frame[0..6], &[0xff; 6], "broadcast");
+                assert_eq!(&frame[38..42], &LAN_IP);
+                let probe = frame[28..32] == [0; 4];
+                seen.push((now, probe));
+            }
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            (0, true),
+            (1_000, true),
+            (2_000, true),
+            (4_000, false),
+            (6_000, false)
+        ]
+    );
+}
+
+/// RFC 5227 section 2.4 (c): another host claiming the router's address is
+/// answered with an Announcement, at most once in ten seconds.
+#[test]
+fn a_host_claiming_the_router_s_address_is_answered_once_in_ten_seconds() {
+    let mut lab = Lab::new();
+    // The probes and announcements of the start are over by 8 seconds.
+    for now in (0..=8_000).step_by(500) {
+        lab.now = now;
+        lab.settle();
+    }
+    lab.all_tx();
+    let other = [2, 0, 0, 0, 0, 0x66];
+    let mut defended = Vec::new();
+    for now in [10_000, 12_000, 20_000] {
+        lab.now = now;
+        lab.fe
+            .io_mut()
+            .inject(IfId(0), arp(1, [0xff; 6], other, LAN_IP, LAN_IP));
+        lab.settle();
+        let announcements = lab
+            .all_tx()
+            .into_iter()
+            .filter(|(egress, frame)| *egress == IfId(0) && is_claim(frame))
+            .count();
+        defended.push(announcements);
+    }
+    assert_eq!(defended, [1, 0, 1]);
+    assert_eq!(lab.neighd.counters().conflicts, 3);
 }

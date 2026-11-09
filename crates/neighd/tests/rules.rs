@@ -105,13 +105,16 @@ impl Lab {
         self.settle(true);
     }
 
-    /// The ARP frames neighd sent (not its reads of the "used" marks).
+    /// The ARP frames neighd sent (not its reads of the "used" marks, nor the probes
+    /// and announcements of the router's own addresses, RFC 5227).
     fn frames_out(&self) -> usize {
         let mut buf = [0_u8; 512];
         let mut count = 0;
         while let Ok(n) = self.fe_punt.recv(&mut buf) {
             let punt = Punt::decode(&buf[..n]).unwrap();
-            if punt.reason != punt::reason::NEIGHBOR_USED {
+            let f = punt.frame;
+            let claim = f.len() >= 42 && (f[28..32] == [0; 4] || f[28..32] == f[38..42]);
+            if punt.reason != punt::reason::NEIGHBOR_USED && !claim {
                 count += 1;
             }
         }
