@@ -211,6 +211,54 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/policy/filtering-type",
+        "sid": 60069,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-firewall:policy",
+        "sid": 60140,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-firewall:policy/filtering-type",
+        "sid": 60141,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-firewall:policy/outside-interface",
+        "sid": 60142,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors",
+        "sid": 60150,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors/ipv4-interval",
+        "sid": 60151,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors/ipv6-burst",
+        "sid": 60152,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fe:icmp-errors/ipv6-interval",
+        "sid": 60153,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ietf-access-control-list:acls/acl/aces/ace",
         "sid": 60070,
         "status": "unstable"

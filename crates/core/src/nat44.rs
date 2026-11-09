@@ -1,3 +1,35 @@
+//! NAT44: NAPT of UDP, TCP and ICMP queries from one inside interface to one
+//! public address and port set.
+//!
+//! # Standards
+//!
+//! - RFC 4787 (UDP): endpoint-independent mapping (REQ-1); filtering
+//!   endpoint-independent, address-dependent or address-and-port-dependent
+//!   (REQ-8, [`Nat44Filtering`]); mappings refreshed by outbound packets only
+//!   (REQ-6) and kept at least two minutes, five by default (REQ-5); fragments
+//!   associated with their first fragment (REQ-14, `ipv4_fragment_tracking`).
+//! - RFC 5382 (TCP): endpoint-independent mapping (REQ-1); filtering as for UDP
+//!   (REQ-3); an unsolicited SYN held at least six seconds before Port Unreachable
+//!   (REQ-4); established sessions kept at least 2 hours 4 minutes (REQ-5),
+//!   transitory ones four minutes.
+//! - RFC 5508 (ICMP): query identifiers mapped as ports, query mappings kept 60
+//!   seconds; ICMP errors about a mapped flow translated both ways (REQ-3 to
+//!   REQ-7), never refreshing or deleting state (REQ-6).
+//! - RFC 7857: port randomization with a key where the port cannot be preserved
+//!   (section 9); TCP RST handling (section 2.2).
+//! - RFC 7597 section 5.1: a MAP-E port set (PSID) as the pool.
+//!
+//! Deviations:
+//!
+//! - Port Unreachable and Protocol Unreachable from the inside are translated only
+//!   from the end host the flow went to.
+//! - A TCP RST's sequence number is not checked against the session.
+//! - A ping from the inside to the public address is answered by the router, not
+//!   hairpinned.
+//! - No Destination Unreachable code 13 when a mapping cannot be made (RFC 5508
+//!   REQ-8); the packet is dropped.
+//! - ICMP query filtering is address-dependent whatever the UDP and TCP filtering.
+
 use std::{
     marker::PhantomData,
     rc::Rc,
@@ -6700,8 +6732,8 @@ fn address_is_host_unicast(snapshot: &ForwardingSnapshot<'_>, address: Ipv4Addre
         return false;
     }
     !snapshot.route_lookup(address).is_some_and(|selected| {
-        selected.is_prefix_network_address(address)
-            || selected.is_prefix_directed_broadcast(address)
+        selected.is_connected_network_address(address)
+            || selected.is_connected_directed_broadcast(address)
     })
 }
 

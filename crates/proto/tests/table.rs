@@ -606,6 +606,7 @@ fn nat_and_firewall_entries_round_trip_and_are_checked() {
                 outside: "wan".into(),
                 external: None,
                 ports: ruster_proto::table::NatPorts::Range { first, last },
+                filtering: ruster_proto::table::NatFiltering::AddressDependent,
             }),
         )
     };
@@ -706,6 +707,7 @@ fn a_nat_with_a_psid_port_set_round_trips_and_is_checked() {
                 outside: "map".into(),
                 external: None,
                 ports,
+                filtering: Default::default(),
             }),
         )
     };
@@ -1007,4 +1009,79 @@ fn an_ipv6_firewall_rule_round_trips_and_a_mixed_one_is_refused() {
     ] {
         assert!(bad.validate().is_err(), "{bad:?}");
     }
+}
+
+/// A NAT entry without `filtering-type` (from an older writer) is
+/// endpoint-independent, and the default is not written.
+#[test]
+fn a_nat_without_filtering_type_is_endpoint_independent() {
+    use ruster_proto::table::{Nat, NatFiltering, NatPorts};
+    let nat = Nat {
+        inside: "lan".into(),
+        outside: "wan".into(),
+        external: None,
+        ports: NatPorts::Range {
+            first: 1_024,
+            last: 32_767,
+        },
+        filtering: NatFiltering::EndpointIndependent,
+    };
+    let change = Change::set(
+        Key::Nat {
+            vrf: "default".into(),
+        },
+        Value::Nat(nat.clone()),
+    );
+    use ruster_proto::session::{decode_changes, encode_changes};
+    let bytes = encode_changes(std::slice::from_ref(&change)).unwrap();
+    assert_eq!(decode_changes(&bytes).unwrap(), vec![change]);
+    let strict = Change::set(
+        Key::Nat {
+            vrf: "default".into(),
+        },
+        Value::Nat(Nat {
+            filtering: NatFiltering::AddressAndPortDependent,
+            ..nat
+        }),
+    );
+    let longer = encode_changes(std::slice::from_ref(&strict)).unwrap();
+    assert!(longer.len() > bytes.len(), "only a non-default is written");
+    assert_eq!(decode_changes(&longer).unwrap(), vec![strict]);
+}
+
+#[test]
+fn icmp_error_limits_round_trip_and_zero_or_a_missing_member_is_refused() {
+    let limits = |ipv4_interval_ms| {
+        Change::set(
+            Key::IcmpErrors {
+                vrf: DEFAULT_VRF.into(),
+            },
+            Value::IcmpErrors {
+                ipv4_interval_ms,
+                ipv6_burst: 10,
+                ipv6_interval_ms: 10,
+            },
+        )
+    };
+    assert_eq!(round_trip(&limits(100)), limits(100));
+    let mut zero = Vec::new();
+    if limits(0).encode(&mut Encoder::new(&mut zero)).is_ok() {
+        assert!(decode_bytes(&zero).is_err(), "an interval of 0");
+    }
+    // {[60150, "default"]: {1: 100, 2: 10}}: no ipv6-interval.
+    let missing = encoded(|e| {
+        e.map(1)
+            .array(2)
+            .u64(sid::ICMP_ERRORS)
+            .text(DEFAULT_VRF)
+            .map(2)
+            .u64(1)
+            .u64(100)
+            .u64(2)
+            .u64(10);
+    });
+    assert!(matches!(
+        decode_bytes(&missing),
+        Err(ModelError::Missing(_))
+    ));
 }

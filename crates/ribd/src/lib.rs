@@ -19,7 +19,10 @@
 //! - RFC 8349 (`ietf-routing`): routes per VRF and prefix, chosen by route preference
 //!   (lower is preferred) between sources.
 //!
-//! Deviations: a preference is set per source, not per route.
+//! Deviations: a preference is set per source, not per route. ribd does not know
+//! the interfaces, so a route out of a disabled interface may be chosen over a
+//! usable one (RFC 8349 chooses among usable routes), and the FE leaves it out;
+//! confd offers none of its own static routes out of one.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -78,6 +81,11 @@ pub struct Ribd {
     resync_pending: bool,
     /// The patch waiting for the FE's answer, and the routes it would make the FE hold.
     in_flight: Option<(u32, BTreeMap<Key, Value>)>,
+    /// The resync-end waiting for the FE's answer.
+    resync_end: Option<u32>,
+    /// The FE refused resync-end: what it holds stays marked stale, and resync-end
+    /// goes again after the next change from a source (not every step).
+    resync_end_refused: bool,
     counters: RibdCounters,
 }
 
@@ -110,6 +118,8 @@ impl Ribd {
             dirty: false,
             resync_pending: false,
             in_flight: None,
+            resync_end: None,
+            resync_end_refused: false,
             counters: RibdCounters::default(),
         })
     }
@@ -139,6 +149,8 @@ impl Ribd {
         self.fe = fe;
         self.sent.clear();
         self.in_flight = None;
+        self.resync_end = None;
+        self.resync_end_refused = false;
         self.dirty = true;
         self.resync_pending = self.waiting_since.is_none();
         Ok(())
@@ -209,11 +221,13 @@ impl Ribd {
     /// once it equals the selection the FE holds everything ribd wants.
     fn finish_resync(&mut self) -> bool {
         if self.resync_pending
+            && !self.resync_end_refused
+            && self.resync_end.is_none()
             && self.in_flight.is_none()
             && !self.dirty
             && self.sent == self.selected()
         {
-            self.fe.resync_end();
+            self.resync_end = Some(self.fe.resync_end());
             self.resync_pending = false;
             return true;
         }
@@ -234,6 +248,7 @@ impl Task for Ribd {
             let mut changed = Changed::default();
             progress = progress.and(source.server.step(&mut changed));
             self.dirty |= changed.0;
+            self.resync_end_refused &= !changed.0;
         }
         let (fe, events) = self.fe.poll();
         progress = progress.and(fe);
@@ -281,6 +296,13 @@ impl Ribd {
             let refused = code.class() != 2;
             if refused {
                 self.counters.patches_refused += 1;
+            }
+            if self.resync_end == Some(*token) {
+                self.resync_end = None;
+                if refused {
+                    self.resync_pending = true;
+                    self.resync_end_refused = true;
+                }
             }
             if self.in_flight.as_ref().is_some_and(|(t, _)| t == token) {
                 let (_, selected) = self.in_flight.take().expect("checked");

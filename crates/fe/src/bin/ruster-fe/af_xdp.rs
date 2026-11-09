@@ -8,8 +8,8 @@ use ruster_io_xdp::native_profile::{
     RingConfig, UmemConfig, ValidatedBindFlags, XDP_COPY, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
 };
 use ruster_io_xdp_native::{
-    NativeSession, RxFillConfig, RxFillEngine, RxWait, SessionConfig, UmemDomainId, XdpAttachMode,
-    XdpPacketIo, XdpPort, XdpPortConfig,
+    NativeSession, RxFillConfig, RxFillEngine, RxWait, SessionConfig, SessionError, SessionFailure,
+    SessionStage, UmemDomainId, XdpAttachMode, XdpPacketIo, XdpPort, XdpPortConfig,
 };
 use ruster_proto::daemon;
 
@@ -54,14 +54,38 @@ pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeS
     for device in devices {
         let config = SessionConfig::new(device, 0, bind_flags, rings, umem)
             .map_err(|error| format!("{device}: {error:?}"))?;
-        let mut session =
-            NativeSession::open(&config).map_err(|error| format!("{device}: {error:?}"))?;
+        let mut session = open_retrying(&config).map_err(|error| format!("{device}: {error:?}"))?;
         session
             .attach_xdp(options.attach)
             .map_err(|error| format!("{device}: attaching XDP: {error:?}"))?;
         sessions.push(session);
     }
     Ok(sessions)
+}
+
+/// Opens a session, trying again for a while when the failure can be transient: a
+/// previous FE's socket on the same queue (or its UMEM accounting) that Linux has
+/// not released yet right after it stopped.
+fn open_retrying(config: &SessionConfig) -> Result<NativeSession, SessionError> {
+    const ATTEMPTS: u32 = 20;
+    const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut attempt = 1;
+    loop {
+        match NativeSession::open(config) {
+            Err(error)
+                if attempt < ATTEMPTS
+                    && matches!(
+                        (error.stage(), error.failure()),
+                        (SessionStage::Bind, SessionFailure::Busy)
+                            | (_, SessionFailure::MemlockLimit)
+                    ) =>
+            {
+                attempt += 1;
+                thread::sleep(WAIT);
+            }
+            result => return result,
+        }
+    }
 }
 
 fn domain(interface: IfId) -> UmemDomainId {
@@ -95,9 +119,19 @@ pub fn packet_io(sessions: &mut [NativeSession]) -> Result<XdpPacketIo<'_>, Stri
 }
 
 /// Waiting for AF_XDP input between steps.
-#[derive(Default)]
 pub struct Waiter {
+    /// How long to wait for input while idle, up to [`crate::IDLE_LONGEST_MS`].
+    idle: daemon::Idle,
     ready_unused: bool,
+}
+
+impl Default for Waiter {
+    fn default() -> Self {
+        Self {
+            idle: daemon::Idle::up_to(crate::IDLE_LONGEST_MS),
+            ready_unused: false,
+        }
+    }
 }
 
 impl Backend<XdpPacketIo<'_>> for Waiter {
@@ -108,6 +142,7 @@ impl Backend<XdpPacketIo<'_>> for Waiter {
     fn after_step(&mut self, io: &mut XdpPacketIo<'_>, busy: bool) -> Result<(), String> {
         if busy {
             self.ready_unused = false;
+            self.idle.after(true);
             return Ok(());
         }
         // Reap completions, retry owed kicks and refill Fill while idle.
@@ -118,7 +153,7 @@ impl Backend<XdpPacketIo<'_>> for Waiter {
             thread::sleep(daemon::IDLE_MAX);
         } else {
             let woke = io
-                .wait_rx(daemon::IDLE_MAX_MS)
+                .wait_rx(self.idle.after(false).unwrap_or(1))
                 .map_err(|error| format!("waiting for packets: {error:?}"))?;
             self.ready_unused = woke == RxWait::Ready;
         }

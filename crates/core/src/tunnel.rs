@@ -13,8 +13,9 @@
 //! - RFC 8200 section 4: Hop-by-Hop and Destination Options headers before the
 //!   inner packet (such as RFC 2473 4.1.1's Tunnel Encapsulation Limit) are
 //!   stepped over when unwrapping; other extension headers are not.
-//! - RFC 2983 (uniform model): the inner IPv4 TOS byte is copied to the outer
-//!   Traffic Class.
+//! - RFC 2983 (uniform model) on sending: the inner IPv4 TOS byte is copied to the
+//!   outer Traffic Class. On receiving, the outer Traffic Class is not copied into
+//!   the inner packet and ECN is not combined (RFC 6040 section 4.2): a deviation.
 //! - RFC 2473 6.7: the IPv4 MTU of a tunnel interface is its own, and at most what
 //!   the IPv6 path to the remote end carries (the egress interface's MTU, less
 //!   PPPoE's header for a session) less the 40-byte IPv6 header. Fragmentation
@@ -206,6 +207,7 @@ pub(crate) fn transmit<S: PacketSlot, T: TraceSink>(
         });
         return Err(DropReason::NeighborUnresolved);
     };
+    trace.record(TraceEvent::Ipv6Routed { egress, next_hop });
     let bytes = packet.bytes_mut();
     let inner = bytes
         .get(ETHERNET + 2..ETHERNET + 4)

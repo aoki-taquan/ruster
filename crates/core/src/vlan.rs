@@ -10,6 +10,8 @@
 //! - IEEE 802.1Q: the C-tag (TPID 0x8100, then PCP, DEI and the 12-bit VLAN ID).
 //! - `draft-ietf-netmod-sub-intf-vlan-model`: a sub-interface matches one outer tag
 //!   and pops it on receive, pushes it on send.
+//! - IEEE 802.1Q: a priority-tagged frame (VLAN ID 0) belongs to the port itself,
+//!   as an untagged one; VLAN ID 4095 is reserved and matches no sub-interface.
 //!
 //! Deviations: S-tags (0x88a8) and stacked tags are not matched; sent frames carry
 //! priority 0.
@@ -42,6 +44,14 @@ pub(crate) fn receive<S: PacketSlot>(
         *bytes.get(15).ok_or(DropReason::EthernetHeaderTruncated)?,
     ]);
     let vid = tci & 0x0fff;
+    // A priority-tagged frame (VLAN ID 0) is the port's own, untagged.
+    if vid == 0 {
+        bytes.copy_within(0..12, TAG);
+        if !packet.resize_front(TAG as isize) {
+            return Err(DropReason::VlanNoRoom);
+        }
+        return Ok(());
+    }
     let binding = vlans
         .iter()
         .find(|b| b.parent == port && b.vid == vid)

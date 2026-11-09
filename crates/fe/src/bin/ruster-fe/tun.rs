@@ -20,9 +20,13 @@ pub fn device(vrf: &str) -> Option<String> {
         .then_some(name)
 }
 
-/// Whether the device exists in this network namespace.
-pub fn exists(device: &str) -> bool {
-    std::path::Path::new("/sys/class/net").join(device).exists()
+/// The device's interface index in this network namespace, or `None` when there is
+/// no such device. A device made again gets another index.
+pub fn index(device: &str) -> Option<u32> {
+    let path = std::path::Path::new("/sys/class/net")
+        .join(device)
+        .join("ifindex");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Opens `/dev/net/tun`, non-blocking, attached to the existing `device`.

@@ -103,23 +103,16 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 #### できたもの（2026-11-08）
 
-IPv4とIPv6の転送、VRF、VLAN（AF_XDP）、NAT44とMAP-EのNAPT、IPv4とIPv6のfirewall、フラグメント、
+IPv4とIPv6の転送、VRF、VLAN、NAT44とMAP-EのNAPT、IPv4とIPv6のfirewall、フラグメント、
 ICMPとICMPv6のエラー、DS-Lite、MAP-E、PPPoE、ルータ宛て通信のTUN、confd、ribd、neighd、
-AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は8本。
+AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は14本で、機能を組み合わせた
+構成（VLANの上のNATとfirewall、PPPoEの上のNATとfirewall、PPPoEの上のMAP-E、VLANごとのVRF、
+DS-LiteとIPv6のfirewall、VRFとfirewall）を含み、どれもAF_XDPとAF_PACKETの両方で通る
+（`scripts/netns-all.sh`）。RFCとの見直し（#506）のHighとMediumは直した。
 
 #### 残り（この順に作る）
 
-1. RFCとの見直し（2026-11-08、#506）で出た点を直す。済んだもの: ルータのどのアドレス宛てもルータに
-   届ける、firewallで転送のICMPv4エラーを通す、ルータが作るパケットをPPPoE・トンネル・VLANから出す、
-   トンネルのMTUを下の回線で確かめる、トンネルの外側のIPv6のフラグメントを組み立てる。残りはこの順:
-   1. neighdの近隣を古くし、確かめ直す（RFC 4861 7.3）。ルータ宛てでないNSから学ばない。
-   2. MAP-Eの残り（#462: 外したあとの宛先、discard route、/64、unicastと重複の確認）。
-   3. NATとfirewallの戻りの絞り方を、既定はRFCの勧めどおりにし、設定で選べるようにする
-      （2026-11-08 owner決定）。
-   4. #506のMediumとLow、`# Standards`の足りないモジュール。
-2. 形の違う構成での試験。機能を一つずつ試す今のnetnsの試験に加えて、機能を組み合わせた構成
-   （VLANの上のNATとfirewall、PPPoEの上のMAP-E、VRFごとのNATなど）を、AF_XDPとAF_PACKETの両方で試す。
-   今のnetnsの試験8本は、どれもAF_XDPとAF_PACKETの両方で通る。
+1. `backlog`のissueに残したMediumとLow（#506の見直しと、各PRの見直しから）。
 
 今は作らないもの（2026-11-08 owner決定）: PPPoEの制御（Discovery、LCP、認証、IPCP。セッションは
 外で張られている前提）、マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。

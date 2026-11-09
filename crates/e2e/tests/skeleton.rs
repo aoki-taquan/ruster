@@ -68,6 +68,8 @@ fn config() -> Config {
             },
         }],
         firewall: Vec::new(),
+        firewall_filtering: Default::default(),
+        icmp_errors: None,
         nat: None,
     }
 }
@@ -494,4 +496,59 @@ fn routes_removed_while_the_fe_was_down_are_gone_from_the_new_fe() {
         routes_before - 1,
         "only the static route is gone"
     );
+}
+
+fn has(router: &Router, key: &Key) -> bool {
+    router.fe.store().get(key).is_some()
+}
+
+#[test]
+fn a_restarted_ribd_removes_the_routes_dropped_while_it_was_down() {
+    let mut router = running_router();
+    let default_route = Key::Route {
+        vrf: "default".into(),
+        prefix: Ipv4Addr::UNSPECIFIED.into(),
+        len: 0,
+    };
+    let lan_route = Key::Route {
+        vrf: "default".into(),
+        prefix: Ipv4Addr::new(192, 0, 2, 0).into(),
+        len: 24,
+    };
+    assert!(has(&router, &default_route));
+
+    // The FE keeps its tables; only ribd's connection goes. The static route is
+    // removed while ribd is down.
+    router.ribd = None;
+    router.settle();
+    let mut config = router.config.clone();
+    config.static_routes.clear();
+    router.confd.as_mut().unwrap().set_config(config);
+    router.settle();
+    assert!(has(&router, &default_route), "kept while ribd is down");
+
+    router.start_ribd();
+    router.settle();
+    assert!(!has(&router, &default_route), "resync-end removed it");
+    assert!(has(&router, &lan_route), "what was sent again stays");
+}
+
+#[test]
+fn a_restarted_confd_removes_what_its_new_configuration_left_out() {
+    let mut router = running_router();
+    let address = |ip: [u8; 4]| Key::Address {
+        interface: "wan".into(),
+        address: Ipv4Addr::from(ip).into(),
+    };
+    assert!(has(&router, &address(WAN_IP)));
+
+    // The FE keeps its tables; confd starts again with another WAN address.
+    router.confd = None;
+    router.settle();
+    router.config.interfaces[1].ipv4 = Some((Ipv4Addr::new(198, 51, 100, 3), 24));
+    router.start_confd();
+    router.settle();
+    assert!(!has(&router, &address(WAN_IP)), "resync-end removed it");
+    assert!(has(&router, &address([198, 51, 100, 3])));
+    assert!(has(&router, &Key::Interface { name: "lan".into() }));
 }

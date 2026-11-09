@@ -64,6 +64,14 @@ pub enum Key {
     Nat {
         vrf: String,
     },
+    /// How the forward firewall of a VRF filters (one per VRF).
+    FirewallPolicy {
+        vrf: String,
+    },
+    /// The rate limits of the ICMP errors the FE generates (one, `default`).
+    IcmpErrors {
+        vrf: String,
+    },
     /// One forward firewall rule of a VRF; lower ids are matched first.
     FirewallRule {
         vrf: String,
@@ -110,6 +118,21 @@ pub enum Value {
         mac: [u8; 6],
     },
     Nat(Nat),
+    /// ICMPv4 errors at most one per `ipv4_interval_ms` per egress and kind; ICMPv6
+    /// errors `ipv6_burst` at once and one more every `ipv6_interval_ms`.
+    IcmpErrors {
+        ipv4_interval_ms: u32,
+        ipv6_burst: u32,
+        ipv6_interval_ms: u32,
+    },
+    /// Which outside endpoints may reach an inside endpoint with a flow out, where
+    /// no rule decides. Left out of the message when it is the default.
+    FirewallPolicy {
+        filtering: NatFiltering,
+        /// The interfaces outside the network the firewall guards (RFC 6092's
+        /// exterior), by name.
+        outside: Vec<String>,
+    },
     FirewallRule(FirewallRule),
     Wireguard(Wireguard),
     WireguardPeer(WireguardPeer),
@@ -159,6 +182,43 @@ pub struct Nat {
     pub outside: String,
     pub external: Option<std::net::Ipv4Addr>,
     pub ports: NatPorts,
+    pub filtering: NatFiltering,
+}
+
+/// Which outside endpoints may reach a mapping (`ietf-nat` `filtering-type`).
+/// Left out of the message when it is the default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NatFiltering {
+    /// Any.
+    #[default]
+    EndpointIndependent,
+    /// Only addresses the mapping has sent to.
+    AddressDependent,
+    /// Only the address and port the mapping has sent to.
+    AddressAndPortDependent,
+}
+
+impl NatFiltering {
+    /// The `ietf-nat` identity's name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::EndpointIndependent => "endpoint-independent-filtering",
+            Self::AddressDependent => "address-dependent-filtering",
+            Self::AddressAndPortDependent => "address-and-port-dependent-filtering",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        [
+            Self::EndpointIndependent,
+            Self::AddressDependent,
+            Self::AddressAndPortDependent,
+        ]
+        .into_iter()
+        .find(|f| f.name() == name)
+    }
 }
 
 /// The public ports of a NAT (`ietf-nat` `port-set-restrict`).
@@ -271,6 +331,8 @@ impl Key {
             Self::Route { .. } => sid::ROUTE,
             Self::Neighbor { .. } => sid::NEIGHBOR,
             Self::Nat { .. } => sid::NAT,
+            Self::FirewallPolicy { .. } => sid::FIREWALL_POLICY,
+            Self::IcmpErrors { .. } => sid::ICMP_ERRORS,
             Self::FirewallRule { .. } => sid::FIREWALL_RULE,
             Self::Wireguard { .. } => sid::WIREGUARD,
             Self::WireguardPeer { .. } => sid::WIREGUARD_PEER,
@@ -339,7 +401,10 @@ impl Change {
         };
         match &self.key {
             Key::Interface { name: n } => name(n)?,
-            Key::Nat { vrf } | Key::FirewallRule { vrf, .. } => name(vrf)?,
+            Key::Nat { vrf }
+            | Key::FirewallPolicy { vrf }
+            | Key::IcmpErrors { vrf }
+            | Key::FirewallRule { vrf, .. } => name(vrf)?,
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
             Key::Wireguard { interface } => name(interface)?,
             Key::WireguardPeer { interface, peer } | Key::WireguardSession { interface, peer } => {
@@ -361,6 +426,8 @@ impl Change {
                         | (Key::Route { .. }, Value::Route(_))
                         | (Key::Neighbor { .. }, Value::Neighbor { .. })
                         | (Key::Nat { .. }, Value::Nat(_))
+                        | (Key::FirewallPolicy { .. }, Value::FirewallPolicy { .. })
+                        | (Key::IcmpErrors { .. }, Value::IcmpErrors { .. })
                         | (Key::FirewallRule { .. }, Value::FirewallRule(_))
                         | (Key::Wireguard { .. }, Value::Wireguard(_))
                         | (Key::WireguardPeer { .. }, Value::WireguardPeer(_))
@@ -574,6 +641,12 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::Nat { vrf } => {
             e.array(2).u64(sid::NAT).text(vrf);
         }
+        Key::FirewallPolicy { vrf } => {
+            e.array(2).u64(sid::FIREWALL_POLICY).text(vrf);
+        }
+        Key::IcmpErrors { vrf } => {
+            e.array(2).u64(sid::ICMP_ERRORS).text(vrf);
+        }
         Key::Wireguard { interface } => {
             e.array(2).u64(sid::WIREGUARD).text(interface);
         }
@@ -602,7 +675,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     let len = d.array()?;
     let table = d.u64()?;
     let expected = match table {
-        sid::INTERFACE | sid::NAT | sid::WIREGUARD => 2,
+        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::WIREGUARD => 2,
         sid::ADDRESS
         | sid::ROUTE
         | sid::NEIGHBOR
@@ -621,6 +694,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     Ok(match table {
         sid::INTERFACE => Key::Interface { name: first },
         sid::NAT => Key::Nat { vrf: first },
+        sid::FIREWALL_POLICY => Key::FirewallPolicy { vrf: first },
+        sid::ICMP_ERRORS => Key::IcmpErrors { vrf: first },
         sid::WIREGUARD => Key::Wireguard { interface: first },
         sid::WIREGUARD_PEER | sid::WIREGUARD_SESSION => {
             let peer = d.text()?.to_owned();
@@ -779,14 +854,47 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::WIREGUARD_SESSION_LOCAL_INDEX - sid::WIREGUARD_SESSION)
                 .u64(u64::from(session.local_index));
         }
+        Value::IcmpErrors {
+            ipv4_interval_ms,
+            ipv6_burst,
+            ipv6_interval_ms,
+        } => {
+            let d = |member: u64| member - sid::ICMP_ERRORS;
+            e.map(3)
+                .u64(d(sid::ICMP_ERRORS_IPV4_INTERVAL))
+                .u64(u64::from(*ipv4_interval_ms))
+                .u64(d(sid::ICMP_ERRORS_IPV6_BURST))
+                .u64(u64::from(*ipv6_burst))
+                .u64(d(sid::ICMP_ERRORS_IPV6_INTERVAL))
+                .u64(u64::from(*ipv6_interval_ms));
+        }
+        Value::FirewallPolicy { filtering, outside } => {
+            let default = *filtering == NatFiltering::default();
+            e.map(u64::from(!default) + u64::from(!outside.is_empty()));
+            if !default {
+                e.u64(sid::FIREWALL_POLICY_FILTERING - sid::FIREWALL_POLICY)
+                    .text(filtering.name());
+            }
+            if !outside.is_empty() {
+                e.u64(sid::FIREWALL_POLICY_OUTSIDE - sid::FIREWALL_POLICY)
+                    .array(outside.len() as u64);
+                for name in outside {
+                    e.text(name);
+                }
+            }
+        }
         Value::Nat(nat) => {
             let d = |member: u64| member - sid::NAT;
             let ports = match nat.ports {
                 NatPorts::Range { .. } => 2,
                 NatPorts::Psid { .. } => 3,
             };
-            e.map(2 + ports + u64::from(nat.external.is_some()))
-                .u64(d(sid::NAT_INSIDE))
+            let filtering = nat.filtering != NatFiltering::default();
+            e.map(2 + ports + u64::from(nat.external.is_some()) + u64::from(filtering));
+            if filtering {
+                e.u64(d(sid::NAT_FILTERING)).text(nat.filtering.name());
+            }
+            e.u64(d(sid::NAT_INSIDE))
                 .text(&nat.inside)
                 .u64(d(sid::NAT_OUTSIDE))
                 .text(&nat.outside);
@@ -856,6 +964,8 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     if matches!(
         table,
         sid::NAT
+            | sid::FIREWALL_POLICY
+            | sid::ICMP_ERRORS
             | sid::FIREWALL_RULE
             | sid::WIREGUARD
             | sid::WIREGUARD_PEER
@@ -1312,6 +1422,33 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             peer_index,
             local_index,
         })
+    } else if table == sid::ICMP_ERRORS {
+        let mut number = |member: u64, what: &'static str| match got.remove(&member) {
+            Some(Member::Uint(n)) => u32::try_from(n)
+                .ok()
+                .filter(|&n| n > 0)
+                .ok_or(ModelError::Invalid(what)),
+            Some(_) => Err(ModelError::Invalid(what)),
+            None => Err(ModelError::Missing(what)),
+        };
+        Value::IcmpErrors {
+            ipv4_interval_ms: number(sid::ICMP_ERRORS_IPV4_INTERVAL, "ipv4-interval")?,
+            ipv6_burst: number(sid::ICMP_ERRORS_IPV6_BURST, "ipv6-burst")?,
+            ipv6_interval_ms: number(sid::ICMP_ERRORS_IPV6_INTERVAL, "ipv6-interval")?,
+        }
+    } else if table == sid::FIREWALL_POLICY {
+        let filtering = match text(sid::FIREWALL_POLICY_FILTERING, "filtering-type")? {
+            Some(name) => {
+                NatFiltering::from_name(&name).ok_or(ModelError::Invalid("filtering-type"))?
+            }
+            None => NatFiltering::default(),
+        };
+        let outside = match got.remove(&sid::FIREWALL_POLICY_OUTSIDE) {
+            Some(Member::List(list)) => list,
+            Some(_) => return Err(ModelError::Invalid("outside")),
+            None => Vec::new(),
+        };
+        Value::FirewallPolicy { filtering, outside }
     } else if table == sid::NAT {
         let inside = text(sid::NAT_INSIDE, "inside")?.ok_or(ModelError::Missing("inside"))?;
         let outside = text(sid::NAT_OUTSIDE, "outside")?.ok_or(ModelError::Missing("outside"))?;
@@ -1321,6 +1458,13 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
                     .map_err(|_| ModelError::Invalid("external address"))?,
             ),
             None => None,
+        };
+        // Left out: endpoint-independent, the default.
+        let filtering = match text(sid::NAT_FILTERING, "filtering-type")? {
+            Some(name) => {
+                NatFiltering::from_name(&name).ok_or(ModelError::Invalid("filtering-type"))?
+            }
+            None => NatFiltering::default(),
         };
         let range = (
             port(&mut got, sid::NAT_FIRST_PORT)?,
@@ -1345,6 +1489,7 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             outside,
             external,
             ports,
+            filtering,
         })
     } else {
         let ingress = text(sid::FIREWALL_INGRESS, "ingress")?;

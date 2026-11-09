@@ -5,12 +5,15 @@
 //! [`socket`] (`docs/design/control-protocol.md`). The process that serves a table
 //! listens; the processes that write or read it connect. A listener creates the
 //! directories it needs (readable by the owner only) and removes a socket file left behind by an earlier run before
-//! it binds. Whoever may open these sockets may change the tables, so the directory
+//! it binds. Next to each socket it holds a lock on `<socket>.lock` until it exits;
+//! when another process holds that lock, the same process is already running, and the
+//! listener stops instead of taking the path over. Whoever may open these sockets may change the tables, so the directory
 //! must be reachable only by the router's processes.
 
 use std::io::{self, ErrorKind};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -75,6 +78,7 @@ fn remove_stale(path: &Path) -> io::Result<()> {
             .mode(0o700)
             .create(parent)?;
     }
+    take_lock(path)?;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => std::fs::remove_file(path),
         Ok(_) => Err(io::Error::new(
@@ -83,6 +87,41 @@ fn remove_stale(path: &Path) -> io::Result<()> {
         )),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// The locks this process holds, one per socket path, kept until it exits.
+static LOCKS: Mutex<Vec<(PathBuf, std::fs::File)>> = Mutex::new(Vec::new());
+
+/// Locks `<path>.lock`, once per process. Binding the same path again later (for
+/// example after a peer restarted) keeps the lock already held.
+fn take_lock(path: &Path) -> io::Result<()> {
+    let mut locks = LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if locks.iter().any(|(held, _)| held == path) {
+        return Ok(());
+    }
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&name)?;
+    match file.try_lock() {
+        Ok(()) => {
+            locks.push((path.to_path_buf(), file));
+            Ok(())
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            ErrorKind::AddrInUse,
+            format!(
+                "{} is in use; is the process already running?",
+                path.display()
+            ),
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
     }
 }
 
@@ -204,16 +243,61 @@ pub fn try_connect(path: &Path) -> Option<UnixStream> {
     UnixStream::connect(path).ok()
 }
 
-/// The longest a process sleeps while idle, so that new connections and socket input
-/// are noticed soon.
+/// How long the FE waits for frames while idle, so that new connections and socket
+/// input are noticed soon. The control-plane processes use [`Idle`].
 pub const IDLE_MAX: Duration = Duration::from_millis(IDLE_MAX_MS as u64);
 /// [`IDLE_MAX`] in milliseconds.
 pub const IDLE_MAX_MS: u32 = 1;
 
-/// Sleeps [`IDLE_MAX`] when the last step found nothing to do.
-pub fn idle(progress: Progress) {
-    if !progress.busy {
-        thread::sleep(IDLE_MAX);
+/// How long a process waits between steps while it has nothing to do: not at all
+/// after a step with work, then 1 ms, doubling while it stays idle up to a limit. A
+/// process that waits for nothing does not wake a thousand times a second.
+#[derive(Debug)]
+pub struct Idle {
+    next_ms: u32,
+    longest_ms: u32,
+}
+
+impl Default for Idle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Idle {
+    /// For a control-plane process: up to 8 ms.
+    pub fn new() -> Self {
+        Self::up_to(8)
+    }
+
+    /// Up to `longest_ms` (at least 1).
+    pub fn up_to(longest_ms: u32) -> Self {
+        Self {
+            next_ms: 0,
+            longest_ms: longest_ms.max(1),
+        }
+    }
+
+    /// How long to wait after a step, in milliseconds; `None` after a busy one.
+    pub fn after(&mut self, busy: bool) -> Option<u32> {
+        if busy {
+            self.next_ms = 0;
+            return None;
+        }
+        self.next_ms = self.next_ms();
+        Some(self.next_ms)
+    }
+
+    /// Sleeps when `progress` found nothing to do.
+    pub fn wait(&mut self, progress: Progress) {
+        if let Some(ms) = self.after(progress.busy) {
+            thread::sleep(Duration::from_millis(u64::from(ms)));
+        }
+    }
+
+    /// The wait the next idle step takes, in milliseconds.
+    pub fn next_ms(&self) -> u32 {
+        self.next_ms.saturating_mul(2).clamp(1, self.longest_ms)
     }
 }
 

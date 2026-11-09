@@ -1014,6 +1014,7 @@ fn nat(first_port: u16, last_port: u16) -> Change {
                 first: first_port,
                 last: last_port,
             },
+            filtering: Default::default(),
         }),
     )
 }
@@ -2371,6 +2372,51 @@ fn a_lan_host_reaches_the_router_s_wan_address() {
     assert!(bench.fe.io_mut().pop_tx().is_none(), "not routed on");
 }
 
+/// With NAT, a LAN host still reaches the router's WAN address (NAT's public
+/// address) on a port outside NAT's range; with a firewall, a WAN host's packet to
+/// the router's LAN address is dropped when no rule lets it in.
+#[test]
+fn the_router_s_addresses_with_nat_and_with_a_firewall() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let mut buf = [0_u8; 2048];
+
+    let to_wan_address = udp_packet([192, 0, 2, 10], [198, 51, 100, 2], (5_000, 22));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&to_wan_address));
+    bench.fe.step(bench.now);
+    let n = kernel
+        .recv(&mut buf)
+        .expect("the LAN reaches the WAN address under NAT");
+    assert_eq!(&buf[..n], &to_wan_address[..]);
+
+    // A firewall with a rule for the LAN only.
+    assert_eq!(
+        bench.patch(&mut config, &[accept_udp_from_lan(1)]),
+        Code::CHANGED
+    );
+    let to_lan_address = udp_packet(INTERNET, [192, 0, 2, 1], (5_000, 22));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&to_lan_address));
+    bench.fe.step(bench.now);
+    assert!(
+        kernel.recv(&mut buf).is_err(),
+        "the LAN address is behind the firewall"
+    );
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "and nothing answers");
+}
+
 /// Without NAT, a Fragmentation Needed or Time Exceeded about a LAN host's flow
 /// goes through the firewall as RELATED to it (RFC 1191, RFC 1812 5.2.7), and one
 /// about no flow does not.
@@ -2815,4 +2861,819 @@ fn a_tunnel_s_fragmented_packet_is_put_back_together() {
     assert_eq!(tx.bytes.len(), 14 + 1000);
     assert_eq!(&tx.bytes[14 + 20..], &inner[20..], "the payload as sent");
     assert_eq!(tx.bytes[14 + 8], 63, "forwarded once");
+}
+
+/// A discard route drops silently; a reject route answers Destination Unreachable,
+/// as if no route held the destination (RFC 1812 5.2.7.1, RFC 4443 3.1 code 6).
+#[test]
+fn discard_and_reject_routes_drop_what_they_hold() {
+    let mut bench = Bench::new();
+    let (_config, mut routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let action = |prefix: [u8; 4], action: RouteAction| {
+        Change::set(
+            Key::Route {
+                vrf: "default".into(),
+                prefix: Ipv4Addr::from(prefix).into(),
+                len: 8,
+            },
+            Value::Route(action),
+        )
+    };
+    assert_eq!(
+        bench.patch(
+            &mut routes,
+            &[
+                action([10, 0, 0, 0], RouteAction::Discard),
+                action([172, 0, 0, 0], RouteAction::Reject),
+            ]
+        ),
+        Code::CHANGED
+    );
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([10, 1, 2, 3]));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "discarded silently");
+
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([172, 1, 2, 3]));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("Destination Unreachable");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!((tx.bytes[14 + 20], tx.bytes[14 + 21]), (3, 0));
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "not sent upstream");
+}
+
+/// NAT's default filtering is endpoint-independent (RFC 4787 REQ-8): once a LAN
+/// host's UDP has gone out, a packet from another outside endpoint to its mapping
+/// reaches it too.
+#[test]
+fn by_default_nat_lets_any_outside_endpoint_reach_a_mapping() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let out = udp_packet([192, 0, 2, 10], INTERNET, (5_000, 3_478));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("translated");
+    let port = u16::from_be_bytes([tx.bytes[34], tx.bytes[35]]);
+
+    let other = udp_packet([203, 0, 113, 99], [198, 51, 100, 2], (3_479, port));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&other));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("reached the host");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[30..34], &[192, 0, 2, 10]);
+    assert_eq!(u16::from_be_bytes([tx.bytes[36], tx.bytes[37]]), 5_000);
+}
+
+/// Where no rule decides, the firewall lets outside endpoints reach an inside
+/// host's port that has a flow out as its filtering says: by default any
+/// (RFC 6092 REC-17), or only addresses it has a flow with, or only the exact flow.
+#[test]
+fn the_firewall_filters_packets_to_an_inside_endpoint_as_configured() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let peer = [203, 0, 113, 7];
+    let other = [203, 0, 113, 99];
+    for (filtering, other_address, other_port) in [
+        (NatFiltering::EndpointIndependent, true, true),
+        (NatFiltering::AddressDependent, false, true),
+        (NatFiltering::AddressAndPortDependent, false, false),
+    ] {
+        let mut bench = Bench::new();
+        let (mut config, _routes) = configure(&mut bench);
+        let mut neighbors = bench.connect(writers::NEIGHBOR);
+        assert_eq!(
+            bench.patch(
+                &mut neighbors,
+                &[
+                    neighbor("wan", GATEWAY, GATEWAY_MAC),
+                    neighbor("lan", host, HOST_MAC),
+                ]
+            ),
+            Code::CHANGED
+        );
+        let changes = vec![
+            rule_for(1, Protocol::Udp, Some("lan"), None),
+            outside_wan(filtering),
+        ];
+        assert_eq!(bench.patch(&mut config, &changes), Code::CHANGED);
+        let out = udp_packet(host, peer, (5_000, 3_478));
+        bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+        bench.fe.step(bench.now);
+        assert!(bench.fe.io_mut().pop_tx().is_some(), "the flow out");
+
+        let mut reaches = |source: [u8; 4], port: u16, inside_port: u16| {
+            let packet = udp_packet(source, host, (port, inside_port));
+            bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+            bench.fe.step(bench.now);
+            bench.fe.io_mut().pop_tx().is_some()
+        };
+        assert!(
+            reaches(peer, 3_478, 5_000),
+            "{filtering:?}: the flow's own reply"
+        );
+        assert_eq!(
+            reaches(peer, 3_479, 5_000),
+            other_port,
+            "{filtering:?}: another port"
+        );
+        assert_eq!(
+            reaches(other, 3_478, 5_000),
+            other_address,
+            "{filtering:?}: another host"
+        );
+        assert!(
+            !reaches(peer, 3_478, 5_001),
+            "{filtering:?}: another inside port"
+        );
+    }
+}
+
+/// A rule decides before the filtering: a deny rule keeps outside endpoints out.
+/// For TCP, only a SYN may open a flow to the inside endpoint.
+#[test]
+fn a_deny_rule_wins_over_filtering_and_only_a_syn_opens_tcp() {
+    use ruster_proto::table::{FirewallAction, Protocol};
+    let host = [192, 0, 2, 10];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let mut deny = rule_for(3, Protocol::Udp, Some("wan"), None);
+    if let Change {
+        value: Some(Value::FirewallRule(rule)),
+        ..
+    } = &mut deny
+    {
+        rule.action = FirewallAction::Drop;
+    }
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("lan"), None),
+                rule_for(2, Protocol::Tcp, Some("lan"), None),
+                deny,
+                outside_wan(ruster_proto::table::NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let out = udp_packet(host, INTERNET, (5_000, 3_478));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    let syn = tcp_packet(host, INTERNET, (6_000, 443), 0x02);
+    bench.fe.io_mut().inject(IfId(0), from_lan(&syn));
+    bench.fe.step(bench.now);
+    assert_eq!(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count(), 2);
+
+    let other = [203, 0, 113, 99];
+    let mut sent = |packet: Vec<u8>| {
+        bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(
+        !sent(udp_packet(other, host, (1, 5_000))),
+        "the deny rule decides"
+    );
+    assert!(
+        !sent(tcp_packet(other, host, (1, 6_000), 0x10)),
+        "an ACK opens nothing"
+    );
+    assert!(
+        sent(tcp_packet(other, host, (1, 6_000), 0x02)),
+        "a SYN opens a flow"
+    );
+    assert!(
+        sent(tcp_packet(other, host, (1, 6_000), 0x10)),
+        "then its packets pass"
+    );
+}
+
+/// The firewall's policy: `filtering`, with "wan" outside.
+fn outside_wan(filtering: ruster_proto::table::NatFiltering) -> Change {
+    Change::set(
+        Key::FirewallPolicy {
+            vrf: "default".into(),
+        },
+        Value::FirewallPolicy {
+            filtering,
+            outside: vec!["wan".into()],
+        },
+    )
+}
+
+/// Only a flow from the inside out of the outside makes an inside endpoint: a flow
+/// an outside host opened by a rule does not let inside hosts reach it, and the
+/// router's own flows open none of its ports (RFC 6092's interior and exterior).
+#[test]
+fn filtering_opens_only_inside_endpoints_of_flows_out() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let attacker = [203, 0, 113, 66];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("wan"), Some("lan")),
+                rule_for(2, Protocol::Udp, Some("rt-default"), None),
+                outside_wan(NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    // The attacker's flow in, allowed by the rule.
+    let inbound = udp_packet(attacker, host, (9_999, 53));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&inbound));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_some(), "the rule lets it in");
+    // A LAN host from another port still cannot reach it: LAN to WAN is denied.
+    let out = udp_packet(host, attacker, (6_000, 9_999));
+    bench.fe.io_mut().inject(IfId(0), from_lan(&out));
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "no way out through it"
+    );
+
+    // The router's own flow out (from its port 123) opens nothing to others.
+    let own = udp_packet([198, 51, 100, 2], INTERNET, (123, 123));
+    kernel.send(&own).unwrap();
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_some(),
+        "the router's packet left"
+    );
+    let stranger = udp_packet([203, 0, 113, 99], [198, 51, 100, 2], (5_555, 123));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&stranger));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    assert!(
+        kernel.recv(&mut buf).is_err(),
+        "a stranger does not reach it"
+    );
+}
+
+/// A flow the filtering opened stays only while the rules still let its inside
+/// endpoint send to it: removing the rule (and renumbering the others) ends it.
+#[test]
+fn a_flow_the_filtering_opened_ends_with_the_rule_that_let_its_host_out() {
+    use ruster_proto::table::{NatFiltering, Protocol};
+    let host = [192, 0, 2, 10];
+    let other = [203, 0, 113, 99];
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", host, HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                rule_for(1, Protocol::Udp, Some("lan"), None),
+                rule_for(2, Protocol::Tcp, Some("lan"), None),
+                outside_wan(NatFiltering::EndpointIndependent),
+            ]
+        ),
+        Code::CHANGED
+    );
+    let send = |bench: &mut Bench, port: IfId, frame: Vec<u8>| {
+        bench.fe.io_mut().inject(port, frame);
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(send(
+        &mut bench,
+        IfId(0),
+        from_lan(&udp_packet(host, INTERNET, (5_000, 53)))
+    ));
+    assert!(send(
+        &mut bench,
+        IfId(1),
+        from_wan(&udp_packet(other, host, (7, 5_000)))
+    ));
+    assert!(send(
+        &mut bench,
+        IfId(0),
+        from_lan(&udp_packet(host, other, (5_000, 7)))
+    ));
+
+    // The UDP rule goes; the TCP one becomes rule 1.
+    let removed = Change::delete(Key::FirewallRule {
+        vrf: "default".into(),
+        id: 2,
+    });
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[rule_for(1, Protocol::Tcp, Some("lan"), None), removed]
+        ),
+        Code::CHANGED
+    );
+    assert!(
+        !send(
+            &mut bench,
+            IfId(0),
+            from_lan(&udp_packet(host, other, (5_000, 7)))
+        ),
+        "no UDP out without a rule"
+    );
+}
+
+/// Packet Too Big has its own rate limit: a burst of other ICMPv6 errors does not
+/// keep path MTU discovery from getting it (RFC 4443 2.4(f), RFC 8201).
+#[test]
+fn many_icmpv6_errors_do_not_use_up_packet_too_big() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let mut narrow_wan = iface("wan", WAN_MAC);
+    if let Change {
+        value: Some(Value::Interface { mtu, .. }),
+        ..
+    } = &mut narrow_wan
+    {
+        *mtu = 1_400;
+    }
+    assert_eq!(bench.patch(&mut config, &[narrow_wan]), Code::CHANGED);
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "lan".into(),
+                address: ip6("2001:db8:1::10"),
+            },
+            Value::Neighbor { mac: HOST_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    for _ in 0..30 {
+        let mut expiring = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+        expiring[14 + 7] = 1;
+        bench.fe.io_mut().inject(IfId(0), expiring);
+    }
+    bench.fe.step(0);
+    let time_exceeded = std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count();
+    assert!(
+        time_exceeded < 30,
+        "the errors are limited ({time_exceeded})"
+    );
+
+    let big = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 1_400]);
+    bench.fe.io_mut().inject(IfId(0), big);
+    bench.fe.step(0);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("Packet Too Big still goes back");
+    assert_eq!(tx.bytes[54], 2, "Packet Too Big");
+    assert_eq!(&tx.bytes[58..62], &1_400_u32.to_be_bytes());
+}
+
+/// IPv6 details (RFC 4443 2.4): no forwarding of unicast in an Ethernet multicast
+/// frame, no error about an ICMPv6 error behind an extension header, and the quote
+/// is the packet, not the frame's padding.
+#[test]
+fn ipv6_errors_and_multicast_frames_follow_rfc_4443() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let code = bench.patch(
+        &mut neighbors,
+        &[
+            Change::set(
+                Key::Neighbor {
+                    interface: "lan".into(),
+                    address: ip6("2001:db8:1::10"),
+                },
+                Value::Neighbor { mac: HOST_MAC },
+            ),
+            Change::set(
+                Key::Neighbor {
+                    interface: "wan".into(),
+                    address: ip6("fe80::1"),
+                },
+                Value::Neighbor { mac: GATEWAY_MAC },
+            ),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let step = |bench: &mut Bench, frame: Vec<u8>| {
+        bench.fe.io_mut().inject(IfId(0), frame);
+        bench.fe.step(0);
+        std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).collect::<Vec<_>>()
+    };
+    assert_eq!(
+        step(
+            &mut bench,
+            ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8])
+        )
+        .len(),
+        1,
+        "to the router's MAC it is forwarded"
+    );
+    let group = [0x33, 0x33, 0, 0, 0, 1];
+    assert!(
+        step(&mut bench, ipv6_frame(group, "2001:db8:99::7", 17, &[0; 8])).is_empty(),
+        "unicast in a multicast frame is not forwarded"
+    );
+    // An ICMPv6 Destination Unreachable behind a Destination Options header.
+    let mut payload = vec![58, 0, 1, 4, 0, 0, 0, 0];
+    payload.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0]);
+    let mut error = ipv6_frame(LAN_MAC, "2001:db8:99::7", 60, &payload);
+    error[14 + 7] = 1;
+    assert!(
+        step(&mut bench, error).is_empty(),
+        "no error about an error"
+    );
+    // An expiring packet with 20 bytes of padding after it.
+    let mut padded = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+    padded[14 + 7] = 1;
+    padded.extend_from_slice(&[0xee; 20]);
+    let tx = step(&mut bench, padded);
+    assert_eq!(tx.len(), 1, "Time Exceeded");
+    let payload_len = u16::from_be_bytes([tx[0].bytes[18], tx[0].bytes[19]]);
+    assert_eq!(payload_len, 8 + 48, "the quote is the 48-byte packet");
+}
+
+/// IPv6 source checks: the router's own address from outside is forged and dropped;
+/// a link-local source toward a global destination gets Destination Unreachable
+/// code 2 back on its link (RFC 4443 3.1).
+#[test]
+fn ipv6_forged_and_link_local_sources_are_refused() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let lan_link_local = Change::set(
+        Key::Address {
+            interface: "lan".into(),
+            address: ip6("fe80::5"),
+        },
+        Value::Address { prefix_len: 64 },
+    );
+    assert_eq!(bench.patch(&mut config, &[lan_link_local]), Code::CHANGED);
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "wan".into(),
+                address: ip6("fe80::1"),
+            },
+            Value::Neighbor { mac: GATEWAY_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let with_source = |source: &str| {
+        let mut frame = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+        frame[22..38].copy_from_slice(&source.parse::<std::net::Ipv6Addr>().unwrap().octets());
+        frame
+    };
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), with_source("2001:db8:1::1"));
+    bench.fe.step(0);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "the router's own address is forged"
+    );
+
+    bench.fe.io_mut().inject(IfId(0), with_source("fe80::10"));
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("Destination Unreachable");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!(
+        (tx.bytes[54], tx.bytes[55]),
+        (1, 2),
+        "beyond scope of source address"
+    );
+    assert_eq!(
+        &tx.bytes[22..38],
+        &ip6_octets("fe80::5"),
+        "from the router's link-local"
+    );
+    assert_eq!(&tx.bytes[38..54], &ip6_octets("fe80::10"));
+}
+
+fn ip6_octets(text: &str) -> [u8; 16] {
+    text.parse::<std::net::Ipv6Addr>().unwrap().octets()
+}
+
+/// A next hop the neighbor process gave up on (written with an all-zero MAC): the
+/// datagram gets Host Unreachable back (RFC 1812 5.2.7.1), and no frame goes out to
+/// the all-zero address.
+#[test]
+fn an_unresolvable_next_hop_gets_host_unreachable() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, [0; 6]),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+            ]
+        ),
+        Code::CHANGED
+    );
+    bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("Host Unreachable");
+    assert_eq!(tx.egress, IfId(0));
+    assert_eq!(&tx.bytes[0..6], &HOST_MAC);
+    assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 1));
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+}
+
+/// The router's own ICMP error about a flow NAT translated for it (Port Unreachable
+/// for a late reply) goes out translated too, from the public address (RFC 5508
+/// REQ-5).
+#[test]
+fn nat_translates_the_router_s_own_icmp_errors_about_its_flows() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    kernel
+        .send(&udp_packet([192, 0, 2, 1], INTERNET, (5_353, 53)))
+        .unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("translated and sent");
+    let port = u16::from_be_bytes([tx.bytes[34], tx.bytes[35]]);
+    let reply = udp_packet(INTERNET, [198, 51, 100, 2], (53, port));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&reply));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("the reply reached the kernel");
+    let delivered = buf[..n].to_vec();
+
+    // The kernel's socket is gone: Port Unreachable about the reply it got.
+    let mut icmp = vec![3, 3, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(&delivered[..28]);
+    let sum = ruster_core::internet_checksum(&icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    let mut error = vec![0x45, 0, 0, 0, 0, 0, 0, 0, 64, 1, 0, 0];
+    error.extend_from_slice(&[192, 0, 2, 1]);
+    error.extend_from_slice(&INTERNET);
+    error.extend_from_slice(&icmp);
+    let len = error.len() as u16;
+    error[2..4].copy_from_slice(&len.to_be_bytes());
+    kernel.send(&ipv4_checksummed(error)).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench.fe.io_mut().pop_tx().expect("the error went out");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(
+        &tx.bytes[26..30],
+        &[198, 51, 100, 2],
+        "from the public address"
+    );
+    assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 3));
+    let quoted = 14 + 20 + 8;
+    assert_eq!(
+        &tx.bytes[quoted + 16..quoted + 20],
+        &[198, 51, 100, 2],
+        "quote turned back"
+    );
+    assert_eq!(
+        u16::from_be_bytes([tx.bytes[quoted + 22], tx.bytes[quoted + 23]]),
+        port
+    );
+}
+
+/// With the firewall on, a truncated datagram to a router address gets no answer,
+/// so it does not tell which addresses are the router's.
+#[test]
+fn with_the_firewall_a_truncated_datagram_to_the_router_gets_no_answer() {
+    use ruster_proto::table::Protocol;
+    let (mut bench, kernel) =
+        router_with_firewall(&[rule_for(1, Protocol::Tcp, Some("lan"), None)]);
+    let mut truncated = udp_packet(INTERNET, [192, 0, 2, 1], (53, 5_000));
+    truncated[2..4].copy_from_slice(&200_u16.to_be_bytes());
+    let truncated = ipv4_checksummed(truncated);
+    bench.fe.io_mut().inject(IfId(1), from_wan(&truncated));
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "no Parameter Problem");
+    let mut buf = [0_u8; 2048];
+    assert!(kernel.recv(&mut buf).is_err());
+}
+
+/// The ICMP error rate limits come from the configuration (RFC 4443 2.4(f), RFC
+/// 1812 4.3.2.8): a burst of 2 lets 2 ICMPv6 errors out at once.
+#[test]
+fn the_icmp_error_limits_come_from_the_configuration() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let mut neighbors = configure_ipv6(&mut bench, &mut config, &mut routes);
+    let limits = Change::set(
+        Key::IcmpErrors {
+            vrf: "default".into(),
+        },
+        Value::IcmpErrors {
+            ipv4_interval_ms: 100,
+            ipv6_burst: 2,
+            ipv6_interval_ms: 1_000,
+        },
+    );
+    assert_eq!(bench.patch(&mut config, &[limits]), Code::CHANGED);
+    let code = bench.patch(
+        &mut neighbors,
+        &[Change::set(
+            Key::Neighbor {
+                interface: "lan".into(),
+                address: ip6("2001:db8:1::10"),
+            },
+            Value::Neighbor { mac: HOST_MAC },
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    for _ in 0..10 {
+        let mut expiring = ipv6_frame(LAN_MAC, "2001:db8:99::7", 17, &[0; 8]);
+        expiring[14 + 7] = 1;
+        bench.fe.io_mut().inject(IfId(0), expiring);
+    }
+    bench.fe.step(0);
+    assert_eq!(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count(), 2);
+}
+
+/// Each VRF has its own limit on packets to its kernel: a flood to the router in
+/// one VRF does not crowd out another VRF's traffic to the router.
+#[test]
+fn a_flood_to_the_router_in_one_vrf_leaves_another_vrf_s_limit() {
+    let mut bench = Bench::new();
+    let mut config = bench.connect(writers::CONFIG);
+    let red_lan = Change::set(
+        Key::Interface { name: "lan".into() },
+        Value::Interface {
+            enabled: true,
+            mac: LAN_MAC,
+            mtu: 1500,
+            vrf: "red".into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: None,
+        },
+    );
+    let code = bench.patch(
+        &mut config,
+        &[
+            red_lan,
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let (red_fe, red_kernel) = UnixDatagram::pair().unwrap();
+    let (default_fe, default_kernel) = UnixDatagram::pair().unwrap();
+    for socket in [&red_fe, &red_kernel, &default_fe, &default_kernel] {
+        socket.set_nonblocking(true).unwrap();
+    }
+    bench.fe.attach_local("red", Box::new(red_fe));
+    bench.fe.attach_local("default", Box::new(default_fe));
+
+    // More than a burst to the router in red, all at one moment.
+    for port in 0..300_u16 {
+        let packet = udp_packet([192, 0, 2, 10], [192, 0, 2, 1], (1_000 + port, 53));
+        bench.fe.io_mut().inject(IfId(0), from_lan(&packet));
+        bench.fe.step(0);
+    }
+    let mut buf = [0_u8; 2048];
+    let mut red = 0;
+    while red_kernel.recv(&mut buf).is_ok() {
+        red += 1;
+    }
+    assert!(red < 300, "red is limited: {red}");
+
+    // The default VRF's packet to the router still goes, at the same moment.
+    let packet = udp_packet(GATEWAY, [198, 51, 100, 2], (1_000, 53));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&packet));
+    bench.fe.step(0);
+    let n = default_kernel
+        .recv(&mut buf)
+        .expect("default is not limited by red");
+    assert_eq!(&buf[..n], &packet[..]);
+}
+
+/// An IPv4 interval longer than a minute is used as it is, and the limits are only
+/// for the default VRF (they are the FE's, for every VRF).
+#[test]
+fn a_long_icmpv4_error_interval_is_used_and_another_vrf_s_limits_are_refused() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let limits = |vrf: &str, ipv4_interval_ms| {
+        Change::set(
+            Key::IcmpErrors { vrf: vrf.into() },
+            Value::IcmpErrors {
+                ipv4_interval_ms,
+                ipv6_burst: 10,
+                ipv6_interval_ms: 10,
+            },
+        )
+    };
+    assert_ne!(
+        bench.patch(&mut config, &[limits("red", 100)]),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[limits("default", 120_000)]),
+        Code::CHANGED
+    );
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(
+        &mut neighbors,
+        &[neighbor("lan", [192, 0, 2, 10], HOST_MAC)],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let mut sent = Vec::new();
+    for now in [0, 70_000] {
+        let mut expiring = udp_from_host([203, 0, 113, 7]);
+        expiring[14 + 8] = 1;
+        expiring[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+        let checksum = ipv4_header_checksum(&expiring[14..34]);
+        expiring[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+        bench.fe.io_mut().inject(IfId(0), expiring);
+        bench.fe.step(now);
+        sent.push(std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count());
+    }
+    assert_eq!(sent, [1, 0], "the second is within 120 s of the first");
 }

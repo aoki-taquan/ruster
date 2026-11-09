@@ -7,7 +7,7 @@
 //! |---|---|
 //! | FE | interfaces, addresses, and the default VRF's firewall rules and NAT |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
-//! | ribd | static routes and the connected routes of the addresses, as source `confd` |
+//! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
 //!
 //! On every (re)connection confd sends everything between resync-begin and resync-end,
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
@@ -72,6 +72,10 @@ pub enum RouteTarget {
     },
     /// Looked up again in another VRF.
     LookupVrf(String),
+    /// Dropped silently.
+    Discard,
+    /// Dropped with a Destination Unreachable.
+    Reject,
 }
 
 /// A WireGuard interface (also an entry of `interfaces`, which has its MAC address,
@@ -99,6 +103,10 @@ pub struct Config {
     pub static_routes: Vec<StaticRoute>,
     /// The default VRF's forward firewall rules, in order.
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
+    /// How the default VRF's forward firewall filters where no rule decides.
+    pub firewall_filtering: ruster_proto::table::NatFiltering,
+    /// The ICMP error rate limits (IPv4 interval, IPv6 burst and interval), when set.
+    pub icmp_errors: Option<(u32, u32, u32)>,
     /// The default VRF's NAPT.
     pub nat: Option<ruster_proto::table::Nat>,
 }
@@ -145,6 +153,9 @@ struct Peer {
     resync_open: bool,
     /// ribd wants `sync-done` after each accepted send.
     says_done: bool,
+    /// The resync-end waiting for an answer. When it is refused, what the peer holds
+    /// stays marked stale, and resync-end goes again after the next accepted change.
+    resync_end: Option<u32>,
 }
 
 impl Peer {
@@ -157,6 +168,11 @@ impl Peer {
 
     /// Handles one answer from the peer.
     fn answer(&mut self, token: u32, accepted: bool) {
+        if self.resync_end == Some(token) {
+            self.resync_end = None;
+            self.resync_open |= !accepted;
+            return;
+        }
         let Some(at) = self.in_flight.iter().position(|(t, _, _)| *t == token) else {
             return;
         };
@@ -165,7 +181,7 @@ impl Peer {
             self.sent = held;
             if self.in_flight.is_empty() {
                 if self.resync_open {
-                    self.client.resync_end();
+                    self.resync_end = Some(self.client.resync_end());
                     self.resync_open = false;
                 }
                 if self.says_done {
@@ -284,12 +300,15 @@ impl Confd {
             .map(|(kind, reason, _)| (*kind, reason.as_str()))
     }
 
-    /// True when every connected process has answered every change sent to it.
+    /// True when every connected process has answered every change sent to it, and
+    /// the resync-end after them.
     pub fn settled(&self) -> bool {
         [&self.fe, &self.ribd, &self.neighd]
             .into_iter()
             .flatten()
-            .all(|peer| peer.client.is_closed() || peer.in_flight.is_empty())
+            .all(|peer| {
+                peer.client.is_closed() || (peer.in_flight.is_empty() && peer.resync_end.is_none())
+            })
     }
 
     /// The processes that are not connected now.
@@ -340,9 +359,10 @@ impl Confd {
             in_flight: Vec::new(),
             resync_open: true,
             says_done,
+            resync_end: None,
         };
         if desired.is_empty() {
-            peer.client.resync_end();
+            peer.resync_end = Some(peer.client.resync_end());
             peer.resync_open = false;
             if says_done {
                 peer.client.sync_done();
@@ -353,9 +373,59 @@ impl Confd {
         Ok(peer)
     }
 
+    /// The interfaces outside the network the firewall guards: NAT's outside and
+    /// those the default VRF's default routes leave through (RFC 6092's exterior).
+    fn firewall_outside(&self) -> Vec<String> {
+        let mut outside: Vec<String> = self
+            .config
+            .nat
+            .iter()
+            .map(|nat| nat.outside.clone())
+            .chain(
+                self.config
+                    .static_routes
+                    .iter()
+                    .filter_map(|route| match &route.target {
+                        RouteTarget::Next { interface, .. }
+                            if route.vrf == ruster_proto::table::DEFAULT_VRF && route.len == 0 =>
+                        {
+                            Some(interface.clone())
+                        }
+                        _ => None,
+                    }),
+            )
+            .collect();
+        outside.sort();
+        outside.dedup();
+        outside
+    }
+
     /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
+        if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.config.icmp_errors {
+            out.insert(
+                Key::IcmpErrors {
+                    vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
+                },
+                Value::IcmpErrors {
+                    ipv4_interval_ms,
+                    ipv6_burst,
+                    ipv6_interval_ms,
+                },
+            );
+        }
+        if !self.config.firewall.is_empty() {
+            out.insert(
+                Key::FirewallPolicy {
+                    vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
+                },
+                Value::FirewallPolicy {
+                    filtering: self.config.firewall_filtering,
+                    outside: self.firewall_outside(),
+                },
+            );
+        }
         for (id, rule) in (1..).zip(&self.config.firewall) {
             out.insert(
                 Key::FirewallRule {
@@ -451,11 +521,32 @@ impl Confd {
         out
     }
 
-    /// Connected routes of enabled interfaces, then static routes (a static route for
-    /// the same prefix replaces the connected one).
+    /// Whether packets can leave through `name`: it is enabled, and so is the parent
+    /// a VLAN sub-interface or PPPoE session runs on.
+    fn usable(&self, name: &str) -> bool {
+        let find = |name: &str| self.config.interfaces.iter().find(|i| i.name == name);
+        let Some(interface) = find(name) else {
+            return false;
+        };
+        let parent = interface
+            .vlan
+            .as_ref()
+            .map(|(parent, _)| parent)
+            .or(interface.pppoe.as_ref().map(|(parent, _, _)| parent));
+        interface.enabled && parent.is_none_or(|parent| self.usable(parent))
+    }
+
+    /// Connected routes of usable interfaces (enabled, on an enabled parent), then
+    /// static routes. A static route for a connected prefix is left out: the connected
+    /// route wins, as on most routers.
     fn routes(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
-        for interface in self.config.interfaces.iter().filter(|i| i.enabled) {
+        for interface in self
+            .config
+            .interfaces
+            .iter()
+            .filter(|i| self.usable(&i.name))
+        {
             // Link-local prefixes are on every link and never forwarded.
             let prefixes = interface
                 .ipv4
@@ -479,17 +570,24 @@ impl Confd {
             }
         }
         for route in &self.config.static_routes {
+            // A static route out of a disabled interface cannot be used: it is not
+            // offered, so that another source's route for the prefix is chosen.
+            if let RouteTarget::Next { interface, .. } = &route.target {
+                if !self.usable(interface) {
+                    continue;
+                }
+            }
             let action = match &route.target {
                 RouteTarget::Next { interface, via } => RouteAction::Forward(vec![NextHop {
                     interface: interface.clone(),
                     address: *via,
                 }]),
                 RouteTarget::LookupVrf(vrf) => RouteAction::LookupVrf(vrf.clone()),
+                RouteTarget::Discard => RouteAction::Discard,
+                RouteTarget::Reject => RouteAction::Reject,
             };
-            out.insert(
-                route_key(&route.vrf, route.prefix, route.len),
-                Value::Route(action),
-            );
+            out.entry(route_key(&route.vrf, route.prefix, route.len))
+                .or_insert(Value::Route(action));
         }
         out
     }
@@ -624,5 +722,102 @@ impl Task for Confd {
             }
         }
         progress
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_static_route_for_a_connected_prefix_does_not_replace_it() {
+        let lan = InterfaceConfig {
+            name: "lan".into(),
+            mac: [2, 0, 0, 0, 0, 1],
+            mtu: 1500,
+            enabled: true,
+            ipv4: Some((Ipv4Addr::new(192, 0, 2, 1), 24)),
+            ipv6: Vec::new(),
+            vrf: "default".into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: None,
+        };
+        let route = |len| StaticRoute {
+            vrf: "default".into(),
+            prefix: IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)),
+            len,
+            target: RouteTarget::Discard,
+        };
+        let confd = Confd::new(Config {
+            wireguard: Vec::new(),
+            interfaces: vec![lan],
+            static_routes: vec![route(24), route(25)],
+            firewall: Vec::new(),
+            firewall_filtering: Default::default(),
+            icmp_errors: None,
+            nat: None,
+        });
+        let routes = confd.routes();
+        let connected = Value::Route(RouteAction::Forward(vec![NextHop {
+            interface: "lan".into(),
+            address: None,
+        }]));
+        let key = |len| route_key("default", IpAddr::V4(Ipv4Addr::new(192, 0, 2, 0)), len);
+        assert_eq!(routes.get(&key(24)), Some(&connected));
+        assert_eq!(
+            routes.get(&key(25)),
+            Some(&Value::Route(RouteAction::Discard))
+        );
+    }
+
+    #[test]
+    fn routes_out_of_a_vlan_on_a_disabled_parent_are_not_offered() {
+        let interface = |name: &str, enabled, ipv4, vlan| InterfaceConfig {
+            name: name.into(),
+            mac: [2, 0, 0, 0, 0, 1],
+            mtu: 1500,
+            enabled,
+            ipv4,
+            ipv6: Vec::new(),
+            vrf: "default".into(),
+            vlan,
+            tunnel: None,
+            pppoe: None,
+        };
+        let config = |trunk_enabled| Config {
+            wireguard: Vec::new(),
+            interfaces: vec![
+                interface("trunk", trunk_enabled, None, None),
+                interface(
+                    "trunk.10",
+                    true,
+                    Some((Ipv4Addr::new(10, 0, 10, 1), 24)),
+                    Some(("trunk".into(), 10)),
+                ),
+            ],
+            static_routes: vec![StaticRoute {
+                vrf: "default".into(),
+                prefix: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)),
+                len: 24,
+                target: RouteTarget::Next {
+                    interface: "trunk.10".into(),
+                    via: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 10, 2))),
+                },
+            }],
+            firewall: Vec::new(),
+            firewall_filtering: Default::default(),
+            icmp_errors: None,
+            nat: None,
+        };
+        let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
+        let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);
+
+        let mut confd = Confd::new(config(false));
+        assert!(confd.routes().is_empty(), "{:?}", confd.routes());
+        confd.set_config(config(true));
+        let routes = confd.routes();
+        assert!(routes.contains_key(&connected));
+        assert!(routes.contains_key(&static_route));
     }
 }

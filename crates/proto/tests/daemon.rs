@@ -33,6 +33,26 @@ fn a_listener_replaces_a_socket_left_by_an_earlier_run() {
 }
 
 #[test]
+fn a_listener_stops_while_another_process_holds_the_path() {
+    let dir = dir("running");
+    for name in ["confd.sock", "punt.sock"] {
+        let path = dir.join(name);
+        // Another process's lock: a separate open of the same file.
+        let other = std::fs::File::create(dir.join(format!("{name}.lock"))).unwrap();
+        other.lock().unwrap();
+        let error = match name {
+            "confd.sock" => daemon::listen(&path).map(drop).unwrap_err(),
+            _ => daemon::bind_datagram(&path).map(drop).unwrap_err(),
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        drop(other);
+        drop(daemon::bind_datagram(&path).unwrap());
+        // Binding again in the same process keeps the lock it holds.
+        drop(daemon::bind_datagram(&path).unwrap());
+    }
+}
+
+#[test]
 fn a_listener_does_not_remove_a_file_that_is_not_a_socket() {
     let dir = dir("file");
     let path = dir.join("x.sock");
@@ -102,4 +122,32 @@ fn notify_sends_the_state_to_the_notify_socket() {
     daemon::notify("READY=1");
     assert!(systemd.recv(&mut buf).is_err());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn an_idle_process_sleeps_longer_until_it_has_work() {
+    use ruster_proto::task::Progress;
+    let mut idle = daemon::Idle::new();
+    let quiet = Progress {
+        busy: false,
+        ..Progress::default()
+    };
+    let busy = Progress {
+        busy: true,
+        ..Progress::default()
+    };
+    let mut waits = Vec::new();
+    for _ in 0..5 {
+        waits.push(idle.next_ms());
+        idle.wait(quiet);
+    }
+    assert_eq!(waits, [1, 2, 4, 8, 8]);
+    idle.wait(busy);
+    assert_eq!(idle.next_ms(), 1, "work starts over from 1 ms");
+
+    let mut fe = daemon::Idle::up_to(4);
+    let waits: Vec<_> = (0..4).map(|_| fe.after(false)).collect();
+    assert_eq!(waits, [Some(1), Some(2), Some(4), Some(4)]);
+    assert_eq!(fe.after(true), None);
+    assert_eq!(fe.after(false), Some(1));
 }

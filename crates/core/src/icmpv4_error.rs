@@ -1,3 +1,23 @@
+//! ICMPv4 errors the router generates about the datagrams it forwards or refuses.
+//!
+//! # Standards
+//!
+//! - RFC 1812 section 4.3.2: Time Exceeded, Destination Unreachable (Network,
+//!   Port, Protocol, Fragmentation Needed with the Next-Hop MTU of RFC 1191,
+//!   Administratively Prohibited when enabled), Parameter Problem and Redirect;
+//!   none about an ICMP error, a non-initial fragment, a broadcast or multicast,
+//!   or a source that is not a host (section 4.3.2.7); the quote at most 576 bytes
+//!   in all and cut to the egress MTU (section 4.3.2.3); precedence 6 (section
+//!   4.3.2.5); a rate limit per kind and egress (section 4.3.2.8), which the
+//!   operator sets ([`Icmpv4ErrorRuntime::set_policy`]).
+//!
+//! - RFC 1812 section 5.2.7.1: Destination Unreachable (Host) for a next hop the
+//!   neighbor process gave up resolving.
+//!
+//! Deviations: while a next hop is still being resolved its datagrams are dropped
+//! silently, not queued (RFC 1122 section 2.3.2.2); no Source Quench (RFC 6633
+//! deprecates it).
+
 use std::{marker::PhantomData, rc::Rc};
 
 use crate::icmpv4_translated_limit::{
@@ -1013,6 +1033,12 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
             && self.translated.is_pristine()
     }
 
+    /// Uses `policy` from now on, as the operator set it. Queued errors and their
+    /// states stay; later decisions use the new intervals.
+    pub fn set_policy(&mut self, policy: Icmpv4ErrorPolicy) {
+        self.policy = policy;
+    }
+
     /// Validates the generated-action queue without changing runtime state.
     ///
     /// Successful commit clears all limiter and action state because queued
@@ -1423,12 +1449,29 @@ impl<'a> Icmpv4ErrorRuntime<'a> {
         let Some(slot) = self.actions.get_mut(self.head) else {
             return false;
         };
-        if slot.0.take().is_none() {
+        let Some(queued) = slot.0.take() else {
             return false;
-        }
+        };
         self.head = (self.head + 1) % self.actions.len();
         self.len -= 1;
         self.counters.dequeued += 1;
+        // Its limiter state no longer waits for it: later errors of its kind out of
+        // its egress may be queued again.
+        if let Some(state) = self.states[..self.occupied_prefix]
+            .iter_mut()
+            .find(|state| {
+                state.occupied
+                    && state.egress == queued.action.egress
+                    && state.class == queued.action.kind.limiter_class()
+                    && state.generation == queued.generation
+            })
+        {
+            // Reusable for any interface, and long past: the next error is not
+            // held back by an interval no error started.
+            state.action_queued = false;
+            state.has_requested = true;
+            state.requested_at = MonotonicMillis(0);
+        }
         true
     }
 
@@ -2489,6 +2532,32 @@ mod tests {
             runtime.schedule(action(1, 20), MonotonicMillis(100)),
             Icmpv4TimeExceededDisposition::Queued { .. }
         ));
+    }
+
+    /// A discarded error frees its egress for the next one, and the runtime still
+    /// moves to a new publication.
+    #[test]
+    fn a_discarded_error_does_not_keep_its_egress_waiting() {
+        let mut states = [Icmpv4ErrorStateSlot::EMPTY; 2];
+        let mut slots = [Icmpv4ErrorActionSlot::EMPTY; 2];
+        let mut runtime = Icmpv4ErrorRuntime::new(
+            Icmpv4ErrorPolicy::new(100, 1_000).unwrap(),
+            &mut states,
+            &mut slots,
+        );
+        let time = action_kind(Icmpv4ErrorKind::TimeExceededTtl, 1, 20);
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(0)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        assert!(runtime.discard_front());
+        assert!(!runtime.discard_front());
+        assert!(matches!(
+            runtime.schedule(time, MonotonicMillis(1_000)),
+            Icmpv4ErrorDisposition::Queued { .. }
+        ));
+        assert!(runtime.discard_front());
+        assert!(runtime.preflight_publication().is_ok());
     }
 
     #[test]

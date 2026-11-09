@@ -12,7 +12,9 @@
 //!   with it; Packet Too Big is needed for path MTU discovery (RFC 8201). Echo
 //!   Request and Reply are a query flow, as ICMPv4's.
 //! - RFC 6092 (Simple Security in IPv6 CPE) as the model: state for outgoing flows,
-//!   replies and related errors pass, what no rule accepts is dropped.
+//!   replies and related errors pass, what no rule accepts is dropped, except
+//!   what the filtering lets reach an inside endpoint (REC-11, REC-17, REC-33; see
+//!   [`crate::firewall`]).
 //!
 //! Deviations:
 //!
@@ -24,6 +26,9 @@
 //! - With the firewall on, a packet from the default VRF with no route is dropped
 //!   without a Destination Unreachable (IPv4 asks the rules whether it would pass).
 //! - ICMPv6 other than Echo and the four errors is dropped (ND is not forwarded).
+//! - A Routing header of type 0 is stepped over like the others and its packet
+//!   forwarded (RFC 6092 REC-4 asks a CE to drop it; RFC 5095 forbids only
+//!   processing it at the destination, which the router is not).
 
 use crate::firewall::{FirewallAddress, FirewallPacket, FIREWALL_ICMP_REPLY};
 use crate::{

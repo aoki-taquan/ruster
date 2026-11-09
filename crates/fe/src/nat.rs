@@ -13,7 +13,11 @@
 //!
 //! - RFC 4787 (UDP), RFC 5382 (TCP) and RFC 5508 (ICMP queries and errors), as
 //!   core's NAT44 implements them, with its default policies (endpoint-independent
-//!   mapping, address-dependent filtering, hairpinning).
+//!   mapping, the filtering the configuration names for UDP and TCP,
+//!   endpoint-independent by default, and hairpinning). ICMP queries stay
+//!   address-dependent. With endpoint-independent filtering, any outside host may
+//!   reach a mapping the router's own traffic made too (its LAN address goes
+//!   through NAT); at most 8 TCP sessions are opened from one outside address.
 //!
 //! Deviations:
 //!
@@ -64,6 +68,7 @@ impl Publication {
             outside,
             public,
             ports,
+            filtering,
         } = nat;
         Ok(Self {
             udp: Nat44UdpConfig::with_port_set(
@@ -72,7 +77,7 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44UdpPolicy::default(),
+                Nat44UdpPolicy::default().with_filtering(filtering),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             tcp: Nat44TcpConfig::with_port_set(
@@ -81,7 +86,12 @@ impl Publication {
                 outside,
                 public,
                 ports,
-                Nat44TcpPolicy::default(),
+                // With filtering that lets other endpoints in, one outside host
+                // may open at most 8 sessions (it cannot fill the table alone).
+                Nat44TcpPolicy::default()
+                    .with_filtering(filtering)
+                    .with_inbound_sessions_per_remote(8)
+                    .expect("8 is within the limit"),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             icmp: Nat44IcmpConfig::with_port_set(

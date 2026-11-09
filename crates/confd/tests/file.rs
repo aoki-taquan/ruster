@@ -217,6 +217,21 @@ interface = "lan"
 }
 
 #[test]
+fn ipv6_addresses_that_are_close_to_the_refused_ones_are_read() {
+    for ipv6 in [
+        "2001:db8::/127",
+        "2001:db8::/128",
+        "fe80::1/64",
+        "2001:db8::1/64",
+    ] {
+        let text = format!(
+            "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv6 = [\"{ipv6}\"]\n"
+        );
+        assert!(parse(&text).is_ok(), "{ipv6}: {:?}", parse(&text).err());
+    }
+}
+
+#[test]
 fn ipv6_mistakes_are_refused() {
     let lan6 = |ipv6: &str| {
         format!("[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv6 = [{ipv6}]\n")
@@ -228,6 +243,11 @@ fn ipv6_mistakes_are_refused() {
         (lan6("\"2001:db8::1/0\""), "1 to 128"),
         (lan6("\"ff02::1/64\""), "unicast"),
         (lan6("\"::1/128\""), "unicast"),
+        (lan6("\"::ffff:192.0.2.1/128\""), "IPv4-mapped"),
+        (lan6("\"::192.0.2.1/128\""), "IPv4-compatible"),
+        (lan6("\"fec0::1/64\""), "site-local"),
+        (lan6("\"fe80::1/10\""), "prefix length 64"),
+        (lan6("\"2001:db8::/64\""), "Subnet-Router anycast"),
         (lan6("\"2001:db8::1/064\""), "is not like"),
         (
             lan6("\"2001:db8::1/64\", \"2001:db8::2/64\""),
@@ -344,21 +364,31 @@ fn vrf_mistakes_are_refused() {
     };
     for (text, expected) in [
         (one("vrf = \"\"\n"), "must not be empty"),
+        (one("vrf = \"twelve-bytes\"\n"), "at most 11"),
+        (one("vrf = \"a/b\"\n"), "at most 11"),
         (
             one("[[route]]\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\n"),
             "another VRF",
         ),
         (
             one("[[route]]\nprefix = \"0.0.0.0/0\"\n"),
-            "either interface or lookup-vrf",
+            "one of interface, lookup-vrf and action",
         ),
         (
             one("[[route]]\nprefix = \"0.0.0.0/0\"\ninterface = \"lan\"\nlookup-vrf = \"red\"\n"),
-            "either interface or lookup-vrf",
+            "one of interface, lookup-vrf and action",
         ),
         (
             one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"default\"\nvia = \"10.0.0.9\"\n"),
             "has no via",
+        ),
+        (
+            one("[[route]]\nprefix = \"10.0.0.0/8\"\naction = \"drop\"\n"),
+            "action must be",
+        ),
+        (
+            one("[[route]]\nprefix = \"10.0.0.0/8\"\naction = \"discard\"\ninterface = \"lan\"\n"),
+            "has no interface",
         ),
         (
             one("[[route]]\nvrf = \"red\"\nprefix = \"0.0.0.0/0\"\nlookup-vrf = \"defualt\"\n"),
@@ -416,6 +446,53 @@ vrf = "red"
         !commands.iter().any(|c| c.contains("fe80")),
         "no link-local addresses"
     );
+}
+
+#[test]
+fn with_nat_the_router_s_own_ipv4_leaves_from_its_inside_address() {
+    let text = r#"
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+ipv4 = "192.0.2.1/24"
+
+[[interface]]
+name = "wan"
+mac = "02:00:00:00:00:02"
+ipv4 = "198.51.100.1/24"
+
+# A link that is neither NAT's inside nor its outside (a BGP peer).
+[[interface]]
+name = "peer"
+mac = "02:00:00:00:00:03"
+ipv4 = "10.9.0.1/30"
+"#;
+    let commands = |text: &str| -> Vec<String> {
+        ruster_confd::kernel::commands(&parse(text).unwrap())
+            .iter()
+            .map(|args| args.join(" "))
+            .collect()
+    };
+    let with_nat = commands(&format!(
+        "{text}\n[nat]\ninside = \"lan\"\noutside = \"wan\"\nports = \"20000-20999\"\n"
+    ));
+    for expected in [
+        "-4 route replace 198.51.100.0/24 dev rt-default src 192.0.2.1",
+        "-4 route replace 192.0.2.0/24 dev rt-default src 192.0.2.1",
+        "-4 route replace 10.9.0.0/30 dev rt-default src 10.9.0.1",
+        "-4 route replace default dev rt-default src 192.0.2.1",
+    ] {
+        assert!(
+            with_nat.contains(&expected.to_string()),
+            "{expected}: {with_nat:#?}"
+        );
+    }
+
+    // Without NAT (a reload that removed it), the WAN prefix leaves from its own
+    // address again.
+    let without = commands(text);
+    let expected = "-4 route replace 198.51.100.0/24 dev rt-default src 198.51.100.1";
+    assert!(without.contains(&expected.to_string()), "{without:#?}");
 }
 
 #[test]
@@ -615,8 +692,18 @@ fn nat_takes_the_outside_address_and_a_port_range() {
                 first: 1_024,
                 last: 32_767,
             },
+            filtering: ruster_proto::table::NatFiltering::EndpointIndependent,
         })
     );
+    assert_eq!(
+        parse(&nat("filtering = \"address-dependent\"\n"))
+            .unwrap()
+            .nat
+            .unwrap()
+            .filtering,
+        ruster_proto::table::NatFiltering::AddressDependent
+    );
+    assert!(error(&nat("filtering = \"strict\"\n")).contains("filtering must be"));
     let got = parse(&nat(
         "ports = \"40000-40999\"\nexternal = \"198.51.100.2\"\n",
     ))
@@ -771,6 +858,11 @@ fn map_e_follows_rfc_7597_appendix_a() {
         .static_routes
         .iter()
         .any(|r| r.len == 0 && r.prefix == std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    // The delegated prefix is discarded where no more specific route holds it
+    // (RFC 7084 WPD-5).
+    assert!(config.static_routes.iter().any(|r| r.len == 56
+        && r.prefix == "2001:db8:12:3400::".parse::<std::net::IpAddr>().unwrap()
+        && r.target == ruster_confd::RouteTarget::Discard));
     let rule =
         format!("{text}[[firewall]]\naction = \"accept\"\nprotocol = \"tcp\"\negress = \"map\"\n");
     assert!(
@@ -788,6 +880,15 @@ fn map_e_follows_rfc_7597_appendix_a() {
             "ea-length must cover",
         ),
         (text.replace("192.0.2.0/24", "224.0.2.0/24"), "unicast"),
+        (
+            text.replace("rule-ipv6 = \"2001:db8::/40\"", "rule-ipv6 = \"2001:db8::1/40\""),
+            "rule-ipv6 has bits set",
+        ),
+        (text.replace("ea-length = 16", "ea-length = 49"), "at most 48"),
+        (
+            text.replace("2001:db8:ffff:1::2/64", "2001:db8:12:3400::2/64"),
+            "must not be an on-link prefix",
+        ),
         (
             text.replace(
                 "[map-e]",
@@ -930,4 +1031,40 @@ fn a_firewall_rule_may_name_the_router_itself() {
         .firewall
         .iter()
         .all(|rule| rule.ingress.as_deref() == Some("rt-default")));
+}
+
+/// RFC 8200 section 5: an interface with IPv6 addresses has an MTU of 1280 or more.
+#[test]
+fn an_ipv6_interface_needs_an_mtu_of_1280() {
+    let iface = |mtu: u16| {
+        format!(
+            "[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nmtu = {mtu}\nipv6 = [\"2001:db8:1::1/64\"]\n"
+        )
+    };
+    assert!(parse(&iface(1_280)).is_ok());
+    assert!(error(&iface(1_279)).contains("at least 1280"));
+}
+
+#[test]
+fn the_firewall_filtering_is_endpoint_independent_unless_set() {
+    use ruster_proto::table::NatFiltering;
+    let rule = "[[firewall]]\naction = \"accept\"\nprotocol = \"udp\"\ningress = \"lan\"\n";
+    let config = parse(&format!("{LAN}{rule}")).unwrap();
+    assert_eq!(config.firewall_filtering, NatFiltering::EndpointIndependent);
+    let config = parse(&format!(
+        "firewall-filtering = \"address-dependent\"\n{LAN}{rule}"
+    ))
+    .unwrap();
+    assert_eq!(config.firewall_filtering, NatFiltering::AddressDependent);
+    assert!(
+        error(&format!("firewall-filtering = \"none\"\n{LAN}{rule}")).contains("filtering must be")
+    );
+}
+
+#[test]
+fn the_icmp_error_limits_may_be_set() {
+    let config = parse(&format!("{LAN}[icmp-errors]\nipv6-burst = 5\n")).unwrap();
+    assert_eq!(config.icmp_errors, Some((100, 5, 10)));
+    assert_eq!(parse(LAN).unwrap().icmp_errors, None);
+    assert!(error(&format!("{LAN}[icmp-errors]\nipv4-interval-ms = 0\n")).contains("intervals"));
 }

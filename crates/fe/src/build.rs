@@ -45,6 +45,9 @@ pub(crate) struct Built {
     pub(crate) vlans: Vec<VlanBinding>,
     /// The enabled IPv4 in IPv6 tunnels.
     pub(crate) tunnels: Vec<Ipv4InIpv6Tunnel>,
+    /// IPv4 next hops the neighbor process could not resolve (written with an
+    /// all-zero MAC address).
+    pub(crate) unreachable: Vec<(IfId, Ipv4Address)>,
     /// The PPPoE sessions on enabled interfaces.
     pub(crate) pppoe: Vec<PppoeSession>,
     /// The WireGuard interfaces that are enabled, with their peers and sessions.
@@ -58,6 +61,16 @@ pub(crate) struct Built {
     /// Whether the tables have any firewall rule. Then the firewall is on even if
     /// none of them is in `firewall`, and drops everything.
     pub(crate) firewall_on: bool,
+    /// The ICMP error rate limits (IPv4 interval, IPv6 burst and interval), when
+    /// set.
+    pub(crate) icmp_errors: Option<(u32, u32, u32)>,
+    /// How the forward firewall filters where no rule decides, and between which
+    /// interfaces (inside, outside).
+    pub(crate) firewall_filtering: ruster_core::FirewallFiltering,
+    pub(crate) firewall_interfaces: (
+        ruster_core::FirewallInterfaceSet,
+        ruster_core::FirewallInterfaceSet,
+    ),
     /// The default VRF's NAPT, when the tables have one and both its interfaces
     /// are enabled.
     pub(crate) nat: Option<Nat>,
@@ -70,6 +83,7 @@ pub(crate) struct Nat {
     pub(crate) outside: IfId,
     pub(crate) public: Ipv4Address,
     pub(crate) ports: PortSet,
+    pub(crate) filtering: ruster_core::Nat44Filtering,
 }
 
 /// One forwarding route before it becomes core's.
@@ -118,7 +132,7 @@ fn within((inner, inner_len): (IpAddr, u8), (outer, outer_len): (IpAddr, u8)) ->
 ///   lookup prefix itself.
 ///
 /// Deviation: where the other VRF has no route, a lookup should drop the packet; here
-/// the packet falls to this VRF's shorter routes, since core has no discard route.
+/// the packet falls to this VRF's shorter routes (not yet made a discard route).
 fn expand_lookups(vrfs: &BTreeMap<String, Vec<Entry>>) -> BTreeMap<String, Vec<Forward>> {
     let forwards = |vrf: &str| -> Vec<Forward> {
         vrfs.get(vrf)
@@ -528,10 +542,15 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         .collect();
     let mut neighbors = Vec::new();
     let mut neighbors6 = Vec::new();
+    let mut unreachable = Vec::new();
+    let mut unreachable6 = Vec::new();
     let mut bindings: Vec<Vec<LocalIpv4Binding>> = vec![Vec::new(); order.len()];
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
     let mut firewall = Vec::new();
     let mut firewall_on = false;
+    let mut firewall_filtering = table::NatFiltering::default();
+    let mut firewall_outside: Vec<String> = Vec::new();
+    let mut icmp_errors = None;
     let mut nat_entry = None;
     for (key, value) in store.iter() {
         match (key, value) {
@@ -576,7 +595,17 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                         len: *len,
                         vrf: other.clone(),
                     },
-                    RouteAction::Local | RouteAction::Discard | RouteAction::Reject => continue,
+                    RouteAction::Discard | RouteAction::Reject => Entry::Forward(Forward {
+                        prefix: *prefix,
+                        len: *len,
+                        egress: if *action == RouteAction::Discard {
+                            IfId::DISCARD
+                        } else {
+                            IfId::REJECT
+                        },
+                        next_hop: None,
+                    }),
+                    RouteAction::Local => continue,
                 };
                 if let Some(list) = entries.get_mut(vrf) {
                     list.push(entry);
@@ -586,7 +615,13 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                 let Some(&(id, _)) = active.get(interface.as_str()) else {
                     continue;
                 };
+                // An all-zero MAC address: the neighbor process gave up on it.
+                let failed = *mac == [0; 6];
                 match *address {
+                    IpAddr::V4(_) if failed => {
+                        unreachable.push((id, v4(*address).expect("IPv4")));
+                    }
+                    IpAddr::V6(a) if failed => unreachable6.push((id, a.octets())),
                     IpAddr::V4(_) => neighbors.push(Neighbor {
                         interface: id,
                         target: v4(*address).expect("IPv4"),
@@ -604,6 +639,31 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
                     return Err(format!("nat in {vrf}: only the default VRF has NAT"));
                 }
                 nat_entry = Some(nat);
+            }
+            (
+                Key::IcmpErrors { vrf },
+                Value::IcmpErrors {
+                    ipv4_interval_ms,
+                    ipv6_burst,
+                    ipv6_interval_ms,
+                },
+            ) => {
+                // The limits are the FE's, for every VRF.
+                if vrf != DEFAULT_VRF {
+                    return Err(format!(
+                        "icmp-errors in {vrf}: the limits are set in the default VRF for all"
+                    ));
+                }
+                icmp_errors = Some((*ipv4_interval_ms, *ipv6_burst, *ipv6_interval_ms));
+            }
+            (Key::FirewallPolicy { vrf }, Value::FirewallPolicy { filtering, outside }) => {
+                if vrf != DEFAULT_VRF {
+                    return Err(format!(
+                        "firewall policy in {vrf}: only the default VRF has a firewall"
+                    ));
+                }
+                firewall_filtering = *filtering;
+                firewall_outside.clone_from(outside);
             }
             (Key::FirewallRule { vrf, id }, Value::FirewallRule(rule)) => {
                 if vrf != DEFAULT_VRF {
@@ -665,7 +725,8 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         )
         .map_err(|error| format!("{name}: {error:?}"))?;
         let ipv6 = Ipv6Fib::new(routes6, neighbors6.clone(), std::mem::take(&mut local6[at]))
-            .map_err(|error| format!("{name}: IPv6: {error:?}"))?;
+            .map_err(|error| format!("{name}: IPv6: {error:?}"))?
+            .with_unreachable(unreachable6.clone());
         vrfs.push(Vrf { owner, ipv6 });
     }
     let by_ingress = (0..interface_names.len())
@@ -695,11 +756,41 @@ pub(crate) fn build(ports: &[String], store: &Store) -> Result<Built, String> {
         interface_names,
         vlans,
         tunnels,
+        unreachable,
         pppoe,
         wireguard,
         kernel,
         firewall,
         firewall_on,
+        // Outside: the interfaces the configuration names. Inside: the default VRF's
+        // other interfaces (the router's own kernel interfaces are neither).
+        icmp_errors,
+        firewall_interfaces: {
+            let outside: Vec<IfId> = firewall_outside
+                .iter()
+                .filter_map(|name| active.get(name.as_str()).map(|&(id, _)| id))
+                .collect();
+            let inside: Vec<IfId> = active
+                .values()
+                .filter(|&&(id, vrf)| vrf == DEFAULT_VRF && !outside.contains(&id))
+                .map(|&(id, _)| id)
+                .collect();
+            (
+                ruster_core::FirewallInterfaceSet::of(&inside),
+                ruster_core::FirewallInterfaceSet::of(&outside),
+            )
+        },
+        firewall_filtering: match firewall_filtering {
+            table::NatFiltering::EndpointIndependent => {
+                ruster_core::FirewallFiltering::EndpointIndependent
+            }
+            table::NatFiltering::AddressDependent => {
+                ruster_core::FirewallFiltering::AddressDependent
+            }
+            table::NatFiltering::AddressAndPortDependent => {
+                ruster_core::FirewallFiltering::AddressAndPortDependent
+            }
+        },
         nat,
     })
 }
@@ -743,6 +834,15 @@ fn nat(
             } => PortSet::psid(offset, length, psid),
         }
         .map_err(|e| format!("nat ports: {e:?}"))?,
+        filtering: match entry.filtering {
+            table::NatFiltering::EndpointIndependent => {
+                ruster_core::Nat44Filtering::EndpointIndependent
+            }
+            table::NatFiltering::AddressDependent => ruster_core::Nat44Filtering::AddressDependent,
+            table::NatFiltering::AddressAndPortDependent => {
+                ruster_core::Nat44Filtering::AddressAndPortDependent
+            }
+        },
     }))
 }
 

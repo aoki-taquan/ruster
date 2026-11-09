@@ -12,12 +12,24 @@
 //! - RFC 1812 section 5.2.3: an IPv4 datagram for any of the router's addresses is
 //!   for the router, whichever interface it came in on. A NAT public address that
 //!   came in from another interface than its own is left to NAT (hairpinning).
+//! - Discard and reject routes ([`IfId::DISCARD`], [`IfId::REJECT`]): a discard
+//!   route drops silently; a reject route is as no route, so the datagram gets
+//!   Destination Unreachable (Network) as RFC 1812 section 5.2.7.1 asks.
 //! - RFC 1191 and RFC 1812 section 5.2.7: with the firewall, a forwarded ICMPv4
 //!   Destination Unreachable, Time Exceeded or Parameter Problem passes as RELATED
 //!   to the live flow it quotes, whose source must be the error's destination; it
 //!   is not judged by the rules and makes no state.
 //!
-//! Deviations: an ICMP error about the router's own datagram has the datagram's
+//! Deviations: with NAT on, an IPv4 datagram decided in another VRF that would leave
+//! through an interface of the default VRF (NAT's) is dropped as
+//! `VRF_LEAK_INTO_SERVICES`, not translated; with only the firewall on, the
+//! firewall judges it as one of the default VRF's, except that a leaked ICMP error
+//! or fragment is dropped. Rules can name only the default VRF's interfaces, so a
+//! rule with no ingress also admits what other VRFs leak. IPv4 options are not forwarded (see `packet`); a later fragment
+//! that starts at offset 1 or 2 is dropped for every protocol, not only TCP (RFC
+//! 1858); transit fragments go through the fragment association table, whose
+//! limits (entries, per source, held per source) drop what goes past them.
+//! An ICMP error about the router's own datagram has the datagram's
 //! destination as its source, not a router address (RFC 1812 section 4.3.2.4),
 //! because every router address is the kernel's own and Linux discards a packet
 //! from one of them.
@@ -574,6 +586,8 @@ pub enum DropReason {
     /// An ICMPv6 error, while the forward firewall is on, whose quoted packet is no
     /// flow the firewall lets through (or cannot be read).
     FirewallIcmpv6Unrelated = 251,
+    /// The route holding the destination is a discard route.
+    RouteDiscard = 252,
 }
 
 use DropReason::*;
@@ -581,7 +595,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 251] = [
+    pub const ALL: [Self; 252] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -833,6 +847,7 @@ impl DropReason {
         WireguardUnderlyingUnsupported,
         WireguardMtuExceeded,
         FirewallIcmpv6Unrelated,
+        RouteDiscard,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1101,6 +1116,7 @@ impl DropReason {
             WireguardUnderlyingUnsupported => "WIREGUARD_UNDERLYING_UNSUPPORTED",
             WireguardMtuExceeded => "WIREGUARD_MTU_EXCEEDED",
             FirewallIcmpv6Unrelated => "FIREWALL_ICMPV6_UNRELATED",
+            RouteDiscard => "ROUTE_DISCARD",
         }
     }
 }
@@ -1417,6 +1433,9 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) kernel_ingress: &'a [IfId],
     /// IPv4 in IPv6 tunnels ([`ForwardingSnapshot::with_tunnels`]).
     pub(crate) tunnels: &'a [crate::Ipv4InIpv6Tunnel],
+    /// Next hops the control side could not resolve (interface, address): a
+    /// datagram to one gets Host Unreachable (RFC 1812 5.2.7.1).
+    pub(crate) unreachable: &'a [(IfId, crate::Ipv4Address)],
     /// PPPoE sessions ([`ForwardingSnapshot::with_pppoe`]).
     pub(crate) pppoe: &'a [crate::PppoeSession],
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
@@ -1566,6 +1585,7 @@ impl<'a> ForwardingSnapshot<'a> {
             if !interfaces
                 .iter()
                 .any(|interface| interface.id == route.egress())
+                && !matches!(route.egress(), IfId::DISCARD | IfId::REJECT)
             {
                 return Err(SnapshotError::RouteUnknownInterface);
             }
@@ -1628,6 +1648,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            unreachable: &[],
             pppoe: &[],
             vlans: &[],
             wireguard: &[],
@@ -1828,6 +1849,26 @@ impl<'a> ForwardingSnapshot<'a> {
     /// Whether `ingress` is one of [`Self::with_kernel_ingress`].
     pub(crate) fn is_kernel_ingress(&self, ingress: IfId) -> bool {
         self.kernel_ingress.contains(&ingress)
+    }
+
+    /// Next hops the control side could not resolve (interface, address): a
+    /// datagram to one gets Host Unreachable instead of a resolve request.
+    #[must_use]
+    pub fn with_unreachable_neighbors(self, unreachable: &'a [(IfId, crate::Ipv4Address)]) -> Self {
+        Self {
+            unreachable,
+            ..self
+        }
+    }
+
+    /// Next hops the control side could not resolve; see
+    /// [`ForwardingSnapshot::with_unreachable_neighbors`].
+    pub(crate) fn is_unreachable_neighbor(
+        &self,
+        interface: IfId,
+        target: crate::Ipv4Address,
+    ) -> bool {
+        self.unreachable.contains(&(interface, target))
     }
 
     /// Sends IPv4 routed to a tunnel's interface inside IPv6 and unwraps the
@@ -2040,6 +2081,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            unreachable: &[],
             pppoe: &[],
             vlans: &[],
             wireguard: &[],
@@ -2431,6 +2473,7 @@ impl ValidatedForwardingOwner {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            unreachable: &[],
             pppoe: &[],
             vlans: &[],
             wireguard: &[],
@@ -2781,6 +2824,11 @@ pub enum TraceEvent {
     Routed {
         egress: IfId,
         neighbor_target: crate::Ipv4Address,
+    },
+    /// An IPv6 packet goes to the neighbor `next_hop` out of `egress`.
+    Ipv6Routed {
+        egress: IfId,
+        next_hop: [u8; 16],
     },
     /// A forwarded packet's next hop is not in the neighbor table and there
     /// is no resolution runtime; the packet is dropped as
@@ -3517,7 +3565,7 @@ where
         } else {
             None
         };
-        let parked = if foreign {
+        let mut parked = if foreign {
             Some((
                 firewall_config.take(),
                 firewall.take(),
@@ -3609,7 +3657,23 @@ where
                             && all_vrfs.for_ingress(decision.egress()).authority()
                                 == all_vrfs.authority()
                         {
-                            return Err(DropReason::VrfLeakIntoServices);
+                            // Into the default VRF: its firewall judges the datagram
+                            // as one of its own; NAT does not translate another
+                            // VRF's, so with NAT on it is dropped.
+                            let nat_on = parked_nat.as_ref().is_some_and(|nat| {
+                                nat.0.is_some() || nat.2.is_some() || nat.4.is_some()
+                            });
+                            let services = parked.as_mut().filter(|_| !nat_on);
+                            let Some((Some(config), Some(runtime), audit)) = services else {
+                                return Err(DropReason::VrfLeakIntoServices);
+                            };
+                            let ipv4 = validate_ipv4_frame(frame)?;
+                            let validated = validate_firewall_transport(frame, ipv4)?;
+                            let packet =
+                                firewall_packet(ingress, decision.egress(), ipv4, validated, None);
+                            firewall_plan = Some(plan_firewall_packet(
+                                packet, config, runtime, audit, nat_now_ms,
+                            )?);
                         }
                         Ok(decision)
                     })
@@ -3899,8 +3963,12 @@ where
                         });
                     }
                     if let Some(plan) = planned.firewall {
+                        // Another VRF's datagram into the default VRF: the firewall
+                        // set aside for it planned it.
+                        let parked_runtime = parked.as_mut().and_then(|p| p.1.as_deref_mut());
                         firewall
                             .as_deref_mut()
+                            .or(parked_runtime)
                             .expect("firewall plan requires a bound runtime")
                             .commit(plan)
                             .expect("sequential packet path keeps firewall plan authority stable");
@@ -4461,10 +4529,10 @@ fn validate_ipv4_ingress(
     }
     let source_route = snapshot.route_lookup(ipv4.source);
     if let Some(selected) = source_route {
-        if selected.is_prefix_network_address(ipv4.source) {
+        if selected.is_connected_network_address(ipv4.source) {
             return Err(Ipv4SourceNetworkAddress);
         }
-        if selected.is_prefix_directed_broadcast(ipv4.source) {
+        if selected.is_connected_directed_broadcast(ipv4.source) {
             return Err(Ipv4SourceDirectedBroadcast);
         }
     }
@@ -4496,10 +4564,10 @@ fn validate_ipv4_forward_destination(
     selected_route: Option<Route>,
 ) -> Result<(), DropReason> {
     if let Some(selected) = selected_route {
-        if selected.is_prefix_network_address(ipv4.destination) {
+        if selected.is_connected_network_address(ipv4.destination) {
             return Err(Ipv4DestinationNetworkAddress);
         }
-        if selected.is_prefix_directed_broadcast(ipv4.destination) {
+        if selected.is_connected_directed_broadcast(ipv4.destination) {
             return Err(Ipv4DestinationDirectedBroadcast);
         }
     }
@@ -4566,6 +4634,12 @@ fn decide_ipv4<T: TraceSink>(
     } else {
         snapshot.route_lookup(ipv4.destination)
     };
+    // A discard route drops silently; a reject route is as no route (Destination
+    // Unreachable).
+    if selected_route.is_some_and(|route| route.egress() == IfId::DISCARD) {
+        return Err(RouteDiscard);
+    }
+    let selected_route = selected_route.filter(|route| route.egress() != IfId::REJECT);
     if !local {
         validate_ipv4_forward_destination(ipv4, selected_route)?;
     }
@@ -4583,6 +4657,7 @@ fn decide_ipv4<T: TraceSink>(
     // the public address as a wrong-ingress external error.
     if is_nat44_icmpv4_inside_candidate(
         frame,
+        snapshot,
         ingress,
         ipv4,
         local,
@@ -5118,6 +5193,28 @@ fn decide_ipv4<T: TraceSink>(
         // A tunnel, PPPoE session or WireGuard interface has no neighbors: the
         // Ethernet header is replaced when the packet is wrapped.
         crate::MacAddress([0; 6])
+    } else if snapshot.is_unreachable_neighbor(route.egress(), target) {
+        // The control side gave up resolving it: Host Unreachable, and no new
+        // resolve request until it tries again.
+        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+            let disposition = decide_icmpv4_error(
+                frame,
+                snapshot,
+                ingress,
+                ipv4,
+                Some(route),
+                Icmpv4ErrorKind::DestinationUnreachableHost,
+                0,
+                runtime,
+                *now,
+                trace,
+            );
+            trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                ingress,
+                disposition,
+            });
+        }
+        return Err(NeighborUnresolved);
     } else {
         // No resolution runtime: the control side resolves (FE/CE split).
         trace.record(TraceEvent::NeighborMissing {
@@ -5238,9 +5335,8 @@ fn decide_ipv4<T: TraceSink>(
 ///   only packets without IPv4 options, so no translated packet can carry a
 ///   source route. Code 8 (Source Host Isolated) is obsolete (RFC 1812
 ///   §5.2.7.1: routers SHOULD NOT generate it).
-/// - Time Exceeded (Type 11, REQ-10 a.2): code 0 only. Code 1 (Fragment
-///   Reassembly) needs a fragment, and NAT44 translates only atomic
-///   datagrams (the quote must be DF=1/MF=0/offset=0).
+/// - Time Exceeded (Type 11, REQ-10 a.2): code 0, and code 1 (Fragment
+///   Reassembly) about a first fragment, from the end host only.
 /// - Parameter Problem (Type 12, REQ-10 b.5, MAY): codes 0–2. The pointer is
 ///   an offset into the quoted packet, which translation never moves.
 ///
@@ -5250,7 +5346,7 @@ fn decide_ipv4<T: TraceSink>(
 pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> bool {
     match icmp_type {
         3 => matches!(code, 0..=4 | 6 | 7 | 9..=15),
-        11 => code == 0,
+        11 => code <= 1,
         12 => code <= 2,
         _ => false,
     }
@@ -5258,7 +5354,8 @@ pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> boo
 
 /// Whether only the quoted destination host itself generates this error:
 /// Protocol Unreachable and Port Unreachable (RFC 1812 §5.2.7.1, RFC 792)
-/// report the absence of a transport or port at the destination host,
+/// report the absence of a transport or port at the destination host, and
+/// Time Exceeded code 1 that the host reassembling the datagram gave up,
 /// never a condition on the path.
 ///
 /// As a local policy ("unless explicitly overridden by local policy", RFC
@@ -5267,7 +5364,7 @@ pub(crate) const fn nat44_icmpv4_error_supported(icmp_type: u8, code: u8) -> boo
 /// address could sweep public ports and tear down inside UDP flows with a
 /// hard error.
 pub(crate) const fn nat44_icmpv4_error_end_host_only(icmp_type: u8, code: u8) -> bool {
-    icmp_type == 3 && matches!(code, 2 | 3)
+    (icmp_type == 3 && matches!(code, 2 | 3)) || (icmp_type == 11 && code == 1)
 }
 
 /// Type, code, and quoted protocol of an ICMPv4 message, peeked within the
@@ -5880,9 +5977,10 @@ fn parse_nat44_icmpv4_error(
     let protocol = *inner_header
         .get(9)
         .ok_or(Nat44Icmpv4QuotedHeaderTruncated)?;
-    // The quoted datagram must be whole, as every translated datagram
-    // (NAT44-008, NAT44-116): MF clear and offset 0, DF either way (MTU2).
-    if inner_flags & 0x3fff != 0 {
+    // The quoted datagram must start at offset 0 so that it has its ports: whole,
+    // or the first fragment of one NAT translated (RFC 5508 REQ-4 and REQ-5 with
+    // NAT-FRAG); DF either way (MTU2).
+    if inner_flags & 0x1fff != 0 {
         return Err(Nat44Icmpv4QuotedFragmentUnsupported);
     }
     if !matches!(protocol, 1 | 6 | 17) {
@@ -7876,11 +7974,11 @@ fn decide_icmpv4_error<T: TraceSink>(
             .record_suppression(Icmpv4TimeExceededDisposition::DestinationLimitedBroadcast);
     }
     if let Some(selected) = selected_destination_route {
-        if selected.is_prefix_network_address(ipv4.destination) {
+        if selected.is_connected_network_address(ipv4.destination) {
             return runtime
                 .record_suppression(Icmpv4TimeExceededDisposition::DestinationNetworkAddress);
         }
-        if selected.is_prefix_directed_broadcast(ipv4.destination) {
+        if selected.is_connected_directed_broadcast(ipv4.destination) {
             return runtime
                 .record_suppression(Icmpv4TimeExceededDisposition::DestinationDirectedBroadcast);
         }
@@ -8184,8 +8282,8 @@ fn icmp_error_source_is_host(
         && octets[0] != 127
         && octets[0] < 224
         && !snapshot.route_lookup(source).is_some_and(|selected| {
-            selected.is_prefix_network_address(source)
-                || selected.is_prefix_directed_broadcast(source)
+            selected.is_connected_network_address(source)
+                || selected.is_connected_directed_broadcast(source)
         })
 }
 
@@ -8203,8 +8301,8 @@ fn icmp_error_candidate_eligible(
         return false;
     }
     if selected_destination_route.is_some_and(|route| {
-        route.is_prefix_network_address(ipv4.destination)
-            || route.is_prefix_directed_broadcast(ipv4.destination)
+        route.is_connected_network_address(ipv4.destination)
+            || route.is_connected_directed_broadcast(ipv4.destination)
     }) || frame.first().is_some_and(|first| first & 1 != 0)
     {
         return false;
@@ -8635,6 +8733,13 @@ fn truncated_parameter_problem<T: TraceSink>(
         // to the public address are NAT's here.
         nat_public_destination(ipv4, nat44_udp_config, nat44_tcp_config, None),
     );
+    // With the forward firewall on, the router's own addresses are behind it
+    // (`rt-default`) and a truncated datagram has no transport header to judge:
+    // stay silent, as for transit, so the answer does not tell which addresses
+    // are the router's.
+    if local && firewall {
+        return;
+    }
     // INPUT-FW: a truncated datagram has no reliable transport header, so
     // the input policy judges it without one; a deny is silent (the drop
     // stays `IPV4_TOTAL_LENGTH_EXCEEDS_PACKET`).
@@ -8648,6 +8753,10 @@ fn truncated_parameter_problem<T: TraceSink>(
         None
     } else {
         let selected_route = snapshot.route_lookup(ipv4.destination);
+        if selected_route.is_some_and(|route| route.egress() == IfId::DISCARD) {
+            return;
+        }
+        let selected_route = selected_route.filter(|route| route.egress() != IfId::REJECT);
         if firewall
             || validate_ipv4_forward_destination(ipv4, selected_route).is_err()
             || !transit_error_allowed(ingress, selected_route, nat44_udp_config, nat44_tcp_config)
@@ -10135,6 +10244,7 @@ mod tests {
             (249, "WIREGUARD_UNDERLYING_UNSUPPORTED"),
             (250, "WIREGUARD_MTU_EXCEEDED"),
             (251, "FIREWALL_ICMPV6_UNRELATED"),
+            (252, "ROUTE_DISCARD"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10144,7 +10254,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(252), None);
+        assert_eq!(DropReason::from_code(253), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

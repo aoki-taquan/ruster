@@ -52,6 +52,7 @@
 //! psid-offset = 6              # optional, 6 when left out
 //! br = "2001:db8:ffff::1"
 //! mtu = 1460                   # optional, 1460 when left out
+//! filtering = "endpoint-independent"  # optional, as for [nat]
 //!
 //! [[route]]
 //! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
@@ -64,10 +65,22 @@
 //! prefix = "0.0.0.0/0"
 //! lookup-vrf = "default"
 //!
+//! [[route]]                    # drop the prefix's packets (a longer route still wins)
+//! prefix = "10.0.0.0/8"
+//! action = "discard"           # silently; "reject": with a Destination Unreachable
+//!
+//! firewall-filtering = "endpoint-independent"  # optional, at the top: who outside
+//!                              # may reach an inside host's UDP or TCP port that has a
+//!                              # flow out, where no rule decides; the default, or
+//!                              # "address-dependent", "address-and-port-dependent".
+//!                              # Outside are NAT's outside and the interfaces of the
+//!                              # default routes; inside, the other interfaces
+//!
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
 //! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
-//! ingress = "lan"              # optional, any interface when left out;
+//! ingress = "lan"              # optional, any interface when left out (and then
+//!                              # also what other VRFs look up in this one);
 //!                              # "rt-default" is the router itself: as ingress its own
 //!                              # packets, as egress the packets to it (SSH, ping, ...)
 //! egress = "wan"               # optional
@@ -77,11 +90,18 @@
 //! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
 //! destination-ports = "53"     # optional
 //!
+//! [icmp-errors]                # optional: the rate limits of the ICMP errors the
+//! ipv4-interval-ms = 100       # router sends: one per this per egress and kind
+//! ipv6-burst = 10              # (RFC 1812 4.3.2.8), and for ICMPv6 this many at
+//! ipv6-interval-ms = 10        # once and one more every this (RFC 4443 2.4(f))
+//!
 //! [nat]                        # NAPT of the default VRF
 //! inside = "lan"
 //! outside = "wan"              # must have an ipv4 address: the public one
 //! ports = "1024-32767"         # optional, 1024-32767 when left out
 //! external = "198.51.100.2"    # optional; for now only the outside's own address
+//! filtering = "endpoint-independent"  # optional, the default, or
+//!                              # "address-dependent", "address-and-port-dependent"
 //! ```
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
@@ -100,25 +120,38 @@
 //!
 //! # Standards
 //!
+//! - RFC 8200 section 5: an interface with IPv6 addresses has an MTU of at least
+//!   1280. Deviation: one with only its link-local address may have less.
 //! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
 //!   when not named.
 //! - RFC 791: the smallest MTU is 68.
+//! - RFC 4291 sections 2.5.5 and 2.6.1, RFC 3879, RFC 6164: an interface's IPv6
+//!   address is not IPv4-mapped, IPv4-compatible, site-local (fec0::/10) or its
+//!   prefix's Subnet-Router anycast address (all zero after the prefix, except on a
+//!   /127), and a link-local one is a /64.
 //! - RFC 6333 section 5 (DS-Lite B4): a `tunnel` interface sends IPv4 inside IPv6
 //!   from `local`, which must be one of the router's IPv6 addresses in the default
 //!   VRF, to the AFTR at `remote`; the outer packets are routed in the default VRF.
-//!   Its MTU is at most 1460 (1500 less the IPv6 header), so the outer packets are
-//!   never fragmented (RFC 6333 5.3 lets the B4 fragment them instead).
+//!   Its MTU is at most 1460 (1500 less the IPv6 header), and at run time at most
+//!   what the link below carries less 40, so the outer packets are not fragmented
+//!   (RFC 6333 5.3 lets the B4 fragment them instead).
 //! - RFC 7597 (MAP-E), the CE: `[map-e]` derives the shared IPv4 address and the
 //!   PSID from the EA bits of the delegated prefix (section 5.2), the CE's IPv6
 //!   address from them (section 6, interface ID `0:IPv4:PSID` on the delegated
 //!   prefix with subnet ID 0), and makes a tunnel to the BR, NAPT on the PSID's
-//!   port set (section 5.1) and the default IPv4 route through the tunnel.
+//!   port set (section 5.1), the default IPv4 route through the tunnel, and a
+//!   discard route for the delegated prefix (RFC 7084 WPD-5). The router's own IPv4
+//!   from its LAN address is translated into the port set like a LAN host's.
 //!   Deviations: one Basic Mapping Rule, no Forwarding Mapping Rules (all traffic
 //!   goes through the BR, hub and spoke); an `ea-length` shorter than the IPv4
 //!   suffix (an IPv4 prefix per CE) is refused; the IPv4 address with no sharing
 //!   (`ea-length` equal to the IPv4 suffix) uses ports 1024 to 32767, below the
-//!   kernel's; the router's own IPv4 (from the kernel) is not translated into the
-//!   port set, so it does not work over MAP-E yet.
+//!   kernel's; a delegated prefix that is a link's on-link prefix is refused (no one
+//!   would answer Neighbor Discovery for the CE's address there); the
+//!   interface ID is RFC 7597's, not the older draft's; the unwrapped IPv4
+//!   destination is not checked against the CE's address (NAT drops what would go
+//!   from the tunnel to the inside without a mapping; one routed elsewhere is
+//!   forwarded).
 //! - RFC 2516: a `pppoe` interface is one PPPoE session on its parent (a port or
 //!   VLAN given before it), with the session ID and the access concentrator's MAC
 //!   that the session's daemon found; its MTU is at most the parent's less 8.
@@ -137,8 +170,10 @@
 //!   the default VRF, not ACLs attached per interface; a rule without addresses whose
 //!   protocol has both families is two ACEs, one per family.
 //! - RFC 4787, RFC 5382 and RFC 5508: `nat` is NAPT for UDP, TCP and ICMP queries
-//!   with core's behaviour (endpoint-independent mapping, address-dependent
-//!   filtering); see `ruster_core`'s NAT modules for its deviations. One inside and
+//!   with core's behaviour (endpoint-independent mapping; filtering as `filtering`
+//!   names for UDP and TCP; endpoint-independent by default, which RFC 4787 REQ-8
+//!   and RFC 5382 REQ-3 recommend where application transparency matters most);
+//!   see `ruster_core`'s NAT modules for its deviations. One inside and
 //!   one outside interface, and the outside interface's address as the public one.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -146,7 +181,9 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use serde::Deserialize;
 
-use ruster_proto::table::{FirewallAction, FirewallRule, Nat, NatPorts, Protocol, DEFAULT_VRF};
+use ruster_proto::table::{
+    FirewallAction, FirewallRule, Nat, NatFiltering, NatPorts, Protocol, DEFAULT_VRF,
+};
 
 use crate::{
     Config, InterfaceConfig, RouteTarget, StaticRoute, WireguardConfig, WireguardPeerConfig,
@@ -154,6 +191,8 @@ use crate::{
 
 /// The smallest MTU an IPv4 interface may have (RFC 791).
 const MIN_MTU: u16 = ruster_proto::table::MIN_MTU;
+/// The least MTU of a link that carries IPv6.
+const IPV6_MIN_MTU: u16 = 1_280;
 /// The FE takes Ethernet frames of up to 1514 bytes.
 const MAX_MTU: u16 = 1_500;
 /// The name rules give the router itself (the default VRF's kernel interface).
@@ -170,6 +209,10 @@ struct File {
     route: Vec<RouteEntry>,
     #[serde(default)]
     firewall: Vec<FirewallEntry>,
+    #[serde(rename = "firewall-filtering")]
+    firewall_filtering: Option<String>,
+    #[serde(rename = "icmp-errors")]
+    icmp_errors: Option<IcmpErrorsEntry>,
     nat: Option<NatEntry>,
     #[serde(rename = "map-e")]
     map_e: Option<MapEEntry>,
@@ -211,15 +254,40 @@ struct MapEEntry {
     psid_offset: Option<u8>,
     br: String,
     mtu: Option<u16>,
+    filtering: Option<String>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
+struct IcmpErrorsEntry {
+    ipv4_interval_ms: Option<u32>,
+    ipv6_burst: Option<u32>,
+    ipv6_interval_ms: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[serde(rename_all = "kebab-case")]
 struct NatEntry {
     inside: String,
     outside: String,
     ports: Option<String>,
     external: Option<String>,
+    filtering: Option<String>,
+}
+
+/// `filtering = "..."` of `[nat]` or `[map-e]`; endpoint-independent when left out.
+fn filtering(at: &str, text: Option<&str>) -> Result<NatFiltering, String> {
+    match text {
+        None => Ok(NatFiltering::default()),
+        Some(text) => NatFiltering::from_name(&format!("{text}-filtering"))
+            .ok_or_else(|| {
+                format!(
+                    "{at}: filtering must be \"endpoint-independent\", \"address-dependent\" or \"address-and-port-dependent\""
+                )
+            }),
+    }
 }
 
 #[derive(Deserialize)]
@@ -283,6 +351,9 @@ struct RouteEntry {
     interface: Option<String>,
     via: Option<String>,
     lookup_vrf: Option<String>,
+    /// `"discard"` (dropped silently) or `"reject"` (dropped with a Destination
+    /// Unreachable), instead of an interface.
+    action: Option<String>,
 }
 
 fn default_vrf() -> String {
@@ -370,9 +441,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if !seen.names.insert(entry.name.clone()) {
             return Err(format!("{at}: given twice"));
         }
-        if entry.vrf.is_empty() {
-            return Err(format!("{at}: vrf must not be empty"));
-        }
+        vrf_name(&at, &entry.vrf)?;
         seen.vrf_of.insert(entry.name.clone(), entry.vrf.clone());
         let vlan = match (&entry.parent, entry.vlan) {
             (Some(parent), Some(id)) => {
@@ -558,6 +627,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             None => None,
         };
+        if !entry.ipv6.is_empty() && mtu < IPV6_MIN_MTU {
+            return Err(format!(
+                "{at}: mtu must be at least {IPV6_MIN_MTU} on an interface with ipv6 addresses"
+            ));
+        }
         let mut ipv6 = Vec::with_capacity(entry.ipv6.len());
         for text in &entry.ipv6 {
             let Some((IpAddr::V6(address), len)) = prefix(text) else {
@@ -570,6 +644,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
             if !unicast_v6(address) {
                 return Err(format!("{at}: ipv6 {text:?} must be a unicast address"));
+            }
+            if let Some(why) = unusable_interface_v6(address, len) {
+                return Err(format!("{at}: ipv6 {text:?} {why}"));
             }
             seen.address(&at, &entry.name, address.into(), len)?;
             ipv6.push((address, len));
@@ -600,7 +677,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
     // A MAP-E CE's tunnel is an interface like the others for what follows.
     let map_e = match file.map_e {
         Some(entry) => {
-            let (tunnel, mapped) = map_e(entry, &seen)?;
+            let (tunnel, mapped, delegated) = map_e(entry, &seen)?;
             let at = format!("map-e interface {:?}", tunnel.name);
             if tunnel.name.is_empty() || tunnel.name.len() > 255 {
                 return Err(format!("{at}: the name must be 1 to 255 bytes"));
@@ -612,7 +689,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             seen.address(&at, &tunnel.name, address.into(), len)?;
             let name = tunnel.name.clone();
             interfaces.push(tunnel);
-            Some((name, mapped))
+            Some((name, mapped, delegated))
         }
         None => None,
     };
@@ -625,8 +702,30 @@ pub fn parse(text: &str) -> Result<Config, String> {
         };
         if map_e
             .as_ref()
-            .is_some_and(|(name, _)| *name == interface.name)
+            .is_some_and(|(name, _, _)| *name == interface.name)
         {
+            // Sent from the CE's own address, which needs no owner; but no other
+            // tunnel may have the same ends.
+            if !pairs.insert((local, remote)) {
+                return Err(format!(
+                    "map-e interface {:?}: another tunnel has the same local and remote",
+                    interface.name
+                ));
+            }
+            // An address on an interface's own link would need answering there
+            // (Neighbor Discovery), which nothing does for the CE's address.
+            if let Some(on_link) = interfaces.iter().find(|i| {
+                i.tunnel.is_none()
+                    && i.ipv6.iter().any(|&(a, len)| {
+                        network(IpAddr::V6(a), len) == network(IpAddr::V6(local), len)
+                    })
+            }) {
+                return Err(format!(
+                    "map-e: prefix gives the CE address {local}, which is on {:?}'s link; \
+                     the delegated prefix must not be an on-link prefix",
+                    on_link.name
+                ));
+            }
             continue;
         }
         let at = format!("interface {:?}", interface.name);
@@ -661,11 +760,28 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if network(address, len) != address {
             return Err(format!("{at}: bits are set after the prefix length"));
         }
-        if entry.vrf.is_empty() {
-            return Err(format!("{at}: vrf must not be empty"));
-        }
+        vrf_name(&at, &entry.vrf)?;
         if !prefixes.insert((entry.vrf.clone(), address, len)) {
             return Err(format!("{at}: given twice in VRF {:?}", entry.vrf));
+        }
+        if let Some(action) = &entry.action {
+            let target = match action.as_str() {
+                "discard" => RouteTarget::Discard,
+                "reject" => RouteTarget::Reject,
+                _ => return Err(format!("{at}: action must be \"discard\" or \"reject\"")),
+            };
+            if entry.interface.is_some() || entry.lookup_vrf.is_some() || entry.via.is_some() {
+                return Err(format!(
+                    "{at}: a {action} route has no interface, lookup-vrf or via"
+                ));
+            }
+            static_routes.push(StaticRoute {
+                vrf: entry.vrf,
+                prefix: address,
+                len,
+                target,
+            });
+            continue;
         }
         let interface = match (entry.interface, entry.lookup_vrf) {
             (None, Some(other)) => {
@@ -684,7 +800,11 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 continue;
             }
             (Some(interface), None) => interface,
-            _ => return Err(format!("{at}: give either interface or lookup-vrf")),
+            _ => {
+                return Err(format!(
+                    "{at}: give one of interface, lookup-vrf and action"
+                ))
+            }
         };
         if !seen.names.contains(&interface) {
             return Err(format!("{at}: no interface {interface:?}"));
@@ -746,6 +866,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ));
         }
     }
+    let firewall_filtering = filtering("firewall-filtering", file.firewall_filtering.as_deref())?;
     let firewall = file
         .firewall
         .into_iter()
@@ -759,7 +880,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         .nat
         .map(|entry| nat(entry, &seen, &interfaces))
         .transpose()?;
-    if let Some((tunnel, mapped)) = map_e {
+    if let Some((tunnel, mapped, (delegated, delegated_len))) = map_e {
         if nat.is_some() {
             return Err("map-e: it makes the NAT itself; give no [nat]".into());
         }
@@ -778,6 +899,18 @@ pub fn parse(text: &str) -> Result<Config, String> {
             },
         });
         nat = Some(mapped);
+        // What of the delegated prefix no more specific route holds is dropped, not sent
+        // back upstream (RFC 7084 WPD-5).
+        if !static_routes.iter().any(|r| {
+            r.vrf == DEFAULT_VRF && r.prefix == IpAddr::V6(delegated) && r.len == delegated_len
+        }) {
+            static_routes.push(StaticRoute {
+                vrf: DEFAULT_VRF.to_owned(),
+                prefix: IpAddr::V6(delegated),
+                len: delegated_len,
+                target: RouteTarget::Discard,
+            });
+        }
     }
     for entry in file.wireguard_peer {
         let at = format!("wireguard-peer {:?} of {:?}", entry.name, entry.interface);
@@ -835,17 +968,36 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ));
         }
     }
+    let icmp_errors = match file.icmp_errors {
+        None => None,
+        Some(entry) => {
+            let at = "icmp-errors";
+            let ipv4 = entry.ipv4_interval_ms.unwrap_or(100);
+            let burst = entry.ipv6_burst.unwrap_or(10);
+            let ipv6 = entry.ipv6_interval_ms.unwrap_or(10);
+            if !(1..=60_000).contains(&ipv4) || !(1..=60_000).contains(&ipv6) {
+                return Err(format!("{at}: intervals must be 1 to 60000 ms"));
+            }
+            if !(1..=10_000).contains(&burst) {
+                return Err(format!("{at}: ipv6-burst must be 1 to 10000"));
+            }
+            Some((ipv4, burst, ipv6))
+        }
+    };
     Ok(Config {
         interfaces,
         wireguard: wireguard_interfaces,
         static_routes,
         firewall,
+        firewall_filtering,
+        icmp_errors,
         nat,
     })
 }
 
-/// The tunnel interface and NAT of a MAP-E CE (RFC 7597 sections 5.2 and 6).
-fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String> {
+/// The MAP-E CE's tunnel interface, its NAT, and the delegated prefix (RFC 7597
+/// sections 5.2 and 6).
+fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Addr, u8)), String> {
     let at = "map-e";
     let v6 = |text: &str, what: &str| match prefix(text) {
         Some((IpAddr::V6(address), len)) => Ok((address, len)),
@@ -875,12 +1027,18 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String
     let suffix = 32 - rule4_len;
     // The EA bits follow the rule IPv6 prefix in the delegated prefix; they hold
     // the IPv4 suffix and then the PSID (RFC 7597 section 5.2).
+    if network(IpAddr::V6(rule6), rule6_len) != IpAddr::V6(rule6) {
+        return Err(format!(
+            "{at}: rule-ipv6 has bits set after its prefix length"
+        ));
+    }
     if network(IpAddr::V6(delegated), rule6_len) != IpAddr::V6(rule6) {
         return Err(format!("{at}: prefix must be inside rule-ipv6"));
     }
-    if ea_length > 48
-        || u16::from(rule6_len) + u16::from(ea_length) > u16::from(delegated_len)
-        || delegated_len > 64
+    if ea_length > 48 {
+        return Err(format!("{at}: ea-length must be at most 48"));
+    }
+    if u16::from(rule6_len) + u16::from(ea_length) > u16::from(delegated_len) || delegated_len > 64
     {
         return Err(format!(
             "{at}: prefix must be at most /64 and hold the ea-length bits after rule-ipv6"
@@ -900,6 +1058,11 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String
     let psid_length = ea_length - suffix;
     let psid = (ea & ((1_u64 << psid_length) - 1)) as u16;
     let ipv4 = Ipv4Addr::from(u32::from(rule4) | (ea >> psid_length) as u32);
+    if !unicast_v4(ipv4) {
+        return Err(format!(
+            "{at}: the IPv4 address the prefix gives, {ipv4}, is not a unicast address"
+        ));
+    }
     let offset = entry.psid_offset.unwrap_or(6);
     if !(1..=15).contains(&offset) {
         return Err(format!("{at}: psid-offset must be 1 to 15"));
@@ -956,12 +1119,17 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat), String
         pppoe: None,
     };
     let nat = Nat {
+        filtering: filtering(at, entry.filtering.as_deref())?,
         inside: entry.inside,
         outside: entry.interface,
         external: None,
         ports,
     };
-    Ok((tunnel, nat))
+    let delegated = match network(IpAddr::V6(delegated), delegated_len) {
+        IpAddr::V6(network) => network,
+        IpAddr::V4(_) => unreachable!("an IPv6 network"),
+    };
+    Ok((tunnel, nat, (delegated, delegated_len)))
 }
 
 /// `"53"` or `"1024-65535"`.
@@ -1036,6 +1204,7 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
         }
     };
     Ok(Nat {
+        filtering: filtering(at, entry.filtering.as_deref())?,
         inside: entry.inside,
         outside: entry.outside,
         external,
@@ -1174,11 +1343,49 @@ fn network(address: IpAddr, len: u8) -> IpAddr {
     ruster_proto::table::network(address, len)
 }
 
+/// The longest VRF name: its kernel devices `vrf-<name>` and `rt-<name>` must fit
+/// Linux's 15-byte interface names.
+const VRF_NAME_MAX: usize = 11;
+
+fn vrf_name(at: &str, vrf: &str) -> Result<(), String> {
+    if vrf.is_empty() {
+        return Err(format!("{at}: vrf must not be empty"));
+    }
+    if vrf.len() > VRF_NAME_MAX || !vrf.bytes().all(|b| b.is_ascii_graphic() && b != b'/') {
+        return Err(format!(
+            "{at}: vrf {vrf:?} must be at most {VRF_NAME_MAX} letters, digits or signs other than /"
+        ));
+    }
+    Ok(())
+}
+
 /// An address a host can have: not unspecified, loopback, multicast, broadcast or
 /// reserved (240.0.0.0/4).
 fn unicast_v4(address: Ipv4Addr) -> bool {
     let first = address.octets()[0];
     first != 0 && !address.is_loopback() && first < 224
+}
+
+/// Why `address/len` cannot be an interface's address, if it cannot.
+fn unusable_interface_v6(address: Ipv6Addr, len: u8) -> Option<&'static str> {
+    let bits = u128::from(address);
+    if bits >> 32 == 0xffff {
+        return Some("is an IPv4-mapped address");
+    }
+    if bits >> 32 == 0 {
+        return Some("is an IPv4-compatible address");
+    }
+    if address.segments()[0] & 0xffc0 == 0xfec0 {
+        return Some("is a site-local address (fec0::/10)");
+    }
+    if address.is_unicast_link_local() {
+        return (len != 64).then_some("is link-local and needs the prefix length 64");
+    }
+    // A /127 has no Subnet-Router anycast address; a /128 has no subnet.
+    if len < 127 && bits & (u128::MAX >> len) == 0 {
+        return Some("is the Subnet-Router anycast address of its prefix");
+    }
+    None
 }
 
 fn unicast_v6(address: Ipv6Addr) -> bool {

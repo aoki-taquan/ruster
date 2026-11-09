@@ -59,7 +59,19 @@ pub const NAT_LAST_PORT: u64 = 60065;
 pub const NAT_PSID_OFFSET: u64 = 60066;
 pub const NAT_PSID_LENGTH: u64 = 60067;
 pub const NAT_PSID: u64 = 60068;
+/// `ietf-nat` `policy/filtering-type` (RFC 4787 section 5).
+pub const NAT_FILTERING: u64 = 60069;
 
+/// How the forward firewall of a VRF filters: its `filtering-type` and its outside
+/// interfaces.
+pub const FIREWALL_POLICY: u64 = 60140;
+pub const FIREWALL_POLICY_FILTERING: u64 = 60141;
+pub const FIREWALL_POLICY_OUTSIDE: u64 = 60142;
+/// The FE's ICMP error rate limits.
+pub const ICMP_ERRORS: u64 = 60150;
+pub const ICMP_ERRORS_IPV4_INTERVAL: u64 = 60151;
+pub const ICMP_ERRORS_IPV6_BURST: u64 = 60152;
+pub const ICMP_ERRORS_IPV6_INTERVAL: u64 = 60153;
 /// One forward firewall rule (`ietf-access-control-list` ace, `ruster-firewall`).
 pub const FIREWALL_RULE: u64 = 60070;
 pub const FIREWALL_INGRESS: u64 = 60071;
@@ -181,6 +193,14 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-offset", NAT_PSID_OFFSET),
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-len", NAT_PSID_LENGTH),
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid", NAT_PSID),
+    ("/ietf-nat:nat/instances/instance/policy/filtering-type", NAT_FILTERING),
+    ("/ruster-firewall:policy", FIREWALL_POLICY),
+    ("/ruster-firewall:policy/filtering-type", FIREWALL_POLICY_FILTERING),
+    ("/ruster-firewall:policy/outside-interface", FIREWALL_POLICY_OUTSIDE),
+    ("/ruster-fe:icmp-errors", ICMP_ERRORS),
+    ("/ruster-fe:icmp-errors/ipv4-interval", ICMP_ERRORS_IPV4_INTERVAL),
+    ("/ruster-fe:icmp-errors/ipv6-burst", ICMP_ERRORS_IPV6_BURST),
+    ("/ruster-fe:icmp-errors/ipv6-interval", ICMP_ERRORS_IPV6_INTERVAL),
     ("/ietf-access-control-list:acls/acl/aces/ace", FIREWALL_RULE),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/ingress-interface", FIREWALL_INGRESS),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/egress-interface", FIREWALL_EGRESS),

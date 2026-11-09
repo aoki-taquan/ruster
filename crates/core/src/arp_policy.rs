@@ -1,21 +1,32 @@
-//! The ARP policy a forwarding snapshot carries: RFC 5227 announcement timing and
+//! The ARP policy a forwarding snapshot carries: announcement timing and
 //! per-interface overrides. Announcements themselves are no longer sent by core
 //! (neighd owns ARP); the policy stays part of the snapshot's configuration.
+//!
+//! # Standards
+//!
+//! - RFC 5227 section 1.1: the default timing is ANNOUNCE_NUM,
+//!   ANNOUNCE_INTERVAL and DEFEND_INTERVAL. Section 2.3 is the Announcements
+//!   the policy times, and section 2.4 (c) the defense it can turn off per
+//!   interface.
+//!
+//! Deviations: nothing acts on this policy. Core no longer sends Announcements
+//! or defends an address, and neighd does neither (see its Deviations), so
+//! the values are carried but have no effect.
 
 use std::num::NonZeroU8;
 
 use crate::IfId;
 
-/// RFC 5227 §1.1 ANNOUNCE_NUM: Announcements per sequence.
+/// ANNOUNCE_NUM: Announcements per sequence.
 pub const ARP_ANNOUNCE_NUM: u8 = 2;
-/// RFC 5227 §1.1 ANNOUNCE_INTERVAL: time between Announcements.
+/// ANNOUNCE_INTERVAL: time between Announcements.
 pub const ARP_ANNOUNCE_INTERVAL_MS: u64 = 2_000;
-/// RFC 5227 §1.1 DEFEND_INTERVAL: minimum interval between defensive
+/// DEFEND_INTERVAL: minimum interval between defensive
 /// Announcements of one address.
 pub const ARP_DEFEND_INTERVAL_MS: u64 = 10_000;
 /// Default minimum interval between two announcement sequences on one
 /// interface (local flap bound, ARP-035). It reuses DEFEND_INTERVAL, the
-/// RFC's own floor for repeated broadcasts about one address.
+/// standard's own floor for repeated broadcasts about one address.
 pub const ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS: u64 = ARP_DEFEND_INTERVAL_MS;
 /// Largest `count` [`ArpAnnouncePolicy::new`] accepts.
 pub const ARP_ANNOUNCE_MAX_COUNT: u8 = 10;
@@ -39,7 +50,7 @@ pub enum ArpAnnouncePolicyError {
     MinIntervalOutOfRange,
 }
 
-/// How the router announces its own addresses (RFC 5227 §2.3).
+/// How the router announces its own addresses.
 ///
 /// 12 bytes (an `Option` of it too): it rides in the by-value forwarding
 /// snapshot.
@@ -51,7 +62,7 @@ pub struct ArpAnnouncePolicy {
 }
 
 impl ArpAnnouncePolicy {
-    /// RFC 5227 §1.1 values: ANNOUNCE_NUM 2, ANNOUNCE_INTERVAL 2 s, and
+    /// The standard values: ANNOUNCE_NUM 2, ANNOUNCE_INTERVAL 2 s, and
     /// the local minimum interval [`ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS`].
     pub const RFC5227: Self = Self {
         count: NonZeroU8::new(ARP_ANNOUNCE_NUM).expect("ANNOUNCE_NUM is nonzero"),
@@ -139,13 +150,13 @@ impl ArpAnnouncePolicy {
 /// router-wide switch. Conflict detection and counting stay on either way.
 ///
 /// 4 bytes; the forwarding snapshot borrows a sorted slice of them
-/// ([`ForwardingSnapshot::with_arp_interfaces`]), not the runtime slots.
+/// ([`crate::ForwardingSnapshot::with_arp_interfaces`]), not the runtime slots.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArpInterfacePolicy {
     pub interface: IfId,
-    /// RFC 5227 §2.3 Announcements on this interface.
+    /// Announcements on this interface.
     pub announce: Option<bool>,
-    /// The RFC 5227 §2.4 (c) defense on this interface. `Some(false)` is
-    /// an operator-selected §2.4 deviation (ARP-038).
+    /// The address defense (see # Standards) on this interface.
+    /// `Some(false)` is an operator-selected deviation from it (ARP-038).
     pub conflict_defense: Option<bool>,
 }

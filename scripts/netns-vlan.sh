@@ -107,7 +107,13 @@ nsx "$a" ping -c 3 -i 0.2 -W 1 10.20.0.10 >/dev/null || fail "VLAN 10 to VLAN 20
 echo "ok: VLAN 10 reaches VLAN 20 through the same port"
 nsx "$a" ping -c 3 -i 0.2 -W 1 198.51.100.10 >/dev/null || fail "VLAN 10 to the uplink"
 nsx "$c" ping -c 3 -i 0.2 -W 1 10.20.0.10 >/dev/null || fail "the uplink to VLAN 20"
-echo "ok: tags come off toward the uplink and go on toward a VLAN"
+# A datagram the size of the uplink's MTU does not fit the VLAN (4 bytes less): it
+# is fragmented on its way into the VLAN, and a longer one is too.
+for size in 1472 3000; do
+  nsx "$c" ping -c 2 -W 2 -M dont -s "$size" 10.20.0.10 >/dev/null ||
+    fail "a $size-byte ping from the uplink into VLAN 20"
+done
+echo "ok: tags come off toward the uplink and go on toward a VLAN, with fragments too"
 # An expiring packet from a VLAN: its ICMP error would leave a sub-interface, which is
 # not sent yet; the FE must go on forwarding.
 nsx "$a" ping -c 3 -i 0.2 -W 1 -t 1 198.51.100.10 >/dev/null 2>&1 || true

@@ -11,7 +11,10 @@
 //! - RFC 8200 section 3: the header fields read and the Hop Limit decrement; a packet
 //!   whose Hop Limit would reach 0 is not forwarded.
 //! - RFC 4291 section 2.5.6: link-local addresses, as source or destination, are not
-//!   forwarded. Section 2.7: a multicast source is invalid.
+//!   forwarded; a link-local source toward another link gets Destination
+//!   Unreachable code 2 back on its link (RFC 4443 section 3.1). Section 2.7: a
+//!   multicast source is invalid. A packet from outside with one of the router's
+//!   addresses as its source is dropped.
 //! - RFC 4861 section 4: Router and Neighbor Solicitation and Advertisement and
 //!   Redirect (ICMPv6 types 133 to 137) addressed to the router or to a multicast
 //!   group go to the control side unchanged; neighd checks the rest of RFC 4861.
@@ -28,8 +31,12 @@
 //!   packet from the kernel's interface ([`with_kernel_ingress`]) is the router's own,
 //!   so its Hop Limit stays.
 //!
-//! Deviations: no Destination Unreachable for an unresolvable neighbor (address
-//! unreachable) or for traffic to the router, no extension headers before an ND
+//! Deviations: the subnet-router anycast address of a connected prefix (RFC 4291
+//! section 2.6.1) is not the router's; extension headers are stepped over only to tell whether a packet is itself an
+//! ICMPv6 error (RFC 4443 2.4(e.1)); one ICMPv6 error limiter for every source,
+//! with one for Packet Too Big and one for the others;
+//! Address Unreachable (RFC 4443 3.1 code 3) only for a next hop the neighbor
+//! process gave up on, none for traffic to the router; no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
 //! to the kernel. Routes are searched linearly, longest prefix first.
 //! An ICMPv6 error about a packet from the kernel's interface has the packet's
@@ -123,6 +130,8 @@ pub struct Ipv6Fib {
     routes: Box<[Ipv6Route]>,
     neighbors: Box<[Ipv6Neighbor]>,
     local: Box<[Ipv6Local]>,
+    /// Next hops the control side could not resolve: Address Unreachable.
+    unreachable: Box<[(IfId, [u8; 16])]>,
 }
 
 impl Ipv6Fib {
@@ -148,6 +157,7 @@ impl Ipv6Fib {
             routes: routes.into(),
             neighbors: neighbors.into(),
             local: local.into(),
+            unreachable: Box::new([]),
         })
     }
 
@@ -170,6 +180,14 @@ impl Ipv6Fib {
 
     pub(crate) fn route(&self, destination: [u8; 16]) -> Option<&Ipv6Route> {
         self.routes.iter().find(|route| route.contains(destination))
+    }
+
+    /// The same table with `unreachable` as the next hops the control side could
+    /// not resolve.
+    #[must_use]
+    pub fn with_unreachable(mut self, unreachable: Vec<(IfId, [u8; 16])>) -> Self {
+        self.unreachable = unreachable.into();
+        self
     }
 
     pub(crate) fn neighbor(&self, interface: IfId, target: [u8; 16]) -> Option<MacAddress> {
@@ -214,6 +232,9 @@ pub struct ControlQueue {
     errors: Box<[ControlFrame]>,
     errors_len: usize,
     limiter: ErrorLimiter,
+    /// Packet Too Big has its own bucket, so that other errors cannot use up what
+    /// path MTU discovery needs.
+    too_big_limiter: ErrorLimiter,
 }
 
 /// A token bucket for ICMPv6 errors (RFC 4443 section 2.4 (f)): a burst of
@@ -223,6 +244,8 @@ struct ErrorLimiter {
     tokens: u32,
     refilled_at: u64,
     now: u64,
+    burst: u32,
+    interval_ms: u64,
 }
 
 /// Errors that may be sent at once.
@@ -232,10 +255,10 @@ pub const ERROR_INTERVAL_MS: u64 = 10;
 
 impl ErrorLimiter {
     fn take(&mut self) -> bool {
-        let earned = self.now.saturating_sub(self.refilled_at) / ERROR_INTERVAL_MS;
+        let earned = self.now.saturating_sub(self.refilled_at) / self.interval_ms;
         if earned > 0 {
             let earned = u32::try_from(earned).unwrap_or(u32::MAX);
-            self.tokens = self.tokens.saturating_add(earned).min(ERROR_BURST);
+            self.tokens = self.tokens.saturating_add(earned).min(self.burst);
             self.refilled_at = self.now;
         }
         if self.tokens == 0 {
@@ -292,6 +315,15 @@ impl ControlQueue {
                 tokens: ERROR_BURST,
                 refilled_at: 0,
                 now: 0,
+                burst: ERROR_BURST,
+                interval_ms: ERROR_INTERVAL_MS,
+            },
+            too_big_limiter: ErrorLimiter {
+                tokens: ERROR_BURST,
+                refilled_at: 0,
+                now: 0,
+                burst: ERROR_BURST,
+                interval_ms: ERROR_INTERVAL_MS,
             },
         }
     }
@@ -309,9 +341,21 @@ impl ControlQueue {
         self
     }
 
+    /// Limits ICMPv6 errors to `burst` at once and one more every `interval_ms`
+    /// (RFC 4443 2.4(f): the parameters are configurable), for Packet Too Big and
+    /// for the other errors each. `interval_ms` is at least 1.
+    pub fn set_error_limit(&mut self, burst: u32, interval_ms: u64) {
+        for limiter in [&mut self.limiter, &mut self.too_big_limiter] {
+            limiter.burst = burst;
+            limiter.interval_ms = interval_ms.max(1);
+            limiter.tokens = limiter.tokens.min(burst);
+        }
+    }
+
     /// The time the error limiter counts by; call before each batch.
     pub fn set_clock(&mut self, now: crate::MonotonicMillis) {
         self.limiter.now = now.0;
+        self.too_big_limiter.now = now.0;
     }
 
     /// The ICMPv6 errors built since the last [`ControlQueue::clear`].
@@ -385,7 +429,12 @@ impl ControlQueue {
         ) else {
             return;
         };
-        if !self.limiter.take() {
+        let limiter = if kind == PACKET_TOO_BIG {
+            &mut self.too_big_limiter
+        } else {
+            &mut self.limiter
+        };
+        if !limiter.take() {
             return;
         }
         let slot = &mut self.errors[self.errors_len];
@@ -481,11 +530,25 @@ where
             Outcome::Drop(Ipv6LocalUnsupported)
         };
     }
+    // A unicast packet for someone else in an Ethernet multicast frame is not
+    // forwarded (every router on the link would).
+    if destination_mac[0] == 0x33 && destination_mac[1] == 0x33 {
+        return Outcome::Drop(Ipv6EthernetAddressInvalid);
+    }
     if is_link_local(destination) || is_unspecified_or_loopback(destination) {
         return Outcome::Drop(Ipv6DestinationNotForwarded);
     }
-    if is_link_local(source) || is_unspecified_or_loopback(source) {
+    if is_unspecified_or_loopback(source) {
         return Outcome::Drop(Ipv6SourceInvalid);
+    }
+    // The router's own address as the source of a packet from outside is forged.
+    if fib.is_local(source) && !snapshot.is_kernel_ingress(ingress) {
+        return Outcome::Drop(Ipv6SourceInvalid);
+    }
+    // A link-local source cannot leave its link: Destination Unreachable code 2,
+    // beyond scope of source address (RFC 4443 3.1).
+    if is_link_local(source) {
+        return Outcome::Error(Ipv6SourceInvalid, DESTINATION_UNREACHABLE, 2, 0);
     }
     let Some(route) = fib.route(destination) else {
         if silent_route_miss {
@@ -493,6 +556,16 @@ where
         }
         return Outcome::Error(RouteMiss, DESTINATION_UNREACHABLE, 0, 0);
     };
+    if route.egress == IfId::DISCARD {
+        return Outcome::Drop(crate::DropReason::RouteDiscard);
+    }
+    if route.egress == IfId::REJECT {
+        if silent_route_miss {
+            return Outcome::Drop(FirewallDefaultDenied);
+        }
+        // RFC 4443 3.1 code 6: reject route to destination.
+        return Outcome::Error(RouteMiss, DESTINATION_UNREACHABLE, 6, 0);
+    }
     let Some(egress) = snapshot.interface(route.egress) else {
         return Outcome::Drop(InterfaceMiss);
     };
@@ -513,12 +586,21 @@ where
         .neighbor(egress.id, next_hop)
         .or(session.then_some(MacAddress([0; 6])))
     else {
+        // The control side gave up resolving it: Address Unreachable (RFC 4443 3.1
+        // code 3), and no new request until it tries again.
+        if fib.unreachable.contains(&(egress.id, next_hop)) {
+            return Outcome::Error(NeighborUnresolved, DESTINATION_UNREACHABLE, 3, 0);
+        }
         trace.record(TraceEvent::Ipv6NeighborMissing {
             egress: egress.id,
             target: next_hop,
         });
         return Outcome::Drop(NeighborUnresolved);
     };
+    trace.record(TraceEvent::Ipv6Routed {
+        egress: egress.id,
+        next_hop,
+    });
     frame[0..6].copy_from_slice(&mac.0);
     frame[6..12].copy_from_slice(&egress.mac.0);
     frame[ip + 7] = hop_limit - hop;
@@ -694,6 +776,34 @@ fn icmpv6_checksum(source: [u8; 16], destination: [u8; 16], icmp: &[u8]) -> u16 
 /// Writes into `out` the Ethernet frame of an ICMPv6 error about `invoking` and returns
 /// the interface to send it out of and its length. `None` when RFC 4443 section 2.4 (e)
 /// forbids one, or there is no route, neighbor or router address to send it with.
+/// The upper-layer header of the IPv6 packet in `frame` (Ethernet): its type and
+/// where it starts, past at most eight Hop-by-Hop, Routing, Destination Options and
+/// (first-fragment) Fragment headers.
+fn upper_layer(frame: &[u8]) -> Option<(u8, usize)> {
+    let ip = ETHERNET_HEADER;
+    let mut next = *frame.get(ip + 6)?;
+    let mut at = ip + IPV6_HEADER;
+    for _ in 0..8 {
+        match next {
+            0 | 43 | 60 => {
+                let header = frame.get(at..at + 2)?;
+                next = header[0];
+                at += (usize::from(header[1]) + 1) * 8;
+            }
+            44 => {
+                let header = frame.get(at..at + 8)?;
+                if u16::from_be_bytes([header[2], header[3]]) >> 3 != 0 {
+                    return None;
+                }
+                next = header[0];
+                at += 8;
+            }
+            _ => return Some((next, at)),
+        }
+    }
+    None
+}
+
 fn build_error(
     out: &mut [u8; CONTROL_FRAME_MAX],
     invoking: &[u8],
@@ -707,8 +817,8 @@ fn build_error(
     let destination = address(invoking, ip + 24);
     // (e.1) no error about an ICMPv6 error; (e.2, e.3) none about multicast, except
     // Packet Too Big; (e.5) none to a source that is not one host.
-    let is_error =
-        invoking[ip + 6] == ICMPV6 && invoking.get(ip + IPV6_HEADER).is_some_and(|&t| t < 128);
+    let is_error = upper_layer(invoking)
+        .is_some_and(|(next, at)| next == ICMPV6 && invoking.get(at).is_some_and(|&t| t < 128));
     let multicast = is_multicast(destination) || invoking[0] & 1 != 0;
     if is_error
         || (multicast && kind != PACKET_TOO_BIG)
@@ -717,7 +827,19 @@ fn build_error(
     {
         return None;
     }
-    let (egress, mac, from) = if snapshot.is_kernel_ingress(ingress) {
+    let (egress, mac, from) = if is_link_local(source) && !snapshot.is_kernel_ingress(ingress) {
+        // Back on its link, to the sender's MAC, from the router's link-local address
+        // there.
+        let egress = snapshot.interface(ingress)?;
+        let mut mac = [0; 6];
+        mac.copy_from_slice(&invoking[6..12]);
+        let from = fib
+            .local
+            .iter()
+            .find(|l| l.interface == ingress && is_link_local(l.address))?
+            .address;
+        (egress, MacAddress(mac), from)
+    } else if snapshot.is_kernel_ingress(ingress) {
         // About the router's own packet: back through the kernel's interface, from
         // the packet's destination (every router address is the kernel's own).
         let mut mac = [0; 6];
@@ -739,7 +861,11 @@ fn build_error(
         (egress, mac, from)
     };
     let limit = ERROR_MAX.min(usize::from(egress.mtu));
-    let quoted = (invoking.len() - ip).min(limit - IPV6_HEADER - 8);
+    // The invoking packet itself: up to its Payload Length, not the frame's padding.
+    let payload_len = usize::from(u16::from_be_bytes([invoking[ip + 4], invoking[ip + 5]]));
+    let quoted = (invoking.len() - ip)
+        .min(IPV6_HEADER + payload_len)
+        .min(limit - IPV6_HEADER - 8);
     let icmp_len = 8 + quoted;
     let frame_len = ip + IPV6_HEADER + icmp_len;
     out[0..6].copy_from_slice(&mac.0);

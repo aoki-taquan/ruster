@@ -11,9 +11,19 @@
 //! - On start it reads the neighbor table the FE already holds and keeps it, so a
 //!   restart does not remove a single neighbor from forwarding.
 //!
-//! Skeleton limits: no aging or re-checking of learned neighbors (no Neighbor
-//! Unreachability Detection), no announcements or duplicate address detection of our
-//! own addresses. Router Solicitations and Advertisements are not neighd's.
+//! - Neighbors packets go to are checked again; those packets no longer go to are
+//!   forgotten (`docs/design/ce-processes.md`, "近隣がまだ使われているか"). Every
+//!   [`CHECK_MS`] neighd reads the FE's "used" marks (the punt socket's
+//!   `NEIGHBOR_USED`). A used neighbor not confirmed for [`REACHABLE_MS`] is probed
+//!   with three requests sent to it alone, one second apart, and forgotten when it
+//!   does not answer; one not used for [`UNUSED_MS`] is forgotten.
+//!
+//! Skeleton limits: no announcements or duplicate address detection of our own
+//! addresses (RFC 4862 section 5.4). Router Solicitations and Advertisements are not
+//! neighd's. No multicast group membership or MLD reports for the solicited-node
+//! groups (RFC 4861 section 7.2.1): multicast is not built for now (2026-11-08
+//! owner decision), so a switch that snoops MLD may not pass solicitations to the
+//! router.
 //!
 //! # Standards
 //!
@@ -25,16 +35,26 @@
 //! - RFC 4861 section 7.2.3: a Neighbor Solicitation's Source Link-Layer Address is
 //!   recorded, and one for our address is answered with a solicited Advertisement
 //!   (to all nodes, unsolicited, when the asker is doing duplicate address detection).
+//!   A solicitation for another node's address is discarded, not learned from.
 //!   Section 7.2.5: an Advertisement updates a neighbor neighd is resolving or knows.
 //!   Section 7.2.2: three solicitations one second apart (MAX_MULTICAST_SOLICIT,
-//!   RETRANS_TIMER) to the target's solicited-node group. Message checks in `nd.rs`.
+//!   RETRANS_TIMER) to the target's solicited-node group; one that does not answer
+//!   is written to the FE with an all-zero MAC address for [`FAILED_MS`], so that
+//!   its datagrams get Host Unreachable or Address Unreachable (RFC 1812 5.2.7.1,
+//!   RFC 4443 3.1), then may be asked for again. Message checks in `nd.rs`.
+//!
+//! - RFC 1122 section 2.3.2.1 and RFC 4861 section 7.3: learned neighbors time out;
+//!   one still in use is confirmed by a unicast request (ARP's "unicast poll", ND's
+//!   PROBE) and removed when it does not answer.
 //!
 //! Deviations from RFC 826: a sender that targets us is added only if it is a host on
 //! that interface's subnet, and at most 4096 neighbors are kept. A packet waiting for a
 //! next hop is dropped, not queued (RFC 1122 section 2.3.2.2 says to keep at least
 //! one). Conflicts are not announced or defended (RFC 5227 section 2.4). Deviations
-//! from RFC 4861: no neighbor states (INCOMPLETE, STALE, REACHABLE...) or reachability
-//! confirmation; an Advertisement always replaces the link-layer address regardless
+//! from RFC 4861: the neighbor states are kept only as far as above (confirmed when
+//! learned or answered, probed when used and not confirmed for [`REACHABLE_MS`], a
+//! fixed time rather than a random one, with no DELAY state); upper-layer
+//! confirmation is not used; an Advertisement always replaces the link-layer address regardless
 //! of its Override flag; a solicitation's source is recorded only if it is link-local
 //! or on one of the interface's prefixes.
 
@@ -65,6 +85,15 @@ const ARP_ETHERNET_IPV4: [u8; 6] = [0, 1, 8, 0, 6, 4];
 const KNOWN_MAX: usize = 4_096;
 /// How long to wait for the FE's neighbor table before going on without it.
 const ADOPT_TIMEOUT_MS: u64 = 1_000;
+/// How often the FE's "used" marks are read.
+pub const CHECK_MS: u64 = 5_000;
+/// A used neighbor not confirmed for this long is probed (RFC 4861's REACHABLE_TIME).
+pub const REACHABLE_MS: u64 = 30_000;
+/// A neighbor no packet went to for this long is forgotten.
+pub const UNUSED_MS: u64 = 600_000;
+/// A next hop that did not answer is reported unreachable for this long, then may
+/// be asked for again.
+pub const FAILED_MS: u64 = 20_000;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NeighdCounters {
@@ -75,7 +104,12 @@ pub struct NeighdCounters {
     pub given_up: u64,
     pub bad_punts: u64,
     pub not_learned: u64,
-    /// Router Solicitations and Advertisements and Redirects, which are not neighd's.
+    /// Unicast requests sent to confirm a used neighbor, and neighbors forgotten (not
+    /// answering those, or not used).
+    pub probes_sent: u64,
+    pub forgotten: u64,
+    /// Router Solicitations and Advertisements and Redirects, which are not neighd's,
+    /// and Neighbor Solicitations for other nodes' addresses.
     pub not_for_neighd: u64,
 }
 
@@ -102,6 +136,20 @@ pub struct Neighd {
     punt: UnixDatagram,
     known: BTreeMap<(String, IpAddr), [u8; 6]>,
     pending: BTreeMap<(String, IpAddr), Pending>,
+    /// When each known neighbor was last confirmed (learned or answered), and last
+    /// used (a packet went to it).
+    confirmed: BTreeMap<(String, IpAddr), u64>,
+    used: BTreeMap<(String, IpAddr), u64>,
+    /// Known neighbors being probed.
+    probing: BTreeMap<(String, IpAddr), Pending>,
+    /// Next hops that did not answer, written to the FE with an all-zero MAC
+    /// address so that it answers their datagrams with Host Unreachable, and when.
+    failed: BTreeMap<(String, IpAddr), u64>,
+    next_check: u64,
+    /// When the marks were last asked for: the FE's answers say a packet went to
+    /// the neighbor by then.
+    asked_at: u64,
+    now_ms: u64,
     counters: NeighdCounters,
 }
 
@@ -141,6 +189,13 @@ impl Neighd {
             punt,
             known: BTreeMap::new(),
             pending: BTreeMap::new(),
+            confirmed: BTreeMap::new(),
+            used: BTreeMap::new(),
+            probing: BTreeMap::new(),
+            failed: BTreeMap::new(),
+            next_check: 0,
+            asked_at: 0,
+            now_ms: 0,
             counters: NeighdCounters::default(),
         })
     }
@@ -332,7 +387,13 @@ impl Neighd {
                                 Some(Value::Neighbor { mac }),
                             ) = (change.key, change.value)
                             {
-                                self.known.insert((interface, address), mac);
+                                let key = (interface, address);
+                                if mac == [0; 6] {
+                                    self.failed.insert(key, now_ms);
+                                    continue;
+                                }
+                                self.confirmed.insert(key.clone(), now_ms);
+                                self.known.insert(key, mac);
                                 self.counters.adopted += 1;
                             }
                         }
@@ -364,7 +425,10 @@ impl Neighd {
 
     fn resolve(&mut self, interface: String, address: IpAddr, now_ms: u64) {
         let key = (interface, address);
-        if self.known.contains_key(&key) || self.pending.contains_key(&key) {
+        if self.known.contains_key(&key)
+            || self.pending.contains_key(&key)
+            || self.failed.contains_key(&key)
+        {
             return;
         }
         self.pending.insert(
@@ -389,6 +453,15 @@ impl Neighd {
             if attempts >= ATTEMPTS {
                 self.pending.remove(&key);
                 self.counters.given_up += 1;
+                // The FE answers its datagrams with Host Unreachable for a while.
+                let _ = self.fe.patch(&[Change::set(
+                    Key::Neighbor {
+                        interface: key.0.clone(),
+                        address: key.1,
+                    },
+                    Value::Neighbor { mac: [0; 6] },
+                )]);
+                self.failed.insert(key, now_ms);
                 continue;
             }
             let (interface, target) = &key;
@@ -418,6 +491,130 @@ impl Neighd {
         }
     }
 
+    fn confirm(&mut self, key: &(String, IpAddr)) {
+        self.confirmed.insert(key.clone(), self.now_ms);
+        self.probing.remove(key);
+    }
+
+    /// Removes a known neighbor, here and in the FE.
+    fn forget(&mut self, key: &(String, IpAddr)) {
+        self.known.remove(key);
+        self.confirmed.remove(key);
+        self.used.remove(key);
+        self.probing.remove(key);
+        let _ = self.fe.patch(&[Change::delete(Key::Neighbor {
+            interface: key.0.clone(),
+            address: key.1,
+        })]);
+        self.counters.forgotten += 1;
+    }
+
+    /// Reads the FE's "used" marks every [`CHECK_MS`], probes the used neighbors that
+    /// are not confirmed, forgets those not used and those not answering.
+    fn check(&mut self, now_ms: u64) -> Progress {
+        let mut busy = false;
+        if now_ms >= self.next_check
+            && !self.known.is_empty()
+            && matches!(self.fe_state, FeState::Running { .. })
+        {
+            self.next_check = now_ms + CHECK_MS;
+            self.asked_at = now_ms;
+            self.send("-", punt::reason::NEIGHBOR_USED, &[]);
+            let keys: Vec<_> = self.known.keys().cloned().collect();
+            for key in keys {
+                let confirmed = self.confirmed.get(&key).copied().unwrap_or(now_ms);
+                let used = self.used.get(&key).copied();
+                let last = used.map_or(confirmed, |used| used.max(confirmed));
+                if now_ms.saturating_sub(last) >= UNUSED_MS {
+                    self.forget(&key);
+                    busy = true;
+                } else if used.is_some_and(|used| used > confirmed)
+                    && now_ms.saturating_sub(confirmed) >= REACHABLE_MS
+                    && !self.probing.contains_key(&key)
+                {
+                    self.probing.insert(
+                        key,
+                        Pending {
+                            attempts: 0,
+                            next_at: now_ms,
+                        },
+                    );
+                }
+            }
+        }
+        // Unreachable next hops may be asked for again after a while.
+        let expired: Vec<_> = self
+            .failed
+            .iter()
+            .filter(|(_, at)| now_ms.saturating_sub(**at) >= FAILED_MS)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in expired {
+            busy = true;
+            self.failed.remove(&key);
+            if !self.known.contains_key(&key) {
+                let _ = self.fe.patch(&[Change::delete(Key::Neighbor {
+                    interface: key.0.clone(),
+                    address: key.1,
+                })]);
+            }
+        }
+        let due: Vec<_> = self
+            .probing
+            .iter()
+            .filter(|(_, p)| p.next_at <= now_ms)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            busy = true;
+            if self.probing[&key].attempts >= ATTEMPTS {
+                self.forget(&key);
+                continue;
+            }
+            let (interface, target) = &key;
+            let neighbor = self.known[&key];
+            let probe = match (self.local_mac(interface), *target) {
+                (Some(mac), IpAddr::V4(target)) => {
+                    self.local_address(interface, target).map(|source| {
+                        let frame = arp_frame(1, mac, source, neighbor, [0; 6], target);
+                        (punt::reason::ARP, frame.to_vec())
+                    })
+                }
+                (Some(mac), IpAddr::V6(target)) => {
+                    self.local_address_v6(interface, target).map(|source| {
+                        (
+                            punt::reason::ND,
+                            nd::solicitation_to(mac, source, target, neighbor),
+                        )
+                    })
+                }
+                (None, _) => None,
+            };
+            if let Some((reason, frame)) = probe {
+                let interface = interface.clone();
+                self.send(&interface, reason, &frame);
+                self.counters.probes_sent += 1;
+            }
+            let probing = self.probing.get_mut(&key).expect("still probing");
+            probing.attempts += 1;
+            probing.next_at = now_ms + RETRY_MS;
+        }
+        let wake = self.probing.values().map(|p| p.next_at).min();
+        let check_at = (!self.known.is_empty()).then_some(self.next_check);
+        let unfail_at = self.failed.values().map(|at| at + FAILED_MS).min();
+        let wake = match (wake, unfail_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        Progress {
+            busy,
+            wake_at: match (wake, check_at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            },
+        }
+    }
+
     fn receive_punts(&mut self) -> bool {
         let mut buf = [0_u8; 2_048];
         let mut busy = false;
@@ -437,6 +634,25 @@ impl Neighd {
                 {
                     let interface = punt.interface.to_owned();
                     self.arp(&interface, punt.frame);
+                }
+                Ok(punt)
+                    if punt.direction == Direction::ToControl
+                        && punt.reason == punt::reason::NEIGHBOR_USED =>
+                {
+                    let address = match punt.frame.len() {
+                        4 => <[u8; 4]>::try_from(punt.frame).ok().map(IpAddr::from),
+                        16 => <[u8; 16]>::try_from(punt.frame).ok().map(IpAddr::from),
+                        _ => None,
+                    };
+                    match address {
+                        Some(address) => {
+                            let key = (punt.interface.to_owned(), address);
+                            if self.known.contains_key(&key) {
+                                self.used.insert(key, self.asked_at);
+                            }
+                        }
+                        None => self.counters.bad_punts += 1,
+                    }
                 }
                 Ok(punt)
                     if punt.direction == Direction::ToControl
@@ -477,8 +693,12 @@ impl Neighd {
         if !known && for_us && !addable {
             self.counters.not_learned += 1;
         }
+        if self.known.contains_key(&key) {
+            self.confirm(&key);
+        }
         if (known || addable) && self.known.get(&key) != Some(&sender_mac) {
             self.known.insert(key.clone(), sender_mac);
+            self.confirm(&key);
             self.pending.remove(&key);
             let _ = self.fe.patch(&[Change::set(
                 Key::Neighbor {
@@ -502,6 +722,8 @@ impl Neighd {
     /// Records `mac` for a neighbor and writes it to the FE if it changed.
     fn learn(&mut self, key: (String, IpAddr), mac: [u8; 6]) {
         self.pending.remove(&key);
+        self.failed.remove(&key);
+        self.confirm(&key);
         if self.known.get(&key) == Some(&mac) {
             return;
         }
@@ -532,6 +754,12 @@ impl Neighd {
                     self.counters.not_learned += 1;
                     return;
                 }
+                // One for another node's address is not ours to learn from or answer
+                // (RFC 4861 7.2.3: silently discarded).
+                if !self.is_local(interface, target) {
+                    self.counters.not_for_neighd += 1;
+                    return;
+                }
                 if let Some(link_layer) = source_link_layer {
                     if !message.source.is_unspecified()
                         && self.on_link_v6(interface, message.source)
@@ -543,9 +771,6 @@ impl Neighd {
                             self.counters.not_learned += 1;
                         }
                     }
-                }
-                if !self.is_local(interface, target) {
-                    return;
                 }
                 let to = if message.source.is_unspecified() {
                     None
@@ -562,6 +787,7 @@ impl Neighd {
             nd::Kind::Advertisement {
                 target,
                 target_link_layer,
+                solicited,
                 ..
             } => {
                 if self.is_local(interface, target) {
@@ -570,6 +796,10 @@ impl Neighd {
                     return;
                 }
                 let key = (interface.to_owned(), IpAddr::V6(target));
+                // A solicited Advertisement confirms reachability (RFC 4861 7.3.3).
+                if solicited && self.known.contains_key(&key) {
+                    self.confirm(&key);
+                }
                 let wanted = self.pending.contains_key(&key) || self.known.contains_key(&key);
                 match target_link_layer {
                     Some(link_layer) if wanted => self.learn(key, link_layer),
@@ -605,13 +835,16 @@ impl Task for Neighd {
                 self.start_running();
             }
         }
+        self.now_ms = now_ms;
         let punts = self.receive_punts();
         let timers = self.retry(now_ms);
+        let checks = self.check(now_ms);
         let (flushed, late) = self.fe.poll();
         self.handle_fe(late, now_ms);
         local
             .and(fe)
             .and(timers)
+            .and(checks)
             .and(flushed)
             .and(Progress::busy(had_events || punts))
     }

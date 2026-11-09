@@ -37,6 +37,12 @@ pub mod reason {
     /// IPv6 Neighbor Discovery (ICMPv6 types 133 to 137): a whole Ethernet frame in
     /// both directions.
     pub const ND: u16 = 2;
+    /// The neighbors packets went to (`docs/design/ce-processes.md`, "近隣がまだ使われて
+    /// いるか"). `FromControl`, with no frame and any interface name: the neighbor
+    /// process asks for them. `ToControl`: one neighbor used since the last ask, the
+    /// frame being its address (4 or 16 bytes) on the named interface; the FE then
+    /// clears its marks.
+    pub const NEIGHBOR_USED: u16 = 3;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

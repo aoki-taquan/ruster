@@ -8,25 +8,37 @@
 //! decision, so a denied datagram is dropped without any ICMP error: no
 //! Echo Reply, Port or Protocol Unreachable, or Parameter Problem.
 //!
-//! The policy is stateless on purpose. The router originates no TCP or UDP
-//! session and no ICMP query, so nothing addressed to it is a reply to
-//! traffic it started; the ICMP errors it originates are never answered
-//! (RFC 1122 §3.2.2), and replies to NAT traffic go to the NAT path, which
-//! the forward firewall judges with its flow state. A flow table would
-//! therefore hold nothing a rule could not say, and costs storage.
+//! The policy is stateless. The FE gives it no rules: traffic to the router
+//! goes on to its kernel through the kernel's interface, where the forward
+//! firewall judges it, and the sessions the kernel starts (BGP, SSH, DNS) and
+//! their replies, with its flow state. Replies to NAT traffic go to the NAT
+//! path.
 //!
 //! The rules reuse the forward rule language: the rule id, interface,
 //! prefix, and port range types and their matchers. Selectors are the
 //! ingress interface, source and destination prefixes, the IPv4 protocol,
 //! and, for ICMP, the message type, or, for TCP and UDP, the destination
 //! port. The default action is [`InputFirewallAction::Accept`], which is
-//! the RFC behavior and the behavior without the table.
+//! the behavior without the table.
 //!
 //! A datagram whose transport header cannot be read (a fragment that is
 //! not the first, or a datagram the link truncated) has no transport
 //! selectors. A rule that needs one then matches only if it denies: an
 //! `accept` rule for ICMP Echo never admits a datagram whose type is
 //! unknown, and a `deny` rule for some port refuses it (fail closed).
+//!
+//! # Standards
+//!
+//! No standard defines the rules or their language.
+//!
+//! - RFC 1122 section 3.2.2: no ICMP message is sent about an ICMP error, so
+//!   no state is needed to admit an answer to an error the router sent.
+//! - RFC 1812 section 4.3.3.6: with the default (accept), Echo Requests are
+//!   answered as without the table.
+//!
+//! Deviations: a denied datagram is dropped without Destination Unreachable
+//! code 13 (RFC 1812 section 5.2.7.1), even when the operator turns code 13
+//! on; that switch is used only by the forward firewall.
 
 use super::{FirewallInterface, FirewallIpv4Prefix, FirewallPortRange, FirewallRuleId};
 use crate::{IfId, Ipv4Address};

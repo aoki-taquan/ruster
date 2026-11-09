@@ -1,5 +1,5 @@
-//! NAT44 translation of ICMPv4 errors that arrive from the inside realm
-//! (RFC 5508 §4.2 REQ-5 and §5 REQ-7).
+//! NAT44 translation of ICMPv4 errors that arrive from the inside realm, and
+//! of hairpinned errors (REQ-5 and REQ-7, see # Standards).
 //!
 //! **REQ-5.** An inside host X (or an inside router on the path to X)
 //! reports an error about an inbound packet `R:r -> X:x` that the NAT
@@ -40,16 +40,36 @@
 //!   inbound packet `R:r -> X:x` (ingress outside, egress inside). For
 //!   REQ-7, both the inbound half `P:x1' -> X2:x2` and the outbound half
 //!   `X1:x1 -> P:x2'` must match. No rule is scanned.
+//!
+//! # Standards
+//!
+//! - RFC 5508 section 4.2.2 (REQ-5): the quoted packet is reverted, type and
+//!   code are kept, and the outer source becomes the public address (REQ-5 c
+//!   for NAPT). The quote is checked as RFC 5508 section 4.1 (REQ-3) asks,
+//!   before this module (`parse_nat44_icmpv4_error`).
+//! - RFC 5508 section 5 (REQ-7, REQ-7 a): hairpinned errors are translated and
+//!   sent to the sender of the quoted packet.
+//! - RFC 5508 section 4.3 (REQ-6): no NAT state is refreshed or deleted.
+//!
+//! Deviations, as the local policy REQ-5 allows: an error is translated only
+//! from the quoted host or the router's next hop toward it, and Port
+//! Unreachable, Protocol Unreachable and Time Exceeded code 1 only from the
+//! quoted host; with a bound firewall the quoted flow must also be live in it.
+//! An error quoting an ICMP query is not hairpinned, since no hairpinned query
+//! session exists. An error with IPv4 options in its outer header, or a
+//! fragment of one, is dropped.
 
 use super::*;
 
 /// Whether an inside-ingress ICMPv4 message is a REQ-5/REQ-7 candidate: a
-/// supported error from the inside interface of a protocol whose policy
+/// supported error from the inside interface (or, from one of the router's own
+/// addresses that route to the inside, the kernel's interface) of a protocol whose policy
 /// translates inside errors, addressed to the public address (hairpin) or
 /// routed toward the outside.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn is_nat44_icmpv4_inside_candidate(
     frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
     ingress: IfId,
     ipv4: packet::ValidatedIpv4,
     local: bool,
@@ -69,7 +89,7 @@ pub(super) fn is_nat44_icmpv4_inside_candidate(
     }
     let enabled = |policy: Nat44Icmpv4ErrorPolicy, inside: IfId, outside: IfId, public| {
         policy.translates_internal()
-            && ingress == inside
+            && nat_inside(snapshot, ingress, ipv4.source, inside)
             && (ipv4.destination == public
                 || selected_route.is_some_and(|route| route.egress() == outside))
     };
@@ -146,8 +166,10 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
 ) -> Result<PacketDecision, DropReason> {
     let quote = parse_nat44_icmpv4_error(frame, outer)
         .map_err(|reason| trace_nat44_icmpv4_drop(ingress, reason, trace))?;
+    // A router address as the sender is forged, unless the router itself sent it
+    // (from the kernel's interface).
     if !icmp_error_source_is_host(snapshot, outer.source)
-        || quoted_remote_is_local(snapshot, outer.source)
+        || (quoted_remote_is_local(snapshot, outer.source) && !snapshot.is_kernel_ingress(ingress))
     {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4SourceForbidden, trace);
     }
@@ -189,9 +211,16 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     if combined_realm_mismatch {
         return nat44_icmpv4_drop(ingress, Nat44CombinedRealmMismatch, trace);
     }
-    if ingress != owner.inside {
+    // From the inside, or from the router itself (from one of its own addresses)
+    // about its own translated flow.
+    let kernel = snapshot.is_kernel_ingress(ingress);
+    if !nat_inside(snapshot, ingress, outer.source, owner.inside)
+        || (kernel && !snapshot.is_local_ipv4(outer.source))
+    {
         return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
     }
+    // The interface the flow's inside end is on: the inside, or the kernel's.
+    let inside_end = ingress;
     // Local strict uRPF: the reporting host is reached through the inside.
     if snapshot
         .route_lookup(outer.source)
@@ -201,6 +230,11 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     }
 
     let hairpin = outer.destination == owner.public_address;
+    // The router's own packets are never hairpinned (a router address is no
+    // hairpin sender), so no error of its is about one.
+    if hairpin && kernel {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4WrongIngress, trace);
+    }
     let egress_route = if hairpin {
         if !owner.hairpinning {
             return nat44_icmpv4_drop(ingress, owner.hairpin_disabled, trace);
@@ -224,8 +258,8 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
     };
 
     // Source authority: the quoted internal destination itself, or the
-    // router's inside next hop toward it. Protocol and Port Unreachable come
-    // only from the host itself.
+    // router's inside next hop toward it. Protocol and Port Unreachable, and
+    // reassembly Time Exceeded, come only from the host itself.
     let internal = quote.destination_address;
     let on_path = outer.source == internal
         || (!nat44_icmpv4_error_end_host_only(quote.icmp_type, quote.icmp_code)
@@ -354,7 +388,7 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
         // ingress outside, egress inside.
         let received = FirewallPacket {
             ingress: owner.outside,
-            egress: owner.inside,
+            egress: inside_end,
             source: quote.source_address.into(),
             destination: internal.into(),
             protocol,

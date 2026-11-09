@@ -1,5 +1,4 @@
-//! RFC 5382 REQ-4: delayed ICMP Port Unreachable for unsolicited inbound
-//! TCP SYNs.
+//! Delayed ICMP Port Unreachable for unsolicited inbound TCP SYNs.
 //!
 //! The packet path drops every unsolicited inbound initial SYN (no live
 //! mapping for its public port, or a filtering refusal) silently, as before,
@@ -14,15 +13,31 @@
 //!
 //! When a firewall is bound, a SYN is held, and a matured hold answered,
 //! only if the firewall would admit the SYN as a new connection to every
-//! inside destination (`FirewallRuntime::permits_unsolicited_syn`): RFC 5382
-//! REQ-4 a forbids a response that the security policy would not allow.
+//! inside destination (`FirewallRuntime::permits_unsolicited_syn`).
+//!
+//! # Standards
+//!
+//! - RFC 5382 section 4.3 (REQ-4): an unsolicited inbound SYN is not answered
+//!   for at least 6 seconds; one whose connection an outbound SYN opened in
+//!   the meantime is dropped silently; otherwise Port Unreachable is sent.
+//!   REQ-4 a: no answer that the firewall would not allow.
+//! - RFC 1812 section 4.3.2.7: no answer about a SYN whose source is not a
+//!   host, as for every error the router sends; and RFC 1812 section 4.3.2.8:
+//!   the Port Unreachable limiter applies.
+//!
+//! Deviations: when holds are off (`with_unsolicited_syn_icmp(false)`), the
+//! runtime has no hold storage, or the hold table is full, the SYN is only
+//! dropped, with no Port Unreachable later (REQ-4's SHOULD). A SYN whose
+//! source is not routed back out of the outside interface is not answered
+//! either. The answer leaves at the first tick after the 6 seconds (and a
+//! small clock margin), and a retransmitted SYN restarts the wait.
 
 use super::*;
 use crate::firewall::FirewallUnsolicitedSynPacket;
 use crate::nat44_syn_hold::unsolicited_syn_deadline_ms;
 
-/// What happened to one unsolicited inbound SYN or one matured hold
-/// (RFC 5382 REQ-4). Cancellation by a translated outbound SYN is counted in
+/// What happened to one unsolicited inbound SYN or one matured hold.
+/// Cancellation by a translated outbound SYN is counted in
 /// [`crate::Nat44TcpCounters::unsolicited_syn_cancelled`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
@@ -43,7 +58,7 @@ pub enum Nat44TcpUnsolicitedSynDisposition {
     Superseded { public_port: u16 },
     /// The bound firewall would not admit the SYN as a new connection to
     /// every inside destination: the SYN was not held, or the matured hold
-    /// was dropped silently (RFC 5382 REQ-4 a).
+    /// was dropped silently.
     FirewallDenied { public_port: u16 },
     /// A matured hold was answered with a queued ICMP Port Unreachable.
     IcmpQueued { public_port: u16, egress: IfId },
@@ -62,7 +77,7 @@ pub struct Nat44TcpUnsolicitedSynDispatchReport {
     pub matured: usize,
     pub superseded: usize,
     /// Matured holds dropped silently because the bound firewall would not
-    /// admit the SYN (RFC 5382 REQ-4 a).
+    /// admit the SYN.
     pub firewall_denied: usize,
     pub queued: usize,
     pub suppressed: usize,
@@ -104,7 +119,7 @@ pub(super) fn hold_unsolicited_syn<T: TraceSink>(
     if !runtime.holds_unsolicited_syns() {
         return;
     }
-    // RFC 1812 §4.3.2.7 suppression, as for every generated error, plus a
+    // The same suppression as for every generated error, plus a
     // reverse-path check: the remote must be routed back out of the outside
     // interface, so a spoofed inside or unrouted source never turns the
     // hold into an ICMP toward the inside realm or nowhere.
@@ -216,7 +231,7 @@ fn remote_routes_outside(
 /// [`crate::NAT44_TCP_UNSOLICITED_SYN_CLOCK_MARGIN_MS`]) has passed at `now`, oldest
 /// first. Each matured hold is removed and yields at most one ICMP
 /// Destination Unreachable, Port Unreachable (Type 3, Code 3) quoting the
-/// held SYN (RFC 5382 REQ-4), queued through `icmpv4_errors` and its Port
+/// held SYN, queued through `icmpv4_errors` and its Port
 /// Unreachable limiter class. It is dropped silently instead when the NAT
 /// would now admit a retransmission of the SYN (an outbound SYN for the
 /// connection was translated, or the filtering now admits the remote), when

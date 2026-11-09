@@ -54,6 +54,13 @@ link() { # host-ns router-dev router-mac host-ip/len gateway
 nsx "$router" sysctl -qw net.ipv4.ip_forward=0
 link "$lan" r-lan 02:00:00:00:00:01 192.0.2.10/24 default
 link "$wan" r-wan 02:00:00:00:00:02 198.51.100.10/24 192.0.2.0/24
+# The ports sit in a VRF with no addresses; the router's kernel has its addresses
+# on the TUN device confd makes.
+nsx "$router" ip link set lo up
+nsx "$router" ip link add vrf-ports type vrf table 999
+nsx "$router" ip link set vrf-ports up
+nsx "$router" ip link set r-lan master vrf-ports
+nsx "$router" ip link set r-wan master vrf-ports
 
 cat > "$work/router.toml" <<'TOML'
 [[interface]]
@@ -80,6 +87,17 @@ ingress = "r-lan"
 action = "accept"
 protocol = "tcp"
 ingress = "r-lan"
+
+# The router's own pings and TCP, as a LAN host's.
+[[firewall]]
+action = "accept"
+protocol = "icmp"
+ingress = "rt-default"
+
+[[firewall]]
+action = "accept"
+protocol = "tcp"
+ingress = "rt-default"
 TOML
 
 run_dir="$work/run"
@@ -92,7 +110,7 @@ start() {
 start ruster-fe --backend "$backend" r-lan r-wan
 start ruster-ribd
 start ruster-neighd
-start ruster-confd "$work/router.toml"
+start ruster-confd --kernel "$work/router.toml"
 
 ok=0
 for _ in $(seq 1 20); do
@@ -100,6 +118,14 @@ for _ in $(seq 1 20); do
 done
 (( ok == 1 )) || fail "the LAN does not reach the WAN host"
 echo "ok: the LAN pings the WAN host"
+
+# The router itself reaches a host on the WAN's subnet through NAT, as a LAN host
+# does (from its inside address), with fragments too.
+for size in 56 3000; do
+  nsx "$router" ping -c 1 -W 2 -s "$size" 198.51.100.10 >/dev/null 2>&1 ||
+    fail "the router pings the WAN host ($size bytes)"
+done
+echo "ok: the router pings the WAN host, fragmented too"
 
 # The WAN host sees the router's address and a port of the range.
 nsx "$wan" python3 -c '
@@ -119,6 +145,25 @@ read -r address port <<<"$seen"
 [[ "$address" == 198.51.100.1 ]] || fail "the WAN host saw $address"
 (( port >= 20000 && port <= 20999 )) || fail "the WAN host saw port $port"
 echo "ok: TCP from the LAN arrives from $address port $port"
+
+# The router itself, too, is translated to its address and a port of the range.
+nsx "$wan" python3 -c '
+import socket
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("198.51.100.10", 8081)); s.listen(1); s.settimeout(10)
+c, peer = s.accept(); c.sendall(b"%s %d\n" % (peer[0].encode(), peer[1])); c.close()
+' >"$work/peer-router.txt" 2>"$work/server-router.log" &
+pids+=("$!")
+listening "$wan" t 8081
+seen=$(nsx "$router" python3 -c '
+import socket
+s = socket.create_connection(("198.51.100.10", 8081), timeout=5)
+print(s.recv(100).decode().strip())
+') || fail "TCP from the router"
+read -r address port <<<"$seen"
+[[ "$address" == 198.51.100.1 ]] || fail "the WAN host saw the router as $address"
+(( port >= 20000 && port <= 20999 )) || fail "the WAN host saw the router's port $port"
+echo "ok: TCP from the router arrives from $address port $port"
 
 if nsx "$wan" ping -c 2 -i 0.2 -W 1 192.0.2.10 >/dev/null 2>&1; then
   fail "the WAN host pings into the LAN"

@@ -1,9 +1,9 @@
-//! NAT44 hairpinning (RFC 4787 §6 REQ-9, REQ-9 a; RFC 5382 §7.2 REQ-8).
+//! NAT44 hairpinning of UDP and TCP.
 //!
 //! An inside host X1:x1 that addresses the public address and port P:x2' of
 //! a live mapping of inside host X2:x2 (X2 may be X1) is translated back into
 //! the inside realm as P:x1' -> X2:x2, where P:x1' is X1's own external
-//! mapping ("External source IP address and port", REQ-9 a).
+//! mapping.
 //!
 //! The packet is treated as two NAT traversals, each committed atomically:
 //!
@@ -24,10 +24,23 @@
 //!
 //! If the inbound half is refused, the outbound half stays committed, as for
 //! an outbound packet the remote NAT drops, which is what hole punching
-//! between two hosts behind the same NAT relies on (RFC 5128 §3.3.2 for UDP,
-//! §3.4 for TCP simultaneous open).
+//! between two hosts behind the same NAT relies on.
 //! Hairpinning disabled, malformed packets, an unknown destination mapping,
 //! and any failure of the outbound half commit nothing.
+//!
+//! # Standards
+//!
+//! - RFC 4787 section 6 (REQ-9, REQ-9 a) for UDP and RFC 5382 section 7.2
+//!   (REQ-8) for TCP: hairpinning is supported, with the "External source IP
+//!   address and port" behavior.
+//! - RFC 5128 section 3.3.2 (UDP hole punching behind the same NAT) and
+//!   section 3.4 (TCP hole punching): the outbound half stays when the inbound
+//!   half is refused.
+//! - ICMP queries are not hairpinned (see `nat44_icmp_query`); hairpinned ICMP
+//!   errors are translated in `nat44_icmpv4_inside`.
+//!
+//! Deviations: hairpinning can be turned off (`with_hairpinning(false)`; it is
+//! on by default), and then such packets are dropped.
 
 use super::*;
 
@@ -66,7 +79,7 @@ fn address_words(address: crate::Ipv4Address) -> [u16; 2] {
     ]
 }
 
-/// RFC 1624 update of a checksum over both IPv4 addresses.
+/// Incremental update of a checksum over both IPv4 addresses.
 fn update_addresses(
     checksum: u16,
     old_source: crate::Ipv4Address,

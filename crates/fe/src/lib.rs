@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 //! The forwarding element (FE): it holds the tables and forwards packets by them.
 //!
-//! See `docs/design/fe-internals.md`. This is the skeleton: one worker, IPv4 only,
-//! one VRF (`default`), one next hop per route. The tables arrive over the table
+//! See `docs/design/fe-internals.md`. One worker, IPv4 and IPv6, VRFs, and one next
+//! hop per route (the first active one of several). The tables arrive over the table
 //! server ([`ruster_proto::session`]); every accepted change rebuilds the core's
 //! [`ValidatedForwardingOwner`] and the worker uses the new one from its next batch.
 //!
@@ -61,6 +61,8 @@ pub mod writers {
         sid::INTERFACE,
         sid::ADDRESS,
         sid::NAT,
+        sid::FIREWALL_POLICY,
+        sid::ICMP_ERRORS,
         sid::FIREWALL_RULE,
         sid::WIREGUARD,
         sid::WIREGUARD_PEER,
@@ -78,6 +80,8 @@ pub const DEFAULT_VRF: &str = ruster_proto::table::DEFAULT_VRF;
 const RX_BUDGET: usize = 64;
 /// ARP packets and resolve requests remembered per batch; more are dropped and counted.
 const EVENTS_PER_BATCH: usize = 64;
+/// Neighbors marked used at most between two reads of the marks.
+const USED_MAX: usize = 8_192;
 /// Frames read from the punt socket per step.
 const INJECT_PER_STEP: usize = 64;
 /// One resolve request per next hop per this many milliseconds.
@@ -127,6 +131,10 @@ pub struct FeCounters {
     /// fragments could not be sent.
     pub fragments_sent: u64,
     pub fragmentation_dropped: u64,
+    /// ICMP errors and fragments for an interface that is not a port (a tunnel, a
+    /// PPPoE session, a VLAN sub-interface) that could not be sent after they were
+    /// counted.
+    pub generated_dropped: u64,
     /// WireGuard packets sealed and sent, and sealed ones that could not be sent.
     pub wireguard_sent: u64,
     pub wireguard_send_dropped: u64,
@@ -145,13 +153,18 @@ pub struct Fe<B> {
     interface_names: Vec<String>,
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
+    unreachable: Vec<(IfId, ruster_core::Ipv4Address)>,
     pppoe: Vec<ruster_core::PppoeSession>,
     wireguard: wireguard::Wireguard,
     /// Each VRF's kernel interface, in the order of `vrfs`.
     kernel: Vec<IfId>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
+    /// ARP and Neighbor Discovery to the neighbor process.
     limiter: local::Limiter,
+    /// Each VRF's packets to its kernel, in the order of `vrfs`: a flood in one VRF
+    /// does not crowd out another's (BGP in another VRF, say).
+    kernel_limiters: Vec<local::Limiter>,
     /// The interfaces enabled in the current tables.
     active: Vec<IfId>,
     server: Server,
@@ -173,6 +186,8 @@ pub struct Fe<B> {
     /// together, for the next batch.
     reassembly: reassembly::Reassembly,
     reassembled: Vec<kernel::Frame>,
+    /// The neighbors packets went to since the neighbor process last read them.
+    used: std::collections::HashSet<(u16, IpAddr)>,
     fragment_tracking: ruster_core::Ipv4FragmentTracker<'static>,
     counters: FeCounters,
 }
@@ -211,6 +226,7 @@ where
             interface_names: built.interface_names,
             vlans: built.vlans,
             tunnels: built.tunnels,
+            unreachable: built.unreachable,
             pppoe: built.pppoe,
             wireguard: {
                 let mut wireguard = wireguard::Wireguard::new();
@@ -220,6 +236,7 @@ where
             kernel: built.kernel,
             local: BTreeMap::new(),
             limiter: local::Limiter::default(),
+            kernel_limiters: Vec::new(),
             active: built.active,
             server: Server::new(),
             punt: None,
@@ -233,6 +250,7 @@ where
             fragmentation: fragments::fragmentation(),
             reassembly: reassembly::Reassembly::default(),
             reassembled: Vec::new(),
+            used: std::collections::HashSet::new(),
             fragment_tracking: fragments::tracker(),
             counters: FeCounters::default(),
         }
@@ -267,6 +285,11 @@ where
     /// Requests itself and drops the rest.
     pub fn attach_local(&mut self, vrf: &str, pipe: Box<dyn LocalPipe>) {
         self.local.insert(vrf.to_owned(), pipe);
+    }
+
+    /// Stops handing VRF `vrf`'s traffic to the kernel (its device went away).
+    pub fn detach_local(&mut self, vrf: &str) {
+        self.local.remove(vrf);
     }
 
     /// The VRFs of the current tables, the default VRF first.
@@ -311,6 +334,7 @@ where
                     .with_kernel_ingress(&self.kernel)
                     .with_vlans(&self.vlans)
                     .with_tunnels(&self.tunnels)
+                    .with_unreachable_neighbors(&self.unreachable)
                     .with_pppoe(&self.pppoe)
                     .with_wireguard(&wg_views)
             })
@@ -368,7 +392,8 @@ where
         self.counters.from_kernel_dropped += from_kernel.dropped;
         for (egress, frame) in from_kernel.to_kernel {
             let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
-            let admitted = self.limiter.take(local::class(packet), now_ms);
+            let vrf = self.kernel.iter().position(|&kernel| kernel == egress);
+            let admitted = self.admit_to_kernel(vrf, packet, now_ms);
             if admitted && self.write_kernel(egress, &frame) {
                 self.counters.to_kernel += 1;
             } else {
@@ -444,10 +469,16 @@ where
             }
         }
         for (egress, frame) in caught {
-            self.send_generated(egress, &frame);
+            if !self.send_generated(egress, &frame) {
+                self.counters.generated_dropped += 1;
+            }
         }
         for arp in &trace.arp {
-            self.punt_arp(arp);
+            if self.limiter.take(local::Class::Arp, now_ms) {
+                self.punt_arp(arp);
+            } else {
+                self.counters.arp_to_control_dropped += 1;
+            }
         }
         for index in 0..self.control.errors().len() {
             let error = &self.control.errors()[index];
@@ -460,7 +491,13 @@ where
             let frame = &self.control.frames()[index];
             let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
             match kind {
-                ControlKind::Neighbor => self.punt_frame(ingress, punt::reason::ND, &bytes),
+                ControlKind::Neighbor => {
+                    if self.limiter.take(local::Class::Nd, now_ms) {
+                        self.punt_frame(ingress, punt::reason::ND, &bytes);
+                    } else {
+                        self.counters.arp_to_control_dropped += 1;
+                    }
+                }
                 ControlKind::Local => {
                     self.send_to_kernel(ingress, &bytes[ETHERNET_HEADER..], now_ms)
                 }
@@ -472,6 +509,9 @@ where
                     }
                 }
             }
+        }
+        if self.used.len() < USED_MAX {
+            self.used.extend(trace.used.drain());
         }
         for &(egress, target) in &trace.misses {
             self.resolve_request(egress, target, now_ms);
@@ -614,6 +654,17 @@ where
             let egress = interface_id(&self.interface_names, punt.interface)
                 .filter(|id| self.active.contains(id));
             match (punt.direction, punt.reason, egress) {
+                // The neighbor process reads the "used" marks, which are then cleared.
+                (Direction::FromControl, punt::reason::NEIGHBOR_USED, _) => {
+                    let used: Vec<_> = self.used.drain().collect();
+                    for (interface, address) in used {
+                        let bytes = match address {
+                            IpAddr::V4(a) => a.octets().to_vec(),
+                            IpAddr::V6(a) => a.octets().to_vec(),
+                        };
+                        self.punt_frame(IfId(interface), punt::reason::NEIGHBOR_USED, &bytes);
+                    }
+                }
                 (Direction::FromControl, reason, Some(egress))
                     if punt.frame.len() >= ETHERNET_HEADER
                         && ((reason == punt::reason::ARP
@@ -633,14 +684,26 @@ where
         busy
     }
 
+    /// Whether `packet` to the kernel of the VRF at `vrf` (in the order of `vrfs`) is
+    /// within that VRF's limit for its class.
+    fn admit_to_kernel(&mut self, vrf: Option<usize>, packet: &[u8], now_ms: u64) -> bool {
+        if self.kernel_limiters.len() != self.names.len() {
+            self.kernel_limiters
+                .resize_with(self.names.len(), local::Limiter::default);
+        }
+        vrf.and_then(|at| self.kernel_limiters.get_mut(at))
+            .is_some_and(|limiter| limiter.take(local::class(packet), now_ms))
+    }
+
     /// Writes a packet addressed to the router to its VRF's kernel pipe.
     fn send_to_kernel(&mut self, ingress: IfId, packet: &[u8], now_ms: u64) {
-        let vrf = self
+        let at = self
             .by_ingress
             .get(usize::from(ingress.0))
-            .and_then(|&at| self.names.get(usize::from(at)));
+            .map(|&at| usize::from(at));
+        let admitted = self.admit_to_kernel(at, packet, now_ms);
+        let vrf = at.and_then(|at| self.names.get(at));
         let pipe = vrf.and_then(|name| self.local.get(name));
-        let admitted = self.limiter.take(local::class(packet), now_ms);
         match pipe {
             Some(pipe) if admitted && pipe.send(packet).is_ok() => self.counters.to_kernel += 1,
             _ => self.counters.to_kernel_dropped += 1,
@@ -753,6 +816,26 @@ where
             // The tracker's entries name the old tables' egress, neighbors and
             // translations: later fragments of those datagrams are dropped.
             self.fragment_tracking.flush_with_key(fragments::key());
+            // Queued ICMP errors and staged fragments name the old tables' interfaces,
+            // whose numbers may now be another interface's: they are dropped.
+            self.fragmentation.flush();
+            while self.icmpv4_errors.discard_front() {}
+            // The ICMP error rate limits, or the defaults when none are set (core's:
+            // 100 ms for IPv4; 10 at once and one every 10 ms for IPv6).
+            let (ipv4_interval, ipv6_burst, ipv6_interval) =
+                built.icmp_errors.unwrap_or((100, 10, 10));
+            // A state lives at least as long as its interval, so any interval works.
+            let interval = u64::from(ipv4_interval);
+            if let Ok(policy) = ruster_core::Icmpv4ErrorPolicy::new(interval, interval.max(60_000))
+            {
+                self.icmpv4_errors.set_policy(policy);
+            }
+            self.control
+                .set_error_limit(ipv6_burst, u64::from(ipv6_interval));
+            // So do the tunnel packets put back together and the neighbors' "used"
+            // marks.
+            self.reassembled.clear();
+            self.used.clear();
             // As for the firewall: a NAT that cannot move stays bound to the old
             // tables, and core drops what it would have translated.
             if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {
@@ -774,10 +857,14 @@ where
             }
             self.vrfs = built.vrfs;
             self.by_ingress = built.by_ingress;
+            if self.names != built.names {
+                self.kernel_limiters.clear();
+            }
             self.names = built.names;
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;
             self.tunnels = built.tunnels;
+            self.unreachable = built.unreachable;
             self.pppoe = built.pppoe;
             self.wireguard.publish(built.wireguard);
             self.kernel = built.kernel;
@@ -849,6 +936,8 @@ impl Hook for Builder {
             &default.owner.snapshot(),
             &built.firewall,
             built.firewall_on,
+            built.firewall_filtering,
+            built.firewall_interfaces,
             self.generation,
         )?;
         let nat = built
@@ -897,6 +986,8 @@ impl ArpEvent {
 struct FeTrace {
     arp: Vec<ArpEvent>,
     misses: Vec<(IfId, IpAddr)>,
+    /// Next hops packets went to in this batch (the neighbors' "used" marks).
+    used: std::collections::HashSet<(u16, IpAddr)>,
     /// WireGuard peers (interface, index among its peers) that had a packet and no
     /// session.
     key_requests: Vec<(IfId, usize)>,
@@ -924,6 +1015,16 @@ impl TraceSink for FeTrace {
                 } else {
                     self.overflow += 1;
                 }
+            }
+            TraceEvent::Routed {
+                egress,
+                neighbor_target,
+            } => {
+                self.used
+                    .insert((egress.0, IpAddr::V4(neighbor_target.octets().into())));
+            }
+            TraceEvent::Ipv6Routed { egress, next_hop } => {
+                self.used.insert((egress.0, IpAddr::V6(next_hop.into())));
             }
             TraceEvent::NeighborMissing { egress, target } => {
                 self.miss(egress, IpAddr::V4(target.octets().into()));

@@ -1,21 +1,20 @@
-//! NAT44 ICMP query translation (RFC 5508 §3, N5).
+//! NAT44 ICMP query translation (N5).
 //!
-//! An ICMP query (Echo, RFC 792; Timestamp, RFC 792) carries no ports. RFC
-//! 5508 §3.1 identifies an ICMP query session by the Query Identifier, and a
-//! NAPT translates that identifier (REQ-1) with a mapping that SHOULD be
-//! external-host independent (REQ-1 a). The state of such a mapping is the
-//! state of an Endpoint-Independent UDP mapping with the identifier in the
-//! place of the port:
+//! An ICMP query (Echo, Timestamp) carries no ports. A query session is
+//! identified by the Query Identifier, and a NAPT translates that identifier
+//! with a mapping that does not depend on the remote host. The state of such
+//! a mapping is the state of an Endpoint-Independent UDP mapping with the
+//! identifier in the place of the port:
 //!
 //! - mapping key: inside interface, internal IPv4 address, internal
-//!   identifier (REQ-1 a: the remote host is not part of it);
+//!   identifier (the remote host is not part of it);
 //! - public identifier: unique among live mappings, preserved when free and
-//!   in the pool, otherwise selected by the keyed RFC 6056 search (N2);
+//!   in the pool, otherwise selected by the keyed port search (N2);
 //! - filter peers: the remote addresses the mapping has queried, used for
 //!   address-dependent filtering of replies and for the authority of
 //!   translated ICMP errors;
-//! - one idle timer per mapping (REQ-2: at least 60 s), refreshed only by
-//!   outbound queries.
+//! - one idle timer per mapping (at least 60 s), refreshed only by outbound
+//!   queries.
 //!
 //! [`Nat44IcmpRuntime`] therefore drives the same caller-backed mapping
 //! engine as [`Nat44UdpRuntime`] (O(1) slot lists, keyed directories, the
@@ -23,25 +22,44 @@
 //! its own fresh hash key, its own counters, and an identifier pool that is
 //! independent of the UDP and TCP port pools. Nothing is shared with the UDP
 //! runtime: the two engines never see each other's state or key.
+//!
+//! # Standards
+//!
+//! - RFC 5508 section 3.1: queries are identified by the Query Identifier,
+//!   which is translated (REQ-1) with an external-host independent mapping
+//!   (REQ-1 a).
+//! - RFC 5508 section 3.2: the idle timer is at least 60 seconds (REQ-2) and
+//!   configurable (REQ-2 a); 60 seconds by default.
+//! - RFC 5508 REQ-4 and REQ-5: [`Nat44IcmpPolicy::with_icmpv4_errors`] selects
+//!   which errors quoting a query are translated.
+//! - RFC 6056: the keyed search for a public identifier that cannot be
+//!   preserved.
+//! - RFC 6888 REQ-4 and REQ-5: per-host limits on query mappings and on the
+//!   remote addresses they hold, off by default.
+//! - RFC 7597 section 5.1: a MAP-E port set limits the identifiers too.
+//!
+//! Deviations: address-and-port-dependent filtering is refused, because a
+//! query has no remote port. Query sessions are never hairpinned (hairpinning
+//! is off in the engine).
 
 use super::*;
 
-/// RFC 5508 REQ-2: an ICMP query session timer MUST NOT expire in less than
-/// 60 seconds.
+/// Shortest ICMP query idle timeout: a query session timer must not expire
+/// in less than 60 seconds.
 pub const NAT44_ICMP_MIN_IDLE_TTL_MS: u64 = 60_000;
-/// Default ICMP query idle timeout: the RFC 5508 REQ-2 floor.
+/// Default ICMP query idle timeout: the floor.
 pub const NAT44_ICMP_DEFAULT_IDLE_TTL_MS: u64 = NAT44_ICMP_MIN_IDLE_TTL_MS;
 /// Largest configurable ICMP query idle timeout (one day, as for UDP).
 pub const NAT44_ICMP_MAX_IDLE_TTL_MS: u64 = NAT44_UDP_MAX_IDLE_TTL_MS;
 
-/// ICMP query translation policy (RFC 5508 §3).
+/// ICMP query translation policy.
 ///
 /// Filtering is [`Nat44Filtering::EndpointIndependent`] or the default
 /// [`Nat44Filtering::AddressDependent`]: a query has no remote port, so
 /// address-and-port-dependent filtering does not exist for it and is
 /// refused. Identifier preservation is the port preservation of N2 applied
 /// to the identifier. `icmpv4_errors` governs the ICMP errors that quote an
-/// ICMP query (RFC 5508 REQ-4 and REQ-5); errors that quote UDP or TCP stay
+/// ICMP query; errors that quote UDP or TCP stay
 /// governed by those protocols.
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub struct Nat44IcmpPolicy {
@@ -72,7 +90,7 @@ impl std::fmt::Debug for Nat44IcmpPolicy {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Nat44IcmpPolicyError {
-    /// Below the RFC 5508 REQ-2 floor of 60 seconds.
+    /// Below the floor of 60 seconds.
     IdleTtlTooShort,
     IdleTtlTooLong,
     /// Address-and-port-dependent filtering needs a remote port, which an
@@ -127,8 +145,7 @@ impl Nat44IcmpPolicy {
         self.filtering
     }
 
-    /// Which ICMP errors quoting an ICMP query are translated (RFC 5508
-    /// REQ-4, REQ-5). The default is [`Nat44Icmpv4ErrorPolicy::Bidirectional`].
+    /// Which ICMP errors quoting an ICMP query are translated. The default is [`Nat44Icmpv4ErrorPolicy::Bidirectional`].
     #[must_use]
     pub const fn with_icmpv4_errors(mut self, policy: Nat44Icmpv4ErrorPolicy) -> Self {
         self.icmpv4_errors = policy;
@@ -156,7 +173,7 @@ impl Nat44IcmpPolicy {
     }
 
     /// Limits the live query mappings of one internal IPv4 address (N3,
-    /// RFC 6888 REQ-4 applied to identifiers). `0` is no limit; a nonzero
+    /// applied to identifiers). `0` is no limit; a nonzero
     /// limit needs per-host storage.
     #[must_use]
     pub const fn with_mappings_per_host(mut self, limit: u16) -> Self {
@@ -170,8 +187,8 @@ impl Nat44IcmpPolicy {
     }
 
     /// Limits the filter peers (remote addresses queried) the live query
-    /// mappings of one internal IPv4 address may hold together (N6, RFC
-    /// 6888 REQ-5; [`Nat44UdpPolicy::with_peers_per_host`] applied to
+    /// mappings of one internal IPv4 address may hold together (N6;
+    /// [`Nat44UdpPolicy::with_peers_per_host`] applied to
     /// queries). `0` is no limit; a nonzero limit needs per-host storage.
     #[must_use]
     pub const fn with_peers_per_host(mut self, limit: u16) -> Self {
@@ -317,8 +334,8 @@ impl Nat44IcmpConfig {
         .map_err(icmp_config_error)
     }
 
-    /// Like [`Self::new`] with any identifier set, such as a MAP-E port set
-    /// (RFC 7597 section 5.1 uses the port set for ICMP identifiers too).
+    /// Like [`Self::new`] with any identifier set, such as a MAP-E port set,
+    /// which limits ICMP identifiers too.
     pub fn with_port_set(
         snapshot: &ForwardingSnapshot<'_>,
         inside: IfId,
@@ -566,7 +583,7 @@ impl Nat44IcmpReconcilePermit<'_, '_> {
     }
 }
 
-/// Worker-local ICMP query NAT state (RFC 5508 §3) on caller-backed storage.
+/// Worker-local ICMP query NAT state on caller-backed storage.
 ///
 /// `!Send + !Sync` like every NAT runtime. See the module documentation for
 /// how it relates to [`Nat44UdpRuntime`].
@@ -607,7 +624,7 @@ impl<'a> Nat44IcmpRuntime<'a> {
 
     /// The ID of the next non-atomic datagram this runtime translates: ICMP
     /// queries and, when bound, every translated ICMPv4 error (one protocol,
-    /// one sequence; RFC 6864 §5.3.1, NAT44-126).
+    /// one sequence; NAT44-126, see `nat44_ipv4_id`).
     pub(crate) fn next_ipv4_id(
         &mut self,
         source: [u8; 4],
@@ -781,7 +798,7 @@ impl<'a> Nat44IcmpRuntime<'a> {
     }
 
     /// Read-only authority for a quoted outbound query `public:identifier
-    /// -> remote` in an external error (RFC 5508 REQ-4): a live mapping
+    /// -> remote` in an external error (REQ-4): a live mapping
     /// whose peers include `remote`, whatever the filtering mode.
     pub(crate) fn inspect_error_quote(
         &self,
@@ -794,7 +811,7 @@ impl<'a> Nat44IcmpRuntime<'a> {
     }
 
     /// Read-only authority for a quoted inbound reply `remote ->
-    /// internal:identifier` in an inside error (RFC 5508 REQ-5). Returns
+    /// internal:identifier` in an inside error (REQ-5). Returns
     /// the public identifier.
     pub(crate) fn inspect_inbound_quote(
         &self,

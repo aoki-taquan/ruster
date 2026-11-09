@@ -1,7 +1,27 @@
+//! The IPv4 route table: interfaces, routes and neighbors as the FE holds them.
+//!
+//! # Standards
+//!
+//! - RFC 1812 section 5.2.4.3: the longest matching prefix decides.
+//! - RFC 1812 section 5.3.5.2: a prefix's network and directed-broadcast addresses
+//!   are known only for a connected prefix; through a gateway they are hosts.
+//!
+//! Deviations: a route has one next hop; of several (ECMP) the FE keeps the first
+//! active one.
+
 use crate::MacAddress;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct IfId(pub u16);
+
+impl IfId {
+    /// The egress of a discard route: what it holds is dropped silently.
+    pub const DISCARD: Self = Self(u16::MAX);
+    /// The egress of a reject route: what it holds is dropped with an ICMP or ICMPv6
+    /// Destination Unreachable, as if no route held it (RFC 1812 5.2.7.1, RFC 4443
+    /// 3.1 code 6).
+    pub const REJECT: Self = Self(u16::MAX - 1);
+}
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Ipv4Address(u32);

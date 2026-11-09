@@ -68,19 +68,25 @@ fn run() -> Result<(), String> {
     let clock = Clock::new();
     let mut synced = false;
     let mut retry = daemon::Retry::default();
+    let mut idle = daemon::Idle::new();
     loop {
         let now = clock.now_ms();
         for (listener, name) in &listeners {
             for stream in daemon::accept(listener) {
-                ribd.attach_source(name, stream)
-                    .map_err(|error| error.to_string())?;
+                // A connection that fails to set up is dropped; the source connects
+                // again.
+                if let Err(error) = ribd.attach_source(name, stream) {
+                    eprintln!("ruster-ribd: {name}: {error}");
+                }
             }
         }
         if ribd.fe_closed() && retry.due(now) {
             if let Some(stream) = daemon::try_connect(&run_dir.join(socket::FE_ROUTE)) {
-                ribd.reconnect_fe(stream)
-                    .map_err(|error| error.to_string())?;
-                eprintln!("ruster-ribd: connected to the FE again");
+                // A failure is tried again at the next turn.
+                match ribd.reconnect_fe(stream) {
+                    Ok(()) => eprintln!("ruster-ribd: connected to the FE again"),
+                    Err(error) => eprintln!("ruster-ribd: connecting to the FE: {error}"),
+                }
             }
         }
         let progress = ribd.step(now);
@@ -88,7 +94,7 @@ fn run() -> Result<(), String> {
             synced = true;
             eprintln!("ruster-ribd: routes sent to the FE");
         }
-        daemon::idle(progress);
+        idle.wait(progress);
     }
 }
 
