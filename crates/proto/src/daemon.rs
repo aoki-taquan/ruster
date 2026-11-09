@@ -142,17 +142,38 @@ pub fn bind_datagram(path: &Path) -> io::Result<UnixDatagram> {
 }
 
 /// Every connection waiting on `listener`. An error (for example too many open files)
-/// ends this round; the listener is tried again on the next one.
+/// ends this round; the listener is tried again on the next one. The error is
+/// written to standard error once, until it changes or accepting works again.
 pub fn accept(listener: &UnixListener) -> Vec<UnixStream> {
     let mut streams = Vec::new();
     loop {
         match listener.accept() {
             Ok((stream, _)) => streams.push(stream),
             Err(error) if error.kind() == ErrorKind::Interrupted => {}
-            Err(_) => return streams,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                *LAST_ACCEPT_ERROR
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+                return streams;
+            }
+            Err(error) => {
+                // Written once until it changes or an accept works again, not every
+                // round.
+                let mut last = LAST_ACCEPT_ERROR
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if *last != Some(error.kind()) {
+                    eprintln!("accepting a connection: {error}; tried again next round");
+                    *last = Some(error.kind());
+                }
+                return streams;
+            }
         }
     }
 }
+
+/// The kind of the last accept error written, so that it is written once.
+static LAST_ACCEPT_ERROR: Mutex<Option<ErrorKind>> = Mutex::new(None);
 
 /// How often a connection to a process that is not up yet is tried again.
 const RETRY: Duration = Duration::from_millis(50);
