@@ -3646,3 +3646,59 @@ fn a_leaked_flow_goes_when_the_leak_is_removed() {
         "the leaked flow is gone"
     );
 }
+
+/// A table change that raises a per-host limit keeps the NAT's flows; one that
+/// lowers it flushes them, so no host is carried over its new limit.
+#[test]
+fn raising_a_per_host_limit_keeps_flows_and_lowering_it_flushes_them() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+        ],
+    );
+    let limited = |ports| {
+        let Change {
+            key,
+            value: Some(Value::Nat(mut nat)),
+        } = nat(40_000, 40_009)
+        else {
+            unreachable!()
+        };
+        nat.ports_per_host = ports;
+        Change::set(key, Value::Nat(nat))
+    };
+    assert_eq!(bench.patch(&mut config, &[limited(4)]), Code::CHANGED);
+    let out = |bench: &mut Bench| {
+        bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+        bench.fe.step(bench.now);
+        let tx = bench.fe.io_mut().pop_tx().expect("translated");
+        u16::from_be_bytes([tx.bytes[34], tx.bytes[35]])
+    };
+    let port = out(&mut bench);
+    let reply_gets_in = |bench: &mut Bench| {
+        let mut frame = udp_reply_to_host();
+        frame[30..34].copy_from_slice(&[198, 51, 100, 2]);
+        frame[36..38].copy_from_slice(&port.to_be_bytes());
+        frame[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&frame[14..34]);
+        frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+        frame[40..42].fill(0);
+        bench.fe.io_mut().inject(IfId(1), frame);
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx().is_some()
+    };
+    assert!(reply_gets_in(&mut bench));
+
+    assert_eq!(bench.patch(&mut config, &[limited(8)]), Code::CHANGED);
+    assert!(
+        reply_gets_in(&mut bench),
+        "a higher limit keeps the mapping"
+    );
+    assert_eq!(bench.patch(&mut config, &[limited(2)]), Code::CHANGED);
+    assert!(!reply_gets_in(&mut bench), "a lower limit flushes it");
+}
