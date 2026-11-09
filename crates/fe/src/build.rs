@@ -37,7 +37,8 @@ pub(crate) struct Built {
     pub(crate) by_ingress: Vec<u16>,
     /// The enabled ports and sub-interfaces.
     pub(crate) active: Vec<IfId>,
-    /// The name of every interface by id: the ports, then the VLAN sub-interfaces.
+    /// The name of every interface by id: the ports, then the others, each keeping
+    /// its id across table changes; an empty name is an id no interface has.
     pub(crate) interface_names: Vec<String>,
     /// The VLAN sub-interfaces of enabled ports.
     pub(crate) vlans: Vec<VlanBinding>,
@@ -438,7 +439,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     names.remove(DEFAULT_VRF);
     let order: Vec<&str> = std::iter::once(DEFAULT_VRF).chain(names).collect();
     let index_of = |vrf: &str| order.iter().position(|v| *v == vrf);
-    // Each VRF's kernel interface, after every other one.
+    // Each VRF's kernel interface.
     let mut kernel = Vec::with_capacity(order.len());
     for (at, vrf) in order.iter().enumerate() {
         let id = ids.take(&format!("rt-{vrf}"))?;
