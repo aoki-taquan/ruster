@@ -3373,3 +3373,61 @@ fn the_nat_limits_the_ports_of_one_host() {
         "the first flow goes on"
     );
 }
+
+/// With a firewall, the Port Unreachable the router's kernel sends about a UDP
+/// datagram a rule let in leaves as related to that flow (RFC 6092); one about a
+/// datagram no flow saw does not.
+#[test]
+fn the_router_s_icmp_error_about_a_flow_it_received_leaves_as_related() {
+    let udp_in = rule_for(
+        1,
+        ruster_proto::table::Protocol::Udp,
+        None,
+        Some("rt-default"),
+    );
+    let (mut bench, kernel) = router_with_firewall(&[udp_in]);
+    let router = [198, 51, 100, 2];
+    let datagram = udp_packet(INTERNET, router, (40_000, 9_999));
+    bench.fe.io_mut().inject(IfId(1), from_wan(&datagram));
+    bench.fe.step(bench.now);
+    let mut buf = [0_u8; 2048];
+    let n = kernel.recv(&mut buf).expect("the rule lets it in");
+    assert_eq!(&buf[..n], &datagram[..]);
+
+    let port_unreachable = |quoted: &[u8]| {
+        let mut icmp = vec![3, 3, 0, 0, 0, 0, 0, 0];
+        icmp.extend_from_slice(&quoted[..28]);
+        let checksum = ruster_core::internet_checksum(&icmp);
+        icmp[2..4].copy_from_slice(&checksum.to_be_bytes());
+        let mut p = vec![0_u8; 20];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&((20 + icmp.len()) as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = 1;
+        p[12..16].copy_from_slice(&router);
+        p[16..20].copy_from_slice(&INTERNET);
+        p.extend_from_slice(&icmp);
+        ipv4_checksummed(p)
+    };
+    kernel.send(&port_unreachable(&datagram)).unwrap();
+    bench.fe.step(bench.now);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("related to the flow, it leaves");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!((tx.bytes[34], tx.bytes[35]), (3, 3));
+
+    // About a datagram that never came in: nothing of it is in the firewall.
+    let other = udp_packet([203, 0, 113, 99], router, (40_001, 9_999));
+    let mut stray = port_unreachable(&other);
+    stray[16..20].copy_from_slice(&[203, 0, 113, 99]);
+    let stray = ipv4_checksummed(stray);
+    kernel.send(&stray).unwrap();
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "unrelated, it is dropped"
+    );
+}
