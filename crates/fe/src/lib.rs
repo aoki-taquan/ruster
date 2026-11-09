@@ -4,7 +4,7 @@
 //! See `docs/design/fe-internals.md`. One worker, IPv4 and IPv6, VRFs, and one next
 //! hop per route (the first active one of several). The tables arrive over the table
 //! server ([`ruster_proto::session`]); every accepted change rebuilds the core's
-//! [`ValidatedForwardingOwner`] and the worker uses the new one from its next batch.
+//! [`ValidatedForwardingOwner`](ruster_core::ValidatedForwardingOwner) and the worker uses the new one from its next batch.
 //!
 //! ARP goes to the neighbor process: core hands each ARP packet over
 //! ([`ForwardingSnapshot::with_arp_to_control`](ruster_core::ForwardingSnapshot::with_arp_to_control)) and the FE sends it on the punt
