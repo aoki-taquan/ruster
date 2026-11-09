@@ -186,6 +186,9 @@ impl Peer {
             self.sent.clear();
             self.client.resync_begin();
             self.resync_open = true;
+            // Nothing is accepted since this resync-begin: resync-end waits for the
+            // next accepted full send, not for the clock.
+            self.resync_end_refused = None;
         }
     }
 }

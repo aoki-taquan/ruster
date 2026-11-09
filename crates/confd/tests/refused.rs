@@ -310,3 +310,48 @@ fn a_refused_resync_end_is_sent_again_after_a_while() {
     );
     assert_eq!(fe.store().get(&wan), None, "sent again");
 }
+
+/// A patch refused after a refused resync-end stops the timed resend: nothing is
+/// accepted since its resync-begin, so a resync-end then would delete everything
+/// confd wrote (#612's review).
+#[test]
+fn a_refused_patch_stops_the_timed_resync_end() {
+    let mut fe = Server::new();
+    let mut check = Check {
+        refuse_mtu: None,
+        keep: None,
+    };
+    let mut two = config(1500);
+    let mut wan = two.interfaces[0].clone();
+    wan.name = "wan".into();
+    wan.mac = [2, 0, 0, 0, 0, 2];
+    wan.ipv4 = None;
+    two.interfaces.push(wan);
+    let mut confd = Confd::new(two);
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    confd.connect_fe(b).unwrap();
+    settle(&mut fe, &mut confd, &mut check);
+
+    check.keep = Some("wan");
+    let mut confd = Confd::new(config(1500));
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    confd.connect_fe(b).unwrap();
+    settle(&mut fe, &mut confd, &mut check);
+    // Within the wait, a change the FE refuses.
+    check.refuse_mtu = Some(1400);
+    confd.set_config(config(1400));
+    settle(&mut fe, &mut confd, &mut check);
+    assert_eq!(mtu(&fe), Some(1500), "refused");
+
+    check.keep = None;
+    check.refuse_mtu = None;
+    for now in [1, ruster_confd::RESYNC_END_RETRY_MS + 1] {
+        for _ in 0..100 {
+            fe.step(&mut check);
+            confd.step(now);
+        }
+    }
+    assert_eq!(mtu(&fe), Some(1500), "what the FE holds stays");
+}
