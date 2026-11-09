@@ -550,6 +550,8 @@ pub enum DropReason {
     PppoeNotIp = 234,
     /// The backend cannot add or remove the PPPoE header in place.
     PppoeNoRoom = 235,
+    // 236 to 250 were WireGuard's, which is no longer part of ruster. The codes
+    // stay taken, so that no code changes meaning; nothing gives these reasons.
     /// A WireGuard packet whose outer headers are malformed, with options, or a
     /// fragment.
     WireguardOuterInvalid = 236,
@@ -1440,8 +1442,6 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) pppoe: &'a [crate::PppoeSession],
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
     pub(crate) vlans: &'a [crate::VlanBinding],
-    /// WireGuard interfaces ([`ForwardingSnapshot::with_wireguard`]).
-    pub(crate) wireguard: &'a [crate::wireguard::WireguardInterface<'a>],
     /// The time NAT, firewall and ICMP limits count by when no ARP resolution
     /// runtime gives one ([`ForwardingSnapshot::with_now`]).
     pub(crate) now: MonotonicMillis,
@@ -1651,7 +1651,6 @@ impl<'a> ForwardingSnapshot<'a> {
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
-            wireguard: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             index: None,
@@ -1888,16 +1887,6 @@ impl<'a> ForwardingSnapshot<'a> {
         Self { pppoe, ..self }
     }
 
-    /// Takes the WireGuard data messages addressed to the router out of their
-    /// outer packets, as packets arriving on the WireGuard interface (see
-    /// [`crate::wireguard::WireguardInterface`]); the peers' state is
-    /// [`Services::wireguard`]. Only the outer snapshot's interfaces count with
-    /// [`ForwardingSnapshot::with_vrfs`].
-    #[must_use]
-    pub fn with_wireguard(self, wireguard: &'a [crate::wireguard::WireguardInterface<'a>]) -> Self {
-        Self { wireguard, ..self }
-    }
-
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
     #[must_use]
     pub fn with_ipv6(self, fib: &'a crate::Ipv6Fib) -> Self {
@@ -2084,7 +2073,6 @@ impl<'a> ForwardingSnapshot<'a> {
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
-            wireguard: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             authority,
@@ -2233,14 +2221,12 @@ impl<'a> ForwardingSnapshot<'a> {
         mtu
     }
 
-    /// Whether frames out of `egress` are wrapped (a tunnel, PPPoE session or
-    /// WireGuard interface): it has no neighbors, and its Ethernet header is replaced
-    /// when the frame is wrapped.
+    /// Whether frames out of `egress` are wrapped (a tunnel or PPPoE session): it has
+    /// no neighbors, and its Ethernet header is replaced when the frame is wrapped.
     #[inline]
     pub(crate) fn wraps_frames(&self, egress: IfId) -> bool {
         crate::tunnel::of(self.tunnels, egress).is_some()
             || crate::pppoe::of(self.pppoe, egress).is_some()
-            || crate::wireguard::of(self.wireguard, egress).is_some()
     }
 
     /// For a generated IPv4 `frame` (Ethernet) to the tunnel interface `egress`:
@@ -2476,7 +2462,6 @@ impl ValidatedForwardingOwner {
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
-            wireguard: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             index: Some(&self.index),
@@ -2880,13 +2865,6 @@ pub enum TraceEvent {
     /// An IPv6 Neighbor Discovery message went to the control queue.
     Ipv6ToControl {
         ingress: IfId,
-    },
-    /// A packet for a WireGuard peer was dropped because the peer has no session (or
-    /// its counter is used up): the key exchange is due. `peer` is the peer's index
-    /// among the interface's peers.
-    WireguardNoSession {
-        interface: IfId,
-        peer: usize,
     },
     /// An IPv6 packet's next hop is not in the IPv6 neighbor table.
     Ipv6NeighborMissing {
@@ -3327,8 +3305,6 @@ where
         services.firewall_audit,
         services.fragmentation,
         services.fragment_tracking,
-        services.wireguard,
-        services.wireguard_send,
         Some(control),
         trace,
     )
@@ -3353,14 +3329,6 @@ pub struct Services<'s, 'c, 'r> {
     pub fragment_tracking: Option<&'s mut Ipv4FragmentTracker<'r>>,
     /// Records the firewall's decisions.
     pub firewall_audit: Option<&'s mut FirewallAuditBuffer<'r>>,
-    /// The state of every WireGuard peer of the snapshot's interfaces, in the
-    /// order of [`crate::wireguard::WireguardInterface::first_peer`]; without it
-    /// WireGuard messages are not opened.
-    pub wireguard: Option<&'s mut [crate::wireguard::PeerState]>,
-    /// Where packets routed to a WireGuard interface are sealed to; the caller sends
-    /// them after the batch ([`crate::wireguard::execute_one_wireguard_send`]).
-    /// Without it, they are dropped.
-    pub wireguard_send: Option<&'s mut crate::wireguard::WireguardSendRuntime<'r>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3398,8 +3366,6 @@ where
         firewall,
         firewall_audit,
         fragmentation,
-        None,
-        None,
         None,
         None,
         trace,
@@ -3442,8 +3408,6 @@ fn forward_batch_tracked<B, T>(
     mut firewall_audit: Option<&mut FirewallAuditBuffer<'_>>,
     mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
     mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
-    mut wireguard: Option<&mut [crate::wireguard::PeerState]>,
-    mut wireguard_send: Option<&mut crate::wireguard::WireguardSendRuntime<'_>>,
     mut control: Option<&mut crate::ControlQueue>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
@@ -3471,13 +3435,8 @@ where
         // A PPPoE session's frame arrives again, out of its session, on the
         // session's interface; a tunnel's IPv6 packet, unwrapped, on its tunnel
         // interface.
-        // WireGuard's data messages come out of their UDP packets the same way.
         let received = crate::pppoe::receive(&mut packet, all_vrfs)
-            .and_then(|()| crate::tunnel::receive(&mut packet, all_vrfs))
-            .and_then(|received| {
-                crate::wireguard::receive(&mut packet, all_vrfs, wireguard.as_deref_mut())
-                    .map(|()| received)
-            });
+            .and_then(|()| crate::tunnel::receive(&mut packet, all_vrfs));
         let reason = match received {
             Ok(crate::tunnel::Received::Fragment) => {
                 let ingress = packet.ingress();
@@ -4013,32 +3972,6 @@ where
                             fragments,
                             reason: ConsumeReason::Ipv4Fragmented,
                         });
-                        break 'packet;
-                    }
-                    if let Some(interface) = crate::wireguard::of(all_vrfs.wireguard, egress) {
-                        let staged = match (wireguard.as_deref_mut(), wireguard_send.as_deref_mut())
-                        {
-                            (Some(states), Some(runtime)) => crate::wireguard::stage(
-                                &mut packet,
-                                interface,
-                                all_vrfs,
-                                states,
-                                runtime,
-                                trace,
-                            ),
-                            _ => Err(DropReason::WireguardNoSession),
-                        };
-                        match staged {
-                            Ok(()) => {
-                                packet.consume(ConsumeReason::WireguardQueued);
-                                consumed += 1;
-                            }
-                            Err(reason) => {
-                                packet.recycle(reason);
-                                dropped += 1;
-                                trace.record(TraceEvent::Dropped { ingress, reason });
-                            }
-                        }
                         break 'packet;
                     }
                     let egress = match crate::tunnel::of(all_vrfs.tunnels, egress) {

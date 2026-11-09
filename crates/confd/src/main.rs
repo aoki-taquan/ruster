@@ -107,12 +107,6 @@ fn run() -> Result<(), String> {
             }
             apply_seen = now;
         }
-        for request in confd.take_key_exchange_requests() {
-            eprintln!(
-                "ruster-confd: WireGuard {} of {} needs a key exchange",
-                request.peer, request.interface
-            );
-        }
         if confd.counters().patches_refused != refused {
             refused = confd.counters().patches_refused;
             eprintln!("ruster-confd: a process refused a change ({refused} so far)");
