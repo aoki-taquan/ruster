@@ -4652,6 +4652,13 @@ impl<'a> Nat44UdpRuntime<'a> {
         self
     }
 
+    /// Turns the IPv4 ID rate limit of [`Self::with_ipv4_id_rate_limit`] on or
+    /// off (it is on once the storage is given). The last uses are kept while it
+    /// is off.
+    pub fn set_ipv4_id_rate_limited(&mut self, on: bool) {
+        self.ipv4_ids.set_rate_limited(on);
+    }
+
     #[must_use]
     pub const fn counters(&self) -> Nat44UdpCounters {
         self.counters
@@ -8696,6 +8703,13 @@ impl<'a> Nat44TcpRuntime<'a> {
     ) -> Self {
         self.ipv4_ids.limit_rate(storage);
         self
+    }
+
+    /// Turns the IPv4 ID rate limit of [`Self::with_ipv4_id_rate_limit`] on or
+    /// off (it is on once the storage is given). The last uses are kept while it
+    /// is off.
+    pub fn set_ipv4_id_rate_limited(&mut self, on: bool) {
+        self.ipv4_ids.set_rate_limited(on);
     }
 
     #[must_use]

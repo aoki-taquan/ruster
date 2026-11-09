@@ -140,8 +140,12 @@ pub(crate) struct Ipv4IdGenerator<'a> {
     outbound: [u16; IPV4_ID_BUCKETS],
     /// Every other tuple (inbound: destination rewritten to an inside host).
     inbound: [u16; IPV4_ID_BUCKETS],
-    /// With it, the rate limit (see the module doc); without it, none.
+    /// With it, the last uses are kept (see the module doc); without it, none.
     used_at: Option<&'a mut Ipv4IdRateLimitStorage>,
+    /// Whether a datagram over the rate is refused (only with `used_at`). The
+    /// last uses are kept while it is off, so turning it on keeps the IDs
+    /// unique from then on.
+    refuse: bool,
 }
 
 impl<'a> Ipv4IdGenerator<'a> {
@@ -151,6 +155,7 @@ impl<'a> Ipv4IdGenerator<'a> {
             outbound: [0; IPV4_ID_BUCKETS],
             inbound: [0; IPV4_ID_BUCKETS],
             used_at: None,
+            refuse: false,
         }
     }
 
@@ -160,6 +165,12 @@ impl<'a> Ipv4IdGenerator<'a> {
             *quarters = [0; 4];
         }
         self.used_at = Some(storage);
+        self.refuse = true;
+    }
+
+    /// Turns refusing on or off; it has an effect only with the storage.
+    pub(crate) fn set_rate_limited(&mut self, on: bool) {
+        self.refuse = on;
     }
 
     /// The ID of the next non-atomic datagram of the translated tuple;
@@ -190,9 +201,13 @@ impl<'a> Ipv4IdGenerator<'a> {
             // was last used more than the MDL ago (whole seconds, so one more).
             let quarters = &mut used_at[base + bucket];
             let quarter = usize::from(counter >> 14);
-            let now = u32::try_from(now_ms / 1_000).unwrap_or(u32::MAX - 1) + 1;
+            let now = u32::try_from(now_ms / 1_000)
+                .unwrap_or(u32::MAX)
+                .min(u32::MAX - 1)
+                + 1;
             let last = quarters[quarter];
-            if counter & 0x3fff == 0
+            if self.refuse
+                && counter & 0x3fff == 0
                 && last != 0
                 && u64::from(now.saturating_sub(last)) <= IPV4_ID_MDL_S
             {

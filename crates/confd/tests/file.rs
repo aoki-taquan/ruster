@@ -693,7 +693,15 @@ fn nat_takes_the_outside_address_and_a_port_range() {
                 last: 32_767,
             },
             filtering: ruster_proto::table::NatFiltering::EndpointIndependent,
+            ipv4_id_rate_limit: true,
         })
+    );
+    assert!(
+        !parse(&nat("ipv4-id-rate-limit = false\n"))
+            .unwrap()
+            .nat
+            .unwrap()
+            .ipv4_id_rate_limit
     );
     assert_eq!(
         parse(&nat("filtering = \"address-dependent\"\n"))

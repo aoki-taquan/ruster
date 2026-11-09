@@ -61,6 +61,8 @@ pub const NAT_PSID_LENGTH: u64 = 60067;
 pub const NAT_PSID: u64 = 60068;
 /// `ietf-nat` `policy/filtering-type` (RFC 4787 section 5).
 pub const NAT_FILTERING: u64 = 60069;
+/// Whether the IPv4 IDs of translated datagrams are rate limited (`ruster-nat`).
+pub const NAT_IPV4_ID_RATE_LIMIT: u64 = 60160;
 
 /// How the forward firewall of a VRF filters: its `filtering-type` and its outside
 /// interfaces.
@@ -174,6 +176,10 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid-len", NAT_PSID_LENGTH),
     ("/ietf-nat:nat/instances/instance/policy/port-set-restrict/port-set/psid", NAT_PSID),
     ("/ietf-nat:nat/instances/instance/policy/filtering-type", NAT_FILTERING),
+    (
+        "/ietf-nat:nat/instances/instance/ruster-nat:ipv4-id-rate-limit",
+        NAT_IPV4_ID_RATE_LIMIT,
+    ),
     ("/ruster-firewall:policy", FIREWALL_POLICY),
     ("/ruster-firewall:policy/filtering-type", FIREWALL_POLICY_FILTERING),
     ("/ruster-firewall:policy/outside-interface", FIREWALL_POLICY_OUTSIDE),

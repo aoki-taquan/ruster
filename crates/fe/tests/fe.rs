@@ -1015,6 +1015,7 @@ fn nat(first_port: u16, last_port: u16) -> Change {
                 last: last_port,
             },
             filtering: Default::default(),
+            ipv4_id_rate_limit: true,
         }),
     )
 }

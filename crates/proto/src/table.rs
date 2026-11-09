@@ -135,6 +135,11 @@ pub struct Nat {
     pub external: Option<std::net::Ipv4Addr>,
     pub ports: NatPorts,
     pub filtering: NatFiltering,
+    /// Whether the rate of translated datagrams that may be fragmented is limited
+    /// so that their IPv4 IDs do not repeat within the maximum datagram lifetime
+    /// (RFC 6864 section 5.2). Left out of the message when it is the default,
+    /// `true`.
+    pub ipv4_id_rate_limit: bool,
 }
 
 /// Which outside endpoints may reach a mapping (`ietf-nat` `filtering-type`).
@@ -745,9 +750,18 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 NatPorts::Psid { .. } => 3,
             };
             let filtering = nat.filtering != NatFiltering::default();
-            e.map(2 + ports + u64::from(nat.external.is_some()) + u64::from(filtering));
+            let no_id_limit = !nat.ipv4_id_rate_limit;
+            e.map(
+                2 + ports
+                    + u64::from(nat.external.is_some())
+                    + u64::from(filtering)
+                    + u64::from(no_id_limit),
+            );
             if filtering {
                 e.u64(d(sid::NAT_FILTERING)).text(nat.filtering.name());
+            }
+            if no_id_limit {
+                e.u64(d(sid::NAT_IPV4_ID_RATE_LIMIT)).bool(false);
             }
             e.u64(d(sid::NAT_INSIDE))
                 .text(&nat.inside)
@@ -1132,6 +1146,7 @@ impl ResolveRequest {
 enum Member {
     Text(String),
     Uint(u64),
+    Bool(bool),
     List(Vec<String>),
 }
 
@@ -1145,6 +1160,7 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         let value = match d.peek_kind()? {
             Kind::Text => Member::Text(d.text()?.to_owned()),
             Kind::Unsigned => Member::Uint(d.u64()?),
+            Kind::Bool => Member::Bool(d.bool()?),
             Kind::Array => {
                 let len = d.array()?;
                 if len > MEMBER_LIST_MAX {
@@ -1211,6 +1227,12 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             }
             None => NatFiltering::default(),
         };
+        // Left out: on, the default.
+        let ipv4_id_rate_limit = match got.remove(&sid::NAT_IPV4_ID_RATE_LIMIT) {
+            None => true,
+            Some(Member::Bool(on)) => on,
+            Some(_) => return Err(ModelError::Invalid("ipv4-id-rate-limit")),
+        };
         let range = (
             port(&mut got, sid::NAT_FIRST_PORT)?,
             port(&mut got, sid::NAT_LAST_PORT)?,
@@ -1235,6 +1257,7 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             external,
             ports,
             filtering,
+            ipv4_id_rate_limit,
         })
     } else {
         let ingress = text(sid::FIREWALL_INGRESS, "ingress")?;
