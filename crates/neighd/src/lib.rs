@@ -18,8 +18,11 @@
 //!   with three requests sent to it alone, one second apart, and forgotten when it
 //!   does not answer; one not used for [`UNUSED_MS`] is forgotten.
 //!
-//! Skeleton limits: no announcements or duplicate address detection of our own
-//! addresses (RFC 4862 section 5.4). Router Solicitations and Advertisements are not
+//! - Each of the router's IPv4 addresses is probed and announced when it appears,
+//!   and defended when another host claims it (RFC 5227).
+//!
+//! Skeleton limits: no duplicate address detection of our own IPv6 addresses (RFC
+//! 4862 section 5.4). Router Solicitations and Advertisements are not
 //! neighd's. No multicast group membership or MLD reports for the solicited-node
 //! groups (RFC 4861 section 7.2.1): multicast is not built for now (2026-11-08
 //! owner decision), so a switch that snoops MLD may not pass solicitations to the
@@ -31,7 +34,12 @@
 //!   sender when the target is us, answer requests for our addresses).
 //! - RFC 1122 section 2.3.2.1: at most one request per second per next hop.
 //! - RFC 5227 section 2.4: a packet whose sender claims our own address is not learned
-//!   or answered.
+//!   or answered. Sections 2.1 and 2.3: an address that appears (or moves to another
+//!   MAC address) is probed PROBE_NUM times, PROBE_MIN apart, and ANNOUNCE_WAIT later
+//!   announced ANNOUNCE_NUM times, ANNOUNCE_INTERVAL apart. Section 2.4 (c): the
+//!   router keeps its configured addresses and defends them, with at most one
+//!   Announcement in DEFEND_INTERVAL; such packets, and another host's probe for an
+//!   address being probed, are counted as conflicts.
 //! - RFC 4861 section 7.2.3: a Neighbor Solicitation's Source Link-Layer Address is
 //!   recorded, and one for our address is answered with a solicited Advertisement
 //!   (to all nodes, unsolicited, when the asker is doing duplicate address detection).
@@ -50,7 +58,9 @@
 //! Deviations from RFC 826: a sender that targets us is added only if it is a host on
 //! that interface's subnet, and at most 4096 neighbors are kept. A packet waiting for a
 //! next hop is dropped, not queued (RFC 1122 section 2.3.2.2 says to keep at least
-//! one). Conflicts are not announced or defended (RFC 5227 section 2.4). Deviations
+//! one). Deviations from RFC 5227: no random wait before or between the probes (the
+//! router's addresses are configured, not chosen), and a conflict found while
+//! probing is counted but the address is used anyway. Deviations
 //! from RFC 4861: the neighbor states are kept only as far as above (confirmed when
 //! learned or answered, probed when used and not confirmed for [`REACHABLE_MS`], a
 //! fixed time rather than a random one, with no DELAY state); upper-layer
@@ -95,6 +105,16 @@ pub const UNUSED_MS: u64 = 600_000;
 /// be asked for again.
 pub const FAILED_MS: u64 = 20_000;
 
+// RFC 5227 section 1.1.
+const PROBE_NUM: u32 = 3;
+/// PROBE_MIN; the random wait up to PROBE_MAX and before the first probe is not
+/// used.
+const PROBE_INTERVAL_MS: u64 = 1_000;
+const ANNOUNCE_WAIT_MS: u64 = 2_000;
+const ANNOUNCE_NUM: u32 = 2;
+const ANNOUNCE_INTERVAL_MS: u64 = 2_000;
+const DEFEND_INTERVAL_MS: u64 = 10_000;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NeighdCounters {
     pub requests_sent: u64,
@@ -111,11 +131,26 @@ pub struct NeighdCounters {
     /// Router Solicitations and Advertisements and Redirects, which are not neighd's,
     /// and Neighbor Solicitations for other nodes' addresses.
     pub not_for_neighd: u64,
+    /// ARP Probes and Announcements of the router's own IPv4 addresses (RFC 5227),
+    /// the defending ones included, and packets from another host that claims or
+    /// probes for one of them.
+    pub claims_sent: u64,
+    pub conflicts: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Pending {
     attempts: u32,
+    next_at: u64,
+}
+
+/// The probing and announcing of one of the router's IPv4 addresses (RFC 5227
+/// sections 2.1 and 2.3).
+#[derive(Clone, Copy, Debug)]
+struct Claim {
+    mac: [u8; 6],
+    /// Probes, then Announcements, sent so far.
+    sent: u32,
     next_at: u64,
 }
 
@@ -149,6 +184,10 @@ pub struct Neighd {
     /// When the marks were last asked for: the FE's answers say a packet went to
     /// the neighbor by then.
     asked_at: u64,
+    /// The router's IPv4 addresses being probed and announced, or done (with the
+    /// MAC address they were claimed with), and when each was last defended.
+    claims: BTreeMap<(String, Ipv4Addr), Claim>,
+    defended: BTreeMap<(String, Ipv4Addr), u64>,
     now_ms: u64,
     counters: NeighdCounters,
 }
@@ -195,6 +234,8 @@ impl Neighd {
             failed: BTreeMap::new(),
             next_check: 0,
             asked_at: 0,
+            claims: BTreeMap::new(),
+            defended: BTreeMap::new(),
             now_ms: 0,
             counters: NeighdCounters::default(),
         })
@@ -679,9 +720,28 @@ impl Neighd {
         let target = Ipv4Addr::new(body[24], body[25], body[26], body[27]);
         let for_us = self.is_local(interface, target);
         // Our own address as sender is a conflict, not a neighbor; do not answer it.
+        // RFC 5227 section 2.4 (c): the router keeps its configured address and
+        // defends it, at most once in DEFEND_INTERVAL.
         if self.is_local(interface, sender) {
             self.counters.not_learned += 1;
+            if self
+                .local_mac(interface)
+                .is_some_and(|mac| mac != sender_mac)
+            {
+                self.counters.conflicts += 1;
+                self.defend(interface, sender);
+            }
             return;
+        }
+        // Section 2.1.1: another host probing for our address while we probe it.
+        if sender.is_unspecified()
+            && for_us
+            && self
+                .claims
+                .get(&(interface.to_owned(), target))
+                .is_some_and(|claim| claim.sent < PROBE_NUM && claim.mac != sender_mac)
+        {
+            self.counters.conflicts += 1;
         }
 
         // RFC 826: update a neighbor we know or are resolving; add one that is asking
@@ -717,6 +777,101 @@ impl Neighd {
                 self.counters.replies_sent += 1;
             }
         }
+    }
+
+    /// Sends an Announcement of `address` on `interface` unless one went out for it
+    /// in the last DEFEND_INTERVAL.
+    fn defend(&mut self, interface: &str, address: Ipv4Addr) {
+        let key = (interface.to_owned(), address);
+        let now = self.now_ms;
+        if self
+            .defended
+            .get(&key)
+            .is_some_and(|&at| now.saturating_sub(at) < DEFEND_INTERVAL_MS)
+        {
+            return;
+        }
+        let Some(mac) = self.local_mac(interface) else {
+            return;
+        };
+        self.defended.insert(key, now);
+        let frame = arp_frame(1, mac, address, [0xff; 6], [0; 6], address);
+        self.send(interface, punt::reason::ARP, &frame);
+        self.counters.claims_sent += 1;
+    }
+
+    /// The router's IPv4 addresses on enabled interfaces, with their MAC address.
+    fn own_ipv4(&self) -> Vec<(String, Ipv4Addr, [u8; 6])> {
+        self.local
+            .store()
+            .iter()
+            .filter_map(|(key, _)| match key {
+                Key::Address {
+                    interface,
+                    address: IpAddr::V4(address),
+                } => self
+                    .local_mac(interface)
+                    .map(|mac| (interface.clone(), *address, mac)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// RFC 5227 sections 2.1 and 2.3: each new address (or one on a new MAC address)
+    /// is probed PROBE_NUM times and then announced ANNOUNCE_NUM times.
+    fn claim(&mut self, now_ms: u64) -> Progress {
+        let own = self.own_ipv4();
+        self.claims.retain(|(interface, address), claim| {
+            own.iter()
+                .any(|(i, a, mac)| i == interface && a == address && *mac == claim.mac)
+        });
+        self.defended.retain(|(interface, address), _| {
+            own.iter().any(|(i, a, _)| i == interface && a == address)
+        });
+        for (interface, address, mac) in own {
+            self.claims.entry((interface, address)).or_insert(Claim {
+                mac,
+                sent: 0,
+                next_at: now_ms,
+            });
+        }
+        let mut wake_at: Option<u64> = None;
+        let mut busy = false;
+        let keys: Vec<_> = self.claims.keys().cloned().collect();
+        for key in keys {
+            let claim = self.claims[&key];
+            if claim.sent >= PROBE_NUM + ANNOUNCE_NUM {
+                continue;
+            }
+            if claim.next_at > now_ms {
+                wake_at = Some(wake_at.map_or(claim.next_at, |at: u64| at.min(claim.next_at)));
+                continue;
+            }
+            let (interface, address) = &key;
+            let (sender, wait) = if claim.sent < PROBE_NUM {
+                let wait = if claim.sent + 1 < PROBE_NUM {
+                    PROBE_INTERVAL_MS
+                } else {
+                    ANNOUNCE_WAIT_MS
+                };
+                (Ipv4Addr::UNSPECIFIED, wait)
+            } else {
+                (*address, ANNOUNCE_INTERVAL_MS)
+            };
+            let frame = arp_frame(1, claim.mac, sender, [0xff; 6], [0; 6], *address);
+            self.send(interface, punt::reason::ARP, &frame);
+            self.counters.claims_sent += 1;
+            busy = true;
+            let next_at = now_ms + wait;
+            if let Some(claim) = self.claims.get_mut(&key) {
+                claim.sent += 1;
+                claim.next_at = next_at;
+                if claim.sent < PROBE_NUM + ANNOUNCE_NUM {
+                    wake_at = Some(wake_at.map_or(next_at, |at: u64| at.min(next_at)));
+                }
+            }
+        }
+        Progress { busy, wake_at }
     }
 
     /// Records `mac` for a neighbor and writes it to the FE if it changed.
@@ -839,12 +994,14 @@ impl Task for Neighd {
         let punts = self.receive_punts();
         let timers = self.retry(now_ms);
         let checks = self.check(now_ms);
+        let claims = self.claim(now_ms);
         let (flushed, late) = self.fe.poll();
         self.handle_fe(late, now_ms);
         local
             .and(fe)
             .and(timers)
             .and(checks)
+            .and(claims)
             .and(flushed)
             .and(Progress::busy(had_events || punts))
     }

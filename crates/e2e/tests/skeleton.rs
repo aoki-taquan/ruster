@@ -204,10 +204,18 @@ impl Router {
         panic!("the router never settled");
     }
 
+    /// The frames sent, without neighd's probes and announcements of the router's
+    /// own addresses (RFC 5227), which go out whenever an address appears.
     fn tx(&mut self) -> Vec<(IfId, Vec<u8>)> {
         let mut out = Vec::new();
         while let Some(frame) = self.fe.io_mut().pop_tx() {
-            out.push((frame.egress, frame.bytes));
+            let bytes = &frame.bytes;
+            let claim = bytes.get(12..14) == Some(&[0x08, 0x06][..])
+                && bytes.len() >= 42
+                && (bytes[28..32] == [0; 4] || bytes[28..32] == bytes[38..42]);
+            if !claim {
+                out.push((frame.egress, frame.bytes));
+            }
         }
         out
     }
