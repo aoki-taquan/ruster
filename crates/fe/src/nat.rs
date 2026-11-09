@@ -34,14 +34,14 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 
 use ruster_core::{
-    dispatch_nat44_tcp_unsolicited_syns, port_free_bitmap_words, DirectoryBucket, DirectoryNode,
-    FirewallConfig, FirewallRuntime, ForwardingSnapshot, Icmpv4ErrorRuntime, MonotonicMillis,
-    Nat44HostCounter, Nat44HostLink, Nat44HostStorage, Nat44IcmpConfig, Nat44IcmpHashKey,
-    Nat44IcmpPolicy, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpHostSlot,
-    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
-    Nat44TcpSessionHostSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
-    Nat44UdpHashKey, Nat44UdpHostSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
-    Nat44UdpPolicy, Nat44UdpRuntime, PortOwnerSlot, Services, TraceSink,
+    dispatch_nat44_tcp_unsolicited_syns, ipv4_id_rate_limit_storage, port_free_bitmap_words,
+    DirectoryBucket, DirectoryNode, FirewallConfig, FirewallRuntime, ForwardingSnapshot,
+    Icmpv4ErrorRuntime, MonotonicMillis, Nat44HostCounter, Nat44HostLink, Nat44HostStorage,
+    Nat44IcmpConfig, Nat44IcmpHashKey, Nat44IcmpPolicy, Nat44IcmpRuntime, Nat44TcpConfig,
+    Nat44TcpHashKey, Nat44TcpHostSlot, Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy,
+    Nat44TcpRuntime, Nat44TcpSessionHostSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot,
+    Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpHostSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot,
+    Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, PortOwnerSlot, Services, TraceSink,
 };
 
 use crate::build;
@@ -62,6 +62,7 @@ pub(crate) struct Publication {
     udp: Nat44UdpConfig,
     tcp: Nat44TcpConfig,
     icmp: Nat44IcmpConfig,
+    ipv4_id_rate_limit: bool,
 }
 
 impl Publication {
@@ -74,6 +75,7 @@ impl Publication {
             public,
             ports,
             filtering,
+            ipv4_id_rate_limit,
         } = nat;
         Ok(Self {
             udp: Nat44UdpConfig::with_port_set(
@@ -108,6 +110,7 @@ impl Publication {
                 Nat44IcmpPolicy::default(),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
+            ipv4_id_rate_limit,
         })
     }
 
@@ -160,10 +163,19 @@ impl Nat {
                 tcp.commit();
                 icmp.commit();
                 this.current = next;
+                this.limit_ipv4_id_rate();
             }
             _ => *nat = Some(Self::allocate(next)?),
         }
         Ok(())
+    }
+
+    /// Turns the IPv4 ID rate limit on or off as the current tables say.
+    fn limit_ipv4_id_rate(&mut self) {
+        let on = self.current.ipv4_id_rate_limit;
+        self.udp.set_ipv4_id_rate_limited(on);
+        self.tcp.set_ipv4_id_rate_limited(on);
+        self.icmp.set_ipv4_id_rate_limited(on);
     }
 
     /// The NAT services to forward with, or none while the tables have no NAT.
@@ -217,7 +229,8 @@ impl Nat {
             udp_storage(ports, MAPPINGS, MAPPINGS),
             udp_key(),
         )
-        .map_err(|e| failed(format!("UDP: {e:?}")))?;
+        .map_err(|e| failed(format!("UDP: {e:?}")))?
+        .with_ipv4_id_rate_limit(Box::leak(ipv4_id_rate_limit_storage()));
         let icmp = Nat44IcmpRuntime::new(
             next.icmp,
             leak(MAPPINGS, Nat44UdpMappingSlot::default()),
@@ -225,7 +238,8 @@ impl Nat {
             udp_storage(ports, MAPPINGS, MAPPINGS),
             icmp_key(),
         )
-        .map_err(|e| failed(format!("ICMP: {e:?}")))?;
+        .map_err(|e| failed(format!("ICMP: {e:?}")))?
+        .with_ipv4_id_rate_limit(Box::leak(ipv4_id_rate_limit_storage()));
         let (mappings, sessions) = (TCP_MAPPINGS, TCP_SESSIONS);
         let hosts = Nat44HostStorage::new(
             leak(mappings, Nat44HostLink::EMPTY),
@@ -260,14 +274,17 @@ impl Nat {
         )
         .map_err(|e| failed(format!("TCP: {e:?}")))?
         .with_unsolicited_syn_holds(leak(SYN_HOLDS, Nat44TcpSynHoldSlot::EMPTY))
-        .map_err(|e| failed(format!("TCP SYN holds: {e:?}")))?;
-        Ok(Self {
+        .map_err(|e| failed(format!("TCP SYN holds: {e:?}")))?
+        .with_ipv4_id_rate_limit(Box::leak(ipv4_id_rate_limit_storage()));
+        let mut nat = Self {
             current: next,
             on: true,
             udp,
             tcp,
             icmp,
-        })
+        };
+        nat.limit_ipv4_id_rate();
+        Ok(nat)
     }
 }
 

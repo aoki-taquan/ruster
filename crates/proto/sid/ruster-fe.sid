@@ -217,6 +217,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ietf-nat:nat/instances/instance/ruster-nat:ipv4-id-rate-limit",
+        "sid": 60160,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-firewall:policy",
         "sid": 60140,
         "status": "unstable"

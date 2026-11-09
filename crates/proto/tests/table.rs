@@ -607,6 +607,7 @@ fn nat_and_firewall_entries_round_trip_and_are_checked() {
                 external: None,
                 ports: ruster_proto::table::NatPorts::Range { first, last },
                 filtering: ruster_proto::table::NatFiltering::AddressDependent,
+                ipv4_id_rate_limit: true,
             }),
         )
     };
@@ -708,6 +709,7 @@ fn a_nat_with_a_psid_port_set_round_trips_and_is_checked() {
                 external: None,
                 ports,
                 filtering: Default::default(),
+                ipv4_id_rate_limit: true,
             }),
         )
     };
@@ -822,6 +824,7 @@ fn a_nat_without_filtering_type_is_endpoint_independent() {
             last: 32_767,
         },
         filtering: NatFiltering::EndpointIndependent,
+        ipv4_id_rate_limit: true,
     };
     let change = Change::set(
         Key::Nat {
@@ -893,4 +896,25 @@ fn the_wireguard_tables_are_gone() {
         decode_bytes(&old),
         Err(ModelError::UnknownTable(60_100))
     ));
+}
+
+#[test]
+fn a_nat_without_the_ipv4_id_rate_limit_round_trips() {
+    let change = Change::set(
+        Key::Nat {
+            vrf: DEFAULT_VRF.into(),
+        },
+        Value::Nat(ruster_proto::table::Nat {
+            inside: "lan".into(),
+            outside: "wan".into(),
+            external: None,
+            ports: ruster_proto::table::NatPorts::Range {
+                first: 1_024,
+                last: 2_047,
+            },
+            filtering: Default::default(),
+            ipv4_id_rate_limit: false,
+        }),
+    );
+    assert_eq!(round_trip(&change), change);
 }

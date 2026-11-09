@@ -43,7 +43,9 @@
 //! within the MDL, and a bucket carries at most 65536 non-atomic datagrams per
 //! MDL. The tuples sharing a bucket share that rate: one inside host sending
 //! DF-clear datagrams fast to one destination holds back the others to it, so
-//! the limit can be left off where that matters more than the IDs.
+//! the limit can be left off where that matters more than the IDs. Only the
+//! outbound counters refuse: the inbound volume comes from outside senders, and
+//! refusing it would let one of them drop other senders' datagrams.
 //!
 //! The split stops outside traffic from advancing an outbound sequence
 //! *directly*. It can still do so indirectly: an outside host that elicits
@@ -101,10 +103,13 @@
 //!   predicted without the key.
 //! - RFC 4963 section 2 describes the misassembly the IDs avoid.
 //!
-//! Deviations: without its storage the runtime does not limit the rate, and
-//! the IDs of a tuple can repeat within the MDL (an operator's choice). The
-//! limit is per bucket, not per tuple, so tuples that share a bucket share the
-//! rate.
+//! Deviations: without its storage, or with the limit off, the runtime does not
+//! limit the rate, and the IDs of a tuple can repeat within the MDL (an
+//! operator's choice). Inbound translations are never limited, so an inbound
+//! tuple's IDs can repeat when outside senders send that fast. The limit is per
+//! bucket, not per tuple, so tuples that share a bucket share the rate. A new
+//! runtime (the FE makes one when the port range changes size) starts its
+//! counters again.
 
 use crate::fixed_directory::{DirectoryHashDomain, DirectoryHashKey};
 
@@ -140,8 +145,12 @@ pub(crate) struct Ipv4IdGenerator<'a> {
     outbound: [u16; IPV4_ID_BUCKETS],
     /// Every other tuple (inbound: destination rewritten to an inside host).
     inbound: [u16; IPV4_ID_BUCKETS],
-    /// With it, the rate limit (see the module doc); without it, none.
+    /// With it, the last uses are kept (see the module doc); without it, none.
     used_at: Option<&'a mut Ipv4IdRateLimitStorage>,
+    /// Whether an outbound datagram over the rate is refused (only with
+    /// `used_at`). The last uses are kept while it is off, so once it is on the
+    /// IDs are unique from the next quarter of each counter.
+    refuse: bool,
 }
 
 impl<'a> Ipv4IdGenerator<'a> {
@@ -151,6 +160,7 @@ impl<'a> Ipv4IdGenerator<'a> {
             outbound: [0; IPV4_ID_BUCKETS],
             inbound: [0; IPV4_ID_BUCKETS],
             used_at: None,
+            refuse: false,
         }
     }
 
@@ -160,6 +170,12 @@ impl<'a> Ipv4IdGenerator<'a> {
             *quarters = [0; 4];
         }
         self.used_at = Some(storage);
+        self.refuse = true;
+    }
+
+    /// Turns refusing on or off; it has an effect only with the storage.
+    pub(crate) fn set_rate_limited(&mut self, on: bool) {
+        self.refuse = on;
     }
 
     /// The ID of the next non-atomic datagram of the translated tuple;
@@ -190,9 +206,16 @@ impl<'a> Ipv4IdGenerator<'a> {
             // was last used more than the MDL ago (whole seconds, so one more).
             let quarters = &mut used_at[base + bucket];
             let quarter = usize::from(counter >> 14);
-            let now = u32::try_from(now_ms / 1_000).unwrap_or(u32::MAX - 1) + 1;
+            let now = u32::try_from(now_ms / 1_000)
+                .unwrap_or(u32::MAX)
+                .min(u32::MAX - 1)
+                + 1;
             let last = quarters[quarter];
-            if counter & 0x3fff == 0
+            // Only outbound: inbound volume is the outside senders', and refusing
+            // it would let one outside host drop the others' datagrams.
+            if self.refuse
+                && base == 0
+                && counter & 0x3fff == 0
                 && last != 0
                 && u64::from(now.saturating_sub(last)) <= IPV4_ID_MDL_S
             {
@@ -257,6 +280,18 @@ mod tests {
         // The fourth quarter was last used at 10 s.
         assert_eq!(ids.next(P, D, 17, P, mdl + 10_999), None);
         assert!(ids.next(P, D, 17, P, mdl + 11_000).is_some());
+    }
+
+    /// Inbound translations are not refused: outside senders could otherwise
+    /// drop each other's datagrams.
+    #[test]
+    fn the_rate_limit_does_not_refuse_inbound() {
+        let mut storage = ipv4_id_rate_limit_storage();
+        let mut ids = generator(7);
+        ids.limit_rate(&mut storage);
+        for _ in 0..70_000 {
+            ids.next(D, [10, 0, 0, 10], 17, P, 0).unwrap();
+        }
     }
 
     #[test]

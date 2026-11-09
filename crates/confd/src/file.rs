@@ -88,6 +88,11 @@
 //! external = "198.51.100.2"    # optional; for now only the outside's own address
 //! filtering = "endpoint-independent"  # optional, the default, or
 //!                              # "address-dependent", "address-and-port-dependent"
+//! ipv4-id-rate-limit = true    # optional, the default: datagrams that may be
+//!                              # fragmented are dropped above the rate at which
+//!                              # their IPv4 IDs stay unique for 120 s (about 550
+//!                              # a second to one destination, shared by the LAN);
+//!                              # false lets them go (also in [map-e])
 //! ```
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
@@ -220,6 +225,7 @@ struct MapEEntry {
     br: String,
     mtu: Option<u16>,
     filtering: Option<String>,
+    ipv4_id_rate_limit: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -240,6 +246,7 @@ struct NatEntry {
     ports: Option<String>,
     external: Option<String>,
     filtering: Option<String>,
+    ipv4_id_rate_limit: Option<bool>,
 }
 
 /// `filtering = "..."` of `[nat]` or `[map-e]`; endpoint-independent when left out.
@@ -989,6 +996,7 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
     };
     let nat = Nat {
         filtering: filtering(at, entry.filtering.as_deref())?,
+        ipv4_id_rate_limit: entry.ipv4_id_rate_limit.unwrap_or(true),
         inside: entry.inside,
         outside: entry.interface,
         external: None,
@@ -1074,6 +1082,7 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
     };
     Ok(Nat {
         filtering: filtering(at, entry.filtering.as_deref())?,
+        ipv4_id_rate_limit: entry.ipv4_id_rate_limit.unwrap_or(true),
         inside: entry.inside,
         outside: entry.outside,
         external,

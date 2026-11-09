@@ -1015,6 +1015,7 @@ fn nat(first_port: u16, last_port: u16) -> Change {
                 last: last_port,
             },
             filtering: Default::default(),
+            ipv4_id_rate_limit: true,
         }),
     )
 }
@@ -3269,4 +3270,60 @@ fn a_due_syn_answer_to_an_unknown_neighbor_asks_for_it() {
     let before = bench.fe.counters().resolve_requests;
     bench.fe.step(7_100);
     assert_eq!(bench.fe.counters().resolve_requests, before + 1);
+}
+
+/// With NAT, datagrams that may be fragmented are limited so that a tuple's IPv4
+/// IDs do not repeat within 120 seconds (RFC 6864 5.2): at one instant, 65536 go
+/// and the next is dropped. With `ipv4_id_rate_limit` off, it goes. Slow in a
+/// debug build (65536 datagrams): `cargo test -p ruster-fe --test fe -- --ignored`.
+#[test]
+#[ignore = "slow: 65536 datagrams"]
+fn the_nat_limits_the_ipv4_ids_and_the_limit_can_be_turned_off() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+        ],
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    let frame = udp_from_host(INTERNET);
+    assert_eq!(frame[14 + 6] & 0x40, 0, "DF is clear");
+    let mut sent = 0;
+    for _ in 0..65_536 / 64 {
+        for _ in 0..64 {
+            bench.fe.io_mut().inject(IfId(0), frame.clone());
+        }
+        bench.fe.step(1_000);
+        sent += std::iter::from_fn(|| bench.fe.io_mut().pop_tx()).count();
+    }
+    assert_eq!(sent, 65_536);
+    bench.fe.io_mut().inject(IfId(0), frame.clone());
+    bench.fe.step(1_000);
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "the 65537th waits");
+
+    let Change {
+        key,
+        value: Some(Value::Nat(mut off)),
+    } = nat(40_000, 40_009)
+    else {
+        unreachable!()
+    };
+    off.ipv4_id_rate_limit = false;
+    assert_eq!(
+        bench.patch(&mut config, &[Change::set(key, Value::Nat(off))]),
+        Code::CHANGED
+    );
+    bench.fe.io_mut().inject(IfId(0), frame);
+    bench.fe.step(1_000);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_some(),
+        "without the limit it goes"
+    );
 }

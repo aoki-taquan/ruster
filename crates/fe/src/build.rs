@@ -80,6 +80,8 @@ pub(crate) struct Nat {
     pub(crate) public: Ipv4Address,
     pub(crate) ports: PortSet,
     pub(crate) filtering: ruster_core::Nat44Filtering,
+    /// Whether the IPv4 IDs of translated datagrams are rate limited.
+    pub(crate) ipv4_id_rate_limit: bool,
 }
 
 /// One forwarding route before it becomes core's.
@@ -721,6 +723,7 @@ fn nat(
                 ruster_core::Nat44Filtering::AddressAndPortDependent
             }
         },
+        ipv4_id_rate_limit: entry.ipv4_id_rate_limit,
     }))
 }
 

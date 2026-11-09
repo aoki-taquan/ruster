@@ -647,6 +647,11 @@ impl<'a> Nat44IcmpRuntime<'a> {
         self
     }
 
+    /// As [`crate::Nat44UdpRuntime::set_ipv4_id_rate_limited`].
+    pub fn set_ipv4_id_rate_limited(&mut self, on: bool) {
+        self.engine.set_ipv4_id_rate_limited(on);
+    }
+
     #[must_use]
     pub const fn counters(&self) -> Nat44IcmpCounters {
         Nat44IcmpCounters::from_engine(self.engine.counters())
