@@ -427,8 +427,15 @@ impl Change {
                     {
                         return Err(ModelError::Invalid("tunnel address"));
                     }
-                    Value::Interface { vrf, vlan, .. } => {
+                    Value::Interface {
+                        vrf, vlan, pppoe, ..
+                    } => {
                         name(vrf)?;
+                        if let (Some(pppoe), Key::Interface { name: own }) = (pppoe, &self.key) {
+                            if *own == pppoe.parent {
+                                return Err(ModelError::Invalid("PPPoE parent (itself)"));
+                            }
+                        }
                         if let Some(vlan) = vlan {
                             name(&vlan.parent)?;
                             if !(1..=4094).contains(&vlan.id) {

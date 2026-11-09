@@ -772,6 +772,38 @@ fn a_pppoe_interface_round_trips_and_is_checked() {
     assert!(ppp(0, [2, 0, 0, 0, 0, 0xac]).validate().is_err());
     assert!(ppp(0xffff, [2, 0, 0, 0, 0, 0xac]).validate().is_err());
     assert!(ppp(1, [0xff; 6]).validate().is_err());
+    let Change {
+        key,
+        value:
+            Some(Value::Interface {
+                pppoe: Some(mut session),
+                enabled,
+                mac,
+                mtu,
+                vrf,
+                ..
+            }),
+    } = good
+    else {
+        unreachable!()
+    };
+    session.parent = "ppp".into();
+    let itself = Change::set(
+        key,
+        Value::Interface {
+            enabled,
+            mac,
+            mtu,
+            vrf,
+            vlan: None,
+            tunnel: None,
+            pppoe: Some(session),
+        },
+    );
+    assert_eq!(
+        itself.validate(),
+        Err(ModelError::Invalid("PPPoE parent (itself)"))
+    );
 }
 
 #[test]
