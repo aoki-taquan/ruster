@@ -2,7 +2,6 @@
 #![doc = "A small, allocation-free IPv4 and ARP packet-processing core."]
 
 mod arp_policy;
-mod chacha20poly1305;
 mod checksum;
 mod firewall;
 mod firewall6;
@@ -33,17 +32,12 @@ mod source_validation;
 mod time;
 mod tunnel;
 mod vlan;
-pub mod wireguard;
 
 pub use arp_policy::{
     ArpAnnouncePolicy, ArpAnnouncePolicyError, ArpInterfacePolicy,
     ARP_ANNOUNCE_DEFAULT_MIN_INTERVAL_MS, ARP_ANNOUNCE_INTERVAL_MS, ARP_ANNOUNCE_MAX_COUNT,
     ARP_ANNOUNCE_MAX_INTERVAL_MS, ARP_ANNOUNCE_MIN_INTERVAL_MS, ARP_ANNOUNCE_NUM,
     ARP_DEFEND_INTERVAL_MS,
-};
-pub use chacha20poly1305::{
-    open as chacha20poly1305_open, seal as chacha20poly1305_seal, wireguard_nonce,
-    TAG_LEN as CHACHA20POLY1305_TAG_LEN,
 };
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[cfg(feature = "validation-test-hooks")]
