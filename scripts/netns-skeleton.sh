@@ -31,6 +31,14 @@ trap cleanup EXIT
 
 for ns in "$host_a" "$host_b" "$router"; do ip netns add "$ns"; done
 nsx() { ip netns exec "$@"; }
+# Waits until something in namespace $1 listens on $2 port $3 (ss -ltn or -lun).
+listening() {
+  for _ in $(seq 1 50); do
+    nsx "$1" ss -Hln"$2" "sport = :$3" | grep -q . && return 0
+    sleep 0.1
+  done
+  fail "nothing listens on $3 in $1"
+}
 
 # The router's devices carry no kernel address: the kernel must leave them to the FE.
 ip link add a0 netns "$host_a" type veth peer name ra netns "$router"
@@ -141,6 +149,23 @@ for name in ruster-fe ruster-ribd ruster-neighd ruster-confd; do start_named "$n
 comes_up || fail "IPv4 does not cross the router"
 all_running || fail "a router process exited"
 echo "ok: IPv4 and IPv6 cross the router both ways (four separate processes)"
+
+# TCP and UDP cross it too, over IPv4 and IPv6: their checksums arrive right.
+for dst in 198.51.100.10 2001:db8:2::10; do
+  family=-4
+  [[ "$dst" == *:* ]] && family=-6
+  nsx "$host_b" timeout 5 nc "$family" -l 8081 >"$work/tcp-through.out" &
+  listening "$host_b" t 8081
+  echo hello-through | nsx "$host_a" timeout 5 nc -N "$dst" 8081 || fail "TCP to $dst"
+  wait $! 2>/dev/null || true
+  grep -q hello-through "$work/tcp-through.out" || fail "TCP data to $dst"
+  nsx "$host_b" timeout 3 nc "$family" -u -l 8082 >"$work/udp-through.out" &
+  listening "$host_b" u 8082
+  echo hello-udp | nsx "$host_a" timeout 1 nc -u -q 0 "$dst" 8082 || true
+  wait $! 2>/dev/null || true
+  grep -q hello-udp "$work/udp-through.out" || fail "UDP to $dst"
+done
+echo "ok: TCP and UDP cross the router (IPv4 and IPv6)"
 
 # A packet that would expire at the router gets a time exceeded error from it.
 out=$(nsx "$host_a" ping -c 1 -W 1 -t 1 198.51.100.10 2>&1 || true)
