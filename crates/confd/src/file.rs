@@ -19,7 +19,7 @@
 //! [[interface]]                # an IPv4 in IPv6 tunnel (DS-Lite softwire)
 //! name = "dslite"
 //! tunnel = { local = "2001:db8:1::2", remote = "2001:db8:ff::1" }
-//! ipv4 = "192.0.0.2/29"        # optional; RFC 6333 5.7's B4 address
+//! ipv4 = "192.0.0.2/29"        # optional; this, the B4's address, when left out
 //! # mtu is 1460 when left out; mac is not needed
 //!
 //! [[interface]]                # a PPPoE session (set up by a daemon outside ruster)
@@ -137,7 +137,9 @@
 //!   VRF, to the AFTR at `remote`; the outer packets are routed in the default VRF.
 //!   Its MTU is at most 1460 (1500 less the IPv6 header), and at run time at most
 //!   what the link below carries less 40, so the outer packets are not fragmented
-//!   (RFC 6333 5.3 lets the B4 fragment them instead).
+//!   (RFC 6333 5.3 lets the B4 fragment them instead). Section 5.7: without an
+//!   IPv4 address of its own, it gets 192.0.0.2/29 (the first such tunnel of a VRF
+//!   only), so that ICMP errors can be sent into it.
 //! - RFC 7597 (MAP-E), the CE: `[map-e]` derives the shared IPv4 address and the
 //!   PSID from the EA bits of the delegated prefix (section 5.2), the CE's IPv6
 //!   address from them (section 6, interface ID `0:IPv4:PSID` on the delegated
@@ -583,6 +585,15 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 }
                 seen.address(&at, &entry.name, address.into(), len)?;
                 Some((address, len))
+            }
+            // A DS-Lite B4 with no address of its own uses the well-known one, so
+            // that it can send ICMP errors into the tunnel.
+            // Only one tunnel of a VRF can have it.
+            None if tunnel.is_some() => {
+                let address = Ipv4Addr::new(192, 0, 0, 2);
+                seen.address(&at, &entry.name, address.into(), 29)
+                    .ok()
+                    .map(|()| (address, 29))
             }
             None => None,
         };

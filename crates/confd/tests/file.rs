@@ -794,6 +794,12 @@ fn a_tunnel_interface_needs_no_mac_and_sends_from_a_router_address() {
             "2001:db8:ff::1".parse().unwrap()
         ))
     );
+    // Without an address of its own it gets the B4's well-known one.
+    let config = parse(&dslite("2001:db8:1::2", "")).unwrap();
+    assert_eq!(
+        config.interfaces[1].ipv4,
+        Some((std::net::Ipv4Addr::new(192, 0, 0, 2), 29))
+    );
     for (text, expected) in [
         (
             dslite("2001:db8:9::9", ""),
