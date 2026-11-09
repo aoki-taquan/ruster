@@ -44,9 +44,10 @@ pub const FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_MAX_IDLE_TTL_MS: u64 = 604_800_000;
 /// Most work one carrying publication may spend re-evaluating carried
 /// flows (RELOAD-CARRY), in units of one first-match rule test: the bound is
-/// `live flows x (rules + 4 x FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT)`, with the
+/// `live flows x (rules + 6 x FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT)`, with the
 /// rule term only when the rules changed and the lookup term only when the
-/// routes changed (two endpoints, two snapshots), checked before any work.
+/// routes changed (two endpoints, two snapshots, and a leaked flow's
+/// responder in its own VRF), checked before any work.
 /// Above it the publication flushes the flow table instead
 /// ([`crate::StateCarryConflict::ReevaluationBudget`]). The bound is a count,
 /// not a time: on the development host (release build) a rule test took
@@ -1780,7 +1781,8 @@ impl CarryRoutes<'_> {
     /// Whether the route to either endpoint of `slot` leaves through
     /// another interface now, or appeared or disappeared. A changed next hop
     /// out of the same interface keeps the flow: its state still matches
-    /// both directions exactly. Two route lookups per snapshot.
+    /// both directions exactly. Two route lookups per snapshot, and for a flow
+    /// that came in through another VRF one more in that VRF.
     ///
     /// An endpoint that is one of the router's own addresses in both
     /// snapshots is skipped (core L2). Such an endpoint can be a flow's
@@ -1795,6 +1797,11 @@ impl CarryRoutes<'_> {
     /// `carried_flow_never_admits_a_reverse_packet_from_a_router_address`
     /// (io-sim) pins that assumption.
     fn moved(self, slot: FirewallStateSlot) -> bool {
+        // A flow that came in through another VRF (leaked into this one) moves too
+        // when that VRF's route to the responder changed: its leak was removed, say.
+        if self.leak_moved(slot) {
+            return true;
+        }
         // An IPv6 flow moves when the IPv6 route of one of its ends leaves through
         // another interface (a snapshot without IPv6 tables has no route).
         let (Some(responder), Some(initiator)) =
@@ -1826,6 +1833,35 @@ impl CarryRoutes<'_> {
                 };
                 egress(self.current) != egress(self.next)
             })
+    }
+
+    /// Whether `slot` came in through another VRF's interface and that VRF's route
+    /// to the responder is not the same in both tables.
+    fn leak_moved(self, slot: FirewallStateSlot) -> bool {
+        let current = self.current.for_ingress(slot.origin_ingress);
+        let next = self.next.for_ingress(slot.origin_ingress);
+        let foreign = current.authority() != self.current.authority()
+            || next.authority() != self.next.authority();
+        if !foreign {
+            return false;
+        }
+        match slot.responder_address {
+            FirewallAddress::V4(address) => {
+                let egress = |snapshot: &crate::ForwardingSnapshot<'_>| {
+                    snapshot.route_lookup(address).map(|route| route.egress())
+                };
+                egress(current) != egress(next)
+            }
+            FirewallAddress::V6(address) => {
+                let egress = |snapshot: &crate::ForwardingSnapshot<'_>| {
+                    snapshot
+                        .ipv6
+                        .and_then(|fib| fib.next_hop(address))
+                        .map(|(egress, _)| egress)
+                };
+                egress(current) != egress(next)
+            }
+        }
     }
 }
 
@@ -2094,8 +2130,9 @@ impl<'state> FirewallRuntime<'state> {
     /// flushes instead ([`crate::StateCarryConflict::Timers`]): it would make
     /// expired, not yet reclaimed flows live again; a shorter one applies
     /// to carried flows from their last activity. The work, `live flows x
-    /// (rules + 4)` rule tests and route lookups as far as each applies
-    /// (two endpoints in two snapshots), is bounded by
+    /// (rules + 6)` rule tests and route lookups as far as each applies
+    /// (two endpoints in two snapshots, and a leaked flow's responder in its
+    /// own VRF), is bounded by
     /// [`FIREWALL_CARRY_REEVALUATION_BUDGET`]; above it the table flushes
     /// ([`crate::StateCarryConflict::ReevaluationBudget`]). Both fallbacks
     /// are fail closed.
@@ -2130,14 +2167,17 @@ impl<'state> FirewallRuntime<'state> {
         let live = self.carry_live_flows();
         let reevaluate = (current.rules != next.rules).then_some(next.rules);
         let routes = (current_snapshot.routes != next_snapshot.routes
-            || current_snapshot.ipv6 != next_snapshot.ipv6)
-            .then_some(CarryRoutes {
-                current: current_snapshot,
-                next: next_snapshot,
-            });
+            || current_snapshot.ipv6 != next_snapshot.ipv6
+            || current_snapshot.other_vrfs_differ(&next_snapshot))
+        .then_some(CarryRoutes {
+            current: current_snapshot,
+            next: next_snapshot,
+        });
         let per_flow = reevaluate.map_or(0, |rules| rules.len() as u64)
             + if routes.is_some() {
-                4 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT
+                // Two endpoints in two snapshots, and a leaked flow's responder in
+                // its own VRF in both.
+                6 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT
             } else {
                 0
             };

@@ -3512,3 +3512,137 @@ fn a_flow_through_a_vlan_survives_adding_a_vlan_before_it() {
         .expect("the flow was carried across the change");
     assert_eq!(&tx.bytes[12..16], &[0x81, 0x00, 0x00, 20]);
 }
+
+/// A flow red leaked into the default VRF (through red's `lookup-vrf`) and the
+/// default VRF's firewall let out stops letting replies in once red's lookup is
+/// removed: the flow's own VRF has another route then.
+#[test]
+fn a_leaked_flow_goes_when_the_leak_is_removed() {
+    let mut bench = Bench::new();
+    let mut config = bench.connect(writers::CONFIG);
+    let red_lan = Change::set(
+        Key::Interface { name: "lan".into() },
+        Value::Interface {
+            enabled: true,
+            mac: LAN_MAC,
+            mtu: 1500,
+            vrf: "red".into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: None,
+        },
+    );
+    // The default VRF's rules name no other VRF's interface: by red's addresses.
+    let udp_from_red = Change::set(
+        Key::FirewallRule {
+            vrf: "default".into(),
+            id: 1,
+        },
+        Value::FirewallRule(ruster_proto::table::FirewallRule {
+            ingress: None,
+            egress: None,
+            source: (Ipv4Addr::new(192, 0, 2, 0).into(), 24),
+            destination: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            protocol: ruster_proto::table::Protocol::Udp,
+            source_ports: (0, 65_535),
+            destination_ports: (0, 65_535),
+            action: ruster_proto::table::FirewallAction::Accept,
+        }),
+    );
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                red_lan,
+                iface("wan", WAN_MAC),
+                address("lan", [192, 0, 2, 1], 24),
+                address("wan", [198, 51, 100, 2], 24),
+                udp_from_red,
+            ],
+        ),
+        Code::CHANGED
+    );
+    let mut routes = bench.connect(writers::ROUTE);
+    let in_vrf = |vrf: &str, prefix: [u8; 4], len: u8, action: RouteAction| {
+        Change::set(
+            Key::Route {
+                vrf: vrf.into(),
+                prefix: Ipv4Addr::from(prefix).into(),
+                len,
+            },
+            Value::Route(action),
+        )
+    };
+    let via_gateway = RouteAction::Forward(vec![NextHop {
+        interface: "wan".into(),
+        address: Some(Ipv4Addr::from(GATEWAY).into()),
+    }]);
+    let back_to_red = RouteAction::Forward(vec![NextHop {
+        interface: "lan".into(),
+        address: None,
+    }]);
+    assert_eq!(
+        bench.patch(
+            &mut routes,
+            &[
+                in_vrf("default", [0, 0, 0, 0], 0, via_gateway),
+                in_vrf("default", [192, 0, 2, 0], 24, back_to_red),
+                in_vrf(
+                    "red",
+                    [0, 0, 0, 0],
+                    0,
+                    RouteAction::LookupVrf("default".into())
+                ),
+            ],
+        ),
+        Code::CHANGED
+    );
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("wan", GATEWAY, GATEWAY_MAC),
+                neighbor("lan", [192, 0, 2, 10], HOST_MAC)
+            ]
+        ),
+        Code::CHANGED
+    );
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([203, 0, 113, 7]));
+    bench.fe.step(bench.now);
+    assert_eq!(
+        bench.fe.io_mut().pop_tx().expect("leaked out").egress,
+        IfId(1)
+    );
+    let reply = || from_wan(&udp_packet([203, 0, 113, 7], [192, 0, 2, 10], (2000, 1000)));
+    bench.fe.io_mut().inject(IfId(1), reply());
+    bench.fe.step(bench.now);
+    let back = bench.fe.io_mut().pop_tx();
+    assert_eq!(
+        back.map(|tx| tx.egress),
+        Some(IfId(0)),
+        "the reply comes back"
+    );
+
+    // Red's lookup into the default VRF is removed.
+    assert_eq!(
+        bench.patch(
+            &mut routes,
+            &[Change::delete(Key::Route {
+                vrf: "red".into(),
+                prefix: Ipv4Addr::UNSPECIFIED.into(),
+                len: 0,
+            })]
+        ),
+        Code::CHANGED
+    );
+    bench.fe.io_mut().inject(IfId(1), reply());
+    bench.fe.step(bench.now);
+    assert!(
+        bench.fe.io_mut().pop_tx().is_none(),
+        "the leaked flow is gone"
+    );
+}

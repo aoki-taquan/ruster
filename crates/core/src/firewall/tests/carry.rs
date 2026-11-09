@@ -501,7 +501,7 @@ fn a_new_next_hop_keeps_flows_and_route_work_counts_against_the_budget() {
         let report = permit.commit();
         assert_eq!((report.states_carried, report.states_revoked), (1, 0));
 
-        let mut next_rules: Vec<FirewallRule> = (0..4_031)
+        let mut next_rules: Vec<FirewallRule> = (0..3_999)
             .map(|id| udp_rule(10 + id, FirewallAction::Deny, (2, 2)))
             .collect();
         next_rules.push(udp_rule(
