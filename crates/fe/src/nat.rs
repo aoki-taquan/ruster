@@ -38,6 +38,10 @@
 //!   use it up).
 //! - Fragments whose datagram started before a table change are dropped
 //!   (`fragments.rs`).
+//! - A fragmented datagram from outside to the public address on a port outside the
+//!   pool (a service of the router's on the WAN address) is lost after its first
+//!   fragment: the fragments that follow are not passed to the router. The router's
+//!   own connections are not affected (their replies come back through NAT).
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 

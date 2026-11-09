@@ -42,6 +42,8 @@
 //! An ICMPv6 error about a packet from the kernel's interface has the packet's
 //! destination as its source, not an address of the router (RFC 4443 section 2.2),
 //! because the kernel discards a packet from one of its own addresses.
+//! No source address validation of forwarded IPv6 (RFC 1812 section 5.3.8's check is
+//! for IPv4; RFC 3704's for IPv6 is not built).
 //!
 //! [`with_kernel_ingress`]: crate::ForwardingSnapshot::with_kernel_ingress
 

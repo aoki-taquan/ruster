@@ -124,7 +124,9 @@
 //! - RFC 8200 section 5: an interface with IPv6 addresses has an MTU of at least
 //!   1280. Deviation: one with only its link-local address may have less.
 //! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
-//!   when not named.
+//!   when not named. A `lookup-vrf` route reaches the other VRF's hosts, not the
+//!   router's own addresses in it: traffic from one VRF to the router's address in
+//!   another is not delivered.
 //! - RFC 791: the smallest MTU is 68.
 //! - RFC 4291 sections 2.5.5 and 2.6.1, RFC 3879, RFC 6164: an interface's IPv6
 //!   address is not IPv4-mapped, IPv4-compatible, site-local (fec0::/10) or its
