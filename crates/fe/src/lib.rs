@@ -787,15 +787,24 @@ where
             }
             // Until a move succeeds the old firewall stays, bound to the old tables:
             // core then drops what it would have checked.
+            // With the IPv6 tables, so that IPv6 flows whose route moved go, and with
+            // every VRF's, so that flows leaked in from another VRF go when its
+            // route changed.
+            let current: Vec<_> = self
+                .vrfs
+                .iter()
+                .map(|vrf| vrf.owner.snapshot().with_ipv6(&vrf.ipv6))
+                .collect();
+            let next: Vec<_> = built
+                .vrfs
+                .iter()
+                .map(|vrf| vrf.owner.snapshot().with_ipv6(&vrf.ipv6))
+                .collect();
             if let Err(error) = firewall::Firewall::publish(
                 &mut self.firewall,
                 publication,
-                // With the IPv6 tables, so that IPv6 flows whose route moved go.
-                self.vrfs[0].owner.snapshot().with_ipv6(&self.vrfs[0].ipv6),
-                built.vrfs[0]
-                    .owner
-                    .snapshot()
-                    .with_ipv6(&built.vrfs[0].ipv6),
+                current[0].with_vrfs(&current, &self.by_ingress),
+                next[0].with_vrfs(&next, &built.by_ingress),
             ) {
                 eprintln!("ruster-fe: {error}");
             }

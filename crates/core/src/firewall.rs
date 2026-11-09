@@ -1795,6 +1795,11 @@ impl CarryRoutes<'_> {
     /// `carried_flow_never_admits_a_reverse_packet_from_a_router_address`
     /// (io-sim) pins that assumption.
     fn moved(self, slot: FirewallStateSlot) -> bool {
+        // A flow that came in through another VRF (leaked into this one) moves too
+        // when that VRF's route to the responder changed: its leak was removed, say.
+        if self.leak_moved(slot) {
+            return true;
+        }
         // An IPv6 flow moves when the IPv6 route of one of its ends leaves through
         // another interface (a snapshot without IPv6 tables has no route).
         let (Some(responder), Some(initiator)) =
@@ -1826,6 +1831,32 @@ impl CarryRoutes<'_> {
                 };
                 egress(self.current) != egress(self.next)
             })
+    }
+
+    /// Whether `slot` came in through another VRF's interface and that VRF's route
+    /// to the responder is not the same in both tables.
+    fn leak_moved(self, slot: FirewallStateSlot) -> bool {
+        let current = self.current.for_ingress(slot.origin_ingress);
+        let next = self.next.for_ingress(slot.origin_ingress);
+        let foreign = current.authority() != self.current.authority()
+            || next.authority() != self.next.authority();
+        if !foreign {
+            return false;
+        }
+        match slot.responder_address {
+            FirewallAddress::V4(address) => {
+                current.route_lookup(address) != next.route_lookup(address)
+            }
+            FirewallAddress::V6(address) => {
+                let egress = |snapshot: &crate::ForwardingSnapshot<'_>| {
+                    snapshot
+                        .ipv6
+                        .and_then(|fib| fib.next_hop(address))
+                        .map(|(egress, _)| egress)
+                };
+                egress(current) != egress(next)
+            }
+        }
     }
 }
 
@@ -2130,11 +2161,12 @@ impl<'state> FirewallRuntime<'state> {
         let live = self.carry_live_flows();
         let reevaluate = (current.rules != next.rules).then_some(next.rules);
         let routes = (current_snapshot.routes != next_snapshot.routes
-            || current_snapshot.ipv6 != next_snapshot.ipv6)
-            .then_some(CarryRoutes {
-                current: current_snapshot,
-                next: next_snapshot,
-            });
+            || current_snapshot.ipv6 != next_snapshot.ipv6
+            || current_snapshot.other_vrfs_differ(&next_snapshot))
+        .then_some(CarryRoutes {
+            current: current_snapshot,
+            next: next_snapshot,
+        });
         let per_flow = reevaluate.map_or(0, |rules| rules.len() as u64)
             + if routes.is_some() {
                 4 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT

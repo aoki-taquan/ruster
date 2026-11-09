@@ -1741,6 +1741,30 @@ impl<'a> ForwardingSnapshot<'a> {
     }
 
     /// The snapshot a packet received on `ingress` is decided with.
+    /// Whether the VRFs other than this one (with [`Self::with_vrfs`]) have other
+    /// routes, or are other VRFs, in `other`.
+    pub(crate) fn other_vrfs_differ(&self, other: &ForwardingSnapshot<'_>) -> bool {
+        let others = |snapshot: &ForwardingSnapshot<'a>| -> &[ForwardingSnapshot<'a>] {
+            snapshot
+                .vrfs
+                .as_ref()
+                .and_then(|vrfs| vrfs.snapshots.get(1..))
+                .unwrap_or(&[])
+        };
+        let (a, b) = (
+            others(self),
+            other
+                .vrfs
+                .as_ref()
+                .and_then(|v| v.snapshots.get(1..))
+                .unwrap_or(&[]),
+        );
+        a.len() != b.len()
+            || a.iter()
+                .zip(b)
+                .any(|(x, y)| x.routes != y.routes || x.ipv6 != y.ipv6)
+    }
+
     pub(crate) fn for_ingress(&self, ingress: IfId) -> &ForwardingSnapshot<'a> {
         self.vrfs
             .as_ref()
