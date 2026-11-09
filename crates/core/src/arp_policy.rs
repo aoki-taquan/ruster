@@ -9,9 +9,9 @@
 //!   the policy times, and section 2.4 (c) the defense it can turn off per
 //!   interface.
 //!
-//! Deviations: nothing acts on this policy. Core no longer sends Announcements
-//! or defends an address, and neighd does neither (see its Deviations), so
-//! the values are carried but have no effect.
+//! Deviations: nothing acts on this policy. The neighbor process probes,
+//! announces and defends the router's addresses with its own timing (see its
+//! `# Standards`), so these values are carried but have no effect.
 
 use std::num::NonZeroU8;
 
