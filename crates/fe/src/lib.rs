@@ -382,7 +382,19 @@ where
         }
         let report =
             forward_batch_with_control(batch, &snapshot, &mut self.control, services, &mut trace);
-        if report.received == 0 {
+        // Unsolicited inbound SYNs whose wait is over get their Port Unreachable,
+        // also in a batch with no packets: the wait ends by the clock.
+        let answered = self.nat.as_mut().map_or(0, |nat| {
+            nat.answer_unsolicited_syns(
+                &mut self.icmpv4_errors,
+                &snapshot,
+                firewall
+                    .as_mut()
+                    .map(|(config, runtime)| (&*config, &mut **runtime)),
+                now,
+            )
+        });
+        if report.received == 0 && answered == 0 {
             return false;
         }
         self.counters.batches += 1;

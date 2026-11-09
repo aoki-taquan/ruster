@@ -34,13 +34,14 @@ use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 
 use ruster_core::{
-    port_free_bitmap_words, DirectoryBucket, DirectoryNode, ForwardingSnapshot, Nat44HostCounter,
-    Nat44HostLink, Nat44HostStorage, Nat44IcmpConfig, Nat44IcmpHashKey, Nat44IcmpPolicy,
-    Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpHostSlot, Nat44TcpIndexStorage,
-    Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime, Nat44TcpSessionHostSlot,
-    Nat44TcpSessionSlot, Nat44UdpConfig, Nat44UdpHashKey, Nat44UdpHostSlot, Nat44UdpIndexStorage,
-    Nat44UdpMappingSlot, Nat44UdpPeerSlot, Nat44UdpPolicy, Nat44UdpRuntime, PortOwnerSlot,
-    Services,
+    dispatch_nat44_tcp_unsolicited_syns, port_free_bitmap_words, DirectoryBucket, DirectoryNode,
+    FirewallConfig, FirewallRuntime, ForwardingSnapshot, Icmpv4ErrorRuntime, MonotonicMillis,
+    Nat44HostCounter, Nat44HostLink, Nat44HostStorage, Nat44IcmpConfig, Nat44IcmpHashKey,
+    Nat44IcmpPolicy, Nat44IcmpRuntime, Nat44TcpConfig, Nat44TcpHashKey, Nat44TcpHostSlot,
+    Nat44TcpIndexStorage, Nat44TcpMappingSlot, Nat44TcpPolicy, Nat44TcpRuntime,
+    Nat44TcpSessionHostSlot, Nat44TcpSessionSlot, Nat44TcpSynHoldSlot, Nat44UdpConfig,
+    Nat44UdpHashKey, Nat44UdpHostSlot, Nat44UdpIndexStorage, Nat44UdpMappingSlot, Nat44UdpPeerSlot,
+    Nat44UdpPolicy, Nat44UdpRuntime, NoTrace, PortOwnerSlot, Services,
 };
 
 use crate::build;
@@ -50,6 +51,10 @@ const MAPPINGS: usize = 1 << 13;
 /// TCP mappings and sessions.
 const TCP_MAPPINGS: usize = 1 << 13;
 const TCP_SESSIONS: usize = 1 << 14;
+/// Unsolicited inbound SYNs held for their delayed Port Unreachable.
+const SYN_HOLDS: usize = 1 << 10;
+/// Matured holds answered per batch.
+const SYN_ANSWERS_PER_BATCH: usize = 64;
 
 /// The NAT configurations made for one set of tables.
 #[derive(Clone, Copy)]
@@ -171,6 +176,36 @@ impl Nat {
         services.nat44_icmp = Some((&self.current.icmp, &mut self.icmp));
     }
 
+    /// Answers the unsolicited inbound SYNs whose 6 seconds are over with a Port
+    /// Unreachable, queued in `errors` (see `ruster_core::dispatch_nat44_tcp_unsolicited_syns`).
+    /// Returns how many holds matured.
+    pub(crate) fn answer_unsolicited_syns(
+        &mut self,
+        errors: &mut Icmpv4ErrorRuntime<'_>,
+        snapshot: &ForwardingSnapshot<'_>,
+        firewall: Option<(&FirewallConfig<'_>, &mut FirewallRuntime<'_>)>,
+        now: MonotonicMillis,
+    ) -> usize {
+        if !self.on {
+            return 0;
+        }
+        let (config, runtime) = match firewall {
+            Some((config, runtime)) => (Some(config), Some(runtime)),
+            None => (None, None),
+        };
+        dispatch_nat44_tcp_unsolicited_syns(
+            &mut self.tcp,
+            errors,
+            snapshot,
+            config,
+            runtime,
+            now,
+            SYN_ANSWERS_PER_BATCH,
+            &mut NoTrace,
+        )
+        .map_or(0, |report| report.matured)
+    }
+
     fn allocate(next: Publication) -> Result<Self, String> {
         let failed = |error: String| format!("nat: {error}");
         let ports = next.ports();
@@ -222,7 +257,9 @@ impl Nat {
             .with_session_hosts(session_hosts),
             tcp_key(),
         )
-        .map_err(|e| failed(format!("TCP: {e:?}")))?;
+        .map_err(|e| failed(format!("TCP: {e:?}")))?
+        .with_unsolicited_syn_holds(leak(SYN_HOLDS, Nat44TcpSynHoldSlot::EMPTY))
+        .map_err(|e| failed(format!("TCP SYN holds: {e:?}")))?;
         Ok(Self {
             current: next,
             on: true,
