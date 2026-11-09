@@ -90,7 +90,9 @@
 //!                              # "address-dependent", "address-and-port-dependent"
 //! ipv4-id-rate-limit = true    # optional, the default: datagrams that may be
 //!                              # fragmented are dropped above the rate at which
-//!                              # their IPv4 IDs stay unique (also in [map-e])
+//!                              # their IPv4 IDs stay unique for 120 s (about 550
+//!                              # a second to one destination, shared by the LAN);
+//!                              # false lets them go (also in [map-e])
 //! ```
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
