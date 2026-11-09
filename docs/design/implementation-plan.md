@@ -101,14 +101,29 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 骨組みの上に[`tables.md`](tables.md)の表を一つずつ載せる。順番はagentが決める（AGENTS.md）。
 
-#### できたもの（2026-11-08）
+#### できたもの（2026-11-09）
 
-IPv4とIPv6の転送、VRF、VLAN、NAT44とMAP-EのNAPT、IPv4とIPv6のfirewall、フラグメント、
-ICMPとICMPv6のエラー、DS-Lite、MAP-E、PPPoE、ルータ宛て通信のTUN、confd、ribd、neighd、
-AF_XDP、AF_PACKET、sim、メッセージ形式、`ruster`コマンド。netnsの試験は14本で、機能を組み合わせた
-構成（VLANの上のNATとfirewall、PPPoEの上のNATとfirewall、PPPoEの上のMAP-E、VLANごとのVRF、
-DS-LiteとIPv6のfirewall、VRFとfirewall）を含み、どれもAF_XDPとAF_PACKETの両方で通る
-（`scripts/netns-all.sh`）。RFCとの見直し（#506）のHighとMediumは直した。
+charterの「作るもの」は全部ある。項目ごとの、従う決まりと外している点（そのモジュールの`# Standards`）と、
+確かめている試験は次のとおり。netnsの試験は14本で、どれもAF_XDPとAF_PACKETの両方で通る
+（`scripts/netns-all.sh`）。
+
+| 作るもの | `# Standards`のあるモジュール | 確かめている試験 |
+|---|---|---|
+| IPv4とIPv6の転送 | core `forwarding.rs`、`route.rs`、`ipv6.rs` | io-sim `acceptance`、`ipv4_property_model`、`ipv6`。netns `skeleton` |
+| VRF | confd `file.rs` | io-sim `vrf`。netns `vrf`、`vrf-vlan`、`vrf-firewall` |
+| VLAN | core `vlan.rs` | io-sim `vlan`。netns `vlan`、`vlan-nat`、`vrf-vlan` |
+| NAT44 | core `nat44.rs`、`nat44_ipv4_id.rs`、fe `nat.rs` | io-sim `nat44_*`、`nat_frag`、`nat_services`。fe `fe.rs`。netns `nat`、`vlan-nat`、`pppoe-nat` |
+| MAP-Eのポートの範囲 | core `port_set.rs`、confd `file.rs` | netns `map-e`、`map-e-pppoe` |
+| 状態を持つfirewall | core `firewall.rs`、`firewall6.rs` | io-sim `stateful_firewall`、`firewall_ipv6`。netns `firewall6`、`dslite-firewall6`、`vrf-firewall`、`nat` |
+| フラグメント | core `ipv4_fragmentation.rs` | io-sim `ipv4_fragmentation*`、`nat_frag`。netns `vlan`、`nat`、`pppoe`、`pppoe-nat`、`dslite` |
+| ICMPとICMPv6のエラー | core `icmpv4_error.rs`、`ipv6.rs` | io-sim `icmpv4_*`、`nat44_icmpv4_*`。netns `skeleton`、`vlan`、`vlan-nat` |
+| トンネル（MAP-E、DS-Lite） | core `tunnel.rs` | io-sim `tunnel`。netns `dslite`、`dslite-firewall6`、`map-e`、`map-e-pppoe` |
+| PPPoEの包み | core `pppoe.rs` | io-sim `pppoe`。netns `pppoe`、`pppoe-nat`、`map-e-pppoe` |
+| ルータ宛て通信の分類、流量制限、TUN | fe `local.rs` | io-sim `local_to_control`、`kernel`。fe `fe.rs`。netns `skeleton`、`nat`、`pppoe` |
+| confd、ribd、neighd | confd `file.rs`、ribd `lib.rs`、neighd `lib.rs`、`nd.rs` | 各crateの試験、e2e `skeleton`。netns `skeleton` |
+| I/O層（AF_XDP、AF_PACKET、sim） | — | io-sim `backend_conformance`。netnsの全部を両方のbackendで |
+| メッセージ形式 | proto `session.rs`、`table.rs` | proto の試験 |
+| 設定を確かめて反映するCLI | — | confd `apply`。netns `skeleton`（`ruster apply`） |
 
 #### 残り（この順に作る）
 
