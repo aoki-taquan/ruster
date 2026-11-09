@@ -125,9 +125,11 @@ charterの「作るもの」は全部ある。項目ごとの、従う決まり�
 | メッセージ形式 | proto `session.rs`、`table.rs` | proto の試験 |
 | 設定を確かめて反映するCLI | — | confd `apply`。netns `skeleton`（`ruster apply`） |
 
-#### 残り（この順に作る）
+#### 残り
 
-1. `backlog`のissueに残したMediumとLow（#506の見直しと、各PRの見直しから）。
+charterの「作るもの」は上の表のとおりそろい、2026-11-09 にownerが達成とみなした。`backlog`のissueに
+残したMediumとLow（試験の不足、数え方、説明の細かい点、作らないと決めて理由を書いた点）は、
+backlogのまま置き、使う場面が出たものから片付ける。
 
 今は作らないもの（2026-11-08 owner決定）: PPPoEの制御（Discovery、LCP、認証、IPCP。セッションは
 外で張られている前提）、マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
