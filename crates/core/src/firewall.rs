@@ -44,9 +44,10 @@ pub const FIREWALL_TCP_ACTIVE_DEFAULT_IDLE_TTL_MS: u64 = 7_440_000;
 pub const FIREWALL_MAX_IDLE_TTL_MS: u64 = 604_800_000;
 /// Most work one carrying publication may spend re-evaluating carried
 /// flows (RELOAD-CARRY), in units of one first-match rule test: the bound is
-/// `live flows x (rules + 4 x FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT)`, with the
+/// `live flows x (rules + 6 x FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT)`, with the
 /// rule term only when the rules changed and the lookup term only when the
-/// routes changed (two endpoints, two snapshots), checked before any work.
+/// routes changed (two endpoints, two snapshots, and a leaked flow's
+/// responder in its own VRF), checked before any work.
 /// Above it the publication flushes the flow table instead
 /// ([`crate::StateCarryConflict::ReevaluationBudget`]). The bound is a count,
 /// not a time: on the development host (release build) a rule test took
@@ -1780,7 +1781,8 @@ impl CarryRoutes<'_> {
     /// Whether the route to either endpoint of `slot` leaves through
     /// another interface now, or appeared or disappeared. A changed next hop
     /// out of the same interface keeps the flow: its state still matches
-    /// both directions exactly. Two route lookups per snapshot.
+    /// both directions exactly. Two route lookups per snapshot, and for a flow
+    /// that came in through another VRF one more in that VRF.
     ///
     /// An endpoint that is one of the router's own addresses in both
     /// snapshots is skipped (core L2). Such an endpoint can be a flow's
@@ -1845,7 +1847,10 @@ impl CarryRoutes<'_> {
         }
         match slot.responder_address {
             FirewallAddress::V4(address) => {
-                current.route_lookup(address) != next.route_lookup(address)
+                let egress = |snapshot: &crate::ForwardingSnapshot<'_>| {
+                    snapshot.route_lookup(address).map(|route| route.egress())
+                };
+                egress(current) != egress(next)
             }
             FirewallAddress::V6(address) => {
                 let egress = |snapshot: &crate::ForwardingSnapshot<'_>| {
@@ -2125,8 +2130,9 @@ impl<'state> FirewallRuntime<'state> {
     /// flushes instead ([`crate::StateCarryConflict::Timers`]): it would make
     /// expired, not yet reclaimed flows live again; a shorter one applies
     /// to carried flows from their last activity. The work, `live flows x
-    /// (rules + 4)` rule tests and route lookups as far as each applies
-    /// (two endpoints in two snapshots), is bounded by
+    /// (rules + 6)` rule tests and route lookups as far as each applies
+    /// (two endpoints in two snapshots, and a leaked flow's responder in its
+    /// own VRF), is bounded by
     /// [`FIREWALL_CARRY_REEVALUATION_BUDGET`]; above it the table flushes
     /// ([`crate::StateCarryConflict::ReevaluationBudget`]). Both fallbacks
     /// are fail closed.
@@ -2169,7 +2175,9 @@ impl<'state> FirewallRuntime<'state> {
         });
         let per_flow = reevaluate.map_or(0, |rules| rules.len() as u64)
             + if routes.is_some() {
-                4 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT
+                // Two endpoints in two snapshots, and a leaked flow's responder in
+                // its own VRF in both.
+                6 * FIREWALL_CARRY_ROUTE_LOOKUP_WEIGHT
             } else {
                 0
             };
