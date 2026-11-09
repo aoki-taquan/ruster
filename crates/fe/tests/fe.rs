@@ -3431,3 +3431,84 @@ fn the_router_s_icmp_error_about_a_flow_it_received_leaves_as_related() {
         "unrelated, it is dropped"
     );
 }
+
+/// An interface keeps its id across a table change: a firewall flow through VLAN
+/// 20 still lets its replies in after VLAN 10, whose name comes first, is added.
+#[test]
+fn a_flow_through_a_vlan_survives_adding_a_vlan_before_it() {
+    let mut bench = Bench::new();
+    let (mut config, mut routes) = configure(&mut bench);
+    let sub = |name: &str, id: u16| {
+        Change::set(
+            Key::Interface { name: name.into() },
+            Value::Interface {
+                enabled: true,
+                mac: LAN_MAC,
+                mtu: 1496,
+                vrf: ruster_proto::table::DEFAULT_VRF.into(),
+                vlan: Some(ruster_proto::table::Vlan {
+                    parent: "lan".into(),
+                    id,
+                }),
+                tunnel: None,
+                pppoe: None,
+            },
+        )
+    };
+    let udp_out = rule_for(1, ruster_proto::table::Protocol::Udp, Some("lan.20"), None);
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[
+                sub("lan.20", 20),
+                address("lan.20", [10, 20, 0, 1], 24),
+                udp_out
+            ]
+        ),
+        Code::CHANGED
+    );
+    assert_eq!(
+        bench.patch(&mut routes, &[route([10, 20, 0, 0], 24, "lan.20", None)]),
+        Code::CHANGED
+    );
+    let host = [10, 20, 0, 5];
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    assert_eq!(
+        bench.patch(
+            &mut neighbors,
+            &[
+                neighbor("lan.20", host, HOST_MAC),
+                neighbor("wan", GATEWAY, GATEWAY_MAC)
+            ]
+        ),
+        Code::CHANGED
+    );
+    let mut out = Vec::new();
+    out.extend_from_slice(&LAN_MAC);
+    out.extend_from_slice(&HOST_MAC);
+    out.extend_from_slice(&[0x81, 0x00, 0x00, 20, 0x08, 0x00]);
+    out.extend_from_slice(&udp_packet(host, INTERNET, (5_000, 53)));
+    bench.fe.io_mut().inject(IfId(0), out);
+    bench.fe.step(bench.now);
+    assert_eq!(bench.fe.io_mut().pop_tx().expect("out").egress, IfId(1));
+    let reply = || from_wan(&udp_packet(INTERNET, host, (53, 5_000)));
+    bench.fe.io_mut().inject(IfId(1), reply());
+    bench.fe.step(bench.now);
+    assert!(bench.fe.io_mut().pop_tx().is_some(), "the reply comes in");
+
+    assert_eq!(
+        bench.patch(
+            &mut config,
+            &[sub("lan.10", 10), address("lan.10", [10, 10, 0, 1], 24)]
+        ),
+        Code::CHANGED
+    );
+    bench.fe.io_mut().inject(IfId(1), reply());
+    bench.fe.step(bench.now);
+    let tx = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("the flow was carried across the change");
+    assert_eq!(&tx.bytes[12..16], &[0x81, 0x00, 0x00, 20]);
+}

@@ -196,10 +196,13 @@ where
             ports,
             built: None,
             generation: 0,
+            names: Vec::new(),
+            checked_names: Vec::new(),
         };
         builder
             .check(&Store::default())
             .expect("empty tables build");
+        builder.committed(&Store::default());
         let (built, _, _) = builder.built.take().expect("built");
         Self {
             io,
@@ -848,6 +851,10 @@ struct Builder {
     )>,
     /// Of the last firewall publication.
     generation: u64,
+    /// The interface of each id in the tables committed last, and in the ones being
+    /// checked: a table change keeps the ids of the interfaces that stay.
+    names: Vec<String>,
+    checked_names: Vec<String>,
 }
 
 /// The id of the interface `name` (a port or a VLAN sub-interface) in `names`.
@@ -858,7 +865,8 @@ fn interface_id(names: &[String], name: &str) -> Option<IfId> {
 
 impl Hook for Builder {
     fn check(&mut self, next: &Store) -> Result<(), String> {
-        let built = build::build(&self.ports, next)?;
+        let built = build::build(&self.ports, next, &self.names)?;
+        self.checked_names.clone_from(&built.interface_names);
         self.generation += 1;
         let default = built.vrfs.first().ok_or("no default VRF")?;
         let publication = firewall::Publication::new(
@@ -877,7 +885,9 @@ impl Hook for Builder {
         Ok(())
     }
 
-    fn committed(&mut self, _store: &Store) {}
+    fn committed(&mut self, _store: &Store) {
+        self.names.clone_from(&self.checked_names);
+    }
 }
 
 #[derive(Clone, Copy)]
