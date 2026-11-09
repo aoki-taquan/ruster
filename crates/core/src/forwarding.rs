@@ -5614,7 +5614,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
     if let (Some(_), PacketDecision::Nat44Icmpv4(rewrite)) = (kernel, &mut decision) {
         rewrite.outer_checksum = rfc1624_update(
             rewrite.outer_checksum,
-            u16::from_be_bytes([outer.ttl - 1, outer.protocol]),
+            u16::from_be_bytes([outer.ttl.wrapping_sub(1), outer.protocol]),
             u16::from_be_bytes([outer.ttl, outer.protocol]),
         );
         rewrite.outer_ttl = outer.ttl;
@@ -5623,7 +5623,7 @@ fn decide_nat44_icmpv4_frag_needed<T: TraceSink>(
 }
 
 /// Parses and validates a candidate ICMPv4 error and its quote (RFC 5508
-/// REQ-3): outer IHL 5, nonfragment, TTL > 1, valid ICMP checksum, a
+/// REQ-3): outer IHL 5, nonfragment, valid ICMP checksum, a
 /// Fragmentation Needed Next-Hop MTU of 0 or at least 68; a quoted
 /// IPv4 header with a valid checksum (options skipped by IHL), reserved flag
 /// and DF ignored, MF=0/offset=0, UDP, TCP or an ICMP query, and the first
@@ -5921,7 +5921,7 @@ fn build_nat44_icmpv4_rewrite(
     let mut outer_checksum = rfc1624_update(
         outer.checksum,
         u16::from_be_bytes([outer.ttl, outer.protocol]),
-        u16::from_be_bytes([outer.ttl - 1, outer.protocol]),
+        u16::from_be_bytes([outer.ttl.wrapping_sub(1), outer.protocol]),
     );
     if rewrite.outer_source.is_some() {
         outer_checksum = rfc1624_update_address(outer_checksum, outer.source, outer_source);
@@ -5935,7 +5935,9 @@ fn build_nat44_icmpv4_rewrite(
         source_mac,
         destination_mac,
         outer_ttl_offset: outer.header_offset + 8,
-        outer_ttl: outer.ttl - 1,
+        // Only a forwarded error is rewritten with this; one to the router's host
+        // (which may come with TTL 0) gets its TTL back above.
+        outer_ttl: outer.ttl.wrapping_sub(1),
         outer_checksum_offset: outer.header_offset + 10,
         outer_source_offset: outer.header_offset + 12,
         inner_checksum_offset: quote.inner_checksum_offset,

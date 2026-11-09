@@ -3744,16 +3744,20 @@ fn an_outside_error_with_ttl_1_about_the_router_s_flow_reaches_it() {
     error[12..16].copy_from_slice(&INTERNET);
     error[16..20].copy_from_slice(&[198, 51, 100, 2]);
     error.extend_from_slice(&icmp);
-    let error = ipv4_checksummed(error);
-    bench.fe.io_mut().inject(IfId(1), from_wan(&error));
-    bench.fe.step(bench.now);
     let mut buf = [0_u8; 2048];
-    let n = kernel.recv(&mut buf).expect("the error reached the router");
-    assert_eq!((buf[20], buf[21]), (3, 3));
-    assert_eq!(
-        &buf[16..20],
-        &[192, 0, 2, 1],
-        "addressed back to the LAN address"
-    );
-    let _ = n;
+    // TTL 1, and TTL 0 too: neither is forwarded, and its TTL stays.
+    for ttl in [1, 0] {
+        error[8] = ttl;
+        let error = ipv4_checksummed(error.clone());
+        bench.fe.io_mut().inject(IfId(1), from_wan(&error));
+        bench.fe.step(bench.now);
+        kernel.recv(&mut buf).expect("the error reached the router");
+        assert_eq!((buf[20], buf[21]), (3, 3));
+        assert_eq!(buf[8], ttl, "its TTL stays");
+        assert_eq!(
+            &buf[16..20],
+            &[192, 0, 2, 1],
+            "addressed back to the LAN address"
+        );
+    }
 }
