@@ -30,7 +30,10 @@
 //! dropped, with no Port Unreachable later (REQ-4's SHOULD). A SYN whose
 //! source is not routed back out of the outside interface is not answered
 //! either. The answer leaves at the first tick after the 6 seconds (and a
-//! small clock margin), and a retransmitted SYN restarts the wait.
+//! small clock margin), and a retransmitted SYN restarts the wait. Every
+//! reconcile of the TCP runtime flushes the holds (the hash key rotates), so a
+//! table change during the wait, such as a neighbor the neighbor process
+//! learned, drops the SYN without an answer.
 
 use super::*;
 use crate::firewall::FirewallUnsolicitedSynPacket;
