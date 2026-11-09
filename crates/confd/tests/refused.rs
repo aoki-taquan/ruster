@@ -35,7 +35,6 @@ impl Hook for Check {
 
 fn config(mtu: u16) -> Config {
     Config {
-        wireguard: Vec::new(),
         interfaces: vec![InterfaceConfig {
             name: "lan".into(),
             mac: [2, 0, 0, 0, 0, 1],

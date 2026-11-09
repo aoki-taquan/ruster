@@ -951,73 +951,17 @@ fn a_pppoe_interface_runs_on_its_parent() {
     }
 }
 
-mod wireguard {
-    use super::*;
-
-    fn file(interface: &str, peers: &str) -> String {
-        format!(
-            "[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\nipv4 = \"198.51.100.2/24\"\n\n\
-             [[interface]]\nname = \"wg0\"\n{interface}\n{peers}"
-        )
-    }
-
-    const WG: &str =
-        "wireguard = { listen-port = 51820, local = \"198.51.100.2\" }\nipv4 = \"10.9.0.1/32\"";
-
-    fn peer_text(extra: &str) -> String {
-        format!(
-            "[[wireguard-peer]]\ninterface = \"wg0\"\nname = \"branch\"\nendpoint = \"203.0.113.9:51821\"\nallowed = [\"10.9.0.0/16\"]\n{extra}\n"
-        )
-    }
-
-    #[test]
-    fn a_wireguard_interface_with_a_peer() {
-        let config = parse(&file(WG, &peer_text(""))).unwrap();
-        let wg = &config.interfaces[1];
-        assert_eq!((wg.name.as_str(), wg.mtu), ("wg0", 1420));
-        let wireguard = &config.wireguard[0];
-        assert_eq!(wireguard.listen_port, 51820);
-        assert_eq!(wireguard.local, Ipv4Addr::new(198, 51, 100, 2));
-        let peer = &wireguard.peers[0];
-        assert_eq!(peer.endpoint, (Ipv4Addr::new(203, 0, 113, 9), 51821));
-        assert_eq!(peer.allowed, [(Ipv4Addr::new(10, 9, 0, 0), 16)]);
-    }
-
-    #[test]
-    fn a_session_key_is_not_taken_from_a_file() {
-        let session =
-            "session = { send = \"01\", receive = \"02\", peer-index = 1, local-index = 2 }";
-        assert!(parse(&file(WG, &peer_text(session))).is_err());
-    }
-
-    #[test]
-    fn what_is_wrong_is_refused() {
-        let bad_wg = |settings: &str| parse(&file(settings, &peer_text("")));
-        for settings in [
-            "wireguard = { listen-port = 0, local = \"198.51.100.2\" }",
-            "wireguard = { listen-port = 1, local = \"127.0.0.1\" }",
-            "wireguard = { listen-port = 1, local = \"198.51.100.77\" }",
-            "wireguard = { listen-port = 1, local = \"198.51.100.2\" }\nmtu = 1441",
-            "wireguard = { listen-port = 1, local = \"198.51.100.2\" }\nvlan = 5\nparent = \"wan\"",
-        ] {
-            assert!(bad_wg(settings).is_err(), "{settings}");
-        }
-        let bad_peer = |text: &str| parse(&file(WG, text));
-        let wrong = |from: &str, to: &str| peer_text("").replace(from, to);
-        for text in [
-            wrong("interface = \"wg0\"", "interface = \"wan\""),
-            wrong("203.0.113.9:51821", "203.0.113.9"),
-            wrong("203.0.113.9:51821", "203.0.113.9:0"),
-            wrong("203.0.113.9:51821", "0.0.0.0:5"),
-            wrong("[\"10.9.0.0/16\"]", "[]"),
-            wrong("[\"10.9.0.0/16\"]", "[\"10.9.0.1/16\"]"),
-            wrong("[\"10.9.0.0/16\"]", "[\"2001:db8::/32\"]"),
-            wrong("name = \"branch\"", "name = \"\""),
-            format!("{}{}", peer_text(""), peer_text("")),
-        ] {
-            assert!(bad_peer(&text).is_err(), "{text}");
-        }
-    }
+#[test]
+fn wireguard_settings_are_refused() {
+    // WireGuard is not part of ruster (docs/charter.md).
+    let interface = "[[interface]]\nname = \"wg0\"\nwireguard = { listen-port = 51820, local = \"198.51.100.2\" }\n";
+    assert!(
+        error(interface).contains("wireguard"),
+        "{}",
+        error(interface)
+    );
+    let peer = "[[wireguard-peer]]\ninterface = \"wg0\"\nname = \"branch\"\nendpoint = \"203.0.113.9:51821\"\nallowed = [\"10.9.0.0/16\"]\n";
+    assert!(error(peer).contains("wireguard-peer"), "{}", error(peer));
 }
 
 #[test]
