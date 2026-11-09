@@ -9,6 +9,9 @@
 //! - RFC 2516 section 4: Ethernet type 0x8864, version and type 1, code 0, the
 //!   session ID and the payload length, then the PPP protocol field (RFC 1661):
 //!   0x0021 for IPv4 (RFC 1332), 0x0057 for IPv6 (RFC 5072).
+//! - RFC 2516 section 5.5: a session is the peer's MAC address, the router's on
+//!   the parent's link and the session ID, so a frame to another host with the
+//!   same ID is not the session's.
 //! - RFC 4638 is not used: a session's MTU is its interface's (1492 on a 1500-byte
 //!   link).
 //!
@@ -73,6 +76,19 @@ pub(crate) fn receive<S: PacketSlot>(
         return Err(DropReason::PppoeUnknownSession);
     };
     let session = *session;
+    // The session is the peer, our MAC address on the parent's link and the ID: the
+    // AC may give another host the same ID.
+    let parent_mac = snapshot
+        .interface(session.parent)
+        .ok_or(DropReason::InterfaceMiss)?
+        .mac;
+    if bytes[0..6] != parent_mac.0 {
+        return Err(DropReason::PppoeUnknownSession);
+    }
+    let mac = snapshot
+        .interface(session.interface)
+        .ok_or(DropReason::InterfaceMiss)?
+        .mac;
     if bytes[14] != 0x11 || bytes[15] != 0 {
         return Err(DropReason::PppoeMalformed);
     }
@@ -85,10 +101,6 @@ pub(crate) fn receive<S: PacketSlot>(
         PPP_IPV6 => IPV6_ETHERTYPE,
         _ => return Err(DropReason::PppoeNotIp),
     };
-    let mac = snapshot
-        .interface(session.interface)
-        .ok_or(DropReason::InterfaceMiss)?
-        .mac;
     bytes.copy_within(6..12, 6 + HEADER);
     bytes[HEADER..HEADER + 6].copy_from_slice(&mac.0);
     bytes[HEADER + 12..HEADER + 14].copy_from_slice(&ethertype);
