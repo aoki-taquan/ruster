@@ -166,6 +166,11 @@ pub(super) fn decide_nat44_icmpv4_inside_error<T: TraceSink>(
 ) -> Result<PacketDecision, DropReason> {
     let quote = parse_nat44_icmpv4_error(frame, outer)
         .map_err(|reason| trace_nat44_icmpv4_drop(ingress, reason, trace))?;
+    // Forwarded out, it goes one hop on (the router's own too: the rewrite takes one
+    // off, and the kernel never sends one this low).
+    if outer.ttl <= 1 {
+        return nat44_icmpv4_drop(ingress, Nat44Icmpv4OuterTtlExpired, trace);
+    }
     // A router address as the sender is forged, unless the router itself sent it
     // (from the kernel's interface).
     if !icmp_error_source_is_host(snapshot, outer.source)
