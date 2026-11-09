@@ -963,3 +963,37 @@ fn a_nat_without_the_ipv4_id_rate_limit_and_with_per_host_limits_round_trips() {
     );
     assert_eq!(round_trip(&change), change);
 }
+
+#[test]
+fn a_per_host_limit_over_u16_is_refused_by_its_name() {
+    let change = Change::set(
+        Key::Nat {
+            vrf: DEFAULT_VRF.into(),
+        },
+        Value::Nat(ruster_proto::table::Nat {
+            inside: "lan".into(),
+            outside: "wan".into(),
+            external: None,
+            ports: ruster_proto::table::NatPorts::Range {
+                first: 1_024,
+                last: 2_047,
+            },
+            filtering: Default::default(),
+            ipv4_id_rate_limit: true,
+            ports_per_host: 0,
+            state_per_host: 512,
+        }),
+    );
+    let mut out = Vec::new();
+    change.encode(&mut Encoder::new(&mut out)).unwrap();
+    // state-per-host (member 102) = 512, made 70000.
+    let at = out
+        .windows(5)
+        .position(|w| w == [0x18, 102, 0x19, 0x02, 0x00])
+        .expect("the member");
+    out.splice(at + 2..at + 5, [0x1a, 0x00, 0x01, 0x11, 0x70]);
+    assert_eq!(
+        decode_bytes(&out),
+        Err(ModelError::Invalid("state-per-host"))
+    );
+}

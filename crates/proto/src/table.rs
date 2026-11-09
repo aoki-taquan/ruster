@@ -1258,8 +1258,15 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             Some(_) => return Err(ModelError::Invalid("ipv4-id-rate-limit")),
         };
         // Left out: 0, no limit.
-        let ports_per_host = port(&mut got, sid::NAT_PORTS_PER_HOST)?.unwrap_or(0);
-        let state_per_host = port(&mut got, sid::NAT_STATE_PER_HOST)?.unwrap_or(0);
+        let limit = |got: &mut std::collections::BTreeMap<u64, Member>,
+                     member: u64,
+                     what: &'static str| match got.remove(&member) {
+            Some(Member::Uint(n)) => u16::try_from(n).map_err(|_| ModelError::Invalid(what)),
+            Some(_) => Err(ModelError::Invalid(what)),
+            None => Ok(0),
+        };
+        let ports_per_host = limit(&mut got, sid::NAT_PORTS_PER_HOST, "ports-per-host")?;
+        let state_per_host = limit(&mut got, sid::NAT_STATE_PER_HOST, "state-per-host")?;
         let range = (
             port(&mut got, sid::NAT_FIRST_PORT)?,
             port(&mut got, sid::NAT_LAST_PORT)?,
