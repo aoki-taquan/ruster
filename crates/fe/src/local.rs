@@ -17,9 +17,8 @@
 //! [`LOCAL_BURST`] for every class and VRF and cannot be configured, where
 //! section 3.2 leaves the rates to each deployment; no class is filtered by
 //! source or port, and fragments are not dropped (section 3.1). The class is
-//! read at a fixed place: an ICMPv6 packet behind an extension header is in
-//! the other class, and an IPv4 fragment after the first is classed by the
-//! bytes where its transport header would be.
+//! read at a fixed place: an ICMPv6 packet behind an extension header, and an
+//! IPv4 fragment after the first, are in the other class.
 
 use std::io;
 use std::os::unix::net::UnixDatagram;
@@ -73,6 +72,15 @@ pub(crate) enum Class {
 /// The class of an IP packet (`packet` starts at the IP header).
 pub(crate) fn class(packet: &[u8]) -> Class {
     let (protocol, header) = match packet.first().map(|b| b >> 4) {
+        // A fragment after the first has no transport header: its bytes there are
+        // data, so it is classed by nothing but being IP.
+        Some(4)
+            if packet
+                .get(6..8)
+                .is_some_and(|f| u16::from_be_bytes([f[0], f[1]]) & 0x1fff != 0) =>
+        {
+            (None, 0)
+        }
         Some(4) => (packet.get(9).copied(), usize::from(packet[0] & 0x0f) * 4),
         Some(6) => (packet.get(6).copied(), 40),
         _ => (None, 0),
@@ -175,5 +183,18 @@ mod tests {
         assert_eq!(class(&tcp), Class::Tcp, "a SYN-ACK is a reply");
         tcp[33] = 0x10;
         assert_eq!(class(&tcp), Class::Tcp);
+    }
+
+    #[test]
+    fn a_later_fragment_is_not_classed_by_its_data() {
+        // Offset 8 (64 bytes): what sits where a TCP header would be is data.
+        let mut later = vec![0x45, 0, 0, 40, 0, 0, 0, 8, 64, 6];
+        later.resize(40, 0);
+        later[33] = 0x02;
+        assert_eq!(class(&later), Class::Other);
+        // The first fragment (MF set, offset 0) has the header.
+        later[6] = 0x20;
+        later[7] = 0;
+        assert_eq!(class(&later), Class::TcpSyn);
     }
 }
