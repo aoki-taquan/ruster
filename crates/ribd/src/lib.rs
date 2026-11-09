@@ -301,7 +301,10 @@ impl Ribd {
                 self.resync_end = None;
                 if refused {
                     self.resync_pending = true;
-                    self.resync_end_refused = true;
+                    // A change from a source in this same step, or a patch on its
+                    // way, already counts as the next change: resync-end goes
+                    // again after it.
+                    self.resync_end_refused = !self.dirty && self.in_flight.is_none();
                 }
             }
             if self.in_flight.as_ref().is_some_and(|(t, _)| t == token) {
