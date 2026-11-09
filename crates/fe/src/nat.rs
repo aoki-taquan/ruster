@@ -2,9 +2,9 @@
 //! and its mappings.
 //!
 //! Every accepted table change makes new configurations for the new tables. The
-//! runtimes take them over and keep their mappings when core allows it (same
-//! interfaces, public address and port range; see `preflight_reconcile_carrying`),
-//! and flush them otherwise. The runtimes' storage is allocated when NAT first
+//! runtimes take them over and keep their mappings when core allows it (see
+//! `preflight_reconcile_carrying`: for example the same interfaces, public address
+//! and port range, and no new or lower per-host limit), and flush them otherwise. The runtimes' storage is allocated when NAT first
 //! appears and kept for the life of the process. Only a port range of another size
 //! needs new storage, and then the old one is not given back: a range is resized by
 //! hand, rarely.
@@ -31,7 +31,9 @@
 //!   NAT's.
 //! - The per-host limits are off unless the tables set them: then one inside host
 //!   may take every mapping. There is no limit on how fast a host makes mappings
-//!   or state (RFC 6888 REQ-4 c, REQ-5 b).
+//!   or state (RFC 6888 REQ-4 c, REQ-5 b). With endpoint-independent filtering,
+//!   `state-per-host` does not limit UDP's outside endpoints (outside hosts could
+//!   use it up).
 //! - Fragments whose datagram started before a table change are dropped
 //!   (`fragments.rs`).
 use std::collections::hash_map::RandomState;
@@ -93,7 +95,16 @@ impl Publication {
                 Nat44UdpPolicy::default()
                     .with_filtering(filtering)
                     .with_mappings_per_host(ports_per_host)
-                    .with_peers_per_host(state_per_host),
+                    // With endpoint-independent filtering every outside sender a
+                    // host answers counts, so outside hosts could use up its
+                    // budget: no peer limit then (core's NAT44-125).
+                    .with_peers_per_host(
+                        if filtering == ruster_core::Nat44Filtering::EndpointIndependent {
+                            0
+                        } else {
+                            state_per_host
+                        },
+                    ),
             )
             .map_err(|e| failed(format!("{e:?}")))?,
             tcp: Nat44TcpConfig::with_port_set(

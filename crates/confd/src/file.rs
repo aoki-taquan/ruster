@@ -96,7 +96,10 @@
 //! ports-per-host = 0           # optional: the most public ports one LAN host
 //!                              # holds for each of UDP, TCP and ICMP; 0 for none
 //! state-per-host = 0           # optional: the most TCP sessions, and outside
-//!                              # endpoints of its UDP and ICMP, of one LAN host
+//!                              # endpoints of its UDP (not with endpoint-
+//!                              # independent filtering) and ICMP, of one LAN host
+//!                              # (both also in [map-e]; setting or lowering one
+//!                              # drops every NAT flow)
 //! ```
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
