@@ -68,6 +68,7 @@ fn config() -> Config {
         }],
         firewall: Vec::new(),
         firewall_filtering: Default::default(),
+        firewall_outside: None,
         icmp_errors: None,
         nat: None,
     }

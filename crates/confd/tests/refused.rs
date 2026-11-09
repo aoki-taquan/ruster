@@ -50,6 +50,7 @@ fn config(mtu: u16) -> Config {
         static_routes: Vec::new(),
         firewall: Vec::new(),
         firewall_filtering: Default::default(),
+        firewall_outside: None,
         icmp_errors: None,
         nat: None,
     }

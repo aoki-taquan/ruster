@@ -86,6 +86,9 @@ pub struct Config {
     pub firewall: Vec<ruster_proto::table::FirewallRule>,
     /// How the default VRF's forward firewall filters where no rule decides.
     pub firewall_filtering: ruster_proto::table::NatFiltering,
+    /// The firewall's outside interfaces as the file names them; when `None`, NAT's
+    /// outside and the interfaces of the default VRF's static default routes.
+    pub firewall_outside: Option<Vec<String>>,
     /// The ICMP error rate limits (IPv4 interval, IPv6 burst and interval), when set.
     pub icmp_errors: Option<(u32, u32, u32)>,
     /// The default VRF's NAPT.
@@ -340,6 +343,12 @@ impl Confd {
     /// The interfaces outside the network the firewall guards: NAT's outside and
     /// those the default VRF's default routes leave through (RFC 6092's exterior).
     fn firewall_outside(&self) -> Vec<String> {
+        if let Some(outside) = &self.config.firewall_outside {
+            let mut outside = outside.clone();
+            outside.sort();
+            outside.dedup();
+            return outside;
+        }
         let mut outside: Vec<String> = self
             .config
             .nat
@@ -682,6 +691,7 @@ mod tests {
             static_routes: vec![route(24), route(25)],
             firewall: Vec::new(),
             firewall_filtering: Default::default(),
+            firewall_outside: None,
             icmp_errors: None,
             nat: None,
         });
@@ -733,6 +743,7 @@ mod tests {
             }],
             firewall: Vec::new(),
             firewall_filtering: Default::default(),
+            firewall_outside: None,
             icmp_errors: None,
             nat: None,
         };
@@ -745,5 +756,27 @@ mod tests {
         let routes = confd.routes();
         assert!(routes.contains_key(&connected));
         assert!(routes.contains_key(&static_route));
+    }
+
+    #[test]
+    fn a_named_firewall_outside_is_what_the_fe_is_told() {
+        let mut config = Config::default();
+        config.firewall.push(ruster_proto::table::FirewallRule {
+            ingress: None,
+            egress: None,
+            source: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            destination: (Ipv4Addr::UNSPECIFIED.into(), 0),
+            protocol: ruster_proto::table::Protocol::Udp,
+            source_ports: (0, 65_535),
+            destination_ports: (0, 65_535),
+            action: ruster_proto::table::FirewallAction::Accept,
+        });
+        config.firewall_outside = Some(vec!["wan".into(), "pppoe".into()]);
+        let tables = Confd::new(config).fe_tables();
+        let policy = tables.iter().find_map(|(key, value)| match (key, value) {
+            (Key::FirewallPolicy { .. }, Value::FirewallPolicy { outside, .. }) => Some(outside),
+            _ => None,
+        });
+        assert_eq!(policy, Some(&vec!["pppoe".to_owned(), "wan".to_owned()]));
     }
 }
