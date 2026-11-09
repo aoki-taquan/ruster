@@ -138,6 +138,10 @@ struct Peer {
     /// The peer refused resync-end; when that was first seen. It is sent again
     /// after the next accepted change, or [`RESYNC_END_RETRY_MS`] after this.
     resync_end_refused: Option<Option<u64>>,
+    /// The peer refused a patch; when that was first seen. Everything is sent again
+    /// with the next change, or [`RESYNC_END_RETRY_MS`] after this (what the peer
+    /// refused for may have gone).
+    patch_refused: Option<Option<u64>>,
 }
 
 /// A refused resync-end is sent again at least this often.
@@ -167,6 +171,7 @@ impl Peer {
         let (_, _, held) = self.in_flight.remove(at);
         if accepted {
             self.sent = held;
+            self.patch_refused = None;
             if self.in_flight.is_empty() {
                 if self.resync_open {
                     self.resync_end = Some(self.client.resync_end());
@@ -189,6 +194,7 @@ impl Peer {
             // Nothing is accepted since this resync-begin: resync-end waits for the
             // next accepted full send, not for the clock.
             self.resync_end_refused = None;
+            self.patch_refused.get_or_insert(None);
         }
     }
 }
@@ -341,6 +347,7 @@ impl Confd {
             says_done,
             resync_end: None,
             resync_end_refused: None,
+            patch_refused: None,
         };
         if desired.is_empty() {
             peer.resync_end = Some(peer.client.resync_end());
@@ -617,6 +624,30 @@ fn send_diff(
 impl Task for Confd {
     fn step(&mut self, now_ms: u64) -> Progress {
         let mut progress = Progress::IDLE;
+        // A refused patch is sent again, in full, after a while, though nothing
+        // changed.
+        let mut resend = Vec::new();
+        for (kind, peer) in [
+            (PeerKind::Fe, &mut self.fe),
+            (PeerKind::Ribd, &mut self.ribd),
+            (PeerKind::Neighd, &mut self.neighd),
+        ] {
+            let Some(peer) = peer else { continue };
+            let Some(seen) = peer.patch_refused.as_mut() else {
+                continue;
+            };
+            let at = *seen.get_or_insert(now_ms);
+            let retry_at = at.saturating_add(RESYNC_END_RETRY_MS);
+            if now_ms < retry_at {
+                progress = progress.and(Progress {
+                    busy: false,
+                    wake_at: Some(retry_at),
+                });
+            } else if peer.in_flight.is_empty() {
+                peer.patch_refused = None;
+                resend.push(kind);
+            }
+        }
         // A refused resync-end goes again after a while, though nothing changed.
         for peer in [&mut self.fe, &mut self.ribd, &mut self.neighd]
             .into_iter()
@@ -641,7 +672,6 @@ impl Task for Confd {
         }
         // Peers that refused a patch older than the configuration now held: a refusal
         // drops every patch in flight, the newer ones too, so they get it all again.
-        let mut resend = Vec::new();
         for (kind, peer) in [
             (PeerKind::Fe, &mut self.fe),
             (PeerKind::Ribd, &mut self.ribd),

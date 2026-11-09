@@ -89,6 +89,9 @@ pub struct Ribd {
     /// may have gone).
     resync_end_refused: bool,
     refused_at: Option<u64>,
+    /// The FE refused a patch: everything goes again with the next change from a
+    /// source, or [`RESYNC_END_RETRY_MS`] after the refusal was seen.
+    patch_refused: Option<Option<u64>>,
     counters: RibdCounters,
 }
 
@@ -127,6 +130,7 @@ impl Ribd {
             resync_end: None,
             resync_end_refused: false,
             refused_at: None,
+            patch_refused: None,
             counters: RibdCounters::default(),
         })
     }
@@ -159,6 +163,7 @@ impl Ribd {
         self.resync_end = None;
         self.resync_end_refused = false;
         self.refused_at = None;
+        self.patch_refused = None;
         self.dirty = true;
         self.resync_pending = self.waiting_since.is_none();
         Ok(())
@@ -283,6 +288,20 @@ impl Task for Ribd {
         if std::mem::take(&mut self.dirty) && self.push() {
             progress.busy = true;
         }
+        if let Some(seen) = self.patch_refused.as_mut() {
+            let at = *seen.get_or_insert(now_ms);
+            let retry_at = at.saturating_add(RESYNC_END_RETRY_MS);
+            if now_ms >= retry_at && self.in_flight.is_none() {
+                self.patch_refused = None;
+                self.dirty = true;
+                progress.busy = true;
+            } else if now_ms < retry_at {
+                progress = progress.and(Progress {
+                    busy: false,
+                    wake_at: Some(retry_at),
+                });
+            }
+        }
         if self.resync_end_refused {
             let at = *self.refused_at.get_or_insert(now_ms);
             let retry_at = at.saturating_add(RESYNC_END_RETRY_MS);
@@ -310,7 +329,7 @@ impl Task for Ribd {
 impl Ribd {
     /// Handles the FE's answers. An accepted patch makes its routes what the FE holds;
     /// a refused one starts a resync, so routes the FE already has are kept until a
-    /// later full send is accepted. The refused routes go again with the next change.
+    /// later full send is accepted. The refused routes go again with the next change, or after RESYNC_END_RETRY_MS.
     fn answers(&mut self, events: &[Event]) {
         for event in events {
             let Event::Response { token, code, .. } = event else {
@@ -338,11 +357,13 @@ impl Ribd {
                     // the FE holds stay until then.
                     self.fe.resync_begin();
                     self.sent.clear();
+                    self.patch_refused.get_or_insert(None);
                     if self.waiting_since.is_none() {
                         self.resync_pending = true;
                     }
                 } else {
                     self.sent = selected;
+                    self.patch_refused = None;
                 }
             }
         }

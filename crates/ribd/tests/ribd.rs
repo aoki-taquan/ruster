@@ -237,7 +237,8 @@ fn a_refused_full_send_after_a_restart_does_not_delete_the_fe_routes() {
     lab.settle();
     lab.now = 10_000;
     lab.settle();
-    assert_eq!(lab.ribd.counters().patches_refused, 1);
+    // Refused, and refused again when it went again after the wait.
+    assert_eq!(lab.ribd.counters().patches_refused, 2);
     assert_eq!(lab.fe_route([0, 0, 0, 0], 0), Some(&via("wan")), "kept");
     assert_eq!(lab.fe_route([10, 0, 0, 0], 8), Some(&via("lan")), "kept");
     assert!(
@@ -379,4 +380,35 @@ fn a_refused_resync_end_is_sent_again_after_a_while() {
     lab.now += 1;
     lab.settle();
     assert_eq!(lab.fe_route([192, 168, 0, 0], 16), None, "sent again");
+}
+
+/// A refused patch is sent again after a while, though no source changed: what
+/// the FE refused for may have gone.
+#[test]
+fn a_refused_patch_is_sent_again_after_a_while() {
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1)]);
+    lab.sources[0]
+        .patch(&[route([10, 0, 0, 0], 8, "lan")])
+        .unwrap();
+    lab.sources[0].sync_done();
+    lab.settle();
+    lab.refuse = Some("bad");
+    lab.sources[0]
+        .patch(&[route([172, 16, 0, 0], 12, "bad")])
+        .unwrap();
+    lab.settle();
+    assert!(lab.fe_route([172, 16, 0, 0], 12).is_none(), "refused");
+
+    lab.refuse = None;
+    lab.now += ruster_ribd::RESYNC_END_RETRY_MS - 1;
+    lab.settle();
+    assert!(lab.fe_route([172, 16, 0, 0], 12).is_none(), "not yet");
+    lab.now += 1;
+    lab.settle();
+    assert_eq!(
+        lab.fe_route([172, 16, 0, 0], 12),
+        Some(&via("bad")),
+        "sent again"
+    );
+    assert_eq!(lab.fe_route([10, 0, 0, 0], 8), Some(&via("lan")));
 }

@@ -311,9 +311,9 @@ fn a_refused_resync_end_is_sent_again_after_a_while() {
     assert_eq!(fe.store().get(&wan), None, "sent again");
 }
 
-/// A patch refused after a refused resync-end stops the timed resend: nothing is
-/// accepted since its resync-begin, so a resync-end then would delete everything
-/// confd wrote (#612's review).
+/// A patch refused after a refused resync-end stops the timed resync-end: nothing
+/// is accepted since its resync-begin, so a resync-end then would delete everything
+/// confd wrote (#612's review). The refused patch itself goes again in full.
 #[test]
 fn a_refused_patch_stops_the_timed_resync_end() {
     let mut fe = Server::new();
@@ -345,13 +345,72 @@ fn a_refused_patch_stops_the_timed_resync_end() {
     settle(&mut fe, &mut confd, &mut check);
     assert_eq!(mtu(&fe), Some(1500), "refused");
 
+    // The reason for the resync-end refusal goes; the change is still refused. A
+    // timed resync-end now would delete everything confd wrote.
     check.keep = None;
-    check.refuse_mtu = None;
-    for now in [1, ruster_confd::RESYNC_END_RETRY_MS + 1] {
+    let step_at = |fe: &mut Server, confd: &mut Confd, check: &mut Check, now: u64| {
         for _ in 0..100 {
-            fe.step(&mut check);
+            fe.step(check);
             confd.step(now);
         }
-    }
-    assert_eq!(mtu(&fe), Some(1500), "what the FE holds stays");
+    };
+    step_at(&mut fe, &mut confd, &mut check, 1);
+    step_at(
+        &mut fe,
+        &mut confd,
+        &mut check,
+        ruster_confd::RESYNC_END_RETRY_MS + 1,
+    );
+    assert_eq!(mtu(&fe), Some(1500), "nothing was deleted");
+    // Then the change is taken: it goes again after the wait.
+    check.refuse_mtu = None;
+    step_at(
+        &mut fe,
+        &mut confd,
+        &mut check,
+        2 * ruster_confd::RESYNC_END_RETRY_MS + 2,
+    );
+    assert_eq!(mtu(&fe), Some(1400), "the refused change is sent again");
+}
+
+/// A refused change is sent again after a while, though the configuration did not
+/// change: what the FE refused for may have gone.
+#[test]
+fn a_refused_change_is_sent_again_after_a_while() {
+    let mut fe = Server::new();
+    let mut check = Check {
+        refuse_mtu: Some(1400),
+        keep: None,
+    };
+    let mut confd = Confd::new(config(1500));
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    confd.connect_fe(b).unwrap();
+    settle(&mut fe, &mut confd, &mut check);
+    confd.set_config(config(1400));
+    settle(&mut fe, &mut confd, &mut check);
+    assert_eq!(mtu(&fe), Some(1500), "refused");
+
+    check.refuse_mtu = None;
+    let step_at = |fe: &mut Server, confd: &mut Confd, check: &mut Check, now: u64| {
+        for _ in 0..100 {
+            fe.step(check);
+            confd.step(now);
+        }
+    };
+    step_at(&mut fe, &mut confd, &mut check, 1);
+    step_at(
+        &mut fe,
+        &mut confd,
+        &mut check,
+        ruster_confd::RESYNC_END_RETRY_MS - 1,
+    );
+    assert_eq!(mtu(&fe), Some(1500), "not yet");
+    step_at(
+        &mut fe,
+        &mut confd,
+        &mut check,
+        ruster_confd::RESYNC_END_RETRY_MS + 1,
+    );
+    assert_eq!(mtu(&fe), Some(1400), "sent again");
 }
