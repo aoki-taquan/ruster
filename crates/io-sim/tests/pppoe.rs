@@ -167,6 +167,10 @@ fn another_session_and_lcp_are_dropped() {
     )
     .is_none());
     assert!(run(&tables(), WAN, in_session(&inner, SESSION, [0xc0, 0x21])).is_none());
+    // The same session ID, for another host on the parent's link (RFC 2516 5.5).
+    let mut other_host = in_session(&inner, SESSION, [0x00, 0x21]);
+    other_host[0..6].copy_from_slice(&[2, 0, 0, 0, 0, 0x77]);
+    assert!(run(&tables(), WAN, other_host).is_none());
 }
 
 #[test]
