@@ -42,6 +42,11 @@
 //!   pool (a service of the router's on the WAN address) is lost after its first
 //!   fragment: the fragments that follow are not passed to the router. The router's
 //!   own connections are not affected (their replies come back through NAT).
+//! - TCP sessions opened from outside (endpoint-independent filtering lets any
+//!   outside host reach a mapping) are limited per outside address (8), not in
+//!   total: hosts with many addresses can fill the session table and hold back new
+//!   connections from inside. `filtering = "address-dependent"` lets in only those
+//!   the inside host has sent to.
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 
