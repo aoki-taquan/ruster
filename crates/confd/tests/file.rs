@@ -1021,6 +1021,14 @@ fn the_firewall_filtering_is_endpoint_independent_unless_set() {
 }
 
 #[test]
+fn the_firewall_outside_may_be_named() {
+    let config = parse(&format!("firewall-outside = [\"lan\"]\n{LAN}")).unwrap();
+    assert_eq!(config.firewall_outside, Some(vec!["lan".to_owned()]));
+    assert_eq!(parse(LAN).unwrap().firewall_outside, None);
+    assert!(error(&format!("firewall-outside = [\"wan\"]\n{LAN}")).contains("no interface"));
+}
+
+#[test]
 fn the_icmp_error_limits_may_be_set() {
     let config = parse(&format!("{LAN}[icmp-errors]\nipv6-burst = 5\n")).unwrap();
     assert_eq!(config.icmp_errors, Some((100, 5, 10)));

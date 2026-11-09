@@ -61,6 +61,9 @@
 //!                              # "address-dependent", "address-and-port-dependent".
 //!                              # Outside are NAT's outside and the interfaces of the
 //!                              # default routes; inside, the other interfaces
+//! firewall-outside = ["wan"]   # optional, at the top: the outside interfaces, when
+//!                              # those are not right (a default route from a routing
+//!                              # daemon, say)
 //!
 //! [[firewall]]                 # forward rules of the default VRF, first match wins
 //! action = "accept"            # or "drop"; an accepted flow's replies pass too
@@ -207,6 +210,8 @@ struct File {
     firewall: Vec<FirewallEntry>,
     #[serde(rename = "firewall-filtering")]
     firewall_filtering: Option<String>,
+    #[serde(rename = "firewall-outside")]
+    firewall_outside: Option<Vec<String>>,
     #[serde(rename = "icmp-errors")]
     icmp_errors: Option<IcmpErrorsEntry>,
     nat: Option<NatEntry>,
@@ -811,6 +816,19 @@ pub fn parse(text: &str) -> Result<Config, String> {
         }
     }
     let firewall_filtering = filtering("firewall-filtering", file.firewall_filtering.as_deref())?;
+    if let Some(outside) = &file.firewall_outside {
+        for name in outside {
+            match seen.vrf_of.get(name) {
+                None => return Err(format!("firewall-outside: no interface {name:?}")),
+                Some(vrf) if vrf != DEFAULT_VRF => {
+                    return Err(format!(
+                        "firewall-outside: interface {name:?} is in VRF {vrf:?}; the firewall is the default VRF's"
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+    }
     let firewall = file
         .firewall
         .into_iter()
@@ -877,6 +895,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         static_routes,
         firewall,
         firewall_filtering,
+        firewall_outside: file.firewall_outside,
         icmp_errors,
         nat,
     })
