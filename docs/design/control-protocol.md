@@ -156,7 +156,6 @@ CORECONFの`ietf-coreconf:error`（`error-tag`、`error-app-tag`、`error-data-n
 - Unix stream socketを書き手ごとに分け、ファイルの権限で誰が書けるかを決める。
 - 枠組みはTCP向けのCoAP（RFC 8323）。ACKや再送が要らず、最大メッセージ長を最初に交換できる。
   初期値は16 MiB。
-- 後でFEとCEを別マシンに置くときは、同じ枠組みをTCP（とTLS）に載せる。
 
 ## パケットの受け渡し
 
