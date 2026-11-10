@@ -5,7 +5,7 @@
 //!
 //! | To | What |
 //! |---|---|
-//! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP and DHCPv6 to `ruster-kea` |
+//! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP and DHCPv6 to `ruster-kea` and IS-IS and OSPF to the interfaces' TAP devices |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses); the `ra` part on `confd/part/ra/part.sock` |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
 //! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`, `ruster-pppoed` for `pppoe`, `ruster-frr` for `frr`, `ruster-dhcpc` for `dhcpc`) | that module's part of the lock form, on `confd/part/<module>/part.sock` ([`part`]) |
@@ -725,6 +725,7 @@ impl Confd {
         }
         pppoe::punt_classes(&self.current.pppoe, &mut out);
         dhcp_client::punt_classes(&self.current.dhcp_client, &mut out);
+        isis_ospf::punt_classes(&self.current, &mut out);
         out
     }
 

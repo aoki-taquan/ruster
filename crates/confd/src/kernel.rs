@@ -15,8 +15,20 @@
 //! Run it in the router's own network namespace: it replaces that namespace's
 //! default routes.
 //!
-//! Limits: link-local addresses are not put on the TUN devices; devices of a VRF that
-//! is removed stay. The configuration file keeps VRF names to 11 bytes, so the device
+//! An interface that runs IS-IS or OSPF gets a persistent TAP device of its own,
+//! `rp-<interface>` (`docs/design/overlay.md` section 6), where FRR speaks them:
+//! with the interface's MAC address and MTU, in the VRF device, without ARP and
+//! Neighbor Discovery (`NOARP`, so no DAD either) and without addresses of its own
+//! making (`addrgenmode none`, no Router Solicitations). It holds the interface's
+//! addresses, its link-local one included, instead of the TUN device, and the
+//! kernel adds their prefix routes on it. Packets to those addresses still come in
+//! through the TUN device, so reverse path filtering is off on the TUN and TAP
+//! devices (and `all`, since the larger counts): loose filtering would drop them
+//! too once the TUN device has no IPv4 address left. A TAP device no interface
+//! needs any more is removed.
+//!
+//! Limits: link-local addresses are not put on the TUN devices (a TAP device has its
+//! interface's); devices of a VRF that is removed stay. The configuration file keeps VRF names to 11 bytes, so the device
 //! names fit.
 
 use std::collections::BTreeMap;
@@ -38,11 +50,26 @@ pub fn table(vrf: &str) -> u32 {
     1_000 + hash % 0x7fff_0000
 }
 
+/// The interfaces of `config` that get a TAP device: enabled, running IS-IS or OSPF.
+fn tap_interfaces(config: &Config) -> Vec<&crate::InterfaceConfig> {
+    let names = crate::isis_ospf::tap_interfaces(config);
+    config
+        .interfaces
+        .iter()
+        .filter(|i| i.enabled && names.iter().any(|(name, ..)| *name == i.name))
+        .collect()
+}
+
 /// The commands for `config`, in order. Each is `ip` arguments.
 pub fn commands(config: &Config) -> Vec<Vec<String>> {
     let mut by_vrf: BTreeMap<&str, Vec<(IpAddr, u8)>> = BTreeMap::new();
+    let taps = tap_interfaces(config);
     for interface in config.interfaces.iter().filter(|i| i.enabled) {
         let addresses = by_vrf.entry(interface.vrf.as_str()).or_default();
+        // Its TAP device holds them.
+        if taps.iter().any(|t| t.name == interface.name) {
+            continue;
+        }
         if let Some((a, len)) = interface.ipv4 {
             addresses.push((IpAddr::V4(a), len));
         }
@@ -79,16 +106,8 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
         // With NAT, the router's own IPv4 leaves from its address on NAT's inside,
         // so that NAT translates it as a host's there (`fe-ce-split.md`).
         let nat_source = (*vrf == DEFAULT_VRF)
-            .then_some(config.nat.as_ref())
-            .flatten()
-            .and_then(|nat| {
-                config
-                    .interfaces
-                    .iter()
-                    .find(|i| i.name == nat.inside && i.enabled)
-            })
-            .and_then(|inside| inside.ipv4)
-            .map(|(address, _)| address.to_string());
+            .then(|| nat_inside_address(config))
+            .flatten();
         // NAT's outside prefix too: otherwise a host on the WAN's subnet (the ISP's
         // gateway) is reached from the WAN address, which is NAT's public address, and
         // its answers find no mapping there. Every other IPv4 prefix leaves from its
@@ -128,7 +147,93 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
             run(&args);
         }
     }
+    for interface in taps {
+        let tap = ruster_config::tap_device(&interface.name);
+        let mac = interface
+            .mac
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        // The FE takes frames of up to 1514 bytes from a TAP device.
+        let mtu = interface.mtu.min(ruster_config::MTU).to_string();
+        run(&["tuntap", "add", "mode", "tap", "dev", &tap]);
+        run(&[
+            "link",
+            "set",
+            &tap,
+            "address",
+            &mac,
+            "mtu",
+            &mtu,
+            "arp",
+            "off",
+            "addrgenmode",
+            "none",
+        ]);
+        if interface.vrf != DEFAULT_VRF {
+            run(&[
+                "link",
+                "set",
+                &tap,
+                "master",
+                &format!("vrf-{}", interface.vrf),
+            ]);
+        }
+        run(&["link", "set", &tap, "up"]);
+        let link_local = crate::link_local(interface.mac);
+        let addresses = interface
+            .ipv4
+            .map(|(a, len)| (IpAddr::V4(a), len))
+            .into_iter()
+            .chain(std::iter::once((IpAddr::V6(link_local), 64)))
+            .chain(
+                interface
+                    .ipv6
+                    .iter()
+                    .filter(|(a, _)| *a != link_local)
+                    .map(|&(a, len)| (IpAddr::V6(a), len)),
+            );
+        for (address, len) in addresses {
+            let with_len = format!("{address}/{len}");
+            if address.is_ipv6() {
+                run(&["address", "replace", &with_len, "dev", &tap, "nodad"]);
+            } else {
+                run(&["address", "replace", &with_len, "dev", &tap]);
+            }
+        }
+        // Its prefix route (the kernel's own on the TAP) leaves from its address,
+        // or for NAT's outside from the inside address, as on the TUN device above;
+        // written on each apply, so that it follows NAT.
+        let outside = config
+            .nat
+            .as_ref()
+            .is_some_and(|n| n.outside == interface.name);
+        if let Some((address, len)) = interface.ipv4 {
+            let source = match nat_inside_address(config) {
+                Some(inside) if outside => inside,
+                _ => address.to_string(),
+            };
+            let prefix = format!(
+                "{}/{len}",
+                ruster_proto::table::network(IpAddr::V4(address), len)
+            );
+            run(&[
+                "-4", "route", "replace", &prefix, "dev", &tap, "src", &source,
+            ]);
+        }
+    }
     out
+}
+
+/// The address of NAT's inside interface, which the router's own IPv4 leaves from.
+fn nat_inside_address(config: &Config) -> Option<String> {
+    let nat = config.nat.as_ref()?;
+    let inside = config
+        .interfaces
+        .iter()
+        .find(|i| i.name == nat.inside && i.enabled)?;
+    inside.ipv4.map(|(address, _)| address.to_string())
 }
 
 fn words(args: &[String]) -> Vec<&str> {
@@ -150,6 +255,21 @@ pub fn apply(config: &Config) -> Vec<String> {
         }
     }
     let commands = commands(config);
+    // TAP devices no interface needs any more.
+    let wanted_taps: Vec<String> = tap_interfaces(config)
+        .iter()
+        .map(|i| ruster_config::tap_device(&i.name))
+        .collect();
+    if let Ok(devices) = std::fs::read_dir("/sys/class/net") {
+        for device in devices.flatten() {
+            let name = device.file_name().to_string_lossy().into_owned();
+            if name.starts_with(ruster_config::TAP_PREFIX) && !wanted_taps.contains(&name) {
+                if let Err(stderr) = ip(&["link", "del", &name]) {
+                    errors.push(format!("ip link del {name}: {}", stderr.trim()));
+                }
+            }
+        }
+    }
     for args in &commands {
         if let ["link", "add", master, "type", "vrf", "table", wanted] = words(args).as_slice() {
             if vrf_table(master).is_some_and(|current| current.to_string() != *wanted) {
@@ -176,11 +296,34 @@ pub fn apply(config: &Config) -> Vec<String> {
     for args in commands.iter().filter(|a| is_device(&words(a))) {
         run(args, &mut errors);
     }
+    // Packets to a TAP device's addresses come in through the TUN device: no
+    // reverse path filtering there (the larger of `all` and the device's counts;
+    // Linux's loose mode drops on a device without an IPv4 address), and a TAP
+    // device sends no Router Solicitation.
+    let mut sysctl = |path: String, value: &str| {
+        if let Err(error) = std::fs::write(&path, value) {
+            errors.push(format!("{path}: {error}"));
+        }
+    };
+    if std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
+        .is_ok_and(|v| v.trim() != "0")
+    {
+        sysctl("/proc/sys/net/ipv4/conf/all/rp_filter".into(), "0");
+    }
+    for device in wanted_addresses(&commands).into_keys() {
+        sysctl(format!("/proc/sys/net/ipv4/conf/{device}/rp_filter"), "0");
+        if device.starts_with(ruster_config::TAP_PREFIX) {
+            sysctl(format!("/proc/sys/net/ipv6/conf/{device}/accept_ra"), "0");
+        }
+    }
     for (tun, wanted) in wanted_addresses(&commands) {
         let promote = format!("/proc/sys/net/ipv4/conf/{tun}/promote_secondaries");
         let _ = std::fs::write(promote, "1");
         for present in addresses_of(&tun) {
-            if !wanted.contains(&present) && !present.starts_with("fe80:") {
+            // A TUN device's link-local addresses are the kernel's; a TAP device's
+            // is its interface's, from the MAC address.
+            let tap = tun.starts_with(ruster_config::TAP_PREFIX);
+            if !wanted.contains(&present) && (tap || !present.starts_with("fe80:")) {
                 if let Err(stderr) = ip(&["address", "del", &present, "dev", &tun]) {
                     errors.push(format!(
                         "ip address del {present} dev {tun}: {}",
@@ -190,7 +333,17 @@ pub fn apply(config: &Config) -> Vec<String> {
             }
         }
     }
-    for args in commands.iter().filter(|a| !is_device(&words(a))) {
+    // Every address before any route: a route's `src` must be an address the
+    // kernel has (NAT's inside address may be on a TAP device, set up after the
+    // TUN device's routes in `commands`).
+    let is_address = |w: &[&str]| matches!(w, ["address", ..]);
+    for args in commands.iter().filter(|a| is_address(&words(a))) {
+        run(args, &mut errors);
+    }
+    for args in commands
+        .iter()
+        .filter(|a| !is_device(&words(a)) && !is_address(&words(a)))
+    {
         run(args, &mut errors);
     }
     errors
@@ -238,7 +391,7 @@ fn wanted_addresses(commands: &[Vec<String>]) -> BTreeMap<String, Vec<String>> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for args in commands {
         match words(args).as_slice() {
-            ["tuntap", "add", "mode", "tun", "dev", tun] => {
+            ["tuntap", "add", "mode", "tun" | "tap", "dev", tun] => {
                 out.entry((*tun).to_owned()).or_default();
             }
             ["address", "replace", address, "dev", tun, ..] => {

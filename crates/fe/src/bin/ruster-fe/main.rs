@@ -200,6 +200,8 @@ const TUN_CHECK_MS: u64 = 1_000;
 struct Tuns {
     /// For each attached VRF, the interface index of its device when it was opened.
     attached: std::collections::BTreeMap<String, u32>,
+    /// For each interface whose TAP device is attached, its index when opened.
+    taps: std::collections::BTreeMap<String, u32>,
     /// The last error for each device, written once until it changes.
     errors: std::collections::BTreeMap<String, String>,
 }
@@ -225,6 +227,7 @@ impl Tuns {
             fe.detach_local(&vrf);
             eprintln!("ruster-fe: the TUN device of VRF {vrf:?} is gone or was made again");
         }
+        self.check_taps(fe);
         for vrf in vrfs {
             if self.attached.contains_key(&vrf) {
                 continue;
@@ -235,11 +238,63 @@ impl Tuns {
             let Some(index) = tun::index(&device) else {
                 continue;
             };
-            match tun::open(&device) {
+            match tun::open(&device, false) {
                 Ok(file) => {
                     fe.attach_local(&vrf, Box::new(file));
                     eprintln!("ruster-fe: traffic to the router in VRF {vrf:?} goes to {device}");
                     self.attached.insert(vrf, index);
+                    self.errors.remove(&device);
+                }
+                Err(error) => {
+                    let text = error.to_string();
+                    if self.errors.get(&device) != Some(&text) {
+                        eprintln!("ruster-fe: {device}: {text}");
+                        self.errors.insert(device, text);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Tuns {
+    /// Attaches each interface whose IS-IS and OSPF go to a TAP device to it once
+    /// confd has created it, and again when it was made again; detaches it when the
+    /// tables no longer send anything there.
+    fn check_taps<B>(&mut self, fe: &mut Fe<B>)
+    where
+        B: PacketIo + GeneratedPacketIo,
+    {
+        let wanted = fe.tap_interfaces();
+        let gone: Vec<String> = self
+            .taps
+            .iter()
+            .filter(|(name, &index)| {
+                !wanted.contains(name)
+                    || tun::tap_device(name).and_then(|d| tun::index(&d)) != Some(index)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in gone {
+            self.taps.remove(&name);
+            fe.detach_tap(&name);
+            eprintln!("ruster-fe: the TAP device of {name:?} is gone, made again or not used");
+        }
+        for name in wanted {
+            if self.taps.contains_key(&name) {
+                continue;
+            }
+            let Some(device) = tun::tap_device(&name) else {
+                continue;
+            };
+            let Some(index) = tun::index(&device) else {
+                continue;
+            };
+            match tun::open(&device, true) {
+                Ok(file) => {
+                    fe.attach_tap(&name, Box::new(file));
+                    eprintln!("ruster-fe: IS-IS and OSPF of {name:?} go to {device}");
+                    self.taps.insert(name, index);
                     self.errors.remove(&device);
                 }
                 Err(error) => {
