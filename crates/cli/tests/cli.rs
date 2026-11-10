@@ -44,4 +44,24 @@ fn show_and_route_fail_clearly_without_a_router() {
     let (ok, text) = ruster(&["route", "add", "--source", "x", "10.0.0.1/8", "dev", "lan"]);
     assert!(!ok);
     assert!(text.contains("not a prefix"), "{text}");
+    let (ok, text) = ruster(&[
+        "--run-dir",
+        "/nonexistent",
+        "source",
+        "pppoe-wan",
+        "ipv4",
+        "198.51.100.2/32",
+    ]);
+    assert!(!ok);
+    assert!(text.contains("confd/source/pppoe-wan.sock"), "{text}");
+    let (ok, text) = ruster(&[
+        "source",
+        "pppoe-wan",
+        "pppoe",
+        "0",
+        "02:00:00:00:00:ac",
+        "1492",
+    ]);
+    assert!(!ok);
+    assert!(text.contains("PPPoE session"), "{text}");
 }

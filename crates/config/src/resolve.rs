@@ -133,8 +133,7 @@ struct InterfaceEntry {
 #[serde(deny_unknown_fields)]
 struct PppoeEntry {
     parent: String,
-    session: u16,
-    peer: String,
+    source: String,
 }
 
 #[derive(Deserialize)]
@@ -191,10 +190,14 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                 local: tunnel.local,
                 remote: tunnel.remote,
             },
+            (None, None, None, Some(_)) if entry.ipv4.is_some() => {
+                return Err(format!(
+                    "{at}: a PPPoE session's ipv4 address comes from its source; give none"
+                ))
+            }
             (None, None, None, Some(pppoe)) => Kind::Pppoe {
                 parent: pppoe.parent,
-                session: pppoe.session,
-                peer: pppoe.peer,
+                source: pppoe.source,
             },
             (Some(_), None, ..) | (None, Some(_), ..) => {
                 return Err(format!("{at}: give parent and vlan together"))
