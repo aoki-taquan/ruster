@@ -201,7 +201,7 @@ impl Ipv6Fib {
             .map(|n| n.mac)
     }
 
-    fn is_local(&self, address: [u8; 16]) -> bool {
+    pub(crate) fn is_local(&self, address: [u8; 16]) -> bool {
         self.local.iter().any(|l| l.address == address)
     }
 }
@@ -423,7 +423,7 @@ impl ControlQueue {
 
     /// Builds an ICMPv6 error about `invoking` toward its source, if RFC 4443 allows
     /// one, there is room and the limiter has a token.
-    fn error(
+    pub(crate) fn error(
         &mut self,
         invoking: &[u8],
         snapshot: &crate::ForwardingSnapshot<'_>,
@@ -486,7 +486,9 @@ fn address(frame: &[u8], at: usize) -> [u8; 16] {
 /// route is found, before anything else is decided for it, so that a packet it drops
 /// makes no ICMPv6 error and no neighbor resolution. With `silent_route_miss`, a
 /// packet with no route is dropped without an error (the firewall guards it, and
-/// cannot say whether it would have let it through).
+/// cannot say whether it would have let it through). With `via` (an SRv6 End.X
+/// SID's interface and next hop), the packet goes there without a route lookup.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decide<T: TraceSink, A>(
     frame: &mut [u8],
     snapshot: &crate::ForwardingSnapshot<'_>,
@@ -494,6 +496,7 @@ pub(crate) fn decide<T: TraceSink, A>(
     ingress: IfId,
     admit: &mut A,
     silent_route_miss: bool,
+    via: Option<(IfId, [u8; 16])>,
     trace: &mut T,
 ) -> Outcome
 where
@@ -565,7 +568,13 @@ where
     if is_link_local(source) {
         return Outcome::Error(Ipv6SourceInvalid, DESTINATION_UNREACHABLE, 2, 0);
     }
-    let Some(route) = fib.route(destination) else {
+    let via = via.map(|(egress, next_hop)| Ipv6Route {
+        prefix: [0; 16],
+        len: 0,
+        egress,
+        next_hop: Some(next_hop),
+    });
+    let Some(route) = via.as_ref().or_else(|| fib.route(destination)) else {
         if silent_route_miss {
             return Outcome::Drop(FirewallDefaultDenied);
         }
@@ -647,6 +656,7 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
     control: Option<&mut ControlQueue>,
     vlans: &[crate::VlanBinding],
     bridges: Option<&mut crate::Bridges>,
+    via: Option<(IfId, [u8; 16])>,
     trace: &mut T,
 ) -> Completed {
     let ingress = packet.ingress();
@@ -692,6 +702,7 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
         ingress,
         &mut admit,
         silent_route_miss,
+        via,
         trace,
     );
     match outcome {

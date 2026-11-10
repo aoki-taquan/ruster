@@ -197,32 +197,35 @@ FEが作る状態（読むだけ）: SIDごとに、処理した数と、ICMPエ
 
 ### SIDのパケットを受けたとき（RFC 8754の4.3、RFC 8986の4.）
 
-IPv6の宛先が、下側のVRFのローカルのSIDに一致したら、そのSIDの動作で扱う。一致しないパケットはSRHを
-見ずに普通に転送する（RFC 8754の4.2、通過するノード）。
+defaultのVRFで受けた、受けたインターフェースのMAC宛てのIPv6で、宛先がローカルのSIDに一致したら、
+そのSIDの動作で扱う（core `srv6.rs`）。一致しないパケットはSRHを見ずに普通に転送する（RFC 8754の4.2、通過するノード）。
 
 ```
-End、End.X:
-  SRHがある
-   ├ Segments Left = 0 → SRHの次のヘッダを処理する（下の「SRHの後」）
+End（4.1）、End.X（4.2）:
+  SRHがあり、Segments Left != 0
    ├ Hop Limit <= 1 → ICMPv6 Time Exceeded（code 0）
    ├ Last Entryが長さを超える、またはSegments Left > Last Entry + 1
    │   → ICMPv6 Parameter Problem（code 0、Segments Leftの位置）
-   └ Hop Limitを1減らし、Segments Leftを1減らし、宛先をSegment List[Segments Left]にする
-       End: 下側のVRFで引き直して送る。End.X: 値の次の転送先へ送る
-  SRHが無い → 「SRHの後」
-End.DT4、End.DT6:
+   └ Segments Leftを1減らし、宛先をSegment List[Segments Left]にする。Hop Limitは続く転送で1減る
+       End: defaultのVRFで引き直す（新しい宛先もローカルのSIDなら、続けて扱う。4個まで）
+       End.X: 値の次の転送先へ送る
+  それ以外 → 「上位のヘッダ」
+End.DT6（4.6）、End.DT4（4.7）:
   SRHがあり、Segments Left != 0 → ICMPv6 Parameter Problem（code 0、Segments Leftの位置）
-  次のヘッダが4（End.DT4）か41（End.DT6）→ 外側のIPv6とその拡張ヘッダを全部外し、
-      値のVRFで内側を転送する（内側のTTLとHop Limitは普通の転送と同じく減らす）
-  それ以外 → 「SRHの後」
-SRHの後: ルータ宛てとして扱えるもの（ICMPv6のEcho）はkernelへ渡し、それ以外は
-  ICMPv6 Parameter Problem（code 4、SR Upper-layer Header Error。RFC 8986の4.1.1）
+  上位のヘッダが41（End.DT6）か4（End.DT4）→ 外側のIPv6とその拡張ヘッダを全部外し、
+      値のVRFで内側を、同じインターフェースで受けたものとして転送する（内側のTTLとHop Limitは普通の転送と同じく減らす）
+  それ以外 → 「上位のヘッダ」
+上位のヘッダ: 設定で許すものは無い。全部ICMPv6 Parameter Problem（code 4、SR Upper-layer Header Error、
+  上位のヘッダの位置。RFC 8986の4.1.1）。SIDへのpingにもこのエラーを返す
 ```
 
 - ICMPエラーの宛先は外側の送信元。速さの上限は今のICMPv6のエラーと同じ。
-- ルータのSIDでないアドレス宛てで、Segments Leftが0でないSRHは、今のIPv6の処理と同じく
-  Parameter Problem（code 0、Routing Typeの位置。RFC 8200の4.4）にする。
-- SRHのTLV（HMACなど）は読まずに飛ばす（RFC 8754の2.1）。外していること: HMAC（RFC 8754の2.1.2）は確かめない。
+- SIDへのパケットで、種類が4でないRouting headerのSegments Leftが0でなければ、Parameter Problem
+  （code 0、Routing Typeの位置。RFC 8200の4.4）にする。
+- SRHのflags、tag、TLV（HMACなど）は読まない（RFC 8754の4.3.1.1.1、TLVを処理する設定は無い）。
+- 外していること: HMAC（RFC 8754の2.1.2）と送信元（5.1）は確かめない。5.1はSR domainの端のaccess listで
+  守る形で、ノードで必ずすることではない。SIDへのフラグメントは組み立てずに捨てる。続けて扱うSIDの数だけ
+  Hop Limitを減らすのではなく、1回だけ減らす。
 
 ### H.Encaps（RFC 8986の5.1）
 
