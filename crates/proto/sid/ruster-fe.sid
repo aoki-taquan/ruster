@@ -7,7 +7,7 @@
     "assignment-range": [
       {
         "entry-point": 60000,
-        "size": 200
+        "size": 300
       }
     ],
     "item": [
@@ -405,6 +405,60 @@
         "namespace": "data",
         "identifier": "/ruster-punt:punt/class/burst",
         "sid": 60180,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:pppoe-session",
+        "sid": 60190,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:pppoe-session/session-id",
+        "sid": 60191,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:pppoe-session/peer-address",
+        "sid": 60192,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:pppoe-session/mtu",
+        "sid": 60193,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:pppoe-session/lifetime",
+        "sid": 60194,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv4-address",
+        "sid": 60200,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv4-address/address",
+        "sid": 60201,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv4-address/prefix-length",
+        "sid": 60202,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv4-address/lifetime",
+        "sid": 60203,
         "status": "unstable"
       },
       {

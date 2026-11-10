@@ -29,7 +29,8 @@
 //! - RFC 5952 section 4: an IPv6 address is accepted only in its canonical text, so
 //!   one address is one key.
 //!
-//! Deviations: the route, neighbor and punt tables are ruster's own models, and the SIDs are
+//! Deviations: the route, neighbor and punt tables and the source values (what a
+//! daemon writes to confd, each with a lifetime) are ruster's own models, and the SIDs are
 //! local (see [`crate::sid`]).
 
 use std::fmt;
@@ -82,6 +83,15 @@ pub enum Key {
     Punt {
         class: String,
     },
+    /// The PPPoE session a source of kind `pppoe` found (`ruster-source`, written
+    /// to confd); one per source, keyed by the source's name.
+    SourcePppoe {
+        source: String,
+    },
+    /// The IPv4 address a source found (by IPCP, or later DHCP); one per source.
+    SourceIpv4 {
+        source: String,
+    },
 }
 
 /// The value of one entry.
@@ -126,6 +136,22 @@ pub enum Value {
     },
     FirewallRule(FirewallRule),
     Punt(PuntClass),
+    /// A PPPoE session: its ID, the access concentrator's MAC address and the most
+    /// the peer takes in one PPP frame; valid for `lifetime` seconds from when it
+    /// arrives.
+    SourcePppoe {
+        session: u16,
+        peer: [u8; 6],
+        mtu: u16,
+        lifetime: u32,
+    },
+    /// An IPv4 address and prefix length, valid for `lifetime` seconds from when it
+    /// arrives.
+    SourceIpv4 {
+        address: std::net::Ipv4Addr,
+        prefix_len: u8,
+        lifetime: u32,
+    },
 }
 
 /// One class of `ruster-punt`: frames that match go to `destination`, at most
@@ -430,6 +456,8 @@ impl Key {
             Self::IcmpErrors { .. } => sid::ICMP_ERRORS,
             Self::FirewallRule { .. } => sid::FIREWALL_RULE,
             Self::Punt { .. } => sid::PUNT,
+            Self::SourcePppoe { .. } => sid::SOURCE_PPPOE,
+            Self::SourceIpv4 { .. } => sid::SOURCE_IPV4,
         }
     }
 }
@@ -500,6 +528,7 @@ impl Change {
             | Key::FirewallRule { vrf, .. } => name(vrf)?,
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
             Key::Punt { class } => name(class)?,
+            Key::SourcePppoe { source } | Key::SourceIpv4 { source } => name(source)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 parse_prefix(&format!("{prefix}/{len}"))?;
@@ -519,6 +548,8 @@ impl Change {
                         | (Key::IcmpErrors { .. }, Value::IcmpErrors { .. })
                         | (Key::FirewallRule { .. }, Value::FirewallRule(_))
                         | (Key::Punt { .. }, Value::Punt(_))
+                        | (Key::SourcePppoe { .. }, Value::SourcePppoe { .. })
+                        | (Key::SourceIpv4 { .. }, Value::SourceIpv4 { .. })
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -628,6 +659,37 @@ impl Change {
                         }
                     }
                     Value::Punt(class) => validate_punt(class)?,
+                    Value::SourcePppoe {
+                        session,
+                        peer,
+                        mtu,
+                        lifetime,
+                    } => {
+                        if *session == 0 || *session == 0xffff {
+                            return Err(ModelError::Invalid("PPPoE session"));
+                        }
+                        if peer[0] & 1 != 0 || *peer == [0; 6] {
+                            return Err(ModelError::Invalid("PPPoE peer"));
+                        }
+                        if *mtu < MIN_MTU {
+                            return Err(ModelError::Invalid("mtu"));
+                        }
+                        if *lifetime == 0 {
+                            return Err(ModelError::Invalid("lifetime"));
+                        }
+                    }
+                    Value::SourceIpv4 {
+                        prefix_len,
+                        lifetime,
+                        ..
+                    } => {
+                        if *prefix_len == 0 || *prefix_len > 32 {
+                            return Err(ModelError::Invalid("prefix length"));
+                        }
+                        if *lifetime == 0 {
+                            return Err(ModelError::Invalid("lifetime"));
+                        }
+                    }
                     Value::Address { prefix_len } => {
                         let Key::Address { address, .. } = &self.key else {
                             unreachable!("checked above");
@@ -724,6 +786,12 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::Punt { class } => {
             e.array(2).u64(sid::PUNT).text(class);
         }
+        Key::SourcePppoe { source } => {
+            e.array(2).u64(sid::SOURCE_PPPOE).text(source);
+        }
+        Key::SourceIpv4 { source } => {
+            e.array(2).u64(sid::SOURCE_IPV4).text(source);
+        }
         Key::FirewallRule { vrf, id } => {
             e.array(3)
                 .u64(sid::FIREWALL_RULE)
@@ -737,7 +805,13 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     let len = d.array()?;
     let table = d.u64()?;
     let expected = match table {
-        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::PUNT => 2,
+        sid::INTERFACE
+        | sid::NAT
+        | sid::FIREWALL_POLICY
+        | sid::ICMP_ERRORS
+        | sid::PUNT
+        | sid::SOURCE_PPPOE
+        | sid::SOURCE_IPV4 => 2,
         sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
@@ -754,6 +828,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::FIREWALL_POLICY => Key::FirewallPolicy { vrf: first },
         sid::ICMP_ERRORS => Key::IcmpErrors { vrf: first },
         sid::PUNT => Key::Punt { class: first },
+        sid::SOURCE_PPPOE => Key::SourcePppoe { source: first },
+        sid::SOURCE_IPV4 => Key::SourceIpv4 { source: first },
         sid::FIREWALL_RULE => Key::FirewallRule {
             vrf: first,
             id: u32::try_from(d.u64()?).map_err(|_| ModelError::Invalid("rule id"))?,
@@ -866,6 +942,37 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             e.map(1)
                 .u64(sid::NEIGHBOR_LINK_LAYER_ADDRESS - sid::NEIGHBOR)
                 .text(&format_mac(mac));
+        }
+        Value::SourcePppoe {
+            session,
+            peer,
+            mtu,
+            lifetime,
+        } => {
+            let d = |member: u64| member - sid::SOURCE_PPPOE;
+            e.map(4)
+                .u64(d(sid::SOURCE_PPPOE_SESSION))
+                .u64(u64::from(*session))
+                .u64(d(sid::SOURCE_PPPOE_PEER))
+                .text(&format_mac(peer))
+                .u64(d(sid::SOURCE_PPPOE_MTU))
+                .u64(u64::from(*mtu))
+                .u64(d(sid::SOURCE_PPPOE_LIFETIME))
+                .u64(u64::from(*lifetime));
+        }
+        Value::SourceIpv4 {
+            address,
+            prefix_len,
+            lifetime,
+        } => {
+            let d = |member: u64| member - sid::SOURCE_IPV4;
+            e.map(3)
+                .u64(d(sid::SOURCE_IPV4_ADDRESS))
+                .text(&address.to_string())
+                .u64(d(sid::SOURCE_IPV4_PREFIX_LENGTH))
+                .u64(u64::from(*prefix_len))
+                .u64(d(sid::SOURCE_IPV4_LIFETIME))
+                .u64(u64::from(*lifetime));
         }
         Value::IcmpErrors {
             ipv4_interval_ms,
@@ -996,7 +1103,13 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
 fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     if matches!(
         table,
-        sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::FIREWALL_RULE | sid::PUNT
+        sid::NAT
+            | sid::FIREWALL_POLICY
+            | sid::ICMP_ERRORS
+            | sid::FIREWALL_RULE
+            | sid::PUNT
+            | sid::SOURCE_PPPOE
+            | sid::SOURCE_IPV4
     ) {
         return decode_policy_value(table, d);
     }
@@ -1349,6 +1462,8 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
     };
     let value = if table == sid::PUNT {
         decode_punt(&mut got)?
+    } else if table == sid::SOURCE_PPPOE || table == sid::SOURCE_IPV4 {
+        decode_source(table, &mut got)?
     } else if table == sid::ICMP_ERRORS {
         let mut number = |member: u64, what: &'static str| match got.remove(&member) {
             Some(Member::Uint(n)) => u32::try_from(n)
@@ -1494,6 +1609,57 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         return Err(ModelError::UnknownMember(unknown));
     }
     Ok(value)
+}
+
+/// A source's value: every member must be there.
+fn decode_source(
+    table: u64,
+    got: &mut std::collections::BTreeMap<u64, Member>,
+) -> Result<Value, ModelError> {
+    let mut number = |member: u64, what: &'static str| match got.remove(&member) {
+        Some(Member::Uint(n)) => Ok(n),
+        Some(_) => Err(ModelError::Invalid(what)),
+        None => Err(ModelError::Missing(what)),
+    };
+    let lifetime_sid = if table == sid::SOURCE_PPPOE {
+        sid::SOURCE_PPPOE_LIFETIME
+    } else {
+        sid::SOURCE_IPV4_LIFETIME
+    };
+    let lifetime = u32::try_from(number(lifetime_sid, "lifetime")?)
+        .map_err(|_| ModelError::Invalid("lifetime"))?;
+    if table == sid::SOURCE_PPPOE {
+        let session = u16::try_from(number(sid::SOURCE_PPPOE_SESSION, "session-id")?)
+            .map_err(|_| ModelError::Invalid("session-id"))?;
+        let mtu = u16::try_from(number(sid::SOURCE_PPPOE_MTU, "mtu")?)
+            .map_err(|_| ModelError::Invalid("mtu"))?;
+        let peer = match got.remove(&sid::SOURCE_PPPOE_PEER) {
+            Some(Member::Text(text)) => parse_mac(&text)?,
+            Some(_) => return Err(ModelError::Invalid("peer-address")),
+            None => return Err(ModelError::Missing("peer-address")),
+        };
+        return Ok(Value::SourcePppoe {
+            session,
+            peer,
+            mtu,
+            lifetime,
+        });
+    }
+    let prefix_len = u8::try_from(number(sid::SOURCE_IPV4_PREFIX_LENGTH, "prefix-length")?)
+        .map_err(|_| ModelError::Invalid("prefix length"))?;
+    let address = match got.remove(&sid::SOURCE_IPV4_ADDRESS) {
+        Some(Member::Text(text)) => match parse_ip(&text)? {
+            IpAddr::V4(address) => address,
+            IpAddr::V6(_) => return Err(ModelError::Invalid("IPv4 address")),
+        },
+        Some(_) => return Err(ModelError::Invalid("address")),
+        None => return Err(ModelError::Missing("address")),
+    };
+    Ok(Value::SourceIpv4 {
+        address,
+        prefix_len,
+        lifetime,
+    })
 }
 
 fn port(

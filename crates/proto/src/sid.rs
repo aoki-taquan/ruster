@@ -109,6 +109,19 @@ pub const PUNT_DROP: u64 = 60178;
 pub const PUNT_RATE: u64 = 60179;
 pub const PUNT_BURST: u64 = 60180;
 
+/// `ruster-source`: what a source (an outside daemon such as `ruster-pppoed`)
+/// writes to confd, each value with its lifetime in seconds. A PPPoE session:
+pub const SOURCE_PPPOE: u64 = 60190;
+pub const SOURCE_PPPOE_SESSION: u64 = 60191;
+pub const SOURCE_PPPOE_PEER: u64 = 60192;
+pub const SOURCE_PPPOE_MTU: u64 = 60193;
+pub const SOURCE_PPPOE_LIFETIME: u64 = 60194;
+/// An IPv4 address with its prefix length.
+pub const SOURCE_IPV4: u64 = 60200;
+pub const SOURCE_IPV4_ADDRESS: u64 = 60201;
+pub const SOURCE_IPV4_PREFIX_LENGTH: u64 = 60202;
+pub const SOURCE_IPV4_LIFETIME: u64 = 60203;
+
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
 pub const RESOLVE_REQUEST_INTERFACE: u64 = 60051;
@@ -239,6 +252,15 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-punt:punt/class/drop", PUNT_DROP),
     ("/ruster-punt:punt/class/rate", PUNT_RATE),
     ("/ruster-punt:punt/class/burst", PUNT_BURST),
+    ("/ruster-source:pppoe-session", SOURCE_PPPOE),
+    ("/ruster-source:pppoe-session/session-id", SOURCE_PPPOE_SESSION),
+    ("/ruster-source:pppoe-session/peer-address", SOURCE_PPPOE_PEER),
+    ("/ruster-source:pppoe-session/mtu", SOURCE_PPPOE_MTU),
+    ("/ruster-source:pppoe-session/lifetime", SOURCE_PPPOE_LIFETIME),
+    ("/ruster-source:ipv4-address", SOURCE_IPV4),
+    ("/ruster-source:ipv4-address/address", SOURCE_IPV4_ADDRESS),
+    ("/ruster-source:ipv4-address/prefix-length", SOURCE_IPV4_PREFIX_LENGTH),
+    ("/ruster-source:ipv4-address/lifetime", SOURCE_IPV4_LIFETIME),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",
