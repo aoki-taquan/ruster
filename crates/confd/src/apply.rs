@@ -684,7 +684,17 @@ impl Apply {
                         _ => None,
                     })
                     .collect();
-                if refusals.is_empty() {
+                if refusals.is_empty() && !confd.settled() {
+                    // Something changed while the processes checked (a source's
+                    // values, a process that connected again).
+                    let line = "an earlier configuration is still waiting for answers";
+                    self.reply(
+                        checking.conn,
+                        &checking.token,
+                        Code::SERVICE_UNAVAILABLE,
+                        vec![line.into()],
+                    );
+                } else if refusals.is_empty() {
                     let late = checks.iter().filter(|(_, c)| **c == Checked::NoAnswer).map(
                         |(module, _)| format!("{} did not answer the check in time", name(*module)),
                     );

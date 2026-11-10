@@ -22,7 +22,8 @@
 //!
 //! A check is the candidate step of `docs/design/router-box.md`, "反映の流れ": the
 //! process works out what the part would change against what it holds now (its
-//! files, its sessions), and takes nothing. `ruster diff` shows the answers, and
+//! files, its sessions), and takes nothing. A process whose part would not change
+//! is not asked: that part is not sent either. `ruster diff` shows the answers, and
 //! `ruster apply` sends nothing to anyone when one refuses ([`crate::apply`]). An
 //! answer too long for one message is cut, saying so. A check cannot foresee
 //! everything: the software a bridge drives may still refuse the file when it reads
@@ -260,16 +261,21 @@ impl Parts {
         }
     }
 
-    /// Asks every connected process to check its part of `candidate`, and notes the
-    /// modules `candidate` has that no process takes now. The answers of an earlier
+    /// Asks every connected process whose part `candidate` changes to check it (one
+    /// whose part stays has no change), and notes the modules `candidate` has that no
+    /// process takes now. The answers of an earlier
     /// check are dropped.
     pub(crate) fn check(&mut self, candidate: &Config) {
         self.checked.clear();
         for module in Module::ALL {
+            let part = module.part(candidate);
             let asked = match self.takers.get_mut(&module) {
-                Some(taker) if !taker.conn.is_closed() => {
-                    taker.check(module, &module.part(candidate))
+                // A part that would not change is not sent, so nothing can refuse it.
+                Some(taker) if !taker.conn.is_closed() && taker.expected() == Some(&part) => {
+                    self.checked.insert(module, Checked::Changes(String::new()));
+                    continue;
                 }
+                Some(taker) if !taker.conn.is_closed() => taker.check(module, &part),
                 _ => false,
             };
             if asked {

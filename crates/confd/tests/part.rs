@@ -508,3 +508,23 @@ fn a_process_that_does_not_answer_the_check_does_not_hold_the_change_up() {
     );
     assert_eq!(rig.confd.config().interfaces[0].mtu, 1400);
 }
+
+#[test]
+fn a_part_that_does_not_change_is_not_checked() {
+    use ruster_confd::part::Checked;
+    let mut rig = Rig::new();
+    let mut dns = Process::new(&mut rig);
+    rig.run(&mut [&mut dns]);
+    // It would refuse even the part it holds; an unrelated change still goes in.
+    dns.refuse = Some("192.0.2.53");
+    dns.check_passes = false;
+    rig.cli
+        .post(&["config"], text(1400, "192.0.2.53").as_bytes());
+    let answers = rig.run(&mut [&mut dns]);
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1400);
+    assert_eq!(
+        rig.confd.part_checks().get(&Module::Dns),
+        Some(&Checked::Changes(String::new()))
+    );
+}
