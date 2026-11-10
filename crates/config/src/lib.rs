@@ -60,6 +60,12 @@
 //! ipv4 = "192.0.0.2/29"        # optional; this, the B4's address, when left out
 //! # mtu is 1460 and mac 02:00:00:00:00:fe when left out
 //!
+//! [[interface]]                # an EtherIP tunnel (RFC 3378), only as a bridge member
+//! name = "eip0"
+//! etherip = { local = "192.0.2.1", remote = "198.51.100.2" }  # IPv4 or IPv6; local
+//!                              # is an address of an interface in the default VRF
+//! # mac is 02:00:00:00:00:fe and mtu 1464 (IPv4) or 1444 (IPv6) when left out
+//!
 //! [[interface]]                # a PPPoE session, there while the session is up
 //! name = "ppp"
 //! pppoe = { parent = "lan", source = "pppoe-wan" }  # the source (of kind pppoe)
@@ -68,7 +74,7 @@
 //!
 //! [[interface]]                # a bridge and its own interface (IRB), after its members
 //! name = "br0"
-//! bridge = { members = ["lan", "lan.10"] }  # ports and VLANs with no address
+//! bridge = { members = ["lan", "lan.10"] }  # ports, VLANs and EtherIP with no address
 //! ipv4 = "192.0.2.1/24"        # optional: the IRB routes like any interface
 //! # mac is the first member's and mtu the smallest member's when left out. In bridge, optional:
 //! # aging-time = 300 (seconds a learned address is used without being seen),
@@ -326,7 +332,8 @@
 //! ipv6 = []
 //! ipv6-from = []
 //!
-//! [interface.kind.vlan]        # or [interface.kind.tunnel] with local and remote,
+//! [interface.kind.vlan]        # or [interface.kind.tunnel] or [interface.kind.etherip]
+//!                              # with local and remote,
 //! parent = "lan"               # [interface.kind.pppoe] with parent and source
 //! id = 10
 //!
@@ -547,7 +554,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x36c2_01bc_43f3_bdd3;
+pub const LOCK_SHAPE: u64 = 0x520a_d798_3830_44be;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -561,6 +568,10 @@ pub const MTU: u16 = 1_500;
 pub const VLAN_OVERHEAD: u16 = 4;
 /// What the PPPoE header takes from the parent's MTU (RFC 2516).
 pub const PPPOE_OVERHEAD: u16 = 8;
+/// What EtherIP's outer headers take from the MTU of the link below: the inner
+/// Ethernet header, the EtherIP header, and IPv4 or IPv6.
+pub const ETHERIP_OVERHEAD_IPV4: u16 = 14 + 2 + 20;
+pub const ETHERIP_OVERHEAD_IPV6: u16 = 14 + 2 + 40;
 /// What the outer IPv6 header takes from a tunnel's MTU.
 pub const TUNNEL_OVERHEAD: u16 = 40;
 /// The MTU of a tunnel or MAP-E that names none.
@@ -845,6 +856,10 @@ pub enum Kind {
     /// A PPPoE session on a port or VLAN, whose session and IPv4 address the
     /// source (of kind `pppoe`) sends.
     Pppoe { parent: String, source: String },
+    /// An EtherIP tunnel (RFC 3378) from the router's address `local` to `remote`;
+    /// only a bridge member.
+    #[serde(rename = "etherip")]
+    EtherIp { local: String, remote: String },
     /// A bridge, and its own interface (IRB) of the same name.
     Bridge(Bridge),
 }

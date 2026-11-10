@@ -69,6 +69,7 @@ fn config(mtu: u16) -> Config {
         isis: None,
         ospf: None,
         ospf6: None,
+        etherip: Vec::new(),
     }
 }
 

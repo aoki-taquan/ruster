@@ -160,6 +160,7 @@ struct InterfaceEntry {
     ipv6_from: Option<crate::Ipv6From>,
     vrf: Option<String>,
     tunnel: Option<TunnelEntry>,
+    etherip: Option<TunnelEntry>,
     pppoe: Option<PppoeEntry>,
     bridge: Option<BridgeEntry>,
 }
@@ -228,7 +229,20 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
     for entry in file.interface {
         let at = format!("interface {:?}", entry.name);
         let vrf = default_vrf(entry.vrf);
+        let etherip = entry.etherip;
         let kind = match (entry.parent, entry.vlan, entry.tunnel, entry.pppoe) {
+            (None, None, None, None) if entry.bridge.is_none() && etherip.is_some() => {
+                let etherip = etherip.expect("checked");
+                Kind::EtherIp {
+                    local: etherip.local,
+                    remote: etherip.remote,
+                }
+            }
+            _ if etherip.is_some() => {
+                return Err(format!(
+                "{at}: an EtherIP tunnel is not also a VLAN, a tunnel, a PPPoE session or a bridge"
+            ))
+            }
             (None, None, None, None) if entry.bridge.is_some() => {
                 let bridge = entry.bridge.expect("checked");
                 Kind::Bridge(crate::Bridge {
@@ -320,13 +334,17 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         };
         let mac = match (entry.mac, &kind, &parent) {
             (Some(mac), ..) => mac,
-            (None, Kind::Tunnel { .. }, _) => TUNNEL_MAC.to_owned(),
+            (None, Kind::Tunnel { .. } | Kind::EtherIp { .. }, _) => TUNNEL_MAC.to_owned(),
             (None, _, Some(parent)) => parent.clone()?.0,
             (None, ..) => return Err(format!("{at}: mac is missing")),
         };
         let mtu = match (entry.mtu, &kind, &parent) {
             (Some(mtu), ..) => mtu,
             (None, Kind::Tunnel { .. }, _) => TUNNEL_MTU,
+            (None, Kind::EtherIp { local, .. }, _) if local.contains(':') => {
+                MTU - crate::ETHERIP_OVERHEAD_IPV6
+            }
+            (None, Kind::EtherIp { .. }, _) => MTU - crate::ETHERIP_OVERHEAD_IPV4,
             (None, _, Some(parent)) => parent.clone()?.1,
             (None, ..) => MTU,
         };

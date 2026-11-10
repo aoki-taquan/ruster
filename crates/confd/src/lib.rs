@@ -45,6 +45,7 @@ pub mod delegated;
 pub mod dhcp6;
 pub mod dhcp_client;
 pub mod diff;
+pub mod etherip;
 pub mod file;
 pub mod isis_ospf;
 pub mod kernel;
@@ -175,6 +176,9 @@ pub struct Config {
     pub isis: Option<ruster_config::Isis>,
     pub ospf: Option<ruster_config::Ospf>,
     pub ospf6: Option<ruster_config::Ospf>,
+    /// The EtherIP interfaces, checked; their interfaces are in `interfaces`
+    /// ([`etherip`]).
+    pub etherip: Vec<etherip::EtherIp>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -630,6 +634,7 @@ impl Confd {
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
         bridge::tables(&self.current.bridges, &mut out);
+        etherip::tables(&self.current.etherip, &mut out);
         if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.current.icmp_errors {
             out.insert(
                 Key::IcmpErrors {
@@ -1222,6 +1227,7 @@ mod tests {
             ospf: None,
             ospf6: None,
             bridges: Vec::new(),
+            etherip: Vec::new(),
         });
         let routes = confd.routes();
         let connected = Value::Route(RouteAction::Forward(vec![NextHop {
@@ -1290,6 +1296,7 @@ mod tests {
             ospf: None,
             ospf6: None,
             bridges: Vec::new(),
+            etherip: Vec::new(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
         let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);
