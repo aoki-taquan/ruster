@@ -126,6 +126,7 @@ where
         .map_err(|error| format!("{}: {error}", socket::FE_PUNT))?;
     fe.attach_punt_to(punt, path(socket::NEIGHD_PUNT))
         .map_err(|error| error.to_string())?;
+    fe.set_punt_dir(args.run_dir.clone());
     let backend = if args.af_packet {
         "AF_PACKET"
     } else {

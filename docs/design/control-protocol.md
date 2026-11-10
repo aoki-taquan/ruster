@@ -162,7 +162,9 @@ CORECONFの`ietf-coreconf:error`（`error-tag`、`error-app-tag`、`error-data-n
 ARP、ND、DHCP、DHCPv6、PPPoEのフレームの受け渡しは、上のメッセージ形式を使わない。CBORで包む意味が
 無く、量も多いため。
 
-- プロトコルごとにUnix datagram socketを分ける（例: `/run/ruster/fe/punt/arp-nd.sock`）。SOCK_SEQPACKETは
+- CEのプロセスごとにUnix datagram socketを分ける。neighdとは`fe/punt/arp-nd.sock`と`neighd/punt.sock`。
+  表`ruster-punt`の渡し先の名前`<name>`のプロセスとは、FEが`fe/punt/<name>.sock`を作って
+  `<name>/punt.sock`へ送り、そのパスから来たものだけを受け取る。SOCK_SEQPACKETは
   標準libraryだけでは扱えないので、境界を保つdatagramにした（Linuxでは詰まると送信が失敗し、送り手が数える）。
 - 1メッセージ = 小さなヘッダ + フレーム一つ。
 
@@ -181,9 +183,13 @@ frame      ...
 理由`NEIGHBOR_USED`のフレームの無いメッセージを送ると、FEは前に読まれてから使われた近隣ごとに、
 アドレス（4か16バイト）をフレームにして返し、印を消す。
 
-- FEは種類ごとに流量の上限を付け、溢れた分は捨てて数える（[`fe-ce-split.md`](fe-ce-split.md)の
-  「ルータ宛て通信の保護」）。
-- ルータ宛てのTCP/UDPはここを通らず、TUNでkernelへ渡す。
+理由は`ARP`（1）、`ND`（2）、`NEIGHBOR_USED`（3）、`PPPOE_DISCOVERY`（4）、`PPP_CONTROL`（5、インターフェースは
+セッションの親）、`IP`（6、DHCPなど）。4から6はどちら向きもEthernetのフレームをそのまま運ぶ。CEが送り返せるのは、
+自分の分類の種類のフレームだけ（PPPoEの分類ならPPPoE、IPの分類ならIPv4とIPv6）。FEはそれを名前の
+インターフェースからそのまま送り出す。
+
+- FEは分類ごとに流量の上限を付け、溢れた分は捨てて数える（[`tables.md`](tables.md)の`ruster-punt`）。
+- ルータ宛てのTCP/UDPは、CEへ渡す分類に当たらなければここを通らず、TUNでkernelへ渡す。
 
 ## SIDの割り当て
 

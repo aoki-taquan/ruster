@@ -41,6 +41,17 @@ pub mod socket {
     /// confd's socket for a new configuration file (from `ruster apply`).
     pub const CONFD_CONFIG: &str = "confd/config.sock";
 
+    /// The FE's datagram socket for frames to and from the control process `name`
+    /// of a punt class (other than neighd).
+    pub fn fe_punt(name: &str) -> String {
+        format!("fe/punt/{name}.sock")
+    }
+
+    /// The datagram socket the control process `name` takes frames from the FE on.
+    pub fn control_punt(name: &str) -> String {
+        format!("{name}/punt.sock")
+    }
+
     /// ribd's table server for the route source `name`.
     pub fn ribd_source(name: &str) -> String {
         format!("ribd/source/{name}.sock")

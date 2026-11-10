@@ -43,6 +43,7 @@ use ruster_proto::table::ResolveRequest;
 use ruster_proto::task::{Progress, Task};
 
 mod build;
+mod control;
 mod firewall;
 mod fragments;
 mod kernel;
@@ -53,7 +54,7 @@ mod reassembly;
 
 pub use local::LocalPipe;
 pub use punt_table::PuntCounters;
-use ruster_proto::table::{PuntDestination, PuntKind};
+use ruster_proto::table::{PuntDestination, PuntKind, PuntMatch};
 
 /// The tables each kind of writer may change (one writer per table).
 pub mod writers {
@@ -163,6 +164,10 @@ pub struct Fe<B> {
     punt: Option<UnixDatagram>,
     /// Where ARP goes when the punt socket is not connected to one peer.
     punt_peer: Option<PathBuf>,
+    /// The sockets to the other control processes the punt classes name.
+    controls: control::Controls,
+    /// What core picks out for them before forwarding.
+    punt_frames: Vec<ruster_core::PuntFrameMatch>,
     last_resolve: BTreeMap<(IfId, IpAddr), u64>,
     /// Neighbor Discovery frames core copied out of the last batch.
     control: ControlQueue,
@@ -230,6 +235,8 @@ where
             server: Server::new(),
             punt: None,
             punt_peer: None,
+            controls: control::Controls::default(),
+            punt_frames: Vec::new(),
             last_resolve: BTreeMap::new(),
             control: ControlQueue::new(EVENTS_PER_BATCH).with_icmpv6_errors(EVENTS_PER_BATCH),
             icmpv4_errors: icmpv4_error_runtime(),
@@ -266,6 +273,18 @@ where
         self.punt = Some(socket);
         self.punt_peer = Some(peer);
         Ok(())
+    }
+
+    /// Binds the sockets to the control processes the punt classes name under
+    /// `dir`, the socket directory (see [`control`]), from the next table change.
+    pub fn set_punt_dir(&mut self, dir: PathBuf) {
+        self.controls.set_dir(dir);
+    }
+
+    /// Uses the connected `socket` for control process `name` of the punt classes,
+    /// instead of one under the socket directory.
+    pub fn attach_control(&mut self, name: &str, socket: UnixDatagram) -> io::Result<()> {
+        self.controls.attach(name, socket)
     }
 
     /// Uses `pipe` to hand the traffic addressed to the router in `vrf` to the kernel,
@@ -336,6 +355,7 @@ where
             .with_tunnels(&self.tunnels)
             .with_pppoe(&self.pppoe)
             .with_kernel_ingress(&self.kernel)
+            .with_punt_frames(&self.punt_frames)
             .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(ports) = self.io.receive(RX_BUDGET) else {
             self.counters.from_kernel_dropped += kernel_frames.len() as u64;
@@ -479,8 +499,9 @@ where
             let frame = &self.control.frames()[index];
             let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
             match kind {
-                // The FE does not ask core for these yet.
-                ControlKind::Punt(_) => {}
+                ControlKind::Punt(class) => {
+                    self.hand_to_control(usize::from(class), ingress, &bytes, now_ms)
+                }
                 ControlKind::Neighbor => {
                     let class = punt_table::built_in(PuntKind::Nd);
                     if self.limits.admit(class, None, now_ms) {
@@ -490,7 +511,14 @@ where
                     }
                 }
                 ControlKind::Local => {
-                    self.send_to_kernel(ingress, &bytes[ETHERNET_HEADER..], now_ms)
+                    let packet = &bytes[ETHERNET_HEADER..];
+                    let class = self.classes.of_local(ingress, packet);
+                    match self.classes.get(class).destination {
+                        PuntDestination::Control(_) => {
+                            self.hand_to_control(class, ingress, &bytes, now_ms);
+                        }
+                        _ => self.send_to_kernel(ingress, class, packet, now_ms),
+                    }
                 }
                 ControlKind::TunnelFragment => {
                     if let Some(whole) = self.reassembly.add(ingress, &bytes, now_ms) {
@@ -559,6 +587,36 @@ where
         }
     }
 
+    /// Sends the whole `frame` of punt class `class` to its control process.
+    fn hand_to_control(&mut self, class: usize, ingress: IfId, frame: &[u8], now_ms: u64) {
+        let entry = self.classes.get(class);
+        let PuntDestination::Control(name) = &entry.destination else {
+            self.limits.dropped(class);
+            return;
+        };
+        let why = match entry.matches {
+            PuntMatch::Kind(PuntKind::PppoeDiscovery) => punt::reason::PPPOE_DISCOVERY,
+            PuntMatch::Kind(PuntKind::PppControl) => punt::reason::PPP_CONTROL,
+            _ => punt::reason::IP,
+        };
+        let interface = self
+            .interface_names
+            .get(usize::from(ingress.0))
+            .filter(|name| !name.is_empty());
+        let sent = match interface {
+            Some(interface) if self.limits.admit(class, None, now_ms) => {
+                self.controls.send(name, why, interface, frame)
+            }
+            Some(_) => return,
+            None => false,
+        };
+        if sent {
+            self.limits.handed(class);
+        } else {
+            self.limits.dropped(class);
+        }
+    }
+
     fn resolve_request(&mut self, egress: IfId, address: IpAddr, now_ms: u64) {
         let last = self.last_resolve.get(&(egress, address)).copied();
         if last.is_some_and(|at| now_ms.saturating_sub(at) < RESOLVE_INTERVAL_MS) {
@@ -590,15 +648,22 @@ where
         self.counters.resolve_requests += 1;
     }
 
-    /// Sends the frames the neighbor process gave back.
+    /// Sends the frames the control processes gave back.
     fn inject(&mut self) -> bool {
-        let Some(socket) = &self.punt else {
-            return false;
-        };
+        let mut refused = 0;
+        let mut frames = self
+            .controls
+            .receive(INJECT_PER_STEP, PUNT_MAX, &mut refused);
+        self.counters.inject_dropped += refused;
+        // The neighbor process's come after the others'.
+        let others = frames.len();
         // One byte more than accepted, to see a datagram that was cut short.
         let mut buf = vec![0_u8; PUNT_MAX + 1];
-        let mut frames = Vec::new();
-        for _ in 0..INJECT_PER_STEP {
+        let neighbor = self.punt.as_ref().map_or(0, |_| INJECT_PER_STEP);
+        for _ in 0..neighbor {
+            let Some(socket) = &self.punt else {
+                break;
+            };
             match socket.recv_from(&mut buf) {
                 // With a fixed peer path, only frames from that path are taken.
                 Ok((_, from))
@@ -615,8 +680,9 @@ where
                 Err(_) => break,
             }
         }
-        let busy = !frames.is_empty();
-        for message in &frames {
+        let busy = !frames.is_empty() || refused > 0;
+        for (at, message) in frames.iter().enumerate() {
+            let neighbor = at >= others;
             let Ok(punt) = Punt::decode(message) else {
                 self.counters.inject_dropped += 1;
                 continue;
@@ -626,7 +692,7 @@ where
                 .filter(|id| self.active.contains(id));
             match (punt.direction, punt.reason, egress) {
                 // The neighbor process reads the "used" marks, which are then cleared.
-                (Direction::FromControl, punt::reason::NEIGHBOR_USED, _) => {
+                (Direction::FromControl, punt::reason::NEIGHBOR_USED, _) if neighbor => {
                     let used: Vec<_> = self.used.drain().collect();
                     for (interface, address) in used {
                         let bytes = match address {
@@ -636,12 +702,16 @@ where
                         self.punt_frame(IfId(interface), punt::reason::NEIGHBOR_USED, None, &bytes);
                     }
                 }
+                // The other control processes' frames were checked as they came.
                 (Direction::FromControl, reason, Some(egress))
                     if punt.frame.len() >= ETHERNET_HEADER
-                        && ((reason == punt::reason::ARP
-                            && punt.frame[12..14] == ETHERTYPE_ARP)
-                            || (reason == punt::reason::ND
-                                && punt.frame[12..14] == ETHERTYPE_IPV6)) =>
+                        && if neighbor {
+                            (reason == punt::reason::ARP && punt.frame[12..14] == ETHERTYPE_ARP)
+                                || (reason == punt::reason::ND
+                                    && punt.frame[12..14] == ETHERTYPE_IPV6)
+                        } else {
+                            true
+                        } =>
                 {
                     if self.send_generated(egress, punt.frame) {
                         self.counters.injected += 1;
@@ -668,10 +738,9 @@ where
         }
     }
 
-    /// Writes a packet addressed to the router to its VRF's kernel pipe, as its
-    /// punt class allows.
-    fn send_to_kernel(&mut self, ingress: IfId, packet: &[u8], now_ms: u64) {
-        let class = self.classes.of_local(ingress, packet);
+    /// Writes a packet addressed to the router, of punt class `class`, to its VRF's
+    /// kernel pipe, as the class allows.
+    fn send_to_kernel(&mut self, ingress: IfId, class: usize, packet: &[u8], now_ms: u64) {
         let at = self
             .by_ingress
             .get(usize::from(ingress.0))
@@ -854,6 +923,8 @@ where
                 self.limits.update(&built.punt, 0);
             }
             self.limits.update(&built.punt, built.names.len());
+            self.punt_frames = built.punt.frame_matches();
+            self.controls.follow(built.punt.controls());
             self.classes = built.punt;
             self.names = built.names;
             self.interface_names = built.interface_names;

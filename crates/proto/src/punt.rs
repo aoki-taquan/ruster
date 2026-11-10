@@ -43,6 +43,15 @@ pub mod reason {
     /// frame being its address (4 or 16 bytes) on the named interface; the FE then
     /// clears its marks.
     pub const NEIGHBOR_USED: u16 = 3;
+    /// A PPPoE Discovery frame (Ethernet type 0x8863), whole, in both directions.
+    pub const PPPOE_DISCOVERY: u16 = 4;
+    /// A PPPoE session frame (0x8864) carrying PPP control (LCP, authentication,
+    /// IPCP, IPv6CP), whole, in both directions. Its interface is the session's
+    /// parent.
+    pub const PPP_CONTROL: u16 = 5;
+    /// An IPv4 or IPv6 frame of a punt class's protocol and ports (DHCP, say),
+    /// whole, in both directions.
+    pub const IP: u16 = 6;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

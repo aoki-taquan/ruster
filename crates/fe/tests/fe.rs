@@ -4052,3 +4052,270 @@ fn punt_classes_that_break_the_rules_are_refused() {
     );
     assert_eq!(code, Code::CHANGED);
 }
+
+fn to_control(name: &str) -> ruster_proto::table::PuntDestination {
+    ruster_proto::table::PuntDestination::Control(name.into())
+}
+
+/// A DHCPDISCOVER-like frame from the LAN host to 255.255.255.255, port 67.
+fn dhcp_broadcast() -> Vec<u8> {
+    let mut frame = udp_from_host([255, 255, 255, 255]);
+    frame[0..6].copy_from_slice(&[0xff; 6]);
+    frame[14 + 12..14 + 16].copy_from_slice(&[0, 0, 0, 0]);
+    frame[14 + 20..14 + 22].copy_from_slice(&68_u16.to_be_bytes());
+    frame[14 + 22..14 + 24].copy_from_slice(&67_u16.to_be_bytes());
+    frame
+}
+
+fn recv_punt(socket: &UnixDatagram) -> (u16, String, Vec<u8>) {
+    let mut buf = [0_u8; 2048];
+    let n = socket
+        .recv(&mut buf)
+        .expect("a frame for the control process");
+    let punt = Punt::decode(&buf[..n]).unwrap();
+    assert_eq!(punt.direction, Direction::ToControl);
+    (punt.reason, punt.interface.to_owned(), punt.frame.to_vec())
+}
+
+fn send_punt(socket: &UnixDatagram, reason: u16, interface: &str, frame: &[u8]) {
+    let mut message = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason,
+        interface,
+        frame,
+    }
+    .encode(&mut message)
+    .unwrap();
+    socket.send(&message).unwrap();
+}
+
+#[test]
+fn dhcp_from_the_lan_goes_to_its_control_process_and_its_replies_go_out() {
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+    let code = bench.patch(
+        &mut config,
+        &[punt_class(
+            "dhcpv4",
+            udp_port(17, Some((67, 67))),
+            Some("lan"),
+            to_control("ruster-kea"),
+            100,
+            2,
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let (fe_end, kea) = UnixDatagram::pair().unwrap();
+    kea.set_nonblocking(true).unwrap();
+    bench.fe.attach_control("ruster-kea", fe_end).unwrap();
+
+    // To the broadcast address, and to the router's own address: whole frames.
+    let broadcast = dhcp_broadcast();
+    let mut unicast = udp_to_router();
+    unicast[14 + 22..14 + 24].copy_from_slice(&67_u16.to_be_bytes());
+    bench.fe.io_mut().inject(IfId(0), broadcast.clone());
+    bench.fe.io_mut().inject(IfId(0), unicast.clone());
+    bench.fe.step(0);
+    assert_eq!(recv_punt(&kea), (punt::reason::IP, "lan".into(), broadcast));
+    assert_eq!(recv_punt(&kea), (punt::reason::IP, "lan".into(), unicast));
+    let mut buf = [0_u8; 2048];
+    assert!(kernel.recv(&mut buf).is_err(), "not to the kernel");
+    assert!(bench.fe.io_mut().pop_tx().is_none(), "nor forwarded");
+
+    // The burst is 2: a third is dropped and counted.
+    bench.fe.io_mut().inject(IfId(0), dhcp_broadcast());
+    bench.fe.step(0);
+    assert!(kea.recv(&mut buf).is_err());
+    let counters = punt_counter(&bench, "dhcpv4");
+    assert_eq!((counters.handed, counters.dropped), (2, 1));
+    // On the WAN the class does not apply: the broadcast is not forwarded either.
+    bench.fe.io_mut().inject(IfId(1), dhcp_broadcast());
+    bench.fe.step(1_000);
+    assert!(kea.recv(&mut buf).is_err());
+
+    // The reply goes out of the named interface as it is; a PPPoE frame from this
+    // process, which has no PPPoE class, does not.
+    let mut reply = dhcp_broadcast();
+    reply[6..12].copy_from_slice(&LAN_MAC);
+    send_punt(&kea, punt::reason::IP, "lan", &reply);
+    let mut padi = vec![0xff_u8; 6];
+    padi.extend_from_slice(&LAN_MAC);
+    padi.extend_from_slice(&[0x88, 0x63, 0x11, 0x09, 0, 0, 0, 0]);
+    send_punt(&kea, punt::reason::PPPOE_DISCOVERY, "lan", &padi);
+    let dropped = bench.fe.counters().inject_dropped;
+    bench.fe.step(1_000);
+    let tx = bench.fe.io_mut().pop_tx().expect("the reply");
+    assert_eq!((tx.egress, tx.bytes), (IfId(0), reply));
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    assert_eq!(bench.fe.counters().inject_dropped, dropped + 1);
+}
+
+/// A PPPoE frame from the access concentrator to the WAN port.
+fn pppoe_frame(ethertype: u16, session: u16, protocol: Option<u16>) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&WAN_MAC);
+    frame.extend_from_slice(&GATEWAY_MAC);
+    frame.extend_from_slice(&ethertype.to_be_bytes());
+    frame.extend_from_slice(&[0x11, if protocol.is_some() { 0 } else { 0x07 }]);
+    frame.extend_from_slice(&session.to_be_bytes());
+    frame.extend_from_slice(&6_u16.to_be_bytes());
+    if let Some(protocol) = protocol {
+        frame.extend_from_slice(&protocol.to_be_bytes());
+    }
+    frame.resize(60, 0);
+    frame
+}
+
+#[test]
+fn pppoe_control_goes_to_its_control_process() {
+    use ruster_proto::table::{PuntKind, PuntMatch};
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let code = bench.patch(
+        &mut config,
+        &[
+            punt_class(
+                "pppoe-discovery",
+                PuntMatch::Kind(PuntKind::PppoeDiscovery),
+                Some("wan"),
+                to_control("ruster-pppoed"),
+                10,
+                10,
+            ),
+            punt_class(
+                "ppp-control",
+                PuntMatch::Kind(PuntKind::PppControl),
+                Some("wan"),
+                to_control("ruster-pppoed"),
+                10,
+                10,
+            ),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let (fe_end, pppoed) = UnixDatagram::pair().unwrap();
+    pppoed.set_nonblocking(true).unwrap();
+    bench.fe.attach_control("ruster-pppoed", fe_end).unwrap();
+
+    let pado = pppoe_frame(0x8863, 0, None);
+    let lcp = pppoe_frame(0x8864, 0x1234, Some(0xc021));
+    let ipv4 = pppoe_frame(0x8864, 0x1234, Some(0x0021));
+    for frame in [&pado, &lcp, &ipv4] {
+        bench.fe.io_mut().inject(IfId(1), frame.clone());
+    }
+    bench.fe.step(0);
+    assert_eq!(
+        recv_punt(&pppoed),
+        (punt::reason::PPPOE_DISCOVERY, "wan".into(), pado)
+    );
+    assert_eq!(
+        recv_punt(&pppoed),
+        (punt::reason::PPP_CONTROL, "wan".into(), lcp.clone())
+    );
+    let mut buf = [0_u8; 2048];
+    assert!(
+        pppoed.recv(&mut buf).is_err(),
+        "session data is not control"
+    );
+
+    // The daemon's own LCP goes out of the WAN port.
+    let mut answer = lcp;
+    answer[0..6].copy_from_slice(&GATEWAY_MAC);
+    answer[6..12].copy_from_slice(&WAN_MAC);
+    send_punt(&pppoed, punt::reason::PPP_CONTROL, "wan", &answer);
+    bench.fe.step(1);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent");
+    assert_eq!((tx.egress, tx.bytes), (IfId(1), answer));
+}
+
+#[test]
+fn with_a_socket_directory_the_fe_binds_a_socket_per_control_process() {
+    let dir = std::env::temp_dir().join(format!("ruster-fe-control-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir(&dir).unwrap();
+    let mut bench = Bench::new();
+    bench.fe.set_punt_dir(dir.clone());
+    let (mut config, _routes) = configure(&mut bench);
+    let code = bench.patch(
+        &mut config,
+        &[punt_class(
+            "dhcpv4",
+            udp_port(17, Some((67, 67))),
+            Some("lan"),
+            to_control("ruster-kea"),
+            100,
+            10,
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let fe_path = dir.join("fe/punt/ruster-kea.sock");
+    assert!(fe_path.exists());
+    std::fs::create_dir(dir.join("ruster-kea")).unwrap();
+    let kea = UnixDatagram::bind(dir.join("ruster-kea/punt.sock")).unwrap();
+    kea.connect(&fe_path).unwrap();
+    bench.fe.io_mut().inject(IfId(0), dhcp_broadcast());
+    bench.fe.step(0);
+    assert_eq!(recv_punt(&kea).1, "lan");
+
+    // Frames back only from the process's own path.
+    let mut reply = dhcp_broadcast();
+    reply[6..12].copy_from_slice(&LAN_MAC);
+    send_punt(&kea, punt::reason::IP, "lan", &reply);
+    let stranger = UnixDatagram::unbound().unwrap();
+    stranger.connect(&fe_path).unwrap();
+    send_punt(&stranger, punt::reason::IP, "lan", &reply);
+    bench.fe.step(1);
+    assert_eq!(bench.fe.io_mut().pop_tx().expect("sent").bytes, reply);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn punt_classes_for_control_processes_follow_the_rules() {
+    use ruster_proto::table::{PuntKind, PuntMatch};
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let discovery = |interface: Option<&str>| {
+        punt_class(
+            "pppoe-discovery",
+            PuntMatch::Kind(PuntKind::PppoeDiscovery),
+            interface,
+            to_control("ruster-pppoed"),
+            1,
+            1,
+        )
+    };
+    let refused = [
+        // Only ARP and ND go to the neighbor process.
+        vec![punt_class(
+            "x",
+            udp_port(17, None),
+            None,
+            to_control("neighd"),
+            1,
+            1,
+        )],
+        // Two classes for PPPoE Discovery on the same interface.
+        vec![discovery(Some("wan")), {
+            let Change { key: _, value } = discovery(None);
+            Change {
+                key: Key::Punt {
+                    class: "more".into(),
+                },
+                value,
+            }
+        }],
+    ];
+    for changes in refused {
+        assert_eq!(
+            bench.patch(&mut config, &changes),
+            Code::BAD_REQUEST,
+            "{changes:?}"
+        );
+    }
+}

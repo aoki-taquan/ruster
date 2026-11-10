@@ -99,8 +99,10 @@ pub fn select(frame: &[u8], ingress: IfId, matches: &[PuntFrameMatch]) -> Option
 /// port.
 fn ip_to_link(frame: &[u8]) -> Option<(u8, Option<u16>)> {
     let ip = frame.get(ETHERNET..)?;
+    // The version agrees with the Ethernet type, as forwarding would check.
+    let version = if frame.get(12..14)? == IPV6 { 6 } else { 4 };
     let (protocol, header) = match ip.first()? >> 4 {
-        4 => {
+        4 if version == 4 => {
             let header = usize::from(ip[0] & 0x0f) * 4;
             let flags = u16::from_be_bytes([*ip.get(6)?, *ip.get(7)?]);
             // A fragment, the first included, or not to the broadcast address.
@@ -109,7 +111,7 @@ fn ip_to_link(frame: &[u8]) -> Option<(u8, Option<u16>)> {
             }
             (*ip.get(9)?, header)
         }
-        6 => {
+        6 if version == 6 => {
             let destination = ip.get(24..40)?;
             if destination[0] != 0xff || destination[1] & 0x0f != 2 {
                 return None;
