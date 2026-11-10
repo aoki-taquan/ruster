@@ -479,6 +479,8 @@ where
             let frame = &self.control.frames()[index];
             let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
             match kind {
+                // The FE does not ask core for these yet.
+                ControlKind::Punt(_) => {}
                 ControlKind::Neighbor => {
                     let class = punt_table::built_in(PuntKind::Nd);
                     if self.limits.admit(class, None, now_ms) {

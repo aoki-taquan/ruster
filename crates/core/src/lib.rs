@@ -24,6 +24,7 @@ mod observability;
 mod packet;
 mod port_set;
 mod pppoe;
+mod punt;
 mod reload_state;
 mod route;
 mod slot_index;
@@ -161,6 +162,7 @@ pub use packet::{
 };
 pub use port_set::{PortSet, PortSetError};
 pub use pppoe::PppoeSession;
+pub use punt::{PuntFrameKind, PuntFrameMatch};
 pub use reload_state::{StateCarryConflict, StateCarryOutcome};
 pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Origin, Route, RouteError,

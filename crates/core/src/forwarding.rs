@@ -1324,6 +1324,8 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) pppoe: &'a [crate::PppoeSession],
     /// VLAN sub-interfaces ([`ForwardingSnapshot::with_vlans`]).
     pub(crate) vlans: &'a [crate::VlanBinding],
+    /// Frames for the control side ([`ForwardingSnapshot::with_punt_frames`]).
+    pub(crate) punt: &'a [crate::PuntFrameMatch],
     /// The time NAT, firewall and ICMP limits count by when no ARP resolution
     /// runtime gives one ([`ForwardingSnapshot::with_now`]).
     pub(crate) now: MonotonicMillis,
@@ -1529,6 +1531,7 @@ impl<'a> ForwardingSnapshot<'a> {
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
+            punt: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             index: None,
@@ -1789,6 +1792,13 @@ impl<'a> ForwardingSnapshot<'a> {
         Self { pppoe, ..self }
     }
 
+    /// Copies the frames `punt` matches into the control queue instead of
+    /// forwarding them (see [`crate::PuntFrameMatch`]); the outer snapshot's count.
+    #[must_use]
+    pub fn with_punt_frames(self, punt: &'a [crate::PuntFrameMatch]) -> Self {
+        Self { punt, ..self }
+    }
+
     /// Forwards IPv6 by `fib` (see [`crate::Ipv6Fib`]).
     #[must_use]
     pub fn with_ipv6(self, fib: &'a crate::Ipv6Fib) -> Self {
@@ -1904,6 +1914,7 @@ impl<'a> ForwardingSnapshot<'a> {
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
+            punt: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             authority,
@@ -2263,6 +2274,7 @@ impl ValidatedForwardingOwner {
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
+            punt: &[],
             now: MonotonicMillis(0),
             vrfs: None,
             index: Some(&self.index),
@@ -3208,6 +3220,26 @@ where
                 packet.recycle(reason);
                 dropped += 1;
                 trace.record(TraceEvent::Dropped { ingress, reason });
+                continue;
+            }
+        }
+        // Frames for the control side go before the sessions and the routes see
+        // them.
+        if !all_vrfs.punt.is_empty() {
+            let ingress = packet.ingress();
+            if let Some(class) = crate::punt::select(packet.bytes_mut(), ingress, all_vrfs.punt) {
+                let queued = control
+                    .as_deref_mut()
+                    .is_some_and(|queue| queue.push_punt(ingress, packet.bytes_mut(), class));
+                if queued {
+                    packet.consume(crate::ConsumeReason::PuntToControl);
+                    consumed += 1;
+                } else {
+                    let reason = DropReason::Ipv6ControlQueueFull;
+                    packet.recycle(reason);
+                    dropped += 1;
+                    trace.record(TraceEvent::Dropped { ingress, reason });
+                }
                 continue;
             }
         }

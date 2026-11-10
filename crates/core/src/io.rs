@@ -290,11 +290,14 @@ pub enum ConsumeReason {
     /// for the FE to put the packet back together and pass it in again (RFC 6333
     /// 5.3, RFC 2473 7.2). The received frame is recycled.
     TunnelFragmentToControl,
+    /// A frame for the control side ([`crate::PuntFrameMatch`]) copied into the
+    /// caller's control queue. The received frame is recycled.
+    PuntToControl,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
@@ -304,6 +307,7 @@ impl ConsumeReason {
         Self::LocalToControl,
         Self::WireguardQueued,
         Self::TunnelFragmentToControl,
+        Self::PuntToControl,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -320,6 +324,7 @@ impl ConsumeReason {
             Self::LocalToControl => 6,
             Self::WireguardQueued => 7,
             Self::TunnelFragmentToControl => 8,
+            Self::PuntToControl => 9,
         }
     }
 
@@ -335,6 +340,7 @@ impl ConsumeReason {
             Self::LocalToControl => "LOCAL_TO_CONTROL",
             Self::WireguardQueued => "WIREGUARD_QUEUED",
             Self::TunnelFragmentToControl => "TUNNEL_FRAGMENT_TO_CONTROL",
+            Self::PuntToControl => "PUNT_TO_CONTROL",
         }
     }
 }
@@ -544,6 +550,7 @@ mod tests {
                 "LOCAL_TO_CONTROL",
                 "WIREGUARD_QUEUED",
                 "TUNNEL_FRAGMENT_TO_CONTROL",
+                "PUNT_TO_CONTROL",
             ]
         );
     }
