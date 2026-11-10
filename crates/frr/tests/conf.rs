@@ -400,3 +400,61 @@ exit
     bad.ospf.as_mut().unwrap().interface[0].name = "a b".into();
     assert!(ruster_frr::conf::config(&bad, "", 2620).is_err());
 }
+
+#[test]
+fn is_is_on_an_interface_without_ipv6_carries_ipv4_only_and_passive_forms_no_adjacency() {
+    use ruster_config::{Isis, IsisInterface, Ospf, OspfInterface};
+    // RFC 5308 section 1: IPv6 is carried on a circuit that has IPv6; "lan" has no
+    // global IPv6 prefix here, so it gets `ip router isis` alone. A passive circuit
+    // is announced without adjacencies (`isis passive`, `ipv6 ospf6 passive`).
+    // RFC 5305 section 3 and RFC 5340 appendix C.3: the largest metric and cost.
+    let frr = Frr {
+        isis: Some(Isis {
+            net: "49.0001.1921.6800.1001.00".into(),
+            level: "level-1".into(),
+            interface: vec![IsisInterface {
+                name: "lan".into(),
+                metric: 16_777_214,
+                passive: true,
+            }],
+        }),
+        ospf6: Some(Ospf {
+            router_id: "192.0.2.1".into(),
+            interface: vec![OspfInterface {
+                name: "lan".into(),
+                area: "0.0.0.1".into(),
+                cost: 65_535,
+                network: "point-to-point".into(),
+                passive: true,
+            }],
+        }),
+        connected: vec![Connected {
+            interface: "lan".into(),
+            prefix: "192.0.2.0/24".into(),
+            link_local: "fe80::1".into(),
+        }],
+        ..Frr::default()
+    };
+    let text = ruster_frr::conf::config(&frr, "", 2620).unwrap();
+    assert!(
+        text.contains(
+            "interface rp-lan
+ ip router isis ruster
+ isis metric 16777214
+ isis passive
+ ipv6 ospf6 area 0.0.0.1
+ ipv6 ospf6 cost 65535
+ ipv6 ospf6 network point-to-point
+ ipv6 ospf6 passive
+exit
+router isis ruster
+ net 49.0001.1921.6800.1001.00
+ is-type level-1
+ metric-style wide
+exit
+"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("ipv6 router isis"), "{text}");
+}

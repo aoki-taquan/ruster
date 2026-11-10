@@ -300,3 +300,202 @@ fn truncated_and_mutated_input_never_panics() {
         read_all(&f);
     }
 }
+
+// RFC 3549 section 2.3.2 and section 3.1.1, with Linux's values: what each field of
+// a route message means, built here field by field.
+
+fn body(f: &[u8]) -> Vec<Result<Message, String>> {
+    let (body, used) = next_frame(f).unwrap().unwrap();
+    assert_eq!(used, f.len());
+    messages(body)
+}
+
+#[test]
+fn the_fpm_length_counts_its_own_four_bytes() {
+    // FRR's `fpm/fpm.h` (not an RFC): version 1, type 1 (netlink), the length in
+    // network byte order with the header. A frame of one 36-byte message is 40.
+    let m = message(24, 2, 8, 254, 1, &[attr(1, &[10, 0, 0, 0])]);
+    assert_eq!(m.len(), 16 + 12 + 8);
+    let f = frame(std::slice::from_ref(&m));
+    assert_eq!(&f[..4], &[1, 1, 0, 40]);
+    let (inner, used) = next_frame(&f).unwrap().unwrap();
+    assert_eq!((inner, used), (&m[..], 40));
+    // A length of exactly the header is a frame with no messages.
+    assert_eq!(next_frame(&[1, 1, 0, 4]), Ok(Some((&[][..], 4))));
+}
+
+#[test]
+fn attributes_are_aligned_to_four_bytes_and_unknown_ones_are_passed_over() {
+    // RFC 3549 section 3.1.1: rta_len counts the 4-byte header and the value, not
+    // the padding; the next attribute starts at RTA_ALIGN(rta_len). An unknown
+    // attribute of 5 bytes (type 200) with 3 bytes of padding, RTA_PRIORITY (6), and
+    // RTA_METRICS (8) with NLA_F_NESTED (0x8000) are all passed over.
+    let mut odd = attr(200, &[0xaa]);
+    assert_eq!((odd[0], odd.len()), (5, 8));
+    odd[5..8].copy_from_slice(&[0xff; 3]); // the padding is not read
+    let metrics = attr(8 | 0x8000, &attr(2, &1400u32.to_ne_bytes()));
+    let m = message(
+        24,
+        2,
+        24,
+        254,
+        1,
+        &[
+            odd,
+            attr(1, &[192, 0, 2, 0]),
+            attr(6, &20u32.to_ne_bytes()),
+            metrics,
+            attr(5, &[198, 51, 100, 1]),
+            attr(4, &7u32.to_ne_bytes()),
+        ],
+    );
+    assert_eq!(
+        body(&frame(&[m])),
+        [Ok(Message::Route(Route {
+            new: true,
+            prefix: ip("192.0.2.0"),
+            len: 24,
+            table: 254,
+            kind: Kind::Unicast,
+            hops: vec![Hop {
+                gateway: Some(ip("198.51.100.1")),
+                oif: Some(7)
+            }],
+        }))]
+    );
+}
+
+#[test]
+fn a_message_ending_off_four_bytes_is_followed_by_the_next_at_its_alignment() {
+    // RFC 3549 section 2.3.2: nlmsg_len counts the message without its trailing
+    // padding; the next starts at NLMSG_ALIGN(nlmsg_len). The first message ends
+    // with a 5-byte attribute: nlmsg_len 16 + 12 + 8 + 5 = 41, the next at 44.
+    let mut first = message(25, 2, 8, 254, 1, &[attr(1, &[10, 0, 0, 0])]);
+    first.extend([5, 0, 200, 0, 0xaa]);
+    let len = first.len() as u32;
+    assert_eq!(len, 41);
+    first[..4].copy_from_slice(&len.to_ne_bytes());
+    first.extend([0; 3]);
+    let second = message(24, 2, 16, 254, 1, &[attr(1, &[10, 1, 0, 0])]);
+    let got: Vec<_> = routes(&frame(&[first, second]))
+        .into_iter()
+        .map(|r| (r.new, r.prefix, r.len))
+        .collect();
+    assert_eq!(
+        got,
+        [(false, ip("10.0.0.0"), 8), (true, ip("10.1.0.0"), 16)]
+    );
+}
+
+#[test]
+fn ipv6_routes_with_rtnexthops_and_deletes() {
+    // RFC 3549 section 3.1.1 and linux/rtnetlink.h: RTA_MULTIPATH is a list of
+    // `struct rtnexthop` {rtnh_len u16, rtnh_flags u8, rtnh_hops u8, rtnh_ifindex
+    // i32}, each followed by its own attributes. One hop here has a gateway, the
+    // other only an interface.
+    let gw = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let mut bare = 8u16.to_ne_bytes().to_vec();
+    bare.extend([0, 0]);
+    bare.extend(9u32.to_ne_bytes());
+    let multipath: Vec<u8> = [nexthop(&gw, 4), bare].concat();
+    let dst = [
+        0x20, 0x01, 0x0d, 0xb8, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let new = message(24, 10, 48, 254, 1, &[attr(1, &dst), attr(9, &multipath)]);
+    let del = message(25, 10, 48, 254, 1, &[attr(1, &dst)]);
+    let got = routes(&frame(&[new, del]));
+    assert_eq!(
+        got[0].hops,
+        [
+            Hop {
+                gateway: Some(ip("fe80::2")),
+                oif: Some(4)
+            },
+            Hop {
+                gateway: None,
+                oif: Some(9)
+            }
+        ]
+    );
+    assert_eq!((got[0].prefix, got[0].len), (ip("2001:db8:10::"), 48));
+    assert!(!got[1].new && got[1].hops.is_empty());
+    assert_eq!((got[1].prefix, got[1].len), (ip("2001:db8:10::"), 48));
+    // A /129 is not an IPv6 prefix, and a 4-byte gateway is not one of AF_INET6.
+    let long = message(24, 10, 129, 254, 1, &[]);
+    assert!(body(&frame(&[long]))[0]
+        .as_ref()
+        .unwrap_err()
+        .contains("prefix length"));
+    let wrong = message(
+        24,
+        10,
+        48,
+        254,
+        1,
+        &[attr(1, &dst), attr(5, &[198, 51, 100, 1])],
+    );
+    assert!(body(&frame(&[wrong]))[0]
+        .as_ref()
+        .unwrap_err()
+        .contains("RTA_GATEWAY of 4 bytes in family 10"));
+}
+
+#[test]
+fn rtm_type_and_rta_table_take_linux_s_values() {
+    // linux/rtnetlink.h: RTN_UNICAST 1, RTN_LOCAL 2, RTN_BLACKHOLE 6,
+    // RTN_UNREACHABLE 7, RTN_PROHIBIT 8. RTA_TABLE (a u32) holds the table when it
+    // is set, as it must be above 255 (rtm_table is then RT_TABLE_COMPAT, 252).
+    let of = |rtype: u8, attrs: &[Vec<u8>]| {
+        let mut all = vec![attr(1, &[10, 0, 0, 0])];
+        all.extend_from_slice(attrs);
+        routes(&frame(&[message(24, 2, 8, 252, rtype, &all)])).remove(0)
+    };
+    assert_eq!(of(7, &[]).kind, Kind::Unreachable);
+    assert_eq!(of(2, &[]).kind, Kind::Other(2));
+    assert_eq!(of(1, &[]).table, 252);
+    assert_eq!(of(1, &[attr(15, &1000u32.to_ne_bytes())]).table, 1000);
+    // RTA_TABLE or RTA_OIF of another size than a u32 is refused.
+    for bad in [attr(15, &[1, 0]), attr(4, &[1, 0, 0, 0, 0])] {
+        let m = message(24, 2, 8, 254, 1, &[attr(1, &[10, 0, 0, 0]), bad]);
+        assert!(body(&frame(&[m]))[0].is_err());
+    }
+}
+
+#[test]
+fn lengths_that_do_not_fit_are_refused() {
+    // RFC 3549 sections 2.3.2 and 3.1.1: nlmsg_len below the 16-byte header or
+    // beyond what is left, an rtmsg cut short, rta_len below 4 or beyond the
+    // message, and rtnh_len below the 8-byte rtnexthop.
+    let mut short = message(24, 2, 8, 254, 1, &[attr(1, &[10, 0, 0, 0])]);
+    short[..4].copy_from_slice(&15u32.to_ne_bytes());
+    let mut long = message(24, 2, 8, 254, 1, &[attr(1, &[10, 0, 0, 0])]);
+    long[..4].copy_from_slice(&100u32.to_ne_bytes());
+    let mut cut = message(24, 2, 8, 254, 1, &[]);
+    cut.truncate(16 + 8);
+    cut[..4].copy_from_slice(&24u32.to_ne_bytes());
+    for (m, why) in [
+        (short, "does not fit"),
+        (long, "does not fit"),
+        (cut, "a route message of 8 bytes"),
+    ] {
+        let got = body(&frame(&[m]));
+        assert!(got[0].as_ref().unwrap_err().contains(why), "{got:?}");
+    }
+    let mut tiny = attr(1, &[10, 0, 0, 0]);
+    tiny[..2].copy_from_slice(&3u16.to_ne_bytes());
+    let mut over = attr(1, &[10, 0, 0, 0]);
+    over[..2].copy_from_slice(&40u16.to_ne_bytes());
+    let mut rtnh = nexthop(&[10, 0, 0, 1], 3);
+    rtnh[..2].copy_from_slice(&4u16.to_ne_bytes());
+    for attrs in [
+        vec![tiny],
+        vec![over],
+        vec![attr(1, &[10, 0, 0, 0]), attr(9, &rtnh)],
+    ] {
+        let got = body(&frame(&[message(24, 2, 8, 254, 1, &attrs)]));
+        assert!(
+            got[0].as_ref().unwrap_err().contains("does not fit"),
+            "{got:?}"
+        );
+    }
+}
