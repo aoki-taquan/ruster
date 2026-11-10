@@ -40,13 +40,12 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 | [`tables.md`](docs/design/tables.md) | FEの表の一覧 |
 | [`fe-internals.md`](docs/design/fe-internals.md) | FEの中の仕事の分け方とスレッドの置き方 |
 | [`ce-processes.md`](docs/design/ce-processes.md) | confd、ribd、neighdの役目 |
+| [`overlay.md`](docs/design/overlay.md) | L2のブリッジ、VXLAN、EtherIP、SRv6、IS-ISとOSPF |
 | [`implementation-plan.md`](docs/design/implementation-plan.md) | 作る順番と、今どこまでできたか |
 
 ## 今の状態
 
-今どこまでできたかは[`implementation-plan.md`](docs/design/implementation-plan.md)の一か所だけに書きます。
-
-今動いている範囲は次のとおりです。
+今どこまでできたかは[`implementation-plan.md`](docs/design/implementation-plan.md)の一か所だけに書きます。今動いている範囲は次のとおりです。
 
 - IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPとICMPv6のエラーを返す。
 - ルータ宛ての通信は、種類ごとに数を抑えてVRFごとのTUNでkernelに渡す。

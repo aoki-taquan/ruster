@@ -19,7 +19,8 @@
 | 転送、TTL、checksum、MAC書き換え | FE | パケットごとの処理 |
 | NATセッション、firewallの状態追跡 | FE | フローごとに作られ、外に問い合わせると間に合わない |
 | フラグメント処理、ICMPエラー生成（流量制限付き） | FE | パケットごとの処理 |
-| トンネルのカプセル化（MAP-E、DS-Lite） | FE | トンネル内の通信はすべて転送 |
+| トンネルのカプセル化（MAP-E、DS-Lite、VXLAN、EtherIP、SRv6） | FE | トンネル内の通信はすべて転送 |
+| ブリッジのMACアドレスの学習とエージング | FE | フレームごとに学び、外に問い合わせると間に合わない |
 | ルータ宛て通信の分類と流量制限 | FE | 攻撃を受けても制御通信を守るため |
 | ARP/ND（問い合わせ、再送、GARP、DAD、衝突検出） | CE | 近隣の数の分しか状態がなく、プロトコルの状態遷移を持つ |
 | 経路計算（RIB）、静的経路の選択 | CE | 相手と会話するプロトコル、ポリシー |
@@ -96,6 +97,8 @@ CEの各プロセスとFEの間に中継するプロセスは置かない。次�
 
 ARP、ND、RA、DHCP、DHCPv6、PPPoEのDiscoveryとセッションの制御（LCP、認証、IPCP、IPv6CP）は、
 FEから担当のCEプロセスへそのまま渡す。CEが作ったフレームはFEがそのまま送り出す。
+IS-ISのフレームとOSPFのパケットは、FRRがインターフェースごとのL2のデバイスを要るので、受けたインターフェースの
+TAPへそのまま書く（[`overlay.md`](overlay.md)の6.）。
 
 - 渡し先は一つの表で決める。行は「インターフェース、種類（ethertype、IPのプロトコルとポート、PPPの
   プロトコル）、渡し先のsocket」。ARPとNDをneighdへ渡すのも、この表の一行にする。
@@ -128,7 +131,9 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
   NATのポートの範囲から外して設定する。そのポートに届いたパケットは、NATの対応を探さずに
   input firewallへ進む。MAP-Eでは、待ち受けもPSIDのポートの組の中から選ぶ。UDPのサービスは、
   受けたアドレスから返す（`IP_PKTINFO`などを使う）。NATがあるときkernelが選ぶ送信元は内側のアドレスなので。
-- TAPではなくTUNを使い、kernelにARP/NDをさせない。
+- TAPではなくTUNを使い、kernelにARP/NDをさせない。IS-ISかOSPFを動かすインターフェースだけは、
+  ARPを切ったTAP（`NOARP`）をインターフェースごとに置き、そのアドレスをTAPに付ける。TAPから出てきたIPは、
+  TUNから読んだパケットと同じに扱う（[`overlay.md`](overlay.md)の6.）。
 - kernelは専用のnetnsに置き、フォワーディングは無効にする。kernelの経路は「全部TUNへ」だけ。
 - アドレスはCEからkernelへ一方向に設定する。kernelからrusterへ情報を取り込まない。
 - VRFごとにTUNを一つ持つ。FEはパケットのVRFでTUNを選び、TUNから読んだパケットはどのTUNから来たかで
@@ -150,7 +155,7 @@ kernelへの分類と上限は、パケットをTUNのインターフェース�
 
 ### kernelに渡さない通信
 
-大量になりうる通信はkernelに渡さない。トンネル（MAP-E、DS-Lite、GRE、VXLAN）の中身は
+大量になりうる通信はkernelに渡さない。トンネル（MAP-E、DS-Lite、GRE、VXLAN、EtherIP、SRv6）の中身は
 FEが転送として処理する。DPUのホスト宛て通信もFEの普通の転送になる。
 
 ## 未決事項

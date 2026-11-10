@@ -28,10 +28,12 @@
 | インターフェース | `ietf-interfaces`（RFC 8343）+ 種類ごとの拡張 | 各インターフェースが一つのVRFに属する | confd | 設定、PPPoEのデーモン |
 | アドレス、MTU | `ietf-ip`（RFC 8344） | インターフェース経由 | confd | 設定、DHCP、PPPoE（IPCP）、DHCPv6-PD、MAP-E計算 |
 | インターフェースごとの動作 | `ruster-if-ip` | インターフェース経由 | confd | 設定 |
-| 経路（FIB） | `ruster-fib` | VRFごと | ribd | 設定、直結、DHCP、ルーティングデーモン |
+| 経路（FIB）、SRv6のローカルのSIDと包む方針 | `ruster-fib` | VRFごと | ribd | 設定、直結、DHCP、ルーティングデーモン |
 | 近隣 | `ruster-neighbor` | インターフェース経由 | neighd | ARP、ND |
 | NAT | `ietf-nat`（RFC 8512）の一部 + VRFの結び付け | VRFごと | confd | 設定、MAP-E計算 |
 | firewall | `ietf-access-control-list`（RFC 8519）+ `ruster-firewall` | VRFごと | confd | 設定 |
+| ブリッジ、メンバー、静的なMAC | `ruster-bridge`（`ieee802-dot1q-bridge`の項目の名前） | — | confd | 設定 |
+| VTEPの一覧 | `ruster-if-vxlan` | インターフェース経由 | confd | 設定 |
 | ルータ宛て通信の分類 | `ruster-punt` | 全体で一つ | confd | 設定 |
 | FE全体の動作 | `ruster-fe` | 全体で一つ | confd | 設定 |
 
@@ -52,10 +54,12 @@
 | Ethernet | — | MACアドレス | 物理ポート。FEが起動時に受け取ったNICと名前で結び付く |
 | VLAN | `ietf-if-vlan-encapsulation`の形 | 親、タグ1つまたは2つ | 標準はまだdraft（draft-ietf-netmod-sub-intf-vlan-model-18）。形を合わせ、RFCになったら置き換える |
 | PPPoE | `ruster-if-pppoe` | 親、セッションID、相手のMAC | セッションの確立は外のデーモン。FEは包むのと外すのだけ |
-| IPトンネル | `ruster-if-tunnel` | 種類（IPv4 in IPv6、IPv6 in IPv4、GRE）、下側のVRF、送信元、宛先 | DS-Liteはこれ一つで表せる |
+| IPトンネル | `ruster-if-tunnel` | 種類（IPv4 in IPv6、IPv6 in IPv4、GRE、EtherIP）、下側のVRF、送信元、宛先 | DS-Liteはこれ一つで表せる。EtherIPはブリッジのメンバーにだけなる |
+| VXLAN | `ruster-if-vxlan` | VNI、送信元、下側のVRF、UDPのポート、学ぶか | ブリッジのメンバーにだけなる。VTEPの一覧は別の行 |
+| IRB | — | — | 名前がブリッジと同じインターフェース（[`overlay.md`](overlay.md)） |
 | loopback | — | — | 特定のポートに属さないルータのアドレス用 |
 
-VXLANなど他のトンネルは、使う場面が出たら同じ形で足す。
+ブリッジ、VXLAN、EtherIP、SRv6の表の中身は[`overlay.md`](overlay.md)に書く。
 
 ### 「下側のVRF」
 
@@ -87,6 +91,8 @@ VXLANなど他のトンネルは、使う場面が出たら同じ形で足す。
   PPPoEやトンネルのように相手が一つしかないインターフェースでは、アドレスを書かない。
 - ルータ宛て（local）、黙って捨てる（discard）、ICMP Unreachableを返す（reject）。
 - 別のVRFで引き直す（lookup-vrf）。
+- SRv6のローカルのSID（End、End.X、End.DT4、End.DT6）。次の転送先には、SRv6で包むSIDのリストを付けられる
+  （[`overlay.md`](overlay.md)の5.）。
 
 VRFをまたぐ転送には二つの方法がある。次の転送先の出力インターフェースが別のVRFに属していれば、
 そのまま送る（インターフェースが自分のVRFを持っているので、FEに追加の処理は要らない）。
@@ -175,7 +181,7 @@ IPv4とIPv6の転送に同じfirewallを使う。決めること（RFC 4890、RF
 | 分類の名前 | 例: `arp`、`nd`、`dhcpv4`、`dhcpv6`、`ra`、`pppoe-discovery`、`ppp-control`、`bgp`、`ssh`、`other` |
 | 一致条件 | 決まった種類（`arp`、`nd`、`pppoe-discovery`、`ppp-control`と、kernelへの`icmp-error`、`icmp`、`tcp-syn`、`tcp`、`udp`、`other`）か、IPのプロトコルとTCP/UDPの宛先ポートの範囲 |
 | インターフェース | 受けたインターフェース。省略するとどれでも |
-| 渡し先 | CEのsocketの名前 / kernel（そのVRFのTUN） / 捨てる |
+| 渡し先 | CEのsocketの名前 / kernel（そのVRFのTUN） / 受けたインターフェースのTAP（IS-IS、OSPF。[`overlay.md`](overlay.md)の6.） / 捨てる |
 | 上限 | 毎秒のパケット数と、まとめて許す数 |
 
 - `arp`、`nd`（渡し先はneighd）と、kernelへの種類の分類（`icmp-error`から`other`まで）は、設定が無くても
@@ -210,6 +216,8 @@ FEが作る状態（読むだけ）: 分類ごとの受け渡し数と捨てた�
 | NATのセッション | `ruster-nat`の状態 |
 | firewallで追っている通信、ルールごとの一致数 | `ruster-firewall`の状態、`ietf-access-control-list`の統計 |
 | ルータ宛て通信の受け渡し数と捨てた数 | `ruster-punt`の状態 |
+| MACの表と、ブリッジごとの数 | `ruster-bridge`の状態 |
+| SRv6のSIDごとの数 | `ruster-fib`の状態 |
 | 各表の使用量と容量 | `ruster-fe`の状態 |
 
 ## 通知
@@ -224,7 +232,7 @@ FEからCEへ、Observeで届く。
 
 ## 未決事項
 
-- `ietf-nat`、`ietf-access-control-list`、`ietf-network-instance`のSIDの有無。
+- `ietf-nat`、`ietf-access-control-list`、`ietf-network-instance`、`ieee802-dot1q-bridge`のSIDの有無。
 - VLANの標準モデルがRFCにならないまま変わったときの扱い。
 - IPv6のRA（ルータ広告）を受け取る側（ホストとして動くインターフェース）をどう扱うか。
 - マルチキャストの転送（IGMP/MLD、PIM）は扱っていない。必要になったら表を足す。
