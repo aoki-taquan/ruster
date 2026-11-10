@@ -113,7 +113,8 @@ confd → 各プロセス: 確定
 ### Kea（`ruster-kea`）
 
 - LANのポートはFEが持ち、kernelからは見えない。DHCPのフレームは、FEの受け渡しの表でLANのポートから
-  `ruster-kea`へ渡す。
+  `ruster-kea`へ渡す。表の行はconfdが書く。全体の設定の`[[dhcp]]`のインターフェースごとに、UDPの67番
+  （ブロードキャストと、更新のときのルータのアドレス宛て）を`kea`へ渡す行`dhcp-<インターフェース名>`。
 - `ruster-kea`はDHCPのリレー（DHCPv4はRFC 1542とRFC 3046、DHCPv6はRFC 8415のrelay-forw）として振る舞い、
   kernelのnetnsのKeaへUDPで渡す。Keaの返事はクライアントへのフレームに戻し、FEの受け渡しで送り出す。
 - Keaの設定は制御用のsocketで入れ替える。

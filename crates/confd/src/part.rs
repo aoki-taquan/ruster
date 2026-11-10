@@ -26,6 +26,7 @@
 //! | Module | Process | Part |
 //! |---|---|---|
 //! | `dns` | `ruster-unbound` | [`ruster_config::dns_part`] |
+//! | `dhcp` | `ruster-kea` | [`ruster_config::dhcp_part`] |
 //!
 //! [`Client`] is the process's side.
 //!
@@ -61,14 +62,16 @@ const MESSAGES_PER_STEP: usize = 16;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Module {
     Dns,
+    Dhcp,
 }
 
 impl Module {
-    pub const ALL: [Module; 1] = [Module::Dns];
+    pub const ALL: [Module; 2] = [Module::Dns, Module::Dhcp];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Dns => "dns",
+            Self::Dhcp => "dhcp",
         }
     }
 
@@ -80,6 +83,7 @@ impl Module {
     pub fn part(self, config: &Config) -> String {
         match self {
             Self::Dns => ruster_config::dns_part(config.dns.as_ref()),
+            Self::Dhcp => ruster_config::dhcp_part(&config.dhcp),
         }
     }
 
@@ -87,6 +91,7 @@ impl Module {
     pub fn configured(self, config: &Config) -> bool {
         match self {
             Self::Dns => config.dns.is_some(),
+            Self::Dhcp => !config.dhcp.is_empty(),
         }
     }
 }

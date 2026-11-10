@@ -634,6 +634,10 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         .next()
         .map(|entry| dns(entry, &seen))
         .transpose()?;
+    // Each is a punt class of the FE, which holds 64 besides its own.
+    if lock.dhcp.len() > DHCP_MAX {
+        return Err(format!("give at most {DHCP_MAX} dhcp"));
+    }
     let mut dhcp = Vec::with_capacity(lock.dhcp.len());
     for entry in lock.dhcp {
         if dhcp
@@ -656,6 +660,9 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         dhcp,
     })
 }
+
+/// The most `dhcp` entries: each takes one of the FE's punt classes.
+const DHCP_MAX: usize = 32;
 
 /// The longest DHCP lease: a day short of a year, well within what Kea and the
 /// 32-bit lease time option (RFC 2132 section 9.2) hold.

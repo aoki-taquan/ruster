@@ -5,10 +5,10 @@
 //!
 //! | To | What |
 //! |---|---|
-//! | FE | interfaces, addresses, and the default VRF's firewall rules and NAT |
+//! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP to `ruster-kea` |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
-//! | a process for a module (`ruster-unbound` for `dns`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
+//! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
 //!
 //! On every (re)connection confd sends everything between resync-begin and resync-end,
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
@@ -152,6 +152,18 @@ struct Peer {
     /// refused for may have gone).
     patch_refused: Option<Option<u64>>,
 }
+
+/// The control process (`<run>/kea/punt.sock`) that DHCP frames are handed to.
+pub const DHCP_CONTROL: &str = "kea";
+/// The punt class of one interface's DHCP: `dhcp-<interface>`.
+pub const DHCP_CLASS_PREFIX: &str = "dhcp-";
+/// The DHCP server port.
+pub const DHCP_SERVER_PORT: u16 = 67;
+/// How many DHCP packets per second, and at once, one interface hands over. A
+/// client sends a few per lease; this leaves room for a LAN of a few hundred
+/// starting together, and keeps a flood from one interface off the others'.
+pub const DHCP_PUNT_RATE: u32 = 200;
+pub const DHCP_PUNT_BURST: u32 = 100;
 
 /// A refused resync-end is sent again at least this often.
 pub const RESYNC_END_RETRY_MS: u64 = 10_000;
@@ -462,6 +474,28 @@ impl Confd {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
                 },
                 Value::Nat(nat.clone()),
+            );
+        }
+        // Each DHCP interface's requests to the server port go to ruster-kea: the
+        // broadcasts before forwarding, and those to the router's address (renewals)
+        // after the input firewall.
+        for dhcp in &self.config.dhcp {
+            out.insert(
+                Key::Punt {
+                    class: format!("{DHCP_CLASS_PREFIX}{}", dhcp.interface),
+                },
+                Value::Punt(ruster_proto::table::PuntClass {
+                    matches: ruster_proto::table::PuntMatch::Ip {
+                        protocol: 17,
+                        ports: Some((DHCP_SERVER_PORT, DHCP_SERVER_PORT)),
+                    },
+                    interface: Some(dhcp.interface.clone()),
+                    destination: ruster_proto::table::PuntDestination::Control(
+                        DHCP_CONTROL.to_owned(),
+                    ),
+                    rate: DHCP_PUNT_RATE,
+                    burst: DHCP_PUNT_BURST,
+                }),
             );
         }
         out
