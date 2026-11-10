@@ -310,9 +310,9 @@
 //!   192.0.0.2/29, if no earlier interface of its VRF has that address or its
 //!   prefix (so only the first such tunnel of a VRF gets it).
 //! - RFC 4861 section 6.2.1: `[[ra]]`'s defaults are the router configuration
-//!   variables' (AdvCurHopLimit the IANA value for IPv6, 64). Deviation: below 9 s
+//!   variables' (AdvCurHopLimit the IANA value for IPv6, 64). Deviations: below 9 s
 //!   MinRtrAdvInterval is 0.75 of MaxRtrAdvInterval, not MaxRtrAdvInterval, which
-//!   the same section's upper bound for it refuses. RFC 4862 section 5.5.3: only the
+//!   the same section's upper bound for it refuses; it is at least 3 s. RFC 4862 section 5.5.3: only the
 //!   prefixes of /64 addresses are advertised (for SLAAC on Ethernet, RFC 2464). RFC
 //!   8106 section 5.1: the DNS servers' lifetime is 3 times MaxRtrAdvInterval.
 //! - RFC 4787 REQ-8 and RFC 5382 REQ-3: NAT and the firewall filter

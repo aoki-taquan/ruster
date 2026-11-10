@@ -11,10 +11,11 @@
 //!   AdvValidLifetime. Section 4.6.2: a prefix is not link-local or multicast.
 //! - RFC 4862 section 5.5.3: an autonomous prefix is a /64 (the interface identifier
 //!   on Ethernet is 64 bits, RFC 2464).
-//! - RFC 8106 section 5.1: the DNS servers are unicast addresses, and their lifetime
-//!   is at least MaxRtrAdvInterval.
+//! - RFC 8106 section 5.1: the DNS servers are unicast addresses.
 //!
-//! Deviations: a prefix must be the prefix of one of the interface's addresses (the
+//! Deviations: the DNS servers' lifetime must be at least MaxRtrAdvInterval (RFC
+//! 6106's bound, which RFC 8106 dropped), so they do not lapse between two
+//! advertisements; an interface must have an MTU of at least 1280; a prefix must be the prefix of one of the interface's addresses (the
 //! router has a connected route for it); at most [`PREFIX_MAX`] prefixes and
 //! [`DNS_MAX`] DNS servers, so an advertisement fits in 1280 bytes. An interface
 //! must be a port or VLAN (an Ethernet link).
@@ -57,6 +58,11 @@ fn one(entry: &Ra, interfaces: &[InterfaceConfig]) -> Result<(), String> {
         .ok_or_else(|| format!("{at}: no such interface"))?;
     if interface.tunnel.is_some() || interface.pppoe.is_some() {
         return Err(format!("{at}: the interface must be a port or a VLAN"));
+    }
+    if interface.mtu < 1_280 {
+        return Err(format!(
+            "{at}: the interface's MTU must be at least 1280 to carry IPv6"
+        ));
     }
     let (min, max) = (entry.min_interval, entry.max_interval);
     if !(4..=1_800).contains(&max) {

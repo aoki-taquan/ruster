@@ -66,6 +66,9 @@ fn ra_is_checked() {
         let got = parse(&text).unwrap_err();
         assert!(got.contains(error), "{entry}: {got}");
     }
+    let small = LAN.replace("vlan = 10", "vlan = 10\nmtu = 1000");
+    let got = parse(&format!("{small}\n[[ra]]\ninterface = \"lan.10\"\n")).unwrap_err();
+    assert!(got.contains("at least 1280"), "{got}");
     assert!(parse(&format!("{good}\n[[ra]]\ninterface = \"lan\"\n"))
         .unwrap_err()
         .contains("given twice"));

@@ -15,12 +15,13 @@ pub const RA_HOP_LIMIT: u8 = 64;
 pub const RA_VALID_LIFETIME: u32 = 2_592_000;
 pub const RA_PREFERRED_LIFETIME: u32 = 604_800;
 
-/// MinRtrAdvInterval for a MaxRtrAdvInterval: 0.33 of it from 9 s. Below that RFC
-/// 4861 gives MaxRtrAdvInterval itself, which is above the 0.75 of it that the same
-/// section allows, so 0.75 of it is used.
+/// MinRtrAdvInterval for a MaxRtrAdvInterval: 0.33 of it from 9 s, and at least
+/// the 3 s the same section allows. Below 9 s RFC 4861 gives MaxRtrAdvInterval
+/// itself, which is above the 0.75 of it that the section allows, so 0.75 of it is
+/// used.
 pub fn ra_min_interval(max: u32) -> u32 {
     if max >= 9 {
-        max * 33 / 100
+        (max * 33 / 100).max(3)
     } else {
         max * 3 / 4
     }

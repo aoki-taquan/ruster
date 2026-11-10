@@ -67,6 +67,12 @@ fn ra_keys_replace_the_defaults() {
         (ra.prefix[0].valid_lifetime, ra.prefix[0].preferred_lifetime),
         (7_200, 3_600)
     );
+    // At 9 s, 0.33 of it would be below 3 s.
+    let nine = resolve(&format!(
+        "{LAN}\n[[ra]]\ninterface = \"lan\"\nmax-interval = 9\n"
+    ))
+    .unwrap();
+    assert_eq!(nine.ra[0].min_interval, 3);
     // Without [dns] there is no DNS server.
     let lock = resolve(&format!("{LAN}\n[[ra]]\ninterface = \"lan\"\n")).unwrap();
     assert!(lock.ra[0].dns.is_empty());
