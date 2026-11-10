@@ -6,7 +6,7 @@
 //! them as a DHCP relay agent: the FE hands it the clients' requests (the punt
 //! classes confd writes for each `[[dhcp]]` interface), it relays them to Kea over
 //! UDP, and it turns Kea's replies back into frames that the FE sends out of the
-//! interface ([`relay`]).
+//! interface ([`relay`], [`agent`]).
 //!
 //! It takes the `dhcp` part of the configuration from confd
 //! ([`ruster_confd::part`]), writes Kea's subnets for it to one file
@@ -20,6 +20,7 @@
 //!
 //! See [`relay`] and [`settings`].
 
+pub mod agent;
 pub mod relay;
 pub mod settings;
 
