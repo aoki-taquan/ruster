@@ -1166,3 +1166,37 @@ fn at_most_32_dhcp_are_taken() {
     }
     assert!(parse(&text).unwrap_err().contains("at most 32 dhcp"));
 }
+
+#[test]
+fn dhcp_subnets_do_not_overlap() {
+    let text = r#"
+[[interface]]
+name = "a"
+mac = "02:00:00:00:00:01"
+ipv4 = "10.0.0.1/16"
+
+[[interface]]
+name = "b"
+mac = "02:00:00:00:00:02"
+ipv4 = "10.0.1.1/24"
+vrf = "red"
+
+[[interface]]
+name = "c"
+mac = "02:00:00:00:00:03"
+ipv4 = "10.0.2.1/24"
+
+[[dhcp]]
+interface = "a"
+pool = "10.0.0.10-10.0.0.20"
+
+[[dhcp]]
+interface = "c"
+pool = "10.0.2.10-10.0.2.20"
+"#;
+    assert!(parse(text)
+        .unwrap_err()
+        .contains("overlaps that of dhcp \"a\""));
+    let zero = "[[interface]]\nname = \"z\"\nmac = \"02:00:00:00:00:01\"\nipv4 = \"1.0.0.1/7\"\n\n[[dhcp]]\ninterface = \"z\"\npool = \"1.0.0.10-1.0.0.20\"\n";
+    assert!(parse(zero).unwrap_err().contains("must not be 0.0.0.0"));
+}

@@ -65,7 +65,8 @@ impl Bridge {
         if let Err(error) = self.reload() {
             let put_back = match &before {
                 Some(before) => self.write(before),
-                None => std::fs::remove_file(&self.path).map_err(|e| e.to_string()),
+                // With no file Kea could not start: one with no subnets instead.
+                None => self.write(&settings::settings(&self.listen, &[])),
             };
             if let Err(again) = put_back.and_then(|()| self.reload()) {
                 eprintln!("ruster-kea: putting the file before back: {again}");
