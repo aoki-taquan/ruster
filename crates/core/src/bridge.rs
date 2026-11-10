@@ -1,7 +1,7 @@
 //! The MAC address table of the FE's bridges, and what a bridge does with a frame.
 //!
 //! See `docs/design/overlay.md`, section 1. A bridge is one broadcast domain whose
-//! members are interfaces (ports, VLAN sub-interfaces). [`MacTable`] holds, for every
+//! members are interfaces (ports, VLAN sub-interfaces, overlays). [`MacTable`] holds, for every
 //! bridge, the member each MAC address was last seen on: entries it learned from the
 //! frames' source addresses, which age, and static ones the control side wrote, which
 //! do not. [`MacTable::receive`] decides what happens to a frame received on a member:
@@ -518,7 +518,7 @@ pub struct BridgeConfig {
     pub limits: BridgeLimits,
     /// The bridge's own interface and its MAC address, when it has one.
     pub irb: Option<(IfId, [u8; 6])>,
-    /// The members, ports and VLAN sub-interfaces.
+    /// The members: ports, VLAN sub-interfaces and overlays.
     pub members: Vec<IfId>,
 }
 
@@ -547,8 +547,8 @@ pub(crate) enum Received {
     /// Not a member's frame, or one for the IRB (its ingress is now the IRB):
     /// forwarding goes on with it.
     Pass,
-    /// Relayed out of one member: commit it to this port.
-    Transmitted(IfId),
+    /// To be sent out of this one member.
+    Forward(IfId),
     Consumed,
     Dropped,
 }
@@ -697,12 +697,10 @@ impl Bridges {
     }
 
     /// The bridge stage of a received frame: a member's frame is learned from and
-    /// relayed, or made to arrive on the IRB. `vlans` tags a frame relayed out of a
-    /// VLAN sub-interface.
+    /// relayed, or made to arrive on the IRB.
     pub(crate) fn receive<S: crate::PacketSlot>(
         &mut self,
         packet: &mut crate::PacketLease<S>,
-        vlans: &[crate::VlanBinding],
         now_ms: u64,
     ) -> Received {
         let member = packet.ingress();
@@ -722,13 +720,10 @@ impl Bridges {
                 packet.set_ingress(irb.expect("an IRB decision has an IRB").0);
                 Received::Pass
             }
-            BridgeDecision::Forward(out) => match crate::vlan::transmit(packet, out, vlans) {
-                Ok(port) => {
-                    self.table.count_forwarded(bridge);
-                    Received::Transmitted(port)
-                }
-                Err(_) => Received::Dropped,
-            },
+            BridgeDecision::Forward(out) => {
+                self.table.count_forwarded(bridge);
+                Received::Forward(out)
+            }
             BridgeDecision::Flood { irb: up } => {
                 let staged = self.stage_flood(bridge, Some(member), packet.bytes_mut());
                 if staged {

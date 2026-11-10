@@ -598,6 +598,22 @@ pub enum DropReason {
     /// all-zero source, to the member it came in on, or one the backend has no room
     /// to tag or untag (`crate::MacTable::receive`).
     BridgeDropped = 254,
+    /// A bridge member's outer packet (EtherIP) that is cut short, a fragment, has
+    /// a bad IPv4 checksum or a wrong EtherIP version (`crate::overlay`).
+    OverlayInvalid = 255,
+    /// An outer packet for an overlay's address from no remote end it has, or
+    /// arriving on an interface outside the default VRF or not to its MAC address.
+    OverlayUnknownPeer = 256,
+    /// A frame bridged to an overlay that does not fit the underlying interface's
+    /// MTU once wrapped (the outer packet is never fragmented).
+    OverlayMtuExceeded = 257,
+    /// No route in the default VRF to an overlay's remote end.
+    OverlayNoRoute = 258,
+    /// An overlay's outer packet would leave through a tunnel, PPPoE session, bridge
+    /// or overlay, which is not done.
+    OverlayUnderlayUnsupported = 259,
+    /// The backend has no room to put on or take off an overlay's outer headers.
+    OverlayNoRoom = 260,
 }
 
 use DropReason::*;
@@ -605,7 +621,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 254] = [
+    pub const ALL: [Self; 260] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -860,6 +876,12 @@ impl DropReason {
         RouteDiscard,
         Nat44Ipv4IdRateExceeded,
         BridgeDropped,
+        OverlayInvalid,
+        OverlayUnknownPeer,
+        OverlayMtuExceeded,
+        OverlayNoRoute,
+        OverlayUnderlayUnsupported,
+        OverlayNoRoom,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1131,6 +1153,12 @@ impl DropReason {
             RouteDiscard => "ROUTE_DISCARD",
             Nat44Ipv4IdRateExceeded => "NAT44_IPV4_ID_RATE_EXCEEDED",
             BridgeDropped => "BRIDGE_DROPPED",
+            OverlayInvalid => "OVERLAY_INVALID",
+            OverlayUnknownPeer => "OVERLAY_UNKNOWN_PEER",
+            OverlayMtuExceeded => "OVERLAY_MTU_EXCEEDED",
+            OverlayNoRoute => "OVERLAY_NO_ROUTE",
+            OverlayUnderlayUnsupported => "OVERLAY_UNDERLAY_UNSUPPORTED",
+            OverlayNoRoom => "OVERLAY_NO_ROOM",
         }
     }
 }
@@ -1323,6 +1351,9 @@ pub struct ForwardingSnapshot<'a> {
     pub(crate) kernel_ingress: &'a [IfId],
     /// IPv4 in IPv6 tunnels ([`ForwardingSnapshot::with_tunnels`]).
     pub(crate) tunnels: &'a [crate::Ipv4InIpv6Tunnel],
+    /// Bridge members that carry frames inside IP
+    /// ([`ForwardingSnapshot::with_overlays`]).
+    pub(crate) overlays: &'a [crate::Overlay],
     /// Next hops the control side could not resolve (interface, address): a
     /// datagram to one gets Host Unreachable (RFC 1812 5.2.7.1).
     pub(crate) unreachable: &'a [(IfId, crate::Ipv4Address)],
@@ -1534,6 +1565,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            overlays: &[],
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
@@ -1790,6 +1822,30 @@ impl<'a> ForwardingSnapshot<'a> {
         Self { tunnels, ..self }
     }
 
+    /// Unwraps the outer packets of bridge members that carry frames inside IP, and
+    /// wraps the frames bridged to them (see [`crate::Overlay`]). The outer
+    /// snapshot's count, and the outer packets are routed by its tables.
+    #[must_use]
+    pub fn with_overlays(self, overlays: &'a [crate::Overlay]) -> Self {
+        Self { overlays, ..self }
+    }
+
+    /// For a `frame` (Ethernet) bridged to `member`: the outer header to put before
+    /// it and the interface (a port or VLAN sub-interface) to send the result out
+    /// of. `None` when `member` is no overlay. `irb` tells the bridges' own
+    /// interfaces; a next hop missing from the neighbor table is recorded in
+    /// `trace`. Cold path.
+    pub fn overlay_header<T: TraceSink>(
+        &self,
+        member: IfId,
+        frame: &[u8],
+        irb: impl Fn(IfId) -> bool,
+        trace: &mut T,
+    ) -> Option<Result<crate::OverlayHeader, DropReason>> {
+        let overlay = crate::overlay::of(self.overlays, member)?;
+        Some(crate::overlay::header(self, overlay, frame, irb, trace))
+    }
+
     /// Sends packets routed to a PPPoE session's interface in that session and
     /// takes the sessions' frames out (see [`crate::PppoeSession`]); the outer
     /// snapshot's count with [`ForwardingSnapshot::with_vrfs`].
@@ -1917,6 +1973,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            overlays: &[],
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
@@ -2277,6 +2334,7 @@ impl ValidatedForwardingOwner {
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
             tunnels: &[],
+            overlays: &[],
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
@@ -3195,6 +3253,47 @@ fn trace_source_validation_failure<T: TraceSink>(
     }
 }
 
+/// How a packet's lease ended before routing.
+#[derive(Debug)]
+enum Ended {
+    Transmitted,
+    Consumed,
+    Dropped,
+}
+
+/// The bridge stage of a received frame (see [`crate::Bridges`]): the packet back
+/// when it goes on to routing (not a member's, or one for the bridge's own
+/// interface), or how its lease ended. `all_vrfs` is the outer snapshot.
+fn bridge_stage<S: crate::PacketSlot, T: TraceSink>(
+    mut packet: crate::PacketLease<S>,
+    bridges: &mut crate::Bridges,
+    all_vrfs: &ForwardingSnapshot<'_>,
+    trace: &mut T,
+) -> Result<crate::PacketLease<S>, Ended> {
+    let ingress = packet.ingress();
+    let reason = match bridges.receive(&mut packet, all_vrfs.now.0) {
+        crate::bridge::Received::Pass => return Ok(packet),
+        crate::bridge::Received::Forward(member) => {
+            let irb = |id: IfId| bridges.irb_of(id).is_some();
+            match crate::overlay::transmit_member(&mut packet, member, all_vrfs, irb, trace) {
+                Ok(port) => {
+                    packet.commit(port);
+                    return Err(Ended::Transmitted);
+                }
+                Err(reason) => reason,
+            }
+        }
+        crate::bridge::Received::Consumed => {
+            packet.consume(crate::ConsumeReason::BridgeFlooded);
+            return Err(Ended::Consumed);
+        }
+        crate::bridge::Received::Dropped => DropReason::BridgeDropped,
+    };
+    packet.recycle(reason);
+    trace.record(TraceEvent::Dropped { ingress, reason });
+    Err(Ended::Dropped)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_batch_tracked<B, T>(
     mut batch: B,
@@ -3237,28 +3336,55 @@ where
             }
         }
         // A bridge member's frame is relayed here, unless it is for the bridge's own
-        // interface (its ingress is then the IRB).
+        // interface (its ingress is then the IRB). An overlay's outer packet is
+        // unwrapped, and its frame relayed as received on the overlay.
         if let Some(bridges) = bridges.as_deref_mut().filter(|b| !b.is_empty()) {
-            match bridges.receive(&mut packet, vlans, all_vrfs.now.0) {
-                crate::bridge::Received::Pass => {}
-                crate::bridge::Received::Transmitted(port) => {
-                    packet.commit(port);
+            let mut stage = bridge_stage(packet, bridges, all_vrfs, trace);
+            if let Ok(passed) = stage.as_mut() {
+                match crate::overlay::receive(passed, all_vrfs) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let member = passed.ingress();
+                        let unwrapped = stage.expect("passed the bridge stage");
+                        stage =
+                            bridge_stage(unwrapped, bridges, all_vrfs, trace).and_then(|packet| {
+                                // An overlay in no bridge: its frame goes nowhere.
+                                if packet.ingress() == member {
+                                    let reason = DropReason::BridgeDropped;
+                                    packet.recycle(reason);
+                                    trace.record(TraceEvent::Dropped {
+                                        ingress: member,
+                                        reason,
+                                    });
+                                    return Err(Ended::Dropped);
+                                }
+                                Ok(packet)
+                            });
+                    }
+                    Err(reason) => {
+                        let packet = stage.expect("passed the bridge stage");
+                        let ingress = packet.ingress();
+                        packet.recycle(reason);
+                        trace.record(TraceEvent::Dropped { ingress, reason });
+                        stage = Err(Ended::Dropped);
+                    }
+                }
+            }
+            packet = match stage {
+                Ok(packet) => packet,
+                Err(Ended::Transmitted) => {
                     tx_requested += 1;
                     continue;
                 }
-                crate::bridge::Received::Consumed => {
-                    packet.consume(crate::ConsumeReason::BridgeFlooded);
+                Err(Ended::Consumed) => {
                     consumed += 1;
                     continue;
                 }
-                crate::bridge::Received::Dropped => {
-                    let (ingress, reason) = (packet.ingress(), DropReason::BridgeDropped);
-                    packet.recycle(reason);
+                Err(Ended::Dropped) => {
                     dropped += 1;
-                    trace.record(TraceEvent::Dropped { ingress, reason });
                     continue;
                 }
-            }
+            };
         }
         // Frames for the control side go before the sessions and the routes see
         // them.
@@ -3873,7 +3999,13 @@ where
                             break 'packet;
                         }
                     };
-                    match crate::vlan::transmit(&mut packet, member, vlans) {
+                    let irb = |id: IfId| {
+                        bridges
+                            .as_deref()
+                            .is_some_and(|bridges| bridges.irb_of(id).is_some())
+                    };
+                    match crate::overlay::transmit_member(&mut packet, member, all_vrfs, irb, trace)
+                    {
                         Ok(port) => {
                             packet.commit(port);
                             tx_requested += 1;
@@ -10058,6 +10190,12 @@ mod tests {
             (252, "ROUTE_DISCARD"),
             (253, "NAT44_IPV4_ID_RATE_EXCEEDED"),
             (254, "BRIDGE_DROPPED"),
+            (255, "OVERLAY_INVALID"),
+            (256, "OVERLAY_UNKNOWN_PEER"),
+            (257, "OVERLAY_MTU_EXCEEDED"),
+            (258, "OVERLAY_NO_ROUTE"),
+            (259, "OVERLAY_UNDERLAY_UNSUPPORTED"),
+            (260, "OVERLAY_NO_ROOM"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10067,7 +10205,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(255), None);
+        assert_eq!(DropReason::from_code(261), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

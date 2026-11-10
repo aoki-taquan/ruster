@@ -22,6 +22,7 @@ pub use nat44_ipv4_id::{ipv4_id_rate_limit_storage, Ipv4IdRateLimitStorage, IPV4
 mod nat44_syn_hold;
 mod nat44_tcp_state;
 mod observability;
+mod overlay;
 mod packet;
 mod port_set;
 mod pppoe;
@@ -161,6 +162,7 @@ pub use observability::{
     BackendMode, BackendStats, FieldValue, FieldVisitor, ObservableFields, TableOccupancy,
 };
 pub(crate) use observability::{HighWaterMark, OccupancyCounter};
+pub use overlay::{Overlay, OverlayHeader, OverlayKind};
 pub use packet::{
     validate_arp, validate_arp_request, validate_ipv4_frame, ArpOpcode, MacAddress, ValidatedArp,
     ValidatedArpRequest, ValidatedIpv4, ARP_ETHERTYPE, ETHERNET_HEADER_LEN, IPV4_ETHERTYPE,
