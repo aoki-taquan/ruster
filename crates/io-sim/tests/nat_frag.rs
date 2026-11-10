@@ -351,6 +351,7 @@ impl World {
                 firewall_audit: None,
                 fragmentation: Some(&mut self.fragmentation),
                 fragment_tracking: self.tracker.as_mut(),
+                bridges: None,
             },
             &mut self.trace,
         );
@@ -1490,6 +1491,7 @@ fn the_fragment_paths_do_not_allocate() {
                     firewall_audit: None,
                     fragmentation: Some(&mut world.fragmentation),
                     fragment_tracking: world.tracker.as_mut(),
+                    bridges: None,
                 },
                 &mut ruster_core::NoTrace,
             );
