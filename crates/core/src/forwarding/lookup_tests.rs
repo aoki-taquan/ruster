@@ -749,8 +749,9 @@ fn validation_answers_as_comparing_every_pair_did() {
 }
 
 #[test]
-fn many_routes_are_validated_without_comparing_every_pair() {
-    // 200,000 routes: comparing every pair would be 2 * 10^10 comparisons.
+fn a_repeat_among_many_routes_is_found() {
+    // 200,000 routes. Comparing every pair (2 * 10^10 comparisons) would still pass,
+    // but take minutes.
     let interfaces = [Interface {
         id: IfId(1),
         mac: MacAddress([2, 0, 0, 0, 0, 1]),
