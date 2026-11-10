@@ -1,6 +1,6 @@
 //! `[bgp]`: the defaults, the lock form and `ruster-frr`'s part.
 
-use ruster_config::{frr_part, parse_frr_part, parse_lock, resolve, Connected};
+use ruster_config::{frr_part, parse_frr_part, parse_lock, resolve, Connected, Frr};
 
 const WAN: &str = r#"
 [[interface]]
@@ -69,14 +69,16 @@ fn the_frr_part_holds_bgp_and_the_connected_prefixes() {
         prefix: "198.51.100.0/24".into(),
         link_local: "fe80::1".into(),
     }];
-    let text = frr_part(lock.bgp.first(), &connected);
+    let frr = Frr {
+        bgp: lock.bgp.first().cloned(),
+        connected: connected.clone(),
+        ..Frr::default()
+    };
+    let text = frr_part(&frr);
     assert!(text.starts_with("version = 1\n"), "{text}");
-    assert_eq!(
-        parse_frr_part(&text).unwrap(),
-        (lock.bgp.first().cloned(), connected.clone())
-    );
-    let none = frr_part(None, &[]);
-    assert_eq!(parse_frr_part(&none).unwrap(), (None, Vec::new()));
+    assert_eq!(parse_frr_part(&text).unwrap(), frr);
+    let none = frr_part(&Frr::default());
+    assert_eq!(parse_frr_part(&none).unwrap(), Frr::default());
     let two = text.replacen("[[bgp]]", "[[bgp]]\nas = 1\nrouter-id = \"1.1.1.1\"\nnetworks = []\ninclude = []\nneighbor = []\n\n[[bgp]]", 1);
     assert!(parse_frr_part(&two).unwrap_err().contains("at most one"));
     assert!(parse_frr_part(&text.replacen("version = 1", "version = 2", 1)).is_err());

@@ -246,6 +246,29 @@
 //! remote-as = 65002
 //! description = "upstream"     # optional
 //!
+//! [isis]                       # optional: IS-IS in the default VRF (FRR's isisd,
+//!                              # through ruster-frr, on the TAP rp-<interface>)
+//! net = "49.0001.1921.6800.1001.00"  # the area, the system ID and NSEL 00
+//! level = "level-1-2"          # optional, the default; or "level-1", "level-2"
+//!
+//! [[isis.interface]]           # a port, VLAN or bridge of the default VRF, of at
+//! name = "wan"                 # most 12 characters
+//! metric = 10                  # optional, 10 when left out (wide metrics)
+//! passive = false              # optional: announce it, but form no adjacency
+//!
+//! [ospf]                       # optional: OSPFv2 in the default VRF (FRR's ospfd);
+//!                              # [ospf6] takes the same keys for OSPFv3 (ospf6d)
+//! router-id = "198.51.100.1"   # optional: as for [bgp]
+//! area = "0.0.0.0"             # optional: the area of the interfaces that name
+//!                              # none; the backbone when left out
+//!
+//! [[ospf.interface]]           # as for isis; for ospf, one with an ipv4 address
+//! name = "wan"
+//! area = "0.0.0.1"             # optional
+//! cost = 10                    # optional, 10 when left out
+//! network = "broadcast"        # optional, the default; or "point-to-point"
+//! passive = false              # optional
+//!
 //! [[source]]                   # optional: a daemon that sends confd values found
 //!                              # at run time, on confd/source/<name>/source.sock
 //! name = "pppoe-wan"           # lower-case letters, digits and -, from a letter
@@ -436,6 +459,25 @@
 //! address = "198.51.100.10"
 //! remote-as = 65002
 //! description = []             # none or one
+//!
+//! [[isis]]                     # none or one
+//! net = "49.0001.1921.6800.1001.00"
+//! level = "level-1-2"
+//!
+//! [[isis.interface]]
+//! name = "lan"
+//! metric = 10
+//! passive = false
+//!
+//! [[ospf]]                     # none or one; [[ospf6]] the same
+//! router-id = "198.51.100.1"
+//!
+//! [[ospf.interface]]
+//! name = "lan"
+//! area = "0.0.0.0"
+//! cost = 10
+//! network = "broadcast"
+//! passive = false
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
@@ -464,17 +506,21 @@
 mod bgp;
 mod dhcp6;
 mod dhcp_client;
+mod isis;
+mod ospf;
 mod ra;
 mod resolve;
 
 use serde::{Deserialize, Serialize};
 
-pub use bgp::{frr_part, parse_frr_part, Bgp, BgpNeighbor, Connected};
+pub use bgp::{frr_part, parse_frr_part, tap_device, Bgp, BgpNeighbor, Connected, Frr, TAP_PREFIX};
 pub use dhcp6::{link_local, Dhcp6, DHCP6_PREFERRED_LIFETIME, DHCP6_VALID_LIFETIME};
 pub use dhcp_client::{
     dhcp_client_part, parse_dhcp_client_part, DhcpClient, DHCP_CLIENT_PUNT_BURST,
     DHCP_CLIENT_PUNT_RATE,
 };
+pub use isis::{Isis, IsisInterface, ISIS_LEVEL, ISIS_LEVELS, ISIS_METRIC};
+pub use ospf::{Ospf, OspfInterface, OSPF_AREA, OSPF_COST, OSPF_NETWORK, OSPF_NETWORKS};
 pub use ra::{
     parse_ra_part, ra_min_interval, ra_part, Ra, RaPrefix, RA_HOP_LIMIT, RA_MAX_INTERVAL,
     RA_PREFERRED_LIFETIME, RA_VALID_LIFETIME,
@@ -501,7 +547,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x540b_f491_e936_b3c4;
+pub const LOCK_SHAPE: u64 = 0x36c2_01bc_43f3_bdd3;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -586,6 +632,15 @@ pub struct Lock {
     pub dhcp_client: Vec<DhcpClient>,
     /// None or one.
     pub bgp: Vec<Bgp>,
+    /// None or one. Lock forms written before IS-IS and OSPF were added have none.
+    #[serde(default)]
+    pub isis: Vec<Isis>,
+    /// None or one.
+    #[serde(default)]
+    pub ospf: Vec<Ospf>,
+    /// None or one.
+    #[serde(default)]
+    pub ospf6: Vec<Ospf>,
 }
 
 /// A PPPoE client (`ruster-pppoed`): the session it sets up for a source. Its

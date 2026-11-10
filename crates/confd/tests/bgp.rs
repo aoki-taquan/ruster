@@ -134,8 +134,9 @@ fn bgp_is_checked() {
 fn the_frr_part_has_the_default_vrf_s_prefixes() {
     let config = file::parse(&bgp("", PEER)).unwrap();
     assert!(Module::Frr.configured(&config));
-    let (got, connected) = ruster_config::parse_frr_part(&Module::Frr.part(&config)).unwrap();
-    assert_eq!(got.as_ref(), config.bgp.as_ref());
+    let part = ruster_config::parse_frr_part(&Module::Frr.part(&config)).unwrap();
+    assert_eq!(part.bgp.as_ref(), config.bgp.as_ref());
+    let connected = part.connected;
     let connected: Vec<(&str, &str)> = connected
         .iter()
         .map(|c| (c.interface.as_str(), c.prefix.as_str()))
@@ -152,8 +153,8 @@ fn the_frr_part_has_the_default_vrf_s_prefixes() {
     );
     let without = file::parse(WAN).unwrap();
     assert!(!Module::Frr.configured(&without));
-    let (none, _) = ruster_config::parse_frr_part(&Module::Frr.part(&without)).unwrap();
-    assert!(none.is_none());
+    let none = ruster_config::parse_frr_part(&Module::Frr.part(&without)).unwrap();
+    assert!(none.bgp.is_none());
     assert_eq!(Module::from_name("frr"), Some(Module::Frr));
 }
 

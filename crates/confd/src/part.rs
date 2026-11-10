@@ -132,10 +132,13 @@ impl Module {
             Self::Ra => ruster_config::ra_part(&config.ra),
             Self::Pppoe => ruster_config::pppoe_part(&config.pppoe),
             Self::Dhcpc => ruster_config::dhcp_client_part(&config.dhcp_client),
-            Self::Frr => ruster_config::frr_part(
-                config.bgp.as_ref(),
-                &crate::bgp::connected(&config.interfaces),
-            ),
+            Self::Frr => ruster_config::frr_part(&ruster_config::Frr {
+                bgp: config.bgp.clone(),
+                isis: config.isis.clone(),
+                ospf: config.ospf.clone(),
+                ospf6: config.ospf6.clone(),
+                connected: crate::bgp::connected(&config.interfaces),
+            }),
         }
     }
 
@@ -147,7 +150,12 @@ impl Module {
             Self::Ra => !config.ra.is_empty(),
             Self::Pppoe => !config.pppoe.is_empty(),
             Self::Dhcpc => !config.dhcp_client.is_empty(),
-            Self::Frr => config.bgp.is_some(),
+            Self::Frr => {
+                config.bgp.is_some()
+                    || config.isis.is_some()
+                    || config.ospf.is_some()
+                    || config.ospf6.is_some()
+            }
         }
     }
 }

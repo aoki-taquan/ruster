@@ -221,3 +221,32 @@ include = ["/etc/ruster/frr.conf"]
 address = "198.51.100.10"
 remote-as = 65002
 description = ["upstream"]
+
+[[isis]]
+net = "49.0001.1921.6800.1001.00"
+level = "level-1-2"
+
+[[isis.interface]]
+name = "lan"
+metric = 10
+passive = false
+
+[[ospf]]
+router-id = "198.51.100.1"
+
+[[ospf.interface]]
+name = "lan"
+area = "0.0.0.0"
+cost = 10
+network = "broadcast"
+passive = false
+
+[[ospf6]]
+router-id = "198.51.100.1"
+
+[[ospf6.interface]]
+name = "lan"
+area = "0.0.0.0"
+cost = 10
+network = "point-to-point"
+passive = true

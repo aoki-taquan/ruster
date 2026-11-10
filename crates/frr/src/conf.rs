@@ -226,7 +226,7 @@ impl Bridge {
     /// `password` or `key-string` on a line is not shown (the include may hold
     /// secrets); a line whose secret changes shows as `(hidden, changed)`.
     pub fn check(&self, part: &str) -> Result<String, String> {
-        let (bgp, connected) = ruster_config::parse_frr_part(part)?;
+        let ruster_config::Frr { bgp, connected, .. } = ruster_config::parse_frr_part(part)?;
         let include = match bgp.as_ref().and_then(|b| b.include.first()) {
             Some(path) => read_include(path)?,
             None => String::new(),
@@ -248,7 +248,7 @@ impl Bridge {
     /// Takes an `frr` part ([`ruster_config::frr_part`]), or refuses it with the
     /// reason; the interfaces' prefixes in it, for the next hops.
     pub fn take(&mut self, part: &str) -> Result<Vec<Connected>, String> {
-        let (bgp, connected) = ruster_config::parse_frr_part(part)?;
+        let ruster_config::Frr { bgp, connected, .. } = ruster_config::parse_frr_part(part)?;
         let include = match bgp.as_ref().and_then(|b| b.include.first()) {
             Some(path) => read_include(path)?,
             None => String::new(),

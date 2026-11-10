@@ -66,6 +66,9 @@ fn config(mtu: u16) -> Config {
         dns_found: Vec::new(),
         bgp: None,
         bridges: Vec::new(),
+        isis: None,
+        ospf: None,
+        ospf6: None,
     }
 }
 

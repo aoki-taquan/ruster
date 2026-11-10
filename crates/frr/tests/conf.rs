@@ -2,7 +2,16 @@
 
 use std::path::{Path, PathBuf};
 
-use ruster_config::{frr_part, Bgp, BgpNeighbor, Connected};
+use ruster_config::{frr_part, Bgp, BgpNeighbor, Connected, Frr};
+
+/// The `frr` part with `bgp` and `connected`.
+fn part_of(bgp: Option<&Bgp>, connected: &[Connected]) -> String {
+    frr_part(&Frr {
+        bgp: bgp.cloned(),
+        connected: connected.to_vec(),
+        ..Frr::default()
+    })
+}
 use ruster_frr::conf::{config, Bridge, HEADER};
 
 fn bgp() -> Bgp {
@@ -163,7 +172,7 @@ fn the_bridge_writes_applies_and_puts_back() {
     let mut with_include = bgp();
     with_include.include = vec![include.display().to_string()];
     let connected = connected();
-    let part = frr_part(Some(&with_include), &connected);
+    let part = part_of(Some(&with_include), &connected);
     let mut bridge = Bridge::new(file.clone(), script(&dir), 2620);
     assert_eq!(bridge.take(&part).unwrap(), connected);
     let written = std::fs::read_to_string(&file).unwrap();
@@ -187,7 +196,7 @@ fn the_bridge_writes_applies_and_puts_back() {
     assert_eq!(ran(&dir), 1);
     // A failing command puts the file before back and refuses.
     std::fs::write(dir.join("broken"), "").unwrap();
-    let error = bridge.take(&frr_part(None, &connected)).unwrap_err();
+    let error = bridge.take(&part_of(None, &connected)).unwrap_err();
     assert!(
         error.contains("broken on purpose"),
         "said on stdout: {error}"
@@ -211,7 +220,7 @@ fn the_bridge_writes_applies_and_puts_back() {
 fn a_new_bridge_runs_the_command_for_the_file_it_finds() {
     let dir = dir("start");
     let file = dir.join("frr.conf");
-    let part = frr_part(None, &[]);
+    let part = part_of(None, &[]);
     Bridge::new(file.clone(), script(&dir), 1)
         .take(&part)
         .unwrap();
@@ -236,7 +245,7 @@ fn with_no_file_before_a_failure_goes_back_to_no_bgp() {
     let file = dir.join("frr.conf");
     std::fs::write(dir.join("broken"), "").unwrap();
     let mut bridge = Bridge::new(file.clone(), script(&dir), 2620);
-    assert!(bridge.take(&frr_part(Some(&bgp()), &connected())).is_err());
+    assert!(bridge.take(&part_of(Some(&bgp()), &connected())).is_err());
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         config(None, &[], "", 2620).unwrap()
@@ -252,7 +261,7 @@ fn a_check_shows_the_diff_with_passwords_hidden_and_writes_nothing() {
     std::fs::write(&include, " neighbor 198.51.100.10 password secret1\n").unwrap();
     let mut with_include = bgp();
     with_include.include = vec![include.display().to_string()];
-    let part = frr_part(Some(&with_include), &connected());
+    let part = part_of(Some(&with_include), &connected());
     let bridge = Bridge::new(file.clone(), Vec::new(), 2620);
     let text = bridge.check(&part).unwrap();
     assert!(text.contains("+router bgp 65001"), "{text}");
