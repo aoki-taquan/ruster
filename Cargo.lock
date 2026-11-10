@@ -172,6 +172,7 @@ dependencies = [
 name = "ruster-frr"
 version = "0.2.0"
 dependencies = [
+ "ruster-confd",
  "ruster-config",
  "ruster-proto",
 ]
