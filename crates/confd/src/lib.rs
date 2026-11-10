@@ -231,7 +231,9 @@ impl Peer {
     /// the patches in flight are answered.
     fn release(&mut self) {
         self.held = false;
-        if !self.in_flight.is_empty() {
+        // After a refusal, resync-end waits for the next accepted full send
+        // ([`Peer::answer`]).
+        if !self.in_flight.is_empty() || self.patch_refused.is_some() {
             return;
         }
         if self.resync_open && self.resync_end.is_none() {

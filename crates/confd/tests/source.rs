@@ -292,3 +292,37 @@ fn sources_are_checked() {
     .unwrap();
     assert_eq!(config.sources[0].sync_wait_ms, 10_000);
 }
+
+#[test]
+fn a_refused_send_while_waiting_does_not_end_the_resync() {
+    struct Refuse;
+    impl Hook for Refuse {
+        fn check(&mut self, next: &Store) -> Result<(), String> {
+            match next.get(&Key::Interface { name: "lan".into() }) {
+                Some(_) => Err("no".into()),
+                None => Ok(()),
+            }
+        }
+        fn committed(&mut self, _store: &Store) {}
+    }
+    let mut fe = fe_with_old_entry();
+    let mut confd = Confd::new(file::parse(&with_source(10)).unwrap());
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, &[sid::INTERFACE, sid::ADDRESS, sid::ICMP_ERRORS])
+        .unwrap();
+    confd.connect_fe(b).unwrap();
+    let mut source = connect(&mut confd);
+    let run = |fe: &mut Server, confd: &mut Confd, source: &mut Client| {
+        for _ in 0..50 {
+            fe.step(&mut Refuse);
+            confd.step(1_000);
+            source.poll();
+        }
+    };
+    run(&mut fe, &mut confd, &mut source);
+    assert!(confd.waiting_for_sources());
+    source.sync_done();
+    run(&mut fe, &mut confd, &mut source);
+    assert!(!confd.waiting_for_sources());
+    assert!(old_entry(&fe));
+}

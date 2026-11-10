@@ -97,6 +97,7 @@ fn run() -> Result<(), String> {
     let clock = Clock::new();
     let mut refused = 0;
     let mut generation = confd.generation();
+    let mut retry_sockets = daemon::Retry::default();
     let mut waiting = confd.waiting_for_sources();
     let mut apply_seen = apply.counters();
     let mut retry = daemon::Retry::default();
@@ -129,7 +130,9 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        if confd.generation() != generation {
+        // A socket that could not be made is tried again at the next turn.
+        let missing = confd.source_names().len() != sources.len();
+        if confd.generation() != generation || (missing && retry_sockets.due(now)) {
             generation = confd.generation();
             source_sockets(&run_dir, &confd, &mut sources);
         }
