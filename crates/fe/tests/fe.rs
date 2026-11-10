@@ -3761,3 +3761,294 @@ fn an_outside_error_with_ttl_1_about_the_router_s_flow_reaches_it() {
         );
     }
 }
+
+fn punt_class(
+    name: &str,
+    matches: ruster_proto::table::PuntMatch,
+    interface: Option<&str>,
+    destination: ruster_proto::table::PuntDestination,
+    rate: u32,
+    burst: u32,
+) -> Change {
+    Change::set(
+        Key::Punt { class: name.into() },
+        Value::Punt(ruster_proto::table::PuntClass {
+            matches,
+            interface: interface.map(Into::into),
+            destination,
+            rate,
+            burst,
+        }),
+    )
+}
+
+fn udp_port(protocol: u8, ports: Option<(u16, u16)>) -> ruster_proto::table::PuntMatch {
+    ruster_proto::table::PuntMatch::Ip { protocol, ports }
+}
+
+/// A UDP packet from the LAN host to the router's LAN address, port 2000.
+fn udp_to_router() -> Vec<u8> {
+    let mut frame = udp_from_host([192, 0, 2, 1]);
+    frame[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&frame[14..34]);
+    frame[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
+fn punt_counter(bench: &Bench, name: &str) -> ruster_fe::PuntCounters {
+    bench
+        .fe
+        .punt_counters()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, c)| c)
+        .unwrap_or_else(|| panic!("no class {name}"))
+}
+
+#[test]
+fn punt_classes_limit_and_drop_traffic_to_the_kernel_by_their_own_rates() {
+    use ruster_proto::table::{PuntDestination, PuntKind, PuntMatch};
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    // Port 2000 on the LAN: 2 at once; the built-in udp class: 3 at once.
+    let code = bench.patch(
+        &mut config,
+        &[
+            punt_class(
+                "app",
+                udp_port(17, Some((2000, 2000))),
+                Some("lan"),
+                PuntDestination::Kernel,
+                1,
+                2,
+            ),
+            punt_class(
+                "udp",
+                PuntMatch::Kind(PuntKind::Udp),
+                None,
+                PuntDestination::Kernel,
+                1,
+                3,
+            ),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    for _ in 0..5 {
+        bench.fe.io_mut().inject(IfId(0), udp_to_router());
+    }
+    bench.fe.step(0);
+    let mut buf = [0_u8; 2048];
+    let mut got = 0;
+    while kernel.recv(&mut buf).is_ok() {
+        got += 1;
+    }
+    assert_eq!(got, 2);
+    let app = punt_counter(&bench, "app");
+    assert_eq!((app.handed, app.dropped), (2, 3));
+
+    // Another port falls into the built-in udp class.
+    let mut other = udp_to_router();
+    other[14 + 22..14 + 24].copy_from_slice(&2001_u16.to_be_bytes());
+    for _ in 0..5 {
+        bench.fe.io_mut().inject(IfId(0), other.clone());
+    }
+    bench.fe.step(0);
+    let udp = punt_counter(&bench, "udp");
+    assert_eq!((udp.handed, udp.dropped), (3, 2));
+    while kernel.recv(&mut buf).is_ok() {}
+
+    // Dropping the class: nothing more reaches the kernel; its counters stay.
+    let code = bench.patch(
+        &mut config,
+        &[punt_class(
+            "app",
+            udp_port(17, Some((2000, 2000))),
+            Some("lan"),
+            PuntDestination::Drop,
+            1,
+            2,
+        )],
+    );
+    assert_eq!(code, Code::CHANGED);
+    bench.fe.io_mut().inject(IfId(0), udp_to_router());
+    bench.fe.step(10_000);
+    assert!(kernel.recv(&mut buf).is_err());
+    let app = punt_counter(&bench, "app");
+    assert_eq!((app.handed, app.dropped), (2, 4));
+
+    // Deleting the built-in class's entry brings back its default rate.
+    let code = bench.patch(
+        &mut config,
+        &[Change::delete(Key::Punt {
+            class: "udp".into(),
+        })],
+    );
+    assert_eq!(code, Code::CHANGED);
+    for _ in 0..50 {
+        bench.fe.io_mut().inject(IfId(0), other.clone());
+    }
+    bench.fe.step(20_000);
+    assert_eq!(punt_counter(&bench, "udp").handed, 3 + 50);
+}
+
+#[test]
+fn arp_is_counted_by_its_built_in_class() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let (fe_end, _neighd_end) = UnixDatagram::pair().unwrap();
+    bench.fe.attach_punt(fe_end).unwrap();
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), arp_request([192, 0, 2, 1]));
+    bench.fe.step(0);
+    let arp = punt_counter(&bench, "arp");
+    assert_eq!((arp.handed, arp.dropped), (1, 0));
+    let names: Vec<String> = bench
+        .fe
+        .punt_counters()
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "arp",
+            "nd",
+            "icmp-error",
+            "icmp",
+            "tcp-syn",
+            "tcp",
+            "udp",
+            "other"
+        ]
+    );
+}
+
+#[test]
+fn punt_classes_that_break_the_rules_are_refused() {
+    use ruster_proto::table::{PuntDestination, PuntKind, PuntMatch};
+    let mut bench = Bench::new();
+    let (mut config, _routes) = configure(&mut bench);
+    let neighd = || PuntDestination::Control("neighd".into());
+    let refused = [
+        // ARP only goes to the neighbor process.
+        vec![punt_class(
+            "arp",
+            PuntMatch::Kind(PuntKind::Arp),
+            None,
+            PuntDestination::Drop,
+            1,
+            1,
+        )],
+        // A built-in class has no interface.
+        vec![punt_class(
+            "icmp",
+            PuntMatch::Kind(PuntKind::Icmp),
+            Some("lan"),
+            PuntDestination::Kernel,
+            1,
+            1,
+        )],
+        // A built-in name with another match.
+        vec![punt_class(
+            "udp",
+            udp_port(17, None),
+            None,
+            PuntDestination::Kernel,
+            1,
+            1,
+        )],
+        // A fixed kind under another name.
+        vec![punt_class(
+            "more-arp",
+            PuntMatch::Kind(PuntKind::Arp),
+            None,
+            neighd(),
+            1,
+            1,
+        )],
+        // Two classes that can match the same packet.
+        vec![
+            punt_class(
+                "a",
+                udp_port(17, Some((60, 70))),
+                Some("lan"),
+                PuntDestination::Kernel,
+                1,
+                1,
+            ),
+            punt_class(
+                "b",
+                udp_port(17, Some((70, 80))),
+                None,
+                PuntDestination::Kernel,
+                1,
+                1,
+            ),
+        ],
+        vec![
+            punt_class("a", udp_port(6, None), None, PuntDestination::Kernel, 1, 1),
+            punt_class(
+                "b",
+                udp_port(6, Some((22, 22))),
+                Some("wan"),
+                PuntDestination::Kernel,
+                1,
+                1,
+            ),
+        ],
+    ];
+    for changes in refused {
+        assert_eq!(
+            bench.patch(&mut config, &changes),
+            Code::BAD_REQUEST,
+            "{changes:?}"
+        );
+    }
+    // The same ports on two interfaces, and other ports, are fine; so is changing
+    // ARP's rate.
+    let code = bench.patch(
+        &mut config,
+        &[
+            punt_class(
+                "a",
+                udp_port(17, Some((60, 70))),
+                Some("lan"),
+                PuntDestination::Kernel,
+                1,
+                1,
+            ),
+            punt_class(
+                "b",
+                udp_port(17, Some((60, 70))),
+                Some("wan"),
+                PuntDestination::Kernel,
+                1,
+                1,
+            ),
+            punt_class(
+                "c",
+                udp_port(17, Some((71, 80))),
+                None,
+                PuntDestination::Kernel,
+                1,
+                1,
+            ),
+            punt_class(
+                "arp",
+                PuntMatch::Kind(PuntKind::Arp),
+                None,
+                neighd(),
+                10,
+                10,
+            ),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+}

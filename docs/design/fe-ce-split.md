@@ -143,13 +143,9 @@ BGP、SSH、DNS、NTP、管理APIなどは、Linux kernelのTCP/IPスタック�
 
 ### ルータ宛て通信の保護
 
-FEは、CEやkernelへ渡すパケットを種類ごとに分類し、それぞれに流量の上限と優先度を付ける。
-
-- 最優先: BGP、BFD、ARP/ND
-- 次: SSH、管理通信、DHCP
-- 最後: ICMP、その他
-
-溢れたら優先度の低いものからFEで捨て、分類ごとに捨てた数を数える。
+FEは、CEやkernelへ渡すパケットを種類ごとに分類し、それぞれに流量の上限を付ける
+（[`tables.md`](tables.md)の`ruster-punt`）。分類ごとに別の上限なので、ICMPの洪水がBGPやARPの分を
+使い切ることはない。溢れた分はFEで捨て、分類ごとに捨てた数を数える。
 kernelへの分類と上限は、パケットをTUNのインターフェースへ転送する直前、input firewallの後で掛ける。
 
 ### kernelに渡さない通信

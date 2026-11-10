@@ -48,9 +48,12 @@ mod fragments;
 mod kernel;
 mod local;
 mod nat;
+mod punt_table;
 mod reassembly;
 
 pub use local::LocalPipe;
+pub use punt_table::PuntCounters;
+use ruster_proto::table::{PuntDestination, PuntKind};
 
 /// The tables each kind of writer may change (one writer per table).
 pub mod writers {
@@ -63,6 +66,7 @@ pub mod writers {
         sid::FIREWALL_POLICY,
         sid::ICMP_ERRORS,
         sid::FIREWALL_RULE,
+        sid::PUNT,
     ];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
@@ -147,11 +151,12 @@ pub struct Fe<B> {
     kernel: Vec<IfId>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
-    /// ARP and Neighbor Discovery to the neighbor process.
-    limiter: local::Limiter,
-    /// Each VRF's packets to its kernel, in the order of `vrfs`: a flood in one VRF
-    /// does not crowd out another's (BGP in another VRF, say).
-    kernel_limiters: Vec<local::Limiter>,
+    /// The classes of the punt table.
+    classes: punt_table::Classes,
+    /// Their rate limits and counters; to the kernel, per VRF in the order of
+    /// `vrfs`: a flood in one VRF does not crowd out another's (BGP in another VRF,
+    /// say).
+    limits: punt_table::Limits,
     /// The interfaces enabled in the current tables.
     active: Vec<IfId>,
     server: Server,
@@ -205,6 +210,7 @@ where
             .expect("empty tables build");
         let (built, _, _) = builder.built.take().expect("built");
         builder.names.clone_from(&built.interface_names);
+        let limits = punt_table::Limits::new(&built.punt, built.vrfs.len());
         Self {
             io,
             builder,
@@ -218,8 +224,8 @@ where
             pppoe: built.pppoe,
             kernel: built.kernel,
             local: BTreeMap::new(),
-            limiter: local::Limiter::default(),
-            kernel_limiters: Vec::new(),
+            limits,
+            classes: built.punt,
             active: built.active,
             server: Server::new(),
             punt: None,
@@ -285,6 +291,11 @@ where
 
     pub fn counters(&self) -> FeCounters {
         self.counters
+    }
+
+    /// Each class of the punt table, by name: what it handed over and dropped.
+    pub fn punt_counters(&self) -> Vec<(String, PuntCounters)> {
+        self.limits.counters()
     }
 
     /// The current tables.
@@ -379,9 +390,11 @@ where
         for (egress, frame) in from_kernel.to_kernel {
             let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
             let vrf = self.kernel.iter().position(|&kernel| kernel == egress);
-            let admitted = self.admit_to_kernel(vrf, packet, now_ms);
-            if admitted && self.write_kernel(egress, &frame) {
+            // From the kernel itself: by its kind, as no interface names it.
+            let class = punt_table::built_in(local::kind(packet));
+            if self.admit_to_kernel(class, vrf, now_ms) && self.write_kernel(egress, &frame) {
                 self.counters.to_kernel += 1;
+                self.limits.handed(class);
             } else {
                 self.counters.to_kernel_dropped += 1;
             }
@@ -447,8 +460,9 @@ where
                 self.counters.generated_dropped += 1;
             }
         }
+        let arp_class = punt_table::built_in(PuntKind::Arp);
         for arp in &trace.arp {
-            if self.limiter.take(local::Class::Arp, now_ms) {
+            if self.limits.admit(arp_class, None, now_ms) {
                 self.punt_arp(arp);
             } else {
                 self.counters.arp_to_control_dropped += 1;
@@ -466,8 +480,9 @@ where
             let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
             match kind {
                 ControlKind::Neighbor => {
-                    if self.limiter.take(local::Class::Nd, now_ms) {
-                        self.punt_frame(ingress, punt::reason::ND, &bytes);
+                    let class = punt_table::built_in(PuntKind::Nd);
+                    if self.limits.admit(class, None, now_ms) {
+                        self.punt_frame(ingress, punt::reason::ND, Some(class), &bytes);
                     } else {
                         self.counters.arp_to_control_dropped += 1;
                     }
@@ -495,11 +510,13 @@ where
 
     fn punt_arp(&mut self, arp: &ArpEvent) {
         let body = arp.body();
-        self.punt_frame(arp.ingress, punt::reason::ARP, &body);
+        let class = punt_table::built_in(PuntKind::Arp);
+        self.punt_frame(arp.ingress, punt::reason::ARP, Some(class), &body);
     }
 
-    /// Sends `frame` to the neighbor process; counted with the ARP counters.
-    fn punt_frame(&mut self, ingress: IfId, reason: u16, frame: &[u8]) {
+    /// Sends `frame` to the neighbor process; counted with the ARP counters, and
+    /// with those of punt class `class`.
+    fn punt_frame(&mut self, ingress: IfId, reason: u16, class: Option<usize>, frame: &[u8]) {
         // An id no interface has now (a hole the tables left) is not sent.
         let Some(name) = self
             .interface_names
@@ -510,6 +527,9 @@ where
         };
         let Some(socket) = &self.punt else {
             self.counters.arp_to_control_dropped += 1;
+            if let Some(class) = class {
+                self.limits.dropped(class);
+            }
             return;
         };
         let mut message = Vec::with_capacity(frame.len() + 64);
@@ -528,6 +548,12 @@ where
         match sent {
             Ok(_) => self.counters.arp_to_control += 1,
             Err(_) => self.counters.arp_to_control_dropped += 1,
+        }
+        if let Some(class) = class {
+            match sent {
+                Ok(_) => self.limits.handed(class),
+                Err(_) => self.limits.dropped(class),
+            }
         }
     }
 
@@ -605,7 +631,7 @@ where
                             IpAddr::V4(a) => a.octets().to_vec(),
                             IpAddr::V6(a) => a.octets().to_vec(),
                         };
-                        self.punt_frame(IfId(interface), punt::reason::NEIGHBOR_USED, &bytes);
+                        self.punt_frame(IfId(interface), punt::reason::NEIGHBOR_USED, None, &bytes);
                     }
                 }
                 (Direction::FromControl, reason, Some(egress))
@@ -627,28 +653,39 @@ where
         busy
     }
 
-    /// Whether `packet` to the kernel of the VRF at `vrf` (in the order of `vrfs`) is
-    /// within that VRF's limit for its class.
-    fn admit_to_kernel(&mut self, vrf: Option<usize>, packet: &[u8], now_ms: u64) -> bool {
-        if self.kernel_limiters.len() != self.names.len() {
-            self.kernel_limiters
-                .resize_with(self.names.len(), local::Limiter::default);
+    /// Whether a packet of punt class `class` may go to the kernel of the VRF at
+    /// `vrf` (in the order of `vrfs`): the class goes there and is within that VRF's
+    /// limit. A refused packet is counted as the class's drop.
+    fn admit_to_kernel(&mut self, class: usize, vrf: Option<usize>, now_ms: u64) -> bool {
+        match (&self.classes.get(class).destination, vrf) {
+            (PuntDestination::Kernel, Some(_)) => self.limits.admit(class, vrf, now_ms),
+            _ => {
+                self.limits.dropped(class);
+                false
+            }
         }
-        vrf.and_then(|at| self.kernel_limiters.get_mut(at))
-            .is_some_and(|limiter| limiter.take(local::class(packet), now_ms))
     }
 
-    /// Writes a packet addressed to the router to its VRF's kernel pipe.
+    /// Writes a packet addressed to the router to its VRF's kernel pipe, as its
+    /// punt class allows.
     fn send_to_kernel(&mut self, ingress: IfId, packet: &[u8], now_ms: u64) {
+        let class = self.classes.of_local(ingress, packet);
         let at = self
             .by_ingress
             .get(usize::from(ingress.0))
             .map(|&at| usize::from(at));
-        let admitted = self.admit_to_kernel(at, packet, now_ms);
+        let admitted = self.admit_to_kernel(class, at, now_ms);
         let vrf = at.and_then(|at| self.names.get(at));
         let pipe = vrf.and_then(|name| self.local.get(name));
         match pipe {
-            Some(pipe) if admitted && pipe.send(packet).is_ok() => self.counters.to_kernel += 1,
+            Some(pipe) if admitted && pipe.send(packet).is_ok() => {
+                self.counters.to_kernel += 1;
+                self.limits.handed(class);
+            }
+            _ if admitted => {
+                self.counters.to_kernel_dropped += 1;
+                self.limits.dropped(class);
+            }
             _ => self.counters.to_kernel_dropped += 1,
         }
     }
@@ -811,8 +848,11 @@ where
             self.vrfs = built.vrfs;
             self.by_ingress = built.by_ingress;
             if self.names != built.names {
-                self.kernel_limiters.clear();
+                // The per-VRF buckets start again.
+                self.limits.update(&built.punt, 0);
             }
+            self.limits.update(&built.punt, built.names.len());
+            self.classes = built.punt;
             self.names = built.names;
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;

@@ -71,6 +71,8 @@ pub(crate) struct Built {
     /// The default VRF's NAPT, when the tables have one and both its interfaces
     /// are enabled.
     pub(crate) nat: Option<Nat>,
+    /// The classes of the punt table.
+    pub(crate) punt: crate::punt_table::Classes,
 }
 
 /// NAPT from `inside` to `outside`, with `public` and `ports`.
@@ -664,7 +666,10 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         .map(|i| i.id)
         .filter(|id| !kernel.contains(id))
         .collect();
+    let punt =
+        crate::punt_table::Classes::build(store, |name| active.get(name).map(|&(id, _)| id))?;
     Ok(Built {
+        punt,
         vrfs,
         names: order.iter().map(|v| (*v).to_owned()).collect(),
         by_ingress,
