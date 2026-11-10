@@ -7,6 +7,8 @@
 # it; the router learns each on its own port, and a LAN host reaches both. A
 # single TUN could not do this: the Hellos to 224.0.0.5 and ff02::5 must leave the
 # right port, and OSPFv3 tells interfaces apart by their link-local addresses.
+# When p1's link goes down, its TAP device's carrier follows and the adjacency drops
+# at once, not after RouterDeadInterval (40 s).
 #
 #   lan (192.0.2.10) -- [r-lan | router | r-p1 10.0.1.1, r-p2 10.0.2.1]
 #     r-p1 -- peer1 (10.0.1.2, point-to-point) -- 203.0.113.0/24, 2001:db8:203::/64
@@ -252,3 +254,25 @@ for address in 203.0.113.1 198.18.0.1 2001:db8:203::1 2001:db8:218::1; do
 done
 echo "ok: the LAN host reaches both neighbours' prefixes over IPv4 and IPv6; they learn"
 echo "    the LAN's from the router's passive interface"
+
+# p1's link goes down (the neighbour's end of the veth): the FE takes the carrier
+# of rp-r-p1 down, and ospfd drops the neighbour well before RouterDeadInterval.
+frr "$router" router vtysh -c 'show ip ospf neighbor' | grep -q "^10.0.0.1 " ||
+  fail "no adjacency on r-p1 before its link goes down: $(state)"
+nsx "$peer1" ip link set h0 down
+started=$SECONDS
+for _ in $(seq 1 50); do
+  frr "$router" router vtysh -c 'show ip ospf neighbor' 2>/dev/null | grep -q "^10.0.0.1 " || break
+  sleep 0.1
+done
+nsx "$router" ip link show rp-r-p1 | grep -q LOWER_UP && fail "rp-r-p1 keeps its carrier with r-p1 down"
+frr "$router" router vtysh -c 'show ip ospf neighbor' | grep -q "^10.0.0.1 " &&
+  fail "the adjacency on r-p1 stays up with its link down: $(state)"
+echo "ok: with r-p1's link down, rp-r-p1 goes down and the adjacency drops in $((SECONDS - started)) s"
+nsx "$peer1" ip link set h0 up
+for _ in $(seq 1 50); do
+  nsx "$router" ip link show rp-r-p1 | grep -q LOWER_UP && break
+  sleep 0.1
+done
+nsx "$router" ip link show rp-r-p1 | grep -q LOWER_UP || fail "rp-r-p1 does not come back up"
+echo "ok: rp-r-p1 comes back up with r-p1's link"
