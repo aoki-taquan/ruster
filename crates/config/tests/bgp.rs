@@ -67,6 +67,7 @@ fn the_frr_part_holds_bgp_and_the_connected_prefixes() {
     let connected = vec![Connected {
         interface: "wan".into(),
         prefix: "198.51.100.0/24".into(),
+        link_local: "fe80::1".into(),
     }];
     let text = frr_part(lock.bgp.first(), &connected);
     assert!(text.starts_with("version = 1\n"), "{text}");
