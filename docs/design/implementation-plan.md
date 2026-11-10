@@ -1,6 +1,6 @@
 # 実装計画
 
-状態: 2026-11-06。設計図（この directory の他の文書）を、今のコードを土台にして実現する順番。
+状態: 2026-11-10。設計図（この directory の他の文書）を、今のコードを土台にして実現する順番。
 
 ## 方針
 
@@ -101,11 +101,13 @@ socketは`/run/ruster`の下の[`control-protocol.md`](control-protocol.md)の�
 
 骨組みの上に[`tables.md`](tables.md)の表を一つずつ載せる。順番はagentが決める（AGENTS.md）。
 
-#### できたもの（2026-11-09）
+#### できたもの（2026-11-10）
 
-charterの「作るもの」は全部ある。項目ごとの、従う決まりと外している点（そのモジュールの`# Standards`）と、
-確かめている試験は次のとおり。netnsの試験は14本で、どれもAF_XDPとAF_PACKETの両方で通る
-（`scripts/netns-all.sh`）。
+charterの「作るもの」は全部ある。項目ごとの、従う決まりと外している点（そのモジュールの`# Standards`。どのRFCの
+どの節に沿うかはそこにだけ書く）と、確かめている試験は次の二つの表のとおり。試験は、RFCなどの決まりの
+フィールドの並びから手で組んだ入力と、決まりの値から出した期待値を使う。
+
+FEとCEの基本:
 
 | 作るもの | `# Standards`のあるモジュール | 確かめている試験 |
 |---|---|---|
@@ -113,7 +115,7 @@ charterの「作るもの」は全部ある。項目ごとの、従う決まり�
 | VRF | confd `file.rs` | io-sim `vrf`。netns `vrf`、`vrf-vlan`、`vrf-firewall` |
 | VLAN | core `vlan.rs` | io-sim `vlan`。netns `vlan`、`vlan-nat`、`vrf-vlan` |
 | NAT44 | core `nat44.rs`、`nat44_ipv4_id.rs`、fe `nat.rs` | io-sim `nat44_*`、`nat_frag`、`nat_services`。fe `fe.rs`。netns `nat`、`vlan-nat`、`pppoe-nat` |
-| MAP-Eのポートの範囲 | core `port_set.rs`、confd `file.rs` | netns `map-e`、`map-e-pppoe` |
+| MAP-Eのポートの範囲 | core `port_set.rs`、confd `file.rs` | netns `map-e`、`map-e-pppoe`、`map-e-pd` |
 | 状態を持つfirewall | core `firewall.rs`、`firewall6.rs` | io-sim `stateful_firewall`、`firewall_ipv6`。netns `firewall6`、`dslite-firewall6`、`vrf-firewall`、`nat` |
 | フラグメント | core `ipv4_fragmentation.rs` | io-sim `ipv4_fragmentation*`、`nat_frag`。netns `vlan`、`nat`、`pppoe`、`pppoe-nat`、`dslite` |
 | ICMPとICMPv6のエラー | core `icmpv4_error.rs`、`ipv6.rs` | io-sim `icmpv4_*`、`nat44_icmpv4_*`。netns `skeleton`、`vlan`、`vlan-nat` |
@@ -123,53 +125,53 @@ charterの「作るもの」は全部ある。項目ごとの、従う決まり�
 | confd、ribd、neighd | confd `file.rs`、ribd `lib.rs`、neighd `lib.rs`、`nd.rs` | 各crateの試験、e2e `skeleton`。netns `skeleton` |
 | I/O層（AF_XDP、AF_PACKET、sim） | — | io-sim `backend_conformance`。netnsの全部を両方のbackendで |
 | メッセージ形式 | proto `session.rs`、`table.rs` | proto の試験 |
-| 設定を確かめて反映するCLI | — | confd `apply`。netns `skeleton`（`ruster apply`） |
+
+ルータ箱としての組み立てと、L2、トンネル、SRv6（2026-11-10に足したもの）。試験の欄は、ファイルと、
+決まりの値で確かめている主な試験と、その中身。
+
+| 作るもの | `# Standards`のあるモジュールと、主な外している点 | 確かめている試験 | netns |
+|---|---|---|---|
+| L2のブリッジとIRB（IEEE 802.1Q。RFCではない） | core `bridge.rs`、confd `bridge.rs`。spanning treeは無い。VLANごとに一つのブリッジ | core `bridge.rs`の`learns_forwards_floods_and_filters`（学習、転送、フラッディング、来たポートへは返さない）、`entries_age`（既定300秒の境目）、`a_frame_from_an_address_restarts_its_ageing`、`multicast_is_flooded_and_never_learned`、`the_reserved_block_ends_at_0f`（01-80-C2-00-00-00〜0Fは中継しない）。fe `tests/bridge.rs`の9本（IRB、VLANのメンバー、移動とエージング、promiscuous、リンク）。confd `tests/bridge.rs`（エージングの範囲10〜1000000秒） | `bridge` |
+| VXLAN | core `overlay.rs`、confd `vxlan.rs`。送り先は設定のVTEPだけ。IPv6でもUDPのchecksumは0にしない。外側をフラグメントしない | core `overlay.rs`の`vxlan_wraps_in_ipv4_with_checksum_zero_and_a_hashed_port`（ヘッダのバイト、Iフラグ、port 4789）、`vxlan_over_ipv6_has_a_udp_checksum`、`vxlan_reserved_bits_are_ignored_on_receipt`（Iフラグの無いものは捨てる）、`vxlan_vni_takes_all_24_bits`、`vxlan_source_ports_stay_in_the_dynamic_range`（49152〜65535）。fe `tests/vxlan.rs`（VTEPへのフラッディング、VTEPからのものを他のVTEPへ流さない）。confd `tests/vxlan.rs`（VNIの範囲） | `vxlan`（相手はLinuxのvxlan。外側IPv4とIPv6） |
+| EtherIP | core `overlay.rs`、confd `etherip.rs`。受けたヘッダのreservedは見ない。フラグメントしない | core `overlay.rs`の`wraps_in_ipv4_with_df_and_a_checksum`、`wraps_in_ipv6`、`etherip_takes_version_3_only`（0〜15のうち3だけ）、`unwraps_from_the_remote_end_only`。fe `tests/etherip.rs`の2本 | `etherip`（相手もruster。外側IPv4とIPv6） |
+| SRv6 | core `srv6.rs`、confd `srv6.rs`。SIDはdefault VRFだけ。SIDへのフラグメントは捨てる。HMACは見ない。外側をフラグメントしない | io-sim `srv6.rs`: End、End.X、End.DT4、End.DT6の手順（`segments_left_picks_the_segment_at_its_new_value`、`segments_left_one_above_last_entry_is_followed`、`the_hop_limit_is_checked_before_the_header`）、Parameter Problemのcodeとpointer（Segments Leftの43、前に拡張ヘッダがあるときの51、上位ヘッダの40、80、88、Segments Leftが残るEnd.DT4とEnd.DT6）、Time Exceeded。io-sim `srv6_encap.rs`: H.EncapsのSRHのバイト、H.Encaps.Red（`reduced_with_two_segments_lists_only_the_second`、一つならSRH無し）、包んで長すぎるときのPacket Too Big。fe `tests/srv6.rs`: DFの無いIPv4は切ってから包む、DFありはFragmentation Needed（MTU 1460）。confd `tests/srv6.rs` | `srv6`（相手はLinuxのseg6） |
+| IS-ISとOSPFのTAP | fe `tap.rs`、confd `isis_ospf.rs`、frr `isis_ospf.rs`。default VRFだけ。broadcastとpoint-to-pointだけ。プロトコルはFRR | fe `tap.rs`の`the_ranges_end_where_the_standards_say`（LLCと長さの境目1500/0x0600、224.0.0.0/24、fe80::/10）。fe `tests/tap.rs`の4本。confd `tests/isis_ospf.rs`（NET、metric、cost、router IDの範囲）。frr `tests/conf.rs`の`isis_and_ospf_are_written_on_the_tap_devices`、`is_is_on_an_interface_without_ipv6_carries_ipv4_only_and_passive_forms_no_adjacency` | `isis`、`ospf`（v2とv3、point-to-pointとbroadcast） |
+| 再帰の次の転送先 | ribd `resolve.rs`。結果をBGPへは返さない（FRRのzebraが持つ） | ribd `resolve.rs`の試験（最長一致、自分自身やその下の経路で解決しない、loop、深さ、VRF、`an_ipv6_next_hop_is_resolved_the_same_way`、`several_next_hops_of_the_match_are_all_kept_in_order`）。ribd `tests/ribd.rs`の`a_gateway_route_is_resolved_and_follows_the_routes_it_goes_through` | `bgp`（multihopの近隣） |
+| 全体の設定（`ruster.toml`とlockの形） | config `lib.rs`、confd `file.rs`。lockはYANGのインスタンスではなくTOML。決まりは[`router-box.md`](router-box.md) | config `tests/lock.rs`（lockの形の読み戻し、全部のkeyが要る、別の版は断る）、`tests/resolve.rs`（既定値の埋め方）、`tests/secrets.rs` | 全部（`ruster apply`で設定を渡す） |
+| 版、差分、confirm、候補の確認 | confd `apply.rs`、`diff.rs`、`part.rs`。confirmの期限は分。persist-idとcancel-commitは無い。FE、ribd、neighdは候補の確認に加わらない | confd `tests/apply.rs`（版、rollback、断られたら前へ戻す、期限内のconfirm、期限後のconfirmは5.03、confdの起動し直し）、`tests/versions.rs`、`tests/diff.rs`（POSIXの`diff -u`の範囲）、`tests/part.rs`（一つでも候補を断れば誰にも送らない）、`tests/refused.rs` | `commit` |
+| Unboundの橋渡し役 | unbound `lib.rs`。DNSはUnboundが行う | unbound `tests/unbound.rs`（access-controlは聞くプレフィックスだけ、上流の順、断られたら元のファイルへ戻す） | `dns`、`dhcpc`、`pppoed` |
+| Keaの橋渡し役とDHCPv4のリレー | kea `relay.rs`、`settings.rs`。giaddrが入っているものとoption 82が付いているものは捨てる。hopsの上限は4 | kea `tests/relay.rs`の`a_request_gets_giaddr_a_hop_and_the_circuit`（バイト単位。option 82はEndの直前）、`a_request_at_the_hops_threshold_is_relayed`、`requests_that_cannot_be_relayed_are_dropped`、`a_reply_goes_to_the_client_without_option_82`、`option_82_is_taken_out_of_a_reply_wherever_it_is`、`a_request_that_option_82_would_make_too_long_is_relayed_without_it`、`a_reply_is_broadcast_when_the_client_asks_or_has_no_address` | `dhcp` |
+| DHCPv6のリレー | kea `relay6.rs`、`settings6.rs`。他のリレーからのRelay-forwardは捨てる（hop-countは常に0） | kea `tests/relay6.rs`の`a_client_message_is_relayed_with_the_link_and_the_client`（Relay-forwardの型12、hop-count、link-address、peer-address、Interface-Id、option 79）、`every_client_message_type_is_relayed_unchanged`、`a_relay_reply_goes_to_the_client`、`every_server_to_client_type_is_passed_to_the_client`、`a_relay_reply_for_another_link_or_broken_is_dropped` | `dhcp6` |
+| FRRの橋渡し役（FPM、BGP、IS-IS、OSPF） | frr `fpm.rs`、`routes.rs`、`server.rs`、`conf.rs`、confd `bgp.rs`。FPMの枠はFRRの形でRFCではない。中はnetlinkの経路のメッセージ。main tableだけ。RTA_NH_IDは断る | frr `tests/fpm.rs`（FRR 10.5の実際のフレーム、`the_fpm_length_counts_its_own_four_bytes`、`attributes_are_aligned_to_four_bytes_and_unknown_ones_are_passed_over`、`ipv6_routes_with_rtnexthops_and_deletes`、`rtm_type_and_rta_table_take_linux_s_values`、`lengths_that_do_not_fit_are_refused`）、`tests/routes.rs`、`tests/server.rs`、`tests/conf.rs`（明示のpolicy）。confd `tests/bgp.rs`（AS 0、23456、4294967295は断る） | `bgp`、`isis`、`ospf` |
+| PPPoEの制御: Discovery | pppoed `discovery.rs`。待ちは2秒から32秒まで倍に | pppoed `tests/discovery.rs`の`codes_and_tags_are_those_of_rfc_2516`、`hand_built_pado_gives_the_padr_byte_for_byte`（PADIからPADTまで手で組んだバイト列。Host-Uniq、AC-Cookie、Relay-Session-Idを返す）、PADIとPADRの送り直し、合わない申し出を捨てる | `pppoed`、`pppoe-nat` |
+| PPPoEの制御: LCPと状態機械 | pppoed `fsm.rs`、`lcp.rs`、`session.rs`。PassiveとRestartの選択肢は無い | pppoed `tests/fsm.rs`の`every_cell_of_the_rfc_1661_transition_table`（遷移表の125の欄の動作と次の状態）、`limits_are_those_of_rfc_1661`（3秒、Max-Terminate 2、Max-Configure 10、Max-Failure 5）。`tests/lcp.rs`（MRU 1492、Magic-Numberのloopback、Echo、Protocol-Reject）。`tests/ppp.rs`の`protocol_numbers_and_codes_are_those_of_the_rfcs` | `pppoed`、`pppoe-nat` |
+| PPPoEの制御: PAPとCHAP | pppoed `auth.rs`。PAPは10回まで | pppoed `tests/auth.rs`（PAPのRequestのバイト、CHAP MD5を固定の値と比べる、Success/Failureは最後のidだけ） | `pppoed`、`pppoe-nat` |
+| PPPoEの制御: IPCPとIPv6CP | pppoed `ipcp.rs`、`ipv6cp.rs`。VJの圧縮は断る | pppoed `tests/ncp.rs`（IP-Address、DNSの129と131をNakで埋める、Interface-Identifier、両方0なら断る）、`tests/writer.rs` | `pppoed`、`pppoe-nat` |
+| DHCPv4のクライアント | dhcpc `client4.rs`、`dhcp4.rs`、`frame.rs`。ARPでの確かめとINIT-REBOOTは無い。overload（52）は読まない | dhcpc `tests/client4.rs`の`a_discover_follows_table_5`、`a_request_in_selecting_repeats_the_discovers_xid_and_secs`、`requests_in_requesting_are_sent_again_as_section_4_1_says`（4、8、16秒±1秒）、`renewing_and_rebinding_wait_half_the_time_left_but_at_least_60_s`、`t1_and_t2_from_the_server_are_used`（既定はリースの0.5と0.875）、`decline_and_release_follow_table_5`。`tests/dhcp4.rs`（オプションの形）、`tests/frame.rs` | `dhcpc` |
+| DHCPv6のクライアント（プレフィックスの委任） | dhcpc `client6.rs`、`dhcp6.rs`、`values.rs`。最初のAdvertiseを待たずに取る。Confirm、Reconfigure、Rapid Commitは無い | dhcpc `tests/client6.rs`の`solicits_are_sent_again_as_section_15_says`、`the_first_solicits_rt_is_strictly_above_irt`、`requests_are_sent_again_with_req_timeout_and_req_max_rt`、`renews_and_rebinds_are_sent_again_with_their_timeouts`、`every_option_request_asks_for_sol_max_rt`、`a_sol_max_rt_option_becomes_solicits_mrt`、`the_ia_pd_asked_for_has_the_section_21_21_layout`、`zero_t1_and_t2_are_the_clients_to_choose`、`messages_without_the_right_identifiers_are_dropped`。confd `tests/delegated.rs`（委任からLANの/64、RA、MAP-EのCE） | `dhcpc`、`map-e-pd` |
+| LANへのRA | neighd `ra.rs`、config `lib.rs`、confd `ra.rs`。RSへの答えは常にマルチキャスト。最後のRAは3秒おき | neighd `ra.rs`の`the_advertisement_has_every_field_and_option`（フレーム全部のバイト）、`unsolicited_ones_go_at_random_intervals_the_first_three_sooner`（最初の三つは16秒以内）、`solicitations_are_answered_soon_but_not_within_three_seconds`（0〜500ms、前のRAから3秒）、`the_rdnss_option_carries_every_server`（RDNSSの長さ）。neighd `tests/ra.rs`の3本。config `tests/ra.rs`（Minは0.33×Max）。confd `tests/ra.rs`（値の範囲） | `ra`、`dhcp6` |
+
+試験で見つかり直した、決まりから外れていた点: DHCPv4のリレーが、option 82を足すとMTUを超えるときも足していた
+（#775）。DHCPv4のクライアントのREQUESTの`secs`がDISCOVERと違った。DHCPv6のクライアントの最初のSolicitの待ちが
+IRTちょうどになりえた。Option RequestにSOL_MAX_RTが無かった（#779）。
+
+netnsの試験は29本で、全部をAF_XDPとAF_PACKETの両方で回す（`scripts/netns-all.sh`）。2026-11-10の結果:
+
+29本×2のbackendの58回が全部通った（main 9aca396）。構成は`bgp`、`bridge`、`commit`、`dhcp`、`dhcp6`、`dhcpc`、`dns`、`dslite-firewall6`、`dslite`、`etherip`、`firewall6`、`isis`、`map-e-pd`、`map-e-pppoe`、`map-e`、`nat`、`ospf`、`pppoe-nat`、`pppoe`、`pppoed`、`ra`、`skeleton`、`srv6`、`vlan-nat`、`vlan`、`vrf-firewall`、`vrf-vlan`、`vrf`、`vxlan`。
 
 #### 残り
 
-charterの「作るもの」は上の表のとおりそろい、2026-11-09 にownerが達成とみなした。`backlog`のissueに
-残したMediumとLow（試験の不足、数え方、説明の細かい点、作らないと決めて理由を書いた点）は、
-backlogのまま置き、使う場面が出たものから片付ける。
+charterの「作るもの」は上の表のとおりそろった。まだのものは次のとおり。
 
-次はルータ箱としての組み立て（2026-11-10 charterに追加）。順番は[`router-box.md`](router-box.md)の
-「作る順番」に従う。lockの形（版1）、confdが各プロセスへ担当の部分を渡すsocket（モジュールごとの`confd/part/<モジュール>/part.sock`）、
-Unboundの橋渡し役（`ruster-unbound`、netns `dns`）と、Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`、
-netns `dhcp`）、neighdのRA（`[[ra]]`、netns `ra`）、DHCPv6のリレー（`[[dhcp6]]`、netns `dhcp6`）まで済んだ。
-FRRの橋渡し役（`[bgp]`、`ruster-frr`、netns `bgp`）も済んだ。ribdが直結していない次の転送先を
-自分の経路で解決するので、multihopの近隣も使える。VRFごとのBGPはまだ。confdは受け取った設定を番号付きの版として`--state-dir`に残し（`ruster versions`、`ruster rollback N`）、
-`ruster diff`でlockの形、confdが書くFEの表、ribdへ渡す経路の差分と、部分を受け取る各プロセスが候補を
-確かめた答え（ファイルや設定の差分）を出す。`ruster apply`は、どれかのプロセスが候補を断れば何も送らない。
-`ruster apply --confirm-within M`は、M分以内に`ruster confirm`が無ければ（confdが起動し直しても）前の版に戻す。
-部分のsocketはモジュールごとで、ディレクトリのグループで開けるプロセスを絞れる（ce-processes.mdの
-「socketの権限」）。消えるNATセッションを差分に出すのと、FE、ribd、neighdを候補の段に加えるのはまだ。
+- VRFごとのBGP。
+- `ruster diff`に消えるNATセッションを出すことと、FE、ribd、neighdを候補の確認に加えること。
+- ブリッジのMACの表をFEの状態のsocketで見せること（今は数をログに出すだけ）。
+- FRRからFPMでSRv6の経路（`seg6local`と`seg6`のencap）を受けることと、SIDごとの数を見せること。
+- `backlog`のissueに残したMediumとLow（試験の不足、数え方、説明の細かい点、作らないと決めて理由を書いた点）は、
+  backlogのまま置き、使う場面が出たものから片付ける。
 
-`ruster-dhcpc`（「作る順番」の4）は、WAN側のDHCPv4とDHCPv6（プレフィックスの委任）のクライアント。設定は
-confdの`dhcpc`の部分（`[[dhcp-client]]`）から受け取り、得た値は送り手（種類`dhcp-client`、`dhcpv6-client`）
-としてconfdへ、default経路はribdへ（送り手`dhcpc`）書く。confdは、インターフェースの`ipv4-from`でWANの
-IPv4アドレスを、`ipv6-from`で委任からLANの/64とRAのプレフィックスを、`[map-e]`の`prefix-from`で
-委任からMAP-EのCEを作り、`[dns]`の`upstream-from`で送り手のDNSサーバをUnboundへ添える（netns `dhcpc`、
-`map-e-pd`）。IPv6のdefault経路はDHCPv6の返事の送り元へ向ける（WAN側のRAは読まない）。
-
-`ruster-pppoed`（「作る順番」の6）は、Discovery、LCP、PAPとCHAP、IPCP、IPv6CPでセッションを張る。設定は
-confdの`pppoe`の部分（`[[pppoe]]`）から受け取り、得た値は送り手（種類`pppoe`）としてconfdへ、`default-route`の
-ときはdefault経路をribdへ（送り手`pppoed`）書く。confdはその値から、セッションのある間だけFEにセッションの
-インターフェースを置き、親のPPPoEのフレームを`pppoed`へ受け渡す行を書く（netns `pppoed`、`pppoe-nat`）。
-`pppoe`と`map-e-pppoe`は、FEの転送を見るために固定のセッションを`ruster source`で渡している。IPCPで
-得たDNSサーバも送り手へ書き、`upstream-from`でUnboundへ渡る。
-
-次はL2のブリッジ、L2を運ぶトンネル、SRv6、IS-ISとOSPF（2026-11-10 charterに追加。設計は
-[`overlay.md`](overlay.md)）。順番はその「作る順番」のとおり: ブリッジとIRB、EtherIP、VXLAN、IS-ISとOSPFのTAP、
-SRv6。BGP EVPNは見送り（2026-11-10 owner決定）。
-ブリッジとIRBは済んだ（core `bridge.rs`、confd `bridge.rs`、fe `bridge`の試験、netns `bridge`）。メンバーはポートと
-VLANのサブインターフェース。EtherIPも済んだ（core `overlay.rs`、confd `etherip.rs`、fe `etherip`の試験、netns
-`etherip`。外側はIPv4とIPv6、相手もrusterで確かめた）。VXLANも済んだ（静的なVTEPの一覧。confd `vxlan.rs`、
-fe `vxlan`の試験、netns `vxlan`。相手はLinuxのvxlanのデバイスで確かめた）。メンバーのポート（VLANのメンバーなら親のポート）は、FEが
-promiscuousにする（`ruster-fe`の`promisc.rs`。netns `bridge`で確かめた）。MACの表をFEの状態のsocketで見せるのもまだ（今は数をログに出すだけ）。
-IS-ISとOSPFのTAPも済んだ（`[isis]`、`[ospf]`、`[ospf6]`、confd `isis_ospf.rs`と`kernel.rs`、fe `tap.rs`、
-`ruster-frr`の`isis_ospf.rs`、netns `isis`と`ospf`）。TAPのcarrierはポートのリンクの状態に合わせる（overlay.mdの6.）。
-SRv6も済んだ（ローカルのSIDのEnd、End.X、End.DT4、End.DT6と、H.EncapsとH.Encaps.Red。core `srv6.rs`、confd `srv6.rs`、
-io-sim `srv6`と`srv6_encap`、fe `srv6`の試験、netns `srv6`。相手はLinuxのseg6で確かめた）。設定の`[srv6]`のSIDと方針は
-confdがribdへ経路として渡す。FRRからFPMでSRv6の経路（`seg6local`と`seg6`のencap）を受けるのと、SIDごとの数を見せるのはまだ。
+組み立ての作りは[`router-box.md`](router-box.md)、L2とトンネルとSRv6の作りは[`overlay.md`](overlay.md)にある。
+BGP EVPNは見送り（2026-11-10 owner決定）。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信
 （IS-ISとOSPFがTAPで受けるものを除く）。
