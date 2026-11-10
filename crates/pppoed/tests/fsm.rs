@@ -331,3 +331,17 @@ fn malformed_packets_are_dropped() {
     assert!(out.is_empty());
     assert_eq!(f.state(), State::Opened);
 }
+
+#[test]
+fn request_sent_again_after_an_ack_gets_a_new_id() {
+    let mut f = fsm();
+    let id = started(&mut f);
+    rx(&mut f, 1, code::CONFIGURE_ACK, id, &[1, 3, 0]);
+    assert_eq!(f.state(), State::AckReceived);
+    let mut out = Vec::new();
+    f.timeout(3_000, &mut out);
+    let s = sent(&out);
+    assert_eq!(s[0].0, code::CONFIGURE_REQUEST);
+    assert_ne!(s[0].1, id);
+    assert_eq!(f.state(), State::RequestSent);
+}

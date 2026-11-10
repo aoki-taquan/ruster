@@ -25,9 +25,10 @@
 //!   to fit [`CODE_REJECT_MAX`].
 //!
 //! Deviations: neither the Passive nor the Restart option of section 4.1 is
-//! offered (an Open in Stopped or Closing stays there). A retransmitted
-//! Configure-Request keeps its identifier and options; a new one gets a new
-//! identifier.
+//! offered (an Open in Stopped or Opened does nothing; in Closing it goes to
+//! Stopping). A retransmitted Configure-Request keeps its options, and its
+//! identifier unless an Ack for it came. Code-Reject is cut to 1492 octets, not
+//! to a smaller MRU the peer may have set.
 
 use crate::ppp::{self, Opt};
 
@@ -247,7 +248,10 @@ impl<N: Negotiation> Fsm<N> {
         if self.restart_counter > 0 {
             match self.state {
                 State::Closing | State::Stopping => self.str(now, out),
-                State::RequestSent | State::AckReceived => {
+                State::RequestSent => self.scr(now, out, true),
+                State::AckReceived => {
+                    // A valid reply came for the last identifier (RFC 1661 5.1).
+                    self.request_id = self.new_id();
                     self.scr(now, out, true);
                     self.state = State::RequestSent;
                 }
@@ -296,14 +300,11 @@ impl<N: Negotiation> Fsm<N> {
 
     /// An unknown code (RUC): a Code-Reject carrying the packet.
     pub fn ruc(&mut self, information: &[u8], out: &mut Vec<Action>) {
-        if matches!(self.state, State::Initial | State::Starting) {
+        if matches!(self.state, State::Initial | State::Starting) || information.len() < 4 {
             return;
         }
-        let length = usize::from(u16::from_be_bytes([
-            information.get(2).copied().unwrap_or(0),
-            information.get(3).copied().unwrap_or(0),
-        ]))
-        .clamp(4, information.len());
+        let length = usize::from(u16::from_be_bytes([information[2], information[3]]))
+            .clamp(4, information.len());
         let rejected = &information[..length.min(CODE_REJECT_MAX - 4)];
         let id = self.new_id();
         out.push(Action::Send(ppp::packet(code::CODE_REJECT, id, rejected)));
@@ -367,7 +368,7 @@ impl<N: Negotiation> Fsm<N> {
                 ppp::packet(code::CONFIGURE_ACK, packet.id, packet.data)
             }
             Reply::Nak(options) => {
-                self.failures += 1;
+                self.failures = self.failures.saturating_add(1);
                 ppp::packet(code::CONFIGURE_NAK, packet.id, &options)
             }
             Reply::Reject(options) => ppp::packet(code::CONFIGURE_REJECT, packet.id, &options),
