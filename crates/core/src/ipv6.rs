@@ -133,7 +133,7 @@ pub struct Ipv6Fib {
     neighbors: Box<[Ipv6Neighbor]>,
     local: Box<[Ipv6Local]>,
     /// Next hops the control side could not resolve: Address Unreachable.
-    unreachable: Box<[(IfId, [u8; 16])]>,
+    pub(crate) unreachable: Box<[(IfId, [u8; 16])]>,
 }
 
 impl Ipv6Fib {
@@ -699,12 +699,16 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
             })
             .and_then(|egress| match bridges {
                 // Out of an IRB: to the member the destination is on, or flooded.
-                Some(bridges) => bridges.transmit(egress, packet.bytes_mut(), snapshot.now.0),
-                None => Ok(Some(egress)),
-            })
-            .and_then(|member| match member {
-                Some(member) => crate::vlan::transmit(&mut packet, member, vlans).map(Some),
-                None => Ok(None),
+                Some(bridges) => {
+                    let member = bridges.transmit(egress, packet.bytes_mut(), snapshot.now.0)?;
+                    let irb = |id: IfId| bridges.irb_of(id).is_some();
+                    member
+                        .map(|member| {
+                            crate::overlay::transmit_member(&mut packet, member, outer, irb, trace)
+                        })
+                        .transpose()
+                }
+                None => crate::vlan::transmit(&mut packet, egress, vlans).map(Some),
             }) {
             Ok(Some(port)) => {
                 packet.commit(port);
