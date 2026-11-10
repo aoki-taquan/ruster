@@ -674,6 +674,13 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     }
     let ra = crate::ra::check(lock.ra, &interfaces)?;
     let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
+    // The FE takes at most this many punt classes besides its own.
+    if dhcp.len() + crate::pppoe::class_count(&pppoe) > PUNT_CLASSES_MAX {
+        return Err(format!(
+            "dhcp and the parents of pppoe take more than {PUNT_CLASSES_MAX} punt classes \
+             (one per dhcp, two per parent)"
+        ));
+    }
     Ok(Config {
         interfaces,
         static_routes,
@@ -692,6 +699,9 @@ pub fn config(lock: Lock) -> Result<Config, String> {
 
 /// The most `dhcp` entries: each takes one of the FE's punt classes.
 const DHCP_MAX: usize = 32;
+
+/// The most punt classes confd writes: the most entries the FE's punt table takes.
+const PUNT_CLASSES_MAX: usize = 64;
 
 /// The longest DHCP lease: a day short of a year, well within what Kea and the
 /// 32-bit lease time option (RFC 2132 section 9.2) hold.

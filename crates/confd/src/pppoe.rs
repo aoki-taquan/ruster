@@ -63,15 +63,23 @@ pub fn check(
             .ok_or_else(|| format!("{at}: no PPPoE interface names this source"))?;
         let (parent, _) = interface.pppoe.as_ref().expect("found by it");
         let mac = ruster_proto::table::format_mac(&interface.mac);
+        let same_mac = ruster_proto::table::parse_mac(&entry.mac.to_ascii_lowercase())
+            .is_ok_and(|m| m == interface.mac);
         if entry.interface != interface.name
             || entry.vrf != interface.vrf
             || entry.parent != *parent
-            || entry.mac != mac
+            || !same_mac
         {
             return Err(format!(
                 "{at}: interface, vrf, parent and mac must be those of interface {:?} ({}, {parent}, {mac})",
                 interface.name, interface.vrf
             ));
+        }
+        if entry.user.is_empty() {
+            return Err(format!("{at}: user is empty"));
+        }
+        if entry.echo_failures > 100 {
+            return Err(format!("{at}: echo-failures must be at most 100"));
         }
         for (what, text) in [
             ("user", &entry.user),
@@ -97,6 +105,13 @@ pub fn check(
         out.push(entry);
     }
     Ok(out)
+}
+
+/// How many punt classes the entries take: two per parent.
+pub fn class_count(entries: &[ruster_config::Pppoe]) -> usize {
+    let parents: std::collections::BTreeSet<&str> =
+        entries.iter().map(|e| e.parent.as_str()).collect();
+    parents.len() * 2
 }
 
 /// The punt classes of the parents the entries' sessions run on.

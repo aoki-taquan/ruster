@@ -297,6 +297,13 @@ fn the_client_s_part_spells_out_where_the_session_runs() {
     let mut wrong = lock.clone();
     wrong.pppoe[0].user = "u".repeat(256);
     assert!(file::config(wrong).unwrap_err().contains("longer than 255"));
+    // An upper-case MAC in ruster.toml is the same MAC.
+    let upper = format!("{CONFIG}{CLIENT}").replace("02:00:00:00:00:02", "02:00:00:00:00:0A");
+    assert!(
+        file::parse(&upper).is_ok(),
+        "{:?}",
+        file::parse(&upper).err()
+    );
     let none = format!(
         "{CONFIG}{}",
         CLIENT.replace("source = \"pppoe-wan\"", "source = \"x\"")
