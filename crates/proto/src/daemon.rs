@@ -40,6 +40,8 @@ pub mod socket {
     pub const NEIGHD_CONFIG: &str = "neighd/config.sock";
     /// confd's socket for a new configuration file (from `ruster apply`).
     pub const CONFD_CONFIG: &str = "confd/config.sock";
+    /// confd's socket where each process takes its part of the configuration.
+    pub const CONFD_PART: &str = "confd/part.sock";
 
     /// The FE's datagram socket for frames to and from the control process `name`
     /// of a punt class (other than neighd).

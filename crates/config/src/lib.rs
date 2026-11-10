@@ -469,15 +469,46 @@ pub fn is_lock(text: &str) -> Result<bool, String> {
 /// Reads the lock form. Every key must be there, and the version must be
 /// [`VERSION`].
 pub fn parse_lock(text: &str) -> Result<Lock, String> {
+    check_version(text)?;
+    toml::from_str(text).map_err(|e| e.to_string())
+}
+
+fn check_version(text: &str) -> Result<(), String> {
     let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
     match table.get("version") {
-        None => return Err("version is missing: not the lock form".into()),
-        Some(toml::Value::Integer(v)) if *v == i64::from(VERSION) => {}
-        Some(v) => {
-            return Err(format!(
-                "version {v} is not one this ruster reads; it reads version {VERSION}"
-            ))
-        }
+        None => Err("version is missing: not the lock form".into()),
+        Some(toml::Value::Integer(v)) if *v == i64::from(VERSION) => Ok(()),
+        Some(v) => Err(format!(
+            "version {v} is not one this ruster reads; it reads version {VERSION}"
+        )),
     }
-    toml::from_str(text).map_err(|e| e.to_string())
+}
+
+/// The part of the lock form that the DNS process takes: the version and `dns`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsPart {
+    version: u32,
+    dns: Vec<Dns>,
+}
+
+/// The DNS process's part of the lock form as TOML text:
+/// `version = 1` and `dns`, a list of none or one.
+pub fn dns_part(dns: Option<&Dns>) -> String {
+    let part = DnsPart {
+        version: VERSION,
+        dns: dns.into_iter().cloned().collect(),
+    };
+    toml::to_string(&part).expect("the lock form is plain TOML")
+}
+
+/// Reads the DNS process's part of the lock form ([`dns_part`]).
+pub fn parse_dns_part(text: &str) -> Result<Option<Dns>, String> {
+    check_version(text)?;
+    let part: DnsPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    match <[Dns; 1]>::try_from(part.dns) {
+        Ok([dns]) => Ok(Some(dns)),
+        Err(none) if none.is_empty() => Ok(None),
+        Err(_) => Err("dns takes at most one value".into()),
+    }
 }
