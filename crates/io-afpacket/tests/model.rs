@@ -63,23 +63,23 @@ fn af_packet_v3_ring_model_validates_geometry_and_ownership() {
     block.validate(first.rx()).expect("bounded block");
     let first_descriptor = PacketDescriptor {
         packet_offset: 64,
-        next_offset: 1_632,
-        mac_offset: 146,
-        net_offset: 160,
+        next_offset: 1_760,
+        mac_offset: 274,
+        net_offset: 288,
         snap_len: 1_472,
         wire_len: 1_500,
         is_last: false,
     };
     let packet = first_descriptor.validate(4_096).expect("bounded packet");
     assert_eq!(packet.header(), 64..112);
-    assert_eq!(packet.data(), 210..1_682);
-    assert_eq!(packet.next_packet_offset(), Some(1_696));
+    assert_eq!(packet.data(), 338..1_810);
+    assert_eq!(packet.next_packet_offset(), Some(1_824));
     assert!(packet.is_truncated());
     let terminal = PacketDescriptor {
-        packet_offset: 1_696,
+        packet_offset: 1_824,
         next_offset: 0,
-        mac_offset: 146,
-        net_offset: 160,
+        mac_offset: 274,
+        net_offset: 288,
         snap_len: 60,
         wire_len: 60,
         is_last: true,
@@ -126,7 +126,7 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
         compact_tx.validate_rx(4_096, 190),
         Err(GeometryError::FrameTooSmall {
             frame_size: 256,
-            minimum: 336,
+            minimum: 464,
         })
     );
     let mut invalid = geometry();
@@ -177,7 +177,7 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
         invalid.validate_rx(4_096, 1_514),
         Err(GeometryError::RxBlockWouldTruncateMaxFrame {
             block_plus_private: 2_544,
-            mac_offset: 146,
+            mac_offset: 274,
             max_frame_len: 1_514,
             block_size: 4_096,
         })
@@ -237,8 +237,8 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
     PacketDescriptor {
         packet_offset: 72,
         next_offset: 0,
-        mac_offset: 146,
-        net_offset: 160,
+        mac_offset: 274,
+        net_offset: 288,
         snap_len: 60,
         wire_len: 60,
         is_last: true,
@@ -270,8 +270,8 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
     let crossing = PacketDescriptor {
         packet_offset: 48,
         next_offset: 64,
-        mac_offset: 146,
-        net_offset: 160,
+        mac_offset: 274,
+        net_offset: 288,
         snap_len: 60,
         wire_len: 60,
         is_last: false,
@@ -283,8 +283,8 @@ fn geometry_descriptor_and_status_fail_closed_on_checked_boundaries() {
     let overflow = PacketDescriptor {
         packet_offset: usize::MAX - 15,
         next_offset: 0,
-        mac_offset: 146,
-        net_offset: 160,
+        mac_offset: 274,
+        net_offset: 288,
         snap_len: 60,
         wire_len: 60,
         is_last: true,
@@ -475,6 +475,6 @@ fn stats_are_fixed_saturating_counters_and_platform_is_explicit() {
         assert_eq!(layout.block_status_offset, 8);
         assert_eq!(layout.block_sequence_offset, 24);
         assert_eq!(layout.tpacket3_hdrlen, 68);
-        assert_eq!(layout.ethernet_mac_offset, 146);
+        assert_eq!(layout.ethernet_mac_offset, 274);
     }
 }

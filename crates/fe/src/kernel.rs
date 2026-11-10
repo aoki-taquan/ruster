@@ -19,8 +19,9 @@ use ruster_core::{
 const ETHERNET_HEADER: usize = 14;
 
 /// Room before a kernel packet for the headers core may add (an IPv6 header for a
-/// tunnel, a PPPoE header, a VLAN tag).
-const HEADROOM: usize = 64;
+/// tunnel, with an SRv6 Segment Routing Header of up to 8 segments, a PPPoE header,
+/// a VLAN tag): as the AF_PACKET backend's.
+const HEADROOM: usize = 192;
 
 /// The MAC address of VRF `at`'s kernel interface.
 pub(crate) fn interface_mac(at: usize) -> MacAddress {

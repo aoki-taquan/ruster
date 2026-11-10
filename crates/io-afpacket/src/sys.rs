@@ -234,7 +234,7 @@ pub(crate) fn validated_uapi_layout() -> Result<UapiLayout, PlatformError> {
             tpacket_request3: 28,
             sockaddr_ll: 20,
             tpacket3_hdrlen: 68,
-            ethernet_mac_offset: 146,
+            ethernet_mac_offset: 274,
         })
     {
         return Err(PlatformError::UapiLayoutMismatch);
