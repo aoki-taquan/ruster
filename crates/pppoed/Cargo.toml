@@ -6,3 +6,4 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+md5 = { package = "md-5", version = "0.10" }
