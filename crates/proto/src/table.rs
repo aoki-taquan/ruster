@@ -279,10 +279,17 @@ pub enum PuntKind {
     Udp,
     /// Anything else.
     Other,
+    /// IS-IS PDUs (ISO 10589): LLC frames with DSAP and SSAP 0xFE to AllL1ISs
+    /// 01-80-C2-00-00-14, AllL2ISs 01-80-C2-00-00-15 or AllISs 09-00-2B-00-00-05.
+    Isis,
+    /// OSPF (IP protocol 89, RFC 2328 and RFC 5340) to AllSPFRouters or
+    /// AllDRouters (224.0.0.5, 224.0.0.6, ff02::5, ff02::6), or to an address of
+    /// the router.
+    Ospf,
 }
 
 impl PuntKind {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 12] = [
         Self::Arp,
         Self::Nd,
         Self::PppoeDiscovery,
@@ -293,6 +300,8 @@ impl PuntKind {
         Self::Tcp,
         Self::Udp,
         Self::Other,
+        Self::Isis,
+        Self::Ospf,
     ];
 
     /// The name on the wire.
@@ -309,6 +318,8 @@ impl PuntKind {
             Self::Tcp => "tcp",
             Self::Udp => "udp",
             Self::Other => "other",
+            Self::Isis => "isis",
+            Self::Ospf => "ospf",
         }
     }
 
@@ -326,6 +337,13 @@ impl PuntKind {
             Self::Arp | Self::Nd | Self::PppoeDiscovery | Self::PppControl
         )
     }
+
+    /// Whether the kind goes to the TAP device of the interface it came in on (a
+    /// routing protocol the kernel's daemons speak there).
+    #[must_use]
+    pub const fn is_routing_protocol(self) -> bool {
+        matches!(self, Self::Isis | Self::Ospf)
+    }
 }
 
 /// Where the frames of a punt class go.
@@ -335,6 +353,9 @@ pub enum PuntDestination {
     Control(String),
     /// The kernel of the VRF the packet came in on (its TUN).
     Kernel,
+    /// The TAP device of the interface the frame came in on, as the whole frame
+    /// (`docs/design/overlay.md` section 6).
+    Tap,
     /// Nowhere: dropped and counted.
     Drop,
 }
@@ -2158,7 +2179,18 @@ fn validate_punt(class: &PuntClass) -> Result<(), ModelError> {
             return Err(ModelError::Invalid("punt control socket name"));
         }
     }
+    // A routing protocol goes to its interface's TAP, and only it does.
+    let routing = matches!(class.matches, PuntMatch::Kind(kind) if kind.is_routing_protocol());
+    if routing != (class.destination == PuntDestination::Tap) {
+        return Err(ModelError::Invalid(
+            "punt destination (isis and ospf go to the TAP, and only they do)",
+        ));
+    }
+    if routing && class.interface.is_none() {
+        return Err(ModelError::Missing("punt interface of a TAP class"));
+    }
     match class.matches {
+        PuntMatch::Kind(kind) if kind.is_routing_protocol() => {}
         // A frame has no IP packet to give the kernel.
         PuntMatch::Kind(kind) if kind.is_frame() => {
             if class.destination == PuntDestination::Kernel {
@@ -2215,6 +2247,9 @@ fn encode_punt(class: &PuntClass, e: &mut Encoder<'_>) {
         PuntDestination::Kernel => {
             e.u64(d(sid::PUNT_KERNEL)).bool(true);
         }
+        PuntDestination::Tap => {
+            e.u64(d(sid::PUNT_TAP)).bool(true);
+        }
         PuntDestination::Drop => {
             e.u64(d(sid::PUNT_DROP)).bool(true);
         }
@@ -2266,10 +2301,12 @@ fn decode_punt(got: &mut Members) -> Result<Value, ModelError> {
     };
     let kernel = flag(got, sid::PUNT_KERNEL)?;
     let drop = flag(got, sid::PUNT_DROP)?;
-    let destination = match (control, kernel, drop) {
-        (Some(name), false, false) => PuntDestination::Control(name),
-        (None, true, false) => PuntDestination::Kernel,
-        (None, false, true) => PuntDestination::Drop,
+    let tap = flag(got, sid::PUNT_TAP)?;
+    let destination = match (control, kernel, drop, tap) {
+        (Some(name), false, false, false) => PuntDestination::Control(name),
+        (None, true, false, false) => PuntDestination::Kernel,
+        (None, false, true, false) => PuntDestination::Drop,
+        (None, false, false, true) => PuntDestination::Tap,
         _ => return Err(ModelError::Invalid("punt destination (exactly one)")),
     };
     let number = |got: &mut Members, member: u64, what: &'static str| match got.remove(&member) {

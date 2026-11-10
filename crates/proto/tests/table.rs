@@ -1057,8 +1057,18 @@ fn punt_classes_round_trip() {
             burst: 1,
         },
     );
+    let tap = punt(
+        "ospf-wan",
+        PuntClass {
+            matches: PuntMatch::Kind(PuntKind::Ospf),
+            interface: Some("wan".into()),
+            destination: PuntDestination::Tap,
+            rate: 100,
+            burst: 50,
+        },
+    );
     let gone = Change::delete(Key::Punt { class: "x".into() });
-    for change in [dhcp, pppoe, icmp, ospf, gone] {
+    for change in [dhcp, pppoe, icmp, ospf, tap, gone] {
         assert_eq!(round_trip(&change), change);
     }
     for kind in PuntKind::ALL {
@@ -1113,6 +1123,16 @@ fn a_bad_punt_class_is_refused() {
         PuntClass {
             interface: Some(String::new()),
             ..class(udp, PuntDestination::Drop)
+        },
+        // IS-IS and OSPF go to an interface's TAP, and only they do.
+        class(PuntMatch::Kind(PuntKind::Isis), PuntDestination::Tap),
+        PuntClass {
+            interface: Some("wan".into()),
+            ..class(PuntMatch::Kind(PuntKind::Ospf), PuntDestination::Kernel)
+        },
+        PuntClass {
+            interface: Some("wan".into()),
+            ..class(udp, PuntDestination::Tap)
         },
     ];
     for value in refused {
