@@ -216,7 +216,7 @@
 //! router-id = "198.51.100.1"   # optional: the first ipv4 address of the default
 //!                              # VRF's enabled interfaces when left out
 //! networks = ["203.0.113.0/24", "2001:db8:5::/48"]  # optional: the prefixes it
-//!                              # announces (each needs a route of its own)
+//!                              # announces, always (FRR sees no route of the FE)
 //! include = "/etc/ruster/frr-extra.conf"  # optional: FRR settings that ruster-frr
 //!                              # adds to FRR's configuration as they are
 //!
