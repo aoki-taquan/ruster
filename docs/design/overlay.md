@@ -29,6 +29,10 @@
 ```
 
 - メンバーにはアドレスを付けない。L3として振る舞うのはIRBだけ。
+- メンバーのポート（VLANのサブインターフェースがメンバーなら、その親のポート）は、自分のMAC以外の宛先の
+  フレームも受ける必要がある（ホストやIRB宛て）。FEはそのポートごとに、何も受けないAF_PACKETのsocketを
+  開いたままにし、`PACKET_MR_PROMISC`でpromiscuousにする。Linuxはpromiscuousの利用者を数えるので、
+  socketを閉じれば（FEが落ちても）FEの分だけが戻り、運用者やtcpdumpの分は残る。
 - IRBは、名前がブリッジと同じインターフェース。MAC、MTU、VRF、アドレスを持つ普通のインターフェースで、
   経路、firewall、NAT、受け渡しの分類、neighd、RA、DHCPはどれもIRBの名前で書く。IRBが無いブリッジは
   L2だけで働く。

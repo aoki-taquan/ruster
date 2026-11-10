@@ -386,3 +386,29 @@ fn a_member_that_leaves_the_bridge_forgets_what_was_learned_on_it() {
         .send(P2, udp(H1, H2, [192, 0, 2, 20], [192, 0, 2, 10]), 1)
         .is_empty());
 }
+
+#[test]
+fn members_and_parents_of_member_vlans_are_promiscuous() {
+    let mut bench = Bench::new(300, &[]);
+    assert_eq!(bench.fe.promiscuous_ports(), ["p1", "p2"]);
+    let vlan = iface(
+        "wan.10",
+        WAN_MAC,
+        Some(Vlan {
+            parent: "wan".into(),
+            id: 10,
+        }),
+    );
+    assert_eq!(bench.patch_config(&[vlan, member("wan.10")]), Code::CHANGED);
+    assert_eq!(bench.fe.promiscuous_ports(), ["p1", "p2", "wan"]);
+    let leave = |name: &str| {
+        Change::delete(Key::BridgePort {
+            interface: name.into(),
+        })
+    };
+    assert_eq!(
+        bench.patch_config(&[leave("p2"), leave("wan.10")]),
+        Code::CHANGED
+    );
+    assert_eq!(bench.fe.promiscuous_ports(), ["p1"]);
+}

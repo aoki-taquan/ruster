@@ -7,7 +7,8 @@
 #   d (b's MAC and address later) -- p4 --/
 #
 # a and b reach each other at L2 (TTL unchanged), c reaches both through the IRB, b's
-# MAC moves to p4 and the FE follows, and learned addresses age out. Run as root
+# MAC moves to p4 and the FE follows, and learned addresses age out. The members are
+# in promiscuous mode while the FE runs, and not after it stops. Run as root
 # after `cargo build`:
 #   sudo scripts/netns-bridge.sh [target/debug]
 # FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
@@ -110,6 +111,15 @@ out=$(nsx "$a" ping -c 3 -i 0.2 -W 1 192.0.2.20) || fail "a to b: $out"
 grep -q "ttl=64" <<<"$out" || fail "a to b was not bridged (TTL changed): $out"
 echo "ok: a and b reach each other at L2"
 
+promiscuity() { nsx "$router" ip -d link show "$1" | grep -o 'promiscuity [0-9]*' | awk '{print $2}'; }
+# The FE looks at the members once a second.
+for port in p1 p2 p4; do
+  for _ in $(seq 1 30); do [[ $(promiscuity "$port") == 1 ]] && break; sleep 0.1; done
+  [[ $(promiscuity "$port") == 1 ]] || fail "member $port is not promiscuous: $(promiscuity "$port")"
+done
+[[ $(promiscuity p3) == 0 ]] || fail "p3, not a member, is promiscuous"
+echo "ok: the members are promiscuous"
+
 for target in 192.0.2.10 192.0.2.20; do
   ok=0
   for _ in $(seq 1 10); do
@@ -150,4 +160,13 @@ sleep 13
 wait_counter bridge_aged $((aged + 1)) 8 || fail "no learned address aged out"
 nsx "$a" ping -c 2 -i 0.2 -W 1 192.0.2.20 >/dev/null || fail "a to b's address after ageing"
 echo "ok: learned addresses age out and are learned again"
+
+fe=${pids[0]}
+pids=("${pids[@]:1}")
+kill "$fe"
+wait "$fe" || true
+for port in p1 p2 p4; do
+  [[ $(promiscuity "$port") == 0 ]] || fail "$port is still promiscuous after the FE stopped"
+done
+echo "ok: the FE stopped and the members are not promiscuous"
 echo "PASS ($backend)"

@@ -12,6 +12,7 @@
 
 mod af_packet;
 mod af_xdp;
+mod promisc;
 mod signal;
 mod tun;
 
@@ -152,6 +153,7 @@ where
     let mut last_report = 0;
     let mut reported = fe.counters();
     let mut tuns = Tuns::default();
+    let mut promiscuous = promisc::Promiscuous::default();
     let mut last_tun_check = 0;
     // A stop asked for while starting: the loop stops at once, without READY=1.
     if !signal::stop_requested() {
@@ -169,6 +171,7 @@ where
             }
             let how = if drained { "drained" } else { "not drained" };
             eprintln!("ruster-fe: stopped, {how} ({:?})", fe.counters());
+            promiscuous.keep(&[]);
             return Ok(());
         }
         waiter.set_clock(fe.io_mut(), MonotonicMillis(now));
@@ -181,6 +184,7 @@ where
         if now.saturating_sub(last_tun_check) >= TUN_CHECK_MS {
             last_tun_check = now;
             tuns.check(fe);
+            promiscuous.keep(&fe.promiscuous_ports());
         }
         let progress = fe.step(now);
         if now.saturating_sub(last_report) >= 5_000 && fe.counters() != reported {

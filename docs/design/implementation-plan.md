@@ -163,8 +163,8 @@ SRv6。BGP EVPNは見送り（2026-11-10 owner決定）。
 ブリッジとIRBは済んだ（core `bridge.rs`、confd `bridge.rs`、fe `bridge`の試験、netns `bridge`）。メンバーはポートと
 VLANのサブインターフェース。EtherIPも済んだ（core `overlay.rs`、confd `etherip.rs`、fe `etherip`の試験、netns
 `etherip`。外側はIPv4とIPv6、相手もrusterで確かめた）。VXLANも済んだ（静的なVTEPの一覧。confd `vxlan.rs`、
-fe `vxlan`の試験、netns `vxlan`。相手はLinuxのvxlanのデバイスで確かめた）。メンバーのNICはFEが他のMAC宛てのフレームも受けられるようにする（vethでは要らない。
-実際のNICでFEがpromiscuousにするのはまだ）。MACの表をFEの状態のsocketで見せるのもまだ（今は数をログに出すだけ）。
+fe `vxlan`の試験、netns `vxlan`。相手はLinuxのvxlanのデバイスで確かめた）。メンバーのポート（VLANのメンバーなら親のポート）は、FEが
+promiscuousにする（`ruster-fe`の`promisc.rs`。netns `bridge`で確かめた）。MACの表をFEの状態のsocketで見せるのもまだ（今は数をログに出すだけ）。
 IS-ISとOSPFのTAPも済んだ（`[isis]`、`[ospf]`、`[ospf6]`、confd `isis_ospf.rs`と`kernel.rs`、fe `tap.rs`、
 `ruster-frr`の`isis_ospf.rs`、netns `isis`と`ospf`）。TAPのリンクの状態をポートに合わせるのはまだ（overlay.mdの6.）。
 
