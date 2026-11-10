@@ -51,8 +51,9 @@ pub struct Ra {
     pub dns: Vec<String>,
     /// Its lifetime, in seconds.
     pub dns_lifetime: u32,
-    /// The sources whose delegated prefixes it also advertises, found at run time.
-    /// None can be given yet.
+    /// The sources whose delegated prefixes it also advertises, found at run time:
+    /// the source of the interface's `ipv6-from`, whose /64 confd adds to `prefix`
+    /// in the part it hands neighd, with the delegated prefix's lifetimes.
     pub prefix_from: Vec<String>,
     /// AdvPrefixList.
     pub prefix: Vec<RaPrefix>,
@@ -152,7 +153,11 @@ pub(crate) fn resolve(
         dns_lifetime: entry
             .dns_lifetime
             .unwrap_or_else(|| max_interval.saturating_mul(3)),
-        prefix_from: Vec::new(),
+        prefix_from: interface
+            .ipv6_from
+            .iter()
+            .map(|f| f.source.clone())
+            .collect(),
         prefix,
     })
 }

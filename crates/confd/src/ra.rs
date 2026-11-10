@@ -107,8 +107,13 @@ fn one(entry: &Ra, interfaces: &[InterfaceConfig]) -> Result<(), String> {
     if !entry.dns.is_empty() && entry.dns_lifetime < max {
         return Err(format!("{at}: dns-lifetime must be at least max-interval"));
     }
-    if !entry.prefix_from.is_empty() {
-        return Err(format!("{at}: prefix-from takes no source yet"));
+    // The delegated /64 confd adds at run time is the interface's ipv6-from.
+    for source in &entry.prefix_from {
+        if interface.ipv6_from.as_ref().map(|(s, _)| s) != Some(source) {
+            return Err(format!(
+                "{at}: prefix-from {source:?} must be the source of the interface's ipv6-from"
+            ));
+        }
     }
     if entry.prefix.len() > PREFIX_MAX {
         return Err(format!("{at}: give at most {PREFIX_MAX} prefixes"));

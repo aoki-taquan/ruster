@@ -40,6 +40,7 @@ use ruster_proto::task::{Progress, Task};
 
 pub mod apply;
 pub mod bgp;
+pub mod delegated;
 pub mod dhcp6;
 pub mod dhcp_client;
 pub mod file;
@@ -73,6 +74,10 @@ pub struct InterfaceConfig {
     /// The source (of kind `dhcp-client`) whose IPv4 address the interface has
     /// while the source has one, instead of `ipv4`.
     pub ipv4_from: Option<String>,
+    /// The source (of kind `dhcpv6-client`) and subnet ID of the /64 of a
+    /// delegated prefix the interface also has while the source has one
+    /// ([`delegated`]).
+    pub ipv6_from: Option<(String, u32)>,
 }
 
 impl InterfaceConfig {
@@ -294,7 +299,11 @@ impl Peer {
 }
 
 pub struct Confd {
+    /// The configuration as given.
     config: Config,
+    /// The configuration in use: `config` with the delegated prefixes now
+    /// ([`delegated`]). The tables and parts are made from it.
+    current: Config,
     fe: Option<Peer>,
     ribd: Option<Peer>,
     neighd: Option<Peer>,
@@ -312,7 +321,7 @@ pub struct Confd {
 impl std::fmt::Debug for Confd {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Confd")
-            .field("config", &self.config)
+            .field("config", &self.current)
             .field("counters", &self.counters)
             .finish_non_exhaustive()
     }
@@ -323,6 +332,7 @@ impl Confd {
         Self {
             sources: source::Sources::new(&config.sources),
             values_changed: 0,
+            current: config.clone(),
             config,
             fe: None,
             ribd: None,
@@ -416,6 +426,7 @@ impl Confd {
         .collect()
     }
 
+    /// The configuration as given (without the values found at run time).
     pub fn config(&self) -> &Config {
         &self.config
     }
@@ -464,7 +475,7 @@ impl Confd {
         .chain(
             part::Module::ALL
                 .into_iter()
-                .filter(|m| m.configured(&self.config) && !self.parts.connected(*m))
+                .filter(|m| m.configured(&self.current) && !self.parts.connected(*m))
                 .map(PeerKind::Part),
         )
         .collect()
@@ -472,11 +483,12 @@ impl Confd {
 
     /// Replaces the configuration; only the differences are sent.
     pub fn set_config(&mut self, config: Config) {
-        self.config = config;
         self.generation += 1;
-        self.sources.set_specs(&self.config.sources);
+        self.sources.set_specs(&config.sources);
+        self.current = delegated::with_delegated(&config, &self.sources);
+        self.config = config;
         self.send_tables();
-        self.parts.send(&self.config, self.generation);
+        self.parts.send(&self.current, self.generation);
     }
 
     /// Sends the FE, neighd and ribd what changed in their tables.
@@ -536,7 +548,7 @@ impl Confd {
     /// The interfaces outside the network the firewall guards: NAT's outside and
     /// those the default VRF's default routes leave through (RFC 6092's exterior).
     fn firewall_outside(&self) -> Vec<String> {
-        if let Some(outside) = &self.config.firewall_outside {
+        if let Some(outside) = &self.current.firewall_outside {
             let mut outside = outside.clone();
             outside.sort();
             outside.dedup();
@@ -548,7 +560,7 @@ impl Confd {
             .iter()
             .map(|nat| nat.outside.clone())
             .chain(
-                self.config
+                self.current
                     .static_routes
                     .iter()
                     .filter_map(|route| match &route.target {
@@ -569,7 +581,7 @@ impl Confd {
     /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
-        if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.config.icmp_errors {
+        if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.current.icmp_errors {
             out.insert(
                 Key::IcmpErrors {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
@@ -581,24 +593,24 @@ impl Confd {
                 },
             );
         }
-        if !self.config.firewall.is_empty() {
+        if !self.current.firewall.is_empty() {
             out.insert(
                 Key::FirewallPolicy {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
                 },
                 Value::FirewallPolicy {
-                    filtering: self.config.firewall_filtering,
+                    filtering: self.current.firewall_filtering,
                     outside: self.firewall_outside(),
                 },
             );
         }
         // The DHCP clients' rules go first, so that no rule drops the replies.
-        let client_rules = if self.config.firewall.is_empty() {
+        let client_rules = if self.current.firewall.is_empty() {
             Vec::new()
         } else {
-            dhcp_client::firewall_rules(&self.config.dhcp_client)
+            dhcp_client::firewall_rules(&self.current.dhcp_client)
         };
-        for (id, rule) in (1..).zip(client_rules.iter().chain(&self.config.firewall)) {
+        for (id, rule) in (1..).zip(client_rules.iter().chain(&self.current.firewall)) {
             out.insert(
                 Key::FirewallRule {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
@@ -618,7 +630,7 @@ impl Confd {
                     .find(|i| i.name == nat.outside)
                     .is_none_or(|i| !i.address_from_source() || self.ipv4(i).is_some())
         };
-        if let Some(nat) = self.config.nat.as_ref().filter(outside_ready) {
+        if let Some(nat) = self.current.nat.as_ref().filter(outside_ready) {
             out.insert(
                 Key::Nat {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
@@ -630,11 +642,11 @@ impl Confd {
         // broadcasts before forwarding, and those to the router's address (renewals)
         // after the input firewall.
         // Each DHCPv6 interface's messages to ff02::1:2, port 547, likewise.
-        let v4 = self.config.dhcp.iter().map(|d| {
+        let v4 = self.current.dhcp.iter().map(|d| {
             let class = (DHCP_CLASS_PREFIX, DHCP_SERVER_PORT);
             (class, &d.interface, d.punt_rate, d.punt_burst)
         });
-        let v6 = self.config.dhcp6.iter().map(|d| {
+        let v6 = self.current.dhcp6.iter().map(|d| {
             let class = (DHCP6_CLASS_PREFIX, DHCP6_SERVER_PORT);
             (class, &d.interface, d.punt_rate, d.punt_burst)
         });
@@ -657,8 +669,8 @@ impl Confd {
                 }),
             );
         }
-        pppoe::punt_classes(&self.config.pppoe, &mut out);
-        dhcp_client::punt_classes(&self.config.dhcp_client, &mut out);
+        pppoe::punt_classes(&self.current.pppoe, &mut out);
+        dhcp_client::punt_classes(&self.current.dhcp_client, &mut out);
         out
     }
 
@@ -672,7 +684,7 @@ impl Confd {
     /// An interface's IPv4 address now: a PPPoE session's from its source while it
     /// is up.
     fn ipv4(&self, interface: &InterfaceConfig) -> Option<(Ipv4Addr, u8)> {
-        self.ipv4_in(&self.config, interface)
+        self.ipv4_in(&self.current, interface)
     }
 
     /// An interface's IPv4 address now, among the interfaces of `config`. A
@@ -715,9 +727,10 @@ impl Confd {
         self.with_values_of(&self.config)
     }
 
-    /// `config` with the IPv4 address now of each interface that takes it from a
-    /// source.
+    /// `config` with the values the sources have now: the IPv4 address of each
+    /// interface that takes it from a source, and the delegated prefixes.
     pub fn with_values_of(&self, config: &Config) -> Config {
+        let config = &delegated::with_delegated(config, &self.sources);
         let mut out = config.clone();
         for interface in &mut out.interfaces {
             if interface.address_from_source() {
@@ -736,7 +749,7 @@ impl Confd {
         let Some((local, _)) = interface.tunnel else {
             return interface.mtu;
         };
-        self.config
+        self.current
             .interfaces
             .iter()
             .find(|i| i.pppoe.is_some() && i.ipv6.iter().any(|&(a, _)| a == local))
@@ -753,7 +766,7 @@ impl Confd {
 
     fn interface_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
-        for interface in &self.config.interfaces {
+        for interface in &self.current.interfaces {
             // A PPPoE session is there only while it is up.
             let session = self.session(interface);
             if interface.pppoe.is_some() && session.is_none() {
@@ -810,7 +823,7 @@ impl Confd {
     /// Whether packets can leave through `name`: it is enabled, and so is the parent
     /// a VLAN sub-interface or PPPoE session runs on.
     fn usable(&self, name: &str) -> bool {
-        let find = |name: &str| self.config.interfaces.iter().find(|i| i.name == name);
+        let find = |name: &str| self.current.interfaces.iter().find(|i| i.name == name);
         let Some(interface) = find(name) else {
             return false;
         };
@@ -837,7 +850,7 @@ impl Confd {
     /// Whether `name` is NAT's outside (with no `external`), takes its IPv4 address
     /// from a DHCP client, and has none now.
     fn waits_for_address(&self, name: &str) -> bool {
-        let Some(interface) = self.config.interfaces.iter().find(|i| i.name == name) else {
+        let Some(interface) = self.current.interfaces.iter().find(|i| i.name == name) else {
             return false;
         };
         interface.ipv4_from.is_some()
@@ -882,7 +895,7 @@ impl Confd {
                 );
             }
         }
-        for route in &self.config.static_routes {
+        for route in &self.current.static_routes {
             // A static route out of a disabled interface cannot be used: it is not
             // offered, so that another source's route for the prefix is chosen.
             if let RouteTarget::Next { interface, .. } = &route.target {
@@ -976,7 +989,11 @@ impl Task for Confd {
         let (mut progress, changed) = self.sources.step(now_ms);
         if changed {
             self.values_changed += 1;
+            self.current = delegated::with_delegated(&self.config, &self.sources);
             self.send_tables();
+            // Generation 0: a refusal of a part the values changed is not the
+            // refusal of a configuration `ruster apply` waits on.
+            self.parts.send(&self.current, 0);
         }
         if waiting && !self.sources.waiting() {
             for peer in [&mut self.fe, &mut self.ribd, &mut self.neighd]
@@ -1075,7 +1092,7 @@ impl Task for Confd {
                 }
             }
         }
-        let (polled, refusals) = self.parts.step(&self.config, self.generation);
+        let (polled, refusals) = self.parts.step(&self.current, self.generation);
         progress = progress.and(polled);
         for (module, reason, generation) in refusals {
             self.counters.patches_refused += 1;
@@ -1122,6 +1139,7 @@ mod tests {
             tunnel: None,
             pppoe: None,
             ipv4_from: None,
+            ipv6_from: None,
         };
         let route = |len| StaticRoute {
             vrf: "default".into(),
@@ -1173,6 +1191,7 @@ mod tests {
             tunnel: None,
             pppoe: None,
             ipv4_from: None,
+            ipv6_from: None,
         };
         let config = |trunk_enabled| Config {
             interfaces: vec![
