@@ -138,6 +138,9 @@
 //! dns = ["192.0.2.1"]          # optional: the DNS servers option; when left out,
 //!                              # the interface's address if [dns] listens on it,
 //!                              # else none
+//! punt-rate = 200              # optional: how many DHCP packets a second the FE
+//! punt-burst = 100             # hands ruster-kea from the interface, and at once;
+//!                              # these when left out
 //!
 //! [[source]]                   # optional: a daemon that sends confd values found
 //!                              # at run time, on confd/source/<name>.sock
@@ -241,6 +244,8 @@
 //! lease-time = 3600
 //! router = ["192.0.2.1"]
 //! dns = ["192.0.2.1"]
+//! punt-rate = 200
+//! punt-burst = 100
 //!
 //! [[source]]
 //! name = "pppoe-wan"
@@ -297,6 +302,11 @@ pub const FILTERING: &str = "endpoint-independent";
 pub const PSID_OFFSET: u8 = 6;
 /// A DHCP lease's time, in seconds.
 pub const DHCP_LEASE_TIME: u32 = 3_600;
+/// How many DHCP packets per second, and at once, the FE hands over from one
+/// interface. A client sends a few per lease; this leaves room for a LAN of a few
+/// hundred starting together, and keeps a flood from one interface off the others'.
+pub const DHCP_PUNT_RATE: u32 = 200;
+pub const DHCP_PUNT_BURST: u32 = 100;
 /// The kinds of source, and how long confd waits after it starts for each to send
 /// everything again, in seconds: a daemon in the same box connects again within a
 /// second or two.
@@ -360,6 +370,10 @@ pub struct Dhcp {
     pub router: Vec<String>,
     /// The DNS servers option.
     pub dns: Vec<String>,
+    /// The FE's rate limit on the DHCP it hands over from the interface: packets
+    /// per second, and at once.
+    pub punt_rate: u32,
+    pub punt_burst: u32,
 }
 
 /// The DNS server for the LAN: Unbound, which `ruster-unbound` configures.

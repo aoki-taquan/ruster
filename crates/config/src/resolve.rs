@@ -9,8 +9,9 @@ use ruster_proto::table::DEFAULT_VRF;
 
 use crate::{
     Dhcp, Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Source,
-    Target, B4_ADDRESS, DHCP_LEASE_TIME, FILTERING, ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_OVERHEAD,
-    PSID_OFFSET, SOURCE_KINDS, TUNNEL_MAC, TUNNEL_MTU, VERSION, VLAN_OVERHEAD,
+    Target, B4_ADDRESS, DHCP_LEASE_TIME, DHCP_PUNT_BURST, DHCP_PUNT_RATE, FILTERING, ICMP_ERRORS,
+    MTU, NAT_PORTS, PPPOE_OVERHEAD, PSID_OFFSET, SOURCE_KINDS, TUNNEL_MAC, TUNNEL_MTU, VERSION,
+    VLAN_OVERHEAD,
 };
 
 #[derive(Deserialize)]
@@ -50,6 +51,8 @@ struct DhcpEntry {
     lease_time: Option<u32>,
     router: Option<Vec<String>>,
     dns: Option<Vec<String>>,
+    punt_rate: Option<u32>,
+    punt_burst: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -412,6 +415,8 @@ fn dhcp(entry: DhcpEntry, interfaces: &[Interface], dns: Option<&Dns>) -> Result
         dns: entry
             .dns
             .unwrap_or_else(|| if listened { vec![own] } else { Vec::new() }),
+        punt_rate: entry.punt_rate.unwrap_or(DHCP_PUNT_RATE),
+        punt_burst: entry.punt_burst.unwrap_or(DHCP_PUNT_BURST),
     })
 }
 

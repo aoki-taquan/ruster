@@ -690,6 +690,10 @@ const DHCP_MAX: usize = 32;
 /// 32-bit lease time option (RFC 2132 section 9.2) hold.
 const DHCP_LEASE_MAX: u32 = 364 * 24 * 3_600;
 
+/// The highest DHCP punt rate (packets a second) and burst: far above what a LAN
+/// needs, and still a limit.
+const DHCP_PUNT_MAX: u32 = 100_000;
+
 /// Checks one `dhcp`: it serves a port or VLAN of the default VRF from the
 /// interface's IPv4 address and subnet, and leases a pool in the subnet.
 fn dhcp_entry(
@@ -756,6 +760,13 @@ fn dhcp_entry(
     if !(60..=DHCP_LEASE_MAX).contains(&entry.lease_time) {
         return Err(format!(
             "{at}: lease-time must be 60 to {DHCP_LEASE_MAX} seconds"
+        ));
+    }
+    if !(1..=DHCP_PUNT_MAX).contains(&entry.punt_rate)
+        || !(1..=DHCP_PUNT_MAX).contains(&entry.punt_burst)
+    {
+        return Err(format!(
+            "{at}: punt-rate and punt-burst must be 1 to {DHCP_PUNT_MAX}"
         ));
     }
     for (what, list) in [("router", &entry.router), ("dns", &entry.dns)] {
