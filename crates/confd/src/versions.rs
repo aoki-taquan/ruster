@@ -32,12 +32,27 @@
 //! then starts again from 1).
 //!
 //! An update of ruster can change the lock form, so the latest version's lock form
-//! may not read. Then, if the version has a `ruster.toml` text, confd resolves it
-//! again with this ruster's defaults and keeps the result as a new version. If
-//! neither reads, confd does not start, rather than run an older configuration. An
-//! older version that does not read is left out with a line in the log. If the start-up
-//! file cannot be kept (a full disk, a directory confd cannot write), confd does not
-//! start either.
+//! may not read. `ruster_config::VERSION` changes when an older lock form no longer
+//! reads, and a test in ruster-config fails when the lock form changes without it.
+//! At start-up confd tries, in order:
+//!
+//! 1. The latest version's lock form.
+//! 2. Its `ruster.toml` text, if it has one, resolved again with this ruster's
+//!    defaults. The result is kept as a new version (and still waits for
+//!    `ruster confirm` if the latest did).
+//! 3. The newest older version that reads in either way. It is kept as a new version,
+//!    a wait for `ruster confirm` is dropped, and confd writes a warning to the log:
+//!    the router keeps running, on an older configuration, rather than not start.
+//!
+//! Step 3 can go back far: older versions kept only as a lock form usually do not read
+//! either, so it is often the newest one with a `ruster.toml`. The warning is written
+//! once; the version list shows how the new version came. Going back to the earlier
+//! ruster then starts with the version kept in step 3, not the one that did not read
+//! (`ruster rollback` reaches it).
+//!
+//! If none reads, confd does not start. A version file that does not read at all is
+//! left out with a line in the log. If the start-up file cannot be kept (a full disk, a
+//! directory confd cannot write), confd does not start either.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -280,44 +295,82 @@ impl Versions {
         Ok(number)
     }
 
-    /// The configuration confd starts with, and where it came from: the latest
-    /// version, or else the file at `path`, which is then kept as version 1.
-    pub fn starting_config(&mut self, path: &str) -> Result<(Config, String), String> {
-        if let Some(latest) = self.latest() {
-            let number = latest.number;
-            let at = format!("version {number}");
-            let lock_error = match file::parse(&latest.lock) {
-                Ok(config) => return Ok((config, at)),
-                Err(error) => error,
-            };
-            // After an update the lock form may have changed; a ruster.toml is
-            // resolved again with this ruster's defaults.
-            let Some(toml) = latest.toml.clone() else {
-                return Err(format!("{at}: {lock_error}"));
-            };
-            let candidate = file::candidate(&toml).map_err(|e| {
-                format!("{at}: {lock_error}; its ruster.toml does not read either: {e}")
-            })?;
-            let how = format!("ruster.toml of version {number} resolved again at start-up");
-            // The deadline moves to the new version first: it is the same
-            // configuration, still waiting for `ruster confirm`.
-            if let Some(waiting) = self.waiting.filter(|w| w.version == number) {
-                self.set_waiting(Some(Waiting {
-                    version: number + 1,
-                    ..waiting
-                }))?;
+    /// The configuration confd starts with: the latest version, or else the file at
+    /// `path`, which is then kept as version 1. When the latest version does not read
+    /// (see the module documentation), the newest older one that does is used.
+    pub fn starting_config(&mut self, path: &str) -> Result<Start, String> {
+        let Some(latest) = self.latest() else {
+            let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            let candidate = file::candidate(&text).map_err(|e| format!("{path}: {e}"))?;
+            self.commit(
+                &format!("start-up file {path}"),
+                &candidate.lock,
+                candidate.toml.as_deref(),
+            )?;
+            return Ok(Start {
+                config: candidate.config,
+                from: path.to_owned(),
+                warning: None,
+            });
+        };
+        let number = latest.number;
+        let latest_error = match read(latest) {
+            Ok((config, None)) => {
+                return Ok(Start {
+                    config,
+                    from: format!("version {number}"),
+                    warning: None,
+                })
             }
-            let new = self.commit(&how, &candidate.lock, Some(&toml))?;
-            return Ok((candidate.config, format!("version {new} ({how})")));
-        }
-        let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-        let candidate = file::candidate(&text).map_err(|e| format!("{path}: {e}"))?;
-        self.commit(
-            &format!("start-up file {path}"),
-            &candidate.lock,
-            candidate.toml.as_deref(),
-        )?;
-        Ok((candidate.config, path.to_owned()))
+            Ok((config, Some(candidate))) => {
+                let how = format!("ruster.toml of version {number} resolved again at start-up");
+                // The deadline moves to the new version first: it is the same
+                // configuration, still waiting for `ruster confirm`.
+                if let Some(waiting) = self.waiting.filter(|w| w.version == number) {
+                    self.set_waiting(Some(Waiting {
+                        version: number + 1,
+                        ..waiting
+                    }))?;
+                }
+                let new = self.commit(&how, &candidate.lock, candidate.toml.as_deref())?;
+                return Ok(Start {
+                    config,
+                    from: format!("version {new} ({how})"),
+                    warning: None,
+                });
+            }
+            Err(error) => format!("version {number}: {error}"),
+        };
+        // The newest older version that reads, so that a router keeps running after an
+        // update; the person is told loudly to check it.
+        let older = self.list.iter().rev().skip(1).find_map(|version| {
+            read(version)
+                .ok()
+                .map(|(config, candidate)| (version.clone(), config, candidate))
+        });
+        let Some((older, config, candidate)) = older else {
+            return Err(latest_error);
+        };
+        let how = format!(
+            "version {} again at start-up: version {number} does not read",
+            older.number
+        );
+        // The version that waited for `ruster confirm` is not the one running.
+        self.set_waiting(None)?;
+        let (lock, toml) = match &candidate {
+            Some(candidate) => (candidate.lock.as_str(), candidate.toml.as_deref()),
+            None => (older.lock.as_str(), older.toml.as_deref()),
+        };
+        let new = self.commit(&how, lock, toml)?;
+        Ok(Start {
+            config,
+            from: format!("version {new} ({how})"),
+            warning: Some(format!(
+                "{latest_error}; started with version {} instead (kept as version {new}). \
+                 Check the configuration and apply it again",
+                older.number
+            )),
+        })
     }
 
     /// One line per version, newest first: number, time (UTC) and how it came.
@@ -341,6 +394,34 @@ impl Versions {
             );
         }
         out
+    }
+}
+
+/// What [`Versions::starting_config`] found.
+#[derive(Debug)]
+pub struct Start {
+    pub config: Config,
+    /// Where the configuration came from, for the log.
+    pub from: String,
+    /// Set when the latest version did not read and an older one is used.
+    pub warning: Option<String>,
+}
+
+/// Reads a kept version: its lock form, or else its `ruster.toml` resolved again with
+/// this ruster's defaults (then with the new lock form).
+fn read(version: &Version) -> Result<(Config, Option<file::Candidate>), String> {
+    let lock_error = match file::parse(&version.lock) {
+        Ok(config) => return Ok((config, None)),
+        Err(error) => error,
+    };
+    let Some(toml) = &version.toml else {
+        return Err(lock_error);
+    };
+    match file::candidate(toml) {
+        Ok(candidate) => Ok((candidate.config.clone(), Some(candidate))),
+        Err(error) => Err(format!(
+            "{lock_error}; its ruster.toml does not read either: {error}"
+        )),
     }
 }
 

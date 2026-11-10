@@ -1,0 +1,211 @@
+# A lock form with every key, every list given at least one item, and every kind of
+# interface and route target. tests/lock.rs reads it to check the lock form's shape
+# against ruster_config::LOCK_SHAPE. It is not a configuration that makes sense.
+version = 1
+firewall-filtering = "endpoint-independent"
+firewall-outside = ["wan"]
+
+[icmp-errors]
+ipv4-interval-ms = 100
+ipv6-burst = 10
+ipv6-interval-ms = 10
+
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+mtu = 1500
+enabled = true
+vrf = "default"
+ipv4 = ["192.0.2.1/24"]
+ipv4-from = ["dhcp-wan"]
+ipv6 = ["2001:db8:1::1/64"]
+ipv6-from = [{ source = "dhcp6-wan", subnet = 1 }]
+kind = "port"
+
+[[interface]]
+name = "lan.10"
+mac = "02:00:00:00:00:01"
+mtu = 1496
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { vlan = { parent = "lan", id = 10 } }
+
+[[interface]]
+name = "tun"
+mac = "02:00:00:00:00:03"
+mtu = 1460
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { tunnel = { local = "2001:db8::1", remote = "2001:db8::2" } }
+
+[[interface]]
+name = "ppp"
+mac = "02:00:00:00:00:04"
+mtu = 1492
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { pppoe = { parent = "lan", source = "pppoe-wan" } }
+
+[[map-e]]
+interface = "map-e"
+inside = "lan"
+prefix = ["2001:db8:12:3400::/56"]
+prefix-from = ["dhcp6-wan"]
+rule-ipv6 = "2001:db8::/32"
+rule-ipv4 = "198.51.100.0/24"
+ea-length = 16
+psid-offset = 6
+br = "2001:db8:ffff::1"
+mtu = 1460
+mac = "02:00:00:00:00:fe"
+ports = "1024-32767"
+filtering = "endpoint-independent"
+ipv4-id-rate-limit = true
+ports-per-host = 0
+state-per-host = 0
+
+[[nat]]
+inside = "lan.10"
+outside = "lan"
+ports = "1024-32767"
+external = ["198.51.100.2"]
+filtering = "endpoint-independent"
+ipv4-id-rate-limit = true
+ports-per-host = 0
+state-per-host = 0
+
+[[route]]
+vrf = "default"
+prefix = "10.0.0.0/8"
+target = "discard"
+
+[[route]]
+vrf = "default"
+prefix = "10.1.0.0/16"
+target = "reject"
+
+[[route]]
+vrf = "default"
+prefix = "10.2.0.0/16"
+target = { lookup-vrf = "red" }
+
+[[route]]
+vrf = "default"
+prefix = "0.0.0.0/0"
+target = { forward = { interface = "lan", via = ["192.0.2.254"] } }
+
+[[firewall]]
+action = "accept"
+protocol = "udp"
+ingress = ["lan"]
+egress = ["wan"]
+source = ["192.0.2.0/24"]
+destination = ["198.51.100.0/24"]
+source-ports = ["1024-65535"]
+destination-ports = ["53"]
+
+[[dns]]
+listen = ["192.0.2.1"]
+allow = ["192.0.2.0/24"]
+upstream = ["192.0.2.53"]
+upstream-from = ["dhcp-wan"]
+
+[[dhcp]]
+interface = "lan"
+mac = "02:00:00:00:00:01"
+address = "192.0.2.1/24"
+pool = "192.0.2.100-192.0.2.199"
+lease-time = 3600
+router = ["192.0.2.1"]
+dns = ["192.0.2.1"]
+punt-rate = 200
+punt-burst = 100
+
+[[dhcp6]]
+interface = "lan"
+mac = "02:00:00:00:00:01"
+link-local = "fe80::ff:fe00:1"
+address = "2001:db8:1::1/64"
+pool = "2001:db8:1::1000-2001:db8:1::1fff"
+preferred-lifetime = 3600
+valid-lifetime = 7200
+dns = ["2001:db8:1::1"]
+punt-rate = 200
+punt-burst = 100
+
+[[ra]]
+interface = "lan"
+min-interval = 198
+max-interval = 600
+router-lifetime = 1800
+hop-limit = 64
+managed = false
+other = false
+mtu = [1500]
+reachable-time = 0
+retrans-timer = 0
+dns = ["2001:db8:1::1"]
+dns-lifetime = 1800
+prefix-from = ["dhcp6-wan"]
+
+[[ra.prefix]]
+prefix = "2001:db8:1::/64"
+on-link = true
+autonomous = true
+valid-lifetime = 2592000
+preferred-lifetime = 604800
+
+[[source]]
+name = "pppoe-wan"
+kind = "pppoe"
+sync-wait = 10
+
+[[pppoe]]
+source = "pppoe-wan"
+interface = "ppp"
+vrf = "default"
+parent = "lan"
+mac = "02:00:00:00:00:04"
+user = "user@isp.example"
+password = "secret"
+service = ""
+ac-name = ["ac"]
+ipv6 = true
+echo-interval = 10
+echo-failures = 3
+default-route = false
+
+[[dhcp-client]]
+interface = "wan"
+vrf = "default"
+mac = "02:00:00:00:00:02"
+link-local = "fe80::ff:fe00:2"
+ipv4-source = ["dhcp-wan"]
+ipv6-source = ["dhcp6-wan"]
+ipv6-address = false
+default-route = true
+punt-rate = 20
+punt-burst = 20
+
+[[bgp]]
+as = 65001
+router-id = "198.51.100.1"
+networks = ["203.0.113.0/24"]
+include = ["/etc/ruster/frr.conf"]
+
+[[bgp.neighbor]]
+address = "198.51.100.10"
+remote-as = 65002
+description = ["upstream"]

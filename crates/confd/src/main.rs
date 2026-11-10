@@ -74,7 +74,11 @@ fn run() -> Result<(), String> {
         Some(dir) => Versions::open(Path::new(dir))?,
         None => Versions::in_memory(),
     };
-    let (config, from) = versions.starting_config(path)?;
+    let start = versions.starting_config(path)?;
+    if let Some(warning) = &start.warning {
+        eprintln!("ruster-confd: WARNING: {warning}");
+    }
+    let (config, from) = (start.config, start.from);
     // Sets up the kernel side before a configuration is sent; the errors are also
     // reported to `ruster apply`.
     let mut prepare = |config: &Config| -> Vec<String> {
