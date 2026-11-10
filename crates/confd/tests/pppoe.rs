@@ -6,7 +6,7 @@ use std::os::unix::net::UnixStream;
 use ruster_confd::{file, Confd};
 use ruster_proto::session::{Client, Hook, Server, Store};
 use ruster_proto::sid;
-use ruster_proto::table::{Change, Key, Pppoe, Value};
+use ruster_proto::table::{Change, Key, Pppoe, PuntDestination, PuntKind, PuntMatch, Value};
 use ruster_proto::task::Task;
 
 struct Accept;
@@ -255,4 +255,86 @@ fn an_address_that_clashes_with_the_configuration_is_not_used() {
         })
         .is_none());
     assert_eq!(rig.confd.with_values().interfaces[2].ipv4, None);
+}
+
+const CLIENT: &str = r#"
+[[pppoe]]
+source = "pppoe-wan"
+user = "user@isp"
+password = "secret"
+ac-name = "isp-ac"
+default-route = true
+"#;
+
+#[test]
+fn the_client_s_part_spells_out_where_the_session_runs() {
+    let lock = ruster_config::resolve(&format!("{CONFIG}{CLIENT}")).unwrap();
+    let [client] = &lock.pppoe[..] else {
+        panic!("{:?}", lock.pppoe)
+    };
+    assert_eq!(
+        (
+            client.interface.as_str(),
+            client.vrf.as_str(),
+            client.parent.as_str(),
+            client.mac.as_str()
+        ),
+        ("ppp", "default", "wan", "02:00:00:00:00:02")
+    );
+    assert_eq!(client.ac_name, ["isp-ac"]);
+    assert!(client.ipv6 && client.default_route && client.service.is_empty());
+    assert_eq!((client.echo_interval, client.echo_failures), (10, 3));
+    let part = ruster_config::pppoe_part(&lock.pppoe);
+    assert_eq!(ruster_config::parse_pppoe_part(&part).unwrap(), lock.pppoe);
+    // The lock form is checked against the interfaces.
+    let config = file::config(lock.clone()).unwrap();
+    assert_eq!(config.pppoe, lock.pppoe);
+    let mut wrong = lock.clone();
+    wrong.pppoe[0].parent = "lan".into();
+    assert!(file::config(wrong)
+        .unwrap_err()
+        .contains("must be those of"));
+    let mut wrong = lock.clone();
+    wrong.pppoe[0].user = "u".repeat(256);
+    assert!(file::config(wrong).unwrap_err().contains("longer than 255"));
+    let none = format!(
+        "{CONFIG}{}",
+        CLIENT.replace("source = \"pppoe-wan\"", "source = \"x\"")
+    );
+    assert!(ruster_config::resolve(&none)
+        .unwrap_err()
+        .contains("no PPPoE interface"));
+}
+
+#[test]
+fn the_parent_s_pppoe_frames_go_to_pppoed() {
+    let mut confd = Confd::new(file::parse(&format!("{CONFIG}{CLIENT}")).unwrap());
+    let mut fe = Server::new();
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(
+        a,
+        &[sid::INTERFACE, sid::ADDRESS, sid::ICMP_ERRORS, sid::PUNT],
+    )
+    .unwrap();
+    confd.connect_fe(b).unwrap();
+    for _ in 0..50 {
+        fe.step(&mut Accept);
+        confd.step(0);
+    }
+    for (class, kind) in [
+        ("pppoe-discovery-wan", PuntKind::PppoeDiscovery),
+        ("ppp-control-wan", PuntKind::PppControl),
+    ] {
+        let Some(Value::Punt(punt)) = fe.store().get(&Key::Punt {
+            class: class.into(),
+        }) else {
+            panic!("no {class}");
+        };
+        assert_eq!(punt.matches, PuntMatch::Kind(kind));
+        assert_eq!(punt.interface.as_deref(), Some("wan"));
+        assert_eq!(punt.destination, PuntDestination::Control("pppoed".into()));
+    }
+    // Without a client, nothing goes to pppoed.
+    let tables = Confd::new(file::parse(CONFIG).unwrap());
+    assert!(tables.config().pppoe.is_empty());
 }

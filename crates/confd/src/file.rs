@@ -673,6 +673,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         dhcp.push(entry);
     }
     let ra = crate::ra::check(lock.ra, &interfaces)?;
+    let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
     Ok(Config {
         interfaces,
         static_routes,
@@ -685,6 +686,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         dhcp,
         ra,
         sources,
+        pppoe,
     })
 }
 

@@ -163,6 +163,20 @@
 //!                              # listens on, else none
 //! dns-lifetime = 1800          # 3 times max-interval
 //!
+//! [[pppoe]]                    # optional: a PPPoE client (ruster-pppoed) for one
+//!                              # source, so for the interface that names it
+//! source = "pppoe-wan"
+//! user = "user@isp.example"
+//! password = "secret"
+//! service = ""                 # optional: the service name; empty for any
+//! ac-name = "ac1"              # optional: take offers only from this AC
+//! ipv6 = true                  # optional, true: run IPv6CP too
+//! echo-interval = 10           # optional, 10: seconds between LCP Echo-Requests;
+//!                              # 0 for none
+//! echo-failures = 3            # optional, 3: unanswered ones that end the session
+//! default-route = false        # optional, false: the IPv4 default route out of
+//!                              # the session, to ribd as source pppoed
+//!
 //! [[source]]                   # optional: a daemon that sends confd values found
 //!                              # at run time, on confd/source/<name>.sock
 //! name = "pppoe-wan"           # lower-case letters, digits and -, from a letter
@@ -295,6 +309,21 @@
 //! name = "pppoe-wan"
 //! kind = "pppoe"
 //! sync-wait = 10
+//!
+//! [[pppoe]]
+//! source = "pppoe-wan"
+//! interface = "ppp"            # the session interface that names the source
+//! vrf = "default"              # its VRF
+//! parent = "lan"               # where the session runs
+//! mac = "02:00:00:00:00:01"    # the session interface's MAC address
+//! user = "user@isp.example"
+//! password = "secret"
+//! service = ""
+//! ac-name = []
+//! ipv6 = true
+//! echo-interval = 10
+//! echo-failures = 3
+//! default-route = false
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
@@ -362,6 +391,12 @@ pub const DHCP_LEASE_TIME: u32 = 3_600;
 /// hundred starting together, and keeps a flood from one interface off the others'.
 pub const DHCP_PUNT_RATE: u32 = 200;
 pub const DHCP_PUNT_BURST: u32 = 100;
+
+/// What a PPPoE client does when not told: run IPv6CP, an LCP Echo-Request every
+/// 10 s, 3 unanswered end the session.
+pub const PPPOE_ECHO_INTERVAL: u32 = 10;
+pub const PPPOE_ECHO_FAILURES: u32 = 3;
+
 /// The kinds of source, and how long confd waits after it starts for each to send
 /// everything again, in seconds: a daemon in the same box connects again within a
 /// second or two.
@@ -395,6 +430,34 @@ pub struct Lock {
     /// One per interface.
     pub ra: Vec<Ra>,
     pub source: Vec<Source>,
+    /// One per source of kind pppoe at most.
+    pub pppoe: Vec<Pppoe>,
+}
+
+/// A PPPoE client (`ruster-pppoed`): the session it sets up for a source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Pppoe {
+    /// The source it writes the session to.
+    pub source: String,
+    /// The session interface, which names the source.
+    pub interface: String,
+    pub vrf: String,
+    /// The port or VLAN the session runs on.
+    pub parent: String,
+    /// The session interface's MAC address.
+    pub mac: String,
+    pub user: String,
+    pub password: String,
+    pub service: String,
+    /// None or one.
+    pub ac_name: Vec<String>,
+    pub ipv6: bool,
+    /// Seconds; 0 for none.
+    pub echo_interval: u32,
+    pub echo_failures: u32,
+    /// Whether to send ribd the IPv4 default route out of the session.
+    pub default_route: bool,
 }
 
 /// A daemon that sends confd values found at run time.
@@ -679,4 +742,28 @@ pub fn parse_dhcp_part(text: &str) -> Result<Vec<Dhcp>, String> {
     check_version(text)?;
     let part: DhcpPart = toml::from_str(text).map_err(|e| e.to_string())?;
     Ok(part.dhcp)
+}
+
+/// The part of the lock form that the PPPoE client takes: the version and `pppoe`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PppoePart {
+    version: u32,
+    pppoe: Vec<Pppoe>,
+}
+
+/// The PPPoE client's part of the lock form as TOML text: `version = 1` and `pppoe`.
+pub fn pppoe_part(pppoe: &[Pppoe]) -> String {
+    let part = PppoePart {
+        version: VERSION,
+        pppoe: pppoe.to_vec(),
+    };
+    toml::to_string(&part).expect("the lock form is plain TOML")
+}
+
+/// Reads the PPPoE client's part of the lock form ([`pppoe_part`]).
+pub fn parse_pppoe_part(text: &str) -> Result<Vec<Pppoe>, String> {
+    check_version(text)?;
+    let part: PppoePart = toml::from_str(text).map_err(|e| e.to_string())?;
+    Ok(part.pppoe)
 }

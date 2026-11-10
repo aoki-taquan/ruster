@@ -75,6 +75,7 @@ fn config() -> Config {
         dhcp: Vec::new(),
         ra: Vec::new(),
         sources: Vec::new(),
+        pppoe: Vec::new(),
     }
 }
 

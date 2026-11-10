@@ -8,10 +8,10 @@ use serde::Deserialize;
 use ruster_proto::table::DEFAULT_VRF;
 
 use crate::{
-    Dhcp, Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Source,
-    Target, B4_ADDRESS, DHCP_LEASE_TIME, DHCP_PUNT_BURST, DHCP_PUNT_RATE, FILTERING, ICMP_ERRORS,
-    MTU, NAT_PORTS, PPPOE_OVERHEAD, PSID_OFFSET, SOURCE_KINDS, TUNNEL_MAC, TUNNEL_MTU, VERSION,
-    VLAN_OVERHEAD,
+    Dhcp, Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Pppoe, Route,
+    Source, Target, B4_ADDRESS, DHCP_LEASE_TIME, DHCP_PUNT_BURST, DHCP_PUNT_RATE, FILTERING,
+    ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_ECHO_FAILURES, PPPOE_ECHO_INTERVAL, PPPOE_OVERHEAD,
+    PSID_OFFSET, SOURCE_KINDS, TUNNEL_MAC, TUNNEL_MTU, VERSION, VLAN_OVERHEAD,
 };
 
 #[derive(Deserialize)]
@@ -35,6 +35,22 @@ struct File {
     ra: Vec<crate::ra::RaEntry>,
     #[serde(default)]
     source: Vec<SourceEntry>,
+    #[serde(default)]
+    pppoe: Vec<PppoeClientEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct PppoeClientEntry {
+    source: String,
+    user: String,
+    password: String,
+    service: Option<String>,
+    ac_name: Option<String>,
+    ipv6: Option<bool>,
+    echo_interval: Option<u32>,
+    echo_failures: Option<u32>,
+    default_route: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -380,6 +396,11 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
             })
         })
         .collect::<Result<_, String>>()?;
+    let pppoe = file
+        .pppoe
+        .into_iter()
+        .map(|entry| pppoe(entry, &interfaces))
+        .collect::<Result<_, _>>()?;
     Ok(Lock {
         version: VERSION,
         firewall_filtering: filtering(file.firewall_filtering),
@@ -397,6 +418,35 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         dhcp,
         ra,
         source,
+        pppoe,
+    })
+}
+
+/// `[[pppoe]]`: where the session of its source runs, from the interface that
+/// names the source.
+fn pppoe(entry: PppoeClientEntry, interfaces: &[Interface]) -> Result<Pppoe, String> {
+    let at = format!("pppoe {:?}", entry.source);
+    let (interface, parent) = interfaces
+        .iter()
+        .find_map(|i| match &i.kind {
+            Kind::Pppoe { parent, source } if *source == entry.source => Some((i, parent)),
+            _ => None,
+        })
+        .ok_or_else(|| format!("{at}: no PPPoE interface names this source"))?;
+    Ok(Pppoe {
+        source: entry.source,
+        interface: interface.name.clone(),
+        vrf: interface.vrf.clone(),
+        parent: parent.clone(),
+        mac: interface.mac.clone(),
+        user: entry.user,
+        password: entry.password,
+        service: entry.service.unwrap_or_default(),
+        ac_name: entry.ac_name.into_iter().collect(),
+        ipv6: entry.ipv6.unwrap_or(true),
+        echo_interval: entry.echo_interval.unwrap_or(PPPOE_ECHO_INTERVAL),
+        echo_failures: entry.echo_failures.unwrap_or(PPPOE_ECHO_FAILURES),
+        default_route: entry.default_route.unwrap_or(false),
     })
 }
 
