@@ -79,6 +79,8 @@ pub(crate) struct Built {
     /// address tables (bridge index, address, member).
     pub(crate) bridges: Vec<(String, ruster_core::BridgeConfig)>,
     pub(crate) bridge_statics: Vec<(u16, [u8; 6], IfId)>,
+    /// The router's SRv6 SIDs and SR policies.
+    pub(crate) srv6: ruster_core::Srv6Table,
 }
 
 /// NAPT from `inside` to `outside`, with `public` and `ports`.
@@ -596,8 +598,15 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         }
     }
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
-    for (key, _) in store.iter() {
+    for (key, value) in store.iter() {
         if let Key::Route { vrf, .. } = key {
+            names.insert(vrf.as_str());
+        }
+        // The VRF of an End.DT4 or End.DT6 SID, even with nothing else in it.
+        if let Value::Route(RouteAction::Srv6Local(
+            table::Srv6Local::EndDt4 { vrf } | table::Srv6Local::EndDt6 { vrf },
+        )) = value
+        {
             names.insert(vrf.as_str());
         }
     }
@@ -626,6 +635,10 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     let mut unreachable6 = Vec::new();
     let mut bindings: Vec<Vec<LocalIpv4Binding>> = vec![Vec::new(); order.len()];
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
+    let mut sids = Vec::new();
+    let mut policies = Vec::new();
+    // Each SR policy's interface and the index of its VRF.
+    let mut policy_vrfs: Vec<(IfId, usize)> = Vec::new();
     let mut firewall = Vec::new();
     let mut firewall_on = false;
     let mut firewall_filtering = table::NatFiltering::default();
@@ -686,6 +699,38 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                         next_hop: None,
                     }),
                     RouteAction::Local => continue,
+                    RouteAction::Srv6Local(local) => {
+                        if let Some(sid) = srv6_sid(*prefix, *len, local, &active, index_of)? {
+                            sids.push(sid);
+                        }
+                        continue;
+                    }
+                    RouteAction::Srv6Encap(encap) => {
+                        // An interface of the FE's own for the policy: the route
+                        // leaves through it, and core wraps what it sends.
+                        let id = ids.take(&format!("srv6 {vrf} {prefix}/{len}"))?;
+                        interfaces.push(Interface {
+                            id,
+                            mac: MacAddress([0x02, 0x73, 0x72, 0x76, 0x36, 0x00]),
+                            mtu: u16::MAX,
+                        });
+                        policy_vrfs.push((id, index_of(vrf).expect("every route VRF is listed")));
+                        policies.push(
+                            ruster_core::Srv6Policy::new(
+                                id,
+                                encap.source.octets(),
+                                encap.segments.iter().map(|s| s.octets()).collect(),
+                                encap.reduced,
+                            )
+                            .map_err(|e| format!("route {vrf} {prefix}/{len}: {e:?}"))?,
+                        );
+                        Entry::Forward(Forward {
+                            prefix: *prefix,
+                            len: *len,
+                            egress: id,
+                            next_hop: None,
+                        })
+                    }
                     RouteAction::Gateways(_) => {
                         return Err(format!(
                             "route {vrf} {prefix}/{len}: next hops without an interface (ribd resolves them)"
@@ -829,14 +874,22 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     for (at, id) in kernel.iter().enumerate() {
         by_ingress[usize::from(id.0)] = u16::try_from(at).unwrap_or(0);
     }
+    // A policy's interface counts as its VRF's (for the firewall).
+    for &(id, at) in &policy_vrfs {
+        by_ingress[usize::from(id.0)] = u16::try_from(at).unwrap_or(0);
+    }
     let enabled = interfaces
         .iter()
         .map(|i| i.id)
-        .filter(|id| !kernel.contains(id))
+        .filter(|id| !kernel.contains(id) && policy_vrfs.iter().all(|&(p, _)| p != *id))
         .collect();
+    let srv6 = ruster_core::Srv6Table::new(sids)
+        .and_then(|table| table.with_policies(policies))
+        .map_err(|error| format!("srv6: {error:?}"))?;
     let punt =
         crate::punt_table::Classes::build(store, |name| active.get(name).map(|&(id, _)| id))?;
     Ok(Built {
+        srv6,
         bridges,
         bridge_statics,
         punt,
@@ -884,6 +937,42 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         },
         nat,
     })
+}
+
+/// Core's SID for an SRv6 SID route, or `None` when it names an interface that is
+/// missing or disabled.
+fn srv6_sid(
+    prefix: IpAddr,
+    len: u8,
+    local: &table::Srv6Local,
+    active: &BTreeMap<&str, (IfId, &str)>,
+    index_of: impl Fn(&str) -> Option<usize>,
+) -> Result<Option<ruster_core::Srv6Sid>, String> {
+    use ruster_core::Srv6Behaviour;
+    let vrf = |name: &str| {
+        index_of(name)
+            .and_then(|at| u16::try_from(at).ok())
+            .ok_or_else(|| format!("SRv6 SID {prefix}/{len}: VRF {name}"))
+    };
+    let behaviour = match local {
+        table::Srv6Local::End => Srv6Behaviour::End,
+        table::Srv6Local::EndX {
+            interface,
+            next_hop,
+        } => match active.get(interface.as_str()) {
+            Some(&(egress, _)) => Srv6Behaviour::EndX {
+                egress,
+                next_hop: next_hop.octets(),
+            },
+            None => return Ok(None),
+        },
+        table::Srv6Local::EndDt4 { vrf: name } => Srv6Behaviour::EndDt4 { vrf: vrf(name)? },
+        table::Srv6Local::EndDt6 { vrf: name } => Srv6Behaviour::EndDt6 { vrf: vrf(name)? },
+    };
+    let prefix = v6(prefix).ok_or_else(|| format!("SRv6 SID {prefix}/{len}: not IPv6"))?;
+    ruster_core::Srv6Sid::new(prefix, len, behaviour)
+        .map(Some)
+        .map_err(|e| format!("SRv6 SID {len}: {e:?}"))
 }
 
 /// Core's NAPT for the table's entry, or `None` when one of its interfaces is

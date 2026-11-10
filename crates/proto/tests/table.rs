@@ -1581,3 +1581,70 @@ fn vxlan_entries_round_trip_and_are_checked() {
         assert!(bad.validate().is_err(), "{bad:?}");
     }
 }
+
+#[test]
+fn srv6_sids_and_policies_round_trip_and_are_checked() {
+    use ruster_proto::table::{Srv6Encap, Srv6Local};
+    let v6 = |t: &str| t.parse::<std::net::Ipv6Addr>().unwrap();
+    let sid = |action| {
+        Change::set(
+            Key::Route {
+                vrf: DEFAULT_VRF.into(),
+                prefix: ip6("fc00:1::4"),
+                len: 128,
+            },
+            Value::Route(RouteAction::Srv6Local(action)),
+        )
+    };
+    let encap = |segments: Vec<std::net::Ipv6Addr>, reduced| {
+        Change::set(
+            Key::Route {
+                vrf: "red".into(),
+                prefix: ip([10, 2, 0, 0]),
+                len: 16,
+            },
+            Value::Route(RouteAction::Srv6Encap(Srv6Encap {
+                source: v6("2001:db8::1"),
+                segments,
+                reduced,
+            })),
+        )
+    };
+    let good = [
+        sid(Srv6Local::End),
+        sid(Srv6Local::EndX {
+            interface: "wan".into(),
+            next_hop: v6("fe80::1"),
+        }),
+        sid(Srv6Local::EndDt4 { vrf: "red".into() }),
+        sid(Srv6Local::EndDt6 { vrf: "red".into() }),
+        encap(vec![v6("fc00:2::4")], false),
+        encap(vec![v6("fc00:2::1"), v6("fc00:3::4")], true),
+    ];
+    for change in &good {
+        assert!(change.validate().is_ok(), "{change:?}");
+        assert_eq!(&round_trip(change), change);
+    }
+    assert!(entry_line(&good[1].key, good[1].value.as_ref().unwrap())
+        .unwrap()
+        .contains("End.X"));
+    // A SID outside the default VRF, or IPv4.
+    let mut other_vrf = sid(Srv6Local::End);
+    other_vrf.key = Key::Route {
+        vrf: "red".into(),
+        prefix: ip6("fc00:1::4"),
+        len: 128,
+    };
+    assert!(other_vrf.validate().is_err());
+    let mut ipv4 = sid(Srv6Local::End);
+    ipv4.key = Key::Route {
+        vrf: DEFAULT_VRF.into(),
+        prefix: ip([10, 0, 0, 1]),
+        len: 32,
+    };
+    assert!(ipv4.validate().is_err());
+    // No segment, too many, or a multicast one.
+    assert!(encap(vec![], false).validate().is_err());
+    assert!(encap(vec![v6("fc00:2::4"); 9], false).validate().is_err());
+    assert!(encap(vec![v6("ff02::1")], false).validate().is_err());
+}

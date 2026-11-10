@@ -44,6 +44,19 @@ pub const ROUTE_LOCAL: u64 = 60035;
 pub const ROUTE_DISCARD: u64 = 60036;
 pub const ROUTE_REJECT: u64 = 60037;
 pub const ROUTE_LOOKUP_VRF: u64 = 60038;
+/// `ruster-fib`: a route that is one of the router's SRv6 SIDs (RFC 8986 section
+/// 4): its behaviour (`End`, `End.X`, `End.DT4`, `End.DT6`), the VRF of End.DT4
+/// and End.DT6, and the interface and next hop of End.X.
+pub const ROUTE_SRV6_BEHAVIOUR: u64 = 60290;
+pub const ROUTE_SRV6_VRF: u64 = 60291;
+pub const ROUTE_SRV6_INTERFACE: u64 = 60292;
+pub const ROUTE_SRV6_NEXT_HOP: u64 = 60293;
+/// `ruster-fib`: a route whose packets are wrapped by an SR policy (RFC 8986
+/// section 5.1): the outer source, the segments (the first first), and whether the
+/// first is left out of the Segment Routing Header (H.Encaps.Red).
+pub const ROUTE_SRV6_SOURCE: u64 = 60294;
+pub const ROUTE_SRV6_SEGMENTS: u64 = 60295;
+pub const ROUTE_SRV6_REDUCED: u64 = 60296;
 
 pub const NEIGHBOR: u64 = 60040;
 pub const NEIGHBOR_LINK_LAYER_ADDRESS: u64 = 60041;
@@ -238,6 +251,13 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-fib:fib/vrf/route/discard", ROUTE_DISCARD),
     ("/ruster-fib:fib/vrf/route/reject", ROUTE_REJECT),
     ("/ruster-fib:fib/vrf/route/lookup-vrf", ROUTE_LOOKUP_VRF),
+    ("/ruster-fib:fib/vrf/route/srv6-local/behavior", ROUTE_SRV6_BEHAVIOUR),
+    ("/ruster-fib:fib/vrf/route/srv6-local/vrf", ROUTE_SRV6_VRF),
+    ("/ruster-fib:fib/vrf/route/srv6-local/outgoing-interface", ROUTE_SRV6_INTERFACE),
+    ("/ruster-fib:fib/vrf/route/srv6-local/next-hop-address", ROUTE_SRV6_NEXT_HOP),
+    ("/ruster-fib:fib/vrf/route/srv6-encap/source-address", ROUTE_SRV6_SOURCE),
+    ("/ruster-fib:fib/vrf/route/srv6-encap/segment", ROUTE_SRV6_SEGMENTS),
+    ("/ruster-fib:fib/vrf/route/srv6-encap/reduced", ROUTE_SRV6_REDUCED),
     ("/ruster-neighbor:neighbors/neighbor", NEIGHBOR),
     (
         "/ruster-neighbor:neighbors/neighbor/link-layer-address",

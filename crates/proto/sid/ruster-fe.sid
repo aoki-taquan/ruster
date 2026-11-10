@@ -631,6 +631,48 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-local/behavior",
+        "sid": 60290,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-local/vrf",
+        "sid": 60291,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-local/outgoing-interface",
+        "sid": 60292,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-local/next-hop-address",
+        "sid": 60293,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-encap/source-address",
+        "sid": 60294,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-encap/segment",
+        "sid": 60295,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-encap/reduced",
+        "sid": 60296,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"

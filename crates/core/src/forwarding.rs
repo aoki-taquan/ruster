@@ -1891,9 +1891,11 @@ impl<'a> ForwardingSnapshot<'a> {
         Self { overlays, ..self }
     }
 
-    /// Handles the IPv6 packets to the router's SRv6 SIDs in `srv6` (see
-    /// [`crate::Srv6Table`]). The outer snapshot's count: the SIDs are the default
-    /// VRF's.
+    /// Handles the IPv6 packets to the router's SRv6 SIDs in `srv6`, and wraps the
+    /// packets routed to its SR policies' interfaces (see [`crate::Srv6Table`]). The
+    /// outer snapshot's SIDs count (they are the default VRF's). Give the same table
+    /// to the outer snapshot and to every VRF's: a route in a VRF finds the policy
+    /// in its own snapshot, and the outer one wraps the packet.
     #[must_use]
     pub fn with_srv6(self, srv6: &'a crate::Srv6Table) -> Self {
         Self {
