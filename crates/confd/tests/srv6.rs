@@ -144,4 +144,15 @@ fn bad_srv6_settings_are_refused() {
     );
     let error = parse(&text).unwrap_err();
     assert!(error.contains("another route"), "{error}");
+    // A SID a static route has, and a policy for a connected prefix.
+    let text =
+        format!("{INTERFACES}{GOOD}\n[[route]]\nprefix = \"fc00:1::4/128\"\ninterface = \"wan\"\n");
+    let error = parse(&text).unwrap_err();
+    assert!(error.contains("another route"), "{error}");
+    let text = format!(
+        "{INTERFACES}{}",
+        GOOD.replacen("prefix = \"10.2.0.0/16\"", "prefix = \"192.168.0.0/24\"", 1)
+    );
+    let error = parse(&text).unwrap_err();
+    assert!(error.contains("another route"), "{error}");
 }

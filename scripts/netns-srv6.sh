@@ -68,12 +68,14 @@ nsx "$linux" sysctl -qw net.vrf.strict_mode=1
 # End.DT4 checks the inner source in vrf-red, whose way back leaves through wan
 # outside the VRF: the reverse path filter would drop it.
 nsx "$linux" sysctl -qw net.ipv4.conf.all.rp_filter=0 net.ipv4.conf.default.rp_filter=0
+nsx "$linux" sysctl -qw net.ipv4.conf.wan.rp_filter=0 net.ipv4.conf.bside.rp_filter=0
 nsx "$linux" ethtool -K wan tx off >/dev/null 2>&1 || true
 nsx "$linux" ip link set wan up
 nsx "$linux" sysctl -qw net.ipv6.conf.wan.seg6_enabled=1
 nsx "$linux" ip -6 addr add 2001:db8::2/64 dev wan nodad
 nsx "$linux" ip -6 addr add fe80::2/64 dev wan nodad
 nsx "$linux" ip link add vrf-red type vrf table 10
+nsx "$linux" sysctl -qw net.ipv4.conf.vrf-red.rp_filter=0
 nsx "$linux" ip link set vrf-red up
 nsx "$linux" ip link set bside master vrf-red
 nsx "$linux" ip addr add 10.2.0.1/24 dev bside
@@ -173,13 +175,19 @@ done
 (( ok == 1 )) || fail "a does not reach b over SRv6 (IPv6)"
 echo "ok: ruster's two-segment policy through Linux's End to End.DT6, and Linux's encap to ruster's End.DT6"
 
-# Linux's packets to a through ruster's End.X, out to Linux and back, then End.DT4.
+# Linux's packets to a through ruster's End.X, out to Linux and back, then End.DT4:
+# Linux sees ruster send it the packet to fc00:1::4 (End.X's next hop is Linux).
 back4 fc00:1::2,fc00:1::4
+nsx "$linux" timeout 8 tcpdump -n -i wan -c 1 -w "$work/endx.pcap" \
+  'ether src 02:00:00:00:01:02 and ip6 dst fc00:1::4' >/dev/null 2>&1 &
+dump=$!
+sleep 1
 ok=0
 for _ in $(seq 1 10); do
   if pings "$b" 192.168.1.10; then ok=1; break; fi
 done
 (( ok == 1 )) || fail "b does not reach a through ruster's End.X"
+wait "$dump" || fail "ruster's End.X did not send the packet to its next hop"
 echo "ok: a two-segment SRH through ruster's End.X"
 # And through ruster's End, then its End.DT4.
 back4 fc00:1::1,fc00:1::4

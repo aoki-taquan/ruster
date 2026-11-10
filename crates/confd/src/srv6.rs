@@ -51,6 +51,9 @@ pub(crate) fn check(
     interfaces: &[InterfaceConfig],
     static_routes: &[StaticRoute],
 ) -> Result<Srv6, String> {
+    if lock.len() > 1 {
+        return Err("srv6: give it once".to_owned());
+    }
     let Some(srv6) = lock.into_iter().next() else {
         return Ok(Srv6::default());
     };
@@ -78,6 +81,22 @@ pub(crate) fn check(
         .iter()
         .flat_map(|i| i.ipv6.iter().map(|&(a, _)| a))
         .collect();
+    // The prefixes other routes have: a SID or a policy for one would not be offered.
+    let mut taken: BTreeSet<(String, IpAddr, u8)> = static_routes
+        .iter()
+        .map(|r| (r.vrf.clone(), r.prefix, r.len))
+        .collect();
+    for interface in interfaces {
+        let connected = interface
+            .ipv4
+            .map(|(a, len)| (IpAddr::V4(a), len))
+            .into_iter()
+            .chain(interface.ipv6.iter().map(|&(a, len)| (IpAddr::V6(a), len)));
+        for (address, len) in connected {
+            let network = ruster_proto::table::network(address, len);
+            taken.insert((interface.vrf.clone(), network, len));
+        }
+    }
     let mut out = Srv6::default();
     for entry in srv6.sid {
         let at = format!("srv6 sid {:?}", entry.sid);
@@ -134,12 +153,11 @@ pub(crate) fn check(
                 ))
             }
         };
+        if !taken.insert((DEFAULT_VRF.to_owned(), IpAddr::V6(sid), 128)) {
+            return Err(format!("{at}: the default VRF has another route for it"));
+        }
         out.sids.push((sid, local));
     }
-    let mut taken: BTreeSet<(&str, IpAddr, u8)> = static_routes
-        .iter()
-        .map(|r| (r.vrf.as_str(), r.prefix, r.len))
-        .collect();
     for entry in &srv6.policy {
         let at = format!("srv6 policy {:?}", entry.prefix);
         let (prefix, len) = crate::file::prefix(&entry.prefix)
@@ -150,7 +168,7 @@ pub(crate) fn check(
         if !vrfs.contains(entry.vrf.as_str()) {
             return Err(format!("{at}: no interface is in VRF {:?}", entry.vrf));
         }
-        if !taken.insert((entry.vrf.as_str(), prefix, len)) {
+        if !taken.insert((entry.vrf.clone(), prefix, len)) {
             return Err(format!(
                 "{at}: VRF {:?} has another route or policy for it",
                 entry.vrf
