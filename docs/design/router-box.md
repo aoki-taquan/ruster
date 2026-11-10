@@ -117,7 +117,8 @@ CLI → 各プロセス: 確定
 
 ## 確かめ方
 
-netnsの試験に、FRR、Kea、Unboundを実際に動かす構成を足す。CIにはaptで入れる（Ubuntuのパッケージ）。
+netnsの試験に、FRR、Kea、Unboundを実際に動かす構成を足す。今のnetnsの試験と同じくローカルで回し、CIには入れない。
+FRR、Kea、UnboundはUbuntuのパッケージを使う。
 
 - FRR: 隣のnetnsのFRRとBGPを張り、受けた経路でFEが転送する。
 - Kea: LANのホストがDHCPでアドレスを得て、WANへ出られる。DHCPv6も同じ。
