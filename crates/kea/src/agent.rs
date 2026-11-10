@@ -12,7 +12,8 @@
 //!
 //! A DHCPv6 reply goes to the MAC address the client's last message came from:
 //! the agent keeps the last [`CLIENTS_MAX`] clients' addresses and MACs, and a reply
-//! to one it does not know is dropped.
+//! to one it does not know is dropped. A LAN host that sends a message from another
+//! client's address gets the replies to it, as with a forged Neighbor Advertisement.
 //!
 //! # Standards
 //!

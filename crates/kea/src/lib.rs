@@ -120,14 +120,23 @@ impl Bridge {
         for (server, _) in &files {
             before.push(server.read()?);
         }
-        for ((server, text), before) in files.iter().zip(&before) {
-            if before.as_deref() != Some(text.as_str()) {
-                server.write(text)?;
-            }
+        let wrote = files
+            .iter()
+            .zip(&before)
+            .try_for_each(|((server, text), before)| {
+                if before.as_deref() == Some(text.as_str()) {
+                    return Ok(());
+                }
+                server.write(text)
+            });
+        if wrote.is_ok() {
+            written();
         }
-        written();
         // Asked even when a file is the same: Kea may not have read it yet.
-        let reloaded = files.iter().try_for_each(|(server, _)| server.reload());
+        let reloaded =
+            wrote.and_then(|()| files.iter().try_for_each(|(server, _)| server.reload()));
+        // A file that could not be written, or that a Kea refused: every file before
+        // is put back.
         if let Err(error) = reloaded {
             // With no file a Kea could not start: one with no subnets instead.
             let empty = [
