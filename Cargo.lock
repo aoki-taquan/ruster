@@ -151,6 +151,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-pppoed"
+version = "0.2.0"
+
+[[package]]
 name = "ruster-proto"
 version = "0.2.0"
 
@@ -158,15 +162,6 @@ version = "0.2.0"
 name = "ruster-ribd"
 version = "0.2.0"
 dependencies = [
- "ruster-proto",
-]
-
-[[package]]
-name = "ruster-unbound"
-version = "0.2.0"
-dependencies = [
- "ruster-confd",
- "ruster-config",
  "ruster-proto",
 ]
 
