@@ -1,10 +1,14 @@
-//! Attaching to the persistent TUN devices confd creates, one per VRF, through a
-//! minimal private FFI (`ioctl(TUNSETIFF)`).
+//! Attaching to the persistent TUN devices confd creates, one per VRF, and to the
+//! TAP devices of the interfaces that run IS-IS or OSPF, through a minimal private
+//! FFI (`ioctl(TUNSETIFF)`).
 //!
 //! The device of VRF `name` is `rt-<name>`. It carries bare IP packets (`IFF_TUN`
-//! with `IFF_NO_PI`). The FE only attaches to a persistent device (one confd made):
-//! when TUNSETIFF made a new one instead, the FE closes it again, which removes it.
-//! So the kernel's addresses and routes on the device outlive an FE restart.
+//! with `IFF_NO_PI`). The device of interface `name` is `rp-<name>`; it carries
+//! Ethernet frames (`IFF_TAP` with `IFF_NO_PI`). The FE only attaches to a
+//! persistent device (one confd made): when TUNSETIFF made a new one instead, the FE
+//! closes it again, which removes it. So the kernel's addresses and routes on the
+//! device outlive an FE restart. A TAP device's carrier is up only while the FE
+//! has it open.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -20,6 +24,14 @@ pub fn device(vrf: &str) -> Option<String> {
         .then_some(name)
 }
 
+/// The TAP device of interface `interface`, or `None` when the name would be too
+/// long.
+pub fn tap_device(interface: &str) -> Option<String> {
+    let name = format!("rp-{interface}");
+    (name.len() <= NAME_MAX && name.bytes().all(|b| b.is_ascii_graphic() && b != b'/'))
+        .then_some(name)
+}
+
 /// The device's interface index in this network namespace, or `None` when there is
 /// no such device. A device made again gets another index.
 pub fn index(device: &str) -> Option<u32> {
@@ -29,15 +41,16 @@ pub fn index(device: &str) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// Opens `/dev/net/tun`, non-blocking, attached to the existing `device`.
-pub fn open(device: &str) -> io::Result<File> {
+/// Opens `/dev/net/tun`, non-blocking, attached to the existing `device`: a TAP
+/// device with `tap`, else a TUN device.
+pub fn open(device: &str, tap: bool) -> io::Result<File> {
     const O_NONBLOCK: i32 = 0o4000;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
         .custom_flags(O_NONBLOCK)
         .open("/dev/net/tun")?;
-    imp::attach(&file, device)?;
+    imp::attach(&file, device, tap)?;
     Ok(file)
 }
 
@@ -55,6 +68,7 @@ mod imp {
     /// `_IOR('T', 210, unsigned int)`.
     const TUNGETIFF: c_ulong = 0x8004_54d2;
     const IFF_TUN: c_short = 0x0001;
+    const IFF_TAP: c_short = 0x0002;
     const IFF_NO_PI: c_short = 0x1000;
     const IFF_PERSIST: c_short = 0x0800;
 
@@ -73,10 +87,11 @@ mod imp {
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
     }
 
-    pub fn attach(file: &File, device: &str) -> io::Result<()> {
+    pub fn attach(file: &File, device: &str, tap: bool) -> io::Result<()> {
+        let mode = if tap { IFF_TAP } else { IFF_TUN };
         let mut request = IfReq {
             name: [0; 16],
-            flags: IFF_TUN | IFF_NO_PI,
+            flags: mode | IFF_NO_PI,
             _pad: [0; 22],
         };
         let bytes = device.as_bytes();
@@ -109,10 +124,10 @@ mod imp {
         if status < 0 {
             return Err(io::Error::last_os_error());
         }
-        if current.flags & IFF_PERSIST == 0 {
+        if current.flags & IFF_PERSIST == 0 || current.flags & (IFF_TUN | IFF_TAP) != mode {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "not a persistent TUN device made by confd",
+                "not a persistent TUN or TAP device made by confd",
             ));
         }
         Ok(())
@@ -123,7 +138,7 @@ mod imp {
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    pub fn attach(_file: &std::fs::File, _device: &str) -> std::io::Result<()> {
+    pub fn attach(_file: &std::fs::File, _device: &str, _tap: bool) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "TUN needs Linux",
@@ -141,5 +156,7 @@ mod tests {
         assert_eq!(device("red").as_deref(), Some("rt-red"));
         assert_eq!(device("a-very-long-vrf"), None);
         assert_eq!(device("a/b"), None);
+        assert_eq!(tap_device("wan.100").as_deref(), Some("rp-wan.100"));
+        assert_eq!(tap_device("thirteenchars"), None);
     }
 }

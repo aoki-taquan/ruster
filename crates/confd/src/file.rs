@@ -861,16 +861,24 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let ospf = crate::isis_ospf::check_ospf("ospf", lock.ospf, &interfaces, &bridges)?;
     let ospf6 = crate::isis_ospf::check_ospf("ospf6", lock.ospf6, &interfaces, &bridges)?;
     // The FE takes at most this many punt classes besides its own.
+    let routing = crate::isis_ospf::class_count(&Config {
+        isis: isis.clone(),
+        ospf: ospf.clone(),
+        ospf6: ospf6.clone(),
+        ..Config::default()
+    });
     if dhcp.len()
         + dhcp6.len()
         + crate::pppoe::class_count(&pppoe)
         + crate::dhcp_client::class_count(&dhcp_client)
+        + routing
         > PUNT_CLASSES_MAX
     {
         return Err(format!(
-            "dhcp, dhcp6, dhcp-client and the parents of pppoe take more than \
-             {PUNT_CLASSES_MAX} punt classes (one per dhcp, dhcp6 and protocol of a \
-             dhcp-client, two per parent)"
+            "dhcp, dhcp6, dhcp-client, the parents of pppoe and the interfaces of isis \
+             and ospf take more than {PUNT_CLASSES_MAX} punt classes (one per dhcp, dhcp6 \
+             and protocol of a dhcp-client, two per parent, one for isis and one for \
+             ospf and ospf6 per interface)"
         ));
     }
     Ok(Config {

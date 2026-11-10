@@ -23,11 +23,13 @@
 //! addresses, whose TAP stands for them and holds the same addresses. An interface
 //! cost of 10 when none is given, not FRR's from the link's bandwidth.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use ruster_config::{Isis, Ospf, ISIS_LEVELS, OSPF_NETWORKS};
-use ruster_proto::table::DEFAULT_VRF;
+use ruster_proto::table::{
+    Key, PuntClass, PuntDestination, PuntKind, PuntMatch, Value, DEFAULT_VRF,
+};
 
 use crate::bridge::Bridge;
 use crate::InterfaceConfig;
@@ -187,6 +189,73 @@ fn is_net(net: &str) -> bool {
         && area.iter().all(|g| matches!(g.len(), 2 | 4) && hex(g))
         && (1..=13).contains(&area_octets)
 }
+
+/// The interfaces whose TAP device carries IS-IS, OSPF or both, with which: (name,
+/// IS-IS, OSPFv2 or OSPFv3), in the order the configuration names them.
+pub fn tap_interfaces(config: &crate::Config) -> Vec<(String, bool, bool)> {
+    let mut out: Vec<(String, bool, bool)> = Vec::new();
+    let isis = config
+        .isis
+        .iter()
+        .flat_map(|i| &i.interface)
+        .map(|i| (&i.name, true));
+    let ospf = [&config.ospf, &config.ospf6]
+        .into_iter()
+        .flatten()
+        .flat_map(|o| &o.interface)
+        .map(|i| (&i.name, false));
+    for (name, is_isis) in isis.chain(ospf) {
+        let at = match out.iter().position(|(n, ..)| n == name) {
+            Some(at) => at,
+            None => {
+                out.push((name.clone(), false, false));
+                out.len() - 1
+            }
+        };
+        if is_isis {
+            out[at].1 = true;
+        } else {
+            out[at].2 = true;
+        }
+    }
+    out
+}
+
+/// The punt classes that send each interface's IS-IS and OSPF to its TAP device:
+/// `isis-<interface>` and `ospf-<interface>` (OSPFv2 and OSPFv3 together).
+pub(crate) fn punt_classes(config: &crate::Config, out: &mut BTreeMap<Key, Value>) {
+    for (name, isis, ospf) in tap_interfaces(config) {
+        let kinds = [(isis, PuntKind::Isis), (ospf, PuntKind::Ospf)];
+        for (_, kind) in kinds.into_iter().filter(|(on, _)| *on) {
+            out.insert(
+                Key::Punt {
+                    class: format!("{}-{name}", kind.name()),
+                },
+                Value::Punt(PuntClass {
+                    matches: PuntMatch::Kind(kind),
+                    interface: Some(name.clone()),
+                    destination: PuntDestination::Tap,
+                    rate: PUNT_RATE,
+                    burst: PUNT_BURST,
+                }),
+            );
+        }
+    }
+}
+
+/// How many punt classes [`punt_classes`] writes.
+pub(crate) fn class_count(config: &crate::Config) -> usize {
+    tap_interfaces(config)
+        .iter()
+        .map(|(_, isis, ospf)| usize::from(*isis) + usize::from(*ospf))
+        .sum()
+}
+
+/// The rate limit of one interface's IS-IS or OSPF to its TAP: packets per second,
+/// and at once. Room for a full database exchange (link-state PDUs or updates
+/// arriving back to back), while a flood on one interface stays off the others.
+const PUNT_RATE: u32 = 1_000;
+const PUNT_BURST: u32 = 500;
 
 #[cfg(test)]
 mod tests {
