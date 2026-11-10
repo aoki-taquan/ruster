@@ -87,6 +87,7 @@ pub mod writers {
         sid::BRIDGE_PORT,
         sid::BRIDGE_MAC,
         sid::ETHERIP,
+        sid::VXLAN,
     ];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];

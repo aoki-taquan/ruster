@@ -128,6 +128,11 @@ pub enum Key {
     EtherIp {
         interface: String,
     },
+    /// A VXLAN interface (`ruster-if-vxlan`, RFC 7348): the interface of this name
+    /// carries its frames in UDP. It is only a bridge member.
+    Vxlan {
+        interface: String,
+    },
 }
 
 /// The value of one entry.
@@ -232,10 +237,20 @@ pub enum Value {
         local: IpAddr,
         remote: IpAddr,
     },
+    /// VXLAN network `vni` (1 to 16777215) from the router's address `local` to the
+    /// remote VTEPs `remotes` (1 to 64, the same family), routed in the default VRF.
+    Vxlan {
+        vni: u32,
+        local: IpAddr,
+        remotes: Vec<IpAddr>,
+    },
 }
 
 /// The range of a bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3).
 pub const BRIDGE_AGING_RANGE: std::ops::RangeInclusive<u32> = 10..=1_000_000;
+
+/// The largest VXLAN network identifier (24 bits).
+pub const VXLAN_VNI_MAX: u32 = 0x00ff_ffff;
 
 /// The most DNS servers one source sends.
 pub const SOURCE_DNS_MAX: usize = 8;
@@ -576,6 +591,7 @@ impl Key {
             Self::BridgePort { .. } => sid::BRIDGE_PORT,
             Self::BridgeMac { .. } => sid::BRIDGE_MAC,
             Self::EtherIp { .. } => sid::ETHERIP,
+            Self::Vxlan { .. } => sid::VXLAN,
         }
     }
 }
@@ -652,7 +668,9 @@ impl Change {
             | Key::SourceIpv6 { source }
             | Key::SourceDns { source } => name(source)?,
             Key::Bridge { name: n } | Key::BridgeMac { bridge: n, .. } => name(n)?,
-            Key::BridgePort { interface } | Key::EtherIp { interface } => name(interface)?,
+            Key::BridgePort { interface }
+            | Key::EtherIp { interface }
+            | Key::Vxlan { interface } => name(interface)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 parse_prefix(&format!("{prefix}/{len}"))?;
@@ -681,6 +699,7 @@ impl Change {
                         | (Key::BridgePort { .. }, Value::BridgePort { .. })
                         | (Key::BridgeMac { .. }, Value::BridgeMac { .. })
                         | (Key::EtherIp { .. }, Value::EtherIp { .. })
+                        | (Key::Vxlan { .. }, Value::Vxlan { .. })
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -828,6 +847,32 @@ impl Change {
                             || local == remote
                         {
                             return Err(ModelError::Invalid("EtherIP local and remote"));
+                        }
+                    }
+                    Value::Vxlan {
+                        vni,
+                        local,
+                        remotes,
+                    } => {
+                        if !(1..=VXLAN_VNI_MAX).contains(vni) {
+                            return Err(ModelError::Invalid("VNI"));
+                        }
+                        let unicast = |a: &IpAddr| {
+                            !(a.is_unspecified() || a.is_loopback() || a.is_multicast())
+                                && !matches!(a, IpAddr::V4(v4) if v4.is_broadcast())
+                        };
+                        let bad = |(at, a): (usize, &IpAddr)| {
+                            a.is_ipv4() != local.is_ipv4()
+                                || !unicast(a)
+                                || a == local
+                                || remotes[..at].contains(a)
+                        };
+                        if !unicast(local)
+                            || remotes.is_empty()
+                            || remotes.len() as u64 > MEMBER_LIST_MAX
+                            || remotes.iter().enumerate().any(bad)
+                        {
+                            return Err(ModelError::Invalid("VXLAN local and remote VTEPs"));
                         }
                     }
                     Value::SourcePppoe {
@@ -1040,6 +1085,9 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::EtherIp { interface } => {
             e.array(2).u64(sid::ETHERIP).text(interface);
         }
+        Key::Vxlan { interface } => {
+            e.array(2).u64(sid::VXLAN).text(interface);
+        }
         Key::BridgeMac { bridge, mac } => {
             e.array(3)
                 .u64(sid::BRIDGE_MAC)
@@ -1071,7 +1119,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::SOURCE_DNS
         | sid::BRIDGE
         | sid::BRIDGE_PORT
-        | sid::ETHERIP => 2,
+        | sid::ETHERIP
+        | sid::VXLAN => 2,
         sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE | sid::BRIDGE_MAC => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
@@ -1096,6 +1145,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::BRIDGE => Key::Bridge { name: first },
         sid::BRIDGE_PORT => Key::BridgePort { interface: first },
         sid::ETHERIP => Key::EtherIp { interface: first },
+        sid::VXLAN => Key::Vxlan { interface: first },
         sid::BRIDGE_MAC => Key::BridgeMac {
             bridge: first,
             mac: parse_mac(d.text()?)?,
@@ -1405,6 +1455,22 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::BRIDGE_MAC_PORT - sid::BRIDGE_MAC)
                 .text(interface);
         }
+        Value::Vxlan {
+            vni,
+            local,
+            remotes,
+        } => {
+            e.map(3)
+                .u64(sid::VXLAN_VNI - sid::VXLAN)
+                .u64(u64::from(*vni))
+                .u64(sid::VXLAN_LOCAL - sid::VXLAN)
+                .text(&local.to_string())
+                .u64(sid::VXLAN_REMOTE - sid::VXLAN)
+                .array(remotes.len() as u64);
+            for remote in remotes {
+                e.text(&remote.to_string());
+            }
+        }
         Value::EtherIp { local, remote } => {
             e.map(2)
                 .u64(sid::ETHERIP_LOCAL - sid::ETHERIP)
@@ -1467,6 +1533,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::BRIDGE_PORT
             | sid::BRIDGE_MAC
             | sid::ETHERIP
+            | sid::VXLAN
     ) {
         return decode_policy_value(table, d);
     }
@@ -1806,6 +1873,20 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
         (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => {
             format!("etherip {interface} {local} to {remote}")
         }
+        (
+            Key::Vxlan { interface },
+            Value::Vxlan {
+                vni,
+                local,
+                remotes,
+            },
+        ) => {
+            let remotes: Vec<String> = remotes.iter().map(ToString::to_string).collect();
+            format!(
+                "vxlan {interface} vni {vni} {local} to {}",
+                remotes.join(" ")
+            )
+        }
         _ => return None,
     };
     Some(line)
@@ -1940,6 +2021,27 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         Value::EtherIp {
             local: address(sid::ETHERIP_LOCAL, "local")?,
             remote: address(sid::ETHERIP_REMOTE, "remote")?,
+        }
+    } else if table == sid::VXLAN {
+        let local =
+            parse_ip(&text(sid::VXLAN_LOCAL, "local")?.ok_or(ModelError::Missing("local"))?)?;
+        let vni = match got.remove(&sid::VXLAN_VNI) {
+            Some(Member::Uint(n)) => u32::try_from(n).map_err(|_| ModelError::Invalid("VNI"))?,
+            Some(_) => return Err(ModelError::Invalid("VNI")),
+            None => return Err(ModelError::Missing("vni")),
+        };
+        let remotes = match got.remove(&sid::VXLAN_REMOTE) {
+            Some(Member::List(list)) => list
+                .iter()
+                .map(|t| parse_ip(t))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(ModelError::Invalid("remote")),
+            None => return Err(ModelError::Missing("remote")),
+        };
+        Value::Vxlan {
+            vni,
+            local,
+            remotes,
         }
     } else if matches!(
         table,

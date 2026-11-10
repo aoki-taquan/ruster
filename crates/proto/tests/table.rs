@@ -1545,3 +1545,39 @@ fn etherip_entries_round_trip_and_are_checked() {
         assert!(change.validate().is_err(), "{change:?}");
     }
 }
+
+#[test]
+fn vxlan_entries_round_trip_and_are_checked() {
+    let ip = |a: &str| a.parse::<std::net::IpAddr>().unwrap();
+    let entry = |vni: u32, local: &str, remotes: &[&str]| {
+        Change::set(
+            Key::Vxlan {
+                interface: "vx0".into(),
+            },
+            Value::Vxlan {
+                vni,
+                local: ip(local),
+                remotes: remotes.iter().map(|r| ip(r)).collect(),
+            },
+        )
+    };
+    let good = entry(100, "192.0.2.1", &["198.51.100.2", "198.51.100.3"]);
+    assert_eq!(round_trip(&good), good);
+    let v6 = entry(16_777_215, "2001:db8::1", &["2001:db8:1::2"]);
+    assert_eq!(round_trip(&v6), v6);
+    assert_eq!(
+        entry_line(&good.key, good.value.as_ref().unwrap()).unwrap(),
+        "vxlan vx0 vni 100 192.0.2.1 to 198.51.100.2 198.51.100.3"
+    );
+    for bad in [
+        entry(0, "192.0.2.1", &["198.51.100.2"]),
+        entry(16_777_216, "192.0.2.1", &["198.51.100.2"]),
+        entry(100, "192.0.2.1", &[]),
+        entry(100, "192.0.2.1", &["2001:db8::2"]),
+        entry(100, "192.0.2.1", &["192.0.2.1"]),
+        entry(100, "192.0.2.1", &["198.51.100.2", "198.51.100.2"]),
+        entry(100, "192.0.2.1", &["239.1.1.1"]),
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}

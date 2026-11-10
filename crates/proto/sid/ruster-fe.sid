@@ -607,6 +607,30 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-if-vxlan:vxlan",
+        "sid": 60280,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-vxlan:vxlan/vni",
+        "sid": 60281,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-vxlan:vxlan/local",
+        "sid": 60282,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-vxlan:vxlan/remote",
+        "sid": 60283,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"

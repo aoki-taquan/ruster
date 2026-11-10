@@ -157,6 +157,12 @@ pub const BRIDGE_MAC_PORT: u64 = 60261;
 pub const ETHERIP: u64 = 60270;
 pub const ETHERIP_LOCAL: u64 = 60271;
 pub const ETHERIP_REMOTE: u64 = 60272;
+/// `ruster-if-vxlan`: a VXLAN interface (RFC 7348), by interface, its VNI, local
+/// address and remote VTEPs.
+pub const VXLAN: u64 = 60280;
+pub const VXLAN_VNI: u64 = 60281;
+pub const VXLAN_LOCAL: u64 = 60282;
+pub const VXLAN_REMOTE: u64 = 60283;
 
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
@@ -321,6 +327,10 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-if-tunnel:etherip", ETHERIP),
     ("/ruster-if-tunnel:etherip/local", ETHERIP_LOCAL),
     ("/ruster-if-tunnel:etherip/remote", ETHERIP_REMOTE),
+    ("/ruster-if-vxlan:vxlan", VXLAN),
+    ("/ruster-if-vxlan:vxlan/vni", VXLAN_VNI),
+    ("/ruster-if-vxlan:vxlan/local", VXLAN_LOCAL),
+    ("/ruster-if-vxlan:vxlan/remote", VXLAN_REMOTE),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",
