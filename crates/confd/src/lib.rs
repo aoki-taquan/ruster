@@ -27,7 +27,7 @@
 //! with it as the outside (and no `external`) is left out while it has no address.
 //! An interface with `ipv4-from` is always there, with the IPv4 address its source
 //! (a DHCP client) has while it has one; as NAT's outside (with no `external`), NAT
-//! and the routes out of it wait for that address, as for a session.
+//! and the IPv4 routes out of it wait for that address (its IPv6 routes do not).
 
 use std::collections::BTreeMap;
 use std::io;
@@ -813,12 +813,26 @@ impl Confd {
             .as_ref()
             .is_some_and(|nat| nat.outside == interface.name && nat.external.is_none());
         let up = match &interface.pppoe {
-            None if nat_outside && interface.ipv4_from.is_some() => self.ipv4(interface).is_some(),
             None => true,
             Some(_) if nat_outside => self.ipv4(interface).is_some(),
             Some(_) => self.session(interface).is_some(),
         };
         interface.enabled && up && parent.is_none_or(|parent| self.usable(parent))
+    }
+
+    /// Whether `name` is NAT's outside (with no `external`), takes its IPv4 address
+    /// from a DHCP client, and has none now.
+    fn waits_for_address(&self, name: &str) -> bool {
+        let Some(interface) = self.config.interfaces.iter().find(|i| i.name == name) else {
+            return false;
+        };
+        interface.ipv4_from.is_some()
+            && self
+                .config
+                .nat
+                .as_ref()
+                .is_some_and(|nat| nat.outside == name && nat.external.is_none())
+            && self.ipv4(interface).is_none()
     }
 
     /// Connected routes of usable interfaces (enabled, on an enabled parent), then
@@ -859,6 +873,12 @@ impl Confd {
             // offered, so that another source's route for the prefix is chosen.
             if let RouteTarget::Next { interface, .. } = &route.target {
                 if !self.usable(interface) {
+                    continue;
+                }
+                // NAT's outside waits for its leased address before IPv4 leaves
+                // through it, or the LAN's would leave untranslated. IPv6 and the
+                // VLANs on it do not wait.
+                if route.prefix.is_ipv4() && self.waits_for_address(interface) {
                     continue;
                 }
             }

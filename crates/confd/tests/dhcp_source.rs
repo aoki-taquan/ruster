@@ -250,3 +250,50 @@ fn ipv4_from_must_name_a_dhcp_client_source_of_its_own() {
     // The lock form says it.
     assert!(lock.to_text().contains("ipv4-from = [\"dhcp-wan\"]"));
 }
+
+#[test]
+fn only_ipv4_waits_for_the_leased_address() {
+    use ruster_proto::session::{Hook, Server, Store};
+    struct Accept;
+    impl Hook for Accept {
+        fn check(&mut self, _next: &Store) -> Result<(), String> {
+            Ok(())
+        }
+        fn committed(&mut self, _store: &Store) {}
+    }
+    let text = CONFIG.replace(
+        "ipv4-from = \"dhcp-wan\"",
+        "ipv4-from = \"dhcp-wan\"\nipv6 = [\"2001:db8:ff::2/64\"]",
+    ) + "\n[[route]]\nprefix = \"0.0.0.0/0\"\ninterface = \"wan\"\nvia = \"198.51.100.1\"\n\n[[route]]\nprefix = \"::/0\"\ninterface = \"wan\"\nvia = \"fe80::1\"\n";
+    let mut confd = Confd::new(file::parse(&text).unwrap());
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut ribd = Server::new();
+    ribd.attach(a, &[ruster_proto::sid::ROUTE]).unwrap();
+    confd.connect_ribd(b).unwrap();
+    let route = |prefix: IpAddr| Key::Route {
+        vrf: "default".into(),
+        prefix,
+        len: 0,
+    };
+    let v4 = route(Ipv4Addr::UNSPECIFIED.into());
+    let v6 = route(Ipv6Addr::UNSPECIFIED.into());
+    let mut step = |confd: &mut Confd, ribd: &mut Server, now| {
+        for _ in 0..50 {
+            confd.step(now);
+            ribd.step(&mut Accept);
+        }
+    };
+    step(&mut confd, &mut ribd, 0);
+    assert!(ribd.store().get(&v6).is_some());
+    assert!(ribd.store().get(&v4).is_none());
+    let mut source = connect(&mut confd, "dhcp-wan");
+    source
+        .patch(&[ipv4("dhcp-wan", Ipv4Addr::new(198, 51, 100, 20), 24)])
+        .unwrap();
+    for _ in 0..50 {
+        confd.step(1);
+        source.poll();
+        ribd.step(&mut Accept);
+    }
+    assert!(ribd.store().get(&v4).is_some());
+}
