@@ -3,6 +3,7 @@ members = [
     "crates/bench",
     "crates/cli",
     "crates/confd",
+    "crates/config",
     "crates/core",
     "crates/e2e",
     "crates/fe",
