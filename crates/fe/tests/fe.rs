@@ -4300,6 +4300,24 @@ fn punt_classes_for_control_processes_follow_the_rules() {
             1,
             1,
         )],
+        // A name whose socket would be the neighbor process's.
+        vec![punt_class(
+            "x",
+            udp_port(17, None),
+            None,
+            to_control("arp-nd"),
+            1,
+            1,
+        )],
+        // ICMPv6 to link-local multicast is Neighbor Discovery's.
+        vec![punt_class(
+            "x",
+            udp_port(58, None),
+            None,
+            to_control("ruster-x"),
+            1,
+            1,
+        )],
         // Two classes for PPPoE Discovery on the same interface.
         vec![discovery(Some("wan")), {
             let Change { key: _, value } = discovery(None);

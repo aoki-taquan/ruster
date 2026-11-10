@@ -8,7 +8,9 @@
 //!
 //! A control process may send back only the kinds of frame its classes give it:
 //! PPPoE frames for a PPPoE class, IPv4 and IPv6 frames for an IP class. The FE
-//! sends them out of the named interface as they are.
+//! sends them out of the named interface as they are. The check is by Ethernet
+//! type only: the interface, protocol and ports of the classes are not checked, so
+//! a control process is trusted as much as the socket directory is.
 //!
 //! # Standards
 //!

@@ -152,10 +152,24 @@ impl Classes {
                     ));
                 }
             }
-            if entry.destination == PuntDestination::Control(NEIGHBOR_PROCESS.to_owned()) {
-                return Err(format!(
-                    "punt class {name}: only ARP and Neighbor Discovery go to {NEIGHBOR_PROCESS}"
-                ));
+            if let PuntDestination::Control(control) = &entry.destination {
+                // The neighbor process's socket is its own: a name whose socket
+                // would be at the same path is refused too.
+                if control == NEIGHBOR_PROCESS
+                    || ruster_proto::daemon::socket::fe_punt(control)
+                        == ruster_proto::daemon::socket::FE_PUNT
+                {
+                    return Err(format!(
+                        "punt class {name}: only ARP and Neighbor Discovery go to \
+                         {NEIGHBOR_PROCESS}, and {control} names its socket"
+                    ));
+                }
+                // ICMPv6 to link-local multicast is Neighbor Discovery's.
+                if matches!(entry.matches, PuntMatch::Ip { protocol: 58, .. }) {
+                    return Err(format!(
+                        "punt class {name}: ICMPv6 goes to the kernel or {NEIGHBOR_PROCESS}"
+                    ));
+                }
             }
             if let Some(&(other, _)) = entries[..at]
                 .iter()
