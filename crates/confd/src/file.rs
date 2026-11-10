@@ -706,6 +706,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let dhcp6 = crate::dhcp6::check(lock.dhcp6, &interfaces)?;
     let ra = crate::ra::check(lock.ra, &interfaces)?;
     let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
+    let bgp = crate::bgp::check(lock.bgp, &interfaces)?;
     // The FE takes at most this many punt classes besides its own.
     if dhcp.len() + dhcp6.len() + crate::pppoe::class_count(&pppoe) > PUNT_CLASSES_MAX {
         return Err(format!(
@@ -727,6 +728,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         ra,
         sources,
         pppoe,
+        bgp,
     })
 }
 

@@ -39,6 +39,7 @@ struct File {
     source: Vec<SourceEntry>,
     #[serde(default)]
     pppoe: Vec<PppoeClientEntry>,
+    bgp: Option<crate::bgp::BgpEntry>,
 }
 
 #[derive(Deserialize)]
@@ -418,6 +419,10 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .into_iter()
         .map(|entry| pppoe(entry, &interfaces))
         .collect::<Result<_, _>>()?;
+    let bgp = file
+        .bgp
+        .map(|entry| crate::bgp::resolve(entry, &interfaces))
+        .transpose()?;
     Ok(Lock {
         version: VERSION,
         firewall_filtering: filtering(file.firewall_filtering),
@@ -437,6 +442,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         ra,
         source,
         pppoe,
+        bgp: bgp.into_iter().collect(),
     })
 }
 
