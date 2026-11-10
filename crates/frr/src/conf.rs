@@ -4,22 +4,30 @@
 //! (`frr.conf`), in this order:
 //!
 //! 1. zebra's FPM settings: `fpm address 127.0.0.1 port <port>`, where `ruster-frr`
-//!    listens, and `no fpm use-next-hop-groups`, so each route carries its next
+//!    listens (without `port` for FRR's default 2620, as FRR shows it, so a reload
+//!    does not change it and zebra does not connect again), and `no fpm use-next-hop-groups`, so each route carries its next
 //!    hops ([`crate::fpm`]). zebra must be started with `-M dplane_fpm_nl` (in
 //!    `/etc/frr/daemons`).
 //! 2. With `bgp`: the import and export policies, prefix lists and route maps named
 //!    `ruster-*`, and `router bgp` with the router ID, the neighbors, and per address
 //!    family the networks and the neighbors of that family.
 //! 3. The operator's include file, as it is. It comes last, so it may add to what is
-//!    above (more settings in `router bgp`, other route maps for a neighbor) or
-//!    change it; `ruster-frr` does not read it. Logging, passwords and the like go
-//!    there too.
+//!    above (more settings in `router bgp` or for a neighbor, logging, passwords);
+//!    `ruster-frr` does not read it. It should not give again a setting written
+//!    above with another value (a second inbound route map for a neighbor):
+//!    `frr-reload.py` applies differences line by line, and which of the two holds
+//!    after a reload is not certain. A changed include file is read when confd next
+//!    sends the part.
 //!
 //! The policies: every neighbor takes every route (`route-map ruster-in`, which also
 //! prefers an IPv6 next hop's global address to its link-local one, since a
 //! link-local address does not say which FE interface it is on) and is sent only the
-//! configured networks (`route-map ruster-out`), so routes learned from one neighbor
-//! are not passed to another. The networks are announced whether or not FRR has a
+//! configured networks of its family (`route-map ruster-out` for IPv4,
+//! `ruster-out-v6-<n>` for the n-th IPv6 neighbor), so routes learned from one
+//! neighbor are not passed to another. An IPv6 neighbor's map also gives the
+//! link-local address of the FE interface it is on as the next hop's: bgpd would
+//! give the kernel's TUN device's, which no FE port answers for, and it needs one
+//! on the TUN to talk to a neighbor on the link at all. The networks are announced whether or not FRR has a
 //! route for them (`no bgp network import-check`): FRR sees only the kernel's side,
 //! not the routes of the FE.
 //!
@@ -38,8 +46,10 @@
 //! Deviations: none of BGP itself is here; FRR implements it.
 
 use std::fmt::Write as _;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::net::IpAddr;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -49,17 +59,27 @@ use ruster_config::{Bgp, Connected};
 /// The first line of the file.
 pub const HEADER: &str =
     "! Written by ruster-frr from confd's frr part; it is replaced on each change.";
+/// FRR's FPM port when none is given.
+pub const FPM_PORT: u16 = 2620;
 /// The largest include file read.
 pub const INCLUDE_MAX: u64 = 1 << 20;
 
 /// FRR's configuration for `bgp`, with FPM on `fpm_port` and the include file's
 /// text. Each value is read as an address, prefix or number again, so nothing else
 /// reaches the file but the include.
-pub fn config(bgp: Option<&Bgp>, include: &str, fpm_port: u16) -> Result<String, String> {
-    let mut out =
-        format!("{HEADER}\nfpm address 127.0.0.1 port {fpm_port}\nno fpm use-next-hop-groups\n");
+pub fn config(
+    bgp: Option<&Bgp>,
+    connected: &[Connected],
+    include: &str,
+    fpm_port: u16,
+) -> Result<String, String> {
+    let port = match fpm_port {
+        FPM_PORT => String::new(),
+        port => format!(" port {port}"),
+    };
+    let mut out = format!("{HEADER}\nfpm address 127.0.0.1{port}\nno fpm use-next-hop-groups\n");
     if let Some(bgp) = bgp {
-        router_bgp(&mut out, bgp)?;
+        router_bgp(&mut out, bgp, connected)?;
     }
     out.push_str(include);
     if !out.ends_with('\n') {
@@ -68,7 +88,20 @@ pub fn config(bgp: Option<&Bgp>, include: &str, fpm_port: u16) -> Result<String,
     Ok(out)
 }
 
-fn router_bgp(out: &mut String, bgp: &Bgp) -> Result<(), String> {
+/// The link-local address of the interface whose prefix holds `neighbor`.
+fn link_local_for(neighbor: IpAddr, connected: &[Connected]) -> Option<std::net::Ipv6Addr> {
+    connected.iter().find_map(|c| {
+        let (network, len) = c.prefix.split_once('/')?;
+        let network: IpAddr = network.parse().ok()?;
+        let len: u8 = len.parse().ok()?;
+        let on = network.is_ipv6() == neighbor.is_ipv6()
+            && len <= 128
+            && ruster_proto::table::network(neighbor, len) == network;
+        on.then(|| c.link_local.parse().ok()).flatten()
+    })
+}
+
+fn router_bgp(out: &mut String, bgp: &Bgp, connected: &[Connected]) -> Result<(), String> {
     let id: std::net::Ipv4Addr = bgp
         .router_id
         .parse()
@@ -112,16 +145,28 @@ fn router_bgp(out: &mut String, bgp: &Bgp) -> Result<(), String> {
         }
     }
     out.push_str("route-map ruster-in permit 10\n set ipv6 next-hop prefer-global\nexit\n");
-    for (family, (keyword, list)) in [("ip", "v4"), ("ipv6", "v6")].into_iter().enumerate() {
-        if !networks[family].is_empty() {
-            let _ = writeln!(
-                out,
-                "route-map ruster-out permit {}\n match {keyword} address prefix-list ruster-out-{list}\nexit",
-                (family + 1) * 10
-            );
-        }
+    if !networks[0].is_empty() {
+        out.push_str(
+            "route-map ruster-out permit 10\n match ip address prefix-list ruster-out-v4\nexit\n",
+        );
     }
     out.push_str("route-map ruster-out deny 100\nexit\n");
+    // An IPv6 neighbor on the link is given the FE interface's link-local address as
+    // the next hop, not the kernel's TUN device's, which only the kernel has.
+    let mut out_map = Vec::new();
+    for (at, address) in neighbors[1].iter().enumerate() {
+        let link_local = link_local_for(*address, connected)
+            .ok_or_else(|| format!("neighbor {address}: on no interface's prefix"))?;
+        let name = format!("ruster-out-v6-{}", at + 1);
+        if !networks[1].is_empty() {
+            let _ = writeln!(
+                out,
+                "route-map {name} permit 10\n match ipv6 address prefix-list ruster-out-v6\n set ipv6 next-hop local {link_local}\nexit"
+            );
+        }
+        let _ = writeln!(out, "route-map {name} deny 100\nexit");
+        out_map.push(name);
+    }
     let _ = writeln!(out, "router bgp {}", bgp.asn);
     let _ = writeln!(out, " bgp router-id {id}");
     out.push_str(" no bgp default ipv4-unicast\n no bgp network import-check\n");
@@ -134,10 +179,14 @@ fn router_bgp(out: &mut String, bgp: &Bgp) -> Result<(), String> {
         for prefix in &networks[family] {
             let _ = writeln!(out, "  network {prefix}");
         }
-        for address in &neighbors[family] {
+        for (at, address) in neighbors[family].iter().enumerate() {
+            let out_name = match family {
+                0 => "ruster-out",
+                _ => &out_map[at],
+            };
             let _ = writeln!(out, "  neighbor {address} activate");
             let _ = writeln!(out, "  neighbor {address} route-map ruster-in in");
-            let _ = writeln!(out, "  neighbor {address} route-map ruster-out out");
+            let _ = writeln!(out, "  neighbor {address} route-map {out_name} out");
         }
         out.push_str(" exit-address-family\n");
     }
@@ -179,7 +228,7 @@ impl Bridge {
             Some(path) => read_include(path)?,
             None => String::new(),
         };
-        let text = config(bgp.as_ref(), &include, self.fpm_port)?;
+        let text = config(bgp.as_ref(), &connected, &include, self.fpm_port)?;
         let before = match std::fs::read_to_string(&self.path) {
             Ok(before) => Some(before),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -194,10 +243,15 @@ impl Bridge {
             self.write(&text)?;
         }
         if let Err(error) = self.run_reload() {
-            let put_back = match &before {
-                Some(before) => self.write(before),
-                None => std::fs::remove_file(&self.path).map_err(|e| e.to_string()),
+            // FRR may hold part of the new configuration now; it is applied again
+            // on the next part, even one the file already holds.
+            self.took = false;
+            // With no file before, FRR is brought back to one without bgp.
+            let before = match before {
+                Some(before) => before,
+                None => config(None, &[], "", self.fpm_port)?,
             };
+            let put_back = self.write(&before);
             if let Err(again) = put_back.and_then(|()| self.run_reload()) {
                 eprintln!("ruster-frr: putting the file before back: {again}");
             }
@@ -211,7 +265,21 @@ impl Bridge {
         let mut next = self.path.clone().into_os_string();
         next.push(".next");
         let at = |e: std::io::Error| format!("{}: {e}", self.path.display());
-        std::fs::write(&next, text).map_err(at)?;
+        // Not for everyone to read: the include may hold passwords. It keeps the
+        // owner of the file before.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o640)
+            .open(&next)
+            .map_err(at)?;
+        std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o640)).map_err(at)?;
+        if let Ok(old) = std::fs::metadata(&self.path) {
+            std::os::unix::fs::chown(&next, Some(old.uid()), Some(old.gid())).map_err(at)?;
+        }
+        file.write_all(text.as_bytes()).map_err(at)?;
+        drop(file);
         std::fs::rename(&next, &self.path).map_err(at)
     }
 
@@ -220,24 +288,35 @@ impl Bridge {
             return Ok(());
         };
         let command = format!("{} {}", self.reload.join(" "), self.path.display());
+        // frr-reload.py says why it failed on its standard output: both are read.
+        let (mut reader, writer) = std::io::pipe().map_err(|e| e.to_string())?;
         let mut child = Command::new(program)
             .args(args)
             .arg(&self.path)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
+            .stdout(writer.try_clone().map_err(|e| e.to_string())?)
+            .stderr(writer)
+            // Its own process group, so that a command stopped for taking too long
+            // takes the programs it started (vtysh) with it.
+            .process_group(0)
             .spawn()
             .map_err(|e| format!("{program}: {e}"))?;
         // Read while it runs, so a full pipe never holds the command up.
-        let stderr = child.stderr.take().map(|stderr| {
-            std::thread::spawn(move || {
-                let mut stderr = stderr;
-                let mut said = Vec::new();
-                let _ = std::io::copy(&mut (&mut stderr).take(4_096), &mut said);
-                let _ = std::io::copy(&mut stderr, &mut std::io::sink());
-                said
-            })
+        let (said_tx, said_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut said = Vec::new();
+            let _ = std::io::copy(&mut (&mut reader).take(4_096), &mut said);
+            let _ = said_tx.send(said);
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
         });
+        let stop = |child: &mut std::process::Child| {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{}", child.id())])
+                .stderr(Stdio::null())
+                .status();
+            let _ = child.kill();
+            let _ = child.wait();
+        };
         let start = Instant::now();
         let status = loop {
             match child.try_wait() {
@@ -246,18 +325,21 @@ impl Bridge {
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop(&mut child);
                     return Err(format!("{command} took longer than {COMMAND_LIMIT:?}"));
                 }
-                Err(error) => return Err(format!("{command}: {error}")),
+                Err(error) => {
+                    stop(&mut child);
+                    return Err(format!("{command}: {error}"));
+                }
             }
         };
         if status.success() {
             return Ok(());
         }
-        let said = stderr
-            .and_then(|reader| reader.join().ok())
+        // What it said, unless something it left running holds the pipe.
+        let said = said_rx
+            .recv_timeout(Duration::from_secs(1))
             .map(|said| String::from_utf8_lossy(&said).into_owned())
             .unwrap_or_default();
         Err(format!("{command} failed ({status}): {}", said.trim()))

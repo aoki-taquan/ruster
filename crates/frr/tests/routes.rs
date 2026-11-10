@@ -23,6 +23,7 @@ fn connected() -> Vec<Connected> {
     .map(|(i, p)| Connected {
         interface: i.into(),
         prefix: p.into(),
+        link_local: "fe80::1".into(),
     })
     .collect()
 }
@@ -191,6 +192,7 @@ fn new_prefixes_remap_the_next_hops() {
     let moved = vec![Connected {
         interface: "wan3".into(),
         prefix: "198.51.100.0/24".into(),
+        link_local: "fe80::1".into(),
     }];
     assert_eq!(
         routes.set_connected(&moved),

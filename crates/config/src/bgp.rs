@@ -42,6 +42,9 @@ pub struct Connected {
     pub interface: String,
     /// `network/len`.
     pub prefix: String,
+    /// The interface's link-local address (from its MAC address), which the
+    /// router gives an IPv6 neighbor on the link as its next hop.
+    pub link_local: String,
 }
 
 /// `[bgp]` of `ruster.toml`.

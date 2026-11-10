@@ -26,12 +26,29 @@ fn bgp() -> Bgp {
     }
 }
 
+fn connected() -> Vec<Connected> {
+    [("198.51.100.0/24"), ("2001:db8:100::/64")]
+        .into_iter()
+        .map(|p| Connected {
+            interface: "wan".into(),
+            prefix: p.into(),
+            link_local: "fe80::ff:fe00:2".into(),
+        })
+        .collect()
+}
+
 #[test]
 fn the_configuration_has_fpm_the_policies_and_router_bgp() {
-    let text = config(Some(&bgp()), "route-map extra permit 10\n", 2620).unwrap();
+    let text = config(
+        Some(&bgp()),
+        &connected(),
+        "route-map extra permit 10\n",
+        2620,
+    )
+    .unwrap();
     let want = format!(
         "{HEADER}
-fpm address 127.0.0.1 port 2620
+fpm address 127.0.0.1
 no fpm use-next-hop-groups
 ip prefix-list ruster-out-v4 seq 5 permit 203.0.113.0/24
 ipv6 prefix-list ruster-out-v6 seq 5 permit 2001:db8:5::/48
@@ -41,10 +58,13 @@ exit
 route-map ruster-out permit 10
  match ip address prefix-list ruster-out-v4
 exit
-route-map ruster-out permit 20
- match ipv6 address prefix-list ruster-out-v6
-exit
 route-map ruster-out deny 100
+exit
+route-map ruster-out-v6-1 permit 10
+ match ipv6 address prefix-list ruster-out-v6
+ set ipv6 next-hop local fe80::ff:fe00:2
+exit
+route-map ruster-out-v6-1 deny 100
 exit
 router bgp 65001
  bgp router-id 198.51.100.1
@@ -63,7 +83,7 @@ router bgp 65001
   network 2001:db8:5::/48
   neighbor 2001:db8:100::10 activate
   neighbor 2001:db8:100::10 route-map ruster-in in
-  neighbor 2001:db8:100::10 route-map ruster-out out
+  neighbor 2001:db8:100::10 route-map ruster-out-v6-1 out
  exit-address-family
 exit
 route-map extra permit 10
@@ -74,7 +94,7 @@ route-map extra permit 10
 
 #[test]
 fn without_bgp_only_fpm_is_set() {
-    let text = config(None, "", 9).unwrap();
+    let text = config(None, &[], "", 9).unwrap();
     assert_eq!(
         text,
         format!("{HEADER}\nfpm address 127.0.0.1 port 9\nno fpm use-next-hop-groups\n")
@@ -83,7 +103,7 @@ fn without_bgp_only_fpm_is_set() {
     let mut quiet = bgp();
     quiet.networks.clear();
     quiet.neighbor.truncate(1);
-    let text = config(Some(&quiet), "log syslog", 9).unwrap();
+    let text = config(Some(&quiet), &[], "log syslog", 9).unwrap();
     assert!(
         !text.contains("prefix-list") && !text.contains("ipv6 unicast"),
         "{text}"
@@ -104,8 +124,13 @@ fn values_that_would_break_the_file_are_refused() {
     ] {
         let mut b = bgp();
         change(&mut b);
-        assert!(config(Some(&b), "", 1).is_err(), "{b:?}");
+        assert!(config(Some(&b), &connected(), "", 1).is_err(), "{b:?}");
     }
+    // An IPv6 neighbor on no interface's prefix has no link-local for its next hop.
+    assert!(config(Some(&bgp()), &connected()[..1], "", 1)
+        .unwrap_err()
+        .contains("no interface"));
+    {}
 }
 
 fn dir(name: &str) -> PathBuf {
@@ -121,7 +146,7 @@ fn script(dir: &Path) -> Vec<String> {
     std::fs::write(
         &path,
         format!(
-            "#!/bin/sh\n[ -e {0}/broken ] && {{ echo broken on purpose >&2; exit 1; }}\necho \"$@\" >> {0}/ran\ncp \"$1\" {0}/applied\n",
+            "#!/bin/sh\necho \"$@\" >> {0}/ran\n[ -e {0}/broken ] && {{ echo broken on purpose; exit 1; }}\ncp \"$1\" {0}/applied\n",
             dir.display()
         ),
     )
@@ -137,14 +162,14 @@ fn the_bridge_writes_applies_and_puts_back() {
     std::fs::write(&include, "hostname router\n").unwrap();
     let mut with_include = bgp();
     with_include.include = vec![include.display().to_string()];
-    let connected = vec![Connected {
-        interface: "wan".into(),
-        prefix: "198.51.100.0/24".into(),
-    }];
+    let connected = connected();
     let part = frr_part(Some(&with_include), &connected);
     let mut bridge = Bridge::new(file.clone(), script(&dir), 2620);
     assert_eq!(bridge.take(&part).unwrap(), connected);
     let written = std::fs::read_to_string(&file).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o640, "the include may hold passwords");
     assert!(written.ends_with("exit\nhostname router\n"), "{written}");
     assert_eq!(
         std::fs::read_to_string(dir.join("applied")).unwrap(),
@@ -163,9 +188,16 @@ fn the_bridge_writes_applies_and_puts_back() {
     // A failing command puts the file before back and refuses.
     std::fs::write(dir.join("broken"), "").unwrap();
     let error = bridge.take(&frr_part(None, &connected)).unwrap_err();
-    assert!(error.contains("broken on purpose"), "{error}");
+    assert!(
+        error.contains("broken on purpose"),
+        "said on stdout: {error}"
+    );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+    assert_eq!(ran(&dir), 3, "the new file, and the one before again");
     std::fs::remove_file(dir.join("broken")).unwrap();
+    // After a failure the same part runs the command again: FRR may be half done.
+    bridge.take(&part).unwrap();
+    assert_eq!(ran(&dir), 4);
     // An include that cannot be read refuses the part and changes nothing.
     std::fs::remove_file(&include).unwrap();
     let error = bridge.take(&part).unwrap_err();
@@ -195,5 +227,19 @@ fn a_new_bridge_runs_the_command_for_the_file_it_finds() {
         .take(&part)
         .unwrap();
     assert!(other.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn with_no_file_before_a_failure_goes_back_to_no_bgp() {
+    let dir = dir("none-before");
+    let file = dir.join("frr.conf");
+    std::fs::write(dir.join("broken"), "").unwrap();
+    let mut bridge = Bridge::new(file.clone(), script(&dir), 2620);
+    assert!(bridge.take(&frr_part(Some(&bgp()), &connected())).is_err());
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        config(None, &[], "", 2620).unwrap()
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

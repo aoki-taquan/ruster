@@ -195,6 +195,7 @@ pub fn connected(interfaces: &[InterfaceConfig]) -> Vec<Connected> {
             out.push(Connected {
                 interface: interface.name.clone(),
                 prefix: format!("{}/{len}", network(address, len)),
+                link_local: crate::link_local(interface.mac).to_string(),
             });
         }
     }
