@@ -183,11 +183,15 @@ fn the_session_interface_is_there_while_the_session_is_up() {
             vrf: "default".into()
         })
         .is_none());
-    assert!(rig.ribd.store().get(&default_route()).is_some());
+    assert!(
+        rig.ribd.store().get(&default_route()).is_none(),
+        "nothing leaves through NAT's outside before NAT is there"
+    );
 
     rig.source.patch(&[address(10)]).unwrap();
     rig.run(2_000);
     assert!(rig.fe(&ppp_address()).is_some());
+    assert!(rig.ribd.store().get(&default_route()).is_some());
     assert!(rig
         .fe(&Key::Nat {
             vrf: "default".into()
@@ -217,5 +221,38 @@ fn the_session_interface_is_there_while_the_session_is_up() {
     rig.run(31_000);
     assert!(rig.fe(&ppp()).is_none());
     assert!(rig.ribd.store().get(&default_route()).is_none());
+    assert_eq!(rig.confd.with_values().interfaces[2].ipv4, None);
+}
+
+#[test]
+fn an_address_that_clashes_with_the_configuration_is_not_used() {
+    let mut rig = Rig::new();
+    rig.source
+        .patch(&[
+            session(30),
+            Change::set(
+                Key::SourceIpv4 {
+                    source: "pppoe-wan".into(),
+                },
+                Value::SourceIpv4 {
+                    address: Ipv4Addr::new(192, 168, 0, 9),
+                    prefix_len: 32,
+                    lifetime: 30,
+                },
+            ),
+        ])
+        .unwrap();
+    rig.run(0);
+    assert!(rig.fe(&ppp()).is_some());
+    let clash = Key::Address {
+        interface: "ppp".into(),
+        address: IpAddr::V4(Ipv4Addr::new(192, 168, 0, 9)),
+    };
+    assert!(rig.fe(&clash).is_none());
+    assert!(rig
+        .fe(&Key::Nat {
+            vrf: "default".into()
+        })
+        .is_none());
     assert_eq!(rig.confd.with_values().interfaces[2].ipv4, None);
 }
