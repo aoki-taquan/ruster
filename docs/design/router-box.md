@@ -105,10 +105,25 @@ confd → 各プロセス: 確定
 ### FRR（`ruster-frr`）
 
 - FRRのzebraに、外の転送部へ経路を渡すFPM（`dplane_fpm_nl`）を使わせる。`ruster-frr`がFPMの受け手になり、
-  受けた経路をribdへ送り手`frr`として渡す。kernelの経路表は使わない。
+  受けた経路をribdへ送り手`frr`として渡す。kernelの経路表は使わない。FPMはTCPだけなので、`ruster-frr`は
+  kernelのnetnsの`127.0.0.1:2620`で待ち、zebraの`frr`ユーザーのsocketからの接続だけを受ける。
 - BGPなどのTCPは、kernelで終端する（TUN経由）。
-- zebraにはFEのインターフェースとアドレスが見えない。インターフェースの状態と直結経路は、
-  `ruster-frr`がconfdから受け取ってzebraへ教える。教え方（FPMの逆向き、vtyshなど）は作るときに決める。
+- 設定は全体の設定の`[bgp]`（default VRFだけ）。`ruster-frr`は`confd/part.sock`のモジュール`frr`で受け取り、
+  FRRの`frr.conf`を全部書いて`frr-reload.py`で読ませる。運用者のファイル（`include`）は最後にそのまま足す。
+  取り込みは全部受け、送り出しは`networks`だけにする（RFC 8212の明示的な方針。ある近隣の経路を別の近隣へ流さない）。
+- zebraへインターフェースは教えない。confdがkernelのnetnsのTUNにルータのアドレスを付けるので、zebraは
+  そこから直結のプレフィックスを知り、直結の近隣の次の転送先を到達できるとみなす。FEのポートのリンクの
+  状態はzebraに伝わらない（BGPのholdで切れる）。
+- 次の転送先: zebraはTUNしか見ないので、FPMの経路はゲートウェイのアドレスとTUNの番号で来る。`ruster-frr`は、
+  ゲートウェイを含むdefault VRFのインターフェースのプレフィックス（confdが部分`frr`の`connected`に入れる）から
+  FEのインターフェースを決め、ribdへ「そのインターフェースとゲートウェイ」で渡す。ribdは次の転送先を
+  再帰的に解決しない（ce-processes.mdの「次の転送先の解決」はまだ）ので、近隣はインターフェースの
+  サブネットにあるものだけにする（multihopのBGPはまだ）。kernelの既定経路で次の転送先を解決させる
+  `ip nht resolve-via-default`は使わない（解決しても`ruster-frr`がFEのインターフェースを決められないため）。
+- IPv6の近隣へ広告する次の転送先のlink-localは、FEのそのポートのもの（MACから作る）にする。bgpdは
+  TUNのlink-localを渡すが、それにはFEのどのポートも答えない。受けた経路は、link-localではなくグローバルの
+  次の転送先を使わせる（どのインターフェースか分かるため）。どちらもroute-mapで行う。
+- zebraはFPMに加えてkernelのnetnsにも経路を入れるが、行き先は全部TUNなので転送には効かない。
 
 ### Kea（`ruster-kea`）
 
@@ -205,5 +220,4 @@ FRR、Kea、UnboundはUbuntuのパッケージを使う。
 
 ## 未決事項
 
-- `ruster-frr`がzebraへインターフェースを教える方法。
 - APIの形（CORECONFのままか、外から使いやすい形を足すか）。
