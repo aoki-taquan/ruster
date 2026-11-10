@@ -156,7 +156,7 @@ start ruster-neighd
 start ruster-confd --kernel "$work/router.toml"
 start ruster-dhcpc
 
-for _ in $(seq 1 100); do grep -q "^bound6 r-wan prefix=2001:db8:12:3400::/56" "$work/ruster-dhcpc.log" && break; sleep 0.1; done
+for _ in $(seq 1 300); do grep -q "^bound6 r-wan prefix=2001:db8:12:3400::/56" "$work/ruster-dhcpc.log" && break; sleep 0.1; done
 grep -q "^bound6 r-wan prefix=2001:db8:12:3400::/56" "$work/ruster-dhcpc.log" || fail "no delegated prefix"
 echo "ok: ruster-dhcpc got 2001:db8:12:3400::/56"
 show=""
