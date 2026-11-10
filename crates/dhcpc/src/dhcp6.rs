@@ -8,7 +8,8 @@
 //! - RFC 8415 section 8: the message header (type, 3-byte transaction ID) and
 //!   section 21.1 the option format. Options: Client Identifier (1) and Server
 //!   Identifier (2), IA_NA (3) with IA Address (5), Option Request (6), Preference
-//!   (7), Elapsed Time (8), Status Code (13), IA_PD (25) with IA Prefix (26).
+//!   (7), Elapsed Time (8), Status Code (13), IA_PD (25) with IA Prefix (26),
+//!   SOL_MAX_RT (82, section 21.24), which every Option Request option asks for.
 //!   Section 11.4: the client's DUID is a DUID-LL (type 3) of the interface's MAC.
 //! - RFC 3646 section 3: DNS Recursive Name Server (23), which the client asks for
 //!   in its Option Request option.
@@ -59,6 +60,7 @@ mod option {
     pub const DNS_SERVERS: u16 = 23;
     pub const IA_PD: u16 = 25;
     pub const IA_PREFIX: u16 = 26;
+    pub const SOL_MAX_RT: u16 = 82;
 }
 
 /// A DUID-LL of a MAC address (RFC 8415 section 11.4): type 3, hardware type 1.
@@ -125,7 +127,10 @@ impl Request<'_> {
         }
         put(&mut out, option::ELAPSED_TIME, &self.elapsed.to_be_bytes());
         if self.kind != kind::RELEASE {
-            put(&mut out, option::ORO, &option::DNS_SERVERS.to_be_bytes());
+            // RFC 8415 section 21.24: SOL_MAX_RT is always asked for.
+            let mut oro = option::SOL_MAX_RT.to_be_bytes().to_vec();
+            oro.extend_from_slice(&option::DNS_SERVERS.to_be_bytes());
+            put(&mut out, option::ORO, &oro);
         }
         // RFC 8415 section 21.4 and 21.21: the client sets T1 and T2 to 0, and
         // the lifetimes of what it holds to 0 too (the server decides them).
@@ -171,6 +176,8 @@ pub struct Reply {
     pub ia_na: Option<Ia<IaAddress>>,
     pub ia_pd: Option<Ia<IaPrefix>>,
     pub dns: Vec<Ipv6Addr>,
+    /// A SOL_MAX_RT option's value in seconds, when it is in 60 to 86400.
+    pub sol_max_rt: Option<u32>,
 }
 
 /// The options in `bytes` as (code, value); `None` when one runs past the end.
@@ -240,6 +247,7 @@ impl Reply {
             ia_na: None,
             ia_pd: None,
             dns: Vec::new(),
+            sol_max_rt: None,
         };
         for (code, value) in list {
             match code {
@@ -250,6 +258,11 @@ impl Reply {
                     reply.dns = (0..value.len() / 16)
                         .map(|i| address_at(value, i * 16))
                         .collect();
+                }
+                // RFC 8415 section 21.24: other values are ignored.
+                option::SOL_MAX_RT if value.len() == 4 => {
+                    let seconds = u32_at(value, 0);
+                    reply.sol_max_rt = (60..=86_400).contains(&seconds).then_some(seconds);
                 }
                 option::IA_NA if reply.ia_na.is_none() => {
                     reply.ia_na = ia(value, option::IA_ADDRESS, |v| {

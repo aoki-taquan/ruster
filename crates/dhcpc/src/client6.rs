@@ -17,7 +17,8 @@
 //!   +0.1 (only upward for the first Solicit), doubles with the same randomizing up
 //!   to MRT. Solicit: IRT 1 s, MRT 3600 s. Request: IRT 1 s, MRT 30 s, MRC 10, after
 //!   which the client solicits again. Renew and Rebind: IRT 10 s, MRT 600 s, until
-//!   T2 and the end of the lease.
+//!   T2 and the end of the lease. Section 21.24: a SOL_MAX_RT option of 60 to
+//!   86400 s in an Advertise or Reply becomes Solicit's MRT.
 //! - RFC 8415 section 14.2 and 21.4: T1 and T2 of 0 from the server leave them to
 //!   the client: 0.5 and 0.8 of the shortest preferred lifetime.
 //! - RFC 8415 section 18.2.10: a Reply's IA with status NoBinding to a Renew or
@@ -109,6 +110,9 @@ pub struct Client {
     rt: u64,
     /// Exchanges that failed in a row, for the wait before soliciting again.
     failures: u32,
+    /// The MRT of Solicit in ms: SOL_MAX_RT, or what a server's SOL_MAX_RT option
+    /// gave.
+    sol_max_rt: u64,
 }
 
 /// Retransmission parameters: IRT and MRT, in ms.
@@ -135,6 +139,7 @@ impl Client {
             tries: 0,
             rt: 0,
             failures: 0,
+            sol_max_rt: SOLICIT.1,
         }
     }
 
@@ -150,10 +155,11 @@ impl Client {
         self.timer
     }
 
-    /// `rt` randomized by -0.1 to +0.1 of it (0 to +0.1 when `up`).
+    /// `rt` randomized by -0.1 to +0.1 of it (above 0 to +0.1 when `up`: section
+    /// 15 wants RAND strictly greater than 0 for the first Solicit).
     fn randomize(&mut self, rt: u64, up: bool) -> u64 {
         let tenth = rt / 10;
-        let low = if up { rt } else { rt - tenth };
+        let low = if up { rt + 1 } else { rt - tenth };
         low + self.rng.below(rt + tenth - low + 1)
     }
 
@@ -244,9 +250,9 @@ impl Client {
             State::Init => {
                 self.state = State::Soliciting;
                 self.begin(now, SOLICIT, true);
-                self.send(now, SOLICIT, None, out);
+                self.send(now, (SOLICIT.0, self.sol_max_rt), None, out);
             }
-            State::Soliciting => self.send(now, SOLICIT, None, out),
+            State::Soliciting => self.send(now, (SOLICIT.0, self.sol_max_rt), None, out),
             State::Requesting if self.tries >= REQUEST_TRIES => self.solicit_again(now, out),
             // After NoBinding the lease held still ends on time.
             State::Requesting if self.end().is_some_and(|end| now >= end) => self.lose(now, out),
@@ -361,6 +367,11 @@ impl Client {
         };
         if reply.xid != self.xid || reply.client_id.as_deref() != Some(self.duid.as_slice()) {
             return;
+        }
+        // Sections 18.2.9 and 18.2.10: taken even from a message that is then
+        // dropped for its status.
+        if let Some(seconds) = reply.sol_max_rt {
+            self.sol_max_rt = u64::from(seconds) * 1_000;
         }
         match (self.state, reply.kind) {
             (State::Soliciting, kind::ADVERTISE) => {

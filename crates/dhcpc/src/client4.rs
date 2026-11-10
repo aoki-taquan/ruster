@@ -20,6 +20,8 @@
 //! - RFC 2131 section 4.1: messages are sent again after 4 s, doubling up to 64 s,
 //!   each wait randomized by -1 to +1 s; a DHCPREQUEST in REQUESTING is sent
 //!   [`REQUEST_TRIES`] times before going back to INIT (section 3.1, step 5).
+//!   Section 4.4.1: the DHCPREQUEST of REQUESTING carries the `secs` of the
+//!   DHCPDISCOVER, whose offer it takes, and the same `xid`.
 //! - RFC 2131 section 3.1, step 5, and section 4.4.4: a leased address that cannot
 //!   be used is declined with DHCPDECLINE, and the client waits 10 s before INIT.
 //!   Section 4.4.6: [`Client::release`] gives the address back with DHCPRELEASE.
@@ -120,6 +122,9 @@ pub struct Client {
     xid: u32,
     /// When the exchange began, for `secs`.
     started_at: u64,
+    /// The `secs` of the last DHCPDISCOVER, which the DHCPREQUESTs of REQUESTING
+    /// repeat (RFC 2131 section 4.4.1).
+    discover_secs: u16,
     /// The offered address and its server, in REQUESTING.
     offer: Option<(Ipv4Addr, Ipv4Addr)>,
     lease: Option<Lease>,
@@ -141,6 +146,7 @@ impl Client {
             state: State::Init,
             xid: 0,
             started_at: now,
+            discover_secs: 0,
             offer: None,
             lease: None,
             bound_at: 0,
@@ -192,7 +198,9 @@ impl Client {
     }
 
     fn discover(&mut self, now: u64, out: &mut Output) {
-        let payload = self.request(now, kind::DISCOVER).encode();
+        let request = self.request(now, kind::DISCOVER);
+        self.discover_secs = request.secs;
+        let payload = request.encode();
         out.sends.push(Send {
             to: To::Broadcast,
             from: Ipv4Addr::UNSPECIFIED,
@@ -206,6 +214,7 @@ impl Client {
         let payload = Request {
             requested: Some(address),
             server: Some(server),
+            secs: self.discover_secs,
             ..self.request(now, kind::REQUEST)
         }
         .encode();
