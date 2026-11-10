@@ -1,56 +1,53 @@
-//! `ruster-pppoed [--run-dir DIR] SETTINGS`: the PPPoE client.
+//! `ruster-pppoed [--run-dir DIR]`: the PPPoE client.
+//!
+//! It takes its settings, one session per `[[pppoe]]`, from confd: the `pppoe`
+//! part on `confd/part.sock` ([`ruster_config::Pppoe`]). A session whose settings
+//! change starts again; one that is no longer there stops.
 //!
 //! It takes PPPoE Discovery and PPP control frames from the FE on
-//! `pppoed/punt.sock` and sends its own to `fe/punt/pppoed.sock`; the FE's punt
-//! table must send the `pppoe-discovery` and `ppp-control` kinds to the control
-//! process `pppoed`. It runs every session of the settings file and writes one
-//! line to standard output when a session comes up, changes or goes down:
+//! `pppoed/punt.sock` and sends its own to `fe/punt/pppoed.sock`; confd writes the
+//! FE's punt classes that send them to the control process `pppoed`.
+//!
+//! What a session gets goes to its confd source (`confd/source/<name>.sock`): the
+//! session ID, the AC's MAC, the MTU and the IPCP address
+//! ([`ruster_pppoed::writer`]). With `default-route`, the IPv4 default route out of
+//! the session interface goes to ribd as the route source `pppoed` (ribd must be
+//! started with it). It also writes one line to standard output when a session
+//! comes up, changes or goes down:
 //!
 //! ```text
-//! up wan session=4660 ac=02:00:00:00:00:ac mtu=1492 ipv4=198.51.100.2 peer-ipv4=198.51.100.1 dns=192.0.2.53,192.0.2.54 ipv6-id=a1b2:c3d4:e5f6:0708 peer-ipv6-id=0000:0000:0000:0001
-//! down wan reason=ac-terminated
-//! failed wan reason=auth-failed
+//! up pppoe-wan session=4660 ac=02:00:00:00:00:ac mtu=1492 ipv4=198.51.100.2 peer-ipv4=198.51.100.1 dns=192.0.2.53,192.0.2.54 ipv6-id=a1b2:c3d4:e5f6:0708 peer-ipv6-id=0000:0000:0000:0001
+//! down pppoe-wan reason=ac-terminated
+//! failed pppoe-wan reason=auth-failed
 //! ```
 //!
-//! A value not known is `-`. `up` comes again whenever a value changes, each
-//! line whole; `failed` is an attempt that ended before the session was up. Both
-//! are followed by a new attempt. Messages for people go to standard error.
-//!
-//! The settings file is TOML, one `[[session]]` per session:
-//!
-//! ```toml
-//! [[session]]
-//! name = "wan"                # the name in the output lines
-//! interface = "r-wan"         # the FE port the session runs on
-//! mac = "02:00:00:00:00:02"   # that port's MAC address
-//! user = "user@isp.example"
-//! password = "secret"
-//! # service = ""              # the service name; empty (the default) for any
-//! # ac-name = "ac1"           # take offers only from this AC
-//! # ipv6 = true               # run IPv6CP too (the default)
-//! # echo-interval = 10        # seconds between LCP Echo-Requests; 0 for none
-//! # echo-failures = 3         # unanswered Echo-Requests that end the session
-//! ```
-//!
-//! The values belong in the whole configuration from confd later; the output
-//! lines are where [`SessionUp`] and [`SessionDown`] will go to confd instead.
+//! The name is the source's. A value not known is `-`. `up` comes again whenever a
+//! value changes, each line whole; `failed` is an attempt that ended before the
+//! session was up. Both are followed by a new attempt. Messages for people go to
+//! standard error. The DNS servers are not handed on yet (to the DNS bridge's
+//! `upstream-from`).
 
+use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixDatagram;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
+use ruster_confd::part::{Client, Module};
 use ruster_pppoed::lcp::Echo;
 use ruster_pppoed::session::{
     Event, FrameKind, Output, Reason, Session, SessionDown, SessionUp, Settings,
 };
+use ruster_pppoed::writer::{self, Writer};
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::punt::{reason, Direction, Punt};
-use ruster_proto::table::{format_mac, parse_mac};
+use ruster_proto::table::{format_mac, parse_mac, Change, Key};
 use ruster_proto::task::Progress;
-use serde::Deserialize;
 
-/// The control process name the FE's punt table uses.
+/// How long to wait for confd at start-up.
+const CONFD_WAIT: Duration = Duration::from_secs(10);
+/// The control process name the FE's punt table uses, and the route source.
 const NAME: &str = "pppoed";
 /// The longest datagram read from the FE: a whole Ethernet frame and the header.
 const DATAGRAM_MAX: usize = 2_048;
@@ -58,108 +55,22 @@ const DATAGRAM_MAX: usize = 2_048;
 /// from running.
 const DATAGRAMS_PER_ROUND: usize = 64;
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct File {
-    #[serde(default)]
-    session: Vec<SessionFile>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-struct SessionFile {
-    name: String,
-    interface: String,
-    mac: String,
-    user: String,
-    password: String,
-    #[serde(default)]
-    service: String,
-    ac_name: Option<String>,
-    #[serde(default = "yes")]
-    ipv6: bool,
-    #[serde(default = "ten")]
-    echo_interval: u32,
-    #[serde(default = "three")]
-    echo_failures: u32,
-}
-
-fn yes() -> bool {
-    true
-}
-fn ten() -> u32 {
-    10
-}
-fn three() -> u32 {
-    3
-}
-
-/// Reads the settings file: each session's name and settings.
-fn settings(text: &str) -> Result<Vec<(String, Settings)>, String> {
-    // The error's own text quotes the line, and its message may quote a value:
-    // neither is shown for a line with the password.
-    let file: File = toml::from_str(text).map_err(|error| {
-        let start = error.span().map_or(0, |span| span.start).min(text.len());
-        let line = text[..start].matches('\n').count() + 1;
-        let secret = text
-            .lines()
-            .nth(line - 1)
-            .is_some_and(|l| l.contains("password"));
-        if secret {
-            format!("line {line}: not valid")
-        } else {
-            format!("line {line}: {}", error.message())
-        }
-    })?;
-    if file.session.is_empty() {
-        return Err("no [[session]]".into());
-    }
-    let mut out: Vec<(String, Settings)> = Vec::new();
-    for s in file.session {
-        let name = s.name;
-        if name.is_empty() || name.contains(char::is_whitespace) {
-            return Err(format!("session name {name:?}: empty or with spaces"));
-        }
-        if out.iter().any(|(n, _)| *n == name) {
-            return Err(format!("session {name}: named twice"));
-        }
-        if s.interface.is_empty() || s.interface.len() > 255 {
-            return Err(format!("session {name}: interface name"));
-        }
-        let mac = parse_mac(&s.mac).map_err(|_| format!("session {name}: mac {:?}", s.mac))?;
-        for (what, value) in [
-            ("user", &s.user),
-            ("password", &s.password),
-            ("service", &s.service),
-        ] {
-            if value.len() > 255 {
-                return Err(format!("session {name}: {what} longer than 255 bytes"));
-            }
-        }
-        if s.ac_name.as_ref().is_some_and(|a| a.len() > 255) {
-            return Err(format!("session {name}: ac-name longer than 255 bytes"));
-        }
-        if s.echo_interval > 0 && s.echo_failures == 0 {
-            return Err(format!("session {name}: echo-failures must be at least 1"));
-        }
-        out.push((
-            name,
-            Settings {
-                interface: s.interface,
-                mac,
-                user: s.user.into_bytes(),
-                password: s.password.into_bytes(),
-                service: s.service.into_bytes(),
-                ac_name: s.ac_name.map(String::into_bytes),
-                echo: Echo {
-                    interval_ms: u64::from(s.echo_interval) * 1_000,
-                    failures: s.echo_failures,
-                },
-                ipv6: s.ipv6,
-            },
-        ));
-    }
-    Ok(out)
+/// A session's settings from its `[[pppoe]]`.
+fn settings(entry: &ruster_config::Pppoe) -> Result<Settings, String> {
+    let mac = parse_mac(&entry.mac).map_err(|_| format!("pppoe {}: mac", entry.source))?;
+    Ok(Settings {
+        interface: entry.parent.clone(),
+        mac,
+        user: entry.user.clone().into_bytes(),
+        password: entry.password.clone().into_bytes(),
+        service: entry.service.clone().into_bytes(),
+        ac_name: entry.ac_name.first().map(|a| a.clone().into_bytes()),
+        echo: Echo {
+            interval_ms: u64::from(entry.echo_interval) * 1_000,
+            failures: entry.echo_failures,
+        },
+        ipv6: entry.ipv6,
+    })
 }
 
 fn reason_text(reason: Reason) -> &'static str {
@@ -245,7 +156,13 @@ fn seed() -> u64 {
 struct Daemon {
     socket: UnixDatagram,
     fe: PathBuf,
-    sessions: Vec<(String, Session)>,
+    run_dir: PathBuf,
+    /// Each session with its `[[pppoe]]`.
+    sessions: Vec<(ruster_config::Pppoe, Session)>,
+    /// Each source's writer, kept while the source is known.
+    sources: BTreeMap<String, Writer>,
+    /// ribd's writer, made when a session wants the default route.
+    ribd: Option<Writer>,
     message: Vec<u8>,
     unsent: u64,
 }
@@ -274,15 +191,121 @@ impl Daemon {
     }
 
     fn handle(&mut self, index: usize, output: Output) {
-        let (name, session) = &self.sessions[index];
+        let (entry, session) = &self.sessions[index];
         let interface = session.settings().interface.clone();
         let mut stdout = std::io::stdout().lock();
         for event in &output.events {
-            let _ = writeln!(stdout, "{}", line(name, event));
+            let _ = writeln!(stdout, "{}", line(&entry.source, event));
         }
         let _ = stdout.flush();
         drop(stdout);
+        if !output.events.is_empty() {
+            let entry = entry.clone();
+            let up = session.up().cloned();
+            self.write(&entry, up.as_ref());
+        }
         self.send(&interface, &output);
+    }
+
+    /// Writes a session's values to its source, and its default route to ribd.
+    fn write(&mut self, entry: &ruster_config::Pppoe, up: Option<&SessionUp>) {
+        let run_dir = &self.run_dir;
+        self.sources
+            .entry(entry.source.clone())
+            .or_insert_with(|| {
+                Writer::new(
+                    run_dir.join(socket::confd_source(&entry.source)),
+                    Some(writer::REFRESH_MS),
+                )
+            })
+            .set(writer::source_values(&entry.source, up));
+        self.routes();
+    }
+
+    /// Sends ribd the default routes of the sessions that want one: per VRF, out of
+    /// the first such session that is up with an address. Made again from all the
+    /// sessions each time, so a session that stopped or moved leaves none behind.
+    fn routes(&mut self) {
+        let mut want: BTreeMap<Key, Change> = BTreeMap::new();
+        for (entry, session) in &self.sessions {
+            if !entry.default_route {
+                continue;
+            }
+            let route = writer::default_route(&entry.vrf, &entry.interface, session.up());
+            if route.value.is_some() {
+                want.entry(route.key.clone()).or_insert(route);
+            }
+        }
+        if want.is_empty()
+            && self.ribd.is_none()
+            && !self.sessions.iter().any(|(e, _)| e.default_route)
+        {
+            return;
+        }
+        let run_dir = &self.run_dir;
+        let ribd = self
+            .ribd
+            .get_or_insert_with(|| Writer::new(run_dir.join(socket::ribd_source(NAME)), None));
+        let mut changes: Vec<Change> = ribd
+            .held()
+            .keys()
+            .filter(|key| !want.contains_key(*key))
+            .map(|key| Change::delete(key.clone()))
+            .collect();
+        changes.extend(want.into_values());
+        ribd.set(changes);
+    }
+
+    /// Takes a new `pppoe` part: sessions whose settings are the same keep running,
+    /// the others start again or stop.
+    fn take(&mut self, text: &str) -> Result<(), String> {
+        let entries = ruster_config::parse_pppoe_part(text)?;
+        let mut fresh = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            fresh.push(settings(entry)?);
+        }
+        let mut old = std::mem::take(&mut self.sessions);
+        for (entry, settings) in entries.into_iter().zip(fresh) {
+            match old.iter().position(|(e, _)| *e == entry) {
+                Some(at) => self.sessions.push(old.swap_remove(at)),
+                None => {
+                    self.sessions
+                        .push((entry.clone(), Session::new(settings, seed())));
+                    self.write(&entry, None);
+                }
+            }
+        }
+        // The values of a session that stopped, unless a new one has its source.
+        for (entry, _) in old {
+            if !self.sessions.iter().any(|(e, _)| e.source == entry.source) {
+                self.write(&entry, None);
+            }
+        }
+        self.routes();
+        Ok(())
+    }
+
+    /// Moves the writers' messages; whether anything moved, and when to come back.
+    fn writers(&mut self, now: u64) -> (bool, Option<u64>) {
+        let mut busy = false;
+        let mut wake: Option<u64> = None;
+        for (name, writer) in self
+            .sources
+            .iter_mut()
+            .map(|(n, w)| (n.as_str(), w))
+            .chain(self.ribd.as_mut().map(|w| (NAME, w)))
+        {
+            let (moved, at) = writer.step(now);
+            busy |= moved;
+            wake = match (wake, at) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            if let Some(reason) = writer.refused.take() {
+                eprintln!("ruster-pppoed: {name}: refused: {reason}");
+            }
+        }
+        (busy, wake)
     }
 
     /// Reads what the FE sent, from the FE's socket only; whether there was
@@ -348,39 +371,62 @@ impl Daemon {
 
 fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
-    let [file] = rest.as_slice() else {
-        return Err("usage: ruster-pppoed [--run-dir DIR] SETTINGS".into());
-    };
-    let text =
-        std::fs::read_to_string(Path::new(file)).map_err(|error| format!("{file}: {error}"))?;
-    let sessions = settings(&text).map_err(|error| format!("{file}: {error}"))?;
+    if !rest.is_empty() {
+        return Err("usage: ruster-pppoed [--run-dir DIR]".into());
+    }
     let path = run_dir.join(socket::control_punt(NAME));
     let socket = daemon::bind_datagram(&path)
         .map_err(|error| format!("{}: {error}", socket::control_punt(NAME)))?;
+    let part_path = run_dir.join(socket::CONFD_PART);
+    let stream = daemon::connect(&part_path, CONFD_WAIT).map_err(|e| format!("connecting: {e}"))?;
+    let mut part = Client::new(stream, Module::Pppoe).map_err(|e| e.to_string())?;
     let mut daemon = Daemon {
         socket,
         fe: run_dir.join(socket::fe_punt(NAME)),
-        sessions: sessions
-            .into_iter()
-            .map(|(name, settings)| (name, Session::new(settings, seed())))
-            .collect(),
+        run_dir: run_dir.clone(),
+        sessions: Vec::new(),
+        sources: BTreeMap::new(),
+        ribd: None,
         message: Vec::new(),
         unsent: 0,
     };
-    eprintln!(
-        "ruster-pppoed: {} session(s); waiting for frames on {}",
-        daemon.sessions.len(),
-        path.display()
-    );
-    daemon::notify("READY=1");
+    eprintln!("ruster-pppoed: waiting for frames on {}", path.display());
 
     let clock = Clock::new();
     let mut idle = daemon::Idle::new();
+    let mut retry = daemon::Retry::default();
     let mut reported_unsent = 0;
+    let mut ready = false;
     loop {
         let now = clock.now_ms();
-        let busy = daemon.receive(now);
-        let wake_at = daemon.timers(now);
+        if part.is_closed() && retry.due(now) {
+            if let Some(stream) = daemon::try_connect(&part_path) {
+                match Client::new(stream, Module::Pppoe) {
+                    Ok(again) => {
+                        part = again;
+                        eprintln!("ruster-pppoed: connected to confd again");
+                    }
+                    Err(error) => eprintln!("ruster-pppoed: connecting: {error}"),
+                }
+            }
+        }
+        let parted = part.poll(&mut |text| {
+            let taken = daemon.take(text);
+            match &taken {
+                Ok(()) => {
+                    eprintln!("ruster-pppoed: {} session(s)", daemon.sessions.len());
+                    if !ready {
+                        ready = true;
+                        daemon::notify("READY=1");
+                    }
+                }
+                Err(error) => eprintln!("ruster-pppoed: refused a part: {error}"),
+            }
+            taken
+        })?;
+        let busy = daemon.receive(now) | parted.busy;
+        let timer = daemon.timers(now);
+        let (moved, written) = daemon.writers(now);
         if daemon.unsent / 100 != reported_unsent / 100 {
             reported_unsent = daemon.unsent;
             eprintln!(
@@ -389,7 +435,19 @@ fn run() -> Result<(), String> {
                 socket::fe_punt(NAME)
             );
         }
-        idle.wait(Progress { busy, wake_at });
+        let wake_at = match (timer, written) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let wake_at = if part.is_closed() {
+            Some(wake_at.map_or(now + 1_000, |w| w.min(now + 1_000)))
+        } else {
+            wake_at
+        };
+        idle.wait(Progress {
+            busy: busy || moved,
+            wake_at,
+        });
     }
 }
 
@@ -408,35 +466,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_file() {
-        let text = r#"
-            [[session]]
-            name = "wan"
-            interface = "r-wan"
-            mac = "02:00:00:00:00:02"
-            user = "u"
-            password = "p"
-            ac-name = "ac1"
-            echo-interval = 0
-        "#;
-        let got = settings(text).unwrap();
-        assert_eq!(got.len(), 1);
-        let (name, s) = &got[0];
-        assert_eq!(name, "wan");
+    fn settings_from_the_part() {
+        let entry = ruster_config::Pppoe {
+            source: "pppoe-wan".into(),
+            interface: "ppp".into(),
+            vrf: "default".into(),
+            parent: "r-wan".into(),
+            mac: "02:00:00:00:00:02".into(),
+            user: "u".into(),
+            password: "p".into(),
+            service: String::new(),
+            ac_name: vec!["ac1".into()],
+            ipv6: true,
+            echo_interval: 0,
+            echo_failures: 3,
+            default_route: false,
+        };
+        let s = settings(&entry).unwrap();
+        assert_eq!(s.interface, "r-wan");
         assert_eq!(s.mac, [2, 0, 0, 0, 0, 2]);
         assert_eq!(s.ac_name.as_deref(), Some(&b"ac1"[..]));
         assert!(s.service.is_empty() && s.ipv6);
         assert_eq!(s.echo.interval_ms, 0);
-
-        let twice = format!("{text}\n{text}");
-        assert!(settings(&twice).unwrap_err().contains("named twice"));
-        assert!(settings("").is_err());
-        assert!(settings(&text.replace("02:00:00:00:00:02", "02:00")).is_err());
-        assert!(settings(&format!("{text}\nfoo = 1")).is_err());
-        // The password is not in the message.
-        let bad = text.replace("password = \"p\"", "password = 98765");
-        let error = settings(&bad).unwrap_err();
-        assert!(!error.contains("98765"), "{error}");
+        let bad = ruster_config::Pppoe {
+            mac: "02:00".into(),
+            ..entry
+        };
+        assert!(settings(&bad).is_err());
     }
 
     #[test]

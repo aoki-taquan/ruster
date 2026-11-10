@@ -1,21 +1,19 @@
 #!/usr/bin/env bash
 # ruster-pppoed against a real access concentrator: rp-pppoe's pppoe-server with
-# pppd, in a neighbouring namespace. The session comes up with CHAP and then with
-# PAP, gets its IPv4 address, the DNS servers and the IPv6 interface identifiers,
-# and goes down when the AC ends it.
+# pppd, in a neighbouring namespace. pppoed takes its settings from confd, and the
+# FE hands it the PPPoE frames. The session comes up with CHAP and then with PAP,
+# gets its IPv4 address, the DNS servers and the IPv6 interface identifiers, and
+# goes down when the AC ends it; a wrong password from `ruster apply` fails.
+# Data through the session is netns-pppoe-nat.sh's.
 #
-#   [router: pppoed + pppoe-punt-bridge.py, r-wan] -- [ac: pppoe-server, a0]
-#
-# The FE is not in this test: confd cannot yet write the punt classes that send
-# PPPoE to pppoed, nor the session interface from pppoed's values. So
-# scripts/pppoe-punt-bridge.py stands in for the FE's punt of PPPoE frames, and
-# the test stops at IPCP and IPv6CP; no data goes through the session.
+#   [router: FE, confd, ribd, neighd, pppoed, r-wan] -- [ac: pppoe-server, a0]
 #
 # Needs the pppoe and ppp packages (sudo apt-get install -y pppoe ppp). Run as
 # root, after `cargo build`:  sudo scripts/netns-pppoed.sh [target/debug]
+# FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
 set -euo pipefail
+backend=${FE_BACKEND:-af-xdp}
 bin=$(realpath "${1:-target/debug}")
-here=$(dirname "$(realpath "$0")")
 command -v pppoe-server >/dev/null || { echo "SKIP: pppoe-server is not installed"; exit 0; }
 command -v pppd >/dev/null || [[ -x /usr/sbin/pppd ]] || { echo "SKIP: pppd is not installed"; exit 0; }
 modprobe ppp_generic 2>/dev/null || true
@@ -58,9 +56,7 @@ nsx "$router" sysctl -qw net.ipv6.conf.r-wan.disable_ipv6=1
 
 run_dir="$work/run"
 mkdir -m 0700 "$run_dir"
-ip netns exec "$router" python3 "$here/pppoe-punt-bridge.py" r-wan "$run_dir" >"$work/bridge.log" 2>&1 &
-pids+=("$!")
-for _ in $(seq 1 50); do grep -q ready "$work/bridge.log" 2>/dev/null && break; sleep 0.1; done
+nsx "$router" ethtool -K r-wan gro off >/dev/null 2>&1 || true
 
 # The AC's secrets, bound over /etc/ppp's only inside its `ip netns exec` (which
 # has its own mount namespace).
@@ -87,24 +83,42 @@ EOF
   pids+=("$ac_pid")
 }
 
-cat >"$work/pppoed.toml" <<'EOF'
-[[session]]
+config() {
+  cat <<TOML
+[[source]]
 name = "wan"
-interface = "r-wan"
+kind = "pppoe"
+
+[[interface]]
+name = "r-wan"
 mac = "02:00:00:00:00:02"
+
+[[interface]]
+name = "ppp"
+pppoe = { parent = "r-wan", source = "wan" }
+
+[[pppoe]]
+source = "wan"
 user = "user@isp"
-password = "secret"
+password = "$1"
 service = "inet"
 ac-name = "isp-ac"
 echo-interval = 2
-EOF
-
-start_pppoed() {
-  ip netns exec "$router" "$bin/ruster-pppoed" --run-dir "$run_dir" "$work/pppoed.toml" \
-    >"$work/pppoed.out" 2>"$work/pppoed.log" &
-  pppoed_pid=$!
-  pids+=("$pppoed_pid")
+TOML
 }
+config secret >"$work/router.toml"
+start() {
+  local name=$1; shift
+  ip netns exec "$router" "$bin/$name" --run-dir "$run_dir" "$@" >>"$work/$name.log" 2>&1 &
+  pids+=("$!")
+}
+start ruster-fe --backend "$backend" r-wan
+start ruster-ribd
+start ruster-neighd
+start ruster-confd "$work/router.toml"
+ip netns exec "$router" "$bin/ruster-pppoed" --run-dir "$run_dir" \
+  >>"$work/pppoed.out" 2>"$work/pppoed.log" &
+pids+=("$!")
 
 # Waits for an output line matching $1.
 wait_line() {
@@ -120,7 +134,6 @@ up='^up wan session=[0-9]+ ac=02:00:00:00:00:ac mtu=1492 ipv4=198.51.100.2 peer-
 for auth in chap pap; do
   : >"$work/pppoed.out"
   start_ac "$auth"
-  start_pppoed
   wait_line "$up" || fail "$auth: no full up line"
   # The AC's side agrees.
   for _ in $(seq 1 30); do
@@ -138,18 +151,19 @@ for auth in chap pap; do
   ns_kill "$ac" pppd TERM
   wait_line '^down wan reason=(peer-terminated|ac-terminated)$' || fail "$auth: no down line"
   echo "ok: $auth session down: $(grep '^down' "$work/pppoed.out" | tail -1)"
-  kill "$pppoed_pid" "$ac_pid" 2>/dev/null || true
-  wait "$pppoed_pid" "$ac_pid" 2>/dev/null || true
+  kill "$ac_pid" 2>/dev/null || true
+  wait "$ac_pid" 2>/dev/null || true
   ns_kill "$ac" pppd KILL
   sleep 0.5
 done
 
-# A wrong password: the attempt fails and is tried again.
-sed -i 's/password = "secret"/password = "wrong"/' "$work/pppoed.toml"
+# A wrong password from a new configuration: the session starts again and fails.
+config wrong >"$work/router.toml"
 : >"$work/pppoed.out"
 start_ac chap
-start_pppoed
+nsx "$router" "$bin/ruster" --run-dir "$run_dir" apply "$work/router.toml" >/dev/null ||
+  fail "ruster apply"
 wait_line '^failed wan reason=auth-failed$' || fail "no failed line for a wrong password"
 echo "ok: a wrong password fails"
 
-echo "PASS"
+echo "PASS ($backend)"
