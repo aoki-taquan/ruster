@@ -17,6 +17,7 @@ members = [
     "crates/pppoed",
     "crates/proto",
     "crates/ribd",
+    "crates/unbound",
 ]
 resolver = "2"
 

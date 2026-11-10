@@ -238,6 +238,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-unbound"
+version = "0.2.0"
+dependencies = [
+ "ruster-confd",
+ "ruster-config",
+ "ruster-proto",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
