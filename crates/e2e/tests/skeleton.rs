@@ -82,6 +82,7 @@ fn config() -> Config {
         sources: Vec::new(),
         pppoe: Vec::new(),
         dhcp_client: Vec::new(),
+        map_e_from: None,
         bgp: None,
     }
 }

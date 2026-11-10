@@ -176,7 +176,7 @@ confd → 各プロセス: 確定
      インターフェースは親と送り手の名前だけを書く（`pppoe = { parent = "wan", source = "pppoe-wan" }`）。
      FEのセッションのインターフェースは、送り手がセッションを持つ間だけある。送り手は`ruster-pppoed`か、
      手で書く道具（`ruster source`）。
-   - MAP-Eのプレフィックス → `ruster-dhcpc`の委任から。
+   - MAP-Eのプレフィックス → `ruster-dhcpc`の委任から（`[map-e]`の`prefix-from`。固定の`prefix`も書ける）。
 3. confdが各プロセスへ担当の部分を配り、候補、差分、確定を揃える形にする。
 4. `ruster.toml`と、それを解決してlockの形にする機能。
 5. APIから設定を入れる口。

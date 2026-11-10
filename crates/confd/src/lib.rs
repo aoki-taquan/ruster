@@ -154,6 +154,10 @@ pub struct Config {
     /// The WAN side's DHCP clients, checked; confd hands them to `ruster-dhcpc`
     /// ([`dhcp_client`]).
     pub dhcp_client: Vec<ruster_config::DhcpClient>,
+    /// A MAP-E CE whose end-user prefix a source (of kind `dhcpv6-client`)
+    /// has delegated: its settings, checked, and the source. Its tunnel, NAT and
+    /// routes are there only while the source has a prefix ([`delegated`]).
+    pub map_e_from: Option<(ruster_config::MapE, String)>,
     /// BGP, checked; confd hands it to `ruster-frr` ([`bgp`]).
     pub bgp: Option<ruster_config::Bgp>,
 }
@@ -555,7 +559,7 @@ impl Confd {
             return outside;
         }
         let mut outside: Vec<String> = self
-            .config
+            .current
             .nat
             .iter()
             .map(|nat| nat.outside.clone())
@@ -624,7 +628,7 @@ impl Confd {
         let outside_ready = |nat: &&ruster_proto::table::Nat| {
             nat.external.is_some()
                 || self
-                    .config
+                    .current
                     .interfaces
                     .iter()
                     .find(|i| i.name == nat.outside)
@@ -835,7 +839,7 @@ impl Confd {
         // NAT's outside session needs its address before anything leaves through it,
         // or the LAN's would leave untranslated.
         let nat_outside = self
-            .config
+            .current
             .nat
             .as_ref()
             .is_some_and(|nat| nat.outside == interface.name && nat.external.is_none());
@@ -855,7 +859,7 @@ impl Confd {
         };
         interface.ipv4_from.is_some()
             && self
-                .config
+                .current
                 .nat
                 .as_ref()
                 .is_some_and(|nat| nat.outside == name && nat.external.is_none())
@@ -868,7 +872,7 @@ impl Confd {
     fn routes(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
         for interface in self
-            .config
+            .current
             .interfaces
             .iter()
             .filter(|i| self.usable(&i.name))
@@ -1162,6 +1166,7 @@ mod tests {
             sources: Vec::new(),
             pppoe: Vec::new(),
             dhcp_client: Vec::new(),
+            map_e_from: None,
             bgp: None,
         });
         let routes = confd.routes();
@@ -1224,6 +1229,7 @@ mod tests {
             sources: Vec::new(),
             pppoe: Vec::new(),
             dhcp_client: Vec::new(),
+            map_e_from: None,
             bgp: None,
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);

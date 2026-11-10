@@ -91,7 +91,8 @@ struct DnsEntry {
 struct MapEEntry {
     interface: String,
     inside: String,
-    prefix: String,
+    prefix: Option<String>,
+    prefix_from: Option<String>,
     rule_ipv6: String,
     rule_ipv4: String,
     ea_length: u8,
@@ -359,10 +360,16 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         ports_per_host: entry.ports_per_host.unwrap_or(0),
         state_per_host: entry.state_per_host.unwrap_or(0),
     });
+    if let Some(entry) = &file.map_e {
+        if entry.prefix.is_some() == entry.prefix_from.is_some() {
+            return Err("map-e: give prefix or prefix-from".into());
+        }
+    }
     let map_e = file.map_e.map(|entry| MapE {
         interface: entry.interface,
         inside: entry.inside,
-        prefix: entry.prefix,
+        prefix: entry.prefix.into_iter().collect(),
+        prefix_from: entry.prefix_from.into_iter().collect(),
         rule_ipv6: entry.rule_ipv6,
         rule_ipv4: entry.rule_ipv4,
         ea_length: entry.ea_length,

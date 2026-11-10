@@ -11,6 +11,9 @@
 //!   `subnet` in the source's prefix, with the router at ::1 in it.
 //! - An `[[ra]]` whose `prefix-from` names that source advertises that /64 too,
 //!   on-link and for SLAAC, with the delegated prefix's lifetimes.
+//! - A `[map-e]` with `prefix-from` is a MAP-E CE of the source's prefix: its
+//!   tunnel, NAT and routes come and go with the prefix, worked out as for a
+//!   prefix given (RFC 7597 sections 5.2 and 6, [`crate::file`]).
 //!
 //! # Standards
 //!
@@ -29,14 +32,18 @@
 //! A prefix that went away is no longer advertised, rather than advertised with a
 //! preferred lifetime of 0 for a while (RFC 9096 section 3, which updates RFC 7084
 //! L-13).
-//! The derived address is not checked against the other interfaces' prefixes.
+//! The derived address is not checked against the other interfaces' prefixes. A
+//! MAP-E prefix that does not fit the rule, or whose CE address is on a link's
+//! prefix (so the LAN must not take subnet 0 of it), makes no CE, with nothing
+//! said; nor is its IPv4 address checked against the other interfaces'.
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ruster_config::RaPrefix;
+use ruster_proto::table::{network, DEFAULT_VRF};
 
 use crate::source::Sources;
-use crate::Config;
+use crate::{Config, RouteTarget, StaticRoute};
 
 /// RFC 9096 section 3's caps on an advertised prefix's lifetimes, in seconds.
 pub const ND_PREFERRED_LIMIT: u32 = 2_700;
@@ -88,5 +95,55 @@ pub(crate) fn with_delegated(base: &Config, sources: &Sources) -> Config {
             }
         }
     }
+    if let Some((entry, source)) = &base.map_e_from {
+        if let Some((prefix, len, _, _)) = sources.prefix(source) {
+            map_e(&mut out, entry, (prefix, len));
+        }
+    }
     out
+}
+
+/// The MAP-E CE of `prefix`: its tunnel, its NAT on the PSID's ports, the default
+/// IPv4 route into the tunnel and a discard route for the prefix, as for a prefix
+/// given ([`crate::file`]). Nothing when the prefix does not fit the rule, or
+/// the CE's address would be on a link's prefix.
+fn map_e(out: &mut Config, entry: &ruster_config::MapE, prefix: (Ipv6Addr, u8)) {
+    let Ok((tunnel, nat, (delegated, delegated_len))) = crate::file::map_e(entry, prefix, None)
+    else {
+        return;
+    };
+    let Some((local, _)) = tunnel.tunnel else {
+        return;
+    };
+    let on_link = out.interfaces.iter().any(|i| {
+        i.tunnel.is_none()
+            && i.ipv6
+                .iter()
+                .any(|&(a, len)| network(IpAddr::V6(a), len) == network(IpAddr::V6(local), len))
+    });
+    if on_link {
+        return;
+    }
+    out.static_routes.push(StaticRoute {
+        vrf: DEFAULT_VRF.to_owned(),
+        prefix: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        len: 0,
+        target: RouteTarget::Next {
+            interface: tunnel.name.clone(),
+            via: None,
+        },
+    });
+    let discard = |r: &StaticRoute| {
+        r.vrf == DEFAULT_VRF && r.prefix == IpAddr::V6(delegated) && r.len == delegated_len
+    };
+    if !out.static_routes.iter().any(discard) {
+        out.static_routes.push(StaticRoute {
+            vrf: DEFAULT_VRF.to_owned(),
+            prefix: IpAddr::V6(delegated),
+            len: delegated_len,
+            target: RouteTarget::Discard,
+        });
+    }
+    out.interfaces.push(tunnel);
+    out.nat = Some(nat);
 }

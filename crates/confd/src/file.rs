@@ -41,7 +41,9 @@
 //!   address from them (section 6, interface ID `0:IPv4:PSID` on the delegated
 //!   prefix with subnet ID 0), and makes a tunnel to the BR, NAPT on the PSID's
 //!   port set (section 5.1), the default IPv4 route through the tunnel, and a
-//!   discard route for the delegated prefix (RFC 7084 WPD-5). The router's own IPv4
+//!   discard route for the delegated prefix (RFC 7084 WPD-5). With `prefix-from`
+//!   the prefix is a source's, and all of that is there only while the source has
+//!   it ([`crate::delegated`]). The router's own IPv4
 //!   from its LAN address is translated into the port set like a LAN host's.
 //!   Deviations: one Basic Mapping Rule, no Forwarding Mapping Rules (all traffic
 //!   goes through the BR, hub and spoke); an `ea-length` shorter than the IPv4
@@ -128,7 +130,7 @@ fn at_most_one<'a>(at: &str, what: &str, list: &'a [String]) -> Result<Option<&'
 
 /// What the interfaces of a file have, to check addresses and routes against.
 #[derive(Default)]
-struct Seen {
+pub(crate) struct Seen {
     names: BTreeSet<String>,
     /// Each interface's VRF.
     vrf_of: BTreeMap<String, String>,
@@ -440,9 +442,62 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     if lock.map_e.len() > 1 || lock.nat.len() > 1 {
         return Err("give at most one map-e and one nat".into());
     }
+    let mut map_e_from = None;
     let map_e = match lock.map_e.into_iter().next() {
+        // The delegated prefix comes at run time ([`crate::delegated`]): checked now
+        // with a prefix of the rule's that holds the EA bits.
+        Some(entry) if !entry.prefix_from.is_empty() => {
+            let at = "map-e";
+            let [source] = &entry.prefix_from[..] else {
+                return Err(format!("{at}: prefix-from takes at most one source"));
+            };
+            if !entry.prefix.is_empty() {
+                return Err(format!("{at}: give prefix or prefix-from, not both"));
+            }
+            if !sources
+                .iter()
+                .any(|s| s.name == *source && s.kind == crate::source::Kind::Dhcpv6Client)
+            {
+                return Err(format!(
+                    "{at}: prefix-from {source:?} must be a source of kind dhcpv6-client"
+                ));
+            }
+            let Some((IpAddr::V6(rule), rule_len)) = prefix(&entry.rule_ipv6) else {
+                return Err(format!("{at}: rule-ipv6 must be an IPv6 prefix"));
+            };
+            let probe = (
+                rule,
+                (u16::from(rule_len) + u16::from(entry.ea_length)).min(64) as u8,
+            );
+            // Subnet 0 of the prefix holds the CE's address (RFC 7597 section 6),
+            // so no interface may be numbered from it.
+            if interfaces
+                .iter()
+                .any(|i| i.ipv6_from.as_ref() == Some(&(source.clone(), 0)))
+            {
+                return Err(format!(
+                    "{at}: subnet 0 of {source:?} is the CE's; give the LAN another (ipv6-from)"
+                ));
+            }
+            let (tunnel, _, _) = map_e(&entry, probe, Some(&seen))?;
+            if tunnel.name.is_empty() || tunnel.name.len() > 255 {
+                return Err(format!("{at}: the name must be 1 to 255 bytes"));
+            }
+            seen.names.insert(tunnel.name.clone());
+            seen.vrf_of
+                .insert(tunnel.name.clone(), DEFAULT_VRF.to_owned());
+            map_e_from = Some((entry.clone(), source.clone()));
+            None
+        }
         Some(entry) => {
-            let (tunnel, mapped, delegated) = map_e(entry, &seen)?;
+            let delegated = match &entry.prefix[..] {
+                [text] => match prefix(text) {
+                    Some((IpAddr::V6(address), len)) => (address, len),
+                    _ => return Err("map-e: prefix must be an IPv6 prefix".into()),
+                },
+                _ => return Err("map-e: give one prefix or one prefix-from".into()),
+            };
+            let (tunnel, mapped, delegated) = map_e(&entry, delegated, Some(&seen))?;
             let at = format!("map-e interface {:?}", tunnel.name);
             if tunnel.name.is_empty() || tunnel.name.len() > 255 {
                 return Err(format!("{at}: the name must be 1 to 255 bytes"));
@@ -565,7 +620,10 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         }
         let tunnel = interfaces
             .iter()
-            .any(|i| i.name == interface && i.tunnel.is_some());
+            .any(|i| i.name == interface && i.tunnel.is_some())
+            || map_e_from
+                .as_ref()
+                .is_some_and(|(m, _): &(ruster_config::MapE, String)| m.interface == interface);
         if tunnel && address.is_ipv6() {
             return Err(format!("{at}: tunnel {interface:?} carries IPv4 only"));
         }
@@ -653,6 +711,16 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         .next()
         .map(|entry| nat(entry, &seen, &interfaces))
         .transpose()?;
+    if map_e_from.is_some() {
+        if nat.is_some() {
+            return Err("map-e: it makes the NAT itself; give no [nat]".into());
+        }
+        if static_routes.iter().any(|r| {
+            r.vrf == DEFAULT_VRF && r.prefix == IpAddr::V4(Ipv4Addr::UNSPECIFIED) && r.len == 0
+        }) {
+            return Err("map-e: it makes the default IPv4 route itself; give none".into());
+        }
+    }
     if let Some((tunnel, mapped, (delegated, delegated_len))) = map_e {
         if nat.is_some() {
             return Err("map-e: it makes the NAT itself; give no [nat]".into());
@@ -777,6 +845,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         sources,
         pppoe,
         dhcp_client,
+        map_e_from,
         bgp,
     })
 }
@@ -931,16 +1000,18 @@ fn dns(entry: ruster_config::Dns, seen: &Seen) -> Result<ruster_config::Dns, Str
 
 /// The MAP-E CE's tunnel interface, its NAT, and the delegated prefix (RFC 7597
 /// sections 5.2 and 6).
-fn map_e(
-    entry: ruster_config::MapE,
-    seen: &Seen,
+/// For `delegated`; the interface's name and inside are checked against `seen`
+/// when given (at run time they were checked when the configuration was taken).
+pub(crate) fn map_e(
+    entry: &ruster_config::MapE,
+    (delegated, delegated_len): (Ipv6Addr, u8),
+    seen: Option<&Seen>,
 ) -> Result<(InterfaceConfig, Nat, (Ipv6Addr, u8)), String> {
     let at = "map-e";
     let v6 = |text: &str, what: &str| match prefix(text) {
         Some((IpAddr::V6(address), len)) => Ok((address, len)),
         _ => Err(format!("{at}: {what} must be an IPv6 prefix")),
     };
-    let (delegated, delegated_len) = v6(&entry.prefix, "prefix")?;
     let (rule6, rule6_len) = v6(&entry.rule_ipv6, "rule-ipv6")?;
     let (rule4, rule4_len) = match prefix(&entry.rule_ipv4) {
         Some((IpAddr::V4(address), len))
@@ -1029,16 +1100,18 @@ fn map_e(
     if !(MIN_MTU..=MAX_MTU - 40).contains(&mtu) {
         return Err(format!("{at}: mtu must be {MIN_MTU} to {}", MAX_MTU - 40));
     }
-    if seen.names.contains(&entry.interface) {
-        return Err(format!(
-            "{at}: interface {:?} is given twice",
-            entry.interface
-        ));
-    }
-    match seen.vrf_of.get(&entry.inside) {
-        Some(vrf) if vrf == DEFAULT_VRF => {}
-        Some(_) => return Err(format!("{at}: inside must be in the default VRF")),
-        None => return Err(format!("{at}: no interface {:?}", entry.inside)),
+    if let Some(seen) = seen {
+        if seen.names.contains(&entry.interface) {
+            return Err(format!(
+                "{at}: interface {:?} is given twice",
+                entry.interface
+            ));
+        }
+        match seen.vrf_of.get(&entry.inside) {
+            Some(vrf) if vrf == DEFAULT_VRF => {}
+            Some(_) => return Err(format!("{at}: inside must be in the default VRF")),
+            None => return Err(format!("{at}: no interface {:?}", entry.inside)),
+        }
     }
     let mac = mac(&entry.mac)
         .filter(|m| m[0] & 1 == 0 && *m != [0; 6])
@@ -1062,8 +1135,8 @@ fn map_e(
         ipv4_id_rate_limit: entry.ipv4_id_rate_limit,
         ports_per_host: entry.ports_per_host,
         state_per_host: entry.state_per_host,
-        inside: entry.inside,
-        outside: entry.interface,
+        inside: entry.inside.clone(),
+        outside: entry.interface.clone(),
         external: None,
         ports,
     };
