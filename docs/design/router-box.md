@@ -24,7 +24,7 @@ confd: 全体の設定を預かる。解決してlockの形にし、版を残し
   ├─ confd自身        インターフェース、アドレス、NAT、firewall、トンネル → FEの表
   ├─ ribd             静的経路、経路の優先度
   ├─ neighd           静的な近隣、RA
-  ├─ ruster-frr       BGP、OSPFなど → FRRの設定
+  ├─ ruster-frr       BGP、IS-IS、OSPF → FRRの設定
   ├─ ruster-kea       DHCPのサーバ → Keaの設定
   ├─ ruster-unbound   DNS → Unboundの設定
   ├─ ruster-pppoed    PPPoEの認証情報
@@ -137,12 +137,14 @@ confd → 各プロセス: 確定
   受けた経路をribdへ送り手`frr`として渡す。kernelの経路表は使わない。FPMはTCPだけなので、`ruster-frr`は
   kernelのnetnsの`127.0.0.1:2620`で待ち、zebraの`frr`ユーザーのsocketからの接続だけを受ける。
 - BGPなどのTCPは、kernelで終端する（TUN経由）。
-- 設定は全体の設定の`[bgp]`（default VRFだけ）。`ruster-frr`は`confd/part/frr/part.sock`でモジュール`frr`を受け取り、
+- 設定は全体の設定の`[bgp]`（default VRFだけ）と、IS-ISとOSPFの`[isis]`、`[ospf]`、`[ospf6]`（[`overlay.md`](overlay.md)の6.）。`ruster-frr`は`confd/part/frr/part.sock`でモジュール`frr`を受け取り、
   FRRの`frr.conf`を全部書いて`frr-reload.py`で読ませる。運用者のファイル（`include`）は最後にそのまま足す。
   取り込みは全部受け、送り出しは`networks`だけにする（RFC 8212の明示的な方針。ある近隣の経路を別の近隣へ流さない）。
-- zebraへインターフェースは教えない。confdがkernelのnetnsのTUNにルータのアドレスを付けるので、zebraは
+- BGPだけのインターフェースはzebraへ教えない。confdがkernelのnetnsのTUNにルータのアドレスを付けるので、zebraは
   そこから直結のプレフィックスを知り、直結の近隣の次の転送先を到達できるとみなす。FEのポートのリンクの
-  状態はzebraに伝わらない（BGPのholdで切れる）。
+  状態はzebraに伝わらない（BGPのholdで切れる）。IS-ISかOSPFを動かすインターフェースは、インターフェースごとの
+  TAP（`rp-<名前>`）としてzebraに見え、その経路は`ruster-frr`がTAPの名前をFEのインターフェースの名前に戻して
+  ribdへ渡す（[`overlay.md`](overlay.md)の6.）。
 - 次の転送先: zebraはTUNしか見ないので、FPMの経路はゲートウェイのアドレスとTUNの番号で来る。経路の
   ゲートウェイが全部default VRFのインターフェースのプレフィックス（confdが部分`frr`の`connected`に入れる）に
   入っていれば、`ruster-frr`は一番長いプレフィックスのインターフェースとゲートウェイでribdへ渡す。一つでも
@@ -156,7 +158,8 @@ confd → 各プロセス: 確定
 - IPv6の近隣へ広告する次の転送先のlink-localは、FEのそのポートのもの（MACから作る）にする。bgpdは
   TUNのlink-localを渡すが、それにはFEのどのポートも答えない。受けた経路は、link-localではなくグローバルの
   次の転送先を使わせる（どのインターフェースか分かるため）。どちらもroute-mapで行う。
-- zebraはFPMに加えてkernelのnetnsにも経路を入れるが、行き先は全部TUNなので転送には効かない。
+- zebraはFPMに加えてkernelのnetnsにも経路を入れるが、行き先はTUNかTAPで、FEはどちらから出てきたパケットも
+  kernelのパケットとして転送するので、転送には効かない。
 
 ### Kea（`ruster-kea`）
 
