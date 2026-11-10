@@ -190,12 +190,33 @@ impl Seen {
 /// Reads a configuration from the text of a configuration file: the lock form when
 /// it has a top-level `version`, else a `ruster.toml`, which is resolved first.
 pub fn parse(text: &str) -> Result<Config, String> {
-    let lock = if ruster_config::is_lock(text)? {
-        ruster_config::parse_lock(text)?
+    candidate(text).map(|c| c.config)
+}
+
+/// A configuration read from a file, with the texts confd keeps of it
+/// ([`crate::versions`]).
+#[derive(Clone, Debug)]
+pub struct Candidate {
+    pub config: Config,
+    /// The lock form as TOML text.
+    pub lock: String,
+    /// The text, when it was a `ruster.toml`.
+    pub toml: Option<String>,
+}
+
+/// Reads a configuration like [`parse`], and keeps its lock form.
+pub fn candidate(text: &str) -> Result<Candidate, String> {
+    let (lock, toml) = if ruster_config::is_lock(text)? {
+        (ruster_config::parse_lock(text)?, None)
     } else {
-        ruster_config::resolve(text)?
+        (ruster_config::resolve(text)?, Some(text.to_owned()))
     };
-    config(lock)
+    let lock_text = lock.to_text();
+    Ok(Candidate {
+        config: config(lock)?,
+        lock: lock_text,
+        toml,
+    })
 }
 
 /// Checks the lock form and makes confd's configuration of it.

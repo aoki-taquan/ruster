@@ -74,7 +74,7 @@ impl Rig {
         fe.attach(a, &[sid::INTERFACE, sid::ADDRESS, sid::ICMP_ERRORS])
             .unwrap();
         confd.connect_fe(b).unwrap();
-        let mut apply = Apply::new();
+        let mut apply = Apply::new(ruster_confd::versions::Versions::in_memory());
         let (a, b) = UnixStream::pair().unwrap();
         apply.attach(a).unwrap();
         Self {

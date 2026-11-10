@@ -49,6 +49,7 @@ pub mod part;
 pub mod pppoe;
 pub mod ra;
 pub mod source;
+pub mod versions;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {
