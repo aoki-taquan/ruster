@@ -409,6 +409,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/tap",
+        "sid": 60181,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-source:pppoe-session",
         "sid": 60190,
         "status": "unstable"

@@ -192,7 +192,9 @@ impl Ipv6Fib {
         self
     }
 
-    pub(crate) fn neighbor(&self, interface: IfId, target: [u8; 16]) -> Option<MacAddress> {
+    /// The MAC address of neighbor `target` on `interface`, when the table has it.
+    #[must_use]
+    pub fn neighbor(&self, interface: IfId, target: [u8; 16]) -> Option<MacAddress> {
         self.neighbors
             .iter()
             .find(|n| n.interface == interface && n.target == target)

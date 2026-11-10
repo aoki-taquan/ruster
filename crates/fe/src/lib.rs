@@ -19,6 +19,9 @@
 //! sent here after the batch, out of every other member; so are the frames the
 //! control processes, ICMP errors and fragments send out of an IRB.
 //!
+//! IS-IS and OSPF go to the TAP device of the interface they came in on, and what
+//! the kernel's daemons write there goes out of that interface ([`tap`]).
+//!
 //! # Standards
 //!
 //! - Forwarding decisions are `ruster-core`'s (RFC 1812 sections 5.2.2 and 5.3.1:
@@ -59,6 +62,7 @@ mod local;
 mod nat;
 mod punt_table;
 mod reassembly;
+mod tap;
 
 pub use local::LocalPipe;
 pub use punt_table::PuntCounters;
@@ -136,6 +140,15 @@ pub struct FeCounters {
     /// yet, or no room).
     pub from_kernel: u64,
     pub from_kernel_dropped: u64,
+    /// Frames written to an interface's TAP device (IS-IS, OSPF), and those dropped
+    /// (rate limit, no TAP, or the TAP full).
+    pub to_tap: u64,
+    pub to_tap_dropped: u64,
+    /// Frames the kernel wrote to a TAP that were sent out or routed, and those
+    /// dropped (another kind, an interface not enabled, a neighbor not known yet,
+    /// or no room).
+    pub from_tap: u64,
+    pub from_tap_dropped: u64,
     /// Tunnels' IPv6 packets put back together from their fragments.
     pub tunnel_reassembled: u64,
     /// Fragments sent for datagrams longer than the egress MTU, and datagrams whose
@@ -178,6 +191,8 @@ pub struct Fe<B> {
     kernel: Vec<IfId>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
+    /// The TAP device of each interface that runs IS-IS or OSPF, by interface name.
+    taps: BTreeMap<String, Box<dyn LocalPipe>>,
     /// The classes of the punt table.
     classes: punt_table::Classes,
     /// Their rate limits and counters; to the kernel, per VRF in the order of
@@ -261,6 +276,7 @@ where
             pppoe: built.pppoe,
             kernel: built.kernel,
             local: BTreeMap::new(),
+            taps: BTreeMap::new(),
             limits,
             classes: built.punt,
             active: built.active,
@@ -334,6 +350,29 @@ where
         self.local.remove(vrf);
     }
 
+    /// The interfaces whose IS-IS and OSPF go to their TAP device, by the punt
+    /// classes of the current tables.
+    pub fn tap_interfaces(&self) -> Vec<String> {
+        self.classes
+            .taps()
+            .into_iter()
+            .filter_map(|id| self.interface_names.get(usize::from(id.0)))
+            .filter(|name| !name.is_empty())
+            .cloned()
+            .collect()
+    }
+
+    /// Uses `pipe`, one Ethernet frame per message, as the TAP device of
+    /// `interface` ([`tap`]).
+    pub fn attach_tap(&mut self, interface: &str, pipe: Box<dyn LocalPipe>) {
+        self.taps.insert(interface.to_owned(), pipe);
+    }
+
+    /// Stops using the TAP device of `interface`.
+    pub fn detach_tap(&mut self, interface: &str) {
+        self.taps.remove(interface);
+    }
+
     /// The VRFs of the current tables, the default VRF first.
     pub fn vrfs(&self) -> &[String] {
         &self.names
@@ -390,6 +429,7 @@ where
         let mut trace = FeTrace::default();
         // The kernel's packets join the ports' in one batch, after them.
         let mut kernel_frames = self.read_kernel();
+        kernel_frames.append(&mut self.read_taps(now_ms));
         kernel_frames.append(&mut self.reassembled);
         // One snapshot per VRF; each packet uses its ingress interface's.
         let snapshots: Vec<_> = self
@@ -570,7 +610,12 @@ where
             let (kind, ingress, bytes) = (frame.kind, frame.ingress, frame.bytes().to_vec());
             match kind {
                 ControlKind::Punt(class) => {
-                    self.hand_to_control(usize::from(class), ingress, &bytes, now_ms)
+                    let class = usize::from(class);
+                    if self.classes.get(class).destination == PuntDestination::Tap {
+                        self.hand_to_tap(class, ingress, &bytes, now_ms);
+                    } else {
+                        self.hand_to_control(class, ingress, &bytes, now_ms);
+                    }
                 }
                 ControlKind::Neighbor => {
                     let class = punt_table::built_in(PuntKind::Nd);
@@ -587,6 +632,7 @@ where
                         PuntDestination::Control(_) => {
                             self.hand_to_control(class, ingress, &bytes, now_ms);
                         }
+                        PuntDestination::Tap => self.hand_to_tap(class, ingress, &bytes, now_ms),
                         _ => self.send_to_kernel(ingress, class, packet, now_ms),
                     }
                 }
@@ -711,6 +757,89 @@ where
         } else {
             self.limits.dropped(class);
         }
+    }
+
+    /// Writes the whole `frame` of punt class `class` to the TAP device of the
+    /// interface it came in on.
+    fn hand_to_tap(&mut self, class: usize, ingress: IfId, frame: &[u8], now_ms: u64) {
+        let tap = self
+            .interface_names
+            .get(usize::from(ingress.0))
+            .filter(|name| !name.is_empty())
+            .and_then(|name| self.taps.get(name));
+        let Some(tap) = tap else {
+            self.limits.dropped(class);
+            self.counters.to_tap_dropped += 1;
+            return;
+        };
+        if !self.limits.admit(class, None, now_ms) {
+            self.counters.to_tap_dropped += 1;
+            return;
+        }
+        if tap.send(frame).is_ok() {
+            self.limits.handed(class);
+            self.counters.to_tap += 1;
+        } else {
+            self.limits.dropped(class);
+            self.counters.to_tap_dropped += 1;
+        }
+    }
+
+    /// Takes what the kernel wrote to the TAP devices: frames for the link are
+    /// sent out of their interface now; the router's other packets are returned,
+    /// for the batch, as packets from their VRF's kernel interface.
+    fn read_taps(&mut self, now_ms: u64) -> Vec<kernel::Frame> {
+        let mut routed = Vec::new();
+        if self.taps.is_empty() {
+            return routed;
+        }
+        let mut buf = vec![0_u8; PUNT_MAX];
+        let names: Vec<String> = self.taps.keys().cloned().collect();
+        for name in names {
+            let id =
+                interface_id(&self.interface_names, &name).filter(|id| self.active.contains(id));
+            for _ in 0..INJECT_PER_STEP {
+                let n = match self.taps.get(&name).map(|tap| tap.recv(&mut buf)) {
+                    Some(Ok(n)) if n > 0 => n,
+                    _ => break,
+                };
+                let vrf = id.and_then(|id| self.by_ingress.get(usize::from(id.0)));
+                let (Some(id), Some(&at)) = (id, vrf) else {
+                    self.counters.from_tap_dropped += 1;
+                    continue;
+                };
+                let at = usize::from(at);
+                let sent = match tap::sort(&buf[..n]) {
+                    tap::FromTap::Link => self.send_generated(id, &buf[..n]),
+                    tap::FromTap::Neighbor(address) => {
+                        match self.vrfs.get(at).and_then(|v| v.ipv6.neighbor(id, address)) {
+                            Some(mac) => {
+                                buf[..6].copy_from_slice(&mac.0);
+                                self.send_generated(id, &buf[..n])
+                            }
+                            None => {
+                                self.resolve_request(id, IpAddr::V6(address.into()), now_ms);
+                                false
+                            }
+                        }
+                    }
+                    tap::FromTap::Routed => match self.kernel.get(at) {
+                        Some(&kernel) => {
+                            routed.push(kernel::Frame::new(kernel, at, &buf[ETHERNET_HEADER..n]));
+                            true
+                        }
+                        None => false,
+                    },
+                    tap::FromTap::Drop => false,
+                };
+                if sent {
+                    self.counters.from_tap += 1;
+                } else {
+                    self.counters.from_tap_dropped += 1;
+                }
+            }
+        }
+        routed
     }
 
     fn resolve_request(&mut self, egress: IfId, address: IpAddr, now_ms: u64) {

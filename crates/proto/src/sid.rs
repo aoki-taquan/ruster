@@ -105,6 +105,8 @@ pub const PUNT_INTERFACE: u64 = 60175;
 pub const PUNT_CONTROL: u64 = 60176;
 pub const PUNT_KERNEL: u64 = 60177;
 pub const PUNT_DROP: u64 = 60178;
+/// Or the TAP device of the interface it came in on (IS-IS and OSPF).
+pub const PUNT_TAP: u64 = 60181;
 /// Packets per second, and how many may go at once.
 pub const PUNT_RATE: u64 = 60179;
 pub const PUNT_BURST: u64 = 60180;
@@ -281,6 +283,7 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-punt:punt/class/drop", PUNT_DROP),
     ("/ruster-punt:punt/class/rate", PUNT_RATE),
     ("/ruster-punt:punt/class/burst", PUNT_BURST),
+    ("/ruster-punt:punt/class/tap", PUNT_TAP),
     ("/ruster-source:pppoe-session", SOURCE_PPPOE),
     ("/ruster-source:pppoe-session/session-id", SOURCE_PPPOE_SESSION),
     ("/ruster-source:pppoe-session/peer-address", SOURCE_PPPOE_PEER),

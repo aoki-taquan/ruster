@@ -11,8 +11,11 @@
 //! matched against the IP entries, then fall into the kernel kind they are of. An
 //! entry for a control process also gets the frames core picks out before
 //! forwarding ([`ruster_core::PuntFrameMatch`]): PPPoE's, and IP to a broadcast or
-//! link-local multicast address (DHCP). Two entries that could match the same
-//! packet are refused, so the order of the entries does not matter.
+//! link-local multicast address (DHCP). An entry of kind `isis` or `ospf` sends
+//! IS-IS PDUs, and OSPF to its multicast addresses or to the router, to the TAP
+//! device of the interface they came in on (`docs/design/overlay.md` section 6),
+//! unchanged. Two entries that could match the same packet are refused, so the
+//! order of the entries does not matter.
 //!
 //! Each class has its own token bucket; a class to the kernel has one per VRF, so
 //! that a flood in one VRF does not crowd out another's. Each class counts what it
@@ -25,6 +28,8 @@
 //! - RFC 2516 (PPPoE), RFC 2131 section 4.1 (DHCP, ports 67 and 68) and RFC 8415
 //!   section 7 (DHCPv6, ports 546 and 547, ff02::1:2): the frames core picks out
 //!   for a control process follow them (`ruster_core::PuntFrameMatch`).
+//! - ISO 10589 (IS-IS), RFC 2328 and RFC 5340 (OSPF, IP protocol 89): the frames
+//!   core picks out for a TAP device (`ruster_core::PuntFrameMatch`).
 //!
 //! Deviations: classes have no priority among themselves; each has its own limit
 //! instead, so one that overflows does not take another's place. An entry with
@@ -145,7 +150,9 @@ impl Classes {
                 continue;
             }
             if let PuntMatch::Kind(kind) = entry.matches {
-                if !matches!(kind, PuntKind::PppoeDiscovery | PuntKind::PppControl) {
+                if !matches!(kind, PuntKind::PppoeDiscovery | PuntKind::PppControl)
+                    && !kind.is_routing_protocol()
+                {
                     return Err(format!(
                         "punt class {name}: kind {} is matched only by its built-in class",
                         kind.name()
@@ -219,11 +226,18 @@ impl Classes {
             .iter()
             .enumerate()
             .skip(BUILT_IN.len())
-            .filter(|(_, class)| matches!(class.destination, PuntDestination::Control(_)))
+            .filter(|(_, class)| {
+                matches!(
+                    class.destination,
+                    PuntDestination::Control(_) | PuntDestination::Tap
+                )
+            })
             .filter_map(|(index, class)| {
                 let kind = match class.matches {
                     PuntMatch::Kind(PuntKind::PppoeDiscovery) => PuntFrameKind::PppoeDiscovery,
                     PuntMatch::Kind(PuntKind::PppControl) => PuntFrameKind::PppControl,
+                    PuntMatch::Kind(PuntKind::Isis) => PuntFrameKind::Isis,
+                    PuntMatch::Kind(PuntKind::Ospf) => PuntFrameKind::Ospf,
                     PuntMatch::Ip { protocol, ports } => PuntFrameKind::Ip { protocol, ports },
                     PuntMatch::Kind(_) => return None,
                 };
@@ -256,6 +270,18 @@ impl Classes {
         controls
     }
 
+    /// The interfaces whose routing protocols go to their TAP device.
+    pub(crate) fn taps(&self) -> Vec<IfId> {
+        let mut taps: Vec<IfId> = self.classes[BUILT_IN.len()..]
+            .iter()
+            .filter(|class| class.destination == PuntDestination::Tap)
+            .filter_map(|class| class.interface)
+            .collect();
+        taps.sort_unstable();
+        taps.dedup();
+        taps
+    }
+
     pub(crate) fn get(&self, index: usize) -> &Class {
         &self.classes[index]
     }
@@ -269,8 +295,14 @@ impl Classes {
     pub(crate) fn of_local(&self, ingress: IfId, packet: &[u8]) -> usize {
         let transport = transport(packet);
         let entry = self.classes[BUILT_IN.len()..].iter().position(|class| {
-            let PuntMatch::Ip { protocol, ports } = class.matches else {
-                return false;
+            let (protocol, ports) = match class.matches {
+                PuntMatch::Ip { protocol, ports } => (protocol, ports),
+                // Every fragment of OSPF to the router goes to the TAP, where
+                // the kernel puts them together.
+                PuntMatch::Kind(PuntKind::Ospf) => {
+                    return class.interface == Some(ingress) && protocol_of(packet) == Some(OSPF);
+                }
+                PuntMatch::Kind(_) => return false,
             };
             class.interface.is_none_or(|id| id == ingress)
                 && match (transport, ports) {
@@ -308,9 +340,24 @@ fn overlap(a: &PuntClass, b: &PuntClass) -> bool {
                     _ => true,
                 }
         }
+        (PuntMatch::Kind(PuntKind::Ospf), PuntMatch::Ip { protocol, .. })
+        | (PuntMatch::Ip { protocol, .. }, PuntMatch::Kind(PuntKind::Ospf)) => protocol == OSPF,
         (a, b) => a == b,
     };
     interfaces && matches
+}
+
+/// OSPF's IP protocol number (RFC 2328 appendix A.1).
+const OSPF: u8 = 89;
+
+/// The protocol of an IPv4 packet, fragment or not, or the next header of an IPv6
+/// packet.
+fn protocol_of(packet: &[u8]) -> Option<u8> {
+    match packet.first()? >> 4 {
+        4 => packet.get(9).copied(),
+        6 => packet.get(6).copied(),
+        _ => None,
+    }
 }
 
 /// The IP protocol of `packet` and, for TCP and UDP that is not a fragment, its
@@ -460,6 +507,44 @@ mod tests {
         p[9] = protocol;
         p[22..24].copy_from_slice(&port.to_be_bytes());
         p
+    }
+
+    #[test]
+    fn an_ospf_class_overlaps_one_for_protocol_89() {
+        let class = |matches, interface: Option<&str>, destination| PuntClass {
+            matches,
+            interface: interface.map(Into::into),
+            destination,
+            rate: 1,
+            burst: 1,
+        };
+        let ospf = class(
+            PuntMatch::Kind(PuntKind::Ospf),
+            Some("lan"),
+            PuntDestination::Tap,
+        );
+        let any_89 = class(
+            PuntMatch::Ip {
+                protocol: 89,
+                ports: None,
+            },
+            None,
+            PuntDestination::Drop,
+        );
+        let isis = class(
+            PuntMatch::Kind(PuntKind::Isis),
+            Some("lan"),
+            PuntDestination::Tap,
+        );
+        assert!(overlap(&ospf, &any_89));
+        assert!(overlap(&any_89, &ospf));
+        assert!(!overlap(&ospf, &isis));
+        let on_wan = PuntClass {
+            interface: Some("wan".into()),
+            ..ospf.clone()
+        };
+        assert!(!overlap(&ospf, &on_wan));
+        assert_eq!(protocol_of(&ipv4(89, 0, 1)), Some(89), "a later fragment");
     }
 
     #[test]
