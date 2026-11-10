@@ -1,56 +1,91 @@
-//! The socket through which the CLI gives confd a new configuration, lists the versions
-//! and goes back to one (`docs/design/router-box.md`, "反映の流れ").
+//! The socket through which the CLI changes confd's configuration
+//! (`docs/design/router-box.md`, "反映の流れ").
 //!
-//! | Request | What |
-//! |---|---|
-//! | POST `config`, the file's text | put it in use (below) |
-//! | POST `rollback/<N>` | put version N's configuration in use, the same way |
-//! | GET `versions` | 2.05 Content: the versions kept, a line each, newest first ([`Versions::listing`]) |
-//! | POST `diff`, the file's text | 2.05 Content: what putting it in use would change, sending nothing ([`crate::diff`]) |
+//! | Request | CLI | What |
+//! |---|---|---|
+//! | POST `diff`, the file's text | `ruster diff` | what putting it in use would change, sending nothing ([`crate::diff`]) |
+//! | POST `config`, the file's text | `ruster apply` | put it in use, and keep it as a version |
+//! | POST `config/confirm-within/<M>`, the file's text | `ruster apply --confirm-within M` | the same, and go back unless confirmed within M minutes (below) |
+//! | POST `confirm` | `ruster confirm` | the version waiting for confirmation stays |
+//! | POST `rollback/<N>` | `ruster rollback N` | put version N's configuration in use again, as a new version |
+//! | GET `versions` | `ruster versions` | the versions kept, a line each, newest first ([`Versions::listing`]) |
 //!
-//! Requests are framed like the other sockets. For POST `config`, confd reads the text as
-//! it reads its file at start-up; for `rollback/<N>`, version N's lock form (4.04 Not
-//! Found when it is not kept). Then it sends what changed to
-//! the FE, ribd and neighd, and the parts that changed to the processes that take them
-//! ([`crate::part`]), and answers once each of them has answered. Once every process
-//! has taken it, confd keeps it as the next version ([`crate::versions`]); the answer
-//! says which.
+//! # Putting a configuration in use
+//!
+//! For `config`, confd reads the text as it reads its file at start-up; for
+//! `rollback/<N>`, it takes version N's lock form. It sends what changed to the FE,
+//! ribd and neighd, and the parts that changed to the processes that take them
+//! ([`crate::part`]). Once each of them has said yes, confd keeps the configuration
+//! as the next version ([`crate::versions`]) and answers, naming the version. If one
+//! refuses, confd sends the configuration before back to all of them.
+//!
+//! After 5.04 confd keeps waiting: a later refusal still puts the configuration before
+//! back, and a later yes keeps the version. A process that disconnects meanwhile (one
+//! already disconnected when the file came is not waited for) is waited for too: it
+//! gets everything when it connects again, and its answer counts. After [`GIVE_UP_MS`]
+//! confd stops waiting, logs it, and keeps the configuration as a version, since it
+//! is the one in use. Only one change is applied at a time.
+//!
+//! # Confirming
+//!
+//! With `confirm-within`, the version kept waits M minutes (1 to
+//! [`MAX_CONFIRM_MINUTES`]) for `confirm`. Without it in time, confd puts the version
+//! before back the same way as a rollback, as a new version ("back to N: version V was
+//! not confirmed"). This is for a change that could cut off the operator: confd holds
+//! the timer, so it goes back even when no CLI is left to ask.
+//!
+//! - The deadline (version, version to go back to, time) is written to the state
+//!   directory before the version is, so confd started again during the wait goes on
+//!   waiting for the time left. Started after the deadline, confd sends the latest
+//!   version as at any start, and starts going back in its first step. A deadline
+//!   more than M minutes away at a start means the clock went back; confd then goes
+//!   back at once too.
+//! - Going back does not wait for the processes to finish what they were sent
+//!   before: a process that never answers must not keep the version in use. It is
+//!   given up on like any change, after [`GIVE_UP_MS`].
+//! - If the deadline or the version cannot be written, confd goes back at once and
+//!   answers 5.00.
+//! - While a version waits, `config`, `confirm-within` and `rollback` are refused with
+//!   5.03; `diff` and `versions` are answered (the listing names the deadline).
+//! - If a process refuses the version before, the waiting version stays in use and
+//!   confd tries again after [`GO_BACK_RETRY_MS`]. A `confirm` that comes while it is
+//!   going back is refused with 5.03.
+//!
+//! # Answers
 //!
 //! | Answer | Meaning |
 //! |---|---|
-//! | 2.04 Changed | every connected process answered yes, and the configuration was kept as a version |
-//! | 2.05 Content | the answer to GET `versions` and POST `diff` |
-//! | 4.00 Bad Request | the file or the version does not read, `<N>` is not a number, or a process refused the change; in the last case confd puts the configuration it had before back |
+//! | 2.04 Changed | every connected process said yes and the version was kept; or, for `confirm`, the version stays |
+//! | 2.05 Content | the answer to `diff` and `versions` |
+//! | 4.00 Bad Request | the file or the version does not read, `<N>` or `<M>` is not one that is allowed, nothing waits for `confirm`, or a process refused the change (and confd puts the configuration before back) |
 //! | 4.04 Not Found | version N is not kept, or the resource is not one of the above |
-//! | 5.00 Internal Server Error | the configuration is in use, but writing the version failed |
-//! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers (for `diff` too, since what is in use is not yet a version); for `config` and `rollback`, also while a change of a source's values is |
+//! | 5.00 Internal Server Error | the configuration is in use, but the version or the deadline could not be written (with `confirm-within`, confd goes back at once) |
+//! | 5.03 Service Unavailable | another change is waiting for answers (for `diff` too, since what is in use is not yet a version; for `config` and `rollback`, also while a change of a source's values is), or a version waits for `confirm` |
 //! | 5.04 Gateway Timeout | a process has not answered in time |
-//!
-//! After 5.04 confd keeps waiting: if the answer is a refusal, it puts the configuration
-//! before back then, and if it is yes, it keeps the version then. A process that
-//! disconnects meanwhile (one already disconnected when the file came is not waited
-//! for) is waited for too: confd sends it everything when it connects again, and its
-//! answer counts. confd stops waiting after [`GIVE_UP_MS`], logs it, and keeps the
-//! configuration as a version, since it is the one in use. A new file is taken only
-//! when every process has answered everything sent to it; until then it gets 5.03.
 //!
 //! The payload of an answer is text for a person: the error, or what the answer needs
 //! to add (a process that is not connected gets the configuration when it connects
-//! again; errors setting up the kernel side; the version number).
+//! again; errors setting up the kernel side; the version number and any deadline).
 //!
 //! Limits:
 //! - Static routes go through ribd, which takes any route; a route the FE then refuses
 //!   is not seen here.
-//! - `diff` shows only what confd itself writes; the other processes are asked only
-//!   when the configuration is put in use. There is no confirm-or-revert yet.
+//! - `diff` shows only what confd itself writes. The other processes are not asked
+//!   for theirs: they check their parts only when the configuration is put in use.
 //!
 //! # Standards
 //!
 //! - RFC 7252 sections 5.8.1 (GET), 5.8.2 (POST) and 5.9 (the response codes above),
 //!   over the stream framing of RFC 8323 like the table sockets.
+//! - RFC 6241 section 8.4 (the confirmed commit of NETCONF), for `confirm-within`
+//!   and `confirm`: without a confirming commit before the timeout, the configuration
+//!   before goes back.
 //!
 //! Deviations: the resources and their text payloads are ruster's own; they are not a
-//! CORECONF datastore.
+//! CORECONF datastore. Of RFC 6241 8.4: the timeout is in minutes (1 to 1440), not
+//! seconds, and counts from when the version is kept; there is no `persist-id` (the
+//! wait outlives the connection, and confd itself) and no `cancel-commit` (wait or
+//! confirm); a new commit during the wait is refused rather than confirming it.
 
 use std::os::unix::net::UnixStream;
 
@@ -58,7 +93,7 @@ use ruster_proto::coap::Code;
 use ruster_proto::conn::{Connection, Incoming, Outgoing};
 use ruster_proto::task::Progress;
 
-use crate::versions::Versions;
+use crate::versions::{unix_now, utc, Versions, Waiting};
 use crate::{diff, file, Confd, Config, PeerKind};
 
 /// The largest configuration file accepted.
@@ -84,7 +119,26 @@ pub struct Apply {
     pending: Option<Pending>,
     counters: ApplyCounters,
     versions: Versions,
+    /// The latest version waits for `ruster confirm`.
+    confirm: Option<Confirm>,
     log: Vec<String>,
+}
+
+/// A version waiting for `ruster confirm`, and when confd goes back.
+#[derive(Clone, Copy, Debug)]
+struct Confirm {
+    waiting: Waiting,
+    due: Due,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Due {
+    /// This long after the first step (after a start-up).
+    In(u64),
+    /// At this time of the steps' clock.
+    At(u64),
+    /// The version before is being sent again.
+    GoingBack,
 }
 
 /// What happened after an answer had gone out, for the log.
@@ -128,15 +182,67 @@ struct Keep {
     how: String,
     lock: String,
     toml: Option<String>,
+    /// It waits this many minutes for `ruster confirm`.
+    confirm: Option<u32>,
+    /// It is the version before one that was not confirmed.
+    going_back: bool,
 }
 
-impl Apply {
-    /// With the versions so far; the latest is the configuration confd has.
-    pub fn new(versions: Versions) -> Self {
+impl Keep {
+    fn new(how: String, lock: String, toml: Option<String>) -> Self {
         Self {
+            how,
+            lock,
+            toml,
+            confirm: None,
+            going_back: false,
+        }
+    }
+}
+
+/// The longest wait for `ruster confirm`: a day.
+pub const MAX_CONFIRM_MINUTES: u32 = 24 * 60;
+
+/// How long confd waits before it tries again to go back, after a process refused
+/// the version before.
+pub const GO_BACK_RETRY_MS: u64 = 60_000;
+
+/// The connection of the answer to a change confd makes by itself.
+const NO_CONNECTION: u64 = u64::MAX;
+
+impl Apply {
+    /// With the versions so far; the latest is the configuration confd has. If it
+    /// waits for `ruster confirm`, the time left is counted from the first step.
+    pub fn new(versions: Versions) -> Self {
+        let mut apply = Self {
             versions,
             ..Self::default()
+        };
+        if let Some(waiting) = apply.versions.waiting() {
+            // A deadline further away than the wait given means the clock went back
+            // (a box with no clock kept across a restart): it cannot be trusted, and
+            // waiting again each start could put going back off for ever.
+            let left_s = waiting.deadline.saturating_sub(unix_now());
+            let left_s = if left_s > u64::from(waiting.minutes) * 60 {
+                0
+            } else {
+                left_s
+            };
+            apply.confirm = Some(Confirm {
+                waiting,
+                due: Due::In(left_s * 1_000),
+            });
+            apply.log.push(format!(
+                "version {} waits for `ruster confirm`; it goes back to version {} in {left_s} s",
+                waiting.version, waiting.back_to
+            ));
         }
+        apply
+    }
+
+    /// The version waiting for `ruster confirm`, if one is.
+    pub fn waiting(&self) -> Option<Waiting> {
+        self.confirm.map(|c| c.waiting)
     }
 
     pub fn counters(&self) -> ApplyCounters {
@@ -174,6 +280,7 @@ impl Apply {
         prepare: &mut dyn FnMut(&Config) -> Vec<String>,
     ) -> Progress {
         let mut busy = self.finish(confd, now_ms, prepare);
+        busy |= self.go_back_when_due(confd, now_ms, prepare);
         let mut index = 0;
         while index < self.conns.len() {
             let id = self.conns[index].0;
@@ -218,9 +325,13 @@ impl Apply {
     ) -> Option<(Code, String)> {
         let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
         let busy = self.pending.is_some() || !confd.settled();
+        let mut confirm = None;
         let candidate = match (request.code, path.as_slice()) {
             (Code::GET, ["versions"]) => return Some((Code::CONTENT, self.versions.listing())),
-            (Code::POST, ["config"] | ["rollback", _]) if busy => {
+            (Code::POST, ["confirm"]) => return Some(self.confirmed()),
+            (Code::POST, ["config"] | ["config", "confirm-within", _] | ["rollback", _])
+                if busy =>
+            {
                 return Some((
                     Code::SERVICE_UNAVAILABLE,
                     "an earlier configuration is still waiting for answers".to_owned(),
@@ -232,6 +343,52 @@ impl Apply {
                     Code::SERVICE_UNAVAILABLE,
                     "an earlier configuration is still waiting for answers".to_owned(),
                 ))
+            }
+            (Code::POST, ["config"] | ["config", "confirm-within", _] | ["rollback", _])
+                if self.confirm.is_some() =>
+            {
+                let waiting = self.confirm.map(|c| c.waiting)?;
+                return Some((
+                    Code::SERVICE_UNAVAILABLE,
+                    format!(
+                        "version {} waits for `ruster confirm` (else it goes back to version {} \
+                         at {}); confirm it, or let it go back, first",
+                        waiting.version,
+                        waiting.back_to,
+                        utc(waiting.deadline)
+                    ),
+                ));
+            }
+            (Code::POST, ["config", "confirm-within", minutes]) => {
+                match minutes
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| minutes.parse::<u32>().ok())
+                    .flatten()
+                    .filter(|m| (1..=MAX_CONFIRM_MINUTES).contains(m))
+                {
+                    // Never without a version to go back to (confd always has one).
+                    Some(_) if self.versions.latest().is_none() => {
+                        return Some((
+                            Code::BAD_REQUEST,
+                            "there is no version to go back to".to_owned(),
+                        ))
+                    }
+                    Some(minutes) => confirm = Some(minutes),
+                    None => {
+                        return Some((
+                            Code::BAD_REQUEST,
+                            format!("{minutes}: minutes from 1 to {MAX_CONFIRM_MINUTES}"),
+                        ))
+                    }
+                }
+                std::str::from_utf8(&request.payload)
+                    .map_err(|_| "the file is not UTF-8".to_owned())
+                    .and_then(file::candidate)
+                    .map(|candidate| {
+                        let keep = Keep::new("apply".into(), candidate.lock, candidate.toml);
+                        (candidate.config, keep)
+                    })
             }
             (Code::POST, ["diff"]) => {
                 return Some(
@@ -248,11 +405,7 @@ impl Apply {
                 .map_err(|_| "the file is not UTF-8".to_owned())
                 .and_then(file::candidate)
                 .map(|candidate| {
-                    let keep = Keep {
-                        how: "apply".into(),
-                        lock: candidate.lock,
-                        toml: candidate.toml,
-                    };
+                    let keep = Keep::new("apply".into(), candidate.lock, candidate.toml);
                     (candidate.config, keep)
                 }),
             (Code::POST, ["rollback", number]) => {
@@ -277,11 +430,11 @@ impl Apply {
                 file::parse(&version.lock)
                     .map_err(|error| format!("version {number}: {error}{hint}"))
                     .map(|config| {
-                        let keep = Keep {
-                            how: format!("rollback to {number}"),
-                            lock: version.lock.clone(),
-                            toml: version.toml.clone(),
-                        };
+                        let keep = Keep::new(
+                            format!("rollback to {number}"),
+                            version.lock.clone(),
+                            version.toml.clone(),
+                        );
                         (config, keep)
                     })
             }
@@ -290,11 +443,107 @@ impl Apply {
         };
         match candidate {
             Err(error) => Some((Code::BAD_REQUEST, error)),
-            Ok((config, keep)) => {
+            Ok((config, mut keep)) => {
+                keep.confirm = confirm;
                 self.start(confd, config, keep, (id, &request.token), now_ms, prepare);
                 None
             }
         }
+    }
+
+    /// Answers `ruster confirm`: the waiting version stays.
+    fn confirmed(&mut self) -> (Code, String) {
+        let Some(confirm) = self.confirm else {
+            return (
+                Code::BAD_REQUEST,
+                "nothing waits for confirmation".to_owned(),
+            );
+        };
+        let (version, back_to) = (confirm.waiting.version, confirm.waiting.back_to);
+        if confirm.due == Due::GoingBack {
+            return (
+                Code::SERVICE_UNAVAILABLE,
+                format!("too late: version {back_to} is being sent again"),
+            );
+        }
+        self.confirm = None;
+        let answer = match self.versions.set_waiting(None) {
+            Ok(()) => (Code::CHANGED, format!("version {version} confirmed")),
+            Err(error) => (
+                Code::INTERNAL_SERVER_ERROR,
+                format!(
+                    "version {version} confirmed, but {error}: confd started again would \
+                     still go back to version {back_to}"
+                ),
+            ),
+        };
+        self.log.push(answer.1.clone());
+        answer
+    }
+
+    /// Goes back to the version before one not confirmed in time, once nothing else
+    /// is being applied.
+    fn go_back_when_due(
+        &mut self,
+        confd: &mut Confd,
+        now_ms: u64,
+        prepare: &mut dyn FnMut(&Config) -> Vec<String>,
+    ) -> bool {
+        let Some(confirm) = &mut self.confirm else {
+            return false;
+        };
+        if let Due::In(left_ms) = confirm.due {
+            confirm.due = Due::At(now_ms + left_ms);
+        }
+        let Due::At(at) = confirm.due else {
+            return false;
+        };
+        // Not waiting for the processes to settle: one that never answers must not
+        // keep the version in use. Going back has its own wait and give-up.
+        if now_ms < at || self.pending.is_some() {
+            return false;
+        }
+        let Waiting {
+            version, back_to, ..
+        } = confirm.waiting;
+        // A lock form from before an update may not read; its ruster.toml is then
+        // resolved again, as at start-up.
+        let config = match self.versions.get(back_to) {
+            None => Err("it is not kept".to_owned()),
+            Some(before) => match file::parse(&before.lock) {
+                Ok(config) => Ok((config, before.lock.clone(), before.toml.clone())),
+                Err(error) => match before.toml.as_deref().map(file::candidate) {
+                    Some(Ok(c)) => Ok((c.config, c.lock, before.toml.clone())),
+                    _ => Err(error),
+                },
+            },
+        };
+        match config {
+            Ok((config, lock, toml)) => {
+                let how = if self.versions.get(version).is_some() {
+                    format!("back to {back_to}: version {version} was not confirmed")
+                } else {
+                    format!("back to {back_to}: the configuration after it was not kept")
+                };
+                let mut keep = Keep::new(how, lock, toml);
+                keep.going_back = true;
+                confirm.due = Due::GoingBack;
+                self.log.push(format!(
+                    "version {version} was not confirmed in time; going back to version {back_to}"
+                ));
+                self.start(confd, config, keep, (NO_CONNECTION, &[]), now_ms, prepare);
+            }
+            Err(error) => {
+                // Nothing to go back to: what is in use stays.
+                self.confirm = None;
+                let _ = self.versions.set_waiting(None);
+                self.log.push(format!(
+                    "version {version} was not confirmed in time, but version {back_to} \
+                     cannot be put back ({error}); version {version} stays"
+                ));
+            }
+        }
+        true
     }
 
     /// What `candidate` would change, as text for a person ([`crate::diff`]).
@@ -373,7 +622,7 @@ impl Apply {
         if refusal.is_none() && !answered && waited >= GIVE_UP_MS && pending.timed_out {
             // The configuration stays, so it is the latest version.
             if let Some(pending) = self.pending.take() {
-                let _ = self.keep(pending.keep);
+                let _ = self.keep(pending.keep, now_ms);
             }
             self.counters.gave_up += 1;
             return true;
@@ -384,11 +633,17 @@ impl Apply {
             }
             pending.timed_out = true;
             let (conn, token) = (pending.conn, pending.token.clone());
-            let lines = vec![
+            let mut lines = vec![
                 "a process has not answered in time; confd keeps waiting up to 30 s and \
                  goes back to the configuration before if it is refused"
                     .to_owned(),
             ];
+            if let Some(minutes) = pending.keep.confirm {
+                lines.push(format!(
+                    "if it is kept, it then waits {minutes} min for `ruster confirm`; \
+                     see `ruster versions`"
+                ));
+            }
             self.reply(conn, &token, Code::GATEWAY_TIMEOUT, absent(confd, lines));
             return true;
         }
@@ -406,11 +661,22 @@ impl Apply {
                 ];
                 lines.extend(prepare(&confd.with_values_of(&pending.previous)));
                 confd.set_config(pending.previous);
+                if pending.keep.going_back {
+                    // The version not confirmed stays for now; confd tries again.
+                    if let Some(confirm) = &mut self.confirm {
+                        confirm.due = Due::At(now_ms + GO_BACK_RETRY_MS);
+                    }
+                    self.log.push(format!(
+                        "going back was refused ({}); trying again in {} s",
+                        lines[0],
+                        GO_BACK_RETRY_MS / 1_000
+                    ));
+                }
                 (Code::BAD_REQUEST, lines)
             }
             None => {
                 let mut lines = pending.notes;
-                let (code, line) = match self.keep(pending.keep) {
+                let (code, line) = match self.keep(pending.keep, now_ms) {
                     Ok(line) => (Code::CHANGED, line),
                     Err(line) => (Code::INTERNAL_SERVER_ERROR, line),
                 };
@@ -427,14 +693,53 @@ impl Apply {
 
     /// Keeps the configuration taken as the next version, and says so in the log and
     /// in the line returned for the answer.
-    fn keep(&mut self, keep: Keep) -> Result<String, String> {
+    ///
+    /// For one that waits for `ruster confirm`, the deadline is written before the
+    /// version, so that confd stopped in between and started again still goes back.
+    /// If either cannot be written, confd goes back at once.
+    fn keep(&mut self, keep: Keep, now_ms: u64) -> Result<String, String> {
         let before = self.versions.latest().map(|v| v.number);
-        let kept = self
-            .versions
-            .commit(&keep.how, &keep.lock, keep.toml.as_deref());
-        let line = match &kept {
-            Ok(number) => format!("kept as version {number} ({})", keep.how),
-            Err(error) => {
+        let mut kept = Err(String::new());
+        if let (Some(minutes), Some(back_to)) = (keep.confirm, before) {
+            let waiting = Waiting {
+                version: back_to + 1,
+                back_to,
+                deadline: unix_now() + u64::from(minutes) * 60,
+                minutes,
+            };
+            self.confirm = Some(Confirm {
+                waiting,
+                due: Due::At(now_ms + u64::from(minutes) * 60_000),
+            });
+            kept = self.versions.set_waiting(Some(waiting)).map(|()| 0);
+        }
+        if keep.confirm.is_none() || kept.is_ok() {
+            kept = self
+                .versions
+                .commit(&keep.how, &keep.lock, keep.toml.as_deref());
+        }
+        let line = match (&kept, self.confirm) {
+            (Ok(number), Some(confirm)) if keep.confirm.is_some() => format!(
+                "kept as version {number} ({}); it goes back to version {} at {} unless \
+                 `ruster confirm` comes first",
+                keep.how,
+                confirm.waiting.back_to,
+                utc(confirm.waiting.deadline)
+            ),
+            (Ok(number), _) => format!("kept as version {number} ({})", keep.how),
+            (Err(error), Some(confirm)) if keep.confirm.is_some() => {
+                self.confirm = Some(Confirm {
+                    due: Due::At(now_ms),
+                    ..confirm
+                });
+                let _ = self.versions.set_waiting(None);
+                format!(
+                    "the configuration is in use but was not kept as a version ({error}); \
+                     going back to version {} now",
+                    confirm.waiting.back_to
+                )
+            }
+            (Err(error), _) => {
                 let back = before.map_or("the file it was started with".into(), |n| {
                     format!("version {n}")
                 });
@@ -444,6 +749,16 @@ impl Apply {
                 )
             }
         };
+        // Once the version before is back in use, nothing waits any more. If it was not
+        // kept, the deadline stays on disk, so confd started again goes back too.
+        if keep.going_back {
+            self.confirm = None;
+            if kept.is_ok() {
+                if let Err(error) = self.versions.set_waiting(None) {
+                    self.log.push(error);
+                }
+            }
+        }
         self.log.push(line.clone());
         kept.map(|_| line.clone()).map_err(|_| line)
     }

@@ -104,15 +104,11 @@ ruster-neighd &
 ruster-confd --kernel --state-dir /var/lib/ruster/confd router.toml &   # --kernel: ルータ宛ての通信のTUNとアドレスも作る
 ```
 
-FEは既定でAF_XDPを使い、各デバイスのqueue 0にXDPのプログラムを付けます（`--xdp-attach native|generic`、
-`--zero-copy`）。`--backend af-packet`ではAF_PACKETを使います。AF_PACKETはkernelからフレームを取り上げないので、
-FEに渡すデバイスにはkernelのアドレスや経路を付けず、kernelでの転送も切っておきます。
-どちらでも、FEのポートのMACはデバイスのMACと同じにします。
+FEは既定でAF_XDPを使い、各デバイスのqueue 0にXDPのプログラムを付けます（`--xdp-attach native|generic`、`--zero-copy`）。`--backend af-packet`ではAF_PACKETを使います。
+AF_PACKETはkernelからフレームを取り上げないので、FEに渡すデバイスにはkernelのアドレスや経路を付けず、kernelでの転送も切っておきます。どちらでも、FEのポートのMACはデバイスのMACと同じにします。
 
-ルータ宛ての通信（ping、SSH、DNSなど）は、VRFごとのTUN（`rt-<VRF名>`）でルータのkernelに渡ります。
-`confd --kernel`がTUNとVRFデバイスを作ってルータのアドレスを付け、kernelでの転送を止めます。
-既定経路を置き換えるので、ルータ専用のnetnsで動かします。FEのポートは、どのバックエンドでも
-アドレスの無いVRFに入れておきます（kernelがポートで受けたフレームを自分宛てとして扱わないように）。
+ルータ宛ての通信（ping、SSH、DNSなど）は、VRFごとのTUN（`rt-<VRF名>`）でルータのkernelに渡ります。`confd --kernel`がTUNとVRFデバイスを作ってルータのアドレスを付け、kernelでの転送を止めます。
+既定経路を置き換えるので、ルータ専用のnetnsで動かします。FEのポートは、どのバックエンドでもアドレスの無いVRFに入れておきます（kernelがポートで受けたフレームを自分宛てとして扱わないように）。
 
 どのプロセスも準備ができるとsystemdに知らせるので、unitは`Type=notify`にできます。FEはSIGTERMかSIGINTで、
 kernelに渡したフレームが戻るのを最大1秒待ってから止まります（二度目のシグナルですぐ止まる）。
@@ -126,6 +122,8 @@ ruster check router.toml                     # confdと同じ読み方で設定�
 ruster resolve router.toml                   # 既定値を全部埋めた形（lockの形）を表示する
 ruster diff router.toml                      # 反映せずに、何が変わるかを表示する
 ruster apply router.toml                     # 確かめてから、動いているconfdの設定を置き換える
+ruster apply --confirm-within 10 router.toml  # 同じ。10分以内にconfirmが無ければ前の版に戻す
+ruster confirm                               # 待っている版をそのまま使う
 ruster versions                              # confdが残した版の一覧（新しい順）
 ruster rollback 3                            # 版3の設定を、新しい版として使い直す
 ruster show                                  # FEが持っている表を全部表示する
@@ -134,7 +132,7 @@ ruster route del --source routed 203.0.113.0/24
 ```
 
 `apply`は、confdが変わった分をFE、ribd、neighdへ送り、全部が受け取ってから答えます。どれかが断るとconfdは前の設定に戻します。全部が受け取った設定は、confdが番号付きの版として`--state-dir`に残します（最新の50個）。
-confdは起動すると残した最新の版を使い、起動時のファイルは版がまだ無いときだけ読みます（それが版1になる）。ファイルから始め直すときは、`--state-dir`を空にします。`--state-dir`が無いと版はメモリにだけあり、起動し直すとファイルを読みます。
+confdは起動すると残した最新の版を使い、起動時のファイルは版がまだ無いときだけ読みます（それが版1になる）。ファイルから始め直すときは、`--state-dir`を空にします。`--state-dir`が無いと版はメモリにだけあり、起動し直すとファイルを読みます。`--confirm-within`の時刻もconfdが`--state-dir`に持つので、CLIが切れても、confdが起動し直しても戻ります。
 
 `route`は、ルーティングデーモンと同じように、ribdの送り手（ここでは`routed`。ribdを`confd:1 routed:20`のように起動しておく）として経路を書きます。ribdは送り手の優先度で選んでFEへ渡します。
 

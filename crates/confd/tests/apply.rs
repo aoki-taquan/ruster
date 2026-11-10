@@ -75,7 +75,7 @@ impl Rig {
             now_ms: 0,
         };
         rig.answers();
-        assert_eq!(rig.mtu(), Some(1500));
+        assert_eq!(rig.mtu(), Some(rig.confd.config().interfaces[0].mtu));
         rig
     }
 
@@ -478,4 +478,244 @@ fn a_diff_shows_the_changes_and_sends_nothing() {
     let answers = rig.answers();
     assert_eq!(answers.len(), 1, "{answers:?}");
     assert_eq!(answers[0].0, Code::SERVICE_UNAVAILABLE, "{answers:?}");
+}
+
+const MINUTE_MS: u64 = 60_000;
+
+/// Applies `text(mtu)` to wait `minutes` for `ruster confirm`, and returns the answer.
+fn apply_to_confirm(rig: &mut Rig, mtu: u16, minutes: &str) -> (Code, String) {
+    rig.cli
+        .post(&["config", "confirm-within", minutes], text(mtu).as_bytes());
+    let mut answers = rig.answers();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    answers.remove(0)
+}
+
+#[test]
+fn a_confirmed_version_stays() {
+    let mut rig = Rig::new();
+    let (code, said) = apply_to_confirm(&mut rig, 1400, "10");
+    assert_eq!(code, Code::CHANGED, "{said}");
+    assert!(
+        said.contains("kept as version 2 (apply); it goes back to version 1 at "),
+        "{said}"
+    );
+    assert!(
+        said.contains(" UTC unless `ruster confirm` comes first\n"),
+        "{said}"
+    );
+    assert_eq!(rig.mtu(), Some(1400));
+    let waiting = rig.apply.waiting().unwrap();
+    assert_eq!(
+        (waiting.version, waiting.back_to, waiting.minutes),
+        (2, 1, 10)
+    );
+
+    // Meanwhile nothing else is applied; a diff is still shown, and the list says so.
+    rig.cli.post(&["config"], text(1300).as_bytes());
+    rig.cli.post(&["rollback", "1"], b"");
+    rig.cli.post(&["diff"], text(1300).as_bytes());
+    rig.cli.get(&["versions"]);
+    let answers = rig.answers();
+    for answer in &answers[..2] {
+        assert_eq!(answer.0, Code::SERVICE_UNAVAILABLE, "{answers:?}");
+        assert!(
+            answer.1.contains("version 2 waits for `ruster confirm`"),
+            "{answers:?}"
+        );
+    }
+    assert_eq!(answers[2].0, Code::CONTENT, "{answers:?}");
+    assert!(
+        answers[3]
+            .1
+            .lines()
+            .next()
+            .unwrap()
+            .contains("goes back to version 1 at"),
+        "{answers:?}"
+    );
+
+    rig.cli.post(&["confirm"], b"");
+    let answers = rig.answers();
+    assert_eq!(
+        answers[0],
+        (Code::CHANGED, "version 2 confirmed".to_owned())
+    );
+    assert!(rig.apply.waiting().is_none());
+    // Long after, it stays.
+    rig.now_ms = 11 * MINUTE_MS;
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1400));
+    rig.cli.post(&["confirm"], b"");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    assert!(answers[0].1.contains("nothing waits"), "{answers:?}");
+}
+
+#[test]
+fn a_version_not_confirmed_in_time_goes_back_as_a_new_version() {
+    let mut rig = Rig::new();
+    apply_to_confirm(&mut rig, 1400, "1");
+    rig.now_ms = MINUTE_MS - 1;
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1400), "not yet");
+    rig.now_ms = MINUTE_MS;
+    assert!(rig.answers().is_empty(), "no one is answered");
+    assert_eq!(rig.mtu(), Some(1500));
+    let latest = rig.apply.versions().latest().unwrap();
+    assert_eq!(latest.number, 3);
+    assert_eq!(latest.how, "back to 1: version 2 was not confirmed");
+    assert_eq!(latest.lock, rig.apply.versions().get(1).unwrap().lock);
+    assert!(rig.apply.waiting().is_none());
+    // A confirm comes too late; the next file goes through.
+    rig.cli.post(&["confirm"], b"");
+    rig.cli.post(&["config"], text(1300).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    assert_eq!(answers[1].0, Code::CHANGED, "{answers:?}");
+}
+
+#[test]
+fn a_refused_going_back_is_tried_again() {
+    let mut rig = Rig::new();
+    apply_to_confirm(&mut rig, 1400, "1");
+    rig.check.refuse_mtu = Some(1500);
+    rig.now_ms = MINUTE_MS;
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1400), "the FE refused going back");
+    assert_eq!(rig.apply.waiting().unwrap().version, 2, "it still waits");
+    let log = rig.apply.take_log().join("\n");
+    assert!(log.contains("going back was refused"), "{log}");
+    rig.check.refuse_mtu = None;
+    rig.now_ms = MINUTE_MS + 60_000;
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1500));
+    assert!(rig.apply.waiting().is_none());
+}
+
+#[test]
+fn a_process_that_never_answers_does_not_stop_going_back() {
+    let mut rig = Rig::new();
+    // The FE stops reading, its socket still open: the confirmed apply times out,
+    // and confd gives up waiting and keeps it.
+    let _silent = std::mem::take(&mut rig.fe);
+    rig.cli
+        .post(&["config", "confirm-within", "1"], text(1400).as_bytes());
+    assert!(rig.answers().is_empty());
+    rig.now_ms = ANSWER_WAIT_MS;
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::GATEWAY_TIMEOUT, "{answers:?}");
+    assert!(
+        answers[0].1.contains("waits 1 min for `ruster confirm`"),
+        "{answers:?}"
+    );
+    rig.now_ms = GIVE_UP_MS;
+    rig.answers();
+    assert_eq!(rig.apply.waiting().unwrap().version, 2);
+
+    // At the deadline confd goes back all the same, and gives up waiting for the FE.
+    rig.now_ms = GIVE_UP_MS + MINUTE_MS;
+    rig.answers();
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1500);
+    rig.now_ms += GIVE_UP_MS;
+    rig.answers();
+    assert!(rig.apply.waiting().is_none());
+    let latest = rig.apply.versions().latest().unwrap();
+    assert_eq!(latest.how, "back to 1: version 2 was not confirmed");
+}
+
+#[test]
+fn a_deadline_beyond_the_wait_given_goes_back_at_once() {
+    let dir = state_dir("confirm-clock");
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    apply_to_confirm(&mut rig, 1400, "5");
+    drop(rig);
+    // As if the clock had gone back an hour before confd started again.
+    let mut versions = Versions::open(&dir).unwrap();
+    let mut waiting = versions.waiting().unwrap();
+    waiting.deadline += 3_600;
+    versions.set_waiting(Some(waiting)).unwrap();
+
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1500));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_refused_or_bad_confirmed_apply_does_not_wait() {
+    let mut rig = Rig::new();
+    for minutes in ["0", "x", "1441", "+1"] {
+        let (code, said) = apply_to_confirm(&mut rig, 1400, minutes);
+        assert_eq!(code, Code::BAD_REQUEST, "{minutes}: {said}");
+        assert!(said.contains("minutes from 1 to 1440"), "{said}");
+    }
+    rig.check.refuse_mtu = Some(1400);
+    let (code, _) = apply_to_confirm(&mut rig, 1400, "1");
+    assert_eq!(code, Code::BAD_REQUEST);
+    assert!(rig.apply.waiting().is_none());
+    assert_eq!(rig.apply.versions().latest().unwrap().number, 1);
+}
+
+#[test]
+fn confd_started_again_in_the_window_still_goes_back() {
+    let dir = state_dir("confirm-restart");
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    apply_to_confirm(&mut rig, 1400, "1");
+    drop(rig);
+
+    // confd started again: it runs version 2 and keeps counting.
+    let versions = Versions::open(&dir).unwrap();
+    let waiting = versions.waiting().unwrap();
+    assert_eq!((waiting.version, waiting.back_to), (2, 1));
+    let mut rig = Rig::with(versions);
+    assert_eq!(rig.mtu(), Some(1400));
+    let log = rig.apply.take_log().join("\n");
+    assert!(
+        log.contains("version 2 waits for `ruster confirm`"),
+        "{log}"
+    );
+    rig.now_ms = MINUTE_MS + 1_000;
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1500));
+    drop(rig);
+
+    // Started again after that, it runs the version put back, and nothing waits.
+    let versions = Versions::open(&dir).unwrap();
+    assert!(versions.waiting().is_none());
+    assert_eq!(versions.latest().unwrap().number, 3);
+    assert!(!dir.join("versions/confirm.toml").exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn confd_started_again_after_the_deadline_goes_back_at_once() {
+    let dir = state_dir("confirm-late");
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    apply_to_confirm(&mut rig, 1400, "5");
+    drop(rig);
+    // As if confd had been down past the deadline.
+    let mut versions = Versions::open(&dir).unwrap();
+    let mut waiting = versions.waiting().unwrap();
+    waiting.deadline -= 10 * 60;
+    versions.set_waiting(Some(waiting)).unwrap();
+
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1500));
+    assert_eq!(rig.apply.versions().latest().unwrap().number, 3);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_deadline_that_cannot_be_written_goes_back_at_once() {
+    let dir = state_dir("confirm-unwritable");
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+    let (code, said) = apply_to_confirm(&mut rig, 1400, "10");
+    assert_eq!(code, Code::INTERNAL_SERVER_ERROR, "{said}");
+    assert!(said.contains("going back to version 1 now"), "{said}");
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1500));
+    assert!(rig.apply.waiting().is_none());
 }
