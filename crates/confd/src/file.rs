@@ -706,11 +706,18 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let dhcp6 = crate::dhcp6::check(lock.dhcp6, &interfaces)?;
     let ra = crate::ra::check(lock.ra, &interfaces)?;
     let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
+    let dhcp_client = crate::dhcp_client::check(lock.dhcp_client, &interfaces, &sources)?;
     // The FE takes at most this many punt classes besides its own.
-    if dhcp.len() + dhcp6.len() + crate::pppoe::class_count(&pppoe) > PUNT_CLASSES_MAX {
+    if dhcp.len()
+        + dhcp6.len()
+        + crate::pppoe::class_count(&pppoe)
+        + crate::dhcp_client::class_count(&dhcp_client)
+        > PUNT_CLASSES_MAX
+    {
         return Err(format!(
-            "dhcp, dhcp6 and the parents of pppoe take more than {PUNT_CLASSES_MAX} punt \
-             classes (one per dhcp and dhcp6, two per parent)"
+            "dhcp, dhcp6, dhcp-client and the parents of pppoe take more than \
+             {PUNT_CLASSES_MAX} punt classes (one per dhcp, dhcp6 and protocol of a \
+             dhcp-client, two per parent)"
         ));
     }
     Ok(Config {
@@ -727,6 +734,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         ra,
         sources,
         pppoe,
+        dhcp_client,
     })
 }
 

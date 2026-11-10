@@ -29,6 +29,7 @@
 //! | `dhcp` | `ruster-kea` | [`ruster_config::dhcp_part`] |
 //! | `ra` | `ruster-neighd` | [`ruster_config::ra_part`] |
 //! | `pppoe` | `ruster-pppoed` | [`ruster_config::pppoe_part`] |
+//! | `dhcpc` | `ruster-dhcpc` | [`ruster_config::dhcp_client_part`] |
 //!
 //! [`Client`] is the process's side.
 //!
@@ -67,10 +68,17 @@ pub enum Module {
     Dhcp,
     Ra,
     Pppoe,
+    Dhcpc,
 }
 
 impl Module {
-    pub const ALL: [Module; 4] = [Module::Dns, Module::Dhcp, Module::Ra, Module::Pppoe];
+    pub const ALL: [Module; 5] = [
+        Module::Dns,
+        Module::Dhcp,
+        Module::Ra,
+        Module::Pppoe,
+        Module::Dhcpc,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -78,6 +86,7 @@ impl Module {
             Self::Dhcp => "dhcp",
             Self::Ra => "ra",
             Self::Pppoe => "pppoe",
+            Self::Dhcpc => "dhcpc",
         }
     }
 
@@ -92,6 +101,7 @@ impl Module {
             Self::Dhcp => ruster_config::dhcp_part(&config.dhcp, &config.dhcp6),
             Self::Ra => ruster_config::ra_part(&config.ra),
             Self::Pppoe => ruster_config::pppoe_part(&config.pppoe),
+            Self::Dhcpc => ruster_config::dhcp_client_part(&config.dhcp_client),
         }
     }
 
@@ -102,6 +112,7 @@ impl Module {
             Self::Dhcp => !config.dhcp.is_empty() || !config.dhcp6.is_empty(),
             Self::Ra => !config.ra.is_empty(),
             Self::Pppoe => !config.pppoe.is_empty(),
+            Self::Dhcpc => !config.dhcp_client.is_empty(),
         }
     }
 }

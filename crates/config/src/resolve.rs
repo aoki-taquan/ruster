@@ -39,6 +39,8 @@ struct File {
     source: Vec<SourceEntry>,
     #[serde(default)]
     pppoe: Vec<PppoeClientEntry>,
+    #[serde(default)]
+    dhcp_client: Vec<crate::dhcp_client::DhcpClientEntry>,
 }
 
 #[derive(Deserialize)]
@@ -418,6 +420,11 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .into_iter()
         .map(|entry| pppoe(entry, &interfaces))
         .collect::<Result<_, _>>()?;
+    let dhcp_client = file
+        .dhcp_client
+        .into_iter()
+        .map(|entry| crate::dhcp_client::resolve(entry, &interfaces))
+        .collect::<Result<_, _>>()?;
     Ok(Lock {
         version: VERSION,
         firewall_filtering: filtering(file.firewall_filtering),
@@ -437,6 +444,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         ra,
         source,
         pppoe,
+        dhcp_client,
     })
 }
 
