@@ -21,8 +21,8 @@
 //!   MAX_INITIAL_RTR_ADVERTISEMENTS (3) at most MAX_INITIAL_RTR_ADVERT_INTERVAL
 //!   (16 s) apart. The same again when the interface's settings change.
 //! - RFC 4861 section 6.2.6: a solicitation is answered after a random delay of up
-//!   to MAX_RA_DELAY_TIME (500 ms) with a multicast advertisement, at least
-//!   MIN_DELAY_BETWEEN_RAS (3 s) after the last multicast one, which resets the
+//!   to MAX_RA_DELAY_TIME (500 ms) with a multicast advertisement, or that delay
+//!   after MIN_DELAY_BETWEEN_RAS (3 s) from the last multicast one, which resets the
 //!   unsolicited interval; when one is scheduled already, or the next unsolicited one
 //!   comes no later, nothing more is scheduled.
 //! - RFC 4861 section 6.2.5: an interface that stops advertising sends
@@ -164,7 +164,8 @@ impl Schedule {
         self.answer_at = None;
     }
 
-    fn earliest(&self, at: u64) -> u64 {
+    /// `at`, or MIN_DELAY_BETWEEN_RAS after the last one when that is later.
+    pub fn earliest(&self, at: u64) -> u64 {
         self.last_sent
             .map_or(at, |last| at.max(last + MIN_DELAY_BETWEEN_RAS_MS))
     }
@@ -174,7 +175,15 @@ impl Schedule {
         if self.answer_at.is_some() {
             return;
         }
-        let at = self.earliest(now_ms + rng.between(0, MAX_RA_DELAY_TIME_MS));
+        let delay = rng.between(0, MAX_RA_DELAY_TIME_MS);
+        // Within MIN_DELAY_BETWEEN_RAS of the last one: that much after it, plus the
+        // delay.
+        let at = match self.last_sent {
+            Some(last) if now_ms < last + MIN_DELAY_BETWEEN_RAS_MS => {
+                last + MIN_DELAY_BETWEEN_RAS_MS + delay
+            }
+            _ => now_ms + delay,
+        };
         if self.next_at > at {
             self.answer_at = Some(at);
         }
@@ -329,7 +338,7 @@ mod tests {
             gaps.push(schedule.due_at() - now);
             now = schedule.due_at();
         }
-        for gap in &gaps[..2] {
+        for gap in &gaps[..3] {
             assert!(*gap <= MAX_INITIAL_RTR_ADVERT_INTERVAL_MS, "{gaps:?}");
         }
         for gap in &gaps[3..] {
@@ -348,16 +357,18 @@ mod tests {
         let mut schedule = Schedule::new(0);
         schedule.sent(&ra, 0, &mut rng);
         let unsolicited = schedule.due_at();
-        // Within 3 s of the last one: at 3 s.
+        // Within 3 s of the last one: 3 s after it, and the delay.
         schedule.solicited(1_000, &mut rng);
-        assert_eq!(schedule.due_at(), MIN_DELAY_BETWEEN_RAS_MS);
+        let answer = schedule.due_at();
+        assert!((3_000..=3_500).contains(&answer), "{answer}");
         // A second solicitation before then changes nothing.
         schedule.solicited(2_000, &mut rng);
-        assert_eq!(schedule.due_at(), MIN_DELAY_BETWEEN_RAS_MS);
-        schedule.sent(&ra, 3_000, &mut rng);
+        assert_eq!(schedule.due_at(), answer);
+        schedule.sent(&ra, answer, &mut rng);
         assert_ne!(schedule.due_at(), unsolicited, "the interval starts again");
         // Long after: within 500 ms.
         let later = schedule.due_at() - 10_000;
+        assert!(later > answer + MIN_DELAY_BETWEEN_RAS_MS);
         schedule.solicited(later, &mut rng);
         assert!((later..=later + MAX_RA_DELAY_TIME_MS).contains(&schedule.due_at()));
         // When the unsolicited one comes first anyway, no answer is scheduled.
