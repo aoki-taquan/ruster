@@ -69,7 +69,7 @@ FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don
 cargo build --workspace --locked
 ```
 
-confdが読む設定ファイルはTOMLです。書き方の全体は`crates/config`の説明にあります。
+confdが読む設定ファイルはTOMLです。書き方の全体は`crates/config`の説明にあります。既定値を全部埋めたlockの形（`ruster resolve`の出力）もそのまま読めます。
 
 ```toml
 [[interface]]
