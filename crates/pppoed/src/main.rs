@@ -42,7 +42,7 @@ use ruster_pppoed::session::{
 use ruster_pppoed::writer::{self, Writer};
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::punt::{reason, Direction, Punt};
-use ruster_proto::table::{format_mac, parse_mac, RouteAction, Value};
+use ruster_proto::table::{format_mac, parse_mac, Change, Key};
 use ruster_proto::task::Progress;
 
 /// How long to wait for confd at start-up.
@@ -219,23 +219,41 @@ impl Daemon {
                 )
             })
             .set(writer::source_values(&entry.source, up));
-        if entry.default_route || self.ribd.is_some() {
-            let route = writer::default_route(
-                &entry.vrf,
-                &entry.interface,
-                up.filter(|_| entry.default_route),
-            );
-            let ribd = self
-                .ribd
-                .get_or_insert_with(|| Writer::new(run_dir.join(socket::ribd_source(NAME)), None));
-            // Another session's route for the VRF is not taken away.
-            let other = ribd.held().contains_key(&route.key)
-                && route.value.is_none()
-                && !matches!(ribd.held().get(&route.key), Some(Value::Route(RouteAction::Forward(hops))) if hops.iter().any(|h| h.interface == entry.interface));
-            if !other {
-                ribd.set(vec![route]);
+        self.routes();
+    }
+
+    /// Sends ribd the default routes of the sessions that want one: per VRF, out of
+    /// the first such session that is up with an address. Made again from all the
+    /// sessions each time, so a session that stopped or moved leaves none behind.
+    fn routes(&mut self) {
+        let mut want: BTreeMap<Key, Change> = BTreeMap::new();
+        for (entry, session) in &self.sessions {
+            if !entry.default_route {
+                continue;
+            }
+            let route = writer::default_route(&entry.vrf, &entry.interface, session.up());
+            if route.value.is_some() {
+                want.entry(route.key.clone()).or_insert(route);
             }
         }
+        if want.is_empty()
+            && self.ribd.is_none()
+            && !self.sessions.iter().any(|(e, _)| e.default_route)
+        {
+            return;
+        }
+        let run_dir = &self.run_dir;
+        let ribd = self
+            .ribd
+            .get_or_insert_with(|| Writer::new(run_dir.join(socket::ribd_source(NAME)), None));
+        let mut changes: Vec<Change> = ribd
+            .held()
+            .keys()
+            .filter(|key| !want.contains_key(*key))
+            .map(|key| Change::delete(key.clone()))
+            .collect();
+        changes.extend(want.into_values());
+        ribd.set(changes);
     }
 
     /// Takes a new `pppoe` part: sessions whose settings are the same keep running,
@@ -263,6 +281,7 @@ impl Daemon {
                 self.write(&entry, None);
             }
         }
+        self.routes();
         Ok(())
     }
 

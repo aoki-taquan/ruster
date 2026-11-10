@@ -245,6 +245,7 @@ echo "ok: the outside cannot open TCP into the LAN"
 # comes up and the LAN gets through again.
 ns_kill "$ac" pppd TERM
 wait_line '^down pppoe-wan reason=(peer-terminated|ac-terminated)$' || fail "no down line"
+: >"$work/pppoed.out"
 gone=0
 for _ in $(seq 1 50); do
   if ! nsx "$router" "$bin/ruster" --run-dir "$run_dir" show | grep -q "^interface ppp "; then gone=1; break; fi
@@ -252,7 +253,6 @@ for _ in $(seq 1 50); do
 done
 (( gone == 1 )) || fail "the session interface stays after the session went down"
 echo "ok: the session interface goes with the session"
-: >"$work/pppoed.out"
 wait_line '^up pppoe-wan ' || fail "no new session"
 reach || fail "the LAN does not get through the new session"
 echo "ok: a new session comes up and the LAN gets through again"
