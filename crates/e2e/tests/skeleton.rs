@@ -73,6 +73,7 @@ fn config() -> Config {
         nat: None,
         dns: None,
         dhcp: Vec::new(),
+        ra: Vec::new(),
         sources: Vec::new(),
     }
 }

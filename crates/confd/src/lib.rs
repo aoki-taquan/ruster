@@ -6,7 +6,7 @@
 //! | To | What |
 //! |---|---|
 //! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP to `ruster-kea` |
-//! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
+//! | neighd | interfaces and addresses (to answer ARP and choose source addresses); the `ra` part on `confd/part.sock` |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
 //! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
 //!
@@ -39,6 +39,7 @@ pub mod apply;
 pub mod file;
 pub mod kernel;
 pub mod part;
+pub mod ra;
 pub mod source;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +110,9 @@ pub struct Config {
     pub dns: Option<ruster_config::Dns>,
     /// The DHCP servers, one per interface, checked; confd hands them to `ruster-kea`.
     pub dhcp: Vec<ruster_config::Dhcp>,
+    /// The Router Advertisements, one per interface, checked; confd hands them to
+    /// neighd.
+    pub ra: Vec<ruster_config::Ra>,
     /// The daemons that send values found at run time ([`source`]).
     pub sources: Vec<source::Spec>,
 }
@@ -1036,6 +1040,7 @@ mod tests {
             nat: None,
             dns: None,
             dhcp: Vec::new(),
+            ra: Vec::new(),
             sources: Vec::new(),
         });
         let routes = confd.routes();
@@ -1091,6 +1096,7 @@ mod tests {
             nat: None,
             dns: None,
             dhcp: Vec::new(),
+            ra: Vec::new(),
             sources: Vec::new(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);

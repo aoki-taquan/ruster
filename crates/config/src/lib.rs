@@ -142,6 +142,27 @@
 //! punt-burst = 100             # hands ruster-kea from the interface, and at once;
 //!                              # these when left out
 //!
+//! [[ra]]                       # optional: Router Advertisements (neighd) on one
+//!                              # interface; one [[ra]] per interface. They
+//!                              # advertise the prefixes of the interface's /64
+//!                              # addresses (not link-local), on-link and for SLAAC
+//! interface = "lan"
+//! max-interval = 600           # optional, seconds; RFC 4861 6.2.1's defaults:
+//! min-interval = 198           # 0.33 of max-interval (0.75 below 9 s)
+//! router-lifetime = 1800       # 3 times max-interval; 0: not a default router
+//! hop-limit = 64
+//! managed = false              # M: addresses from DHCPv6
+//! other = false                # O: other settings from DHCPv6
+//! mtu = 1500                   # an MTU option; none when left out
+//! reachable-time = 0           # milliseconds; 0: unspecified
+//! retrans-timer = 0
+//! valid-lifetime = 2592000     # of each prefix, seconds
+//! preferred-lifetime = 604800
+//! dns = ["2001:db8:1::1"]      # a Recursive DNS Server option (RFC 8106); when
+//!                              # left out, the interface's addresses [dns]
+//!                              # listens on, else none
+//! dns-lifetime = 1800          # 3 times max-interval
+//!
 //! [[source]]                   # optional: a daemon that sends confd values found
 //!                              # at run time, on confd/source/<name>.sock
 //! name = "pppoe-wan"           # lower-case letters, digits and -, from a letter
@@ -247,6 +268,29 @@
 //! punt-rate = 200
 //! punt-burst = 100
 //!
+//! [[ra]]                       # the prefixes' lifetimes are in [[ra.prefix]]
+//! interface = "lan"
+//! min-interval = 198
+//! max-interval = 600
+//! router-lifetime = 1800
+//! hop-limit = 64
+//! managed = false
+//! other = false
+//! mtu = []                     # none or one
+//! reachable-time = 0
+//! retrans-timer = 0
+//! dns = []
+//! dns-lifetime = 1800
+//! prefix-from = []             # the sources whose delegated prefixes it advertises
+//!                              # too (a WAN DHCPv6 client); none can be given yet
+//!
+//! [[ra.prefix]]                # the interface's /64s, from its addresses
+//! prefix = "2001:db8:1::/64"
+//! on-link = true
+//! autonomous = true
+//! valid-lifetime = 2592000
+//! preferred-lifetime = 604800
+//!
 //! [[source]]
 //! name = "pppoe-wan"
 //! kind = "pppoe"
@@ -265,13 +309,24 @@
 //! - RFC 6333 section 5.7: a DS-Lite tunnel with no IPv4 address gets the B4's,
 //!   192.0.0.2/29, if no earlier interface of its VRF has that address or its
 //!   prefix (so only the first such tunnel of a VRF gets it).
+//! - RFC 4861 section 6.2.1: `[[ra]]`'s defaults are the router configuration
+//!   variables' (AdvCurHopLimit the IANA value for IPv6, 64). Deviation: below 9 s
+//!   MinRtrAdvInterval is 0.75 of MaxRtrAdvInterval, not MaxRtrAdvInterval, which
+//!   the same section's upper bound for it refuses. RFC 4862 section 5.5.3: only the
+//!   prefixes of /64 addresses are advertised (for SLAAC on Ethernet, RFC 2464). RFC
+//!   8106 section 5.1: the DNS servers' lifetime is 3 times MaxRtrAdvInterval.
 //! - RFC 4787 REQ-8 and RFC 5382 REQ-3: NAT and the firewall filter
 //!   endpoint-independently by default.
 
+mod ra;
 mod resolve;
 
 use serde::{Deserialize, Serialize};
 
+pub use ra::{
+    parse_ra_part, ra_min_interval, ra_part, Ra, RaPrefix, RA_HOP_LIMIT, RA_MAX_INTERVAL,
+    RA_PREFERRED_LIFETIME, RA_VALID_LIFETIME,
+};
 pub use resolve::resolve;
 
 /// The lock form's version that this ruster reads and writes.
@@ -337,6 +392,8 @@ pub struct Lock {
     pub dns: Vec<Dns>,
     /// One per interface.
     pub dhcp: Vec<Dhcp>,
+    /// One per interface.
+    pub ra: Vec<Ra>,
     pub source: Vec<Source>,
 }
 

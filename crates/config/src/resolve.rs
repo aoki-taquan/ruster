@@ -32,6 +32,8 @@ struct File {
     #[serde(default)]
     dhcp: Vec<DhcpEntry>,
     #[serde(default)]
+    ra: Vec<crate::ra::RaEntry>,
+    #[serde(default)]
     source: Vec<SourceEntry>,
 }
 
@@ -350,6 +352,11 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .into_iter()
         .map(|entry| dhcp(entry, &interfaces, dns.as_ref()))
         .collect::<Result<_, _>>()?;
+    let ra = file
+        .ra
+        .into_iter()
+        .map(|entry| crate::ra::resolve(entry, &interfaces, dns.as_ref()))
+        .collect::<Result<_, _>>()?;
     let source = file
         .source
         .into_iter()
@@ -388,6 +395,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         firewall,
         dns: dns.into_iter().collect(),
         dhcp,
+        ra,
         source,
     })
 }

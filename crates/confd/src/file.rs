@@ -672,6 +672,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         }
         dhcp.push(entry);
     }
+    let ra = crate::ra::check(lock.ra, &interfaces)?;
     Ok(Config {
         interfaces,
         static_routes,
@@ -682,6 +683,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         nat,
         dns,
         dhcp,
+        ra,
         sources,
     })
 }
