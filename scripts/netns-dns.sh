@@ -195,6 +195,15 @@ for address in 192.0.2.1 198.51.100.1; do
 done
 echo "ok: the WAN host gets no answer"
 
+# ruster diff shows the change to Unbound's settings, and makes none.
+before=$(cat "$udir/ruster.conf")
+out=$(ruster diff "$work/other-upstream.toml" 2>&1) || fail "ruster diff: $out"
+grep -q "^ruster-unbound (dns):" <<<"$out" || fail "ruster diff does not name ruster-unbound: $out"
+grep -q "^+.*198.51.100.11" <<<"$out" || fail "ruster diff does not show the new upstream: $out"
+grep -q "^-.*198.51.100.10" <<<"$out" || fail "ruster diff does not show the old upstream: $out"
+[[ "$(cat "$udir/ruster.conf")" == "$before" ]] || fail "ruster diff changed the settings"
+echo "ok: ruster diff shows the change ruster-unbound would make, and makes none"
+
 # Unbound cannot restart: ruster-unbound refuses the new part and confd goes back.
 touch "$udir/broken"
 before=$(cat "$udir/ruster.conf")

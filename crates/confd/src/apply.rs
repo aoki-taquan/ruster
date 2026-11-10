@@ -3,7 +3,7 @@
 //!
 //! | Request | CLI | What |
 //! |---|---|---|
-//! | POST `diff`, the file's text | `ruster diff` | what putting it in use would change, sending nothing ([`crate::diff`]) |
+//! | POST `diff`, the file's text | `ruster diff` | what putting it in use would change, putting it in use nowhere ([`crate::diff`]) |
 //! | POST `config`, the file's text | `ruster apply` | put it in use, and keep it as a version |
 //! | POST `config/confirm-within/<M>`, the file's text | `ruster apply --confirm-within M` | the same, and go back unless confirmed within M minutes (below) |
 //! | POST `confirm` | `ruster confirm` | the version waiting for confirmation stays |
@@ -13,11 +13,25 @@
 //! # Putting a configuration in use
 //!
 //! For `config`, confd reads the text as it reads its file at start-up; for
-//! `rollback/<N>`, it takes version N's lock form. It sends what changed to the FE,
-//! ribd and neighd, and the parts that changed to the processes that take them
-//! ([`crate::part`]). Once each of them has said yes, confd keeps the configuration
-//! as the next version ([`crate::versions`]) and answers, naming the version. If one
-//! refuses, confd sends the configuration before back to all of them.
+//! `rollback/<N>`, it takes version N's lock form. Then it goes in two steps, the
+//! candidate and the commit of `docs/design/router-box.md`, "反映の流れ":
+//!
+//! 1. Candidate: each process that takes a part checks its part of the
+//!    configuration without taking it ([`crate::part`]). If one refuses it, confd
+//!    answers 4.00 with each refusal and sends nothing to anyone. A process that is
+//!    not connected is not asked; one that has not answered after [`ANSWER_WAIT_MS`]
+//!    is not waited for, and the answer says so. `diff` stops here and answers with
+//!    what each process said ([`crate::diff`]).
+//! 2. Commit: confd sends what changed to the FE, ribd and neighd, and the parts that
+//!    changed to the processes that take them. Once each of them has said yes, confd
+//!    keeps the configuration as the next version ([`crate::versions`]) and answers,
+//!    naming the version. If one refuses, confd sends the configuration before back
+//!    to all of them. This catches what the check cannot: the FE, ribd and neighd
+//!    are not asked first, and the software a bridge drives may refuse the file only
+//!    when it reads it.
+//!
+//! The processes check one candidate at a time: requests that come meanwhile wait,
+//! in order, until its answers are in.
 //!
 //! After 5.04 confd keeps waiting: a later refusal still puts the configuration before
 //! back, and a later yes keeps the version. A process that disconnects meanwhile (one
@@ -41,8 +55,9 @@
 //!   more than M minutes away at a start means the clock went back; confd then goes
 //!   back at once too.
 //! - Going back does not wait for the processes to finish what they were sent
-//!   before: a process that never answers must not keep the version in use. It is
-//!   given up on like any change, after [`GIVE_UP_MS`].
+//!   before, and does not ask them to check it first: a process that never answers
+//!   or refuses must not keep the version in use. It is given up on like any change,
+//!   after [`GIVE_UP_MS`].
 //! - If the deadline or the version cannot be written, confd goes back at once and
 //!   answers 5.00.
 //! - While a version waits, `config`, `confirm-within` and `rollback` are refused with
@@ -57,7 +72,7 @@
 //! |---|---|
 //! | 2.04 Changed | every connected process said yes and the version was kept; or, for `confirm`, the version stays |
 //! | 2.05 Content | the answer to `diff` and `versions` |
-//! | 4.00 Bad Request | the file or the version does not read, `<N>` or `<M>` is not one that is allowed, nothing waits for `confirm`, or a process refused the change (and confd puts the configuration before back) |
+//! | 4.00 Bad Request | the file or the version does not read, `<N>` or `<M>` is not one that is allowed, nothing waits for `confirm`, a process refused the candidate (nothing was sent), or a process refused the change (and confd puts the configuration before back) |
 //! | 4.04 Not Found | version N is not kept, or the resource is not one of the above |
 //! | 5.00 Internal Server Error | the configuration is in use, but the version or the deadline could not be written (with `confirm-within`, confd goes back at once) |
 //! | 5.03 Service Unavailable | another change is waiting for answers (for `diff` too, since what is in use is not yet a version; for `config` and `rollback`, also while a change of a source's values is), or a version waits for `confirm` |
@@ -70,8 +85,8 @@
 //! Limits:
 //! - Static routes go through ribd, which takes any route; a route the FE then refuses
 //!   is not seen here.
-//! - `diff` shows only what confd itself writes. The other processes are not asked
-//!   for theirs: they check their parts only when the configuration is put in use.
+//! - The FE, ribd and neighd do not take part in the candidate step: confd works out
+//!   their tables itself, and they check them only when they are sent.
 //!
 //! # Standards
 //!
@@ -93,6 +108,7 @@ use ruster_proto::coap::Code;
 use ruster_proto::conn::{Connection, Incoming, Outgoing};
 use ruster_proto::task::Progress;
 
+use crate::part::{Checked, Module};
 use crate::versions::{unix_now, utc, Versions, Waiting};
 use crate::{diff, file, Confd, Config, PeerKind};
 
@@ -117,6 +133,8 @@ pub struct Apply {
     conns: Vec<(u64, Connection)>,
     next_id: u64,
     pending: Option<Pending>,
+    /// A candidate whose parts the processes are checking.
+    checking: Option<Checking>,
     counters: ApplyCounters,
     versions: Versions,
     /// The latest version waits for `ruster confirm`.
@@ -175,6 +193,21 @@ struct Pending {
     timed_out: bool,
     /// What to keep as a version once it is taken.
     keep: Keep,
+}
+
+/// A candidate the processes are checking ([`crate::part`]), and what then.
+struct Checking {
+    conn: u64,
+    token: Vec<u8>,
+    started_ms: u64,
+    then: Then,
+}
+
+enum Then {
+    /// Answer `diff` with confd's own part of it and the processes' answers.
+    Diff(String),
+    /// Put it in use unless a process refuses it.
+    Apply(Box<Config>, Keep),
 }
 
 /// A version to keep: how it came, the lock form and the `ruster.toml` text.
@@ -280,12 +313,18 @@ impl Apply {
         prepare: &mut dyn FnMut(&Config) -> Vec<String>,
     ) -> Progress {
         let mut busy = self.finish(confd, now_ms, prepare);
+        busy |= self.finish_check(confd, now_ms, prepare);
         busy |= self.go_back_when_due(confd, now_ms, prepare);
         let mut index = 0;
         while index < self.conns.len() {
             let id = self.conns[index].0;
             busy |= self.conns[index].1.pump().unwrap_or(false);
             for _ in 0..REQUESTS_PER_STEP {
+                // The processes check one candidate at a time: the requests after it
+                // wait for its answers, in order.
+                if self.checking.is_some() {
+                    break;
+                }
                 let conn = &mut self.conns[index].1;
                 // A client that does not read its answers gets no more handled.
                 if conn.backlog() >= conn.limit() {
@@ -295,10 +334,12 @@ impl Apply {
                     break;
                 };
                 busy = true;
-                let answer = self.handle(confd, id, &request, now_ms, prepare);
+                let answer = self.handle(confd, id, &request, now_ms);
                 if let Some((code, text)) = answer {
                     send(&mut self.conns[index].1, &request.token, code, &text);
                 }
+                // With no process to ask, a check is answered at once.
+                self.finish_check(confd, now_ms, prepare);
             }
             let conn = &mut self.conns[index].1;
             busy |= conn.pump().unwrap_or(false);
@@ -310,18 +351,18 @@ impl Apply {
             }
         }
         busy |= self.finish(confd, now_ms, prepare);
+        busy |= self.finish_check(confd, now_ms, prepare);
         Progress::busy(busy)
     }
 
     /// Handles one request of connection `id`. `None` when the answer comes later
-    /// (from [`Apply::finish`]) or there is none.
+    /// (from [`Apply::finish_check`] and [`Apply::finish`]) or there is none.
     fn handle(
         &mut self,
         confd: &mut Confd,
         id: u64,
         request: &Incoming,
         now_ms: u64,
-        prepare: &mut dyn FnMut(&Config) -> Vec<String>,
     ) -> Option<(Code, String)> {
         let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
         let busy = self.pending.is_some() || !confd.settled();
@@ -391,15 +432,24 @@ impl Apply {
                     })
             }
             (Code::POST, ["diff"]) => {
-                return Some(
-                    match std::str::from_utf8(&request.payload)
-                        .map_err(|_| "the file is not UTF-8".to_owned())
-                        .and_then(file::candidate)
-                    {
-                        Err(error) => (Code::BAD_REQUEST, error),
-                        Ok(candidate) => (Code::CONTENT, self.diff(confd, &candidate)),
-                    },
-                )
+                return match std::str::from_utf8(&request.payload)
+                    .map_err(|_| "the file is not UTF-8".to_owned())
+                    .and_then(file::candidate)
+                {
+                    Err(error) => Some((Code::BAD_REQUEST, error)),
+                    Ok(candidate) => {
+                        let own = self.diff(confd, &candidate);
+                        self.check(
+                            confd,
+                            &candidate.config,
+                            Then::Diff(own),
+                            id,
+                            request,
+                            now_ms,
+                        );
+                        None
+                    }
+                };
             }
             (Code::POST, ["config"]) => std::str::from_utf8(&request.payload)
                 .map_err(|_| "the file is not UTF-8".to_owned())
@@ -445,7 +495,15 @@ impl Apply {
             Err(error) => Some((Code::BAD_REQUEST, error)),
             Ok((config, mut keep)) => {
                 keep.confirm = confirm;
-                self.start(confd, config, keep, (id, &request.token), now_ms, prepare);
+                let candidate = config.clone();
+                self.check(
+                    confd,
+                    &candidate,
+                    Then::Apply(Box::new(config), keep),
+                    id,
+                    request,
+                    now_ms,
+                );
                 None
             }
         }
@@ -563,13 +621,88 @@ impl Apply {
             confd.tables_now_and_with(&candidate.config);
         format!(
             "lock form:\n{}\nFE tables (with the values the sources have now):\n{}\n\
-             routes offered to ribd:\n{}\n\
-             not shown: what the other processes would do with their parts; they are \
-             asked when it is applied\n",
+             routes offered to ribd:\n{}",
             none(diff::lines(lock, &candidate.lock, (&name, "new"))),
             none(diff::tables(&fe_now, &fe_then)),
             none(diff::tables(&routes_now, &routes_then)),
         )
+    }
+
+    /// Asks the processes to check their parts of `candidate`;
+    /// [`Apply::finish_check`] goes on once they have answered.
+    fn check(
+        &mut self,
+        confd: &mut Confd,
+        candidate: &Config,
+        then: Then,
+        conn: u64,
+        request: &Incoming,
+        now_ms: u64,
+    ) {
+        confd.check_parts(candidate);
+        self.checking = Some(Checking {
+            conn,
+            token: request.token.clone(),
+            started_ms: now_ms,
+            then,
+        });
+    }
+
+    /// Once every process asked has answered the check, or [`ANSWER_WAIT_MS`] has
+    /// passed: answers `diff`, or refuses the candidate if a process refused it, or
+    /// sends it.
+    fn finish_check(
+        &mut self,
+        confd: &mut Confd,
+        now_ms: u64,
+        prepare: &mut dyn FnMut(&Config) -> Vec<String>,
+    ) -> bool {
+        let Some(checking) = &self.checking else {
+            return false;
+        };
+        let checks = confd.part_checks();
+        let answered = !checks.values().any(|c| *c == Checked::NoAnswer);
+        if !answered && now_ms.saturating_sub(checking.started_ms) < ANSWER_WAIT_MS {
+            return false;
+        }
+        let Some(checking) = self.checking.take() else {
+            return false;
+        };
+        let checks = checks.clone();
+        match checking.then {
+            Then::Diff(own) => {
+                let text = format!("{own}\n{}", part_sections(&checks));
+                self.reply(checking.conn, &checking.token, Code::CONTENT, vec![text]);
+            }
+            Then::Apply(config, keep) => {
+                let refusals: Vec<String> = checks
+                    .iter()
+                    .filter_map(|(module, checked)| match checked {
+                        Checked::Refused(reason) => {
+                            Some(format!("{} refuses it: {reason}", name(*module)))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if refusals.is_empty() {
+                    let late = checks.iter().filter(|(_, c)| **c == Checked::NoAnswer).map(
+                        |(module, _)| format!("{} did not answer the check in time", name(*module)),
+                    );
+                    let late: Vec<String> = late.collect();
+                    let to = (checking.conn, checking.token.as_slice());
+                    self.start(confd, *config, keep, to, now_ms, prepare);
+                    if let Some(pending) = &mut self.pending {
+                        pending.notes.splice(0..0, late);
+                    }
+                } else {
+                    let mut lines = refusals;
+                    lines.push("nothing was sent; the configuration in use stays".into());
+                    self.log.push(lines.join("; "));
+                    self.reply(checking.conn, &checking.token, Code::BAD_REQUEST, lines);
+                }
+            }
+        }
+        true
     }
 
     /// Sends a new configuration to the processes; [`Apply::finish`] answers
@@ -768,6 +901,35 @@ impl Apply {
             send(conn, token, code, &lines.join("\n"));
         }
     }
+}
+
+/// A process that takes a module's part, for a person.
+fn name(module: Module) -> String {
+    format!("{} ({module})", module.process())
+}
+
+/// What each process said to a check, a section each, for `ruster diff`.
+fn part_sections(checks: &std::collections::BTreeMap<Module, Checked>) -> String {
+    let mut out = String::new();
+    for (module, checked) in checks {
+        out.push_str(&format!("{}:\n", name(*module)));
+        match checked {
+            Checked::Changes(text) if text.is_empty() => out.push_str("no change\n"),
+            Checked::Changes(text) => {
+                out.push_str(text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            Checked::Refused(reason) => out.push_str(&format!("refuses it: {reason}\n")),
+            Checked::NotConnected => {
+                out.push_str("not connected; it gets the configuration when it connects\n");
+            }
+            Checked::NoAnswer => out.push_str("did not answer in time\n"),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// `lines`, and a line for each process that is not connected.

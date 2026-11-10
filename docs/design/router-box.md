@@ -85,19 +85,27 @@ confd → 各プロセス: 確定
 各プロセス: 反映する
 ```
 
-上は目指す形。今の作り（`crates/confd/src/apply.rs`）は次のとおり。
+上は目指す形。今の作り（`crates/confd/src/apply.rs`）では、候補の段は部分を受け取るプロセスにだけあり、
+差分を見て確定する二つの操作は一つ（`ruster apply`）にまとまっている。
 
 | CLI | confdがすること |
 |---|---|
-| `ruster diff FILE` | 解決し、型を検証し、誰にも送らずに差分を返す |
-| `ruster apply FILE` | 全員へ送り、全員が受け入れたら版として残す。一つでも断ったら全員へ一つ前の設定を送り直す |
+| `ruster diff FILE` | 解決し、型を検証する。部分を受け取る各プロセスに候補の部分を確かめさせ、どこにも反映せずに、confdの差分と各プロセスの答えを返す |
+| `ruster apply FILE` | 同じく各プロセスに候補を確かめさせ、一つでも断れば誰にも送らずに断る。全員が受け入れられるなら全員へ送り、全員が受け入れたら版として残す。送った後で一つでも断ったら全員へ一つ前の設定を送り直す |
 | `ruster apply --confirm-within M FILE` | applyと同じ。M分以内に`ruster confirm`が来なければ、一つ前の版を新しい版として送り直す |
-| `ruster versions`、`ruster rollback N` | 版の一覧。版Nの設定をapplyと同じ道で送り、新しい版にする（間の版は消さない） |
+| `ruster versions`、`ruster rollback N` | 版の一覧。版Nの設定をapplyと同じ道（候補の確認を含む）で送り、新しい版にする（間の版は消さない） |
 
-- 差分は、confdが自分で出せる分だけ（`crates/confd/src/diff.rs`）: 最新の版と候補のlockの形の行の差分、
-  confdが書くFEの表と、ribdへ渡す経路の変わる行。各プロセスに候補を送って差分を返させる（FRRの設定、
-  消えるNATセッションなど）のはまだ。そのため候補と確定は分かれておらず、各プロセスは反映のときに初めて
-  検証し、断ればconfdが全員を一つ前の設定に戻す。
+- 候補の確認は部分のsocketの`POST <モジュール>/check`（`crates/confd/src/part.rs`）。プロセスは反映せずに、
+  変わることを文で返すか、断る理由を返す。
+  - `ruster-unbound`、`ruster-kea`、`ruster-frr`: 書くファイルの行の差分（FRRはパスワードなどを隠す）。
+  - `ruster-pppoed`、`ruster-dhcpc`、neighdのRA: 部分の設定の行の差分（PPPoEのパスワードは隠す）と、
+    始まる、やり直す、止まるもの（セッション、クライアント、RA）。
+- confd自身の差分（`crates/confd/src/diff.rs`）は、最新の版と候補のlockの形の行の差分、confdが書くFEの表と、
+  ribdへ渡す経路の変わる行。FE、ribd、neighdは候補の段に加わらず、送られたときに初めて表を検証する。
+- つながっていないプロセスは聞かず、「つながっていない」と出す（候補にそのモジュールがあるときだけ）。
+  3秒で答えないプロセスは待たず、diffでは「答えなかった」、applyではそう書いて送る。
+- 確認では分からないこともある（既製のソフトが読み直すときに断る、FEが表を断る）。そのため、送った後で
+  断られたら全員を一つ前の設定に戻す仕組みは二段目の守りとして残す。消えるNATセッションはまだ出さない。
 - 版はconfdが`--state-dir`のファイルに残す（lockの形と、`ruster.toml`で来たときはその文。最新の50個。
   `crates/confd/src/versions.rs`）。書き込みは一時ファイル、fsync、rename、ディレクトリのfsyncの順。
 - 起動したプロセスは、confdから最新の版を受け取る。confdが起動し直したときは、残した最新の版を読んで
