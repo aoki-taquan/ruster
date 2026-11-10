@@ -62,6 +62,10 @@ nsx "$ac" ip addr add 198.51.100.1/32 dev ac0
 nsx "$ac" ip route add 198.51.100.2/32 dev ac0
 
 cat > "$work/router.toml" <<'TOML'
+[[source]]
+name = "pppoe-wan"
+kind = "pppoe"
+
 [[interface]]
 name = "r-lan"
 mac = "02:00:00:00:00:01"
@@ -73,8 +77,7 @@ mac = "02:00:00:00:00:02"
 
 [[interface]]
 name = "ppp"
-pppoe = { parent = "r-wan", session = 4660, peer = "02:00:00:00:00:ac" }
-ipv4 = "198.51.100.2/32"
+pppoe = { parent = "r-wan", source = "pppoe-wan" }
 
 [[route]]
 prefix = "0.0.0.0/0"
@@ -112,6 +115,14 @@ start ruster-fe --backend "$backend" r-lan r-wan
 start ruster-ribd
 start ruster-neighd
 start ruster-confd "$work/router.toml"
+# The session is fixed (the AC stand-in has no Discovery or PPP control): it is
+# handed to confd by hand, as ruster-pppoed would.
+fed=0
+for _ in $(seq 1 50); do
+  if nsx "$router" "$bin/ruster" --run-dir "$run_dir" source pppoe-wan pppoe 4660 02:00:00:00:00:ac 1492 ipv4 198.51.100.2/32 2>>"$work/source.log"; then fed=1; break; fi
+  sleep 0.1
+done
+(( fed == 1 )) || fail "confd took no values for the session"
 listening() {
   for _ in $(seq 1 50); do
     nsx "$1" ss -Hln"$2" "sport = :$3" | grep -q . && return 0

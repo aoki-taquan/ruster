@@ -54,8 +54,9 @@
 //!   from the tunnel to the inside without a mapping; one routed elsewhere is
 //!   forwarded).
 //! - RFC 2516: a `pppoe` interface is one PPPoE session on its parent (a port or
-//!   VLAN given before it), with the session ID and the access concentrator's MAC
-//!   that the session's daemon found; its MTU is at most the parent's less 8.
+//!   VLAN given before it); the session ID, the access concentrator's MAC and the
+//!   IPv4 address come from its source (of kind pppoe, one interface each). Its MTU
+//!   is at most the parent's less 8.
 //! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
 //!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
@@ -192,6 +193,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
 
 /// Checks the lock form and makes confd's configuration of it.
 pub fn config(lock: Lock) -> Result<Config, String> {
+    let sources = crate::source::specs(lock.source)?;
     let mut seen = Seen::default();
     let mut interfaces = Vec::with_capacity(lock.interface.len());
     for entry in lock.interface {
@@ -246,12 +248,9 @@ pub fn config(lock: Lock) -> Result<Config, String> {
                 };
                 tunnel = Some((address(local, "local")?, address(remote, "remote")?));
             }
-            // A PPPoE session on a port or VLAN sub-interface given before it.
-            Kind::Pppoe {
-                parent,
-                session,
-                peer,
-            } => {
+            // A PPPoE session on a port or VLAN sub-interface given before it, from
+            // a source of kind pppoe.
+            Kind::Pppoe { parent, source } => {
                 let Some(parent) = interfaces.iter().find(|i: &&InterfaceConfig| {
                     i.name == *parent && i.tunnel.is_none() && i.pppoe.is_none()
                 }) else {
@@ -259,24 +258,28 @@ pub fn config(lock: Lock) -> Result<Config, String> {
                         "{at}: PPPoE parent {parent:?} must be a port or VLAN given before it"
                     ));
                 };
-                if *session == 0 || *session == 0xffff {
-                    return Err(format!("{at}: PPPoE session must be 1 to 65534"));
-                }
-                let taken = interfaces.iter().any(|i| {
-                    i.pppoe
-                        .as_ref()
-                        .is_some_and(|(p, id, _)| *p == parent.name && id == session)
-                });
-                if taken {
+                if !sources
+                    .iter()
+                    .any(|s| s.name == *source && s.kind == crate::source::Kind::Pppoe)
+                {
                     return Err(format!(
-                        "{at}: PPPoE session {session} on {:?} is given twice",
-                        parent.name
+                        "{at}: PPPoE source {source:?} must be a source of kind pppoe"
                     ));
                 }
-                let peer = mac(peer)
-                    .filter(|m| m[0] & 1 == 0 && *m != [0; 6])
-                    .ok_or_else(|| format!("{at}: PPPoE peer must be a unicast MAC address"))?;
-                pppoe = Some((parent.name.clone(), *session, peer, parent.mtu));
+                if interfaces
+                    .iter()
+                    .any(|i| i.pppoe.as_ref().is_some_and(|(_, s)| s == source))
+                {
+                    return Err(format!(
+                        "{at}: source {source:?} is the session of another interface"
+                    ));
+                }
+                if !entry.ipv4.is_empty() {
+                    return Err(format!(
+                        "{at}: a PPPoE session's ipv4 address comes from its source; give none"
+                    ));
+                }
+                pppoe = Some((parent.name.clone(), source.clone(), parent.mtu));
             }
         }
         let mac =
@@ -290,7 +293,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         let max_mtu = match (&vlan, &tunnel, &pppoe) {
             (Some((_, _, parent_mtu)), _, _) => parent_mtu - 4,
             (_, Some(_), _) => MAX_MTU - 40,
-            (_, _, Some((_, _, _, parent_mtu))) => parent_mtu - 8,
+            (_, _, Some((_, _, parent_mtu))) => parent_mtu - 8,
             _ => MAX_MTU,
         };
         let mtu = entry.mtu;
@@ -358,7 +361,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
             vrf: entry.vrf,
             vlan: vlan.map(|(parent, id, _)| (parent, id)),
             tunnel,
-            pppoe: pppoe.map(|(parent, session, peer, _)| (parent, session, peer)),
+            pppoe: pppoe.map(|(parent, source, _)| (parent, source)),
         });
     }
     // A MAP-E CE's tunnel is an interface like the others for what follows.
@@ -679,7 +682,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         nat,
         dns,
         dhcp,
-        sources: crate::source::specs(lock.source)?,
+        sources,
     })
 }
 
@@ -1025,7 +1028,10 @@ fn nat(
         .find(|i| i.name == entry.outside)
         .and_then(|i| i.ipv4)
         .map(|(address, _)| address);
-    if outside_address.is_none() {
+    let session = interfaces
+        .iter()
+        .any(|i| i.name == entry.outside && i.pppoe.is_some());
+    if outside_address.is_none() && !session {
         return Err(format!("{at}: {:?} has no ipv4 address", entry.outside));
     }
     let external = match at_most_one(at, "external", &entry.external)? {

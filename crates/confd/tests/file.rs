@@ -935,32 +935,26 @@ fn map_e_follows_rfc_7597_appendix_a() {
 }
 
 #[test]
-fn a_pppoe_interface_runs_on_its_parent() {
+fn a_pppoe_interface_runs_on_its_parent_from_its_source() {
     let wan = "[[interface]]\nname = \"wan\"\nmac = \"02:00:00:00:00:02\"\n";
+    let source = "[[source]]\nname = \"pppoe-wan\"\nkind = \"pppoe\"\n";
     let ppp = |extra: &str| {
-        format!("{wan}[[interface]]\nname = \"ppp\"\npppoe = {{ parent = \"wan\", session = 4660, peer = \"02:00:00:00:00:ac\" }}\n{extra}")
+        format!("{source}{wan}[[interface]]\nname = \"ppp\"\npppoe = {{ parent = \"wan\", source = \"pppoe-wan\" }}\n{extra}")
     };
-    let config = parse(&ppp("ipv4 = \"198.51.100.2/32\"\n")).unwrap();
+    let config = parse(&ppp("")).unwrap();
     let session = &config.interfaces[1];
     assert_eq!((session.mtu, session.mac), (1492, [2, 0, 0, 0, 0, 2]));
-    assert_eq!(
-        session.pppoe,
-        Some(("wan".into(), 4660, [2, 0, 0, 0, 0, 0xac]))
-    );
+    assert_eq!(session.pppoe, Some(("wan".into(), "pppoe-wan".into())));
     for (text, expected) in [
         (ppp("mtu = 1500\n"), "mtu must be"),
-        (ppp("").replace("4660", "0"), "1 to 65534"),
-        (
-            ppp("").replace("02:00:00:00:00:ac", "ff:ff:ff:ff:ff:ff"),
-            "unicast",
-        ),
+        (ppp("").replace("source = \"pppoe-wan\" }", "source = \"other\" }"), "kind pppoe"),
         (
             ppp("").replace("parent = \"wan\"", "parent = \"dmz\""),
             "port or VLAN",
         ),
         (
-            ppp("[[interface]]\nname = \"ppp2\"\npppoe = { parent = \"wan\", session = 4660, peer = \"02:00:00:00:00:ac\" }\n"),
-            "given twice",
+            ppp("[[interface]]\nname = \"ppp2\"\npppoe = { parent = \"wan\", source = \"pppoe-wan\" }\n"),
+            "another interface",
         ),
         (
             ppp("[[interface]]\nname = \"v\"\nparent = \"ppp\"\nvlan = 10\n"),
@@ -970,6 +964,9 @@ fn a_pppoe_interface_runs_on_its_parent() {
         let got = error(&text);
         assert!(got.contains(expected), "{text}: {got}");
     }
+    // NAT may have the session as its outside: the address comes with it.
+    let nat = ppp("[[interface]]\nname = \"lan\"\nmac = \"02:00:00:00:00:01\"\nipv4 = \"192.168.0.1/24\"\n\n[nat]\ninside = \"lan\"\noutside = \"ppp\"\n");
+    assert!(parse(&nat).is_ok());
 }
 
 #[test]

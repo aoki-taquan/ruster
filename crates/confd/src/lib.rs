@@ -18,8 +18,13 @@
 //! link-local address from its MAC address ([`link_local`]). Connected routes come from
 //! the IPv4 and global IPv6 prefixes of enabled interfaces. Limits: one IPv4 address per
 //! interface. Daemons send values found at run time as sources ([`source`]); confd
-//! keeps them and, after it starts, waits for them before the FE, ribd and neighd
-//! drop what they hold from before. No table is made from them yet.
+//! makes tables from them with the configuration, and after it starts, waits for them
+//! before the FE, ribd and neighd drop what they hold from before.
+//!
+//! A PPPoE interface is in the FE (and neighd) only while its source has a session,
+//! with the session's ID, AC and MTU (at most the configured one) and the IPv4
+//! address the source has; routes out of it are offered to ribd only then, and NAT
+//! with it as the outside (and no `external`) is left out while it has no address.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -53,8 +58,10 @@ pub struct InterfaceConfig {
     pub vlan: Option<(String, u16)>,
     /// For an IPv4 in IPv6 tunnel: its local and remote IPv6 addresses.
     pub tunnel: Option<(Ipv6Addr, Ipv6Addr)>,
-    /// For a PPPoE session: its parent interface, session ID and peer MAC.
-    pub pppoe: Option<(String, u16, [u8; 6])>,
+    /// For a PPPoE session: its parent interface and the source that sends the
+    /// session and its IPv4 address. The interface is in the FE only while the
+    /// source has a session, with the IPv4 address it has (if any) instead of `ipv4`.
+    pub pppoe: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -249,6 +256,8 @@ pub struct Confd {
     neighd: Option<Peer>,
     parts: part::Parts,
     sources: source::Sources,
+    /// Counts the changes of the sources' values.
+    values_changed: u64,
     counters: ConfdCounters,
     /// Counts [`Confd::set_config`] calls; each patch carries the one it came from.
     generation: u64,
@@ -269,6 +278,7 @@ impl Confd {
     pub fn new(config: Config) -> Self {
         Self {
             sources: source::Sources::new(&config.sources),
+            values_changed: 0,
             config,
             fe: None,
             ribd: None,
@@ -530,7 +540,18 @@ impl Confd {
                 Value::FirewallRule(rule.clone()),
             );
         }
-        if let Some(nat) = &self.config.nat {
+        // NAT takes its public address from the outside: a PPPoE session's comes
+        // with the session, and NAT waits for it.
+        let outside_ready = |nat: &&ruster_proto::table::Nat| {
+            nat.external.is_some()
+                || self
+                    .config
+                    .interfaces
+                    .iter()
+                    .find(|i| i.name == nat.outside)
+                    .is_none_or(|i| i.pppoe.is_none() || self.ipv4(i).is_some())
+        };
+        if let Some(nat) = self.config.nat.as_ref().filter(outside_ready) {
             out.insert(
                 Key::Nat {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
@@ -563,9 +584,100 @@ impl Confd {
         out
     }
 
+    /// A PPPoE interface's session now, from its source: the session ID, the AC's
+    /// MAC and the MTU. `None` for an interface that is not a session.
+    fn session(&self, interface: &InterfaceConfig) -> Option<(u16, [u8; 6], u16)> {
+        let (_, source) = interface.pppoe.as_ref()?;
+        self.sources.pppoe(source)
+    }
+
+    /// An interface's IPv4 address now: a PPPoE session's from its source while it
+    /// is up.
+    fn ipv4(&self, interface: &InterfaceConfig) -> Option<(Ipv4Addr, u8)> {
+        self.ipv4_in(&self.config, interface)
+    }
+
+    /// An interface's IPv4 address now, among the interfaces of `config`. A
+    /// session's address is left out when its prefix overlaps the prefix of another
+    /// interface's address in the VRF (one given, or another session's), or when it
+    /// is its prefix's network or broadcast address: the same checks as for an
+    /// address in the configuration ([`file`](mod@file)).
+    fn ipv4_in(&self, config: &Config, interface: &InterfaceConfig) -> Option<(Ipv4Addr, u8)> {
+        let Some((_, source)) = &interface.pppoe else {
+            return interface.ipv4;
+        };
+        self.session(interface)?;
+        let (address, len) = self.sources.ipv4(source)?;
+        let host_mask = u32::MAX.checked_shr(u32::from(len)).unwrap_or(0);
+        let host = u32::from(address) & host_mask;
+        if len <= 30 && (host == 0 || host == host_mask) {
+            return None;
+        }
+        let overlaps = |(other, other_len): (Ipv4Addr, u8)| {
+            let len = len.min(other_len);
+            network(IpAddr::V4(address), len) == network(IpAddr::V4(other), len)
+        };
+        let taken = config
+            .interfaces
+            .iter()
+            .filter(|i| i.name != interface.name && i.vrf == interface.vrf)
+            .filter_map(|i| match &i.pppoe {
+                None => i.ipv4,
+                Some((_, other)) => self.sources.ipv4(other),
+            })
+            .any(overlaps);
+        (!taken).then_some((address, len))
+    }
+
+    /// The configuration with each PPPoE session's IPv4 address now, for the kernel
+    /// side ([`kernel`]).
+    pub fn with_values(&self) -> Config {
+        self.with_values_of(&self.config)
+    }
+
+    /// `config` with each PPPoE session's IPv4 address now.
+    pub fn with_values_of(&self, config: &Config) -> Config {
+        let mut out = config.clone();
+        for interface in &mut out.interfaces {
+            if interface.pppoe.is_some() {
+                interface.ipv4 = self.ipv4_in(config, interface);
+            }
+        }
+        out
+    }
+
+    /// An interface's MTU now: a session's is at most what the session takes, and a
+    /// tunnel's at most what the interface of its local address takes less 40.
+    fn mtu(&self, interface: &InterfaceConfig) -> u16 {
+        if let Some((_, _, mtu)) = self.session(interface) {
+            return mtu.min(interface.mtu);
+        }
+        let Some((local, _)) = interface.tunnel else {
+            return interface.mtu;
+        };
+        self.config
+            .interfaces
+            .iter()
+            .find(|i| i.pppoe.is_some() && i.ipv6.iter().any(|&(a, _)| a == local))
+            .and_then(|owner| self.session(owner).map(|_| self.mtu(owner)))
+            .map_or(interface.mtu, |owner| {
+                interface.mtu.min(owner.saturating_sub(40))
+            })
+    }
+
+    /// Counts the changes of the values from the sources.
+    pub fn values_changed(&self) -> u64 {
+        self.values_changed
+    }
+
     fn interface_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
         for interface in &self.config.interfaces {
+            // A PPPoE session is there only while it is up.
+            let session = self.session(interface);
+            if interface.pppoe.is_some() && session.is_none() {
+                continue;
+            }
             out.insert(
                 Key::Interface {
                     name: interface.name.clone(),
@@ -573,7 +685,7 @@ impl Confd {
                 Value::Interface {
                     enabled: interface.enabled,
                     mac: interface.mac,
-                    mtu: interface.mtu,
+                    mtu: self.mtu(interface),
                     vrf: interface.vrf.clone(),
                     vlan: interface
                         .vlan
@@ -585,18 +697,18 @@ impl Confd {
                     tunnel: interface
                         .tunnel
                         .map(|(local, remote)| ruster_proto::table::Tunnel { local, remote }),
-                    pppoe: interface.pppoe.as_ref().map(|(parent, session, peer)| {
-                        ruster_proto::table::Pppoe {
+                    pppoe: interface.pppoe.as_ref().zip(session).map(
+                        |((parent, _), (session, peer, _))| ruster_proto::table::Pppoe {
                             parent: parent.clone(),
-                            session: *session,
-                            peer: *peer,
-                        }
-                    }),
+                            session,
+                            peer,
+                        },
+                    ),
                 },
             );
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);
-            let addresses = interface
-                .ipv4
+            let addresses = self
+                .ipv4(interface)
                 .map(|(a, len)| (IpAddr::V4(a), len))
                 .into_iter()
                 .chain(std::iter::once(link_local))
@@ -625,8 +737,20 @@ impl Confd {
             .vlan
             .as_ref()
             .map(|(parent, _)| parent)
-            .or(interface.pppoe.as_ref().map(|(parent, _, _)| parent));
-        interface.enabled && parent.is_none_or(|parent| self.usable(parent))
+            .or(interface.pppoe.as_ref().map(|(parent, _)| parent));
+        // NAT's outside session needs its address before anything leaves through it,
+        // or the LAN's would leave untranslated.
+        let nat_outside = self
+            .config
+            .nat
+            .as_ref()
+            .is_some_and(|nat| nat.outside == interface.name && nat.external.is_none());
+        let up = match &interface.pppoe {
+            None => true,
+            Some(_) if nat_outside => self.ipv4(interface).is_some(),
+            Some(_) => self.session(interface).is_some(),
+        };
+        interface.enabled && up && parent.is_none_or(|parent| self.usable(parent))
     }
 
     /// Connected routes of usable interfaces (enabled, on an enabled parent), then
@@ -641,8 +765,8 @@ impl Confd {
             .filter(|i| self.usable(&i.name))
         {
             // Link-local prefixes are on every link and never forwarded.
-            let prefixes = interface
-                .ipv4
+            let prefixes = self
+                .ipv4(interface)
                 .map(|(a, len)| (IpAddr::V4(a), len))
                 .into_iter()
                 .chain(
@@ -749,6 +873,7 @@ impl Task for Confd {
         let waiting = self.sources.waiting();
         let (mut progress, changed) = self.sources.step(now_ms);
         if changed {
+            self.values_changed += 1;
             self.send_tables();
         }
         if waiting && !self.sources.waiting() {

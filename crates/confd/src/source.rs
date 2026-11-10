@@ -10,7 +10,7 @@
 //! | `pppoe` | [`Key::SourcePppoe`] (the session ID, the access concentrator's MAC, the MTU) and [`Key::SourceIpv4`] (the address IPCP gave) |
 //!
 //! A write to another table, or under another source's name, is refused. So is an
-//! IPv4 address that is not a unicast address.
+//! IPv4 address that is not a unicast address, and a session MTU below 1280.
 //!
 //! Every value carries a lifetime in seconds. confd counts it from when the value
 //! arrives, and from each time it arrives again: the daemon sends its values again
@@ -46,6 +46,8 @@ use ruster_proto::sid;
 use ruster_proto::table::{Change, Key, Value};
 use ruster_proto::task::Progress;
 
+/// The least session MTU taken.
+pub const IPV6_MIN_MTU: u16 = 1_280;
 /// The longest `sync-wait`, in seconds.
 pub const SYNC_WAIT_MAX: u32 = 600;
 /// The most sources: each has a socket.
@@ -157,10 +159,15 @@ impl Hook for Taking<'_> {
             if source != self.name {
                 return Err(format!("this is the socket of source {}", self.name));
             }
-            if let Value::SourceIpv4 { address, .. } = value {
-                if !unicast(*address) {
+            match value {
+                Value::SourceIpv4 { address, .. } if !unicast(*address) => {
                     return Err(format!("{address} is not a unicast address"));
                 }
+                // The session interface may carry IPv6 (RFC 8200 section 5).
+                Value::SourcePppoe { mtu, .. } if *mtu < IPV6_MIN_MTU => {
+                    return Err(format!("mtu {mtu} is less than {IPV6_MIN_MTU}"));
+                }
+                _ => {}
             }
         }
         Ok(())

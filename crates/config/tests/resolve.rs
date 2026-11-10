@@ -22,7 +22,7 @@ vlan = 10
 
 [[interface]]
 name = "ppp"
-pppoe = { parent = "lan.10", session = 4660, peer = "02:00:00:00:00:ac" }
+pppoe = { parent = "lan.10", source = "pppoe-wan" }
 
 [[interface]]
 name = "ds1"
@@ -151,8 +151,12 @@ fn what_a_default_needs_is_checked() {
             "parent \"b\" must be an interface given before it",
         ),
         (
-            "[[interface]]\nname = \"a\"\npppoe = { parent = \"b\", session = 1, peer = \"02:00:00:00:00:01\" }\n",
+            "[[interface]]\nname = \"a\"\npppoe = { parent = \"b\", source = \"s\" }\n",
             "PPPoE parent \"b\" must be a port or VLAN",
+        ),
+        (
+            "[[interface]]\nname = \"b\"\nmac = \"02:00:00:00:00:01\"\n\n[[interface]]\nname = \"a\"\npppoe = { parent = \"b\", source = \"s\" }\nipv4 = \"192.0.2.1/32\"\n",
+            "comes from its source",
         ),
         ("[[route]]\nprefix = \"10.0.0.0/8\"\n", "give one of interface"),
         ("[[route]]\nprefix = \"10.0.0.0/8\"\naction = \"drop\"\n", "action must be"),

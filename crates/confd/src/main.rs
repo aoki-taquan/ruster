@@ -98,6 +98,8 @@ fn run() -> Result<(), String> {
     let mut refused = 0;
     let mut generation = confd.generation();
     let mut retry_sockets = daemon::Retry::default();
+    let mut values_seen = confd.values_changed();
+    let mut kernel_config = None;
     let mut waiting = confd.waiting_for_sources();
     let mut apply_seen = apply.counters();
     let mut retry = daemon::Retry::default();
@@ -132,9 +134,20 @@ fn run() -> Result<(), String> {
         }
         // A socket that could not be made is tried again at the next turn.
         let missing = confd.source_names().len() != sources.len();
-        if confd.generation() != generation || (missing && retry_sockets.due(now)) {
+        let new_values = confd.values_changed() != values_seen;
+        if confd.generation() != generation || new_values || (missing && retry_sockets.due(now)) {
             generation = confd.generation();
+            values_seen = confd.values_changed();
             source_sockets(&run_dir, &confd, &mut sources);
+            // A PPPoE session's address comes and goes with the session.
+            // A value sent again unchanged changes nothing there.
+            let now_config = confd.with_values();
+            if kernel && kernel_config.as_ref() != Some(&now_config) {
+                for error in ruster_confd::kernel::apply(&now_config) {
+                    eprintln!("ruster-confd: kernel: {error}");
+                }
+                kernel_config = Some(now_config);
+            }
         }
         for (name, listener) in &sources {
             for stream in daemon::accept(listener) {

@@ -7,6 +7,7 @@
 //! ruster [--run-dir DIR] show             print every table the FE holds
 //! ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
 //! ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
+//! ruster [--run-dir DIR] source NAME [--lifetime SECONDS] [pppoe SESSION PEER MTU] [ipv4 ADDRESS/LEN]
 //! ```
 //!
 //! `apply` sends the file to confd, which sends what changed to the FE, ribd and neighd
@@ -16,6 +17,11 @@
 //! `route` writes to ribd as the route source NAME, the way a routing daemon does
 //! (ribd must have been started with that source). ribd picks between sources by
 //! preference and sends the result to the FE.
+//!
+//! `source` writes to confd as the source NAME, the way `ruster-pppoed` does
+//! ([`ruster_confd::source`]): the values given replace all the source had, each
+//! for SECONDS (3600 when left out), and with none it has none. It ends with
+//! `sync-done`, as a daemon does after connecting.
 
 use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
@@ -38,16 +44,29 @@ const USAGE: &str = "usage:
   ruster [--run-dir DIR] apply FILE
   ruster [--run-dir DIR] show
   ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
-  ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX";
+  ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
+  ruster [--run-dir DIR] source NAME [--lifetime SECONDS] [pppoe SESSION PEER MTU] [ipv4 ADDRESS/LEN]";
+
+/// How long the values of `ruster source` last when no lifetime is given.
+const SOURCE_LIFETIME: u32 = 3_600;
 
 /// Sends one request and waits for its answer.
 fn request(
     path: &Path,
     send: impl FnOnce(&mut Client) -> Result<u32, String>,
 ) -> Result<(Code, Vec<u8>), String> {
+    requests(path, |c| send(c).map(|token| vec![token]))
+}
+
+/// Sends requests and waits for their answers: the first refusal, or the last
+/// answer.
+fn requests(
+    path: &Path,
+    send: impl FnOnce(&mut Client) -> Result<Vec<u32>, String>,
+) -> Result<(Code, Vec<u8>), String> {
     let stream = UnixStream::connect(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut client = Client::new(stream).map_err(|e| e.to_string())?;
-    let token = send(&mut client)?;
+    let mut tokens = send(&mut client)?;
     let start = Instant::now();
     while start.elapsed() < WAIT {
         let (_, events) = client.poll();
@@ -58,7 +77,11 @@ fn request(
                 payload,
             } = event
             {
-                if t == token {
+                if !tokens.contains(&t) {
+                    continue;
+                }
+                tokens.retain(|&other| other != t);
+                if tokens.is_empty() || code.class() != 2 {
                     // One more poll sends anything still queued (sync-done).
                     client.poll();
                     return Ok((code, payload));
@@ -212,6 +235,91 @@ fn route(run_dir: &Path, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn source(run_dir: &Path, args: &[String]) -> Result<(), String> {
+    let (name, rest) = args.split_first().ok_or(USAGE)?;
+    let number = |text: &str, what: &str| -> Result<u32, String> {
+        text.parse().map_err(|_| format!("{text}: not a {what}"))
+    };
+    let mut lifetime = SOURCE_LIFETIME;
+    let mut session = None;
+    let mut ipv4 = None;
+    let words: Vec<&str> = rest.iter().map(String::as_str).collect();
+    let mut words = words.as_slice();
+    loop {
+        words = match words {
+            [] => break,
+            ["--lifetime", seconds, rest @ ..] => {
+                lifetime = number(seconds, "lifetime in seconds")?;
+                rest
+            }
+            ["pppoe", id, peer, mtu, rest @ ..] => {
+                let id = u16::try_from(number(id, "session ID")?)
+                    .map_err(|_| format!("{id}: not a session ID"))?;
+                let peer = ruster_proto::table::parse_mac(peer)
+                    .map_err(|_| format!("{peer}: not a MAC address"))?;
+                let mtu =
+                    u16::try_from(number(mtu, "MTU")?).map_err(|_| format!("{mtu}: not an MTU"))?;
+                session = Some((id, peer, mtu));
+                rest
+            }
+            ["ipv4", text, rest @ ..] => {
+                let bad = || format!("{text}: not an address like 198.51.100.2/32");
+                let (address, len) = text.split_once('/').ok_or_else(bad)?;
+                ipv4 = Some((
+                    address.parse().map_err(|_| bad())?,
+                    len.parse().map_err(|_| bad())?,
+                ));
+                rest
+            }
+            _ => return Err(USAGE.into()),
+        };
+    }
+    let mut changes = Vec::new();
+    if let Some((session, peer, mtu)) = session {
+        changes.push(Change::set(
+            Key::SourcePppoe {
+                source: name.clone(),
+            },
+            Value::SourcePppoe {
+                session,
+                peer,
+                mtu,
+                lifetime,
+            },
+        ));
+    }
+    if let Some((address, prefix_len)) = ipv4 {
+        changes.push(Change::set(
+            Key::SourceIpv4 {
+                source: name.clone(),
+            },
+            Value::SourceIpv4 {
+                address,
+                prefix_len,
+                lifetime,
+            },
+        ));
+    }
+    for change in &changes {
+        change.validate().map_err(|e| e.to_string())?;
+    }
+    let path = run_dir.join(socket::confd_source(name));
+    let (code, payload) = requests(&path, |c| {
+        let mut tokens = vec![c.resync_begin()];
+        if !changes.is_empty() {
+            tokens.push(c.patch(&changes).map_err(|e| e.to_string())?);
+        }
+        tokens.push(c.resync_end());
+        tokens.push(c.sync_done());
+        Ok(tokens)
+    })?;
+    if code.class() != 2 {
+        let said = String::from_utf8_lossy(&payload);
+        return Err(format!("confd refused the values ({code:?}): {said}"));
+    }
+    Ok(())
+}
+
 fn check(path: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     let config = ruster_confd::file::parse(&text).map_err(|e| format!("{path}: {e}"))?;
@@ -264,6 +372,7 @@ fn run() -> Result<(), String> {
             ("apply", [file]) => apply(&run_dir, file),
             ("show", []) => show(&run_dir),
             ("route", args) => route(&run_dir, args),
+            ("source", args) => source(&run_dir, args),
             _ => Err(USAGE.into()),
         },
         None => Err(USAGE.into()),

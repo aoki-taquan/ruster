@@ -164,7 +164,7 @@ impl Apply {
                     {
                         Err(error) => Some((Code::BAD_REQUEST, error)),
                         Ok(config) => {
-                            let notes = prepare(&config);
+                            let notes = prepare(&confd.with_values_of(&config));
                             let previous = confd.config().clone();
                             confd.set_config(config);
                             self.pending = Some(Pending {
@@ -251,7 +251,7 @@ impl Apply {
                     why,
                     "the configuration before it is being sent again".into(),
                 ];
-                lines.extend(prepare(&pending.previous));
+                lines.extend(prepare(&confd.with_values_of(&pending.previous)));
                 confd.set_config(pending.previous);
                 (Code::BAD_REQUEST, lines)
             }

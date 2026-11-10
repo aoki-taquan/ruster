@@ -46,11 +46,11 @@
 //! ipv4 = "192.0.0.2/29"        # optional; this, the B4's address, when left out
 //! # mtu is 1460 and mac 02:00:00:00:00:fe when left out
 //!
-//! [[interface]]                # a PPPoE session (set up by a daemon outside ruster)
+//! [[interface]]                # a PPPoE session, there while the session is up
 //! name = "ppp"
-//! pppoe = { parent = "lan", session = 4660, peer = "02:00:00:00:00:ac" }
-//! ipv4 = "198.51.100.2/32"     # optional
-//! # mac is the parent's and mtu its less 8 when left out
+//! pppoe = { parent = "lan", source = "pppoe-wan" }  # the source (of kind pppoe)
+//!                              # that sends the session and its IPv4 address
+//! # mac is the parent's and mtu its less 8 when left out; no ipv4
 //!
 //! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
 //! interface = "map"            # the tunnel interface it makes
@@ -192,7 +192,7 @@
 //! ipv6 = []
 //!
 //! [interface.kind.vlan]        # or [interface.kind.tunnel] with local and remote,
-//! parent = "lan"               # [interface.kind.pppoe] with parent, session, peer
+//! parent = "lan"               # [interface.kind.pppoe] with parent and source
 //! id = 10
 //!
 //! [[nat]]
@@ -459,12 +459,9 @@ pub enum Kind {
     Vlan { parent: String, id: u16 },
     /// An IPv4 in IPv6 tunnel (DS-Lite).
     Tunnel { local: String, remote: String },
-    /// A PPPoE session on a port or VLAN.
-    Pppoe {
-        parent: String,
-        session: u16,
-        peer: String,
-    },
+    /// A PPPoE session on a port or VLAN, whose session and IPv4 address the
+    /// source (of kind `pppoe`) sends.
+    Pppoe { parent: String, source: String },
 }
 
 /// A MAP-E CE (RFC 7597): one Basic Mapping Rule, the delegated prefix, the BR.

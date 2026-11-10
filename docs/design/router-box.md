@@ -160,7 +160,10 @@ confd → 各プロセス: 確定
    既定値はconfdの各所から外し、解決のライブラリへ集める。今のTOMLは、型が変わるまで`ruster.toml`として
    読み、解決してlockの形にする。
 2. 実行中に決まる値を、全体の設定から外す。
-   - PPPoEのセッション番号と相手のMAC → `ruster-pppoed`から。それまでは送り手を手で書く道具で渡す。
+   - PPPoEのセッション番号と相手のMAC、IPCPで得たアドレス → 送り手（種類`pppoe`）から。設定のPPPoEの
+     インターフェースは親と送り手の名前だけを書く（`pppoe = { parent = "wan", source = "pppoe-wan" }`）。
+     FEのセッションのインターフェースは、送り手がセッションを持つ間だけある。送り手は`ruster-pppoed`か、
+     手で書く道具（`ruster source`）。
    - MAP-Eのプレフィックス → `ruster-dhcpc`の委任から。
 3. confdが各プロセスへ担当の部分を配り、候補、差分、確定を揃える形にする。
 4. `ruster.toml`と、それを解決してlockの形にする機能。
