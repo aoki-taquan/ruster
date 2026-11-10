@@ -29,8 +29,10 @@
 //! (`docs/design/ce-processes.md`, "socketの権限").
 //!
 //! The sockets that hand out one part of the configuration, or take one source's
-//! values, each have a directory of their own ([`socket::confd_part`],
-//! [`socket::confd_source`], [`socket::ribd_source`]). Made beforehand with a group
+//! values, and confd's socket for the whole configuration, each have a directory of
+//! their own ([`socket::confd_part`],
+//! [`socket::confd_source`], [`socket::ribd_source`], [`socket::CONFD_CONFIG`]).
+//! Made beforehand with a group
 //! only one process is in, such a directory limits its socket to that process: for
 //! example `confd/part/pppoe/`, whose part holds the PPPoE passwords, to
 //! `ruster-pppoed`.
@@ -70,7 +72,10 @@ pub mod socket {
     /// neighd's table server for interfaces and addresses (written by confd).
     pub const NEIGHD_CONFIG: &str = "neighd/config.sock";
     /// confd's socket for a new configuration file (from `ruster apply`).
-    pub const CONFD_CONFIG: &str = "confd/config.sock";
+    ///
+    /// It holds the whole configuration (PPPoE passwords included) and replaces it, so
+    /// it has a directory of its own, whose group can be the operators' only.
+    pub const CONFD_CONFIG: &str = "confd/config/config.sock";
 
     /// The FE's datagram socket for frames to and from the control process `name`
     /// of a punt class (other than neighd).

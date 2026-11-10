@@ -37,7 +37,7 @@ fn check_says_whether_a_configuration_file_is_good() {
 fn versions_and_rollback_fail_clearly_without_a_router() {
     let (ok, text) = ruster(&["--run-dir", "/nonexistent", "versions"]);
     assert!(!ok);
-    assert!(text.contains("confd/config.sock"), "{text}");
+    assert!(text.contains("confd/config/config.sock"), "{text}");
     let (ok, text) = ruster(&["--run-dir", "/nonexistent", "rollback", "x"]);
     assert!(!ok);
     assert!(text.contains("x: not a version number"), "{text}");
@@ -48,7 +48,7 @@ fn versions_and_rollback_fail_clearly_without_a_router() {
     }
     let (ok, text) = ruster(&["--run-dir", "/nonexistent", "confirm"]);
     assert!(!ok);
-    assert!(text.contains("confd/config.sock"), "{text}");
+    assert!(text.contains("confd/config/config.sock"), "{text}");
 }
 
 #[test]

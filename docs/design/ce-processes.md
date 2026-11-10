@@ -53,7 +53,7 @@ FEと、TUNを作る`confd --kernel`（capabilityで絞ってもよい）。`rus
 | プロセス | ユーザー | 作るsocket | つなぐ、送るsocket |
 |---|---|---|---|
 | `ruster-fe` | root | `fe/config.sock`、`fe/route.sock`、`fe/neigh.sock`、`fe/state.sock`、`fe/punt/*.sock` | 各プロセスの`<名前>/punt.sock` |
-| `ruster-confd` | root（`--kernel`）、無ければ専用 | `confd/config.sock`、`confd/part/<モジュール>/part.sock`、`confd/source/<送り手>/source.sock` | `fe/config.sock`、`neighd/config.sock`、`ribd/source/confd/source.sock` |
+| `ruster-confd` | root（`--kernel`）、無ければ専用 | `confd/config/config.sock`、`confd/part/<モジュール>/part.sock`、`confd/source/<送り手>/source.sock` | `fe/config.sock`、`neighd/config.sock`、`ribd/source/confd/source.sock` |
 | `ruster-ribd` | 専用 | `ribd/source/<送り手>/source.sock` | `fe/route.sock` |
 | `ruster-neighd` | 専用 | `neighd/config.sock`、`neighd/punt.sock` | `fe/neigh.sock`、`fe/punt/arp-nd.sock`、`confd/part/ra/part.sock` |
 | `ruster-pppoed` | 専用 | `pppoed/punt.sock` | `fe/punt/pppoed.sock`、`confd/part/pppoe/part.sock`、`confd/source/<設定の送り手>/source.sock`、`ribd/source/pppoed/source.sock` |
@@ -61,21 +61,25 @@ FEと、TUNを作る`confd --kernel`（capabilityで絞ってもよい）。`rus
 | `ruster-kea` | 専用 | `kea/punt.sock` | `fe/punt/kea.sock`、`confd/part/dhcp/part.sock` |
 | `ruster-unbound` | 専用（上の権限付き） | 無し | `confd/part/dns/part.sock` |
 | `ruster-frr` | 専用（上の権限付き） | 無し | `confd/part/frr/part.sock`、`ribd/source/frr/source.sock` |
-| `ruster`（CLI） | グループの運用者 | 無し | `confd/config.sock`、`fe/state.sock`、`confd/source/<送り手>/source.sock`、`ribd/source/<送り手>/source.sock` |
+| `ruster`（CLI） | グループの運用者 | 無し | `confd/config/config.sock`、`fe/state.sock`、`confd/source/<送り手>/source.sock`、`ribd/source/<送り手>/source.sock` |
 
 ### 部分と送り手のsocket
 
 confdが担当の部分を渡すsocketと、confdとribdが送り手の値を受けるsocketは、モジュールや送り手ごとに
 ディレクトリを分けて置く（`confd/part/<モジュール>/`、`confd/source/<送り手>/`、`ribd/source/<送り手>/`）。
+CLIが設定全体を入れ替え、差分（パスワードを含むlockの形）を受け取る`confd/config/config.sock`も、
+ディレクトリを分けて置く。
 socketを作るのは今までどおりconfdとribdで、ディレクトリが無ければ作る。運用者がそのディレクトリを先に、
 使うプロセスだけが入るグループで作っておくと、そのsocketはそのプロセス（と作る側）だけが開ける。
 
 たとえば`pppoe`の部分（PPPoEのパスワードを含む）を`ruster-pppoed`だけに渡すには、`pppoed`ユーザーだけが入る
-グループ`pppoed`を使い、systemdのtmpfiles.dに次のように書く。
+グループ`pppoed`を使い、systemdのtmpfiles.dに次のように書く。`ruster-admin`は、`ruster apply`などを使う
+運用者だけが入るグループ。
 
 ```
 d /run/ruster                        2750 root   ruster -
 d /run/ruster/confd                  2750 confd  ruster -
+d /run/ruster/confd/config           2750 confd  ruster-admin -
 d /run/ruster/confd/part             2750 confd  ruster -
 d /run/ruster/confd/part/pppoe       2750 confd  pppoed -
 d /run/ruster/confd/source           2750 confd  ruster -
@@ -87,13 +91,18 @@ d /run/ruster/ribd/source/pppoed     2750 ribd   pppoed -
 
 - set-group-IDの印があるので、confdが作る`part.sock`のグループは`pppoed`になる。0660なので、開けるのは
   持ち主のconfdとグループの`pppoed`だけ。ほかのプロセスは、`ruster`グループでもディレクトリに入れない。
+- 持ち主は、そのプロセスを動かすユーザーにする（confdを`--kernel`でrootとして動かすならroot）。
 - 上の段（`/run/ruster`、`confd`、`confd/part`）は、全部のプロセスが通れるように`ruster`グループのまま。
+- `confd/config/`を絞らないと、グループのどのプロセスも設定全体を読み（`ruster diff`の差分にパスワードが出る）、
+  入れ替えられる。`pppoe`の部分を絞っても、こちらを絞らなければ意味が無い。
+- 後から`ruster apply`で送り手を足すときも、先にそのディレクトリを作る。作らずに足すと、confdが上から
+  `ruster`グループを引き継いで作るので、グループのどのプロセスもその送り手の値を書ける。
 - `ruster source`で手で値を書く運用者は、その送り手のグループにも入る。
 - confdは、socketの名前が示すモジュールしか渡さない（`dns`のsocketで`pppoe`を名乗っても断る）。
 - ほかのモジュールと送り手も同じように絞れる。絞らないディレクトリは、上から`ruster`グループを引き継ぐ。
 
-限界: 上の表の`fe/*.sock`や`neighd/config.sock`などは、今もグループの全部のプロセスが開ける。たとえば
-`ruster-unbound`も`fe/route.sock`へ書ける。接続の相手のユーザーを確かめる方法（`SO_PEERCRED`）は、
+限界: ディレクトリを分けたのは上のsocketだけで、`fe/*.sock`、`neighd/config.sock`、`<名前>/punt.sock`は、
+今もグループの全部のプロセスが開ける。たとえば`ruster-unbound`も`fe/route.sock`へ書ける。接続の相手のユーザーを確かめる方法（`SO_PEERCRED`）は、
 Rustの標準libraryでは安定していないので使わない。
 
 ## `ruster-confd`（設定管理）

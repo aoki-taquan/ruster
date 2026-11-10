@@ -186,18 +186,24 @@ fn a_directory_made_beforehand_gives_its_socket_its_own_group() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     // A group of this process other than its own, as an operator's group for one
     // process (`docs/design/ce-processes.md`, "部分と送り手のsocket").
+    // root may give any group: nogroup's.
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let primary = std::fs::metadata("/proc/self").unwrap().gid();
-    let Some(other) = status
-        .lines()
-        .find_map(|l| l.strip_prefix("Groups:"))
-        .and_then(|groups| {
-            groups
-                .split_whitespace()
-                .filter_map(|g| g.parse::<u32>().ok())
-                .find(|&g| g != primary)
-        })
-    else {
+    let me = std::fs::metadata("/proc/self").unwrap();
+    let primary = me.gid();
+    let other = if me.uid() == 0 {
+        Some(65_534)
+    } else {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Groups:"))
+            .and_then(|groups| {
+                groups
+                    .split_whitespace()
+                    .filter_map(|g| g.parse::<u32>().ok())
+                    .find(|&g| g != primary)
+            })
+    };
+    let Some(other) = other else {
         eprintln!("skipped: this process is in no second group");
         return;
     };
