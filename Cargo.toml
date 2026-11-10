@@ -5,6 +5,7 @@ members = [
     "crates/confd",
     "crates/config",
     "crates/core",
+    "crates/dhcpc",
     "crates/e2e",
     "crates/fe",
     "crates/io-afpacket",

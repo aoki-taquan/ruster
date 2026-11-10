@@ -135,6 +135,10 @@ name = "ruster-core"
 version = "0.2.0"
 
 [[package]]
+name = "ruster-dhcpc"
+version = "0.2.0"
+
+[[package]]
 name = "ruster-e2e"
 version = "0.2.0"
 dependencies = [
