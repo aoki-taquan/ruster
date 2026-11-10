@@ -119,14 +119,16 @@ impl Taker {
     fn put(&mut self, module: Module, part: String, generation: u64) {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
-        let _ = self.conn.send(&Outgoing {
+        let sent = self.conn.send(&Outgoing {
             code: Some(Code::PUT),
             token: &token.to_be_bytes(),
             path: &[module.name()],
             payload: part.as_bytes(),
             ..Outgoing::default()
         });
-        self.in_flight.push((token, generation, part));
+        if sent.is_ok() {
+            self.in_flight.push((token, generation, part));
+        }
     }
 }
 
@@ -190,7 +192,9 @@ impl Parts {
             let conn = &mut self.unnamed[index];
             busy |= conn.pump().unwrap_or(false);
             let mut module = None;
-            if let Ok(Some(request)) = conn.next_message() {
+            if conn.backlog() >= conn.limit() {
+                conn.close();
+            } else if let Ok(Some(request)) = conn.next_message() {
                 busy = true;
                 module = name(conn, &request);
             }
@@ -218,6 +222,10 @@ impl Parts {
         for (module, taker) in &mut self.takers {
             busy |= taker.conn.pump().unwrap_or(false);
             for _ in 0..MESSAGES_PER_STEP {
+                // A process that does not read its answers gets no more handled.
+                if taker.conn.backlog() >= taker.conn.limit() {
+                    break;
+                }
                 let Ok(Some(message)) = taker.conn.next_message() else {
                     break;
                 };
