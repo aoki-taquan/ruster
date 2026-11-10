@@ -30,6 +30,7 @@ cleanup() {
   wait 2>/dev/null || true
   for ns in "$lan" "$wan" "$router"; do ip netns del "$ns" 2>/dev/null || true; done
   rm -rf "$kdir"
+  [[ -n "${ours:-}" ]] && rm -f "$control"
   if [[ "${keep_logs:-}" == 1 ]]; then echo "logs in $work"; else rm -rf "$work"; fi
 }
 trap cleanup EXIT
@@ -136,6 +137,7 @@ kea_as() {
 }
 kea_as -t "$kdir/kea-dhcp4.conf" >"$work/kea-check.log" 2>&1 ||
   fail "Kea does not take the file"
+ours=1
 (kea_as -c "$kdir/kea-dhcp4.conf" 2>&1 | cat >>"$work/kea.log") &
 pids+=("$!")
 for _ in $(seq 1 100); do [[ -S "$control" ]] && grep -q DHCP4_STARTED "$work/kea.log" && break; sleep 0.1; done
@@ -160,11 +162,16 @@ done
 (( ok == 1 )) || fail "the LAN host does not reach the WAN host"
 echo "ok: with that lease the LAN host reaches the WAN through NAT"
 
-# Renewing goes to the router's address (the server identifier), not broadcast.
+# Renewing goes to the router's address (the server identifier), not broadcast:
+# udhcpc sends it unicast, and it is answered before udhcpc falls back to a
+# broadcast rebind. Kea sees it relayed, as its second DHCPREQUEST.
 kill -USR1 "$(cat "$work/udhcpc.pid")"
 for _ in $(seq 1 50); do grep -q "^renew" "$work/lease" && break; sleep 0.1; done
 grep -q "^renew" "$work/lease" || fail "the renewal was not answered: $(cat "$work/lease")"
-grep -q "DHCPREQUEST.*from 192.0.2.1 to 127.0.0.1" "$work/kea.log" || fail "Kea did not see a relayed request"
+grep -q "sending renew to server 192.0.2.1" "$work/udhcpc.log" || fail "udhcpc did not renew unicast"
+grep -q "rebind" "$work/udhcpc.log" && fail "udhcpc fell back to a rebind"
+(( $(grep -c "DHCPREQUEST.*from 192.0.2.1 to 127.0.0.1" "$work/kea.log") == 2 )) ||
+  fail "Kea did not see the renewal relayed"
 echo "ok: the lease is renewed through the relay"
 
 ruster() { nsx "$router" "$bin/ruster" --run-dir "$run_dir" "$@"; }
@@ -172,7 +179,7 @@ out=$(ruster apply "$work/other-pool.toml") || fail "ruster apply: $out"
 grep -q "applied" <<<"$out" || fail "ruster apply said: $out"
 grep -q "192.0.2.200 - 192.0.2.220" "$kdir/ruster-dhcp4.json" || fail "the new pool is not written"
 kea_as -t "$kdir/kea-dhcp4.conf" >/dev/null 2>&1 || fail "Kea does not take the new file"
-echo "ok: ruster apply changes Kea's pool"
+echo "ok: ruster apply writes the new pool, and Kea reads it"
 
 out=$(ruster apply "$work/router.toml") || fail "ruster apply without dhcp: $out"
 grep -q "applied" <<<"$out" || fail "ruster apply said: $out"
