@@ -2,7 +2,7 @@
 
 use std::net::Ipv4Addr;
 
-use ruster_kea::relay::{reply, request, Drop, Link};
+use ruster_kea::relay::{reply, request, Dropped, Link};
 
 const CLIENT: [u8; 6] = [0x02, 0, 0, 0, 0, 0x10];
 
@@ -133,21 +133,21 @@ fn requests_that_cannot_be_relayed_are_dropped() {
         change(&mut m);
         frame([0; 4], [255; 4], &m)
     };
-    let cases: Vec<(Vec<u8>, Drop)> = vec![
-        (with(&|m| m[0] = 2), Drop::Op),
-        (with(&|m| m[3] = 5), Drop::Hops),
+    let cases: Vec<(Vec<u8>, Dropped)> = vec![
+        (with(&|m| m[0] = 2), Dropped::Op),
+        (with(&|m| m[3] = 5), Dropped::Hops),
         (
             with(&|m| m[24..28].copy_from_slice(&[10, 0, 0, 1])),
-            Drop::Giaddr,
+            Dropped::Giaddr,
         ),
         (
             with(&|m| m.splice(240..240, [82, 3, 1, 1, b'x']).for_each(drop)),
-            Drop::AgentOption,
+            Dropped::AgentOption,
         ),
-        (with(&|m| m.truncate(239)), Drop::Malformed),
-        (with(&|m| m[236] = 0), Drop::Malformed),
-        (with(&|m| m.truncate(244)), Drop::Malformed),
-        (with(&|m| m[241] = 200), Drop::Malformed),
+        (with(&|m| m.truncate(239)), Dropped::Malformed),
+        (with(&|m| m[236] = 0), Dropped::Malformed),
+        (with(&|m| m.truncate(244)), Dropped::Malformed),
+        (with(&|m| m[241] = 200), Dropped::Malformed),
     ];
     for (at, (frame, why)) in cases.into_iter().enumerate() {
         assert_eq!(request(&link(), &frame), Err(why), "case {at}");
@@ -156,22 +156,22 @@ fn requests_that_cannot_be_relayed_are_dropped() {
     let good = discover();
     let mut bad_ip = good.clone();
     bad_ip[14 + 8] = 1; // TTL changed, the checksum not
-    assert_eq!(request(&link(), &bad_ip), Err(Drop::Checksum));
+    assert_eq!(request(&link(), &bad_ip), Err(Dropped::Checksum));
     let mut bad_udp = good.clone();
     bad_udp[14 + 28 + 4] ^= 1;
-    assert_eq!(request(&link(), &bad_udp), Err(Drop::Checksum));
+    assert_eq!(request(&link(), &bad_udp), Err(Dropped::Checksum));
     let mut port = good.clone();
     port[14 + 23] = 68;
-    assert_eq!(request(&link(), &port), Err(Drop::NotDhcp));
+    assert_eq!(request(&link(), &port), Err(Dropped::NotDhcp));
     let mut fragment = good.clone();
     fragment[14 + 6] = 0x20;
-    assert_eq!(request(&link(), &fragment), Err(Drop::NotDhcp));
+    assert_eq!(request(&link(), &fragment), Err(Dropped::NotDhcp));
     let mut ipv6 = good.clone();
     ipv6[12..14].copy_from_slice(&[0x86, 0xdd]);
-    assert_eq!(request(&link(), &ipv6), Err(Drop::NotDhcp));
+    assert_eq!(request(&link(), &ipv6), Err(Dropped::NotDhcp));
     let mut options = good;
     options[14] = 0x46;
-    assert_eq!(request(&link(), &options), Err(Drop::NotDhcp));
+    assert_eq!(request(&link(), &options), Err(Dropped::NotDhcp));
 }
 
 /// Kea's reply to the relay, echoing option 82.
@@ -248,10 +248,10 @@ fn a_reply_is_broadcast_when_the_client_asks_or_has_no_address() {
 fn replies_that_are_not_for_the_link_are_dropped() {
     let mut other = kea_reply(0, [0; 4], [192, 0, 2, 100]);
     other[24..28].copy_from_slice(&[192, 0, 2, 2]);
-    assert_eq!(reply(&link(), &other), Err(Drop::Giaddr));
+    assert_eq!(reply(&link(), &other), Err(Dropped::Giaddr));
     let mut op = kea_reply(0, [0; 4], [192, 0, 2, 100]);
     op[0] = 1;
-    assert_eq!(reply(&link(), &op), Err(Drop::Op));
+    assert_eq!(reply(&link(), &op), Err(Dropped::Op));
     let mut long = kea_reply(0, [0; 4], [192, 0, 2, 100]);
     long.pop();
     for _ in 0..6 {
@@ -259,10 +259,10 @@ fn replies_that_are_not_for_the_link_are_dropped() {
         long.extend_from_slice(&[0; 255]);
     }
     long.push(255);
-    assert_eq!(reply(&link(), &long), Err(Drop::TooLong));
+    assert_eq!(reply(&link(), &long), Err(Dropped::TooLong));
     let mut cut = kea_reply(0, [0; 4], [192, 0, 2, 100]);
     cut.truncate(250);
-    assert_eq!(reply(&link(), &cut), Err(Drop::Malformed));
+    assert_eq!(reply(&link(), &cut), Err(Dropped::Malformed));
 }
 
 #[test]

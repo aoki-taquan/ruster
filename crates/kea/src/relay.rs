@@ -25,7 +25,7 @@
 //!   `hops`, and puts its address on the receiving interface in a zero `giaddr`.
 //! - RFC 1542 section 4.1.2 and 5.4, RFC 2131 section 4.1: a BOOTREPLY goes to the
 //!   client on the interface `giaddr` names; broadcast when the BROADCAST flag is
-//!   set, else to `yiaddr` (or, when that is zero, `ciaddr`) at the `chaddr`
+//!   set, else to `yiaddr` at the `chaddr`
 //!   hardware address, from UDP port 67 to port 68.
 //! - RFC 3046 sections 2.0 and 2.1: the Relay Agent Information option (82), last
 //!   before End, with a Circuit ID sub-option (1) naming the circuit, here the
@@ -37,7 +37,12 @@
 //! Deviations: a request whose `giaddr` is not zero (from another relay agent on
 //! the LAN) is dropped, so are one that already carries option 82 (RFC 3046 2.1
 //! allows this for an untrusted circuit), an IPv4 fragment and one with IP options;
-//! the hops threshold is not configurable; a reply whose `htype` and `hlen` are not
+//! the hops threshold is not configurable; the request's UDP source port is not
+//! checked; Pad and what follows End are left out of the relayed request (which may
+//! then be shorter than BOOTP's 300 bytes), and options without End are taken; with
+//! an interface name of more than 253 bytes no option 82 is added; a reply with no
+//! `yiaddr` (an answer to DHCPINFORM) goes to `ciaddr`, as RFC 2131 4.1 says for a
+//! server, since RFC 1542 names only `yiaddr`; a reply whose `htype` and `hlen` are not
 //! Ethernet's (1 and 6) is broadcast; a reply is sent with TTL 64; options in
 //! `sname` and `file` (option overload) are passed as they are.
 
@@ -90,7 +95,7 @@ const CHADDR: usize = 28;
 
 /// Why a message is dropped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Drop {
+pub enum Dropped {
     /// Not an IPv4 UDP packet to port 67 that can be read whole.
     NotDhcp,
     /// A bad IPv4 header or UDP checksum.
@@ -109,7 +114,7 @@ pub enum Drop {
     TooLong,
 }
 
-impl std::fmt::Display for Drop {
+impl std::fmt::Display for Dropped {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let text = match self {
             Self::NotDhcp => "not a DHCP request",
@@ -127,25 +132,25 @@ impl std::fmt::Display for Drop {
 
 /// The relayed request for Kea, from a client's request in `frame` (Ethernet, no
 /// VLAN tag) that came in on `link`.
-pub fn request(link: &Link, frame: &[u8]) -> Result<Vec<u8>, Drop> {
+pub fn request(link: &Link, frame: &[u8]) -> Result<Vec<u8>, Dropped> {
     let message = udp_payload(frame)?;
     if message.len() < OPTIONS || message[FIXED..OPTIONS] != COOKIE {
-        return Err(Drop::Malformed);
+        return Err(Dropped::Malformed);
     }
     if message[OP] != BOOTREQUEST {
-        return Err(Drop::Op);
+        return Err(Dropped::Op);
     }
     if message[HOPS] > MAX_HOPS {
-        return Err(Drop::Hops);
+        return Err(Dropped::Hops);
     }
     if message[GIADDR..GIADDR + 4] != [0; 4] {
-        return Err(Drop::Giaddr);
+        return Err(Dropped::Giaddr);
     }
     let mut options = Vec::new();
     for option in Options(&message[OPTIONS..]) {
         let (code, whole) = option?;
         if code == RELAY_AGENT_INFORMATION {
-            return Err(Drop::AgentOption);
+            return Err(Dropped::AgentOption);
         }
         options.extend_from_slice(whole);
     }
@@ -167,15 +172,15 @@ pub fn request(link: &Link, frame: &[u8]) -> Result<Vec<u8>, Drop> {
 }
 
 /// The frame to the client for Kea's reply `message` to `link`'s address.
-pub fn reply(link: &Link, message: &[u8]) -> Result<Vec<u8>, Drop> {
+pub fn reply(link: &Link, message: &[u8]) -> Result<Vec<u8>, Dropped> {
     if message.len() < OPTIONS || message[FIXED..OPTIONS] != COOKIE {
-        return Err(Drop::Malformed);
+        return Err(Dropped::Malformed);
     }
     if message[OP] != BOOTREPLY {
-        return Err(Drop::Op);
+        return Err(Dropped::Op);
     }
     if message[GIADDR..GIADDR + 4] != link.address.octets() {
-        return Err(Drop::Giaddr);
+        return Err(Dropped::Giaddr);
     }
     let mut payload = Vec::with_capacity(message.len());
     payload.extend_from_slice(&message[..OPTIONS]);
@@ -187,7 +192,7 @@ pub fn reply(link: &Link, message: &[u8]) -> Result<Vec<u8>, Drop> {
     }
     payload.push(END);
     if IPV4_HEADER + UDP_HEADER + payload.len() > MAX_PACKET {
-        return Err(Drop::TooLong);
+        return Err(Dropped::TooLong);
     }
 
     let address = |at: usize| {
@@ -249,33 +254,33 @@ fn frame(link: &Link, mac: [u8; 6], to: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
 }
 
 /// The UDP payload of an IPv4 packet to port 67 in `frame`, its checksums checked.
-fn udp_payload(frame: &[u8]) -> Result<&[u8], Drop> {
+fn udp_payload(frame: &[u8]) -> Result<&[u8], Dropped> {
     if frame.get(12..14) != Some(&[0x08, 0x00][..]) {
-        return Err(Drop::NotDhcp);
+        return Err(Dropped::NotDhcp);
     }
     let ip = &frame[ETHERNET..];
     // Version 4 and no IP options.
     if ip.len() < IPV4_HEADER || ip[0] != 0x45 {
-        return Err(Drop::NotDhcp);
+        return Err(Dropped::NotDhcp);
     }
     let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
     let fragment = u16::from_be_bytes([ip[6], ip[7]]) & 0x3fff != 0;
     if total < IPV4_HEADER + UDP_HEADER || total > ip.len() || fragment || ip[9] != 17 {
-        return Err(Drop::NotDhcp);
+        return Err(Dropped::NotDhcp);
     }
     if checksum(&ip[..IPV4_HEADER], 0) != 0 {
-        return Err(Drop::Checksum);
+        return Err(Dropped::Checksum);
     }
     let udp = &ip[IPV4_HEADER..total];
     let length = usize::from(u16::from_be_bytes([udp[4], udp[5]]));
     let to = u16::from_be_bytes([udp[2], udp[3]]);
     if to != SERVER_PORT || length < UDP_HEADER || length > udp.len() {
-        return Err(Drop::NotDhcp);
+        return Err(Dropped::NotDhcp);
     }
     let udp = &udp[..length];
     // A zero checksum is none (RFC 768).
     if udp[6..8] != [0, 0] && checksum(udp, pseudo_header(&ip[..IPV4_HEADER], length)) != 0 {
-        return Err(Drop::Checksum);
+        return Err(Dropped::Checksum);
     }
     Ok(&udp[UDP_HEADER..])
 }
@@ -310,7 +315,7 @@ fn checksum(bytes: &[u8], sum: u32) -> u16 {
 struct Options<'a>(&'a [u8]);
 
 impl<'a> Iterator for Options<'a> {
-    type Item = Result<(u8, &'a [u8]), Drop>;
+    type Item = Result<(u8, &'a [u8]), Dropped>;
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
@@ -324,12 +329,12 @@ impl<'a> Iterator for Options<'a> {
                 _ => {
                     let Some(&len) = rest.first() else {
                         self.0 = &[];
-                        return Some(Err(Drop::Malformed));
+                        return Some(Err(Dropped::Malformed));
                     };
                     let end = 2 + usize::from(len);
                     let Some(whole) = self.0.get(..end) else {
                         self.0 = &[];
-                        return Some(Err(Drop::Malformed));
+                        return Some(Err(Dropped::Malformed));
                     };
                     self.0 = &self.0[end..];
                     return Some(Ok((code, whole)));
