@@ -277,7 +277,7 @@ fn only_ipv4_waits_for_the_leased_address() {
     };
     let v4 = route(Ipv4Addr::UNSPECIFIED.into());
     let v6 = route(Ipv6Addr::UNSPECIFIED.into());
-    let mut step = |confd: &mut Confd, ribd: &mut Server, now| {
+    let step = |confd: &mut Confd, ribd: &mut Server, now| {
         for _ in 0..50 {
             confd.step(now);
             ribd.step(&mut Accept);
