@@ -16,16 +16,18 @@
 //!
 //! confd puts the part right after the 2.04, and again whenever a new configuration
 //! changes it. A part is the whole of the module, so each PUT replaces the last one.
+//! A refused PUT is handled like a refusal from the FE, ribd or neighd: if it is for
+//! a new configuration from `ruster apply`, confd puts the configuration before back
+//! ([`crate::apply`]), which for the refusing process is the part it already holds.
 //!
 //! A check is the candidate step of `docs/design/router-box.md`, "反映の流れ": the
 //! process works out what the part would change against what it holds now (its
-//! files, its sessions), and takes nothing. An answer too long for one message is
-//! cut, saying so. `ruster diff` and `ruster apply` use the answers ([`crate::apply`]). A check cannot
-//! foresee everything: the software a bridge drives may still refuse the file when
-//! it reads it, which the answer to the PUT then says.
-//! A refusal is handled like one from the FE, ribd or neighd: if it is for a new
-//! configuration from `ruster apply`, confd puts the configuration before back
-//! ([`crate::apply`]), which for the refusing process is the part it already holds.
+//! files, its sessions), and takes nothing. A process whose part would not change
+//! is not asked: that part is not sent either. `ruster diff` shows the answers, and
+//! `ruster apply` sends nothing to anyone when one refuses ([`crate::apply`]). An
+//! answer too long for one message is cut, saying so. A check cannot foresee
+//! everything: the software a bridge drives may still refuse the file when it reads
+//! it, which the answer to the PUT then says.
 //! A process gets only its own module's part, never the rest of the configuration.
 //!
 //! One connection takes one module, and one connection holds each module: a newer one
@@ -259,16 +261,21 @@ impl Parts {
         }
     }
 
-    /// Asks every connected process to check its part of `candidate`, and notes the
-    /// modules `candidate` has that no process takes now. The answers of an earlier
+    /// Asks every connected process whose part `candidate` changes to check it (one
+    /// whose part stays has no change), and notes the modules `candidate` has that no
+    /// process takes now. The answers of an earlier
     /// check are dropped.
     pub(crate) fn check(&mut self, candidate: &Config) {
         self.checked.clear();
         for module in Module::ALL {
+            let part = module.part(candidate);
             let asked = match self.takers.get_mut(&module) {
-                Some(taker) if !taker.conn.is_closed() => {
-                    taker.check(module, &module.part(candidate))
+                // A part that would not change is not sent, so nothing can refuse it.
+                Some(taker) if !taker.conn.is_closed() && taker.expected() == Some(&part) => {
+                    self.checked.insert(module, Checked::Changes(String::new()));
+                    continue;
                 }
+                Some(taker) if !taker.conn.is_closed() => taker.check(module, &part),
                 _ => false,
             };
             if asked {

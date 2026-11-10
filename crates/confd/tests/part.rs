@@ -25,10 +25,12 @@ fn text(mtu: u16, upstream: &str) -> String {
     )
 }
 
-/// A process for `dns` that refuses parts with `refuse` in them.
+/// A process for `dns` that refuses parts with `refuse` in them; with
+/// `check_passes`, only when it takes them, not when it checks them.
 struct Process {
     client: Client,
     refuse: Option<&'static str>,
+    check_passes: bool,
     taken: Vec<String>,
 }
 
@@ -39,16 +41,21 @@ impl Process {
         Self {
             client: Client::new(b, Module::Dns).unwrap(),
             refuse: None,
+            check_passes: false,
             taken: Vec::new(),
         }
     }
 
     fn poll(&mut self) -> bool {
         let refuse = self.refuse;
+        let check_passes = self.check_passes;
         let taken = &mut self.taken;
         self.client
             .poll(&mut |asked| match (asked, refuse) {
-                (Asked::Check(part) | Asked::Take(part), Some(word)) if part.contains(word) => {
+                (Asked::Take(part), Some(word)) if part.contains(word) => {
+                    Err(format!("{word} refused"))
+                }
+                (Asked::Check(part), Some(word)) if part.contains(word) && !check_passes => {
                     Err(format!("{word} refused"))
                 }
                 (Asked::Check(part), _) => Ok(format!("would take {} lines", part.lines().count())),
@@ -151,7 +158,9 @@ fn a_refused_part_puts_the_configuration_before_back() {
     let mut rig = Rig::new();
     let mut dns = Process::new(&mut rig);
     rig.run(&mut [&mut dns]);
+    // The check passes; the software behind the process refuses it when it is taken.
     dns.refuse = Some("192.0.2.99");
+    dns.check_passes = true;
     rig.cli
         .post(&["config"], text(1400, "192.0.2.99").as_bytes());
     let answers = rig.run(&mut [&mut dns]);
@@ -373,4 +382,149 @@ fn a_long_check_answer_is_cut_to_fit() {
     };
     assert!(said.ends_with(" more bytes)\n"), "cut");
     assert!(!client.is_closed());
+}
+
+#[test]
+fn a_candidate_a_process_refuses_is_not_sent_to_anyone() {
+    let mut rig = Rig::new();
+    let mut dns = Process::new(&mut rig);
+    rig.run(&mut [&mut dns]);
+    dns.refuse = Some("192.0.2.99");
+    rig.cli
+        .post(&["config"], text(1400, "192.0.2.99").as_bytes());
+    let answers = rig.run(&mut [&mut dns]);
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    assert_eq!(
+        answers[0].1,
+        "ruster-unbound (dns) refuses it: 192.0.2.99 refused\n\
+         nothing was sent; the configuration in use stays"
+    );
+    assert_eq!(dns.taken.len(), 1, "nothing was put");
+    assert_eq!(
+        rig.confd.config().interfaces[0].mtu,
+        1500,
+        "nor sent to the FE"
+    );
+    assert!(rig.apply.versions().list().is_empty(), "nor kept");
+}
+
+#[test]
+fn a_diff_shows_what_each_process_would_change() {
+    let mut rig = Rig::new();
+    let mut dns = Process::new(&mut rig);
+    rig.run(&mut [&mut dns]);
+    rig.cli.post(&["diff"], text(1500, "192.0.2.54").as_bytes());
+    dns.refuse = Some("192.0.2.99");
+    rig.cli.post(&["diff"], text(1500, "192.0.2.99").as_bytes());
+    let answers = rig.run(&mut [&mut dns]);
+    assert_eq!(answers.len(), 2, "{answers:?}");
+    assert_eq!(answers[0].0, Code::CONTENT);
+    assert!(
+        answers[0]
+            .1
+            .contains("\nruster-unbound (dns):\nwould take "),
+        "{answers:?}"
+    );
+    assert!(
+        answers[1]
+            .1
+            .contains("ruster-unbound (dns):\nrefuses it: 192.0.2.99 refused\n"),
+        "{answers:?}"
+    );
+    assert_eq!(dns.taken.len(), 1);
+
+    // Without the process, the diff says so.
+    drop(dns);
+    rig.run(&mut []);
+    rig.cli.post(&["diff"], text(1500, "192.0.2.54").as_bytes());
+    let answers = rig.run(&mut []);
+    assert!(
+        answers[0].1.contains(
+            "ruster-unbound (dns):\nnot connected; it gets the configuration when it connects\n"
+        ),
+        "{answers:?}"
+    );
+}
+
+#[test]
+fn a_process_that_does_not_answer_the_check_does_not_hold_the_change_up() {
+    use ruster_proto::conn::{Connection, Outgoing};
+    let mut rig = Rig::new();
+    let (a, b) = UnixStream::pair().unwrap();
+    rig.confd.attach_part(Module::Dns, a).unwrap();
+    let mut conn = Connection::new(b, 1 << 20).unwrap();
+    conn.send(&Outgoing {
+        code: Some(Code::POST),
+        token: &[0],
+        path: &["dns"],
+        ..Default::default()
+    })
+    .unwrap();
+    // Takes each part, and never answers a check.
+    let silent = |conn: &mut Connection| {
+        conn.pump().unwrap();
+        while let Ok(Some(message)) = conn.next_message() {
+            if message.code == Code::PUT {
+                conn.send(&Outgoing {
+                    code: Some(Code::CHANGED),
+                    token: &message.token,
+                    ..Default::default()
+                })
+                .unwrap();
+            }
+        }
+        conn.pump().unwrap();
+    };
+    let mut answers = Vec::new();
+    for _ in 0..20 {
+        rig.fe.step(&mut Accept);
+        rig.confd.step(0);
+        silent(&mut conn);
+    }
+    rig.cli
+        .post(&["config"], text(1400, "192.0.2.54").as_bytes());
+    for now in [0, 0, 0, 0, 0, ruster_confd::apply::ANSWER_WAIT_MS]
+        .into_iter()
+        .chain(std::iter::repeat_n(ruster_confd::apply::ANSWER_WAIT_MS, 50))
+    {
+        rig.fe.step(&mut Accept);
+        rig.confd.step(now);
+        rig.apply.step(&mut rig.confd, now, &mut |_| Vec::new());
+        silent(&mut conn);
+        let (_, events) = rig.cli.poll();
+        for event in events {
+            if let Event::Response { code, payload, .. } = event {
+                answers.push((code, String::from_utf8(payload).unwrap()));
+            }
+        }
+    }
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    assert!(
+        answers[0]
+            .1
+            .starts_with("ruster-unbound (dns) did not answer the check in time\n"),
+        "{answers:?}"
+    );
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1400);
+}
+
+#[test]
+fn a_part_that_does_not_change_is_not_checked() {
+    use ruster_confd::part::Checked;
+    let mut rig = Rig::new();
+    let mut dns = Process::new(&mut rig);
+    rig.run(&mut [&mut dns]);
+    // It would refuse even the part it holds; an unrelated change still goes in.
+    dns.refuse = Some("192.0.2.53");
+    dns.check_passes = false;
+    rig.cli
+        .post(&["config"], text(1400, "192.0.2.53").as_bytes());
+    let answers = rig.run(&mut [&mut dns]);
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1400);
+    assert_eq!(
+        rig.confd.part_checks().get(&Module::Dns),
+        Some(&Checked::Changes(String::new()))
+    );
 }

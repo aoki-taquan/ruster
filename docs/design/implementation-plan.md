@@ -137,9 +137,11 @@ Unboundの橋渡し役（`ruster-unbound`、netns `dns`）と、Keaの橋渡し�
 netns `dhcp`）、neighdのRA（`[[ra]]`、netns `ra`）、DHCPv6のリレー（`[[dhcp6]]`、netns `dhcp6`）まで済んだ。
 FRRの橋渡し役（`[bgp]`、`ruster-frr`、netns `bgp`）も済んだ。ribdが直結していない次の転送先を
 自分の経路で解決するので、multihopの近隣も使える。VRFごとのBGPはまだ。confdは受け取った設定を番号付きの版として`--state-dir`に残し（`ruster versions`、`ruster rollback N`）、
-`ruster diff`でlockの形、confdが書くFEの表、ribdへ渡す経路の差分を出す。`ruster apply --confirm-within M`は、
-M分以内に`ruster confirm`が無ければ（confdが起動し直しても）前の版に戻す。各プロセスに差分を聞くのと、
-候補と確定を分けるのはまだ。
+`ruster diff`でlockの形、confdが書くFEの表、ribdへ渡す経路の差分と、部分を受け取る各プロセスが候補を
+確かめた答え（ファイルや設定の差分）を出す。`ruster apply`は、どれかのプロセスが候補を断れば何も送らない。
+`ruster apply --confirm-within M`は、M分以内に`ruster confirm`が無ければ（confdが起動し直しても）前の版に戻す。
+部分のsocketはモジュールごとで、ディレクトリのグループで開けるプロセスを絞れる（ce-processes.mdの
+「socketの権限」）。消えるNATセッションを差分に出すのと、FE、ribd、neighdを候補の段に加えるのはまだ。
 
 `ruster-dhcpc`（「作る順番」の4）は、WAN側のDHCPv4とDHCPv6（プレフィックスの委任）のクライアント。設定は
 confdの`dhcpc`の部分（`[[dhcp-client]]`）から受け取り、得た値は送り手（種類`dhcp-client`、`dhcpv6-client`）

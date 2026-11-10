@@ -15,9 +15,11 @@
 //! ruster [--run-dir DIR] source NAME [--lifetime SECONDS] [pppoe SESSION PEER MTU] [ipv4 ADDRESS/LEN]
 //! ```
 //!
-//! `apply` sends the file to confd, which sends what changed to the FE, ribd and neighd
-//! and answers once they have answered. If one of them refuses, confd puts the
-//! configuration it had before back ([`ruster_confd::apply`]). Otherwise confd keeps it
+//! `apply` sends the file to confd. confd first has each process that takes a part
+//! (`ruster-unbound`, `ruster-kea` and the others) check its part, and sends nothing if
+//! one refuses it. Then it sends what changed to the FE, ribd, neighd and those
+//! processes and answers once they have answered. If one of them refuses, confd puts
+//! the configuration it had before back ([`ruster_confd::apply`]). Otherwise confd keeps it
 //! as the next version ([`ruster_confd::versions`]). `rollback N` goes the same way
 //! with version N's configuration, which becomes a new version: the versions between
 //! stay.
@@ -26,8 +28,9 @@
 //! unless `confirm` comes within that time, even if confd is started again meanwhile.
 //! Use it for a change that could cut off the connection you apply it over.
 //!
-//! `diff` sends the file to confd, which reads it as for `apply` but sends it to no
-//! one, and prints what would change ([`ruster_confd::diff`]).
+//! `diff` sends the file to confd, which reads it as for `apply` and has the processes
+//! check their parts, but puts it in use nowhere, and prints what would change: confd's
+//! own and each process's ([`ruster_confd::diff`]).
 //!
 //! `route` writes to ribd as the route source NAME, the way a routing daemon does
 //! (ribd must have been started with that source). ribd picks between sources by
@@ -51,7 +54,9 @@ use ruster_proto::table::{
     entry_line, network, Change, Key, NextHop, RouteAction, Value, DEFAULT_VRF,
 };
 
-const WAIT: Duration = Duration::from_secs(5);
+/// How long to wait for an answer: confd waits up to 3 s for the processes' checks
+/// and 3 s more for their answers to the change.
+const WAIT: Duration = Duration::from_secs(10);
 
 const USAGE: &str = "usage:
   ruster check FILE

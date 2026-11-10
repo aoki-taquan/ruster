@@ -1,8 +1,8 @@
 //! What a new configuration would change, shown before it is applied (`ruster diff`,
 //! `docs/design/router-box.md`, "反映の流れ").
 //!
-//! confd reads the file as `ruster apply` would, sends nothing, and answers with text
-//! for a person in three parts:
+//! confd reads the file as `ruster apply` would, puts it in use nowhere, and answers
+//! with text for a person in four parts:
 //!
 //! 1. The lock form: a line diff from the latest version to the file's lock form, in
 //!    the unified format (`---`, `+++`, `@@` hunks with three lines of context).
@@ -11,11 +11,17 @@
 //!    now (a PPPoE session, a delegated prefix), so they change as those do.
 //! 3. The routes confd offers ribd (static and connected), likewise. Which routes the
 //!    FE ends up with is ribd's choice among all its sources.
+//! 4. A section for each process that takes a part ([`crate::part`]): what it says
+//!    taking its part would change (`ruster-unbound`, `ruster-kea` and `ruster-frr`
+//!    diff the files they write; `ruster-pppoed`, `ruster-dhcpc` and neighd's RA
+//!    diff the settings and name what would start, start again or stop), "no
+//!    change", the reason it would refuse it, "not connected", or "did not answer in
+//!    time" (after 3 s, [`crate::apply::ANSWER_WAIT_MS`]). Processes that are not
+//!    connected are named only when the file has their module.
 //!
-//! Not shown: what the other processes would do with their parts (FRR's
-//! configuration, Kea's subnets, NAT sessions that would end). They are asked only
-//! when the configuration is applied, and a refusal then puts the configuration before
-//! back ([`crate::apply`]). Nor what `--kernel` would change on the kernel side.
+//! Not shown: NAT sessions that would end, and what `--kernel` would change on the
+//! kernel side. A process cannot foresee everything either: the software a bridge
+//! drives may still refuse the file when it reads it.
 //! Firewall rules are numbered by place, so a rule added near the top shows each rule
 //! after it as removed and added (the FE gets all those changes too).
 //!
