@@ -870,6 +870,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let ospf6 = crate::isis_ospf::check_ospf("ospf6", lock.ospf6, &interfaces, &bridges)?;
     let etherip = crate::etherip::check(etherip, &interfaces, &bridges)?;
     let vxlan = crate::vxlan::check(vxlan, &interfaces, &bridges)?;
+    let srv6 = crate::srv6::check(lock.srv6, &interfaces, &static_routes)?;
     // The FE takes at most this many punt classes besides its own.
     let routing = crate::isis_ospf::class_count(&Config {
         isis: isis.clone(),
@@ -914,6 +915,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         ospf6,
         etherip,
         vxlan,
+        srv6,
         dns_found: Vec::new(),
     })
 }

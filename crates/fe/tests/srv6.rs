@@ -211,9 +211,12 @@ fn a_packet_to_an_end_dt4_sid_is_unwrapped_into_its_vrf() {
     let mut frame = WAN_MAC.to_vec();
     frame.extend_from_slice(&GATEWAY_MAC);
     frame.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
-    frame.extend_from_slice(&u16::try_from(inner.len()).unwrap().to_be_bytes());
-    frame.extend_from_slice(&[4, 64]);
+    frame.extend_from_slice(&u16::try_from(24 + inner.len()).unwrap().to_be_bytes());
+    frame.extend_from_slice(&[43, 64]);
     frame.extend_from_slice(&v6("2001:db8:ff::9").octets());
+    frame.extend_from_slice(&v6("fc00:1::4").octets());
+    // A Segment Routing Header with no segment left, as Linux puts on.
+    frame.extend_from_slice(&[4, 2, 4, 0, 0, 0, 0, 0]);
     frame.extend_from_slice(&v6("fc00:1::4").octets());
     frame.extend_from_slice(&inner);
     let out = send(&mut fe, WAN, frame);

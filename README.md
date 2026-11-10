@@ -49,7 +49,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 
 - IPv4とIPv6の転送。近隣はneighdがARPとNDで解決する。ICMPとICMPv6のエラーを返す。
 - ルータ宛ての通信は、種類ごとに数を抑えてVRFごとのTUNでkernelに渡す。
-- VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。
+- VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。VRFはSRv6（`[srv6]`。End、End.X、End.DT4、End.DT6、H.Encaps）で別のルータのVRFとつなげる。
 - VLAN（802.1Q）のサブインターフェースを持てる。AF_PACKETでは、kernelが外したタグをバックエンドがフレームに戻す。
 - L2のブリッジ（MACの学習、フラッディング、エージング）と、ブリッジのアドレスで経路につなぐIRB。設定は`[[interface]]`の`bridge`。メンバーにはEtherIP（`etherip`）とVXLAN（`vxlan`、VTEPは一覧で書く）も使える。
 - 経路は静的なもの、直結、FRRのBGP（multihopの近隣も。次の転送先はribdが解決する）。実際のNICや回線ではまだ試していません。
