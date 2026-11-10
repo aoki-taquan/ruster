@@ -158,6 +158,7 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 `netns-pppoed.sh`は、`pppoe-server`（パッケージ`pppoe`と`ppp`）を相手に、pppoedのセッションをIPCPとIPv6CPまで張ります（FEは通さない）。
 `netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る）。
 `netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。`netns-dhcp6.sh`はDHCPv6で同じことを確かめます（`kea-dhcp6-server`と`busybox`）。`netns-ra.sh`は、LANのホストがneighdのRAでSLAACのアドレスと既定経路を得ることを確かめます。`netns-dhcpc.sh`は、`ruster-dhcpc`がISP側のKeaからWANのIPv4アドレスと委任されたプレフィックスを得て、LANのホストがNATでISP側へ出られることを確かめます（`kea-dhcp4-server`と`kea-dhcp6-server`）。`netns-map-e-pd.sh`は、MAP-EのプレフィックスをDHCPv6-PDから得て同じことを確かめます。`netns-bgp.sh`は、隣のnetnsのFRRとBGPを張り、受けた経路でLANのホストがその先へ届くことと、取り下げで経路が消えることを確かめます（`frr`が要る）。どれもインターネットにはつながない。
+`netns-commit.sh`は、confdを`--state-dir`で動かし、`ruster diff`が何も変えないこと、反映した版がconfdの再起動の後も残ること、確認の無い反映がconfdの再起動をまたいで前の版に戻ること、`ruster confirm`と`ruster rollback`を確かめます。
 
 ## 開発
 
