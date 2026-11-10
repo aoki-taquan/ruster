@@ -412,3 +412,62 @@ fn a_refused_patch_is_sent_again_after_a_while() {
     );
     assert_eq!(lab.fe_route([10, 0, 0, 0], 8), Some(&via("lan")));
 }
+
+/// A BGP route through a gateway that is reached by a static route: the FE gets it
+/// resolved, and it follows the static route when that changes or goes.
+#[test]
+fn a_gateway_route_is_resolved_and_follows_the_routes_it_goes_through() {
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1), spec("bgp", 20)]);
+    let hop = |interface: &str, address: [u8; 4]| {
+        Value::Route(RouteAction::Forward(vec![NextHop {
+            interface: interface.into(),
+            address: Some(Ipv4Addr::from(address).into()),
+        }]))
+    };
+    let far = Change::set(
+        key([203, 0, 113, 0], 24),
+        Value::Route(RouteAction::Gateways(vec![
+            Ipv4Addr::new(10, 255, 0, 2).into()
+        ])),
+    );
+    lab.sources[1].patch(&[far]).unwrap();
+    lab.settle();
+    assert_eq!(
+        lab.fe_route([203, 0, 113, 0], 24),
+        None,
+        "not resolvable yet"
+    );
+
+    lab.sources[0]
+        .patch(&[
+            route([198, 51, 100, 0], 24, "wan"),
+            Change::set(key([10, 255, 0, 2], 32), hop("wan", [198, 51, 100, 10])),
+        ])
+        .unwrap();
+    lab.settle();
+    assert_eq!(
+        lab.fe_route([203, 0, 113, 0], 24),
+        Some(&hop("wan", [198, 51, 100, 10]))
+    );
+
+    // The static route moves to another link: the BGP route moves with it.
+    lab.sources[0]
+        .patch(&[
+            route([192, 168, 9, 0], 24, "wan2"),
+            Change::set(key([10, 255, 0, 2], 32), hop("wan2", [192, 168, 9, 1])),
+        ])
+        .unwrap();
+    lab.settle();
+    assert_eq!(
+        lab.fe_route([203, 0, 113, 0], 24),
+        Some(&hop("wan2", [192, 168, 9, 1]))
+    );
+
+    // The static route goes: the BGP route leaves the FE.
+    lab.sources[0]
+        .patch(&[Change::delete(key([10, 255, 0, 2], 32))])
+        .unwrap();
+    lab.settle();
+    assert_eq!(lab.fe_route([203, 0, 113, 0], 24), None);
+    assert!(lab.fe_route([198, 51, 100, 0], 24).is_some());
+}

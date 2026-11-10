@@ -1,16 +1,19 @@
-//! `ruster-ribd [--run-dir DIR] [NAME:PREFERENCE[:HOLD_MS]]...`: route selection.
+//! `ruster-ribd [--run-dir DIR] [--resolve-via-default] [NAME:PREFERENCE[:HOLD_MS]]...`:
+//! route selection.
 //!
 //! ribd writes the FE's route table and listens on one socket per route source
 //! (`ribd/source/NAME/source.sock`). With no sources given, the only source is `confd` with
 //! preference 1. Lower preference wins; HOLD_MS (default 5000) is how long ribd waits
 //! for a source to finish sending after start-up before it tells the FE it is done.
+//! `--resolve-via-default` lets gateways be resolved through the default route
+//! ([`ruster_ribd::resolve`]).
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
-use ruster_ribd::{Ribd, SourceSpec};
+use ruster_ribd::{Options, Ribd, SourceSpec};
 
 /// How long to wait for the FE at start-up.
 const FE_WAIT: Duration = Duration::from_secs(10);
@@ -44,7 +47,13 @@ fn source(text: &str) -> Result<SourceSpec, String> {
 }
 
 fn run() -> Result<(), String> {
-    let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
+    let (run_dir, mut rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
+    let mut options = Options::default();
+    rest.retain(|arg| {
+        let flag = arg == "--resolve-via-default";
+        options.resolve_via_default |= flag;
+        !flag
+    });
     let mut sources = rest
         .iter()
         .map(|text| source(text))
@@ -61,7 +70,7 @@ fn run() -> Result<(), String> {
     }
     let fe = daemon::connect(&run_dir.join(socket::FE_ROUTE), FE_WAIT)
         .map_err(|error| format!("connecting to the FE: {error}"))?;
-    let mut ribd = Ribd::new(fe, sources).map_err(|error| error.to_string())?;
+    let mut ribd = Ribd::with_options(fe, sources, options).map_err(|error| error.to_string())?;
     eprintln!("ruster-ribd: connected to the FE");
     daemon::notify("READY=1");
 
