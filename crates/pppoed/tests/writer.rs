@@ -101,3 +101,33 @@ fn a_session_without_an_address_has_no_address_or_route() {
         }])))
     );
 }
+
+#[test]
+fn the_ipcp_dns_servers_go_to_the_source() {
+    let mut session = up(Some(Ipv4Addr::new(198, 51, 100, 2)));
+    session.dns = vec![
+        Ipv4Addr::new(192, 0, 2, 53),
+        Ipv4Addr::UNSPECIFIED,
+        Ipv4Addr::new(192, 0, 2, 53),
+    ];
+    let changes = source_values("pppoe-wan", Some(&session));
+    let dns = changes
+        .iter()
+        .find(|c| matches!(c.key, Key::SourceDns { .. }))
+        .unwrap();
+    assert_eq!(
+        dns.value,
+        Some(Value::SourceDns {
+            servers: vec![Ipv4Addr::new(192, 0, 2, 53).into()],
+            lifetime: LIFETIME
+        })
+    );
+    // None given, or the session down: deleted.
+    let changes = source_values("pppoe-wan", Some(&up(None)));
+    assert!(changes
+        .iter()
+        .any(|c| matches!(c.key, Key::SourceDns { .. }) && c.value.is_none()));
+    assert!(source_values("pppoe-wan", None)
+        .iter()
+        .all(|c| c.value.is_none()));
+}

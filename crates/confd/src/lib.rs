@@ -158,6 +158,10 @@ pub struct Config {
     /// has delegated: its settings, checked, and the source. Its tunnel, NAT and
     /// routes are there only while the source has a prefix ([`delegated`]).
     pub map_e_from: Option<(ruster_config::MapE, String)>,
+    /// The DNS servers the sources of `dns`'s `upstream-from` have now, in order
+    /// and once each: a value found at run time ([`delegated`]), which confd hands
+    /// `ruster-unbound` beside the `dns` part.
+    pub dns_found: Vec<IpAddr>,
     /// BGP, checked; confd hands it to `ruster-frr` ([`bgp`]).
     pub bgp: Option<ruster_config::Bgp>,
 }
@@ -1167,6 +1171,7 @@ mod tests {
             pppoe: Vec::new(),
             dhcp_client: Vec::new(),
             map_e_from: None,
+            dns_found: Vec::new(),
             bgp: None,
         });
         let routes = confd.routes();
@@ -1230,6 +1235,7 @@ mod tests {
             pppoe: Vec::new(),
             dhcp_client: Vec::new(),
             map_e_from: None,
+            dns_found: Vec::new(),
             bgp: None,
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);

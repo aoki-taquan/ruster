@@ -307,3 +307,70 @@ fn what_a_prefix_given_would_refuse_is_refused_with_prefix_from() {
         .replace("ea-length = 16", "ea-length = 200");
     assert!(file::parse(&long).is_err());
 }
+
+#[test]
+fn the_dns_servers_of_the_sources_go_to_unbound_with_the_part() {
+    let text = r#"
+[[source]]
+name = "dhcp-wan"
+kind = "dhcp-client"
+
+[[source]]
+name = "pppoe-wan"
+kind = "pppoe"
+
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+ipv4 = "192.168.0.1/24"
+
+[dns]
+listen = ["lan"]
+upstream = ["192.0.2.53"]
+upstream-from = ["dhcp-wan", "pppoe-wan"]
+"#;
+    let mut confd = Confd::new(file::parse(text).unwrap());
+    let (a, b) = UnixStream::pair().unwrap();
+    confd.attach_part(a).unwrap();
+    let mut unbound = PartClient::new(b, Module::Dns).unwrap();
+    let mut sources = Vec::new();
+    for name in ["dhcp-wan", "pppoe-wan"] {
+        let (a, b) = UnixStream::pair().unwrap();
+        confd.attach_source(name, a).unwrap();
+        sources.push(Client::new(b).unwrap());
+    }
+    let dns = |source: &str, servers: &[&str]| {
+        Change::set(
+            Key::SourceDns {
+                source: source.into(),
+            },
+            Value::SourceDns {
+                servers: servers.iter().map(|s| s.parse().unwrap()).collect(),
+                lifetime: 60,
+            },
+        )
+    };
+    sources[0]
+        .patch(&[dns("dhcp-wan", &["198.51.100.53", "198.51.100.54"])])
+        .unwrap();
+    sources[1]
+        .patch(&[dns("pppoe-wan", &["198.51.100.54", "2001:db8::53"])])
+        .unwrap();
+    let mut parts = Vec::new();
+    for _ in 0..50 {
+        confd.step(0);
+        for source in &mut sources {
+            source.poll();
+        }
+        unbound
+            .poll(&mut |text| {
+                parts.push(text.to_owned());
+                Ok(())
+            })
+            .unwrap();
+    }
+    let (dns, found) = ruster_config::parse_dns_part_with(parts.last().unwrap()).unwrap();
+    assert_eq!(dns.unwrap().upstream, ["192.0.2.53"]);
+    let found: Vec<String> = found.iter().map(ToString::to_string).collect();
+    assert_eq!(found, ["198.51.100.53", "198.51.100.54", "2001:db8::53"]);
+}

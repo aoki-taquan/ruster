@@ -136,8 +136,10 @@ confd → 各プロセス: 確定
 
 - Unboundは、ルータのLAN側のアドレスで待ち受ける（TUN経由）。
 - 問い合わせを許す範囲は、全体の設定のLANのプレフィックスから作る。
-- 上流のDNSサーバは、全体の設定に書くか、`ruster-dhcpc`や`ruster-pppoed`がWAN側で得た値を使う
-  （後者はまだ無い。lockの`upstream-from`がその置き場所）。
+- 上流のDNSサーバは、全体の設定に書くか（`upstream`）、`ruster-dhcpc`や`ruster-pppoed`がWAN側で得た値を
+  使う（`upstream-from`に送り手の名前を書く）。得た値は送り手としてconfdへ渡り、confdは`dns`の部分を
+  `ruster-unbound`へ渡すとき、その送り手が今持つDNSサーバを別の欄（`upstream-found`）で添える。lockの
+  ファイルには入れない。`ruster-unbound`は`upstream`の後にそれらへforwardする。値が変われば部分を渡し直す。
 - `ruster-unbound`は、待ち受け、許す範囲、上流を一つのファイルに書き、運用者の`unbound.conf`がそれを
   `include-toplevel:`で取り込む。ほかの設定（`local-data`など）は運用者のファイルに書く。
 - 書いたら`systemctl restart unbound`（変えられる）で読み直させる。`unbound-control reload`では、
@@ -147,8 +149,8 @@ confd → 各プロセス: 確定
 
 | プロセス | 中身 | 得た値の渡し先 |
 |---|---|---|
-| `ruster-pppoed` | PPPoEのDiscovery（RFC 2516）、LCP（RFC 1661）、認証（PAP、CHAP: RFC 1994）、IPCP（RFC 1332）、IPv6CP（RFC 5072） | セッションとアドレスはconfd、経路はribd、DNSサーバは`ruster-unbound` |
-| `ruster-dhcpc` | DHCPv4（RFC 2131）、DHCPv6（RFC 8415）とプレフィックスの委任 | アドレスとプレフィックスはconfd、経路はribd、DNSサーバは`ruster-unbound` |
+| `ruster-pppoed` | PPPoEのDiscovery（RFC 2516）、LCP（RFC 1661）、認証（PAP、CHAP: RFC 1994）、IPCP（RFC 1332）、IPv6CP（RFC 5072） | セッション、アドレス、DNSサーバはconfd（DNSサーバはconfdから`ruster-unbound`へ）、経路はribd |
+| `ruster-dhcpc` | DHCPv4（RFC 2131）、DHCPv6（RFC 8415）とプレフィックスの委任 | アドレス、プレフィックス、DNSサーバはconfd（DNSサーバはconfdから`ruster-unbound`へ）、経路はribd |
 | neighd（RA） | LANへのRA（RFC 4861の6節） | なし。広告するプレフィックスはconfdから受け取る |
 
 - PPPoEとDHCPのフレームは、FEの受け渡しの表で担当のプロセスへ渡す（[`fe-ce-split.md`](fe-ce-split.md)の

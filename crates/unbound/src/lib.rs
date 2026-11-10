@@ -30,8 +30,10 @@
 //! Unbound's unit can be ordered after it (`systemctl restart unbound` then starts
 //! Unbound). While the command runs, ruster-unbound answers nothing else.
 //!
-//! The upstream servers that a WAN DHCP client or PPPoE finds at run time are not
-//! used yet (the lock form's `upstream-from`).
+//! The upstream servers that a WAN DHCP client or PPPoE finds at run time (the
+//! sources of the lock form's `upstream-from`) come with the part as
+//! `upstream-found`; they are forwarded to after `upstream`, and a change of them
+//! is a new part like any other. With neither, Unbound resolves from the root.
 //!
 //! # Standards
 //!
@@ -56,6 +58,12 @@ pub const HEADER: &str =
 /// The Unbound settings for `dns`, the text of the included file. Each value is read
 /// as an address or prefix again, so nothing else reaches the file.
 pub fn settings(dns: Option<&Dns>) -> Result<String, String> {
+    settings_with(dns, &[])
+}
+
+/// The Unbound settings for `dns` and the servers its `upstream-from` sources
+/// have now (`found`), which it forwards to after `upstream`.
+pub fn settings_with(dns: Option<&Dns>, found: &[IpAddr]) -> Result<String, String> {
     let mut out = format!("{HEADER}\nserver:\n");
     let Some(dns) = dns else {
         return Ok(out);
@@ -83,10 +91,19 @@ pub fn settings(dns: Option<&Dns>) -> Result<String, String> {
             .ok_or_else(|| format!("allow {text:?} has no usable prefix length"))?;
         let _ = writeln!(out, "    access-control: {prefix}/{len} allow");
     }
-    if !dns.upstream.is_empty() {
+    let mut upstream: Vec<IpAddr> = Vec::new();
+    for text in &dns.upstream {
+        upstream.push(address(text, "upstream")?);
+    }
+    for server in found {
+        if !upstream.contains(server) {
+            upstream.push(*server);
+        }
+    }
+    if !upstream.is_empty() {
         out.push_str("forward-zone:\n    name: \".\"\n");
-        for text in &dns.upstream {
-            let _ = writeln!(out, "    forward-addr: {}", address(text, "upstream")?);
+        for server in upstream {
+            let _ = writeln!(out, "    forward-addr: {server}");
         }
     }
     Ok(out)
@@ -119,8 +136,8 @@ impl Bridge {
     /// Takes a `dns` part ([`ruster_config::dns_part`]), or refuses it with the reason.
     /// `written` runs once the file holds the part, before the command.
     pub fn take(&mut self, part: &str, written: &mut dyn FnMut()) -> Result<(), String> {
-        let dns = ruster_config::parse_dns_part(part)?;
-        let text = settings(dns.as_ref())?;
+        let (dns, found) = ruster_config::parse_dns_part_with(part)?;
+        let text = settings_with(dns.as_ref(), &found)?;
         let before = match std::fs::read_to_string(&self.path) {
             Ok(before) => Some(before),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,

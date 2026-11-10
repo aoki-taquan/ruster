@@ -138,6 +138,8 @@
 //!                              # through ruster-unbound)
 //! upstream = ["192.0.2.53"]    # optional: the servers it forwards every query to;
 //!                              # when left out it resolves from the root itself
+//! upstream-from = ["dhcp-wan"] # optional: sources whose DNS servers (found at run
+//!                              # time) it forwards to as well
 //! listen = ["lan.10"]          # optional: the interfaces of the default VRF it
 //!                              # answers on; when left out, the inside of [nat] or
 //!                              # [map-e] (one of them, or listen, must be given)
@@ -336,7 +338,8 @@
 //! allow = ["192.0.2.0/24"]     # the clients it answers: their prefixes
 //! upstream = ["192.0.2.53"]    # empty: it resolves from the root itself
 //! upstream-from = []           # the sources whose DNS servers it uses too (a WAN
-//!                              # DHCP client, say); none can be given yet
+//!                              # DHCP client, PPPoE); confd sends what they have
+//!                              # now with the part, as upstream-found
 //!
 //! [[dhcp]]
 //! interface = "lan"
@@ -625,8 +628,8 @@ pub struct Dns {
     pub allow: Vec<String>,
     /// The servers it forwards every query to; none: it resolves from the root.
     pub upstream: Vec<String>,
-    /// The sources whose DNS servers it also forwards to, found at run time. None
-    /// can be given yet.
+    /// The sources whose DNS servers it also forwards to, found at run time; confd
+    /// hands them over beside the part (`upstream-found`, [`dns_part_with`]).
     pub upstream_from: Vec<String>,
 }
 
@@ -833,25 +836,53 @@ fn check_version(text: &str) -> Result<(), String> {
 struct DnsPart {
     version: u32,
     dns: Vec<Dns>,
+    /// Not of the lock form: the DNS servers the sources of `upstream-from` have
+    /// now, which confd adds to the part it hands over.
+    #[serde(
+        default,
+        rename = "upstream-found",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    upstream_found: Vec<String>,
 }
 
 /// The DNS process's part of the lock form as TOML text:
 /// `version = 1` and `dns`, a list of none or one.
 pub fn dns_part(dns: Option<&Dns>) -> String {
+    dns_part_with(dns, &[])
+}
+
+/// The DNS process's part with `upstream-found`, the DNS servers the sources of
+/// `upstream-from` have now (a value found at run time, not of the lock form).
+pub fn dns_part_with(dns: Option<&Dns>, found: &[std::net::IpAddr]) -> String {
     let part = DnsPart {
         version: VERSION,
         dns: dns.into_iter().cloned().collect(),
+        upstream_found: found.iter().map(ToString::to_string).collect(),
     };
     toml::to_string(&part).expect("the lock form is plain TOML")
 }
 
 /// Reads the DNS process's part of the lock form ([`dns_part`]).
 pub fn parse_dns_part(text: &str) -> Result<Option<Dns>, String> {
+    parse_dns_part_with(text).map(|(dns, _)| dns)
+}
+
+/// Reads the DNS process's part ([`dns_part_with`]) with the servers found.
+pub fn parse_dns_part_with(text: &str) -> Result<(Option<Dns>, Vec<std::net::IpAddr>), String> {
     check_version(text)?;
     let part: DnsPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    let found = part
+        .upstream_found
+        .iter()
+        .map(|t| {
+            t.parse()
+                .map_err(|_| format!("upstream-found {t:?} is not an address"))
+        })
+        .collect::<Result<_, _>>()?;
     match <[Dns; 1]>::try_from(part.dns) {
-        Ok([dns]) => Ok(Some(dns)),
-        Err(none) if none.is_empty() => Ok(None),
+        Ok([dns]) => Ok((Some(dns), found)),
+        Err(none) if none.is_empty() => Ok((None, found)),
         Err(_) => Err("dns takes at most one value".into()),
     }
 }

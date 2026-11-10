@@ -9,7 +9,7 @@
 //! FE's punt classes that send them to the control process `pppoed`.
 //!
 //! What a session gets goes to its confd source (`confd/source/<name>.sock`): the
-//! session ID, the AC's MAC, the MTU and the IPCP address
+//! session ID, the AC's MAC, the MTU, the IPCP address and DNS servers
 //! ([`ruster_pppoed::writer`]). With `default-route`, the IPv4 default route out of
 //! the session interface goes to ribd as the route source `pppoed` (ribd must be
 //! started with it). It also writes one line to standard output when a session
@@ -24,8 +24,8 @@
 //! The name is the source's. A value not known is `-`. `up` comes again whenever a
 //! value changes, each line whole; `failed` is an attempt that ended before the
 //! session was up. Both are followed by a new attempt. Messages for people go to
-//! standard error. The DNS servers are not handed on yet (to the DNS bridge's
-//! `upstream-from`).
+//! standard error. The DNS servers go to the source too, for the DNS bridge
+//! (`[dns]`'s `upstream-from`).
 
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};

@@ -79,10 +79,12 @@ struct DhcpEntry {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct DnsEntry {
     #[serde(default)]
     upstream: Vec<String>,
+    #[serde(default)]
+    upstream_from: Vec<String>,
     listen: Option<Vec<String>>,
 }
 
@@ -576,7 +578,7 @@ fn dns(
         listen,
         allow,
         upstream: entry.upstream,
-        upstream_from: Vec::new(),
+        upstream_from: entry.upstream_from,
     })
 }
 
