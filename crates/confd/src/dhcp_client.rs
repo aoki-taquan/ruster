@@ -7,7 +7,10 @@
 //! `dhcpc6-<interface>` (UDP to port 546) when it runs DHCPv6. They take the
 //! replies to 255.255.255.255 before forwarding, and those to the router's own
 //! addresses (a DHCPv4 renewal's answer, every DHCPv6 reply to the link-local
-//! address) after the input firewall.
+//! address) once the firewall lets them through to the router (`rt-default`).
+//! With firewall rules, confd puts rules that accept those replies in front of
+//! them ([`firewall_rules`]): the client's requests go out through the punt socket
+//! and open no flow for the replies.
 //!
 //! # Standards
 //!
@@ -22,7 +25,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use ruster_config::DhcpClient;
-use ruster_proto::table::{Key, PuntClass, PuntDestination, PuntMatch, Value, DEFAULT_VRF};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use ruster_proto::table::{
+    FirewallAction, FirewallRule, Key, Protocol, PuntClass, PuntDestination, PuntMatch, Value,
+    DEFAULT_VRF,
+};
 
 use crate::source::{Kind, Spec};
 use crate::InterfaceConfig;
@@ -149,4 +157,41 @@ pub fn punt_classes(entries: &[DhcpClient], out: &mut BTreeMap<Key, Value>) {
             );
         }
     }
+}
+
+/// The firewall rules that let the servers' replies reach the clients: from the
+/// interface to the router, UDP from port 67 to 68 (IPv4) and from 547 to 546
+/// (IPv6). The router's own interface is `rt-default`.
+pub fn firewall_rules(entries: &[DhcpClient]) -> Vec<FirewallRule> {
+    let mut out = Vec::new();
+    for entry in entries {
+        for (runs, any, from, to) in [
+            (
+                !entry.ipv4_source.is_empty(),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                67,
+                CLIENT_PORT,
+            ),
+            (
+                !entry.ipv6_source.is_empty(),
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                547,
+                CLIENT6_PORT,
+            ),
+        ] {
+            if runs {
+                out.push(FirewallRule {
+                    ingress: Some(entry.interface.clone()),
+                    egress: Some("rt-default".to_owned()),
+                    source: (any, 0),
+                    destination: (any, 0),
+                    protocol: Protocol::Udp,
+                    source_ports: (from, from),
+                    destination_ports: (to, to),
+                    action: FirewallAction::Accept,
+                });
+            }
+        }
+    }
+    out
 }

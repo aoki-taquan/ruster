@@ -589,7 +589,13 @@ impl Confd {
                 },
             );
         }
-        for (id, rule) in (1..).zip(&self.config.firewall) {
+        // The DHCP clients' rules go first, so that no rule drops the replies.
+        let client_rules = if self.config.firewall.is_empty() {
+            Vec::new()
+        } else {
+            dhcp_client::firewall_rules(&self.config.dhcp_client)
+        };
+        for (id, rule) in (1..).zip(client_rules.iter().chain(&self.config.firewall)) {
             out.insert(
                 Key::FirewallRule {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),

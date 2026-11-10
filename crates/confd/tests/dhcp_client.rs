@@ -141,8 +141,59 @@ fn the_interface_s_dhcp_replies_go_to_dhcpc() {
         assert_eq!(punt.interface.as_deref(), Some("wan"));
         assert_eq!(punt.destination, PuntDestination::Control("dhcpc".into()));
     }
-    // DHCPv4 only: no class for DHCPv6.
-    let v4 = CONFIG.replace("ipv6-source = \"dhcp6-wan\"\n", "");
-    let confd = Confd::new(file::parse(&v4).unwrap());
-    assert!(confd.config().dhcp_client[0].ipv6_source.is_empty());
+    // DHCPv4 only: no class for DHCPv6, and with a firewall rule, the replies are
+    // let through to the router before it.
+    let v4 = CONFIG.replace("ipv6-source = \"dhcp6-wan\"\n", "")
+        + "\n[[firewall]]\naction = \"accept\"\nprotocol = \"icmp\"\ningress = \"lan\"\n";
+    let fe = tables(&v4);
+    assert!(fe
+        .get(&Key::Punt {
+            class: "dhcpc6-wan".into()
+        })
+        .is_none());
+    let rule = |id| match fe.get(&Key::FirewallRule {
+        vrf: "default".into(),
+        id,
+    }) {
+        Some(Value::FirewallRule(rule)) => rule.clone(),
+        other => panic!("{other:?}"),
+    };
+    let first = rule(1);
+    assert_eq!(first.ingress.as_deref(), Some("wan"));
+    assert_eq!(first.egress.as_deref(), Some("rt-default"));
+    assert_eq!(
+        (first.source_ports, first.destination_ports),
+        ((67, 67), (68, 68))
+    );
+    assert_eq!(
+        rule(2).ingress.as_deref(),
+        Some("lan"),
+        "the configured rule after it"
+    );
+}
+
+/// The FE's tables for `text`.
+fn tables(text: &str) -> Store {
+    let mut confd = Confd::new(file::parse(text).unwrap());
+    let mut fe = Server::new();
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(
+        a,
+        &[
+            sid::INTERFACE,
+            sid::ADDRESS,
+            sid::ICMP_ERRORS,
+            sid::PUNT,
+            sid::FIREWALL_POLICY,
+            sid::FIREWALL_RULE,
+            sid::NAT,
+        ],
+    )
+    .unwrap();
+    confd.connect_fe(b).unwrap();
+    for _ in 0..50 {
+        fe.step(&mut Accept);
+        confd.step(0);
+    }
+    fe.store().clone()
 }
