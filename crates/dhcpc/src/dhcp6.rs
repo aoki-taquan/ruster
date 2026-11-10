@@ -204,7 +204,7 @@ fn address_at(bytes: &[u8], at: usize) -> Ipv6Addr {
 }
 
 /// An IA_NA or IA_PD whose IAID is ours, with the first of what it holds that
-/// `read` takes; `None` when it is malformed or another IA's.
+/// `read` takes (one with lifetimes that can be used); `None` when it is malformed or another IA's.
 fn ia<T>(value: &[u8], held_code: u16, read: impl Fn(&[u8]) -> Option<T>) -> Option<Ia<T>> {
     if value.len() < 12 || u32_at(value, 0) != IAID {
         return None;
@@ -253,18 +253,24 @@ impl Reply {
                 }
                 option::IA_NA if reply.ia_na.is_none() => {
                     reply.ia_na = ia(value, option::IA_ADDRESS, |v| {
-                        (v.len() >= 24).then(|| IaAddress {
+                        let (preferred, valid) = (u32_at(v.get(..24)?, 16), u32_at(v, 20));
+                        // RFC 8415 section 21.6: preferred above valid is dropped;
+                        // a valid lifetime of 0 is one being taken away.
+                        (valid > 0 && preferred <= valid).then(|| IaAddress {
                             address: address_at(v, 0),
-                            preferred: u32_at(v, 16),
-                            valid: u32_at(v, 20),
+                            preferred,
+                            valid,
                         })
                     });
                 }
                 option::IA_PD if reply.ia_pd.is_none() => {
                     reply.ia_pd = ia(value, option::IA_PREFIX, |v| {
-                        (v.len() >= 25 && v[8] <= 128).then(|| IaPrefix {
-                            preferred: u32_at(v, 0),
-                            valid: u32_at(v, 4),
+                        let (preferred, valid) = (u32_at(v.get(..25)?, 0), u32_at(v, 4));
+                        // RFC 8415 section 21.22, as for an address.
+                        let usable = valid > 0 && preferred <= valid && (1..=128).contains(&v[8]);
+                        usable.then(|| IaPrefix {
+                            preferred,
+                            valid,
                             len: v[8],
                             prefix: address_at(v, 9),
                         })

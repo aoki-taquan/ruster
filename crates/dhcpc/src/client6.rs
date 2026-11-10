@@ -25,9 +25,15 @@
 //!   ends the lease.
 //!
 //! Deviations: the first acceptable Advertise is taken without waiting for others
-//! (section 18.2.1 waits the first RT for more unless the preference is 255). A
+//! (section 18.2.1 waits the first RT for more unless the preference is 255); it
+//! must hold a prefix, and an address only when one is asked for and given. A
 //! Release is sent once, not retransmitted, as the client is stopping. No Confirm
-//! or Information-request, no Reconfigure, no Rapid Commit.
+//! or Information-request, no Reconfigure, no Rapid Commit. The lease ends with the
+//! shortest valid lifetime of what it holds. T1 is at least 10 s and T2 at least
+//! T1; T1 above T2 from the server is replaced by the client's own (section 21.4
+//! drops such an IA). A failed Request goes back to Solicit, after a wait that
+//! doubles with each failure in a row (1 s to an hour), also on a top-level error
+//! status (section 18.2.10 sends the Request again for some).
 
 use std::net::Ipv6Addr;
 
@@ -38,6 +44,8 @@ use crate::Rng;
 pub const REQUEST_TRIES: u32 = 10;
 /// Infinite lifetime.
 const INFINITE: u32 = u32::MAX;
+/// The shortest T1, in seconds.
+const LEAST_T1: u32 = 10;
 
 /// What the client asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,6 +107,8 @@ pub struct Client {
     tries: u32,
     /// The retransmission timeout now, in ms.
     rt: u64,
+    /// Exchanges that failed in a row, for the wait before soliciting again.
+    failures: u32,
 }
 
 /// Retransmission parameters: IRT and MRT, in ms.
@@ -124,6 +134,7 @@ impl Client {
             timer: Some(first),
             tries: 0,
             rt: 0,
+            failures: 0,
         }
     }
 
@@ -196,27 +207,32 @@ impl Client {
         (seconds != INFINITE).then(|| self.bound_at + u64::from(seconds) * 1_000)
     }
 
-    /// When the lease ends: the longest valid lifetime of what it holds.
+    /// When the lease ends: the shortest valid lifetime of what it holds.
     fn end(&self) -> Option<u64> {
         let lease = self.lease.as_ref()?;
         let valid = [
             lease.address.map(|a| a.valid),
             lease.prefix.map(|p| p.valid),
         ];
-        self.at(valid.into_iter().flatten().max()?)
+        self.at(valid.into_iter().flatten().min()?)
     }
 
-    fn solicit_again(&mut self, now: u64) {
-        self.offer = None;
-        self.state = State::Init;
-        self.timer = Some(now + self.rng.below(1_001));
-    }
-
-    fn lose(&mut self, now: u64, out: &mut Output) {
+    /// Back to soliciting, giving up the lease if one is held, after a wait that
+    /// doubles with each failure in a row from 1 s up to an hour (section 14.1:
+    /// a server that keeps failing the client gets no flood).
+    fn solicit_again(&mut self, now: u64, out: &mut Output) {
         if self.lease.take().is_some() {
             out.events.push(Event::Lost);
         }
-        self.solicit_again(now);
+        self.offer = None;
+        self.state = State::Init;
+        let wait = SOLICIT.0 << self.failures.min(12);
+        self.failures += 1;
+        self.timer = Some(now + self.randomize(wait.min(SOLICIT.1), false));
+    }
+
+    fn lose(&mut self, now: u64, out: &mut Output) {
+        self.solicit_again(now, out);
     }
 
     pub fn timeout(&mut self, now: u64, out: &mut Output) {
@@ -231,8 +247,13 @@ impl Client {
                 self.send(now, SOLICIT, None, out);
             }
             State::Soliciting => self.send(now, SOLICIT, None, out),
-            State::Requesting if self.tries >= REQUEST_TRIES => self.solicit_again(now),
-            State::Requesting => self.send(now, REQUEST, None, out),
+            State::Requesting if self.tries >= REQUEST_TRIES => self.solicit_again(now, out),
+            // After NoBinding the lease held still ends on time.
+            State::Requesting if self.end().is_some_and(|end| now >= end) => self.lose(now, out),
+            State::Requesting => {
+                let end = self.end();
+                self.send(now, REQUEST, end, out)
+            }
             State::Bound | State::Renewing | State::Rebinding => {
                 let lease = self.lease.as_ref().expect("a lease");
                 let t2 = self.at(lease.t2);
@@ -251,7 +272,8 @@ impl Client {
                     self.state = State::Renewing;
                     self.begin(now, RENEW, false);
                 }
-                self.send(now, RENEW, t2, out);
+                let until = [t2, end].into_iter().flatten().min();
+                self.send(now, RENEW, until, out);
             }
             State::Stopped => {}
         }
@@ -276,7 +298,14 @@ impl Client {
                 prefix: network(p.prefix, p.len),
                 ..p
             });
-        if (self.want.address && address.is_none()) || (self.want.prefix && prefix.is_none()) {
+        // The prefix is what the client is for; an address only when it asks for
+        // nothing else.
+        let wanted = if self.want.prefix {
+            prefix.is_some()
+        } else {
+            address.is_some()
+        };
+        if !wanted {
             return None;
         }
         let shortest = [address.map(|a| a.preferred), prefix.map(|p| p.preferred)]
@@ -311,13 +340,17 @@ impl Client {
                 );
             }
         }
+        // At least LEAST_T1 s, so that a lifetime of 0 or 1 s does not make the
+        // client renew without pause.
+        let t1 = t1.unwrap_or(INFINITE).max(LEAST_T1);
+        let t2 = t2.unwrap_or(INFINITE).max(t1);
         Some(Lease {
             address,
             prefix,
             dns: reply.dns.clone(),
             server_id,
-            t1: t1.unwrap_or(INFINITE),
-            t2: t2.unwrap_or(INFINITE),
+            t1,
+            t2,
         })
     }
 
@@ -349,7 +382,7 @@ impl Client {
                 }
                 match self.lease_of(&reply) {
                     Some(lease) if reply.status == status::SUCCESS => self.bind(now, lease, out),
-                    _ => self.solicit_again(now),
+                    _ => self.solicit_again(now, out),
                 }
             }
             (State::Renewing | State::Rebinding, kind::REPLY) => {
@@ -361,8 +394,16 @@ impl Client {
                     reply.ia_pd.as_ref().map(|ia| ia.status),
                 ]
                 .contains(&Some(status::NO_BINDING));
+                // A reply without the IA asked for is no answer about it
+                // (section 18.2.10.1): keep the lease and keep asking.
+                let missing = if self.want.prefix {
+                    reply.ia_pd.is_none()
+                } else {
+                    reply.ia_na.is_none()
+                };
                 match self.lease_of(&reply) {
                     Some(lease) => self.bind(now, lease, out),
+                    None if missing => {}
                     None if no_binding => {
                         let held = self.lease.clone().expect("a lease");
                         self.offer = Some(Lease {
@@ -382,13 +423,15 @@ impl Client {
     }
 
     fn bind(&mut self, now: u64, lease: Lease, out: &mut Output) {
+        self.failures = 0;
         self.state = State::Bound;
         self.offer = None;
         self.bound_at = now;
         out.events.push(Event::Bound(lease.clone()));
         let t1 = lease.t1;
         self.lease = Some(lease);
-        self.timer = self.at(t1);
+        // T1, or the end of the lease if that comes first.
+        self.timer = [self.at(t1), self.end()].into_iter().flatten().min();
     }
 
     /// Gives the lease back (Release, sent once) and stops.

@@ -369,3 +369,94 @@ fn malformed_replies_are_not_read() {
     bad[at] = 200;
     assert_eq!(Reply::parse(&bad).unwrap().ia_pd.unwrap().lease, None);
 }
+
+#[test]
+fn a_preferred_lifetime_of_0_does_not_make_it_renew_without_pause() {
+    let (client, at) = bound(
+        PD,
+        &Server {
+            t1: 0,
+            t2: 0,
+            preferred: 0,
+            ..SERVER
+        },
+    );
+    assert!(client.next_timer().unwrap() >= at + 10_000);
+}
+
+#[test]
+fn a_lease_held_while_asking_again_still_ends() {
+    let (mut client, bound_at) = bound(PD, &SERVER);
+    let (at, out) = fire(&mut client);
+    let no_binding = Server {
+        ia_status: Some(status::NO_BINDING),
+        ..SERVER
+    };
+    let mut done = Output::default();
+    client.receive(
+        at,
+        &reply(kind::REPLY, &out.sends[0], &no_binding),
+        &mut done,
+    );
+    let mut lost = false;
+    for _ in 0..100 {
+        let (now, out) = fire(&mut client);
+        if out.events == [Event::Lost] {
+            lost = true;
+            assert!(now <= bound_at + 7_200_000);
+            break;
+        }
+    }
+    assert!(lost);
+    assert!(client.lease().is_none());
+}
+
+#[test]
+fn a_prefix_being_taken_away_is_passed_over_for_the_next() {
+    let mut client = Client::new(MAC, PD, 8, 0);
+    let (at, out) = fire(&mut client);
+    let mut advertise = reply(kind::ADVERTISE, &out.sends[0], &SERVER);
+    // Another IA Prefix with lifetimes 0 before the good one in the IA_PD.
+    let ia_pd = advertise.len() - (4 + 12 + 4 + 25);
+    let mut old = vec![0, 26, 0, 25];
+    old.extend_from_slice(&[0; 8]);
+    old.push(48);
+    old.extend_from_slice(&"2001:db8:99::".parse::<Ipv6Addr>().unwrap().octets());
+    let at_options = ia_pd + 4 + 12;
+    advertise.splice(at_options..at_options, old);
+    let len = u16::from_be_bytes([advertise[ia_pd + 2], advertise[ia_pd + 3]]) + 29;
+    advertise[ia_pd + 2..ia_pd + 4].copy_from_slice(&len.to_be_bytes());
+    let parsed = Reply::parse(&advertise).unwrap();
+    assert_eq!(parsed.ia_pd.unwrap().lease.unwrap().len, 56);
+    let mut next = Output::default();
+    client.receive(at, &advertise, &mut next);
+    assert_eq!(client.state(), State::Requesting);
+}
+
+#[test]
+fn a_server_that_keeps_failing_gets_ever_longer_waits() {
+    let mut client = Client::new(MAC, PD, 9, 0);
+    let no_prefix = Server {
+        ia_status: Some(status::NO_PREFIX_AVAIL),
+        ..SERVER
+    };
+    let mut waits = Vec::new();
+    for _ in 0..6 {
+        let (at, out) = fire(&mut client);
+        let mut next = Output::default();
+        client.receive(
+            at,
+            &reply(kind::ADVERTISE, &out.sends[0], &SERVER),
+            &mut next,
+        );
+        let mut done = Output::default();
+        client.receive(
+            at,
+            &reply(kind::REPLY, &next.sends[0], &no_prefix),
+            &mut done,
+        );
+        assert_eq!(client.state(), State::Init);
+        waits.push(client.next_timer().unwrap() - at);
+    }
+    assert!(waits[5] >= 28_000, "{waits:?}");
+}
