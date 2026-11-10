@@ -8,7 +8,7 @@
 //! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP and DHCPv6 to `ruster-kea` |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses); the `ra` part on `confd/part.sock` |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
-//! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`, `ruster-pppoed` for `pppoe`, `ruster-frr` for `frr`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
+//! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`, `ruster-pppoed` for `pppoe`, `ruster-frr` for `frr`, `ruster-dhcpc` for `dhcpc`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
 //!
 //! On every (re)connection confd sends everything between resync-begin and resync-end,
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
@@ -41,6 +41,7 @@ use ruster_proto::task::{Progress, Task};
 pub mod apply;
 pub mod bgp;
 pub mod dhcp6;
+pub mod dhcp_client;
 pub mod file;
 pub mod kernel;
 pub mod part;
@@ -145,6 +146,9 @@ pub struct Config {
     pub sources: Vec<source::Spec>,
     /// The PPPoE clients, checked; confd hands them to `ruster-pppoed` ([`pppoe`]).
     pub pppoe: Vec<ruster_config::Pppoe>,
+    /// The WAN side's DHCP clients, checked; confd hands them to `ruster-dhcpc`
+    /// ([`dhcp_client`]).
+    pub dhcp_client: Vec<ruster_config::DhcpClient>,
     /// BGP, checked; confd hands it to `ruster-frr` ([`bgp`]).
     pub bgp: Option<ruster_config::Bgp>,
 }
@@ -588,7 +592,13 @@ impl Confd {
                 },
             );
         }
-        for (id, rule) in (1..).zip(&self.config.firewall) {
+        // The DHCP clients' rules go first, so that no rule drops the replies.
+        let client_rules = if self.config.firewall.is_empty() {
+            Vec::new()
+        } else {
+            dhcp_client::firewall_rules(&self.config.dhcp_client)
+        };
+        for (id, rule) in (1..).zip(client_rules.iter().chain(&self.config.firewall)) {
             out.insert(
                 Key::FirewallRule {
                     vrf: ruster_proto::table::DEFAULT_VRF.to_owned(),
@@ -648,6 +658,7 @@ impl Confd {
             );
         }
         pppoe::punt_classes(&self.config.pppoe, &mut out);
+        dhcp_client::punt_classes(&self.config.dhcp_client, &mut out);
         out
     }
 
@@ -1132,6 +1143,7 @@ mod tests {
             ra: Vec::new(),
             sources: Vec::new(),
             pppoe: Vec::new(),
+            dhcp_client: Vec::new(),
             bgp: None,
         });
         let routes = confd.routes();
@@ -1192,6 +1204,7 @@ mod tests {
             ra: Vec::new(),
             sources: Vec::new(),
             pppoe: Vec::new(),
+            dhcp_client: Vec::new(),
             bgp: None,
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);

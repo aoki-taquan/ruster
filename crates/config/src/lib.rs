@@ -196,6 +196,20 @@
 //! default-route = false        # optional, false: the IPv4 default route out of
 //!                              # the session, to ribd as source pppoed
 //!
+//! [[dhcp-client]]              # optional: the WAN side's DHCP client
+//!                              # (ruster-dhcpc) on one port or VLAN
+//! interface = "wan"
+//! ipv4-source = "dhcp-wan"     # optional: run DHCPv4, sending the lease to this
+//!                              # source (of kind dhcp-client); the interface's
+//!                              # ipv4-from when left out
+//! ipv6-source = "dhcp6-wan"    # optional: run DHCPv6 and ask for a delegated
+//!                              # prefix, sending to this source (dhcpv6-client)
+//! ipv6-address = false         # optional, false: ask DHCPv6 for an address too
+//! default-route = true         # optional, true: to ribd as source dhcpc, the IPv4
+//!                              # default route via the router option, and the
+//!                              # IPv6 one via the address DHCPv6 replies come from
+//! punt-rate = 20               # optional, as in [[dhcp]]; these when left out
+//! punt-burst = 20
 //! [bgp]                        # optional: BGP in the default VRF (FRR's bgpd,
 //!                              # through ruster-frr)
 //! as = 65001                   # the router's AS number
@@ -378,6 +392,17 @@
 //! echo-failures = 3
 //! default-route = false
 //!
+//! [[dhcp-client]]
+//! interface = "wan"
+//! vrf = "default"
+//! mac = "02:00:00:00:00:02"
+//! link-local = "fe80::ff:fe00:2"
+//! ipv4-source = ["dhcp-wan"]   # none or one
+//! ipv6-source = []             # none or one
+//! ipv6-address = false
+//! default-route = true
+//! punt-rate = 20
+//! punt-burst = 20
 //! [[bgp]]                      # none or one
 //! as = 65001
 //! router-id = "198.51.100.1"
@@ -415,6 +440,7 @@
 
 mod bgp;
 mod dhcp6;
+mod dhcp_client;
 mod ra;
 mod resolve;
 
@@ -422,6 +448,10 @@ use serde::{Deserialize, Serialize};
 
 pub use bgp::{frr_part, parse_frr_part, Bgp, BgpNeighbor, Connected};
 pub use dhcp6::{link_local, Dhcp6, DHCP6_PREFERRED_LIFETIME, DHCP6_VALID_LIFETIME};
+pub use dhcp_client::{
+    dhcp_client_part, parse_dhcp_client_part, DhcpClient, DHCP_CLIENT_PUNT_BURST,
+    DHCP_CLIENT_PUNT_RATE,
+};
 pub use ra::{
     parse_ra_part, ra_min_interval, ra_part, Ra, RaPrefix, RA_HOP_LIMIT, RA_MAX_INTERVAL,
     RA_PREFERRED_LIFETIME, RA_VALID_LIFETIME,
@@ -505,6 +535,8 @@ pub struct Lock {
     pub source: Vec<Source>,
     /// One per source of kind pppoe at most.
     pub pppoe: Vec<Pppoe>,
+    /// One per interface.
+    pub dhcp_client: Vec<DhcpClient>,
     /// None or one.
     pub bgp: Vec<Bgp>,
 }

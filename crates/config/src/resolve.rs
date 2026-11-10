@@ -39,6 +39,8 @@ struct File {
     source: Vec<SourceEntry>,
     #[serde(default)]
     pppoe: Vec<PppoeClientEntry>,
+    #[serde(default)]
+    dhcp_client: Vec<crate::dhcp_client::DhcpClientEntry>,
     bgp: Option<crate::bgp::BgpEntry>,
 }
 
@@ -419,6 +421,11 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .into_iter()
         .map(|entry| pppoe(entry, &interfaces))
         .collect::<Result<_, _>>()?;
+    let dhcp_client = file
+        .dhcp_client
+        .into_iter()
+        .map(|entry| crate::dhcp_client::resolve(entry, &interfaces))
+        .collect::<Result<_, _>>()?;
     let bgp = file
         .bgp
         .map(|entry| crate::bgp::resolve(entry, &interfaces))
@@ -442,6 +449,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         ra,
         source,
         pppoe,
+        dhcp_client,
         bgp: bgp.into_iter().collect(),
     })
 }

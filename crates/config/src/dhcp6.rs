@@ -73,7 +73,7 @@ pub fn link_local(mac: [u8; 6]) -> Ipv6Addr {
 }
 
 /// `aa:bb:cc:dd:ee:ff` as bytes.
-fn mac(text: &str) -> Option<[u8; 6]> {
+pub(crate) fn mac(text: &str) -> Option<[u8; 6]> {
     let mut out = [0; 6];
     let mut parts = text.split(':');
     for byte in &mut out {

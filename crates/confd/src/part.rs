@@ -29,6 +29,7 @@
 //! | `dhcp` | `ruster-kea` | [`ruster_config::dhcp_part`] |
 //! | `ra` | `ruster-neighd` | [`ruster_config::ra_part`] |
 //! | `pppoe` | `ruster-pppoed` | [`ruster_config::pppoe_part`] |
+//! | `dhcpc` | `ruster-dhcpc` | [`ruster_config::dhcp_client_part`] |
 //! | `frr` | `ruster-frr` | [`ruster_config::frr_part`], with the prefixes of the default VRF's interfaces ([`crate::bgp::connected`]) |
 //!
 //! [`Client`] is the process's side.
@@ -68,15 +69,17 @@ pub enum Module {
     Dhcp,
     Ra,
     Pppoe,
+    Dhcpc,
     Frr,
 }
 
 impl Module {
-    pub const ALL: [Module; 5] = [
+    pub const ALL: [Module; 6] = [
         Module::Dns,
         Module::Dhcp,
         Module::Ra,
         Module::Pppoe,
+        Module::Dhcpc,
         Module::Frr,
     ];
 
@@ -86,6 +89,7 @@ impl Module {
             Self::Dhcp => "dhcp",
             Self::Ra => "ra",
             Self::Pppoe => "pppoe",
+            Self::Dhcpc => "dhcpc",
             Self::Frr => "frr",
         }
     }
@@ -101,6 +105,7 @@ impl Module {
             Self::Dhcp => ruster_config::dhcp_part(&config.dhcp, &config.dhcp6),
             Self::Ra => ruster_config::ra_part(&config.ra),
             Self::Pppoe => ruster_config::pppoe_part(&config.pppoe),
+            Self::Dhcpc => ruster_config::dhcp_client_part(&config.dhcp_client),
             Self::Frr => ruster_config::frr_part(
                 config.bgp.as_ref(),
                 &crate::bgp::connected(&config.interfaces),
@@ -115,6 +120,7 @@ impl Module {
             Self::Dhcp => !config.dhcp.is_empty() || !config.dhcp6.is_empty(),
             Self::Ra => !config.ra.is_empty(),
             Self::Pppoe => !config.pppoe.is_empty(),
+            Self::Dhcpc => !config.dhcp_client.is_empty(),
             Self::Frr => config.bgp.is_some(),
         }
     }
