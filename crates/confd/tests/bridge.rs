@@ -1,7 +1,7 @@
 //! Bridges in the configuration and the FE's tables confd writes for them.
 
 use ruster_confd::file::parse;
-use ruster_confd::{Config, Confd};
+use ruster_confd::{Confd, Config};
 use ruster_proto::table::{Key, Value};
 
 const BRIDGE: &str = r#"
@@ -87,8 +87,14 @@ mac = "02:00:00:00:01:02"
         (r#"bridge = { members = [] }"#, "member"),
         (r#"bridge = { members = ["p9"] }"#, "first member"),
         (r#"bridge = { members = ["p1", "p9"] }"#, "no interface"),
-        (r#"bridge = { members = ["p1"], aging-time = 5 }"#, "aging-time"),
-        (r#"bridge = { members = ["p1"], max-learned = 0 }"#, "max-learned"),
+        (
+            r#"bridge = { members = ["p1"], aging-time = 5 }"#,
+            "aging-time",
+        ),
+        (
+            r#"bridge = { members = ["p1"], max-learned = 0 }"#,
+            "max-learned",
+        ),
         (
             r#"bridge = { members = ["p1"], static-mac = [{ mac = "01:00:5e:00:00:01", interface = "p1" }] }"#,
             "unicast",
@@ -97,11 +103,17 @@ mac = "02:00:00:00:01:02"
             r#"bridge = { members = ["p1"], static-mac = [{ mac = "02:00:00:00:00:01", interface = "p2" }] }"#,
             "no member",
         ),
-        (r#"bridge = { members = ["p1"] }
-mtu = 9000"#, "mtu"),
-        (r#"bridge = { members = ["p1"] }
+        (
+            r#"bridge = { members = ["p1"] }
+mtu = 9000"#,
+            "mtu",
+        ),
+        (
+            r#"bridge = { members = ["p1"] }
 parent = "p1"
-vlan = 3"#, "not also"),
+vlan = 3"#,
+            "not also",
+        ),
     ] {
         let text = format!("{base}\n[[interface]]\nname = \"br0\"\n{bridge}\n");
         let error = parse(&text).unwrap_err();

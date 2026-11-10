@@ -84,7 +84,9 @@ pub(crate) fn check(
         for fixed in entry.static_mac {
             let mac = crate::file::mac(&fixed.mac)
                 .filter(|mac| mac[0] & 1 == 0 && *mac != [0; 6])
-                .ok_or_else(|| format!("{at}: static-mac {:?} must be a unicast address", fixed.mac))?;
+                .ok_or_else(|| {
+                    format!("{at}: static-mac {:?} must be a unicast address", fixed.mac)
+                })?;
             if !entry.members.contains(&fixed.interface) {
                 return Err(format!(
                     "{at}: static-mac {:?} names {:?}, which is no member",

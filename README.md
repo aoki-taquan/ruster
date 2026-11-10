@@ -51,9 +51,8 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 - ルータ宛ての通信は、種類ごとに数を抑えてVRFごとのTUNでkernelに渡す。
 - VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。
 - VLAN（802.1Q）のサブインターフェースを持てる。AF_PACKETでは、kernelが外したタグをバックエンドがフレームに戻す。
-- 経路は静的なもの、直結、FRRのBGP（multihopの近隣も。次の転送先はribdが解決する）。
-
-実際のNICや回線ではまだ試していません。
+- L2のブリッジ（MACの学習、フラッディング、エージング）と、ブリッジのアドレスで経路につなぐIRB。設定は`[[interface]]`の`bridge`。
+- 経路は静的なもの、直結、FRRのBGP（multihopの近隣も。次の転送先はribdが解決する）。実際のNICや回線ではまだ試していません。
 
 ARPとNDの解決はneighdが行い、FEは受けたARPとNDをneighdへ渡します。
 default VRFの転送のfirewallは、設定ファイルの規則でFEが使います。IPv4とIPv6の両方で、状態を追います（IPv6の先頭でないフラグメントは落とします）。アドレスを書かないtcp/udpの規則はIPv6にも効くので、`ingress`を書かない規則は、IPv6では外からLANへの通信も通します。ルータ自身はLANのホストと同じ扱いで、規則では`rt-default`と書きます（ルータ宛ては`egress = "rt-default"`、ルータが出す通信は`ingress = "rt-default"`）。
@@ -148,6 +147,7 @@ sudo scripts/netns-skeleton.sh target/debug                       # AF_XDP
 sudo FE_BACKEND=af-packet scripts/netns-skeleton.sh target/debug  # AF_PACKET
 sudo scripts/netns-vrf.sh target/debug       # VRF: 同じアドレスの2つのVRFと、片方だけの漏らし
 sudo scripts/netns-vlan.sh target/debug      # VLAN: 同じポートの2つのVLANとタグなしの上流
+sudo scripts/netns-bridge.sh target/debug    # ブリッジ: L2の到達、IRBでの経路、MACの移動とエージング
 sudo scripts/netns-firewall6.sh target/debug # IPv6のfirewall: 外へ出るTCPとping6の戻りだけが入る
 sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエンドで（組み合わせの構成も含む）
 ```

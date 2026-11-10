@@ -39,8 +39,8 @@ use ruster_proto::table::{network, Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
 pub mod apply;
-pub mod bridge;
 pub mod bgp;
+pub mod bridge;
 pub mod delegated;
 pub mod dhcp6;
 pub mod dhcp_client;
