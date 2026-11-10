@@ -5,7 +5,7 @@
 //!
 //! | To | What |
 //! |---|---|
-//! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP to `ruster-kea` |
+//! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP and DHCPv6 to `ruster-kea` |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses); the `ra` part on `confd/part.sock` |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
 //! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`, `ruster-pppoed` for `pppoe`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
@@ -36,6 +36,7 @@ use ruster_proto::table::{network, Change, Key, NextHop, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
 pub mod apply;
+pub mod dhcp6;
 pub mod file;
 pub mod kernel;
 pub mod part;
@@ -111,6 +112,9 @@ pub struct Config {
     pub dns: Option<ruster_config::Dns>,
     /// The DHCP servers, one per interface, checked; confd hands them to `ruster-kea`.
     pub dhcp: Vec<ruster_config::Dhcp>,
+    /// The DHCPv6 servers, one per interface, checked; confd hands them to
+    /// `ruster-kea` with `dhcp`.
+    pub dhcp6: Vec<ruster_config::Dhcp6>,
     /// The Router Advertisements, one per interface, checked; confd hands them to
     /// neighd.
     pub ra: Vec<ruster_config::Ra>,
@@ -181,6 +185,10 @@ pub const DHCP_CONTROL: &str = "kea";
 pub const DHCP_CLASS_PREFIX: &str = "dhcp-";
 /// The DHCP server port.
 pub const DHCP_SERVER_PORT: u16 = 67;
+/// The punt class of one interface's DHCPv6: `dhcp6-<interface>`.
+pub const DHCP6_CLASS_PREFIX: &str = "dhcp6-";
+/// The DHCPv6 server and relay agent port (RFC 8415 section 7.2).
+pub const DHCP6_SERVER_PORT: u16 = 547;
 
 /// A refused resync-end is sent again at least this often.
 pub const RESYNC_END_RETRY_MS: u64 = 10_000;
@@ -569,22 +577,31 @@ impl Confd {
         // Each DHCP interface's requests to the server port go to ruster-kea: the
         // broadcasts before forwarding, and those to the router's address (renewals)
         // after the input firewall.
-        for dhcp in &self.config.dhcp {
+        // Each DHCPv6 interface's messages to ff02::1:2, port 547, likewise.
+        let v4 = self.config.dhcp.iter().map(|d| {
+            let class = (DHCP_CLASS_PREFIX, DHCP_SERVER_PORT);
+            (class, &d.interface, d.punt_rate, d.punt_burst)
+        });
+        let v6 = self.config.dhcp6.iter().map(|d| {
+            let class = (DHCP6_CLASS_PREFIX, DHCP6_SERVER_PORT);
+            (class, &d.interface, d.punt_rate, d.punt_burst)
+        });
+        for ((prefix, port), interface, rate, burst) in v4.chain(v6) {
             out.insert(
                 Key::Punt {
-                    class: format!("{DHCP_CLASS_PREFIX}{}", dhcp.interface),
+                    class: format!("{prefix}{interface}"),
                 },
                 Value::Punt(ruster_proto::table::PuntClass {
                     matches: ruster_proto::table::PuntMatch::Ip {
                         protocol: 17,
-                        ports: Some((DHCP_SERVER_PORT, DHCP_SERVER_PORT)),
+                        ports: Some((port, port)),
                     },
-                    interface: Some(dhcp.interface.clone()),
+                    interface: Some(interface.clone()),
                     destination: ruster_proto::table::PuntDestination::Control(
                         DHCP_CONTROL.to_owned(),
                     ),
-                    rate: dhcp.punt_rate,
-                    burst: dhcp.punt_burst,
+                    rate,
+                    burst,
                 }),
             );
         }
@@ -1044,6 +1061,7 @@ mod tests {
             nat: None,
             dns: None,
             dhcp: Vec::new(),
+            dhcp6: Vec::new(),
             ra: Vec::new(),
             sources: Vec::new(),
             pppoe: Vec::new(),
@@ -1101,6 +1119,7 @@ mod tests {
             nat: None,
             dns: None,
             dhcp: Vec::new(),
+            dhcp6: Vec::new(),
             ra: Vec::new(),
             sources: Vec::new(),
             pppoe: Vec::new(),

@@ -142,6 +142,19 @@
 //! punt-burst = 100             # hands ruster-kea from the interface, and at once;
 //!                              # these when left out
 //!
+//! [[dhcp6]]                    # optional: a DHCPv6 server (Kea, through
+//!                              # ruster-kea) for one interface; one per interface
+//! interface = "lan"            # a port or VLAN of the default VRF with a global
+//!                              # ipv6 address; the first is the relay's
+//!                              # link-address and gives the subnet
+//! pool = "2001:db8:1::1000-2001:db8:1::1fff"  # the addresses it leases
+//! preferred-lifetime = 3600    # optional, seconds; these when left out
+//! valid-lifetime = 7200
+//! dns = ["2001:db8:1::1"]      # optional: the DNS servers option; when left out,
+//!                              # the interface's addresses [dns] listens on
+//! punt-rate = 200              # optional, as in [[dhcp]]
+//! punt-burst = 100
+//!
 //! [[ra]]                       # optional: Router Advertisements (neighd) on one
 //!                              # interface; one [[ra]] per interface. They
 //!                              # advertise the prefixes of the interface's /64
@@ -282,6 +295,18 @@
 //! punt-rate = 200
 //! punt-burst = 100
 //!
+//! [[dhcp6]]
+//! interface = "lan"
+//! mac = "02:00:00:00:00:01"
+//! link-local = "fe80::ff:fe00:1"  # from mac: the source of the replies to clients
+//! address = "2001:db8:1::1/64" # the interface's first global ipv6 address
+//! pool = "2001:db8:1::1000-2001:db8:1::1fff"
+//! preferred-lifetime = 3600
+//! valid-lifetime = 7200
+//! dns = []
+//! punt-rate = 200
+//! punt-burst = 100
+//!
 //! [[ra]]                       # the prefixes' lifetimes are in [[ra.prefix]]
 //! interface = "lan"
 //! min-interval = 198
@@ -347,11 +372,13 @@
 //! - RFC 4787 REQ-8 and RFC 5382 REQ-3: NAT and the firewall filter
 //!   endpoint-independently by default.
 
+mod dhcp6;
 mod ra;
 mod resolve;
 
 use serde::{Deserialize, Serialize};
 
+pub use dhcp6::{link_local, Dhcp6, DHCP6_PREFERRED_LIFETIME, DHCP6_VALID_LIFETIME};
 pub use ra::{
     parse_ra_part, ra_min_interval, ra_part, Ra, RaPrefix, RA_HOP_LIMIT, RA_MAX_INTERVAL,
     RA_PREFERRED_LIFETIME, RA_VALID_LIFETIME,
@@ -427,6 +454,8 @@ pub struct Lock {
     pub dns: Vec<Dns>,
     /// One per interface.
     pub dhcp: Vec<Dhcp>,
+    /// One per interface.
+    pub dhcp6: Vec<Dhcp6>,
     /// One per interface.
     pub ra: Vec<Ra>,
     pub source: Vec<Source>,
@@ -720,28 +749,32 @@ pub fn parse_dns_part(text: &str) -> Result<Option<Dns>, String> {
     }
 }
 
-/// The part of the lock form that the DHCP process takes: the version and `dhcp`.
+/// The part of the lock form that the DHCP process takes: the version, `dhcp` and
+/// `dhcp6`.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DhcpPart {
     version: u32,
     dhcp: Vec<Dhcp>,
+    dhcp6: Vec<Dhcp6>,
 }
 
-/// The DHCP process's part of the lock form as TOML text: `version = 1` and `dhcp`.
-pub fn dhcp_part(dhcp: &[Dhcp]) -> String {
+/// The DHCP process's part of the lock form as TOML text: `version = 1`, `dhcp` and
+/// `dhcp6`.
+pub fn dhcp_part(dhcp: &[Dhcp], dhcp6: &[Dhcp6]) -> String {
     let part = DhcpPart {
         version: VERSION,
         dhcp: dhcp.to_vec(),
+        dhcp6: dhcp6.to_vec(),
     };
     toml::to_string(&part).expect("the lock form is plain TOML")
 }
 
 /// Reads the DHCP process's part of the lock form ([`dhcp_part`]).
-pub fn parse_dhcp_part(text: &str) -> Result<Vec<Dhcp>, String> {
+pub fn parse_dhcp_part(text: &str) -> Result<(Vec<Dhcp>, Vec<Dhcp6>), String> {
     check_version(text)?;
     let part: DhcpPart = toml::from_str(text).map_err(|e| e.to_string())?;
-    Ok(part.dhcp)
+    Ok((part.dhcp, part.dhcp6))
 }
 
 /// The part of the lock form that the PPPoE client takes: the version and `pppoe`.

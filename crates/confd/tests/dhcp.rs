@@ -112,7 +112,7 @@ fn each_dhcp_interface_hands_the_server_port_to_kea() {
         ]
     );
     assert_eq!(parts.len(), 1);
-    let dhcp = ruster_config::parse_dhcp_part(&parts[0]).unwrap();
+    let (dhcp, _) = ruster_config::parse_dhcp_part(&parts[0]).unwrap();
     assert_eq!(dhcp.len(), 2);
     assert_eq!(dhcp[1].address, "10.10.0.1/24");
 
@@ -124,7 +124,10 @@ fn each_dhcp_interface_hands_the_server_port_to_kea() {
         [("dhcp-lan.10".to_owned(), class("lan.10", 50, 20))]
     );
     assert_eq!(parts.len(), 2);
-    assert_eq!(ruster_config::parse_dhcp_part(&parts[1]).unwrap().len(), 1);
+    assert_eq!(
+        ruster_config::parse_dhcp_part(&parts[1]).unwrap().0.len(),
+        1
+    );
 
     // Without dhcp there are no classes, and the part is empty.
     confd.set_config(file::parse(INTERFACES).unwrap());
@@ -132,5 +135,6 @@ fn each_dhcp_interface_hands_the_server_port_to_kea() {
     assert!(punt_classes(&fe).is_empty());
     assert!(ruster_config::parse_dhcp_part(&parts[2])
         .unwrap()
+        .0
         .is_empty());
 }

@@ -672,13 +672,14 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         }
         dhcp.push(entry);
     }
+    let dhcp6 = crate::dhcp6::check(lock.dhcp6, &interfaces)?;
     let ra = crate::ra::check(lock.ra, &interfaces)?;
     let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
     // The FE takes at most this many punt classes besides its own.
-    if dhcp.len() + crate::pppoe::class_count(&pppoe) > PUNT_CLASSES_MAX {
+    if dhcp.len() + dhcp6.len() + crate::pppoe::class_count(&pppoe) > PUNT_CLASSES_MAX {
         return Err(format!(
-            "dhcp and the parents of pppoe take more than {PUNT_CLASSES_MAX} punt classes \
-             (one per dhcp, two per parent)"
+            "dhcp, dhcp6 and the parents of pppoe take more than {PUNT_CLASSES_MAX} punt \
+             classes (one per dhcp and dhcp6, two per parent)"
         ));
     }
     Ok(Config {
@@ -691,6 +692,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         nat,
         dns,
         dhcp,
+        dhcp6,
         ra,
         sources,
         pppoe,
@@ -1187,7 +1189,7 @@ fn firewall_rule(
         .collect())
 }
 
-fn mac(text: &str) -> Option<[u8; 6]> {
+pub(crate) fn mac(text: &str) -> Option<[u8; 6]> {
     let mut out = [0_u8; 6];
     let mut parts = text.split(':');
     for byte in &mut out {
@@ -1200,7 +1202,7 @@ fn mac(text: &str) -> Option<[u8; 6]> {
     parts.next().is_none().then_some(out)
 }
 
-fn prefix(text: &str) -> Option<(IpAddr, u8)> {
+pub(crate) fn prefix(text: &str) -> Option<(IpAddr, u8)> {
     let (address, len) = text.split_once('/')?;
     let canonical = !len.is_empty()
         && len.len() <= 3

@@ -10,7 +10,7 @@ use ruster_kea::Bridge;
 
 fn part(pool: &str) -> String {
     format!(
-        "version = 1\n\n[[dhcp]]\ninterface = \"lan\"\nmac = \"02:00:00:00:00:01\"\naddress = \"192.0.2.1/24\"\npool = \"{pool}\"\nlease-time = 600\nrouter = [\"192.0.2.1\"]\ndns = [\"192.0.2.1\", \"192.0.2.2\"]\npunt-rate = 200\npunt-burst = 100\n"
+        "version = 1\ndhcp6 = []\n\n[[dhcp]]\ninterface = \"lan\"\nmac = \"02:00:00:00:00:01\"\naddress = \"192.0.2.1/24\"\npool = \"{pool}\"\nlease-time = 600\nrouter = [\"192.0.2.1\"]\ndns = [\"192.0.2.1\", \"192.0.2.2\"]\npunt-rate = 200\npunt-burst = 100\n"
     )
 }
 
@@ -20,7 +20,7 @@ fn listen() -> Listen {
 
 #[test]
 fn a_subnet_per_interface_with_its_options() {
-    let dhcp = ruster_config::parse_dhcp_part(&part("192.0.2.100-192.0.2.199")).unwrap();
+    let (dhcp, _) = ruster_config::parse_dhcp_part(&part("192.0.2.100-192.0.2.199")).unwrap();
     let served = ruster_kea::settings::read(&dhcp).unwrap();
     assert_eq!(served[0].link.mac, [2, 0, 0, 0, 0, 1]);
     let text = settings(&listen(), &served);
@@ -48,7 +48,7 @@ fn only_addresses_reach_the_file() {
     for bad in ["192.0.2.100-x }, y: {", "192.0.2.100"] {
         let mut text = part("192.0.2.100-192.0.2.199");
         text = text.replace("192.0.2.100-192.0.2.199", bad);
-        let dhcp = ruster_config::parse_dhcp_part(&text).unwrap();
+        let (dhcp, _) = ruster_config::parse_dhcp_part(&text).unwrap();
         assert!(ruster_kea::settings::read(&dhcp).is_err(), "{bad}");
     }
     assert!(Listen::parse("lo\"/127.0.0.1").is_err());

@@ -32,6 +32,8 @@ struct File {
     #[serde(default)]
     dhcp: Vec<DhcpEntry>,
     #[serde(default)]
+    dhcp6: Vec<crate::dhcp6::Dhcp6Entry>,
+    #[serde(default)]
     ra: Vec<crate::ra::RaEntry>,
     #[serde(default)]
     source: Vec<SourceEntry>,
@@ -368,6 +370,11 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .into_iter()
         .map(|entry| dhcp(entry, &interfaces, dns.as_ref()))
         .collect::<Result<_, _>>()?;
+    let dhcp6 = file
+        .dhcp6
+        .into_iter()
+        .map(|entry| crate::dhcp6::resolve(entry, &interfaces, dns.as_ref()))
+        .collect::<Result<_, _>>()?;
     let ra = file
         .ra
         .into_iter()
@@ -416,6 +423,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         firewall,
         dns: dns.into_iter().collect(),
         dhcp,
+        dhcp6,
         ra,
         source,
         pppoe,

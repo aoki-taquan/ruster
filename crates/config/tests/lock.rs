@@ -119,11 +119,17 @@ fn the_dns_part_reads_back_the_same() {
 #[test]
 fn the_dhcp_part_reads_back_the_same() {
     let lock = parse_lock(&example()).unwrap();
-    let text = ruster_config::dhcp_part(&lock.dhcp);
+    let text = ruster_config::dhcp_part(&lock.dhcp, &lock.dhcp6);
     assert!(text.starts_with("version = 1\n"), "{text}");
-    assert_eq!(ruster_config::parse_dhcp_part(&text).unwrap(), lock.dhcp);
-    let none = ruster_config::dhcp_part(&[]);
-    assert!(ruster_config::parse_dhcp_part(&none).unwrap().is_empty());
+    assert_eq!(
+        ruster_config::parse_dhcp_part(&text).unwrap(),
+        (lock.dhcp.clone(), lock.dhcp6.clone())
+    );
+    let none = ruster_config::dhcp_part(&[], &[]);
+    assert_eq!(
+        ruster_config::parse_dhcp_part(&none).unwrap(),
+        (Vec::new(), Vec::new())
+    );
     assert!(ruster_config::parse_dhcp_part("version = 2\ndhcp = []\n").is_err());
     assert!(
         ruster_config::parse_dhcp_part(&example()).is_err(),
