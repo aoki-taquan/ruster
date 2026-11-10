@@ -51,7 +51,11 @@ impl Bridge {
     /// or refuses it with the reason. `written` runs once the file holds the part,
     /// before Kea is asked to read it.
     pub fn take(&mut self, part: &str, written: &mut dyn FnMut()) -> Result<Vec<Served>, String> {
-        let served = settings::read(&ruster_config::parse_dhcp_part(part)?)?;
+        let (dhcp, dhcp6) = ruster_config::parse_dhcp_part(part)?;
+        if !dhcp6.is_empty() {
+            return Err("ruster-kea does not relay DHCPv6 yet".into());
+        }
+        let served = settings::read(&dhcp)?;
         let text = settings::settings(&self.listen, &served);
         let before = match std::fs::read_to_string(&self.path) {
             Ok(before) => Some(before),

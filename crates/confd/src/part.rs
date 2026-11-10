@@ -89,7 +89,7 @@ impl Module {
     pub fn part(self, config: &Config) -> String {
         match self {
             Self::Dns => ruster_config::dns_part(config.dns.as_ref()),
-            Self::Dhcp => ruster_config::dhcp_part(&config.dhcp),
+            Self::Dhcp => ruster_config::dhcp_part(&config.dhcp, &config.dhcp6),
             Self::Ra => ruster_config::ra_part(&config.ra),
             Self::Pppoe => ruster_config::pppoe_part(&config.pppoe),
         }
@@ -99,7 +99,7 @@ impl Module {
     pub fn configured(self, config: &Config) -> bool {
         match self {
             Self::Dns => config.dns.is_some(),
-            Self::Dhcp => !config.dhcp.is_empty(),
+            Self::Dhcp => !config.dhcp.is_empty() || !config.dhcp6.is_empty(),
             Self::Ra => !config.ra.is_empty(),
             Self::Pppoe => !config.pppoe.is_empty(),
         }
