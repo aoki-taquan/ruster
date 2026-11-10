@@ -10,7 +10,7 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_neighd::Neighd;
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::{Progress, Task};
@@ -72,13 +72,17 @@ fn run() -> Result<(), String> {
         }
         let mut taken = Progress::IDLE;
         if let Some(client) = &mut part {
-            let polled = client.poll(&mut |text| {
+            let polled = client.poll(&mut |asked| {
+                let text = match asked {
+                    Asked::Check(text) => return neighd.check_ra(text),
+                    Asked::Take(text) => text,
+                };
                 let result = neighd.take_ra(text);
                 match &result {
                     Ok(()) => eprintln!("ruster-neighd: took the ra part"),
                     Err(error) => eprintln!("ruster-neighd: refused the ra part: {error}"),
                 }
-                result
+                result.map(|()| String::new())
             });
             match polled {
                 Ok(progress) => taken = progress,

@@ -172,3 +172,30 @@ fn dhcp6_needs_its_file_and_a_refusal_puts_both_back() {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), before4);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_check_shows_the_subnets_diff_and_writes_nothing() {
+    let dir = dir("check");
+    let file = dir.join("ruster-dhcp4.json");
+    let mut bridge = Bridge::new(file.clone(), None, listen());
+    let text = bridge.check(&part("192.0.2.100-192.0.2.199")).unwrap();
+    assert!(
+        text.contains("+") && text.contains("192.0.2.100 - 192.0.2.199"),
+        "{text}"
+    );
+    assert!(!file.exists(), "a check writes nothing");
+    bridge
+        .take(&part("192.0.2.100-192.0.2.199"), &mut || {})
+        .unwrap();
+    assert_eq!(bridge.check(&part("192.0.2.100-192.0.2.199")).unwrap(), "");
+    let text = bridge.check(&part("192.0.2.10-192.0.2.20")).unwrap();
+    assert!(
+        text.contains("-") && text.contains("192.0.2.10 - 192.0.2.20"),
+        "{text}"
+    );
+    // A DHCPv6 entry without a DHCPv6 file is refused, as when it is taken.
+    assert!(bridge
+        .check(&part6("2001:db8:1::100-2001:db8:1::1ff"))
+        .is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -34,7 +34,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_pppoed::lcp::Echo;
 use ruster_pppoed::session::{
     Event, FrameKind, Output, Reason, Session, SessionDown, SessionUp, Settings,
@@ -71,6 +71,44 @@ fn settings(entry: &ruster_config::Pppoe) -> Result<Settings, String> {
         },
         ipv6: entry.ipv6,
     })
+}
+
+/// What taking a `pppoe` part would change for sessions with `before`: the settings
+/// that change, with the passwords hidden, and the sessions that would start, start
+/// again or stop; or the reason it would be refused.
+fn changes(before: &[ruster_config::Pppoe], text: &str) -> Result<String, String> {
+    let entries = ruster_config::parse_pppoe_part(text)?;
+    for entry in &entries {
+        settings(entry)?;
+    }
+    let hide = |entry: &ruster_config::Pppoe, changed: bool| ruster_config::Pppoe {
+        password: if changed {
+            "(hidden, changed)"
+        } else {
+            "(hidden)"
+        }
+        .into(),
+        ..entry.clone()
+    };
+    let after: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let old = before.iter().find(|e| e.source == entry.source);
+            hide(entry, old.is_some_and(|e| e.password != entry.password))
+        })
+        .collect();
+    let before: Vec<_> = before.iter().map(|e| hide(e, false)).collect();
+    Ok(ruster_confd::part::changes(
+        &before,
+        &after,
+        |e| &e.source,
+        ruster_config::pppoe_part,
+        [
+            "the session starts",
+            "the session starts again",
+            "the session stops",
+        ],
+    ))
 }
 
 fn reason_text(reason: Reason) -> &'static str {
@@ -256,6 +294,12 @@ impl Daemon {
         ribd.set(changes);
     }
 
+    /// What taking a `pppoe` part would change ([`changes`]).
+    fn check(&self, text: &str) -> Result<String, String> {
+        let before: Vec<_> = self.sessions.iter().map(|(e, _)| e.clone()).collect();
+        changes(&before, text)
+    }
+
     /// Takes a new `pppoe` part: sessions whose settings are the same keep running,
     /// the others start again or stop.
     fn take(&mut self, text: &str) -> Result<(), String> {
@@ -410,7 +454,11 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        let parted = part.poll(&mut |text| {
+        let parted = part.poll(&mut |asked| {
+            let text = match asked {
+                Asked::Check(text) => return daemon.check(text),
+                Asked::Take(text) => text,
+            };
             let taken = daemon.take(text);
             match &taken {
                 Ok(()) => {
@@ -422,7 +470,7 @@ fn run() -> Result<(), String> {
                 }
                 Err(error) => eprintln!("ruster-pppoed: refused a part: {error}"),
             }
-            taken
+            taken.map(|()| String::new())
         })?;
         let busy = daemon.receive(now) | parted.busy;
         let timer = daemon.timers(now);
@@ -493,6 +541,56 @@ mod tests {
             ..entry
         };
         assert!(settings(&bad).is_err());
+    }
+
+    #[test]
+    fn a_check_names_the_settings_and_sessions_that_change() {
+        let entry = ruster_config::Pppoe {
+            source: "pppoe-wan".into(),
+            interface: "ppp".into(),
+            vrf: "default".into(),
+            parent: "r-wan".into(),
+            mac: "02:00:00:00:00:02".into(),
+            user: "u".into(),
+            password: "secret1".into(),
+            service: String::new(),
+            ac_name: Vec::new(),
+            ipv6: false,
+            echo_interval: 10,
+            echo_failures: 3,
+            default_route: false,
+        };
+        let part = |entries: &[ruster_config::Pppoe]| ruster_config::pppoe_part(entries);
+        let same = changes(
+            std::slice::from_ref(&entry),
+            &part(std::slice::from_ref(&entry)),
+        )
+        .unwrap();
+        assert_eq!(same, "");
+        let first = changes(&[], &part(std::slice::from_ref(&entry))).unwrap();
+        assert!(
+            first.ends_with("pppoe-wan: the session starts\n"),
+            "{first}"
+        );
+        assert!(!first.contains("secret1"), "{first}");
+        let new = ruster_config::Pppoe {
+            password: "secret2".into(),
+            ..entry.clone()
+        };
+        let text = changes(std::slice::from_ref(&entry), &part(&[new])).unwrap();
+        assert!(text.contains("(hidden, changed)"), "{text}");
+        assert!(!text.contains("secret"), "{text}");
+        assert!(
+            text.ends_with("pppoe-wan: the session starts again\n"),
+            "{text}"
+        );
+        let gone = changes(std::slice::from_ref(&entry), &part(&[])).unwrap();
+        assert!(gone.ends_with("pppoe-wan: the session stops\n"), "{gone}");
+        let bad = ruster_config::Pppoe {
+            mac: "02:00".into(),
+            ..entry
+        };
+        assert!(changes(&[], &part(&[bad])).is_err());
     }
 
     #[test]

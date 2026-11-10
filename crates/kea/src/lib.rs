@@ -72,6 +72,9 @@ impl Server {
     }
 }
 
+/// The files a part makes, each with its text, and what to serve.
+type Files<'a> = (Vec<(&'a Server, String)>, Vec<Served>, Vec<Served6>);
+
 /// Writes Kea's settings files and has Kea read them.
 #[derive(Debug)]
 pub struct Bridge {
@@ -98,14 +101,24 @@ impl Bridge {
         self
     }
 
-    /// Takes a `dhcp` part ([`ruster_config::dhcp_part`]) and gives what to serve,
-    /// or refuses it with the reason. `written` runs once the files hold the part,
-    /// before Kea is asked to read them.
-    pub fn take(
-        &mut self,
-        part: &str,
-        written: &mut dyn FnMut(),
-    ) -> Result<(Vec<Served>, Vec<Served6>), String> {
+    /// What taking a `dhcp` part would change: the line diff of each file, or the
+    /// reason it would be refused. Nothing is written.
+    pub fn check(&self, part: &str) -> Result<String, String> {
+        let mut out = String::new();
+        for (server, text) in self.files(part)?.0 {
+            let before = server.read()?.unwrap_or_default();
+            let name = server.path.display().to_string();
+            out.push_str(&ruster_confd::diff::lines(
+                &before,
+                &text,
+                (&name, "candidate"),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The files a `dhcp` part makes, each with its text, and what to serve.
+    fn files(&self, part: &str) -> Result<Files<'_>, String> {
         let (dhcp, dhcp6) = ruster_config::parse_dhcp_part(part)?;
         let served = settings::read(&dhcp)?;
         let served6 = settings6::read(&dhcp6)?;
@@ -116,6 +129,18 @@ impl Bridge {
         if let Some((server, listen)) = &self.v6 {
             files.push((server, settings6::settings(listen, &served6)));
         }
+        Ok((files, served, served6))
+    }
+
+    /// Takes a `dhcp` part ([`ruster_config::dhcp_part`]) and gives what to serve,
+    /// or refuses it with the reason. `written` runs once the files hold the part,
+    /// before Kea is asked to read them.
+    pub fn take(
+        &mut self,
+        part: &str,
+        written: &mut dyn FnMut(),
+    ) -> Result<(Vec<Served>, Vec<Served6>), String> {
+        let (files, served, served6) = self.files(part)?;
         let mut before = Vec::with_capacity(files.len());
         for (server, _) in &files {
             before.push(server.read()?);

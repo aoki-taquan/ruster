@@ -2,7 +2,7 @@
 
 use std::os::unix::net::UnixStream;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_confd::{file, Confd};
 use ruster_proto::session::{Hook, Server, Store};
 use ruster_proto::sid;
@@ -143,9 +143,11 @@ fn each_dhcp6_interface_hands_port_547_to_kea() {
     for _ in 0..200 {
         fe.step(&mut Accept);
         confd.step(0);
-        kea.poll(&mut |part| {
-            parts.push(part.to_owned());
-            Ok(())
+        kea.poll(&mut |asked| {
+            if let Asked::Take(part) = asked {
+                parts.push(part.to_owned());
+            }
+            Ok(String::new())
         })
         .unwrap();
     }

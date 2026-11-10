@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_unbound::Bridge;
 
@@ -54,7 +54,11 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        let progress = client.poll(&mut |part| {
+        let progress = client.poll(&mut |asked| {
+            let part = match asked {
+                Asked::Check(part) => return bridge.check(part),
+                Asked::Take(part) => part,
+            };
             let result = bridge.take(part, &mut || {
                 if !ready {
                     ready = true;
@@ -65,7 +69,7 @@ fn run() -> Result<(), String> {
             if let Err(error) = &result {
                 eprintln!("ruster-unbound: refused a part: {error}");
             }
-            result
+            result.map(|()| String::new())
         })?;
         idle.wait(progress);
     }

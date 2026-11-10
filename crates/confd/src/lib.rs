@@ -378,6 +378,20 @@ impl Confd {
         self.parts.attach(module, stream)
     }
 
+    /// Asks each process that takes a part to check its part of `candidate`, with
+    /// the values the sources have now, without taking it ([`part`]). The answers
+    /// come in [`Confd::part_checks`] as the steps go.
+    pub fn check_parts(&mut self, candidate: &Config) {
+        let with = delegated::with_delegated(candidate, &self.sources);
+        self.parts.check(&with);
+    }
+
+    /// The answers to the last [`Confd::check_parts`] so far, by module: the modules
+    /// a process takes now, and those the candidate has that none takes.
+    pub fn part_checks(&self) -> &BTreeMap<part::Module, part::Checked> {
+        self.parts.checked()
+    }
+
     /// Takes a connection on `confd/source/<name>/source.sock` ([`source`]).
     pub fn attach_source(&mut self, name: &str, stream: UnixStream) -> io::Result<()> {
         self.sources.attach(name, stream)

@@ -169,3 +169,24 @@ fn the_servers_found_are_forwarded_to_after_those_given() {
         Vec::<std::net::IpAddr>::new()
     );
 }
+
+#[test]
+fn a_check_shows_the_file_diff_and_writes_nothing() {
+    let dir = dir("check");
+    let file = dir.join("ruster.conf");
+    let bridge = Bridge::new(file.clone(), Vec::new());
+    let first = bridge.check(&dns_part(Some(&dns()))).unwrap();
+    assert!(first.contains("+server:"), "{first}");
+    assert!(!file.exists(), "a check writes nothing");
+    std::fs::write(&file, settings(Some(&dns())).unwrap()).unwrap();
+    assert_eq!(bridge.check(&dns_part(Some(&dns()))).unwrap(), "");
+    let mut other = dns();
+    other.upstream = vec!["198.51.100.54".into()];
+    let text = bridge.check(&dns_part(Some(&other))).unwrap();
+    assert!(
+        text.contains("198.51.100.53") && text.contains("198.51.100.54"),
+        "{text}"
+    );
+    assert!(bridge.check("version = 1\ndns = [1]\n").is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

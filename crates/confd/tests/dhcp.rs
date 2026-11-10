@@ -2,7 +2,7 @@
 
 use std::os::unix::net::UnixStream;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_confd::{file, Confd};
 use ruster_config::{DHCP_PUNT_BURST, DHCP_PUNT_RATE};
 use ruster_proto::session::{Hook, Server, Store};
@@ -56,9 +56,11 @@ fn run(fe: &mut Server, confd: &mut Confd, kea: &mut Client, parts: &mut Vec<Str
     for _ in 0..200 {
         fe.step(&mut Accept);
         confd.step(0);
-        kea.poll(&mut |part| {
-            parts.push(part.to_owned());
-            Ok(())
+        kea.poll(&mut |asked| {
+            if let Asked::Take(part) = asked {
+                parts.push(part.to_owned());
+            }
+            Ok(String::new())
         })
         .unwrap();
     }

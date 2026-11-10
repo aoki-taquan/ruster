@@ -220,6 +220,31 @@ impl Bridge {
         }
     }
 
+    /// What taking an `frr` part would change: the line diff of `frr.conf`, or the
+    /// reason it would be refused. Nothing is written, and FRR is not asked; it may
+    /// still refuse the file when it reads it. What follows the word `password` on a
+    /// line is not shown (the include may hold passwords), so a changed password
+    /// shows as no change.
+    pub fn check(&self, part: &str) -> Result<String, String> {
+        let (bgp, connected) = ruster_config::parse_frr_part(part)?;
+        let include = match bgp.as_ref().and_then(|b| b.include.first()) {
+            Some(path) => read_include(path)?,
+            None => String::new(),
+        };
+        let text = config(bgp.as_ref(), &connected, &include, self.fpm_port)?;
+        let before = match std::fs::read_to_string(&self.path) {
+            Ok(before) => before,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("{}: {error}", self.path.display())),
+        };
+        let name = self.path.display().to_string();
+        Ok(ruster_confd::diff::lines(
+            &hide_passwords(&before),
+            &hide_passwords(&text),
+            (&name, "candidate"),
+        ))
+    }
+
     /// Takes an `frr` part ([`ruster_config::frr_part`]), or refuses it with the
     /// reason; the interfaces' prefixes in it, for the next hops.
     pub fn take(&mut self, part: &str) -> Result<Vec<Connected>, String> {
@@ -359,4 +384,23 @@ fn read_include(path: &str) -> Result<String, String> {
         return Err(format!("include {path}: larger than {INCLUDE_MAX} bytes"));
     }
     Ok(text)
+}
+
+/// `text` with what follows the word `password` on each line replaced by `(hidden)`.
+fn hide_passwords(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.iter().position(|w| *w == "password") {
+            Some(at) => {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(indent);
+                out.push_str(&words[..=at].join(" "));
+                out.push_str(" (hidden)");
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
