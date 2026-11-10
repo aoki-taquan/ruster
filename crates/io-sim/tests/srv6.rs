@@ -455,3 +455,161 @@ fn the_second_sid_in_a_row_counts_the_hop_limit_too() {
     let (sent, _) = run(&tables, CORE, outer(END, 3, 41, &headers, &inner));
     assert_eq!(sent.expect("sent").1[14 + 7], 1);
 }
+
+/// A Hop-by-Hop Options header (RFC 8200 section 4.3) of 8 bytes, PadN only.
+fn hop_by_hop(next: u8) -> Vec<u8> {
+    vec![next, 0, 1, 4, 0, 0, 0, 0]
+}
+
+/// `outer`, with `first` as the IPv6 header's Next Header.
+fn outer_after(
+    first: u8,
+    destination: &str,
+    hop_limit: u8,
+    headers: &[u8],
+    inner: &[u8],
+) -> Vec<u8> {
+    let mut frame = outer(destination, hop_limit, first, headers, inner);
+    frame[14 + 6] = first;
+    frame
+}
+
+#[test]
+fn the_pointer_counts_the_headers_before_the_segment_routing_header() {
+    // RFC 8754 4.3.1.1 S09-S10 (RFC 8986 4.1): the Pointer is the offset of
+    // Segments Left from the start of the IPv6 header, here 40 + 8 + 3.
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let mut headers = hop_by_hop(43);
+    headers.extend(srh(41, 3, 1, &[DT6, END]));
+    let (sent, errors) = run(&tables, CORE, outer_after(0, END, 64, &headers, &inner));
+    assert!(sent.is_none());
+    assert_eq!(icmpv6(&errors), (4, 0, 51));
+}
+
+#[test]
+fn the_upper_layer_error_points_past_every_extension_header() {
+    // RFC 8754 4.3.1.2 and RFC 8986 4.1.1: code 4, the Pointer at the upper-layer
+    // header: 40 + 8 (Hop-by-Hop) + 40 (an SRH of two).
+    let tables = tables();
+    let mut headers = hop_by_hop(43);
+    headers.extend(srh(17, 0, 1, &[END, "fc00:2::1"]));
+    let (_, errors) = run(&tables, CORE, outer_after(0, END, 64, &headers, &[0; 8]));
+    assert_eq!(icmpv6(&errors), (4, 4, 88));
+}
+
+#[test]
+fn no_next_header_at_a_sid_is_an_upper_layer_error() {
+    // RFC 8986 4.1.1: End allows no upper-layer header, No Next Header (59) included.
+    let tables = tables();
+    let (_, errors) = run(&tables, CORE, outer(END, 64, 59, &[], &[]));
+    assert_eq!(icmpv6(&errors), (4, 4, 40));
+}
+
+#[test]
+fn segments_left_one_above_last_entry_is_followed() {
+    // RFC 8754 4.1.1 and 4.3.1.1 S09: the reduced SRH (H.Encaps.Red) has Segments
+    // Left = Last Entry + 1; only a larger value is an error. Segment List[0] becomes
+    // the destination.
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let headers = srh(41, 1, 0, &["fc00:2::6"]);
+    let (sent, errors) = run(&tables, CORE, outer(END, 64, 41, &headers, &inner));
+    assert!(errors.is_empty());
+    let (_, frame) = sent.expect("sent");
+    assert_eq!(&frame[14 + 24..14 + 40], &ip6("fc00:2::6"));
+    assert_eq!(&frame[54..58], &[41, 2, 4, 0], "Segments Left 0");
+    assert_eq!(frame[54 + 4], 0, "Last Entry kept");
+}
+
+#[test]
+fn segments_left_picks_the_segment_at_its_new_value() {
+    // RFC 8986 4.1 S13-S14: Segments Left 2 -> 1, the destination Segment List[1];
+    // the rest of the SRH is left as it was.
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let headers = srh(41, 2, 2, &["fc00:2::6", "fc00:3::6", END]);
+    let frame = outer(END, 64, 41, &headers, &inner);
+    let (sent, _) = run(&tables, CORE, frame.clone());
+    let (_, out) = sent.expect("sent");
+    assert_eq!(&out[14 + 24..14 + 40], &ip6("fc00:3::6"));
+    assert_eq!(out[54 + 3], 1);
+    let mut want = frame[54..].to_vec();
+    want[3] = 1;
+    assert_eq!(&out[54..], &want[..]);
+}
+
+#[test]
+fn a_header_with_no_segment_list_is_a_parameter_problem() {
+    // RFC 8754 4.3.1.1 S08-S09: Hdr Ext Len 0 gives max_LE = -1, so any Last Entry
+    // is beyond it.
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let headers = srh(41, 1, 0, &[]);
+    let (sent, errors) = run(&tables, CORE, outer(END, 64, 41, &headers, &inner));
+    assert!(sent.is_none());
+    assert_eq!(icmpv6(&errors), (4, 0, 43));
+}
+
+#[test]
+fn the_hop_limit_is_checked_before_the_header() {
+    // RFC 8986 4.1: S05 (Hop Limit) comes before S09 (Last Entry and Segments Left).
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let headers = srh(41, 3, 1, &[DT6, END]);
+    let (_, errors) = run(&tables, CORE, outer(END, 1, 41, &headers, &inner));
+    assert_eq!(icmpv6(&errors), (3, 0, 0));
+    let (_, errors) = run(&tables, CORE, outer(END, 0, 41, &headers, &inner));
+    assert_eq!(icmpv6(&errors), (3, 0, 0));
+}
+
+#[test]
+fn end_x_with_hop_limit_one_is_time_exceeded() {
+    // RFC 8986 4.2: End.X is End with a different S15, so S05 holds.
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let headers = srh(41, 1, 1, &["fc00:2::6", END_X]);
+    let (sent, errors) = run(&tables, CORE, outer(END_X, 1, 41, &headers, &inner));
+    assert!(sent.is_none());
+    assert_eq!(icmpv6(&errors), (3, 0, 0));
+}
+
+#[test]
+fn another_routing_type_with_no_segments_left_is_stepped_over() {
+    // RFC 8200 4.4: an unrecognized Routing Type with Segments Left 0 is ignored,
+    // and the next header processed: End.DT4 unwraps the IPv4 packet behind it.
+    let tables = tables();
+    let inner = ipv4_packet(REMOTE4, HOST4);
+    let mut headers = srh(4, 0, 0, &["fc00:2::4"]);
+    headers[2] = 3;
+    let (sent, errors) = run(&tables, CORE, outer(DT4, 64, 4, &headers, &inner));
+    assert!(errors.is_empty());
+    let (egress, frame) = sent.expect("sent");
+    assert_eq!(egress, LAN);
+    assert_eq!(&frame[12..14], &[0x08, 0x00]);
+    assert_eq!(frame.len(), 14 + 28);
+}
+
+#[test]
+fn end_dt6_with_segments_left_is_a_parameter_problem_at_segments_left() {
+    // RFC 8986 4.6 S02-S03: code 0, the Pointer at Segments Left (40 + 3).
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let headers = srh(41, 1, 1, &["fc00:2::6", DT6]);
+    let (sent, errors) = run(&tables, CORE, outer(DT6, 64, 41, &headers, &inner));
+    assert!(sent.is_none_or(|(egress, _)| egress != LAN));
+    assert_eq!(icmpv6(&errors), (4, 0, 43));
+}
+
+#[test]
+fn a_fragment_to_a_sid_is_dropped() {
+    // A deviation (module `# Standards`): fragments to a SID are not put back
+    // together. RFC 8200 4.5 Fragment header: offset 0, M set.
+    let tables = tables();
+    let inner = ipv4_packet(REMOTE4, HOST4);
+    let fragment = [4, 0, 0, 1, 0, 0, 0, 7];
+    let frame = outer_after(44, DT4, 64, &fragment, &inner);
+    let (sent, errors) = run(&tables, CORE, frame);
+    assert!(sent.is_none());
+    assert!(errors.is_empty());
+}

@@ -564,6 +564,67 @@ mod tests {
     }
 
     #[test]
+    fn an_ipv6_next_hop_is_resolved_the_same_way() {
+        // RFC 4271 5.1.3 (and RFC 4760 for IPv6): a global NEXT_HOP on a connected
+        // /64 is the immediate next hop; one reached through a static route takes
+        // that route's next hop and interface.
+        let map = resolved(
+            &[
+                ("2001:db8:1::/64", dev("wan", None)),
+                ("2001:db8:ff::/48", dev("wan", Some("fe80::1"))),
+                ("2001:db8:a::/48", gateways(&["2001:db8:1::2"])),
+                ("2001:db8:b::/48", gateways(&["2001:db8:ff::9"])),
+            ],
+            false,
+        );
+        assert_eq!(
+            hops(&map, "2001:db8:a::/48"),
+            Some(vec![hop("wan", "2001:db8:1::2")])
+        );
+        assert_eq!(
+            hops(&map, "2001:db8:b::/48"),
+            Some(vec![hop("wan", "fe80::1")])
+        );
+    }
+
+    #[test]
+    fn a_host_route_through_its_own_address_is_not_used() {
+        // RFC 4271 9.1.2.1: the NEXT_HOP would become unresolvable once the route
+        // were installed (the /32 would carry the packets to its own gateway).
+        let map = resolved(
+            &[
+                ("10.0.0.0/8", dev("wan", Some("198.51.100.10"))),
+                ("10.1.2.3/32", gateways(&["10.1.2.3"])),
+            ],
+            false,
+        );
+        assert_eq!(hops(&map, "10.1.2.3/32"), None);
+    }
+
+    #[test]
+    fn several_next_hops_of_the_match_are_all_kept_in_order() {
+        // RFC 4271 5.1.3: the immediate next hops are those of the route the
+        // NEXT_HOP resolves through; an ECMP static route gives all of them.
+        let map = resolved(
+            &[
+                (
+                    "10.255.0.0/16",
+                    Value::Route(RouteAction::Forward(vec![
+                        hop("a", "192.168.1.1"),
+                        hop("b", "192.168.2.1"),
+                    ])),
+                ),
+                ("203.0.113.0/24", gateways(&["10.255.0.2"])),
+            ],
+            false,
+        );
+        assert_eq!(
+            hops(&map, "203.0.113.0/24"),
+            Some(vec![hop("a", "192.168.1.1"), hop("b", "192.168.2.1")])
+        );
+    }
+
+    #[test]
     fn routes_are_resolved_in_their_own_vrf_only() {
         let mut map = BTreeMap::new();
         map.insert(

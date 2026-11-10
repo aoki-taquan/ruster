@@ -227,3 +227,70 @@ fn a_packet_to_an_end_dt4_sid_is_unwrapped_into_its_vrf() {
     assert_eq!(&sent[12..14], &[0x08, 0x00]);
     assert_eq!(&sent[14 + 16..14 + 20], &HOST);
 }
+
+/// An Ethernet frame from the host to `REMOTE` (behind the SR policy): IPv4 UDP,
+/// `len` bytes long.
+fn long_to_policy(len: usize, df: bool) -> Vec<u8> {
+    let mut frame = LAN_MAC.to_vec();
+    frame.extend_from_slice(&HOST_MAC);
+    frame.extend_from_slice(&[0x08, 0x00]);
+    let mut ip = vec![0_u8; len];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&u16::try_from(len).unwrap().to_be_bytes());
+    if df {
+        ip[6] = 0x40;
+    }
+    ip[8] = 64;
+    ip[9] = 17;
+    ip[12..16].copy_from_slice(&HOST);
+    ip[16..20].copy_from_slice(&REMOTE);
+    let checksum = ipv4_header_checksum(&ip[..20]);
+    ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+    ip[24..26].copy_from_slice(&u16::try_from(len - 20).unwrap().to_be_bytes());
+    frame.extend_from_slice(&ip);
+    frame
+}
+
+#[test]
+fn an_ipv4_packet_without_df_too_long_once_wrapped_is_fragmented_then_wrapped() {
+    // RFC 8754 5.3 and RFC 2473 7: the outer packet is never fragmented; the inner
+    // IPv4 packet (DF clear) is cut to fit 1500 - 40 (RFC 791), each fragment wrapped.
+    let mut fe = bench();
+    let out = send(&mut fe, LAN, long_to_policy(1500, false));
+    assert!(out.len() >= 2, "{} frames", out.len());
+    let mut carried = 0;
+    for (port, frame) in &out {
+        assert_eq!(*port, WAN);
+        assert!(frame.len() - 14 <= 1500, "each fits the link");
+        assert_eq!(frame[14 + 6], 4, "inner IPv4, no SRH");
+        let inner = 14 + 40;
+        let total = usize::from(u16::from_be_bytes([frame[inner + 2], frame[inner + 3]]));
+        assert!(total <= 1460);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([frame[14 + 4], frame[14 + 5]])),
+            total,
+            "outer Payload Length"
+        );
+        carried += total - 20;
+    }
+    assert_eq!(carried, 1500 - 20, "all of the payload");
+}
+
+#[test]
+fn an_ipv4_packet_with_df_too_long_once_wrapped_gets_fragmentation_needed() {
+    // RFC 2473 7.2 and RFC 1191 section 4: Destination Unreachable code 4 with the
+    // Next-Hop MTU the policy carries, 1500 - 40.
+    let mut fe = bench();
+    assert!(send(&mut fe, LAN, long_to_policy(1460, true))
+        .iter()
+        .any(|(port, _)| *port == WAN));
+    let out = send(&mut fe, LAN, long_to_policy(1461, true));
+    assert!(out.iter().all(|(port, _)| *port != WAN));
+    let (port, error) = out.first().expect("an ICMP error back");
+    assert_eq!(*port, LAN);
+    assert_eq!(&error[0..6], &HOST_MAC);
+    assert_eq!(error[14 + 9], 1, "ICMP");
+    let icmp = 14 + 20;
+    assert_eq!((error[icmp], error[icmp + 1]), (3, 4));
+    assert_eq!(u16::from_be_bytes([error[icmp + 6], error[icmp + 7]]), 1460);
+}
