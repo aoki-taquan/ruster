@@ -1038,6 +1038,20 @@ fn the_firewall_outside_may_be_named() {
 fn the_icmp_error_limits_may_be_set() {
     let config = parse(&format!("{LAN}[icmp-errors]\nipv6-burst = 5\n")).unwrap();
     assert_eq!(config.icmp_errors, Some((100, 5, 10)));
-    assert_eq!(parse(LAN).unwrap().icmp_errors, None);
+    // Left out, the defaults, which confd now sets in the FE too.
+    assert_eq!(parse(LAN).unwrap().icmp_errors, Some((100, 10, 10)));
     assert!(error(&format!("{LAN}[icmp-errors]\nipv4-interval-ms = 0\n")).contains("intervals"));
+}
+
+#[test]
+fn the_lock_form_is_read_as_its_file() {
+    let lock = ruster_config::resolve(GOOD).unwrap().to_text();
+    assert_eq!(parse(&lock).unwrap(), parse(GOOD).unwrap());
+    assert!(error(&lock.replacen("mtu = 1500\n", "", 1)).contains("missing"));
+    assert!(error(&lock.replacen("version = 1", "version = 9", 1)).contains("version 9"));
+    // A list of none or one takes no more.
+    assert!(
+        error(&lock.replacen("ipv4 = []", "ipv4 = [\"10.0.0.1/8\", \"10.0.0.2/8\"]", 1))
+            .contains("at most one")
+    );
 }

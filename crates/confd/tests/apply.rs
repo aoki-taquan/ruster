@@ -49,7 +49,8 @@ impl Rig {
         let mut fe = Server::new();
         let mut confd = Confd::new(file::parse(&text(1500)).unwrap());
         let (a, b) = UnixStream::pair().unwrap();
-        fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+        fe.attach(a, &[sid::INTERFACE, sid::ADDRESS, sid::ICMP_ERRORS])
+            .unwrap();
         confd.connect_fe(b).unwrap();
         let mut apply = Apply::new();
         let (a, b) = UnixStream::pair().unwrap();
@@ -129,7 +130,11 @@ fn a_refused_file_puts_the_configuration_before_it_back() {
     );
     assert_eq!(rig.confd.config().interfaces[0].mtu, 1500);
     assert_eq!(rig.mtu(), Some(1500));
-    assert_eq!(rig.fe.store().len(), 3, "the interface and both addresses");
+    assert_eq!(
+        rig.fe.store().len(),
+        4,
+        "the interface, both addresses and the ICMP error limits"
+    );
 
     // The next file goes through as usual.
     rig.cli.post(&["config"], text(1280).as_bytes());
@@ -213,7 +218,9 @@ fn a_process_that_reconnects_and_refuses_still_puts_the_configuration_before_bac
 
     // A new FE: confd connects and sends everything; the FE refuses it.
     let (a, b) = UnixStream::pair().unwrap();
-    rig.fe.attach(a, &[sid::INTERFACE, sid::ADDRESS]).unwrap();
+    rig.fe
+        .attach(a, &[sid::INTERFACE, sid::ADDRESS, sid::ICMP_ERRORS])
+        .unwrap();
     rig.confd.connect_fe(b).unwrap();
     let answers = rig.answers();
     assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");

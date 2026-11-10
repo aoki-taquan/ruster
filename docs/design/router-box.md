@@ -137,7 +137,8 @@ confd → 各プロセス: 確定
 今の`ruster apply`のTOMLは、FEの表をほぼそのまま書いた形。次の順で移す。
 
 1. lockの形（YANGの型と、そのTOMLでの書き方）を決め、confdが読めるようにする。
-   既定値はconfdの各所から外し、解決のライブラリへ集める。今のTOMLは捨てる。最初はlockを直接書く。
+   既定値はconfdの各所から外し、解決のライブラリへ集める。今のTOMLは、型が変わるまで`ruster.toml`として
+   読み、解決してlockの形にする。
 2. 実行中に決まる値を、全体の設定から外す。
    - PPPoEのセッション番号と相手のMAC → `ruster-pppoed`から。それまでは送り手を手で書く道具で渡す。
    - MAP-Eのプレフィックス → `ruster-dhcpc`の委任から。
@@ -158,7 +159,7 @@ FRR、Kea、UnboundはUbuntuのパッケージを使う。
 
 ## 作る順番
 
-1. `ruster.lock`と反映の流れ（上の「移り方」の1から3）。`ruster.toml`の解決は、lockの形が落ち着いてから。
+1. `ruster.lock`と反映の流れ（上の「移り方」の1から3）。`ruster.toml`の新しい書き方は、lockの形が落ち着いてから。
 2. Unbound。橋渡し役の型を決める。
 3. Kea（リレーを含む）と、neighdのRA。
 4. `ruster-dhcpc`（MAP-Eのプレフィックスを全体の設定から外す）。

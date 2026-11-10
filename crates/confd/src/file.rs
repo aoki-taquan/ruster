@@ -1,109 +1,6 @@
-//! The configuration file, in TOML.
-//!
-//! ```toml
-//! [[interface]]
-//! name = "lan"                 # the FE port (the Linux device name)
-//! mac = "02:00:00:00:00:01"
-//! mtu = 1500                   # optional, 1500 when left out
-//! enabled = true               # optional, true when left out
-//! ipv4 = "192.0.2.1/24"        # optional
-//! ipv6 = ["2001:db8:1::1/64"]  # optional; a link-local address is added by itself
-//! vrf = "red"                  # optional, "default" when left out
-//!
-//! [[interface]]                # a VLAN sub-interface of lan, after lan
-//! name = "lan.10"
-//! parent = "lan"
-//! vlan = 10                    # 1 to 4094; mac is lan's when left out
-//! ipv4 = "10.10.0.1/24"
-//!
-//! [[interface]]                # an IPv4 in IPv6 tunnel (DS-Lite softwire)
-//! name = "dslite"
-//! tunnel = { local = "2001:db8:1::2", remote = "2001:db8:ff::1" }
-//! ipv4 = "192.0.0.2/29"        # optional; this, the B4's address, when left out
-//! # mtu is 1460 when left out; mac is not needed
-//!
-//! [[interface]]                # a PPPoE session (set up by a daemon outside ruster)
-//! name = "ppp"
-//! pppoe = { parent = "wan", session = 4660, peer = "02:00:00:00:00:ac" }
-//! ipv4 = "198.51.100.2/32"     # optional
-//! # mac is the parent's and mtu its less 8 when left out
-//!
-//! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
-//! interface = "map"            # the tunnel interface it makes
-//! inside = "lan"               # the NAT's inside
-//! prefix = "2001:db8:12:3400::/56"  # the delegated (end-user) IPv6 prefix
-//! rule-ipv6 = "2001:db8::/40"  # the Basic Mapping Rule
-//! rule-ipv4 = "192.0.2.0/24"
-//! ea-length = 16
-//! psid-offset = 6              # optional, 6 when left out
-//! br = "2001:db8:ffff::1"
-//! mtu = 1460                   # optional, 1460 when left out
-//! filtering = "endpoint-independent"  # optional, as for [nat]
-//!
-//! [[route]]
-//! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
-//! interface = "wan"
-//! via = "198.51.100.1"         # optional; left out for an on-link route
-//! vrf = "default"              # optional; the interface may be in another VRF
-//!
-//! [[route]]                    # look the destination up again in another VRF
-//! vrf = "red"
-//! prefix = "0.0.0.0/0"
-//! lookup-vrf = "default"
-//!
-//! [[route]]                    # drop the prefix's packets (a longer route still wins)
-//! prefix = "10.0.0.0/8"
-//! action = "discard"           # silently; "reject": with a Destination Unreachable
-//!
-//! firewall-filtering = "endpoint-independent"  # optional, at the top: who outside
-//!                              # may reach an inside host's UDP or TCP port that has a
-//!                              # flow out, where no rule decides; the default, or
-//!                              # "address-dependent", "address-and-port-dependent".
-//!                              # Outside are NAT's outside and the interfaces of the
-//!                              # default routes; inside, the other interfaces
-//! firewall-outside = ["wan"]   # optional, at the top: the outside interfaces, when
-//!                              # those are not right (a default route from a routing
-//!                              # daemon, say)
-//!
-//! [[firewall]]                 # forward rules of the default VRF, first match wins
-//! action = "accept"            # or "drop"; an accepted flow's replies pass too
-//! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
-//! ingress = "lan"              # optional, any interface when left out (and then
-//!                              # also what other VRFs look up in this one);
-//!                              # "rt-default" is the router itself: as ingress its own
-//!                              # packets, as egress the packets to it (SSH, ping, ...)
-//! egress = "wan"               # optional
-//! source = "192.0.2.0/24"      # optional, any address when left out; IPv4 or IPv6
-//! destination = "0.0.0.0/0"    # optional, of the source's family
-//! # A tcp or udp rule with neither source nor destination is for IPv4 and IPv6.
-//! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
-//! destination-ports = "53"     # optional
-//!
-//! [icmp-errors]                # optional: the rate limits of the ICMP errors the
-//! ipv4-interval-ms = 100       # router sends: one per this per egress and kind
-//! ipv6-burst = 10              # (RFC 1812 4.3.2.8), and for ICMPv6 this many at
-//! ipv6-interval-ms = 10        # once and one more every this (RFC 4443 2.4(f))
-//!
-//! [nat]                        # NAPT of the default VRF
-//! inside = "lan"
-//! outside = "wan"              # must have an ipv4 address: the public one
-//! ports = "1024-32767"         # optional, 1024-32767 when left out
-//! external = "198.51.100.2"    # optional; for now only the outside's own address
-//! filtering = "endpoint-independent"  # optional, the default, or
-//!                              # "address-dependent", "address-and-port-dependent"
-//! ipv4-id-rate-limit = true    # optional, the default: datagrams that may be
-//!                              # fragmented are dropped above the rate at which
-//!                              # their IPv4 IDs stay unique for 120 s (about 550
-//!                              # a second to one destination, shared by the LAN);
-//!                              # false lets them go (also in [map-e])
-//! ports-per-host = 0           # optional: the most public ports one LAN host
-//!                              # holds for each of UDP, TCP and ICMP; 0 for none
-//! state-per-host = 0           # optional: the most TCP sessions, and outside
-//!                              # endpoints of its UDP (not with endpoint-
-//!                              # independent filtering) and ICMP, of one LAN host
-//!                              # (both also in [map-e]; setting or lowering one
-//!                              # drops every NAT flow)
-//! ```
+//! The configuration: checks the lock form ([`ruster_config::Lock`]) and turns it
+//! into confd's [`Config`]. A `ruster.toml` is resolved to the lock form first; both
+//! are described in [`ruster_config`], which also holds every default.
 //!
 //! The NAT pool must not overlap the ports the router's kernel picks for its own
 //! connections (`net.ipv4.ip_local_port_range`, 32768-60999 by default): UDP and TCP
@@ -123,8 +20,7 @@
 //!
 //! - RFC 8200 section 5: an interface with IPv6 addresses has an MTU of at least
 //!   1280. Deviation: one with only its link-local address may have less.
-//! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF, `default`
-//!   when not named. A `lookup-vrf` route reaches the other VRF's hosts, not the
+//! - RFC 8529 (`ietf-network-instance`): an interface belongs to one VRF. A `lookup-vrf` route reaches the other VRF's hosts, not the
 //!   router's own addresses in it: traffic from one VRF to the router's address in
 //!   another is not delivered.
 //! - RFC 791: the smallest MTU is 68.
@@ -137,9 +33,9 @@
 //!   VRF, to the AFTR at `remote`; the outer packets are routed in the default VRF.
 //!   Its MTU is at most 1460 (1500 less the IPv6 header), and at run time at most
 //!   what the link below carries less 40, so the outer packets are not fragmented
-//!   (RFC 6333 5.3 lets the B4 fragment them instead). Section 5.7: without an
-//!   IPv4 address of its own, it gets 192.0.0.2/29 (the first such tunnel of a VRF
-//!   only), so that ICMP errors can be sent into it.
+//!   (RFC 6333 5.3 lets the B4 fragment them instead). Section 5.7: the lock form
+//!   gives the first such tunnel of a VRF with no IPv4 address the B4's, so that
+//!   ICMP errors can be sent into it.
 //! - RFC 7597 (MAP-E), the CE: `[map-e]` derives the shared IPv4 address and the
 //!   PSID from the EA bits of the delegated prefix (section 5.2), the CE's IPv6
 //!   address from them (section 6, interface ID `0:IPv4:PSID` on the delegated
@@ -150,7 +46,7 @@
 //!   Deviations: one Basic Mapping Rule, no Forwarding Mapping Rules (all traffic
 //!   goes through the BR, hub and spoke); an `ea-length` shorter than the IPv4
 //!   suffix (an IPv4 prefix per CE) is refused; the IPv4 address with no sharing
-//!   (`ea-length` equal to the IPv4 suffix) uses ports 1024 to 32767, below the
+//!   (`ea-length` equal to the IPv4 suffix) uses `ports` of the lock form, below the
 //!   kernel's; a delegated prefix that is a link's on-link prefix is refused (no one
 //!   would answer Neighbor Discovery for the CE's address there); the
 //!   interface ID is RFC 7597's, not the older draft's; the unwrapped IPv4
@@ -184,8 +80,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use serde::Deserialize;
-
+use ruster_config::{FirewallOutside, Kind, Lock, Target};
 use ruster_proto::table::{
     FirewallAction, FirewallRule, Nat, NatFiltering, NatPorts, Protocol, DEFAULT_VRF,
 };
@@ -200,163 +95,23 @@ const IPV6_MIN_MTU: u16 = 1_280;
 const MAX_MTU: u16 = 1_500;
 /// The name rules give the router itself (the default VRF's kernel interface).
 const ROUTER_INTERFACE: &str = "rt-default";
-/// The MAC address of a tunnel that names none.
-const TUNNEL_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0xfe];
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct File {
-    #[serde(default)]
-    interface: Vec<InterfaceEntry>,
-    #[serde(default)]
-    route: Vec<RouteEntry>,
-    #[serde(default)]
-    firewall: Vec<FirewallEntry>,
-    #[serde(rename = "firewall-filtering")]
-    firewall_filtering: Option<String>,
-    #[serde(rename = "firewall-outside")]
-    firewall_outside: Option<Vec<String>>,
-    #[serde(rename = "icmp-errors")]
-    icmp_errors: Option<IcmpErrorsEntry>,
-    nat: Option<NatEntry>,
-    #[serde(rename = "map-e")]
-    map_e: Option<MapEEntry>,
+/// `filtering = "..."` of `nat`, `map-e` or the firewall.
+fn filtering(at: &str, text: &str) -> Result<NatFiltering, String> {
+    NatFiltering::from_name(&format!("{text}-filtering")).ok_or_else(|| {
+        format!(
+            "{at}: filtering must be \"endpoint-independent\", \"address-dependent\" or \"address-and-port-dependent\""
+        )
+    })
 }
 
-/// A MAP-E CE (RFC 7597): one Basic Mapping Rule, the delegated prefix, the BR.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "kebab-case")]
-struct MapEEntry {
-    /// The tunnel interface confd makes.
-    interface: String,
-    /// The NAT's inside interface.
-    inside: String,
-    /// The end-user IPv6 prefix (the one delegated to the CE).
-    prefix: String,
-    rule_ipv6: String,
-    rule_ipv4: String,
-    ea_length: u8,
-    psid_offset: Option<u8>,
-    br: String,
-    mtu: Option<u16>,
-    filtering: Option<String>,
-    ipv4_id_rate_limit: Option<bool>,
-    ports_per_host: Option<u16>,
-    state_per_host: Option<u16>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "kebab-case")]
-struct IcmpErrorsEntry {
-    ipv4_interval_ms: Option<u32>,
-    ipv6_burst: Option<u32>,
-    ipv6_interval_ms: Option<u32>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "kebab-case")]
-struct NatEntry {
-    inside: String,
-    outside: String,
-    ports: Option<String>,
-    external: Option<String>,
-    filtering: Option<String>,
-    ipv4_id_rate_limit: Option<bool>,
-    ports_per_host: Option<u16>,
-    state_per_host: Option<u16>,
-}
-
-/// `filtering = "..."` of `[nat]` or `[map-e]`; endpoint-independent when left out.
-fn filtering(at: &str, text: Option<&str>) -> Result<NatFiltering, String> {
-    match text {
-        None => Ok(NatFiltering::default()),
-        Some(text) => NatFiltering::from_name(&format!("{text}-filtering"))
-            .ok_or_else(|| {
-                format!(
-                    "{at}: filtering must be \"endpoint-independent\", \"address-dependent\" or \"address-and-port-dependent\""
-                )
-            }),
+/// The one value of a list that holds none or one.
+fn at_most_one<'a>(at: &str, what: &str, list: &'a [String]) -> Result<Option<&'a String>, String> {
+    match list {
+        [] => Ok(None),
+        [one] => Ok(Some(one)),
+        _ => Err(format!("{at}: {what} takes at most one value")),
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "kebab-case")]
-struct FirewallEntry {
-    action: String,
-    protocol: String,
-    ingress: Option<String>,
-    egress: Option<String>,
-    source: Option<String>,
-    destination: Option<String>,
-    source_ports: Option<String>,
-    destination_ports: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InterfaceEntry {
-    name: String,
-    /// Optional for a VLAN sub-interface, which then has its parent's.
-    mac: Option<String>,
-    parent: Option<String>,
-    vlan: Option<u16>,
-    /// 1500 when left out; for a sub-interface, its parent's less the 4-byte tag.
-    mtu: Option<u16>,
-    #[serde(default = "default_enabled")]
-    enabled: bool,
-    ipv4: Option<String>,
-    #[serde(default)]
-    ipv6: Vec<String>,
-    #[serde(default = "default_vrf")]
-    vrf: String,
-    tunnel: Option<TunnelEntry>,
-    pppoe: Option<PppoeEntry>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PppoeEntry {
-    parent: String,
-    session: u16,
-    peer: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TunnelEntry {
-    local: String,
-    remote: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "kebab-case")]
-struct RouteEntry {
-    #[serde(default = "default_vrf")]
-    vrf: String,
-    prefix: String,
-    interface: Option<String>,
-    via: Option<String>,
-    lookup_vrf: Option<String>,
-    /// `"discard"` (dropped silently) or `"reject"` (dropped with a Destination
-    /// Unreachable), instead of an interface.
-    action: Option<String>,
-}
-
-fn default_vrf() -> String {
-    DEFAULT_VRF.to_owned()
-}
-
-fn default_mtu() -> u16 {
-    1_500
-}
-
-fn default_enabled() -> bool {
-    true
 }
 
 /// What the interfaces of a file have, to check addresses and routes against.
@@ -418,12 +173,22 @@ impl Seen {
     }
 }
 
-/// Reads a configuration from the text of a configuration file.
+/// Reads a configuration from the text of a configuration file: the lock form when
+/// it has a top-level `version`, else a `ruster.toml`, which is resolved first.
 pub fn parse(text: &str) -> Result<Config, String> {
-    let file: File = toml::from_str(text).map_err(|error| error.to_string())?;
+    let lock = if ruster_config::is_lock(text)? {
+        ruster_config::parse_lock(text)?
+    } else {
+        ruster_config::resolve(text)?
+    };
+    config(lock)
+}
+
+/// Checks the lock form and makes confd's configuration of it.
+pub fn config(lock: Lock) -> Result<Config, String> {
     let mut seen = Seen::default();
-    let mut interfaces = Vec::with_capacity(file.interface.len());
-    for entry in file.interface {
+    let mut interfaces = Vec::with_capacity(lock.interface.len());
+    for entry in lock.interface {
         let at = format!("interface {:?}", entry.name);
         if entry.name.is_empty() || entry.name.len() > 255 {
             return Err(format!("{at}: the name must be 1 to 255 bytes"));
@@ -433,8 +198,13 @@ pub fn parse(text: &str) -> Result<Config, String> {
         }
         vrf_name(&at, &entry.vrf)?;
         seen.vrf_of.insert(entry.name.clone(), entry.vrf.clone());
-        let vlan = match (&entry.parent, entry.vlan) {
-            (Some(parent), Some(id)) => {
+        let mut vlan = None;
+        let mut tunnel = None;
+        let mut pppoe = None;
+        match &entry.kind {
+            Kind::Port => {}
+            Kind::Vlan { parent, id } => {
+                let id = *id;
                 if !(1..=4094).contains(&id) {
                     return Err(format!("{at}: vlan must be 1 to 4094"));
                 }
@@ -451,22 +221,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 if taken {
                     return Err(format!("{at}: vlan {id} on {parent:?} is given twice"));
                 }
-                Some((parent.clone(), id, parent_entry.mac))
+                vlan = Some((parent.clone(), id, parent_entry.mtu));
             }
-            (None, None) => None,
-            _ => return Err(format!("{at}: give parent and vlan together")),
-        };
-        let tunnel = match &entry.tunnel {
-            None => None,
-            Some(_) if vlan.is_some() => {
-                return Err(format!(
-                    "{at}: an interface is a VLAN or a tunnel, not both"
-                ))
-            }
-            Some(_) if !entry.ipv6.is_empty() => {
+            Kind::Tunnel { .. } if !entry.ipv6.is_empty() => {
                 return Err(format!("{at}: a tunnel carries IPv4 only; give it no ipv6"))
             }
-            Some(tunnel) => {
+            Kind::Tunnel { local, remote } => {
                 let address = |text: &str, what: &str| -> Result<Ipv6Addr, String> {
                     let address: Ipv6Addr = text
                         .parse()
@@ -478,92 +238,60 @@ pub fn parse(text: &str) -> Result<Config, String> {
                     }
                     Ok(address)
                 };
-                Some((
-                    address(&tunnel.local, "local")?,
-                    address(&tunnel.remote, "remote")?,
-                ))
+                tunnel = Some((address(local, "local")?, address(remote, "remote")?));
             }
-        };
-        // A PPPoE session on a port or VLAN sub-interface given before it.
-        let pppoe = match &entry.pppoe {
-            None => None,
-            Some(_) if vlan.is_some() || tunnel.is_some() => {
-                return Err(format!(
-                    "{at}: an interface is one of a VLAN, a tunnel and a PPPoE session"
-                ))
-            }
-            Some(session) => {
+            // A PPPoE session on a port or VLAN sub-interface given before it.
+            Kind::Pppoe {
+                parent,
+                session,
+                peer,
+            } => {
                 let Some(parent) = interfaces.iter().find(|i: &&InterfaceConfig| {
-                    i.name == session.parent && i.tunnel.is_none() && i.pppoe.is_none()
+                    i.name == *parent && i.tunnel.is_none() && i.pppoe.is_none()
                 }) else {
                     return Err(format!(
-                        "{at}: PPPoE parent {:?} must be a port or VLAN given before it",
-                        session.parent
+                        "{at}: PPPoE parent {parent:?} must be a port or VLAN given before it"
                     ));
                 };
-                if session.session == 0 || session.session == 0xffff {
+                if *session == 0 || *session == 0xffff {
                     return Err(format!("{at}: PPPoE session must be 1 to 65534"));
                 }
                 let taken = interfaces.iter().any(|i| {
                     i.pppoe
                         .as_ref()
-                        .is_some_and(|(p, id, _)| *p == parent.name && *id == session.session)
+                        .is_some_and(|(p, id, _)| *p == parent.name && id == session)
                 });
                 if taken {
                     return Err(format!(
-                        "{at}: PPPoE session {} on {:?} is given twice",
-                        session.session, parent.name
+                        "{at}: PPPoE session {session} on {:?} is given twice",
+                        parent.name
                     ));
                 }
-                let peer = mac(&session.peer)
+                let peer = mac(peer)
                     .filter(|m| m[0] & 1 == 0 && *m != [0; 6])
                     .ok_or_else(|| format!("{at}: PPPoE peer must be a unicast MAC address"))?;
-                Some((
-                    parent.name.clone(),
-                    session.session,
-                    peer,
-                    parent.mac,
-                    parent.mtu,
-                ))
+                pppoe = Some((parent.name.clone(), *session, peer, parent.mtu));
             }
-        };
-        let mac = match (&entry.mac, &vlan) {
-            (Some(text), _) => {
-                mac(text).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?
-            }
-            (None, Some((_, _, parent_mac))) => *parent_mac,
-            // A tunnel has no link; its MAC address only names it inside the FE.
-            (None, None) if tunnel.is_some() => TUNNEL_MAC,
-            // A session's frames go out with its parent's address.
-            (None, None) if pppoe.is_some() => pppoe.as_ref().map(|p| p.3).unwrap(),
-            (None, None) => return Err(format!("{at}: mac is missing")),
-        };
+        }
+        let mac =
+            mac(&entry.mac).ok_or_else(|| format!("{at}: mac is not like 02:00:00:00:00:01"))?;
         if mac[0] & 1 != 0 || mac == [0; 6] {
             return Err(format!("{at}: mac must be a unicast address"));
         }
-        // A sub-interface's frames carry a 4-byte tag on its parent's link.
-        let max_mtu = vlan
-            .as_ref()
-            .and_then(|(parent, _, _)| interfaces.iter().find(|i| i.name == *parent))
-            .map_or(MAX_MTU, |parent| parent.mtu - 4);
-        // A tunnel's packets carry a 40-byte IPv6 header on the link below.
-        let max_mtu = if tunnel.is_some() {
-            MAX_MTU - 40
-        } else {
-            max_mtu
+        // A sub-interface's frames carry a 4-byte tag on its parent's link, a
+        // tunnel's packets a 40-byte IPv6 header on the link below, and a session's
+        // 8 bytes of PPPoE header on the parent's link.
+        let max_mtu = match (&vlan, &tunnel, &pppoe) {
+            (Some((_, _, parent_mtu)), _, _) => parent_mtu - 4,
+            (_, Some(_), _) => MAX_MTU - 40,
+            (_, _, Some((_, _, _, parent_mtu))) => parent_mtu - 8,
+            _ => MAX_MTU,
         };
-        // A session's packets carry 8 bytes of PPPoE header on the parent's link.
-        let max_mtu = pppoe.as_ref().map_or(max_mtu, |p| p.4 - 8);
-        let mtu = match (entry.mtu, &vlan) {
-            (Some(mtu), _) => mtu,
-            (None, Some(_)) => max_mtu,
-            (None, None) if tunnel.is_some() || pppoe.is_some() => max_mtu,
-            (None, None) => default_mtu(),
-        };
+        let mtu = entry.mtu;
         if !(MIN_MTU..=max_mtu).contains(&mtu) {
             return Err(format!("{at}: mtu must be {MIN_MTU} to {max_mtu}"));
         }
-        let ipv4 = match &entry.ipv4 {
+        let ipv4 = match at_most_one(&at, "ipv4", &entry.ipv4)? {
             Some(text) => {
                 let Some((IpAddr::V4(address), len)) = prefix(text) else {
                     return Err(format!("{at}: ipv4 is not like 192.0.2.1/24"));
@@ -585,15 +313,6 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 }
                 seen.address(&at, &entry.name, address.into(), len)?;
                 Some((address, len))
-            }
-            // A DS-Lite B4 with no address of its own uses the well-known one, so
-            // that it can send ICMP errors into the tunnel.
-            // Only one tunnel of a VRF can have it.
-            None if tunnel.is_some() => {
-                let address = Ipv4Addr::new(192, 0, 0, 2);
-                seen.address(&at, &entry.name, address.into(), 29)
-                    .ok()
-                    .map(|()| (address, 29))
             }
             None => None,
         };
@@ -633,11 +352,14 @@ pub fn parse(text: &str) -> Result<Config, String> {
             vrf: entry.vrf,
             vlan: vlan.map(|(parent, id, _)| (parent, id)),
             tunnel,
-            pppoe: pppoe.map(|(parent, session, peer, _, _)| (parent, session, peer)),
+            pppoe: pppoe.map(|(parent, session, peer, _)| (parent, session, peer)),
         });
     }
     // A MAP-E CE's tunnel is an interface like the others for what follows.
-    let map_e = match file.map_e {
+    if lock.map_e.len() > 1 || lock.nat.len() > 1 {
+        return Err("give at most one map-e and one nat".into());
+    }
+    let map_e = match lock.map_e.into_iter().next() {
         Some(entry) => {
             let (tunnel, mapped, delegated) = map_e(entry, &seen)?;
             let at = format!("map-e interface {:?}", tunnel.name);
@@ -713,9 +435,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ));
         }
     }
-    let mut static_routes = Vec::with_capacity(file.route.len());
+    let mut static_routes = Vec::with_capacity(lock.route.len());
     let mut prefixes = BTreeSet::new();
-    for entry in file.route {
+    for entry in lock.route {
         let at = format!("route {:?}", entry.prefix);
         let (address, len) = prefix(&entry.prefix)
             .ok_or_else(|| format!("{at}: prefix is not like 10.0.0.0/8 or 2001:db8::/32"))?;
@@ -726,32 +448,23 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if !prefixes.insert((entry.vrf.clone(), address, len)) {
             return Err(format!("{at}: given twice in VRF {:?}", entry.vrf));
         }
-        if let Some(action) = &entry.action {
-            let target = match action.as_str() {
-                "discard" => RouteTarget::Discard,
-                "reject" => RouteTarget::Reject,
-                _ => return Err(format!("{at}: action must be \"discard\" or \"reject\"")),
-            };
-            if entry.interface.is_some() || entry.lookup_vrf.is_some() || entry.via.is_some() {
-                return Err(format!(
-                    "{at}: a {action} route has no interface, lookup-vrf or via"
-                ));
+        let (interface, via) = match entry.target {
+            Target::Discard | Target::Reject => {
+                static_routes.push(StaticRoute {
+                    vrf: entry.vrf,
+                    prefix: address,
+                    len,
+                    target: if entry.target == Target::Discard {
+                        RouteTarget::Discard
+                    } else {
+                        RouteTarget::Reject
+                    },
+                });
+                continue;
             }
-            static_routes.push(StaticRoute {
-                vrf: entry.vrf,
-                prefix: address,
-                len,
-                target,
-            });
-            continue;
-        }
-        let interface = match (entry.interface, entry.lookup_vrf) {
-            (None, Some(other)) => {
+            Target::LookupVrf(other) => {
                 if other.is_empty() || other == entry.vrf {
                     return Err(format!("{at}: lookup-vrf must name another VRF"));
-                }
-                if entry.via.is_some() {
-                    return Err(format!("{at}: a lookup-vrf route has no via"));
                 }
                 static_routes.push(StaticRoute {
                     vrf: entry.vrf,
@@ -761,11 +474,9 @@ pub fn parse(text: &str) -> Result<Config, String> {
                 });
                 continue;
             }
-            (Some(interface), None) => interface,
-            _ => {
-                return Err(format!(
-                    "{at}: give one of interface, lookup-vrf and action"
-                ))
+            Target::Forward { interface, via } => {
+                let via = at_most_one(&at, "via", &via)?.cloned();
+                (interface, via)
             }
         };
         if !seen.names.contains(&interface) {
@@ -777,7 +488,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
         if tunnel && address.is_ipv6() {
             return Err(format!("{at}: tunnel {interface:?} carries IPv4 only"));
         }
-        let via = match &entry.via {
+        let via = match &via {
             Some(text) => {
                 let via = text
                     .parse::<IpAddr>()
@@ -828,8 +539,12 @@ pub fn parse(text: &str) -> Result<Config, String> {
             ));
         }
     }
-    let firewall_filtering = filtering("firewall-filtering", file.firewall_filtering.as_deref())?;
-    if let Some(outside) = &file.firewall_outside {
+    let firewall_filtering = filtering("firewall-filtering", &lock.firewall_filtering)?;
+    let firewall_outside = match lock.firewall_outside {
+        FirewallOutside::Derive => None,
+        FirewallOutside::Interfaces(names) => Some(names),
+    };
+    if let Some(outside) = &firewall_outside {
         for name in outside {
             match seen.vrf_of.get(name) {
                 None => return Err(format!("firewall-outside: no interface {name:?}")),
@@ -842,7 +557,7 @@ pub fn parse(text: &str) -> Result<Config, String> {
             }
         }
     }
-    let firewall = file
+    let firewall = lock
         .firewall
         .into_iter()
         .enumerate()
@@ -851,8 +566,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
         .into_iter()
         .flatten()
         .collect();
-    let mut nat = file
+    let mut nat = lock
         .nat
+        .into_iter()
+        .next()
         .map(|entry| nat(entry, &seen, &interfaces))
         .transpose()?;
     if let Some((tunnel, mapped, (delegated, delegated_len))) = map_e {
@@ -887,28 +604,27 @@ pub fn parse(text: &str) -> Result<Config, String> {
             });
         }
     }
-    let icmp_errors = match file.icmp_errors {
-        None => None,
-        Some(entry) => {
-            let at = "icmp-errors";
-            let ipv4 = entry.ipv4_interval_ms.unwrap_or(100);
-            let burst = entry.ipv6_burst.unwrap_or(10);
-            let ipv6 = entry.ipv6_interval_ms.unwrap_or(10);
-            if !(1..=60_000).contains(&ipv4) || !(1..=60_000).contains(&ipv6) {
-                return Err(format!("{at}: intervals must be 1 to 60000 ms"));
-            }
-            if !(1..=10_000).contains(&burst) {
-                return Err(format!("{at}: ipv6-burst must be 1 to 10000"));
-            }
-            Some((ipv4, burst, ipv6))
+    let icmp_errors = {
+        let at = "icmp-errors";
+        let ruster_config::IcmpErrors {
+            ipv4_interval_ms: ipv4,
+            ipv6_burst: burst,
+            ipv6_interval_ms: ipv6,
+        } = lock.icmp_errors;
+        if !(1..=60_000).contains(&ipv4) || !(1..=60_000).contains(&ipv6) {
+            return Err(format!("{at}: intervals must be 1 to 60000 ms"));
         }
+        if !(1..=10_000).contains(&burst) {
+            return Err(format!("{at}: ipv6-burst must be 1 to 10000"));
+        }
+        Some((ipv4, burst, ipv6))
     };
     Ok(Config {
         interfaces,
         static_routes,
         firewall,
         firewall_filtering,
-        firewall_outside: file.firewall_outside,
+        firewall_outside,
         icmp_errors,
         nat,
     })
@@ -916,7 +632,10 @@ pub fn parse(text: &str) -> Result<Config, String> {
 
 /// The MAP-E CE's tunnel interface, its NAT, and the delegated prefix (RFC 7597
 /// sections 5.2 and 6).
-fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Addr, u8)), String> {
+fn map_e(
+    entry: ruster_config::MapE,
+    seen: &Seen,
+) -> Result<(InterfaceConfig, Nat, (Ipv6Addr, u8)), String> {
     let at = "map-e";
     let v6 = |text: &str, what: &str| match prefix(text) {
         Some((IpAddr::V6(address), len)) => Ok((address, len)),
@@ -982,16 +701,13 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
             "{at}: the IPv4 address the prefix gives, {ipv4}, is not a unicast address"
         ));
     }
-    let offset = entry.psid_offset.unwrap_or(6);
+    let offset = entry.psid_offset;
     if !(1..=15).contains(&offset) {
         return Err(format!("{at}: psid-offset must be 1 to 15"));
     }
     let ports = if psid_length == 0 {
-        NatPorts::Range {
-            // Below the kernel's ephemeral ports, as for [nat].
-            first: 1_024,
-            last: 32_767,
-        }
+        let (first, last) = nat_ports(at, &entry.ports)?;
+        NatPorts::Range { first, last }
     } else {
         if offset == 0 || u16::from(offset) + u16::from(psid_length) >= 16 {
             return Err(format!(
@@ -1010,7 +726,7 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
     let upper = upper & !(u128::MAX >> delegated_len);
     let interface_id = (u128::from(u32::from(ipv4)) << 16) | u128::from(psid);
     let local = Ipv6Addr::from(upper | interface_id);
-    let mtu = entry.mtu.unwrap_or(MAX_MTU - 40);
+    let mtu = entry.mtu;
     if !(MIN_MTU..=MAX_MTU - 40).contains(&mtu) {
         return Err(format!("{at}: mtu must be {MIN_MTU} to {}", MAX_MTU - 40));
     }
@@ -1025,9 +741,12 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
         Some(_) => return Err(format!("{at}: inside must be in the default VRF")),
         None => return Err(format!("{at}: no interface {:?}", entry.inside)),
     }
+    let mac = mac(&entry.mac)
+        .filter(|m| m[0] & 1 == 0 && *m != [0; 6])
+        .ok_or_else(|| format!("{at}: mac must be a unicast MAC address"))?;
     let tunnel = InterfaceConfig {
         name: entry.interface.clone(),
-        mac: TUNNEL_MAC,
+        mac,
         mtu,
         enabled: true,
         ipv4: Some((ipv4, 32)),
@@ -1038,10 +757,10 @@ fn map_e(entry: MapEEntry, seen: &Seen) -> Result<(InterfaceConfig, Nat, (Ipv6Ad
         pppoe: None,
     };
     let nat = Nat {
-        filtering: filtering(at, entry.filtering.as_deref())?,
-        ipv4_id_rate_limit: entry.ipv4_id_rate_limit.unwrap_or(true),
-        ports_per_host: entry.ports_per_host.unwrap_or(0),
-        state_per_host: entry.state_per_host.unwrap_or(0),
+        filtering: filtering(at, &entry.filtering)?,
+        ipv4_id_rate_limit: entry.ipv4_id_rate_limit,
+        ports_per_host: entry.ports_per_host,
+        state_per_host: entry.state_per_host,
         inside: entry.inside,
         outside: entry.interface,
         external: None,
@@ -1070,7 +789,21 @@ fn port_range(text: &str) -> Option<(u16, u16)> {
     }
 }
 
-fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<Nat, String> {
+/// The NAT's ports, `"1024-32767"`.
+fn nat_ports(at: &str, text: &str) -> Result<(u16, u16), String> {
+    match port_range(text) {
+        Some((first, last)) if first > 0 => Ok((first, last)),
+        _ => Err(format!(
+            "{at}: ports must be a range such as 1024-65535, not 0"
+        )),
+    }
+}
+
+fn nat(
+    entry: ruster_config::Nat,
+    seen: &Seen,
+    interfaces: &[InterfaceConfig],
+) -> Result<Nat, String> {
     let at = "nat";
     for name in [&entry.inside, &entry.outside] {
         match seen.vrf_of.get(name) {
@@ -1088,20 +821,7 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
             "{at}: inside and outside must be different interfaces"
         ));
     }
-    let (first_port, last_port) = match &entry.ports {
-        // Below Linux's default ephemeral ports (32768-60999), which the router's
-        // own connections use: UDP and TCP to the public address outside the pool
-        // are the router's.
-        None => (1_024, 32_767),
-        Some(text) => match port_range(text) {
-            Some((first, last)) if first > 0 => (first, last),
-            _ => {
-                return Err(format!(
-                    "{at}: ports must be a range such as 1024-65535, not 0"
-                ))
-            }
-        },
-    };
+    let (first_port, last_port) = nat_ports(at, &entry.ports)?;
     let outside_address = interfaces
         .iter()
         .find(|i| i.name == entry.outside)
@@ -1110,7 +830,7 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
     if outside_address.is_none() {
         return Err(format!("{at}: {:?} has no ipv4 address", entry.outside));
     }
-    let external = match &entry.external {
+    let external = match at_most_one(at, "external", &entry.external)? {
         None => None,
         Some(text) => {
             let address: Ipv4Addr = text
@@ -1126,10 +846,10 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
         }
     };
     Ok(Nat {
-        filtering: filtering(at, entry.filtering.as_deref())?,
-        ipv4_id_rate_limit: entry.ipv4_id_rate_limit.unwrap_or(true),
-        ports_per_host: entry.ports_per_host.unwrap_or(0),
-        state_per_host: entry.state_per_host.unwrap_or(0),
+        filtering: filtering(at, &entry.filtering)?,
+        ipv4_id_rate_limit: entry.ipv4_id_rate_limit,
+        ports_per_host: entry.ports_per_host,
+        state_per_host: entry.state_per_host,
         inside: entry.inside,
         outside: entry.outside,
         external,
@@ -1142,7 +862,19 @@ fn nat(entry: NatEntry, seen: &Seen, interfaces: &[InterfaceConfig]) -> Result<N
 
 /// The table rules of one `[[firewall]]` entry: one for its family, or one for each
 /// when neither its addresses nor its protocol says which (IPv4 first).
-fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Vec<FirewallRule>, String> {
+fn firewall_rule(
+    at: &str,
+    entry: ruster_config::FirewallRule,
+    seen: &Seen,
+) -> Result<Vec<FirewallRule>, String> {
+    let one =
+        |what: &str, list: &[String]| at_most_one(at, what, list).map(Option::<&String>::cloned);
+    let ingress = one("ingress", &entry.ingress)?;
+    let egress = one("egress", &entry.egress)?;
+    let source = one("source", &entry.source)?;
+    let destination = one("destination", &entry.destination)?;
+    let source_ports = one("source-ports", &entry.source_ports)?;
+    let destination_ports = one("destination-ports", &entry.destination_ports)?;
     let action = match entry.action.as_str() {
         "accept" => FirewallAction::Accept,
         "drop" => FirewallAction::Drop,
@@ -1159,7 +891,7 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Vec<Fire
             ))
         }
     };
-    for name in [&entry.ingress, &entry.egress].into_iter().flatten() {
+    for name in [&ingress, &egress].into_iter().flatten() {
         // The router itself: its own packets come and go through the default VRF's
         // kernel interface.
         if name == ROUTER_INTERFACE {
@@ -1182,8 +914,8 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Vec<Fire
             _ => Err(format!("{at}: {what} must be a prefix with no host bits")),
         },
     };
-    let source = given(&entry.source, "source")?;
-    let destination = given(&entry.destination, "destination")?;
+    let source = given(&source, "source")?;
+    let destination = given(&destination, "destination")?;
     // The family: the addresses', else the protocol's, else both.
     let families: Vec<bool> = match (source, destination, protocol) {
         (Some((a, _)), Some((b, _)), _) if a.is_ipv6() != b.is_ipv6() => {
@@ -1220,8 +952,8 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Vec<Fire
         port_range(text)
             .ok_or_else(|| format!("{at}: {what} must be a port or a range such as 1024-65535"))
     };
-    let source_ports = ports(&entry.source_ports, "source-ports")?;
-    let destination_ports = ports(&entry.destination_ports, "destination-ports")?;
+    let source_ports = ports(&source_ports, "source-ports")?;
+    let destination_ports = ports(&destination_ports, "destination-ports")?;
     Ok(families
         .into_iter()
         .map(|ipv6| FirewallRule {
@@ -1229,8 +961,8 @@ fn firewall_rule(at: &str, entry: FirewallEntry, seen: &Seen) -> Result<Vec<Fire
             destination: destination.unwrap_or(any(ipv6)),
             source_ports,
             destination_ports,
-            ingress: entry.ingress.clone(),
-            egress: entry.egress.clone(),
+            ingress: ingress.clone(),
+            egress: egress.clone(),
             protocol,
             action,
         })
