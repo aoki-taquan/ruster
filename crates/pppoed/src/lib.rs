@@ -10,6 +10,7 @@
 //! - [`discovery`]: PPPoE Discovery (RFC 2516 section 5).
 //! - [`ppp`]: session frames and control packets.
 //! - [`fsm`]: the option negotiation automaton (RFC 1661 section 4).
+//! - [`lcp`]: LCP options, echo keepalive (RFC 1661, RFC 2516 section 7).
 //!
 //! # Standards
 //!
@@ -17,7 +18,38 @@
 
 pub mod discovery;
 pub mod fsm;
+pub mod lcp;
 pub mod ppp;
 
 /// An Ethernet MAC address.
 pub type Mac = [u8; 6];
+
+/// A small pseudo-random generator (SplitMix64) for Host-Uniq values, magic
+/// numbers and interface identifiers. These must differ between sessions and
+/// restarts, not be secret: the daemon seeds it from the system's random source.
+#[derive(Clone, Debug)]
+pub struct Rng(u64);
+
+impl Rng {
+    pub fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    pub fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// A value that is not zero.
+    pub fn non_zero_u32(&mut self) -> u32 {
+        loop {
+            let value = self.next_u64() as u32;
+            if value != 0 {
+                return value;
+            }
+        }
+    }
+}
