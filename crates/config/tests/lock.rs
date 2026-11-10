@@ -138,7 +138,8 @@ fn the_dhcp_part_reads_back_the_same() {
 }
 
 /// Each key of `value` under `at`, with the types of its values, one line each. The
-/// items of a list are merged.
+/// items of a list are merged. Not seen: the values a string may take (other than the
+/// names of kinds and targets), and the range of an integer.
 fn shape(at: &str, value: &toml::Value, out: &mut std::collections::BTreeSet<String>) {
     match value {
         toml::Value::Table(table) => {
@@ -152,6 +153,10 @@ fn shape(at: &str, value: &toml::Value, out: &mut std::collections::BTreeSet<Str
             for item in items {
                 shape(&format!("{at}[]"), item, out);
             }
+        }
+        // A kind of interface or route target without fields is written as its name.
+        toml::Value::String(name) if at.ends_with(".kind") || at.ends_with(".target") => {
+            out.insert(format!("{at}: string {name:?}"));
         }
         other => {
             out.insert(format!("{at}: {}", other.type_str()));

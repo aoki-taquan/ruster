@@ -44,8 +44,14 @@
 //!    a wait for `ruster confirm` is dropped, and confd writes a warning to the log:
 //!    the router keeps running, on an older configuration, rather than not start.
 //!
-//! If none reads, confd does not start. An older version that does not read is left
-//! out with a line in the log. If the start-up file cannot be kept (a full disk, a
+//! Step 3 can go back far: older versions kept only as a lock form usually do not read
+//! either, so it is often the newest one with a `ruster.toml`. The warning is written
+//! once; the version list shows how the new version came. Going back to the earlier
+//! ruster then starts with the version kept in step 3, not the one that did not read
+//! (`ruster rollback` reaches it).
+//!
+//! If none reads, confd does not start. A version file that does not read at all is
+//! left out with a line in the log. If the start-up file cannot be kept (a full disk, a
 //! directory confd cannot write), confd does not start either.
 
 use std::fmt::Write as _;

@@ -493,7 +493,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x1901_6ecf_ca04_bf0a;
+pub const LOCK_SHAPE: u64 = 0x4f81_7b1d_1dae_7483;
 
 /// The MTU of an interface that names none, and the most the FE takes (frames of
 /// up to 1514 bytes).
