@@ -136,8 +136,8 @@ VXLANのインターフェースはブリッジのメンバーで、一つのVNI
 | 送信元 | ルータのアドレス（IPv4かIPv6）。外側の送信元になり、このアドレス宛てを受ける |
 | 下側のVRF | 外側のパケットを送るVRF（[`tables.md`](tables.md)の「下側のVRF」と同じ） |
 | UDPの宛先ポート | 既定4789（IANA） |
-| VTEPの一覧 | 行ごとに（インターフェース、相手のVTEPのアドレス）。BUMを一つずつ包んで送る相手（head-end replication） |
-| 学ぶか | 内側の送信元MACを、VTEPのアドレスと一緒に学ぶか（既定は学ぶ。BGP EVPNで静的に入れるときは学ばない） |
+| VTEPの一覧 | 行ごとに（インターフェース、相手のVTEPのアドレス）。BUMを一つずつ包んで送る相手（head-end replication）。全体の設定に書く |
+| 学ぶか | 内側の送信元MACを、VTEPのアドレスと一緒に学ぶか（既定は学ぶ） |
 
 ### 送る
 
@@ -296,19 +296,10 @@ TAPのデバイスを一つ置く。
 - TAPのリンクの状態（FEが開いている間だけup）をポートのリンクの状態に合わせるか。合わせればisisdとospfdが
   ポートの切断にすぐ気づく。
 
-## 7. BGP EVPN（未決）
+## 7. BGP EVPN（見送り）
 
-charterはBGP EVPN（RFC 7432、RFC 8365）をFRRで使うと決めた。できるかどうかは別のagentが調べている。
-決まっていないこと:
-
-- zebraとbgpdは、VNIとMACアドレスをkernelのVXLANとbridgeのデバイスから知る。kernelにはTUNとTAPしか
-  無いので、何をkernelに見せるか（kernelにVXLANとbridgeのデバイスを置き、データは流さない、など）。
-- 受けたtype-2（MAC/IP）とtype-3（Inclusive Multicast Ethernet Tag）の経路を、FPMで受けられるか
-  （`dplane_fpm_nl`が近隣とMACの更新を運ぶか）。受けられないなら、どこから読むか。
-- 受けた値を誰がFEへ書くか。MACの静的なエントリとVTEPの一覧の書き手はconfdなので、`ruster-frr`が
-  送り手としてconfdへ渡すか、別の書き手を置くか（「一つの表に書き手は一つ」との兼ね合い）。
-- FEが学んだMACを、bgpdへどう知らせるか（type-2の広告に要る）。
-- ARPとNDの抑制（RFC 7432の10.）をneighdで持つか。
+BGP EVPNは見送る（2026-11-10 owner決定。ルーティングデーモンの見直しと一緒に考え直す）。FRRのFPMは、type-3の
+VTEP、相手の近隣、L2のMACの送り直しを運ばないので、kernelを経路の入口に使う例外が要るため。
 
 ## 8. 作る順番
 
@@ -317,4 +308,3 @@ charterはBGP EVPN（RFC 7432、RFC 8365）をFRRで使うと決めた。でき�
 3. VXLAN（静的なVTEPの一覧）。
 4. IS-ISとOSPFのTAP、`ruster-frr`の`[isis]`、`[ospf]`、`[ospf6]`。
 5. SRv6のローカルのSID（End、End.X、End.DT4、End.DT6）とH.Encaps。
-6. BGP EVPN（調べた結果を見てから）。
