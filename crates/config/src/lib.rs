@@ -40,6 +40,14 @@
 //! ipv4-from = "dhcp-wan"       # optional, instead of ipv4: the source (of kind
 //!                              # dhcp-client) that sends the address
 //!
+//! [[interface]]                # a LAN port numbered from a delegated prefix
+//! name = "lan2"
+//! mac = "02:00:00:00:00:03"
+//! ipv6-from = { source = "dhcp6-wan", subnet = 1 }  # optional: the /64 of subnet
+//!                              # ID 1 in the prefix the source (of kind
+//!                              # dhcpv6-client) has delegated, with the router at
+//!                              # ::1 in it; besides any ipv6 given
+//!
 //! [[interface]]                # a VLAN sub-interface of lan, after lan
 //! name = "lan.10"
 //! parent = "lan"
@@ -269,6 +277,7 @@
 //! ipv4 = ["192.0.2.1/24"]
 //! ipv4-from = []               # none or one source; then ipv4 is empty
 //! ipv6 = []
+//! ipv6-from = []               # none or one: [{ source = "dhcp6-wan", subnet = 1 }]
 //! kind = "port"
 //!
 //! [[interface]]
@@ -280,6 +289,7 @@
 //! ipv4 = []
 //! ipv4-from = []
 //! ipv6 = []
+//! ipv6-from = []
 //!
 //! [interface.kind.vlan]        # or [interface.kind.tunnel] with local and remote,
 //! parent = "lan"               # [interface.kind.pppoe] with parent and source
@@ -363,7 +373,7 @@
 //! dns = []
 //! dns-lifetime = 1800
 //! prefix-from = []             # the sources whose delegated prefixes it advertises
-//!                              # too (a WAN DHCPv6 client); none can be given yet
+//!                              # too: the interface's ipv6-from source
 //!
 //! [[ra.prefix]]                # the interface's /64s, from its addresses
 //! prefix = "2001:db8:1::/64"
@@ -676,7 +686,18 @@ pub struct Interface {
     /// interface has, instead of `ipv4`.
     pub ipv4_from: Vec<String>,
     pub ipv6: Vec<String>,
+    /// None or one: a /64 of a delegated prefix, besides `ipv6`.
+    pub ipv6_from: Vec<Ipv6From>,
     pub kind: Kind,
+}
+
+/// An interface's /64 from the prefix a source (of kind `dhcpv6-client`) has
+/// delegated: subnet ID `subnet`, with the router's address ::1 in it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Ipv6From {
+    pub source: String,
+    pub subnet: u32,
 }
 
 /// What an interface is.

@@ -59,6 +59,9 @@
 //!   is at most the parent's less 8.
 //! - RFC 2131: an interface with `ipv4-from` (a port or VLAN) has the IPv4 address
 //!   its source, a DHCP client of kind dhcp-client (one interface each), leased.
+//! - RFC 8415 section 6.3 and RFC 7084 L-2: an interface with `ipv6-from` is
+//!   numbered from the prefix delegated to its source (of kind dhcpv6-client)
+//!   ([`crate::delegated`]).
 //! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
 //!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
@@ -327,6 +330,43 @@ pub fn config(lock: Lock) -> Result<Config, String> {
             }
             None => None,
         };
+        let ipv6_from = match entry.ipv6_from.as_slice() {
+            [] => None,
+            [from] => {
+                if tunnel.is_some() || pppoe.is_some() {
+                    return Err(format!("{at}: only a port or VLAN takes ipv6-from"));
+                }
+                if !sources
+                    .iter()
+                    .any(|s| s.name == from.source && s.kind == crate::source::Kind::Dhcpv6Client)
+                {
+                    return Err(format!(
+                        "{at}: ipv6-from {:?} must be a source of kind dhcpv6-client",
+                        from.source
+                    ));
+                }
+                if mtu < IPV6_MIN_MTU {
+                    return Err(format!(
+                        "{at}: mtu must be at least {IPV6_MIN_MTU} on an interface with ipv6-from"
+                    ));
+                }
+                // Subnet IDs of a /48 are 16 bits; a shorter prefix's that do not fit
+                // a /64 are refused at run time.
+                if from.subnet > u32::from(u16::MAX) {
+                    return Err(format!("{at}: ipv6-from subnet must be 0 to 65535"));
+                }
+                if interfaces.iter().any(|i: &InterfaceConfig| {
+                    i.ipv6_from.as_ref() == Some(&(from.source.clone(), from.subnet))
+                }) {
+                    return Err(format!(
+                        "{at}: subnet {} of {:?} is another interface's",
+                        from.subnet, from.source
+                    ));
+                }
+                Some((from.source.clone(), from.subnet))
+            }
+            _ => return Err(format!("{at}: ipv6-from takes at most one value")),
+        };
         let ipv4_from = match at_most_one(&at, "ipv4-from", &entry.ipv4_from)? {
             None => None,
             Some(_) if ipv4.is_some() => {
@@ -393,6 +433,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
             tunnel,
             pppoe: pppoe.map(|(parent, source, _)| (parent, source)),
             ipv4_from,
+            ipv6_from,
         });
     }
     // A MAP-E CE's tunnel is an interface like the others for what follows.
@@ -1014,6 +1055,7 @@ fn map_e(
         tunnel: Some((local, br)),
         pppoe: None,
         ipv4_from: None,
+        ipv6_from: None,
     };
     let nat = Nat {
         filtering: filtering(at, &entry.filtering)?,

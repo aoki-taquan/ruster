@@ -151,6 +151,7 @@ struct InterfaceEntry {
     ipv4_from: Option<String>,
     #[serde(default)]
     ipv6: Vec<String>,
+    ipv6_from: Option<crate::Ipv6From>,
     vrf: Option<String>,
     tunnel: Option<TunnelEntry>,
     pppoe: Option<PppoeEntry>,
@@ -313,6 +314,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
             ipv4,
             ipv4_from: entry.ipv4_from.into_iter().collect(),
             ipv6: entry.ipv6,
+            ipv6_from: entry.ipv6_from.into_iter().collect(),
             kind,
         });
     }

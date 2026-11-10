@@ -44,6 +44,7 @@ fn config() -> Config {
                 tunnel: None,
                 pppoe: None,
                 ipv4_from: None,
+                ipv6_from: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -57,6 +58,7 @@ fn config() -> Config {
                 tunnel: None,
                 pppoe: None,
                 ipv4_from: None,
+                ipv6_from: None,
             },
         ],
         static_routes: vec![StaticRoute {
