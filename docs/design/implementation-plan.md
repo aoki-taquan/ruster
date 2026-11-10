@@ -159,7 +159,7 @@ confdの`pppoe`の部分（`[[pppoe]]`）から受け取り、得た値は送り
 
 次はL2のブリッジ、L2を運ぶトンネル、SRv6、IS-ISとOSPF（2026-11-10 charterに追加。設計は
 [`overlay.md`](overlay.md)）。順番はその「作る順番」のとおり: ブリッジとIRB、EtherIP、VXLAN、IS-ISとOSPFのTAP、
-SRv6、BGP EVPN（調べた結果を見てから）。
+SRv6。BGP EVPNは見送り（2026-11-10 owner決定）。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
 外れている点として、それぞれのモジュールの`# Standards`に書く。
