@@ -1,10 +1,15 @@
 //! IPv6 Neighbor Discovery messages: reading and checking them, and building the
-//! Neighbor Solicitations and Advertisements neighd sends.
+//! Neighbor Solicitations and Advertisements neighd sends (its Router
+//! Advertisements are built in `ra.rs`).
 //!
 //! # Standards
 //!
 //! - RFC 4861 section 4.3 and 4.4: the Neighbor Solicitation and Advertisement
-//!   formats; section 4.6.1: the Source and Target Link-Layer Address options.
+//!   formats; section 4.1: the Router Solicitation format; section 4.6.1: the
+//!   Source and Target Link-Layer Address options.
+//! - RFC 4861 section 6.1.1: the checks on a received Router Solicitation (Hop
+//!   Limit 255, valid ICMP checksum, code 0, length at least 8, no option of length
+//!   0, no Source Link-Layer Address option from the unspecified address).
 //! - RFC 4861 sections 7.1.1 and 7.1.2: the checks on a received message (Hop Limit
 //!   255, valid ICMP checksum, code 0, length at least 24, target not multicast, no
 //!   option of length 0, an unspecified source only to a solicited-node group and
@@ -20,6 +25,7 @@ const ETHERNET_HEADER: usize = 14;
 const IPV6_HEADER: usize = 40;
 const ICMPV6: u8 = 58;
 const ND_HOP_LIMIT: u8 = 255;
+pub const ROUTER_SOLICITATION: u8 = 133;
 pub const NEIGHBOR_SOLICITATION: u8 = 135;
 pub const NEIGHBOR_ADVERTISEMENT: u8 = 136;
 const OPTION_SOURCE_LINK_LAYER: u8 = 1;
@@ -40,6 +46,9 @@ pub struct Message {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    RouterSolicitation {
+        source_link_layer: Option<[u8; 6]>,
+    },
     Solicitation {
         target: Ipv6Addr,
         source_link_layer: Option<[u8; 6]>,
@@ -55,7 +64,7 @@ pub enum Kind {
 /// Why a frame was not a usable Neighbor Discovery message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refused {
-    /// Router Solicitation and Advertisement, Redirect: not neighd's.
+    /// Router Advertisement and Redirect: not neighd's.
     NotForNeighd,
     Invalid,
 }
@@ -67,7 +76,7 @@ fn address(bytes: &[u8]) -> Ipv6Addr {
 }
 
 /// The ICMPv6 checksum of `icmp` between `source` and `destination`.
-fn checksum(source: Ipv6Addr, destination: Ipv6Addr, icmp: &[u8]) -> u16 {
+pub(crate) fn checksum(source: Ipv6Addr, destination: Ipv6Addr, icmp: &[u8]) -> u16 {
     let mut sum: u32 = 0;
     let mut add = |bytes: &[u8]| {
         for pair in bytes.chunks(2) {
@@ -102,25 +111,32 @@ pub fn parse(frame: &[u8]) -> Result<Message, Refused> {
         return Err(Refused::Invalid);
     }
     let kind = icmp[0];
-    if kind != NEIGHBOR_SOLICITATION && kind != NEIGHBOR_ADVERTISEMENT {
-        return Err(Refused::NotForNeighd);
-    }
+    // The fixed part before the options.
+    let fixed = match kind {
+        ROUTER_SOLICITATION => 8,
+        NEIGHBOR_SOLICITATION | NEIGHBOR_ADVERTISEMENT => 24,
+        _ => return Err(Refused::NotForNeighd),
+    };
     let source = address(&frame[ip + 8..]);
     let destination = address(&frame[ip + 24..]);
     if frame[ip + 7] != ND_HOP_LIMIT
-        || icmp.len() < 24
+        || icmp.len() < fixed
         || icmp[1] != 0
         || checksum(source, destination, icmp) != 0
     {
         return Err(Refused::Invalid);
     }
-    let target = address(&icmp[8..]);
+    let target = if kind == ROUTER_SOLICITATION {
+        Ipv6Addr::UNSPECIFIED
+    } else {
+        address(&icmp[8..])
+    };
     if target.is_multicast() {
         return Err(Refused::Invalid);
     }
     let mut source_link_layer = None;
     let mut target_link_layer = None;
-    let mut options = &icmp[24..];
+    let mut options = &icmp[fixed..];
     while !options.is_empty() {
         let (Some(&option), Some(&units)) = (options.first(), options.get(1)) else {
             return Err(Refused::Invalid);
@@ -142,7 +158,12 @@ pub fn parse(frame: &[u8]) -> Result<Message, Refused> {
     }
     let mut source_mac = [0; 6];
     source_mac.copy_from_slice(&frame[6..12]);
-    let kind = if kind == NEIGHBOR_SOLICITATION {
+    let kind = if kind == ROUTER_SOLICITATION {
+        if source.is_unspecified() && source_link_layer.is_some() {
+            return Err(Refused::Invalid);
+        }
+        Kind::RouterSolicitation { source_link_layer }
+    } else if kind == NEIGHBOR_SOLICITATION {
         if source.is_unspecified()
             && (!is_solicited_node(destination) || source_link_layer.is_some())
         {
@@ -192,7 +213,7 @@ pub fn multicast_mac(group: Ipv6Addr) -> [u8; 6] {
     [0x33, 0x33, o[12], o[13], o[14], o[15]]
 }
 
-fn frame(
+pub(crate) fn frame(
     destination_mac: [u8; 6],
     source_mac: [u8; 6],
     source: Ipv6Addr,
@@ -306,6 +327,63 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A Router Solicitation from `source` to all routers, with the link-layer
+    /// option when `mac` is given.
+    fn router_solicitation(source: Ipv6Addr, mac: Option<[u8; 6]>) -> Vec<u8> {
+        let mut icmp = vec![ROUTER_SOLICITATION, 0, 0, 0, 0, 0, 0, 0];
+        if let Some(mac) = mac {
+            icmp.extend_from_slice(&[OPTION_SOURCE_LINK_LAYER, 1]);
+            icmp.extend_from_slice(&mac);
+        }
+        let all_routers = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
+        frame(
+            multicast_mac(all_routers),
+            [2; 6],
+            source,
+            all_routers,
+            icmp,
+        )
+    }
+
+    #[test]
+    fn router_solicitations_are_read_and_checked() {
+        let host: Ipv6Addr = "fe80::2".parse().unwrap();
+        let rs = parse(&router_solicitation(host, Some([2; 6]))).unwrap();
+        assert_eq!(rs.source, host);
+        assert_eq!(
+            rs.kind,
+            Kind::RouterSolicitation {
+                source_link_layer: Some([2; 6])
+            }
+        );
+        let bare = parse(&router_solicitation(Ipv6Addr::UNSPECIFIED, None)).unwrap();
+        assert_eq!(
+            bare.kind,
+            Kind::RouterSolicitation {
+                source_link_layer: None
+            }
+        );
+        // From the unspecified address with a link-layer address: invalid.
+        assert_eq!(
+            parse(&router_solicitation(Ipv6Addr::UNSPECIFIED, Some([2; 6]))),
+            Err(Refused::Invalid)
+        );
+        let good = router_solicitation(host, Some([2; 6]));
+        let mut hop = good.clone();
+        hop[21] = 64;
+        let mut sum = good.clone();
+        sum[57] ^= 1;
+        let mut zero_option = good.clone();
+        zero_option[14 + 40 + 9] = 0;
+        for bad in [hop, sum, zero_option, good[..14 + 40 + 7].to_vec()] {
+            assert_eq!(parse(&bad), Err(Refused::Invalid));
+        }
+        // A Router Advertisement is not neighd's to read.
+        let mut ra = good;
+        ra[54] = 134;
+        assert_eq!(parse(&ra), Err(Refused::NotForNeighd));
     }
 
     #[test]
