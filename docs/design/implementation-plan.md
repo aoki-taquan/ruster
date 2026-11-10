@@ -165,8 +165,11 @@ VLANのサブインターフェース。EtherIPも済んだ（core `overlay.rs`�
 `etherip`。外側はIPv4とIPv6、相手もrusterで確かめた）。VXLANも済んだ（静的なVTEPの一覧。confd `vxlan.rs`、
 fe `vxlan`の試験、netns `vxlan`。相手はLinuxのvxlanのデバイスで確かめた）。メンバーのNICはFEが他のMAC宛てのフレームも受けられるようにする（vethでは要らない。
 実際のNICでFEがpromiscuousにするのはまだ）。MACの表をFEの状態のsocketで見せるのもまだ（今は数をログに出すだけ）。
+IS-ISとOSPFのTAPも済んだ（`[isis]`、`[ospf]`、`[ospf6]`、confd `isis_ospf.rs`と`kernel.rs`、fe `tap.rs`、
+`ruster-frr`の`isis_ospf.rs`、netns `isis`と`ospf`）。TAPのリンクの状態をポートに合わせるのはまだ（overlay.mdの6.）。
 
-今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
+今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信
+（IS-ISとOSPFがTAPで受けるものを除く）。
 外れている点として、それぞれのモジュールの`# Standards`に書く。
 
 ## 気をつけること
