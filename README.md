@@ -69,7 +69,7 @@ FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don
 cargo build --workspace --locked
 ```
 
-confdが読む設定ファイルはTOMLです。
+confdが読む設定ファイルはTOMLです。書き方の全体は`crates/config`の説明にあります。
 
 ```toml
 [[interface]]
@@ -122,6 +122,7 @@ CEのプロセスが落ちている間も、FEは持っている表で転送を�
 
 ```bash
 ruster check router.toml                     # confdと同じ読み方で設定ファイルを確かめる
+ruster resolve router.toml                   # 既定値を全部埋めた形（lockの形）を表示する
 ruster apply router.toml                     # 確かめてから、動いているconfdの設定を置き換える
 ruster show                                  # FEが持っている表を全部表示する
 ruster route add --source routed 203.0.113.0/24 dev wan via 198.51.100.1
@@ -175,6 +176,7 @@ cargo test --doc --workspace --all-features --locked
 | `fe` | FE（`ruster-fe`） |
 | `confd`、`ribd`、`neighd` | CEのプロセス |
 | `cli` | `ruster`コマンド |
+| `config` | 設定の書き方（`ruster.toml`と、既定値を全部埋めたlockの形）と、その解決 |
 | `proto` | プロセス間のメッセージ（CBOR、CoAPの枠組み、表、接続、起動まわり） |
 | `core` | パケットの検証と転送の判断。packet bufferは借りるだけで、割り当てをしない |
 | `io-afpacket`、`io-xdp`、`io-xdp-native`、`io-sim` | FEのI/O層（AF_PACKET、AF_XDP、試験用のsim） |

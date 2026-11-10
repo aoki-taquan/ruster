@@ -1,18 +1,128 @@
-//! The router's configuration in the lock form.
+//! The router's configuration in its two forms, `ruster.toml` and the lock form.
 //!
-//! The lock form spells out every parameter; nothing in it is optional, and it
-//! carries a format version. [`parse_lock`] reads it and [`Lock::to_text`] writes
-//! it. The processes are to take this form only and hold no defaults.
+//! `ruster.toml` is what people write: it may leave out a value that has a default
+//! or that follows from other settings. The lock form spells out every parameter;
+//! nothing in it is optional, and it carries a format version. [`resolve`] turns
+//! the first into the second, [`parse_lock`] reads the lock form and
+//! [`Lock::to_text`] writes it. The processes take the lock form only and hold no
+//! defaults: those are all here.
 //!
-//! It holds the defaults and the values that follow from the configuration alone
-//! (a VLAN's MTU from its parent's). What depends on values found at run time (the
-//! firewall's outside from the default routes, MAP-E's address from the delegated
-//! prefix) is still worked out by the process.
+//! The lock form holds the defaults and the values that follow from the
+//! configuration alone (a VLAN's MTU from its parent's). What depends on values
+//! found at run time (the firewall's outside from the default routes, MAP-E's
+//! address from the delegated prefix) is still worked out by the process.
+//!
+//! # `ruster.toml`
+//!
+//! ```toml
+//! firewall-filtering = "endpoint-independent"  # optional: who outside
+//!                              # may reach an inside host's UDP or TCP port that has a
+//!                              # flow out, where no rule decides; the default, or
+//!                              # "address-dependent", "address-and-port-dependent".
+//!                              # Outside are NAT's outside and the interfaces of the
+//!                              # default routes; inside, the other interfaces
+//! firewall-outside = ["wan"]   # optional: the outside interfaces, when
+//!                              # those are not right (a default route from a routing
+//!                              # daemon, say)
+//!
+//! [[interface]]
+//! name = "lan"                 # the FE port (the Linux device name)
+//! mac = "02:00:00:00:00:01"
+//! mtu = 1500                   # optional, 1500 when left out
+//! enabled = true               # optional, true when left out
+//! ipv4 = "192.0.2.1/24"        # optional
+//! ipv6 = ["2001:db8:1::1/64"]  # optional; a link-local address is added by itself
+//! vrf = "red"                  # optional, "default" when left out
+//!
+//! [[interface]]                # a VLAN sub-interface of lan, after lan
+//! name = "lan.10"
+//! parent = "lan"
+//! vlan = 10                    # 1 to 4094
+//! ipv4 = "10.10.0.1/24"        # mac is lan's and mtu lan's less 4 when left out
+//!
+//! [[interface]]                # an IPv4 in IPv6 tunnel (DS-Lite softwire)
+//! name = "dslite"
+//! tunnel = { local = "2001:db8:1::2", remote = "2001:db8:ff::1" }
+//! ipv4 = "192.0.0.2/29"        # optional; this, the B4's address, when left out
+//! # mtu is 1460 and mac 02:00:00:00:00:fe when left out
+//!
+//! [[interface]]                # a PPPoE session (set up by a daemon outside ruster)
+//! name = "ppp"
+//! pppoe = { parent = "lan", session = 4660, peer = "02:00:00:00:00:ac" }
+//! ipv4 = "198.51.100.2/32"     # optional
+//! # mac is the parent's and mtu its less 8 when left out
+//!
+//! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
+//! interface = "map"            # the tunnel interface it makes
+//! inside = "lan"               # the NAT's inside
+//! prefix = "2001:db8:12:3400::/56"  # the delegated (end-user) IPv6 prefix
+//! rule-ipv6 = "2001:db8::/40"  # the Basic Mapping Rule
+//! rule-ipv4 = "192.0.2.0/24"
+//! ea-length = 16
+//! psid-offset = 6              # optional, 6 when left out
+//! br = "2001:db8:ffff::1"
+//! mtu = 1460                   # optional, 1460 when left out
+//! filtering = "endpoint-independent"  # optional, as for [nat]
+//!
+//! [[route]]
+//! prefix = "0.0.0.0/0"         # or an IPv6 prefix such as "::/0"
+//! interface = "wan"
+//! via = "198.51.100.1"         # optional; left out for an on-link route
+//! vrf = "default"              # optional; the interface may be in another VRF
+//!
+//! [[route]]                    # look the destination up again in another VRF
+//! vrf = "red"
+//! prefix = "0.0.0.0/0"
+//! lookup-vrf = "default"
+//!
+//! [[route]]                    # drop the prefix's packets (a longer route still wins)
+//! prefix = "10.0.0.0/8"
+//! action = "discard"           # silently; "reject": with a Destination Unreachable
+//!
+//! [[firewall]]                 # forward rules of the default VRF, first match wins
+//! action = "accept"            # or "drop"; an accepted flow's replies pass too
+//! protocol = "udp"             # "tcp", "udp", "icmp" (IPv4) or "icmpv6" (IPv6)
+//! ingress = "lan"              # optional, any interface when left out (and then
+//!                              # also what other VRFs look up in this one);
+//!                              # "rt-default" is the router itself: as ingress its own
+//!                              # packets, as egress the packets to it (SSH, ping, ...)
+//! egress = "wan"               # optional
+//! source = "192.0.2.0/24"      # optional, any address when left out; IPv4 or IPv6
+//! destination = "0.0.0.0/0"    # optional, of the source's family
+//! # A tcp or udp rule with neither source nor destination is for IPv4 and IPv6.
+//! source-ports = "1024-65535"  # optional, tcp and udp only; any when left out
+//! destination-ports = "53"     # optional
+//!
+//! [icmp-errors]                # optional: the rate limits of the ICMP errors the
+//! ipv4-interval-ms = 100       # router sends: one per this per egress and kind
+//! ipv6-burst = 10              # (RFC 1812 4.3.2.8), and for ICMPv6 this many at
+//! ipv6-interval-ms = 10        # once and one more every this (RFC 4443 2.4(f));
+//!                              # these when left out
+//!
+//! [nat]                        # NAPT of the default VRF
+//! inside = "lan"
+//! outside = "wan"              # must have an ipv4 address: the public one
+//! ports = "1024-32767"         # optional, 1024-32767 when left out
+//! external = "198.51.100.2"    # optional; for now only the outside's own address
+//! filtering = "endpoint-independent"  # optional, the default, or
+//!                              # "address-dependent", "address-and-port-dependent"
+//! ipv4-id-rate-limit = true    # optional, the default: datagrams that may be
+//!                              # fragmented are dropped above the rate at which
+//!                              # their IPv4 IDs stay unique for 120 s (about 550
+//!                              # a second to one destination, shared by the LAN);
+//!                              # false lets them go (also in [map-e])
+//! ports-per-host = 0           # optional: the most public ports one LAN host
+//!                              # holds for each of UDP, TCP and ICMP; 0 for none
+//! state-per-host = 0           # optional: the most TCP sessions, and outside
+//!                              # endpoints of its UDP (not with endpoint-
+//!                              # independent filtering) and ICMP, of one LAN host
+//!                              # (both also in [map-e]; setting or lowering one
+//!                              # drops every NAT flow)
+//! ```
 //!
 //! # The lock form
 //!
-//! The settings of confd's configuration file (`ruster_confd::file`) with every
-//! key given. A value there may be none or one of
+//! The same settings with every key given. A value there may be none or one of
 //! is a list (`ipv4 = []`, `via = ["198.51.100.1"]`, `nat = []`); an empty list
 //! means there is none, and for a firewall match, that it matches anything. An
 //! interface's `kind` and a route's `target` say what it is.
@@ -94,11 +204,52 @@
 //!
 //! - RFC 6243: the lock form is the configuration with its defaults reported, as
 //!   `report-all` does. Deviation: it is TOML, not a YANG instance.
+//! - RFC 8529 (`ietf-network-instance`): an interface or route with no VRF is in
+//!   `default`.
+//! - RFC 6333 section 5.7: a DS-Lite tunnel with no IPv4 address gets the B4's,
+//!   192.0.0.2/29, if no earlier interface of its VRF has that address or its
+//!   prefix (so only the first such tunnel of a VRF gets it).
+//! - RFC 4787 REQ-8 and RFC 5382 REQ-3: NAT and the firewall filter
+//!   endpoint-independently by default.
+
+mod resolve;
 
 use serde::{Deserialize, Serialize};
 
+pub use resolve::resolve;
+
 /// The lock form's version that this ruster reads and writes.
 pub const VERSION: u32 = 1;
+
+/// The MTU of an interface that names none, and the most the FE takes (frames of
+/// up to 1514 bytes).
+pub const MTU: u16 = 1_500;
+/// What a VLAN tag takes from the parent's MTU.
+pub const VLAN_OVERHEAD: u16 = 4;
+/// What the PPPoE header takes from the parent's MTU (RFC 2516).
+pub const PPPOE_OVERHEAD: u16 = 8;
+/// What the outer IPv6 header takes from a tunnel's MTU.
+pub const TUNNEL_OVERHEAD: u16 = 40;
+/// The MTU of a tunnel or MAP-E that names none.
+pub const TUNNEL_MTU: u16 = MTU - TUNNEL_OVERHEAD;
+/// The MAC address of a tunnel that names none; it only names the tunnel inside
+/// the FE.
+pub const TUNNEL_MAC: &str = "02:00:00:00:00:fe";
+/// A DS-Lite B4's address when it has none of its own (RFC 6333 section 5.7).
+pub const B4_ADDRESS: &str = "192.0.0.2/29";
+/// The NAT's ports: below Linux's default ephemeral ports (32768-60999), which the
+/// router's own connections use.
+pub const NAT_PORTS: &str = "1024-32767";
+/// NAT's and the firewall's filtering.
+pub const FILTERING: &str = "endpoint-independent";
+/// MAP-E's PSID offset (RFC 7597 section 5.1).
+pub const PSID_OFFSET: u8 = 6;
+/// The ICMP error rate limits: IPv4's interval, and ICMPv6's burst and interval.
+pub const ICMP_ERRORS: IcmpErrors = IcmpErrors {
+    ipv4_interval_ms: 100,
+    ipv6_burst: 10,
+    ipv6_interval_ms: 10,
+};
 
 /// The configuration with every parameter given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

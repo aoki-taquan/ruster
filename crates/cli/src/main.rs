@@ -2,6 +2,7 @@
 //!
 //! ```text
 //! ruster check FILE                       check a configuration file as confd reads it
+//! ruster resolve FILE                     print a ruster.toml in the lock form
 //! ruster [--run-dir DIR] apply FILE       check it, then make it confd's configuration
 //! ruster [--run-dir DIR] show             print every table the FE holds
 //! ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
@@ -33,6 +34,7 @@ const WAIT: Duration = Duration::from_secs(5);
 
 const USAGE: &str = "usage:
   ruster check FILE
+  ruster resolve FILE
   ruster [--run-dir DIR] apply FILE
   ruster [--run-dir DIR] show
   ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
@@ -221,6 +223,19 @@ fn check(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Prints the lock form of a `ruster.toml` (or of a lock form, which is then
+/// checked).
+fn resolve(path: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let lock = if ruster_config::is_lock(&text).map_err(|e| format!("{path}: {e}"))? {
+        ruster_config::parse_lock(&text)
+    } else {
+        ruster_config::resolve(&text)
+    };
+    print!("{}", lock.map_err(|e| format!("{path}: {e}"))?.to_text());
+    Ok(())
+}
+
 fn apply(run_dir: &Path, path: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     ruster_confd::file::parse(&text).map_err(|e| format!("{path}: {e}"))?;
@@ -245,6 +260,7 @@ fn run() -> Result<(), String> {
     match rest.split_first() {
         Some((command, args)) => match (command.as_str(), args) {
             ("check", [file]) => check(file),
+            ("resolve", [file]) => resolve(file),
             ("apply", [file]) => apply(&run_dir, file),
             ("show", []) => show(&run_dir),
             ("route", args) => route(&run_dir, args),

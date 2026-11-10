@@ -5,7 +5,8 @@ use ruster_config::{parse_lock, FirewallOutside, Kind, Target};
 /// The lock form example in the crate's documentation.
 fn example() -> String {
     let source = include_str!("../src/lib.rs");
-    let block = source.split("//! ```toml\n").nth(1).unwrap();
+    // The second block; the first is `ruster.toml`'s.
+    let block = source.split("//! ```toml\n").nth(2).unwrap();
     block
         .lines()
         .take_while(|line| *line != "//! ```")
