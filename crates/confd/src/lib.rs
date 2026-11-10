@@ -991,7 +991,9 @@ impl Task for Confd {
             self.values_changed += 1;
             self.current = delegated::with_delegated(&self.config, &self.sources);
             self.send_tables();
-            self.parts.send(&self.current, self.generation);
+            // Generation 0: a refusal of a part the values changed is not the
+            // refusal of a configuration `ruster apply` waits on.
+            self.parts.send(&self.current, 0);
         }
         if waiting && !self.sources.waiting() {
             for peer in [&mut self.fe, &mut self.ribd, &mut self.neighd]

@@ -114,7 +114,8 @@ fn the_lan_takes_its_64_and_advertises_it_while_the_prefix_lasts() {
     assert!(advertised.on_link && advertised.autonomous);
     assert_eq!(
         (advertised.preferred_lifetime, advertised.valid_lifetime),
-        (3_600, 7_200)
+        (2_700, 5_400),
+        "RFC 9096's caps"
     );
     // The value runs out: the address and the advertised prefix go.
     run(&mut confd, &mut source, &mut neighd, &mut parts, 70_000);

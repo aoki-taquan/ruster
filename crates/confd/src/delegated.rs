@@ -17,14 +17,18 @@
 //! - RFC 8415 section 6.3 and RFC 7084 L-2: the router numbers its LAN links from
 //!   the delegated prefix, a /64 each (RFC 4291 section 2.5.1, RFC 4862 section
 //!   5.5.3 for SLAAC).
-//! - RFC 9096 section 3 (recommendation 1): the advertised prefix's preferred and
-//!   valid lifetimes are at most the delegated prefix's.
+//! - RFC 9096 section 3: the advertised prefix's preferred and valid lifetimes are
+//!   at most the delegated prefix's, and at most ND_PREFERRED_LIMIT (2700 s) and
+//!   ND_VALID_LIMIT (5400 s).
 //!
 //! Deviations: the router's address is ::1 of the /64, not one made from the MAC
 //! (EUI-64), so it does not change with the hardware. The lifetimes advertised
 //! are those the delegating router gave at the last renewal, not counted down
 //! (they are refreshed at each renewal, which comes well before they run out). A
 //! prefix longer than /64, or one with no room for the subnet ID, numbers nothing.
+//! A prefix that went away is no longer advertised, rather than advertised with a
+//! preferred lifetime of 0 for a while (RFC 9096 section 3, which updates RFC 7084
+//! L-13).
 //! The derived address is not checked against the other interfaces' prefixes.
 
 use std::net::{IpAddr, Ipv6Addr};
@@ -33,6 +37,10 @@ use ruster_config::RaPrefix;
 
 use crate::source::Sources;
 use crate::Config;
+
+/// RFC 9096 section 3's caps on an advertised prefix's lifetimes, in seconds.
+pub const ND_PREFERRED_LIMIT: u32 = 2_700;
+pub const ND_VALID_LIMIT: u32 = 5_400;
 
 /// The /64 of subnet ID `subnet` in `prefix/len`, if there is room for it.
 pub fn subnet(prefix: Ipv6Addr, len: u8, subnet: u32) -> Option<Ipv6Addr> {
@@ -74,8 +82,8 @@ pub(crate) fn with_delegated(base: &Config, sources: &Sources) -> Config {
                     prefix: text,
                     on_link: true,
                     autonomous: true,
-                    valid_lifetime: valid,
-                    preferred_lifetime: preferred.min(valid),
+                    valid_lifetime: valid.min(ND_VALID_LIMIT),
+                    preferred_lifetime: preferred.min(valid).min(ND_PREFERRED_LIMIT),
                 });
             }
         }
