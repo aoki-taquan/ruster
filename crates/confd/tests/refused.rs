@@ -53,6 +53,7 @@ fn config(mtu: u16) -> Config {
         firewall_outside: None,
         icmp_errors: None,
         nat: None,
+        dns: None,
     }
 }
 

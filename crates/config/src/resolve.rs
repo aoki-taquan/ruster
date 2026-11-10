@@ -1,16 +1,16 @@
 //! `ruster.toml` to the lock form.
 
 use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use serde::Deserialize;
 
 use ruster_proto::table::DEFAULT_VRF;
 
 use crate::{
-    FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Target, B4_ADDRESS,
-    FILTERING, ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_OVERHEAD, PSID_OFFSET, TUNNEL_MAC, TUNNEL_MTU,
-    VERSION, VLAN_OVERHEAD,
+    Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Target,
+    B4_ADDRESS, FILTERING, ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_OVERHEAD, PSID_OFFSET, TUNNEL_MAC,
+    TUNNEL_MTU, VERSION, VLAN_OVERHEAD,
 };
 
 #[derive(Deserialize)]
@@ -27,6 +27,15 @@ struct File {
     icmp_errors: Option<IcmpErrorsEntry>,
     nat: Option<NatEntry>,
     map_e: Option<MapEEntry>,
+    dns: Option<DnsEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DnsEntry {
+    #[serde(default)]
+    upstream: Vec<String>,
+    listen: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -304,6 +313,10 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         ports_per_host: entry.ports_per_host.unwrap_or(0),
         state_per_host: entry.state_per_host.unwrap_or(0),
     });
+    let dns = file
+        .dns
+        .map(|entry| dns(entry, &interfaces, nat.as_ref(), map_e.as_ref()))
+        .transpose()?;
     Ok(Lock {
         version: VERSION,
         firewall_filtering: filtering(file.firewall_filtering),
@@ -317,7 +330,85 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         nat: nat.into_iter().collect(),
         route,
         firewall,
+        dns: dns.into_iter().collect(),
     })
+}
+
+/// `[dns]`: the addresses and prefixes of the interfaces it listens on.
+fn dns(
+    entry: DnsEntry,
+    interfaces: &[Interface],
+    nat: Option<&Nat>,
+    map_e: Option<&MapE>,
+) -> Result<Dns, String> {
+    let names = match entry.listen {
+        Some(names) => names,
+        None => {
+            let inside: Vec<String> = nat
+                .map(|nat| nat.inside.clone())
+                .into_iter()
+                .chain(map_e.map(|map_e| map_e.inside.clone()))
+                .collect();
+            if inside.is_empty() {
+                return Err(
+                    "dns: give listen; there is no [nat] or [map-e] inside to answer on".into(),
+                );
+            }
+            inside
+        }
+    };
+    let mut listen = Vec::new();
+    let mut allow = Vec::new();
+    for name in &names {
+        let at = format!("dns: listen {name:?}");
+        let interface = interfaces
+            .iter()
+            .find(|i| i.name == *name)
+            .ok_or_else(|| format!("{at}: no such interface"))?;
+        if interface.vrf != DEFAULT_VRF {
+            return Err(format!("{at}: the interface must be in the default VRF"));
+        }
+        let before = listen.len();
+        for text in interface.ipv4.iter().chain(&interface.ipv6) {
+            let (address, network) = address_and_network(text)
+                .ok_or_else(|| format!("{at}: {text:?} is not an address and prefix length"))?;
+            if matches!(address, IpAddr::V6(a) if a.is_unicast_link_local()) {
+                continue;
+            }
+            listen.push(address.to_string());
+            if !allow.contains(&network) {
+                allow.push(network);
+            }
+        }
+        if listen.len() == before {
+            return Err(format!("{at}: the interface has no address to answer on"));
+        }
+    }
+    Ok(Dns {
+        listen,
+        allow,
+        upstream: entry.upstream,
+        upstream_from: Vec::new(),
+    })
+}
+
+/// `address/len` as the address and its network as `network/len`.
+fn address_and_network(text: &str) -> Option<(IpAddr, String)> {
+    let (address, len) = text.split_once('/')?;
+    let address: IpAddr = address.parse().ok()?;
+    let len: u8 = len.parse().ok()?;
+    let network = match address {
+        IpAddr::V4(a) if len <= 32 => {
+            let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+            IpAddr::from(Ipv4Addr::from(u32::from(a) & mask))
+        }
+        IpAddr::V6(a) if len <= 128 => {
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            IpAddr::from(std::net::Ipv6Addr::from(u128::from(a) & mask))
+        }
+        _ => return None,
+    };
+    Some((address, format!("{network}/{len}")))
 }
 
 fn route(entry: RouteEntry) -> Result<Route, String> {

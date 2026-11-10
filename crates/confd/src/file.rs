@@ -619,6 +619,15 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         }
         Some((ipv4, burst, ipv6))
     };
+    if lock.dns.len() > 1 {
+        return Err("give at most one dns".into());
+    }
+    let dns = lock
+        .dns
+        .into_iter()
+        .next()
+        .map(|entry| dns(entry, &seen))
+        .transpose()?;
     Ok(Config {
         interfaces,
         static_routes,
@@ -627,7 +636,49 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         firewall_outside,
         icmp_errors,
         nat,
+        dns,
     })
+}
+
+/// Checks `dns`: it answers on the router's own addresses in the default VRF.
+fn dns(entry: ruster_config::Dns, seen: &Seen) -> Result<ruster_config::Dns, String> {
+    let at = "dns";
+    if entry.listen.is_empty() {
+        return Err(format!("{at}: listen needs at least one address"));
+    }
+    for text in &entry.listen {
+        let ours = text
+            .parse::<IpAddr>()
+            .is_ok_and(|a| seen.addresses.contains(&(DEFAULT_VRF.to_owned(), a)));
+        if !ours {
+            return Err(format!(
+                "{at}: listen {text:?} must be an address of an interface in the default VRF"
+            ));
+        }
+    }
+    for text in &entry.allow {
+        match prefix(text) {
+            Some((address, len)) if network(address, len) == address => {}
+            _ => {
+                return Err(format!(
+                    "{at}: allow {text:?} must be a prefix like 192.0.2.0/24, with no bits after its length"
+                ))
+            }
+        }
+    }
+    for text in &entry.upstream {
+        let usable = text.parse::<IpAddr>().is_ok_and(|a| match a {
+            IpAddr::V4(v) => unicast_v4(v),
+            IpAddr::V6(v) => unicast_v6(v),
+        });
+        if !usable {
+            return Err(format!("{at}: upstream {text:?} must be a unicast address"));
+        }
+    }
+    if !entry.upstream_from.is_empty() {
+        return Err(format!("{at}: upstream-from cannot name a source yet"));
+    }
+    Ok(entry)
 }
 
 /// The MAP-E CE's tunnel interface, its NAT, and the delegated prefix (RFC 7597

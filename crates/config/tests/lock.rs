@@ -36,6 +36,8 @@ fn the_documented_example_is_read() {
         }
     );
     assert_eq!(lock.firewall[0].destination_ports, ["53"]);
+    assert_eq!(lock.dns[0].listen, ["192.0.2.1"]);
+    assert!(lock.dns[0].upstream_from.is_empty());
 }
 
 #[test]

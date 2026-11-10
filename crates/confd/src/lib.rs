@@ -93,6 +93,8 @@ pub struct Config {
     pub icmp_errors: Option<(u32, u32, u32)>,
     /// The default VRF's NAPT.
     pub nat: Option<ruster_proto::table::Nat>,
+    /// The DNS server for the LAN, checked; confd hands it to `ruster-unbound`.
+    pub dns: Option<ruster_config::Dns>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -760,6 +762,7 @@ mod tests {
             firewall_outside: None,
             icmp_errors: None,
             nat: None,
+            dns: None,
         });
         let routes = confd.routes();
         let connected = Value::Route(RouteAction::Forward(vec![NextHop {
@@ -812,6 +815,7 @@ mod tests {
             firewall_outside: None,
             icmp_errors: None,
             nat: None,
+            dns: None,
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
         let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);
