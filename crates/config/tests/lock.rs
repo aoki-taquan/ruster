@@ -41,6 +41,7 @@ fn the_documented_example_is_read() {
     assert_eq!(lock.dhcp[0].pool, "192.0.2.100-192.0.2.199");
     assert_eq!(lock.source[0].kind, "pppoe");
     assert_eq!(lock.source[0].sync_wait, 10);
+    assert_eq!(lock.pppoe[0].parent, "lan");
 }
 
 #[test]

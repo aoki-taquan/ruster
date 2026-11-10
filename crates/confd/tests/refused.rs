@@ -57,6 +57,7 @@ fn config(mtu: u16) -> Config {
         dhcp: Vec::new(),
         ra: Vec::new(),
         sources: Vec::new(),
+        pppoe: Vec::new(),
     }
 }
 
