@@ -4,6 +4,8 @@
 //! ruster check FILE                       check a configuration file as confd reads it
 //! ruster resolve FILE                     print a ruster.toml in the lock form
 //! ruster [--run-dir DIR] apply FILE       check it, then make it confd's configuration
+//! ruster [--run-dir DIR] versions         list the versions confd keeps, newest first
+//! ruster [--run-dir DIR] rollback N       make version N the configuration again
 //! ruster [--run-dir DIR] show             print every table the FE holds
 //! ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
 //! ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
@@ -12,7 +14,10 @@
 //!
 //! `apply` sends the file to confd, which sends what changed to the FE, ribd and neighd
 //! and answers once they have answered. If one of them refuses, confd puts the
-//! configuration it had before back ([`ruster_confd::apply`]).
+//! configuration it had before back ([`ruster_confd::apply`]). Otherwise confd keeps it
+//! as the next version ([`ruster_confd::versions`]). `rollback N` goes the same way
+//! with version N's configuration, which becomes a new version: the versions between
+//! stay.
 //!
 //! `route` writes to ribd as the route source NAME, the way a routing daemon does
 //! (ribd must have been started with that source). ribd picks between sources by
@@ -42,6 +47,8 @@ const USAGE: &str = "usage:
   ruster check FILE
   ruster resolve FILE
   ruster [--run-dir DIR] apply FILE
+  ruster [--run-dir DIR] versions
+  ruster [--run-dir DIR] rollback N
   ruster [--run-dir DIR] show
   ruster [--run-dir DIR] route add --source NAME [--vrf VRF] PREFIX dev IFACE [via ADDR]
   ruster [--run-dir DIR] route del --source NAME [--vrf VRF] PREFIX
@@ -347,19 +354,49 @@ fn resolve(path: &str) -> Result<(), String> {
 fn apply(run_dir: &Path, path: &str) -> Result<(), String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     ruster_confd::file::parse(&text).map_err(|e| format!("{path}: {e}"))?;
+    commit(run_dir, path, &["config"], text.as_bytes())
+}
+
+/// Makes version `number` the latest version again.
+fn rollback(run_dir: &Path, number: &str) -> Result<(), String> {
+    let number: u64 = number
+        .parse()
+        .map_err(|_| format!("{number}: not a version number"))?;
+    commit(
+        run_dir,
+        &format!("version {number}"),
+        &["rollback", &number.to_string()],
+        &[],
+    )
+}
+
+/// Asks confd to put a configuration in use and says how it went; `what` names it.
+fn commit(run_dir: &Path, what: &str, path: &[&str], payload: &[u8]) -> Result<(), String> {
     let socket = run_dir.join(socket::CONFD_CONFIG);
-    let (code, payload) = request(&socket, |c| Ok(c.post(&["config"], text.as_bytes())))?;
+    let (code, payload) = request(&socket, |c| Ok(c.post(path, payload)))?;
     let said = String::from_utf8_lossy(&payload);
     match code.class() {
         2 => {}
-        4 => return Err(format!("{path}: not applied: {said}")),
+        4 => return Err(format!("{what}: not applied: {said}")),
         // A timeout leaves the new configuration in confd; the text says so.
-        _ => return Err(format!("{path}: {said}")),
+        _ => return Err(format!("{what}: {said}")),
     }
-    println!("{path}: applied");
+    println!("{what}: applied");
     if !said.is_empty() {
         println!("{said}");
     }
+    Ok(())
+}
+
+/// Lists the versions confd keeps, newest first.
+fn versions(run_dir: &Path) -> Result<(), String> {
+    let socket = run_dir.join(socket::CONFD_CONFIG);
+    let (code, payload) = request(&socket, |c| Ok(c.get(&["versions"])))?;
+    let said = String::from_utf8_lossy(&payload);
+    if code != Code::CONTENT {
+        return Err(format!("versions: confd answered {code:?} {said}"));
+    }
+    print!("{said}");
     Ok(())
 }
 
@@ -370,6 +407,8 @@ fn run() -> Result<(), String> {
             ("check", [file]) => check(file),
             ("resolve", [file]) => resolve(file),
             ("apply", [file]) => apply(&run_dir, file),
+            ("versions", []) => versions(&run_dir),
+            ("rollback", [number]) => rollback(&run_dir, number),
             ("show", []) => show(&run_dir),
             ("route", args) => route(&run_dir, args),
             ("source", args) => source(&run_dir, args),
