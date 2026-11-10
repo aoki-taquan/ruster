@@ -49,8 +49,8 @@
 //! supported 32-bit ABI is checked independently.
 //!
 //! The AP0 profile is deliberately narrow: `SOCK_RAW` Ethernet II,
-//! `PACKET_RESERVE` of [`TPACKET_V3_RESERVE`] (64), `TPACKET3_HDRLEN == 68`, RX
-//! `tp_mac == 146`, and `tp_net == 160`. RX alone may set retire timeout, private bytes, and
+//! `PACKET_RESERVE` of [`TPACKET_V3_RESERVE`] (192), `TPACKET3_HDRLEN == 68`, RX
+//! `tp_mac == 274`, and `tp_net == 288`. RX alone may set retire timeout, private bytes, and
 //! `TP_FT_REQ_FILL_RXHASH`; all three corresponding TX request fields must be
 //! zero. RX block-private geometry uses the kernel's checked eight-byte
 //! `BLK_PLUS_PRIV` alignment and rejects configurations that cannot hold the

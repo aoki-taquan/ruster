@@ -484,8 +484,8 @@ mod tests {
         PacketDescriptor {
             packet_offset: 64,
             next_offset: 144,
-            mac_offset: 146,
-            net_offset: 160,
+            mac_offset: 274,
+            net_offset: 288,
             snap_len: 60,
             wire_len: 60,
             is_last: false,

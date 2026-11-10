@@ -119,7 +119,7 @@ const FIRST_PACKET: usize = 64;
 const MAX_FRAME: usize = 1_514;
 const TX_FRAME: usize = 4_096;
 const TX_DATA: usize = 48;
-const MAC: usize = 146;
+const MAC: usize = 274;
 const FIRST_FD: RawFd = 100;
 pub(super) const LAN_PORT: usize = 0;
 pub(super) const WAN_PORT: usize = 1;
@@ -375,7 +375,7 @@ impl PortView {
                 raw_write_u32(header + 16, length);
                 raw_write_u32(header + 20, TP_STATUS_USER);
                 raw_write_u16(header + 24, mac);
-                raw_write_u16(header + 26, 160);
+                raw_write_u16(header + 26, 288);
                 raw_write_bytes(header + MAC, payload);
             }
             offset += total;

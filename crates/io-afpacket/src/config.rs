@@ -10,9 +10,10 @@ pub const TPACKET_BLOCK_HEADER_LEN: usize = 48;
 pub const TPACKET_V3_HDRLEN: usize = 68;
 /// Room asked of the kernel (`PACKET_RESERVE`) between the RX TPACKET_V3 header and
 /// the frame, so that the forwarding path can put headers in front of a frame in
-/// place: an IPv6 header for MAP-E and DS-Lite (40 bytes), PPPoE (8) and a VLAN tag (4).
-/// A multiple of 16 keeps the network header 16-byte aligned.
-pub const TPACKET_V3_RESERVE: usize = 64;
+/// place: an IPv6 header and an SRv6 Segment Routing Header of up to 8 segments
+/// (40 + 8 + 128 bytes), PPPoE (8) and a VLAN tag (4); 188 in all. A multiple of 16
+/// keeps the network header 16-byte aligned.
+pub const TPACKET_V3_RESERVE: usize = 192;
 pub const TPACKET_V3_ETHERNET_MAC_OFFSET: usize = 82 + TPACKET_V3_RESERVE;
 pub const TPACKET_V3_ETHERNET_NETWORK_OFFSET: usize = 96 + TPACKET_V3_RESERVE;
 pub const TPACKET_V3_TX_DATA_OFFSET: usize = 48;

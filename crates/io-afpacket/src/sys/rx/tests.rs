@@ -21,7 +21,7 @@ const COMBINED_LEN: usize = RX_LEN + 4_096;
 const FIRST_PACKET: usize = 64;
 /// Small enough that one 4 KiB block holds a maximum frame, one byte over it, and
 /// five short frames, each behind the reserved headroom.
-const MAX_FRAME: usize = 1_200;
+const MAX_FRAME: usize = 880;
 const UNLIMITED: RxBudget = RxBudget {
     packets: usize::MAX,
     block_status_reads: usize::MAX,
@@ -168,7 +168,7 @@ impl Fixture {
         let start = block * BLOCK_SIZE;
         let mut offset = FIRST_PACKET;
         for (index, packet) in packets.iter().enumerate() {
-            let total = (146 + packet.payload.len()).next_multiple_of(8);
+            let total = (274 + packet.payload.len()).next_multiple_of(8);
             let next = if index + 1 == packets.len() {
                 0
             } else {
@@ -183,10 +183,10 @@ impl Fixture {
             self.write_u32(header + 16, packet.wire_len.unwrap_or(snap));
             self.write_u32(header + 20, packet.status);
             self.write_u16(header + 24, packet.mac_offset);
-            self.write_u16(header + 26, 160);
+            self.write_u16(header + 26, 288);
             self.write_u32(header + 32, packet.vlan.0);
             self.write_u16(header + 36, packet.vlan.1);
-            self.write(header + 146, packet.payload);
+            self.write(header + 274, packet.payload);
             offset += total;
         }
         self.write_u32(start, 2);
@@ -201,7 +201,7 @@ impl Fixture {
     }
 
     fn data_address(&self, block: usize, packet_offset: usize) -> usize {
-        self.base.as_ptr() as usize + block * BLOCK_SIZE + packet_offset + 146
+        self.base.as_ptr() as usize + block * BLOCK_SIZE + packet_offset + 274
     }
 }
 
@@ -247,7 +247,7 @@ const fn packet(payload: &[u8]) -> Packet<'_> {
         payload,
         snap_len: None,
         wire_len: None,
-        mac_offset: 146,
+        mac_offset: 274,
         next_offset: None,
         status: TP_STATUS_USER,
         vlan: (0, 0),
@@ -523,7 +523,7 @@ fn rx_live_lease_blocks_return_until_release_and_returns_exactly_once() {
         assert_eq!(report.abandoned_leaks, 0);
         assert_eq!(report.blocks_returned, 1);
     }
-    assert_eq!(raw_u8(base, FIRST_PACKET + 146), 0xee, "zero-copy mutation");
+    assert_eq!(raw_u8(base, FIRST_PACKET + 274), 0xee, "zero-copy mutation");
 
     // The returned packet's token is stale: no second completion or return.
     let mut report = RxBatchReport::default();
@@ -744,9 +744,9 @@ fn rx_local_packet_faults_are_terminal_once_and_siblings_are_delivered() {
     }
     let report = batch.finish();
     let last_offset = FIRST_PACKET
-        + (146_usize + 60).next_multiple_of(8) * 4
-        + (146 + MAX_FRAME + 1).next_multiple_of(8)
-        + (146 + MAX_FRAME).next_multiple_of(8);
+        + (274_usize + 60).next_multiple_of(8) * 4
+        + (274 + MAX_FRAME + 1).next_multiple_of(8)
+        + (274 + MAX_FRAME).next_multiple_of(8);
     assert_eq!(
         events,
         [
@@ -789,7 +789,7 @@ fn rx_local_packet_faults_are_terminal_once_and_siblings_are_delivered() {
                 6,
                 Some(RxPacketFault::Descriptor(
                     GeometryError::PacketDataOutOfBounds {
-                        offset: last_offset + 146,
+                        offset: last_offset + 274,
                         length: 4_000,
                     }
                 )),
@@ -797,7 +797,7 @@ fn rx_local_packet_faults_are_terminal_once_and_siblings_are_delivered() {
             ),
         ]
     );
-    assert!(last_offset + 146 + 4_000 > block_len);
+    assert!(last_offset + 274 + 4_000 > block_len);
     assert_eq!(
         returned,
         [RxBlockReturn {
@@ -1199,7 +1199,7 @@ fn rx_injected_mapping_failures_halt_retry_and_count_once() {
         expect_fault(batch.next()),
         RxFault::Packet {
             token: token(0, 1, 0),
-            fault: RxPacketFault::Mapping(injected(FIRST_PACKET + 146, 60)),
+            fault: RxPacketFault::Mapping(injected(FIRST_PACKET + 274, 60)),
             returned: None,
         }
     );
