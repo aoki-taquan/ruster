@@ -17,7 +17,10 @@
 //! sends what leaves a bridge's own interface (IRB) to the member its destination
 //! was learned on ([`ruster_core::Bridges`]). The frames it floods are copied out and
 //! sent here after the batch, out of every other member; so are the frames the
-//! control processes, ICMP errors and fragments send out of an IRB.
+//! control processes, ICMP errors and fragments send out of an IRB. A member that is
+//! an EtherIP interface ([`ruster_core::Overlay`]) gets those frames wrapped here too,
+//! with the outer header core makes; a frame that does not fit once wrapped is
+//! dropped and counted.
 //!
 //! # Standards
 //!
@@ -79,6 +82,7 @@ pub mod writers {
         sid::BRIDGE,
         sid::BRIDGE_PORT,
         sid::BRIDGE_MAC,
+        sid::ETHERIP,
     ];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
@@ -155,6 +159,11 @@ pub struct FeCounters {
     pub bridge_flooded: u64,
     pub bridge_flood_dropped: u64,
     pub bridge_dropped: u64,
+    /// Frames bridged to an overlay (EtherIP) that were dropped because they do not
+    /// fit the underlying interface's MTU once wrapped, and those dropped for any
+    /// other reason (no route toward the remote end, say).
+    pub overlay_too_big: u64,
+    pub overlay_dropped: u64,
 }
 
 pub struct Fe<B> {
@@ -172,6 +181,8 @@ pub struct Fe<B> {
     interface_names: Vec<String>,
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
+    /// The bridge members that carry frames inside IP.
+    overlays: Vec<ruster_core::Overlay>,
     unreachable: Vec<(IfId, ruster_core::Ipv4Address)>,
     pppoe: Vec<ruster_core::PppoeSession>,
     /// Each VRF's kernel interface, in the order of `vrfs`.
@@ -257,6 +268,7 @@ where
             interface_names: built.interface_names,
             vlans: built.vlans,
             tunnels: built.tunnels,
+            overlays: built.overlays,
             unreachable: built.unreachable,
             pppoe: built.pppoe,
             kernel: built.kernel,
@@ -417,6 +429,7 @@ where
             .with_vrfs(&snapshots, &self.by_ingress)
             .with_vlans(&self.vlans)
             .with_tunnels(&self.tunnels)
+            .with_overlays(&self.overlays)
             .with_pppoe(&self.pppoe)
             .with_kernel_ingress(&self.kernel)
             .with_punt_frames(&self.punt_frames)
@@ -476,6 +489,8 @@ where
         self.counters.forwarded += report.tx_requested as u64;
         self.counters.dropped += report.dropped as u64;
         self.counters.arp_to_control_dropped += trace.overflow;
+        self.counters.overlay_too_big += trace.overlay_too_big;
+        self.counters.overlay_dropped += trace.overlay_dropped;
         self.counters.from_kernel_dropped += from_kernel.dropped;
         for (egress, frame) in from_kernel.to_kernel {
             let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
@@ -611,26 +626,41 @@ where
     /// Sends each frame the bridges flooded in the last batch out of every member of
     /// its bridge but the one it came in on.
     fn send_flood(&mut self) {
-        let Self {
-            io, bridges, vlans, ..
-        } = self;
+        if self.bridges.flood().is_empty() {
+            return;
+        }
+        let mut trace = FeTrace::default();
         let mut failed = Vec::new();
-        for frame in bridges.flood() {
-            let mut dropped = 0;
-            for &member in bridges.members(frame.bridge) {
-                if Some(member) != frame.from && !send_member(io, vlans, member, frame.bytes()) {
-                    dropped += 1;
+        {
+            let mut members = Members::of(self, &mut trace);
+            for frame in members.bridges.flood() {
+                let mut dropped = 0;
+                for &member in members.bridges.members(frame.bridge) {
+                    if Some(member) != frame.from && !members.send(member, frame.bytes()) {
+                        dropped += 1;
+                    }
+                }
+                if dropped > 0 {
+                    failed.push((frame.bridge, dropped));
                 }
             }
-            if dropped > 0 {
-                failed.push((frame.bridge, dropped));
-            }
         }
-        bridges.clear_flood();
+        self.bridges.clear_flood();
         for (bridge, dropped) in failed {
             for _ in 0..dropped {
-                bridges.table.count_flood_dropped(bridge);
+                self.bridges.table.count_flood_dropped(bridge);
             }
+        }
+        self.after_members(trace);
+    }
+
+    /// Counts what sending to the members dropped, and asks for the next hops
+    /// toward an overlay's remote end that were missing.
+    fn after_members(&mut self, trace: FeTrace) {
+        self.counters.overlay_too_big += trace.overlay_too_big;
+        self.counters.overlay_dropped += trace.overlay_dropped;
+        for (egress, target) in trace.misses {
+            self.resolve_request(egress, target, self.now_ms);
         }
     }
 
@@ -920,27 +950,31 @@ where
             let Some(destination) = frame.get(..6).and_then(|d| <[u8; 6]>::try_from(d).ok()) else {
                 return false;
             };
-            let Self {
-                io,
-                bridges,
-                vlans,
-                now_ms,
-                ..
-            } = self;
-            if let Some(member) = bridges.table.send(bridge, &destination, *now_ms) {
-                bridges.table.count_forwarded(bridge);
-                return send_member(io, vlans, member, frame);
-            }
+            let now_ms = self.now_ms;
+            let known = self.bridges.table.send(bridge, &destination, now_ms);
+            let mut trace = FeTrace::default();
             let mut sent = false;
             let mut dropped = 0;
-            for &member in bridges.members(bridge) {
-                if send_member(io, vlans, member, frame) {
-                    sent = true;
+            {
+                let mut members = Members::of(self, &mut trace);
+                if let Some(member) = known {
+                    sent = members.send(member, frame);
                 } else {
-                    dropped += 1;
+                    for &member in members.bridges.members(bridge) {
+                        if members.send(member, frame) {
+                            sent = true;
+                        } else {
+                            dropped += 1;
+                        }
+                    }
                 }
             }
-            bridges.table.count_flood(bridge, dropped);
+            if known.is_some() {
+                self.bridges.table.count_forwarded(bridge);
+            } else {
+                self.bridges.table.count_flood(bridge, dropped);
+            }
+            self.after_members(trace);
             return sent;
         }
         send_member(&mut self.io, &self.vlans, egress, frame)
@@ -960,11 +994,80 @@ fn send_member<B: GeneratedPacketIo>(
     egress: IfId,
     frame: &[u8],
 ) -> bool {
+    send_parts(io, vlans, egress, frame, &[])
+}
+
+/// Sends `head` and `body`, one frame, out of `egress`, a port or a VLAN
+/// sub-interface.
+fn send_parts<B: GeneratedPacketIo>(
+    io: &mut B,
+    vlans: &[VlanBinding],
+    egress: IfId,
+    head: &[u8],
+    body: &[u8],
+) -> bool {
     let (port, tag) = match vlans.iter().find(|b| b.sub == egress) {
         Some(binding) => (binding.parent, Some(binding.vid)),
         None => (egress, None),
     };
-    send_on_port(io, port, tag, frame)
+    send_on_port_parts(io, port, tag, head, body)
+}
+
+/// Where the frames of bridge members go: out of ports and VLAN sub-interfaces, or
+/// wrapped for an overlay and routed by the default VRF.
+struct Members<'f, 't, B> {
+    io: &'f mut B,
+    vlans: &'f [VlanBinding],
+    bridges: &'f ruster_core::Bridges,
+    outer: ruster_core::ForwardingSnapshot<'f>,
+    trace: &'t mut FeTrace,
+}
+
+impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
+    fn of(fe: &'f mut Fe<B>, trace: &'t mut FeTrace) -> Self {
+        let Fe {
+            io,
+            vlans,
+            bridges,
+            vrfs,
+            tunnels,
+            overlays,
+            pppoe,
+            unreachable,
+            ..
+        } = fe;
+        let outer = vrfs[0]
+            .owner
+            .snapshot()
+            .with_ipv6(&vrfs[0].ipv6)
+            .with_tunnels(tunnels)
+            .with_pppoe(pppoe)
+            .with_overlays(overlays)
+            .with_unreachable_neighbors(unreachable);
+        Self {
+            io,
+            vlans,
+            bridges,
+            outer,
+            trace,
+        }
+    }
+
+    /// Sends `frame` out of `member`.
+    fn send(&mut self, member: IfId, frame: &[u8]) -> bool {
+        let bridges = self.bridges;
+        let irb = |id: IfId| bridges.irb_of(id).is_some();
+        match self.outer.overlay_header(member, frame, irb, self.trace) {
+            None => send_member(self.io, self.vlans, member, frame),
+            Some(Ok(header)) => {
+                send_parts(self.io, self.vlans, header.egress, header.bytes(), frame)
+            }
+            Some(Err(reason)) => {
+                self.trace.overlay_drop(reason);
+                false
+            }
+        }
+    }
 }
 
 /// Sends `frame` out of port `port` as it is, with VLAN tag `tag` put in.
@@ -974,25 +1077,42 @@ fn send_on_port<B: GeneratedPacketIo>(
     tag: Option<u16>,
     frame: &[u8],
 ) -> bool {
+    send_on_port_parts(io, port, tag, frame, &[])
+}
+
+/// Sends `head` and `body`, one frame, out of port `port`, with VLAN tag `tag`
+/// put in.
+fn send_on_port_parts<B: GeneratedPacketIo>(
+    io: &mut B,
+    port: IfId,
+    tag: Option<u16>,
+    head: &[u8],
+    body: &[u8],
+) -> bool {
     // An all-zero destination is what core puts on a frame to be wrapped (a
     // tunnel's, a session's): one that was not wrapped never leaves a port.
-    if frame.len() < ETHERNET_HEADER || frame[..6] == [0; 6] {
+    if head.len() < ETHERNET_HEADER || head[..6] == [0; 6] {
         return false;
     }
     let extra = if tag.is_some() { 4 } else { 0 };
     let mut batch = io.begin_generated(port);
-    let sent = match batch.allocate(frame.len() + extra) {
+    let sent = match batch.allocate(head.len() + body.len() + extra) {
         Ok(mut lease) => {
             let bytes = lease.bytes_mut();
-            match tag {
+            let rest = match tag {
                 Some(vid) => {
-                    bytes[..12].copy_from_slice(&frame[..12]);
+                    bytes[..12].copy_from_slice(&head[..12]);
                     bytes[12..14].copy_from_slice(&[0x81, 0x00]);
                     bytes[14..16].copy_from_slice(&(vid & 0x0fff).to_be_bytes());
-                    bytes[16..].copy_from_slice(&frame[12..]);
+                    bytes[16..4 + head.len()].copy_from_slice(&head[12..]);
+                    4 + head.len()
                 }
-                None => bytes.copy_from_slice(frame),
-            }
+                None => {
+                    bytes[..head.len()].copy_from_slice(head);
+                    head.len()
+                }
+            };
+            bytes[rest..].copy_from_slice(body);
             lease.commit();
             true
         }
@@ -1076,6 +1196,7 @@ where
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;
             self.tunnels = built.tunnels;
+            self.overlays = built.overlays;
             self.unreachable = built.unreachable;
             self.pppoe = built.pppoe;
             self.kernel = built.kernel;
@@ -1231,6 +1352,10 @@ struct FeTrace {
     /// Next hops packets went to in this batch (the neighbors' "used" marks).
     used: std::collections::HashSet<(u16, IpAddr)>,
     overflow: u64,
+    /// Frames bridged to an overlay dropped for their length, and for any other
+    /// reason.
+    overlay_too_big: u64,
+    overlay_dropped: u64,
 }
 
 impl TraceSink for FeTrace {
@@ -1271,12 +1396,28 @@ impl TraceSink for FeTrace {
             TraceEvent::Ipv6NeighborMissing { egress, target } => {
                 self.miss(egress, IpAddr::V6(target.into()));
             }
+            TraceEvent::Dropped { reason, .. } => self.overlay_drop(reason),
             _ => {}
         }
     }
 }
 
 impl FeTrace {
+    /// Counts a frame bridged to an overlay that was dropped (any other drop is
+    /// left alone).
+    fn overlay_drop(&mut self, reason: ruster_core::DropReason) {
+        use ruster_core::DropReason::{
+            OverlayMtuExceeded, OverlayNoRoom, OverlayNoRoute, OverlayUnderlayUnsupported,
+        };
+        match reason {
+            OverlayMtuExceeded => self.overlay_too_big += 1,
+            OverlayNoRoom | OverlayNoRoute | OverlayUnderlayUnsupported => {
+                self.overlay_dropped += 1;
+            }
+            _ => {}
+        }
+    }
+
     fn miss(&mut self, egress: IfId, target: IpAddr) {
         let miss = (egress, target);
         if self.misses.len() < EVENTS_PER_BATCH && !self.misses.contains(&miss) {

@@ -583,6 +583,24 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-if-tunnel:etherip",
+        "sid": 60270,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-tunnel:etherip/local",
+        "sid": 60271,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-if-tunnel:etherip/remote",
+        "sid": 60272,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"

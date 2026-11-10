@@ -1471,3 +1471,57 @@ fn bridge_entries_round_trip_and_are_checked() {
         assert!(change.validate().is_err(), "{change:?}");
     }
 }
+
+#[test]
+fn etherip_entries_round_trip_and_are_checked() {
+    let ip = |a: &str| a.parse::<std::net::IpAddr>().unwrap();
+    let entries = [
+        Change::set(
+            Key::EtherIp {
+                interface: "eip0".into(),
+            },
+            Value::EtherIp {
+                local: ip("192.0.2.1"),
+                remote: ip("198.51.100.2"),
+            },
+        ),
+        Change::set(
+            Key::EtherIp {
+                interface: "eip1".into(),
+            },
+            Value::EtherIp {
+                local: ip("2001:db8::1"),
+                remote: ip("2001:db8:1::2"),
+            },
+        ),
+        Change::delete(Key::EtherIp {
+            interface: "eip0".into(),
+        }),
+    ];
+    for change in &entries {
+        assert_eq!(&round_trip(change), change);
+    }
+    assert_eq!(
+        entry_line(&entries[0].key, entries[0].value.as_ref().unwrap()).unwrap(),
+        "etherip eip0 192.0.2.1 to 198.51.100.2"
+    );
+    let bad = [
+        ("192.0.2.1", "2001:db8::2"),
+        ("0.0.0.0", "192.0.2.2"),
+        ("192.0.2.1", "224.0.0.1"),
+        ("192.0.2.1", "192.0.2.1"),
+        ("2001:db8::1", "::1"),
+    ];
+    for (local, remote) in bad {
+        let change = Change::set(
+            Key::EtherIp {
+                interface: "eip0".into(),
+            },
+            Value::EtherIp {
+                local: ip(local),
+                remote: ip(remote),
+            },
+        );
+        assert!(change.validate().is_err(), "{change:?}");
+    }
+}
