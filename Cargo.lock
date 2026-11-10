@@ -141,6 +141,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruster-kea"
+version = "0.2.0"
+
+[[package]]
 name = "ruster-neighd"
 version = "0.2.0"
 dependencies = [

@@ -12,6 +12,7 @@ members = [
     "crates/io-sim",
     "crates/io-xdp",
     "crates/io-xdp-native",
+    "crates/kea",
     "crates/neighd",
     "crates/pppoed",
     "crates/proto",
