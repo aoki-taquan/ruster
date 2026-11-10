@@ -73,6 +73,10 @@ pub(crate) struct Built {
     pub(crate) nat: Option<Nat>,
     /// The classes of the punt table.
     pub(crate) punt: crate::punt_table::Classes,
+    /// The bridges by name, in name order, and the static entries of their MAC
+    /// address tables (bridge index, address, member).
+    pub(crate) bridges: Vec<(String, ruster_core::BridgeConfig)>,
+    pub(crate) bridge_statics: Vec<(u16, [u8; 6], IfId)>,
 }
 
 /// NAPT from `inside` to `outside`, with `public` and `ports`.
@@ -432,6 +436,84 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
     }
+    // Each bridge's own interface (IRB) is the interface of its name; its members
+    // are enabled ports and VLAN sub-interfaces.
+    let mut bridges: Vec<(String, ruster_core::BridgeConfig)> = Vec::new();
+    for (key, value) in store.iter() {
+        if let (
+            Key::Bridge { name },
+            Value::Bridge {
+                aging_s,
+                max_learned,
+            },
+        ) = (key, value)
+        {
+            let limits = ruster_core::BridgeLimits {
+                aging_ms: u64::from(*aging_s) * 1_000,
+                max_macs: *max_learned,
+            };
+            let irb = match store.get(&Key::Interface { name: name.clone() }) {
+                Some(Value::Interface {
+                    enabled: true,
+                    mac,
+                    mtu,
+                    vrf,
+                    vlan: None,
+                    tunnel: None,
+                    pppoe: None,
+                }) => {
+                    if ports.iter().any(|port| port == name) {
+                        return Err(format!("bridge {name} has the name of a port"));
+                    }
+                    let id = ids.take(name)?;
+                    interfaces.push(Interface {
+                        id,
+                        mac: MacAddress(*mac),
+                        mtu: *mtu,
+                    });
+                    active.insert(name.as_str(), (id, vrf.as_str()));
+                    Some((id, *mac))
+                }
+                _ => None,
+            };
+            bridges.push((
+                name.clone(),
+                ruster_core::BridgeConfig {
+                    limits,
+                    irb,
+                    members: Vec::new(),
+                },
+            ));
+        }
+    }
+    let bridge_names: Vec<String> = bridges.iter().map(|(name, _)| name.clone()).collect();
+    let bridge_at = |name: &str| bridge_names.iter().position(|n| n == name);
+    let mut bridge_statics = Vec::new();
+    let mut members: Vec<(usize, IfId)> = Vec::new();
+    for (key, value) in store.iter() {
+        if let (Key::BridgePort { interface }, Value::BridgePort { bridge }) = (key, value) {
+            let member = active
+                .get(interface.as_str())
+                .map(|&(id, _)| id)
+                .filter(|id| usize::from(id.0) < ports.len() || vlans.iter().any(|b| b.sub == *id));
+            if let (Some(at), Some(member)) = (bridge_at(bridge), member) {
+                members.push((at, member));
+            }
+        }
+    }
+    for (at, member) in members {
+        bridges[at].1.members.push(member);
+    }
+    for (key, value) in store.iter() {
+        if let (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) = (key, value) {
+            let member = active.get(interface.as_str()).map(|&(id, _)| id);
+            if let (Some(at), Some(member)) = (bridge_at(bridge), member) {
+                if bridges[at].1.members.contains(&member) {
+                    bridge_statics.push((u16::try_from(at).unwrap_or(u16::MAX), *mac, member));
+                }
+            }
+        }
+    }
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
     for (key, _) in store.iter() {
         if let Key::Route { vrf, .. } = key {
@@ -674,6 +756,8 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     let punt =
         crate::punt_table::Classes::build(store, |name| active.get(name).map(|&(id, _)| id))?;
     Ok(Built {
+        bridges,
+        bridge_statics,
         punt,
         vrfs,
         names: order.iter().map(|v| (*v).to_owned()).collect(),
