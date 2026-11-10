@@ -28,7 +28,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 | `ruster-unbound` | confdから設定の`[dns]`を受け取り、Unboundの設定に書いて読み直させる | — |
 | `ruster-kea` | confdから設定の`[[dhcp]]`と`[[dhcp6]]`を受け取ってKeaの設定に書き、LANとKeaの間でDHCPとDHCPv6をリレーする | — |
 
-ルーティングデーモン、DHCP、DNSはrusterに組み込みません。外のデーモンがconfdやribdへ渡します。DNSのサーバはUnboundで、`ruster-unbound`がconfdの設定をUnboundの設定に変えます。DHCPのサーバはKeaで、`ruster-kea`が同じように設定を変え、FEから渡されたDHCPをKeaへリレーします。
+ルーティングデーモン、DHCP、DNSはrusterに組み込みません。外のデーモンがconfdやribdへ渡します。DNSのサーバはUnboundで、`ruster-unbound`がconfdの設定をUnboundの設定に変えます。DHCPのサーバはKeaで、`ruster-kea`が同じように設定を変え、FEから渡されたDHCPをKeaへリレーします。ルーティングデーモンはFRRで、`ruster-frr`が設定の`[bgp]`をFRRの設定に変え、zebraからFPMで受けた経路をribdへ渡します。
 
 設計の詳細は`docs/design/`にあります。
 
@@ -52,7 +52,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 - ルータ宛ての通信は、種類ごとに数を抑えてVRFごとのTUNでkernelに渡す。
 - VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。
 - VLAN（802.1Q）のサブインターフェースを持てる。AF_PACKETでは、kernelが外したタグをバックエンドがフレームに戻す。
-- 経路は静的なものと直結だけ。
+- 経路は静的なもの、直結、FRRのBGP（直結の近隣だけ）。
 
 実際のNICや回線ではまだ試していません。
 
@@ -159,7 +159,7 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 `netns-dslite-firewall6.sh`（DS-LiteとIPv6のfirewall）、`netns-vrf-firewall.sh`（VRFとfirewall）です。
 `netns-pppoed.sh`は、`pppoe-server`（パッケージ`pppoe`と`ppp`）を相手に、pppoedのセッションをIPCPとIPv6CPまで張ります（FEは通さない）。
 `netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る）。
-`netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。`netns-dhcp6.sh`はDHCPv6で同じことを確かめます（`kea-dhcp6-server`と`busybox`）。`netns-ra.sh`は、LANのホストがneighdのRAでSLAACのアドレスと既定経路を得ることを確かめます。`netns-dhcpc.sh`は、`ruster-dhcpc`がISP側のKeaからWANのIPv4アドレスと委任されたプレフィックスを得て、LANのホストがNATでISP側へ出られることを確かめます（`kea-dhcp4-server`と`kea-dhcp6-server`）。`netns-map-e-pd.sh`は、MAP-EのプレフィックスをDHCPv6-PDから得て同じことを確かめます。どれもインターネットにはつながない。
+`netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。`netns-dhcp6.sh`はDHCPv6で同じことを確かめます（`kea-dhcp6-server`と`busybox`）。`netns-ra.sh`は、LANのホストがneighdのRAでSLAACのアドレスと既定経路を得ることを確かめます。`netns-dhcpc.sh`は、`ruster-dhcpc`がISP側のKeaからWANのIPv4アドレスと委任されたプレフィックスを得て、LANのホストがNATでISP側へ出られることを確かめます（`kea-dhcp4-server`と`kea-dhcp6-server`）。`netns-map-e-pd.sh`は、MAP-EのプレフィックスをDHCPv6-PDから得て同じことを確かめます。`netns-bgp.sh`は、隣のnetnsのFRRとBGPを張り、受けた経路でLANのホストがその先へ届くことと、取り下げで経路が消えることを確かめます（`frr`が要る）。どれもインターネットにはつながない。
 
 ## 開発
 
@@ -181,7 +181,7 @@ cargo test --doc --workspace --all-features --locked
 |---|---|
 | `fe` | FE（`ruster-fe`） |
 | `confd`、`ribd`、`neighd`、`pppoed`、`dhcpc` | CEのプロセス |
-| `unbound`、`kea` | Unbound、Keaの橋渡し役（`ruster-unbound`、`ruster-kea`。後者はDHCPv4とDHCPv6のリレーも） |
+| `unbound`、`kea`、`frr` | Unbound、Kea、FRRの橋渡し役（`ruster-unbound`、`ruster-kea`、`ruster-frr`。Keaの方はDHCPv4とDHCPv6のリレーも、FRRの方はFPMの受け手も） |
 | `cli` | `ruster`コマンド |
 | `config` | 設定の書き方（`ruster.toml`と、既定値を全部埋めたlockの形）と、その解決 |
 | `proto` | プロセス間のメッセージ（CBOR、CoAPの枠組み、表、接続、起動まわり） |
