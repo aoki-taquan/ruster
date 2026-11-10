@@ -158,9 +158,8 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 （PPPoEの上のNATとfirewall）、`netns-map-e-pppoe.sh`（PPPoEの上のMAP-E）、`netns-vrf-vlan.sh`（VLANごとのVRF）、
 `netns-dslite-firewall6.sh`（DS-LiteとIPv6のfirewall）、`netns-vrf-firewall.sh`（VRFとfirewall）です。
 `netns-pppoed.sh`は、`pppoe-server`（パッケージ`pppoe`と`ppp`）を相手に、pppoedのセッションをIPCPとIPv6CPまで張ります（FEは通さない）。
-`netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る。
-インターネットにはつながない）。
-`netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。
+`netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る）。
+`netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。どちらもインターネットにはつながない。
 
 ## 開発
 
@@ -182,8 +181,7 @@ cargo test --doc --workspace --all-features --locked
 |---|---|
 | `fe` | FE（`ruster-fe`） |
 | `confd`、`ribd`、`neighd`、`pppoed` | CEのプロセス |
-| `unbound` | Unboundの橋渡し役（`ruster-unbound`） |
-| `kea` | Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`） |
+| `unbound`、`kea` | Unbound、Keaの橋渡し役（`ruster-unbound`、`ruster-kea`。後者はDHCPv4のリレーも） |
 | `cli` | `ruster`コマンド |
 | `config` | 設定の書き方（`ruster.toml`と、既定値を全部埋めたlockの形）と、その解決 |
 | `proto` | プロセス間のメッセージ（CBOR、CoAPの枠組み、表、接続、起動まわり） |
