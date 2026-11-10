@@ -161,7 +161,8 @@ netnsの試験は29本で、全部をAF_XDPとAF_PACKETの両方で回す（`scr
 
 #### 残り
 
-charterの「作るもの」は上の表のとおりそろった。まだのものは次のとおり。
+charterの「作るもの」は上の表のとおりそろい、2026-11-10 にownerが達成とみなした。下はcharterの外で、
+使う場面が出たらownerがcharterに足してから作る。外から設定を入れるAPIの形も未決のまま置く。
 
 - VRFごとのBGP。
 - `ruster diff`に消えるNATセッションを出すことと、FE、ribd、neighdを候補の確認に加えること。
