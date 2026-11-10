@@ -30,7 +30,13 @@
 //! INIT-REBOOT: a client that starts again begins with DHCPDISCOVER. An ACK
 //! without a subnet mask is taken with the address's class mask (RFC 791), and one
 //! without a lease time is ignored. T1 and T2 that are not below the lease time (T1
-//! below T2) are replaced by the defaults.
+//! below T2) are replaced by the defaults. A lease shorter than 20 s is taken as
+//! 20 s, and going back to INIT (after a DHCPNAK or the end of a lease) waits 1 to
+//! 10 s as at the start. The lease is timed from when the DHCPACK arrives, not from
+//! when the request was sent (section 4.4.1). An ACK to a renewal may give another
+//! address; [`Event::Bound`] then carries it, and the old one is no longer held.
+//! The BROADCAST flag is set in RENEWING and REBINDING too, as in the other states
+//! ([`crate::dhcp4`]).
 
 use std::net::Ipv4Addr;
 
@@ -43,6 +49,8 @@ pub const REQUEST_TRIES: u32 = 4;
 const LEAST_RENEW_WAIT_MS: u64 = 60_000;
 /// The wait after a DHCPDECLINE.
 const DECLINE_WAIT_MS: u64 = 10_000;
+/// The shortest lease taken, in seconds.
+const LEAST_LEASE: u32 = 20;
 /// A lease time of all ones is infinite.
 const INFINITE: u32 = u32::MAX;
 
@@ -241,9 +249,15 @@ impl Client {
         if self.lease.take().is_some() {
             out.events.push(Event::Lost);
         }
+        self.restart(now);
+    }
+
+    /// Back to INIT, with the same 1 to 10 s wait as at the start, so that a server
+    /// that keeps refusing does not make the client send without pause.
+    fn restart(&mut self, now: u64) {
         self.offer = None;
         self.state = State::Init;
-        self.timer = Some(now);
+        self.timer = Some(now + 1_000 + self.rng.below(9_001));
     }
 
     pub fn timeout(&mut self, now: u64, out: &mut Output) {
@@ -258,11 +272,7 @@ impl Client {
                 self.discover(now, out);
             }
             State::Selecting => self.discover(now, out),
-            State::Requesting if self.tries >= REQUEST_TRIES => {
-                self.offer = None;
-                self.state = State::Init;
-                self.timer = Some(now);
-            }
+            State::Requesting if self.tries >= REQUEST_TRIES => self.restart(now),
             State::Requesting => self.select(now, out),
             State::Bound | State::Renewing | State::Rebinding => self.lease_timer(now, out),
         }
@@ -339,11 +349,7 @@ impl Client {
                 }
                 self.bind(now, lease, out);
             }
-            (State::Requesting, kind::NAK) => {
-                self.offer = None;
-                self.state = State::Init;
-                self.timer = Some(now);
-            }
+            (State::Requesting, kind::NAK) => self.restart(now),
             (State::Renewing | State::Rebinding, kind::NAK) => self.lose(now, out),
             _ => {}
         }
@@ -362,6 +368,7 @@ impl Client {
         let payload = Request {
             requested: Some(lease.address),
             server: Some(lease.server),
+            secs: 0,
             ..self.request(now, kind::DECLINE)
         }
         .encode();
@@ -383,6 +390,7 @@ impl Client {
             let payload = Request {
                 ciaddr: lease.address,
                 server: Some(lease.server),
+                secs: 0,
                 ..self.request(now, kind::RELEASE)
             }
             .encode();
@@ -401,7 +409,9 @@ impl Client {
 
 /// The lease an ACK gives, if it has a lease time.
 fn lease(reply: &Reply, server: Ipv4Addr) -> Option<Lease> {
-    let lease_time = reply.lease_time?;
+    // A lease shorter than this is taken as this long, so that a server giving
+    // 0 s does not make the client bind and lose the address without pause.
+    let lease_time = reply.lease_time?.max(LEAST_LEASE);
     let prefix_len = reply
         .subnet_mask
         .and_then(dhcp4::mask_len)

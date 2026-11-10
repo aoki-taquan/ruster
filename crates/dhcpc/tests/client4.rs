@@ -239,6 +239,9 @@ fn a_nak_sends_the_client_back_to_init() {
     );
     assert_eq!(done.events, [Event::Lost]);
     assert_eq!(client.state(), State::Init);
+    // Not at once: a server that keeps refusing gets no flood.
+    let next = client.next_timer().unwrap();
+    assert!((at + 1_000..=at + 10_000).contains(&next), "{next}");
     let (_, out) = fire(&mut client);
     assert_eq!(kind_of(&out.sends[0]), kind::DISCOVER);
 }
