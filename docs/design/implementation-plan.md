@@ -136,7 +136,9 @@ backlogのまま置き、使う場面が出たものから片付ける。
 Unboundの橋渡し役（`ruster-unbound`、netns `dns`）と、Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`、
 netns `dhcp`）、neighdのRA（`[[ra]]`、netns `ra`）、DHCPv6のリレー（`[[dhcp6]]`、netns `dhcp6`）まで済んだ。
 FRRの橋渡し役（`[bgp]`、`ruster-frr`、netns `bgp`）も済んだ。BGPは直結の近隣だけで、次の転送先の
-再帰的な解決（ribd）とVRFごとのBGPはまだ。候補、差分、確定を分けるのはまだで、新しい設定はどれかが断ったら前に戻すだけ。
+再帰的な解決（ribd）とVRFごとのBGPはまだ。confdは受け取った設定を番号付きの版として`--state-dir`に残し（`ruster versions`、`ruster rollback N`）、
+`ruster diff`でlockの形、confdが書くFEの表、ribdへ渡す経路の差分を出す。各プロセスに差分を聞くのと、
+候補と確定を分けるのはまだ。
 
 `ruster-dhcpc`（「作る順番」の4）は、WAN側のDHCPv4とDHCPv6（プレフィックスの委任）のクライアント。設定は
 confdの`dhcpc`の部分（`[[dhcp-client]]`）から受け取り、得た値は送り手（種類`dhcp-client`、`dhcpv6-client`）

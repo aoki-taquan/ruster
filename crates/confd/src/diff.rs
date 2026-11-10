@@ -15,7 +15,9 @@
 //! Not shown: what the other processes would do with their parts (FRR's
 //! configuration, Kea's subnets, NAT sessions that would end). They are asked only
 //! when the configuration is applied, and a refusal then puts the configuration before
-//! back ([`crate::apply`]).
+//! back ([`crate::apply`]). Nor what `--kernel` would change on the kernel side.
+//! Firewall rules are numbered by place, so a rule added near the top shows each rule
+//! after it as removed and added (the FE gets all those changes too).
 //!
 //! The line diff is the longest common subsequence of the lines after the lines the
 //! two share at the start and the end. When that middle is too large to compare

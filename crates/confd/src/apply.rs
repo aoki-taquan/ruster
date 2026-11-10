@@ -23,7 +23,7 @@
 //! | 4.00 Bad Request | the file or the version does not read, `<N>` is not a number, or a process refused the change; in the last case confd puts the configuration it had before back |
 //! | 4.04 Not Found | version N is not kept, or the resource is not one of the above |
 //! | 5.00 Internal Server Error | the configuration is in use, but writing the version failed |
-//! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers (for `diff` too, since what is in use is not yet a version) |
+//! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers (for `diff` too, since what is in use is not yet a version); for `config` and `rollback`, also while a change of a source's values is |
 //! | 5.04 Gateway Timeout | a process has not answered in time |
 //!
 //! After 5.04 confd keeps waiting: if the answer is a refusal, it puts the configuration
@@ -220,7 +220,14 @@ impl Apply {
         let busy = self.pending.is_some() || !confd.settled();
         let candidate = match (request.code, path.as_slice()) {
             (Code::GET, ["versions"]) => return Some((Code::CONTENT, self.versions.listing())),
-            (Code::POST, ["config" | "diff"] | ["rollback", _]) if busy => {
+            (Code::POST, ["config"] | ["rollback", _]) if busy => {
+                return Some((
+                    Code::SERVICE_UNAVAILABLE,
+                    "an earlier configuration is still waiting for answers".to_owned(),
+                ))
+            }
+            // Only reads; but what is in use is not yet a version.
+            (Code::POST, ["diff"]) if self.pending.is_some() => {
                 return Some((
                     Code::SERVICE_UNAVAILABLE,
                     "an earlier configuration is still waiting for answers".to_owned(),
