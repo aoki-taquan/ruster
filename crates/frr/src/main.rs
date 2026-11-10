@@ -6,8 +6,10 @@
 //! (`/usr/lib/frr/frr-reload.py --reload` when not given; an empty one runs
 //! nothing), split at spaces. It listens for zebra's FPM connection on
 //! 127.0.0.1:PORT (2620 when not given), taking it only from a socket of user ID
-//! UID when one is given, and gives the routes to ribd as the route source `frr`
-//! (`ribd/source/frr.sock`; start ribd with `frr:PREFERENCE`). Run it in the
+//! UID (the `frr` user's when not given; `any` takes every one), and gives the
+//! routes to ribd as the route source `frr` (`ribd/source/frr.sock`; start ribd
+//! with `frr:PREFERENCE:65000`: ruster-frr says it has sent everything only once
+//! zebra's routes are in, which may take up to 60 s after it starts). Run it in the
 //! router's kernel namespace, where zebra runs. It tells systemd it is ready once
 //! FILE is first written. When confd or ribd goes away it connects again every
 //! second.
@@ -32,7 +34,7 @@ fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
     let mut reload = "/usr/lib/frr/frr-reload.py --reload".to_owned();
     let mut port: u16 = 2620;
-    let mut owner = None;
+    let mut owner = Some(None);
     let mut file = None;
     let mut args = rest.into_iter();
     while let Some(arg) = args.next() {
@@ -45,11 +47,14 @@ fn run() -> Result<(), String> {
                     .ok_or("--fpm-port needs a port")?;
             }
             "--fpm-owner" => {
-                owner = Some(
-                    args.next()
-                        .and_then(|u| u.parse().ok())
-                        .ok_or("--fpm-owner needs a user ID")?,
-                );
+                owner = match args.next().as_deref() {
+                    Some("any") => None,
+                    Some(uid) => Some(Some(
+                        uid.parse()
+                            .map_err(|_| "--fpm-owner needs a user ID or any")?,
+                    )),
+                    None => return Err("--fpm-owner needs a user ID or any".into()),
+                };
             }
             _ if file.is_none() => file = Some(PathBuf::from(arg)),
             _ => return Err("give one file".into()),
@@ -58,6 +63,14 @@ fn run() -> Result<(), String> {
     let file = file.ok_or("give the file to write FRR's configuration to")?;
     let reload = reload.split_whitespace().map(str::to_owned).collect();
     let mut bridge = Bridge::new(file, reload, port);
+    let owner = match owner {
+        Some(None) => Some(
+            user_id("frr")
+                .ok_or("there is no user frr in /etc/passwd; give --fpm-owner UID (or any)")?,
+        ),
+        Some(Some(uid)) => Some(uid),
+        None => None,
+    };
     let mut fpm = Fpm::bind(port, owner).map_err(|e| format!("FPM port {port}: {e}"))?;
     let mut ribd = Writer::new(run_dir.join(socket::ribd_source(SOURCE)), None);
 
@@ -105,8 +118,9 @@ fn run() -> Result<(), String> {
             busy,
             wake_at: wake,
         });
-        // Until zebra's routes are all in, ribd is not told the routes are sent.
-        if fpm.ready() {
+        // Until zebra's routes are all in and their interfaces known, ribd is not
+        // told the routes are sent.
+        if fpm.ready() && written {
             if !announced {
                 announced = true;
                 eprintln!(
@@ -125,6 +139,15 @@ fn run() -> Result<(), String> {
         }
         idle.wait(progress);
     }
+}
+
+/// A user's ID, from `/etc/passwd`.
+fn user_id(name: &str) -> Option<u32> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        (fields.next()? == name).then(|| fields.nth(1)?.parse().ok())?
+    })
 }
 
 fn main() -> ExitCode {

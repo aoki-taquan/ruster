@@ -4,14 +4,18 @@
 //! - A new connection replaces the one before (zebra connected again). The routes
 //!   held are marked stale; zebra sends all of its routes again, and once it has
 //!   been quiet for [`QUIET_MS`] the routes it did not send again are removed.
-//!   zebra marks no end of its sending, so quiet is the sign.
+//!   zebra marks no end of its sending, so quiet is the sign; at the latest the
+//!   routes are swept [`RESYNC_MAX_MS`] after it connected. A zebra that started
+//!   again connects before bgpd has its routes, so its routes come back as bgpd
+//!   learns them again.
 //! - While no connection is up, the routes are kept for [`HOLD_MS`], then removed.
 //! - A frame that is not FPM version 1 netlink ends the connection; a message that
 //!   cannot be read is counted and passed over, and the first reason of each
 //!   connection is logged.
 //! - With an owner given ([`Fpm::bind`]), a connection is taken only from a socket of
 //!   that user, as `/proc/net/tcp` shows it: anyone on the router may connect to a
-//!   TCP port, and zebra runs as `frr`.
+//!   TCP port, and zebra runs as `frr`. `ruster-frr` gives the `frr` user's ID
+//!   unless told otherwise.
 //!
 //! [`Fpm::ready`] says when what ruster-frr holds is worth giving to ribd: after
 //! zebra's first sending went quiet, or after [`HOLD_MS`] without zebra.
@@ -36,6 +40,10 @@ use crate::routes::Routes;
 pub const QUIET_MS: u64 = 3_000;
 /// How long the routes are kept while zebra is not connected, in milliseconds.
 pub const HOLD_MS: u64 = 30_000;
+/// The longest a resync waits for zebra to be quiet, in milliseconds.
+pub const RESYNC_MAX_MS: u64 = 30_000;
+/// The most connections taken per step, so a flood of them does not hold the loop.
+const ACCEPTS_PER_STEP: usize = 8;
 /// The most bytes read per step, so a fast sender does not hold the loop.
 const READ_PER_STEP: usize = 1 << 20;
 
@@ -53,6 +61,8 @@ pub struct Fpm {
     routes: Routes,
     /// When the routes start being swept after a connection: the last message's time.
     resync_since: Option<u64>,
+    /// When the connection being resynced came.
+    connected_at: u64,
     /// When the connection went away.
     lost_at: Option<u64>,
     started_at: Option<u64>,
@@ -80,6 +90,7 @@ impl Fpm {
             conn: None,
             routes: Routes::new(),
             resync_since: None,
+            connected_at: 0,
             lost_at: None,
             started_at: None,
             ready: false,
@@ -137,13 +148,18 @@ impl Fpm {
             self.resync_since = None;
         }
         if let Some(since) = self.resync_since {
-            if now >= since.saturating_add(QUIET_MS) {
+            // Quiet, or at the latest RESYNC_MAX_MS after it connected: zebra may
+            // never be quiet while routes keep changing.
+            let at = since
+                .saturating_add(QUIET_MS)
+                .min(self.connected_at.saturating_add(RESYNC_MAX_MS));
+            if now >= at {
                 changes.extend(self.routes.sweep());
                 self.resync_since = None;
                 self.ready = true;
                 busy = true;
             } else {
-                wake = Some(since.saturating_add(QUIET_MS));
+                wake = Some(at);
             }
         }
         if let (None, Some(lost)) = (&self.conn, self.lost_at) {
@@ -168,7 +184,7 @@ impl Fpm {
 
     fn accept(&mut self, now: u64) -> bool {
         let mut busy = false;
-        loop {
+        for _ in 0..ACCEPTS_PER_STEP {
             let (stream, peer) = match self.listener.accept() {
                 Ok(accepted) => accepted,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => return busy,
@@ -200,7 +216,9 @@ impl Fpm {
             self.lost_at = None;
             self.routes.mark_stale();
             self.resync_since = Some(now);
+            self.connected_at = now;
         }
+        busy
     }
 }
 

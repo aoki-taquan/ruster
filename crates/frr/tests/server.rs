@@ -46,7 +46,7 @@ fn key(n: u8) -> Key {
     }
 }
 
-/// Steps until a change comes or `tries` run out.
+/// Steps until a change comes, a second at most.
 fn changes(fpm: &mut Fpm, now: u64) -> Vec<Change> {
     let mut out = Vec::new();
     for _ in 0..200 {
@@ -87,13 +87,11 @@ fn routes_come_in_and_stale_ones_are_swept() {
     // zebra connects again and sends only 10.1/16: 10.2/16 goes once it is quiet.
     let mut again = connect(&fpm);
     again.write_all(&frame(1, true)).unwrap();
-    for _ in 0..200 {
+    // Long enough for the frame to be read on some step.
+    for _ in 0..100 {
         fpm.step(QUIET_MS + 10);
-        if fpm.connected() && fpm.routes().len() == 2 {
-            break;
-        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    std::thread::sleep(std::time::Duration::from_millis(50));
     assert!(fpm.step(QUIET_MS + 20).0.is_empty());
     let swept = fpm.step(2 * QUIET_MS + 100).0;
     assert_eq!(swept, [Change::delete(key(2))]);
@@ -184,4 +182,23 @@ fn the_owner_is_read_from_proc_net_tcp() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(!other.connected(), "another user's socket is refused");
+}
+
+#[test]
+fn a_resync_ends_even_when_zebra_is_never_quiet() {
+    let mut fpm = Fpm::bind(0, None).unwrap();
+    fpm.set_connected(&connected());
+    let mut zebra = connect(&fpm);
+    zebra.write_all(&frame(1, true)).unwrap();
+    assert_eq!(changes(&mut fpm, 0).len(), 1);
+    // A change every second: never quiet for QUIET_MS.
+    let mut now = 0;
+    while now < ruster_frr::server::RESYNC_MAX_MS - 1_000 {
+        now += 1_000;
+        zebra.write_all(&frame(2, now % 2_000 == 0)).unwrap();
+        changes(&mut fpm, now);
+        assert!(!fpm.ready(), "at {now}");
+    }
+    fpm.step(ruster_frr::server::RESYNC_MAX_MS);
+    assert!(fpm.ready());
 }
