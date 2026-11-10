@@ -1,32 +1,47 @@
-//! Bridge members that carry Ethernet frames inside IP: EtherIP.
+//! Bridge members that carry Ethernet frames inside IP: EtherIP and VXLAN.
 //!
-//! See `docs/design/overlay.md`, section 4. An [`Overlay`] is an interface that is
-//! a member of a bridge, like a port, but whose frames travel inside IP packets
-//! between the router's address `local` and the remote end. A frame the bridge
-//! sends out of it gets the outer headers ([`transmit_member`]) and is routed by
-//! the default VRF, as the outer packets of the other tunnels are; an outer packet
-//! from the remote end to `local` loses them ([`receive`]) and its frame is
-//! received on the member.
+//! See `docs/design/overlay.md`, sections 3 and 4. An [`Overlay`] is an interface
+//! that is a member of a bridge, like a port, but whose frames travel inside IP
+//! packets between the router's address `local` and remote ends. A frame the bridge
+//! sends out of it gets the outer headers ([`transmit_member`]) and is routed by the
+//! default VRF, as the outer packets of the other tunnels are; an outer packet from a
+//! remote end to `local` loses them ([`receive`]) and its frame is received on the
+//! member. An EtherIP interface has one remote end. A VXLAN interface has one VNI and
+//! a list of remote VTEPs: a frame goes to the VTEP its destination was learned
+//! behind, and the FE sends a flooded one to each of them (head-end replication).
 //!
 //! # Standards
 //!
 //! - RFC 3378 section 3 (EtherIP): IP protocol 97, a two-byte header of version 3
 //!   and twelve reserved bits set to zero, then the Ethernet frame without its FCS.
 //!   A packet whose version is not 3 is dropped. The outer header is IPv4 or IPv6.
+//! - RFC 7348 section 5 (VXLAN): UDP to port 4789, an eight-byte header with the I
+//!   flag set and the 24-bit VNI, then the Ethernet frame without its FCS. The UDP
+//!   source port is a hash of the inner frame's flow (its IP addresses and ports,
+//!   or its MAC addresses), in 49152 to 65535. A packet without the I flag, or whose
+//!   inner frame has a VLAN tag (section 6.1), is dropped. Over IPv4 the UDP
+//!   checksum is 0; over IPv6 it is computed (RFC 6935 is not used). A received
+//!   checksum is not checked (RFC 7348 section 5 allows that).
+//! - RFC 7348 section 4.1: the outer source address of a received frame is learned
+//!   with its inner source MAC address (see `crate::MacTable`).
 //! - RFC 791 and RFC 8200: the outer header, TTL or Hop Limit 64; an IPv4 outer
-//!   header has DF set and identification 0 (RFC 6864 section 4.1: an atomic
-//!   datagram). An IPv4 outer header with a bad checksum is dropped (RFC 1122
-//!   section 3.2.1.2).
+//!   header has DF set (RFC 7348 section 4.3) and identification 0 (RFC 6864
+//!   section 4.1: an atomic datagram). An IPv4 outer header with a bad checksum is
+//!   dropped (RFC 1122 section 3.2.1.2).
 //!
 //! Deviations:
 //!
-//! - The outer packet is never fragmented, and outer fragments are dropped, not
-//!   put back together (RFC 3378 does not forbid fragmenting): a frame longer than
-//!   the underlying interface's MTU less the outer headers is dropped and counted
+//! - The outer packet is never fragmented, and outer fragments are dropped, not put
+//!   back together (RFC 3378 does not forbid fragmenting): a frame longer than the
+//!   underlying interface's MTU less the outer headers is dropped and counted
 //!   ([`DropReason::OverlayMtuExceeded`]).
-//! - The reserved bits of a received EtherIP header are not looked at.
-//! - IPv6 extension headers before the EtherIP header are not stepped over: such
-//!   packets are not unwrapped.
+//! - The reserved bits of a received EtherIP header and VXLAN header are not looked
+//!   at.
+//! - IPv6 extension headers before the EtherIP or UDP header are not stepped over:
+//!   such packets are not unwrapped.
+//! - VXLAN: no multicast underlay (RFC 7348 section 4.2); the remote VTEPs are a
+//!   list given in the tables, and packets from any other address are dropped. The
+//!   UDP port is always 4789.
 //! - The outer packets are always routed in the default VRF, only out of a port or a
 //!   VLAN sub-interface (not a tunnel, PPPoE session or bridge), and only those
 //!   arriving on an interface of the default VRF are unwrapped.
@@ -40,14 +55,22 @@ const IPV4_HEADER: usize = 20;
 const IPV6_HEADER: usize = 40;
 const IPV4_ETHERTYPE: [u8; 2] = [0x08, 0x00];
 const IPV6_ETHERTYPE: [u8; 2] = [0x86, 0xdd];
-/// IP protocol number of EtherIP.
+const VLAN_ETHERTYPE: [u8; 2] = [0x81, 0x00];
+/// IP protocol numbers of EtherIP, UDP and TCP.
 const ETHERIP: u8 = 97;
+const UDP: u8 = 17;
+const TCP: u8 = 6;
 /// The EtherIP header: version 3, reserved 0.
 const ETHERIP_HEADER: [u8; 2] = [0x30, 0x00];
+/// The UDP port of VXLAN (IANA), and the UDP and VXLAN headers' length.
+const VXLAN_PORT: u16 = 4789;
+const VXLAN_HEADERS: usize = 16;
+/// The I flag of the VXLAN header.
+const VXLAN_I: u8 = 0x08;
 /// TTL and Hop Limit of the outer header.
 const HOP_LIMIT: u8 = 64;
 /// The longest outer header (Ethernet, IPv6, UDP and VXLAN).
-const MAX_HEADER: usize = ETHERNET + IPV6_HEADER + 16;
+const MAX_HEADER: usize = ETHERNET + IPV6_HEADER + VXLAN_HEADERS;
 
 /// A bridge member whose frames travel inside IP.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -59,11 +82,32 @@ pub struct Overlay {
     pub kind: OverlayKind,
 }
 
-/// What carries the frames.
+/// What carries the frames. The remote ends are of the family of `local`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OverlayKind {
-    /// EtherIP (RFC 3378) to and from one remote end, of the family of `local`.
+    /// EtherIP (RFC 3378) to and from one remote end.
     EtherIp { remote: IpAddr },
+    /// VXLAN (RFC 7348) network `vni` (1 to 16777215), to and from the remote VTEPs
+    /// `remotes`.
+    Vxlan { vni: u32, remotes: Vec<IpAddr> },
+}
+
+impl Overlay {
+    /// The remote ends: where a frame of an unknown destination goes.
+    #[must_use]
+    pub fn remotes(&self) -> &[IpAddr] {
+        match &self.kind {
+            OverlayKind::EtherIp { remote } => std::slice::from_ref(remote),
+            OverlayKind::Vxlan { remotes, .. } => remotes,
+        }
+    }
+
+    /// Whether it is a VXLAN interface: a frame flooded from one is not sent to
+    /// another (every VTEP sends its own frames to all the others).
+    #[must_use]
+    pub fn is_vxlan(&self) -> bool {
+        matches!(self.kind, OverlayKind::Vxlan { .. })
+    }
 }
 
 /// The overlay whose interface is `id`.
@@ -98,9 +142,9 @@ struct Outer {
     end: usize,
 }
 
-/// Reads the outer IPv4 or IPv6 header of `bytes` (Ethernet). `Ok(None)` for a
-/// frame that is no IP packet or is cut short; an IPv4 header that is wrong once
-/// it is known to be for an overlay is checked by [`check_ipv4`].
+/// Reads the outer IPv4 or IPv6 header of `bytes` (Ethernet). `None` for a frame
+/// that is no IP packet or is cut short; an IPv4 header that is wrong once it is
+/// known to be for an overlay is checked by [`check_ipv4`].
 fn outer(bytes: &[u8]) -> Option<Outer> {
     let ethertype = bytes.get(12..14)?;
     let ip = bytes.get(ETHERNET..)?;
@@ -159,25 +203,47 @@ fn check_ipv4(bytes: &[u8], payload: usize) -> Result<(), DropReason> {
     Ok(())
 }
 
+/// What [`receive`] did with a packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Received {
+    /// Not an overlay's outer packet: left as it was.
+    NotOverlay,
+    /// Unwrapped: its frame arrives on the overlay's interface, from remote VTEP
+    /// `vtep` for a VXLAN interface.
+    Unwrapped { vtep: Option<IpAddr> },
+}
+
 /// Unwraps `packet` when it is an outer packet of one of the snapshot's overlays:
-/// its frame is left, received on the overlay's interface. `Ok(false)` leaves any
-/// other packet as it was. `snapshot` is the outer (default VRF's) one.
+/// its frame is left, received on the overlay's interface. Any other packet is left
+/// as it was. `snapshot` is the outer (default VRF's) one.
 pub(crate) fn receive<S: PacketSlot>(
     packet: &mut PacketLease<S>,
     snapshot: &crate::ForwardingSnapshot<'_>,
-) -> Result<bool, DropReason> {
+) -> Result<Received, DropReason> {
     let overlays = snapshot.overlays;
     if overlays.is_empty() {
-        return Ok(false);
+        return Ok(Received::NotOverlay);
     }
     let ingress = packet.ingress();
     let bytes = packet.bytes_mut();
     let Some(outer) = outer(bytes) else {
-        return Ok(false);
+        return Ok(Received::NotOverlay);
     };
-    if outer.protocol != ETHERIP || !overlays.iter().any(|o| o.local == outer.destination) {
-        return Ok(false);
-    }
+    let ours = |vxlan: bool| {
+        overlays
+            .iter()
+            .any(|o| o.local == outer.destination && o.is_vxlan() == vxlan)
+    };
+    let vxlan = match outer.protocol {
+        ETHERIP if ours(false) => false,
+        UDP if ours(true)
+            && bytes.get(outer.payload + 2..outer.payload + 4)
+                == Some(&VXLAN_PORT.to_be_bytes()[..]) =>
+        {
+            true
+        }
+        _ => return Ok(Received::NotOverlay),
+    };
     // For one of the overlays' addresses from here on: dropped unless it is right.
     if outer.source.is_ipv4() {
         check_ipv4(bytes, outer.payload)?;
@@ -193,47 +259,134 @@ pub(crate) fn receive<S: PacketSlot>(
     if bytes[0..6] != interface.mac.0 {
         return Err(DropReason::OverlayUnknownPeer);
     }
-    let overlay = overlays
-        .iter()
-        .find(|o| {
-            o.local == outer.destination
-                && matches!(o.kind, OverlayKind::EtherIp { remote } if remote == outer.source)
-        })
-        .ok_or(DropReason::OverlayUnknownPeer)?;
-    let header = bytes
-        .get(outer.payload..outer.payload + 2)
-        .ok_or(DropReason::OverlayInvalid)?;
-    if header[0] >> 4 != ETHERIP_HEADER[0] >> 4 {
-        return Err(DropReason::OverlayInvalid);
-    }
-    let frame = outer.payload + 2;
+    let (overlay, frame) = if vxlan {
+        let header = bytes
+            .get(outer.payload..outer.payload + VXLAN_HEADERS)
+            .ok_or(DropReason::OverlayInvalid)?;
+        let length = usize::from(u16::from_be_bytes([header[4], header[5]]));
+        if header[8] & VXLAN_I == 0 || length < VXLAN_HEADERS || outer.payload + length > outer.end
+        {
+            return Err(DropReason::OverlayInvalid);
+        }
+        let vni = u32::from_be_bytes([0, header[12], header[13], header[14]]);
+        let overlay = overlays
+            .iter()
+            .find(|o| {
+                o.local == outer.destination
+                    && matches!(&o.kind, OverlayKind::Vxlan { vni: v, remotes }
+                        if *v == vni && remotes.contains(&outer.source))
+            })
+            .ok_or(DropReason::OverlayUnknownPeer)?;
+        let frame = outer.payload + VXLAN_HEADERS;
+        // RFC 7348 6.1: an inner VLAN tag is not taken.
+        if bytes.get(frame + 12..frame + 14) == Some(&VLAN_ETHERTYPE[..]) {
+            return Err(DropReason::OverlayInvalid);
+        }
+        (overlay, frame)
+    } else {
+        let overlay = overlays
+            .iter()
+            .find(|o| {
+                o.local == outer.destination
+                    && matches!(o.kind, OverlayKind::EtherIp { remote } if remote == outer.source)
+            })
+            .ok_or(DropReason::OverlayUnknownPeer)?;
+        let header = bytes
+            .get(outer.payload..outer.payload + 2)
+            .ok_or(DropReason::OverlayInvalid)?;
+        if header[0] >> 4 != ETHERIP_HEADER[0] >> 4 {
+            return Err(DropReason::OverlayInvalid);
+        }
+        (overlay, outer.payload + 2)
+    };
     if outer.end < frame + ETHERNET {
         return Err(DropReason::OverlayInvalid);
     }
     let member = overlay.interface;
+    let vtep = vxlan.then_some(outer.source);
     // Padding after the outer packet goes, then the outer headers.
     if !packet.truncate(outer.end) || !packet.resize_front(frame as isize) {
         return Err(DropReason::OverlayNoRoom);
     }
     packet.set_ingress(member);
-    Ok(true)
+    Ok(Received::Unwrapped { vtep })
 }
 
-/// The outer header for `inner` (an Ethernet frame) leaving `overlay`, routed by
-/// `snapshot` (the default VRF's). `irb` tells the bridges' own interfaces, which
-/// the outer packet may not leave through. A next hop missing from the neighbor
-/// table is recorded in `trace`.
+/// A hash of the flow of `inner` (an Ethernet frame): its IP addresses and, for TCP
+/// and UDP that are not later fragments, its ports; its MAC addresses otherwise
+/// (FNV-1a).
+fn flow_hash(inner: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    let mut add = |bytes: &[u8]| {
+        for &b in bytes {
+            hash = (hash ^ u32::from(b)).wrapping_mul(0x0100_0193);
+        }
+    };
+    let ip = &inner[ETHERNET.min(inner.len())..];
+    let ports = |at: usize, protocol: u8| match protocol {
+        TCP | UDP => ip.get(at..at + 4),
+        _ => None,
+    };
+    match inner.get(12..14) {
+        Some(t) if t == IPV4_ETHERTYPE && ip.len() >= IPV4_HEADER => {
+            add(&ip[12..20]);
+            let later = u16::from_be_bytes([ip[6], ip[7]]) & 0x1fff != 0;
+            let header = usize::from(ip[0] & 0x0f) * 4;
+            if let Some(p) = ports(header, ip[9]).filter(|_| !later) {
+                add(p);
+            }
+        }
+        Some(t) if t == IPV6_ETHERTYPE && ip.len() >= IPV6_HEADER => {
+            add(&ip[8..40]);
+            if let Some(p) = ports(IPV6_HEADER, ip[6]) {
+                add(p);
+            }
+        }
+        _ => add(&inner[..12.min(inner.len())]),
+    }
+    hash
+}
+
+/// The one's complement sum of `bytes` as 16-bit words, added to `sum`.
+fn add_words(mut sum: u64, bytes: &[u8]) -> u64 {
+    let mut words = bytes.chunks_exact(2);
+    for word in words.by_ref() {
+        sum += u64::from(u16::from_be_bytes([word[0], word[1]]));
+    }
+    if let Some(&last) = words.remainder().first() {
+        sum += u64::from(last) << 8;
+    }
+    sum
+}
+
+/// The outer header for `inner` (an Ethernet frame) leaving `overlay` for its
+/// remote end `remote`, routed by `snapshot` (the default VRF's). `irb` tells the
+/// bridges' own interfaces, which the outer packet may not leave through. A next hop
+/// missing from the neighbor table is recorded in `trace`.
 pub(crate) fn header<T: TraceSink>(
     snapshot: &crate::ForwardingSnapshot<'_>,
     overlay: &Overlay,
+    remote: IpAddr,
     inner: &[u8],
     irb: impl Fn(IfId) -> bool,
     trace: &mut T,
 ) -> Result<OverlayHeader, DropReason> {
-    let OverlayKind::EtherIp { remote } = overlay.kind;
     if inner.len() < ETHERNET {
         return Err(DropReason::EthernetHeaderTruncated);
     }
+    if !overlay.remotes().contains(&remote) {
+        return Err(DropReason::OverlayUnknownPeer);
+    }
+    let vni = match overlay.kind {
+        OverlayKind::Vxlan { vni, .. } => {
+            // RFC 7348 6.1: no inner VLAN tag is sent.
+            if inner[12..14] == VLAN_ETHERTYPE {
+                return Err(DropReason::OverlayInvalid);
+            }
+            Some(vni)
+        }
+        OverlayKind::EtherIp { .. } => None,
+    };
     let (egress, mac) = route(snapshot, remote, trace)?;
     if irb(egress) || snapshot.wraps_frames(egress) || of(snapshot.overlays, egress).is_some() {
         return Err(DropReason::OverlayUnderlayUnsupported);
@@ -249,8 +402,14 @@ pub(crate) fn header<T: TraceSink>(
     let b = &mut out.bytes;
     b[0..6].copy_from_slice(&mac.0);
     b[6..12].copy_from_slice(&interface.mac.0);
-    let carried = ETHERIP_HEADER.len() + inner.len();
+    let encapsulation = if vni.is_some() {
+        VXLAN_HEADERS
+    } else {
+        ETHERIP_HEADER.len()
+    };
+    let carried = encapsulation + inner.len();
     let ip = ETHERNET;
+    let protocol = if vni.is_some() { UDP } else { ETHERIP };
     let payload = match (overlay.local, remote) {
         (IpAddr::V4(local), IpAddr::V4(remote)) => {
             let total = IPV4_HEADER + carried;
@@ -264,7 +423,7 @@ pub(crate) fn header<T: TraceSink>(
             // Don't Fragment; identification 0.
             b[ip + 6] = 0x40;
             b[ip + 8] = HOP_LIMIT;
-            b[ip + 9] = ETHERIP;
+            b[ip + 9] = protocol;
             b[ip + 12..ip + 16].copy_from_slice(&local.octets());
             b[ip + 16..ip + 20].copy_from_slice(&remote.octets());
             let checksum = crate::ipv4_header_checksum(&b[ip..ip + IPV4_HEADER]);
@@ -279,7 +438,7 @@ pub(crate) fn header<T: TraceSink>(
             b[12..14].copy_from_slice(&IPV6_ETHERTYPE);
             b[ip] = 0x60;
             b[ip + 4..ip + 6].copy_from_slice(&length.to_be_bytes());
-            b[ip + 6] = ETHERIP;
+            b[ip + 6] = protocol;
             b[ip + 7] = HOP_LIMIT;
             b[ip + 8..ip + 24].copy_from_slice(&local.octets());
             b[ip + 24..ip + 40].copy_from_slice(&remote.octets());
@@ -287,8 +446,37 @@ pub(crate) fn header<T: TraceSink>(
         }
         _ => return Err(DropReason::OverlayInvalid),
     };
-    b[payload..payload + 2].copy_from_slice(&ETHERIP_HEADER);
-    out.len = payload + 2;
+    let Some(vni) = vni else {
+        b[payload..payload + 2].copy_from_slice(&ETHERIP_HEADER);
+        out.len = payload + 2;
+        return Ok(out);
+    };
+    let udp = payload;
+    let length = u16::try_from(carried).map_err(|_| DropReason::OverlayMtuExceeded)?;
+    // 49152 to 65535 (RFC 7348 section 5).
+    let port = 0xc000 | (flow_hash(inner) & 0x3fff) as u16;
+    b[udp..udp + 2].copy_from_slice(&port.to_be_bytes());
+    b[udp + 2..udp + 4].copy_from_slice(&VXLAN_PORT.to_be_bytes());
+    b[udp + 4..udp + 6].copy_from_slice(&length.to_be_bytes());
+    b[udp + 8] = VXLAN_I;
+    b[udp + 12..udp + 15].copy_from_slice(&vni.to_be_bytes()[1..]);
+    if overlay.local.is_ipv6() {
+        // Over the pseudo-header (addresses, length, next header), the UDP and
+        // VXLAN headers and the frame (RFC 8200 section 8.1).
+        let mut sum = add_words(0, &b[ip + 8..ip + 40]);
+        sum += u64::from(length) + u64::from(UDP);
+        sum = add_words(sum, &b[udp..udp + VXLAN_HEADERS]);
+        sum = add_words(sum, inner);
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        let checksum = match !(sum as u16) {
+            0 => 0xffff,
+            c => c,
+        };
+        b[udp + 6..udp + 8].copy_from_slice(&checksum.to_be_bytes());
+    }
+    out.len = udp + VXLAN_HEADERS;
     Ok(out)
 }
 
@@ -349,18 +537,27 @@ fn route<T: TraceSink>(
 }
 
 /// Sends the bridged frame `packet` out of `member`: wrapped when it is an overlay
-/// (see [`header`]), then tagged when the interface below is a VLAN
-/// sub-interface. Returns the port to commit it to. `snapshot` is the outer one.
+/// (see [`header`]) for the remote end `vtep` (a VXLAN interface's, learned with
+/// the destination) or its only one (EtherIP), then tagged when the interface below
+/// is a VLAN sub-interface. Returns the port to commit it to. `snapshot` is the
+/// outer one.
 pub(crate) fn transmit_member<S: PacketSlot, T: TraceSink>(
     packet: &mut PacketLease<S>,
     member: IfId,
+    vtep: Option<IpAddr>,
     snapshot: &crate::ForwardingSnapshot<'_>,
     irb: impl Fn(IfId) -> bool,
     trace: &mut T,
 ) -> Result<IfId, DropReason> {
     let egress = match of(snapshot.overlays, member) {
         Some(overlay) => {
-            let outer = header(snapshot, overlay, packet.bytes_mut(), irb, trace)?;
+            let remote = match (&overlay.kind, vtep) {
+                (OverlayKind::EtherIp { remote }, _) => *remote,
+                (OverlayKind::Vxlan { .. }, Some(vtep)) => vtep,
+                // A VXLAN destination known with no VTEP: nowhere to send it.
+                (OverlayKind::Vxlan { .. }, None) => return Err(DropReason::OverlayNoRoute),
+            };
+            let outer = header(snapshot, overlay, remote, packet.bytes_mut(), irb, trace)?;
             let len = outer.len;
             if !packet.resize_front(-(len as isize)) {
                 return Err(DropReason::OverlayNoRoom);
@@ -499,7 +696,15 @@ mod tests {
         let t = tables(1500, LOCAL4.into(), REMOTE4.into());
         let s = snapshot(&t);
         let frame = inner();
-        let h = header(&s, &t.overlays[0], &frame, |_| false, &mut NullTrace).unwrap();
+        let h = header(
+            &s,
+            &t.overlays[0],
+            t.overlays[0].remotes()[0],
+            &frame,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
         assert_eq!(h.egress, PORT);
         let b = h.bytes();
         assert_eq!(b.len(), 14 + 20 + 2);
@@ -526,7 +731,15 @@ mod tests {
         let t = tables(1500, local.into(), remote.into());
         let s = snapshot(&t);
         let frame = inner();
-        let h = header(&s, &t.overlays[0], &frame, |_| false, &mut NullTrace).unwrap();
+        let h = header(
+            &s,
+            &t.overlays[0],
+            t.overlays[0].remotes()[0],
+            &frame,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
         let b = h.bytes();
         assert_eq!(b.len(), 14 + 40 + 2);
         assert_eq!(&b[12..14], &[0x86, 0xdd]);
@@ -547,10 +760,26 @@ mod tests {
         let mut frame = inner();
         // 20 + 2 + 1478 = 1500 fits; one more does not.
         frame.resize(1478, 0);
-        assert!(header(&s, &t.overlays[0], &frame, |_| false, &mut NullTrace).is_ok());
+        assert!(header(
+            &s,
+            &t.overlays[0],
+            t.overlays[0].remotes()[0],
+            &frame,
+            |_| false,
+            &mut NullTrace
+        )
+        .is_ok());
         frame.push(0);
         assert_eq!(
-            header(&s, &t.overlays[0], &frame, |_| false, &mut NullTrace).unwrap_err(),
+            header(
+                &s,
+                &t.overlays[0],
+                t.overlays[0].remotes()[0],
+                &frame,
+                |_| false,
+                &mut NullTrace
+            )
+            .unwrap_err(),
             DropReason::OverlayMtuExceeded
         );
         // Nor out of a bridge's own interface.
@@ -558,6 +787,7 @@ mod tests {
             header(
                 &s,
                 &t.overlays[0],
+                t.overlays[0].remotes()[0],
                 &inner(),
                 |id| id == PORT,
                 &mut NullTrace
@@ -585,7 +815,7 @@ mod tests {
         p
     }
 
-    fn unwrap(t: &Tables, bytes: Vec<u8>) -> (Result<bool, DropReason>, Vec<u8>, IfId) {
+    fn unwrap(t: &Tables, bytes: Vec<u8>) -> (Result<Received, DropReason>, Vec<u8>, IfId) {
         let s = snapshot(t);
         let mut packet = lease(PORT, bytes);
         let result = receive(&mut packet, &s);
@@ -603,7 +833,7 @@ mod tests {
         let mut padded = outer_ipv4(REMOTE4, 3, &frame);
         padded.extend_from_slice(&[0; 6]);
         let (result, bytes, ingress) = unwrap(&t, padded);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(Received::Unwrapped { vtep: None }));
         assert_eq!(bytes, frame);
         assert_eq!(ingress, MEMBER);
         // Another source: dropped.
@@ -644,7 +874,7 @@ mod tests {
         let checksum = crate::ipv4_header_checksum(&udp[14..34]);
         udp[24..26].copy_from_slice(&checksum.to_be_bytes());
         let (result, bytes, ingress) = unwrap(&t, udp.clone());
-        assert_eq!(result, Ok(false));
+        assert_eq!(result, Ok(Received::NotOverlay));
         assert_eq!((bytes, ingress), (udp, PORT));
     }
 
@@ -656,7 +886,8 @@ mod tests {
         let s = snapshot(&t);
         let frame = inner();
         let mut packet = lease(PORT, frame.clone());
-        let port = transmit_member(&mut packet, MEMBER, &s, |_| false, &mut NullTrace).unwrap();
+        let port =
+            transmit_member(&mut packet, MEMBER, None, &s, |_| false, &mut NullTrace).unwrap();
         assert_eq!(port, PORT);
         let mut wrapped = packet.bytes_mut().to_vec();
         packet.commit(port);
@@ -666,7 +897,228 @@ mod tests {
         wrapped[22..38].copy_from_slice(&b);
         wrapped[38..54].copy_from_slice(&a);
         let (result, bytes, ingress) = unwrap(&t, wrapped);
-        assert_eq!(result, Ok(true));
+        assert_eq!(result, Ok(Received::Unwrapped { vtep: None }));
         assert_eq!((bytes, ingress), (frame, MEMBER));
+    }
+
+    /// The tables with the overlay a VXLAN interface of VNI 100 to `remotes`.
+    fn vxlan(local: IpAddr, remotes: Vec<IpAddr>) -> Tables {
+        let mut t = tables(1500, local, remotes[0]);
+        t.overlays[0].kind = OverlayKind::Vxlan { vni: 100, remotes };
+        t
+    }
+
+    fn udp_ipv4(inner_frame: &[u8]) -> Vec<u8> {
+        let mut f = inner_frame.to_vec();
+        f[12..14].copy_from_slice(&[0x08, 0x00]);
+        f.truncate(14);
+        let mut ip = vec![0x45, 0, 0, 40, 0, 0, 0, 0, 64, 17, 0, 0];
+        ip.extend_from_slice(&[10, 0, 0, 1, 10, 0, 0, 2]);
+        ip.extend_from_slice(&[0x30, 0x39, 0x00, 0x50, 0, 20, 0, 0]);
+        ip.extend_from_slice(&[0; 12]);
+        f.extend_from_slice(&ip);
+        f
+    }
+
+    #[test]
+    fn vxlan_wraps_in_ipv4_with_checksum_zero_and_a_hashed_port() {
+        let other = Ipv4Addr::new(192, 0, 2, 3);
+        let mut t = vxlan(LOCAL4.into(), vec![REMOTE4.into(), other.into()]);
+        t.neighbors.push(Neighbor {
+            interface: PORT,
+            target: crate::Ipv4Address::from_octets(other.octets()),
+            mac: MacAddress([2, 0, 0, 0, 0, 3]),
+        });
+        let s = snapshot(&t);
+        let frame = udp_ipv4(&inner());
+        let h = header(
+            &s,
+            &t.overlays[0],
+            REMOTE4.into(),
+            &frame,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
+        let b = h.bytes();
+        assert_eq!(b.len(), 14 + 20 + 8 + 8);
+        assert_eq!(&b[20..22], &[0x40, 0], "DF");
+        assert_eq!(b[23], 17);
+        assert_eq!(crate::ipv4_header_checksum(&b[14..34]), 0);
+        let port = u16::from_be_bytes([b[34], b[35]]);
+        assert!(port >= 49152);
+        assert_eq!(&b[36..38], &4789_u16.to_be_bytes());
+        assert_eq!(
+            usize::from(u16::from_be_bytes([b[38], b[39]])),
+            16 + frame.len()
+        );
+        assert_eq!(&b[40..42], &[0, 0], "no UDP checksum over IPv4");
+        assert_eq!(&b[42..50], &[0x08, 0, 0, 0, 0, 0, 100, 0]);
+        // The same flow, the same port; another flow, most likely another.
+        let again = header(
+            &s,
+            &t.overlays[0],
+            other.into(),
+            &frame,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
+        assert_eq!(&again.bytes()[34..36], &b[34..36]);
+        let mut moved = frame.clone();
+        moved[14 + 20 + 1] = 0x3a;
+        let elsewhere = header(
+            &s,
+            &t.overlays[0],
+            REMOTE4.into(),
+            &moved,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
+        assert_ne!(&elsewhere.bytes()[34..36], &b[34..36]);
+        // Not to an address off the list, and no inner VLAN tag.
+        let stranger = IpAddr::from([192, 0, 2, 9]);
+        assert_eq!(
+            header(
+                &s,
+                &t.overlays[0],
+                stranger,
+                &frame,
+                |_| false,
+                &mut NullTrace
+            )
+            .unwrap_err(),
+            DropReason::OverlayUnknownPeer
+        );
+        let mut tagged = frame;
+        tagged[12..14].copy_from_slice(&[0x81, 0x00]);
+        assert_eq!(
+            header(
+                &s,
+                &t.overlays[0],
+                REMOTE4.into(),
+                &tagged,
+                |_| false,
+                &mut NullTrace
+            )
+            .unwrap_err(),
+            DropReason::OverlayInvalid
+        );
+    }
+
+    #[test]
+    fn vxlan_over_ipv6_has_a_udp_checksum() {
+        let local: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let remote: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let t = vxlan(local.into(), vec![remote.into()]);
+        let s = snapshot(&t);
+        let frame = inner();
+        let h = header(
+            &s,
+            &t.overlays[0],
+            remote.into(),
+            &frame,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
+        let b = h.bytes();
+        assert_eq!(b.len(), 14 + 40 + 16);
+        let length = u16::try_from(16 + frame.len()).unwrap();
+        let mut pseudo = b[22..54].to_vec();
+        pseudo.extend_from_slice(&[0, 0]);
+        pseudo.extend_from_slice(&length.to_be_bytes());
+        pseudo.extend_from_slice(&[0, 0, 0, 17]);
+        pseudo.extend_from_slice(&b[54..70]);
+        pseudo.extend_from_slice(&frame);
+        assert_ne!(&b[60..62], &[0, 0]);
+        assert_eq!(crate::internet_checksum(&pseudo), 0);
+    }
+
+    fn outer_vxlan(source: Ipv4Addr, flags: u8, vni: u32, frame: &[u8]) -> Vec<u8> {
+        let mut p = PORT_MAC.to_vec();
+        p.extend_from_slice(&PEER_MAC);
+        p.extend_from_slice(&[0x08, 0x00]);
+        let total = u16::try_from(20 + 16 + frame.len()).unwrap();
+        let mut ip = vec![0x45, 0];
+        ip.extend_from_slice(&total.to_be_bytes());
+        ip.extend_from_slice(&[0, 0, 0x40, 0, 64, 17, 0, 0]);
+        ip.extend_from_slice(&source.octets());
+        ip.extend_from_slice(&LOCAL4.octets());
+        let checksum = crate::ipv4_header_checksum(&ip);
+        ip[10..12].copy_from_slice(&checksum.to_be_bytes());
+        p.extend_from_slice(&ip);
+        let length = u16::try_from(16 + frame.len()).unwrap();
+        p.extend_from_slice(&[0xc0, 0x01, 0x12, 0xb5]);
+        p.extend_from_slice(&length.to_be_bytes());
+        p.extend_from_slice(&[0, 0, flags, 0, 0, 0]);
+        p.extend_from_slice(&vni.to_be_bytes()[1..]);
+        p.push(0);
+        p.extend_from_slice(frame);
+        p
+    }
+
+    #[test]
+    fn vxlan_unwraps_from_listed_vteps_with_the_vni() {
+        let t = vxlan(LOCAL4.into(), vec![REMOTE4.into()]);
+        let frame = inner();
+        let (result, bytes, ingress) = unwrap(&t, outer_vxlan(REMOTE4, 0x08, 100, &frame));
+        assert_eq!(
+            result,
+            Ok(Received::Unwrapped {
+                vtep: Some(REMOTE4.into())
+            })
+        );
+        assert_eq!((bytes, ingress), (frame.clone(), MEMBER));
+        let stranger = Ipv4Addr::new(192, 0, 2, 9);
+        for (outer, reason) in [
+            (
+                outer_vxlan(stranger, 0x08, 100, &frame),
+                DropReason::OverlayUnknownPeer,
+            ),
+            (
+                outer_vxlan(REMOTE4, 0x08, 101, &frame),
+                DropReason::OverlayUnknownPeer,
+            ),
+            (
+                outer_vxlan(REMOTE4, 0, 100, &frame),
+                DropReason::OverlayInvalid,
+            ),
+        ] {
+            assert_eq!(unwrap(&t, outer).0, Err(reason));
+        }
+        let mut tagged = frame;
+        tagged[12..14].copy_from_slice(&[0x81, 0x00]);
+        assert_eq!(
+            unwrap(&t, outer_vxlan(REMOTE4, 0x08, 100, &tagged)).0,
+            Err(DropReason::OverlayInvalid)
+        );
+        // Another UDP port: not VXLAN's.
+        let mut other = outer_vxlan(REMOTE4, 0x08, 100, &inner());
+        other[36..38].copy_from_slice(&4790_u16.to_be_bytes());
+        assert_eq!(unwrap(&t, other).0, Ok(Received::NotOverlay));
+    }
+
+    #[test]
+    fn vxlan_sends_to_the_learned_vtep_only() {
+        let t = vxlan(LOCAL4.into(), vec![REMOTE4.into()]);
+        let s = snapshot(&t);
+        let mut packet = lease(PORT, inner());
+        assert_eq!(
+            transmit_member(&mut packet, MEMBER, None, &s, |_| false, &mut NullTrace),
+            Err(DropReason::OverlayNoRoute)
+        );
+        let port = transmit_member(
+            &mut packet,
+            MEMBER,
+            Some(REMOTE4.into()),
+            &s,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
+        assert_eq!(&packet.bytes_mut()[30..34], &REMOTE4.octets());
+        packet.commit(port);
     }
 }

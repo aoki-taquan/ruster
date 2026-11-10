@@ -705,8 +705,15 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
                     let member = bridges.transmit(egress, packet.bytes_mut(), snapshot.now.0)?;
                     let irb = |id: IfId| bridges.irb_of(id).is_some();
                     member
-                        .map(|member| {
-                            crate::overlay::transmit_member(&mut packet, member, outer, irb, trace)
+                        .map(|(member, to)| {
+                            crate::overlay::transmit_member(
+                                &mut packet,
+                                member,
+                                to,
+                                outer,
+                                irb,
+                                trace,
+                            )
                         })
                         .transpose()
                 }

@@ -682,7 +682,9 @@ where
             for frame in members.bridges.flood() {
                 let mut dropped = 0;
                 for &member in members.bridges.members(frame.bridge) {
-                    if Some(member) != frame.from && !members.send(member, frame.bytes()) {
+                    if members.floods_to(frame.from, member)
+                        && !members.send(member, None, frame.bytes())
+                    {
                         dropped += 1;
                     }
                 }
@@ -1091,11 +1093,11 @@ where
             let mut dropped = 0;
             {
                 let mut members = Members::of(self, &mut trace);
-                if let Some(member) = known {
-                    sent = members.send(member, frame);
+                if let Some((member, vtep)) = known {
+                    sent = members.send(member, vtep, frame);
                 } else {
                     for &member in members.bridges.members(bridge) {
-                        if members.send(member, frame) {
+                        if members.send(member, None, frame) {
                             sent = true;
                         } else {
                             dropped += 1;
@@ -1187,19 +1189,47 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
         }
     }
 
-    /// Sends `frame` out of `member`.
-    fn send(&mut self, member: IfId, frame: &[u8]) -> bool {
+    /// Sends `frame` out of `member`: for an overlay, to remote end `vtep` when it
+    /// is known (a VXLAN interface's, learned with the destination), or to each of
+    /// its remote ends. Whether it went out at least once.
+    fn send(&mut self, member: IfId, vtep: Option<IpAddr>, frame: &[u8]) -> bool {
+        let Some(overlay) = self.outer.overlay(member) else {
+            return send_member(self.io, self.vlans, member, frame);
+        };
+        let remotes = match &vtep {
+            Some(vtep) if overlay.is_vxlan() => std::slice::from_ref(vtep),
+            _ => overlay.remotes(),
+        };
         let bridges = self.bridges;
-        let irb = |id: IfId| bridges.irb_of(id).is_some();
-        match self.outer.overlay_header(member, frame, irb, self.trace) {
-            None => send_member(self.io, self.vlans, member, frame),
-            Some(Ok(header)) => {
-                send_parts(self.io, self.vlans, header.egress, header.bytes(), frame)
+        let mut sent = false;
+        for &remote in remotes {
+            let irb = |id: IfId| bridges.irb_of(id).is_some();
+            match self
+                .outer
+                .overlay_header(member, remote, frame, irb, self.trace)
+            {
+                Some(Ok(header)) => {
+                    sent |= send_parts(self.io, self.vlans, header.egress, header.bytes(), frame);
+                }
+                Some(Err(reason)) => self.trace.overlay_drop(reason),
+                None => {}
             }
-            Some(Err(reason)) => {
-                self.trace.overlay_drop(reason);
-                false
-            }
+        }
+        sent
+    }
+
+    /// Whether a frame flooded from `from` goes out of `member`: not back where it
+    /// came from, nor from one VXLAN interface to another (RFC 8365 section 8.3:
+    /// each VTEP sends its own frames to every other).
+    fn floods_to(&self, from: Option<IfId>, member: IfId) -> bool {
+        let vxlan = |id: IfId| {
+            self.outer
+                .overlay(id)
+                .is_some_and(ruster_core::Overlay::is_vxlan)
+        };
+        match from {
+            Some(from) => from != member && !(vxlan(from) && vxlan(member)),
+            None => true,
         }
     }
 }
