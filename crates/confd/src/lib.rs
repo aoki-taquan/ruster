@@ -43,6 +43,7 @@ pub mod bgp;
 pub mod delegated;
 pub mod dhcp6;
 pub mod dhcp_client;
+pub mod diff;
 pub mod file;
 pub mod kernel;
 pub mod part;
@@ -585,6 +586,20 @@ impl Confd {
         outside.sort();
         outside.dedup();
         outside
+    }
+
+    /// What confd writes now, and what `config` would make it write with the values
+    /// the sources have now, without sending anything (`ruster diff`): the FE's
+    /// tables, and the routes it offers ribd.
+    pub fn tables_now_and_with(&mut self, config: &Config) -> [[BTreeMap<Key, Value>; 2]; 2] {
+        let now = [self.fe_tables(), self.routes()];
+        let with = delegated::with_delegated(config, &self.sources);
+        let saved = std::mem::replace(&mut self.current, with);
+        let then = [self.fe_tables(), self.routes()];
+        self.current = saved;
+        let [fe_now, routes_now] = now;
+        let [fe_then, routes_then] = then;
+        [[fe_now, fe_then], [routes_now, routes_then]]
     }
 
     /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.

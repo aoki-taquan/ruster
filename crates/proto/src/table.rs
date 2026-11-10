@@ -1510,6 +1510,70 @@ pub fn format_mac(mac: &[u8; 6]) -> String {
     parts.join(":")
 }
 
+/// An interface, address, route or neighbor entry as a line of text for a person
+/// (`ruster show`); `None` for the other tables.
+pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
+    let line = match (key, value) {
+        (
+            Key::Interface { name },
+            Value::Interface {
+                enabled,
+                mac,
+                mtu,
+                vrf,
+                vlan,
+                tunnel,
+                pppoe,
+            },
+        ) => format!(
+            "interface {name} {} mac {} mtu {mtu} vrf {vrf}{}{}{}",
+            if *enabled { "up" } else { "down" },
+            format_mac(mac),
+            vlan.as_ref()
+                .map(|v| format!(" vlan {} on {}", v.id, v.parent))
+                .unwrap_or_default(),
+            tunnel
+                .as_ref()
+                .map(|t| format!(" tunnel {} to {}", t.local, t.remote))
+                .unwrap_or_default(),
+            pppoe
+                .as_ref()
+                .map(|p| format!(
+                    " pppoe session {} on {} to {}",
+                    p.session,
+                    p.parent,
+                    format_mac(&p.peer)
+                ))
+                .unwrap_or_default()
+        ),
+        (Key::Address { interface, address }, Value::Address { prefix_len }) => {
+            format!("address {interface} {address}/{prefix_len}")
+        }
+        (Key::Route { vrf, prefix, len }, Value::Route(action)) => {
+            let action = match action {
+                RouteAction::Forward(hops) => hops
+                    .iter()
+                    .map(|hop| match hop.address {
+                        Some(via) => format!("via {via} dev {}", hop.interface),
+                        None => format!("dev {}", hop.interface),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                RouteAction::Local => "local".into(),
+                RouteAction::Discard => "discard".into(),
+                RouteAction::Reject => "reject".into(),
+                RouteAction::LookupVrf(other) => format!("lookup-vrf {other}"),
+            };
+            format!("route {vrf} {prefix}/{len} {action}")
+        }
+        (Key::Neighbor { interface, address }, Value::Neighbor { mac }) => {
+            format!("neighbor {interface} {address} {}", format_mac(mac))
+        }
+        _ => return None,
+    };
+    Some(line)
+}
+
 pub fn parse_mac(text: &str) -> Result<[u8; 6], ModelError> {
     let invalid = ModelError::Invalid("MAC address");
     let mut mac = [0; 6];

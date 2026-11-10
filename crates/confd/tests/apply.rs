@@ -438,3 +438,44 @@ fn a_rollback_to_a_lock_form_this_confd_does_not_read_is_refused_with_a_hint() {
     assert!(answers[0].1.contains("ruster.toml is kept"), "{answers:?}");
     assert_eq!(rig.apply.versions().latest().unwrap().number, 3);
 }
+
+#[test]
+fn a_diff_shows_the_changes_and_sends_nothing() {
+    let mut rig = Rig::new();
+    rig.cli.post(&["diff"], text(1400).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].0, Code::CONTENT, "{answers:?}");
+    let said = &answers[0].1;
+    assert!(said.contains("--- version 1\n+++ new\n"), "{said}");
+    assert!(said.contains("\n-mtu = 1500\n+mtu = 1400\n"), "{said}");
+    assert!(
+        said.contains(
+            "- interface lan up mac 02:00:00:00:00:01 mtu 1500 vrf default\n\
+             + interface lan up mac 02:00:00:00:00:01 mtu 1400 vrf default\n"
+        ),
+        "{said}"
+    );
+    assert!(
+        said.contains("routes offered to ribd:\nno change\n"),
+        "{said}"
+    );
+    // Nothing was sent or kept.
+    assert_eq!(rig.mtu(), Some(1500));
+    assert_eq!(rig.apply.versions().list().len(), 1);
+
+    // The configuration in use has no change; a file with an error has no diff.
+    rig.cli.post(&["diff"], text(1500).as_bytes());
+    rig.cli.post(&["diff"], b"[[interface]]\n");
+    let answers = rig.answers();
+    assert_eq!(answers[0].1.matches("no change").count(), 3, "{answers:?}");
+    assert_eq!(answers[1].0, Code::BAD_REQUEST, "{answers:?}");
+
+    // While a change waits for answers, the version is not what is in use.
+    let _silent = std::mem::take(&mut rig.fe);
+    rig.cli.post(&["config"], text(1300).as_bytes());
+    rig.cli.post(&["diff"], text(1400).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers.len(), 1, "{answers:?}");
+    assert_eq!(answers[0].0, Code::SERVICE_UNAVAILABLE, "{answers:?}");
+}

@@ -6,6 +6,7 @@
 //! | POST `config`, the file's text | put it in use (below) |
 //! | POST `rollback/<N>` | put version N's configuration in use, the same way |
 //! | GET `versions` | 2.05 Content: the versions kept, a line each, newest first ([`Versions::listing`]) |
+//! | POST `diff`, the file's text | 2.05 Content: what putting it in use would change, sending nothing ([`crate::diff`]) |
 //!
 //! Requests are framed like the other sockets. For POST `config`, confd reads the text as
 //! it reads its file at start-up; for `rollback/<N>`, version N's lock form (4.04 Not
@@ -18,11 +19,11 @@
 //! | Answer | Meaning |
 //! |---|---|
 //! | 2.04 Changed | every connected process answered yes, and the configuration was kept as a version |
-//! | 2.05 Content | the answer to GET `versions` |
+//! | 2.05 Content | the answer to GET `versions` and POST `diff` |
 //! | 4.00 Bad Request | the file or the version does not read, `<N>` is not a number, or a process refused the change; in the last case confd puts the configuration it had before back |
 //! | 4.04 Not Found | version N is not kept, or the resource is not one of the above |
 //! | 5.00 Internal Server Error | the configuration is in use, but writing the version failed |
-//! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers |
+//! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers (for `diff` too, since what is in use is not yet a version) |
 //! | 5.04 Gateway Timeout | a process has not answered in time |
 //!
 //! After 5.04 confd keeps waiting: if the answer is a refusal, it puts the configuration
@@ -40,8 +41,8 @@
 //! Limits:
 //! - Static routes go through ribd, which takes any route; a route the FE then refuses
 //!   is not seen here.
-//! - A new configuration is sent to the processes and taken in one step: there is no
-//!   preview of the changes and no confirm-or-revert yet.
+//! - `diff` shows only what confd itself writes; the other processes are asked only
+//!   when the configuration is put in use. There is no confirm-or-revert yet.
 //!
 //! # Standards
 //!
@@ -58,7 +59,7 @@ use ruster_proto::conn::{Connection, Incoming, Outgoing};
 use ruster_proto::task::Progress;
 
 use crate::versions::Versions;
-use crate::{file, Confd, Config, PeerKind};
+use crate::{diff, file, Confd, Config, PeerKind};
 
 /// The largest configuration file accepted.
 const LIMIT: usize = 1 << 20;
@@ -219,11 +220,22 @@ impl Apply {
         let busy = self.pending.is_some() || !confd.settled();
         let candidate = match (request.code, path.as_slice()) {
             (Code::GET, ["versions"]) => return Some((Code::CONTENT, self.versions.listing())),
-            (Code::POST, ["config"] | ["rollback", _]) if busy => {
+            (Code::POST, ["config" | "diff"] | ["rollback", _]) if busy => {
                 return Some((
                     Code::SERVICE_UNAVAILABLE,
                     "an earlier configuration is still waiting for answers".to_owned(),
                 ))
+            }
+            (Code::POST, ["diff"]) => {
+                return Some(
+                    match std::str::from_utf8(&request.payload)
+                        .map_err(|_| "the file is not UTF-8".to_owned())
+                        .and_then(file::candidate)
+                    {
+                        Err(error) => (Code::BAD_REQUEST, error),
+                        Ok(candidate) => (Code::CONTENT, self.diff(confd, &candidate)),
+                    },
+                )
             }
             (Code::POST, ["config"]) => std::str::from_utf8(&request.payload)
                 .map_err(|_| "the file is not UTF-8".to_owned())
@@ -276,6 +288,32 @@ impl Apply {
                 None
             }
         }
+    }
+
+    /// What `candidate` would change, as text for a person ([`crate::diff`]).
+    fn diff(&self, confd: &mut Confd, candidate: &file::Candidate) -> String {
+        let (name, lock) = match self.versions.latest() {
+            Some(latest) => (format!("version {}", latest.number), latest.lock.as_str()),
+            None => ("nothing".to_owned(), ""),
+        };
+        let none = |text: String| {
+            if text.is_empty() {
+                "no change\n".into()
+            } else {
+                text
+            }
+        };
+        let [[fe_now, fe_then], [routes_now, routes_then]] =
+            confd.tables_now_and_with(&candidate.config);
+        format!(
+            "lock form:\n{}\nFE tables (with the values the sources have now):\n{}\n\
+             routes offered to ribd:\n{}\n\
+             not shown: what the other processes would do with their parts; they are \
+             asked when it is applied\n",
+            none(diff::lines(lock, &candidate.lock, (&name, "new"))),
+            none(diff::tables(&fe_now, &fe_then)),
+            none(diff::tables(&routes_now, &routes_then)),
+        )
     }
 
     /// Sends a new configuration to the processes; [`Apply::finish`] answers
