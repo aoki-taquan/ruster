@@ -185,3 +185,61 @@ fn the_documented_example_is_resolved() {
     assert_eq!(blocks.len(), 2);
     resolve(&blocks[0]).unwrap();
 }
+
+const DNS_INTERFACES: &str = r#"
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+ipv4 = "192.0.2.1/24"
+ipv6 = ["fe80::1/64", "2001:db8:1::1/64"]
+
+[[interface]]
+name = "wan"
+mac = "02:00:00:00:00:02"
+ipv4 = "198.51.100.2/24"
+
+[[interface]]
+name = "red"
+mac = "02:00:00:00:00:03"
+ipv4 = "10.0.0.1/24"
+vrf = "red"
+"#;
+
+#[test]
+fn dns_answers_on_nat_s_inside_when_listen_is_left_out() {
+    let text = format!(
+        "{DNS_INTERFACES}\n[nat]\ninside = \"lan\"\noutside = \"wan\"\n\n[dns]\nupstream = [\"192.0.2.53\"]\n"
+    );
+    let lock = resolve(&text).unwrap();
+    let dns = &lock.dns[0];
+    assert_eq!(dns.listen, ["192.0.2.1", "2001:db8:1::1"], "no link-local");
+    assert_eq!(dns.allow, ["192.0.2.0/24", "2001:db8:1::/64"]);
+    assert_eq!(dns.upstream, ["192.0.2.53"]);
+    assert!(dns.upstream_from.is_empty());
+    assert_eq!(parse_lock(&lock.to_text()).unwrap(), lock);
+}
+
+#[test]
+fn dns_listens_where_it_is_told() {
+    let text = format!("{DNS_INTERFACES}\n[dns]\nlisten = [\"lan\", \"wan\"]\n");
+    let dns = resolve(&text).unwrap().dns.remove(0);
+    assert_eq!(dns.listen, ["192.0.2.1", "2001:db8:1::1", "198.51.100.2"]);
+    assert_eq!(
+        dns.allow,
+        ["192.0.2.0/24", "2001:db8:1::/64", "198.51.100.0/24"]
+    );
+    assert!(dns.upstream.is_empty(), "it resolves from the root");
+    assert!(resolve(DNS_INTERFACES).unwrap().dns.is_empty());
+}
+
+#[test]
+fn dns_needs_somewhere_to_listen() {
+    for (dns, error) in [
+        ("[dns]\n", "give listen"),
+        ("[dns]\nlisten = [\"nope\"]\n", "no such interface"),
+        ("[dns]\nlisten = [\"red\"]\n", "default VRF"),
+    ] {
+        let error_text = resolve(&format!("{DNS_INTERFACES}\n{dns}")).unwrap_err();
+        assert!(error_text.contains(error), "{dns}: {error_text}");
+    }
+}

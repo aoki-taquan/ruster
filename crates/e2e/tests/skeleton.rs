@@ -71,6 +71,7 @@ fn config() -> Config {
         firewall_outside: None,
         icmp_errors: None,
         nat: None,
+        dns: None,
     }
 }
 

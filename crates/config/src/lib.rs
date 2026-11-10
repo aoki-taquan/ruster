@@ -118,6 +118,14 @@
 //!                              # independent filtering) and ICMP, of one LAN host
 //!                              # (both also in [map-e]; setting or lowering one
 //!                              # drops every NAT flow)
+//!
+//! [dns]                        # optional: the DNS server for the LAN (Unbound,
+//!                              # through ruster-unbound)
+//! upstream = ["192.0.2.53"]    # optional: the servers it forwards every query to;
+//!                              # when left out it resolves from the root itself
+//! listen = ["lan.10"]          # optional: the interfaces of the default VRF it
+//!                              # answers on; when left out, the inside of [nat] or
+//!                              # [map-e] (one of them, or listen, must be given)
 //! ```
 //!
 //! # The lock form
@@ -195,6 +203,14 @@
 //! destination = []
 //! source-ports = []
 //! destination-ports = ["53"]
+//!
+//! [[dns]]                      # none or one
+//! listen = ["192.0.2.1"]       # the router's addresses it answers on: those of the
+//!                              # listen interfaces (not link-local ones)
+//! allow = ["192.0.2.0/24"]     # the clients it answers: their prefixes
+//! upstream = ["192.0.2.53"]    # empty: it resolves from the root itself
+//! upstream-from = []           # the sources whose DNS servers it uses too (a WAN
+//!                              # DHCP client, say); none can be given yet
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
@@ -266,6 +282,23 @@ pub struct Lock {
     pub nat: Vec<Nat>,
     pub route: Vec<Route>,
     pub firewall: Vec<FirewallRule>,
+    /// None or one.
+    pub dns: Vec<Dns>,
+}
+
+/// The DNS server for the LAN: Unbound, which `ruster-unbound` configures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Dns {
+    /// The router's addresses it answers on.
+    pub listen: Vec<String>,
+    /// The prefixes of the clients it answers.
+    pub allow: Vec<String>,
+    /// The servers it forwards every query to; none: it resolves from the root.
+    pub upstream: Vec<String>,
+    /// The sources whose DNS servers it also forwards to, found at run time. None
+    /// can be given yet.
+    pub upstream_from: Vec<String>,
 }
 
 /// The firewall's outside interfaces.

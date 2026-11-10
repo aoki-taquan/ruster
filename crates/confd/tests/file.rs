@@ -1055,3 +1055,42 @@ fn the_lock_form_is_read_as_its_file() {
             .contains("at most one")
     );
 }
+
+#[test]
+fn the_dns_section_is_kept_and_checked() {
+    let text = format!("{GOOD}\n[dns]\nlisten = [\"lan\"]\nupstream = [\"192.0.2.53\"]\n");
+    let dns = parse(&text).unwrap().dns.unwrap();
+    assert_eq!(dns.listen, ["192.0.2.1"]);
+    assert_eq!(dns.allow, ["192.0.2.0/24"]);
+    assert_eq!(parse(GOOD).unwrap().dns, None);
+
+    let lock = ruster_config::resolve(&text).unwrap().to_text();
+    assert_eq!(parse(&lock).unwrap(), parse(&text).unwrap());
+    for (from, to, expected) in [
+        ("listen = [\"192.0.2.1\"]", "listen = []", "at least one"),
+        (
+            "listen = [\"192.0.2.1\"]",
+            "listen = [\"192.0.2.9\"]",
+            "address of an interface",
+        ),
+        (
+            "allow = [\"192.0.2.0/24\"]",
+            "allow = [\"192.0.2.1/24\"]",
+            "no bits after",
+        ),
+        (
+            "upstream = [\"192.0.2.53\"]",
+            "upstream = [\"224.0.0.1\"]",
+            "unicast",
+        ),
+        (
+            "upstream-from = []",
+            "upstream-from = [\"dhcp-wan\"]",
+            "cannot name a source yet",
+        ),
+    ] {
+        assert!(lock.contains(from), "{lock}");
+        let e = error(&lock.replacen(from, to, 1));
+        assert!(e.contains(expected), "{to}: {e}");
+    }
+}
