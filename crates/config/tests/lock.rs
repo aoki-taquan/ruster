@@ -1,0 +1,92 @@
+//! The lock form.
+
+use ruster_config::{parse_lock, FirewallOutside, Kind, Target};
+
+/// The lock form example in the crate's documentation.
+fn example() -> String {
+    let source = include_str!("../src/lib.rs");
+    let block = source.split("//! ```toml\n").nth(1).unwrap();
+    block
+        .lines()
+        .take_while(|line| *line != "//! ```")
+        .map(|line| line.strip_prefix("//!").unwrap().trim_start_matches(' '))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_documented_example_is_read() {
+    let lock = parse_lock(&example()).unwrap();
+    assert_eq!(lock.version, 1);
+    assert_eq!(lock.firewall_outside, FirewallOutside::Derive);
+    assert_eq!(
+        lock.interface[1].kind,
+        Kind::Vlan {
+            parent: "lan".into(),
+            id: 10
+        }
+    );
+    assert_eq!(lock.route[0].target, Target::Discard);
+    assert_eq!(
+        lock.route[1].target,
+        Target::Forward {
+            interface: "lan".into(),
+            via: vec!["192.0.2.254".into()]
+        }
+    );
+    assert_eq!(lock.firewall[0].destination_ports, ["53"]);
+}
+
+#[test]
+fn the_lock_form_reads_back_the_same() {
+    let lock = parse_lock(&example()).unwrap();
+    let text = lock.to_text();
+    assert_eq!(parse_lock(&text).unwrap(), lock, "{text}");
+    let mut other = lock.clone();
+    other.firewall_outside = FirewallOutside::Interfaces(vec!["lan".into()]);
+    other.route.push(ruster_config::Route {
+        vrf: "red".into(),
+        prefix: "0.0.0.0/0".into(),
+        target: Target::LookupVrf("default".into()),
+    });
+    other.interface[0].kind = Kind::Tunnel {
+        local: "2001:db8::1".into(),
+        remote: "2001:db8::2".into(),
+    };
+    assert_eq!(parse_lock(&other.to_text()).unwrap(), other);
+}
+
+#[test]
+fn a_lock_must_give_every_key() {
+    let text = parse_lock(&example()).unwrap().to_text();
+    for key in [
+        "mtu = 1500\n",
+        "firewall-outside = \"derive\"\n",
+        "ipv6 = []\n",
+        "map-e = []\n",
+        "external = []\n",
+        "ipv6-burst = 10\n",
+    ] {
+        assert!(text.contains(key), "{key} in {text}");
+        let missing = text.replacen(key, "", 1);
+        let error = parse_lock(&missing).unwrap_err();
+        assert!(error.contains("missing"), "{key}: {error}");
+    }
+    let error =
+        parse_lock(&text.replacen("mtu = 1500\n", "mtu = 1500\nspeed = 1\n", 1)).unwrap_err();
+    assert!(error.contains("unknown field"), "{error}");
+    let error = parse_lock(&text.replace("\"derive\"", "\"guess\"")).unwrap_err();
+    assert!(error.contains("firewall-outside"), "{error}");
+}
+
+#[test]
+fn another_version_is_refused() {
+    let text = parse_lock(&example()).unwrap().to_text();
+    let error = parse_lock(&text.replacen("version = 1", "version = 2", 1)).unwrap_err();
+    assert!(
+        error.contains("version 2") && error.contains("reads version 1"),
+        "{error}"
+    );
+    let error = parse_lock(&text.replacen("version = 1\n", "", 1)).unwrap_err();
+    assert!(error.contains("version is missing"), "{error}");
+}
