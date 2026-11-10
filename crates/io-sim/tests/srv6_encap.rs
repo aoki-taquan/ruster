@@ -312,3 +312,55 @@ fn a_generated_frame_is_wrapped_too() {
     assert_eq!(frame[14 + 6], 43);
     assert!(default.srv6_frame(LAN, &ipv4(28, false)).is_none());
 }
+
+#[test]
+fn reduced_with_two_segments_lists_only_the_second() {
+    // RFC 8986 5.2 and RFC 8754 4.1.1: the SRH holds Segment List[0] = the second
+    // segment only; Segments Left 1, Last Entry 0, Hdr Ext Len 2.
+    let tables = tables(&["fc00:2::1", "fc00:4::4"], true);
+    let (sent, _) = run(&tables, ipv4(28, false));
+    let (_, frame) = sent.expect("sent");
+    let ip = 14;
+    assert_eq!(&frame[ip + 24..ip + 40], &ip6("fc00:2::1"));
+    assert_eq!(
+        u16::from_be_bytes([frame[ip + 4], frame[ip + 5]]),
+        8 + 16 + 28,
+        "Payload Length"
+    );
+    let srh = ip + 40;
+    assert_eq!(&frame[srh..srh + 8], &[4, 2, 4, 1, 0, 0, 0, 0]);
+    assert_eq!(&frame[srh + 8..srh + 24], &ip6("fc00:4::4"));
+    assert_eq!(frame.len(), srh + 24 + 28);
+}
+
+#[test]
+fn reduced_with_one_segment_needs_no_header_either() {
+    // RFC 8754 4.1: with one segment there is no SRH; the destination is it.
+    let tables = tables(&["fc00:4::6"], true);
+    let (sent, _) = run(&tables, ipv4(28, false));
+    let (_, frame) = sent.expect("sent");
+    assert_eq!(frame[14 + 6], 4, "Next Header IPv4");
+    assert_eq!(&frame[14 + 24..14 + 40], &ip6("fc00:4::6"));
+    assert_eq!(frame.len(), 14 + 40 + 28);
+}
+
+#[test]
+fn ipv6_inside_a_segment_routing_header_is_next_header_41() {
+    // RFC 8986 5.1: the SRH's Next Header names the inner packet, IPv6 (41); the
+    // outer Payload Length counts the SRH and the whole inner packet.
+    let tables = tables(&["fc00:2::1", "fc00:4::6"], false);
+    let (sent, _) = run(&tables, ipv6(8));
+    let (_, frame) = sent.expect("sent");
+    let ip = 14;
+    assert_eq!(frame[ip + 6], 43);
+    assert_eq!(
+        u16::from_be_bytes([frame[ip + 4], frame[ip + 5]]),
+        40 + 40 + 8
+    );
+    let srh = ip + 40;
+    assert_eq!(&frame[srh..srh + 8], &[41, 4, 4, 1, 1, 0, 0, 0]);
+    assert_eq!(&frame[srh + 8..srh + 24], &ip6("fc00:4::6"));
+    assert_eq!(&frame[srh + 24..srh + 40], &ip6("fc00:2::1"));
+    let inner = srh + 40;
+    assert_eq!(&frame[inner + 24..inner + 40], &ip6("2001:db8:c::5"));
+}
