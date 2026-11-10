@@ -386,6 +386,34 @@ where
         self.taps.remove(interface);
     }
 
+    /// The ports that must take frames for every MAC address (promiscuous mode),
+    /// in port order: the bridge members, and the parents of VLAN sub-interfaces
+    /// that are members. A member takes frames for the hosts behind it and for the
+    /// IRB, whose MAC address is not the port's.
+    pub fn promiscuous_ports(&self) -> Vec<String> {
+        let mut wanted = vec![false; self.builder.ports.len()];
+        let bridges = (0..self.bridge_names.len()).filter_map(|b| u16::try_from(b).ok());
+        for bridge in bridges {
+            for &member in self.bridges.members(bridge) {
+                let port = self
+                    .vlans
+                    .iter()
+                    .find(|v| v.sub == member)
+                    .map_or(member, |v| v.parent);
+                if let Some(w) = wanted.get_mut(usize::from(port.0)) {
+                    *w = true;
+                }
+            }
+        }
+        self.builder
+            .ports
+            .iter()
+            .zip(wanted)
+            .filter(|(_, w)| *w)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     /// The VRFs of the current tables, the default VRF first.
     pub fn vrfs(&self) -> &[String] {
         &self.names
