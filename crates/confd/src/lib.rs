@@ -97,6 +97,8 @@ pub struct Config {
     pub nat: Option<ruster_proto::table::Nat>,
     /// The DNS server for the LAN, checked; confd hands it to `ruster-unbound`.
     pub dns: Option<ruster_config::Dns>,
+    /// The DHCP servers, one per interface, checked; confd hands them to `ruster-kea`.
+    pub dhcp: Vec<ruster_config::Dhcp>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -800,6 +802,7 @@ mod tests {
             icmp_errors: None,
             nat: None,
             dns: None,
+            dhcp: Vec::new(),
         });
         let routes = confd.routes();
         let connected = Value::Route(RouteAction::Forward(vec![NextHop {
@@ -853,6 +856,7 @@ mod tests {
             icmp_errors: None,
             nat: None,
             dns: None,
+            dhcp: Vec::new(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
         let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);

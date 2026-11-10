@@ -243,3 +243,38 @@ fn dns_needs_somewhere_to_listen() {
         assert!(error_text.contains(error), "{dns}: {error_text}");
     }
 }
+
+#[test]
+fn dhcp_takes_the_interface_s_address_and_options() {
+    let text = format!(
+        "{DNS_INTERFACES}\n[dns]\nlisten = [\"lan\"]\n\n[[dhcp]]\ninterface = \"lan\"\npool = \"192.0.2.100-192.0.2.199\"\n\n[[dhcp]]\ninterface = \"wan\"\npool = \"198.51.100.10-198.51.100.20\"\nlease-time = 600\nrouter = []\n"
+    );
+    let lock = resolve(&text).unwrap();
+    let [lan, wan] = &lock.dhcp[..] else {
+        panic!("{:?}", lock.dhcp)
+    };
+    assert_eq!(lan.mac, "02:00:00:00:00:01");
+    assert_eq!(lan.address, "192.0.2.1/24");
+    assert_eq!(lan.lease_time, ruster_config::DHCP_LEASE_TIME);
+    assert_eq!(lan.router, ["192.0.2.1"]);
+    assert_eq!(lan.dns, ["192.0.2.1"], "[dns] listens on lan");
+    assert_eq!(wan.lease_time, 600);
+    assert!(wan.router.is_empty());
+    assert!(wan.dns.is_empty(), "[dns] does not listen on wan");
+    assert_eq!(parse_lock(&lock.to_text()).unwrap(), lock);
+    assert!(resolve(DNS_INTERFACES).unwrap().dhcp.is_empty());
+}
+
+#[test]
+fn dhcp_needs_an_interface_with_ipv4() {
+    for (dhcp, error) in [
+        ("interface = \"nope\"", "no such interface"),
+        ("interface = \"ds\"", "no ipv4 address"),
+    ] {
+        let text = format!(
+            "{DNS_INTERFACES}\n[[interface]]\nname = \"ds\"\nmac = \"02:00:00:00:00:04\"\n\n[[dhcp]]\n{dhcp}\npool = \"192.0.2.10-192.0.2.20\"\n"
+        );
+        let got = resolve(&text).unwrap_err();
+        assert!(got.contains(error), "{dhcp}: {got}");
+    }
+}

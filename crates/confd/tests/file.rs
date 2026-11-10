@@ -1094,3 +1094,64 @@ fn the_dns_section_is_kept_and_checked() {
         assert!(e.contains(expected), "{to}: {e}");
     }
 }
+
+#[test]
+fn the_dhcp_section_is_kept_and_checked() {
+    let text = format!(
+        "{GOOD}\n[dns]\nlisten = [\"lan\"]\n\n[[dhcp]]\ninterface = \"lan\"\npool = \"192.0.2.100-192.0.2.199\"\n"
+    );
+    let dhcp = parse(&text).unwrap().dhcp;
+    assert_eq!(dhcp.len(), 1);
+    assert_eq!(dhcp[0].address, "192.0.2.1/24");
+    assert_eq!(dhcp[0].router, ["192.0.2.1"]);
+    assert_eq!(dhcp[0].dns, ["192.0.2.1"], "[dns] listens on lan");
+    assert!(parse(GOOD).unwrap().dhcp.is_empty());
+
+    for (entry, error) in [
+        ("pool = \"192.0.2.0-192.0.2.9\"", "within the hosts"),
+        ("pool = \"192.0.2.200-192.0.2.255\"", "within the hosts"),
+        ("pool = \"192.0.3.10-192.0.3.20\"", "within the hosts"),
+        ("pool = \"192.0.2.1-192.0.2.20\"", "router's address"),
+        ("pool = \"192.0.2.20-192.0.2.10\"", "first not above"),
+        ("pool = \"192.0.2.10\"", "pool must be like"),
+        (
+            "pool = \"192.0.2.10-192.0.2.20\"\nlease-time = 10",
+            "lease-time",
+        ),
+        ("pool = \"192.0.2.10-192.0.2.20\"\ndns = [\"::1\"]", "dns"),
+        (
+            "pool = \"192.0.2.10-192.0.2.20\"\nrouter = [\"0.0.0.0\"]",
+            "router",
+        ),
+    ] {
+        let text = format!("{GOOD}\n[[dhcp]]\ninterface = \"lan\"\n{entry}\n");
+        let got = parse(&text).unwrap_err();
+        assert!(got.contains(error), "{entry}: {got}");
+    }
+    let twice = format!(
+        "{GOOD}\n[[dhcp]]\ninterface = \"lan\"\npool = \"192.0.2.10-192.0.2.20\"\n\n[[dhcp]]\ninterface = \"lan\"\npool = \"192.0.2.30-192.0.2.40\"\n"
+    );
+    assert!(parse(&twice).unwrap_err().contains("given twice"));
+}
+
+#[test]
+fn a_dhcp_lock_entry_must_agree_with_its_interface() {
+    let text = format!("{GOOD}\n[[dhcp]]\ninterface = \"lan\"\npool = \"192.0.2.10-192.0.2.20\"\n");
+    let lock = ruster_config::resolve(&text).unwrap();
+    assert!(ruster_confd::file::config(lock.clone()).is_ok());
+    for (change, error) in [
+        (("mac", "02:00:00:00:00:09"), "mac must be the interface's"),
+        (("address", "192.0.2.2/24"), "address must be"),
+        (("interface", "nope"), "no such interface"),
+    ] {
+        let mut lock = lock.clone();
+        let entry = &mut lock.dhcp[0];
+        match change.0 {
+            "mac" => entry.mac = change.1.into(),
+            "address" => entry.address = change.1.into(),
+            _ => entry.interface = change.1.into(),
+        }
+        let got = ruster_confd::file::config(lock).unwrap_err();
+        assert!(got.contains(error), "{change:?}: {got}");
+    }
+}

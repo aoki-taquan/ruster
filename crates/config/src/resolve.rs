@@ -8,9 +8,9 @@ use serde::Deserialize;
 use ruster_proto::table::DEFAULT_VRF;
 
 use crate::{
-    Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Target,
-    B4_ADDRESS, FILTERING, ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_OVERHEAD, PSID_OFFSET, TUNNEL_MAC,
-    TUNNEL_MTU, VERSION, VLAN_OVERHEAD,
+    Dhcp, Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Target,
+    B4_ADDRESS, DHCP_LEASE_TIME, FILTERING, ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_OVERHEAD,
+    PSID_OFFSET, TUNNEL_MAC, TUNNEL_MTU, VERSION, VLAN_OVERHEAD,
 };
 
 #[derive(Deserialize)]
@@ -28,6 +28,18 @@ struct File {
     nat: Option<NatEntry>,
     map_e: Option<MapEEntry>,
     dns: Option<DnsEntry>,
+    #[serde(default)]
+    dhcp: Vec<DhcpEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct DhcpEntry {
+    interface: String,
+    pool: String,
+    lease_time: Option<u32>,
+    router: Option<Vec<String>>,
+    dns: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -317,6 +329,11 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .dns
         .map(|entry| dns(entry, &interfaces, nat.as_ref(), map_e.as_ref()))
         .transpose()?;
+    let dhcp = file
+        .dhcp
+        .into_iter()
+        .map(|entry| dhcp(entry, &interfaces, dns.as_ref()))
+        .collect::<Result<_, _>>()?;
     Ok(Lock {
         version: VERSION,
         firewall_filtering: filtering(file.firewall_filtering),
@@ -331,6 +348,36 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         route,
         firewall,
         dns: dns.into_iter().collect(),
+        dhcp,
+    })
+}
+
+/// `[[dhcp]]`: the interface's MAC and IPv4 address, and the options' defaults.
+fn dhcp(entry: DhcpEntry, interfaces: &[Interface], dns: Option<&Dns>) -> Result<Dhcp, String> {
+    let at = format!("dhcp {:?}", entry.interface);
+    let interface = interfaces
+        .iter()
+        .find(|i| i.name == entry.interface)
+        .ok_or_else(|| format!("{at}: no such interface"))?;
+    let address = interface
+        .ipv4
+        .first()
+        .ok_or_else(|| format!("{at}: the interface has no ipv4 address"))?;
+    let own = address
+        .split_once('/')
+        .map_or(address.as_str(), |(address, _)| address)
+        .to_owned();
+    let listened = dns.is_some_and(|dns| dns.listen.contains(&own));
+    Ok(Dhcp {
+        interface: entry.interface,
+        mac: interface.mac.clone(),
+        address: address.clone(),
+        pool: entry.pool,
+        lease_time: entry.lease_time.unwrap_or(DHCP_LEASE_TIME),
+        router: entry.router.unwrap_or_else(|| vec![own.clone()]),
+        dns: entry
+            .dns
+            .unwrap_or_else(|| if listened { vec![own] } else { Vec::new() }),
     })
 }
 

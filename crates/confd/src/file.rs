@@ -76,6 +76,12 @@
 //!   and RFC 5382 REQ-3 recommend where application transparency matters most);
 //!   see `ruster_core`'s NAT modules for its deviations. One inside and
 //!   one outside interface, and the outside interface's address as the public one.
+//! - RFC 2131 section 4.1 and RFC 1542 section 4: a `dhcp` serves the clients of one
+//!   port or VLAN of the default VRF through a relay agent whose address (giaddr) is
+//!   the interface's IPv4 address, so the subnet is that address's prefix; the pool
+//!   lies within the subnet's hosts and leaves out the router's address. RFC 2132:
+//!   `router` is option 3, `dns` option 6, `lease-time` option 51. Deviations: one
+//!   pool per interface; a lease is 60 s to 364 days.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -628,6 +634,16 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         .next()
         .map(|entry| dns(entry, &seen))
         .transpose()?;
+    let mut dhcp = Vec::with_capacity(lock.dhcp.len());
+    for entry in lock.dhcp {
+        if dhcp
+            .iter()
+            .any(|d: &ruster_config::Dhcp| d.interface == entry.interface)
+        {
+            return Err(format!("dhcp {:?}: given twice", entry.interface));
+        }
+        dhcp.push(dhcp_entry(entry, &interfaces)?);
+    }
     Ok(Config {
         interfaces,
         static_routes,
@@ -637,7 +653,95 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         icmp_errors,
         nat,
         dns,
+        dhcp,
     })
+}
+
+/// The longest DHCP lease: a day short of a year, well within what Kea and the
+/// 32-bit lease time option (RFC 2132 section 9.2) hold.
+const DHCP_LEASE_MAX: u32 = 364 * 24 * 3_600;
+
+/// Checks one `dhcp`: it serves a port or VLAN of the default VRF from the
+/// interface's IPv4 address and subnet, and leases a pool in the subnet.
+fn dhcp_entry(
+    entry: ruster_config::Dhcp,
+    interfaces: &[InterfaceConfig],
+) -> Result<ruster_config::Dhcp, String> {
+    let at = format!("dhcp {:?}", entry.interface);
+    let interface = interfaces
+        .iter()
+        .find(|i| i.name == entry.interface)
+        .ok_or_else(|| format!("{at}: no such interface"))?;
+    if interface.vrf != DEFAULT_VRF {
+        return Err(format!("{at}: the interface must be in the default VRF"));
+    }
+    if interface.tunnel.is_some() || interface.pppoe.is_some() {
+        return Err(format!("{at}: the interface must be a port or a VLAN"));
+    }
+    if mac(&entry.mac) != Some(interface.mac) {
+        return Err(format!("{at}: mac must be the interface's"));
+    }
+    let Some((own, len)) = interface.ipv4 else {
+        return Err(format!("{at}: the interface has no ipv4 address"));
+    };
+    if prefix(&entry.address) != Some((IpAddr::V4(own), len)) {
+        return Err(format!(
+            "{at}: address must be the interface's, {own}/{len}"
+        ));
+    }
+    if len > 30 {
+        return Err(format!(
+            "{at}: the interface's prefix has no addresses to lease"
+        ));
+    }
+    let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
+    let subnet = u32::from(own) & mask;
+    // The hosts of the subnet: neither its network nor its broadcast address.
+    let host = |a: Ipv4Addr| {
+        u32::from(a) & mask == subnet
+            && a != Ipv4Addr::from(subnet)
+            && u32::from(a) != subnet | !mask
+    };
+    let (first, last) = entry
+        .pool
+        .split_once('-')
+        .and_then(|(a, b)| Some((a.parse::<Ipv4Addr>().ok()?, b.parse::<Ipv4Addr>().ok()?)))
+        .filter(|(a, b)| a <= b)
+        .ok_or_else(|| {
+            format!("{at}: pool must be like 192.0.2.100-192.0.2.199, the first not above the last")
+        })?;
+    if !host(first) || !host(last) {
+        return Err(format!(
+            "{at}: pool must be within the hosts of {}/{len}",
+            Ipv4Addr::from(subnet)
+        ));
+    }
+    if (first..=last).contains(&own) {
+        return Err(format!(
+            "{at}: pool must not hold the router's address {own}"
+        ));
+    }
+    if !(60..=DHCP_LEASE_MAX).contains(&entry.lease_time) {
+        return Err(format!(
+            "{at}: lease-time must be 60 to {DHCP_LEASE_MAX} seconds"
+        ));
+    }
+    for (what, list) in [("router", &entry.router), ("dns", &entry.dns)] {
+        for text in list {
+            let usable = text.parse::<Ipv4Addr>().is_ok_and(unicast_v4);
+            if !usable {
+                return Err(format!(
+                    "{at}: {what} {text:?} must be a unicast IPv4 address"
+                ));
+            }
+        }
+    }
+    if entry.router.len() > 8 || entry.dns.len() > 8 {
+        return Err(format!(
+            "{at}: router and dns take at most 8 addresses each"
+        ));
+    }
+    Ok(entry)
 }
 
 /// Checks `dns`: it answers on the router's own addresses in the default VRF.
