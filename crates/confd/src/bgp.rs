@@ -13,9 +13,10 @@
 //! - RFC 4760: a session carries the unicast routes of its neighbor's address family
 //!   (IPv4 or IPv6).
 //!
-//! Deviations: only the default VRF; each neighbor must be on the subnet of one of
-//! the default VRF's interfaces (no multihop sessions), so that its next hops are on
-//! a link the FE knows; so link-local IPv6 neighbors are not taken either.
+//! Deviations: only the default VRF; link-local IPv6 neighbors are not taken, since
+//! ribd could not tell the link of their next hops. A neighbor off the links
+//! (multihop) is taken; its session settings (`ebgp-multihop`) go in the operator's
+//! include file.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -102,8 +103,27 @@ pub(crate) fn check(
         if is_own(address, interfaces) {
             return Err(format!("{at}: it is one of the router's addresses"));
         }
-        // On the subnet, and not its network or (IPv4) broadcast address.
-        let on_link = connected.iter().any(|c| {
+        // A unicast address a session can be set up to; a neighbor off the links
+        // (multihop) is reached by the routes ribd has, and its next hops are
+        // resolved there.
+        let unicast = match address {
+            IpAddr::V4(a) => {
+                !(a.is_unspecified() || a.is_loopback() || a.is_multicast() || a.is_broadcast())
+            }
+            IpAddr::V6(a) => {
+                !(a.is_unspecified()
+                    || a.is_loopback()
+                    || a.is_multicast()
+                    || a.is_unicast_link_local())
+            }
+        };
+        if !unicast {
+            return Err(format!(
+                "{at}: must be a unicast address, not a link-local one"
+            ));
+        }
+        // On a subnet: not its network or (IPv4) broadcast address.
+        let not_a_host = connected.iter().any(|c| {
             crate::file::prefix(&c.prefix).is_some_and(|(n, len)| {
                 let max = if n.is_ipv4() { 32 } else { 128 };
                 let broadcast = match (address, n) {
@@ -114,13 +134,12 @@ pub(crate) fn check(
                 };
                 n.is_ipv4() == address.is_ipv4()
                     && network(address, len) == n
-                    && (address != n || len >= max - 1)
-                    && !broadcast
+                    && ((address == n && len < max - 1) || broadcast)
             })
         });
-        if !on_link {
+        if not_a_host {
             return Err(format!(
-                "{at}: must be on the subnet of an enabled interface of the default VRF"
+                "{at}: is the network or broadcast address of a subnet of the default VRF"
             ));
         }
         match neighbor.description.as_slice() {

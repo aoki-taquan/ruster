@@ -135,12 +135,16 @@ confd → 各プロセス: 確定
 - zebraへインターフェースは教えない。confdがkernelのnetnsのTUNにルータのアドレスを付けるので、zebraは
   そこから直結のプレフィックスを知り、直結の近隣の次の転送先を到達できるとみなす。FEのポートのリンクの
   状態はzebraに伝わらない（BGPのholdで切れる）。
-- 次の転送先: zebraはTUNしか見ないので、FPMの経路はゲートウェイのアドレスとTUNの番号で来る。`ruster-frr`は、
-  ゲートウェイを含むdefault VRFのインターフェースのプレフィックス（confdが部分`frr`の`connected`に入れる）から
-  FEのインターフェースを決め、ribdへ「そのインターフェースとゲートウェイ」で渡す。ribdは次の転送先を
-  再帰的に解決しない（ce-processes.mdの「次の転送先の解決」はまだ）ので、近隣はインターフェースの
-  サブネットにあるものだけにする（multihopのBGPはまだ）。kernelの既定経路で次の転送先を解決させる
-  `ip nht resolve-via-default`は使わない（解決しても`ruster-frr`がFEのインターフェースを決められないため）。
+- 次の転送先: zebraはTUNしか見ないので、FPMの経路はゲートウェイのアドレスとTUNの番号で来る。経路の
+  ゲートウェイが全部default VRFのインターフェースのプレフィックス（confdが部分`frr`の`connected`に入れる）に
+  入っていれば、`ruster-frr`は一番長いプレフィックスのインターフェースとゲートウェイでribdへ渡す。一つでも
+  入っていなければ、ゲートウェイのアドレスだけで渡し、ribdが自分の経路で解決する
+  （ce-processes.mdの「次の転送先の解決」）。link-localのゲートウェイは、どのリンクか分からないので渡さない。
+- 直結していない近隣（eBGPのmultihopや、静的経路の先のiBGP）も設定できる。セッションの設定
+  （`ebgp-multihop`、`update-source`）と、zebraにkernelのdefault経路（TUN向け）で次の転送先を到達できると
+  みなさせる`ip nht resolve-via-default`は、運用者のファイル（`include`）に書く。zebraはribdの静的経路を
+  知らないため。その代わり、FEへ入れられるかはribdだけが判断し、bgpdは解決できない次の転送先の経路を
+  選ぶことがある（その経路はFEに入らない）。
 - IPv6の近隣へ広告する次の転送先のlink-localは、FEのそのポートのもの（MACから作る）にする。bgpdは
   TUNのlink-localを渡すが、それにはFEのどのポートも答えない。受けた経路は、link-localではなくグローバルの
   次の転送先を使わせる（どのインターフェースか分かるため）。どちらもroute-mapで行う。

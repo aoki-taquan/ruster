@@ -43,6 +43,11 @@ fn bgp_is_checked() {
     );
     let config = file::parse(&good).unwrap();
     assert_eq!(config.bgp.as_ref().unwrap().neighbor.len(), 2);
+    // Neighbors off the links (multihop) are taken.
+    for address in ["203.0.113.9", "10.3.0.9", "2001:db8:5::9"] {
+        let text = bgp("", &format!("address = \"{address}\"\nremote-as = 1\n"));
+        assert!(file::parse(&text).is_ok(), "{address}");
+    }
     for (top, neighbor, error) in [
         ("router-id = \"0.0.0.0\"\n", PEER, "router-id"),
         ("router-id = \"2001:db8::1\"\n", PEER, "router-id"),
@@ -100,10 +105,10 @@ fn bgp_is_checked() {
             "address = \"198.51.100.1\"\nremote-as = 1\n",
             "router's addresses",
         ),
-        ("", "address = \"203.0.113.9\"\nremote-as = 1\n", "subnet"),
-        ("", "address = \"10.3.0.9\"\nremote-as = 1\n", "subnet"),
-        ("", "address = \"10.4.0.9\"\nremote-as = 1\n", "subnet"),
-        ("", "address = \"2001:db8:5::9\"\nremote-as = 1\n", "subnet"),
+        ("", "address = \"fe80::9\"\nremote-as = 1\n", "link-local"),
+        ("", "address = \"224.0.0.5\"\nremote-as = 1\n", "unicast"),
+        ("", "address = \"127.0.0.1\"\nremote-as = 1\n", "unicast"),
+        ("", "address = \"::\"\nremote-as = 1\n", "unicast"),
         ("", &format!("{PEER}description = \"\"\n"), "description"),
         (
             "",

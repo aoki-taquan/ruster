@@ -232,9 +232,9 @@
 //!                              # adds to FRR's configuration as they are
 //!
 //! [[bgp.neighbor]]
-//! address = "198.51.100.10"    # on the subnet of one of the default VRF's
-//!                              # interfaces; the session carries the unicast
-//!                              # routes of its family (IPv4 or IPv6)
+//! address = "198.51.100.10"    # not link-local; off the links (multihop)
+//!                              # needs settings in `include`; the session carries
+//!                              # the unicast routes of its family (IPv4 or IPv6)
 //! remote-as = 65002
 //! description = "upstream"     # optional
 //!

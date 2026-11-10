@@ -135,8 +135,8 @@ backlogのまま置き、使う場面が出たものから片付ける。
 「作る順番」に従う。lockの形（版1）、confdが各プロセスへ担当の部分を渡すsocket（モジュールごとの`confd/part/<モジュール>/part.sock`）、
 Unboundの橋渡し役（`ruster-unbound`、netns `dns`）と、Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`、
 netns `dhcp`）、neighdのRA（`[[ra]]`、netns `ra`）、DHCPv6のリレー（`[[dhcp6]]`、netns `dhcp6`）まで済んだ。
-FRRの橋渡し役（`[bgp]`、`ruster-frr`、netns `bgp`）も済んだ。BGPは直結の近隣だけで、次の転送先の
-再帰的な解決（ribd）とVRFごとのBGPはまだ。confdは受け取った設定を番号付きの版として`--state-dir`に残し（`ruster versions`、`ruster rollback N`）、
+FRRの橋渡し役（`[bgp]`、`ruster-frr`、netns `bgp`）も済んだ。ribdが直結していない次の転送先を
+自分の経路で解決するので、multihopの近隣も使える。VRFごとのBGPはまだ。confdは受け取った設定を番号付きの版として`--state-dir`に残し（`ruster versions`、`ruster rollback N`）、
 `ruster diff`でlockの形、confdが書くFEの表、ribdへ渡す経路の差分を出す。`ruster apply --confirm-within M`は、
 M分以内に`ruster confirm`が無ければ（confdが起動し直しても）前の版に戻す。各プロセスに差分を聞くのと、
 候補と確定を分けるのはまだ。
