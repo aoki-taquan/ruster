@@ -4,11 +4,29 @@
 //! Every socket lives under one directory (`/run/ruster` by default), at the paths in
 //! [`socket`] (`docs/design/control-protocol.md`). The process that serves a table
 //! listens; the processes that write or read it connect. A listener creates the
-//! directories it needs (readable by the owner only) and removes a socket file left behind by an earlier run before
+//! directories it needs and removes a socket file left behind by an earlier run before
 //! it binds. Next to each socket it holds a lock on `<socket>.lock` until it exits;
 //! when another process holds that lock, the same process is already running, and the
-//! listener stops instead of taking the path over. Whoever may open these sockets may change the tables, so the directory
-//! must be reachable only by the router's processes.
+//! listener stops instead of taking the path over.
+//!
+//! Whoever may open these sockets may change the tables or read the configuration
+//! (PPPoE passwords included), so only the router's processes may reach them. File
+//! permissions do this, whatever the umask:
+//!
+//! - A directory the listener creates gets mode 0750 ([`DIR_MODE`]): the owner and the
+//!   group may enter, others may not.
+//! - Each socket gets mode 0660 ([`SOCKET_MODE`]): the owner and the group may connect
+//!   (connecting needs write permission on the socket file), others may not.
+//! - The group is the one Linux gives a new file: the group of its directory when that
+//!   directory has the set-group-ID bit, otherwise the process's group. A directory the
+//!   listener creates inside a set-group-ID directory keeps that bit, so one group
+//!   set on the top directory reaches every socket under it.
+//!
+//! When every process runs as root (as in the netns scripts), the group is root's and
+//! nothing else is needed. When they run as different users, the top directory (with
+//! the set-group-ID bit and a group shared by the router's processes) and each
+//! process's own directory under it are made beforehand
+//! (`docs/design/ce-processes.md`, "socketの権限").
 
 use std::io::{self, ErrorKind};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
@@ -21,6 +39,12 @@ use crate::task::Progress;
 
 /// The socket directory when none is given.
 pub const DEFAULT_RUN_DIR: &str = "/run/ruster";
+
+/// The mode of a directory a listener creates: the owner and the group may enter.
+pub const DIR_MODE: u32 = 0o750;
+
+/// The mode of each socket file: the owner and the group may connect.
+pub const SOCKET_MODE: u32 = 0o660;
 
 /// Socket file names inside the socket directory.
 pub mod socket {
@@ -90,11 +114,7 @@ impl Clock {
 fn remove_stale(path: &Path) -> io::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     if let Some(parent) = path.parent() {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(parent)?;
+        create_dirs(parent)?;
     }
     take_lock(path)?;
     match std::fs::symlink_metadata(path) {
@@ -106,6 +126,38 @@ fn remove_stale(path: &Path) -> io::Result<()> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Creates `dir` and the directories above it that are missing, each with
+/// [`DIR_MODE`] whatever the umask. A directory that is already there is left as it is.
+fn create_dirs(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    if dir.as_os_str().is_empty() || dir.is_dir() {
+        return Ok(());
+    }
+    if let Some(parent) = dir.parent() {
+        create_dirs(parent)?;
+    }
+    match std::fs::DirBuilder::new().mode(DIR_MODE).create(dir) {
+        Ok(()) => {}
+        // Another process made it in the meantime.
+        Err(error) if error.kind() == ErrorKind::AlreadyExists && dir.is_dir() => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    // The umask may have taken bits away. The set-group-ID bit Linux copies from the
+    // parent stays.
+    let mode = std::fs::metadata(dir)?.permissions().mode();
+    let wanted = (mode & 0o7000) | DIR_MODE;
+    if mode & 0o7777 != wanted {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(wanted))?;
+    }
+    Ok(())
+}
+
+/// Gives the socket at `path` [`SOCKET_MODE`], whatever the umask.
+fn set_socket_mode(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(SOCKET_MODE))
 }
 
 /// The locks this process holds, one per socket path, kept until it exits.
@@ -122,7 +174,9 @@ fn take_lock(path: &Path) -> io::Result<()> {
     }
     let mut name = path.as_os_str().to_owned();
     name.push(".lock");
+    use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
+        .mode(0o600)
         .create(true)
         .truncate(false)
         .write(true)
@@ -146,7 +200,10 @@ fn take_lock(path: &Path) -> io::Result<()> {
 /// A non-blocking listening stream socket at `path`.
 pub fn listen(path: &Path) -> io::Result<UnixListener> {
     remove_stale(path)?;
+    // Until the mode is set the umask decides it; the 0750 directory keeps others out
+    // in the meantime.
     let listener = UnixListener::bind(path)?;
+    set_socket_mode(path)?;
     listener.set_nonblocking(true)?;
     Ok(listener)
 }
@@ -155,6 +212,7 @@ pub fn listen(path: &Path) -> io::Result<UnixListener> {
 pub fn bind_datagram(path: &Path) -> io::Result<UnixDatagram> {
     remove_stale(path)?;
     let socket = UnixDatagram::bind(path)?;
+    set_socket_mode(path)?;
     socket.set_nonblocking(true)?;
     Ok(socket)
 }

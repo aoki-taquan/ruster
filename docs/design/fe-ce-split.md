@@ -62,7 +62,7 @@ CEの各プロセスとFEの間に中継するプロセスは置かない。次�
 |---|---|
 | 起動、停止、再起動、依存順 | systemd |
 | 相手の見つけ方 | 固定のsocketパス（例: `/run/ruster/fe/route.sock`） |
-| 誰が何を書けるか | 表ごとにsocketを分け、ファイルの権限で制御する |
+| 誰が何を書けるか | 表ごとにsocketを分け、ファイルの権限で制御する（[`ce-processes.md`](ce-processes.md)の「socketの権限」） |
 | 設定 | 全体の設定は`ruster-confd`が預かり、各プロセスへ担当の部分を配る（[`router-box.md`](router-box.md)） |
 | 状態の表示 | 各プロセスが自分の状態を返し、CLIが並べる |
 
