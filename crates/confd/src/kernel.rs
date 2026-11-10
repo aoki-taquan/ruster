@@ -104,16 +104,8 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
         // With NAT, the router's own IPv4 leaves from its address on NAT's inside,
         // so that NAT translates it as a host's there (`fe-ce-split.md`).
         let nat_source = (*vrf == DEFAULT_VRF)
-            .then_some(config.nat.as_ref())
-            .flatten()
-            .and_then(|nat| {
-                config
-                    .interfaces
-                    .iter()
-                    .find(|i| i.name == nat.inside && i.enabled)
-            })
-            .and_then(|inside| inside.ipv4)
-            .map(|(address, _)| address.to_string());
+            .then(|| nat_inside_address(config))
+            .flatten();
         // NAT's outside prefix too: otherwise a host on the WAN's subnet (the ISP's
         // gateway) is reached from the WAN address, which is NAT's public address, and
         // its answers find no mapping there. Every other IPv4 prefix leaves from its
@@ -161,7 +153,8 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
             .map(|b| format!("{b:02x}"))
             .collect::<Vec<_>>()
             .join(":");
-        let mtu = interface.mtu.to_string();
+        // The FE takes frames of up to 1514 bytes from a TAP device.
+        let mtu = interface.mtu.min(ruster_config::MTU).to_string();
         run(&["tuntap", "add", "mode", "tap", "dev", &tap]);
         run(&[
             "link",
@@ -192,7 +185,13 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
             .map(|(a, len)| (IpAddr::V4(a), len))
             .into_iter()
             .chain(std::iter::once((IpAddr::V6(link_local), 64)))
-            .chain(interface.ipv6.iter().map(|&(a, len)| (IpAddr::V6(a), len)));
+            .chain(
+                interface
+                    .ipv6
+                    .iter()
+                    .filter(|(a, _)| *a != link_local)
+                    .map(|&(a, len)| (IpAddr::V6(a), len)),
+            );
         for (address, len) in addresses {
             let with_len = format!("{address}/{len}");
             if address.is_ipv6() {
@@ -201,8 +200,34 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
                 run(&["address", "replace", &with_len, "dev", &tap]);
             }
         }
+        // NAT's outside: its prefix route (the kernel's own on the TAP) leaves from
+        // the inside address, as on the TUN device above.
+        let inside = nat_inside_address(config);
+        let outside = config
+            .nat
+            .as_ref()
+            .is_some_and(|n| n.outside == interface.name);
+        if let (Some(source), Some((address, len)), true) = (&inside, interface.ipv4, outside) {
+            let prefix = format!(
+                "{}/{len}",
+                ruster_proto::table::network(IpAddr::V4(address), len)
+            );
+            run(&[
+                "-4", "route", "replace", &prefix, "dev", &tap, "src", source,
+            ]);
+        }
     }
     out
+}
+
+/// The address of NAT's inside interface, which the router's own IPv4 leaves from.
+fn nat_inside_address(config: &Config) -> Option<String> {
+    let nat = config.nat.as_ref()?;
+    let inside = config
+        .interfaces
+        .iter()
+        .find(|i| i.name == nat.inside && i.enabled)?;
+    inside.ipv4.map(|(address, _)| address.to_string())
 }
 
 fn words(args: &[String]) -> Vec<&str> {
@@ -288,7 +313,10 @@ pub fn apply(config: &Config) -> Vec<String> {
         let promote = format!("/proc/sys/net/ipv4/conf/{tun}/promote_secondaries");
         let _ = std::fs::write(promote, "1");
         for present in addresses_of(&tun) {
-            if !wanted.contains(&present) && !present.starts_with("fe80:") {
+            // A TUN device's link-local addresses are the kernel's; a TAP device's
+            // is its interface's, from the MAC address.
+            let tap = tun.starts_with(ruster_config::TAP_PREFIX);
+            if !wanted.contains(&present) && (tap || !present.starts_with("fe80:")) {
                 if let Err(stderr) = ip(&["address", "del", &present, "dev", &tun]) {
                     errors.push(format!(
                         "ip address del {present} dev {tun}: {}",
@@ -298,7 +326,17 @@ pub fn apply(config: &Config) -> Vec<String> {
             }
         }
     }
-    for args in commands.iter().filter(|a| !is_device(&words(a))) {
+    // Every address before any route: a route's `src` must be an address the
+    // kernel has (NAT's inside address may be on a TAP device, set up after the
+    // TUN device's routes in `commands`).
+    let is_address = |w: &[&str]| matches!(w, ["address", ..]);
+    for args in commands.iter().filter(|a| is_address(&words(a))) {
+        run(args, &mut errors);
+    }
+    for args in commands
+        .iter()
+        .filter(|a| !is_device(&words(a)) && !is_address(&words(a)))
+    {
         run(args, &mut errors);
     }
     errors

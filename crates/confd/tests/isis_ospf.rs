@@ -178,3 +178,26 @@ fn the_kernel_side_puts_the_interface_s_addresses_on_its_tap() {
         "lan's address is on its TAP, not the TUN: {commands:#?}"
     );
 }
+
+#[test]
+fn with_nat_on_tap_interfaces_the_routes_leave_from_the_inside_address() {
+    let text = with(&format!(
+        "{ROUTING}[nat]\ninside = \"lan\"\noutside = \"br0\"\nports = \"20000-20999\"\n\
+         [[isis.interface]]\nname = \"br0\"\n"
+    ));
+    let config = file::parse(&text).unwrap();
+    let commands: Vec<String> = ruster_confd::kernel::commands(&config)
+        .iter()
+        .map(|args| args.join(" "))
+        .collect();
+    for expected in [
+        "address replace 192.0.2.1/24 dev rp-lan",
+        "-4 route replace default dev rt-default src 192.0.2.1",
+        "-4 route replace 10.2.0.0/24 dev rp-br0 src 192.0.2.1",
+    ] {
+        assert!(
+            commands.iter().any(|c| c == expected),
+            "{expected}: {commands:#?}"
+        );
+    }
+}
