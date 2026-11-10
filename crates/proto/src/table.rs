@@ -524,7 +524,56 @@ pub enum RouteAction {
     Reject,
     /// Looked up again in another VRF.
     LookupVrf(String),
+    /// One of the router's SRv6 SIDs (an IPv6 prefix of the default VRF).
+    Srv6Local(Srv6Local),
+    /// Wrapped by an SR policy; the outer packet is routed in the default VRF.
+    Srv6Encap(Srv6Encap),
 }
+
+/// What the router does with a packet to one of its SRv6 SIDs (RFC 8986 section 4).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Srv6Local {
+    End,
+    /// Out of `interface` to `next_hop`.
+    EndX {
+        interface: String,
+        next_hop: std::net::Ipv6Addr,
+    },
+    /// The inner IPv4 packet, routed in `vrf`.
+    EndDt4 {
+        vrf: String,
+    },
+    /// The inner IPv6 packet, routed in `vrf`.
+    EndDt6 {
+        vrf: String,
+    },
+}
+
+impl Srv6Local {
+    /// The behaviour's name, as RFC 8986 section 10.2 writes it.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::End => "End",
+            Self::EndX { .. } => "End.X",
+            Self::EndDt4 { .. } => "End.DT4",
+            Self::EndDt6 { .. } => "End.DT6",
+        }
+    }
+}
+
+/// The segments of an SR policy (H.Encaps, RFC 8986 section 5.1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Srv6Encap {
+    /// The outer source address.
+    pub source: std::net::Ipv6Addr,
+    /// The first segment first; 1 to [`SRV6_SEGMENTS_MAX`].
+    pub segments: Vec<std::net::Ipv6Addr>,
+    /// The first segment is left out of the Segment Routing Header (H.Encaps.Red).
+    pub reduced: bool,
+}
+
+/// The most segments one SR policy holds.
+pub const SRV6_SEGMENTS_MAX: usize = 8;
 
 /// A VLAN sub-interface: frames on `parent` tagged `id` (802.1Q outer tag).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -764,6 +813,30 @@ impl Change {
                         }
                     }
                     Value::Route(RouteAction::LookupVrf(vrf)) => name(vrf)?,
+                    Value::Route(RouteAction::Srv6Local(local)) => {
+                        let Key::Route { vrf, prefix, .. } = &self.key else {
+                            unreachable!("checked above");
+                        };
+                        if !prefix.is_ipv6() || vrf != DEFAULT_VRF {
+                            return Err(ModelError::Invalid("SRv6 SID (IPv6, default VRF)"));
+                        }
+                        match local {
+                            Srv6Local::End => {}
+                            Srv6Local::EndX { interface, .. } => name(interface)?,
+                            Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } => name(vrf)?,
+                        }
+                    }
+                    Value::Route(RouteAction::Srv6Encap(encap)) => {
+                        if encap.segments.is_empty() || encap.segments.len() > SRV6_SEGMENTS_MAX {
+                            return Err(ModelError::Invalid("number of SRv6 segments"));
+                        }
+                        let unusable = |a: &std::net::Ipv6Addr| {
+                            a.is_unspecified() || a.is_loopback() || a.is_multicast()
+                        };
+                        if unusable(&encap.source) || encap.segments.iter().any(unusable) {
+                            return Err(ModelError::Invalid("SRv6 address"));
+                        }
+                    }
                     Value::Nat(nat) => {
                         name(&nat.inside)?;
                         name(&nat.outside)?;
@@ -1228,7 +1301,13 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(u64::from(*prefix_len));
         }
         Value::Route(action) => {
-            e.map(1);
+            e.map(match action {
+                RouteAction::Srv6Local(Srv6Local::End) => 1,
+                RouteAction::Srv6Local(Srv6Local::EndX { .. }) => 3,
+                RouteAction::Srv6Local(_) => 2,
+                RouteAction::Srv6Encap(_) => 3,
+                _ => 1,
+            });
             match action {
                 RouteAction::Forward(hops) => {
                     e.u64(sid::ROUTE_NEXT_HOP - sid::ROUTE)
@@ -1265,6 +1344,8 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 RouteAction::LookupVrf(vrf) => {
                     e.u64(sid::ROUTE_LOOKUP_VRF - sid::ROUTE).text(vrf);
                 }
+                RouteAction::Srv6Local(local) => encode_srv6_local(e, local),
+                RouteAction::Srv6Encap(encap) => encode_srv6_encap(e, encap),
             }
         }
         Value::Neighbor { mac } => {
@@ -1551,6 +1632,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     let mut tunnel_remote = None;
     let mut prefix_len = None;
     let mut action = None;
+    let mut srv6 = Srv6Members::default();
     for _ in 0..members {
         let member = table
             .checked_add(d.u64()?)
@@ -1595,6 +1677,17 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             }
             sid::INTERFACE_TUNNEL_REMOTE if table == sid::INTERFACE => {
                 put(&mut tunnel_remote, parse_ipv6(d.text()?)?)?;
+            }
+            sid::ROUTE_SRV6_BEHAVIOUR
+            | sid::ROUTE_SRV6_VRF
+            | sid::ROUTE_SRV6_INTERFACE
+            | sid::ROUTE_SRV6_NEXT_HOP
+            | sid::ROUTE_SRV6_SOURCE
+            | sid::ROUTE_SRV6_SEGMENTS
+            | sid::ROUTE_SRV6_REDUCED
+                if table == sid::ROUTE =>
+            {
+                srv6.decode(member, d)?;
             }
             sid::ROUTE_LOOKUP_VRF if table == sid::ROUTE => {
                 put(&mut action, RouteAction::LookupVrf(d.text()?.to_owned()))?;
@@ -1663,13 +1756,120 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
         sid::ADDRESS => Ok(Value::Address {
             prefix_len: prefix_len.ok_or(ModelError::Missing("prefix-length"))?,
         }),
-        sid::ROUTE => Ok(Value::Route(
-            action.ok_or(ModelError::Missing("route action"))?,
-        )),
+        sid::ROUTE => {
+            if let Some(srv6) = srv6.action()? {
+                put(&mut action, srv6)?;
+            }
+            Ok(Value::Route(
+                action.ok_or(ModelError::Missing("route action"))?,
+            ))
+        }
         sid::NEIGHBOR => Ok(Value::Neighbor {
             mac: mac.ok_or(ModelError::Missing("link-layer-address"))?,
         }),
         _ => Err(ModelError::WrongTable),
+    }
+}
+
+fn encode_srv6_local(e: &mut Encoder, local: &Srv6Local) {
+    let d = |member: u64| member - sid::ROUTE;
+    e.u64(d(sid::ROUTE_SRV6_BEHAVIOUR)).text(local.name());
+    match local {
+        Srv6Local::End => {}
+        Srv6Local::EndX {
+            interface,
+            next_hop,
+        } => {
+            e.u64(d(sid::ROUTE_SRV6_INTERFACE))
+                .text(interface)
+                .u64(d(sid::ROUTE_SRV6_NEXT_HOP))
+                .text(&next_hop.to_string());
+        }
+        Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } => {
+            e.u64(d(sid::ROUTE_SRV6_VRF)).text(vrf);
+        }
+    }
+}
+
+fn encode_srv6_encap(e: &mut Encoder, encap: &Srv6Encap) {
+    let d = |member: u64| member - sid::ROUTE;
+    e.u64(d(sid::ROUTE_SRV6_SOURCE))
+        .text(&encap.source.to_string())
+        .u64(d(sid::ROUTE_SRV6_SEGMENTS))
+        .array(encap.segments.len() as u64);
+    for segment in &encap.segments {
+        e.text(&segment.to_string());
+    }
+    e.u64(d(sid::ROUTE_SRV6_REDUCED)).bool(encap.reduced);
+}
+
+/// The SRv6 members of a route, as they are read.
+#[derive(Default)]
+struct Srv6Members {
+    behaviour: Option<String>,
+    vrf: Option<String>,
+    interface: Option<String>,
+    next_hop: Option<std::net::Ipv6Addr>,
+    source: Option<std::net::Ipv6Addr>,
+    segments: Option<Vec<std::net::Ipv6Addr>>,
+    reduced: Option<bool>,
+}
+
+impl Srv6Members {
+    fn decode(&mut self, member: u64, d: &mut Decoder<'_>) -> Result<(), ModelError> {
+        match member {
+            sid::ROUTE_SRV6_BEHAVIOUR => put(&mut self.behaviour, d.text()?.to_owned()),
+            sid::ROUTE_SRV6_VRF => put(&mut self.vrf, d.text()?.to_owned()),
+            sid::ROUTE_SRV6_INTERFACE => put(&mut self.interface, d.text()?.to_owned()),
+            sid::ROUTE_SRV6_NEXT_HOP => put(&mut self.next_hop, parse_ipv6(d.text()?)?),
+            sid::ROUTE_SRV6_SOURCE => put(&mut self.source, parse_ipv6(d.text()?)?),
+            sid::ROUTE_SRV6_REDUCED => put(&mut self.reduced, d.bool()?),
+            _ => {
+                let count = d.array()?;
+                if count == 0 || count > SRV6_SEGMENTS_MAX as u64 {
+                    return Err(ModelError::Invalid("number of SRv6 segments"));
+                }
+                let mut segments = Vec::new();
+                for _ in 0..count {
+                    segments.push(parse_ipv6(d.text()?)?);
+                }
+                put(&mut self.segments, segments)
+            }
+        }
+    }
+
+    /// The route action the members make, if any.
+    fn action(self) -> Result<Option<RouteAction>, ModelError> {
+        let local = self.behaviour.is_some()
+            || self.vrf.is_some()
+            || self.interface.is_some()
+            || self.next_hop.is_some();
+        let encap = self.source.is_some() || self.segments.is_some() || self.reduced.is_some();
+        if local && encap {
+            return Err(ModelError::Invalid("duplicate member"));
+        }
+        if encap {
+            return Ok(Some(RouteAction::Srv6Encap(Srv6Encap {
+                source: self.source.ok_or(ModelError::Missing("source-address"))?,
+                segments: self.segments.ok_or(ModelError::Missing("segment"))?,
+                reduced: self.reduced.unwrap_or(false),
+            })));
+        }
+        if !local {
+            return Ok(None);
+        }
+        let behaviour = self.behaviour.ok_or(ModelError::Missing("behavior"))?;
+        let local = match (behaviour.as_str(), self.vrf, self.interface, self.next_hop) {
+            ("End", None, None, None) => Srv6Local::End,
+            ("End.X", None, Some(interface), Some(next_hop)) => Srv6Local::EndX {
+                interface,
+                next_hop,
+            },
+            ("End.DT4", Some(vrf), None, None) => Srv6Local::EndDt4 { vrf },
+            ("End.DT6", Some(vrf), None, None) => Srv6Local::EndDt6 { vrf },
+            _ => return Err(ModelError::Invalid("SRv6 behavior and its members")),
+        };
+        Ok(Some(RouteAction::Srv6Local(local)))
     }
 }
 
@@ -1851,6 +2051,27 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
                 RouteAction::Discard => "discard".into(),
                 RouteAction::Reject => "reject".into(),
                 RouteAction::LookupVrf(other) => format!("lookup-vrf {other}"),
+                RouteAction::Srv6Local(local) => match local {
+                    Srv6Local::End => "srv6 End".into(),
+                    Srv6Local::EndX {
+                        interface,
+                        next_hop,
+                    } => format!("srv6 End.X via {next_hop} dev {interface}"),
+                    Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } => {
+                        format!("srv6 {} vrf {vrf}", local.name())
+                    }
+                },
+                RouteAction::Srv6Encap(encap) => format!(
+                    "encap srv6{} from {} segs {}",
+                    if encap.reduced { " reduced" } else { "" },
+                    encap.source,
+                    encap
+                        .segments
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
             };
             format!("route {vrf} {prefix}/{len} {action}")
         }

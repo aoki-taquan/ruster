@@ -188,16 +188,22 @@ VXLANのインターフェースはブリッジのメンバーで、一つのVNI
 
 ### 表
 
-SIDは、RFC 8986では経路の表の一部として扱われる。そのため書き手はribdで、FPMが運ぶzebraのSRv6の経路
-（`seg6local`と`seg6`のencap）を`ruster-frr`がribdへ渡し、設定の静的なSIDはconfdが送り手としてribdへ渡す。
+SIDは、RFC 8986では経路の表の一部として扱われる。そのため書き手はribdで、設定の静的なSIDと方針はconfdが
+送り手としてribdへ渡す（静的経路と同じ道。ribdは経路の一つとして選んでFEへ書く）。FPMが運ぶzebraのSRv6の
+経路（`seg6local`と`seg6`のencap）を`ruster-frr`がribdへ渡すのはまだ。
 
 | 表 | キー | 値 |
 |---|---|---|
-| ローカルのSID（`ruster-fib`の行の種類） | VRF（下側）、SIDのプレフィックス | 動作: End / End.X（次の転送先: インターフェースとアドレス） / End.DT4（VRF） / End.DT6（VRF） |
-| 包む方針（`ruster-fib`の次の転送先の拡張） | 経路のプレフィックス（どのVRFでも） | SIDのリスト（1個以上）。外側は下側のVRFで送る |
-| 包むときの送信元 | FE全体で一つ（`ruster-fe`） | IPv6アドレス |
+| ローカルのSID（`ruster-fib`の経路の動作`srv6-local`） | defaultのVRF、SIDのプレフィックス（IPv6） | 動作: End / End.X（インターフェースと次の転送先のアドレス） / End.DT4（VRF） / End.DT6（VRF） |
+| 包む方針（`ruster-fib`の経路の動作`srv6-encap`） | VRF、経路のプレフィックス | 外側の送信元、SIDのリスト（1から8個）、H.Encaps.Redか。外側はdefaultのVRFで送る |
 
-FEが作る状態（読むだけ）: SIDごとに、処理した数と、ICMPエラーにした数。
+- SIDはdefaultのVRFにだけ置く（下側のVRFを選ぶのは、要る場面が出てから）。
+- 外側の送信元は、FE全体で一つの値にせず、方針の行ごとに持つ。confdが`[srv6]`の送信元を全部の方針に入れる。
+  表を一つ減らし、ribdは値をそのまま運ぶだけで済むため。
+- FEは方針ごとに、FEの中だけのインターフェース（名前は`srv6 <VRF> <プレフィックス>`）を作り、その経路の出口にする。
+- End.XのインターフェースがFEに無いか無効なら、そのSIDは無いものとして扱う。
+
+FEが作る状態（読むだけ）: SIDごとの数はまだ。今は捨てた理由（`SRV6_*`）ごとの数だけ。
 
 ### SIDのパケットを受けたとき（RFC 8754の4.3、RFC 8986の4.）
 

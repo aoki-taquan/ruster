@@ -71,6 +71,11 @@
 //! - A SID whose VRF the snapshot does not have drops its packets.
 //! - An outer packet that would leave through a tunnel or another policy is
 //!   dropped; no flags, tag or TLVs are put in the Segment Routing Header.
+//! - The outer packet is never fragmented, even when what a policy carries is less
+//!   than 1280 (RFC 2473 section 7.1 would fragment it then): Packet Too Big may
+//!   report less than the IPv6 minimum MTU. The SR domain's links are to be larger
+//!   (RFC 8754 section 5.3).
+//! - The outer packet does not go through the default VRF's forward firewall.
 //! - The ICMPv6 errors are rate limited and routed as the others (`crate::ipv6`).
 
 use crate::{DropReason, IfId, MacAddress, PacketLease, PacketSlot, TraceEvent, TraceSink};
@@ -128,7 +133,8 @@ pub enum Srv6Error {
     HostBitsSet,
     /// Two SIDs for the same prefix.
     DuplicateSid,
-    /// A policy with no segment, or more than 16.
+    /// A policy with no segment, or more than 8 (the outer headers must fit the
+    /// room the backends leave in front of a frame).
     SegmentCount,
     /// Two policies for the same interface.
     DuplicatePolicy,
@@ -447,7 +453,7 @@ fn unwrap<S: PacketSlot>(
 }
 
 /// Segments one policy holds, at most.
-const MAX_SEGMENTS: usize = 16;
+const MAX_SEGMENTS: usize = 8;
 /// The Hop Limit of the outer header (RFC 2473 section 6.3: the tunnel's own).
 const OUTER_HOP_LIMIT: u8 = 64;
 

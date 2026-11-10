@@ -195,6 +195,8 @@ pub struct Fe<B> {
     interface_names: Vec<String>,
     vlans: Vec<VlanBinding>,
     tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
+    /// The router's SRv6 SIDs and SR policies.
+    srv6: ruster_core::Srv6Table,
     /// The bridge members that carry frames inside IP.
     overlays: Vec<ruster_core::Overlay>,
     unreachable: Vec<(IfId, ruster_core::Ipv4Address)>,
@@ -284,6 +286,7 @@ where
             interface_names: built.interface_names,
             vlans: built.vlans,
             tunnels: built.tunnels,
+            srv6: built.srv6,
             overlays: built.overlays,
             unreachable: built.unreachable,
             pppoe: built.pppoe,
@@ -486,6 +489,7 @@ where
                     .with_kernel_ingress(&self.kernel)
                     .with_vlans(&self.vlans)
                     .with_tunnels(&self.tunnels)
+                    .with_srv6(&self.srv6)
                     .with_unreachable_neighbors(&self.unreachable)
                     .with_pppoe(&self.pppoe)
             })
@@ -498,6 +502,7 @@ where
             .with_vrfs(&snapshots, &self.by_ingress)
             .with_vlans(&self.vlans)
             .with_tunnels(&self.tunnels)
+            .with_srv6(&self.srv6)
             .with_overlays(&self.overlays)
             .with_pppoe(&self.pppoe)
             .with_kernel_ingress(&self.kernel)
@@ -1098,8 +1103,14 @@ where
             .snapshot()
             .with_ipv6(&self.vrfs[0].ipv6)
             .with_tunnels(&self.tunnels)
+            .with_srv6(&self.srv6)
             .with_pppoe(&self.pppoe);
         match outer.tunnel_frame(egress, frame) {
+            Some(Ok((below, wrapped))) => return self.send_generated(below, &wrapped),
+            Some(Err(_)) => return false,
+            None => {}
+        }
+        match outer.srv6_frame(egress, frame) {
             Some(Ok((below, wrapped))) => return self.send_generated(below, &wrapped),
             Some(Err(_)) => return false,
             None => {}
@@ -1389,6 +1400,7 @@ where
             self.interface_names = built.interface_names;
             self.vlans = built.vlans;
             self.tunnels = built.tunnels;
+            self.srv6 = built.srv6;
             self.overlays = built.overlays;
             self.unreachable = built.unreachable;
             self.pppoe = built.pppoe;
