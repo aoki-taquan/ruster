@@ -118,6 +118,24 @@ mod tests {
         assert_eq!(sort(&frame(0x86dd, &ipv6(global))), FromTap::Routed);
     }
 
+    /// The edges of each range: IEEE 802.3 clause 3.2.6 (1500 is a length, 0x0600
+    /// a type), RFC 5771 section 4 (224.0.0.0/24) and RFC 4291 section 2.5.6
+    /// (fe80::/10).
+    #[test]
+    fn the_ranges_end_where_the_standards_say() {
+        assert_eq!(sort(&frame(1500, &[0xfe, 0xfe, 3])), FromTap::Link);
+        assert_eq!(sort(&frame(0x0600, &[0xfe, 0xfe, 3])), FromTap::Drop);
+        assert_eq!(sort(&frame(0x0800, &ipv4([224, 0, 0, 0]))), FromTap::Link);
+        assert_eq!(sort(&frame(0x0800, &ipv4([224, 0, 0, 255]))), FromTap::Link);
+        assert_eq!(sort(&frame(0x0800, &ipv4([224, 0, 1, 0]))), FromTap::Routed);
+        let mut last = [0xff_u8; 16];
+        last[..2].copy_from_slice(&[0xfe, 0xbf]);
+        assert_eq!(sort(&frame(0x86dd, &ipv6(last))), FromTap::Neighbor(last));
+        let mut site = [0_u8; 16];
+        site[..2].copy_from_slice(&[0xfe, 0xc0]);
+        assert_eq!(sort(&frame(0x86dd, &ipv6(site))), FromTap::Routed);
+    }
+
     #[test]
     fn other_frames_are_dropped() {
         assert_eq!(sort(&frame(0x0806, &[0; 28])), FromTap::Drop, "ARP");
