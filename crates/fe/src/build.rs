@@ -523,6 +523,11 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                         next_hop: None,
                     }),
                     RouteAction::Local => continue,
+                    RouteAction::Gateways(_) => {
+                        return Err(format!(
+                            "route {vrf} {prefix}/{len}: next hops without an interface (ribd resolves them)"
+                        ));
+                    }
                 };
                 if let Some(list) = entries.get_mut(vrf) {
                     list.push(entry);

@@ -11,13 +11,17 @@
 //! only after every source said it has sent everything (`sync-done`) or its hold time
 //! ran out. Forwarding keeps the old routes in the meantime.
 //!
-//! Skeleton limits: next hops are passed through as given (no recursive resolution),
-//! no route leaking between VRFs, no metric or ECMP across sources.
+//! A selected route whose next hops are only gateway addresses is resolved through
+//! the other selected routes of its VRF before it goes to the FE ([`resolve`]).
+//!
+//! Skeleton limits: no route leaking between VRFs, no metric or ECMP across sources.
 //!
 //! # Standards
 //!
 //! - RFC 8349 (`ietf-routing`): routes per VRF and prefix, chosen by route preference
 //!   (lower is preferred) between sources.
+//! - RFC 4271 sections 5.1.3 and 9.1.2.1: gateways are resolved recursively (see
+//!   [`resolve`]).
 //!
 //! Deviations: a preference is set per source, not per route. ribd does not know
 //! the interfaces, so a route out of a disabled interface may be chosen over a
@@ -33,6 +37,8 @@ use ruster_proto::sid;
 use ruster_proto::table::{Change, Key, Value};
 use ruster_proto::task::{Progress, Task};
 
+pub mod resolve;
+
 /// A route source and how much it is preferred.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SourceSpec {
@@ -41,6 +47,13 @@ pub struct SourceSpec {
     pub preference: u32,
     /// After ribd starts, how long to wait for this source's `sync-done`.
     pub hold_ms: u64,
+}
+
+/// How ribd works, apart from its sources.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Gateways may be resolved through the default route ([`resolve`]).
+    pub resolve_via_default: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,6 +83,7 @@ impl Hook for Changed {
 
 pub struct Ribd {
     sources: Vec<Source>,
+    options: Options,
     fe: Client,
     /// What the FE was sent since ribd started.
     sent: BTreeMap<Key, Value>,
@@ -111,6 +125,14 @@ impl std::fmt::Debug for Ribd {
 impl Ribd {
     /// `fe` is a connection to the FE allowed to write the route table.
     pub fn new(fe: UnixStream, sources: Vec<SourceSpec>) -> io::Result<Self> {
+        Self::with_options(fe, sources, Options::default())
+    }
+
+    pub fn with_options(
+        fe: UnixStream,
+        sources: Vec<SourceSpec>,
+        options: Options,
+    ) -> io::Result<Self> {
         let mut fe = Client::new(fe)?;
         fe.resync_begin();
         Ok(Self {
@@ -121,6 +143,7 @@ impl Ribd {
                     server: Server::new(),
                 })
                 .collect(),
+            options,
             fe,
             sent: BTreeMap::new(),
             waiting_since: Some(None),
@@ -178,7 +201,8 @@ impl Ribd {
         self.waiting_since.is_none()
     }
 
-    /// The selected route for every VRF and prefix.
+    /// The selected route for every VRF and prefix, with gateways resolved: what the
+    /// FE should hold.
     fn selected(&self) -> BTreeMap<Key, Value> {
         let mut order: Vec<&Source> = self.sources.iter().collect();
         order.sort_by_key(|s| s.spec.preference);
@@ -190,6 +214,7 @@ impl Ribd {
                 }
             }
         }
+        resolve::resolve(&mut selected, self.options.resolve_via_default);
         selected
     }
 

@@ -12,7 +12,9 @@
 //! Inside a value, members are keyed by their SID minus the SID of the entry, as in
 //! RFC 9254. Addresses, prefixes and MAC addresses are text, as YANG types them. An
 //! address is IPv4 or IPv6 (`inet:ip-address`); a prefix length is checked against its
-//! family, and a next hop must be of the route's family.
+//! family, and a next hop must be of the route's family. A route's next hops all name
+//! their outgoing interface, or all give only an address (a gateway that ribd
+//! resolves, as RFC 8349's `next-hop-address` without `outgoing-interface`).
 //!
 //! # Standards
 //!
@@ -428,6 +430,10 @@ pub struct FirewallRule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteAction {
     Forward(Vec<NextHop>),
+    /// Next hops given only as gateway addresses, not necessarily on a link (a BGP
+    /// NEXT_HOP). Only a route source writes these; ribd resolves them to
+    /// [`RouteAction::Forward`] before the FE sees the route.
+    Gateways(Vec<IpAddr>),
     /// Addressed to the router.
     Local,
     /// Dropped silently.
@@ -801,6 +807,17 @@ impl Change {
                             }
                         }
                     }
+                    Value::Route(RouteAction::Gateways(gateways)) => {
+                        if gateways.is_empty() {
+                            return Err(ModelError::Missing("next-hop"));
+                        }
+                        let Key::Route { prefix, .. } = &self.key else {
+                            unreachable!("checked above");
+                        };
+                        if gateways.iter().any(|a| a.is_ipv4() != prefix.is_ipv4()) {
+                            return Err(ModelError::Invalid("next hop address family"));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1026,6 +1043,15 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                             e.u64(delta(sid::NEXT_HOP_ADDRESS))
                                 .text(&address.to_string());
                         }
+                    }
+                }
+                RouteAction::Gateways(gateways) => {
+                    e.u64(sid::ROUTE_NEXT_HOP - sid::ROUTE)
+                        .array(gateways.len() as u64);
+                    for gateway in gateways {
+                        e.map(1)
+                            .u64(sid::NEXT_HOP_ADDRESS - sid::ROUTE_NEXT_HOP)
+                            .text(&gateway.to_string());
                     }
                 }
                 RouteAction::Local => {
@@ -1336,7 +1362,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
                 )?;
             }
             sid::ROUTE_NEXT_HOP if table == sid::ROUTE => {
-                put(&mut action, RouteAction::Forward(decode_next_hops(d)?))?;
+                put(&mut action, decode_next_hops(d)?)?;
             }
             sid::ROUTE_LOCAL | sid::ROUTE_DISCARD | sid::ROUTE_REJECT if table == sid::ROUTE => {
                 if !d.bool()? {
@@ -1400,12 +1426,15 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     }
 }
 
-fn decode_next_hops(d: &mut Decoder<'_>) -> Result<Vec<NextHop>, ModelError> {
+/// Next hops that all name their interface ([`RouteAction::Forward`]), or that all
+/// give only an address ([`RouteAction::Gateways`]).
+fn decode_next_hops(d: &mut Decoder<'_>) -> Result<RouteAction, ModelError> {
     let count = d.array()?;
     if count == 0 {
         return Err(ModelError::Missing("next-hop"));
     }
     let mut hops = Vec::new();
+    let mut gateways = Vec::new();
     for _ in 0..count {
         let members = d.map()?;
         let mut interface = None;
@@ -1420,12 +1449,19 @@ fn decode_next_hops(d: &mut Decoder<'_>) -> Result<Vec<NextHop>, ModelError> {
                 other => return Err(ModelError::UnknownMember(other)),
             }
         }
-        hops.push(NextHop {
-            interface: interface.ok_or(ModelError::Missing("outgoing-interface"))?,
-            address,
-        });
+        match (interface, address) {
+            (Some(interface), address) => hops.push(NextHop { interface, address }),
+            (None, Some(address)) => gateways.push(address),
+            (None, None) => return Err(ModelError::Missing("outgoing-interface")),
+        }
     }
-    Ok(hops)
+    match (hops.is_empty(), gateways.is_empty()) {
+        (false, true) => Ok(RouteAction::Forward(hops)),
+        (true, false) => Ok(RouteAction::Gateways(gateways)),
+        _ => Err(ModelError::Invalid(
+            "next hops with and without an outgoing interface",
+        )),
+    }
 }
 
 /// Stores a member, refusing a second value for the same member (RFC 8949
@@ -1557,6 +1593,11 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
                         Some(via) => format!("via {via} dev {}", hop.interface),
                         None => format!("dev {}", hop.interface),
                     })
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                RouteAction::Gateways(gateways) => gateways
+                    .iter()
+                    .map(|via| format!("via {via}"))
                     .collect::<Vec<_>>()
                     .join(", "),
                 RouteAction::Local => "local".into(),

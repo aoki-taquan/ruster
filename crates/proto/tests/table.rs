@@ -1324,3 +1324,56 @@ fn dhcp_source_values_round_trip_and_are_checked() {
         assert!(change.validate().is_err(), "{change:?}");
     }
 }
+
+#[test]
+fn gateway_routes_round_trip_and_do_not_mix_with_interface_hops() {
+    let route = |prefix: IpAddr, len| Key::Route {
+        vrf: DEFAULT_VRF.into(),
+        prefix,
+        len,
+    };
+    let change = Change::set(
+        route(ip([203, 0, 113, 0]), 24),
+        Value::Route(RouteAction::Gateways(vec![
+            ip([10, 255, 0, 2]),
+            ip([10, 255, 0, 3]),
+        ])),
+    );
+    assert_eq!(round_trip(&change), change);
+    let v6 = Change::set(
+        route(ip6("2001:db8:203::"), 64),
+        Value::Route(RouteAction::Gateways(vec![ip6("2001:db8:ff::2")])),
+    );
+    assert_eq!(round_trip(&v6), v6);
+
+    // A gateway of the other family, and none at all.
+    for gateways in [vec![ip6("2001:db8::1")], vec![]] {
+        let bad = Change::set(
+            route(ip([203, 0, 113, 0]), 24),
+            Value::Route(RouteAction::Gateways(gateways)),
+        );
+        assert!(bad.validate().is_err());
+    }
+
+    // One next hop with an interface and one without.
+    let bytes = encoded(|e| {
+        let d = |member: u64| member - sid::ROUTE_NEXT_HOP;
+        e.map(1)
+            .array(3)
+            .u64(sid::ROUTE)
+            .text("default")
+            .text("203.0.113.0/24")
+            .map(1)
+            .u64(sid::ROUTE_NEXT_HOP - sid::ROUTE)
+            .array(2)
+            .map(2)
+            .u64(d(sid::NEXT_HOP_INTERFACE))
+            .text("wan")
+            .u64(d(sid::NEXT_HOP_ADDRESS))
+            .text("198.51.100.10")
+            .map(1)
+            .u64(d(sid::NEXT_HOP_ADDRESS))
+            .text("10.255.0.2");
+    });
+    assert!(matches!(decode_bytes(&bytes), Err(ModelError::Invalid(_))));
+}
