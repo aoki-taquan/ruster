@@ -13,11 +13,19 @@
 //! Frames the neighbor process sends back go out through the backend's generated
 //! frames.
 //!
+//! Bridges (`docs/design/overlay.md`): core relays the frames of bridge members and
+//! sends what leaves a bridge's own interface (IRB) to the member its destination
+//! was learned on ([`ruster_core::Bridges`]). The frames it floods are copied out and
+//! sent here after the batch, out of every other member; so are the frames the
+//! control processes, ICMP errors and fragments send out of an IRB.
+//!
 //! # Standards
 //!
 //! - Forwarding decisions are `ruster-core`'s (RFC 1812 sections 5.2.2 and 5.3.1:
 //!   header checks and the TTL).
 //! - RFC 1122 section 2.3.2.1: at most one resolve request per second per next hop.
+//! - IEEE 802.1Q 8.6: a flooded frame leaves every member but the one it came in on
+//!   (the rest as in `ruster_core`'s bridge module).
 //!
 //! Deviations: ARP is not answered in the FE; every ARP packet goes to the neighbor
 //! process.
@@ -68,6 +76,9 @@ pub mod writers {
         sid::ICMP_ERRORS,
         sid::FIREWALL_RULE,
         sid::PUNT,
+        sid::BRIDGE,
+        sid::BRIDGE_PORT,
+        sid::BRIDGE_MAC,
     ];
     pub const ROUTE: &[u64] = &[sid::ROUTE];
     pub const NEIGHBOR: &[u64] = &[sid::NEIGHBOR];
@@ -90,6 +101,12 @@ const RESOLVE_INTERVAL_MS: u64 = 1_000;
 /// Next hops remembered for the rate limit. Older ones are forgotten first; when all
 /// are recent, further requests wait (and are counted).
 const RESOLVE_REMEMBERED: usize = 1_024;
+/// MAC addresses the bridges learn, all together.
+const BRIDGE_MACS: usize = 8_192;
+/// Flooded frames copied out in one batch; more are dropped and counted.
+const FLOOD_SLOTS: usize = RX_BUDGET;
+/// Slots of the MAC address table looked at for aged entries per step.
+const AGING_PER_STEP: usize = 256;
 /// The largest frame accepted from the punt socket (Ethernet with a 1500-byte payload
 /// and a VLAN tag, plus the punt header).
 const PUNT_MAX: usize = 1_522 + 300;
@@ -129,6 +146,15 @@ pub struct FeCounters {
     /// PPPoE session, a VLAN sub-interface) that could not be sent after they were
     /// counted.
     pub generated_dropped: u64,
+    /// The bridges' counters added up (see [`ruster_core::BridgeCounters`]).
+    pub bridge_learned: u64,
+    pub bridge_moved: u64,
+    pub bridge_aged: u64,
+    pub bridge_limited: u64,
+    pub bridge_forwarded: u64,
+    pub bridge_flooded: u64,
+    pub bridge_flood_dropped: u64,
+    pub bridge_dropped: u64,
 }
 
 pub struct Fe<B> {
@@ -185,6 +211,12 @@ pub struct Fe<B> {
     /// The neighbors packets went to since the neighbor process last read them.
     used: std::collections::HashSet<(u16, IpAddr)>,
     fragment_tracking: ruster_core::Ipv4FragmentTracker<'static>,
+    /// The bridges, their MAC address tables and the frames they flood.
+    bridges: ruster_core::Bridges,
+    /// The bridges' names, in the order of their ids.
+    bridge_names: Vec<String>,
+    /// The time of the current step.
+    now_ms: u64,
     counters: FeCounters,
 }
 
@@ -247,6 +279,9 @@ where
             reassembled: Vec::new(),
             used: std::collections::HashSet::new(),
             fragment_tracking: fragments::tracker(),
+            bridges: ruster_core::Bridges::new(BRIDGE_MACS, FLOOD_SLOTS, hash_key()),
+            bridge_names: Vec::new(),
+            now_ms: 0,
             counters: FeCounters::default(),
         }
     }
@@ -309,7 +344,36 @@ where
     }
 
     pub fn counters(&self) -> FeCounters {
-        self.counters
+        let mut counters = self.counters;
+        for b in self.bridges.table.counters() {
+            counters.bridge_learned += b.learned;
+            counters.bridge_moved += b.moved;
+            counters.bridge_aged += b.aged;
+            counters.bridge_limited += b.limited;
+            counters.bridge_forwarded += b.forwarded;
+            counters.bridge_flooded += b.flooded;
+            counters.bridge_flood_dropped += b.flood_dropped;
+            counters.bridge_dropped += b.dropped + b.filtered;
+        }
+        counters
+    }
+
+    /// Each bridge's counters, by name.
+    pub fn bridge_counters(&self) -> Vec<(String, ruster_core::BridgeCounters)> {
+        self.bridge_names
+            .iter()
+            .cloned()
+            .zip(self.bridges.table.counters())
+            .collect()
+    }
+
+    /// Every entry of the bridges' MAC address tables, with its bridge's name.
+    pub fn bridge_entries(&self) -> Vec<(String, ruster_core::MacEntry)> {
+        self.bridges
+            .table
+            .entries()
+            .filter_map(|e| Some((self.bridge_names.get(usize::from(e.bridge))?.clone(), e)))
+            .collect()
     }
 
     /// Each class of the punt table, by name: what it handed over and dropped.
@@ -384,6 +448,10 @@ where
         if let Some(nat) = self.nat.as_mut() {
             nat.services(&mut services);
         }
+        self.bridges.clear_flood();
+        if !self.bridges.is_empty() {
+            services.bridges = Some(&mut self.bridges);
+        }
         let report =
             forward_batch_with_control(batch, &snapshot, &mut self.control, services, &mut trace);
         // Unsolicited inbound SYNs whose wait is over get their Port Unreachable,
@@ -399,6 +467,8 @@ where
                 &mut trace,
             )
         });
+        self.bridges.table.age(now_ms, AGING_PER_STEP);
+        self.send_flood();
         if report.received == 0 && answered == 0 {
             return false;
         }
@@ -536,6 +606,32 @@ where
             self.resolve_request(egress, target, now_ms);
         }
         true
+    }
+
+    /// Sends each frame the bridges flooded in the last batch out of every member of
+    /// its bridge but the one it came in on.
+    fn send_flood(&mut self) {
+        let Self {
+            io, bridges, vlans, ..
+        } = self;
+        let mut failed = Vec::new();
+        for frame in bridges.flood() {
+            let mut dropped = 0;
+            for &member in bridges.members(frame.bridge) {
+                if Some(member) != frame.from && !send_member(io, vlans, member, frame.bytes()) {
+                    dropped += 1;
+                }
+            }
+            if dropped > 0 {
+                failed.push((frame.bridge, dropped));
+            }
+        }
+        bridges.clear_flood();
+        for (bridge, dropped) in failed {
+            for _ in 0..dropped {
+                bridges.table.count_flood_dropped(bridge);
+            }
+        }
     }
 
     fn punt_arp(&mut self, arp: &ArpEvent) {
@@ -818,43 +914,92 @@ where
             Some(Err(_)) => return false,
             None => {}
         }
-        let vlan = self.vlans.iter().find(|b| b.sub == egress).copied();
-        let (port, tag) = match vlan {
-            Some(binding) => (binding.parent, Some(binding.vid)),
-            None => (egress, None),
-        };
-        self.send_port(port, tag, frame)
+        // Out of a bridge's own interface: to the member the destination is on,
+        // or out of every member.
+        if let Some(bridge) = self.bridges.irb_of(egress) {
+            let Some(destination) = frame.get(..6).and_then(|d| <[u8; 6]>::try_from(d).ok()) else {
+                return false;
+            };
+            let Self {
+                io,
+                bridges,
+                vlans,
+                now_ms,
+                ..
+            } = self;
+            if let Some(member) = bridges.table.send(bridge, &destination, *now_ms) {
+                bridges.table.count_forwarded(bridge);
+                return send_member(io, vlans, member, frame);
+            }
+            let mut sent = false;
+            let mut dropped = 0;
+            for &member in bridges.members(bridge) {
+                if send_member(io, vlans, member, frame) {
+                    sent = true;
+                } else {
+                    dropped += 1;
+                }
+            }
+            bridges.table.count_flood(bridge, dropped);
+            return sent;
+        }
+        send_member(&mut self.io, &self.vlans, egress, frame)
     }
 
     /// Sends `frame` out of port `port` as it is, with VLAN tag `tag` put in.
     fn send_port(&mut self, port: IfId, tag: Option<u16>, frame: &[u8]) -> bool {
-        // An all-zero destination is what core puts on a frame to be wrapped (a
-        // tunnel's, a session's): one that was not wrapped never leaves a port.
-        if frame.len() < ETHERNET_HEADER || frame[..6] == [0; 6] {
-            return false;
-        }
-        let extra = if tag.is_some() { 4 } else { 0 };
-        let mut batch = self.io.begin_generated(port);
-        let sent = match batch.allocate(frame.len() + extra) {
-            Ok(mut lease) => {
-                let bytes = lease.bytes_mut();
-                match tag {
-                    Some(vid) => {
-                        bytes[..12].copy_from_slice(&frame[..12]);
-                        bytes[12..14].copy_from_slice(&[0x81, 0x00]);
-                        bytes[14..16].copy_from_slice(&(vid & 0x0fff).to_be_bytes());
-                        bytes[16..].copy_from_slice(&frame[12..]);
-                    }
-                    None => bytes.copy_from_slice(frame),
-                }
-                lease.commit();
-                true
-            }
-            Err(_) => false,
-        };
-        let completion = batch.finish();
-        sent && completion.error.is_none()
+        send_on_port(&mut self.io, port, tag, frame)
     }
+}
+
+/// Sends `frame` out of `egress`, a port or a VLAN sub-interface (out of its parent,
+/// tagged).
+fn send_member<B: GeneratedPacketIo>(
+    io: &mut B,
+    vlans: &[VlanBinding],
+    egress: IfId,
+    frame: &[u8],
+) -> bool {
+    let (port, tag) = match vlans.iter().find(|b| b.sub == egress) {
+        Some(binding) => (binding.parent, Some(binding.vid)),
+        None => (egress, None),
+    };
+    send_on_port(io, port, tag, frame)
+}
+
+/// Sends `frame` out of port `port` as it is, with VLAN tag `tag` put in.
+fn send_on_port<B: GeneratedPacketIo>(
+    io: &mut B,
+    port: IfId,
+    tag: Option<u16>,
+    frame: &[u8],
+) -> bool {
+    // An all-zero destination is what core puts on a frame to be wrapped (a
+    // tunnel's, a session's): one that was not wrapped never leaves a port.
+    if frame.len() < ETHERNET_HEADER || frame[..6] == [0; 6] {
+        return false;
+    }
+    let extra = if tag.is_some() { 4 } else { 0 };
+    let mut batch = io.begin_generated(port);
+    let sent = match batch.allocate(frame.len() + extra) {
+        Ok(mut lease) => {
+            let bytes = lease.bytes_mut();
+            match tag {
+                Some(vid) => {
+                    bytes[..12].copy_from_slice(&frame[..12]);
+                    bytes[12..14].copy_from_slice(&[0x81, 0x00]);
+                    bytes[14..16].copy_from_slice(&(vid & 0x0fff).to_be_bytes());
+                    bytes[16..].copy_from_slice(&frame[12..]);
+                }
+                None => bytes.copy_from_slice(frame),
+            }
+            lease.commit();
+            true
+        }
+        Err(_) => false,
+    };
+    let completion = batch.finish();
+    sent && completion.error.is_none()
 }
 
 impl<B> Task for Fe<B>
@@ -862,6 +1007,7 @@ where
     B: PacketIo + GeneratedPacketIo,
 {
     fn step(&mut self, now_ms: u64) -> Progress {
+        self.now_ms = now_ms;
         let control = self.server.step(&mut self.builder);
         if let Some((built, publication, nat)) = self.builder.built.take() {
             self.builder.names.clone_from(&built.interface_names);
@@ -934,12 +1080,39 @@ where
             self.pppoe = built.pppoe;
             self.kernel = built.kernel;
             self.active = built.active;
+            // A bridge that stays keeps what it learned on the members it keeps.
+            let old_of_new: Vec<Option<u16>> = built
+                .bridges
+                .iter()
+                .map(|(name, _)| {
+                    let at = self.bridge_names.iter().position(|old| old == name)?;
+                    u16::try_from(at).ok()
+                })
+                .collect();
+            let (names, configs): (Vec<String>, Vec<_>) = built.bridges.into_iter().unzip();
+            self.bridge_names = names;
+            let left = self
+                .bridges
+                .publish(configs, &old_of_new, &built.bridge_statics);
+            if left > 0 {
+                eprintln!("ruster-fe: {left} static MAC addresses left out: the table is full");
+            }
         }
         let worked = self.worker(now_ms);
         let injected = self.inject();
         // Notifications queued by the worker go out now.
         let flushed = self.server.step(&mut self.builder);
         control.and(flushed).and(Progress::busy(worked || injected))
+    }
+}
+
+/// A secret key for hashed tables, so no one outside can aim at their buckets.
+fn hash_key() -> ruster_core::ResolutionHashKey {
+    loop {
+        let (a, b) = nat::words();
+        if let Ok(key) = ruster_core::ResolutionHashKey::new(a, b) {
+            break key;
+        }
     }
 }
 
