@@ -89,6 +89,7 @@ fn config() -> Config {
         isis: None,
         ospf: None,
         ospf6: None,
+        etherip: Vec::new(),
     }
 }
 

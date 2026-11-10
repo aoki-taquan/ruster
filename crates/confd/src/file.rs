@@ -241,6 +241,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let mut seen = Seen::default();
     let mut interfaces = Vec::with_capacity(lock.interface.len());
     let mut bridges = Vec::new();
+    let mut etherip = Vec::new();
     for entry in lock.interface {
         let at = format!("interface {:?}", entry.name);
         if entry.name.is_empty() || entry.name.len() > 255 {
@@ -257,6 +258,9 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         match &entry.kind {
             Kind::Port => {}
             Kind::Bridge(bridge) => bridges.push((entry.name.clone(), bridge.clone())),
+            Kind::EtherIp { local, remote } => {
+                etherip.push((entry.name.clone(), local.clone(), remote.clone()));
+            }
             Kind::Vlan { parent, id } => {
                 let id = *id;
                 if !(1..=4094).contains(&id) {
@@ -860,6 +864,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let isis = crate::isis_ospf::check_isis(lock.isis, &interfaces, &bridges)?;
     let ospf = crate::isis_ospf::check_ospf("ospf", lock.ospf, &interfaces, &bridges)?;
     let ospf6 = crate::isis_ospf::check_ospf("ospf6", lock.ospf6, &interfaces, &bridges)?;
+    let etherip = crate::etherip::check(etherip, &interfaces, &bridges)?;
     // The FE takes at most this many punt classes besides its own.
     if dhcp.len()
         + dhcp6.len()
@@ -894,6 +899,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         isis,
         ospf,
         ospf6,
+        etherip,
         dns_found: Vec::new(),
     })
 }

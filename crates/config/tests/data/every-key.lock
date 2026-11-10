@@ -59,6 +59,18 @@ ipv6-from = []
 kind = { pppoe = { parent = "lan", source = "pppoe-wan" } }
 
 [[interface]]
+name = "eip0"
+mac = "02:00:00:00:00:fe"
+mtu = 1464
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { etherip = { local = "192.0.2.1", remote = "198.51.100.2" } }
+
+[[interface]]
 name = "br0"
 mac = "02:00:00:00:00:04"
 mtu = 1492

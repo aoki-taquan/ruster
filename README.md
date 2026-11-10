@@ -51,7 +51,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 - ルータ宛ての通信は、種類ごとに数を抑えてVRFごとのTUNでkernelに渡す。
 - VRFは複数持てる。別のVRFのインターフェースへ送る経路と、lookup-vrfで経路を漏らせる。
 - VLAN（802.1Q）のサブインターフェースを持てる。AF_PACKETでは、kernelが外したタグをバックエンドがフレームに戻す。
-- L2のブリッジ（MACの学習、フラッディング、エージング）と、ブリッジのアドレスで経路につなぐIRB。設定は`[[interface]]`の`bridge`。
+- L2のブリッジ（MACの学習、フラッディング、エージング）と、ブリッジのアドレスで経路につなぐIRB。設定は`[[interface]]`の`bridge`。メンバーにはEtherIP（`etherip`）も使える。
 - 経路は静的なもの、直結、FRRのBGP（multihopの近隣も。次の転送先はribdが解決する）。実際のNICや回線ではまだ試していません。
 
 ARPとNDの解決はneighdが行い、FEは受けたARPとNDをneighdへ渡します。
