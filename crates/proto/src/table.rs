@@ -28,10 +28,13 @@
 //!   `bind-ni-name`; `default` when left out.
 //! - `draft-ietf-netmod-sub-intf-vlan-model`: a sub-interface names its
 //!   `parent-interface` and the VLAN ID of its outer 802.1Q tag.
+//! - IEEE 802.1Qcp (`ieee802-dot1q-bridge`): a bridge's ageing time (10 to 1000000
+//!   seconds), an interface's `bridge-port/bridge-name`, and the static entries of the
+//!   filtering database; here in the tables of `ruster-bridge`.
 //! - RFC 5952 section 4: an IPv6 address is accepted only in its canonical text, so
 //!   one address is one key.
 //!
-//! Deviations: the route, neighbor and punt tables and the source values (what a
+//! Deviations: the route, neighbor, punt and bridge tables and the source values (what a
 //! daemon writes to confd, each with a lifetime) are ruster's own models, and the SIDs are
 //! local (see [`crate::sid`]).
 
@@ -105,6 +108,20 @@ pub enum Key {
     /// The DNS servers a source found (DHCP, DHCPv6 or IPCP); one list per source.
     SourceDns {
         source: String,
+    },
+    /// A bridge (`ruster-bridge`). The interface of the same name, when there is
+    /// one, is the bridge's own interface (its IRB).
+    Bridge {
+        name: String,
+    },
+    /// The bridge an interface is a member of; one per interface.
+    BridgePort {
+        interface: String,
+    },
+    /// A static entry of a bridge's MAC address table.
+    BridgeMac {
+        bridge: String,
+        mac: [u8; 6],
     },
 }
 
@@ -189,7 +206,25 @@ pub enum Value {
         servers: Vec<IpAddr>,
         lifetime: u32,
     },
+    /// A bridge: a learned address not seen for `aging_s` seconds is no longer used
+    /// (IEEE 802.1Q 8.8.3: 10 to 1000000, 300 recommended), and at most
+    /// `max_learned` addresses are learned.
+    Bridge {
+        aging_s: u32,
+        max_learned: u32,
+    },
+    /// The interface is a member of bridge `bridge`.
+    BridgePort {
+        bridge: String,
+    },
+    /// The address is on member `interface`.
+    BridgeMac {
+        interface: String,
+    },
 }
+
+/// The range of a bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3).
+pub const BRIDGE_AGING_RANGE: std::ops::RangeInclusive<u32> = 10..=1_000_000;
 
 /// The most DNS servers one source sends.
 pub const SOURCE_DNS_MAX: usize = 8;
@@ -505,6 +540,9 @@ impl Key {
             Self::SourcePrefix { .. } => sid::SOURCE_PREFIX,
             Self::SourceIpv6 { .. } => sid::SOURCE_IPV6,
             Self::SourceDns { .. } => sid::SOURCE_DNS,
+            Self::Bridge { .. } => sid::BRIDGE,
+            Self::BridgePort { .. } => sid::BRIDGE_PORT,
+            Self::BridgeMac { .. } => sid::BRIDGE_MAC,
         }
     }
 }
@@ -580,6 +618,8 @@ impl Change {
             | Key::SourcePrefix { source }
             | Key::SourceIpv6 { source }
             | Key::SourceDns { source } => name(source)?,
+            Key::Bridge { name: n } | Key::BridgeMac { bridge: n, .. } => name(n)?,
+            Key::BridgePort { interface } => name(interface)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 parse_prefix(&format!("{prefix}/{len}"))?;
@@ -604,6 +644,9 @@ impl Change {
                         | (Key::SourcePrefix { .. }, Value::SourcePrefix { .. })
                         | (Key::SourceIpv6 { .. }, Value::SourceIpv6 { .. })
                         | (Key::SourceDns { .. }, Value::SourceDns { .. })
+                        | (Key::Bridge { .. }, Value::Bridge { .. })
+                        | (Key::BridgePort { .. }, Value::BridgePort { .. })
+                        | (Key::BridgeMac { .. }, Value::BridgeMac { .. })
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -713,6 +756,33 @@ impl Change {
                         }
                     }
                     Value::Punt(class) => validate_punt(class)?,
+                    Value::Bridge {
+                        aging_s,
+                        max_learned,
+                    } => {
+                        if !BRIDGE_AGING_RANGE.contains(aging_s) {
+                            return Err(ModelError::Invalid("aging-time"));
+                        }
+                        if *max_learned == 0 {
+                            return Err(ModelError::Invalid("max-learned"));
+                        }
+                    }
+                    Value::BridgePort { bridge } => {
+                        name(bridge)?;
+                        if let Key::BridgePort { interface } = &self.key {
+                            if interface == bridge {
+                                return Err(ModelError::Invalid("bridge port (the bridge itself)"));
+                            }
+                        }
+                    }
+                    Value::BridgeMac { interface } => {
+                        name(interface)?;
+                        if let Key::BridgeMac { mac, .. } = &self.key {
+                            if mac[0] & 1 != 0 || *mac == [0; 6] {
+                                return Err(ModelError::Invalid("static MAC address"));
+                            }
+                        }
+                    }
                     Value::SourcePppoe {
                         session,
                         peer,
@@ -914,6 +984,18 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::SourceDns { source } => {
             e.array(2).u64(sid::SOURCE_DNS).text(source);
         }
+        Key::Bridge { name } => {
+            e.array(2).u64(sid::BRIDGE).text(name);
+        }
+        Key::BridgePort { interface } => {
+            e.array(2).u64(sid::BRIDGE_PORT).text(interface);
+        }
+        Key::BridgeMac { bridge, mac } => {
+            e.array(3)
+                .u64(sid::BRIDGE_MAC)
+                .text(bridge)
+                .text(&format_mac(mac));
+        }
         Key::FirewallRule { vrf, id } => {
             e.array(3)
                 .u64(sid::FIREWALL_RULE)
@@ -936,8 +1018,10 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::SOURCE_IPV4
         | sid::SOURCE_PREFIX
         | sid::SOURCE_IPV6
-        | sid::SOURCE_DNS => 2,
-        sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE => 3,
+        | sid::SOURCE_DNS
+        | sid::BRIDGE
+        | sid::BRIDGE_PORT => 2,
+        sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE | sid::BRIDGE_MAC => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
     if len != expected {
@@ -958,6 +1042,12 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::SOURCE_PREFIX => Key::SourcePrefix { source: first },
         sid::SOURCE_IPV6 => Key::SourceIpv6 { source: first },
         sid::SOURCE_DNS => Key::SourceDns { source: first },
+        sid::BRIDGE => Key::Bridge { name: first },
+        sid::BRIDGE_PORT => Key::BridgePort { interface: first },
+        sid::BRIDGE_MAC => Key::BridgeMac {
+            bridge: first,
+            mac: parse_mac(d.text()?)?,
+        },
         sid::FIREWALL_RULE => Key::FirewallRule {
             vrf: first,
             id: u32::try_from(d.u64()?).map_err(|_| ModelError::Invalid("rule id"))?,
@@ -1243,6 +1333,26 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             }
         }
         Value::Punt(class) => encode_punt(class, e),
+        Value::Bridge {
+            aging_s,
+            max_learned,
+        } => {
+            e.map(2)
+                .u64(sid::BRIDGE_AGING_TIME - sid::BRIDGE)
+                .u64(u64::from(*aging_s))
+                .u64(sid::BRIDGE_MAX_LEARNED - sid::BRIDGE)
+                .u64(u64::from(*max_learned));
+        }
+        Value::BridgePort { bridge } => {
+            e.map(1)
+                .u64(sid::BRIDGE_PORT_BRIDGE - sid::BRIDGE_PORT)
+                .text(bridge);
+        }
+        Value::BridgeMac { interface } => {
+            e.map(1)
+                .u64(sid::BRIDGE_MAC_PORT - sid::BRIDGE_MAC)
+                .text(interface);
+        }
         Value::FirewallRule(rule) => {
             let d = |member: u64| member - sid::FIREWALL_RULE;
             let members = 8 + u64::from(rule.ingress.is_some()) + u64::from(rule.egress.is_some());
@@ -1294,6 +1404,9 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::SOURCE_PREFIX
             | sid::SOURCE_IPV6
             | sid::SOURCE_DNS
+            | sid::BRIDGE
+            | sid::BRIDGE_PORT
+            | sid::BRIDGE_MAC
     ) {
         return decode_policy_value(table, d);
     }
@@ -1553,7 +1666,7 @@ pub fn format_mac(mac: &[u8; 6]) -> String {
     parts.join(":")
 }
 
-/// An interface, address, route or neighbor entry as a line of text for a person
+/// An interface, address, route, neighbor or bridge entry as a line of text for a person
 /// (`ruster show`); `None` for the other tables.
 pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
     let line = match (key, value) {
@@ -1616,6 +1729,19 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
         }
         (Key::Neighbor { interface, address }, Value::Neighbor { mac }) => {
             format!("neighbor {interface} {address} {}", format_mac(mac))
+        }
+        (
+            Key::Bridge { name },
+            Value::Bridge {
+                aging_s,
+                max_learned,
+            },
+        ) => format!("bridge {name} aging {aging_s} max-learned {max_learned}"),
+        (Key::BridgePort { interface }, Value::BridgePort { bridge }) => {
+            format!("bridge-port {interface} bridge {bridge}")
+        }
+        (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) => {
+            format!("bridge-mac {bridge} {} {interface}", format_mac(mac))
         }
         _ => return None,
     };
@@ -1725,6 +1851,25 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
     };
     let value = if table == sid::PUNT {
         decode_punt(&mut got)?
+    } else if table == sid::BRIDGE {
+        let mut number = |member: u64, what: &'static str| match got.remove(&member) {
+            Some(Member::Uint(n)) => u32::try_from(n).map_err(|_| ModelError::Invalid(what)),
+            Some(_) => Err(ModelError::Invalid(what)),
+            None => Err(ModelError::Missing(what)),
+        };
+        Value::Bridge {
+            aging_s: number(sid::BRIDGE_AGING_TIME, "aging-time")?,
+            max_learned: number(sid::BRIDGE_MAX_LEARNED, "max-learned")?,
+        }
+    } else if table == sid::BRIDGE_PORT {
+        Value::BridgePort {
+            bridge: text(sid::BRIDGE_PORT_BRIDGE, "bridge-name")?
+                .ok_or(ModelError::Missing("bridge-name"))?,
+        }
+    } else if table == sid::BRIDGE_MAC {
+        Value::BridgeMac {
+            interface: text(sid::BRIDGE_MAC_PORT, "port")?.ok_or(ModelError::Missing("port"))?,
+        }
     } else if matches!(
         table,
         sid::SOURCE_PPPOE

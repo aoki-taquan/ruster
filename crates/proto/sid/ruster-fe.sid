@@ -541,6 +541,48 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge",
+        "sid": 60240,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/aging-time",
+        "sid": 60241,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/max-learned",
+        "sid": 60242,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridge-ports/bridge-port",
+        "sid": 60250,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridge-ports/bridge-port/bridge-name",
+        "sid": 60251,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/filtering-entry",
+        "sid": 60260,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-bridge:bridges/bridge/filtering-entry/port",
+        "sid": 60261,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"
