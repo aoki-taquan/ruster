@@ -277,22 +277,23 @@ impl Neighd {
     /// Takes the `ra` part of the configuration ([`ruster_config::ra_part`]); it
     /// replaces the last one.
     pub fn take_ra(&mut self, part: &str) -> Result<(), String> {
-        let ra = ruster_config::parse_ra_part(part)?;
-        let mut by_name = BTreeMap::new();
-        for entry in ra {
-            // confd checked these; the intervals are checked again, since a short one
-            // would flood the link (RFC 4861 section 6.2.1).
-            let (min, max) = (entry.min_interval, entry.max_interval);
-            if !(4..=1_800).contains(&max) || min < 3 || u64::from(min) * 4 > u64::from(max) * 3 {
-                return Err(format!("ra {:?}: bad intervals", entry.interface));
-            }
-            let name = entry.interface.clone();
-            if by_name.insert(name.clone(), entry).is_some() {
-                return Err(format!("ra {name:?}: given twice"));
-            }
-        }
-        self.ra = by_name;
+        self.ra = read_ra(part)?;
         Ok(())
+    }
+
+    /// What taking an `ra` part would change: the RA settings that change, and the
+    /// interfaces whose Router Advertisements would start, change or stop; or the
+    /// reason it would be refused.
+    pub fn check_ra(&self, part: &str) -> Result<String, String> {
+        let after: Vec<_> = read_ra(part)?.into_values().collect();
+        let before: Vec<_> = self.ra.values().cloned().collect();
+        Ok(ruster_confd::part::changes(
+            &before,
+            &after,
+            |r| &r.interface,
+            ruster_config::ra_part,
+            ["RAs start", "RAs change", "RAs stop"],
+        ))
     }
 
     /// True once the FE connection closed (the FE stopped or restarted).
@@ -1225,4 +1226,23 @@ fn mask(len: u8) -> u32 {
 
 fn same_subnet(a: Ipv4Addr, b: Ipv4Addr, len: u8) -> bool {
     (u32::from(a) ^ u32::from(b)) & mask(len) == 0
+}
+
+/// The RA entries of an `ra` part by interface, or why they are refused.
+fn read_ra(part: &str) -> Result<BTreeMap<String, ruster_config::Ra>, String> {
+    let ra = ruster_config::parse_ra_part(part)?;
+    let mut by_name = BTreeMap::new();
+    for entry in ra {
+        // confd checked these; the intervals are checked again, since a short one
+        // would flood the link (RFC 4861 section 6.2.1).
+        let (min, max) = (entry.min_interval, entry.max_interval);
+        if !(4..=1_800).contains(&max) || min < 3 || u64::from(min) * 4 > u64::from(max) * 3 {
+            return Err(format!("ra {:?}: bad intervals", entry.interface));
+        }
+        let name = entry.interface.clone();
+        if by_name.insert(name.clone(), entry).is_some() {
+            return Err(format!("ra {name:?}: given twice"));
+        }
+    }
+    Ok(by_name)
 }

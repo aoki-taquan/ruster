@@ -5,7 +5,7 @@ use std::net::Ipv6Addr;
 use std::os::unix::net::UnixStream;
 
 use ruster_confd::delegated::subnet;
-use ruster_confd::part::{Client as PartClient, Module};
+use ruster_confd::part::{Asked, Client as PartClient, Module};
 use ruster_confd::{file, Confd};
 use ruster_proto::session::Client;
 use ruster_proto::table::{Change, Key, Value};
@@ -84,9 +84,11 @@ fn the_lan_takes_its_64_and_advertises_it_while_the_prefix_lasts() {
             confd.step(now);
             source.poll();
             neighd
-                .poll(&mut |text| {
-                    parts.push(text.to_owned());
-                    Ok(())
+                .poll(&mut |asked| {
+                    if let Asked::Take(text) = asked {
+                        parts.push(text.to_owned());
+                    }
+                    Ok(String::new())
                 })
                 .unwrap();
         }
@@ -363,9 +365,11 @@ upstream-from = ["dhcp-wan", "pppoe-wan"]
             source.poll();
         }
         unbound
-            .poll(&mut |text| {
-                parts.push(text.to_owned());
-                Ok(())
+            .poll(&mut |asked| {
+                if let Asked::Take(text) = asked {
+                    parts.push(text.to_owned());
+                }
+                Ok(String::new())
             })
             .unwrap();
     }

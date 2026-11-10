@@ -220,6 +220,31 @@ impl Bridge {
         }
     }
 
+    /// What taking an `frr` part would change: the line diff of `frr.conf`, or the
+    /// reason it would be refused. Nothing is written, and FRR is not asked; it may
+    /// still refuse the file when it reads it. What follows a word such as
+    /// `password` or `key-string` on a line is not shown (the include may hold
+    /// secrets); a line whose secret changes shows as `(hidden, changed)`.
+    pub fn check(&self, part: &str) -> Result<String, String> {
+        let (bgp, connected) = ruster_config::parse_frr_part(part)?;
+        let include = match bgp.as_ref().and_then(|b| b.include.first()) {
+            Some(path) => read_include(path)?,
+            None => String::new(),
+        };
+        let text = config(bgp.as_ref(), &connected, &include, self.fpm_port)?;
+        let before = match std::fs::read_to_string(&self.path) {
+            Ok(before) => before,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("{}: {error}", self.path.display())),
+        };
+        let name = self.path.display().to_string();
+        Ok(ruster_confd::diff::lines(
+            &hide_secrets(&before, &before),
+            &hide_secrets(&text, &before),
+            (&name, "candidate"),
+        ))
+    }
+
     /// Takes an `frr` part ([`ruster_config::frr_part`]), or refuses it with the
     /// reason; the interfaces' prefixes in it, for the next hops.
     pub fn take(&mut self, part: &str) -> Result<Vec<Connected>, String> {
@@ -359,4 +384,39 @@ fn read_include(path: &str) -> Result<String, String> {
         return Err(format!("include {path}: larger than {INCLUDE_MAX} bytes"));
     }
     Ok(text)
+}
+
+/// The words after which FRR's configuration holds a secret.
+const SECRET_WORDS: [&str; 7] = [
+    "password",
+    "area-password",
+    "domain-password",
+    "key-string",
+    "authentication-key",
+    "md5",
+    "community",
+];
+
+/// `text` with what follows a word of [`SECRET_WORDS`] on each line replaced by
+/// `(hidden)`, or by `(hidden, changed)` when the line is not in `before`.
+fn hide_secrets(text: &str, before: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.iter().position(|w| SECRET_WORDS.contains(w)) {
+            Some(at) => {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                out.push_str(indent);
+                out.push_str(&words[..=at].join(" "));
+                if before.lines().any(|b| b == line) {
+                    out.push_str(" (hidden)");
+                } else {
+                    out.push_str(" (hidden, changed)");
+                }
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }

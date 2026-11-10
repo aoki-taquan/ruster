@@ -243,3 +243,54 @@ fn with_no_file_before_a_failure_goes_back_to_no_bgp() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_check_shows_the_diff_with_passwords_hidden_and_writes_nothing() {
+    let dir = dir("check");
+    let file = dir.join("frr.conf");
+    let include = dir.join("extra.conf");
+    std::fs::write(&include, " neighbor 198.51.100.10 password secret1\n").unwrap();
+    let mut with_include = bgp();
+    with_include.include = vec![include.display().to_string()];
+    let part = frr_part(Some(&with_include), &connected());
+    let bridge = Bridge::new(file.clone(), Vec::new(), 2620);
+    let text = bridge.check(&part).unwrap();
+    assert!(text.contains("+router bgp 65001"), "{text}");
+    assert!(
+        text.contains("+ neighbor 198.51.100.10 password (hidden, changed)"),
+        "{text}"
+    );
+    assert!(!text.contains("secret1"), "{text}");
+    assert!(!file.exists(), "a check writes nothing");
+    std::fs::write(
+        &file,
+        config(
+            Some(&with_include),
+            &connected(),
+            " neighbor 198.51.100.10 password secret2\n",
+            2620,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // Only the password differs, and it is not shown.
+    let text = bridge.check(&part).unwrap();
+    assert!(
+        text.contains("+ neighbor 198.51.100.10 password (hidden, changed)"),
+        "{text}"
+    );
+    assert!(!text.contains("secret"), "{text}");
+    std::fs::write(
+        &file,
+        config(
+            Some(&with_include),
+            &connected(),
+            " neighbor 198.51.100.10 password secret1\n",
+            2620,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(bridge.check(&part).unwrap(), "");
+    let _ = std::fs::remove_dir_all(&dir);
+}

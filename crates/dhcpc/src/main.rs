@@ -35,7 +35,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_config::DhcpClient;
 use ruster_dhcpc::client6::Want;
 use ruster_dhcpc::{client4, client6, dhcp4, dhcp6, frame, values};
@@ -127,6 +127,27 @@ impl Interface {
         .flatten()
         .min()
     }
+}
+
+/// What taking a `dhcpc` part would change for clients with `before`: the settings
+/// that change, and the interfaces whose clients would start, start again
+/// (releasing what they have) or stop; or the reason it would be refused.
+fn changes(before: &[DhcpClient], text: &str) -> Result<String, String> {
+    let entries = ruster_config::parse_dhcp_client_part(text)?;
+    for entry in &entries {
+        Interface::new(entry.clone(), 0)?;
+    }
+    Ok(ruster_confd::part::changes(
+        before,
+        &entries,
+        |e| &e.interface,
+        ruster_config::dhcp_client_part,
+        [
+            "the client starts",
+            "the client starts again",
+            "the client stops",
+        ],
+    ))
 }
 
 struct Daemon {
@@ -286,6 +307,12 @@ impl Daemon {
             .collect();
         changes.extend(want.into_values());
         ribd.set(changes);
+    }
+
+    /// What taking a `dhcpc` part would change ([`changes`]).
+    fn check(&self, text: &str) -> Result<String, String> {
+        let before: Vec<DhcpClient> = self.interfaces.iter().map(|i| i.entry.clone()).collect();
+        changes(&before, text)
     }
 
     /// Takes a new `dhcpc` part: interfaces whose settings are the same keep their
@@ -483,7 +510,11 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        let parted = part.poll(&mut |text| {
+        let parted = part.poll(&mut |asked| {
+            let text = match asked {
+                Asked::Check(text) => return daemon.check(text),
+                Asked::Take(text) => text,
+            };
             let taken = daemon.take(text, now);
             match &taken {
                 Ok(()) => {
@@ -495,7 +526,7 @@ fn run() -> Result<(), String> {
                 }
                 Err(error) => eprintln!("ruster-dhcpc: refused a part: {error}"),
             }
-            taken
+            taken.map(|()| String::new())
         })?;
         let busy = daemon.receive(now) | parted.busy;
         let timer = daemon.timers(now);
@@ -526,5 +557,52 @@ fn main() -> ExitCode {
             eprintln!("ruster-dhcpc: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_check_names_the_settings_and_clients_that_change() {
+        let entry = DhcpClient {
+            interface: "wan".into(),
+            vrf: "default".into(),
+            mac: "02:00:00:00:00:02".into(),
+            link_local: "fe80::ff:fe00:2".into(),
+            ipv4_source: vec!["dhcp-wan".into()],
+            ipv6_source: Vec::new(),
+            ipv6_address: false,
+            default_route: true,
+            punt_rate: 200,
+            punt_burst: 100,
+        };
+        let part = ruster_config::dhcp_client_part;
+        assert_eq!(
+            changes(
+                std::slice::from_ref(&entry),
+                &part(std::slice::from_ref(&entry))
+            )
+            .unwrap(),
+            ""
+        );
+        let first = changes(&[], &part(std::slice::from_ref(&entry))).unwrap();
+        assert!(first.ends_with("wan: the client starts\n"), "{first}");
+        let other = DhcpClient {
+            default_route: false,
+            ..entry.clone()
+        };
+        let text = changes(std::slice::from_ref(&entry), &part(&[other])).unwrap();
+        assert!(text.contains("-default-route = true"), "{text}");
+        assert!(text.contains("+default-route = false"), "{text}");
+        assert!(text.ends_with("wan: the client starts again\n"), "{text}");
+        let gone = changes(std::slice::from_ref(&entry), &part(&[])).unwrap();
+        assert!(gone.ends_with("wan: the client stops\n"), "{gone}");
+        let bad = DhcpClient {
+            link_local: "x".into(),
+            ..entry
+        };
+        assert!(changes(&[], &part(&[bad])).is_err());
     }
 }

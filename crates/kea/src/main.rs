@@ -20,7 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_kea::agent::Agent;
 use ruster_kea::settings::Listen;
 use ruster_kea::settings6::Listen6;
@@ -95,7 +95,11 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        let polled = client.poll(&mut |part| {
+        let polled = client.poll(&mut |asked| {
+            let part = match asked {
+                Asked::Check(part) => return bridge.check(part),
+                Asked::Take(part) => part,
+            };
             let result = bridge.take(part, &mut || {
                 if !ready {
                     ready = true;
@@ -110,7 +114,7 @@ fn run() -> Result<(), String> {
                         served6.into_iter().map(|s| s.link).collect(),
                     );
                     eprintln!("ruster-kea: took a part");
-                    Ok(())
+                    Ok(String::new())
                 }
                 Err(error) => {
                     eprintln!("ruster-kea: refused a part: {error}");

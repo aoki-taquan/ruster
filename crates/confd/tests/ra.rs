@@ -3,7 +3,7 @@
 use std::os::unix::net::UnixStream;
 
 use ruster_confd::file::parse;
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_confd::Confd;
 use ruster_proto::task::Task;
 
@@ -121,9 +121,11 @@ fn neighd_takes_the_ra_part() {
         for _ in 0..50 {
             confd.step(0);
             neighd
-                .poll(&mut |part| {
-                    parts.push(part.to_owned());
-                    Ok(())
+                .poll(&mut |asked| {
+                    if let Asked::Take(part) = asked {
+                        parts.push(part.to_owned());
+                    }
+                    Ok(String::new())
                 })
                 .unwrap();
         }

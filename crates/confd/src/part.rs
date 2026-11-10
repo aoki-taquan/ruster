@@ -12,9 +12,17 @@
 //! |---|---|---|
 //! | process | POST `<module>`, no payload | 2.04 Changed; 4.04 Not Found for a module other than the socket's; 4.00 Bad Request for a second module on one connection |
 //! | confd | PUT `<module>`, the part as TOML text | 2.04 Changed when the process took it; any other code refuses it, with the reason as text |
+//! | confd | POST `<module>/check`, a candidate part as TOML text | 2.05 Content with what taking it would change, as text for a person (empty when nothing would); 4.00 Bad Request with the reason when the process would refuse it |
 //!
 //! confd puts the part right after the 2.04, and again whenever a new configuration
 //! changes it. A part is the whole of the module, so each PUT replaces the last one.
+//!
+//! A check is the candidate step of `docs/design/router-box.md`, "反映の流れ": the
+//! process works out what the part would change against what it holds now (its
+//! files, its sessions), and takes nothing. An answer too long for one message is
+//! cut, saying so. `ruster diff` and `ruster apply` use the answers ([`crate::apply`]). A check cannot
+//! foresee everything: the software a bridge drives may still refuse the file when
+//! it reads it, which the answer to the PUT then says.
 //! A refusal is handled like one from the FE, ribd or neighd: if it is for a new
 //! configuration from `ruster apply`, confd puts the configuration before back
 //! ([`crate::apply`]), which for the refusing process is the part it already holds.
@@ -35,7 +43,8 @@
 //! | `dhcpc` | `ruster-dhcpc` | [`ruster_config::dhcp_client_part`] |
 //! | `frr` | `ruster-frr` | [`ruster_config::frr_part`], with the prefixes of the default VRF's interfaces ([`crate::bgp::connected`]) |
 //!
-//! [`Client`] is the process's side.
+//! [`Client`] is the process's side, and [`changes`] the text a process that runs
+//! one thing per entry answers a check with.
 //!
 //! # Standards
 //!
@@ -97,6 +106,18 @@ impl Module {
         }
     }
 
+    /// The process that takes the module.
+    pub fn process(self) -> &'static str {
+        match self {
+            Self::Dns => "ruster-unbound",
+            Self::Dhcp => "ruster-kea",
+            Self::Ra => "ruster-neighd",
+            Self::Pppoe => "ruster-pppoed",
+            Self::Dhcpc => "ruster-dhcpc",
+            Self::Frr => "ruster-frr",
+        }
+    }
+
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|m| m.name() == name)
     }
@@ -143,6 +164,8 @@ struct Taker {
     held: Option<String>,
     /// PUTs waiting for an answer: token, configuration generation, part.
     in_flight: Vec<(u32, u64, String)>,
+    /// The token of the check waiting for an answer, if one is.
+    checking: Option<u32>,
 }
 
 impl Taker {
@@ -154,9 +177,14 @@ impl Taker {
             .or(self.held.as_ref())
     }
 
-    fn put(&mut self, module: Module, part: String, generation: u64) {
+    fn token(&mut self) -> u32 {
         let token = self.next_token;
         self.next_token = self.next_token.wrapping_add(1);
+        token
+    }
+
+    fn put(&mut self, module: Module, part: String, generation: u64) {
+        let token = self.token();
         let sent = self.conn.send(&Outgoing {
             code: Some(Code::PUT),
             token: &token.to_be_bytes(),
@@ -168,6 +196,32 @@ impl Taker {
             self.in_flight.push((token, generation, part));
         }
     }
+
+    fn check(&mut self, module: Module, part: &str) -> bool {
+        let token = self.token();
+        let sent = self.conn.send(&Outgoing {
+            code: Some(Code::POST),
+            token: &token.to_be_bytes(),
+            path: &[module.name(), "check"],
+            payload: part.as_bytes(),
+            ..Outgoing::default()
+        });
+        self.checking = sent.is_ok().then_some(token);
+        sent.is_ok()
+    }
+}
+
+/// A process's answer to a check of a candidate part.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Checked {
+    /// It would take the part; what that would change (empty: nothing).
+    Changes(String),
+    /// It would refuse the part, for this reason.
+    Refused(String),
+    /// No process takes the module now.
+    NotConnected,
+    /// It has not answered (yet).
+    NoAnswer,
 }
 
 /// confd's side: the connections, and the process holding each module.
@@ -176,6 +230,8 @@ pub(crate) struct Parts {
     /// Connections that have not named a module yet, with the module of their socket.
     unnamed: Vec<(Module, Connection)>,
     takers: BTreeMap<Module, Taker>,
+    /// The answers to the last check, by module.
+    checked: BTreeMap<Module, Checked>,
 }
 
 /// A process refused a part: the module, its reason, and the generation of the part.
@@ -201,6 +257,31 @@ impl Parts {
                 taker.put(*module, part, generation);
             }
         }
+    }
+
+    /// Asks every connected process to check its part of `candidate`, and notes the
+    /// modules `candidate` has that no process takes now. The answers of an earlier
+    /// check are dropped.
+    pub(crate) fn check(&mut self, candidate: &Config) {
+        self.checked.clear();
+        for module in Module::ALL {
+            let asked = match self.takers.get_mut(&module) {
+                Some(taker) if !taker.conn.is_closed() => {
+                    taker.check(module, &module.part(candidate))
+                }
+                _ => false,
+            };
+            if asked {
+                self.checked.insert(module, Checked::NoAnswer);
+            } else if module.configured(candidate) {
+                self.checked.insert(module, Checked::NotConnected);
+            }
+        }
+    }
+
+    /// The answers to the last check so far, by module.
+    pub(crate) fn checked(&self) -> &BTreeMap<Module, Checked> {
+        &self.checked
     }
 
     /// True when every connected process has answered every PUT.
@@ -255,7 +336,12 @@ impl Parts {
                 next_token: 1,
                 held: None,
                 in_flight: Vec::new(),
+                checking: None,
             };
+            // A process that started again does not answer the older one's check.
+            if self.checked.get(&module) == Some(&Checked::NoAnswer) {
+                self.checked.insert(module, Checked::NotConnected);
+            }
             taker.put(module, module.part(config), generation);
             // The older connection for the module, if any, is closed by the drop.
             self.takers.insert(module, taker);
@@ -274,7 +360,7 @@ impl Parts {
                 busy = true;
                 if message.code.class() == 0 {
                     // The module is named already; nothing else is asked of confd.
-                    answer(
+                    reply(
                         &mut taker.conn,
                         &message.token,
                         Code::BAD_REQUEST,
@@ -288,6 +374,17 @@ impl Parts {
                     .try_into()
                     .map(u32::from_be_bytes)
                     .unwrap_or(0);
+                if taker.checking == Some(token) {
+                    taker.checking = None;
+                    let text = String::from_utf8_lossy(&message.payload).into_owned();
+                    let answer = if message.code.class() == 2 {
+                        Checked::Changes(text)
+                    } else {
+                        Checked::Refused(text)
+                    };
+                    self.checked.insert(*module, answer);
+                    continue;
+                }
                 let Some(at) = taker.in_flight.iter().position(|(t, _, _)| *t == token) else {
                     continue;
                 };
@@ -301,6 +398,9 @@ impl Parts {
             }
             busy |= taker.conn.take_more();
             busy |= taker.conn.pump().unwrap_or(false);
+            if taker.conn.is_closed() && taker.checking.take().is_some() {
+                self.checked.insert(*module, Checked::NotConnected);
+            }
         }
         (Progress::busy(busy), refusals)
     }
@@ -316,19 +416,62 @@ fn name(conn: &mut Connection, request: &Incoming, socket: Module) -> Option<Mod
         _ => None,
     };
     match module {
-        Some(_) => answer(conn, &request.token, Code::CHANGED, ""),
-        None => answer(conn, &request.token, Code::NOT_FOUND, "no such module"),
+        Some(_) => reply(conn, &request.token, Code::CHANGED, ""),
+        None => reply(conn, &request.token, Code::NOT_FOUND, "no such module"),
     }
     module
 }
 
-fn answer(conn: &mut Connection, token: &[u8], code: Code, text: &str) {
+fn reply(conn: &mut Connection, token: &[u8], code: Code, text: &str) {
     let _ = conn.send(&Outgoing {
         code: Some(code),
         token,
         payload: text.as_bytes(),
         ..Outgoing::default()
     });
+}
+
+/// What confd asks of a process ([`Client::poll`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asked<'a> {
+    /// Take this part. `Ok` takes it (its text is not used); `Err` refuses it, with
+    /// the reason.
+    Take(&'a str),
+    /// Check this candidate part without taking it. `Ok` says what taking it would
+    /// change, as text for a person (empty when nothing would); `Err` says why it
+    /// would be refused.
+    Check(&'a str),
+}
+
+/// The answer to a check for a process that runs one thing per entry of its part
+/// (`ruster-pppoed`, `ruster-dhcpc`, neighd's RA): the line diff of the part from
+/// `before` to `after`, written by `part`, and then a line for each entry that would
+/// start, change or stop, named by `key`, with the words of `verbs` (in that order).
+/// Empty when the entries are the same. Entries whose content should not be shown
+/// (passwords) are hidden by the caller before.
+pub fn changes<T: PartialEq>(
+    before: &[T],
+    after: &[T],
+    key: impl Fn(&T) -> &str,
+    part: impl Fn(&[T]) -> String,
+    verbs: [&str; 3],
+) -> String {
+    let mut out = crate::diff::lines(&part(before), &part(after), ("in use", "candidate"));
+    for entry in after {
+        let same_key = before.iter().find(|b| key(b) == key(entry));
+        let verb = match same_key {
+            None => verbs[0],
+            Some(old) if old != entry => verbs[1],
+            Some(_) => continue,
+        };
+        out.push_str(&format!("{}: {verb}\n", key(entry)));
+    }
+    for entry in before {
+        if !after.iter().any(|a| key(a) == key(entry)) {
+            out.push_str(&format!("{}: {}\n", key(entry), verbs[2]));
+        }
+    }
+    out
 }
 
 /// The process's side: names its module, then takes each part confd puts.
@@ -365,12 +508,12 @@ impl Client {
         self.named
     }
 
-    /// Hands each part confd put to `take` and answers with what it returns: `Ok`
-    /// takes the part, `Err` refuses it with the reason. An error from confd to the
-    /// module's name is returned.
+    /// Hands each part confd put, and each candidate part it asks to check, to
+    /// `answer` and answers confd with what it returns ([`Asked`]). An error from
+    /// confd to the module's name is returned.
     pub fn poll(
         &mut self,
-        take: &mut dyn FnMut(&str) -> Result<(), String>,
+        answer: &mut dyn FnMut(Asked<'_>) -> Result<String, String>,
     ) -> Result<Progress, String> {
         let mut busy = self.conn.pump().unwrap_or(false);
         while let Ok(Some(message)) = self.conn.next_message() {
@@ -384,22 +527,45 @@ impl Client {
                 continue;
             }
             let path: Vec<&str> = message.path.iter().map(String::as_str).collect();
+            let text = std::str::from_utf8(&message.payload)
+                .map_err(|_| "the part is not UTF-8".to_owned());
             let (code, text) = match (message.code, path.as_slice()) {
                 (Code::PUT, [name]) if *name == self.module.name() => {
-                    match std::str::from_utf8(&message.payload)
-                        .map_err(|_| "the part is not UTF-8".to_owned())
-                        .and_then(&mut *take)
-                    {
-                        Ok(()) => (Code::CHANGED, String::new()),
+                    match text.and_then(|part| answer(Asked::Take(part))) {
+                        Ok(_) => (Code::CHANGED, String::new()),
                         Err(reason) => (Code::BAD_REQUEST, reason),
+                    }
+                }
+                (Code::POST, [name, "check"]) if *name == self.module.name() => {
+                    let limit = self.conn.peer_limit().unwrap_or(LIMIT);
+                    match text.and_then(|part| answer(Asked::Check(part))) {
+                        Ok(changes) => (Code::CONTENT, cut(changes, limit)),
+                        Err(reason) => (Code::BAD_REQUEST, cut(reason, limit)),
                     }
                 }
                 _ => (Code::NOT_FOUND, String::new()),
             };
-            answer(&mut self.conn, &message.token, code, &text);
+            reply(&mut self.conn, &message.token, code, &text);
         }
         busy |= self.conn.take_more();
         busy |= self.conn.pump().unwrap_or(false);
         Ok(Progress::busy(busy))
     }
+}
+
+/// `text` cut to fit a message confd takes (`limit` bytes, less room for the
+/// header), saying how much was left out.
+fn cut(mut text: String, limit: usize) -> String {
+    let room = limit.saturating_sub(1_024);
+    if text.len() <= room {
+        return text;
+    }
+    let mut at = room.saturating_sub(64);
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let left = text.len() - at;
+    text.truncate(at);
+    text.push_str(&format!("\n(cut: {left} more bytes)\n"));
+    text
 }

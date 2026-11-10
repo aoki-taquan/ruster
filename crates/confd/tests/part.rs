@@ -3,7 +3,7 @@
 use std::os::unix::net::UnixStream;
 
 use ruster_confd::apply::Apply;
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_confd::{file, Confd};
 use ruster_proto::coap::Code;
 use ruster_proto::session::{self, Event, Hook, Server, Store};
@@ -47,11 +47,14 @@ impl Process {
         let refuse = self.refuse;
         let taken = &mut self.taken;
         self.client
-            .poll(&mut |part| match refuse {
-                Some(word) if part.contains(word) => Err(format!("{word} refused")),
-                _ => {
+            .poll(&mut |asked| match (asked, refuse) {
+                (Asked::Check(part) | Asked::Take(part), Some(word)) if part.contains(word) => {
+                    Err(format!("{word} refused"))
+                }
+                (Asked::Check(part), _) => Ok(format!("would take {} lines", part.lines().count())),
+                (Asked::Take(part), _) => {
                     taken.push(part.to_owned());
-                    Ok(())
+                    Ok(String::new())
                 }
             })
             .unwrap()
@@ -256,4 +259,118 @@ fn connections_waiting_on_one_socket_do_not_keep_the_others_out() {
         name_on(&mut rig, Module::Pppoe, "pppoe"),
         Some(Code::CHANGED)
     );
+}
+
+#[test]
+fn a_check_gets_each_process_answer_without_taking_the_part() {
+    use ruster_confd::part::Checked;
+    let mut rig = Rig::new();
+    let mut dns = Process::new(&mut rig);
+    rig.run(&mut [&mut dns]);
+    let candidate = file::parse(&text(1500, "192.0.2.54")).unwrap();
+    rig.confd.check_parts(&candidate);
+    assert_eq!(
+        rig.confd.part_checks().get(&Module::Dns),
+        Some(&Checked::NoAnswer)
+    );
+    rig.run(&mut [&mut dns]);
+    let Some(Checked::Changes(said)) = rig.confd.part_checks().get(&Module::Dns) else {
+        panic!("{:?}", rig.confd.part_checks());
+    };
+    assert!(said.starts_with("would take"), "{said}");
+    assert_eq!(dns.taken.len(), 1, "a check takes nothing");
+    assert_eq!(upstream(&dns.taken[0]), ["192.0.2.53"]);
+    // Only modules a process takes, or the candidate has, are named.
+    assert_eq!(rig.confd.part_checks().len(), 1);
+
+    dns.refuse = Some("192.0.2.99");
+    rig.confd
+        .check_parts(&file::parse(&text(1500, "192.0.2.99")).unwrap());
+    rig.run(&mut [&mut dns]);
+    assert_eq!(
+        rig.confd.part_checks().get(&Module::Dns),
+        Some(&Checked::Refused("192.0.2.99 refused".into()))
+    );
+    assert_eq!(dns.taken.len(), 1);
+}
+
+#[test]
+fn a_check_names_the_modules_no_process_takes() {
+    use ruster_confd::part::Checked;
+    let mut rig = Rig::new();
+    rig.run(&mut []);
+    rig.confd
+        .check_parts(&file::parse(&text(1500, "192.0.2.54")).unwrap());
+    assert_eq!(
+        rig.confd.part_checks().get(&Module::Dns),
+        Some(&Checked::NotConnected)
+    );
+
+    // A process that goes away before it answers is not connected either.
+    let mut dns = Process::new(&mut rig);
+    rig.run(&mut [&mut dns]);
+    rig.confd
+        .check_parts(&file::parse(&text(1500, "192.0.2.55")).unwrap());
+    drop(dns);
+    rig.run(&mut []);
+    assert_eq!(
+        rig.confd.part_checks().get(&Module::Dns),
+        Some(&Checked::NotConnected)
+    );
+}
+
+#[test]
+fn changes_names_the_entries_that_start_change_and_stop() {
+    let part = |entries: &[(&str, u32)]| {
+        entries
+            .iter()
+            .map(|(k, v)| format!("{k} = {v}\n"))
+            .collect::<String>()
+    };
+    let before = [("a", 1), ("b", 2)];
+    let after = [("b", 3), ("c", 4)];
+    let text = ruster_confd::part::changes(
+        &before,
+        &after,
+        |e| e.0,
+        |entries| part(entries),
+        ["starts", "changes", "stops"],
+    );
+    assert!(text.contains("-a = 1\n"), "{text}");
+    assert!(text.contains("+b = 3\n"), "{text}");
+    assert!(
+        text.ends_with("b: changes\nc: starts\na: stops\n"),
+        "{text}"
+    );
+    assert_eq!(
+        ruster_confd::part::changes(&before, &before, |e| e.0, |e| part(e), ["", "", ""]),
+        ""
+    );
+}
+
+#[test]
+fn a_long_check_answer_is_cut_to_fit() {
+    use ruster_confd::part::Checked;
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut confd = Confd::new(file::parse(&text(1500, "192.0.2.53")).unwrap());
+    confd.attach_part(Module::Dns, a).unwrap();
+    let mut client = Client::new(b, Module::Dns).unwrap();
+    let mut answer = |asked: Asked<'_>| match asked {
+        Asked::Check(_) => Ok("x".repeat(2 << 20)),
+        Asked::Take(_) => Ok(String::new()),
+    };
+    for _ in 0..50 {
+        confd.step(0);
+        client.poll(&mut answer).unwrap();
+    }
+    confd.check_parts(&file::parse(&text(1500, "192.0.2.54")).unwrap());
+    for _ in 0..200 {
+        confd.step(0);
+        client.poll(&mut answer).unwrap();
+    }
+    let Some(Checked::Changes(said)) = confd.part_checks().get(&Module::Dns) else {
+        panic!("{:?}", confd.part_checks().get(&Module::Dns));
+    };
+    assert!(said.ends_with(" more bytes)\n"), "cut");
+    assert!(!client.is_closed());
 }

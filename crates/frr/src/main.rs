@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use ruster_confd::part::{Client, Module};
+use ruster_confd::part::{Asked, Client, Module};
 use ruster_frr::conf::Bridge;
 use ruster_frr::server::Fpm;
 use ruster_proto::daemon::{self, socket, Clock};
@@ -96,19 +96,25 @@ fn run() -> Result<(), String> {
             }
         }
         let mut changes = Vec::new();
-        let mut progress = client.poll(&mut |part| match bridge.take(part) {
-            Ok(connected) => {
-                if !written {
-                    written = true;
-                    eprintln!("ruster-frr: wrote FRR's configuration");
-                    daemon::notify("READY=1");
+        let mut progress = client.poll(&mut |asked| {
+            let part = match asked {
+                Asked::Check(part) => return bridge.check(part),
+                Asked::Take(part) => part,
+            };
+            match bridge.take(part) {
+                Ok(connected) => {
+                    if !written {
+                        written = true;
+                        eprintln!("ruster-frr: wrote FRR's configuration");
+                        daemon::notify("READY=1");
+                    }
+                    changes.extend(fpm.set_connected(&connected));
+                    Ok(String::new())
                 }
-                changes.extend(fpm.set_connected(&connected));
-                Ok(())
-            }
-            Err(error) => {
-                eprintln!("ruster-frr: refused a part: {error}");
-                Err(error)
+                Err(error) => {
+                    eprintln!("ruster-frr: refused a part: {error}");
+                    Err(error)
+                }
             }
         })?;
         let (more, busy, wake) = fpm.step(now);

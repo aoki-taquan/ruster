@@ -259,3 +259,19 @@ fn an_interface_without_ra_or_disabled_sends_none() {
         assert!(lab.neighd.take_ra(&bad).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn a_check_names_the_ra_settings_that_change_and_takes_nothing() {
+    let mut lab = Lab::new();
+    let start = lab.neighd.check_ra(&part(true)).unwrap();
+    assert!(start.contains("+interface = \"lan\""), "{start}");
+    assert!(start.ends_with("lan: RAs start\n"), "{start}");
+    lab.settle();
+    lab.run_to(5_000);
+    assert!(lab.advertisements().is_empty(), "a check takes nothing");
+    lab.neighd.take_ra(&part(true)).unwrap();
+    assert_eq!(lab.neighd.check_ra(&part(true)).unwrap(), "");
+    let stop = lab.neighd.check_ra(&part(false)).unwrap();
+    assert!(stop.ends_with("lan: RAs stop\n"), "{stop}");
+    assert!(lab.neighd.check_ra("version = 1\nra = 1\n").is_err());
+}

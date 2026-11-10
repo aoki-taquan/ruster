@@ -166,6 +166,24 @@ impl Bridge {
         Ok(())
     }
 
+    /// What taking a `dns` part would change: the line diff of the file, or the
+    /// reason it would be refused. Nothing is written.
+    pub fn check(&self, part: &str) -> Result<String, String> {
+        let (dns, found) = ruster_config::parse_dns_part_with(part)?;
+        let text = settings_with(dns.as_ref(), &found)?;
+        let before = match std::fs::read_to_string(&self.path) {
+            Ok(before) => before,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(format!("{}: {error}", self.path.display())),
+        };
+        let name = self.path.display().to_string();
+        Ok(ruster_confd::diff::lines(
+            &before,
+            &text,
+            (&name, "candidate"),
+        ))
+    }
+
     fn write(&self, text: &str) -> Result<(), String> {
         let mut next = self.path.clone().into_os_string();
         next.push(".next");
