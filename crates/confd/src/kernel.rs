@@ -200,20 +200,24 @@ pub fn commands(config: &Config) -> Vec<Vec<String>> {
                 run(&["address", "replace", &with_len, "dev", &tap]);
             }
         }
-        // NAT's outside: its prefix route (the kernel's own on the TAP) leaves from
-        // the inside address, as on the TUN device above.
-        let inside = nat_inside_address(config);
+        // Its prefix route (the kernel's own on the TAP) leaves from its address,
+        // or for NAT's outside from the inside address, as on the TUN device above;
+        // written on each apply, so that it follows NAT.
         let outside = config
             .nat
             .as_ref()
             .is_some_and(|n| n.outside == interface.name);
-        if let (Some(source), Some((address, len)), true) = (&inside, interface.ipv4, outside) {
+        if let Some((address, len)) = interface.ipv4 {
+            let source = match nat_inside_address(config) {
+                Some(inside) if outside => inside,
+                _ => address.to_string(),
+            };
             let prefix = format!(
                 "{}/{len}",
                 ruster_proto::table::network(IpAddr::V4(address), len)
             );
             run(&[
-                "-4", "route", "replace", &prefix, "dev", &tap, "src", source,
+                "-4", "route", "replace", &prefix, "dev", &tap, "src", &source,
             ]);
         }
     }
