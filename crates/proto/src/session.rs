@@ -143,6 +143,11 @@ pub trait Hook {
 
     /// `store` is now the current tables.
     fn committed(&mut self, store: &Store);
+
+    /// An iPATCH was taken (after [`Hook::committed`]): its changes, including
+    /// entries set again to the value they had. A receiver that keeps a lifetime per
+    /// entry starts it again here.
+    fn patched(&mut self, _changes: &[Change]) {}
 }
 
 struct Peer {
@@ -291,7 +296,11 @@ impl Server {
                         (Code::FORBIDDEN, b"table not writable here".to_vec())
                     } else {
                         let next = self.store.with_changes(&changes);
-                        self.commit(next, hook)
+                        let answer = self.commit(next, hook);
+                        if answer.0 == Code::CHANGED {
+                            hook.patched(&changes);
+                        }
+                        answer
                     }
                 }
             },

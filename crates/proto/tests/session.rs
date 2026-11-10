@@ -337,3 +337,31 @@ fn sync_done_is_remembered() {
     assert_eq!(response(&events, token).0, Code::CHANGED);
     assert!(bench.server.sync_done());
 }
+
+#[test]
+fn the_hook_hears_each_patch_even_when_nothing_changes() {
+    #[derive(Default)]
+    struct Heard(Vec<usize>);
+    impl Hook for Heard {
+        fn check(&mut self, _next: &Store) -> Result<(), String> {
+            Ok(())
+        }
+        fn committed(&mut self, _store: &Store) {}
+        fn patched(&mut self, changes: &[Change]) {
+            self.0.push(changes.len());
+        }
+    }
+    let mut server = Server::new();
+    let (a, b) = UnixStream::pair().unwrap();
+    server.attach(a, &[sid::INTERFACE]).unwrap();
+    let mut client = Client::new(b).unwrap();
+    let mut heard = Heard::default();
+    for _ in 0..2 {
+        client.patch(&[iface("eth0", 1)]).unwrap();
+        for _ in 0..100 {
+            server.step(&mut heard);
+            client.poll();
+        }
+    }
+    assert_eq!(heard.0, vec![1, 1]);
+}

@@ -138,9 +138,9 @@ fn sid_file_matches_the_constants() {
         "the .sid file has items the code does not"
     );
     // Inside the file's assignment range.
-    assert!(text.contains("\"entry-point\": 60000,\n        \"size\": 200"));
+    assert!(text.contains("\"entry-point\": 60000,\n        \"size\": 300"));
     assert!(
-        values.iter().all(|v| (60_000..60_200).contains(v)),
+        values.iter().all(|v| (60_000..60_300).contains(v)),
         "{values:?}"
     );
 }
@@ -1176,4 +1176,78 @@ fn a_bad_punt_class_is_refused() {
             .u64(1);
     });
     assert_eq!(decode_bytes(&no_burst), Err(ModelError::Missing("burst")));
+}
+
+#[test]
+fn source_values_round_trip_and_are_checked() {
+    let session = Change::set(
+        Key::SourcePppoe {
+            source: "pppoe-wan".into(),
+        },
+        Value::SourcePppoe {
+            session: 4660,
+            peer: [2, 0, 0, 0, 0, 0xac],
+            mtu: 1492,
+            lifetime: 60,
+        },
+    );
+    let address = Change::set(
+        Key::SourceIpv4 {
+            source: "pppoe-wan".into(),
+        },
+        Value::SourceIpv4 {
+            address: Ipv4Addr::new(198, 51, 100, 2),
+            prefix_len: 32,
+            lifetime: 60,
+        },
+    );
+    for change in [&session, &address] {
+        assert_eq!(&round_trip(change), change);
+        assert_eq!(
+            &round_trip(&Change::delete(change.key.clone())),
+            &Change::delete(change.key.clone())
+        );
+    }
+    let with = |value| Change::set(session.key.clone(), value);
+    let bad = [
+        with(Value::SourcePppoe {
+            session: 0,
+            peer: [2, 0, 0, 0, 0, 0xac],
+            mtu: 1492,
+            lifetime: 60,
+        }),
+        with(Value::SourcePppoe {
+            session: 1,
+            peer: [1, 0, 0, 0, 0, 0xac],
+            mtu: 1492,
+            lifetime: 60,
+        }),
+        with(Value::SourcePppoe {
+            session: 1,
+            peer: [2, 0, 0, 0, 0, 0xac],
+            mtu: 1492,
+            lifetime: 0,
+        }),
+        Change::set(
+            address.key.clone(),
+            Value::SourceIpv4 {
+                address: Ipv4Addr::new(198, 51, 100, 2),
+                prefix_len: 33,
+                lifetime: 60,
+            },
+        ),
+        // The value of another table.
+        Change::set(
+            address.key.clone(),
+            Value::SourcePppoe {
+                session: 1,
+                peer: [2, 0, 0, 0, 0, 0xac],
+                mtu: 1492,
+                lifetime: 60,
+            },
+        ),
+    ];
+    for change in bad {
+        assert!(change.validate().is_err(), "{change:?}");
+    }
 }
