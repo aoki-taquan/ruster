@@ -38,7 +38,7 @@
 //! Address Unreachable (RFC 4443 3.1 code 3) only for a next hop the neighbor
 //! process gave up on, none for traffic to the router; no extension headers before an ND
 //! message, and other traffic addressed to the router is dropped until it is passed
-//! to the kernel. Routes are searched linearly, longest prefix first.
+//! to the kernel.
 //! An ICMPv6 error about a packet from the kernel's interface has the packet's
 //! destination as its source, not an address of the router (RFC 4443 section 2.2),
 //! because the kernel discards a packet from one of its own addresses.
@@ -105,6 +105,7 @@ impl Ipv6Route {
         })
     }
 
+    #[cfg(test)]
     fn contains(&self, address: [u8; 16]) -> bool {
         masked(address, self.len) == self.prefix
     }
@@ -126,20 +127,41 @@ pub struct Ipv6Local {
 }
 
 /// The IPv6 tables of one snapshot.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Ipv6Fib {
     /// Longest prefix first.
     routes: Box<[Ipv6Route]>,
+    /// Where the longest matching route changes: the first address of each range,
+    /// in order and starting at `::`, so that every address is in one range.
+    range_starts: Box<[u128]>,
+    /// The route of each range (an index into `routes`), or [`NO_ROUTE`].
+    range_routes: Box<[u32]>,
+    /// In the order of (interface, address).
     neighbors: Box<[Ipv6Neighbor]>,
     local: Box<[Ipv6Local]>,
     /// Next hops the control side could not resolve: Address Unreachable.
     pub(crate) unreachable: Box<[(IfId, [u8; 16])]>,
 }
 
+impl Default for Ipv6Fib {
+    /// The table with no routes, neighbors or addresses.
+    fn default() -> Self {
+        let (range_starts, range_routes) = ranges(&[]);
+        Self {
+            routes: Box::default(),
+            range_starts,
+            range_routes,
+            neighbors: Box::default(),
+            local: Box::default(),
+            unreachable: Box::default(),
+        }
+    }
+}
+
 impl Ipv6Fib {
     pub fn new(
         mut routes: Vec<Ipv6Route>,
-        neighbors: Vec<Ipv6Neighbor>,
+        mut neighbors: Vec<Ipv6Neighbor>,
         local: Vec<Ipv6Local>,
     ) -> Result<Self, Ipv6FibError> {
         routes.sort_by(|a, b| b.len.cmp(&a.len).then(a.prefix.cmp(&b.prefix)));
@@ -149,14 +171,18 @@ impl Ipv6Fib {
         {
             return Err(Ipv6FibError::DuplicateRoute);
         }
-        let mut seen: Vec<(IfId, [u8; 16])> =
-            neighbors.iter().map(|n| (n.interface, n.target)).collect();
-        seen.sort_unstable();
-        if seen.windows(2).any(|w| w[0] == w[1]) {
+        neighbors.sort_unstable_by_key(|n| (n.interface, n.target));
+        if neighbors
+            .windows(2)
+            .any(|w| (w[0].interface, w[0].target) == (w[1].interface, w[1].target))
+        {
             return Err(Ipv6FibError::DuplicateNeighbor);
         }
+        let (range_starts, range_routes) = ranges(&routes);
         Ok(Self {
             routes: routes.into(),
+            range_starts,
+            range_routes,
             neighbors: neighbors.into(),
             local: local.into(),
             unreachable: Box::new([]),
@@ -180,8 +206,14 @@ impl Ipv6Fib {
             .map(|route| (route.egress, route.next_hop.unwrap_or(destination)))
     }
 
+    /// The longest prefix that has `destination`: a binary search over the ranges,
+    /// so the number of comparisons grows with the logarithm of the number of routes.
     pub(crate) fn route(&self, destination: [u8; 16]) -> Option<&Ipv6Route> {
-        self.routes.iter().find(|route| route.contains(destination))
+        let address = u128::from_be_bytes(destination);
+        let after = self.range_starts.partition_point(|&start| start <= address);
+        // The first range starts at `::`, so `after` is at least 1.
+        let route = *self.range_routes.get(after.checked_sub(1)?)?;
+        self.routes.get(route as usize)
     }
 
     /// The same table with `unreachable` as the next hops the control side could
@@ -196,14 +228,66 @@ impl Ipv6Fib {
     #[must_use]
     pub fn neighbor(&self, interface: IfId, target: [u8; 16]) -> Option<MacAddress> {
         self.neighbors
-            .iter()
-            .find(|n| n.interface == interface && n.target == target)
-            .map(|n| n.mac)
+            .binary_search_by_key(&(interface, target), |n| (n.interface, n.target))
+            .ok()
+            .map(|at| self.neighbors[at].mac)
     }
 
     pub(crate) fn is_local(&self, address: [u8; 16]) -> bool {
         self.local.iter().any(|l| l.address == address)
     }
+}
+
+/// No route has the range.
+const NO_ROUTE: u32 = u32::MAX;
+
+/// The ranges of addresses over which the longest matching route of `routes` stays
+/// the same, as their first addresses and their routes.
+///
+/// Two prefixes are either apart or one inside the other, so the longest match can
+/// only change where a prefix starts or just after one ends. Going through those
+/// points in order, the prefixes that have the point are kept on a stack, the
+/// longest on top.
+fn ranges(routes: &[Ipv6Route]) -> (Box<[u128]>, Box<[u32]>) {
+    let first = |route: &Ipv6Route| u128::from_be_bytes(route.prefix);
+    let last =
+        |route: &Ipv6Route| first(route) | u128::MAX.checked_shr(u32::from(route.len)).unwrap_or(0);
+    // By first address, and of those that start together the shortest first, so that
+    // the longest is pushed last.
+    let mut order: Vec<usize> = (0..routes.len()).collect();
+    order.sort_by_key(|&at| (first(&routes[at]), routes[at].len));
+    let mut points = Vec::with_capacity(routes.len() * 2 + 1);
+    points.push(0);
+    for route in routes {
+        points.push(first(route));
+        if let Some(after) = last(route).checked_add(1) {
+            points.push(after);
+        }
+    }
+    points.sort_unstable();
+    points.dedup();
+
+    let mut starts = Vec::with_capacity(points.len());
+    let mut found = Vec::with_capacity(points.len());
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next = 0;
+    for point in points {
+        while stack.last().is_some_and(|&top| last(&routes[top]) < point) {
+            stack.pop();
+        }
+        while let Some(&at) = order.get(next).filter(|&&at| first(&routes[at]) == point) {
+            stack.push(at);
+            next += 1;
+        }
+        let route = stack.last().map_or(NO_ROUTE, |&at| {
+            u32::try_from(at).expect("far fewer routes than u32::MAX")
+        });
+        if found.last() != Some(&route) {
+            starts.push(point);
+            found.push(route);
+        }
+    }
+    (starts.into(), found.into())
 }
 
 fn masked(address: [u8; 16], len: u8) -> [u8; 16] {
@@ -973,4 +1057,161 @@ fn build_error(
     let sum = icmpv6_checksum(from, source, &out[icmp..frame_len]);
     out[icmp + 2..icmp + 4].copy_from_slice(&sum.to_be_bytes());
     Some((egress.id, frame_len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // SplitMix64.
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = self.0;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^ (value >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> u64 {
+            self.next() % bound
+        }
+
+        fn address(&mut self) -> u128 {
+            u128::from(self.next()) << 64 | u128::from(self.next())
+        }
+    }
+
+    /// Routes whose prefixes are often inside one another: cut at random lengths
+    /// (0 and 128 among them) from a few addresses.
+    fn random_routes(rng: &mut Rng) -> Vec<Ipv6Route> {
+        let bases: Vec<u128> = (0..4).map(|_| rng.address()).collect();
+        let mut routes: Vec<Ipv6Route> = Vec::new();
+        for _ in 0..rng.below(40) {
+            let len = match rng.below(8) {
+                0 => 0,
+                1 => 128,
+                2 => 127,
+                _ => rng.below(129) as u8,
+            };
+            let base = match rng.below(4) {
+                0 => rng.address(),
+                _ => bases[rng.below(4) as usize] ^ u128::from(rng.below(256)),
+            };
+            let prefix = masked(base.to_be_bytes(), len);
+            if routes.iter().any(|r| r.prefix == prefix && r.len == len) {
+                continue;
+            }
+            let egress = IfId(routes.len() as u16);
+            routes.push(Ipv6Route::new(prefix, len, egress, None).unwrap());
+        }
+        routes
+    }
+
+    #[test]
+    fn the_route_found_is_the_longest_prefix_that_has_the_address() {
+        let mut rng = Rng(0x6970_7636);
+        for _ in 0..2_000 {
+            let routes = random_routes(&mut rng);
+            let fib = Ipv6Fib::new(routes.clone(), Vec::new(), Vec::new()).unwrap();
+            let mut addresses: Vec<u128> = (0..16).map(|_| rng.address()).collect();
+            addresses.extend([0, u128::MAX]);
+            // The edges of every prefix, and the addresses just outside them.
+            for route in &routes {
+                let first = u128::from_be_bytes(route.prefix);
+                let last = first | u128::MAX.checked_shr(u32::from(route.len)).unwrap_or(0);
+                addresses.extend([
+                    first,
+                    last,
+                    first.wrapping_sub(1),
+                    last.wrapping_add(1),
+                    first | (rng.address() & (last ^ first)),
+                ]);
+            }
+            for address in addresses {
+                let address = address.to_be_bytes();
+                let expected = routes
+                    .iter()
+                    .filter(|route| route.contains(address))
+                    .max_by_key(|route| route.len);
+                assert_eq!(fib.route(address), expected, "{address:?} in {routes:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_table_without_routes_has_no_route_for_any_address() {
+        for fib in [
+            Ipv6Fib::default(),
+            Ipv6Fib::new(Vec::new(), Vec::new(), Vec::new()).unwrap(),
+        ] {
+            assert_eq!(fib.route([0; 16]), None);
+            assert_eq!(fib.route([0xff; 16]), None);
+            assert_eq!(fib, Ipv6Fib::default());
+        }
+    }
+
+    #[test]
+    fn a_default_route_has_every_address_and_a_host_route_only_its_own() {
+        let host = [0x20, 1, 0xd, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let fib = Ipv6Fib::new(
+            vec![
+                Ipv6Route::new([0; 16], 0, IfId(1), None).unwrap(),
+                Ipv6Route::new(host, 128, IfId(2), None).unwrap(),
+                Ipv6Route::new([0xff; 16], 128, IfId(3), None).unwrap(),
+            ],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let egress = |address| fib.route(address).map(|route| route.egress);
+        assert_eq!(egress(host), Some(IfId(2)));
+        let mut next = host;
+        next[15] = 2;
+        assert_eq!(egress(next), Some(IfId(1)));
+        assert_eq!(egress([0; 16]), Some(IfId(1)));
+        assert_eq!(egress([0xff; 16]), Some(IfId(3)));
+    }
+
+    #[test]
+    fn a_neighbor_is_found_by_its_interface_and_address_in_any_order() {
+        let mut rng = Rng(0x6e65_6967);
+        let mut neighbors: Vec<Ipv6Neighbor> = Vec::new();
+        for at in 0..200u16 {
+            let interface = IfId(rng.below(4) as u16);
+            // Few addresses, so the same one is on several interfaces.
+            let target = u128::from(rng.below(80)).to_be_bytes();
+            if neighbors
+                .iter()
+                .any(|n| n.interface == interface && n.target == target)
+            {
+                continue;
+            }
+            let mac = MacAddress([2, 0, 0, 0, (at >> 8) as u8, at as u8]);
+            neighbors.push(Ipv6Neighbor {
+                interface,
+                target,
+                mac,
+            });
+        }
+        let fib = Ipv6Fib::new(Vec::new(), neighbors.clone(), Vec::new()).unwrap();
+        for interface in 0..5 {
+            for target in 0..90u128 {
+                let (interface, target) = (IfId(interface), target.to_be_bytes());
+                let expected = neighbors
+                    .iter()
+                    .find(|n| n.interface == interface && n.target == target)
+                    .map(|n| n.mac);
+                assert_eq!(fib.neighbor(interface, target), expected);
+            }
+        }
+        let again = neighbors[3];
+        neighbors.push(again);
+        assert_eq!(
+            Ipv6Fib::new(Vec::new(), neighbors, Vec::new()),
+            Err(Ipv6FibError::DuplicateNeighbor)
+        );
+    }
 }
