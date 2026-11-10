@@ -139,6 +139,18 @@ pub const SOURCE_DNS: u64 = 60230;
 pub const SOURCE_DNS_ADDRESS: u64 = 60231;
 pub const SOURCE_DNS_LIFETIME: u64 = 60232;
 
+/// `ruster-bridge` (names after `ieee802-dot1q-bridge`): a bridge, its ageing time in
+/// seconds and the most addresses it learns.
+pub const BRIDGE: u64 = 60240;
+pub const BRIDGE_AGING_TIME: u64 = 60241;
+pub const BRIDGE_MAX_LEARNED: u64 = 60242;
+/// A member of a bridge (`ieee802-dot1q-bridge` `bridge-port/bridge-name`), by interface.
+pub const BRIDGE_PORT: u64 = 60250;
+pub const BRIDGE_PORT_BRIDGE: u64 = 60251;
+/// A static entry of a bridge's MAC address table (`filtering-database/filtering-entry`).
+pub const BRIDGE_MAC: u64 = 60260;
+pub const BRIDGE_MAC_PORT: u64 = 60261;
+
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
 pub const RESOLVE_REQUEST_INTERFACE: u64 = 60051;
@@ -291,6 +303,13 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-source:dns-servers", SOURCE_DNS),
     ("/ruster-source:dns-servers/address", SOURCE_DNS_ADDRESS),
     ("/ruster-source:dns-servers/lifetime", SOURCE_DNS_LIFETIME),
+    ("/ruster-bridge:bridges/bridge", BRIDGE),
+    ("/ruster-bridge:bridges/bridge/aging-time", BRIDGE_AGING_TIME),
+    ("/ruster-bridge:bridges/bridge/max-learned", BRIDGE_MAX_LEARNED),
+    ("/ruster-bridge:bridge-ports/bridge-port", BRIDGE_PORT),
+    ("/ruster-bridge:bridge-ports/bridge-port/bridge-name", BRIDGE_PORT_BRIDGE),
+    ("/ruster-bridge:bridges/bridge/filtering-entry", BRIDGE_MAC),
+    ("/ruster-bridge:bridges/bridge/filtering-entry/port", BRIDGE_MAC_PORT),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",

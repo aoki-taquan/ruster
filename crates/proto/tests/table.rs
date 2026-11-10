@@ -5,7 +5,8 @@ use std::net::{IpAddr, Ipv4Addr};
 use ruster_proto::cbor::{Decoder, Encoder};
 use ruster_proto::sid;
 use ruster_proto::table::{
-    format_mac, parse_mac, Change, Key, ModelError, NextHop, RouteAction, Value, Vlan, DEFAULT_VRF,
+    entry_line, format_mac, parse_mac, Change, Key, ModelError, NextHop, RouteAction, Value, Vlan,
+    DEFAULT_VRF,
 };
 
 fn round_trip(change: &Change) -> Change {
@@ -1383,4 +1384,90 @@ fn gateway_routes_round_trip_and_do_not_mix_with_interface_hops() {
             .text("10.255.0.2");
     });
     assert!(matches!(decode_bytes(&bytes), Err(ModelError::Invalid(_))));
+}
+
+#[test]
+fn bridge_entries_round_trip_and_are_checked() {
+    let entries = [
+        Change::set(
+            Key::Bridge { name: "br0".into() },
+            Value::Bridge {
+                aging_s: 300,
+                max_learned: 4096,
+            },
+        ),
+        Change::set(
+            Key::BridgePort {
+                interface: "p1".into(),
+            },
+            Value::BridgePort {
+                bridge: "br0".into(),
+            },
+        ),
+        Change::set(
+            Key::BridgeMac {
+                bridge: "br0".into(),
+                mac: [2, 0, 0, 0, 0, 0x0a],
+            },
+            Value::BridgeMac {
+                interface: "p1".into(),
+            },
+        ),
+        Change::delete(Key::BridgeMac {
+            bridge: "br0".into(),
+            mac: [2, 0, 0, 0, 0, 0x0b],
+        }),
+    ];
+    for change in &entries {
+        assert_eq!(&round_trip(change), change);
+    }
+    assert_eq!(
+        entry_line(&entries[2].key, entries[2].value.as_ref().unwrap()).unwrap(),
+        "bridge-mac br0 02:00:00:00:00:0a p1"
+    );
+    let bad = [
+        Change::set(
+            Key::Bridge { name: "br0".into() },
+            Value::Bridge {
+                aging_s: 9,
+                max_learned: 1,
+            },
+        ),
+        Change::set(
+            Key::Bridge { name: "br0".into() },
+            Value::Bridge {
+                aging_s: 300,
+                max_learned: 0,
+            },
+        ),
+        // A member cannot be the bridge's own interface.
+        Change::set(
+            Key::BridgePort {
+                interface: "br0".into(),
+            },
+            Value::BridgePort {
+                bridge: "br0".into(),
+            },
+        ),
+        Change::set(
+            Key::BridgeMac {
+                bridge: "br0".into(),
+                mac: [1, 0, 0, 0, 0, 1],
+            },
+            Value::BridgeMac {
+                interface: "p1".into(),
+            },
+        ),
+        Change::set(
+            Key::BridgePort {
+                interface: "p1".into(),
+            },
+            Value::BridgeMac {
+                interface: "p1".into(),
+            },
+        ),
+    ];
+    for change in &bad {
+        assert!(change.validate().is_err(), "{change:?}");
+    }
 }
