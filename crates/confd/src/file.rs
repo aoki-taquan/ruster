@@ -679,6 +679,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         nat,
         dns,
         dhcp,
+        sources: crate::source::specs(lock.source)?,
     })
 }
 

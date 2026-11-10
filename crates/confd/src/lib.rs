@@ -17,7 +17,9 @@
 //! The configuration file is TOML ([`file`](mod@file)). Every interface also gets an IPv6
 //! link-local address from its MAC address ([`link_local`]). Connected routes come from
 //! the IPv4 and global IPv6 prefixes of enabled interfaces. Limits: one IPv4 address per
-//! interface, no dynamic values from other daemons yet.
+//! interface. Daemons send values found at run time as sources ([`source`]); confd
+//! keeps them and, after it starts, waits for them before the FE, ribd and neighd
+//! drop what they hold from before. No table is made from them yet.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -32,6 +34,7 @@ pub mod apply;
 pub mod file;
 pub mod kernel;
 pub mod part;
+pub mod source;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {
@@ -99,6 +102,8 @@ pub struct Config {
     pub dns: Option<ruster_config::Dns>,
     /// The DHCP servers, one per interface, checked; confd hands them to `ruster-kea`.
     pub dhcp: Vec<ruster_config::Dhcp>,
+    /// The daemons that send values found at run time ([`source`]).
+    pub sources: Vec<source::Spec>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -141,6 +146,9 @@ struct Peer {
     resync_open: bool,
     /// ribd wants `sync-done` after each accepted send.
     says_done: bool,
+    /// confd started and waits for its sources: resync-end and `sync-done` are held
+    /// back, so the peer keeps what it holds from before ([`source`]).
+    held: bool,
     /// The resync-end waiting for an answer. When it is refused, what the peer holds
     /// stays marked stale, and resync-end goes again after the next accepted change.
     resync_end: Option<u32>,
@@ -193,7 +201,7 @@ impl Peer {
         if accepted {
             self.sent = held;
             self.patch_refused = None;
-            if self.in_flight.is_empty() {
+            if self.in_flight.is_empty() && !self.held {
                 if self.resync_open {
                     self.resync_end = Some(self.client.resync_end());
                     self.resync_end_refused = None;
@@ -218,6 +226,23 @@ impl Peer {
             self.patch_refused.get_or_insert(None);
         }
     }
+
+    /// confd stopped waiting for its sources: what was held back goes now, or after
+    /// the patches in flight are answered.
+    fn release(&mut self) {
+        self.held = false;
+        if !self.in_flight.is_empty() {
+            return;
+        }
+        if self.resync_open && self.resync_end.is_none() {
+            self.resync_end = Some(self.client.resync_end());
+            self.resync_end_refused = None;
+            self.resync_open = false;
+        }
+        if self.says_done {
+            self.client.sync_done();
+        }
+    }
 }
 
 pub struct Confd {
@@ -226,6 +251,7 @@ pub struct Confd {
     ribd: Option<Peer>,
     neighd: Option<Peer>,
     parts: part::Parts,
+    sources: source::Sources,
     counters: ConfdCounters,
     /// Counts [`Confd::set_config`] calls; each patch carries the one it came from.
     generation: u64,
@@ -245,6 +271,7 @@ impl std::fmt::Debug for Confd {
 impl Confd {
     pub fn new(config: Config) -> Self {
         Self {
+            sources: source::Sources::new(&config.sources),
             config,
             fe: None,
             ribd: None,
@@ -277,6 +304,33 @@ impl Confd {
     /// Takes a connection on `confd/part.sock` ([`part`]).
     pub fn attach_part(&mut self, stream: UnixStream) -> io::Result<()> {
         self.parts.attach(stream)
+    }
+
+    /// Takes a connection on `confd/source/<name>.sock` ([`source`]).
+    pub fn attach_source(&mut self, name: &str, stream: UnixStream) -> io::Result<()> {
+        self.sources.attach(name, stream)
+    }
+
+    /// The names of the sources of the configuration, each with its socket.
+    pub fn source_names(&self) -> Vec<String> {
+        self.sources.names()
+    }
+
+    /// True while confd waits for its sources after it started.
+    pub fn waiting_for_sources(&self) -> bool {
+        self.sources.waiting()
+    }
+
+    /// The PPPoE session the source `name` has sent and that has not run out: its
+    /// ID, the access concentrator's MAC and the MTU.
+    pub fn source_pppoe(&self, name: &str) -> Option<(u16, [u8; 6], u16)> {
+        self.sources.pppoe(name)
+    }
+
+    /// The IPv4 address and prefix length the source `name` has sent and that has
+    /// not run out.
+    pub fn source_ipv4(&self, name: &str) -> Option<(Ipv4Addr, u8)> {
+        self.sources.ipv4(name)
     }
 
     /// The peers whose connection closed. Connecting again sends everything again;
@@ -352,6 +406,13 @@ impl Confd {
     pub fn set_config(&mut self, config: Config) {
         self.config = config;
         self.generation += 1;
+        self.sources.set_specs(&self.config.sources);
+        self.send_tables();
+        self.parts.send(&self.config, self.generation);
+    }
+
+    /// Sends the FE, neighd and ribd what changed in their tables.
+    fn send_tables(&mut self) {
         let generation = self.generation;
         let interfaces = self.interface_tables();
         let fe = self.fe_tables();
@@ -366,7 +427,6 @@ impl Confd {
                 send_diff(peer, desired, generation, counters);
             }
         }
-        self.parts.send(&self.config, generation);
     }
 
     fn full_send(
@@ -384,11 +444,16 @@ impl Confd {
             in_flight: Vec::new(),
             resync_open: true,
             says_done,
+            held: self.sources.waiting(),
             resync_end: None,
             resync_end_refused: None,
             patch_refused: None,
         };
-        if desired.is_empty() {
+        if peer.held {
+            if !desired.is_empty() {
+                send_diff(&mut peer, &desired, self.generation, &mut self.counters);
+            }
+        } else if desired.is_empty() {
             peer.resync_end = Some(peer.client.resync_end());
             peer.resync_open = false;
             if says_done {
@@ -684,7 +749,19 @@ fn send_diff(
 
 impl Task for Confd {
     fn step(&mut self, now_ms: u64) -> Progress {
-        let mut progress = Progress::IDLE;
+        let waiting = self.sources.waiting();
+        let (mut progress, changed) = self.sources.step(now_ms);
+        if changed {
+            self.send_tables();
+        }
+        if waiting && !self.sources.waiting() {
+            for peer in [&mut self.fe, &mut self.ribd, &mut self.neighd]
+                .into_iter()
+                .flatten()
+            {
+                peer.release();
+            }
+        }
         // A refused patch is sent again, in full, after a while, though nothing
         // changed.
         let mut resend = Vec::new();
@@ -724,7 +801,7 @@ impl Task for Confd {
                     busy: false,
                     wake_at: Some(retry_at),
                 });
-            } else if peer.in_flight.is_empty() && peer.resync_end.is_none() {
+            } else if peer.in_flight.is_empty() && peer.resync_end.is_none() && !peer.held {
                 peer.resync_end = Some(peer.client.resync_end());
                 peer.resync_open = false;
                 peer.resync_end_refused = None;
@@ -837,6 +914,7 @@ mod tests {
             nat: None,
             dns: None,
             dhcp: Vec::new(),
+            sources: Vec::new(),
         });
         let routes = confd.routes();
         let connected = Value::Route(RouteAction::Forward(vec![NextHop {
@@ -891,6 +969,7 @@ mod tests {
             nat: None,
             dns: None,
             dhcp: Vec::new(),
+            sources: Vec::new(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
         let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);

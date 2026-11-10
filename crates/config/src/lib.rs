@@ -138,6 +138,15 @@
 //! dns = ["192.0.2.1"]          # optional: the DNS servers option; when left out,
 //!                              # the interface's address if [dns] listens on it,
 //!                              # else none
+//!
+//! [[source]]                   # optional: a daemon that sends confd values found
+//!                              # at run time, on confd/source/<name>.sock
+//! name = "pppoe-wan"           # lower-case letters, digits and -, from a letter
+//! kind = "pppoe"               # what it may send: "pppoe" (ruster-pppoed: a
+//!                              # session and its IPv4 address)
+//! sync-wait = 10               # optional: after confd starts, the most seconds
+//!                              # it waits for the source to send everything again;
+//!                              # by kind when left out (10 for pppoe)
 //! ```
 //!
 //! # The lock form
@@ -232,6 +241,11 @@
 //! lease-time = 3600
 //! router = ["192.0.2.1"]
 //! dns = ["192.0.2.1"]
+//!
+//! [[source]]
+//! name = "pppoe-wan"
+//! kind = "pppoe"
+//! sync-wait = 10
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
@@ -283,6 +297,10 @@ pub const FILTERING: &str = "endpoint-independent";
 pub const PSID_OFFSET: u8 = 6;
 /// A DHCP lease's time, in seconds.
 pub const DHCP_LEASE_TIME: u32 = 3_600;
+/// The kinds of source, and how long confd waits after it starts for each to send
+/// everything again, in seconds: a daemon in the same box connects again within a
+/// second or two.
+pub const SOURCE_KINDS: &[(&str, u32)] = &[("pppoe", 10)];
 /// The ICMP error rate limits: IPv4's interval, and ICMPv6's burst and interval.
 pub const ICMP_ERRORS: IcmpErrors = IcmpErrors {
     ipv4_interval_ms: 100,
@@ -309,6 +327,19 @@ pub struct Lock {
     pub dns: Vec<Dns>,
     /// One per interface.
     pub dhcp: Vec<Dhcp>,
+    pub source: Vec<Source>,
+}
+
+/// A daemon that sends confd values found at run time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Source {
+    pub name: String,
+    /// One of [`SOURCE_KINDS`].
+    pub kind: String,
+    /// After confd starts, the most seconds it waits for the source to send
+    /// everything again.
+    pub sync_wait: u32,
 }
 
 /// The DHCP server for one interface: Kea, which `ruster-kea` configures and relays

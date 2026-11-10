@@ -2,8 +2,13 @@
 //! sends it to the FE, ribd (as route source `confd`) and neighd. With `--kernel` it
 //! also sets up the kernel side of traffic to the router ([`ruster_confd::kernel`]).
 //! `ruster apply` gives it a new file later ([`ruster_confd::apply`]), and processes
-//! such as `ruster-unbound` take their part of it ([`ruster_confd::part`]).
+//! such as `ruster-unbound` take their part of it ([`ruster_confd::part`]). Each
+//! source of the configuration gets `confd/source/<name>.sock`
+//! ([`ruster_confd::source`]).
 
+use std::collections::BTreeMap;
+use std::os::unix::net::UnixListener;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -14,6 +19,31 @@ use ruster_proto::task::Task;
 
 /// How long to wait for each process at start-up.
 const PEER_WAIT: Duration = Duration::from_secs(10);
+
+/// Listens on the socket of each source of the configuration, and stops listening
+/// for those it no longer has.
+fn source_sockets(run_dir: &Path, confd: &Confd, listening: &mut BTreeMap<String, UnixListener>) {
+    let names = confd.source_names();
+    listening.retain(|name, _| {
+        let keep = names.contains(name);
+        if !keep {
+            let _ = std::fs::remove_file(run_dir.join(socket::confd_source(name)));
+        }
+        keep
+    });
+    for name in names {
+        if listening.contains_key(&name) {
+            continue;
+        }
+        let path = socket::confd_source(&name);
+        match daemon::listen(&run_dir.join(&path)) {
+            Ok(listener) => {
+                listening.insert(name, listener);
+            }
+            Err(error) => eprintln!("ruster-confd: {path}: {error}"),
+        }
+    }
+}
 
 fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
@@ -46,6 +76,8 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", socket::CONFD_PART))?;
     let mut apply = Apply::new();
     let mut confd = Confd::new(config);
+    let mut sources = BTreeMap::new();
+    source_sockets(&run_dir, &confd, &mut sources);
     let connect = |name: &str| {
         daemon::connect(&run_dir.join(name), PEER_WAIT)
             .map_err(|error| format!("connecting: {error}"))
@@ -64,6 +96,8 @@ fn run() -> Result<(), String> {
 
     let clock = Clock::new();
     let mut refused = 0;
+    let mut generation = confd.generation();
+    let mut waiting = confd.waiting_for_sources();
     let mut apply_seen = apply.counters();
     let mut retry = daemon::Retry::default();
     let mut idle = daemon::Idle::new();
@@ -95,6 +129,17 @@ fn run() -> Result<(), String> {
                 }
             }
         }
+        if confd.generation() != generation {
+            generation = confd.generation();
+            source_sockets(&run_dir, &confd, &mut sources);
+        }
+        for (name, listener) in &sources {
+            for stream in daemon::accept(listener) {
+                if let Err(error) = confd.attach_source(name, stream) {
+                    eprintln!("ruster-confd: source {name}: {error}");
+                }
+            }
+        }
         for stream in daemon::accept(&parts) {
             if let Err(error) = confd.attach_part(stream) {
                 eprintln!("ruster-confd: {}: {error}", socket::CONFD_PART);
@@ -117,6 +162,12 @@ fn run() -> Result<(), String> {
                 eprintln!("ruster-confd: stopped waiting for answers to a new configuration");
             }
             apply_seen = now;
+        }
+        if waiting && !confd.waiting_for_sources() {
+            waiting = false;
+            eprintln!(
+                "ruster-confd: the sources sent everything again (or their sync-wait passed)"
+            );
         }
         if confd.counters().patches_refused != refused {
             refused = confd.counters().patches_refused;
