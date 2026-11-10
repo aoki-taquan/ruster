@@ -625,6 +625,23 @@ fn a_process_that_never_answers_does_not_stop_going_back() {
 }
 
 #[test]
+fn a_confirm_that_comes_while_going_back_is_refused() {
+    // RFC 6241 section 8.4: once the timeout has passed, the configuration goes
+    // back; a confirming commit that comes after is too late. Here the FE does not
+    // answer, so going back is still under way when `confirm` comes.
+    let mut rig = Rig::new();
+    apply_to_confirm(&mut rig, 1400, "1");
+    let _silent = std::mem::take(&mut rig.fe);
+    rig.now_ms = MINUTE_MS;
+    rig.answers();
+    rig.cli.post(&["confirm"], b"");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::SERVICE_UNAVAILABLE, "{answers:?}");
+    assert!(answers[0].1.contains("too late"), "{answers:?}");
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1500);
+}
+
+#[test]
 fn a_deadline_beyond_the_wait_given_goes_back_at_once() {
     let dir = state_dir("confirm-clock");
     let mut rig = Rig::with(Versions::open(&dir).unwrap());
