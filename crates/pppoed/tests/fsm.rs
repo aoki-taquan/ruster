@@ -345,3 +345,333 @@ fn request_sent_again_after_an_ack_gets_a_new_id() {
     assert_ne!(s[0].1, id);
     assert_eq!(f.state(), State::RequestSent);
 }
+
+#[test]
+fn limits_are_those_of_rfc_1661() {
+    // RFC 1661 section 4.6: Restart timer 3 seconds, Max-Terminate 2,
+    // Max-Configure 10, Max-Failure 5.
+    assert_eq!(
+        Limits::default(),
+        Limits {
+            restart_ms: 3_000,
+            max_terminate: 2,
+            max_configure: 10,
+            max_failure: 5,
+        }
+    );
+}
+
+/// An event of the RFC 1661 section 4.1 table.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Ev {
+    Up,
+    Down,
+    Open,
+    Close,
+    ToPlus,
+    ToMinus,
+    RcrPlus,
+    RcrMinus,
+    Rca,
+    Rcn,
+    Rtr,
+    Rta,
+    Ruc,
+    RxjPlus,
+    RxjMinus,
+}
+
+type LastRequest = Option<(u8, Vec<u8>)>;
+
+/// Remembers the last Configure-Request among the actions, and clears them.
+fn note(out: &mut Vec<Action>, last: &mut LastRequest) {
+    for (c, id, data) in sent(out) {
+        if c == code::CONFIGURE_REQUEST {
+            *last = Some((id, data));
+        }
+    }
+    out.clear();
+}
+
+/// An automaton in `state`, reached only through events, and the last
+/// Configure-Request it sent as (identifier, options). With `spent` the restart
+/// counter is 0 in every state (Max-Configure and Max-Terminate 0), for TO-.
+fn in_state(state: State, spent: bool) -> (Fsm<Toy>, LastRequest) {
+    let limits = if spent {
+        Limits {
+            max_terminate: 0,
+            max_configure: 0,
+            ..Limits::default()
+        }
+    } else {
+        Limits::default()
+    };
+    let mut f = Fsm::new(Toy::default(), limits);
+    let mut out = Vec::new();
+    let mut last = None;
+    let mut now = 0;
+    let start = |f: &mut Fsm<Toy>, out: &mut Vec<Action>| {
+        f.up(0, out);
+        f.open(0, out);
+    };
+    match state {
+        State::Initial => {}
+        State::Starting => f.open(0, &mut out),
+        State::Closed | State::Closing => {
+            start(&mut f, &mut out);
+            note(&mut out, &mut last);
+            f.close(0, &mut out);
+            while state == State::Closed && f.state() != State::Closed {
+                now += 3_000;
+                f.timeout(now, &mut out);
+            }
+        }
+        State::Stopped => {
+            start(&mut f, &mut out);
+            note(&mut out, &mut last);
+            while f.state() != State::Stopped {
+                now += 3_000;
+                f.timeout(now, &mut out);
+            }
+        }
+        State::Stopping => {
+            start(&mut f, &mut out);
+            f.close(0, &mut out);
+            f.open(0, &mut out);
+        }
+        State::RequestSent => start(&mut f, &mut out),
+        State::AckReceived | State::AckSent | State::Opened => {
+            start(&mut f, &mut out);
+            note(&mut out, &mut last);
+            let (id, data) = last.clone().unwrap();
+            if state != State::AckSent {
+                f.receive(0, &ppp::packet(code::CONFIGURE_ACK, id, &data), &mut out);
+            }
+            if state != State::AckReceived {
+                f.receive(
+                    0,
+                    &ppp::packet(code::CONFIGURE_REQUEST, 50, &[1, 3, 7]),
+                    &mut out,
+                );
+            }
+        }
+    }
+    note(&mut out, &mut last);
+    assert_eq!(f.state(), state, "could not reach {state:?}");
+    (f, last)
+}
+
+/// The actions by the names RFC 1661 section 4.4 gives them. The counter actions
+/// (irc, zrc) have no output and are not listed.
+fn named(actions: &[Action]) -> Vec<&'static str> {
+    actions
+        .iter()
+        .map(|a| match a {
+            Action::Up => "tlu",
+            Action::Down => "tld",
+            Action::Started => "tls",
+            Action::Finished => "tlf",
+            Action::Send(bytes) => match bytes[0] {
+                code::CONFIGURE_REQUEST => "scr",
+                code::CONFIGURE_ACK => "sca",
+                code::CONFIGURE_NAK | code::CONFIGURE_REJECT => "scn",
+                code::TERMINATE_REQUEST => "str",
+                code::TERMINATE_ACK => "sta",
+                code::CODE_REJECT => "scj",
+                other => panic!("unexpected code {other}"),
+            },
+        })
+        .collect()
+}
+
+const NOW: u64 = 100_000;
+
+fn apply(f: &mut Fsm<Toy>, last: &LastRequest, ev: Ev) -> Vec<Action> {
+    let mut out = Vec::new();
+    let (id, data) = last.clone().unwrap_or_default();
+    let packet = match ev {
+        Ev::Up => {
+            f.up(NOW, &mut out);
+            return out;
+        }
+        Ev::Down => {
+            f.down(&mut out);
+            return out;
+        }
+        Ev::Open => {
+            f.open(NOW, &mut out);
+            return out;
+        }
+        Ev::Close => {
+            f.close(NOW, &mut out);
+            return out;
+        }
+        Ev::ToPlus | Ev::ToMinus => {
+            f.timeout(NOW, &mut out);
+            return out;
+        }
+        Ev::RcrPlus => ppp::packet(code::CONFIGURE_REQUEST, 60, &[1, 3, 7]),
+        Ev::RcrMinus => ppp::packet(code::CONFIGURE_REQUEST, 60, &[1, 3, 5]),
+        Ev::Rca => ppp::packet(code::CONFIGURE_ACK, id, &data),
+        Ev::Rcn => ppp::packet(code::CONFIGURE_NAK, id, &[1, 3, 9]),
+        Ev::Rtr => ppp::packet(code::TERMINATE_REQUEST, 61, &[]),
+        Ev::Rta => ppp::packet(code::TERMINATE_ACK, 62, &[]),
+        Ev::Ruc => ppp::packet(42, 63, &[]),
+        // Code-Reject of a code beyond 7, and of Configure-Request (section 5.7).
+        Ev::RxjPlus => ppp::packet(code::CODE_REJECT, 64, &[12, 0, 0, 4]),
+        Ev::RxjMinus => ppp::packet(code::CODE_REJECT, 64, &[1, 0, 0, 4]),
+    };
+    f.receive(NOW, &packet, &mut out);
+    out
+}
+
+#[test]
+fn every_cell_of_the_rfc_1661_transition_table() {
+    use State::*;
+    // RFC 1661 section 4.1, event by event. Cells marked "-" (cannot happen) are
+    // left out. Open in Stopped, Opened, Closing and Stopping has no "r" (Restart
+    // option) here: the module's Deviations say it is not offered.
+    #[rustfmt::skip]
+    let table: &[(Ev, State, &[&str], State)] = &[
+        (Ev::Up, Initial, &[], Closed),
+        (Ev::Up, Starting, &["scr"], RequestSent),
+
+        (Ev::Down, Closed, &[], Initial),
+        (Ev::Down, Stopped, &["tls"], Starting),
+        (Ev::Down, Closing, &[], Initial),
+        (Ev::Down, Stopping, &[], Starting),
+        (Ev::Down, RequestSent, &[], Starting),
+        (Ev::Down, AckReceived, &[], Starting),
+        (Ev::Down, AckSent, &[], Starting),
+        (Ev::Down, Opened, &["tld"], Starting),
+
+        (Ev::Open, Initial, &["tls"], Starting),
+        (Ev::Open, Starting, &[], Starting),
+        (Ev::Open, Closed, &["scr"], RequestSent),
+        (Ev::Open, Stopped, &[], Stopped),
+        (Ev::Open, Closing, &[], Stopping),
+        (Ev::Open, Stopping, &[], Stopping),
+        (Ev::Open, RequestSent, &[], RequestSent),
+        (Ev::Open, AckReceived, &[], AckReceived),
+        (Ev::Open, AckSent, &[], AckSent),
+        (Ev::Open, Opened, &[], Opened),
+
+        (Ev::Close, Initial, &[], Initial),
+        (Ev::Close, Starting, &["tlf"], Initial),
+        (Ev::Close, Closed, &[], Closed),
+        (Ev::Close, Stopped, &[], Closed),
+        (Ev::Close, Closing, &[], Closing),
+        (Ev::Close, Stopping, &[], Closing),
+        (Ev::Close, RequestSent, &["str"], Closing),
+        (Ev::Close, AckReceived, &["str"], Closing),
+        (Ev::Close, AckSent, &["str"], Closing),
+        (Ev::Close, Opened, &["tld", "str"], Closing),
+
+        (Ev::ToPlus, Closing, &["str"], Closing),
+        (Ev::ToPlus, Stopping, &["str"], Stopping),
+        (Ev::ToPlus, RequestSent, &["scr"], RequestSent),
+        (Ev::ToPlus, AckReceived, &["scr"], RequestSent),
+        (Ev::ToPlus, AckSent, &["scr"], AckSent),
+
+        (Ev::ToMinus, Closing, &["tlf"], Closed),
+        (Ev::ToMinus, Stopping, &["tlf"], Stopped),
+        (Ev::ToMinus, RequestSent, &["tlf"], Stopped),
+        (Ev::ToMinus, AckReceived, &["tlf"], Stopped),
+        (Ev::ToMinus, AckSent, &["tlf"], Stopped),
+
+        (Ev::RcrPlus, Closed, &["sta"], Closed),
+        (Ev::RcrPlus, Stopped, &["scr", "sca"], AckSent),
+        (Ev::RcrPlus, Closing, &[], Closing),
+        (Ev::RcrPlus, Stopping, &[], Stopping),
+        (Ev::RcrPlus, RequestSent, &["sca"], AckSent),
+        (Ev::RcrPlus, AckReceived, &["sca", "tlu"], Opened),
+        (Ev::RcrPlus, AckSent, &["sca"], AckSent),
+        (Ev::RcrPlus, Opened, &["tld", "scr", "sca"], AckSent),
+
+        (Ev::RcrMinus, Closed, &["sta"], Closed),
+        (Ev::RcrMinus, Stopped, &["scr", "scn"], RequestSent),
+        (Ev::RcrMinus, Closing, &[], Closing),
+        (Ev::RcrMinus, Stopping, &[], Stopping),
+        (Ev::RcrMinus, RequestSent, &["scn"], RequestSent),
+        (Ev::RcrMinus, AckReceived, &["scn"], AckReceived),
+        (Ev::RcrMinus, AckSent, &["scn"], RequestSent),
+        (Ev::RcrMinus, Opened, &["tld", "scr", "scn"], RequestSent),
+
+        (Ev::Rca, Closed, &["sta"], Closed),
+        (Ev::Rca, Stopped, &["sta"], Stopped),
+        (Ev::Rca, Closing, &[], Closing),
+        (Ev::Rca, Stopping, &[], Stopping),
+        (Ev::Rca, RequestSent, &[], AckReceived),
+        (Ev::Rca, AckReceived, &["scr"], RequestSent),
+        (Ev::Rca, AckSent, &["tlu"], Opened),
+        (Ev::Rca, Opened, &["tld", "scr"], RequestSent),
+
+        (Ev::Rcn, Closed, &["sta"], Closed),
+        (Ev::Rcn, Stopped, &["sta"], Stopped),
+        (Ev::Rcn, Closing, &[], Closing),
+        (Ev::Rcn, Stopping, &[], Stopping),
+        (Ev::Rcn, RequestSent, &["scr"], RequestSent),
+        (Ev::Rcn, AckReceived, &["scr"], RequestSent),
+        (Ev::Rcn, AckSent, &["scr"], AckSent),
+        (Ev::Rcn, Opened, &["tld", "scr"], RequestSent),
+
+        (Ev::Rtr, Closed, &["sta"], Closed),
+        (Ev::Rtr, Stopped, &["sta"], Stopped),
+        (Ev::Rtr, Closing, &["sta"], Closing),
+        (Ev::Rtr, Stopping, &["sta"], Stopping),
+        (Ev::Rtr, RequestSent, &["sta"], RequestSent),
+        (Ev::Rtr, AckReceived, &["sta"], RequestSent),
+        (Ev::Rtr, AckSent, &["sta"], RequestSent),
+        (Ev::Rtr, Opened, &["tld", "sta"], Stopping),
+
+        (Ev::Rta, Closed, &[], Closed),
+        (Ev::Rta, Stopped, &[], Stopped),
+        (Ev::Rta, Closing, &["tlf"], Closed),
+        (Ev::Rta, Stopping, &["tlf"], Stopped),
+        (Ev::Rta, RequestSent, &[], RequestSent),
+        (Ev::Rta, AckReceived, &[], RequestSent),
+        (Ev::Rta, AckSent, &[], AckSent),
+        (Ev::Rta, Opened, &["tld", "scr"], RequestSent),
+
+        (Ev::Ruc, Closed, &["scj"], Closed),
+        (Ev::Ruc, Stopped, &["scj"], Stopped),
+        (Ev::Ruc, Closing, &["scj"], Closing),
+        (Ev::Ruc, Stopping, &["scj"], Stopping),
+        (Ev::Ruc, RequestSent, &["scj"], RequestSent),
+        (Ev::Ruc, AckReceived, &["scj"], AckReceived),
+        (Ev::Ruc, AckSent, &["scj"], AckSent),
+        (Ev::Ruc, Opened, &["scj"], Opened),
+
+        (Ev::RxjPlus, Closed, &[], Closed),
+        (Ev::RxjPlus, Stopped, &[], Stopped),
+        (Ev::RxjPlus, Closing, &[], Closing),
+        (Ev::RxjPlus, Stopping, &[], Stopping),
+        (Ev::RxjPlus, RequestSent, &[], RequestSent),
+        (Ev::RxjPlus, AckReceived, &[], RequestSent),
+        (Ev::RxjPlus, AckSent, &[], AckSent),
+        (Ev::RxjPlus, Opened, &[], Opened),
+
+        (Ev::RxjMinus, Closed, &["tlf"], Closed),
+        (Ev::RxjMinus, Stopped, &["tlf"], Stopped),
+        (Ev::RxjMinus, Closing, &["tlf"], Closed),
+        (Ev::RxjMinus, Stopping, &["tlf"], Stopped),
+        (Ev::RxjMinus, RequestSent, &["tlf"], Stopped),
+        (Ev::RxjMinus, AckReceived, &["tlf"], Stopped),
+        (Ev::RxjMinus, AckSent, &["tlf"], Stopped),
+        (Ev::RxjMinus, Opened, &["tld", "str"], Stopping),
+    ];
+    for &(ev, from, actions, to) in table {
+        let (mut f, last) = in_state(from, ev == Ev::ToMinus);
+        let out = apply(&mut f, &last, ev);
+        let names = named(&out);
+        assert_eq!(names, actions, "{ev:?} in {from:?}");
+        assert_eq!(f.state(), to, "{ev:?} in {from:?}");
+        // Section 4.6: the restart timer runs only in these states; each scr or
+        // str starts it for one restart period.
+        let timed = matches!(to, Closing | Stopping | RequestSent | AckReceived | AckSent);
+        assert_eq!(f.next_timer().is_some(), timed, "{ev:?} in {from:?}");
+        if names.iter().any(|a| *a == "scr" || *a == "str") {
+            assert_eq!(f.next_timer(), Some(NOW + 3_000), "{ev:?} in {from:?}");
+        }
+    }
+}

@@ -84,3 +84,53 @@ fn option_lists() {
     assert_eq!(options(&[1, 5, 0]), None);
     assert_eq!(options(&[1]), None);
 }
+
+#[test]
+fn protocol_numbers_and_codes_are_those_of_the_rfcs() {
+    use ruster_pppoed::auth::{chap, pap};
+    use ruster_pppoed::fsm::code;
+    use ruster_pppoed::lcp;
+    // RFC 1332 section 2 and 5072 section 2 (0x0021, 0x8021; 0x0057, 0x8057),
+    // RFC 1661 section 2 (LCP 0xc021), RFC 1334 section 2.2 (PAP 0xc023), RFC 1994
+    // section 4 (CHAP 0xc223).
+    assert_eq!(
+        [
+            protocol::IPV4,
+            protocol::IPCP,
+            protocol::IPV6,
+            protocol::IPV6CP,
+            protocol::LCP,
+            protocol::PAP,
+            protocol::CHAP,
+        ],
+        [0x0021, 0x8021, 0x0057, 0x8057, 0xc021, 0xc023, 0xc223]
+    );
+    // RFC 1661 section 5: codes 1 to 11.
+    assert_eq!(
+        [
+            code::CONFIGURE_REQUEST,
+            code::CONFIGURE_ACK,
+            code::CONFIGURE_NAK,
+            code::CONFIGURE_REJECT,
+            code::TERMINATE_REQUEST,
+            code::TERMINATE_ACK,
+            code::CODE_REJECT,
+            lcp::code::PROTOCOL_REJECT,
+            lcp::code::ECHO_REQUEST,
+            lcp::code::ECHO_REPLY,
+            lcp::code::DISCARD_REQUEST,
+        ],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    );
+    // RFC 1334 section 2.2: PAP codes. RFC 1994 section 4: CHAP codes.
+    assert_eq!([pap::REQUEST, pap::ACK, pap::NAK], [1, 2, 3]);
+    assert_eq!(
+        [
+            chap::CHALLENGE,
+            chap::RESPONSE,
+            chap::SUCCESS,
+            chap::FAILURE
+        ],
+        [1, 2, 3, 4]
+    );
+}

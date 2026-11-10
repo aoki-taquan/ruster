@@ -389,3 +389,94 @@ fn malformed_frames_are_refused() {
     assert_eq!(tags.ac_name, Some(&b"a"[..]));
     assert_eq!(tags.host_uniq, None);
 }
+
+#[test]
+fn codes_and_tags_are_those_of_rfc_2516() {
+    // Section 5: the Discovery codes. Appendix A: the tag types.
+    assert_eq!(
+        [code::PADI, code::PADO, code::PADR, code::PADS, code::PADT],
+        [0x09, 0x07, 0x19, 0x65, 0xa7]
+    );
+    assert_eq!(
+        [
+            tag::END_OF_LIST,
+            tag::SERVICE_NAME,
+            tag::AC_NAME,
+            tag::HOST_UNIQ,
+            tag::AC_COOKIE,
+            tag::RELAY_SESSION_ID,
+            tag::SERVICE_NAME_ERROR,
+            tag::AC_SYSTEM_ERROR,
+            tag::GENERIC_ERROR,
+        ],
+        [0x0000, 0x0101, 0x0102, 0x0103, 0x0104, 0x0110, 0x0201, 0x0202, 0x0203]
+    );
+}
+
+#[test]
+fn hand_built_pado_gives_the_padr_byte_for_byte() {
+    let mut d = discovery(b"inet", None);
+    let mut out = Vec::new();
+    d.start(0, &mut out);
+    // RFC 2516 section 5.1, byte for byte: broadcast, Ethernet type 0x8863,
+    // ver/type 0x11, code 0x09, session 0, length 20, Service-Name "inet",
+    // Host-Uniq.
+    #[rustfmt::skip]
+    let padi = [
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02, 0, 0, 0, 0, 0x02, 0x88, 0x63,
+        0x11, 0x09, 0x00, 0x00, 0x00, 0x14,
+        0x01, 0x01, 0x00, 0x04, b'i', b'n', b'e', b't',
+        0x01, 0x03, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,
+    ];
+    assert_eq!(out, [padi.to_vec()]);
+    out.clear();
+    // Section 5.2: a PADO written out from the field layout, with a Service-Name,
+    // AC-Name, Host-Uniq, AC-Cookie and Relay-Session-Id, then End-Of-List and
+    // Ethernet padding the length leaves out.
+    #[rustfmt::skip]
+    let pado = [
+        0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0xac, 0x88, 0x63,
+        0x11, 0x07, 0x00, 0x00, 0x00, 0x2c,
+        0x01, 0x02, 0x00, 0x02, b'a', b'c',
+        0x01, 0x01, 0x00, 0x04, b'i', b'n', b'e', b't',
+        0x01, 0x03, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,
+        0x01, 0x04, 0x00, 0x04, 0xc0, 0x0c, 0x1e, 0xe5,
+        0x01, 0x10, 0x00, 0x02, 0x51, 0x52,
+        0x00, 0x00, 0x00, 0x00,
+        0, 0, 0, 0, 0, 0,
+    ];
+    assert_eq!(d.receive(1, &pado, &mut out), None);
+    // Section 5.3: the PADR goes to the AC's unicast address with code 0x19,
+    // session 0, one Service-Name, and the Host-Uniq, AC-Cookie and
+    // Relay-Session-Id given back unchanged.
+    #[rustfmt::skip]
+    let padr = [
+        0x02, 0, 0, 0, 0, 0xac, 0x02, 0, 0, 0, 0, 0x02, 0x88, 0x63,
+        0x11, 0x19, 0x00, 0x00, 0x00, 0x22,
+        0x01, 0x01, 0x00, 0x04, b'i', b'n', b'e', b't',
+        0x01, 0x03, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,
+        0x01, 0x04, 0x00, 0x04, 0xc0, 0x0c, 0x1e, 0xe5,
+        0x01, 0x10, 0x00, 0x02, 0x51, 0x52,
+    ];
+    assert_eq!(out, [padr.to_vec()]);
+    out.clear();
+    // Section 5.4: the PADS (code 0x65) gives session 0x2a01.
+    #[rustfmt::skip]
+    let pads = [
+        0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0xac, 0x88, 0x63,
+        0x11, 0x65, 0x2a, 0x01, 0x00, 0x14,
+        0x01, 0x01, 0x00, 0x04, b'i', b'n', b'e', b't',
+        0x01, 0x03, 0x00, 0x08, 1, 2, 3, 4, 5, 6, 7, 8,
+    ];
+    assert_eq!(
+        d.receive(2, &pads, &mut out),
+        Some(Event::Session { id: 0x2a01, ac: AC })
+    );
+    // Section 5.5: a PADT (code 0xa7) from the AC with our session ends it.
+    #[rustfmt::skip]
+    let padt = [
+        0x02, 0, 0, 0, 0, 0x02, 0x02, 0, 0, 0, 0, 0xac, 0x88, 0x63,
+        0x11, 0xa7, 0x2a, 0x01, 0x00, 0x00,
+    ];
+    assert_eq!(d.receive(3, &padt, &mut out), Some(Event::Terminated));
+}
