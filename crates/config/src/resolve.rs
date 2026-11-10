@@ -42,6 +42,9 @@ struct File {
     #[serde(default)]
     dhcp_client: Vec<crate::dhcp_client::DhcpClientEntry>,
     bgp: Option<crate::bgp::BgpEntry>,
+    isis: Option<crate::isis::IsisEntry>,
+    ospf: Option<crate::ospf::OspfEntry>,
+    ospf6: Option<crate::ospf::OspfEntry>,
 }
 
 #[derive(Deserialize)]
@@ -486,6 +489,14 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .bgp
         .map(|entry| crate::bgp::resolve(entry, &interfaces))
         .transpose()?;
+    let ospf = file
+        .ospf
+        .map(|entry| crate::ospf::resolve("ospf", entry, &interfaces))
+        .transpose()?;
+    let ospf6 = file
+        .ospf6
+        .map(|entry| crate::ospf::resolve("ospf6", entry, &interfaces))
+        .transpose()?;
     Ok(Lock {
         version: VERSION,
         firewall_filtering: filtering(file.firewall_filtering),
@@ -507,6 +518,9 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         pppoe,
         dhcp_client,
         bgp: bgp.into_iter().collect(),
+        isis: file.isis.map(crate::isis::resolve).into_iter().collect(),
+        ospf: ospf.into_iter().collect(),
+        ospf6: ospf6.into_iter().collect(),
     })
 }
 

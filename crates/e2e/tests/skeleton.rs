@@ -86,6 +86,9 @@ fn config() -> Config {
         dns_found: Vec::new(),
         bgp: None,
         bridges: Vec::new(),
+        isis: None,
+        ospf: None,
+        ospf6: None,
     }
 }
 

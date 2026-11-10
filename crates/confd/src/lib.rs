@@ -46,6 +46,7 @@ pub mod dhcp6;
 pub mod dhcp_client;
 pub mod diff;
 pub mod file;
+pub mod isis_ospf;
 pub mod kernel;
 pub mod part;
 pub mod pppoe;
@@ -169,6 +170,11 @@ pub struct Config {
     pub bgp: Option<ruster_config::Bgp>,
     /// The bridges, checked; their own interfaces are in `interfaces` ([`bridge`]).
     pub bridges: Vec<bridge::Bridge>,
+    /// IS-IS, OSPFv2 and OSPFv3, checked; confd hands them to `ruster-frr`
+    /// ([`isis_ospf`]).
+    pub isis: Option<ruster_config::Isis>,
+    pub ospf: Option<ruster_config::Ospf>,
+    pub ospf6: Option<ruster_config::Ospf>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1212,6 +1218,9 @@ mod tests {
             map_e_from: None,
             dns_found: Vec::new(),
             bgp: None,
+            isis: None,
+            ospf: None,
+            ospf6: None,
             bridges: Vec::new(),
         });
         let routes = confd.routes();
@@ -1277,6 +1286,9 @@ mod tests {
             map_e_from: None,
             dns_found: Vec::new(),
             bgp: None,
+            isis: None,
+            ospf: None,
+            ospf6: None,
             bridges: Vec::new(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);

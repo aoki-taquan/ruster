@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use ruster_proto::table::DEFAULT_VRF;
 
-use crate::{Interface, VERSION};
+use crate::{Interface, Isis, Ospf, VERSION};
 
 /// BGP in the default VRF, every value given.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,11 +74,7 @@ struct NeighborEntry {
 pub(crate) fn resolve(entry: BgpEntry, interfaces: &[Interface]) -> Result<Bgp, String> {
     let router_id = match entry.router_id {
         Some(id) => id,
-        None => interfaces
-            .iter()
-            .filter(|i| i.vrf == DEFAULT_VRF && i.enabled)
-            .flat_map(|i| &i.ipv4)
-            .find_map(|a| a.split_once('/').map(|(a, _)| a.to_owned()))
+        None => first_ipv4(interfaces)
             .ok_or("bgp: give router-id; no interface of the default VRF has an ipv4 address")?,
     };
     Ok(Bgp {
@@ -98,34 +94,82 @@ pub(crate) fn resolve(entry: BgpEntry, interfaces: &[Interface]) -> Result<Bgp, 
     })
 }
 
+/// The first IPv4 address of the default VRF's enabled interfaces: the router ID
+/// when none is given.
+pub(crate) fn first_ipv4(interfaces: &[Interface]) -> Option<String> {
+    interfaces
+        .iter()
+        .filter(|i| i.vrf == DEFAULT_VRF && i.enabled)
+        .flat_map(|i| &i.ipv4)
+        .find_map(|a| a.split_once('/').map(|(a, _)| a.to_owned()))
+}
+
+/// The name of the TAP device in the kernel's namespace that stands for FE
+/// interface `interface`, where FRR speaks IS-IS and OSPF
+/// (`docs/design/overlay.md` section 6).
+pub fn tap_device(interface: &str) -> String {
+    format!("{TAP_PREFIX}{interface}")
+}
+
+/// What [`tap_device`] puts before the interface's name.
+pub const TAP_PREFIX: &str = "rp-";
+
+/// What `ruster-frr` takes: the routing protocols, and the default VRF's
+/// interfaces that confd worked out from the configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Frr {
+    pub bgp: Option<Bgp>,
+    pub isis: Option<Isis>,
+    pub ospf: Option<Ospf>,
+    pub ospf6: Option<Ospf>,
+    pub connected: Vec<Connected>,
+}
+
 /// The part of the lock form that `ruster-frr` takes.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FrrPart {
     version: u32,
     bgp: Vec<Bgp>,
+    #[serde(default)]
+    isis: Vec<Isis>,
+    #[serde(default)]
+    ospf: Vec<Ospf>,
+    #[serde(default)]
+    ospf6: Vec<Ospf>,
     connected: Vec<Connected>,
 }
 
-/// `ruster-frr`'s part of the lock form as TOML text: `version = 1`, `bgp` (none or
-/// one) and `connected`, the prefixes of the default VRF's interfaces that confd
-/// worked out from them.
-pub fn frr_part(bgp: Option<&Bgp>, connected: &[Connected]) -> String {
+/// `ruster-frr`'s part of the lock form as TOML text: `version = 1`, `bgp`, `isis`,
+/// `ospf` and `ospf6` (each none or one) and `connected`, the prefixes of the
+/// default VRF's interfaces that confd worked out from them.
+pub fn frr_part(frr: &Frr) -> String {
     let part = FrrPart {
         version: VERSION,
-        bgp: bgp.into_iter().cloned().collect(),
-        connected: connected.to_vec(),
+        bgp: frr.bgp.iter().cloned().collect(),
+        isis: frr.isis.iter().cloned().collect(),
+        ospf: frr.ospf.iter().cloned().collect(),
+        ospf6: frr.ospf6.iter().cloned().collect(),
+        connected: frr.connected.clone(),
     };
     toml::to_string(&part).expect("the lock form is plain TOML")
 }
 
 /// Reads `ruster-frr`'s part of the lock form ([`frr_part`]).
-pub fn parse_frr_part(text: &str) -> Result<(Option<Bgp>, Vec<Connected>), String> {
+pub fn parse_frr_part(text: &str) -> Result<Frr, String> {
     crate::check_version(text)?;
     let part: FrrPart = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
-    match <[Bgp; 1]>::try_from(part.bgp) {
-        Ok([bgp]) => Ok((Some(bgp), part.connected)),
-        Err(none) if none.is_empty() => Ok((None, part.connected)),
-        Err(_) => Err("bgp takes at most one value".into()),
+    fn one<T>(what: &str, list: Vec<T>) -> Result<Option<T>, String> {
+        if list.len() > 1 {
+            return Err(format!("{what} takes at most one value"));
+        }
+        Ok(list.into_iter().next())
     }
+    Ok(Frr {
+        bgp: one("bgp", part.bgp)?,
+        isis: one("isis", part.isis)?,
+        ospf: one("ospf", part.ospf)?,
+        ospf6: one("ospf6", part.ospf6)?,
+        connected: part.connected,
+    })
 }

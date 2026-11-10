@@ -857,6 +857,9 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let dhcp_client = crate::dhcp_client::check(lock.dhcp_client, &interfaces, &sources)?;
     let bgp = crate::bgp::check(lock.bgp, &interfaces)?;
     let bridges = crate::bridge::check(bridges, &interfaces)?;
+    let isis = crate::isis_ospf::check_isis(lock.isis, &interfaces, &bridges)?;
+    let ospf = crate::isis_ospf::check_ospf("ospf", lock.ospf, &interfaces, &bridges)?;
+    let ospf6 = crate::isis_ospf::check_ospf("ospf6", lock.ospf6, &interfaces, &bridges)?;
     // The FE takes at most this many punt classes besides its own.
     if dhcp.len()
         + dhcp6.len()
@@ -888,6 +891,9 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         map_e_from,
         bgp,
         bridges,
+        isis,
+        ospf,
+        ospf6,
         dns_found: Vec::new(),
     })
 }
