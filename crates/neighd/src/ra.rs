@@ -208,6 +208,8 @@ impl Schedule {
             self.initial -= 1;
             interval = interval.min(MAX_INITIAL_RTR_ADVERT_INTERVAL_MS);
         }
+        // Never closer than MIN_DELAY_BETWEEN_RAS, whatever the settings.
+        let interval = interval.max(MIN_DELAY_BETWEEN_RAS_MS);
         self.next_at = now_ms + interval;
     }
 }

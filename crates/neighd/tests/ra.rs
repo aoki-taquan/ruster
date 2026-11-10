@@ -249,4 +249,13 @@ fn an_interface_without_ra_or_disabled_sends_none() {
     lab.run_to(11_000);
     assert_eq!(lab.advertisements().len(), 1);
     assert!(lab.neighd.take_ra("version = 1\nra = 3\n").is_err());
+    // Intervals that would flood the link are refused, and so is an interface twice.
+    let good = part(true);
+    for bad in [
+        good.replace("max-interval = 600", "max-interval = 0"),
+        good.replace("min-interval = 198", "min-interval = 0"),
+        format!("{good}\n{}", &good[good.find("[[ra]]").unwrap()..]),
+    ] {
+        assert!(lab.neighd.take_ra(&bad).is_err(), "{bad}");
+    }
 }

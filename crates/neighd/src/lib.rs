@@ -26,7 +26,9 @@
 //!   Solicitations there ([`ra`]). An interface advertises while it is in the part,
 //!   enabled and has its link-local address; when it leaves the part it sends the
 //!   final advertisements. One disabled or gone from the tables sends none, since
-//!   the FE sends nothing out of it.
+//!   the FE sends nothing out of it. Nor does neighd when it stops: a restart should
+//!   not take the router away from the hosts (RFC 4861 section 6.2.5 asks for final
+//!   advertisements only when an interface stops advertising).
 //!
 //! Skeleton limits: no duplicate address detection of our own IPv6 addresses (RFC
 //! 4862 section 5.4). Router Advertisements of other routers are not read (RFC
@@ -276,7 +278,20 @@ impl Neighd {
     /// replaces the last one.
     pub fn take_ra(&mut self, part: &str) -> Result<(), String> {
         let ra = ruster_config::parse_ra_part(part)?;
-        self.ra = ra.into_iter().map(|r| (r.interface.clone(), r)).collect();
+        let mut by_name = BTreeMap::new();
+        for entry in ra {
+            // confd checked these; the intervals are checked again, since a short one
+            // would flood the link (RFC 4861 section 6.2.1).
+            let (min, max) = (entry.min_interval, entry.max_interval);
+            if !(4..=1_800).contains(&max) || min < 3 || u64::from(min) * 4 > u64::from(max) * 3 {
+                return Err(format!("ra {:?}: bad intervals", entry.interface));
+            }
+            let name = entry.interface.clone();
+            if by_name.insert(name.clone(), entry).is_some() {
+                return Err(format!("ra {name:?}: given twice"));
+            }
+        }
+        self.ra = by_name;
         Ok(())
     }
 
@@ -1044,9 +1059,13 @@ impl Neighd {
             let ready = self.advertiser(&name).is_some();
             match (self.ra.get(&name), self.advertising.get_mut(&name)) {
                 (Some(ra), None) if ready => {
-                    self.finals.remove(&name);
+                    // Not within MIN_DELAY_BETWEEN_RAS of a final one.
+                    let at = self
+                        .finals
+                        .remove(&name)
+                        .map_or(now_ms, |last| last.next_at.max(now_ms));
                     self.advertising
-                        .insert(name, (ra.clone(), ra::Schedule::new(now_ms)));
+                        .insert(name, (ra.clone(), ra::Schedule::new(at)));
                 }
                 (Some(ra), Some((held, schedule))) if ready => {
                     if held != ra {
