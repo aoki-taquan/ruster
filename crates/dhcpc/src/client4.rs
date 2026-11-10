@@ -35,7 +35,7 @@
 //! 10 s as at the start. The lease is timed from when the DHCPACK arrives, not from
 //! when the request was sent (section 4.4.1). An ACK to a renewal may give another
 //! address; [`Event::Bound`] then carries it, and the old one is no longer held.
-//! The BROADCAST flag is set in RENEWING and REBINDING too, as in the other states
+//! The BROADCAST flag is set only while the client has no address
 //! ([`crate::dhcp4`]).
 
 use std::net::Ipv4Addr;
