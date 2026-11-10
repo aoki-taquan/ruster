@@ -4,7 +4,9 @@
 //! ruster check FILE                       check a configuration file as confd reads it
 //! ruster resolve FILE                     print a ruster.toml in the lock form
 //! ruster [--run-dir DIR] diff FILE        show what applying it would change
-//! ruster [--run-dir DIR] apply FILE       check it, then make it confd's configuration
+//! ruster [--run-dir DIR] apply [--confirm-within MINUTES] FILE
+//!                                         check it, then make it confd's configuration
+//! ruster [--run-dir DIR] confirm          keep the version that waits for confirmation
 //! ruster [--run-dir DIR] versions         list the versions confd keeps, newest first
 //! ruster [--run-dir DIR] rollback N       make version N the configuration again
 //! ruster [--run-dir DIR] show             print every table the FE holds
@@ -19,6 +21,10 @@
 //! as the next version ([`ruster_confd::versions`]). `rollback N` goes the same way
 //! with version N's configuration, which becomes a new version: the versions between
 //! stay.
+//!
+//! With `--confirm-within MINUTES` (1 to 1440), confd goes back to the version before
+//! unless `confirm` comes within that time, even if confd is started again meanwhile.
+//! Use it for a change that could cut off the connection you apply it over.
 //!
 //! `diff` sends the file to confd, which reads it as for `apply` but sends it to no
 //! one, and prints what would change ([`ruster_confd::diff`]).
@@ -51,7 +57,8 @@ const USAGE: &str = "usage:
   ruster check FILE
   ruster resolve FILE
   ruster [--run-dir DIR] diff FILE
-  ruster [--run-dir DIR] apply FILE
+  ruster [--run-dir DIR] apply [--confirm-within MINUTES] FILE
+  ruster [--run-dir DIR] confirm
   ruster [--run-dir DIR] versions
   ruster [--run-dir DIR] rollback N
   ruster [--run-dir DIR] show
@@ -300,10 +307,41 @@ fn resolve(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn apply(run_dir: &Path, path: &str) -> Result<(), String> {
+/// `apply FILE`, or `apply --confirm-within MINUTES FILE`.
+fn apply(run_dir: &Path, args: &[String]) -> Result<(), String> {
+    let (minutes, path) = match args {
+        [path] => (None, path),
+        [flag, minutes, path] if flag == "--confirm-within" => match minutes.parse::<u32>() {
+            Ok(m) if (1..=24 * 60).contains(&m) && !minutes.starts_with('+') => {
+                (Some(minutes.as_str()), path)
+            }
+            _ => return Err(format!("{minutes}: minutes from 1 to 1440")),
+        },
+        _ => return Err(USAGE.into()),
+    };
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
     ruster_confd::file::parse(&text).map_err(|e| format!("{path}: {e}"))?;
-    commit(run_dir, path, &["config"], text.as_bytes())
+    match minutes {
+        None => commit(run_dir, path, &["config"], text.as_bytes()),
+        Some(minutes) => commit(
+            run_dir,
+            path,
+            &["config", "confirm-within", minutes],
+            text.as_bytes(),
+        ),
+    }
+}
+
+/// Keeps the version that waits for confirmation.
+fn confirm(run_dir: &Path) -> Result<(), String> {
+    let socket = run_dir.join(socket::CONFD_CONFIG);
+    let (code, payload) = request(&socket, |c| Ok(c.post(&["confirm"], &[])))?;
+    let said = String::from_utf8_lossy(&payload);
+    if code != Code::CHANGED {
+        return Err(format!("confirm: {said}"));
+    }
+    println!("{said}");
+    Ok(())
 }
 
 /// Makes version `number` the latest version again.
@@ -370,7 +408,8 @@ fn run() -> Result<(), String> {
             ("check", [file]) => check(file),
             ("resolve", [file]) => resolve(file),
             ("diff", [file]) => diff(&run_dir, file),
-            ("apply", [file]) => apply(&run_dir, file),
+            ("apply", args) => apply(&run_dir, args),
+            ("confirm", []) => confirm(&run_dir),
             ("versions", []) => versions(&run_dir),
             ("rollback", [number]) => rollback(&run_dir, number),
             ("show", []) => show(&run_dir),

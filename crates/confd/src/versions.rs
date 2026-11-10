@@ -13,7 +13,12 @@
 //! ```text
 //! DIR/versions/000001.toml   version 1: time, how, lock, toml
 //! DIR/versions/000002.toml
+//! DIR/versions/confirm.toml  only while the latest waits for `ruster confirm`:
+//!                            version, back-to, deadline, minutes ([`Waiting`])
 //! ```
+//!
+//! A `confirm.toml` for a version that is not the latest is from a crash between
+//! writing it and writing the version, and is removed at start-up.
 //!
 //! The directory is made with mode 0700 and the files with 0600, since the lock form
 //! can hold PPPoE passwords. Each file is written to a temporary file, synced, renamed
@@ -70,7 +75,25 @@ pub struct Version {
 pub struct Versions {
     dir: Option<PathBuf>,
     list: Vec<Version>,
+    waiting: Option<Waiting>,
 }
+
+/// The latest version waits for `ruster confirm` ([`crate::apply`]); without it in
+/// time, confd goes back to `back_to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Waiting {
+    pub version: u64,
+    pub back_to: u64,
+    /// When it goes back, in seconds since 1970-01-01 UTC.
+    pub deadline: u64,
+    /// How long it was given; a start-up waits at most this long, should the clock
+    /// have gone back.
+    pub minutes: u32,
+}
+
+/// The name of the file that holds [`Waiting`], beside the versions.
+const WAITING: &str = "confirm.toml";
 
 impl Versions {
     /// Versions only in memory.
@@ -125,10 +148,69 @@ impl Versions {
                 ),
             }
         }
-        Ok(Self {
+        let mut versions = Self {
             dir: Some(dir),
             list,
-        })
+            waiting: None,
+        };
+        versions.read_waiting()?;
+        Ok(versions)
+    }
+
+    /// Reads [`WAITING`]. One for a version that is not the latest is from before a
+    /// crash (the version was not written, or a newer one was) and is removed.
+    fn read_waiting(&mut self) -> Result<(), String> {
+        let Some(dir) = &self.dir else {
+            return Ok(());
+        };
+        let path = dir.join(WAITING);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("{}: {error}", path.display())),
+        };
+        let waiting: Waiting =
+            toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let latest = self.latest().map(|v| v.number);
+        if Some(waiting.version) == latest && self.get(waiting.back_to).is_some() {
+            self.waiting = Some(waiting);
+            return Ok(());
+        }
+        eprintln!(
+            "ruster-confd: {}: version {} is not the latest, or version {} is not kept; \
+             nothing waits for confirmation",
+            path.display(),
+            waiting.version,
+            waiting.back_to
+        );
+        self.set_waiting(None)
+    }
+
+    /// The version waiting for `ruster confirm`, if one is.
+    pub fn waiting(&self) -> Option<Waiting> {
+        self.waiting
+    }
+
+    /// Keeps (or with `None`, drops) what waits for confirmation, in the state
+    /// directory too. On an error writing, nothing is kept; on an error removing, it
+    /// is dropped in memory only.
+    pub fn set_waiting(&mut self, waiting: Option<Waiting>) -> Result<(), String> {
+        let written = match (&self.dir, &waiting) {
+            (None, _) => Ok(()),
+            (Some(dir), Some(waiting)) => {
+                let text = toml::to_string(waiting).map_err(|e| e.to_string())?;
+                write_atomically(dir, WAITING, text.as_bytes())
+            }
+            (Some(dir), None) => match fs::remove_file(dir.join(WAITING)) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                _ => fs::File::open(dir).and_then(|d| d.sync_all()),
+            },
+        };
+        let written = written.map_err(|e| format!("{WAITING}: {e}"));
+        if written.is_ok() || waiting.is_none() {
+            self.waiting = waiting;
+        }
+        written
     }
 
     /// The versions kept, oldest first.
@@ -149,9 +231,7 @@ impl Versions {
         let number = self.latest().map_or(1, |v| v.number + 1);
         let version = Version {
             number,
-            time: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
+            time: unix_now(),
             how: how.to_owned(),
             lock: lock.to_owned(),
             toml: toml.map(str::to_owned),
@@ -208,9 +288,17 @@ impl Versions {
     pub fn listing(&self) -> String {
         let mut out = String::new();
         for version in self.list.iter().rev() {
+            let waits = match self.waiting {
+                Some(w) if w.version == version.number => format!(
+                    " (waits for `ruster confirm`; goes back to version {} at {})",
+                    w.back_to,
+                    utc(w.deadline)
+                ),
+                _ => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "{:>6}  {}  {}",
+                "{:>6}  {}  {}{waits}",
                 version.number,
                 utc(version.time),
                 version.how
@@ -218,6 +306,13 @@ impl Versions {
         }
         out
     }
+}
+
+/// Seconds since 1970-01-01 UTC now.
+pub fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn file_name(number: u64) -> String {

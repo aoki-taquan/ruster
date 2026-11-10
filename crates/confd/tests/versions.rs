@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ruster_confd::file;
-use ruster_confd::versions::{utc, Versions, KEEP};
+use ruster_confd::versions::{utc, Versions, Waiting, KEEP};
 
 fn state_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -174,6 +174,31 @@ fn an_older_version_that_does_not_read_is_left_out() {
     let again = Versions::open(&dir).unwrap();
     let numbers: Vec<u64> = again.list().iter().map(|v| v.number).collect();
     assert_eq!(numbers, [2]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_deadline_for_a_version_that_is_not_the_latest_is_dropped() {
+    let dir = state_dir("waiting");
+    let mut versions = Versions::open(&dir).unwrap();
+    versions.commit("apply", "version = 1\n", None).unwrap();
+    let waiting = Waiting {
+        version: 2,
+        back_to: 1,
+        deadline: 4_000_000_000,
+        minutes: 5,
+    };
+    // Written, and then confd stopped before version 2 was.
+    versions.set_waiting(Some(waiting)).unwrap();
+    assert!(dir.join("versions/confirm.toml").exists());
+    let mut again = Versions::open(&dir).unwrap();
+    assert_eq!(again.waiting(), None);
+    assert!(!dir.join("versions/confirm.toml").exists());
+
+    // Once version 2 is there, it is kept.
+    again.set_waiting(Some(waiting)).unwrap();
+    again.commit("apply", "version = 1\n", None).unwrap();
+    assert_eq!(Versions::open(&dir).unwrap().waiting(), Some(waiting));
     std::fs::remove_dir_all(dir).unwrap();
 }
 

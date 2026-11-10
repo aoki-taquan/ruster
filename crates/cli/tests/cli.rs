@@ -41,6 +41,14 @@ fn versions_and_rollback_fail_clearly_without_a_router() {
     let (ok, text) = ruster(&["--run-dir", "/nonexistent", "rollback", "x"]);
     assert!(!ok);
     assert!(text.contains("x: not a version number"), "{text}");
+    for minutes in ["0", "1441", "x"] {
+        let (ok, text) = ruster(&["apply", "--confirm-within", minutes, "router.toml"]);
+        assert!(!ok);
+        assert!(text.contains("minutes from 1 to 1440"), "{text}");
+    }
+    let (ok, text) = ruster(&["--run-dir", "/nonexistent", "confirm"]);
+    assert!(!ok);
+    assert!(text.contains("confd/config.sock"), "{text}");
 }
 
 #[test]
