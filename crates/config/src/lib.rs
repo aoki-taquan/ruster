@@ -474,7 +474,26 @@ pub use ra::{
 pub use resolve::resolve;
 
 /// The lock form's version that this ruster reads and writes.
+///
+/// Raise it when a lock form written by an earlier ruster may no longer read: a key
+/// added without a default, a key removed or renamed, a type or a meaning changed.
+/// Adding a key with a default, or a new kind of interface or route target, keeps it.
+/// [`LOCK_SHAPE`] makes a change of the lock form fail a test until one of the two is
+/// set again on purpose.
 pub const VERSION: u32 = 1;
+
+/// A fingerprint of the lock form's shape (each key, where it is, and the type of its
+/// value), taken from `tests/data/every-key.lock`. The test
+/// `the_lock_form_does_not_change_without_a_new_version` in `tests/lock.rs` fails
+/// when the lock form changes, and prints the new shape and fingerprint. Then:
+///
+/// 1. If a lock form of this [`VERSION`] written before the change may not read
+///    after it, raise [`VERSION`].
+/// 2. Either way, set this to the fingerprint the test printed.
+///
+/// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
+/// key required, and checks that every list in it has an item).
+pub const LOCK_SHAPE: u64 = 0x1901_6ecf_ca04_bf0a;
 
 /// The MTU of an interface that names none, and the most the FE takes (frames of
 /// up to 1514 bytes).

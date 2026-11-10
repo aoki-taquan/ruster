@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use ruster_confd::file;
-use ruster_confd::versions::{utc, Versions, Waiting, KEEP};
+use ruster_confd::versions::{utc, Start, Versions, Waiting, KEEP};
 
 fn state_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
@@ -87,7 +87,7 @@ fn confd_starts_with_the_file_only_when_there_is_no_version() {
     let path = path.to_str().unwrap();
 
     let mut versions = Versions::open(&dir).unwrap();
-    let (config, from) = versions.starting_config(path).unwrap();
+    let Start { config, from, .. } = versions.starting_config(path).unwrap();
     assert_eq!(from, path);
     assert_eq!(config.interfaces[0].mtu, 1500);
     let first = versions.latest().unwrap();
@@ -100,7 +100,7 @@ fn confd_starts_with_the_file_only_when_there_is_no_version() {
     versions.commit("apply", &newer.lock, None).unwrap();
     std::fs::write(path, TOML.replace("192.0.2.1", "192.0.2.3")).unwrap();
     let mut again = Versions::open(&dir).unwrap();
-    let (config, from) = again.starting_config(path).unwrap();
+    let Start { config, from, .. } = again.starting_config(path).unwrap();
     assert_eq!(from, "version 2");
     assert_eq!(
         config.interfaces[0].ipv4.unwrap().0.to_string(),
@@ -135,7 +135,7 @@ fn a_lock_form_from_before_an_update_is_resolved_again_from_its_ruster_toml() {
         .commit("apply", "version = 1\nold-key = 3\n", Some(TOML))
         .unwrap();
     let mut again = Versions::open(&dir).unwrap();
-    let (config, from) = again.starting_config("/nonexistent").unwrap();
+    let Start { config, from, .. } = again.starting_config("/nonexistent").unwrap();
     assert_eq!(
         from,
         "version 2 (ruster.toml of version 1 resolved again at start-up)"
@@ -145,7 +145,8 @@ fn a_lock_form_from_before_an_update_is_resolved_again_from_its_ruster_toml() {
     assert_eq!(latest.lock, file::candidate(TOML).unwrap().lock);
     assert_eq!(latest.toml.as_deref(), Some(TOML));
 
-    // With a ruster.toml that does not read either, confd does not start.
+    // With a ruster.toml that does not read either, confd starts with the newest
+    // older version that reads, and says so.
     versions
         .commit(
             "apply",
@@ -153,11 +154,61 @@ fn a_lock_form_from_before_an_update_is_resolved_again_from_its_ruster_toml() {
             Some("[[interface]]\n"),
         )
         .unwrap();
-    let error = Versions::open(&dir)
+    let mut third = Versions::open(&dir).unwrap();
+    let start = third.starting_config("/nonexistent").unwrap();
+    assert_eq!(
+        start.from,
+        "version 3 (version 1 again at start-up: version 2 does not read)"
+    );
+    let warning = start.warning.unwrap();
+    assert!(warning.starts_with("version 2: "), "{warning}");
+    assert!(warning.contains("does not read either"), "{warning}");
+    assert_eq!(
+        third.latest().unwrap().lock,
+        file::candidate(TOML).unwrap().lock
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_latest_version_that_does_not_read_falls_back_to_an_older_one() {
+    let dir = state_dir("fallback");
+    let mut versions = Versions::open(&dir).unwrap();
+    let lock = file::candidate(TOML).unwrap().lock;
+    versions.commit("apply", &lock, None).unwrap();
+    // An older ruster's lock form, kept without its ruster.toml, waiting for
+    // `ruster confirm`.
+    versions
+        .set_waiting(Some(Waiting {
+            version: 3,
+            back_to: 1,
+            deadline: 4_000_000_000,
+            minutes: 5,
+        }))
+        .unwrap();
+    versions
+        .commit("apply", "version = 1\nold-key = 3\n", None)
+        .unwrap();
+    versions
+        .commit("apply", "version = 1\nold-key = 4\n", None)
+        .unwrap();
+
+    let mut again = Versions::open(&dir).unwrap();
+    let start = again.starting_config("/nonexistent").unwrap();
+    assert_eq!(start.config.interfaces[0].name, "lan");
+    assert_eq!(
+        start.from,
+        "version 4 (version 1 again at start-up: version 3 does not read)"
+    );
+    assert!(start.warning.unwrap().starts_with("version 3: "));
+    assert_eq!(again.waiting(), None);
+    // The next start uses the version kept, without a warning.
+    let next = Versions::open(&dir)
         .unwrap()
         .starting_config("/nonexistent")
-        .unwrap_err();
-    assert!(error.contains("does not read either"), "{error}");
+        .unwrap();
+    assert_eq!(next.from, "version 4");
+    assert_eq!(next.warning, None);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -221,7 +272,7 @@ fn a_waiting_version_resolved_again_at_start_up_still_waits() {
         .unwrap();
 
     let mut again = Versions::open(&dir).unwrap();
-    let (_, from) = again.starting_config("/nonexistent").unwrap();
+    let Start { from, .. } = again.starting_config("/nonexistent").unwrap();
     assert!(from.starts_with("version 3 "), "{from}");
     let moved = Waiting {
         version: 3,

@@ -136,3 +136,60 @@ fn the_dhcp_part_reads_back_the_same() {
         "only dhcp"
     );
 }
+
+/// Each key of `value` under `at`, with the types of its values, one line each. The
+/// items of a list are merged.
+fn shape(at: &str, value: &toml::Value, out: &mut std::collections::BTreeSet<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            out.insert(format!("{at}: table"));
+            for (key, value) in table {
+                shape(&format!("{at}.{key}"), value, out);
+            }
+        }
+        toml::Value::Array(items) => {
+            out.insert(format!("{at}: list"));
+            for item in items {
+                shape(&format!("{at}[]"), item, out);
+            }
+        }
+        other => {
+            out.insert(format!("{at}: {}", other.type_str()));
+        }
+    }
+}
+
+/// FNV-1a, 64 bits.
+fn fingerprint(text: &str) -> u64 {
+    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3)
+    })
+}
+
+#[test]
+fn the_lock_form_does_not_change_without_a_new_version() {
+    let text = include_str!("data/every-key.lock");
+    let lock = parse_lock(text)
+        .unwrap_or_else(|e| panic!("every-key.lock does not read; add the new keys to it: {e}"));
+    // As this ruster writes it, so that the shape is that of the types.
+    let written: toml::Value = toml::from_str(&lock.to_text()).unwrap();
+    let mut lines = std::collections::BTreeSet::new();
+    shape("", &written, &mut lines);
+    for list in lines.iter().filter_map(|line| line.strip_suffix(": list")) {
+        let item = format!("{list}[]:");
+        assert!(
+            lines.iter().any(|line| line.starts_with(&item)),
+            "{list} has no item in every-key.lock"
+        );
+    }
+    let shape = lines.into_iter().collect::<Vec<_>>().join("\n");
+    let found = fingerprint(&shape);
+    assert_eq!(
+        found,
+        ruster_config::LOCK_SHAPE,
+        "\n{shape}\n\nThe lock form changed. If a lock form of version {} written \
+         before this change may not read after it, raise ruster_config::VERSION. Either \
+         way, set ruster_config::LOCK_SHAPE to {found:#018x}.",
+        ruster_config::VERSION
+    );
+}

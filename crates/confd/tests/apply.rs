@@ -3,7 +3,7 @@
 use std::os::unix::net::UnixStream;
 
 use ruster_confd::apply::{Apply, ANSWER_WAIT_MS, GIVE_UP_MS};
-use ruster_confd::versions::Versions;
+use ruster_confd::versions::{Start, Versions};
 use ruster_confd::{file, Confd};
 use ruster_proto::coap::Code;
 use ruster_proto::session::{Client, Event, Hook, Server, Store};
@@ -328,7 +328,7 @@ fn the_versions_outlive_confd() {
     // confd started again: the file is not read, the latest version is used.
     let mut versions = Versions::open(&dir).unwrap();
     assert_eq!(versions.list().len(), 2);
-    let (config, from) = versions
+    let Start { config, from, .. } = versions
         .starting_config("/nonexistent/router.toml")
         .unwrap();
     assert_eq!(from, "version 2");
