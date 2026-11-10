@@ -66,6 +66,14 @@
 //!                              # that sends the session and its IPv4 address
 //! # mac is the parent's and mtu its less 8 when left out; no ipv4
 //!
+//! [[interface]]                # a bridge and its own interface (IRB), after its members
+//! name = "br0"
+//! bridge = { members = ["lan", "lan.10"] }  # ports and VLANs with no address
+//! ipv4 = "192.0.2.1/24"        # optional: the IRB routes like any interface
+//! # mac is the first member's and mtu the smallest member's when left out. In bridge, optional:
+//! # aging-time = 300 (seconds a learned address is used without being seen),
+//! # max-learned = 4096, static-mac = [{ mac = "02:...", interface = "lan" }]
+//!
 //! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
 //! interface = "map"            # the tunnel interface it makes
 //! inside = "lan"               # the NAT's inside
@@ -493,7 +501,12 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x4f81_7b1d_1dae_7483;
+pub const LOCK_SHAPE: u64 = 0x540b_f491_e936_b3c4;
+
+/// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
+pub const BRIDGE_AGING_TIME: u32 = 300;
+/// The most addresses a bridge learns.
+pub const BRIDGE_MAX_LEARNED: u32 = 4_096;
 
 /// The MTU of an interface that names none, and the most the FE takes (frames of
 /// up to 1514 bytes).
@@ -777,6 +790,28 @@ pub enum Kind {
     /// A PPPoE session on a port or VLAN, whose session and IPv4 address the
     /// source (of kind `pppoe`) sends.
     Pppoe { parent: String, source: String },
+    /// A bridge, and its own interface (IRB) of the same name.
+    Bridge(Bridge),
+}
+
+/// A bridge (`docs/design/overlay.md`): its members (ports and VLANs), how long a
+/// learned address is used without being seen (seconds), the most addresses it
+/// learns, and the addresses fixed to a member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Bridge {
+    pub members: Vec<String>,
+    pub aging_time: u32,
+    pub max_learned: u32,
+    pub static_mac: Vec<StaticMac>,
+}
+
+/// A MAC address fixed to a member of a bridge.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct StaticMac {
+    pub mac: String,
+    pub interface: String,
 }
 
 /// A MAP-E CE (RFC 7597): one Basic Mapping Rule, the delegated prefix, the BR.

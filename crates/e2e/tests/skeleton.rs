@@ -85,6 +85,7 @@ fn config() -> Config {
         map_e_from: None,
         dns_found: Vec::new(),
         bgp: None,
+        bridges: Vec::new(),
     }
 }
 

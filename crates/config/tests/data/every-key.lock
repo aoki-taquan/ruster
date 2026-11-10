@@ -58,6 +58,18 @@ ipv6 = []
 ipv6-from = []
 kind = { pppoe = { parent = "lan", source = "pppoe-wan" } }
 
+[[interface]]
+name = "br0"
+mac = "02:00:00:00:00:04"
+mtu = 1492
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { bridge = { members = ["lan.10"], aging-time = 300, max-learned = 4096, static-mac = [{ mac = "02:00:00:00:00:10", interface = "lan.10" }] } }
+
 [[map-e]]
 interface = "map-e"
 inside = "lan"

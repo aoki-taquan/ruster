@@ -40,6 +40,7 @@ use ruster_proto::task::{Progress, Task};
 
 pub mod apply;
 pub mod bgp;
+pub mod bridge;
 pub mod delegated;
 pub mod dhcp6;
 pub mod dhcp_client;
@@ -166,6 +167,8 @@ pub struct Config {
     pub dns_found: Vec<IpAddr>,
     /// BGP, checked; confd hands it to `ruster-frr` ([`bgp`]).
     pub bgp: Option<ruster_config::Bgp>,
+    /// The bridges, checked; their own interfaces are in `interfaces` ([`bridge`]).
+    pub bridges: Vec<bridge::Bridge>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -620,6 +623,7 @@ impl Confd {
     /// The interface tables, the firewall rules (numbered from 1 in order) and NAT.
     fn fe_tables(&self) -> BTreeMap<Key, Value> {
         let mut out = self.interface_tables();
+        bridge::tables(&self.current.bridges, &mut out);
         if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.current.icmp_errors {
             out.insert(
                 Key::IcmpErrors {
@@ -839,6 +843,10 @@ impl Confd {
                     ),
                 },
             );
+            // A bridge member has no address, not even a link-local one.
+            if bridge::is_member(&self.current.bridges, &interface.name) {
+                continue;
+            }
             let link_local = (IpAddr::V6(link_local(interface.mac)), 64);
             let addresses = self
                 .ipv4(interface)
@@ -1204,6 +1212,7 @@ mod tests {
             map_e_from: None,
             dns_found: Vec::new(),
             bgp: None,
+            bridges: Vec::new(),
         });
         let routes = confd.routes();
         let connected = Value::Route(RouteAction::Forward(vec![NextHop {
@@ -1268,6 +1277,7 @@ mod tests {
             map_e_from: None,
             dns_found: Vec::new(),
             bgp: None,
+            bridges: Vec::new(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
         let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);

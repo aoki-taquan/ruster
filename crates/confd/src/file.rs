@@ -240,6 +240,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let sources = crate::source::specs(lock.source)?;
     let mut seen = Seen::default();
     let mut interfaces = Vec::with_capacity(lock.interface.len());
+    let mut bridges = Vec::new();
     for entry in lock.interface {
         let at = format!("interface {:?}", entry.name);
         if entry.name.is_empty() || entry.name.len() > 255 {
@@ -255,6 +256,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         let mut pppoe = None;
         match &entry.kind {
             Kind::Port => {}
+            Kind::Bridge(bridge) => bridges.push((entry.name.clone(), bridge.clone())),
             Kind::Vlan { parent, id } => {
                 let id = *id;
                 if !(1..=4094).contains(&id) {
@@ -854,6 +856,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
     let dhcp_client = crate::dhcp_client::check(lock.dhcp_client, &interfaces, &sources)?;
     let bgp = crate::bgp::check(lock.bgp, &interfaces)?;
+    let bridges = crate::bridge::check(bridges, &interfaces)?;
     // The FE takes at most this many punt classes besides its own.
     if dhcp.len()
         + dhcp6.len()
@@ -884,6 +887,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         dhcp_client,
         map_e_from,
         bgp,
+        bridges,
         dns_found: Vec::new(),
     })
 }
