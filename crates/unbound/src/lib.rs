@@ -92,9 +92,10 @@ pub fn settings(dns: Option<&Dns>) -> Result<String, String> {
     Ok(out)
 }
 
-/// How long the command may take; it is stopped after this and counts as failed,
-/// well before confd stops waiting for an answer (30 s).
-pub const COMMAND_LIMIT: Duration = Duration::from_secs(20);
+/// How long the command may take; it is stopped after this and counts as failed.
+/// The command and the run that puts the file before back fit together before confd
+/// stops waiting for an answer (30 s).
+pub const COMMAND_LIMIT: Duration = Duration::from_secs(12);
 
 /// Writes the file and runs the command that has Unbound read it.
 #[derive(Debug)]
