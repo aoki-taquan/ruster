@@ -134,8 +134,8 @@ backlogのまま置き、使う場面が出たものから片付ける。
 次はルータ箱としての組み立て（2026-11-10 charterに追加）。順番は[`router-box.md`](router-box.md)の
 「作る順番」に従う。lockの形（版1）、confdが各プロセスへ担当の部分を渡すsocket（`confd/part.sock`）、
 Unboundの橋渡し役（`ruster-unbound`、netns `dns`）と、Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`、
-netns `dhcp`）まで済んだ。候補、差分、確定を分けるのはまだで、新しい設定はどれかが断ったら前に戻すだけ。
-次は「作る順番」の3の残り（DHCPv6のリレーと、neighdのRA）。
+netns `dhcp`）、neighdのRA（`[[ra]]`、netns `ra`）まで済んだ。候補、差分、確定を分けるのはまだで、
+新しい設定はどれかが断ったら前に戻すだけ。次は「作る順番」の3の残り（DHCPv6のリレー）。
 
 `ruster-pppoed`（「作る順番」の6）は、制御の部分だけを先に作った。Discovery、LCP、PAPとCHAP、IPCP、IPv6CPで
 セッションを張り、得た値を標準出力の行に書く（netns `pppoed`）。設定はまだ専用のファイルから読む。残りは、

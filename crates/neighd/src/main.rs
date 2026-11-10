@@ -1,15 +1,19 @@
-//! `ruster-neighd [--run-dir DIR]`: ARP for the FE.
+//! `ruster-neighd [--run-dir DIR]`: ARP, Neighbor Discovery and Router
+//! Advertisements for the FE.
 //!
-//! neighd writes the FE's neighbor table, takes ARP from the FE on `neighd/punt.sock`
-//! and sends frames back to `fe/punt/arp-nd.sock`. confd gives it the interfaces and addresses
-//! on `neighd/config.sock`.
+//! neighd writes the FE's neighbor table, takes ARP and ND from the FE on
+//! `neighd/punt.sock` and sends frames back to `fe/punt/arp-nd.sock`. confd gives it
+//! the interfaces and addresses on `neighd/config.sock`, and the Router
+//! Advertisements as the `ra` part on `confd/part.sock`, which neighd connects to
+//! once confd is there, and again every second when confd goes away.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
+use ruster_confd::part::{Client, Module};
 use ruster_neighd::Neighd;
 use ruster_proto::daemon::{self, socket, Clock};
-use ruster_proto::task::Task;
+use ruster_proto::task::{Progress, Task};
 
 /// How long to wait for the FE at start-up.
 const FE_WAIT: Duration = Duration::from_secs(10);
@@ -36,6 +40,8 @@ fn run() -> Result<(), String> {
     let mut last_report = 0;
     let mut reported = neighd.counters();
     let mut retry = daemon::Retry::default();
+    let mut part: Option<Client> = None;
+    let mut part_retry = daemon::Retry::default();
     let mut idle = daemon::Idle::new();
     loop {
         let now = clock.now_ms();
@@ -60,7 +66,29 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        let progress = neighd.step(now);
+        if part.as_ref().is_none_or(Client::is_closed) && part_retry.due(now) {
+            part = daemon::try_connect(&path(socket::CONFD_PART))
+                .and_then(|stream| Client::new(stream, Module::Ra).ok());
+        }
+        let mut taken = Progress::IDLE;
+        if let Some(client) = &mut part {
+            let polled = client.poll(&mut |text| {
+                let result = neighd.take_ra(text);
+                match &result {
+                    Ok(()) => eprintln!("ruster-neighd: took the ra part"),
+                    Err(error) => eprintln!("ruster-neighd: refused the ra part: {error}"),
+                }
+                result
+            });
+            match polled {
+                Ok(progress) => taken = progress,
+                Err(error) => {
+                    eprintln!("ruster-neighd: {error}");
+                    part = None;
+                }
+            }
+        }
+        let progress = neighd.step(now).and(taken);
         if now.saturating_sub(last_report) >= 5_000 && neighd.counters() != reported {
             reported = neighd.counters();
             last_report = now;

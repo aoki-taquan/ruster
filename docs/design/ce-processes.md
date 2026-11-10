@@ -172,9 +172,10 @@ NDでは、使われている近隣だけを確かめ直す（RFC 4861の状態�
 - neighdがDADを行い、結果をconfdへ返す。confdは「使える」か「重複」に書き換える。
 - `ietf-ip`のアドレスの状態（tentative、preferred、duplicateなど）をそのまま使う。
 
-### 扱わないもの
+### RA（ルータ広告）
 
-RA（ルータ広告）を送るのも受けるのもneighdではない。外のデーモンの仕事。
+LANへのRA（RFC 4861の6.2）はneighdが送る。設定は全体の設定の`[[ra]]`で、neighdは`confd/part.sock`の
+モジュール`ra`で受け取る（[`router-box.md`](router-box.md)の「自作の制御」）。ほかのルータのRAは読まない。
 
 ## `ruster`（CLI）
 
