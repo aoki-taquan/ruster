@@ -420,7 +420,8 @@ where
     /// Whether the link of `interface` is up, given whether each port's link is up
     /// (`ports_up`, in port order): down when the current tables do not enable it;
     /// a VLAN sub-interface's follows its parent's; an IRB's is up while one of its
-    /// members' is; another's (a tunnel's) is up.
+    /// members' is, a tunnel member counting as up; another's (a tunnel's, a PPPoE
+    /// session's, which IS-IS and OSPF do not run on) is up.
     pub fn link_up(&self, interface: &str, ports_up: &[bool]) -> bool {
         interface_id(&self.interface_names, interface)
             .is_some_and(|id| self.interface_link_up(id, ports_up))
