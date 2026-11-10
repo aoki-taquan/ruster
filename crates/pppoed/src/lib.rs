@@ -14,6 +14,8 @@
 //! - [`auth`]: PAP (RFC 1334) and CHAP with MD5 (RFC 1994).
 //! - [`ipcp`]: IPv4 address and DNS servers (RFC 1332, RFC 1877).
 //! - [`ipv6cp`]: IPv6 interface identifiers (RFC 5072).
+//! - [`session`]: one session through all of the above, started again when it
+//!   ends.
 //!
 //! # Standards
 //!
@@ -26,6 +28,7 @@ pub mod ipcp;
 pub mod ipv6cp;
 pub mod lcp;
 pub mod ppp;
+pub mod session;
 
 /// An Ethernet MAC address.
 pub type Mac = [u8; 6];
