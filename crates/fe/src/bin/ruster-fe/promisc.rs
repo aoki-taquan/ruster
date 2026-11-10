@@ -25,7 +25,9 @@ use std::os::fd::OwnedFd;
 /// The sockets that keep ports in promiscuous mode, by port name.
 #[derive(Default)]
 pub struct Promiscuous {
-    held: BTreeMap<String, OwnedFd>,
+    /// The socket of each port, with the device's index when it was opened: a
+    /// device made again under the same name lost the membership.
+    held: BTreeMap<String, (u32, OwnedFd)>,
     /// The last error for each port, written once until it changes.
     errors: BTreeMap<String, String>,
 }
@@ -33,8 +35,8 @@ pub struct Promiscuous {
 impl Promiscuous {
     /// Keeps exactly the ports `wanted` in promiscuous mode.
     pub fn keep(&mut self, wanted: &[String]) {
-        self.held.retain(|port, _| {
-            let keep = wanted.contains(port);
+        self.held.retain(|port, (index, _)| {
+            let keep = wanted.contains(port) && crate::if_index(port).ok() == Some(*index);
             if !keep {
                 eprintln!("ruster-fe: {port} leaves promiscuous mode");
             }
@@ -45,12 +47,14 @@ impl Promiscuous {
             if self.held.contains_key(port) {
                 continue;
             }
-            let held = crate::if_index(port)
-                .and_then(|index| imp::hold(index).map_err(|error| error.to_string()));
+            let held = crate::if_index(port).and_then(|index| {
+                let socket = imp::hold(index).map_err(|error| error.to_string())?;
+                Ok((index, socket))
+            });
             match held {
-                Ok(socket) => {
-                    eprintln!("ruster-fe: {port} is in promiscuous mode (a bridge member)");
-                    self.held.insert(port.clone(), socket);
+                Ok(held) => {
+                    eprintln!("ruster-fe: {port} is in promiscuous mode");
+                    self.held.insert(port.clone(), held);
                     self.errors.remove(port);
                 }
                 Err(text) => {
