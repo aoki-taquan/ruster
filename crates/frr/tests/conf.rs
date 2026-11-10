@@ -257,7 +257,7 @@ fn a_check_shows_the_diff_with_passwords_hidden_and_writes_nothing() {
     let text = bridge.check(&part).unwrap();
     assert!(text.contains("+router bgp 65001"), "{text}");
     assert!(
-        text.contains("+ neighbor 198.51.100.10 password (hidden)"),
+        text.contains("+ neighbor 198.51.100.10 password (hidden, changed)"),
         "{text}"
     );
     assert!(!text.contains("secret1"), "{text}");
@@ -274,6 +274,23 @@ fn a_check_shows_the_diff_with_passwords_hidden_and_writes_nothing() {
     )
     .unwrap();
     // Only the password differs, and it is not shown.
+    let text = bridge.check(&part).unwrap();
+    assert!(
+        text.contains("+ neighbor 198.51.100.10 password (hidden, changed)"),
+        "{text}"
+    );
+    assert!(!text.contains("secret"), "{text}");
+    std::fs::write(
+        &file,
+        config(
+            Some(&with_include),
+            &connected(),
+            " neighbor 198.51.100.10 password secret1\n",
+            2620,
+        )
+        .unwrap(),
+    )
+    .unwrap();
     assert_eq!(bridge.check(&part).unwrap(), "");
     let _ = std::fs::remove_dir_all(&dir);
 }

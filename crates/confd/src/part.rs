@@ -19,8 +19,8 @@
 //!
 //! A check is the candidate step of `docs/design/router-box.md`, "反映の流れ": the
 //! process works out what the part would change against what it holds now (its
-//! files, its sessions), and takes nothing. `ruster diff` shows the answers, and
-//! `ruster apply` sends nothing when one refuses ([`crate::apply`]). A check cannot
+//! files, its sessions), and takes nothing. An answer too long for one message is
+//! cut, saying so. `ruster diff` and `ruster apply` use the answers ([`crate::apply`]). A check cannot
 //! foresee everything: the software a bridge drives may still refuse the file when
 //! it reads it, which the answer to the PUT then says.
 //! A refusal is handled like one from the FE, ribd or neighd: if it is for a new
@@ -537,9 +537,10 @@ impl Client {
                     }
                 }
                 (Code::POST, [name, "check"]) if *name == self.module.name() => {
+                    let limit = self.conn.peer_limit().unwrap_or(LIMIT);
                     match text.and_then(|part| answer(Asked::Check(part))) {
-                        Ok(changes) => (Code::CONTENT, changes),
-                        Err(reason) => (Code::BAD_REQUEST, reason),
+                        Ok(changes) => (Code::CONTENT, cut(changes, limit)),
+                        Err(reason) => (Code::BAD_REQUEST, cut(reason, limit)),
                     }
                 }
                 _ => (Code::NOT_FOUND, String::new()),
@@ -550,4 +551,21 @@ impl Client {
         busy |= self.conn.pump().unwrap_or(false);
         Ok(Progress::busy(busy))
     }
+}
+
+/// `text` cut to fit a message confd takes (`limit` bytes, less room for the
+/// header), saying how much was left out.
+fn cut(mut text: String, limit: usize) -> String {
+    let room = limit.saturating_sub(1_024);
+    if text.len() <= room {
+        return text;
+    }
+    let mut at = room.saturating_sub(64);
+    while !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let left = text.len() - at;
+    text.truncate(at);
+    text.push_str(&format!("\n(cut: {left} more bytes)\n"));
+    text
 }

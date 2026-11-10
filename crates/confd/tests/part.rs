@@ -347,3 +347,30 @@ fn changes_names_the_entries_that_start_change_and_stop() {
         ""
     );
 }
+
+#[test]
+fn a_long_check_answer_is_cut_to_fit() {
+    use ruster_confd::part::Checked;
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut confd = Confd::new(file::parse(&text(1500, "192.0.2.53")).unwrap());
+    confd.attach_part(Module::Dns, a).unwrap();
+    let mut client = Client::new(b, Module::Dns).unwrap();
+    let mut answer = |asked: Asked<'_>| match asked {
+        Asked::Check(_) => Ok("x".repeat(2 << 20)),
+        Asked::Take(_) => Ok(String::new()),
+    };
+    for _ in 0..50 {
+        confd.step(0);
+        client.poll(&mut answer).unwrap();
+    }
+    confd.check_parts(&file::parse(&text(1500, "192.0.2.54")).unwrap());
+    for _ in 0..200 {
+        confd.step(0);
+        client.poll(&mut answer).unwrap();
+    }
+    let Some(Checked::Changes(said)) = confd.part_checks().get(&Module::Dns) else {
+        panic!("{:?}", confd.part_checks().get(&Module::Dns));
+    };
+    assert!(said.ends_with(" more bytes)\n"), "cut");
+    assert!(!client.is_closed());
+}

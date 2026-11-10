@@ -309,15 +309,15 @@ impl Daemon {
         ribd.set(changes);
     }
 
-    /// Takes a new `dhcpc` part: interfaces whose settings are the same keep their
-    /// clients, the others start again, and those no longer there give their leases
-    /// back.
     /// What taking a `dhcpc` part would change ([`changes`]).
     fn check(&self, text: &str) -> Result<String, String> {
         let before: Vec<DhcpClient> = self.interfaces.iter().map(|i| i.entry.clone()).collect();
         changes(&before, text)
     }
 
+    /// Takes a new `dhcpc` part: interfaces whose settings are the same keep their
+    /// clients, the others start again, and those no longer there give their leases
+    /// back.
     fn take(&mut self, text: &str, now: u64) -> Result<(), String> {
         let entries = ruster_config::parse_dhcp_client_part(text)?;
         let mut fresh = Vec::with_capacity(entries.len());

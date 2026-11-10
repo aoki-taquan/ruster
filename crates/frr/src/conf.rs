@@ -222,9 +222,9 @@ impl Bridge {
 
     /// What taking an `frr` part would change: the line diff of `frr.conf`, or the
     /// reason it would be refused. Nothing is written, and FRR is not asked; it may
-    /// still refuse the file when it reads it. What follows the word `password` on a
-    /// line is not shown (the include may hold passwords), so a changed password
-    /// shows as no change.
+    /// still refuse the file when it reads it. What follows a word such as
+    /// `password` or `key-string` on a line is not shown (the include may hold
+    /// secrets); a line whose secret changes shows as `(hidden, changed)`.
     pub fn check(&self, part: &str) -> Result<String, String> {
         let (bgp, connected) = ruster_config::parse_frr_part(part)?;
         let include = match bgp.as_ref().and_then(|b| b.include.first()) {
@@ -239,8 +239,8 @@ impl Bridge {
         };
         let name = self.path.display().to_string();
         Ok(ruster_confd::diff::lines(
-            &hide_passwords(&before),
-            &hide_passwords(&text),
+            &hide_secrets(&before, &before),
+            &hide_secrets(&text, &before),
             (&name, "candidate"),
         ))
     }
@@ -386,17 +386,33 @@ fn read_include(path: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// `text` with what follows the word `password` on each line replaced by `(hidden)`.
-fn hide_passwords(text: &str) -> String {
+/// The words after which FRR's configuration holds a secret.
+const SECRET_WORDS: [&str; 7] = [
+    "password",
+    "area-password",
+    "domain-password",
+    "key-string",
+    "authentication-key",
+    "md5",
+    "community",
+];
+
+/// `text` with what follows a word of [`SECRET_WORDS`] on each line replaced by
+/// `(hidden)`, or by `(hidden, changed)` when the line is not in `before`.
+fn hide_secrets(text: &str, before: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for line in text.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
-        match words.iter().position(|w| *w == "password") {
+        match words.iter().position(|w| SECRET_WORDS.contains(w)) {
             Some(at) => {
                 let indent = &line[..line.len() - line.trim_start().len()];
                 out.push_str(indent);
                 out.push_str(&words[..=at].join(" "));
-                out.push_str(" (hidden)");
+                if before.lines().any(|b| b == line) {
+                    out.push_str(" (hidden)");
+                } else {
+                    out.push_str(" (hidden, changed)");
+                }
             }
             None => out.push_str(line),
         }
