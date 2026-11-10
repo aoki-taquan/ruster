@@ -74,7 +74,7 @@ fn run() -> Result<(), String> {
         bridge = bridge.with_dhcp6(server, listen6);
     }
 
-    let path = run_dir.join(socket::CONFD_PART);
+    let path = run_dir.join(socket::confd_part(Module::Dhcp.name()));
     let stream = daemon::connect(&path, CONFD_WAIT).map_err(|e| format!("connecting: {e}"))?;
     let mut client = Client::new(stream, Module::Dhcp).map_err(|e| e.to_string())?;
     let clock = Clock::new();

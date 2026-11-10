@@ -37,7 +37,7 @@ socketはルータのプロセスだけが開けるようにする。決まり�
 | 置き方 | 用意すること |
 |---|---|
 | 全部をrootで動かす（netnsの試験） | 無し。グループもrootになる |
-| プロセスごとにユーザーを分ける | ルータのプロセスが共有するグループ（例: `ruster`）を作り、各プロセスをそのグループで動かす。一番上のディレクトリと、各プロセスのディレクトリ（下の表の作るsocketの一段目）を先に作る。一番上はグループとset-group-IDの印を付けて2750、各プロセスのディレクトリはそのプロセスのユーザーの持ち物で2750（systemdならtmpfiles.dで`d /run/ruster 2750 root ruster`、`d /run/ruster/ribd 2750 ribd ruster`など） |
+| プロセスごとにユーザーを分ける | ルータのプロセスが共有するグループ（例: `ruster`）を作り、各プロセスをそのグループで動かす。一番上のディレクトリと、各プロセスのディレクトリ（下の表の作るsocketの一段目）を先に作る。一番上はグループとset-group-IDの印を付けて2750、各プロセスのディレクトリはそのプロセスのユーザーの持ち物で2750。さらに、部分と送り手のディレクトリを、使うプロセスだけのグループで作る（下の「部分と送り手のsocket」） |
 
 一番上をグループが書けるようにはしない。書けると、グループのプロセスがほかのプロセスのディレクトリを
 先に作ったり置き換えたりして、そのプロセスのふりができる。各プロセスは自分のディレクトリの下
@@ -53,18 +53,48 @@ FEと、TUNを作る`confd --kernel`（capabilityで絞ってもよい）。`rus
 | プロセス | ユーザー | 作るsocket | つなぐ、送るsocket |
 |---|---|---|---|
 | `ruster-fe` | root | `fe/config.sock`、`fe/route.sock`、`fe/neigh.sock`、`fe/state.sock`、`fe/punt/*.sock` | 各プロセスの`<名前>/punt.sock` |
-| `ruster-confd` | root（`--kernel`）、無ければ専用 | `confd/config.sock`、`confd/part.sock`、`confd/source/*.sock` | `fe/config.sock`、`neighd/config.sock`、`ribd/source/confd.sock` |
-| `ruster-ribd` | 専用 | `ribd/source/*.sock` | `fe/route.sock` |
-| `ruster-neighd` | 専用 | `neighd/config.sock`、`neighd/punt.sock` | `fe/neigh.sock`、`fe/punt/arp-nd.sock`、`confd/part.sock` |
-| `ruster-pppoed`、`ruster-dhcpc` | 専用 | `<名前>/punt.sock` | `fe/punt/<名前>.sock`、`confd/part.sock`、`confd/source/*.sock`、`ribd/source/<名前>.sock` |
-| `ruster-kea` | 専用 | `kea/punt.sock` | `fe/punt/kea.sock`、`confd/part.sock` |
-| `ruster-unbound`、`ruster-frr` | 専用（上の権限付き） | 無し | `confd/part.sock`（frrは`ribd/source/frr.sock`も） |
-| `ruster`（CLI） | グループの運用者 | 無し | `confd/config.sock`、`fe/state.sock`、`confd/source/*.sock`、`ribd/source/*.sock` |
+| `ruster-confd` | root（`--kernel`）、無ければ専用 | `confd/config.sock`、`confd/part/<モジュール>/part.sock`、`confd/source/<送り手>/source.sock` | `fe/config.sock`、`neighd/config.sock`、`ribd/source/confd/source.sock` |
+| `ruster-ribd` | 専用 | `ribd/source/<送り手>/source.sock` | `fe/route.sock` |
+| `ruster-neighd` | 専用 | `neighd/config.sock`、`neighd/punt.sock` | `fe/neigh.sock`、`fe/punt/arp-nd.sock`、`confd/part/ra/part.sock` |
+| `ruster-pppoed` | 専用 | `pppoed/punt.sock` | `fe/punt/pppoed.sock`、`confd/part/pppoe/part.sock`、`confd/source/<設定の送り手>/source.sock`、`ribd/source/pppoed/source.sock` |
+| `ruster-dhcpc` | 専用 | `dhcpc/punt.sock` | `fe/punt/dhcpc.sock`、`confd/part/dhcpc/part.sock`、`confd/source/<設定の送り手>/source.sock`、`ribd/source/dhcpc/source.sock` |
+| `ruster-kea` | 専用 | `kea/punt.sock` | `fe/punt/kea.sock`、`confd/part/dhcp/part.sock` |
+| `ruster-unbound` | 専用（上の権限付き） | 無し | `confd/part/dns/part.sock` |
+| `ruster-frr` | 専用（上の権限付き） | 無し | `confd/part/frr/part.sock`、`ribd/source/frr/source.sock` |
+| `ruster`（CLI） | グループの運用者 | 無し | `confd/config.sock`、`fe/state.sock`、`confd/source/<送り手>/source.sock`、`ribd/source/<送り手>/source.sock` |
 
-限界: グループは一つなので、グループに入ったプロセスはどのsocketも開ける。たとえば`ruster-unbound`も
-`confd/part.sock`から`pppoe`の部分（パスワード）を受け取れ、`fe/route.sock`へ書ける。プロセスごとに
-開けるsocketを絞るには、socketをグループの違うディレクトリに分ける必要があり、まだしていない。
-接続の相手のユーザーを確かめる方法（`SO_PEERCRED`）は、Rustの標準libraryでは安定していないので使わない。
+### 部分と送り手のsocket
+
+confdが担当の部分を渡すsocketと、confdとribdが送り手の値を受けるsocketは、モジュールや送り手ごとに
+ディレクトリを分けて置く（`confd/part/<モジュール>/`、`confd/source/<送り手>/`、`ribd/source/<送り手>/`）。
+socketを作るのは今までどおりconfdとribdで、ディレクトリが無ければ作る。運用者がそのディレクトリを先に、
+使うプロセスだけが入るグループで作っておくと、そのsocketはそのプロセス（と作る側）だけが開ける。
+
+たとえば`pppoe`の部分（PPPoEのパスワードを含む）を`ruster-pppoed`だけに渡すには、`pppoed`ユーザーだけが入る
+グループ`pppoed`を使い、systemdのtmpfiles.dに次のように書く。
+
+```
+d /run/ruster                        2750 root   ruster -
+d /run/ruster/confd                  2750 confd  ruster -
+d /run/ruster/confd/part             2750 confd  ruster -
+d /run/ruster/confd/part/pppoe       2750 confd  pppoed -
+d /run/ruster/confd/source           2750 confd  ruster -
+d /run/ruster/confd/source/pppoe-wan 2750 confd  pppoed -
+d /run/ruster/ribd                   2750 ribd   ruster -
+d /run/ruster/ribd/source            2750 ribd   ruster -
+d /run/ruster/ribd/source/pppoed     2750 ribd   pppoed -
+```
+
+- set-group-IDの印があるので、confdが作る`part.sock`のグループは`pppoed`になる。0660なので、開けるのは
+  持ち主のconfdとグループの`pppoed`だけ。ほかのプロセスは、`ruster`グループでもディレクトリに入れない。
+- 上の段（`/run/ruster`、`confd`、`confd/part`）は、全部のプロセスが通れるように`ruster`グループのまま。
+- `ruster source`で手で値を書く運用者は、その送り手のグループにも入る。
+- confdは、socketの名前が示すモジュールしか渡さない（`dns`のsocketで`pppoe`を名乗っても断る）。
+- ほかのモジュールと送り手も同じように絞れる。絞らないディレクトリは、上から`ruster`グループを引き継ぐ。
+
+限界: 上の表の`fe/*.sock`や`neighd/config.sock`などは、今もグループの全部のプロセスが開ける。たとえば
+`ruster-unbound`も`fe/route.sock`へ書ける。接続の相手のユーザーを確かめる方法（`SO_PEERCRED`）は、
+Rustの標準libraryでは安定していないので使わない。
 
 ## `ruster-confd`（設定管理）
 
@@ -99,7 +129,7 @@ FEに書く表は「設定」と「動的な値」から計算する。
 送り手 pppoe-wan1 { 種類 pppoe; 親 eth1; }
 ```
 
-- 送り手ごとに`/run/ruster/confd/source/<名前>.sock`ができる。外のデーモンはそこへ書く。
+- 送り手ごとに`/run/ruster/confd/source/<名前>/source.sock`ができる（「部分と送り手のsocket」）。外のデーモンはそこへ書く。
   値は表の行として書き（`ruster-source`の表、鍵は送り手の名前）、それぞれに有効期限（秒）を付ける。
   confdは受け取った時から数え、送り直されたら数え直す（`crates/confd/src/source.rs`）。
 - 送り手の種類ごとに、書ける値が決まっている。
@@ -122,7 +152,7 @@ FEに書く表は「設定」と「動的な値」から計算する。
 
 APIやCLIから候補を受け、各プロセスへ候補、差分、確定を配る。目指す形と今の作り（差分、版、確認付きの反映）は
 [`router-box.md`](router-box.md)の「反映の流れ」に書く。
-FE、ribd、neighdへは表として書き、橋渡し役などへは`confd/part.sock`で担当のモジュールの部分を渡す。
+FE、ribd、neighdへは表として書き、橋渡し役などへは`confd/part/<モジュール>/part.sock`で担当のモジュールの部分を渡す。
 confd自身の担当の部分は自分で検証し（YANGの制約、参照先があるか、意味の矛盾）、差分（FEの表がどう変わるか、
 ribdへ渡す経路）を出し、確定したらFEへ反映する。受け取った設定は番号付きの版としてファイルに残す。
 
@@ -160,7 +190,7 @@ confd再起動
 | DHCP client、PPPoE | default経路 |
 | ルーティングデーモン | BGP、OSPFなどの経路 |
 
-送り手の宣言とsocketの分け方はconfdと同じ（`/run/ruster/ribd/source/<名前>.sock`）。
+送り手の宣言とsocketの分け方はconfdと同じ（`/run/ruster/ribd/source/<名前>/source.sock`）。
 
 ### 選び方
 
@@ -224,8 +254,8 @@ NDでは、使われている近隣だけを確かめ直す（RFC 4861の状態�
 
 ### RA（ルータ広告）
 
-LANへのRA（RFC 4861の6.2）はneighdが送る。設定は全体の設定の`[[ra]]`で、neighdは`confd/part.sock`の
-モジュール`ra`で受け取る（[`router-box.md`](router-box.md)の「自作の制御」）。ほかのルータのRAは読まない。
+LANへのRA（RFC 4861の6.2）はneighdが送る。設定は全体の設定の`[[ra]]`で、neighdは`confd/part/ra/part.sock`で
+モジュール`ra`を受け取る（[`router-box.md`](router-box.md)の「自作の制御」）。ほかのルータのRAは読まない。
 
 ## `ruster`（CLI）
 

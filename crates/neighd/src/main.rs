@@ -4,7 +4,7 @@
 //! neighd writes the FE's neighbor table, takes ARP and ND from the FE on
 //! `neighd/punt.sock` and sends frames back to `fe/punt/arp-nd.sock`. confd gives it
 //! the interfaces and addresses on `neighd/config.sock`, and the Router
-//! Advertisements as the `ra` part on `confd/part.sock`, which neighd connects to
+//! Advertisements as the `ra` part on `confd/part/ra/part.sock`, which neighd connects to
 //! once confd is there, and again every second when confd goes away.
 
 use std::process::ExitCode;
@@ -67,7 +67,7 @@ fn run() -> Result<(), String> {
             }
         }
         if part.as_ref().is_none_or(Client::is_closed) && part_retry.due(now) {
-            part = daemon::try_connect(&path(socket::CONFD_PART))
+            part = daemon::try_connect(&path(&socket::confd_part(Module::Ra.name())))
                 .and_then(|stream| Client::new(stream, Module::Ra).ok());
         }
         let mut taken = Progress::IDLE;

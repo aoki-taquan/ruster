@@ -7,7 +7,7 @@
 //! nothing), split at spaces. It listens for zebra's FPM connection on
 //! 127.0.0.1:PORT (2620 when not given), taking it only from a socket of user ID
 //! UID (the `frr` user's when not given; `any` takes every one), and gives the
-//! routes to ribd as the route source `frr` (`ribd/source/frr.sock`; start ribd
+//! routes to ribd as the route source `frr` (`ribd/source/frr/source.sock`; start ribd
 //! with `frr:PREFERENCE:65000`: ruster-frr says it has sent everything only once
 //! zebra's routes are in, which may take up to 60 s after it starts). Run it in the
 //! router's kernel namespace, where zebra runs. It tells systemd it is ready once
@@ -74,7 +74,7 @@ fn run() -> Result<(), String> {
     let mut fpm = Fpm::bind(port, owner).map_err(|e| format!("FPM port {port}: {e}"))?;
     let mut ribd = Writer::new(run_dir.join(socket::ribd_source(SOURCE)), None);
 
-    let path = run_dir.join(socket::CONFD_PART);
+    let path = run_dir.join(socket::confd_part(Module::Frr.name()));
     let stream = daemon::connect(&path, CONFD_WAIT).map_err(|e| format!("connecting: {e}"))?;
     let mut client = Client::new(stream, Module::Frr).map_err(|e| e.to_string())?;
     let clock = Clock::new();

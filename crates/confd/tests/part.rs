@@ -35,7 +35,7 @@ struct Process {
 impl Process {
     fn new(rig: &mut Rig) -> Self {
         let (a, b) = UnixStream::pair().unwrap();
-        rig.confd.attach_part(a).unwrap();
+        rig.confd.attach_part(Module::Dns, a).unwrap();
         Self {
             client: Client::new(b, Module::Dns).unwrap(),
             refuse: None,
@@ -199,27 +199,61 @@ fn a_process_that_starts_again_replaces_the_old_one() {
     assert_eq!(new.taken.len(), 2);
 }
 
-#[test]
-fn an_unknown_module_is_refused() {
-    let mut rig = Rig::new();
+/// The answer to naming `name` on `socket`'s socket.
+fn name_on(rig: &mut Rig, socket: Module, name: &str) -> Option<Code> {
     let (a, b) = UnixStream::pair().unwrap();
-    rig.confd.attach_part(a).unwrap();
+    rig.confd.attach_part(socket, a).unwrap();
     let mut conn = ruster_proto::conn::Connection::new(b, 1 << 20).unwrap();
     conn.send(&ruster_proto::conn::Outgoing {
         code: Some(Code::POST),
         token: &[1],
-        path: &["kea"],
+        path: &[name],
         ..Default::default()
     })
     .unwrap();
-    let mut answer = None;
     for _ in 0..100 {
         rig.confd.step(0);
         conn.pump().unwrap();
         if let Ok(Some(message)) = conn.next_message() {
-            answer = Some(message.code);
-            break;
+            return Some(message.code);
         }
     }
-    assert_eq!(answer, Some(Code::NOT_FOUND));
+    None
+}
+
+#[test]
+fn an_unknown_module_is_refused() {
+    let mut rig = Rig::new();
+    assert_eq!(name_on(&mut rig, Module::Dns, "kea"), Some(Code::NOT_FOUND));
+}
+
+#[test]
+fn a_socket_hands_out_only_its_own_module() {
+    let mut rig = Rig::new();
+    // A process that may open only the dns socket cannot take the PPPoE passwords.
+    assert_eq!(
+        name_on(&mut rig, Module::Dns, "pppoe"),
+        Some(Code::NOT_FOUND)
+    );
+    assert_eq!(
+        name_on(&mut rig, Module::Pppoe, "pppoe"),
+        Some(Code::CHANGED)
+    );
+}
+
+#[test]
+fn connections_waiting_on_one_socket_do_not_keep_the_others_out() {
+    let mut rig = Rig::new();
+    let mut held = Vec::new();
+    for _ in 0..ruster_confd::part::MAX_UNNAMED {
+        let (a, b) = UnixStream::pair().unwrap();
+        rig.confd.attach_part(Module::Dns, a).unwrap();
+        held.push(b);
+    }
+    let (a, _b) = UnixStream::pair().unwrap();
+    assert!(rig.confd.attach_part(Module::Dns, a).is_err());
+    assert_eq!(
+        name_on(&mut rig, Module::Pppoe, "pppoe"),
+        Some(Code::CHANGED)
+    );
 }

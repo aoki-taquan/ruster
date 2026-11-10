@@ -3,7 +3,7 @@
 //!
 //! Each `[[pppoe]]` sets up the session of one source of kind pppoe, on the parent
 //! of the interface that names the source. confd hands the entries to
-//! `ruster-pppoed` on `confd/part.sock` (module `pppoe`), and for each parent
+//! `ruster-pppoed` on `confd/part/pppoe/part.sock` (module `pppoe`), and for each parent
 //! writes two punt classes to the FE: `pppoe-discovery-<parent>` and
 //! `ppp-control-<parent>`, to the control process `pppoed`.
 //!

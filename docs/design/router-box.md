@@ -40,7 +40,8 @@ FEの表（CORECONF）: confd、ribd、neighdだけが書く。どれもFEと直
 - 全体の設定の型はYANGで決める。標準のモジュール（`ietf-interfaces`、`ietf-ip`、`ietf-routing`、
   `ietf-nat`、`ietf-dhcp`など）を土台に、足りない部分を`ruster-*`のモジュールで足す。
 - 各プロセスは、confdから自分の担当のモジュールだけを受け取る。担当の外の部分は受け取らない。
-  受け取り口は`/run/ruster/confd/part.sock`。プロセスがつないで担当のモジュールの名前（`dns`など）を
+  受け取り口はモジュールごとの`/run/ruster/confd/part/<モジュール>/part.sock`（ディレクトリごとに権限を
+  絞れる。ce-processes.mdの「socketの権限」）。プロセスがつないで担当のモジュールの名前（`dns`など）を
   POSTで送ると、confdはそのモジュールの部分をlockの形のTOMLでPUTし、変わるたびにPUTし直す。
   プロセスは受け入れたか断ったかをPUTへの応答で返す（`crates/confd/src/part.rs`）。
 
@@ -115,7 +116,7 @@ confd → 各プロセス: 確定
 2. 相手から得た値を、rusterのCEのプロセスへ送り手として渡す。
 3. 相手が必要とする動的な値（WAN側で得たDNSサーバなど）を、ほかのCEのプロセスから受け取って設定に入れる。
 
-- 担当の部分は`confd/part.sock`から受け取り、受け入れたか断ったかを返す（「設定の三段」）。相手のソフトの
+- 担当の部分は`confd/part/<モジュール>/part.sock`から受け取り、受け入れたか断ったかを返す（「設定の三段」）。相手のソフトの
   設定に書けない、または相手が読み直せないときは断り、書く前のファイルに戻す。confdは前の版に戻す。
 - 既製のソフトの起動と再起動はsystemdに任せる。橋渡し役は相手を起動しない。
 - 既製のソフトは、ルータ宛て通信を終端するkernelのnetnsで動く。FEから見るとTUNの先のホストになる。
@@ -128,7 +129,7 @@ confd → 各プロセス: 確定
   受けた経路をribdへ送り手`frr`として渡す。kernelの経路表は使わない。FPMはTCPだけなので、`ruster-frr`は
   kernelのnetnsの`127.0.0.1:2620`で待ち、zebraの`frr`ユーザーのsocketからの接続だけを受ける。
 - BGPなどのTCPは、kernelで終端する（TUN経由）。
-- 設定は全体の設定の`[bgp]`（default VRFだけ）。`ruster-frr`は`confd/part.sock`のモジュール`frr`で受け取り、
+- 設定は全体の設定の`[bgp]`（default VRFだけ）。`ruster-frr`は`confd/part/frr/part.sock`でモジュール`frr`を受け取り、
   FRRの`frr.conf`を全部書いて`frr-reload.py`で読ませる。運用者のファイル（`include`）は最後にそのまま足す。
   取り込みは全部受け、送り出しは`networks`だけにする（RFC 8212の明示的な方針。ある近隣の経路を別の近隣へ流さない）。
 - zebraへインターフェースは教えない。confdがkernelのnetnsのTUNにルータのアドレスを付けるので、zebraは
@@ -195,7 +196,7 @@ confd → 各プロセス: 確定
   confdはそのサブネットの/64を作り、ルータのアドレスはその::1にする（MACからのEUI-64にしないのは、
   機器を替えてもアドレスが変わらないようにするため）。
 - RAはNDの一部なのでneighdに置く。設定は全体の設定の`[[ra]]`（インターフェースごと）で、neighdは
-  `confd/part.sock`のモジュール`ra`で受け取る。neighdがconfdから受けている表（インターフェースとアドレス）は
+  `confd/part/ra/part.sock`でモジュール`ra`を受け取る。neighdがconfdから受けている表（インターフェースとアドレス）は
   FEの表と同じ形で、RAの設定はその形に無いため。広告するプレフィックスは、インターフェースのIPv6アドレスの
   /64からlockの形に入れる。DHCPv6-PDで委任されたプレフィックスは実行中の値なので、lockには送り手を
   `prefix-from`に書くだけにする。インターフェースに`ipv6-from`があれば、`[[ra]]`の`prefix-from`は

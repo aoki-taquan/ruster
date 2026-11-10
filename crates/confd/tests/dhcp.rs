@@ -86,7 +86,7 @@ fn each_dhcp_interface_hands_the_server_port_to_kea() {
     .unwrap();
     confd.connect_fe(b).unwrap();
     let (a, b) = UnixStream::pair().unwrap();
-    confd.attach_part(a).unwrap();
+    confd.attach_part(Module::Dhcp, a).unwrap();
     let mut kea = Client::new(b, Module::Dhcp).unwrap();
     let mut parts = Vec::new();
     run(&mut fe, &mut confd, &mut kea, &mut parts);

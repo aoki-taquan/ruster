@@ -180,3 +180,47 @@ fn sockets_and_the_directories_made_for_them_are_closed_to_others() {
     assert_eq!(mode(&plain), 0o700);
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn a_directory_made_beforehand_gives_its_socket_its_own_group() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // A group of this process other than its own, as an operator's group for one
+    // process (`docs/design/ce-processes.md`, "部分と送り手のsocket").
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let primary = std::fs::metadata("/proc/self").unwrap().gid();
+    let Some(other) = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Groups:"))
+        .and_then(|groups| {
+            groups
+                .split_whitespace()
+                .filter_map(|g| g.parse::<u32>().ok())
+                .find(|&g| g != primary)
+        })
+    else {
+        eprintln!("skipped: this process is in no second group");
+        return;
+    };
+    let dir = dir("own-group");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2750)).unwrap();
+    let pppoe = dir.join("confd/part/pppoe");
+    std::fs::create_dir_all(&pppoe).unwrap();
+    std::os::unix::fs::chown(&pppoe, None, Some(other)).unwrap();
+    std::fs::set_permissions(&pppoe, std::fs::Permissions::from_mode(0o2750)).unwrap();
+    let path = dir.join(ruster_proto::daemon::socket::confd_part("pppoe"));
+    let dns = dir.join(ruster_proto::daemon::socket::confd_part("dns"));
+    let _listener = daemon::listen(&path).unwrap();
+    let _other = daemon::listen(&dns).unwrap();
+    let meta = std::fs::metadata(&path).unwrap();
+    assert_eq!(meta.gid(), other);
+    assert_eq!(meta.mode() & 0o7777, daemon::SOCKET_MODE);
+    // The directory made beforehand is left as it is.
+    assert_eq!(std::fs::metadata(&pppoe).unwrap().mode() & 0o7777, 0o2750);
+    assert_eq!(std::fs::metadata(&pppoe).unwrap().gid(), other);
+    // A directory confd makes takes the group from above.
+    assert_eq!(
+        std::fs::metadata(&dns).unwrap().gid(),
+        std::fs::metadata(&dir).unwrap().gid()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -1,7 +1,7 @@
 //! `ruster-ribd [--run-dir DIR] [NAME:PREFERENCE[:HOLD_MS]]...`: route selection.
 //!
 //! ribd writes the FE's route table and listens on one socket per route source
-//! (`ribd/source/NAME.sock`). With no sources given, the only source is `confd` with
+//! (`ribd/source/NAME/source.sock`). With no sources given, the only source is `confd` with
 //! preference 1. Lower preference wins; HOLD_MS (default 5000) is how long ribd waits
 //! for a source to finish sending after start-up before it tells the FE it is done.
 

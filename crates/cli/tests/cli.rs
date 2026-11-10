@@ -71,7 +71,10 @@ fn show_and_route_fail_clearly_without_a_router() {
         "198.51.100.2/32",
     ]);
     assert!(!ok);
-    assert!(text.contains("confd/source/pppoe-wan.sock"), "{text}");
+    assert!(
+        text.contains("confd/source/pppoe-wan/source.sock"),
+        "{text}"
+    );
     let (ok, text) = ruster(&[
         "source",
         "pppoe-wan",

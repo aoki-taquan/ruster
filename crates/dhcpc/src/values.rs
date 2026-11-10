@@ -1,5 +1,5 @@
 //! What the client writes: each lease's values to its confd source
-//! (`confd/source/<name>.sock`), and the default routes to ribd as the route source
+//! (`confd/source/<name>/source.sock`), and the default routes to ribd as the route source
 //! `dhcpc` (`docs/design/ce-processes.md`, "送り手").
 //!
 //! The values carry [`LIFETIME`] and are sent again every [`REFRESH_MS`], so they

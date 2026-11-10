@@ -69,7 +69,7 @@ fn the_lan_takes_its_64_and_advertises_it_while_the_prefix_lasts() {
     assert!(lock.ra[0].prefix.is_empty());
     let mut confd = Confd::new(file::config(lock).unwrap());
     let (a, b) = UnixStream::pair().unwrap();
-    confd.attach_part(a).unwrap();
+    confd.attach_part(Module::Ra, a).unwrap();
     let mut neighd = PartClient::new(b, Module::Ra).unwrap();
     let (a, b) = UnixStream::pair().unwrap();
     confd.attach_source("dhcp6-wan", a).unwrap();
@@ -331,7 +331,7 @@ upstream-from = ["dhcp-wan", "pppoe-wan"]
 "#;
     let mut confd = Confd::new(file::parse(text).unwrap());
     let (a, b) = UnixStream::pair().unwrap();
-    confd.attach_part(a).unwrap();
+    confd.attach_part(Module::Dns, a).unwrap();
     let mut unbound = PartClient::new(b, Module::Dns).unwrap();
     let mut sources = Vec::new();
     for name in ["dhcp-wan", "pppoe-wan"] {

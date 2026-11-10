@@ -2,7 +2,7 @@
 //! (`docs/design/ce-processes.md`, "送り手").
 //!
 //! The configuration declares each source with a name and a kind. confd listens on
-//! `confd/source/<name>.sock` for each, and the daemon writes its values there as
+//! `confd/source/<name>/source.sock` for each, and the daemon writes its values there as
 //! table entries ([`ruster_proto::session`]), keyed by the source's name:
 //!
 //! | Kind | What it may write |

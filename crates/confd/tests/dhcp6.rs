@@ -137,7 +137,7 @@ fn each_dhcp6_interface_hands_port_547_to_kea() {
     .unwrap();
     confd.connect_fe(b).unwrap();
     let (a, b) = UnixStream::pair().unwrap();
-    confd.attach_part(a).unwrap();
+    confd.attach_part(Module::Dhcp, a).unwrap();
     let mut kea = Client::new(b, Module::Dhcp).unwrap();
     let mut parts = Vec::new();
     for _ in 0..200 {

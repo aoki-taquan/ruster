@@ -132,7 +132,7 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-09 にow
 backlogのまま置き、使う場面が出たものから片付ける。
 
 次はルータ箱としての組み立て（2026-11-10 charterに追加）。順番は[`router-box.md`](router-box.md)の
-「作る順番」に従う。lockの形（版1）、confdが各プロセスへ担当の部分を渡すsocket（`confd/part.sock`）、
+「作る順番」に従う。lockの形（版1）、confdが各プロセスへ担当の部分を渡すsocket（モジュールごとの`confd/part/<モジュール>/part.sock`）、
 Unboundの橋渡し役（`ruster-unbound`、netns `dns`）と、Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`、
 netns `dhcp`）、neighdのRA（`[[ra]]`、netns `ra`）、DHCPv6のリレー（`[[dhcp6]]`、netns `dhcp6`）まで済んだ。
 FRRの橋渡し役（`[bgp]`、`ruster-frr`、netns `bgp`）も済んだ。BGPは直結の近隣だけで、次の転送先の

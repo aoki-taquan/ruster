@@ -239,7 +239,7 @@
 //! description = "upstream"     # optional
 //!
 //! [[source]]                   # optional: a daemon that sends confd values found
-//!                              # at run time, on confd/source/<name>.sock
+//!                              # at run time, on confd/source/<name>/source.sock
 //! name = "pppoe-wan"           # lower-case letters, digits and -, from a letter
 //! kind = "pppoe"               # what it may send: "pppoe" (ruster-pppoed: a
 //!                              # session, its IPv4 address and DNS servers),

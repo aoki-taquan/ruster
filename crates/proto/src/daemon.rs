@@ -27,6 +27,13 @@
 //! the set-group-ID bit and a group shared by the router's processes) and each
 //! process's own directory under it are made beforehand
 //! (`docs/design/ce-processes.md`, "socketの権限").
+//!
+//! The sockets that hand out one part of the configuration, or take one source's
+//! values, each have a directory of their own ([`socket::confd_part`],
+//! [`socket::confd_source`], [`socket::ribd_source`]). Made beforehand with a group
+//! only one process is in, such a directory limits its socket to that process: for
+//! example `confd/part/pppoe/`, whose part holds the PPPoE passwords, to
+//! `ruster-pppoed`.
 
 use std::io::{self, ErrorKind};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
@@ -64,8 +71,6 @@ pub mod socket {
     pub const NEIGHD_CONFIG: &str = "neighd/config.sock";
     /// confd's socket for a new configuration file (from `ruster apply`).
     pub const CONFD_CONFIG: &str = "confd/config.sock";
-    /// confd's socket where each process takes its part of the configuration.
-    pub const CONFD_PART: &str = "confd/part.sock";
 
     /// The FE's datagram socket for frames to and from the control process `name`
     /// of a punt class (other than neighd).
@@ -78,14 +83,23 @@ pub mod socket {
         format!("{name}/punt.sock")
     }
 
-    /// confd's table server for the source `name` (values found at run time).
-    pub fn confd_source(name: &str) -> String {
-        format!("confd/source/{name}.sock")
+    /// confd's socket where the process for `module` takes its part of the
+    /// configuration. Each module has a directory of its own, so that its group can
+    /// be one only that process is in.
+    pub fn confd_part(module: &str) -> String {
+        format!("confd/part/{module}/part.sock")
     }
 
-    /// ribd's table server for the route source `name`.
+    /// confd's table server for the source `name` (values found at run time), in a
+    /// directory of its own like [`confd_part`].
+    pub fn confd_source(name: &str) -> String {
+        format!("confd/source/{name}/source.sock")
+    }
+
+    /// ribd's table server for the route source `name`, in a directory of its own
+    /// like [`confd_part`].
     pub fn ribd_source(name: &str) -> String {
-        format!("ribd/source/{name}.sock")
+        format!("ribd/source/{name}/source.sock")
     }
 }
 
