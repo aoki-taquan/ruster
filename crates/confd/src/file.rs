@@ -646,7 +646,28 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         {
             return Err(format!("dhcp {:?}: given twice", entry.interface));
         }
-        dhcp.push(dhcp_entry(entry, &interfaces)?);
+        let entry = dhcp_entry(entry, &interfaces)?;
+        // Kea knows a subnet by its address; two subnets of which one holds the
+        // other would share it, and the relay addresses could pick either.
+        let subnet =
+            |d: &ruster_config::Dhcp| prefix(&d.address).map(|(a, len)| (network(a, len), len));
+        if let Some((IpAddr::V4(a), len)) = subnet(&entry) {
+            let holds = |b: Ipv4Addr, l: u8| {
+                let shorter = len.min(l);
+                let mask = u32::MAX.checked_shl(32 - u32::from(shorter)).unwrap_or(0);
+                u32::from(a) & mask == u32::from(b) & mask
+            };
+            let other = dhcp.iter().find(|d: &&ruster_config::Dhcp| {
+                matches!(subnet(d), Some((IpAddr::V4(b), l)) if holds(b, l))
+            });
+            if let Some(other) = other {
+                return Err(format!(
+                    "dhcp {:?}: its subnet overlaps that of dhcp {:?}",
+                    entry.interface, other.interface
+                ));
+            }
+        }
+        dhcp.push(entry);
     }
     Ok(Config {
         interfaces,
@@ -703,6 +724,9 @@ fn dhcp_entry(
     }
     let mask = u32::MAX.checked_shl(32 - u32::from(len)).unwrap_or(0);
     let subnet = u32::from(own) & mask;
+    if subnet == 0 {
+        return Err(format!("{at}: the subnet must not be 0.0.0.0/{len}"));
+    }
     // The hosts of the subnet: neither its network nor its broadcast address.
     let host = |a: Ipv4Addr| {
         u32::from(a) & mask == subnet
