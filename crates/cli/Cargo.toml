@@ -10,5 +10,6 @@ name = "ruster"
 path = "src/main.rs"
 
 [dependencies]
+ruster-config = { path = "../config" }
 ruster-confd = { path = "../confd" }
 ruster-proto = { path = "../proto" }
