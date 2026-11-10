@@ -276,7 +276,7 @@ where
     }
 
     /// Binds the sockets to the control processes the punt classes name under
-    /// `dir`, the socket directory (see [`control`]), from the next table change.
+    /// `dir`, the socket directory (`fe/punt/<name>.sock`), from the next table change.
     pub fn set_punt_dir(&mut self, dir: PathBuf) {
         self.controls.set_dir(dir);
     }
