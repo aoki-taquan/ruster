@@ -605,3 +605,164 @@ fn index_heap_at_the_worst_config_shape_is_about_392_kib() {
     assert_eq!(bytes - tables, entries * 2 + lists);
     assert!(bytes <= 400 * 1024, "{bytes}");
 }
+
+/// What validation answered when it compared every entry with every earlier one:
+/// the entries in slice order, and for each a repeat before an unknown interface.
+fn validation_by_pairs(tables: &Tables) -> Result<(), SnapshotError> {
+    let Tables {
+        routes,
+        interfaces,
+        neighbors,
+        local_ipv4,
+    } = tables;
+    let known = |id: IfId| interfaces.iter().any(|interface| interface.id == id);
+    for (index, route) in routes.iter().enumerate() {
+        if routes[..index]
+            .iter()
+            .any(|c| c.prefix() == route.prefix() && c.prefix_len() == route.prefix_len())
+        {
+            return Err(SnapshotError::DuplicateRoute);
+        }
+        if !known(route.egress()) && !matches!(route.egress(), IfId::DISCARD | IfId::REJECT) {
+            return Err(SnapshotError::RouteUnknownInterface);
+        }
+    }
+    for (index, interface) in interfaces.iter().enumerate() {
+        if interfaces[..index].iter().any(|c| c.id == interface.id) {
+            return Err(SnapshotError::DuplicateInterface);
+        }
+        if interface.mtu < crate::IPV4_MIN_MTU {
+            return Err(SnapshotError::InterfaceMtuBelowMinimum);
+        }
+    }
+    for (index, neighbor) in neighbors.iter().enumerate() {
+        if neighbors[..index]
+            .iter()
+            .any(|c| c.interface == neighbor.interface && c.target == neighbor.target)
+        {
+            return Err(SnapshotError::DuplicateNeighbor);
+        }
+        if !known(neighbor.interface) {
+            return Err(SnapshotError::NeighborUnknownInterface);
+        }
+    }
+    for (index, binding) in local_ipv4.iter().enumerate() {
+        if binding.address.is_unspecified() {
+            return Err(SnapshotError::LocalIpv4BindingUnspecified);
+        }
+        if local_ipv4[..index]
+            .iter()
+            .any(|c| c.interface == binding.interface || c.address == binding.address)
+        {
+            return Err(SnapshotError::DuplicateLocalIpv4Binding);
+        }
+        if !known(binding.interface) {
+            return Err(SnapshotError::LocalIpv4BindingUnknownInterface);
+        }
+    }
+    Ok(())
+}
+
+/// Valid tables with a few entries spoiled: repeated, moved to an interface the
+/// tables do not have, an MTU too small, an unspecified address.
+fn spoiled_tables(rng: &mut Rng) -> Tables {
+    let mut tables = random_tables(rng, 24);
+    let missing = IfId(900 + rng.below(3) as u16);
+    for _ in 0..rng.below(4) {
+        match rng.below(9) {
+            0 if !tables.routes.is_empty() => {
+                let from = tables.routes[rng.below(tables.routes.len() as u64) as usize];
+                let at = rng.below(tables.routes.len() as u64 + 1) as usize;
+                tables.routes.insert(at, from);
+            }
+            1 if !tables.routes.is_empty() => {
+                let at = rng.below(tables.routes.len() as u64) as usize;
+                let route = tables.routes[at];
+                let egress = [missing, IfId::DISCARD, IfId::REJECT][rng.below(3) as usize];
+                tables.routes[at] =
+                    Route::new(route.prefix(), route.prefix_len(), egress, route.next_hop())
+                        .unwrap();
+            }
+            2 => {
+                let from = tables.interfaces[rng.below(tables.interfaces.len() as u64) as usize];
+                let at = rng.below(tables.interfaces.len() as u64 + 1) as usize;
+                tables.interfaces.insert(at, from);
+            }
+            3 => {
+                let at = rng.below(tables.interfaces.len() as u64) as usize;
+                tables.interfaces[at].mtu = crate::IPV4_MIN_MTU - 1;
+            }
+            4 if !tables.neighbors.is_empty() => {
+                let from = tables.neighbors[rng.below(tables.neighbors.len() as u64) as usize];
+                let at = rng.below(tables.neighbors.len() as u64 + 1) as usize;
+                tables.neighbors.insert(at, from);
+            }
+            5 if !tables.neighbors.is_empty() => {
+                let at = rng.below(tables.neighbors.len() as u64) as usize;
+                tables.neighbors[at].interface = missing;
+            }
+            6 if !tables.local_ipv4.is_empty() => {
+                let mut from =
+                    tables.local_ipv4[rng.below(tables.local_ipv4.len() as u64) as usize];
+                // The same interface, the same address, or both.
+                match rng.below(3) {
+                    0 => from.address = ip(rng.address() | 1),
+                    1 => from.interface = missing,
+                    _ => {}
+                }
+                let at = rng.below(tables.local_ipv4.len() as u64 + 1) as usize;
+                tables.local_ipv4.insert(at, from);
+            }
+            7 if !tables.local_ipv4.is_empty() => {
+                let at = rng.below(tables.local_ipv4.len() as u64) as usize;
+                tables.local_ipv4[at].interface = missing;
+            }
+            8 if !tables.local_ipv4.is_empty() => {
+                let at = rng.below(tables.local_ipv4.len() as u64) as usize;
+                tables.local_ipv4[at].address = ip(0);
+            }
+            _ => {}
+        }
+    }
+    tables
+}
+
+#[test]
+fn validation_answers_as_comparing_every_pair_did() {
+    let mut rng = Rng(0x7461_626c_6573);
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..20_000 {
+        let tables = spoiled_tables(&mut rng);
+        let expected = validation_by_pairs(&tables);
+        let got = ForwardingSnapshot::new(
+            &tables.routes,
+            &tables.interfaces,
+            &tables.neighbors,
+            &tables.local_ipv4,
+        )
+        .map(|_| ());
+        assert_eq!(got, expected);
+        seen.insert(format!("{expected:?}"));
+    }
+    // Every answer came up: valid tables and each of the nine errors.
+    assert_eq!(seen.len(), 10, "{seen:?}");
+}
+
+#[test]
+fn many_routes_are_validated_without_comparing_every_pair() {
+    // 200,000 routes: comparing every pair would be 2 * 10^10 comparisons.
+    let interfaces = [Interface {
+        id: IfId(1),
+        mac: MacAddress([2, 0, 0, 0, 0, 1]),
+        mtu: 1500,
+    }];
+    let mut routes: Vec<Route> = (0..200_000u32)
+        .map(|i| Route::new(ip(i << 8), 24, IfId(1), None).unwrap())
+        .collect();
+    assert!(ForwardingSnapshot::new(&routes, &interfaces, &[], &[]).is_ok());
+    routes.push(routes[7]);
+    assert_eq!(
+        ForwardingSnapshot::new(&routes, &interfaces, &[], &[]).err(),
+        Some(SnapshotError::DuplicateRoute)
+    );
+}

@@ -1502,6 +1502,17 @@ pub fn take_full_forwarding_validation_count() -> usize {
     FULL_FORWARDING_VALIDATIONS.with(|count| count.replace(0))
 }
 
+/// The index of the first key that an earlier one equals.
+fn first_repeat<K: Ord>(keys: impl Iterator<Item = K>) -> Option<usize> {
+    let mut sorted: Vec<(K, usize)> = keys.zip(0..).collect();
+    sorted.sort_unstable();
+    sorted
+        .windows(2)
+        .filter(|pair| pair[0].0 == pair[1].0)
+        .map(|pair| pair[1].1)
+        .min()
+}
+
 impl<'a> ForwardingSnapshot<'a> {
     pub fn new(
         routes: &'a [Route],
@@ -1527,59 +1538,72 @@ impl<'a> ForwardingSnapshot<'a> {
     ) -> Result<Self, SnapshotError> {
         #[cfg(any(test, feature = "validation-test-hooks"))]
         FULL_FORWARDING_VALIDATIONS.with(|count| count.set(count.get().saturating_add(1)));
-        for (index, route) in routes.iter().enumerate() {
-            if routes[..index].iter().any(|candidate| {
-                candidate.prefix() == route.prefix() && candidate.prefix_len() == route.prefix_len()
-            }) {
-                return Err(SnapshotError::DuplicateRoute);
+        // Each list is checked in slice order and the first entry in error decides,
+        // a repeat before an unknown interface. Repeats are found by sorting the
+        // keys, so a table of many routes costs `n log n`, not `n * n`.
+        let mut ids: Vec<IfId> = interfaces.iter().map(|interface| interface.id).collect();
+        ids.sort_unstable();
+        let known = |id: IfId| ids.binary_search(&id).is_ok();
+
+        let repeat = first_repeat(routes.iter().map(|r| (r.prefix(), r.prefix_len())));
+        let unknown = routes.iter().position(|route| {
+            !known(route.egress()) && !matches!(route.egress(), IfId::DISCARD | IfId::REJECT)
+        });
+        match (repeat, unknown) {
+            (Some(repeat), Some(unknown)) if unknown < repeat => {
+                return Err(SnapshotError::RouteUnknownInterface)
             }
-            if !interfaces
-                .iter()
-                .any(|interface| interface.id == route.egress())
-                && !matches!(route.egress(), IfId::DISCARD | IfId::REJECT)
-            {
-                return Err(SnapshotError::RouteUnknownInterface);
-            }
+            (Some(_), _) => return Err(SnapshotError::DuplicateRoute),
+            (None, Some(_)) => return Err(SnapshotError::RouteUnknownInterface),
+            (None, None) => {}
         }
-        for (index, interface) in interfaces.iter().enumerate() {
-            if interfaces[..index]
-                .iter()
-                .any(|candidate| candidate.id == interface.id)
-            {
-                return Err(SnapshotError::DuplicateInterface);
+
+        let repeat = first_repeat(interfaces.iter().map(|interface| interface.id));
+        let small = interfaces
+            .iter()
+            .position(|interface| interface.mtu < crate::IPV4_MIN_MTU);
+        match (repeat, small) {
+            (Some(repeat), Some(small)) if small < repeat => {
+                return Err(SnapshotError::InterfaceMtuBelowMinimum)
             }
-            if interface.mtu < crate::IPV4_MIN_MTU {
-                return Err(SnapshotError::InterfaceMtuBelowMinimum);
-            }
+            (Some(_), _) => return Err(SnapshotError::DuplicateInterface),
+            (None, Some(_)) => return Err(SnapshotError::InterfaceMtuBelowMinimum),
+            (None, None) => {}
         }
-        for (index, neighbor) in neighbors.iter().enumerate() {
-            if neighbors[..index].iter().any(|candidate| {
-                candidate.interface == neighbor.interface && candidate.target == neighbor.target
-            }) {
-                return Err(SnapshotError::DuplicateNeighbor);
+
+        let repeat = first_repeat(neighbors.iter().map(|n| (n.interface, n.target)));
+        let unknown = neighbors.iter().position(|n| !known(n.interface));
+        match (repeat, unknown) {
+            (Some(repeat), Some(unknown)) if unknown < repeat => {
+                return Err(SnapshotError::NeighborUnknownInterface)
             }
-            if !interfaces
-                .iter()
-                .any(|interface| interface.id == neighbor.interface)
-            {
-                return Err(SnapshotError::NeighborUnknownInterface);
-            }
+            (Some(_), _) => return Err(SnapshotError::DuplicateNeighbor),
+            (None, Some(_)) => return Err(SnapshotError::NeighborUnknownInterface),
+            (None, None) => {}
         }
-        for (index, binding) in local_ipv4.iter().enumerate() {
-            if binding.address.is_unspecified() {
-                return Err(SnapshotError::LocalIpv4BindingUnspecified);
-            }
-            if local_ipv4[..index].iter().any(|candidate| {
-                candidate.interface == binding.interface || candidate.address == binding.address
-            }) {
-                return Err(SnapshotError::DuplicateLocalIpv4Binding);
-            }
-            if !interfaces
-                .iter()
-                .any(|interface| interface.id == binding.interface)
-            {
-                return Err(SnapshotError::LocalIpv4BindingUnknownInterface);
-            }
+
+        // Per entry: unspecified, then a repeat (of the interface or of the
+        // address), then an unknown interface.
+        let unspecified = local_ipv4.iter().position(|b| b.address.is_unspecified());
+        let repeat = match (
+            first_repeat(local_ipv4.iter().map(|binding| binding.interface)),
+            first_repeat(local_ipv4.iter().map(|binding| binding.address)),
+        ) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let unknown = local_ipv4.iter().position(|b| !known(b.interface));
+        let first = [
+            (unspecified, SnapshotError::LocalIpv4BindingUnspecified),
+            (repeat, SnapshotError::DuplicateLocalIpv4Binding),
+            (unknown, SnapshotError::LocalIpv4BindingUnknownInterface),
+        ]
+        .into_iter()
+        .filter_map(|(at, error)| Some((at?, error)))
+        // The earliest entry; among its errors, the first listed.
+        .min_by_key(|(at, _)| *at);
+        if let Some((_, error)) = first {
+            return Err(error);
         }
         Ok(Self {
             routes,
