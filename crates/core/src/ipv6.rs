@@ -281,6 +281,8 @@ pub enum ControlKind {
     Local,
     /// A fragment of a tunnel's IPv6 packet, for the FE to put back together.
     TunnelFragment,
+    /// A frame a [`crate::PuntFrameMatch`] picked out, with its class.
+    Punt(u16),
 }
 
 /// One frame for the control side, or one ICMPv6 error to send.
@@ -370,6 +372,15 @@ impl ControlQueue {
         let pushed = self.push(ingress, frame);
         if pushed {
             self.slots[self.len - 1].kind = ControlKind::TunnelFragment;
+        }
+        pushed
+    }
+
+    /// Queues a frame of punt class `class`; a full queue drops it.
+    pub(crate) fn push_punt(&mut self, ingress: IfId, frame: &[u8], class: u16) -> bool {
+        let pushed = self.push(ingress, frame);
+        if pushed {
+            self.slots[self.len - 1].kind = ControlKind::Punt(class);
         }
         pushed
     }
