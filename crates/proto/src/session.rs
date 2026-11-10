@@ -447,6 +447,12 @@ impl Client {
         self.request(Code::POST, path, None, payload)
     }
 
+    /// Sends GET to `path`, for a resource outside the tables (confd's `versions`).
+    /// Returns the token of the request.
+    pub fn get(&mut self, path: &[&str]) -> u32 {
+        self.request(Code::GET, path, None, &[])
+    }
+
     /// Asks for notifications. They arrive as [`Event::Notification`].
     pub fn observe(&mut self) -> u32 {
         let token = self.request(Code::GET, &["s"], Some(0), &[]);

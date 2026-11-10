@@ -1,8 +1,15 @@
 //! The socket through which `ruster apply` gives confd a new configuration file
 //! (`docs/design/ce-processes.md`, "反映の流れ").
 //!
-//! A request is POST `config` with the file's text as its payload, framed like the other
-//! sockets. confd reads the text as it reads its file at start-up, sends what changed to
+//! | Request | What |
+//! |---|---|
+//! | POST `config`, the file's text | put it in use (below) |
+//! | POST `rollback/<N>` | put version N's configuration in use, the same way |
+//! | GET `versions` | 2.05 Content: the versions kept, a line each, newest first ([`Versions::listing`]) |
+//!
+//! Requests are framed like the other sockets. For POST `config`, confd reads the text as
+//! it reads its file at start-up; for `rollback/<N>`, version N's lock form (4.04 Not
+//! Found when it is not kept). Then it sends what changed to
 //! the FE, ribd and neighd, and the parts that changed to the processes that take them
 //! ([`crate::part`]), and answers once each of them has answered. Once every process
 //! has taken it, confd keeps it as the next version ([`crate::versions`]); the answer
@@ -36,16 +43,16 @@
 //!
 //! # Standards
 //!
-//! - RFC 7252 section 5.8.2 (POST) and 5.9 (the response codes above), over the stream
-//!   framing of RFC 8323 like the table sockets.
+//! - RFC 7252 sections 5.8.1 (GET), 5.8.2 (POST) and 5.9 (the response codes above),
+//!   over the stream framing of RFC 8323 like the table sockets.
 //!
-//! Deviations: the resource `config` and its TOML payload are ruster's own; they are not a
+//! Deviations: the resources and their text payloads are ruster's own; they are not a
 //! CORECONF datastore.
 
 use std::os::unix::net::UnixStream;
 
 use ruster_proto::coap::Code;
-use ruster_proto::conn::{Connection, Outgoing};
+use ruster_proto::conn::{Connection, Incoming, Outgoing};
 use ruster_proto::task::Progress;
 
 use crate::versions::Versions;
@@ -178,39 +185,7 @@ impl Apply {
                     break;
                 };
                 busy = true;
-                let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
-                let answer = match (request.code, path.as_slice()) {
-                    (Code::POST, ["config"]) if self.pending.is_some() || !confd.settled() => {
-                        Some((
-                            Code::SERVICE_UNAVAILABLE,
-                            "an earlier configuration is still waiting for answers".to_owned(),
-                        ))
-                    }
-                    (Code::POST, ["config"]) => match std::str::from_utf8(&request.payload)
-                        .map_err(|_| "the file is not UTF-8".to_owned())
-                        .and_then(file::candidate)
-                    {
-                        Err(error) => Some((Code::BAD_REQUEST, error)),
-                        Ok(candidate) => {
-                            let keep = Keep {
-                                how: "apply".into(),
-                                lock: candidate.lock,
-                                toml: candidate.toml,
-                            };
-                            self.start(
-                                confd,
-                                candidate.config,
-                                keep,
-                                (id, &request.token),
-                                now_ms,
-                                prepare,
-                            );
-                            None
-                        }
-                    },
-                    (code, _) if code.class() == 0 => Some((Code::NOT_FOUND, String::new())),
-                    _ => None,
-                };
+                let answer = self.handle(confd, id, &request, now_ms, prepare);
                 if let Some((code, text)) = answer {
                     send(&mut self.conns[index].1, &request.token, code, &text);
                 }
@@ -226,6 +201,65 @@ impl Apply {
         }
         busy |= self.finish(confd, now_ms, prepare);
         Progress::busy(busy)
+    }
+
+    /// Handles one request of connection `id`. `None` when the answer comes later
+    /// (from [`Apply::finish`]) or there is none.
+    fn handle(
+        &mut self,
+        confd: &mut Confd,
+        id: u64,
+        request: &Incoming,
+        now_ms: u64,
+        prepare: &mut dyn FnMut(&Config) -> Vec<String>,
+    ) -> Option<(Code, String)> {
+        let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
+        let busy = self.pending.is_some() || !confd.settled();
+        let candidate = match (request.code, path.as_slice()) {
+            (Code::GET, ["versions"]) => return Some((Code::CONTENT, self.versions.listing())),
+            (Code::POST, ["config"] | ["rollback", _]) if busy => {
+                return Some((
+                    Code::SERVICE_UNAVAILABLE,
+                    "an earlier configuration is still waiting for answers".to_owned(),
+                ))
+            }
+            (Code::POST, ["config"]) => std::str::from_utf8(&request.payload)
+                .map_err(|_| "the file is not UTF-8".to_owned())
+                .and_then(file::candidate)
+                .map(|candidate| {
+                    let keep = Keep {
+                        how: "apply".into(),
+                        lock: candidate.lock,
+                        toml: candidate.toml,
+                    };
+                    (candidate.config, keep)
+                }),
+            (Code::POST, ["rollback", number]) => {
+                let Some(version) = number.parse().ok().and_then(|n| self.versions.get(n)) else {
+                    return Some((Code::NOT_FOUND, format!("there is no version {number}")));
+                };
+                // A version from before an update may be one this confd cannot read.
+                file::parse(&version.lock)
+                    .map_err(|error| format!("version {number}: {error}"))
+                    .map(|config| {
+                        let keep = Keep {
+                            how: format!("rollback to {number}"),
+                            lock: version.lock.clone(),
+                            toml: version.toml.clone(),
+                        };
+                        (config, keep)
+                    })
+            }
+            (code, _) if code.class() == 0 => return Some((Code::NOT_FOUND, String::new())),
+            _ => return None,
+        };
+        match candidate {
+            Err(error) => Some((Code::BAD_REQUEST, error)),
+            Ok((config, keep)) => {
+                self.start(confd, config, keep, (id, &request.token), now_ms, prepare);
+                None
+            }
+        }
     }
 
     /// Sends a new configuration to the processes; [`Apply::finish`] answers

@@ -352,3 +352,61 @@ fn a_version_that_cannot_be_written_is_said_with_5_00() {
     assert_eq!(rig.mtu(), Some(1400));
     assert_eq!(rig.apply.versions().latest().unwrap().number, 1);
 }
+
+#[test]
+fn a_rollback_makes_an_old_version_the_latest() {
+    let mut rig = Rig::new();
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    rig.answers();
+    rig.cli.post(&["rollback", "1"], b"");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    assert!(
+        answers[0].1.contains("kept as version 3 (rollback to 1)"),
+        "{answers:?}"
+    );
+    assert_eq!(rig.mtu(), Some(1500));
+    let versions = rig.apply.versions();
+    assert_eq!(
+        versions.latest().unwrap().lock,
+        versions.get(1).unwrap().lock
+    );
+    assert_eq!(versions.list().len(), 3, "version 2 stays");
+
+    rig.cli.get(&["versions"]);
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::CONTENT);
+    let lines: Vec<&str> = answers[0].1.lines().collect();
+    assert_eq!(lines.len(), 3, "{answers:?}");
+    assert!(lines[0].ends_with("rollback to 1"), "{answers:?}");
+    assert!(lines[2].ends_with("start"), "{answers:?}");
+}
+
+#[test]
+fn a_rollback_goes_like_a_new_file() {
+    let mut rig = Rig::new();
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    rig.answers();
+    rig.cli.post(&["rollback", "7"], b"");
+    rig.cli.post(&["rollback", "x"], b"");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::NOT_FOUND, "{answers:?}");
+    assert!(answers[0].1.contains("no version 7"), "{answers:?}");
+    assert_eq!(answers[1].0, Code::NOT_FOUND, "{answers:?}");
+
+    // A refusal puts version 2 back and keeps nothing.
+    rig.check.refuse_mtu = Some(1500);
+    rig.cli.post(&["rollback", "1"], b"");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    assert_eq!(rig.mtu(), Some(1400));
+    assert_eq!(rig.apply.versions().latest().unwrap().number, 2);
+
+    // While a change waits for answers, a rollback waits too.
+    let _silent = std::mem::take(&mut rig.fe);
+    rig.check.refuse_mtu = None;
+    rig.cli.post(&["config"], text(1300).as_bytes());
+    rig.cli.post(&["rollback", "1"], b"");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::SERVICE_UNAVAILABLE, "{answers:?}");
+}

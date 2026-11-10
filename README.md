@@ -127,6 +127,8 @@ CEのプロセスが落ちている間も、FEは持っている表で転送を�
 ruster check router.toml                     # confdと同じ読み方で設定ファイルを確かめる
 ruster resolve router.toml                   # 既定値を全部埋めた形（lockの形）を表示する
 ruster apply router.toml                     # 確かめてから、動いているconfdの設定を置き換える
+ruster versions                              # confdが残した版の一覧（新しい順）
+ruster rollback 3                            # 版3の設定を、新しい版として使い直す
 ruster show                                  # FEが持っている表を全部表示する
 ruster route add --source routed 203.0.113.0/24 dev wan via 198.51.100.1
 ruster route del --source routed 203.0.113.0/24
