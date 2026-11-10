@@ -1155,3 +1155,14 @@ fn a_dhcp_lock_entry_must_agree_with_its_interface() {
         assert!(got.contains(error), "{change:?}: {got}");
     }
 }
+
+#[test]
+fn at_most_32_dhcp_are_taken() {
+    let mut text = String::new();
+    for n in 1..=33 {
+        text.push_str(&format!(
+            "[[interface]]\nname = \"l{n}\"\nmac = \"02:00:00:00:01:{n:02x}\"\nipv4 = \"10.0.{n}.1/24\"\n\n[[dhcp]]\ninterface = \"l{n}\"\npool = \"10.0.{n}.10-10.0.{n}.20\"\n\n"
+        ));
+    }
+    assert!(parse(&text).unwrap_err().contains("at most 32 dhcp"));
+}

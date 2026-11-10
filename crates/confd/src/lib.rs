@@ -8,7 +8,7 @@
 //! | FE | interfaces, addresses, the default VRF's firewall rules and NAT, and the punt classes that hand DHCP to `ruster-kea` |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
-//! | a process for a module (`ruster-unbound` for `dns`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
+//! | a process for a module (`ruster-unbound` for `dns`, `ruster-kea` for `dhcp`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
 //!
 //! On every (re)connection confd sends everything between resync-begin and resync-end,
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
@@ -157,7 +157,7 @@ struct Peer {
 pub const DHCP_CONTROL: &str = "kea";
 /// The punt class of one interface's DHCP: `dhcp-<interface>`.
 pub const DHCP_CLASS_PREFIX: &str = "dhcp-";
-/// The DHCP server port (RFC 2131 section 4.1).
+/// The DHCP server port.
 pub const DHCP_SERVER_PORT: u16 = 67;
 /// How many DHCP packets per second, and at once, one interface hands over. A
 /// client sends a few per lease; this leaves room for a LAN of a few hundred
