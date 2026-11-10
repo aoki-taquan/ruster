@@ -204,8 +204,9 @@ const TUN_CHECK_MS: u64 = 1_000;
 struct Tuns {
     /// For each attached VRF, the interface index of its device when it was opened.
     attached: std::collections::BTreeMap<String, u32>,
-    /// For each interface whose TAP device is attached, its index when opened.
-    taps: std::collections::BTreeMap<String, u32>,
+    /// For each interface whose TAP device is attached: its index when opened, a
+    /// second handle to it for its carrier, and the carrier last set.
+    taps: std::collections::BTreeMap<String, Tap>,
     /// The last error for each device, written once until it changes.
     errors: std::collections::BTreeMap<String, String>,
 }
@@ -273,9 +274,9 @@ impl Tuns {
         let gone: Vec<String> = self
             .taps
             .iter()
-            .filter(|(name, &index)| {
+            .filter(|(name, tap)| {
                 !wanted.contains(name)
-                    || tun::tap_device(name).and_then(|d| tun::index(&d)) != Some(index)
+                    || tun::tap_device(name).and_then(|d| tun::index(&d)) != Some(tap.index)
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -294,11 +295,17 @@ impl Tuns {
             let Some(index) = tun::index(&device) else {
                 continue;
             };
-            match tun::open(&device, true) {
-                Ok(file) => {
+            let opened = tun::open(&device, true).and_then(|file| Ok((file.try_clone()?, file)));
+            match opened {
+                Ok((handle, file)) => {
                     fe.attach_tap(&name, Box::new(file));
                     eprintln!("ruster-fe: IS-IS and OSPF of {name:?} go to {device}");
-                    self.taps.insert(name, index);
+                    let tap = Tap {
+                        index,
+                        handle,
+                        carrier: None,
+                    };
+                    self.taps.insert(name, tap);
                     self.errors.remove(&device);
                 }
                 Err(error) => {
@@ -310,7 +317,46 @@ impl Tuns {
                 }
             }
         }
+        self.set_carriers(fe);
     }
+
+    /// Sets each attached TAP device's carrier to its interface's link state.
+    fn set_carriers<B>(&mut self, fe: &Fe<B>)
+    where
+        B: PacketIo + GeneratedPacketIo,
+    {
+        if self.taps.is_empty() {
+            return;
+        }
+        let ports_up: Vec<bool> = fe.ports().iter().map(|p| tun::carrier(p)).collect();
+        for (name, tap) in &mut self.taps {
+            let up = fe.link_up(name, &ports_up);
+            if tap.carrier == Some(up) {
+                continue;
+            }
+            // Written once per change, also when it fails.
+            tap.carrier = Some(up);
+            let state = if up { "up" } else { "down" };
+            match tun::set_carrier(&tap.handle, up) {
+                Ok(()) => {
+                    eprintln!("ruster-fe: the link of {name:?} is {state}; so is its TAP device")
+                }
+                Err(error) => {
+                    eprintln!("ruster-fe: setting the TAP device of {name:?} {state}: {error}")
+                }
+            }
+        }
+    }
+}
+
+/// An attached TAP device.
+struct Tap {
+    /// Its interface index when opened.
+    index: u32,
+    /// A second handle to it (the FE holds the first), to set its carrier.
+    handle: std::fs::File,
+    /// The carrier last set; none yet after opening (it is up then).
+    carrier: Option<bool>,
 }
 
 fn main() -> ExitCode {

@@ -166,7 +166,7 @@ VLANのサブインターフェース。EtherIPも済んだ（core `overlay.rs`�
 fe `vxlan`の試験、netns `vxlan`。相手はLinuxのvxlanのデバイスで確かめた）。メンバーのポート（VLANのメンバーなら親のポート）は、FEが
 promiscuousにする（`ruster-fe`の`promisc.rs`。netns `bridge`で確かめた）。MACの表をFEの状態のsocketで見せるのもまだ（今は数をログに出すだけ）。
 IS-ISとOSPFのTAPも済んだ（`[isis]`、`[ospf]`、`[ospf6]`、confd `isis_ospf.rs`と`kernel.rs`、fe `tap.rs`、
-`ruster-frr`の`isis_ospf.rs`、netns `isis`と`ospf`）。TAPのリンクの状態をポートに合わせるのはまだ（overlay.mdの6.）。
+`ruster-frr`の`isis_ospf.rs`、netns `isis`と`ospf`）。TAPのcarrierはポートのリンクの状態に合わせる（overlay.mdの6.）。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信
 （IS-ISとOSPFがTAPで受けるものを除く）。

@@ -417,6 +417,45 @@ where
             .collect()
     }
 
+    /// Whether the link of `interface` is up, given whether each port's link is up
+    /// (`ports_up`, in port order): down when the current tables do not enable it;
+    /// a VLAN sub-interface's follows its parent's; an IRB's is up while one of its
+    /// members' is; another's (a tunnel's) is up.
+    pub fn link_up(&self, interface: &str, ports_up: &[bool]) -> bool {
+        interface_id(&self.interface_names, interface)
+            .is_some_and(|id| self.interface_link_up(id, ports_up))
+    }
+
+    fn interface_link_up(&self, id: IfId, ports_up: &[bool]) -> bool {
+        if !self.active.contains(&id) {
+            return false;
+        }
+        let member_up = |member: IfId| {
+            let port = self
+                .vlans
+                .iter()
+                .find(|v| v.sub == member)
+                .map_or(member, |v| v.parent);
+            if !self.active.contains(&port) {
+                return false;
+            }
+            if usize::from(port.0) < self.builder.ports.len() {
+                ports_up.get(usize::from(port.0)).copied().unwrap_or(false)
+            } else {
+                true
+            }
+        };
+        match self.bridges.irb_of(id) {
+            Some(bridge) => self.bridges.members(bridge).iter().any(|&m| member_up(m)),
+            None => member_up(id),
+        }
+    }
+
+    /// The ports, in order: port `i` is `IfId(i)`.
+    pub fn ports(&self) -> &[String] {
+        &self.builder.ports
+    }
+
     /// The VRFs of the current tables, the default VRF first.
     pub fn vrfs(&self) -> &[String] {
         &self.names
