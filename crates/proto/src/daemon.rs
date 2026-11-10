@@ -54,6 +54,11 @@ pub mod socket {
         format!("{name}/punt.sock")
     }
 
+    /// confd's table server for the source `name` (values found at run time).
+    pub fn confd_source(name: &str) -> String {
+        format!("confd/source/{name}.sock")
+    }
+
     /// ribd's table server for the route source `name`.
     pub fn ribd_source(name: &str) -> String {
         format!("ribd/source/{name}.sock")

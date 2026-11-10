@@ -8,9 +8,9 @@ use serde::Deserialize;
 use ruster_proto::table::DEFAULT_VRF;
 
 use crate::{
-    Dhcp, Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Target,
-    B4_ADDRESS, DHCP_LEASE_TIME, FILTERING, ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_OVERHEAD,
-    PSID_OFFSET, TUNNEL_MAC, TUNNEL_MTU, VERSION, VLAN_OVERHEAD,
+    Dhcp, Dns, FirewallOutside, FirewallRule, Interface, Kind, Lock, MapE, Nat, Route, Source,
+    Target, B4_ADDRESS, DHCP_LEASE_TIME, FILTERING, ICMP_ERRORS, MTU, NAT_PORTS, PPPOE_OVERHEAD,
+    PSID_OFFSET, SOURCE_KINDS, TUNNEL_MAC, TUNNEL_MTU, VERSION, VLAN_OVERHEAD,
 };
 
 #[derive(Deserialize)]
@@ -30,6 +30,16 @@ struct File {
     dns: Option<DnsEntry>,
     #[serde(default)]
     dhcp: Vec<DhcpEntry>,
+    #[serde(default)]
+    source: Vec<SourceEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct SourceEntry {
+    name: String,
+    kind: String,
+    sync_wait: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -334,6 +344,29 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         .into_iter()
         .map(|entry| dhcp(entry, &interfaces, dns.as_ref()))
         .collect::<Result<_, _>>()?;
+    let source = file
+        .source
+        .into_iter()
+        .map(|entry| {
+            let wait = SOURCE_KINDS
+                .iter()
+                .find(|(kind, _)| *kind == entry.kind)
+                .map(|&(_, wait)| wait)
+                .ok_or_else(|| {
+                    format!(
+                        "source {:?}: kind {:?} is not one of {:?}",
+                        entry.name,
+                        entry.kind,
+                        SOURCE_KINDS.iter().map(|(k, _)| *k).collect::<Vec<_>>()
+                    )
+                })?;
+            Ok(Source {
+                name: entry.name,
+                kind: entry.kind,
+                sync_wait: entry.sync_wait.unwrap_or(wait),
+            })
+        })
+        .collect::<Result<_, String>>()?;
     Ok(Lock {
         version: VERSION,
         firewall_filtering: filtering(file.firewall_filtering),
@@ -349,6 +382,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         firewall,
         dns: dns.into_iter().collect(),
         dhcp,
+        source,
     })
 }
 

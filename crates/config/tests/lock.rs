@@ -39,6 +39,8 @@ fn the_documented_example_is_read() {
     assert_eq!(lock.dns[0].listen, ["192.0.2.1"]);
     assert!(lock.dns[0].upstream_from.is_empty());
     assert_eq!(lock.dhcp[0].pool, "192.0.2.100-192.0.2.199");
+    assert_eq!(lock.source[0].kind, "pppoe");
+    assert_eq!(lock.source[0].sync_wait, 10);
 }
 
 #[test]

@@ -55,6 +55,7 @@ fn config(mtu: u16) -> Config {
         nat: None,
         dns: None,
         dhcp: Vec::new(),
+        sources: Vec::new(),
     }
 }
 
