@@ -200,6 +200,12 @@ fn a_relay_reply_for_another_link_or_broken_is_dropped() {
     ] {
         assert_eq!(reply(&link(), &message), Err(error));
     }
+    let twice = relay_reply(
+        "2001:db8:1::1",
+        0,
+        &[option(9, ADVERTISE), option(9, ADVERTISE)],
+    );
+    assert_eq!(reply(&link(), &twice), Err(Dropped::Malformed));
     let mut forward = relay_reply("2001:db8:1::1", 0, &good);
     forward[0] = 12;
     assert_eq!(reply(&link(), &forward), Err(Dropped::Type));

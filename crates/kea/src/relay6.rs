@@ -35,8 +35,9 @@
 //!   requests and computed on replies (RFC 8200 section 8.1).
 //!
 //! Deviations: a Relay-forward from another relay agent on the LAN is dropped (the
-//! router is the only one), and so are messages a client never sends (Advertise,
-//! Reply, Reconfigure, Relay-reply; RFC 8415 section 16); IPv6 with extension
+//! router is the only one), and so are the server's messages to a client
+//! (Advertise, Reply, Reconfigure) and Relay-reply; other types, unknown ones
+//! included, are relayed (RFC 8415 section 19); IPv6 with extension
 //! headers is dropped; a Relay-reply is taken only with hop-count 0 and the link's
 //! global address as link-address, and a reply only of a type a server sends to a
 //! client (Advertise, Reply, Reconfigure); a reply is sent with Hop Limit 64 and at
@@ -192,6 +193,8 @@ pub fn reply<'a>(link: &Link6, message: &'a [u8]) -> Result<(Ipv6Addr, &'a [u8])
             return Err(Dropped::Malformed);
         };
         match code {
+            // RFC 8415 section 21.10: one Relay Message option.
+            OPTION_RELAY_MSG if inner.is_some() => return Err(Dropped::Malformed),
             OPTION_RELAY_MSG => inner = Some(value),
             OPTION_INTERFACE_ID if value != link.interface.as_bytes() => return Err(Dropped::Link),
             _ => {}
