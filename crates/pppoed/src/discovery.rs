@@ -21,7 +21,7 @@
 //! - RFC 2516 Appendix A: Host-Uniq is sent in PADI and PADR and must come back
 //!   unchanged; AC-Cookie and Relay-Session-Id from the PADO are returned in the
 //!   PADR.
-//! - RFC 2516 sections 5.1 and 5.3: with no PADO, the PADI is sent again with the
+//! - RFC 2516 section 8: with no PADO, the PADI is sent again with the
 //!   wait doubled; with no PADS, the PADR is sent again the same way and, after
 //!   [`PADR_TRIES`], Discovery starts again from the PADI.
 //!
@@ -382,7 +382,7 @@ impl Discovery {
                 (tag::HOST_UNIQ, &self.host_uniq),
             ],
         ));
-        self.timer = Some(now + self.wait_ms);
+        self.timer = Some(now.saturating_add(self.wait_ms));
     }
 
     fn send_padr(&mut self, now: u64, out: &mut Vec<Vec<u8>>) {
@@ -403,6 +403,6 @@ impl Discovery {
             tags.push((tag::RELAY_SESSION_ID, relay));
         }
         out.push(frame(*ac, self.settings.mac, code::PADR, 0, &tags));
-        self.timer = Some(now + self.wait_ms);
+        self.timer = Some(now.saturating_add(self.wait_ms));
     }
 }
