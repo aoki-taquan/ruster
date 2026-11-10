@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 
 use ruster_kea::settings::{settings, Listen};
-use ruster_kea::Bridge;
+use ruster_kea::settings6::Listen6;
+use ruster_kea::{Bridge, Server};
 
 fn part(pool: &str) -> String {
     format!(
@@ -91,7 +92,7 @@ fn a_file_kea_refuses_is_put_back() {
     let served = bridge
         .take(&part("192.0.2.100-192.0.2.199"), &mut || written += 1)
         .unwrap();
-    assert_eq!(served.len(), 1);
+    assert_eq!(served.0.len(), 1);
     assert_eq!(written, 1);
     assert!(asked.recv().unwrap().contains("config-reload"));
     let before = std::fs::read_to_string(&file).unwrap();
@@ -117,5 +118,57 @@ fn without_kea_running_the_part_is_taken() {
     assert!(std::fs::read_to_string(&file)
         .unwrap()
         .contains("192.0.2.100 - 192.0.2.199"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A part with one dhcp6 entry, and the DHCPv4 entry of [`part`].
+fn part6(pool: &str) -> String {
+    part("192.0.2.100-192.0.2.199").replace(
+        "dhcp6 = []\n",
+        "",
+    ) + &format!(
+        "\n[[dhcp6]]\ninterface = \"lan\"\nmac = \"02:00:00:00:00:01\"\nlink-local = \"fe80::ff:fe00:1\"\naddress = \"2001:db8:1::1/64\"\npool = \"{pool}\"\npreferred-lifetime = 600\nvalid-lifetime = 1200\ndns = []\npunt-rate = 200\npunt-burst = 100\n"
+    )
+}
+
+#[test]
+fn dhcp6_needs_its_file_and_a_refusal_puts_both_back() {
+    let dir = dir("six");
+    let file = dir.join("ruster-dhcp4.json");
+    let file6 = dir.join("ruster-dhcp6.json");
+    let mut only4 = Bridge::new(file.clone(), None, listen());
+    let error = only4
+        .take(&part6("2001:db8:1::1000-2001:db8:1::1fff"), &mut || {})
+        .unwrap_err();
+    assert!(error.contains("--dhcp6"), "{error}");
+
+    // Kea's DHCPv4 takes each file; its DHCPv6 takes the first and refuses the second.
+    let (control, _asked) = kea(&dir, vec![0, 0, 0]);
+    let six = dir.join("six");
+    std::fs::create_dir_all(&six).unwrap();
+    let (control6, _asked6) = kea(&six, vec![0, 1, 0]);
+    let mut bridge = Bridge::new(file.clone(), Some(control), listen()).with_dhcp6(
+        Server {
+            path: file6.clone(),
+            control: Some(control6),
+        },
+        Listen6::parse("lo/::1").unwrap(),
+    );
+    let (served, served6) = bridge
+        .take(&part6("2001:db8:1::1000-2001:db8:1::1fff"), &mut || {})
+        .unwrap();
+    assert_eq!((served.len(), served6.len()), (1, 1));
+    let before = std::fs::read_to_string(&file6).unwrap();
+    assert!(
+        before.contains("2001:db8:1::1000 - 2001:db8:1::1fff"),
+        "{before}"
+    );
+    let before4 = std::fs::read_to_string(&file).unwrap();
+    let error = bridge
+        .take(&part6("2001:db8:1::2000-2001:db8:1::2fff"), &mut || {})
+        .unwrap_err();
+    assert!(error.contains("said 1"), "{error}");
+    assert_eq!(std::fs::read_to_string(&file6).unwrap(), before);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), before4);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,7 +1,10 @@
 //! Checks `[[dhcp6]]` of the lock form: a DHCPv6 server for one interface, which
 //! `ruster-kea` relays to. confd hands the entries to `ruster-kea` in the `dhcp`
 //! part ([`crate::part`]) and writes a punt class per entry that hands the
-//! interface's DHCPv6 (UDP port 547 to ff02::1:2) to `ruster-kea`.
+//! interface's UDP port 547 to `ruster-kea`: what is sent to a link-local multicast
+//! group (ff02::1:2, where clients send), and to the router's addresses after the
+//! input firewall. As the class does not name a family, IPv4 broadcasts to port 547
+//! go there too; ruster-kea drops them.
 //!
 //! # Standards
 //!

@@ -125,7 +125,12 @@ confd → 各プロセス: 確定
   取り込む。lease database、制御用のsocket、ログは運用者のファイルに書く。書いたら制御用のsocketで
   `config-reload`を送る。Keaが断ったら前のファイルに戻して断る。Keaが動いていなければ受け入れる
   （起動したときに読む）。
-- DHCPv6のリレー（RFC 8415のrelay-forw）はまだ。LANへのRAが先に要る。
+- DHCPv6は全体の設定の`[[dhcp6]]`。confdはUDPの547番を`kea`へ渡す行`dhcp6-<インターフェース名>`を書き、
+  `dhcp`の部分に入れて渡す。`ruster-kea`はインターフェースのグローバルなアドレスのUDP 547番からKeaの
+  dhcp6（`lo/::1`）へRelay-forwardを送り、KeaはRelay-replyをそのアドレスへ返す。クライアントへの返事は
+  ルータのリンクローカルアドレスから、クライアントが最後に送ってきたフレームのMACへ送る。Keaのdhcp6の
+  ファイルも同じく運用者の`kea-dhcp6.conf`が取り込む。クライアントがDHCPv6を使うには、`[[ra]]`で
+  `managed`か`other`を立てる。
 
 ### Unbound（`ruster-unbound`）
 
