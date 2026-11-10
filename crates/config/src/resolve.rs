@@ -338,33 +338,39 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
             // A bridge's own interface: its first port's or VLAN's MAC (a tunnel's
             // is the same on every router), and the smallest MTU of its members
             // given before it.
-            Kind::Bridge(bridge) => Some(
-                bridge
+            // An empty MAC: it has no such member.
+            Kind::Bridge(bridge) => {
+                let given: Vec<&Interface> = bridge
                     .members
                     .iter()
                     .filter_map(|member| interfaces.iter().find(|i| i.name == *member))
+                    .collect();
+                let mac = given
+                    .iter()
                     .find(|i| matches!(i.kind, Kind::Port | Kind::Vlan { .. }))
-                    .map(|i| {
-                        let mtu = interfaces
-                            .iter()
-                            .filter(|m| bridge.members.contains(&m.name))
-                            .map(|m| m.mtu)
-                            .min()
-                            .unwrap_or(i.mtu);
-                        (i.mac.clone(), mtu)
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "{at}: give its mac, or a port or VLAN given before it as a member"
-                        )
-                    }),
-            ),
+                    .map_or_else(String::new, |i| i.mac.clone());
+                Some(
+                    given
+                        .iter()
+                        .map(|m| m.mtu)
+                        .min()
+                        .map(|mtu| (mac, mtu))
+                        .ok_or_else(|| {
+                            format!("{at}: its first member must be an interface given before it")
+                        }),
+                )
+            }
             _ => None,
         };
         let mac = match (entry.mac, &kind, &parent) {
             (Some(mac), ..) => mac,
             (None, Kind::Tunnel { .. } | Kind::EtherIp { .. } | Kind::Vxlan { .. }, _) => {
                 TUNNEL_MAC.to_owned()
+            }
+            (None, Kind::Bridge(_), Some(Ok((mac, _)))) if mac.is_empty() => {
+                return Err(format!(
+                    "{at}: give its mac: it has no port or VLAN member given before it"
+                ))
             }
             (None, _, Some(parent)) => parent.clone()?.0,
             (None, ..) => return Err(format!("{at}: mac is missing")),

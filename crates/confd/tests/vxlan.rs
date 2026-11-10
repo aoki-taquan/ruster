@@ -121,3 +121,14 @@ fn bad_vxlan_interfaces_are_refused() {
     let error = parse(&text).unwrap_err();
     assert!(error.contains("already has VXLAN"), "{error}");
 }
+
+#[test]
+fn a_bridge_of_tunnels_only_needs_its_mac() {
+    let vxlan = r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] }"#;
+    let error = parse(&with(vxlan, r#"members = ["vx0"]"#)).unwrap_err();
+    assert!(error.contains("give its mac"), "{error}");
+    let text = with(vxlan, r#"members = ["vx0"]"#) + "mac = \"02:00:00:00:00:77\"\n";
+    let config = parse(&text).unwrap();
+    let br0 = config.interfaces.iter().find(|i| i.name == "br0").unwrap();
+    assert_eq!((br0.mac, br0.mtu), ([2, 0, 0, 0, 0, 0x77], 1450));
+}
