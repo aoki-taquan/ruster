@@ -46,6 +46,7 @@ fn config(mtu: u16) -> Config {
             vlan: None,
             tunnel: None,
             pppoe: None,
+            ipv4_from: None,
         }],
         static_routes: Vec::new(),
         firewall: Vec::new(),
@@ -170,6 +171,7 @@ fn what_is_accepted_after_a_refused_send_is_cleaned_up_later() {
         vlan: None,
         tunnel: None,
         pppoe: None,
+        ipv4_from: None,
     });
     confd.set_config(with_wan);
     settle(&mut fe, &mut confd, &mut check);

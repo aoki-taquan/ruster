@@ -60,9 +60,12 @@ FEに書く表は「設定」と「動的な値」から計算する。
 
 | 種類 | 書ける値 |
 |---|---|
-| dhcp-client | 指定したインターフェースのIPv4アドレス |
-| dhcpv6-client | 指定したインターフェースのIPv6アドレス、委任されたプレフィックス、DS-LiteのAFTRのアドレス、MAP-Eのルール |
-| pppoe | PPPoEのセッション（ID、相手のMAC）、IPCPで得たアドレス |
+| dhcp-client | IPv4アドレス、DNSサーバ |
+| dhcpv6-client | IPv6アドレス（IA_NA）、委任されたプレフィックス（IA_PD）、DNSサーバ |
+| pppoe | PPPoEのセッション（ID、相手のMAC）、IPCPで得たアドレス、DNSサーバ |
+
+どのインターフェースの値になるかは設定が決める（`ipv4-from`など）。DS-LiteのAFTRやMAP-Eのルールは、
+今は設定に書く。
 
 経路はconfdではなく`ruster-ribd`へ渡す（DHCPのdefault経路など）。
 

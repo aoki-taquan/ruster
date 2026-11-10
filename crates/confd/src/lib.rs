@@ -25,6 +25,9 @@
 //! with the session's ID, AC and MTU (at most the configured one) and the IPv4
 //! address the source has; routes out of it are offered to ribd only then, and NAT
 //! with it as the outside (and no `external`) is left out while it has no address.
+//! An interface with `ipv4-from` is always there, with the IPv4 address its source
+//! (a DHCP client) has while it has one; as NAT's outside (with no `external`), NAT
+//! and the routes out of it wait for that address, as for a session.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -65,6 +68,25 @@ pub struct InterfaceConfig {
     /// session and its IPv4 address. The interface is in the FE only while the
     /// source has a session, with the IPv4 address it has (if any) instead of `ipv4`.
     pub pppoe: Option<(String, String)>,
+    /// The source (of kind `dhcp-client`) whose IPv4 address the interface has
+    /// while the source has one, instead of `ipv4`.
+    pub ipv4_from: Option<String>,
+}
+
+impl InterfaceConfig {
+    /// The source the interface's IPv4 address comes from: a PPPoE session's, or
+    /// `ipv4_from`.
+    pub fn ipv4_source(&self) -> Option<&str> {
+        self.pppoe
+            .as_ref()
+            .map(|(_, source)| source.as_str())
+            .or(self.ipv4_from.as_deref())
+    }
+
+    /// Whether the interface's IPv4 address comes from a source.
+    pub fn address_from_source(&self) -> bool {
+        self.ipv4_source().is_some()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -355,6 +377,23 @@ impl Confd {
         self.sources.ipv4(name)
     }
 
+    /// The delegated prefix the source `name` has sent and that has not run out:
+    /// the prefix, its length, and its preferred and valid lifetimes.
+    pub fn source_prefix(&self, name: &str) -> Option<(Ipv6Addr, u8, u32, u32)> {
+        self.sources.prefix(name)
+    }
+
+    /// The IPv6 address and prefix length the source `name` has sent and that has
+    /// not run out.
+    pub fn source_ipv6(&self, name: &str) -> Option<(Ipv6Addr, u8)> {
+        self.sources.ipv6(name)
+    }
+
+    /// The DNS servers the source `name` has sent and that have not run out.
+    pub fn source_dns(&self, name: &str) -> &[IpAddr] {
+        self.sources.dns(name)
+    }
+
     /// The peers whose connection closed. Connecting again sends everything again;
     /// a [`PeerKind::Part`] process connects again by itself.
     pub fn closed(&self) -> Vec<PeerKind> {
@@ -564,7 +603,7 @@ impl Confd {
                     .interfaces
                     .iter()
                     .find(|i| i.name == nat.outside)
-                    .is_none_or(|i| i.pppoe.is_none() || self.ipv4(i).is_some())
+                    .is_none_or(|i| !i.address_from_source() || self.ipv4(i).is_some())
         };
         if let Some(nat) = self.config.nat.as_ref().filter(outside_ready) {
             out.insert(
@@ -628,10 +667,12 @@ impl Confd {
     /// is its prefix's network or broadcast address: the same checks as for an
     /// address in the configuration ([`file`](mod@file)).
     fn ipv4_in(&self, config: &Config, interface: &InterfaceConfig) -> Option<(Ipv4Addr, u8)> {
-        let Some((_, source)) = &interface.pppoe else {
+        let Some(source) = interface.ipv4_source() else {
             return interface.ipv4;
         };
-        self.session(interface)?;
+        if interface.pppoe.is_some() {
+            self.session(interface)?;
+        }
         let (address, len) = self.sources.ipv4(source)?;
         let host_mask = u32::MAX.checked_shr(u32::from(len)).unwrap_or(0);
         let host = u32::from(address) & host_mask;
@@ -646,25 +687,26 @@ impl Confd {
             .interfaces
             .iter()
             .filter(|i| i.name != interface.name && i.vrf == interface.vrf)
-            .filter_map(|i| match &i.pppoe {
+            .filter_map(|i| match i.ipv4_source() {
                 None => i.ipv4,
-                Some((_, other)) => self.sources.ipv4(other),
+                Some(other) => self.sources.ipv4(other),
             })
             .any(overlaps);
         (!taken).then_some((address, len))
     }
 
-    /// The configuration with each PPPoE session's IPv4 address now, for the kernel
-    /// side ([`kernel`]).
+    /// The configuration with the IPv4 address now of each interface that takes it
+    /// from a source, for the kernel side ([`kernel`]).
     pub fn with_values(&self) -> Config {
         self.with_values_of(&self.config)
     }
 
-    /// `config` with each PPPoE session's IPv4 address now.
+    /// `config` with the IPv4 address now of each interface that takes it from a
+    /// source.
     pub fn with_values_of(&self, config: &Config) -> Config {
         let mut out = config.clone();
         for interface in &mut out.interfaces {
-            if interface.pppoe.is_some() {
+            if interface.address_from_source() {
                 interface.ipv4 = self.ipv4_in(config, interface);
             }
         }
@@ -771,6 +813,7 @@ impl Confd {
             .as_ref()
             .is_some_and(|nat| nat.outside == interface.name && nat.external.is_none());
         let up = match &interface.pppoe {
+            None if nat_outside && interface.ipv4_from.is_some() => self.ipv4(interface).is_some(),
             None => true,
             Some(_) if nat_outside => self.ipv4(interface).is_some(),
             Some(_) => self.session(interface).is_some(),
@@ -1044,6 +1087,7 @@ mod tests {
             vlan: None,
             tunnel: None,
             pppoe: None,
+            ipv4_from: None,
         };
         let route = |len| StaticRoute {
             vrf: "default".into(),
@@ -1092,6 +1136,7 @@ mod tests {
             vlan,
             tunnel: None,
             pppoe: None,
+            ipv4_from: None,
         };
         let config = |trunk_enabled| Config {
             interfaces: vec![

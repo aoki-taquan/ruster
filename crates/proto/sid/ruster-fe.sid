@@ -463,6 +463,84 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-source:delegated-prefix",
+        "sid": 60210,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:delegated-prefix/prefix",
+        "sid": 60211,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:delegated-prefix/prefix-length",
+        "sid": 60212,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:delegated-prefix/preferred-lifetime",
+        "sid": 60213,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:delegated-prefix/valid-lifetime",
+        "sid": 60214,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:delegated-prefix/lifetime",
+        "sid": 60215,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv6-address",
+        "sid": 60220,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv6-address/address",
+        "sid": 60221,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv6-address/prefix-length",
+        "sid": 60222,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:ipv6-address/lifetime",
+        "sid": 60223,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:dns-servers",
+        "sid": 60230,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:dns-servers/address",
+        "sid": 60231,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-source:dns-servers/lifetime",
+        "sid": 60232,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"

@@ -88,8 +88,20 @@ pub enum Key {
     SourcePppoe {
         source: String,
     },
-    /// The IPv4 address a source found (by IPCP, or later DHCP); one per source.
+    /// The IPv4 address a source found (by IPCP or DHCP); one per source.
     SourceIpv4 {
+        source: String,
+    },
+    /// The IPv6 prefix delegated to a source (DHCPv6 IA_PD); one per source.
+    SourcePrefix {
+        source: String,
+    },
+    /// The IPv6 address a source found (DHCPv6 IA_NA); one per source.
+    SourceIpv6 {
+        source: String,
+    },
+    /// The DNS servers a source found (DHCP, DHCPv6 or IPCP); one list per source.
+    SourceDns {
         source: String,
     },
 }
@@ -152,7 +164,33 @@ pub enum Value {
         prefix_len: u8,
         lifetime: u32,
     },
+    /// A delegated prefix (no bits set after its length) and the preferred and
+    /// valid lifetimes the delegating router gave it, in seconds (RFC 8415 section
+    /// 21.22); valid for `lifetime` seconds from when it arrives.
+    SourcePrefix {
+        prefix: std::net::Ipv6Addr,
+        prefix_len: u8,
+        preferred: u32,
+        valid: u32,
+        lifetime: u32,
+    },
+    /// An IPv6 address and prefix length, valid for `lifetime` seconds from when it
+    /// arrives.
+    SourceIpv6 {
+        address: std::net::Ipv6Addr,
+        prefix_len: u8,
+        lifetime: u32,
+    },
+    /// 1 to [`SOURCE_DNS_MAX`] DNS servers, IPv4 or IPv6, valid for `lifetime`
+    /// seconds from when they arrive.
+    SourceDns {
+        servers: Vec<IpAddr>,
+        lifetime: u32,
+    },
 }
+
+/// The most DNS servers one source sends.
+pub const SOURCE_DNS_MAX: usize = 8;
 
 /// One class of `ruster-punt`: frames that match go to `destination`, at most
 /// `rate` per second and `burst` at once.
@@ -458,6 +496,9 @@ impl Key {
             Self::Punt { .. } => sid::PUNT,
             Self::SourcePppoe { .. } => sid::SOURCE_PPPOE,
             Self::SourceIpv4 { .. } => sid::SOURCE_IPV4,
+            Self::SourcePrefix { .. } => sid::SOURCE_PREFIX,
+            Self::SourceIpv6 { .. } => sid::SOURCE_IPV6,
+            Self::SourceDns { .. } => sid::SOURCE_DNS,
         }
     }
 }
@@ -528,7 +569,11 @@ impl Change {
             | Key::FirewallRule { vrf, .. } => name(vrf)?,
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
             Key::Punt { class } => name(class)?,
-            Key::SourcePppoe { source } | Key::SourceIpv4 { source } => name(source)?,
+            Key::SourcePppoe { source }
+            | Key::SourceIpv4 { source }
+            | Key::SourcePrefix { source }
+            | Key::SourceIpv6 { source }
+            | Key::SourceDns { source } => name(source)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 parse_prefix(&format!("{prefix}/{len}"))?;
@@ -550,6 +595,9 @@ impl Change {
                         | (Key::Punt { .. }, Value::Punt(_))
                         | (Key::SourcePppoe { .. }, Value::SourcePppoe { .. })
                         | (Key::SourceIpv4 { .. }, Value::SourceIpv4 { .. })
+                        | (Key::SourcePrefix { .. }, Value::SourcePrefix { .. })
+                        | (Key::SourceIpv6 { .. }, Value::SourceIpv6 { .. })
+                        | (Key::SourceDns { .. }, Value::SourceDns { .. })
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -690,6 +738,47 @@ impl Change {
                             return Err(ModelError::Invalid("lifetime"));
                         }
                     }
+                    Value::SourcePrefix {
+                        prefix,
+                        prefix_len,
+                        preferred,
+                        valid,
+                        lifetime,
+                    } => {
+                        let address = IpAddr::V6(*prefix);
+                        if *prefix_len == 0
+                            || *prefix_len > 128
+                            || network(address, *prefix_len) != address
+                        {
+                            return Err(ModelError::Invalid("prefix"));
+                        }
+                        if preferred > valid || *valid == 0 {
+                            return Err(ModelError::Invalid("prefix lifetimes"));
+                        }
+                        if *lifetime == 0 {
+                            return Err(ModelError::Invalid("lifetime"));
+                        }
+                    }
+                    Value::SourceIpv6 {
+                        prefix_len,
+                        lifetime,
+                        ..
+                    } => {
+                        if *prefix_len == 0 || *prefix_len > 128 {
+                            return Err(ModelError::Invalid("prefix length"));
+                        }
+                        if *lifetime == 0 {
+                            return Err(ModelError::Invalid("lifetime"));
+                        }
+                    }
+                    Value::SourceDns { servers, lifetime } => {
+                        if servers.is_empty() || servers.len() > SOURCE_DNS_MAX {
+                            return Err(ModelError::Invalid("number of DNS servers"));
+                        }
+                        if *lifetime == 0 {
+                            return Err(ModelError::Invalid("lifetime"));
+                        }
+                    }
                     Value::Address { prefix_len } => {
                         let Key::Address { address, .. } = &self.key else {
                             unreachable!("checked above");
@@ -792,6 +881,15 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::SourceIpv4 { source } => {
             e.array(2).u64(sid::SOURCE_IPV4).text(source);
         }
+        Key::SourcePrefix { source } => {
+            e.array(2).u64(sid::SOURCE_PREFIX).text(source);
+        }
+        Key::SourceIpv6 { source } => {
+            e.array(2).u64(sid::SOURCE_IPV6).text(source);
+        }
+        Key::SourceDns { source } => {
+            e.array(2).u64(sid::SOURCE_DNS).text(source);
+        }
         Key::FirewallRule { vrf, id } => {
             e.array(3)
                 .u64(sid::FIREWALL_RULE)
@@ -811,7 +909,10 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::ICMP_ERRORS
         | sid::PUNT
         | sid::SOURCE_PPPOE
-        | sid::SOURCE_IPV4 => 2,
+        | sid::SOURCE_IPV4
+        | sid::SOURCE_PREFIX
+        | sid::SOURCE_IPV6
+        | sid::SOURCE_DNS => 2,
         sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
@@ -830,6 +931,9 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::PUNT => Key::Punt { class: first },
         sid::SOURCE_PPPOE => Key::SourcePppoe { source: first },
         sid::SOURCE_IPV4 => Key::SourceIpv4 { source: first },
+        sid::SOURCE_PREFIX => Key::SourcePrefix { source: first },
+        sid::SOURCE_IPV6 => Key::SourceIpv6 { source: first },
+        sid::SOURCE_DNS => Key::SourceDns { source: first },
         sid::FIREWALL_RULE => Key::FirewallRule {
             vrf: first,
             id: u32::try_from(d.u64()?).map_err(|_| ModelError::Invalid("rule id"))?,
@@ -974,6 +1078,50 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(d(sid::SOURCE_IPV4_LIFETIME))
                 .u64(u64::from(*lifetime));
         }
+        Value::SourcePrefix {
+            prefix,
+            prefix_len,
+            preferred,
+            valid,
+            lifetime,
+        } => {
+            let d = |member: u64| member - sid::SOURCE_PREFIX;
+            e.map(5)
+                .u64(d(sid::SOURCE_PREFIX_PREFIX))
+                .text(&prefix.to_string())
+                .u64(d(sid::SOURCE_PREFIX_PREFIX_LENGTH))
+                .u64(u64::from(*prefix_len))
+                .u64(d(sid::SOURCE_PREFIX_PREFERRED))
+                .u64(u64::from(*preferred))
+                .u64(d(sid::SOURCE_PREFIX_VALID))
+                .u64(u64::from(*valid))
+                .u64(d(sid::SOURCE_PREFIX_LIFETIME))
+                .u64(u64::from(*lifetime));
+        }
+        Value::SourceIpv6 {
+            address,
+            prefix_len,
+            lifetime,
+        } => {
+            let d = |member: u64| member - sid::SOURCE_IPV6;
+            e.map(3)
+                .u64(d(sid::SOURCE_IPV6_ADDRESS))
+                .text(&address.to_string())
+                .u64(d(sid::SOURCE_IPV6_PREFIX_LENGTH))
+                .u64(u64::from(*prefix_len))
+                .u64(d(sid::SOURCE_IPV6_LIFETIME))
+                .u64(u64::from(*lifetime));
+        }
+        Value::SourceDns { servers, lifetime } => {
+            let d = |member: u64| member - sid::SOURCE_DNS;
+            e.map(2)
+                .u64(d(sid::SOURCE_DNS_ADDRESS))
+                .array(servers.len() as u64);
+            for server in servers {
+                e.text(&server.to_string());
+            }
+            e.u64(d(sid::SOURCE_DNS_LIFETIME)).u64(u64::from(*lifetime));
+        }
         Value::IcmpErrors {
             ipv4_interval_ms,
             ipv6_burst,
@@ -1110,6 +1258,9 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::PUNT
             | sid::SOURCE_PPPOE
             | sid::SOURCE_IPV4
+            | sid::SOURCE_PREFIX
+            | sid::SOURCE_IPV6
+            | sid::SOURCE_DNS
     ) {
         return decode_policy_value(table, d);
     }
@@ -1462,7 +1613,14 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
     };
     let value = if table == sid::PUNT {
         decode_punt(&mut got)?
-    } else if table == sid::SOURCE_PPPOE || table == sid::SOURCE_IPV4 {
+    } else if matches!(
+        table,
+        sid::SOURCE_PPPOE
+            | sid::SOURCE_IPV4
+            | sid::SOURCE_PREFIX
+            | sid::SOURCE_IPV6
+            | sid::SOURCE_DNS
+    ) {
         decode_source(table, &mut got)?
     } else if table == sid::ICMP_ERRORS {
         let mut number = |member: u64, what: &'static str| match got.remove(&member) {
@@ -1621,10 +1779,12 @@ fn decode_source(
         Some(_) => Err(ModelError::Invalid(what)),
         None => Err(ModelError::Missing(what)),
     };
-    let lifetime_sid = if table == sid::SOURCE_PPPOE {
-        sid::SOURCE_PPPOE_LIFETIME
-    } else {
-        sid::SOURCE_IPV4_LIFETIME
+    let lifetime_sid = match table {
+        sid::SOURCE_PPPOE => sid::SOURCE_PPPOE_LIFETIME,
+        sid::SOURCE_PREFIX => sid::SOURCE_PREFIX_LIFETIME,
+        sid::SOURCE_IPV6 => sid::SOURCE_IPV6_LIFETIME,
+        sid::SOURCE_DNS => sid::SOURCE_DNS_LIFETIME,
+        _ => sid::SOURCE_IPV4_LIFETIME,
     };
     let lifetime = u32::try_from(number(lifetime_sid, "lifetime")?)
         .map_err(|_| ModelError::Invalid("lifetime"))?;
@@ -1643,6 +1803,59 @@ fn decode_source(
             peer,
             mtu,
             lifetime,
+        });
+    }
+    if table == sid::SOURCE_DNS {
+        let servers = match got.remove(&sid::SOURCE_DNS_ADDRESS) {
+            Some(Member::List(list)) => list
+                .iter()
+                .map(|text| parse_ip(text))
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(_) => return Err(ModelError::Invalid("address")),
+            None => return Err(ModelError::Missing("address")),
+        };
+        return Ok(Value::SourceDns { servers, lifetime });
+    }
+    if table == sid::SOURCE_PREFIX || table == sid::SOURCE_IPV6 {
+        let (address_sid, len_sid) = if table == sid::SOURCE_PREFIX {
+            (sid::SOURCE_PREFIX_PREFIX, sid::SOURCE_PREFIX_PREFIX_LENGTH)
+        } else {
+            (sid::SOURCE_IPV6_ADDRESS, sid::SOURCE_IPV6_PREFIX_LENGTH)
+        };
+        let prefix_len = u8::try_from(number(len_sid, "prefix-length")?)
+            .map_err(|_| ModelError::Invalid("prefix length"))?;
+        let lifetimes = if table == sid::SOURCE_PREFIX {
+            let mut seconds = |member: u64, what: &'static str| {
+                u32::try_from(number(member, what)?).map_err(|_| ModelError::Invalid(what))
+            };
+            Some((
+                seconds(sid::SOURCE_PREFIX_PREFERRED, "preferred-lifetime")?,
+                seconds(sid::SOURCE_PREFIX_VALID, "valid-lifetime")?,
+            ))
+        } else {
+            None
+        };
+        let address = match got.remove(&address_sid) {
+            Some(Member::Text(text)) => match parse_ip(&text)? {
+                IpAddr::V6(address) => address,
+                IpAddr::V4(_) => return Err(ModelError::Invalid("IPv6 address")),
+            },
+            Some(_) => return Err(ModelError::Invalid("address")),
+            None => return Err(ModelError::Missing("address")),
+        };
+        return Ok(match lifetimes {
+            Some((preferred, valid)) => Value::SourcePrefix {
+                prefix: address,
+                prefix_len,
+                preferred,
+                valid,
+                lifetime,
+            },
+            None => Value::SourceIpv6 {
+                address,
+                prefix_len,
+                lifetime,
+            },
         });
     }
     let prefix_len = u8::try_from(number(sid::SOURCE_IPV4_PREFIX_LENGTH, "prefix-length")?)
