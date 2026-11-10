@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![doc = "A small, allocation-free IPv4 and ARP packet-processing core."]
 
+mod bridge;
 mod checksum;
 mod firewall;
 mod firewall6;
@@ -34,6 +35,7 @@ mod time;
 mod tunnel;
 mod vlan;
 
+pub use bridge::{BridgeCounters, BridgeDecision, BridgeLimits, Learned, MacEntry, MacTable};
 pub use checksum::{internet_checksum, ipv4_header_checksum, rfc1624_update};
 #[cfg(feature = "validation-test-hooks")]
 #[doc(hidden)]

@@ -86,6 +86,8 @@ pub(crate) enum DirectoryHashDomain {
     /// Evicted allowing or poisoned keys of the fragment association table
     /// (NAT-FRAG tombstones).
     Ipv4FragmentTombstone = 0x4950_4652_544f_4d42,
+    /// The MAC address table of the bridges, keyed by the bridge and the address.
+    BridgeMac = 0x4252_4944_4d41_4321,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
