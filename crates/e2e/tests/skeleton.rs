@@ -79,6 +79,7 @@ fn config() -> Config {
         ra: Vec::new(),
         sources: Vec::new(),
         pppoe: Vec::new(),
+        bgp: None,
     }
 }
 
