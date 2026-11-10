@@ -12,7 +12,8 @@
 //! - An `[[ra]]` whose `prefix-from` names that source advertises that /64 too,
 //!   on-link and for SLAAC, with the delegated prefix's lifetimes.
 //! - `[dns]`'s `upstream-from`: the DNS servers its sources have now, in order and
-//!   once each, go to `ruster-unbound` with the `dns` part (`upstream-found`).
+//!   once each, go to `ruster-unbound` with the `dns` part (`upstream-found`);
+//!   link-local ones are left out.
 //! - A `[map-e]` with `prefix-from` is a MAP-E CE of the source's prefix: its
 //!   tunnel, NAT and routes come and go with the prefix, worked out as for a
 //!   prefix given (RFC 7597 sections 5.2 and 6, [`crate::file`]).
@@ -100,7 +101,9 @@ pub(crate) fn with_delegated(base: &Config, sources: &Sources) -> Config {
     if let Some(dns) = &base.dns {
         for name in &dns.upstream_from {
             for server in sources.dns(name) {
-                if !out.dns_found.contains(server) {
+                // A link-local server needs an interface Unbound is not told.
+                let link_local = matches!(server, IpAddr::V6(a) if a.is_unicast_link_local());
+                if !link_local && !out.dns_found.contains(server) {
                     out.dns_found.push(*server);
                 }
             }
