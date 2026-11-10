@@ -50,9 +50,9 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
 - ルータ箱としての組み立て:
   - 運用者が書く全体の設定。FEの表（CORECONF）とは別の形で、CEの各コンポーネントの設定も含む。
     FEの表を書くのはCEのプロセスだけで、運用者が直接書くことはない。
-  - 既製のソフト（経路デーモンのFRR、DHCPのサーバのKea、DNSのサーバのUnbound）とrusterをつなぐ橋渡し役。
-    FRRで使うプロトコルは、BGP、IS-IS、OSPF（v2とv3）、BGP EVPN（RFC 7432、RFC 8365。VXLANの制御）。ソフトごとに一つ置き、
+  - 既製のソフト（経路デーモンのFRR、DHCPのサーバのKea、DNSのサーバのUnbound）とrusterをつなぐ橋渡し役。ソフトごとに一つ置き、
     全体の設定から自分の担当の部分を読んで相手のソフトの設定に変え、相手から得た値をCEのプロセスへ渡す。
+    FRRで使うプロトコルは、BGP、IS-IS、OSPF（v2とv3）、BGP EVPN（RFC 7432、RFC 8365。VXLANの制御）。
   - 自作する制御: PPPoEの制御（Discovery、LCP、認証、IPCP、IPv6CP）、WAN側のDHCPクライアント
     （DHCPv4、DHCPv6とプレフィックスの委任）、LANへのRA。
 
