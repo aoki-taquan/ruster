@@ -19,12 +19,14 @@
 //! - RFC 1661 section 5.7: a Protocol-Reject of LCP is RXJ-, of another protocol
 //!   RXJ+, and that protocol is no longer used. Sections 5.8 and 5.9: an
 //!   Echo-Request is answered with our Magic-Number only in the Opened state;
-//!   Discard-Request is dropped; Echo packets that carry our own Magic-Number
-//!   (a looped-back link) are dropped. Protocol-Reject for a protocol we do not
-//!   run is sent only in the Opened state, cut to fit the MRU.
+//!   Discard-Request is dropped. Protocol-Reject for a protocol we do not run is
+//!   sent only in the Opened state, cut to fit the MRU.
 //!
 //! Deviations: PFC and every other option not listed above are rejected (PFC is
-//! allowed by RFC 2516 but the FE reads two-byte protocol numbers). A peer that
+//! allowed by RFC 2516 but the FE reads two-byte protocol numbers). A peer MRU
+//! below [`MRU_MIN`] is Nak'd with [`MRU_MIN`]. Echo packets shorter than four
+//! octets or carrying our own Magic-Number (a looped-back link) are dropped, not
+//! answered. A peer that
 //! Code-Rejects Echo-Request is not sent more of them. The echo keepalive is not in
 //! RFC 1661; its interval and limit are ours.
 
@@ -128,7 +130,7 @@ impl Negotiation for LcpOptions {
                         peer_mru = mru;
                         None
                     } else {
-                        Some(MRU.to_be_bytes().to_vec())
+                        Some(mru.clamp(MRU_MIN, MRU).to_be_bytes().to_vec())
                     }
                 }
                 (option::AUTH_PROTOCOL, _) => match value {
@@ -145,9 +147,14 @@ impl Negotiation for LcpOptions {
                 (option::MAGIC_NUMBER, 4) => {
                     let magic = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
                     if magic == 0 || magic == self.magic {
-                        // Perhaps a looped-back link: both sides pick again.
-                        self.magic = self.new_magic(magic);
-                        let other = self.new_magic(self.magic);
+                        // Perhaps a looped-back link: suggest another number.
+                        // Ours changes only when the peer Naks it.
+                        let other = loop {
+                            let other = self.new_magic(magic);
+                            if other != self.magic {
+                                break other;
+                            }
+                        };
                         Some(other.to_be_bytes().to_vec())
                     } else {
                         peer_magic = magic;

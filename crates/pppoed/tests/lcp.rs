@@ -72,14 +72,19 @@ fn peer_options() {
     );
     // A Nak does not take the values in.
     assert_eq!(o.peer_mru, 1492);
-    // Our own magic number: Nak with another, and ours changes too.
+    // Our own magic number: Nak with another; ours changes only on a Nak.
     let looped = [&[5, 6][..], &ours.to_be_bytes()].concat();
     let Reply::Nak(nak) = o.check(&options(&looped), true) else {
         panic!("not a Nak");
     };
     assert_eq!(nak[..2], [5, 6]);
     assert_ne!(nak[2..], ours.to_be_bytes());
-    assert_ne!(o.magic, ours);
+    assert_eq!(o.magic, ours);
+    // An MRU below the smallest we take: Nak with that smallest.
+    assert_eq!(
+        o.check(&options(&[1, 4, 0, 100]), true),
+        Reply::Nak(vec![1, 4, 0, 128])
+    );
     // After Max-Failure, what would be Nak'd is rejected.
     assert_eq!(
         o.check(&options(&[1, 4, 0x05, 0xdc]), false),
