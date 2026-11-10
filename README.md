@@ -95,8 +95,8 @@ via = "198.51.100.1"          # 省略すると直結の経路
 ```
 
 起動はFEが先です。ほかのプロセスは、相手のsocketができるまで10秒待ちます。socketは`/run/ruster`の下にでき（`--run-dir`で変えられる）、
-同じグループのプロセスだけが開けます。FEだけをrootで動かすときは、先に`sudo install -d -m 2750 -g "$(id -g)" /run/ruster`で
-自分のグループのディレクトリを作ります（[`ce-processes.md`](docs/design/ce-processes.md)の「socketの権限」）。
+同じグループのプロセスだけが開けます。FEだけをrootで動かすときは、先に`sudo install -d -m 2750 -o "$(id -u)" -g "$(id -g)" /run/ruster`で
+自分のディレクトリを作ります（[`ce-processes.md`](docs/design/ce-processes.md)の「socketの権限」）。
 
 ```bash
 sudo ruster-fe lan wan &         # 転送するデバイスを並べる。rootが要る

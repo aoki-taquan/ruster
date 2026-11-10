@@ -37,10 +37,18 @@ socketはルータのプロセスだけが開けるようにする。決まり�
 | 置き方 | 用意すること |
 |---|---|
 | 全部をrootで動かす（netnsの試験） | 無し。グループもrootになる |
-| プロセスごとにユーザーを分ける | ルータのプロセスが共有するグループ（例: `ruster`）を作り、各プロセスをそのグループで動かす。一番上のディレクトリはそのグループとset-group-IDの印を付けて先に作る（`install -d -m 2750 -g ruster /run/ruster`、systemdならtmpfiles.dの`d /run/ruster 2750 root ruster`） |
+| プロセスごとにユーザーを分ける | ルータのプロセスが共有するグループ（例: `ruster`）を作り、各プロセスをそのグループで動かす。一番上のディレクトリと、各プロセスのディレクトリ（下の表の作るsocketの一段目）を先に作る。一番上はグループとset-group-IDの印を付けて2750、各プロセスのディレクトリはそのプロセスのユーザーの持ち物で2750（systemdならtmpfiles.dで`d /run/ruster 2750 root ruster`、`d /run/ruster/ribd 2750 ribd ruster`など） |
+
+一番上をグループが書けるようにはしない。書けると、グループのプロセスがほかのプロセスのディレクトリを
+先に作ったり置き換えたりして、そのプロセスのふりができる。各プロセスは自分のディレクトリの下
+（`confd/source/`など）だけを作る。
+
+前の版（ディレクトリを0700で作った）から更新したときや、全部をrootで動かした後にユーザーを分けるときは、
+残ったディレクトリとlockのファイルの持ち主と権限がそのままなので、`/run/ruster`を消すか再起動してから始める。
 
 分けるときのユーザーと、各プロセスが開くsocketは次のとおり。rootが要るのは、AF_XDPやAF_PACKETを使う
-FEと、TUNを作る`confd --kernel`だけ（capabilityで絞ってもよい）。
+FEと、TUNを作る`confd --kernel`（capabilityで絞ってもよい）。`ruster-unbound`と`ruster-frr`は相手の
+ソフトの設定を書いて読み直させるので、そのファイルとsystemctlやvtyshを使える権限が要る。
 
 | プロセス | ユーザー | 作るsocket | つなぐ、送るsocket |
 |---|---|---|---|
@@ -50,7 +58,7 @@ FEと、TUNを作る`confd --kernel`だけ（capabilityで絞ってもよい）�
 | `ruster-neighd` | 専用 | `neighd/config.sock`、`neighd/punt.sock` | `fe/neigh.sock`、`fe/punt/arp-nd.sock`、`confd/part.sock` |
 | `ruster-pppoed`、`ruster-dhcpc` | 専用 | `<名前>/punt.sock` | `fe/punt/<名前>.sock`、`confd/part.sock`、`confd/source/*.sock`、`ribd/source/<名前>.sock` |
 | `ruster-kea` | 専用 | `kea/punt.sock` | `fe/punt/kea.sock`、`confd/part.sock` |
-| `ruster-unbound`、`ruster-frr` | 専用 | 無し | `confd/part.sock`（frrは`ribd/source/frr.sock`も） |
+| `ruster-unbound`、`ruster-frr` | 専用（上の権限付き） | 無し | `confd/part.sock`（frrは`ribd/source/frr.sock`も） |
 | `ruster`（CLI） | グループの運用者 | 無し | `confd/config.sock`、`fe/state.sock`、`confd/source/*.sock`、`ribd/source/*.sock` |
 
 限界: グループは一つなので、グループに入ったプロセスはどのsocketも開ける。たとえば`ruster-unbound`も

@@ -23,8 +23,9 @@
 //!   set on the top directory reaches every socket under it.
 //!
 //! When every process runs as root (as in the netns scripts), the group is root's and
-//! nothing else is needed. When they run as different users, the top directory is made
-//! beforehand with the set-group-ID bit and a group shared by the router's processes
+//! nothing else is needed. When they run as different users, the top directory (with
+//! the set-group-ID bit and a group shared by the router's processes) and each
+//! process's own directory under it are made beforehand
 //! (`docs/design/ce-processes.md`, "socketの権限").
 
 use std::io::{self, ErrorKind};
@@ -199,6 +200,8 @@ fn take_lock(path: &Path) -> io::Result<()> {
 /// A non-blocking listening stream socket at `path`.
 pub fn listen(path: &Path) -> io::Result<UnixListener> {
     remove_stale(path)?;
+    // Until the mode is set the umask decides it; the 0750 directory keeps others out
+    // in the meantime.
     let listener = UnixListener::bind(path)?;
     set_socket_mode(path)?;
     listener.set_nonblocking(true)?;
