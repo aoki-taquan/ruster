@@ -462,6 +462,10 @@ fn network_packets_before_authentication_are_dropped() {
     let mut out = Output::default();
     s.receive(1, FrameKind::Control, &frame, &mut out);
     assert!(out.frames.is_empty());
+    // Nor is another control protocol answered with a Protocol-Reject yet.
+    let (_, frame) = ac.session(0x80fd, code::CONFIGURE_REQUEST, 1, &[]);
+    s.receive(1, FrameKind::Control, &frame, &mut out);
+    assert!(out.frames.is_empty());
 }
 
 #[test]

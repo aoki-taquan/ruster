@@ -4,10 +4,13 @@
 //! A [`Session`] runs Discovery, then LCP, then the authentication the peer asked
 //! for, then IPCP and (when enabled) IPv6CP. It reports [`Event::Up`] with every
 //! value the session got ([`SessionUp`]) when the first network protocol opens,
-//! and again whenever a value changes; each report is whole, not a change. When the
-//! session ends after an Up it reports [`Event::Down`]; an attempt that ends before
-//! is reported as [`Event::Failed`]. Either way it starts again from Discovery
-//! after a wait that doubles while attempts keep failing.
+//! and again whenever a value changes; each report is whole, not a change. When no
+//! network protocol is open any more it reports [`Event::Down`]: the session has
+//! ended, or the peer is negotiating again, and an Up may follow on the same
+//! session. An attempt that ends without an Up is reported as [`Event::Failed`].
+//! Either way an ended attempt starts again from Discovery after a wait that
+//! doubles while attempts keep failing. The first reason found for an ending is
+//! the one reported.
 //!
 //! # Standards
 //!
@@ -223,6 +226,16 @@ impl Session {
             self.restart_at = None;
             self.phase = Phase::Discovery;
             self.reason = None;
+            // A new Host-Uniq, so that a late answer to an earlier attempt is
+            // not taken.
+            self.discovery = Discovery::new(
+                discovery::Settings {
+                    mac: self.settings.mac,
+                    service: self.settings.service.clone(),
+                    ac_name: self.settings.ac_name.clone(),
+                },
+                self.rng.next_u64().to_be_bytes(),
+            );
             let mut frames = Vec::new();
             self.discovery.start(now, &mut frames);
             push(out, FrameKind::Discovery, frames);
@@ -235,7 +248,7 @@ impl Session {
             let notice = self.lcp.timeout(now, &mut actions);
             self.lcp_actions(now, actions, out);
             if notice == Some(Notice::NoEcho) {
-                self.reason = Some(Reason::NoEcho);
+                self.reason.get_or_insert(Reason::NoEcho);
                 self.lower_down(now, true, out);
             }
         }
@@ -278,11 +291,11 @@ impl Session {
         match event {
             Some(discovery::Event::Session { .. }) => self.begin_link(now, out),
             Some(discovery::Event::Refused(_)) => {
-                self.reason = Some(Reason::Refused);
+                self.reason.get_or_insert(Reason::Refused);
                 self.end(now, out);
             }
             Some(discovery::Event::Terminated) => {
-                self.reason = Some(Reason::AcTerminated);
+                self.reason.get_or_insert(Reason::AcTerminated);
                 self.lower_down(now, false, out);
             }
             None => {}
@@ -300,14 +313,16 @@ impl Session {
         let information = packet.information;
         match packet.protocol {
             protocol::LCP => {
-                if ppp::Packet::parse(information)
-                    .is_some_and(|p| p.code == fsm::code::TERMINATE_REQUEST)
-                    && self.reason.is_none()
-                {
-                    self.reason = Some(Reason::PeerTerminated);
-                }
+                let was_opened = self.lcp.opened();
                 let mut actions = Vec::new();
                 let notice = self.lcp.receive(now, information, &mut actions);
+                if was_opened
+                    && self.lcp.fsm.state() == fsm::State::Stopping
+                    && ppp::Packet::parse(information)
+                        .is_some_and(|p| p.code == fsm::code::TERMINATE_REQUEST)
+                {
+                    self.reason.get_or_insert(Reason::PeerTerminated);
+                }
                 self.lcp_actions(now, actions, out);
                 if let Some(Notice::ProtocolRejected(rejected)) = notice {
                     let mut actions = Vec::new();
@@ -344,11 +359,14 @@ impl Session {
             }
             protocol::IPCP => {}
             protocol::IPV6CP if self.settings.ipv6 => {}
-            other => {
+            // Before the network phase, other packets are discarded (RFC 1661
+            // section 3.4).
+            other if self.phase == Phase::Network => {
                 if let Some(reject) = self.lcp.protocol_reject(other, information) {
                     self.send(protocol::LCP, reject, out);
                 }
             }
+            _ => {}
         }
     }
 
