@@ -87,8 +87,13 @@ mac = "02:00:00:00:01:02"
         (r#"bridge = { members = [] }"#, "member"),
         (r#"bridge = { members = ["p9"] }"#, "first member"),
         (r#"bridge = { members = ["p1", "p9"] }"#, "no interface"),
+        // IEEE 802.1Q 8.8.3: 10 to 1000000 seconds.
         (
-            r#"bridge = { members = ["p1"], aging-time = 5 }"#,
+            r#"bridge = { members = ["p1"], aging-time = 9 }"#,
+            "aging-time",
+        ),
+        (
+            r#"bridge = { members = ["p1"], aging-time = 1000001 }"#,
             "aging-time",
         ),
         (
@@ -118,6 +123,14 @@ vlan = 3"#,
         let text = format!("{base}\n[[interface]]\nname = \"br0\"\n{bridge}\n");
         let error = parse(&text).unwrap_err();
         assert!(error.contains(why), "{bridge}: {error}");
+    }
+    // The ends of the range are taken.
+    for aging in [10, 1_000_000] {
+        let text = format!(
+            "{base}\n[[interface]]\nname = \"br0\"\nbridge = {{ members = [\"p1\"], aging-time = {aging} }}\n"
+        );
+        let config = parse(&text).unwrap();
+        assert_eq!(config.bridges[0].aging_s, aging);
     }
     // A member with an address.
     let text = format!(

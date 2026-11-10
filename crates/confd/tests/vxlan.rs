@@ -120,6 +120,9 @@ fn bad_vxlan_interfaces_are_refused() {
     );
     let error = parse(&text).unwrap_err();
     assert!(error.contains("already has VXLAN"), "{error}");
+    // RFC 7348 section 5: the largest 24-bit VNI is taken.
+    let top = r#"vxlan = { vni = 16777215, local = "192.0.2.1", remote = ["198.51.100.2"] }"#;
+    assert!(parse(&with(top, MEMBERS)).is_ok());
 }
 
 #[test]

@@ -1100,6 +1100,143 @@ mod tests {
         assert_eq!(unwrap(&t, other).0, Ok(Received::NotOverlay));
     }
 
+    /// RFC 7348 section 5: the seven R flags and both reserved fields "MUST be set to
+    /// zero on transmission and ignored on receipt"; only the I flag is looked at.
+    #[test]
+    fn vxlan_reserved_bits_are_ignored_on_receipt() {
+        let t = vxlan(LOCAL4.into(), vec![REMOTE4.into()]);
+        let frame = inner();
+        let mut outer = outer_vxlan(REMOTE4, 0xff, 100, &frame);
+        // Flags at 42, reserved 43..46, VNI 46..49, reserved 49.
+        outer[43..46].copy_from_slice(&[0xff; 3]);
+        outer[49] = 0xff;
+        let (result, bytes, ingress) = unwrap(&t, outer);
+        assert_eq!(
+            result,
+            Ok(Received::Unwrapped {
+                vtep: Some(REMOTE4.into())
+            })
+        );
+        assert_eq!((bytes, ingress), (frame, MEMBER));
+        // Every flag but I set: dropped (the I flag "MUST be set to 1").
+        assert_eq!(
+            unwrap(&t, outer_vxlan(REMOTE4, 0xf7, 100, &inner())).0,
+            Err(DropReason::OverlayInvalid)
+        );
+    }
+
+    /// RFC 7348 section 5: the VNI is 24 bits, in network byte order after the
+    /// flags and 24 reserved bits.
+    #[test]
+    fn vxlan_vni_takes_all_24_bits() {
+        let mut t = vxlan(LOCAL4.into(), vec![REMOTE4.into()]);
+        t.overlays[0].kind = OverlayKind::Vxlan {
+            vni: 0x00ab_cdef,
+            remotes: vec![REMOTE4.into()],
+        };
+        let s = snapshot(&t);
+        let frame = inner();
+        let h = header(
+            &s,
+            &t.overlays[0],
+            REMOTE4.into(),
+            &frame,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
+        assert_eq!(&h.bytes()[42..50], &[0x08, 0, 0, 0, 0xab, 0xcd, 0xef, 0]);
+        let (result, _, _) = unwrap(&t, outer_vxlan(REMOTE4, 0x08, 0x00ab_cdef, &frame));
+        assert!(matches!(result, Ok(Received::Unwrapped { .. })));
+        // Only the low two octets the same: another VNI.
+        let (result, _, _) = unwrap(&t, outer_vxlan(REMOTE4, 0x08, 0x0000_cdef, &frame));
+        assert_eq!(result, Err(DropReason::OverlayUnknownPeer));
+    }
+
+    /// RFC 7348 section 5: the UDP source port comes from a hash of the inner frame
+    /// and "SHOULD" be in the dynamic/private range 49152-65535; the destination is
+    /// 4789.
+    #[test]
+    fn vxlan_source_ports_stay_in_the_dynamic_range() {
+        let t = vxlan(LOCAL4.into(), vec![REMOTE4.into()]);
+        let s = snapshot(&t);
+        let mut ports = std::collections::BTreeSet::new();
+        for i in 0..=255_u8 {
+            let mut frame = udp_ipv4(&inner());
+            // The inner source port and the inner destination address.
+            frame[14 + 20] = i;
+            frame[14 + 19] = i.wrapping_mul(7);
+            let h = header(
+                &s,
+                &t.overlays[0],
+                REMOTE4.into(),
+                &frame,
+                |_| false,
+                &mut NullTrace,
+            )
+            .unwrap();
+            let b = h.bytes();
+            let port = u16::from_be_bytes([b[34], b[35]]);
+            assert!(port >= 49152, "{port}");
+            assert_eq!(&b[36..38], &4789_u16.to_be_bytes());
+            ports.insert(port);
+        }
+        assert!(ports.len() > 128, "the flows spread: {}", ports.len());
+    }
+
+    /// RFC 7348 section 5 over IPv6 (RFC 8200 section 8.1): a VXLAN packet sent with
+    /// its UDP checksum unwraps at the other end to the same frame and VNI.
+    #[test]
+    fn vxlan_over_ipv6_unwraps_to_itself() {
+        let local: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let remote: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let t = vxlan(local.into(), vec![remote.into()]);
+        let s = snapshot(&t);
+        let frame = inner();
+        let mut packet = lease(PORT, frame.clone());
+        let port = transmit_member(
+            &mut packet,
+            MEMBER,
+            Some(remote.into()),
+            &s,
+            |_| false,
+            &mut NullTrace,
+        )
+        .unwrap();
+        let mut wrapped = packet.bytes_mut().to_vec();
+        packet.commit(port);
+        assert_eq!(wrapped[20], 17);
+        assert_eq!(&wrapped[56..58], &4789_u16.to_be_bytes());
+        assert_eq!(&wrapped[62..70], &[0x08, 0, 0, 0, 0, 0, 100, 0]);
+        wrapped[0..6].copy_from_slice(&PORT_MAC);
+        let (a, b) = (wrapped[22..38].to_vec(), wrapped[38..54].to_vec());
+        wrapped[22..38].copy_from_slice(&b);
+        wrapped[38..54].copy_from_slice(&a);
+        let (result, bytes, ingress) = unwrap(&t, wrapped);
+        assert_eq!(
+            result,
+            Ok(Received::Unwrapped {
+                vtep: Some(remote.into())
+            })
+        );
+        assert_eq!((bytes, ingress), (frame, MEMBER));
+    }
+
+    /// RFC 3378 section 3: version 3 is the only one; every other is dropped.
+    #[test]
+    fn etherip_takes_version_3_only() {
+        let t = tables(1500, LOCAL4.into(), REMOTE4.into());
+        let frame = inner();
+        for version in 0..16 {
+            let (result, _, _) = unwrap(&t, outer_ipv4(REMOTE4, version, &frame));
+            if version == 3 {
+                assert_eq!(result, Ok(Received::Unwrapped { vtep: None }));
+            } else {
+                assert_eq!(result, Err(DropReason::OverlayInvalid), "version {version}");
+            }
+        }
+    }
+
     #[test]
     fn vxlan_sends_to_the_learned_vtep_only() {
         let t = vxlan(LOCAL4.into(), vec![REMOTE4.into()]);

@@ -903,6 +903,75 @@ mod tests {
         );
     }
 
+    /// IEEE 802.1Q-2018 table 8-1: the whole block 01-80-C2-00-00-00 to -0F is
+    /// filtered, and the address after it is relayed.
+    #[test]
+    fn the_reserved_block_ends_at_0f() {
+        let mut t = table(16, 16);
+        for last in 0..=0x0f {
+            assert_eq!(
+                t.receive(
+                    0,
+                    P1,
+                    None,
+                    &frame([0x01, 0x80, 0xc2, 0, 0, last], A),
+                    None,
+                    0
+                ),
+                BridgeDecision::Drop,
+                "01-80-C2-00-00-{last:02X}"
+            );
+        }
+        assert_eq!(t.counters().next().unwrap().dropped, 16);
+        assert_eq!(
+            t.receive(
+                0,
+                P1,
+                None,
+                &frame([0x01, 0x80, 0xc2, 0, 0, 0x10], A),
+                None,
+                0
+            ),
+            BridgeDecision::Flood { irb: false }
+        );
+    }
+
+    /// IEEE 802.1Q-2018 8.6.3 and 8.8: a group address is never looked up, so a
+    /// multicast frame is flooded (and taken by the IRB) even when a frame from that
+    /// address was seen; a group source is not learned (8.7).
+    #[test]
+    fn multicast_is_flooded_and_never_learned() {
+        let mut t = table(16, 16);
+        let group = [0x01, 0x00, 0x5e, 0x00, 0x00, 0x05];
+        assert_eq!(
+            t.receive(0, P1, None, &frame(group, A), Some(IRB), 0),
+            BridgeDecision::Flood { irb: true }
+        );
+        assert_eq!(
+            t.receive(0, P2, None, &frame(group, B), None, 1),
+            BridgeDecision::Flood { irb: false }
+        );
+        assert_eq!(
+            t.receive(0, P2, None, &frame(B, group), None, 2),
+            BridgeDecision::Drop
+        );
+        assert!(t.entries().all(|e| e.mac != group));
+        assert_eq!(t.send(0, &group, 3), None);
+        assert_eq!(t.send(0, &[0xff; 6], 3), None);
+    }
+
+    /// IEEE 802.1Q-2018 8.7 and 8.8.3: each frame from an address refreshes its
+    /// entry, and the ageing time counts from the last one seen.
+    #[test]
+    fn a_frame_from_an_address_restarts_its_ageing() {
+        let mut t = table(16, 16);
+        t.receive(0, P1, None, &frame(B, A), None, 0);
+        t.receive(0, P1, None, &frame(B, A), None, 200_000);
+        assert_eq!(t.send(0, &A, 500_000), Some((P1, None)));
+        assert_eq!(t.send(0, &A, 500_001), None);
+        assert_eq!(t.counters().next().unwrap().learned, 1);
+    }
+
     #[test]
     fn an_address_behind_a_vtep_is_sent_to_that_vtep() {
         let mut t = table(16, 16);
