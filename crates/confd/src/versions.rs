@@ -2,9 +2,11 @@
 //! (`docs/design/router-box.md`, "反映の流れ").
 //!
 //! A version is committed when every process has taken a new configuration (see
-//! [`crate::apply`]). Each one keeps the lock form, the `ruster.toml` text when the
-//! configuration came as one, the time and how it came. Numbers go up by one and are
-//! never used again; the last [`KEEP`] versions are kept and older ones are deleted.
+//! [`crate::apply`]), with two exceptions: the file confd starts with, which is kept
+//! before it is sent, and a configuration whose answers confd stopped waiting for,
+//! which stays in use. Each version keeps the lock form, the `ruster.toml` text when
+//! the configuration came as one, the time and how it came. Numbers go up by one from
+//! the latest kept; the last [`KEEP`] versions are kept and older ones are deleted.
 //!
 //! With `--state-dir DIR`, the versions are files, so they outlive confd:
 //!
@@ -21,9 +23,16 @@
 //! At start-up confd uses the latest version ([`Versions::starting_config`]). The file
 //! given on its command line is read only when there is no version yet, and then it
 //! becomes version 1: it is the first configuration, not the one confd goes back to
-//! each time it starts. To start over from the file, empty the directory. If the
-//! latest version cannot be read (for example, after an update that reads another
-//! lock form version), confd does not start, rather than run an older configuration.
+//! each time it starts. To start over from the file, empty the directory (numbering
+//! then starts again from 1).
+//!
+//! An update of ruster can change the lock form, so the latest version's lock form
+//! may not read. Then, if the version has a `ruster.toml` text, confd resolves it
+//! again with this ruster's defaults and keeps the result as a new version. If
+//! neither reads, confd does not start, rather than run an older configuration. An
+//! older version that does not read is left out with a line in the log. If the start-up
+//! file cannot be kept (a full disk, a directory confd cannot write), confd does not
+//! start either.
 
 use std::fmt::Write as _;
 use std::fs;
@@ -78,26 +87,44 @@ impl Versions {
             .mode(0o700)
             .create(&dir)
             .map_err(at)?;
-        let mut list = Vec::new();
+        let mut found = Vec::new();
         for entry in fs::read_dir(&dir).map_err(at)? {
             let entry = entry.map_err(at)?;
             let name = entry.file_name();
+            // Exactly the names confd writes; a temporary file left by a crash, or
+            // anything else, is not a version.
             let Some(number) = name
                 .to_str()
                 .and_then(|n| n.strip_suffix(".toml"))
+                .filter(|n| n.len() == 6 && n.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|n| n.parse::<u64>().ok())
             else {
-                // A temporary file left by a crash, or something else.
                 continue;
             };
-            let path = entry.path();
-            let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            let mut version: Version =
-                toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-            version.number = number;
-            list.push(version);
+            found.push((number, entry.path()));
         }
-        list.sort_by_key(|v| v.number);
+        found.sort();
+        let mut list = Vec::new();
+        let latest = found.last().map(|(n, _)| *n);
+        for (number, path) in found {
+            let read = fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|text| toml::from_str::<Version>(&text).map_err(|e| e.to_string()));
+            match read {
+                Ok(mut version) => {
+                    version.number = number;
+                    list.push(version);
+                }
+                // Only the latest version decides how confd starts.
+                Err(error) if Some(number) == latest => {
+                    return Err(format!("{}: {error}", path.display()));
+                }
+                Err(error) => eprintln!(
+                    "ruster-confd: {}: {error}; this older version is left out",
+                    path.display()
+                ),
+            }
+        }
         Ok(Self {
             dir: Some(dir),
             list,
@@ -149,9 +176,23 @@ impl Versions {
     /// version, or else the file at `path`, which is then kept as version 1.
     pub fn starting_config(&mut self, path: &str) -> Result<(Config, String), String> {
         if let Some(latest) = self.latest() {
-            let at = format!("version {}", latest.number);
-            let config = file::parse(&latest.lock).map_err(|e| format!("{at}: {e}"))?;
-            return Ok((config, at));
+            let number = latest.number;
+            let at = format!("version {number}");
+            let lock_error = match file::parse(&latest.lock) {
+                Ok(config) => return Ok((config, at)),
+                Err(error) => error,
+            };
+            // After an update the lock form may have changed; a ruster.toml is
+            // resolved again with this ruster's defaults.
+            let Some(toml) = latest.toml.clone() else {
+                return Err(format!("{at}: {lock_error}"));
+            };
+            let candidate = file::candidate(&toml).map_err(|e| {
+                format!("{at}: {lock_error}; its ruster.toml does not read either: {e}")
+            })?;
+            let how = format!("ruster.toml of version {number} resolved again at start-up");
+            let new = self.commit(&how, &candidate.lock, Some(&toml))?;
+            return Ok((candidate.config, format!("version {new} ({how})")));
         }
         let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
         let candidate = file::candidate(&text).map_err(|e| format!("{path}: {e}"))?;
@@ -187,10 +228,14 @@ fn file_name(number: u64) -> String {
 /// temporary file, synced, renamed, and the directory synced.
 pub fn write_atomically(dir: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     let temp = dir.join(format!(".{name}.tmp"));
+    // One left by a crash is made again, so that it gets mode 0600.
+    match fs::remove_file(&temp) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(&temp)?;
     file.write_all(bytes)?;

@@ -127,6 +127,57 @@ fn a_latest_version_that_cannot_be_read_stops_the_start() {
 }
 
 #[test]
+fn a_lock_form_from_before_an_update_is_resolved_again_from_its_ruster_toml() {
+    let dir = state_dir("update");
+    let mut versions = Versions::open(&dir).unwrap();
+    // As if an older ruster had written a lock form this one does not read.
+    versions
+        .commit("apply", "version = 1\nold-key = 3\n", Some(TOML))
+        .unwrap();
+    let mut again = Versions::open(&dir).unwrap();
+    let (config, from) = again.starting_config("/nonexistent").unwrap();
+    assert_eq!(
+        from,
+        "version 2 (ruster.toml of version 1 resolved again at start-up)"
+    );
+    assert_eq!(config.interfaces[0].name, "lan");
+    let latest = again.latest().unwrap();
+    assert_eq!(latest.lock, file::candidate(TOML).unwrap().lock);
+    assert_eq!(latest.toml.as_deref(), Some(TOML));
+
+    // With a ruster.toml that does not read either, confd does not start.
+    versions
+        .commit(
+            "apply",
+            "version = 1\nold-key = 3\n",
+            Some("[[interface]]\n"),
+        )
+        .unwrap();
+    let error = Versions::open(&dir)
+        .unwrap()
+        .starting_config("/nonexistent")
+        .unwrap_err();
+    assert!(error.contains("does not read either"), "{error}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn an_older_version_that_does_not_read_is_left_out() {
+    let dir = state_dir("older");
+    let mut versions = Versions::open(&dir).unwrap();
+    versions.commit("apply", "version = 1\n", None).unwrap();
+    versions.commit("apply", "version = 1\n", None).unwrap();
+    std::fs::write(dir.join("versions/000001.toml"), "how = 3").unwrap();
+    // Names confd does not write are not versions.
+    std::fs::write(dir.join("versions/1.toml"), "how = 3").unwrap();
+    std::fs::write(dir.join("versions/+00002.toml"), "how = 3").unwrap();
+    let again = Versions::open(&dir).unwrap();
+    let numbers: Vec<u64> = again.list().iter().map(|v| v.number).collect();
+    assert_eq!(numbers, [2]);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn times_are_shown_in_utc() {
     assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
     assert_eq!(utc(951_782_400), "2000-02-29 00:00:00 UTC");
