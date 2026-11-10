@@ -2,7 +2,8 @@
 //! the configuration from confd and writes Unbound's settings to FILE
 //! ([`ruster_unbound`]). After each change it runs COMMAND, split at spaces
 //! (`systemctl restart unbound` when not given; an empty one runs nothing). It tells
-//! systemd it is ready once FILE is written, so Unbound can be started after it.
+//! systemd it is ready once FILE is first written, before running COMMAND, so
+//! Unbound can be started after it. A program path with spaces cannot be given.
 //! When confd goes away it connects again every second.
 
 use std::path::PathBuf;
@@ -53,20 +54,19 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        let mut took = false;
         let progress = client.poll(&mut |part| {
-            let result = bridge.take(part);
+            let result = bridge.take(part, &mut || {
+                if !ready {
+                    ready = true;
+                    eprintln!("ruster-unbound: wrote the settings");
+                    daemon::notify("READY=1");
+                }
+            });
             if let Err(error) = &result {
                 eprintln!("ruster-unbound: refused a part: {error}");
             }
-            took |= result.is_ok();
             result
         })?;
-        if took && !ready {
-            ready = true;
-            eprintln!("ruster-unbound: wrote the settings");
-            daemon::notify("READY=1");
-        }
         idle.wait(progress);
     }
 }

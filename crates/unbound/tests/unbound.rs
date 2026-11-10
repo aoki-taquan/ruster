@@ -74,29 +74,63 @@ fn a_part_is_written_and_reloaded() {
         format!("echo x >> {}", log.display()),
     ];
     let mut bridge = Bridge::new(file.clone(), reload);
-    bridge.take(&dns_part(Some(&dns()))).unwrap();
+    bridge.take(&dns_part(Some(&dns())), &mut || {}).unwrap();
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
         settings(Some(&dns())).unwrap()
     );
     // The same part again runs nothing.
-    bridge.take(&dns_part(Some(&dns()))).unwrap();
-    bridge.take(&dns_part(None)).unwrap();
+    bridge.take(&dns_part(Some(&dns())), &mut || {}).unwrap();
+    bridge.take(&dns_part(None), &mut || {}).unwrap();
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "x\nx\n");
-    assert!(bridge.take("version = 1\ndns = [1]\n").is_err());
+    assert!(bridge.take("version = 1\ndns = [1]\n", &mut || {}).is_err());
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
-fn a_failed_reload_puts_the_file_before_back_and_refuses() {
+fn a_failed_command_puts_the_file_before_back_and_refuses() {
     let dir = dir("fail");
     let file = dir.join("ruster.conf");
-    let mut bridge = Bridge::new(file.clone(), vec!["false".into()]);
-    // The first part is kept: Unbound may not be running yet.
-    bridge.take(&dns_part(None)).unwrap();
+    let flag = dir.join("broken");
+    let reload = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("! test -e {}", flag.display()),
+    ];
+    // The first part fails too, and then there is no file.
+    std::fs::write(&flag, "").unwrap();
+    let mut bridge = Bridge::new(file.clone(), reload);
+    let mut written = 0;
+    assert!(bridge.take(&dns_part(None), &mut || written += 1).is_err());
+    assert_eq!(written, 1, "told before the command runs");
+    assert!(!file.exists());
+
+    std::fs::remove_file(&flag).unwrap();
+    bridge.take(&dns_part(None), &mut || {}).unwrap();
     let first = std::fs::read_to_string(&file).unwrap();
-    let error = bridge.take(&dns_part(Some(&dns()))).unwrap_err();
-    assert!(error.contains("false failed"), "{error}");
+    std::fs::write(&flag, "").unwrap();
+    let error = bridge
+        .take(&dns_part(Some(&dns())), &mut || {})
+        .unwrap_err();
+    assert!(error.contains("failed"), "{error}");
     assert_eq!(std::fs::read_to_string(&file).unwrap(), first);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn after_a_start_the_command_runs_for_the_file_it_finds() {
+    let dir = dir("again");
+    let file = dir.join("ruster.conf");
+    let log = dir.join("runs");
+    let reload = vec![
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("echo x >> {}", log.display()),
+    ];
+    std::fs::write(&file, settings(None).unwrap()).unwrap();
+    let mut bridge = Bridge::new(file.clone(), reload);
+    bridge.take(&dns_part(None), &mut || {}).unwrap();
+    bridge.take(&dns_part(None), &mut || {}).unwrap();
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "x\n");
     std::fs::remove_dir_all(&dir).unwrap();
 }

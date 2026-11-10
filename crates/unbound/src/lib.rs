@@ -21,12 +21,14 @@
 //! on its defaults (localhost) only.
 //!
 //! Taking a part ([`Bridge::take`]): the file is replaced (written next to it, then
-//! renamed), and the command is run. When it fails, the file before is put
-//! back, the command is run once more, and the part is refused, so confd puts the
-//! configuration before back. A part that gives the file it already holds changes
-//! nothing and runs nothing. The first part after ruster-unbound starts is the
-//! exception: a failed command is only logged, because Unbound may not be running yet
-//! and reads the file when it starts.
+//! renamed), and the command is run. When it fails, or takes longer than
+//! [`COMMAND_LIMIT`], the file before is put back, the command is run once more, and
+//! the part is refused, so confd puts the configuration before back. A part that
+//! gives the file it already holds changes nothing and runs nothing, except the first
+//! part after ruster-unbound starts, which always runs the command. ruster-unbound
+//! tells systemd it is ready once the first file is written, before that command, so
+//! Unbound's unit can be ordered after it (`systemctl restart unbound` then starts
+//! Unbound). While the command runs, ruster-unbound answers nothing else.
 //!
 //! The upstream servers that a WAN DHCP client or PPPoE finds at run time are not
 //! used yet (the lock form's `upstream-from`).
@@ -42,7 +44,8 @@
 use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use ruster_config::Dns;
 
@@ -89,13 +92,17 @@ pub fn settings(dns: Option<&Dns>) -> Result<String, String> {
     Ok(out)
 }
 
-/// Writes the file and runs the reload command.
+/// How long the command may take; it is stopped after this and counts as failed,
+/// well before confd stops waiting for an answer (30 s).
+pub const COMMAND_LIMIT: Duration = Duration::from_secs(20);
+
+/// Writes the file and runs the command that has Unbound read it.
 #[derive(Debug)]
 pub struct Bridge {
     path: PathBuf,
     reload: Vec<String>,
-    /// The text the file holds, once a part was taken.
-    holds: Option<String>,
+    /// Whether a part was taken since ruster-unbound started.
+    took: bool,
 }
 
 impl Bridge {
@@ -104,36 +111,40 @@ impl Bridge {
         Self {
             path,
             reload,
-            holds: None,
+            took: false,
         }
     }
 
     /// Takes a `dns` part ([`ruster_config::dns_part`]), or refuses it with the reason.
-    pub fn take(&mut self, part: &str) -> Result<(), String> {
+    /// `written` runs once the file holds the part, before the command.
+    pub fn take(&mut self, part: &str, written: &mut dyn FnMut()) -> Result<(), String> {
         let dns = ruster_config::parse_dns_part(part)?;
         let text = settings(dns.as_ref())?;
-        let first = self.holds.is_none();
-        let before = std::fs::read_to_string(&self.path).ok();
-        if before.as_deref() == Some(text.as_str()) {
-            self.holds = Some(text);
+        let before = match std::fs::read_to_string(&self.path) {
+            Ok(before) => Some(before),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(format!("{}: {error}", self.path.display())),
+        };
+        // After a start, the command runs even for the file it finds: Unbound may not
+        // have read it (ruster-unbound may have stopped between the two).
+        if self.took && before.as_deref() == Some(text.as_str()) {
             return Ok(());
         }
-        self.write(&text)?;
-        if let Err(error) = self.run_reload() {
-            if first {
-                eprintln!("ruster-unbound: {error}; Unbound reads the file when it starts");
-            } else {
-                let put_back = match &before {
-                    Some(before) => self.write(before),
-                    None => std::fs::remove_file(&self.path).map_err(|e| e.to_string()),
-                };
-                if let Err(again) = put_back.and_then(|()| self.run_reload()) {
-                    eprintln!("ruster-unbound: putting the file before back: {again}");
-                }
-                return Err(error);
-            }
+        if before.as_deref() != Some(text.as_str()) {
+            self.write(&text)?;
         }
-        self.holds = Some(text);
+        written();
+        if let Err(error) = self.run_reload() {
+            let put_back = match &before {
+                Some(before) => self.write(before),
+                None => std::fs::remove_file(&self.path).map_err(|e| e.to_string()),
+            };
+            if let Err(again) = put_back.and_then(|()| self.run_reload()) {
+                eprintln!("ruster-unbound: putting the file before back: {again}");
+            }
+            return Err(error);
+        }
+        self.took = true;
         Ok(())
     }
 
@@ -149,24 +160,36 @@ impl Bridge {
         let Some((program, args)) = self.reload.split_first() else {
             return Ok(());
         };
-        let output = Command::new(program)
+        let command = self.reload.join(" ");
+        let mut child = Command::new(program)
             .args(args)
-            .output()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|e| format!("{program}: {e}"))?;
-        if output.status.success() {
+        let start = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if start.elapsed() < COMMAND_LIMIT => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("{command} took longer than {COMMAND_LIMIT:?}"));
+                }
+                Err(error) => return Err(format!("{command}: {error}")),
+            }
+        };
+        if status.success() {
             return Ok(());
         }
-        let said = String::from_utf8_lossy(&output.stderr);
-        let said = said.trim();
-        let said = if said.is_empty() {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        } else {
-            said.to_owned()
-        };
-        Err(format!(
-            "{} failed ({}): {said}",
-            self.reload.join(" "),
-            output.status
-        ))
+        let mut said = String::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr, &mut said);
+        }
+        Err(format!("{command} failed ({status}): {}", said.trim()))
     }
 }

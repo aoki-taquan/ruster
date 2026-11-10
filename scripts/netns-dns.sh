@@ -154,11 +154,13 @@ start ruster-neighd
 start ruster-confd --kernel "$work/router.toml"
 # Without Unbound running, the first part's restart starts it.
 start ruster-unbound --reload "$work/restart-unbound" "$udir/ruster.conf"
-for _ in $(seq 1 50); do [[ -s "$udir/unbound.pid" ]] && break; sleep 0.1; done
-[[ -s "$udir/ruster.conf" ]] || fail "ruster-unbound wrote no settings"
+up=0
+for _ in $(seq 1 100); do
+  nsx "$router" unbound-control -c "$udir/unbound.conf" status >/dev/null 2>&1 && { up=1; break; }
+  sleep 0.1
+done
+(( up == 1 )) || fail "the router's Unbound does not run"
 grep -q interface: "$udir/ruster.conf" && fail "settings without [dns]: $(cat "$udir/ruster.conf")"
-nsx "$router" unbound-control -c "$udir/unbound.conf" status >/dev/null 2>&1 ||
-  fail "the router's Unbound does not run"
 nsx "$wan" unbound -c "$udir/up/unbound.conf" || fail "the upstream Unbound does not start"
 
 ok=0
@@ -207,9 +209,19 @@ echo "ok: a failed reload is refused, and the configuration before stays"
 # ruster-unbound starts again and takes the part again without changing anything.
 kill "${pids[4]}"; wait "${pids[4]}" 2>/dev/null || true
 start ruster-unbound --reload "$work/restart-unbound" "$udir/ruster.conf"
-sleep 1
+for _ in $(seq 1 50); do
+  (( $(grep -c "wrote the settings" "$work/ruster-unbound.log") == 2 )) && break
+  sleep 0.1
+done
+(( $(grep -c "wrote the settings" "$work/ruster-unbound.log") == 2 )) || fail "ruster-unbound did not start again"
 [[ "$(cat "$udir/ruster.conf")" == "$before" ]] || fail "the settings changed after a restart"
-out=$(ruster apply "$work/router.toml") || fail "ruster apply without dns: $out"
+# Its first part restarts Unbound; until that is answered, confd takes no new file.
+for _ in $(seq 1 50); do
+  out=$(ruster apply "$work/router.toml" 2>&1) && break
+  grep -q "still waiting" <<<"$out" || break
+  sleep 0.2
+done
+grep -q "applied" <<<"$out" || fail "ruster apply without dns: $out"
 grep -q interface: "$udir/ruster.conf" && fail "settings after removing dns: $(cat "$udir/ruster.conf")"
 ask "$lan" 192.0.2.1 host.router.example | grep -q "192.0.2.99" &&
   fail "Unbound still answers the LAN after dns was removed"
