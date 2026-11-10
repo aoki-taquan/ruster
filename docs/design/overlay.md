@@ -229,16 +229,19 @@ End.DT6（4.6）、End.DT4（4.7）:
 
 ### H.Encaps（RFC 8986の5.1）
 
-経路の次の転送先に包む方針があれば、FIBを引いた後、内側のパケットを包む。
+経路の次の転送先に包む方針があれば、FIBを引いた後、内側のパケットを包む（core `srv6.rs`）。core では、方針ごとに
+FEの中だけのインターフェースを一つ置き、その経路の出口にする（DS-Liteのトンネルと同じ形）。
 
-- 外側のIPv6: 送信元はFE全体の送信元、宛先はSIDのリストの最初のSID。Hop Limitは64。Flow Labelは内側の
-  フローのhash（RFC 6437）。Traffic Classは内側から写す。
+- 外側のIPv6: 送信元は方針の送信元、宛先はSIDのリストの最初のSID。Hop Limitは64（RFC 2473の6.3）。
+  Flow Labelは内側のフローのhash（RFC 6437、RFC 8754の5.5）。Traffic Classは内側から写す。内側のTTLとHop Limitは
+  普通の転送で1減っている（S05）。
 - SRH: SIDのリストを逆順に入れ、Segments LeftとLast Entryはリストの長さ−1。次のヘッダは4（IPv4）か41（IPv6）。
-- 包んだ後は下側のVRFで最初のSIDを引き直して送る（今のトンネルと同じく、引き直しは2段まで）。
-- 包むと長くなる分（40 + 8 + 16 × SIDの数）が出口のMTUに入らなければ、IPv4（DF=1）はFragmentation Needed、
-  IPv6はPacket Too Bigを内側の送信元へ返す。MTUは出口のMTUから長くなる分を引いた値。DF=0のIPv4は
-  包む前に分割する。
-- 外していること: H.Encaps.Red（最初のSIDをSRHに入れない形）とH.Encaps.L2は作らない。
+  SIDが1個ならSRHは付けない。H.Encaps.Red（5.2）を選ぶと、最初のSIDをSRHに入れず、Last Entryは長さ−2。
+- 包んだ後はdefaultのVRFで最初のSIDを引いて送る。その先がトンネルや別の方針なら捨てる。
+- 包むと長くなる分（40、SRHがあれば8 + 16 × SRHのSIDの数）が出口のMTUに入らなければ、IPv4（DF=1）は
+  Fragmentation Needed、IPv6はPacket Too Bigを内側の送信元へ返す。MTUは出口のMTUから長くなる分を引いた値。
+  DF=0のIPv4は包む前に分割する。外側は分割しない。
+- 外していること: H.Encaps.L2は作らない。SRHにflags、tag、TLVは入れない。
 
 ## 6. IS-ISとOSPF（FRR）
 

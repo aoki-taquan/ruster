@@ -627,6 +627,10 @@ pub enum DropReason {
     /// A packet unwrapped by End.DT4 or End.DT6 whose inner destination is the
     /// router's: not delivered.
     Srv6ToRouter = 265,
+    /// No usable route in the default VRF to an SR policy's first segment.
+    Srv6NoRoute = 266,
+    /// A packet longer than an SR policy carries once wrapped.
+    Srv6MtuExceeded = 267,
 }
 
 use DropReason::*;
@@ -634,7 +638,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 265] = [
+    pub const ALL: [Self; 267] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -900,6 +904,8 @@ impl DropReason {
         Srv6NoRoom,
         Srv6VrfUnknown,
         Srv6ToRouter,
+        Srv6NoRoute,
+        Srv6MtuExceeded,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1182,6 +1188,8 @@ impl DropReason {
             Srv6NoRoom => "SRV6_NO_ROOM",
             Srv6VrfUnknown => "SRV6_VRF_UNKNOWN",
             Srv6ToRouter => "SRV6_TO_ROUTER",
+            Srv6NoRoute => "SRV6_NO_ROUTE",
+            Srv6MtuExceeded => "SRV6_MTU_EXCEEDED",
         }
     }
 }
@@ -2192,6 +2200,25 @@ impl<'a> ForwardingSnapshot<'a> {
                 None => mtu,
             };
         }
+        if let Some(policy) = self.srv6_policy(egress) {
+            let below = self
+                .ipv6
+                .and_then(|fib| fib.next_hop(policy.first_segment()))
+                // Not through a tunnel or another policy (the outer packet is not
+                // sent that way), so the MTUs never go round in a loop.
+                .filter(|&(out, _)| {
+                    self.srv6_policy(out).is_none()
+                        && crate::tunnel::of(self.tunnels, out).is_none()
+                })
+                .and_then(|(out, _)| {
+                    let link = self.interface(out)?.mtu;
+                    Some(self.carried_mtu(out, link))
+                });
+            return match below {
+                Some(below) => mtu.min(below.saturating_sub(policy.overhead_u16())),
+                None => mtu,
+            };
+        }
         if let Some(session) = crate::pppoe::of(self.pppoe, egress) {
             if let Some(parent) = self.interface(session.parent) {
                 return mtu.min(parent.mtu.saturating_sub(8));
@@ -2200,12 +2227,33 @@ impl<'a> ForwardingSnapshot<'a> {
         mtu
     }
 
-    /// Whether frames out of `egress` are wrapped (a tunnel or PPPoE session): it has
+    /// The SR policy whose interface is `egress` ([`Self::with_srv6`]).
+    #[inline]
+    pub(crate) fn srv6_policy(&self, egress: IfId) -> Option<&'a crate::Srv6Policy> {
+        self.srv6.and_then(|table| table.policy(egress))
+    }
+
+    /// For a generated `frame` (Ethernet, IPv4 or IPv6) to the SR policy interface
+    /// `egress`: the interface to send it out of and the frame inside the policy's
+    /// outer headers. `None` when `egress` is no policy's.
+    #[must_use]
+    pub fn srv6_frame(
+        &self,
+        egress: IfId,
+        frame: &[u8],
+    ) -> Option<Result<(IfId, Vec<u8>), crate::TunnelOriginError>> {
+        let policy = self.srv6_policy(egress)?;
+        Some(crate::srv6::wrap(policy, self, frame))
+    }
+
+    /// Whether frames out of `egress` are wrapped (a tunnel, PPPoE session or SR
+    /// policy): it has
     /// no neighbors, and its Ethernet header is replaced when the frame is wrapped.
     #[inline]
     pub(crate) fn wraps_frames(&self, egress: IfId) -> bool {
         crate::tunnel::of(self.tunnels, egress).is_some()
             || crate::pppoe::of(self.pppoe, egress).is_some()
+            || self.srv6_policy(egress).is_some()
     }
 
     /// For a generated IPv4 `frame` (Ethernet) to the tunnel interface `egress`:
@@ -4064,6 +4112,26 @@ where
                             match crate::tunnel::transmit(&mut packet, tunnel, all_vrfs, trace) {
                                 Ok(underlying) => underlying,
                                 Err(reason) => {
+                                    packet.recycle(reason);
+                                    dropped += 1;
+                                    trace.record(TraceEvent::Dropped { ingress, reason });
+                                    break 'packet;
+                                }
+                            }
+                        }
+                        None => egress,
+                    };
+                    let egress = match all_vrfs.srv6_policy(egress) {
+                        Some(policy) => {
+                            match crate::srv6::transmit(&mut packet, policy, all_vrfs, trace) {
+                                Ok(underlying) => underlying,
+                                Err(not) => {
+                                    let reason = match not {
+                                        crate::srv6::NotWrapped::Drop(reason) => reason,
+                                        crate::srv6::NotWrapped::TooBig(_) => {
+                                            DropReason::Srv6MtuExceeded
+                                        }
+                                    };
                                     packet.recycle(reason);
                                     dropped += 1;
                                     trace.record(TraceEvent::Dropped { ingress, reason });
@@ -10316,6 +10384,8 @@ mod tests {
             (263, "SRV6_NO_ROOM"),
             (264, "SRV6_VRF_UNKNOWN"),
             (265, "SRV6_TO_ROUTER"),
+            (266, "SRV6_NO_ROUTE"),
+            (267, "SRV6_MTU_EXCEEDED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10325,7 +10395,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(266), None);
+        assert_eq!(DropReason::from_code(268), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
