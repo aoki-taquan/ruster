@@ -330,6 +330,17 @@ fn next_hops_through_a_tap_are_on_its_interface_link_local_ones_too() {
             forward(&[("p1", "10.9.0.2"), ("p2", "fe80::3")])
         ))
     );
+    // A next hop through the TUN on no prefix: ribd resolves the gateways, and a
+    // link-local one is not among them.
+    let mut mixed = route(true, "10.1.0.0", 16, Kind::Unicast, &[]);
+    mixed.hops = vec![through("fe80::3", 8), through("10.9.9.9", 3)];
+    assert_eq!(
+        routes.take(&mixed),
+        Some(Change::set(
+            key("10.1.0.0", 16),
+            Value::Route(RouteAction::Gateways(vec![ip("10.9.9.9")]))
+        ))
+    );
     // The TAP goes: back to what the prefixes say.
     let changes = routes.set_taps(std::collections::BTreeMap::new());
     assert!(

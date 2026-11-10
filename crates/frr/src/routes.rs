@@ -206,12 +206,14 @@ impl Routes {
                     Some(hops) => Some(RouteAction::Forward(hops)),
                     None => {
                         let mut only: Vec<IpAddr> = Vec::new();
+                        // ribd resolves these through its own routes; a link-local
+                        // gateway says nothing of its link there.
                         for &(g, _) in &usable {
-                            if !only.contains(&g) {
+                            if !is_link_local(g) && !only.contains(&g) {
                                 only.push(g);
                             }
                         }
-                        Some(RouteAction::Gateways(only))
+                        (!only.is_empty()).then_some(RouteAction::Gateways(only))
                     }
                 }
             }
