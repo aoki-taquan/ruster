@@ -210,6 +210,22 @@
 //!                              # IPv6 one via the address DHCPv6 replies come from
 //! punt-rate = 20               # optional, as in [[dhcp]]; these when left out
 //! punt-burst = 20
+//! [bgp]                        # optional: BGP in the default VRF (FRR's bgpd,
+//!                              # through ruster-frr)
+//! as = 65001                   # the router's AS number
+//! router-id = "198.51.100.1"   # optional: the first ipv4 address of the default
+//!                              # VRF's enabled interfaces when left out
+//! networks = ["203.0.113.0/24", "2001:db8:5::/48"]  # optional: the prefixes it
+//!                              # announces (each needs a route of its own)
+//! include = "/etc/ruster/frr-extra.conf"  # optional: FRR settings that ruster-frr
+//!                              # adds to FRR's configuration as they are
+//!
+//! [[bgp.neighbor]]
+//! address = "198.51.100.10"    # on the subnet of one of the default VRF's
+//!                              # interfaces; the session carries the unicast
+//!                              # routes of its family (IPv4 or IPv6)
+//! remote-as = 65002
+//! description = "upstream"     # optional
 //!
 //! [[source]]                   # optional: a daemon that sends confd values found
 //!                              # at run time, on confd/source/<name>.sock
@@ -387,6 +403,16 @@
 //! default-route = true
 //! punt-rate = 20
 //! punt-burst = 20
+//! [[bgp]]                      # none or one
+//! as = 65001
+//! router-id = "198.51.100.1"
+//! networks = ["203.0.113.0/24"]
+//! include = []                 # none or one
+//!
+//! [[bgp.neighbor]]
+//! address = "198.51.100.10"
+//! remote-as = 65002
+//! description = []             # none or one
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
@@ -407,9 +433,12 @@
 //!   the same section's upper bound for it refuses; it is at least 3 s. RFC 4862 section 5.5.3: only the
 //!   prefixes of /64 addresses are advertised (for SLAAC on Ethernet, RFC 2464). RFC
 //!   8106 section 5.1: the DNS servers' lifetime is 3 times MaxRtrAdvInterval.
+//! - RFC 6286 section 2.1: a BGP Identifier is a 32-bit number, written as an IPv4
+//!   address; the default is one of the router's IPv4 addresses.
 //! - RFC 4787 REQ-8 and RFC 5382 REQ-3: NAT and the firewall filter
 //!   endpoint-independently by default.
 
+mod bgp;
 mod dhcp6;
 mod dhcp_client;
 mod ra;
@@ -417,6 +446,7 @@ mod resolve;
 
 use serde::{Deserialize, Serialize};
 
+pub use bgp::{frr_part, parse_frr_part, Bgp, BgpNeighbor, Connected};
 pub use dhcp6::{link_local, Dhcp6, DHCP6_PREFERRED_LIFETIME, DHCP6_VALID_LIFETIME};
 pub use dhcp_client::{
     dhcp_client_part, parse_dhcp_client_part, DhcpClient, DHCP_CLIENT_PUNT_BURST,
@@ -507,6 +537,8 @@ pub struct Lock {
     pub pppoe: Vec<Pppoe>,
     /// One per interface.
     pub dhcp_client: Vec<DhcpClient>,
+    /// None or one.
+    pub bgp: Vec<Bgp>,
 }
 
 /// A PPPoE client (`ruster-pppoed`): the session it sets up for a source.

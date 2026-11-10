@@ -80,6 +80,7 @@ fn config() -> Config {
         sources: Vec::new(),
         pppoe: Vec::new(),
         dhcp_client: Vec::new(),
+        bgp: None,
     }
 }
 

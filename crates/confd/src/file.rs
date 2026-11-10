@@ -707,6 +707,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let ra = crate::ra::check(lock.ra, &interfaces)?;
     let pppoe = crate::pppoe::check(lock.pppoe, &interfaces, &sources)?;
     let dhcp_client = crate::dhcp_client::check(lock.dhcp_client, &interfaces, &sources)?;
+    let bgp = crate::bgp::check(lock.bgp, &interfaces)?;
     // The FE takes at most this many punt classes besides its own.
     if dhcp.len()
         + dhcp6.len()
@@ -735,6 +736,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         sources,
         pppoe,
         dhcp_client,
+        bgp,
     })
 }
 

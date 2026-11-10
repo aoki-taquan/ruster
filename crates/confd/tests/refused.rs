@@ -61,6 +61,7 @@ fn config(mtu: u16) -> Config {
         sources: Vec::new(),
         pppoe: Vec::new(),
         dhcp_client: Vec::new(),
+        bgp: None,
     }
 }
 
