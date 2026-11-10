@@ -6,7 +6,7 @@
 //! # Standards
 //!
 //! - RFC 4271 section 4.2 and RFC 6793: AS numbers are 4 octets; 0 (RFC 7607) and
-//!   23456 (AS_TRANS, RFC 6793 section 9) are not used as the router's or a
+//!   23456 (AS_TRANS, RFC 6793 section 9) and 4294967295 (RFC 7300) are not used as the router's or a
 //!   neighbor's.
 //! - RFC 6286 section 2.1: the BGP Identifier is a non-zero 32-bit number, written
 //!   as an IPv4 address.
@@ -15,7 +15,7 @@
 //!
 //! Deviations: only the default VRF; each neighbor must be on the subnet of one of
 //! the default VRF's interfaces (no multihop sessions), so that its next hops are on
-//! a link the FE knows.
+//! a link the FE knows; so link-local IPv6 neighbors are not taken either.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -61,16 +61,27 @@ pub(crate) fn check(
     let mut networks = BTreeSet::new();
     for text in &bgp.networks {
         let (address, len) = crate::file::prefix(text)
-            .filter(|&(a, len)| network(a, len) == a)
-            .ok_or_else(|| format!("{at}: network {text:?} must be a prefix with no host bits"))?;
+            .filter(|&(a, len)| network(a, len) == a && unicast(a))
+            .ok_or_else(|| {
+                format!("{at}: network {text:?} must be a unicast prefix with no host bits")
+            })?;
         if !networks.insert((address, len)) {
             return Err(format!("{at}: network {text:?} is given twice"));
         }
     }
     match bgp.include.as_slice() {
         [] => {}
-        [path] if path.starts_with('/') && path.len() <= PATH_MAX && !has_control(path) => {}
-        [_] => return Err(format!("{at}: include must be an absolute path")),
+        [path]
+            if path.starts_with('/')
+                && !path.ends_with('/')
+                && path.len() <= PATH_MAX
+                && !has_control(path) => {}
+        [_] => {
+            return Err(format!(
+                "{at}: include must be an absolute file path of at most {PATH_MAX} bytes, \
+                 without control characters"
+            ))
+        }
         _ => return Err(format!("{at}: include takes at most one path")),
     }
     if bgp.neighbor.len() > NEIGHBORS_MAX {
@@ -91,9 +102,20 @@ pub(crate) fn check(
         if is_own(address, interfaces) {
             return Err(format!("{at}: it is one of the router's addresses"));
         }
+        // On the subnet, and not its network or (IPv4) broadcast address.
         let on_link = connected.iter().any(|c| {
             crate::file::prefix(&c.prefix).is_some_and(|(n, len)| {
-                n.is_ipv4() == address.is_ipv4() && network(address, len) == n
+                let max = if n.is_ipv4() { 32 } else { 128 };
+                let broadcast = match (address, n) {
+                    (IpAddr::V4(a), IpAddr::V4(_)) if len < 31 => {
+                        u32::from(a) | (u32::MAX >> len) == u32::from(a)
+                    }
+                    _ => false,
+                };
+                n.is_ipv4() == address.is_ipv4()
+                    && network(address, len) == n
+                    && (address != n || len >= max - 1)
+                    && !broadcast
             })
         });
         if !on_link {
@@ -104,12 +126,14 @@ pub(crate) fn check(
         match neighbor.description.as_slice() {
             [] => {}
             [text]
-                if !text.is_empty()
+                if !text.starts_with(' ')
+                    && !text.ends_with(' ')
+                    && !text.is_empty()
                     && text.len() <= DESCRIPTION_MAX
                     && text.bytes().all(|b| (b' '..=b'~').contains(&b)) => {}
             [_] => {
                 return Err(format!(
-                    "{at}: description must be 1 to {DESCRIPTION_MAX} printable ASCII characters"
+                    "{at}: description must be 1 to {DESCRIPTION_MAX} printable ASCII characters, not starting or ending with a space"
                 ))
             }
             _ => return Err(format!("{at}: description takes at most one text")),
@@ -119,10 +143,20 @@ pub(crate) fn check(
 }
 
 fn check_as(at: &str, what: &str, asn: u32) -> Result<(), String> {
-    if asn == 0 || asn == AS_TRANS {
-        return Err(format!("{at}: {what} must not be 0 or 23456 (AS_TRANS)"));
+    if asn == 0 || asn == AS_TRANS || asn == u32::MAX {
+        return Err(format!(
+            "{at}: {what} must not be 0, 23456 (AS_TRANS) or 4294967295"
+        ));
     }
     Ok(())
+}
+
+/// Not multicast, loopback or link-local: a prefix worth announcing.
+fn unicast(a: IpAddr) -> bool {
+    match a {
+        IpAddr::V4(a) => !a.is_multicast() && !a.is_loopback() && !a.is_link_local(),
+        IpAddr::V6(a) => !a.is_multicast() && !a.is_loopback() && !a.is_unicast_link_local(),
+    }
 }
 
 fn has_control(text: &str) -> bool {

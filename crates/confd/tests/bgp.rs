@@ -54,7 +54,32 @@ fn bgp_is_checked() {
             "twice",
         ),
         ("include = \"frr.conf\"\n", PEER, "absolute"),
-        ("include = \"/etc/a\\nb\"\n", PEER, "absolute"),
+        ("include = \"/etc/a\\nb\"\n", PEER, "control"),
+        ("include = \"/etc/\"\n", PEER, "file path"),
+        ("networks = [\"224.0.0.0/4\"]\n", PEER, "unicast"),
+        ("networks = [\"fe80::/64\"]\n", PEER, "unicast"),
+        ("", "address = \"198.51.100.0\"\nremote-as = 1\n", "subnet"),
+        (
+            "",
+            "address = \"198.51.100.255\"\nremote-as = 1\n",
+            "subnet",
+        ),
+        (
+            "",
+            "address = \"2001:db8:100::\"\nremote-as = 1\n",
+            "subnet",
+        ),
+        (
+            "",
+            "address = \"198.51.100.10\"\nremote-as = 4294967295\n",
+            "4294967295",
+        ),
+        ("", &format!("{PEER}description = \" \"\n"), "description"),
+        (
+            "",
+            &format!("{PEER}description = \"caf\u{e9}\"\n"),
+            "description",
+        ),
         (
             "",
             "address = \"198.51.100.10\"\nremote-as = 0\n",
@@ -125,4 +150,33 @@ fn the_frr_part_has_the_default_vrf_s_prefixes() {
     let (none, _) = ruster_config::parse_frr_part(&Module::Frr.part(&without)).unwrap();
     assert!(none.is_none());
     assert_eq!(Module::from_name("frr"), Some(Module::Frr));
+}
+
+/// What only the lock form can hold: more than one of a none-or-one list.
+#[test]
+fn lists_of_none_or_one_take_no_more() {
+    let lock = ruster_config::resolve(&bgp("", PEER)).unwrap().to_text();
+    let parse = |text: &str| file::parse(text).err().unwrap_or_default();
+    assert!(parse(&lock).is_empty(), "{}", parse(&lock));
+    for (from, to, error) in [
+        (
+            "include = []",
+            "include = [\"/a\", \"/b\"]",
+            "at most one path",
+        ),
+        (
+            "description = []",
+            "description = [\"a\", \"b\"]",
+            "at most one text",
+        ),
+    ] {
+        assert!(parse(&lock.replacen(from, to, 1)).contains(error), "{to}");
+    }
+    let start = lock.find("[[bgp]]").unwrap();
+    let twice = format!("{lock}\n{}", &lock[start..]);
+    assert!(
+        parse(&twice).contains("at most one bgp"),
+        "{}",
+        parse(&twice)
+    );
 }

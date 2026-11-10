@@ -73,7 +73,7 @@ pub(crate) fn resolve(entry: BgpEntry, interfaces: &[Interface]) -> Result<Bgp, 
         Some(id) => id,
         None => interfaces
             .iter()
-            .filter(|i| i.vrf == DEFAULT_VRF)
+            .filter(|i| i.vrf == DEFAULT_VRF && i.enabled)
             .flat_map(|i| &i.ipv4)
             .find_map(|a| a.split_once('/').map(|(a, _)| a.to_owned()))
             .ok_or("bgp: give router-id; no interface of the default VRF has an ipv4 address")?,

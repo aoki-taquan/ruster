@@ -200,7 +200,7 @@
 //!                              # through ruster-frr)
 //! as = 65001                   # the router's AS number
 //! router-id = "198.51.100.1"   # optional: the first ipv4 address of the default
-//!                              # VRF's interfaces when left out
+//!                              # VRF's enabled interfaces when left out
 //! networks = ["203.0.113.0/24", "2001:db8:5::/48"]  # optional: the prefixes it
 //!                              # announces (each needs a route of its own)
 //! include = "/etc/ruster/frr-extra.conf"  # optional: FRR settings that ruster-frr
@@ -363,17 +363,6 @@
 //! kind = "pppoe"
 //! sync-wait = 10
 //!
-//! [[bgp]]                      # none or one
-//! as = 65001
-//! router-id = "198.51.100.1"
-//! networks = ["203.0.113.0/24"]
-//! include = []                 # none or one
-//!
-//! [[bgp.neighbor]]
-//! address = "198.51.100.10"
-//! remote-as = 65002
-//! description = []             # none or one
-//!
 //! [[pppoe]]
 //! source = "pppoe-wan"
 //! interface = "ppp"            # the session interface that names the source
@@ -388,6 +377,17 @@
 //! echo-interval = 10
 //! echo-failures = 3
 //! default-route = false
+//!
+//! [[bgp]]                      # none or one
+//! as = 65001
+//! router-id = "198.51.100.1"
+//! networks = ["203.0.113.0/24"]
+//! include = []                 # none or one
+//!
+//! [[bgp.neighbor]]
+//! address = "198.51.100.10"
+//! remote-as = 65002
+//! description = []             # none or one
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
