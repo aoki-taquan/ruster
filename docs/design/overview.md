@@ -105,8 +105,8 @@ FEは、ルータ宛ての通信を分類し、種類ごとに上限を付けて
 
 | 種類 | 渡し先 | 通り道 |
 |---|---|---|
-| ARP、ND | `ruster-neighd` | 専用のUnix datagram socket |
-| DHCP、DHCPv6、RS/RA、PPPoEのDiscoveryとセッションの制御 | 担当の外のデーモン | 専用のUnix datagram socket |
+| ARP、ND（RSとRAを含む） | `ruster-neighd` | 専用のUnix datagram socket |
+| DHCP、DHCPv6、PPPoEのDiscoveryとセッションの制御 | 担当の外のデーモン | 専用のUnix datagram socket |
 | それ以外のTCP/UDP、ICMPのEcho | kernel | TUN |
 | トンネルの中身（MAP-E、DS-Lite） | 渡さない | FEがトンネルを外して転送する |
 

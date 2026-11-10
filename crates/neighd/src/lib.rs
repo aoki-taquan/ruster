@@ -21,9 +21,16 @@
 //! - Each of the router's IPv4 addresses is probed and announced when it appears,
 //!   and defended when another host claims it (RFC 5227).
 //!
+//! - It sends Router Advertisements on the interfaces of the `ra` part, which it takes
+//!   from confd on `confd/part.sock` ([`Neighd::take_ra`]), and answers Router
+//!   Solicitations there ([`ra`]). An interface advertises while it is in the part,
+//!   enabled and has its link-local address; when it leaves the part it sends the
+//!   final advertisements. One disabled or gone from the tables sends none, since
+//!   the FE sends nothing out of it.
+//!
 //! Skeleton limits: no duplicate address detection of our own IPv6 addresses (RFC
-//! 4862 section 5.4). Router Solicitations and Advertisements are not
-//! neighd's. No multicast group membership or MLD reports for the solicited-node
+//! 4862 section 5.4). Router Advertisements of other routers are not read (RFC
+//! 4861 section 6.2.7). No multicast group membership or MLD reports for the solicited-node
 //! groups (RFC 4861 section 7.2.1): multicast is not built for now (2026-11-08
 //! owner decision), so a switch that snoops MLD may not pass solicitations to the
 //! router.
@@ -45,6 +52,8 @@
 //!   (to all nodes, unsolicited, when the asker is doing duplicate address detection).
 //!   A solicitation for another node's address is discarded, not learned from.
 //!   Section 7.2.5: an Advertisement updates a neighbor neighd is resolving or knows.
+//!   Section 6.2.6: a Router Solicitation's Source Link-Layer Address is recorded
+//!   like a Neighbor Solicitation's.
 //!   Section 7.2.2: three solicitations one second apart (MAX_MULTICAST_SOLICIT,
 //!   RETRANS_TIMER) to the target's solicited-node group; one that does not answer
 //!   is written to the FE with an all-zero MAC address for [`FAILED_MS`], so that
@@ -129,9 +138,14 @@ pub struct NeighdCounters {
     /// answering those, or not used).
     pub probes_sent: u64,
     pub forgotten: u64,
-    /// Router Solicitations and Advertisements and Redirects, which are not neighd's,
-    /// and Neighbor Solicitations for other nodes' addresses.
+    /// Router Advertisements and Redirects, which are not neighd's, Router
+    /// Solicitations on an interface that does not advertise, and Neighbor
+    /// Solicitations for other nodes' addresses.
     pub not_for_neighd: u64,
+    /// Router Advertisements sent, the final ones included, and Router
+    /// Solicitations taken on an advertising interface.
+    pub advertisements_sent: u64,
+    pub router_solicitations: u64,
     /// ARP Probes and Announcements of the router's own IPv4 addresses (RFC 5227),
     /// the defending ones included, and packets from another host that claims or
     /// probes for one of them.
@@ -189,6 +203,13 @@ pub struct Neighd {
     /// MAC address they were claimed with), and when each was last defended.
     claims: BTreeMap<(String, Ipv4Addr), Claim>,
     defended: BTreeMap<(String, Ipv4Addr), u64>,
+    /// The `ra` part: the Router Advertisements of each interface; the interfaces
+    /// advertising now, with the settings they advertise; and those sending their
+    /// final ones.
+    ra: BTreeMap<String, ruster_config::Ra>,
+    advertising: BTreeMap<String, (ruster_config::Ra, ra::Schedule)>,
+    finals: BTreeMap<String, ra::Final>,
+    rng: ra::Rng,
     now_ms: u64,
     counters: NeighdCounters,
 }
@@ -237,6 +258,10 @@ impl Neighd {
             asked_at: 0,
             claims: BTreeMap::new(),
             defended: BTreeMap::new(),
+            ra: BTreeMap::new(),
+            advertising: BTreeMap::new(),
+            finals: BTreeMap::new(),
+            rng: ra::Rng::new(seed()),
             now_ms: 0,
             counters: NeighdCounters::default(),
         })
@@ -245,6 +270,14 @@ impl Neighd {
     /// Accepts the connection confd writes interfaces and addresses on.
     pub fn attach_config(&mut self, stream: UnixStream) -> io::Result<()> {
         self.local.attach(stream, CONFIG_TABLES)
+    }
+
+    /// Takes the `ra` part of the configuration ([`ruster_config::ra_part`]); it
+    /// replaces the last one.
+    pub fn take_ra(&mut self, part: &str) -> Result<(), String> {
+        let ra = ruster_config::parse_ra_part(part)?;
+        self.ra = ra.into_iter().map(|r| (r.interface.clone(), r)).collect();
+        Ok(())
     }
 
     /// True once the FE connection closed (the FE stopped or restarted).
@@ -901,7 +934,24 @@ impl Neighd {
             return;
         };
         match message.kind {
-            nd::Kind::RouterSolicitation { .. } => self.counters.not_for_neighd += 1,
+            nd::Kind::RouterSolicitation { source_link_layer } => {
+                let Some((_, schedule)) = self.advertising.get_mut(interface) else {
+                    self.counters.not_for_neighd += 1;
+                    return;
+                };
+                schedule.solicited(self.now_ms, &mut self.rng);
+                self.counters.router_solicitations += 1;
+                if let Some(link_layer) = source_link_layer {
+                    if !message.source.is_unspecified()
+                        && self.on_link_v6(interface, message.source)
+                    {
+                        let key = (interface.to_owned(), IpAddr::V6(message.source));
+                        if self.known.contains_key(&key) || self.known.len() < KNOWN_MAX {
+                            self.learn(key, link_layer);
+                        }
+                    }
+                }
+            }
             nd::Kind::Solicitation {
                 target,
                 source_link_layer,
@@ -966,6 +1016,102 @@ impl Neighd {
         }
     }
 
+    /// The interface's MAC and link-local addresses, when it is enabled and has one.
+    fn advertiser(&self, interface: &str) -> Option<([u8; 6], Ipv6Addr)> {
+        let mac = self.local_mac(interface)?;
+        let link_local = self.local.store().iter().find_map(|(key, _)| match key {
+            Key::Address {
+                interface: name,
+                address: IpAddr::V6(address),
+            } if name == interface && address.is_unicast_link_local() => Some(*address),
+            _ => None,
+        })?;
+        Some((mac, link_local))
+    }
+
+    /// Starts and stops advertising as the `ra` part and the interfaces say, and
+    /// sends the Router Advertisements that are due (RFC 4861 sections 6.2.4 to
+    /// 6.2.6).
+    fn advertise(&mut self, now_ms: u64) -> Progress {
+        let mut busy = false;
+        let names: Vec<String> = self
+            .ra
+            .keys()
+            .chain(self.advertising.keys())
+            .cloned()
+            .collect();
+        for name in names {
+            let ready = self.advertiser(&name).is_some();
+            match (self.ra.get(&name), self.advertising.get_mut(&name)) {
+                (Some(ra), None) if ready => {
+                    self.finals.remove(&name);
+                    self.advertising
+                        .insert(name, (ra.clone(), ra::Schedule::new(now_ms)));
+                }
+                (Some(ra), Some((held, schedule))) if ready => {
+                    if held != ra {
+                        *held = ra.clone();
+                        schedule.restart(now_ms);
+                    }
+                }
+                (None, Some(_)) if ready => {
+                    let (held, schedule) = self.advertising.remove(&name).expect("advertising");
+                    // Not within MIN_DELAY_BETWEEN_RAS of the last one.
+                    let at = schedule.earliest(now_ms);
+                    self.finals.insert(name, ra::Final::new(held, at));
+                }
+                (_, Some(_)) => {
+                    self.advertising.remove(&name);
+                }
+                _ => {}
+            }
+        }
+        let due: Vec<String> = self
+            .advertising
+            .iter()
+            .filter(|(_, (_, schedule))| schedule.due_at() <= now_ms)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in due {
+            let Some((mac, source)) = self.advertiser(&name) else {
+                continue;
+            };
+            let (held, schedule) = self.advertising.get_mut(&name).expect("advertising");
+            let frame = ra::advertisement(held, mac, source, false);
+            schedule.sent(held, now_ms, &mut self.rng);
+            self.send(&name, punt::reason::ND, &frame);
+            self.counters.advertisements_sent += 1;
+            busy = true;
+        }
+        let due: Vec<String> = self
+            .finals
+            .iter()
+            .filter(|(_, last)| last.next_at <= now_ms)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in due {
+            let Some((mac, source)) = self.advertiser(&name) else {
+                self.finals.remove(&name);
+                continue;
+            };
+            let last = self.finals.get_mut(&name).expect("final");
+            let frame = ra::advertisement(&last.ra, mac, source, true);
+            if !last.sent(now_ms) {
+                self.finals.remove(&name);
+            }
+            self.send(&name, punt::reason::ND, &frame);
+            self.counters.advertisements_sent += 1;
+            busy = true;
+        }
+        let wake_at = self
+            .advertising
+            .values()
+            .map(|(_, schedule)| schedule.due_at())
+            .chain(self.finals.values().map(|last| last.next_at))
+            .min();
+        Progress { busy, wake_at }
+    }
+
     fn send(&mut self, interface: &str, reason: u16, frame: &[u8]) {
         let mut message = Vec::with_capacity(frame.len() + 16);
         let punt = Punt {
@@ -997,6 +1143,7 @@ impl Task for Neighd {
         let timers = self.retry(now_ms);
         let checks = self.check(now_ms);
         let claims = self.claim(now_ms);
+        let advertised = self.advertise(now_ms);
         let (flushed, late) = self.fe.poll();
         self.handle_fe(late, now_ms);
         local
@@ -1004,9 +1151,18 @@ impl Task for Neighd {
             .and(timers)
             .and(checks)
             .and(claims)
+            .and(advertised)
             .and(flushed)
             .and(Progress::busy(had_events || punts))
     }
+}
+
+/// A seed for the Router Advertisement intervals, different in each process.
+fn seed() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(u64::from(std::process::id()));
+    hasher.finish()
 }
 
 /// An Ethernet ARP frame.
