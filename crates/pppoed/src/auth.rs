@@ -21,7 +21,7 @@
 //! Deviations: a PAP Ack or Nak without Msg-Length is taken (as pppd does). The
 //! number of PAP tries is the RFC 1661 Max-Configure (10), as
 //! RFC 1334 leaves it to the implementation. The authentication phase also ends
-//! badly when it does not end in time (the session sets the limit).
+//! badly when it does not end in time ([`crate::session::AUTH_TIMEOUT_MS`]).
 
 use md5::{Digest, Md5};
 
