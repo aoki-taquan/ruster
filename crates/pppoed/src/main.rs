@@ -54,6 +54,9 @@ use serde::Deserialize;
 const NAME: &str = "pppoed";
 /// The longest datagram read from the FE: a whole Ethernet frame and the header.
 const DATAGRAM_MAX: usize = 2_048;
+/// The most datagrams read in one round, so that a flood does not keep the timers
+/// from running.
+const DATAGRAMS_PER_ROUND: usize = 64;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,7 +96,21 @@ fn three() -> u32 {
 
 /// Reads the settings file: each session's name and settings.
 fn settings(text: &str) -> Result<Vec<(String, Settings)>, String> {
-    let file: File = toml::from_str(text).map_err(|error| error.to_string())?;
+    // The error's own text quotes the line, and its message may quote a value:
+    // neither is shown for a line with the password.
+    let file: File = toml::from_str(text).map_err(|error| {
+        let start = error.span().map_or(0, |span| span.start).min(text.len());
+        let line = text[..start].matches('\n').count() + 1;
+        let secret = text
+            .lines()
+            .nth(line - 1)
+            .is_some_and(|l| l.contains("password"));
+        if secret {
+            format!("line {line}: not valid")
+        } else {
+            format!("line {line}: {}", error.message())
+        }
+    })?;
     if file.session.is_empty() {
         return Err("no [[session]]".into());
     }
@@ -268,13 +285,18 @@ impl Daemon {
         self.send(&interface, &output);
     }
 
-    /// Reads what the FE sent; whether there was anything.
+    /// Reads what the FE sent, from the FE's socket only; whether there was
+    /// anything.
     fn receive(&mut self, now: u64) -> bool {
         let mut buf = [0; DATAGRAM_MAX];
         let mut any = false;
-        loop {
-            let n = match self.socket.recv(&mut buf) {
-                Ok(n) => n,
+        for _ in 0..DATAGRAMS_PER_ROUND {
+            let n = match self.socket.recv_from(&mut buf) {
+                Ok((n, from)) if from.as_pathname() == Some(self.fe.as_path()) => n,
+                Ok(_) => {
+                    any = true;
+                    continue;
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return any,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
                 Err(error) => {
@@ -302,6 +324,7 @@ impl Daemon {
                 self.handle(index, output);
             }
         }
+        any
     }
 
     fn timers(&mut self, now: u64) -> Option<u64> {
@@ -410,6 +433,10 @@ mod tests {
         assert!(settings("").is_err());
         assert!(settings(&text.replace("02:00:00:00:00:02", "02:00")).is_err());
         assert!(settings(&format!("{text}\nfoo = 1")).is_err());
+        // The password is not in the message.
+        let bad = text.replace("password = \"p\"", "password = 98765");
+        let error = settings(&bad).unwrap_err();
+        assert!(!error.contains("98765"), "{error}");
     }
 
     #[test]
