@@ -11,7 +11,7 @@
 //!   ours not 0) or equal to ours is Nak'd with a different identifier that is not
 //!   0; both 0 is rejected. A Nak of ours gives the identifier to use, unless it
 //!   is 0 or the peer's. Section 4.1 also allows a random identifier when there is
-//!   no stable one.
+//!   no stable one; its "u" bit is 0, in ours and in those we suggest.
 //! - RFC 1661 section 5.4: other options are rejected.
 //!
 //! Deviations: IPv6-Compression-Protocol (RFC 5072 section 4.2) is rejected and
@@ -58,7 +58,9 @@ impl Ipv6cpOptions {
     /// An identifier that is neither 0 nor `not`.
     fn random(rng: &mut Rng, not: [u8; 8]) -> [u8; 8] {
         loop {
-            let id = rng.next_u64().to_be_bytes();
+            let mut id = rng.next_u64().to_be_bytes();
+            // A random identifier has the "u" bit 0 (RFC 5072 section 4.1).
+            id[0] &= !0x02;
             if id != ZERO && id != not {
                 return id;
             }

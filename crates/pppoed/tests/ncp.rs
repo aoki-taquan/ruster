@@ -77,6 +77,7 @@ fn ipv6cp_interface_identifiers() {
     let mut o = Ipv6cpOptions::new(Rng::new(5));
     let ours = o.local;
     assert_ne!(ours, [0; 8]);
+    assert_eq!(ours[0] & 0x02, 0);
     assert_eq!(o.request(), [&[1, 10][..], &ours].concat());
 
     // Different and not 0: Ack.
@@ -94,6 +95,7 @@ fn ipv6cp_interface_identifiers() {
         assert_eq!(nak[..2], [1, 10]);
         assert_ne!(nak[2..], [0; 8]);
         assert_ne!(nak[2..], ours);
+        assert_eq!(nak[2] & 0x02, 0);
     }
 
     // A Nak of ours gives the identifier to use, unless it is 0 or the peer's.

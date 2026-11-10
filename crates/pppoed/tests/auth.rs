@@ -33,6 +33,16 @@ fn pap_request_ack() {
         Some(Outcome::Success)
     );
     assert_eq!(c.next_timer(), None);
+
+    // An Ack without Msg-Length is taken too.
+    let mut c = Client::new(Auth::Pap, b"user", b"pass");
+    let mut out = Vec::new();
+    c.start(0, &mut out);
+    let id = parsed(&out[0]).1;
+    assert_eq!(
+        c.receive(&ppp::packet(pap::ACK, id, &[]), &mut out),
+        Some(Outcome::Success)
+    );
 }
 
 #[test]

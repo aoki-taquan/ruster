@@ -18,7 +18,8 @@
 //!   and Failure count only with the identifier of our last Response. A Challenge
 //!   with a value size of 0 or past the packet is invalid.
 //!
-//! Deviations: the number of PAP tries is the RFC 1661 Max-Configure (10), as
+//! Deviations: a PAP Ack or Nak without Msg-Length is taken (as pppd does). The
+//! number of PAP tries is the RFC 1661 Max-Configure (10), as
 //! RFC 1334 leaves it to the implementation. The authentication phase also ends
 //! badly when it does not end in time (the session sets the limit).
 
@@ -121,8 +122,9 @@ impl Client {
         let packet = ppp::Packet::parse(information)?;
         match (self.method, packet.code) {
             (Auth::Pap, pap::ACK | pap::NAK) if Some(packet.id) == self.id => {
-                let length = usize::from(*packet.data.first()?);
-                if packet.data.len() < 1 + length || self.succeeded {
+                // Some peers leave out Msg-Length; that is a message of 0.
+                let length = packet.data.first().map_or(0, |&l| usize::from(l));
+                if (!packet.data.is_empty() && packet.data.len() < 1 + length) || self.succeeded {
                     return None;
                 }
                 self.timer = None;
