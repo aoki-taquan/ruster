@@ -394,7 +394,7 @@ fn versions(run_dir: &Path) -> Result<(), String> {
     let (code, payload) = request(&socket, |c| Ok(c.get(&["versions"])))?;
     let said = String::from_utf8_lossy(&payload);
     if code != Code::CONTENT {
-        return Err(format!("versions: {said}"));
+        return Err(format!("versions: confd answered {code:?} {said}"));
     }
     print!("{said}");
     Ok(())

@@ -389,10 +389,16 @@ fn a_rollback_goes_like_a_new_file() {
     rig.answers();
     rig.cli.post(&["rollback", "7"], b"");
     rig.cli.post(&["rollback", "x"], b"");
+    rig.cli.post(&["rollback", "+1"], b"");
     let answers = rig.answers();
     assert_eq!(answers[0].0, Code::NOT_FOUND, "{answers:?}");
-    assert!(answers[0].1.contains("no version 7"), "{answers:?}");
-    assert_eq!(answers[1].0, Code::NOT_FOUND, "{answers:?}");
+    assert_eq!(answers[0].1, "it is not kept", "{answers:?}");
+    assert_eq!(answers[1].0, Code::BAD_REQUEST, "{answers:?}");
+    assert!(
+        answers[1].1.contains("x: not a version number"),
+        "{answers:?}"
+    );
+    assert_eq!(answers[2].0, Code::BAD_REQUEST, "{answers:?}");
 
     // A refusal puts version 2 back and keeps nothing.
     rig.check.refuse_mtu = Some(1500);
@@ -408,5 +414,27 @@ fn a_rollback_goes_like_a_new_file() {
     rig.cli.post(&["config"], text(1300).as_bytes());
     rig.cli.post(&["rollback", "1"], b"");
     let answers = rig.answers();
+    assert_eq!(answers.len(), 1, "{answers:?}");
     assert_eq!(answers[0].0, Code::SERVICE_UNAVAILABLE, "{answers:?}");
+}
+
+#[test]
+fn a_rollback_to_a_lock_form_this_confd_does_not_read_is_refused_with_a_hint() {
+    let mut versions = Versions::in_memory();
+    let first = file::candidate(&text(1500)).unwrap();
+    versions
+        .commit("start", &first.lock, Some(&text(1500)))
+        .unwrap();
+    // As if written by an older ruster with another lock form.
+    versions
+        .commit("apply", "version = 1\nold-key = 3\n", Some(&text(1400)))
+        .unwrap();
+    versions.commit("apply", &first.lock, None).unwrap();
+    let mut rig = Rig::with(versions);
+    rig.cli.post(&["rollback", "2"], b"");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    assert!(answers[0].1.starts_with("version 2: "), "{answers:?}");
+    assert!(answers[0].1.contains("ruster.toml is kept"), "{answers:?}");
+    assert_eq!(rig.apply.versions().latest().unwrap().number, 3);
 }

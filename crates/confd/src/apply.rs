@@ -1,5 +1,5 @@
-//! The socket through which `ruster apply` gives confd a new configuration file
-//! (`docs/design/ce-processes.md`, "反映の流れ").
+//! The socket through which the CLI gives confd a new configuration, lists the versions
+//! and goes back to one (`docs/design/router-box.md`, "反映の流れ").
 //!
 //! | Request | What |
 //! |---|---|
@@ -18,7 +18,9 @@
 //! | Answer | Meaning |
 //! |---|---|
 //! | 2.04 Changed | every connected process answered yes, and the configuration was kept as a version |
-//! | 4.00 Bad Request | the file has an error, or a process refused the change; in the second case confd puts the configuration it had before back |
+//! | 2.05 Content | the answer to GET `versions` |
+//! | 4.00 Bad Request | the file or the version does not read, `<N>` is not a number, or a process refused the change; in the last case confd puts the configuration it had before back |
+//! | 4.04 Not Found | version N is not kept, or the resource is not one of the above |
 //! | 5.00 Internal Server Error | the configuration is in use, but writing the version failed |
 //! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers |
 //! | 5.04 Gateway Timeout | a process has not answered in time |
@@ -235,12 +237,26 @@ impl Apply {
                     (candidate.config, keep)
                 }),
             (Code::POST, ["rollback", number]) => {
-                let Some(version) = number.parse().ok().and_then(|n| self.versions.get(n)) else {
-                    return Some((Code::NOT_FOUND, format!("there is no version {number}")));
+                let Some(number) = number
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
+                    .then(|| number.parse::<u64>().ok())
+                    .flatten()
+                else {
+                    return Some((Code::BAD_REQUEST, format!("{number}: not a version number")));
+                };
+                let Some(version) = self.versions.get(number) else {
+                    return Some((Code::NOT_FOUND, "it is not kept".to_owned()));
                 };
                 // A version from before an update may be one this confd cannot read.
+                let hint = if version.toml.is_some() {
+                    "; its ruster.toml is kept: `ruster apply` of it resolves it with this \
+                     ruster's defaults"
+                } else {
+                    ""
+                };
                 file::parse(&version.lock)
-                    .map_err(|error| format!("version {number}: {error}"))
+                    .map_err(|error| format!("version {number}: {error}{hint}"))
                     .map(|config| {
                         let keep = Keep {
                             how: format!("rollback to {number}"),
