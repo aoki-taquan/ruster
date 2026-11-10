@@ -18,8 +18,9 @@
 //!   above Last Entry + 1 gets Parameter Problem code 0 pointing at Segments Left.
 //!   Otherwise Segments Left is decremented, Segment List[Segments Left] becomes the
 //!   destination and the packet is routed in the default VRF; the routing
-//!   decrements the Hop Limit once. A new destination that is again a local SID is
-//!   handled again, up to [`MAX_LOCAL_SEGMENTS`] times in all.
+//!   decrements the Hop Limit (S12). A new destination that is again a local SID is
+//!   handled again, up to [`MAX_LOCAL_SEGMENTS`] times in all, each decrementing the
+//!   Hop Limit once more.
 //! - RFC 8986 section 4.2 (End.X): the same, but the packet leaves through the
 //!   SID's interface to its next hop, without a route lookup.
 //! - RFC 8986 section 4.6 (End.DT6) and 4.7 (End.DT4): a Segments Left other than
@@ -46,7 +47,10 @@
 //! - No HMAC (RFC 8754 section 2.1.2) is checked, and the source address is not
 //!   checked (RFC 8754 section 5.1 places that in the access lists at the edges of
 //!   the SR domain; the forward firewall can do it for traffic it guards).
-//! - Several local SIDs in a row decrement the Hop Limit once, not once each.
+//! - A packet unwrapped by End.DT4 or End.DT6 whose inner destination is the
+//!   router's (in the SID's VRF) is dropped, not delivered: its way to the kernel
+//!   follows the VRF of the interface it came in on.
+//! - A SID whose VRF the snapshot does not have drops its packets.
 //! - The ICMPv6 errors are rate limited and routed as the others (`crate::ipv6`).
 
 use crate::{DropReason, IfId, PacketLease, PacketSlot};
@@ -173,7 +177,7 @@ pub(crate) enum Received {
 pub(crate) enum Rejected {
     Drop(DropReason),
     /// Dropped, with an ICMPv6 error of this type, code and parameter to send
-    /// about the packet as it was received.
+    /// about the packet (as received, or as the SIDs before rewrote it).
     Error(DropReason, u8, u8, u32),
 }
 
@@ -227,9 +231,10 @@ pub(crate) fn receive<S: PacketSlot>(
         let chain = walk(bytes)?;
         match (sid.behaviour, chain) {
             (Srv6Behaviour::End | Srv6Behaviour::EndX { .. }, Chain::Segments(srh)) => {
-                // RFC 8986 4.1 S05: before anything is changed, so that the error
-                // quotes the packet as it came.
-                if bytes[ip + 7] <= 1 {
+                // RFC 8986 4.1 S05: before anything is changed. For a further SID
+                // in a row, the Hop Limit counts the decrement the routing after
+                // this still makes.
+                if bytes[ip + 7] <= 1 + u8::from(segment > 0) {
                     return Err(Rejected::Error(
                         DropReason::Ipv6HopLimitExpired,
                         TIME_EXCEEDED,
@@ -238,8 +243,8 @@ pub(crate) fn receive<S: PacketSlot>(
                     ));
                 }
                 next_segment(bytes, srh)?;
-                // The routing after this decrements the Hop Limit once; each
-                // further local SID in a row is the routing's to decrement too.
+                // The routing after this decrements the Hop Limit once (S12 of the
+                // first SID); each further SID in a row decrements it here.
                 if segment > 0 {
                     bytes[ip + 7] -= 1;
                 }
@@ -258,7 +263,27 @@ pub(crate) fn receive<S: PacketSlot>(
             }
             (Srv6Behaviour::EndDt4 { vrf }, Chain::Upper(IPV4, at))
             | (Srv6Behaviour::EndDt6 { vrf }, Chain::Upper(IPV6, at)) => {
-                unwrap(packet, at)?;
+                let target = snapshot
+                    .vrf_snapshot(vrf)
+                    .ok_or(Rejected::Drop(DropReason::Srv6VrfUnknown))?;
+                // The inner packet must lie inside the outer one, and not be for the
+                // router: such a packet would reach the kernel of the VRF its
+                // ingress interface is in, not the SID's.
+                let local = match bytes.get(at..) {
+                    Some(inner) if inner.len() >= 20 && inner[0] >> 4 == 4 => {
+                        let mut d = [0; 4];
+                        d.copy_from_slice(&inner[16..20]);
+                        target.is_local_ipv4(crate::Ipv4Address::from_octets(d))
+                    }
+                    Some(inner) if inner.len() >= IPV6_HEADER && inner[0] >> 4 == 6 => target
+                        .ipv6
+                        .is_some_and(|fib| fib.is_local(address(inner, 24))),
+                    _ => return Err(Rejected::Drop(DropReason::Srv6HeaderInvalid)),
+                };
+                if local {
+                    return Err(Rejected::Drop(DropReason::Srv6ToRouter));
+                }
+                unwrap(packet, at, end)?;
                 return Ok(Received::Unwrapped { vrf });
             }
             (_, Chain::Upper(_, at)) => {
@@ -351,8 +376,16 @@ fn next_segment(frame: &mut [u8], srh: usize) -> Result<(), Rejected> {
 }
 
 /// Takes the outer IPv6 header and its extension headers (up to `inner`, the
-/// offset of the inner packet) off `packet`, keeping its Ethernet addresses.
-fn unwrap<S: PacketSlot>(packet: &mut PacketLease<S>, inner: usize) -> Result<(), Rejected> {
+/// offset of the inner packet) off `packet`, keeping its Ethernet addresses. What
+/// follows the outer packet (`end`) goes.
+fn unwrap<S: PacketSlot>(
+    packet: &mut PacketLease<S>,
+    inner: usize,
+    end: usize,
+) -> Result<(), Rejected> {
+    if !packet.truncate(end) {
+        return Err(Rejected::Drop(DropReason::Srv6NoRoom));
+    }
     let bytes = packet.bytes_mut();
     let version = bytes.get(inner).map(|b| b >> 4);
     let ethertype = match version {

@@ -201,7 +201,7 @@ impl Ipv6Fib {
             .map(|n| n.mac)
     }
 
-    fn is_local(&self, address: [u8; 16]) -> bool {
+    pub(crate) fn is_local(&self, address: [u8; 16]) -> bool {
         self.local.iter().any(|l| l.address == address)
     }
 }

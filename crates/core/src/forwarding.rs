@@ -622,6 +622,11 @@ pub enum DropReason {
     Srv6ParameterProblem = 262,
     /// The backend has no room to take off or put on the SRv6 outer headers.
     Srv6NoRoom = 263,
+    /// A packet to an SRv6 End.DT4 or End.DT6 SID whose VRF is not in the tables.
+    Srv6VrfUnknown = 264,
+    /// A packet unwrapped by End.DT4 or End.DT6 whose inner destination is the
+    /// router's: not delivered.
+    Srv6ToRouter = 265,
 }
 
 use DropReason::*;
@@ -629,7 +634,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 263] = [
+    pub const ALL: [Self; 265] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -893,6 +898,8 @@ impl DropReason {
         Srv6HeaderInvalid,
         Srv6ParameterProblem,
         Srv6NoRoom,
+        Srv6VrfUnknown,
+        Srv6ToRouter,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1173,6 +1180,8 @@ impl DropReason {
             Srv6HeaderInvalid => "SRV6_HEADER_INVALID",
             Srv6ParameterProblem => "SRV6_PARAMETER_PROBLEM",
             Srv6NoRoom => "SRV6_NO_ROOM",
+            Srv6VrfUnknown => "SRV6_VRF_UNKNOWN",
+            Srv6ToRouter => "SRV6_TO_ROUTER",
         }
     }
 }
@@ -1718,13 +1727,18 @@ impl<'a> ForwardingSnapshot<'a> {
             .unwrap_or(0)
     }
 
-    /// The snapshot of VRF `index` (with [`Self::with_vrfs`]); this one when there
-    /// is none.
+    /// The snapshot of VRF `index`: with [`Self::with_vrfs`], that snapshot;
+    /// without, this one for index 0. `None` for a VRF there is not.
+    pub(crate) fn vrf_snapshot(&self, index: u16) -> Option<&ForwardingSnapshot<'a>> {
+        match &self.vrfs {
+            Some(vrfs) => vrfs.snapshots.get(usize::from(index)),
+            None => (index == 0).then_some(self),
+        }
+    }
+
+    /// [`Self::vrf_snapshot`], or this one.
     pub(crate) fn for_vrf(&self, index: u16) -> &ForwardingSnapshot<'a> {
-        self.vrfs
-            .as_ref()
-            .and_then(|vrfs| vrfs.snapshots.get(usize::from(index)))
-            .unwrap_or(self)
+        self.vrf_snapshot(index).unwrap_or(self)
     }
 
     /// Copies every IPv4 and IPv6 packet addressed to the router, after the input
@@ -3501,7 +3515,7 @@ where
         // unwrapped into the SID's VRF.
         let (vrf, via) = match crate::srv6::receive(&mut packet, all_vrfs) {
             Ok(crate::srv6::Received::NotSid) => (None, None),
-            Ok(crate::srv6::Received::Forward { via }) => (Some(0), via),
+            Ok(crate::srv6::Received::Forward { via }) => (None, via),
             Ok(crate::srv6::Received::Unwrapped { vrf }) => (Some(vrf), None),
             Err(rejected) => {
                 let ingress = packet.ingress();
@@ -10300,6 +10314,8 @@ mod tests {
             (261, "SRV6_HEADER_INVALID"),
             (262, "SRV6_PARAMETER_PROBLEM"),
             (263, "SRV6_NO_ROOM"),
+            (264, "SRV6_VRF_UNKNOWN"),
+            (265, "SRV6_TO_ROUTER"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10309,7 +10325,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(264), None);
+        assert_eq!(DropReason::from_code(266), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails

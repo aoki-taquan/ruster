@@ -400,3 +400,58 @@ fn a_sid_is_not_handled_from_another_vrf() {
     let (sent, _) = run(&tables, LAN, frame);
     assert!(sent.is_none_or(|(egress, _)| egress != LAN));
 }
+
+#[test]
+fn a_packet_after_the_outer_one_is_not_unwrapped() {
+    let tables = tables();
+    // Payload Length 0: the IPv4 packet that follows is not inside.
+    let mut frame = outer(DT4, 64, 4, &[], &[]);
+    frame.extend_from_slice(&ipv4_packet(REMOTE4, HOST4));
+    let (sent, _) = run(&tables, CORE, frame);
+    assert!(sent.is_none());
+}
+
+#[test]
+fn an_unwrapped_packet_for_the_router_is_dropped() {
+    let mut tables = tables();
+    tables.red6 = Ipv6Fib::new(
+        vec![Ipv6Route::new(ip6("2001:db8:a::"), 64, LAN, None).unwrap()],
+        vec![],
+        vec![Ipv6Local {
+            interface: LAN,
+            address: ip6("2001:db8:a::1"),
+        }],
+    )
+    .unwrap();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::1"), 64);
+    let (sent, errors) = run(&tables, CORE, outer(DT6, 64, 41, &[], &inner));
+    assert!(sent.is_none());
+    assert!(errors.is_empty());
+}
+
+#[test]
+fn a_sid_of_a_vrf_not_in_the_tables_drops() {
+    let mut tables = tables();
+    tables.srv6 = Srv6Table::new(vec![Srv6Sid::new(
+        ip6(DT4),
+        128,
+        Srv6Behaviour::EndDt4 { vrf: 7 },
+    )
+    .unwrap()])
+    .unwrap();
+    let inner = ipv4_packet(REMOTE4, HOST4);
+    let (sent, _) = run(&tables, CORE, outer(DT4, 64, 4, &[], &inner));
+    assert!(sent.is_none());
+}
+
+#[test]
+fn the_second_sid_in_a_row_counts_the_hop_limit_too() {
+    let tables = tables();
+    let inner = ipv6_packet(ip6("2001:db8:b::1"), ip6("2001:db8:a::10"), 64);
+    let headers = srh(41, 2, 2, &["fc00:2::6", END, END]);
+    let (sent, errors) = run(&tables, CORE, outer(END, 2, 41, &headers, &inner));
+    assert!(sent.is_none());
+    assert_eq!(icmpv6(&errors), (3, 0, 0));
+    let (sent, _) = run(&tables, CORE, outer(END, 3, 41, &headers, &inner));
+    assert_eq!(sent.expect("sent").1[14 + 7], 1);
+}
