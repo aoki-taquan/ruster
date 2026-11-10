@@ -69,7 +69,8 @@
 //! [map-e]                      # a MAP-E CE (instead of [nat] and a tunnel)
 //! interface = "map"            # the tunnel interface it makes
 //! inside = "lan"               # the NAT's inside
-//! prefix = "2001:db8:12:3400::/56"  # the delegated (end-user) IPv6 prefix
+//! prefix = "2001:db8:12:3400::/56"  # the delegated (end-user) IPv6 prefix, or
+//! # prefix-from = "dhcp6-wan"  # the source (of kind dhcpv6-client) that has it
 //! rule-ipv6 = "2001:db8::/40"  # the Basic Mapping Rule
 //! rule-ipv4 = "192.0.2.0/24"
 //! ea-length = 16
@@ -261,7 +262,8 @@
 //! firewall-outside = "derive"  # NAT's outside and the default routes', or a list
 //! map-e = []                   # a [[map-e]] has all of [map-e]'s keys, and
 //!                              # mac = "02:00:00:00:00:fe" and ports = "1024-32767"
-//!                              # (the NAT's ports when the address is not shared)
+//!                              # (the NAT's ports when the address is not shared);
+//!                              # prefix and prefix-from are lists of none or one
 //!
 //! [icmp-errors]
 //! ipv4-interval-ms = 100
@@ -723,8 +725,11 @@ pub struct MapE {
     pub interface: String,
     /// The NAT's inside interface.
     pub inside: String,
-    /// The end-user IPv6 prefix (the one delegated to the CE).
-    pub prefix: String,
+    /// None or one: the end-user IPv6 prefix (the one delegated to the CE), given.
+    pub prefix: Vec<String>,
+    /// None or one: the source (of kind `dhcpv6-client`) whose delegated prefix is
+    /// the end-user prefix, found at run time; then `prefix` is empty.
+    pub prefix_from: Vec<String>,
     pub rule_ipv6: String,
     pub rule_ipv4: String,
     pub ea_length: u8,

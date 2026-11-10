@@ -148,3 +148,106 @@ fn ipv6_from_is_checked() {
     lock.ra[0].prefix_from = vec!["other".into()];
     assert!(file::config(lock).unwrap_err().contains("prefix-from"));
 }
+
+const MAP_E: &str = r#"
+[[source]]
+name = "dhcp6-wan"
+kind = "dhcpv6-client"
+
+[[interface]]
+name = "lan"
+mac = "02:00:00:00:00:01"
+ipv4 = "192.168.0.1/24"
+ipv6-from = { source = "dhcp6-wan", subnet = 1 }
+
+[[interface]]
+name = "wan"
+mac = "02:00:00:00:00:02"
+
+[map-e]
+interface = "map"
+inside = "lan"
+prefix-from = "dhcp6-wan"
+rule-ipv6 = "2001:db8::/40"
+rule-ipv4 = "192.0.2.0/24"
+ea-length = 16
+br = "2001:db8:ffff::1"
+"#;
+
+#[test]
+fn a_map_e_ce_follows_the_delegated_prefix() {
+    let lock = ruster_config::resolve(MAP_E).unwrap();
+    assert_eq!(lock.map_e[0].prefix_from, ["dhcp6-wan"]);
+    assert!(lock.map_e[0].prefix.is_empty());
+    let mut confd = Confd::new(file::config(lock).unwrap());
+    let (a, b) = UnixStream::pair().unwrap();
+    confd.attach_source("dhcp6-wan", a).unwrap();
+    let mut source = Client::new(b).unwrap();
+    let mut run = |confd: &mut Confd, now| {
+        for _ in 0..50 {
+            confd.step(now);
+            source.poll();
+        }
+    };
+    run(&mut confd, 0);
+    assert!(confd.with_values().nat.is_none(), "no CE before the prefix");
+    // RFC 7597 appendix A, example 1.
+    let (a, b) = UnixStream::pair().unwrap();
+    confd.attach_source("dhcp6-wan", a).unwrap();
+    let mut source = Client::new(b).unwrap();
+    source.patch(&[prefix(60)]).unwrap();
+    for _ in 0..50 {
+        confd.step(1);
+        source.poll();
+    }
+    let now = confd.with_values();
+    let map = now.interfaces.iter().find(|i| i.name == "map").unwrap();
+    assert_eq!(map.ipv4, Some(("192.0.2.18".parse().unwrap(), 32)));
+    assert_eq!(
+        map.tunnel,
+        Some((
+            "2001:db8:12:3400:0:c000:212:34".parse().unwrap(),
+            "2001:db8:ffff::1".parse().unwrap()
+        ))
+    );
+    let nat = now.nat.as_ref().unwrap();
+    assert_eq!(nat.outside, "map");
+    assert!(matches!(
+        nat.ports,
+        ruster_proto::table::NatPorts::Psid {
+            psid: 0x34,
+            length: 8,
+            offset: 6
+        }
+    ));
+    assert!(now
+        .static_routes
+        .iter()
+        .any(|r| r.len == 0 && r.prefix.is_ipv4()));
+    // The LAN took subnet 1, the CE subnet 0.
+    let lan = now.interfaces.iter().find(|i| i.name == "lan").unwrap();
+    assert_eq!(lan.ipv6, [("2001:db8:12:3401::1".parse().unwrap(), 64)]);
+    // The prefix runs out: the CE goes.
+    for _ in 0..50 {
+        confd.step(70_000);
+        source.poll();
+    }
+    let now = confd.with_values();
+    assert!(now.nat.is_none());
+    assert!(now.interfaces.iter().all(|i| i.name != "map"));
+}
+
+#[test]
+fn a_map_e_prefix_from_is_checked() {
+    let both = MAP_E.replace(
+        "prefix-from = \"dhcp6-wan\"",
+        "prefix-from = \"dhcp6-wan\"\nprefix = \"2001:db8:12:3400::/56\"",
+    );
+    assert!(ruster_config::resolve(&both).is_err());
+    let neither = MAP_E.replace("prefix-from = \"dhcp6-wan\"\n", "");
+    assert!(ruster_config::resolve(&neither).is_err());
+    let not_v6 = MAP_E.replace("kind = \"dhcpv6-client\"", "kind = \"dhcp-client\"");
+    assert!(file::parse(&not_v6).is_err());
+    let with_nat = format!("{MAP_E}\n[nat]\ninside = \"lan\"\noutside = \"wan\"\n");
+    assert!(file::parse(&with_nat).is_err());
+}
