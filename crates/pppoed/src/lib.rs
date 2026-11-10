@@ -9,12 +9,14 @@
 //!
 //! - [`discovery`]: PPPoE Discovery (RFC 2516 section 5).
 //! - [`ppp`]: session frames and control packets.
+//! - [`fsm`]: the option negotiation automaton (RFC 1661 section 4).
 //!
 //! # Standards
 //!
 //! Each module lists the sections it follows and where it deviates.
 
 pub mod discovery;
+pub mod fsm;
 pub mod ppp;
 
 /// An Ethernet MAC address.
