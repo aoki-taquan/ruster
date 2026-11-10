@@ -11,13 +11,19 @@
 //! - [`ppp`]: session frames and control packets.
 //! - [`fsm`]: the option negotiation automaton (RFC 1661 section 4).
 //! - [`lcp`]: LCP options, echo keepalive (RFC 1661, RFC 2516 section 7).
+//! - [`auth`]: PAP (RFC 1334) and CHAP with MD5 (RFC 1994).
+//! - [`ipcp`]: IPv4 address and DNS servers (RFC 1332, RFC 1877).
+//! - [`ipv6cp`]: IPv6 interface identifiers (RFC 5072).
 //!
 //! # Standards
 //!
 //! Each module lists the sections it follows and where it deviates.
 
+pub mod auth;
 pub mod discovery;
 pub mod fsm;
+pub mod ipcp;
+pub mod ipv6cp;
 pub mod lcp;
 pub mod ppp;
 
