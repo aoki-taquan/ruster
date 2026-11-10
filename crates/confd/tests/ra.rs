@@ -114,7 +114,7 @@ fn neighd_takes_the_ra_part() {
     let text = format!("{LAN}\n[[ra]]\ninterface = \"lan\"\n");
     let mut confd = Confd::new(parse(&text).unwrap());
     let (a, b) = UnixStream::pair().unwrap();
-    confd.attach_part(a).unwrap();
+    confd.attach_part(Module::Ra, a).unwrap();
     let mut neighd = Client::new(b, Module::Ra).unwrap();
     let mut parts = Vec::new();
     let mut run = |confd: &mut Confd, parts: &mut Vec<String>| {

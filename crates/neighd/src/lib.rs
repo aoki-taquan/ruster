@@ -22,7 +22,7 @@
 //!   and defended when another host claims it (RFC 5227).
 //!
 //! - It sends Router Advertisements on the interfaces of the `ra` part, which it takes
-//!   from confd on `confd/part.sock` ([`Neighd::take_ra`]), and answers Router
+//!   from confd on `confd/part/ra/part.sock` ([`Neighd::take_ra`]), and answers Router
 //!   Solicitations there ([`ra`]). An interface advertises while it is in the part,
 //!   enabled and has its link-local address; when it leaves the part it sends the
 //!   final advertisements. One disabled or gone from the tables sends none, since

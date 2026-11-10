@@ -8,9 +8,9 @@
 //! FILE again ([`ruster_confd::versions`]).
 //!
 //! `ruster apply` gives it a new file later ([`ruster_confd::apply`]), and processes
-//! such as `ruster-unbound` take their part of it ([`ruster_confd::part`]). Each
-//! source of the configuration gets `confd/source/<name>.sock`
-//! ([`ruster_confd::source`]).
+//! such as `ruster-unbound` take their part of it on `confd/part/<module>/part.sock`
+//! ([`ruster_confd::part`]). Each source of the configuration gets
+//! `confd/source/<name>/source.sock` ([`ruster_confd::source`]).
 
 use std::collections::BTreeMap;
 use std::os::unix::net::UnixListener;
@@ -19,6 +19,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use ruster_confd::apply::Apply;
+use ruster_confd::part::Module;
 use ruster_confd::versions::Versions;
 use ruster_confd::{Confd, Config, PeerKind};
 use ruster_proto::daemon::{self, socket, Clock};
@@ -97,8 +98,13 @@ fn run() -> Result<(), String> {
     prepare(&config);
     let listener = daemon::listen(&run_dir.join(socket::CONFD_CONFIG))
         .map_err(|error| format!("{}: {error}", socket::CONFD_CONFIG))?;
-    let parts = daemon::listen(&run_dir.join(socket::CONFD_PART))
-        .map_err(|error| format!("{}: {error}", socket::CONFD_PART))?;
+    let mut parts = Vec::new();
+    for module in Module::ALL {
+        let path = socket::confd_part(module.name());
+        let listener =
+            daemon::listen(&run_dir.join(&path)).map_err(|error| format!("{path}: {error}"))?;
+        parts.push((module, listener));
+    }
     let mut apply = Apply::new(versions);
     let mut confd = Confd::new(config);
     let mut sources = BTreeMap::new();
@@ -181,9 +187,11 @@ fn run() -> Result<(), String> {
                 }
             }
         }
-        for stream in daemon::accept(&parts) {
-            if let Err(error) = confd.attach_part(stream) {
-                eprintln!("ruster-confd: {}: {error}", socket::CONFD_PART);
+        for (module, listener) in &parts {
+            for stream in daemon::accept(listener) {
+                if let Err(error) = confd.attach_part(*module, stream) {
+                    eprintln!("ruster-confd: part {module}: {error}");
+                }
             }
         }
         for stream in daemon::accept(&listener) {

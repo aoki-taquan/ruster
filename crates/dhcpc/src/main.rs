@@ -1,7 +1,7 @@
 //! `ruster-dhcpc [--run-dir DIR]`: the WAN side's DHCP client.
 //!
 //! It takes its settings, one interface per `[[dhcp-client]]`, from confd: the
-//! `dhcpc` part on `confd/part.sock` ([`ruster_config::DhcpClient`]). An
+//! `dhcpc` part on `confd/part/dhcpc/part.sock` ([`ruster_config::DhcpClient`]). An
 //! interface whose settings change starts again; one that is no longer there gives
 //! its leases back (DHCPRELEASE, DHCPv6 Release) and stops. The FE may already have
 //! dropped the punt classes then, and with them the release: the server then keeps
@@ -450,7 +450,7 @@ fn run() -> Result<(), String> {
     let path = run_dir.join(socket::control_punt(NAME));
     let socket = daemon::bind_datagram(&path)
         .map_err(|error| format!("{}: {error}", socket::control_punt(NAME)))?;
-    let part_path = run_dir.join(socket::CONFD_PART);
+    let part_path = run_dir.join(socket::confd_part(Module::Dhcpc.name()));
     let stream = daemon::connect(&part_path, CONFD_WAIT).map_err(|e| format!("connecting: {e}"))?;
     let mut part = Client::new(stream, Module::Dhcpc).map_err(|e| e.to_string())?;
     let mut daemon = Daemon {

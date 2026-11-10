@@ -1,13 +1,16 @@
-//! The socket where each process takes its part of the configuration
+//! The sockets where each process takes its part of the configuration
 //! (`docs/design/router-box.md`, "設定の三段").
 //!
-//! A process (such as `ruster-unbound`) connects to `confd/part.sock`, names the one
-//! module it is responsible for, and from then on confd puts that module's part to it,
-//! in the lock form, and the process answers whether it took it:
+//! Each module has its own socket, `confd/part/<module>/part.sock`, in a directory of
+//! its own, so that file permissions can let only the module's process open it
+//! (`docs/design/ce-processes.md`, "socketの権限"): the `pppoe` part holds the PPPoE
+//! passwords. A process (such as `ruster-unbound`) connects to its module's socket,
+//! names the module, and from then on confd puts that module's part to it, in the
+//! lock form, and the process answers whether it took it:
 //!
 //! | From | Request | Answer |
 //! |---|---|---|
-//! | process | POST `<module>`, no payload | 2.04 Changed; 4.04 Not Found for a module confd does not know; 4.00 Bad Request for a second module on one connection |
+//! | process | POST `<module>`, no payload | 2.04 Changed; 4.04 Not Found for a module other than the socket's; 4.00 Bad Request for a second module on one connection |
 //! | confd | PUT `<module>`, the part as TOML text | 2.04 Changed when the process took it; any other code refuses it, with the reason as text |
 //!
 //! confd puts the part right after the 2.04, and again whenever a new configuration
@@ -56,7 +59,7 @@ use crate::Config;
 /// The largest message on this socket.
 const LIMIT: usize = 1 << 20;
 
-/// At most this many connections that have not named a module yet.
+/// At most this many connections per socket that have not named a module yet.
 pub const MAX_UNNAMED: usize = 8;
 
 /// At most this many messages are handled per connection in one step.
@@ -170,7 +173,8 @@ impl Taker {
 /// confd's side: the connections, and the process holding each module.
 #[derive(Default)]
 pub(crate) struct Parts {
-    unnamed: Vec<Connection>,
+    /// Connections that have not named a module yet, with the module of their socket.
+    unnamed: Vec<(Module, Connection)>,
     takers: BTreeMap<Module, Taker>,
 }
 
@@ -178,11 +182,14 @@ pub(crate) struct Parts {
 pub(crate) type Refusal = (Module, String, u64);
 
 impl Parts {
-    pub(crate) fn attach(&mut self, stream: UnixStream) -> io::Result<()> {
-        if self.unnamed.len() >= MAX_UNNAMED {
+    /// Takes a connection on `module`'s socket.
+    pub(crate) fn attach(&mut self, module: Module, stream: UnixStream) -> io::Result<()> {
+        // Counted per socket, so that a process that may open one socket cannot keep
+        // the others' processes out.
+        if self.unnamed.iter().filter(|(m, _)| *m == module).count() >= MAX_UNNAMED {
             return Err(io::Error::other("too many connections"));
         }
-        self.unnamed.push(Connection::new(stream, LIMIT)?);
+        self.unnamed.push((module, Connection::new(stream, LIMIT)?));
         Ok(())
     }
 
@@ -224,19 +231,19 @@ impl Parts {
         let mut named = Vec::new();
         let mut index = 0;
         while index < self.unnamed.len() {
-            let conn = &mut self.unnamed[index];
+            let (socket, conn) = &mut self.unnamed[index];
             busy |= conn.pump().unwrap_or(false);
             let mut module = None;
             if conn.backlog() >= conn.limit() {
                 conn.close();
             } else if let Ok(Some(request)) = conn.next_message() {
                 busy = true;
-                module = name(conn, &request);
+                module = name(conn, &request, *socket);
             }
             busy |= conn.pump().unwrap_or(false);
             if let Some(module) = module {
-                named.push((module, self.unnamed.swap_remove(index)));
-            } else if self.unnamed[index].is_closed() {
+                named.push((module, self.unnamed.swap_remove(index).1));
+            } else if self.unnamed[index].1.is_closed() {
                 self.unnamed.swap_remove(index);
             } else {
                 index += 1;
@@ -299,11 +306,12 @@ impl Parts {
     }
 }
 
-/// Answers a connection's first request; the module it names, if it is one.
-fn name(conn: &mut Connection, request: &Incoming) -> Option<Module> {
+/// Answers a connection's first request on `socket`'s socket; the module it names,
+/// if it is that one.
+fn name(conn: &mut Connection, request: &Incoming, socket: Module) -> Option<Module> {
     let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
     let module = match (request.code, path.as_slice()) {
-        (Code::POST, [name]) => Module::from_name(name),
+        (Code::POST, [name]) => Module::from_name(name).filter(|m| *m == socket),
         (code, _) if code.class() != 0 => return None,
         _ => None,
     };
@@ -332,7 +340,7 @@ pub struct Client {
 }
 
 impl Client {
-    /// Takes over a connection to `confd/part.sock` and names `module`.
+    /// Takes over a connection to `confd/part/<module>/part.sock` and names `module`.
     pub fn new(stream: UnixStream, module: Module) -> io::Result<Self> {
         let mut conn = Connection::new(stream, LIMIT)?;
         let _ = conn.send(&Outgoing {

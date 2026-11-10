@@ -1,7 +1,7 @@
 //! The WAN side's DHCP client's part (`[[dhcp-client]]`, for `ruster-dhcpc`) and
 //! the punt classes that hand it DHCP and DHCPv6.
 //!
-//! confd hands the entries to `ruster-dhcpc` on `confd/part.sock` (module
+//! confd hands the entries to `ruster-dhcpc` on `confd/part/dhcpc/part.sock` (module
 //! `dhcpc`), and for each interface writes the FE's punt classes to the control
 //! process `dhcpc`: `dhcpc-<interface>` (UDP to port 68) when it runs DHCPv4, and
 //! `dhcpc6-<interface>` (UDP to port 546) when it runs DHCPv6. They take the

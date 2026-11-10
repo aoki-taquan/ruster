@@ -1,14 +1,14 @@
 //! `ruster-pppoed [--run-dir DIR]`: the PPPoE client.
 //!
 //! It takes its settings, one session per `[[pppoe]]`, from confd: the `pppoe`
-//! part on `confd/part.sock` ([`ruster_config::Pppoe`]). A session whose settings
+//! part on `confd/part/pppoe/part.sock` ([`ruster_config::Pppoe`]). A session whose settings
 //! change starts again; one that is no longer there stops.
 //!
 //! It takes PPPoE Discovery and PPP control frames from the FE on
 //! `pppoed/punt.sock` and sends its own to `fe/punt/pppoed.sock`; confd writes the
 //! FE's punt classes that send them to the control process `pppoed`.
 //!
-//! What a session gets goes to its confd source (`confd/source/<name>.sock`): the
+//! What a session gets goes to its confd source (`confd/source/<name>/source.sock`): the
 //! session ID, the AC's MAC, the MTU, the IPCP address and DNS servers
 //! ([`ruster_pppoed::writer`]). With `default-route`, the IPv4 default route out of
 //! the session interface goes to ribd as the route source `pppoed` (ribd must be
@@ -377,7 +377,7 @@ fn run() -> Result<(), String> {
     let path = run_dir.join(socket::control_punt(NAME));
     let socket = daemon::bind_datagram(&path)
         .map_err(|error| format!("{}: {error}", socket::control_punt(NAME)))?;
-    let part_path = run_dir.join(socket::CONFD_PART);
+    let part_path = run_dir.join(socket::confd_part(Module::Pppoe.name()));
     let stream = daemon::connect(&part_path, CONFD_WAIT).map_err(|e| format!("connecting: {e}"))?;
     let mut part = Client::new(stream, Module::Pppoe).map_err(|e| e.to_string())?;
     let mut daemon = Daemon {

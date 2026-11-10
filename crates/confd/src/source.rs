@@ -2,7 +2,7 @@
 //! (`docs/design/ce-processes.md`, "送り手").
 //!
 //! The configuration declares each source with a name and a kind. confd listens on
-//! `confd/source/<name>.sock` for each, and the daemon writes its values there as
+//! `confd/source/<name>/source.sock` for each, and the daemon writes its values there as
 //! table entries ([`ruster_proto::session`]), keyed by the source's name:
 //!
 //! | Kind | What it may write |
@@ -55,7 +55,7 @@ pub const IPV6_MIN_MTU: u16 = 1_280;
 pub const SYNC_WAIT_MAX: u32 = 600;
 /// The most sources: each has a socket.
 pub const SOURCES_MAX: usize = 32;
-/// The longest source name, so that `<name>.sock` is a short path component.
+/// The longest source name, so that `<name>/source.sock` is a short path.
 pub const NAME_MAX: usize = 32;
 
 /// What a source is, and so what it may write.

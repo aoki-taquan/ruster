@@ -1,6 +1,6 @@
 //! A writer of table entries to a table server that keeps what the server should
 //! hold and writes it again after each (re)connection: what a daemon uses for its
-//! confd source (`confd/source/<name>.sock`) and its ribd route source
+//! confd source (`confd/source/<name>/source.sock`) and its ribd route source
 //! (`docs/design/ce-processes.md`, "送り手").
 //!
 //! Whenever a [`Writer`] connects (again) it sends resync-begin, everything it

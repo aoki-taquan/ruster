@@ -1,5 +1,5 @@
 //! Where the client's sessions go: each session's values to its confd source
-//! (`confd/source/<name>.sock`), and the default routes to ribd as the route source
+//! (`confd/source/<name>/source.sock`), and the default routes to ribd as the route source
 //! `pppoed` (`docs/design/ce-processes.md`, "送り手").
 //!
 //! A [`Writer`] ([`ruster_proto::writer`]) keeps what its receiver should hold and

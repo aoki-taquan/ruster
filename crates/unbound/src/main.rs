@@ -35,7 +35,7 @@ fn run() -> Result<(), String> {
     let reload = reload.split_whitespace().map(str::to_owned).collect();
     let mut bridge = Bridge::new(file, reload);
 
-    let path = run_dir.join(socket::CONFD_PART);
+    let path = run_dir.join(socket::confd_part(Module::Dns.name()));
     let stream = daemon::connect(&path, CONFD_WAIT).map_err(|e| format!("connecting: {e}"))?;
     let mut client = Client::new(stream, Module::Dns).map_err(|e| e.to_string())?;
     let clock = Clock::new();
