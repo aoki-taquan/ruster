@@ -214,3 +214,35 @@ fn a_relay_reply_for_another_link_or_broken_is_dropped() {
         assert!(reply(&link(), &whole[..cut]).is_err(), "cut at {cut}");
     }
 }
+
+// RFC 8415 section 19: a relay agent relays every message from a client, of the
+// types section 7.3 lists and of types it does not know, unchanged in a Relay
+// Message option (21.10) of a Relay-forward (19.1.1: msg-type 12, hop-count 0).
+#[test]
+fn every_client_message_type_is_relayed_unchanged() {
+    // Solicit, Request, Confirm, Renew, Rebind, Release, Decline,
+    // Information-request, and an unassigned type.
+    for kind in [1, 3, 4, 5, 6, 8, 9, 11, 200] {
+        let mut message = SOLICIT.to_vec();
+        message[0] = kind;
+        let relayed = request(&link(), &client_frame(&message, 17)).unwrap();
+        let m = &relayed.message;
+        assert_eq!(m[..2], [12, 0], "type {kind}");
+        assert_eq!(m[2..18], ip("2001:db8:1::1").octets(), "link-address");
+        assert_eq!(m[18..34], ip("fe80::10").octets(), "peer-address");
+        assert!(m.ends_with(&option(9, &message)), "type {kind}");
+    }
+}
+
+// RFC 8415 section 19.2: the message in the Relay Message option goes to the client
+// as it is, whatever server-to-client type it is: Advertise, Reply or Reconfigure.
+#[test]
+fn every_server_to_client_type_is_passed_to_the_client() {
+    for kind in [2, 7, 10] {
+        let mut inner = ADVERTISE.to_vec();
+        inner[0] = kind;
+        let message = relay_reply("2001:db8:1::1", 0, &[option(9, &inner), option(18, b"lan")]);
+        let (to, got) = reply(&link(), &message).unwrap();
+        assert_eq!((to, got), (ip("fe80::10"), &inner[..]), "type {kind}");
+    }
+}

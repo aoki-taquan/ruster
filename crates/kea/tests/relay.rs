@@ -291,3 +291,77 @@ fn no_input_makes_it_panic() {
         let _ = reply(&link(), &k);
     }
 }
+
+// RFC 1542 section 4.1.1: a request is discarded only when `hops` exceeds the
+// threshold (4); at the threshold it is relayed and `hops` becomes 5.
+#[test]
+fn a_request_at_the_hops_threshold_is_relayed() {
+    let mut m = message(1, 0, [0; 4], [0; 4], [0; 4], DISCOVER);
+    m[3] = 4;
+    let relayed = request(&link(), &frame([0; 4], [255; 4], &m)).unwrap();
+    assert_eq!(relayed[3], 5);
+}
+
+// RFC 2132 section 2: Pad (0) may come between options. RFC 3046 section 2.0: the
+// relay agent's option goes after the client's last option and before End, as code
+// 82, its length, then sub-option 1 (Circuit ID), its length and the ID.
+#[test]
+fn option_82_follows_the_client_s_options_after_pad() {
+    let options = [53, 1, 3, 0, 0, 50, 4, 192, 0, 2, 100, 0, 255];
+    let m = message(1, 0, [0; 4], [0; 4], [0; 4], &options);
+    let relayed = request(&link(), &frame([0; 4], [255; 4], &m)).unwrap();
+    assert_eq!(
+        relayed[240..],
+        [53, 1, 3, 50, 4, 192, 0, 2, 100, 82, 5, 1, 3, b'l', b'a', b'n', 255]
+    );
+}
+
+// RFC 3046 section 2.1: without a configured maximum, the relay agent SHALL NOT
+// make the packet larger than the MTU (1500) by adding the option; it relays the
+// request without it.
+#[test]
+fn a_request_that_option_82_would_make_too_long_is_relayed_without_it() {
+    // 20 IPv4 + 8 UDP + 240 fixed and cookie + the client's options + 7 for option
+    // 82 ("lan") + End: exactly 1500, then one byte more.
+    for (extra, with_82) in [(0, true), (1, false)] {
+        let mut left = 1_500 - 20 - 8 - 240 - 7 - 1 + extra;
+        let mut options = Vec::new();
+        while left > 0 {
+            let len = (left - 2).min(255);
+            options.extend_from_slice(&[43, u8::try_from(len).unwrap()]);
+            options.extend(std::iter::repeat_n(0xab, len));
+            left -= 2 + len;
+        }
+        let mut with_end = options.clone();
+        with_end.push(255);
+        let m = message(1, 0, [0; 4], [0; 4], [0; 4], &with_end);
+        let relayed = request(&link(), &frame([0; 4], [255; 4], &m)).unwrap();
+        let tail = &relayed[240 + options.len()..];
+        if with_82 {
+            assert_eq!(tail, [82, 5, 1, 3, b'l', b'a', b'n', 255]);
+            assert_eq!(20 + 8 + relayed.len(), 1_500);
+        } else {
+            assert_eq!(tail, [255], "relayed without option 82");
+        }
+        assert_eq!(relayed[24..28], [192, 0, 2, 1], "giaddr all the same");
+    }
+}
+
+// RFC 3046 section 2.2: the option is taken out of the reply wherever the server
+// put it; the other options stay in their order, and `hops` as the server sent it.
+#[test]
+fn option_82_is_taken_out_of_a_reply_wherever_it_is() {
+    let kea = message(
+        2,
+        0,
+        [0; 4],
+        [192, 0, 2, 100],
+        [192, 0, 2, 1],
+        &[
+            53, 1, 5, 82, 5, 1, 3, b'l', b'a', b'n', 51, 4, 0, 0, 14, 16, 255,
+        ],
+    );
+    let out = reply(&link(), &kea).unwrap();
+    assert_eq!(out[14 + 28 + 240..], [53, 1, 5, 51, 4, 0, 0, 14, 16, 255]);
+    assert_eq!(out[14 + 28 + 3], 0);
+}
