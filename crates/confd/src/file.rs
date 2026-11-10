@@ -465,7 +465,20 @@ pub fn config(lock: Lock) -> Result<Config, String> {
             let Some((IpAddr::V6(rule), rule_len)) = prefix(&entry.rule_ipv6) else {
                 return Err(format!("{at}: rule-ipv6 must be an IPv6 prefix"));
             };
-            let probe = (rule, (rule_len + entry.ea_length).min(64));
+            let probe = (
+                rule,
+                (u16::from(rule_len) + u16::from(entry.ea_length)).min(64) as u8,
+            );
+            // Subnet 0 of the prefix holds the CE's address (RFC 7597 section 6),
+            // so no interface may be numbered from it.
+            if interfaces
+                .iter()
+                .any(|i| i.ipv6_from.as_ref() == Some(&(source.clone(), 0)))
+            {
+                return Err(format!(
+                    "{at}: subnet 0 of {source:?} is the CE's; give the LAN another (ipv6-from)"
+                ));
+            }
             let (tunnel, _, _) = map_e(&entry, probe, Some(&seen))?;
             if tunnel.name.is_empty() || tunnel.name.len() > 255 {
                 return Err(format!("{at}: the name must be 1 to 255 bytes"));
@@ -607,7 +620,10 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         }
         let tunnel = interfaces
             .iter()
-            .any(|i| i.name == interface && i.tunnel.is_some());
+            .any(|i| i.name == interface && i.tunnel.is_some())
+            || map_e_from
+                .as_ref()
+                .is_some_and(|(m, _): &(ruster_config::MapE, String)| m.interface == interface);
         if tunnel && address.is_ipv6() {
             return Err(format!("{at}: tunnel {interface:?} carries IPv4 only"));
         }

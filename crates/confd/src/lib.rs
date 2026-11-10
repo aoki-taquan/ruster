@@ -559,7 +559,7 @@ impl Confd {
             return outside;
         }
         let mut outside: Vec<String> = self
-            .config
+            .current
             .nat
             .iter()
             .map(|nat| nat.outside.clone())
@@ -628,7 +628,7 @@ impl Confd {
         let outside_ready = |nat: &&ruster_proto::table::Nat| {
             nat.external.is_some()
                 || self
-                    .config
+                    .current
                     .interfaces
                     .iter()
                     .find(|i| i.name == nat.outside)
@@ -839,7 +839,7 @@ impl Confd {
         // NAT's outside session needs its address before anything leaves through it,
         // or the LAN's would leave untranslated.
         let nat_outside = self
-            .config
+            .current
             .nat
             .as_ref()
             .is_some_and(|nat| nat.outside == interface.name && nat.external.is_none());
@@ -859,7 +859,7 @@ impl Confd {
         };
         interface.ipv4_from.is_some()
             && self
-                .config
+                .current
                 .nat
                 .as_ref()
                 .is_some_and(|nat| nat.outside == name && nat.external.is_none())
@@ -872,7 +872,7 @@ impl Confd {
     fn routes(&self) -> BTreeMap<Key, Value> {
         let mut out = BTreeMap::new();
         for interface in self
-            .config
+            .current
             .interfaces
             .iter()
             .filter(|i| self.usable(&i.name))

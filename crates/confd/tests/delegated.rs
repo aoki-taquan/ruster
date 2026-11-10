@@ -251,3 +251,59 @@ fn a_map_e_prefix_from_is_checked() {
     let with_nat = format!("{MAP_E}\n[nat]\ninside = \"lan\"\noutside = \"wan\"\n");
     assert!(file::parse(&with_nat).is_err());
 }
+
+#[test]
+fn the_delegated_lan_and_the_ce_have_their_routes() {
+    use ruster_proto::session::{Hook, Server, Store};
+    struct Accept;
+    impl Hook for Accept {
+        fn check(&mut self, _next: &Store) -> Result<(), String> {
+            Ok(())
+        }
+        fn committed(&mut self, _store: &Store) {}
+    }
+    let mut confd = Confd::new(file::parse(MAP_E).unwrap());
+    let (a, b) = UnixStream::pair().unwrap();
+    let mut ribd = Server::new();
+    ribd.attach(a, &[ruster_proto::sid::ROUTE]).unwrap();
+    confd.connect_ribd(b).unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    confd.attach_source("dhcp6-wan", a).unwrap();
+    let mut source = Client::new(b).unwrap();
+    source.patch(&[prefix(60)]).unwrap();
+    for _ in 0..50 {
+        confd.step(1);
+        source.poll();
+        ribd.step(&mut Accept);
+    }
+    let route = |prefix: &str, len| {
+        ribd.store()
+            .get(&Key::Route {
+                vrf: "default".into(),
+                prefix: prefix.parse().unwrap(),
+                len,
+            })
+            .cloned()
+    };
+    assert!(route("2001:db8:12:3401::", 64).is_some(), "the LAN's /64");
+    assert!(route("192.0.2.18", 32).is_some(), "the CE's address");
+    assert_eq!(
+        route("2001:db8:12:3400::", 56),
+        Some(Value::Route(ruster_proto::table::RouteAction::Discard))
+    );
+}
+
+#[test]
+fn what_a_prefix_given_would_refuse_is_refused_with_prefix_from() {
+    // Subnet 0 is the CE's.
+    let subnet0 = MAP_E.replace("subnet = 1", "subnet = 0");
+    assert!(file::parse(&subnet0).unwrap_err().contains("subnet 0"));
+    // IPv6 into the tunnel.
+    let v6 = format!("{MAP_E}\n[[route]]\nprefix = \"2001:db8:aaaa::/48\"\ninterface = \"map\"\n");
+    assert!(file::parse(&v6).unwrap_err().contains("IPv4 only"));
+    // Lengths that do not add up are refused, not a panic.
+    let long = MAP_E
+        .replace("2001:db8::/40", "2001:db8::/128")
+        .replace("ea-length = 16", "ea-length = 200");
+    assert!(file::parse(&long).is_err());
+}
