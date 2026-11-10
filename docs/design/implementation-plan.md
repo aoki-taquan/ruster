@@ -135,15 +135,21 @@ backlogのまま置き、使う場面が出たものから片付ける。
 「作る順番」に従う。lockの形（版1）、confdが各プロセスへ担当の部分を渡すsocket（`confd/part.sock`）、
 Unboundの橋渡し役（`ruster-unbound`、netns `dns`）と、Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`、
 netns `dhcp`）、neighdのRA（`[[ra]]`、netns `ra`）、DHCPv6のリレー（`[[dhcp6]]`、netns `dhcp6`）まで済んだ。
-候補、差分、確定を分けるのはまだで、新しい設定はどれかが断ったら前に戻すだけ。次は「作る順番」の4
-（`ruster-dhcpc`）。
+候補、差分、確定を分けるのはまだで、新しい設定はどれかが断ったら前に戻すだけ。
+
+`ruster-dhcpc`（「作る順番」の4）は、WAN側のDHCPv4とDHCPv6（プレフィックスの委任）のクライアント。設定は
+confdの`dhcpc`の部分（`[[dhcp-client]]`）から受け取り、得た値は送り手（種類`dhcp-client`、`dhcpv6-client`）
+としてconfdへ、default経路はribdへ（送り手`dhcpc`）書く。confdは、インターフェースの`ipv4-from`でWANの
+IPv4アドレスを、`ipv6-from`で委任からLANの/64とRAのプレフィックスを、`[map-e]`の`prefix-from`で
+委任からMAP-EのCEを作り、`[dns]`の`upstream-from`で送り手のDNSサーバをUnboundへ添える（netns `dhcpc`、
+`map-e-pd`）。IPv6のdefault経路はDHCPv6の返事の送り元へ向ける（WAN側のRAは読まない）。
 
 `ruster-pppoed`（「作る順番」の6）は、Discovery、LCP、PAPとCHAP、IPCP、IPv6CPでセッションを張る。設定は
 confdの`pppoe`の部分（`[[pppoe]]`）から受け取り、得た値は送り手（種類`pppoe`）としてconfdへ、`default-route`の
 ときはdefault経路をribdへ（送り手`pppoed`）書く。confdはその値から、セッションのある間だけFEにセッションの
 インターフェースを置き、親のPPPoEのフレームを`pppoed`へ受け渡す行を書く（netns `pppoed`、`pppoe-nat`）。
-`pppoe`と`map-e-pppoe`は、FEの転送を見るために固定のセッションを`ruster source`で渡している。残りは、
-IPCPで得たDNSサーバをUnboundの`upstream-from`へ渡すこと。
+`pppoe`と`map-e-pppoe`は、FEの転送を見るために固定のセッションを`ruster source`で渡している。IPCPで
+得たDNSサーバも送り手へ書き、`upstream-from`でUnboundへ渡る。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
 外れている点として、それぞれのモジュールの`# Standards`に書く。
