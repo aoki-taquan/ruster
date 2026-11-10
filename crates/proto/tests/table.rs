@@ -997,3 +997,183 @@ fn a_per_host_limit_over_u16_is_refused_by_its_name() {
         Err(ModelError::Invalid("state-per-host"))
     );
 }
+
+fn punt(class: &str, value: ruster_proto::table::PuntClass) -> Change {
+    Change::set(
+        Key::Punt {
+            class: class.into(),
+        },
+        Value::Punt(value),
+    )
+}
+
+#[test]
+fn punt_classes_round_trip() {
+    use ruster_proto::table::{PuntClass, PuntDestination, PuntKind, PuntMatch};
+    let dhcp = punt(
+        "dhcpv4",
+        PuntClass {
+            matches: PuntMatch::Ip {
+                protocol: 17,
+                ports: Some((67, 68)),
+            },
+            interface: Some("lan".into()),
+            destination: PuntDestination::Control("ruster-kea".into()),
+            rate: 100,
+            burst: 20,
+        },
+    );
+    let pppoe = punt(
+        "pppoe-discovery",
+        PuntClass {
+            matches: PuntMatch::Kind(PuntKind::PppoeDiscovery),
+            interface: None,
+            destination: PuntDestination::Control("ruster-pppoed".into()),
+            rate: 10,
+            burst: 10,
+        },
+    );
+    let icmp = punt(
+        "icmp",
+        PuntClass {
+            matches: PuntMatch::Kind(PuntKind::Icmp),
+            interface: None,
+            destination: PuntDestination::Kernel,
+            rate: 2_000,
+            burst: 200,
+        },
+    );
+    let ospf = punt(
+        "ospf",
+        PuntClass {
+            matches: PuntMatch::Ip {
+                protocol: 89,
+                ports: None,
+            },
+            interface: None,
+            destination: PuntDestination::Drop,
+            rate: 1,
+            burst: 1,
+        },
+    );
+    let gone = Change::delete(Key::Punt { class: "x".into() });
+    for change in [dhcp, pppoe, icmp, ospf, gone] {
+        assert_eq!(round_trip(&change), change);
+    }
+    for kind in PuntKind::ALL {
+        assert_eq!(PuntKind::from_name(kind.name()), Some(kind));
+    }
+}
+
+#[test]
+fn a_bad_punt_class_is_refused() {
+    use ruster_proto::table::{PuntClass, PuntDestination, PuntKind, PuntMatch};
+    let class = |matches, destination| PuntClass {
+        matches,
+        interface: None,
+        destination,
+        rate: 10,
+        burst: 10,
+    };
+    let control = |name: &str| PuntDestination::Control(name.into());
+    let udp = PuntMatch::Ip {
+        protocol: 17,
+        ports: Some((67, 67)),
+    };
+    let refused = [
+        class(PuntMatch::Kind(PuntKind::Arp), PuntDestination::Kernel),
+        class(PuntMatch::Kind(PuntKind::Udp), control("kea")),
+        class(
+            PuntMatch::Ip {
+                protocol: 1,
+                ports: Some((1, 2)),
+            },
+            PuntDestination::Kernel,
+        ),
+        class(
+            PuntMatch::Ip {
+                protocol: 17,
+                ports: Some((68, 67)),
+            },
+            PuntDestination::Kernel,
+        ),
+        class(udp, control("../etc")),
+        class(udp, control("Kea")),
+        class(udp, control("")),
+        class(udp, control(&"a".repeat(33))),
+        PuntClass {
+            rate: 0,
+            ..class(udp, PuntDestination::Drop)
+        },
+        PuntClass {
+            burst: 0,
+            ..class(udp, PuntDestination::Drop)
+        },
+        PuntClass {
+            interface: Some(String::new()),
+            ..class(udp, PuntDestination::Drop)
+        },
+    ];
+    for value in refused {
+        let change = punt("x", value.clone());
+        assert!(change.validate().is_err(), "{value:?}");
+    }
+    assert!(punt("x", class(udp, control(&"a".repeat(32))))
+        .validate()
+        .is_ok());
+
+    // {[60170, "x"]: {1: "arp", 2: 17, 6: "neighd", 9: 1, 10: 1}}: a kind and a
+    // protocol both.
+    let both = encoded(|e| {
+        e.map(1)
+            .array(2)
+            .u64(sid::PUNT)
+            .text("x")
+            .map(5)
+            .u64(1)
+            .text("arp")
+            .u64(2)
+            .u64(17)
+            .u64(6)
+            .text("neighd")
+            .u64(9)
+            .u64(1)
+            .u64(10)
+            .u64(1);
+    });
+    assert!(decode_bytes(&both).is_err());
+    // Two destinations.
+    let two = encoded(|e| {
+        e.map(1)
+            .array(2)
+            .u64(sid::PUNT)
+            .text("x")
+            .map(5)
+            .u64(1)
+            .text("udp")
+            .u64(7)
+            .bool(true)
+            .u64(8)
+            .bool(true)
+            .u64(9)
+            .u64(1)
+            .u64(10)
+            .u64(1);
+    });
+    assert!(decode_bytes(&two).is_err());
+    // No burst.
+    let no_burst = encoded(|e| {
+        e.map(1)
+            .array(2)
+            .u64(sid::PUNT)
+            .text("x")
+            .map(3)
+            .u64(1)
+            .text("udp")
+            .u64(7)
+            .bool(true)
+            .u64(9)
+            .u64(1);
+    });
+    assert_eq!(decode_bytes(&no_burst), Err(ModelError::Missing("burst")));
+}

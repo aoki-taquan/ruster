@@ -29,7 +29,7 @@
 //! - RFC 5952 section 4: an IPv6 address is accepted only in its canonical text, so
 //!   one address is one key.
 //!
-//! Deviations: the route and neighbor tables are ruster's own models, and the SIDs are
+//! Deviations: the route, neighbor and punt tables are ruster's own models, and the SIDs are
 //! local (see [`crate::sid`]).
 
 use std::fmt;
@@ -77,6 +77,11 @@ pub enum Key {
         vrf: String,
         id: u32,
     },
+    /// One class of traffic to the router or to the control side (`ruster-punt`,
+    /// one table for the whole FE).
+    Punt {
+        class: String,
+    },
 }
 
 /// The value of one entry.
@@ -120,6 +125,132 @@ pub enum Value {
         outside: Vec<String>,
     },
     FirewallRule(FirewallRule),
+    Punt(PuntClass),
+}
+
+/// One class of `ruster-punt`: frames that match go to `destination`, at most
+/// `rate` per second and `burst` at once.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PuntClass {
+    pub matches: PuntMatch,
+    /// Only frames that came in on this interface; any interface when `None`.
+    pub interface: Option<String>,
+    pub destination: PuntDestination,
+    /// Packets per second, at least 1.
+    pub rate: u32,
+    /// Packets that may go at once, at least 1.
+    pub burst: u32,
+}
+
+/// What a punt class matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PuntMatch {
+    /// A fixed kind of traffic.
+    Kind(PuntKind),
+    /// IP packets of `protocol` (either family), and for TCP and UDP only the
+    /// destination ports `first..=last` when given.
+    Ip {
+        protocol: u8,
+        ports: Option<(u16, u16)>,
+    },
+}
+
+/// The fixed kinds of traffic a punt class can match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PuntKind {
+    /// ARP (RFC 826).
+    Arp,
+    /// IPv6 Neighbor Discovery (RFC 4861).
+    Nd,
+    /// PPPoE Discovery frames (RFC 2516 section 5, Ethernet type 0x8863).
+    PppoeDiscovery,
+    /// PPP control protocols in PPPoE session frames (RFC 1661 section 2: protocol
+    /// numbers from 0x8000, such as LCP, PAP, CHAP, IPCP and IPv6CP).
+    PppControl,
+    /// To the kernel: ICMP and ICMPv6 errors.
+    IcmpError,
+    /// Other ICMP and ICMPv6.
+    Icmp,
+    /// TCP SYNs that open a connection.
+    TcpSyn,
+    /// Other TCP.
+    Tcp,
+    Udp,
+    /// Anything else.
+    Other,
+}
+
+impl PuntKind {
+    pub const ALL: [Self; 10] = [
+        Self::Arp,
+        Self::Nd,
+        Self::PppoeDiscovery,
+        Self::PppControl,
+        Self::IcmpError,
+        Self::Icmp,
+        Self::TcpSyn,
+        Self::Tcp,
+        Self::Udp,
+        Self::Other,
+    ];
+
+    /// The name on the wire.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Arp => "arp",
+            Self::Nd => "nd",
+            Self::PppoeDiscovery => "pppoe-discovery",
+            Self::PppControl => "ppp-control",
+            Self::IcmpError => "icmp-error",
+            Self::Icmp => "icmp",
+            Self::TcpSyn => "tcp-syn",
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Other => "other",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
+
+    /// Whether the kind is a frame for a control process rather than an IP packet
+    /// for the kernel.
+    #[must_use]
+    pub const fn is_frame(self) -> bool {
+        matches!(
+            self,
+            Self::Arp | Self::Nd | Self::PppoeDiscovery | Self::PppControl
+        )
+    }
+}
+
+/// Where the frames of a punt class go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PuntDestination {
+    /// The control process with this socket name, as a whole frame.
+    Control(String),
+    /// The kernel of the VRF the packet came in on (its TUN).
+    Kernel,
+    /// Nowhere: dropped and counted.
+    Drop,
+}
+
+/// The longest socket name of a control process.
+pub const PUNT_CONTROL_NAME_MAX: usize = 32;
+
+/// Whether `name` can name a control process's socket: 1 to
+/// [`PUNT_CONTROL_NAME_MAX`] lower-case letters, digits and `-`, starting with a
+/// letter, so that it is one safe path component.
+#[must_use]
+pub fn is_control_name(name: &str) -> bool {
+    name.len() <= PUNT_CONTROL_NAME_MAX
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 /// The most entries a list member of a value has.
@@ -298,6 +429,7 @@ impl Key {
             Self::FirewallPolicy { .. } => sid::FIREWALL_POLICY,
             Self::IcmpErrors { .. } => sid::ICMP_ERRORS,
             Self::FirewallRule { .. } => sid::FIREWALL_RULE,
+            Self::Punt { .. } => sid::PUNT,
         }
     }
 }
@@ -367,6 +499,7 @@ impl Change {
             | Key::IcmpErrors { vrf }
             | Key::FirewallRule { vrf, .. } => name(vrf)?,
             Key::Address { interface, .. } | Key::Neighbor { interface, .. } => name(interface)?,
+            Key::Punt { class } => name(class)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 parse_prefix(&format!("{prefix}/{len}"))?;
@@ -385,6 +518,7 @@ impl Change {
                         | (Key::FirewallPolicy { .. }, Value::FirewallPolicy { .. })
                         | (Key::IcmpErrors { .. }, Value::IcmpErrors { .. })
                         | (Key::FirewallRule { .. }, Value::FirewallRule(_))
+                        | (Key::Punt { .. }, Value::Punt(_))
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -493,6 +627,7 @@ impl Change {
                             }
                         }
                     }
+                    Value::Punt(class) => validate_punt(class)?,
                     Value::Address { prefix_len } => {
                         let Key::Address { address, .. } = &self.key else {
                             unreachable!("checked above");
@@ -586,6 +721,9 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::IcmpErrors { vrf } => {
             e.array(2).u64(sid::ICMP_ERRORS).text(vrf);
         }
+        Key::Punt { class } => {
+            e.array(2).u64(sid::PUNT).text(class);
+        }
         Key::FirewallRule { vrf, id } => {
             e.array(3)
                 .u64(sid::FIREWALL_RULE)
@@ -599,7 +737,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
     let len = d.array()?;
     let table = d.u64()?;
     let expected = match table {
-        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS => 2,
+        sid::INTERFACE | sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::PUNT => 2,
         sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
@@ -615,6 +753,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::NAT => Key::Nat { vrf: first },
         sid::FIREWALL_POLICY => Key::FirewallPolicy { vrf: first },
         sid::ICMP_ERRORS => Key::IcmpErrors { vrf: first },
+        sid::PUNT => Key::Punt { class: first },
         sid::FIREWALL_RULE => Key::FirewallRule {
             vrf: first,
             id: u32::try_from(d.u64()?).map_err(|_| ModelError::Invalid("rule id"))?,
@@ -815,6 +954,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 e.u64(d(sid::NAT_EXTERNAL)).text(&external.to_string());
             }
         }
+        Value::Punt(class) => encode_punt(class, e),
         Value::FirewallRule(rule) => {
             let d = |member: u64| member - sid::FIREWALL_RULE;
             let members = 8 + u64::from(rule.ingress.is_some()) + u64::from(rule.egress.is_some());
@@ -856,7 +996,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
 fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
     if matches!(
         table,
-        sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::FIREWALL_RULE
+        sid::NAT | sid::FIREWALL_POLICY | sid::ICMP_ERRORS | sid::FIREWALL_RULE | sid::PUNT
     ) {
         return decode_policy_value(table, d);
     }
@@ -1207,7 +1347,9 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
         Some(_) => Err(ModelError::Invalid(what)),
         None => Ok(None),
     };
-    let value = if table == sid::ICMP_ERRORS {
+    let value = if table == sid::PUNT {
+        decode_punt(&mut got)?
+    } else if table == sid::ICMP_ERRORS {
         let mut number = |member: u64, what: &'static str| match got.remove(&member) {
             Some(Member::Uint(n)) => u32::try_from(n)
                 .ok()
@@ -1365,4 +1507,145 @@ fn port(
         Some(_) => Err(ModelError::Invalid("port")),
         None => Ok(None),
     }
+}
+
+/// The checks of a punt class that do not depend on the other classes.
+fn validate_punt(class: &PuntClass) -> Result<(), ModelError> {
+    if class.rate == 0 || class.burst == 0 {
+        return Err(ModelError::Invalid("punt rate or burst"));
+    }
+    if class.interface.as_deref() == Some("") {
+        return Err(ModelError::Invalid("empty name"));
+    }
+    if let PuntDestination::Control(name) = &class.destination {
+        if !is_control_name(name) {
+            return Err(ModelError::Invalid("punt control socket name"));
+        }
+    }
+    match class.matches {
+        // A frame has no IP packet to give the kernel.
+        PuntMatch::Kind(kind) if kind.is_frame() => {
+            if class.destination == PuntDestination::Kernel {
+                return Err(ModelError::Invalid(
+                    "punt destination (a frame to the kernel)",
+                ));
+            }
+        }
+        // The kernel's kinds are what is left of the traffic to the router.
+        PuntMatch::Kind(_) => {
+            if matches!(class.destination, PuntDestination::Control(_)) {
+                return Err(ModelError::Invalid("punt destination (a kernel kind)"));
+            }
+        }
+        PuntMatch::Ip { protocol, ports } => {
+            if let Some((first, last)) = ports {
+                if !matches!(protocol, 6 | 17) || first > last {
+                    return Err(ModelError::Invalid("punt ports"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn encode_punt(class: &PuntClass, e: &mut Encoder<'_>) {
+    let d = |member: u64| member - sid::PUNT;
+    let matches = match class.matches {
+        PuntMatch::Kind(_) | PuntMatch::Ip { ports: None, .. } => 1,
+        PuntMatch::Ip { ports: Some(_), .. } => 3,
+    };
+    e.map(3 + matches + u64::from(class.interface.is_some()));
+    match class.matches {
+        PuntMatch::Kind(kind) => {
+            e.u64(d(sid::PUNT_KIND)).text(kind.name());
+        }
+        PuntMatch::Ip { protocol, ports } => {
+            e.u64(d(sid::PUNT_PROTOCOL)).u64(u64::from(protocol));
+            if let Some((first, last)) = ports {
+                e.u64(d(sid::PUNT_FIRST_PORT))
+                    .u64(u64::from(first))
+                    .u64(d(sid::PUNT_LAST_PORT))
+                    .u64(u64::from(last));
+            }
+        }
+    }
+    if let Some(interface) = &class.interface {
+        e.u64(d(sid::PUNT_INTERFACE)).text(interface);
+    }
+    match &class.destination {
+        PuntDestination::Control(name) => {
+            e.u64(d(sid::PUNT_CONTROL)).text(name);
+        }
+        PuntDestination::Kernel => {
+            e.u64(d(sid::PUNT_KERNEL)).bool(true);
+        }
+        PuntDestination::Drop => {
+            e.u64(d(sid::PUNT_DROP)).bool(true);
+        }
+    }
+    e.u64(d(sid::PUNT_RATE))
+        .u64(u64::from(class.rate))
+        .u64(d(sid::PUNT_BURST))
+        .u64(u64::from(class.burst));
+}
+
+type Members = std::collections::BTreeMap<u64, Member>;
+
+fn decode_punt(got: &mut Members) -> Result<Value, ModelError> {
+    let text = |got: &mut Members, member: u64, what: &'static str| match got.remove(&member) {
+        Some(Member::Text(t)) => Ok(Some(t)),
+        Some(_) => Err(ModelError::Invalid(what)),
+        None => Ok(None),
+    };
+    let kind = match text(got, sid::PUNT_KIND, "punt kind")? {
+        Some(name) => Some(PuntKind::from_name(&name).ok_or(ModelError::Invalid("punt kind"))?),
+        None => None,
+    };
+    let protocol = match got.remove(&sid::PUNT_PROTOCOL) {
+        Some(Member::Uint(n)) => {
+            Some(u8::try_from(n).map_err(|_| ModelError::Invalid("punt protocol"))?)
+        }
+        Some(_) => return Err(ModelError::Invalid("punt protocol")),
+        None => None,
+    };
+    let ports = match (
+        port(got, sid::PUNT_FIRST_PORT)?,
+        port(got, sid::PUNT_LAST_PORT)?,
+    ) {
+        (Some(first), Some(last)) => Some((first, last)),
+        (None, None) => None,
+        _ => return Err(ModelError::Missing("first-port and last-port together")),
+    };
+    let matches = match (kind, protocol) {
+        (Some(kind), None) if ports.is_none() => PuntMatch::Kind(kind),
+        (None, Some(protocol)) => PuntMatch::Ip { protocol, ports },
+        _ => return Err(ModelError::Invalid("punt match (a kind or a protocol)")),
+    };
+    let interface = text(got, sid::PUNT_INTERFACE, "punt interface")?;
+    let control = text(got, sid::PUNT_CONTROL, "punt control")?;
+    let flag = |got: &mut Members, member: u64| match got.remove(&member) {
+        Some(Member::Bool(true)) => Ok(true),
+        Some(_) => Err(ModelError::Invalid("punt destination flag")),
+        None => Ok(false),
+    };
+    let kernel = flag(got, sid::PUNT_KERNEL)?;
+    let drop = flag(got, sid::PUNT_DROP)?;
+    let destination = match (control, kernel, drop) {
+        (Some(name), false, false) => PuntDestination::Control(name),
+        (None, true, false) => PuntDestination::Kernel,
+        (None, false, true) => PuntDestination::Drop,
+        _ => return Err(ModelError::Invalid("punt destination (exactly one)")),
+    };
+    let number = |got: &mut Members, member: u64, what: &'static str| match got.remove(&member) {
+        Some(Member::Uint(n)) => u32::try_from(n).map_err(|_| ModelError::Invalid(what)),
+        Some(_) => Err(ModelError::Invalid(what)),
+        None => Err(ModelError::Missing(what)),
+    };
+    Ok(Value::Punt(PuntClass {
+        matches,
+        interface,
+        destination,
+        rate: number(got, sid::PUNT_RATE, "rate")?,
+        burst: number(got, sid::PUNT_BURST, "burst")?,
+    }))
 }

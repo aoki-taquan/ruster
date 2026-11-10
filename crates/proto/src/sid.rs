@@ -90,6 +90,25 @@ pub const FIREWALL_DESTINATION_PORT_LOW: u64 = 60078;
 pub const FIREWALL_DESTINATION_PORT_HIGH: u64 = 60079;
 pub const FIREWALL_ACTION: u64 = 60080;
 
+/// One class of `ruster-punt`: what traffic to the router or to the control side it
+/// matches, where it goes, and its rate limit.
+pub const PUNT: u64 = 60170;
+/// A fixed kind of traffic (`arp`, `nd`, `pppoe-discovery`, ...).
+pub const PUNT_KIND: u64 = 60171;
+/// Or an IP protocol, with a range of destination ports for TCP and UDP.
+pub const PUNT_PROTOCOL: u64 = 60172;
+pub const PUNT_FIRST_PORT: u64 = 60173;
+pub const PUNT_LAST_PORT: u64 = 60174;
+/// Only frames that came in on this interface.
+pub const PUNT_INTERFACE: u64 = 60175;
+/// The destination: a control process's socket name, the kernel, or nowhere.
+pub const PUNT_CONTROL: u64 = 60176;
+pub const PUNT_KERNEL: u64 = 60177;
+pub const PUNT_DROP: u64 = 60178;
+/// Packets per second, and how many may go at once.
+pub const PUNT_RATE: u64 = 60179;
+pub const PUNT_BURST: u64 = 60180;
+
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
 pub const RESOLVE_REQUEST_INTERFACE: u64 = 60051;
@@ -209,6 +228,17 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/lower-port", FIREWALL_DESTINATION_PORT_LOW),
     ("/ietf-access-control-list:acls/acl/aces/ace/matches/l4/destination-port/upper-port", FIREWALL_DESTINATION_PORT_HIGH),
     ("/ietf-access-control-list:acls/acl/aces/ace/actions/forwarding", FIREWALL_ACTION),
+    ("/ruster-punt:punt/class", PUNT),
+    ("/ruster-punt:punt/class/kind", PUNT_KIND),
+    ("/ruster-punt:punt/class/protocol", PUNT_PROTOCOL),
+    ("/ruster-punt:punt/class/first-port", PUNT_FIRST_PORT),
+    ("/ruster-punt:punt/class/last-port", PUNT_LAST_PORT),
+    ("/ruster-punt:punt/class/interface", PUNT_INTERFACE),
+    ("/ruster-punt:punt/class/control", PUNT_CONTROL),
+    ("/ruster-punt:punt/class/kernel", PUNT_KERNEL),
+    ("/ruster-punt:punt/class/drop", PUNT_DROP),
+    ("/ruster-punt:punt/class/rate", PUNT_RATE),
+    ("/ruster-punt:punt/class/burst", PUNT_BURST),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",
