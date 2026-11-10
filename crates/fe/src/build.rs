@@ -438,11 +438,34 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
     }
-    // EtherIP interfaces get the ids after those: an interface row of the name, with
-    // no VLAN, tunnel or PPPoE session, and the EtherIP row.
+    // EtherIP and VXLAN interfaces get the ids after those: an interface row of the
+    // name, with no VLAN, tunnel or PPPoE session, and the EtherIP or VXLAN row.
     let mut overlays = Vec::new();
     for (key, value) in store.iter() {
-        if let (Key::EtherIp { interface: name }, Value::EtherIp { local, remote }) = (key, value) {
+        let (name, local, kind) = match (key, value) {
+            (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => (
+                interface,
+                *local,
+                ruster_core::OverlayKind::EtherIp { remote: *remote },
+            ),
+            (
+                Key::Vxlan { interface },
+                Value::Vxlan {
+                    vni,
+                    local,
+                    remotes,
+                },
+            ) => (
+                interface,
+                *local,
+                ruster_core::OverlayKind::Vxlan {
+                    vni: *vni,
+                    remotes: remotes.clone(),
+                },
+            ),
+            _ => continue,
+        };
+        {
             let Some(Value::Interface {
                 enabled: true,
                 mac,
@@ -456,7 +479,10 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                 continue;
             };
             if ports.iter().any(|port| port == name) {
-                return Err(format!("EtherIP interface {name} has the name of a port"));
+                return Err(format!("overlay interface {name} has the name of a port"));
+            }
+            if active.contains_key(name.as_str()) {
+                return Err(format!("{name} is both an EtherIP and a VXLAN interface"));
             }
             let id = ids.take(name)?;
             interfaces.push(Interface {
@@ -466,8 +492,8 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
             });
             overlays.push(ruster_core::Overlay {
                 interface: id,
-                local: *local,
-                kind: ruster_core::OverlayKind::EtherIp { remote: *remote },
+                local,
+                kind,
             });
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
@@ -489,9 +515,14 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                     interface: name.clone(),
                 })
                 .is_some()
+                || store
+                    .get(&Key::Vxlan {
+                        interface: name.clone(),
+                    })
+                    .is_some()
             {
                 return Err(format!(
-                    "bridge {name} has the name of an EtherIP interface"
+                    "bridge {name} has the name of an EtherIP or VXLAN interface"
                 ));
             }
             let limits = ruster_core::BridgeLimits {
