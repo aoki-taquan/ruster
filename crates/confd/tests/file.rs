@@ -1120,6 +1120,14 @@ fn the_dhcp_section_is_kept_and_checked() {
         ),
         ("pool = \"192.0.2.10-192.0.2.20\"\ndns = [\"::1\"]", "dns"),
         (
+            "pool = \"192.0.2.10-192.0.2.20\"\npunt-rate = 0",
+            "punt-rate",
+        ),
+        (
+            "pool = \"192.0.2.10-192.0.2.20\"\npunt-burst = 100001",
+            "punt-burst",
+        ),
+        (
             "pool = \"192.0.2.10-192.0.2.20\"\nrouter = [\"0.0.0.0\"]",
             "router",
         ),

@@ -10,7 +10,7 @@ use ruster_kea::Bridge;
 
 fn part(pool: &str) -> String {
     format!(
-        "version = 1\n\n[[dhcp]]\ninterface = \"lan\"\nmac = \"02:00:00:00:00:01\"\naddress = \"192.0.2.1/24\"\npool = \"{pool}\"\nlease-time = 600\nrouter = [\"192.0.2.1\"]\ndns = [\"192.0.2.1\", \"192.0.2.2\"]\n"
+        "version = 1\n\n[[dhcp]]\ninterface = \"lan\"\nmac = \"02:00:00:00:00:01\"\naddress = \"192.0.2.1/24\"\npool = \"{pool}\"\nlease-time = 600\nrouter = [\"192.0.2.1\"]\ndns = [\"192.0.2.1\", \"192.0.2.2\"]\npunt-rate = 200\npunt-burst = 100\n"
     )
 }
 

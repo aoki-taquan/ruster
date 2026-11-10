@@ -3,7 +3,8 @@
 use std::os::unix::net::UnixStream;
 
 use ruster_confd::part::{Client, Module};
-use ruster_confd::{file, Confd, DHCP_PUNT_BURST, DHCP_PUNT_RATE};
+use ruster_confd::{file, Confd};
+use ruster_config::{DHCP_PUNT_BURST, DHCP_PUNT_RATE};
 use ruster_proto::session::{Hook, Server, Store};
 use ruster_proto::sid;
 use ruster_proto::table::{Key, PuntClass, PuntDestination, PuntMatch, Value};
@@ -33,13 +34,18 @@ ipv4 = "10.10.0.1/24"
 
 fn with_dhcp(interfaces: &[&str]) -> String {
     let mut text = INTERFACES.to_owned();
-    for (name, pool) in [
-        ("lan", "192.0.2.100-192.0.2.199"),
-        ("lan.10", "10.10.0.100-10.10.0.199"),
+    // lan.10 sets its own punt limits; lan takes the defaults.
+    for (name, pool, more) in [
+        ("lan", "192.0.2.100-192.0.2.199", ""),
+        (
+            "lan.10",
+            "10.10.0.100-10.10.0.199",
+            "punt-rate = 50\npunt-burst = 20\n",
+        ),
     ] {
         if interfaces.contains(&name) {
             text.push_str(&format!(
-                "\n[[dhcp]]\ninterface = \"{name}\"\npool = \"{pool}\"\n"
+                "\n[[dhcp]]\ninterface = \"{name}\"\npool = \"{pool}\"\n{more}"
             ));
         }
     }
@@ -85,21 +91,24 @@ fn each_dhcp_interface_hands_the_server_port_to_kea() {
     let mut parts = Vec::new();
     run(&mut fe, &mut confd, &mut kea, &mut parts);
 
-    let class = |interface: &str| PuntClass {
+    let class = |interface: &str, rate, burst| PuntClass {
         matches: PuntMatch::Ip {
             protocol: 17,
             ports: Some((67, 67)),
         },
         interface: Some(interface.into()),
         destination: PuntDestination::Control("kea".into()),
-        rate: DHCP_PUNT_RATE,
-        burst: DHCP_PUNT_BURST,
+        rate,
+        burst,
     };
     assert_eq!(
         punt_classes(&fe),
         [
-            ("dhcp-lan".to_owned(), class("lan")),
-            ("dhcp-lan.10".to_owned(), class("lan.10")),
+            (
+                "dhcp-lan".to_owned(),
+                class("lan", DHCP_PUNT_RATE, DHCP_PUNT_BURST)
+            ),
+            ("dhcp-lan.10".to_owned(), class("lan.10", 50, 20)),
         ]
     );
     assert_eq!(parts.len(), 1);
@@ -112,7 +121,7 @@ fn each_dhcp_interface_hands_the_server_port_to_kea() {
     run(&mut fe, &mut confd, &mut kea, &mut parts);
     assert_eq!(
         punt_classes(&fe),
-        [("dhcp-lan.10".to_owned(), class("lan.10"))]
+        [("dhcp-lan.10".to_owned(), class("lan.10", 50, 20))]
     );
     assert_eq!(parts.len(), 2);
     assert_eq!(ruster_config::parse_dhcp_part(&parts[1]).unwrap().len(), 1);

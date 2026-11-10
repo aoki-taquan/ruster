@@ -167,11 +167,6 @@ pub const DHCP_CONTROL: &str = "kea";
 pub const DHCP_CLASS_PREFIX: &str = "dhcp-";
 /// The DHCP server port.
 pub const DHCP_SERVER_PORT: u16 = 67;
-/// How many DHCP packets per second, and at once, one interface hands over. A
-/// client sends a few per lease; this leaves room for a LAN of a few hundred
-/// starting together, and keeps a flood from one interface off the others'.
-pub const DHCP_PUNT_RATE: u32 = 200;
-pub const DHCP_PUNT_BURST: u32 = 100;
 
 /// A refused resync-end is sent again at least this often.
 pub const RESYNC_END_RETRY_MS: u64 = 10_000;
@@ -560,8 +555,8 @@ impl Confd {
                     destination: ruster_proto::table::PuntDestination::Control(
                         DHCP_CONTROL.to_owned(),
                     ),
-                    rate: DHCP_PUNT_RATE,
-                    burst: DHCP_PUNT_BURST,
+                    rate: dhcp.punt_rate,
+                    burst: dhcp.punt_burst,
                 }),
             );
         }

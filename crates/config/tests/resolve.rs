@@ -247,7 +247,7 @@ fn dns_needs_somewhere_to_listen() {
 #[test]
 fn dhcp_takes_the_interface_s_address_and_options() {
     let text = format!(
-        "{DNS_INTERFACES}\n[dns]\nlisten = [\"lan\"]\n\n[[dhcp]]\ninterface = \"lan\"\npool = \"192.0.2.100-192.0.2.199\"\n\n[[dhcp]]\ninterface = \"wan\"\npool = \"198.51.100.10-198.51.100.20\"\nlease-time = 600\nrouter = []\n"
+        "{DNS_INTERFACES}\n[dns]\nlisten = [\"lan\"]\n\n[[dhcp]]\ninterface = \"lan\"\npool = \"192.0.2.100-192.0.2.199\"\n\n[[dhcp]]\ninterface = \"wan\"\npool = \"198.51.100.10-198.51.100.20\"\nlease-time = 600\nrouter = []\npunt-rate = 50\npunt-burst = 20\n"
     );
     let lock = resolve(&text).unwrap();
     let [lan, wan] = &lock.dhcp[..] else {
@@ -259,6 +259,14 @@ fn dhcp_takes_the_interface_s_address_and_options() {
     assert_eq!(lan.router, ["192.0.2.1"]);
     assert_eq!(lan.dns, ["192.0.2.1"], "[dns] listens on lan");
     assert_eq!(wan.lease_time, 600);
+    assert_eq!(
+        (lan.punt_rate, lan.punt_burst),
+        (
+            ruster_config::DHCP_PUNT_RATE,
+            ruster_config::DHCP_PUNT_BURST
+        )
+    );
+    assert_eq!((wan.punt_rate, wan.punt_burst), (50, 20));
     assert!(wan.router.is_empty());
     assert!(wan.dns.is_empty(), "[dns] does not listen on wan");
     assert_eq!(parse_lock(&lock.to_text()).unwrap(), lock);
