@@ -39,6 +39,9 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
   - NAT（NAT44、MAP-Eのポートの範囲を使うNAPT）、状態を持つfirewall
   - フラグメント処理、ICMPとICMPv6のエラー生成
   - トンネル（MAP-E、DS-Lite）のカプセル化、PPPoEのカプセル化
+  - L2のブリッジ（MACアドレスの学習、フラッディング、エージング）と、ルーティングとのつなぎ（IRB）
+  - L2を運ぶトンネル: VXLAN（RFC 7348）、EtherIP（RFC 3378）
+  - SRv6（RFC 8754のSRH、RFC 8986のEnd、End.X、End.DT4、End.DT6、H.Encaps）
   - ルータ宛て通信の分類と流量制限、kernelへの受け渡し（TUN）
 - CE: 設定管理（`ruster-confd`）、経路の選択（`ruster-ribd`）、ARPとND（`ruster-neighd`）。
 - FEをいろいろな環境で動かすためのI/O層（AF_XDP、AF_PACKET、sim）。
@@ -47,7 +50,8 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
 - ルータ箱としての組み立て:
   - 運用者が書く全体の設定。FEの表（CORECONF）とは別の形で、CEの各コンポーネントの設定も含む。
     FEの表を書くのはCEのプロセスだけで、運用者が直接書くことはない。
-  - 既製のソフト（経路デーモンのFRR、DHCPのサーバのKea、DNSのサーバのUnbound）とrusterをつなぐ橋渡し役。ソフトごとに一つ置き、
+  - 既製のソフト（経路デーモンのFRR、DHCPのサーバのKea、DNSのサーバのUnbound）とrusterをつなぐ橋渡し役。
+    FRRで使うプロトコルは、BGP、IS-IS、OSPF（v2とv3）、BGP EVPN（RFC 7432、RFC 8365。VXLANの制御）。ソフトごとに一つ置き、
     全体の設定から自分の担当の部分を読んで相手のソフトの設定に変え、相手から得た値をCEのプロセスへ渡す。
   - 自作する制御: PPPoEの制御（Discovery、LCP、認証、IPCP、IPv6CP）、WAN側のDHCPクライアント
     （DHCPv4、DHCPv6とプレフィックスの委任）、LANへのRA。
