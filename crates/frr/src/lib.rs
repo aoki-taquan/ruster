@@ -14,3 +14,4 @@
 pub mod conf;
 pub mod fpm;
 pub mod routes;
+pub mod server;
