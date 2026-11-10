@@ -194,14 +194,30 @@ pub fn parse(text: &str) -> Result<Config, String> {
 }
 
 /// A configuration read from a file, with the texts confd keeps of it
-/// ([`crate::versions`]).
-#[derive(Clone, Debug)]
+/// ([`crate::versions`]). Its `Debug` does not show the texts, which may hold PPPoE
+/// passwords.
+#[derive(Clone)]
 pub struct Candidate {
     pub config: Config,
     /// The lock form as TOML text.
     pub lock: String,
     /// The text, when it was a `ruster.toml`.
     pub toml: Option<String>,
+}
+
+impl std::fmt::Debug for Candidate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            config,
+            lock: _,
+            toml,
+        } = self;
+        f.debug_struct("Candidate")
+            .field("config", config)
+            .field("lock", &ruster_config::HIDDEN)
+            .field("toml", &toml.as_ref().map(|_| ruster_config::HIDDEN))
+            .finish()
+    }
 }
 
 /// Reads a configuration like [`parse`], and keeps its lock form.

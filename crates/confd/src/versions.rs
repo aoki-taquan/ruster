@@ -53,8 +53,9 @@ use crate::{file, Config};
 /// How many versions are kept.
 pub const KEEP: usize = 50;
 
-/// One committed configuration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// One committed configuration. Its `Debug` does not show the texts, which may hold
+/// PPPoE passwords.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Version {
     #[serde(skip)]
@@ -68,6 +69,25 @@ pub struct Version {
     /// The `ruster.toml` text, when the configuration came as one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toml: Option<String>,
+}
+
+impl std::fmt::Debug for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            number,
+            time,
+            how,
+            lock: _,
+            toml,
+        } = self;
+        f.debug_struct("Version")
+            .field("number", number)
+            .field("time", time)
+            .field("how", how)
+            .field("lock", &ruster_config::HIDDEN)
+            .field("toml", &toml.as_ref().map(|_| ruster_config::HIDDEN))
+            .finish()
+    }
 }
 
 /// The versions, oldest first.
@@ -132,7 +152,10 @@ impl Versions {
         for (number, path) in found {
             let read = fs::read_to_string(&path)
                 .map_err(|e| e.to_string())
-                .and_then(|text| toml::from_str::<Version>(&text).map_err(|e| e.to_string()));
+                .and_then(|text| {
+                    toml::from_str::<Version>(&text)
+                        .map_err(|e| ruster_config::toml_error(&text, &e))
+                });
             match read {
                 Ok(mut version) => {
                     version.number = number;
@@ -169,8 +192,13 @@ impl Versions {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("{}: {error}", path.display())),
         };
-        let waiting: Waiting =
-            toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let waiting: Waiting = toml::from_str(&text).map_err(|e| {
+            format!(
+                "{}: {}",
+                path.display(),
+                ruster_config::toml_error(&text, &e)
+            )
+        })?;
         let latest = self.latest().map(|v| v.number);
         if Some(waiting.version) == latest && self.get(waiting.back_to).is_some() {
             self.waiting = Some(waiting);

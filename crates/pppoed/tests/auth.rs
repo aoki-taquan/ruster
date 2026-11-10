@@ -143,3 +143,13 @@ fn chap_bad_challenges_are_dropped() {
         None
     );
 }
+
+#[test]
+fn debug_hides_the_password() {
+    let c = Client::new(Auth::Pap, b"user", b"hunter2");
+    let shown = format!("{c:?}");
+    assert!(
+        !shown.contains("hunter2") && !shown.contains("104, 117"),
+        "{shown}"
+    );
+}

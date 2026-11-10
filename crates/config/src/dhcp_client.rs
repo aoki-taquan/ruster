@@ -108,6 +108,6 @@ pub fn dhcp_client_part(entries: &[DhcpClient]) -> String {
 /// Reads `ruster-dhcpc`'s part of the lock form ([`dhcp_client_part`]).
 pub fn parse_dhcp_client_part(text: &str) -> Result<Vec<DhcpClient>, String> {
     crate::check_version(text)?;
-    let part: DhcpClientPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    let part: DhcpClientPart = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     Ok(part.dhcp_client)
 }
