@@ -179,7 +179,7 @@ IPv4とIPv6の転送に同じfirewallを使う。決めること（RFC 4890、RF
 | 項目 | 内容 |
 |---|---|
 | 分類の名前 | 例: `arp`、`nd`、`dhcpv4`、`dhcpv6`、`ra`、`pppoe-discovery`、`ppp-control`、`bgp`、`ssh`、`other` |
-| 一致条件 | 決まった種類（`arp`、`nd`、`pppoe-discovery`、`ppp-control`と、kernelへの`icmp-error`、`icmp`、`tcp-syn`、`tcp`、`udp`、`other`）か、IPのプロトコルとTCP/UDPの宛先ポートの範囲 |
+| 一致条件 | 決まった種類（`arp`、`nd`、`pppoe-discovery`、`ppp-control`、TAPへの`isis`、`ospf`と、kernelへの`icmp-error`、`icmp`、`tcp-syn`、`tcp`、`udp`、`other`）か、IPのプロトコルとTCP/UDPの宛先ポートの範囲 |
 | インターフェース | 受けたインターフェース。省略するとどれでも |
 | 渡し先 | CEのsocketの名前 / kernel（そのVRFのTUN） / 受けたインターフェースのTAP（IS-IS、OSPF。[`overlay.md`](overlay.md)の6.） / 捨てる |
 | 上限 | 毎秒のパケット数と、まとめて許す数 |

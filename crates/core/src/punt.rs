@@ -112,8 +112,14 @@ pub fn select(frame: &[u8], ingress: IfId, matches: &[PuntFrameMatch]) -> Option
             }
             found(&|kind| kind == PuntFrameKind::PppControl)
         }
-        IPV4 | IPV6 if is_ospf_multicast(frame) => found(&|kind| kind == PuntFrameKind::Ospf),
         IPV4 | IPV6 => {
+            // An interface's OSPF class first; without one, a class for protocol
+            // 89 to link-local multicast takes it as before.
+            if is_ospf_multicast(frame) {
+                if let Some(class) = found(&|kind| kind == PuntFrameKind::Ospf) {
+                    return Some(class);
+                }
+            }
             let (protocol, port) = ip_to_link(frame)?;
             found(&|kind| match kind {
                 PuntFrameKind::Ip { protocol: p, ports } => {
@@ -384,6 +390,17 @@ mod tests {
             None,
             "behind an extension header"
         );
+        let any_89 = PuntFrameMatch {
+            ingress: None,
+            kind: PuntFrameKind::Ip {
+                protocol: 89,
+                ports: None,
+            },
+            class: 15,
+        };
+        let both = [OSPF_ON_1, any_89];
+        assert_eq!(select(&ospf6(5), IfId(1), &both), Some(14));
+        assert_eq!(select(&ospf6(5), IfId(2), &both), Some(15), "as before");
         let mut not_v4 = ospf([224, 0, 0, 5]);
         not_v4[14] = 0x65;
         assert_eq!(select(&not_v4, IfId(1), &all), None);

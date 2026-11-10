@@ -793,7 +793,8 @@ where
         if self.taps.is_empty() {
             return routed;
         }
-        let mut buf = vec![0_u8; PUNT_MAX];
+        // One byte more than taken, to see a frame that was cut short.
+        let mut buf = vec![0_u8; PUNT_MAX + 1];
         let names: Vec<String> = self.taps.keys().cloned().collect();
         for name in names {
             let id =
@@ -803,6 +804,10 @@ where
                     Some(Ok(n)) if n > 0 => n,
                     _ => break,
                 };
+                if n > PUNT_MAX {
+                    self.counters.from_tap_dropped += 1;
+                    continue;
+                }
                 let vrf = id.and_then(|id| self.by_ingress.get(usize::from(id.0)));
                 let (Some(id), Some(&at)) = (id, vrf) else {
                     self.counters.from_tap_dropped += 1;
