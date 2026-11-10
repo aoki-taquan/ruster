@@ -36,8 +36,13 @@
 //!
 //! - The deadline (version, version to go back to, time) is written to the state
 //!   directory before the version is, so confd started again during the wait goes on
-//!   waiting for the time left, and confd started after the deadline goes back at once.
-//!   The time left after a start is at most M minutes, in case the clock went back.
+//!   waiting for the time left. Started after the deadline, confd sends the latest
+//!   version as at any start, and starts going back in its first step. A deadline
+//!   more than M minutes away at a start means the clock went back; confd then goes
+//!   back at once too.
+//! - Going back does not wait for the processes to finish what they were sent
+//!   before: a process that never answers must not keep the version in use. It is
+//!   given up on like any change, after [`GIVE_UP_MS`].
 //! - If the deadline or the version cannot be written, confd goes back at once and
 //!   answers 5.00.
 //! - While a version waits, `config`, `confirm-within` and `rollback` are refused with
@@ -72,9 +77,15 @@
 //!
 //! - RFC 7252 sections 5.8.1 (GET), 5.8.2 (POST) and 5.9 (the response codes above),
 //!   over the stream framing of RFC 8323 like the table sockets.
+//! - RFC 6241 section 8.4 (the confirmed commit of NETCONF), for `confirm-within`
+//!   and `confirm`: without a confirming commit before the timeout, the configuration
+//!   before goes back.
 //!
 //! Deviations: the resources and their text payloads are ruster's own; they are not a
-//! CORECONF datastore.
+//! CORECONF datastore. Of RFC 6241 8.4: the timeout is in minutes (1 to 1440), not
+//! seconds, and counts from when the version is kept; there is no `persist-id` (the
+//! wait outlives the connection, and confd itself) and no `cancel-commit` (wait or
+//! confirm); a new commit during the wait is refused rather than confirming it.
 
 use std::os::unix::net::UnixStream;
 
@@ -208,10 +219,15 @@ impl Apply {
             ..Self::default()
         };
         if let Some(waiting) = apply.versions.waiting() {
-            let left_s = waiting
-                .deadline
-                .saturating_sub(unix_now())
-                .min(u64::from(waiting.minutes) * 60);
+            // A deadline further away than the wait given means the clock went back
+            // (a box with no clock kept across a restart): it cannot be trusted, and
+            // waiting again each start could put going back off for ever.
+            let left_s = waiting.deadline.saturating_sub(unix_now());
+            let left_s = if left_s > u64::from(waiting.minutes) * 60 {
+                0
+            } else {
+                left_s
+            };
             apply.confirm = Some(Confirm {
                 waiting,
                 due: Due::In(left_s * 1_000),
@@ -351,6 +367,13 @@ impl Apply {
                     .flatten()
                     .filter(|m| (1..=MAX_CONFIRM_MINUTES).contains(m))
                 {
+                    // Never without a version to go back to (confd always has one).
+                    Some(_) if self.versions.latest().is_none() => {
+                        return Some((
+                            Code::BAD_REQUEST,
+                            "there is no version to go back to".to_owned(),
+                        ))
+                    }
                     Some(minutes) => confirm = Some(minutes),
                     None => {
                         return Some((
@@ -475,23 +498,34 @@ impl Apply {
         let Due::At(at) = confirm.due else {
             return false;
         };
-        if now_ms < at || self.pending.is_some() || !confd.settled() {
+        // Not waiting for the processes to settle: one that never answers must not
+        // keep the version in use. Going back has its own wait and give-up.
+        if now_ms < at || self.pending.is_some() {
             return false;
         }
         let Waiting {
             version, back_to, ..
         } = confirm.waiting;
+        // A lock form from before an update may not read; its ruster.toml is then
+        // resolved again, as at start-up.
         let config = match self.versions.get(back_to) {
             None => Err("it is not kept".to_owned()),
-            Some(before) => file::parse(&before.lock).map(|config| (config, before)),
+            Some(before) => match file::parse(&before.lock) {
+                Ok(config) => Ok((config, before.lock.clone(), before.toml.clone())),
+                Err(error) => match before.toml.as_deref().map(file::candidate) {
+                    Some(Ok(c)) => Ok((c.config, c.lock, before.toml.clone())),
+                    _ => Err(error),
+                },
+            },
         };
         match config {
-            Ok((config, before)) => {
-                let mut keep = Keep::new(
-                    format!("back to {back_to}: version {version} was not confirmed"),
-                    before.lock.clone(),
-                    before.toml.clone(),
-                );
+            Ok((config, lock, toml)) => {
+                let how = if self.versions.get(version).is_some() {
+                    format!("back to {back_to}: version {version} was not confirmed")
+                } else {
+                    format!("back to {back_to}: the configuration after it was not kept")
+                };
+                let mut keep = Keep::new(how, lock, toml);
                 keep.going_back = true;
                 confirm.due = Due::GoingBack;
                 self.log.push(format!(
@@ -599,11 +633,17 @@ impl Apply {
             }
             pending.timed_out = true;
             let (conn, token) = (pending.conn, pending.token.clone());
-            let lines = vec![
+            let mut lines = vec![
                 "a process has not answered in time; confd keeps waiting up to 30 s and \
                  goes back to the configuration before if it is refused"
                     .to_owned(),
             ];
+            if let Some(minutes) = pending.keep.confirm {
+                lines.push(format!(
+                    "if it is kept, it then waits {minutes} min for `ruster confirm`; \
+                     see `ruster versions`"
+                ));
+            }
             self.reply(conn, &token, Code::GATEWAY_TIMEOUT, absent(confd, lines));
             return true;
         }

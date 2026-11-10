@@ -271,6 +271,14 @@ impl Versions {
                 format!("{at}: {lock_error}; its ruster.toml does not read either: {e}")
             })?;
             let how = format!("ruster.toml of version {number} resolved again at start-up");
+            // The deadline moves to the new version first: it is the same
+            // configuration, still waiting for `ruster confirm`.
+            if let Some(waiting) = self.waiting.filter(|w| w.version == number) {
+                self.set_waiting(Some(Waiting {
+                    version: number + 1,
+                    ..waiting
+                }))?;
+            }
             let new = self.commit(&how, &candidate.lock, Some(&toml))?;
             return Ok((candidate.config, format!("version {new} ({how})")));
         }

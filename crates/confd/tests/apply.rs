@@ -594,6 +594,55 @@ fn a_refused_going_back_is_tried_again() {
 }
 
 #[test]
+fn a_process_that_never_answers_does_not_stop_going_back() {
+    let mut rig = Rig::new();
+    // The FE stops reading, its socket still open: the confirmed apply times out,
+    // and confd gives up waiting and keeps it.
+    let _silent = std::mem::take(&mut rig.fe);
+    rig.cli
+        .post(&["config", "confirm-within", "1"], text(1400).as_bytes());
+    assert!(rig.answers().is_empty());
+    rig.now_ms = ANSWER_WAIT_MS;
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::GATEWAY_TIMEOUT, "{answers:?}");
+    assert!(
+        answers[0].1.contains("waits 1 min for `ruster confirm`"),
+        "{answers:?}"
+    );
+    rig.now_ms = GIVE_UP_MS;
+    rig.answers();
+    assert_eq!(rig.apply.waiting().unwrap().version, 2);
+
+    // At the deadline confd goes back all the same, and gives up waiting for the FE.
+    rig.now_ms = GIVE_UP_MS + MINUTE_MS;
+    rig.answers();
+    assert_eq!(rig.confd.config().interfaces[0].mtu, 1500);
+    rig.now_ms += GIVE_UP_MS;
+    rig.answers();
+    assert!(rig.apply.waiting().is_none());
+    let latest = rig.apply.versions().latest().unwrap();
+    assert_eq!(latest.how, "back to 1: version 2 was not confirmed");
+}
+
+#[test]
+fn a_deadline_beyond_the_wait_given_goes_back_at_once() {
+    let dir = state_dir("confirm-clock");
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    apply_to_confirm(&mut rig, 1400, "5");
+    drop(rig);
+    // As if the clock had gone back an hour before confd started again.
+    let mut versions = Versions::open(&dir).unwrap();
+    let mut waiting = versions.waiting().unwrap();
+    waiting.deadline += 3_600;
+    versions.set_waiting(Some(waiting)).unwrap();
+
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    rig.answers();
+    assert_eq!(rig.mtu(), Some(1500));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn a_refused_or_bad_confirmed_apply_does_not_wait() {
     let mut rig = Rig::new();
     for minutes in ["0", "x", "1441", "+1"] {

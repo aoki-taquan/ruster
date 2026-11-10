@@ -203,6 +203,37 @@ fn a_deadline_for_a_version_that_is_not_the_latest_is_dropped() {
 }
 
 #[test]
+fn a_waiting_version_resolved_again_at_start_up_still_waits() {
+    let dir = state_dir("waiting-update");
+    let mut versions = Versions::open(&dir).unwrap();
+    let lock = file::candidate(TOML).unwrap().lock;
+    versions.commit("apply", &lock, Some(TOML)).unwrap();
+    let waiting = Waiting {
+        version: 2,
+        back_to: 1,
+        deadline: 4_000_000_000,
+        minutes: 5,
+    };
+    versions.set_waiting(Some(waiting)).unwrap();
+    // As if an older ruster had written version 2's lock form.
+    versions
+        .commit("apply", "version = 1\nold-key = 3\n", Some(TOML))
+        .unwrap();
+
+    let mut again = Versions::open(&dir).unwrap();
+    let (_, from) = again.starting_config("/nonexistent").unwrap();
+    assert!(from.starts_with("version 3 "), "{from}");
+    let moved = Waiting {
+        version: 3,
+        ..waiting
+    };
+    assert_eq!(again.waiting(), Some(moved));
+    // And after one more start, it still waits.
+    assert_eq!(Versions::open(&dir).unwrap().waiting(), Some(moved));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn times_are_shown_in_utc() {
     assert_eq!(utc(0), "1970-01-01 00:00:00 UTC");
     assert_eq!(utc(951_782_400), "2000-02-29 00:00:00 UTC");
