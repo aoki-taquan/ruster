@@ -485,3 +485,13 @@ fn sessions_on_one_interface_take_only_their_own_offers() {
     a.receive(1, FrameKind::Discovery, &offer[0].1, &mut o);
     assert_eq!(o.frames.len(), 1);
 }
+
+#[test]
+fn settings_debug_hides_the_password() {
+    let shown = format!("{:?}", settings(b"hunter2"));
+    assert!(
+        !shown.contains("hunter2") && !shown.contains("104, 117"),
+        "{shown}"
+    );
+    assert!(shown.contains("user"), "{shown}");
+}
