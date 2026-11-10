@@ -81,6 +81,7 @@ use ruster_proto::table::{network, Change, Key, ResolveRequest, Value};
 use ruster_proto::task::{Progress, Task};
 
 mod nd;
+pub mod ra;
 
 /// The tables confd writes to neighd.
 pub const CONFIG_TABLES: &[u64] = &[ruster_proto::sid::INTERFACE, ruster_proto::sid::ADDRESS];
@@ -900,6 +901,7 @@ impl Neighd {
             return;
         };
         match message.kind {
+            nd::Kind::RouterSolicitation { .. } => self.counters.not_for_neighd += 1,
             nd::Kind::Solicitation {
                 target,
                 source_link_layer,
