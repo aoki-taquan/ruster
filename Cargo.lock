@@ -214,6 +214,9 @@ name = "ruster-pppoed"
 version = "0.2.0"
 dependencies = [
  "md-5",
+ "ruster-proto",
+ "serde",
+ "toml",
 ]
 
 [[package]]

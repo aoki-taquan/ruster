@@ -136,6 +136,11 @@ backlogのまま置き、使う場面が出たものから片付ける。
 Unboundの橋渡し役（`ruster-unbound`、netns `dns`）まで済んだ。候補、差分、確定を分けるのはまだで、
 新しい設定はどれかが断ったら前に戻すだけ。次は「作る順番」の3（Kea）。
 
+`ruster-pppoed`（「作る順番」の6）は、制御の部分だけを先に作った。Discovery、LCP、PAPとCHAP、IPCP、IPv6CPで
+セッションを張り、得た値を標準出力の行に書く（netns `pppoed`）。設定はまだ専用のファイルから読む。残りは、
+設定をconfdの`confd/part.sock`から受け取ること、得た値（`SessionUp`、`SessionDown`）を送り手としてconfdへ
+渡すこと、confdがFEの分類（`pppoe-discovery`と`ppp-control`を`pppoed`へ）を書くこと。
+
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
 外れている点として、それぞれのモジュールの`# Standards`に書く。
 
