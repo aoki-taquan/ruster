@@ -68,6 +68,15 @@ pub(crate) fn check(
                     "{at}: member {member:?} must have no address (the bridge's own interface has them)"
                 ));
             }
+            // A session's frames would be bridged before they reach the session.
+            if interfaces
+                .iter()
+                .any(|i| i.pppoe.as_ref().is_some_and(|(parent, _)| parent == member))
+            {
+                return Err(format!(
+                    "{at}: member {member:?} is the parent of a PPPoE session"
+                ));
+            }
             if let Some(other) = taken.insert(member.clone(), name.clone()) {
                 return Err(format!(
                     "{at}: member {member:?} is already in bridge {other:?}"
@@ -105,6 +114,27 @@ pub(crate) fn check(
             max_learned: entry.max_learned,
             statics,
         });
+    }
+    // A bridge's own interface carries no VLAN or PPPoE session (the FE relays only
+    // ports' and VLANs' frames), and takes no address from a DHCP client.
+    for interface in interfaces {
+        let parent = interface
+            .vlan
+            .as_ref()
+            .map(|(parent, _)| parent)
+            .or(interface.pppoe.as_ref().map(|(parent, _)| parent));
+        if let Some(parent) = parent.filter(|p| bridges.iter().any(|b| b.name == **p)) {
+            return Err(format!(
+                "interface {:?}: its parent {parent:?} is a bridge; a VLAN or PPPoE session runs on a port or VLAN",
+                interface.name
+            ));
+        }
+        if interface.ipv4_from.is_some() && bridges.iter().any(|b| b.name == interface.name) {
+            return Err(format!(
+                "interface {:?}: a bridge takes no ipv4-from",
+                interface.name
+            ));
+        }
     }
     // A bridge's own interface is no member of another.
     if let Some(bridge) = bridges.iter().find(|b| taken.contains_key(&b.name)) {

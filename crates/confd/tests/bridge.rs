@@ -134,4 +134,15 @@ vlan = 3"#,
          \n[[interface]]\nname = \"br1\"\nbridge = {{ members = [\"p1\"] }}\n"
     );
     assert!(parse(&text).unwrap_err().contains("already in bridge"));
+    // A member that is a PPPoE session's parent.
+    let text = format!(
+        "[[source]]\nname = \"pppoe-wan\"\nkind = \"pppoe\"\n{base}\n[[interface]]\nname = \"ppp\"\n\
+         pppoe = {{ parent = \"p1\", source = \"pppoe-wan\" }}\n\n[[interface]]\nname = \"br0\"\n\
+         bridge = {{ members = [\"p1\"] }}\n"
+    );
+    let error = parse(&text).unwrap_err();
+    assert!(
+        error.contains("is the parent of a PPPoE session"),
+        "{error}"
+    );
 }

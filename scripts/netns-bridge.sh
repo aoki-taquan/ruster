@@ -44,6 +44,9 @@ host() { # namespace, its device, the router's port, the port's MAC
   nsx "$router" ip link set "$3" master vrf-ports
   nsx "$router" ip link set "$3" address "$4" up
   nsx "$1" ethtool -K "$2" tx off >/dev/null 2>&1 || true
+  # No IPv6 on the hosts: its unasked frames would teach the bridge b's MAC on p4
+  # before the move.
+  nsx "$1" sysctl -qw "net.ipv6.conf.$2.disable_ipv6=1"
   nsx "$1" ip link set "$2" up
 }
 host "$a" a0 p1 02:00:00:00:00:01
@@ -55,6 +58,7 @@ nsx "$a" ip route add default via 192.0.2.1
 nsx "$b" ip link set b0 address "$b_mac"
 nsx "$b" ip addr add 192.0.2.20/24 dev b0
 nsx "$b" ip route add default via 192.0.2.1
+nsx "$d" ip link set d0 down
 nsx "$d" ip link set d0 address "$b_mac"
 nsx "$c" ip addr add 198.51.100.10/24 dev c0
 nsx "$c" ip route add default via 198.51.100.1
@@ -131,6 +135,7 @@ wait_counter() { # name, at least, seconds
 
 # b moves to p4: d takes its MAC and address and speaks first.
 nsx "$b" ip link set b0 down
+nsx "$d" ip link set d0 up
 nsx "$d" ip addr add 192.0.2.20/24 dev d0
 nsx "$d" ip route add default via 192.0.2.1
 nsx "$d" ping -c 2 -i 0.2 -W 1 192.0.2.10 >/dev/null || fail "d (b's MAC on p4) does not reach a"
