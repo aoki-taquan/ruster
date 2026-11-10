@@ -159,7 +159,7 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 `netns-dslite-firewall6.sh`（DS-LiteとIPv6のfirewall）、`netns-vrf-firewall.sh`（VRFとfirewall）です。
 `netns-pppoed.sh`は、`pppoe-server`（パッケージ`pppoe`と`ppp`）を相手に、pppoedのセッションをIPCPとIPv6CPまで張ります（FEは通さない）。
 `netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る）。
-`netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。`netns-dhcp6.sh`はDHCPv6で同じことを確かめます（`kea-dhcp6-server`と`busybox`）。`netns-ra.sh`は、LANのホストがneighdのRAでSLAACのアドレスと既定経路を得ることを確かめます。どれもインターネットにはつながない。
+`netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。`netns-dhcp6.sh`はDHCPv6で同じことを確かめます（`kea-dhcp6-server`と`busybox`）。`netns-ra.sh`は、LANのホストがneighdのRAでSLAACのアドレスと既定経路を得ることを確かめます。`netns-dhcpc.sh`は、`ruster-dhcpc`がISP側のKeaからWANのIPv4アドレスと委任されたプレフィックスを得て、LANのホストがNATでISP側へ出られることを確かめます（`kea-dhcp4-server`と`kea-dhcp6-server`）。どれもインターネットにはつながない。
 
 ## 開発
 
@@ -180,7 +180,7 @@ cargo test --doc --workspace --all-features --locked
 | crate | 中身 |
 |---|---|
 | `fe` | FE（`ruster-fe`） |
-| `confd`、`ribd`、`neighd`、`pppoed` | CEのプロセス |
+| `confd`、`ribd`、`neighd`、`pppoed`、`dhcpc` | CEのプロセス |
 | `unbound`、`kea` | Unbound、Keaの橋渡し役（`ruster-unbound`、`ruster-kea`。後者はDHCPv4とDHCPv6のリレーも） |
 | `cli` | `ruster`コマンド |
 | `config` | 設定の書き方（`ruster.toml`と、既定値を全部埋めたlockの形）と、その解決 |
