@@ -644,6 +644,7 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
     firewall: FirewallService<'_, '_, '_, '_, '_, '_, '_>,
     control: Option<&mut ControlQueue>,
     vlans: &[crate::VlanBinding],
+    bridges: Option<&mut crate::Bridges>,
     trace: &mut T,
 ) -> Completed {
     let ingress = packet.ingress();
@@ -696,11 +697,22 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
             .map_or(Ok(egress), |session| {
                 crate::pppoe::transmit(&mut packet, session, snapshot)
             })
-            .and_then(|egress| crate::vlan::transmit(&mut packet, egress, vlans))
-        {
-            Ok(port) => {
+            .and_then(|egress| match bridges {
+                // Out of an IRB: to the member the destination is on, or flooded.
+                Some(bridges) => bridges.transmit(egress, packet.bytes_mut(), snapshot.now.0),
+                None => Ok(Some(egress)),
+            })
+            .and_then(|member| match member {
+                Some(member) => crate::vlan::transmit(&mut packet, member, vlans).map(Some),
+                None => Ok(None),
+            }) {
+            Ok(Some(port)) => {
                 packet.commit(port);
                 Completed::Transmitted
+            }
+            Ok(None) => {
+                packet.consume(crate::ConsumeReason::BridgeFlooded);
+                Completed::Consumed
             }
             Err(reason) => {
                 packet.recycle(reason);

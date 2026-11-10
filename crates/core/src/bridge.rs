@@ -6,7 +6,9 @@
 //! frames' source addresses, which age, and static ones the control side wrote, which
 //! do not. [`MacTable::receive`] decides what happens to a frame received on a member:
 //! it goes up to the bridge's own interface (the IRB), out of one member, or out of
-//! all the others (flooding). The table never allocates after [`MacTable::new`] while
+//! all the others (flooding). [`Bridges`] holds every bridge's members and IRB with the
+//! table, and is what forwarding uses: frames it floods are copied out to slots made
+//! at the start, for the caller to send after the batch. The table never allocates after [`MacTable::new`] while
 //! packets pass; only [`MacTable::republish`], on a table change, does.
 //!
 //! # Standards
@@ -51,8 +53,10 @@ pub struct BridgeCounters {
     pub limited: u64,
     /// Frames sent out of the one member their destination was learned on.
     pub forwarded: u64,
-    /// Frames flooded (each counted once), and copies of them that could not be sent.
+    /// Frames flooded, each counted once.
     pub flooded: u64,
+    /// Copies of flooded frames that could not be sent, and flooded frames that
+    /// found no room to be copied out.
     pub flood_dropped: u64,
     /// Frames dropped because their destination is on the member they came in on.
     pub filtered: u64,
@@ -163,7 +167,11 @@ impl MacTable {
     /// hashed with `key`. No bridge is set until [`MacTable::republish`].
     #[must_use]
     pub fn new(capacity: usize, key: ResolutionHashKey) -> Self {
-        let slots = (capacity.max(1) * 2).next_power_of_two();
+        let slots = capacity
+            .clamp(1, 1 << 24)
+            .saturating_mul(2)
+            .next_power_of_two();
+        let capacity = capacity.min(1 << 24);
         Self {
             slots: vec![EMPTY; slots].into_boxed_slice(),
             mask: slots - 1,
@@ -296,16 +304,21 @@ impl MacTable {
                 seen_ms: 0,
             });
         }
+        // The new id of each old bridge (the first that names it).
+        let mut new_of_old: Vec<Option<u16>> = vec![None; old_bridges.len()];
+        for (new, old) in old_of_new.iter().enumerate().take(self.bridges.len()) {
+            if let Some(slot) = old.and_then(|o| new_of_old.get_mut(usize::from(o))) {
+                if slot.is_none() {
+                    *slot = u16::try_from(new).ok();
+                }
+            }
+        }
         for slot in old.into_iter().filter(|s| !s.fixed) {
-            let Some(new) = old_of_new
-                .iter()
-                .position(|&o| o == Some(slot.bridge))
-                .and_then(|at| u16::try_from(at).ok())
-            else {
+            let Some(new) = new_of_old.get(usize::from(slot.bridge)).copied().flatten() else {
                 continue;
             };
-            let room = self.bridges[usize::from(new)].learned
-                < self.bridges[usize::from(new)].limits.max_macs;
+            let state = &self.bridges[usize::from(new)];
+            let room = state.learned < state.limits.max_macs;
             if !keep(new, slot.member)
                 || self.find(new, &slot.mac).is_some()
                 || self.len >= self.capacity
@@ -464,6 +477,13 @@ impl MacTable {
         }
     }
 
+    /// Counts a flooded frame that found no room to be copied out.
+    pub fn count_flood_dropped(&mut self, bridge: u16) {
+        if let Some(b) = self.bridges.get_mut(usize::from(bridge)) {
+            b.counters.flood_dropped += 1;
+        }
+    }
+
     /// Each bridge's counters, in the order of their ids.
     pub fn counters(&self) -> impl Iterator<Item = BridgeCounters> + '_ {
         self.bridges.iter().map(|b| b.counters)
@@ -489,6 +509,270 @@ impl MacTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+}
+
+/// One bridge as the tables give it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BridgeConfig {
+    pub limits: BridgeLimits,
+    /// The bridge's own interface and its MAC address, when it has one.
+    pub irb: Option<(IfId, [u8; 6])>,
+    /// The members, ports and VLAN sub-interfaces.
+    pub members: Vec<IfId>,
+}
+
+/// The longest frame a flood copies out (an Ethernet frame with a 9216-byte payload).
+pub const FLOOD_FRAME_MAX: usize = 9_216 + 14;
+
+/// A flooded frame waiting to be sent out of the members of its bridge.
+pub struct FloodFrame {
+    pub bridge: u16,
+    /// The member it came in on, which it does not go back out of.
+    pub from: Option<IfId>,
+    len: usize,
+    buf: Box<[u8]>,
+}
+
+impl FloodFrame {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+/// How a received frame left the bridge, for the batch counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Received {
+    /// Not a member's frame, or one for the IRB (its ingress is now the IRB):
+    /// forwarding goes on with it.
+    Pass,
+    /// Relayed out of one member: commit it to this port.
+    Transmitted(IfId),
+    Consumed,
+    Dropped,
+}
+
+/// Every bridge of the FE: their members, the MAC address table, and the flooded
+/// frames of the current batch.
+pub struct Bridges {
+    pub table: MacTable,
+    bridges: Vec<BridgeConfig>,
+    /// The bridge of each member, by interface id.
+    member_of: Vec<Option<u16>>,
+    /// The bridge of each IRB, by interface id.
+    irb_of: Vec<Option<u16>>,
+    flood: Vec<FloodFrame>,
+    flooded: usize,
+}
+
+impl std::fmt::Debug for Bridges {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Bridges")
+            .field("table", &self.table)
+            .field("bridges", &self.bridges)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Bridges {
+    /// Room for `capacity` MAC addresses and `flood_slots` flooded frames per batch,
+    /// all allocated now.
+    #[must_use]
+    pub fn new(capacity: usize, flood_slots: usize, key: ResolutionHashKey) -> Self {
+        Self {
+            table: MacTable::new(capacity, key),
+            bridges: Vec::new(),
+            member_of: Vec::new(),
+            irb_of: Vec::new(),
+            flood: (0..flood_slots)
+                .map(|_| FloodFrame {
+                    bridge: 0,
+                    from: None,
+                    len: 0,
+                    buf: vec![0; FLOOD_FRAME_MAX].into_boxed_slice(),
+                })
+                .collect(),
+            flooded: 0,
+        }
+    }
+
+    /// Sets the bridges after a table change (see [`MacTable::republish`]); a member
+    /// listed twice stays with the first bridge. Returns the static entries left out.
+    pub fn publish(
+        &mut self,
+        bridges: Vec<BridgeConfig>,
+        old_of_new: &[Option<u16>],
+        statics: &[(u16, [u8; 6], IfId)],
+    ) -> usize {
+        let size = |ids: &mut dyn Iterator<Item = IfId>| ids.map(|id| usize::from(id.0) + 1).max();
+        let len = size(
+            &mut bridges
+                .iter()
+                .flat_map(|b| b.members.iter().copied().chain(b.irb.map(|(id, _)| id))),
+        )
+        .unwrap_or(0);
+        self.member_of = vec![None; len];
+        self.irb_of = vec![None; len];
+        for (at, bridge) in bridges.iter().enumerate() {
+            let at = u16::try_from(at).unwrap_or(u16::MAX);
+            for member in &bridge.members {
+                let slot = &mut self.member_of[usize::from(member.0)];
+                if slot.is_none() {
+                    *slot = Some(at);
+                }
+            }
+            if let Some((irb, _)) = bridge.irb {
+                self.irb_of[usize::from(irb.0)] = Some(at);
+            }
+        }
+        let limits: Vec<BridgeLimits> = bridges.iter().map(|b| b.limits).collect();
+        let member_of = &self.member_of;
+        let left = self.table.republish(
+            &limits,
+            old_of_new,
+            |bridge, member| {
+                member_of.get(usize::from(member.0)).copied().flatten() == Some(bridge)
+            },
+            statics,
+        );
+        self.bridges = bridges;
+        self.flooded = 0;
+        left
+    }
+
+    /// Whether there is any bridge.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bridges.is_empty()
+    }
+
+    /// The bridge `id` is a member of.
+    #[must_use]
+    pub fn member_of(&self, id: IfId) -> Option<u16> {
+        self.member_of.get(usize::from(id.0)).copied().flatten()
+    }
+
+    /// The bridge `id` is the own interface (IRB) of.
+    #[must_use]
+    pub fn irb_of(&self, id: IfId) -> Option<u16> {
+        self.irb_of.get(usize::from(id.0)).copied().flatten()
+    }
+
+    /// The members of bridge `bridge`.
+    #[must_use]
+    pub fn members(&self, bridge: u16) -> &[IfId] {
+        self.bridges
+            .get(usize::from(bridge))
+            .map_or(&[], |b| b.members.as_slice())
+    }
+
+    /// Copies `frame` out to be flooded over `bridge` (but not back out of `from`).
+    /// Returns `false`, counting it, when there is no room or it is too long.
+    pub fn stage_flood(&mut self, bridge: u16, from: Option<IfId>, frame: &[u8]) -> bool {
+        let Some(slot) = self.flood.get_mut(self.flooded) else {
+            self.table.count_flood_dropped(bridge);
+            return false;
+        };
+        if frame.len() > slot.buf.len() {
+            self.table.count_flood_dropped(bridge);
+            return false;
+        }
+        slot.buf[..frame.len()].copy_from_slice(frame);
+        slot.len = frame.len();
+        slot.bridge = bridge;
+        slot.from = from;
+        self.flooded += 1;
+        true
+    }
+
+    /// The frames flooded since the last [`Bridges::clear_flood`].
+    #[must_use]
+    pub fn flood(&self) -> &[FloodFrame] {
+        &self.flood[..self.flooded]
+    }
+
+    pub fn clear_flood(&mut self) {
+        self.flooded = 0;
+    }
+
+    /// The bridge stage of a received frame: a member's frame is learned from and
+    /// relayed, or made to arrive on the IRB. `vlans` tags a frame relayed out of a
+    /// VLAN sub-interface.
+    pub(crate) fn receive<S: crate::PacketSlot>(
+        &mut self,
+        packet: &mut crate::PacketLease<S>,
+        vlans: &[crate::VlanBinding],
+        now_ms: u64,
+    ) -> Received {
+        let member = packet.ingress();
+        let Some(bridge) = self.member_of(member) else {
+            return Received::Pass;
+        };
+        let irb = self.bridges[usize::from(bridge)].irb;
+        let decision = self.table.receive(
+            bridge,
+            member,
+            packet.bytes_mut(),
+            irb.map(|(_, mac)| mac),
+            now_ms,
+        );
+        match decision {
+            BridgeDecision::Irb => {
+                packet.set_ingress(irb.expect("an IRB decision has an IRB").0);
+                Received::Pass
+            }
+            BridgeDecision::Forward(out) => match crate::vlan::transmit(packet, out, vlans) {
+                Ok(port) => {
+                    self.table.count_forwarded(bridge);
+                    Received::Transmitted(port)
+                }
+                Err(_) => Received::Dropped,
+            },
+            BridgeDecision::Flood { irb: up } => {
+                let staged = self.stage_flood(bridge, Some(member), packet.bytes_mut());
+                if staged {
+                    self.table.count_flood(bridge, 0);
+                }
+                match irb {
+                    Some((id, _)) if up => {
+                        packet.set_ingress(id);
+                        Received::Pass
+                    }
+                    _ if staged => Received::Consumed,
+                    _ => Received::Dropped,
+                }
+            }
+            BridgeDecision::Drop => Received::Dropped,
+        }
+    }
+
+    /// Where a frame sent out of `egress` goes when `egress` is an IRB: the member its
+    /// destination was learned on, or `None` after it was copied out to be flooded
+    /// (or dropped for want of room, `Err`). Any other egress is returned as it is.
+    pub(crate) fn transmit(
+        &mut self,
+        egress: IfId,
+        frame: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<IfId>, crate::DropReason> {
+        let Some(bridge) = self.irb_of(egress) else {
+            return Ok(Some(egress));
+        };
+        let destination: [u8; 6] = frame
+            .get(0..6)
+            .and_then(|d| d.try_into().ok())
+            .ok_or(crate::DropReason::EthernetHeaderTruncated)?;
+        if let Some(member) = self.table.send(bridge, &destination, now_ms) {
+            self.table.count_forwarded(bridge);
+            return Ok(Some(member));
+        }
+        if self.stage_flood(bridge, None, frame) {
+            self.table.count_flood(bridge, 0);
+            Ok(None)
+        } else {
+            Err(crate::DropReason::BridgeDropped)
+        }
     }
 }
 
@@ -660,5 +944,41 @@ mod tests {
         t.republish(&[limits], &[Some(0)], |_, _| true, &[]);
         assert_eq!(t.send(0, &A, 0), Some(P1));
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn an_irb_sends_to_the_learned_member_or_copies_out_to_flood() {
+        let key = ResolutionHashKey::new(3, 4).unwrap();
+        let mut bridges = Bridges::new(16, 1, key);
+        let config = BridgeConfig {
+            limits: BridgeLimits {
+                aging_ms: 1_000,
+                max_macs: 8,
+            },
+            irb: Some((IfId(9), IRB)),
+            members: vec![P1, P2],
+        };
+        bridges.publish(vec![config], &[None], &[]);
+        assert_eq!(bridges.member_of(P2), Some(0));
+        assert_eq!(bridges.irb_of(IfId(9)), Some(0));
+        // Not an IRB: as it is.
+        assert_eq!(bridges.transmit(P3, &frame(A, IRB), 0), Ok(Some(P3)));
+        // Unknown: copied out, once (one slot).
+        assert_eq!(bridges.transmit(IfId(9), &frame(A, IRB), 0), Ok(None));
+        assert_eq!(bridges.flood().len(), 1);
+        assert_eq!(bridges.flood()[0].bytes(), frame(A, IRB).as_slice());
+        assert_eq!(bridges.flood()[0].from, None);
+        assert_eq!(
+            bridges.transmit(IfId(9), &frame(A, IRB), 0),
+            Err(crate::DropReason::BridgeDropped)
+        );
+        bridges.clear_flood();
+        bridges.table.learn(0, A, P2, 0);
+        assert_eq!(bridges.transmit(IfId(9), &frame(A, IRB), 1), Ok(Some(P2)));
+        let counters = bridges.table.counters().next().unwrap();
+        assert_eq!(
+            (counters.flooded, counters.flood_dropped, counters.forwarded),
+            (1, 1, 1)
+        );
     }
 }

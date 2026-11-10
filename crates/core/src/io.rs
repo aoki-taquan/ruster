@@ -293,11 +293,14 @@ pub enum ConsumeReason {
     /// A frame for the control side ([`crate::PuntFrameMatch`]) copied into the
     /// caller's control queue. The received frame is recycled.
     PuntToControl,
+    /// A frame a bridge floods, copied out to be sent out of each other member as
+    /// generated frames after the batch. The received frame is recycled.
+    BridgeFlooded,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
@@ -308,6 +311,7 @@ impl ConsumeReason {
         Self::WireguardQueued,
         Self::TunnelFragmentToControl,
         Self::PuntToControl,
+        Self::BridgeFlooded,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -325,6 +329,7 @@ impl ConsumeReason {
             Self::WireguardQueued => 7,
             Self::TunnelFragmentToControl => 8,
             Self::PuntToControl => 9,
+            Self::BridgeFlooded => 10,
         }
     }
 
@@ -341,6 +346,7 @@ impl ConsumeReason {
             Self::WireguardQueued => "WIREGUARD_QUEUED",
             Self::TunnelFragmentToControl => "TUNNEL_FRAGMENT_TO_CONTROL",
             Self::PuntToControl => "PUNT_TO_CONTROL",
+            Self::BridgeFlooded => "BRIDGE_FLOODED",
         }
     }
 }
@@ -551,6 +557,7 @@ mod tests {
                 "WIREGUARD_QUEUED",
                 "TUNNEL_FRAGMENT_TO_CONTROL",
                 "PUNT_TO_CONTROL",
+                "BRIDGE_FLOODED",
             ]
         );
     }

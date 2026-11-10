@@ -594,6 +594,10 @@ pub enum DropReason {
     /// IDs stay unique within the maximum datagram lifetime (when the NAT limits
     /// it).
     Nat44Ipv4IdRateExceeded = 253,
+    /// A frame a bridge does not relay: to a reserved address, from a group or
+    /// all-zero source, to the member it came in on, or one the backend has no room
+    /// to tag or untag (`crate::MacTable::receive`).
+    BridgeDropped = 254,
 }
 
 use DropReason::*;
@@ -601,7 +605,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 253] = [
+    pub const ALL: [Self; 254] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -855,6 +859,7 @@ impl DropReason {
         FirewallIcmpv6Unrelated,
         RouteDiscard,
         Nat44Ipv4IdRateExceeded,
+        BridgeDropped,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1125,6 +1130,7 @@ impl DropReason {
             FirewallIcmpv6Unrelated => "FIREWALL_ICMPV6_UNRELATED",
             RouteDiscard => "ROUTE_DISCARD",
             Nat44Ipv4IdRateExceeded => "NAT44_IPV4_ID_RATE_EXCEEDED",
+            BridgeDropped => "BRIDGE_DROPPED",
         }
     }
 }
@@ -3097,6 +3103,7 @@ where
         services.fragmentation,
         services.fragment_tracking,
         Some(control),
+        services.bridges,
         trace,
     )
 }
@@ -3120,6 +3127,10 @@ pub struct Services<'s, 'c, 'r> {
     pub fragment_tracking: Option<&'s mut Ipv4FragmentTracker<'r>>,
     /// Records the firewall's decisions.
     pub firewall_audit: Option<&'s mut FirewallAuditBuffer<'r>>,
+    /// Relays the frames of bridge members and sends what leaves an IRB to its
+    /// members (`docs/design/overlay.md`); flooded frames are copied out into it,
+    /// for the caller to send after the batch.
+    pub bridges: Option<&'s mut crate::Bridges>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3157,6 +3168,7 @@ where
         firewall,
         firewall_audit,
         fragmentation,
+        None,
         None,
         None,
         trace,
@@ -3200,6 +3212,7 @@ fn forward_batch_tracked<B, T>(
     mut fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
     mut fragment_tracking: Option<&mut Ipv4FragmentTracker<'_>>,
     mut control: Option<&mut crate::ControlQueue>,
+    mut bridges: Option<&mut crate::Bridges>,
     trace: &mut T,
 ) -> BatchReport<B::Error>
 where
@@ -3221,6 +3234,30 @@ where
                 dropped += 1;
                 trace.record(TraceEvent::Dropped { ingress, reason });
                 continue;
+            }
+        }
+        // A bridge member's frame is relayed here, unless it is for the bridge's own
+        // interface (its ingress is then the IRB).
+        if let Some(bridges) = bridges.as_deref_mut().filter(|b| !b.is_empty()) {
+            match bridges.receive(&mut packet, vlans, all_vrfs.now.0) {
+                crate::bridge::Received::Pass => {}
+                crate::bridge::Received::Transmitted(port) => {
+                    packet.commit(port);
+                    tx_requested += 1;
+                    continue;
+                }
+                crate::bridge::Received::Consumed => {
+                    packet.consume(crate::ConsumeReason::BridgeFlooded);
+                    consumed += 1;
+                    continue;
+                }
+                crate::bridge::Received::Dropped => {
+                    let (ingress, reason) = (packet.ingress(), DropReason::BridgeDropped);
+                    packet.recycle(reason);
+                    dropped += 1;
+                    trace.record(TraceEvent::Dropped { ingress, reason });
+                    continue;
+                }
             }
         }
         // Frames for the control side go before the sessions and the routes see
@@ -3299,6 +3336,7 @@ where
                     firewall_service,
                     control.as_deref_mut(),
                     vlans,
+                    bridges.as_deref_mut(),
                     trace,
                 ) {
                     crate::ipv6::Completed::Transmitted => tx_requested += 1,
@@ -3814,7 +3852,28 @@ where
                         }
                         None => egress,
                     };
-                    match crate::vlan::transmit(&mut packet, egress, vlans) {
+                    // Out of an IRB: to the member the destination is on, or flooded.
+                    let member = match bridges.as_deref_mut() {
+                        Some(bridges) => {
+                            bridges.transmit(egress, packet.bytes_mut(), all_vrfs.now.0)
+                        }
+                        None => Ok(Some(egress)),
+                    };
+                    let member = match member {
+                        Ok(Some(member)) => member,
+                        Ok(None) => {
+                            packet.consume(crate::ConsumeReason::BridgeFlooded);
+                            consumed += 1;
+                            break 'packet;
+                        }
+                        Err(reason) => {
+                            packet.recycle(reason);
+                            dropped += 1;
+                            trace.record(TraceEvent::Dropped { ingress, reason });
+                            break 'packet;
+                        }
+                    };
+                    match crate::vlan::transmit(&mut packet, member, vlans) {
                         Ok(port) => {
                             packet.commit(port);
                             tx_requested += 1;
@@ -9998,6 +10057,7 @@ mod tests {
             (251, "FIREWALL_ICMPV6_UNRELATED"),
             (252, "ROUTE_DISCARD"),
             (253, "NAT44_IPV4_ID_RATE_EXCEEDED"),
+            (254, "BRIDGE_DROPPED"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10007,7 +10067,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(254), None);
+        assert_eq!(DropReason::from_code(255), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
