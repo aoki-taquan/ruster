@@ -158,6 +158,17 @@ struct InterfaceEntry {
     vrf: Option<String>,
     tunnel: Option<TunnelEntry>,
     pppoe: Option<PppoeEntry>,
+    bridge: Option<BridgeEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct BridgeEntry {
+    members: Vec<String>,
+    aging_time: Option<u32>,
+    max_learned: Option<u32>,
+    #[serde(default)]
+    static_mac: Vec<crate::StaticMac>,
 }
 
 #[derive(Deserialize)]
@@ -215,6 +226,20 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         let at = format!("interface {:?}", entry.name);
         let vrf = default_vrf(entry.vrf);
         let kind = match (entry.parent, entry.vlan, entry.tunnel, entry.pppoe) {
+            (None, None, None, None) if entry.bridge.is_some() => {
+                let bridge = entry.bridge.expect("checked");
+                Kind::Bridge(crate::Bridge {
+                    members: bridge.members,
+                    aging_time: bridge.aging_time.unwrap_or(crate::BRIDGE_AGING_TIME),
+                    max_learned: bridge.max_learned.unwrap_or(crate::BRIDGE_MAX_LEARNED),
+                    static_mac: bridge.static_mac,
+                })
+            }
+            _ if entry.bridge.is_some() => {
+                return Err(format!(
+                    "{at}: a bridge is not also a VLAN, a tunnel or a PPPoE session"
+                ))
+            }
             (None, None, None, None) => Kind::Port,
             (Some(parent), Some(id), None, None) => Kind::Vlan { parent, id },
             (None, None, Some(tunnel), None) => Kind::Tunnel {
@@ -266,6 +291,26 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                     .map(|i| (i.mac.clone(), i.mtu.saturating_sub(PPPOE_OVERHEAD)))
                     .ok_or_else(|| {
                         format!("{at}: PPPoE parent {parent:?} must be a port or VLAN given before it")
+                    }),
+            ),
+            // A bridge's own interface: its first member's MAC, and the smallest MTU
+            // of its members given before it.
+            Kind::Bridge(bridge) => Some(
+                bridge
+                    .members
+                    .first()
+                    .and_then(|first| interfaces.iter().find(|i| i.name == *first))
+                    .map(|i| {
+                        let mtu = interfaces
+                            .iter()
+                            .filter(|m| bridge.members.contains(&m.name))
+                            .map(|m| m.mtu)
+                            .min()
+                            .unwrap_or(i.mtu);
+                        (i.mac.clone(), mtu)
+                    })
+                    .ok_or_else(|| {
+                        format!("{at}: its first member must be an interface given before it")
                     }),
             ),
             _ => None,
