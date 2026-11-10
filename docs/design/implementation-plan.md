@@ -162,7 +162,8 @@ confdの`pppoe`の部分（`[[pppoe]]`）から受け取り、得た値は送り
 SRv6。BGP EVPNは見送り（2026-11-10 owner決定）。
 ブリッジとIRBは済んだ（core `bridge.rs`、confd `bridge.rs`、fe `bridge`の試験、netns `bridge`）。メンバーはポートと
 VLANのサブインターフェース。EtherIPも済んだ（core `overlay.rs`、confd `etherip.rs`、fe `etherip`の試験、netns
-`etherip`。外側はIPv4とIPv6、相手もrusterで確かめた）。メンバーのNICはFEが他のMAC宛てのフレームも受けられるようにする（vethでは要らない。
+`etherip`。外側はIPv4とIPv6、相手もrusterで確かめた）。VXLANも済んだ（静的なVTEPの一覧。confd `vxlan.rs`、
+fe `vxlan`の試験、netns `vxlan`。相手はLinuxのvxlanのデバイスで確かめた）。メンバーのNICはFEが他のMAC宛てのフレームも受けられるようにする（vethでは要らない。
 実際のNICでFEがpromiscuousにするのはまだ）。MACの表をFEの状態のsocketで見せるのもまだ（今は数をログに出すだけ）。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。

@@ -54,6 +54,7 @@ pub mod pppoe;
 pub mod ra;
 pub mod source;
 pub mod versions;
+pub mod vxlan;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {
@@ -179,6 +180,9 @@ pub struct Config {
     /// The EtherIP interfaces, checked; their interfaces are in `interfaces`
     /// ([`etherip`]).
     pub etherip: Vec<etherip::EtherIp>,
+    /// The VXLAN interfaces, checked; their interfaces are in `interfaces`
+    /// ([`vxlan`]).
+    pub vxlan: Vec<vxlan::Vxlan>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -635,6 +639,7 @@ impl Confd {
         let mut out = self.interface_tables();
         bridge::tables(&self.current.bridges, &mut out);
         etherip::tables(&self.current.etherip, &mut out);
+        vxlan::tables(&self.current.vxlan, &mut out);
         if let Some((ipv4_interval_ms, ipv6_burst, ipv6_interval_ms)) = self.current.icmp_errors {
             out.insert(
                 Key::IcmpErrors {
@@ -1229,6 +1234,7 @@ mod tests {
             ospf6: None,
             bridges: Vec::new(),
             etherip: Vec::new(),
+            vxlan: Vec::new(),
         });
         let routes = confd.routes();
         let connected = Value::Route(RouteAction::Forward(vec![NextHop {
@@ -1298,6 +1304,7 @@ mod tests {
             ospf6: None,
             bridges: Vec::new(),
             etherip: Vec::new(),
+            vxlan: Vec::new(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
         let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);

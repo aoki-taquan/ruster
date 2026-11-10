@@ -71,6 +71,18 @@ ipv6-from = []
 kind = { etherip = { local = "192.0.2.1", remote = "198.51.100.2" } }
 
 [[interface]]
+name = "vx100"
+mac = "02:00:00:00:00:fe"
+mtu = 1450
+enabled = true
+vrf = "default"
+ipv4 = []
+ipv4-from = []
+ipv6 = []
+ipv6-from = []
+kind = { vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] } }
+
+[[interface]]
 name = "br0"
 mac = "02:00:00:00:00:04"
 mtu = 1492

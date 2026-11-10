@@ -32,9 +32,9 @@ pub struct EtherIp {
 }
 
 /// The most the FE takes on a link (frames of up to 1514 bytes).
-const LINK_MTU: u16 = 1_500;
+pub(crate) const LINK_MTU: u16 = 1_500;
 
-fn unicast(address: IpAddr) -> bool {
+pub(crate) fn unicast(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(a) => {
             !(a.is_unspecified()
@@ -50,6 +50,17 @@ fn unicast(address: IpAddr) -> bool {
                 || a.is_unicast_link_local())
         }
     }
+}
+
+/// Whether `local` is an address given to an interface of the default VRF.
+pub(crate) fn given(interfaces: &[InterfaceConfig], local: IpAddr) -> bool {
+    interfaces.iter().any(|i| {
+        i.vrf == DEFAULT_VRF
+            && match local {
+                IpAddr::V4(a) => i.ipv4.is_some_and(|(own, _)| own == a),
+                IpAddr::V6(a) => i.ipv6.iter().any(|&(own, _)| own == a),
+            }
+    })
 }
 
 /// Checks the EtherIP interfaces (name, local, remote) against the interfaces and
@@ -77,14 +88,7 @@ pub(crate) fn check(
         if local == remote {
             return Err(format!("{at}: etherip local and remote must differ"));
         }
-        let given = interfaces.iter().any(|i| {
-            i.vrf == DEFAULT_VRF
-                && match local {
-                    IpAddr::V4(a) => i.ipv4.is_some_and(|(own, _)| own == a),
-                    IpAddr::V6(a) => i.ipv6.iter().any(|&(own, _)| own == a),
-                }
-        });
-        if !given {
+        if !given(interfaces, local) {
             return Err(format!(
                 "{at}: etherip local {local} must be an address given to an interface in the default VRF"
             ));
