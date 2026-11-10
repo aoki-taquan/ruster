@@ -32,6 +32,7 @@ mod route;
 mod slot_index;
 mod slot_list;
 mod source_validation;
+mod srv6;
 mod time;
 mod tunnel;
 mod vlan;
@@ -176,6 +177,7 @@ pub use route::{
     TunnelOriginError, ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
 pub use source_validation::{SourceValidation, SourceValidationBinding};
+pub use srv6::{Srv6Behaviour, Srv6Error, Srv6Sid, Srv6Table};
 pub use time::MonotonicMillis;
 pub use tunnel::Ipv4InIpv6Tunnel;
 pub use vlan::VlanBinding;

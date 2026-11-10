@@ -614,6 +614,14 @@ pub enum DropReason {
     OverlayUnderlayUnsupported = 259,
     /// The backend has no room to put on or take off an overlay's outer headers.
     OverlayNoRoom = 260,
+    /// A packet to a local SRv6 SID whose extension headers are cut short, too
+    /// many, a fragment, or whose inner packet is not of the SID's family
+    /// (`crate::srv6`).
+    Srv6HeaderInvalid = 261,
+    /// A packet to a local SRv6 SID dropped with an ICMPv6 Parameter Problem.
+    Srv6ParameterProblem = 262,
+    /// The backend has no room to take off or put on the SRv6 outer headers.
+    Srv6NoRoom = 263,
 }
 
 use DropReason::*;
@@ -621,7 +629,7 @@ use DropReason::*;
 impl DropReason {
     /// Every reason in ascending stable code order. Codes are contiguous
     /// from 1, so `ALL[code - 1]` is the reason with that code.
-    pub const ALL: [Self; 260] = [
+    pub const ALL: [Self; 263] = [
         EthernetHeaderTruncated,
         UnsupportedEtherType,
         Ipv4HeaderTruncated,
@@ -882,6 +890,9 @@ impl DropReason {
         OverlayNoRoute,
         OverlayUnderlayUnsupported,
         OverlayNoRoom,
+        Srv6HeaderInvalid,
+        Srv6ParameterProblem,
+        Srv6NoRoom,
     ];
 
     /// The reason with stable discriminant `code`, if any.
@@ -1159,6 +1170,9 @@ impl DropReason {
             OverlayNoRoute => "OVERLAY_NO_ROUTE",
             OverlayUnderlayUnsupported => "OVERLAY_UNDERLAY_UNSUPPORTED",
             OverlayNoRoom => "OVERLAY_NO_ROOM",
+            Srv6HeaderInvalid => "SRV6_HEADER_INVALID",
+            Srv6ParameterProblem => "SRV6_PARAMETER_PROBLEM",
+            Srv6NoRoom => "SRV6_NO_ROOM",
         }
     }
 }
@@ -1354,6 +1368,8 @@ pub struct ForwardingSnapshot<'a> {
     /// Bridge members that carry frames inside IP
     /// ([`ForwardingSnapshot::with_overlays`]).
     pub(crate) overlays: &'a [crate::Overlay],
+    /// The router's SRv6 SIDs ([`ForwardingSnapshot::with_srv6`]).
+    pub(crate) srv6: Option<&'a crate::Srv6Table>,
     /// Next hops the control side could not resolve (interface, address): a
     /// datagram to one gets Host Unreachable (RFC 1812 5.2.7.1).
     pub(crate) unreachable: &'a [(IfId, crate::Ipv4Address)],
@@ -1566,6 +1582,7 @@ impl<'a> ForwardingSnapshot<'a> {
             kernel_ingress: &[],
             tunnels: &[],
             overlays: &[],
+            srv6: None,
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
@@ -1685,6 +1702,28 @@ impl<'a> ForwardingSnapshot<'a> {
                 let index = *vrfs.by_ingress.get(usize::from(ingress.0))?;
                 vrfs.snapshots.get(usize::from(index))
             })
+            .unwrap_or(self)
+    }
+
+    /// The index of the VRF (with [`Self::with_vrfs`]) a packet received on
+    /// `ingress` is decided in: 0, this snapshot's, when there is none.
+    pub(crate) fn vrf_of(&self, ingress: IfId) -> u16 {
+        self.vrfs
+            .as_ref()
+            .and_then(|vrfs| {
+                let index = *vrfs.by_ingress.get(usize::from(ingress.0))?;
+                vrfs.snapshots.get(usize::from(index))?;
+                Some(index)
+            })
+            .unwrap_or(0)
+    }
+
+    /// The snapshot of VRF `index` (with [`Self::with_vrfs`]); this one when there
+    /// is none.
+    pub(crate) fn for_vrf(&self, index: u16) -> &ForwardingSnapshot<'a> {
+        self.vrfs
+            .as_ref()
+            .and_then(|vrfs| vrfs.snapshots.get(usize::from(index)))
             .unwrap_or(self)
     }
 
@@ -1828,6 +1867,17 @@ impl<'a> ForwardingSnapshot<'a> {
     #[must_use]
     pub fn with_overlays(self, overlays: &'a [crate::Overlay]) -> Self {
         Self { overlays, ..self }
+    }
+
+    /// Handles the IPv6 packets to the router's SRv6 SIDs in `srv6` (see
+    /// [`crate::Srv6Table`]). The outer snapshot's count: the SIDs are the default
+    /// VRF's.
+    #[must_use]
+    pub fn with_srv6(self, srv6: &'a crate::Srv6Table) -> Self {
+        Self {
+            srv6: Some(srv6),
+            ..self
+        }
     }
 
     /// The overlay whose interface is `member`, if any.
@@ -1983,6 +2033,7 @@ impl<'a> ForwardingSnapshot<'a> {
             kernel_ingress: &[],
             tunnels: &[],
             overlays: &[],
+            srv6: None,
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
@@ -2344,6 +2395,7 @@ impl ValidatedForwardingOwner {
             kernel_ingress: &[],
             tunnels: &[],
             overlays: &[],
+            srv6: None,
             unreachable: &[],
             pppoe: &[],
             vlans: &[],
@@ -3445,10 +3497,41 @@ where
             trace.record(TraceEvent::Dropped { ingress, reason });
             continue;
         }
+        // A packet to one of the router's SRv6 SIDs: on to its next segment, or
+        // unwrapped into the SID's VRF.
+        let (vrf, via) = match crate::srv6::receive(&mut packet, all_vrfs) {
+            Ok(crate::srv6::Received::NotSid) => (None, None),
+            Ok(crate::srv6::Received::Forward { via }) => (Some(0), via),
+            Ok(crate::srv6::Received::Unwrapped { vrf }) => (Some(vrf), None),
+            Err(rejected) => {
+                let ingress = packet.ingress();
+                let reason = match rejected {
+                    crate::srv6::Rejected::Drop(reason) => reason,
+                    crate::srv6::Rejected::Error(reason, kind, code, parameter) => {
+                        if let (Some(queue), Some(fib)) = (control.as_deref_mut(), all_vrfs.ipv6) {
+                            queue.error(
+                                packet.bytes_mut(),
+                                all_vrfs,
+                                fib,
+                                ingress,
+                                (kind, code, parameter),
+                            );
+                        }
+                        reason
+                    }
+                };
+                packet.recycle(reason);
+                dropped += 1;
+                trace.record(TraceEvent::Dropped { ingress, reason });
+                continue;
+            }
+        };
         // Every VRF runs on the outer snapshot's clock.
-        let snapshot = &all_vrfs
-            .for_ingress(packet.ingress())
-            .with_now(all_vrfs.now);
+        let snapshot = match vrf {
+            Some(vrf) => all_vrfs.for_vrf(vrf),
+            None => all_vrfs.for_ingress(packet.ingress()),
+        };
+        let snapshot = &snapshot.with_now(all_vrfs.now);
         if let Some(fib) = snapshot.ipv6 {
             if packet::read_u16(packet.bytes_mut(), 12) == Some(crate::IPV6_ETHERTYPE) {
                 let outer = all_vrfs.authority();
@@ -3474,6 +3557,7 @@ where
                     control.as_deref_mut(),
                     vlans,
                     bridges.as_deref_mut(),
+                    via,
                     trace,
                 ) {
                     crate::ipv6::Completed::Transmitted => tx_requested += 1,
@@ -10213,6 +10297,9 @@ mod tests {
             (258, "OVERLAY_NO_ROUTE"),
             (259, "OVERLAY_UNDERLAY_UNSUPPORTED"),
             (260, "OVERLAY_NO_ROOM"),
+            (261, "SRV6_HEADER_INVALID"),
+            (262, "SRV6_PARAMETER_PROBLEM"),
+            (263, "SRV6_NO_ROOM"),
         ];
         let actual = DropReason::ALL;
         assert_eq!(actual.len(), expected.len());
@@ -10222,7 +10309,7 @@ mod tests {
             assert_eq!(DropReason::from_code(discriminant), Some(*reason));
         }
         assert_eq!(DropReason::from_code(0), None);
-        assert_eq!(DropReason::from_code(261), None);
+        assert_eq!(DropReason::from_code(264), None);
     }
 
     /// `DropReason::ALL` lists every declared variant: a new variant fails
