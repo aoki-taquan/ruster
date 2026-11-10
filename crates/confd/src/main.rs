@@ -1,6 +1,12 @@
-//! `ruster-confd [--run-dir DIR] [--kernel] FILE`: reads the configuration file and
-//! sends it to the FE, ribd (as route source `confd`) and neighd. With `--kernel` it
-//! also sets up the kernel side of traffic to the router ([`ruster_confd::kernel`]).
+//! `ruster-confd [--run-dir DIR] [--state-dir DIR] [--kernel] FILE`: sends the
+//! configuration to the FE, ribd (as route source `confd`) and neighd. With `--kernel`
+//! it also sets up the kernel side of traffic to the router ([`ruster_confd::kernel`]).
+//!
+//! The configuration is the latest version confd has kept. FILE is read only when there
+//! is none yet, and becomes version 1. With `--state-dir` the versions are files there
+//! and outlive confd; without it they are only in memory, so confd started again reads
+//! FILE again ([`ruster_confd::versions`]).
+//!
 //! `ruster apply` gives it a new file later ([`ruster_confd::apply`]), and processes
 //! such as `ruster-unbound` take their part of it ([`ruster_confd::part`]). Each
 //! source of the configuration gets `confd/source/<name>.sock`
@@ -13,7 +19,8 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use ruster_confd::apply::Apply;
-use ruster_confd::{file, Confd, Config, PeerKind};
+use ruster_confd::versions::Versions;
+use ruster_confd::{Confd, Config, PeerKind};
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
 
@@ -47,13 +54,27 @@ fn source_sockets(run_dir: &Path, confd: &Confd, listening: &mut BTreeMap<String
 
 fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
-    let kernel = rest.iter().any(|a| a == "--kernel");
-    let rest: Vec<&String> = rest.iter().filter(|a| *a != "--kernel").collect();
-    let [path] = rest.as_slice() else {
+    let mut kernel = false;
+    let mut state_dir = None;
+    let mut files = Vec::new();
+    let mut args = rest.into_iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--kernel" => kernel = true,
+            "--state-dir" => {
+                state_dir = Some(args.next().ok_or("--state-dir needs a directory")?);
+            }
+            _ => files.push(arg),
+        }
+    }
+    let [path] = files.as_slice() else {
         return Err("give one configuration file".into());
     };
-    let text = std::fs::read_to_string(path).map_err(|error| format!("{path}: {error}"))?;
-    let config = file::parse(&text).map_err(|error| format!("{path}: {error}"))?;
+    let mut versions = match &state_dir {
+        Some(dir) => Versions::open(Path::new(dir))?,
+        None => Versions::in_memory(),
+    };
+    let (config, from) = versions.starting_config(path)?;
     // Sets up the kernel side before a configuration is sent; the errors are also
     // reported to `ruster apply`.
     let mut prepare = |config: &Config| -> Vec<String> {
@@ -74,7 +95,7 @@ fn run() -> Result<(), String> {
         .map_err(|error| format!("{}: {error}", socket::CONFD_CONFIG))?;
     let parts = daemon::listen(&run_dir.join(socket::CONFD_PART))
         .map_err(|error| format!("{}: {error}", socket::CONFD_PART))?;
-    let mut apply = Apply::new();
+    let mut apply = Apply::new(versions);
     let mut confd = Confd::new(config);
     let mut sources = BTreeMap::new();
     source_sockets(&run_dir, &confd, &mut sources);
@@ -91,7 +112,7 @@ fn run() -> Result<(), String> {
     confd
         .connect_neighd(connect(socket::NEIGHD_CONFIG)?)
         .map_err(|error| error.to_string())?;
-    eprintln!("ruster-confd: sent {path}");
+    eprintln!("ruster-confd: sent {from}");
     daemon::notify("READY=1");
 
     let clock = Clock::new();
@@ -178,6 +199,9 @@ fn run() -> Result<(), String> {
                 eprintln!("ruster-confd: stopped waiting for answers to a new configuration");
             }
             apply_seen = now;
+        }
+        for line in apply.take_log() {
+            eprintln!("ruster-confd: {line}");
         }
         if waiting && !confd.waiting_for_sources() {
             waiting = false;

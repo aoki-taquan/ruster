@@ -101,7 +101,7 @@ via = "198.51.100.1"          # 省略すると直結の経路
 sudo ruster-fe lan wan &         # 転送するデバイスを並べる。rootが要る
 ruster-ribd &                    # 送り手を省略すると confd:1
 ruster-neighd &
-ruster-confd --kernel router.toml &   # --kernel: ルータ宛ての通信のTUNとアドレスも作る
+ruster-confd --kernel --state-dir /var/lib/ruster/confd router.toml &   # --kernel: ルータ宛ての通信のTUNとアドレスも作る
 ```
 
 FEは既定でAF_XDPを使い、各デバイスのqueue 0にXDPのプログラムを付けます（`--xdp-attach native|generic`、
@@ -133,7 +133,9 @@ ruster route del --source routed 203.0.113.0/24
 ```
 
 `apply`は、confdが変わった分をFE、ribd、neighdへ送り、全部が受け取ってから答えます。どれかが断ると
-confdは前の設定に戻します。新しい設定はconfdのメモリにだけあり、confdを起動し直すと起動時のファイルを読みます。
+confdは前の設定に戻します。全部が受け取った設定は、confdが番号付きの版として`--state-dir`に残します（最新の50個）。
+confdは起動すると残した最新の版を使い、起動時のファイルは版がまだ無いときだけ読みます（それが版1になる）。
+ファイルから始め直すときは、`--state-dir`を空にします。`--state-dir`が無いと版はメモリにだけあり、起動し直すとファイルを読みます。
 
 `route`は、ルーティングデーモンと同じように、ribdの送り手（ここでは`routed`。ribdを`confd:1 routed:20`の
 ように起動しておく）として経路を書きます。ribdは送り手の優先度で選んでFEへ渡します。

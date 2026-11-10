@@ -3,6 +3,7 @@
 use std::os::unix::net::UnixStream;
 
 use ruster_confd::apply::{Apply, ANSWER_WAIT_MS, GIVE_UP_MS};
+use ruster_confd::versions::Versions;
 use ruster_confd::{file, Confd};
 use ruster_proto::coap::Code;
 use ruster_proto::session::{Client, Event, Hook, Server, Store};
@@ -46,13 +47,23 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
+        Self::with(Versions::in_memory())
+    }
+
+    /// With these versions, and a first one of MTU 1500 if there is none, as
+    /// confd's start-up does.
+    fn with(mut versions: Versions) -> Self {
+        if versions.latest().is_none() {
+            let first = file::candidate(&text(1500)).unwrap();
+            versions.commit("start", &first.lock, None).unwrap();
+        }
         let mut fe = Server::new();
-        let mut confd = Confd::new(file::parse(&text(1500)).unwrap());
+        let mut confd = Confd::new(file::parse(&versions.latest().unwrap().lock).unwrap());
         let (a, b) = UnixStream::pair().unwrap();
         fe.attach(a, &[sid::INTERFACE, sid::ADDRESS, sid::ICMP_ERRORS])
             .unwrap();
         confd.connect_fe(b).unwrap();
-        let mut apply = Apply::new();
+        let mut apply = Apply::new(versions);
         let (a, b) = UnixStream::pair().unwrap();
         apply.attach(a).unwrap();
         let mut rig = Self {
@@ -241,6 +252,10 @@ fn confd_stops_waiting_after_a_while() {
     rig.now_ms = GIVE_UP_MS;
     assert!(rig.answers().is_empty());
     assert_eq!(rig.apply.counters().gave_up, 1);
+    // The configuration in use is the latest version.
+    let latest = rig.apply.versions().latest().unwrap();
+    assert_eq!(latest.number, 2);
+    assert!(latest.lock.contains("mtu = 1400"), "{}", latest.lock);
 }
 
 #[test]
@@ -255,4 +270,85 @@ fn a_process_already_down_is_not_waited_for() {
         answers[0].1.contains("the FE is not connected"),
         "{answers:?}"
     );
+}
+
+fn state_dir(name: &str) -> std::path::PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("ruster-confd-apply-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+#[test]
+fn each_taken_file_is_kept_as_the_next_version() {
+    let mut rig = Rig::new();
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    assert!(
+        answers[0].1.contains("kept as version 2 (apply)"),
+        "{answers:?}"
+    );
+    let latest = rig.apply.versions().latest().unwrap();
+    assert!(latest.lock.contains("mtu = 1400"), "{}", latest.lock);
+    assert_eq!(latest.toml.as_deref(), Some(text(1400).as_str()));
+
+    // A refused file and a file with an error are not kept.
+    rig.check.refuse_mtu = Some(1280);
+    rig.cli.post(&["config"], text(1280).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    rig.cli.post(&["config"], b"[[interface]]\n");
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::BAD_REQUEST, "{answers:?}");
+    assert_eq!(rig.apply.versions().latest().unwrap().number, 2);
+
+    // The lock form is kept as it came, without a toml text.
+    let lock = rig.apply.versions().latest().unwrap().lock.clone();
+    rig.cli.post(
+        &["config"],
+        lock.replace("mtu = 1400", "mtu = 1300").as_bytes(),
+    );
+    let answers = rig.answers();
+    assert!(answers[0].1.contains("kept as version 3"), "{answers:?}");
+    let latest = rig.apply.versions().latest().unwrap();
+    assert!(latest.lock.contains("mtu = 1300"), "{}", latest.lock);
+    assert_eq!(latest.toml, None);
+}
+
+#[test]
+fn the_versions_outlive_confd() {
+    let dir = state_dir("outlive");
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::CHANGED, "{answers:?}");
+    drop(rig);
+
+    // confd started again: the file is not read, the latest version is used.
+    let mut versions = Versions::open(&dir).unwrap();
+    assert_eq!(versions.list().len(), 2);
+    let (config, from) = versions
+        .starting_config("/nonexistent/router.toml")
+        .unwrap();
+    assert_eq!(from, "version 2");
+    assert_eq!(config.interfaces[0].mtu, 1400);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn a_version_that_cannot_be_written_is_said_with_5_00() {
+    let dir = state_dir("unwritable");
+    let mut rig = Rig::with(Versions::open(&dir).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+    rig.cli.post(&["config"], text(1400).as_bytes());
+    let answers = rig.answers();
+    assert_eq!(answers[0].0, Code::INTERNAL_SERVER_ERROR, "{answers:?}");
+    assert!(
+        answers[0].1.contains("would go back to version 1"),
+        "{answers:?}"
+    );
+    // It is in use all the same.
+    assert_eq!(rig.mtu(), Some(1400));
+    assert_eq!(rig.apply.versions().latest().unwrap().number, 1);
 }

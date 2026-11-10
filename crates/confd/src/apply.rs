@@ -4,33 +4,35 @@
 //! A request is POST `config` with the file's text as its payload, framed like the other
 //! sockets. confd reads the text as it reads its file at start-up, sends what changed to
 //! the FE, ribd and neighd, and the parts that changed to the processes that take them
-//! ([`crate::part`]), and answers once each of them has answered:
+//! ([`crate::part`]), and answers once each of them has answered. Once every process
+//! has taken it, confd keeps it as the next version ([`crate::versions`]); the answer
+//! says which.
 //!
 //! | Answer | Meaning |
 //! |---|---|
-//! | 2.04 Changed | every connected process answered yes |
+//! | 2.04 Changed | every connected process answered yes, and the configuration was kept as a version |
 //! | 4.00 Bad Request | the file has an error, or a process refused the change; in the second case confd puts the configuration it had before back |
+//! | 5.00 Internal Server Error | the configuration is in use, but writing the version failed |
 //! | 5.03 Service Unavailable | an earlier new configuration is still waiting for answers |
 //! | 5.04 Gateway Timeout | a process has not answered in time |
 //!
 //! After 5.04 confd keeps waiting: if the answer is a refusal, it puts the configuration
-//! before back then. A process that disconnects meanwhile (one already disconnected
-//! when the file came is not waited for) is waited for too: confd sends
-//! it everything when it connects again, and its answer counts. confd stops waiting after
-//! [`GIVE_UP_MS`] and logs it. A new file is taken only when every process has answered
-//! everything sent to it; until then it gets 5.03.
+//! before back then, and if it is yes, it keeps the version then. A process that
+//! disconnects meanwhile (one already disconnected when the file came is not waited
+//! for) is waited for too: confd sends it everything when it connects again, and its
+//! answer counts. confd stops waiting after [`GIVE_UP_MS`], logs it, and keeps the
+//! configuration as a version, since it is the one in use. A new file is taken only
+//! when every process has answered everything sent to it; until then it gets 5.03.
 //!
 //! The payload of an answer is text for a person: the error, or what the answer needs
 //! to add (a process that is not connected gets the configuration when it connects
-//! again; errors setting up the kernel side).
+//! again; errors setting up the kernel side; the version number).
 //!
 //! Limits:
 //! - Static routes go through ribd, which takes any route; a route the FE then refuses
 //!   is not seen here.
-//! - The new configuration lives only in confd's memory, so confd started again reads
-//!   its file.
-//! - There is no preview of the changes, no confirm-or-revert and no list of earlier
-//!   versions yet.
+//! - A new configuration is sent to the processes and taken in one step: there is no
+//!   preview of the changes and no confirm-or-revert yet.
 //!
 //! # Standards
 //!
@@ -46,6 +48,7 @@ use ruster_proto::coap::Code;
 use ruster_proto::conn::{Connection, Outgoing};
 use ruster_proto::task::Progress;
 
+use crate::versions::Versions;
 use crate::{file, Confd, Config, PeerKind};
 
 /// The largest configuration file accepted.
@@ -63,13 +66,15 @@ pub const MAX_CONNECTIONS: usize = 8;
 /// At most this many requests are handled per connection in one step.
 const REQUESTS_PER_STEP: usize = 16;
 
-/// The connections of `ruster apply` and the one change being applied.
+/// The connections of `ruster apply`, the one change being applied and the versions.
 #[derive(Default)]
 pub struct Apply {
     conns: Vec<(u64, Connection)>,
     next_id: u64,
     pending: Option<Pending>,
     counters: ApplyCounters,
+    versions: Versions,
+    log: Vec<String>,
 }
 
 /// What happened after an answer had gone out, for the log.
@@ -86,6 +91,7 @@ impl std::fmt::Debug for Apply {
         f.debug_struct("Apply")
             .field("connections", &self.conns.len())
             .field("pending", &self.pending.is_some())
+            .field("versions", &self.versions.list().len())
             .finish()
     }
 }
@@ -103,15 +109,37 @@ struct Pending {
     notes: Vec<String>,
     /// 5.04 went out; the answer still decides whether to go back.
     timed_out: bool,
+    /// What to keep as a version once it is taken.
+    keep: Keep,
+}
+
+/// A version to keep: how it came, the lock form and the `ruster.toml` text.
+struct Keep {
+    how: String,
+    lock: String,
+    toml: Option<String>,
 }
 
 impl Apply {
-    pub fn new() -> Self {
-        Self::default()
+    /// With the versions so far; the latest is the configuration confd has.
+    pub fn new(versions: Versions) -> Self {
+        Self {
+            versions,
+            ..Self::default()
+        }
     }
 
     pub fn counters(&self) -> ApplyCounters {
         self.counters
+    }
+
+    pub fn versions(&self) -> &Versions {
+        &self.versions
+    }
+
+    /// Lines for confd's log since the last call.
+    pub fn take_log(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.log)
     }
 
     /// Takes a connection, or closes it if [`MAX_CONNECTIONS`] are open.
@@ -160,23 +188,23 @@ impl Apply {
                     }
                     (Code::POST, ["config"]) => match std::str::from_utf8(&request.payload)
                         .map_err(|_| "the file is not UTF-8".to_owned())
-                        .and_then(file::parse)
+                        .and_then(file::candidate)
                     {
                         Err(error) => Some((Code::BAD_REQUEST, error)),
-                        Ok(config) => {
-                            let notes = prepare(&confd.with_values_of(&config));
-                            let previous = confd.config().clone();
-                            confd.set_config(config);
-                            self.pending = Some(Pending {
-                                conn: id,
-                                token: request.token.clone(),
-                                previous,
-                                generation: confd.generation(),
-                                started_ms: now_ms,
-                                closed_at_start: confd.closed(),
-                                notes,
-                                timed_out: false,
-                            });
+                        Ok(candidate) => {
+                            let keep = Keep {
+                                how: "apply".into(),
+                                lock: candidate.lock,
+                                toml: candidate.toml,
+                            };
+                            self.start(
+                                confd,
+                                candidate.config,
+                                keep,
+                                (id, &request.token),
+                                now_ms,
+                                prepare,
+                            );
                             None
                         }
                     },
@@ -200,6 +228,33 @@ impl Apply {
         Progress::busy(busy)
     }
 
+    /// Sends a new configuration to the processes; [`Apply::finish`] answers
+    /// `(connection, token)` once they have answered.
+    fn start(
+        &mut self,
+        confd: &mut Confd,
+        config: Config,
+        keep: Keep,
+        (conn, token): (u64, &[u8]),
+        now_ms: u64,
+        prepare: &mut dyn FnMut(&Config) -> Vec<String>,
+    ) {
+        let notes = prepare(&confd.with_values_of(&config));
+        let previous = confd.config().clone();
+        confd.set_config(config);
+        self.pending = Some(Pending {
+            conn,
+            token: token.to_vec(),
+            previous,
+            generation: confd.generation(),
+            started_ms: now_ms,
+            closed_at_start: confd.closed(),
+            notes,
+            timed_out: false,
+            keep,
+        });
+    }
+
     /// Answers the pending change if the processes have answered or the wait is over,
     /// and goes back if one refused it.
     fn finish(
@@ -221,7 +276,10 @@ impl Apply {
                 .iter()
                 .all(|kind| pending.closed_at_start.contains(kind));
         if refusal.is_none() && !answered && waited >= GIVE_UP_MS && pending.timed_out {
-            self.pending = None;
+            // The configuration stays, so it is the latest version.
+            if let Some(pending) = self.pending.take() {
+                let _ = self.keep(pending.keep);
+            }
             self.counters.gave_up += 1;
             return true;
         }
@@ -255,13 +313,44 @@ impl Apply {
                 confd.set_config(pending.previous);
                 (Code::BAD_REQUEST, lines)
             }
-            None => (Code::CHANGED, pending.notes),
+            None => {
+                let mut lines = pending.notes;
+                let (code, line) = match self.keep(pending.keep) {
+                    Ok(line) => (Code::CHANGED, line),
+                    Err(line) => (Code::INTERNAL_SERVER_ERROR, line),
+                };
+                lines.push(line);
+                (code, lines)
+            }
         };
         // After 5.04 the answer went out already.
         if !pending.timed_out {
             self.reply(pending.conn, &pending.token, code, absent(confd, lines));
         }
         true
+    }
+
+    /// Keeps the configuration taken as the next version, and says so in the log and
+    /// in the line returned for the answer.
+    fn keep(&mut self, keep: Keep) -> Result<String, String> {
+        let before = self.versions.latest().map(|v| v.number);
+        let kept = self
+            .versions
+            .commit(&keep.how, &keep.lock, keep.toml.as_deref());
+        let line = match &kept {
+            Ok(number) => format!("kept as version {number} ({})", keep.how),
+            Err(error) => {
+                let back = before.map_or("the file it was started with".into(), |n| {
+                    format!("version {n}")
+                });
+                format!(
+                    "the configuration is in use but was not kept as a version ({error}); \
+                     confd started again would go back to {back}"
+                )
+            }
+        };
+        self.log.push(line.clone());
+        kept.map(|_| line.clone()).map_err(|_| line)
     }
 
     fn reply(&mut self, conn: u64, token: &[u8], code: Code, lines: Vec<String>) {
