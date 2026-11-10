@@ -92,7 +92,12 @@ fn lease4(routers: Vec<Ipv4Addr>) -> client4::Lease {
         address: Ipv4Addr::new(198, 51, 100, 20),
         prefix_len: 24,
         routers,
-        dns: vec![Ipv4Addr::new(192, 0, 2, 53), Ipv4Addr::new(192, 0, 2, 53)],
+        dns: vec![
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::new(192, 0, 2, 53),
+            Ipv4Addr::new(192, 0, 2, 53),
+            Ipv4Addr::BROADCAST,
+        ],
         server: Ipv4Addr::new(198, 51, 100, 1),
         lease_time: 3600,
         t1: 1800,
@@ -115,7 +120,7 @@ fn a_dhcpv4_lease_gives_the_address_dns_and_default_route() {
             lifetime: LIFETIME
         })
     );
-    // Once each.
+    // Once each, and only those confd takes.
     assert_eq!(
         changes[1].value,
         Some(Value::SourceDns {
@@ -168,6 +173,19 @@ fn a_dhcpv6_lease_gives_the_prefix_and_a_route_via_the_server() {
         })
     ));
     assert!(changes[1].value.is_none(), "no address");
+    let link_local = client6::Lease {
+        prefix: Some(IaPrefix {
+            prefix: "fe80::".parse().unwrap(),
+            len: 64,
+            preferred: 1,
+            valid: 1,
+        }),
+        dns: vec!["ff02::1".parse().unwrap()],
+        ..lease.clone()
+    };
+    assert!(values6("dhcp6-wan", Some(&link_local))
+        .iter()
+        .all(|c| c.value.is_none()));
     assert!(changes[2].value.is_none(), "no DNS servers");
     for change in &changes {
         change.validate().unwrap();

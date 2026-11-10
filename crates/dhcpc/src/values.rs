@@ -17,7 +17,10 @@
 //! Deviations: the IPv6 default route goes to the address the DHCPv6 replies came
 //! from (the ISP's server or relay on the link), not to a router learned from
 //! Router Advertisements, which ruster does not read on the WAN side. An IA_NA
-//! address is sent as a /128 (RFC 8415 section 21.6 gives no prefix length).
+//! address is sent as a /128 (RFC 8415 section 21.6 gives no prefix length). A
+//! DNS server, prefix or address confd would refuse (not unicast, or a link-local
+//! prefix) is left out. The IPv4 default route needs a router in the leased
+//! subnet.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -35,7 +38,7 @@ fn dns(source: &str, servers: Vec<IpAddr>) -> Change {
         source: source.to_owned(),
     };
     let mut unique: Vec<IpAddr> = Vec::new();
-    for server in servers {
+    for server in servers.into_iter().filter(|&a| usable(a)) {
         if !unique.contains(&server) && unique.len() < SOURCE_DNS_MAX {
             unique.push(server);
         }
@@ -51,6 +54,23 @@ fn dns(source: &str, servers: Vec<IpAddr>) -> Change {
             lifetime: LIFETIME,
         },
     )
+}
+
+/// An address confd takes from a source: unicast (RFC 1122 section 3.2.1.3, RFC
+/// 4291 section 2.4), and for a prefix or IA_NA address not link-local. Anything
+/// else is left out, so that one bad value does not make confd refuse the rest.
+fn usable(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(a) => {
+            let first = a.octets()[0];
+            first != 0 && first != 127 && first < 224
+        }
+        IpAddr::V6(a) => !(a.is_unspecified() || a.is_loopback() || a.is_multicast()),
+    }
+}
+
+fn global(address: Ipv6Addr) -> bool {
+    usable(address.into()) && !address.is_unicast_link_local()
 }
 
 /// A DHCPv4 lease's values for its source: set while bound, deleted when not.
@@ -82,8 +102,8 @@ pub fn values6(source: &str, lease: Option<&client6::Lease>) -> Vec<Change> {
     let address_key = Key::SourceIpv6 {
         source: source.to_owned(),
     };
-    let prefix = lease.and_then(|l| l.prefix);
-    let address = lease.and_then(|l| l.address);
+    let prefix = lease.and_then(|l| l.prefix).filter(|p| global(p.prefix));
+    let address = lease.and_then(|l| l.address).filter(|a| global(a.address));
     vec![
         match prefix {
             Some(p) => Change::set(
