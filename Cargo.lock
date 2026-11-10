@@ -137,6 +137,11 @@ version = "0.2.0"
 [[package]]
 name = "ruster-dhcpc"
 version = "0.2.0"
+dependencies = [
+ "ruster-confd",
+ "ruster-config",
+ "ruster-proto",
+]
 
 [[package]]
 name = "ruster-e2e"

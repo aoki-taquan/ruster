@@ -6,3 +6,6 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+ruster-config = { path = "../config" }
+ruster-confd = { path = "../confd" }
+ruster-proto = { path = "../proto" }

@@ -89,9 +89,12 @@ impl Request {
         out[2] = 6;
         out[4..8].copy_from_slice(&self.xid.to_be_bytes());
         out[8..10].copy_from_slice(&self.secs.to_be_bytes());
-        // RFC 2131 section 4.4.4: DECLINE and RELEASE carry no flags.
+        // RFC 2131 section 4.1: only a client that has no address yet asks for
+        // broadcast answers; one with an address (RENEWING, REBINDING) takes them
+        // unicast, which a server may also send to the broadcast Ethernet address
+        // when asked for broadcast. DECLINE and RELEASE carry no flags (4.4.4).
         let flags = match self.kind {
-            kind::DISCOVER | kind::REQUEST => BROADCAST,
+            kind::DISCOVER | kind::REQUEST if self.ciaddr.is_unspecified() => BROADCAST,
             _ => 0,
         };
         out[10..12].copy_from_slice(&flags.to_be_bytes());

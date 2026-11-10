@@ -3,12 +3,16 @@
 //!
 //! The protocol is here without I/O: DHCPv4 messages ([`dhcp4`]) and the client
 //! of one interface ([`client4`]), DHCPv6 messages ([`dhcp6`]) and the client of
-//! one interface with prefix delegation ([`client6`]).
+//! one interface with prefix delegation ([`client6`]). The daemon (`ruster-dhcpc`)
+//! carries them in frames to and from the FE ([`frame`]) and writes what the
+//! clients get to confd and ribd ([`values`]).
 
 pub mod client4;
 pub mod client6;
 pub mod dhcp4;
 pub mod dhcp6;
+pub mod frame;
+pub mod values;
 
 /// A small pseudo-random generator (xorshift64*) for transaction IDs and the
 /// randomized waits. They must differ between clients and restarts, not be secret:
