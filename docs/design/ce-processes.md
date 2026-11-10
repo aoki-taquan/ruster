@@ -20,6 +20,44 @@
 - 受け取り口は送り手ごとにsocketを分け、送り手が書ける範囲を設定で限る（下の「送り手」）。
 - メッセージは全部[`control-protocol.md`](control-protocol.md)の形式。CEどうしも同じ。
 
+## socketの権限
+
+socketを開けるプロセスは、表を書き換えたり、設定（PPPoEのパスワードを含む）を読んだりできる。そこで
+socketはルータのプロセスだけが開けるようにする。決まりはファイルの権限だけで作る
+（`crates/proto/src/daemon.rs`）。
+
+- socketを作るプロセスは、無いディレクトリを0750で、socketを0660で作る（umaskによらない）。持ち主と
+  グループだけが入れて、つなげる。隣のlockのファイルは0600。
+- グループは、置いたディレクトリにset-group-IDの印があればそのディレクトリのグループ、無ければ作った
+  プロセスのグループ。作ったディレクトリにも印が引き継がれるので、一番上のディレクトリのグループが
+  下の全部のsocketに届く。
+
+置き方は二つある。
+
+| 置き方 | 用意すること |
+|---|---|
+| 全部をrootで動かす（netnsの試験） | 無し。グループもrootになる |
+| プロセスごとにユーザーを分ける | ルータのプロセスが共有するグループ（例: `ruster`）を作り、各プロセスをそのグループで動かす。一番上のディレクトリはそのグループとset-group-IDの印を付けて先に作る（`install -d -m 2750 -g ruster /run/ruster`、systemdならtmpfiles.dの`d /run/ruster 2750 root ruster`） |
+
+分けるときのユーザーと、各プロセスが開くsocketは次のとおり。rootが要るのは、AF_XDPやAF_PACKETを使う
+FEと、TUNを作る`confd --kernel`だけ（capabilityで絞ってもよい）。
+
+| プロセス | ユーザー | 作るsocket | つなぐ、送るsocket |
+|---|---|---|---|
+| `ruster-fe` | root | `fe/config.sock`、`fe/route.sock`、`fe/neigh.sock`、`fe/state.sock`、`fe/punt/*.sock` | 各プロセスの`<名前>/punt.sock` |
+| `ruster-confd` | root（`--kernel`）、無ければ専用 | `confd/config.sock`、`confd/part.sock`、`confd/source/*.sock` | `fe/config.sock`、`neighd/config.sock`、`ribd/source/confd.sock` |
+| `ruster-ribd` | 専用 | `ribd/source/*.sock` | `fe/route.sock` |
+| `ruster-neighd` | 専用 | `neighd/config.sock`、`neighd/punt.sock` | `fe/neigh.sock`、`fe/punt/arp-nd.sock`、`confd/part.sock` |
+| `ruster-pppoed`、`ruster-dhcpc` | 専用 | `<名前>/punt.sock` | `fe/punt/<名前>.sock`、`confd/part.sock`、`confd/source/*.sock`、`ribd/source/<名前>.sock` |
+| `ruster-kea` | 専用 | `kea/punt.sock` | `fe/punt/kea.sock`、`confd/part.sock` |
+| `ruster-unbound`、`ruster-frr` | 専用 | 無し | `confd/part.sock`（frrは`ribd/source/frr.sock`も） |
+| `ruster`（CLI） | グループの運用者 | 無し | `confd/config.sock`、`fe/state.sock`、`confd/source/*.sock`、`ribd/source/*.sock` |
+
+限界: グループは一つなので、グループに入ったプロセスはどのsocketも開ける。たとえば`ruster-unbound`も
+`confd/part.sock`から`pppoe`の部分（パスワード）を受け取れ、`fe/route.sock`へ書ける。プロセスごとに
+開けるsocketを絞るには、socketをグループの違うディレクトリに分ける必要があり、まだしていない。
+接続の相手のユーザーを確かめる方法（`SO_PEERCRED`）は、Rustの標準libraryでは安定していないので使わない。
+
 ## `ruster-confd`（設定管理）
 
 ### 持つもの

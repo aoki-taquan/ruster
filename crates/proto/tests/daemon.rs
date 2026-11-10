@@ -151,3 +151,32 @@ fn an_idle_process_sleeps_longer_until_it_has_work() {
     assert_eq!(fe.after(true), None);
     assert_eq!(fe.after(false), Some(1));
 }
+
+#[test]
+fn sockets_and_the_directories_made_for_them_are_closed_to_others() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = dir("modes");
+    // The top directory carries the group for everything under it.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2750)).unwrap();
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().mode() & 0o7777;
+    let stream = dir.join("a/b/x.sock");
+    let datagram = dir.join("a/punt.sock");
+    let _listener = daemon::listen(&stream).unwrap();
+    let _socket = daemon::bind_datagram(&datagram).unwrap();
+    assert_eq!(mode(&dir.join("a")), 0o2750);
+    assert_eq!(mode(&dir.join("a/b")), 0o2750);
+    assert_eq!(mode(&stream), daemon::SOCKET_MODE);
+    assert_eq!(mode(&datagram), daemon::SOCKET_MODE);
+    assert_eq!(mode(&dir.join("a/b/x.sock.lock")), 0o600);
+    let group = std::fs::metadata(&dir).unwrap().gid();
+    assert_eq!(std::fs::metadata(&stream).unwrap().gid(), group);
+    // Without the set-group-ID bit above, a new directory is plain 0750.
+    let plain = dir.join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let _other = daemon::listen(&plain.join("c/y.sock")).unwrap();
+    assert_eq!(mode(&plain.join("c")), daemon::DIR_MODE);
+    // A directory already there is left as it is.
+    assert_eq!(mode(&plain), 0o700);
+    std::fs::remove_dir_all(dir).unwrap();
+}
