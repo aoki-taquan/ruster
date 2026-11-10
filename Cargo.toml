@@ -8,6 +8,7 @@ members = [
     "crates/dhcpc",
     "crates/e2e",
     "crates/fe",
+    "crates/frr",
     "crates/io-afpacket",
     "crates/io-conformance",
     "crates/io-sim",
