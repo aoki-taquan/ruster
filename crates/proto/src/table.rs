@@ -817,6 +817,13 @@ impl Change {
                         if gateways.iter().any(|a| a.is_ipv4() != prefix.is_ipv4()) {
                             return Err(ModelError::Invalid("next hop address family"));
                         }
+                        // A link-local address says nothing of its link.
+                        if gateways
+                            .iter()
+                            .any(|a| matches!(a, IpAddr::V6(a) if a.is_unicast_link_local()))
+                        {
+                            return Err(ModelError::Invalid("link-local gateway"));
+                        }
                     }
                     _ => {}
                 }

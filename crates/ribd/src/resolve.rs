@@ -9,28 +9,35 @@
 //! The rules, for a gateway route `R` in VRF `V`:
 //!
 //! 1. Each gateway is looked up by longest prefix match in the routes selected for
-//!    `V`, and only there (no other VRF).
-//! 2. If the match is `R` itself, the gateway cannot be resolved, and no less
-//!    specific route is tried: once `R` were in the FE, packets to the gateway would
-//!    follow `R`, a loop (RFC 4271 section 9.1.2.1, a NEXT_HOP that "would become
-//!    unresolvable if the route was installed").
+//!    `V`, and only there (no other VRF). The match is the one route the gateway
+//!    can be resolved through; a less specific route is never tried instead.
+//! 2. If the match is `R` itself, the gateway cannot be resolved: once `R` were in
+//!    the FE, packets to the gateway would follow `R` (RFC 4271 section 9.1.2.1, a
+//!    NEXT_HOP that "would become unresolvable if the route was installed").
 //! 3. A match with next hops that name their interface resolves the gateway: each
 //!    of its next hops gives the interface, and its address, or the gateway itself
 //!    when it has none (the gateway is on that link).
-//! 4. A match that is itself a gateway route is resolved first, the same way, and
-//!    its result is used. If it resolves to nothing, it would not be in the FE, so
-//!    the next less specific route is tried, as if it were not there. A route met
-//!    again while resolving it (a loop between gateway routes) counts as resolving
-//!    to nothing; so does going deeper than [`DEPTH_MAX`] gateway routes.
-//! 5. A local, discard, reject or other-VRF route stops the lookup: the gateway
-//!    cannot be resolved.
-//! 6. The default route (prefix length 0) is used only when ribd is told to
-//!    (`--resolve-via-default`); otherwise reaching it means the gateway cannot be
-//!    resolved, as RIBs usually do (FRR's `ip nht resolve-via-default`).
+//! 4. A match that is itself a gateway route gives the next hops that it resolves
+//!    to. If it resolves to none, the gateway cannot be resolved either.
+//! 5. Gateway routes that match each other's gateways in a loop are resolved only
+//!    through their gateways that lead out of the loop. A gateway whose match is in
+//!    the same loop cannot be resolved: following it would come back to `R`.
+//! 6. A gateway whose match goes through [`DEPTH_MAX`] gateway routes already
+//!    (counting the match) cannot be resolved.
+//! 7. A local, discard, reject or other-VRF route as the match: the gateway cannot
+//!    be resolved.
+//! 8. The default route (prefix length 0) is used only when ribd is told to
+//!    (`--resolve-via-default`); otherwise the gateway cannot be resolved, as RIBs
+//!    usually do (FRR's `ip nht resolve-via-default`).
 //!
 //! A route keeps the next hops its gateways resolve to, without duplicates, in the
 //! order of its gateways. A route none of whose gateways resolves is not given to
 //! the FE (and is deleted there if it was).
+//!
+//! The result depends only on the selected routes, not on the order they are
+//! worked through. Each distinct gateway is looked up once; the loops are found as
+//! the strongly connected components of the gateway routes (Tarjan), so the work
+//! grows with the number of routes and gateways.
 //!
 //! # Standards
 //!
@@ -41,7 +48,11 @@
 //!
 //! Deviations: the result is not given back to the source (BGP's next hop tracking
 //! comes from FRR's zebra, which sees only the kernel's routes), so BGP may choose
-//! a path that ribd then cannot resolve.
+//! a path that ribd then cannot resolve. A gateway route that resolves to nothing
+//! still hides less specific routes from the gateways it matches (rule 4), where a
+//! RIB that falls back to them would resolve more; and a gateway into a loop is not
+//! used even when the route it matches resolves out of the loop (rule 5). Both
+//! leave a route out rather than risk a loop.
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
@@ -51,22 +62,21 @@ use ruster_proto::table::{network, Key, NextHop, RouteAction, Value};
 /// The most gateway routes one resolution goes through, the route itself included.
 pub const DEPTH_MAX: usize = 8;
 
+/// What one gateway matched.
+#[derive(Clone, Copy)]
+enum Match<'a> {
+    /// Nothing it can be resolved through.
+    None,
+    /// A route with next hops that name their interface.
+    Hops(&'a [NextHop]),
+    /// The gateway route with this index.
+    Gateway(usize),
+}
+
 /// Replaces each gateway route in `selected` with the next hops it resolves to, or
 /// removes it when it resolves to none.
 pub fn resolve(selected: &mut BTreeMap<Key, Value>, via_default: bool) {
-    let routes = &*selected;
-    let mut resolver = Resolver {
-        routes,
-        via_default,
-        done: HashMap::new(),
-    };
-    let mut results = Vec::new();
-    for (key, value) in routes {
-        if matches!(value, Value::Route(RouteAction::Gateways(_))) {
-            let (hops, _) = resolver.route(key, &mut Vec::new());
-            results.push((key.clone(), hops));
-        }
-    }
+    let results = resolved(selected, via_default);
     for (key, hops) in results {
         if hops.is_empty() {
             selected.remove(&key);
@@ -76,107 +86,187 @@ pub fn resolve(selected: &mut BTreeMap<Key, Value>, via_default: bool) {
     }
 }
 
-struct Resolver<'a> {
-    routes: &'a BTreeMap<Key, Value>,
-    via_default: bool,
-    /// Gateway routes already resolved, with results that did not depend on where
-    /// the resolution started (no loop or depth limit met on the way).
-    done: HashMap<&'a Key, Vec<NextHop>>,
-}
-
-impl<'a> Resolver<'a> {
-    /// The next hops of the route at `key`, and whether the result depends on the
-    /// gateway routes being resolved (`stack`) and so may not be kept.
-    fn route(&mut self, key: &'a Key, stack: &mut Vec<&'a Key>) -> (Vec<NextHop>, bool) {
-        if let Some(hops) = self.done.get(key) {
-            return (hops.clone(), false);
-        }
-        let Some(Value::Route(RouteAction::Gateways(gateways))) = self.routes.get(key) else {
-            return (Vec::new(), false);
-        };
-        if stack.contains(&key) || stack.len() >= DEPTH_MAX {
-            return (Vec::new(), true);
-        }
-        let Key::Route { vrf, .. } = key else {
-            return (Vec::new(), false);
-        };
-        stack.push(key);
-        let mut hops: Vec<NextHop> = Vec::new();
-        let mut depends = false;
-        for &gateway in gateways {
-            let (found, d) = self.gateway(vrf, gateway, key, stack);
-            depends |= d;
-            for hop in found {
-                if !hops.contains(&hop) {
-                    hops.push(hop);
-                }
-            }
-        }
-        stack.pop();
-        if !depends {
-            self.done.insert(key, hops.clone());
-        }
-        (hops, depends)
-    }
-
-    /// The next hops `gateway` resolves to for the route at `own`.
-    fn gateway(
-        &mut self,
-        vrf: &str,
-        gateway: IpAddr,
-        own: &'a Key,
-        stack: &mut Vec<&'a Key>,
-    ) -> (Vec<NextHop>, bool) {
-        let max: u8 = if gateway.is_ipv4() { 32 } else { 128 };
-        let mut probe = Key::Route {
-            vrf: vrf.to_owned(),
-            prefix: gateway,
-            len: max,
-        };
-        let mut depends = false;
-        for len in (0..=max).rev() {
-            if len == 0 && !self.via_default {
-                break;
-            }
-            if let Key::Route {
-                prefix, len: at, ..
-            } = &mut probe
-            {
-                *prefix = network(gateway, len);
-                *at = len;
-            }
-            let Some((key, Value::Route(action))) = self.routes.get_key_value(&probe) else {
-                continue;
+/// Each gateway route of `routes`, and the next hops it resolves to.
+fn resolved(routes: &BTreeMap<Key, Value>, via_default: bool) -> Vec<(Key, Vec<NextHop>)> {
+    let nodes: Vec<(&Key, &[IpAddr])> = routes
+        .iter()
+        .filter_map(|(key, value)| match value {
+            Value::Route(RouteAction::Gateways(gateways)) => Some((key, gateways.as_slice())),
+            _ => None,
+        })
+        .collect();
+    let index: HashMap<&Key, usize> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, (k, _))| (*k, i))
+        .collect();
+    let mut found: HashMap<(&str, IpAddr), Option<&Key>> = HashMap::new();
+    let edges: Vec<Vec<(IpAddr, Match)>> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, (key, gateways))| {
+            let Key::Route { vrf, .. } = key else {
+                return Vec::new();
             };
-            if key == own {
-                break;
-            }
-            match action {
-                RouteAction::Forward(through) => {
-                    let hops = through
+            gateways
+                .iter()
+                .map(|&gateway| {
+                    let hit = *found
+                        .entry((vrf.as_str(), gateway))
+                        .or_insert_with(|| longest_match(routes, vrf, gateway, via_default));
+                    let to = match hit.map(|k| (k, &routes[k])) {
+                        Some((_, Value::Route(RouteAction::Forward(hops)))) => Match::Hops(hops),
+                        Some((k, Value::Route(RouteAction::Gateways(_)))) if index[k] != i => {
+                            Match::Gateway(index[k])
+                        }
+                        _ => Match::None,
+                    };
+                    (gateway, to)
+                })
+                .collect()
+        })
+        .collect();
+
+    let components = components(&edges);
+    let mut component = vec![0; nodes.len()];
+    for (c, members) in components.iter().enumerate() {
+        for &n in members {
+            component[n] = c;
+        }
+    }
+    // Components come out after every component they reach, so the gateway routes
+    // a component goes through are done before it. `depth` is how many gateway
+    // routes a route's resolution goes through, itself included; 0 for none.
+    let mut hops: Vec<Vec<NextHop>> = vec![Vec::new(); nodes.len()];
+    let mut depth = vec![0_usize; nodes.len()];
+    for members in &components {
+        for &n in members {
+            let mut out: Vec<NextHop> = Vec::new();
+            let mut deepest = 0;
+            for &(gateway, to) in &edges[n] {
+                let add: Vec<NextHop> = match to {
+                    Match::None => continue,
+                    Match::Hops(through) => through
                         .iter()
                         .map(|hop| NextHop {
                             interface: hop.interface.clone(),
                             address: Some(hop.address.unwrap_or(gateway)),
                         })
-                        .collect();
-                    return (hops, depends);
-                }
-                RouteAction::Gateways(_) => {
-                    let (hops, d) = self.route(key, stack);
-                    depends |= d;
-                    if !hops.is_empty() {
-                        return (hops, depends);
+                        .collect(),
+                    Match::Gateway(m) => {
+                        if component[m] == component[n] || depth[m] == 0 || depth[m] >= DEPTH_MAX {
+                            continue;
+                        }
+                        deepest = deepest.max(depth[m]);
+                        hops[m].clone()
+                    }
+                };
+                for hop in add {
+                    if !out.contains(&hop) {
+                        out.push(hop);
                     }
                 }
-                RouteAction::Local
-                | RouteAction::Discard
-                | RouteAction::Reject
-                | RouteAction::LookupVrf(_) => break,
+            }
+            if !out.is_empty() {
+                depth[n] = deepest + 1;
+            }
+            hops[n] = out;
+        }
+    }
+    nodes
+        .into_iter()
+        .zip(hops)
+        .map(|((key, _), hops)| (key.clone(), hops))
+        .collect()
+}
+
+/// The longest match for `gateway` among `routes` of `vrf`, if it is one that may
+/// resolve a gateway (not the default route unless `via_default`).
+fn longest_match<'a>(
+    routes: &'a BTreeMap<Key, Value>,
+    vrf: &str,
+    gateway: IpAddr,
+    via_default: bool,
+) -> Option<&'a Key> {
+    let max: u8 = if gateway.is_ipv4() { 32 } else { 128 };
+    let mut probe = Key::Route {
+        vrf: vrf.to_owned(),
+        prefix: gateway,
+        len: max,
+    };
+    for len in (1..=max).rev().chain(via_default.then_some(0)) {
+        if let Key::Route {
+            prefix, len: at, ..
+        } = &mut probe
+        {
+            *prefix = network(gateway, len);
+            *at = len;
+        }
+        if let Some((key, _)) = routes.get_key_value(&probe) {
+            return Some(key);
+        }
+    }
+    None
+}
+
+/// The strongly connected components of the graph of gateway routes (Tarjan's
+/// algorithm, without recursion), each after every component it reaches.
+fn components(edges: &[Vec<(IpAddr, Match)>]) -> Vec<Vec<usize>> {
+    const UNSEEN: usize = usize::MAX;
+    let n = edges.len();
+    let mut order = vec![UNSEEN; n];
+    let mut low = vec![0; n];
+    let mut on_stack = vec![false; n];
+    let mut stack: Vec<usize> = Vec::new();
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut next = 0;
+    for root in 0..n {
+        if order[root] != UNSEEN {
+            continue;
+        }
+        // (node, how many of its targets were looked at)
+        let mut walk: Vec<(usize, usize)> = vec![(root, 0)];
+        order[root] = next;
+        low[root] = next;
+        next += 1;
+        stack.push(root);
+        on_stack[root] = true;
+        while let Some(&mut (v, ref mut seen)) = walk.last_mut() {
+            if let Some(&(_, to)) = edges[v].get(*seen) {
+                *seen += 1;
+                let Match::Gateway(w) = to else {
+                    continue;
+                };
+                if order[w] == UNSEEN {
+                    order[w] = next;
+                    low[w] = next;
+                    next += 1;
+                    stack.push(w);
+                    on_stack[w] = true;
+                    walk.push((w, 0));
+                } else if on_stack[w] {
+                    low[v] = low[v].min(order[w]);
+                }
+                continue;
+            }
+            walk.pop();
+            if let Some(&(parent, _)) = walk.last() {
+                low[parent] = low[parent].min(low[v]);
+            }
+            if low[v] == order[v] {
+                let mut members = Vec::new();
+                while let Some(w) = stack.pop() {
+                    on_stack[w] = false;
+                    members.push(w);
+                    if w == v {
+                        break;
+                    }
+                }
+                out.push(members);
             }
         }
-        (Vec::new(), depends)
     }
+    out
 }
 
 #[cfg(test)]
@@ -355,19 +445,25 @@ mod tests {
     }
 
     #[test]
-    fn gateway_routes_in_a_loop_resolve_to_nothing_whatever_the_order() {
-        // A via an address in B, B via an address in A.
-        let map = resolved(
-            &[
+    fn gateway_routes_in_a_loop_resolve_only_out_of_it_whatever_the_order() {
+        // A via an address in B, B via an address in A: neither, and the /8 under
+        // both is not used instead.
+        for with_wider in [false, true] {
+            let mut routes = vec![
                 ("10.1.0.0/16", gateways(&["10.2.0.1"])),
                 ("10.2.0.0/16", gateways(&["10.1.0.1"])),
-            ],
-            false,
-        );
-        assert!(map.is_empty());
+            ];
+            if with_wider {
+                routes.push(("10.0.0.0/8", dev("wan", Some("198.51.100.10"))));
+            }
+            let map = resolved(&routes, false);
+            assert_eq!(hops(&map, "10.1.0.0/16"), None);
+            assert_eq!(hops(&map, "10.2.0.0/16"), None);
+        }
 
-        // A also has a gateway on a link: A resolves through it, and B through A,
-        // whichever is resolved first.
+        // A also has a gateway on a link: A resolves through that one only, and B,
+        // whose one gateway leads back into the loop, not at all; whichever sorts
+        // first, and with the /8 there too.
         for (a, b) in [
             ("10.1.0.0/16", "10.2.0.0/16"),
             ("10.2.0.0/16", "10.1.0.0/16"),
@@ -376,19 +472,24 @@ mod tests {
             let second = b.replace(".0.0/16", ".0.1");
             let map = resolved(
                 &[
+                    ("10.0.0.0/8", dev("wan", Some("198.51.100.10"))),
                     ("192.168.1.0/24", dev("lan", None)),
                     (a, gateways(&[&second, "192.168.1.1"])),
                     (b, gateways(&[&first])),
+                    // Outside the loop, through A.
+                    ("203.0.113.0/24", gateways(&[&first])),
                 ],
                 false,
             );
-            assert_eq!(hops(&map, a), Some(vec![hop("lan", "192.168.1.1")]), "{a}");
-            assert_eq!(hops(&map, b), Some(vec![hop("lan", "192.168.1.1")]), "{b}");
+            let lan = Some(vec![hop("lan", "192.168.1.1")]);
+            assert_eq!(hops(&map, a), lan, "{a}");
+            assert_eq!(hops(&map, b), None, "{b}");
+            assert_eq!(hops(&map, "203.0.113.0/24"), lan);
         }
     }
 
     #[test]
-    fn a_gateway_route_that_resolves_to_nothing_lets_a_less_specific_route_resolve() {
+    fn a_gateway_route_that_resolves_to_nothing_is_not_passed_over() {
         let map = resolved(
             &[
                 ("10.0.0.0/8", dev("wan", Some("198.51.100.10"))),
@@ -398,34 +499,68 @@ mod tests {
             false,
         );
         assert_eq!(hops(&map, "10.1.0.0/16"), None);
-        assert_eq!(
-            hops(&map, "203.0.113.0/24"),
-            Some(vec![hop("wan", "198.51.100.10")])
-        );
+        assert_eq!(hops(&map, "203.0.113.0/24"), None);
     }
 
     #[test]
-    fn resolution_stops_at_the_depth_limit() {
-        // A chain of gateway routes, each through the next, ending on a link.
-        let chain = |length: usize| {
+    fn resolution_stops_at_the_depth_limit_however_the_chain_sorts() {
+        // A chain of gateway routes, each through the next, ending on a link. The
+        // head sorts first, or last.
+        let chain = |length: usize, head_first: bool| {
+            let at = |i: usize| if head_first { i } else { length - 1 - i };
             let mut routes = vec![("192.168.1.0/24".to_owned(), dev("lan", None))];
             for i in 0..length {
                 let gateway = if i + 1 == length {
                     "192.168.1.1".to_owned()
                 } else {
-                    format!("10.{}.0.1", i + 1)
+                    format!("10.{}.0.1", at(i + 1))
                 };
-                routes.push((format!("10.{i}.0.0/16"), gateways(&[&gateway])));
+                routes.push((format!("10.{}.0.0/16", at(i)), gateways(&[&gateway])));
             }
             let mut map: BTreeMap<Key, Value> =
                 routes.iter().map(|(k, v)| (key(k), v.clone())).collect();
             resolve(&mut map, false);
-            map
+            (
+                map,
+                format!("10.{}.0.0/16", at(0)),
+                format!("10.{}.0.0/16", at(1)),
+            )
         };
-        assert!(hops(&chain(DEPTH_MAX), "10.0.0.0/16").is_some());
-        let map = chain(DEPTH_MAX + 1);
-        assert_eq!(hops(&map, "10.0.0.0/16"), None);
-        assert!(hops(&map, "10.1.0.0/16").is_some());
+        for head_first in [true, false] {
+            let (map, head, _) = chain(DEPTH_MAX, head_first);
+            assert!(hops(&map, &head).is_some());
+            let (map, head, second) = chain(DEPTH_MAX + 1, head_first);
+            assert_eq!(hops(&map, &head), None, "{head_first}");
+            assert!(hops(&map, &second).is_some());
+        }
+    }
+
+    #[test]
+    fn many_gateway_routes_through_each_other_take_little_work() {
+        // Each of 200 routes has gateways in every other one: one big loop, with
+        // a way out only from the last.
+        let n = 200;
+        let mut map = BTreeMap::new();
+        map.insert(key("192.168.1.0/24"), dev("lan", None));
+        for i in 0..n {
+            let mut list: Vec<IpAddr> = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| IpAddr::from(Ipv4Addr::new(10, (j / 256) as u8, (j % 256) as u8, 1)))
+                .collect();
+            if i == n - 1 {
+                list.push(ip("192.168.1.1"));
+            }
+            map.insert(
+                Key::Route {
+                    vrf: "default".into(),
+                    prefix: Ipv4Addr::new(10, (i / 256) as u8, (i % 256) as u8, 0).into(),
+                    len: 24,
+                },
+                Value::Route(RouteAction::Gateways(list)),
+            );
+        }
+        resolve(&mut map, false);
+        assert_eq!(map.len(), 2, "the link, and the last route out of the loop");
     }
 
     #[test]

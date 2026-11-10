@@ -1346,7 +1346,14 @@ fn gateway_routes_round_trip_and_do_not_mix_with_interface_hops() {
     );
     assert_eq!(round_trip(&v6), v6);
 
-    // A gateway of the other family, and none at all.
+    // A gateway of the other family, a link-local one, and none at all.
+    let v6_route = |gateways| {
+        Change::set(
+            route(ip6("2001:db8:203::"), 64),
+            Value::Route(RouteAction::Gateways(gateways)),
+        )
+    };
+    assert!(v6_route(vec![ip6("fe80::1")]).validate().is_err());
     for gateways in [vec![ip6("2001:db8::1")], vec![]] {
         let bad = Change::set(
             route(ip([203, 0, 113, 0]), 24),
