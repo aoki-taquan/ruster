@@ -5,8 +5,9 @@
 関連: [`overview.md`](overview.md)（プロセスの一覧）、[`tables.md`](tables.md)（FEの表）、
 [`control-protocol.md`](control-protocol.md)（メッセージ形式）。
 
-rusterが作るCEは`ruster-confd`、`ruster-ribd`、`ruster-neighd`と、CLIの`ruster`だけ。
-ここではこの四つの中身と、外のデーモンとのつなぎ方を決める。
+ここでは`ruster-confd`、`ruster-ribd`、`ruster-neighd`と、CLIの`ruster`の中身と、外のデーモンとの
+つなぎ方を決める。既製のソフトの橋渡し役と自作の制御（PPPoE、DHCPクライアント）は
+[`router-box.md`](router-box.md)。
 
 ## 共通の決まり
 
@@ -25,7 +26,7 @@ rusterが作るCEは`ruster-confd`、`ruster-ribd`、`ruster-neighd`と、CLIの
 
 | 持つもの | 中身 | 保存 |
 |---|---|---|
-| 設定 | 運用者が書いたもの。YANGで表す | ファイル。過去の版も残す |
+| 設定 | 全体の設定（[`router-box.md`](router-box.md)）のうちconfdの担当の部分 | ファイル。過去の版も残す |
 | 動的な値 | 外のデーモンから受け取った値（DHCPで得たアドレスなど）。有効期限付き | 保存しない |
 
 FEに書く表は「設定」と「動的な値」から計算する。
@@ -63,20 +64,13 @@ FEに書く表は「設定」と「動的な値」から計算する。
 
 経路はconfdではなく`ruster-ribd`へ渡す（DHCPのdefault経路など）。
 
-外のデーモンの設定（PPPoEの認証情報など）は、そのデーモン自身が持つ。confdは外のデーモンを設定しない。
+外のデーモンの設定（PPPoEの認証情報など）は、全体の設定からそのデーモン自身が読む。confdは外のデーモンを設定しない。
 
 ### 反映の流れ
 
-```
-CLI → confd: 新しい設定の候補
-confd: 検証（YANGの制約、参照先があるか、意味の矛盾）
-confd → CLI: 差分（FEの表がどう変わるか、消えるNATセッションなど）
-CLI → confd: 確定
-confd: FE、ribd、neighdへ反映。失敗したら一つ前の設定を新しい版として反映し直す
-```
-
-- 確定に「N分以内に確認しなければ戻す」を付けられる。遠隔から設定を変えて自分が締め出されたときに戻る。
-- 過去の版を番号で指定して戻せる。
+CLIが各プロセスへ候補、差分、確定を順に話す（[`router-box.md`](router-box.md)の「反映の流れ」）。
+confdは担当の部分を検証し（YANGの制約、参照先があるか、意味の矛盾）、差分（FEの表がどう変わるか、
+消えるNATセッションなど）を返し、確定したらFEへ反映する。
 
 ### kernel側への設定
 
