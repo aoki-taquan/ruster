@@ -1830,20 +1830,29 @@ impl<'a> ForwardingSnapshot<'a> {
         Self { overlays, ..self }
     }
 
-    /// For a `frame` (Ethernet) bridged to `member`: the outer header to put before
-    /// it and the interface (a port or VLAN sub-interface) to send the result out
-    /// of. `None` when `member` is no overlay. `irb` tells the bridges' own
-    /// interfaces; a next hop missing from the neighbor table is recorded in
-    /// `trace`. Cold path.
+    /// The overlay whose interface is `member`, if any.
+    #[must_use]
+    pub fn overlay(&self, member: IfId) -> Option<&'a crate::Overlay> {
+        crate::overlay::of(self.overlays, member)
+    }
+
+    /// For a `frame` (Ethernet) bridged to `member` for its remote end `remote`
+    /// (one of [`crate::Overlay::remotes`]): the outer header to put before it and
+    /// the interface (a port or VLAN sub-interface) to send the result out of.
+    /// `None` when `member` is no overlay. `irb` tells the bridges' own interfaces;
+    /// a next hop missing from the neighbor table is recorded in `trace`. Cold path.
     pub fn overlay_header<T: TraceSink>(
         &self,
         member: IfId,
+        remote: std::net::IpAddr,
         frame: &[u8],
         irb: impl Fn(IfId) -> bool,
         trace: &mut T,
     ) -> Option<Result<crate::OverlayHeader, DropReason>> {
         let overlay = crate::overlay::of(self.overlays, member)?;
-        Some(crate::overlay::header(self, overlay, frame, irb, trace))
+        Some(crate::overlay::header(
+            self, overlay, remote, frame, irb, trace,
+        ))
     }
 
     /// Sends packets routed to a PPPoE session's interface in that session and
@@ -3268,14 +3277,15 @@ fn bridge_stage<S: crate::PacketSlot, T: TraceSink>(
     mut packet: crate::PacketLease<S>,
     bridges: &mut crate::Bridges,
     all_vrfs: &ForwardingSnapshot<'_>,
+    vtep: Option<std::net::IpAddr>,
     trace: &mut T,
 ) -> Result<crate::PacketLease<S>, Ended> {
     let ingress = packet.ingress();
-    let reason = match bridges.receive(&mut packet, all_vrfs.now.0) {
+    let reason = match bridges.receive(&mut packet, vtep, all_vrfs.now.0) {
         crate::bridge::Received::Pass => return Ok(packet),
-        crate::bridge::Received::Forward(member) => {
+        crate::bridge::Received::Forward(member, to) => {
             let irb = |id: IfId| bridges.irb_of(id).is_some();
-            match crate::overlay::transmit_member(&mut packet, member, all_vrfs, irb, trace) {
+            match crate::overlay::transmit_member(&mut packet, member, to, all_vrfs, irb, trace) {
                 Ok(port) => {
                     packet.commit(port);
                     return Err(Ended::Transmitted);
@@ -3339,15 +3349,15 @@ where
         // interface (its ingress is then the IRB). An overlay's outer packet is
         // unwrapped, and its frame relayed as received on the overlay.
         if let Some(bridges) = bridges.as_deref_mut().filter(|b| !b.is_empty()) {
-            let mut stage = bridge_stage(packet, bridges, all_vrfs, trace);
+            let mut stage = bridge_stage(packet, bridges, all_vrfs, None, trace);
             if let Ok(passed) = stage.as_mut() {
                 match crate::overlay::receive(passed, all_vrfs) {
-                    Ok(false) => {}
-                    Ok(true) => {
+                    Ok(crate::overlay::Received::NotOverlay) => {}
+                    Ok(crate::overlay::Received::Unwrapped { vtep }) => {
                         let member = passed.ingress();
                         let unwrapped = stage.expect("passed the bridge stage");
-                        stage =
-                            bridge_stage(unwrapped, bridges, all_vrfs, trace).and_then(|packet| {
+                        stage = bridge_stage(unwrapped, bridges, all_vrfs, vtep, trace).and_then(
+                            |packet| {
                                 // An overlay in no bridge: its frame goes nowhere.
                                 if packet.ingress() == member {
                                     let reason = DropReason::BridgeDropped;
@@ -3359,7 +3369,8 @@ where
                                     return Err(Ended::Dropped);
                                 }
                                 Ok(packet)
-                            });
+                            },
+                        );
                     }
                     Err(reason) => {
                         let packet = stage.expect("passed the bridge stage");
@@ -3983,9 +3994,9 @@ where
                         Some(bridges) => {
                             bridges.transmit(egress, packet.bytes_mut(), all_vrfs.now.0)
                         }
-                        None => Ok(Some(egress)),
+                        None => Ok(Some((egress, None))),
                     };
-                    let member = match member {
+                    let (member, to) = match member {
                         Ok(Some(member)) => member,
                         Ok(None) => {
                             packet.consume(crate::ConsumeReason::BridgeFlooded);
@@ -4004,8 +4015,14 @@ where
                             .as_deref()
                             .is_some_and(|bridges| bridges.irb_of(id).is_some())
                     };
-                    match crate::overlay::transmit_member(&mut packet, member, all_vrfs, irb, trace)
-                    {
+                    match crate::overlay::transmit_member(
+                        &mut packet,
+                        member,
+                        to,
+                        all_vrfs,
+                        irb,
+                        trace,
+                    ) {
                         Ok(port) => {
                             packet.commit(port);
                             tx_requested += 1;

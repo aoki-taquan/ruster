@@ -22,11 +22,15 @@
 //!   recommended, 8.8.3).
 //! - IEEE 802.1Q-2018 8.6.3 and table 8-1: frames to 01-80-C2-00-00-00 to
 //!   01-80-C2-00-00-0F are not relayed.
+//! - RFC 7348 section 4.1: an address learned on a VXLAN member is learned with the
+//!   remote VTEP it came from, and frames to it go to that VTEP.
 //!
 //! Deviations: no spanning tree (the operator keeps the topology free of loops); a
 //! bridge does not tell VLANs apart (VLAN-unaware: make one bridge per VLAN with VLAN
 //! sub-interfaces as members); a frame with a group or all-zero source address is
 //! dropped, not relayed.
+
+use std::net::IpAddr;
 
 use crate::fixed_directory::DirectoryHashDomain;
 use crate::{IfId, ResolutionHashKey};
@@ -70,8 +74,9 @@ pub struct BridgeCounters {
 pub enum BridgeDecision {
     /// The frame is the bridge's own interface's (the IRB's): it is received there.
     Irb,
-    /// The frame goes out of this member only.
-    Forward(IfId),
+    /// The frame goes out of this member only (to this remote VTEP, for an address
+    /// learned on a VXLAN member).
+    Forward(IfId, Option<IpAddr>),
     /// The frame goes out of every member but the one it came in on, and is also
     /// received on the IRB when `irb` (a broadcast or multicast frame).
     Flood { irb: bool },
@@ -98,6 +103,8 @@ struct Slot {
     bridge: u16,
     mac: [u8; 6],
     member: IfId,
+    /// The remote VTEP behind a VXLAN member.
+    vtep: Option<IpAddr>,
     seen_ms: u64,
 }
 
@@ -107,6 +114,7 @@ const EMPTY: Slot = Slot {
     bridge: 0,
     mac: [0; 6],
     member: IfId(0),
+    vtep: None,
     seen_ms: 0,
 };
 
@@ -123,6 +131,8 @@ pub struct MacEntry {
     pub bridge: u16,
     pub mac: [u8; 6],
     pub member: IfId,
+    /// The remote VTEP behind a VXLAN member.
+    pub vtep: Option<IpAddr>,
     /// A static entry (written by the control side), not a learned one.
     pub fixed: bool,
     /// When a learned entry was last seen.
@@ -301,6 +311,7 @@ impl MacTable {
                 bridge,
                 mac,
                 member,
+                vtep: None,
                 seen_ms: 0,
             });
         }
@@ -335,8 +346,16 @@ impl MacTable {
         left_out
     }
 
-    /// Learns that `mac` was seen on `member` of `bridge` at `now_ms`.
-    pub fn learn(&mut self, bridge: u16, mac: [u8; 6], member: IfId, now_ms: u64) -> Learned {
+    /// Learns that `mac` was seen on `member` of `bridge` at `now_ms`, behind remote
+    /// VTEP `vtep` for a VXLAN member.
+    pub fn learn(
+        &mut self,
+        bridge: u16,
+        mac: [u8; 6],
+        member: IfId,
+        vtep: Option<IpAddr>,
+        now_ms: u64,
+    ) -> Learned {
         let Some(state) = self.bridges.get(usize::from(bridge)) else {
             return Learned::Limited;
         };
@@ -348,10 +367,11 @@ impl MacTable {
                 return Learned::Static;
             }
             slot.seen_ms = now_ms;
-            if slot.member == member {
+            if slot.member == member && slot.vtep == vtep {
                 return Learned::Refreshed;
             }
             slot.member = member;
+            slot.vtep = vtep;
             let counters = &mut self.bridges[usize::from(bridge)].counters;
             // An entry past its age that comes back elsewhere is learned anew.
             if aged {
@@ -372,6 +392,7 @@ impl MacTable {
             bridge,
             mac,
             member,
+            vtep,
             seen_ms: now_ms,
         });
         let state = &mut self.bridges[usize::from(bridge)];
@@ -380,9 +401,14 @@ impl MacTable {
         Learned::New
     }
 
-    /// The member `mac` of `bridge` is on, unless it is not known or has aged (then
-    /// its entry goes).
-    pub fn lookup(&mut self, bridge: u16, mac: &[u8; 6], now_ms: u64) -> Option<IfId> {
+    /// The member `mac` of `bridge` is on (and the remote VTEP behind it), unless it
+    /// is not known or has aged (then its entry goes).
+    pub fn lookup(
+        &mut self,
+        bridge: u16,
+        mac: &[u8; 6],
+        now_ms: u64,
+    ) -> Option<(IfId, Option<IpAddr>)> {
         let at = self.find(bridge, mac)?;
         if self.aged(&self.slots[at], now_ms) {
             if let Some(b) = self.bridges.get_mut(usize::from(bridge)) {
@@ -391,7 +417,7 @@ impl MacTable {
             self.remove(at);
             return None;
         }
-        Some(self.slots[at].member)
+        Some((self.slots[at].member, self.slots[at].vtep))
     }
 
     /// Looks at up to `budget` slots, from where the last call stopped, and removes the
@@ -413,12 +439,14 @@ impl MacTable {
     }
 
     /// Decides what bridge `bridge` does with `frame` (Ethernet, without a VLAN tag)
-    /// received on `member` at `now_ms`, learning its source; `irb` is the MAC address
-    /// of the bridge's own interface, when it has one.
+    /// received on `member` (from remote VTEP `vtep`, for a VXLAN member) at
+    /// `now_ms`, learning its source; `irb` is the MAC address of the bridge's own
+    /// interface, when it has one.
     pub fn receive(
         &mut self,
         bridge: u16,
         member: IfId,
+        vtep: Option<IpAddr>,
         frame: &[u8],
         irb: Option<[u8; 6]>,
         now_ms: u64,
@@ -435,7 +463,7 @@ impl MacTable {
             self.bridges[usize::from(bridge)].counters.dropped += 1;
             return BridgeDecision::Drop;
         }
-        self.learn(bridge, source, member, now_ms);
+        self.learn(bridge, source, member, vtep, now_ms);
         if Some(destination) == irb {
             return BridgeDecision::Irb;
         }
@@ -443,19 +471,24 @@ impl MacTable {
             return BridgeDecision::Flood { irb: irb.is_some() };
         }
         match self.lookup(bridge, &destination, now_ms) {
-            Some(out) if out == member => {
+            Some((out, _)) if out == member => {
                 self.bridges[usize::from(bridge)].counters.filtered += 1;
                 BridgeDecision::Drop
             }
-            Some(out) => BridgeDecision::Forward(out),
+            Some((out, to)) => BridgeDecision::Forward(out, to),
             None => BridgeDecision::Flood { irb: false },
         }
     }
 
-    /// The member a frame to `destination` leaves bridge `bridge` through when the
-    /// bridge's own interface sends it, or `None` to flood it (a group address, or
-    /// one not known).
-    pub fn send(&mut self, bridge: u16, destination: &[u8; 6], now_ms: u64) -> Option<IfId> {
+    /// The member a frame to `destination` leaves bridge `bridge` through (and the
+    /// remote VTEP behind it) when the bridge's own interface sends it, or `None` to
+    /// flood it (a group address, or one not known).
+    pub fn send(
+        &mut self,
+        bridge: u16,
+        destination: &[u8; 6],
+        now_ms: u64,
+    ) -> Option<(IfId, Option<IpAddr>)> {
         if is_group(destination) {
             return None;
         }
@@ -495,6 +528,7 @@ impl MacTable {
             bridge: s.bridge,
             mac: s.mac,
             member: s.member,
+            vtep: s.vtep,
             fixed: s.fixed,
             seen_ms: s.seen_ms,
         })
@@ -547,8 +581,8 @@ pub(crate) enum Received {
     /// Not a member's frame, or one for the IRB (its ingress is now the IRB):
     /// forwarding goes on with it.
     Pass,
-    /// To be sent out of this one member.
-    Forward(IfId),
+    /// To be sent out of this one member (to this remote VTEP).
+    Forward(IfId, Option<IpAddr>),
     Consumed,
     Dropped,
 }
@@ -701,6 +735,7 @@ impl Bridges {
     pub(crate) fn receive<S: crate::PacketSlot>(
         &mut self,
         packet: &mut crate::PacketLease<S>,
+        vtep: Option<IpAddr>,
         now_ms: u64,
     ) -> Received {
         let member = packet.ingress();
@@ -711,6 +746,7 @@ impl Bridges {
         let decision = self.table.receive(
             bridge,
             member,
+            vtep,
             packet.bytes_mut(),
             irb.map(|(_, mac)| mac),
             now_ms,
@@ -720,9 +756,9 @@ impl Bridges {
                 packet.set_ingress(irb.expect("an IRB decision has an IRB").0);
                 Received::Pass
             }
-            BridgeDecision::Forward(out) => {
+            BridgeDecision::Forward(out, to) => {
                 self.table.count_forwarded(bridge);
-                Received::Forward(out)
+                Received::Forward(out, to)
             }
             BridgeDecision::Flood { irb: up } => {
                 let staged = self.stage_flood(bridge, Some(member), packet.bytes_mut());
@@ -750,17 +786,17 @@ impl Bridges {
         egress: IfId,
         frame: &[u8],
         now_ms: u64,
-    ) -> Result<Option<IfId>, crate::DropReason> {
+    ) -> Result<Option<(IfId, Option<IpAddr>)>, crate::DropReason> {
         let Some(bridge) = self.irb_of(egress) else {
-            return Ok(Some(egress));
+            return Ok(Some((egress, None)));
         };
         let destination: [u8; 6] = frame
             .get(0..6)
             .and_then(|d| d.try_into().ok())
             .ok_or(crate::DropReason::EthernetHeaderTruncated)?;
-        if let Some(member) = self.table.send(bridge, &destination, now_ms) {
+        if let Some(to) = self.table.send(bridge, &destination, now_ms) {
             self.table.count_forwarded(bridge);
-            return Ok(Some(member));
+            return Ok(Some(to));
         }
         if self.stage_flood(bridge, None, frame) {
             self.table.count_flood(bridge, 0);
@@ -807,16 +843,16 @@ mod tests {
     fn learns_forwards_floods_and_filters() {
         let mut t = table(16, 16);
         // B is not known yet: flooded, A learned on P1.
-        let d = t.receive(0, P1, &frame(B, A), Some(IRB), 0);
+        let d = t.receive(0, P1, None, &frame(B, A), Some(IRB), 0);
         assert_eq!(d, BridgeDecision::Flood { irb: false });
         // A is known: B's reply goes to P1 only.
         assert_eq!(
-            t.receive(0, P2, &frame(A, B), Some(IRB), 1),
-            BridgeDecision::Forward(P1)
+            t.receive(0, P2, None, &frame(A, B), Some(IRB), 1),
+            BridgeDecision::Forward(P1, None)
         );
         // Back to where it came from: dropped.
         assert_eq!(
-            t.receive(0, P2, &frame(B, A), Some(IRB), 2),
+            t.receive(0, P2, None, &frame(B, A), Some(IRB), 2),
             BridgeDecision::Drop
         );
         // A moved to P2 with that frame, so this one is filtered too.
@@ -824,11 +860,18 @@ mod tests {
         assert_eq!(t.counters().next().unwrap().filtered, 1);
         // Broadcast: flooded and received on the IRB.
         assert_eq!(
-            t.receive(0, P3, &frame([0xff; 6], [2, 0, 0, 0, 0, 0xc]), Some(IRB), 3),
+            t.receive(
+                0,
+                P3,
+                None,
+                &frame([0xff; 6], [2, 0, 0, 0, 0, 0xc]),
+                Some(IRB),
+                3
+            ),
             BridgeDecision::Flood { irb: true }
         );
         assert_eq!(
-            t.receive(0, P3, &frame(IRB, [2, 0, 0, 0, 0, 0xc]), Some(IRB), 4),
+            t.receive(0, P3, None, &frame(IRB, [2, 0, 0, 0, 0, 0xc]), Some(IRB), 4),
             BridgeDecision::Irb
         );
         assert_eq!(t.counters().next().unwrap().learned, 3);
@@ -839,15 +882,15 @@ mod tests {
         let mut t = table(16, 16);
         let stp = [0x01, 0x80, 0xc2, 0, 0, 0];
         assert_eq!(
-            t.receive(0, P1, &frame(stp, A), None, 0),
+            t.receive(0, P1, None, &frame(stp, A), None, 0),
             BridgeDecision::Drop
         );
         assert_eq!(
-            t.receive(0, P1, &frame(B, [0xff; 6]), None, 0),
+            t.receive(0, P1, None, &frame(B, [0xff; 6]), None, 0),
             BridgeDecision::Drop
         );
         assert_eq!(
-            t.receive(0, P1, &frame(B, [0; 6]), None, 0),
+            t.receive(0, P1, None, &frame(B, [0; 6]), None, 0),
             BridgeDecision::Drop
         );
         assert_eq!(t.counters().next().unwrap().dropped, 3);
@@ -855,21 +898,37 @@ mod tests {
         // IS-IS's AllL1ISs is past the reserved range: flooded.
         let isis = [0x01, 0x80, 0xc2, 0, 0, 0x14];
         assert_eq!(
-            t.receive(0, P1, &frame(isis, A), None, 0),
+            t.receive(0, P1, None, &frame(isis, A), None, 0),
             BridgeDecision::Flood { irb: false }
         );
     }
 
     #[test]
+    fn an_address_behind_a_vtep_is_sent_to_that_vtep() {
+        let mut t = table(16, 16);
+        let one = Some(IpAddr::from([192, 0, 2, 1]));
+        let two = Some(IpAddr::from([192, 0, 2, 2]));
+        t.receive(0, P3, one, &frame(B, A), None, 0);
+        assert_eq!(
+            t.receive(0, P1, None, &frame(A, B), None, 1),
+            BridgeDecision::Forward(P3, one)
+        );
+        // A seen behind another VTEP of the same member moves there.
+        assert_eq!(t.learn(0, A, P3, two, 2), Learned::Moved);
+        assert_eq!(t.send(0, &A, 3), Some((P3, two)));
+        assert_eq!(t.entries().find(|e| e.mac == A).unwrap().vtep, two);
+    }
+
+    #[test]
     fn entries_age() {
         let mut t = table(16, 16);
-        t.learn(0, A, P1, 0);
-        assert_eq!(t.send(0, &A, 300_000), Some(P1));
+        t.learn(0, A, P1, None, 0);
+        assert_eq!(t.send(0, &A, 300_000), Some((P1, None)));
         assert_eq!(t.send(0, &A, 300_001), None);
         assert_eq!(t.counters().next().unwrap().aged, 1);
         assert!(t.is_empty());
         // The sweep removes those not looked up.
-        t.learn(0, B, P2, 1_000);
+        t.learn(0, B, P2, None, 1_000);
         t.age(400_000, 1_000);
         assert!(t.is_empty());
         assert_eq!(t.counters().next().unwrap().aged, 2);
@@ -878,9 +937,12 @@ mod tests {
     #[test]
     fn limits_and_statics() {
         let mut t = table(16, 2);
-        assert_eq!(t.learn(0, A, P1, 0), Learned::New);
-        assert_eq!(t.learn(0, B, P1, 0), Learned::New);
-        assert_eq!(t.learn(0, [2, 0, 0, 0, 0, 9], P1, 0), Learned::Limited);
+        assert_eq!(t.learn(0, A, P1, None, 0), Learned::New);
+        assert_eq!(t.learn(0, B, P1, None, 0), Learned::New);
+        assert_eq!(
+            t.learn(0, [2, 0, 0, 0, 0, 9], P1, None, 0),
+            Learned::Limited
+        );
         assert_eq!(t.counters().next().unwrap().limited, 1);
         // A static entry is not moved by learning, and does not age.
         let s = [2, 0, 0, 0, 0, 0x55];
@@ -897,8 +959,8 @@ mod tests {
         // The learned entries on P1 went; the counters stayed.
         assert_eq!(t.len(), 1);
         assert_eq!(t.counters().next().unwrap().learned, 2);
-        assert_eq!(t.learn(0, s, P1, 5), Learned::Static);
-        assert_eq!(t.send(0, &s, 1_000_000), Some(P3));
+        assert_eq!(t.learn(0, s, P1, None, 5), Learned::Static);
+        assert_eq!(t.send(0, &s, 1_000_000), Some((P3, None)));
     }
 
     #[test]
@@ -909,15 +971,18 @@ mod tests {
             [2, 0, 0, 0, a, b]
         };
         for i in 0..500 {
-            assert_eq!(t.learn(0, mac(i), IfId(i % 7), u64::from(i)), Learned::New);
+            assert_eq!(
+                t.learn(0, mac(i), IfId(i % 7), None, u64::from(i)),
+                Learned::New
+            );
         }
-        assert_eq!(t.learn(0, mac(999), P1, 0), Learned::Limited);
+        assert_eq!(t.learn(0, mac(999), P1, None, 0), Learned::Limited);
         // Every other one ages out (seen at an even time, aged after 300 s from 0).
         for i in (0..500).step_by(2) {
             assert_eq!(t.lookup(0, &mac(i), 300_000 + u64::from(i) + 1), None);
         }
         for i in (1..500).step_by(2) {
-            assert_eq!(t.lookup(0, &mac(i), 300_000), Some(IfId(i % 7)));
+            assert_eq!(t.lookup(0, &mac(i), 300_000), Some((IfId(i % 7), None)));
         }
         assert_eq!(t.len(), 250);
     }
@@ -930,14 +995,14 @@ mod tests {
             max_macs: 4,
         };
         t.republish(&[limits, limits], &[None, None], |_, _| true, &[]);
-        t.learn(0, A, P1, 0);
+        t.learn(0, A, P1, None, 0);
         assert_eq!(t.send(1, &A, 0), None);
-        t.learn(1, A, P2, 0);
-        assert_eq!(t.send(0, &A, 0), Some(P1));
-        assert_eq!(t.send(1, &A, 0), Some(P2));
+        t.learn(1, A, P2, None, 0);
+        assert_eq!(t.send(0, &A, 0), Some((P1, None)));
+        assert_eq!(t.send(1, &A, 0), Some((P2, None)));
         // Bridge 1 goes, bridge 0 becomes 1.
         t.republish(&[limits], &[Some(0)], |_, _| true, &[]);
-        assert_eq!(t.send(0, &A, 0), Some(P1));
+        assert_eq!(t.send(0, &A, 0), Some((P1, None)));
         assert_eq!(t.len(), 1);
     }
 
@@ -957,7 +1022,10 @@ mod tests {
         assert_eq!(bridges.member_of(P2), Some(0));
         assert_eq!(bridges.irb_of(IfId(9)), Some(0));
         // Not an IRB: as it is.
-        assert_eq!(bridges.transmit(P3, &frame(A, IRB), 0), Ok(Some(P3)));
+        assert_eq!(
+            bridges.transmit(P3, &frame(A, IRB), 0),
+            Ok(Some((P3, None)))
+        );
         // Unknown: copied out, once (one slot).
         assert_eq!(bridges.transmit(IfId(9), &frame(A, IRB), 0), Ok(None));
         assert_eq!(bridges.flood().len(), 1);
@@ -968,8 +1036,11 @@ mod tests {
             Err(crate::DropReason::BridgeDropped)
         );
         bridges.clear_flood();
-        bridges.table.learn(0, A, P2, 0);
-        assert_eq!(bridges.transmit(IfId(9), &frame(A, IRB), 1), Ok(Some(P2)));
+        bridges.table.learn(0, A, P2, None, 0);
+        assert_eq!(
+            bridges.transmit(IfId(9), &frame(A, IRB), 1),
+            Ok(Some((P2, None)))
+        );
         let counters = bridges.table.counters().next().unwrap();
         assert_eq!(
             (counters.flooded, counters.flood_dropped, counters.forwarded),
