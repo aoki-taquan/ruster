@@ -238,10 +238,12 @@ SRHの後: ルータ宛てとして扱えるもの（ICMPv6のEcho）はkernel�
 
 ### 設定と経路
 
-- 全体の設定に`[isis]`（NETのarea、レベル、インターフェースごとのmetricとpassive）と`[ospf]`、`[ospf6]`
-  （router-id、area、インターフェースごとのcost、network type、passive）を足す。lockの形には既定値も全部書く。
-- `ruster-frr`は今の`frr`の部分に入れて受け取り、`frr.conf`の`router isis`、`router ospf`、`router ospf6`と
-  インターフェースの節を書く。
+- 全体の設定の`[isis]`（NET、レベル、インターフェースごとのmetricとpassive）と`[ospf]`、`[ospf6]`
+  （router-id、area、インターフェースごとのcost、network type、passive）。lockの形には既定値も全部書く
+  （`crates/config`の`isis.rs`、`ospf.rs`）。confdが確かめる（`crates/confd/src/isis_ospf.rs`）。defaultのVRFだけで、
+  インターフェースはポート、VLAN、ブリッジ（IRB）。名前は12文字まで、アドレスは設定に書いたもの（送り手からのものは不可）。
+- `ruster-frr`は`frr`の部分で受け取り、`frr.conf`に`interface rp-<名前>`の節と`router isis ruster`、`router ospf`、
+  `router ospf6`を書く（`crates/frr/src/isis_ospf.rs`）。
 - 経路はBGPと同じく、zebraがFPMで`ruster-frr`へ渡し、`ruster-frr`が送り手`frr`としてribdへ渡す。
   プロトコルの間の選択（administrative distance）はzebraが行い、ribdはzebraが選んだ経路だけを受ける。
 
@@ -269,23 +271,31 @@ TAPのデバイスを一つ置く。
                ⇄ TUN rt-default（ほかのルータ宛ての通信）
 ```
 
-- 作るのはconfd（`--kernel`のとき、TUNと同じく）。名前は`rp-<インターフェース名>`（Linuxの15文字に
-  入らなければconfdが断る）。MACはそのインターフェースのMACと同じにし、ARPを切る（`NOARP`。kernelは
-  ARPもNDもDADもしない）。そのインターフェースのアドレスは、TUNではなくTAPに付ける。link-localは同じMACから
-  作るので、FEのポートのlink-localと同じになる。
+- 作るのはconfd（`--kernel`のとき、TUNと同じく。`crates/confd/src/kernel.rs`）。名前は`rp-<インターフェース名>`。
+  MACとMTUはそのインターフェースのもの（MTUは1500まで: FEがTAPから受けるフレームの大きさ）。ARPを切り
+  （`NOARP`。kernelはARPもNDもDADもしない）、`addrgenmode none`でアドレスを自分で作らせず、`accept_ra`を0にして
+  Router Solicitationも出させない。そのインターフェースのアドレスは、link-localも含めてTUNではなくTAPに付ける。
+  link-localは同じMACから作るので、FEのポートのlink-localと同じになる。IS-ISもOSPFも動かさなくなった
+  インターフェースのTAPは消し、アドレスはTUNへ戻す。
+- FEは、TAPへの行があるインターフェースの`rp-<名前>`を、TUNと同じく1秒ごとに見て開く（`TUNSETIFF`に`IFF_TAP`）。
 - FEからTAPへ: 受け渡しの分類に、種類`isis`（宛先MACが上の三つで、LLCのDSAPとSSAPが0xFE）と
   `ospf`（IPのプロトコル89で、224.0.0.5、224.0.0.6、ff02::5、ff02::6、またはルータのアドレス宛て）を足し、
-  渡し先に「受けたインターフェースのTAP」を足す。行はconfdが、設定でIS-ISやOSPFを動かすインターフェースに
-  だけ書く。フレームはEthernetのまま、変えずに書く。
+  渡し先に「受けたインターフェースのTAP」を足す。行（`isis-<名前>`、`ospf-<名前>`、毎秒1000、まとめて500）は
+  confdが、設定でIS-ISやOSPFを動かすインターフェースにだけ書く。フレームはEthernetのまま、変えずに書く。
+  マルチキャストは転送の前に、ルータのアドレス宛てのOSPFはルータ宛ての分類のところで取り出す。
 - TAPからFEへ:
   - LLCのフレーム（IS-IS）と、宛先がリンクローカルのマルチキャスト（224.0.0.0/24、ff02::/16）のIPは、
     そのインターフェースからそのまま送る（IRBならブリッジへ）。
-  - それ以外のIPは、そのインターフェースのVRFのTUNから読んだパケットと同じに扱う（kernelのパケットとして転送）。
-    zebraはIS-ISやOSPFの経路をkernelにもTAP向けに入れるので、ルータ自身の通信（iBGPなど）がTAPから出てくるため。
+  - IPv6のリンクローカルのユニキャスト（OSPFv3のbroadcastのリンクで、近隣へのDatabase Descriptionなど）は、
+    FEの近隣の表で相手のMACを入れて、そのインターフェースから送る。表に無ければneighdに解決を頼んで捨てる。
+    NOARPのTAPでは、kernelはユニキャストの宛先MACに自分のMACを入れるため。
+  - それ以外のIPは、そのインターフェースのVRFのTUNから読んだパケットと同じに扱う（kernelのパケットとして転送。
+    TTLは減らさない）。TAPには接続の経路が付き、zebraはIS-ISやOSPFの経路をTAP向けに入れるので、ルータ自身の
+    通信（OSPFv2の近隣へのユニキャスト、iBGPなど）がTAPから出てくるため。
   - ARPとNDはTAPから出てこない（NOARP）。
 - zebraはTAPのデバイスとアドレスを見るので、isisdとospfdはインターフェースごとに動き、経路の次の転送先は
-  TAPの番号で届く。`ruster-frr`は`rp-<名前>`をFEのインターフェースの名前に戻してribdへ渡す。
-  インターフェースが分かるので、link-localの次の転送先（IS-ISやOSPFv3のIPv6）も渡せる。
+  TAPの番号で届く。`ruster-frr`は1秒ごとにTAPの番号を読み、`rp-<名前>`をFEのインターフェースの名前に戻して
+  ribdへ渡す。インターフェースが分かるので、link-localの次の転送先（IS-ISやOSPFv3のIPv6）も渡せる。
 
 ### 選ばなかった方法
 
@@ -293,11 +303,20 @@ TAPのデバイスを一つ置く。
   開いて読み書きしているので、TAPも同じ形で持てる。
 - OSPFだけはTUNで通す: ポートが一つの構成でしか動かない（上の「問題」）。IS-ISと同じTAPに揃える。
 
-### 実装で確かめること
+### 確かめたこと（netns `isis`、`ospf`）
 
-- TAPに付けたアドレス宛ての通信は、FEからはTUNで届く。kernelの`rp_filter`をlooseか0にする。
-- TAPのリンクの状態（FEが開いている間だけup）をポートのリンクの状態に合わせるか。合わせればisisdとospfdが
-  ポートの切断にすぐ気づく。
+- `rp_filter`: TAPのアドレス宛ての通信はTUNから届く。looseでも足りない: Linuxのlooseは、受けたデバイスに
+  IPv4アドレスが一つも無いと落とす（全部のアドレスがTAPへ移るとTUNには無い）。confdはTUN、TAP、`all`を0にする。
+- NOARPのTAPでは、`nodad`を付けないIPv6アドレスもtentativeにならない（DADをしない）。`addrgenmode none`なら
+  link-localも自分では作らない。
+- TAPを通る経路: zebraはIS-IS、OSPFの経路をkernelにTAP向けのゲートウェイで入れ、FPMにはTAPの番号で渡す。
+  kernelがその経路で送るパケットはTAPから出てきて、FEがTUNのものと同じに転送する。ribdへは`ruster-frr`が
+  FEのインターフェースに戻して渡すので、OSPFv3とIS-ISのIPv6のlink-localの次の転送先も使える。
+- TAPのリンクの状態: TAPのcarrierはFEが開いている間だけup（TUNのドライバの振る舞い）。FEが止まればisisdと
+  ospfdはすぐ気づく。ポートのリンクの状態には合わせない: 今はポートの切断はhold time（IS-ISは既定30秒、
+  OSPFはRouterDeadInterval 40秒）で気づく。合わせるなら、FEがポートのリンクの状態を知ってから
+  `TUNSETCARRIER`でTAPに写す。
+- OSPFのbroadcastのリンクは、DRを選ぶまでRouterDeadInterval（40秒）待つ。netnsの`ospf`はそのため1分ほどかかる。
 
 ## 7. BGP EVPN（見送り）
 
