@@ -126,6 +126,18 @@
 //! listen = ["lan.10"]          # optional: the interfaces of the default VRF it
 //!                              # answers on; when left out, the inside of [nat] or
 //!                              # [map-e] (one of them, or listen, must be given)
+//!
+//! [[dhcp]]                     # optional: a DHCP server (Kea, through ruster-kea)
+//!                              # for one interface; one [[dhcp]] per interface
+//! interface = "lan"            # a port or VLAN of the default VRF with an ipv4
+//!                              # address, which is the relay's and gives the subnet
+//! pool = "192.0.2.100-192.0.2.199"  # the addresses it leases, in the subnet
+//! lease-time = 3600            # optional, in seconds; 3600 when left out
+//! router = ["192.0.2.1"]       # optional: the routers option; the interface's
+//!                              # address when left out
+//! dns = ["192.0.2.1"]          # optional: the DNS servers option; when left out,
+//!                              # the interface's address if [dns] listens on it,
+//!                              # else none
 //! ```
 //!
 //! # The lock form
@@ -211,6 +223,15 @@
 //! upstream = ["192.0.2.53"]    # empty: it resolves from the root itself
 //! upstream-from = []           # the sources whose DNS servers it uses too (a WAN
 //!                              # DHCP client, say); none can be given yet
+//!
+//! [[dhcp]]
+//! interface = "lan"
+//! mac = "02:00:00:00:00:01"    # the interface's: the source of the frames to clients
+//! address = "192.0.2.1/24"     # the interface's IPv4 address
+//! pool = "192.0.2.100-192.0.2.199"
+//! lease-time = 3600
+//! router = ["192.0.2.1"]
+//! dns = ["192.0.2.1"]
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
@@ -260,6 +281,8 @@ pub const NAT_PORTS: &str = "1024-32767";
 pub const FILTERING: &str = "endpoint-independent";
 /// MAP-E's PSID offset (RFC 7597 section 5.1).
 pub const PSID_OFFSET: u8 = 6;
+/// A DHCP lease's time, in seconds.
+pub const DHCP_LEASE_TIME: u32 = 3_600;
 /// The ICMP error rate limits: IPv4's interval, and ICMPv6's burst and interval.
 pub const ICMP_ERRORS: IcmpErrors = IcmpErrors {
     ipv4_interval_ms: 100,
@@ -284,6 +307,28 @@ pub struct Lock {
     pub firewall: Vec<FirewallRule>,
     /// None or one.
     pub dns: Vec<Dns>,
+    /// One per interface.
+    pub dhcp: Vec<Dhcp>,
+}
+
+/// The DHCP server for one interface: Kea, which `ruster-kea` configures and relays
+/// to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Dhcp {
+    pub interface: String,
+    /// The interface's MAC address.
+    pub mac: String,
+    /// The interface's IPv4 address and prefix length.
+    pub address: String,
+    /// The first and last address leased, as `first-last`.
+    pub pool: String,
+    /// In seconds.
+    pub lease_time: u32,
+    /// The routers option.
+    pub router: Vec<String>,
+    /// The DNS servers option.
+    pub dns: Vec<String>,
 }
 
 /// The DNS server for the LAN: Unbound, which `ruster-unbound` configures.
@@ -511,4 +556,28 @@ pub fn parse_dns_part(text: &str) -> Result<Option<Dns>, String> {
         Err(none) if none.is_empty() => Ok(None),
         Err(_) => Err("dns takes at most one value".into()),
     }
+}
+
+/// The part of the lock form that the DHCP process takes: the version and `dhcp`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DhcpPart {
+    version: u32,
+    dhcp: Vec<Dhcp>,
+}
+
+/// The DHCP process's part of the lock form as TOML text: `version = 1` and `dhcp`.
+pub fn dhcp_part(dhcp: &[Dhcp]) -> String {
+    let part = DhcpPart {
+        version: VERSION,
+        dhcp: dhcp.to_vec(),
+    };
+    toml::to_string(&part).expect("the lock form is plain TOML")
+}
+
+/// Reads the DHCP process's part of the lock form ([`dhcp_part`]).
+pub fn parse_dhcp_part(text: &str) -> Result<Vec<Dhcp>, String> {
+    check_version(text)?;
+    let part: DhcpPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    Ok(part.dhcp)
 }

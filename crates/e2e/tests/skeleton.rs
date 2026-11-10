@@ -72,6 +72,7 @@ fn config() -> Config {
         icmp_errors: None,
         nat: None,
         dns: None,
+        dhcp: Vec::new(),
     }
 }
 

@@ -38,6 +38,7 @@ fn the_documented_example_is_read() {
     assert_eq!(lock.firewall[0].destination_ports, ["53"]);
     assert_eq!(lock.dns[0].listen, ["192.0.2.1"]);
     assert!(lock.dns[0].upstream_from.is_empty());
+    assert_eq!(lock.dhcp[0].pool, "192.0.2.100-192.0.2.199");
 }
 
 #[test]
@@ -109,5 +110,20 @@ fn the_dns_part_reads_back_the_same() {
     assert!(
         ruster_config::parse_dns_part(&example()).is_err(),
         "only dns"
+    );
+}
+
+#[test]
+fn the_dhcp_part_reads_back_the_same() {
+    let lock = parse_lock(&example()).unwrap();
+    let text = ruster_config::dhcp_part(&lock.dhcp);
+    assert!(text.starts_with("version = 1\n"), "{text}");
+    assert_eq!(ruster_config::parse_dhcp_part(&text).unwrap(), lock.dhcp);
+    let none = ruster_config::dhcp_part(&[]);
+    assert!(ruster_config::parse_dhcp_part(&none).unwrap().is_empty());
+    assert!(ruster_config::parse_dhcp_part("version = 2\ndhcp = []\n").is_err());
+    assert!(
+        ruster_config::parse_dhcp_part(&example()).is_err(),
+        "only dhcp"
     );
 }
