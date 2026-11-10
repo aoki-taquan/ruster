@@ -15,7 +15,9 @@
 //! - RFC 1661 section 5.4: other options are rejected.
 //!
 //! Deviations: IPv6-Compression-Protocol (RFC 5072 section 4.2) is rejected and
-//! never asked for.
+//! never asked for. The identifiers are negotiated and reported, but no link-local
+//! address is formed from them (RFC 5072 section 5): IPv6 over the session is not
+//! used yet, so the session interface carries no IPv6 address.
 
 use crate::fsm::{Negotiation, Reply};
 use crate::ppp::{push_option, Opt};
