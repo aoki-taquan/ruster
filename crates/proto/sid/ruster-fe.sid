@@ -343,6 +343,72 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-punt:punt/class",
+        "sid": 60170,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/kind",
+        "sid": 60171,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/protocol",
+        "sid": 60172,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/first-port",
+        "sid": 60173,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/last-port",
+        "sid": 60174,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/interface",
+        "sid": 60175,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/control",
+        "sid": 60176,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/kernel",
+        "sid": 60177,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/drop",
+        "sid": 60178,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/rate",
+        "sid": 60179,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-punt:punt/class/burst",
+        "sid": 60180,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"
