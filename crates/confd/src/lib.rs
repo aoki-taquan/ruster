@@ -8,6 +8,7 @@
 //! | FE | interfaces, addresses, and the default VRF's firewall rules and NAT |
 //! | neighd | interfaces and addresses (to answer ARP and choose source addresses) |
 //! | ribd | static routes out of usable interfaces and the connected routes of the addresses, as source `confd` |
+//! | a process for a module (`ruster-unbound` for `dns`) | that module's part of the lock form, on `confd/part.sock` ([`part`]) |
 //!
 //! On every (re)connection confd sends everything between resync-begin and resync-end,
 //! so entries it no longer has are removed, and tells ribd `sync-done`. After that it
@@ -30,6 +31,7 @@ use ruster_proto::task::{Progress, Task};
 pub mod apply;
 pub mod file;
 pub mod kernel;
+pub mod part;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InterfaceConfig {
@@ -109,15 +111,18 @@ pub enum PeerKind {
     Fe,
     Ribd,
     Neighd,
+    /// The process that takes a module's part ([`part`]); it connects to confd.
+    Part(part::Module),
 }
 
 impl std::fmt::Display for PeerKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Self::Fe => "the FE",
-            Self::Ribd => "ribd",
-            Self::Neighd => "neighd",
-        })
+        match self {
+            Self::Fe => f.write_str("the FE"),
+            Self::Ribd => f.write_str("ribd"),
+            Self::Neighd => f.write_str("neighd"),
+            Self::Part(module) => write!(f, "the process for {module}"),
+        }
     }
 }
 
@@ -206,6 +211,7 @@ pub struct Confd {
     fe: Option<Peer>,
     ribd: Option<Peer>,
     neighd: Option<Peer>,
+    parts: part::Parts,
     counters: ConfdCounters,
     /// Counts [`Confd::set_config`] calls; each patch carries the one it came from.
     generation: u64,
@@ -229,6 +235,7 @@ impl Confd {
             fe: None,
             ribd: None,
             neighd: None,
+            parts: part::Parts::default(),
             counters: ConfdCounters::default(),
             generation: 0,
             last_refusal: None,
@@ -253,7 +260,13 @@ impl Confd {
         Ok(())
     }
 
-    /// The peers whose connection closed. Connecting again sends everything again.
+    /// Takes a connection on `confd/part.sock` ([`part`]).
+    pub fn attach_part(&mut self, stream: UnixStream) -> io::Result<()> {
+        self.parts.attach(stream)
+    }
+
+    /// The peers whose connection closed. Connecting again sends everything again;
+    /// a [`PeerKind::Part`] process connects again by itself.
     pub fn closed(&self) -> Vec<PeerKind> {
         [
             (PeerKind::Fe, &self.fe),
@@ -263,6 +276,7 @@ impl Confd {
         .into_iter()
         .filter(|(_, peer)| peer.as_ref().is_some_and(|peer| peer.client.is_closed()))
         .map(|(kind, _)| kind)
+        .chain(self.parts.closed().into_iter().map(PeerKind::Part))
         .collect()
     }
 
@@ -297,9 +311,11 @@ impl Confd {
             .all(|peer| {
                 peer.client.is_closed() || (peer.in_flight.is_empty() && peer.resync_end.is_none())
             })
+            && self.parts.settled()
     }
 
-    /// The processes that are not connected now.
+    /// The processes that are not connected now: of those that take a module's
+    /// part, the ones whose module is in the configuration.
     pub fn absent(&self) -> Vec<PeerKind> {
         [
             (PeerKind::Fe, &self.fe),
@@ -309,6 +325,12 @@ impl Confd {
         .into_iter()
         .filter(|(_, peer)| peer.as_ref().is_none_or(|peer| peer.client.is_closed()))
         .map(|(kind, _)| kind)
+        .chain(
+            part::Module::ALL
+                .into_iter()
+                .filter(|m| m.configured(&self.config) && !self.parts.connected(*m))
+                .map(PeerKind::Part),
+        )
         .collect()
     }
 
@@ -330,6 +352,7 @@ impl Confd {
                 send_diff(peer, desired, generation, counters);
             }
         }
+        self.parts.send(&self.config, generation);
     }
 
     fn full_send(
@@ -715,11 +738,25 @@ impl Task for Confd {
                 }
             }
         }
+        let (polled, refusals) = self.parts.step(&self.config, self.generation);
+        progress = progress.and(polled);
+        for (module, reason, generation) in refusals {
+            self.counters.patches_refused += 1;
+            let newer = self
+                .last_refusal
+                .as_ref()
+                .is_some_and(|(_, _, g)| *g > generation);
+            if !newer {
+                self.last_refusal = Some((PeerKind::Part(module), reason, generation));
+            }
+        }
         for kind in resend {
             let (desired, peer) = match kind {
                 PeerKind::Fe => (self.fe_tables(), &mut self.fe),
                 PeerKind::Ribd => (self.routes(), &mut self.ribd),
                 PeerKind::Neighd => (self.interface_tables(), &mut self.neighd),
+                // A part is put whole each time; nothing to send again.
+                PeerKind::Part(_) => continue,
             };
             if let Some(peer) = peer {
                 send_diff(peer, &desired, self.generation, &mut self.counters);

@@ -93,3 +93,21 @@ fn another_version_is_refused() {
     let error = parse_lock(&text.replacen("version = 1\n", "", 1)).unwrap_err();
     assert!(error.contains("version is missing"), "{error}");
 }
+
+#[test]
+fn the_dns_part_reads_back_the_same() {
+    let lock = parse_lock(&example()).unwrap();
+    let text = ruster_config::dns_part(lock.dns.first());
+    assert!(text.starts_with("version = 1\n"), "{text}");
+    assert_eq!(
+        ruster_config::parse_dns_part(&text).unwrap().as_ref(),
+        lock.dns.first()
+    );
+    let none = ruster_config::dns_part(None);
+    assert_eq!(ruster_config::parse_dns_part(&none).unwrap(), None);
+    assert!(ruster_config::parse_dns_part("version = 2\ndns = []\n").is_err());
+    assert!(
+        ruster_config::parse_dns_part(&example()).is_err(),
+        "only dns"
+    );
+}

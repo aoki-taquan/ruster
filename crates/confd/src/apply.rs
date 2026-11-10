@@ -3,7 +3,8 @@
 //!
 //! A request is POST `config` with the file's text as its payload, framed like the other
 //! sockets. confd reads the text as it reads its file at start-up, sends what changed to
-//! the FE, ribd and neighd, and answers once each of them has answered:
+//! the FE, ribd and neighd, and the parts that changed to the processes that take them
+//! ([`crate::part`]), and answers once each of them has answered:
 //!
 //! | Answer | Meaning |
 //! |---|---|

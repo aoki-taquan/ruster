@@ -40,6 +40,9 @@ FEの表（CORECONF）: confd、ribd、neighdだけが書く。どれもFEと直
 - 全体の設定の型はYANGで決める。標準のモジュール（`ietf-interfaces`、`ietf-ip`、`ietf-routing`、
   `ietf-nat`、`ietf-dhcp`など）を土台に、足りない部分を`ruster-*`のモジュールで足す。
 - 各プロセスは、confdから自分の担当のモジュールだけを受け取る。担当の外の部分は受け取らない。
+  受け取り口は`/run/ruster/confd/part.sock`。プロセスがつないで担当のモジュールの名前（`dns`など）を
+  POSTで送ると、confdはそのモジュールの部分をlockの形のTOMLでPUTし、変わるたびにPUTし直す。
+  プロセスは受け入れたか断ったかをPUTへの応答で返す（`crates/confd/src/part.rs`）。
 
 ### `ruster.toml`と`ruster.lock`
 
@@ -76,6 +79,8 @@ confd → 各プロセス: 確定
 各プロセス: 反映する
 ```
 
+- 今は候補と確定を分けていない。confdは新しい版を全員へ送り、どれか一つが断ったら全員へ一つ前の版を
+  送り直す（`ruster apply`）。候補、差分、確定の形にするのは後で行う。
 - どれか一つでも検証に失敗したら、どのプロセスにも確定を送らない。
 - 確定の後に一つが反映に失敗したら、confdが全員へ一つ前の版を新しい版として送り直す。
 - 版はconfdがファイルに残し、番号で戻せる。「N分以内に確認しなければ戻す」の時刻もconfdが持つ。

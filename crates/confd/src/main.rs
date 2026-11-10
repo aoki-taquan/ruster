@@ -1,7 +1,8 @@
 //! `ruster-confd [--run-dir DIR] [--kernel] FILE`: reads the configuration file and
 //! sends it to the FE, ribd (as route source `confd`) and neighd. With `--kernel` it
 //! also sets up the kernel side of traffic to the router ([`ruster_confd::kernel`]).
-//! `ruster apply` gives it a new file later ([`ruster_confd::apply`]).
+//! `ruster apply` gives it a new file later ([`ruster_confd::apply`]), and processes
+//! such as `ruster-unbound` take their part of it ([`ruster_confd::part`]).
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -41,6 +42,8 @@ fn run() -> Result<(), String> {
     prepare(&config);
     let listener = daemon::listen(&run_dir.join(socket::CONFD_CONFIG))
         .map_err(|error| format!("{}: {error}", socket::CONFD_CONFIG))?;
+    let parts = daemon::listen(&run_dir.join(socket::CONFD_PART))
+        .map_err(|error| format!("{}: {error}", socket::CONFD_PART))?;
     let mut apply = Apply::new();
     let mut confd = Confd::new(config);
     let connect = |name: &str| {
@@ -70,6 +73,8 @@ fn run() -> Result<(), String> {
         if !closed.is_empty() && retry.due(now) {
             for kind in closed {
                 let name = match kind {
+                    // It connects to confd again by itself.
+                    PeerKind::Part(_) => continue,
                     PeerKind::Fe => socket::FE_CONFIG.to_owned(),
                     PeerKind::Ribd => socket::ribd_source("confd"),
                     PeerKind::Neighd => socket::NEIGHD_CONFIG.to_owned(),
@@ -82,11 +87,17 @@ fn run() -> Result<(), String> {
                     PeerKind::Fe => confd.connect_fe(stream),
                     PeerKind::Ribd => confd.connect_ribd(stream),
                     PeerKind::Neighd => confd.connect_neighd(stream),
+                    PeerKind::Part(_) => continue,
                 };
                 match connected {
                     Ok(()) => eprintln!("ruster-confd: connected to {name} again"),
                     Err(error) => eprintln!("ruster-confd: connecting to {name}: {error}"),
                 }
+            }
+        }
+        for stream in daemon::accept(&parts) {
+            if let Err(error) = confd.attach_part(stream) {
+                eprintln!("ruster-confd: {}: {error}", socket::CONFD_PART);
             }
         }
         for stream in daemon::accept(&listener) {
