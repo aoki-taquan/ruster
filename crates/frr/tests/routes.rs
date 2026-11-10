@@ -131,7 +131,8 @@ fn next_hops_take_the_interface_of_the_longest_prefix() {
         routes.take(&route(true, "198.51.100.0", 24, Kind::Unicast, &[""])),
         None
     );
-    assert_eq!(routes.len(), 3);
+    // The one with a link-local next hop is held, for when its TAP is known.
+    assert_eq!(routes.len(), 4);
 }
 
 #[test]
@@ -292,5 +293,65 @@ fn new_prefixes_change_only_the_routes_they_move() {
             key("10.0.0.0", 8),
             forward(&[("wan", "198.51.100.10")])
         )]
+    );
+}
+
+#[test]
+fn next_hops_through_a_tap_are_on_its_interface_link_local_ones_too() {
+    let mut routes = Routes::new();
+    routes.set_connected(&connected());
+    let through = |gateway: &str, oif: u32| Hop {
+        gateway: Some(ip(gateway)),
+        oif: Some(oif),
+    };
+    let mut learned = route(true, "2001:db8:9::", 48, Kind::Unicast, &[]);
+    learned.hops = vec![through("fe80::2", 7)];
+    // Before the TAP's index is known the link-local next hop is not usable.
+    assert_eq!(routes.take(&learned), None);
+    let mut taps = std::collections::BTreeMap::new();
+    taps.insert(7, "p1".to_owned());
+    taps.insert(8, "p2".to_owned());
+    assert_eq!(
+        routes.set_taps(taps.clone()),
+        [Change::set(
+            key("2001:db8:9::", 48),
+            forward(&[("p1", "fe80::2")])
+        )]
+    );
+    assert!(routes.set_taps(taps).is_empty(), "nothing changed");
+    // Two next hops, one through each TAP, and a gateway not on any prefix:
+    // the TAP gives the interface whatever the prefixes say.
+    let mut ecmp = route(true, "10.0.0.0", 8, Kind::Unicast, &[]);
+    ecmp.hops = vec![through("10.9.0.2", 7), through("fe80::3", 8)];
+    assert_eq!(
+        routes.take(&ecmp),
+        Some(Change::set(
+            key("10.0.0.0", 8),
+            forward(&[("p1", "10.9.0.2"), ("p2", "fe80::3")])
+        ))
+    );
+    // A next hop through the TUN on no prefix: ribd resolves the gateways, and a
+    // link-local one is not among them.
+    let mut mixed = route(true, "10.1.0.0", 16, Kind::Unicast, &[]);
+    mixed.hops = vec![through("fe80::3", 8), through("10.9.9.9", 3)];
+    assert_eq!(
+        routes.take(&mixed),
+        Some(Change::set(
+            key("10.1.0.0", 16),
+            Value::Route(RouteAction::Gateways(vec![ip("10.9.9.9")]))
+        ))
+    );
+    // The TAP goes: back to what the prefixes say.
+    let changes = routes.set_taps(std::collections::BTreeMap::new());
+    assert!(
+        changes.contains(&Change::delete(key("2001:db8:9::", 48))),
+        "{changes:?}"
+    );
+    assert!(
+        changes.contains(&Change::set(
+            key("10.0.0.0", 8),
+            Value::Route(RouteAction::Gateways(vec![ip("10.9.0.2")]))
+        )),
+        "{changes:?}"
     );
 }

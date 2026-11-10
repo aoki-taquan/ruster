@@ -27,6 +27,8 @@ use ruster_proto::writer::Writer;
 
 /// How long to wait for confd at start-up.
 const CONFD_WAIT: Duration = Duration::from_secs(10);
+/// How often the TAP devices' indexes are read again.
+const TAP_CHECK_MS: u64 = 1_000;
 /// The route source's name at ribd.
 const SOURCE: &str = "frr";
 
@@ -82,6 +84,7 @@ fn run() -> Result<(), String> {
     let mut idle = daemon::Idle::new();
     let mut written = false;
     let mut announced = false;
+    let mut taps_read_at: Option<u64> = None;
     loop {
         let now = clock.now_ms();
         if client.is_closed() && retry.due(now) {
@@ -117,8 +120,18 @@ fn run() -> Result<(), String> {
                 }
             }
         })?;
+        // Next hops through a TAP device are on the FE interface it stands for.
+        if taps_read_at.is_none_or(|at| now.saturating_sub(at) >= TAP_CHECK_MS) {
+            taps_read_at = Some(now);
+            changes.extend(fpm.set_taps(ruster_frr::routes::tap_indexes()));
+        }
         let (more, busy, wake) = fpm.step(now);
         changes.extend(more);
+        let tap_wake = taps_read_at.map(|at| at.saturating_add(TAP_CHECK_MS));
+        let wake = match (wake, tap_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         ribd.set(changes);
         progress = progress.and(Progress {
             busy,

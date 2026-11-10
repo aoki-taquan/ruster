@@ -13,5 +13,6 @@
 
 pub mod conf;
 pub mod fpm;
+pub mod isis_ospf;
 pub mod routes;
 pub mod server;
