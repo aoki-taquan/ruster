@@ -97,32 +97,33 @@ fn next_hops_take_the_interface_of_the_longest_prefix() {
             forward(&[("wan", "2001:db8:100::10")])
         ))
     );
-    // A next hop on no interface, a link-local one and none at all are left out.
+    // A link-local next hop and none at all are left out.
     let left_out = routes.take(&route(
         true,
         "2001:db8:204::",
         48,
         Kind::Unicast,
-        &["fe80::1", "2001:db8:9::1", ""],
+        &["fe80::1", ""],
     ));
-    assert_eq!(
-        left_out,
-        Some(Change::delete(key("2001:db8:204::", 48))),
-        "held, but nothing for ribd"
-    );
-    assert_eq!(routes.hops_left_out, 1 + 2, "no gateway, then the two");
-    let partly = routes.take(&route(
+    assert_eq!(left_out, None, "nothing for ribd");
+    assert_eq!(routes.hops_left_out, 2);
+    // A gateway on no interface (a neighbor more than one hop away): ribd gets
+    // every gateway of the route, without interfaces, and resolves them.
+    let multihop = routes.take(&route(
         true,
         "10.0.0.0",
         8,
         Kind::Unicast,
-        &["10.9.9.9", "192.0.2.254"],
+        &["10.9.9.9", "fe80::1", "192.0.2.254"],
     ));
     assert_eq!(
-        partly,
+        multihop,
         Some(Change::set(
             key("10.0.0.0", 8),
-            forward(&[("lan", "192.0.2.254")])
+            Value::Route(RouteAction::Gateways(vec![
+                ip("10.9.9.9"),
+                ip("192.0.2.254")
+            ]))
         ))
     );
     // A connected route (no gateway) is not ribd's from here.
@@ -130,7 +131,7 @@ fn next_hops_take_the_interface_of_the_longest_prefix() {
         routes.take(&route(true, "198.51.100.0", 24, Kind::Unicast, &[""])),
         None
     );
-    assert_eq!(routes.len(), 4);
+    assert_eq!(routes.len(), 3);
 }
 
 #[test]
@@ -203,9 +204,12 @@ fn new_prefixes_remap_the_next_hops() {
     );
     assert_eq!(
         routes.set_connected(&[]),
-        [Change::delete(key("203.0.113.0", 24))]
+        [Change::set(
+            key("203.0.113.0", 24),
+            Value::Route(RouteAction::Gateways(vec![ip("198.51.100.10")]))
+        )],
+        "left to ribd to resolve"
     );
-    assert_eq!(routes.len(), 1, "still held: back when the prefix is");
 }
 
 #[test]
@@ -276,7 +280,10 @@ fn new_prefixes_change_only_the_routes_they_move() {
     fewer.retain(|c| c.interface != "wan");
     assert_eq!(
         routes.set_connected(&fewer),
-        [Change::delete(key("10.0.0.0", 8))]
+        [Change::set(
+            key("10.0.0.0", 8),
+            Value::Route(RouteAction::Gateways(vec![ip("198.51.100.10")]))
+        )]
     );
     assert!(routes.set_connected(&fewer).is_empty());
     assert_eq!(

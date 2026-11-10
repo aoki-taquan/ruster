@@ -2,14 +2,15 @@
 //!
 //! zebra runs in the router's kernel namespace, where every interface of the FE is
 //! one TUN device per VRF with the router's addresses. So a next hop from zebra is a
-//! gateway address and the TUN's index, and the FE's interface is not in it. It is
-//! found here from the gateway: the interface whose prefix (from confd's `frr` part,
-//! [`ruster_config::Connected`]) holds the gateway, the longest such prefix. The
-//! next hop goes to ribd as that interface and the gateway. ribd does not resolve
-//! next hops further, so a gateway on none of the interfaces' prefixes (a BGP next
-//! hop that zebra resolved through the kernel's default route), a link-local one, or
-//! none at all (a connected route, which confd gives ribd itself) leaves the next hop
-//! out, and a route with no next hop left is not given to ribd.
+//! gateway address and the TUN's index, and the FE's interface is not in it. When
+//! every gateway of a route is on an interface's prefix (from confd's `frr` part,
+//! [`ruster_config::Connected`]), the next hops go to ribd as the interface of the
+//! longest such prefix and the gateway. Otherwise (a BGP neighbor more than one hop
+//! away, whose next hop zebra resolved through the kernel's default route) the
+//! route goes to ribd with its gateways only, and ribd resolves them through its
+//! own routes (`ruster_ribd::resolve`). A link-local gateway, which says nothing of
+//! its link, or none at all (a connected route, which confd gives ribd itself) is
+//! left out, and a route with no next hop left is not given to ribd.
 //!
 //! Only the main table (the default VRF) is read. A blackhole route is a discard
 //! route, an unreachable or prohibit route a reject route; other route types are
@@ -29,7 +30,7 @@
 //! - RFC 8349 (`ietf-routing`): a route has next hops with an outgoing interface and
 //!   an address, or is a blackhole (discard) or unreachable (reject) route.
 //!
-//! Deviations: no recursive next hops (see above); only the default VRF; a prohibit
+//! Deviations: only the default VRF; a prohibit
 //! route rejects with the same Destination Unreachable as an unreachable one.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -63,7 +64,7 @@ pub struct Routes {
     stale: BTreeSet<(IpAddr, u8)>,
     /// Routes not taken: another table or type, or past [`ROUTES_MAX`].
     pub passed_over: u64,
-    /// Next hops left out: no gateway, or one on none of the interfaces.
+    /// Next hops left out: no gateway, or a link-local one.
     pub hops_left_out: u64,
 }
 
@@ -117,13 +118,6 @@ impl Routes {
 
     /// The interface whose prefix holds `gateway`.
     fn interface(&self, gateway: IpAddr) -> Option<&str> {
-        let link_local = match gateway {
-            IpAddr::V6(a) => a.is_unicast_link_local(),
-            IpAddr::V4(_) => false,
-        };
-        if link_local {
-            return None;
-        }
         self.connected
             .iter()
             .find(|(n, len, _)| n.is_ipv4() == gateway.is_ipv4() && network(gateway, *len) == *n)
@@ -137,16 +131,19 @@ impl Routes {
             Some(Held::Discard) => Some(RouteAction::Discard),
             Some(Held::Reject) => Some(RouteAction::Reject),
             Some(Held::Forward(gateways)) => {
-                let mut hops: Vec<NextHop> = Vec::new();
-                for &gateway in gateways {
-                    if let Some(interface) = self.interface(gateway) {
-                        hops.push(NextHop {
-                            interface: interface.to_owned(),
+                let hops: Option<Vec<NextHop>> = gateways
+                    .iter()
+                    .map(|&gateway| {
+                        Some(NextHop {
+                            interface: self.interface(gateway)?.to_owned(),
                             address: Some(gateway),
-                        });
-                    }
-                }
-                (!hops.is_empty()).then_some(RouteAction::Forward(hops))
+                        })
+                    })
+                    .collect();
+                Some(match hops {
+                    Some(hops) => RouteAction::Forward(hops),
+                    None => RouteAction::Gateways(gateways.clone()),
+                })
             }
         };
         match action {
@@ -189,12 +186,10 @@ impl Routes {
                 for hop in &route.hops {
                     match hop.gateway {
                         Some(g) if gateways.contains(&g) => {}
-                        Some(g) if self.interface(g).is_some() => gateways.push(g),
-                        // Kept, in case an interface's prefix comes to hold it.
-                        Some(g) => {
+                        Some(IpAddr::V6(g)) if g.is_unicast_link_local() => {
                             self.hops_left_out += 1;
-                            gateways.push(g);
                         }
+                        Some(g) => gateways.push(g),
                         None => self.hops_left_out += 1,
                     }
                 }
