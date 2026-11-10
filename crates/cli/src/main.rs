@@ -3,6 +3,7 @@
 //! ```text
 //! ruster check FILE                       check a configuration file as confd reads it
 //! ruster resolve FILE                     print a ruster.toml in the lock form
+//! ruster [--run-dir DIR] diff FILE        show what applying it would change
 //! ruster [--run-dir DIR] apply FILE       check it, then make it confd's configuration
 //! ruster [--run-dir DIR] versions         list the versions confd keeps, newest first
 //! ruster [--run-dir DIR] rollback N       make version N the configuration again
@@ -18,6 +19,9 @@
 //! as the next version ([`ruster_confd::versions`]). `rollback N` goes the same way
 //! with version N's configuration, which becomes a new version: the versions between
 //! stay.
+//!
+//! `diff` sends the file to confd, which reads it as for `apply` but sends it to no
+//! one, and prints what would change ([`ruster_confd::diff`]).
 //!
 //! `route` writes to ribd as the route source NAME, the way a routing daemon does
 //! (ribd must have been started with that source). ribd picks between sources by
@@ -38,7 +42,7 @@ use ruster_proto::coap::Code;
 use ruster_proto::daemon::{self, socket};
 use ruster_proto::session::{decode_changes, Client, Event};
 use ruster_proto::table::{
-    format_mac, network, Change, Key, NextHop, RouteAction, Value, DEFAULT_VRF,
+    entry_line, network, Change, Key, NextHop, RouteAction, Value, DEFAULT_VRF,
 };
 
 const WAIT: Duration = Duration::from_secs(5);
@@ -46,6 +50,7 @@ const WAIT: Duration = Duration::from_secs(5);
 const USAGE: &str = "usage:
   ruster check FILE
   ruster resolve FILE
+  ruster [--run-dir DIR] diff FILE
   ruster [--run-dir DIR] apply FILE
   ruster [--run-dir DIR] versions
   ruster [--run-dir DIR] rollback N
@@ -103,69 +108,13 @@ fn requests(
     Err(format!("{}: no answer", path.display()))
 }
 
-/// One table entry as a line of text.
+/// One table entry as a line of text; empty for a deletion or a table not shown.
 fn line(change: &Change) -> String {
-    let Some(value) = &change.value else {
-        return String::new();
-    };
-    match (&change.key, value) {
-        (
-            Key::Interface { name },
-            Value::Interface {
-                enabled,
-                mac,
-                mtu,
-                vrf,
-                vlan,
-                tunnel,
-                pppoe,
-            },
-        ) => format!(
-            "interface {name} {} mac {} mtu {mtu} vrf {vrf}{}{}{}",
-            if *enabled { "up" } else { "down" },
-            format_mac(mac),
-            vlan.as_ref()
-                .map(|v| format!(" vlan {} on {}", v.id, v.parent))
-                .unwrap_or_default(),
-            tunnel
-                .as_ref()
-                .map(|t| format!(" tunnel {} to {}", t.local, t.remote))
-                .unwrap_or_default(),
-            pppoe
-                .as_ref()
-                .map(|p| format!(
-                    " pppoe session {} on {} to {}",
-                    p.session,
-                    p.parent,
-                    format_mac(&p.peer)
-                ))
-                .unwrap_or_default()
-        ),
-        (Key::Address { interface, address }, Value::Address { prefix_len }) => {
-            format!("address {interface} {address}/{prefix_len}")
-        }
-        (Key::Route { vrf, prefix, len }, Value::Route(action)) => {
-            let action = match action {
-                RouteAction::Forward(hops) => hops
-                    .iter()
-                    .map(|hop| match hop.address {
-                        Some(via) => format!("via {via} dev {}", hop.interface),
-                        None => format!("dev {}", hop.interface),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                RouteAction::Local => "local".into(),
-                RouteAction::Discard => "discard".into(),
-                RouteAction::Reject => "reject".into(),
-                RouteAction::LookupVrf(other) => format!("lookup-vrf {other}"),
-            };
-            format!("route {vrf} {prefix}/{len} {action}")
-        }
-        (Key::Neighbor { interface, address }, Value::Neighbor { mac }) => {
-            format!("neighbor {interface} {address} {}", format_mac(mac))
-        }
-        _ => String::new(),
-    }
+    change
+        .value
+        .as_ref()
+        .and_then(|value| entry_line(&change.key, value))
+        .unwrap_or_default()
 }
 
 fn show(run_dir: &Path) -> Result<(), String> {
@@ -400,12 +349,27 @@ fn versions(run_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Prints what applying the file would change, without applying it.
+fn diff(run_dir: &Path, path: &str) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    ruster_confd::file::parse(&text).map_err(|e| format!("{path}: {e}"))?;
+    let socket = run_dir.join(socket::CONFD_CONFIG);
+    let (code, payload) = request(&socket, |c| Ok(c.post(&["diff"], text.as_bytes())))?;
+    let said = String::from_utf8_lossy(&payload);
+    if code != Code::CONTENT {
+        return Err(format!("{path}: confd answered {code:?} {said}"));
+    }
+    print!("{said}");
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let (run_dir, rest) = daemon::run_dir_and_rest(std::env::args().skip(1))?;
     match rest.split_first() {
         Some((command, args)) => match (command.as_str(), args) {
             ("check", [file]) => check(file),
             ("resolve", [file]) => resolve(file),
+            ("diff", [file]) => diff(&run_dir, file),
             ("apply", [file]) => apply(&run_dir, file),
             ("versions", []) => versions(&run_dir),
             ("rollback", [number]) => rollback(&run_dir, number),

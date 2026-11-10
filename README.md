@@ -124,6 +124,7 @@ kernelに渡したフレームが戻るのを最大1秒待ってから止まり�
 ```bash
 ruster check router.toml                     # confdと同じ読み方で設定ファイルを確かめる
 ruster resolve router.toml                   # 既定値を全部埋めた形（lockの形）を表示する
+ruster diff router.toml                      # 反映せずに、何が変わるかを表示する
 ruster apply router.toml                     # 確かめてから、動いているconfdの設定を置き換える
 ruster versions                              # confdが残した版の一覧（新しい順）
 ruster rollback 3                            # 版3の設定を、新しい版として使い直す
