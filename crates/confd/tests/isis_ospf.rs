@@ -30,6 +30,10 @@ ipv4 = "10.4.0.1/24"
 vrf = "red"
 
 [[interface]]
+name = "a b"
+mac = "02:00:00:00:00:06"
+
+[[interface]]
 name = "verylongname1"
 mac = "02:00:00:00:00:05"
 ipv4 = "10.5.0.1/24"
@@ -72,6 +76,7 @@ fn isis_and_ospf_are_checked() {
         (isis("49.0001.1921.6800.1001.00", "red"), "default VRF"),
         (isis("49.0001.1921.6800.1001.00", "p2"), "bridge member"),
         (isis("49.0001.1921.6800.1001.00", "verylongname1"), "at most 12"),
+        (isis("49.0001.1921.6800.1001.00", "a b"), "without spaces"),
         (
             with("[isis]\nnet = \"49.0001.1921.6800.1001.00\"\nlevel = \"level-3\"\n"),
             "level",

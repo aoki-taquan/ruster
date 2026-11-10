@@ -6,9 +6,10 @@
 //! # Standards
 //!
 //! - ISO 10589 section 7.1.1 and RFC 1195: a Network Entity Title is an area address
-//!   of 1 to 13 octets, a 6-octet system ID and the NSEL 00, written as FRR does
-//!   (`49.0001.1921.6800.1001.00`: the first octet, then groups of two).
-//! - RFC 5305 section 3.7: a wide metric is 24 bits; 2^24 - 1 takes the link out of
+//!   of 1 to 13 octets, a 6-octet system ID and the NSEL 00, written in hex as FRR
+//!   reads it (`49.0001.1921.6800.1001.00`: the system ID and NSEL in the last four
+//!   groups, the area in groups of one or two octets before them).
+//! - RFC 5305 section 3: a wide metric is 24 bits; 2^24 - 1 takes the link out of
 //!   SPF, so it is not taken.
 //! - RFC 2328 appendix C.3: an interface's cost is 1 to 65535. Section 1.2 and
 //!   appendix C.3: an area ID and the router ID are 32-bit numbers written as IPv4
@@ -16,9 +17,11 @@
 //!   the same for OSPFv3.
 //!
 //! Deviations: only the default VRF; only the network types broadcast and
-//! point-to-point. An interface whose address a source finds (DHCP, PPPoE), a
-//! tunnel and a bridge member are not taken: IS-IS and OSPF run on ports, VLANs and
-//! bridges' own interfaces, whose TAP stands for them.
+//! point-to-point; at most 32 interfaces for each. An interface whose address a
+//! source finds (DHCP, PPPoE), a tunnel and a bridge member are not taken: IS-IS
+//! and OSPF run on ports, VLANs and bridges' own interfaces with configured
+//! addresses, whose TAP stands for them and holds the same addresses. An interface
+//! cost of 10 when none is given, not FRR's from the link's bandwidth.
 
 use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
@@ -132,6 +135,12 @@ fn check_interfaces(
             .iter()
             .find(|i| i.name == name)
             .ok_or_else(|| format!("{at}: no such interface"))?;
+        // The TAP device's name, and a word in FRR's configuration.
+        if !name.bytes().all(|b| b.is_ascii_graphic() && b != b'/') {
+            return Err(format!(
+                "{at}: the name must be printable ASCII without spaces or /"
+            ));
+        }
         if name.len() > NAME_MAX {
             return Err(format!(
                 "{at}: the name must be at most {NAME_MAX} characters, so that its TAP \
@@ -145,34 +154,38 @@ fn check_interfaces(
         if interface.tunnel.is_some() || interface.pppoe.is_some() {
             return Err(format!("{at}: only a port, a VLAN or a bridge"));
         }
+        if interface.address_from_source() {
+            return Err(format!(
+                "{at}: its address comes from a source; give one in the configuration"
+            ));
+        }
         if bridges.iter().any(|b| b.members.iter().any(|m| m == name)) {
             return Err(format!(
                 "{at}: it is a bridge member; give the bridge instead"
             ));
         }
-        if ipv4 && (interface.ipv4.is_none() || interface.ipv4_from.is_some()) {
+        if ipv4 && interface.ipv4.is_none() {
             return Err(format!("{at}: OSPFv2 needs an ipv4 address on it"));
         }
     }
     Ok(())
 }
 
-/// Whether `net` is a Network Entity Title as FRR writes it: two hex digits (the
-/// first octet of the area), groups of four, and `00`, with a 6-octet system ID and
-/// an area of 1 to 13 octets.
+/// Whether `net` is a Network Entity Title in hex groups as FRR reads it: the
+/// area in groups of one or two octets (1 to 13 octets), then the system ID in three
+/// groups of two octets and `00`.
 fn is_net(net: &str) -> bool {
     let groups: Vec<&str> = net.split('.').collect();
-    let hex = |g: &str| g.bytes().all(|b| b.is_ascii_hexdigit());
-    let [first, middle @ .., last] = groups.as_slice() else {
+    let hex = |g: &str| !g.is_empty() && g.bytes().all(|b| b.is_ascii_hexdigit());
+    let [area @ .., a, b, c, nsel] = groups.as_slice() else {
         return false;
     };
-    // The area's first octet, its other octets in pairs, the system ID's three
-    // pairs; at most 13 octets of area: 1 + 2 * 6.
-    first.len() == 2
-        && hex(first)
-        && *last == "00"
-        && (3..=9).contains(&middle.len())
-        && middle.iter().all(|g| g.len() == 4 && hex(g))
+    let area_octets: usize = area.iter().map(|g| g.len() / 2).sum();
+    *nsel == "00"
+        && [a, b, c].iter().all(|g| g.len() == 4 && hex(g))
+        && !area.is_empty()
+        && area.iter().all(|g| matches!(g.len(), 2 | 4) && hex(g))
+        && (1..=13).contains(&area_octets)
 }
 
 #[cfg(test)]
@@ -183,6 +196,9 @@ mod tests {
     fn nets_are_read_as_frr_writes_them() {
         assert!(is_net("49.0001.1921.6800.1001.00"));
         assert!(is_net("49.1921.6800.1001.00"), "a one-octet area");
+        assert!(is_net("49.01.1921.6800.1001.00"), "two octets");
+        assert!(is_net("4901.1921.6800.1001.00"), "two octets in one group");
+        assert!(!is_net("49.0.1921.6800.1001.00"));
         assert!(is_net("49.0001.0002.0003.0004.0005.0006.1921.6800.1001.00"));
         assert!(!is_net(
             "49.0001.0002.0003.0004.0005.0006.0007.1921.6800.1001.00"
