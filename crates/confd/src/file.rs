@@ -775,7 +775,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         .dns
         .into_iter()
         .next()
-        .map(|entry| dns(entry, &seen))
+        .map(|entry| dns(entry, &seen, &sources))
         .transpose()?;
     // Each is a punt class of the FE, which holds 64 besides its own.
     if lock.dhcp.len() > DHCP_MAX {
@@ -847,6 +847,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         dhcp_client,
         map_e_from,
         bgp,
+        dns_found: Vec::new(),
     })
 }
 
@@ -958,7 +959,11 @@ fn dhcp_entry(
 }
 
 /// Checks `dns`: it answers on the router's own addresses in the default VRF.
-fn dns(entry: ruster_config::Dns, seen: &Seen) -> Result<ruster_config::Dns, String> {
+fn dns(
+    entry: ruster_config::Dns,
+    seen: &Seen,
+    sources: &[crate::source::Spec],
+) -> Result<ruster_config::Dns, String> {
     let at = "dns";
     if entry.listen.is_empty() {
         return Err(format!("{at}: listen needs at least one address"));
@@ -992,8 +997,14 @@ fn dns(entry: ruster_config::Dns, seen: &Seen) -> Result<ruster_config::Dns, Str
             return Err(format!("{at}: upstream {text:?} must be a unicast address"));
         }
     }
-    if !entry.upstream_from.is_empty() {
-        return Err(format!("{at}: upstream-from cannot name a source yet"));
+    // Every kind of source may send DNS servers.
+    for (index, name) in entry.upstream_from.iter().enumerate() {
+        if !sources.iter().any(|s| s.name == *name) {
+            return Err(format!("{at}: upstream-from {name:?} is not a source"));
+        }
+        if entry.upstream_from[..index].contains(name) {
+            return Err(format!("{at}: upstream-from {name:?} is given twice"));
+        }
     }
     Ok(entry)
 }

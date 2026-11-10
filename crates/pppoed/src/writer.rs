@@ -18,7 +18,7 @@
 
 use std::net::Ipv4Addr;
 
-use ruster_proto::table::{Change, Key, NextHop, RouteAction, Value};
+use ruster_proto::table::{Change, Key, NextHop, RouteAction, Value, SOURCE_DNS_MAX};
 pub use ruster_proto::writer::Writer;
 
 use crate::session::SessionUp;
@@ -36,8 +36,15 @@ pub fn source_values(source: &str, up: Option<&SessionUp>) -> Vec<Change> {
     let address = Key::SourceIpv4 {
         source: source.to_owned(),
     };
+    let dns = Key::SourceDns {
+        source: source.to_owned(),
+    };
     let Some(up) = up else {
-        return vec![Change::delete(session), Change::delete(address)];
+        return vec![
+            Change::delete(session),
+            Change::delete(address),
+            Change::delete(dns),
+        ];
     };
     let mut out = vec![Change::set(
         session,
@@ -58,6 +65,26 @@ pub fn source_values(source: &str, up: Option<&SessionUp>) -> Vec<Change> {
             },
         ),
         None => Change::delete(address),
+    });
+    // RFC 1877: the DNS servers IPCP gave, those confd takes (unicast), once each.
+    let mut servers: Vec<std::net::IpAddr> = Vec::new();
+    for server in &up.dns {
+        let first = server.octets()[0];
+        let unicast = first != 0 && first != 127 && first < 224;
+        if unicast && !servers.contains(&(*server).into()) && servers.len() < SOURCE_DNS_MAX {
+            servers.push((*server).into());
+        }
+    }
+    out.push(if servers.is_empty() {
+        Change::delete(dns)
+    } else {
+        Change::set(
+            dns,
+            Value::SourceDns {
+                servers,
+                lifetime: LIFETIME,
+            },
+        )
     });
     out
 }

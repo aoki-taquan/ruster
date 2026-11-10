@@ -1087,7 +1087,7 @@ fn the_dns_section_is_kept_and_checked() {
         (
             "upstream-from = []",
             "upstream-from = [\"dhcp-wan\"]",
-            "cannot name a source yet",
+            "is not a source",
         ),
     ] {
         assert!(lock.contains(from), "{lock}");

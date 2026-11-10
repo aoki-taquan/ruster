@@ -134,3 +134,38 @@ fn after_a_start_the_command_runs_for_the_file_it_finds() {
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "x\n");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn the_servers_found_are_forwarded_to_after_those_given() {
+    let found: Vec<std::net::IpAddr> = vec![
+        "198.51.100.53".parse().unwrap(),
+        "192.0.2.53".parse().unwrap(),
+        "2001:db8::53".parse().unwrap(),
+    ];
+    let part = ruster_config::dns_part_with(Some(&dns()), &found);
+    let (parsed, back) = ruster_config::parse_dns_part_with(&part).unwrap();
+    assert_eq!(back, found);
+    let text = ruster_unbound::settings_with(parsed.as_ref(), &back).unwrap();
+    let forwards: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("forward-addr"))
+        .collect();
+    assert_eq!(forwards.len(), 3, "{text}");
+    // The one given first, and the one found twice once.
+    assert!(forwards[0].ends_with("198.51.100.53") && forwards[1].ends_with("192.0.2.53"));
+    // With no servers given, those found are used.
+    let own = Dns {
+        upstream: Vec::new(),
+        ..dns()
+    };
+    assert!(ruster_unbound::settings_with(Some(&own), &found[..1])
+        .unwrap()
+        .contains("forward-zone:\n    name: \".\"\n    forward-addr: 198.51.100.53\n"));
+    // The part without servers found reads as before.
+    assert_eq!(
+        ruster_config::parse_dns_part_with(&dns_part(Some(&dns())))
+            .unwrap()
+            .1,
+        Vec::<std::net::IpAddr>::new()
+    );
+}

@@ -25,7 +25,7 @@
 //!
 //! | Module | Process | Part |
 //! |---|---|---|
-//! | `dns` | `ruster-unbound` | [`ruster_config::dns_part`] |
+//! | `dns` | `ruster-unbound` | [`ruster_config::dns_part_with`]: with the DNS servers the sources of `upstream-from` have now (`upstream-found`) |
 //! | `dhcp` | `ruster-kea` | [`ruster_config::dhcp_part`] |
 //! | `ra` | `ruster-neighd` | [`ruster_config::ra_part`] |
 //! | `pppoe` | `ruster-pppoed` | [`ruster_config::pppoe_part`] |
@@ -101,7 +101,7 @@ impl Module {
     /// The module's part of `config`.
     pub fn part(self, config: &Config) -> String {
         match self {
-            Self::Dns => ruster_config::dns_part(config.dns.as_ref()),
+            Self::Dns => ruster_config::dns_part_with(config.dns.as_ref(), &config.dns_found),
             Self::Dhcp => ruster_config::dhcp_part(&config.dhcp, &config.dhcp6),
             Self::Ra => ruster_config::ra_part(&config.ra),
             Self::Pppoe => ruster_config::pppoe_part(&config.pppoe),
