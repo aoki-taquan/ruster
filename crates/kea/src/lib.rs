@@ -22,7 +22,9 @@
 
 pub mod agent;
 pub mod relay;
+pub mod relay6;
 pub mod settings;
+pub mod settings6;
 
 use std::path::PathBuf;
 
