@@ -8,7 +8,9 @@
 //! persistent device (one confd made): when TUNSETIFF made a new one instead, the FE
 //! closes it again, which removes it. So the kernel's addresses and routes on the
 //! device outlive an FE restart. A TAP device's carrier is up only while the FE
-//! has it open.
+//! has it open; the FE also sets it (`ioctl(TUNSETCARRIER)`) to the link state of
+//! the interface it stands for, so IS-IS and OSPF see a port go down at once
+//! instead of after their hold time.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -41,6 +43,20 @@ pub fn index(device: &str) -> Option<u32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// Whether `device`'s link is up: its carrier is on. A device that is down or not
+/// there has none.
+pub fn carrier(device: &str) -> bool {
+    let path = std::path::Path::new("/sys/class/net")
+        .join(device)
+        .join("carrier");
+    std::fs::read_to_string(path).is_ok_and(|text| text.trim() == "1")
+}
+
+/// Sets the carrier of the TUN or TAP device `file` is attached to.
+pub fn set_carrier(file: &File, up: bool) -> io::Result<()> {
+    imp::set_carrier(file, up)
+}
+
 /// Opens `/dev/net/tun`, non-blocking, attached to the existing `device`: a TAP
 /// device with `tap`, else a TUN device.
 pub fn open(device: &str, tap: bool) -> io::Result<File> {
@@ -71,6 +87,8 @@ mod imp {
     const IFF_TAP: c_short = 0x0002;
     const IFF_NO_PI: c_short = 0x1000;
     const IFF_PERSIST: c_short = 0x0800;
+    /// `_IOW('T', 226, int)`.
+    const TUNSETCARRIER: c_ulong = 0x4004_54e2;
 
     /// `struct ifreq` as TUNSETIFF reads it: the name, then the flags at the start
     /// of the 24-byte union.
@@ -133,12 +151,31 @@ mod imp {
         Ok(())
     }
 
+    pub fn set_carrier(file: &File, up: bool) -> io::Result<()> {
+        let carrier: c_int = up.into();
+        // SAFETY: `ioctl` as above. The fd is an open `/dev/net/tun` attached to a
+        // device, owned by `file` and alive for the call. TUNSETCARRIER reads one
+        // `int` through the pointer, which is valid for the call; nothing keeps it.
+        let status = unsafe { ioctl(file.as_raw_fd(), TUNSETCARRIER, std::ptr::addr_of!(carrier)) };
+        if status < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     const _: () = assert!(std::mem::size_of::<IfReq>() == 40);
 }
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
     pub fn attach(_file: &std::fs::File, _device: &str, _tap: bool) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "TUN needs Linux",
+        ))
+    }
+
+    pub fn set_carrier(_file: &std::fs::File, _up: bool) -> std::io::Result<()> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "TUN needs Linux",

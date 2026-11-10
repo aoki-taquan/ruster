@@ -332,9 +332,10 @@ TAPのデバイスを一つ置く。
   kernelがその経路で送るパケットはTAPから出てきて、FEがTUNのものと同じに転送する。ribdへは`ruster-frr`が
   FEのインターフェースに戻して渡すので、OSPFv3とIS-ISのIPv6のlink-localの次の転送先も使える。
 - TAPのリンクの状態: TAPのcarrierはFEが開いている間だけup（TUNのドライバの振る舞い）。FEが止まればisisdと
-  ospfdはすぐ気づく。ポートのリンクの状態には合わせない: 今はポートの切断はhold time（IS-ISは既定30秒、
-  OSPFはRouterDeadInterval 40秒）で気づく。合わせるなら、FEがポートのリンクの状態を知ってから
-  `TUNSETCARRIER`でTAPに写す。
+  ospfdはすぐ気づく。FEは1秒ごとにポートのcarrierを見て、`TUNSETCARRIER`でTAPに写す: ポートはそのポート、
+  VLANのサブインターフェースは親のポート、IRBはメンバーのどれかがupならup（VXLANやEtherIPのメンバーは常にup）。表で無効にしたインターフェースは
+  down。ポートの切断にはhold time（IS-ISは既定30秒、OSPFはRouterDeadInterval 40秒）を待たずに気づく
+  （netns `ospf`で、相手側のvethを落として1秒ほどで隣接が消えるのを確かめた）。
 - OSPFのbroadcastのリンクは、DRを選ぶまでRouterDeadInterval（40秒）待つ。netnsの`ospf`はそのため1分ほどかかる。
 
 ## 7. BGP EVPN（見送り）

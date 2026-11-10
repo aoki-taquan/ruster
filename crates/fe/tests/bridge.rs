@@ -412,3 +412,42 @@ fn members_and_parents_of_member_vlans_are_promiscuous() {
     );
     assert_eq!(bench.fe.promiscuous_ports(), ["p1"]);
 }
+
+#[test]
+fn links_follow_the_ports_and_a_disabled_interface_is_down() {
+    let vlan = iface(
+        "wan.10",
+        WAN_MAC,
+        Some(Vlan {
+            parent: "wan".into(),
+            id: 10,
+        }),
+    );
+    let mut bench = Bench::new(300, &[vlan]);
+    let fe = &bench.fe;
+    assert_eq!(fe.ports(), ["p1", "p2", "wan"]);
+    // The IRB is up while one member is.
+    assert!(fe.link_up("br0", &[false, true, false]));
+    assert!(!fe.link_up("br0", &[false, false, true]));
+    assert!(fe.link_up("p1", &[true, false, false]));
+    assert!(!fe.link_up("p1", &[false, true, true]));
+    // A VLAN sub-interface follows its parent.
+    assert!(fe.link_up("wan.10", &[false, false, true]));
+    assert!(!fe.link_up("wan.10", &[true, true, false]));
+    assert!(!fe.link_up("nothing", &[true, true, true]));
+    let disabled = Change::set(
+        Key::Interface { name: "wan".into() },
+        Value::Interface {
+            enabled: false,
+            mac: WAN_MAC,
+            mtu: 1500,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: None,
+            tunnel: None,
+            pppoe: None,
+        },
+    );
+    assert_eq!(bench.patch_config(&[disabled]), Code::CHANGED);
+    assert!(!bench.fe.link_up("wan", &[true, true, true]));
+    assert!(!bench.fe.link_up("wan.10", &[true, true, true]));
+}
