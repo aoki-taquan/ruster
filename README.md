@@ -26,8 +26,9 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 | `ruster-neighd` | ARP。FEから受け取って答え、問い合わせる | 近隣 |
 | `ruster-pppoed` | PPPoEのセッションを張る（Discovery、LCP、PAP/CHAP、IPCP、IPv6CP）。得た値はまだ標準出力に書くだけ | — |
 | `ruster-unbound` | confdから設定の`[dns]`を受け取り、Unboundの設定に書いて読み直させる | — |
+| `ruster-kea` | confdから設定の`[[dhcp]]`を受け取ってKeaの設定に書き、LANとKeaの間でDHCPをリレーする | — |
 
-ルーティングデーモン、DHCP、DNSはrusterに組み込みません。外のデーモンがconfdやribdへ渡します。DNSのサーバはUnboundで、`ruster-unbound`がconfdの設定をUnboundの設定に変えます。
+ルーティングデーモン、DHCP、DNSはrusterに組み込みません。外のデーモンがconfdやribdへ渡します。DNSのサーバはUnboundで、`ruster-unbound`がconfdの設定をUnboundの設定に変えます。DHCPのサーバはKeaで、`ruster-kea`が同じように設定を変え、FEから渡されたDHCPをKeaへリレーします。
 
 設計の詳細は`docs/design/`にあります。
 
@@ -159,6 +160,7 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 `netns-pppoed.sh`は、`pppoe-server`（パッケージ`pppoe`と`ppp`）を相手に、pppoedのセッションをIPCPとIPv6CPまで張ります（FEは通さない）。
 `netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る。
 インターネットにはつながない）。
+`netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。
 
 ## 開発
 
@@ -181,6 +183,7 @@ cargo test --doc --workspace --all-features --locked
 | `fe` | FE（`ruster-fe`） |
 | `confd`、`ribd`、`neighd`、`pppoed` | CEのプロセス |
 | `unbound` | Unboundの橋渡し役（`ruster-unbound`） |
+| `kea` | Keaの橋渡し役とDHCPv4のリレー（`ruster-kea`） |
 | `cli` | `ruster`コマンド |
 | `config` | 設定の書き方（`ruster.toml`と、既定値を全部埋めたlockの形）と、その解決 |
 | `proto` | プロセス間のメッセージ（CBOR、CoAPの枠組み、表、接続、起動まわり） |

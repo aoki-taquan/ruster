@@ -117,7 +117,15 @@ confd → 各プロセス: 確定
   （ブロードキャストと、更新のときのルータのアドレス宛て）を`kea`へ渡す行`dhcp-<インターフェース名>`。
 - `ruster-kea`はDHCPのリレー（DHCPv4はRFC 1542とRFC 3046、DHCPv6はRFC 8415のrelay-forw）として振る舞い、
   kernelのnetnsのKeaへUDPで渡す。Keaの返事はクライアントへのフレームに戻し、FEの受け渡しで送り出す。
-- Keaの設定は制御用のsocketで入れ替える。
+- Keaはkernelのnetnsのloopback（`lo/127.0.0.1`、変えられる）で、`dhcp-socket-type: udp`で待ち受ける。
+  `ruster-kea`はインターフェースのアドレスのUDP 67番からリレーし、Keaは`giaddr`の67番へ返す。Keaの
+  `giaddr`と同じアドレスでは待ち受けない（返事が自分に届いてしまう）。server identifierはインターフェースの
+  アドレスにし、更新の要求もFEが`ruster-kea`へ渡す。
+- `ruster-kea`はサブネットを一つのファイルに書き、運用者の`kea-dhcp4.conf`が`Dhcp4`の中で`<?include?>`で
+  取り込む。lease database、制御用のsocket、ログは運用者のファイルに書く。書いたら制御用のsocketで
+  `config-reload`を送る。Keaが断ったら前のファイルに戻して断る。Keaが動いていなければ受け入れる
+  （起動したときに読む）。
+- DHCPv6のリレー（RFC 8415のrelay-forw）はまだ。LANへのRAが先に要る。
 
 ### Unbound（`ruster-unbound`）
 
