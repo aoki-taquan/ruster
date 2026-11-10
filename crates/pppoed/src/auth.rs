@@ -55,8 +55,8 @@ pub enum Outcome {
     Failure,
 }
 
-/// The authentication of one session.
-#[derive(Clone, Debug)]
+/// The authentication of one session. Its `Debug` does not show the password.
+#[derive(Clone)]
 pub struct Client {
     method: Auth,
     user: Vec<u8>,
@@ -67,6 +67,32 @@ pub struct Client {
     tries: u32,
     timer: Option<u64>,
     succeeded: bool,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field by name, so that a new one is not missed.
+        let Self {
+            method,
+            user,
+            password: _,
+            id,
+            next_id,
+            tries,
+            timer,
+            succeeded,
+        } = self;
+        f.debug_struct("Client")
+            .field("method", method)
+            .field("user", user)
+            .field("password", &ruster_config::HIDDEN)
+            .field("id", id)
+            .field("next_id", next_id)
+            .field("tries", tries)
+            .field("timer", timer)
+            .field("succeeded", succeeded)
+            .finish()
+    }
 }
 
 impl Client {

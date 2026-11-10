@@ -205,7 +205,7 @@ fn ipv4_prefix(text: &str) -> Option<(Ipv4Addr, Ipv4Addr, u8)> {
 /// Reads `ruster.toml` and gives every value it leaves out. Only what a default
 /// needs is checked here; the rest is the reader of the lock form's to check.
 pub fn resolve(text: &str) -> Result<Lock, String> {
-    let file: File = toml::from_str(text).map_err(|error| error.to_string())?;
+    let file: File = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     let mut interfaces: Vec<Interface> = Vec::with_capacity(file.interface.len());
     // The IPv4 addresses and prefixes so far, per VRF: the B4's address is given
     // only where it is free.

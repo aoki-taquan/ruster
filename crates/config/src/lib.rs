@@ -556,8 +556,9 @@ pub struct Lock {
     pub bgp: Vec<Bgp>,
 }
 
-/// A PPPoE client (`ruster-pppoed`): the session it sets up for a source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A PPPoE client (`ruster-pppoed`): the session it sets up for a source. Its
+/// `Debug` does not show the password.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Pppoe {
     /// The source it writes the session to.
@@ -581,6 +582,45 @@ pub struct Pppoe {
     /// Whether to send ribd the IPv4 default route out of the session.
     pub default_route: bool,
 }
+
+impl std::fmt::Debug for Pppoe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field by name, so that a new one is not missed.
+        let Self {
+            source,
+            interface,
+            vrf,
+            parent,
+            mac,
+            user,
+            password: _,
+            service,
+            ac_name,
+            ipv6,
+            echo_interval,
+            echo_failures,
+            default_route,
+        } = self;
+        f.debug_struct("Pppoe")
+            .field("source", source)
+            .field("interface", interface)
+            .field("vrf", vrf)
+            .field("parent", parent)
+            .field("mac", mac)
+            .field("user", user)
+            .field("password", &HIDDEN)
+            .field("service", service)
+            .field("ac_name", ac_name)
+            .field("ipv6", ipv6)
+            .field("echo_interval", echo_interval)
+            .field("echo_failures", echo_failures)
+            .field("default_route", default_route)
+            .finish()
+    }
+}
+
+/// What `Debug` shows in place of a password.
+pub const HIDDEN: &str = "(hidden)";
 
 /// A daemon that sends confd values found at run time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -806,9 +846,28 @@ impl Lock {
     }
 }
 
+/// A TOML reading error as text that does not quote the configuration: the message
+/// and where it is, without the line itself, which may hold a password. On a line that
+/// mentions a password the message is left out too, since it may quote the value
+/// (`invalid type: integer `1234``).
+pub fn toml_error(text: &str, error: &toml::de::Error) -> String {
+    let Some(start) = error.span().map(|span| span.start.min(text.len())) else {
+        return error.message().to_owned();
+    };
+    let before = text.get(..start).unwrap_or(text);
+    let line_start = before.rfind('\n').map_or(0, |at| at + 1);
+    let line_number = before.matches('\n').count() + 1;
+    let column = before[line_start..].chars().count() + 1;
+    let line = text[line_start..].lines().next().unwrap_or("");
+    if line.contains("password") {
+        return format!("line {line_number}, column {column}: a value that is not valid (not shown: the line holds a password)");
+    }
+    format!("line {line_number}, column {column}: {}", error.message())
+}
+
 /// Whether the text is the lock form: it has a top-level `version`.
 pub fn is_lock(text: &str) -> Result<bool, String> {
-    let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let table: toml::Table = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     Ok(table.contains_key("version"))
 }
 
@@ -816,11 +875,11 @@ pub fn is_lock(text: &str) -> Result<bool, String> {
 /// [`VERSION`].
 pub fn parse_lock(text: &str) -> Result<Lock, String> {
     check_version(text)?;
-    toml::from_str(text).map_err(|e| e.to_string())
+    toml::from_str(text).map_err(|e| crate::toml_error(text, &e))
 }
 
 fn check_version(text: &str) -> Result<(), String> {
-    let table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+    let table: toml::Table = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     match table.get("version") {
         None => Err("version is missing: not the lock form".into()),
         Some(toml::Value::Integer(v)) if *v == i64::from(VERSION) => Ok(()),
@@ -871,7 +930,7 @@ pub fn parse_dns_part(text: &str) -> Result<Option<Dns>, String> {
 /// Reads the DNS process's part ([`dns_part_with`]) with the servers found.
 pub fn parse_dns_part_with(text: &str) -> Result<(Option<Dns>, Vec<std::net::IpAddr>), String> {
     check_version(text)?;
-    let part: DnsPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    let part: DnsPart = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     let found = part
         .upstream_found
         .iter()
@@ -911,7 +970,7 @@ pub fn dhcp_part(dhcp: &[Dhcp], dhcp6: &[Dhcp6]) -> String {
 /// Reads the DHCP process's part of the lock form ([`dhcp_part`]).
 pub fn parse_dhcp_part(text: &str) -> Result<(Vec<Dhcp>, Vec<Dhcp6>), String> {
     check_version(text)?;
-    let part: DhcpPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    let part: DhcpPart = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     Ok((part.dhcp, part.dhcp6))
 }
 
@@ -935,6 +994,6 @@ pub fn pppoe_part(pppoe: &[Pppoe]) -> String {
 /// Reads the PPPoE client's part of the lock form ([`pppoe_part`]).
 pub fn parse_pppoe_part(text: &str) -> Result<Vec<Pppoe>, String> {
     check_version(text)?;
-    let part: PppoePart = toml::from_str(text).map_err(|e| e.to_string())?;
+    let part: PppoePart = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     Ok(part.pppoe)
 }

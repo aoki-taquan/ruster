@@ -122,7 +122,7 @@ pub fn frr_part(bgp: Option<&Bgp>, connected: &[Connected]) -> String {
 /// Reads `ruster-frr`'s part of the lock form ([`frr_part`]).
 pub fn parse_frr_part(text: &str) -> Result<(Option<Bgp>, Vec<Connected>), String> {
     crate::check_version(text)?;
-    let part: FrrPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    let part: FrrPart = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     match <[Bgp; 1]>::try_from(part.bgp) {
         Ok([bgp]) => Ok((Some(bgp), part.connected)),
         Err(none) if none.is_empty() => Ok((None, part.connected)),

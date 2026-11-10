@@ -193,6 +193,6 @@ pub fn ra_part(ra: &[Ra]) -> String {
 /// Reads neighd's Router Advertisement part of the lock form ([`ra_part`]).
 pub fn parse_ra_part(text: &str) -> Result<Vec<Ra>, String> {
     crate::check_version(text)?;
-    let part: RaPart = toml::from_str(text).map_err(|e| e.to_string())?;
+    let part: RaPart = toml::from_str(text).map_err(|e| crate::toml_error(text, &e))?;
     Ok(part.ra)
 }

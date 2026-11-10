@@ -48,8 +48,8 @@ pub const FIRST_RETRY_MS: u64 = 3_000;
 /// The longest wait before starting again.
 pub const LONGEST_RETRY_MS: u64 = 60_000;
 
-/// What one session is set up with.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// What one session is set up with. Its `Debug` does not show the password.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Settings {
     /// The interface the session runs on (the parent of the session interface).
     pub interface: String,
@@ -64,6 +64,32 @@ pub struct Settings {
     pub echo: Echo,
     /// Run IPv6CP too.
     pub ipv6: bool,
+}
+
+impl std::fmt::Debug for Settings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Every field by name, so that a new one is not missed.
+        let Self {
+            interface,
+            mac,
+            user,
+            password: _,
+            service,
+            ac_name,
+            echo,
+            ipv6,
+        } = self;
+        f.debug_struct("Settings")
+            .field("interface", interface)
+            .field("mac", mac)
+            .field("user", user)
+            .field("password", &ruster_config::HIDDEN)
+            .field("service", service)
+            .field("ac_name", ac_name)
+            .field("echo", echo)
+            .field("ipv6", ipv6)
+            .finish()
+    }
 }
 
 /// What an established session gives: the values the FE's `pppoe` interface, its
