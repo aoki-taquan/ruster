@@ -22,8 +22,10 @@
 //! making (`addrgenmode none`, no Router Solicitations). It holds the interface's
 //! addresses, its link-local one included, instead of the TUN device, and the
 //! kernel adds their prefix routes on it. Packets to those addresses still come in
-//! through the TUN device, so reverse path filtering is loose on both. A TAP device
-//! no interface needs any more is removed.
+//! through the TUN device, so reverse path filtering is off on the TUN and TAP
+//! devices (and `all`, since the larger counts): loose filtering would drop them
+//! too once the TUN device has no IPv4 address left. A TAP device no interface
+//! needs any more is removed.
 //!
 //! Limits: link-local addresses are not put on the TUN devices (a TAP device has its
 //! interface's); devices of a VRF that is removed stay. The configuration file keeps VRF names to 11 bytes, so the device
@@ -294,21 +296,22 @@ pub fn apply(config: &Config) -> Vec<String> {
     for args in commands.iter().filter(|a| is_device(&words(a))) {
         run(args, &mut errors);
     }
-    // Packets to a TAP device's addresses come in through the TUN device: reverse
-    // path filtering is loose (the larger of `all` and the device's counts), and
-    // a TAP device sends no Router Solicitation.
+    // Packets to a TAP device's addresses come in through the TUN device: no
+    // reverse path filtering there (the larger of `all` and the device's counts;
+    // Linux's loose mode drops on a device without an IPv4 address), and a TAP
+    // device sends no Router Solicitation.
     let mut sysctl = |path: String, value: &str| {
         if let Err(error) = std::fs::write(&path, value) {
             errors.push(format!("{path}: {error}"));
         }
     };
     if std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
-        .is_ok_and(|v| v.trim() == "1")
+        .is_ok_and(|v| v.trim() != "0")
     {
-        sysctl("/proc/sys/net/ipv4/conf/all/rp_filter".into(), "2");
+        sysctl("/proc/sys/net/ipv4/conf/all/rp_filter".into(), "0");
     }
     for device in wanted_addresses(&commands).into_keys() {
-        sysctl(format!("/proc/sys/net/ipv4/conf/{device}/rp_filter"), "2");
+        sysctl(format!("/proc/sys/net/ipv4/conf/{device}/rp_filter"), "0");
         if device.starts_with(ruster_config::TAP_PREFIX) {
             sysctl(format!("/proc/sys/net/ipv6/conf/{device}/accept_ra"), "0");
         }
