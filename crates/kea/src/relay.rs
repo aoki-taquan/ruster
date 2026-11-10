@@ -30,7 +30,8 @@
 //! - RFC 3046 sections 2.0 and 2.1: the Relay Agent Information option (82), last
 //!   before End, with a Circuit ID sub-option (1) naming the circuit, here the
 //!   interface; section 2.2: the option is taken out of the reply before it goes to
-//!   the client.
+//!   the client. Section 2.1: a request that the option would make larger than
+//!   [`MAX_PACKET`] is relayed without it.
 //! - RFC 791, RFC 768 and RFC 1071: the IPv4 header and UDP checksums are checked on
 //!   requests and computed on replies.
 //!
@@ -40,7 +41,8 @@
 //! the hops threshold is not configurable; the request's UDP source port is not
 //! checked; Pad and what follows End are left out of the relayed request (which may
 //! then be shorter than BOOTP's 300 bytes), and options without End are taken; with
-//! an interface name of more than 253 bytes no option 82 is added; a reply with no
+//! an interface name of more than 253 bytes no option 82 is added, and no counter
+//! counts the requests relayed without it (RFC 3046 2.1 says one SHOULD); a reply with no
 //! `yiaddr` (an answer to DHCPINFORM) goes to `ciaddr`, as RFC 2131 4.1 says for a
 //! server, since RFC 1542 names only `yiaddr`; a reply whose `htype` and `hlen` are not
 //! Ethernet's (1 and 6) is broadcast; a reply is sent with TTL 64; options in
@@ -63,7 +65,8 @@ pub const SERVER_PORT: u16 = 67;
 pub const CLIENT_PORT: u16 = 68;
 /// A request with more hops than this is discarded (RFC 1542 4.1.1's default).
 pub const MAX_HOPS: u8 = 4;
-/// The largest IPv4 packet a reply is sent in: Ethernet's MTU.
+/// The largest IPv4 packet a reply is sent in, and a relayed request is made
+/// (with option 82): Ethernet's MTU.
 pub const MAX_PACKET: usize = 1_500;
 
 const ETHERNET: usize = 14;
@@ -159,10 +162,13 @@ pub fn request(link: &Link, frame: &[u8]) -> Result<Vec<u8>, Dropped> {
     out[HOPS] += 1;
     out[GIADDR..GIADDR + 4].copy_from_slice(&link.address.octets());
     out.extend_from_slice(&options);
-    // A Circuit ID of 1 to 255 bytes in an option of at most 255.
+    // A Circuit ID of 1 to 255 bytes in an option of at most 255, and only when the
+    // packet stays within MAX_PACKET with it.
     let name = link.interface.as_bytes();
+    let end = 1;
+    let fits = IPV4_HEADER + UDP_HEADER + out.len() + 4 + name.len() + end <= MAX_PACKET;
     if let (Ok(id), Ok(all)) = (u8::try_from(name.len()), u8::try_from(name.len() + 2)) {
-        if id > 0 {
+        if id > 0 && fits {
             out.extend_from_slice(&[RELAY_AGENT_INFORMATION, all, CIRCUIT_ID, id]);
             out.extend_from_slice(name);
         }

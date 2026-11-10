@@ -327,6 +327,36 @@ mod tests {
         assert_eq!(frame[54 + 5], 0, "no flags");
     }
 
+    // RFC 8106 section 5.1: type 25, Length 1 + 2 * the number of addresses (in
+    // units of 8 octets), 16 bits reserved, the 32-bit Lifetime, then the addresses.
+    // RFC 4861 section 4.6.2: an infinite lifetime is all ones.
+    #[test]
+    fn the_rdnss_option_carries_every_server() {
+        let mut two = ra();
+        two.mtu.clear();
+        two.prefix[0].valid_lifetime = u32::MAX;
+        two.prefix[0].preferred_lifetime = u32::MAX;
+        two.dns = vec!["2001:db8:1::1".into(), "2001:db8:2::53".into()];
+        two.dns_lifetime = 3_600;
+        let source: Ipv6Addr = "fe80::1".parse().unwrap();
+        let frame = advertisement(&two, MAC, source, false);
+        let icmp = &frame[54..];
+        assert_eq!(nd::checksum(source, ALL_NODES, icmp), 0);
+        let prefix = &icmp[16 + 8..16 + 8 + 32];
+        assert_eq!(&prefix[..4], &[3, 4, 64, 0xc0]);
+        assert_eq!(&prefix[4..12], &[0xff; 8], "infinite lifetimes");
+        let rdnss = &icmp[16 + 8 + 32..];
+        #[rustfmt::skip]
+        let expected: Vec<u8> = [
+            &[25, 5, 0, 0][..], &3_600_u32.to_be_bytes(),
+            &"2001:db8:1::1".parse::<Ipv6Addr>().unwrap().octets(),
+            &"2001:db8:2::53".parse::<Ipv6Addr>().unwrap().octets(),
+        ]
+        .concat();
+        assert_eq!(rdnss, &expected[..]);
+        assert_eq!(rdnss.len(), 5 * 8);
+    }
+
     #[test]
     fn unsolicited_ones_go_at_random_intervals_the_first_three_sooner() {
         let ra = ra();
