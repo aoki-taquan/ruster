@@ -16,6 +16,7 @@
 //! - [`ipv6cp`]: IPv6 interface identifiers (RFC 5072).
 //! - [`session`]: one session through all of the above, started again when it
 //!   ends.
+//! - [`writer`]: what a session got, to confd as a source and to ribd.
 //!
 //! # Standards
 //!
@@ -29,6 +30,7 @@ pub mod ipv6cp;
 pub mod lcp;
 pub mod ppp;
 pub mod session;
+pub mod writer;
 
 /// An Ethernet MAC address.
 pub type Mac = [u8; 6];
