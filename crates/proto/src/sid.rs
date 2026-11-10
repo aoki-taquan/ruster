@@ -152,6 +152,11 @@ pub const BRIDGE_PORT_BRIDGE: u64 = 60251;
 /// A static entry of a bridge's MAC address table (`filtering-database/filtering-entry`).
 pub const BRIDGE_MAC: u64 = 60260;
 pub const BRIDGE_MAC_PORT: u64 = 60261;
+/// `ruster-if-tunnel`: an EtherIP interface (RFC 3378), by interface, its local and
+/// remote addresses.
+pub const ETHERIP: u64 = 60270;
+pub const ETHERIP_LOCAL: u64 = 60271;
+pub const ETHERIP_REMOTE: u64 = 60272;
 
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
@@ -313,6 +318,9 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-bridge:bridge-ports/bridge-port/bridge-name", BRIDGE_PORT_BRIDGE),
     ("/ruster-bridge:bridges/bridge/filtering-entry", BRIDGE_MAC),
     ("/ruster-bridge:bridges/bridge/filtering-entry/port", BRIDGE_MAC_PORT),
+    ("/ruster-if-tunnel:etherip", ETHERIP),
+    ("/ruster-if-tunnel:etherip/local", ETHERIP_LOCAL),
+    ("/ruster-if-tunnel:etherip/remote", ETHERIP_REMOTE),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",

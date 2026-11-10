@@ -44,6 +44,8 @@ pub(crate) struct Built {
     pub(crate) vlans: Vec<VlanBinding>,
     /// The enabled IPv4 in IPv6 tunnels.
     pub(crate) tunnels: Vec<Ipv4InIpv6Tunnel>,
+    /// The enabled bridge members that carry frames inside IP (EtherIP).
+    pub(crate) overlays: Vec<ruster_core::Overlay>,
     /// IPv4 next hops the neighbor process could not resolve (written with an
     /// all-zero MAC address).
     pub(crate) unreachable: Vec<(IfId, Ipv4Address)>,
@@ -436,8 +438,42 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
     }
+    // EtherIP interfaces get the ids after those: an interface row of the name, with
+    // no VLAN, tunnel or PPPoE session, and the EtherIP row.
+    let mut overlays = Vec::new();
+    for (key, value) in store.iter() {
+        if let (Key::EtherIp { interface: name }, Value::EtherIp { local, remote }) = (key, value) {
+            let Some(Value::Interface {
+                enabled: true,
+                mac,
+                mtu,
+                vrf,
+                vlan: None,
+                tunnel: None,
+                pppoe: None,
+            }) = store.get(&Key::Interface { name: name.clone() })
+            else {
+                continue;
+            };
+            if ports.iter().any(|port| port == name) {
+                return Err(format!("EtherIP interface {name} has the name of a port"));
+            }
+            let id = ids.take(name)?;
+            interfaces.push(Interface {
+                id,
+                mac: MacAddress(*mac),
+                mtu: *mtu,
+            });
+            overlays.push(ruster_core::Overlay {
+                interface: id,
+                local: *local,
+                kind: ruster_core::OverlayKind::EtherIp { remote: *remote },
+            });
+            active.insert(name.as_str(), (id, vrf.as_str()));
+        }
+    }
     // Each bridge's own interface (IRB) is the interface of its name; its members
-    // are enabled ports and VLAN sub-interfaces.
+    // are enabled ports, VLAN sub-interfaces and overlays.
     let mut bridges: Vec<(String, ruster_core::BridgeConfig)> = Vec::new();
     for (key, value) in store.iter() {
         if let (
@@ -448,6 +484,16 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
             },
         ) = (key, value)
         {
+            if store
+                .get(&Key::EtherIp {
+                    interface: name.clone(),
+                })
+                .is_some()
+            {
+                return Err(format!(
+                    "bridge {name} has the name of an EtherIP interface"
+                ));
+            }
             let limits = ruster_core::BridgeLimits {
                 aging_ms: u64::from(*aging_s) * 1_000,
                 max_macs: *max_learned,
@@ -495,7 +541,11 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
             let member = active
                 .get(interface.as_str())
                 .map(|&(id, _)| id)
-                .filter(|id| usize::from(id.0) < ports.len() || vlans.iter().any(|b| b.sub == *id));
+                .filter(|id| {
+                    usize::from(id.0) < ports.len()
+                        || vlans.iter().any(|b| b.sub == *id)
+                        || overlays.iter().any(|o| o.interface == *id)
+                });
             if let (Some(at), Some(member)) = (bridge_at(bridge), member) {
                 members.push((at, member));
             }
@@ -766,6 +816,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         interface_names,
         vlans,
         tunnels,
+        overlays,
         unreachable,
         pppoe,
         kernel,

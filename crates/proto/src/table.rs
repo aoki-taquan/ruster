@@ -123,6 +123,11 @@ pub enum Key {
         bridge: String,
         mac: [u8; 6],
     },
+    /// An EtherIP interface (`ruster-if-tunnel`, RFC 3378): the interface of this
+    /// name carries its frames inside IP. It is only a bridge member.
+    EtherIp {
+        interface: String,
+    },
 }
 
 /// The value of one entry.
@@ -220,6 +225,12 @@ pub enum Value {
     /// The address is on member `interface`.
     BridgeMac {
         interface: String,
+    },
+    /// EtherIP from the router's address `local` to `remote` (the same family),
+    /// routed in the default VRF.
+    EtherIp {
+        local: IpAddr,
+        remote: IpAddr,
     },
 }
 
@@ -564,6 +575,7 @@ impl Key {
             Self::Bridge { .. } => sid::BRIDGE,
             Self::BridgePort { .. } => sid::BRIDGE_PORT,
             Self::BridgeMac { .. } => sid::BRIDGE_MAC,
+            Self::EtherIp { .. } => sid::ETHERIP,
         }
     }
 }
@@ -640,7 +652,7 @@ impl Change {
             | Key::SourceIpv6 { source }
             | Key::SourceDns { source } => name(source)?,
             Key::Bridge { name: n } | Key::BridgeMac { bridge: n, .. } => name(n)?,
-            Key::BridgePort { interface } => name(interface)?,
+            Key::BridgePort { interface } | Key::EtherIp { interface } => name(interface)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
                 parse_prefix(&format!("{prefix}/{len}"))?;
@@ -668,6 +680,7 @@ impl Change {
                         | (Key::Bridge { .. }, Value::Bridge { .. })
                         | (Key::BridgePort { .. }, Value::BridgePort { .. })
                         | (Key::BridgeMac { .. }, Value::BridgeMac { .. })
+                        | (Key::EtherIp { .. }, Value::EtherIp { .. })
                 );
                 if !table_matches {
                     return Err(ModelError::WrongTable);
@@ -802,6 +815,19 @@ impl Change {
                             if mac[0] & 1 != 0 || *mac == [0; 6] {
                                 return Err(ModelError::Invalid("static MAC address"));
                             }
+                        }
+                    }
+                    Value::EtherIp { local, remote } => {
+                        let unicast = |a: &IpAddr| {
+                            !(a.is_unspecified() || a.is_loopback() || a.is_multicast())
+                                && !matches!(a, IpAddr::V4(v4) if v4.is_broadcast())
+                        };
+                        if local.is_ipv4() != remote.is_ipv4()
+                            || !unicast(local)
+                            || !unicast(remote)
+                            || local == remote
+                        {
+                            return Err(ModelError::Invalid("EtherIP local and remote"));
                         }
                     }
                     Value::SourcePppoe {
@@ -1011,6 +1037,9 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
         Key::BridgePort { interface } => {
             e.array(2).u64(sid::BRIDGE_PORT).text(interface);
         }
+        Key::EtherIp { interface } => {
+            e.array(2).u64(sid::ETHERIP).text(interface);
+        }
         Key::BridgeMac { bridge, mac } => {
             e.array(3)
                 .u64(sid::BRIDGE_MAC)
@@ -1041,7 +1070,8 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         | sid::SOURCE_IPV6
         | sid::SOURCE_DNS
         | sid::BRIDGE
-        | sid::BRIDGE_PORT => 2,
+        | sid::BRIDGE_PORT
+        | sid::ETHERIP => 2,
         sid::ADDRESS | sid::ROUTE | sid::NEIGHBOR | sid::FIREWALL_RULE | sid::BRIDGE_MAC => 3,
         other => return Err(ModelError::UnknownTable(other)),
     };
@@ -1065,6 +1095,7 @@ pub fn decode_key(d: &mut Decoder<'_>) -> Result<Key, ModelError> {
         sid::SOURCE_DNS => Key::SourceDns { source: first },
         sid::BRIDGE => Key::Bridge { name: first },
         sid::BRIDGE_PORT => Key::BridgePort { interface: first },
+        sid::ETHERIP => Key::EtherIp { interface: first },
         sid::BRIDGE_MAC => Key::BridgeMac {
             bridge: first,
             mac: parse_mac(d.text()?)?,
@@ -1374,6 +1405,13 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 .u64(sid::BRIDGE_MAC_PORT - sid::BRIDGE_MAC)
                 .text(interface);
         }
+        Value::EtherIp { local, remote } => {
+            e.map(2)
+                .u64(sid::ETHERIP_LOCAL - sid::ETHERIP)
+                .text(&local.to_string())
+                .u64(sid::ETHERIP_REMOTE - sid::ETHERIP)
+                .text(&remote.to_string());
+        }
         Value::FirewallRule(rule) => {
             let d = |member: u64| member - sid::FIREWALL_RULE;
             let members = 8 + u64::from(rule.ingress.is_some()) + u64::from(rule.egress.is_some());
@@ -1428,6 +1466,7 @@ fn decode_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelError> {
             | sid::BRIDGE
             | sid::BRIDGE_PORT
             | sid::BRIDGE_MAC
+            | sid::ETHERIP
     ) {
         return decode_policy_value(table, d);
     }
@@ -1764,6 +1803,9 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
         (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) => {
             format!("bridge-mac {bridge} {} {interface}", format_mac(mac))
         }
+        (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => {
+            format!("etherip {interface} {local} to {remote}")
+        }
         _ => return None,
     };
     Some(line)
@@ -1890,6 +1932,14 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
     } else if table == sid::BRIDGE_MAC {
         Value::BridgeMac {
             interface: text(sid::BRIDGE_MAC_PORT, "port")?.ok_or(ModelError::Missing("port"))?,
+        }
+    } else if table == sid::ETHERIP {
+        let mut address = |member: u64, what: &'static str| {
+            parse_ip(&text(member, what)?.ok_or(ModelError::Missing(what))?)
+        };
+        Value::EtherIp {
+            local: address(sid::ETHERIP_LOCAL, "local")?,
+            remote: address(sid::ETHERIP_REMOTE, "remote")?,
         }
     } else if matches!(
         table,
