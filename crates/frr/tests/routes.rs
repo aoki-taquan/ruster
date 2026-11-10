@@ -226,3 +226,62 @@ fn routes_not_sent_again_are_swept() {
     assert!(routes.sweep().is_empty());
     assert_eq!(routes.clear(), [Change::delete(key("10.0.0.0", 16))]);
 }
+
+#[test]
+fn an_update_in_one_frame_is_one_change() {
+    let mut routes = Routes::new();
+    routes.set_connected(&connected());
+    routes.take(&route(
+        true,
+        "10.0.0.0",
+        8,
+        Kind::Unicast,
+        &["198.51.100.10"],
+    ));
+    let update = [
+        route(false, "10.0.0.0", 8, Kind::Unicast, &[]),
+        route(true, "10.0.0.0", 8, Kind::Unicast, &["192.0.2.254"]),
+        route(true, "10.1.0.0", 16, Kind::Blackhole, &[]),
+    ];
+    assert_eq!(
+        routes.take_frame(&update),
+        [
+            Change::set(key("10.0.0.0", 8), forward(&[("lan", "192.0.2.254")])),
+            Change::set(key("10.1.0.0", 16), Value::Route(RouteAction::Discard)),
+        ]
+    );
+}
+
+#[test]
+fn new_prefixes_change_only_the_routes_they_move() {
+    let mut routes = Routes::new();
+    routes.set_connected(&connected());
+    routes.take(&route(
+        true,
+        "10.0.0.0",
+        8,
+        Kind::Unicast,
+        &["198.51.100.10"],
+    ));
+    routes.take(&route(
+        true,
+        "10.1.0.0",
+        16,
+        Kind::Unicast,
+        &["192.0.2.254", "192.0.2.254"],
+    ));
+    let mut fewer = connected();
+    fewer.retain(|c| c.interface != "wan");
+    assert_eq!(
+        routes.set_connected(&fewer),
+        [Change::delete(key("10.0.0.0", 8))]
+    );
+    assert!(routes.set_connected(&fewer).is_empty());
+    assert_eq!(
+        routes.set_connected(&connected()),
+        [Change::set(
+            key("10.0.0.0", 8),
+            forward(&[("wan", "198.51.100.10")])
+        )]
+    );
+}

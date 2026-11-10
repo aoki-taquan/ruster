@@ -15,6 +15,10 @@
 //! route, an unreachable or prohibit route a reject route; other route types are
 //! not given.
 //!
+//! zebra gives an IPv6 route learned from a neighbor on the link with the
+//! neighbor's link-local address as the next hop, unless told to prefer the global
+//! one; `ruster-frr` tells bgpd so in the configuration it writes.
+//!
 //! zebra sends every route again when it connects; nothing marks the end. When FPM
 //! connects again the routes held are marked stale ([`Routes::mark_stale`]); each
 //! route sent again is no longer stale, and the owner removes the rest
@@ -25,7 +29,8 @@
 //! - RFC 8349 (`ietf-routing`): a route has next hops with an outgoing interface and
 //!   an address, or is a blackhole (discard) or unreachable (reject) route.
 //!
-//! Deviations: no recursive next hops (see above); only the default VRF.
+//! Deviations: no recursive next hops (see above); only the default VRF; a prohibit
+//! route rejects with the same Destination Unreachable as an unreachable one.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
@@ -87,7 +92,7 @@ impl Routes {
     /// Takes the interfaces' prefixes; the changes for ribd of every route whose
     /// next hops map differently now.
     pub fn set_connected(&mut self, connected: &[Connected]) -> Vec<Change> {
-        self.connected = connected
+        let connected: Vec<(IpAddr, u8, String)> = connected
             .iter()
             .filter_map(|c| {
                 let (address, len) = c.prefix.split_once('/')?;
@@ -97,10 +102,17 @@ impl Routes {
                 (len <= max).then(|| (network(address, len), len, c.interface.clone()))
             })
             .collect();
+        let keys: Vec<(IpAddr, u8)> = self.held.keys().copied().collect();
+        let before: Vec<Change> = keys.iter().map(|&k| self.change(k)).collect();
+        self.connected = connected;
         // Longest first, so the first that holds a gateway is the longest match.
         self.connected.sort_by_key(|c| std::cmp::Reverse(c.1));
-        let keys: Vec<(IpAddr, u8)> = self.held.keys().copied().collect();
-        keys.into_iter().map(|k| self.change(k)).collect()
+        keys.into_iter()
+            .zip(before)
+            .map(|(k, before)| (self.change(k), before))
+            .filter(|(now, before)| now != before)
+            .map(|(now, _)| now)
+            .collect()
     }
 
     /// The interface whose prefix holds `gateway`.
@@ -119,7 +131,7 @@ impl Routes {
     }
 
     /// The change for ribd that makes it hold what is held for `at`.
-    fn change(&mut self, at: (IpAddr, u8)) -> Change {
+    fn change(&self, at: (IpAddr, u8)) -> Change {
         let action = match self.held.get(&at) {
             None => None,
             Some(Held::Discard) => Some(RouteAction::Discard),
@@ -127,17 +139,11 @@ impl Routes {
             Some(Held::Forward(gateways)) => {
                 let mut hops: Vec<NextHop> = Vec::new();
                 for &gateway in gateways {
-                    match self.interface(gateway) {
-                        Some(interface) => {
-                            let hop = NextHop {
-                                interface: interface.to_owned(),
-                                address: Some(gateway),
-                            };
-                            if !hops.contains(&hop) {
-                                hops.push(hop);
-                            }
-                        }
-                        None => self.hops_left_out += 1,
+                    if let Some(interface) = self.interface(gateway) {
+                        hops.push(NextHop {
+                            interface: interface.to_owned(),
+                            address: Some(gateway),
+                        });
                     }
                 }
                 (!hops.is_empty()).then_some(RouteAction::Forward(hops))
@@ -147,6 +153,22 @@ impl Routes {
             Some(action) => Change::set(key(at.0, at.1), Value::Route(action)),
             None => Change::delete(key(at.0, at.1)),
         }
+    }
+
+    /// Takes the route messages of one frame; the changes for ribd, one per prefix
+    /// at most: zebra sends an update as a delete and the new route in one frame,
+    /// and ribd gets only the new route, so it never goes without it in between.
+    pub fn take_frame(&mut self, routes: &[Route]) -> Vec<Change> {
+        let mut out: Vec<Change> = Vec::new();
+        for route in routes {
+            if let Some(change) = self.take(route) {
+                match out.iter_mut().find(|c| c.key == change.key) {
+                    Some(earlier) => *earlier = change,
+                    None => out.push(change),
+                }
+            }
+        }
+        out
     }
 
     /// Takes one route message; the change for ribd, if it is one ribd may care
@@ -163,16 +185,19 @@ impl Routes {
             (true, Kind::Blackhole) => Some(Held::Discard),
             (true, Kind::Unreachable) => Some(Held::Reject),
             (true, Kind::Unicast) => {
-                let gateways: Vec<IpAddr> = route
-                    .hops
-                    .iter()
-                    .filter_map(|h| {
-                        if h.gateway.is_none() {
+                let mut gateways: Vec<IpAddr> = Vec::new();
+                for hop in &route.hops {
+                    match hop.gateway {
+                        Some(g) if gateways.contains(&g) => {}
+                        Some(g) if self.interface(g).is_some() => gateways.push(g),
+                        // Kept, in case an interface's prefix comes to hold it.
+                        Some(g) => {
                             self.hops_left_out += 1;
+                            gateways.push(g);
                         }
-                        h.gateway
-                    })
-                    .collect();
+                        None => self.hops_left_out += 1,
+                    }
+                }
                 (!gateways.is_empty()).then_some(Held::Forward(gateways))
             }
             (true, Kind::Other(_)) => {
