@@ -11,7 +11,9 @@
 //! 2. With `bgp`: the import and export policies, prefix lists and route maps named
 //!    `ruster-*`, and `router bgp` with the router ID, the neighbors, and per address
 //!    family the networks and the neighbors of that family.
-//! 3. The operator's include file, as it is. It comes last, so it may add to what is
+//! 3. With `isis`, `ospf` or `ospf6`: their interface sections on the TAP devices
+//!    and `router` sections ([`crate::isis_ospf`]).
+//! 4. The operator's include file, as it is. It comes last, so it may add to what is
 //!    above (more settings in `router bgp` or for a neighbor, logging, passwords);
 //!    `ruster-frr` does not read it. It should not give again a setting written
 //!    above with another value (a second inbound route map for a neighbor):
@@ -54,7 +56,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use ruster_config::{Bgp, Connected};
+use ruster_config::{Bgp, Connected, Frr};
 
 /// The first line of the file.
 pub const HEADER: &str =
@@ -64,23 +66,19 @@ pub const FPM_PORT: u16 = 2620;
 /// The largest include file read.
 pub const INCLUDE_MAX: u64 = 1 << 20;
 
-/// FRR's configuration for `bgp`, with FPM on `fpm_port` and the include file's
+/// FRR's configuration for `frr`, with FPM on `fpm_port` and the include file's
 /// text. Each value is read as an address, prefix or number again, so nothing else
 /// reaches the file but the include.
-pub fn config(
-    bgp: Option<&Bgp>,
-    connected: &[Connected],
-    include: &str,
-    fpm_port: u16,
-) -> Result<String, String> {
+pub fn config(frr: &Frr, include: &str, fpm_port: u16) -> Result<String, String> {
     let port = match fpm_port {
         FPM_PORT => String::new(),
         port => format!(" port {port}"),
     };
     let mut out = format!("{HEADER}\nfpm address 127.0.0.1{port}\nno fpm use-next-hop-groups\n");
-    if let Some(bgp) = bgp {
-        router_bgp(&mut out, bgp, connected)?;
+    if let Some(bgp) = &frr.bgp {
+        router_bgp(&mut out, bgp, &frr.connected)?;
     }
+    crate::isis_ospf::write(&mut out, frr)?;
     out.push_str(include);
     if !out.ends_with('\n') {
         out.push('\n');
@@ -226,12 +224,12 @@ impl Bridge {
     /// `password` or `key-string` on a line is not shown (the include may hold
     /// secrets); a line whose secret changes shows as `(hidden, changed)`.
     pub fn check(&self, part: &str) -> Result<String, String> {
-        let ruster_config::Frr { bgp, connected, .. } = ruster_config::parse_frr_part(part)?;
-        let include = match bgp.as_ref().and_then(|b| b.include.first()) {
+        let frr = ruster_config::parse_frr_part(part)?;
+        let include = match frr.bgp.as_ref().and_then(|b| b.include.first()) {
             Some(path) => read_include(path)?,
             None => String::new(),
         };
-        let text = config(bgp.as_ref(), &connected, &include, self.fpm_port)?;
+        let text = config(&frr, &include, self.fpm_port)?;
         let before = match std::fs::read_to_string(&self.path) {
             Ok(before) => before,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -248,12 +246,12 @@ impl Bridge {
     /// Takes an `frr` part ([`ruster_config::frr_part`]), or refuses it with the
     /// reason; the interfaces' prefixes in it, for the next hops.
     pub fn take(&mut self, part: &str) -> Result<Vec<Connected>, String> {
-        let ruster_config::Frr { bgp, connected, .. } = ruster_config::parse_frr_part(part)?;
-        let include = match bgp.as_ref().and_then(|b| b.include.first()) {
+        let frr = ruster_config::parse_frr_part(part)?;
+        let include = match frr.bgp.as_ref().and_then(|b| b.include.first()) {
             Some(path) => read_include(path)?,
             None => String::new(),
         };
-        let text = config(bgp.as_ref(), &connected, &include, self.fpm_port)?;
+        let text = config(&frr, &include, self.fpm_port)?;
         let before = match std::fs::read_to_string(&self.path) {
             Ok(before) => Some(before),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -262,7 +260,7 @@ impl Bridge {
         // After a start, the command runs even for the file it finds: FRR may not
         // have applied it (ruster-frr may have stopped between the two).
         if self.took && before.as_deref() == Some(text.as_str()) {
-            return Ok(connected);
+            return Ok(frr.connected);
         }
         if before.as_deref() != Some(text.as_str()) {
             self.write(&text)?;
@@ -274,7 +272,7 @@ impl Bridge {
             // With no file before, FRR is brought back to one without bgp.
             let before = match before {
                 Some(before) => before,
-                None => config(None, &[], "", self.fpm_port)?,
+                None => config(&Frr::default(), "", self.fpm_port)?,
             };
             let put_back = self.write(&before);
             if let Err(again) = put_back.and_then(|()| self.run_reload()) {
@@ -283,7 +281,7 @@ impl Bridge {
             return Err(error);
         }
         self.took = true;
-        Ok(connected)
+        Ok(frr.connected)
     }
 
     fn write(&self, text: &str) -> Result<(), String> {

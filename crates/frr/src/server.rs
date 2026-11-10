@@ -114,6 +114,12 @@ impl Fpm {
         &self.routes
     }
 
+    /// Takes the TAP devices' indexes ([`crate::routes::tap_indexes`]); the
+    /// changes for ribd.
+    pub fn set_taps(&mut self, taps: std::collections::BTreeMap<u32, String>) -> Vec<Change> {
+        self.routes.set_taps(taps)
+    }
+
     /// Takes the interfaces' prefixes from confd's part; the changes for ribd.
     pub fn set_connected(&mut self, connected: &[Connected]) -> Vec<Change> {
         self.routes.set_connected(connected)

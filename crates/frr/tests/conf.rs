@@ -12,7 +12,22 @@ fn part_of(bgp: Option<&Bgp>, connected: &[Connected]) -> String {
         ..Frr::default()
     })
 }
-use ruster_frr::conf::{config, Bridge, HEADER};
+use ruster_frr::conf::{Bridge, HEADER};
+
+/// FRR's configuration for `bgp` and `connected`.
+fn config(
+    bgp: Option<&Bgp>,
+    connected: &[Connected],
+    include: &str,
+    port: u16,
+) -> Result<String, String> {
+    let frr = Frr {
+        bgp: bgp.cloned(),
+        connected: connected.to_vec(),
+        ..Frr::default()
+    };
+    ruster_frr::conf::config(&frr, include, port)
+}
 
 fn bgp() -> Bgp {
     Bgp {
@@ -302,4 +317,86 @@ fn a_check_shows_the_diff_with_passwords_hidden_and_writes_nothing() {
     .unwrap();
     assert_eq!(bridge.check(&part).unwrap(), "");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn isis_and_ospf_are_written_on_the_tap_devices() {
+    use ruster_config::{Isis, IsisInterface, Ospf, OspfInterface};
+    let ospf_on = |name: &str, network: &str, passive| OspfInterface {
+        name: name.into(),
+        area: "0.0.0.0".into(),
+        cost: 20,
+        network: network.into(),
+        passive,
+    };
+    let frr = Frr {
+        isis: Some(Isis {
+            net: "49.0001.1921.6800.1001.00".into(),
+            level: "level-2".into(),
+            interface: vec![IsisInterface {
+                name: "wan".into(),
+                metric: 30,
+                passive: false,
+            }],
+        }),
+        ospf: Some(Ospf {
+            router_id: "192.0.2.1".into(),
+            interface: vec![
+                ospf_on("wan", "point-to-point", false),
+                ospf_on("lan", "broadcast", true),
+            ],
+        }),
+        ospf6: Some(Ospf {
+            router_id: "192.0.2.1".into(),
+            interface: vec![ospf_on("wan", "broadcast", false)],
+        }),
+        connected: vec![Connected {
+            interface: "wan".into(),
+            prefix: "2001:db8:100::/64".into(),
+            link_local: "fe80::ff:fe00:2".into(),
+        }],
+        ..Frr::default()
+    };
+    let text = ruster_frr::conf::config(&frr, "", 2620).unwrap();
+    let want = format!(
+        "{HEADER}
+fpm address 127.0.0.1
+no fpm use-next-hop-groups
+interface rp-wan
+ ip router isis ruster
+ ipv6 router isis ruster
+ isis metric 30
+ ip ospf area 0.0.0.0
+ ip ospf cost 20
+ ip ospf network point-to-point
+ ipv6 ospf6 area 0.0.0.0
+ ipv6 ospf6 cost 20
+ ipv6 ospf6 network broadcast
+exit
+interface rp-lan
+ ip ospf area 0.0.0.0
+ ip ospf cost 20
+ ip ospf network broadcast
+ ip ospf passive
+exit
+router isis ruster
+ net 49.0001.1921.6800.1001.00
+ is-type level-2-only
+ metric-style wide
+exit
+router ospf
+ ospf router-id 192.0.2.1
+exit
+router ospf6
+ ospf6 router-id 192.0.2.1
+exit
+"
+    );
+    assert_eq!(text, want);
+    let mut bad = frr.clone();
+    bad.isis.as_mut().unwrap().net = "49.0001\nrouter bgp 1".into();
+    assert!(ruster_frr::conf::config(&bad, "", 2620).is_err());
+    let mut bad = frr;
+    bad.ospf.as_mut().unwrap().interface[0].name = "a b".into();
+    assert!(ruster_frr::conf::config(&bad, "", 2620).is_err());
 }
