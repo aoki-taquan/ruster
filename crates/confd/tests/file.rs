@@ -44,6 +44,7 @@ fn a_file_becomes_the_configuration() {
                 vlan: None,
                 tunnel: None,
                 pppoe: None,
+                ipv4_from: None,
             },
             InterfaceConfig {
                 name: "wan".into(),
@@ -56,6 +57,7 @@ fn a_file_becomes_the_configuration() {
                 vlan: None,
                 tunnel: None,
                 pppoe: None,
+                ipv4_from: None,
             },
         ]
     );

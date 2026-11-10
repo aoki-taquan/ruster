@@ -57,6 +57,8 @@
 //!   VLAN given before it); the session ID, the access concentrator's MAC and the
 //!   IPv4 address come from its source (of kind pppoe, one interface each). Its MTU
 //!   is at most the parent's less 8.
+//! - RFC 2131: an interface with `ipv4-from` (a port or VLAN) has the IPv4 address
+//!   its source, a DHCP client of kind dhcp-client (one interface each), leased.
 //! - RFC 919 and RFC 922: an IPv4 interface address in a prefix of /30 or shorter is
 //!   not the network or broadcast address of the prefix (RFC 3021 /31 is allowed).
 //! - RFC 6890 and RFC 1122 section 3.2.1.3: IPv4 interface addresses and next hops
@@ -325,6 +327,34 @@ pub fn config(lock: Lock) -> Result<Config, String> {
             }
             None => None,
         };
+        let ipv4_from = match at_most_one(&at, "ipv4-from", &entry.ipv4_from)? {
+            None => None,
+            Some(_) if ipv4.is_some() => {
+                return Err(format!("{at}: give ipv4 or ipv4-from, not both"))
+            }
+            Some(_) if tunnel.is_some() || pppoe.is_some() => {
+                return Err(format!("{at}: only a port or VLAN takes ipv4-from"))
+            }
+            Some(source) => {
+                if !sources
+                    .iter()
+                    .any(|s| s.name == *source && s.kind == crate::source::Kind::DhcpClient)
+                {
+                    return Err(format!(
+                        "{at}: ipv4-from {source:?} must be a source of kind dhcp-client"
+                    ));
+                }
+                if interfaces
+                    .iter()
+                    .any(|i: &InterfaceConfig| i.ipv4_from.as_ref() == Some(source))
+                {
+                    return Err(format!(
+                        "{at}: source {source:?} gives the address of another interface"
+                    ));
+                }
+                Some(source.clone())
+            }
+        };
         if !entry.ipv6.is_empty() && mtu < IPV6_MIN_MTU {
             return Err(format!(
                 "{at}: mtu must be at least {IPV6_MIN_MTU} on an interface with ipv6 addresses"
@@ -362,6 +392,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
             vlan: vlan.map(|(parent, id, _)| (parent, id)),
             tunnel,
             pppoe: pppoe.map(|(parent, source, _)| (parent, source)),
+            ipv4_from,
         });
     }
     // A MAP-E CE's tunnel is an interface like the others for what follows.
@@ -972,6 +1003,7 @@ fn map_e(
         vlan: None,
         tunnel: Some((local, br)),
         pppoe: None,
+        ipv4_from: None,
     };
     let nat = Nat {
         filtering: filtering(at, &entry.filtering)?,
@@ -1046,7 +1078,7 @@ fn nat(
         .map(|(address, _)| address);
     let session = interfaces
         .iter()
-        .any(|i| i.name == entry.outside && i.pppoe.is_some());
+        .any(|i| i.name == entry.outside && i.address_from_source());
     if outside_address.is_none() && !session {
         return Err(format!("{at}: {:?} has no ipv4 address", entry.outside));
     }

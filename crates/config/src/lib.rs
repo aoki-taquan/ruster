@@ -34,6 +34,12 @@
 //! ipv6 = ["2001:db8:1::1/64"]  # optional; a link-local address is added by itself
 //! vrf = "red"                  # optional, "default" when left out
 //!
+//! [[interface]]                # a WAN port whose IPv4 address a DHCP client finds
+//! name = "wan"
+//! mac = "02:00:00:00:00:02"
+//! ipv4-from = "dhcp-wan"       # optional, instead of ipv4: the source (of kind
+//!                              # dhcp-client) that sends the address
+//!
 //! [[interface]]                # a VLAN sub-interface of lan, after lan
 //! name = "lan.10"
 //! parent = "lan"
@@ -194,10 +200,13 @@
 //!                              # at run time, on confd/source/<name>.sock
 //! name = "pppoe-wan"           # lower-case letters, digits and -, from a letter
 //! kind = "pppoe"               # what it may send: "pppoe" (ruster-pppoed: a
-//!                              # session and its IPv4 address)
+//!                              # session, its IPv4 address and DNS servers),
+//!                              # "dhcp-client" (an IPv4 address and DNS servers),
+//!                              # "dhcpv6-client" (an IPv6 address, a delegated
+//!                              # prefix and DNS servers)
 //! sync-wait = 10               # optional: after confd starts, the most seconds
 //!                              # it waits for the source to send everything again;
-//!                              # by kind when left out (10 for pppoe)
+//!                              # by kind when left out (10 for each)
 //! ```
 //!
 //! # The lock form
@@ -227,6 +236,7 @@
 //! enabled = true
 //! vrf = "default"
 //! ipv4 = ["192.0.2.1/24"]
+//! ipv4-from = []               # none or one source; then ipv4 is empty
 //! ipv6 = []
 //! kind = "port"
 //!
@@ -237,6 +247,7 @@
 //! enabled = true
 //! vrf = "default"
 //! ipv4 = []
+//! ipv4-from = []
 //! ipv6 = []
 //!
 //! [interface.kind.vlan]        # or [interface.kind.tunnel] with local and remote,
@@ -427,7 +438,8 @@ pub const PPPOE_ECHO_FAILURES: u32 = 3;
 /// The kinds of source, and how long confd waits after it starts for each to send
 /// everything again, in seconds: a daemon in the same box connects again within a
 /// second or two.
-pub const SOURCE_KINDS: &[(&str, u32)] = &[("pppoe", 10)];
+pub const SOURCE_KINDS: &[(&str, u32)] =
+    &[("pppoe", 10), ("dhcp-client", 10), ("dhcpv6-client", 10)];
 /// The ICMP error rate limits: IPv4's interval, and ICMPv6's burst and interval.
 pub const ICMP_ERRORS: IcmpErrors = IcmpErrors {
     ipv4_interval_ms: 100,
@@ -594,6 +606,9 @@ pub struct Interface {
     pub vrf: String,
     /// None or one.
     pub ipv4: Vec<String>,
+    /// None or one: the source (of kind `dhcp-client`) whose IPv4 address the
+    /// interface has, instead of `ipv4`.
+    pub ipv4_from: Vec<String>,
     pub ipv6: Vec<String>,
     pub kind: Kind,
 }

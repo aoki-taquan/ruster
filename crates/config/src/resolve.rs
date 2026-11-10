@@ -136,7 +136,7 @@ struct FirewallEntry {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct InterfaceEntry {
     name: String,
     mac: Option<String>,
@@ -145,6 +145,7 @@ struct InterfaceEntry {
     mtu: Option<u16>,
     enabled: Option<bool>,
     ipv4: Option<String>,
+    ipv4_from: Option<String>,
     #[serde(default)]
     ipv6: Vec<String>,
     vrf: Option<String>,
@@ -274,6 +275,14 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
             (None, _, Some(parent)) => parent.clone()?.1,
             (None, ..) => MTU,
         };
+        if entry.ipv4_from.is_some() {
+            if entry.ipv4.is_some() {
+                return Err(format!("{at}: give ipv4 or ipv4-from, not both"));
+            }
+            if !matches!(kind, Kind::Port | Kind::Vlan { .. }) {
+                return Err(format!("{at}: only a port or VLAN takes ipv4-from"));
+            }
+        }
         let ipv4 = match entry.ipv4 {
             Some(text) => vec![text],
             None if matches!(kind, Kind::Tunnel { .. }) => {
@@ -299,6 +308,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
             enabled: entry.enabled.unwrap_or(true),
             vrf,
             ipv4,
+            ipv4_from: entry.ipv4_from.into_iter().collect(),
             ipv6: entry.ipv6,
             kind,
         });

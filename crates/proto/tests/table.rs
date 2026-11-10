@@ -1251,3 +1251,76 @@ fn source_values_round_trip_and_are_checked() {
         assert!(change.validate().is_err(), "{change:?}");
     }
 }
+
+#[test]
+fn dhcp_source_values_round_trip_and_are_checked() {
+    let source = || "dhcp6-wan".to_owned();
+    let prefix = |prefix: &str, len, preferred, valid| {
+        Change::set(
+            Key::SourcePrefix { source: source() },
+            Value::SourcePrefix {
+                prefix: prefix.parse().unwrap(),
+                prefix_len: len,
+                preferred,
+                valid,
+                lifetime: 60,
+            },
+        )
+    };
+    let address = |len, lifetime| {
+        Change::set(
+            Key::SourceIpv6 { source: source() },
+            Value::SourceIpv6 {
+                address: "2001:db8::2".parse().unwrap(),
+                prefix_len: len,
+                lifetime,
+            },
+        )
+    };
+    let dns = |servers: Vec<IpAddr>| {
+        Change::set(
+            Key::SourceDns { source: source() },
+            Value::SourceDns {
+                servers,
+                lifetime: 60,
+            },
+        )
+    };
+    let good = [
+        prefix("2001:db8:12:3400::", 56, 3600, 7200),
+        address(128, 60),
+        dns(vec![
+            Ipv4Addr::new(192, 0, 2, 53).into(),
+            "2001:db8::53".parse().unwrap(),
+        ]),
+    ];
+    for change in &good {
+        change.validate().unwrap();
+        assert_eq!(&round_trip(change), change);
+        let delete = Change::delete(change.key.clone());
+        assert_eq!(round_trip(&delete), delete);
+    }
+    let bad = [
+        // Bits after the prefix length.
+        prefix("2001:db8:12:3401::", 56, 3600, 7200),
+        prefix("2001:db8:12:3400::", 0, 3600, 7200),
+        // Preferred above valid.
+        prefix("2001:db8:12:3400::", 56, 7201, 7200),
+        address(129, 60),
+        address(128, 0),
+        dns(Vec::new()),
+        dns(vec![Ipv4Addr::new(192, 0, 2, 53).into(); 9]),
+        // The value of another table.
+        Change::set(
+            Key::SourceDns { source: source() },
+            Value::SourceIpv6 {
+                address: "2001:db8::2".parse().unwrap(),
+                prefix_len: 128,
+                lifetime: 60,
+            },
+        ),
+    ];
+    for change in bad {
+        assert!(change.validate().is_err(), "{change:?}");
+    }
+}

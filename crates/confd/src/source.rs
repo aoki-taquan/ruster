@@ -7,10 +7,13 @@
 //!
 //! | Kind | What it may write |
 //! |---|---|
-//! | `pppoe` | [`Key::SourcePppoe`] (the session ID, the access concentrator's MAC, the MTU) and [`Key::SourceIpv4`] (the address IPCP gave) |
+//! | `pppoe` | [`Key::SourcePppoe`] (the session ID, the access concentrator's MAC, the MTU), [`Key::SourceIpv4`] (the address IPCP gave) and [`Key::SourceDns`] |
+//! | `dhcp-client` | [`Key::SourceIpv4`] (the leased address and its prefix length) and [`Key::SourceDns`] |
+//! | `dhcpv6-client` | [`Key::SourceIpv6`] (an IA_NA address), [`Key::SourcePrefix`] (the delegated prefix) and [`Key::SourceDns`] |
 //!
 //! A write to another table, or under another source's name, is refused. So is an
-//! IPv4 address that is not a unicast address, and a session MTU below 1280.
+//! address that is not a unicast address (a DNS server's too, and a delegated
+//! prefix that is link-local or multicast), and a session MTU below 1280.
 //!
 //! Every value carries a lifetime in seconds. confd counts it from when the value
 //! arrives, and from each time it arrives again: the daemon sends its values again
@@ -38,7 +41,7 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::net::UnixStream;
 
 use ruster_proto::session::{Hook, Server, Store};
@@ -60,12 +63,18 @@ pub const NAME_MAX: usize = 32;
 pub enum Kind {
     /// `ruster-pppoed`: one PPPoE session.
     Pppoe,
+    /// `ruster-dhcpc`'s DHCPv4 client on one interface.
+    DhcpClient,
+    /// `ruster-dhcpc`'s DHCPv6 client on one interface.
+    Dhcpv6Client,
 }
 
 impl Kind {
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "pppoe" => Some(Self::Pppoe),
+            "dhcp-client" => Some(Self::DhcpClient),
+            "dhcpv6-client" => Some(Self::Dhcpv6Client),
             _ => None,
         }
     }
@@ -73,13 +82,17 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Self::Pppoe => "pppoe",
+            Self::DhcpClient => "dhcp-client",
+            Self::Dhcpv6Client => "dhcpv6-client",
         }
     }
 
     /// The tables (SIDs) a source of this kind writes.
     pub fn tables(self) -> &'static [u64] {
         match self {
-            Self::Pppoe => &[sid::SOURCE_PPPOE, sid::SOURCE_IPV4],
+            Self::Pppoe => &[sid::SOURCE_PPPOE, sid::SOURCE_IPV4, sid::SOURCE_DNS],
+            Self::DhcpClient => &[sid::SOURCE_IPV4, sid::SOURCE_DNS],
+            Self::Dhcpv6Client => &[sid::SOURCE_IPV6, sid::SOURCE_PREFIX, sid::SOURCE_DNS],
         }
     }
 }
@@ -119,8 +132,12 @@ pub fn specs(sources: Vec<ruster_config::Source>) -> Result<Vec<Spec>, String> {
         if out.iter().any(|s| s.name == source.name) {
             return Err(format!("{at}: given twice"));
         }
-        let kind = Kind::from_name(&source.kind)
-            .ok_or_else(|| format!("{at}: kind {:?} is not \"pppoe\"", source.kind))?;
+        let kind = Kind::from_name(&source.kind).ok_or_else(|| {
+            format!(
+                "{at}: kind {:?} is not \"pppoe\", \"dhcp-client\" or \"dhcpv6-client\"",
+                source.kind
+            )
+        })?;
         if source.sync_wait > SYNC_WAIT_MAX {
             return Err(format!("{at}: sync-wait must be at most {SYNC_WAIT_MAX}"));
         }
@@ -153,7 +170,11 @@ impl Hook for Taking<'_> {
     fn check(&mut self, next: &Store) -> Result<(), String> {
         for (key, value) in next.iter() {
             let source = match key {
-                Key::SourcePppoe { source } | Key::SourceIpv4 { source } => source,
+                Key::SourcePppoe { source }
+                | Key::SourceIpv4 { source }
+                | Key::SourceIpv6 { source }
+                | Key::SourcePrefix { source }
+                | Key::SourceDns { source } => source,
                 _ => return Err("not a source's value".into()),
             };
             if source != self.name {
@@ -162,6 +183,21 @@ impl Hook for Taking<'_> {
             match value {
                 Value::SourceIpv4 { address, .. } if !unicast(*address) => {
                     return Err(format!("{address} is not a unicast address"));
+                }
+                Value::SourceIpv6 { address, .. } if !unicast_v6(*address) => {
+                    return Err(format!("{address} is not a global unicast address"));
+                }
+                Value::SourcePrefix { prefix, .. } if !unicast_v6(*prefix) => {
+                    return Err(format!("{prefix} is not a global unicast prefix"));
+                }
+                Value::SourceDns { servers, .. } => {
+                    let bad = servers.iter().find(|a| match a {
+                        IpAddr::V4(a) => !unicast(*a),
+                        IpAddr::V6(a) => a.is_unspecified() || a.is_loopback() || a.is_multicast(),
+                    });
+                    if let Some(bad) = bad {
+                        return Err(format!("DNS server {bad} is not a unicast address"));
+                    }
                 }
                 // The session interface may carry IPv6 (RFC 8200 section 5).
                 Value::SourcePppoe { mtu, .. } if *mtu < IPV6_MIN_MTU => {
@@ -182,9 +218,13 @@ impl Hook for Taking<'_> {
     fn patched(&mut self, changes: &[Change]) {
         for change in changes {
             let lifetime = match &change.value {
-                Some(Value::SourcePppoe { lifetime, .. } | Value::SourceIpv4 { lifetime, .. }) => {
-                    *lifetime
-                }
+                Some(
+                    Value::SourcePppoe { lifetime, .. }
+                    | Value::SourceIpv4 { lifetime, .. }
+                    | Value::SourceIpv6 { lifetime, .. }
+                    | Value::SourcePrefix { lifetime, .. }
+                    | Value::SourceDns { lifetime, .. },
+                ) => *lifetime,
                 _ => {
                     self.until.remove(&change.key);
                     continue;
@@ -201,6 +241,15 @@ impl Hook for Taking<'_> {
 fn unicast(address: Ipv4Addr) -> bool {
     let first = address.octets()[0];
     first != 0 && first != 127 && first < 224
+}
+
+/// A global unicast IPv6 address or prefix: not unspecified, loopback, multicast
+/// or link-local (RFC 4291 section 2.4).
+fn unicast_v6(address: Ipv6Addr) -> bool {
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || address.is_unicast_link_local())
 }
 
 /// confd's sources and the values they sent.
@@ -325,6 +374,50 @@ impl Sources {
                 session, peer, mtu, ..
             } => Some((*session, *peer, *mtu)),
             _ => None,
+        }
+    }
+
+    /// The delegated prefix the source `name` has now: the prefix, its length, and
+    /// the preferred and valid lifetimes it was given.
+    pub(crate) fn prefix(&self, name: &str) -> Option<(Ipv6Addr, u8, u32, u32)> {
+        let key = Key::SourcePrefix {
+            source: name.to_owned(),
+        };
+        match self.value(name, &key)? {
+            Value::SourcePrefix {
+                prefix,
+                prefix_len,
+                preferred,
+                valid,
+                ..
+            } => Some((*prefix, *prefix_len, *preferred, *valid)),
+            _ => None,
+        }
+    }
+
+    /// The IPv6 address and prefix length the source `name` has now.
+    pub(crate) fn ipv6(&self, name: &str) -> Option<(Ipv6Addr, u8)> {
+        let key = Key::SourceIpv6 {
+            source: name.to_owned(),
+        };
+        match self.value(name, &key)? {
+            Value::SourceIpv6 {
+                address,
+                prefix_len,
+                ..
+            } => Some((*address, *prefix_len)),
+            _ => None,
+        }
+    }
+
+    /// The DNS servers the source `name` has now; none when it has sent none.
+    pub(crate) fn dns(&self, name: &str) -> &[IpAddr] {
+        let key = Key::SourceDns {
+            source: name.to_owned(),
+        };
+        match self.value(name, &key) {
+            Some(Value::SourceDns { servers, .. }) => servers,
+            _ => &[],
         }
     }
 

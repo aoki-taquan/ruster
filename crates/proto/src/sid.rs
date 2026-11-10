@@ -121,6 +121,23 @@ pub const SOURCE_IPV4: u64 = 60200;
 pub const SOURCE_IPV4_ADDRESS: u64 = 60201;
 pub const SOURCE_IPV4_PREFIX_LENGTH: u64 = 60202;
 pub const SOURCE_IPV4_LIFETIME: u64 = 60203;
+/// A delegated IPv6 prefix (DHCPv6 IA_PD) with its preferred and valid lifetimes
+/// as the delegating router gave them.
+pub const SOURCE_PREFIX: u64 = 60210;
+pub const SOURCE_PREFIX_PREFIX: u64 = 60211;
+pub const SOURCE_PREFIX_PREFIX_LENGTH: u64 = 60212;
+pub const SOURCE_PREFIX_PREFERRED: u64 = 60213;
+pub const SOURCE_PREFIX_VALID: u64 = 60214;
+pub const SOURCE_PREFIX_LIFETIME: u64 = 60215;
+/// An IPv6 address with its prefix length (DHCPv6 IA_NA).
+pub const SOURCE_IPV6: u64 = 60220;
+pub const SOURCE_IPV6_ADDRESS: u64 = 60221;
+pub const SOURCE_IPV6_PREFIX_LENGTH: u64 = 60222;
+pub const SOURCE_IPV6_LIFETIME: u64 = 60223;
+/// The DNS servers a source found (DHCP, DHCPv6, IPCP).
+pub const SOURCE_DNS: u64 = 60230;
+pub const SOURCE_DNS_ADDRESS: u64 = 60231;
+pub const SOURCE_DNS_LIFETIME: u64 = 60232;
 
 /// Notification: the FE has a packet for a next hop that is not in the neighbor table.
 pub const RESOLVE_REQUEST: u64 = 60050;
@@ -261,6 +278,19 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-source:ipv4-address/address", SOURCE_IPV4_ADDRESS),
     ("/ruster-source:ipv4-address/prefix-length", SOURCE_IPV4_PREFIX_LENGTH),
     ("/ruster-source:ipv4-address/lifetime", SOURCE_IPV4_LIFETIME),
+    ("/ruster-source:delegated-prefix", SOURCE_PREFIX),
+    ("/ruster-source:delegated-prefix/prefix", SOURCE_PREFIX_PREFIX),
+    ("/ruster-source:delegated-prefix/prefix-length", SOURCE_PREFIX_PREFIX_LENGTH),
+    ("/ruster-source:delegated-prefix/preferred-lifetime", SOURCE_PREFIX_PREFERRED),
+    ("/ruster-source:delegated-prefix/valid-lifetime", SOURCE_PREFIX_VALID),
+    ("/ruster-source:delegated-prefix/lifetime", SOURCE_PREFIX_LIFETIME),
+    ("/ruster-source:ipv6-address", SOURCE_IPV6),
+    ("/ruster-source:ipv6-address/address", SOURCE_IPV6_ADDRESS),
+    ("/ruster-source:ipv6-address/prefix-length", SOURCE_IPV6_PREFIX_LENGTH),
+    ("/ruster-source:ipv6-address/lifetime", SOURCE_IPV6_LIFETIME),
+    ("/ruster-source:dns-servers", SOURCE_DNS),
+    ("/ruster-source:dns-servers/address", SOURCE_DNS_ADDRESS),
+    ("/ruster-source:dns-servers/lifetime", SOURCE_DNS_LIFETIME),
     ("/ruster-neighbor:resolve-request", RESOLVE_REQUEST),
     (
         "/ruster-neighbor:resolve-request/interface",
