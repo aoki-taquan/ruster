@@ -161,6 +161,7 @@ struct InterfaceEntry {
     vrf: Option<String>,
     tunnel: Option<TunnelEntry>,
     etherip: Option<TunnelEntry>,
+    vxlan: Option<VxlanEntry>,
     pppoe: Option<PppoeEntry>,
     bridge: Option<BridgeEntry>,
 }
@@ -180,6 +181,14 @@ struct BridgeEntry {
 struct PppoeEntry {
     parent: String,
     source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VxlanEntry {
+    vni: u32,
+    local: String,
+    remote: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -230,7 +239,23 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         let at = format!("interface {:?}", entry.name);
         let vrf = default_vrf(entry.vrf);
         let etherip = entry.etherip;
+        if entry.vxlan.is_some() && etherip.is_some() {
+            return Err(format!("{at}: give etherip or vxlan, not both"));
+        }
         let kind = match (entry.parent, entry.vlan, entry.tunnel, entry.pppoe) {
+            (None, None, None, None) if entry.bridge.is_none() && entry.vxlan.is_some() => {
+                let vxlan = entry.vxlan.expect("checked");
+                Kind::Vxlan {
+                    vni: vxlan.vni,
+                    local: vxlan.local,
+                    remote: vxlan.remote,
+                }
+            }
+            _ if entry.vxlan.is_some() => {
+                return Err(format!(
+                "{at}: a VXLAN interface is not also a VLAN, a tunnel, a PPPoE session or a bridge"
+            ))
+            }
             (None, None, None, None) if entry.bridge.is_none() && etherip.is_some() => {
                 let etherip = etherip.expect("checked");
                 Kind::EtherIp {
@@ -310,13 +335,15 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                         format!("{at}: PPPoE parent {parent:?} must be a port or VLAN given before it")
                     }),
             ),
-            // A bridge's own interface: its first member's MAC, and the smallest MTU
-            // of its members given before it.
+            // A bridge's own interface: its first port's or VLAN's MAC (a tunnel's
+            // is the same on every router), and the smallest MTU of its members
+            // given before it.
             Kind::Bridge(bridge) => Some(
                 bridge
                     .members
-                    .first()
-                    .and_then(|first| interfaces.iter().find(|i| i.name == *first))
+                    .iter()
+                    .filter_map(|member| interfaces.iter().find(|i| i.name == *member))
+                    .find(|i| matches!(i.kind, Kind::Port | Kind::Vlan { .. }))
                     .map(|i| {
                         let mtu = interfaces
                             .iter()
@@ -327,14 +354,18 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                         (i.mac.clone(), mtu)
                     })
                     .ok_or_else(|| {
-                        format!("{at}: its first member must be an interface given before it")
+                        format!(
+                            "{at}: give its mac, or a port or VLAN given before it as a member"
+                        )
                     }),
             ),
             _ => None,
         };
         let mac = match (entry.mac, &kind, &parent) {
             (Some(mac), ..) => mac,
-            (None, Kind::Tunnel { .. } | Kind::EtherIp { .. }, _) => TUNNEL_MAC.to_owned(),
+            (None, Kind::Tunnel { .. } | Kind::EtherIp { .. } | Kind::Vxlan { .. }, _) => {
+                TUNNEL_MAC.to_owned()
+            }
             (None, _, Some(parent)) => parent.clone()?.0,
             (None, ..) => return Err(format!("{at}: mac is missing")),
         };
@@ -345,6 +376,10 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
                 MTU - crate::ETHERIP_OVERHEAD_IPV6
             }
             (None, Kind::EtherIp { .. }, _) => MTU - crate::ETHERIP_OVERHEAD_IPV4,
+            (None, Kind::Vxlan { local, .. }, _) if local.contains(':') => {
+                MTU - crate::VXLAN_OVERHEAD_IPV6
+            }
+            (None, Kind::Vxlan { .. }, _) => MTU - crate::VXLAN_OVERHEAD_IPV4,
             (None, _, Some(parent)) => parent.clone()?.1,
             (None, ..) => MTU,
         };

@@ -90,6 +90,7 @@ fn config() -> Config {
         ospf: None,
         ospf6: None,
         etherip: Vec::new(),
+        vxlan: Vec::new(),
     }
 }
 

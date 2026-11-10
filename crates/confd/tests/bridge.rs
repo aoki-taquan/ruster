@@ -85,7 +85,7 @@ mac = "02:00:00:00:01:02"
 "#;
     for (bridge, why) in [
         (r#"bridge = { members = [] }"#, "member"),
-        (r#"bridge = { members = ["p9"] }"#, "first member"),
+        (r#"bridge = { members = ["p9"] }"#, "give its mac"),
         (r#"bridge = { members = ["p1", "p9"] }"#, "no interface"),
         (
             r#"bridge = { members = ["p1"], aging-time = 5 }"#,
