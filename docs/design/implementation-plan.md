@@ -132,7 +132,9 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-09 にow
 backlogのまま置き、使う場面が出たものから片付ける。
 
 次はルータ箱としての組み立て（2026-11-10 charterに追加）。順番は[`router-box.md`](router-box.md)の
-「作る順番」に従う。今は「移り方」の1の途中で、既定値を`ruster-config`へ集め、confdはlockの形（版1）だけを使う。
+「作る順番」に従う。lockの形（版1）、confdが各プロセスへ担当の部分を渡すsocket（`confd/part.sock`）、
+Unboundの橋渡し役（`ruster-unbound`、netns `dns`）まで済んだ。候補、差分、確定を分けるのはまだで、
+新しい設定はどれかが断ったら前に戻すだけ。次は「作る順番」の3（Kea）。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信。
 外れている点として、それぞれのモジュールの`# Standards`に書く。

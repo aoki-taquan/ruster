@@ -24,8 +24,9 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 | `ruster-confd` | 設定ファイルを読み、各プロセスへ渡す | インターフェース、アドレス |
 | `ruster-ribd` | 送り手（confdや外のデーモン）の経路から選び、FEへ渡す | 経路 |
 | `ruster-neighd` | ARP。FEから受け取って答え、問い合わせる | 近隣 |
+| `ruster-unbound` | confdから設定の`[dns]`を受け取り、Unboundの設定に書いて読み直させる | — |
 
-ルーティングデーモン、DHCP、DNSはrusterに組み込みません。外のデーモンがconfdやribdへ渡します。
+ルーティングデーモン、DHCP、DNSはrusterに組み込みません。外のデーモンがconfdやribdへ渡します。DNSのサーバはUnboundで、`ruster-unbound`がconfdの設定をUnboundの設定に変えます。
 
 設計の詳細は`docs/design/`にあります。
 
@@ -154,6 +155,8 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 機能を組み合わせた構成の試験は、`netns-vlan-nat.sh`（VLANの上のNATとfirewall）、`netns-pppoe-nat.sh`
 （PPPoEの上のNATとfirewall）、`netns-map-e-pppoe.sh`（PPPoEの上のMAP-E）、`netns-vrf-vlan.sh`（VLANごとのVRF）、
 `netns-dslite-firewall6.sh`（DS-LiteとIPv6のfirewall）、`netns-vrf-firewall.sh`（VRFとfirewall）です。
+`netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る。
+インターネットにはつながない）。
 
 ## 開発
 
@@ -175,6 +178,7 @@ cargo test --doc --workspace --all-features --locked
 |---|---|
 | `fe` | FE（`ruster-fe`） |
 | `confd`、`ribd`、`neighd` | CEのプロセス |
+| `unbound` | Unboundの橋渡し役（`ruster-unbound`） |
 | `cli` | `ruster`コマンド |
 | `config` | 設定の書き方（`ruster.toml`と、既定値を全部埋めたlockの形）と、その解決 |
 | `proto` | プロセス間のメッセージ（CBOR、CoAPの枠組み、表、接続、起動まわり） |
