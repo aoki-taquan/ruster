@@ -5,11 +5,14 @@
 //! `nd` to the neighbor process, and the kinds of the kernel's traffic
 //! (`icmp-error`, `icmp`, `tcp-syn`, `tcp`, `udp`, `other`). An entry with one of
 //! their names changes their rate and burst (and, for a kernel kind, may drop it);
-//! deleting it brings back the default. Other entries match an IP protocol and,
-//! for TCP and UDP, a range of destination ports, on one interface or on any.
-//! Packets to the router are first matched against those entries, then fall into
-//! the kernel kind they are of. Two entries that could match the same packet are
-//! refused, so the order of the entries does not matter.
+//! deleting it brings back the default. Other entries match PPPoE Discovery, PPP
+//! control in PPPoE sessions, or an IP protocol and, for TCP and UDP, a range of
+//! destination ports, on one interface or on any. Packets to the router are first
+//! matched against the IP entries, then fall into the kernel kind they are of. An
+//! entry for a control process also gets the frames core picks out before
+//! forwarding ([`ruster_core::PuntFrameMatch`]): PPPoE's, and IP to a broadcast or
+//! link-local multicast address (DHCP). Two entries that could match the same
+//! packet are refused, so the order of the entries does not matter.
 //!
 //! Each class has its own token bucket; a class to the kernel has one per VRF, so
 //! that a flood in one VRF does not crowd out another's. Each class counts what it
@@ -19,6 +22,9 @@
 //!
 //! - RFC 6192 section 3 (Informational): traffic to the router is sorted into
 //!   classes, each with its own rate limit, set by the deployment (section 3.2).
+//! - RFC 2516 (PPPoE), RFC 2131 section 4.1 (DHCP, ports 67 and 68) and RFC 8415
+//!   section 7 (DHCPv6, ports 546 and 547, ff02::1:2): the frames core picks out
+//!   for a control process follow them (`ruster_core::PuntFrameMatch`).
 //!
 //! Deviations: classes have no priority among themselves; each has its own limit
 //! instead, so one that overflows does not take another's place. An entry with
@@ -26,7 +32,7 @@
 //! whose transport header follows an extension header; those fall into a kernel
 //! kind.
 
-use ruster_core::IfId;
+use ruster_core::{IfId, PuntFrameKind, PuntFrameMatch};
 use ruster_proto::session::Store;
 use ruster_proto::table::{Key, PuntClass, PuntDestination, PuntKind, PuntMatch, Value};
 
@@ -40,6 +46,8 @@ pub(crate) const DEFAULT_RATE: u32 = 2_000;
 pub(crate) const DEFAULT_BURST: u32 = 200;
 /// The control process ARP and Neighbor Discovery go to.
 pub(crate) const NEIGHBOR_PROCESS: &str = "neighd";
+/// The most control processes the entries may name.
+pub(crate) const CONTROLS_MAX: usize = 16;
 
 /// The built-in classes, in the order of their index.
 const BUILT_IN: [PuntKind; 8] = [
@@ -136,37 +144,40 @@ impl Classes {
                 built.burst = entry.burst;
                 continue;
             }
-            let PuntMatch::Ip { protocol, ports } = entry.matches else {
-                return Err(format!(
-                    "punt class {name}: a fixed kind is matched only by its built-in class"
-                ));
-            };
-            if matches!(entry.destination, PuntDestination::Control(_)) {
-                return Err(format!(
-                    "punt class {name}: a control process as the destination is not supported yet"
-                ));
-            }
-            for &(other, earlier) in &entries[..at] {
-                let PuntMatch::Ip {
-                    protocol: other_protocol,
-                    ports: other_ports,
-                } = earlier.matches
-                else {
-                    continue;
-                };
-                let interfaces = match (&entry.interface, &earlier.interface) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => true,
-                };
-                let ports = match (ports, other_ports) {
-                    (Some((a, b)), Some((c, d))) => a <= d && c <= b,
-                    _ => true,
-                };
-                if protocol == other_protocol && interfaces && ports {
+            if let PuntMatch::Kind(kind) = entry.matches {
+                if !matches!(kind, PuntKind::PppoeDiscovery | PuntKind::PppControl) {
                     return Err(format!(
-                        "punt classes {other} and {name} can match the same packet"
+                        "punt class {name}: kind {} is matched only by its built-in class",
+                        kind.name()
                     ));
                 }
+            }
+            if let PuntDestination::Control(control) = &entry.destination {
+                // The neighbor process's socket is its own: a name whose socket
+                // would be at the same path is refused too.
+                if control == NEIGHBOR_PROCESS
+                    || ruster_proto::daemon::socket::fe_punt(control)
+                        == ruster_proto::daemon::socket::FE_PUNT
+                {
+                    return Err(format!(
+                        "punt class {name}: only ARP and Neighbor Discovery go to \
+                         {NEIGHBOR_PROCESS}, and {control} names its socket"
+                    ));
+                }
+                // ICMPv6 to link-local multicast is Neighbor Discovery's.
+                if matches!(entry.matches, PuntMatch::Ip { protocol: 58, .. }) {
+                    return Err(format!(
+                        "punt class {name}: ICMPv6 goes to the kernel or {NEIGHBOR_PROCESS}"
+                    ));
+                }
+            }
+            if let Some(&(other, _)) = entries[..at]
+                .iter()
+                .find(|(_, earlier)| overlap(entry, earlier))
+            {
+                return Err(format!(
+                    "punt classes {other} and {name} can match the same packet"
+                ));
             }
             let resolved = match &entry.interface {
                 Some(named) => match interface(named) {
@@ -184,7 +195,65 @@ impl Classes {
                 burst: entry.burst,
             });
         }
+        let mut controls: Vec<&str> = classes
+            .iter()
+            .filter_map(|class| match &class.destination {
+                PuntDestination::Control(name) => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        controls.sort_unstable();
+        controls.dedup();
+        if controls.len() > CONTROLS_MAX {
+            return Err(format!(
+                "punt classes name more than {CONTROLS_MAX} control processes"
+            ));
+        }
         Ok(Self { classes })
+    }
+
+    /// What core picks out before forwarding for the entries to a control process,
+    /// each with the index of its class.
+    pub(crate) fn frame_matches(&self) -> Vec<PuntFrameMatch> {
+        self.classes
+            .iter()
+            .enumerate()
+            .skip(BUILT_IN.len())
+            .filter(|(_, class)| matches!(class.destination, PuntDestination::Control(_)))
+            .filter_map(|(index, class)| {
+                let kind = match class.matches {
+                    PuntMatch::Kind(PuntKind::PppoeDiscovery) => PuntFrameKind::PppoeDiscovery,
+                    PuntMatch::Kind(PuntKind::PppControl) => PuntFrameKind::PppControl,
+                    PuntMatch::Ip { protocol, ports } => PuntFrameKind::Ip { protocol, ports },
+                    PuntMatch::Kind(_) => return None,
+                };
+                Some(PuntFrameMatch {
+                    ingress: class.interface,
+                    kind,
+                    class: u16::try_from(index).ok()?,
+                })
+            })
+            .collect()
+    }
+
+    /// The control processes the classes go to, each with the kinds of frame it
+    /// may send back: (name, PPPoE frames, IP frames).
+    pub(crate) fn controls(&self) -> Vec<(String, bool, bool)> {
+        let mut controls: Vec<(String, bool, bool)> = Vec::new();
+        for class in &self.classes[BUILT_IN.len()..] {
+            let PuntDestination::Control(name) = &class.destination else {
+                continue;
+            };
+            let pppoe = matches!(class.matches, PuntMatch::Kind(_));
+            match controls.iter_mut().find(|(n, ..)| n == name) {
+                Some(control) => {
+                    control.1 |= pppoe;
+                    control.2 |= !pppoe;
+                }
+                None => controls.push((name.clone(), pppoe, !pppoe)),
+            }
+        }
+        controls
     }
 
     pub(crate) fn get(&self, index: usize) -> &Class {
@@ -217,6 +286,31 @@ impl Classes {
             None => built_in(local::kind(packet)),
         }
     }
+}
+
+/// Whether two entries could match the same packet.
+fn overlap(a: &PuntClass, b: &PuntClass) -> bool {
+    let interfaces = match (&a.interface, &b.interface) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    };
+    let matches = match (a.matches, b.matches) {
+        (
+            PuntMatch::Ip { protocol, ports },
+            PuntMatch::Ip {
+                protocol: other,
+                ports: other_ports,
+            },
+        ) => {
+            protocol == other
+                && match (ports, other_ports) {
+                    (Some((a, b)), Some((c, d))) => a <= d && c <= b,
+                    _ => true,
+                }
+        }
+        (a, b) => a == b,
+    };
+    interfaces && matches
 }
 
 /// The IP protocol of `packet` and, for TCP and UDP that is not a fragment, its
