@@ -45,6 +45,7 @@ struct File {
     isis: Option<crate::isis::IsisEntry>,
     ospf: Option<crate::ospf::OspfEntry>,
     ospf6: Option<crate::ospf::OspfEntry>,
+    srv6: Option<crate::srv6::Srv6Entry>,
 }
 
 #[derive(Deserialize)]
@@ -580,6 +581,7 @@ pub fn resolve(text: &str) -> Result<Lock, String> {
         isis: file.isis.map(crate::isis::resolve).into_iter().collect(),
         ospf: ospf.into_iter().collect(),
         ospf6: ospf6.into_iter().collect(),
+        srv6: file.srv6.map(crate::srv6::resolve).into_iter().collect(),
     })
 }
 

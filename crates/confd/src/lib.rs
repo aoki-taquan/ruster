@@ -53,6 +53,7 @@ pub mod part;
 pub mod pppoe;
 pub mod ra;
 pub mod source;
+pub mod srv6;
 pub mod versions;
 pub mod vxlan;
 
@@ -183,6 +184,8 @@ pub struct Config {
     /// The VXLAN interfaces, checked; their interfaces are in `interfaces`
     /// ([`vxlan`]).
     pub vxlan: Vec<vxlan::Vxlan>,
+    /// The SRv6 SIDs and SR policies, checked: routes for ribd ([`srv6`]).
+    pub srv6: srv6::Srv6,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -985,6 +988,7 @@ impl Confd {
             out.entry(route_key(&route.vrf, route.prefix, route.len))
                 .or_insert(Value::Route(action));
         }
+        srv6::routes(&self.current.srv6, &mut out);
         out
     }
 }
@@ -1235,6 +1239,7 @@ mod tests {
             bridges: Vec::new(),
             etherip: Vec::new(),
             vxlan: Vec::new(),
+            srv6: Default::default(),
         });
         let routes = confd.routes();
         let connected = Value::Route(RouteAction::Forward(vec![NextHop {
@@ -1305,6 +1310,7 @@ mod tests {
             bridges: Vec::new(),
             etherip: Vec::new(),
             vxlan: Vec::new(),
+            srv6: Default::default(),
         };
         let connected = route_key("default", IpAddr::V4(Ipv4Addr::new(10, 0, 10, 0)), 24);
         let static_route = route_key("default", IpAddr::V4(Ipv4Addr::new(198, 51, 100, 0)), 24);

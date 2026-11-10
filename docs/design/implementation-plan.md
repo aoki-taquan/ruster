@@ -167,6 +167,9 @@ fe `vxlan`の試験、netns `vxlan`。相手はLinuxのvxlanのデバイスで�
 promiscuousにする（`ruster-fe`の`promisc.rs`。netns `bridge`で確かめた）。MACの表をFEの状態のsocketで見せるのもまだ（今は数をログに出すだけ）。
 IS-ISとOSPFのTAPも済んだ（`[isis]`、`[ospf]`、`[ospf6]`、confd `isis_ospf.rs`と`kernel.rs`、fe `tap.rs`、
 `ruster-frr`の`isis_ospf.rs`、netns `isis`と`ospf`）。TAPのcarrierはポートのリンクの状態に合わせる（overlay.mdの6.）。
+SRv6も済んだ（ローカルのSIDのEnd、End.X、End.DT4、End.DT6と、H.EncapsとH.Encaps.Red。core `srv6.rs`、confd `srv6.rs`、
+io-sim `srv6`と`srv6_encap`、fe `srv6`の試験、netns `srv6`。相手はLinuxのseg6で確かめた）。設定の`[srv6]`のSIDと方針は
+confdがribdへ経路として渡す。FRRからFPMでSRv6の経路（`seg6local`と`seg6`のencap）を受けるのと、SIDごとの数を見せるのはまだ。
 
 今は作らないもの（2026-11-08 owner決定）: マルチキャスト（MLDを含む）、ルータのlink-localへのND以外の通信
 （IS-ISとOSPFがTAPで受けるものを除く）。

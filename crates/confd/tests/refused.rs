@@ -71,6 +71,7 @@ fn config(mtu: u16) -> Config {
         ospf6: None,
         etherip: Vec::new(),
         vxlan: Vec::new(),
+        srv6: Default::default(),
     }
 }
 

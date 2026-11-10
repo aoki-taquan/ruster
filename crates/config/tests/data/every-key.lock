@@ -274,3 +274,20 @@ area = "0.0.0.0"
 cost = 10
 network = "point-to-point"
 passive = true
+
+[[srv6]]
+locator = "fc00:1::/48"
+source = "2001:db8::1"
+
+[[srv6.sid]]
+sid = "fc00:1::2"
+behavior = "End.X"
+vrf = ["red"]
+interface = ["lan"]
+next-hop = ["fe80::2"]
+
+[[srv6.policy]]
+prefix = "10.2.0.0/16"
+vrf = "red"
+segments = ["fc00:2::4"]
+reduced = false

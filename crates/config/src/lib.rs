@@ -282,6 +282,25 @@
 //! network = "broadcast"        # optional, the default; or "point-to-point"
 //! passive = false              # optional
 //!
+//! [srv6]                       # optional: SRv6 (RFC 8754, RFC 8986), in the default VRF
+//! locator = "fc00:1::/48"      # the router's SIDs are in it
+//! source = "2001:db8::1"       # the SR policies' outer source; an address given to
+//!                              # an interface of the default VRF
+//!
+//! [[srv6.sid]]                 # a local SID
+//! sid = "fc00:1::4"
+//! behavior = "End.DT4"         # "End", "End.X", "End.DT4" (IPv4 inside) or
+//!                              # "End.DT6" (IPv6 inside)
+//! vrf = "red"                  # End.DT4 and End.DT6: the VRF the inner packet goes on in
+//! # interface = "wan" and next-hop = "fe80::2" for End.X
+//!
+//! [[srv6.policy]]              # an SR policy (H.Encaps)
+//! prefix = "10.2.0.0/16"       # the route it makes, in its VRF
+//! vrf = "red"                  # optional, default
+//! segments = ["fc00:2::4"]     # 1 to 8 SIDs, the first first
+//! reduced = false              # optional: H.Encaps.Red (the first SID left out of
+//!                              # the SRH); with one SID there is no SRH either way
+//!
 //! [[source]]                   # optional: a daemon that sends confd values found
 //!                              # at run time, on confd/source/<name>/source.sock
 //! name = "pppoe-wan"           # lower-case letters, digits and -, from a letter
@@ -493,6 +512,23 @@
 //! cost = 10
 //! network = "broadcast"
 //! passive = false
+//!
+//! [[srv6]]                     # none or one
+//! locator = "fc00:1::/48"
+//! source = "2001:db8::1"
+//!
+//! [[srv6.sid]]
+//! sid = "fc00:1::4"
+//! behavior = "End.DT4"
+//! vrf = ["red"]                # none or one; so are interface and next-hop
+//! interface = []
+//! next-hop = []
+//!
+//! [[srv6.policy]]
+//! prefix = "10.2.0.0/16"
+//! vrf = "red"
+//! segments = ["fc00:2::4"]
+//! reduced = false
 //! ```
 //!
 //! Text with another `version` is refused. A later version that removes a
@@ -525,6 +561,7 @@ mod isis;
 mod ospf;
 mod ra;
 mod resolve;
+mod srv6;
 
 use serde::{Deserialize, Serialize};
 
@@ -541,6 +578,7 @@ pub use ra::{
     RA_PREFERRED_LIFETIME, RA_VALID_LIFETIME,
 };
 pub use resolve::resolve;
+pub use srv6::{Srv6, Srv6Policy, Srv6Sid};
 
 /// The lock form's version that this ruster reads and writes.
 ///
@@ -562,7 +600,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0xf5cf_b91f_ca70_735c;
+pub const LOCK_SHAPE: u64 = 0x761c_1bec_dcf0_bb7e;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -664,6 +702,9 @@ pub struct Lock {
     /// None or one.
     #[serde(default)]
     pub ospf6: Vec<Ospf>,
+    /// None or one.
+    #[serde(default)]
+    pub srv6: Vec<Srv6>,
 }
 
 /// A PPPoE client (`ruster-pppoed`): the session it sets up for a source. Its
