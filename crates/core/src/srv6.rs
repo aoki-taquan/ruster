@@ -1,7 +1,9 @@
-//! SRv6: the router's own SIDs (segment identifiers).
+//! SRv6: the router's own SIDs (segment identifiers), and SR policies.
 //!
 //! A [`Srv6Table`] given with
-//! [`with_srv6`](crate::ForwardingSnapshot::with_srv6) holds the router's local SIDs.
+//! [`with_srv6`](crate::ForwardingSnapshot::with_srv6) holds the router's local SIDs
+//! and its policies. A route whose interface is a policy's sends its packets
+//! inside the policy's outer headers (H.Encaps).
 //! An IPv6 packet that arrives in the default VRF, to the receiving interface's MAC
 //! address, whose destination is one of them is handled by the SID's behaviour
 //! before it is routed; every other packet is left alone (a transit node does not
@@ -38,6 +40,22 @@
 //!   pointing at its Routing Type otherwise.
 //! - RFC 8200 section 4: Hop-by-Hop and Destination Options headers are stepped
 //!   over, at most [`MAX_EXTENSION_HEADERS`] extension headers in all.
+//! - RFC 8986 section 5.1 (H.Encaps) and RFC 8754 section 4.1: a packet routed to
+//!   a policy's interface (its TTL or Hop Limit already decremented, S05) gets an
+//!   outer IPv6 header from the policy's source to its first segment and a Segment
+//!   Routing Header with the segments, last first, Segments Left and Last Entry n - 1;
+//!   with one segment the header is left out. Section 5.2 (H.Encaps.Red) and RFC 8754
+//!   section 4.1.1: the first segment left out of it, Last Entry n - 2. The outer
+//!   packet is routed in the default VRF.
+//! - RFC 2473 section 6.3: the outer Hop Limit is the router's own, 64. RFC 2983's
+//!   uniform model: the inner TOS or Traffic Class is copied to the outer Traffic
+//!   Class. RFC 6437 and RFC 8754 section 5.5: the outer flow label is a hash of the
+//!   inner flow (its addresses, and ports for TCP and UDP), never 0.
+//! - RFC 8754 section 5.3 and RFC 2473 section 7: the outer packet is never
+//!   fragmented. The most a policy carries is the underlying interface's MTU less the
+//!   outer headers; a longer IPv6 packet gets Packet Too Big with that MTU, and a
+//!   longer IPv4 one Fragmentation Needed (DF set) or is fragmented before it is
+//!   wrapped (DF clear), as for the IPv4 in IPv6 tunnels.
 //!
 //! Deviations:
 //!
@@ -51,9 +69,11 @@
 //!   router's (in the SID's VRF) is dropped, not delivered: its way to the kernel
 //!   follows the VRF of the interface it came in on.
 //! - A SID whose VRF the snapshot does not have drops its packets.
+//! - An outer packet that would leave through a tunnel or another policy is
+//!   dropped; no flags, tag or TLVs are put in the Segment Routing Header.
 //! - The ICMPv6 errors are rate limited and routed as the others (`crate::ipv6`).
 
-use crate::{DropReason, IfId, PacketLease, PacketSlot};
+use crate::{DropReason, IfId, MacAddress, PacketLease, PacketSlot, TraceEvent, TraceSink};
 
 const ETHERNET: usize = 14;
 const IPV6_HEADER: usize = 40;
@@ -108,6 +128,10 @@ pub enum Srv6Error {
     HostBitsSet,
     /// Two SIDs for the same prefix.
     DuplicateSid,
+    /// A policy with no segment, or more than 16.
+    SegmentCount,
+    /// Two policies for the same interface.
+    DuplicatePolicy,
 }
 
 impl Srv6Sid {
@@ -131,6 +155,7 @@ impl Srv6Sid {
 pub struct Srv6Table {
     /// Longest prefix first.
     sids: Box<[Srv6Sid]>,
+    policies: Box<[Srv6Policy]>,
 }
 
 impl Srv6Table {
@@ -142,7 +167,26 @@ impl Srv6Table {
         {
             return Err(Srv6Error::DuplicateSid);
         }
-        Ok(Self { sids: sids.into() })
+        Ok(Self {
+            sids: sids.into(),
+            policies: Box::new([]),
+        })
+    }
+
+    /// The same table with `policies`, each on its own interface.
+    pub fn with_policies(mut self, policies: Vec<Srv6Policy>) -> Result<Self, Srv6Error> {
+        let mut interfaces: Vec<IfId> = policies.iter().map(|p| p.interface).collect();
+        interfaces.sort_unstable();
+        if interfaces.windows(2).any(|w| w[0] == w[1]) {
+            return Err(Srv6Error::DuplicatePolicy);
+        }
+        self.policies = policies.into();
+        Ok(self)
+    }
+
+    /// The policy whose interface is `interface`.
+    pub(crate) fn policy(&self, interface: IfId) -> Option<&Srv6Policy> {
+        self.policies.iter().find(|p| p.interface == interface)
     }
 
     fn sid(&self, destination: [u8; 16]) -> Option<&Srv6Sid> {
@@ -400,4 +444,241 @@ fn unwrap<S: PacketSlot>(
         return Err(Rejected::Drop(DropReason::Srv6NoRoom));
     }
     Ok(())
+}
+
+/// Segments one policy holds, at most.
+const MAX_SEGMENTS: usize = 16;
+/// The Hop Limit of the outer header (RFC 2473 section 6.3: the tunnel's own).
+const OUTER_HOP_LIMIT: u8 = 64;
+
+/// An SR policy (RFC 8986 section 5.1, H.Encaps): packets routed to `interface`
+/// leave inside an outer IPv6 header from `source` to the first of `segments`,
+/// with a Segment Routing Header that lists them. The outer packet is routed in
+/// the default VRF.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Srv6Policy {
+    interface: IfId,
+    source: [u8; 16],
+    /// The first segment first.
+    segments: Box<[[u8; 16]]>,
+    reduced: bool,
+}
+
+impl Srv6Policy {
+    /// With `reduced`, the first segment is left out of the Segment Routing Header
+    /// (H.Encaps.Red, section 5.2). With one segment there is no Segment Routing
+    /// Header either way (RFC 8754 section 4.1).
+    pub fn new(
+        interface: IfId,
+        source: [u8; 16],
+        segments: Vec<[u8; 16]>,
+        reduced: bool,
+    ) -> Result<Self, Srv6Error> {
+        if segments.is_empty() || segments.len() > MAX_SEGMENTS {
+            return Err(Srv6Error::SegmentCount);
+        }
+        Ok(Self {
+            interface,
+            source,
+            segments: segments.into(),
+            reduced,
+        })
+    }
+
+    /// The entries of the Segment Routing Header; 0 for none.
+    fn listed(&self) -> usize {
+        match self.segments.len() {
+            1 => 0,
+            n if self.reduced => n - 1,
+            n => n,
+        }
+    }
+
+    pub(crate) fn first_segment(&self) -> [u8; 16] {
+        self.segments[0]
+    }
+
+    /// [`Self::overhead`], for an MTU.
+    pub(crate) fn overhead_u16(&self) -> u16 {
+        u16::try_from(self.overhead()).unwrap_or(u16::MAX)
+    }
+
+    /// The length of the outer headers.
+    fn overhead(&self) -> usize {
+        match self.listed() {
+            0 => IPV6_HEADER,
+            listed => IPV6_HEADER + 8 + 16 * listed,
+        }
+    }
+}
+
+/// Why [`transmit`] did not wrap a packet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NotWrapped {
+    Drop(DropReason),
+    /// Longer than `mtu`, the most the policy carries: Packet Too Big or
+    /// Fragmentation Needed for the inner packet.
+    TooBig(u16),
+}
+
+/// The inner packet of an Ethernet `frame`: the Next Header for it, its length and
+/// its traffic class (the IPv4 TOS byte, or the IPv6 Traffic Class).
+fn inner(frame: &[u8]) -> Result<(u8, usize, u8), DropReason> {
+    let ip = frame.get(ETHERNET..).unwrap_or_default();
+    match frame.get(12..14) {
+        Some(t) if t == IPV4_ETHERTYPE && ip.len() >= 20 && ip[0] >> 4 == 4 => {
+            let len = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
+            Ok((IPV4, len.min(ip.len()), ip[1]))
+        }
+        Some(t) if t == IPV6_ETHERTYPE && ip.len() >= IPV6_HEADER && ip[0] >> 4 == 6 => {
+            let len = IPV6_HEADER + usize::from(u16::from_be_bytes([ip[4], ip[5]]));
+            Ok((IPV6, len.min(ip.len()), (ip[0] << 4) | (ip[1] >> 4)))
+        }
+        _ => Err(DropReason::Srv6HeaderInvalid),
+    }
+}
+
+/// Where the outer packet of `policy` goes: the interface (in `outer`, the default
+/// VRF), the next hop's MAC address, and the most the interface carries.
+fn underlay<T: TraceSink>(
+    policy: &Srv6Policy,
+    outer: &crate::ForwardingSnapshot<'_>,
+    trace: &mut T,
+) -> Result<(IfId, MacAddress, MacAddress, u16), DropReason> {
+    let fib = outer.ipv6.ok_or(DropReason::Srv6NoRoute)?;
+    let (egress, next_hop) = fib
+        .next_hop(policy.segments[0])
+        .ok_or(DropReason::Srv6NoRoute)?;
+    let session = crate::pppoe::of(outer.pppoe, egress).is_some();
+    // Into a tunnel or another policy: not done.
+    if outer.wraps_frames(egress) && !session {
+        return Err(DropReason::Srv6NoRoute);
+    }
+    let interface = outer.interface(egress).ok_or(DropReason::InterfaceMiss)?;
+    let Some(mac) = fib
+        .neighbor(egress, next_hop)
+        .or(session.then_some(MacAddress([0; 6])))
+    else {
+        trace.record(TraceEvent::Ipv6NeighborMissing {
+            egress,
+            target: next_hop,
+        });
+        return Err(DropReason::NeighborUnresolved);
+    };
+    trace.record(TraceEvent::Ipv6Routed { egress, next_hop });
+    let mtu = outer.carried_mtu(egress, interface.mtu);
+    Ok((egress, mac, interface.mac, mtu))
+}
+
+/// Writes the Ethernet header and the outer headers of `policy` into `out` (as
+/// long as the Ethernet header and [`Srv6Policy::overhead`]).
+fn write_headers(
+    out: &mut [u8],
+    policy: &Srv6Policy,
+    (to, from): (MacAddress, MacAddress),
+    (next, inner_len, class, flow): (u8, usize, u8, u32),
+) {
+    let listed = policy.listed();
+    let payload = policy.overhead() - IPV6_HEADER + inner_len;
+    out[0..6].copy_from_slice(&to.0);
+    out[6..12].copy_from_slice(&from.0);
+    out[12..14].copy_from_slice(&IPV6_ETHERTYPE);
+    let ip = ETHERNET;
+    let flow = flow & 0x000f_ffff;
+    out[ip] = 0x60 | (class >> 4);
+    out[ip + 1] = (class << 4) | (flow >> 16) as u8;
+    out[ip + 2..ip + 4].copy_from_slice(&(flow as u16).to_be_bytes());
+    out[ip + 4..ip + 6].copy_from_slice(&u16::try_from(payload).unwrap_or(u16::MAX).to_be_bytes());
+    out[ip + 6] = if listed == 0 { next } else { ROUTING };
+    out[ip + 7] = OUTER_HOP_LIMIT;
+    out[ip + 8..ip + 24].copy_from_slice(&policy.source);
+    out[ip + 24..ip + 40].copy_from_slice(&policy.segments[0]);
+    if listed == 0 {
+        return;
+    }
+    let srh = ip + IPV6_HEADER;
+    let n = policy.segments.len();
+    // RFC 8754 section 4.1: Segments Left n - 1; Last Entry n - 1, or n - 2 reduced.
+    out[srh..srh + 8].copy_from_slice(&[
+        next,
+        u8::try_from(listed * 2).unwrap_or(u8::MAX),
+        SEGMENT_ROUTING,
+        u8::try_from(n - 1).unwrap_or(u8::MAX),
+        u8::try_from(listed - 1).unwrap_or(u8::MAX),
+        0,
+        0,
+        0,
+    ]);
+    // Segment List[0] is the last segment.
+    for (entry, segment) in policy.segments.iter().rev().take(listed).enumerate() {
+        let at = srh + 8 + 16 * entry;
+        out[at..at + 16].copy_from_slice(segment);
+    }
+}
+
+/// The flow label of the outer header: a hash of the inner packet's flow, never 0
+/// (RFC 6437 section 3, RFC 8754 section 5.5).
+fn flow_label(frame: &[u8]) -> u32 {
+    match crate::overlay::flow_hash(frame) & 0x000f_ffff {
+        0 => 1,
+        label => label,
+    }
+}
+
+/// H.Encaps (RFC 8986 section 5.1) on the forwarded `packet`, already rewritten for
+/// `policy`'s interface (its TTL or Hop Limit decremented): wraps it and returns the
+/// interface to send it out of.
+pub(crate) fn transmit<S: PacketSlot, T: TraceSink>(
+    packet: &mut PacketLease<S>,
+    policy: &Srv6Policy,
+    outer: &crate::ForwardingSnapshot<'_>,
+    trace: &mut T,
+) -> Result<IfId, NotWrapped> {
+    let (next, inner_len, class) = inner(packet.bytes_mut()).map_err(NotWrapped::Drop)?;
+    let (egress, to, from, mtu) = underlay(policy, outer, trace).map_err(NotWrapped::Drop)?;
+    let overhead = policy.overhead();
+    if overhead + inner_len > usize::from(mtu) {
+        let carried = usize::from(mtu).saturating_sub(overhead);
+        return Err(NotWrapped::TooBig(u16::try_from(carried).unwrap_or(0)));
+    }
+    let flow = flow_label(packet.bytes_mut());
+    if !packet.resize_front(-(overhead as isize)) {
+        return Err(NotWrapped::Drop(DropReason::Srv6NoRoom));
+    }
+    let bytes = packet.bytes_mut();
+    write_headers(
+        &mut bytes[..ETHERNET + overhead],
+        policy,
+        (to, from),
+        (next, inner_len, class, flow),
+    );
+    Ok(egress)
+}
+
+/// [`transmit`] for a generated `frame` (Ethernet) to `policy`'s interface: the
+/// interface to send it out of and the wrapped frame. Cold path.
+pub(crate) fn wrap(
+    policy: &Srv6Policy,
+    outer: &crate::ForwardingSnapshot<'_>,
+    frame: &[u8],
+) -> Result<(IfId, Vec<u8>), crate::TunnelOriginError> {
+    use crate::TunnelOriginError::{Dropped, TooBig};
+    let (next, inner_len, class) = inner(frame).map_err(Dropped)?;
+    let (egress, to, from, mtu) = underlay(policy, outer, &mut crate::NoTrace).map_err(Dropped)?;
+    let overhead = policy.overhead();
+    if overhead + inner_len > usize::from(mtu) {
+        let carried = usize::from(mtu).saturating_sub(overhead);
+        return Err(TooBig {
+            mtu: u16::try_from(carried).unwrap_or(0),
+        });
+    }
+    let mut out = vec![0; ETHERNET + overhead];
+    write_headers(
+        &mut out,
+        policy,
+        (to, from),
+        (next, inner_len, class, flow_label(frame)),
+    );
+    out.extend_from_slice(&frame[ETHERNET..ETHERNET + inner_len]);
+    Ok((egress, out))
 }

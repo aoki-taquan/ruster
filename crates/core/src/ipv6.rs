@@ -605,7 +605,9 @@ where
         return Outcome::Error(Ipv6PacketTooBig, PACKET_TOO_BIG, 0, u32::from(egress.mtu));
     }
     let next_hop = route.next_hop.unwrap_or(destination);
-    let session = crate::pppoe::of(snapshot.pppoe, egress.id).is_some();
+    // A PPPoE session or an SR policy has no neighbors: its frames are wrapped.
+    let session = crate::pppoe::of(snapshot.pppoe, egress.id).is_some()
+        || snapshot.srv6_policy(egress.id).is_some();
     let Some(mac) = fib
         .neighbor(egress.id, next_hop)
         .or(session.then_some(MacAddress([0; 6])))
@@ -706,43 +708,32 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
         trace,
     );
     match outcome {
-        Outcome::Transmit(egress) => match crate::pppoe::of(snapshot.pppoe, egress)
-            .map_or(Ok(egress), |session| {
-                crate::pppoe::transmit(&mut packet, session, snapshot)
-            })
-            .and_then(|egress| match bridges {
-                // Out of an IRB: to the member the destination is on, or flooded.
-                Some(bridges) => {
-                    let member = bridges.transmit(egress, packet.bytes_mut(), snapshot.now.0)?;
-                    let irb = |id: IfId| bridges.irb_of(id).is_some();
-                    member
-                        .map(|(member, to)| {
-                            crate::overlay::transmit_member(
-                                &mut packet,
-                                member,
-                                to,
-                                outer,
-                                irb,
-                                trace,
-                            )
-                        })
-                        .transpose()
+        Outcome::Transmit(egress) => match outer.srv6_policy(egress).map_or(Ok(egress), |policy| {
+            crate::srv6::transmit(&mut packet, policy, outer, trace)
+        }) {
+            Err(crate::srv6::NotWrapped::TooBig(mtu)) => {
+                // Too long once wrapped: Packet Too Big with what the policy
+                // carries (RFC 2473 7.1).
+                let reason = crate::DropReason::Ipv6PacketTooBig;
+                if let Some(queue) = control {
+                    queue.error(
+                        packet.bytes_mut(),
+                        snapshot,
+                        fib,
+                        ingress,
+                        (PACKET_TOO_BIG, 0, u32::from(mtu)),
+                    );
                 }
-                None => crate::vlan::transmit(&mut packet, egress, vlans).map(Some),
-            }) {
-            Ok(Some(port)) => {
-                packet.commit(port);
-                Completed::Transmitted
-            }
-            Ok(None) => {
-                packet.consume(crate::ConsumeReason::BridgeFlooded);
-                Completed::Consumed
-            }
-            Err(reason) => {
                 packet.recycle(reason);
                 trace.record(TraceEvent::Dropped { ingress, reason });
                 Completed::Dropped
             }
+            Err(crate::srv6::NotWrapped::Drop(reason)) => {
+                packet.recycle(reason);
+                trace.record(TraceEvent::Dropped { ingress, reason });
+                Completed::Dropped
+            }
+            Ok(egress) => complete_transmit(packet, egress, snapshot, outer, vlans, bridges, trace),
         },
         Outcome::Drop(reason) => {
             packet.recycle(reason);
@@ -792,6 +783,53 @@ pub(crate) fn complete<S: crate::PacketSlot, T: TraceSink>(
                 trace.record(TraceEvent::Dropped { ingress, reason });
                 Completed::Dropped
             }
+        }
+    }
+}
+
+/// Sends a forwarded IPv6 `packet` out of `egress`: into its PPPoE session, out of
+/// a bridge's member for an IRB, or tagged for a VLAN sub-interface.
+#[allow(clippy::too_many_arguments)]
+fn complete_transmit<S: crate::PacketSlot, T: TraceSink>(
+    mut packet: crate::PacketLease<S>,
+    egress: IfId,
+    snapshot: &crate::ForwardingSnapshot<'_>,
+    outer: &crate::ForwardingSnapshot<'_>,
+    vlans: &[crate::VlanBinding],
+    bridges: Option<&mut crate::Bridges>,
+    trace: &mut T,
+) -> Completed {
+    let ingress = packet.ingress();
+    let sent = crate::pppoe::of(snapshot.pppoe, egress)
+        .map_or(Ok(egress), |session| {
+            crate::pppoe::transmit(&mut packet, session, snapshot)
+        })
+        .and_then(|egress| match bridges {
+            // Out of an IRB: to the member the destination is on, or flooded.
+            Some(bridges) => {
+                let member = bridges.transmit(egress, packet.bytes_mut(), snapshot.now.0)?;
+                let irb = |id: IfId| bridges.irb_of(id).is_some();
+                member
+                    .map(|(member, to)| {
+                        crate::overlay::transmit_member(&mut packet, member, to, outer, irb, trace)
+                    })
+                    .transpose()
+            }
+            None => crate::vlan::transmit(&mut packet, egress, vlans).map(Some),
+        });
+    match sent {
+        Ok(Some(port)) => {
+            packet.commit(port);
+            Completed::Transmitted
+        }
+        Ok(None) => {
+            packet.consume(crate::ConsumeReason::BridgeFlooded);
+            Completed::Consumed
+        }
+        Err(reason) => {
+            packet.recycle(reason);
+            trace.record(TraceEvent::Dropped { ingress, reason });
+            Completed::Dropped
         }
     }
 }

@@ -315,7 +315,7 @@ pub(crate) fn receive<S: PacketSlot>(
 /// A hash of the flow of `inner` (an Ethernet frame): its IP addresses and, for TCP
 /// and UDP that are not later fragments, its ports; its MAC addresses otherwise
 /// (FNV-1a).
-fn flow_hash(inner: &[u8]) -> u32 {
+pub(crate) fn flow_hash(inner: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     let mut add = |bytes: &[u8]| {
         for &b in bytes {
