@@ -41,6 +41,7 @@ use std::io::{self, ErrorKind};
 use std::net::IpAddr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use ruster_core::{
     execute_one_icmpv4_error, execute_one_ipv4_fragmentation, forward_batch_with_control,
@@ -180,9 +181,67 @@ pub struct FeCounters {
     pub overlay_dropped: u64,
 }
 
+/// The forwarding element: the control task and the worker, stepped one after the
+/// other on the caller's thread.
+///
+/// The two share nothing. The control task sends the worker each version of the
+/// tables it builds, and the worker sends back its notifications for the table
+/// connections and which version it now uses, over one queue each way.
 pub struct Fe<B> {
-    io: B,
+    control: ControlTask,
+    worker: Worker<B>,
+}
+
+/// The tables built for one accepted store, with its firewall and NAT.
+type Version = (
+    build::Built,
+    firewall::Publication,
+    Option<nat::Publication>,
+);
+
+/// What the worker tells the control task.
+enum FromWorker {
+    /// A notification for the table connections that observe (a resolve request).
+    Notify(Vec<u8>),
+    /// The worker now uses a version whose interfaces have these names, by id.
+    Using(Vec<String>),
+}
+
+/// The control role of `docs/design/fe-internals.md`: it talks to the table
+/// connections and builds a version of the tables for each accepted change. It
+/// does not touch packets.
+struct ControlTask {
+    server: Server,
     builder: Builder,
+    versions: Sender<Version>,
+    from_worker: Receiver<FromWorker>,
+}
+
+impl ControlTask {
+    fn step(&mut self) -> Progress {
+        for message in self.from_worker.try_iter() {
+            match message {
+                FromWorker::Notify(payload) => self.server.notify(&payload),
+                FromWorker::Using(names) => self.builder.names = names,
+            }
+        }
+        let progress = self.server.step(&mut self.builder);
+        // Of several versions built in one step, the last.
+        if let Some(version) = self.builder.built.take() {
+            // The worker lives as long as this task: both are parts of one `Fe`.
+            let _ = self.versions.send(version);
+        }
+        progress
+    }
+}
+
+/// The worker role: it receives, forwards and sends packets by the version of the
+/// tables it has, and holds the state packets make (NAT, the firewall, fragments,
+/// the bridges' MAC addresses).
+struct Worker<B> {
+    io: B,
+    /// The backend's ports, in order: port `i` is `IfId(i)`.
+    ports: Vec<String>,
     /// Core's tables per VRF, the default VRF first.
     vrfs: Vec<build::Vrf>,
     /// For each port, the index in `vrfs` of its VRF.
@@ -215,7 +274,9 @@ pub struct Fe<B> {
     limits: punt_table::Limits,
     /// The interfaces enabled in the current tables.
     active: Vec<IfId>,
-    server: Server,
+    /// The versions the control task built; the worker moves to the last.
+    versions: Receiver<Version>,
+    to_control: Sender<FromWorker>,
     punt: Option<UnixDatagram>,
     /// Where ARP goes when the punt socket is not connected to one peer.
     punt_peer: Option<PathBuf>,
@@ -252,8 +313,8 @@ pub struct Fe<B> {
 impl<B> std::fmt::Debug for Fe<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Fe")
-            .field("ports", &self.builder.ports)
-            .field("counters", &self.counters)
+            .field("ports", &self.worker.ports)
+            .field("counters", &self.worker.counters)
             .finish_non_exhaustive()
     }
 }
@@ -266,7 +327,7 @@ where
     /// so nothing is forwarded until a writer adds interfaces and routes.
     pub fn new(io: B, ports: Vec<String>) -> Self {
         let mut builder = Builder {
-            ports,
+            ports: ports.clone(),
             built: None,
             generation: 0,
             names: Vec::new(),
@@ -277,9 +338,17 @@ where
         let (built, _, _) = builder.built.take().expect("built");
         builder.names.clone_from(&built.interface_names);
         let limits = punt_table::Limits::new(&built.punt, built.vrfs.len());
-        Self {
-            io,
+        let (versions, from_control) = mpsc::channel();
+        let (to_control, from_worker) = mpsc::channel();
+        let control = ControlTask {
+            server: Server::new(),
             builder,
+            versions,
+            from_worker,
+        };
+        let worker = Worker {
+            io,
+            ports,
             vrfs: built.vrfs,
             by_ingress: built.by_ingress,
             names: built.names,
@@ -296,7 +365,8 @@ where
             limits,
             classes: built.punt,
             active: built.active,
-            server: Server::new(),
+            versions: from_control,
+            to_control,
             punt: None,
             punt_peer: None,
             controls: control::Controls::default(),
@@ -315,20 +385,21 @@ where
             bridge_names: Vec::new(),
             now_ms: 0,
             counters: FeCounters::default(),
-        }
+        };
+        Self { control, worker }
     }
 
     /// Accepts a table connection that may write `writes` (see [`writers`]).
     pub fn attach(&mut self, stream: UnixStream, writes: &[u64]) -> io::Result<()> {
-        self.server.attach(stream, writes)
+        self.control.server.attach(stream, writes)
     }
 
     /// Uses `socket` to pass ARP to the neighbor process and to take frames back.
     /// It replaces an earlier one, for when the neighbor process restarts.
     pub fn attach_punt(&mut self, socket: UnixDatagram) -> io::Result<()> {
         socket.set_nonblocking(true)?;
-        self.punt = Some(socket);
-        self.punt_peer = None;
+        self.worker.punt = Some(socket);
+        self.worker.punt_peer = None;
         Ok(())
     }
 
@@ -337,42 +408,43 @@ where
     /// whoever sends them. A neighbor process that restarts binds the same path again.
     pub fn attach_punt_to(&mut self, socket: UnixDatagram, peer: PathBuf) -> io::Result<()> {
         socket.set_nonblocking(true)?;
-        self.punt = Some(socket);
-        self.punt_peer = Some(peer);
+        self.worker.punt = Some(socket);
+        self.worker.punt_peer = Some(peer);
         Ok(())
     }
 
     /// Binds the sockets to the control processes the punt classes name under
     /// `dir`, the socket directory (`fe/punt/<name>.sock`), from the next table change.
     pub fn set_punt_dir(&mut self, dir: PathBuf) {
-        self.controls.set_dir(dir);
+        self.worker.controls.set_dir(dir);
     }
 
     /// Uses the connected `socket` for control process `name` of the punt classes,
     /// instead of one under the socket directory.
     pub fn attach_control(&mut self, name: &str, socket: UnixDatagram) -> io::Result<()> {
-        self.controls.attach(name, socket)
+        self.worker.controls.attach(name, socket)
     }
 
     /// Uses `pipe` to hand the traffic addressed to the router in `vrf` to the kernel,
     /// and to send the kernel's packets out. Without a pipe, core answers Echo
     /// Requests itself and drops the rest.
     pub fn attach_local(&mut self, vrf: &str, pipe: Box<dyn LocalPipe>) {
-        self.local.insert(vrf.to_owned(), pipe);
+        self.worker.local.insert(vrf.to_owned(), pipe);
     }
 
     /// Stops handing VRF `vrf`'s traffic to the kernel (its device went away).
     pub fn detach_local(&mut self, vrf: &str) {
-        self.local.remove(vrf);
+        self.worker.local.remove(vrf);
     }
 
     /// The interfaces whose IS-IS and OSPF go to their TAP device, by the punt
     /// classes of the current tables.
     pub fn tap_interfaces(&self) -> Vec<String> {
-        self.classes
+        self.worker
+            .classes
             .taps()
             .into_iter()
-            .filter_map(|id| self.interface_names.get(usize::from(id.0)))
+            .filter_map(|id| self.worker.interface_names.get(usize::from(id.0)))
             .filter(|name| !name.is_empty())
             .cloned()
             .collect()
@@ -381,12 +453,12 @@ where
     /// Uses `pipe`, one Ethernet frame per message, as the TAP device of
     /// `interface` ([`tap`]).
     pub fn attach_tap(&mut self, interface: &str, pipe: Box<dyn LocalPipe>) {
-        self.taps.insert(interface.to_owned(), pipe);
+        self.worker.taps.insert(interface.to_owned(), pipe);
     }
 
     /// Stops using the TAP device of `interface`.
     pub fn detach_tap(&mut self, interface: &str) {
-        self.taps.remove(interface);
+        self.worker.taps.remove(interface);
     }
 
     /// The ports that must take frames for every MAC address (promiscuous mode),
@@ -394,11 +466,12 @@ where
     /// that are members. A member takes frames for the hosts behind it and for the
     /// IRB, whose MAC address is not the port's.
     pub fn promiscuous_ports(&self) -> Vec<String> {
-        let mut wanted = vec![false; self.builder.ports.len()];
-        let bridges = (0..self.bridge_names.len()).filter_map(|b| u16::try_from(b).ok());
+        let mut wanted = vec![false; self.worker.ports.len()];
+        let bridges = (0..self.worker.bridge_names.len()).filter_map(|b| u16::try_from(b).ok());
         for bridge in bridges {
-            for &member in self.bridges.members(bridge) {
+            for &member in self.worker.bridges.members(bridge) {
                 let port = self
+                    .worker
                     .vlans
                     .iter()
                     .find(|v| v.sub == member)
@@ -408,7 +481,7 @@ where
                 }
             }
         }
-        self.builder
+        self.worker
             .ports
             .iter()
             .zip(wanted)
@@ -423,52 +496,58 @@ where
     /// members' is, a tunnel member counting as up; another's (a tunnel's, a PPPoE
     /// session's, which IS-IS and OSPF do not run on) is up.
     pub fn link_up(&self, interface: &str, ports_up: &[bool]) -> bool {
-        interface_id(&self.interface_names, interface)
+        interface_id(&self.worker.interface_names, interface)
             .is_some_and(|id| self.interface_link_up(id, ports_up))
     }
 
     fn interface_link_up(&self, id: IfId, ports_up: &[bool]) -> bool {
-        if !self.active.contains(&id) {
+        if !self.worker.active.contains(&id) {
             return false;
         }
         let member_up = |member: IfId| {
             let port = self
+                .worker
                 .vlans
                 .iter()
                 .find(|v| v.sub == member)
                 .map_or(member, |v| v.parent);
-            if !self.active.contains(&port) {
+            if !self.worker.active.contains(&port) {
                 return false;
             }
-            if usize::from(port.0) < self.builder.ports.len() {
+            if usize::from(port.0) < self.worker.ports.len() {
                 ports_up.get(usize::from(port.0)).copied().unwrap_or(false)
             } else {
                 true
             }
         };
-        match self.bridges.irb_of(id) {
-            Some(bridge) => self.bridges.members(bridge).iter().any(|&m| member_up(m)),
+        match self.worker.bridges.irb_of(id) {
+            Some(bridge) => self
+                .worker
+                .bridges
+                .members(bridge)
+                .iter()
+                .any(|&m| member_up(m)),
             None => member_up(id),
         }
     }
 
     /// The ports, in order: port `i` is `IfId(i)`.
     pub fn ports(&self) -> &[String] {
-        &self.builder.ports
+        &self.worker.ports
     }
 
     /// The VRFs of the current tables, the default VRF first.
     pub fn vrfs(&self) -> &[String] {
-        &self.names
+        &self.worker.names
     }
 
     pub fn io_mut(&mut self) -> &mut B {
-        &mut self.io
+        &mut self.worker.io
     }
 
     pub fn counters(&self) -> FeCounters {
-        let mut counters = self.counters;
-        for b in self.bridges.table.counters() {
+        let mut counters = self.worker.counters;
+        for b in self.worker.bridges.table.counters() {
             counters.bridge_learned += b.learned;
             counters.bridge_moved += b.moved;
             counters.bridge_aged += b.aged;
@@ -483,32 +562,150 @@ where
 
     /// Each bridge's counters, by name.
     pub fn bridge_counters(&self) -> Vec<(String, ruster_core::BridgeCounters)> {
-        self.bridge_names
+        self.worker
+            .bridge_names
             .iter()
             .cloned()
-            .zip(self.bridges.table.counters())
+            .zip(self.worker.bridges.table.counters())
             .collect()
     }
 
     /// Every entry of the bridges' MAC address tables, with its bridge's name.
     pub fn bridge_entries(&self) -> Vec<(String, ruster_core::MacEntry)> {
-        self.bridges
+        self.worker
+            .bridges
             .table
             .entries()
-            .filter_map(|e| Some((self.bridge_names.get(usize::from(e.bridge))?.clone(), e)))
+            .filter_map(|e| {
+                Some((
+                    self.worker.bridge_names.get(usize::from(e.bridge))?.clone(),
+                    e,
+                ))
+            })
             .collect()
     }
 
     /// Each class of the punt table, by name: what it handed over and dropped.
     pub fn punt_counters(&self) -> Vec<(String, PuntCounters)> {
-        self.limits.counters()
+        self.worker.limits.counters()
     }
 
     /// The current tables.
     pub fn store(&self) -> &Store {
-        self.server.store()
+        self.control.server.store()
+    }
+}
+
+impl<B> Worker<B>
+where
+    B: PacketIo + GeneratedPacketIo,
+{
+    /// Moves to the last version the control task built, if there is a new one,
+    /// then forwards a batch and sends the frames the control processes gave back.
+    fn step(&mut self, now_ms: u64) -> bool {
+        self.now_ms = now_ms;
+        if let Some(version) = self.versions.try_iter().last() {
+            self.take(version);
+        }
+        let worked = self.worker(now_ms);
+        let injected = self.inject();
+        worked || injected
     }
 
+    /// Replaces the tables with `version`'s. State that names the old tables'
+    /// interfaces is dropped or moved, as each part below says.
+    fn take(&mut self, (built, publication, nat): Version) {
+        // The control task builds the next version on these ids.
+        let _ = self
+            .to_control
+            .send(FromWorker::Using(built.interface_names.clone()));
+        // The tracker's entries name the old tables' egress, neighbors and
+        // translations: later fragments of those datagrams are dropped.
+        self.fragment_tracking.flush_with_key(fragments::key());
+        // Queued ICMP errors and staged fragments name the old tables' interfaces,
+        // whose numbers may now be another interface's: they are dropped.
+        self.fragmentation.flush();
+        while self.icmpv4_errors.discard_front() {}
+        // The ICMP error rate limits, or the defaults when none are set (core's:
+        // 100 ms for IPv4; 10 at once and one every 10 ms for IPv6).
+        let (ipv4_interval, ipv6_burst, ipv6_interval) = built.icmp_errors.unwrap_or((100, 10, 10));
+        // A state lives at least as long as its interval, so any interval works.
+        let interval = u64::from(ipv4_interval);
+        if let Ok(policy) = ruster_core::Icmpv4ErrorPolicy::new(interval, interval.max(60_000)) {
+            self.icmpv4_errors.set_policy(policy);
+        }
+        self.control
+            .set_error_limit(ipv6_burst, u64::from(ipv6_interval));
+        // So do the tunnel packets put back together and the neighbors' "used"
+        // marks.
+        self.reassembled.clear();
+        self.used.clear();
+        // As for the firewall: a NAT that cannot move stays bound to the old
+        // tables, and core drops what it would have translated.
+        if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {
+            eprintln!("ruster-fe: {error}");
+        }
+        // Until a move succeeds the old firewall stays, bound to the old tables:
+        // core then drops what it would have checked.
+        // With the IPv6 tables, so that IPv6 flows whose route moved go, and with
+        // every VRF's, so that flows leaked in from another VRF go when its
+        // route changed.
+        let current: Vec<_> = self
+            .vrfs
+            .iter()
+            .map(|vrf| vrf.owner.snapshot().with_ipv6(&vrf.ipv6))
+            .collect();
+        let next: Vec<_> = built
+            .vrfs
+            .iter()
+            .map(|vrf| vrf.owner.snapshot().with_ipv6(&vrf.ipv6))
+            .collect();
+        if let Err(error) = firewall::Firewall::publish(
+            &mut self.firewall,
+            publication,
+            current[0].with_vrfs(&current, &self.by_ingress),
+            next[0].with_vrfs(&next, &built.by_ingress),
+        ) {
+            eprintln!("ruster-fe: {error}");
+        }
+        self.vrfs = built.vrfs;
+        self.by_ingress = built.by_ingress;
+        if self.names != built.names {
+            // The per-VRF buckets start again.
+            self.limits.update(&built.punt, 0);
+        }
+        self.limits.update(&built.punt, built.names.len());
+        self.punt_frames = built.punt.frame_matches();
+        self.controls.follow(built.punt.controls());
+        self.classes = built.punt;
+        self.names = built.names;
+        self.interface_names = built.interface_names;
+        self.vlans = built.vlans;
+        self.tunnels = built.tunnels;
+        self.srv6 = built.srv6;
+        self.overlays = built.overlays;
+        self.unreachable = built.unreachable;
+        self.pppoe = built.pppoe;
+        self.kernel = built.kernel;
+        self.active = built.active;
+        // A bridge that stays keeps what it learned on the members it keeps.
+        let old_of_new: Vec<Option<u16>> = built
+            .bridges
+            .iter()
+            .map(|(name, _)| {
+                let at = self.bridge_names.iter().position(|old| old == name)?;
+                u16::try_from(at).ok()
+            })
+            .collect();
+        let (names, configs): (Vec<String>, Vec<_>) = built.bridges.into_iter().unzip();
+        self.bridge_names = names;
+        let left = self
+            .bridges
+            .publish(configs, &old_of_new, &built.bridge_statics);
+        if left > 0 {
+            eprintln!("ruster-fe: {left} static MAC addresses left out: the table is full");
+        }
+    }
     fn worker(&mut self, now_ms: u64) -> bool {
         let mut trace = FeTrace::default();
         // The kernel's packets join the ports' in one batch, after them.
@@ -634,7 +831,7 @@ where
         // Until one cannot be built or allocated (it stays queued for the next batch).
         // Those for an interface that is not a port (the kernel's, a VLAN
         // sub-interface, a PPPoE session, a tunnel) are caught and sent after.
-        let ports = self.builder.ports.len();
+        let ports = self.ports.len();
         let mut caught = Vec::new();
         while let Ok(Some(report)) = execute_one_icmpv4_error(
             &mut kernel::WithKernel {
@@ -649,7 +846,7 @@ where
             if report.allocation_error.is_some() || report.build_error.is_some() {
                 // One for an egress the backend does not have would stay at the front
                 // and block every later error: drop it. Others wait for the next batch.
-                let unknown = usize::from(report.action.egress.0) >= self.builder.ports.len();
+                let unknown = usize::from(report.action.egress.0) >= self.ports.len();
                 if unknown {
                     self.icmpv4_errors.discard_front();
                     continue;
@@ -980,7 +1177,8 @@ where
             address,
         }
         .encode(&mut Encoder::new(&mut payload));
-        self.server.notify(&payload);
+        // The control task lives as long as the worker: both are parts of one `Fe`.
+        let _ = self.to_control.send(FromWorker::Notify(payload));
         self.counters.resolve_requests += 1;
     }
 
@@ -1240,8 +1438,8 @@ struct Members<'f, 't, B> {
 }
 
 impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
-    fn of(fe: &'f mut Fe<B>, trace: &'t mut FeTrace) -> Self {
-        let Fe {
+    fn of(fe: &'f mut Worker<B>, trace: &'t mut FeTrace) -> Self {
+        let Worker {
             io,
             vlans,
             bridges,
@@ -1371,104 +1569,11 @@ where
     B: PacketIo + GeneratedPacketIo,
 {
     fn step(&mut self, now_ms: u64) -> Progress {
-        self.now_ms = now_ms;
-        let control = self.server.step(&mut self.builder);
-        if let Some((built, publication, nat)) = self.builder.built.take() {
-            self.builder.names.clone_from(&built.interface_names);
-            // The tracker's entries name the old tables' egress, neighbors and
-            // translations: later fragments of those datagrams are dropped.
-            self.fragment_tracking.flush_with_key(fragments::key());
-            // Queued ICMP errors and staged fragments name the old tables' interfaces,
-            // whose numbers may now be another interface's: they are dropped.
-            self.fragmentation.flush();
-            while self.icmpv4_errors.discard_front() {}
-            // The ICMP error rate limits, or the defaults when none are set (core's:
-            // 100 ms for IPv4; 10 at once and one every 10 ms for IPv6).
-            let (ipv4_interval, ipv6_burst, ipv6_interval) =
-                built.icmp_errors.unwrap_or((100, 10, 10));
-            // A state lives at least as long as its interval, so any interval works.
-            let interval = u64::from(ipv4_interval);
-            if let Ok(policy) = ruster_core::Icmpv4ErrorPolicy::new(interval, interval.max(60_000))
-            {
-                self.icmpv4_errors.set_policy(policy);
-            }
-            self.control
-                .set_error_limit(ipv6_burst, u64::from(ipv6_interval));
-            // So do the tunnel packets put back together and the neighbors' "used"
-            // marks.
-            self.reassembled.clear();
-            self.used.clear();
-            // As for the firewall: a NAT that cannot move stays bound to the old
-            // tables, and core drops what it would have translated.
-            if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {
-                eprintln!("ruster-fe: {error}");
-            }
-            // Until a move succeeds the old firewall stays, bound to the old tables:
-            // core then drops what it would have checked.
-            // With the IPv6 tables, so that IPv6 flows whose route moved go, and with
-            // every VRF's, so that flows leaked in from another VRF go when its
-            // route changed.
-            let current: Vec<_> = self
-                .vrfs
-                .iter()
-                .map(|vrf| vrf.owner.snapshot().with_ipv6(&vrf.ipv6))
-                .collect();
-            let next: Vec<_> = built
-                .vrfs
-                .iter()
-                .map(|vrf| vrf.owner.snapshot().with_ipv6(&vrf.ipv6))
-                .collect();
-            if let Err(error) = firewall::Firewall::publish(
-                &mut self.firewall,
-                publication,
-                current[0].with_vrfs(&current, &self.by_ingress),
-                next[0].with_vrfs(&next, &built.by_ingress),
-            ) {
-                eprintln!("ruster-fe: {error}");
-            }
-            self.vrfs = built.vrfs;
-            self.by_ingress = built.by_ingress;
-            if self.names != built.names {
-                // The per-VRF buckets start again.
-                self.limits.update(&built.punt, 0);
-            }
-            self.limits.update(&built.punt, built.names.len());
-            self.punt_frames = built.punt.frame_matches();
-            self.controls.follow(built.punt.controls());
-            self.classes = built.punt;
-            self.names = built.names;
-            self.interface_names = built.interface_names;
-            self.vlans = built.vlans;
-            self.tunnels = built.tunnels;
-            self.srv6 = built.srv6;
-            self.overlays = built.overlays;
-            self.unreachable = built.unreachable;
-            self.pppoe = built.pppoe;
-            self.kernel = built.kernel;
-            self.active = built.active;
-            // A bridge that stays keeps what it learned on the members it keeps.
-            let old_of_new: Vec<Option<u16>> = built
-                .bridges
-                .iter()
-                .map(|(name, _)| {
-                    let at = self.bridge_names.iter().position(|old| old == name)?;
-                    u16::try_from(at).ok()
-                })
-                .collect();
-            let (names, configs): (Vec<String>, Vec<_>) = built.bridges.into_iter().unzip();
-            self.bridge_names = names;
-            let left = self
-                .bridges
-                .publish(configs, &old_of_new, &built.bridge_statics);
-            if left > 0 {
-                eprintln!("ruster-fe: {left} static MAC addresses left out: the table is full");
-            }
-        }
-        let worked = self.worker(now_ms);
-        let injected = self.inject();
-        // Notifications queued by the worker go out now.
-        let flushed = self.server.step(&mut self.builder);
-        control.and(flushed).and(Progress::busy(worked || injected))
+        let control = self.control.step();
+        let worked = self.worker.step(now_ms);
+        // The worker's notifications go out now.
+        let flushed = self.control.step();
+        control.and(flushed).and(Progress::busy(worked))
     }
 }
 
