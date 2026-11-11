@@ -13,7 +13,8 @@
 //! large as the number of gateways and of routes without one, which is
 //! small beside the routes a routing protocol brings.
 //!
-//! The forwarding path does not use this yet.
+//! [`crate::ValidatedForwardingOwner`] holds one and answers the packet path
+//! from it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -135,7 +136,14 @@ impl Ipv4Routes {
     /// The longest route that has `destination`.
     #[inline]
     pub fn route(&self, destination: Ipv4Address) -> Option<Route> {
-        self.tree.lookup(&destination.octets()).copied()
+        self.route_counted(destination).0
+    }
+
+    /// [`Self::route`], and the number of tree nodes read for it.
+    #[inline]
+    pub(crate) fn route_counted(&self, destination: Ipv4Address) -> (Option<Route>, u32) {
+        let (route, read) = self.tree.lookup_counted(&destination.octets());
+        (route.copied(), read)
     }
 
     /// Whether `address` is the first or the last address of a route of at
@@ -208,7 +216,7 @@ impl FromIterator<Route> for Ipv4Routes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Interface, Ipv4OriginPolicy, MacAddress, ValidatedForwardingOwner};
+    use crate::{ForwardingSnapshot, Interface, MacAddress};
 
     struct Rng(u64);
 
@@ -241,8 +249,8 @@ mod tests {
         Route::new(ip(some_address(rng) & mask(len)), len, egress, next_hop).unwrap()
     }
 
-    /// What the forwarding snapshot answers for the same routes, built from
-    /// nothing as it is today.
+    /// What a snapshot that borrows the list of routes answers: it goes
+    /// through every route for each question.
     fn assert_answers_as_the_snapshot(table: &Ipv4Routes, routes: &[Route], rng: &mut Rng) {
         let interfaces: Vec<Interface> = (0..3)
             .map(|id| Interface {
@@ -251,15 +259,7 @@ mod tests {
                 mtu: 1500,
             })
             .collect();
-        let owner = ValidatedForwardingOwner::new(
-            routes.into(),
-            interfaces.into(),
-            Box::default(),
-            Box::default(),
-            Ipv4OriginPolicy::default(),
-        )
-        .unwrap();
-        let snapshot = owner.snapshot();
+        let snapshot = ForwardingSnapshot::new(routes, &interfaces, &[], &[]).unwrap();
         assert_eq!(table.len(), routes.len());
         for _ in 0..200 {
             let address = ip(some_address(rng) ^ rng.below(4) as u32);
@@ -295,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn any_run_of_changes_answers_as_the_snapshot_built_from_the_routes_does() {
+    fn any_run_of_changes_answers_as_going_through_every_route_does() {
         let mut rng = Rng(0x7461_626c);
         let mut table = Ipv4Routes::new();
         let mut model: BTreeMap<(u32, u8), Route> = BTreeMap::new();

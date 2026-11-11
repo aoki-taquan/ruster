@@ -2166,7 +2166,7 @@ impl<'state> FirewallRuntime<'state> {
             || new.tcp_active_idle_ttl_ms > old.tcp_active_idle_ttl_ms;
         let live = self.carry_live_flows();
         let reevaluate = (current.rules != next.rules).then_some(next.rules);
-        let routes = (current_snapshot.routes != next_snapshot.routes
+        let routes = (current_snapshot.ipv4_routes_differ(&next_snapshot)
             || current_snapshot.ipv6 != next_snapshot.ipv6
             || current_snapshot.other_vrfs_differ(&next_snapshot))
         .then_some(CarryRoutes {
