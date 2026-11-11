@@ -43,7 +43,7 @@ nsx() { ip netns exec "$@"; }
 ns_kill() {
   local pid
   for pid in $(ip netns pids "$1" 2>/dev/null); do
-    [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == "$2" ]] && kill "-$3" "$pid" 2>/dev/null
+    [[ "$(cat "/proc/$pid/comm" 2>/dev/null)" == "$2" ]] && kill "-$3" "$pid" 2>/dev/null || true
   done
   return 0
 }
