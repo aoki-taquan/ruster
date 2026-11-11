@@ -4527,12 +4527,19 @@ fn a_control_task_on_another_thread_feeds_the_worker_and_passes_its_requests_on(
         &[neighbor("wan", GATEWAY, GATEWAY_MAC)],
     );
     assert_eq!(code, Code::CHANGED);
-    // The answer comes when the version is built; the worker moves to it on its
-    // next step.
-    fe.step(0);
-    fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
-    fe.step(0);
-    let tx = fe.io_mut().pop_tx().expect("forwarded");
+    // The answer comes when the version is built, a moment before it is sent to
+    // the worker: packets are tried until one is forwarded by it.
+    let mut forwarded = None;
+    for _ in 0..5_000 {
+        fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+        fe.step(0);
+        forwarded = fe.io_mut().pop_tx();
+        if forwarded.is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let tx = forwarded.expect("forwarded");
     assert_eq!(tx.egress, IfId(1));
     assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
 
