@@ -127,15 +127,10 @@ pub struct Ipv6Local {
 }
 
 /// The IPv6 tables of one snapshot.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Ipv6Fib {
-    /// Longest prefix first.
-    routes: Box<[Ipv6Route]>,
-    /// Where the longest matching route changes: the first address of each range,
-    /// in order and starting at `::`, so that every address is in one range.
-    range_starts: Box<[u128]>,
-    /// The route of each range (an index into `routes`), or [`NO_ROUTE`].
-    range_routes: Box<[u32]>,
+    /// By prefix, for the longest match.
+    routes: crate::Ipv6RouteTree<Ipv6Route>,
     /// In the order of (interface, address).
     neighbors: Box<[Ipv6Neighbor]>,
     local: Box<[Ipv6Local]>,
@@ -143,33 +138,17 @@ pub struct Ipv6Fib {
     pub(crate) unreachable: Box<[(IfId, [u8; 16])]>,
 }
 
-impl Default for Ipv6Fib {
-    /// The table with no routes, neighbors or addresses.
-    fn default() -> Self {
-        let (range_starts, range_routes) = ranges(&[]);
-        Self {
-            routes: Box::default(),
-            range_starts,
-            range_routes,
-            neighbors: Box::default(),
-            local: Box::default(),
-            unreachable: Box::default(),
-        }
-    }
-}
-
 impl Ipv6Fib {
     pub fn new(
-        mut routes: Vec<Ipv6Route>,
+        routes: Vec<Ipv6Route>,
         mut neighbors: Vec<Ipv6Neighbor>,
         local: Vec<Ipv6Local>,
     ) -> Result<Self, Ipv6FibError> {
-        routes.sort_by(|a, b| b.len.cmp(&a.len).then(a.prefix.cmp(&b.prefix)));
-        if routes
-            .windows(2)
-            .any(|w| w[0].len == w[1].len && w[0].prefix == w[1].prefix)
-        {
-            return Err(Ipv6FibError::DuplicateRoute);
+        let mut tree = crate::Ipv6RouteTree::new();
+        for route in routes {
+            if tree.insert(&route.prefix, route.len, route).is_some() {
+                return Err(Ipv6FibError::DuplicateRoute);
+            }
         }
         neighbors.sort_unstable_by_key(|n| (n.interface, n.target));
         if neighbors
@@ -178,11 +157,8 @@ impl Ipv6Fib {
         {
             return Err(Ipv6FibError::DuplicateNeighbor);
         }
-        let (range_starts, range_routes) = ranges(&routes);
         Ok(Self {
-            routes: routes.into(),
-            range_starts,
-            range_routes,
+            routes: tree,
             neighbors: neighbors.into(),
             local: local.into(),
             unreachable: Box::new([]),
@@ -206,14 +182,10 @@ impl Ipv6Fib {
             .map(|route| (route.egress, route.next_hop.unwrap_or(destination)))
     }
 
-    /// The longest prefix that has `destination`: a binary search over the ranges,
-    /// so the number of comparisons grows with the logarithm of the number of routes.
+    /// The longest prefix that has `destination`: the route tree read one byte of
+    /// the address at a time, at most 16 nodes whatever the number of routes.
     pub(crate) fn route(&self, destination: [u8; 16]) -> Option<&Ipv6Route> {
-        let address = u128::from_be_bytes(destination);
-        let after = self.range_starts.partition_point(|&start| start <= address);
-        // The first range starts at `::`, so `after` is at least 1.
-        let route = *self.range_routes.get(after.checked_sub(1)?)?;
-        self.routes.get(route as usize)
+        self.routes.lookup(&destination)
     }
 
     /// The same table with `unreachable` as the next hops the control side could
@@ -236,58 +208,6 @@ impl Ipv6Fib {
     pub(crate) fn is_local(&self, address: [u8; 16]) -> bool {
         self.local.iter().any(|l| l.address == address)
     }
-}
-
-/// No route has the range.
-const NO_ROUTE: u32 = u32::MAX;
-
-/// The ranges of addresses over which the longest matching route of `routes` stays
-/// the same, as their first addresses and their routes.
-///
-/// Two prefixes are either apart or one inside the other, so the longest match can
-/// only change where a prefix starts or just after one ends. Going through those
-/// points in order, the prefixes that have the point are kept on a stack, the
-/// longest on top.
-fn ranges(routes: &[Ipv6Route]) -> (Box<[u128]>, Box<[u32]>) {
-    let first = |route: &Ipv6Route| u128::from_be_bytes(route.prefix);
-    let last =
-        |route: &Ipv6Route| first(route) | u128::MAX.checked_shr(u32::from(route.len)).unwrap_or(0);
-    // By first address, and of those that start together the shortest first, so that
-    // the longest is pushed last.
-    let mut order: Vec<usize> = (0..routes.len()).collect();
-    order.sort_by_key(|&at| (first(&routes[at]), routes[at].len));
-    let mut points = Vec::with_capacity(routes.len() * 2 + 1);
-    points.push(0);
-    for route in routes {
-        points.push(first(route));
-        if let Some(after) = last(route).checked_add(1) {
-            points.push(after);
-        }
-    }
-    points.sort_unstable();
-    points.dedup();
-
-    let mut starts = Vec::with_capacity(points.len());
-    let mut found = Vec::with_capacity(points.len());
-    let mut stack: Vec<usize> = Vec::new();
-    let mut next = 0;
-    for point in points {
-        while stack.last().is_some_and(|&top| last(&routes[top]) < point) {
-            stack.pop();
-        }
-        while let Some(&at) = order.get(next).filter(|&&at| first(&routes[at]) == point) {
-            stack.push(at);
-            next += 1;
-        }
-        let route = stack.last().map_or(NO_ROUTE, |&at| {
-            u32::try_from(at).expect("far fewer routes than u32::MAX")
-        });
-        if found.last() != Some(&route) {
-            starts.push(point);
-            found.push(route);
-        }
-    }
-    (starts.into(), found.into())
 }
 
 fn masked(address: [u8; 16], len: u8) -> [u8; 16] {
