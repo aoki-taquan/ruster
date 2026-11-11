@@ -706,6 +706,8 @@ where
             eprintln!("ruster-fe: {left} static MAC addresses left out: the table is full");
         }
     }
+
+    /// Forwards one batch by the tables the worker has. Whether it did anything.
     fn worker(&mut self, now_ms: u64) -> bool {
         let mut trace = FeTrace::default();
         // The kernel's packets join the ports' in one batch, after them.
@@ -1620,7 +1622,7 @@ impl GeneratedIcmpv4TraceSink for NoTrace {
 struct Builder {
     ports: Vec<String>,
     /// The tables built for the last accepted store and their firewall, until the
-    /// FE takes them.
+    /// control task sends them to the worker at the end of its step.
     built: Option<(
         build::Built,
         firewall::Publication,
@@ -1628,9 +1630,10 @@ struct Builder {
     )>,
     /// Of the last firewall publication.
     generation: u64,
-    /// The interface of each id in the tables the FE uses: a table change keeps the
-    /// ids of the interfaces that stay. Several changes checked in one step build
-    /// on these, not on each other, since the FE takes only the last.
+    /// The interface of each id in the tables the worker uses (it says so each time
+    /// it moves to a version): a table change keeps the ids of the interfaces that
+    /// stay. Several changes checked before the worker moves build on these, not on
+    /// each other, since the worker takes only the last.
     names: Vec<String>,
 }
 
