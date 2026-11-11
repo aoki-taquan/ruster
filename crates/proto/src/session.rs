@@ -16,8 +16,8 @@
 //! [`Hook::check`], and learns about each accepted set through [`Hook::committed`].
 //! A request that fails changes nothing.
 //!
-//! The store is copied for each change. That is fine for the skeleton's small tables;
-//! large tables (a full BGP table) need a structure that shares unchanged parts.
+//! The store is changed in place and the change taken back if it is refused, so a
+//! change costs what it touches, not the size of the tables.
 //!
 //! # Standards
 //!
