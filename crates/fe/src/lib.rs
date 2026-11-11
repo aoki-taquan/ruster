@@ -304,6 +304,10 @@ impl ControlTask {
             FromWorker::Using(names) => {
                 self.builder.names = names;
                 self.awaiting_worker = false;
+                // The worker uses the version the changes are in: now their
+                // writers are told. (With the worker gone, nobody is: the FE is
+                // stopping.)
+                self.server.release_changed();
             }
             FromWorker::Sync(number) => {
                 self.sync_wanted = Some(number);
@@ -462,8 +466,10 @@ where
         let limits = punt_table::Limits::new(&built.punt, built.vrfs.len());
         let (versions, from_control) = mpsc::channel();
         let (to_control, from_worker) = mpsc::channel();
+        let mut server = Server::new();
+        server.hold_changed();
         let control = ControlTask {
-            server: Server::new(),
+            server,
             builder,
             versions,
             from_worker,
