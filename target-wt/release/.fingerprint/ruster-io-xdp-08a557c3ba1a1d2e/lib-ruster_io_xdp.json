@@ -1,0 +1,1 @@
+{"rustc":12019306335353385202,"features":"[]","declared_features":"[\"test-hooks\"]","target":5369965173892075485,"profile":2040997289075261528,"path":17779387062202522696,"deps":[],"local":[{"CheckDepInfo":{"dep_info":"release/.fingerprint/ruster-io-xdp-08a557c3ba1a1d2e/dep-lib-ruster_io_xdp","checksum":false}}],"rustflags":[],"config":9396254390672932401,"compile_kind":0}

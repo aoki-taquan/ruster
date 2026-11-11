@@ -41,7 +41,8 @@ use std::io::{self, ErrorKind};
 use std::net::IpAddr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::Duration;
 
 use ruster_core::{
     execute_one_icmpv4_error, execute_one_ipv4_fragmentation, forward_batch_with_control,
@@ -218,6 +219,17 @@ impl Control {
     pub fn fe_gone(&self) -> bool {
         self.0.worker_gone
     }
+
+    /// Waits until the worker says something, at most `longest`: for a thread that
+    /// found nothing to do in its last step. What arrives on the table connections
+    /// is seen at the next step only.
+    pub fn wait(&mut self, longest: Duration) {
+        match self.0.from_worker.recv_timeout(longest) {
+            Ok(message) => self.0.on_message(message),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => self.0.worker_gone = true,
+        }
+    }
 }
 
 impl Task for Control {
@@ -233,12 +245,26 @@ type Version = (
     Option<nat::Publication>,
 );
 
+/// What the control task sends the worker, in this order.
+enum ToWorker {
+    Version(Box<Version>),
+    /// The answer to [`FromWorker::Sync`] with the same number: every table change
+    /// that had arrived when the worker asked is in a version sent before this.
+    Synced(u64),
+}
+
 /// What the worker tells the control task.
 enum FromWorker {
     /// A notification for the table connections that observe (a resolve request).
     Notify(Vec<u8>),
     /// The worker now uses a version whose interfaces have these names, by id.
     Using(Vec<String>),
+    /// The worker holds frames the control processes gave it to send, and asks to
+    /// be told ([`ToWorker::Synced`]) once the table changes that arrived before
+    /// them are in a version. A control process that writes a table and then sends
+    /// a frame (the neighbor process: a neighbor, then its ARP reply) can count on
+    /// the frame leaving after the change is in use.
+    Sync(u64),
 }
 
 /// The control role of `docs/design/fe-internals.md`: it talks to the table
@@ -247,8 +273,10 @@ enum FromWorker {
 struct ControlTask {
     server: Server,
     builder: Builder,
-    versions: Sender<Version>,
+    versions: Sender<ToWorker>,
     from_worker: Receiver<FromWorker>,
+    /// The number of the worker's last [`FromWorker::Sync`] not answered yet.
+    sync_wanted: Option<u64>,
     /// A version was sent and the worker has not said yet that it uses it.
     ///
     /// Until it does, no further change is looked at: the next version must be built
@@ -260,14 +288,21 @@ struct ControlTask {
 }
 
 impl ControlTask {
+    fn on_message(&mut self, message: FromWorker) {
+        match message {
+            FromWorker::Notify(payload) => self.server.notify(&payload),
+            FromWorker::Using(names) => {
+                self.builder.names = names;
+                self.awaiting_worker = false;
+            }
+            FromWorker::Sync(number) => self.sync_wanted = Some(number),
+        }
+    }
+
     fn step(&mut self) -> Progress {
         loop {
             match self.from_worker.try_recv() {
-                Ok(FromWorker::Notify(payload)) => self.server.notify(&payload),
-                Ok(FromWorker::Using(names)) => {
-                    self.builder.names = names;
-                    self.awaiting_worker = false;
-                }
+                Ok(message) => self.on_message(message),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.worker_gone = true;
@@ -281,8 +316,14 @@ impl ControlTask {
         let progress = self.server.step(&mut self.builder);
         // Of several versions built in one step, the last.
         if let Some(version) = self.builder.built.take() {
-            self.worker_gone |= self.versions.send(version).is_err();
+            let sent = self.versions.send(ToWorker::Version(Box::new(version)));
+            self.worker_gone |= sent.is_err();
             self.awaiting_worker = true;
+        } else if !progress.busy {
+            // Nothing more had arrived, and the worker uses the last version.
+            if let Some(number) = self.sync_wanted.take() {
+                self.worker_gone |= self.versions.send(ToWorker::Synced(number)).is_err();
+            }
         }
         progress
     }
@@ -328,10 +369,19 @@ struct Worker<B> {
     /// The interfaces enabled in the current tables.
     active: Vec<IfId>,
     /// The versions the control task built; the worker moves to the last.
-    versions: Receiver<Version>,
+    versions: Receiver<ToWorker>,
     to_control: Sender<FromWorker>,
     /// The control task's end of the queues is gone.
     control_gone: bool,
+    /// The control task was taken out of the `Fe`: it sees table changes at its own
+    /// pace, so the frames of the control processes wait for it ([`FromWorker::Sync`]).
+    detached: bool,
+    /// The frames read from the control processes' sockets and not sent yet, with
+    /// how many of them are not the neighbor process's (those come first).
+    held: Option<(Vec<Vec<u8>>, usize)>,
+    /// The number of the last [`FromWorker::Sync`] sent, and of the last answered.
+    sync: u64,
+    synced: u64,
     punt: Option<UnixDatagram>,
     /// Where ARP goes when the punt socket is not connected to one peer.
     punt_peer: Option<PathBuf>,
@@ -400,6 +450,7 @@ where
             builder,
             versions,
             from_worker,
+            sync_wanted: None,
             awaiting_worker: false,
             worker_gone: false,
         };
@@ -425,6 +476,10 @@ where
             versions: from_control,
             to_control,
             control_gone: false,
+            detached: false,
+            held: None,
+            sync: 0,
+            synced: 0,
             punt: None,
             punt_peer: None,
             controls: control::Controls::default(),
@@ -467,7 +522,9 @@ where
     /// Takes the control task out, to be stepped on another thread; `None` when it
     /// was taken before. From then on [`Fe::step`] steps the worker only.
     pub fn detach_control(&mut self) -> Option<Control> {
-        self.control.take().map(Control)
+        let control = self.control.take()?;
+        self.worker.detached = true;
+        Some(Control(control))
     }
 
     /// Whether the [`Control`] taken out of this is gone: the tables will not change
@@ -689,7 +746,8 @@ where
         let mut last = None;
         loop {
             match self.versions.try_recv() {
-                Ok(version) => last = Some(version),
+                Ok(ToWorker::Version(version)) => last = Some(*version),
+                Ok(ToWorker::Synced(number)) => self.synced = number,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.control_gone = true;
@@ -1277,8 +1335,40 @@ where
         self.counters.resolve_requests += 1;
     }
 
-    /// Sends the frames the control processes gave back.
+    /// Sends the frames the control processes gave back. Whether there was any.
+    ///
+    /// With the control task on another thread, the frames read are held until it
+    /// says that the table changes that arrived before them are in the version the
+    /// worker uses (see [`FromWorker::Sync`]); forwarding goes on meanwhile.
     fn inject(&mut self) -> bool {
+        if !self.detached {
+            let (frames, others, refused) = self.read_injected();
+            self.send_injected(&frames, others);
+            return !frames.is_empty() || refused;
+        }
+        if self.held.is_none() {
+            let (frames, others, refused) = self.read_injected();
+            if frames.is_empty() {
+                return refused;
+            }
+            self.held = Some((frames, others));
+            self.sync += 1;
+            // If it is gone, the frames go out at once below.
+            let _ = self.to_control.send(FromWorker::Sync(self.sync));
+        }
+        if self.synced == self.sync || self.control_gone {
+            if let Some((frames, others)) = self.held.take() {
+                self.send_injected(&frames, others);
+            }
+        }
+        // Busy while frames wait, so that the answer is seen at once.
+        true
+    }
+
+    /// Reads the frames the control processes gave back: the frames, how many of
+    /// them are not the neighbor process's (those come first), and whether any was
+    /// refused.
+    fn read_injected(&mut self) -> (Vec<Vec<u8>>, usize, bool) {
         let mut refused = 0;
         let mut frames = self
             .controls
@@ -1309,7 +1399,11 @@ where
                 Err(_) => break,
             }
         }
-        let busy = !frames.is_empty() || refused > 0;
+        (frames, others, refused > 0)
+    }
+
+    /// Sends `frames`, of which the first `others` are not the neighbor process's.
+    fn send_injected(&mut self, frames: &[Vec<u8>], others: usize) {
         for (at, message) in frames.iter().enumerate() {
             let neighbor = at >= others;
             let Ok(punt) = Punt::decode(message) else {
@@ -1351,7 +1445,6 @@ where
                 _ => self.counters.inject_dropped += 1,
             }
         }
-        busy
     }
 
     /// Whether a packet of punt class `class` may go to the kernel of the VRF at

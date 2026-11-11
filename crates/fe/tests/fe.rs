@@ -4456,7 +4456,7 @@ fn a_control_task_on_another_thread_feeds_the_worker_and_passes_its_requests_on(
     let thread = std::thread::spawn(move || {
         while !control.fe_gone() {
             if !control.step(0).busy {
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                control.wait(std::time::Duration::from_millis(1));
             }
         }
     });
@@ -4545,4 +4545,129 @@ fn a_control_task_on_another_thread_feeds_the_worker_and_passes_its_requests_on(
 
     drop(fe);
     thread.join().unwrap();
+}
+
+/// Steps the control task, then the worker, until the worker sends a frame: the
+/// frame, if it came within a few rounds.
+fn released(fe: &mut Fe<SimIo>, control: &mut ruster_fe::Control) -> Option<Vec<u8>> {
+    for _ in 0..4 {
+        control.step(0);
+        fe.step(0);
+        if let Some(tx) = fe.io_mut().pop_tx() {
+            return Some(tx.bytes);
+        }
+    }
+    None
+}
+
+#[test]
+fn a_frame_from_a_control_process_leaves_after_the_table_change_sent_before_it() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    control.attach(a, writers::CONFIG).unwrap();
+    let mut config = Client::new(b).unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    control.attach(a, writers::NEIGHBOR).unwrap();
+    let mut neighbors = Client::new(b).unwrap();
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    fe.attach_punt(fe_end).unwrap();
+    let token = config
+        .patch(&[
+            iface("lan", LAN_MAC),
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+        ])
+        .unwrap();
+    config.poll();
+    control.step(0);
+    fe.step(0);
+    control.step(0);
+    assert_eq!(response(&mut config, token), Some(Code::CHANGED));
+
+    // As the neighbor process does: the neighbor first, then the ARP reply to it.
+    let token = neighbors
+        .patch(&[neighbor("lan", [192, 0, 2, 10], HOST_MAC)])
+        .unwrap();
+    neighbors.poll();
+    let mut reply = vec![0xab_u8; 42];
+    reply[12..14].copy_from_slice(&[0x08, 0x06]);
+    let mut message = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &reply,
+    }
+    .encode(&mut message)
+    .unwrap();
+    neighd_end.send(&message).unwrap();
+
+    // The worker has the frame, but the control task has not looked at the change.
+    for _ in 0..3 {
+        assert!(fe.step(0).busy, "busy while a frame waits");
+        assert!(fe.io_mut().pop_tx().is_none(), "the frame waits");
+    }
+    // It builds the version; the frame still waits for the worker to use it.
+    control.step(0);
+    assert_eq!(response(&mut neighbors, token), Some(Code::CHANGED));
+    fe.step(0);
+    assert!(fe.io_mut().pop_tx().is_none(), "the frame waits");
+    // Nothing more had arrived: the control task says so, and the frame leaves.
+    assert_eq!(released(&mut fe, &mut control), Some(reply));
+    assert!(!fe.step(0).busy, "idle again");
+}
+
+#[test]
+fn without_table_changes_a_frame_from_a_control_process_leaves_once_the_control_task_ran() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    control.attach(a, writers::CONFIG).unwrap();
+    let mut config = Client::new(b).unwrap();
+    let token = config.patch(&[iface("lan", LAN_MAC)]).unwrap();
+    config.poll();
+    control.step(0);
+    fe.step(0);
+    control.step(0);
+    assert_eq!(response(&mut config, token), Some(Code::CHANGED));
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    fe.attach_punt(fe_end).unwrap();
+
+    for round in 0..3_u8 {
+        // Not zero: a frame to an all-zero address never leaves a port.
+        let mut reply = vec![0xa0 + round; 42];
+        reply[12..14].copy_from_slice(&[0x08, 0x06]);
+        let mut message = Vec::new();
+        Punt {
+            direction: Direction::FromControl,
+            reason: punt::reason::ARP,
+            interface: "lan",
+            frame: &reply,
+        }
+        .encode(&mut message)
+        .unwrap();
+        neighd_end.send(&message).unwrap();
+        fe.step(0);
+        assert!(fe.io_mut().pop_tx().is_none());
+        assert_eq!(released(&mut fe, &mut control), Some(reply));
+    }
+
+    // With the control task gone nobody answers: frames leave at once.
+    drop(control);
+    fe.step(0);
+    let mut reply = vec![9_u8; 42];
+    reply[12..14].copy_from_slice(&[0x08, 0x06]);
+    let mut message = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &reply,
+    }
+    .encode(&mut message)
+    .unwrap();
+    neighd_end.send(&message).unwrap();
+    fe.step(0);
+    assert_eq!(fe.io_mut().pop_tx().expect("sent").bytes, reply);
 }

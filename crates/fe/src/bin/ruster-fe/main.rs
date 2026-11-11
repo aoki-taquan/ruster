@@ -170,7 +170,9 @@ fn control_loop(mut control: Control, listeners: &[(UnixListener, &[u64])]) {
             }
         }
         if !control.step(clock.now_ms()).busy {
-            std::thread::sleep(daemon::IDLE_MAX);
+            // The worker wakes it at once; the table connections are looked at
+            // again when the wait is over.
+            control.wait(daemon::IDLE_MAX);
         }
     }
 }
