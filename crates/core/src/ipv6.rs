@@ -165,6 +165,24 @@ impl Ipv6Fib {
         })
     }
 
+    /// The tables around `routes` as they are, shared with whoever else holds
+    /// them: nothing here grows with the number of routes.
+    pub fn with_routes(
+        routes: crate::Ipv6RouteTree<Ipv6Route>,
+        neighbors: Vec<Ipv6Neighbor>,
+        local: Vec<Ipv6Local>,
+    ) -> Result<Self, Ipv6FibError> {
+        let mut fib = Self::new(Vec::new(), neighbors, local)?;
+        fib.routes = routes;
+        Ok(fib)
+    }
+
+    /// The routes.
+    #[must_use]
+    pub fn routes(&self) -> &crate::Ipv6RouteTree<Ipv6Route> {
+        &self.routes
+    }
+
     /// The interface and the address of the next hop toward `destination`.
     /// The egress, next hop and (when known) next hop MAC for a packet the router
     /// sends to `destination`.
