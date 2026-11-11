@@ -14,8 +14,9 @@
 //! routes takes one route's change in the time of copying four nodes. The
 //! packet path only reads: no lock, no counter is written.
 //!
-//! [`crate::ValidatedForwardingOwner`] builds one from its routes for the
-//! IPv4 longest match. It builds the whole tree for every version still.
+//! [`crate::ValidatedForwardingOwner`] and [`crate::Ipv6Fib`] build one from
+//! their routes for the longest match. They build the whole tree for every
+//! version still.
 
 use std::sync::Arc;
 
@@ -166,6 +167,8 @@ impl<const N: usize, V: PartialEq> PartialEq for RouteTree<N, V> {
         self.len == other.len && (Arc::ptr_eq(&self.root, &other.root) || self.root == other.root)
     }
 }
+
+impl<const N: usize, V: Eq> Eq for RouteTree<N, V> {}
 
 /// The node a prefix of `len` bits ends in, counted from the first, and the
 /// prefix inside that node.
