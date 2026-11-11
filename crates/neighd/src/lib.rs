@@ -1141,6 +1141,10 @@ impl Neighd {
             frame,
         };
         if punt.encode(&mut message).is_ok() {
+            // The table changes made so far go first: the FE sends a frame after
+            // the changes that reached it before the frame (a neighbor, then the
+            // ARP reply to it).
+            self.fe.flush();
             let _ = self.punt.send(&message);
         }
     }

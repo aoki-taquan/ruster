@@ -4671,3 +4671,114 @@ fn without_table_changes_a_frame_from_a_control_process_leaves_once_the_control_
     fe.step(0);
     assert_eq!(fe.io_mut().pop_tx().expect("sent").bytes, reply);
 }
+
+/// A frame from the neighbor process: an ARP packet out of "lan".
+fn frame_from_neighd(fill: u8) -> (Vec<u8>, Vec<u8>) {
+    let mut reply = vec![fill; 42];
+    reply[12..14].copy_from_slice(&[0x08, 0x06]);
+    let mut message = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &reply,
+    }
+    .encode(&mut message)
+    .unwrap();
+    (reply, message)
+}
+
+#[test]
+fn a_frame_waits_for_a_change_that_is_behind_more_requests_than_one_step_takes() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().unwrap();
+    let mut clients = Vec::new();
+    for writes in [writers::CONFIG, writers::ROUTE, writers::NEIGHBOR] {
+        let (a, b) = UnixStream::pair().unwrap();
+        control.attach(a, writes).unwrap();
+        clients.push(Client::new(b).unwrap());
+    }
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    fe.attach_punt(fe_end).unwrap();
+    let config = clients[0]
+        .patch(&[
+            iface("lan", LAN_MAC),
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+        ])
+        .unwrap();
+    clients[0].poll();
+    let routes = clients[1]
+        .patch(&[
+            route([192, 0, 2, 0], 24, "lan", None),
+            route([198, 51, 100, 0], 24, "wan", None),
+            route([0, 0, 0, 0], 0, "wan", Some(GATEWAY)),
+        ])
+        .unwrap();
+    clients[1].poll();
+    for _ in 0..4 {
+        control.step(0);
+        fe.step(0);
+    }
+    assert_eq!(response(&mut clients[0], config), Some(Code::CHANGED));
+    assert_eq!(response(&mut clients[1], routes), Some(Code::CHANGED));
+
+    // A hundred requests, more than one step of the control task takes from a
+    // connection; then the neighbor; then the frame.
+    for _ in 0..100 {
+        clients[2].get(&["c"]);
+    }
+    clients[2]
+        .patch(&[neighbor("wan", GATEWAY, GATEWAY_MAC)])
+        .unwrap();
+    clients[2].flush();
+    let (reply, message) = frame_from_neighd(0xab);
+    neighd_end.send(&message).unwrap();
+    fe.step(0);
+    assert!(fe.io_mut().pop_tx().is_none(), "the frame waits");
+    assert_eq!(released(&mut fe, &mut control), Some(reply));
+
+    // The worker already uses the neighbor: a packet through it is forwarded with
+    // no further step of the control task.
+    fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    fe.step(0);
+    let tx = fe.io_mut().pop_tx().expect("forwarded");
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+}
+
+#[test]
+fn a_frame_leaves_while_another_writer_never_pauses() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    control.attach(a, writers::CONFIG).unwrap();
+    let mut config = Client::new(b).unwrap();
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    fe.attach_punt(fe_end).unwrap();
+    config.patch(&[iface("lan", LAN_MAC)]).unwrap();
+    config.flush();
+    control.step(0);
+    fe.step(0);
+
+    let (reply, message) = frame_from_neighd(0xab);
+    neighd_end.send(&message).unwrap();
+    let mut left_after = None;
+    for round in 1..=20_u8 {
+        // Another change, each time before the control task looks.
+        config
+            .patch(&[iface("wan", [2, 0, 0, 0, 1, round])])
+            .unwrap();
+        config.flush();
+        control.step(0);
+        fe.step(0);
+        if let Some(tx) = fe.io_mut().pop_tx() {
+            assert_eq!(tx.bytes, reply);
+            left_after = Some(round);
+            break;
+        }
+    }
+    // Asked on the first step of the worker, answered on the control task's fourth
+    // after that.
+    assert_eq!(left_after, Some(5));
+}

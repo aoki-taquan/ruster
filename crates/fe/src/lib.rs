@@ -263,9 +263,17 @@ enum FromWorker {
     /// be told ([`ToWorker::Synced`]) once the table changes that arrived before
     /// them are in a version. A control process that writes a table and then sends
     /// a frame (the neighbor process: a neighbor, then its ARP reply) can count on
-    /// the frame leaving after the change is in use.
+    /// the frame leaving after the change is in use, as long as what it wrote
+    /// before the frame is read within [`SYNC_STEPS`] steps of the control task (64
+    /// requests and 64 KiB a connection in each).
     Sync(u64),
 }
+
+/// The steps of the control task after which a [`FromWorker::Sync`] is answered
+/// even if table changes keep arriving, so that a writer that never pauses (routes
+/// while a routing protocol converges) does not keep the frames of the control
+/// processes from leaving.
+const SYNC_STEPS: u32 = 4;
 
 /// The control role of `docs/design/fe-internals.md`: it talks to the table
 /// connections and builds a version of the tables for each accepted change. It
@@ -277,6 +285,8 @@ struct ControlTask {
     from_worker: Receiver<FromWorker>,
     /// The number of the worker's last [`FromWorker::Sync`] not answered yet.
     sync_wanted: Option<u64>,
+    /// The steps that looked at the table connections since it was asked.
+    sync_steps: u32,
     /// A version was sent and the worker has not said yet that it uses it.
     ///
     /// Until it does, no further change is looked at: the next version must be built
@@ -295,7 +305,10 @@ impl ControlTask {
                 self.builder.names = names;
                 self.awaiting_worker = false;
             }
-            FromWorker::Sync(number) => self.sync_wanted = Some(number),
+            FromWorker::Sync(number) => {
+                self.sync_wanted = Some(number);
+                self.sync_steps = 0;
+            }
         }
     }
 
@@ -319,9 +332,13 @@ impl ControlTask {
             let sent = self.versions.send(ToWorker::Version(Box::new(version)));
             self.worker_gone |= sent.is_err();
             self.awaiting_worker = true;
-        } else if !progress.busy {
-            // Nothing more had arrived, and the worker uses the last version.
-            if let Some(number) = self.sync_wanted.take() {
+        }
+        if let Some(number) = self.sync_wanted {
+            self.sync_steps += 1;
+            // Nothing more had arrived; or enough was looked at. After the version
+            // of this step, if there is one: the worker moves to it first.
+            if !progress.busy || self.sync_steps >= SYNC_STEPS {
+                self.sync_wanted = None;
                 self.worker_gone |= self.versions.send(ToWorker::Synced(number)).is_err();
             }
         }
@@ -451,6 +468,7 @@ where
             versions,
             from_worker,
             sync_wanted: None,
+            sync_steps: 0,
             awaiting_worker: false,
             worker_gone: false,
         };
@@ -1353,7 +1371,7 @@ where
             }
             self.held = Some((frames, others));
             self.sync += 1;
-            // If it is gone, the frames go out at once below.
+            // If it is gone, the frames go out on the next step.
             let _ = self.to_control.send(FromWorker::Sync(self.sync));
         }
         if self.synced == self.sync || self.control_gone {
