@@ -4383,6 +4383,11 @@ fn a_detached_control_task_takes_the_connections_and_the_fe_steps_only_its_worke
     // The FE alone does not answer: the connection is the control task's.
     fe.step(0);
     assert_eq!(response(&mut config, token), None);
+    // Nor the control task alone: the answer says that the worker uses the change.
+    control.step(0);
+    assert_eq!(response(&mut config, token), None);
+    fe.step(0);
+    assert_eq!(response(&mut config, token), None);
     control.step(0);
     assert_eq!(response(&mut config, token), Some(Code::CHANGED));
     assert!(!fe.control_gone() && !control.fe_gone());
@@ -4421,24 +4426,28 @@ fn the_next_change_waits_until_the_worker_uses_the_version_sent() {
         .unwrap();
     config.poll();
     control.step(0);
-    assert_eq!(response(&mut config, first), Some(Code::CHANGED));
 
     // "lan.10" sorts before it. Built on the ids of the tables before the first
     // change, it would take that id and move "lan.20", which the worker may
-    // already use under it. So the change is not looked at yet.
+    // already use under it. So the change is not looked at yet; and the first is
+    // not answered before the worker uses it.
     let second = config.patch(&[vlan("lan.10", "lan", 10)]).unwrap();
     config.poll();
     for _ in 0..3 {
         control.step(0);
-        assert_eq!(response(&mut config, second), None);
+        let (_, events) = config.poll();
+        assert!(events.is_empty(), "{events:?}");
     }
 
-    // The worker moves to the first version and says so; now the second is built,
-    // on the first one's ids.
+    // The worker moves to the first version and says so: the first change is
+    // answered, and the second is built, on the first one's ids.
+    fe.step(0);
+    control.step(0);
+    assert_eq!(response(&mut config, first), Some(Code::CHANGED));
+    assert_eq!(response(&mut config, second), None);
     fe.step(0);
     control.step(0);
     assert_eq!(response(&mut config, second), Some(Code::CHANGED));
-    fe.step(0);
     assert!(fe.link_up("lan.20", &[true, true]));
     assert!(fe.link_up("lan.10", &[true, true]));
 }
@@ -4610,11 +4619,11 @@ fn a_frame_from_a_control_process_leaves_after_the_table_change_sent_before_it()
     }
     // It builds the version; the frame still waits for the worker to use it.
     control.step(0);
-    assert_eq!(response(&mut neighbors, token), Some(Code::CHANGED));
     fe.step(0);
     assert!(fe.io_mut().pop_tx().is_none(), "the frame waits");
     // Nothing more had arrived: the control task says so, and the frame leaves.
     assert_eq!(released(&mut fe, &mut control), Some(reply));
+    assert_eq!(response(&mut neighbors, token), Some(Code::CHANGED));
     assert!(!fe.step(0).busy, "idle again");
 }
 

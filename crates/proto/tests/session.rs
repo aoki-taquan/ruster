@@ -365,3 +365,69 @@ fn the_hook_hears_each_patch_even_when_nothing_changes() {
     }
     assert_eq!(heard.0, vec![1, 1]);
 }
+
+fn has_response(events: &[Event], token: u32) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, Event::Response { token: t, .. } if *t == token))
+}
+
+#[test]
+fn held_answers_to_accepted_changes_go_out_when_released() {
+    let mut bench = Bench::new();
+    bench.server.hold_changed();
+    let mut client = bench.connect(&[sid::INTERFACE]);
+    let mut other = bench.connect(&[sid::NEIGHBOR]);
+
+    // The changes are in the store at once; their answers wait.
+    let patched = client.patch(&[iface("eth0", 1)]).unwrap();
+    let begun = client.resync_begin();
+    let ended = client.resync_end();
+    let neighbor_patched = other.patch(&[neighbor([10, 0, 0, 1])]).unwrap();
+    // What is not an accepted change is answered as always: a refusal, a read,
+    // resync-begin (2.04, but the store is as it was).
+    let refused = client.patch(&[iface("bad", 2)]).unwrap();
+    let read = client.get_all();
+    let mut events = bench.settle(&mut client);
+    let mut other_events = bench.settle(&mut other);
+    // The neighbor; the resync took the interface away again.
+    assert_eq!(bench.server.store().len(), 1);
+    assert!(!has_response(&events, patched));
+    assert!(!has_response(&events, ended));
+    assert!(!has_response(&other_events, neighbor_patched));
+    assert_eq!(response(&events, begun).0, Code::CHANGED);
+    assert_eq!(response(&events, refused).0, Code::BAD_REQUEST);
+    assert_eq!(response(&events, read).0, Code::CONTENT);
+
+    bench.server.release_changed();
+    events.append(&mut bench.settle(&mut client));
+    other_events.append(&mut bench.settle(&mut other));
+    assert_eq!(response(&events, patched).0, Code::CHANGED);
+    assert_eq!(response(&events, ended).0, Code::CHANGED);
+    assert_eq!(response(&other_events, neighbor_patched).0, Code::CHANGED);
+
+    // Nothing is left to release, and a connection that went away is passed over.
+    let patched = client.patch(&[iface("eth1", 3)]).unwrap();
+    let neighbor_patched = other.patch(&[neighbor([10, 0, 0, 2])]).unwrap();
+    bench.settle(&mut client);
+    bench.settle(&mut other);
+    drop(other);
+    bench.server.step(&mut bench.hook);
+    bench.server.release_changed();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, patched).0, Code::CHANGED);
+    let _ = neighbor_patched;
+    bench.server.release_changed();
+    assert!(bench.settle(&mut client).is_empty());
+}
+
+#[test]
+fn without_holding_an_accepted_change_is_answered_at_once() {
+    let mut bench = Bench::new();
+    let mut client = bench.connect(&[sid::INTERFACE]);
+    let token = client.patch(&[iface("eth0", 1)]).unwrap();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, token).0, Code::CHANGED);
+    bench.server.release_changed();
+    assert!(bench.settle(&mut client).is_empty());
+}

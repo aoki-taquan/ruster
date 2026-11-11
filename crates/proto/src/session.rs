@@ -151,6 +151,8 @@ pub trait Hook {
 }
 
 struct Peer {
+    /// Which connection this is, for as long as the server lives.
+    id: u64,
     conn: Connection,
     writes: Vec<u64>,
     observe_token: Option<Vec<u8>>,
@@ -162,6 +164,13 @@ pub struct Server {
     store: Store,
     peers: Vec<Peer>,
     sync_done: bool,
+    next_id: u64,
+    /// Whether the answers to accepted changes are kept back
+    /// ([`Server::hold_changed`]), and those kept back: connection and token.
+    hold: bool,
+    held: Vec<(u64, Vec<u8>)>,
+    /// The request being handled changed the store.
+    committed: bool,
 }
 
 impl std::fmt::Debug for Server {
@@ -213,13 +222,37 @@ impl Server {
                 peer.conn.close();
             }
         }
+        self.next_id += 1;
         self.peers.push(Peer {
+            id: self.next_id,
             conn: Connection::new(stream, DEFAULT_LIMIT)?,
             writes: writes.to_vec(),
             observe_token: None,
             observe_seq: 0,
         });
         Ok(())
+    }
+
+    /// From now on the answer to an accepted change (2.04 to an iPATCH or to
+    /// resync-end) is not sent when the change is accepted but at the next
+    /// [`Server::release_changed`]: for a server whose tables take effect somewhere
+    /// else, a little later, and whose writers may count on an answered change
+    /// being in effect. Refusals are still answered at once.
+    pub fn hold_changed(&mut self) {
+        self.hold = true;
+    }
+
+    /// Queues the answers kept back, for the connections that are still there.
+    pub fn release_changed(&mut self) {
+        for (id, token) in std::mem::take(&mut self.held) {
+            if let Some(peer) = self.peers.iter_mut().find(|peer| peer.id == id) {
+                let _ = peer.conn.send(&Outgoing {
+                    code: Some(Code::CHANGED),
+                    token: &token,
+                    ..Outgoing::default()
+                });
+            }
+        }
     }
 
     /// Queues a notification for every connection that observes `s`.
@@ -283,6 +316,7 @@ impl Server {
     }
 
     fn handle(&mut self, index: usize, request: &Incoming, hook: &mut dyn Hook) {
+        self.committed = false;
         let path: Vec<&str> = request.path.iter().map(String::as_str).collect();
         let writes = self.peers[index].writes.clone();
         let (code, payload): (Code, Vec<u8>) = match (request.code, path.as_slice()) {
@@ -351,6 +385,11 @@ impl Server {
             }
             _ => return,
         };
+        if self.hold && std::mem::take(&mut self.committed) {
+            self.held
+                .push((self.peers[index].id, request.token.clone()));
+            return;
+        }
         let _ = self.peers[index].conn.send(&Outgoing {
             code: Some(code),
             token: &request.token,
@@ -364,6 +403,7 @@ impl Server {
             Err(reason) => (Code::BAD_REQUEST, reason.into_bytes()),
             Ok(()) => {
                 self.store = next;
+                self.committed = true;
                 hook.committed(&self.store);
                 (Code::CHANGED, Vec::new())
             }
