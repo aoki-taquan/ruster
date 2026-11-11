@@ -123,7 +123,7 @@ impl Classes {
             })
             .collect();
         let mut entries: Vec<(&str, &PuntClass)> = Vec::new();
-        for (key, value) in store.iter() {
+        for (key, value) in store.table(ruster_proto::sid::PUNT) {
             if let (Key::Punt { class }, Value::Punt(entry)) = (key, value) {
                 entries.push((class, entry));
             }

@@ -501,3 +501,48 @@ fn a_refused_resync_end_keeps_the_stale_entries_for_the_next_one() {
     assert_eq!(bench.server.store().len(), 1);
     assert!(bench.server.store().get(&iface_key("eth0")).is_some());
 }
+
+#[test]
+fn a_table_is_read_without_the_others() {
+    let mut bench = Bench::new();
+    let mut ifaces = bench.connect(&[sid::INTERFACE]);
+    let mut neighbors = bench.connect(&[sid::NEIGHBOR]);
+    ifaces.patch(&[iface("eth1", 2), iface("eth0", 1)]).unwrap();
+    neighbors
+        .patch(&[neighbor([10, 0, 0, 2]), neighbor([10, 0, 0, 1])])
+        .unwrap();
+    bench.settle(&mut ifaces);
+    bench.settle(&mut neighbors);
+
+    let store = bench.server.store();
+    let names = |table| -> Vec<Key> { store.table(table).map(|(key, _)| key.clone()).collect() };
+    // Each table's entries, in the order of their keys.
+    assert_eq!(
+        names(sid::INTERFACE),
+        [iface_key("eth0"), iface_key("eth1")]
+    );
+    assert_eq!(names(sid::NEIGHBOR).len(), 2);
+    assert_eq!(names(sid::ROUTE), []);
+    // Everything: the tables one after the other.
+    let all: Vec<Key> = store.iter().map(|(key, _)| key.clone()).collect();
+    assert_eq!(all, [names(sid::INTERFACE), names(sid::NEIGHBOR)].concat());
+    assert_eq!(store.len(), 4);
+
+    // A table emptied again leaves a store equal to one that never had it.
+    let before = {
+        let mut other = Bench::new();
+        let mut client = other.connect(&[sid::INTERFACE]);
+        client.patch(&[iface("eth1", 2), iface("eth0", 1)]).unwrap();
+        other.settle(&mut client);
+        other.server.store().clone()
+    };
+    let gone: Vec<Change> = names(sid::NEIGHBOR)
+        .into_iter()
+        .map(Change::delete)
+        .collect();
+    neighbors.patch(&gone).unwrap();
+    bench.settle(&mut neighbors);
+    assert_eq!(bench.server.store(), &before);
+    assert_eq!(bench.server.store().table(sid::NEIGHBOR).count(), 0);
+    assert!(!bench.server.store().is_empty());
+}

@@ -45,7 +45,10 @@ const REQUESTS_PER_STEP: usize = 64;
 /// The tables of a server, keyed by entry.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Store {
-    entries: BTreeMap<Key, Slot>,
+    /// The entries of each table that has any, by the table's SID: one table's
+    /// entries are read without going through another's ([`Store::table`]), which
+    /// matters when one table (the routes) is far larger than the rest.
+    tables: BTreeMap<u64, BTreeMap<Key, Slot>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,25 +60,62 @@ struct Slot {
 
 impl Store {
     pub fn get(&self, key: &Key) -> Option<&Value> {
-        self.entries.get(key).map(|slot| &slot.value)
+        self.slot(key).map(|slot| &slot.value)
     }
 
+    /// Every entry, table by table in the order of their SIDs, each table in the
+    /// order of its keys.
     pub fn iter(&self) -> impl Iterator<Item = (&Key, &Value)> {
-        self.entries.iter().map(|(key, slot)| (key, &slot.value))
+        self.tables
+            .values()
+            .flatten()
+            .map(|(key, slot)| (key, &slot.value))
+    }
+
+    /// The entries of the table with SID `table` ([`Key::table`]), in the order of
+    /// their keys.
+    pub fn table(&self, table: u64) -> impl Iterator<Item = (&Key, &Value)> {
+        self.tables
+            .get(&table)
+            .into_iter()
+            .flatten()
+            .map(|(key, slot)| (key, &slot.value))
+    }
+
+    fn slot(&self, key: &Key) -> Option<&Slot> {
+        self.tables.get(&key.table())?.get(key)
+    }
+
+    fn insert(&mut self, key: Key, slot: Slot) -> Option<Slot> {
+        self.tables
+            .entry(key.table())
+            .or_default()
+            .insert(key, slot)
+    }
+
+    /// A table left without entries goes too, so that two stores with the same
+    /// entries are equal.
+    fn remove(&mut self, key: &Key) -> Option<Slot> {
+        let table = self.tables.get_mut(&key.table())?;
+        let slot = table.remove(key);
+        if table.is_empty() {
+            self.tables.remove(&key.table());
+        }
+        slot
     }
 
     /// Whether `key` is an entry its writer has not sent again since a resync began:
     /// it goes when the resync ends.
     pub fn is_stale(&self, key: &Key) -> bool {
-        self.entries.get(key).is_some_and(|slot| slot.stale)
+        self.slot(key).is_some_and(|slot| slot.stale)
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.tables.values().map(BTreeMap::len).sum()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.tables.is_empty()
     }
 
     /// Makes `changes`, in order. What they replaced is returned, to put back with
@@ -86,14 +126,14 @@ impl Store {
         let mut undo = Vec::with_capacity(changes.len());
         for change in changes {
             let before = match &change.value {
-                Some(value) => self.entries.insert(
+                Some(value) => self.insert(
                     change.key.clone(),
                     Slot {
                         value: value.clone(),
                         stale: false,
                     },
                 ),
-                None => self.entries.remove(&change.key),
+                None => self.remove(&change.key),
             };
             undo.push((change.key.clone(), before));
         }
@@ -106,16 +146,18 @@ impl Store {
         // entry as it was.
         for (key, before) in undo.0.into_iter().rev() {
             match before {
-                Some(slot) => self.entries.insert(key, slot),
-                None => self.entries.remove(&key),
+                Some(slot) => self.insert(key, slot),
+                None => self.remove(&key),
             };
         }
     }
 
     fn mark_stale(&mut self, tables: &[u64]) {
-        for (key, slot) in &mut self.entries {
-            if tables.contains(&key.table()) {
-                slot.stale = true;
+        for (table, entries) in &mut self.tables {
+            if tables.contains(table) {
+                for slot in entries.values_mut() {
+                    slot.stale = true;
+                }
             }
         }
     }
@@ -124,15 +166,17 @@ impl Store {
     /// [`Store::apply`].
     fn drop_stale(&mut self, tables: &[u64]) -> Undo {
         let stale: Vec<Key> = self
-            .entries
+            .tables
             .iter()
-            .filter(|(key, slot)| slot.stale && tables.contains(&key.table()))
+            .filter(|(table, _)| tables.contains(table))
+            .flat_map(|(_, entries)| entries)
+            .filter(|(_, slot)| slot.stale)
             .map(|(key, _)| key.clone())
             .collect();
         let undo = stale
             .into_iter()
             .map(|key| {
-                let slot = self.entries.remove(&key);
+                let slot = self.remove(&key);
                 (key, slot)
             })
             .collect();
