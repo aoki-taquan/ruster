@@ -103,7 +103,7 @@ ruster-neighd &
 ruster-confd --kernel --state-dir /var/lib/ruster/confd router.toml &   # --kernel: ルータ宛ての通信のTUNとアドレスも作る
 ```
 
-FEは既定でAF_XDPを使い、各デバイスのqueue 0にXDPのプログラムを付けます（`--xdp-attach native|generic`、`--zero-copy`）。`--backend af-packet`ではAF_PACKETを使います。
+FEは既定でAF_XDPを使い、各デバイスのqueue 0にXDPのプログラムを付けます（`--xdp-attach native|generic`、`--zero-copy`）。`--backend af-packet`ではAF_PACKETを使います。表の接続と表の作成は別のthreadで行い、大きな表を作る間も転送は続きます（`--one-thread`で転送と同じthreadにする）。
 AF_PACKETはkernelからフレームを取り上げないので、FEに渡すデバイスにはkernelのアドレスや経路を付けず、kernelでの転送も切っておきます。どちらでも、FEのポートのMACはデバイスのMACと同じにします。
 
 ルータ宛ての通信（ping、SSH、DNSなど）は、VRFごとのTUN（`rt-<VRF名>`）でルータのkernelに渡ります。`confd --kernel`がTUNとVRFデバイスを作ってルータのアドレスを付け、kernelでの転送を止めます。

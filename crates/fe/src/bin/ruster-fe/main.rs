@@ -1,5 +1,5 @@
 //! `ruster-fe [--run-dir DIR] [--backend af-xdp|af-packet] [--xdp-attach native|generic]
-//! [--zero-copy] DEVICE...`: the FE on Linux.
+//! [--zero-copy] [--one-thread] DEVICE...`: the FE on Linux.
 //!
 //! Each DEVICE is a Linux network device and becomes the port of the same name: the
 //! interface names in the tables are the device names. The FE listens on the table
@@ -7,6 +7,9 @@
 //!
 //! - `af-xdp` (the default) attaches an XDP program to queue 0 of each device and
 //!   takes the frames away from the kernel. Copy mode unless `--zero-copy`.
+//! - The table connections are served, and each version of the tables built, on a
+//!   thread of their own, so forwarding goes on while a large version is built.
+//!   With `--one-thread` the forwarding thread does that too, between batches.
 //! - `af-packet` receives copies: the kernel still sees every frame, so the devices
 //!   must carry no kernel address or route, and the kernel must not forward on them.
 
@@ -20,7 +23,7 @@ use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
 
 use ruster_core::{GeneratedPacketIo, MonotonicMillis, PacketIo};
-use ruster_fe::{writers, Fe};
+use ruster_fe::{writers, Control, Fe};
 use ruster_io_xdp_native::XdpAttachMode;
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
@@ -55,6 +58,8 @@ struct Args {
     run_dir: std::path::PathBuf,
     af_packet: bool,
     xdp: af_xdp::Options,
+    /// The control task on the forwarding thread, not on one of its own.
+    one_thread: bool,
     devices: Vec<String>,
 }
 
@@ -67,6 +72,7 @@ fn args() -> Result<Args, String> {
             attach: XdpAttachMode::Native,
             zero_copy: false,
         },
+        one_thread: false,
         devices: Vec::new(),
     };
     let mut rest = rest.into_iter();
@@ -83,6 +89,7 @@ fn args() -> Result<Args, String> {
                 _ => return Err("--xdp-attach is native or generic".into()),
             },
             "--zero-copy" => args.xdp.zero_copy = true,
+            "--one-thread" => args.one_thread = true,
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ => args.devices.push(arg),
         }
@@ -113,7 +120,7 @@ where
 {
     let mut fe = Fe::new(io, args.devices.clone());
     let path = |name: &str| args.run_dir.join(name);
-    let mut listeners: Vec<(UnixListener, &[u64])> = Vec::new();
+    let mut listeners: Vec<(UnixListener, &'static [u64])> = Vec::new();
     for (name, writes) in [
         (socket::FE_CONFIG, writers::CONFIG),
         (socket::FE_ROUTE, writers::ROUTE),
@@ -137,7 +144,35 @@ where
         "ruster-fe: forwarding on {} ({backend})",
         args.devices.join(", ")
     );
+    if !args.one_thread {
+        let control = fe.detach_control().ok_or("the control task is gone")?;
+        let listeners = std::mem::take(&mut listeners);
+        std::thread::Builder::new()
+            .name("control".into())
+            .spawn(move || control_loop(control, &listeners))
+            .map_err(|error| format!("starting the control thread: {error}"))?;
+    }
     run_loop(&mut fe, &mut waiter, &listeners)
+}
+
+/// Serves the table connections and builds the versions of the tables, until the
+/// FE is gone or a connection cannot be taken. The forwarding thread sees that this
+/// one ended and stops the FE.
+fn control_loop(mut control: Control, listeners: &[(UnixListener, &[u64])]) {
+    let clock = Clock::new();
+    while !control.fe_gone() {
+        for (listener, writes) in listeners {
+            for stream in daemon::accept(listener) {
+                if let Err(error) = control.attach(stream, writes) {
+                    eprintln!("ruster-fe: {error}");
+                    return;
+                }
+            }
+        }
+        if !control.step(clock.now_ms()).busy {
+            std::thread::sleep(daemon::IDLE_MAX);
+        }
+    }
 }
 
 fn run_loop<B, W>(
@@ -173,6 +208,9 @@ where
             eprintln!("ruster-fe: stopped, {how} ({:?})", fe.counters());
             promiscuous.keep(&[]);
             return Ok(());
+        }
+        if fe.control_gone() {
+            return Err("the control thread stopped".into());
         }
         waiter.set_clock(fe.io_mut(), MonotonicMillis(now));
         for (listener, writes) in listeners {

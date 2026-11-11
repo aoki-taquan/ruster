@@ -4337,3 +4337,205 @@ fn punt_classes_for_control_processes_follow_the_rules() {
         );
     }
 }
+
+/// The response to `token`, if `client` has it by now.
+fn response(client: &mut Client, token: u32) -> Option<Code> {
+    client.poll().1.iter().find_map(|event| match event {
+        Event::Response { token: t, code, .. } if *t == token => Some(*code),
+        _ => None,
+    })
+}
+
+/// A sub-interface of `parent` for VLAN `vid`.
+fn vlan(name: &str, parent: &str, vid: u16) -> Change {
+    Change::set(
+        Key::Interface { name: name.into() },
+        Value::Interface {
+            enabled: true,
+            mac: LAN_MAC,
+            mtu: 1496,
+            vrf: ruster_proto::table::DEFAULT_VRF.into(),
+            vlan: Some(ruster_proto::table::Vlan {
+                parent: parent.into(),
+                id: vid,
+            }),
+            tunnel: None,
+            pppoe: None,
+        },
+    )
+}
+
+#[test]
+fn a_detached_control_task_takes_the_connections_and_the_fe_steps_only_its_worker() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().expect("the first time");
+    assert!(fe.detach_control().is_none());
+    assert!(fe.store().is_none());
+    let (a, _b) = UnixStream::pair().unwrap();
+    assert!(fe.attach(a, writers::CONFIG).is_err());
+
+    let (a, b) = UnixStream::pair().unwrap();
+    control.attach(a, writers::CONFIG).unwrap();
+    let mut config = Client::new(b).unwrap();
+    let token = config
+        .patch(&[iface("lan", LAN_MAC), iface("wan", WAN_MAC)])
+        .unwrap();
+    // The FE alone does not answer: the connection is the control task's.
+    fe.step(0);
+    assert_eq!(response(&mut config, token), None);
+    control.step(0);
+    assert_eq!(response(&mut config, token), Some(Code::CHANGED));
+    assert!(!fe.control_gone() && !control.fe_gone());
+
+    drop(control);
+    fe.step(0);
+    assert!(fe.control_gone());
+}
+
+#[test]
+fn a_detached_control_task_knows_when_the_fe_is_gone() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().unwrap();
+    control.step(0);
+    assert!(!control.fe_gone());
+    drop(fe);
+    control.step(0);
+    assert!(control.fe_gone());
+}
+
+#[test]
+fn the_next_change_waits_until_the_worker_uses_the_version_sent() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().unwrap();
+    let (a, b) = UnixStream::pair().unwrap();
+    control.attach(a, writers::CONFIG).unwrap();
+    let mut config = Client::new(b).unwrap();
+
+    // "lan.20" takes the first id after the ports.
+    let first = config
+        .patch(&[
+            iface("lan", LAN_MAC),
+            iface("wan", WAN_MAC),
+            vlan("lan.20", "lan", 20),
+        ])
+        .unwrap();
+    config.poll();
+    control.step(0);
+    assert_eq!(response(&mut config, first), Some(Code::CHANGED));
+
+    // "lan.10" sorts before it. Built on the ids of the tables before the first
+    // change, it would take that id and move "lan.20", which the worker may
+    // already use under it. So the change is not looked at yet.
+    let second = config.patch(&[vlan("lan.10", "lan", 10)]).unwrap();
+    config.poll();
+    for _ in 0..3 {
+        control.step(0);
+        assert_eq!(response(&mut config, second), None);
+    }
+
+    // The worker moves to the first version and says so; now the second is built,
+    // on the first one's ids.
+    fe.step(0);
+    control.step(0);
+    assert_eq!(response(&mut config, second), Some(Code::CHANGED));
+    fe.step(0);
+    assert!(fe.link_up("lan.20", &[true, true]));
+    assert!(fe.link_up("lan.10", &[true, true]));
+}
+
+#[test]
+fn a_control_task_on_another_thread_feeds_the_worker_and_passes_its_requests_on() {
+    let mut fe = Fe::new(SimIo::new(), vec!["lan".into(), "wan".into()]);
+    let mut control = fe.detach_control().unwrap();
+    let mut clients = Vec::new();
+    for writes in [writers::CONFIG, writers::ROUTE, writers::NEIGHBOR] {
+        let (a, b) = UnixStream::pair().unwrap();
+        control.attach(a, writes).unwrap();
+        clients.push(Client::new(b).unwrap());
+    }
+    let thread = std::thread::spawn(move || {
+        while !control.fe_gone() {
+            if !control.step(0).busy {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    });
+    // Steps the worker until the control thread answered request `token`.
+    let answer = |fe: &mut Fe<SimIo>, client: &mut Client, token: u32| {
+        for _ in 0..5_000 {
+            fe.step(0);
+            if let Some(code) = response(client, token) {
+                return code;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("no answer from the control thread");
+    };
+    let patch = |fe: &mut Fe<SimIo>, client: &mut Client, changes: &[Change]| {
+        let token = client.patch(changes).unwrap();
+        answer(fe, client, token)
+    };
+    // Before there is a route, so that the first request is seen. The registration
+    // has no answer of its own; the request after it on the same connection has.
+    clients[2].observe();
+    let token = clients[2].get(&["c"]);
+    assert_eq!(answer(&mut fe, &mut clients[2], token), Code::CONTENT);
+    let code = patch(
+        &mut fe,
+        &mut clients[0],
+        &[
+            iface("lan", LAN_MAC),
+            iface("wan", WAN_MAC),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let code = patch(
+        &mut fe,
+        &mut clients[1],
+        &[
+            route([192, 0, 2, 0], 24, "lan", None),
+            route([198, 51, 100, 0], 24, "wan", None),
+            route([0, 0, 0, 0], 0, "wan", Some(GATEWAY)),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+
+    // No neighbor yet: the worker's resolve request reaches the observer through
+    // the control thread.
+    let mut asked = false;
+    for _ in 0..5_000 {
+        fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+        fe.step(0);
+        let (_, events) = clients[2].poll();
+        if events
+            .iter()
+            .any(|e| matches!(e, Event::Notification { .. }))
+        {
+            asked = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(asked, "no resolve request");
+    while fe.io_mut().pop_tx().is_some() {}
+
+    let code = patch(
+        &mut fe,
+        &mut clients[2],
+        &[neighbor("wan", GATEWAY, GATEWAY_MAC)],
+    );
+    assert_eq!(code, Code::CHANGED);
+    // The answer comes when the version is built; the worker moves to it on its
+    // next step.
+    fe.step(0);
+    fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+    fe.step(0);
+    let tx = fe.io_mut().pop_tx().expect("forwarded");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[0..6], &GATEWAY_MAC);
+
+    drop(fe);
+    thread.join().unwrap();
+}

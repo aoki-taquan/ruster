@@ -41,7 +41,7 @@ use std::io::{self, ErrorKind};
 use std::net::IpAddr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use ruster_core::{
     execute_one_icmpv4_error, execute_one_ipv4_fragmentation, forward_batch_with_control,
@@ -181,15 +181,49 @@ pub struct FeCounters {
     pub overlay_dropped: u64,
 }
 
-/// The forwarding element: the control task and the worker, stepped one after the
-/// other on the caller's thread.
+/// The forwarding element: the control task and the worker.
 ///
 /// The two share nothing. The control task sends the worker each version of the
 /// tables it builds, and the worker sends back its notifications for the table
 /// connections and which version it now uses, over one queue each way.
+///
+/// [`Fe::step`] steps both, one after the other, on the caller's thread. After
+/// [`Fe::detach_control`] it steps the worker only, and the caller steps the
+/// [`Control`] it got wherever it likes: building a large version of the tables
+/// then does not hold up forwarding.
 pub struct Fe<B> {
-    control: ControlTask,
+    /// `None` once detached.
+    control: Option<ControlTask>,
     worker: Worker<B>,
+}
+
+/// The control task of an [`Fe`], taken out of it by [`Fe::detach_control`] to be
+/// stepped on another thread.
+pub struct Control(ControlTask);
+
+// A thread can be given it.
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<Control>();
+};
+
+impl Control {
+    /// Accepts a table connection that may write `writes` (see [`writers`]).
+    pub fn attach(&mut self, stream: UnixStream, writes: &[u64]) -> io::Result<()> {
+        self.0.server.attach(stream, writes)
+    }
+
+    /// Whether the [`Fe`] this was taken out of is gone: nothing is left to build
+    /// tables for.
+    pub fn fe_gone(&self) -> bool {
+        self.0.worker_gone
+    }
+}
+
+impl Task for Control {
+    fn step(&mut self, _now_ms: u64) -> Progress {
+        self.0.step()
+    }
 }
 
 /// The tables built for one accepted store, with its firewall and NAT.
@@ -215,21 +249,40 @@ struct ControlTask {
     builder: Builder,
     versions: Sender<Version>,
     from_worker: Receiver<FromWorker>,
+    /// A version was sent and the worker has not said yet that it uses it.
+    ///
+    /// Until it does, no further change is looked at: the next version must be built
+    /// on the interface ids of the one the worker uses, or an interface could get
+    /// another's id while the worker's state (NAT, the firewall) still names it.
+    awaiting_worker: bool,
+    /// The worker's end of the queues is gone.
+    worker_gone: bool,
 }
 
 impl ControlTask {
     fn step(&mut self) -> Progress {
-        for message in self.from_worker.try_iter() {
-            match message {
-                FromWorker::Notify(payload) => self.server.notify(&payload),
-                FromWorker::Using(names) => self.builder.names = names,
+        loop {
+            match self.from_worker.try_recv() {
+                Ok(FromWorker::Notify(payload)) => self.server.notify(&payload),
+                Ok(FromWorker::Using(names)) => {
+                    self.builder.names = names;
+                    self.awaiting_worker = false;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.worker_gone = true;
+                    break;
+                }
             }
+        }
+        if self.awaiting_worker && !self.worker_gone {
+            return Progress::IDLE;
         }
         let progress = self.server.step(&mut self.builder);
         // Of several versions built in one step, the last.
         if let Some(version) = self.builder.built.take() {
-            // The worker lives as long as this task: both are parts of one `Fe`.
-            let _ = self.versions.send(version);
+            self.worker_gone |= self.versions.send(version).is_err();
+            self.awaiting_worker = true;
         }
         progress
     }
@@ -277,6 +330,8 @@ struct Worker<B> {
     /// The versions the control task built; the worker moves to the last.
     versions: Receiver<Version>,
     to_control: Sender<FromWorker>,
+    /// The control task's end of the queues is gone.
+    control_gone: bool,
     punt: Option<UnixDatagram>,
     /// Where ARP goes when the punt socket is not connected to one peer.
     punt_peer: Option<PathBuf>,
@@ -345,6 +400,8 @@ where
             builder,
             versions,
             from_worker,
+            awaiting_worker: false,
+            worker_gone: false,
         };
         let worker = Worker {
             io,
@@ -367,6 +424,7 @@ where
             active: built.active,
             versions: from_control,
             to_control,
+            control_gone: false,
             punt: None,
             punt_peer: None,
             controls: control::Controls::default(),
@@ -386,12 +444,36 @@ where
             now_ms: 0,
             counters: FeCounters::default(),
         };
-        Self { control, worker }
+        Self {
+            control: Some(control),
+            worker,
+        }
     }
 
     /// Accepts a table connection that may write `writes` (see [`writers`]).
+    ///
+    /// Fails after [`Fe::detach_control`]: the connection is then the [`Control`]'s
+    /// to accept.
     pub fn attach(&mut self, stream: UnixStream, writes: &[u64]) -> io::Result<()> {
-        self.control.server.attach(stream, writes)
+        match &mut self.control {
+            Some(control) => control.server.attach(stream, writes),
+            None => Err(io::Error::new(
+                ErrorKind::Unsupported,
+                "the control task was detached",
+            )),
+        }
+    }
+
+    /// Takes the control task out, to be stepped on another thread; `None` when it
+    /// was taken before. From then on [`Fe::step`] steps the worker only.
+    pub fn detach_control(&mut self) -> Option<Control> {
+        self.control.take().map(Control)
+    }
+
+    /// Whether the [`Control`] taken out of this is gone: the tables will not change
+    /// any more.
+    pub fn control_gone(&self) -> bool {
+        self.worker.control_gone
     }
 
     /// Uses `socket` to pass ARP to the neighbor process and to take frames back.
@@ -590,9 +672,9 @@ where
         self.worker.limits.counters()
     }
 
-    /// The current tables.
-    pub fn store(&self) -> &Store {
-        self.control.server.store()
+    /// The current tables; `None` after [`Fe::detach_control`].
+    pub fn store(&self) -> Option<&Store> {
+        self.control.as_ref().map(|control| control.server.store())
     }
 }
 
@@ -604,7 +686,18 @@ where
     /// then forwards a batch and sends the frames the control processes gave back.
     fn step(&mut self, now_ms: u64) -> bool {
         self.now_ms = now_ms;
-        if let Some(version) = self.versions.try_iter().last() {
+        let mut last = None;
+        loop {
+            match self.versions.try_recv() {
+                Ok(version) => last = Some(version),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.control_gone = true;
+                    break;
+                }
+            }
+        }
+        if let Some(version) = last {
             self.take(version);
         }
         let worked = self.worker(now_ms);
@@ -1179,7 +1272,7 @@ where
             address,
         }
         .encode(&mut Encoder::new(&mut payload));
-        // The control task lives as long as the worker: both are parts of one `Fe`.
+        // Nobody is left to tell when the control task is gone.
         let _ = self.to_control.send(FromWorker::Notify(payload));
         self.counters.resolve_requests += 1;
     }
@@ -1571,11 +1664,14 @@ where
     B: PacketIo + GeneratedPacketIo,
 {
     fn step(&mut self, now_ms: u64) -> Progress {
-        let control = self.control.step();
+        let Some(control) = &mut self.control else {
+            return Progress::busy(self.worker.step(now_ms));
+        };
+        let before = control.step();
         let worked = self.worker.step(now_ms);
         // The worker's notifications go out now.
-        let flushed = self.control.step();
-        control.and(flushed).and(Progress::busy(worked))
+        let flushed = control.step();
+        before.and(flushed).and(Progress::busy(worked))
     }
 }
 
@@ -1632,8 +1728,8 @@ struct Builder {
     generation: u64,
     /// The interface of each id in the tables the worker uses (it says so each time
     /// it moves to a version): a table change keeps the ids of the interfaces that
-    /// stay. Several changes checked before the worker moves build on these, not on
-    /// each other, since the worker takes only the last.
+    /// stay. Several changes checked in one step build on these, not on each other,
+    /// since the worker takes only the last.
     names: Vec<String>,
 }
 
