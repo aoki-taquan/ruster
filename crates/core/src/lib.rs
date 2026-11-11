@@ -29,6 +29,7 @@ mod pppoe;
 mod punt;
 mod reload_state;
 mod route;
+mod route_tree;
 mod slot_index;
 mod slot_list;
 mod source_validation;
@@ -176,6 +177,7 @@ pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Origin, Route, RouteError,
     TunnelOriginError, ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
+pub use route_tree::Ipv4RouteTree;
 pub use source_validation::{SourceValidation, SourceValidationBinding};
 pub use srv6::{Srv6Behaviour, Srv6Error, Srv6Policy, Srv6Sid, Srv6Table};
 pub use time::MonotonicMillis;
