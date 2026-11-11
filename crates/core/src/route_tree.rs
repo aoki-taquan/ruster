@@ -13,7 +13,8 @@
 //! routes takes one route's change in the time of copying four nodes. The
 //! packet path only reads: no lock, no counter is written.
 //!
-//! The forwarding path does not use this yet.
+//! [`crate::ValidatedForwardingOwner`] builds one from its routes for the
+//! IPv4 longest match. It builds the whole tree for every version still.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -55,6 +56,21 @@ impl<V: Copy> Node<V> {
 
     fn is_empty(&self) -> bool {
         self.own.is_empty() && self.child_count == 0
+    }
+
+    fn heap_bytes(&self) -> usize {
+        use std::mem::{size_of, size_of_val};
+        let below: usize = self
+            .children
+            .iter()
+            .flat_map(|children| children.iter().flatten())
+            .map(|child| child.heap_bytes())
+            .sum();
+        size_of::<Self>()
+            + self.own.len() * size_of::<(Own, V)>()
+            + size_of_val(&*self.places)
+            + self.children.as_deref().map_or(0, size_of_val)
+            + below
     }
 
     /// Fills the places a route of `len` bits at `bits` covers from `own`.
@@ -129,12 +145,20 @@ impl<V: Copy> Ipv4RouteTree<V> {
     /// The value of the longest route that has `address`.
     #[inline]
     pub fn lookup(&self, address: Ipv4Address) -> Option<V> {
+        self.lookup_counted(address).0
+    }
+
+    /// [`Self::lookup`], and the number of nodes read for it.
+    #[inline]
+    pub(crate) fn lookup_counted(&self, address: Ipv4Address) -> (Option<V>, u32) {
         let address = u32::from_be_bytes(address.octets());
         let mut node = &*self.root;
         let mut used = 0;
         let mut best = None;
+        let mut read = 0;
         for stride in STRIDES {
             let index = bits_at(address, used, stride);
+            read += 1;
             if let Some(value) = node.places[index] {
                 best = Some(value);
             }
@@ -144,7 +168,13 @@ impl<V: Copy> Ipv4RouteTree<V> {
             }
             used += stride;
         }
-        best
+        (best, read)
+    }
+
+    /// About the heap bytes the tree holds, counting a node other trees share
+    /// too in full. Goes through every node.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.root.heap_bytes()
     }
 
     /// The value of the route `prefix/len` itself. The bits of `prefix` after

@@ -6,13 +6,8 @@
 //! path lookup then costs a bounded number of comparisons that depends only
 //! on the configured list lengths logarithmically, never linearly:
 //!
-//! - Route LPM: the routes are flattened into disjoint address intervals
-//!   ("binary search on ranges"). Every route is a prefix, so the routes
-//!   form a laminar family (two prefixes are disjoint or nested) and the
-//!   longest match is constant between consecutive prefix boundaries. The
-//!   boundaries (at most `2 * routes + 1`, fewer after merging neighbouring
-//!   intervals with the same answer) are sorted and searched with one
-//!   binary search: at most 14 probes at the 4096-route config limit.
+//! - Route LPM: a [`crate::Ipv4RouteTree`] read 8 bits of the destination
+//!   at a time, at most four nodes whatever the number of routes.
 //! - Exact keys (interface by id, local address by address and by
 //!   interface, static neighbor by `(interface, target)`, connected network
 //!   and directed-broadcast boundaries, gateway next hops): sorted arrays
@@ -36,23 +31,17 @@
 //! routes with the same prefix and length, and two matching routes of the
 //! same length necessarily have the same prefix (`address & mask`), so a
 //! validated table never has a tie. The builder still reproduces the
-//! last-wins rule for unvalidated input: it sorts with a stable sort, so
-//! equal prefixes stay in slice order and the later one is pushed last and
-//! ends on top of the nesting stack. Exact-key lookups return the first
-//! element in slice order, like the reference `find`.
+//! last-wins rule for unvalidated input: it sets the routes in slice order,
+//! and a route set again takes the place of the one before. Exact-key
+//! lookups return the first element in slice order, like the reference
+//! `find`.
 
 use crate::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route};
 
-/// No route covers the interval.
-const NO_ROUTE: u32 = u32::MAX;
-
 /// Immutable lookup indexes for one validated forwarding owner.
 pub(crate) struct ForwardingIndex {
-    /// Sorted interval starts; `lpm_starts[0] == 0` always (with or without
-    /// routes), so every address falls in exactly one interval.
-    lpm_starts: Box<[u32]>,
-    /// Route index per interval, or [`NO_ROUTE`].
-    lpm_routes: Box<[u32]>,
+    /// The routes by prefix; the value is the slice index plus one.
+    lpm: crate::Ipv4RouteTree<std::num::NonZeroU32>,
     /// `(interface id, slice index)` sorted by id.
     interfaces: Box<[(u16, u32)]>,
     /// `(address, slice index)` sorted by address.
@@ -78,7 +67,7 @@ impl std::fmt::Debug for ForwardingIndex {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ForwardingIndex")
-            .field("lpm_intervals", &self.lpm_starts.len())
+            .field("lpm_routes", &self.lpm.len())
             .field("heap_bytes", &self.heap_bytes())
             .finish_non_exhaustive()
     }
@@ -148,7 +137,7 @@ impl ForwardingIndex {
         neighbors: &[Neighbor],
         local_ipv4: &[LocalIpv4Binding],
     ) -> Self {
-        let (lpm_starts, lpm_routes) = build_lpm(routes);
+        let lpm = build_lpm(routes);
         let mut interface_keys: Vec<(u16, u32)> = interfaces
             .iter()
             .enumerate()
@@ -211,8 +200,7 @@ impl ForwardingIndex {
         }
 
         Self {
-            lpm_starts,
-            lpm_routes,
+            lpm,
             interfaces: interface_keys.into_boxed_slice(),
             locals_by_address: locals_by_address.into_boxed_slice(),
             locals_by_interface: locals_by_interface.into_boxed_slice(),
@@ -238,8 +226,7 @@ impl ForwardingIndex {
     /// Heap bytes held by the index (snapshot memory, freed with the owner).
     pub(crate) fn heap_bytes(&self) -> usize {
         use std::mem::size_of_val;
-        size_of_val(&*self.lpm_starts)
-            + size_of_val(&*self.lpm_routes)
+        self.lpm.heap_bytes()
             + size_of_val(&*self.interfaces)
             + size_of_val(&*self.locals_by_address)
             + size_of_val(&*self.locals_by_interface)
@@ -250,14 +237,12 @@ impl ForwardingIndex {
             + self.input_firewall.heap_bytes()
     }
 
-    /// Slice index of the longest-prefix route for `destination`.
+    /// Slice index of the longest-prefix route for `destination`, and the
+    /// number of tree nodes read.
     #[inline]
     pub(crate) fn route(&self, destination: Ipv4Address) -> (Option<usize>, u32) {
-        let address = address_bits(destination);
-        let (after, probes) = partition(&self.lpm_starts, |start| *start <= address);
-        // `lpm_starts[0] == 0`, so `after >= 1`.
-        let route = self.lpm_routes[after - 1];
-        ((route != NO_ROUTE).then_some(route as usize), probes)
+        let (route, read) = self.lpm.lookup_counted(destination);
+        (route.map(|slot| slot.get() as usize - 1), read)
     }
 
     #[inline]
@@ -310,53 +295,15 @@ impl ForwardingIndex {
 }
 
 /// Flattens the routes into disjoint intervals with their longest match.
-fn build_lpm(routes: &[Route]) -> (Box<[u32]>, Box<[u32]>) {
-    let mut order: Vec<usize> = (0..routes.len()).collect();
-    // Stable: equal (prefix, length) keep slice order, so the later route
-    // ends on top of the stack, like the reference `max_by_key`.
-    order.sort_by_key(|&index| {
-        (
-            address_bits(routes[index].prefix()),
-            routes[index].prefix_len(),
-        )
-    });
-    let mut points: Vec<u32> = Vec::with_capacity(routes.len() * 2 + 1);
-    points.push(0);
-    for route in routes {
-        points.push(address_bits(route.prefix()));
-        if let Some(after) = prefix_last(*route).checked_add(1) {
-            points.push(after);
-        }
+fn build_lpm(routes: &[Route]) -> crate::Ipv4RouteTree<std::num::NonZeroU32> {
+    let mut tree = crate::Ipv4RouteTree::new();
+    // In slice order: of two routes with the same prefix and length the
+    // later one stays, like the reference `max_by_key`.
+    for (index, route) in routes.iter().enumerate() {
+        let value = std::num::NonZeroU32::new(slot(index) + 1).expect("an index plus one");
+        tree.insert(route.prefix(), route.prefix_len(), value);
     }
-    points.sort_unstable();
-    points.dedup();
-
-    let mut starts = Vec::with_capacity(points.len());
-    let mut values = Vec::with_capacity(points.len());
-    let mut stack: Vec<usize> = Vec::new();
-    let mut next = 0;
-    for point in points {
-        // Nested prefixes: the innermost (top) ends first.
-        while stack
-            .last()
-            .is_some_and(|&top| prefix_last(routes[top]) < point)
-        {
-            stack.pop();
-        }
-        while let Some(&index) = order.get(next) {
-            if address_bits(routes[index].prefix()) != point {
-                break;
-            }
-            stack.push(index);
-            next += 1;
-        }
-        let value = stack.last().map_or(NO_ROUTE, |&index| slot(index));
-        if values.last() != Some(&value) {
-            starts.push(point);
-            values.push(value);
-        }
-    }
-    (starts.into_boxed_slice(), values.into_boxed_slice())
+    tree
 }
 
 /// Linear reference semantics, the pre-H4c per-packet code. Used for
