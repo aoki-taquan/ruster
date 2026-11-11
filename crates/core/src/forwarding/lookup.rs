@@ -1,24 +1,24 @@
 //! Publication-time lookup indexes over one forwarding snapshot (PERF-002).
 //!
-//! [`ForwardingIndex`] is built once by [`crate::ValidatedForwardingOwner::new`]
-//! on the cold publication path (allocation allowed there) from the same
-//! boxed tables it validates, and is never mutated afterwards. Every packet
-//! path lookup then costs a bounded number of comparisons that depends only
-//! on the configured list lengths logarithmically, never linearly:
+//! [`ForwardingIndex`] is built by [`crate::ValidatedForwardingOwner`] on the
+//! cold publication path (allocation allowed there) and is never mutated
+//! afterwards. The routes come as a [`crate::Ipv4Routes`], which a new owner
+//! may share with the one before it; the indexes of the other tables are
+//! built from the boxed tables the owner validates.
 //!
-//! - Route LPM: a [`crate::Ipv4RouteTree`] read one byte of the destination
-//!   at a time, at most four nodes whatever the number of routes.
-//! - Exact keys (interface by id, local address by address and by
-//!   interface, static neighbor by `(interface, target)`, connected network
-//!   and directed-broadcast boundaries, gateway next hops): sorted arrays
-//!   searched by binary search. Keys come from validated configuration, not
-//!   from packets, so a hash table would gain nothing against an attacker
-//!   and would need a secret to stay bounded; a sorted array is
-//!   deterministic, has no worst case beyond `ceil(log2(n + 1))` probes,
-//!   and needs no per-publication key.
-//! - On-link senders (ARP learning, ARP-031): the direct (no next hop)
-//!   routes of every interface merged into disjoint `(interface, address)`
-//!   intervals, plus the gateway set.
+//! - Route LPM: the route tree read one byte of the destination at a time,
+//!   at most four nodes whatever the number of routes.
+//! - What is asked of the routes as a whole (connected network and
+//!   directed-broadcast addresses, gateway next hops, on-link senders for
+//!   ARP learning, ARP-031): ordered sets that [`crate::Ipv4Routes`] keeps
+//!   up to date as routes are set and taken out.
+//! - Exact keys of the other tables (interface by id, local address by
+//!   address and by interface, static neighbor by `(interface, target)`):
+//!   sorted arrays searched by binary search. Keys come from validated
+//!   configuration, not from packets, so a hash table would gain nothing
+//!   against an attacker and would need a secret to stay bounded; a sorted
+//!   array is deterministic, has no worst case beyond `ceil(log2(n + 1))`
+//!   probes, and needs no per-publication key.
 //!
 //! The linear functions at the bottom of this file are the reference
 //! semantics. They remain the implementation for snapshots borrowed with
