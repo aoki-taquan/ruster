@@ -460,6 +460,13 @@ impl Client {
         token
     }
 
+    /// Writes the requests made so far, as far as the socket takes them now: for a
+    /// caller that then sends something on another socket which must not overtake
+    /// them. What arrives meanwhile is kept for the next [`Client::poll`].
+    pub fn flush(&mut self) {
+        let _ = self.conn.pump();
+    }
+
     /// Moves bytes and returns what arrived.
     pub fn poll(&mut self) -> (Progress, Vec<Event>) {
         let mut busy = self.conn.pump().unwrap_or(false);

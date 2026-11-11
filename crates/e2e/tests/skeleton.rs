@@ -495,7 +495,7 @@ fn a_restarted_fe_is_filled_again_by_the_control_processes() {
         "neighd gave the new FE the neighbors it knew"
     );
     assert!(
-        router.fe.store().len() >= 7,
+        router.fe.store().is_some_and(|store| store.len() >= 7),
         "interfaces, addresses, routes and neighbors"
     );
 }
@@ -506,6 +506,7 @@ fn routes_removed_while_the_fe_was_down_are_gone_from_the_new_fe() {
     let routes_before = router
         .fe
         .store()
+        .expect("the FE has its control task")
         .iter()
         .filter(|(key, _)| matches!(key, Key::Route { .. }))
         .count();
@@ -517,6 +518,7 @@ fn routes_removed_while_the_fe_was_down_are_gone_from_the_new_fe() {
     let routes_after = router
         .fe
         .store()
+        .expect("the FE has its control task")
         .iter()
         .filter(|(key, _)| matches!(key, Key::Route { .. }))
         .count();
@@ -528,7 +530,10 @@ fn routes_removed_while_the_fe_was_down_are_gone_from_the_new_fe() {
 }
 
 fn has(router: &Router, key: &Key) -> bool {
-    router.fe.store().get(key).is_some()
+    router
+        .fe
+        .store()
+        .is_some_and(|store| store.get(key).is_some())
 }
 
 #[test]
