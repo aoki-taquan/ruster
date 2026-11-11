@@ -1540,4 +1540,107 @@ mod tests {
         assert!(hook.read_all > 20, "{}", hook.read_all);
         assert!(hook.refused > 5, "{}", hook.refused);
     }
+
+    /// Builds as the FE does, from the routes kept, and adds up the time.
+    #[derive(Default)]
+    struct Timed {
+        ports: Vec<String>,
+        names: Vec<String>,
+        kept: Option<Routes>,
+        spent: std::time::Duration,
+    }
+
+    impl Hook for Timed {
+        fn check(&mut self, next: &Store) -> Result<(), String> {
+            self.check_patch(next, &[])
+        }
+
+        fn check_patch(
+            &mut self,
+            next: &Store,
+            changed: &[(&Key, Option<&Value>)],
+        ) -> Result<(), String> {
+            let started = std::time::Instant::now();
+            let kept = self.kept.take().map(|routes| (routes, changed));
+            let (built, routes) = build(&self.ports, next, &self.names, kept)?;
+            self.spent += started.elapsed();
+            self.names = built.interface_names;
+            self.kept = Some(routes);
+            Ok(())
+        }
+
+        fn committed(&mut self, _store: &Store) {}
+    }
+
+    /// Release timing, run on demand:
+    /// `cargo test --release -p ruster-fe build_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing report, not a pass/fail test"]
+    fn build_timing_up_to_a_full_table() {
+        use std::time::{Duration, Instant};
+
+        let route = |index: u32, interface: &str| {
+            Change::set(
+                Key::Route {
+                    vrf: DEFAULT_VRF.into(),
+                    prefix: std::net::Ipv4Addr::from(0x1000_0000 + (index << 8)).into(),
+                    len: 24,
+                },
+                Value::Route(RouteAction::Forward(vec![NextHop {
+                    interface: interface.into(),
+                    address: None,
+                }])),
+            )
+        };
+        for count in [131_072u32, 1_048_576] {
+            let mut hook = Timed {
+                ports: vec!["p0".into(), "p1".into()],
+                ..Timed::default()
+            };
+            let mut server = Server::new();
+            let connect = |server: &mut Server, writes: &[u64]| {
+                let (a, b) = UnixStream::pair().unwrap();
+                server.attach(a, writes).unwrap();
+                Client::new(b).unwrap()
+            };
+            let mut config = connect(&mut server, &[sid::INTERFACE]);
+            let mut routes = connect(&mut server, &[sid::ROUTE]);
+            let mut send = |client: &mut Client, hook: &mut Timed, changes: &[Change]| {
+                client.patch(changes).unwrap();
+                while client.poll().1.is_empty() {
+                    server.step(hook);
+                }
+            };
+            send(
+                &mut config,
+                &mut hook,
+                &[
+                    interface("p0", true, DEFAULT_VRF),
+                    interface("p1", true, DEFAULT_VRF),
+                ],
+            );
+            // The whole table arrives 1,000 routes at a time.
+            let started = Instant::now();
+            for first in (0..count).step_by(1000) {
+                let changes: Vec<Change> = (first..count.min(first + 1000))
+                    .map(|index| route(index, "p0"))
+                    .collect();
+                send(&mut routes, &mut hook, &changes);
+            }
+            let load = started.elapsed();
+            let load_build = std::mem::take(&mut hook.spent);
+            // Then one route changes, 20 times.
+            let started = Instant::now();
+            for round in 0..20 {
+                let interface = ["p1", "p0"][round % 2];
+                send(&mut routes, &mut hook, &[route(count / 2, interface)]);
+            }
+            let one = started.elapsed() / 20;
+            let one_build: Duration = hook.spent / 20;
+            println!(
+                "{count} routes: the whole table in {load:?} (building {load_build:?}), \
+                 one route in {one:?} (building {one_build:?})"
+            );
+        }
+    }
 }
