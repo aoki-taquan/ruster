@@ -305,7 +305,8 @@ impl ControlTask {
                 self.builder.names = names;
                 self.awaiting_worker = false;
                 // The worker uses the version the changes are in: now their
-                // writers are told.
+                // writers are told. (With the worker gone, nobody is: the FE is
+                // stopping.)
                 self.server.release_changed();
             }
             FromWorker::Sync(number) => {
