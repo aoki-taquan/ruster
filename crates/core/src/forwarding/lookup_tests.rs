@@ -379,6 +379,8 @@ fn lookup_probes_are_bounded_at_the_config_limits() {
         &tables.local_ipv4,
     );
     // ceil(log2(n + 1)) probes for n sorted entries.
+    // The route tree reads at most one node per 8 bits of the address.
+    let tree_bound = 4;
     let route_bound = log2_ceil(2 * 4096 + 1); // 14
     let neighbor_bound = log2_ceil(4096); // 13
     let local_bound = log2_ceil(1024); // 11
@@ -402,7 +404,7 @@ fn lookup_probes_are_bounded_at_the_config_limits() {
         worst[6] = worst[6].max(index.interface(IfId(id)).1);
         worst[6] = worst[6].max(index.local_by_interface(IfId(id)).1);
     }
-    assert!(worst[0] <= route_bound, "route probes {}", worst[0]);
+    assert!(worst[0] <= tree_bound, "route tree nodes {}", worst[0]);
     assert!(worst[1] <= local_bound, "local probes {}", worst[1]);
     assert!(worst[2] <= neighbor_bound, "neighbor probes {}", worst[2]);
     assert!(worst[3] <= route_bound, "connected probes {}", worst[3]);
@@ -527,14 +529,15 @@ fn unvalidated_duplicate_keys_resolve_to_the_first_like_find() {
 }
 
 /// The largest index the config limits allow: 4096 non-adjacent direct
-/// routes (every route adds two LPM intervals, two connected boundaries,
-/// and its own on-link range), 4096 static neighbors, and 256 interfaces
-/// with one address each, and 256 input firewall rules (INPUT-FW) in the
-/// shape with the most per-ingress list entries: 128 for any interface and
-/// protocol, 128 naming distinct interfaces. About 392 KiB (snapshot
-/// memory; two owners coexist during a reload, about 784 KiB).
+/// routes (every route adds two connected boundaries and its own on-link
+/// range, and they fill the route tree's nodes of 32 /16s), 4096 static
+/// neighbors, and 256 interfaces with one address each, and 256 input
+/// firewall rules (INPUT-FW) in the shape with the most per-ingress list
+/// entries: 128 for any interface and protocol, 128 naming distinct
+/// interfaces. About 415 KiB (snapshot memory; two owners coexist during a
+/// reload, about 830 KiB).
 #[test]
-fn index_heap_at_the_worst_config_shape_is_about_392_kib() {
+fn index_heap_at_the_worst_config_shape_is_about_415_kib() {
     let interfaces: Vec<Interface> = (0..256u16)
         .map(|id| Interface {
             id: IfId(id),
@@ -569,13 +572,12 @@ fn index_heap_at_the_worst_config_shape_is_about_392_kib() {
         .collect();
     let mut index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
     let tables = index.heap_bytes();
-    // 8193 LPM intervals x 8 + 8192 boundaries x 8 + 4096 on-link ranges
-    // x 16 + 4096 neighbors x 16 + 256 interfaces x 8 + 2 x 256 locals x 8.
-    assert_eq!(
-        tables,
-        8193 * 8 + 8192 * 8 + 4096 * 16 + 4096 * 16 + 256 * 8 + 2 * 256 * 8
-    );
-    assert!(tables <= 300 * 1024, "{tables}");
+    // 8192 boundaries x 8 + 4096 on-link ranges x 16 + 4096 neighbors x 16
+    // + 256 interfaces x 8 + 2 x 256 locals x 8, and the route tree.
+    let sorted = 8192 * 8 + 4096 * 16 + 4096 * 16 + 256 * 8 + 2 * 256 * 8;
+    let tree = tables - sorted;
+    // 32 nodes of a /16 with 128 routes each, and the two nodes above them.
+    assert!((64 * 1024..=96 * 1024).contains(&tree), "{tree}");
 
     // Input rules: with `a` rules for any interface and protocol and `b`
     // naming distinct interfaces, the lists hold 4a + 4b(a + 1) entries,
@@ -603,7 +605,7 @@ fn index_heap_at_the_worst_config_shape_is_about_392_kib() {
     let entries = 4 * 128 + 4 * 128 * 129;
     let lists = 128 * std::mem::size_of::<(u16, [u32; 5])>();
     assert_eq!(bytes - tables, entries * 2 + lists);
-    assert!(bytes <= 400 * 1024, "{bytes}");
+    assert!(bytes <= 420 * 1024, "{bytes}");
 }
 
 /// What validation answered when it compared every entry with every earlier one:

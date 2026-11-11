@@ -2500,7 +2500,7 @@ impl ValidatedForwardingOwner {
     /// limits: the worst shape (4096 non-adjacent direct routes, 4096
     /// neighbors, 256 interfaces with one address each, and 256 input
     /// firewall rules split into the most per-ingress lists, INPUT-FW) is
-    /// about 392 KiB, about 784 KiB while a reload holds the old and the new
+    /// about 415 KiB, about 830 KiB while a reload holds the old and the new
     /// owner.
     #[must_use]
     pub fn index_heap_bytes(&self) -> usize {
