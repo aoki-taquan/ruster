@@ -82,6 +82,16 @@ impl Store {
             .map(|(key, slot)| (key, &slot.value))
     }
 
+    /// Every entry but those of the table with SID `table`, in the order of
+    /// [`Store::iter`].
+    pub fn iter_without(&self, table: u64) -> impl Iterator<Item = (&Key, &Value)> {
+        self.tables
+            .iter()
+            .filter(move |(sid, _)| **sid != table)
+            .flat_map(|(_, entries)| entries)
+            .map(|(key, slot)| (key, &slot.value))
+    }
+
     fn slot(&self, key: &Key) -> Option<&Slot> {
         self.tables.get(&key.table())?.get(key)
     }
@@ -188,6 +198,21 @@ impl Store {
 /// for a key that was not there, in the order of the changes.
 struct Undo(Vec<(Key, Option<Slot>)>);
 
+impl Undo {
+    /// Each entry that was touched, once, with the value it had before (`None`: it
+    /// was not there), in the order of the keys.
+    fn before(&self) -> Vec<(&Key, Option<&Value>)> {
+        let mut first: BTreeMap<&Key, Option<&Value>> = BTreeMap::new();
+        for (key, slot) in &self.0 {
+            // Of several changes of one entry, the first one's "before".
+            first
+                .entry(key)
+                .or_insert_with(|| slot.as_ref().map(|slot| &slot.value));
+        }
+        first.into_iter().collect()
+    }
+}
+
 /// Encodes changes as an iPATCH payload (a CBOR sequence).
 pub fn encode_changes(changes: &[Change]) -> Result<Vec<u8>, ModelError> {
     let mut out = Vec::new();
@@ -213,6 +238,21 @@ pub trait Hook {
     /// Whether `next` may become the current tables. The error text goes back to the
     /// writer.
     fn check(&mut self, next: &Store) -> Result<(), String>;
+
+    /// Like [`Hook::check`], for the tables an iPATCH would leave: `changed` has each
+    /// entry the patch touched, once, in the order of the keys, with the value it
+    /// had before (`None`: it was not there); what it has now is in `next`. For an
+    /// owner that keeps something made from the tables and can follow a change
+    /// without reading them all again. The answer must be the one [`Hook::check`]
+    /// would give for `next`.
+    fn check_patch(
+        &mut self,
+        next: &Store,
+        changed: &[(&Key, Option<&Value>)],
+    ) -> Result<(), String> {
+        let _ = changed;
+        self.check(next)
+    }
 
     /// `store` is now the current tables.
     fn committed(&mut self, store: &Store);
@@ -403,7 +443,7 @@ impl Server {
                         (Code::FORBIDDEN, b"table not writable here".to_vec())
                     } else {
                         let undo = self.store.apply(&changes);
-                        let answer = self.commit(undo, hook);
+                        let answer = self.commit(undo, hook, true);
                         if answer.0 == Code::CHANGED {
                             hook.patched(&changes);
                         }
@@ -439,7 +479,7 @@ impl Server {
             }
             (Code::POST, ["c", "resync-end"]) if !writes.is_empty() => {
                 let undo = self.store.drop_stale(&writes);
-                self.commit(undo, hook)
+                self.commit(undo, hook, false)
             }
             (Code::GET, ["s"]) if request.observe == Some(0) => {
                 let peer = &mut self.peers[index];
@@ -473,8 +513,15 @@ impl Server {
 
     /// Asks `hook` about the store as it is now, already changed: on a refusal the
     /// change is taken back with `undo`.
-    fn commit(&mut self, undo: Undo, hook: &mut dyn Hook) -> (Code, Vec<u8>) {
-        match hook.check(&self.store) {
+    ///
+    /// For an iPATCH (`patch`) the hook is also told which entries it touched.
+    fn commit(&mut self, undo: Undo, hook: &mut dyn Hook, patch: bool) -> (Code, Vec<u8>) {
+        let checked = if patch {
+            hook.check_patch(&self.store, &undo.before())
+        } else {
+            hook.check(&self.store)
+        };
+        match checked {
             Err(reason) => {
                 self.store.revert(undo);
                 (Code::BAD_REQUEST, reason.into_bytes())
