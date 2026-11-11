@@ -1883,11 +1883,13 @@ impl Builder {
         next: &Store,
         changed: Option<&[(&Key, Option<&Value>)]>,
     ) -> Result<(), String> {
-        // The kept routes are for the store of the last build that was accepted: a
-        // build that fails leaves none, and the next one reads the routes again.
+        // The kept routes are for the store of the last change that was accepted.
+        // They are put back only once this one is, at the end: a change refused
+        // anywhere below is taken out of the store again, and the routes it came
+        // to must not stay. After a refusal there are none, and the next build
+        // reads the routes again.
         let kept = self.routes.take().zip(changed);
         let (built, routes) = build::build(&self.ports, next, &self.names, kept)?;
-        self.routes = Some(routes);
         self.generation += 1;
         let default = built.vrfs.first().ok_or("no default VRF")?;
         let publication = firewall::Publication::new(
@@ -1903,6 +1905,7 @@ impl Builder {
             .map(|nat| nat::Publication::new(&default.owner.snapshot(), nat))
             .transpose()?;
         self.built = Some((built, publication, nat));
+        self.routes = Some(routes);
         Ok(())
     }
 }

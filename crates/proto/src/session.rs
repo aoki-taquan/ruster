@@ -244,7 +244,8 @@ pub trait Hook {
     /// had before (`None`: it was not there); what it has now is in `next`. For an
     /// owner that keeps something made from the tables and can follow a change
     /// without reading them all again. The answer must be the one [`Hook::check`]
-    /// would give for `next`.
+    /// would give for `next`. After an `Err` the tables are as they were before the
+    /// patch, so what the owner keeps must not have followed it.
     fn check_patch(
         &mut self,
         next: &Store,
