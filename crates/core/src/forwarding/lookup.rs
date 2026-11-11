@@ -6,7 +6,7 @@
 //! path lookup then costs a bounded number of comparisons that depends only
 //! on the configured list lengths logarithmically, never linearly:
 //!
-//! - Route LPM: a [`crate::Ipv4RouteTree`] read 8 bits of the destination
+//! - Route LPM: a [`crate::Ipv4RouteTree`] read one byte of the destination
 //!   at a time, at most four nodes whatever the number of routes.
 //! - Exact keys (interface by id, local address by address and by
 //!   interface, static neighbor by `(interface, target)`, connected network
@@ -40,8 +40,8 @@ use crate::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route};
 
 /// Immutable lookup indexes for one validated forwarding owner.
 pub(crate) struct ForwardingIndex {
-    /// The routes by prefix; the value is the slice index plus one.
-    lpm: crate::Ipv4RouteTree<std::num::NonZeroU32>,
+    /// The routes by prefix; the value is the slice index.
+    lpm: crate::Ipv4RouteTree<u32>,
     /// `(interface id, slice index)` sorted by id.
     interfaces: Box<[(u16, u32)]>,
     /// `(address, slice index)` sorted by address.
@@ -241,8 +241,8 @@ impl ForwardingIndex {
     /// number of tree nodes read.
     #[inline]
     pub(crate) fn route(&self, destination: Ipv4Address) -> (Option<usize>, u32) {
-        let (route, read) = self.lpm.lookup_counted(destination);
-        (route.map(|slot| slot.get() as usize - 1), read)
+        let (route, read) = self.lpm.lookup_counted(&destination.octets());
+        (route.map(|slot| *slot as usize), read)
     }
 
     #[inline]
@@ -295,13 +295,12 @@ impl ForwardingIndex {
 }
 
 /// Flattens the routes into disjoint intervals with their longest match.
-fn build_lpm(routes: &[Route]) -> crate::Ipv4RouteTree<std::num::NonZeroU32> {
+fn build_lpm(routes: &[Route]) -> crate::Ipv4RouteTree<u32> {
     let mut tree = crate::Ipv4RouteTree::new();
     // In slice order: of two routes with the same prefix and length the
     // later one stays, like the reference `max_by_key`.
     for (index, route) in routes.iter().enumerate() {
-        let value = std::num::NonZeroU32::new(slot(index) + 1).expect("an index plus one");
-        tree.insert(route.prefix(), route.prefix_len(), value);
+        tree.insert(&route.prefix().octets(), route.prefix_len(), slot(index));
     }
     tree
 }

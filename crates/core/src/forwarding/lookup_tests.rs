@@ -534,10 +534,10 @@ fn unvalidated_duplicate_keys_resolve_to_the_first_like_find() {
 /// neighbors, and 256 interfaces with one address each, and 256 input
 /// firewall rules (INPUT-FW) in the shape with the most per-ingress list
 /// entries: 128 for any interface and protocol, 128 naming distinct
-/// interfaces. About 415 KiB (snapshot memory; two owners coexist during a
-/// reload, about 830 KiB).
+/// interfaces. Under 400 KiB (snapshot memory; two owners coexist during a
+/// reload, under 800 KiB).
 #[test]
-fn index_heap_at_the_worst_config_shape_is_about_415_kib() {
+fn index_heap_at_the_worst_config_shape_is_under_400_kib() {
     let interfaces: Vec<Interface> = (0..256u16)
         .map(|id| Interface {
             id: IfId(id),
@@ -577,7 +577,7 @@ fn index_heap_at_the_worst_config_shape_is_about_415_kib() {
     let sorted = 8192 * 8 + 4096 * 16 + 4096 * 16 + 256 * 8 + 2 * 256 * 8;
     let tree = tables - sorted;
     // 32 nodes of a /16 with 128 routes each, and the two nodes above them.
-    assert!((64 * 1024..=96 * 1024).contains(&tree), "{tree}");
+    assert!((48 * 1024..=64 * 1024).contains(&tree), "{tree}");
 
     // Input rules: with `a` rules for any interface and protocol and `b`
     // naming distinct interfaces, the lists hold 4a + 4b(a + 1) entries,
@@ -605,7 +605,7 @@ fn index_heap_at_the_worst_config_shape_is_about_415_kib() {
     let entries = 4 * 128 + 4 * 128 * 129;
     let lists = 128 * std::mem::size_of::<(u16, [u32; 5])>();
     assert_eq!(bytes - tables, entries * 2 + lists);
-    assert!(bytes <= 420 * 1024, "{bytes}");
+    assert!(bytes <= 400 * 1024, "{bytes}");
 }
 
 /// What validation answered when it compared every entry with every earlier one:

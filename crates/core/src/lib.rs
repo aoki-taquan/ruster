@@ -177,7 +177,7 @@ pub use route::{
     IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Origin, Route, RouteError,
     TunnelOriginError, ETHERNET_DEFAULT_MTU, IPV4_MIN_MTU,
 };
-pub use route_tree::Ipv4RouteTree;
+pub use route_tree::{Ipv4RouteTree, Ipv6RouteTree, RouteTree};
 pub use source_validation::{SourceValidation, SourceValidationBinding};
 pub use srv6::{Srv6Behaviour, Srv6Error, Srv6Policy, Srv6Sid, Srv6Table};
 pub use time::MonotonicMillis;
