@@ -625,6 +625,8 @@ mod tests {
             .collect();
         let mut now = 0;
         let mut checked = 0;
+        // Steps with a patch on its way while a source has changed again.
+        let mut overtaken = 0;
         for _ in 0..rounds {
             let source = &mut sources[rng.below(3) as usize];
             let bad = rng.below(12) == 0;
@@ -647,6 +649,18 @@ mod tests {
             }
             // Time passes, so that what the FE refused is tried again.
             now += RESYNC_END_RETRY_MS / 3;
+            // At times the next change comes before the FE answered this one: ribd
+            // takes the change and sends its patch, and the FE is not stepped.
+            if rng.below(3) == 0 {
+                for _ in 0..2 {
+                    for source in &mut sources {
+                        source.poll();
+                    }
+                    ribd.step(now);
+                    overtaken += usize::from(ribd.in_flight.is_some() && !ribd.touched.is_empty());
+                }
+                continue;
+            }
             let mut quiet = false;
             for _ in 0..1_000 {
                 let mut busy = fe.step(&mut Fe).busy;
@@ -682,7 +696,10 @@ mod tests {
             assert_eq!(held, selected, "seed {seed}");
             checked += 1;
         }
-        assert!(checked > rounds / 2, "{checked} of {rounds}");
+        assert!(checked > rounds / 3, "{checked} of {rounds}");
+        if !gateways {
+            assert!(overtaken > 0, "no change came while a patch was on its way");
+        }
         ribd.made
     }
 
