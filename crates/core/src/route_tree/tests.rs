@@ -160,8 +160,13 @@ fn any_run_of_changes_answers_as_comparing_every_route_does() {
     assert!(tree.root.places.iter().all(Option::is_none));
 }
 
-fn child<V>(node: &Node<V>, index: usize) -> &Arc<Node<V>> {
-    node.children.as_ref().unwrap()[index].as_ref().unwrap()
+/// The node reached by reading `bytes` of an address.
+fn node_at<'a, V>(tree: &'a Ipv4RouteTree<V>, bytes: &[usize]) -> &'a Arc<Node<V>> {
+    let mut node = &tree.root;
+    for byte in bytes {
+        node = node.children.as_ref().unwrap()[*byte].as_ref().unwrap();
+    }
+    node
 }
 
 #[test]
@@ -182,17 +187,22 @@ fn a_changed_copy_shares_the_nodes_off_the_way_to_the_change() {
     assert_eq!(after.lookup(ip(0x0a01_0201)), Some(10));
     // 10.2/16 is off the way: one node, used by both.
     assert!(Arc::ptr_eq(
-        child(&before.root, 0x0a02),
-        child(&after.root, 0x0a02)
+        node_at(&before, &[10, 2]),
+        node_at(&after, &[10, 2])
     ));
     // 10.1/16 is on the way and was copied; 10.1.3/24 below it was not.
-    let (old, new) = (child(&before.root, 0x0a01), child(&after.root, 0x0a01));
-    assert!(!Arc::ptr_eq(old, new));
-    assert!(Arc::ptr_eq(child(old, 3), child(new, 3)));
+    assert!(!Arc::ptr_eq(
+        node_at(&before, &[10, 1]),
+        node_at(&after, &[10, 1])
+    ));
+    assert!(Arc::ptr_eq(
+        node_at(&before, &[10, 1, 3]),
+        node_at(&after, &[10, 1, 3])
+    ));
     // A change to a tree no other uses is made in place.
-    let node = Arc::as_ptr(child(&after.root, 0x0a01));
+    let node = Arc::as_ptr(node_at(&after, &[10, 1]));
     after.insert(ip(0x0a01_0500), 24, 11);
-    assert_eq!(Arc::as_ptr(child(&after.root, 0x0a01)), node);
+    assert_eq!(Arc::as_ptr(node_at(&after, &[10, 1])), node);
 }
 
 /// Release timing, run on demand:
