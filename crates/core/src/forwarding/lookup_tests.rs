@@ -767,3 +767,46 @@ fn a_repeat_among_many_routes_is_found() {
         Some(SnapshotError::DuplicateRoute)
     );
 }
+
+/// The same at the sizes of a BGP table. The destinations are spread over all
+/// the routes, so the index does not stay in the CPU's cache:
+/// `cargo test --release -p ruster-core lookup_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "timing report, not a pass/fail test"]
+fn lookup_timing_up_to_a_full_table() {
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    for count in [4096u32, 131_072, 1_048_576] {
+        let mut tables = limit_tables();
+        tables.routes = (0..count)
+            .map(|index| {
+                let prefix = ip(0x1000_0000 + (index << 8));
+                let egress = IfId((index % 256) as u16);
+                let next_hop = (index % 2 == 1).then(|| ip(0x1000_0000 + ((index - 1) << 8) + 1));
+                Route::new(prefix, 24, egress, next_hop).unwrap()
+            })
+            .collect();
+        let started = Instant::now();
+        let owner = owner(&tables);
+        let built = started.elapsed();
+        let snapshot = owner.snapshot();
+        let mut rng = Rng(0x7177);
+        let addresses: Vec<Ipv4Address> = (0..65_536)
+            .map(|_| ip(0x1000_0000 + (rng.address() % (count << 8))))
+            .collect();
+        let rounds = 200;
+        let started = Instant::now();
+        for _ in 0..rounds {
+            for address in &addresses {
+                black_box(snapshot.route_lookup(black_box(*address)));
+            }
+        }
+        let lookup_ns = started.elapsed().as_nanos() as f64 / f64::from(rounds * 65_536);
+        println!(
+            "{count} /24 routes: validation and index {built:?}, LPM {lookup_ns:.1} ns, \
+             index {} bytes",
+            owner.index_heap_bytes()
+        );
+    }
+}
