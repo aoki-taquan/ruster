@@ -170,7 +170,7 @@ wait_line() { # pattern count
 wait_line '^bound4 r-wan address=198\.51\.100\.1(0[0-9]|10)/24 router=198\.51\.100\.1 dns=198\.51\.100\.53 lease=30$' ||
   fail "no DHCPv4 lease"
 echo "ok: DHCPv4: $(grep '^bound4' "$work/dhcpc.out" | head -1)"
-wait_line '^bound6 r-wan prefix=2001:db8:1[0-9a-f]{2}:[0-9a-f]{0,2}00::/56 address=- dns=2001:db8::53 via=fe80::' ||
+wait_line '^bound6 r-wan prefix=2001:db8:1[0-9a-f]{2}(:[0-9a-f]{1,2}00)?::/56 address=- dns=2001:db8::53 via=fe80::' ||
   fail "no delegated prefix"
 echo "ok: DHCPv6-PD: $(grep '^bound6' "$work/dhcpc.out" | head -1)"
 
