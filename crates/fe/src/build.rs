@@ -15,8 +15,8 @@ use std::net::IpAddr;
 use ruster_core::{
     FirewallAction, FirewallInterface, FirewallIpv4Prefix, FirewallPortRange, FirewallProtocol,
     FirewallRule, FirewallRuleId, IfId, Interface, Ipv4Address, Ipv4InIpv6Tunnel, Ipv4OriginPolicy,
-    Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, LocalIpv4Binding, MacAddress, Neighbor, PortSet,
-    PppoeSession, Route, ValidatedForwardingOwner, VlanBinding,
+    Ipv4Routes, Ipv6Fib, Ipv6Local, Ipv6Neighbor, Ipv6Route, Ipv6RouteTree, LocalIpv4Binding,
+    MacAddress, Neighbor, PortSet, PppoeSession, Route, ValidatedForwardingOwner, VlanBinding,
 };
 use ruster_proto::session::Store;
 use ruster_proto::sid;
@@ -147,6 +147,64 @@ pub(crate) struct Routes {
     /// Whether a route is an SRv6 SID or policy. Those make SIDs and interfaces of
     /// the FE's own too, so with one every build reads the routes again.
     srv6: bool,
+    /// How many of the entries look up in another VRF. With one, a VRF's routes
+    /// for core come from another VRF's too, and are all made again.
+    lookups: usize,
+    /// Core's routes of each VRF, as the build gave them to core. The next build
+    /// makes its change to these and shares the rest with this one.
+    tables: BTreeMap<String, Tables>,
+}
+
+/// Core's routes of one VRF.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Tables {
+    v4: Ipv4Routes,
+    v6: Ipv6RouteTree<Ipv6Route>,
+}
+
+impl Tables {
+    fn set(&mut self, route: &Forward, vrf: &str) -> Result<(), String> {
+        let failed = |error| format!("route {}/{} in {vrf}: {error}", route.prefix, route.len);
+        match route.prefix {
+            IpAddr::V4(prefix) => {
+                let route = Route::new(
+                    Ipv4Address::from_octets(prefix.octets()),
+                    route.len,
+                    route.egress,
+                    route.next_hop.and_then(v4),
+                )
+                .map_err(|e| failed(format!("{e:?}")))?;
+                self.v4.set(route);
+            }
+            IpAddr::V6(prefix) => {
+                let len = route.len;
+                let route = Ipv6Route::new(
+                    prefix.octets(),
+                    len,
+                    route.egress,
+                    route.next_hop.and_then(v6),
+                )
+                .map_err(|e| failed(format!("{e:?}")))?;
+                self.v6.insert(&prefix.octets(), len, route);
+            }
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, prefix: IpAddr, len: u8) {
+        match prefix {
+            // A length no route has: there is none to take out.
+            IpAddr::V4(_) if len > 32 => {}
+            IpAddr::V6(_) if len > 128 => {}
+            IpAddr::V4(prefix) => {
+                self.v4
+                    .remove(Ipv4Address::from_octets(prefix.octets()), len);
+            }
+            IpAddr::V6(prefix) => {
+                self.v6.remove(&prefix.octets(), len);
+            }
+        }
+    }
 }
 
 impl Routes {
@@ -382,13 +440,20 @@ pub(crate) fn build(
     kept: Option<(Routes, Changed<'_>)>,
 ) -> Result<(Built, Routes), String> {
     let kept = kept.filter(|(routes, changed)| routes.follows(changed, store));
+    // Core's routes of the build before, when no entry looked up in another VRF.
+    let mut kept_tables = None;
+    let mut lookups = 0;
     let (kept_names, mut counts, kept_entries, changed): (Vec<String>, _, _, _) = match kept {
-        Some((routes, changed)) => (
-            routes.counts.keys().cloned().collect(),
-            routes.counts,
-            Some(routes.entries),
-            changed,
-        ),
+        Some((routes, changed)) => {
+            lookups = routes.lookups;
+            kept_tables = (routes.lookups == 0).then_some(routes.tables);
+            (
+                routes.counts.keys().cloned().collect(),
+                routes.counts,
+                Some(routes.entries),
+                changed,
+            )
+        }
         None => (Vec::new(), BTreeMap::new(), None, &[][..]),
     };
     let port = |name: &str| {
@@ -955,14 +1020,20 @@ pub(crate) fn build(
         let Some(list) = entries.get_mut(vrf) else {
             continue;
         };
-        match after.and_then(|action| forwarding(*prefix, *len, action, &active)) {
-            Some(entry) => {
-                list.insert((*prefix, *len), entry);
-            }
-            None => {
-                list.remove(&(*prefix, *len));
-            }
-        }
+        let is_lookup = |entry: &Option<Entry>| matches!(entry, Some(Entry::Lookup { .. }));
+        let entry = after.and_then(|action| forwarding(*prefix, *len, action, &active));
+        let had = match entry.clone() {
+            Some(entry) => list.insert((*prefix, *len), entry),
+            None => list.remove(&(*prefix, *len)),
+        };
+        lookups = lookups + usize::from(is_lookup(&entry)) - usize::from(is_lookup(&had));
+    }
+    if all_routes {
+        lookups = entries
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter(|entry| matches!(entry, Entry::Lookup { .. }))
+            .count();
     }
 
     firewall.sort_by_key(|rule| rule.id());
@@ -970,46 +1041,57 @@ pub(crate) fn build(
         Some(entry) => nat(entry, &active, &bindings[0])?,
         None => None,
     };
-    let routes = expand_lookups(&entries);
+    // Core's routes of each VRF. With those of the build before, and no entry
+    // that looks up in another VRF before or now, only the change is made to
+    // them. Otherwise they are made from every entry.
+    let mut tables = match kept_tables.filter(|_| lookups == 0) {
+        Some(mut tables) => {
+            for (key, _) in changed {
+                let Key::Route { vrf, prefix, len } = key else {
+                    continue;
+                };
+                let Some(list) = entries.get(vrf) else {
+                    continue;
+                };
+                let table = tables.entry(vrf.clone()).or_default();
+                match list.get(&(*prefix, *len)) {
+                    Some(Entry::Forward(route)) => table.set(route, vrf)?,
+                    Some(Entry::Lookup { .. }) => unreachable!("no entry looks up"),
+                    None => table.remove(*prefix, *len),
+                }
+            }
+            tables
+        }
+        None => {
+            let mut tables = BTreeMap::new();
+            for (name, routes) in expand_lookups(&entries) {
+                let mut table = Tables::default();
+                for route in &routes {
+                    table.set(route, &name)?;
+                }
+                tables.insert(name, table);
+            }
+            tables
+        }
+    };
     let mut vrfs = Vec::with_capacity(order.len());
     for (at, name) in order.iter().enumerate() {
-        let mut routes4 = Vec::new();
-        let mut routes6 = Vec::new();
-        for route in &routes[*name] {
-            let failed =
-                |error| format!("route {}/{} in {name}: {error:?}", route.prefix, route.len);
-            match route.prefix {
-                IpAddr::V4(_) => routes4.push(
-                    Route::new(
-                        v4(route.prefix).expect("IPv4"),
-                        route.len,
-                        route.egress,
-                        route.next_hop.and_then(v4),
-                    )
-                    .map_err(|e| failed(format!("{e:?}")))?,
-                ),
-                IpAddr::V6(_) => routes6.push(
-                    Ipv6Route::new(
-                        v6(route.prefix).expect("IPv6"),
-                        route.len,
-                        route.egress,
-                        route.next_hop.and_then(v6),
-                    )
-                    .map_err(|e| failed(format!("{e:?}")))?,
-                ),
-            }
-        }
-        let owner = ValidatedForwardingOwner::new(
-            routes4.into(),
+        let table = tables.entry((*name).to_owned()).or_default().clone();
+        let owner = ValidatedForwardingOwner::with_routes(
+            table.v4,
             interfaces.clone().into(),
             neighbors.clone().into(),
             std::mem::take(&mut bindings[at]).into(),
             Ipv4OriginPolicy::default(),
         )
         .map_err(|error| format!("{name}: {error:?}"))?;
-        let ipv6 = Ipv6Fib::new(routes6, neighbors6.clone(), std::mem::take(&mut local6[at]))
-            .map_err(|error| format!("{name}: IPv6: {error:?}"))?
-            .with_unreachable(unreachable6.clone());
+        let ipv6 = Ipv6Fib::with_routes(
+            table.v6,
+            neighbors6.clone(),
+            std::mem::take(&mut local6[at]),
+        )
+        .map_err(|error| format!("{name}: IPv6: {error:?}"))?
+        .with_unreachable(unreachable6.clone());
         vrfs.push(Vrf { owner, ipv6 });
     }
     let interface_names = ids.names;
@@ -1094,6 +1176,8 @@ pub(crate) fn build(
         counts,
         entries,
         srv6: srv6_routes,
+        lookups,
+        tables,
     };
     Ok((built, routes))
 }
@@ -1340,6 +1424,8 @@ mod tests {
         followed: usize,
         read_all: usize,
         refused: usize,
+        /// The builds that made the change to core's routes of the build before.
+        shared: usize,
     }
 
     impl Hook for BothWays {
@@ -1359,6 +1445,7 @@ mod tests {
                 .kept
                 .as_ref()
                 .is_some_and(|routes| routes.follows(changed, next));
+            let no_lookup_before = self.kept.as_ref().is_some_and(|r| r.lookups == 0);
             let all = build(&self.ports, next, &self.names, None);
             let kept = self.kept.take().map(|routes| (routes, changed));
             let made = build(&self.ports, next, &self.names, kept);
@@ -1372,6 +1459,9 @@ mod tests {
                     for (made, all) in made.vrfs.iter().zip(&all.vrfs) {
                         assert_eq!(made.owner.routes(), all.owner.routes());
                         assert_eq!(made.ipv6, all.ipv6);
+                    }
+                    if follows && no_lookup_before && made_routes.lookups == 0 {
+                        self.shared += 1;
                     }
                     if follows {
                         self.followed += 1;
@@ -1452,7 +1542,7 @@ mod tests {
         }
     }
 
-    fn route_change(rng: &mut Rng) -> Change {
+    fn route_change(rng: &mut Rng, lookups: bool) -> Change {
         let key = route_key(rng);
         let v6 = matches!(&key, Key::Route { prefix, .. } if prefix.is_ipv6());
         let default = matches!(&key, Key::Route { vrf, .. } if vrf == DEFAULT_VRF);
@@ -1471,7 +1561,8 @@ mod tests {
             25..=27 => RouteAction::Discard,
             28..=30 => RouteAction::Reject,
             31..=32 => RouteAction::Local,
-            33..=36 => RouteAction::LookupVrf(rng.pick(&VRFS).into()),
+            33..=36 if lookups => RouteAction::LookupVrf(rng.pick(&VRFS).into()),
+            33..=36 => RouteAction::Discard,
             // The kinds the kept routes cannot follow.
             37 if v6 => RouteAction::Gateways(vec!["2001:db8::1".parse().unwrap()]),
             37 => RouteAction::Gateways(vec!["192.0.2.1".parse().unwrap()]),
@@ -1483,7 +1574,17 @@ mod tests {
 
     #[test]
     fn a_change_made_to_the_kept_routes_gives_what_reading_every_route_gives() {
-        let mut rng = Rng(0x726f_7574_6573);
+        // With routes that look up in another VRF, core's routes are made from
+        // every entry; without, the change is made to those of the build before.
+        let with_lookups = changes_both_ways(0x726f_7574_6573, true);
+        assert!(with_lookups.shared > 5, "{}", with_lookups.shared);
+        assert!(with_lookups.shared < with_lookups.followed / 2);
+        let without = changes_both_ways(0x726f_7574_6574, false);
+        assert_eq!(without.shared, without.followed);
+    }
+
+    fn changes_both_ways(seed: u64, lookups: bool) -> BothWays {
+        let mut rng = Rng(seed);
         let mut hook = BothWays {
             ports: vec!["p0".into(), "p1".into(), "p2".into()],
             ..BothWays::default()
@@ -1515,7 +1616,7 @@ mod tests {
                 1 => {
                     routes.resync_begin();
                     let again: Vec<Change> = (0..rng.below(4))
-                        .map(|_| route_change(&mut rng))
+                        .map(|_| route_change(&mut rng, lookups))
                         .filter(|change| change.value.is_some())
                         .collect();
                     routes.patch(&again).unwrap();
@@ -1524,7 +1625,7 @@ mod tests {
                 // Routes, a few at once, at times the same one twice.
                 _ => {
                     let changes: Vec<Change> = (0..1 + rng.below(4))
-                        .map(|_| route_change(&mut rng))
+                        .map(|_| route_change(&mut rng, lookups))
                         .collect();
                     routes.patch(&changes).unwrap();
                 }
@@ -1539,6 +1640,7 @@ mod tests {
         assert!(hook.followed > 100, "{}", hook.followed);
         assert!(hook.read_all > 20, "{}", hook.read_all);
         assert!(hook.refused > 5, "{}", hook.refused);
+        hook
     }
 
     /// Builds as the FE does, from the routes kept, and adds up the time.
@@ -1586,9 +1688,10 @@ mod tests {
                     prefix: std::net::Ipv4Addr::from(0x1000_0000 + (index << 8)).into(),
                     len: 24,
                 },
+                // Through a gateway, as the routes of a routing protocol are.
                 Value::Route(RouteAction::Forward(vec![NextHop {
                     interface: interface.into(),
-                    address: None,
+                    address: Some("192.0.2.1".parse().unwrap()),
                 }])),
             )
         };
