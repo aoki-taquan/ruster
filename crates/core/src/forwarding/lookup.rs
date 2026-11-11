@@ -40,8 +40,8 @@ use crate::{IfId, Interface, Ipv4Address, LocalIpv4Binding, Neighbor, Route};
 
 /// Immutable lookup indexes for one validated forwarding owner.
 pub(crate) struct ForwardingIndex {
-    /// The routes by prefix; the value is the slice index.
-    lpm: crate::Ipv4RouteTree<u32>,
+    /// The routes, and what the packet path asks of them as a whole.
+    routes: crate::Ipv4Routes,
     /// `(interface id, slice index)` sorted by id.
     interfaces: Box<[(u16, u32)]>,
     /// `(address, slice index)` sorted by address.
@@ -50,14 +50,6 @@ pub(crate) struct ForwardingIndex {
     locals_by_interface: Box<[(u16, u32)]>,
     /// `(interface << 32 | target, slice index)` sorted by key.
     neighbors: Box<[(u64, u32)]>,
-    /// `interface << 32 | address` of every network and directed-broadcast
-    /// address of a connected (no next hop) route of length at most 30.
-    connected_boundaries: Box<[u64]>,
-    /// `interface << 32 | next hop` of every gateway route.
-    gateways: Box<[u64]>,
-    /// Disjoint, sorted, inclusive `(interface << 32 | first, interface <<
-    /// 32 | last)` ranges covered by direct routes.
-    on_link: Box<[(u64, u64)]>,
     /// The input firewall rules split by ingress and protocol class
     /// (INPUT-FW), set by [`crate::ValidatedForwardingOwner::with_input_firewall`].
     input_firewall: crate::firewall::InputFirewallIndex,
@@ -67,7 +59,7 @@ impl std::fmt::Debug for ForwardingIndex {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ForwardingIndex")
-            .field("lpm_routes", &self.lpm.len())
+            .field("routes", &self.routes.len())
             .field("heap_bytes", &self.heap_bytes())
             .finish_non_exhaustive()
     }
@@ -79,14 +71,6 @@ const fn key(interface: IfId, address: Ipv4Address) -> u64 {
 
 const fn address_bits(address: Ipv4Address) -> u32 {
     u32::from_be_bytes(address.octets())
-}
-
-fn prefix_last(route: Route) -> u32 {
-    // `checked_shr` is `None` for `/32` (shift by 32): no host bits.
-    address_bits(route.prefix())
-        | u32::MAX
-            .checked_shr(u32::from(route.prefix_len()))
-            .unwrap_or(0)
 }
 
 fn slot(index: usize) -> u32 {
@@ -123,21 +107,28 @@ fn exact<K: Ord + Copy>(items: &[(K, u32)], wanted: K) -> (Option<usize>, u32) {
     (found, probes)
 }
 
-#[inline]
-fn member(items: &[u64], wanted: u64) -> (bool, u32) {
-    let (position, probes) = partition(items, |candidate| *candidate < wanted);
-    (items.get(position) == Some(&wanted), probes)
-}
-
 impl ForwardingIndex {
-    /// Builds every index. Cold path: allocates and sorts, `O(n log n)`.
+    /// Builds every index from a list of routes. Of two routes with the same
+    /// prefix and length the later one stays, like the reference
+    /// `max_by_key`. Cold path: allocates and sorts, `O(n log n)`.
     pub(crate) fn build(
         routes: &[Route],
         interfaces: &[Interface],
         neighbors: &[Neighbor],
         local_ipv4: &[LocalIpv4Binding],
     ) -> Self {
-        let lpm = build_lpm(routes);
+        let routes = routes.iter().copied().collect();
+        Self::with_routes(routes, interfaces, neighbors, local_ipv4)
+    }
+
+    /// Builds the indexes of the other tables around `routes`, which is
+    /// taken as it is: nothing here grows with the number of routes.
+    pub(crate) fn with_routes(
+        routes: crate::Ipv4Routes,
+        interfaces: &[Interface],
+        neighbors: &[Neighbor],
+        local_ipv4: &[LocalIpv4Binding],
+    ) -> Self {
         let mut interface_keys: Vec<(u16, u32)> = interfaces
             .iter()
             .enumerate()
@@ -163,51 +154,12 @@ impl ForwardingIndex {
             .collect();
         neighbor_keys.sort_by_key(|(key, _)| *key);
 
-        let mut connected_boundaries = Vec::new();
-        let mut gateways = Vec::new();
-        let mut direct: Vec<(u64, u64)> = Vec::new();
-        for route in routes {
-            if let Some(next_hop) = route.next_hop() {
-                gateways.push(key(route.egress(), next_hop));
-                continue;
-            }
-            let base = u64::from(route.egress().0) << 32;
-            let first = address_bits(route.prefix());
-            let last = prefix_last(*route);
-            direct.push((base | u64::from(first), base | u64::from(last)));
-            if route.prefix_len() <= 30 {
-                connected_boundaries.push(base | u64::from(first));
-                connected_boundaries.push(base | u64::from(last));
-            }
-        }
-        connected_boundaries.sort_unstable();
-        connected_boundaries.dedup();
-        gateways.sort_unstable();
-        gateways.dedup();
-        direct.sort_unstable();
-        let mut on_link: Vec<(u64, u64)> = Vec::with_capacity(direct.len());
-        for (first, last) in direct {
-            match on_link.last_mut() {
-                // Merge overlapping and touching ranges. Ranges of two
-                // interfaces can only touch at an interface boundary of
-                // the 48-bit key space, where merging keeps the exact same
-                // covered set.
-                Some((_, previous_last)) if first <= previous_last.saturating_add(1) => {
-                    *previous_last = (*previous_last).max(last);
-                }
-                _ => on_link.push((first, last)),
-            }
-        }
-
         Self {
-            lpm,
+            routes,
             interfaces: interface_keys.into_boxed_slice(),
             locals_by_address: locals_by_address.into_boxed_slice(),
             locals_by_interface: locals_by_interface.into_boxed_slice(),
             neighbors: neighbor_keys.into_boxed_slice(),
-            connected_boundaries: connected_boundaries.into_boxed_slice(),
-            gateways: gateways.into_boxed_slice(),
-            on_link: on_link.into_boxed_slice(),
             input_firewall: crate::firewall::InputFirewallIndex::default(),
         }
     }
@@ -226,23 +178,25 @@ impl ForwardingIndex {
     /// Heap bytes held by the index (snapshot memory, freed with the owner).
     pub(crate) fn heap_bytes(&self) -> usize {
         use std::mem::size_of_val;
-        self.lpm.heap_bytes()
+        self.routes.heap_bytes()
             + size_of_val(&*self.interfaces)
             + size_of_val(&*self.locals_by_address)
             + size_of_val(&*self.locals_by_interface)
             + size_of_val(&*self.neighbors)
-            + size_of_val(&*self.connected_boundaries)
-            + size_of_val(&*self.gateways)
-            + size_of_val(&*self.on_link)
             + self.input_firewall.heap_bytes()
     }
 
-    /// Slice index of the longest-prefix route for `destination`, and the
-    /// number of tree nodes read.
+    /// The routes.
     #[inline]
-    pub(crate) fn route(&self, destination: Ipv4Address) -> (Option<usize>, u32) {
-        let (route, read) = self.lpm.lookup_counted(&destination.octets());
-        (route.map(|slot| *slot as usize), read)
+    pub(crate) const fn routes(&self) -> &crate::Ipv4Routes {
+        &self.routes
+    }
+
+    /// The longest-prefix route for `destination`, and the number of tree
+    /// nodes read.
+    #[inline]
+    pub(crate) fn route(&self, destination: Ipv4Address) -> (Option<Route>, u32) {
+        self.routes.route_counted(destination)
     }
 
     #[inline]
@@ -270,39 +224,20 @@ impl ForwardingIndex {
     }
 
     #[inline]
-    pub(crate) fn connected_boundary(&self, interface: IfId, address: Ipv4Address) -> (bool, u32) {
-        member(&self.connected_boundaries, key(interface, address))
+    pub(crate) fn connected_boundary(&self, interface: IfId, address: Ipv4Address) -> bool {
+        self.routes.is_connected_boundary(interface, address)
     }
 
     #[inline]
-    pub(crate) fn gateway(&self, interface: IfId, next_hop: Ipv4Address) -> (bool, u32) {
-        member(&self.gateways, key(interface, next_hop))
+    #[cfg(test)]
+    pub(crate) fn gateway(&self, interface: IfId, next_hop: Ipv4Address) -> bool {
+        self.routes.is_gateway(interface, next_hop)
     }
 
     #[inline]
-    pub(crate) fn sender_on_link(&self, interface: IfId, sender: Ipv4Address) -> (bool, u32) {
-        let wanted = key(interface, sender);
-        let (after, range_probes) = partition(&self.on_link, |(first, _)| *first <= wanted);
-        let covered = after
-            .checked_sub(1)
-            .is_some_and(|position| self.on_link[position].1 >= wanted);
-        if covered {
-            return (true, range_probes);
-        }
-        let (gateway, gateway_probes) = self.gateway(interface, sender);
-        (gateway, range_probes + gateway_probes)
+    pub(crate) fn sender_on_link(&self, interface: IfId, sender: Ipv4Address) -> bool {
+        self.routes.is_sender_on_link(interface, sender)
     }
-}
-
-/// Flattens the routes into disjoint intervals with their longest match.
-fn build_lpm(routes: &[Route]) -> crate::Ipv4RouteTree<u32> {
-    let mut tree = crate::Ipv4RouteTree::new();
-    // In slice order: of two routes with the same prefix and length the
-    // later one stays, like the reference `max_by_key`.
-    for (index, route) in routes.iter().enumerate() {
-        tree.insert(&route.prefix().octets(), route.prefix_len(), slot(index));
-    }
-    tree
 }
 
 /// Linear reference semantics, the pre-H4c per-packet code. Used for

@@ -13,7 +13,8 @@
 //! large as the number of gateways and of routes without one, which is
 //! small beside the routes a routing protocol brings.
 //!
-//! The forwarding path does not use this yet.
+//! [`crate::ValidatedForwardingOwner`] holds one and answers the packet path
+//! from it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -135,7 +136,14 @@ impl Ipv4Routes {
     /// The longest route that has `destination`.
     #[inline]
     pub fn route(&self, destination: Ipv4Address) -> Option<Route> {
-        self.tree.lookup(&destination.octets()).copied()
+        self.route_counted(destination).0
+    }
+
+    /// [`Self::route`], and the number of tree nodes read for it.
+    #[inline]
+    pub(crate) fn route_counted(&self, destination: Ipv4Address) -> (Option<Route>, u32) {
+        let (route, read) = self.tree.lookup_counted(&destination.octets());
+        (route.copied(), read)
     }
 
     /// Whether `address` is the first or the last address of a route of at

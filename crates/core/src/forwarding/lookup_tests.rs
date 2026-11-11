@@ -282,10 +282,7 @@ fn unvalidated_duplicate_prefixes_resolve_to_the_last_like_max_by_key() {
                 ip(bits(route.prefix()) | !mask(route.prefix_len())),
                 ip(rng.address()),
             ] {
-                assert_eq!(
-                    index.route(address).0.map(|slot| routes[slot]),
-                    linear::route(&routes, address)
-                );
+                assert_eq!(index.route(address).0, linear::route(&routes, address));
             }
         }
     }
@@ -299,27 +296,27 @@ fn edge_tables_default_host_and_empty() {
     let empty = ForwardingIndex::build(&[], &[], &[], &[]);
     assert_eq!(empty.route(ip(0)).0, None);
     assert_eq!(empty.route(ip(u32::MAX)).0, None);
-    assert!(!empty.sender_on_link(IfId(1), ip(1)).0);
+    assert!(!empty.sender_on_link(IfId(1), ip(1)));
 
     let routes = [default, host_low, host_high];
     let index = ForwardingIndex::build(&routes, &[], &[], &[]);
-    assert_eq!(index.route(ip(0)).0, Some(1));
-    assert_eq!(index.route(ip(1)).0, Some(0));
-    assert_eq!(index.route(ip(u32::MAX - 1)).0, Some(0));
-    assert_eq!(index.route(ip(u32::MAX)).0, Some(2));
+    assert_eq!(index.route(ip(0)).0, Some(host_low));
+    assert_eq!(index.route(ip(1)).0, Some(default));
+    assert_eq!(index.route(ip(u32::MAX - 1)).0, Some(default));
+    assert_eq!(index.route(ip(u32::MAX)).0, Some(host_high));
     // `/0` and `/32` are never connected boundaries (length > 30 or a
     // gateway), but a direct `/32` is on-link for its own address only.
-    assert!(index.sender_on_link(IfId(3), ip(u32::MAX)).0);
-    assert!(!index.sender_on_link(IfId(3), ip(u32::MAX - 1)).0);
-    assert!(index.sender_on_link(IfId(1), ip(0x0a00_0001)).0);
-    assert!(!index.sender_on_link(IfId(1), ip(0x0a00_0002)).0);
+    assert!(index.sender_on_link(IfId(3), ip(u32::MAX)));
+    assert!(!index.sender_on_link(IfId(3), ip(u32::MAX - 1)));
+    assert!(index.sender_on_link(IfId(1), ip(0x0a00_0001)));
+    assert!(!index.sender_on_link(IfId(1), ip(0x0a00_0002)));
 
     let connected = [Route::new(ip(0), 0, IfId(4), None).unwrap()];
     let index = ForwardingIndex::build(&connected, &[], &[], &[]);
-    assert!(index.connected_boundary(IfId(4), ip(0)).0);
-    assert!(index.connected_boundary(IfId(4), ip(u32::MAX)).0);
-    assert!(!index.connected_boundary(IfId(5), ip(u32::MAX)).0);
-    assert!(index.sender_on_link(IfId(4), ip(0x1234_5678)).0);
+    assert!(index.connected_boundary(IfId(4), ip(0)));
+    assert!(index.connected_boundary(IfId(4), ip(u32::MAX)));
+    assert!(!index.connected_boundary(IfId(5), ip(u32::MAX)));
+    assert!(index.sender_on_link(IfId(4), ip(0x1234_5678)));
 }
 
 fn limit_tables() -> Tables {
@@ -379,44 +376,35 @@ fn lookup_probes_are_bounded_at_the_config_limits() {
         &tables.local_ipv4,
     );
     // ceil(log2(n + 1)) probes for n sorted entries.
-    // The route tree reads at most one node per 8 bits of the address.
+    // The route tree reads at most one node per byte of the address. What
+    // is asked of the routes as a whole (connected boundary, gateway, on
+    // link) is in ordered maps of the standard library and not counted.
     let tree_bound = 4;
-    let route_bound = log2_ceil(2 * 4096 + 1); // 14
+    // ceil(log2(n + 1)) probes for n sorted entries.
     let neighbor_bound = log2_ceil(4096); // 13
     let local_bound = log2_ceil(1024); // 11
     let interface_bound = log2_ceil(256); // 9
-    assert_eq!(route_bound, 14);
     let mut rng = Rng(0xc057);
     let mut addresses = probe_addresses(&mut rng, &tables);
     addresses.extend((0..4096).map(|_| ip(rng.address())));
-    let mut worst = [0u32; 7];
+    let mut worst = [0u32; 4];
     for address in &addresses {
         worst[0] = worst[0].max(index.route(*address).1);
         worst[1] = worst[1].max(index.local_by_address(*address).1);
         for id in [IfId(0), IfId(17), IfId(255)] {
             worst[2] = worst[2].max(index.static_neighbor(id, *address).1);
-            worst[3] = worst[3].max(index.connected_boundary(id, *address).1);
-            worst[4] = worst[4].max(index.gateway(id, *address).1);
-            worst[5] = worst[5].max(index.sender_on_link(id, *address).1);
         }
     }
     for id in 0..=u16::MAX {
-        worst[6] = worst[6].max(index.interface(IfId(id)).1);
-        worst[6] = worst[6].max(index.local_by_interface(IfId(id)).1);
+        worst[3] = worst[3].max(index.interface(IfId(id)).1);
+        worst[3] = worst[3].max(index.local_by_interface(IfId(id)).1);
     }
     assert!(worst[0] <= tree_bound, "route tree nodes {}", worst[0]);
     assert!(worst[1] <= local_bound, "local probes {}", worst[1]);
     assert!(worst[2] <= neighbor_bound, "neighbor probes {}", worst[2]);
-    assert!(worst[3] <= route_bound, "connected probes {}", worst[3]);
-    assert!(worst[4] <= neighbor_bound, "gateway probes {}", worst[4]);
-    assert!(
-        worst[5] <= route_bound + neighbor_bound,
-        "on-link probes {}",
-        worst[5]
-    );
-    assert!(worst[6] <= interface_bound, "interface probes {}", worst[6]);
+    assert!(worst[3] <= interface_bound, "interface probes {}", worst[3]);
     // Memory at the limits stays small and is reported.
-    assert!(index.heap_bytes() < 256 * 1024, "{}", index.heap_bytes());
+    assert!(index.heap_bytes() < 320 * 1024, "{}", index.heap_bytes());
 }
 
 #[test]
@@ -529,15 +517,16 @@ fn unvalidated_duplicate_keys_resolve_to_the_first_like_find() {
 }
 
 /// The largest index the config limits allow: 4096 non-adjacent direct
-/// routes (every route adds two connected boundaries and its own on-link
-/// range, and they fill the route tree's nodes of 32 /16s), 4096 static
-/// neighbors, and 256 interfaces with one address each, and 256 input
-/// firewall rules (INPUT-FW) in the shape with the most per-ingress list
-/// entries: 128 for any interface and protocol, 128 naming distinct
-/// interfaces. Under 400 KiB (snapshot memory; two owners coexist during a
-/// reload, under 800 KiB).
+/// routes (every route is in the route tree, adds two connected boundaries
+/// and is one of the routes without a gateway), 4096 static neighbors, and
+/// 256 interfaces with one address each, and 256 input firewall rules
+/// (INPUT-FW) in the shape with the most per-ingress list entries: 128 for
+/// any interface and protocol, 128 naming distinct interfaces. Under 480 KiB
+/// with the routes themselves, which the owner holds nowhere else (snapshot
+/// memory; two owners coexist during a reload, and share the routes that
+/// did not change).
 #[test]
-fn index_heap_at_the_worst_config_shape_is_under_400_kib() {
+fn index_heap_at_the_worst_config_shape_is_under_480_kib() {
     let interfaces: Vec<Interface> = (0..256u16)
         .map(|id| Interface {
             id: IfId(id),
@@ -572,12 +561,13 @@ fn index_heap_at_the_worst_config_shape_is_under_400_kib() {
         .collect();
     let mut index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
     let tables = index.heap_bytes();
-    // 8192 boundaries x 8 + 4096 on-link ranges x 16 + 4096 neighbors x 16
-    // + 256 interfaces x 8 + 2 x 256 locals x 8, and the route tree.
-    let sorted = 8192 * 8 + 4096 * 16 + 4096 * 16 + 256 * 8 + 2 * 256 * 8;
-    let tree = tables - sorted;
-    // 32 nodes of a /16 with 128 routes each, and the two nodes above them.
-    assert!((48 * 1024..=64 * 1024).contains(&tree), "{tree}");
+    // 4096 neighbors x 16 + 256 interfaces x 8 + 2 x 256 locals x 8, and
+    // the routes: the tree with the routes themselves in it (32 nodes of a
+    // /16 with 128 routes each, and the two nodes above them), their 8192
+    // boundaries, and the 4096 of them without a gateway.
+    let sorted = 4096 * 16 + 256 * 8 + 2 * 256 * 8;
+    let routes = tables - sorted;
+    assert!((256 * 1024..=288 * 1024).contains(&routes), "{routes}");
 
     // Input rules: with `a` rules for any interface and protocol and `b`
     // naming distinct interfaces, the lists hold 4a + 4b(a + 1) entries,
@@ -605,7 +595,7 @@ fn index_heap_at_the_worst_config_shape_is_under_400_kib() {
     let entries = 4 * 128 + 4 * 128 * 129;
     let lists = 128 * std::mem::size_of::<(u16, [u32; 5])>();
     assert_eq!(bytes - tables, entries * 2 + lists);
-    assert!(bytes <= 400 * 1024, "{bytes}");
+    assert!(bytes <= 480 * 1024, "{bytes}");
 }
 
 /// What validation answered when it compared every entry with every earlier one:
@@ -770,8 +760,10 @@ fn a_repeat_among_many_routes_is_found() {
     );
 }
 
-/// The same at the sizes of a BGP table. The destinations are spread over all
-/// the routes, so the index does not stay in the CPU's cache:
+/// The same at the sizes of a BGP table: 256 connected /24s, one per
+/// interface, and every other route through a gateway in one of them. The
+/// destinations are spread over all the routes, so the table does not stay
+/// in the CPU's cache:
 /// `cargo test --release -p ruster-core lookup_timing -- --ignored --nocapture`
 #[test]
 #[ignore = "timing report, not a pass/fail test"]
@@ -781,14 +773,16 @@ fn lookup_timing_up_to_a_full_table() {
 
     for count in [4096u32, 131_072, 1_048_576] {
         let mut tables = limit_tables();
-        tables.routes = (0..count)
-            .map(|index| {
+        tables.routes = (0..256u32)
+            .map(|link| Route::new(ip(0x0a00_0000 | (link << 8)), 24, IfId(link as u16), None))
+            .chain((0..count).map(|index| {
+                let link = index % 256;
+                let gateway = ip(0x0a00_0000 | (link << 8) | 1);
                 let prefix = ip(0x1000_0000 + (index << 8));
-                let egress = IfId((index % 256) as u16);
-                let next_hop = (index % 2 == 1).then(|| ip(0x1000_0000 + ((index - 1) << 8) + 1));
-                Route::new(prefix, 24, egress, next_hop).unwrap()
-            })
-            .collect();
+                Route::new(prefix, 24, IfId(link as u16), Some(gateway))
+            }))
+            .collect::<Result<_, _>>()
+            .unwrap();
         let started = Instant::now();
         let owner = owner(&tables);
         let built = started.elapsed();

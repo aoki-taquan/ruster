@@ -1422,7 +1422,12 @@ impl std::fmt::Debug for ForwardingSnapshot<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ForwardingSnapshot")
-            .field("routes_len", &self.routes.len())
+            .field(
+                "routes_len",
+                &self
+                    .index
+                    .map_or(self.routes.len(), |index| index.routes().len()),
+            )
             .field("interfaces_len", &self.interfaces.len())
             .field("neighbors_len", &self.neighbors.len())
             .field("local_ipv4_len", &self.local_ipv4.len())
@@ -1452,7 +1457,6 @@ impl std::fmt::Debug for ForwardingSnapshot<'_> {
 /// }
 /// ```
 pub struct ValidatedForwardingOwner {
-    routes: Box<[Route]>,
     interfaces: Box<[Interface]>,
     neighbors: Box<[Neighbor]>,
     local_ipv4: Box<[LocalIpv4Binding]>,
@@ -1476,7 +1480,7 @@ impl std::fmt::Debug for ValidatedForwardingOwner {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ValidatedForwardingOwner")
-            .field("routes_len", &self.routes.len())
+            .field("routes_len", &self.routes().len())
             .field("interfaces_len", &self.interfaces.len())
             .field("neighbors_len", &self.neighbors.len())
             .field("local_ipv4_len", &self.local_ipv4.len())
@@ -1732,7 +1736,7 @@ impl<'a> ForwardingSnapshot<'a> {
         a.len() != b.len()
             || a.iter()
                 .zip(b)
-                .any(|(x, y)| x.routes != y.routes || x.ipv6 != y.ipv6)
+                .any(|(x, y)| x.ipv4_routes_differ(y) || x.ipv6 != y.ipv6)
     }
 
     /// The snapshot a packet received on `ingress` is decided with.
@@ -2133,12 +2137,24 @@ impl<'a> ForwardingSnapshot<'a> {
         }
     }
 
-    /// Longest-prefix route for `destination` (bounded binary search over
-    /// the owner index; linear reference without one).
+    /// Whether the IPv4 routes of this snapshot and of `other` are the same
+    /// routes. Two owners that share their routes, or all but a change,
+    /// compare in the time of the change.
+    pub(crate) fn ipv4_routes_differ(&self, other: &Self) -> bool {
+        match (self.index, other.index) {
+            (Some(a), Some(b)) => a.routes() != b.routes(),
+            (None, None) => self.routes != other.routes,
+            // An owner's routes against a borrowed list: taken as changed.
+            _ => true,
+        }
+    }
+
+    /// Longest-prefix route for `destination` (the owner's route tree;
+    /// linear reference without one).
     #[inline]
     pub(crate) fn route_lookup(&self, destination: crate::Ipv4Address) -> Option<Route> {
         match self.index {
-            Some(index) => index.route(destination).0.map(|slot| self.routes[slot]),
+            Some(index) => index.route(destination).0,
             None => linear::route(self.routes, destination),
         }
     }
@@ -2331,7 +2347,7 @@ impl<'a> ForwardingSnapshot<'a> {
         address: crate::Ipv4Address,
     ) -> bool {
         match self.index {
-            Some(index) => index.connected_boundary(interface, address).0,
+            Some(index) => index.connected_boundary(interface, address),
             None => linear::connected_boundary(self.routes, interface, address),
         }
     }
@@ -2341,7 +2357,7 @@ impl<'a> ForwardingSnapshot<'a> {
     #[cfg(test)]
     pub(crate) fn is_gateway(&self, interface: IfId, next_hop: crate::Ipv4Address) -> bool {
         match self.index {
-            Some(index) => index.gateway(interface, next_hop).0,
+            Some(index) => index.gateway(interface, next_hop),
             None => linear::gateway(self.routes, interface, next_hop),
         }
     }
@@ -2353,7 +2369,7 @@ impl<'a> ForwardingSnapshot<'a> {
     #[inline]
     pub(crate) fn sender_on_link(&self, interface: IfId, sender: crate::Ipv4Address) -> bool {
         match self.index {
-            Some(index) => index.sender_on_link(interface, sender).0,
+            Some(index) => index.sender_on_link(interface, sender),
             None => linear::sender_on_link(self.routes, interface, sender),
         }
     }
@@ -2376,11 +2392,53 @@ impl ValidatedForwardingOwner {
             ipv4_origin,
         )
         .map_err(ValidatedForwardingOwnerError::Snapshot)?;
+        let index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
+        Self::around(index, interfaces, neighbors, local_ipv4, ipv4_origin)
+    }
+
+    /// The owner of `routes` as they are, shared with whoever else holds
+    /// them, and of the other tables. The other tables are validated as
+    /// [`Self::new`] does, and every route must leave by one of
+    /// `interfaces` (or discard or reject). The work does not grow with the
+    /// number of routes.
+    pub fn with_routes(
+        routes: crate::Ipv4Routes,
+        interfaces: Box<[Interface]>,
+        neighbors: Box<[Neighbor]>,
+        local_ipv4: Box<[LocalIpv4Binding]>,
+        ipv4_origin: Ipv4OriginPolicy,
+    ) -> Result<Self, ValidatedForwardingOwnerError> {
+        ForwardingSnapshot::with_ipv4_origin_policy(
+            &[],
+            &interfaces,
+            &neighbors,
+            &local_ipv4,
+            ipv4_origin,
+        )
+        .map_err(ValidatedForwardingOwnerError::Snapshot)?;
+        let known = |id: IfId| {
+            matches!(id, IfId::DISCARD | IfId::REJECT)
+                || interfaces.iter().any(|interface| interface.id == id)
+        };
+        if !routes.egresses().all(known) {
+            return Err(ValidatedForwardingOwnerError::Snapshot(
+                SnapshotError::RouteUnknownInterface,
+            ));
+        }
+        let index = ForwardingIndex::with_routes(routes, &interfaces, &neighbors, &local_ipv4);
+        Self::around(index, interfaces, neighbors, local_ipv4, ipv4_origin)
+    }
+
+    fn around(
+        index: ForwardingIndex,
+        interfaces: Box<[Interface]>,
+        neighbors: Box<[Neighbor]>,
+        local_ipv4: Box<[LocalIpv4Binding]>,
+        ipv4_origin: Ipv4OriginPolicy,
+    ) -> Result<Self, ValidatedForwardingOwnerError> {
         let authority = next_publication_nonce()
             .ok_or(ValidatedForwardingOwnerError::PublicationNonceExhausted)?;
-        let index = ForwardingIndex::build(&routes, &interfaces, &neighbors, &local_ipv4);
         Ok(Self {
-            routes,
             interfaces,
             neighbors,
             local_ipv4,
@@ -2466,7 +2524,8 @@ impl ValidatedForwardingOwner {
     #[must_use]
     pub fn snapshot(&self) -> ForwardingSnapshot<'_> {
         ForwardingSnapshot {
-            routes: &self.routes,
+            // The routes are in the index; the packet path asks it.
+            routes: &[],
             interfaces: &self.interfaces,
             neighbors: &self.neighbors,
             local_ipv4: &self.local_ipv4,
@@ -2495,21 +2554,20 @@ impl ValidatedForwardingOwner {
         }
     }
 
-    /// Heap bytes of the publication-time lookup indexes (snapshot memory,
-    /// not runtime storage; freed with the owner). Bounded by the config
-    /// limits: the worst shape (4096 non-adjacent direct routes, 4096
+    /// Heap bytes of the publication-time lookup indexes, the routes
+    /// themselves included (snapshot memory, not runtime storage). At the
+    /// config limits the worst shape (4096 non-adjacent direct routes, 4096
     /// neighbors, 256 interfaces with one address each, and 256 input
     /// firewall rules split into the most per-ingress lists, INPUT-FW) is
-    /// under 400 KiB, under 800 KiB while a reload holds the old and the new
-    /// owner.
+    /// under 480 KiB. Routes that two owners share are counted in each.
     #[must_use]
     pub fn index_heap_bytes(&self) -> usize {
         self.index.heap_bytes()
     }
 
     #[must_use]
-    pub fn routes(&self) -> &[Route] {
-        &self.routes
+    pub fn routes(&self) -> &crate::Ipv4Routes {
+        self.index.routes()
     }
 
     #[must_use]
