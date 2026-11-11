@@ -14,6 +14,7 @@ mod icmpv4_translated_limit;
 mod io;
 mod ipv4_fragment_tracking;
 mod ipv4_fragmentation;
+mod ipv4_routes;
 mod ipv6;
 mod nat44;
 mod nat44_host_quota;
@@ -123,6 +124,7 @@ pub use ipv4_fragmentation::{
     IPV4_FRAGMENTATION_DEFAULT_MAX_FRAGMENTS, IPV4_FRAGMENTATION_MAX_FRAGMENTS,
     IPV4_FRAGMENTATION_MIN_MAX_FRAGMENTS,
 };
+pub use ipv4_routes::Ipv4Routes;
 pub use ipv6::{
     ControlFrame, ControlKind, ControlQueue, Ipv6Fib, Ipv6FibError, Ipv6Local, Ipv6Neighbor,
     Ipv6Route, CONTROL_FRAME_MAX, IPV6_ETHERTYPE,
