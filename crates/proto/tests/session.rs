@@ -546,3 +546,96 @@ fn a_table_is_read_without_the_others() {
     assert_eq!(bench.server.store().table(sid::NEIGHBOR).count(), 0);
     assert!(!bench.server.store().is_empty());
 }
+
+/// An entry a patch touched: its key, and what it held before and after.
+type Touch = (Key, Option<Value>, Option<Value>);
+
+/// Records what each patch is said to have touched.
+#[derive(Default)]
+struct Touched {
+    seen: Vec<Vec<Touch>>,
+    whole: usize,
+}
+
+impl Hook for Touched {
+    fn check(&mut self, _next: &Store) -> Result<(), String> {
+        self.whole += 1;
+        Ok(())
+    }
+
+    fn check_patch(
+        &mut self,
+        next: &Store,
+        changed: &[(&Key, Option<&Value>)],
+    ) -> Result<(), String> {
+        self.seen.push(
+            changed
+                .iter()
+                .map(|(key, before)| ((*key).clone(), before.cloned(), next.get(key).cloned()))
+                .collect(),
+        );
+        Ok(())
+    }
+
+    fn committed(&mut self, _store: &Store) {}
+}
+
+#[test]
+fn the_hook_is_told_what_a_patch_touched_and_what_it_held_before() {
+    let mut server = Server::new();
+    let mut hook = Touched::default();
+    let (a, b) = UnixStream::pair().unwrap();
+    server.attach(a, &[sid::INTERFACE]).unwrap();
+    let mut client = Client::new(b).unwrap();
+    let value = |change: Change| change.value;
+    let settle = |server: &mut Server, hook: &mut Touched, client: &mut Client| {
+        for _ in 0..8 {
+            client.poll();
+            server.step(hook);
+        }
+    };
+
+    client.patch(&[iface("eth1", 1), iface("eth0", 2)]).unwrap();
+    settle(&mut server, &mut hook, &mut client);
+    // Each entry once, in the order of the keys; nothing was there before.
+    assert_eq!(
+        hook.seen.pop().unwrap(),
+        [
+            (iface_key("eth0"), None, value(iface("eth0", 2))),
+            (iface_key("eth1"), None, value(iface("eth1", 1))),
+        ]
+    );
+
+    // One entry changed twice and removed, one changed, one that is not there
+    // removed: "before" is the value before the patch, whatever came between.
+    client
+        .patch(&[
+            iface("eth0", 7),
+            iface("eth0", 8),
+            Change::delete(iface_key("eth0")),
+            iface("eth1", 9),
+            Change::delete(iface_key("eth9")),
+        ])
+        .unwrap();
+    settle(&mut server, &mut hook, &mut client);
+    assert_eq!(
+        hook.seen.pop().unwrap(),
+        [
+            (iface_key("eth0"), value(iface("eth0", 2)), None),
+            (
+                iface_key("eth1"),
+                value(iface("eth1", 1)),
+                value(iface("eth1", 9))
+            ),
+            (iface_key("eth9"), None, None),
+        ]
+    );
+
+    // The end of a resync is not a patch: the hook is asked about the whole.
+    assert_eq!(hook.whole, 0);
+    client.resync_begin();
+    client.resync_end();
+    settle(&mut server, &mut hook, &mut client);
+    assert_eq!(hook.whole, 1);
+    assert!(hook.seen.is_empty());
+}

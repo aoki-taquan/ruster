@@ -71,7 +71,7 @@ mod tap;
 
 pub use local::LocalPipe;
 pub use punt_table::PuntCounters;
-use ruster_proto::table::{PuntDestination, PuntKind, PuntMatch};
+use ruster_proto::table::{Key, PuntDestination, PuntKind, PuntMatch, Value};
 
 /// The tables each kind of writer may change (one writer per table).
 pub mod writers {
@@ -455,6 +455,7 @@ where
         let mut builder = Builder {
             ports: ports.clone(),
             built: None,
+            routes: None,
             generation: 0,
             names: Vec::new(),
         };
@@ -1841,6 +1842,8 @@ struct Builder {
         firewall::Publication,
         Option<nat::Publication>,
     )>,
+    /// What the routes came to in the last build, for the next one to start from.
+    routes: Option<build::Routes>,
     /// Of the last firewall publication.
     generation: u64,
     /// The interface of each id in the tables the worker uses (it says so each time
@@ -1858,7 +1861,35 @@ fn interface_id(names: &[String], name: &str) -> Option<IfId> {
 
 impl Hook for Builder {
     fn check(&mut self, next: &Store) -> Result<(), String> {
-        let built = build::build(&self.ports, next, &self.names)?;
+        self.rebuild(next, None)
+    }
+
+    fn check_patch(
+        &mut self,
+        next: &Store,
+        changed: &[(&Key, Option<&Value>)],
+    ) -> Result<(), String> {
+        self.rebuild(next, Some(changed))
+    }
+
+    fn committed(&mut self, _store: &Store) {}
+}
+
+impl Builder {
+    /// Builds the tables for `next`, which is the store of the last build with an
+    /// iPATCH made that touched `changed`, when that is given.
+    fn rebuild(
+        &mut self,
+        next: &Store,
+        changed: Option<&[(&Key, Option<&Value>)]>,
+    ) -> Result<(), String> {
+        // The kept routes are for the store of the last change that was accepted.
+        // They are put back only once this one is, at the end: a change refused
+        // anywhere below is taken out of the store again, and the routes it came
+        // to must not stay. After a refusal there are none, and the next build
+        // reads the routes again.
+        let kept = self.routes.take().zip(changed);
+        let (built, routes) = build::build(&self.ports, next, &self.names, kept)?;
         self.generation += 1;
         let default = built.vrfs.first().ok_or("no default VRF")?;
         let publication = firewall::Publication::new(
@@ -1874,10 +1905,9 @@ impl Hook for Builder {
             .map(|nat| nat::Publication::new(&default.owner.snapshot(), nat))
             .transpose()?;
         self.built = Some((built, publication, nat));
+        self.routes = Some(routes);
         Ok(())
     }
-
-    fn committed(&mut self, _store: &Store) {}
 }
 
 #[derive(Clone, Copy)]

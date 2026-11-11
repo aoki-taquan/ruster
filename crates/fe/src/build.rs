@@ -109,7 +109,7 @@ struct Forward {
 }
 
 /// A route of one VRF: forward, or look up again in another VRF.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Entry {
     Forward(Forward),
     Lookup {
@@ -125,6 +125,108 @@ impl Entry {
             Self::Forward(f) => (f.prefix, f.len),
             Self::Lookup { prefix, len, .. } => (*prefix, *len),
         }
+    }
+}
+
+/// The entries an iPATCH touched, each with the value it held before
+/// ([`ruster_proto::session::Hook::check_patch`]).
+pub(crate) type Changed<'a> = &'a [(&'a Key, Option<&'a Value>)];
+
+/// Each VRF's entries by prefix: in the order of the route keys of the tables.
+type Entries = BTreeMap<String, BTreeMap<(IpAddr, u8), Entry>>;
+
+/// What the routes of the tables came to in a build, kept for the next one: a change
+/// of routes alone is then made to this, and the routes are not all read again (with
+/// many routes that is most of a build's time).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Routes {
+    /// How many routes each VRF that has any holds.
+    counts: BTreeMap<String, usize>,
+    /// The entries of every VRF of the tables (also of one without routes).
+    entries: Entries,
+    /// Whether a route is an SRv6 SID or policy. Those make SIDs and interfaces of
+    /// the FE's own too, so with one every build reads the routes again.
+    srv6: bool,
+}
+
+impl Routes {
+    /// Whether these, made for the tables before a change, can be brought to
+    /// `store` by making the change to them: `changed` (each entry touched and what
+    /// it held before) is routes only, none of them an SRv6 one, and every VRF they
+    /// are in has routes before and after (so the VRFs stay the same).
+    fn follows(&self, changed: Changed<'_>, store: &Store) -> bool {
+        if self.srv6 {
+            return false;
+        }
+        let mut growth: BTreeMap<&str, isize> = BTreeMap::new();
+        for (key, before) in changed {
+            let Key::Route { vrf, .. } = key else {
+                return false;
+            };
+            let after = store.get(key);
+            let plain = match after {
+                None => true,
+                Some(Value::Route(action)) => matches!(
+                    action,
+                    RouteAction::Forward(_)
+                        | RouteAction::LookupVrf(_)
+                        | RouteAction::Discard
+                        | RouteAction::Reject
+                        | RouteAction::Local
+                ),
+                Some(_) => false,
+            };
+            if !plain {
+                return false;
+            }
+            *growth.entry(vrf.as_str()).or_default() +=
+                isize::from(after.is_some()) - isize::from(before.is_some());
+        }
+        growth.iter().all(|(vrf, by)| {
+            self.counts
+                .get(*vrf)
+                .is_some_and(|&had| had.checked_add_signed(*by).is_some_and(|has| has > 0))
+        })
+    }
+}
+
+/// The entry of a route that only says where packets go, or `None` when it makes
+/// none: no next hop on an enabled interface, or a route to the router itself.
+/// (`None` too for the kinds that are more than that; the callers take those first.)
+fn forwarding(
+    prefix: IpAddr,
+    len: u8,
+    action: &RouteAction,
+    active: &BTreeMap<&str, (IfId, &str)>,
+) -> Option<Entry> {
+    match action {
+        RouteAction::Forward(hops) => {
+            let (egress, hop) = hops
+                .iter()
+                .find_map(|hop| active.get(hop.interface.as_str()).map(|&(id, _)| (id, hop)))?;
+            Some(Entry::Forward(Forward {
+                prefix,
+                len,
+                egress,
+                next_hop: hop.address,
+            }))
+        }
+        RouteAction::LookupVrf(other) => Some(Entry::Lookup {
+            prefix,
+            len,
+            vrf: other.clone(),
+        }),
+        RouteAction::Discard | RouteAction::Reject => Some(Entry::Forward(Forward {
+            prefix,
+            len,
+            egress: if *action == RouteAction::Discard {
+                IfId::DISCARD
+            } else {
+                IfId::REJECT
+            },
+            next_hop: None,
+        })),
+        _ => None,
     }
 }
 
@@ -146,12 +248,12 @@ fn within((inner, inner_len): (IpAddr, u8), (outer, outer_len): (IpAddr, u8)) ->
 ///
 /// Deviation: where the other VRF has no route, a lookup should drop the packet; here
 /// the packet falls to this VRF's shorter routes (not yet made a discard route).
-fn expand_lookups(vrfs: &BTreeMap<String, Vec<Entry>>) -> BTreeMap<String, Vec<Forward>> {
+fn expand_lookups(vrfs: &Entries) -> BTreeMap<String, Vec<Forward>> {
     let forwards = |vrf: &str| -> Vec<Forward> {
         vrfs.get(vrf)
             .map(|entries| {
                 entries
-                    .iter()
+                    .values()
                     .filter_map(|e| match e {
                         Entry::Forward(f) => Some(f.clone()),
                         Entry::Lookup { .. } => None,
@@ -164,7 +266,7 @@ fn expand_lookups(vrfs: &BTreeMap<String, Vec<Entry>>) -> BTreeMap<String, Vec<F
     for (name, entries) in vrfs {
         let mut own = forwards(name);
         let mut added = Vec::new();
-        for entry in entries {
+        for entry in entries.values() {
             let Entry::Lookup { prefix, len, vrf } = entry else {
                 continue;
             };
@@ -175,7 +277,7 @@ fn expand_lookups(vrfs: &BTreeMap<String, Vec<Entry>>) -> BTreeMap<String, Vec<F
                 if !within(at, lookup) {
                     continue;
                 }
-                let shadowed = entries.iter().any(|e| {
+                let shadowed = entries.values().any(|e| {
                     let q = e.prefix();
                     q.1 > lookup.1 && within(q, lookup) && within(at, q)
                 });
@@ -265,7 +367,30 @@ impl Ids<'_> {
     }
 }
 
-pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Result<Built, String> {
+/// Core's tables for `store`. `previous` names the interface of each id in the
+/// tables in use, so that the interfaces that stay keep their ids.
+///
+/// `kept` is what the routes came to in the build for the tables before, when
+/// `store` is those tables with an iPATCH made that touched `changed`: a change the
+/// kept routes can follow ([`Routes::follows`]) is made to them. Otherwise, and
+/// with `None`, the routes are all read. Either way the result is the same; the
+/// routes it came to are returned for the next build.
+pub(crate) fn build(
+    ports: &[String],
+    store: &Store,
+    previous: &[String],
+    kept: Option<(Routes, Changed<'_>)>,
+) -> Result<(Built, Routes), String> {
+    let kept = kept.filter(|(routes, changed)| routes.follows(changed, store));
+    let (kept_names, mut counts, kept_entries, changed): (Vec<String>, _, _, _) = match kept {
+        Some((routes, changed)) => (
+            routes.counts.keys().cloned().collect(),
+            routes.counts,
+            Some(routes.entries),
+            changed,
+        ),
+        None => (Vec::new(), BTreeMap::new(), None, &[][..]),
+    };
     let port = |name: &str| {
         let index = ports.iter().position(|p| p == name)?;
         u16::try_from(index).ok().map(IfId)
@@ -599,16 +724,21 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         }
     }
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
-    for (key, value) in store.table(sid::ROUTE) {
-        if let Key::Route { vrf, .. } = key {
-            names.insert(vrf.as_str());
-        }
-        // The VRF of an End.DT4 or End.DT6 SID, even with nothing else in it.
-        if let Value::Route(RouteAction::Srv6Local(
-            table::Srv6Local::EndDt4 { vrf } | table::Srv6Local::EndDt6 { vrf },
-        )) = value
-        {
-            names.insert(vrf.as_str());
+    if kept_entries.is_some() {
+        // The VRFs the routes are in, as before: the change kept them.
+        names.extend(kept_names.iter().map(String::as_str));
+    } else {
+        for (key, value) in store.table(sid::ROUTE) {
+            if let Key::Route { vrf, .. } = key {
+                names.insert(vrf.as_str());
+            }
+            // The VRF of an End.DT4 or End.DT6 SID, even with nothing else in it.
+            if let Value::Route(RouteAction::Srv6Local(
+                table::Srv6Local::EndDt4 { vrf } | table::Srv6Local::EndDt6 { vrf },
+            )) = value
+            {
+                names.insert(vrf.as_str());
+            }
         }
     }
     names.remove(DEFAULT_VRF);
@@ -626,10 +756,15 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         kernel.push(id);
     }
 
-    let mut entries: BTreeMap<String, Vec<Entry>> = order
-        .iter()
-        .map(|v| ((*v).to_owned(), Vec::new()))
-        .collect();
+    // Without the kept routes every route is read below; with them, none.
+    let all_routes = kept_entries.is_none();
+    let mut srv6_routes = false;
+    let mut entries: Entries = kept_entries.unwrap_or_else(|| {
+        order
+            .iter()
+            .map(|v| ((*v).to_owned(), BTreeMap::new()))
+            .collect()
+    });
     let mut neighbors = Vec::new();
     let mut neighbors6 = Vec::new();
     let mut unreachable = Vec::new();
@@ -646,7 +781,12 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     let mut firewall_outside: Vec<String> = Vec::new();
     let mut icmp_errors = None;
     let mut nat_entry = None;
-    for (key, value) in store.iter() {
+    let read: Box<dyn Iterator<Item = (&Key, &Value)>> = if all_routes {
+        Box::new(store.iter())
+    } else {
+        Box::new(store.iter_without(sid::ROUTE))
+    };
+    for (key, value) in read {
         match (key, value) {
             (Key::Address { interface, address }, Value::Address { .. }) => {
                 let Some(&(id, vrf)) = active.get(interface.as_str()) else {
@@ -670,37 +810,15 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                 }
             }
             (Key::Route { vrf, prefix, len }, Value::Route(action)) => {
-                let entry = match action {
-                    RouteAction::Forward(hops) => {
-                        let Some((egress, hop)) = hops.iter().find_map(|hop| {
-                            active.get(hop.interface.as_str()).map(|&(id, _)| (id, hop))
-                        }) else {
-                            continue;
-                        };
-                        Entry::Forward(Forward {
-                            prefix: *prefix,
-                            len: *len,
-                            egress,
-                            next_hop: hop.address,
-                        })
+                match counts.get_mut(vrf.as_str()) {
+                    Some(count) => *count += 1,
+                    None => {
+                        counts.insert(vrf.clone(), 1);
                     }
-                    RouteAction::LookupVrf(other) => Entry::Lookup {
-                        prefix: *prefix,
-                        len: *len,
-                        vrf: other.clone(),
-                    },
-                    RouteAction::Discard | RouteAction::Reject => Entry::Forward(Forward {
-                        prefix: *prefix,
-                        len: *len,
-                        egress: if *action == RouteAction::Discard {
-                            IfId::DISCARD
-                        } else {
-                            IfId::REJECT
-                        },
-                        next_hop: None,
-                    }),
-                    RouteAction::Local => continue,
+                }
+                let entry = match action {
                     RouteAction::Srv6Local(local) => {
+                        srv6_routes = true;
                         if let Some(sid) = srv6_sid(*prefix, *len, local, &active, index_of)? {
                             sids.push(sid);
                         }
@@ -709,6 +827,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                     RouteAction::Srv6Encap(encap) => {
                         // An interface of the FE's own for the policy: the route
                         // leaves through it, and core wraps what it sends.
+                        srv6_routes = true;
                         let id = ids.take(&format!("srv6 {vrf} {prefix}/{len}"))?;
                         interfaces.push(Interface {
                             id,
@@ -737,9 +856,13 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                             "route {vrf} {prefix}/{len}: next hops without an interface (ribd resolves them)"
                         ));
                     }
+                    plain => match forwarding(*prefix, *len, plain, &active) {
+                        Some(entry) => entry,
+                        None => continue,
+                    },
                 };
                 if let Some(list) = entries.get_mut(vrf) {
-                    list.push(entry);
+                    list.insert((*prefix, *len), entry);
                 }
             }
             (Key::Neighbor { interface, address }, Value::Neighbor { mac }) => {
@@ -810,6 +933,35 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
                 }
             }
             _ => {}
+        }
+    }
+
+    // The change, made to the kept routes (none without them).
+    for (key, before) in changed {
+        let Key::Route { vrf, prefix, len } = key else {
+            continue;
+        };
+        let after = match store.get(key) {
+            Some(Value::Route(action)) => Some(action),
+            _ => None,
+        };
+        if let Some(count) = counts.get_mut(vrf.as_str()) {
+            match (before.is_some(), after.is_some()) {
+                (false, true) => *count += 1,
+                (true, false) => *count -= 1,
+                _ => {}
+            }
+        }
+        let Some(list) = entries.get_mut(vrf) else {
+            continue;
+        };
+        match after.and_then(|action| forwarding(*prefix, *len, action, &active)) {
+            Some(entry) => {
+                list.insert((*prefix, *len), entry);
+            }
+            None => {
+                list.remove(&(*prefix, *len));
+            }
         }
     }
 
@@ -889,7 +1041,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         .map_err(|error| format!("srv6: {error:?}"))?;
     let punt =
         crate::punt_table::Classes::build(store, |name| active.get(name).map(|&(id, _)| id))?;
-    Ok(Built {
+    let built = Built {
         srv6,
         bridges,
         bridge_statics,
@@ -937,7 +1089,13 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
             }
         },
         nat,
-    })
+    };
+    let routes = Routes {
+        counts,
+        entries,
+        srv6: srv6_routes,
+    };
+    Ok((built, routes))
 }
 
 /// Core's SID for an SRv6 SID route, or `None` when it names an interface that is
@@ -1111,6 +1269,12 @@ mod tests {
         }
     }
 
+    fn by_prefix(vrfs: BTreeMap<String, Vec<Entry>>) -> Entries {
+        vrfs.into_iter()
+            .map(|(vrf, list)| (vrf, list.into_iter().map(|e| (e.prefix(), e)).collect()))
+            .collect()
+    }
+
     fn prefixes(routes: &[Forward]) -> Vec<(String, u8, u16)> {
         let mut out: Vec<_> = routes
             .iter()
@@ -1140,7 +1304,7 @@ mod tests {
                 fwd("192.0.2.0", 24, 5),
             ],
         );
-        let out = expand_lookups(&vrfs);
+        let out = expand_lookups(&by_prefix(vrfs));
         assert_eq!(
             prefixes(&out["red"]),
             [
@@ -1156,6 +1320,224 @@ mod tests {
     fn a_lookup_into_a_vrf_without_routes_adds_nothing() {
         let mut vrfs = BTreeMap::new();
         vrfs.insert("red".to_owned(), vec![lookup("::", 0, "blue")]);
-        assert!(expand_lookups(&vrfs)["red"].is_empty());
+        assert!(expand_lookups(&by_prefix(vrfs))["red"].is_empty());
+    }
+
+    use std::os::unix::net::UnixStream;
+
+    use ruster_proto::session::{Client, Hook, Server};
+    use ruster_proto::table::{Change, NextHop};
+
+    /// Builds for every change both ways, from the kept routes and reading every
+    /// route, and has them agree.
+    #[derive(Default)]
+    struct BothWays {
+        ports: Vec<String>,
+        names: Vec<String>,
+        kept: Option<Routes>,
+        /// The builds that made the change to the kept routes, and those that could
+        /// not.
+        followed: usize,
+        read_all: usize,
+        refused: usize,
+    }
+
+    impl Hook for BothWays {
+        fn check(&mut self, next: &Store) -> Result<(), String> {
+            let (built, routes) = build(&self.ports, next, &self.names, None)?;
+            self.names = built.interface_names;
+            self.kept = Some(routes);
+            Ok(())
+        }
+
+        fn check_patch(
+            &mut self,
+            next: &Store,
+            changed: &[(&Key, Option<&Value>)],
+        ) -> Result<(), String> {
+            let follows = self
+                .kept
+                .as_ref()
+                .is_some_and(|routes| routes.follows(changed, next));
+            let all = build(&self.ports, next, &self.names, None);
+            let kept = self.kept.take().map(|routes| (routes, changed));
+            let made = build(&self.ports, next, &self.names, kept);
+            match (all, made) {
+                (Ok((all, all_routes)), Ok((made, made_routes))) => {
+                    assert_eq!(made_routes, all_routes);
+                    assert_eq!(made.names, all.names);
+                    assert_eq!(made.interface_names, all.interface_names);
+                    assert_eq!(made.by_ingress, all.by_ingress);
+                    assert_eq!(made.vrfs.len(), all.vrfs.len());
+                    for (made, all) in made.vrfs.iter().zip(&all.vrfs) {
+                        assert_eq!(made.owner.routes(), all.owner.routes());
+                        assert_eq!(made.ipv6, all.ipv6);
+                    }
+                    if follows {
+                        self.followed += 1;
+                    } else {
+                        self.read_all += 1;
+                    }
+                    self.names = made.interface_names;
+                    self.kept = Some(made_routes);
+                    Ok(())
+                }
+                (Err(all), Err(made)) => {
+                    assert_eq!(made, all);
+                    self.refused += 1;
+                    Err(all)
+                }
+                (all, made) => panic!(
+                    "reading every route: {:?}; from the kept routes: {:?}",
+                    all.map(|_| ()),
+                    made.map(|_| ())
+                ),
+            }
+        }
+
+        fn committed(&mut self, _store: &Store) {}
+    }
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn below(&mut self, bound: u64) -> u64 {
+            // SplitMix64.
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = self.0;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (value ^ (value >> 31)) % bound
+        }
+
+        fn pick<T: Copy>(&mut self, of: &[T]) -> T {
+            of[self.below(of.len() as u64) as usize]
+        }
+    }
+
+    fn interface(name: &str, enabled: bool, vrf: &str) -> Change {
+        Change::set(
+            Key::Interface { name: name.into() },
+            Value::Interface {
+                enabled,
+                mac: [2, 0, 0, 0, 0, 1],
+                mtu: 1500,
+                vrf: vrf.into(),
+                vlan: None,
+                tunnel: None,
+                pppoe: None,
+            },
+        )
+    }
+
+    const VRFS: [&str; 3] = [DEFAULT_VRF, "red", "blue"];
+
+    /// A route key out of few, so that routes are changed and removed again: the
+    /// prefixes are inside one another, of both families.
+    fn route_key(rng: &mut Rng) -> Key {
+        let (prefix, len) = rng.pick(&[
+            ("0.0.0.0", 0),
+            ("10.0.0.0", 8),
+            ("10.1.0.0", 16),
+            ("10.1.2.0", 24),
+            ("192.0.2.0", 24),
+            ("::", 0),
+            ("2001:db8::", 32),
+            ("2001:db8:1::", 48),
+        ]);
+        Key::Route {
+            vrf: rng.pick(&VRFS).into(),
+            prefix: prefix.parse().unwrap(),
+            len,
+        }
+    }
+
+    fn route_change(rng: &mut Rng) -> Change {
+        let key = route_key(rng);
+        let v6 = matches!(&key, Key::Route { prefix, .. } if prefix.is_ipv6());
+        let default = matches!(&key, Key::Route { vrf, .. } if vrf == DEFAULT_VRF);
+        let hop = |rng: &mut Rng| NextHop {
+            // "gone" is no interface; "p1" is at times disabled.
+            interface: rng.pick(&["p0", "p1", "p2", "gone"]).into(),
+            address: match (rng.below(2), v6) {
+                (0, _) => None,
+                (_, false) => Some("192.0.2.1".parse().unwrap()),
+                (_, true) => Some("fe80::1".parse().unwrap()),
+            },
+        };
+        let action = match rng.below(40) {
+            0..=7 => return Change::delete(key),
+            8..=24 => RouteAction::Forward((0..1 + rng.below(2)).map(|_| hop(rng)).collect()),
+            25..=27 => RouteAction::Discard,
+            28..=30 => RouteAction::Reject,
+            31..=32 => RouteAction::Local,
+            33..=36 => RouteAction::LookupVrf(rng.pick(&VRFS).into()),
+            // The kinds the kept routes cannot follow.
+            37 if v6 => RouteAction::Gateways(vec!["2001:db8::1".parse().unwrap()]),
+            37 => RouteAction::Gateways(vec!["192.0.2.1".parse().unwrap()]),
+            _ if v6 && default => RouteAction::Srv6Local(table::Srv6Local::End),
+            _ => RouteAction::Discard,
+        };
+        Change::set(key, Value::Route(action))
+    }
+
+    #[test]
+    fn a_change_made_to_the_kept_routes_gives_what_reading_every_route_gives() {
+        let mut rng = Rng(0x726f_7574_6573);
+        let mut hook = BothWays {
+            ports: vec!["p0".into(), "p1".into(), "p2".into()],
+            ..BothWays::default()
+        };
+        let mut server = Server::new();
+        let connect = |server: &mut Server, writes: &[u64]| {
+            let (a, b) = UnixStream::pair().unwrap();
+            server.attach(a, writes).unwrap();
+            Client::new(b).unwrap()
+        };
+        let mut config = connect(&mut server, &[sid::INTERFACE]);
+        let mut routes = connect(&mut server, &[sid::ROUTE]);
+        config
+            .patch(&[
+                interface("p0", true, DEFAULT_VRF),
+                interface("p1", true, "red"),
+                interface("p2", true, "blue"),
+            ])
+            .unwrap();
+        for _ in 0..300 {
+            match rng.below(40) {
+                // The interfaces change: the kept routes do not follow that.
+                0 => {
+                    let change =
+                        interface("p1", rng.below(2) == 0, rng.pick(&[DEFAULT_VRF, "red"]));
+                    config.patch(&[change]).unwrap();
+                }
+                // A resync of the routes: what is not sent again goes.
+                1 => {
+                    routes.resync_begin();
+                    let again: Vec<Change> = (0..rng.below(4))
+                        .map(|_| route_change(&mut rng))
+                        .filter(|change| change.value.is_some())
+                        .collect();
+                    routes.patch(&again).unwrap();
+                    routes.resync_end();
+                }
+                // Routes, a few at once, at times the same one twice.
+                _ => {
+                    let changes: Vec<Change> = (0..1 + rng.below(4))
+                        .map(|_| route_change(&mut rng))
+                        .collect();
+                    routes.patch(&changes).unwrap();
+                }
+            }
+            for _ in 0..4 {
+                config.poll();
+                routes.poll();
+                server.step(&mut hook);
+            }
+        }
+        // Each way was taken often enough for the comparison to mean something.
+        assert!(hook.followed > 100, "{}", hook.followed);
+        assert!(hook.read_all > 20, "{}", hook.read_all);
+        assert!(hook.refused > 5, "{}", hook.refused);
     }
 }

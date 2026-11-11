@@ -4791,3 +4791,68 @@ fn a_frame_leaves_while_another_writer_never_pauses() {
     // after that.
     assert_eq!(left_after, Some(5));
 }
+
+#[test]
+fn a_change_refused_after_its_tables_were_built_does_not_stay_in_the_routes_kept() {
+    let mut bench = Bench {
+        fe: Fe::new(SimIo::new(), vec!["lan".into(), "wan".into(), "dmz".into()]),
+        now: 0,
+    };
+    let mut config = bench.connect(writers::CONFIG);
+    let mut routes = bench.connect(writers::ROUTE);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let dmz_mac = [2, 0, 0, 0, 0, 3];
+    let server_mac = [2, 0, 0, 0, 0, 0x30];
+    let code = bench.patch(
+        &mut config,
+        &[
+            iface("lan", LAN_MAC),
+            iface("wan", WAN_MAC),
+            iface("dmz", dmz_mac),
+            address("lan", [192, 0, 2, 1], 24),
+            address("wan", [198, 51, 100, 2], 24),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let code = bench.patch(
+        &mut routes,
+        &[
+            route([192, 0, 2, 0], 24, "lan", None),
+            route([10, 0, 0, 0], 8, "dmz", None),
+        ],
+    );
+    assert_eq!(code, Code::CHANGED);
+    let code = bench.patch(
+        &mut neighbors,
+        &[neighbor("dmz", [10, 1, 1, 1], server_mac)],
+    );
+    assert_eq!(code, Code::CHANGED);
+
+    // One change: "dmz" disabled, and a NAT whose address is not the outside
+    // interface's. The tables are built for it; the NAT is refused after that.
+    let mut disabled = iface("dmz", dmz_mac);
+    if let Some(Value::Interface { enabled, .. }) = &mut disabled.value {
+        *enabled = false;
+    }
+    let mut other = nat(1_000, 2_000);
+    if let Some(Value::Nat(nat)) = &mut other.value {
+        nat.external = Some(Ipv4Addr::new(203, 0, 113, 99));
+    }
+    assert_eq!(
+        bench.patch(&mut config, &[disabled, other]),
+        Code::BAD_REQUEST
+    );
+
+    // A change of routes alone follows. The route through "dmz" is still there:
+    // the refused change, which would have taken it away, left nothing behind.
+    let code = bench.patch(&mut routes, &[route([203, 0, 113, 0], 24, "wan", None)]);
+    assert_eq!(code, Code::CHANGED);
+    bench
+        .fe
+        .io_mut()
+        .inject(IfId(0), udp_from_host([10, 1, 1, 1]));
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("forwarded");
+    assert_eq!(tx.egress, IfId(2));
+    assert_eq!(&tx.bytes[0..6], &server_mac);
+}
