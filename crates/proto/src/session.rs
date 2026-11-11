@@ -16,8 +16,8 @@
 //! [`Hook::check`], and learns about each accepted set through [`Hook::committed`].
 //! A request that fails changes nothing.
 //!
-//! The store is copied for each change. That is fine for the skeleton's small tables;
-//! large tables (a full BGP table) need a structure that shares unchanged parts.
+//! The store is changed in place and the change taken back if it is refused, so a
+//! change costs what it touches, not the size of the tables.
 //!
 //! # Standards
 //!
@@ -78,25 +78,38 @@ impl Store {
         self.entries.is_empty()
     }
 
-    fn with_changes(&self, changes: &[Change]) -> Self {
-        let mut next = self.clone();
+    /// Makes `changes`, in order. What they replaced is returned, to put back with
+    /// [`Store::revert`] if the result is refused: the store is changed in place
+    /// rather than copied, since a copy costs as much as the whole store however
+    /// small the change.
+    fn apply(&mut self, changes: &[Change]) -> Undo {
+        let mut undo = Vec::with_capacity(changes.len());
         for change in changes {
-            match &change.value {
-                Some(value) => {
-                    next.entries.insert(
-                        change.key.clone(),
-                        Slot {
-                            value: value.clone(),
-                            stale: false,
-                        },
-                    );
-                }
-                None => {
-                    next.entries.remove(&change.key);
-                }
-            }
+            let before = match &change.value {
+                Some(value) => self.entries.insert(
+                    change.key.clone(),
+                    Slot {
+                        value: value.clone(),
+                        stale: false,
+                    },
+                ),
+                None => self.entries.remove(&change.key),
+            };
+            undo.push((change.key.clone(), before));
         }
-        next
+        Undo(undo)
+    }
+
+    /// Puts back what [`Store::apply`] or [`Store::drop_stale`] replaced.
+    fn revert(&mut self, undo: Undo) {
+        // Backwards: of two changes of one entry, the first one's "before" is the
+        // entry as it was.
+        for (key, before) in undo.0.into_iter().rev() {
+            match before {
+                Some(slot) => self.entries.insert(key, slot),
+                None => self.entries.remove(&key),
+            };
+        }
     }
 
     fn mark_stale(&mut self, tables: &[u64]) {
@@ -107,13 +120,29 @@ impl Store {
         }
     }
 
-    fn without_stale(&self, tables: &[u64]) -> Self {
-        let mut next = self.clone();
-        next.entries
-            .retain(|key, slot| !(slot.stale && tables.contains(&key.table())));
-        next
+    /// Removes the stale entries of `tables`. What it removed is returned, as from
+    /// [`Store::apply`].
+    fn drop_stale(&mut self, tables: &[u64]) -> Undo {
+        let stale: Vec<Key> = self
+            .entries
+            .iter()
+            .filter(|(key, slot)| slot.stale && tables.contains(&key.table()))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let undo = stale
+            .into_iter()
+            .map(|key| {
+                let slot = self.entries.remove(&key);
+                (key, slot)
+            })
+            .collect();
+        Undo(undo)
     }
 }
+
+/// The entries a change of a [`Store`] replaced: each key with what it held, `None`
+/// for a key that was not there, in the order of the changes.
+struct Undo(Vec<(Key, Option<Slot>)>);
 
 /// Encodes changes as an iPATCH payload (a CBOR sequence).
 pub fn encode_changes(changes: &[Change]) -> Result<Vec<u8>, ModelError> {
@@ -329,8 +358,8 @@ impl Server {
                     if changes.iter().any(|c| !writes.contains(&c.key.table())) {
                         (Code::FORBIDDEN, b"table not writable here".to_vec())
                     } else {
-                        let next = self.store.with_changes(&changes);
-                        let answer = self.commit(next, hook);
+                        let undo = self.store.apply(&changes);
+                        let answer = self.commit(undo, hook);
                         if answer.0 == Code::CHANGED {
                             hook.patched(&changes);
                         }
@@ -365,8 +394,8 @@ impl Server {
                 (Code::CHANGED, Vec::new())
             }
             (Code::POST, ["c", "resync-end"]) if !writes.is_empty() => {
-                let next = self.store.without_stale(&writes);
-                self.commit(next, hook)
+                let undo = self.store.drop_stale(&writes);
+                self.commit(undo, hook)
             }
             (Code::GET, ["s"]) if request.observe == Some(0) => {
                 let peer = &mut self.peers[index];
@@ -398,11 +427,15 @@ impl Server {
         });
     }
 
-    fn commit(&mut self, next: Store, hook: &mut dyn Hook) -> (Code, Vec<u8>) {
-        match hook.check(&next) {
-            Err(reason) => (Code::BAD_REQUEST, reason.into_bytes()),
+    /// Asks `hook` about the store as it is now, already changed: on a refusal the
+    /// change is taken back with `undo`.
+    fn commit(&mut self, undo: Undo, hook: &mut dyn Hook) -> (Code, Vec<u8>) {
+        match hook.check(&self.store) {
+            Err(reason) => {
+                self.store.revert(undo);
+                (Code::BAD_REQUEST, reason.into_bytes())
+            }
             Ok(()) => {
-                self.store = next;
                 self.committed = true;
                 hook.committed(&self.store);
                 (Code::CHANGED, Vec::new())

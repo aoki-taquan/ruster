@@ -8,16 +8,24 @@ use ruster_proto::session::{decode_changes, Client, Event, Hook, Server, Store};
 use ruster_proto::sid;
 use ruster_proto::table::{Change, Key, Value};
 
-/// Refuses any store holding an interface named "bad"; records each commit.
+/// Refuses any store holding an interface named "bad", and any without the
+/// interface named in `required`; records each commit.
 #[derive(Default)]
 struct TestHook {
     commits: usize,
+    required: Option<&'static str>,
 }
 
 impl Hook for TestHook {
     fn check(&mut self, next: &Store) -> Result<(), String> {
         if next.get(&iface_key("bad")).is_some() {
             return Err("bad interface".into());
+        }
+        if self
+            .required
+            .is_some_and(|name| next.get(&iface_key(name)).is_none())
+        {
+            return Err("required interface gone".into());
         }
         Ok(())
     }
@@ -430,4 +438,66 @@ fn without_holding_an_accepted_change_is_answered_at_once() {
     assert_eq!(response(&events, token).0, Code::CHANGED);
     bench.server.release_changed();
     assert!(bench.settle(&mut client).is_empty());
+}
+
+#[test]
+fn a_refused_patch_leaves_every_entry_as_it_was() {
+    let mut bench = Bench::new();
+    let mut client = bench.connect(&[sid::INTERFACE]);
+    let token = client
+        .patch(&[iface("eth0", 1), iface("eth1", 2), iface("eth2", 3)])
+        .unwrap();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, token).0, Code::CHANGED);
+    // "eth1" is stale: a refused change of it must not make it fresh.
+    client.resync_begin();
+    client.patch(&[iface("eth0", 1), iface("eth2", 3)]).unwrap();
+    bench.settle(&mut client);
+    let before = bench.server.store().clone();
+    assert!(before.is_stale(&iface_key("eth1")));
+
+    // An entry changed, changed again and removed; one removed; one that is not
+    // there removed; one added, and then the one that gets it all refused.
+    let token = client
+        .patch(&[
+            iface("eth0", 7),
+            iface("eth0", 8),
+            Change::delete(iface_key("eth0")),
+            iface("eth1", 9),
+            Change::delete(iface_key("eth2")),
+            Change::delete(iface_key("eth9")),
+            iface("eth3", 4),
+            iface("bad", 5),
+        ])
+        .unwrap();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, token).0, Code::BAD_REQUEST);
+    assert_eq!(bench.server.store(), &before);
+    assert!(bench.server.store().is_stale(&iface_key("eth1")));
+    assert!(!bench.server.store().is_stale(&iface_key("eth0")));
+}
+
+#[test]
+fn a_refused_resync_end_keeps_the_stale_entries_for_the_next_one() {
+    let mut bench = Bench::new();
+    let mut client = bench.connect(&[sid::INTERFACE]);
+    client.patch(&[iface("eth0", 1), iface("eth1", 2)]).unwrap();
+    client.resync_begin();
+    client.patch(&[iface("eth0", 1)]).unwrap();
+    bench.settle(&mut client);
+
+    bench.hook.required = Some("eth1");
+    let token = client.resync_end();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, token).0, Code::BAD_REQUEST);
+    assert_eq!(bench.server.store().len(), 2);
+    assert!(bench.server.store().is_stale(&iface_key("eth1")));
+    assert!(!bench.server.store().is_stale(&iface_key("eth0")));
+
+    bench.hook.required = None;
+    let token = client.resync_end();
+    let events = bench.settle(&mut client);
+    assert_eq!(response(&events, token).0, Code::CHANGED);
+    assert_eq!(bench.server.store().len(), 1);
+    assert!(bench.server.store().get(&iface_key("eth0")).is_some());
 }
