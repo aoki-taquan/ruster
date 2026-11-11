@@ -19,6 +19,7 @@ use ruster_core::{
     PppoeSession, Route, ValidatedForwardingOwner, VlanBinding,
 };
 use ruster_proto::session::Store;
+use ruster_proto::sid;
 use ruster_proto::table::{self, network, Key, RouteAction, Value, DEFAULT_VRF};
 
 /// Core's tables of one VRF.
@@ -272,7 +273,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     // Enabled interfaces and their VRFs.
     let mut interfaces = Vec::new();
     let mut active: BTreeMap<&str, (IfId, &str)> = BTreeMap::new();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::INTERFACE) {
         if let (
             Key::Interface { name },
             Value::Interface {
@@ -305,7 +306,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         ports: ports.len(),
     };
     let mut vlans = Vec::new();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::INTERFACE) {
         if let (
             Key::Interface { name },
             Value::Interface {
@@ -350,7 +351,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     }
     // Tunnel interfaces get the ids after those.
     let mut tunnels = Vec::new();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::INTERFACE) {
         if let (
             Key::Interface { name },
             Value::Interface {
@@ -383,7 +384,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     // PPPoE sessions get the ids after those; their parent is an enabled port or
     // VLAN sub-interface.
     let mut pppoe = Vec::new();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::INTERFACE) {
         if let (
             Key::Interface { name },
             Value::Interface {
@@ -443,7 +444,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     // EtherIP and VXLAN interfaces get the ids after those: an interface row of the
     // name, with no VLAN, tunnel or PPPoE session, and the EtherIP or VXLAN row.
     let mut overlays = Vec::new();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::ETHERIP).chain(store.table(sid::VXLAN)) {
         let (name, local, kind) = match (key, value) {
             (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => (
                 interface,
@@ -503,7 +504,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     // Each bridge's own interface (IRB) is the interface of its name; its members
     // are enabled ports, VLAN sub-interfaces and overlays.
     let mut bridges: Vec<(String, ruster_core::BridgeConfig)> = Vec::new();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::BRIDGE) {
         if let (
             Key::Bridge { name },
             Value::Bridge {
@@ -569,7 +570,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     let bridge_at = |name: &str| bridge_names.iter().position(|n| n == name);
     let mut bridge_statics = Vec::new();
     let mut members: Vec<(usize, IfId)> = Vec::new();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::BRIDGE_PORT) {
         if let (Key::BridgePort { interface }, Value::BridgePort { bridge }) = (key, value) {
             let member = active
                 .get(interface.as_str())
@@ -587,7 +588,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
     for (at, member) in members {
         bridges[at].1.members.push(member);
     }
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::BRIDGE_MAC) {
         if let (Key::BridgeMac { bridge, mac }, Value::BridgeMac { interface }) = (key, value) {
             let member = active.get(interface.as_str()).map(|&(id, _)| id);
             if let (Some(at), Some(member)) = (bridge_at(bridge), member) {
@@ -598,7 +599,7 @@ pub(crate) fn build(ports: &[String], store: &Store, previous: &[String]) -> Res
         }
     }
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
-    for (key, value) in store.iter() {
+    for (key, value) in store.table(sid::ROUTE) {
         if let Key::Route { vrf, .. } = key {
             names.insert(vrf.as_str());
         }
