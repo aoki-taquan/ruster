@@ -31,10 +31,18 @@
 //! # TX
 //!
 //! A forwarded frame committed to its ingress port is transmitted in place
-//! from the same UMEM frame (same-frame TX, no copy). A frame committed to
-//! another port cannot be: each port has its own UMEM, and a descriptor can
-//! only name a frame of the socket's own UMEM (shared-UMEM zero copy across
-//! interfaces is deferred, XDP-136). The adapter therefore copies it: it
+//! from the same UMEM frame (same-frame TX, no copy). So is a frame
+//! committed to another port whose socket shares the ingress port's UMEM
+//! (`NativeSession::open_sharing`): the egress port's TX ring names the RX
+//! frame, which stays the ingress port's and returns to its pool when the
+//! completion comes back (`cross_port_in_place` on the egress port). A port
+//! has at most its RX pool less one Fill ring of frames away like that, so
+//! a peer whose link went down cannot stop it from receiving; beyond that,
+//! and for a frame that grew into the headroom, it copies as below.
+//!
+//! A frame committed to a port with another UMEM cannot be named by that
+//! port's descriptors (a kernel without shared UMEM across interfaces, or
+//! ports that cannot run in one mode). The adapter copies it: it
 //! allocates a generated frame of the egress engine, copies the exact
 //! visible bytes once (`len` bytes, no zeroing first, because every byte is
 //! overwritten at once), commits that frame on the egress TX ring, and
@@ -427,6 +435,9 @@ pub struct XdpAdapterCounters {
     /// Forwarded frames transmitted in place from their RX frame (egress
     /// is the ingress port).
     pub forwarded_in_place: u64,
+    /// Forwarded frames from another port of the same UMEM transmitted by
+    /// this (egress) port from their RX frame, without a copy.
+    pub cross_port_in_place: u64,
     /// Forwarded frames from another port copied into a generated frame of
     /// this (egress) port and transmitted.
     pub cross_port_copies: u64,
@@ -835,9 +846,32 @@ impl<'memory> XdpPacketIo<'memory> {
     /// Settles port `index` (reap, owed kicks). A datapath failure stops
     /// the adapter; it and a genuine kick failure are returned.
     fn settle_port(&mut self, index: usize) -> Result<(), XdpIoError> {
-        match self.ports[index].settle(self.clock_ms) {
+        let settled = self.ports[index].settle(self.clock_ms);
+        self.return_lent(index);
+        match settled {
             Err(error @ XdpIoError::Datapath { .. }) => Err(self.fault(error)),
             other => other,
+        }
+    }
+
+    /// Gives the completions of frames port `out` transmitted for other
+    /// ports back to those ports, whose frames they are: only then are the
+    /// frames free again. Called after everything that reaps `out`.
+    fn return_lent(&mut self, out: usize) {
+        while let Some(mut completion) = self.ports[out].engine.take_lent_completion() {
+            let mut returned = false;
+            for home in 0..self.ports.len() {
+                match self.ports[home].engine.complete_lent(completion) {
+                    Ok(()) => {
+                        returned = true;
+                        break;
+                    }
+                    Err(other) => completion = other,
+                }
+            }
+            // Every engine that can lend to `out` is a port of this
+            // adapter, so the frame's home was among them.
+            debug_assert!(returned, "a lent frame's home is a port of this adapter");
         }
     }
 
@@ -921,12 +955,18 @@ impl<'memory> XdpPacketIo<'memory> {
         self.stop = Some(self.stop.unwrap_or(Stop::Drained));
         self.reclaim_outstanding();
         let mut report = XdpDrainReport::default();
-        for port in self.ports.iter_mut() {
+        for index in 0..self.ports.len() {
+            let port = &mut self.ports[index];
             let interface = port.config.interface;
             let drained = port
                 .engine
                 .drain(rounds)
-                .map_err(|error| XdpIoError::Datapath { interface, error })?;
+                .map_err(|error| XdpIoError::Datapath { interface, error });
+            // A frame this port sent for one drained before it shows there
+            // as in flight until the next call.
+            self.return_lent(index);
+            let drained = drained?;
+            let port = &mut self.ports[index];
             report.completed = report.completed.saturating_add(drained.completed());
             report.rx_pending_released = report
                 .rx_pending_released
@@ -997,8 +1037,66 @@ impl<'memory> XdpPacketIo<'memory> {
             } else {
                 self.transmit_in_place(out, lease, error)
             }
+        } else if self.can_lend(ingress, out, &lease) {
+            self.transmit_through(ingress, out, lease, error)
         } else {
             self.transmit_copy(ingress, out, lease, error)
+        }
+    }
+
+    /// Whether port `out` can transmit this frame of port `ingress` from
+    /// where it is: both ports use one UMEM, the frame did not grow into
+    /// the headroom, and `ingress` may still have frames away (a peer that
+    /// stops completing must not take the frames it receives with).
+    fn can_lend(&self, ingress: usize, out: usize, lease: &RawLease) -> bool {
+        let home = &self.ports[ingress].engine;
+        home.shares_umem_with(&self.ports[out].engine)
+            && home.tx_lent() < home.tx_lent_limit()
+            && !home.lease_before_headroom(lease)
+    }
+
+    /// A frame for another port of the same UMEM: that port's TX ring gets
+    /// the RX frame itself, which returns to its own port's pool when the
+    /// completion comes back (`return_lent`).
+    fn transmit_through(
+        &mut self,
+        ingress: usize,
+        out: usize,
+        lease: RawLease,
+        error: &mut Option<XdpIoError>,
+    ) -> bool {
+        #[cfg(test)]
+        let snapshot = self.test_rx_snapshot(ingress, &lease);
+        let [source, target] = self
+            .ports
+            .get_disjoint_mut([ingress, out])
+            .expect("distinct ports in range");
+        let interface = target.config.interface;
+        let handoff = source.engine.resume_rx(lease).stage_tx();
+        match source.engine.submit_tx_through(&mut target.engine, handoff) {
+            Ok(_) => {
+                target.kick_owed = true;
+                bump(&mut target.counters.cross_port_in_place);
+                true
+            }
+            Err(rejected) => {
+                let reason = rejected.reason();
+                let cancelled = source.engine.cancel_tx_handoff(rejected.into_handoff());
+                assert!(cancelled.is_ok(), "the adapter's own handoff cancels");
+                if let TxRejection::Blocked(_) = reason {
+                    bump(&mut target.counters.tx_blocked);
+                    self.relieve(out, error);
+                } else {
+                    let failure = self.fault(XdpIoError::Submit {
+                        interface,
+                        rejection: reason,
+                    });
+                    error.get_or_insert(failure);
+                }
+                #[cfg(test)]
+                self.test_rx_rejected(ingress, snapshot, interface, Some(out));
+                false
+            }
         }
     }
 
@@ -1247,6 +1345,10 @@ impl<'memory> PacketIo for XdpPacketIo<'memory> {
                     }
                 }
             }
+        }
+        // Each poll reaped its port: frames sent for other ports go home.
+        for out in 0..count {
+            self.return_lent(out);
         }
         Ok(XdpRxBatch {
             io: self,
@@ -1963,6 +2065,7 @@ pub struct XdpCounters {
     pub generated_inflight: u64,
     // Adapter.
     pub forwarded_in_place: u64,
+    pub cross_port_in_place: u64,
     pub cross_port_copies: u64,
     pub cross_port_copy_unavailable: u64,
     pub tx_over_mtu: u64,
@@ -2055,6 +2158,7 @@ impl XdpCounters {
             generated_rejected: generated.generated_rejected_total(),
             generated_inflight: u64::from(generated.generated_inflight),
             forwarded_in_place: adapter.forwarded_in_place,
+            cross_port_in_place: adapter.cross_port_in_place,
             cross_port_copies: adapter.cross_port_copies,
             cross_port_copy_unavailable: adapter.cross_port_copy_unavailable,
             tx_over_mtu: adapter.tx_over_mtu,
@@ -2135,6 +2239,7 @@ impl XdpCounters {
             generated_rejected,
             generated_inflight,
             forwarded_in_place,
+            cross_port_in_place,
             cross_port_copies,
             cross_port_copy_unavailable,
             tx_over_mtu,
@@ -2229,6 +2334,7 @@ impl XdpCounters {
         count("generated_rejected", self.generated_rejected);
         count("generated_inflight", self.generated_inflight);
         count("forwarded_in_place", self.forwarded_in_place);
+        count("cross_port_in_place", self.cross_port_in_place);
         count("cross_port_copies", self.cross_port_copies);
         count(
             "cross_port_copy_unavailable",

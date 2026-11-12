@@ -2301,3 +2301,121 @@ fn check_capacity_refuses_unknown_egress_stopped_and_corrupt_rings() {
     };
     assert_untouched(&completion);
 }
+
+/// Where the WAN part starts when LAN and WAN share one UMEM.
+const SHARED_BASE: u64 = FRAMES as u64 * FRAME_SIZE as u64;
+
+/// A LAN kernel with `rx_frames` RX frames and a WAN kernel whose socket
+/// joined the LAN socket's UMEM.
+fn shared_kernels(rx_frames: u32) -> (ScriptedKernel, ScriptedKernel) {
+    let lan = kernel_with(rx_frames, FRAMES - rx_frames);
+    let wan = kernel().sharing_umem_of(&lan, SHARED_BASE);
+    (lan, wan)
+}
+
+#[test]
+fn cross_port_forward_within_one_umem_transmits_the_received_frame() {
+    let (lan, wan) = shared_kernels(RX_FRAMES);
+    let mut io = adapter(&lan, &wan);
+    let topology = topology();
+    let snapshot = snapshot(&topology);
+    let original = ipv4_frame(98, 64);
+    let rx_address = deliver(&lan, &original);
+    let free = io.engine(LAN).expect("LAN").free_frames();
+
+    let report = forward_batch(io.receive(8).expect("receive"), &snapshot, &mut NoTrace);
+    assert!(report.invariants_hold(), "{report:?}");
+    assert_eq!(report.completion.tx_accepted, 1);
+    assert_eq!(report.completion.error, None);
+
+    // The WAN TX ring names the frame the LAN socket received into.
+    assert_eq!(lan.tx_pending(), 0);
+    let descriptor = wan.consume_tx().expect("TX descriptor");
+    assert_eq!(descriptor.address, rx_address, "the same UMEM frame");
+    assert_eq!(descriptor.len as usize, original.len());
+    let mut bytes = vec![0; original.len()];
+    lan.read_umem_sent_elsewhere(descriptor.address, &mut bytes);
+    assert_eq!(&bytes[0..6], &SERVER_MAC.0, "next-hop MAC");
+    assert_eq!(&bytes[6..12], &WAN_MAC.0, "egress MAC");
+    assert_eq!(bytes[22], 63, "TTL decremented");
+    assert_eq!(&bytes[34..], &original[34..]);
+
+    let stats = io.port_stats(WAN).expect("WAN").counters;
+    assert_eq!((stats.cross_port_in_place, stats.cross_port_copies), (1, 0));
+    assert_eq!(stats.generated_committed, 0);
+    assert_eq!(io.engine(LAN).expect("LAN").tx_lent(), 1);
+    audit(&io);
+    // In flight on WAN: a publication waits for it.
+    assert!(matches!(
+        io.try_publication_quiescence().map(|_| ()),
+        Err(XdpQuiescenceError::TxInFlight { interface: WAN, .. })
+    ));
+
+    // The completion on WAN returns the frame to the LAN pool.
+    assert!(wan.produce_completion(descriptor.address));
+    assert_eq!(io.service().expect("service"), 1);
+    let lan_engine = io.engine(LAN).expect("LAN");
+    assert_eq!(lan_engine.tx_lent(), 0);
+    assert!(lan_engine.free_frames() + lan.fill_pending() > free);
+    assert_eq!(lan_engine.frame_accounting().tx_in_flight, 0);
+    audit(&io);
+    assert!(io.try_publication_quiescence().is_ok());
+
+    // The other direction names a frame of the WAN part on the LAN ring.
+    let mut reply = ipv4_frame(98, 64);
+    reply[0..6].copy_from_slice(&WAN_MAC.0);
+    reply[26..30].copy_from_slice(&SERVER_IP);
+    reply[30..34].copy_from_slice(&HOST_IP);
+    let reply_address = deliver(&wan, &reply);
+    assert!(reply_address >= SHARED_BASE);
+    {
+        let mut batch = io.receive(8).expect("receive");
+        let packet = batch.next_packet().expect("lease");
+        assert_eq!(packet.ingress(), WAN);
+        packet.commit(LAN);
+        assert_eq!(batch.finish().tx_accepted, 1);
+    }
+    let descriptor = lan.consume_tx().expect("TX descriptor");
+    assert_eq!(descriptor.address, reply_address);
+    assert!(lan.produce_completion(descriptor.address));
+    assert_eq!(io.service().expect("service"), 1);
+    assert_eq!(io.engine(WAN).expect("WAN").tx_lent(), 0);
+    audit(&io);
+}
+
+#[test]
+fn cross_port_forward_copies_once_a_port_has_its_share_of_frames_away() {
+    // 12 RX frames and a Fill ring of 8: at most 4 frames are away.
+    let (lan, wan) = shared_kernels(12);
+    let mut io = adapter(&lan, &wan);
+    let topology = topology();
+    let snapshot = snapshot(&topology);
+    for _ in 0..6 {
+        let _ = deliver(&lan, &ipv4_frame(98, 64));
+    }
+    let report = forward_batch(io.receive(8).expect("receive"), &snapshot, &mut NoTrace);
+    assert_eq!(report.completion.tx_accepted, 6, "{report:?}");
+    let stats = io.port_stats(WAN).expect("WAN").counters;
+    assert_eq!((stats.cross_port_in_place, stats.cross_port_copies), (4, 2));
+    assert_eq!(io.engine(LAN).expect("LAN").tx_lent(), 4);
+    audit(&io);
+
+    // A drain reports the lent frames until WAN completed them and they
+    // are back in the LAN pool.
+    let mut addresses = Vec::new();
+    while let Some(descriptor) = wan.consume_tx() {
+        addresses.push(descriptor.address);
+    }
+    assert_eq!(addresses.len(), 6);
+    let report = io.drain(1).expect("drain");
+    assert!(!report.is_drained(), "{report:?}");
+    for address in addresses {
+        assert!(wan.produce_completion(address));
+    }
+    // LAN drains before WAN reaps: one more call sees the frames home.
+    let _ = io.drain(1).expect("drain");
+    let report = io.drain(1).expect("drain");
+    assert!(report.is_drained(), "{report:?}");
+    assert_eq!(io.engine(LAN).expect("LAN").tx_lent(), 0);
+    audit(&io);
+}
