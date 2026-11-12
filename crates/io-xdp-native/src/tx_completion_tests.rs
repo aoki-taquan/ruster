@@ -422,6 +422,87 @@ fn tx_completion_lag_and_reordering_are_tracked() {
     audit(&engine);
 }
 
+/// An engine whose frames are one part of a larger UMEM: every address it
+/// puts on Fill and TX counts from the start of that UMEM, addresses of
+/// other parts are refused untouched, and nothing else about it changes.
+#[test]
+fn a_part_of_a_shared_umem_uses_addresses_from_the_start_of_the_umem() {
+    const BASE: u64 = 64 * FRAME_SIZE as u64;
+    let kernel = kernel().at_base(BASE);
+    let mut engine = engine(&kernel);
+    audit(&engine);
+    for logical in kernel.fill_consumer()..kernel.fill_producer() {
+        let address = kernel.fill_entry(logical);
+        assert!((BASE..BASE + frame_base(RX_FRAMES)).contains(&address));
+    }
+
+    // Addresses of the part before this one and of the one after it are
+    // not this engine's frames, on RX and on Completion.
+    let before = snapshot(engine.ledger());
+    for address in [HEADROOM, BASE - 1, BASE + UMEM_LEN + HEADROOM] {
+        assert!(kernel.produce_rx(XdpDescriptor {
+            address,
+            len: 60,
+            options: 0,
+        }));
+        assert!(kernel.produce_completion(address));
+    }
+    {
+        let mut batch = engine.poll(RING).expect("poll");
+        assert_eq!(batch.completions().invalid(), 3);
+        assert!(batch.next_frame().is_none());
+    }
+    assert_eq!(snapshot(engine.ledger()), before);
+    assert_eq!(
+        engine
+            .counters()
+            .rx_invalid(RxInvalidReason::AddressOutsideUmem),
+        3
+    );
+    assert_eq!(
+        engine
+            .tx_counters()
+            .tx_invalid_completion(CompletionInvalidReason::AddressOutsideUmem),
+        3
+    );
+
+    // Receive, rewrite in place, transmit, complete.
+    let frame = deliver(&kernel, 60) - 64;
+    let handoff = {
+        let mut batch = engine.poll(RING).expect("poll");
+        let mut lent = batch.next_frame().expect("frame");
+        assert_eq!(lent.frame().index(), frame);
+        assert_eq!(
+            lent.bytes().as_ptr().addr(),
+            kernel.umem_address(BASE + frame_base(frame) + HEADROOM)
+        );
+        swap_macs(lent.bytes_mut());
+        lent.stage_tx()
+    };
+    assert_eq!(engine.submit_tx(handoff).expect("submitted").submitted(), 1);
+    let descriptor = kernel.consume_tx().expect("TX descriptor");
+    assert_eq!(descriptor.address, BASE + frame_base(frame) + HEADROOM);
+    assert!(kernel.tx_holds(frame));
+    assert!(kernel.produce_completion(descriptor.address));
+    assert_eq!(engine.reap_completions(RING).expect("reap").reaped(), 1);
+    assert_eq!(state(&engine, frame), FrameStateKind::Free);
+
+    // A generated frame goes the same way.
+    let generated = {
+        let mut frame = engine.allocate_generated(60).expect("generated frame");
+        frame.bytes_mut().fill(0x5a);
+        let index = frame.frame().index();
+        assert_eq!(frame.commit().expect("committed").submitted(), 1);
+        index
+    };
+    let descriptor = kernel.consume_tx().expect("TX descriptor");
+    assert_eq!(descriptor.address, BASE + frame_base(generated) + HEADROOM);
+    assert!(kernel.produce_completion(descriptor.address));
+    assert_eq!(engine.reap_completions(RING).expect("reap").reaped(), 1);
+    assert_eq!(engine.tx_counters().tx_invalid_completion_total(), 3);
+    audit(&engine);
+}
+
 #[test]
 fn tx_invalid_completions_are_counted_and_fail_closed() {
     let kernel = kernel();

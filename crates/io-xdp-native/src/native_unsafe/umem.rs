@@ -17,11 +17,19 @@
 //! Fill, and not in flight on TX: a TX frame becomes `Free` only after its
 //! validated completion), or from `FillOwnedByKernel` only after the kernel
 //! returned that exact frame on the RX ring (`receive` then `lease_rx`).
-//! That protocol in turn needs the engine to be the only writer of this
-//! UMEM's Fill and TX rings, which the once-per-session `DatapathRings`
-//! bundle guarantees: the engine receives every ring of the socket together
-//! with the UMEM, and no raw view of that socket was ever lent. A kernel that keeps writing a
-//! frame after returning it violates the AF_XDP contract.
+//! That protocol in turn needs the engine to be the only one that puts
+//! these frames on a Fill or TX ring, which the once-per-session
+//! `DatapathRings` bundle guarantees: the engine receives every ring of the
+//! socket together with the frames, and no raw view of that socket was ever
+//! lent. When several sockets share one registered UMEM, each session holds
+//! its own part of the mapping (`RegionPart`: the parts never overlap), the
+//! mapping here is that part alone, and the engine refuses every ring
+//! address outside it. The kernel accepts any address of the UMEM on any of
+//! its sockets, so the argument also needs every other socket of the UMEM
+//! to be driven by its own engine: a UMEM with more than one part never
+//! lends raw ring views, and one that lent them gets no second part
+//! (`RegionPart::lend_raw`). A kernel that
+//! keeps writing a frame after returning it violates the AF_XDP contract.
 
 use std::{fmt, marker::PhantomData, ptr::NonNull};
 

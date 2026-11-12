@@ -28,9 +28,9 @@ use super::{
 use crate::{
     abi::{
         XdpMmapOffsets, XdpRingOffset, AF_XDP, SOL_XDP, XDP_COPY, XDP_MMAP_OFFSETS, XDP_OPTIONS,
-        XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_RX_RING, XDP_TX_RING, XDP_UMEM_COMPLETION_RING,
-        XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING, XDP_UMEM_PGOFF_FILL_RING, XDP_UMEM_REG,
-        XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
+        XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_RX_RING, XDP_SHARED_UMEM, XDP_TX_RING,
+        XDP_UMEM_COMPLETION_RING, XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING,
+        XDP_UMEM_PGOFF_FILL_RING, XDP_UMEM_REG, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
     },
     xdp_program::{
         redirect_program, BpfInsn, BPF_OBJ_NAME_LEN, MAP_NAME, PROGRAM_NAME, REDIRECT_PROGRAM_LEN,
@@ -463,7 +463,10 @@ impl Syscalls for SessionFake {
                 return Err(Errno::Linux(raw));
             }
         }
-        self.bound_flags.set(flags);
+        // A socket that joins a UMEM runs in that UMEM's mode.
+        if flags & XDP_SHARED_UMEM == 0 {
+            self.bound_flags.set(flags);
+        }
         Ok(())
     }
 
@@ -1967,4 +1970,274 @@ fn native_session_reads_the_mtu_before_any_resource_and_fails_closed() {
     assert_eq!(fake.len.get(), 1, "only the interface lookup ran");
     assert_eq!(fake.open_fds.get(), 0);
     assert_eq!(fake.live_mappings(), 0);
+}
+
+/// The transcript of one successful `open_sharing`: no UMEM is mapped or
+/// registered, and the bind names the socket of the session it joins.
+fn sharing_calls() -> Vec<Call> {
+    let mut calls = vec![Call::InterfaceIndex { name: name_bytes() }];
+    calls.extend(
+        attempt_calls(0, 0)
+            .into_iter()
+            .filter(|call| !matches!(call, Call::MapAnonymous { .. } | Call::Bind { .. }))
+            .filter(|call| !matches!(call, Call::SetOption { name, .. } if *name == XDP_UMEM_REG)),
+    );
+    let Call::Bind { len, mut address } = sockaddr(XDP_SHARED_UMEM) else {
+        unreachable!("sockaddr is a bind");
+    };
+    address[12..16].copy_from_slice(&u32::try_from(FAKE_FD).expect("fd").to_ne_bytes());
+    let bind = calls.len() - 1;
+    calls.insert(bind, Call::Bind { len, address });
+    calls
+}
+
+/// Where the first generated frame of the session's engine starts in memory.
+fn first_generated_address<S: MapsRealMemory>(session: &mut SessionCore<'_, S>) -> (u64, usize) {
+    let datapath = session.take_datapath().expect("datapath");
+    let base = datapath.address_base();
+    let mut engine = crate::RxFillEngine::new(
+        datapath,
+        crate::UmemDomainId::new(std::num::NonZeroU128::MIN),
+        crate::RxFillConfig::new(std::num::NonZeroU32::MIN),
+    )
+    .expect("engine");
+    let frame = engine.allocate_generated(60).expect("generated frame");
+    (base, frame.bytes().as_ptr().addr())
+}
+
+#[test]
+fn native_session_joins_the_umem_of_another_and_the_mapping_goes_with_the_last() {
+    let fake = SessionFake::new();
+    let mut owner =
+        SessionCore::open_with_room(&fake, &config(XDP_COPY), 129).expect("session with room");
+    // The registered UMEM is the session's own frames and the room.
+    let mut expected = full_success_calls(&fake, copy_flags());
+    let mut reg = [0_u8; 32];
+    reg[0..8].copy_from_slice(&(umem_address_of(&fake) as u64).to_ne_bytes());
+    reg[8..16].copy_from_slice(&(2 * UMEM_LEN as u64).to_ne_bytes());
+    reg[16..20].copy_from_slice(&2_048_u32.to_ne_bytes());
+    reg[20..24].copy_from_slice(&128_u32.to_ne_bytes());
+    expected[2] = Call::MapAnonymous { len: 2 * UMEM_LEN };
+    expected[3] = option(XDP_UMEM_REG, &reg);
+    assert_eq!(fake.transcript(), expected);
+
+    let mut joined = owner
+        .open_sharing(&config(XDP_COPY))
+        .expect("joined session");
+    expected.extend(sharing_calls());
+    assert_eq!(fake.transcript(), expected);
+    assert_eq!(joined.mode(), NegotiatedMode::Copy);
+    assert_eq!((fake.live_mappings(), fake.open_fds.get()), (9, 2));
+
+    // Nothing is left: a third session is refused before it takes anything.
+    let full = owner
+        .open_sharing(&config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("no room");
+    assert_eq!(
+        (full.stage(), full.failure()),
+        (SessionStage::ShareUmem, SessionFailure::SharedUmemFull)
+    );
+    expected.extend([
+        Call::InterfaceIndex { name: name_bytes() },
+        attempt_calls(0, 0)[0],
+        Call::Close { fd: FAKE_FD },
+    ]);
+    assert_eq!(fake.transcript(), expected);
+
+    // Each session's frames are its own part of the one mapping.
+    let umem = umem_address_of(&fake);
+    // Frame 65 is the first of the generated pool; the data starts after
+    // the kernel's headroom and the configured 128 bytes.
+    let in_part = 65 * 2_048 + 256 + 128;
+    assert_eq!(first_generated_address(&mut owner), (0, umem + in_part));
+    assert_eq!(
+        first_generated_address(&mut joined),
+        (UMEM_LEN as u64, umem + UMEM_LEN + in_part)
+    );
+
+    // The owner goes first: its rings and socket, but not the mapping the
+    // joined session still uses.
+    let before = fake.transcript().len();
+    owner.close().expect("owner closes");
+    let teardown = fake.transcript()[before..].to_vec();
+    assert_eq!(teardown.len(), 5);
+    assert!(!teardown.contains(&Call::Unmap {
+        map_call: 3,
+        len: 2 * UMEM_LEN
+    }));
+    assert_eq!((fake.live_mappings(), fake.open_fds.get()), (5, 1));
+    drop(joined);
+    fake.assert_released();
+}
+
+#[test]
+fn native_session_unmaps_a_shared_umem_with_its_last_session() {
+    let fake = SessionFake::new();
+    let owner = SessionCore::open_with_room(&fake, &config(XDP_COPY), 129).expect("owner");
+    let joined = owner.open_sharing(&config(XDP_COPY)).expect("joined");
+    joined.close().expect("joined closes");
+    assert_eq!((fake.live_mappings(), fake.open_fds.get()), (5, 1));
+    // The part of a closed session is not handed out again: the kernel may
+    // still hold frames of it on another socket's TX ring.
+    let again = owner
+        .open_sharing(&config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("the room was used");
+    assert_eq!(again.failure(), SessionFailure::SharedUmemFull);
+    let before = fake.transcript().len();
+    drop(owner);
+    assert_eq!(
+        fake.transcript()[before + 4..],
+        [
+            Call::Unmap {
+                map_call: 3,
+                len: 2 * UMEM_LEN
+            },
+            Call::Close { fd: FAKE_FD },
+        ]
+    );
+    fake.assert_released();
+}
+
+#[test]
+fn native_session_failed_join_takes_nothing_from_the_room() {
+    let reference = SessionFake::new();
+    let owner = SessionCore::open(&reference, &config(XDP_COPY)).expect("reference");
+    let owner_calls = reference.transcript().len();
+    drop(owner);
+    let join_calls = sharing_calls().len();
+    for step in 1..=join_calls {
+        let fake = SessionFake::new();
+        let owner = SessionCore::open_with_room(&fake, &config(XDP_COPY), 129).expect("owner");
+        fake.fail_at
+            .set(Some((owner_calls + step, Errno::Linux(errno::EINVAL))));
+        let error = owner
+            .open_sharing(&config(XDP_COPY))
+            .map(|_| ())
+            .expect_err("injected failure");
+        assert_ne!(error.stage(), SessionStage::ShareUmem, "step {step}");
+        // Everything the failed join acquired is released, in reverse.
+        let prefix = &sharing_calls()[..step];
+        let mut expected = fake.transcript()[..owner_calls].to_vec();
+        expected.extend_from_slice(prefix);
+        expected.extend(
+            reverse_cleanup(prefix, Some(step))
+                .into_iter()
+                .map(|call| match call {
+                    Call::Unmap { map_call, len } => Call::Unmap {
+                        map_call: map_call + owner_calls,
+                        len,
+                    },
+                    other => other,
+                }),
+        );
+        assert_eq!(fake.transcript(), expected, "step {step}");
+        fake.fail_at.set(None);
+        let mut joined = owner
+            .open_sharing(&config(XDP_COPY))
+            .expect("room is intact");
+        assert_eq!(
+            joined.take_datapath().expect("datapath").address_base(),
+            UMEM_LEN as u64
+        );
+    }
+}
+
+#[test]
+fn native_session_join_must_fit_the_umem_and_come_out_in_its_mode() {
+    let fake = SessionFake::new();
+    let owner = SessionCore::open_with_room(&fake, &config(XDP_ZEROCOPY), 129).expect("owner");
+    assert_eq!(owner.mode(), NegotiatedMode::ZeroCopy);
+
+    let other_frames = SessionConfig::new(
+        "veth0",
+        3,
+        ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | XDP_COPY).expect("valid flags"),
+        RingConfig::new(64, 128, 64, 256).expect("valid rings"),
+        UmemConfig::new(64, 4_096, 128, 32, 32, 0).expect("valid geometry"),
+    )
+    .expect("valid session config");
+    let error = owner
+        .open_sharing(&other_frames)
+        .map(|_| ())
+        .expect_err("another frame size");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (SessionStage::ShareUmem, SessionFailure::SharedUmemGeometry)
+    );
+
+    // The bind flags of the joining config are not sent, and the session
+    // runs in the mode of the UMEM.
+    let joined = owner.open_sharing(&config(XDP_COPY)).expect("joined");
+    assert_eq!(joined.mode(), NegotiatedMode::ZeroCopy);
+    assert!(fake.transcript().contains(&sharing_calls()[11]));
+    drop(joined);
+
+    // A driver without zero-copy refuses the bind.
+    let fake = SessionFake::new();
+    let owner = SessionCore::open_with_room(&fake, &config(XDP_ZEROCOPY), 258).expect("owner");
+    let bind = fake.transcript().len() + 12;
+    fake.fail_at
+        .set(Some((bind, Errno::Linux(errno::EOPNOTSUPP))));
+    let error = owner
+        .open_sharing(&config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("no zero-copy");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (SessionStage::Bind, SessionFailure::ZeroCopyUnsupported)
+    );
+    // A kernel that reports another mode than the UMEM's is not trusted.
+    fake.fail_at.set(None);
+    fake.options_override.set(Some(0));
+    let error = owner
+        .open_sharing(&config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("mode mismatch");
+    assert_eq!(
+        error.failure(),
+        SessionFailure::NegotiatedModeMismatch {
+            negotiated: NegotiatedMode::Copy
+        }
+    );
+}
+
+#[test]
+fn native_session_raw_rings_and_a_shared_umem_exclude_each_other() {
+    // Raw views first: nothing joins afterwards, also after they ended.
+    let fake = SessionFake::new();
+    let mut owner = SessionCore::open_with_room(&fake, &config(XDP_COPY), 129).expect("owner");
+    assert!(owner.rings().is_ok(), "raw views of the only part");
+    let error = owner
+        .open_sharing(&config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("raw views were lent");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (SessionStage::ShareUmem, SessionFailure::SharedUmemRawRings)
+    );
+    drop(owner);
+    fake.assert_released();
+
+    // A second part first: neither session lends raw views, also after the
+    // other one closed.
+    let fake = SessionFake::new();
+    let mut owner = SessionCore::open_with_room(&fake, &config(XDP_COPY), 129).expect("owner");
+    let mut joined = owner.open_sharing(&config(XDP_COPY)).expect("joined");
+    assert_eq!(
+        owner.rings().map(|_| ()),
+        Err(crate::RingsError::SharedUmem)
+    );
+    assert_eq!(
+        joined.rings().map(|_| ()),
+        Err(crate::RingsError::SharedUmem)
+    );
+    drop(joined);
+    assert_eq!(
+        owner.rings().map(|_| ()),
+        Err(crate::RingsError::SharedUmem)
+    );
+    // The datapath is still there for the engine.
+    assert!(owner.take_datapath().is_ok());
 }

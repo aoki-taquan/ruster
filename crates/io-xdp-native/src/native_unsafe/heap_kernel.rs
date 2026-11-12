@@ -155,6 +155,9 @@ pub(crate) struct ScriptedKernel {
     tx_entries: RingEntries,
     completion_entries: RingEntries,
     umem_config: UmemConfig,
+    /// Where this socket's part starts in the UMEM it shares: every ring
+    /// address the script reads or writes counts from the UMEM's start.
+    address_base: Cell<u64>,
     taken: Cell<bool>,
     held: RefCell<Vec<bool>>,
     tx_held: RefCell<Vec<bool>>,
@@ -199,6 +202,7 @@ impl ScriptedKernel {
             tx_entries: tx,
             completion_entries: completion,
             umem_config: umem,
+            address_base: Cell::new(0),
             taken: Cell::new(false),
             held: RefCell::new(vec![false; umem.frame_count() as usize]),
             tx_held: RefCell::new(vec![false; umem.frame_count() as usize]),
@@ -211,6 +215,14 @@ impl ScriptedKernel {
             deferred: RefCell::new(Vec::new()),
             statistics: Cell::new(None),
         }
+    }
+
+    /// The same kernel as one socket of a shared UMEM whose part starts at
+    /// `base` (a multiple of the frame size).
+    pub(crate) fn at_base(self, base: u64) -> Self {
+        assert_eq!(base % u64::from(self.umem_config.frame_size()), 0);
+        self.address_base.set(base);
+        self
     }
 
     /// Lends the application side as one bundle, at most once, exactly as
@@ -248,13 +260,15 @@ impl ScriptedKernel {
                 .expect("heap TX view"),
             umem,
             umem_config: self.umem_config,
+            address_base: self.address_base.get(),
             kick: SocketKick::new(KickTarget::Kernel(self)),
             origin: self.origin,
         }))
     }
 
     fn frame_of(&self, address: u64) -> Option<usize> {
-        let frame = address / u64::from(self.umem_config.frame_size());
+        let local = address.checked_sub(self.address_base.get())?;
+        let frame = local / u64::from(self.umem_config.frame_size());
         usize::try_from(frame)
             .ok()
             .filter(|frame| *frame < self.umem_config.frame_count() as usize)
@@ -381,6 +395,7 @@ impl ScriptedKernel {
     /// it transmits but never writes it).
     fn held_range(&self, offset: u64, len: usize, tx_ok: bool) -> usize {
         let frame = self.frame_of(offset).expect("offset inside UMEM");
+        let offset = offset - self.address_base.get();
         let frame_size = u64::from(self.umem_config.frame_size());
         let end = offset + len as u64;
         assert!(
@@ -428,6 +443,7 @@ impl ScriptedKernel {
     /// The process address of UMEM byte `offset`, as a lent slice's
     /// `as_ptr().addr()` reports it (identity only, never dereferenced).
     pub(crate) fn umem_address(&self, offset: u64) -> usize {
+        let offset = offset - self.address_base.get();
         self.umem.base.as_ptr().addr() + usize::try_from(offset).expect("test offset")
     }
 

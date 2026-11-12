@@ -52,8 +52,9 @@ impl SessionConfig {
     ///
     /// The name must be 1..=15 bytes of printable ASCII other than `/` and
     /// `:`, and must not be `.` or `..`. The queue id must not exceed
-    /// [`MAX_QUEUE_ID`]. Shared UMEM is rejected: each session registers and
-    /// owns exactly one UMEM.
+    /// [`MAX_QUEUE_ID`]. The `XDP_SHARED_UMEM` flag is rejected: a session
+    /// joins another one's UMEM through `NativeSession::open_sharing`, which
+    /// sets the flag itself.
     pub fn new(
         device: &str,
         queue: u32,
@@ -162,7 +163,8 @@ pub enum SessionConfigError {
     },
     /// The device name is `.`/`..` or contains a non-printable, `/`, or `:` byte.
     DeviceNameInvalid,
-    /// `XDP_SHARED_UMEM` is outside the initial session profile.
+    /// `XDP_SHARED_UMEM` was given as a bind flag; it is set only by
+    /// `NativeSession::open_sharing`.
     SharedUmemUnsupported,
     /// The queue id exceeds [`MAX_QUEUE_ID`].
     QueueOutOfRange {
@@ -221,6 +223,9 @@ pub enum SessionStage {
     MapUmem,
     /// `XDP_UMEM_REG`.
     RegisterUmem,
+    /// A session that joins another one's UMEM instead of the two steps
+    /// above: its frames must fit that UMEM.
+    ShareUmem,
     /// `XDP_UMEM_FILL_RING` size.
     SizeFillRing,
     /// `XDP_UMEM_COMPLETION_RING` size.
@@ -326,7 +331,14 @@ pub enum SessionFailure {
     /// The rtnetlink link query of [`SessionStage::TxQueueCheck`] failed
     /// (typed, value-free). Fails closed.
     LinkQuery(crate::LinkQueryError),
-    /// The negotiated mode differs from the explicitly bound copy policy.
+    /// The session's frame size or headroom differs from the UMEM it joins.
+    SharedUmemGeometry,
+    /// The UMEM the session joins has too little room left for its frames.
+    SharedUmemFull,
+    /// Raw ring views were lent on the UMEM the session would join.
+    SharedUmemRawRings,
+    /// The negotiated mode differs from the explicitly bound copy policy,
+    /// or from the mode of the UMEM the session joined.
     NegotiatedModeMismatch {
         /// Mode reported by the kernel.
         negotiated: NegotiatedMode,

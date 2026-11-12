@@ -10,6 +10,10 @@
 //! order, each once. [`SessionCore`] declares its owners in reverse
 //! acquisition order, so dropping a live session releases the four ring
 //! mappings (TX, RX, Completion, Fill), then the UMEM, then the socket.
+//!
+//! A session can also join the UMEM of another one (`open_sharing`): it
+//! then registers nothing and takes the next free part of that mapping
+//! (`RegionPart`), and the mapping is unmapped with its last part.
 
 use std::{marker::PhantomData, mem::size_of};
 
@@ -17,9 +21,9 @@ use crate::{
     abi::{
         RingElement, RingMmapLayout, SockAddrXdp, XdpMmapOffsets, XdpOptions, XdpRingOffset,
         XdpUmemReg, AF_XDP, SOL_XDP, XDP_COPY, XDP_MMAP_OFFSETS, XDP_OPTIONS, XDP_OPTIONS_ZEROCOPY,
-        XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_RX_RING, XDP_TX_RING, XDP_UMEM_COMPLETION_RING,
-        XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING, XDP_UMEM_PGOFF_FILL_RING, XDP_UMEM_REG,
-        XDP_ZEROCOPY,
+        XDP_PGOFF_RX_RING, XDP_PGOFF_TX_RING, XDP_RX_RING, XDP_SHARED_UMEM, XDP_TX_RING,
+        XDP_UMEM_COMPLETION_RING, XDP_UMEM_FILL_RING, XDP_UMEM_PGOFF_COMPLETION_RING,
+        XDP_UMEM_PGOFF_FILL_RING, XDP_UMEM_REG, XDP_ZEROCOPY,
     },
     session::{
         AttachError, AttachFailure, AttachStage, CleanupError, CleanupStage, NativeRings,
@@ -36,7 +40,7 @@ use crate::datapath::{DatapathError, DatapathParts, DatapathRings, RingsError};
 
 use super::syscall::{
     errno, interface_index, Errno, LinuxSyscalls, MappedRegion, MapsRealMemory, OwnedBpfFd,
-    OwnedXdpFd, ResourceError, SyscallError, TxQueueProbe, IFNAMSIZ, PAGE_SIZE,
+    OwnedXdpFd, RegionPart, ResourceError, SyscallError, TxQueueProbe, IFNAMSIZ, PAGE_SIZE,
 };
 
 /// Verifier log capacity: the program's success log is about 100 bytes, so
@@ -210,10 +214,12 @@ const fn fail(stage: SessionStage, failure: SessionFailure) -> SessionError {
     SessionError::new(stage, failure)
 }
 
-fn encode_umem_reg(address: u64, umem: UmemConfig) -> [u8; UMEM_REG_LEN] {
+/// `byte_len` is the whole registered length: the session's own frames and
+/// the room kept for sessions that join later.
+fn encode_umem_reg(address: u64, byte_len: u64, umem: UmemConfig) -> [u8; UMEM_REG_LEN] {
     let mut bytes = [0_u8; UMEM_REG_LEN];
     bytes[0..8].copy_from_slice(&address.to_ne_bytes());
-    bytes[8..16].copy_from_slice(&umem.byte_len().to_ne_bytes());
+    bytes[8..16].copy_from_slice(&byte_len.to_ne_bytes());
     bytes[16..20].copy_from_slice(&umem.frame_size().to_ne_bytes());
     // User headroom only; the kernel adds XDP_PACKET_HEADROOM itself.
     bytes[20..24].copy_from_slice(&umem.headroom().to_ne_bytes());
@@ -229,7 +235,8 @@ fn encode_sockaddr(flags: u16, ifindex: u32, queue: u32) -> [u8; SOCKADDR_LEN] {
     bytes[2..4].copy_from_slice(&flags.to_ne_bytes());
     bytes[4..8].copy_from_slice(&ifindex.to_ne_bytes());
     bytes[8..12].copy_from_slice(&queue.to_ne_bytes());
-    // shared_umem_fd = 0: the initial profile never shares UMEM.
+    // shared_umem_fd stays 0 here; `OwnedXdpFd::bind_sharing` sets it for
+    // a session that joins another session's UMEM.
     bytes
 }
 
@@ -379,15 +386,16 @@ fn set_ring_size<S: MapsRealMemory>(
 ///
 /// Field order is drop order: the attached XDP objects (link first, so the
 /// program is detached before anything else), then ring mappings in reverse
-/// mapping order, then the UMEM, then the socket. Ring views are produced
-/// only by borrowing this value mutably, so no view can outlive a mapping.
+/// mapping order, then the session's part of the UMEM (the mapping itself
+/// goes with its last part), then the socket. Ring views are produced only
+/// by borrowing this value mutably, so no view can outlive a mapping.
 pub(super) struct SessionCore<'s, S: MapsRealMemory> {
     xdp: Option<XdpObjects<'s, S>>,
     tx: MappedRegion<'s, S>,
     rx: MappedRegion<'s, S>,
     completion: MappedRegion<'s, S>,
     fill: MappedRegion<'s, S>,
-    umem: MappedRegion<'s, S>,
+    umem: RegionPart<'s, S>,
     fd: OwnedXdpFd<'s, S>,
     plans: RingPlans,
     umem_config: UmemConfig,
@@ -433,6 +441,70 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     /// `CAP_IPC_LOCK`, `auto` therefore needs `RLIMIT_MEMLOCK` of at least
     /// twice the UMEM size, or the fallback fails with `MemlockLimit`.
     pub(super) fn open(syscalls: &'s S, config: &SessionConfig) -> Result<Self, SessionError> {
+        Self::open_with_room(syscalls, config, 0)
+    }
+
+    /// [`Self::open`] with a UMEM registered `room_frames` frames longer
+    /// than the session's own, for sessions that join it later.
+    pub(super) fn open_with_room(
+        syscalls: &'s S,
+        config: &SessionConfig,
+        room_frames: u32,
+    ) -> Result<Self, SessionError> {
+        let (ifindex, mtu) = Self::probe(syscalls, config)?;
+        let raw = config.bind_flags().raw();
+        let own = UmemSource::Own { room_frames };
+        match config.mode() {
+            BindMode::CopyRequired | BindMode::ZeroCopyRequired => {
+                Self::attempt(syscalls, config, ifindex, raw, own)
+            }
+            BindMode::Automatic => {
+                match Self::attempt(syscalls, config, ifindex, raw | XDP_ZEROCOPY, own) {
+                    Err(error) if error.failure() == SessionFailure::ZeroCopyUnsupported => {
+                        let mut session =
+                            Self::attempt(syscalls, config, ifindex, raw | XDP_COPY, own)?;
+                        session.zero_copy_fallback = true;
+                        Ok(session)
+                    }
+                    other => other,
+                }
+            }
+        }
+        .map(|mut session| {
+            session.mtu = mtu;
+            session
+        })
+    }
+
+    /// Opens a session on another interface or queue that uses the next
+    /// free part of the UMEM this session uses, instead of registering one.
+    ///
+    /// Linux v6.8 `xsk_bind` accepts no other bind flag together with
+    /// `XDP_SHARED_UMEM`: `xp_assign_dev_shared` takes the copy policy and
+    /// need-wakeup from the UMEM and from this session's pool. The bind
+    /// flags of `config` are therefore not sent, and the joined session
+    /// must come out in this session's mode. The new socket has its own
+    /// Fill and Completion rings, which the kernel requires for another
+    /// interface or queue (`EINVAL` otherwise, and for the same interface
+    /// and queue as this session).
+    pub(super) fn open_sharing(&self, config: &SessionConfig) -> Result<Self, SessionError> {
+        let syscalls = self.fd.syscalls();
+        let (ifindex, mtu) = Self::probe(syscalls, config)?;
+        Self::attempt(
+            syscalls,
+            config,
+            ifindex,
+            XDP_SHARED_UMEM,
+            UmemSource::Shared(self),
+        )
+        .map(|mut session| {
+            session.mtu = mtu;
+            session
+        })
+    }
+
+    /// The checks before any resource: the interface, its TX queue, its MTU.
+    fn probe(syscalls: &'s S, config: &SessionConfig) -> Result<(u32, u32), SessionError> {
         let ifindex = interface_index(syscalls, config.interface_name_bytes())
             .map_err(at(SessionStage::InterfaceLookup))?;
         // Before any resource: a queue without a TX queue binds fine and
@@ -471,33 +543,13 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         }
         // The TX length bound of the core adapter (mtu + Ethernet header):
         // read once here, before any resource.
-        let mtu = link.mtu;
-        if mtu == 0 {
+        if link.mtu == 0 {
             return Err(fail(
                 SessionStage::MtuProbe,
                 SessionFailure::MtuUnverifiable,
             ));
         }
-        let raw = config.bind_flags().raw();
-        match config.mode() {
-            BindMode::CopyRequired | BindMode::ZeroCopyRequired => {
-                Self::attempt(syscalls, config, ifindex, raw)
-            }
-            BindMode::Automatic => {
-                match Self::attempt(syscalls, config, ifindex, raw | XDP_ZEROCOPY) {
-                    Err(error) if error.failure() == SessionFailure::ZeroCopyUnsupported => {
-                        let mut session = Self::attempt(syscalls, config, ifindex, raw | XDP_COPY)?;
-                        session.zero_copy_fallback = true;
-                        Ok(session)
-                    }
-                    other => other,
-                }
-            }
-        }
-        .map(|mut session| {
-            session.mtu = mtu;
-            session
-        })
+        Ok((ifindex, link.mtu))
     }
 
     fn attempt(
@@ -505,35 +557,67 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         config: &SessionConfig,
         ifindex: u32,
         flags: u16,
+        source: UmemSource<'_, 's, S>,
     ) -> Result<Self, SessionError> {
         let umem_config = config.umem();
         let rings = config.rings();
+        let out_of_range = |stage| fail(stage, SessionFailure::ArgumentOutOfRange);
+        let part_len = usize::try_from(umem_config.byte_len())
+            .map_err(|_| out_of_range(SessionStage::MapUmem))?;
 
         let fd = OwnedXdpFd::open(syscalls).map_err(at(SessionStage::OpenSocket))?;
 
-        let umem_len = usize::try_from(umem_config.byte_len())
-            .ok()
-            .and_then(|len| len.checked_next_multiple_of(PAGE_SIZE))
-            .ok_or(fail(
-                SessionStage::MapUmem,
-                SessionFailure::ArgumentOutOfRange,
-            ))?;
-        let umem =
-            MappedRegion::map_anonymous(syscalls, umem_len).map_err(at(SessionStage::MapUmem))?;
-        check_page_aligned(SessionStage::MapUmem, &umem)?;
-
-        let address = u64::try_from(umem.address_bits()).map_err(|_| {
-            fail(
-                SessionStage::RegisterUmem,
-                SessionFailure::ArgumentOutOfRange,
-            )
-        })?;
-        fd.set_socket_option(
-            SOL_XDP,
-            XDP_UMEM_REG,
-            &encode_umem_reg(address, umem_config),
-        )
-        .map_err(at(SessionStage::RegisterUmem))?;
+        // A session with its own UMEM maps and registers it here; one that
+        // joins checks that its frames fit what is left of the other's.
+        let own = match source {
+            UmemSource::Own { room_frames } => {
+                let registered = u64::from(room_frames)
+                    .checked_mul(u64::from(umem_config.frame_size()))
+                    .and_then(|room| room.checked_add(umem_config.byte_len()))
+                    .ok_or(out_of_range(SessionStage::MapUmem))?;
+                let usable =
+                    usize::try_from(registered).map_err(|_| out_of_range(SessionStage::MapUmem))?;
+                let mapped = usable
+                    .checked_next_multiple_of(PAGE_SIZE)
+                    .ok_or(out_of_range(SessionStage::MapUmem))?;
+                let region = MappedRegion::map_anonymous(syscalls, mapped)
+                    .map_err(at(SessionStage::MapUmem))?;
+                check_page_aligned(SessionStage::MapUmem, &region)?;
+                let address = u64::try_from(region.address_bits())
+                    .map_err(|_| out_of_range(SessionStage::RegisterUmem))?;
+                fd.set_socket_option(
+                    SOL_XDP,
+                    XDP_UMEM_REG,
+                    &encode_umem_reg(address, registered, umem_config),
+                )
+                .map_err(at(SessionStage::RegisterUmem))?;
+                Some((region, usable))
+            }
+            UmemSource::Shared(owner) => {
+                let theirs = owner.umem_config;
+                if theirs.frame_size() != umem_config.frame_size()
+                    || theirs.headroom() != umem_config.headroom()
+                {
+                    return Err(fail(
+                        SessionStage::ShareUmem,
+                        SessionFailure::SharedUmemGeometry,
+                    ));
+                }
+                if owner.umem.raw_lent() {
+                    return Err(fail(
+                        SessionStage::ShareUmem,
+                        SessionFailure::SharedUmemRawRings,
+                    ));
+                }
+                if owner.umem.room() < part_len {
+                    return Err(fail(
+                        SessionStage::ShareUmem,
+                        SessionFailure::SharedUmemFull,
+                    ));
+                }
+                None
+            }
+        };
 
         set_ring_size(
             &fd,
@@ -591,9 +675,17 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         )
         .map_err(|(stage, failure)| fail(stage, failure))?;
 
-        let zero_copy_bind = flags & XDP_ZEROCOPY != 0;
-        fd.bind_bytes(&encode_sockaddr(flags, ifindex, config.queue()))
-            .map_err(|error| classify(SessionStage::Bind, error, zero_copy_bind))?;
+        // A joined socket comes out in the mode of the UMEM it joins.
+        let zero_copy_bind = match source {
+            UmemSource::Own { .. } => flags & XDP_ZEROCOPY != 0,
+            UmemSource::Shared(owner) => owner.mode == NegotiatedMode::ZeroCopy,
+        };
+        let address = encode_sockaddr(flags, ifindex, config.queue());
+        match source {
+            UmemSource::Own { .. } => fd.bind_bytes(&address),
+            UmemSource::Shared(owner) => fd.bind_sharing(address, &owner.fd),
+        }
+        .map_err(|error| classify(SessionStage::Bind, error, zero_copy_bind))?;
 
         let mut raw_options = [0_u8; OPTIONS_LEN];
         let actual = fd
@@ -622,7 +714,8 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             NegotiatedMode::Copy
         };
         // Every attempt binds with exactly one of XDP_COPY or XDP_ZEROCOPY,
-        // so the kernel's own silent copy fallback never applies.
+        // or joins a UMEM whose mode is already known, so the kernel's own
+        // silent copy fallback never applies.
         let expected = if zero_copy_bind {
             NegotiatedMode::ZeroCopy
         } else {
@@ -634,6 +727,15 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
                 SessionFailure::NegotiatedModeMismatch { negotiated: mode },
             ));
         }
+
+        // Last, so a failed attempt takes nothing from a shared UMEM. The
+        // lengths were checked above, and nothing else ran in between.
+        let umem = match (own, source) {
+            (Some((region, usable)), _) => RegionPart::first(region, usable, part_len),
+            (None, UmemSource::Shared(owner)) => owner.umem.next(part_len),
+            (None, UmemSource::Own { .. }) => None,
+        }
+        .ok_or(out_of_range(SessionStage::MapUmem))?;
 
         Ok(Self {
             xdp: None,
@@ -662,6 +764,9 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         if self.datapath == DatapathAccess::Taken {
             return Err(RingsError::DatapathTaken);
         }
+        if !self.umem.lend_raw() {
+            return Err(RingsError::SharedUmem);
+        }
         self.datapath = DatapathAccess::RawLent;
         self.raw_views().map_err(RingsError::Map)
     }
@@ -676,6 +781,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         }
         // `open` rejected a zero or unaligned UMEM address, so only an
         // inactive region could yield no borrow.
+        let address_base = self.umem.offset() as u64;
         let Some(umem) = self.umem.borrow_mapping() else {
             return Err(DatapathError::Map(RingMapError::MappingTooShort {
                 required: 1,
@@ -711,6 +817,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             tx,
             umem,
             umem_config: self.umem_config,
+            address_base,
             kick,
             origin: self.origin,
         }))
@@ -764,7 +871,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         note(CleanupStage::UnmapRxRing, rx.unmap());
         note(CleanupStage::UnmapCompletionRing, completion.unmap());
         note(CleanupStage::UnmapFillRing, fill.unmap());
-        note(CleanupStage::UnmapUmem, umem.unmap());
+        note(CleanupStage::UnmapUmem, umem.release());
         note(CleanupStage::CloseSocket, fd.close());
         first.map_or(Ok(()), Err)
     }
@@ -894,6 +1001,23 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     }
 }
 
+/// Where a session's UMEM comes from.
+enum UmemSource<'a, 's, S: MapsRealMemory> {
+    /// Map and register a new one, with room for this many more frames
+    /// that sessions joining later can take.
+    Own { room_frames: u32 },
+    /// Join the UMEM this session uses.
+    Shared(&'a SessionCore<'s, S>),
+}
+
+impl<S: MapsRealMemory> Clone for UmemSource<'_, '_, S> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<S: MapsRealMemory> Copy for UmemSource<'_, '_, S> {}
+
 type ViewFailure = (SessionStage, SessionFailure);
 
 fn view_error(failure: SessionFailure) -> RingMapError {
@@ -1003,6 +1127,54 @@ impl NativeSession {
     /// namespace.
     pub fn open(config: &SessionConfig) -> Result<Self, SessionError> {
         SessionCore::open(&LINUX_SYSCALLS, config).map(|core| Self {
+            core,
+            _worker_local: PhantomData,
+        })
+    }
+
+    /// Like [`Self::open`], and registers a UMEM with room for `room_frames`
+    /// more frames than the session's own, which sessions opened with
+    /// [`Self::open_sharing`] take.
+    pub fn open_with_room(config: &SessionConfig, room_frames: u32) -> Result<Self, SessionError> {
+        SessionCore::open_with_room(&LINUX_SYSCALLS, config, room_frames).map(|core| Self {
+            core,
+            _worker_local: PhantomData,
+        })
+    }
+
+    /// Opens a session on another interface or queue that shares this
+    /// session's UMEM (Linux 5.10+), so a frame received by one of them can
+    /// be transmitted by the other without a copy.
+    ///
+    /// The new session's frames are the next free part of the UMEM, in the
+    /// room that [`Self::open_with_room`] kept: its frame size and headroom
+    /// must equal this session's
+    /// ([`SessionFailure::SharedUmemGeometry`](crate::SessionFailure::SharedUmemGeometry)),
+    /// and its frame count must fit
+    /// ([`SessionFailure::SharedUmemFull`](crate::SessionFailure::SharedUmemFull)).
+    /// The kernel decides copy or zero-copy per UMEM, so the bind flags of
+    /// `config` are not used: the new session runs in this session's mode
+    /// with need-wakeup as this session has it, and an interface that
+    /// cannot (zero-copy on a driver without it) fails at
+    /// [`SessionStage::Bind`](crate::SessionStage::Bind) with
+    /// [`SessionFailure::ZeroCopyUnsupported`](crate::SessionFailure::ZeroCopyUnsupported).
+    /// Such an interface can still be opened with its own UMEM.
+    ///
+    /// A failed open takes nothing from the room. Each session is closed on
+    /// its own, in any order; the UMEM memory is unmapped with the last of
+    /// them (only that close can report a failed unmap). The part of a
+    /// closed session is not handed out again. Every session of a UMEM must
+    /// be opened before the datapath of the one they join is taken, because
+    /// the engine then keeps that session borrowed.
+    ///
+    /// Raw ring views ([`Self::rings`]) can name any frame of the UMEM, so
+    /// they and sharing exclude each other: a session whose UMEM has more
+    /// than one part lends none
+    /// ([`RingsError::SharedUmem`](crate::RingsError::SharedUmem)), and a
+    /// session that lent them is not joined
+    /// ([`SessionFailure::SharedUmemRawRings`](crate::SessionFailure::SharedUmemRawRings)).
+    pub fn open_sharing(&self, config: &SessionConfig) -> Result<Self, SessionError> {
+        self.core.open_sharing(config).map(|core| Self {
             core,
             _worker_local: PhantomData,
         })
