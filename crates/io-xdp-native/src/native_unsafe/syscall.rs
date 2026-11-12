@@ -8,13 +8,12 @@
 //! future data path.
 
 use std::{
-    cell::Cell,
     ffi::{c_char, c_int, c_long, c_short, c_uint, c_void, CStr},
     fmt,
     mem::size_of,
     os::fd::RawFd,
     ptr::NonNull,
-    rc::Rc,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use crate::{
@@ -1529,18 +1528,46 @@ impl<S: Syscalls> Drop for MappedRegion<'_, S> {
     }
 }
 
+// SAFETY: a `MappedRegion` is the exclusive owner of one mapping, which is
+// process-wide: its address is valid on every thread and `munmap` may be
+// called from any of them. Nothing in it is tied to the thread that created
+// it. Bytes are reached only through `borrow_mapping` (`&mut self`) or a
+// `RegionPart` (below); a shared reference reads the address, the length
+// and the active flag, which change only through `&mut self`. `S: Sync`
+// because the seam reference is shared with the creating thread.
+unsafe impl<S: Syscalls + Sync> Send for MappedRegion<'_, S> {}
+// SAFETY: see above; `&MappedRegion` gives no access to the mapped bytes.
+unsafe impl<S: Syscalls + Sync> Sync for MappedRegion<'_, S> {}
+
+/// What has been handed out of one [`PartedRegion`].
+struct Handed {
+    /// Bytes handed out so far. Parts are cut from the front in order and
+    /// this only grows, so no two parts overlap.
+    bytes: usize,
+    /// Raw ring views of the first part's socket were lent. Whatever they
+    /// published stays with the kernel after the views end, so this is
+    /// never cleared, and no other part is handed out afterwards.
+    raw_lent: bool,
+}
+
 /// One UMEM mapping handed out in parts, one part per session.
+///
+/// The sessions may live on different threads; the lock is taken only when
+/// a session is opened or lends raw ring views, never on the packet path.
 struct PartedRegion<'syscalls, S: Syscalls> {
     region: MappedRegion<'syscalls, S>,
     /// Bytes registered as UMEM, at most the mapped length.
     usable: usize,
-    /// Bytes handed out so far. Parts are cut from the front in order and
-    /// this only grows, so no two parts overlap.
-    handed: Cell<usize>,
-    /// Raw ring views of the first part's socket were lent. Whatever they
-    /// published stays with the kernel after the views end, so this is
-    /// never cleared, and no other part is handed out afterwards.
-    raw_lent: Cell<bool>,
+    handed: Mutex<Handed>,
+}
+
+impl<S: Syscalls> PartedRegion<'_, S> {
+    /// The record of what was handed out. A panic while it was held cannot
+    /// leave it half updated (each update is one assignment), so a poisoned
+    /// lock is used as it is.
+    fn handed(&self) -> std::sync::MutexGuard<'_, Handed> {
+        self.handed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// One session's own part of a UMEM mapping.
@@ -1549,7 +1576,7 @@ struct PartedRegion<'syscalls, S: Syscalls> {
 /// joins it takes the next free bytes. The mapping is unmapped when its
 /// last part is released or dropped.
 pub(super) struct RegionPart<'syscalls, S: Syscalls> {
-    whole: Rc<PartedRegion<'syscalls, S>>,
+    whole: Arc<PartedRegion<'syscalls, S>>,
     offset: usize,
     byte_len: usize,
 }
@@ -1567,11 +1594,13 @@ impl<'syscalls, S: Syscalls> RegionPart<'syscalls, S> {
             return None;
         }
         Some(Self {
-            whole: Rc::new(PartedRegion {
+            whole: Arc::new(PartedRegion {
                 region,
                 usable,
-                handed: Cell::new(byte_len),
-                raw_lent: Cell::new(false),
+                handed: Mutex::new(Handed {
+                    bytes: byte_len,
+                    raw_lent: false,
+                }),
             }),
             offset: 0,
             byte_len,
@@ -1580,7 +1609,7 @@ impl<'syscalls, S: Syscalls> RegionPart<'syscalls, S> {
 
     /// Registered bytes no part has taken yet.
     pub(super) fn room(&self) -> usize {
-        self.whole.usable - self.whole.handed.get()
+        self.whole.usable - self.whole.handed().bytes
     }
 
     /// Records that raw ring views of this part's socket are lent, which
@@ -1588,29 +1617,34 @@ impl<'syscalls, S: Syscalls> RegionPart<'syscalls, S> {
     /// (`true`) only while this is the one part ever handed out: the frames
     /// of another part belong to that part's engine alone.
     pub(super) fn lend_raw(&self) -> bool {
-        if self.whole.handed.get() != self.byte_len {
+        let mut handed = self.whole.handed();
+        if handed.bytes != self.byte_len {
             return false;
         }
-        self.whole.raw_lent.set(true);
+        handed.raw_lent = true;
         true
     }
 
     /// Whether raw ring views were ever lent ([`Self::lend_raw`]).
     pub(super) fn raw_lent(&self) -> bool {
-        self.whole.raw_lent.get()
+        self.whole.handed().raw_lent
     }
 
     /// Takes the next `byte_len` bytes of the same mapping as another
     /// session's part, or `None` if fewer are left or raw ring views were
     /// lent.
     pub(super) fn next(&self, byte_len: usize) -> Option<Self> {
-        if byte_len > self.room() || self.raw_lent() {
+        // One lock for the check and the cut, so two sessions opened at the
+        // same time get different parts, and none after raw views.
+        let mut handed = self.whole.handed();
+        if handed.raw_lent || byte_len > self.whole.usable - handed.bytes {
             return None;
         }
-        let offset = self.whole.handed.get();
-        self.whole.handed.set(offset + byte_len);
+        let offset = handed.bytes;
+        handed.bytes = offset + byte_len;
+        drop(handed);
         Some(Self {
-            whole: Rc::clone(&self.whole),
+            whole: Arc::clone(&self.whole),
             offset,
             byte_len,
         })
@@ -1624,7 +1658,7 @@ impl<'syscalls, S: Syscalls> RegionPart<'syscalls, S> {
     /// Gives the part up. The mapping is unmapped, and the result is that
     /// unmap's, only if this was its last part.
     pub(super) fn release(self) -> Result<(), ResourceError> {
-        match Rc::try_unwrap(self.whole) {
+        match Arc::try_unwrap(self.whole) {
             Ok(parted) => parted.region.unmap(),
             Err(_) => Ok(()),
         }
@@ -1648,11 +1682,13 @@ impl<S: MapsRealMemory> RegionPart<'_, S> {
         // keep `offset + byte_len <= handed <= usable <= region.byte_len`,
         // so `start..start + byte_len` lies inside it. The mapping is
         // unmapped only by `unmap_once`, which needs the region by `&mut`
-        // or by value: the `Rc` gives neither while any part exists, and
+        // or by value: the `Arc` gives neither while any part exists, on
+        // whatever thread, and
         // this part cannot be released or dropped while the returned borrow
         // holds `&mut self`. For the same reason
         // `MappedRegion::borrow_mapping` (the whole mapping, `&mut`) is
-        // unreachable. Two parts never overlap (`handed` only grows), and
+        // unreachable. Two parts never overlap (`handed` only grows, and
+        // is read and advanced under one lock), and
         // one part is not borrowed twice at a time (`&mut self`), so the
         // borrow is exclusive. What the kernel does with these bytes is
         // decided by the addresses put on the rings of every socket of the

@@ -1164,10 +1164,16 @@ static LINUX_SYSCALLS: LinuxSyscalls = LinuxSyscalls;
 /// XSKMAP fds), then unmaps the TX, RX, Completion, and Fill rings, then
 /// the UMEM, then closes the socket, each exactly once.
 ///
-/// The session is `!Send` and `!Sync` through an explicit marker: one
-/// worker owns its rings.
+/// The session can be moved to another thread (`Send`): it is opened with
+/// the others at startup and then given to the worker that runs its queue.
+/// Nothing borrows it while it moves (ring views and the datapath bundle
+/// borrow it, so they are taken on the thread that keeps it), its mappings
+/// and file descriptors are the process's, and a UMEM shared with sessions
+/// on other threads is divided under a lock and unmapped by whichever
+/// session ends last. It is not `Sync`: one thread at a time owns its
+/// rings.
 ///
-/// ```compile_fail
+/// ```
 /// fn send<T: Send>() {}
 /// send::<ruster_io_xdp_native::NativeSession>();
 /// ```
@@ -1188,7 +1194,8 @@ static LINUX_SYSCALLS: LinuxSyscalls = LinuxSyscalls;
 /// ```
 pub struct NativeSession {
     core: SessionCore<'static, LinuxSyscalls>,
-    _worker_local: PhantomData<*mut ()>,
+    /// `Send` and not `Sync`: see the type's documentation.
+    _one_thread_at_a_time: PhantomData<std::cell::Cell<()>>,
 }
 
 impl NativeSession {
@@ -1197,7 +1204,7 @@ impl NativeSession {
     pub fn open(config: &SessionConfig) -> Result<Self, SessionError> {
         SessionCore::open(&LINUX_SYSCALLS, config).map(|core| Self {
             core,
-            _worker_local: PhantomData,
+            _one_thread_at_a_time: PhantomData,
         })
     }
 
@@ -1207,7 +1214,7 @@ impl NativeSession {
     pub fn open_with_room(config: &SessionConfig, room_frames: u32) -> Result<Self, SessionError> {
         SessionCore::open_with_room(&LINUX_SYSCALLS, config, room_frames).map(|core| Self {
             core,
-            _worker_local: PhantomData,
+            _one_thread_at_a_time: PhantomData,
         })
     }
 
@@ -1245,7 +1252,7 @@ impl NativeSession {
     pub fn open_sharing(&self, config: &SessionConfig) -> Result<Self, SessionError> {
         self.core.open_sharing(config).map(|core| Self {
             core,
-            _worker_local: PhantomData,
+            _one_thread_at_a_time: PhantomData,
         })
     }
 
