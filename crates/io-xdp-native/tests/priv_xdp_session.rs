@@ -1506,11 +1506,11 @@ fn priv_xdp_queues_each_get_the_frames_of_their_own_queue() {
         }
         eprintln!("priv_xdp_queues: frames by socket and sending queue {seen:?}");
     }
-    // The joined session goes first; the program is the first one's.
-    second.close().expect("queue 1 teardown");
-    assert!(attached_program(&device).is_some());
+    // The program is the first session's: it goes with that session, while
+    // the socket of queue 1 is still open and in the map.
     first.close().expect("queue 0 teardown");
     wait_detached(&device);
+    second.close().expect("queue 1 teardown");
     eprintln!(
         "priv_xdp_queues: two sockets on two queues of one device with one UMEM and one \
          program each received the frames of their own queue only verified"

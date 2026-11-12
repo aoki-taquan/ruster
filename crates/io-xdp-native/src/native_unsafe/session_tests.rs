@@ -2293,10 +2293,9 @@ fn native_xdp_program_of_one_queue_takes_the_sockets_of_the_others() {
     );
     assert_eq!(second.xdp_attach_mode(), Some(XdpAttachMode::Native));
 
-    // Once only, and not next to a program of its own.
+    // Not next to a program of its own, in either order.
     let before = fake.transcript().len();
     for error in [
-        second.join_xdp(&first).expect_err("joined already"),
         second
             .attach_xdp(XdpAttachMode::Native)
             .expect_err("joined already"),
@@ -2313,6 +2312,21 @@ fn native_xdp_program_of_one_queue_takes_the_sockets_of_the_others() {
     // detach and its close leave map, program and link alone.
     second.detach_xdp().expect("nothing to detach");
     assert_eq!(fake.transcript().len(), before);
+
+    // The owner detaches and attaches again: a new map, which the joined
+    // session joins again.
+    first.detach_xdp().expect("detach");
+    first
+        .attach_xdp_queues(XdpAttachMode::Native, 4)
+        .expect("attach again");
+    let before = fake.transcript().len();
+    second.join_xdp(&first).expect("join again");
+    assert_eq!(fake.transcript().len(), before + 1);
+    let error = first
+        .attach_xdp_queues(XdpAttachMode::Native, crate::MAX_QUEUE_ID + 2)
+        .expect_err("attached, and too many queues");
+    assert_eq!(error.stage(), AttachStage::Precondition);
+    let before = fake.transcript().len();
     second.close().expect("close");
     let closed = fake.transcript()[before..].to_vec();
     assert!(closed

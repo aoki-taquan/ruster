@@ -915,6 +915,9 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         if self.xdp.is_some() || self.xdp_joined.is_some() {
             return Err(precondition(AttachFailure::AlreadyAttached));
         }
+        if queues > crate::session::MAX_QUEUE_ID + 1 {
+            return Err(precondition(AttachFailure::ArgumentOutOfRange));
+        }
         if mode == XdpAttachMode::Generic && self.mode == NegotiatedMode::ZeroCopy {
             return Err(precondition(AttachFailure::GenericRequiresCopyMode));
         }
@@ -992,9 +995,13 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     /// The entry belongs to the socket: the kernel removes it when the
     /// socket closes (`xsk_delete_from_maps`), and this session has no
     /// handle on the map to remove it earlier.
+    ///
+    /// A session can join again: the program it joined may have been
+    /// detached since, which this session cannot see. Joining a map it is
+    /// still in is the kernel's `EEXIST`.
     pub(super) fn join_xdp(&mut self, attached: &Self) -> Result<(), AttachError> {
         let precondition = |failure| AttachError::new(AttachStage::Precondition, failure, None);
-        if self.xdp.is_some() || self.xdp_joined.is_some() {
+        if self.xdp.is_some() {
             return Err(precondition(AttachFailure::AlreadyAttached));
         }
         let Some(objects) = attached.xdp.as_ref() else {
@@ -1371,8 +1378,8 @@ impl NativeSession {
     /// [`Self::attach_xdp_queues`]: packets of this session's queue then
     /// reach this socket.
     ///
-    /// Refused before any syscall when this session is attached or joined
-    /// already, `attached` has no program
+    /// Refused before any syscall when this session has a program of its
+    /// own, `attached` has no program
     /// ([`AttachFailure::NotAttached`](crate::AttachFailure::NotAttached)),
     /// the two are on different interfaces
     /// ([`AttachFailure::OtherInterface`](crate::AttachFailure::OtherInterface)),
@@ -1381,8 +1388,10 @@ impl NativeSession {
     /// ([`AttachFailure::TooBig`](crate::AttachFailure::TooBig)).
     ///
     /// The program stays `attached`'s: detaching or closing that session
-    /// stops the packets of every queue. This session's place in the map
-    /// ends when this session closes; [`Self::detach_xdp`] does not end it.
+    /// stops the packets of every queue, which this session is not told.
+    /// After a new attach it joins again. This session's place in a map
+    /// ends when this session closes; [`Self::detach_xdp`] does not end it,
+    /// and joining a map it is still in fails with the kernel's `EEXIST`.
     pub fn join_xdp(&mut self, attached: &Self) -> Result<(), AttachError> {
         self.core.join_xdp(&attached.core)
     }
@@ -1394,8 +1403,8 @@ impl NativeSession {
         self.core.detach_xdp()
     }
 
-    /// Returns the attach mode of the live attachment, if any: this
-    /// session's own, or the one it joined.
+    /// Returns the attach mode of this session's own live attachment, or
+    /// else of the program it last joined (which may be gone since).
     #[must_use]
     pub fn xdp_attach_mode(&self) -> Option<XdpAttachMode> {
         self.core.xdp_attach_mode()
