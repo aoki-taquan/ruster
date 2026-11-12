@@ -84,6 +84,15 @@ pub struct TxSubmitReport {
 }
 
 impl TxSubmitReport {
+    /// One handoff published, nothing left behind.
+    pub(super) const fn of_one(need_wakeup: Result<NeedWakeup, NativeRingError>) -> Self {
+        Self {
+            submitted: 1,
+            blocked: None,
+            need_wakeup,
+        }
+    }
+
     /// Handoffs published to the TX ring by this call.
     #[must_use]
     pub const fn submitted(self) -> u32 {
@@ -156,6 +165,10 @@ pub struct TxRejected {
 }
 
 impl TxRejected {
+    pub(super) const fn new(reason: TxRejection, handoff: TxHandoff) -> Self {
+        Self { reason, handoff }
+    }
+
     /// Why the handoff was not submitted.
     #[must_use]
     pub const fn reason(&self) -> TxRejection {
@@ -306,6 +319,13 @@ pub struct TxCounters {
     pub kick_errors: u64,
     /// Calls to [`RxFillEngine::drain`].
     pub drains: u64,
+    /// Frames of this engine sent out through another socket's TX ring
+    /// ([`RxFillEngine::submit_tx_through`]).
+    pub tx_lent: u64,
+    /// Such frames whose completion came back.
+    pub tx_lent_completed: u64,
+    /// Such submissions refused at [`RxFillEngine::tx_lent_limit`].
+    pub tx_lent_limited: u64,
     /// Frames currently published to TX and not completed.
     pub tx_inflight: u32,
     /// Peak of [`Self::tx_inflight`] over the engine lifetime.
@@ -337,6 +357,10 @@ pub(crate) struct InflightEntry {
     pub(super) address: u64,
     /// `polls` at submission.
     pub(super) stamp: u64,
+    /// The engine whose ledger `token` belongs to: this engine's own id,
+    /// or the id of the engine that sent the frame out through this one's
+    /// TX ring (`lend.rs`).
+    pub(super) home: u64,
 }
 
 /// Fixed-capacity, submission-ordered list of in-flight TX frames.
@@ -371,7 +395,7 @@ impl InflightFifo {
         (self.head + offset) % self.slots.len()
     }
 
-    fn push(&mut self, entry: InflightEntry) -> bool {
+    pub(super) fn push(&mut self, entry: InflightEntry) -> bool {
         if self.len == self.slots.len() {
             return false;
         }
@@ -389,11 +413,14 @@ impl InflightFifo {
         }
     }
 
-    /// Removes the entry of `token`; returns it and its offset from head.
-    fn remove(&mut self, token: FrameToken) -> Option<(InflightEntry, usize)> {
-        let offset = (0..self.len).find(|offset| {
-            self.slots[self.slot(*offset)].is_some_and(|entry| entry.token == token)
-        })?;
+    /// Removes the oldest entry `wanted` accepts; returns it and its offset
+    /// from head.
+    pub(super) fn remove(
+        &mut self,
+        wanted: impl Fn(&InflightEntry) -> bool,
+    ) -> Option<(InflightEntry, usize)> {
+        let offset = (0..self.len)
+            .find(|offset| self.slots[self.slot(*offset)].is_some_and(|entry| wanted(&entry)))?;
         let entry = self.slots[self.slot(offset)].take()?;
         if offset == 0 {
             self.head = self.slot(1);
@@ -574,7 +601,7 @@ impl EngineState<'_> {
 
     /// The TX ring entry of `handoff`: its address counts from the start of
     /// the UMEM, so the engine's `base` is added.
-    fn tx_descriptor(handoff: &TxHandoff, base: u64) -> XdpDescriptor {
+    pub(super) fn tx_descriptor(handoff: &TxHandoff, base: u64) -> XdpDescriptor {
         let descriptor = handoff.descriptor;
         XdpDescriptor {
             address: base + descriptor.frame_base() + u64::from(descriptor.data_offset()),
@@ -589,7 +616,9 @@ impl EngineState<'_> {
             .checked_sub(self.address_base)
             .filter(|local| *local < self.umem_len)
         else {
-            return Err(CompletionInvalidReason::AddressOutsideUmem);
+            // Not a frame of this part: one another engine sent out through
+            // this TX ring, or nothing this engine knows.
+            return self.complete_for_another(address);
         };
         let Ok(index) = u32::try_from(local / self.frame_size) else {
             return Err(CompletionInvalidReason::AddressOutsideUmem);
@@ -601,10 +630,15 @@ impl EngineState<'_> {
         let (FrameStateKind::TxOwnedByKernel, Some(token)) = (view.kind(), view.token()) else {
             return Err(CompletionInvalidReason::NotInFlight);
         };
-        let (entry, offset) = self
+        let own = self.engine_id;
+        let Some((entry, offset)) = self
             .inflight
-            .remove(token)
-            .expect("every TxOwnedByKernel frame is listed in flight");
+            .remove(|entry| entry.home == own && entry.token == token)
+        else {
+            // In flight on another socket's TX ring: its completion comes
+            // back through `complete_lent`, never on this ring.
+            return Err(CompletionInvalidReason::NotInFlight);
+        };
         self.tx_counters.tx_inflight = self.tx_counters.tx_inflight.saturating_sub(1);
         let generated = self.is_generated(index);
         if generated {
@@ -867,6 +901,7 @@ impl RxFillEngine<'_> {
                 token,
                 address,
                 stamp,
+                home: state.engine_id,
             });
             debug_assert!(pushed, "bounded by the in-flight allowance");
             published += 1;
@@ -1055,7 +1090,7 @@ impl RxFillEngine<'_> {
         let entry = self.state.inflight.oldest()?;
         self.state
             .inflight
-            .remove(entry.token)
+            .remove(|listed| listed.token == entry.token)
             .map(|(entry, _)| entry)
     }
 
@@ -1111,12 +1146,13 @@ mod fifo_tests {
                         token,
                         address: u64::from(token.frame().index()),
                         stamp,
+                        home: 1,
                     }));
                     model.push_back(token);
                 } else if !model.is_empty() {
                     let offset = next(model.len());
                     let token = model.remove(offset).expect("present");
-                    let (entry, found) = fifo.remove(token).expect("listed");
+                    let (entry, found) = fifo.remove(|entry| entry.token == token).expect("listed");
                     assert_eq!((entry.token, found), (token, offset));
                 }
                 assert_eq!(fifo.len(), model.len());
@@ -1130,7 +1166,7 @@ mod fifo_tests {
             }
             // A token that is not listed is not found.
             if let Some(absent) = pool.iter().find(|token| !model.contains(token)) {
-                assert!(fifo.remove(*absent).is_none());
+                assert!(fifo.remove(|entry| entry.token == *absent).is_none());
             }
         }
     }

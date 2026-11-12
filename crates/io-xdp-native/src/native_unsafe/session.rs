@@ -404,6 +404,8 @@ pub(super) struct SessionCore<'s, S: MapsRealMemory> {
     mtu: u32,
     /// Process-unique identity stamped into the datapath bundle.
     origin: u64,
+    /// The origin of the session that registered the UMEM this one uses.
+    umem_id: u64,
     mode: NegotiatedMode,
     zero_copy_fallback: bool,
     datapath: DatapathAccess,
@@ -737,6 +739,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         }
         .ok_or(out_of_range(SessionStage::MapUmem))?;
 
+        let origin = crate::datapath::next_origin();
         Ok(Self {
             xdp: None,
             tx,
@@ -750,7 +753,11 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             ifindex,
             queue: config.queue(),
             mtu: 0,
-            origin: crate::datapath::next_origin(),
+            origin,
+            umem_id: match source {
+                UmemSource::Own { .. } => origin,
+                UmemSource::Shared(owner) => owner.umem_id,
+            },
             mode,
             zero_copy_fallback: false,
             datapath: DatapathAccess::Untouched,
@@ -818,6 +825,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
             umem,
             umem_config: self.umem_config,
             address_base,
+            umem_id: self.umem_id,
             kick,
             origin: self.origin,
         }))

@@ -158,6 +158,9 @@ pub(crate) struct ScriptedKernel {
     /// Where this socket's part starts in the UMEM it shares: every ring
     /// address the script reads or writes counts from the UMEM's start.
     address_base: Cell<u64>,
+    /// The UMEM this socket's part belongs to; its own origin unless
+    /// `sharing_umem_of` joined another kernel's.
+    umem_id: Cell<u64>,
     taken: Cell<bool>,
     held: RefCell<Vec<bool>>,
     tx_held: RefCell<Vec<bool>>,
@@ -203,6 +206,7 @@ impl ScriptedKernel {
             completion_entries: completion,
             umem_config: umem,
             address_base: Cell::new(0),
+            umem_id: Cell::new(0),
             taken: Cell::new(false),
             held: RefCell::new(vec![false; umem.frame_count() as usize]),
             tx_held: RefCell::new(vec![false; umem.frame_count() as usize]),
@@ -223,6 +227,13 @@ impl ScriptedKernel {
         assert_eq!(base % u64::from(self.umem_config.frame_size()), 0);
         self.address_base.set(base);
         self
+    }
+
+    /// The same kernel as another socket of the UMEM `first` registered,
+    /// with its part at `base`.
+    pub(crate) fn sharing_umem_of(self, first: &Self, base: u64) -> Self {
+        self.umem_id.set(first.origin);
+        self.at_base(base)
     }
 
     /// Lends the application side as one bundle, at most once, exactly as
@@ -261,6 +272,10 @@ impl ScriptedKernel {
             umem,
             umem_config: self.umem_config,
             address_base: self.address_base.get(),
+            umem_id: match self.umem_id.get() {
+                0 => self.origin,
+                shared => shared,
+            },
             kick: SocketKick::new(KickTarget::Kernel(self)),
             origin: self.origin,
         }))
