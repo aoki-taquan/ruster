@@ -1092,6 +1092,38 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
     let Some(_device) = requested(Some("adapter")) else {
         return;
     };
+    // Each port with its own UMEM (a forwarded frame is copied), then both
+    // on one (the egress socket transmits the ingress socket's frame).
+    adapter_forwards(false);
+    adapter_forwards(true);
+    eprintln!(
+        "priv_xdp_adapter: a frame from veth A was forwarded by core through the adapter, \
+         copied into port B's generated pool with a UMEM per port and transmitted from its own \
+         frame with one shared UMEM, sent on veth B with the rewritten MACs and TTL, received \
+         by B's peer, a 60-frame burst completed without more traffic, a link flap on B \
+         recovered to a ready quiescence, and both ports drained verified"
+    );
+}
+
+/// Opens port B on the UMEM of port A's session, retrying the transient
+/// bind EBUSY like [`open_after_release`].
+fn open_sharing_after_release(owner: &NativeSession, config: &SessionConfig) -> NativeSession {
+    for _ in 0..100 {
+        match owner.open_sharing(config) {
+            Ok(session) => return session,
+            Err(error)
+                if (error.stage(), error.failure())
+                    == (SessionStage::Bind, SessionFailure::Busy) =>
+            {
+                sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("joining the UMEM failed: {error:?}"),
+        }
+    }
+    panic!("queue still busy one second after teardown");
+}
+
+fn adapter_forwards(shared: bool) {
     let port_a = required("RUSTER_PRIV_XDP_FWD_A");
     let peer_a = required("RUSTER_PRIV_XDP_FWD_A_PEER");
     let port_b = required("RUSTER_PRIV_XDP_FWD_B");
@@ -1106,8 +1138,13 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
     );
     let lan = IfId(1);
     let wan = IfId(2);
-    let mut session_a = open_after_release(&adapter_session_config(&port_a));
-    let mut session_b = open_after_release(&adapter_session_config(&port_b));
+    let room = if shared { FRAME_COUNT as u32 } else { 0 };
+    let mut session_a = open_after_release_with_room(&adapter_session_config(&port_a), room);
+    let mut session_b = if shared {
+        open_sharing_after_release(&session_a, &adapter_session_config(&port_b))
+    } else {
+        open_after_release(&adapter_session_config(&port_b))
+    };
     for session in [&mut session_a, &mut session_b] {
         assert_eq!(session.mode(), NegotiatedMode::Copy);
         assert_eq!(session.mtu(), 1_500, "veth default MTU from sysfs");
@@ -1164,7 +1201,11 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
         let original = forward_frame(mac_a);
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut sent = 0_u32;
-        while io.port_stats(wan).expect("WAN").counters.cross_port_copies == 0 {
+        let carried = |io: &XdpPacketIo<'_>| {
+            let counters = io.port_stats(wan).expect("WAN").counters;
+            counters.cross_port_copies + counters.cross_port_in_place
+        };
+        while carried(&io) == 0 {
             if sent < 50 {
                 let status = Command::new("python3")
                     .args(["-I", "-c", RAW_SEND, &peer_a, &hex(&original)])
@@ -1212,7 +1253,15 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
         assert_eq!(stats.ports, 2);
         assert_eq!(stats.copy_ports, 2);
         let wan_stats = io.port_stats(wan).expect("WAN");
-        assert!(wan_stats.counters.cross_port_copies >= 1, "{wan_stats:?}");
+        let (copies, in_place) = (
+            wan_stats.counters.cross_port_copies,
+            wan_stats.counters.cross_port_in_place,
+        );
+        if shared {
+            assert!(in_place >= 1 && copies == 0, "{wan_stats:?}");
+        } else {
+            assert!(copies >= 1 && in_place == 0, "{wan_stats:?}");
+        }
         assert!(wan_stats.counters.tx_kicks >= 1, "{wan_stats:?}");
         assert!(
             wan_stats.tx_need_wakeup,
@@ -1313,20 +1362,15 @@ fn priv_xdp_adapter_forwards_between_two_veth_ports_through_core_and_drains() {
         }
         assert!(matches!(io.receive(1), Err(XdpIoError::Stopped)));
         eprintln!(
-            "priv_xdp_adapter: {} raw frames sent, {} cross-port copies, {} completed before the drain",
-            sent, wan_stats.counters.cross_port_copies, wan_stats.counters.tx_completed
+            "priv_xdp_adapter: shared UMEM {shared}: {sent} raw frames sent, {copies} copied, \
+             {in_place} sent from their own frame, {} completed before the drain",
+            wan_stats.counters.tx_completed
         );
     }
     session_a.close().expect("port A teardown");
     session_b.close().expect("port B teardown");
     wait_detached(&port_a);
     wait_detached(&port_b);
-    eprintln!(
-        "priv_xdp_adapter: a frame from veth A was forwarded by core through the adapter, \
-         copied into port B's generated pool, transmitted on veth B with the rewritten MACs and \
-         TTL, received by B's peer, a 60-frame burst completed without more traffic, a link \
-         flap on B recovered to a ready quiescence, and both ports drained verified"
-    );
 }
 
 /// Sends one raw frame (argv[2], hex) on `argv[1]` after `argv[3]` seconds.

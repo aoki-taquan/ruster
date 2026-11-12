@@ -455,6 +455,31 @@ impl ScriptedKernel {
         }
     }
 
+    /// Kernel-reads bytes of a frame of this part that another socket of
+    /// the UMEM is transmitting: this script does not hold it, the engine's
+    /// ledger records it as with the kernel all the same.
+    pub(crate) fn read_umem_sent_elsewhere(&self, address: u64, out: &mut [u8]) {
+        let frame = self.frame_of(address).expect("address inside this part");
+        let offset = address - self.address_base.get();
+        let frame_size = u64::from(self.umem_config.frame_size());
+        assert!(
+            offset + out.len() as u64 <= (frame as u64 + 1) * frame_size,
+            "range crosses its frame"
+        );
+        let offset = usize::try_from(offset).expect("test offset");
+        // SAFETY: the range lies inside the allocation and inside one
+        // frame. The caller reads it only between the TX descriptor naming
+        // it and its completion, while the engine's ledger records the
+        // frame as `TxOwnedByKernel` and lends it to no one.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.umem.base.as_ptr().add(offset),
+                out.as_mut_ptr(),
+                out.len(),
+            );
+        }
+    }
+
     /// The process address of UMEM byte `offset`, as a lent slice's
     /// `as_ptr().addr()` reports it (identity only, never dereferenced).
     pub(crate) fn umem_address(&self, offset: u64) -> usize {

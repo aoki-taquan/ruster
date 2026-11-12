@@ -30,7 +30,8 @@ pub struct Options {
     pub zero_copy: bool,
 }
 
-/// Opens one socket on queue 0 of each device and attaches the XDP program.
+/// Opens one socket on queue 0 of each device, all on one UMEM where the devices
+/// allow it, and attaches the XDP program.
 pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeSession>, String> {
     let mode = if options.zero_copy {
         XDP_ZEROCOPY
@@ -50,11 +51,45 @@ pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeS
         0,
     )
     .map_err(bad)?;
-    let mut sessions = Vec::with_capacity(devices.len());
+    let mut sessions: Vec<NativeSession> = Vec::with_capacity(devices.len());
+    // The first port registers a UMEM with room for the frames of every
+    // other port, so a frame received on one goes out of another without a
+    // copy. A port that cannot join it gets its own.
+    let room = u32::try_from(devices.len().saturating_sub(1))
+        .ok()
+        .and_then(|others| others.checked_mul(FRAME_COUNT))
+        .ok_or("too many devices")?;
     for device in devices {
         let config = SessionConfig::new(device, 0, bind_flags, rings, umem)
             .map_err(|error| format!("{device}: {error:?}"))?;
-        let mut session = open_retrying(&config).map_err(|error| format!("{device}: {error:?}"))?;
+        let joined = match sessions.first() {
+            Some(first) => match open_retrying(|| first.open_sharing(&config)) {
+                Ok(session) => Some(session),
+                // Anything else (a queue still busy, no memory) would fail
+                // an own UMEM too, or pass and leave the port copying for
+                // good: the start fails instead.
+                Err(error) if !cannot_share(error) => {
+                    return Err(format!("{device}: {error:?}"));
+                }
+                Err(error) => {
+                    eprintln!(
+                        "ruster-fe: {device} does not share the packet memory of {} \
+                         ({error:?}); packets between them are copied",
+                        devices[0]
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+        let mut session = match joined {
+            Some(session) => session,
+            None => {
+                let room = if sessions.is_empty() { room } else { 0 };
+                open_retrying(|| NativeSession::open_with_room(&config, room))
+                    .map_err(|error| format!("{device}: {error:?}"))?
+            }
+        };
         session
             .attach_xdp(options.attach)
             .map_err(|error| format!("{device}: attaching XDP: {error:?}"))?;
@@ -63,15 +98,33 @@ pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeS
     Ok(sessions)
 }
 
+/// Whether a failed join means that this device cannot use the first one's UMEM
+/// at all: its frames do not fit it, its driver cannot run in the UMEM's mode, or
+/// the kernel does not share a UMEM between devices (before Linux 5.10).
+fn cannot_share(error: SessionError) -> bool {
+    matches!(
+        (error.stage(), error.failure()),
+        (SessionStage::ShareUmem, _)
+            | (
+                SessionStage::Bind,
+                SessionFailure::ZeroCopyUnsupported
+                    | SessionFailure::Unsupported
+                    | SessionFailure::InvalidArgument
+            )
+    )
+}
+
 /// Opens a session, trying again for a while when the failure can be transient: a
 /// previous FE's socket on the same queue (or its UMEM accounting) that Linux has
 /// not released yet right after it stopped.
-fn open_retrying(config: &SessionConfig) -> Result<NativeSession, SessionError> {
+fn open_retrying(
+    open: impl Fn() -> Result<NativeSession, SessionError>,
+) -> Result<NativeSession, SessionError> {
     const ATTEMPTS: u32 = 20;
     const WAIT: std::time::Duration = std::time::Duration::from_millis(100);
     let mut attempt = 1;
     loop {
-        match NativeSession::open(config) {
+        match open() {
             Err(error)
                 if attempt < ATTEMPTS
                     && matches!(
