@@ -492,7 +492,8 @@ impl FrameAccounting {
 /// Whether a drain returned every TX frame.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DrainOutcome {
-    /// No frame is in flight on TX. Frames still published to Fill
+    /// No frame is in flight on TX, on this socket or (lent) on another
+    /// one. Frames still published to Fill
     /// ([`FrameAccounting::fill_in_kernel`]) stay with the kernel until it
     /// returns them on RX or the socket closes; that is expected at
     /// shutdown and not reported as a failure.
@@ -637,6 +638,10 @@ impl EngineState<'_> {
         else {
             // In flight on another socket's TX ring: its completion comes
             // back through `complete_lent`, never on this ring.
+            assert!(
+                self.lent > 0,
+                "every TxOwnedByKernel frame is listed in flight or lent"
+            );
             return Err(CompletionInvalidReason::NotInFlight);
         };
         self.tx_counters.tx_inflight = self.tx_counters.tx_inflight.saturating_sub(1);
@@ -1067,7 +1072,8 @@ impl RxFillEngine<'_> {
         }
         let accounting = self.state.accounting();
         let generated_accounting = self.state.generated_accounting();
-        let outcome = match self.tx_inflight() {
+        // Frames this engine lent are not back until `complete_lent`.
+        let outcome = match self.tx_inflight() + self.state.lent {
             0 => DrainOutcome::Drained,
             frames => DrainOutcome::TxInFlight { frames },
         };

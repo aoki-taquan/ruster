@@ -271,15 +271,14 @@ fn a_drain_reaps_lent_frames_and_they_still_return_home() {
         (report.outcome(), report.completed()),
         (DrainOutcome::Drained, 1)
     );
-    // A drains with its frame still on the way back, then gets it.
+    // A is not drained while its frame is on the way back.
     assert_eq!(
-        a.drain(1).expect("drain").accounting().tx_in_flight,
-        1,
-        "the lent frame is still the kernel's"
+        a.drain(1).expect("drain").outcome(),
+        DrainOutcome::TxInFlight { frames: 1 }
     );
     a.complete_lent(b.take_lent_completion().expect("one completion"))
         .expect("home");
-    assert_eq!(a.drain(1).expect("drain").accounting().tx_in_flight, 0);
+    assert_eq!(a.drain(1).expect("drain").outcome(), DrainOutcome::Drained);
     audit(&a);
     audit(&b);
 }

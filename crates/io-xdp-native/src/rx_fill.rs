@@ -732,8 +732,10 @@ impl EngineState<'_> {
 pub struct RxFillEngine<'memory> {
     fill: FillProducer<'memory>,
     rx: RxConsumer<'memory>,
-    /// Owned by the engine alone: no one else can submit a TX descriptor
-    /// naming a frame of this ledger.
+    /// Owned by the engine alone. A descriptor naming a frame of this
+    /// ledger is written here, or to the TX ring of another engine of the
+    /// same UMEM by `submit_tx_through`; either way only after this ledger
+    /// moved the frame to the kernel.
     tx: TxProducer<'memory>,
     completion: CompletionConsumer<'memory>,
     kick: SocketKick<'memory>,
