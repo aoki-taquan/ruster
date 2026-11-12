@@ -279,7 +279,9 @@ gatewayの集合も、経路を足し引きするたびに保つ（`Ipv4Routes`�
    - socketが他のsocketのUMEMの区画を使えるようにする（済み）。
    - 同じUMEMのポートの間では、受信したbufferをそのまま出口のポートから送る（済み）。FEは最初のポートで
      全ポート分のUMEMを登録し、残りはそこに参加する。参加できないポートは自分のUMEMで開く。
-   - queueごとに受信と送信を持つ。XDPのプログラムは、queueごとのsocketへ回す。
+   - 一つのNICの複数のqueueにsocketを付ける。XDPのプログラムはNICに一つで、queueごとのsocketへ回す（済み）。
+   - socketを開いた後で別のスレッドへ渡せるようにする。socketは起動時にまとめて開き、worker iには
+     全NICのqueue iのsocketを渡す。アダプタは今の作り（NICごとに一つのsocket）のまま、workerごとに一つ持つ。
 2. 「受け渡し」（CEのsocketとTUNの読み書き）をworkerから分ける。
 3. 表の版を全部のworkerへ届ける。全workerが移ってから、古い版を解放してCEへ応答する。
    カウンタはworkerごとに持ち、制御が足す。

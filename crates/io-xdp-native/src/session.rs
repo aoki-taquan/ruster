@@ -406,7 +406,8 @@ pub enum XdpAttachMode {
 pub enum AttachStage {
     /// Checks before any syscall: not already attached, mode compatible.
     Precondition,
-    /// `BPF_MAP_CREATE` of a `BPF_MAP_TYPE_XSKMAP` with `queue + 1` slots.
+    /// `BPF_MAP_CREATE` of a `BPF_MAP_TYPE_XSKMAP` with `queue + 1` slots,
+    /// or as many as the queues the program is attached for.
     CreateMap,
     /// `BPF_PROG_LOAD` of the `BPF_PROG_TYPE_XDP` redirect program.
     LoadProgram,
@@ -425,6 +426,10 @@ pub enum AttachFailure {
     AlreadyAttached,
     /// Generic XDP was requested for a zero-copy session.
     GenericRequiresCopyMode,
+    /// The session to join has no attached program.
+    NotAttached,
+    /// The session to join is bound to another interface.
+    OtherInterface,
     /// `EBUSY` or `EEXIST` from `BPF_LINK_CREATE`: another XDP program or
     /// link is attached to the interface in the requested mode or in the
     /// other of native/generic mode, or (Linux 5.15+) to an upper device.

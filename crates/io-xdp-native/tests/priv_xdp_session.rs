@@ -1373,6 +1373,150 @@ fn adapter_forwards(shared: bool) {
     wait_detached(&port_b);
 }
 
+/// Sends one raw frame (argv[2], hex) on `argv[1]` from CPU `argv[3]`.
+const PINNED_RAW_SEND: &str = r"
+import os, socket, sys
+os.sched_setaffinity(0, {int(sys.argv[3])})
+s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+s.bind((sys.argv[1], 0))
+s.send(bytes.fromhex(sys.argv[2]))
+";
+
+/// Marks the frames of the queues phase; the next byte is the sender's queue.
+const QUEUE_MARKER: &[u8] = b"ruster-queue-";
+
+/// Two sockets on the two queues of one device, sharing one UMEM and one
+/// XDP program: each receives exactly the frames of its own queue.
+#[test]
+fn priv_xdp_queues_each_get_the_frames_of_their_own_queue() {
+    let Some(_device) = requested(Some("queues")) else {
+        return;
+    };
+    let device = required("RUSTER_PRIV_XDP_MQ");
+    let peer = required("RUSTER_PRIV_XDP_MQ_PEER");
+    assert_eq!(attached_program(&device), None, "veth starts without XDP");
+
+    // veth hands a frame sent on the peer's TX queue n to RX queue n of the
+    // device. XPS picks the peer's TX queue by the sending CPU, so a sender
+    // pinned to one of two CPUs chooses the queue.
+    let output = Command::new("python3")
+        .args([
+            "-I",
+            "-c",
+            "import os; print(*sorted(os.sched_getaffinity(0))[:2])",
+        ])
+        .output()
+        .expect("list the allowed CPUs");
+    let cpus: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(|cpu| cpu.parse().expect("CPU number"))
+        .collect();
+    assert_eq!(cpus.len(), 2, "the queues phase needs two CPUs");
+    for (queue, cpu) in cpus.iter().enumerate() {
+        // One bit per CPU, in comma-separated 32-bit hex words.
+        let mut mask = format!("{:x}", 1_u32 << (cpu % 32));
+        for _ in 0..cpu / 32 {
+            mask.push_str(",00000000");
+        }
+        fs::write(
+            format!("/sys/class/net/{peer}/queues/tx-{queue}/xps_cpus"),
+            mask,
+        )
+        .expect("set XPS on the peer");
+    }
+
+    let frames = FRAME_COUNT as u32;
+    let mut first = open_after_release_with_room(&session_config(&device, 0, XDP_COPY), frames);
+    let mut second = open_sharing_after_release(&first, &session_config(&device, 1, 0));
+    first
+        .attach_xdp_queues(XdpAttachMode::Native, 2)
+        .expect("native attach for two queues");
+    // A socket of another interface has no place in this program.
+    let mut other = open_after_release(&session_config(
+        &required("RUSTER_PRIV_XDP_ASYM_DEVICE"),
+        0,
+        XDP_COPY,
+    ));
+    let error = other.join_xdp(&first).expect_err("another interface");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (AttachStage::Precondition, AttachFailure::OtherInterface)
+    );
+    other.close().expect("clean teardown");
+    second.join_xdp(&first).expect("queue 1 joins the program");
+    assert_eq!(second.xdp_attach_mode(), Some(XdpAttachMode::Native));
+
+    let frame = |queue: u8| {
+        let mut bytes = vec![0xff_u8; 6];
+        bytes.extend_from_slice(&[0x02, 0, 0, 0, 0, 0x99]);
+        // An EtherType for local experiments: nothing else sends it.
+        bytes.extend_from_slice(&[0x88, 0xb5]);
+        bytes.extend_from_slice(QUEUE_MARKER);
+        bytes.push(queue);
+        bytes.resize(60, 0);
+        bytes
+    };
+    {
+        let mut engines = [engine(&mut first, 0x5471), engine(&mut second, 0x5472)];
+        // `seen[socket][sender]`: marked frames socket `socket` received
+        // from the sender pinned for queue `sender`.
+        let mut seen = [[0_u32; 2]; 2];
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while seen[0][0] == 0 || seen[1][1] == 0 {
+            for (queue, cpu) in cpus.iter().enumerate() {
+                let status = Command::new("python3")
+                    .args([
+                        "-I",
+                        "-c",
+                        PINNED_RAW_SEND,
+                        &peer,
+                        &hex(&frame(queue as u8)),
+                        &cpu.to_string(),
+                    ])
+                    .status()
+                    .expect("run the pinned sender");
+                assert!(status.success(), "pinned sender failed");
+            }
+            sleep(Duration::from_millis(20));
+            for (socket, engine) in engines.iter_mut().enumerate() {
+                let mut batch = engine.poll(64).expect("poll");
+                while let Some(received) = batch.next_frame() {
+                    let bytes = received.bytes();
+                    if let Some(at) = bytes
+                        .windows(QUEUE_MARKER.len())
+                        .position(|window| window == QUEUE_MARKER)
+                    {
+                        seen[socket][usize::from(bytes[at + QUEUE_MARKER.len()])] += 1;
+                    }
+                    received.recycle();
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "both queues did not receive within ten seconds: {seen:?}"
+            );
+        }
+        assert_eq!(
+            (seen[0][1], seen[1][0]),
+            (0, 0),
+            "a frame reached the socket of another queue: {seen:?}"
+        );
+        for engine in &engines {
+            engine.audit().expect("engine audit");
+        }
+        eprintln!("priv_xdp_queues: frames by socket and sending queue {seen:?}");
+    }
+    // The joined session goes first; the program is the first one's.
+    second.close().expect("queue 1 teardown");
+    assert!(attached_program(&device).is_some());
+    first.close().expect("queue 0 teardown");
+    wait_detached(&device);
+    eprintln!(
+        "priv_xdp_queues: two sockets on two queues of one device with one UMEM and one \
+         program each received the frames of their own queue only verified"
+    );
+}
+
 /// Sends one raw frame (argv[2], hex) on `argv[1]` after `argv[3]` seconds.
 const DELAYED_RAW_SEND: &str = r"
 import socket, sys, time
