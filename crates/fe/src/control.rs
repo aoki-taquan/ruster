@@ -130,8 +130,11 @@ impl Controls {
         max: usize,
         refused: &mut u64,
     ) -> Vec<Vec<u8>> {
-        let mut buf = vec![0_u8; max + 1];
         let mut got = Vec::new();
+        if self.list.is_empty() {
+            return got;
+        }
+        let mut buf = vec![0_u8; max + 1];
         for control in &self.list {
             for _ in 0..per_process {
                 match control.socket.recv_from(&mut buf) {

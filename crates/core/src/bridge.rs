@@ -423,6 +423,9 @@ impl MacTable {
     /// Looks at up to `budget` slots, from where the last call stopped, and removes the
     /// learned entries past their age.
     pub fn age(&mut self, now_ms: u64, budget: usize) {
+        if self.len == 0 {
+            return;
+        }
         for _ in 0..budget.min(self.slots.len()) {
             let at = self.sweep;
             let slot = self.slots[at];

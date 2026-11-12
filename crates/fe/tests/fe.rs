@@ -4856,3 +4856,57 @@ fn a_change_refused_after_its_tables_were_built_does_not_stay_in_the_routes_kept
     assert_eq!(tx.egress, IfId(2));
     assert_eq!(&tx.bytes[0..6], &server_mac);
 }
+
+/// How long one step of the FE takes with a two-port router's tables, without
+/// packets and with batches of forwarded packets. The time around `step` only:
+/// putting the packets into `SimIo` and taking them out is not counted.
+///
+/// Release timing, run on demand:
+/// `cargo test --release -p ruster-fe --test fe step_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "timing report, not a pass/fail test"]
+fn step_timing_without_packets_and_with_batches() {
+    use std::time::{Duration, Instant};
+
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(code, Code::CHANGED);
+
+    const ROUNDS: u32 = 200_000;
+    let frame = udp_from_host(INTERNET);
+    let report = |bench: &mut Bench, what: &str| {
+        let started = Instant::now();
+        for _ in 0..ROUNDS {
+            bench.fe.step(0);
+        }
+        let empty = started.elapsed() / ROUNDS;
+        println!("{what}, a step without packets: {empty:?}");
+        for batch in [1_u32, 8, 32] {
+            let rounds = 100_000 / batch;
+            let mut spent = Duration::ZERO;
+            for _ in 0..rounds {
+                for _ in 0..batch {
+                    bench.fe.io_mut().inject(IfId(0), frame.clone());
+                }
+                let started = Instant::now();
+                bench.fe.step(0);
+                spent += started.elapsed();
+                for _ in 0..batch {
+                    assert!(bench.fe.io_mut().pop_tx().is_some(), "forwarded");
+                }
+            }
+            let step = spent / rounds;
+            println!(
+                "{what}, a step with {batch:>2} packets: {step:?}, {:?} for each packet",
+                step / batch
+            );
+        }
+    };
+    // As `--one-thread` runs it: the connections are read in the same step.
+    report(&mut bench, "with the connections");
+    // As it runs by default: the control task is another thread's.
+    let _control = bench.fe.detach_control().expect("the control task");
+    report(&mut bench, "the worker alone");
+}

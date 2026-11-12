@@ -418,7 +418,11 @@ impl Server {
                     Ok(None) | Err(ConnError::Frame(_) | ConnError::Io(_)) => break,
                 }
             }
-            busy |= self.peers[index].conn.pump().unwrap_or(false);
+            // Again only to send what the requests above answered: with nothing
+            // to send, a second read would find what the next step reads anyway.
+            if self.peers[index].conn.backlog() > 0 {
+                busy |= self.peers[index].conn.pump().unwrap_or(false);
+            }
             busy |= self.peers[index].conn.take_more();
             if self.peers[index].conn.is_closed() {
                 self.peers.swap_remove(index);

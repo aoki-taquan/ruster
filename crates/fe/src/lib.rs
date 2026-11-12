@@ -1275,7 +1275,7 @@ where
             return routed;
         }
         // One byte more than taken, to see a frame that was cut short.
-        let mut buf = vec![0_u8; PUNT_MAX + 1];
+        let mut buf = [0_u8; PUNT_MAX + 1];
         let names: Vec<String> = self.taps.keys().cloned().collect();
         for name in names {
             let id =
@@ -1402,7 +1402,7 @@ where
         // The neighbor process's come after the others'.
         let others = frames.len();
         // One byte more than accepted, to see a datagram that was cut short.
-        let mut buf = vec![0_u8; PUNT_MAX + 1];
+        let mut buf = [0_u8; PUNT_MAX + 1];
         let neighbor = self.punt.as_ref().map_or(0, |_| INJECT_PER_STEP);
         for _ in 0..neighbor {
             let Some(socket) = &self.punt else {
@@ -1511,8 +1511,11 @@ where
     /// The packets the kernel wrote to each VRF's pipe, as frames from its kernel
     /// interface.
     fn read_kernel(&self) -> Vec<kernel::Frame> {
-        let mut buf = vec![0_u8; PUNT_MAX];
         let mut frames = Vec::new();
+        if self.local.is_empty() {
+            return frames;
+        }
+        let mut buf = [0_u8; PUNT_MAX];
         for (at, name) in self.names.iter().enumerate() {
             let (Some(pipe), Some(&ingress)) = (self.local.get(name), self.kernel.get(at)) else {
                 continue;
