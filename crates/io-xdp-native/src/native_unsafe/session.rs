@@ -603,6 +603,12 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
                         SessionFailure::SharedUmemGeometry,
                     ));
                 }
+                if owner.umem.raw_lent() {
+                    return Err(fail(
+                        SessionStage::ShareUmem,
+                        SessionFailure::SharedUmemRawRings,
+                    ));
+                }
                 if owner.umem.room() < part_len {
                     return Err(fail(
                         SessionStage::ShareUmem,
@@ -757,6 +763,9 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     pub(super) fn rings(&mut self) -> Result<NativeRings<'_>, RingsError> {
         if self.datapath == DatapathAccess::Taken {
             return Err(RingsError::DatapathTaken);
+        }
+        if !self.umem.lend_raw() {
+            return Err(RingsError::SharedUmem);
         }
         self.datapath = DatapathAccess::RawLent;
         self.raw_views().map_err(RingsError::Map)
@@ -1153,7 +1162,17 @@ impl NativeSession {
     ///
     /// A failed open takes nothing from the room. Each session is closed on
     /// its own, in any order; the UMEM memory is unmapped with the last of
-    /// them.
+    /// them (only that close can report a failed unmap). The part of a
+    /// closed session is not handed out again. Every session of a UMEM must
+    /// be opened before the datapath of the one they join is taken, because
+    /// the engine then keeps that session borrowed.
+    ///
+    /// Raw ring views ([`Self::rings`]) can name any frame of the UMEM, so
+    /// they and sharing exclude each other: a session whose UMEM has more
+    /// than one part lends none
+    /// ([`RingsError::SharedUmem`](crate::RingsError::SharedUmem)), and a
+    /// session that lent them is not joined
+    /// ([`SessionFailure::SharedUmemRawRings`](crate::SessionFailure::SharedUmemRawRings)).
     pub fn open_sharing(&self, config: &SessionConfig) -> Result<Self, SessionError> {
         self.core.open_sharing(config).map(|core| Self {
             core,

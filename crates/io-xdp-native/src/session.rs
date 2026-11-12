@@ -335,6 +335,8 @@ pub enum SessionFailure {
     SharedUmemGeometry,
     /// The UMEM the session joins has too little room left for its frames.
     SharedUmemFull,
+    /// Raw ring views were lent on the UMEM the session would join.
+    SharedUmemRawRings,
     /// The negotiated mode differs from the explicitly bound copy policy,
     /// or from the mode of the UMEM the session joined.
     NegotiatedModeMismatch {

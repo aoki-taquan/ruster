@@ -24,7 +24,11 @@
 //! lent. When several sockets share one registered UMEM, each session holds
 //! its own part of the mapping (`RegionPart`: the parts never overlap), the
 //! mapping here is that part alone, and the engine refuses every ring
-//! address outside it, so the same argument holds per part. A kernel that
+//! address outside it. The kernel accepts any address of the UMEM on any of
+//! its sockets, so the argument also needs every other socket of the UMEM
+//! to be driven by its own engine: a UMEM with more than one part never
+//! lends raw ring views, and one that lent them gets no second part
+//! (`RegionPart::lend_raw`). A kernel that
 //! keeps writing a frame after returning it violates the AF_XDP contract.
 
 use std::{fmt, marker::PhantomData, ptr::NonNull};

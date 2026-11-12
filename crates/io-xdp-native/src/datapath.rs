@@ -213,6 +213,9 @@ impl Error for DatapathError {}
 pub enum RingsError {
     /// The datapath bundle was taken; raw views would alias the engine.
     DatapathTaken,
+    /// Other sessions use parts of this session's UMEM; raw views could
+    /// publish their frames.
+    SharedUmem,
     /// A ring view could not be bound to its mapping.
     Map(RingMapError),
 }

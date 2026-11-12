@@ -2202,3 +2202,42 @@ fn native_session_join_must_fit_the_umem_and_come_out_in_its_mode() {
         }
     );
 }
+
+#[test]
+fn native_session_raw_rings_and_a_shared_umem_exclude_each_other() {
+    // Raw views first: nothing joins afterwards, also after they ended.
+    let fake = SessionFake::new();
+    let mut owner = SessionCore::open_with_room(&fake, &config(XDP_COPY), 129).expect("owner");
+    assert!(owner.rings().is_ok(), "raw views of the only part");
+    let error = owner
+        .open_sharing(&config(XDP_COPY))
+        .map(|_| ())
+        .expect_err("raw views were lent");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (SessionStage::ShareUmem, SessionFailure::SharedUmemRawRings)
+    );
+    drop(owner);
+    fake.assert_released();
+
+    // A second part first: neither session lends raw views, also after the
+    // other one closed.
+    let fake = SessionFake::new();
+    let mut owner = SessionCore::open_with_room(&fake, &config(XDP_COPY), 129).expect("owner");
+    let mut joined = owner.open_sharing(&config(XDP_COPY)).expect("joined");
+    assert_eq!(
+        owner.rings().map(|_| ()),
+        Err(crate::RingsError::SharedUmem)
+    );
+    assert_eq!(
+        joined.rings().map(|_| ()),
+        Err(crate::RingsError::SharedUmem)
+    );
+    drop(joined);
+    assert_eq!(
+        owner.rings().map(|_| ()),
+        Err(crate::RingsError::SharedUmem)
+    );
+    // The datapath is still there for the engine.
+    assert!(owner.take_datapath().is_ok());
+}
