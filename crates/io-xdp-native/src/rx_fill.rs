@@ -559,6 +559,10 @@ struct EngineState<'memory> {
     frame_size: u64,
     headroom: u64,
     umem_len: u64,
+    /// Where this engine's frames start in the registered UMEM. Addresses
+    /// on the four rings count from the start of the UMEM; everything else
+    /// here counts from the start of the engine's own part.
+    address_base: u64,
 }
 
 /// What happens to the frame of a refused descriptor.
@@ -579,11 +583,17 @@ impl EngineState<'_> {
     ///
     /// On failure the [`Refusal`] says what happens to the frame.
     fn classify(&self, raw: XdpDescriptor) -> Classified {
-        if raw.address >= self.umem_len {
+        // Below the base or past the end: a frame of another part of a
+        // shared UMEM, or of none.
+        let Some(address) = raw
+            .address
+            .checked_sub(self.address_base)
+            .filter(|address| *address < self.umem_len)
+        else {
             return Err((RxInvalidReason::AddressOutsideUmem, Refusal::Untouched));
-        }
-        let frame_base = raw.address & !(self.frame_size - 1);
-        let Ok(index) = u32::try_from(raw.address / self.frame_size) else {
+        };
+        let frame_base = address & !(self.frame_size - 1);
+        let Ok(index) = u32::try_from(address / self.frame_size) else {
             return Err((RxInvalidReason::AddressOutsideUmem, Refusal::Untouched));
         };
         let ledger = self.frames.ledger();
@@ -597,7 +607,7 @@ impl EngineState<'_> {
         if raw.options != 0 {
             return quarantine(RxInvalidReason::UnsupportedOptions);
         }
-        let offset = raw.address - frame_base;
+        let offset = address - frame_base;
         if offset < self.headroom {
             return quarantine(RxInvalidReason::DataBeforeHeadroom);
         }
@@ -613,7 +623,7 @@ impl EngineState<'_> {
             ));
         }
         match ledger.layout().validate_descriptor(RawDescriptor {
-            addr: raw.address,
+            addr: address,
             len: raw.len,
             options: raw.options,
         }) {
@@ -745,6 +755,7 @@ impl<'memory> RxFillEngine<'memory> {
             tx,
             umem,
             umem_config: geometry,
+            address_base,
             kick,
             origin,
         } = datapath.into_parts();
@@ -806,6 +817,7 @@ impl<'memory> RxFillEngine<'memory> {
             frame_size: u64::from(geometry.frame_size()),
             headroom: u64::from(headroom),
             umem_len: geometry.byte_len(),
+            address_base,
         };
         let mut engine = Self {
             fill,
@@ -967,7 +979,7 @@ impl<'memory> RxFillEngine<'memory> {
         };
         for slot in &state.scratch[..reserved] {
             let token = slot.expect("reserved prefix");
-            let address = u64::from(token.frame().index()) * state.frame_size;
+            let address = state.address_base + u64::from(token.frame().index()) * state.frame_size;
             if let Err(error) = reservation.write(address) {
                 reservation.release_cancel();
                 state.rollback_reserved(reserved);

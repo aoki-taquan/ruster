@@ -572,10 +572,12 @@ impl EngineState<'_> {
         Ok(())
     }
 
-    fn tx_descriptor(handoff: &TxHandoff) -> XdpDescriptor {
+    /// The TX ring entry of `handoff`: its address counts from the start of
+    /// the UMEM, so the engine's `base` is added.
+    fn tx_descriptor(handoff: &TxHandoff, base: u64) -> XdpDescriptor {
         let descriptor = handoff.descriptor;
         XdpDescriptor {
-            address: descriptor.frame_base() + u64::from(descriptor.data_offset()),
+            address: base + descriptor.frame_base() + u64::from(descriptor.data_offset()),
             len: descriptor.len(),
             options: 0,
         }
@@ -583,10 +585,13 @@ impl EngineState<'_> {
 
     /// Validates and applies one completion address.
     fn complete(&mut self, address: u64) -> Result<(), CompletionInvalidReason> {
-        if address >= self.umem_len {
+        let Some(local) = address
+            .checked_sub(self.address_base)
+            .filter(|local| *local < self.umem_len)
+        else {
             return Err(CompletionInvalidReason::AddressOutsideUmem);
-        }
-        let Ok(index) = u32::try_from(address / self.frame_size) else {
+        };
+        let Ok(index) = u32::try_from(local / self.frame_size) else {
             return Err(CompletionInvalidReason::AddressOutsideUmem);
         };
         let ledger = self.frames.ledger();
@@ -824,8 +829,9 @@ impl RxFillEngine<'_> {
                 return Err(TxSubmitError::Ring(error));
             }
         };
+        let base = state.address_base;
         for (_, handoff) in chosen() {
-            if let Err(error) = reservation.write(EngineState::tx_descriptor(handoff)) {
+            if let Err(error) = reservation.write(EngineState::tx_descriptor(handoff, base)) {
                 reservation.release_cancel();
                 rollback(state, take);
                 return Err(TxSubmitError::Ring(error));
@@ -844,7 +850,7 @@ impl RxFillEngine<'_> {
             let Some(handoff) = slot.take() else {
                 continue;
             };
-            let address = EngineState::tx_descriptor(&handoff).address;
+            let address = EngineState::tx_descriptor(&handoff, base).address;
             let token = handoff.defuse();
             state
                 .frames

@@ -201,8 +201,13 @@ fn session_config(device: &str, queue: u32, mode_flag: u16) -> SessionConfig {
 /// Opens `config`, retrying only the bounded transient bind EBUSY that
 /// follows the previous session's deferred kernel pool release.
 fn open_after_release(config: &SessionConfig) -> NativeSession {
+    open_after_release_with_room(config, 0)
+}
+
+/// [`open_after_release`] with a UMEM that has room for `room_frames` more.
+fn open_after_release_with_room(config: &SessionConfig, room_frames: u32) -> NativeSession {
     for _ in 0..100 {
-        match NativeSession::open(config) {
+        match NativeSession::open_with_room(config, room_frames) {
             Ok(session) => return session,
             Err(error)
                 if (error.stage(), error.failure())
@@ -356,6 +361,54 @@ fn priv_xdp_session_opens_copy_mode_on_netns_veth() {
     );
     auto.close().expect("clean teardown");
 
+    // One UMEM for three sockets: queue 1 of the same device and a queue of
+    // another device join the UMEM that queue 0 registered. Each has its
+    // own rings, runs in the UMEM's mode, and closes on its own.
+    let frames = FRAME_COUNT as u32;
+    let mut owner = open_after_release_with_room(&session_config(&device, 0, XDP_COPY), 2 * frames);
+    let other_device = required("RUSTER_PRIV_XDP_ASYM_DEVICE");
+    let mut same_device = owner
+        .open_sharing(&session_config(&device, 1, 0))
+        .expect("queue 1 joins the UMEM");
+    let mut another = owner
+        .open_sharing(&session_config(&other_device, 0, 0))
+        .expect("another device joins the UMEM");
+    assert_eq!(same_device.mode(), NegotiatedMode::Copy);
+    assert_eq!(another.mode(), NegotiatedMode::Copy);
+    let full = owner
+        .open_sharing(&session_config(&other_device, 1, 0))
+        .map(|_| ())
+        .expect_err("the room is used up");
+    assert_eq!(
+        (full.stage(), full.failure()),
+        (SessionStage::ShareUmem, SessionFailure::SharedUmemFull)
+    );
+    let bases: Vec<u64> = [&mut owner, &mut same_device, &mut another]
+        .into_iter()
+        .map(|session| {
+            let datapath = session.take_datapath().expect("datapath");
+            let base = datapath.address_base();
+            // The first refill publishes this part's frames to the socket's
+            // own Fill ring.
+            let engine = RxFillEngine::new(
+                datapath,
+                UmemDomainId::new(NonZeroU128::MIN),
+                RxFillConfig::new(NonZeroU32::new(64).expect("nonzero")),
+            )
+            .expect("engine over a part of the UMEM");
+            assert_eq!(engine.initial_refill().published(), 64);
+            base
+        })
+        .collect();
+    assert_eq!(
+        bases,
+        [0, FRAME_COUNT * FRAME_SIZE, 2 * FRAME_COUNT * FRAME_SIZE]
+    );
+    // The session that registered the UMEM goes first.
+    owner.close().expect("clean teardown");
+    same_device.close().expect("clean teardown");
+    another.close().expect("clean teardown");
+
     // Real-kernel errno classification. The smoke veth has two queues.
     // Queue 2 on a 2/2-queue veth: the TX queue check refuses it before
     // any resource (the bind would have failed with EINVAL).
@@ -384,7 +437,9 @@ fn priv_xdp_session_opens_copy_mode_on_netns_veth() {
         (missing.stage(), missing.failure()),
         (SessionStage::InterfaceLookup, SessionFailure::NoSuchDevice)
     );
-    eprintln!("priv_xdp_session: copy, auto fallback, EBUSY, no-TX-queue refusal, ENODEV verified");
+    eprintln!(
+        "priv_xdp_session: copy, auto fallback, EBUSY, shared UMEM, no-TX-queue refusal, ENODEV verified"
+    );
 }
 
 #[test]

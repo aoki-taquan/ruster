@@ -5,6 +5,8 @@
 #![doc = "transaction through a private, dependency-free syscall/RAII seam: AF_XDP socket,"]
 #![doc = "anonymous UMEM registration, four ring sizes, checked `XDP_MMAP_OFFSETS`, ring"]
 #![doc = "mappings, `sockaddr_xdp` bind, and `XDP_OPTIONS` mode check."]
+#![doc = "[`NativeSession::open_sharing`] opens a socket on another interface or queue that"]
+#![doc = "uses a part of the same registered UMEM instead of its own."]
 #![doc = "[`NativeSession::attach_xdp`] then redirects the bound queue to the socket with a"]
 #![doc = "hand-assembled XDP program, an XSKMAP, and an unpinned `bpf_link` (Linux 5.9+),"]
 #![doc = "refusing any interface that already has an XDP program. [`RxFillEngine`] runs"]

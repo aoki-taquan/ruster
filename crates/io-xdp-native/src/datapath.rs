@@ -56,6 +56,7 @@ pub struct DatapathRings<'session> {
     tx: TxProducer<'session>,
     umem: UmemMapping<'session>,
     umem_config: UmemConfig,
+    address_base: u64,
     kick: SocketKick<'session>,
     origin: u64,
 }
@@ -79,6 +80,9 @@ pub(crate) struct DatapathParts<'session> {
     pub(crate) tx: TxProducer<'session>,
     pub(crate) umem: UmemMapping<'session>,
     pub(crate) umem_config: UmemConfig,
+    /// Where `umem` starts in the UMEM the socket registered or joined:
+    /// ring addresses count from the start of that UMEM.
+    pub(crate) address_base: u64,
     pub(crate) kick: SocketKick<'session>,
     /// The session (or test kernel) the bundle came from.
     pub(crate) origin: u64,
@@ -104,6 +108,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            address_base,
             kick,
             origin,
         } = parts;
@@ -114,6 +119,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            address_base,
             kick,
             origin,
         }
@@ -127,6 +133,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            address_base,
             kick,
             origin,
         } = self;
@@ -137,6 +144,7 @@ impl<'session> DatapathRings<'session> {
             tx,
             umem,
             umem_config,
+            address_base,
             kick,
             origin,
         }
@@ -146,6 +154,13 @@ impl<'session> DatapathRings<'session> {
     #[must_use]
     pub const fn umem_config(&self) -> UmemConfig {
         self.umem_config
+    }
+
+    /// Where the session's frames start in the UMEM its socket uses, in
+    /// bytes: zero unless the session joined another session's UMEM.
+    #[must_use]
+    pub const fn address_base(&self) -> u64 {
+        self.address_base
     }
 
     /// Returns the Fill, RX, TX, and Completion capacities, in that order.
