@@ -147,11 +147,20 @@ echo "ok: TCP from the VLAN arrives from $address port $port"
 nsx "$lan" python3 -c '
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-s.bind(("10.10.0.10", 5000)); s.settimeout(5)
-s.sendto(b"hello", ("198.51.100.10", 3478))
+s.bind(("10.10.0.10", 5000)); s.settimeout(0.2)
+# The server binds after this starts: say hello again until it answers.
 got = []
-while len(got) < 2:
-    data, peer = s.recvfrom(100); got.append(peer[0])
+for _ in range(25):
+    if not got:
+        s.sendto(b"hello", ("198.51.100.10", 3478))
+    try:
+        data, peer = s.recvfrom(100); got.append(peer[0])
+    except TimeoutError:
+        continue
+    if len(got) == 2:
+        break
+else:
+    raise TimeoutError("timed out")
 print(" ".join(sorted(got)))
 ' >"$work/udp.txt" 2>"$work/udp-client.log" &
 client=$!
