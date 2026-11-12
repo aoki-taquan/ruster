@@ -30,8 +30,12 @@
 #            pool, and a last one drained (X03)
 #   adapter  two one-queue veth pairs as two ports of one XdpPacketIo: a raw
 #            frame sent by A's peer is forwarded by core forward_batch,
-#            copied into port B's generated pool, received by B's peer
+#            copied into port B's generated pool (a UMEM per port) or sent
+#            from its own frame (one shared UMEM), received by B's peer
 #            with the rewritten MACs and TTL, then both ports drain (X04a)
+#   queues   two sockets on the two queues of one veth, on one UMEM and one
+#            XDP program: senders pinned by XPS to each of the peer's TX
+#            queues reach the socket of the matching RX queue only
 #   foreign  a netlink-attached xdpgeneric program loaded with `ip` is
 #            refused in both modes and left untouched (same program id)
 #   holder   attach in a separate process, SIGKILL it, link auto-detaches
@@ -81,6 +85,8 @@ fwd_a=rx00c4
 fwd_a_peer=rx00c5
 fwd_b=rx00c6
 fwd_b_peer=rx00c7
+mq=rx00c8
+mq_peer=rx00c9
 work=$(mktemp -d "${TMPDIR:-/tmp}/ruster-priv-xdp.XXXXXX")
 binary_path=$(readlink -f "$binary")
 
@@ -92,6 +98,7 @@ priv_xdp_attach_redirects_refuses_second_and_detaches_on_netns_veth
 priv_xdp_attach_refuses_foreign_program_and_leaves_it_untouched
 priv_xdp_engine_validates_and_recycles_peer_frames
 priv_xdp_generated_arp_request_is_learned_by_the_peer_and_drained
+priv_xdp_queues_each_get_the_frames_of_their_own_queue
 priv_xdp_session_opens_copy_mode_on_netns_veth
 priv_xdp_tx_reflects_peer_frame_completes_and_drains_on_netns_veth'
 listed=$("$binary" --list --format=terse | sed -n 's/^\(priv_xdp_[a-z0-9_]*\): test$/\1/p' | LC_ALL=C sort)
@@ -168,6 +175,13 @@ for pair in "$fwd_a $fwd_a_peer" "$fwd_b $fwd_b_peer"; do
     sudo -n ip -n "$netns" link set "$1" up
     sudo -n ip -n "$netns" link set "$2" up
 done
+# Two queues on both ends for the queues phase: the test pins its senders
+# so that each of the peer's TX queues, and with it each RX queue of the
+# device, gets frames.
+sudo -n ip -n "$netns" link add "$mq" numtxqueues 2 numrxqueues 2 type veth \
+    peer name "$mq_peer" numtxqueues 2 numrxqueues 2
+sudo -n ip -n "$netns" link set "$mq" up
+sudo -n ip -n "$netns" link set "$mq_peer" up
 # TEST-NET-1 source for frames sent from the peer end; the device itself
 # has no address, so ARP requests go unanswered and repeat.
 sudo -n ip -n "$netns" address add 192.0.2.2/24 dev "$peer"
@@ -190,6 +204,8 @@ run_phase() {
         RUSTER_PRIV_XDP_FWD_A_PEER="$fwd_a_peer" \
         RUSTER_PRIV_XDP_FWD_B="$fwd_b" \
         RUSTER_PRIV_XDP_FWD_B_PEER="$fwd_b_peer" \
+        RUSTER_PRIV_XDP_MQ="$mq" \
+        RUSTER_PRIV_XDP_MQ_PEER="$mq_peer" \
         "$binary" --exact "$@" --nocapture --test-threads=1 >"$log" 2>&1 || status=$?
     cat "$log"
     test "$status" -eq 0 || {
@@ -244,6 +260,8 @@ for dev in "$fwd_a" "$fwd_b"; do
         exit 1
     fi
 done
+
+run_phase queues priv_xdp_queues priv_xdp_queues_each_get_the_frames_of_their_own_queue
 
 # Foreign program: a compiler-free XDP_PASS object attached through netlink.
 python3 -I "$here/priv-xdp-foreign-elf.py" "$work/foreign.o"

@@ -391,6 +391,8 @@ fn set_ring_size<S: MapsRealMemory>(
 /// by borrowing this value mutably, so no view can outlive a mapping.
 pub(super) struct SessionCore<'s, S: MapsRealMemory> {
     xdp: Option<XdpObjects<'s, S>>,
+    /// The mode of another session's program this socket was added to.
+    xdp_joined: Option<XdpAttachMode>,
     tx: MappedRegion<'s, S>,
     rx: MappedRegion<'s, S>,
     completion: MappedRegion<'s, S>,
@@ -742,6 +744,7 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         let origin = crate::datapath::next_origin();
         Ok(Self {
             xdp: None,
+            xdp_joined: None,
             tx,
             rx,
             completion,
@@ -897,9 +900,23 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     /// detected under RTNL and never replaced or detached. A failed link
     /// deletes the socket's map entry before closing program and map.
     pub(super) fn attach_xdp(&mut self, mode: XdpAttachMode) -> Result<(), AttachError> {
+        self.attach_xdp_queues(mode, 0)
+    }
+
+    /// [`Self::attach_xdp`] with an XSKMAP of at least `queues` slots, so
+    /// sessions on other queues of the interface can be added to it
+    /// ([`Self::join_xdp`]).
+    pub(super) fn attach_xdp_queues(
+        &mut self,
+        mode: XdpAttachMode,
+        queues: u32,
+    ) -> Result<(), AttachError> {
         let precondition = |failure| AttachError::new(AttachStage::Precondition, failure, None);
-        if self.xdp.is_some() {
+        if self.xdp.is_some() || self.xdp_joined.is_some() {
             return Err(precondition(AttachFailure::AlreadyAttached));
+        }
+        if queues > crate::session::MAX_QUEUE_ID + 1 {
+            return Err(precondition(AttachFailure::ArgumentOutOfRange));
         }
         if mode == XdpAttachMode::Generic && self.mode == NegotiatedMode::ZeroCopy {
             return Err(precondition(AttachFailure::GenericRequiresCopyMode));
@@ -912,11 +929,15 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         };
         let at = |stage| move |error| classify_attach(stage, error, native, None);
         // The queue id is at most MAX_QUEUE_ID, so this cannot overflow.
-        let max_entries = self.queue.checked_add(1).ok_or(AttachError::new(
-            AttachStage::CreateMap,
-            AttachFailure::ArgumentOutOfRange,
-            None,
-        ))?;
+        let max_entries = self
+            .queue
+            .checked_add(1)
+            .ok_or(AttachError::new(
+                AttachStage::CreateMap,
+                AttachFailure::ArgumentOutOfRange,
+                None,
+            ))?
+            .max(queues);
 
         let map = OwnedBpfFd::create_xskmap(self.fd.syscalls(), max_entries)
             .map_err(at(AttachStage::CreateMap))?;
@@ -965,9 +986,46 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         Ok(())
     }
 
+    /// Stores this session's socket at its queue in the XSKMAP of
+    /// `attached`, a session on another queue of the same interface whose
+    /// program is attached: the program then hands this queue's packets to
+    /// this socket. One `BPF_MAP_UPDATE_ELEM` (`BPF_NOEXIST`); nothing else
+    /// changes, and a failure leaves both sessions as they were.
+    ///
+    /// The entry belongs to the socket: the kernel removes it when the
+    /// socket closes (`xsk_delete_from_maps`), and this session has no
+    /// handle on the map to remove it earlier.
+    ///
+    /// A session can join again: the program it joined may have been
+    /// detached since, which this session cannot see. Joining a map it is
+    /// still in is the kernel's `EEXIST`.
+    pub(super) fn join_xdp(&mut self, attached: &Self) -> Result<(), AttachError> {
+        let precondition = |failure| AttachError::new(AttachStage::Precondition, failure, None);
+        if self.xdp.is_some() {
+            return Err(precondition(AttachFailure::AlreadyAttached));
+        }
+        let Some(objects) = attached.xdp.as_ref() else {
+            return Err(precondition(AttachFailure::NotAttached));
+        };
+        if attached.ifindex != self.ifindex {
+            return Err(precondition(AttachFailure::OtherInterface));
+        }
+        if objects.mode == XdpAttachMode::Generic && self.mode == NegotiatedMode::ZeroCopy {
+            return Err(precondition(AttachFailure::GenericRequiresCopyMode));
+        }
+        let native = objects.mode == XdpAttachMode::Native;
+        let Some(map) = objects.map.as_ref() else {
+            return Err(precondition(AttachFailure::NotAttached));
+        };
+        map.insert_socket(self.queue, &self.fd)
+            .map_err(|error| classify_attach(AttachStage::InsertSocket, error, native, None))?;
+        self.xdp_joined = Some(objects.mode);
+        Ok(())
+    }
+
     /// Detaches by closing the link, then deletes the socket's map entry and
     /// closes program and map, each once. A session without an attachment
-    /// is a no-op.
+    /// of its own is a no-op.
     pub(super) fn detach_xdp(&mut self) -> Result<(), CleanupError> {
         let mut first = None;
         if let Some(mut objects) = self.xdp.take() {
@@ -981,7 +1039,10 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
     }
 
     pub(super) fn xdp_attach_mode(&self) -> Option<XdpAttachMode> {
-        self.xdp.as_ref().map(|objects| objects.mode)
+        self.xdp
+            .as_ref()
+            .map(|objects| objects.mode)
+            .or(self.xdp_joined)
     }
 
     pub(super) const fn mode(&self) -> NegotiatedMode {
@@ -1300,14 +1361,50 @@ impl NativeSession {
         self.core.attach_xdp(mode)
     }
 
+    /// Like [`Self::attach_xdp`] for an interface whose other queues get
+    /// sockets too: the XSKMAP has at least `queues` slots, and the session
+    /// of each other queue is added with [`Self::join_xdp`]. Until then (and
+    /// for queues that never get one) their packets are dropped.
+    pub fn attach_xdp_queues(
+        &mut self,
+        mode: XdpAttachMode,
+        queues: u32,
+    ) -> Result<(), AttachError> {
+        self.core.attach_xdp_queues(mode, queues)
+    }
+
+    /// Adds this session's socket to the program that `attached`, a session
+    /// on another queue of the same interface, attached with
+    /// [`Self::attach_xdp_queues`]: packets of this session's queue then
+    /// reach this socket.
+    ///
+    /// Refused before any syscall when this session has a program of its
+    /// own, `attached` has no program
+    /// ([`AttachFailure::NotAttached`](crate::AttachFailure::NotAttached)),
+    /// the two are on different interfaces
+    /// ([`AttachFailure::OtherInterface`](crate::AttachFailure::OtherInterface)),
+    /// or the program is generic and this session zero-copy. The kernel
+    /// refuses a queue beyond the map's slots
+    /// ([`AttachFailure::TooBig`](crate::AttachFailure::TooBig)).
+    ///
+    /// The program stays `attached`'s: detaching or closing that session
+    /// stops the packets of every queue, which this session is not told.
+    /// After a new attach it joins again. This session's place in a map
+    /// ends when this session closes; [`Self::detach_xdp`] does not end it,
+    /// and joining a map it is still in fails with the kernel's `EEXIST`.
+    pub fn join_xdp(&mut self, attached: &Self) -> Result<(), AttachError> {
+        self.core.join_xdp(&attached.core)
+    }
+
     /// Detaches the program by closing its link, then closes the program
     /// and the XSKMAP, each once, and reports the first failure. Without an
-    /// attachment this does nothing.
+    /// attachment of its own this does nothing.
     pub fn detach_xdp(&mut self) -> Result<(), CleanupError> {
         self.core.detach_xdp()
     }
 
-    /// Returns the attach mode of the live attachment, if any.
+    /// Returns the attach mode of this session's own live attachment, or
+    /// else of the program it last joined (which may be gone since).
     #[must_use]
     pub fn xdp_attach_mode(&self) -> Option<XdpAttachMode> {
         self.core.xdp_attach_mode()

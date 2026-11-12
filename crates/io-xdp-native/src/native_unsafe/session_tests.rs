@@ -2241,3 +2241,137 @@ fn native_session_raw_rings_and_a_shared_umem_exclude_each_other() {
     // The datapath is still there for the engine.
     assert!(owner.take_datapath().is_ok());
 }
+
+/// [`config`] in copy mode on another queue of the same device.
+fn config_on(queue: u32) -> SessionConfig {
+    SessionConfig::new(
+        "veth0",
+        queue,
+        ValidatedBindFlags::new(XDP_USE_NEED_WAKEUP | XDP_COPY).expect("valid flags"),
+        RingConfig::new(64, 128, 64, 256).expect("valid rings"),
+        umem(),
+    )
+    .expect("valid session config")
+}
+
+#[test]
+fn native_xdp_program_of_one_queue_takes_the_sockets_of_the_others() {
+    let fake = SessionFake::new();
+    let mut first = SessionCore::open(&fake, &config_on(0)).expect("queue 0");
+    let mut second = SessionCore::open(&fake, &config_on(2)).expect("queue 2");
+
+    // Nothing to join yet.
+    let before = fake.transcript().len();
+    let error = second.join_xdp(&first).expect_err("no program");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (AttachStage::Precondition, AttachFailure::NotAttached)
+    );
+    assert_eq!(fake.transcript().len(), before);
+
+    // The map is as large as the queues asked for, not only `queue + 1`.
+    first
+        .attach_xdp_queues(XdpAttachMode::Native, 4)
+        .expect("attach");
+    let mut expected = attach_calls(crate::xdp_program::XDP_FLAGS_DRV_MODE);
+    let Call::MapUpdate { key, .. } = &mut expected[2] else {
+        unreachable!("the third call stores the socket");
+    };
+    *key = 0;
+    assert_eq!(fake.transcript()[before..], expected);
+
+    // Joining is one map update at the session's own queue.
+    let before = fake.transcript().len();
+    second.join_xdp(&first).expect("join");
+    assert_eq!(
+        fake.transcript()[before..],
+        [Call::MapUpdate {
+            map_fd: FAKE_MAP_FD,
+            key: 2,
+            value: FAKE_FD,
+        }]
+    );
+    assert_eq!(second.xdp_attach_mode(), Some(XdpAttachMode::Native));
+
+    // Not next to a program of its own, in either order.
+    let before = fake.transcript().len();
+    for error in [
+        second
+            .attach_xdp(XdpAttachMode::Native)
+            .expect_err("joined already"),
+        first.join_xdp(&second).expect_err("attached itself"),
+    ] {
+        assert_eq!(
+            (error.stage(), error.failure()),
+            (AttachStage::Precondition, AttachFailure::AlreadyAttached)
+        );
+    }
+    assert_eq!(fake.transcript().len(), before);
+
+    // The joined session has nothing of the program to release: its
+    // detach and its close leave map, program and link alone.
+    second.detach_xdp().expect("nothing to detach");
+    assert_eq!(fake.transcript().len(), before);
+
+    // The owner detaches and attaches again: a new map, which the joined
+    // session joins again.
+    first.detach_xdp().expect("detach");
+    first
+        .attach_xdp_queues(XdpAttachMode::Native, 4)
+        .expect("attach again");
+    let before = fake.transcript().len();
+    second.join_xdp(&first).expect("join again");
+    assert_eq!(fake.transcript().len(), before + 1);
+    let error = first
+        .attach_xdp_queues(XdpAttachMode::Native, crate::MAX_QUEUE_ID + 2)
+        .expect_err("attached, and too many queues");
+    assert_eq!(error.stage(), AttachStage::Precondition);
+    let before = fake.transcript().len();
+    second.close().expect("close");
+    let closed = fake.transcript()[before..].to_vec();
+    assert!(closed
+        .iter()
+        .all(|call| matches!(call, Call::Unmap { .. } | Call::Close { fd: FAKE_FD })));
+    drop(first);
+    fake.assert_released();
+}
+
+#[test]
+fn native_xdp_join_failure_changes_nothing_and_a_small_map_is_reported() {
+    let fake = SessionFake::new();
+    let mut first = SessionCore::open(&fake, &config_on(0)).expect("queue 0");
+    let mut second = SessionCore::open(&fake, &config_on(2)).expect("queue 2");
+    // A map for queue 0 alone: the kernel refuses key 2.
+    first.attach_xdp(XdpAttachMode::Native).expect("attach");
+    fake.fail_at.set(Some((
+        fake.transcript().len() + 1,
+        Errno::Linux(errno::E2BIG),
+    )));
+    let error = second.join_xdp(&first).expect_err("beyond the map");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (AttachStage::InsertSocket, AttachFailure::TooBig)
+    );
+    assert_eq!(second.xdp_attach_mode(), None);
+    // Still free to attach or join.
+    fake.fail_at.set(None);
+    second.join_xdp(&first).expect("join");
+
+    // A generic program does not take a zero-copy socket.
+    let fake = SessionFake::new();
+    let mut first = SessionCore::open(&fake, &config_on(0)).expect("queue 0");
+    first
+        .attach_xdp_queues(XdpAttachMode::Generic, 4)
+        .expect("attach");
+    let mut zero_copy = SessionCore::open(&fake, &config(XDP_ZEROCOPY)).expect("queue 3");
+    let error = zero_copy
+        .join_xdp(&first)
+        .expect_err("zero-copy and generic");
+    assert_eq!(
+        (error.stage(), error.failure()),
+        (
+            AttachStage::Precondition,
+            AttachFailure::GenericRequiresCopyMode
+        )
+    );
+}

@@ -101,9 +101,10 @@ pub(crate) const XDP_PASS: i32 = 2;
 /// spread, or the window before the socket is in the map) would reach the
 /// kernel stack, which could forward it around the router's firewall and
 /// NAT or answer ARP/ICMP for the port. The cost is that such frames are
-/// lost: M2 binds one queue per port, so operators must use a single-queue
-/// device or steer all traffic to the bound queue (ethtool RSS/ntuple),
-/// and a port must not keep kernel L3 configuration. See XDP-050; a startup
+/// lost: every queue that receives traffic needs a socket in the map
+/// (`NativeSession::attach_xdp_queues` and `join_xdp`), or operators must
+/// use a single-queue device or steer all traffic to the bound queues
+/// (ethtool RSS/ntuple), and a port must not keep kernel L3 configuration. See XDP-050; a startup
 /// check of the queue/steering setup is X04 (XDP-063).
 pub(crate) const REDIRECT_FALLBACK_ACTION: i32 = XDP_DROP;
 
