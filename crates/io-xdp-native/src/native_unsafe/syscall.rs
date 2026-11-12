@@ -1658,9 +1658,11 @@ impl<'syscalls, S: Syscalls> RegionPart<'syscalls, S> {
     /// Gives the part up. The mapping is unmapped, and the result is that
     /// unmap's, only if this was its last part.
     pub(super) fn release(self) -> Result<(), ResourceError> {
-        match Arc::try_unwrap(self.whole) {
-            Ok(parted) => parted.region.unmap(),
-            Err(_) => Ok(()),
+        // `into_inner` and not `try_unwrap`: of two parts released at the
+        // same time on two threads, exactly one gets the region.
+        match Arc::into_inner(self.whole) {
+            Some(parted) => parted.region.unmap(),
+            None => Ok(()),
         }
     }
 }

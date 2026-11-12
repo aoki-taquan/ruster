@@ -1477,7 +1477,16 @@ fn priv_xdp_queues_each_get_the_frames_of_their_own_queue() {
         }
     };
     let count = |socket: usize, sender: usize| seen[socket][sender].load(Ordering::Relaxed);
+    /// Ends the other thread's loop however the scope is left, so a panic
+    /// here fails the test instead of waiting for that thread for ever.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
     let second = std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
         let other = scope.spawn(|| {
             let mut second = second;
             {
@@ -1486,6 +1495,8 @@ fn priv_xdp_queues_each_get_the_frames_of_their_own_queue() {
                     receive(1, &mut engine);
                     sleep(Duration::from_millis(5));
                 }
+                // What arrived since the last look counts too.
+                receive(1, &mut engine);
                 engine.audit().expect("engine audit");
             }
             second
@@ -1510,11 +1521,13 @@ fn priv_xdp_queues_each_get_the_frames_of_their_own_queue() {
                 }
                 sleep(Duration::from_millis(20));
                 receive(0, &mut engine);
-                if Instant::now() >= deadline {
-                    stop.store(true, Ordering::Relaxed);
-                    panic!("both queues did not receive within ten seconds: {seen:?}");
-                }
+                assert!(!other.is_finished(), "the thread of queue 1 stopped");
+                assert!(
+                    Instant::now() < deadline,
+                    "both queues did not receive within ten seconds: {seen:?}"
+                );
             }
+            receive(0, &mut engine);
             engine.audit().expect("engine audit");
         }
         stop.store(true, Ordering::Relaxed);

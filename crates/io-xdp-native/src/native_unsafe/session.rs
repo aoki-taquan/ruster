@@ -733,13 +733,17 @@ impl<'s, S: MapsRealMemory> SessionCore<'s, S> {
         }
 
         // Last, so a failed attempt takes nothing from a shared UMEM. The
-        // lengths were checked above, and nothing else ran in between.
+        // lengths were checked above; a session of the same UMEM opened on
+        // another thread meanwhile can still have taken the room.
         let umem = match (own, source) {
-            (Some((region, usable)), _) => RegionPart::first(region, usable, part_len),
-            (None, UmemSource::Shared(owner)) => owner.umem.next(part_len),
-            (None, UmemSource::Own { .. }) => None,
-        }
-        .ok_or(out_of_range(SessionStage::MapUmem))?;
+            (Some((region, usable)), _) => RegionPart::first(region, usable, part_len)
+                .ok_or(out_of_range(SessionStage::MapUmem))?,
+            (None, UmemSource::Shared(owner)) => owner.umem.next(part_len).ok_or(fail(
+                SessionStage::ShareUmem,
+                SessionFailure::SharedUmemFull,
+            ))?,
+            (None, UmemSource::Own { .. }) => return Err(out_of_range(SessionStage::MapUmem)),
+        };
 
         let origin = crate::datapath::next_origin();
         Ok(Self {
@@ -1173,12 +1177,19 @@ static LINUX_SYSCALLS: LinuxSyscalls = LinuxSyscalls;
 /// session ends last. It is not `Sync`: one thread at a time owns its
 /// rings.
 ///
+/// The interface was looked up in the network namespace of the thread that
+/// opened the session, and Linux keeps namespace and capabilities per
+/// thread. [`Self::attach_xdp`], [`Self::join_xdp`] and
+/// [`Self::open_sharing`] must therefore run on a thread in that same
+/// namespace, with the capabilities the open had: in another namespace the
+/// same interface index can name another device.
+///
 /// ```
 /// fn send<T: Send>() {}
 /// send::<ruster_io_xdp_native::NativeSession>();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn sync<T: Sync>() {}
 /// sync::<ruster_io_xdp_native::NativeSession>();
 /// ```
