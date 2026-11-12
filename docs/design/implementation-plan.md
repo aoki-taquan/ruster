@@ -280,7 +280,7 @@ gatewayの集合も、経路を足し引きするたびに保つ（`Ipv4Routes`�
    - 同じUMEMのポートの間では、受信したbufferをそのまま出口のポートから送る（済み）。FEは最初のポートで
      全ポート分のUMEMを登録し、残りはそこに参加する。参加できないポートは自分のUMEMで開く。
    - 一つのNICの複数のqueueにsocketを付ける。XDPのプログラムはNICに一つで、queueごとのsocketへ回す（済み）。
-   - socketを開いた後で別のスレッドへ渡せるようにする。socketは起動時にまとめて開き、worker iには
+   - socketを開いた後で別のスレッドへ渡せるようにする（済み）。socketは起動時にまとめて開き、worker iには
      全NICのqueue iのsocketを渡す。アダプタは今の作り（NICごとに一つのsocket）のまま、workerごとに一つ持つ。
 2. 「受け渡し」（CEのsocketとTUNの読み書き）をworkerから分ける。
 3. 表の版を全部のworkerへ届ける。全workerが移ってから、古い版を解放してCEへ応答する。
@@ -304,8 +304,6 @@ BGP EVPNは見送り（2026-11-10 owner決定）。
 
 - 今のパケットのleaseは`Rc`で`Send`できない。workerの間でbufferを渡すときは、leaseそのものではなく、
   I/O層が作る「渡すための値」（AF_XDPではbufferの番号）を渡す。
-- UMEMの区画を持つ値（`RegionPart`）も`Rc`で、今は一つのスレッドの中でしか分けられない。
-  queueごとのsocketを別のスレッドに持たせる段階で直す。
 - 一つのUMEMを使うsocketは、engineを作る前に全部開く。閉じたsocketの区画は使い回さない。
   ポートを動いている間に足す、開き直す、が要るようになったら直す。
 - `forwarding.rs`には約20個の`forward_batch_with_*`の入口がある。ARPを外すときに一つにまとめる。

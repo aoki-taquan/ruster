@@ -31,6 +31,7 @@ use std::{
     num::{NonZeroU128, NonZeroU32},
     os::unix::fs::MetadataExt,
     process::{Command, Stdio},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
     thread::sleep,
     time::{Duration, Instant},
 };
@@ -1456,56 +1457,88 @@ fn priv_xdp_queues_each_get_the_frames_of_their_own_queue() {
         bytes.resize(60, 0);
         bytes
     };
-    {
-        let mut engines = [engine(&mut first, 0x5471), engine(&mut second, 0x5472)];
-        // `seen[socket][sender]`: marked frames socket `socket` received
-        // from the sender pinned for queue `sender`.
-        let mut seen = [[0_u32; 2]; 2];
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while seen[0][0] == 0 || seen[1][1] == 0 {
-            for (queue, cpu) in cpus.iter().enumerate() {
-                let status = Command::new("python3")
-                    .args([
-                        "-I",
-                        "-c",
-                        PINNED_RAW_SEND,
-                        &peer,
-                        &hex(&frame(queue as u8)),
-                        &cpu.to_string(),
-                    ])
-                    .status()
-                    .expect("run the pinned sender");
-                assert!(status.success(), "pinned sender failed");
+    // `seen[socket][sender]`: marked frames socket `socket` received from the
+    // sender pinned for queue `sender`. The socket of queue 1 was opened
+    // here and runs on a thread of its own, as a second worker would.
+    let seen: [[AtomicU32; 2]; 2] = Default::default();
+    let stop = AtomicBool::new(false);
+    let receive = |socket: usize, engine: &mut RxFillEngine<'_>| {
+        let mut batch = engine.poll(64).expect("poll");
+        while let Some(received) = batch.next_frame() {
+            let bytes = received.bytes();
+            if let Some(at) = bytes
+                .windows(QUEUE_MARKER.len())
+                .position(|window| window == QUEUE_MARKER)
+            {
+                let sender = usize::from(bytes[at + QUEUE_MARKER.len()]);
+                seen[socket][sender].fetch_add(1, Ordering::Relaxed);
             }
-            sleep(Duration::from_millis(20));
-            for (socket, engine) in engines.iter_mut().enumerate() {
-                let mut batch = engine.poll(64).expect("poll");
-                while let Some(received) = batch.next_frame() {
-                    let bytes = received.bytes();
-                    if let Some(at) = bytes
-                        .windows(QUEUE_MARKER.len())
-                        .position(|window| window == QUEUE_MARKER)
-                    {
-                        seen[socket][usize::from(bytes[at + QUEUE_MARKER.len()])] += 1;
-                    }
-                    received.recycle();
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "both queues did not receive within ten seconds: {seen:?}"
-            );
+            received.recycle();
         }
-        assert_eq!(
-            (seen[0][1], seen[1][0]),
-            (0, 0),
-            "a frame reached the socket of another queue: {seen:?}"
-        );
-        for engine in &engines {
+    };
+    let count = |socket: usize, sender: usize| seen[socket][sender].load(Ordering::Relaxed);
+    /// Ends the other thread's loop however the scope is left, so a panic
+    /// here fails the test instead of waiting for that thread for ever.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+    let second = std::thread::scope(|scope| {
+        let _stop = StopOnDrop(&stop);
+        let other = scope.spawn(|| {
+            let mut second = second;
+            {
+                let mut engine = engine(&mut second, 0x5472);
+                while !stop.load(Ordering::Relaxed) {
+                    receive(1, &mut engine);
+                    sleep(Duration::from_millis(5));
+                }
+                // What arrived since the last look counts too.
+                receive(1, &mut engine);
+                engine.audit().expect("engine audit");
+            }
+            second
+        });
+        {
+            let mut engine = engine(&mut first, 0x5471);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while count(0, 0) == 0 || count(1, 1) == 0 {
+                for (queue, cpu) in cpus.iter().enumerate() {
+                    let status = Command::new("python3")
+                        .args([
+                            "-I",
+                            "-c",
+                            PINNED_RAW_SEND,
+                            &peer,
+                            &hex(&frame(queue as u8)),
+                            &cpu.to_string(),
+                        ])
+                        .status()
+                        .expect("run the pinned sender");
+                    assert!(status.success(), "pinned sender failed");
+                }
+                sleep(Duration::from_millis(20));
+                receive(0, &mut engine);
+                assert!(!other.is_finished(), "the thread of queue 1 stopped");
+                assert!(
+                    Instant::now() < deadline,
+                    "both queues did not receive within ten seconds: {seen:?}"
+                );
+            }
+            receive(0, &mut engine);
             engine.audit().expect("engine audit");
         }
-        eprintln!("priv_xdp_queues: frames by socket and sending queue {seen:?}");
-    }
+        stop.store(true, Ordering::Relaxed);
+        other.join().expect("the thread of queue 1")
+    });
+    assert_eq!(
+        (count(0, 1), count(1, 0)),
+        (0, 0),
+        "a frame reached the socket of another queue: {seen:?}"
+    );
+    eprintln!("priv_xdp_queues: frames by socket and sending queue {seen:?}");
     // The program is the first session's: it goes with that session, while
     // the socket of queue 1 is still open and in the map.
     first.close().expect("queue 0 teardown");
@@ -1513,7 +1546,7 @@ fn priv_xdp_queues_each_get_the_frames_of_their_own_queue() {
     second.close().expect("queue 1 teardown");
     eprintln!(
         "priv_xdp_queues: two sockets on two queues of one device with one UMEM and one \
-         program each received the frames of their own queue only verified"
+         program, each on its own thread, received the frames of their own queue only verified"
     );
 }
 
