@@ -36,9 +36,10 @@
 //! (`NativeSession::open_sharing`): the egress port's TX ring names the RX
 //! frame, which stays the ingress port's and returns to its pool when the
 //! completion comes back (`cross_port_in_place` on the egress port). A port
-//! has at most its RX pool less one Fill ring of frames away like that, so
-//! a peer whose link went down cannot stop it from receiving; beyond that,
-//! and for a frame that grew into the headroom, it copies as below.
+//! has at most its RX pool less one Fill ring of frames away like that, and
+//! sends none to a port whose link was seen down, so that a peer that stops
+//! completing leaves it frames to receive with; in those cases, and for a
+//! frame that grew into the headroom, it copies as below.
 //!
 //! A frame committed to a port with another UMEM cannot be named by that
 //! port's descriptors (a kernel without shared UMEM across interfaces, or
@@ -1046,11 +1047,13 @@ impl<'memory> XdpPacketIo<'memory> {
 
     /// Whether port `out` can transmit this frame of port `ingress` from
     /// where it is: both ports use one UMEM, the frame did not grow into
-    /// the headroom, and `ingress` may still have frames away (a peer that
-    /// stops completing must not take the frames it receives with).
+    /// the headroom, `ingress` may still have frames away, and the link of
+    /// `out` was not seen down. A port that stops completing would keep the
+    /// frames; a copy leaves it only frames of its own generated pool.
     fn can_lend(&self, ingress: usize, out: usize, lease: &RawLease) -> bool {
         let home = &self.ports[ingress].engine;
         home.shares_umem_with(&self.ports[out].engine)
+            && !self.ports[out].link_down
             && home.tx_lent() < home.tx_lent_limit()
             && !home.lease_before_headroom(lease)
     }

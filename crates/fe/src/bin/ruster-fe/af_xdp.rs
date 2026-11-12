@@ -65,6 +65,12 @@ pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeS
         let joined = match sessions.first() {
             Some(first) => match open_retrying(|| first.open_sharing(&config)) {
                 Ok(session) => Some(session),
+                // Anything else (a queue still busy, no memory) would fail
+                // an own UMEM too, or pass and leave the port copying for
+                // good: the start fails instead.
+                Err(error) if !cannot_share(error) => {
+                    return Err(format!("{device}: {error:?}"));
+                }
                 Err(error) => {
                     eprintln!(
                         "ruster-fe: {device} does not share the packet memory of {} \
@@ -90,6 +96,22 @@ pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeS
         sessions.push(session);
     }
     Ok(sessions)
+}
+
+/// Whether a failed join means that this device cannot use the first one's UMEM
+/// at all: its frames do not fit it, its driver cannot run in the UMEM's mode, or
+/// the kernel does not share a UMEM between devices (before Linux 5.10).
+fn cannot_share(error: SessionError) -> bool {
+    matches!(
+        (error.stage(), error.failure()),
+        (SessionStage::ShareUmem, _)
+            | (
+                SessionStage::Bind,
+                SessionFailure::ZeroCopyUnsupported
+                    | SessionFailure::Unsupported
+                    | SessionFailure::InvalidArgument
+            )
+    )
 }
 
 /// Opens a session, trying again for a while when the failure can be transient: a
