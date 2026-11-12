@@ -1658,7 +1658,10 @@ impl<S: MapsRealMemory> RegionPart<'_, S> {
         // decided by the addresses put on the rings of every socket of the
         // UMEM: `lend_raw` and `next` exclude each other for good, so with
         // more than one part every ring is written by its part's engine
-        // only, which names frames of its own part only. Rust never forms
+        // only. An engine puts on Fill only frames of its own part, and on
+        // TX only frames whose home ledger (its own, or that of the engine
+        // lending the frame) already records them as with the kernel. Rust
+        // never forms
         // references into the bytes here.
         Some(unsafe { BorrowedMmap::from_raw_parts(start, self.byte_len) })
     }

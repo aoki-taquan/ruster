@@ -111,9 +111,10 @@ pub use ruster_io_xdp::{AuditError, FrameId, FrameStateKind, LedgerError, UmemDo
 pub use rx_fill::{
     CompletionInvalidReason, CompletionLag, CompletionReport, DrainOutcome, DrainReport,
     FrameAccounting, GeneratedAccounting, GeneratedAllocError, GeneratedCounters, GeneratedFrame,
-    GeneratedRejectReason, RefillReport, RxBatch, RxFillAuditError, RxFillConfig, RxFillCounters,
-    RxFillEngine, RxFillError, RxFillSetupError, RxFrame, RxInvalidReason, TxBlocked, TxCounters,
-    TxHandoff, TxRejected, TxRejection, TxSubmitError, TxSubmitReport, ETHERNET_HEADER_LEN,
+    GeneratedRejectReason, LentCompletion, RefillReport, RxBatch, RxFillAuditError, RxFillConfig,
+    RxFillCounters, RxFillEngine, RxFillError, RxFillSetupError, RxFrame, RxInvalidReason,
+    TxBlocked, TxCounters, TxHandoff, TxRejected, TxRejection, TxSubmitError, TxSubmitReport,
+    ETHERNET_HEADER_LEN,
 };
 pub use session::{
     AttachError, AttachFailure, AttachStage, CleanupError, CleanupStage, NativeRings,
@@ -124,6 +125,8 @@ pub use session::{
 
 #[cfg(test)]
 mod generated_tests;
+#[cfg(test)]
+mod lend_tests;
 #[cfg(test)]
 mod packet_io_conformance;
 #[cfg(test)]

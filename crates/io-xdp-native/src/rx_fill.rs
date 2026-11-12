@@ -32,6 +32,8 @@
 
 #[path = "generated.rs"]
 mod generated;
+#[path = "lend.rs"]
+mod lend;
 #[path = "tx_completion.rs"]
 mod tx_completion;
 
@@ -43,6 +45,7 @@ pub use generated::{
     GeneratedAccounting, GeneratedAllocError, GeneratedCounters, GeneratedFrame,
     GeneratedRejectReason,
 };
+pub use lend::LentCompletion;
 use tx_completion::InflightFifo;
 pub use tx_completion::{
     CompletionInvalidReason, CompletionLag, CompletionReport, DrainOutcome, DrainReport,
@@ -549,8 +552,16 @@ struct EngineState<'memory> {
     pending: TokenFifo,
     scratch: Box<[Option<FrameToken>]>,
     counters: RxFillCounters,
-    /// Published, not yet completed TX frames, in submission order.
+    /// Published, not yet completed TX frames of this socket's TX ring, in
+    /// submission order: this engine's own and those it sent for others.
     inflight: InflightFifo,
+    /// The registered UMEM this engine's frames are a part of.
+    umem_id: u64,
+    /// This engine's frames in flight on other sockets' TX rings.
+    lent: u32,
+    /// Completed frames this engine sent for others, until the caller
+    /// takes them. Never more than the TX capacity it was allocated with.
+    lent_completions: Vec<LentCompletion>,
     tx_counters: TxCounters,
     /// Set by `drain`: no new TX or Fill publication, ever again.
     draining: bool,
@@ -721,8 +732,10 @@ impl EngineState<'_> {
 pub struct RxFillEngine<'memory> {
     fill: FillProducer<'memory>,
     rx: RxConsumer<'memory>,
-    /// Owned by the engine alone: no one else can submit a TX descriptor
-    /// naming a frame of this ledger.
+    /// Owned by the engine alone. A descriptor naming a frame of this
+    /// ledger is written here, or to the TX ring of another engine of the
+    /// same UMEM by `submit_tx_through`; either way only after this ledger
+    /// moved the frame to the kernel.
     tx: TxProducer<'memory>,
     completion: CompletionConsumer<'memory>,
     kick: SocketKick<'memory>,
@@ -756,6 +769,7 @@ impl<'memory> RxFillEngine<'memory> {
             umem,
             umem_config: geometry,
             address_base,
+            umem_id,
             kick,
             origin,
         } = datapath.into_parts();
@@ -810,6 +824,9 @@ impl<'memory> RxFillEngine<'memory> {
             scratch: vec![None; fill.capacity() as usize].into_boxed_slice(),
             counters: RxFillCounters::default(),
             inflight: InflightFifo::new(tx.capacity()),
+            umem_id,
+            lent: 0,
+            lent_completions: Vec::with_capacity(tx.capacity() as usize),
             tx_counters: TxCounters::default(),
             draining: false,
             fill_batch,
@@ -1176,7 +1193,12 @@ impl<'memory> RxFillEngine<'memory> {
                 _ => return Err(RxFillAuditError::PendingEntry { frame }),
             }
         }
+        let own = self.state.engine_id;
         for entry in self.state.inflight.iter() {
+            // A frame sent for another engine is in that engine's ledger.
+            if entry.home != own {
+                continue;
+            }
             let frame = entry.token.frame().index();
             let entry_slot = seen.get_mut(frame as usize);
             let in_flight = ledger.state(frame).is_ok_and(|state| {
@@ -1230,13 +1252,22 @@ impl<'memory> RxFillEngine<'memory> {
         if listed != available {
             return Err(RxFillAuditError::PendingCount { listed, available });
         }
-        let listed = self.tx_inflight();
-        if listed != in_flight || self.state.tx_counters.tx_inflight != listed {
+        // In flight by the ledger: this engine's frames on its own TX ring
+        // and those it sent out through others. Listed: its own and those
+        // it sent for others.
+        let all = self.tx_inflight();
+        let for_others = self.state.inflight.iter().filter(|entry| entry.home != own);
+        let for_others = u32::try_from(for_others.count()).expect("bounded by the u32 ring");
+        let listed = all - for_others + self.state.lent;
+        if listed != in_flight || self.state.tx_counters.tx_inflight != all {
             return Err(RxFillAuditError::InflightCount { listed, in_flight });
         }
         let limit = self.tx_inflight_limit();
-        if in_flight > limit {
-            return Err(RxFillAuditError::InflightExceedsLimit { in_flight, limit });
+        if all > limit {
+            return Err(RxFillAuditError::InflightExceedsLimit {
+                in_flight: all,
+                limit,
+            });
         }
         let recorded = self.generated_accounting();
         for kind in STATE_KINDS {
@@ -1638,7 +1669,7 @@ impl Drop for TxHandoff {
 
 impl TxHandoff {
     /// Consumes the handoff inside an engine method, without the drop check.
-    fn defuse(self) -> FrameToken {
+    pub(super) fn defuse(self) -> FrameToken {
         let token = self.token;
         std::mem::forget(self);
         token

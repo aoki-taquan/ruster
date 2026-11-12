@@ -57,6 +57,7 @@ pub struct DatapathRings<'session> {
     umem: UmemMapping<'session>,
     umem_config: UmemConfig,
     address_base: u64,
+    umem_id: u64,
     kick: SocketKick<'session>,
     origin: u64,
 }
@@ -83,6 +84,9 @@ pub(crate) struct DatapathParts<'session> {
     /// Where `umem` starts in the UMEM the socket registered or joined:
     /// ring addresses count from the start of that UMEM.
     pub(crate) address_base: u64,
+    /// The registered UMEM `umem` is a part of: the origin of the session
+    /// (or test kernel) that registered it.
+    pub(crate) umem_id: u64,
     pub(crate) kick: SocketKick<'session>,
     /// The session (or test kernel) the bundle came from.
     pub(crate) origin: u64,
@@ -109,6 +113,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             address_base,
+            umem_id,
             kick,
             origin,
         } = parts;
@@ -120,6 +125,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             address_base,
+            umem_id,
             kick,
             origin,
         }
@@ -134,6 +140,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             address_base,
+            umem_id,
             kick,
             origin,
         } = self;
@@ -145,6 +152,7 @@ impl<'session> DatapathRings<'session> {
             umem,
             umem_config,
             address_base,
+            umem_id,
             kick,
             origin,
         }
