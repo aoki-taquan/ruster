@@ -8,7 +8,8 @@ use super::lookup_tests::{
 };
 use super::*;
 use crate::{
-    FirewallPolicy, FirewallRule, Ipv4Address, MacAddress, PacketLease, PacketSlot, SlotCompletion,
+    forward_batch_stateless, ConsumeReason, FirewallPolicy, FirewallRule, Ipv4Address, MacAddress,
+    PacketLease, PacketSlot, SlotCompletion, Stateful,
 };
 
 const NO_NAT: plain_ipv4::Nat<'static> = plain_ipv4::Nat {
@@ -1023,4 +1024,82 @@ fn with_nat_the_short_way_ends_every_packet_as_the_full_way_does() {
     assert!(rounds > 200, "{rounds} rounds with NAT");
     assert!(short > 1_000, "short way taken {short} times");
     assert!(translated > 500, "{translated} translated");
+}
+
+/// What [`forward_batch_stateless`] sends and what it hands over, forwarded
+/// afterwards the full way as if received by the worker that owns the state,
+/// end every packet (frame and how it ended) as the full way alone ends it.
+#[test]
+fn the_stateless_way_with_its_owner_ends_every_packet_as_the_full_way_does() {
+    let mut rng = Rng(0x0057_a7e1_e550_0001);
+    let (mut sent_here, mut handed_over) = (0, 0);
+    for round in 0..600 {
+        let mut tables = random_tables(&mut rng, 40);
+        with_reachable_neighbors(&mut rng, &mut tables);
+        let owner = owner(&tables);
+        let kernel = [tables.interfaces[0].id];
+        let snapshot = owner.snapshot();
+        let snapshot = if round % 4 == 0 {
+            snapshot.with_kernel_ingress(&kernel)
+        } else {
+            snapshot
+        };
+        let ids = interface_ids(&tables);
+        let addresses = probe_addresses(&mut rng, &tables);
+        let frames: Vec<Item> = (0..64)
+            .map(|_| random_frame(&mut rng, &tables, &ids, &addresses))
+            .collect();
+        let (full, _, _) = forward(&snapshot, &frames, true);
+
+        let mut items: Vec<Item> = frames
+            .iter()
+            .map(|item| Item {
+                ingress: item.ingress,
+                frame: item.frame.clone(),
+                ended: None,
+            })
+            .collect();
+        let mut handed: Vec<Item> = Vec::new();
+        let stateful = Stateful {
+            firewall: round % 9 == 0,
+            bridges: round % 11 == 0,
+            ..Stateful::default()
+        };
+        forward_batch_stateless(
+            Items {
+                items: &mut items,
+                next: 0,
+            },
+            &snapshot,
+            stateful,
+            |ingress, frame| {
+                handed.push(Item {
+                    ingress,
+                    frame: frame.to_vec(),
+                    ended: None,
+                });
+            },
+            &mut NoTrace,
+        );
+        let (owned, _, _) = forward(&snapshot, &handed, true);
+        let mut owned = owned.iter();
+        for (index, (item, full)) in items.iter().zip(&full).enumerate() {
+            let ended = if item.ended == Some(SlotCompletion::Consume(ConsumeReason::HandedToOwner))
+            {
+                handed_over += 1;
+                owned.next().expect("one owned outcome per handed packet")
+            } else {
+                if stateful.firewall || stateful.bridges {
+                    panic!("round {round} frame {index}: everything is handed over");
+                }
+                sent_here += 1;
+                item
+            };
+            assert_eq!(ended.ended, full.ended, "round {round} frame {index}");
+            assert_eq!(ended.frame, full.frame, "round {round} frame {index}");
+        }
+        assert!(owned.next().is_none(), "round {round}");
+    }
+    assert!(sent_here > 1_000, "{sent_here} sent by the stateless way");
+    assert!(handed_over > 10_000, "{handed_over} handed over");
 }

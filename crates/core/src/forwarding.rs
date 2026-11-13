@@ -78,6 +78,7 @@ mod lookup_tests;
 mod nat44_icmp_query;
 mod nat44_icmpv4_inside;
 mod plain_ipv4;
+pub use plain_ipv4::{forward_batch_stateless, Stateful};
 #[cfg(test)]
 mod plain_ipv4_tests;
 mod unsolicited_syn;
