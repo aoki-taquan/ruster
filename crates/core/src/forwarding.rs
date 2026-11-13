@@ -77,6 +77,9 @@ mod lookup;
 mod lookup_tests;
 mod nat44_icmp_query;
 mod nat44_icmpv4_inside;
+mod plain_ipv4;
+#[cfg(test)]
+mod plain_ipv4_tests;
 mod unsolicited_syn;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3556,6 +3559,13 @@ where
     let mut consumed = 0;
     let all_vrfs = snapshot;
     let vlans = all_vrfs.vlans;
+    // With no NAT or firewall to consult, a plain IPv4 forward goes the short
+    // way (`plain_ipv4`).
+    let plain = plain_ipv4::enabled()
+        && nat44_udp_config.is_none()
+        && nat44_tcp_config.is_none()
+        && nat44_icmp_config.is_none()
+        && firewall_config.is_none();
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
         if !vlans.is_empty() {
@@ -3635,6 +3645,36 @@ where
                     packet.recycle(reason);
                     dropped += 1;
                     trace.record(TraceEvent::Dropped { ingress, reason });
+                }
+                continue;
+            }
+        }
+        // PPPoE, tunnels and SRv6 below take no IPv4 frame: the short way can
+        // start here.
+        if plain {
+            let ingress = packet.ingress();
+            let bridges = bridges.as_deref();
+            let decided = plain_ipv4::decide(
+                packet.bytes_mut(),
+                all_vrfs.for_ingress(ingress),
+                all_vrfs,
+                ingress,
+                bridges,
+            );
+            if let Some(decided) = decided {
+                match plain_ipv4::send(&mut packet, decided, ingress, all_vrfs, bridges, trace) {
+                    Ok(port) => {
+                        packet.commit(port);
+                        tx_requested += 1;
+                        trace.record(TraceEvent::TxRequested {
+                            egress: decided.egress(),
+                        });
+                    }
+                    Err(reason) => {
+                        packet.recycle(reason);
+                        dropped += 1;
+                        trace.record(TraceEvent::Dropped { ingress, reason });
+                    }
                 }
                 continue;
             }

@@ -5,10 +5,10 @@ use super::lookup::{linear, ForwardingIndex};
 use super::*;
 use crate::{Ipv4Address, MacAddress};
 
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(super) fn next(&mut self) -> u64 {
         // SplitMix64: deterministic, seedable, no dependency.
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut value = self.0;
@@ -17,20 +17,20 @@ impl Rng {
         value ^ (value >> 31)
     }
 
-    fn below(&mut self, bound: u64) -> u64 {
+    pub(super) fn below(&mut self, bound: u64) -> u64 {
         self.next() % bound
     }
 
-    fn address(&mut self) -> u32 {
+    pub(super) fn address(&mut self) -> u32 {
         self.next() as u32
     }
 }
 
-fn ip(bits: u32) -> Ipv4Address {
+pub(super) fn ip(bits: u32) -> Ipv4Address {
     Ipv4Address::from_octets(bits.to_be_bytes())
 }
 
-fn bits(address: Ipv4Address) -> u32 {
+pub(super) fn bits(address: Ipv4Address) -> u32 {
     u32::from_be_bytes(address.octets())
 }
 
@@ -42,17 +42,17 @@ fn mask(len: u8) -> u32 {
     }
 }
 
-struct Tables {
-    routes: Vec<Route>,
-    interfaces: Vec<Interface>,
-    neighbors: Vec<Neighbor>,
-    local_ipv4: Vec<LocalIpv4Binding>,
+pub(super) struct Tables {
+    pub(super) routes: Vec<Route>,
+    pub(super) interfaces: Vec<Interface>,
+    pub(super) neighbors: Vec<Neighbor>,
+    pub(super) local_ipv4: Vec<LocalIpv4Binding>,
 }
 
 /// Random tables that pass snapshot validation: overlapping prefixes drawn
 /// from a few bases (so nesting is common), `/0` and `/32` included, a few
 /// interfaces, unique neighbors and one address per interface.
-fn random_tables(rng: &mut Rng, max_routes: u64) -> Tables {
+pub(super) fn random_tables(rng: &mut Rng, max_routes: u64) -> Tables {
     let interface_count = 1 + rng.below(6) as u16;
     let interfaces: Vec<Interface> = (0..interface_count)
         .map(|id| Interface {
@@ -129,7 +129,7 @@ fn random_tables(rng: &mut Rng, max_routes: u64) -> Tables {
 }
 
 /// Addresses that hit every interval boundary of the table plus random ones.
-fn probe_addresses(rng: &mut Rng, tables: &Tables) -> Vec<Ipv4Address> {
+pub(super) fn probe_addresses(rng: &mut Rng, tables: &Tables) -> Vec<Ipv4Address> {
     let mut addresses = vec![ip(0), ip(1), ip(u32::MAX), ip(u32::MAX - 1)];
     for route in &tables.routes {
         let first = bits(route.prefix());
@@ -159,7 +159,7 @@ fn probe_addresses(rng: &mut Rng, tables: &Tables) -> Vec<Ipv4Address> {
     addresses
 }
 
-fn interface_ids(tables: &Tables) -> Vec<IfId> {
+pub(super) fn interface_ids(tables: &Tables) -> Vec<IfId> {
     let mut ids: Vec<IfId> = tables
         .interfaces
         .iter()
@@ -170,7 +170,7 @@ fn interface_ids(tables: &Tables) -> Vec<IfId> {
     ids
 }
 
-fn owner(tables: &Tables) -> ValidatedForwardingOwner {
+pub(super) fn owner(tables: &Tables) -> ValidatedForwardingOwner {
     ValidatedForwardingOwner::new(
         tables.routes.clone().into_boxed_slice(),
         tables.interfaces.clone().into_boxed_slice(),
