@@ -282,7 +282,16 @@ lookupを通して届く先だけを作り直す。100万経路とlookup-vrfの�
    - 一つのNICの複数のqueueにsocketを付ける。XDPのプログラムはNICに一つで、queueごとのsocketへ回す（済み）。
    - socketを開いた後で別のスレッドへ渡せるようにする（済み）。socketは起動時にまとめて開き、worker iには
      全NICのqueue iのsocketを渡す。アダプタは今の作り（NICごとに一つのsocket）のまま、workerごとに一つ持つ。
-2. 「受け渡し」（CEのsocketとTUNの読み書き）をworkerから分ける。
+2. 「受け渡し」（CEのsocketとTUNの読み書き）をworkerから分ける。次の順に、PRを分けて進める。
+   - TUN、TAP、punt socket、制御プロセスのsocketを一つの値（受け渡し）にまとめる。動きは変えない。
+   - workerから外への書き込みをqueueに置き、受け渡しが書く。workerは分類と種類ごとの上限までを行い、
+     queueが一杯なら捨てて数える。書けたかどうかは受け渡しが数え、`Fe`がworkerの数と合わせて見せる。
+   - kernelとTAPと制御プロセスから読んだものを、受け渡しがqueueでworkerへ渡す。制御プロセスのフレームを
+     表の変更の後に出す決まり（`Sync`）はworkerに残す。
+   - 受け渡しを別のthreadで動かせるようにする（`Fe::detach_handover`）。TUNとTAPの付け外しは受け渡しへ
+     送る。
+   `Fe::step`は、受け渡しを別にしないときは「読む → worker → 書く」の順に回し、一回りの中の動きを今と
+   同じにする。
 3. 表の版を全部のworkerへ届ける。全workerが移ってから、古い版を解放してCEへ応答する。
    カウンタはworkerごとに持ち、制御が足す。
 4. workerを複数動かす。状態を持たない通信だけで、NATやfirewallを使う設定ではworkerを一つに制限する。
