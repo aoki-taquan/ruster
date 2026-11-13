@@ -1,5 +1,6 @@
 //! The short way through for the most common packet: an IPv4 datagram that is
-//! only forwarded, with no NAT to consult.
+//! only forwarded, perhaps judged by the forward firewall or translated from
+//! the inside out by NAT.
 //!
 //! [`decide`] makes the same checks as the full decision (`decide_ipv4`,
 //! `check_egress_mtu`) for that case, in the same functions, and answers only
@@ -19,9 +20,9 @@
 //! with the full decision's own functions; a datagram to the public address,
 //! ICMP, and configurations whose realms disagree go the full way.
 //!
-//! The answer, once sent ([`send`]), leaves the frame, the trace and the
-//! firewall as the full way would: `plain_ipv4_tests` compares both on random
-//! tables, rules and frames.
+//! The answer, once sent ([`send`], [`send_translated`]), leaves the frame,
+//! the trace, the firewall and NAT as the full way would: `plain_ipv4_tests`
+//! compares both on random tables, rules, NAT configurations and frames.
 
 use super::*;
 use crate::{PacketLease, PacketSlot};
