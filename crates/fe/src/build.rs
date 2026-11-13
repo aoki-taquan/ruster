@@ -432,10 +432,13 @@ fn covering(other: &BTreeMap<(IpAddr, u8), Entry>, lookup: (IpAddr, u8)) -> Opti
 /// they look up in, so that following a change does not go through them all.
 struct LookupIndex<'a> {
     /// Each VRF's lookups (prefix, VRF looked up in), in the order of the list.
-    of: BTreeMap<&'a str, Vec<((IpAddr, u8), &'a str)>>,
+    of: BTreeMap<&'a str, Vec<(Prefix, &'a str)>>,
     /// The lookups into each VRF (VRF they are in, prefix).
-    into: BTreeMap<&'a str, Vec<(&'a str, (IpAddr, u8))>>,
+    into: BTreeMap<&'a str, Vec<(&'a str, Prefix)>>,
 }
+
+/// A prefix and its length.
+type Prefix = (IpAddr, u8);
 
 impl<'a> LookupIndex<'a> {
     fn new(lookup_list: &'a [(String, (IpAddr, u8), String)]) -> Self {
