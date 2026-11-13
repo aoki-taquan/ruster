@@ -386,6 +386,9 @@ struct Worker<B> {
     pppoe: Vec<ruster_core::PppoeSession>,
     /// Each VRF's kernel interface, in the order of `vrfs`.
     kernel: Vec<IfId>,
+    /// The same as a bitmap by id ([`ruster_core::kernel_ingress_bits`]), which
+    /// each packet is looked up in.
+    kernel_bits: Vec<u64>,
     /// Each VRF's pipe to the kernel, for traffic addressed to the router.
     local: BTreeMap<String, Box<dyn LocalPipe>>,
     /// The TAP device of each interface that runs IS-IS or OSPF, by interface name.
@@ -508,6 +511,7 @@ where
             overlays: built.overlays,
             unreachable: built.unreachable,
             pppoe: built.pppoe,
+            kernel_bits: ruster_core::kernel_ingress_bits(&built.kernel),
             kernel: built.kernel,
             local: BTreeMap::new(),
             taps: BTreeMap::new(),
@@ -889,6 +893,7 @@ where
         self.overlays = built.overlays;
         self.unreachable = built.unreachable;
         self.pppoe = built.pppoe;
+        self.kernel_bits = ruster_core::kernel_ingress_bits(&built.kernel);
         self.kernel = built.kernel;
         self.active = built.active;
         // A bridge that stays keeps what it learned on the members it keeps.
@@ -953,6 +958,7 @@ where
                     .with_ipv6(&vrf.ipv6)
                     .with_local_to_control(self.local.contains_key(name))
                     .with_kernel_ingress(&self.kernel)
+                    .with_kernel_ingress_bits(&self.kernel_bits)
                     .with_vlans(&self.vlans)
                     .with_tunnels(&self.tunnels)
                     .with_srv6(&self.srv6)
@@ -972,6 +978,7 @@ where
             .with_overlays(&self.overlays)
             .with_pppoe(&self.pppoe)
             .with_kernel_ingress(&self.kernel)
+            .with_kernel_ingress_bits(&self.kernel_bits)
             .with_punt_frames(&self.punt_frames)
             .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(ports) = self.io.receive(RX_BUDGET) else {
@@ -981,7 +988,7 @@ where
         let mut from_kernel = kernel::Outcome::default();
         let batch = kernel::Joined {
             ports,
-            kernel_ids: &self.kernel,
+            kernel_ids: &self.kernel_bits,
             kernel: kernel_frames.into_iter(),
             outcome: &mut from_kernel,
             kernel_done: 0,

@@ -74,10 +74,10 @@ pub use forwarding::{
     Nat44TcpUnsolicitedSynDispatchReport, Nat44TcpUnsolicitedSynDisposition,
 };
 pub use forwarding::{
-    forward_batch, forward_batch_with_control, ArpPolicy, BatchReport, DropReason,
-    ForwardingSnapshot, Ipv4OriginPolicy, Ipv4OriginPolicyError, Nat44Icmpv4Disposition, NoTrace,
-    Services, SnapshotError, TraceEvent, TraceSink, ValidatedForwardingOwner,
-    ValidatedForwardingOwnerError,
+    forward_batch, forward_batch_with_control, kernel_ingress_bits, ArpPolicy, BatchReport,
+    DropReason, ForwardingSnapshot, Ipv4OriginPolicy, Ipv4OriginPolicyError,
+    Nat44Icmpv4Disposition, NoTrace, Services, SnapshotError, TraceEvent, TraceSink,
+    ValidatedForwardingOwner, ValidatedForwardingOwnerError,
 };
 pub use generated::{
     GeneratedAllocationError, GeneratedBatchCompletion, GeneratedPacketBatch, GeneratedPacketIo,

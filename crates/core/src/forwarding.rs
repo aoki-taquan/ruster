@@ -1380,6 +1380,9 @@ pub struct ForwardingSnapshot<'a> {
     /// Interfaces whose packets the router's own stack sent
     /// ([`ForwardingSnapshot::with_kernel_ingress`]).
     pub(crate) kernel_ingress: &'a [IfId],
+    /// The same as a bitmap by interface id, when the caller gave one
+    /// ([`ForwardingSnapshot::with_kernel_ingress_bits`]).
+    pub(crate) kernel_ingress_bits: &'a [u64],
     /// IPv4 in IPv6 tunnels ([`ForwardingSnapshot::with_tunnels`]).
     pub(crate) tunnels: &'a [crate::Ipv4InIpv6Tunnel],
     /// Bridge members that carry frames inside IP
@@ -1625,6 +1628,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6: None,
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
+            kernel_ingress_bits: &[],
             tunnels: &[],
             overlays: &[],
             srv6: None,
@@ -1834,6 +1838,18 @@ impl<'a> ForwardingSnapshot<'a> {
         }
     }
 
+    /// The interfaces of [`Self::with_kernel_ingress`] as a bitmap (bit `id % 64`
+    /// of word `id / 64`), which every packet then looks up instead of going
+    /// through the list: with many VRFs the list is long. It must name exactly
+    /// those interfaces; [`kernel_ingress_bits`] makes it.
+    #[must_use]
+    pub fn with_kernel_ingress_bits(self, kernel_ingress_bits: &'a [u64]) -> Self {
+        Self {
+            kernel_ingress_bits,
+            ..self
+        }
+    }
+
     /// Where a packet the router itself sends to `destination` goes: the route's
     /// egress interface and its MAC, the next hop, and the next hop's MAC when the
     /// neighbor table has it. `None` without a route (or IPv6 tables, for IPv6).
@@ -1879,7 +1895,13 @@ impl<'a> ForwardingSnapshot<'a> {
 
     /// Whether `ingress` is one of [`Self::with_kernel_ingress`].
     pub(crate) fn is_kernel_ingress(&self, ingress: IfId) -> bool {
-        self.kernel_ingress.contains(&ingress)
+        if self.kernel_ingress_bits.is_empty() {
+            return self.kernel_ingress.contains(&ingress);
+        }
+        let id = usize::from(ingress.0);
+        self.kernel_ingress_bits
+            .get(id / 64)
+            .is_some_and(|word| word >> (id % 64) & 1 == 1)
     }
 
     /// Next hops the control side could not resolve (interface, address): a
@@ -2083,6 +2105,7 @@ impl<'a> ForwardingSnapshot<'a> {
             ipv6: None,
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
+            kernel_ingress_bits: &[],
             tunnels: &[],
             overlays: &[],
             srv6: None,
@@ -2540,6 +2563,7 @@ impl ValidatedForwardingOwner {
             ipv6: None,
             ipv6_forwarding_blocked: false,
             kernel_ingress: &[],
+            kernel_ingress_bits: &[],
             tunnels: &[],
             overlays: &[],
             srv6: None,
@@ -10480,5 +10504,49 @@ mod tests {
             .collect();
         let listed: Vec<String> = DropReason::ALL.iter().map(|r| format!("{r:?}")).collect();
         assert_eq!(declared, listed);
+    }
+}
+
+/// The bitmap of [`ForwardingSnapshot::with_kernel_ingress_bits`] for `kernel`.
+#[must_use]
+pub fn kernel_ingress_bits(kernel: &[IfId]) -> Vec<u64> {
+    let words = kernel
+        .iter()
+        .map(|id| usize::from(id.0) / 64 + 1)
+        .max()
+        .unwrap_or(0);
+    let mut bits = vec![0_u64; words];
+    for id in kernel {
+        let id = usize::from(id.0);
+        bits[id / 64] |= 1 << (id % 64);
+    }
+    bits
+}
+
+#[cfg(test)]
+mod kernel_ingress_bits_tests {
+    use super::*;
+
+    /// The bitmap names exactly the listed interfaces, across words.
+    #[test]
+    fn the_bitmap_answers_as_the_list_does() {
+        for kernel in [
+            vec![],
+            vec![IfId(0)],
+            vec![IfId(2), IfId(63), IfId(64), IfId(65)],
+            vec![IfId(130), IfId(7), IfId(129)],
+        ] {
+            let bits = kernel_ingress_bits(&kernel);
+            let list = ForwardingSnapshot::new(&[], &[], &[], &[])
+                .expect("empty tables")
+                .with_kernel_ingress(&kernel);
+            let both = list.with_kernel_ingress_bits(&bits);
+            for id in 0..200 {
+                let id = IfId(id);
+                assert_eq!(list.is_kernel_ingress(id), kernel.contains(&id));
+                // An empty bitmap falls back to the list.
+                assert_eq!(both.is_kernel_ingress(id), kernel.contains(&id), "{id:?}");
+            }
+        }
     }
 }
