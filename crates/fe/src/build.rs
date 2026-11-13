@@ -210,16 +210,21 @@ impl Tables {
 impl Routes {
     /// Whether these, made for the tables before a change, can be brought to
     /// `store` by making the change to them: `changed` (each entry touched and what
-    /// it held before) is routes only, none of them an SRv6 one, and every VRF they
-    /// are in has routes before and after (so the VRFs stay the same).
+    /// it held before) is routes and neighbors only, none of the routes an SRv6
+    /// one, and every VRF the routes are in has routes before and after (so the
+    /// VRFs stay the same). A neighbor changes no route: what a route comes to
+    /// depends on the interfaces alone ([`forwarding`]), and the neighbors are read
+    /// from the tables in every build.
     fn follows(&self, changed: Changed<'_>, store: &Store) -> bool {
         if self.srv6 {
             return false;
         }
         let mut growth: BTreeMap<&str, isize> = BTreeMap::new();
         for (key, before) in changed {
-            let Key::Route { vrf, .. } = key else {
-                return false;
+            let vrf = match key {
+                Key::Route { vrf, .. } => vrf,
+                Key::Neighbor { .. } => continue,
+                _ => return false,
             };
             let after = store.get(key);
             let plain = match after {
@@ -1597,6 +1602,7 @@ mod tests {
         };
         let mut config = connect(&mut server, &[sid::INTERFACE]);
         let mut routes = connect(&mut server, &[sid::ROUTE]);
+        let mut neighbors = connect(&mut server, &[sid::NEIGHBOR]);
         config
             .patch(&[
                 interface("p0", true, DEFAULT_VRF),
@@ -1604,7 +1610,7 @@ mod tests {
                 interface("p2", true, "blue"),
             ])
             .unwrap();
-        for _ in 0..300 {
+        for _ in 0..400 {
             match rng.below(40) {
                 // The interfaces change: the kept routes do not follow that.
                 0 => {
@@ -1622,6 +1628,21 @@ mod tests {
                     routes.patch(&again).unwrap();
                     routes.resync_end();
                 }
+                // A neighbor comes, changes or goes: the kept routes stay as they
+                // are, whatever else the tables hold.
+                2..=9 => {
+                    let key = Key::Neighbor {
+                        interface: rng.pick(&["p0", "p1", "p2"]).into(),
+                        address: std::net::Ipv4Addr::new(10, 0, 0, 1 + rng.below(3) as u8).into(),
+                    };
+                    let change = if rng.below(3) == 0 {
+                        Change::delete(key)
+                    } else {
+                        let mac = [2, 0, 0, 0, 0, 1 + rng.below(4) as u8];
+                        Change::set(key, Value::Neighbor { mac })
+                    };
+                    neighbors.patch(&[change]).unwrap();
+                }
                 // Routes, a few at once, at times the same one twice.
                 _ => {
                     let changes: Vec<Change> = (0..1 + rng.below(4))
@@ -1633,6 +1654,7 @@ mod tests {
             for _ in 0..4 {
                 config.poll();
                 routes.poll();
+                neighbors.poll();
                 server.step(&mut hook);
             }
         }
@@ -1708,13 +1730,15 @@ mod tests {
             };
             let mut config = connect(&mut server, &[sid::INTERFACE]);
             let mut routes = connect(&mut server, &[sid::ROUTE]);
-            let mut send = |client: &mut Client, hook: &mut Timed, changes: &[Change]| {
-                client.patch(changes).unwrap();
-                while client.poll().1.is_empty() {
-                    server.step(hook);
-                }
-            };
+            let send =
+                |server: &mut Server, client: &mut Client, hook: &mut Timed, changes: &[Change]| {
+                    client.patch(changes).unwrap();
+                    while client.poll().1.is_empty() {
+                        server.step(hook);
+                    }
+                };
             send(
+                &mut server,
                 &mut config,
                 &mut hook,
                 &[
@@ -1728,7 +1752,7 @@ mod tests {
                 let changes: Vec<Change> = (first..count.min(first + 1000))
                     .map(|index| route(index, "p0"))
                     .collect();
-                send(&mut routes, &mut hook, &changes);
+                send(&mut server, &mut routes, &mut hook, &changes);
             }
             let load = started.elapsed();
             let load_build = std::mem::take(&mut hook.spent);
@@ -1736,13 +1760,36 @@ mod tests {
             let started = Instant::now();
             for round in 0..20 {
                 let interface = ["p1", "p0"][round % 2];
-                send(&mut routes, &mut hook, &[route(count / 2, interface)]);
+                send(
+                    &mut server,
+                    &mut routes,
+                    &mut hook,
+                    &[route(count / 2, interface)],
+                );
             }
             let one = started.elapsed() / 20;
-            let one_build: Duration = hook.spent / 20;
+            let one_build: Duration = std::mem::take(&mut hook.spent) / 20;
+            // Then one neighbor changes, 20 times, as when neighd learns one.
+            let mut neighbors = connect(&mut server, &[sid::NEIGHBOR]);
+            let started = Instant::now();
+            for round in 0..20_u8 {
+                let neighbor = Change::set(
+                    Key::Neighbor {
+                        interface: "p0".into(),
+                        address: "192.0.2.1".parse().unwrap(),
+                    },
+                    Value::Neighbor {
+                        mac: [2, 0, 0, 0, 0, round],
+                    },
+                );
+                send(&mut server, &mut neighbors, &mut hook, &[neighbor]);
+            }
+            let neighbor = started.elapsed() / 20;
+            let neighbor_build: Duration = hook.spent / 20;
             println!(
                 "{count} routes: the whole table in {load:?} (building {load_build:?}), \
-                 one route in {one:?} (building {one_build:?})"
+                 one route in {one:?} (building {one_build:?}), \
+                 one neighbor in {neighbor:?} (building {neighbor_build:?})"
             );
         }
     }
