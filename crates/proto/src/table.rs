@@ -724,8 +724,11 @@ impl Change {
                 name(vrf)?;
                 // The prefix is an address already: what a text of it is checked
                 // for is left.
-                if *len > max_len(prefix) || network(*prefix, *len) != *prefix {
-                    return Err(ModelError::Invalid("prefix"));
+                if *len > max_len(prefix) {
+                    return Err(ModelError::Invalid("prefix length"));
+                }
+                if network(*prefix, *len) != *prefix {
+                    return Err(ModelError::Invalid("prefix (host bits set)"));
                 }
             }
         }
@@ -2809,11 +2812,14 @@ mod ip_text_tests {
         for _ in 0..10_000 {
             let bits = next();
             addresses.push(IpAddr::V4((bits as u32).into()));
-            // Runs of zero groups at random places.
-            let mask = next() & next();
-            let wide =
-                (u128::from(bits) << 64 | u128::from(next())) & u128::from(mask).rotate_left(32);
+            // Zero groups, in runs or not, at random places.
+            let mask = (u128::from(next()) << 64 | u128::from(next()))
+                & (u128::from(next()) << 64 | u128::from(next()));
+            let wide = (u128::from(bits) << 64 | u128::from(next())) & mask;
             addresses.push(IpAddr::V6(wide.into()));
+            // An IPv4-mapped address.
+            let mapped = std::net::Ipv4Addr::from(bits as u32).to_ipv6_mapped();
+            addresses.push(IpAddr::V6(mapped));
         }
         for address in addresses {
             assert_eq!(IpText::of(address).as_str(), address.to_string());
