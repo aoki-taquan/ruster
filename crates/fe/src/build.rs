@@ -428,12 +428,43 @@ fn covering(other: &BTreeMap<(IpAddr, u8), Entry>, lookup: (IpAddr, u8)) -> Opti
         })
 }
 
+/// The lookups of [`Routes::lookup_list`] by the VRF they are in and by the VRF
+/// they look up in, so that following a change does not go through them all.
+struct LookupIndex<'a> {
+    /// Each VRF's lookups (prefix, VRF looked up in), in the order of the list.
+    of: BTreeMap<&'a str, Vec<((IpAddr, u8), &'a str)>>,
+    /// The lookups into each VRF (VRF they are in, prefix).
+    into: BTreeMap<&'a str, Vec<(&'a str, (IpAddr, u8))>>,
+}
+
+impl<'a> LookupIndex<'a> {
+    fn new(lookup_list: &'a [(String, (IpAddr, u8), String)]) -> Self {
+        let mut index = Self {
+            of: BTreeMap::new(),
+            into: BTreeMap::new(),
+        };
+        for (vrf, lookup, other) in lookup_list {
+            index
+                .of
+                .entry(vrf.as_str())
+                .or_default()
+                .push((*lookup, other.as_str()));
+            index
+                .into
+                .entry(other.as_str())
+                .or_default()
+                .push((vrf.as_str(), *lookup));
+        }
+        index
+    }
+}
+
 /// What [`expand_lookups`] gives VRF `vrf` for the prefix `key`, found without
 /// expanding: its own route there, or else the first of its lookups (in
 /// `lookup_list`) that brings one in, as the expansion takes them.
 fn expanded_at(
     entries: &Entries,
-    lookup_list: &[(String, (IpAddr, u8), String)],
+    lookups: &LookupIndex<'_>,
     vrf: &str,
     key: (IpAddr, u8),
 ) -> Option<Forward> {
@@ -442,8 +473,8 @@ fn expanded_at(
         return Some(route.clone());
     }
     let no_entries = BTreeMap::new();
-    for (_, lookup, other) in lookup_list.iter().filter(|(of, ..)| of == vrf) {
-        let other = entries.get(other).unwrap_or(&no_entries);
+    for (lookup, other) in lookups.of.get(vrf).map_or(&[][..], Vec::as_slice) {
+        let other = entries.get(*other).unwrap_or(&no_entries);
         if within(key, *lookup) {
             if let Some(Entry::Forward(route)) = other.get(&key) {
                 if !shadowed(own, *lookup, key) {
@@ -471,7 +502,7 @@ fn expanded_at(
 ///   (the covering route).
 fn follow_lookups<'e>(
     entries: &'e Entries,
-    lookup_list: &'e [(String, (IpAddr, u8), String)],
+    lookups: &LookupIndex<'e>,
     changed: Changed<'e>,
 ) -> BTreeSet<(&'e str, (IpAddr, u8))> {
     let no_entries = BTreeMap::new();
@@ -485,22 +516,24 @@ fn follow_lookups<'e>(
         }
         let at = (*prefix, *len);
         affected.insert((vrf.as_str(), at));
-        for (of, lookup, other) in lookup_list {
-            if of == vrf && lookup.1 < at.1 && within(at, *lookup) {
-                let other = entries.get(other).unwrap_or(&no_entries);
+
+        let vrf = vrf.as_str();
+        for (lookup, other) in lookups.of.get(vrf).map_or(&[][..], Vec::as_slice) {
+            if lookup.1 < at.1 && within(at, *lookup) {
+                let other = entries.get(*other).unwrap_or(&no_entries);
                 for (&inner, _) in other.range((at.0, 0)..=(last_address(at), u8::MAX)) {
                     if within(inner, at) {
-                        affected.insert((of.as_str(), inner));
+                        affected.insert((vrf, inner));
                     }
                 }
             }
-            if other == vrf {
-                if within(at, *lookup) {
-                    affected.insert((of.as_str(), at));
-                }
-                if at.1 < lookup.1 && within(*lookup, at) {
-                    affected.insert((of.as_str(), *lookup));
-                }
+        }
+        for (of, lookup) in lookups.into.get(vrf).map_or(&[][..], Vec::as_slice) {
+            if within(at, *lookup) {
+                affected.insert((of, at));
+            }
+            if at.1 < lookup.1 && within(*lookup, at) {
+                affected.insert((of, *lookup));
             }
         }
     }
@@ -1213,9 +1246,10 @@ pub(crate) fn build(
     // every entry.
     let mut tables = match kept_tables.filter(|_| !lookup_changed) {
         Some(mut tables) => {
-            for (vrf, key) in follow_lookups(&entries, &lookup_list, changed) {
+            let index = LookupIndex::new(&lookup_list);
+            for (vrf, key) in follow_lookups(&entries, &index, changed) {
                 let table = tables.entry(vrf.to_owned()).or_default();
-                match expanded_at(&entries, &lookup_list, vrf, key) {
+                match expanded_at(&entries, &index, vrf, key) {
                     Some(route) => table.set(&route, vrf)?,
                     None => table.remove(key.0, key.1),
                 }
@@ -1849,6 +1883,9 @@ mod tests {
             ("10.0.0.0", 8),
             ("10.1.0.0", 16),
             ("10.1.2.0", 24),
+            ("10.1.2.16", 28),
+            ("10.1.2.17", 32),
+            ("10.2.0.0", 16),
             ("192.0.2.0", 24),
             ("::", 0),
             ("2001:db8::", 32),
@@ -1880,7 +1917,10 @@ mod tests {
             25..=27 => RouteAction::Discard,
             28..=30 => RouteAction::Reject,
             31..=32 => RouteAction::Local,
-            33..=36 if lookups => RouteAction::LookupVrf(rng.pick(&VRFS).into()),
+            // At times into a VRF that has no interface and no route.
+            33..=36 if lookups => {
+                RouteAction::LookupVrf(rng.pick(&[VRFS[0], VRFS[1], VRFS[2], "green"]).into())
+            }
             33..=36 => RouteAction::Discard,
             // The kinds the kept routes cannot follow.
             37 if v6 => RouteAction::Gateways(vec!["2001:db8::1".parse().unwrap()]),
