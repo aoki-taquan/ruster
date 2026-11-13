@@ -42,6 +42,7 @@ use std::net::IpAddr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use ruster_core::{
@@ -253,8 +254,10 @@ impl Task for Control {
 }
 
 /// The tables built for one accepted store, with its firewall and NAT.
+/// The tables are shared by reference: a worker reads them, and gives the
+/// version it moved away from back to the control task, which frees it.
 type Version = (
-    build::Built,
+    Arc<build::Built>,
     firewall::Publication,
     Option<nat::Publication>,
 );
@@ -281,6 +284,9 @@ enum FromWorker {
     /// before the frame is read within [`SYNC_STEPS`] steps of the control task (64
     /// requests and 64 KiB a connection in each).
     Sync(u64),
+    /// The tables of a version the worker moved away from, to be freed here, not
+    /// on the worker's thread.
+    Retired(Arc<build::Built>),
 }
 
 /// The steps of the control task after which a [`FromWorker::Sync`] is answered
@@ -327,6 +333,7 @@ impl ControlTask {
                 self.sync_wanted = Some(number);
                 self.sync_steps = 0;
             }
+            FromWorker::Retired(tables) => drop(tables),
         }
     }
 
@@ -347,6 +354,8 @@ impl ControlTask {
         let progress = self.server.step(&mut self.builder);
         // Of several versions built in one step, the last.
         if let Some(version) = self.builder.built.take() {
+            let (built, publication, nat) = version;
+            let version = (Arc::new(built), publication, nat);
             let sent = self.versions.send(ToWorker::Version(Box::new(version)));
             self.worker_gone |= sent.is_err();
             self.awaiting_worker = true;
@@ -371,27 +380,14 @@ struct Worker<B> {
     io: B,
     /// The backend's ports, in order: port `i` is `IfId(i)`.
     ports: Vec<String>,
-    /// Core's tables per VRF, the default VRF first.
-    vrfs: Vec<build::Vrf>,
-    /// For each port, the index in `vrfs` of its VRF.
-    by_ingress: Vec<u16>,
-    /// The VRF names, in the order of `vrfs`.
-    names: Vec<String>,
-    /// Every interface's name by id: the ports, then the others (VLAN
-    /// sub-interfaces, tunnels, PPPoE sessions, the kernel's), each keeping its id
-    /// across table changes; an empty name is an id no interface has.
-    interface_names: Vec<String>,
-    vlans: Vec<VlanBinding>,
-    tunnels: Vec<ruster_core::Ipv4InIpv6Tunnel>,
-    /// The router's SRv6 SIDs and SR policies.
-    srv6: ruster_core::Srv6Table,
-    /// The bridge members that carry frames inside IP.
-    overlays: Vec<ruster_core::Overlay>,
-    unreachable: Vec<(IfId, ruster_core::Ipv4Address)>,
-    pppoe: Vec<ruster_core::PppoeSession>,
-    /// Each VRF's kernel interface, in the order of `vrfs`.
-    kernel: Vec<IfId>,
-    /// The same as a bitmap by id ([`ruster_core::kernel_ingress_bits`]), which
+    /// The tables of the version in use: core's tables per VRF (the default VRF
+    /// first), the VRF of each port, the names of the VRFs and of every interface
+    /// by id (the ports, then the others, each keeping its id across table changes;
+    /// an empty name is an id no interface has), the VLAN sub-interfaces, tunnels,
+    /// SRv6, overlays, PPPoE sessions, kernel interfaces, punt classes and the
+    /// enabled interfaces.
+    tables: Arc<build::Built>,
+    /// Each VRF's kernel interface as a bitmap by id ([`ruster_core::kernel_ingress_bits`]), which
     /// each packet is looked up in.
     kernel_bits: Vec<u64>,
     /// The pipes to the kernel, the TAP devices and the sockets to the control
@@ -409,14 +405,10 @@ struct Worker<B> {
     /// The queues to and from the handover's writes on another thread
     /// ([`Fe::detach_handover`]); `None` while they are written here.
     writer: Option<(Sender<handover::ToWriter>, Receiver<handover::Written>)>,
-    /// The classes of the punt table.
-    classes: punt_table::Classes,
     /// Their rate limits and counters; to the kernel, per VRF in the order of
     /// `vrfs`: a flood in one VRF does not crowd out another's (BGP in another VRF,
     /// say).
     limits: punt_table::Limits,
-    /// The interfaces enabled in the current tables.
-    active: Vec<IfId>,
     /// The versions the control task built; the worker moves to the last.
     versions: Receiver<ToWorker>,
     to_control: Sender<FromWorker>,
@@ -493,6 +485,7 @@ where
             .check(&Store::default())
             .expect("empty tables build");
         let (built, _, _) = builder.built.take().expect("built");
+        let built = Arc::new(built);
         builder.names.clone_from(&built.interface_names);
         let limits = punt_table::Limits::new(&built.punt, built.vrfs.len());
         let (versions, from_control) = mpsc::channel();
@@ -512,18 +505,7 @@ where
         let worker = Worker {
             io,
             ports,
-            vrfs: built.vrfs,
-            by_ingress: built.by_ingress,
-            names: built.names,
-            interface_names: built.interface_names,
-            vlans: built.vlans,
-            tunnels: built.tunnels,
-            srv6: built.srv6,
-            overlays: built.overlays,
-            unreachable: built.unreachable,
-            pppoe: built.pppoe,
             kernel_bits: ruster_core::kernel_ingress_bits(&built.kernel),
-            kernel: built.kernel,
             handover: handover::Handover::default(),
             outbox: Vec::new(),
             spare: Vec::new(),
@@ -531,10 +513,9 @@ where
             version: 0,
             writer: None,
             limits,
-            classes: built.punt,
-            active: built.active,
             versions: from_control,
             to_control,
+            tables: built,
             control_gone: false,
             detached: false,
             held: None,
@@ -664,10 +645,11 @@ where
     /// classes of the current tables.
     pub fn tap_interfaces(&self) -> Vec<String> {
         self.worker
-            .classes
+            .tables
+            .punt
             .taps()
             .into_iter()
-            .filter_map(|id| self.worker.interface_names.get(usize::from(id.0)))
+            .filter_map(|id| self.worker.tables.interface_names.get(usize::from(id.0)))
             .filter(|name| !name.is_empty())
             .cloned()
             .collect()
@@ -697,6 +679,7 @@ where
             for &member in self.worker.bridges.members(bridge) {
                 let port = self
                     .worker
+                    .tables
                     .vlans
                     .iter()
                     .find(|v| v.sub == member)
@@ -721,22 +704,23 @@ where
     /// members' is, a tunnel member counting as up; another's (a tunnel's, a PPPoE
     /// session's, which IS-IS and OSPF do not run on) is up.
     pub fn link_up(&self, interface: &str, ports_up: &[bool]) -> bool {
-        interface_id(&self.worker.interface_names, interface)
+        interface_id(&self.worker.tables.interface_names, interface)
             .is_some_and(|id| self.interface_link_up(id, ports_up))
     }
 
     fn interface_link_up(&self, id: IfId, ports_up: &[bool]) -> bool {
-        if !self.worker.active.contains(&id) {
+        if !self.worker.tables.active.contains(&id) {
             return false;
         }
         let member_up = |member: IfId| {
             let port = self
                 .worker
+                .tables
                 .vlans
                 .iter()
                 .find(|v| v.sub == member)
                 .map_or(member, |v| v.parent);
-            if !self.worker.active.contains(&port) {
+            if !self.worker.tables.active.contains(&port) {
                 return false;
             }
             if usize::from(port.0) < self.worker.ports.len() {
@@ -763,7 +747,7 @@ where
 
     /// The VRFs of the current tables, the default VRF first.
     pub fn vrfs(&self) -> &[String] {
-        &self.worker.names
+        &self.worker.tables.names
     }
 
     pub fn io_mut(&mut self) -> &mut B {
@@ -1044,6 +1028,7 @@ where
         // every VRF's, so that flows leaked in from another VRF go when its
         // route changed.
         let current: Vec<_> = self
+            .tables
             .vrfs
             .iter()
             .map(|vrf| vrf.owner.snapshot().with_ipv6(&vrf.ipv6))
@@ -1056,29 +1041,28 @@ where
         if let Err(error) = firewall::Firewall::publish(
             &mut self.firewall,
             publication,
-            current[0].with_vrfs(&current, &self.by_ingress),
+            current[0].with_vrfs(&current, &self.tables.by_ingress),
             next[0].with_vrfs(&next, &built.by_ingress),
         ) {
             eprintln!("ruster-fe: {error}");
         }
-        self.vrfs = built.vrfs;
-        self.by_ingress = built.by_ingress;
-        if self.names != built.names {
+        if self.tables.names != built.names {
             // The per-VRF buckets start again.
             self.limits.update(&built.punt, 0);
         }
         self.limits.update(&built.punt, built.names.len());
         self.punt_frames = built.punt.frame_matches();
         self.handover.controls.follow(built.punt.controls());
-        self.classes = built.punt;
-        self.names = built.names;
-        self.interface_names = built.interface_names;
+        self.kernel_bits = ruster_core::kernel_ingress_bits(&built.kernel);
+        let old = std::mem::replace(&mut self.tables, built);
+        // Freed on the control task's side; here only when it is gone.
+        let _ = self.to_control.send(FromWorker::Retired(old));
         self.version += 1;
         self.handover_names = handover::Names {
-            interfaces: self.interface_names.clone(),
-            vrfs: self.names.clone(),
-            controls: (0..self.classes.len())
-                .map(|class| match &self.classes.get(class).destination {
+            interfaces: self.tables.interface_names.clone(),
+            vrfs: self.tables.names.clone(),
+            controls: (0..self.tables.punt.len())
+                .map(|class| match &self.tables.punt.get(class).destination {
                     PuntDestination::Control(name) => Some(name.clone()),
                     _ => None,
                 })
@@ -1086,17 +1070,9 @@ where
         };
         self.endpoints_changed();
         self.tell_writer(handover::ToWriter::Names(self.handover_names.clone()));
-        self.vlans = built.vlans;
-        self.tunnels = built.tunnels;
-        self.srv6 = built.srv6;
-        self.overlays = built.overlays;
-        self.unreachable = built.unreachable;
-        self.pppoe = built.pppoe;
-        self.kernel_bits = ruster_core::kernel_ingress_bits(&built.kernel);
-        self.kernel = built.kernel;
-        self.active = built.active;
         // A bridge that stays keeps what it learned on the members it keeps.
-        let old_of_new: Vec<Option<u16>> = built
+        let old_of_new: Vec<Option<u16>> = self
+            .tables
             .bridges
             .iter()
             .map(|(name, _)| {
@@ -1104,11 +1080,11 @@ where
                 u16::try_from(at).ok()
             })
             .collect();
-        let (names, configs): (Vec<String>, Vec<_>) = built.bridges.into_iter().unzip();
+        let (names, configs): (Vec<String>, Vec<_>) = self.tables.bridges.iter().cloned().unzip();
         self.bridge_names = names;
         let left = self
             .bridges
-            .publish(configs, &old_of_new, &built.bridge_statics);
+            .publish(configs, &old_of_new, &self.tables.bridge_statics);
         if left > 0 {
             eprintln!("ruster-fe: {left} static MAC addresses left out: the table is full");
         }
@@ -1147,22 +1123,23 @@ where
         kernel_frames.append(&mut self.reassembled);
         // One snapshot per VRF; each packet uses its ingress interface's.
         let snapshots: Vec<_> = self
+            .tables
             .vrfs
             .iter()
-            .zip(&self.names)
+            .zip(&self.tables.names)
             .map(|(vrf, name)| {
                 vrf.owner
                     .snapshot()
                     .with_arp_to_control(true)
                     .with_ipv6(&vrf.ipv6)
                     .with_local_to_control(self.handover.has_local(name))
-                    .with_kernel_ingress(&self.kernel)
+                    .with_kernel_ingress(&self.tables.kernel)
                     .with_kernel_ingress_bits(&self.kernel_bits)
-                    .with_vlans(&self.vlans)
-                    .with_tunnels(&self.tunnels)
-                    .with_srv6(&self.srv6)
-                    .with_unreachable_neighbors(&self.unreachable)
-                    .with_pppoe(&self.pppoe)
+                    .with_vlans(&self.tables.vlans)
+                    .with_tunnels(&self.tables.tunnels)
+                    .with_srv6(&self.tables.srv6)
+                    .with_unreachable_neighbors(&self.tables.unreachable)
+                    .with_pppoe(&self.tables.pppoe)
             })
             .collect();
         let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
@@ -1170,13 +1147,13 @@ where
         // not forwarded through the default VRF rather than forwarded unchecked.
         let snapshot = snapshots[0]
             .with_now(MonotonicMillis(now_ms))
-            .with_vrfs(&snapshots, &self.by_ingress)
-            .with_vlans(&self.vlans)
-            .with_tunnels(&self.tunnels)
-            .with_srv6(&self.srv6)
-            .with_overlays(&self.overlays)
-            .with_pppoe(&self.pppoe)
-            .with_kernel_ingress(&self.kernel)
+            .with_vrfs(&snapshots, &self.tables.by_ingress)
+            .with_vlans(&self.tables.vlans)
+            .with_tunnels(&self.tables.tunnels)
+            .with_srv6(&self.tables.srv6)
+            .with_overlays(&self.tables.overlays)
+            .with_pppoe(&self.tables.pppoe)
+            .with_kernel_ingress(&self.tables.kernel)
             .with_kernel_ingress_bits(&self.kernel_bits)
             .with_punt_frames(&self.punt_frames)
             .with_ipv6_forwarding_blocked(firewall.is_some());
@@ -1244,7 +1221,11 @@ where
         self.counters.from_kernel_dropped += from_kernel.dropped;
         for (egress, frame) in from_kernel.to_kernel {
             let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
-            let vrf = self.kernel.iter().position(|&kernel| kernel == egress);
+            let vrf = self
+                .tables
+                .kernel
+                .iter()
+                .position(|&kernel| kernel == egress);
             // From the kernel itself: by its kind, as no interface names it.
             let class = punt_table::built_in(local::kind(packet));
             if self.admit_to_kernel(class, vrf, now_ms) && self.write_kernel(egress, &frame) {
@@ -1255,7 +1236,7 @@ where
             }
         }
         for (egress, frame) in from_kernel.sent {
-            let sent = if self.kernel.contains(&egress) {
+            let sent = if self.tables.kernel.contains(&egress) {
                 self.write_kernel(egress, frame.bytes())
             } else {
                 self.send_port(egress, None, frame.bytes())
@@ -1336,7 +1317,7 @@ where
             match kind {
                 ControlKind::Punt(class) => {
                     let class = usize::from(class);
-                    if self.classes.get(class).destination == PuntDestination::Tap {
+                    if self.tables.punt.get(class).destination == PuntDestination::Tap {
                         self.hand_to_tap(class, ingress, &bytes, now_ms);
                     } else {
                         self.hand_to_control(class, ingress, &bytes, now_ms);
@@ -1352,8 +1333,8 @@ where
                 }
                 ControlKind::Local => {
                     let packet = &bytes[ETHERNET_HEADER..];
-                    let class = self.classes.of_local(ingress, packet);
-                    match self.classes.get(class).destination {
+                    let class = self.tables.punt.of_local(ingress, packet);
+                    match self.tables.punt.get(class).destination {
                         PuntDestination::Control(_) => {
                             self.hand_to_control(class, ingress, &bytes, now_ms);
                         }
@@ -1432,7 +1413,7 @@ where
     /// with those of punt class `class`.
     fn punt_frame(&mut self, ingress: IfId, reason: u16, class: Option<usize>, frame: &[u8]) {
         // An id no interface has now (a hole the tables left) is not sent.
-        if name_at(&self.interface_names, usize::from(ingress.0)).is_none_or(str::is_empty) {
+        if name_at(&self.tables.interface_names, usize::from(ingress.0)).is_none_or(str::is_empty) {
             return;
         }
         if !self.handover.has_punt() {
@@ -1446,7 +1427,7 @@ where
         let good = Punt {
             direction: Direction::ToControl,
             reason,
-            interface: &self.interface_names[usize::from(ingress.0)],
+            interface: &self.tables.interface_names[usize::from(ingress.0)],
             frame,
         }
         .encode(&mut message)
@@ -1456,7 +1437,7 @@ where
 
     /// Sends the whole `frame` of punt class `class` to its control process.
     fn hand_to_control(&mut self, class: usize, ingress: IfId, frame: &[u8], now_ms: u64) {
-        let entry = self.classes.get(class);
+        let entry = self.tables.punt.get(class);
         if !matches!(entry.destination, PuntDestination::Control(_)) {
             self.limits.dropped(class);
             return;
@@ -1466,7 +1447,7 @@ where
             PuntMatch::Kind(PuntKind::PppControl) => punt::reason::PPP_CONTROL,
             _ => punt::reason::IP,
         };
-        if name_at(&self.interface_names, usize::from(ingress.0)).is_none_or(str::is_empty) {
+        if name_at(&self.tables.interface_names, usize::from(ingress.0)).is_none_or(str::is_empty) {
             self.limits.dropped(class);
             return;
         }
@@ -1477,7 +1458,7 @@ where
         let good = Punt {
             direction: Direction::ToControl,
             reason: why,
-            interface: &self.interface_names[usize::from(ingress.0)],
+            interface: &self.tables.interface_names[usize::from(ingress.0)],
             frame,
         }
         .encode(&mut message)
@@ -1489,6 +1470,7 @@ where
     /// interface it came in on.
     fn hand_to_tap(&mut self, class: usize, ingress: IfId, frame: &[u8], now_ms: u64) {
         let tap = self
+            .tables
             .interface_names
             .get(usize::from(ingress.0))
             .filter(|name| !name.is_empty() && self.handover.has_tap(name));
@@ -1519,8 +1501,8 @@ where
         // One byte more than taken, to see a frame that was cut short.
         let mut buf = [0_u8; PUNT_MAX + 1];
         for name in names {
-            let id =
-                interface_id(&self.interface_names, &name).filter(|id| self.active.contains(id));
+            let id = interface_id(&self.tables.interface_names, &name)
+                .filter(|id| self.tables.active.contains(id));
             for _ in 0..INJECT_PER_STEP {
                 let Some(n) = self.handover.recv_tap(&name, &mut buf) else {
                     break;
@@ -1529,7 +1511,7 @@ where
                     self.counters.from_tap_dropped += 1;
                     continue;
                 }
-                let vrf = id.and_then(|id| self.by_ingress.get(usize::from(id.0)));
+                let vrf = id.and_then(|id| self.tables.by_ingress.get(usize::from(id.0)));
                 let (Some(id), Some(&at)) = (id, vrf) else {
                     self.counters.from_tap_dropped += 1;
                     continue;
@@ -1538,7 +1520,12 @@ where
                 let sent = match tap::sort(&buf[..n]) {
                     tap::FromTap::Link => self.send_generated(id, &buf[..n]),
                     tap::FromTap::Neighbor(address) => {
-                        match self.vrfs.get(at).and_then(|v| v.ipv6.neighbor(id, address)) {
+                        match self
+                            .tables
+                            .vrfs
+                            .get(at)
+                            .and_then(|v| v.ipv6.neighbor(id, address))
+                        {
                             Some(mac) => {
                                 buf[..6].copy_from_slice(&mac.0);
                                 self.send_generated(id, &buf[..n])
@@ -1549,7 +1536,7 @@ where
                             }
                         }
                     }
-                    tap::FromTap::Routed => match self.kernel.get(at) {
+                    tap::FromTap::Routed => match self.tables.kernel.get(at) {
                         Some(&kernel) => {
                             routed.push(kernel::Frame::new(kernel, at, &buf[ETHERNET_HEADER..n]));
                             true
@@ -1574,6 +1561,7 @@ where
             return;
         }
         let Some(name) = self
+            .tables
             .interface_names
             .get(usize::from(egress.0))
             .filter(|name| !name.is_empty())
@@ -1663,8 +1651,8 @@ where
                 continue;
             };
             // Only out of an interface the current tables have enabled.
-            let egress = interface_id(&self.interface_names, punt.interface)
-                .filter(|id| self.active.contains(id));
+            let egress = interface_id(&self.tables.interface_names, punt.interface)
+                .filter(|id| self.tables.active.contains(id));
             match (punt.direction, punt.reason, egress) {
                 // The neighbor process reads the "used" marks, which are then cleared.
                 (Direction::FromControl, punt::reason::NEIGHBOR_USED, _) if neighbor => {
@@ -1703,7 +1691,7 @@ where
     /// `vrf` (in the order of `vrfs`): the class goes there and is within that VRF's
     /// limit. A refused packet is counted as the class's drop.
     fn admit_to_kernel(&mut self, class: usize, vrf: Option<usize>, now_ms: u64) -> bool {
-        match (&self.classes.get(class).destination, vrf) {
+        match (&self.tables.punt.get(class).destination, vrf) {
             (PuntDestination::Kernel, Some(_)) => self.limits.admit(class, vrf, now_ms),
             _ => {
                 self.limits.dropped(class);
@@ -1716,6 +1704,7 @@ where
     /// kernel pipe, as the class allows.
     fn send_to_kernel(&mut self, ingress: IfId, class: usize, packet: &[u8], now_ms: u64) {
         let at = self
+            .tables
             .by_ingress
             .get(usize::from(ingress.0))
             .map(|&at| usize::from(at));
@@ -1737,8 +1726,8 @@ where
             return frames;
         }
         let mut buf = [0_u8; PUNT_MAX];
-        for (at, name) in self.names.iter().enumerate() {
-            let Some(&ingress) = self.kernel.get(at) else {
+        for (at, name) in self.tables.names.iter().enumerate() {
+            let Some(&ingress) = self.tables.kernel.get(at) else {
                 continue;
             };
             for _ in 0..INJECT_PER_STEP {
@@ -1754,7 +1743,7 @@ where
     /// Writes `frame` (Ethernet) for kernel interface `egress` to its VRF's pipe,
     /// without the Ethernet header.
     fn write_kernel(&mut self, egress: IfId, frame: &[u8]) -> bool {
-        let at = self.kernel.iter().position(|&id| id == egress);
+        let at = self.tables.kernel.iter().position(|&id| id == egress);
         match (at, frame.get(ETHERNET_HEADER..)) {
             (Some(at), Some(packet)) => {
                 self.hand(handover::Where::Generated(at), |bytes| {
@@ -1770,17 +1759,17 @@ where
     /// Sends `frame` out of `egress`; out of a VLAN sub-interface's parent, tagged,
     /// for a sub-interface.
     fn send_generated(&mut self, egress: IfId, frame: &[u8]) -> bool {
-        if self.kernel.contains(&egress) {
+        if self.tables.kernel.contains(&egress) {
             return self.write_kernel(egress, frame);
         }
         // Into a tunnel or a PPPoE session, then out of the interface below it.
-        let outer = self.vrfs[0]
+        let outer = self.tables.vrfs[0]
             .owner
             .snapshot()
-            .with_ipv6(&self.vrfs[0].ipv6)
-            .with_tunnels(&self.tunnels)
-            .with_srv6(&self.srv6)
-            .with_pppoe(&self.pppoe);
+            .with_ipv6(&self.tables.vrfs[0].ipv6)
+            .with_tunnels(&self.tables.tunnels)
+            .with_srv6(&self.tables.srv6)
+            .with_pppoe(&self.tables.pppoe);
         match outer.tunnel_frame(egress, frame) {
             Some(Ok((below, wrapped))) => return self.send_generated(below, &wrapped),
             Some(Err(_)) => return false,
@@ -1829,7 +1818,7 @@ where
             self.after_members(trace);
             return sent;
         }
-        send_member(&mut self.io, &self.vlans, egress, frame)
+        send_member(&mut self.io, &self.tables.vlans, egress, frame)
     }
 
     /// Sends `frame` out of port `port` as it is, with VLAN tag `tag` put in.
@@ -1879,15 +1868,19 @@ impl<'f, 't, B: GeneratedPacketIo> Members<'f, 't, B> {
     fn of(fe: &'f mut Worker<B>, trace: &'t mut FeTrace) -> Self {
         let Worker {
             io,
-            vlans,
             bridges,
+            tables,
+            ..
+        } = fe;
+        let build::Built {
+            vlans,
             vrfs,
             tunnels,
             overlays,
             pppoe,
             unreachable,
             ..
-        } = fe;
+        } = &**tables;
         let outer = vrfs[0]
             .owner
             .snapshot()
