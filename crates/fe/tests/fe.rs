@@ -870,6 +870,41 @@ fn an_interface_in_another_vrf_uses_that_vrf_s_routes_and_a_lookup_reaches_defau
     assert!(bench.fe.io_mut().pop_tx().is_none());
 }
 
+/// With the handover's writes on a task of their own, what goes to the kernel is
+/// written when that task steps, and counted by the FE once it hears back; a pipe
+/// attached afterwards is written to as well.
+#[test]
+fn with_the_handover_detached_the_kernel_s_traffic_is_written_by_its_task() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut handover = bench.fe.detach_handover().expect("a handover task");
+    assert!(bench.fe.detach_handover().is_none(), "taken once");
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    let mut to_router = udp_from_host([192, 0, 2, 1]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&to_router[14..34]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+    bench.fe.io_mut().inject(IfId(0), to_router.clone());
+    bench.fe.step(0);
+    let mut buf = [0_u8; 2048];
+    assert!(kernel.recv(&mut buf).is_err(), "not written by the worker");
+    assert_eq!(bench.fe.counters().to_kernel, 0);
+
+    assert!(handover.step(0).busy);
+    let n = kernel.recv(&mut buf).unwrap();
+    assert_eq!(&buf[..n], &to_router[14..]);
+    bench.fe.step(1);
+    assert_eq!(bench.fe.counters().to_kernel, 1);
+    assert!(!handover.fe_gone());
+    drop(bench);
+    handover.step(2);
+    assert!(handover.fe_gone());
+}
+
 #[test]
 fn traffic_to_the_router_goes_to_the_kernel_pipe_and_the_kernel_s_packets_go_out() {
     let mut bench = Bench::new();
