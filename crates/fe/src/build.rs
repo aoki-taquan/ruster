@@ -1544,19 +1544,24 @@ mod tests {
                 for _ in 0..rng.below(40) {
                     let v6 = rng.below(4) == 0;
                     let len = if v6 { rng.below(129) } else { rng.below(33) } as u8;
-                    // Few distinct high bits, so that prefixes nest.
-                    let bits = rng.below(8) << 61 | rng.below(1 << 20);
+                    // Few distinct high bits, so that prefixes nest, and random
+                    // ones below, so that they have siblings at every length.
                     let address: IpAddr = if v6 {
-                        std::net::Ipv6Addr::from(u128::from(bits) << 64).into()
+                        let high = u128::from(rng.below(8)) << 125;
+                        let low =
+                            u128::from(rng.below(1 << 30)) << 64 | u128::from(rng.below(1 << 30));
+                        std::net::Ipv6Addr::from(high | low << 30).into()
                     } else {
-                        std::net::Ipv4Addr::from((bits >> 32) as u32).into()
+                        let bits = rng.below(8) << 29 | rng.below(1 << 29);
+                        std::net::Ipv4Addr::from(bits as u32).into()
                     };
                     let prefix = network(address, len);
                     let entry = if rng.below(6) == 0 {
                         Entry::Lookup {
                             prefix,
                             len,
-                            vrf: rng.pick(&names).into(),
+                            // At times into a VRF that is not there.
+                            vrf: rng.pick(&[names[0], names[1], names[2], "green"]).into(),
                         }
                     } else {
                         Entry::Forward(Forward {
