@@ -3559,13 +3559,12 @@ where
     let mut consumed = 0;
     let all_vrfs = snapshot;
     let vlans = all_vrfs.vlans;
-    // With no NAT or firewall to consult, a plain IPv4 forward goes the short
-    // way (`plain_ipv4`).
+    // With no NAT to consult, a plain IPv4 forward goes the short way
+    // (`plain_ipv4`).
     let plain = plain_ipv4::enabled()
         && nat44_udp_config.is_none()
         && nat44_tcp_config.is_none()
-        && nat44_icmp_config.is_none()
-        && firewall_config.is_none();
+        && nat44_icmp_config.is_none();
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
         if !vlans.is_empty() {
@@ -3653,16 +3652,56 @@ where
         // start here.
         if plain {
             let ingress = packet.ingress();
-            let bridges = bridges.as_deref();
-            let decided = plain_ipv4::decide(
-                packet.bytes_mut(),
-                all_vrfs.for_ingress(ingress),
-                all_vrfs,
-                ingress,
-                bridges,
-            );
+            let snapshot = all_vrfs.for_ingress(ingress);
+            // The forward firewall is the default VRF's: another VRF's datagram
+            // goes the full way.
+            let decided =
+                if firewall_config.is_none() || snapshot.authority() == all_vrfs.authority() {
+                    plain_ipv4::decide(
+                        packet.bytes_mut(),
+                        snapshot,
+                        all_vrfs,
+                        ingress,
+                        bridges.as_deref(),
+                        firewall_config.is_some(),
+                    )
+                } else {
+                    None
+                };
             if let Some(decided) = decided {
-                match plain_ipv4::send(&mut packet, decided, ingress, all_vrfs, bridges, trace) {
+                plain_ipv4::validated(&decided, ingress, trace);
+                let planned = match firewall_config {
+                    Some(config) => plain_ipv4::plan_firewall(
+                        packet.bytes_mut(),
+                        &snapshot.with_now(all_vrfs.now),
+                        ingress,
+                        &decided,
+                        config,
+                        &mut firewall,
+                        &mut firewall_audit,
+                        &mut icmpv4_errors,
+                        trace,
+                    )
+                    .map(Some),
+                    None => Ok(None),
+                };
+                let sent = planned.and_then(|plan| {
+                    let firewall = plan.map(|plan| {
+                        let runtime = firewall
+                            .as_deref_mut()
+                            .expect("firewall plan requires a bound runtime");
+                        (plan, runtime)
+                    });
+                    plain_ipv4::send(
+                        &mut packet,
+                        decided,
+                        firewall,
+                        all_vrfs,
+                        bridges.as_deref(),
+                        trace,
+                    )
+                });
+                match sent {
                     Ok(port) => {
                         packet.commit(port);
                         tx_requested += 1;
@@ -5027,25 +5066,7 @@ fn decide_ipv4<T: TraceSink>(
     if let Some(config) = firewall_config {
         if (!local || nat_inbound_candidate) && !related_error {
             let runtime = require_firewall_runtime(snapshot, config, firewall)?;
-            let validated = match validate_firewall_transport(frame, ipv4) {
-                Ok(validated) => validated,
-                Err(reason) => {
-                    runtime.record_invalid_packet();
-                    return Err(reason);
-                }
-            };
-            if let Err(error) = runtime.observe_attempt(nat_now.0) {
-                return Err(match error {
-                    FirewallPlanError::ClockRegression => FirewallClockRegression,
-                    FirewallPlanError::RuleDenied(_)
-                    | FirewallPlanError::DefaultDenied
-                    | FirewallPlanError::InvalidInitialTcp(_)
-                    | FirewallPlanError::InvalidInitialIcmp(_)
-                    | FirewallPlanError::StateFull(_) => {
-                        unreachable!("clock observation only reports regression")
-                    }
-                });
-            }
+            let validated = observe_forward_firewall(frame, ipv4, runtime, nat_now)?;
             observe_combined_nat_security_time(
                 snapshot,
                 ingress,
@@ -5386,46 +5407,20 @@ fn decide_ipv4<T: TraceSink>(
                     _ => FirewallRelatedIcmpv4StateMiss,
                 })?;
         } else {
-            let planned = plan_firewall(
+            *firewall_plan = Some(plan_forward_firewall(
+                frame,
+                snapshot,
                 ingress,
-                route.egress(),
                 ipv4,
+                route,
                 firewall_validated.expect("forward firewall packet was preflight validated"),
-                None,
                 config,
                 runtime,
                 firewall_audit,
-                nat_now.0,
-            );
-            match planned {
-                Ok(plan) => *firewall_plan = Some(plan),
-                Err(reason) => {
-                    // RFC 1812 §5.2.7.1 Code 13 for an administrative deny,
-                    // off unless `admin-prohibited = true` (ICMP-ERR). The
-                    // datagram is quoted as received, before any translation.
-                    if matches!(reason, FirewallRuleDenied | FirewallDefaultDenied) {
-                        if let Some((runtime, now)) = icmpv4_errors.as_mut() {
-                            let disposition = decide_icmpv4_error(
-                                frame,
-                                snapshot,
-                                ingress,
-                                ipv4,
-                                Some(route),
-                                Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
-                                0,
-                                runtime,
-                                *now,
-                                trace,
-                            );
-                            trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
-                                ingress,
-                                disposition,
-                            });
-                        }
-                    }
-                    return Err(reason);
-                }
-            }
+                icmpv4_errors,
+                nat_now,
+                trace,
+            )?);
         }
     }
     // The router's own packets are not forwarded: their TTL stays.
@@ -6599,6 +6594,91 @@ fn observe_combined_nat_security_time<T: TraceSink>(
         }
     }
     Ok(())
+}
+
+/// The forward firewall's first look at a datagram it judges: its transport
+/// header, then the clock. Counts an invalid one.
+fn observe_forward_firewall(
+    frame: &[u8],
+    ipv4: packet::ValidatedIpv4,
+    runtime: &mut FirewallRuntime<'_>,
+    now: MonotonicMillis,
+) -> Result<ValidatedFirewallTransport, DropReason> {
+    let validated = match validate_firewall_transport(frame, ipv4) {
+        Ok(validated) => validated,
+        Err(reason) => {
+            runtime.record_invalid_packet();
+            return Err(reason);
+        }
+    };
+    if let Err(error) = runtime.observe_attempt(now.0) {
+        return Err(match error {
+            FirewallPlanError::ClockRegression => FirewallClockRegression,
+            FirewallPlanError::RuleDenied(_)
+            | FirewallPlanError::DefaultDenied
+            | FirewallPlanError::InvalidInitialTcp(_)
+            | FirewallPlanError::InvalidInitialIcmp(_)
+            | FirewallPlanError::StateFull(_) => {
+                unreachable!("clock observation only reports regression")
+            }
+        });
+    }
+    Ok(validated)
+}
+
+/// Plans a forwarded datagram with the forward firewall. A refusal by a rule
+/// or the default gets an administratively prohibited error (RFC 1812
+/// §5.2.7.1 Code 13, off unless `admin-prohibited = true`, ICMP-ERR) quoting
+/// the datagram as received, before any translation.
+#[allow(clippy::too_many_arguments)]
+fn plan_forward_firewall<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    ipv4: packet::ValidatedIpv4,
+    route: Route,
+    validated: ValidatedFirewallTransport,
+    config: &FirewallConfig<'_>,
+    runtime: &mut FirewallRuntime<'_>,
+    audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    now: MonotonicMillis,
+    trace: &mut T,
+) -> Result<FirewallPlan, DropReason> {
+    let planned = plan_firewall(
+        ingress,
+        route.egress(),
+        ipv4,
+        validated,
+        None,
+        config,
+        runtime,
+        audit,
+        now.0,
+    );
+    if let Err(reason) = planned {
+        if matches!(reason, FirewallRuleDenied | FirewallDefaultDenied) {
+            if let Some((runtime, now)) = icmpv4_errors.as_mut() {
+                let disposition = decide_icmpv4_error(
+                    frame,
+                    snapshot,
+                    ingress,
+                    ipv4,
+                    Some(route),
+                    Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+                    0,
+                    runtime,
+                    *now,
+                    trace,
+                );
+                trace.record(TraceEvent::Icmpv4DestinationUnreachableDisposition {
+                    ingress,
+                    disposition,
+                });
+            }
+        }
+    }
+    planned
 }
 
 #[allow(clippy::too_many_arguments)]

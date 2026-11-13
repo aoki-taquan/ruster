@@ -7,7 +7,9 @@ use super::lookup_tests::{
     bits, interface_ids, ip, owner, probe_addresses, random_tables, Rng, Tables,
 };
 use super::*;
-use crate::{Ipv4Address, MacAddress, PacketLease, PacketSlot, SlotCompletion};
+use crate::{
+    FirewallPolicy, FirewallRule, Ipv4Address, MacAddress, PacketLease, PacketSlot, SlotCompletion,
+};
 
 struct Item {
     ingress: IfId,
@@ -110,7 +112,10 @@ fn random_mac(rng: &mut Rng) -> [u8; 6] {
 /// An Ethernet frame with an IPv4 header, mostly valid and mostly to be
 /// forwarded, with every field the short way looks at sometimes off.
 fn random_frame(rng: &mut Rng, tables: &Tables, ids: &[IfId], addresses: &[Ipv4Address]) -> Item {
-    let ingress = ids[rng.below(ids.len() as u64) as usize];
+    let ingress = match tables.interfaces.len() as u64 {
+        n if n > 0 && rng.below(4) != 0 => tables.interfaces[rng.below(n) as usize].id,
+        _ => ids[rng.below(ids.len() as u64) as usize],
+    };
     let pick = |rng: &mut Rng| addresses[rng.below(addresses.len() as u64) as usize];
     let options = if rng.below(16) == 0 { 4 } else { 0 };
     let payload = match rng.below(8) {
@@ -172,6 +177,13 @@ fn random_frame(rng: &mut Rng, tables: &Tables, ids: &[IfId], addresses: &[Ipv4A
     for byte in &mut frame[34..] {
         *byte = rng.next() as u8;
     }
+    write_transport(rng, &mut frame, 14 + 20 + options);
+    transport_checksum(&mut frame);
+    if rng.below(32) == 0 {
+        if let Some(byte) = frame.last_mut() {
+            *byte ^= 0x40;
+        }
+    }
     let header_end = 14 + 20 + options;
     let checksum = crate::ipv4_header_checksum(&frame[14..header_end]);
     frame[24..26].copy_from_slice(&checksum.to_be_bytes());
@@ -190,6 +202,244 @@ fn random_frame(rng: &mut Rng, tables: &Tables, ids: &[IfId], addresses: &[Ipv4A
         frame,
         ended: None,
     }
+}
+
+/// A transport header the firewall can read, most of the time: UDP with its
+/// length, TCP with a header length and SYN or ACK, ICMP Echo or an error.
+fn write_transport(rng: &mut Rng, frame: &mut [u8], at: usize) {
+    let len = frame.len().saturating_sub(at);
+    match frame[23] {
+        17 if len >= 8 && rng.below(16) != 0 => {
+            frame[at + 4..at + 6].copy_from_slice(&(len as u16).to_be_bytes());
+            frame[at + 6..at + 8].copy_from_slice(&[0, 0]);
+        }
+        6 if len >= 20 && rng.below(16) != 0 => {
+            frame[at + 12] = 0x50;
+            frame[at + 13] = [0x02, 0x10, 0x12, 0x18][rng.below(4) as usize];
+        }
+        1 if len >= 8 => {
+            frame[at] = [8, 0, 3, 11][rng.below(4) as usize];
+            frame[at + 1] = 0;
+        }
+        _ => {}
+    }
+}
+
+/// Sets the TCP or ICMP checksum of a whole IPv4 frame (not a fragment).
+fn transport_checksum(frame: &mut [u8]) {
+    let header_len = usize::from(frame[14] & 0x0f) * 4;
+    let at = 14 + header_len;
+    let end = 14 + usize::from(u16::from_be_bytes([frame[16], frame[17]]));
+    if end > frame.len() || at > end {
+        return;
+    }
+    match frame[23] {
+        6 if end - at >= 20 => {
+            frame[at + 16..at + 18].copy_from_slice(&[0, 0]);
+            let mut pseudo = Vec::with_capacity(12 + end - at);
+            pseudo.extend_from_slice(&frame[26..34]);
+            pseudo.extend_from_slice(&[0, 6]);
+            pseudo.extend_from_slice(&((end - at) as u16).to_be_bytes());
+            pseudo.extend_from_slice(&frame[at..end]);
+            let checksum = crate::internet_checksum(&pseudo);
+            frame[at + 16..at + 18].copy_from_slice(&checksum.to_be_bytes());
+        }
+        1 if end - at >= 8 => {
+            frame[at + 2..at + 4].copy_from_slice(&[0, 0]);
+            let checksum = crate::internet_checksum(&frame[at..end]);
+            frame[at + 2..at + 4].copy_from_slice(&checksum.to_be_bytes());
+        }
+        _ => {}
+    }
+}
+
+/// The reply to a frame that left through `egress`: addresses and ports
+/// swapped, in from `egress`, to its MAC.
+fn reply(frame: &[u8], egress: IfId, tables: &Tables) -> Item {
+    let mut frame = frame.to_vec();
+    if let Some(interface) = tables.interfaces.iter().find(|i| i.id == egress) {
+        frame[0..6].copy_from_slice(&interface.mac.0);
+    }
+    frame[6..12].copy_from_slice(&[2, 9, 9, 9, 9, 9]);
+    let (source, destination) = (frame[26..30].to_vec(), frame[30..34].to_vec());
+    frame[26..30].copy_from_slice(&destination);
+    frame[30..34].copy_from_slice(&source);
+    frame[22] = 64;
+    let header_len = usize::from(frame[14] & 0x0f) * 4;
+    let at = 14 + header_len;
+    if matches!(frame[23], 6 | 17) && frame.len() >= at + 4 {
+        let (from, to) = (frame[at..at + 2].to_vec(), frame[at + 2..at + 4].to_vec());
+        frame[at..at + 2].copy_from_slice(&to);
+        frame[at + 2..at + 4].copy_from_slice(&from);
+        if frame[23] == 6 && frame.len() > at + 13 && frame[at + 13] == 0x02 {
+            frame[at + 13] = 0x12;
+        }
+    }
+    if frame[23] == 1 && frame.len() > at && frame[at] == 8 {
+        frame[at] = 0;
+    }
+    transport_checksum(&mut frame);
+    frame[24..26].copy_from_slice(&[0, 0]);
+    let checksum = crate::ipv4_header_checksum(&frame[14..14 + header_len]);
+    frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+    Item {
+        ingress: egress,
+        frame,
+        ended: None,
+    }
+}
+
+fn random_prefix(rng: &mut Rng, addresses: &[Ipv4Address]) -> crate::FirewallPrefix {
+    let len = [0, 0, 0, 0, 8, 16, 24, 32][rng.below(8) as usize];
+    let address = bits(addresses[rng.below(addresses.len() as u64) as usize]);
+    let masked = if len == 0 {
+        0
+    } else {
+        address & (u32::MAX << (32 - len))
+    };
+    crate::FirewallIpv4Prefix::new(ip(masked), len as u8)
+        .expect("a masked prefix")
+        .into()
+}
+
+fn random_rules(rng: &mut Rng, ids: &[IfId], addresses: &[Ipv4Address]) -> Vec<FirewallRule> {
+    let interface = |rng: &mut Rng| match rng.below(3) {
+        0 | 1 => crate::FirewallInterface::Any,
+        _ => crate::FirewallInterface::Interface(ids[rng.below(ids.len() as u64) as usize]),
+    };
+    let all = crate::FirewallPortRange::new(0, u16::MAX).expect("all ports");
+    let mut rules: Vec<FirewallRule> = (0..1 + rng.below(5))
+        .map(|id| {
+            FirewallRule::new(
+                crate::FirewallRuleId(id as u32 + 1),
+                interface(rng),
+                interface(rng),
+                random_prefix(rng, addresses),
+                random_prefix(rng, addresses),
+                [
+                    FirewallProtocol::Udp,
+                    FirewallProtocol::Tcp,
+                    FirewallProtocol::Icmp,
+                ][rng.below(3) as usize],
+                all,
+                all,
+                if rng.below(6) == 0 {
+                    crate::FirewallAction::Deny
+                } else {
+                    crate::FirewallAction::AllowStateful
+                },
+            )
+        })
+        .collect();
+    // Often everything else is let through, so that flows are opened and
+    // their replies come back.
+    if rng.below(2) == 0 {
+        let any = crate::FirewallIpv4Prefix::new(ip(0), 0).expect("/0").into();
+        for (at, protocol) in [
+            FirewallProtocol::Udp,
+            FirewallProtocol::Tcp,
+            FirewallProtocol::Icmp,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            rules.push(FirewallRule::new(
+                crate::FirewallRuleId(100 + at as u32),
+                crate::FirewallInterface::Any,
+                crate::FirewallInterface::Any,
+                any,
+                any,
+                protocol,
+                all,
+                all,
+                crate::FirewallAction::AllowStateful,
+            ));
+        }
+    }
+    rules
+}
+
+/// A forward firewall and what it keeps, for one way of forwarding.
+struct Guarded {
+    states: Vec<crate::FirewallStateSlot>,
+    audit: Vec<crate::FirewallAuditRecord>,
+    errors: Vec<crate::Icmpv4ErrorStateSlot>,
+    actions: Vec<crate::Icmpv4ErrorActionSlot>,
+}
+
+impl Guarded {
+    fn new() -> Self {
+        Self {
+            states: vec![crate::FirewallStateSlot::default(); 64],
+            audit: vec![crate::FirewallAuditRecord::default(); 512],
+            errors: vec![crate::Icmpv4ErrorStateSlot::EMPTY; 16],
+            actions: vec![crate::Icmpv4ErrorActionSlot::EMPTY; 16],
+        }
+    }
+}
+
+type Outcome = (Vec<Item>, Vec<TraceEvent>, (usize, usize, usize, usize));
+
+/// `batches` forwarded in turn with the firewall, one way: what each ended
+/// as, and the firewall's counters, states and audit records after.
+fn forward_guarded(
+    snapshot: &ForwardingSnapshot<'_>,
+    config: &FirewallConfig<'_>,
+    batches: &[&[Item]],
+    short_way: bool,
+    guarded: &mut Guarded,
+) -> (
+    Vec<Outcome>,
+    crate::FirewallCounters,
+    Vec<crate::FirewallAuditRecord>,
+) {
+    let policy = crate::Icmpv4ErrorPolicy::default().with_generation(
+        crate::Icmpv4ErrorKind::DestinationUnreachableAdministrativelyProhibited,
+        true,
+    );
+    let mut errors =
+        crate::Icmpv4ErrorRuntime::new(policy, &mut guarded.errors, &mut guarded.actions);
+    let mut runtime = FirewallRuntime::new(*config, &mut guarded.states);
+    let mut audit = crate::FirewallAuditBuffer::new(&mut guarded.audit);
+    let mut control = crate::ControlQueue::new(16);
+    let mut outcomes = Vec::new();
+    plain_ipv4::OFF.with(|off| off.set(!short_way));
+    for (at, frames) in batches.iter().enumerate() {
+        let mut items: Vec<Item> = frames
+            .iter()
+            .map(|item| Item {
+                ingress: item.ingress,
+                frame: item.frame.clone(),
+                ended: None,
+            })
+            .collect();
+        let mut trace = Recorded::default();
+        let snapshot = snapshot.with_now(MonotonicMillis(1_000 + at as u64 * 10));
+        let report = forward_batch_with_control(
+            Items {
+                items: &mut items,
+                next: 0,
+            },
+            &snapshot,
+            &mut control,
+            Services {
+                icmpv4_errors: Some(&mut errors),
+                firewall: Some((config, &mut runtime)),
+                firewall_audit: Some(&mut audit),
+                ..Services::default()
+            },
+            &mut trace,
+        );
+        let counts = (
+            report.received,
+            report.tx_requested,
+            report.dropped,
+            report.consumed,
+        );
+        outcomes.push((items, trace.0, counts));
+    }
+    plain_ipv4::OFF.with(|off| off.set(false));
+    (outcomes, runtime.counters(), audit.records().to_vec())
 }
 
 fn forward(
@@ -275,6 +525,7 @@ fn the_short_way_ends_every_packet_as_the_full_way_does() {
                     &snapshot,
                     item.ingress,
                     None,
+                    false,
                 )
                 .is_some()
             })
@@ -293,4 +544,111 @@ fn the_short_way_ends_every_packet_as_the_full_way_does() {
     // that are sent do not.
     assert!(short > 1_000, "short way taken {short} times");
     assert!(sent > short, "sent {sent}, short way {short}");
+}
+
+#[test]
+fn with_a_firewall_the_short_way_ends_every_packet_as_the_full_way_does() {
+    let mut rng = Rng(0xf1fe_0a11_5eed_0001);
+    let mut short = 0;
+    let mut replies_sent = 0;
+    let mut states = 0;
+    for round in 0..600 {
+        let mut tables = random_tables(&mut rng, 24);
+        with_reachable_neighbors(&mut rng, &mut tables);
+        // Every other round, a second VRF (its own owner, so another
+        // authority) holds some of the interfaces: the firewall is the
+        // default VRF's, and that VRF's datagrams go the full way.
+        let default_vrf = owner(&tables);
+        let second_vrf = owner(&tables);
+        let vrfs = [default_vrf.snapshot(), second_vrf.snapshot()];
+        let by_ingress: Vec<u16> =
+            (0..=tables.interfaces.iter().map(|i| i.id.0).max().unwrap_or(0))
+                .map(|_| u16::from(round % 2 == 1 && rng.below(2) == 0))
+                .collect();
+        let snapshot = vrfs[0].with_vrfs(&vrfs, &by_ingress);
+        let ids = interface_ids(&tables);
+        let addresses = probe_addresses(&mut rng, &tables);
+        let interfaces: Vec<IfId> = tables.interfaces.iter().map(|i| i.id).collect();
+        let rules = random_rules(&mut rng, &interfaces, &addresses);
+        let config = FirewallConfig::new(
+            &snapshot,
+            &rules,
+            FirewallPolicy::default(),
+            1,
+            crate::FirewallHashKey::new(0x0123_4567_89ab_cdef, 0xfedc_ba98_7654_3210)
+                .expect("a key"),
+        )
+        .expect("a firewall");
+        let first: Vec<Item> = (0..48)
+            .map(|_| random_frame(&mut rng, &tables, &ids, &addresses))
+            .collect();
+        short += first
+            .iter()
+            .filter(|item| {
+                plain_ipv4::decide(
+                    &item.frame,
+                    snapshot.for_ingress(item.ingress),
+                    &snapshot,
+                    item.ingress,
+                    None,
+                    true,
+                )
+                .is_some()
+            })
+            .count();
+        // The replies to what the full way sent, and the first batch again.
+        let (sent, _, _) =
+            forward_guarded(&snapshot, &config, &[&first], false, &mut Guarded::new());
+        let mut second: Vec<Item> = sent[0]
+            .0
+            .iter()
+            .filter_map(|item| match item.ended {
+                Some(SlotCompletion::Transmit(egress)) => Some(reply(&item.frame, egress, &tables)),
+                _ => None,
+            })
+            .collect();
+        second.extend(first.iter().map(|item| Item {
+            ingress: item.ingress,
+            frame: item.frame.clone(),
+            ended: None,
+        }));
+        let batches: [&[Item]; 2] = [&first, &second];
+        let mut fast_kept = Guarded::new();
+        let mut full_kept = Guarded::new();
+        let (fast, fast_counters, fast_audit) =
+            forward_guarded(&snapshot, &config, &batches, true, &mut fast_kept);
+        let (full, full_counters, full_audit) =
+            forward_guarded(&snapshot, &config, &batches, false, &mut full_kept);
+        for (batch, (fast, full)) in fast.iter().zip(&full).enumerate() {
+            assert_eq!(fast.2, full.2, "round {round} batch {batch}");
+            assert_eq!(fast.1, full.1, "round {round} batch {batch}");
+            for (index, (fast, full)) in fast.0.iter().zip(&full.0).enumerate() {
+                assert_eq!(
+                    fast.ended, full.ended,
+                    "round {round} batch {batch} frame {index}"
+                );
+                assert_eq!(
+                    fast.frame, full.frame,
+                    "round {round} batch {batch} frame {index}"
+                );
+            }
+        }
+        assert_eq!(fast_counters, full_counters, "round {round}");
+        assert_eq!(fast_kept.states, full_kept.states, "round {round}");
+        assert_eq!(fast_audit, full_audit, "round {round}");
+        assert_eq!(fast_kept.errors, full_kept.errors, "round {round}");
+        assert_eq!(fast_kept.actions, full_kept.actions, "round {round}");
+        replies_sent += full[1].2 .1;
+        states += full_kept
+            .states
+            .iter()
+            .filter(|slot| **slot != crate::FirewallStateSlot::default())
+            .count();
+    }
+    assert!(short > 1_000, "short way taken {short} times");
+    assert!(states > 200, "{states} flows opened");
+    assert!(
+        replies_sent > 300,
+        "{replies_sent} sent in the second batches"
+    );
 }
