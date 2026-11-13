@@ -1187,6 +1187,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// the templates name the old publication's egress and neighbors.
     pub fn flush(&mut self) {
         if !self.touched {
+            self.debug_assert_as_reset();
             return;
         }
         self.counters.entries_flushed += self.live_entries;
@@ -1199,6 +1200,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         if !self.touched {
             // Every slot and directory is as a reset left it: only the key
             // changes, without going through the storage.
+            self.debug_assert_as_reset();
             self.entry_directory.rekey_empty(key.directory_key());
             self.host_directory.rekey_empty(key.directory_key());
             self.tombstone_directory.rekey_empty(key.directory_key());
@@ -1210,6 +1212,25 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.host_directory.clear_with_key(key.directory_key());
         self.tombstone_directory.clear_with_key(key.directory_key());
         self.reset();
+    }
+
+    /// That the table is as [`Self::reset`] left it, as `touched` being unset
+    /// promises. Cheap: what any write leaves behind shows in one of these.
+    fn debug_assert_as_reset(&self) {
+        debug_assert_eq!(
+            (
+                self.live_entries,
+                self.live_held,
+                self.ingress_len,
+                self.tombstone_next
+            ),
+            (0, 0, 0, 0),
+            "an untouched fragment table holds nothing"
+        );
+        debug_assert!(
+            self.age == NO_ENDS && self.evict == NO_ENDS && self.allow == NO_ENDS,
+            "an untouched fragment table lists nothing"
+        );
     }
 
     fn reset(&mut self) {
@@ -1252,8 +1273,8 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// Frees every entry older than the timeout at `now_ms`, at most
     /// `budget` of them, and returns how many it freed. Expiry is otherwise
     /// lazy (each table operation expires up to two of the oldest entries);
-    /// `run_tick` calls this each tick with a small budget so the occupancy
-    /// and the expiry counters stay current without traffic.
+    /// a caller can call this with a small budget so that the occupancy and
+    /// the expiry counters stay current without traffic.
     pub fn sweep(&mut self, now_ms: u64, budget: usize) -> usize {
         self.touched = true;
         let before = self.live_entries;

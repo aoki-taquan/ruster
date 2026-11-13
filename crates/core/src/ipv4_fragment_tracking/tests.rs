@@ -2175,8 +2175,22 @@ fn a_flush_of_an_untouched_table_only_changes_the_key() {
     let mut storage_a = Storage::new(4, 4, 1514);
     let mut flushed =
         Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage_a.borrow(), key()).unwrap();
+    // Used under the old key first, then emptied: what an untouched flush
+    // leaves alone is then what a full one left.
+    for id in 0..6 {
+        if let Ok(ticket) = flushed.admit_first(info(&fragment(id, MF, 64, 17, 8)), 0) {
+            flushed.commit_deny(ticket, 0);
+        }
+        let later = fragment(id + 10, 2, 64, 17, 8);
+        let _ = flushed.follow(info(&later), &later, later.len(), 0);
+    }
+    assert!(flushed.entries() > 0);
+    flushed.flush();
+    let counters = flushed.counters();
     flushed.flush_with_key(new_key);
     flushed.flush();
+    assert_eq!(flushed.counters(), counters, "nothing more is flushed");
+    assert!(flushed.check_invariants().is_ok());
     let mut storage_b = Storage::new(4, 4, 1514);
     let mut fresh =
         Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage_b.borrow(), new_key).unwrap();
@@ -2196,17 +2210,22 @@ fn a_flush_of_an_untouched_table_only_changes_the_key() {
             }
         }
         assert_eq!(flushed.occupancy(), fresh.occupancy(), "round {round}");
-        assert_eq!(flushed.counters(), fresh.counters(), "round {round}");
+        assert_eq!(flushed.entries(), fresh.entries(), "round {round}");
+        assert_eq!(flushed.held(), fresh.held(), "round {round}");
     }
     // Touched now: a flush discards and counts what is there.
     let entries = flushed.entries();
     let held = flushed.held();
     assert!(entries > 0);
+    let before = flushed.counters();
     flushed.flush_with_key(key());
     assert_eq!((flushed.entries(), flushed.held()), (0, 0));
-    let counters = flushed.counters();
+    let after = flushed.counters();
     assert_eq!(
-        (counters.entries_flushed, counters.held_flushed),
+        (
+            after.entries_flushed - before.entries_flushed,
+            after.held_flushed - before.held_flushed
+        ),
         (entries, held)
     );
 }
