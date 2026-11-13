@@ -220,11 +220,20 @@ impl Routes {
     /// interfaces too. The other tables (addresses, neighbors, NAT, firewall,
     /// what goes to the control processes, the bridges' members and static
     /// addresses) change no route, and are read from the tables in every build.
-    fn follows(&self, changed: Changed<'_>, store: &Store) -> bool {
+    ///
+    /// When they do, the route each changed entry holds now (`None` for one that
+    /// is gone or is not a route), in the order of `changed`, so that the build
+    /// does not look each up again.
+    fn follows<'s>(
+        &self,
+        changed: Changed<'_>,
+        store: &'s Store,
+    ) -> Option<Vec<Option<&'s RouteAction>>> {
         if self.srv6 {
-            return false;
+            return None;
         }
         let mut growth: BTreeMap<&str, isize> = BTreeMap::new();
+        let mut afters = Vec::with_capacity(changed.len());
         for (key, before) in changed {
             let vrf = match key {
                 Key::Route { vrf, .. } => vrf,
@@ -241,38 +250,38 @@ impl Routes {
                 | Key::SourceIpv6 { .. }
                 | Key::SourceDns { .. }
                 | Key::BridgePort { .. }
-                | Key::BridgeMac { .. } => continue,
+                | Key::BridgeMac { .. } => {
+                    afters.push(None);
+                    continue;
+                }
                 // Each of these makes or changes an interface. (No wildcard: a
                 // kind added later must be put on one side or the other.)
                 Key::Interface { .. }
                 | Key::EtherIp { .. }
                 | Key::Vxlan { .. }
-                | Key::Bridge { .. } => return false,
+                | Key::Bridge { .. } => return None,
             };
-            let after = store.get(key);
-            let plain = match after {
-                None => true,
-                Some(Value::Route(action)) => matches!(
-                    action,
-                    RouteAction::Forward(_)
-                        | RouteAction::LookupVrf(_)
-                        | RouteAction::Discard
-                        | RouteAction::Reject
-                        | RouteAction::Local
-                ),
-                Some(_) => false,
+            let after = match store.get(key) {
+                None => None,
+                Some(Value::Route(
+                    action @ (RouteAction::Forward(_)
+                    | RouteAction::LookupVrf(_)
+                    | RouteAction::Discard
+                    | RouteAction::Reject
+                    | RouteAction::Local),
+                )) => Some(action),
+                Some(_) => return None,
             };
-            if !plain {
-                return false;
-            }
             *growth.entry(vrf.as_str()).or_default() +=
                 isize::from(after.is_some()) - isize::from(before.is_some());
+            afters.push(after);
         }
-        growth.iter().all(|(vrf, by)| {
+        let kept = growth.iter().all(|(vrf, by)| {
             self.counts
                 .get(*vrf)
                 .is_some_and(|&had| had.checked_add_signed(*by).is_some_and(|has| has > 0))
-        })
+        });
+        kept.then_some(afters)
     }
 }
 
@@ -467,23 +476,28 @@ pub(crate) fn build(
     previous: &[String],
     kept: Option<(Routes, Changed<'_>)>,
 ) -> Result<(Built, Routes), String> {
-    let kept = kept.filter(|(routes, changed)| routes.follows(changed, store));
+    let kept = kept.and_then(|(routes, changed)| {
+        let afters = routes.follows(changed, store)?;
+        Some((routes, changed, afters))
+    });
     // Core's routes of the build before, when no entry looked up in another VRF.
     let mut kept_tables = None;
     let mut lookups = 0;
-    let (kept_names, mut counts, kept_entries, changed): (Vec<String>, _, _, _) = match kept {
-        Some((routes, changed)) => {
-            lookups = routes.lookups;
-            kept_tables = (routes.lookups == 0).then_some(routes.tables);
-            (
-                routes.counts.keys().cloned().collect(),
-                routes.counts,
-                Some(routes.entries),
-                changed,
-            )
-        }
-        None => (Vec::new(), BTreeMap::new(), None, &[][..]),
-    };
+    let (kept_names, mut counts, kept_entries, changed, afters): (Vec<String>, _, _, _, _) =
+        match kept {
+            Some((routes, changed, afters)) => {
+                lookups = routes.lookups;
+                kept_tables = (routes.lookups == 0).then_some(routes.tables);
+                (
+                    routes.counts.keys().cloned().collect(),
+                    routes.counts,
+                    Some(routes.entries),
+                    changed,
+                    afters,
+                )
+            }
+            None => (Vec::new(), BTreeMap::new(), None, &[][..], Vec::new()),
+        };
     let port = |name: &str| {
         let index = ports.iter().position(|p| p == name)?;
         u16::try_from(index).ok().map(IfId)
@@ -1030,13 +1044,9 @@ pub(crate) fn build(
     }
 
     // The change, made to the kept routes (none without them).
-    for (key, before) in changed {
+    for ((key, before), &after) in changed.iter().zip(&afters) {
         let Key::Route { vrf, prefix, len } = key else {
             continue;
-        };
-        let after = match store.get(key) {
-            Some(Value::Route(action)) => Some(action),
-            _ => None,
         };
         if let Some(count) = counts.get_mut(vrf.as_str()) {
             match (before.is_some(), after.is_some()) {
@@ -1476,7 +1486,7 @@ mod tests {
             let follows = self
                 .kept
                 .as_ref()
-                .is_some_and(|routes| routes.follows(changed, next));
+                .is_some_and(|routes| routes.follows(changed, next).is_some());
             let no_lookup_before = self.kept.as_ref().is_some_and(|r| r.lookups == 0);
             let all = build(&self.ports, next, &self.names, None);
             let kept = self.kept.take().map(|routes| (routes, changed));
@@ -1635,7 +1645,7 @@ mod tests {
         let store = Store::default();
         let v4: IpAddr = "192.0.2.1".parse().unwrap();
         let name = || String::from("p0");
-        let follows = |key: Key| routes.follows(&[(&key, None)], &store);
+        let follows = |key: Key| routes.follows(&[(&key, None)], &store).is_some();
         for key in [
             Key::Address {
                 interface: name(),

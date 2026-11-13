@@ -722,7 +722,11 @@ impl Change {
             | Key::Vxlan { interface } => name(interface)?,
             Key::Route { vrf, prefix, len } => {
                 name(vrf)?;
-                parse_prefix(&format!("{prefix}/{len}"))?;
+                // The prefix is an address already: what a text of it is checked
+                // for is left.
+                if *len > max_len(prefix) || network(*prefix, *len) != *prefix {
+                    return Err(ModelError::Invalid("prefix"));
+                }
             }
         }
         match &self.value {
@@ -1108,19 +1112,19 @@ pub fn encode_key(key: &Key, e: &mut Encoder<'_>) {
             e.array(3)
                 .u64(sid::ADDRESS)
                 .text(interface)
-                .text(&address.to_string());
+                .text(IpText::of(*address).as_str());
         }
         Key::Route { vrf, prefix, len } => {
             e.array(3)
                 .u64(sid::ROUTE)
                 .text(vrf)
-                .text(&format!("{prefix}/{len}"));
+                .text(IpText::prefix(*prefix, *len).as_str());
         }
         Key::Neighbor { interface, address } => {
             e.array(3)
                 .u64(sid::NEIGHBOR)
                 .text(interface)
-                .text(&address.to_string());
+                .text(IpText::of(*address).as_str());
         }
         Key::Nat { vrf } => {
             e.array(2).u64(sid::NAT).text(vrf);
@@ -1319,7 +1323,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                             .text(&hop.interface);
                         if let Some(address) = hop.address {
                             e.u64(delta(sid::NEXT_HOP_ADDRESS))
-                                .text(&address.to_string());
+                                .text(IpText::of(address).as_str());
                         }
                     }
                 }
@@ -1329,7 +1333,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                     for gateway in gateways {
                         e.map(1)
                             .u64(sid::NEXT_HOP_ADDRESS - sid::ROUTE_NEXT_HOP)
-                            .text(&gateway.to_string());
+                            .text(IpText::of(*gateway).as_str());
                     }
                 }
                 RouteAction::Local => {
@@ -1378,7 +1382,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             let d = |member: u64| member - sid::SOURCE_IPV4;
             e.map(3)
                 .u64(d(sid::SOURCE_IPV4_ADDRESS))
-                .text(&address.to_string())
+                .text(IpText::of(*address).as_str())
                 .u64(d(sid::SOURCE_IPV4_PREFIX_LENGTH))
                 .u64(u64::from(*prefix_len))
                 .u64(d(sid::SOURCE_IPV4_LIFETIME))
@@ -1394,7 +1398,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             let d = |member: u64| member - sid::SOURCE_PREFIX;
             e.map(5)
                 .u64(d(sid::SOURCE_PREFIX_PREFIX))
-                .text(&prefix.to_string())
+                .text(IpText::of(*prefix).as_str())
                 .u64(d(sid::SOURCE_PREFIX_PREFIX_LENGTH))
                 .u64(u64::from(*prefix_len))
                 .u64(d(sid::SOURCE_PREFIX_PREFERRED))
@@ -1412,7 +1416,7 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             let d = |member: u64| member - sid::SOURCE_IPV6;
             e.map(3)
                 .u64(d(sid::SOURCE_IPV6_ADDRESS))
-                .text(&address.to_string())
+                .text(IpText::of(*address).as_str())
                 .u64(d(sid::SOURCE_IPV6_PREFIX_LENGTH))
                 .u64(u64::from(*prefix_len))
                 .u64(d(sid::SOURCE_IPV6_LIFETIME))
@@ -1783,7 +1787,7 @@ fn encode_srv6_local(e: &mut Encoder, local: &Srv6Local) {
             e.u64(d(sid::ROUTE_SRV6_INTERFACE))
                 .text(interface)
                 .u64(d(sid::ROUTE_SRV6_NEXT_HOP))
-                .text(&next_hop.to_string());
+                .text(IpText::of(*next_hop).as_str());
         }
         Srv6Local::EndDt4 { vrf } | Srv6Local::EndDt6 { vrf } => {
             e.u64(d(sid::ROUTE_SRV6_VRF)).text(vrf);
@@ -1948,13 +1952,89 @@ pub fn network(address: IpAddr, len: u8) -> IpAddr {
     }
 }
 
+/// The text of an IP address (RFC 5952 for IPv6, dotted decimal for IPv4), or of
+/// a prefix, made on the stack: tables of many routes are written and read as
+/// text, address by address.
+struct IpText {
+    bytes: [u8; IpText::CAPACITY],
+    len: usize,
+}
+
+impl IpText {
+    /// The longest IPv6 text (with an IPv4 tail) and `/128`.
+    const CAPACITY: usize = 45 + 4;
+
+    fn of(address: impl Into<IpAddr>) -> Self {
+        let mut text = Self {
+            bytes: [0; Self::CAPACITY],
+            len: 0,
+        };
+        match address.into() {
+            IpAddr::V4(address) => {
+                for (at, octet) in address.octets().into_iter().enumerate() {
+                    if at > 0 {
+                        text.push(b'.');
+                    }
+                    text.decimal(octet);
+                }
+            }
+            IpAddr::V6(address) => {
+                use std::fmt::Write;
+                // The standard library's text is RFC 5952's.
+                write!(text, "{address}").expect("an IPv6 text fits");
+            }
+        }
+        text
+    }
+
+    fn prefix(address: IpAddr, len: u8) -> Self {
+        let mut text = Self::of(address);
+        text.push(b'/');
+        text.decimal(len);
+        text
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.bytes[self.len] = byte;
+        self.len += 1;
+    }
+
+    fn decimal(&mut self, value: u8) {
+        if value >= 100 {
+            self.push(b'0' + value / 100);
+        }
+        if value >= 10 {
+            self.push(b'0' + value / 10 % 10);
+        }
+        self.push(b'0' + value % 10);
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("ASCII")
+    }
+}
+
+impl std::fmt::Write for IpText {
+    fn write_str(&mut self, part: &str) -> std::fmt::Result {
+        let end = self.len + part.len();
+        self.bytes
+            .get_mut(self.len..end)
+            .ok_or(std::fmt::Error)?
+            .copy_from_slice(part.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// An IP address in the canonical text of RFC 5952 (for IPv6) or dotted decimal.
 fn parse_ip(text: &str) -> Result<IpAddr, ModelError> {
     let address: IpAddr = text
         .parse()
         .map_err(|_| ModelError::Invalid("IP address"))?;
     // One spelling per address, so that keys compare equal (RFC 5952 section 4).
-    if address.to_string() != text {
+    // Every IPv4 address the parser takes is in its one spelling already: it
+    // refuses leading zeros and anything but four decimal numbers.
+    if address.is_ipv6() && IpText::of(address).as_str() != text {
         return Err(ModelError::Invalid("IP address (not canonical)"));
     }
     Ok(address)
@@ -2146,7 +2226,7 @@ impl ResolveRequest {
             .u64(sid::RESOLVE_REQUEST_INTERFACE - sid::RESOLVE_REQUEST)
             .text(&self.interface)
             .u64(sid::RESOLVE_REQUEST_ADDRESS - sid::RESOLVE_REQUEST)
-            .text(&self.address.to_string());
+            .text(IpText::of(self.address).as_str());
     }
 
     pub fn decode(d: &mut Decoder<'_>) -> Result<Self, ModelError> {
@@ -2694,4 +2774,72 @@ fn decode_punt(got: &mut Members) -> Result<Value, ModelError> {
         rate: number(got, sid::PUNT_RATE, "rate")?,
         burst: number(got, sid::PUNT_BURST, "burst")?,
     }))
+}
+
+#[cfg(test)]
+mod ip_text_tests {
+    use super::*;
+
+    /// Addresses and prefixes as the standard library writes them, which is
+    /// what the tables' text was before.
+    #[test]
+    fn the_text_of_an_address_or_prefix_is_the_standard_one() {
+        let mut seed = 0x6970_7465_7874_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut addresses: Vec<IpAddr> = [
+            "0.0.0.0",
+            "255.255.255.255",
+            "10.0.0.1",
+            "100.64.9.99",
+            "::",
+            "::1",
+            "::ffff:192.0.2.1",
+            "2001:db8::",
+            "fe80::1:0:0:1",
+            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+        ]
+        .iter()
+        .map(|text| text.parse().unwrap())
+        .collect();
+        for _ in 0..10_000 {
+            let bits = next();
+            addresses.push(IpAddr::V4((bits as u32).into()));
+            // Runs of zero groups at random places.
+            let mask = next() & next();
+            let wide =
+                (u128::from(bits) << 64 | u128::from(next())) & u128::from(mask).rotate_left(32);
+            addresses.push(IpAddr::V6(wide.into()));
+        }
+        for address in addresses {
+            assert_eq!(IpText::of(address).as_str(), address.to_string());
+            for len in [0, 7, 24, max_len(&address)] {
+                assert_eq!(
+                    IpText::prefix(address, len).as_str(),
+                    format!("{address}/{len}")
+                );
+            }
+            assert_eq!(parse_ip(&address.to_string()), Ok(address));
+        }
+    }
+
+    #[test]
+    fn an_address_in_another_spelling_is_refused() {
+        for text in [
+            "010.0.0.1",
+            "10.0.0.01",
+            "1.2.3",
+            "1.2.3.4.5",
+            " 1.2.3.4",
+            "2001:DB8::1",
+            "2001:db8:0:0:0:0:0:1",
+            "::ffff:c000:201",
+        ] {
+            assert!(parse_ip(text).is_err(), "{text}");
+        }
+    }
 }
