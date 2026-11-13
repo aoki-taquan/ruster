@@ -3559,12 +3559,13 @@ where
     let mut consumed = 0;
     let all_vrfs = snapshot;
     let vlans = all_vrfs.vlans;
-    // With no NAT to consult, a plain IPv4 forward goes the short way
-    // (`plain_ipv4`).
+    // A plain IPv4 forward goes the short way (`plain_ipv4`), with the
+    // forward firewall or with NAT, not with both.
     let plain = plain_ipv4::enabled()
-        && nat44_udp_config.is_none()
-        && nat44_tcp_config.is_none()
-        && nat44_icmp_config.is_none();
+        && (firewall_config.is_none()
+            || (nat44_udp_config.is_none()
+                && nat44_tcp_config.is_none()
+                && nat44_icmp_config.is_none()));
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
         if !vlans.is_empty() {
@@ -3653,54 +3654,97 @@ where
         if plain {
             let ingress = packet.ingress();
             let snapshot = all_vrfs.for_ingress(ingress);
-            // The forward firewall is the default VRF's: another VRF's datagram
-            // goes the full way.
-            let decided =
-                if firewall_config.is_none() || snapshot.authority() == all_vrfs.authority() {
-                    plain_ipv4::decide(
-                        packet.bytes_mut(),
-                        snapshot,
-                        all_vrfs,
-                        ingress,
-                        bridges.as_deref(),
-                        firewall_config.is_some(),
-                    )
-                } else {
-                    None
-                };
+            let nat = plain_ipv4::Nat {
+                udp: nat44_udp_config,
+                tcp: nat44_tcp_config,
+                icmp: nat44_icmp_config,
+            };
+            // The forward firewall and NAT are the default VRF's: another VRF's
+            // datagram goes the full way.
+            let decided = if (firewall_config.is_none() && !nat.any())
+                || snapshot.authority() == all_vrfs.authority()
+            {
+                plain_ipv4::decide(
+                    packet.bytes_mut(),
+                    snapshot,
+                    all_vrfs,
+                    ingress,
+                    bridges.as_deref(),
+                    firewall_config.is_some(),
+                    nat,
+                )
+            } else {
+                None
+            };
             if let Some(decided) = decided {
                 plain_ipv4::validated(&decided, ingress, trace);
-                let planned = match firewall_config {
-                    Some(config) => plain_ipv4::plan_firewall(
+                let snapshot = &snapshot.with_now(all_vrfs.now);
+                let sent = if nat.any() {
+                    plain_ipv4::translate(
                         packet.bytes_mut(),
-                        &snapshot.with_now(all_vrfs.now),
+                        snapshot,
                         ingress,
                         &decided,
-                        config,
-                        &mut firewall,
-                        &mut firewall_audit,
-                        &mut icmpv4_errors,
+                        nat,
+                        &mut nat44_udp,
+                        &mut nat44_tcp,
                         trace,
                     )
-                    .map(Some),
-                    None => Ok(None),
+                    .and_then(|translated| match translated {
+                        Some(decision) => plain_ipv4::send_translated(
+                            &mut packet,
+                            decision,
+                            ingress,
+                            &mut nat44_udp,
+                            &mut nat44_tcp,
+                            &mut nat44_icmp,
+                            all_vrfs,
+                            bridges.as_deref(),
+                            trace,
+                        ),
+                        None => plain_ipv4::send(
+                            &mut packet,
+                            decided,
+                            None,
+                            all_vrfs,
+                            bridges.as_deref(),
+                            trace,
+                        ),
+                    })
+                } else {
+                    let planned = match firewall_config {
+                        Some(config) => plain_ipv4::plan_firewall(
+                            packet.bytes_mut(),
+                            snapshot,
+                            ingress,
+                            &decided,
+                            config,
+                            &mut firewall,
+                            &mut firewall_audit,
+                            &mut icmpv4_errors,
+                            trace,
+                        )
+                        .map(Some),
+                        None => Ok(None),
+                    };
+                    planned.and_then(|plan| {
+                        plain_ipv4::routed(&decided, trace);
+                        let firewall = plan.map(|plan| {
+                            let runtime = firewall
+                                .as_deref_mut()
+                                .expect("firewall plan requires a bound runtime");
+                            (plan, runtime)
+                        });
+                        plain_ipv4::send(
+                            &mut packet,
+                            decided,
+                            firewall,
+                            all_vrfs,
+                            bridges.as_deref(),
+                            trace,
+                        )
+                    })
                 };
-                let sent = planned.and_then(|plan| {
-                    let firewall = plan.map(|plan| {
-                        let runtime = firewall
-                            .as_deref_mut()
-                            .expect("firewall plan requires a bound runtime");
-                        (plan, runtime)
-                    });
-                    plain_ipv4::send(
-                        &mut packet,
-                        decided,
-                        firewall,
-                        all_vrfs,
-                        bridges.as_deref(),
-                        trace,
-                    )
-                });
                 match sent {
                     Ok(port) => {
                         packet.commit(port);
@@ -3956,55 +4000,13 @@ where
                         Ok(decision)
                     })
                     .and_then(|decision| {
-                        // Every NAT commit is checked before the packet is
-                        // rewritten, so a plan the runtime would refuse (stale or
-                        // corrupt reuse lists or indexes) is a counted drop, never
-                        // a worker panic.
-                        if let PacketDecision::Nat44Udp(nat) = decision {
-                            let runtime = nat44_udp
-                                .as_deref()
-                                .ok_or(DropReason::Nat44UdpRuntimeUnavailable)?;
-                            match nat.transition {
-                                Nat44UdpTransition::Outbound(plan) => runtime
-                                    .prevalidate_outbound_commit(plan, nat_now_ms)
-                                    .map_err(|_| DropReason::Nat44UdpConfigMismatch)?,
-                                Nat44UdpTransition::Inbound(plan)
-                                | Nat44UdpTransition::Hairpin(plan) => {
-                                    runtime
-                                        .prevalidate_inbound_commit(plan, nat_now_ms)
-                                        .map_err(|_| DropReason::Nat44UdpConfigMismatch)?;
-                                }
-                            }
-                        }
-                        if let PacketDecision::Nat44Tcp(nat) = decision {
-                            let runtime = nat44_tcp
-                                .as_deref()
-                                .ok_or(DropReason::Nat44TcpRuntimeUnavailable)?;
-                            match nat.transition {
-                                Nat44TcpTransition::Outbound(plan) => runtime
-                                    .prevalidate_outbound_commit(plan, nat_now_ms)
-                                    .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
-                                Nat44TcpTransition::Inbound(plan)
-                                | Nat44TcpTransition::Hairpin(plan) => {
-                                    runtime
-                                        .prevalidate_inbound_commit(plan, nat_now_ms)
-                                        .map_err(|_| DropReason::Nat44TcpConfigMismatch)?;
-                                }
-                            }
-                        }
-                        if let PacketDecision::Nat44Icmp(nat) = decision {
-                            let runtime = nat44_icmp
-                                .as_deref()
-                                .ok_or(DropReason::Nat44IcmpRuntimeUnavailable)?;
-                            match nat.transition {
-                                Nat44IcmpTransition::Outbound(plan) => runtime
-                                    .prevalidate_outbound_commit(plan, nat_now_ms)
-                                    .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
-                                Nat44IcmpTransition::Inbound(plan) => runtime
-                                    .prevalidate_inbound_commit(plan, nat_now_ms)
-                                    .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
-                            }
-                        }
+                        prevalidate_nat(
+                            decision,
+                            nat44_udp.as_deref(),
+                            nat44_tcp.as_deref(),
+                            nat44_icmp.as_deref(),
+                            nat_now_ms,
+                        )?;
                         if matches!(
                             decision,
                             PacketDecision::ConsumeArp(_)
@@ -4173,74 +4175,15 @@ where
                 Ok(planned) => {
                     let decision = planned.decision;
                     let egress = decision.egress();
-                    if let PacketDecision::Nat44Udp(nat) = decision {
-                        let runtime = nat44_udp
-                            .as_deref_mut()
-                            .expect("NAT decision requires a bound runtime");
-                        match nat.transition {
-                            Nat44UdpTransition::Outbound(plan) => {
-                                runtime
-                                    .commit_outbound(plan, nat_now_ms)
-                                    .expect("sequential packet path keeps UDP NAT plan current");
-                            }
-                            Nat44UdpTransition::Inbound(plan) => {
-                                runtime
-                                    .commit_inbound(plan, nat_now_ms)
-                                    .expect("sequential packet path keeps UDP NAT plan current");
-                            }
-                            Nat44UdpTransition::Hairpin(plan) => {
-                                runtime
-                                    .commit_hairpin_inbound(plan, nat_now_ms)
-                                    .expect("sequential packet path keeps UDP NAT plan current");
-                            }
-                        }
-                        trace.record(TraceEvent::Nat44Udp {
-                            ingress,
-                            disposition: nat.disposition,
-                        });
-                    }
-                    if let PacketDecision::Nat44Tcp(nat) = decision {
-                        if let Some(runtime) = nat44_tcp.as_deref_mut() {
-                            match nat.transition {
-                                Nat44TcpTransition::Outbound(plan) => {
-                                    runtime.commit_prevalidated_outbound(plan, nat_now_ms);
-                                }
-                                Nat44TcpTransition::Inbound(plan) => {
-                                    runtime.commit_prevalidated_inbound(plan, nat_now_ms);
-                                }
-                                Nat44TcpTransition::Hairpin(plan) => {
-                                    runtime.commit_prevalidated_hairpin_inbound(plan, nat_now_ms);
-                                }
-                            }
-                        }
-                        trace.record(TraceEvent::Nat44Tcp {
-                            ingress,
-                            disposition: nat.disposition,
-                        });
-                    }
-                    if let PacketDecision::Nat44Icmp(nat) = decision {
-                        let runtime = nat44_icmp
-                            .as_deref_mut()
-                            .expect("ICMP query NAT decision requires a bound runtime");
-                        match nat.transition {
-                            Nat44IcmpTransition::Outbound(plan) => runtime
-                                .commit_outbound(plan, nat_now_ms)
-                                .expect("sequential packet path keeps ICMP query NAT plan current"),
-                            Nat44IcmpTransition::Inbound(plan) => runtime
-                                .commit_inbound(plan, nat_now_ms)
-                                .expect("sequential packet path keeps ICMP query NAT plan current"),
-                        }
-                        trace.record(TraceEvent::Nat44Icmp {
-                            ingress,
-                            disposition: nat.disposition,
-                        });
-                    }
-                    if let PacketDecision::Nat44Icmpv4(nat) = decision {
-                        trace.record(TraceEvent::Nat44Icmpv4 {
-                            ingress,
-                            disposition: nat.disposition,
-                        });
-                    }
+                    commit_nat(
+                        decision,
+                        &mut nat44_udp,
+                        &mut nat44_tcp,
+                        &mut nat44_icmp,
+                        nat_now_ms,
+                        ingress,
+                        trace,
+                    );
                     if let Some(plan) = planned.firewall {
                         // Another VRF's datagram into the default VRF: the firewall
                         // set aside for it planned it.
@@ -4458,6 +4401,138 @@ where
         });
     }
     report
+}
+
+/// Checks, before the packet is rewritten, that the runtime will take the NAT
+/// plan of `decision`, so a plan it would refuse (stale or corrupt reuse lists
+/// or indexes) is a counted drop, never a worker panic.
+fn prevalidate_nat(
+    decision: PacketDecision,
+    nat44_udp: Option<&Nat44UdpRuntime<'_>>,
+    nat44_tcp: Option<&Nat44TcpRuntime<'_>>,
+    nat44_icmp: Option<&Nat44IcmpRuntime<'_>>,
+    nat_now_ms: u64,
+) -> Result<(), DropReason> {
+    if let PacketDecision::Nat44Udp(nat) = decision {
+        let runtime = nat44_udp.ok_or(DropReason::Nat44UdpRuntimeUnavailable)?;
+        match nat.transition {
+            Nat44UdpTransition::Outbound(plan) => runtime
+                .prevalidate_outbound_commit(plan, nat_now_ms)
+                .map_err(|_| DropReason::Nat44UdpConfigMismatch)?,
+            Nat44UdpTransition::Inbound(plan) | Nat44UdpTransition::Hairpin(plan) => {
+                runtime
+                    .prevalidate_inbound_commit(plan, nat_now_ms)
+                    .map_err(|_| DropReason::Nat44UdpConfigMismatch)?;
+            }
+        }
+    }
+    if let PacketDecision::Nat44Tcp(nat) = decision {
+        let runtime = nat44_tcp.ok_or(DropReason::Nat44TcpRuntimeUnavailable)?;
+        match nat.transition {
+            Nat44TcpTransition::Outbound(plan) => runtime
+                .prevalidate_outbound_commit(plan, nat_now_ms)
+                .map_err(|_| DropReason::Nat44TcpConfigMismatch)?,
+            Nat44TcpTransition::Inbound(plan) | Nat44TcpTransition::Hairpin(plan) => {
+                runtime
+                    .prevalidate_inbound_commit(plan, nat_now_ms)
+                    .map_err(|_| DropReason::Nat44TcpConfigMismatch)?;
+            }
+        }
+    }
+    if let PacketDecision::Nat44Icmp(nat) = decision {
+        let runtime = nat44_icmp.ok_or(DropReason::Nat44IcmpRuntimeUnavailable)?;
+        match nat.transition {
+            Nat44IcmpTransition::Outbound(plan) => runtime
+                .prevalidate_outbound_commit(plan, nat_now_ms)
+                .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
+            Nat44IcmpTransition::Inbound(plan) => runtime
+                .prevalidate_inbound_commit(plan, nat_now_ms)
+                .map_err(|_| DropReason::Nat44IcmpConfigMismatch)?,
+        }
+    }
+    Ok(())
+}
+
+/// Commits the NAT plan of a `decision` [`prevalidate_nat`] passed, and
+/// records its disposition.
+#[allow(clippy::too_many_arguments)]
+fn commit_nat<T: TraceSink>(
+    decision: PacketDecision,
+    nat44_udp: &mut Option<&mut Nat44UdpRuntime<'_>>,
+    nat44_tcp: &mut Option<&mut Nat44TcpRuntime<'_>>,
+    nat44_icmp: &mut Option<&mut Nat44IcmpRuntime<'_>>,
+    nat_now_ms: u64,
+    ingress: IfId,
+    trace: &mut T,
+) {
+    if let PacketDecision::Nat44Udp(nat) = decision {
+        let runtime = nat44_udp
+            .as_deref_mut()
+            .expect("NAT decision requires a bound runtime");
+        match nat.transition {
+            Nat44UdpTransition::Outbound(plan) => {
+                runtime
+                    .commit_outbound(plan, nat_now_ms)
+                    .expect("sequential packet path keeps UDP NAT plan current");
+            }
+            Nat44UdpTransition::Inbound(plan) => {
+                runtime
+                    .commit_inbound(plan, nat_now_ms)
+                    .expect("sequential packet path keeps UDP NAT plan current");
+            }
+            Nat44UdpTransition::Hairpin(plan) => {
+                runtime
+                    .commit_hairpin_inbound(plan, nat_now_ms)
+                    .expect("sequential packet path keeps UDP NAT plan current");
+            }
+        }
+        trace.record(TraceEvent::Nat44Udp {
+            ingress,
+            disposition: nat.disposition,
+        });
+    }
+    if let PacketDecision::Nat44Tcp(nat) = decision {
+        if let Some(runtime) = nat44_tcp.as_deref_mut() {
+            match nat.transition {
+                Nat44TcpTransition::Outbound(plan) => {
+                    runtime.commit_prevalidated_outbound(plan, nat_now_ms);
+                }
+                Nat44TcpTransition::Inbound(plan) => {
+                    runtime.commit_prevalidated_inbound(plan, nat_now_ms);
+                }
+                Nat44TcpTransition::Hairpin(plan) => {
+                    runtime.commit_prevalidated_hairpin_inbound(plan, nat_now_ms);
+                }
+            }
+        }
+        trace.record(TraceEvent::Nat44Tcp {
+            ingress,
+            disposition: nat.disposition,
+        });
+    }
+    if let PacketDecision::Nat44Icmp(nat) = decision {
+        let runtime = nat44_icmp
+            .as_deref_mut()
+            .expect("ICMP query NAT decision requires a bound runtime");
+        match nat.transition {
+            Nat44IcmpTransition::Outbound(plan) => runtime
+                .commit_outbound(plan, nat_now_ms)
+                .expect("sequential packet path keeps ICMP query NAT plan current"),
+            Nat44IcmpTransition::Inbound(plan) => runtime
+                .commit_inbound(plan, nat_now_ms)
+                .expect("sequential packet path keeps ICMP query NAT plan current"),
+        }
+        trace.record(TraceEvent::Nat44Icmp {
+            ingress,
+            disposition: nat.disposition,
+        });
+    }
+    if let PacketDecision::Nat44Icmpv4(nat) = decision {
+        trace.record(TraceEvent::Nat44Icmpv4 {
+            ingress,
+            disposition: nat.disposition,
+        });
+    }
 }
 
 /// The egress MTU rule of RFC 1812 §4.2.2.7 for every IPv4 decision that
@@ -4880,6 +4955,23 @@ fn validate_ipv4_forward_destination(
     Ok(())
 }
 
+/// Whether the NAT configurations disagree on their realms (inside, outside,
+/// public address).
+fn combined_realm_mismatch(
+    nat44_udp_config: Option<&Nat44UdpConfig>,
+    nat44_tcp_config: Option<&Nat44TcpConfig>,
+    nat44_icmp_config: Option<&Nat44IcmpConfig>,
+) -> bool {
+    matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp))
+        || nat44_icmp_config.is_some_and(|icmp| {
+            nat44_udp_config.is_some_and(|udp| {
+                !icmp.realm_matches(udp.inside(), udp.outside(), udp.public_address())
+            }) || nat44_tcp_config.is_some_and(|tcp| {
+                !icmp.realm_matches(tcp.inside(), tcp.outside(), tcp.public_address())
+            })
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn decide_ipv4<T: TraceSink>(
     frame: &[u8],
@@ -4950,14 +5042,8 @@ fn decide_ipv4<T: TraceSink>(
         validate_ipv4_forward_destination(ipv4, selected_route)?;
     }
     let nat_now = snapshot.now;
-    let combined_realm_mismatch = matches!((nat44_udp_config, nat44_tcp_config), (Some(udp), Some(tcp)) if !tcp.realm_matches_udp(*udp))
-        || nat44_icmp_config.is_some_and(|icmp| {
-            nat44_udp_config.is_some_and(|udp| {
-                !icmp.realm_matches(udp.inside(), udp.outside(), udp.public_address())
-            }) || nat44_tcp_config.is_some_and(|tcp| {
-                !icmp.realm_matches(tcp.inside(), tcp.outside(), tcp.public_address())
-            })
-        });
+    let combined_realm_mismatch =
+        combined_realm_mismatch(nat44_udp_config, nat44_tcp_config, nat44_icmp_config);
     // Inside-realm errors (RFC 5508 REQ-5, REQ-7) before the external
     // candidate, which would otherwise claim an inside error addressed to
     // the public address as a wrong-ingress external error.

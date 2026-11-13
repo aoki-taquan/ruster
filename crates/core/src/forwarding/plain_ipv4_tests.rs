@@ -11,6 +11,12 @@ use crate::{
     FirewallPolicy, FirewallRule, Ipv4Address, MacAddress, PacketLease, PacketSlot, SlotCompletion,
 };
 
+const NO_NAT: plain_ipv4::Nat<'static> = plain_ipv4::Nat {
+    udp: None,
+    tcp: None,
+    icmp: None,
+};
+
 struct Item {
     ingress: IfId,
     frame: Vec<u8>,
@@ -526,6 +532,7 @@ fn the_short_way_ends_every_packet_as_the_full_way_does() {
                     item.ingress,
                     None,
                     false,
+                    NO_NAT,
                 )
                 .is_some()
             })
@@ -592,6 +599,7 @@ fn with_a_firewall_the_short_way_ends_every_packet_as_the_full_way_does() {
                     item.ingress,
                     None,
                     true,
+                    NO_NAT,
                 )
                 .is_some()
             })
@@ -651,4 +659,368 @@ fn with_a_firewall_the_short_way_ends_every_packet_as_the_full_way_does() {
         replies_sent > 300,
         "{replies_sent} sent in the second batches"
     );
+}
+
+fn leak<T: Clone>(len: usize, value: T) -> &'static mut [T] {
+    Box::leak(vec![value; len].into_boxed_slice())
+}
+
+fn buckets(count: usize) -> &'static mut [crate::DirectoryBucket] {
+    leak(count.next_power_of_two(), crate::DirectoryBucket::default())
+}
+
+const NAT_SLOTS: usize = 16;
+const NAT_PORTS: u16 = 8;
+
+fn udp_runtime(config: Nat44UdpConfig) -> Nat44UdpRuntime<'static> {
+    let ports = usize::from(NAT_PORTS);
+    Nat44UdpRuntime::new(
+        config,
+        leak(NAT_SLOTS, crate::Nat44UdpMappingSlot::default()),
+        leak(NAT_SLOTS, crate::Nat44UdpPeerSlot::default()),
+        crate::Nat44UdpIndexStorage::new(
+            buckets(NAT_SLOTS),
+            leak(NAT_SLOTS, crate::DirectoryNode::default()),
+            buckets(NAT_SLOTS),
+            leak(NAT_SLOTS, crate::DirectoryNode::default()),
+            leak(ports, crate::PortOwnerSlot::default()),
+            leak(crate::port_free_bitmap_words(ports), 0_u64),
+            crate::Nat44HostStorage::disabled(),
+        ),
+        crate::Nat44UdpHashKey::new(0x1357_9bdf_2468_ace0, 0xfdb9_7531_eca8_6420).expect("a key"),
+    )
+    .expect("a UDP runtime")
+}
+
+fn tcp_runtime(config: Nat44TcpConfig) -> Nat44TcpRuntime<'static> {
+    let ports = usize::from(NAT_PORTS);
+    Nat44TcpRuntime::new(
+        config,
+        leak(NAT_SLOTS, crate::Nat44TcpMappingSlot::default()),
+        leak(NAT_SLOTS, crate::Nat44TcpSessionSlot::default()),
+        crate::Nat44TcpIndexStorage::new(
+            buckets(NAT_SLOTS),
+            leak(NAT_SLOTS, crate::DirectoryNode::default()),
+            buckets(NAT_SLOTS),
+            leak(NAT_SLOTS, crate::DirectoryNode::default()),
+            buckets(NAT_SLOTS),
+            leak(NAT_SLOTS, crate::DirectoryNode::default()),
+            leak(ports, crate::PortOwnerSlot::default()),
+            leak(crate::port_free_bitmap_words(ports), 0_u64),
+            crate::Nat44HostStorage::disabled(),
+        ),
+        crate::Nat44TcpHashKey::new(0xc001_d00d_f00d_beef, 0x1234_5678_9abc_def0).expect("a key"),
+    )
+    .expect("a TCP runtime")
+}
+
+/// `batches` forwarded in turn with NAT, one way: what each ended as, and
+/// NAT's counters and tables after.
+fn forward_translated(
+    snapshot: &ForwardingSnapshot<'_>,
+    udp_config: Option<&Nat44UdpConfig>,
+    tcp_config: Option<&Nat44TcpConfig>,
+    batches: &[&[Item]],
+    times: &[u64],
+    short_way: bool,
+) -> (Vec<Outcome>, impl PartialEq + std::fmt::Debug, NatTables) {
+    let mut udp = udp_config.map(|config| udp_runtime(*config));
+    let mut tcp = tcp_config.map(|config| tcp_runtime(*config));
+    let mut control = crate::ControlQueue::new(16);
+    let mut outcomes = Vec::new();
+    plain_ipv4::OFF.with(|off| off.set(!short_way));
+    for (at, frames) in batches.iter().enumerate() {
+        let mut items: Vec<Item> = frames
+            .iter()
+            .map(|item| Item {
+                ingress: item.ingress,
+                frame: item.frame.clone(),
+                ended: None,
+            })
+            .collect();
+        let mut trace = Recorded::default();
+        let snapshot = snapshot.with_now(MonotonicMillis(times[at]));
+        let report = forward_batch_with_control(
+            Items {
+                items: &mut items,
+                next: 0,
+            },
+            &snapshot,
+            &mut control,
+            Services {
+                nat44_udp: udp_config.zip(udp.as_mut()),
+                nat44_tcp: tcp_config.zip(tcp.as_mut()),
+                ..Services::default()
+            },
+            &mut trace,
+        );
+        let counts = (
+            report.received,
+            report.tx_requested,
+            report.dropped,
+            report.consumed,
+        );
+        outcomes.push((items, trace.0, counts));
+    }
+    plain_ipv4::OFF.with(|off| off.set(false));
+    let counters = (
+        udp.as_ref().map(Nat44UdpRuntime::counters),
+        tcp.as_ref().map(Nat44TcpRuntime::counters),
+    );
+    let state = (
+        udp.as_ref().map(|udp| {
+            (
+                udp.mappings()
+                    .iter()
+                    .filter(|slot| slot.is_occupied())
+                    .count(),
+                udp.peers().iter().filter(|slot| slot.is_occupied()).count(),
+            )
+        }),
+        tcp.as_ref().map(|tcp| {
+            (
+                tcp.mappings()
+                    .iter()
+                    .filter(|slot| slot.is_occupied())
+                    .count(),
+                tcp.sessions()
+                    .iter()
+                    .filter(|slot| slot.is_occupied())
+                    .count(),
+            )
+        }),
+    );
+    let tables: NatTables = (
+        udp.as_ref()
+            .map(|u| u.mappings().to_vec())
+            .unwrap_or_default(),
+        udp.as_ref().map(|u| u.peers().to_vec()).unwrap_or_default(),
+        tcp.as_ref()
+            .map(|t| t.mappings().to_vec())
+            .unwrap_or_default(),
+        tcp.as_ref()
+            .map(|t| t.sessions().to_vec())
+            .unwrap_or_default(),
+    );
+    (outcomes, (counters, state), tables)
+}
+
+/// NAT's tables after a run: UDP mappings and peers, TCP mappings and
+/// sessions.
+type NatTables = (
+    Vec<crate::Nat44UdpMappingSlot>,
+    Vec<crate::Nat44UdpPeerSlot>,
+    Vec<crate::Nat44TcpMappingSlot>,
+    Vec<crate::Nat44TcpSessionSlot>,
+);
+
+#[test]
+fn with_nat_the_short_way_ends_every_packet_as_the_full_way_does() {
+    let mut rng = Rng(0x0a7a_5eed_0000_0001);
+    let mut short = 0;
+    let mut translated = 0;
+    let mut rounds = 0;
+    for round in 0..600 {
+        let mut tables = random_tables(&mut rng, 16);
+        if tables.interfaces.len() < 2 {
+            continue;
+        }
+        // The outside has an address (the public one); the inside a network
+        // behind it, and the outside a way to everywhere.
+        let outside_at = rng.below(tables.interfaces.len() as u64) as usize;
+        let outside = tables.interfaces[outside_at].id;
+        let inside = tables.interfaces[(outside_at + 1) % tables.interfaces.len()].id;
+        let public = ip(0xc633_6401 + rng.below(200) as u32);
+        tables
+            .local_ipv4
+            .retain(|binding| binding.interface != outside);
+        tables.local_ipv4.push(LocalIpv4Binding {
+            interface: outside,
+            address: public,
+        });
+        let network = 0x0ac8_0000 | (rng.below(256) as u32) << 8;
+        tables
+            .routes
+            .retain(|route| route.prefix_len() != 0 && route.prefix() != ip(network));
+        tables
+            .routes
+            .push(Route::new(ip(network), 24, inside, None).expect("inside network"));
+        let gateway = ip(0xc633_6301);
+        tables
+            .routes
+            .push(Route::new(ip(0), 0, outside, Some(gateway)).expect("default route"));
+        with_reachable_neighbors(&mut rng, &mut tables);
+        for (interface, target) in [(outside, gateway), (inside, ip(network | 7))] {
+            if !tables
+                .neighbors
+                .iter()
+                .any(|n| n.interface == interface && n.target == target)
+            {
+                tables.neighbors.push(Neighbor {
+                    interface,
+                    target,
+                    mac: MacAddress([2, 3, 0, 0, 0, tables.neighbors.len() as u8]),
+                });
+            }
+        }
+        let Ok(owner) = std::panic::catch_unwind(|| owner(&tables)) else {
+            continue;
+        };
+        let snapshot = owner.snapshot();
+        let port = 40_000 + rng.below(1_000) as u16;
+        let udp_config = (rng.below(4) != 0).then(|| {
+            Nat44UdpConfig::new(
+                &snapshot,
+                inside,
+                outside,
+                public,
+                port,
+                port + NAT_PORTS - 1,
+                crate::Nat44UdpPolicy::default(),
+            )
+            .expect("a UDP NAT")
+        });
+        // Now and then TCP NAT has another inside: the realms disagree.
+        let tcp_inside = match tables.interfaces.len() {
+            n if n > 2 && rng.below(4) == 0 => tables.interfaces[(outside_at + 2) % n].id,
+            _ => inside,
+        };
+        let tcp_config = (rng.below(4) != 0).then(|| {
+            Nat44TcpConfig::new(
+                &snapshot,
+                tcp_inside,
+                outside,
+                public,
+                port,
+                port + NAT_PORTS - 1,
+                crate::Nat44TcpPolicy::default(),
+            )
+            .expect("a TCP NAT")
+        });
+        if udp_config.is_none() && tcp_config.is_none() {
+            continue;
+        }
+        rounds += 1;
+        let ids = interface_ids(&tables);
+        let mut addresses = probe_addresses(&mut rng, &tables);
+        addresses.extend((0..16).map(|host| ip(network | host)));
+        addresses.push(public);
+        let first: Vec<Item> = (0..48)
+            .map(|_| {
+                let mut item = random_frame(&mut rng, &tables, &ids, &addresses);
+                // Mostly from a host on the inside.
+                if rng.below(3) != 0 && item.frame.len() >= 34 && item.frame[12..14] == [8, 0] {
+                    item.ingress = inside;
+                    let mac = tables
+                        .interfaces
+                        .iter()
+                        .find(|i| i.id == inside)
+                        .unwrap()
+                        .mac;
+                    item.frame[0..6].copy_from_slice(&mac.0);
+                    item.frame[26..30]
+                        .copy_from_slice(&ip(network | (1 + rng.below(6) as u32)).octets());
+                    if item.frame[14] == 0x45 {
+                        transport_checksum(&mut item.frame);
+                        item.frame[24..26].copy_from_slice(&[0, 0]);
+                        let checksum = crate::ipv4_header_checksum(&item.frame[14..34]);
+                        item.frame[24..26].copy_from_slice(&checksum.to_be_bytes());
+                    }
+                }
+                item
+            })
+            .collect();
+        let nat = plain_ipv4::Nat {
+            udp: udp_config.as_ref(),
+            tcp: tcp_config.as_ref(),
+            icmp: None,
+        };
+        short += first
+            .iter()
+            .filter(|item| {
+                plain_ipv4::decide(
+                    &item.frame,
+                    snapshot.for_ingress(item.ingress),
+                    &snapshot,
+                    item.ingress,
+                    None,
+                    false,
+                    nat,
+                )
+                .is_some()
+            })
+            .count();
+        let (sent, _, _) = forward_translated(
+            &snapshot,
+            udp_config.as_ref(),
+            tcp_config.as_ref(),
+            &[&first],
+            &[1_000],
+            false,
+        );
+        let mut second: Vec<Item> = sent[0]
+            .0
+            .iter()
+            .filter_map(|item| match item.ended {
+                Some(SlotCompletion::Transmit(egress)) => Some(reply(&item.frame, egress, &tables)),
+                _ => None,
+            })
+            .collect();
+        second.extend(first.iter().map(|item| Item {
+            ingress: item.ingress,
+            frame: item.frame.clone(),
+            ended: None,
+        }));
+        let batches: [&[Item]; 2] = [&first, &second];
+        // Now and then the clock goes back, which NAT refuses.
+        let times = [1_000, if round % 5 == 0 { 990 } else { 1_010 }];
+        let (fast, fast_state, fast_tables) = forward_translated(
+            &snapshot,
+            udp_config.as_ref(),
+            tcp_config.as_ref(),
+            &batches,
+            &times,
+            true,
+        );
+        let (full, full_state, full_tables) = forward_translated(
+            &snapshot,
+            udp_config.as_ref(),
+            tcp_config.as_ref(),
+            &batches,
+            &times,
+            false,
+        );
+        for (batch, (fast, full)) in fast.iter().zip(&full).enumerate() {
+            assert_eq!(fast.2, full.2, "round {round} batch {batch}");
+            assert_eq!(fast.1, full.1, "round {round} batch {batch}");
+            for (index, (fast, full)) in fast.0.iter().zip(&full.0).enumerate() {
+                assert_eq!(
+                    fast.ended, full.ended,
+                    "round {round} batch {batch} frame {index}"
+                );
+                assert_eq!(
+                    fast.frame, full.frame,
+                    "round {round} batch {batch} frame {index}"
+                );
+            }
+        }
+        assert_eq!(fast_state, full_state, "round {round}");
+        assert!(
+            fast_tables == full_tables,
+            "round {round}: the NAT tables differ"
+        );
+        translated += full[0]
+            .1
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    TraceEvent::Nat44Udp { .. } | TraceEvent::Nat44Tcp { .. }
+                )
+            })
+            .count();
+    }
+    assert!(rounds > 200, "{rounds} rounds with NAT");
+    assert!(short > 1_000, "short way taken {short} times");
+    assert!(translated > 500, "{translated} translated");
 }
