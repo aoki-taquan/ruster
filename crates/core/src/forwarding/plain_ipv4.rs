@@ -394,7 +394,8 @@ pub(super) fn send<S: PacketSlot, T: TraceSink>(
 
 /// What [`forward_batch_stateless`] must leave to the worker that owns the
 /// state: the NAT configurations it tells NAT's packets by, and whether a
-/// forward firewall or a bridge is on (then every packet is handed over).
+/// forward firewall is on or the bridges are not empty (then every packet is
+/// handed over).
 #[derive(Clone, Copy, Default)]
 pub struct Stateful<'c> {
     pub nat44_udp: Option<&'c Nat44UdpConfig>,
@@ -405,12 +406,13 @@ pub struct Stateful<'c> {
 }
 
 /// Forwards the packets of `batch` that need no state, and hands every other
-/// one to `hand` (its ingress and its frame, after the VLAN tag is taken off)
-/// for the worker that owns the state, which forwards it as received there
+/// one to `hand` (its ingress and its frame, both as received) for the worker
+/// that owns the state, which forwards it as if it had received it
 /// ([`crate::forward_batch_with_control`]). A packet is forwarded here only when
 /// it is a plain forward that NAT leaves alone, with no firewall and no bridge
 /// and not for the control side: the short way's own answer. It then ends, frame
-/// and trace, as the full way would end it.
+/// and trace, as the full way would end it. With VLAN sub-interfaces, a tagged
+/// frame is handed over as it is.
 pub fn forward_batch_stateless<B, T>(
     mut batch: B,
     snapshot: &ForwardingSnapshot<'_>,
@@ -432,17 +434,11 @@ where
     let (mut received, mut tx_requested, mut dropped, mut consumed) = (0, 0, 0, 0);
     while let Some(mut packet) = batch.next_packet() {
         received += 1;
-        if !everything && !all_vrfs.vlans.is_empty() {
-            if let Err(reason) = crate::vlan::receive(&mut packet, all_vrfs.vlans) {
-                let ingress = packet.ingress();
-                packet.recycle(reason);
-                dropped += 1;
-                trace.record(TraceEvent::Dropped { ingress, reason });
-                continue;
-            }
-        }
         let ingress = packet.ingress();
+        let tagged = !all_vrfs.vlans.is_empty()
+            && packet.bytes_mut().get(12..14) == Some(&crate::vlan::TPID[..]);
         let decided = if everything
+            || tagged
             || (!all_vrfs.punt.is_empty()
                 && crate::punt::select(packet.bytes_mut(), ingress, all_vrfs.punt).is_some())
         {

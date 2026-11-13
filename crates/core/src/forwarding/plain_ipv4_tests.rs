@@ -1103,3 +1103,44 @@ fn the_stateless_way_with_its_owner_ends_every_packet_as_the_full_way_does() {
     assert!(sent_here > 1_000, "{sent_here} sent by the stateless way");
     assert!(handed_over > 10_000, "{handed_over} handed over");
 }
+
+/// With VLAN sub-interfaces, a tagged frame is handed over as received: the
+/// owner takes the tag off once, as it would off a frame it received.
+#[test]
+fn the_stateless_way_hands_a_tagged_frame_over_as_received() {
+    let mut rng = Rng(0x0057_a7e1_0f1a_0001);
+    let tables = random_tables(&mut rng, 8);
+    let owner = owner(&tables);
+    let port = tables.interfaces[0].id;
+    let vlans = [crate::VlanBinding {
+        parent: port,
+        vid: 100,
+        sub: IfId(500),
+    }];
+    let snapshot = owner.snapshot().with_vlans(&vlans);
+    let mut frame = vec![0_u8; 64];
+    frame[12..14].copy_from_slice(&[0x81, 0x00]);
+    frame[14..16].copy_from_slice(&100_u16.to_be_bytes());
+    frame[16..18].copy_from_slice(&[0x08, 0x00]);
+    let mut items = vec![Item {
+        ingress: port,
+        frame: frame.clone(),
+        ended: None,
+    }];
+    let mut handed = Vec::new();
+    forward_batch_stateless(
+        Items {
+            items: &mut items,
+            next: 0,
+        },
+        &snapshot,
+        Stateful::default(),
+        |ingress, bytes| handed.push((ingress, bytes.to_vec())),
+        &mut NoTrace,
+    );
+    assert_eq!(handed, vec![(port, frame)]);
+    assert_eq!(
+        items[0].ended,
+        Some(SlotCompletion::Consume(ConsumeReason::HandedToOwner))
+    );
+}

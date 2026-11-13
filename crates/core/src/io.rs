@@ -565,6 +565,7 @@ mod tests {
                 "TUNNEL_FRAGMENT_TO_CONTROL",
                 "PUNT_TO_CONTROL",
                 "BRIDGE_FLOODED",
+                "HANDED_TO_OWNER",
             ]
         );
     }

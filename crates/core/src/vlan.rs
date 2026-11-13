@@ -18,7 +18,7 @@
 
 use crate::{DropReason, IfId, PacketLease, PacketSlot};
 
-const TPID: [u8; 2] = [0x81, 0x00];
+pub(crate) const TPID: [u8; 2] = [0x81, 0x00];
 const TAG: usize = 4;
 
 /// Port `parent` with VLAN ID `vid` is interface `sub`.
