@@ -9,7 +9,9 @@
 //!   takes the frames away from the kernel. Copy mode unless `--zero-copy`.
 //! - The table connections are served, and each version of the tables built, on a
 //!   thread of their own, so forwarding goes on while a large version is built.
-//!   With `--one-thread` the forwarding thread does that too, between batches.
+//!   What goes to the kernel, the TAP devices and the control processes is written
+//!   on another thread. With `--one-thread` the forwarding thread does both too,
+//!   between batches.
 //! - `af-packet` receives copies: the kernel still sees every frame, so the devices
 //!   must carry no kernel address or route, and the kernel must not forward on them.
 
@@ -23,7 +25,7 @@ use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
 
 use ruster_core::{GeneratedPacketIo, MonotonicMillis, PacketIo};
-use ruster_fe::{writers, Control, Fe};
+use ruster_fe::{writers, Control, Fe, HandoverTask};
 use ruster_io_xdp_native::XdpAttachMode;
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
@@ -151,6 +153,13 @@ where
             .name("control".into())
             .spawn(move || control_loop(control, &listeners))
             .map_err(|error| format!("starting the control thread: {error}"))?;
+        let handover = fe
+            .detach_handover()
+            .ok_or("the handover's sockets cannot be given a second handle")?;
+        std::thread::Builder::new()
+            .name("handover".into())
+            .spawn(move || handover_loop(handover))
+            .map_err(|error| format!("starting the handover thread: {error}"))?;
     }
     run_loop(&mut fe, &mut waiter, &listeners)
 }
@@ -173,6 +182,16 @@ fn control_loop(mut control: Control, listeners: &[(UnixListener, &[u64])]) {
             // The worker wakes it at once; the table connections are looked at
             // again when the wait is over.
             control.wait(daemon::IDLE_MAX);
+        }
+    }
+}
+
+/// Writes what the worker hands over (to the kernel, the TAP devices and the
+/// control processes), until the FE is gone.
+fn handover_loop(mut handover: HandoverTask) {
+    while !handover.fe_gone() {
+        if !handover.step(0).busy {
+            handover.wait(daemon::IDLE_MAX);
         }
     }
 }

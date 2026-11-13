@@ -42,6 +42,28 @@ pub(crate) struct Controls {
 }
 
 impl Controls {
+    /// A second handle on every socket, for sending from another thread.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        let list = self
+            .list
+            .iter()
+            .map(|control| {
+                Ok(Control {
+                    name: control.name.clone(),
+                    socket: control.socket.try_clone()?,
+                    peer: control.peer.clone(),
+                    pppoe: control.pppoe,
+                    ip: control.ip,
+                })
+            })
+            .collect::<io::Result<_>>()?;
+        Ok(Self {
+            dir: self.dir.clone(),
+            list,
+            wanted: self.wanted.clone(),
+        })
+    }
+
     /// Binds the sockets under `dir` from the next table change.
     pub(crate) fn set_dir(&mut self, dir: PathBuf) {
         self.dir = Some(dir);

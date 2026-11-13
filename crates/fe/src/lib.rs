@@ -70,6 +70,7 @@ mod punt_table;
 mod reassembly;
 mod tap;
 
+pub use handover::HandoverTask;
 pub use local::LocalPipe;
 pub use punt_table::PuntCounters;
 use ruster_proto::table::{Key, PuntDestination, PuntKind, PuntMatch, Value};
@@ -400,6 +401,14 @@ struct Worker<B> {
     /// of those written, to be used again.
     outbox: Vec<handover::Out>,
     spare: Vec<Vec<u8>>,
+    /// The names the writes are resolved by, of the current tables.
+    handover_names: handover::Names,
+    /// The number of the current tables, for counting writes that come back from
+    /// a handover on another thread after the tables changed.
+    version: u64,
+    /// The queues to and from the handover's writes on another thread
+    /// ([`Fe::detach_handover`]); `None` while they are written here.
+    writer: Option<(Sender<handover::ToWriter>, Receiver<handover::Written>)>,
     /// The classes of the punt table.
     classes: punt_table::Classes,
     /// Their rate limits and counters; to the kernel, per VRF in the order of
@@ -518,6 +527,9 @@ where
             handover: handover::Handover::default(),
             outbox: Vec::new(),
             spare: Vec::new(),
+            handover_names: handover::Names::default(),
+            version: 0,
+            writer: None,
             limits,
             classes: built.punt,
             active: built.active,
@@ -575,6 +587,26 @@ where
         Some(Control(control))
     }
 
+    /// Moves the handover's writes (to the kernel, the TAP devices and the control
+    /// processes) to the returned task, to be stepped on another thread. The
+    /// worker keeps reading. `None` once taken, or when a socket cannot be given
+    /// a second handle.
+    pub fn detach_handover(&mut self) -> Option<HandoverTask> {
+        if self.worker.writer.is_some() {
+            return None;
+        }
+        let endpoints = self.worker.handover.try_clone().ok()?;
+        let (to_writer, from_worker) = mpsc::channel();
+        let (to_worker, from_writer) = mpsc::channel();
+        self.worker.writer = Some((to_writer, from_writer));
+        Some(HandoverTask::new(
+            endpoints,
+            self.worker.handover_names.clone(),
+            from_worker,
+            to_worker,
+        ))
+    }
+
     /// Whether the [`Control`] taken out of this is gone: the tables will not change
     /// any more.
     pub fn control_gone(&self) -> bool {
@@ -586,6 +618,7 @@ where
     pub fn attach_punt(&mut self, socket: UnixDatagram) -> io::Result<()> {
         socket.set_nonblocking(true)?;
         self.worker.handover.attach_punt(socket, None);
+        self.worker.endpoints_changed();
         Ok(())
     }
 
@@ -595,6 +628,7 @@ where
     pub fn attach_punt_to(&mut self, socket: UnixDatagram, peer: PathBuf) -> io::Result<()> {
         socket.set_nonblocking(true)?;
         self.worker.handover.attach_punt(socket, Some(peer));
+        self.worker.endpoints_changed();
         Ok(())
     }
 
@@ -607,7 +641,9 @@ where
     /// Uses the connected `socket` for control process `name` of the punt classes,
     /// instead of one under the socket directory.
     pub fn attach_control(&mut self, name: &str, socket: UnixDatagram) -> io::Result<()> {
-        self.worker.handover.attach_control(name, socket)
+        self.worker.handover.attach_control(name, socket)?;
+        self.worker.endpoints_changed();
+        Ok(())
     }
 
     /// Uses `pipe` to hand the traffic addressed to the router in `vrf` to the kernel,
@@ -615,11 +651,13 @@ where
     /// Requests itself and drops the rest.
     pub fn attach_local(&mut self, vrf: &str, pipe: Box<dyn LocalPipe>) {
         self.worker.handover.attach_local(vrf, pipe);
+        self.worker.endpoints_changed();
     }
 
     /// Stops handing VRF `vrf`'s traffic to the kernel (its device went away).
     pub fn detach_local(&mut self, vrf: &str) {
         self.worker.handover.detach_local(vrf);
+        self.worker.endpoints_changed();
     }
 
     /// The interfaces whose IS-IS and OSPF go to their TAP device, by the punt
@@ -639,11 +677,13 @@ where
     /// `interface` ([`tap`]).
     pub fn attach_tap(&mut self, interface: &str, pipe: Box<dyn LocalPipe>) {
         self.worker.handover.attach_tap(interface, pipe);
+        self.worker.endpoints_changed();
     }
 
     /// Stops using the TAP device of `interface`.
     pub fn detach_tap(&mut self, interface: &str) {
         self.worker.handover.detach_tap(interface);
+        self.worker.endpoints_changed();
     }
 
     /// The ports that must take frames for every MAC address (promiscuous mode),
@@ -789,6 +829,7 @@ where
     /// then forwards a batch and sends the frames the control processes gave back.
     fn step(&mut self, now_ms: u64) -> bool {
         self.now_ms = now_ms;
+        self.count_returned();
         let mut last = None;
         loop {
             match self.versions.try_recv() {
@@ -845,24 +886,28 @@ where
         }
     }
 
-    /// Has the handover write what the step left, in order, and counts each.
+    /// Has the handover write what the step left, in order, and counts each; or
+    /// sends it to the handover's thread, which sends back what it wrote.
     fn write_handed(&mut self) {
+        if self.outbox.is_empty() {
+            return;
+        }
+        if let Some((to_writer, _)) = &self.writer {
+            let outs = std::mem::take(&mut self.outbox);
+            if let Err(error) = to_writer.send(handover::ToWriter::Write(self.version, outs)) {
+                // The handover's thread is gone: nothing is written.
+                self.writer = None;
+                if let handover::ToWriter::Write(_, outs) = error.0 {
+                    for out in outs {
+                        self.count_written(out.to, false);
+                    }
+                }
+            }
+            return;
+        }
         let mut outbox = std::mem::take(&mut self.outbox);
         for out in outbox.drain(..) {
-            let to = match out.to {
-                handover::Where::Neighbor(_) => Some(handover::To::Neighbor),
-                handover::Where::Control(class) => match &self.classes.get(class).destination {
-                    PuntDestination::Control(name) => Some(handover::To::Control(name)),
-                    _ => None,
-                },
-                handover::Where::Tap(id, _) => {
-                    name_at(&self.interface_names, usize::from(id.0)).map(handover::To::Tap)
-                }
-                handover::Where::Kernel(at, _) | handover::Where::Generated(at) => {
-                    name_at(&self.names, at).map(handover::To::Kernel)
-                }
-            };
-            let sent = to.is_some_and(|to| self.handover.write(to, &out.bytes));
+            let sent = self.handover.write_out(&self.handover_names, &out);
             self.count_written(out.to, sent);
             if self.spare.len() < HANDED_PER_STEP {
                 self.spare.push(out.bytes);
@@ -871,8 +916,53 @@ where
         self.outbox = outbox;
     }
 
+    /// Counts what the handover's thread wrote. Those left under other tables
+    /// are counted without their punt class, whose number may now be another's.
+    fn count_returned(&mut self) {
+        loop {
+            let Some((_, from_writer)) = &self.writer else {
+                return;
+            };
+            let Ok(written) = from_writer.try_recv() else {
+                return;
+            };
+            let current = written.version == self.version;
+            for (out, sent) in written.outs.into_iter().zip(written.sent) {
+                self.count_written_as(out.to, sent, current);
+                if self.spare.len() < HANDED_PER_STEP {
+                    self.spare.push(out.bytes);
+                }
+            }
+        }
+    }
+
+    /// Sends `message` to the handover's thread, if there is one.
+    fn tell_writer(&mut self, message: handover::ToWriter) {
+        if let Some((to_writer, _)) = &self.writer {
+            if to_writer.send(message).is_err() {
+                self.writer = None;
+            }
+        }
+    }
+
+    /// Gives the handover's thread the endpoints again, after one changed.
+    fn endpoints_changed(&mut self) {
+        if self.writer.is_none() {
+            return;
+        }
+        match self.handover.try_clone() {
+            Ok(endpoints) => self.tell_writer(handover::ToWriter::Endpoints(Box::new(endpoints))),
+            Err(error) => eprintln!("ruster-fe: the handover's endpoints: {error}"),
+        }
+    }
+
     /// Counts a write left to the handover, written or not.
     fn count_written(&mut self, to: handover::Where, sent: bool) {
+        self.count_written_as(to, sent, true);
+    }
+
+    /// The same, with its punt class only if `classed`.
+    fn count_written_as(&mut self, to: handover::Where, sent: bool, classed: bool) {
         let class = match to {
             handover::Where::Neighbor(class) => {
                 if sent {
@@ -906,7 +996,7 @@ where
                 None
             }
         };
-        if let Some(class) = class {
+        if let Some(class) = class.filter(|_| classed) {
             if sent {
                 self.limits.handed(class);
             } else {
@@ -983,6 +1073,19 @@ where
         self.classes = built.punt;
         self.names = built.names;
         self.interface_names = built.interface_names;
+        self.version += 1;
+        self.handover_names = handover::Names {
+            interfaces: self.interface_names.clone(),
+            vrfs: self.names.clone(),
+            controls: (0..self.classes.len())
+                .map(|class| match &self.classes.get(class).destination {
+                    PuntDestination::Control(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect(),
+        };
+        self.endpoints_changed();
+        self.tell_writer(handover::ToWriter::Names(self.handover_names.clone()));
         self.vlans = built.vlans;
         self.tunnels = built.tunnels;
         self.srv6 = built.srv6;

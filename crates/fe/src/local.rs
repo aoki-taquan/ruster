@@ -25,10 +25,13 @@ use std::os::unix::net::UnixDatagram;
 
 use ruster_proto::table::PuntKind;
 
-/// One VRF's connection to the kernel: one IP packet per message.
-pub trait LocalPipe {
+/// One VRF's connection to the kernel: one IP packet per message. It may be
+/// written from another thread than it is read from ([`LocalPipe::try_clone`]).
+pub trait LocalPipe: Send {
     fn send(&self, packet: &[u8]) -> io::Result<usize>;
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    /// A second handle on the same connection.
+    fn try_clone(&self) -> io::Result<Box<dyn LocalPipe>>;
 }
 
 impl LocalPipe for UnixDatagram {
@@ -39,6 +42,10 @@ impl LocalPipe for UnixDatagram {
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         UnixDatagram::recv(self, buf)
     }
+
+    fn try_clone(&self) -> io::Result<Box<dyn LocalPipe>> {
+        Ok(Box::new(UnixDatagram::try_clone(self)?))
+    }
 }
 
 impl LocalPipe for std::fs::File {
@@ -48,6 +55,10 @@ impl LocalPipe for std::fs::File {
 
     fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         io::Read::read(&mut &*self, buf)
+    }
+
+    fn try_clone(&self) -> io::Result<Box<dyn LocalPipe>> {
+        Ok(Box::new(std::fs::File::try_clone(self)?))
     }
 }
 

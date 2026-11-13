@@ -16,8 +16,11 @@ use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::time::Duration;
 
 use ruster_core::IfId;
+use ruster_proto::task::{Progress, Task};
 
 use crate::control::Controls;
 use crate::LocalPipe;
@@ -52,6 +55,139 @@ pub(crate) enum To<'a> {
     Control(&'a str),
     Tap(&'a str),
     Kernel(&'a str),
+}
+
+/// The names [`Where`] is resolved by: those of one version of the worker's
+/// tables.
+#[derive(Clone, Default)]
+pub(crate) struct Names {
+    /// Every interface's name by id (an empty name is an id no interface has).
+    pub(crate) interfaces: Vec<String>,
+    /// The VRFs' names, in the worker's order.
+    pub(crate) vrfs: Vec<String>,
+    /// For each punt class, the control process it goes to, if it is one.
+    pub(crate) controls: Vec<Option<String>>,
+}
+
+impl Names {
+    pub(crate) fn resolve(&self, to: Where) -> Option<To<'_>> {
+        fn named(name: &str) -> Option<&str> {
+            Some(name).filter(|name| !name.is_empty())
+        }
+        match to {
+            Where::Neighbor(_) => Some(To::Neighbor),
+            Where::Control(class) => self.controls.get(class)?.as_deref().map(To::Control),
+            Where::Tap(id, _) => named(self.interfaces.get(usize::from(id.0))?).map(To::Tap),
+            Where::Kernel(at, _) | Where::Generated(at) => {
+                named(self.vrfs.get(at)?).map(To::Kernel)
+            }
+        }
+    }
+}
+
+/// What the worker sends a handover on another thread, in order.
+pub(crate) enum ToWriter {
+    /// The names of the next writes.
+    Names(Names),
+    /// Every endpoint, again, after one was attached or taken away.
+    Endpoints(Box<Handover>),
+    /// Writes left in one step of the worker under the tables of this version.
+    Write(u64, Vec<Out>),
+}
+
+/// The writes of one [`ToWriter::Write`], back to the worker with whether each
+/// went (their buffers to be used again).
+pub(crate) struct Written {
+    pub(crate) version: u64,
+    pub(crate) outs: Vec<Out>,
+    pub(crate) sent: Vec<bool>,
+}
+
+/// The handover's writes on a thread of their own ([`crate::Fe::detach_handover`]):
+/// what goes to the kernel, the TAP devices and the control processes is written
+/// there, not on the worker's thread.
+pub struct HandoverTask {
+    handover: Handover,
+    names: Names,
+    from_worker: Receiver<ToWriter>,
+    to_worker: Sender<Written>,
+    worker_gone: bool,
+}
+
+// A thread can be given it.
+const _: fn() = || {
+    fn is_send<T: Send>() {}
+    is_send::<HandoverTask>();
+};
+
+impl HandoverTask {
+    pub(crate) fn new(
+        handover: Handover,
+        names: Names,
+        from_worker: Receiver<ToWriter>,
+        to_worker: Sender<Written>,
+    ) -> Self {
+        Self {
+            handover,
+            names,
+            from_worker,
+            to_worker,
+            worker_gone: false,
+        }
+    }
+
+    /// Whether the FE it writes for is gone.
+    pub fn fe_gone(&self) -> bool {
+        self.worker_gone
+    }
+
+    /// Waits at most `longest` for something to write, and writes it.
+    pub fn wait(&mut self, longest: Duration) {
+        match self.from_worker.recv_timeout(longest) {
+            Ok(message) => self.on(message),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => self.worker_gone = true,
+        }
+    }
+
+    fn on(&mut self, message: ToWriter) {
+        match message {
+            ToWriter::Names(names) => self.names = names,
+            ToWriter::Endpoints(handover) => self.handover = *handover,
+            ToWriter::Write(version, outs) => {
+                let sent = outs
+                    .iter()
+                    .map(|out| self.handover.write_out(&self.names, out))
+                    .collect();
+                let written = Written {
+                    version,
+                    outs,
+                    sent,
+                };
+                self.worker_gone |= self.to_worker.send(written).is_err();
+            }
+        }
+    }
+}
+
+impl Task for HandoverTask {
+    fn step(&mut self, _now_ms: u64) -> Progress {
+        let mut busy = false;
+        loop {
+            match self.from_worker.try_recv() {
+                Ok(message) => {
+                    busy = true;
+                    self.on(message);
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.worker_gone = true;
+                    break;
+                }
+            }
+        }
+        Progress::busy(busy)
+    }
 }
 
 #[derive(Default)]
@@ -185,6 +321,34 @@ impl Handover {
             Ok(n) if n > 0 => Some(n),
             _ => None,
         }
+    }
+
+    /// A second handle on every endpoint, for writing from another thread.
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        let pipes = |pipes: &BTreeMap<String, Box<dyn LocalPipe>>| {
+            pipes
+                .iter()
+                .map(|(name, pipe)| Ok((name.clone(), pipe.try_clone()?)))
+                .collect::<io::Result<BTreeMap<_, _>>>()
+        };
+        Ok(Self {
+            local: pipes(&self.local)?,
+            taps: pipes(&self.taps)?,
+            punt: self
+                .punt
+                .as_ref()
+                .map(UnixDatagram::try_clone)
+                .transpose()?,
+            punt_peer: self.punt_peer.clone(),
+            controls: self.controls.try_clone()?,
+        })
+    }
+
+    /// Writes `out` to where `names` say: whether it went.
+    pub(crate) fn write_out(&self, names: &Names, out: &Out) -> bool {
+        names
+            .resolve(out.to)
+            .is_some_and(|to| self.write(to, &out.bytes))
     }
 
     /// Writes `bytes` to `to`: whether it went.
