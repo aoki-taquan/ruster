@@ -39,8 +39,6 @@ pub(crate) struct Controls {
     list: Vec<Control>,
     /// The control processes of the current tables, and what each may send back.
     wanted: Vec<(String, bool, bool)>,
-    /// The message being sent, kept to be used again.
-    message: Vec<u8>,
 }
 
 impl Controls {
@@ -99,25 +97,14 @@ impl Controls {
         self.wanted = wanted;
     }
 
-    /// Sends `frame` from `interface` to control process `name`; whether it went.
-    pub(crate) fn send(&mut self, name: &str, why: u16, interface: &str, frame: &[u8]) -> bool {
+    /// Sends the encoded punt `message` to control process `name`; whether it went.
+    pub(crate) fn send(&self, name: &str, message: &[u8]) -> bool {
         let Some(control) = self.list.iter().find(|c| c.name == name) else {
             return false;
         };
-        self.message.clear();
-        let encoded = Punt {
-            direction: Direction::ToControl,
-            reason: why,
-            interface,
-            frame,
-        }
-        .encode(&mut self.message);
-        if encoded.is_err() {
-            return false;
-        }
         let sent = match &control.peer {
-            Some(peer) => control.socket.send_to(&self.message, peer),
-            None => control.socket.send(&self.message),
+            Some(peer) => control.socket.send_to(message, peer),
+            None => control.socket.send(message),
         };
         sent.is_ok()
     }

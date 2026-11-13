@@ -4,7 +4,9 @@
 //! neighbor process, and the sockets of the other control processes.
 //!
 //! It only writes and reads them. What goes where, the rate limits and the counts
-//! are the worker's.
+//! are the worker's. The worker leaves what is to be written ([`Out`]) and the
+//! handover writes it ([`Handover::write`]), each write's result going back to be
+//! counted ([`Count`]).
 //!
 //! # Standards
 //!
@@ -15,8 +17,42 @@ use std::io::{self, ErrorKind};
 use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 
+use ruster_core::IfId;
+
 use crate::control::Controls;
 use crate::LocalPipe;
+
+/// Where a write the worker left goes, by the worker's tables of the step it was
+/// left in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Where {
+    /// The neighbor process, an encoded punt message; counted with the ARP
+    /// counters and, if any, those of the punt class.
+    Neighbor(Option<usize>),
+    /// The control process of the punt class, an encoded punt message.
+    Control(usize),
+    /// The TAP device of the interface, a frame of the punt class.
+    Tap(IfId, usize),
+    /// The pipe to the kernel of the VRF at this index, an IP packet of the punt
+    /// class.
+    Kernel(usize, usize),
+    /// The same, a packet the FE sends out of the VRF's kernel interface.
+    Generated(usize),
+}
+
+/// One write the worker left to the handover.
+pub(crate) struct Out {
+    pub(crate) to: Where,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// Where a write goes, by name.
+pub(crate) enum To<'a> {
+    Neighbor,
+    Control(&'a str),
+    Tap(&'a str),
+    Kernel(&'a str),
+}
 
 #[derive(Default)]
 pub(crate) struct Handover {
@@ -149,6 +185,17 @@ impl Handover {
             Ok(n) if n > 0 => Some(n),
             _ => None,
         }
+    }
+
+    /// Writes `bytes` to `to`: whether it went.
+    pub(crate) fn write(&self, to: To<'_>, bytes: &[u8]) -> bool {
+        let sent = match to {
+            To::Neighbor => self.send_punt(bytes),
+            To::Control(name) => Some(self.controls.send(name, bytes)),
+            To::Tap(interface) => self.send_tap(interface, bytes),
+            To::Kernel(vrf) => self.send_kernel(vrf, bytes),
+        };
+        sent == Some(true)
     }
 
     /// Binds the sockets to the control processes under `dir`.
