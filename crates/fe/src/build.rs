@@ -242,9 +242,12 @@ impl Routes {
                 | Key::SourceDns { .. }
                 | Key::BridgePort { .. }
                 | Key::BridgeMac { .. } => continue,
-                // Each of these makes or changes an interface. (A kind added
-                // later lands here too, until it is known to change no route.)
-                _ => return false,
+                // Each of these makes or changes an interface. (No wildcard: a
+                // kind added later must be put on one side or the other.)
+                Key::Interface { .. }
+                | Key::EtherIp { .. }
+                | Key::Vxlan { .. }
+                | Key::Bridge { .. } => return false,
             };
             let after = store.get(key);
             let plain = match after {
@@ -1617,6 +1620,46 @@ mod tests {
             _ => RouteAction::Discard,
         };
         Change::set(key, Value::Route(action))
+    }
+
+    /// Which kinds of entry a change may touch for the kept routes to follow it.
+    #[test]
+    fn the_kept_routes_follow_every_table_but_those_that_make_interfaces() {
+        let routes = Routes {
+            counts: BTreeMap::from([(DEFAULT_VRF.to_owned(), 1)]),
+            entries: Entries::new(),
+            srv6: false,
+            lookups: 0,
+            tables: BTreeMap::new(),
+        };
+        let store = Store::default();
+        let v4: IpAddr = "192.0.2.1".parse().unwrap();
+        let name = || String::from("p0");
+        let follows = |key: Key| routes.follows(&[(&key, None)], &store);
+        for key in [
+            Key::Address {
+                interface: name(),
+                address: v4,
+            },
+            Key::Neighbor {
+                interface: name(),
+                address: v4,
+            },
+            Key::Nat { vrf: name() },
+            Key::FirewallPolicy { vrf: name() },
+            Key::IcmpErrors { vrf: name() },
+            Key::BridgePort { interface: name() },
+        ] {
+            assert!(follows(key.clone()), "{key:?}");
+        }
+        for key in [
+            Key::Interface { name: name() },
+            Key::EtherIp { interface: name() },
+            Key::Vxlan { interface: name() },
+            Key::Bridge { name: name() },
+        ] {
+            assert!(!follows(key.clone()), "{key:?}");
+        }
     }
 
     #[test]
