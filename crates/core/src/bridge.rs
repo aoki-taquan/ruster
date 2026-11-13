@@ -277,9 +277,16 @@ impl MacTable {
         keep: impl Fn(u16, IfId) -> bool,
         statics: &[(u16, [u8; 6], IfId)],
     ) -> usize {
-        let old: Vec<Slot> = self.slots.iter().filter(|s| s.used).copied().collect();
+        // An empty table is all `EMPTY` already (`remove` leaves `EMPTY` behind):
+        // with nothing learned, nothing is gone through slot by slot.
+        let old: Vec<Slot> = if self.len == 0 {
+            Vec::new()
+        } else {
+            let old = self.slots.iter().filter(|s| s.used).copied().collect();
+            self.slots.fill(EMPTY);
+            old
+        };
         let old_bridges = std::mem::take(&mut self.bridges);
-        self.slots.fill(EMPTY);
         self.len = 0;
         self.sweep = 0;
         self.bridges = bridges
