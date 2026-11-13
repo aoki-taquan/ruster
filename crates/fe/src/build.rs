@@ -120,6 +120,7 @@ enum Entry {
 }
 
 impl Entry {
+    #[cfg(test)]
     fn prefix(&self) -> (IpAddr, u8) {
         match self {
             Self::Forward(f) => (f.prefix, f.len),
