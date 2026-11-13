@@ -62,6 +62,7 @@ mod build;
 mod control;
 mod firewall;
 mod fragments;
+mod handover;
 mod kernel;
 mod local;
 mod nat;
@@ -389,10 +390,9 @@ struct Worker<B> {
     /// The same as a bitmap by id ([`ruster_core::kernel_ingress_bits`]), which
     /// each packet is looked up in.
     kernel_bits: Vec<u64>,
-    /// Each VRF's pipe to the kernel, for traffic addressed to the router.
-    local: BTreeMap<String, Box<dyn LocalPipe>>,
-    /// The TAP device of each interface that runs IS-IS or OSPF, by interface name.
-    taps: BTreeMap<String, Box<dyn LocalPipe>>,
+    /// The pipes to the kernel, the TAP devices and the sockets to the control
+    /// processes, for traffic addressed to the router.
+    handover: handover::Handover,
     /// The classes of the punt table.
     classes: punt_table::Classes,
     /// Their rate limits and counters; to the kernel, per VRF in the order of
@@ -415,11 +415,6 @@ struct Worker<B> {
     /// The number of the last [`FromWorker::Sync`] sent, and of the last answered.
     sync: u64,
     synced: u64,
-    punt: Option<UnixDatagram>,
-    /// Where ARP goes when the punt socket is not connected to one peer.
-    punt_peer: Option<PathBuf>,
-    /// The sockets to the other control processes the punt classes name.
-    controls: control::Controls,
     /// What core picks out for them before forwarding.
     punt_frames: Vec<ruster_core::PuntFrameMatch>,
     last_resolve: BTreeMap<(IfId, IpAddr), u64>,
@@ -513,8 +508,7 @@ where
             pppoe: built.pppoe,
             kernel_bits: ruster_core::kernel_ingress_bits(&built.kernel),
             kernel: built.kernel,
-            local: BTreeMap::new(),
-            taps: BTreeMap::new(),
+            handover: handover::Handover::default(),
             limits,
             classes: built.punt,
             active: built.active,
@@ -525,9 +519,6 @@ where
             held: None,
             sync: 0,
             synced: 0,
-            punt: None,
-            punt_peer: None,
-            controls: control::Controls::default(),
             punt_frames: Vec::new(),
             last_resolve: BTreeMap::new(),
             control: ControlQueue::new(EVENTS_PER_BATCH).with_icmpv6_errors(EVENTS_PER_BATCH),
@@ -585,8 +576,7 @@ where
     /// It replaces an earlier one, for when the neighbor process restarts.
     pub fn attach_punt(&mut self, socket: UnixDatagram) -> io::Result<()> {
         socket.set_nonblocking(true)?;
-        self.worker.punt = Some(socket);
-        self.worker.punt_peer = None;
+        self.worker.handover.attach_punt(socket, None);
         Ok(())
     }
 
@@ -595,33 +585,32 @@ where
     /// whoever sends them. A neighbor process that restarts binds the same path again.
     pub fn attach_punt_to(&mut self, socket: UnixDatagram, peer: PathBuf) -> io::Result<()> {
         socket.set_nonblocking(true)?;
-        self.worker.punt = Some(socket);
-        self.worker.punt_peer = Some(peer);
+        self.worker.handover.attach_punt(socket, Some(peer));
         Ok(())
     }
 
     /// Binds the sockets to the control processes the punt classes name under
     /// `dir`, the socket directory (`fe/punt/<name>.sock`), from the next table change.
     pub fn set_punt_dir(&mut self, dir: PathBuf) {
-        self.worker.controls.set_dir(dir);
+        self.worker.handover.set_control_dir(dir);
     }
 
     /// Uses the connected `socket` for control process `name` of the punt classes,
     /// instead of one under the socket directory.
     pub fn attach_control(&mut self, name: &str, socket: UnixDatagram) -> io::Result<()> {
-        self.worker.controls.attach(name, socket)
+        self.worker.handover.attach_control(name, socket)
     }
 
     /// Uses `pipe` to hand the traffic addressed to the router in `vrf` to the kernel,
     /// and to send the kernel's packets out. Without a pipe, core answers Echo
     /// Requests itself and drops the rest.
     pub fn attach_local(&mut self, vrf: &str, pipe: Box<dyn LocalPipe>) {
-        self.worker.local.insert(vrf.to_owned(), pipe);
+        self.worker.handover.attach_local(vrf, pipe);
     }
 
     /// Stops handing VRF `vrf`'s traffic to the kernel (its device went away).
     pub fn detach_local(&mut self, vrf: &str) {
-        self.worker.local.remove(vrf);
+        self.worker.handover.detach_local(vrf);
     }
 
     /// The interfaces whose IS-IS and OSPF go to their TAP device, by the punt
@@ -640,12 +629,12 @@ where
     /// Uses `pipe`, one Ethernet frame per message, as the TAP device of
     /// `interface` ([`tap`]).
     pub fn attach_tap(&mut self, interface: &str, pipe: Box<dyn LocalPipe>) {
-        self.worker.taps.insert(interface.to_owned(), pipe);
+        self.worker.handover.attach_tap(interface, pipe);
     }
 
     /// Stops using the TAP device of `interface`.
     pub fn detach_tap(&mut self, interface: &str) {
-        self.worker.taps.remove(interface);
+        self.worker.handover.detach_tap(interface);
     }
 
     /// The ports that must take frames for every MAC address (promiscuous mode),
@@ -883,7 +872,7 @@ where
         }
         self.limits.update(&built.punt, built.names.len());
         self.punt_frames = built.punt.frame_matches();
-        self.controls.follow(built.punt.controls());
+        self.handover.controls.follow(built.punt.controls());
         self.classes = built.punt;
         self.names = built.names;
         self.interface_names = built.interface_names;
@@ -956,7 +945,7 @@ where
                     .snapshot()
                     .with_arp_to_control(true)
                     .with_ipv6(&vrf.ipv6)
-                    .with_local_to_control(self.local.contains_key(name))
+                    .with_local_to_control(self.handover.has_local(name))
                     .with_kernel_ingress(&self.kernel)
                     .with_kernel_ingress_bits(&self.kernel_bits)
                     .with_vlans(&self.vlans)
@@ -1240,13 +1229,13 @@ where
         else {
             return;
         };
-        let Some(socket) = &self.punt else {
+        if !self.handover.has_punt() {
             self.counters.arp_to_control_dropped += 1;
             if let Some(class) = class {
                 self.limits.dropped(class);
             }
             return;
-        };
+        }
         let mut message = Vec::with_capacity(frame.len() + 64);
         Punt {
             direction: Direction::ToControl,
@@ -1256,18 +1245,17 @@ where
         }
         .encode(&mut message)
         .expect("port names are short and non-empty");
-        let sent = match &self.punt_peer {
-            Some(peer) => socket.send_to(&message, peer),
-            None => socket.send(&message),
-        };
-        match sent {
-            Ok(_) => self.counters.arp_to_control += 1,
-            Err(_) => self.counters.arp_to_control_dropped += 1,
+        let sent = self.handover.send_punt(&message) == Some(true);
+        if sent {
+            self.counters.arp_to_control += 1;
+        } else {
+            self.counters.arp_to_control_dropped += 1;
         }
         if let Some(class) = class {
-            match sent {
-                Ok(_) => self.limits.handed(class),
-                Err(_) => self.limits.dropped(class),
+            if sent {
+                self.limits.handed(class);
+            } else {
+                self.limits.dropped(class);
             }
         }
     }
@@ -1290,7 +1278,7 @@ where
             .filter(|name| !name.is_empty());
         let sent = match interface {
             Some(interface) if self.limits.admit(class, None, now_ms) => {
-                self.controls.send(name, why, interface, frame)
+                self.handover.controls.send(name, why, interface, frame)
             }
             Some(_) => return,
             None => false,
@@ -1308,8 +1296,7 @@ where
         let tap = self
             .interface_names
             .get(usize::from(ingress.0))
-            .filter(|name| !name.is_empty())
-            .and_then(|name| self.taps.get(name));
+            .filter(|name| !name.is_empty() && self.handover.has_tap(name));
         let Some(tap) = tap else {
             self.limits.dropped(class);
             self.counters.to_tap_dropped += 1;
@@ -1319,7 +1306,7 @@ where
             self.counters.to_tap_dropped += 1;
             return;
         }
-        if tap.send(frame).is_ok() {
+        if self.handover.send_tap(tap, frame) == Some(true) {
             self.limits.handed(class);
             self.counters.to_tap += 1;
         } else {
@@ -1333,19 +1320,18 @@ where
     /// for the batch, as packets from their VRF's kernel interface.
     fn read_taps(&mut self, now_ms: u64) -> Vec<kernel::Frame> {
         let mut routed = Vec::new();
-        if self.taps.is_empty() {
+        let names = self.handover.tap_names();
+        if names.is_empty() {
             return routed;
         }
         // One byte more than taken, to see a frame that was cut short.
         let mut buf = [0_u8; PUNT_MAX + 1];
-        let names: Vec<String> = self.taps.keys().cloned().collect();
         for name in names {
             let id =
                 interface_id(&self.interface_names, &name).filter(|id| self.active.contains(id));
             for _ in 0..INJECT_PER_STEP {
-                let n = match self.taps.get(&name).map(|tap| tap.recv(&mut buf)) {
-                    Some(Ok(n)) if n > 0 => n,
-                    _ => break,
+                let Some(n) = self.handover.recv_tap(&name, &mut buf) else {
+                    break;
                 };
                 if n > PUNT_MAX {
                     self.counters.from_tap_dropped += 1;
@@ -1458,31 +1444,19 @@ where
     fn read_injected(&mut self) -> (Vec<Vec<u8>>, usize, bool) {
         let mut refused = 0;
         let mut frames = self
+            .handover
             .controls
             .receive(INJECT_PER_STEP, PUNT_MAX, &mut refused);
         self.counters.inject_dropped += refused;
         // The neighbor process's come after the others'.
         let others = frames.len();
-        let Some(socket) = &self.punt else {
-            return (frames, others, refused > 0);
-        };
         // One byte more than accepted, to see a datagram that was cut short.
         let mut buf = [0_u8; PUNT_MAX + 1];
         for _ in 0..INJECT_PER_STEP {
-            match socket.recv_from(&mut buf) {
-                // With a fixed peer path, only frames from that path are taken.
-                Ok((_, from))
-                    if self
-                        .punt_peer
-                        .as_deref()
-                        .is_some_and(|peer| from.as_pathname() != Some(peer)) =>
-                {
-                    self.counters.inject_dropped += 1;
-                }
-                Ok((n, _)) if n <= PUNT_MAX => frames.push(buf[..n].to_vec()),
-                Ok(_) => self.counters.inject_dropped += 1,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                Err(_) => break,
+            match self.handover.recv_punt(&mut buf) {
+                Some(handover::FromPunt::Taken(n)) => frames.push(buf[..n].to_vec()),
+                Some(handover::FromPunt::Refused) => self.counters.inject_dropped += 1,
+                None => break,
             }
         }
         (frames, others, refused > 0)
@@ -1555,9 +1529,11 @@ where
             .map(|&at| usize::from(at));
         let admitted = self.admit_to_kernel(class, at, now_ms);
         let vrf = at.and_then(|at| self.names.get(at));
-        let pipe = vrf.and_then(|name| self.local.get(name));
-        match pipe {
-            Some(pipe) if admitted && pipe.send(packet).is_ok() => {
+        let sent = vrf
+            .filter(|_| admitted)
+            .and_then(|name| self.handover.send_kernel(name, packet));
+        match sent {
+            Some(true) => {
                 self.counters.to_kernel += 1;
                 self.limits.handed(class);
             }
@@ -1573,18 +1549,18 @@ where
     /// interface.
     fn read_kernel(&self) -> Vec<kernel::Frame> {
         let mut frames = Vec::new();
-        if self.local.is_empty() {
+        if !self.handover.any_local() {
             return frames;
         }
         let mut buf = [0_u8; PUNT_MAX];
         for (at, name) in self.names.iter().enumerate() {
-            let (Some(pipe), Some(&ingress)) = (self.local.get(name), self.kernel.get(at)) else {
+            let Some(&ingress) = self.kernel.get(at) else {
                 continue;
             };
             for _ in 0..INJECT_PER_STEP {
-                match pipe.recv(&mut buf) {
-                    Ok(n) if n > 0 => frames.push(kernel::Frame::new(ingress, at, &buf[..n])),
-                    _ => break,
+                match self.handover.recv_kernel(name, &mut buf) {
+                    Some(n) => frames.push(kernel::Frame::new(ingress, at, &buf[..n])),
+                    None => break,
                 }
             }
         }
@@ -1594,14 +1570,13 @@ where
     /// Writes `frame` (Ethernet) for kernel interface `egress` to its VRF's pipe,
     /// without the Ethernet header.
     fn write_kernel(&mut self, egress: IfId, frame: &[u8]) -> bool {
-        let pipe = self
+        let vrf = self
             .kernel
             .iter()
             .position(|&id| id == egress)
-            .and_then(|at| self.names.get(at))
-            .and_then(|name| self.local.get(name));
-        match (pipe, frame.get(ETHERNET_HEADER..)) {
-            (Some(pipe), Some(packet)) => pipe.send(packet).is_ok(),
+            .and_then(|at| self.names.get(at));
+        match (vrf, frame.get(ETHERNET_HEADER..)) {
+            (Some(vrf), Some(packet)) => self.handover.send_kernel(vrf, packet) == Some(true),
             _ => false,
         }
     }
