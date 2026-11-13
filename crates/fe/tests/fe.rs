@@ -4909,4 +4909,12 @@ fn step_timing_without_packets_and_with_batches() {
     // As it runs by default: the control task is another thread's.
     let _control = bench.fe.detach_control().expect("the control task");
     report(&mut bench, "the worker alone");
+    // As the daemon has it: the neighbor process's socket and the default VRF's
+    // kernel device are there to be read, with nothing in them.
+    let (punt, _neighd) = UnixDatagram::pair().unwrap();
+    bench.fe.attach_punt(punt).unwrap();
+    let (pipe, _kernel) = UnixDatagram::pair().unwrap();
+    pipe.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(pipe));
+    report(&mut bench, "the worker with its sockets");
 }

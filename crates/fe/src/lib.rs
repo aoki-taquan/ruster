@@ -426,6 +426,8 @@ struct Worker<B> {
     reassembled: Vec<kernel::Frame>,
     /// The neighbors packets went to since the neighbor process last read them.
     used: std::collections::HashSet<(u16, IpAddr)>,
+    /// What the last batch's packets left to act on; see [`FeTrace`].
+    trace: FeTrace,
     fragment_tracking: ruster_core::Ipv4FragmentTracker<'static>,
     /// The bridges, their MAC address tables and the frames they flood.
     bridges: ruster_core::Bridges,
@@ -518,6 +520,7 @@ where
             reassembly: reassembly::Reassembly::default(),
             reassembled: Vec::new(),
             used: std::collections::HashSet::new(),
+            trace: FeTrace::default(),
             fragment_tracking: fragments::tracker(),
             bridges: ruster_core::Bridges::new(BRIDGE_MACS, FLOOD_SLOTS, hash_key()),
             bridge_names: Vec::new(),
@@ -885,7 +888,15 @@ where
 
     /// Forwards one batch by the tables the worker has. Whether it did anything.
     fn worker(&mut self, now_ms: u64) -> bool {
-        let mut trace = FeTrace::default();
+        // The lists a batch fills are kept from step to step, emptied.
+        let mut trace = std::mem::take(&mut self.trace);
+        let worked = self.forward(now_ms, &mut trace);
+        trace.clear();
+        self.trace = trace;
+        worked
+    }
+
+    fn forward(&mut self, now_ms: u64, trace: &mut FeTrace) -> bool {
         // The kernel's packets join the ports' in one batch, after them.
         let mut kernel_frames = self.read_kernel();
         kernel_frames.append(&mut self.read_taps(now_ms));
@@ -955,7 +966,7 @@ where
             services.bridges = Some(&mut self.bridges);
         }
         let report =
-            forward_batch_with_control(batch, &snapshot, &mut self.control, services, &mut trace);
+            forward_batch_with_control(batch, &snapshot, &mut self.control, services, &mut *trace);
         // Unsolicited inbound SYNs whose wait is over get their Port Unreachable,
         // also in a batch with no packets: the wait ends by the clock.
         let answered = self.nat.as_mut().map_or(0, |nat| {
@@ -966,7 +977,7 @@ where
                     .as_mut()
                     .map(|(config, runtime)| (&*config, &mut **runtime)),
                 now,
-                &mut trace,
+                &mut *trace,
             )
         });
         self.bridges.table.age(now_ms, AGING_PER_STEP);
@@ -1110,7 +1121,7 @@ where
             }
         }
         if self.used.len() < USED_MAX {
-            self.used.extend(trace.used.drain());
+            self.used.extend(trace.used.drain(..));
         }
         for &(egress, target) in &trace.misses {
             self.resolve_request(egress, target, now_ms);
@@ -1401,13 +1412,12 @@ where
         self.counters.inject_dropped += refused;
         // The neighbor process's come after the others'.
         let others = frames.len();
+        let Some(socket) = &self.punt else {
+            return (frames, others, refused > 0);
+        };
         // One byte more than accepted, to see a datagram that was cut short.
         let mut buf = [0_u8; PUNT_MAX + 1];
-        let neighbor = self.punt.as_ref().map_or(0, |_| INJECT_PER_STEP);
-        for _ in 0..neighbor {
-            let Some(socket) = &self.punt else {
-                break;
-            };
+        for _ in 0..INJECT_PER_STEP {
             match socket.recv_from(&mut buf) {
                 // With a fixed peer path, only frames from that path are taken.
                 Ok((_, from))
@@ -1948,8 +1958,10 @@ impl ArpEvent {
 struct FeTrace {
     arp: Vec<ArpEvent>,
     misses: Vec<(IfId, IpAddr)>,
-    /// Next hops packets went to in this batch (the neighbors' "used" marks).
-    used: std::collections::HashSet<(u16, IpAddr)>,
+    /// Next hops packets went to in this batch (the neighbors' "used" marks),
+    /// in the order of the packets; one that repeats the one before is left out,
+    /// so a run of packets to one next hop costs one entry.
+    used: Vec<(u16, IpAddr)>,
     overflow: u64,
     /// Frames bridged to an overlay dropped for their length, and for any other
     /// reason.
@@ -1983,11 +1995,10 @@ impl TraceSink for FeTrace {
                 egress,
                 neighbor_target,
             } => {
-                self.used
-                    .insert((egress.0, IpAddr::V4(neighbor_target.octets().into())));
+                self.mark_used((egress.0, IpAddr::V4(neighbor_target.octets().into())));
             }
             TraceEvent::Ipv6Routed { egress, next_hop } => {
-                self.used.insert((egress.0, IpAddr::V6(next_hop.into())));
+                self.mark_used((egress.0, IpAddr::V6(next_hop.into())));
             }
             TraceEvent::NeighborMissing { egress, target } => {
                 self.miss(egress, IpAddr::V4(target.octets().into()));
@@ -2002,6 +2013,22 @@ impl TraceSink for FeTrace {
 }
 
 impl FeTrace {
+    /// Empties it for the next batch, keeping the lists' memory.
+    fn clear(&mut self) {
+        self.arp.clear();
+        self.misses.clear();
+        self.used.clear();
+        self.overflow = 0;
+        self.overlay_too_big = 0;
+        self.overlay_dropped = 0;
+    }
+
+    fn mark_used(&mut self, next_hop: (u16, IpAddr)) {
+        if self.used.last() != Some(&next_hop) {
+            self.used.push(next_hop);
+        }
+    }
+
     /// Counts a frame bridged to an overlay that was dropped (any other drop is
     /// left alone).
     fn overlay_drop(&mut self, reason: ruster_core::DropReason) {
