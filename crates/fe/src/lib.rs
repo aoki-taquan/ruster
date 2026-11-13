@@ -118,6 +118,9 @@ const HANDED_IN_EVERY: u8 = 8;
 /// See [`HANDED_IN_EVERY`].
 const BUSY_STEPS: u8 = 2;
 /// One resolve request per next hop per this many milliseconds.
+/// The most writes one step leaves to the handover; more are dropped and counted.
+const HANDED_PER_STEP: usize = 1_024;
+
 const RESOLVE_INTERVAL_MS: u64 = 1_000;
 /// Next hops remembered for the rate limit. Older ones are forgotten first; when all
 /// are recent, further requests wait (and are counted).
@@ -393,6 +396,10 @@ struct Worker<B> {
     /// The pipes to the kernel, the TAP devices and the sockets to the control
     /// processes, for traffic addressed to the router.
     handover: handover::Handover,
+    /// What the step left to the handover to write, in order; and the buffers
+    /// of those written, to be used again.
+    outbox: Vec<handover::Out>,
+    spare: Vec<Vec<u8>>,
     /// The classes of the punt table.
     classes: punt_table::Classes,
     /// Their rate limits and counters; to the kernel, per VRF in the order of
@@ -509,6 +516,8 @@ where
             kernel_bits: ruster_core::kernel_ingress_bits(&built.kernel),
             kernel: built.kernel,
             handover: handover::Handover::default(),
+            outbox: Vec::new(),
+            spare: Vec::new(),
             limits,
             classes: built.punt,
             active: built.active,
@@ -805,7 +814,105 @@ where
         let worked = self.worker(now_ms, read_handed_in);
         // Frames held for the control task's answer go out whatever the ports do.
         let injected = (read_handed_in || self.held.is_some()) && self.inject();
+        self.write_handed();
         worked || injected
+    }
+
+    /// Leaves the bytes `fill` writes (if it says they are good) to the handover,
+    /// to be written to `to` at the end of the step. Counted as not written when
+    /// they are not good or the list is full.
+    fn hand(&mut self, to: handover::Where, fill: impl FnOnce(&mut Vec<u8>) -> bool) {
+        let mut bytes = self.buffer();
+        let good = fill(&mut bytes);
+        self.leave(to, bytes, good);
+    }
+
+    /// An empty buffer for [`Self::leave`].
+    fn buffer(&mut self) -> Vec<u8> {
+        let mut bytes = self.spare.pop().unwrap_or_default();
+        bytes.clear();
+        bytes
+    }
+
+    /// Leaves `bytes` to the handover if they are `good` and the list has room;
+    /// else counts them as not written.
+    fn leave(&mut self, to: handover::Where, bytes: Vec<u8>, good: bool) {
+        if good && self.outbox.len() < HANDED_PER_STEP {
+            self.outbox.push(handover::Out { to, bytes });
+        } else {
+            self.spare.push(bytes);
+            self.count_written(to, false);
+        }
+    }
+
+    /// Has the handover write what the step left, in order, and counts each.
+    fn write_handed(&mut self) {
+        let mut outbox = std::mem::take(&mut self.outbox);
+        for out in outbox.drain(..) {
+            let to = match out.to {
+                handover::Where::Neighbor(_) => Some(handover::To::Neighbor),
+                handover::Where::Control(class) => match &self.classes.get(class).destination {
+                    PuntDestination::Control(name) => Some(handover::To::Control(name)),
+                    _ => None,
+                },
+                handover::Where::Tap(id, _) => {
+                    name_at(&self.interface_names, usize::from(id.0)).map(handover::To::Tap)
+                }
+                handover::Where::Kernel(at, _) | handover::Where::Generated(at) => {
+                    name_at(&self.names, at).map(handover::To::Kernel)
+                }
+            };
+            let sent = to.is_some_and(|to| self.handover.write(to, &out.bytes));
+            self.count_written(out.to, sent);
+            if self.spare.len() < HANDED_PER_STEP {
+                self.spare.push(out.bytes);
+            }
+        }
+        self.outbox = outbox;
+    }
+
+    /// Counts a write left to the handover, written or not.
+    fn count_written(&mut self, to: handover::Where, sent: bool) {
+        let class = match to {
+            handover::Where::Neighbor(class) => {
+                if sent {
+                    self.counters.arp_to_control += 1;
+                } else {
+                    self.counters.arp_to_control_dropped += 1;
+                }
+                class
+            }
+            handover::Where::Control(class) => Some(class),
+            handover::Where::Tap(_, class) => {
+                if sent {
+                    self.counters.to_tap += 1;
+                } else {
+                    self.counters.to_tap_dropped += 1;
+                }
+                Some(class)
+            }
+            handover::Where::Kernel(_, class) => {
+                if sent {
+                    self.counters.to_kernel += 1;
+                } else {
+                    self.counters.to_kernel_dropped += 1;
+                }
+                Some(class)
+            }
+            handover::Where::Generated(_) => {
+                if !sent {
+                    self.counters.to_kernel_dropped += 1;
+                }
+                None
+            }
+        };
+        if let Some(class) = class {
+            if sent {
+                self.limits.handed(class);
+            } else {
+                self.limits.dropped(class);
+            }
+        }
     }
 
     /// Replaces the tables with `version`'s. State that names the old tables'
@@ -1222,13 +1329,9 @@ where
     /// with those of punt class `class`.
     fn punt_frame(&mut self, ingress: IfId, reason: u16, class: Option<usize>, frame: &[u8]) {
         // An id no interface has now (a hole the tables left) is not sent.
-        let Some(name) = self
-            .interface_names
-            .get(usize::from(ingress.0))
-            .filter(|name| !name.is_empty())
-        else {
+        if name_at(&self.interface_names, usize::from(ingress.0)).is_none_or(str::is_empty) {
             return;
-        };
+        }
         if !self.handover.has_punt() {
             self.counters.arp_to_control_dropped += 1;
             if let Some(class) = class {
@@ -1236,58 +1339,47 @@ where
             }
             return;
         }
-        let mut message = Vec::with_capacity(frame.len() + 64);
-        Punt {
+        let mut message = self.buffer();
+        let good = Punt {
             direction: Direction::ToControl,
             reason,
-            interface: name,
+            interface: &self.interface_names[usize::from(ingress.0)],
             frame,
         }
         .encode(&mut message)
-        .expect("port names are short and non-empty");
-        let sent = self.handover.send_punt(&message) == Some(true);
-        if sent {
-            self.counters.arp_to_control += 1;
-        } else {
-            self.counters.arp_to_control_dropped += 1;
-        }
-        if let Some(class) = class {
-            if sent {
-                self.limits.handed(class);
-            } else {
-                self.limits.dropped(class);
-            }
-        }
+        .is_ok();
+        self.leave(handover::Where::Neighbor(class), message, good);
     }
 
     /// Sends the whole `frame` of punt class `class` to its control process.
     fn hand_to_control(&mut self, class: usize, ingress: IfId, frame: &[u8], now_ms: u64) {
         let entry = self.classes.get(class);
-        let PuntDestination::Control(name) = &entry.destination else {
+        if !matches!(entry.destination, PuntDestination::Control(_)) {
             self.limits.dropped(class);
             return;
-        };
+        }
         let why = match entry.matches {
             PuntMatch::Kind(PuntKind::PppoeDiscovery) => punt::reason::PPPOE_DISCOVERY,
             PuntMatch::Kind(PuntKind::PppControl) => punt::reason::PPP_CONTROL,
             _ => punt::reason::IP,
         };
-        let interface = self
-            .interface_names
-            .get(usize::from(ingress.0))
-            .filter(|name| !name.is_empty());
-        let sent = match interface {
-            Some(interface) if self.limits.admit(class, None, now_ms) => {
-                self.handover.controls.send(name, why, interface, frame)
-            }
-            Some(_) => return,
-            None => false,
-        };
-        if sent {
-            self.limits.handed(class);
-        } else {
+        if name_at(&self.interface_names, usize::from(ingress.0)).is_none_or(str::is_empty) {
             self.limits.dropped(class);
+            return;
         }
+        if !self.limits.admit(class, None, now_ms) {
+            return;
+        }
+        let mut message = self.buffer();
+        let good = Punt {
+            direction: Direction::ToControl,
+            reason: why,
+            interface: &self.interface_names[usize::from(ingress.0)],
+            frame,
+        }
+        .encode(&mut message)
+        .is_ok();
+        self.leave(handover::Where::Control(class), message, good);
     }
 
     /// Writes the whole `frame` of punt class `class` to the TAP device of the
@@ -1297,22 +1389,19 @@ where
             .interface_names
             .get(usize::from(ingress.0))
             .filter(|name| !name.is_empty() && self.handover.has_tap(name));
-        let Some(tap) = tap else {
+        if tap.is_none() {
             self.limits.dropped(class);
             self.counters.to_tap_dropped += 1;
             return;
-        };
+        }
         if !self.limits.admit(class, None, now_ms) {
             self.counters.to_tap_dropped += 1;
             return;
         }
-        if self.handover.send_tap(tap, frame) == Some(true) {
-            self.limits.handed(class);
-            self.counters.to_tap += 1;
-        } else {
-            self.limits.dropped(class);
-            self.counters.to_tap_dropped += 1;
-        }
+        self.hand(handover::Where::Tap(ingress, class), |bytes| {
+            bytes.extend_from_slice(frame);
+            true
+        });
     }
 
     /// Takes what the kernel wrote to the TAP devices: frames for the link are
@@ -1528,19 +1617,11 @@ where
             .get(usize::from(ingress.0))
             .map(|&at| usize::from(at));
         let admitted = self.admit_to_kernel(class, at, now_ms);
-        let vrf = at.and_then(|at| self.names.get(at));
-        let sent = vrf
-            .filter(|_| admitted)
-            .and_then(|name| self.handover.send_kernel(name, packet));
-        match sent {
-            Some(true) => {
-                self.counters.to_kernel += 1;
-                self.limits.handed(class);
-            }
-            _ if admitted => {
-                self.counters.to_kernel_dropped += 1;
-                self.limits.dropped(class);
-            }
+        match at {
+            Some(at) if admitted => self.hand(handover::Where::Kernel(at, class), |bytes| {
+                bytes.extend_from_slice(packet);
+                true
+            }),
             _ => self.counters.to_kernel_dropped += 1,
         }
     }
@@ -1570,13 +1651,15 @@ where
     /// Writes `frame` (Ethernet) for kernel interface `egress` to its VRF's pipe,
     /// without the Ethernet header.
     fn write_kernel(&mut self, egress: IfId, frame: &[u8]) -> bool {
-        let vrf = self
-            .kernel
-            .iter()
-            .position(|&id| id == egress)
-            .and_then(|at| self.names.get(at));
-        match (vrf, frame.get(ETHERNET_HEADER..)) {
-            (Some(vrf), Some(packet)) => self.handover.send_kernel(vrf, packet) == Some(true),
+        let at = self.kernel.iter().position(|&id| id == egress);
+        match (at, frame.get(ETHERNET_HEADER..)) {
+            (Some(at), Some(packet)) => {
+                self.hand(handover::Where::Generated(at), |bytes| {
+                    bytes.extend_from_slice(packet);
+                    true
+                });
+                true
+            }
             _ => false,
         }
     }
@@ -1893,6 +1976,11 @@ struct Builder {
 }
 
 /// The id of the interface `name` (a port or a VLAN sub-interface) in `names`.
+/// The name at `at`, if there is one.
+fn name_at(names: &[String], at: usize) -> Option<&str> {
+    names.get(at).map(String::as_str)
+}
+
 fn interface_id(names: &[String], name: &str) -> Option<IfId> {
     let index = names.iter().position(|n| n == name)?;
     u16::try_from(index).ok().map(IfId)
