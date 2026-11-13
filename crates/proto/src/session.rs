@@ -202,14 +202,20 @@ impl Undo {
     /// Each entry that was touched, once, with the value it had before (`None`: it
     /// was not there), in the order of the keys.
     fn before(&self) -> Vec<(&Key, Option<&Value>)> {
-        let mut first: BTreeMap<&Key, Option<&Value>> = BTreeMap::new();
-        for (key, slot) in &self.0 {
-            // Of several changes of one entry, the first one's "before".
-            first
-                .entry(key)
-                .or_insert_with(|| slot.as_ref().map(|slot| &slot.value));
+        let mut before: Vec<(&Key, Option<&Value>)> = self
+            .0
+            .iter()
+            .map(|(key, slot)| (key, slot.as_ref().map(|slot| &slot.value)))
+            .collect();
+        // A writer's changes are often in key order already; checking costs one
+        // comparison each, sorting a large patch a lot more.
+        if !before.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            // Stable: of several changes of one entry, the first one's "before"
+            // stays in front and is the one kept.
+            before.sort_by(|a, b| a.0.cmp(b.0));
+            before.dedup_by(|later, first| later.0 == first.0);
         }
-        first.into_iter().collect()
+        before
     }
 }
 
