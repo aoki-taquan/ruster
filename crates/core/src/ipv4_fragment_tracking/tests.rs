@@ -2165,3 +2165,67 @@ fn record_merges_touching_ranges_and_over_approximates() {
     // The end still holds: data past it is a contradiction.
     assert_eq!(entry.record(72, 8, true), Err(()));
 }
+
+/// A flush of a table nothing touched since it was made or last flushed only
+/// changes the key; the table then behaves as one made with that key, and once
+/// touched, a flush discards everything again.
+#[test]
+fn a_flush_of_an_untouched_table_only_changes_the_key() {
+    let new_key = ResolutionHashKey::new(3, 5).unwrap();
+    let mut storage_a = Storage::new(4, 4, 1514);
+    let mut flushed =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage_a.borrow(), key()).unwrap();
+    // Used under the old key first, then emptied: what an untouched flush
+    // leaves alone is then what a full one left.
+    for id in 0..6 {
+        if let Ok(ticket) = flushed.admit_first(info(&fragment(id, MF, 64, 17, 8)), 0) {
+            flushed.commit_deny(ticket, 0);
+        }
+        let later = fragment(id + 10, 2, 64, 17, 8);
+        let _ = flushed.follow(info(&later), &later, later.len(), 0);
+    }
+    assert!(flushed.entries() > 0);
+    flushed.flush();
+    let counters = flushed.counters();
+    flushed.flush_with_key(new_key);
+    flushed.flush();
+    assert_eq!(flushed.counters(), counters, "nothing more is flushed");
+    assert!(flushed.check_invariants().is_ok());
+    let mut storage_b = Storage::new(4, 4, 1514);
+    let mut fresh =
+        Ipv4FragmentTracker::new(policy(1_000, 4, 4), storage_b.borrow(), new_key).unwrap();
+    // The same fragments into both: firsts admitted and denied, later ones held,
+    // over the per-host limits, at times past the timeout.
+    for round in 0..40_u16 {
+        let now = u64::from(round) * 300;
+        let id = round % 7;
+        for tracker in [&mut flushed, &mut fresh] {
+            if round % 3 == 0 {
+                if let Ok(ticket) = tracker.admit_first(info(&fragment(id, MF, 64, 17, 8)), now) {
+                    tracker.commit_deny(ticket, now);
+                }
+            } else {
+                let later = fragment(id, 2, 64, 17, 8);
+                let _ = tracker.follow(info(&later), &later, later.len(), now);
+            }
+        }
+        assert_eq!(flushed.occupancy(), fresh.occupancy(), "round {round}");
+        assert_eq!(flushed.entries(), fresh.entries(), "round {round}");
+        assert_eq!(flushed.held(), fresh.held(), "round {round}");
+    }
+    // Touched now: a flush discards and counts what is there.
+    let entries = flushed.entries();
+    let held = flushed.held();
+    assert!(entries > 0);
+    let before = flushed.counters();
+    flushed.flush_with_key(key());
+    assert_eq!((flushed.entries(), flushed.held()), (0, 0));
+    let after = flushed.counters();
+    assert_eq!(
+        (
+            after.entries_flushed - before.entries_flushed,
+            after.held_flushed - before.held_flushed
+        ),
+        (entries, held)
+    );
+}

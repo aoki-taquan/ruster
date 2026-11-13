@@ -278,6 +278,18 @@ impl<'a> FixedDirectory<'a> {
         self.nodes.fill(DirectoryNode::default());
     }
 
+    /// Sets the key of a directory with nothing in it (as [`Self::clear`] left
+    /// it): the same as [`Self::clear_with_key`], without going through it.
+    pub(crate) fn rekey_empty(&mut self, hash_key: DirectoryHashKey) {
+        debug_assert!(
+            self.buckets
+                .iter()
+                .all(|b| *b == DirectoryBucket::default()),
+            "only an empty directory is rekeyed without clearing"
+        );
+        self.hash_key = hash_key;
+    }
+
     pub(crate) fn clear_with_key(&mut self, hash_key: DirectoryHashKey) {
         self.clear();
         self.hash_key = hash_key;

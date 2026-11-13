@@ -1017,6 +1017,10 @@ pub struct Ipv4FragmentTracker<'a> {
     tombstone_next: usize,
     live_entries: usize,
     live_held: usize,
+    /// Whether anything may have been written since the last reset. Every
+    /// operation that can change the table sets it first; a flush of a table
+    /// that was not touched has nothing to discard, and only changes the key.
+    touched: bool,
     /// Largest `live_entries` and `live_held` since construction or the
     /// last flush (OBS-017).
     entries_high_water: HighWaterMark,
@@ -1121,6 +1125,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
             tombstone_next: 0,
             live_entries: 0,
             live_held: 0,
+            touched: true,
             entries_high_water: HighWaterMark::default(),
             held_high_water: HighWaterMark::default(),
             counters: Ipv4FragmentTrackingCounters::default(),
@@ -1181,6 +1186,10 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// held fragments counted as flushed). A publication apply calls it:
     /// the templates name the old publication's egress and neighbors.
     pub fn flush(&mut self) {
+        if !self.touched {
+            self.debug_assert_as_reset();
+            return;
+        }
         self.counters.entries_flushed += self.live_entries;
         self.counters.held_flushed += self.live_held;
         self.reset();
@@ -1188,12 +1197,40 @@ impl<'a> Ipv4FragmentTracker<'a> {
 
     /// [`Self::flush`] and rekey with the new publication's key.
     pub fn flush_with_key(&mut self, key: ResolutionHashKey) {
+        if !self.touched {
+            // Every slot and directory is as a reset left it: only the key
+            // changes, without going through the storage.
+            self.debug_assert_as_reset();
+            self.entry_directory.rekey_empty(key.directory_key());
+            self.host_directory.rekey_empty(key.directory_key());
+            self.tombstone_directory.rekey_empty(key.directory_key());
+            return;
+        }
         self.counters.entries_flushed += self.live_entries;
         self.counters.held_flushed += self.live_held;
         self.entry_directory.clear_with_key(key.directory_key());
         self.host_directory.clear_with_key(key.directory_key());
         self.tombstone_directory.clear_with_key(key.directory_key());
         self.reset();
+    }
+
+    /// That the table is as [`Self::reset`] left it, as `touched` being unset
+    /// promises. Cheap: what any write leaves behind shows in one of these.
+    fn debug_assert_as_reset(&self) {
+        debug_assert_eq!(
+            (
+                self.live_entries,
+                self.live_held,
+                self.ingress_len,
+                self.tombstone_next
+            ),
+            (0, 0, 0, 0),
+            "an untouched fragment table holds nothing"
+        );
+        debug_assert!(
+            self.age == NO_ENDS && self.evict == NO_ENDS && self.allow == NO_ENDS,
+            "an untouched fragment table lists nothing"
+        );
     }
 
     fn reset(&mut self) {
@@ -1230,14 +1267,16 @@ impl<'a> Ipv4FragmentTracker<'a> {
         self.live_held = 0;
         self.entries_high_water.reset(0);
         self.held_high_water.reset(0);
+        self.touched = false;
     }
 
     /// Frees every entry older than the timeout at `now_ms`, at most
     /// `budget` of them, and returns how many it freed. Expiry is otherwise
     /// lazy (each table operation expires up to two of the oldest entries);
-    /// `run_tick` calls this each tick with a small budget so the occupancy
-    /// and the expiry counters stay current without traffic.
+    /// a caller can call this with a small budget so that the occupancy and
+    /// the expiry counters stay current without traffic.
     pub fn sweep(&mut self, now_ms: u64, budget: usize) -> usize {
+        self.touched = true;
         let before = self.live_entries;
         self.expire(now_ms, budget);
         before - self.live_entries
@@ -1863,6 +1902,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         info: Ipv4FragmentInfo,
         now_ms: u64,
     ) -> Result<Ipv4FragmentFirstTicket, DropReason> {
+        self.touched = true;
         self.expire(now_ms, 2);
         match self.lookup(info.key, now_ms) {
             Some(index) => match self.entries[index].state {
@@ -1957,6 +1997,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         fragmentation: Option<&mut Ipv4FragmentationRuntime<'_>>,
         now_ms: u64,
     ) {
+        self.touched = true;
         self.counters.first_allowed += 1;
         let Some(index) = self.entry_for_ticket(ticket, EntryState::Allow, now_ms) else {
             return;
@@ -1971,6 +2012,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
 
     /// Records a refused first fragment and discards what was held for it.
     pub(crate) fn commit_deny(&mut self, ticket: Ipv4FragmentFirstTicket, now_ms: u64) {
+        self.touched = true;
         self.counters.first_denied += 1;
         let Some(index) = self.entry_for_ticket(ticket, EntryState::Deny, now_ms) else {
             return;
@@ -2022,6 +2064,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
         frame_len: usize,
         now_ms: u64,
     ) -> Result<Ipv4FragmentFollow, DropReason> {
+        self.touched = true;
         self.expire(now_ms, 2);
         let existing = self.lookup(info.key, now_ms);
         if let Some(index) = existing {
@@ -2136,6 +2179,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// A later fragment was forwarded with its entry's template; the entry
     /// is freed once its whole datagram was seen.
     pub(crate) fn followed(&mut self, entry: u32) {
+        self.touched = true;
         self.counters.followed += 1;
         let index = entry as usize;
         if self.entries.get(index).is_some() {
@@ -2152,6 +2196,7 @@ impl<'a> Ipv4FragmentTracker<'a> {
     /// `fragment_tracking.poisoned`). Any other entry is left alone:
     /// nothing is held or forwarded for a fragment that cannot leave.
     pub(crate) fn ttl_expired(&mut self, info: Ipv4FragmentInfo, now_ms: u64) {
+        self.touched = true;
         let Some(index) = self.lookup(info.key, now_ms) else {
             return;
         };
