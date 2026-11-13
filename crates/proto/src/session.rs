@@ -403,7 +403,8 @@ impl Server {
         let mut busy = false;
         let mut index = 0;
         while index < self.peers.len() {
-            busy |= self.peers[index].conn.pump().unwrap_or(false);
+            // What this peer did in this step: bytes moved, or a request handled.
+            let mut active = self.peers[index].conn.pump().unwrap_or(false);
             for _ in 0..REQUESTS_PER_STEP {
                 // Backpressure: a peer that does not read its replies gets no more
                 // handled until it does.
@@ -412,13 +413,19 @@ impl Server {
                 }
                 match self.peers[index].conn.next_message() {
                     Ok(Some(request)) => {
-                        busy = true;
+                        active = true;
                         self.handle(index, &request, hook);
                     }
                     Ok(None) | Err(ConnError::Frame(_) | ConnError::Io(_)) => break,
                 }
             }
-            busy |= self.peers[index].conn.pump().unwrap_or(false);
+            // Again, to send the answers and to read on while a long message
+            // comes in. A peer that did nothing and is owed nothing is left
+            // until the next step: a second read would find nothing.
+            if active || self.peers[index].conn.backlog() > 0 {
+                active |= self.peers[index].conn.pump().unwrap_or(false);
+            }
+            busy |= active;
             busy |= self.peers[index].conn.take_more();
             if self.peers[index].conn.is_closed() {
                 self.peers.swap_remove(index);

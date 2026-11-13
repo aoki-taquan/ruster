@@ -90,6 +90,9 @@ pub struct Connection {
     closed: bool,
     peer_limit: Option<usize>,
     more: bool,
+    /// Where each read lands before its bytes join `inbuf`: allocated once,
+    /// so a pump that finds nothing to read touches no memory.
+    chunk: Box<[u8]>,
 }
 
 impl fmt::Debug for Connection {
@@ -115,6 +118,7 @@ impl Connection {
             closed: false,
             peer_limit: None,
             more: false,
+            chunk: vec![0; READ_CHUNK].into_boxed_slice(),
         };
         let mut size = [0; 4];
         let size = coap::uint_option(u32::try_from(limit).unwrap_or(u32::MAX), &mut size);
@@ -201,30 +205,20 @@ impl Connection {
         if self.inbuf.len() >= self.limit {
             return Ok(moved);
         }
-        let start = self.inbuf.len();
-        self.inbuf.resize(start + READ_CHUNK, 0);
         let read = loop {
-            match self.stream.read(&mut self.inbuf[start..]) {
+            match self.stream.read(&mut self.chunk) {
                 Ok(n) => break n,
                 Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => break usize::MAX,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => return Ok(moved),
                 Err(error) if error.kind() == ErrorKind::ConnectionReset => break 0,
-                Err(error) => {
-                    self.inbuf.truncate(start);
-                    return Err(error.into());
-                }
+                Err(error) => return Err(error.into()),
             }
         };
-        match read {
-            usize::MAX => self.inbuf.truncate(start),
-            0 => {
-                self.inbuf.truncate(start);
-                self.closed = true;
-            }
-            n => {
-                self.inbuf.truncate(start + n);
-                moved = true;
-            }
+        if read == 0 {
+            self.closed = true;
+        } else {
+            self.inbuf.extend_from_slice(&self.chunk[..read]);
+            moved = true;
         }
         Ok(moved)
     }
