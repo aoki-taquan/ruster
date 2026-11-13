@@ -210,11 +210,16 @@ impl Tables {
 impl Routes {
     /// Whether these, made for the tables before a change, can be brought to
     /// `store` by making the change to them: `changed` (each entry touched and what
-    /// it held before) is routes and neighbors only, none of the routes an SRv6
-    /// one, and every VRF the routes are in has routes before and after (so the
-    /// VRFs stay the same). A neighbor changes no route: what a route comes to
-    /// depends on the interfaces alone ([`forwarding`]), and the neighbors are read
-    /// from the tables in every build.
+    /// it held before) has no entry that makes or changes an interface, none of
+    /// its routes is an SRv6 one, and every VRF the routes are in has routes
+    /// before and after (so the VRFs, and with them the interfaces' ids, stay the
+    /// same).
+    ///
+    /// What a route comes to depends on the interfaces alone ([`forwarding`]):
+    /// the interface table and the tunnel and bridge tables, which make
+    /// interfaces too. The other tables (addresses, neighbors, NAT, firewall,
+    /// what goes to the control processes, the bridges' members and static
+    /// addresses) change no route, and are read from the tables in every build.
     fn follows(&self, changed: Changed<'_>, store: &Store) -> bool {
         if self.srv6 {
             return false;
@@ -223,7 +228,22 @@ impl Routes {
         for (key, before) in changed {
             let vrf = match key {
                 Key::Route { vrf, .. } => vrf,
-                Key::Neighbor { .. } => continue,
+                Key::Address { .. }
+                | Key::Neighbor { .. }
+                | Key::Nat { .. }
+                | Key::FirewallPolicy { .. }
+                | Key::IcmpErrors { .. }
+                | Key::FirewallRule { .. }
+                | Key::Punt { .. }
+                | Key::SourcePppoe { .. }
+                | Key::SourceIpv4 { .. }
+                | Key::SourcePrefix { .. }
+                | Key::SourceIpv6 { .. }
+                | Key::SourceDns { .. }
+                | Key::BridgePort { .. }
+                | Key::BridgeMac { .. } => continue,
+                // Each of these makes or changes an interface. (A kind added
+                // later lands here too, until it is known to change no route.)
                 _ => return false,
             };
             let after = store.get(key);
@@ -1433,6 +1453,8 @@ mod tests {
         shared: usize,
         /// The builds that kept the routes for a change of neighbors alone.
         neighbors_only: usize,
+        /// The builds that kept the routes for a change of addresses alone.
+        addresses_only: usize,
     }
 
     impl Hook for BothWays {
@@ -1468,13 +1490,22 @@ mod tests {
                     for (made, all) in made.vrfs.iter().zip(&all.vrfs) {
                         assert_eq!(made.owner.routes(), all.owner.routes());
                         assert_eq!(made.owner.neighbors(), all.owner.neighbors());
+                        assert_eq!(made.owner.local_ipv4(), all.owner.local_ipv4());
+                        assert_eq!(made.owner.interfaces(), all.owner.interfaces());
                         assert_eq!(made.ipv6, all.ipv6);
                     }
                     let no_route = !changed
                         .iter()
                         .any(|(key, _)| matches!(key, Key::Route { .. }));
                     if follows && no_route {
-                        self.neighbors_only += 1;
+                        if changed
+                            .iter()
+                            .all(|(key, _)| matches!(key, Key::Address { .. }))
+                        {
+                            self.addresses_only += 1;
+                        } else {
+                            self.neighbors_only += 1;
+                        }
                     }
                     if follows && no_lookup_before && made_routes.lookups == 0 {
                         self.shared += 1;
@@ -1614,6 +1645,7 @@ mod tests {
         let mut config = connect(&mut server, &[sid::INTERFACE]);
         let mut routes = connect(&mut server, &[sid::ROUTE]);
         let mut neighbors = connect(&mut server, &[sid::NEIGHBOR]);
+        let mut addresses = connect(&mut server, &[sid::ADDRESS]);
         config
             .patch(&[
                 interface("p0", true, DEFAULT_VRF),
@@ -1680,6 +1712,26 @@ mod tests {
                         }
                     }
                 }
+                // An address comes or goes, on an interface that is there, is
+                // disabled, or is not there.
+                12..=15 => {
+                    let host = 1 + rng.below(3) as u8;
+                    let address: IpAddr = if rng.below(2) == 0 {
+                        std::net::Ipv4Addr::new(10, 0, host, 1).into()
+                    } else {
+                        std::net::Ipv6Addr::new(0xfd00, 0, 0, host.into(), 0, 0, 0, 1).into()
+                    };
+                    let key = Key::Address {
+                        interface: rng.pick(&["p0", "p1", "p2", "p3"]).into(),
+                        address,
+                    };
+                    let change = if rng.below(3) == 0 {
+                        Change::delete(key)
+                    } else {
+                        Change::set(key, Value::Address { prefix_len: 24 })
+                    };
+                    addresses.patch(&[change]).unwrap();
+                }
                 // Routes, a few at once, at times the same one twice.
                 _ => {
                     let changes: Vec<Change> = (0..1 + rng.below(4))
@@ -1692,6 +1744,7 @@ mod tests {
                 config.poll();
                 routes.poll();
                 neighbors.poll();
+                addresses.poll();
                 server.step(&mut hook);
             }
         }
@@ -1700,6 +1753,7 @@ mod tests {
         assert!(hook.read_all > 20, "{}", hook.read_all);
         assert!(hook.refused > 5, "{}", hook.refused);
         assert!(hook.neighbors_only > 20, "{}", hook.neighbors_only);
+        assert!(hook.addresses_only > 20, "{}", hook.addresses_only);
         hook
     }
 
@@ -1825,11 +1879,29 @@ mod tests {
                 send(&mut server, &mut neighbors, &mut hook, &[neighbor]);
             }
             let neighbor = started.elapsed() / 20;
-            let neighbor_build: Duration = hook.spent / 20;
+            let neighbor_build: Duration = std::mem::take(&mut hook.spent) / 20;
+            // Then an address comes and goes, 20 times, as from DHCP or PPPoE.
+            let mut addresses = connect(&mut server, &[sid::ADDRESS]);
+            let started = Instant::now();
+            for round in 0..20 {
+                let key = Key::Address {
+                    interface: "p1".into(),
+                    address: "198.51.100.2".parse().unwrap(),
+                };
+                let change = if round % 2 == 0 {
+                    Change::set(key, Value::Address { prefix_len: 24 })
+                } else {
+                    Change::delete(key)
+                };
+                send(&mut server, &mut addresses, &mut hook, &[change]);
+            }
+            let address = started.elapsed() / 20;
+            let address_build: Duration = hook.spent / 20;
             println!(
                 "{count} routes: the whole table in {load:?} (building {load_build:?}), \
                  one route in {one:?} (building {one_build:?}), \
-                 one neighbor in {neighbor:?} (building {neighbor_build:?})"
+                 one neighbor in {neighbor:?} (building {neighbor_build:?}), \
+                 one address in {address:?} (building {address_build:?})"
             );
         }
     }
