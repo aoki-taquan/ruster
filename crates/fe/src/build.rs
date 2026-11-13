@@ -120,6 +120,7 @@ enum Entry {
 }
 
 impl Entry {
+    #[cfg(test)]
     fn prefix(&self) -> (IpAddr, u8) {
         match self {
             Self::Forward(f) => (f.prefix, f.len),
@@ -344,66 +345,86 @@ fn within((inner, inner_len): (IpAddr, u8), (outer, outer_len): (IpAddr, u8)) ->
 /// Deviation: where the other VRF has no route, a lookup should drop the packet; here
 /// the packet falls to this VRF's shorter routes (not yet made a discard route).
 fn expand_lookups(vrfs: &Entries) -> BTreeMap<String, Vec<Forward>> {
-    let forwards = |vrf: &str| -> Vec<Forward> {
-        vrfs.get(vrf)
-            .map(|entries| {
-                entries
-                    .values()
-                    .filter_map(|e| match e {
-                        Entry::Forward(f) => Some(f.clone()),
-                        Entry::Lookup { .. } => None,
-                    })
-                    .collect()
+    let forwards = |entries: &BTreeMap<(IpAddr, u8), Entry>| -> Vec<Forward> {
+        entries
+            .values()
+            .filter_map(|e| match e {
+                Entry::Forward(f) => Some(f.clone()),
+                Entry::Lookup { .. } => None,
             })
-            .unwrap_or_default()
+            .collect()
     };
+    let no_entries = BTreeMap::new();
     let mut out = BTreeMap::new();
     for (name, entries) in vrfs {
-        let mut own = forwards(name);
-        let mut added = Vec::new();
+        let mut own = forwards(entries);
+        // The prefixes in `own`, to leave out an expanded route that one of them
+        // (or an earlier expanded one) already has.
+        let mut taken: BTreeSet<(IpAddr, u8)> = own.iter().map(|r| (r.prefix, r.len)).collect();
         for entry in entries.values() {
             let Entry::Lookup { prefix, len, vrf } = entry else {
                 continue;
             };
             let lookup = (*prefix, *len);
-            let other = forwards(vrf);
-            for route in &other {
-                let at = (route.prefix, route.len);
+            let other = vrfs.get(vrf).unwrap_or(&no_entries);
+            let mut added = Vec::new();
+            // The other VRF's routes inside the lookup prefix: those whose address
+            // lies in it (the map is in address order).
+            let last = last_address(lookup);
+            for (&at, other_entry) in other.range((lookup.0, 0)..=(last, u8::MAX)) {
+                let Entry::Forward(route) = other_entry else {
+                    continue;
+                };
                 if !within(at, lookup) {
                     continue;
                 }
-                let shadowed = entries.values().any(|e| {
-                    let q = e.prefix();
-                    q.1 > lookup.1 && within(q, lookup) && within(at, q)
-                });
+                // Shadowed by a route of this VRF longer than the lookup prefix
+                // that holds it: one per length in between, looked up.
+                let shadowed = (lookup.1 + 1..=at.1)
+                    .any(|len| entries.contains_key(&(network(at.0, len), len)));
                 if !shadowed {
                     added.push(route.clone());
                 }
             }
-            if let Some(covering) = other
-                .iter()
-                .filter(|r| r.len < lookup.1 && within(lookup, (r.prefix, r.len)))
-                .max_by_key(|r| r.len)
-            {
+            // The longest route of the other VRF that holds the whole lookup
+            // prefix (shorter than it), as the lookup prefix itself.
+            let covering = (0..lookup.1).rev().find_map(|len| {
+                match other.get(&(network(lookup.0, len), len)) {
+                    Some(Entry::Forward(route)) => Some(route),
+                    _ => None,
+                }
+            });
+            if let Some(covering) = covering {
                 added.push(Forward {
                     prefix: lookup.0,
                     len: lookup.1,
                     ..covering.clone()
                 });
             }
-        }
-        // This VRF's own routes win over expanded ones for the same prefix.
-        for route in added {
-            if !own
-                .iter()
-                .any(|r| r.prefix == route.prefix && r.len == route.len)
-            {
-                own.push(route);
+            // This VRF's own routes win over expanded ones for the same prefix.
+            for route in added {
+                if taken.insert((route.prefix, route.len)) {
+                    own.push(route);
+                }
             }
         }
         out.insert(name.clone(), own);
     }
     out
+}
+
+/// The last address of a prefix (all host bits set).
+fn last_address((address, len): (IpAddr, u8)) -> IpAddr {
+    match address {
+        IpAddr::V4(a) => {
+            let host = u32::MAX.checked_shr(u32::from(len)).unwrap_or(0);
+            IpAddr::V4((u32::from(a) | host).into())
+        }
+        IpAddr::V6(a) => {
+            let host = u128::MAX.checked_shr(u32::from(len)).unwrap_or(0);
+            IpAddr::V6((u128::from(a) | host).into())
+        }
+    }
 }
 
 fn v4(address: IpAddr) -> Option<Ipv4Address> {
@@ -1445,6 +1466,129 @@ mod tests {
         assert!(expand_lookups(&by_prefix(vrfs))["red"].is_empty());
     }
 
+    /// The expansion as it was first written: each route of the other VRF
+    /// against each of this VRF's, quadratic, kept as the reference.
+    fn expand_lookups_reference(vrfs: &Entries) -> BTreeMap<String, Vec<Forward>> {
+        let forwards = |vrf: &str| -> Vec<Forward> {
+            vrfs.get(vrf)
+                .map(|entries| {
+                    entries
+                        .values()
+                        .filter_map(|e| match e {
+                            Entry::Forward(f) => Some(f.clone()),
+                            Entry::Lookup { .. } => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut out = BTreeMap::new();
+        for (name, entries) in vrfs {
+            let mut own = forwards(name);
+            let mut added = Vec::new();
+            for entry in entries.values() {
+                let Entry::Lookup { prefix, len, vrf } = entry else {
+                    continue;
+                };
+                let lookup = (*prefix, *len);
+                let other = forwards(vrf);
+                for route in &other {
+                    let at = (route.prefix, route.len);
+                    if !within(at, lookup) {
+                        continue;
+                    }
+                    let shadowed = entries.values().any(|e| {
+                        let q = e.prefix();
+                        q.1 > lookup.1 && within(q, lookup) && within(at, q)
+                    });
+                    if !shadowed {
+                        added.push(route.clone());
+                    }
+                }
+                if let Some(covering) = other
+                    .iter()
+                    .filter(|r| r.len < lookup.1 && within(lookup, (r.prefix, r.len)))
+                    .max_by_key(|r| r.len)
+                {
+                    added.push(Forward {
+                        prefix: lookup.0,
+                        len: lookup.1,
+                        ..covering.clone()
+                    });
+                }
+            }
+            for route in added {
+                if !own
+                    .iter()
+                    .any(|r| r.prefix == route.prefix && r.len == route.len)
+                {
+                    own.push(route);
+                }
+            }
+            out.insert(name.clone(), own);
+        }
+        out
+    }
+
+    /// Random VRFs of forward and lookup routes, IPv4 and IPv6, nested at every
+    /// length: the expansion gives what the reference gives, in the same order.
+    #[test]
+    fn the_expansion_gives_what_the_reference_gives() {
+        let mut rng = Rng(0x6c6f_6f6b_7570);
+        let names = ["default", "red", "blue"];
+        let mut added = 0;
+        for _ in 0..300 {
+            let mut vrfs: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
+            for name in names {
+                let mut list = Vec::new();
+                for _ in 0..rng.below(40) {
+                    let v6 = rng.below(4) == 0;
+                    let len = if v6 { rng.below(129) } else { rng.below(33) } as u8;
+                    // Few distinct high bits, so that prefixes nest, and random
+                    // ones below, so that they have siblings at every length.
+                    let address: IpAddr = if v6 {
+                        let high = u128::from(rng.below(8)) << 125;
+                        let low =
+                            u128::from(rng.below(1 << 30)) << 64 | u128::from(rng.below(1 << 30));
+                        std::net::Ipv6Addr::from(high | low << 30).into()
+                    } else {
+                        let bits = rng.below(8) << 29 | rng.below(1 << 29);
+                        std::net::Ipv4Addr::from(bits as u32).into()
+                    };
+                    let prefix = network(address, len);
+                    let entry = if rng.below(6) == 0 {
+                        Entry::Lookup {
+                            prefix,
+                            len,
+                            // At times into a VRF that is not there.
+                            vrf: rng.pick(&[names[0], names[1], names[2], "green"]).into(),
+                        }
+                    } else {
+                        Entry::Forward(Forward {
+                            prefix,
+                            len,
+                            egress: IfId(rng.below(4) as u16),
+                            next_hop: None,
+                        })
+                    };
+                    list.push(entry);
+                }
+                vrfs.insert(name.into(), list);
+            }
+            let entries = by_prefix(vrfs);
+            let expanded = expand_lookups(&entries);
+            assert_eq!(expanded, expand_lookups_reference(&entries));
+            let forwards = entries
+                .values()
+                .flat_map(BTreeMap::values)
+                .filter(|entry| matches!(entry, Entry::Forward(_)))
+                .count();
+            added += expanded.values().map(Vec::len).sum::<usize>() - forwards;
+        }
+        // The lookups did bring routes in.
+        assert!(added > 1_000, "{added}");
+    }
+
     use std::os::unix::net::UnixStream;
 
     use ruster_proto::session::{Client, Hook, Server};
@@ -1841,6 +1985,95 @@ mod tests {
         }
 
         fn committed(&mut self, _store: &Store) {}
+    }
+
+    /// Release timing of a VRF whose default route looks up in the default VRF,
+    /// which holds `count` routes, run on demand:
+    /// `cargo test --release -p ruster-fe lookup_timing -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing report, not a pass/fail test"]
+    fn lookup_timing_up_to_a_full_table() {
+        use std::time::Instant;
+
+        let route = |index: u32, vrf: &str, len: u8| {
+            Change::set(
+                Key::Route {
+                    vrf: vrf.into(),
+                    prefix: std::net::Ipv4Addr::from(0x1000_0000 + (index << 8)).into(),
+                    len,
+                },
+                Value::Route(RouteAction::Forward(vec![NextHop {
+                    interface: "p0".into(),
+                    address: Some("192.0.2.1".parse().unwrap()),
+                }])),
+            )
+        };
+        for (count, own) in [(16_384_u32, 16_u32), (65_536, 16), (16_384, 4_096)] {
+            let mut hook = Timed {
+                ports: vec!["p0".into(), "p1".into()],
+                ..Timed::default()
+            };
+            let mut server = Server::new();
+            let connect = |server: &mut Server, writes: &[u64]| {
+                let (a, b) = UnixStream::pair().unwrap();
+                server.attach(a, writes).unwrap();
+                Client::new(b).unwrap()
+            };
+            let mut config = connect(&mut server, &[sid::INTERFACE]);
+            let mut routes = connect(&mut server, &[sid::ROUTE]);
+            let send =
+                |server: &mut Server, client: &mut Client, hook: &mut Timed, changes: &[Change]| {
+                    client.patch(changes).unwrap();
+                    while client.poll().1.is_empty() {
+                        server.step(hook);
+                    }
+                };
+            send(
+                &mut server,
+                &mut config,
+                &mut hook,
+                &[
+                    interface("p0", true, DEFAULT_VRF),
+                    interface("p1", true, "red"),
+                ],
+            );
+            for first in (0..count).step_by(1000) {
+                let changes: Vec<Change> = (first..count.min(first + 1000))
+                    .map(|index| route(index, DEFAULT_VRF, 24))
+                    .collect();
+                send(&mut server, &mut routes, &mut hook, &changes);
+            }
+            // Red's own routes, longer ones inside the default VRF's, and its
+            // default route looking up in the default VRF.
+            let mut own_routes: Vec<Change> =
+                (0..own).map(|index| route(index * 4, "red", 26)).collect();
+            own_routes.push(Change::set(
+                Key::Route {
+                    vrf: "red".into(),
+                    prefix: "0.0.0.0".parse().unwrap(),
+                    len: 0,
+                },
+                Value::Route(RouteAction::LookupVrf(DEFAULT_VRF.into())),
+            ));
+            for chunk in own_routes.chunks(1000) {
+                send(&mut server, &mut routes, &mut hook, chunk);
+            }
+            std::mem::take(&mut hook.spent);
+            let started = Instant::now();
+            for round in 0..5_u32 {
+                send(
+                    &mut server,
+                    &mut routes,
+                    &mut hook,
+                    &[route(count + round, DEFAULT_VRF, 24)],
+                );
+            }
+            println!(
+                "{count} routes and {own} of red's: one route in {:?} (building {:?})",
+                started.elapsed() / 5,
+                hook.spent / 5
+            );
+        }
     }
 
     /// Release timing, run on demand:
