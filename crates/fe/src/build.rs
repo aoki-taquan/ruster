@@ -1431,6 +1431,8 @@ mod tests {
         refused: usize,
         /// The builds that made the change to core's routes of the build before.
         shared: usize,
+        /// The builds that kept the routes for a change of neighbors alone.
+        neighbors_only: usize,
     }
 
     impl Hook for BothWays {
@@ -1461,9 +1463,18 @@ mod tests {
                     assert_eq!(made.interface_names, all.interface_names);
                     assert_eq!(made.by_ingress, all.by_ingress);
                     assert_eq!(made.vrfs.len(), all.vrfs.len());
+                    // What a neighbor does change is the same both ways.
+                    assert_eq!(made.unreachable, all.unreachable);
                     for (made, all) in made.vrfs.iter().zip(&all.vrfs) {
                         assert_eq!(made.owner.routes(), all.owner.routes());
+                        assert_eq!(made.owner.neighbors(), all.owner.neighbors());
                         assert_eq!(made.ipv6, all.ipv6);
+                    }
+                    let no_route = !changed
+                        .iter()
+                        .any(|(key, _)| matches!(key, Key::Route { .. }));
+                    if follows && no_route {
+                        self.neighbors_only += 1;
                     }
                     if follows && no_lookup_before && made_routes.lookups == 0 {
                         self.shared += 1;
@@ -1628,20 +1639,46 @@ mod tests {
                     routes.patch(&again).unwrap();
                     routes.resync_end();
                 }
-                // A neighbor comes, changes or goes: the kept routes stay as they
-                // are, whatever else the tables hold.
-                2..=9 => {
-                    let key = Key::Neighbor {
-                        interface: rng.pick(&["p0", "p1", "p2"]).into(),
-                        address: std::net::Ipv4Addr::new(10, 0, 0, 1 + rng.below(3) as u8).into(),
+                // A neighbor comes, changes, is marked unreachable (a MAC of
+                // zeros) or goes, IPv4 or IPv6: the kept routes stay as they are,
+                // whatever else the tables hold. At times as a resync of the
+                // neighbors. (Routes and neighbors have different writers, so
+                // one change never holds both.)
+                kind @ 2..=11 => {
+                    let neighbor = |rng: &mut Rng| {
+                        let host = 1 + rng.below(3) as u8;
+                        let address: IpAddr = if rng.below(2) == 0 {
+                            std::net::Ipv4Addr::new(10, 0, 0, host).into()
+                        } else {
+                            std::net::Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, host.into()).into()
+                        };
+                        let key = Key::Neighbor {
+                            interface: rng.pick(&["p0", "p1", "p2"]).into(),
+                            address,
+                        };
+                        match rng.below(4) {
+                            0 => Change::delete(key),
+                            1 => Change::set(key, Value::Neighbor { mac: [0; 6] }),
+                            _ => {
+                                let mac = [2, 0, 0, 0, 0, 1 + rng.below(4) as u8];
+                                Change::set(key, Value::Neighbor { mac })
+                            }
+                        }
                     };
-                    let change = if rng.below(3) == 0 {
-                        Change::delete(key)
-                    } else {
-                        let mac = [2, 0, 0, 0, 0, 1 + rng.below(4) as u8];
-                        Change::set(key, Value::Neighbor { mac })
-                    };
-                    neighbors.patch(&[change]).unwrap();
+                    match kind {
+                        2 => {
+                            neighbors.resync_begin();
+                            let again: Vec<Change> = (0..rng.below(3))
+                                .map(|_| neighbor(&mut rng))
+                                .filter(|change| change.value.is_some())
+                                .collect();
+                            neighbors.patch(&again).unwrap();
+                            neighbors.resync_end();
+                        }
+                        _ => {
+                            neighbors.patch(&[neighbor(&mut rng)]).unwrap();
+                        }
+                    }
                 }
                 // Routes, a few at once, at times the same one twice.
                 _ => {
@@ -1662,6 +1699,7 @@ mod tests {
         assert!(hook.followed > 100, "{}", hook.followed);
         assert!(hook.read_all > 20, "{}", hook.read_all);
         assert!(hook.refused > 5, "{}", hook.refused);
+        assert!(hook.neighbors_only > 20, "{}", hook.neighbors_only);
         hook
     }
 
@@ -1676,6 +1714,8 @@ mod tests {
 
     impl Hook for Timed {
         fn check(&mut self, next: &Store) -> Result<(), String> {
+            // Not from a change: every route is read, as the FE does.
+            self.kept = None;
             self.check_patch(next, &[])
         }
 
