@@ -347,16 +347,11 @@ pub(crate) fn flow_hash(inner: &[u8]) -> u32 {
     hash
 }
 
-/// The one's complement sum of `bytes` as 16-bit words, added to `sum`.
-fn add_words(mut sum: u64, bytes: &[u8]) -> u64 {
-    let mut words = bytes.chunks_exact(2);
-    for word in words.by_ref() {
-        sum += u64::from(u16::from_be_bytes([word[0], word[1]]));
-    }
-    if let Some(&last) = words.remainder().first() {
-        sum += u64::from(last) << 8;
-    }
-    sum
+/// The one's complement sum of `bytes` as 16-bit words, added to `sum`, not yet
+/// folded to 16 bits.
+fn add_words(sum: u64, bytes: &[u8]) -> u64 {
+    // Folded, it is the same as adding the words one by one.
+    sum + u64::from(crate::checksum::ones_complement_sum(0, bytes))
 }
 
 /// The outer header for `inner` (an Ethernet frame) leaving `overlay` for its

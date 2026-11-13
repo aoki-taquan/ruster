@@ -15,14 +15,32 @@
 /// is treated as the high byte of a zero-padded 16-bit word.
 #[must_use]
 pub fn internet_checksum(bytes: &[u8]) -> u16 {
-    let mut chunks = bytes.chunks_exact(2);
-    let mut sum = chunks.by_ref().fold(0_u32, |sum, word| {
-        add_folded(sum, u16::from_be_bytes([word[0], word[1]]))
-    });
-    if let Some(&last) = chunks.remainder().first() {
-        sum = add_folded(sum, u16::from(last) << 8);
+    !ones_complement_sum(0, bytes)
+}
+
+/// The one's complement sum of `bytes` as big-endian 16-bit words (an odd last
+/// byte as the high half of a word), added to `initial`, folded to 16 bits and
+/// not inverted.
+///
+/// Four bytes are added at a time into 64 bits and folded once at the end: a
+/// one's complement sum of 32-bit words folds to the sum of their 16-bit halves
+/// (RFC 1071 section 2), and nothing in between waits for the carry of the add
+/// before it.
+#[must_use]
+pub(crate) fn ones_complement_sum(initial: u32, bytes: &[u8]) -> u16 {
+    let mut sum = u64::from(initial);
+    let mut words = bytes.chunks_exact(4);
+    for word in words.by_ref() {
+        sum += u64::from(u32::from_be_bytes([word[0], word[1], word[2], word[3]]));
     }
-    fold(sum)
+    let rest = words.remainder();
+    let mut last = [0_u8; 4];
+    last[..rest.len()].copy_from_slice(rest);
+    sum += u64::from(u32::from_be_bytes(last));
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
 }
 
 /// Computes the Internet checksum over an IPv4 header.
@@ -40,15 +58,6 @@ pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
 pub fn rfc1624_update(checksum: u16, old_word: u16, new_word: u16) -> u16 {
     let sum = u32::from(!checksum) + u32::from(!old_word) + u32::from(new_word);
     !fold_sum(sum)
-}
-
-fn fold(sum: u32) -> u16 {
-    !fold_sum(sum)
-}
-
-fn add_folded(sum: u32, word: u16) -> u32 {
-    let sum = sum + u32::from(word);
-    (sum & 0xffff) + (sum >> 16)
 }
 
 fn fold_sum(mut sum: u32) -> u16 {
@@ -157,6 +166,32 @@ mod tests {
     fn internet_checksum_folds_carry_for_large_odd_messages() {
         let bytes = vec![0xff; 200_001];
         assert_eq!(internet_checksum(&bytes), 0x00ff);
+    }
+
+    /// With a starting sum (a pseudo-header's), as the transport checksums use
+    /// it: the same as the 16-bit sum of the starting sum's halves and the words.
+    #[test]
+    fn ones_complement_sum_with_a_starting_sum_matches_the_word_by_word_sum() {
+        let mut rng = DeterministicRng::seeded();
+        for length in (0..80).chain([1_499, 1_500, 1_501]) {
+            for _ in 0..16 {
+                let mut bytes = vec![0; length];
+                rng.fill(&mut bytes);
+                let initial = u32::from(rng.next_u16()) * 6 + u32::from(rng.next_u16());
+                let mut sum = u64::from(initial);
+                for (at, byte) in bytes.iter().enumerate() {
+                    sum += u64::from(*byte) << if at % 2 == 0 { 8 } else { 0 };
+                }
+                while sum > 0xffff {
+                    sum = (sum & 0xffff) + (sum >> 16);
+                }
+                assert_eq!(
+                    ones_complement_sum(initial, &bytes),
+                    sum as u16,
+                    "length={length}"
+                );
+            }
+        }
     }
 
     #[test]
