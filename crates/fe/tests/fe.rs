@@ -5000,3 +5000,57 @@ fn step_timing_without_packets_and_with_batches() {
     bench.fe.attach_local("default", Box::new(pipe));
     report(&mut bench, "the worker with its sockets");
 }
+
+/// How long the whole FE takes to make one route change with many routes: the
+/// patch answered and the worker forwarding by the new tables.
+///
+/// Release timing, run on demand:
+/// `cargo test --release -p ruster-fe --test fe version_timing -- --ignored --nocapture`
+#[test]
+#[ignore = "timing report, not a pass/fail test"]
+fn version_timing_up_to_a_full_table() {
+    use std::time::{Duration, Instant};
+
+    let mut bench = Bench::new();
+    let (_config, mut routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(code, Code::CHANGED);
+    let route_at = |index: u32| {
+        route(
+            (0x1000_0000 + (index << 8)).to_be_bytes(),
+            24,
+            "wan",
+            Some(GATEWAY),
+        )
+    };
+    let mut loaded = 0;
+    for count in [131_072_u32, 1_048_576] {
+        let started = Instant::now();
+        for first in (loaded..count).step_by(1000) {
+            let changes: Vec<Change> = (first..count.min(first + 1000)).map(route_at).collect();
+            assert_eq!(bench.patch(&mut routes, &changes), Code::CHANGED);
+        }
+        let load = started.elapsed();
+        loaded = count;
+        let mut spent = Duration::ZERO;
+        for round in 0..20 {
+            let mut change = route_at(count / 2);
+            if round % 2 == 0 {
+                change = route(
+                    (0x1000_0000 + ((count / 2) << 8)).to_be_bytes(),
+                    24,
+                    "lan",
+                    None,
+                );
+            }
+            let started = Instant::now();
+            assert_eq!(bench.patch(&mut routes, &[change]), Code::CHANGED);
+            spent += started.elapsed();
+        }
+        println!(
+            "{count} routes: loaded in {load:?}, one route changed in {:?}",
+            spent / 20
+        );
+    }
+}
