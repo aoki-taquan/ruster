@@ -89,11 +89,19 @@ pub(crate) struct Outcome {
     pub(crate) to_kernel: Vec<(IfId, Vec<u8>)>,
 }
 
+/// Whether `id` is set in a bitmap of [`ruster_core::kernel_ingress_bits`].
+fn is_kernel(bits: &[u64], id: IfId) -> bool {
+    let id = usize::from(id.0);
+    bits.get(id / 64)
+        .is_some_and(|word| word >> (id % 64) & 1 == 1)
+}
+
 /// A port batch followed by the kernel's frames.
 pub(crate) struct Joined<'o, B> {
     pub(crate) ports: B,
-    /// The kernel interfaces.
-    pub(crate) kernel_ids: &'o [IfId],
+    /// The kernel interfaces, as a bitmap by id
+    /// ([`ruster_core::kernel_ingress_bits`]).
+    pub(crate) kernel_ids: &'o [u64],
     pub(crate) kernel: std::vec::IntoIter<Frame>,
     pub(crate) outcome: &'o mut Outcome,
     pub(crate) kernel_done: usize,
@@ -102,7 +110,7 @@ pub(crate) struct Joined<'o, B> {
 pub(crate) enum Slot<'a, S> {
     Port {
         slot: S,
-        kernel_ids: &'a [IfId],
+        kernel_ids: &'a [u64],
         outcome: &'a mut Outcome,
     },
     Kernel {
@@ -211,7 +219,7 @@ impl<S: PacketSlot> PacketSlot for Slot<'_, S> {
                 outcome,
             } => match completion {
                 // To the router's host: the FE writes it to the kernel's pipe.
-                SlotCompletion::Transmit(egress) if kernel_ids.contains(&egress) => {
+                SlotCompletion::Transmit(egress) if is_kernel(kernel_ids, egress) => {
                     outcome.to_kernel.push((egress, slot.bytes_mut().to_vec()));
                     slot.complete(SlotCompletion::Consume(
                         ruster_core::ConsumeReason::LocalToControl,
