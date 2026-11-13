@@ -305,6 +305,79 @@ fn arp_goes_to_the_neighbor_socket_and_frames_come_back() {
     assert_eq!(tx.bytes, reply);
 }
 
+/// While the ports bring packets in every step, the neighbor process's socket and
+/// the kernel's device are read once in eight steps, not in each; a step without
+/// packets from the ports reads them at once.
+#[test]
+fn under_load_what_is_handed_in_still_goes_out_within_a_few_steps() {
+    let mut bench = Bench::new();
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(code, Code::CHANGED);
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    bench.fe.attach_punt(fe_end).unwrap();
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    let mut reply = vec![0xab_u8; 42];
+    reply[12..14].copy_from_slice(&[0x08, 0x06]);
+    let mut message = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::ARP,
+        interface: "lan",
+        frame: &reply,
+    }
+    .encode(&mut message)
+    .unwrap();
+    // The router's own packet to the Internet, as the kernel writes it.
+    let own = udp_from_host(INTERNET)[14..].to_vec();
+
+    // One loaded step: a packet from the LAN is forwarded. Returns what else left.
+    let loaded_step = |bench: &mut Bench| {
+        bench.fe.io_mut().inject(IfId(0), udp_from_host(INTERNET));
+        bench.fe.step(0);
+        let mut others = Vec::new();
+        let mut forwarded = 0;
+        while let Some(tx) = bench.fe.io_mut().pop_tx() {
+            if tx.egress == IfId(1) && tx.bytes[6..12] == WAN_MAC && tx.bytes[22] == 63 {
+                forwarded += 1;
+            } else {
+                others.push(tx);
+            }
+        }
+        assert_eq!(forwarded, 1, "the port's packet is forwarded in every step");
+        others
+    };
+    for _ in 0..4 {
+        assert!(loaded_step(&mut bench).is_empty());
+    }
+    // Handed in under load: both leave, within eight steps and not in every one.
+    let mut waited = Vec::new();
+    for _ in 0..3 {
+        neighd_end.send(&message).unwrap();
+        kernel.send(&own).unwrap();
+        let mut steps = 0;
+        let mut left = 0;
+        while left < 2 {
+            steps += 1;
+            assert!(steps <= 9, "left unread for more than eight steps");
+            left += loaded_step(&mut bench).len();
+        }
+        waited.push(steps);
+    }
+    assert!(waited.iter().any(|steps| *steps > 1), "{waited:?}");
+
+    // Without packets from the ports the next step reads them at once.
+    bench.fe.step(0);
+    neighd_end.send(&message).unwrap();
+    bench.fe.step(0);
+    let tx = bench.fe.io_mut().pop_tx().expect("sent at once");
+    assert_eq!((tx.egress, tx.bytes), (IfId(0), reply));
+}
+
 #[test]
 fn rejected_tables_leave_the_old_ones_forwarding() {
     let mut bench = Bench::new();
@@ -469,6 +542,9 @@ fn a_punt_socket_at_a_fixed_path_sends_to_whoever_binds_the_peer_path() {
         // The same message from anyone else is not sent.
         let stranger = UnixDatagram::unbound().unwrap();
         stranger.send_to(&message, dir.join("fe")).unwrap();
+        // After steps that forwarded packets the FE may leave the sockets for a
+        // later step; the second one reads them.
+        bench.fe.step(round);
         bench.fe.step(round);
         assert_eq!(bench.fe.io_mut().pop_tx().expect("sent").bytes, reply);
     }
@@ -2698,6 +2774,9 @@ fn filtering_opens_only_inside_endpoints_of_flows_out() {
     // The router's own flow out (from its port 123) opens nothing to others.
     let own = udp_packet([198, 51, 100, 2], INTERNET, (123, 123));
     kernel.send(&own).unwrap();
+    // After steps that forwarded packets the FE may leave the sockets for a
+    // later step; the second one reads them.
+    bench.fe.step(bench.now);
     bench.fe.step(bench.now);
     assert!(
         bench.fe.io_mut().pop_tx().is_some(),
@@ -4148,6 +4227,9 @@ fn dhcp_from_the_lan_goes_to_its_control_process_and_its_replies_go_out() {
     padi.extend_from_slice(&[0x88, 0x63, 0x11, 0x09, 0, 0, 0, 0]);
     send_punt(&kea, punt::reason::PPPOE_DISCOVERY, "lan", &padi);
     let dropped = bench.fe.counters().inject_dropped;
+    // After steps that forwarded packets the FE may leave the sockets for a
+    // later step; the second one reads them.
+    bench.fe.step(1_000);
     bench.fe.step(1_000);
     let tx = bench.fe.io_mut().pop_tx().expect("the reply");
     assert_eq!((tx.egress, tx.bytes), (IfId(0), reply));
@@ -4883,7 +4965,7 @@ fn step_timing_without_packets_and_with_batches() {
         }
         let empty = started.elapsed() / ROUNDS;
         println!("{what}, a step without packets: {empty:?}");
-        for batch in [1_u32, 8, 32] {
+        for batch in [1_u32, 8, 32, 64] {
             let rounds = 100_000 / batch;
             let mut spent = Duration::ZERO;
             for _ in 0..rounds {

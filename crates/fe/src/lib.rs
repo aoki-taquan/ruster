@@ -107,6 +107,15 @@ const EVENTS_PER_BATCH: usize = 64;
 const USED_MAX: usize = 8_192;
 /// Frames read from the punt socket per step.
 const INJECT_PER_STEP: usize = 64;
+/// While the ports bring packets step after step, what the kernel and the control
+/// processes hand in is read once in this many steps: each of their sockets
+/// costs a system call a step, also when it has nothing. Only after
+/// [`BUSY_STEPS`] steps in a row with packets from the ports; until then, and
+/// after any step without, every step reads them, so an FE that is not loaded
+/// answers as fast as before.
+const HANDED_IN_EVERY: u8 = 8;
+/// See [`HANDED_IN_EVERY`].
+const BUSY_STEPS: u8 = 2;
 /// One resolve request per next hop per this many milliseconds.
 const RESOLVE_INTERVAL_MS: u64 = 1_000;
 /// Next hops remembered for the rate limit. Older ones are forgotten first; when all
@@ -428,6 +437,11 @@ struct Worker<B> {
     used: std::collections::HashSet<(u16, IpAddr)>,
     /// What the last batch's packets left to act on; see [`FeTrace`].
     trace: FeTrace,
+    /// Steps in a row, up to now, in which the ports brought packets (it stops
+    /// counting at [`BUSY_STEPS`]).
+    busy_steps: u8,
+    /// Steps since the kernel's and the control processes' sockets were read.
+    unread_steps: u8,
     fragment_tracking: ruster_core::Ipv4FragmentTracker<'static>,
     /// The bridges, their MAC address tables and the frames they flood.
     bridges: ruster_core::Bridges,
@@ -521,6 +535,8 @@ where
             reassembled: Vec::new(),
             used: std::collections::HashSet::new(),
             trace: FeTrace::default(),
+            busy_steps: 0,
+            unread_steps: 0,
             fragment_tracking: fragments::tracker(),
             bridges: ruster_core::Bridges::new(BRIDGE_MACS, FLOOD_SLOTS, hash_key()),
             bridge_names: Vec::new(),
@@ -786,8 +802,16 @@ where
         if let Some(version) = last {
             self.take(version);
         }
-        let worked = self.worker(now_ms);
-        let injected = self.inject();
+        // See `HANDED_IN_EVERY`.
+        let read_handed_in = self.busy_steps < BUSY_STEPS || self.unread_steps >= HANDED_IN_EVERY;
+        self.unread_steps = if read_handed_in {
+            0
+        } else {
+            self.unread_steps + 1
+        };
+        let worked = self.worker(now_ms, read_handed_in);
+        // Frames held for the control task's answer go out whatever the ports do.
+        let injected = (read_handed_in || self.held.is_some()) && self.inject();
         worked || injected
     }
 
@@ -887,19 +911,35 @@ where
     }
 
     /// Forwards one batch by the tables the worker has. Whether it did anything.
-    fn worker(&mut self, now_ms: u64) -> bool {
+    fn worker(&mut self, now_ms: u64, read_handed_in: bool) -> bool {
         // The lists a batch fills are kept from step to step, emptied.
         let mut trace = std::mem::take(&mut self.trace);
-        let worked = self.forward(now_ms, &mut trace);
+        let before = self.busy_steps;
+        self.busy_steps = 0;
+        let worked = self.forward(now_ms, read_handed_in, before, &mut trace);
         trace.clear();
         self.trace = trace;
         worked
     }
 
-    fn forward(&mut self, now_ms: u64, trace: &mut FeTrace) -> bool {
+    /// `busy_before` is [`Self::busy_steps`] as the last step left it; this step
+    /// sets it again, to zero wherever it ends without packets from the ports.
+    fn forward(
+        &mut self,
+        now_ms: u64,
+        read_handed_in: bool,
+        busy_before: u8,
+        trace: &mut FeTrace,
+    ) -> bool {
         // The kernel's packets join the ports' in one batch, after them.
-        let mut kernel_frames = self.read_kernel();
-        kernel_frames.append(&mut self.read_taps(now_ms));
+        let mut kernel_frames = if read_handed_in {
+            let mut frames = self.read_kernel();
+            frames.append(&mut self.read_taps(now_ms));
+            frames
+        } else {
+            Vec::new()
+        };
+        let handed_in = kernel_frames.len();
         kernel_frames.append(&mut self.reassembled);
         // One snapshot per VRF; each packet uses its ingress interface's.
         let snapshots: Vec<_> = self
@@ -982,6 +1022,10 @@ where
         });
         self.bridges.table.age(now_ms, AGING_PER_STEP);
         self.send_flood();
+        // What the ports brought, without what was handed in.
+        if report.received > handed_in {
+            self.busy_steps = (busy_before + 1).min(BUSY_STEPS);
+        }
         if report.received == 0 && answered == 0 {
             return false;
         }
