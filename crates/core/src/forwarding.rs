@@ -7006,24 +7006,13 @@ fn transport_checksum_valid(
 ) -> bool {
     let source = source.octets();
     let destination = destination.octets();
-    let mut sum = u32::from(u16::from_be_bytes([source[0], source[1]]))
+    let sum = u32::from(u16::from_be_bytes([source[0], source[1]]))
         + u32::from(u16::from_be_bytes([source[2], source[3]]))
         + u32::from(u16::from_be_bytes([destination[0], destination[1]]))
         + u32::from(u16::from_be_bytes([destination[2], destination[3]]))
         + u32::from(protocol)
         + u32::from(length);
-    let mut chunks = segment.chunks_exact(2);
-    for word in chunks.by_ref() {
-        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    if let Some(last) = chunks.remainder().first() {
-        sum += u32::from(*last) << 8;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    sum == 0xffff
+    crate::checksum::ones_complement_sum(sum, segment) == 0xffff
 }
 
 fn nat44_icmpv4_drop<T: TraceSink>(
@@ -7664,24 +7653,13 @@ fn tcp_checksum_valid(
     let Ok(length) = u16::try_from(segment.len()) else {
         return false;
     };
-    let mut sum = u32::from(u16::from_be_bytes([source[0], source[1]]))
+    let sum = u32::from(u16::from_be_bytes([source[0], source[1]]))
         + u32::from(u16::from_be_bytes([source[2], source[3]]))
         + u32::from(u16::from_be_bytes([destination[0], destination[1]]))
         + u32::from(u16::from_be_bytes([destination[2], destination[3]]))
         + 6
         + u32::from(length);
-    let mut chunks = segment.chunks_exact(2);
-    for word in chunks.by_ref() {
-        sum += u32::from(u16::from_be_bytes([word[0], word[1]]));
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    if let Some(last) = chunks.remainder().first() {
-        sum += u32::from(*last) << 8;
-    }
-    while sum > 0xffff {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    sum == 0xffff
+    crate::checksum::ones_complement_sum(sum, segment) == 0xffff
 }
 
 #[allow(clippy::too_many_arguments)]
