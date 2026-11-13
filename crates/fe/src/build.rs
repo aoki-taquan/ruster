@@ -149,8 +149,13 @@ pub(crate) struct Routes {
     /// the FE's own too, so with one every build reads the routes again.
     srv6: bool,
     /// How many of the entries look up in another VRF. With one, a VRF's routes
-    /// for core come from another VRF's too, and are all made again.
+    /// for core come from another VRF's too.
     lookups: usize,
+    /// Those entries: the VRF each is in, its prefix and the VRF it looks up in,
+    /// in the order of the VRFs and of the prefixes. A change of routes made to
+    /// the kept ones is followed through them ([`follow_lookups`]); a change of
+    /// one of them makes the routes of every VRF again.
+    lookup_list: Vec<(String, (IpAddr, u8), String)>,
     /// Core's routes of each VRF, as the build gave them to core. The next build
     /// makes its change to these and shares the rest with this one.
     tables: BTreeMap<String, Tables>,
@@ -378,28 +383,12 @@ fn expand_lookups(vrfs: &Entries) -> BTreeMap<String, Vec<Forward>> {
                 if !within(at, lookup) {
                     continue;
                 }
-                // Shadowed by a route of this VRF longer than the lookup prefix
-                // that holds it: one per length in between, looked up.
-                let shadowed = (lookup.1 + 1..=at.1)
-                    .any(|len| entries.contains_key(&(network(at.0, len), len)));
-                if !shadowed {
+                if !shadowed(entries, lookup, at) {
                     added.push(route.clone());
                 }
             }
-            // The longest route of the other VRF that holds the whole lookup
-            // prefix (shorter than it), as the lookup prefix itself.
-            let covering = (0..lookup.1).rev().find_map(|len| {
-                match other.get(&(network(lookup.0, len), len)) {
-                    Some(Entry::Forward(route)) => Some(route),
-                    _ => None,
-                }
-            });
-            if let Some(covering) = covering {
-                added.push(Forward {
-                    prefix: lookup.0,
-                    len: lookup.1,
-                    ..covering.clone()
-                });
+            if let Some(covering) = covering(other, lookup) {
+                added.push(covering);
             }
             // This VRF's own routes win over expanded ones for the same prefix.
             for route in added {
@@ -411,6 +400,111 @@ fn expand_lookups(vrfs: &Entries) -> BTreeMap<String, Vec<Forward>> {
         out.insert(name.clone(), own);
     }
     out
+}
+
+/// Whether a route of the VRF of `entries` longer than `lookup` holds `at`, which
+/// is inside `lookup`: that route wins for `at`, so the lookup does not bring it
+/// in. One look per length in between.
+fn shadowed(
+    entries: &BTreeMap<(IpAddr, u8), Entry>,
+    lookup: (IpAddr, u8),
+    at: (IpAddr, u8),
+) -> bool {
+    (lookup.1 + 1..=at.1).any(|len| entries.contains_key(&(network(at.0, len), len)))
+}
+
+/// The longest route of `other` that holds the whole `lookup` prefix (shorter than
+/// it), as the lookup prefix itself.
+fn covering(other: &BTreeMap<(IpAddr, u8), Entry>, lookup: (IpAddr, u8)) -> Option<Forward> {
+    (0..lookup.1)
+        .rev()
+        .find_map(|len| match other.get(&(network(lookup.0, len), len)) {
+            Some(Entry::Forward(route)) => Some(Forward {
+                prefix: lookup.0,
+                len: lookup.1,
+                ..route.clone()
+            }),
+            _ => None,
+        })
+}
+
+/// What [`expand_lookups`] gives VRF `vrf` for the prefix `key`, found without
+/// expanding: its own route there, or else the first of its lookups (in
+/// `lookup_list`) that brings one in, as the expansion takes them.
+fn expanded_at(
+    entries: &Entries,
+    lookup_list: &[(String, (IpAddr, u8), String)],
+    vrf: &str,
+    key: (IpAddr, u8),
+) -> Option<Forward> {
+    let own = entries.get(vrf)?;
+    if let Some(Entry::Forward(route)) = own.get(&key) {
+        return Some(route.clone());
+    }
+    let no_entries = BTreeMap::new();
+    for (_, lookup, other) in lookup_list.iter().filter(|(of, ..)| of == vrf) {
+        let other = entries.get(other).unwrap_or(&no_entries);
+        if within(key, *lookup) {
+            if let Some(Entry::Forward(route)) = other.get(&key) {
+                if !shadowed(own, *lookup, key) {
+                    return Some(route.clone());
+                }
+            }
+        }
+        if key == *lookup {
+            if let Some(route) = covering(other, *lookup) {
+                return Some(route);
+            }
+        }
+    }
+    None
+}
+
+/// The prefixes of each VRF whose route for core a change of routes (none of
+/// them a lookup) may have changed, given the lookups:
+///
+/// - the changed prefix in its own VRF;
+/// - in that VRF, when it is inside one of the VRF's lookups, every route of the
+///   looked-up VRF inside it (it shadows them, or no longer does);
+/// - in each VRF that looks up in the changed one: the changed prefix, when it
+///   is inside the lookup, and the lookup prefix, when the changed one holds it
+///   (the covering route).
+fn follow_lookups<'e>(
+    entries: &'e Entries,
+    lookup_list: &'e [(String, (IpAddr, u8), String)],
+    changed: Changed<'e>,
+) -> BTreeSet<(&'e str, (IpAddr, u8))> {
+    let no_entries = BTreeMap::new();
+    let mut affected = BTreeSet::new();
+    for (key, _) in changed {
+        let Key::Route { vrf, prefix, len } = key else {
+            continue;
+        };
+        if !entries.contains_key(vrf) {
+            continue;
+        }
+        let at = (*prefix, *len);
+        affected.insert((vrf.as_str(), at));
+        for (of, lookup, other) in lookup_list {
+            if of == vrf && lookup.1 < at.1 && within(at, *lookup) {
+                let other = entries.get(other).unwrap_or(&no_entries);
+                for (&inner, _) in other.range((at.0, 0)..=(last_address(at), u8::MAX)) {
+                    if within(inner, at) {
+                        affected.insert((of.as_str(), inner));
+                    }
+                }
+            }
+            if other == vrf {
+                if within(at, *lookup) {
+                    affected.insert((of.as_str(), at));
+                }
+                if at.1 < lookup.1 && within(*lookup, at) {
+                    affected.insert((of.as_str(), *lookup));
+                }
+            }
+        }
+    }
+    affected
 }
 
 /// The last address of a prefix (all host bits set).
@@ -501,14 +595,16 @@ pub(crate) fn build(
         let afters = routes.follows(changed, store)?;
         Some((routes, changed, afters))
     });
-    // Core's routes of the build before, when no entry looked up in another VRF.
+    // Core's routes of the build before.
     let mut kept_tables = None;
     let mut lookups = 0;
+    let mut lookup_list = Vec::new();
     let (kept_names, mut counts, kept_entries, changed, afters): (Vec<String>, _, _, _, _) =
         match kept {
             Some((routes, changed, afters)) => {
                 lookups = routes.lookups;
-                kept_tables = (routes.lookups == 0).then_some(routes.tables);
+                lookup_list = routes.lookup_list;
+                kept_tables = Some(routes.tables);
                 (
                     routes.counts.keys().cloned().collect(),
                     routes.counts,
@@ -1065,6 +1161,7 @@ pub(crate) fn build(
     }
 
     // The change, made to the kept routes (none without them).
+    let mut lookup_changed = false;
     for ((key, before), &after) in changed.iter().zip(&afters) {
         let Key::Route { vrf, prefix, len } = key else {
             continue;
@@ -1086,13 +1183,23 @@ pub(crate) fn build(
             None => list.remove(&(*prefix, *len)),
         };
         lookups = lookups + usize::from(is_lookup(&entry)) - usize::from(is_lookup(&had));
+        lookup_changed |= is_lookup(&entry) || is_lookup(&had);
     }
-    if all_routes {
-        lookups = entries
-            .values()
-            .flat_map(BTreeMap::values)
-            .filter(|entry| matches!(entry, Entry::Lookup { .. }))
-            .count();
+    if all_routes || lookup_changed {
+        lookup_list = entries
+            .iter()
+            .flat_map(|(vrf, list)| {
+                list.values().filter_map(move |entry| match entry {
+                    Entry::Lookup {
+                        prefix,
+                        len,
+                        vrf: other,
+                    } => Some((vrf.clone(), (*prefix, *len), other.clone())),
+                    Entry::Forward(_) => None,
+                })
+            })
+            .collect();
+        lookups = lookup_list.len();
     }
 
     firewall.sort_by_key(|rule| rule.id());
@@ -1101,22 +1208,16 @@ pub(crate) fn build(
         None => None,
     };
     // Core's routes of each VRF. With those of the build before, and no entry
-    // that looks up in another VRF before or now, only the change is made to
-    // them. Otherwise they are made from every entry.
-    let mut tables = match kept_tables.filter(|_| lookups == 0) {
+    // that looks up in another VRF changed, only the change is made to them,
+    // with what it changes through the lookups. Otherwise they are made from
+    // every entry.
+    let mut tables = match kept_tables.filter(|_| !lookup_changed) {
         Some(mut tables) => {
-            for (key, _) in changed {
-                let Key::Route { vrf, prefix, len } = key else {
-                    continue;
-                };
-                let Some(list) = entries.get(vrf) else {
-                    continue;
-                };
-                let table = tables.entry(vrf.clone()).or_default();
-                match list.get(&(*prefix, *len)) {
-                    Some(Entry::Forward(route)) => table.set(route, vrf)?,
-                    Some(Entry::Lookup { .. }) => unreachable!("no entry looks up"),
-                    None => table.remove(*prefix, *len),
+            for (vrf, key) in follow_lookups(&entries, &lookup_list, changed) {
+                let table = tables.entry(vrf.to_owned()).or_default();
+                match expanded_at(&entries, &lookup_list, vrf, key) {
+                    Some(route) => table.set(&route, vrf)?,
+                    None => table.remove(key.0, key.1),
                 }
             }
             tables
@@ -1236,6 +1337,7 @@ pub(crate) fn build(
         entries,
         srv6: srv6_routes,
         lookups,
+        lookup_list,
         tables,
     };
     Ok((built, routes))
@@ -1612,6 +1714,10 @@ mod tests {
         neighbors_only: usize,
         /// The builds that kept the routes for a change of addresses alone.
         addresses_only: usize,
+        /// The builds that made a change of routes to core's routes of the build
+        /// before through the lookups (an entry looked up in another VRF, and
+        /// the change touched none of those).
+        through_lookups: usize,
     }
 
     impl Hook for BothWays {
@@ -1666,6 +1772,15 @@ mod tests {
                     }
                     if follows && no_lookup_before && made_routes.lookups == 0 {
                         self.shared += 1;
+                    }
+                    let is_lookup = |value: Option<&Value>| {
+                        matches!(value, Some(Value::Route(RouteAction::LookupVrf(_))))
+                    };
+                    let touches_a_lookup = changed
+                        .iter()
+                        .any(|(key, before)| is_lookup(*before) || is_lookup(next.get(key)));
+                    if follows && !no_lookup_before && !touches_a_lookup {
+                        self.through_lookups += 1;
                     }
                     if follows {
                         self.followed += 1;
@@ -1784,6 +1899,7 @@ mod tests {
             entries: Entries::new(),
             srv6: false,
             lookups: 0,
+            lookup_list: Vec::new(),
             tables: BTreeMap::new(),
         };
         let store = Store::default();
@@ -1822,6 +1938,11 @@ mod tests {
         // every entry; without, the change is made to those of the build before.
         let with_lookups = changes_both_ways(0x726f_7574_6573, true);
         assert!(with_lookups.shared > 5, "{}", with_lookups.shared);
+        assert!(
+            with_lookups.through_lookups > 50,
+            "{}",
+            with_lookups.through_lookups
+        );
         assert!(with_lookups.shared < with_lookups.followed / 2);
         let without = changes_both_ways(0x726f_7574_6574, false);
         assert_eq!(without.shared, without.followed);
@@ -2008,7 +2129,12 @@ mod tests {
                 }])),
             )
         };
-        for (count, own) in [(16_384_u32, 16_u32), (65_536, 16), (16_384, 4_096)] {
+        for (count, own) in [
+            (16_384_u32, 16_u32),
+            (65_536, 16),
+            (16_384, 4_096),
+            (1_048_576, 16),
+        ] {
             let mut hook = Timed {
                 ports: vec!["p0".into(), "p1".into()],
                 ..Timed::default()
