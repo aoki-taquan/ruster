@@ -1,5 +1,5 @@
 //! The short way through for the most common packet: an IPv4 datagram that is
-//! only forwarded, with no NAT or firewall to consult.
+//! only forwarded, with no NAT to consult.
 //!
 //! [`decide`] makes the same checks as the full decision (`decide_ipv4`,
 //! `check_egress_mtu`) for that case, in the same functions, and answers only
@@ -10,8 +10,14 @@
 //! [`decide`] neither writes the frame nor records a trace event, so a `None`
 //! leaves no mark.
 //!
-//! The answer, once sent ([`send`]), leaves the frame and the trace as the full
-//! way would: `plain_ipv4_tests` compares both on random tables and frames.
+//! With a forward firewall, a datagram [`decide`] answered for is then judged
+//! by it ([`plan_firewall`]) with the full decision's own functions. Every
+//! other check has passed by then, so the firewall's answer is the packet's:
+//! sent, or dropped as the full way drops it.
+//!
+//! The answer, once sent ([`send`]), leaves the frame, the trace and the
+//! firewall as the full way would: `plain_ipv4_tests` compares both on random
+//! tables, rules and frames.
 
 use super::*;
 use crate::{PacketLease, PacketSlot};
@@ -20,7 +26,8 @@ use crate::{PacketLease, PacketSlot};
 #[derive(Clone, Copy)]
 pub(super) struct Plain {
     rewrite: Ipv4RewriteDecision,
-    destination: crate::Ipv4Address,
+    ipv4: packet::ValidatedIpv4,
+    route: Route,
     target: crate::Ipv4Address,
 }
 
@@ -52,7 +59,9 @@ pub(super) fn enabled() -> bool {
 
 /// `frame`, received on `ingress` and decided in `snapshot` (its VRF's),
 /// when it is a plain forward; `outer` is the batch's snapshot, whose
-/// tunnels, PPPoE sessions and SR policies wrap what leaves.
+/// tunnels, PPPoE sessions and SR policies wrap what leaves. With
+/// `firewall` (the forward firewall is on), an ICMPv4 error, which the
+/// firewall judges by the flow it quotes, is not.
 #[inline]
 pub(super) fn decide(
     frame: &[u8],
@@ -60,13 +69,14 @@ pub(super) fn decide(
     outer: &ForwardingSnapshot<'_>,
     ingress: IfId,
     bridges: Option<&crate::Bridges>,
+    firewall: bool,
 ) -> Option<Plain> {
     if packet::read_u16(frame, 12)? != IPV4_ETHERTYPE || is_ipv4_fragment(frame) {
         return None;
     }
     validate_ethernet_ingress(frame, snapshot, ingress, IPV4_ETHERTYPE).ok()?;
     let ipv4 = validate_ipv4_frame(frame).ok()?;
-    if ipv4.header_len != 20 {
+    if ipv4.header_len != 20 || (firewall && is_related_icmpv4_error_candidate(frame, ipv4)) {
         return None;
     }
     validate_ipv4_ingress(snapshot, ingress, ipv4).ok()?;
@@ -109,33 +119,78 @@ pub(super) fn decide(
             new_ttl_protocol: u16::from_be_bytes([ipv4.ttl - 1, ipv4.protocol]),
             old_checksum: ipv4.checksum,
         },
-        destination: ipv4.destination,
+        ipv4,
+        route,
         target,
     })
 }
 
-/// Rewrites the frame [`decide`] answered for and readies it to leave: the
-/// port to commit it to, or why it is dropped. Records what the full way
-/// records up to the commit.
+/// Judges `plain` with the forward firewall, as the full way does for a
+/// forwarded datagram: `snapshot` is the default VRF's, on the batch's clock.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_firewall<T: TraceSink>(
+    frame: &[u8],
+    snapshot: &ForwardingSnapshot<'_>,
+    ingress: IfId,
+    plain: &Plain,
+    config: &FirewallConfig<'_>,
+    firewall: &mut Option<&mut FirewallRuntime<'_>>,
+    audit: &mut Option<&mut FirewallAuditBuffer<'_>>,
+    icmpv4_errors: &mut Option<(&mut Icmpv4ErrorRuntime<'_>, MonotonicMillis)>,
+    trace: &mut T,
+) -> Result<FirewallPlan, DropReason> {
+    let now = snapshot.now;
+    let runtime = require_firewall_runtime(snapshot, config, firewall)?;
+    let validated = observe_forward_firewall(frame, plain.ipv4, runtime, now)?;
+    // Without NAT there is no NAT clock to observe.
+    plan_forward_firewall(
+        frame,
+        snapshot,
+        ingress,
+        plain.ipv4,
+        plain.route,
+        validated,
+        config,
+        runtime,
+        audit,
+        icmpv4_errors,
+        now,
+        trace,
+    )
+}
+
+/// What the full way records first for a datagram [`decide`] answered for.
+#[inline]
+pub(super) fn validated<T: TraceSink>(plain: &Plain, ingress: IfId, trace: &mut T) {
+    trace.record(TraceEvent::Ipv4Validated {
+        ingress,
+        destination: plain.ipv4.destination,
+    });
+}
+
+/// Rewrites the frame [`decide`] answered for, commits the firewall's plan
+/// for it, and readies it to leave: the port to commit it to, or why it is
+/// dropped. Records what the full way records from the route to the commit.
 #[inline]
 pub(super) fn send<S: PacketSlot, T: TraceSink>(
     packet: &mut PacketLease<S>,
     plain: Plain,
-    ingress: IfId,
+    firewall: Option<(FirewallPlan, &mut FirewallRuntime<'_>)>,
     outer: &ForwardingSnapshot<'_>,
     bridges: Option<&crate::Bridges>,
     trace: &mut T,
 ) -> Result<IfId, DropReason> {
     let egress = plain.egress();
-    trace.record(TraceEvent::Ipv4Validated {
-        ingress,
-        destination: plain.destination,
-    });
     trace.record(TraceEvent::Routed {
         egress,
         neighbor_target: plain.target,
     });
     apply_ipv4_rewrite(packet.bytes_mut(), plain.rewrite)?;
+    if let Some((plan, runtime)) = firewall {
+        runtime
+            .commit(plan)
+            .expect("sequential packet path keeps firewall plan authority stable");
+    }
     let irb = |id: IfId| bridges.is_some_and(|bridges| bridges.irb_of(id).is_some());
     crate::overlay::transmit_member(packet, egress, None, outer, irb, trace)
 }
