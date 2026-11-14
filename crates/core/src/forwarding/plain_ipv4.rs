@@ -459,6 +459,8 @@ where
                 })
                 .flatten()
                 .filter(|plain| plain.through == Through::Forward && !plain.observe_tcp)
+                // The kernel's interface is the owner's to write to.
+                .filter(|plain| !all_vrfs.is_kernel_ingress(plain.egress()))
         };
         let Some(plain) = decided else {
             hand(ingress, packet.bytes_mut());
