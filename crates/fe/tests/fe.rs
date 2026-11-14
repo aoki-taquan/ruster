@@ -870,6 +870,120 @@ fn an_interface_in_another_vrf_uses_that_vrf_s_routes_and_a_lookup_reaches_defau
     assert!(bench.fe.io_mut().pop_tx().is_none());
 }
 
+/// With a second worker, a packet it receives that needs no state is forwarded
+/// out of its own backend; one for the router is handed to worker 0, which
+/// writes it to the kernel. Table changes are answered once both workers moved.
+#[test]
+fn a_second_worker_forwards_plain_packets_and_hands_the_rest_to_the_first() {
+    let mut bench = Bench {
+        fe: Fe::with_workers(
+            SimIo::new(),
+            vec![SimIo::new()],
+            vec!["lan".into(), "wan".into()],
+        ),
+        now: 0,
+    };
+    let (_config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    let code = bench.patch(&mut neighbors, &[neighbor("wan", GATEWAY, GATEWAY_MAC)]);
+    assert_eq!(code, Code::CHANGED);
+    let (fe_end, kernel) = UnixDatagram::pair().unwrap();
+    fe_end.set_nonblocking(true).unwrap();
+    kernel.set_nonblocking(true).unwrap();
+    bench.fe.attach_local("default", Box::new(fe_end));
+
+    bench
+        .fe
+        .worker_io_mut(1)
+        .unwrap()
+        .inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(1);
+    let tx = bench
+        .fe
+        .worker_io_mut(1)
+        .unwrap()
+        .pop_tx()
+        .expect("forwarded by the second worker");
+    assert_eq!(tx.egress, IfId(1));
+    assert_eq!(&tx.bytes[6..12], &WAN_MAC);
+    assert!(bench.fe.io_mut().pop_tx().is_none());
+
+    let mut to_router = udp_from_host([192, 0, 2, 1]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&to_router[14..34]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+    bench
+        .fe
+        .worker_io_mut(1)
+        .unwrap()
+        .inject(IfId(0), to_router.clone());
+    bench.fe.step(2);
+    let mut buf = [0_u8; 2048];
+    let n = kernel
+        .recv(&mut buf)
+        .expect("written to the kernel by worker 0");
+    assert_eq!(&buf[..n], &to_router[14..]);
+    let counters = bench.fe.counters();
+    assert_eq!(counters.handed_to_owner, 1);
+    assert_eq!(counters.to_kernel, 1);
+    assert_eq!(counters.forwarded, 1);
+}
+
+/// With NAT, a packet the second worker receives from the inside is handed to
+/// worker 0, which translates it; its reply, to the public address, too.
+#[test]
+fn with_nat_a_second_worker_hands_what_nat_translates_to_the_first() {
+    let mut bench = Bench {
+        fe: Fe::with_workers(
+            SimIo::new(),
+            vec![SimIo::new()],
+            vec!["lan".into(), "wan".into()],
+        ),
+        now: 0,
+    };
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+        ],
+    );
+    assert_eq!(
+        bench.patch(&mut config, &[nat(40_000, 40_009)]),
+        Code::CHANGED
+    );
+    bench
+        .fe
+        .worker_io_mut(1)
+        .unwrap()
+        .inject(IfId(0), udp_from_host(INTERNET));
+    bench.fe.step(10);
+    assert!(bench.fe.worker_io_mut(1).unwrap().pop_tx().is_none());
+    let out = bench.fe.io_mut().pop_tx().expect("translated by worker 0");
+    assert_eq!(out.egress, IfId(1));
+    assert_eq!(&out.bytes[26..30], &[198, 51, 100, 2], "the WAN address");
+    let port = u16::from_be_bytes([out.bytes[34], out.bytes[35]]);
+
+    let mut reply = udp_reply_to_host();
+    reply[30..34].copy_from_slice(&[198, 51, 100, 2]);
+    reply[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&reply[14..34]);
+    reply[24..26].copy_from_slice(&checksum.to_be_bytes());
+    reply[36..38].copy_from_slice(&port.to_be_bytes());
+    bench.fe.worker_io_mut(1).unwrap().inject(IfId(1), reply);
+    bench.fe.step(20);
+    let back = bench
+        .fe
+        .io_mut()
+        .pop_tx()
+        .expect("translated back by worker 0");
+    assert_eq!(back.egress, IfId(0));
+    assert_eq!(&back.bytes[30..34], &[192, 0, 2, 10]);
+    assert_eq!(bench.fe.counters().handed_to_owner, 2);
+}
+
 /// With the handover's writes on a task of their own, what goes to the kernel is
 /// written when that task steps, and counted by the FE once it hears back; a pipe
 /// attached afterwards is written to as well.

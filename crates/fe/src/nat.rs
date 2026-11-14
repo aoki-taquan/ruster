@@ -83,6 +83,11 @@ pub(crate) struct Publication {
 }
 
 impl Publication {
+    /// Its UDP, TCP and ICMP query configurations.
+    pub(crate) fn configs(&self) -> (Nat44UdpConfig, Nat44TcpConfig, Nat44IcmpConfig) {
+        (self.udp, self.tcp, self.icmp)
+    }
+
     /// The configurations of `nat` for tables whose default VRF is `snapshot`.
     pub(crate) fn new(snapshot: &ForwardingSnapshot<'_>, nat: build::Nat) -> Result<Self, String> {
         let failed = |error: String| format!("nat: {error}");

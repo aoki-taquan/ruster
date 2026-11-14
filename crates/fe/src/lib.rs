@@ -41,6 +41,7 @@ use std::io::{self, ErrorKind};
 use std::net::IpAddr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,8 +50,8 @@ use ruster_core::{
     execute_one_icmpv4_error, execute_one_ipv4_fragmentation, forward_batch_with_control,
     ArpOpcode, ControlKind, ControlQueue, GeneratedIcmpv4Trace, GeneratedIcmpv4TraceSink,
     GeneratedPacketBatch, GeneratedPacketIo, Icmpv4ErrorActionSlot, Icmpv4ErrorPolicy,
-    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, MonotonicMillis, PacketIo, Services,
-    TraceEvent, TraceSink, VlanBinding,
+    Icmpv4ErrorRuntime, Icmpv4ErrorStateSlot, IfId, MonotonicMillis, Nat44IcmpConfig,
+    Nat44TcpConfig, Nat44UdpConfig, PacketIo, Services, TraceEvent, TraceSink, VlanBinding,
 };
 use ruster_proto::cbor::Encoder;
 use ruster_proto::punt::{self, Direction, Punt};
@@ -146,6 +147,9 @@ pub struct FeCounters {
     pub batches: u64,
     pub forwarded: u64,
     pub dropped: u64,
+    /// Packets the other workers handed to worker 0, which owns the state
+    /// ([`Fe::with_workers`]); worker 0 counts them again as it forwards them.
+    pub handed_to_owner: u64,
     pub arp_to_control: u64,
     pub arp_to_control_dropped: u64,
     pub resolve_requests: u64,
@@ -211,6 +215,119 @@ pub struct Fe<B> {
     /// `None` once detached.
     control: Option<ControlTask>,
     worker: Worker<B>,
+    /// The other workers ([`Fe::with_workers`]); empty once detached.
+    others: Vec<OtherWorker<B>>,
+    /// Their counters, kept after they are detached.
+    others_counters: Vec<Arc<OtherCounters>>,
+}
+
+/// What the control task sends a worker other than worker 0 with each version:
+/// the tables, and the NAT whose packets it hands over.
+#[derive(Clone)]
+struct ForOther {
+    tables: Arc<build::Built>,
+    nat: Option<(Nat44UdpConfig, Nat44TcpConfig, Nat44IcmpConfig)>,
+}
+
+/// The counters of a worker other than worker 0, read by [`Fe::counters`] from
+/// any thread.
+#[derive(Default)]
+struct OtherCounters {
+    batches: AtomicU64,
+    forwarded: AtomicU64,
+    dropped: AtomicU64,
+    handed: AtomicU64,
+}
+
+/// A worker other than worker 0 ([`Fe::with_workers`]): it forwards by itself
+/// only what needs no state (`ruster_core::forward_batch_stateless`) and hands
+/// every other packet to worker 0, which owns NAT, the firewall, the bridges and
+/// the connections to the control side.
+pub struct OtherWorker<B> {
+    io: B,
+    tables: Arc<build::Built>,
+    kernel_bits: Vec<u64>,
+    punt_frames: Vec<ruster_core::PuntFrameMatch>,
+    nat: Option<(Nat44UdpConfig, Nat44TcpConfig, Nat44IcmpConfig)>,
+    versions: Receiver<Box<ForOther>>,
+    to_control: Sender<FromWorker>,
+    to_owner: Sender<Vec<(IfId, Vec<u8>)>>,
+    counters: Arc<OtherCounters>,
+    gone: bool,
+}
+
+impl<B: PacketIo> OtherWorker<B> {
+    /// Whether the [`Fe`] it worked for is gone.
+    pub fn fe_gone(&self) -> bool {
+        self.gone
+    }
+
+    fn step(&mut self, now_ms: u64) -> bool {
+        let mut last = None;
+        loop {
+            match self.versions.try_recv() {
+                Ok(version) => last = Some(version),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.gone = true;
+                    break;
+                }
+            }
+        }
+        if let Some(version) = last {
+            self.kernel_bits = ruster_core::kernel_ingress_bits(&version.tables.kernel);
+            self.punt_frames = version.tables.punt.frame_matches();
+            self.nat = version.nat;
+            let old = std::mem::replace(&mut self.tables, version.tables);
+            self.gone |= self.to_control.send(FromWorker::OtherUsing(old)).is_err();
+        }
+        let tables = &*self.tables;
+        let snapshots = vrf_snapshots(tables, &self.kernel_bits, |_| false);
+        let snapshot = outer_snapshot(&snapshots, tables, &self.kernel_bits, &self.punt_frames)
+            .with_now(MonotonicMillis(now_ms));
+        let Ok(ports) = self.io.receive(RX_BUDGET) else {
+            return false;
+        };
+        let stateful = ruster_core::Stateful {
+            nat44_udp: self.nat.as_ref().map(|nat| &nat.0),
+            nat44_tcp: self.nat.as_ref().map(|nat| &nat.1),
+            nat44_icmp: self.nat.as_ref().map(|nat| &nat.2),
+            firewall: tables.firewall_on,
+            bridges: !tables.bridges.is_empty(),
+        };
+        let mut handed = Vec::new();
+        let report = ruster_core::forward_batch_stateless(
+            ports,
+            &snapshot,
+            stateful,
+            |ingress, frame| handed.push((ingress, frame.to_vec())),
+            &mut ruster_core::NoTrace,
+        );
+        if report.received == 0 {
+            return false;
+        }
+        let counters = &self.counters;
+        counters.batches.fetch_add(1, Ordering::Relaxed);
+        counters
+            .forwarded
+            .fetch_add(report.tx_requested as u64, Ordering::Relaxed);
+        counters
+            .dropped
+            .fetch_add(report.dropped as u64, Ordering::Relaxed);
+        counters
+            .handed
+            .fetch_add(handed.len() as u64, Ordering::Relaxed);
+        if !handed.is_empty() {
+            self.gone |= self.to_owner.send(handed).is_err();
+        }
+        true
+    }
+}
+
+impl<B: PacketIo> Task for OtherWorker<B> {
+    fn step(&mut self, now_ms: u64) -> Progress {
+        Progress::busy(OtherWorker::step(self, now_ms))
+    }
 }
 
 /// The control task of an [`Fe`], taken out of it by [`Fe::detach_control`] to be
@@ -287,6 +404,9 @@ enum FromWorker {
     /// The tables of a version the worker moved away from, to be freed here, not
     /// on the worker's thread.
     Retired(Arc<build::Built>),
+    /// Another worker ([`Fe::with_workers`]) now uses the last version sent, and
+    /// gives back the tables it moved away from.
+    OtherUsing(Arc<build::Built>),
 }
 
 /// The steps of the control task after which a [`FromWorker::Sync`] is answered
@@ -307,6 +427,11 @@ struct ControlTask {
     sync_wanted: Option<u64>,
     /// The steps that looked at the table connections since it was asked.
     sync_steps: u32,
+    /// The other workers' queues ([`Fe::with_workers`]).
+    others: Vec<Sender<Box<ForOther>>>,
+    /// How many of the other workers have not said yet that they use the last
+    /// version sent.
+    others_awaited: usize,
     /// A version was sent and the worker has not said yet that it uses it.
     ///
     /// Until it does, no further change is looked at: the next version must be built
@@ -324,16 +449,26 @@ impl ControlTask {
             FromWorker::Using(names) => {
                 self.builder.names = names;
                 self.awaiting_worker = false;
-                // The worker uses the version the changes are in: now their
-                // writers are told. (With the worker gone, nobody is: the FE is
-                // stopping.)
-                self.server.release_changed();
+                self.release_when_all_moved();
+            }
+            FromWorker::OtherUsing(tables) => {
+                drop(tables);
+                self.others_awaited = self.others_awaited.saturating_sub(1);
+                self.release_when_all_moved();
             }
             FromWorker::Sync(number) => {
                 self.sync_wanted = Some(number);
                 self.sync_steps = 0;
             }
             FromWorker::Retired(tables) => drop(tables),
+        }
+    }
+
+    /// Once every worker uses the version the changes are in, their writers are
+    /// told. (With the worker gone, nobody is: the FE is stopping.)
+    fn release_when_all_moved(&mut self) {
+        if !self.awaiting_worker && self.others_awaited == 0 {
+            self.server.release_changed();
         }
     }
 
@@ -348,14 +483,25 @@ impl ControlTask {
                 }
             }
         }
-        if self.awaiting_worker && !self.worker_gone {
+        if (self.awaiting_worker || self.others_awaited > 0) && !self.worker_gone {
             return Progress::IDLE;
         }
         let progress = self.server.step(&mut self.builder);
         // Of several versions built in one step, the last.
         if let Some(version) = self.builder.built.take() {
             let (built, publication, nat) = version;
-            let version = (Arc::new(built), publication, nat);
+            let built = Arc::new(built);
+            let other = ForOther {
+                tables: Arc::clone(&built),
+                nat: nat.as_ref().map(nat::Publication::configs),
+            };
+            self.others_awaited = 0;
+            for to_other in &self.others {
+                if to_other.send(Box::new(other.clone())).is_ok() {
+                    self.others_awaited += 1;
+                }
+            }
+            let version = (built, publication, nat);
             let sent = self.versions.send(ToWorker::Version(Box::new(version)));
             self.worker_gone |= sent.is_err();
             self.awaiting_worker = true;
@@ -456,6 +602,8 @@ struct Worker<B> {
     /// The time of the current step.
     now_ms: u64,
     counters: FeCounters,
+    /// What the other workers handed over, to be forwarded as received here.
+    from_others: Receiver<Vec<(IfId, Vec<u8>)>>,
 }
 
 impl<B> std::fmt::Debug for Fe<B> {
@@ -474,6 +622,12 @@ where
     /// `ports` names the backend's ports; port `i` is `IfId(i)`. The tables start empty,
     /// so nothing is forwarded until a writer adds interfaces and routes.
     pub fn new(io: B, ports: Vec<String>) -> Self {
+        Self::with_workers(io, Vec::new(), ports)
+    }
+
+    /// Like [`Fe::new`], with more workers on `others` (other queues of the same
+    /// ports): they forward what needs no state and hand the rest to the first.
+    pub fn with_workers(io: B, others: Vec<B>, ports: Vec<String>) -> Self {
         let mut builder = Builder {
             ports: ports.clone(),
             built: None,
@@ -490,6 +644,26 @@ where
         let limits = punt_table::Limits::new(&built.punt, built.vrfs.len());
         let (versions, from_control) = mpsc::channel();
         let (to_control, from_worker) = mpsc::channel();
+        let (to_owner, from_others) = mpsc::channel();
+        let mut to_others = Vec::new();
+        let mut other_workers = Vec::new();
+        for io in others {
+            let (to_other, versions) = mpsc::channel();
+            to_others.push(to_other);
+            other_workers.push(OtherWorker {
+                io,
+                tables: Arc::clone(&built),
+                kernel_bits: ruster_core::kernel_ingress_bits(&built.kernel),
+                punt_frames: Vec::new(),
+                nat: None,
+                versions,
+                to_control: to_control.clone(),
+                to_owner: to_owner.clone(),
+                counters: Arc::default(),
+                gone: false,
+            });
+        }
+        drop(to_owner);
         let mut server = Server::new();
         server.hold_changed();
         let control = ControlTask {
@@ -499,6 +673,8 @@ where
             from_worker,
             sync_wanted: None,
             sync_steps: 0,
+            others: to_others,
+            others_awaited: 0,
             awaiting_worker: false,
             worker_gone: false,
         };
@@ -539,11 +715,33 @@ where
             bridge_names: Vec::new(),
             now_ms: 0,
             counters: FeCounters::default(),
+            from_others,
         };
+        let others_counters = other_workers
+            .iter()
+            .map(|w| Arc::clone(&w.counters))
+            .collect();
         Self {
             control: Some(control),
             worker,
+            others: other_workers,
+            others_counters,
         }
+    }
+
+    /// The backend of worker `worker`: 0 is the one [`Fe::io_mut`] gives, the
+    /// others those given to [`Fe::with_workers`] (until detached).
+    pub fn worker_io_mut(&mut self, worker: usize) -> Option<&mut B> {
+        match worker {
+            0 => Some(&mut self.worker.io),
+            n => self.others.get_mut(n - 1).map(|other| &mut other.io),
+        }
+    }
+
+    /// Takes the other workers out ([`Fe::with_workers`]), each to be stepped on
+    /// a thread of its own. From then on [`Fe::step`] steps worker 0 only.
+    pub fn detach_workers(&mut self) -> Vec<OtherWorker<B>> {
+        std::mem::take(&mut self.others)
     }
 
     /// Accepts a table connection that may write `writes` (see [`writers`]).
@@ -756,6 +954,12 @@ where
 
     pub fn counters(&self) -> FeCounters {
         let mut counters = self.worker.counters;
+        for other in &self.others_counters {
+            counters.batches += other.batches.load(Ordering::Relaxed);
+            counters.forwarded += other.forwarded.load(Ordering::Relaxed);
+            counters.dropped += other.dropped.load(Ordering::Relaxed);
+            counters.handed_to_owner += other.handed.load(Ordering::Relaxed);
+        }
         for b in self.worker.bridges.table.counters() {
             counters.bridge_learned += b.learned;
             counters.bridge_moved += b.moved;
@@ -1121,41 +1325,26 @@ where
         };
         let handed_in = kernel_frames.len();
         kernel_frames.append(&mut self.reassembled);
+        // What the other workers handed over joins as if received here.
+        while kernel_frames.len() < RX_BUDGET {
+            let Ok(handed) = self.from_others.try_recv() else {
+                break;
+            };
+            kernel_frames.extend(
+                handed
+                    .iter()
+                    .map(|(ingress, frame)| kernel::Frame::from_ethernet(*ingress, frame)),
+            );
+        }
         // One snapshot per VRF; each packet uses its ingress interface's.
-        let snapshots: Vec<_> = self
-            .tables
-            .vrfs
-            .iter()
-            .zip(&self.tables.names)
-            .map(|(vrf, name)| {
-                vrf.owner
-                    .snapshot()
-                    .with_arp_to_control(true)
-                    .with_ipv6(&vrf.ipv6)
-                    .with_local_to_control(self.handover.has_local(name))
-                    .with_kernel_ingress(&self.tables.kernel)
-                    .with_kernel_ingress_bits(&self.kernel_bits)
-                    .with_vlans(&self.tables.vlans)
-                    .with_tunnels(&self.tables.tunnels)
-                    .with_srv6(&self.tables.srv6)
-                    .with_unreachable_neighbors(&self.tables.unreachable)
-                    .with_pppoe(&self.tables.pppoe)
-            })
-            .collect();
+        let tables = &*self.tables;
+        let handover = &self.handover;
+        let snapshots = vrf_snapshots(tables, &self.kernel_bits, |name| handover.has_local(name));
         let mut firewall = self.firewall.as_mut().and_then(firewall::Firewall::service);
         // IPv6 goes through the firewall too; should its runtime be missing, IPv6 is
         // not forwarded through the default VRF rather than forwarded unchecked.
-        let snapshot = snapshots[0]
+        let snapshot = outer_snapshot(&snapshots, tables, &self.kernel_bits, &self.punt_frames)
             .with_now(MonotonicMillis(now_ms))
-            .with_vrfs(&snapshots, &self.tables.by_ingress)
-            .with_vlans(&self.tables.vlans)
-            .with_tunnels(&self.tables.tunnels)
-            .with_srv6(&self.tables.srv6)
-            .with_overlays(&self.tables.overlays)
-            .with_pppoe(&self.tables.pppoe)
-            .with_kernel_ingress(&self.tables.kernel)
-            .with_kernel_ingress_bits(&self.kernel_bits)
-            .with_punt_frames(&self.punt_frames)
             .with_ipv6_forwarding_blocked(firewall.is_some());
         let Ok(ports) = self.io.receive(RX_BUDGET) else {
             self.counters.from_kernel_dropped += kernel_frames.len() as u64;
@@ -1241,10 +1430,11 @@ where
             } else {
                 self.send_port(egress, None, frame.bytes())
             };
-            if sent {
-                self.counters.from_kernel += 1;
-            } else {
-                self.counters.from_kernel_dropped += 1;
+            match (frame.kernel, sent) {
+                (true, true) => self.counters.from_kernel += 1,
+                (true, false) => self.counters.from_kernel_dropped += 1,
+                (false, true) => {}
+                (false, false) => self.counters.dropped += 1,
             }
         }
 
@@ -2000,11 +2190,17 @@ where
     B: PacketIo + GeneratedPacketIo,
 {
     fn step(&mut self, now_ms: u64) -> Progress {
+        // The other workers first, so that what they hand over is forwarded in
+        // the same step.
+        let mut others = false;
+        for other in &mut self.others {
+            others |= other.step(now_ms);
+        }
         let Some(control) = &mut self.control else {
-            return Progress::busy(self.worker.step(now_ms));
+            return Progress::busy(self.worker.step(now_ms) || others);
         };
         let before = control.step();
-        let worked = self.worker.step(now_ms);
+        let worked = self.worker.step(now_ms) || others;
         // The worker's notifications go out now.
         let flushed = control.step();
         before.and(flushed).and(Progress::busy(worked))
@@ -2072,6 +2268,53 @@ struct Builder {
 }
 
 /// The id of the interface `name` (a port or a VLAN sub-interface) in `names`.
+/// One snapshot per VRF of `tables`; `local` says whether a VRF's traffic to the
+/// router goes to the kernel.
+fn vrf_snapshots<'t>(
+    tables: &'t build::Built,
+    kernel_bits: &'t [u64],
+    local: impl Fn(&str) -> bool,
+) -> Vec<ruster_core::ForwardingSnapshot<'t>> {
+    tables
+        .vrfs
+        .iter()
+        .zip(&tables.names)
+        .map(|(vrf, name)| {
+            vrf.owner
+                .snapshot()
+                .with_arp_to_control(true)
+                .with_ipv6(&vrf.ipv6)
+                .with_local_to_control(local(name))
+                .with_kernel_ingress(&tables.kernel)
+                .with_kernel_ingress_bits(kernel_bits)
+                .with_vlans(&tables.vlans)
+                .with_tunnels(&tables.tunnels)
+                .with_srv6(&tables.srv6)
+                .with_unreachable_neighbors(&tables.unreachable)
+                .with_pppoe(&tables.pppoe)
+        })
+        .collect()
+}
+
+/// The snapshot a batch is forwarded by: the default VRF's, with every VRF's.
+fn outer_snapshot<'t>(
+    snapshots: &'t [ruster_core::ForwardingSnapshot<'t>],
+    tables: &'t build::Built,
+    kernel_bits: &'t [u64],
+    punt_frames: &'t [ruster_core::PuntFrameMatch],
+) -> ruster_core::ForwardingSnapshot<'t> {
+    snapshots[0]
+        .with_vrfs(snapshots, &tables.by_ingress)
+        .with_vlans(&tables.vlans)
+        .with_tunnels(&tables.tunnels)
+        .with_srv6(&tables.srv6)
+        .with_overlays(&tables.overlays)
+        .with_pppoe(&tables.pppoe)
+        .with_kernel_ingress(&tables.kernel)
+        .with_kernel_ingress_bits(kernel_bits)
+        .with_punt_frames(punt_frames)
+}
+
 /// The name at `at`, if there is one.
 fn name_at(names: &[String], at: usize) -> Option<&str> {
     names.get(at).map(String::as_str)

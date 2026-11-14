@@ -38,6 +38,9 @@ pub(crate) struct Frame {
     ingress: IfId,
     buf: Vec<u8>,
     start: usize,
+    /// From the kernel, not a frame of a port (put back together, or handed over
+    /// by another worker).
+    pub(crate) kernel: bool,
 }
 
 impl Frame {
@@ -58,11 +61,12 @@ impl Frame {
             ingress,
             buf,
             start: HEADROOM,
+            kernel: true,
         }
     }
 
     /// `frame` (Ethernet) as it arrived on `ingress`: a packet the FE put back
-    /// together.
+    /// together, or one another worker handed over.
     pub(crate) fn from_ethernet(ingress: IfId, frame: &[u8]) -> Self {
         let mut buf = vec![0; HEADROOM + frame.len()];
         buf[HEADROOM..].copy_from_slice(frame);
@@ -70,6 +74,7 @@ impl Frame {
             ingress,
             buf,
             start: HEADROOM,
+            kernel: false,
         }
     }
 
