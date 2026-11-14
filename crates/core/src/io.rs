@@ -296,11 +296,15 @@ pub enum ConsumeReason {
     /// A frame a bridge floods, copied out to be sent out of each other member as
     /// generated frames after the batch. The received frame is recycled.
     BridgeFlooded,
+    /// A packet that needs state (NAT, the firewall, a bridge) or the control
+    /// side, handed to the worker that owns them
+    /// ([`crate::forward_batch_stateless`]). The received frame is recycled.
+    HandedToOwner,
 }
 
 impl ConsumeReason {
     /// Every reason in declaration order; `ALL[reason.index()] == reason`.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::ArpControl,
         Self::Ipv4LocalUnsupported,
         Self::Ipv4Fragmented,
@@ -312,6 +316,7 @@ impl ConsumeReason {
         Self::TunnelFragmentToControl,
         Self::PuntToControl,
         Self::BridgeFlooded,
+        Self::HandedToOwner,
     ];
 
     /// Dense index into [`Self::ALL`]. Exhaustive inside core, so a new
@@ -330,6 +335,7 @@ impl ConsumeReason {
             Self::TunnelFragmentToControl => 8,
             Self::PuntToControl => 9,
             Self::BridgeFlooded => 10,
+            Self::HandedToOwner => 11,
         }
     }
 
@@ -347,6 +353,7 @@ impl ConsumeReason {
             Self::TunnelFragmentToControl => "TUNNEL_FRAGMENT_TO_CONTROL",
             Self::PuntToControl => "PUNT_TO_CONTROL",
             Self::BridgeFlooded => "BRIDGE_FLOODED",
+            Self::HandedToOwner => "HANDED_TO_OWNER",
         }
     }
 }
@@ -558,6 +565,7 @@ mod tests {
                 "TUNNEL_FRAGMENT_TO_CONTROL",
                 "PUNT_TO_CONTROL",
                 "BRIDGE_FLOODED",
+                "HANDED_TO_OWNER",
             ]
         );
     }

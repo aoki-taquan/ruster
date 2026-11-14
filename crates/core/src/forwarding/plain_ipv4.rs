@@ -25,7 +25,7 @@
 //! compares both on random tables, rules, NAT configurations and frames.
 
 use super::*;
-use crate::{PacketLease, PacketSlot};
+use crate::{ConsumeReason, PacketBatch, PacketLease, PacketSlot};
 
 /// A datagram [`decide`] found plain: where it goes and what to write.
 #[derive(Clone, Copy)]
@@ -390,4 +390,117 @@ pub(super) fn send<S: PacketSlot, T: TraceSink>(
     }
     let irb = |id: IfId| bridges.is_some_and(|bridges| bridges.irb_of(id).is_some());
     crate::overlay::transmit_member(packet, egress, None, outer, irb, trace)
+}
+
+/// What [`forward_batch_stateless`] must leave to the worker that owns the
+/// state: the NAT configurations it tells NAT's packets by, and whether a
+/// forward firewall is on or the bridges are not empty (then every packet is
+/// handed over).
+#[derive(Clone, Copy, Default)]
+pub struct Stateful<'c> {
+    pub nat44_udp: Option<&'c Nat44UdpConfig>,
+    pub nat44_tcp: Option<&'c Nat44TcpConfig>,
+    pub nat44_icmp: Option<&'c Nat44IcmpConfig>,
+    pub firewall: bool,
+    pub bridges: bool,
+}
+
+/// Forwards the packets of `batch` that need no state, and hands every other
+/// one to `hand` (its ingress and its frame, both as received) for the worker
+/// that owns the state, which forwards it as if it had received it
+/// ([`crate::forward_batch_with_control`]). A packet is forwarded here only when
+/// it is a plain forward that NAT leaves alone, with no firewall and no bridge
+/// and not for the control side: the short way's own answer. It then ends, frame
+/// and trace, as the full way would end it. With VLAN sub-interfaces, a tagged
+/// frame is handed over as it is.
+pub fn forward_batch_stateless<B, T>(
+    mut batch: B,
+    snapshot: &ForwardingSnapshot<'_>,
+    stateful: Stateful<'_>,
+    mut hand: impl FnMut(IfId, &[u8]),
+    trace: &mut T,
+) -> BatchReport<B::Error>
+where
+    B: PacketBatch,
+    T: TraceSink,
+{
+    let all_vrfs = snapshot;
+    let nat = Nat {
+        udp: stateful.nat44_udp,
+        tcp: stateful.nat44_tcp,
+        icmp: stateful.nat44_icmp,
+    };
+    let everything = stateful.firewall || stateful.bridges;
+    let (mut received, mut tx_requested, mut dropped, mut consumed) = (0, 0, 0, 0);
+    while let Some(mut packet) = batch.next_packet() {
+        received += 1;
+        let ingress = packet.ingress();
+        let tagged = !all_vrfs.vlans.is_empty()
+            && packet.bytes_mut().get(12..14) == Some(&crate::vlan::TPID[..]);
+        let decided = if everything
+            || tagged
+            || (!all_vrfs.punt.is_empty()
+                && crate::punt::select(packet.bytes_mut(), ingress, all_vrfs.punt).is_some())
+        {
+            None
+        } else {
+            let snapshot = all_vrfs.for_ingress(ingress);
+            (!nat.any() || snapshot.authority() == all_vrfs.authority())
+                .then(|| {
+                    decide(
+                        packet.bytes_mut(),
+                        snapshot,
+                        all_vrfs,
+                        ingress,
+                        None,
+                        false,
+                        nat,
+                    )
+                })
+                .flatten()
+                .filter(|plain| plain.through == Through::Forward && !plain.observe_tcp)
+        };
+        let Some(plain) = decided else {
+            hand(ingress, packet.bytes_mut());
+            packet.consume(ConsumeReason::HandedToOwner);
+            consumed += 1;
+            continue;
+        };
+        validated(&plain, ingress, trace);
+        routed(&plain, trace);
+        match send(&mut packet, plain, None, all_vrfs, None, trace) {
+            Ok(port) => {
+                packet.commit(port);
+                tx_requested += 1;
+                trace.record(TraceEvent::TxRequested {
+                    egress: plain.egress(),
+                });
+            }
+            Err(reason) => {
+                packet.recycle(reason);
+                dropped += 1;
+                trace.record(TraceEvent::Dropped { ingress, reason });
+            }
+        }
+    }
+    let completion = batch.finish();
+    let report = BatchReport {
+        received,
+        tx_requested,
+        dropped,
+        consumed,
+        completion,
+    };
+    let invariants_hold = report.invariants_hold();
+    debug_assert!(
+        invariants_hold,
+        "backend batch accounting violates the forwarding contract"
+    );
+    if invariants_hold {
+        trace.record(TraceEvent::BatchCompleted {
+            tx_accepted: report.completion.tx_accepted,
+            tx_rejected: report.completion.tx_rejected,
+        });
+    }
+    report
 }
