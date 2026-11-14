@@ -60,10 +60,12 @@ pub fn open_sessions(
     )
     .map_err(bad)?;
     let mut all: Vec<Vec<NativeSession>> = Vec::with_capacity(workers as usize);
-    // The first port registers a UMEM with room for the frames of every
-    // other socket, so a frame received on one goes out of another without a
-    // copy. A socket that cannot join it gets its own.
-    let room = u32::try_from((devices.len() * workers as usize).saturating_sub(1))
+    // For each queue, the first port registers a UMEM with room for the frames
+    // of the queue's other sockets, so a frame received on one goes out of
+    // another without a copy. A socket that cannot join it gets its own. The
+    // workers of different queues never pass frames between them, so each
+    // queue's UMEM is its own.
+    let room = u32::try_from(devices.len().saturating_sub(1))
         .ok()
         .and_then(|others| others.checked_mul(FRAME_COUNT))
         .ok_or("too many devices")?;
@@ -72,7 +74,7 @@ pub fn open_sessions(
         for (at, device) in devices.iter().enumerate() {
             let config = SessionConfig::new(device, queue, bind_flags, rings, umem)
                 .map_err(|error| format!("{device} queue {queue}: {error:?}"))?;
-            let first = all.first().and_then(|q| q.first()).or(sessions.first());
+            let first = sessions.first();
             let joined = match first {
                 Some(first) => match open_retrying(|| first.open_sharing(&config)) {
                     Ok(session) => Some(session),
@@ -84,8 +86,8 @@ pub fn open_sessions(
                     }
                     Err(error) => {
                         eprintln!(
-                            "ruster-fe: {device} does not share the packet memory of {} \
-                         ({error:?}); packets between them are copied",
+                            "ruster-fe: {device} queue {queue} does not share the packet \
+                             memory of {} ({error:?}); packets between them are copied",
                             devices[0]
                         );
                         None
