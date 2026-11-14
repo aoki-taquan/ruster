@@ -132,8 +132,11 @@ const RESOLVE_INTERVAL_MS: u64 = 1_000;
 const RESOLVE_REMEMBERED: usize = 1_024;
 /// MAC addresses the bridges learn, all together.
 const BRIDGE_MACS: usize = 8_192;
-/// Flooded frames copied out in one batch; more are dropped and counted.
-const FLOOD_SLOTS: usize = RX_BUDGET;
+/// Flooded frames copied out in one batch; more are dropped and counted. A
+/// batch holds the ports' frames and, after them, what the kernel and the other
+/// workers ([`Fe::with_workers`]) handed in, which comes to at most about three
+/// times [`RX_BUDGET`].
+const FLOOD_SLOTS: usize = 3 * RX_BUDGET;
 /// Slots of the MAC address table looked at for aged entries per step.
 const AGING_PER_STEP: usize = 256;
 /// The largest frame accepted from the punt socket (Ethernet with a 1500-byte payload
