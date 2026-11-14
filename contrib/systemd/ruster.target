@@ -1,0 +1,6 @@
+[Unit]
+Description=ruster router
+Wants=ruster-netns.service ruster-fe.service ruster-ribd.service ruster-neighd.service ruster-confd.service
+
+[Install]
+WantedBy=multi-user.target

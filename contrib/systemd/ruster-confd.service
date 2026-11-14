@@ -1,0 +1,16 @@
+[Unit]
+Description=ruster configuration
+PartOf=ruster.target
+BindsTo=ruster-netns.service
+Wants=ruster-fe.service ruster-ribd.service ruster-neighd.service
+After=ruster-netns.service ruster-fe.service ruster-ribd.service ruster-neighd.service
+
+[Service]
+Type=notify
+NetworkNamespacePath=/run/netns/ruster
+# The file is read only while confd has no version kept in its state directory.
+ExecStart=/usr/local/bin/ruster-confd --kernel --state-dir /var/lib/ruster/confd /etc/ruster/router.toml
+StateDirectory=ruster/confd
+StateDirectoryMode=0700
+Restart=on-failure
+RestartSec=1

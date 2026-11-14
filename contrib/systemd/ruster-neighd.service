@@ -1,0 +1,13 @@
+[Unit]
+Description=ruster ARP and ND
+PartOf=ruster.target
+BindsTo=ruster-netns.service
+Wants=ruster-fe.service
+After=ruster-netns.service ruster-fe.service
+
+[Service]
+Type=notify
+NetworkNamespacePath=/run/netns/ruster
+ExecStart=/usr/local/bin/ruster-neighd
+Restart=on-failure
+RestartSec=1

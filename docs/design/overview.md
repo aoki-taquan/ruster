@@ -116,7 +116,7 @@ kernelはフォワーディングをしない（[`fe-ce-split.md`](fe-ce-split.m
 
 ## 起動と障害
 
-- systemdが起動する。順番は`ruster-fe`、`ruster-confd`、`ruster-ribd`と`ruster-neighd`、外のデーモン。
+- systemdが起動する（`contrib/systemd`）。順番は`ruster-fe`、`ruster-ribd`と`ruster-neighd`、`ruster-confd`、外のデーモン。
 - 起動直後のFEの表は空で、何も転送しない（どのインターフェースも有効になっていないため）。
 - **CEのプロセスが落ちたとき**: FEは表を最後の状態のまま保って転送を続ける。再起動したプロセスは
   自分の表を全部送り直す（送られなかったエントリはFEが消す）。
