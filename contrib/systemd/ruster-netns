@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Makes the router's network namespace and moves the FE's devices into it, or
+# gives the devices back and removes it.
+#
+#   ruster-netns up NAME DEVICE...
+#   ruster-netns down NAME DEVICE...
+#
+# The kernel in the namespace terminates traffic to the router only: confd makes
+# its addresses on TUN devices and replaces its default route, so the host's own
+# namespace keeps its addresses and routes. The FE's devices carry no kernel
+# address and sit in a VRF with no addresses, so the kernel never takes their
+# frames as its own (README「動かす」).
+set -euo pipefail
+
+usage() { echo "usage: ruster-netns up|down NAME DEVICE..." >&2; exit 2; }
+(( $# >= 3 )) || usage
+action=$1 ns=$2
+shift 2
+
+in_ns() { ip -n "$ns" "$@"; }
+
+up() {
+  [[ -e "/run/netns/$ns" ]] || ip netns add "$ns"
+  in_ns link set lo up
+  ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=0
+  in_ns link show vrf-ports >/dev/null 2>&1 || in_ns link add vrf-ports type vrf table 999
+  in_ns link set vrf-ports up
+  local dev
+  for dev in "$@"; do
+    # A device already moved by an earlier start is left where it is.
+    if ! in_ns link show "$dev" >/dev/null 2>&1; then
+      ip link set dev "$dev" netns "$ns"
+    fi
+    ip netns exec "$ns" sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"
+    in_ns link set "$dev" master vrf-ports
+    in_ns link set "$dev" up
+  done
+}
+
+down() {
+  [[ -e "/run/netns/$ns" ]] || return 0
+  local dev
+  for dev in "$@"; do
+    in_ns link show "$dev" >/dev/null 2>&1 || continue
+    in_ns link set "$dev" down nomaster
+    # Back to the host's namespace (that of process 1), so a later start finds it.
+    in_ns link set "$dev" netns 1
+  done
+  ip netns del "$ns"
+}
+
+case $action in
+  up) up "$@" ;;
+  down) down "$@" ;;
+  *) usage ;;
+esac

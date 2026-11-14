@@ -1,0 +1,14 @@
+[Unit]
+Description=ruster route selection
+PartOf=ruster.target
+BindsTo=ruster-netns.service
+Wants=ruster-fe.service
+After=ruster-netns.service ruster-fe.service
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/ruster/ruster.env
+NetworkNamespacePath=/run/netns/ruster
+ExecStart=/usr/local/bin/ruster-ribd $RUSTER_RIBD_SOURCES
+Restart=on-failure
+RestartSec=1
