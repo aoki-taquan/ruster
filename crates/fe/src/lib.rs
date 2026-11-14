@@ -237,7 +237,9 @@ struct ForOther {
 /// handed over (ingress, frame), and the next hops of those it forwarded, for
 /// the neighbors' "used" marks.
 struct Handed {
-    frames: Vec<(IfId, Vec<u8>)>,
+    /// As frames with room in front, so worker 0 forwards them without another
+    /// copy.
+    frames: Vec<kernel::Frame>,
     used: Vec<(u16, IpAddr)>,
     /// The tables the marks were made by, by address: marks made by others than
     /// worker 0's name other interfaces.
@@ -369,7 +371,7 @@ impl<B: PacketIo> OtherWorker<B> {
             ports,
             &snapshot,
             stateful,
-            |ingress, frame| handed.push((ingress, frame.to_vec())),
+            |ingress, frame| handed.push(kernel::Frame::from_ethernet(ingress, frame)),
             &mut used,
         );
         if report.received == 0 {
@@ -1462,12 +1464,7 @@ where
             let Ok(handed) = self.from_others.try_recv() else {
                 break;
             };
-            kernel_frames.extend(
-                handed
-                    .frames
-                    .iter()
-                    .map(|(ingress, frame)| kernel::Frame::from_ethernet(*ingress, frame)),
-            );
+            kernel_frames.extend(handed.frames);
             if handed.tables == Arc::as_ptr(&self.tables) as usize {
                 let room = USED_MAX.saturating_sub(self.used.len());
                 self.used.extend(handed.used.into_iter().take(room));
