@@ -907,6 +907,27 @@ fn a_second_worker_forwards_plain_packets_and_hands_the_rest_to_the_first() {
     assert_eq!(tx.egress, IfId(1));
     assert_eq!(&tx.bytes[6..12], &WAN_MAC);
     assert!(bench.fe.io_mut().pop_tx().is_none());
+    // The next hop it went to is marked used, as for worker 0's packets.
+    let (fe_end, neighd_end) = UnixDatagram::pair().unwrap();
+    neighd_end.set_nonblocking(true).unwrap();
+    bench.fe.attach_punt(fe_end).unwrap();
+    let mut ask = Vec::new();
+    Punt {
+        direction: Direction::FromControl,
+        reason: punt::reason::NEIGHBOR_USED,
+        interface: "lan",
+        frame: &[],
+    }
+    .encode(&mut ask)
+    .unwrap();
+    neighd_end.send(&ask).unwrap();
+    bench.fe.step(1);
+    let mut buf = [0_u8; 2048];
+    let n = neighd_end.recv(&mut buf).expect("the used marks");
+    let used = Punt::decode(&buf[..n]).unwrap();
+    assert_eq!(used.reason, punt::reason::NEIGHBOR_USED);
+    assert_eq!(used.interface, "wan");
+    assert_eq!(used.frame, &GATEWAY[..]);
 
     let mut to_router = udp_from_host([192, 0, 2, 1]);
     to_router[14 + 10..14 + 12].copy_from_slice(&[0, 0]);

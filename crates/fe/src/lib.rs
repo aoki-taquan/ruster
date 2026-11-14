@@ -229,6 +229,34 @@ struct ForOther {
     nat: Option<(Nat44UdpConfig, Nat44TcpConfig, Nat44IcmpConfig)>,
 }
 
+/// What a worker other than worker 0 sends it after a batch: the packets it
+/// handed over (ingress, frame), and the next hops of those it forwarded, for
+/// the neighbors' "used" marks.
+struct Handed {
+    frames: Vec<(IfId, Vec<u8>)>,
+    used: Vec<(u16, IpAddr)>,
+}
+
+/// Collects the next hops a batch's packets went to.
+#[derive(Default)]
+struct UsedMarks(Vec<(u16, IpAddr)>);
+
+impl TraceSink for UsedMarks {
+    fn record(&mut self, event: TraceEvent) {
+        let next_hop = match event {
+            TraceEvent::Routed {
+                egress,
+                neighbor_target,
+            } => (egress.0, IpAddr::V4(neighbor_target.octets().into())),
+            TraceEvent::Ipv6Routed { egress, next_hop } => (egress.0, IpAddr::V6(next_hop.into())),
+            _ => return,
+        };
+        if self.0.last() != Some(&next_hop) {
+            self.0.push(next_hop);
+        }
+    }
+}
+
 /// The counters of a worker other than worker 0, read by [`Fe::counters`] from
 /// any thread.
 #[derive(Default)]
@@ -251,7 +279,7 @@ pub struct OtherWorker<B> {
     nat: Option<(Nat44UdpConfig, Nat44TcpConfig, Nat44IcmpConfig)>,
     versions: Receiver<Box<ForOther>>,
     to_control: Sender<FromWorker>,
-    to_owner: Sender<Vec<(IfId, Vec<u8>)>>,
+    to_owner: Sender<Handed>,
     counters: Arc<OtherCounters>,
     gone: bool,
 }
@@ -296,12 +324,13 @@ impl<B: PacketIo> OtherWorker<B> {
             bridges: !tables.bridges.is_empty(),
         };
         let mut handed = Vec::new();
+        let mut used = UsedMarks::default();
         let report = ruster_core::forward_batch_stateless(
             ports,
             &snapshot,
             stateful,
             |ingress, frame| handed.push((ingress, frame.to_vec())),
-            &mut ruster_core::NoTrace,
+            &mut used,
         );
         if report.received == 0 {
             return false;
@@ -317,7 +346,11 @@ impl<B: PacketIo> OtherWorker<B> {
         counters
             .handed
             .fetch_add(handed.len() as u64, Ordering::Relaxed);
-        if !handed.is_empty() {
+        if !handed.is_empty() || !used.0.is_empty() {
+            let handed = Handed {
+                frames: handed,
+                used: used.0,
+            };
             self.gone |= self.to_owner.send(handed).is_err();
         }
         true
@@ -603,7 +636,7 @@ struct Worker<B> {
     now_ms: u64,
     counters: FeCounters,
     /// What the other workers handed over, to be forwarded as received here.
-    from_others: Receiver<Vec<(IfId, Vec<u8>)>>,
+    from_others: Receiver<Handed>,
 }
 
 impl<B> std::fmt::Debug for Fe<B> {
@@ -1332,9 +1365,11 @@ where
             };
             kernel_frames.extend(
                 handed
+                    .frames
                     .iter()
                     .map(|(ingress, frame)| kernel::Frame::from_ethernet(*ingress, frame)),
             );
+            self.used.extend(handed.used);
         }
         // One snapshot per VRF; each packet uses its ingress interface's.
         let tables = &*self.tables;
