@@ -41,6 +41,9 @@ mod xdp_program;
 #[path = "native_unsafe/abi.rs"]
 pub mod abi;
 mod native_unsafe {
+    #[cfg(target_os = "linux")]
+    #[path = "affinity.rs"]
+    pub(super) mod affinity;
     #[cfg(test)]
     #[path = "heap_kernel.rs"]
     pub(super) mod heap_kernel;
@@ -89,6 +92,8 @@ pub use error::{
     AbiLayoutError, NativeRingError, NativeSyscallPlatformError, PlatformError, RingField,
     RingMapError,
 };
+#[cfg(target_os = "linux")]
+pub use native_unsafe::affinity::pin_current_thread;
 pub use native_unsafe::kick::{KickDeferral, KickError, KickOutcome, RxWait, RxWaitError};
 #[cfg(all(
     target_os = "linux",

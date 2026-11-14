@@ -29,6 +29,8 @@ const DRAIN_ROUNDS: u32 = 8;
 pub struct Options {
     pub attach: XdpAttachMode,
     pub zero_copy: bool,
+    /// Poll for packets without waiting while idle.
+    pub busy_poll: bool,
 }
 
 /// Opens one socket on each of queues 0 to `workers - 1` of each device, all on
@@ -197,13 +199,16 @@ pub struct Waiter {
     /// How long to wait for input while idle, up to [`crate::IDLE_LONGEST_MS`].
     idle: daemon::Idle,
     ready_unused: bool,
+    /// Never wait: poll again at once.
+    busy_poll: bool,
 }
 
-impl Default for Waiter {
-    fn default() -> Self {
+impl Waiter {
+    pub fn new(busy_poll: bool) -> Self {
         Self {
             idle: daemon::Idle::up_to(crate::IDLE_LONGEST_MS),
             ready_unused: false,
+            busy_poll,
         }
     }
 }
@@ -222,6 +227,9 @@ impl Backend<XdpPacketIo<'_>> for Waiter {
         // Reap completions, retry owed kicks and refill Fill while idle.
         io.service()
             .map_err(|error| format!("the packet backend stopped: {error:?}"))?;
+        if self.busy_poll {
+            return Ok(());
+        }
         if self.ready_unused || !io.can_wait() {
             self.ready_unused = false;
             thread::sleep(daemon::IDLE_MAX);
