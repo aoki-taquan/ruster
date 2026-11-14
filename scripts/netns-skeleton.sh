@@ -10,6 +10,9 @@
 # FE_BACKEND=af-packet selects the FE's AF_PACKET backend (af-xdp by default).
 set -euo pipefail
 backend=${FE_BACKEND:-af-xdp}
+# FE_WORKERS=N runs the FE with N forwarding workers, one per queue of devices
+# that have N queues (AF_XDP only).
+workers=${FE_WORKERS:-1}
 
 bin=$(realpath "${1:-target/debug}")
 for name in ruster-fe ruster-ribd ruster-neighd ruster-confd ruster; do
@@ -41,8 +44,11 @@ listening() {
 }
 
 # The router's devices carry no kernel address: the kernel must leave them to the FE.
-ip link add a0 netns "$host_a" type veth peer name ra netns "$router"
-ip link add b0 netns "$host_b" type veth peer name rb netns "$router"
+queues="numtxqueues $workers numrxqueues $workers"
+# shellcheck disable=SC2086
+ip link add a0 netns "$host_a" $queues type veth peer name ra netns "$router" $queues
+# shellcheck disable=SC2086
+ip link add b0 netns "$host_b" $queues type veth peer name rb netns "$router" $queues
 nsx "$router" sysctl -qw net.ipv4.ip_forward=0
 for dev in ra rb; do
   nsx "$router" sysctl -qw "net.ipv6.conf.$dev.disable_ipv6=1"
@@ -107,7 +113,7 @@ start() {
 }
 args_of() {
   case $1 in
-    ruster-fe) echo "--backend $backend ra rb" ;;
+    ruster-fe) echo "--backend $backend --workers $workers ra rb" ;;
     ruster-confd) echo "--kernel $work/router.toml" ;;
     ruster-ribd) echo "confd:1 routed:20" ;;
     *) echo "" ;;

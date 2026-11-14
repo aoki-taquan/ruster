@@ -300,6 +300,25 @@ pub struct OtherWorker<B> {
     gone: bool,
 }
 
+impl OtherWorker<()> {
+    /// The worker, forwarding on `io`.
+    pub fn with_io<B>(self, io: B) -> OtherWorker<B> {
+        OtherWorker {
+            io,
+            tables: self.tables,
+            kernel_bits: self.kernel_bits,
+            punt_frames: self.punt_frames,
+            nat: self.nat,
+            versions: self.versions,
+            to_control: self.to_control,
+            to_owner: self.to_owner,
+            hand_all: self.hand_all,
+            counters: self.counters,
+            gone: self.gone,
+        }
+    }
+}
+
 impl<B: PacketIo> OtherWorker<B> {
     /// Whether the [`Fe`] it worked for is gone.
     pub fn fe_gone(&self) -> bool {
@@ -693,6 +712,24 @@ where
     /// Like [`Fe::new`], with more workers on `others` (other queues of the same
     /// ports): they forward what needs no state and hand the rest to the first.
     pub fn with_workers(io: B, others: Vec<B>, ports: Vec<String>) -> Self {
+        let (mut fe, seeds) = Self::with_worker_seeds(io, others.len(), ports);
+        fe.others = seeds
+            .into_iter()
+            .zip(others)
+            .map(|(seed, io)| seed.with_io(io))
+            .collect();
+        fe
+    }
+
+    /// Like [`Fe::with_workers`] with `others` workers not in the `Fe` and not yet
+    /// given their backends: each is given its own with [`OtherWorker::with_io`],
+    /// on its own thread (a backend that cannot move between threads is opened
+    /// there), and stepped there.
+    pub fn with_worker_seeds(
+        io: B,
+        others: usize,
+        ports: Vec<String>,
+    ) -> (Self, Vec<OtherWorker<()>>) {
         let mut builder = Builder {
             ports: ports.clone(),
             built: None,
@@ -713,11 +750,11 @@ where
         let hand_all = Arc::new(AtomicBool::new(false));
         let mut to_others = Vec::new();
         let mut other_workers = Vec::new();
-        for io in others {
+        for _ in 0..others {
             let (to_other, versions) = mpsc::channel();
             to_others.push(to_other);
             other_workers.push(OtherWorker {
-                io,
+                io: (),
                 tables: Arc::clone(&built),
                 kernel_bits: ruster_core::kernel_ingress_bits(&built.kernel),
                 punt_frames: Vec::new(),
@@ -789,12 +826,13 @@ where
             .iter()
             .map(|w| Arc::clone(&w.counters))
             .collect();
-        Self {
+        let fe = Self {
             control: Some(control),
             worker,
-            others: other_workers,
+            others: Vec::new(),
             others_counters,
-        }
+        };
+        (fe, other_workers)
     }
 
     /// The backend of worker `worker`: 0 is the one [`Fe::io_mut`] gives, the
