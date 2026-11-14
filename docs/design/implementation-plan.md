@@ -292,9 +292,12 @@ lookupを通して届く先だけを作り直す。100万経路とlookup-vrfの�
    （2026-11-13 owner決定）。NATやfirewallやブリッジの設定では速くならないが、動きは今と同じ。
 5. 状態の持ち主を決めて、workerの間で渡す（firewall、NAT、フラグメントの組み立て、解決待ちの順）。
    持ち主の計算に使うhash関数は、ここに入る前に決める。
-6. workerの数、固定するコア、待ち方を起動時の引数にする。省いたときはworker一つ。workerの数は
-   `ruster-fe --workers N`（AF_XDPだけ、#838）。コアの固定と待ち方はまだ。コアの固定にはsystem callが
-   要り、今のFEのcrateは`unsafe`を禁じているので、やり方（I/O層に足す、外部crate）を決めてから。
+6. workerの数、固定するコア、待ち方を起動時の引数にする（済み、#838と次のPR）。`ruster-fe --workers N`
+   （AF_XDPだけ）、`--cpus A,B,...`（workerごとのCPU。system callはI/O層の`pin_current_thread`、
+   2026-11-14 owner決定）、`--busy-poll`（待たずに回り続ける）。省いたときはworker一つで、待つ。
+
+5.は、`--workers`の効果を複数queueのNICの実機で測り、worker 0が詰まると分かってから決める
+（2026-11-14 owner決定）。
 
 FEの一回りと表の切り替えで、手の入っていなかった所は測って直した（#813〜#823、2026-11-13）。sim、
 release buildで、パケットの無い一回り0.23µs、素のIPv4の転送が1パケット約450ns（`ruster-bench`のcoreだけで

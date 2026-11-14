@@ -1,5 +1,6 @@
 //! `ruster-fe [--run-dir DIR] [--backend af-xdp|af-packet] [--xdp-attach native|generic]
-//! [--zero-copy] [--one-thread] [--workers N] DEVICE...`: the FE on Linux.
+//! [--zero-copy] [--one-thread] [--workers N] [--cpus A,B,...] [--busy-poll] DEVICE...`:
+//! the FE on Linux.
 //!
 //! Each DEVICE is a Linux network device and becomes the port of the same name: the
 //! interface names in the tables are the device names. The FE listens on the table
@@ -11,6 +12,9 @@
 //!   on a thread of its own: the first owns NAT, the firewall, the bridges and the
 //!   control side, and the others hand it every packet that needs them. Packets
 //!   on queues from N up are dropped, so the devices should have N queues.
+//!   `--cpus` pins worker `i` to the `i`th CPU of the list (one for each
+//!   worker), and `--busy-poll` keeps the workers polling instead of waiting for
+//!   packets: less delay, a whole core each.
 //! - The table connections are served, and each version of the tables built, on a
 //!   thread of their own, so forwarding goes on while a large version is built.
 //!   What goes to the kernel, the TAP devices and the control processes is written
@@ -70,6 +74,8 @@ struct Args {
     one_thread: bool,
     /// Forwarding workers, one per queue of each device (AF_XDP only).
     workers: u32,
+    /// The CPU each worker is pinned to, in worker order; none when empty.
+    cpus: Vec<usize>,
     devices: Vec<String>,
 }
 
@@ -81,9 +87,11 @@ fn args() -> Result<Args, String> {
         xdp: af_xdp::Options {
             attach: XdpAttachMode::Native,
             zero_copy: false,
+            busy_poll: false,
         },
         one_thread: false,
         workers: 1,
+        cpus: Vec::new(),
         devices: Vec::new(),
     };
     let mut rest = rest.into_iter();
@@ -101,6 +109,14 @@ fn args() -> Result<Args, String> {
             },
             "--zero-copy" => args.xdp.zero_copy = true,
             "--one-thread" => args.one_thread = true,
+            "--cpus" => {
+                args.cpus = rest
+                    .next()
+                    .map(|list| list.split(',').map(str::parse).collect::<Result<_, _>>())
+                    .and_then(Result::ok)
+                    .ok_or("--cpus is a list of CPU numbers, such as 2,3")?;
+            }
+            "--busy-poll" => args.xdp.busy_poll = true,
             "--workers" => {
                 args.workers = rest
                     .next()
@@ -118,6 +134,12 @@ fn args() -> Result<Args, String> {
     if args.workers > 1 && (args.af_packet || args.one_thread) {
         return Err("--workers needs the af-xdp backend and its own threads".into());
     }
+    if !args.cpus.is_empty() && args.cpus.len() != args.workers as usize {
+        return Err("--cpus names one CPU for each worker".into());
+    }
+    if (!args.cpus.is_empty() || args.xdp.busy_poll) && args.af_packet {
+        return Err("--cpus and --busy-poll need the af-xdp backend".into());
+    }
     Ok(args)
 }
 
@@ -131,7 +153,7 @@ fn run() -> Result<(), String> {
         let mut sessions = af_xdp::open_sessions(&args.devices, args.xdp, args.workers)?;
         let (first, others) = sessions.split_at_mut(1);
         let io = af_xdp::packet_io(&mut first[0], 0)?;
-        serve(io, others, af_xdp::Waiter::default(), &args)
+        serve(io, others, af_xdp::Waiter::new(args.xdp.busy_poll), &args)
     }
 }
 
@@ -188,16 +210,20 @@ where
             .spawn(move || handover_loop(handover))
             .map_err(|error| format!("starting the handover thread: {error}"))?;
     }
+    let (cpus, busy_poll) = (&args.cpus, args.xdp.busy_poll);
+    pin(cpus.first())?;
     std::thread::scope(|scope| {
         for (at, (seed, sessions)) in seeds.into_iter().zip(others.iter_mut()).enumerate() {
             let queue = at + 1;
             std::thread::Builder::new()
                 .name(format!("worker {queue}"))
-                .spawn_scoped(scope, move || match af_xdp::packet_io(sessions, queue) {
-                    Ok(io) => other_loop(seed.with_io(io), af_xdp::Waiter::default()),
-                    Err(error) => {
-                        eprintln!("ruster-fe: worker {queue}: {error}");
-                        WORKER_FAILED.store(true, Ordering::Relaxed);
+                .spawn_scoped(scope, move || {
+                    match pin(cpus.get(queue)).and_then(|()| af_xdp::packet_io(sessions, queue)) {
+                        Ok(io) => other_loop(seed.with_io(io), af_xdp::Waiter::new(busy_poll)),
+                        Err(error) => {
+                            eprintln!("ruster-fe: worker {queue}: {error}");
+                            WORKER_FAILED.store(true, Ordering::Relaxed);
+                        }
                     }
                 })
                 .map_err(|error| format!("starting worker {queue}: {error}"))?;
@@ -232,6 +258,15 @@ where
     let until = clock.now_ms().saturating_add(DRAIN_MS);
     while !waiter.drain(other.io_mut()) && clock.now_ms() < until && !signal::force_requested() {
         std::thread::sleep(daemon::IDLE_MAX);
+    }
+}
+
+/// Pins the calling thread to `cpu`, if one is given.
+fn pin(cpu: Option<&usize>) -> Result<(), String> {
+    match cpu {
+        Some(&cpu) => ruster_io_xdp_native::pin_current_thread(cpu)
+            .map_err(|error| format!("pinning to CPU {cpu}: {error}")),
+        None => Ok(()),
     }
 }
 

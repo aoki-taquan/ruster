@@ -17,8 +17,9 @@ for backend in af-xdp af-packet; do
     fi
   done
 done
-# The skeleton again with two forwarding workers on two queues.
-if FE_BACKEND=af-xdp FE_WORKERS=2 bash "$here/netns-skeleton.sh" "$bin" >/dev/null 2>&1; then
+# The skeleton again with two forwarding workers on two queues, pinned and
+# polling.
+if FE_BACKEND=af-xdp FE_WORKERS=2 FE_EXTRA="--cpus 0,1 --busy-poll" bash "$here/netns-skeleton.sh" "$bin" >/dev/null 2>&1; then
   echo "pass  af-xdp netns-skeleton (2 workers)"
 else
   echo "FAIL  af-xdp netns-skeleton (2 workers)"

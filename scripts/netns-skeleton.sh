@@ -13,6 +13,8 @@ backend=${FE_BACKEND:-af-xdp}
 # FE_WORKERS=N runs the FE with N forwarding workers, one per queue of devices
 # that have N queues (AF_XDP only).
 workers=${FE_WORKERS:-1}
+# FE_EXTRA adds options to the FE's (such as --cpus 0,1 --busy-poll).
+fe_extra=${FE_EXTRA:-}
 
 bin=$(realpath "${1:-target/debug}")
 for name in ruster-fe ruster-ribd ruster-neighd ruster-confd ruster; do
@@ -113,7 +115,7 @@ start() {
 }
 args_of() {
   case $1 in
-    ruster-fe) echo "--backend $backend --workers $workers ra rb" ;;
+    ruster-fe) echo "--backend $backend --workers $workers $fe_extra ra rb" ;;
     ruster-confd) echo "--kernel $work/router.toml" ;;
     ruster-ribd) echo "confd:1 routed:20" ;;
     *) echo "" ;;
