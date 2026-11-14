@@ -41,8 +41,10 @@ use std::io::{self, ErrorKind};
 use std::net::IpAddr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{
+    self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError,
+};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -150,6 +152,8 @@ pub struct FeCounters {
     /// Packets the other workers handed to worker 0, which owns the state
     /// ([`Fe::with_workers`]); worker 0 counts them again as it forwards them.
     pub handed_to_owner: u64,
+    /// Those dropped because worker 0's queue was full.
+    pub handed_dropped: u64,
     pub arp_to_control: u64,
     pub arp_to_control_dropped: u64,
     pub resolve_requests: u64,
@@ -235,7 +239,14 @@ struct ForOther {
 struct Handed {
     frames: Vec<(IfId, Vec<u8>)>,
     used: Vec<(u16, IpAddr)>,
+    /// The tables the marks were made by, by address: marks made by others than
+    /// worker 0's name other interfaces.
+    tables: usize,
 }
+
+/// How many batches the other workers may have handed over and worker 0 not
+/// taken yet; more are dropped and counted.
+const HANDED_QUEUED: usize = 16;
 
 /// Collects the next hops a batch's packets went to.
 #[derive(Default)]
@@ -265,6 +276,7 @@ struct OtherCounters {
     forwarded: AtomicU64,
     dropped: AtomicU64,
     handed: AtomicU64,
+    handed_dropped: AtomicU64,
 }
 
 /// A worker other than worker 0 ([`Fe::with_workers`]): it forwards by itself
@@ -279,7 +291,11 @@ pub struct OtherWorker<B> {
     nat: Option<(Nat44UdpConfig, Nat44TcpConfig, Nat44IcmpConfig)>,
     versions: Receiver<Box<ForOther>>,
     to_control: Sender<FromWorker>,
-    to_owner: Sender<Handed>,
+    to_owner: SyncSender<Handed>,
+    /// Set while worker 0's NAT or firewall is still bound to older tables (it
+    /// could not move them): then every packet is handed over, as worker 0 drops
+    /// what that NAT or firewall would have handled.
+    hand_all: Arc<AtomicBool>,
     counters: Arc<OtherCounters>,
     gone: bool,
 }
@@ -288,6 +304,11 @@ impl<B: PacketIo> OtherWorker<B> {
     /// Whether the [`Fe`] it worked for is gone.
     pub fn fe_gone(&self) -> bool {
         self.gone
+    }
+
+    /// Its backend.
+    pub fn io_mut(&mut self) -> &mut B {
+        &mut self.io
     }
 
     fn step(&mut self, now_ms: u64) -> bool {
@@ -320,7 +341,7 @@ impl<B: PacketIo> OtherWorker<B> {
             nat44_udp: self.nat.as_ref().map(|nat| &nat.0),
             nat44_tcp: self.nat.as_ref().map(|nat| &nat.1),
             nat44_icmp: self.nat.as_ref().map(|nat| &nat.2),
-            firewall: tables.firewall_on,
+            firewall: tables.firewall_on || self.hand_all.load(Ordering::Relaxed),
             bridges: !tables.bridges.is_empty(),
         };
         let mut handed = Vec::new();
@@ -343,15 +364,23 @@ impl<B: PacketIo> OtherWorker<B> {
         counters
             .dropped
             .fetch_add(report.dropped as u64, Ordering::Relaxed);
-        counters
-            .handed
-            .fetch_add(handed.len() as u64, Ordering::Relaxed);
         if !handed.is_empty() || !used.0.is_empty() {
+            let count = handed.len() as u64;
             let handed = Handed {
                 frames: handed,
                 used: used.0,
+                tables: Arc::as_ptr(&self.tables) as usize,
             };
-            self.gone |= self.to_owner.send(handed).is_err();
+            match self.to_owner.try_send(handed) {
+                Ok(()) => counters.handed.fetch_add(count, Ordering::Relaxed),
+                Err(TrySendError::Full(_)) => {
+                    counters.handed_dropped.fetch_add(count, Ordering::Relaxed)
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.gone = true;
+                    0
+                }
+            };
         }
         true
     }
@@ -637,6 +666,9 @@ struct Worker<B> {
     counters: FeCounters,
     /// What the other workers handed over, to be forwarded as received here.
     from_others: Receiver<Handed>,
+    /// Told to the other workers: this worker's NAT or firewall could not move
+    /// to the tables in use.
+    hand_all: Arc<AtomicBool>,
 }
 
 impl<B> std::fmt::Debug for Fe<B> {
@@ -677,7 +709,8 @@ where
         let limits = punt_table::Limits::new(&built.punt, built.vrfs.len());
         let (versions, from_control) = mpsc::channel();
         let (to_control, from_worker) = mpsc::channel();
-        let (to_owner, from_others) = mpsc::channel();
+        let (to_owner, from_others) = mpsc::sync_channel(HANDED_QUEUED);
+        let hand_all = Arc::new(AtomicBool::new(false));
         let mut to_others = Vec::new();
         let mut other_workers = Vec::new();
         for io in others {
@@ -692,6 +725,7 @@ where
                 versions,
                 to_control: to_control.clone(),
                 to_owner: to_owner.clone(),
+                hand_all: Arc::clone(&hand_all),
                 counters: Arc::default(),
                 gone: false,
             });
@@ -749,6 +783,7 @@ where
             now_ms: 0,
             counters: FeCounters::default(),
             from_others,
+            hand_all,
         };
         let others_counters = other_workers
             .iter()
@@ -772,7 +807,9 @@ where
     }
 
     /// Takes the other workers out ([`Fe::with_workers`]), each to be stepped on
-    /// a thread of its own. From then on [`Fe::step`] steps worker 0 only.
+    /// a thread of its own. From then on [`Fe::step`] steps worker 0 only. Each
+    /// must keep being stepped while the `Fe` runs: the control task answers a
+    /// table change only once every worker moved to it.
     pub fn detach_workers(&mut self) -> Vec<OtherWorker<B>> {
         std::mem::take(&mut self.others)
     }
@@ -992,6 +1029,7 @@ where
             counters.forwarded += other.forwarded.load(Ordering::Relaxed);
             counters.dropped += other.dropped.load(Ordering::Relaxed);
             counters.handed_to_owner += other.handed.load(Ordering::Relaxed);
+            counters.handed_dropped += other.handed_dropped.load(Ordering::Relaxed);
         }
         for b in self.worker.bridges.table.counters() {
             counters.bridge_learned += b.learned;
@@ -1104,6 +1142,25 @@ where
         } else {
             self.spare.push(bytes);
             self.count_written(to, false);
+        }
+    }
+
+    /// Writes a port's `frame` that core sent to kernel interface `egress`, within
+    /// the punt limits, and counts it.
+    fn counted_to_kernel(&mut self, egress: IfId, frame: &[u8], now_ms: u64) {
+        let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
+        let vrf = self
+            .tables
+            .kernel
+            .iter()
+            .position(|&kernel| kernel == egress);
+        // From the kernel itself: by its kind, as no interface names it.
+        let class = punt_table::built_in(local::kind(packet));
+        if self.admit_to_kernel(class, vrf, now_ms) && self.write_kernel(egress, frame) {
+            self.counters.to_kernel += 1;
+            self.limits.handed(class);
+        } else {
+            self.counters.to_kernel_dropped += 1;
         }
     }
 
@@ -1256,8 +1313,10 @@ where
         self.used.clear();
         // As for the firewall: a NAT that cannot move stays bound to the old
         // tables, and core drops what it would have translated.
+        let mut stuck = false;
         if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {
             eprintln!("ruster-fe: {error}");
+            stuck = true;
         }
         // Until a move succeeds the old firewall stays, bound to the old tables:
         // core then drops what it would have checked.
@@ -1282,7 +1341,9 @@ where
             next[0].with_vrfs(&next, &built.by_ingress),
         ) {
             eprintln!("ruster-fe: {error}");
+            stuck = true;
         }
+        self.hand_all.store(stuck, Ordering::Relaxed);
         if self.tables.names != built.names {
             // The per-VRF buckets start again.
             self.limits.update(&built.punt, 0);
@@ -1369,7 +1430,10 @@ where
                     .iter()
                     .map(|(ingress, frame)| kernel::Frame::from_ethernet(*ingress, frame)),
             );
-            self.used.extend(handed.used);
+            if handed.tables == Arc::as_ptr(&self.tables) as usize {
+                let room = USED_MAX.saturating_sub(self.used.len());
+                self.used.extend(handed.used.into_iter().take(room));
+            }
         }
         // One snapshot per VRF; each packet uses its ingress interface's.
         let tables = &*self.tables;
@@ -1444,22 +1508,15 @@ where
         self.counters.overlay_dropped += trace.overlay_dropped;
         self.counters.from_kernel_dropped += from_kernel.dropped;
         for (egress, frame) in from_kernel.to_kernel {
-            let packet = frame.get(ETHERNET_HEADER..).unwrap_or_default();
-            let vrf = self
-                .tables
-                .kernel
-                .iter()
-                .position(|&kernel| kernel == egress);
-            // From the kernel itself: by its kind, as no interface names it.
-            let class = punt_table::built_in(local::kind(packet));
-            if self.admit_to_kernel(class, vrf, now_ms) && self.write_kernel(egress, &frame) {
-                self.counters.to_kernel += 1;
-                self.limits.handed(class);
-            } else {
-                self.counters.to_kernel_dropped += 1;
-            }
+            self.counted_to_kernel(egress, &frame, now_ms);
         }
-        for (egress, frame) in from_kernel.sent {
+        // A frame of a port handed over by another worker, to the kernel: as one
+        // received here (the punt limits and counts).
+        let (handed_to_kernel, sent): (Vec<_>, Vec<_>) = from_kernel
+            .sent
+            .into_iter()
+            .partition(|(egress, frame)| !frame.kernel && self.tables.kernel.contains(egress));
+        for (egress, frame) in sent {
             let sent = if self.tables.kernel.contains(&egress) {
                 self.write_kernel(egress, frame.bytes())
             } else {
@@ -1471,6 +1528,9 @@ where
                 (false, true) => {}
                 (false, false) => self.counters.dropped += 1,
             }
+        }
+        for (egress, frame) in handed_to_kernel {
+            self.counted_to_kernel(egress, frame.bytes(), now_ms);
         }
 
         // Until one cannot be built or allocated (it stays queued for the next batch).

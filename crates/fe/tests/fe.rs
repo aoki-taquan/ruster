@@ -1005,6 +1005,34 @@ fn with_nat_a_second_worker_hands_what_nat_translates_to_the_first() {
     assert_eq!(bench.fe.counters().handed_to_owner, 2);
 }
 
+/// What a second worker hands over waits in a queue of a few batches; when
+/// worker 0 does not take them, the rest is dropped and counted.
+#[test]
+fn a_second_worker_drops_what_worker_0_has_no_room_for() {
+    let mut bench = Bench {
+        fe: Fe::with_workers(
+            SimIo::new(),
+            vec![SimIo::new()],
+            vec!["lan".into(), "wan".into()],
+        ),
+        now: 0,
+    };
+    let (_config, _routes) = configure(&mut bench);
+    let mut second = bench.fe.detach_workers().pop().expect("a second worker");
+    let mut to_router = udp_from_host([192, 0, 2, 1]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&[0, 0]);
+    let checksum = ipv4_header_checksum(&to_router[14..34]);
+    to_router[14 + 10..14 + 12].copy_from_slice(&checksum.to_be_bytes());
+    for step in 0..40 {
+        second.io_mut().inject(IfId(0), to_router.clone());
+        assert!(Task::step(&mut second, step).busy);
+    }
+    let counters = bench.fe.counters();
+    assert!(counters.handed_to_owner > 0);
+    assert!(counters.handed_dropped > 0);
+    assert_eq!(counters.handed_to_owner + counters.handed_dropped, 40);
+}
+
 /// With the handover's writes on a task of their own, what goes to the kernel is
 /// written when that task steps, and counted by the FE once it hears back; a pipe
 /// attached afterwards is written to as well.
