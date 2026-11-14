@@ -9,7 +9,8 @@
 //!   takes the frames away from the kernel. Copy mode unless `--zero-copy`. With
 //!   `--workers N`, queues 0 to N-1 of each device, one forwarding worker each
 //!   on a thread of its own: the first owns NAT, the firewall, the bridges and the
-//!   control side, and the others hand it every packet that needs them.
+//!   control side, and the others hand it every packet that needs them. Packets
+//!   on queues from N up are dropped, so the devices should have N queues.
 //! - The table connections are served, and each version of the tables built, on a
 //!   thread of their own, so forwarding goes on while a large version is built.
 //!   What goes to the kernel, the TAP devices and the control processes is written
@@ -17,6 +18,8 @@
 //!   between batches.
 //! - `af-packet` receives copies: the kernel still sees every frame, so the devices
 //!   must carry no kernel address or route, and the kernel must not forward on them.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod af_packet;
 mod af_xdp;
@@ -192,12 +195,16 @@ where
                 .name(format!("worker {queue}"))
                 .spawn_scoped(scope, move || match af_xdp::packet_io(sessions, queue) {
                     Ok(io) => other_loop(seed.with_io(io), af_xdp::Waiter::default()),
-                    Err(error) => eprintln!("ruster-fe: worker {queue}: {error}"),
+                    Err(error) => {
+                        eprintln!("ruster-fe: worker {queue}: {error}");
+                        WORKER_FAILED.store(true, Ordering::Relaxed);
+                    }
                 })
                 .map_err(|error| format!("starting worker {queue}: {error}"))?;
         }
         let result = run_loop(&mut fe, &mut waiter, &listeners);
-        // The other workers see it gone and stop.
+        // However the first worker stopped, the others stop too.
+        WORKERS_STOP.store(true, Ordering::Relaxed);
         drop(fe);
         result
     })
@@ -211,17 +218,27 @@ where
     W: Backend<B>,
 {
     let clock = Clock::new();
-    while !other.fe_gone() && !signal::stop_requested() {
+    while !other.fe_gone() && !signal::stop_requested() && !WORKERS_STOP.load(Ordering::Relaxed) {
         let now = clock.now_ms();
         waiter.set_clock(other.io_mut(), MonotonicMillis(now));
         let busy = other.step(now).busy;
         if let Err(error) = waiter.after_step(other.io_mut(), busy) {
+            // Its queue's packets would go nowhere: the FE stops.
             eprintln!("ruster-fe: {error}");
+            WORKER_FAILED.store(true, Ordering::Relaxed);
             return;
         }
     }
-    waiter.drain(other.io_mut());
+    let until = clock.now_ms().saturating_add(DRAIN_MS);
+    while !waiter.drain(other.io_mut()) && clock.now_ms() < until && !signal::force_requested() {
+        std::thread::sleep(daemon::IDLE_MAX);
+    }
 }
+
+/// Set when the first worker's loop ended, for the others to stop.
+static WORKERS_STOP: AtomicBool = AtomicBool::new(false);
+/// Set when another worker stopped on an error, for the FE to stop.
+static WORKER_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Serves the table connections and builds the versions of the tables, until the
 /// FE is gone or a connection cannot be taken. The forwarding thread sees that this
@@ -291,6 +308,9 @@ where
         }
         if fe.control_gone() {
             return Err("the control thread stopped".into());
+        }
+        if WORKER_FAILED.load(Ordering::Relaxed) {
+            return Err("a forwarding worker stopped".into());
         }
         waiter.set_clock(fe.io_mut(), MonotonicMillis(now));
         for (listener, writes) in listeners {
