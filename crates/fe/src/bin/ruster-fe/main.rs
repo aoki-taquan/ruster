@@ -1,12 +1,16 @@
 //! `ruster-fe [--run-dir DIR] [--backend af-xdp|af-packet] [--xdp-attach native|generic]
-//! [--zero-copy] [--one-thread] DEVICE...`: the FE on Linux.
+//! [--zero-copy] [--one-thread] [--workers N] DEVICE...`: the FE on Linux.
 //!
 //! Each DEVICE is a Linux network device and becomes the port of the same name: the
 //! interface names in the tables are the device names. The FE listens on the table
 //! sockets in the socket directory and forwards by what the writers send.
 //!
 //! - `af-xdp` (the default) attaches an XDP program to queue 0 of each device and
-//!   takes the frames away from the kernel. Copy mode unless `--zero-copy`.
+//!   takes the frames away from the kernel. Copy mode unless `--zero-copy`. With
+//!   `--workers N`, queues 0 to N-1 of each device, one forwarding worker each
+//!   on a thread of its own: the first owns NAT, the firewall, the bridges and the
+//!   control side, and the others hand it every packet that needs them. Packets
+//!   on queues from N up are dropped, so the devices should have N queues.
 //! - The table connections are served, and each version of the tables built, on a
 //!   thread of their own, so forwarding goes on while a large version is built.
 //!   What goes to the kernel, the TAP devices and the control processes is written
@@ -14,6 +18,8 @@
 //!   between batches.
 //! - `af-packet` receives copies: the kernel still sees every frame, so the devices
 //!   must carry no kernel address or route, and the kernel must not forward on them.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod af_packet;
 mod af_xdp;
@@ -25,7 +31,7 @@ use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
 
 use ruster_core::{GeneratedPacketIo, MonotonicMillis, PacketIo};
-use ruster_fe::{writers, Control, Fe, HandoverTask};
+use ruster_fe::{writers, Control, Fe, HandoverTask, OtherWorker};
 use ruster_io_xdp_native::XdpAttachMode;
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
@@ -62,6 +68,8 @@ struct Args {
     xdp: af_xdp::Options,
     /// The control task on the forwarding thread, not on one of its own.
     one_thread: bool,
+    /// Forwarding workers, one per queue of each device (AF_XDP only).
+    workers: u32,
     devices: Vec<String>,
 }
 
@@ -75,6 +83,7 @@ fn args() -> Result<Args, String> {
             zero_copy: false,
         },
         one_thread: false,
+        workers: 1,
         devices: Vec::new(),
     };
     let mut rest = rest.into_iter();
@@ -92,12 +101,22 @@ fn args() -> Result<Args, String> {
             },
             "--zero-copy" => args.xdp.zero_copy = true,
             "--one-thread" => args.one_thread = true,
+            "--workers" => {
+                args.workers = rest
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .filter(|&n| (1..=64).contains(&n))
+                    .ok_or("--workers is a number from 1 to 64")?;
+            }
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ => args.devices.push(arg),
         }
     }
     if args.devices.is_empty() {
         return Err("give at least one device".into());
+    }
+    if args.workers > 1 && (args.af_packet || args.one_thread) {
+        return Err("--workers needs the af-xdp backend and its own threads".into());
     }
     Ok(args)
 }
@@ -107,20 +126,28 @@ fn run() -> Result<(), String> {
     signal::install().map_err(|name| format!("installing the {name} handler"))?;
     if args.af_packet {
         let io = af_packet::open(&args.devices)?;
-        serve(io, af_packet::Waiter::default(), &args)
+        serve(io, &mut [], af_packet::Waiter::default(), &args)
     } else {
-        let mut sessions = af_xdp::open_sessions(&args.devices, args.xdp)?;
-        let io = af_xdp::packet_io(&mut sessions)?;
-        serve(io, af_xdp::Waiter::default(), &args)
+        let mut sessions = af_xdp::open_sessions(&args.devices, args.xdp, args.workers)?;
+        let (first, others) = sessions.split_at_mut(1);
+        let io = af_xdp::packet_io(&mut first[0], 0)?;
+        serve(io, others, af_xdp::Waiter::default(), &args)
     }
 }
 
-fn serve<B, W>(io: B, mut waiter: W, args: &Args) -> Result<(), String>
+/// Runs the FE on `io` (queue 0 of each device), with one more worker on each of
+/// `others` (the AF_XDP sessions of queue 1, 2 and so on, by device).
+fn serve<B, W>(
+    io: B,
+    others: &mut [Vec<af_xdp::NativeSession>],
+    mut waiter: W,
+    args: &Args,
+) -> Result<(), String>
 where
     B: PacketIo + GeneratedPacketIo,
     W: Backend<B>,
 {
-    let mut fe = Fe::new(io, args.devices.clone());
+    let (mut fe, seeds) = Fe::with_worker_seeds(io, others.len(), args.devices.clone());
     let path = |name: &str| args.run_dir.join(name);
     let mut listeners: Vec<(UnixListener, &'static [u64])> = Vec::new();
     for (name, writes) in [
@@ -161,8 +188,57 @@ where
             .spawn(move || handover_loop(handover))
             .map_err(|error| format!("starting the handover thread: {error}"))?;
     }
-    run_loop(&mut fe, &mut waiter, &listeners)
+    std::thread::scope(|scope| {
+        for (at, (seed, sessions)) in seeds.into_iter().zip(others.iter_mut()).enumerate() {
+            let queue = at + 1;
+            std::thread::Builder::new()
+                .name(format!("worker {queue}"))
+                .spawn_scoped(scope, move || match af_xdp::packet_io(sessions, queue) {
+                    Ok(io) => other_loop(seed.with_io(io), af_xdp::Waiter::default()),
+                    Err(error) => {
+                        eprintln!("ruster-fe: worker {queue}: {error}");
+                        WORKER_FAILED.store(true, Ordering::Relaxed);
+                    }
+                })
+                .map_err(|error| format!("starting worker {queue}: {error}"))?;
+        }
+        let result = run_loop(&mut fe, &mut waiter, &listeners);
+        // However the first worker stopped, the others stop too.
+        WORKERS_STOP.store(true, Ordering::Relaxed);
+        drop(fe);
+        result
+    })
 }
+
+/// Steps a worker other than the first until the FE is gone or a stop is asked
+/// for.
+fn other_loop<B, W>(mut other: OtherWorker<B>, mut waiter: W)
+where
+    B: PacketIo,
+    W: Backend<B>,
+{
+    let clock = Clock::new();
+    while !other.fe_gone() && !signal::stop_requested() && !WORKERS_STOP.load(Ordering::Relaxed) {
+        let now = clock.now_ms();
+        waiter.set_clock(other.io_mut(), MonotonicMillis(now));
+        let busy = other.step(now).busy;
+        if let Err(error) = waiter.after_step(other.io_mut(), busy) {
+            // Its queue's packets would go nowhere: the FE stops.
+            eprintln!("ruster-fe: {error}");
+            WORKER_FAILED.store(true, Ordering::Relaxed);
+            return;
+        }
+    }
+    let until = clock.now_ms().saturating_add(DRAIN_MS);
+    while !waiter.drain(other.io_mut()) && clock.now_ms() < until && !signal::force_requested() {
+        std::thread::sleep(daemon::IDLE_MAX);
+    }
+}
+
+/// Set when the first worker's loop ended, for the others to stop.
+static WORKERS_STOP: AtomicBool = AtomicBool::new(false);
+/// Set when another worker stopped on an error, for the FE to stop.
+static WORKER_FAILED: AtomicBool = AtomicBool::new(false);
 
 /// Serves the table connections and builds the versions of the tables, until the
 /// FE is gone or a connection cannot be taken. The forwarding thread sees that this
@@ -232,6 +308,9 @@ where
         }
         if fe.control_gone() {
             return Err("the control thread stopped".into());
+        }
+        if WORKER_FAILED.load(Ordering::Relaxed) {
+            return Err("a forwarding worker stopped".into());
         }
         waiter.set_clock(fe.io_mut(), MonotonicMillis(now));
         for (listener, writes) in listeners {

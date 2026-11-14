@@ -7,9 +7,10 @@ use ruster_core::{IfId, MonotonicMillis};
 use ruster_io_xdp::native_profile::{
     RingConfig, UmemConfig, ValidatedBindFlags, XDP_COPY, XDP_USE_NEED_WAKEUP, XDP_ZEROCOPY,
 };
+pub use ruster_io_xdp_native::NativeSession;
 use ruster_io_xdp_native::{
-    NativeSession, RxFillConfig, RxFillEngine, RxWait, SessionConfig, SessionError, SessionFailure,
-    SessionStage, UmemDomainId, XdpAttachMode, XdpPacketIo, XdpPort, XdpPortConfig,
+    RxFillConfig, RxFillEngine, RxWait, SessionConfig, SessionError, SessionFailure, SessionStage,
+    UmemDomainId, XdpAttachMode, XdpPacketIo, XdpPort, XdpPortConfig,
 };
 use ruster_proto::daemon;
 
@@ -30,9 +31,14 @@ pub struct Options {
     pub zero_copy: bool,
 }
 
-/// Opens one socket on queue 0 of each device, all on one UMEM where the devices
-/// allow it, and attaches the XDP program.
-pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeSession>, String> {
+/// Opens one socket on each of queues 0 to `workers - 1` of each device, all on
+/// one UMEM where the devices allow it, and attaches the XDP program; the
+/// sessions by queue, then by device.
+pub fn open_sessions(
+    devices: &[String],
+    options: Options,
+    workers: u32,
+) -> Result<Vec<Vec<NativeSession>>, String> {
     let mode = if options.zero_copy {
         XDP_ZEROCOPY
     } else {
@@ -51,51 +57,66 @@ pub fn open_sessions(devices: &[String], options: Options) -> Result<Vec<NativeS
         0,
     )
     .map_err(bad)?;
-    let mut sessions: Vec<NativeSession> = Vec::with_capacity(devices.len());
+    let mut all: Vec<Vec<NativeSession>> = Vec::with_capacity(workers as usize);
     // The first port registers a UMEM with room for the frames of every
-    // other port, so a frame received on one goes out of another without a
-    // copy. A port that cannot join it gets its own.
-    let room = u32::try_from(devices.len().saturating_sub(1))
+    // other socket, so a frame received on one goes out of another without a
+    // copy. A socket that cannot join it gets its own.
+    let room = u32::try_from((devices.len() * workers as usize).saturating_sub(1))
         .ok()
         .and_then(|others| others.checked_mul(FRAME_COUNT))
         .ok_or("too many devices")?;
-    for device in devices {
-        let config = SessionConfig::new(device, 0, bind_flags, rings, umem)
-            .map_err(|error| format!("{device}: {error:?}"))?;
-        let joined = match sessions.first() {
-            Some(first) => match open_retrying(|| first.open_sharing(&config)) {
-                Ok(session) => Some(session),
-                // Anything else (a queue still busy, no memory) would fail
-                // an own UMEM too, or pass and leave the port copying for
-                // good: the start fails instead.
-                Err(error) if !cannot_share(error) => {
-                    return Err(format!("{device}: {error:?}"));
-                }
-                Err(error) => {
-                    eprintln!(
-                        "ruster-fe: {device} does not share the packet memory of {} \
+    for queue in 0..workers {
+        let mut sessions: Vec<NativeSession> = Vec::with_capacity(devices.len());
+        for (at, device) in devices.iter().enumerate() {
+            let config = SessionConfig::new(device, queue, bind_flags, rings, umem)
+                .map_err(|error| format!("{device} queue {queue}: {error:?}"))?;
+            let first = all.first().and_then(|q| q.first()).or(sessions.first());
+            let joined = match first {
+                Some(first) => match open_retrying(|| first.open_sharing(&config)) {
+                    Ok(session) => Some(session),
+                    // Anything else (a queue still busy, no memory) would fail
+                    // an own UMEM too, or pass and leave the port copying for
+                    // good: the start fails instead.
+                    Err(error) if !cannot_share(error) => {
+                        return Err(format!("{device}: {error:?}"));
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "ruster-fe: {device} does not share the packet memory of {} \
                          ({error:?}); packets between them are copied",
-                        devices[0]
-                    );
-                    None
+                            devices[0]
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            let mut session = match joined {
+                Some(session) => session,
+                None => {
+                    let room = if first.is_none() { room } else { 0 };
+                    open_retrying(|| NativeSession::open_with_room(&config, room))
+                        .map_err(|error| format!("{device}: {error:?}"))?
                 }
-            },
-            None => None,
-        };
-        let mut session = match joined {
-            Some(session) => session,
-            None => {
-                let room = if sessions.is_empty() { room } else { 0 };
-                open_retrying(|| NativeSession::open_with_room(&config, room))
-                    .map_err(|error| format!("{device}: {error:?}"))?
+            };
+            match all.first() {
+                // Queue 0's session attaches the program for every queue; the
+                // others join it.
+                Some(queue_0) => session
+                    .join_xdp(&queue_0[at])
+                    .map_err(|error| format!("{device} queue {queue}: joining XDP: {error:?}"))?,
+                None if workers > 1 => session
+                    .attach_xdp_queues(options.attach, workers)
+                    .map_err(|error| format!("{device}: attaching XDP: {error:?}"))?,
+                None => session
+                    .attach_xdp(options.attach)
+                    .map_err(|error| format!("{device}: attaching XDP: {error:?}"))?,
             }
-        };
-        session
-            .attach_xdp(options.attach)
-            .map_err(|error| format!("{device}: attaching XDP: {error:?}"))?;
-        sessions.push(session);
+            sessions.push(session);
+        }
+        all.push(sessions);
     }
-    Ok(sessions)
+    Ok(all)
 }
 
 /// Whether a failed join means that this device cannot use the first one's UMEM
@@ -141,15 +162,15 @@ fn open_retrying(
     }
 }
 
-fn domain(interface: IfId) -> UmemDomainId {
+fn domain(queue: usize, interface: IfId) -> UmemDomainId {
     // A tag keeps these apart from domains other code may make.
     const TAG: u128 = 0x7275_7374_6572_2d66_6500_0000_0000_0000;
-    let id = TAG | u128::from(interface.0);
+    let id = TAG | (queue as u128) << 16 | u128::from(interface.0);
     UmemDomainId::new(NonZeroU128::new(id).unwrap_or(NonZeroU128::MIN))
 }
 
-/// The packet I/O over the opened sessions; port `i` is `IfId(i)`.
-pub fn packet_io(sessions: &mut [NativeSession]) -> Result<XdpPacketIo<'_>, String> {
+/// The packet I/O over the opened sessions of one queue; port `i` is `IfId(i)`.
+pub fn packet_io(sessions: &mut [NativeSession], queue: usize) -> Result<XdpPacketIo<'_>, String> {
     let mut ports = Vec::with_capacity(sessions.len());
     for (index, session) in sessions.iter_mut().enumerate() {
         let interface = u16::try_from(index)
@@ -162,7 +183,7 @@ pub fn packet_io(sessions: &mut [NativeSession]) -> Result<XdpPacketIo<'_>, Stri
         let fill_batch = datapath.capacities()[0];
         let engine = RxFillEngine::new(
             datapath,
-            domain(interface),
+            domain(queue, interface),
             RxFillConfig::new(NonZeroU32::new(fill_batch).unwrap_or(NonZeroU32::MIN)),
         )
         .map_err(|error| format!("{error:?}"))?;
