@@ -1,10 +1,9 @@
 [Unit]
 Description=ruster bridge to FRR
 PartOf=ruster.target
-Before=frr.service
 BindsTo=ruster-netns.service
-Wants=ruster-confd.service
-After=ruster-netns.service ruster-confd.service ruster-ribd.service
+Wants=ruster-confd.service frr.service
+After=ruster-netns.service ruster-confd.service ruster-ribd.service frr.service
 
 [Service]
 Type=notify
