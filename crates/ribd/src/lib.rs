@@ -30,11 +30,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::net::IpAddr;
 use std::os::unix::net::UnixStream;
 
 use ruster_proto::session::{Client, Event, Hook, Server, Store};
 use ruster_proto::sid;
-use ruster_proto::table::{Change, Key, RouteAction, Value};
+use ruster_proto::table::{network, Change, Key, RouteAction, Value};
 use ruster_proto::task::{Progress, Task};
 
 pub mod resolve;
@@ -85,10 +86,56 @@ struct Source {
     server: Server,
     /// How many of its routes give their next hops as gateways only.
     gateways: usize,
+    /// The gateway addresses of those routes, by VRF, and how many routes give each.
+    gateway_addresses: BTreeMap<(String, IpAddr), usize>,
 }
 
 fn is_gateways(value: Option<&Value>) -> bool {
     matches!(value, Some(Value::Route(RouteAction::Gateways(_))))
+}
+
+/// The VRF and gateway addresses of a gateway route.
+fn gateways_of<'a>(key: &'a Key, value: Option<&'a Value>) -> Option<(&'a str, &'a [IpAddr])> {
+    match (key, value) {
+        (Key::Route { vrf, .. }, Some(Value::Route(RouteAction::Gateways(gateways)))) => {
+            Some((vrf.as_str(), gateways.as_slice()))
+        }
+        _ => None,
+    }
+}
+
+fn count_gateways(
+    addresses: &mut BTreeMap<(String, IpAddr), usize>,
+    key: &Key,
+    value: Option<&Value>,
+    add: bool,
+) {
+    let Some((vrf, gateways)) = gateways_of(key, value) else {
+        return;
+    };
+    for &gateway in gateways {
+        let entry = (vrf.to_owned(), gateway);
+        if add {
+            *addresses.entry(entry).or_default() += 1;
+        } else if let Some(count) = addresses.get_mut(&entry) {
+            *count -= 1;
+            if *count == 0 {
+                addresses.remove(&entry);
+            }
+        }
+    }
+}
+
+/// The last address of a prefix.
+fn last_address(prefix: IpAddr, len: u8) -> IpAddr {
+    match network(prefix, len) {
+        IpAddr::V4(a) => {
+            IpAddr::V4((u32::from(a) | u32::MAX.checked_shr(u32::from(len)).unwrap_or(0)).into())
+        }
+        IpAddr::V6(a) => {
+            IpAddr::V6((u128::from(a) | u128::MAX.checked_shr(u32::from(len)).unwrap_or(0)).into())
+        }
+    }
 }
 
 /// Notes what changed in a source's table.
@@ -101,6 +148,7 @@ struct Changed<'a> {
     /// The entries its patches touched are added here.
     touched: &'a mut BTreeSet<Key>,
     gateways: &'a mut usize,
+    gateway_addresses: &'a mut BTreeMap<(String, IpAddr), usize>,
 }
 
 impl Hook for Changed<'_> {
@@ -110,6 +158,10 @@ impl Hook for Changed<'_> {
             .iter()
             .filter(|(_, value)| is_gateways(Some(value)))
             .count();
+        self.gateway_addresses.clear();
+        for (key, value) in next.iter() {
+            count_gateways(self.gateway_addresses, key, Some(value), true);
+        }
         Ok(())
     }
 
@@ -125,6 +177,8 @@ impl Hook for Changed<'_> {
             if is_gateways(next.get(key)) {
                 *self.gateways += 1;
             }
+            count_gateways(self.gateway_addresses, key, *before, false);
+            count_gateways(self.gateway_addresses, key, next.get(key), true);
             self.touched.insert((*key).clone());
         }
         Ok(())
@@ -210,6 +264,7 @@ impl Ribd {
                     spec,
                     server: Server::new(),
                     gateways: 0,
+                    gateway_addresses: BTreeMap::new(),
                 })
                 .collect(),
             options,
@@ -304,11 +359,19 @@ impl Ribd {
             self.dirty = true;
             return false;
         }
-        // A route given by its gateways is resolved through the other routes, so a
-        // change of any route may change it: with one, every route is gone through.
-        let whole = self.whole || self.sources.iter().any(|source| source.gateways > 0);
         let touched = std::mem::take(&mut self.touched);
+        // A route given by its gateways is resolved through the other routes. When a
+        // touched route may be what a gateway matches, or a touched gateway route
+        // matches another gateway route, every route is gone through.
+        let mut whole = self.whole || self.gateways_reached(&touched);
         self.whole = false;
+        let mut changes = Vec::new();
+        if !whole {
+            match self.changes_of(&touched) {
+                Some(of) => changes = of,
+                None => whole = true,
+            }
+        }
         if whole {
             let selected = self.selected();
             self.queued.clear();
@@ -328,7 +391,7 @@ impl Ribd {
             for key in &touched {
                 self.queued.remove(key);
             }
-            for change in self.changes_of(touched) {
+            for change in changes {
                 self.queued.insert(change.key.clone(), change);
             }
         }
@@ -363,30 +426,69 @@ impl Ribd {
         }
     }
 
-    /// What the FE must be sent for the routes `touched`, when no route is given by
-    /// its gateways (the selected route is then what the FE holds, as it is): for
-    /// each, the route of the best source that has it, if that is not what the FE
-    /// was sent.
-    fn changes_of(&self, touched: BTreeSet<Key>) -> Vec<Change> {
-        let mut order: Vec<&Source> = self.sources.iter().collect();
-        order.sort_by_key(|s| s.spec.preference);
+    /// Whether a touched route's prefix holds a gateway address of a gateway route:
+    /// its change may change what that route resolves to.
+    fn gateways_reached(&self, touched: &BTreeSet<Key>) -> bool {
+        if self.sources.iter().all(|source| source.gateways == 0) {
+            return false;
+        }
+        touched.iter().any(|key| {
+            let Key::Route { vrf, prefix, len } = key else {
+                return false;
+            };
+            let first = (vrf.clone(), network(*prefix, *len));
+            let last = (vrf.clone(), last_address(*prefix, *len));
+            self.sources.iter().any(|source| {
+                source
+                    .gateway_addresses
+                    .range(first.clone()..=last.clone())
+                    .next()
+                    .is_some()
+            })
+        })
+    }
+
+    /// The selected route of `key`, as its best source gives it.
+    fn selected_of(&self, key: &Key) -> Option<&Value> {
+        self.sources
+            .iter()
+            .filter_map(|source| Some((source.spec.preference, source.server.store().get(key)?)))
+            .min_by_key(|(preference, _)| *preference)
+            .map(|(_, value)| value)
+    }
+
+    /// What the FE must be sent for the routes `touched`, when no gateway route
+    /// resolves through them ([`Self::gateways_reached`]): for each, the route of the
+    /// best source that has it, resolved if it is a gateway route, if that is not
+    /// what the FE was sent. `None` when a touched gateway route matches another
+    /// gateway route, which only resolving every route works out.
+    fn changes_of(&self, touched: &BTreeSet<Key>) -> Option<Vec<Change>> {
         let mut changes = Vec::new();
         for key in touched {
             if !matches!(key, Key::Route { .. }) {
                 continue;
             }
-            let selected = order
-                .iter()
-                .find_map(|source| source.server.store().get(&key));
-            match (selected, self.sent.get(&key)) {
-                (Some(value), sent) if sent != Some(value) => {
-                    changes.push(Change::set(key, value.clone()));
+            let selected = match self.selected_of(key) {
+                Some(Value::Route(RouteAction::Gateways(gateways))) => {
+                    let hops = resolve::resolve_one(
+                        key,
+                        gateways,
+                        self.options.resolve_via_default,
+                        |at| self.selected_of(at),
+                    )?;
+                    (!hops.is_empty()).then_some(Value::Route(RouteAction::Forward(hops)))
                 }
-                (None, Some(_)) => changes.push(Change::delete(key)),
+                other => other.cloned(),
+            };
+            match (selected, self.sent.get(key)) {
+                (Some(value), sent) if sent != Some(&value) => {
+                    changes.push(Change::set(key.clone(), value));
+                }
+                (None, Some(_)) => changes.push(Change::delete(key.clone())),
                 _ => {}
             }
         }
-        changes
+        Some(changes)
     }
 
     /// resync-end deletes what the FE holds from ribd but was not sent again, so it
@@ -426,6 +528,7 @@ impl Task for Ribd {
                 whole: false,
                 touched: &mut self.touched,
                 gateways: &mut source.gateways,
+                gateway_addresses: &mut source.gateway_addresses,
             };
             progress = progress.and(source.server.step(&mut changed));
             self.dirty |= changed.any;
@@ -755,7 +858,7 @@ mod tests {
     }
 
     #[test]
-    fn with_a_route_given_by_its_gateways_every_route_is_gone_through() {
+    fn with_routes_given_by_their_gateways_the_touched_routes_mostly_do() {
         let mut whole = 0;
         let mut touched = 0;
         for seed in 0..1 {
@@ -763,10 +866,10 @@ mod tests {
             whole += made.0;
             touched += made.1;
         }
-        // Now and then no route is given by its gateways, and the touched routes
-        // alone are gone through.
+        // A touched route that holds a gateway, or a gateway route through another,
+        // makes every route be gone through; otherwise the touched routes alone are.
         assert!(whole > 30, "{whole}");
-        assert!(touched > 0, "{touched}");
+        assert!(touched > 10, "{touched}");
     }
 
     #[test]
@@ -859,5 +962,103 @@ mod tests {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
         assert_eq!(held, ribd.selected());
+    }
+
+    /// A BGP table: many routes through two gateways on a connected route.
+    #[test]
+    fn changing_gateway_routes_goes_through_only_them() {
+        let mut fe = Server::new();
+        let (a, b) = UnixStream::pair().unwrap();
+        fe.attach(a, &[sid::ROUTE]).unwrap();
+        let specs = [("confd", 1), ("bgp", 50)].map(|(name, preference)| SourceSpec {
+            name: name.into(),
+            preference,
+            hold_ms: 0,
+        });
+        let mut ribd = Ribd::new(b, specs.to_vec()).unwrap();
+        let mut sources: Vec<Client> = specs
+            .iter()
+            .map(|spec| {
+                let (a, b) = UnixStream::pair().unwrap();
+                ribd.attach_source(&spec.name, a).unwrap();
+                let mut client = Client::new(b).unwrap();
+                client.sync_done();
+                client
+            })
+            .collect();
+        let key = |text: &str| {
+            let (prefix, len) = text.split_once('/').unwrap();
+            Key::Route {
+                vrf: "default".into(),
+                prefix: prefix.parse().unwrap(),
+                len: len.parse().unwrap(),
+            }
+        };
+        let connected = |interface: &str| {
+            Value::Route(RouteAction::Forward(vec![NextHop {
+                interface: interface.into(),
+                address: None,
+            }]))
+        };
+        let via =
+            |gateway: &str| Value::Route(RouteAction::Gateways(vec![gateway.parse().unwrap()]));
+        let bgp = |i: u32, gateway: &str| {
+            let prefix = std::net::Ipv4Addr::from(0x6400_0000 + (i << 8));
+            Change::set(key(&format!("{prefix}/24")), via(gateway))
+        };
+        let mut settle = |ribd: &mut Ribd, sources: &mut Vec<Client>| {
+            for _ in 0..10_000 {
+                let mut busy = fe.step(&mut Fe).busy;
+                busy |= ribd.step(0).busy;
+                for source in sources.iter_mut() {
+                    busy |= source.poll().0.busy;
+                }
+                if !busy {
+                    let held: BTreeMap<Key, Value> = fe
+                        .store()
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect();
+                    assert_eq!(held, ribd.selected());
+                    return held;
+                }
+            }
+            panic!("never settled");
+        };
+        sources[0]
+            .patch(&[Change::set(key("198.51.100.0/24"), connected("wan"))])
+            .unwrap();
+        sources[1]
+            .patch(&(0..200).map(|i| bgp(i, "198.51.100.1")).collect::<Vec<_>>())
+            .unwrap();
+        let held = settle(&mut ribd, &mut sources);
+        assert_eq!(held.len(), 201);
+        let whole = ribd.made.0;
+        // Changes of the BGP routes alone: no route is gone through again.
+        for round in 0..20 {
+            let gateway = ["198.51.100.1", "198.51.100.2"][round % 2];
+            sources[1]
+                .patch(
+                    &(round as u32 * 10..round as u32 * 10 + 10)
+                        .map(|i| bgp(i, gateway))
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            settle(&mut ribd, &mut sources);
+        }
+        // A gateway that matches nothing: the route goes.
+        sources[1].patch(&[bgp(0, "203.0.113.1")]).unwrap();
+        assert_eq!(settle(&mut ribd, &mut sources).len(), 200);
+        assert_eq!(ribd.made.0, whole);
+        // The connected route the gateways match changes: every route goes again.
+        sources[0]
+            .patch(&[Change::set(key("198.51.100.0/24"), connected("wan2"))])
+            .unwrap();
+        let held = settle(&mut ribd, &mut sources);
+        assert!(ribd.made.0 > whole);
+        assert!(held.values().all(|value| match value {
+            Value::Route(RouteAction::Forward(hops)) => hops[0].interface == "wan2",
+            _ => false,
+        }));
     }
 }
