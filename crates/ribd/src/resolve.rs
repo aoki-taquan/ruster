@@ -2,9 +2,13 @@
 //! ([`RouteAction::Gateways`], a BGP route's NEXT_HOP), to the outgoing interface and
 //! the next hop on that link that the FE needs.
 //!
-//! ribd resolves every gateway route each time it works out what the FE should
-//! hold, from the routes selected at that time. So when a route that a resolution
-//! went through changes or goes, the routes resolved through it change with it.
+//! ribd resolves the gateway routes from the routes selected at that time. When a
+//! changed route's prefix holds a gateway address of some gateway route, the change
+//! may change what that route resolves to, and ribd resolves every gateway route
+//! again ([`resolve`]). Otherwise it resolves only the changed gateway routes, each
+//! on its own ([`resolve_one`]), unless one of their gateways matches another
+//! gateway route. Either way, when a route that a resolution went through changes
+//! or goes, the routes resolved through it change with it.
 //!
 //! The rules, for a gateway route `R` in VRF `V`:
 //!
@@ -207,6 +211,55 @@ fn longest_match<'a>(
         }
     }
     None
+}
+
+/// The next hops one gateway route resolves to, by the rules above, when none of its
+/// gateways matches a gateway route other than itself: then the result needs no
+/// other route resolved first. `None` when one does (rules 4 to 6 need every
+/// gateway route, [`resolve`]).
+///
+/// `selected` gives the selected route of a key, as [`resolve`]'s map would.
+pub fn resolve_one<'a>(
+    key: &Key,
+    gateways: &[IpAddr],
+    via_default: bool,
+    selected: impl Fn(&Key) -> Option<&'a Value>,
+) -> Option<Vec<NextHop>> {
+    let Key::Route { vrf, .. } = key else {
+        return Some(Vec::new());
+    };
+    let mut out: Vec<NextHop> = Vec::new();
+    for &gateway in gateways {
+        let max: u8 = if gateway.is_ipv4() { 32 } else { 128 };
+        let hit = (1..=max)
+            .rev()
+            .chain(via_default.then_some(0))
+            .find_map(|len| {
+                let probe = Key::Route {
+                    vrf: vrf.clone(),
+                    prefix: network(gateway, len),
+                    len,
+                };
+                selected(&probe).map(|value| (probe, value))
+            });
+        match hit {
+            Some((probe, _)) if probe == *key => {}
+            Some((_, Value::Route(RouteAction::Forward(through)))) => {
+                for hop in through {
+                    let hop = NextHop {
+                        interface: hop.interface.clone(),
+                        address: Some(hop.address.unwrap_or(gateway)),
+                    };
+                    if !out.contains(&hop) {
+                        out.push(hop);
+                    }
+                }
+            }
+            Some((_, Value::Route(RouteAction::Gateways(_)))) => return None,
+            _ => {}
+        }
+    }
+    Some(out)
 }
 
 /// The strongly connected components of the graph of gateway routes (Tarjan's
