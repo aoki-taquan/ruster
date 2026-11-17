@@ -50,10 +50,28 @@ pub struct SourceSpec {
 }
 
 /// How ribd works, apart from its sources.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
     /// Gateways may be resolved through the default route ([`resolve`]).
     pub resolve_via_default: bool,
+    /// The most changes one patch to the FE carries. More go in several patches, one
+    /// after the other's answer, so that no message passes the connection's size
+    /// limit (a full table after the FE restarted, or a table arriving faster than
+    /// the FE takes it).
+    pub changes_per_patch: usize,
+}
+
+/// A route with 16 next hops on long interface names takes about 1 KiB, so 8,192 of
+/// them stay well below the 16 MiB a message may have.
+pub const CHANGES_PER_PATCH: usize = 8_192;
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            resolve_via_default: false,
+            changes_per_patch: CHANGES_PER_PATCH,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -117,14 +135,6 @@ impl Hook for Changed<'_> {
     }
 }
 
-/// A patch on its way to the FE: what the FE holds once it accepts it.
-enum InFlight {
-    /// Every route in it.
-    All(BTreeMap<Key, Value>),
-    /// What it held before, with these changes.
-    Changes(Vec<Change>),
-}
-
 pub struct Ribd {
     sources: Vec<Source>,
     options: Options,
@@ -147,8 +157,12 @@ pub struct Ribd {
     made: (usize, usize),
     /// resync-begin was sent; resync-end follows once the FE accepted the full send.
     resync_pending: bool,
-    /// The patch waiting for the FE's answer, and the routes it would make the FE hold.
-    in_flight: Option<(u32, InFlight)>,
+    /// The patch waiting for the FE's answer, and its changes: once accepted, the FE
+    /// holds what it held before with them.
+    in_flight: Option<(u32, Vec<Change>)>,
+    /// Changes made but not sent yet, because a patch carries at most
+    /// [`Options::changes_per_patch`]. None of their keys is in the patch in flight.
+    queued: BTreeMap<Key, Change>,
     /// The resync-end waiting for the FE's answer.
     resync_end: Option<u32>,
     /// The FE refused resync-end: what it holds stays marked stale, and resync-end
@@ -209,6 +223,7 @@ impl Ribd {
             made: (0, 0),
             resync_pending: false,
             in_flight: None,
+            queued: BTreeMap::new(),
             resync_end: None,
             resync_end_refused: false,
             refused_at: None,
@@ -242,6 +257,7 @@ impl Ribd {
         self.fe = fe;
         self.sent.clear();
         self.in_flight = None;
+        self.queued.clear();
         self.resync_end = None;
         self.resync_end_refused = false;
         self.refused_at = None;
@@ -279,7 +295,8 @@ impl Ribd {
     }
 
     /// Sends the FE what changed since what it accepted. One patch at a time: what
-    /// the FE holds is only known once it answered.
+    /// the FE holds is only known once it answered. A patch carries at most
+    /// [`Options::changes_per_patch`] changes; the rest wait in `queued` for the next.
     /// Returns whether a patch was sent.
     fn push(&mut self) -> bool {
         if self.in_flight.is_some() {
@@ -292,36 +309,50 @@ impl Ribd {
         let whole = self.whole || self.sources.iter().any(|source| source.gateways > 0);
         let touched = std::mem::take(&mut self.touched);
         self.whole = false;
-        let (changes, holds) = if whole {
+        if whole {
             let selected = self.selected();
-            let mut changes = Vec::new();
+            self.queued.clear();
             for (key, value) in &selected {
                 if self.sent.get(key) != Some(value) {
-                    changes.push(Change::set(key.clone(), value.clone()));
+                    self.queued
+                        .insert(key.clone(), Change::set(key.clone(), value.clone()));
                 }
             }
             for key in self.sent.keys() {
                 if !selected.contains_key(key) {
-                    changes.push(Change::delete(key.clone()));
+                    self.queued.insert(key.clone(), Change::delete(key.clone()));
                 }
             }
-            (changes, InFlight::All(selected))
         } else {
-            let changes = self.changes_of(touched);
-            (changes.clone(), InFlight::Changes(changes))
-        };
-        if changes.is_empty() {
+            // A queued change of a route touched again may be out of date.
+            for key in &touched {
+                self.queued.remove(key);
+            }
+            for change in self.changes_of(touched) {
+                self.queued.insert(change.key.clone(), change);
+            }
+        }
+        if self.queued.is_empty() {
             return false;
+        }
+        let mut changes = Vec::new();
+        while changes.len() < self.options.changes_per_patch.max(1) {
+            let Some((_, change)) = self.queued.pop_first() else {
+                break;
+            };
+            changes.push(change);
         }
         match self.fe.patch(&changes) {
             Ok(token) => {
                 self.counters.patches_sent += 1;
                 #[cfg(test)]
-                match holds {
-                    InFlight::All(_) => self.made.0 += 1,
-                    InFlight::Changes(_) => self.made.1 += 1,
+                if whole {
+                    self.made.0 += 1;
+                } else {
+                    self.made.1 += 1;
                 }
-                self.in_flight = Some((token, holds));
+                // The rest goes after the answer (`step`).
+                self.in_flight = Some((token, changes));
                 true
             }
             Err(_) => {
@@ -369,6 +400,7 @@ impl Ribd {
             && self.resync_end.is_none()
             && self.in_flight.is_none()
             && !self.dirty
+            && self.queued.is_empty()
             && self.sent == self.selected()
         {
             self.resync_end = Some(self.fe.resync_end());
@@ -423,7 +455,10 @@ impl Task for Ribd {
                 });
             }
         }
-        if std::mem::take(&mut self.dirty) && self.push() {
+        // Queued changes go once the patch before them was answered. A refusal
+        // empties the queue, so a refused patch is not sent again at once.
+        let queued = !self.queued.is_empty() && self.in_flight.is_none();
+        if (std::mem::take(&mut self.dirty) || queued) && self.push() {
             progress.busy = true;
         }
         if let Some(seen) = self.patch_refused.as_mut() {
@@ -461,6 +496,8 @@ impl Task for Ribd {
         }
         let (flushed, events) = self.fe.poll();
         self.answers(&events);
+        // An answer just read lets the queued changes go on the next step.
+        progress.busy |= !self.queued.is_empty() && self.in_flight.is_none();
         progress.and(flushed)
     }
 }
@@ -489,29 +526,25 @@ impl Ribd {
                 }
             }
             if self.in_flight.as_ref().is_some_and(|(t, _)| t == token) {
-                let (_, holds) = self.in_flight.take().expect("checked");
+                let (_, changes) = self.in_flight.take().expect("checked");
                 if refused {
                     // What the FE holds from ribd is now unclear: start a resync, so
                     // the next accepted full send is followed by resync-end. Routes
                     // the FE holds stay until then.
                     self.fe.resync_begin();
                     self.sent.clear();
+                    self.queued.clear();
                     self.whole = true;
                     self.patch_refused.get_or_insert(None);
                     if self.waiting_since.is_none() {
                         self.resync_pending = true;
                     }
                 } else {
-                    match holds {
-                        InFlight::All(selected) => self.sent = selected,
-                        InFlight::Changes(changes) => {
-                            for change in changes {
-                                match change.value {
-                                    Some(value) => self.sent.insert(change.key, value),
-                                    None => self.sent.remove(&change.key),
-                                };
-                            }
-                        }
+                    for change in changes {
+                        match change.value {
+                            Some(value) => self.sent.insert(change.key, value),
+                            None => self.sent.remove(&change.key),
+                        };
                     }
                     self.patch_refused = None;
                 }
@@ -601,7 +634,7 @@ mod tests {
     /// Runs changes from three sources against an FE and, whenever all is quiet and
     /// the FE refused nothing, has what the FE holds be the selection made by going
     /// through every route. Returns the patches made each way.
-    fn run(seed: u64, rounds: usize, gateways: bool) -> (usize, usize) {
+    fn run(seed: u64, rounds: usize, gateways: bool, per_patch: usize) -> (usize, usize) {
         let mut rng = Rng(seed);
         let mut fe = Server::new();
         let (a, b) = UnixStream::pair().unwrap();
@@ -612,7 +645,11 @@ mod tests {
                 preference,
                 hold_ms: 0,
             });
-        let mut ribd = Ribd::new(b, specs.to_vec()).unwrap();
+        let options = Options {
+            changes_per_patch: per_patch,
+            ..Options::default()
+        };
+        let mut ribd = Ribd::with_options(b, specs.to_vec(), options).unwrap();
         let mut sources: Vec<Client> = specs
             .iter()
             .map(|spec| {
@@ -708,7 +745,7 @@ mod tests {
         let mut whole = 0;
         let mut touched = 0;
         for seed in 0..2 {
-            let made = run(0x7269_6264 + seed, 100, false);
+            let made = run(0x7269_6264 + seed, 100, false, CHANGES_PER_PATCH);
             whole += made.0;
             touched += made.1;
         }
@@ -722,7 +759,7 @@ mod tests {
         let mut whole = 0;
         let mut touched = 0;
         for seed in 0..1 {
-            let made = run(0x6761_7465 + seed, 120, true);
+            let made = run(0x6761_7465 + seed, 120, true, CHANGES_PER_PATCH);
             whole += made.0;
             touched += made.1;
         }
@@ -730,5 +767,97 @@ mod tests {
         // alone are gone through.
         assert!(whole > 30, "{whole}");
         assert!(touched > 0, "{touched}");
+    }
+
+    #[test]
+    fn patches_of_a_few_changes_each_give_the_same() {
+        for (seed, gateways) in [(0x7370_6c69, false), (0x7370_6c6a, true)] {
+            for per_patch in [1, 2] {
+                run(seed, 80, gateways, per_patch);
+            }
+        }
+    }
+
+    /// The FE: records how many changes each patch had.
+    #[derive(Default)]
+    struct Sizes(Vec<usize>);
+
+    impl Hook for Sizes {
+        fn check(&mut self, _next: &Store) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn check_patch(
+            &mut self,
+            _next: &Store,
+            changed: &[(&Key, Option<&Value>)],
+        ) -> Result<(), String> {
+            self.0.push(changed.len());
+            Ok(())
+        }
+
+        fn committed(&mut self, _store: &Store) {}
+    }
+
+    #[test]
+    fn many_routes_go_in_patches_of_at_most_the_limit() {
+        let mut fe = Server::new();
+        let (a, b) = UnixStream::pair().unwrap();
+        fe.attach(a, &[sid::ROUTE]).unwrap();
+        let spec = SourceSpec {
+            name: "bgp".into(),
+            preference: 50,
+            hold_ms: 0,
+        };
+        let options = Options {
+            changes_per_patch: 7,
+            ..Options::default()
+        };
+        let mut ribd = Ribd::with_options(b, vec![spec], options).unwrap();
+        let (a, b) = UnixStream::pair().unwrap();
+        ribd.attach_source("bgp", a).unwrap();
+        let mut source = Client::new(b).unwrap();
+        let route = |i: u32, interface: &str| {
+            let key = Key::Route {
+                vrf: "default".into(),
+                prefix: std::net::Ipv4Addr::from(0x0a00_0000 + (i << 8)).into(),
+                len: 24,
+            };
+            let hop = NextHop {
+                interface: interface.into(),
+                address: None,
+            };
+            Change::set(key, Value::Route(RouteAction::Forward(vec![hop])))
+        };
+        let mut sizes = Sizes::default();
+        let mut settle = |ribd: &mut Ribd, source: &mut Client, sizes: &mut Sizes| {
+            for _ in 0..10_000 {
+                let mut busy = fe.step(sizes).busy;
+                busy |= ribd.step(0).busy;
+                busy |= source.poll().0.busy;
+                if !busy {
+                    return fe.store().iter().count();
+                }
+            }
+            panic!("never settled");
+        };
+        source.sync_done();
+        source
+            .patch(&(0..100).map(|i| route(i, "a")).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(settle(&mut ribd, &mut source, &mut sizes), 100);
+        // Changes that come while the first patches are on their way.
+        source
+            .patch(&(50..150).map(|i| route(i, "b")).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(settle(&mut ribd, &mut source, &mut sizes), 150);
+        assert!(sizes.0.iter().all(|&n| n <= 7), "{:?}", sizes.0);
+        assert!(sizes.0.len() >= 150 / 7, "{:?}", sizes.0);
+        let held: BTreeMap<Key, Value> = fe
+            .store()
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(held, ribd.selected());
     }
 }
