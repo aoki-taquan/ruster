@@ -1,0 +1,18 @@
+[Unit]
+Description=ruster bridge to Kea
+PartOf=ruster.target
+Before=kea-dhcp4-server.service kea-dhcp6-server.service
+BindsTo=ruster-netns.service
+Wants=ruster-confd.service
+After=ruster-netns.service ruster-confd.service
+
+[Service]
+Type=notify
+EnvironmentFile=/etc/ruster/ruster.env
+NetworkNamespacePath=/run/netns/ruster
+ExecStart=/usr/local/bin/ruster-kea $RUSTER_KEA_OPTIONS /etc/kea/ruster-dhcp4.json
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=ruster.target
