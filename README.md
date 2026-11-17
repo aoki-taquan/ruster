@@ -24,7 +24,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 | `ruster-confd` | 設定ファイルを読み、各プロセスへ渡す | インターフェース、アドレス |
 | `ruster-ribd` | 送り手（confdや外のデーモン）の経路から選び、FEへ渡す | 経路 |
 | `ruster-neighd` | ARPとND。FEから受け取って答え、問い合わせる。LANへRAを送る | 近隣 |
-| `ruster-pppoed` | PPPoEのセッションを張る（Discovery、LCP、PAP/CHAP、IPCP、IPv6CP）。得た値はまだ標準出力に書くだけ | — |
+| `ruster-pppoed` | PPPoEのセッションを張る（Discovery、LCP、PAP/CHAP、IPCP、IPv6CP）。得た値はconfdへ、既定経路はribdへ渡す | — |
 | `ruster-unbound` | confdから設定の`[dns]`を受け取り、Unboundの設定に書いて読み直させる | — |
 | `ruster-kea` | confdから設定の`[[dhcp]]`と`[[dhcp6]]`を受け取ってKeaの設定に書き、LANとKeaの間でDHCPとDHCPv6をリレーする | — |
 
@@ -59,7 +59,7 @@ default VRFの転送のfirewallは、設定ファイルの規則でFEが使い�
 default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFEが使います。
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます。
 MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます。ルータ自身のIPv4も同じです。
-PPPoEのセッション（RFC 2516）を、設定ファイルの`pppoe`のインターフェースで使えます。FEは包むのと外すのだけを行います。セッションは`ruster-pppoed`が張りますが、得た値（セッションの番号、ACのMAC、アドレス）は、まだ手で設定ファイルに写します。
+PPPoEのセッション（RFC 2516）を、設定ファイルの`pppoe`のインターフェースで使えます。FEは包むのと外すのだけを行います。セッションは`ruster-pppoed`が張り、得た値（セッションの番号、ACのMAC、アドレス）を設定の送り手としてconfdへ渡します。
 FEは、egressのMTUより長いIPv4のdatagramをフラグメントにし（Don't Fragmentが無いもの）、NATはフラグメントになったdatagramも変換します。
 
 ## 動かす
@@ -92,12 +92,12 @@ interface = "wan"
 via = "198.51.100.1"          # 省略すると直結の経路
 ```
 
-systemdで起動するときは、[`contrib/systemd`](contrib/systemd)のunitを使います。`ruster.target`が専用のnetns（`ruster`）を作り、`ruster.env`の`RUSTER_PORTS`のデバイスをそこへ移し（止めると戻す）、FE、ribd、neighd、confdを順に起動します。落ちたプロセスは1秒後に起動し直されます。
+systemdで起動するときは、[`contrib/systemd`](contrib/systemd)のunitを使います。`ruster.target`が専用のnetns（`ruster`）を作り、`ruster.env`の`RUSTER_PORTS`のデバイスをそこへ移し（止めると戻す）、FE、ribd、neighd、confdを順に起動します。落ちたプロセスは1秒後に起動し直されます。橋渡し役（`ruster-pppoed`、`ruster-dhcpc`、`ruster-kea`、`ruster-unbound`、`ruster-frr`）は、使うものだけを`systemctl enable`すると`ruster.target`と一緒に起動します。経路を書くものは`RUSTER_RIBD_SOURCES`にも足します。Kea、Unbound、FRRの既製のunitには、そのnetnsで橋渡し役の後に動かすdrop-in（`*.service.d/ruster.conf`）を置きます。Keaの設定は`/etc/kea/ruster-dhcp4.json`をincludeし、FRRのzebraは`-M dplane_fpm_nl`で起動します。
 
 ```bash
-sudo install -m 755 target/release/ruster-{fe,ribd,neighd,confd} target/release/ruster /usr/local/bin/
+sudo install -m 755 target/release/ruster{,-fe,-ribd,-neighd,-confd,-pppoed,-dhcpc,-kea,-unbound,-frr} /usr/local/bin/
 sudo install -D -m 755 contrib/systemd/ruster-netns /usr/local/lib/ruster/ruster-netns
-sudo install -m 644 contrib/systemd/*.service contrib/systemd/ruster.target /etc/systemd/system/
+sudo cp -r contrib/systemd/*.service contrib/systemd/*.service.d contrib/systemd/ruster.target /etc/systemd/system/
 sudo install -D -m 644 contrib/systemd/ruster.env /etc/ruster/ruster.env   # RUSTER_PORTSを直す。router.tomlも/etc/ruster/に置く
 sudo systemctl daemon-reload && sudo systemctl enable --now ruster.target
 ```
@@ -158,7 +158,7 @@ sudo scripts/netns-all.sh target/debug       # 全部を両方のバックエン
 `netns-pppoed.sh`は、`pppoe-server`（パッケージ`pppoe`と`ppp`）を相手に、pppoedのセッションをIPCPとIPv6CPまで張ります（FEは通さない）。
 `netns-dns.sh`は、LANのホストがルータのUnboundで名前を引けることを確かめます（`unbound`と`dig`が要る）。
 `netns-dhcp.sh`は、LANのホストがKeaからアドレスを得てWANへ出られることを確かめます（`kea-dhcp4-server`と`udhcpc`が要る）。`netns-dhcp6.sh`はDHCPv6で同じことを確かめます（`kea-dhcp6-server`と`busybox`）。`netns-ra.sh`は、LANのホストがneighdのRAでSLAACのアドレスと既定経路を得ることを確かめます。`netns-dhcpc.sh`は、`ruster-dhcpc`がISP側のKeaからWANのIPv4アドレスと委任されたプレフィックスを得て、LANのホストがNATでISP側へ出られることを確かめます（`kea-dhcp4-server`と`kea-dhcp6-server`）。`netns-map-e-pd.sh`は、MAP-EのプレフィックスをDHCPv6-PDから得て同じことを確かめます。`netns-bgp.sh`は、隣のnetnsのFRRとBGPを張り、受けた経路でLANのホストがその先へ届くことと、取り下げで経路が消えることを確かめます（`frr`が要る）。どれもインターネットにはつながない。
-`netns-commit.sh`は、confdを`--state-dir`で動かし、`ruster diff`が何も変えないこと、反映した版がconfdの再起動の後も残ること、確認の無い反映がconfdの再起動をまたいで前の版に戻ること、`ruster confirm`と`ruster rollback`を確かめます。`netns-systemd.sh`は、`contrib/systemd`のunitを`/run/systemd/system`に置いて起動し、転送、SIGKILLで落としたプロセスの起動し直し、止めてからの起動し直しを確かめます（systemdが要る）。
+`netns-commit.sh`は、confdを`--state-dir`で動かし、`ruster diff`が何も変えないこと、反映した版がconfdの再起動の後も残ること、確認の無い反映がconfdの再起動をまたいで前の版に戻ること、`ruster confirm`と`ruster rollback`を確かめます。`netns-systemd.sh`は、`contrib/systemd`のunitを`/run/systemd/system`に置いて起動し、転送、SIGKILLで落としたプロセスの起動し直し、止めてからの起動し直しを確かめます（systemdが要る）。`netns-systemd-bridges.sh`は、同じくunitで`ruster-dhcpc`、`ruster-kea`、`ruster-unbound`と、drop-inを付けたKeaとUnboundのserviceを起動し、WANのアドレスをDHCPで得て、LANのホストがKeaからアドレスを得てUnboundで名前を引き、NATで外へ出られることを確かめます。
 
 ## 開発
 
