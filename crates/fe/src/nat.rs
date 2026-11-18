@@ -62,12 +62,8 @@ use ruster_core::{
 };
 
 use crate::build;
+use crate::StateSizes;
 
-/// UDP and ICMP mappings, and their peers.
-const MAPPINGS: usize = 1 << 13;
-/// TCP mappings and sessions.
-const TCP_MAPPINGS: usize = 1 << 13;
-const TCP_SESSIONS: usize = 1 << 14;
 /// Unsolicited inbound SYNs held for their delayed Port Unreachable.
 const SYN_HOLDS: usize = 1 << 10;
 /// Matured holds answered per batch.
@@ -170,8 +166,13 @@ pub(crate) struct Nat {
 }
 
 impl Nat {
-    /// Moves `nat` to `next` (`None` when the tables have no NAT).
-    pub(crate) fn publish(nat: &mut Option<Self>, next: Option<Publication>) -> Result<(), String> {
+    /// Moves `nat` to `next` (`None` when the tables have no NAT). New storage
+    /// is of `sizes`.
+    pub(crate) fn publish(
+        nat: &mut Option<Self>,
+        next: Option<Publication>,
+        sizes: StateSizes,
+    ) -> Result<(), String> {
         let Some(next) = next else {
             if let Some(this) = nat {
                 this.on = false;
@@ -205,7 +206,7 @@ impl Nat {
                 this.current = next;
                 this.limit_ipv4_id_rate();
             }
-            _ => *nat = Some(Self::allocate(next)?),
+            _ => *nat = Some(Self::allocate(next, sizes)?),
         }
         Ok(())
     }
@@ -259,28 +260,30 @@ impl Nat {
         .map_or(0, |report| report.matured)
     }
 
-    fn allocate(next: Publication) -> Result<Self, String> {
+    fn allocate(next: Publication, sizes: StateSizes) -> Result<Self, String> {
         let failed = |error: String| format!("nat: {error}");
         let ports = next.ports();
+        // UDP and ICMP mappings have as many peers as mappings.
+        let mappings = sizes.nat_mappings;
         let udp = Nat44UdpRuntime::new(
             next.udp,
-            leak(MAPPINGS, Nat44UdpMappingSlot::default()),
-            leak(MAPPINGS, Nat44UdpPeerSlot::default()),
-            udp_storage(ports, MAPPINGS, MAPPINGS),
+            leak(mappings, Nat44UdpMappingSlot::default()),
+            leak(mappings, Nat44UdpPeerSlot::default()),
+            udp_storage(ports, mappings, mappings),
             udp_key(),
         )
         .map_err(|e| failed(format!("UDP: {e:?}")))?
         .with_ipv4_id_rate_limit(Box::leak(ipv4_id_rate_limit_storage()));
         let icmp = Nat44IcmpRuntime::new(
             next.icmp,
-            leak(MAPPINGS, Nat44UdpMappingSlot::default()),
-            leak(MAPPINGS, Nat44UdpPeerSlot::default()),
-            udp_storage(ports, MAPPINGS, MAPPINGS),
+            leak(mappings, Nat44UdpMappingSlot::default()),
+            leak(mappings, Nat44UdpPeerSlot::default()),
+            udp_storage(ports, mappings, mappings),
             icmp_key(),
         )
         .map_err(|e| failed(format!("ICMP: {e:?}")))?
         .with_ipv4_id_rate_limit(Box::leak(ipv4_id_rate_limit_storage()));
-        let (mappings, sessions) = (TCP_MAPPINGS, TCP_SESSIONS);
+        let sessions = sizes.nat_sessions;
         let hosts = Nat44HostStorage::new(
             leak(mappings, Nat44HostLink::EMPTY),
             leak(mappings, Nat44TcpHostSlot::EMPTY),

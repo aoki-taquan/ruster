@@ -146,6 +146,28 @@ const ETHERNET_HEADER: usize = 14;
 const ETHERTYPE_ARP: [u8; 2] = [0x08, 0x06];
 const ETHERTYPE_IPV6: [u8; 2] = [0x86, 0xdd];
 
+/// How many NAT and firewall states the FE keeps. They are allocated when the
+/// tables first have NAT or a firewall rule, and kept for the life of the process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateSizes {
+    /// NAT mappings, each of UDP, ICMP and TCP (one per inside address and port).
+    pub nat_mappings: usize,
+    /// NAT TCP sessions (one per connection).
+    pub nat_sessions: usize,
+    /// Firewall flow states: about three quarters of them can be live at once.
+    pub firewall_states: usize,
+}
+
+impl Default for StateSizes {
+    fn default() -> Self {
+        Self {
+            nat_mappings: 1 << 13,
+            nat_sessions: 1 << 14,
+            firewall_states: 1 << 14,
+        }
+    }
+}
+
 /// Counters for things the FE dropped on its own.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FeCounters {
@@ -666,6 +688,8 @@ struct Worker<B> {
     firewall: Option<firewall::Firewall>,
     /// The default VRF's NAPT, once the tables have had one.
     nat: Option<nat::Nat>,
+    /// How many states NAT and the firewall get when first allocated.
+    state_sizes: StateSizes,
     fragmentation: ruster_core::Ipv4FragmentationRuntime<'static>,
     /// Tunnels' fragmented IPv6 packets being put back together, and those put
     /// together, for the next batch.
@@ -812,6 +836,7 @@ where
             icmpv4_errors: icmpv4_error_runtime(),
             firewall: None,
             nat: None,
+            state_sizes: StateSizes::default(),
             fragmentation: fragments::fragmentation(),
             reassembly: reassembly::Reassembly::default(),
             reassembled: Vec::new(),
@@ -922,6 +947,12 @@ where
         self.worker.handover.attach_punt(socket, Some(peer));
         self.worker.endpoints_changed();
         Ok(())
+    }
+
+    /// Sets how many NAT and firewall states to allocate. Only before the tables
+    /// first have NAT or a firewall rule: once allocated, the states keep their size.
+    pub fn set_state_sizes(&mut self, sizes: StateSizes) {
+        self.worker.state_sizes = sizes;
     }
 
     /// Binds the sockets to the control processes the punt classes name under
@@ -1357,7 +1388,7 @@ where
         // As for the firewall: a NAT that cannot move stays bound to the old
         // tables, and core drops what it would have translated.
         let mut stuck = false;
-        if let Err(error) = nat::Nat::publish(&mut self.nat, nat) {
+        if let Err(error) = nat::Nat::publish(&mut self.nat, nat, self.state_sizes) {
             eprintln!("ruster-fe: {error}");
             stuck = true;
         }
@@ -1380,6 +1411,7 @@ where
         if let Err(error) = firewall::Firewall::publish(
             &mut self.firewall,
             publication,
+            self.state_sizes.firewall_states,
             current[0].with_vrfs(&current, &self.tables.by_ingress),
             next[0].with_vrfs(&next, &built.by_ingress),
         ) {

@@ -1,6 +1,6 @@
 //! `ruster-fe [--run-dir DIR] [--backend af-xdp|af-packet] [--xdp-attach native|generic]
-//! [--zero-copy] [--one-thread] [--workers N] [--cpus A,B,...] [--busy-poll] DEVICE...`:
-//! the FE on Linux.
+//! [--zero-copy] [--one-thread] [--workers N] [--cpus A,B,...] [--busy-poll]
+//! [--nat-mappings N] [--nat-sessions N] [--firewall-states N] DEVICE...`: the FE on Linux.
 //!
 //! Each DEVICE is a Linux network device and becomes the port of the same name: the
 //! interface names in the tables are the device names. The FE listens on the table
@@ -20,6 +20,13 @@
 //!   What goes to the kernel, the TAP devices and the control processes is written
 //!   on another thread. With `--one-thread` the forwarding thread does both too,
 //!   between batches.
+//! - `--nat-mappings` (8,192 by default) is how many inside addresses and ports NAT
+//!   maps, for each of UDP, ICMP and TCP; `--nat-sessions` (16,384) how many TCP
+//!   connections it follows; `--firewall-states` (16,384) how many flows the
+//!   firewall keeps, about three quarters of them live at once. Each is from
+//!   [`STATES_LEAST`] to [`STATES_MOST`]. A mapping takes about 700 bytes, a
+//!   session about 220 and a firewall state about 110, allocated when the tables
+//!   first have NAT or a firewall rule.
 //! - `af-packet` receives copies: the kernel still sees every frame, so the devices
 //!   must carry no kernel address or route, and the kernel must not forward on them.
 
@@ -35,7 +42,7 @@ use std::os::unix::net::UnixListener;
 use std::process::ExitCode;
 
 use ruster_core::{GeneratedPacketIo, MonotonicMillis, PacketIo};
-use ruster_fe::{writers, Control, Fe, HandoverTask, OtherWorker};
+use ruster_fe::{writers, Control, Fe, HandoverTask, OtherWorker, StateSizes};
 use ruster_io_xdp_native::XdpAttachMode;
 use ruster_proto::daemon::{self, socket, Clock};
 use ruster_proto::task::Task;
@@ -53,6 +60,11 @@ pub trait Backend<B> {
     /// frame handed to the kernel came back.
     fn drain(&mut self, io: &mut B) -> bool;
 }
+
+/// The fewest and the most of each of `--nat-mappings`, `--nat-sessions` and
+/// `--firewall-states`.
+pub const STATES_LEAST: usize = 64;
+pub const STATES_MOST: usize = 1 << 22;
 
 /// How long a stopping FE waits for frames still in the kernel.
 const DRAIN_MS: u64 = 1_000;
@@ -76,6 +88,7 @@ struct Args {
     workers: u32,
     /// The CPU each worker is pinned to, in worker order; none when empty.
     cpus: Vec<usize>,
+    states: StateSizes,
     devices: Vec<String>,
 }
 
@@ -92,7 +105,16 @@ fn args() -> Result<Args, String> {
         one_thread: false,
         workers: 1,
         cpus: Vec::new(),
+        states: StateSizes::default(),
         devices: Vec::new(),
+    };
+    let count = |flag: &str, value: Option<String>| {
+        value
+            .and_then(|n| n.parse().ok())
+            .filter(|n| (STATES_LEAST..=STATES_MOST).contains(n))
+            .ok_or(format!(
+                "{flag} is a number from {STATES_LEAST} to {STATES_MOST}"
+            ))
     };
     let mut rest = rest.into_iter();
     while let Some(arg) = rest.next() {
@@ -124,6 +146,9 @@ fn args() -> Result<Args, String> {
                     .filter(|&n| (1..=64).contains(&n))
                     .ok_or("--workers is a number from 1 to 64")?;
             }
+            "--nat-mappings" => args.states.nat_mappings = count(&arg, rest.next())?,
+            "--nat-sessions" => args.states.nat_sessions = count(&arg, rest.next())?,
+            "--firewall-states" => args.states.firewall_states = count(&arg, rest.next())?,
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ => args.devices.push(arg),
         }
@@ -170,6 +195,7 @@ where
     W: Backend<B>,
 {
     let (mut fe, seeds) = Fe::with_worker_seeds(io, others.len(), args.devices.clone());
+    fe.set_state_sizes(args.states);
     let path = |name: &str| args.run_dir.join(name);
     let mut listeners: Vec<(UnixListener, &'static [u64])> = Vec::new();
     for (name, writes) in [

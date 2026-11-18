@@ -56,7 +56,7 @@ router as a service、DPUで動くことを目指しています。ハードウ�
 
 ARPとNDの解決はneighdが行い、FEは受けたARPとNDをneighdへ渡します。
 default VRFの転送のfirewallは、設定ファイルの規則でFEが使います。IPv4とIPv6の両方で、状態を追います（IPv6の先頭でないフラグメントは落とします）。アドレスを書かないtcp/udpの規則はIPv6にも効くので、`ingress`を書かない規則は、IPv6では外からLANへの通信も通します。ルータ自身はLANのホストと同じ扱いで、規則では`rt-default`と書きます（ルータ宛ては`egress = "rt-default"`、ルータが出す通信は`ingress = "rt-default"`）。
-default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFEが使います。
+default VRFのNAPT（UDP、TCP、ICMP）も、設定ファイルの`[nat]`でFEが使います。NATの対応、TCPのセッション、firewallの状態の数は`ruster-fe`の`--nat-mappings`、`--nat-sessions`、`--firewall-states`で変えられます（既定は8,192、16,384、16,384）。
 DS-LiteのB4として、設定ファイルの`tunnel`のインターフェースでIPv4をIPv6に包んでAFTRへ送れます。
 MAP-EのCEとして、設定ファイルの`[map-e]`から共有のIPv4 address、PSID、CEのIPv6 addressを計算し、PSIDのポートの組でNAPTしてBRへ送れます。ルータ自身のIPv4も同じです。
 PPPoEのセッション（RFC 2516）を、設定ファイルの`pppoe`のインターフェースで使えます。FEは包むのと外すのだけを行います。セッションは`ruster-pppoed`が張り、得た値（セッションの番号、ACのMAC、アドレス）を設定の送り手としてconfdへ渡します。

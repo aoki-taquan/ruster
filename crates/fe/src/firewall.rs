@@ -15,9 +15,6 @@ use ruster_core::{
     FirewallStateSlot, ForwardingSnapshot, ValidatedFirewallOwner,
 };
 
-/// Flow states: about three quarters of them can be live at once.
-const STATES: usize = 1 << 14;
-
 /// A firewall publication made for one set of tables.
 pub(crate) struct Publication {
     owner: ValidatedFirewallOwner,
@@ -63,20 +60,21 @@ pub(crate) struct Firewall {
 impl Firewall {
     /// Moves `firewall` to `next`, made for the tables whose default VRF is
     /// `next_snapshot`; `current_snapshot` is that of the tables in use. Nothing is
-    /// allocated until a publication has rules.
+    /// allocated until a publication has rules; then `states` flow states.
     pub(crate) fn publish(
         firewall: &mut Option<Self>,
         next: Publication,
+        states: usize,
         current_snapshot: ForwardingSnapshot<'_>,
         next_snapshot: ForwardingSnapshot<'_>,
     ) -> Result<(), String> {
         let Some(this) = firewall else {
             if next.rules {
-                let states =
-                    Box::leak(vec![FirewallStateSlot::default(); STATES].into_boxed_slice());
                 let endpoints = Box::leak(
-                    vec![ruster_core::FirewallEndpointSlot::default(); STATES].into_boxed_slice(),
+                    vec![ruster_core::FirewallEndpointSlot::default(); states].into_boxed_slice(),
                 );
+                let states =
+                    Box::leak(vec![FirewallStateSlot::default(); states].into_boxed_slice());
                 let runtime =
                     FirewallRuntime::new(next.owner.config(), states).with_endpoints(endpoints);
                 *firewall = Some(Self {
