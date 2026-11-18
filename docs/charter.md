@@ -42,9 +42,10 @@ rusterで何を作り、何を作らないかを決める文書です。作業�
   - トンネル（MAP-E、DS-Lite）のカプセル化、PPPoEのカプセル化
   - L2のブリッジ（MACアドレスの学習、フラッディング、エージング）と、ルーティングとのつなぎ（IRB）
   - L2を運ぶトンネル: VXLAN（RFC 7348。送り先のVTEPは設定に書く）、EtherIP（RFC 3378）
-  - SRv6（RFC 8754のSRH、RFC 8986のEnd、End.X、End.DT4、End.DT6、H.Encaps）
+  - SRv6（RFC 8754のSRH。RFC 8986のEnd、End.X、End.DX2、End.DX4、End.DX6、End.DT4、End.DT6、End.DT46、
+    H.Encaps、H.Encaps.Red、H.Encaps.L2、H.Encaps.L2.Red、PSP、USP、USD。RFC 9800の圧縮したSID（NEXT-CSID））
   - ルータ宛て通信の分類と流量制限、kernelへの受け渡し（TUN）
-- CE: 設定管理（`ruster-confd`）、経路の選択（`ruster-ribd`）、ARPとND（`ruster-neighd`）。
+- CE: 設定管理（`ruster-confd`）、経路の選択（`ruster-ribd`。SRv6の経路も、送り手から受ける）、ARPとND（`ruster-neighd`）。
 - FEをいろいろな環境で動かすためのI/O層（AF_XDP、AF_PACKET、sim）。
 - FEとCEをつなぐ小さなメッセージ形式と、それを読み書きするライブラリ。
 - 設定ファイルを検証してCEの各プロセスへ反映するCLI。
