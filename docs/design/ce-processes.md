@@ -191,7 +191,8 @@ confd再起動
 ### 入力
 
 経路の提供元（送り手）ごとに、VRFと宛先プレフィックスをキーに、次の転送先（インターフェースとアドレス、
-またはゲートウェイのアドレスだけ）か、discard、rejectなどの動作を受け取る。形は`ietf-routing`（RFC 8349）に合わせる。
+またはゲートウェイのアドレスだけ）か、discard、rejectなどの動作を受け取る。SRv6のローカルのSIDと包む方針も
+経路の動作の一つで（[`overlay.md`](overlay.md)の「5. SRv6」）、どの送り手も書ける。形は`ietf-routing`（RFC 8349）に合わせる。
 経路ごとの優先度、metric、有効期限は受け取らない。
 
 優先度は送り手ごとに一つで、ribdの起動の引数で決める（`NAME:PREFERENCE:HOLD_MS:DROP_MS`、後ろの二つは省略できる）。送り手のsocketも、
@@ -202,7 +203,7 @@ confd再起動
 |---|---|
 | confd | 設定の静的経路、アドレスから決まる直結経路 |
 | DHCP client、PPPoE | default経路 |
-| ルーティングデーモン | BGP、OSPFなどの経路 |
+| ルーティングデーモン | BGP、OSPFなどの経路。BGPのSRv6 L3VPN（RFC 9252）なら、End.DT4などのSIDと、包む方針の経路 |
 
 送り手の宣言とsocketの分け方はconfdと同じ（`/run/ruster/ribd/source/<名前>/source.sock`）。
 
@@ -225,7 +226,7 @@ FEへ書く（RFC 4271の5.1.3と9.1.2.1）。
 - 引いた経路もゲートウェイだけの経路なら、その解決の結果を使う。それが解決できなければ、こちらも解決できない。
 - ゲートウェイだけの経路どうしが互いを引いてループになるときは、ループの外へ出るゲートウェイだけを使う。
   たどる深さは8つの経路まで。
-- local、discard、reject、別のVRFを引き直す経路に当たったら解決できない。
+- local、discard、reject、別のVRFを引き直す経路、SRv6の経路に当たったら解決できない。
 - default経路は、ribdに`--resolve-via-default`を付けたときだけ使う（FRRの`ip nht resolve-via-default`と同じ）。
 - どのゲートウェイも解決できない経路はFEに入れない。
 
