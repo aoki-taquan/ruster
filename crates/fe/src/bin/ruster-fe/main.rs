@@ -21,12 +21,12 @@
 //!   on another thread. With `--one-thread` the forwarding thread does both too,
 //!   between batches.
 //! - `--nat-mappings` (8,192 by default) is how many inside addresses and ports NAT
-//!   maps, for each of UDP, ICMP and TCP; `--nat-sessions` (16,384) how many TCP
-//!   connections it follows; `--firewall-states` (16,384) how many flows the
-//!   firewall keeps, about three quarters of them live at once. Each is from
-//!   [`STATES_LEAST`] to [`STATES_MOST`]. A mapping takes about 700 bytes, a
-//!   session about 220 and a firewall state about 110, allocated when the tables
-//!   first have NAT or a firewall rule.
+//!   maps, for each of UDP, ICMP and TCP, and `--nat-sessions` (16,384) how many
+//!   TCP connections it follows: each from [`STATES_LEAST`] to [`NAT_MOST`].
+//!   `--firewall-states` (16,384) is how many flows the firewall keeps, about three
+//!   quarters of them live at once, from [`STATES_LEAST`] to [`FIREWALL_MOST`].
+//!   A mapping takes about 700 bytes, a session about 220 and a firewall state
+//!   about 110, allocated when the tables first have NAT or a firewall rule.
 //! - `af-packet` receives copies: the kernel still sees every frame, so the devices
 //!   must carry no kernel address or route, and the kernel must not forward on them.
 
@@ -61,10 +61,18 @@ pub trait Backend<B> {
     fn drain(&mut self, io: &mut B) -> bool;
 }
 
-/// The fewest and the most of each of `--nat-mappings`, `--nat-sessions` and
-/// `--firewall-states`.
+/// The fewest of each of `--nat-mappings`, `--nat-sessions` and `--firewall-states`.
 pub const STATES_LEAST: usize = 64;
-pub const STATES_MOST: usize = 1 << 22;
+/// The most of `--nat-mappings` and `--nat-sessions`. Every table change looks at
+/// all of NAT's states on the forwarding thread: at this size, by the bytes read,
+/// about 5 to 20 ms.
+pub const NAT_MOST: usize = 1 << 18;
+/// The most of `--firewall-states`. A table change carries the live flows only
+/// while checking them again stays within core's
+/// `FIREWALL_CARRY_REEVALUATION_BUDGET`, and drops them all above it: with changed
+/// routes, about 43,000 live flows. At this size about 24,000 are live, which
+/// leaves room for changed rules too.
+pub const FIREWALL_MOST: usize = 1 << 15;
 
 /// How long a stopping FE waits for frames still in the kernel.
 const DRAIN_MS: u64 = 1_000;
@@ -108,13 +116,11 @@ fn args() -> Result<Args, String> {
         states: StateSizes::default(),
         devices: Vec::new(),
     };
-    let count = |flag: &str, value: Option<String>| {
+    let count = |flag: &str, value: Option<String>, most: usize| {
         value
             .and_then(|n| n.parse().ok())
-            .filter(|n| (STATES_LEAST..=STATES_MOST).contains(n))
-            .ok_or(format!(
-                "{flag} is a number from {STATES_LEAST} to {STATES_MOST}"
-            ))
+            .filter(|n| (STATES_LEAST..=most).contains(n))
+            .ok_or(format!("{flag} is a number from {STATES_LEAST} to {most}"))
     };
     let mut rest = rest.into_iter();
     while let Some(arg) = rest.next() {
@@ -146,9 +152,15 @@ fn args() -> Result<Args, String> {
                     .filter(|&n| (1..=64).contains(&n))
                     .ok_or("--workers is a number from 1 to 64")?;
             }
-            "--nat-mappings" => args.states.nat_mappings = count(&arg, rest.next())?,
-            "--nat-sessions" => args.states.nat_sessions = count(&arg, rest.next())?,
-            "--firewall-states" => args.states.firewall_states = count(&arg, rest.next())?,
+            "--nat-mappings" => {
+                args.states.nat_mappings = count(&arg, rest.next(), NAT_MOST)?;
+            }
+            "--nat-sessions" => {
+                args.states.nat_sessions = count(&arg, rest.next(), NAT_MOST)?;
+            }
+            "--firewall-states" => {
+                args.states.firewall_states = count(&arg, rest.next(), FIREWALL_MOST)?;
+            }
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ => args.devices.push(arg),
         }
