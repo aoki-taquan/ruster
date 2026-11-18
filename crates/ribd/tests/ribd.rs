@@ -58,6 +58,7 @@ fn spec(name: &str, preference: u32) -> SourceSpec {
         name: name.into(),
         preference,
         hold_ms: 5_000,
+        drop_after_ms: None,
     }
 }
 
