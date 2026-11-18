@@ -353,6 +353,15 @@ impl Server {
         Ok(())
     }
 
+    /// Takes every entry of the tables `tables` away, as a resync with nothing sent
+    /// again would: for a receiver whose writer went away and did not come back.
+    /// Returns whether `hook` took it.
+    pub fn drop_tables(&mut self, tables: &[u64], hook: &mut dyn Hook) -> bool {
+        self.store.mark_stale(tables);
+        let undo = self.store.drop_stale(tables);
+        self.commit(undo, hook, false).0 == Code::CHANGED
+    }
+
     /// From now on the answer to an accepted change (2.04 to an iPATCH or to
     /// resync-end) is not sent when the change is accepted but at the next
     /// [`Server::release_changed`]: for a server whose tables take effect somewhere

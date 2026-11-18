@@ -1,10 +1,12 @@
-//! `ruster-ribd [--run-dir DIR] [--resolve-via-default] [NAME:PREFERENCE[:HOLD_MS]]...`:
+//! `ruster-ribd [--run-dir DIR] [--resolve-via-default] [NAME:PREFERENCE[:HOLD_MS[:DROP_MS]]]...`:
 //! route selection.
 //!
 //! ribd writes the FE's route table and listens on one socket per route source
 //! (`ribd/source/NAME/source.sock`). With no sources given, the only source is `confd` with
 //! preference 1. Lower preference wins; HOLD_MS (default 5000) is how long ribd waits
 //! for a source to finish sending after start-up before it tells the FE it is done.
+//! With DROP_MS, a source that has had no connection for that long loses its routes;
+//! without it, they stay until it connects again or ribd restarts.
 //! `--resolve-via-default` lets gateways be resolved through the default route
 //! ([`ruster_ribd::resolve`]).
 
@@ -19,7 +21,7 @@ use ruster_ribd::{Options, Ribd, SourceSpec};
 const FE_WAIT: Duration = Duration::from_secs(10);
 
 fn source(text: &str) -> Result<SourceSpec, String> {
-    let bad = || format!("{text}: a source is NAME:PREFERENCE[:HOLD_MS]");
+    let bad = || format!("{text}: a source is NAME:PREFERENCE[:HOLD_MS[:DROP_MS]]");
     let mut parts = text.split(':');
     let name = parts
         .next()
@@ -36,6 +38,10 @@ fn source(text: &str) -> Result<SourceSpec, String> {
         Some(hold) => hold.parse().map_err(|_| bad())?,
         None => 5_000,
     };
+    let drop_after_ms = match parts.next() {
+        Some(after) => Some(after.parse().map_err(|_| bad())?),
+        None => None,
+    };
     if parts.next().is_some() {
         return Err(bad());
     }
@@ -43,6 +49,7 @@ fn source(text: &str) -> Result<SourceSpec, String> {
         name: name.to_owned(),
         preference,
         hold_ms,
+        drop_after_ms,
     })
 }
 

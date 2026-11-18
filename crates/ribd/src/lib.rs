@@ -11,6 +11,10 @@
 //! only after every source said it has sent everything (`sync-done`) or its hold time
 //! ran out. Forwarding keeps the old routes in the meantime.
 //!
+//! A source given a drop time ([`SourceSpec::drop_after_ms`]) that has had no
+//! connection for that long loses its routes; others keep theirs until they connect
+//! again or ribd restarts.
+//!
 //! A selected route whose next hops are only gateway addresses is resolved through
 //! the other selected routes of its VRF before it goes to the FE ([`resolve`]).
 //!
@@ -48,6 +52,9 @@ pub struct SourceSpec {
     pub preference: u32,
     /// After ribd starts, how long to wait for this source's `sync-done`.
     pub hold_ms: u64,
+    /// When set, the source's routes go once it has had no connection for this
+    /// long. When not, they stay until it connects again or ribd restarts.
+    pub drop_after_ms: Option<u64>,
 }
 
 /// How ribd works, apart from its sources.
@@ -79,6 +86,8 @@ impl Default for Options {
 pub struct RibdCounters {
     pub patches_sent: u64,
     pub patches_refused: u64,
+    /// Sources whose routes went because they stayed away.
+    pub sources_dropped: u64,
 }
 
 struct Source {
@@ -88,6 +97,8 @@ struct Source {
     gateways: usize,
     /// The gateway addresses of those routes, by VRF, and how many routes give each.
     gateway_addresses: BTreeMap<(String, IpAddr), usize>,
+    /// Since when it has had no connection, while it has routes.
+    gone_since: Option<u64>,
 }
 
 fn is_gateways(value: Option<&Value>) -> bool {
@@ -265,6 +276,7 @@ impl Ribd {
                     server: Server::new(),
                     gateways: 0,
                     gateway_addresses: BTreeMap::new(),
+                    gone_since: None,
                 })
                 .collect(),
             options,
@@ -531,6 +543,30 @@ impl Task for Ribd {
                 gateway_addresses: &mut source.gateway_addresses,
             };
             progress = progress.and(source.server.step(&mut changed));
+            // A source that went away for longer than it may: its routes go.
+            if let Some(after) = source.spec.drop_after_ms {
+                if source.server.peers() > 0 || source.server.store().is_empty() {
+                    source.gone_since = None;
+                } else {
+                    let since = *source.gone_since.get_or_insert(now_ms);
+                    let at = since.saturating_add(after);
+                    if now_ms >= at {
+                        source.gone_since = None;
+                        if source.server.drop_tables(&[sid::ROUTE], &mut changed) {
+                            self.counters.sources_dropped += 1;
+                            eprintln!(
+                                "ruster-ribd: source {} has been away {after} ms; its routes go",
+                                source.spec.name
+                            );
+                        }
+                    } else {
+                        progress = progress.and(Progress {
+                            busy: false,
+                            wake_at: Some(at),
+                        });
+                    }
+                }
+            }
             self.dirty |= changed.any;
             self.whole |= changed.whole;
             self.resync_end_refused &= !changed.any;
@@ -747,6 +783,7 @@ mod tests {
                 name: name.into(),
                 preference,
                 hold_ms: 0,
+                drop_after_ms: None,
             });
         let options = Options {
             changes_per_patch: per_patch,
@@ -911,6 +948,7 @@ mod tests {
             name: "bgp".into(),
             preference: 50,
             hold_ms: 0,
+            drop_after_ms: None,
         };
         let options = Options {
             changes_per_patch: 7,
@@ -974,6 +1012,7 @@ mod tests {
             name: name.into(),
             preference,
             hold_ms: 0,
+            drop_after_ms: None,
         });
         let mut ribd = Ribd::new(b, specs.to_vec()).unwrap();
         let mut sources: Vec<Client> = specs
@@ -1060,5 +1099,77 @@ mod tests {
             Value::Route(RouteAction::Forward(hops)) => hops[0].interface == "wan2",
             _ => false,
         }));
+    }
+
+    /// Two sources with the same routes' kind: `kept` keeps its routes when it goes
+    /// away, `dropped` loses them after 1 s without a connection.
+    #[test]
+    fn a_source_away_longer_than_it_may_loses_its_routes() {
+        let mut fe = Server::new();
+        let (a, b) = UnixStream::pair().unwrap();
+        fe.attach(a, &[sid::ROUTE]).unwrap();
+        let specs = [("kept", 20, None), ("dropped", 50, Some(1_000))].map(
+            |(name, preference, drop_after_ms)| SourceSpec {
+                name: name.into(),
+                preference,
+                hold_ms: 0,
+                drop_after_ms,
+            },
+        );
+        let mut ribd = Ribd::new(b, specs.to_vec()).unwrap();
+        let route = |third: u8| {
+            let key = Key::Route {
+                vrf: "default".into(),
+                prefix: std::net::Ipv4Addr::new(10, 0, third, 0).into(),
+                len: 24,
+            };
+            let hop = NextHop {
+                interface: "a".into(),
+                address: None,
+            };
+            Change::set(key, Value::Route(RouteAction::Forward(vec![hop])))
+        };
+        let connect = |ribd: &mut Ribd, name: &str, third: u8| {
+            let (a, b) = UnixStream::pair().unwrap();
+            ribd.attach_source(name, a).unwrap();
+            let mut client = Client::new(b).unwrap();
+            client.patch(&[route(third)]).unwrap();
+            client.sync_done();
+            client
+        };
+        let mut kept = Some(connect(&mut ribd, "kept", 1));
+        let mut dropped = Some(connect(&mut ribd, "dropped", 2));
+        // How many routes the FE holds once all is quiet at `now`.
+        let mut settle = |ribd: &mut Ribd, now: u64| {
+            for _ in 0..1_000 {
+                let busy = fe.step(&mut Fe).busy | ribd.step(now).busy;
+                if !busy {
+                    break;
+                }
+            }
+            fe.store().len()
+        };
+        for client in [&mut kept, &mut dropped].into_iter().flatten() {
+            client.poll();
+        }
+        assert_eq!(settle(&mut ribd, 0), 2);
+        // Both go away.
+        drop(kept.take());
+        drop(dropped.take());
+        assert_eq!(settle(&mut ribd, 10), 2);
+        assert_eq!(settle(&mut ribd, 1_009), 2);
+        assert_eq!(settle(&mut ribd, 1_010), 1);
+        assert_eq!(ribd.counters().sources_dropped, 1);
+        // Back, and away again: a connection before the time keeps the routes.
+        dropped = Some(connect(&mut ribd, "dropped", 2));
+        dropped.as_mut().unwrap().poll();
+        assert_eq!(settle(&mut ribd, 2_000), 2);
+        drop(dropped.take());
+        assert_eq!(settle(&mut ribd, 2_500), 2);
+        dropped = Some(connect(&mut ribd, "dropped", 2));
+        dropped.as_mut().unwrap().poll();
+        assert_eq!(settle(&mut ribd, 3_400), 2);
+        assert_eq!(settle(&mut ribd, 9_000), 2);
+        assert_eq!(ribd.counters().sources_dropped, 1);
     }
 }

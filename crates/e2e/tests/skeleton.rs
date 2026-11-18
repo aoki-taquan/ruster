@@ -153,6 +153,7 @@ impl Router {
                 name: "confd".into(),
                 preference: 1,
                 hold_ms: 5_000,
+                drop_after_ms: None,
             }],
         )
         .unwrap();
