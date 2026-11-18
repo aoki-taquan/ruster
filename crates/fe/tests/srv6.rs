@@ -294,3 +294,51 @@ fn an_ipv4_packet_with_df_too_long_once_wrapped_gets_fragmentation_needed() {
     assert_eq!((error[icmp], error[icmp + 1]), (3, 4));
     assert_eq!(u16::from_be_bytes([error[icmp + 6], error[icmp + 7]]), 1460);
 }
+
+#[test]
+fn routes_with_the_same_policy_share_one_interface() {
+    let mut fe = bench();
+    // More routes than there are interface ids, all with the policy of the bench's
+    // 10.2.0.0/16, and one with another policy.
+    let policy = |segment: &str| {
+        RouteAction::Srv6Encap(Srv6Encap {
+            source: v6("2001:db8::1"),
+            segments: vec![v6(segment)],
+            reduced: false,
+        })
+    };
+    let mut routes: Vec<Change> = (0..70_000_u32)
+        .map(|n| {
+            let address = Ipv4Addr::from(0x0b00_0000 | n);
+            route("red", address.into(), 32, policy("fc00:2::4"))
+        })
+        .collect();
+    routes.push(route(
+        "red",
+        Ipv4Addr::new(10, 3, 0, 0).into(),
+        16,
+        policy("fc00:3::4"),
+    ));
+    let (a, b) = UnixStream::pair().unwrap();
+    fe.attach(a, writers::ROUTE).unwrap();
+    let mut client = Client::new(b).unwrap();
+    let token = client.patch(&routes).unwrap();
+    assert_eq!(settle(&mut fe, &mut client, token), Code::CHANGED);
+
+    let to = |destination: [u8; 4]| {
+        let mut frame = LAN_MAC.to_vec();
+        frame.extend_from_slice(&HOST_MAC);
+        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(&ipv4(HOST, destination));
+        frame
+    };
+    for (destination, segment) in [
+        ([11, 1, 17, 111], "fc00:2::4"),
+        (REMOTE, "fc00:2::4"),
+        ([10, 3, 0, 9], "fc00:3::4"),
+    ] {
+        let out = send(&mut fe, LAN, to(destination));
+        assert_eq!(out.len(), 1, "{destination:?}");
+        assert_eq!(&out[0].1[14 + 24..14 + 40], &v6(segment).octets());
+    }
+}
