@@ -4,7 +4,7 @@ use std::net::Ipv4Addr;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 
 use ruster_core::{ipv4_header_checksum, IfId};
-use ruster_fe::{writers, Fe};
+use ruster_fe::{writers, Fe, StateSizes};
 use ruster_io_sim::SimIo;
 use ruster_proto::cbor::Decoder;
 use ruster_proto::coap::Code;
@@ -5251,4 +5251,76 @@ fn version_timing_up_to_a_full_table() {
             spent / 20
         );
     }
+}
+
+/// Sends ten UDP datagrams from the LAN host, from ten source ports, and then the
+/// replies to them, with NAT or the firewall of `sizes`. Returns how many went out
+/// and how many replies came back in.
+fn ten_flows(sizes: StateSizes, with_nat: bool) -> (usize, usize) {
+    let mut bench = Bench::new();
+    bench.fe.set_state_sizes(sizes);
+    let (mut config, _routes) = configure(&mut bench);
+    let mut neighbors = bench.connect(writers::NEIGHBOR);
+    bench.patch(
+        &mut neighbors,
+        &[
+            neighbor("wan", GATEWAY, GATEWAY_MAC),
+            neighbor("lan", [192, 0, 2, 10], HOST_MAC),
+        ],
+    );
+    let tables = if with_nat {
+        nat(40_000, 40_999)
+    } else {
+        accept_udp_from_lan(10)
+    };
+    assert_eq!(bench.patch(&mut config, &[tables]), Code::CHANGED);
+    let mut send = |ingress: u16, frame: Vec<u8>| {
+        bench.now += 10;
+        bench.fe.io_mut().inject(IfId(ingress), frame);
+        bench.fe.step(bench.now);
+        bench.fe.io_mut().pop_tx()
+    };
+    let mut replies = Vec::new();
+    for source_port in 1_000..1_010_u16 {
+        let mut frame = udp_from_host(INTERNET);
+        frame[34..36].copy_from_slice(&source_port.to_be_bytes());
+        let Some(out) = send(0, frame) else { continue };
+        let mut reply = udp_reply_to_host();
+        // Back to the address and port the datagram left from.
+        reply[30..34].copy_from_slice(&out.bytes[26..30]);
+        reply[24..26].fill(0);
+        let checksum = ipv4_header_checksum(&reply[14..34]);
+        reply[24..26].copy_from_slice(&checksum.to_be_bytes());
+        reply[36..38].copy_from_slice(&out.bytes[34..36]);
+        replies.push(reply);
+    }
+    let out = replies.len();
+    let back = replies
+        .into_iter()
+        .filter_map(|reply| send(1, reply))
+        .count();
+    (out, back)
+}
+
+#[test]
+fn nat_keeps_as_many_mappings_as_it_was_given() {
+    assert_eq!(ten_flows(StateSizes::default(), true), (10, 10));
+    let small = StateSizes {
+        nat_mappings: 4,
+        ..StateSizes::default()
+    };
+    let (out, back) = ten_flows(small, true);
+    assert!((1..=4).contains(&out), "{out} mapped");
+    assert_eq!(back, out);
+}
+
+#[test]
+fn the_firewall_keeps_as_many_flows_as_it_was_given() {
+    assert_eq!(ten_flows(StateSizes::default(), false), (10, 10));
+    let small = StateSizes {
+        firewall_states: 4,
+        ..StateSizes::default()
+    };
+    let (out, back) = ten_flows(small, false);
+    assert!((1..=3).contains(&back), "{back} of {out} came back");
 }
