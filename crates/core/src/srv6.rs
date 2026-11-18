@@ -180,10 +180,12 @@ impl Srv6Table {
     }
 
     /// The same table with `policies`, each on its own interface.
-    pub fn with_policies(mut self, policies: Vec<Srv6Policy>) -> Result<Self, Srv6Error> {
-        let mut interfaces: Vec<IfId> = policies.iter().map(|p| p.interface).collect();
-        interfaces.sort_unstable();
-        if interfaces.windows(2).any(|w| w[0] == w[1]) {
+    pub fn with_policies(mut self, mut policies: Vec<Srv6Policy>) -> Result<Self, Srv6Error> {
+        policies.sort_unstable_by_key(|p| p.interface);
+        if policies
+            .windows(2)
+            .any(|w| w[0].interface == w[1].interface)
+        {
             return Err(Srv6Error::DuplicatePolicy);
         }
         self.policies = policies.into();
@@ -192,7 +194,10 @@ impl Srv6Table {
 
     /// The policy whose interface is `interface`.
     pub(crate) fn policy(&self, interface: IfId) -> Option<&Srv6Policy> {
-        self.policies.iter().find(|p| p.interface == interface)
+        self.policies
+            .binary_search_by_key(&interface, |p| p.interface)
+            .ok()
+            .map(|at| &self.policies[at])
     }
 
     fn sid(&self, destination: [u8; 16]) -> Option<&Srv6Sid> {
@@ -489,6 +494,13 @@ impl Srv6Policy {
             segments: segments.into(),
             reduced,
         })
+    }
+
+    /// The same policy on `interface`.
+    #[must_use]
+    pub fn on(mut self, interface: IfId) -> Self {
+        self.interface = interface;
+        self
     }
 
     /// The entries of the Segment Routing Header; 0 for none.

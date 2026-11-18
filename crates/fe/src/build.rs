@@ -1035,6 +1035,9 @@ pub(crate) fn build(
     let mut policies = Vec::new();
     // Each SR policy's interface and the index of its VRF.
     let mut policy_vrfs: Vec<(IfId, usize)> = Vec::new();
+    // The interface of each SR policy, by its VRF, source, segments and whether
+    // reduced: the routes with the same policy share one.
+    let mut policy_ids: BTreeMap<(&str, &table::Srv6Encap), IfId> = BTreeMap::new();
     let mut firewall = Vec::new();
     let mut firewall_on = false;
     let mut firewall_filtering = table::NatFiltering::default();
@@ -1086,24 +1089,32 @@ pub(crate) fn build(
                     }
                     RouteAction::Srv6Encap(encap) => {
                         // An interface of the FE's own for the policy: the route
-                        // leaves through it, and core wraps what it sends.
+                        // leaves through it, and core wraps what it sends. The
+                        // routes of one VRF with the same policy share it.
                         srv6_routes = true;
-                        let id = ids.take(&format!("srv6 {vrf} {prefix}/{len}"))?;
-                        interfaces.push(Interface {
-                            id,
-                            mac: MacAddress([0x02, 0x73, 0x72, 0x76, 0x36, 0x00]),
-                            mtu: u16::MAX,
-                        });
-                        policy_vrfs.push((id, index_of(vrf).expect("every route VRF is listed")));
-                        policies.push(
-                            ruster_core::Srv6Policy::new(
-                                id,
-                                encap.source.octets(),
-                                encap.segments.iter().map(|s| s.octets()).collect(),
-                                encap.reduced,
-                            )
-                            .map_err(|e| format!("route {vrf} {prefix}/{len}: {e:?}"))?,
-                        );
+                        let id = match policy_ids.get(&(vrf.as_str(), encap)) {
+                            Some(&id) => id,
+                            None => {
+                                let policy = ruster_core::Srv6Policy::new(
+                                    IfId(0),
+                                    encap.source.octets(),
+                                    encap.segments.iter().map(|s| s.octets()).collect(),
+                                    encap.reduced,
+                                )
+                                .map_err(|e| format!("route {vrf} {prefix}/{len}: {e:?}"))?;
+                                let id = ids.take(&policy_name(vrf, encap))?;
+                                interfaces.push(Interface {
+                                    id,
+                                    mac: MacAddress([0x02, 0x73, 0x72, 0x76, 0x36, 0x00]),
+                                    mtu: u16::MAX,
+                                });
+                                policy_vrfs
+                                    .push((id, index_of(vrf).expect("every route VRF is listed")));
+                                policies.push(policy.on(id));
+                                policy_ids.insert((vrf.as_str(), encap), id);
+                                id
+                            }
+                        };
                         Entry::Forward(Forward {
                             prefix: *prefix,
                             len: *len,
@@ -1310,10 +1321,11 @@ pub(crate) fn build(
     for &(id, at) in &policy_vrfs {
         by_ingress[usize::from(id.0)] = u16::try_from(at).unwrap_or(0);
     }
+    let policy_interfaces: BTreeSet<IfId> = policy_vrfs.iter().map(|&(id, _)| id).collect();
     let enabled = interfaces
         .iter()
         .map(|i| i.id)
-        .filter(|id| !kernel.contains(id) && policy_vrfs.iter().all(|&(p, _)| p != *id))
+        .filter(|id| !kernel.contains(id) && !policy_interfaces.contains(id))
         .collect();
     let srv6 = ruster_core::Srv6Table::new(sids)
         .and_then(|table| table.with_policies(policies))
@@ -1378,6 +1390,19 @@ pub(crate) fn build(
         tables,
     };
     Ok((built, routes))
+}
+
+/// The name of the FE's own interface for the SR policy `encap` of VRF `vrf`.
+fn policy_name(vrf: &str, encap: &table::Srv6Encap) -> String {
+    use std::fmt::Write;
+    let mut name = format!("srv6 {vrf} {}", encap.source);
+    for segment in &encap.segments {
+        let _ = write!(name, " {segment}");
+    }
+    if encap.reduced {
+        name.push_str(" red");
+    }
+    name
 }
 
 /// Core's SID for an SRv6 SID route, or `None` when it names an interface that is

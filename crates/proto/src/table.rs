@@ -562,7 +562,7 @@ impl Srv6Local {
 }
 
 /// The segments of an SR policy (H.Encaps, RFC 8986 section 5.1).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Srv6Encap {
     /// The outer source address.
     pub source: std::net::Ipv6Addr,
