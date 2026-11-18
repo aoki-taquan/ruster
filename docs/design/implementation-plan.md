@@ -171,6 +171,24 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-10 にow
 - `backlog`のissueに残したMediumとLow（試験の不足、数え方、説明の細かい点、作らないと決めて理由を書いた点）は、
   backlogのまま置き、使う場面が出たものから片付ける。
 
+#### SRv6とVXLANを作りきる（2026-11-19 owner決定）
+
+ownerが、SRv6の動作を増やすこと、VXLANの制限を外すこと、SRv6とVXLANのbacklogを片付けること、
+経路の送り手（bird-rsなど）からSRv6の経路を受けることを決めた（charterも書き換えた）。FPMでFRRから受けるのと
+EVPNは、今までどおり作らない。順番は次のとおり。
+
+1. 包む方針の経路のインターフェースを、同じ（送信元、SIDのリスト、Red）の経路で共有する（#768）。
+   経路の送り手からBGPの経路が多く来ても、尽きず遅くならないため。
+2. 経路の送り手からSRv6の経路（`srv6-local`と`srv6-encap`）を受けて選ぶことを、ribdで確かめて書く。
+3. End.DX4、End.DX6、End.DT46。
+4. PSP、USP、USDのflavor（End、End.X）。
+5. H.Encaps.L2、H.Encaps.L2.Red、End.DX2。L2の方は、VXLANやEtherIPと同じくブリッジのメンバーにする。
+6. SIDごとの数を、FEの状態のsocketで見せる。
+7. VXLAN: 一つのブリッジに複数のVXLANのメンバー、UDPのポートと下側のVRFを選ぶ、下側の本当のMTUで
+   確かめる、一覧から消したVTEPの後ろで学んだMACを消す、VXLANのメンバーに静的なMAC（VTEPを付けて）。
+8. RFC 9800のNEXT-CSID（End、End.X、End.DT4、End.DT6、End.DT46）。
+9. SRv6とVXLANのbacklog（#754、#756、#759、#762、#765、#768、#774）のうち、上で片付かなかったもの。
+
 #### 経路や通信の数が増えたとき
 
 FRRの橋渡し役は100万経路まで受ける。2026-11-10に測ると、FEは表が大きいと更新に時間がかかり、その間は
