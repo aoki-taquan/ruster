@@ -86,6 +86,11 @@ pub mod option {
     pub const ACCEPT: u16 = 17;
     /// In a CSM message (RFC 8323 section 5.3.1).
     pub const MAX_MESSAGE_SIZE: u16 = 2;
+    /// In a CSM message: the version of ruster's control protocol the sender
+    /// speaks ([`crate::conn::PROTOCOL_VERSION`]). From the experimental range of
+    /// RFC 8323 section 11.2, and even, so elective: a peer that does not know it
+    /// ignores it.
+    pub const PROTOCOL_VERSION: u16 = 65000;
 }
 
 /// The longest token CoAP allows.

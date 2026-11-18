@@ -4,17 +4,26 @@
 //! [`Connection::pump`] moves bytes between the socket and the buffers, and
 //! [`Connection::next_message`] hands out whole messages. Signaling messages
 //! (RFC 8323 section 5) are handled here: each side sends a CSM with its
-//! Max-Message-Size first, a Ping is answered with a Pong, and an Abort closes the
-//! connection.
+//! Max-Message-Size and the version of the control protocol it speaks first, a Ping
+//! is answered with a Pong, and an Abort closes the connection.
+//!
+//! A peer whose CSM gives another protocol version is sent an Abort that says both
+//! versions, and the connection closes; the reason goes to standard error on both
+//! sides, so a peer built from another version of ruster shows as that, not as
+//! refused requests. A CSM without a version (a peer from before versions) is
+//! taken.
 //!
 //! Messages are copied into [`Incoming`] values. This is the control path, where
 //! a copy is cheaper than tying the caller to the buffer.
 //!
 //! # Standards
 //!
-//! - RFC 8323 section 5.3: each side sends a CSM first, with Max-Message-Size.
+//! - RFC 8323 section 5.3: each side sends a CSM first, with Max-Message-Size, and
+//!   the protocol version as an elective option from the experimental range
+//!   ([`option::PROTOCOL_VERSION`]).
 //! - RFC 8323 section 5.4: a Ping is answered with a Pong.
-//! - RFC 8323 section 5.6: an Abort closes the connection.
+//! - RFC 8323 section 5.6: an Abort closes the connection; its diagnostic payload
+//!   says why.
 //!
 //! Deviations: a Release (section 5.5) is ignored instead of draining the connection,
 //! and the Block-Wise-Transfer CSM option is not offered.
@@ -27,6 +36,11 @@ use crate::coap::{self, option, Code, Decoded, EncodeError, FrameError};
 
 /// The largest message either side accepts, announced in the CSM.
 pub const DEFAULT_LIMIT: usize = 16 * 1024 * 1024;
+
+/// The version of the control protocol (`docs/design/control-protocol.md`),
+/// announced in the CSM. It goes up when a message or a table's encoding changes
+/// so that a peer from before cannot read it.
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// At most this many bytes are read from the socket in one [`Connection::pump`].
 const READ_CHUNK: usize = 64 * 1024;
@@ -89,6 +103,8 @@ pub struct Connection {
     outbuf: Vec<u8>,
     closed: bool,
     peer_limit: Option<usize>,
+    /// The protocol version from the peer's CSM, once it has arrived with one.
+    peer_version: Option<u32>,
     more: bool,
     /// Where each read lands before its bytes join `inbuf`: allocated once,
     /// so a pump that finds nothing to read touches no memory.
@@ -117,16 +133,22 @@ impl Connection {
             outbuf: Vec::new(),
             closed: false,
             peer_limit: None,
+            peer_version: None,
             more: false,
             chunk: vec![0; READ_CHUNK].into_boxed_slice(),
         };
         let mut size = [0; 4];
         let size = coap::uint_option(u32::try_from(limit).unwrap_or(u32::MAX), &mut size);
+        let mut version = [0; 4];
+        let version = coap::uint_option(PROTOCOL_VERSION, &mut version);
         coap::encode(
             &mut conn.outbuf,
             Code::CSM,
             &[],
-            &[(option::MAX_MESSAGE_SIZE, size)],
+            &[
+                (option::MAX_MESSAGE_SIZE, size),
+                (option::PROTOCOL_VERSION, version),
+            ],
             &[],
         )
         .expect("a CSM always encodes");
@@ -141,6 +163,11 @@ impl Connection {
     /// The Max-Message-Size from the peer's CSM, once it has arrived.
     pub fn peer_limit(&self) -> Option<usize> {
         self.peer_limit
+    }
+
+    /// The protocol version from the peer's CSM, once it has arrived with one.
+    pub fn peer_version(&self) -> Option<u32> {
+        self.peer_version
     }
 
     /// Queues one message. Nothing is sent until [`Connection::pump`].
@@ -256,11 +283,31 @@ impl Connection {
             let max_size = message
                 .option(option::MAX_MESSAGE_SIZE)
                 .and_then(coap::read_uint_option);
+            let version = message
+                .option(option::PROTOCOL_VERSION)
+                .and_then(coap::read_uint_option);
             self.consumed += used;
             match code {
                 Code::CSM => {
                     if let Some(size) = max_size {
                         self.peer_limit = Some(size as usize);
+                    }
+                    if let Some(version) = version {
+                        self.peer_version = Some(version);
+                        if version != PROTOCOL_VERSION {
+                            let reason = format!(
+                                "control protocol version {version} from the peer, {PROTOCOL_VERSION} here"
+                            );
+                            eprintln!("ruster: closing a connection: {reason}");
+                            let _ = self.send(&Outgoing {
+                                code: Some(Code::ABORT),
+                                payload: reason.as_bytes(),
+                                ..Outgoing::default()
+                            });
+                            let _ = self.flush_now();
+                            self.close();
+                            return Ok(None);
+                        }
                     }
                 }
                 Code::PING if self.outbuf.len() < self.limit => {
@@ -274,6 +321,12 @@ impl Connection {
                 }
                 Code::PING | Code::PONG | Code::RELEASE => {}
                 Code::ABORT => {
+                    if !incoming.payload.is_empty() {
+                        eprintln!(
+                            "ruster: the peer closed a connection: {}",
+                            String::from_utf8_lossy(&incoming.payload)
+                        );
+                    }
                     self.closed = true;
                     return Ok(None);
                 }
@@ -308,6 +361,22 @@ impl Connection {
     /// The largest message this side accepts.
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// Writes what is queued as far as the socket takes it now, without waiting:
+    /// for a last message before [`Connection::close`].
+    fn flush_now(&mut self) -> io::Result<()> {
+        while !self.outbuf.is_empty() {
+            match self.stream.write(&self.outbuf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    self.outbuf.drain(..n);
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
     }
 
     /// Stops using the connection. The peer sees the socket close when it is dropped.

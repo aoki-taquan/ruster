@@ -4,7 +4,9 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 
 use ruster_proto::coap::{self, Code};
-use ruster_proto::conn::{ConnError, Connection, Incoming, Outgoing, DEFAULT_LIMIT};
+use ruster_proto::conn::{
+    ConnError, Connection, Incoming, Outgoing, DEFAULT_LIMIT, PROTOCOL_VERSION,
+};
 use ruster_proto::task::{run_until_idle, Progress, Task};
 
 fn pair() -> (Connection, Connection) {
@@ -48,7 +50,98 @@ fn csm_is_exchanged_and_requests_arrive_whole() {
     assert_eq!(got.path, ["c"]);
     assert_eq!(got.payload, b"body");
     assert_eq!(b.peer_limit(), Some(DEFAULT_LIMIT));
+    assert_eq!(b.peer_version(), Some(PROTOCOL_VERSION));
     assert!(receive(&mut b).is_none());
+}
+
+/// Writes a CSM by hand to `raw`, with `version` when given.
+fn raw_csm(raw: &mut UnixStream, version: Option<u32>) {
+    let mut size = [0; 4];
+    let size = coap::uint_option(1024, &mut size);
+    let mut number = [0; 4];
+    let mut options = vec![(coap::option::MAX_MESSAGE_SIZE, size)];
+    if let Some(version) = version {
+        options.push((
+            coap::option::PROTOCOL_VERSION,
+            coap::uint_option(version, &mut number),
+        ));
+    }
+    let mut out = Vec::new();
+    coap::encode(&mut out, Code::CSM, &[], &options, &[]).unwrap();
+    raw.write_all(&out).unwrap();
+}
+
+/// Reads every message `raw` has been sent, in order.
+fn raw_messages(raw: &mut UnixStream) -> Vec<(Code, Vec<u8>)> {
+    use std::io::Read;
+    raw.set_nonblocking(true).unwrap();
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 4096];
+    loop {
+        match raw.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(_) => break,
+        }
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    while let Ok(coap::Decoded::Message(message, used)) = coap::decode(&bytes[at..], DEFAULT_LIMIT)
+    {
+        out.push((message.code, message.payload.to_vec()));
+        at += used;
+    }
+    out
+}
+
+#[test]
+fn a_peer_of_another_protocol_version_is_sent_an_abort_and_closed() {
+    let (a, mut raw) = UnixStream::pair().unwrap();
+    let mut conn = Connection::new(a, DEFAULT_LIMIT).unwrap();
+    raw_csm(&mut raw, Some(PROTOCOL_VERSION + 1));
+    conn.pump().unwrap();
+    assert!(receive(&mut conn).is_none());
+    assert!(conn.is_closed());
+    assert_eq!(conn.peer_version(), Some(PROTOCOL_VERSION + 1));
+    let got = raw_messages(&mut raw);
+    assert_eq!(got[0].0, Code::CSM);
+    let (code, payload) = got.last().unwrap();
+    assert_eq!(*code, Code::ABORT);
+    let reason = String::from_utf8_lossy(payload);
+    assert!(
+        reason.contains(&format!(
+            "version {} from the peer, {PROTOCOL_VERSION} here",
+            PROTOCOL_VERSION + 1
+        )),
+        "{reason}"
+    );
+}
+
+#[test]
+fn a_peer_without_a_protocol_version_is_taken() {
+    let (a, mut raw) = UnixStream::pair().unwrap();
+    let mut conn = Connection::new(a, DEFAULT_LIMIT).unwrap();
+    raw_csm(&mut raw, None);
+    conn.pump().unwrap();
+    assert!(receive(&mut conn).is_none());
+    assert!(!conn.is_closed());
+    assert_eq!(conn.peer_version(), None);
+    assert_eq!(conn.peer_limit(), Some(1024));
+}
+
+#[test]
+fn an_abort_closes_the_connection() {
+    let (mut a, mut b) = pair();
+    settle(&mut a, &mut b);
+    a.send(&Outgoing {
+        code: Some(Code::ABORT),
+        payload: b"why",
+        ..Outgoing::default()
+    })
+    .unwrap();
+    settle(&mut a, &mut b);
+    assert!(receive(&mut b).is_none());
+    assert!(b.is_closed());
 }
 
 #[test]
