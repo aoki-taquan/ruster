@@ -222,3 +222,16 @@ fn the_mtu_leaves_room_for_the_outer_headers_on_the_largest_link() {
     );
     assert!(parse(&fitting).is_ok(), "{:?}", parse(&fitting).err());
 }
+
+#[test]
+fn a_bridge_member_is_no_link_for_the_outer_packets() {
+    // wan (1400) is the only routed link; p1 (1500) is a member of the bridge.
+    let small = WAN.replace(
+        "ipv6 = [\"2001:db8::1/64\"]\n",
+        "ipv6 = [\"2001:db8::1/64\"]\nmtu = 1400\n",
+    );
+    let vxlan = r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] }"#;
+    let text = with(vxlan, MEMBERS).replacen(WAN, &small, 1);
+    let error = parse(&text).unwrap_err();
+    assert!(error.contains("at most 1350 (1400"), "{error}");
+}

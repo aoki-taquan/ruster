@@ -110,10 +110,10 @@ pub(crate) fn check(
             .iter()
             .find(|i| i.name == name)
             .map_or(0, |i| i.mtu);
-        if mtu > link_mtu - overhead {
+        if mtu > link_mtu.saturating_sub(overhead) {
             return Err(format!(
                 "{at}: mtu must be at most {} ({link_mtu}, the largest MTU of the links, less the outer headers)",
-                link_mtu - overhead
+                link_mtu.saturating_sub(overhead)
             ));
         }
         if out.iter().any(|e| e.local == local && e.remote == remote) {

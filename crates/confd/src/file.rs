@@ -892,6 +892,12 @@ pub fn config(lock: Lock) -> Result<Config, String> {
         .chain(vxlan.iter().map(|(name, ..)| name.as_str()))
         .chain(srv6_l2.iter().map(|(name, ..)| name.as_str()))
         .chain(bridges.iter().map(|(name, _)| name.as_str()))
+        // A bridge member has no address: no route leaves through it.
+        .chain(
+            bridges
+                .iter()
+                .flat_map(|(_, bridge)| bridge.members.iter().map(String::as_str)),
+        )
         .collect();
     let link_mtu = interfaces
         .iter()
