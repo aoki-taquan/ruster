@@ -56,6 +56,7 @@ impl Bench {
                     local: IpAddr::from(LOCAL),
                     remotes: vec![IpAddr::from(VTEP2), IpAddr::from(VTEP3)],
                     port: 4789,
+                    underlay_vrf: "default".into(),
                 },
             ),
             Change::set(
@@ -272,6 +273,7 @@ fn vxlan(name: &str, vni: u32, remotes: &[[u8; 4]]) -> Change {
             local: IpAddr::from(LOCAL),
             remotes: remotes.iter().map(|r| IpAddr::from(*r)).collect(),
             port: 4789,
+            underlay_vrf: "default".into(),
         },
     )
 }
@@ -357,6 +359,7 @@ fn another_udp_port_is_sent_to_and_received_on() {
             local,
             remotes,
             port: 8472,
+            underlay_vrf: "default".into(),
         },
     )]);
     let broadcast = frame([0xff; 6], H1, 60);
@@ -406,4 +409,108 @@ fn a_static_address_on_a_vxlan_member_goes_to_its_vtep_only() {
         },
     )]);
     assert_ne!(code, Code::CHANGED);
+}
+
+#[test]
+fn the_outer_packets_are_in_the_underlay_vrf() {
+    // wan, and the route to the VTEPs, in VRF blue; vx0's outer packets there too.
+    let mut wan = iface("wan", WAN_MAC);
+    if let Some(Value::Interface { vrf, .. }) = wan.value.as_mut() {
+        *vrf = "blue".into();
+    }
+    let Change { key, value, .. } = vxlan("vx0", 100, &[VTEP2]);
+    let Some(Value::Vxlan {
+        vni,
+        local,
+        remotes,
+        port,
+        ..
+    }) = value
+    else {
+        unreachable!()
+    };
+    let in_blue = Change::set(
+        key,
+        Value::Vxlan {
+            vni,
+            local,
+            remotes,
+            port,
+            underlay_vrf: "blue".into(),
+        },
+    );
+    let mut bench = Bench::with(&[wan, in_blue]);
+    let route = Change::set(
+        Key::Route {
+            vrf: "blue".into(),
+            prefix: Ipv4Addr::UNSPECIFIED.into(),
+            len: 0,
+        },
+        Value::Route(RouteAction::Forward(vec![NextHop {
+            interface: "wan".into(),
+            address: Some(Ipv4Addr::new(198, 51, 100, 1).into()),
+        }])),
+    );
+    let (a, b) = UnixStream::pair().unwrap();
+    bench.fe.attach(a, writers::ROUTE).unwrap();
+    let mut routes = Client::new(b).unwrap();
+    let token = routes.patch(&[route]).unwrap();
+    assert_eq!(settle(&mut bench.fe, &mut routes, token), Code::CHANGED);
+
+    let broadcast = frame([0xff; 6], H1, 60);
+    let out = bench.send(P1, broadcast.clone());
+    assert_eq!(out.len(), 1, "{out:?}");
+    assert_eq!(vtep_of(&out[0].1, &broadcast), VTEP2);
+    let b = frame(H1, H2, 60);
+    assert_eq!(bench.send(WAN, outer(VTEP2, 100, &b)), vec![(P1, b)]);
+}
+
+#[test]
+fn outer_packets_in_another_vrf_than_the_underlay_are_not_taken() {
+    // wan in VRF blue, vx0's outer packets in the default VRF: not unwrapped.
+    let mut wan = iface("wan", WAN_MAC);
+    if let Some(Value::Interface { vrf, .. }) = wan.value.as_mut() {
+        *vrf = "blue".into();
+    }
+    let mut bench = Bench::with(&[wan]);
+    let b = frame(H1, H2, 60);
+    let out = bench.send(WAN, outer(VTEP2, 100, &b));
+    assert!(out.iter().all(|(port, _)| *port != P1), "{out:?}");
+}
+
+#[test]
+fn an_underlay_vrf_with_no_interface_up_leaves_the_overlay_without_a_route() {
+    // vx0's outer packets in VRF blue, which has no enabled interface: the tables
+    // are taken, and frames for vx0 go nowhere.
+    let mut down = iface("blue0", [2, 0, 0, 0, 0, 0xb]);
+    if let Some(Value::Interface { enabled, vrf, .. }) = down.value.as_mut() {
+        *enabled = false;
+        *vrf = "blue".into();
+    }
+    let Change { key, value, .. } = vxlan("vx0", 100, &[VTEP2]);
+    let Some(Value::Vxlan {
+        vni,
+        local,
+        remotes,
+        port,
+        ..
+    }) = value
+    else {
+        unreachable!()
+    };
+    let mut bench = Bench::with(&[
+        down,
+        Change::set(
+            key,
+            Value::Vxlan {
+                vni,
+                local,
+                remotes,
+                port,
+                underlay_vrf: "blue".into(),
+            },
+        ),
+    ]);
+    let out = bench.send(P1, frame([0xff; 6], H1, 60));
+    assert!(out.iter().all(|(port, _)| *port != WAN), "{out:?}");
 }

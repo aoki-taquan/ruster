@@ -859,7 +859,11 @@ pub(crate) fn build(
         .table(sid::ETHERIP)
         .chain(store.table(sid::VXLAN))
         .chain(store.table(sid::SRV6_L2));
+    // The VRF each overlay's outer packets are in, by name: the ids come with the
+    // VRFs' order, below.
+    let mut overlay_vrfs: Vec<&str> = Vec::new();
     for (key, value) in members {
+        let mut underlay = DEFAULT_VRF;
         let (name, local, kind) = match (key, value) {
             (Key::EtherIp { interface }, Value::EtherIp { local, remote }) => (
                 interface,
@@ -873,16 +877,20 @@ pub(crate) fn build(
                     local,
                     remotes,
                     port,
+                    underlay_vrf,
                 },
-            ) => (
-                interface,
-                *local,
-                ruster_core::OverlayKind::Vxlan {
-                    vni: *vni,
-                    remotes: remotes.clone(),
-                    port: *port,
-                },
-            ),
+            ) => {
+                underlay = underlay_vrf.as_str();
+                (
+                    interface,
+                    *local,
+                    ruster_core::OverlayKind::Vxlan {
+                        vni: *vni,
+                        remotes: remotes.clone(),
+                        port: *port,
+                    },
+                )
+            }
             (
                 Key::Srv6L2 { interface },
                 Value::Srv6L2 {
@@ -946,7 +954,9 @@ pub(crate) fn build(
                 interface: id,
                 local,
                 kind,
+                vrf: 0,
             });
+            overlay_vrfs.push(underlay);
             active.insert(name.as_str(), (id, vrf.as_str()));
         }
     }
@@ -1120,6 +1130,13 @@ pub(crate) fn build(
     names.remove(DEFAULT_VRF);
     let order: Vec<&str> = std::iter::once(DEFAULT_VRF).chain(names).collect();
     let index_of = |vrf: &str| order.iter().position(|v| *v == vrf);
+    // A VRF with no enabled interface and no route is not in the tables: the
+    // overlay has no route then (as with no link up in the default VRF).
+    for (overlay, name) in overlays.iter_mut().zip(&overlay_vrfs) {
+        overlay.vrf = index_of(name)
+            .and_then(|at| u16::try_from(at).ok())
+            .unwrap_or(u16::MAX);
+    }
     // Each VRF's kernel interface.
     let mut kernel = Vec::with_capacity(order.len());
     for (at, vrf) in order.iter().enumerate() {

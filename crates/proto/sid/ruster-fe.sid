@@ -643,6 +643,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-if-vxlan:vxlan/underlay-vrf",
+        "sid": 60285,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-if-srv6-l2:srv6-l2",
         "sid": 60300,
         "status": "unstable"

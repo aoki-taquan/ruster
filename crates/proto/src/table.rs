@@ -253,6 +253,9 @@ pub enum Value {
         /// The UDP port, sent to and received on (RFC 7348 section 5: 4789 by
         /// default, [`VXLAN_PORT`]).
         port: u16,
+        /// The VRF the outer packets are routed in and arrive in ([`DEFAULT_VRF`]
+        /// when not given).
+        underlay_vrf: String,
     },
     /// Frames leave wrapped from `source` toward `segments` (the first first;
     /// H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets to the
@@ -1056,7 +1059,9 @@ impl Change {
                         local,
                         remotes,
                         port,
+                        underlay_vrf,
                     } => {
+                        name(underlay_vrf)?;
                         if *port == 0 {
                             return Err(ModelError::Invalid("port"));
                         }
@@ -1685,8 +1690,10 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
             local,
             remotes,
             port,
+            underlay_vrf,
         } => {
-            e.map(4)
+            let other_vrf = underlay_vrf != DEFAULT_VRF;
+            e.map(4 + u64::from(other_vrf))
                 .u64(sid::VXLAN_VNI - sid::VXLAN)
                 .u64(u64::from(*vni))
                 .u64(sid::VXLAN_LOCAL - sid::VXLAN)
@@ -1697,6 +1704,9 @@ fn encode_value(value: &Value, e: &mut Encoder<'_>) {
                 e.text(&remote.to_string());
             }
             e.u64(sid::VXLAN_PORT - sid::VXLAN).u64(u64::from(*port));
+            if other_vrf {
+                e.u64(sid::VXLAN_VRF - sid::VXLAN).text(underlay_vrf);
+            }
         }
         Value::Srv6L2 {
             source,
@@ -2399,6 +2409,7 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
                 local,
                 remotes,
                 port,
+                underlay_vrf,
             },
         ) => {
             let remotes: Vec<String> = remotes.iter().map(ToString::to_string).collect();
@@ -2407,8 +2418,13 @@ pub fn entry_line(key: &Key, value: &Value) -> Option<String> {
             } else {
                 format!(" port {port}")
             };
+            let vrf = if underlay_vrf == DEFAULT_VRF {
+                String::new()
+            } else {
+                format!(" underlay-vrf {underlay_vrf}")
+            };
             format!(
-                "vxlan {interface} vni {vni}{port} {local} to {}",
+                "vxlan {interface} vni {vni}{port}{vrf} {local} to {}",
                 remotes.join(" ")
             )
         }
@@ -2578,6 +2594,8 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
     } else if table == sid::VXLAN {
         let local =
             parse_ip(&text(sid::VXLAN_LOCAL, "local")?.ok_or(ModelError::Missing("local"))?)?;
+        let underlay_vrf =
+            text(sid::VXLAN_VRF, "underlay-vrf")?.unwrap_or_else(|| DEFAULT_VRF.to_owned());
         let vni = match got.remove(&sid::VXLAN_VNI) {
             Some(Member::Uint(n)) => u32::try_from(n).map_err(|_| ModelError::Invalid("VNI"))?,
             Some(_) => return Err(ModelError::Invalid("VNI")),
@@ -2605,6 +2623,7 @@ fn decode_policy_value(table: u64, d: &mut Decoder<'_>) -> Result<Value, ModelEr
             local,
             remotes,
             port,
+            underlay_vrf,
         }
     } else if matches!(
         table,

@@ -268,14 +268,16 @@ pub fn config(lock: Lock) -> Result<Config, String> {
                 local,
                 remote,
                 port,
+                underlay_vrf,
             } => {
-                vxlan.push((
-                    entry.name.clone(),
-                    *vni,
-                    local.clone(),
-                    remote.clone(),
-                    *port,
-                ));
+                vxlan.push(crate::vxlan::Entry {
+                    name: entry.name.clone(),
+                    vni: *vni,
+                    local: local.clone(),
+                    remote: remote.clone(),
+                    port: *port,
+                    underlay_vrf: underlay_vrf.clone(),
+                });
             }
             Kind::Srv6L2 {
                 sid,
@@ -889,7 +891,7 @@ pub fn config(lock: Lock) -> Result<Config, String> {
     let members: BTreeSet<&str> = etherip
         .iter()
         .map(|(name, ..)| name.as_str())
-        .chain(vxlan.iter().map(|(name, ..)| name.as_str()))
+        .chain(vxlan.iter().map(|v| v.name.as_str()))
         .chain(srv6_l2.iter().map(|(name, ..)| name.as_str()))
         .chain(bridges.iter().map(|(name, _)| name.as_str()))
         // A bridge member has no address: no route leaves through it.
@@ -899,25 +901,31 @@ pub fn config(lock: Lock) -> Result<Config, String> {
                 .flat_map(|(_, bridge)| bridge.members.iter().map(String::as_str)),
         )
         .collect();
-    let link_mtu = interfaces
-        .iter()
-        .filter(|i| {
-            i.enabled
-                && i.vrf == DEFAULT_VRF
-                && i.tunnel.is_none()
-                && i.pppoe.is_none()
-                && !members.contains(i.name.as_str())
-        })
-        .map(|i| i.mtu)
-        .max()
-        .unwrap_or(crate::etherip::LINK_MTU)
-        .min(crate::etherip::LINK_MTU);
+    // Owned: the lists are checked below.
+    let members: BTreeSet<String> = members.into_iter().map(str::to_owned).collect();
+    // Of VRF `vrf` (VXLAN's outer packets may be in another than the default).
+    let link_mtu_in = |vrf: &str| {
+        interfaces
+            .iter()
+            .filter(|i| {
+                i.enabled
+                    && i.vrf == vrf
+                    && i.tunnel.is_none()
+                    && i.pppoe.is_none()
+                    && !members.contains(&i.name)
+            })
+            .map(|i| i.mtu)
+            .max()
+            .unwrap_or(crate::etherip::LINK_MTU)
+            .min(crate::etherip::LINK_MTU)
+    };
+    let link_mtu = link_mtu_in(DEFAULT_VRF);
     let bridges = crate::bridge::check(bridges, &interfaces)?;
     let isis = crate::isis_ospf::check_isis(lock.isis, &interfaces, &bridges)?;
     let ospf = crate::isis_ospf::check_ospf("ospf", lock.ospf, &interfaces, &bridges)?;
     let ospf6 = crate::isis_ospf::check_ospf("ospf6", lock.ospf6, &interfaces, &bridges)?;
     let etherip = crate::etherip::check(etherip, &interfaces, &bridges, link_mtu)?;
-    let vxlan = crate::vxlan::check(vxlan, &interfaces, &bridges, link_mtu)?;
+    let vxlan = crate::vxlan::check(vxlan, &interfaces, &bridges, link_mtu_in)?;
     let srv6 = crate::srv6::check(
         lock.srv6,
         &interfaces,

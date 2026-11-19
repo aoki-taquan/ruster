@@ -1562,6 +1562,7 @@ fn vxlan_entries_round_trip_and_are_checked() {
                 local: ip(local),
                 remotes: remotes.iter().map(|r| ip(r)).collect(),
                 port: ruster_proto::table::VXLAN_PORT,
+                underlay_vrf: DEFAULT_VRF.into(),
             },
         )
     };

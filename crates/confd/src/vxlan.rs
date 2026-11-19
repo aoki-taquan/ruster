@@ -20,7 +20,7 @@ use std::net::IpAddr;
 
 use ruster_proto::table::{Key, Value, VXLAN_VNI_MAX};
 
-use crate::etherip::{given, unicast};
+use crate::etherip::{given_in, unicast};
 use crate::InterfaceConfig;
 
 /// One VXLAN interface, checked.
@@ -32,6 +32,18 @@ pub struct Vxlan {
     pub local: IpAddr,
     pub remotes: Vec<IpAddr>,
     pub port: u16,
+    /// The VRF the outer packets are in.
+    pub underlay_vrf: String,
+}
+
+/// One VXLAN interface of the lock form.
+pub(crate) struct Entry {
+    pub name: String,
+    pub vni: u32,
+    pub local: String,
+    pub remote: Vec<String>,
+    pub port: u16,
+    pub underlay_vrf: String,
 }
 
 /// The most remote VTEPs of one interface.
@@ -40,13 +52,22 @@ const REMOTES_MAX: usize = 64;
 /// Checks the VXLAN interfaces (name, VNI, local, remotes) against the interfaces
 /// and the bridges.
 pub(crate) fn check(
-    entries: Vec<(String, u32, String, Vec<String>, u16)>,
+    entries: Vec<Entry>,
     interfaces: &[InterfaceConfig],
     bridges: &[crate::bridge::Bridge],
-    link_mtu: u16,
+    link_mtu_in: impl Fn(&str) -> u16,
 ) -> Result<Vec<Vxlan>, String> {
     let mut out: Vec<Vxlan> = Vec::with_capacity(entries.len());
-    for (name, vni, local, remote, port) in entries {
+    for Entry {
+        name,
+        vni,
+        local,
+        remote,
+        port,
+        underlay_vrf,
+    } in entries
+    {
+        let link_mtu = link_mtu_in(&underlay_vrf);
         let at = format!("interface {name:?}");
         if port == 0 {
             return Err(format!("{at}: vxlan port must be 1 to 65535"));
@@ -79,9 +100,9 @@ pub(crate) fn check(
             }
             remotes.push(vtep);
         }
-        if !given(interfaces, local) {
+        if !given_in(interfaces, &underlay_vrf, local) {
             return Err(format!(
-                "{at}: vxlan local {local} must be an address given to an interface in the default VRF"
+                "{at}: vxlan local {local} must be an address given to an interface in VRF {underlay_vrf:?}"
             ));
         }
         let Some(bridge) = bridges.iter().find(|b| b.members.contains(&name)) else {
@@ -140,6 +161,7 @@ pub(crate) fn check(
             local,
             remotes,
             port,
+            underlay_vrf,
         });
     }
     // A VTEP only on a VXLAN member's static address.
@@ -169,6 +191,7 @@ pub(crate) fn tables(vxlan: &[Vxlan], out: &mut BTreeMap<Key, Value>) {
                 local: interface.local,
                 remotes: interface.remotes.clone(),
                 port: interface.port,
+                underlay_vrf: interface.underlay_vrf.clone(),
             },
         );
     }

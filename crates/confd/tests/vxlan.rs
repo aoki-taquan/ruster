@@ -54,6 +54,7 @@ fn a_vxlan_member_becomes_its_row() {
                 "198.51.100.3".parse().unwrap()
             ],
             port: 4789,
+            underlay_vrf: "default".into(),
         })
     );
     // Another UDP port.
@@ -234,4 +235,25 @@ fn a_bridge_member_is_no_link_for_the_outer_packets() {
     let text = with(vxlan, MEMBERS).replacen(WAN, &small, 1);
     let error = parse(&text).unwrap_err();
     assert!(error.contains("at most 1350 (1400"), "{error}");
+}
+
+#[test]
+fn the_underlay_vrf_holds_the_local_address() {
+    let red = WAN.replace(
+        "ipv6 = [\"2001:db8::1/64\"]\n",
+        "ipv6 = [\"2001:db8::1/64\"]\nvrf = \"red\"\n",
+    );
+    let vxlan = r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"], underlay-vrf = "red" }"#;
+    let config = parse(&with(vxlan, MEMBERS).replacen(WAN, &red, 1)).unwrap();
+    let mut confd = Confd::new(Config::default());
+    let [[_, tables], _] = confd.tables_now_and_with(&config);
+    assert!(matches!(
+        tables.get(&Key::Vxlan {
+            interface: "vx0".into()
+        }),
+        Some(Value::Vxlan { underlay_vrf, .. }) if underlay_vrf == "red"
+    ));
+    // The default VRF does not have it.
+    let error = parse(&with(vxlan, MEMBERS)).unwrap_err();
+    assert!(error.contains("interface in VRF \"red\""), "{error}");
 }

@@ -56,8 +56,13 @@ pub(crate) fn unicast(address: IpAddr) -> bool {
 
 /// Whether `local` is an address given to an interface of the default VRF.
 pub(crate) fn given(interfaces: &[InterfaceConfig], local: IpAddr) -> bool {
+    given_in(interfaces, DEFAULT_VRF, local)
+}
+
+/// Whether `local` is an address given to an interface of VRF `vrf`.
+pub(crate) fn given_in(interfaces: &[InterfaceConfig], vrf: &str, local: IpAddr) -> bool {
     interfaces.iter().any(|i| {
-        i.vrf == DEFAULT_VRF
+        i.vrf == vrf
             && match local {
                 IpAddr::V4(a) => i.ipv4.is_some_and(|(own, _)| own == a),
                 IpAddr::V6(a) => i.ipv6.iter().any(|&(own, _)| own == a),
