@@ -220,7 +220,7 @@ SIDは、RFC 8986では経路の表の一部として扱われる。そのため
 
 | 表 | キー | 値 |
 |---|---|---|
-| ローカルのSID（`ruster-fib`の経路の動作`srv6-local`） | defaultのVRF、SIDのプレフィックス（IPv6） | 動作: End / End.X、End.DX4、End.DX6（インターフェースと次の転送先のアドレス） / End.DT4、End.DT6、End.DT46（VRF）。EndとEnd.Xのflavor（PSP、USP、USD）は、動作の名前に付ける（RFC 8986の10.2の名前、`End with PSP & USD`など） |
+| ローカルのSID（`ruster-fib`の経路の動作`srv6-local`） | defaultのVRF、SIDのプレフィックス（IPv6） | 動作: End / End.X、End.DX4、End.DX6（インターフェースと次の転送先のアドレス） / End.DT4、End.DT6、End.DT46（VRF）。EndとEnd.Xのflavor（PSP、USP、USD、NEXT-CSID）は、動作の名前に付ける（RFC 8986の10.2とRFC 9800の9.の名前、`End with NEXT-CSID & PSP`など）。NEXT-CSIDのSIDの長さはブロックとCSIDの長さの和 |
 | 包む方針（`ruster-fib`の経路の動作`srv6-encap`） | VRF、経路のプレフィックス | 外側の送信元、SIDのリスト（1から8個）、H.Encaps.Redか。外側はdefaultのVRFで送る |
 
 - SIDはdefaultのVRFにだけ置く（下側のVRFを選ぶのは、要る場面が出てから）。
@@ -249,6 +249,9 @@ End（4.1）、End.X（4.2）:
        End: defaultのVRFで引き直す（新しい宛先もローカルのSIDなら、続けて扱う。4個まで）
        End.X: 値の次の転送先へ送る
        PSP（4.16.1）なら、Segments Leftが0になったところでSRHを外す
+NEXT-CSID（RFC 9800の4.1）のEnd、End.X: SIDはロケータのブロックとCSID一つ（長さは値の`locator-block-length`と
+  `csid-length`）。宛先のそれより後ろ（引数）が0でなければ、上のSRHの処理の前に、Hop Limitを確かめ、引数を
+  ブロックの直後へずらして残りを0にし、次へ送る（Endは引き直し、End.Xは値の次の転送先へ）。引数が0なら上のとおり
   USD（4.16.3）で、上位のヘッダが41か4 → 内側を外す。EndはdefaultのVRFで経路を引き、End.Xは値の
       次の転送先へ送る（内側がIPv4ならdefaultのVRFで引く）。内側がルータ宛てかNDなら捨てる
   それ以外 → 「上位のヘッダ」（USP（4.16.2）は受けるが、処理する上位のヘッダが無いので何も変わらない）

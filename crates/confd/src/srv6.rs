@@ -3,7 +3,8 @@
 //!
 //! The local SIDs and the SR policies are routes of `ruster-fib` (RFC 8986 treats
 //! a SID as a FIB entry), so confd hands them to ribd as it does its static routes,
-//! and ribd writes them to the FE. Each SID is a /128 route of the default VRF; each
+//! and ribd writes them to the FE. Each SID is a /128 route of the default VRF (a NEXT-CSID one of
+//! its block and CSID); each
 //! policy a route of its VRF whose packets the FE wraps.
 //!
 //! # Standards
@@ -134,15 +135,83 @@ pub(crate) fn check(
         let interface = at_most_one(&at, "interface", &entry.interface)?;
         let next_hop = at_most_one(&at, "next-hop", &entry.next_hop)?;
         let mut flavors = Srv6Flavors::default();
+        let mut next_csid = false;
         for name in &entry.flavors {
             let on = match name.as_str() {
                 "PSP" => &mut flavors.psp,
                 "USP" => &mut flavors.usp,
                 "USD" => &mut flavors.usd,
-                _ => return Err(format!("{at}: flavors are PSP, USP and USD, not {name:?}")),
+                "NEXT-CSID" => &mut next_csid,
+                _ => {
+                    return Err(format!(
+                        "{at}: flavors are PSP, USP, USD and NEXT-CSID, not {name:?}"
+                    ))
+                }
             };
             if std::mem::replace(on, true) {
                 return Err(format!("{at}: flavor {name} given twice"));
+            }
+        }
+        // NEXT-CSID (RFC 9800 4.1): the SID is the locator block and one CSID, the
+        // bits after it the next CSIDs.
+        flavors.next_csid = match (next_csid, entry.csid_structure.as_slice()) {
+            (false, []) => None,
+            (true, &[block, csid]) if csid > 0 && u16::from(block) + u16::from(csid) <= 128 => {
+                Some(ruster_proto::table::Srv6Csid { block, csid })
+            }
+            (true, _) => {
+                return Err(format!(
+                    "{at}: NEXT-CSID needs csid-structure = [block length, CSID length], \
+                     together at most 128 bits"
+                ))
+            }
+            (false, _) => {
+                return Err(format!("{at}: csid-structure is only for NEXT-CSID"));
+            }
+        };
+        let len = sid_len(&flavors);
+        if ruster_proto::table::network(IpAddr::V6(sid), len) != IpAddr::V6(sid) {
+            return Err(format!(
+                "{at}: bits are set after the block and the CSID ({len} bits)"
+            ));
+        }
+        // A NEXT-CSID SID is a prefix: every packet into it is taken as compressed
+        // SIDs, so it stays in the locator and covers none of the router's own
+        // addresses or the default VRF's longer routes.
+        if flavors.next_csid.is_some() {
+            let inside = |address: IpAddr| {
+                address.is_ipv6() && ruster_proto::table::network(address, len) == IpAddr::V6(sid)
+            };
+            if len < locator_len {
+                return Err(format!(
+                    "{at}: its {len} bits are fewer than the locator's {locator_len}"
+                ));
+            }
+            if own.iter().any(|a| inside(IpAddr::V6(*a))) {
+                return Err(format!(
+                    "{at}: its prefix covers an address of an interface"
+                ));
+            }
+            let routes = static_routes
+                .iter()
+                .filter(|r| r.vrf == DEFAULT_VRF)
+                .map(|r| (r.prefix, r.len))
+                .chain(
+                    interfaces
+                        .iter()
+                        .filter(|i| i.vrf == DEFAULT_VRF)
+                        .flat_map(|i| {
+                            i.ipv6
+                                .iter()
+                                .map(|&(a, l)| (ruster_proto::table::network(IpAddr::V6(a), l), l))
+                        }),
+                );
+            for (prefix, plen) in routes {
+                if plen > len && inside(prefix) {
+                    return Err(format!(
+                        "{at}: its prefix covers the default VRF's route {prefix}/{plen}"
+                    ));
+                }
             }
         }
         if flavors != Srv6Flavors::default() && !matches!(entry.behavior.as_str(), "End" | "End.X")
@@ -215,7 +284,7 @@ pub(crate) fn check(
                 ))
             }
         };
-        if !taken.insert((DEFAULT_VRF.to_owned(), IpAddr::V6(sid), 128)) {
+        if !taken.insert((DEFAULT_VRF.to_owned(), IpAddr::V6(sid), len)) {
             return Err(format!("{at}: the default VRF has another route for it"));
         }
         out.sids.push((sid, local));
@@ -283,6 +352,20 @@ pub(crate) fn check(
                 "{at}: srv6-l2 sid is an address of an interface or another SID"
             ));
         }
+        let covered = out.sids.iter().any(|(other, local)| match local {
+            Srv6Local::End { flavors } | Srv6Local::EndX { flavors, .. }
+                if flavors.next_csid.is_some() =>
+            {
+                ruster_proto::table::network(IpAddr::V6(sid), sid_len(flavors))
+                    == IpAddr::V6(*other)
+            }
+            _ => false,
+        });
+        if covered {
+            return Err(format!(
+                "{at}: srv6-l2 sid is inside a NEXT-CSID SID's prefix"
+            ));
+        }
         if taken.contains(&(DEFAULT_VRF.to_owned(), IpAddr::V6(sid), 128)) {
             return Err(format!("{at}: the default VRF has a route for its sid"));
         }
@@ -341,14 +424,25 @@ pub(crate) fn tables(srv6: &Srv6, out: &mut BTreeMap<Key, Value>) {
     }
 }
 
+/// The length of a SID's route: its block and CSID with NEXT-CSID, 128 otherwise.
+fn sid_len(flavors: &Srv6Flavors) -> u8 {
+    flavors
+        .next_csid
+        .map_or(128, |c| c.block.saturating_add(c.csid))
+}
+
 /// Adds the routes of `srv6` to `out` (ribd's routes from confd), after the
 /// connected and static ones, which win.
 pub(crate) fn routes(srv6: &Srv6, out: &mut BTreeMap<Key, Value>) {
     for (sid, local) in &srv6.sids {
+        let len = match local {
+            Srv6Local::End { flavors } | Srv6Local::EndX { flavors, .. } => sid_len(flavors),
+            _ => 128,
+        };
         out.entry(Key::Route {
             vrf: DEFAULT_VRF.to_owned(),
             prefix: IpAddr::V6(*sid),
-            len: 128,
+            len,
         })
         .or_insert_with(|| Value::Route(RouteAction::Srv6Local(local.clone())));
     }

@@ -5,7 +5,7 @@
 # End.DT46, End.DX4 and End.DX6).
 #
 #   a 192.168.1.10 -- p1 [ruster, p1 in red] wan 2001:db8::1 ==== 2001:db8::2 [Linux, bside in vrf-red] -- b 10.2.0.7
-#     fd00:a::10                                SIDs fc00:1::/48     SIDs fc00:2::/48                    fd00:b::7
+#     fd00:a::10                                SIDs fc00:1::/32     SIDs fc00:2::/48                    fd00:b::7
 #
 # Checks: IPv4 and IPv6 both ways; Linux's packets through ruster's End and End.X
 # with a two-segment SRH; ruster's two-segment policy through Linux's End; Linux's
@@ -84,7 +84,7 @@ nsx "$linux" ip addr add 10.2.0.1/24 dev bside
 nsx "$linux" ip addr add fd00:b::1/64 dev bside nodad
 nsx "$linux" ip link set bside up
 nsx "$linux" ip sr tunsrc set 2001:db8::2
-nsx "$linux" ip -6 route add fc00:1::/48 via 2001:db8::1 dev wan
+nsx "$linux" ip -6 route add fc00:1::/32 via 2001:db8::1 dev wan
 nsx "$linux" ip -6 route add fc00:2::1/128 encap seg6local action End dev wan
 nsx "$linux" ip -6 route add fc00:2::4/128 encap seg6local action End.DT4 vrftable 10 dev vrf-red
 nsx "$linux" ip -6 route add fc00:2::6/128 encap seg6local action End.DT6 vrftable 10 dev vrf-red
@@ -121,7 +121,7 @@ interface = "wan"
 via = "2001:db8::2"
 
 [srv6]
-locator = "fc00:1::/48"
+locator = "fc00:1::/32"
 source = "2001:db8::1"
 
 [[srv6.sid]]
@@ -153,6 +153,17 @@ vrf = "red"
 sid = "fc00:1::5"
 behavior = "End"
 flavors = ["PSP"]
+
+[[srv6.sid]]
+sid = "fc00:1:1::"
+behavior = "End"
+flavors = ["NEXT-CSID"]
+csid-structure = [32, 16]
+
+[[srv6.sid]]
+sid = "fc00:1:4::"
+behavior = "End.DT4"
+vrf = "red"
 
 [[srv6.sid]]
 sid = "fc00:1::d4"
@@ -223,6 +234,13 @@ echo "ok: a two-segment SRH through ruster's End"
 back4 fc00:1::5,fc00:1::4
 pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End with PSP"
 echo "ok: a two-segment SRH through ruster's End with PSP"
+
+# Compressed SIDs (RFC 9800, a 32-bit block fc00:1 and 16-bit CSIDs): Linux sends
+# to the container fc00:1:1:4::, whose first CSID (1) is ruster's End with
+# NEXT-CSID; it shifts the next in, fc00:1:4::, ruster's End.DT4.
+back4 fc00:1:1:4::
+pings "$b" 192.168.1.10 || pings "$b" 192.168.1.10 || fail "b does not reach a through ruster's End with NEXT-CSID"
+echo "ok: a container of compressed SIDs through ruster's End with NEXT-CSID"
 
 # To ruster's End.DT46 SID, IPv4 and IPv6, and to its End.DX4 and End.DX6 SIDs,
 # which send the inner packet to a without a lookup.

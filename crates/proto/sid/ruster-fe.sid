@@ -721,6 +721,18 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-local/locator-block-length",
+        "sid": 60297,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
+        "identifier": "/ruster-fib:fib/vrf/route/srv6-local/csid-length",
+        "sid": 60298,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-neighbor:resolve-request",
         "sid": 60050,
         "status": "unstable"

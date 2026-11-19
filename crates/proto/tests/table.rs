@@ -1617,7 +1617,7 @@ fn vxlan_entries_round_trip_and_are_checked() {
 
 #[test]
 fn srv6_sids_and_policies_round_trip_and_are_checked() {
-    use ruster_proto::table::{Srv6Encap, Srv6Flavors, Srv6Local};
+    use ruster_proto::table::{Srv6Csid, Srv6Encap, Srv6Flavors, Srv6Local};
     let v6 = |t: &str| t.parse::<std::net::Ipv6Addr>().unwrap();
     let sid = |action| {
         Change::set(
@@ -1660,6 +1660,7 @@ fn srv6_sids_and_policies_round_trip_and_are_checked() {
                 psp: true,
                 usp: false,
                 usd: true,
+                next_csid: None,
             },
         }),
         sid(Srv6Local::EndX {
@@ -1669,6 +1670,7 @@ fn srv6_sids_and_policies_round_trip_and_are_checked() {
                 psp: true,
                 usp: true,
                 usd: true,
+                next_csid: None,
             },
         }),
         sid(Srv6Local::EndDx6 {
@@ -1705,6 +1707,35 @@ fn srv6_sids_and_policies_round_trip_and_are_checked() {
         names.contains(&"End.X with PSP, USP & USD".to_owned()),
         "{names:?}"
     );
+    // NEXT-CSID (RFC 9800): named first, its lengths carried, and checked against
+    // the SID's length.
+    let mut usid = sid(Srv6Local::End {
+        flavors: Srv6Flavors {
+            psp: true,
+            next_csid: Some(Srv6Csid {
+                block: 32,
+                csid: 16,
+            }),
+            ..Srv6Flavors::default()
+        },
+    });
+    usid.key = Key::Route {
+        vrf: DEFAULT_VRF.into(),
+        prefix: ip6("fc00:0:1::"),
+        len: 48,
+    };
+    assert!(usid.validate().is_ok());
+    assert_eq!(round_trip(&usid), usid);
+    assert!(entry_line(&usid.key, usid.value.as_ref().unwrap())
+        .unwrap()
+        .contains("End with NEXT-CSID & PSP"));
+    let mut wrong = usid.clone();
+    wrong.key = Key::Route {
+        vrf: DEFAULT_VRF.into(),
+        prefix: ip6("fc00:0:1::"),
+        len: 64,
+    };
+    assert!(wrong.validate().is_err());
     // A SID outside the default VRF, or IPv4.
     let mut other_vrf = sid(Srv6Local::End {
         flavors: Default::default(),

@@ -58,6 +58,9 @@ pub const ROUTE_SRV6_NEXT_HOP: u64 = 60293;
 pub const ROUTE_SRV6_SOURCE: u64 = 60294;
 pub const ROUTE_SRV6_SEGMENTS: u64 = 60295;
 pub const ROUTE_SRV6_REDUCED: u64 = 60296;
+/// The locator block length and the CSID length of a NEXT-CSID SID (RFC 9800).
+pub const ROUTE_SRV6_CSID_BLOCK: u64 = 60297;
+pub const ROUTE_SRV6_CSID_LENGTH: u64 = 60298;
 
 pub const NEIGHBOR: u64 = 60040;
 pub const NEIGHBOR_LINK_LAYER_ADDRESS: u64 = 60041;
@@ -273,6 +276,8 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-fib:fib/vrf/route/srv6-encap/source-address", ROUTE_SRV6_SOURCE),
     ("/ruster-fib:fib/vrf/route/srv6-encap/segment", ROUTE_SRV6_SEGMENTS),
     ("/ruster-fib:fib/vrf/route/srv6-encap/reduced", ROUTE_SRV6_REDUCED),
+    ("/ruster-fib:fib/vrf/route/srv6-local/locator-block-length", ROUTE_SRV6_CSID_BLOCK),
+    ("/ruster-fib:fib/vrf/route/srv6-local/csid-length", ROUTE_SRV6_CSID_LENGTH),
     ("/ruster-neighbor:neighbors/neighbor", NEIGHBOR),
     (
         "/ruster-neighbor:neighbors/neighbor/link-layer-address",
