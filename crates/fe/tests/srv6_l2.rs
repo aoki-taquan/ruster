@@ -85,7 +85,7 @@ impl Bench {
         );
         for (writer, changes) in [
             (writers::CONFIG, &config[..]),
-            (writers::ROUTE, &[route][..]),
+            (writers::ROUTE, &[route, end_sid()][..]),
             (writers::NEIGHBOR, &[neighbor][..]),
         ] {
             let (a, b) = UnixStream::pair().unwrap();
@@ -167,6 +167,22 @@ fn frame(dst: [u8; 6], src: [u8; 6], len: usize) -> Vec<u8> {
     f
 }
 
+/// The router's End SID fc00:1::1.
+fn end_sid() -> Change {
+    Change::set(
+        Key::Route {
+            vrf: "default".into(),
+            prefix: v6("fc00:1::1").into(),
+            len: 128,
+        },
+        Value::Route(RouteAction::Srv6Local(
+            ruster_proto::table::Srv6Local::End {
+                flavors: Default::default(),
+            },
+        )),
+    )
+}
+
 /// `inner` as the remote end sends it: to the router's End.DX2 SID, with a Segment
 /// Routing Header with `left` segments left.
 fn outer(left: u8, inner: &[u8]) -> Vec<u8> {
@@ -235,4 +251,25 @@ fn two_segments_get_a_segment_routing_header_and_reduced_leaves_the_first_out() 
         assert_eq!(usize::from(payload), 8 + 16 * listed + a.len());
         assert_eq!(&w[srh + 8 + 16 * listed..], &a[..]);
     }
+}
+
+#[test]
+fn a_frame_through_the_router_s_end_then_its_end_dx2_reaches_the_bridge() {
+    let mut bench = Bench::new(&["fc00:2::d2"], false);
+    // H1 learned on p1 first.
+    bench.send(P1, frame(H2, H1, 60));
+    let b = frame(H1, H2, 60);
+    // To End fc00:1::1 with one segment left, the End.DX2 SID.
+    let mut p = WAN_MAC.to_vec();
+    p.extend_from_slice(&GATEWAY_MAC);
+    p.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
+    p.extend_from_slice(&u16::try_from(40 + b.len()).unwrap().to_be_bytes());
+    p.extend_from_slice(&[43, 64]);
+    p.extend_from_slice(&v6("2001:db8::9").octets());
+    p.extend_from_slice(&v6("fc00:1::1").octets());
+    p.extend_from_slice(&[143, 4, 4, 1, 1, 0, 0, 0]);
+    p.extend_from_slice(&v6(DX2).octets());
+    p.extend_from_slice(&v6("fc00:1::1").octets());
+    p.extend_from_slice(&b);
+    assert_eq!(bench.send(WAN, p), vec![(P1, b)]);
 }

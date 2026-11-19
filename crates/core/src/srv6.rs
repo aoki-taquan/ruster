@@ -35,6 +35,13 @@
 //!   packet. Sections 4.4 (End.DX6) and 4.5 (End.DX4): the same checks and
 //!   unwrapping, but the inner packet goes out of the SID's interface to its next
 //!   hop without a route lookup, as forwarded in that interface's VRF.
+//! - RFC 8986 section 4.9 (End.DX2): a packet that reaches an SRv6 L2 interface's
+//!   SID after another of the router's SIDs (End with a Segment Routing Header)
+//!   loses its outer headers here, and its frame goes through the interface's
+//!   bridge; Segments Left other than 0 or another upper-layer header than 143 get
+//!   Parameter Problem as for the other behaviours that unwrap. (A packet straight
+//!   to that SID is taken with the other bridge members' outer packets,
+//!   `crate::overlay`.)
 //! - RFC 8986 section 4.16 (flavors of End and End.X): PSP (4.16.1) takes the
 //!   Segment Routing Header off once Segments Left reaches 0 (the Next Header
 //!   before it takes its next header, the Payload Length its length less); USD
@@ -72,6 +79,8 @@
 //! Deviations:
 //!
 //! - The SIDs are the default VRF's; the router does not take SIDs in another VRF.
+//! - A frame End.DX2 takes after another SID is dropped when it is for the bridge's
+//!   own interface.
 //! - End.X with USD routes an inner IPv4 packet in the default VRF: its next hop is
 //!   an IPv6 address.
 //! - A fragment to a SID (a Fragment header before the upper-layer header) is
@@ -109,6 +118,8 @@ const DESTINATION_OPTIONS: u8 = 60;
 const IPV4: u8 = 4;
 const IPV6: u8 = 41;
 const ICMPV6: u8 = 58;
+/// The upper-layer header of an Ethernet frame (RFC 8986 section 10.1).
+const ETHERNET_FRAME: u8 = 143;
 /// The Routing Type of the Segment Routing Header (RFC 8754 section 2).
 const SEGMENT_ROUTING: u8 = 4;
 const TIME_EXCEEDED: u8 = 3;
@@ -145,6 +156,10 @@ pub enum Srv6Behaviour {
     EndDx6 { egress: IfId, next_hop: [u8; 16] },
     /// End.DX4 (section 4.5): the inner IPv4 packet, out of `egress` to `next_hop`.
     EndDx4 { egress: IfId, next_hop: [u8; 4] },
+    /// End.DX2 (section 4.9): the inner Ethernet frame, received on bridge member
+    /// `member`. Made from an SRv6 L2 interface ([`crate::OverlayKind::Srv6L2`]),
+    /// not given in a [`Srv6Table`].
+    EndDx2 { member: IfId },
 }
 
 /// The flavors of End and End.X (RFC 8986 section 4.16).
@@ -171,6 +186,7 @@ impl Srv6Behaviour {
             Self::EndDt4 { .. } | Self::EndDx4 { .. } => next == IPV4,
             Self::EndDt6 { .. } | Self::EndDx6 { .. } => next == IPV6,
             Self::EndDt46 { .. } => next == IPV4 || next == IPV6,
+            Self::EndDx2 { .. } => next == ETHERNET_FRAME,
         }
     }
 }
@@ -280,6 +296,9 @@ pub(crate) enum Received {
     /// On to its next segment, its destination rewritten: routed in the default
     /// VRF, or out of the interface and to the next hop `via` (End.X).
     Forward { via: Option<(IfId, [u8; 16])> },
+    /// Unwrapped by End.DX2: the inner frame is received on bridge member `member`
+    /// (the packet's ingress is set to it).
+    ToMember { member: IfId },
     /// Unwrapped: the inner packet (Ethernet kept) is routed in VRF `vrf`, or,
     /// with `via` (End.DX4 and End.DX6), goes out of that interface to that next
     /// hop (an IPv4 address in the first four bytes for End.DX4).
@@ -313,8 +332,28 @@ pub(crate) fn receive<S: PacketSlot>(
     packet: &mut PacketLease<S>,
     snapshot: &crate::ForwardingSnapshot<'_>,
 ) -> Result<Received, Rejected> {
-    let Some(table) = snapshot.srv6.filter(|t| !t.sids.is_empty()) else {
+    let table = snapshot.srv6;
+    let members = snapshot
+        .overlays
+        .iter()
+        .any(|o| matches!(o.kind, crate::OverlayKind::Srv6L2 { .. }));
+    if table.is_none_or(|t| t.sids.is_empty()) && !members {
         return Ok(Received::NotSid);
+    }
+    let lookup = |destination: [u8; 16]| -> Option<Srv6Sid> {
+        if let Some(sid) = table.and_then(|t| t.sid(destination)) {
+            return Some(*sid);
+        }
+        snapshot.overlays.iter().find_map(|o| match o.kind {
+            crate::OverlayKind::Srv6L2 { sid, .. } if sid == destination => Some(Srv6Sid {
+                prefix: sid,
+                len: 128,
+                behaviour: Srv6Behaviour::EndDx2 {
+                    member: o.interface,
+                },
+            }),
+            _ => None,
+        })
     };
     let ingress = packet.ingress();
     if snapshot.vrf_of(ingress) != 0 || snapshot.is_kernel_ingress(ingress) {
@@ -328,7 +367,7 @@ pub(crate) fn receive<S: PacketSlot>(
     if bytes[ip] >> 4 != 6 {
         return Ok(Received::NotSid);
     }
-    let Some(mut sid) = table.sid(address(bytes, ip + 24)) else {
+    let Some(mut sid) = lookup(address(bytes, ip + 24)) else {
         return Ok(Received::NotSid);
     };
     // Only a frame sent to the receiving interface itself.
@@ -381,7 +420,7 @@ pub(crate) fn receive<S: PacketSlot>(
                         via: Some((egress, next_hop)),
                     });
                 }
-                match table.sid(address(packet.bytes_mut(), ip + 24)) {
+                match lookup(address(packet.bytes_mut(), ip + 24)) {
                     Some(next) => sid = next,
                     None => return Ok(Received::Forward { via: None }),
                 }
@@ -389,6 +428,17 @@ pub(crate) fn receive<S: PacketSlot>(
             // End and End.X are taken above: every other behaviour unwraps.
             (_, Chain::Segments(srh, _)) => {
                 return Err(segments_left_error(srh));
+            }
+            (Srv6Behaviour::EndDx2 { member }, Chain::Upper(ETHERNET_FRAME, at)) => {
+                // S01 to S05: the outer headers go; the frame is the member's.
+                if end < at + ETHERNET {
+                    return Err(Rejected::Drop(DropReason::Srv6HeaderInvalid));
+                }
+                if !packet.truncate(end) || !packet.resize_front(at as isize) {
+                    return Err(Rejected::Drop(DropReason::Srv6NoRoom));
+                }
+                packet.set_ingress(member);
+                return Ok(Received::ToMember { member });
             }
             (behaviour, Chain::Upper(next, at)) if behaviour.takes(next) => {
                 // The inner packet must lie inside the outer one.
@@ -419,6 +469,7 @@ pub(crate) fn receive<S: PacketSlot>(
                     // VRF; End.X's goes to its next hop (an IPv6 one: an inner
                     // IPv4 packet is routed in the default VRF too).
                     Srv6Behaviour::End { .. } => (0, None),
+                    Srv6Behaviour::EndDx2 { .. } => unreachable!("taken above"),
                     Srv6Behaviour::EndX {
                         egress, next_hop, ..
                     } if next == IPV6 => (snapshot.vrf_of(egress), Some((egress, next_hop))),

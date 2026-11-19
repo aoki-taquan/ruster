@@ -3826,6 +3826,31 @@ where
             Ok(crate::srv6::Received::NotSid) => (None, None),
             Ok(crate::srv6::Received::Forward { via }) => (None, via),
             Ok(crate::srv6::Received::Unwrapped { vrf, via }) => (Some(vrf), via),
+            // End.DX2 after another of the router's SIDs: the frame goes through
+            // the member's bridge. (A frame straight to End.DX2 was taken with the
+            // other overlays', above.) One for the bridge's own interface, or of a
+            // member in no bridge, is dropped.
+            Ok(crate::srv6::Received::ToMember { member }) => {
+                let reason = DropReason::BridgeDropped;
+                let staged = match bridges.as_deref_mut() {
+                    Some(bridges) => bridge_stage(packet, bridges, all_vrfs, None, trace),
+                    None => Ok(packet),
+                };
+                match staged {
+                    Ok(packet) => {
+                        packet.recycle(reason);
+                        dropped += 1;
+                        trace.record(TraceEvent::Dropped {
+                            ingress: member,
+                            reason,
+                        });
+                    }
+                    Err(Ended::Transmitted) => tx_requested += 1,
+                    Err(Ended::Consumed) => consumed += 1,
+                    Err(Ended::Dropped) => dropped += 1,
+                }
+                continue;
+            }
             Err(rejected) => {
                 let ingress = packet.ingress();
                 let reason = match rejected {
