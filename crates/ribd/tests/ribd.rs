@@ -472,3 +472,61 @@ fn a_gateway_route_is_resolved_and_follows_the_routes_it_goes_through() {
     assert_eq!(lab.fe_route([203, 0, 113, 0], 24), None);
     assert!(lab.fe_route([198, 51, 100, 0], 24).is_some());
 }
+
+#[test]
+fn srv6_routes_from_a_source_reach_the_fe_like_any_route() {
+    use ruster_proto::table::{Srv6Encap, Srv6Local};
+    use std::net::Ipv6Addr;
+    let v6 = |text: &str| text.parse::<Ipv6Addr>().unwrap();
+    let mut lab = Lab::new(Server::new(), vec![spec("static", 1), spec("bgp", 20)]);
+    // A SID of the router, and a VPN route that leaves wrapped, as BGP gives them
+    // (RFC 9252): End.DT4 into VRF red, and red's 10.2.0.0/16 to another router's.
+    let sid = Key::Route {
+        vrf: "default".into(),
+        prefix: v6("fc00:1::4").into(),
+        len: 128,
+    };
+    let vpn = Key::Route {
+        vrf: "red".into(),
+        prefix: Ipv4Addr::new(10, 2, 0, 0).into(),
+        len: 16,
+    };
+    let dt4 = Value::Route(RouteAction::Srv6Local(Srv6Local::EndDt4 {
+        vrf: "red".into(),
+    }));
+    let encap = |segment: &str| {
+        Value::Route(RouteAction::Srv6Encap(Srv6Encap {
+            source: v6("2001:db8::1"),
+            segments: vec![v6(segment)],
+            reduced: false,
+        }))
+    };
+    lab.sources[1]
+        .patch(&[
+            Change::set(sid.clone(), dt4.clone()),
+            Change::set(vpn.clone(), encap("fc00:2::4")),
+        ])
+        .unwrap();
+    lab.settle();
+    assert_eq!(lab.fe.store().get(&sid), Some(&dt4));
+    assert_eq!(lab.fe.store().get(&vpn), Some(&encap("fc00:2::4")));
+
+    // The better source's route for the same prefix wins, of any kind.
+    lab.sources[0]
+        .patch(&[Change::set(vpn.clone(), encap("fc00:3::4"))])
+        .unwrap();
+    lab.settle();
+    assert_eq!(lab.fe.store().get(&vpn), Some(&encap("fc00:3::4")));
+    lab.sources[0]
+        .patch(&[Change::delete(vpn.clone())])
+        .unwrap();
+    lab.settle();
+    assert_eq!(lab.fe.store().get(&vpn), Some(&encap("fc00:2::4")));
+
+    lab.sources[1]
+        .patch(&[Change::delete(sid.clone()), Change::delete(vpn.clone())])
+        .unwrap();
+    lab.settle();
+    assert_eq!(lab.fe.store().get(&sid), None);
+    assert_eq!(lab.fe.store().get(&vpn), None);
+}
