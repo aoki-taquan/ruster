@@ -31,6 +31,10 @@
 //!   extension headers are taken off and the inner packet is routed in the SID's
 //!   VRF, as a packet received on the same interface (its TTL or Hop Limit is
 //!   decremented as any forwarded packet's).
+//! - RFC 8986 section 4.8 (End.DT46): as End.DT4 and End.DT6, for either inner
+//!   packet. Sections 4.4 (End.DX6) and 4.5 (End.DX4): the same checks and
+//!   unwrapping, but the inner packet goes out of the SID's interface to its next
+//!   hop without a route lookup, as forwarded in that interface's VRF.
 //! - RFC 8986 section 4.1.1 and RFC 8754 section 4.3.1.2: any other upper-layer
 //!   header, or No Next Header, gets Parameter Problem code 4 (SR Upper-layer
 //!   Header Error) pointing at it. No upper-layer header is allowed by
@@ -65,10 +69,14 @@
 //! - No HMAC (RFC 8754 section 2.1.2) is checked, and the source address is not
 //!   checked (RFC 8754 section 5.1 places that in the access lists at the edges of
 //!   the SR domain; the forward firewall can do it for traffic it guards).
-//! - A packet unwrapped by End.DT4 or End.DT6 whose inner destination is the
+//! - A packet unwrapped by End.DT4, End.DT6 or End.DT46 whose inner destination is the
 //!   router's (in the SID's VRF) is dropped, not delivered: its way to the kernel
 //!   follows the VRF of the interface it came in on.
 //! - A SID whose VRF the snapshot does not have drops its packets.
+//! - A packet unwrapped by End.DX4 or End.DX6 whose inner destination is the
+//!   router's (in the VRF of the SID's interface) is dropped, as for End.DT4 and
+//!   End.DT6. So is an inner Neighbor Discovery packet, for every behaviour that
+//!   unwraps.
 //! - An outer packet that would leave through a tunnel or another policy is
 //!   dropped; no flags, tag or TLVs are put in the Segment Routing Header.
 //! - The outer packet is never fragmented, even when what a policy carries is less
@@ -90,6 +98,7 @@ const FRAGMENT: u8 = 44;
 const DESTINATION_OPTIONS: u8 = 60;
 const IPV4: u8 = 4;
 const IPV6: u8 = 41;
+const ICMPV6: u8 = 58;
 /// The Routing Type of the Segment Routing Header (RFC 8754 section 2).
 const SEGMENT_ROUTING: u8 = 4;
 const TIME_EXCEEDED: u8 = 3;
@@ -116,6 +125,24 @@ pub enum Srv6Behaviour {
     EndDt6 { vrf: u16 },
     /// End.DT4 (section 4.7): the inner IPv4 packet, routed in VRF `vrf`.
     EndDt4 { vrf: u16 },
+    /// End.DT46 (section 4.8): the inner IPv4 or IPv6 packet, routed in VRF `vrf`.
+    EndDt46 { vrf: u16 },
+    /// End.DX6 (section 4.4): the inner IPv6 packet, out of `egress` to `next_hop`.
+    EndDx6 { egress: IfId, next_hop: [u8; 16] },
+    /// End.DX4 (section 4.5): the inner IPv4 packet, out of `egress` to `next_hop`.
+    EndDx4 { egress: IfId, next_hop: [u8; 4] },
+}
+
+impl Srv6Behaviour {
+    /// Whether the behaviour unwraps an inner packet of upper-layer header `next`.
+    fn takes(self, next: u8) -> bool {
+        match self {
+            Self::End | Self::EndX { .. } => false,
+            Self::EndDt4 { .. } | Self::EndDx4 { .. } => next == IPV4,
+            Self::EndDt6 { .. } | Self::EndDx6 { .. } => next == IPV6,
+            Self::EndDt46 { .. } => next == IPV4 || next == IPV6,
+        }
+    }
 }
 
 /// One local SID: the addresses `prefix/len` (a SID, or a SID with its arguments).
@@ -223,8 +250,13 @@ pub(crate) enum Received {
     /// On to its next segment, its destination rewritten: routed in the default
     /// VRF, or out of the interface and to the next hop `via` (End.X).
     Forward { via: Option<(IfId, [u8; 16])> },
-    /// Unwrapped: the inner packet (Ethernet kept) is routed in VRF `vrf`.
-    Unwrapped { vrf: u16 },
+    /// Unwrapped: the inner packet (Ethernet kept) is routed in VRF `vrf`, or,
+    /// with `via` (End.DX4 and End.DX6), goes out of that interface to that next
+    /// hop (an IPv4 address in the first four bytes for End.DX4).
+    Unwrapped {
+        vrf: u16,
+        via: Option<(IfId, [u8; 16])>,
+    },
 }
 
 /// Why [`receive`] did not pass a packet on.
@@ -313,33 +345,61 @@ pub(crate) fn receive<S: PacketSlot>(
                     None => return Ok(Received::Forward { via: None }),
                 }
             }
-            (Srv6Behaviour::EndDt4 { .. } | Srv6Behaviour::EndDt6 { .. }, Chain::Segments(srh)) => {
+            // End and End.X are taken above: every other behaviour unwraps.
+            (_, Chain::Segments(srh)) => {
                 return Err(segments_left_error(srh));
             }
-            (Srv6Behaviour::EndDt4 { vrf }, Chain::Upper(IPV4, at))
-            | (Srv6Behaviour::EndDt6 { vrf }, Chain::Upper(IPV6, at)) => {
+            (behaviour, Chain::Upper(next, at)) if behaviour.takes(next) => {
+                // The inner packet must lie inside the outer one.
+                let inner = match bytes.get(at..) {
+                    Some(inner) if next == IPV4 && inner.len() >= 20 && inner[0] >> 4 == 4 => inner,
+                    Some(inner)
+                        if next == IPV6 && inner.len() >= IPV6_HEADER && inner[0] >> 4 == 6 =>
+                    {
+                        inner
+                    }
+                    _ => return Err(Rejected::Drop(DropReason::Srv6HeaderInvalid)),
+                };
+                let (vrf, via) = match behaviour {
+                    Srv6Behaviour::EndDt4 { vrf }
+                    | Srv6Behaviour::EndDt6 { vrf }
+                    | Srv6Behaviour::EndDt46 { vrf } => (vrf, None),
+                    // Out to the adjacency, without a lookup: in the VRF of its
+                    // interface.
+                    Srv6Behaviour::EndDx6 { egress, next_hop } => {
+                        (snapshot.vrf_of(egress), Some((egress, next_hop)))
+                    }
+                    Srv6Behaviour::EndDx4 { egress, next_hop } => {
+                        let mut hop = [0; 16];
+                        hop[..4].copy_from_slice(&next_hop);
+                        (snapshot.vrf_of(egress), Some((egress, hop)))
+                    }
+                    Srv6Behaviour::End | Srv6Behaviour::EndX { .. } => {
+                        unreachable!("takes no inner packet")
+                    }
+                };
                 let target = snapshot
                     .vrf_snapshot(vrf)
                     .ok_or(Rejected::Drop(DropReason::Srv6VrfUnknown))?;
-                // The inner packet must lie inside the outer one, and not be for the
-                // router: such a packet would reach the kernel of the VRF its
-                // ingress interface is in, not the SID's.
-                let local = match bytes.get(at..) {
-                    Some(inner) if inner.len() >= 20 && inner[0] >> 4 == 4 => {
-                        let mut d = [0; 4];
-                        d.copy_from_slice(&inner[16..20]);
-                        target.is_local_ipv4(crate::Ipv4Address::from_octets(d))
-                    }
-                    Some(inner) if inner.len() >= IPV6_HEADER && inner[0] >> 4 == 6 => target
+                // Not for the router: such a packet would reach the kernel of the
+                // VRF its ingress interface is in, past that VRF's firewall. Nor
+                // Neighbor Discovery: it would count as received on the outer
+                // packet's link.
+                let local = if next == IPV4 {
+                    let mut d = [0; 4];
+                    d.copy_from_slice(&inner[16..20]);
+                    target.is_local_ipv4(crate::Ipv4Address::from_octets(d))
+                } else {
+                    target
                         .ipv6
-                        .is_some_and(|fib| fib.is_local(address(inner, 24))),
-                    _ => return Err(Rejected::Drop(DropReason::Srv6HeaderInvalid)),
+                        .is_some_and(|fib| fib.is_local(address(inner, 24)))
+                        || is_neighbor_discovery(inner)
                 };
                 if local {
                     return Err(Rejected::Drop(DropReason::Srv6ToRouter));
                 }
                 unwrap(packet, at, end)?;
-                return Ok(Received::Unwrapped { vrf });
+                return Ok(Received::Unwrapped { vrf, via });
             }
             (_, Chain::Upper(_, at)) => {
                 return Err(Rejected::Error(
@@ -352,6 +412,12 @@ pub(crate) fn receive<S: PacketSlot>(
         }
     }
     Err(Rejected::Drop(DropReason::Srv6HeaderInvalid))
+}
+
+/// Whether the IPv6 packet `ip` (from its header) is Neighbor Discovery: ICMPv6
+/// right after the header, of type 133 to 137 (RFC 4861).
+fn is_neighbor_discovery(ip: &[u8]) -> bool {
+    ip.get(6) == Some(&ICMPV6) && ip.get(IPV6_HEADER).is_some_and(|t| (133..=137).contains(t))
 }
 
 fn address(frame: &[u8], at: usize) -> [u8; 16] {

@@ -195,7 +195,7 @@ SIDは、RFC 8986では経路の表の一部として扱われる。そのため
 
 | 表 | キー | 値 |
 |---|---|---|
-| ローカルのSID（`ruster-fib`の経路の動作`srv6-local`） | defaultのVRF、SIDのプレフィックス（IPv6） | 動作: End / End.X（インターフェースと次の転送先のアドレス） / End.DT4（VRF） / End.DT6（VRF） |
+| ローカルのSID（`ruster-fib`の経路の動作`srv6-local`） | defaultのVRF、SIDのプレフィックス（IPv6） | 動作: End / End.X、End.DX4、End.DX6（インターフェースと次の転送先のアドレス） / End.DT4、End.DT6、End.DT46（VRF） |
 | 包む方針（`ruster-fib`の経路の動作`srv6-encap`） | VRF、経路のプレフィックス | 外側の送信元、SIDのリスト（1から8個）、H.Encaps.Redか。外側はdefaultのVRFで送る |
 
 - SIDはdefaultのVRFにだけ置く（下側のVRFを選ぶのは、要る場面が出てから）。
@@ -224,10 +224,15 @@ End（4.1）、End.X（4.2）:
        End: defaultのVRFで引き直す（新しい宛先もローカルのSIDなら、続けて扱う。4個まで）
        End.X: 値の次の転送先へ送る
   それ以外 → 「上位のヘッダ」
-End.DT6（4.6）、End.DT4（4.7）:
+End.DT6（4.6）、End.DT4（4.7）、End.DT46（4.8）、End.DX6（4.4）、End.DX4（4.5）:
   SRHがあり、Segments Left != 0 → ICMPv6 Parameter Problem（code 0、Segments Leftの位置）
-  上位のヘッダが41（End.DT6）か4（End.DT4）→ 外側のIPv6とその拡張ヘッダを全部外し、
-      値のVRFで内側を、同じインターフェースで受けたものとして転送する（内側のTTLとHop Limitは普通の転送と同じく減らす）
+  上位のヘッダが41（End.DT6、End.DT46、End.DX6）か4（End.DT4、End.DT46、End.DX4）
+      → 外側のIPv6とその拡張ヘッダを全部外し、内側を同じインターフェースで受けたものとして転送する
+        （内側のTTLとHop Limitは普通の転送と同じく減らす）
+      内側がルータ自身のアドレス宛て（そのVRFで）か、NDのパケットなら捨てる
+      End.DT*: 値のVRFで経路を引く
+      End.DX*: 経路を引かず、値のインターフェースと次の転送先へ送る（そのインターフェースのVRFの
+        firewallとNATを通る）
   それ以外 → 「上位のヘッダ」
 上位のヘッダ: 設定で許すものは無い。全部ICMPv6 Parameter Problem（code 4、SR Upper-layer Header Error、
   上位のヘッダの位置。RFC 8986の4.1.1）。SIDへのpingにもこのエラーを返す

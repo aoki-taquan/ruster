@@ -45,8 +45,9 @@ pub const ROUTE_DISCARD: u64 = 60036;
 pub const ROUTE_REJECT: u64 = 60037;
 pub const ROUTE_LOOKUP_VRF: u64 = 60038;
 /// `ruster-fib`: a route that is one of the router's SRv6 SIDs (RFC 8986 section
-/// 4): its behaviour (`End`, `End.X`, `End.DT4`, `End.DT6`), the VRF of End.DT4
-/// and End.DT6, and the interface and next hop of End.X.
+/// 4): its behaviour (`End`, `End.X`, `End.DX4`, `End.DX6`, `End.DT4`, `End.DT6`,
+/// `End.DT46`), the VRF of End.DT4, End.DT6 and End.DT46, and the interface and next
+/// hop of End.X, End.DX4 and End.DX6.
 pub const ROUTE_SRV6_BEHAVIOUR: u64 = 60290;
 pub const ROUTE_SRV6_VRF: u64 = 60291;
 pub const ROUTE_SRV6_INTERFACE: u64 = 60292;

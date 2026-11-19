@@ -289,10 +289,12 @@
 //!
 //! [[srv6.sid]]                 # a local SID
 //! sid = "fc00:1::4"
-//! behavior = "End.DT4"         # "End", "End.X", "End.DT4" (IPv4 inside) or
-//!                              # "End.DT6" (IPv6 inside)
-//! vrf = "red"                  # End.DT4 and End.DT6: the VRF the inner packet goes on in
-//! # interface = "wan" and next-hop = "fe80::2" for End.X
+//! behavior = "End.DT4"         # "End", "End.X", "End.DX4", "End.DX6", "End.DT4"
+//!                              # (IPv4 inside), "End.DT6" (IPv6 inside) or "End.DT46"
+//! vrf = "red"                  # End.DT4, End.DT6 and End.DT46: the VRF the inner
+//!                              # packet goes on in
+//! # interface = "wan" and next-hop = "fe80::2" for End.X (default VRF) and End.DX6
+//! # (any interface); next-hop an IPv4 address for End.DX4
 //!
 //! [[srv6.policy]]              # an SR policy (H.Encaps)
 //! prefix = "10.2.0.0/16"       # the route it makes, in its VRF

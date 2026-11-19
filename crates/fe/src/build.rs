@@ -1018,9 +1018,12 @@ pub(crate) fn build(
             if let Key::Route { vrf, .. } = key {
                 names.insert(vrf.as_str());
             }
-            // The VRF of an End.DT4 or End.DT6 SID, even with nothing else in it.
+            // The VRF of an End.DT4, End.DT6 or End.DT46 SID, even with nothing
+            // else in it.
             if let Value::Route(RouteAction::Srv6Local(
-                table::Srv6Local::EndDt4 { vrf } | table::Srv6Local::EndDt6 { vrf },
+                table::Srv6Local::EndDt4 { vrf }
+                | table::Srv6Local::EndDt6 { vrf }
+                | table::Srv6Local::EndDt46 { vrf },
             )) = value
             {
                 names.insert(vrf.as_str());
@@ -1142,8 +1145,9 @@ pub(crate) fn build(
                 }
                 let entry = match action {
                     RouteAction::Srv6Local(local) => {
-                        if let table::Srv6Local::EndDt4 { vrf } | table::Srv6Local::EndDt6 { vrf } =
-                            local
+                        if let table::Srv6Local::EndDt4 { vrf }
+                        | table::Srv6Local::EndDt6 { vrf }
+                        | table::Srv6Local::EndDt46 { vrf } = local
                         {
                             sid_vrfs.insert(vrf.clone());
                         }
@@ -1523,8 +1527,29 @@ fn srv6_sid(
             },
             None => return Ok(None),
         },
+        table::Srv6Local::EndDx6 {
+            interface,
+            next_hop,
+        } => match active.get(interface.as_str()) {
+            Some(&(egress, _)) => Srv6Behaviour::EndDx6 {
+                egress,
+                next_hop: next_hop.octets(),
+            },
+            None => return Ok(None),
+        },
+        table::Srv6Local::EndDx4 {
+            interface,
+            next_hop,
+        } => match active.get(interface.as_str()) {
+            Some(&(egress, _)) => Srv6Behaviour::EndDx4 {
+                egress,
+                next_hop: next_hop.octets(),
+            },
+            None => return Ok(None),
+        },
         table::Srv6Local::EndDt4 { vrf: name } => Srv6Behaviour::EndDt4 { vrf: vrf(name)? },
         table::Srv6Local::EndDt6 { vrf: name } => Srv6Behaviour::EndDt6 { vrf: vrf(name)? },
+        table::Srv6Local::EndDt46 { vrf: name } => Srv6Behaviour::EndDt46 { vrf: vrf(name)? },
     };
     let prefix = v6(prefix).ok_or_else(|| format!("SRv6 SID {prefix}/{len}: not IPv6"))?;
     ruster_core::Srv6Sid::new(prefix, len, behaviour)

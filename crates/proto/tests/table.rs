@@ -1618,6 +1618,15 @@ fn srv6_sids_and_policies_round_trip_and_are_checked() {
         }),
         sid(Srv6Local::EndDt4 { vrf: "red".into() }),
         sid(Srv6Local::EndDt6 { vrf: "red".into() }),
+        sid(Srv6Local::EndDt46 { vrf: "red".into() }),
+        sid(Srv6Local::EndDx6 {
+            interface: "lan".into(),
+            next_hop: v6("fe80::2"),
+        }),
+        sid(Srv6Local::EndDx4 {
+            interface: "lan".into(),
+            next_hop: "192.0.2.2".parse().unwrap(),
+        }),
         encap(vec![v6("fc00:2::4")], false),
         encap(vec![v6("fc00:2::1"), v6("fc00:3::4")], true),
     ];

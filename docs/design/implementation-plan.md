@@ -134,7 +134,7 @@ FEとCEの基本:
 | L2のブリッジとIRB（IEEE 802.1Q。RFCではない） | core `bridge.rs`、confd `bridge.rs`。spanning treeは無い。VLANごとに一つのブリッジ | core `bridge.rs`の`learns_forwards_floods_and_filters`（学習、転送、フラッディング、来たポートへは返さない）、`entries_age`（既定300秒の境目）、`a_frame_from_an_address_restarts_its_ageing`、`multicast_is_flooded_and_never_learned`、`the_reserved_block_ends_at_0f`（01-80-C2-00-00-00〜0Fは中継しない）。fe `tests/bridge.rs`の9本（IRB、VLANのメンバー、移動とエージング、promiscuous、リンク）。confd `tests/bridge.rs`（エージングの範囲10〜1000000秒） | `bridge` |
 | VXLAN | core `overlay.rs`、confd `vxlan.rs`。送り先は設定のVTEPだけ。IPv6でもUDPのchecksumは0にしない。外側をフラグメントしない | core `overlay.rs`の`vxlan_wraps_in_ipv4_with_checksum_zero_and_a_hashed_port`（ヘッダのバイト、Iフラグ、port 4789）、`vxlan_over_ipv6_has_a_udp_checksum`、`vxlan_reserved_bits_are_ignored_on_receipt`（Iフラグの無いものは捨てる）、`vxlan_vni_takes_all_24_bits`、`vxlan_source_ports_stay_in_the_dynamic_range`（49152〜65535）。fe `tests/vxlan.rs`（VTEPへのフラッディング、VTEPからのものを他のVTEPへ流さない）。confd `tests/vxlan.rs`（VNIの範囲） | `vxlan`（相手はLinuxのvxlan。外側IPv4とIPv6） |
 | EtherIP | core `overlay.rs`、confd `etherip.rs`。受けたヘッダのreservedは見ない。フラグメントしない | core `overlay.rs`の`wraps_in_ipv4_with_df_and_a_checksum`、`wraps_in_ipv6`、`etherip_takes_version_3_only`（0〜15のうち3だけ）、`unwraps_from_the_remote_end_only`。fe `tests/etherip.rs`の2本 | `etherip`（相手もruster。外側IPv4とIPv6） |
-| SRv6 | core `srv6.rs`、confd `srv6.rs`。SIDはdefault VRFだけ。SIDへのフラグメントは捨てる。HMACは見ない。外側をフラグメントしない | io-sim `srv6.rs`: End、End.X、End.DT4、End.DT6の手順（`segments_left_picks_the_segment_at_its_new_value`、`segments_left_one_above_last_entry_is_followed`、`the_hop_limit_is_checked_before_the_header`）、Parameter Problemのcodeとpointer（Segments Leftの43、前に拡張ヘッダがあるときの51、上位ヘッダの40、80、88、Segments Leftが残るEnd.DT4とEnd.DT6）、Time Exceeded。io-sim `srv6_encap.rs`: H.EncapsのSRHのバイト、H.Encaps.Red（`reduced_with_two_segments_lists_only_the_second`、一つならSRH無し）、包んで長すぎるときのPacket Too Big。fe `tests/srv6.rs`: DFの無いIPv4は切ってから包む、DFありはFragmentation Needed（MTU 1460）。confd `tests/srv6.rs` | `srv6`（相手はLinuxのseg6） |
+| SRv6 | core `srv6.rs`、confd `srv6.rs`。SIDはdefault VRFだけ。SIDへのフラグメントは捨てる。HMACは見ない。外側をフラグメントしない | io-sim `srv6.rs`: End、End.X、End.DT4、End.DT6の手順（`segments_left_picks_the_segment_at_its_new_value`、`segments_left_one_above_last_entry_is_followed`、`the_hop_limit_is_checked_before_the_header`）、Parameter Problemのcodeとpointer（Segments Leftの43、前に拡張ヘッダがあるときの51、上位ヘッダの40、80、88、Segments Leftが残るEnd.DT4とEnd.DT6）、Time Exceeded。io-sim `srv6_encap.rs`: H.EncapsのSRHのバイト、H.Encaps.Red（`reduced_with_two_segments_lists_only_the_second`、一つならSRH無し）、包んで長すぎるときのPacket Too Big。fe `tests/srv6.rs`: DFの無いIPv4は切ってから包む、DFありはFragmentation Needed（MTU 1460）、End.DT46、End.DX4、End.DX6（経路を引かずに次の転送先へ、Segments Leftが残るとParameter Problem）。confd `tests/srv6.rs` | `srv6`（相手はLinuxのseg6。End.DT46、End.DX4、End.DX6も） |
 | IS-ISとOSPFのTAP | fe `tap.rs`、confd `isis_ospf.rs`、frr `isis_ospf.rs`。default VRFだけ。broadcastとpoint-to-pointだけ。プロトコルはFRR | fe `tap.rs`の`the_ranges_end_where_the_standards_say`（LLCと長さの境目1500/0x0600、224.0.0.0/24、fe80::/10）。fe `tests/tap.rs`の4本。confd `tests/isis_ospf.rs`（NET、metric、cost、router IDの範囲）。frr `tests/conf.rs`の`isis_and_ospf_are_written_on_the_tap_devices`、`is_is_on_an_interface_without_ipv6_carries_ipv4_only_and_passive_forms_no_adjacency` | `isis`、`ospf`（v2とv3、point-to-pointとbroadcast） |
 | 再帰の次の転送先 | ribd `resolve.rs`。結果をBGPへは返さない（FRRのzebraが持つ） | ribd `resolve.rs`の試験（最長一致、自分自身やその下の経路で解決しない、loop、深さ、VRF、`an_ipv6_next_hop_is_resolved_the_same_way`、`several_next_hops_of_the_match_are_all_kept_in_order`）。ribd `tests/ribd.rs`の`a_gateway_route_is_resolved_and_follows_the_routes_it_goes_through` | `bgp`（multihopの近隣） |
 | 全体の設定（`ruster.toml`とlockの形） | config `lib.rs`、confd `file.rs`。lockはYANGのインスタンスではなくTOML。決まりは[`router-box.md`](router-box.md) | config `tests/lock.rs`（lockの形の読み戻し、全部のkeyが要る、別の版は断る）、`tests/resolve.rs`（既定値の埋め方）、`tests/secrets.rs` | 全部（`ruster apply`で設定を渡す） |
@@ -175,17 +175,13 @@ charterの「作るもの」は上の表のとおりそろい、2026-11-10 にow
 
 次の順に作る。FPMでFRRからSRv6の経路を受けることとEVPNは作らない。
 
-1. 包む方針の経路のインターフェースを、同じ（送信元、SIDのリスト、Red）の経路で共有する（#768）。
-   経路の送り手からBGPの経路が多く来ても、尽きず遅くならないため。
-2. 経路の送り手からSRv6の経路（`srv6-local`と`srv6-encap`）を受けて選ぶことを、ribdで確かめて書く。
-3. End.DX4、End.DX6、End.DT46。
-4. PSP、USP、USDのflavor（End、End.X）。
-5. H.Encaps.L2、H.Encaps.L2.Red、End.DX2。L2の方は、VXLANやEtherIPと同じくブリッジのメンバーにする。
-6. SIDごとの数を、FEの状態のsocketで見せる。
-7. VXLAN: 一つのブリッジに複数のVXLANのメンバー、UDPのポートと下側のVRFを選ぶ、下側の本当のMTUで
+1. PSP、USP、USDのflavor（End、End.X）。
+2. H.Encaps.L2、H.Encaps.L2.Red、End.DX2。L2の方は、VXLANやEtherIPと同じくブリッジのメンバーにする。
+3. SIDごとの数を、FEの状態のsocketで見せる。
+4. VXLAN: 一つのブリッジに複数のVXLANのメンバー、UDPのポートと下側のVRFを選ぶ、下側の本当のMTUで
    確かめる、一覧から消したVTEPの後ろで学んだMACを消す、VXLANのメンバーに静的なMAC（VTEPを付けて）。
-8. RFC 9800のNEXT-CSID（End、End.X、End.DT4、End.DT6、End.DT46）。
-9. SRv6とVXLANのbacklog（#754、#756、#759、#762、#765、#768、#774）のうち、上で片付かなかったもの。
+5. RFC 9800のNEXT-CSID（End、End.X、End.DT4、End.DT6、End.DT46）。
+6. SRv6とVXLANのbacklog（#754、#756、#759、#762、#765、#768、#774）のうち、上で片付かなかったもの。
 
 #### 経路や通信の数が増えたとき
 
