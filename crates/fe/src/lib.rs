@@ -2178,11 +2178,9 @@ where
                     sent = members.send(member, vtep, frame);
                 } else {
                     for &member in members.bridges.members(bridge) {
-                        if members.send(member, None, frame) {
-                            sent = true;
-                        } else {
-                            dropped += 1;
-                        }
+                        let (went, failed) = members.send_counted(member, None, frame);
+                        sent |= went;
+                        dropped += failed;
                     }
                 }
             }

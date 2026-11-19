@@ -110,7 +110,14 @@ pub(crate) fn check(
                 "{at}: a VXLAN interface must be a member of a bridge"
             ));
         };
-        crate::etherip::check_ends(&at, interfaces, bridges, &name, local, &remotes)?;
+        crate::etherip::check_ends(
+            &at,
+            interfaces,
+            bridges,
+            (&name, &underlay_vrf),
+            local,
+            &remotes,
+        )?;
         // Frames flooded from one VXLAN member go to the bridge's others: a VTEP
         // behind two would get them back, and two routers joined so would loop.
         if let Some(other) = out.iter().find(|v| {
