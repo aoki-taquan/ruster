@@ -631,6 +631,12 @@
       },
       {
         "namespace": "data",
+        "identifier": "/ruster-if-vxlan:vxlan/port",
+        "sid": 60284,
+        "status": "unstable"
+      },
+      {
+        "namespace": "data",
         "identifier": "/ruster-if-srv6-l2:srv6-l2",
         "sid": 60300,
         "status": "unstable"

@@ -872,6 +872,7 @@ pub(crate) fn build(
                     vni,
                     local,
                     remotes,
+                    port,
                 },
             ) => (
                 interface,
@@ -879,6 +880,7 @@ pub(crate) fn build(
                 ruster_core::OverlayKind::Vxlan {
                     vni: *vni,
                     remotes: remotes.clone(),
+                    port: *port,
                 },
             ),
             (

@@ -55,6 +55,7 @@ impl Bench {
                     vni: 100,
                     local: IpAddr::from(LOCAL),
                     remotes: vec![IpAddr::from(VTEP2), IpAddr::from(VTEP3)],
+                    port: 4789,
                 },
             ),
             Change::set(
@@ -270,6 +271,7 @@ fn vxlan(name: &str, vni: u32, remotes: &[[u8; 4]]) -> Change {
             vni,
             local: IpAddr::from(LOCAL),
             remotes: remotes.iter().map(|r| IpAddr::from(*r)).collect(),
+            port: 4789,
         },
     )
 }
@@ -333,4 +335,45 @@ fn an_address_learned_in_a_vni_is_forgotten_when_the_interface_changes_vni() {
     assert!(out
         .iter()
         .all(|(_, w)| w[46..49] == 300_u32.to_be_bytes()[1..]));
+}
+
+#[test]
+fn another_udp_port_is_sent_to_and_received_on() {
+    let mut bench = Bench::new();
+    let Change { key, value, .. } = vxlan("vx0", 100, &[VTEP2]);
+    let Some(Value::Vxlan {
+        vni,
+        local,
+        remotes,
+        ..
+    }) = value
+    else {
+        unreachable!()
+    };
+    bench.change(&[Change::set(
+        key,
+        Value::Vxlan {
+            vni,
+            local,
+            remotes,
+            port: 8472,
+        },
+    )]);
+    let broadcast = frame([0xff; 6], H1, 60);
+    let out = bench.send(P1, broadcast);
+    assert_eq!(out.len(), 1);
+    assert_eq!(&out[0].1[36..38], &8472_u16.to_be_bytes());
+    // In on 8472, not on 4789.
+    let b = frame(H1, H2, 60);
+    let on = |port: u16| {
+        let mut p = outer(VTEP2, 100, &b);
+        p[36..38].copy_from_slice(&port.to_be_bytes());
+        p
+    };
+    // On 4789 it is UDP to the router, not VXLAN: nothing goes to p1.
+    assert!(bench
+        .send(WAN, on(4789))
+        .iter()
+        .all(|(port, _)| *port != P1));
+    assert_eq!(bench.send(WAN, on(8472)), vec![(P1, b)]);
 }

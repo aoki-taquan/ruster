@@ -15,7 +15,7 @@
 //! - RFC 3378 section 3 (EtherIP): IP protocol 97, a two-byte header of version 3
 //!   and twelve reserved bits set to zero, then the Ethernet frame without its FCS.
 //!   A packet whose version is not 3 is dropped. The outer header is IPv4 or IPv6.
-//! - RFC 7348 section 5 (VXLAN): UDP to port 4789, an eight-byte header with the I
+//! - RFC 7348 section 5 (VXLAN): UDP to port 4789 (or the interface's own port), an eight-byte header with the I
 //!   flag set and the 24-bit VNI, then the Ethernet frame without its FCS. The UDP
 //!   source port is a hash of the inner frame's flow (its IP addresses and ports,
 //!   or its MAC addresses), in 49152 to 65535. A packet without the I flag, or whose
@@ -48,8 +48,7 @@
 //! - IPv6 extension headers before the EtherIP or UDP header are not stepped over:
 //!   such packets are not unwrapped.
 //! - VXLAN: no multicast underlay (RFC 7348 section 4.2); the remote VTEPs are a
-//!   list given in the tables, and packets from any other address are dropped. The
-//!   UDP port is always 4789.
+//!   list given in the tables, and packets from any other address are dropped.
 //! - SRv6: a packet to an End.DX2 SID with segments left, or whose upper-layer
 //!   header is not 143, is dropped without an ICMPv6 error (RFC 8986 4.9 S01 to
 //!   S04 would send Parameter Problem); its source is not checked.
@@ -74,7 +73,7 @@ const TCP: u8 = 6;
 /// The EtherIP header: version 3, reserved 0.
 const ETHERIP_HEADER: [u8; 2] = [0x30, 0x00];
 /// The UDP port of VXLAN (IANA), and the UDP and VXLAN headers' length.
-const VXLAN_PORT: u16 = 4789;
+pub const VXLAN_PORT: u16 = 4789;
 const VXLAN_HEADERS: usize = 16;
 /// The I flag of the VXLAN header.
 const VXLAN_I: u8 = 0x08;
@@ -108,8 +107,12 @@ pub enum OverlayKind {
     /// EtherIP (RFC 3378) to and from one remote end.
     EtherIp { remote: IpAddr },
     /// VXLAN (RFC 7348) network `vni` (1 to 16777215), to and from the remote VTEPs
-    /// `remotes`.
-    Vxlan { vni: u32, remotes: Vec<IpAddr> },
+    /// `remotes`, on UDP port `port` (4789, [`VXLAN_PORT`], unless another is given).
+    Vxlan {
+        vni: u32,
+        remotes: Vec<IpAddr>,
+        port: u16,
+    },
     /// SRv6 (RFC 8986): frames leave wrapped toward `segments` (IPv6, the first
     /// first, 1 to 8; H.Encaps.L2, or H.Encaps.L2.Red with `reduced`), and packets
     /// to the router's End.DX2 SID `sid` bring frames in. `local` is the outer
@@ -278,21 +281,23 @@ pub(crate) fn receive<S: PacketSlot>(
         return Ok(received);
     }
     let bytes = packet.bytes_mut();
-    let ours = |vxlan: bool| {
+    let etherip = || {
+        overlays
+            .iter()
+            .any(|o| o.local == outer.destination && matches!(o.kind, OverlayKind::EtherIp { .. }))
+    };
+    let to_port = bytes
+        .get(outer.payload + 2..outer.payload + 4)
+        .map(|p| u16::from_be_bytes([p[0], p[1]]));
+    let vxlan_port = |port: u16| {
         overlays.iter().any(|o| {
             o.local == outer.destination
-                && o.is_vxlan() == vxlan
-                && !matches!(o.kind, OverlayKind::Srv6L2 { .. })
+                && matches!(o.kind, OverlayKind::Vxlan { port: p, .. } if p == port)
         })
     };
-    let vxlan = match outer.protocol {
-        ETHERIP if ours(false) => false,
-        UDP if ours(true)
-            && bytes.get(outer.payload + 2..outer.payload + 4)
-                == Some(&VXLAN_PORT.to_be_bytes()[..]) =>
-        {
-            true
-        }
+    let vxlan = match (outer.protocol, to_port) {
+        (ETHERIP, _) if etherip() => false,
+        (UDP, Some(port)) if vxlan_port(port) => true,
         _ => return Ok(Received::NotOverlay),
     };
     // For one of the overlays' addresses from here on: dropped unless it is right.
@@ -324,8 +329,8 @@ pub(crate) fn receive<S: PacketSlot>(
             .iter()
             .find(|o| {
                 o.local == outer.destination
-                    && matches!(&o.kind, OverlayKind::Vxlan { vni: v, remotes }
-                        if *v == vni && remotes.contains(&outer.source))
+                    && matches!(&o.kind, OverlayKind::Vxlan { vni: v, remotes, port }
+                        if *v == vni && Some(*port) == to_port && remotes.contains(&outer.source))
             })
             .ok_or(DropReason::OverlayUnknownPeer)?;
         let frame = outer.payload + VXLAN_HEADERS;
@@ -477,12 +482,12 @@ pub(crate) fn header<T: TraceSink>(
         return Err(DropReason::OverlayUnknownPeer);
     }
     let vni = match overlay.kind {
-        OverlayKind::Vxlan { vni, .. } => {
+        OverlayKind::Vxlan { vni, port, .. } => {
             // RFC 7348 6.1: no inner VLAN tag is sent.
             if inner[12..14] == VLAN_ETHERTYPE {
                 return Err(DropReason::OverlayInvalid);
             }
-            Some(vni)
+            Some((vni, port))
         }
         OverlayKind::EtherIp { .. } => None,
         OverlayKind::Srv6L2 { .. } => None,
@@ -557,7 +562,7 @@ pub(crate) fn header<T: TraceSink>(
         }
         _ => return Err(DropReason::OverlayInvalid),
     };
-    let Some(vni) = vni else {
+    let Some((vni, vxlan_port)) = vni else {
         b[payload..payload + 2].copy_from_slice(&ETHERIP_HEADER);
         out.len = payload + 2;
         return Ok(out);
@@ -567,7 +572,7 @@ pub(crate) fn header<T: TraceSink>(
     // 49152 to 65535 (RFC 7348 section 5).
     let port = 0xc000 | (flow_hash(inner) & 0x3fff) as u16;
     b[udp..udp + 2].copy_from_slice(&port.to_be_bytes());
-    b[udp + 2..udp + 4].copy_from_slice(&VXLAN_PORT.to_be_bytes());
+    b[udp + 2..udp + 4].copy_from_slice(&vxlan_port.to_be_bytes());
     b[udp + 4..udp + 6].copy_from_slice(&length.to_be_bytes());
     b[udp + 8] = VXLAN_I;
     b[udp + 12..udp + 15].copy_from_slice(&vni.to_be_bytes()[1..]);
@@ -1083,7 +1088,11 @@ mod tests {
     /// The tables with the overlay a VXLAN interface of VNI 100 to `remotes`.
     fn vxlan(local: IpAddr, remotes: Vec<IpAddr>) -> Tables {
         let mut t = tables(1500, local, remotes[0]);
-        t.overlays[0].kind = OverlayKind::Vxlan { vni: 100, remotes };
+        t.overlays[0].kind = OverlayKind::Vxlan {
+            vni: 100,
+            remotes,
+            port: VXLAN_PORT,
+        };
         t
     }
 
@@ -1312,6 +1321,7 @@ mod tests {
         t.overlays[0].kind = OverlayKind::Vxlan {
             vni: 0x00ab_cdef,
             remotes: vec![REMOTE4.into()],
+            port: VXLAN_PORT,
         };
         let s = snapshot(&t);
         let frame = inner();

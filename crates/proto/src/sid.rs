@@ -177,6 +177,8 @@ pub const VXLAN: u64 = 60280;
 pub const VXLAN_VNI: u64 = 60281;
 pub const VXLAN_LOCAL: u64 = 60282;
 pub const VXLAN_REMOTE: u64 = 60283;
+/// The UDP port VXLAN interfaces use (4789 when not given, RFC 7348 section 5).
+pub const VXLAN_PORT: u64 = 60284;
 /// `ruster-if-srv6-l2`: an interface whose frames travel over SRv6 (RFC 8986 H.Encaps.L2
 /// and End.DX2), by interface, its outer source, its End.DX2 SID, the segments it
 /// sends to and whether reduced.
@@ -360,6 +362,7 @@ pub const ALL: &[(&str, u64)] = &[
     ("/ruster-if-vxlan:vxlan/vni", VXLAN_VNI),
     ("/ruster-if-vxlan:vxlan/local", VXLAN_LOCAL),
     ("/ruster-if-vxlan:vxlan/remote", VXLAN_REMOTE),
+    ("/ruster-if-vxlan:vxlan/port", VXLAN_PORT),
     ("/ruster-if-srv6-l2:srv6-l2", SRV6_L2),
     ("/ruster-if-srv6-l2:srv6-l2/source-address", SRV6_L2_SOURCE),
     ("/ruster-if-srv6-l2:srv6-l2/sid", SRV6_L2_SID),

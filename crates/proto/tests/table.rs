@@ -1558,6 +1558,7 @@ fn vxlan_entries_round_trip_and_are_checked() {
                 vni,
                 local: ip(local),
                 remotes: remotes.iter().map(|r| ip(r)).collect(),
+                port: ruster_proto::table::VXLAN_PORT,
             },
         )
     };
@@ -1580,6 +1581,34 @@ fn vxlan_entries_round_trip_and_are_checked() {
     ] {
         assert!(bad.validate().is_err(), "{bad:?}");
     }
+    // Another UDP port: carried, and shown.
+    let with_port = |port: u16| {
+        let mut change = entry(100, "192.0.2.1", &["198.51.100.2"]);
+        if let Some(Value::Vxlan { port: p, .. }) = change.value.as_mut() {
+            *p = port;
+        }
+        change
+    };
+    let other = with_port(8472);
+    assert_eq!(round_trip(&other), other);
+    assert_eq!(
+        entry_line(&other.key, other.value.as_ref().unwrap()).unwrap(),
+        "vxlan vx0 vni 100 port 8472 192.0.2.1 to 198.51.100.2"
+    );
+    assert!(with_port(0).validate().is_err());
+    // A row from before the port was added (no member 60284) reads as 4789.
+    let mut out = Vec::new();
+    let mut e = Encoder::new(&mut out);
+    e.map(1).array(2).u64(60280).text("vx0");
+    e.map(3)
+        .u64(1)
+        .u64(100)
+        .u64(2)
+        .text("192.0.2.1")
+        .u64(3)
+        .array(1)
+        .text("198.51.100.2");
+    assert_eq!(decode_bytes(&out).unwrap(), with_port(4789));
 }
 
 #[test]

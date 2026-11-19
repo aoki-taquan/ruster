@@ -75,7 +75,8 @@
 //! [[interface]]                # a VXLAN network (RFC 7348), only as a bridge member
 //! name = "vx100"
 //! vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2", "198.51.100.3"] }
-//!                              # the remote VTEPs get every broadcast (UDP 4789)
+//!                              # port = 4789 by default
+//!                              # the remote VTEPs get every broadcast (UDP, 4789 unless port says)
 //! # mac is 02:00:00:00:00:fe and mtu 1450 (IPv4) or 1430 (IPv6) when left out
 //!
 //! [[interface]]                # a PPPoE session, there while the session is up
@@ -609,7 +610,7 @@ pub const VERSION: u32 = 1;
 ///
 /// A new key also goes into `tests/data/every-key.lock` (the test reads it with every
 /// key required, and checks that every list in it has an item).
-pub const LOCK_SHAPE: u64 = 0x7c0b_e85b_2349_06fe;
+pub const LOCK_SHAPE: u64 = 0x7788_a209_aa63_df6b;
 
 /// A bridge's ageing time, in seconds (IEEE 802.1Q 8.8.3, the recommended value).
 pub const BRIDGE_AGING_TIME: u32 = 300;
@@ -631,6 +632,13 @@ pub const ETHERIP_OVERHEAD_IPV6: u16 = 14 + 2 + 40;
 /// Ethernet header, VXLAN, UDP, and IPv4 or IPv6.
 pub const VXLAN_OVERHEAD_IPV4: u16 = 14 + 8 + 8 + 20;
 pub const VXLAN_OVERHEAD_IPV6: u16 = 14 + 8 + 8 + 40;
+
+/// VXLAN's UDP port when none is given (IANA, RFC 7348 section 5).
+pub const VXLAN_PORT: u16 = 4789;
+
+fn vxlan_port() -> u16 {
+    VXLAN_PORT
+}
 
 /// What an SRv6 L2 interface's outer headers take from the MTU of the link below
 /// for `segments` segments: the inner Ethernet header, IPv6, and with two segments
@@ -937,11 +945,14 @@ pub enum Kind {
     #[serde(rename = "etherip")]
     EtherIp { local: String, remote: String },
     /// A VXLAN network (RFC 7348) `vni` from the router's address `local` to the
-    /// remote VTEPs `remote`; only a bridge member.
+    /// remote VTEPs `remote`, on UDP port `port`; only a bridge member. A lock
+    /// written before the port was added has none: 4789.
     Vxlan {
         vni: u32,
         local: String,
         remote: Vec<String>,
+        #[serde(default = "vxlan_port")]
+        port: u16,
     },
     /// Frames over SRv6 (RFC 8986): wrapped toward `segments` (H.Encaps.L2, or
     /// H.Encaps.L2.Red with `reduced`) from `[srv6]`'s source, and brought in by
