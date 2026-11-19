@@ -514,3 +514,22 @@ fn an_underlay_vrf_with_no_interface_up_leaves_the_overlay_without_a_route() {
     let out = bench.send(P1, frame([0xff; 6], H1, 60));
     assert!(out.iter().all(|(port, _)| *port != WAN), "{out:?}");
 }
+
+#[test]
+fn the_inner_frame_ends_with_the_udp_datagram_and_carries_no_vlan_tag() {
+    let mut bench = Bench::new();
+    let b = frame(H1, H2, 60);
+    // Four bytes after the UDP datagram, inside the IPv4 packet: not the frame's.
+    let mut p = outer(VTEP2, 100, &b);
+    p.extend_from_slice(&[0xee; 4]);
+    let total = u16::from_be_bytes([p[16], p[17]]) + 4;
+    p[16..18].copy_from_slice(&total.to_be_bytes());
+    p[24..26].fill(0);
+    let checksum = ipv4_header_checksum(&p[14..34]);
+    p[24..26].copy_from_slice(&checksum.to_be_bytes());
+    assert_eq!(bench.send(WAN, p), vec![(P1, b)]);
+    // An 802.1ad tag inside: dropped (RFC 7348 6.1).
+    let mut tagged = frame(H1, H2, 60);
+    tagged[12..14].copy_from_slice(&[0x88, 0xa8]);
+    assert_eq!(bench.send(WAN, outer(VTEP2, 100, &tagged)), vec![]);
+}

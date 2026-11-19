@@ -274,6 +274,16 @@ pub const BRIDGE_AGING_RANGE: std::ops::RangeInclusive<u32> = 10..=1_000_000;
 /// VXLAN's UDP port (IANA, RFC 7348 section 5).
 pub const VXLAN_PORT: u16 = 4789;
 
+/// Whether `a` can be an end of an EtherIP or VXLAN tunnel: a unicast address, not
+/// IPv6 link-local (it names no interface) nor IPv4-mapped.
+fn tunnel_end(a: IpAddr) -> bool {
+    !(a.is_unspecified() || a.is_loopback() || a.is_multicast())
+        && match a {
+            IpAddr::V4(v4) => !v4.is_broadcast(),
+            IpAddr::V6(v6) => !v6.is_unicast_link_local() && v6.to_ipv4_mapped().is_none(),
+        }
+}
+
 /// The largest VXLAN network identifier (24 bits).
 pub const VXLAN_VNI_MAX: u32 = 0x00ff_ffff;
 
@@ -1060,10 +1070,7 @@ impl Change {
                         }
                     }
                     Value::EtherIp { local, remote } => {
-                        let unicast = |a: &IpAddr| {
-                            !(a.is_unspecified() || a.is_loopback() || a.is_multicast())
-                                && !matches!(a, IpAddr::V4(v4) if v4.is_broadcast())
-                        };
+                        let unicast = |a: &IpAddr| tunnel_end(*a);
                         if local.is_ipv4() != remote.is_ipv4()
                             || !unicast(local)
                             || !unicast(remote)
@@ -1104,10 +1111,7 @@ impl Change {
                         if !(1..=VXLAN_VNI_MAX).contains(vni) {
                             return Err(ModelError::Invalid("VNI"));
                         }
-                        let unicast = |a: &IpAddr| {
-                            !(a.is_unspecified() || a.is_loopback() || a.is_multicast())
-                                && !matches!(a, IpAddr::V4(v4) if v4.is_broadcast())
-                        };
+                        let unicast = |a: &IpAddr| tunnel_end(*a);
                         let bad = |(at, a): (usize, &IpAddr)| {
                             a.is_ipv4() != local.is_ipv4()
                                 || !unicast(a)

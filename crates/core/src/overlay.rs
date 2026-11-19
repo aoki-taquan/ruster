@@ -15,13 +15,13 @@
 //! - RFC 3378 section 3 (EtherIP): IP protocol 97, a two-byte header of version 3
 //!   and twelve reserved bits set to zero, then the Ethernet frame without its FCS.
 //!   A packet whose version is not 3 is dropped. The outer header is IPv4 or IPv6.
-//! - RFC 7348 section 5 (VXLAN): UDP to port 4789 (or the interface's own port), an eight-byte header with the I
-//!   flag set and the 24-bit VNI, then the Ethernet frame without its FCS. The UDP
-//!   source port is a hash of the inner frame's flow (its IP addresses and ports,
-//!   or its MAC addresses), in 49152 to 65535. A packet without the I flag, or whose
-//!   inner frame has a VLAN tag (section 6.1), is dropped. Over IPv4 the UDP
-//!   checksum is 0; over IPv6 it is computed (RFC 6935 is not used). A received
-//!   checksum is not checked (RFC 7348 section 5 allows that).
+//! - RFC 7348 section 5 (VXLAN): UDP to port 4789 (or the interface's own port), an
+//!   eight-byte header with the I flag set and the 24-bit VNI, then the Ethernet
+//!   frame without its FCS, to the end of the UDP datagram. The UDP source port is a
+//!   hash of the inner frame's flow (its IP addresses and ports, or its MAC
+//!   addresses), in 49152 to 65535. A packet without the I flag, or whose inner
+//!   frame has a VLAN tag (section 6.1: 0x8100, 0x88a8 or 0x9100), is dropped. Over
+//!   IPv4 the UDP checksum is 0; over IPv6 it is computed (RFC 6935 is not used).
 //! - RFC 7348 section 4.1: the outer source address of a received frame is learned
 //!   with its inner source MAC address (see `crate::MacTable`).
 //! - RFC 8986 sections 5.3 and 5.4 (H.Encaps.L2, H.Encaps.L2.Red): an outer IPv6
@@ -44,7 +44,9 @@
 //!   underlying interface's MTU less the outer headers is dropped and counted
 //!   ([`DropReason::OverlayMtuExceeded`]).
 //! - The reserved bits of a received EtherIP header and VXLAN header are not looked
-//!   at.
+//!   at. A received UDP checksum is not checked, also over IPv6 and also when it is
+//!   0 (RFC 8200 section 8.1 would drop an IPv6 UDP datagram with checksum 0 unless
+//!   RFC 6935 is used: VXLAN's datagrams are taken here before the UDP layer).
 //! - IPv6 extension headers before the EtherIP or UDP header are not stepped over:
 //!   such packets are not unwrapped.
 //! - VXLAN: no multicast underlay (RFC 7348 section 4.2); the remote VTEPs are a
@@ -67,6 +69,9 @@ const IPV6_HEADER: usize = 40;
 const IPV4_ETHERTYPE: [u8; 2] = [0x08, 0x00];
 const IPV6_ETHERTYPE: [u8; 2] = [0x86, 0xdd];
 const VLAN_ETHERTYPE: [u8; 2] = [0x81, 0x00];
+/// The VLAN tags an inner VXLAN frame may not carry (RFC 7348 6.1): 802.1Q, 802.1ad
+/// and the older 0x9100.
+const VLAN_TAGS: [[u8; 2]; 3] = [VLAN_ETHERTYPE, [0x88, 0xa8], [0x91, 0x00]];
 /// IP protocol numbers of EtherIP, UDP and TCP.
 const ETHERIP: u8 = 97;
 const UDP: u8 = 17;
@@ -321,6 +326,8 @@ pub(crate) fn receive<S: PacketSlot>(
     if bytes[0..6] != interface.mac.0 {
         return Err(DropReason::OverlayUnknownPeer);
     }
+    // The end of the inner frame: the outer packet's, or VXLAN's UDP datagram's.
+    let mut inner_end = outer.end;
     let (overlay, frame) = if vxlan {
         let header = bytes
             .get(outer.payload..outer.payload + VXLAN_HEADERS)
@@ -341,8 +348,10 @@ pub(crate) fn receive<S: PacketSlot>(
             })
             .ok_or(DropReason::OverlayUnknownPeer)?;
         let frame = outer.payload + VXLAN_HEADERS;
+        inner_end = outer.payload + length;
         // RFC 7348 6.1: an inner VLAN tag is not taken.
-        if bytes.get(frame + 12..frame + 14) == Some(&VLAN_ETHERTYPE[..]) {
+        let tag = bytes.get(frame + 12..frame + 14);
+        if VLAN_TAGS.iter().any(|t| tag == Some(&t[..])) {
             return Err(DropReason::OverlayInvalid);
         }
         (overlay, frame)
@@ -363,13 +372,14 @@ pub(crate) fn receive<S: PacketSlot>(
         }
         (overlay, outer.payload + 2)
     };
-    if outer.end < frame + ETHERNET {
+    if inner_end < frame + ETHERNET {
         return Err(DropReason::OverlayInvalid);
     }
     let member = overlay.interface;
     let vtep = vxlan.then_some(outer.source);
-    // Padding after the outer packet goes, then the outer headers.
-    if !packet.truncate(outer.end) || !packet.resize_front(frame as isize) {
+    // What follows the inner frame goes (padding, or bytes after a short UDP
+    // datagram), then the outer headers.
+    if !packet.truncate(inner_end) || !packet.resize_front(frame as isize) {
         return Err(DropReason::OverlayNoRoom);
     }
     packet.set_ingress(member);
@@ -494,7 +504,7 @@ pub(crate) fn header<T: TraceSink>(
     let vni = match overlay.kind {
         OverlayKind::Vxlan { vni, port, .. } => {
             // RFC 7348 6.1: no inner VLAN tag is sent.
-            if inner[12..14] == VLAN_ETHERTYPE {
+            if VLAN_TAGS.iter().any(|t| inner[12..14] == t[..]) {
                 return Err(DropReason::OverlayInvalid);
             }
             Some((vni, port))

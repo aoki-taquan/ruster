@@ -257,3 +257,29 @@ fn the_underlay_vrf_holds_the_local_address() {
     let error = parse(&with(vxlan, MEMBERS)).unwrap_err();
     assert!(error.contains("interface in VRF \"red\""), "{error}");
 }
+
+#[test]
+fn a_vxlan_interface_s_ends_are_not_its_bridge_s_nor_the_router_s() {
+    let with_irb = |local: &str, remote: &str| {
+        format!(
+            "{WAN}\n[[interface]]\nname = \"vx0\"\nvxlan = {{ vni = 100, local = \"{local}\", remote = [\"{remote}\"] }}\n\n[[interface]]\nname = \"br0\"\nipv4 = \"203.0.113.1/24\"\nbridge = {{ members = [\"vx0\", \"p1\"] }}\n"
+        )
+    };
+    assert!(parse(&with_irb("192.0.2.1", "198.51.100.2")).is_ok());
+    // A remote VTEP that is another address of the router (the bridge's).
+    let error = parse(&with_irb("192.0.2.1", "203.0.113.1")).unwrap_err();
+    assert!(error.contains("address of the router"), "{error}");
+    // The bridge's own address as local: the outer packets would go through it.
+    let error = parse(&with_irb("203.0.113.1", "198.51.100.2")).unwrap_err();
+    assert!(error.contains("its own bridge's address"), "{error}");
+    // No VLAN on it (refused when the file is read; confd refuses it in a lock too).
+    let vlan = format!(
+        "{}\n[[interface]]\nname = \"vx0.10\"\nparent = \"vx0\"\nvlan = 10\n",
+        with(
+            r#"vxlan = { vni = 100, local = "192.0.2.1", remote = ["198.51.100.2"] }"#,
+            MEMBERS
+        )
+    );
+    let error = parse(&vlan).unwrap_err();
+    assert!(error.contains("parent"), "{error}");
+}

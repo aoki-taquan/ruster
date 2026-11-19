@@ -70,6 +70,44 @@ pub(crate) fn given_in(interfaces: &[InterfaceConfig], vrf: &str, local: IpAddr)
     })
 }
 
+/// The interface `address` is given to, if any.
+pub(crate) fn owner(interfaces: &[InterfaceConfig], address: IpAddr) -> Option<&str> {
+    interfaces
+        .iter()
+        .find(|i| match address {
+            IpAddr::V4(a) => i.ipv4.is_some_and(|(own, _)| own == a),
+            IpAddr::V6(a) => i.ipv6.iter().any(|&(own, _)| own == a),
+        })
+        .map(|i| i.name.as_str())
+}
+
+/// The checks every tunnel bridge member's ends pass: its outer packets do not
+/// go through its own bridge (`local` is not its bridge's own address), and the
+/// remote ends are not the router's.
+pub(crate) fn check_ends(
+    at: &str,
+    interfaces: &[InterfaceConfig],
+    bridges: &[crate::bridge::Bridge],
+    name: &str,
+    local: IpAddr,
+    remotes: &[IpAddr],
+) -> Result<(), String> {
+    if let Some(owner) = owner(interfaces, local) {
+        if bridges
+            .iter()
+            .any(|b| b.name == owner && b.members.iter().any(|m| m == name))
+        {
+            return Err(format!(
+                "{at}: local {local} is its own bridge's address: the outer packets would go through it"
+            ));
+        }
+    }
+    if let Some(remote) = remotes.iter().find(|r| owner(interfaces, **r).is_some()) {
+        return Err(format!("{at}: remote {remote} is an address of the router"));
+    }
+    Ok(())
+}
+
 /// Checks the EtherIP interfaces (name, local, remote) against the interfaces and
 /// the bridges.
 pub(crate) fn check(
@@ -101,6 +139,7 @@ pub(crate) fn check(
                 "{at}: etherip local {local} must be an address given to an interface in the default VRF"
             ));
         }
+        check_ends(&at, interfaces, bridges, &name, local, &[remote])?;
         if !crate::bridge::is_member(bridges, &name) {
             return Err(format!(
                 "{at}: an EtherIP tunnel must be a member of a bridge"
