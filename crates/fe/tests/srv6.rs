@@ -508,3 +508,32 @@ fn a_cross_connect_sid_with_segments_left_gets_a_parameter_problem() {
         );
     }
 }
+
+#[test]
+fn an_unwrapped_packet_to_the_router_or_neighbor_discovery_is_dropped() {
+    let mut fe = bench_with_cross_connects();
+    // To the router's address on the SID's interface.
+    for sid in ["fc00:1::d4", "fc00:1::46", "fc00:1::4"] {
+        let out = send(
+            &mut fe,
+            WAN,
+            to_sid(sid, 0, 4, &ipv4(REMOTE, [192, 168, 0, 1])),
+        );
+        assert!(out.is_empty(), "{sid}: {out:?}");
+    }
+    // A Neighbor Advertisement inside, with Hop Limit 255.
+    let mut na = ipv6("fe80::99", "ff02::1");
+    na[6] = 58;
+    na[7] = 255;
+    na.truncate(40);
+    na.extend_from_slice(&[136, 0, 0, 0, 0x20, 0, 0, 0]);
+    na.extend_from_slice(&v6("fe80::fe").octets());
+    na[4..6].copy_from_slice(&24_u16.to_be_bytes());
+    for sid in ["fc00:1::d6", "fc00:1::46"] {
+        let dropped = fe.counters().dropped;
+        let out = send(&mut fe, WAN, to_sid(sid, 0, 41, &na));
+        assert!(out.is_empty(), "{sid}: {out:?}");
+        // Dropped, not handed to the neighbor process.
+        assert_eq!(fe.counters().dropped, dropped + 1, "{sid}");
+    }
+}

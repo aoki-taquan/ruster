@@ -69,13 +69,14 @@
 //! - No HMAC (RFC 8754 section 2.1.2) is checked, and the source address is not
 //!   checked (RFC 8754 section 5.1 places that in the access lists at the edges of
 //!   the SR domain; the forward firewall can do it for traffic it guards).
-//! - A packet unwrapped by End.DT4 or End.DT6 whose inner destination is the
+//! - A packet unwrapped by End.DT4, End.DT6 or End.DT46 whose inner destination is the
 //!   router's (in the SID's VRF) is dropped, not delivered: its way to the kernel
 //!   follows the VRF of the interface it came in on.
 //! - A SID whose VRF the snapshot does not have drops its packets.
-//! - An inner IPv6 packet of End.DX6 to one of the router's addresses (in the
-//!   interface's VRF) is the router's, not sent to the next hop; End.DX4's inner
-//!   IPv4 packet always goes to the next hop.
+//! - A packet unwrapped by End.DX4 or End.DX6 whose inner destination is the
+//!   router's (in the VRF of the SID's interface) is dropped, as for End.DT4 and
+//!   End.DT6. So is an inner Neighbor Discovery packet, for every behaviour that
+//!   unwraps.
 //! - An outer packet that would leave through a tunnel or another policy is
 //!   dropped; no flags, tag or TLVs are put in the Segment Routing Header.
 //! - The outer packet is never fragmented, even when what a policy carries is less
@@ -97,6 +98,7 @@ const FRAGMENT: u8 = 44;
 const DESTINATION_OPTIONS: u8 = 60;
 const IPV4: u8 = 4;
 const IPV6: u8 = 41;
+const ICMPV6: u8 = 58;
 /// The Routing Type of the Segment Routing Header (RFC 8754 section 2).
 const SEGMENT_ROUTING: u8 = 4;
 const TIME_EXCEEDED: u8 = 3;
@@ -361,26 +363,7 @@ pub(crate) fn receive<S: PacketSlot>(
                 let (vrf, via) = match behaviour {
                     Srv6Behaviour::EndDt4 { vrf }
                     | Srv6Behaviour::EndDt6 { vrf }
-                    | Srv6Behaviour::EndDt46 { vrf } => {
-                        let target = snapshot
-                            .vrf_snapshot(vrf)
-                            .ok_or(Rejected::Drop(DropReason::Srv6VrfUnknown))?;
-                        // Not for the router: such a packet would reach the kernel
-                        // of the VRF its ingress interface is in, not the SID's.
-                        let local = if next == IPV4 {
-                            let mut d = [0; 4];
-                            d.copy_from_slice(&inner[16..20]);
-                            target.is_local_ipv4(crate::Ipv4Address::from_octets(d))
-                        } else {
-                            target
-                                .ipv6
-                                .is_some_and(|fib| fib.is_local(address(inner, 24)))
-                        };
-                        if local {
-                            return Err(Rejected::Drop(DropReason::Srv6ToRouter));
-                        }
-                        (vrf, None)
-                    }
+                    | Srv6Behaviour::EndDt46 { vrf } => (vrf, None),
                     // Out to the adjacency, without a lookup: in the VRF of its
                     // interface.
                     Srv6Behaviour::EndDx6 { egress, next_hop } => {
@@ -395,6 +378,26 @@ pub(crate) fn receive<S: PacketSlot>(
                         unreachable!("takes no inner packet")
                     }
                 };
+                let target = snapshot
+                    .vrf_snapshot(vrf)
+                    .ok_or(Rejected::Drop(DropReason::Srv6VrfUnknown))?;
+                // Not for the router: such a packet would reach the kernel of the
+                // VRF its ingress interface is in, past that VRF's firewall. Nor
+                // Neighbor Discovery: it would count as received on the outer
+                // packet's link.
+                let local = if next == IPV4 {
+                    let mut d = [0; 4];
+                    d.copy_from_slice(&inner[16..20]);
+                    target.is_local_ipv4(crate::Ipv4Address::from_octets(d))
+                } else {
+                    target
+                        .ipv6
+                        .is_some_and(|fib| fib.is_local(address(inner, 24)))
+                        || is_neighbor_discovery(inner)
+                };
+                if local {
+                    return Err(Rejected::Drop(DropReason::Srv6ToRouter));
+                }
                 unwrap(packet, at, end)?;
                 return Ok(Received::Unwrapped { vrf, via });
             }
@@ -409,6 +412,12 @@ pub(crate) fn receive<S: PacketSlot>(
         }
     }
     Err(Rejected::Drop(DropReason::Srv6HeaderInvalid))
+}
+
+/// Whether the IPv6 packet `ip` (from its header) is Neighbor Discovery: ICMPv6
+/// right after the header, of type 133 to 137 (RFC 4861).
+fn is_neighbor_discovery(ip: &[u8]) -> bool {
+    ip.get(6) == Some(&ICMPV6) && ip.get(IPV6_HEADER).is_some_and(|t| (133..=137).contains(t))
 }
 
 fn address(frame: &[u8], at: usize) -> [u8; 16] {
