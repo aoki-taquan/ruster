@@ -9,12 +9,16 @@
 //! # Standards
 //!
 //! - RFC 8986 section 3.1: the SIDs are taken from the router's locator.
-//! - RFC 8986 section 4 (End, End.X, End.DX6, End.DX4, End.DT6, End.DT4, End.DT46) and 5.1 and 5.2 (H.Encaps,
-//!   H.Encaps.Red): the behaviours and their parameters.
+//! - RFC 8986 section 4 (End, End.X, End.DX6, End.DX4, End.DT6, End.DT4, End.DT46,
+//!   and the flavors of section 4.16) and 5.1 and 5.2 (H.Encaps, H.Encaps.Red): the
+//!   behaviours and their parameters.
+//! - RFC 8986 sections 4.9 (End.DX2), 5.3 and 5.4 (H.Encaps.L2, H.Encaps.L2.Red):
+//!   the SRv6 L2 interfaces, each a bridge member with its End.DX2 SID (from the
+//!   locator) and the segments its frames go to; the FE's `ruster-if-srv6-l2` rows.
 //!
-//! Deviations: the SIDs are in the default VRF, the locator is not announced (no
-//! IS-IS or OSPF SRv6 extensions), and the source must be an address given to an
-//! interface of the default VRF.
+//! Deviations: the SIDs, End.DX2's too, are in the default VRF, the locator is not
+//! announced (no IS-IS or OSPF SRv6 extensions), and the source must be an address
+//! given to an interface of the default VRF.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv6Addr};
