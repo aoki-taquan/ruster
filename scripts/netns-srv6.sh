@@ -84,7 +84,7 @@ nsx "$linux" ip addr add 10.2.0.1/24 dev bside
 nsx "$linux" ip addr add fd00:b::1/64 dev bside nodad
 nsx "$linux" ip link set bside up
 nsx "$linux" ip sr tunsrc set 2001:db8::2
-nsx "$linux" ip -6 route add fc00:1::/48 via 2001:db8::1 dev wan
+nsx "$linux" ip -6 route add fc00:1::/32 via 2001:db8::1 dev wan
 nsx "$linux" ip -6 route add fc00:2::1/128 encap seg6local action End dev wan
 nsx "$linux" ip -6 route add fc00:2::4/128 encap seg6local action End.DT4 vrftable 10 dev vrf-red
 nsx "$linux" ip -6 route add fc00:2::6/128 encap seg6local action End.DT6 vrftable 10 dev vrf-red
