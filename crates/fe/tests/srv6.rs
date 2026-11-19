@@ -627,6 +627,4 @@ fn usd_unwraps_the_inner_packet_with_no_segment_left() {
     assert_eq!(out[0].0, WAN);
     assert_eq!(&out[0].1[0..6], &GATEWAY_MAC);
     assert_eq!(&out[0].1[14 + 24..14 + 40], &v6("2001:db8:99::1").octets());
-    // Plain End (fc00:1::4 is End.DT4; the bench has no plain End): without USD an
-    // inner packet is an upper-layer header error, as before.
 }
