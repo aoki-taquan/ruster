@@ -135,6 +135,8 @@ pub(crate) type Changed<'a> = &'a [(&'a Key, Option<&'a Value>)];
 
 /// Each VRF's entries by prefix: in the order of the route keys of the tables.
 type Entries = BTreeMap<String, BTreeMap<(IpAddr, u8), Entry>>;
+/// Something of each SR policy, by its VRF.
+type Policies<T> = BTreeMap<String, BTreeMap<table::Srv6Encap, T>>;
 
 /// What the routes of the tables came to in a build, kept for the next one: a change
 /// of routes alone is then made to this, and the routes are not all read again (with
@@ -145,9 +147,15 @@ pub(crate) struct Routes {
     counts: BTreeMap<String, usize>,
     /// The entries of every VRF of the tables (also of one without routes).
     entries: Entries,
-    /// Whether a route is an SRv6 SID or policy. Those make SIDs and interfaces of
-    /// the FE's own too, so with one every build reads the routes again.
-    srv6: bool,
+    /// The SRv6 SIDs the routes made, and the VRFs of their End.DT4 and End.DT6
+    /// (a VRF with no route of its own). A change of a SID route reads every
+    /// route again.
+    sids: Vec<ruster_core::Srv6Sid>,
+    sid_vrfs: BTreeSet<String>,
+    /// The SR policies the routes leave through, each by its VRF, with how many
+    /// routes do. Each makes an interface of the FE's own, so a change that makes
+    /// a policy or leaves one without routes reads every route again.
+    policies: Policies<usize>,
     /// How many of the entries look up in another VRF. With one, a VRF's routes
     /// for core come from another VRF's too.
     lookups: usize,
@@ -217,9 +225,9 @@ impl Routes {
     /// Whether these, made for the tables before a change, can be brought to
     /// `store` by making the change to them: `changed` (each entry touched and what
     /// it held before) has no entry that makes or changes an interface, none of
-    /// its routes is an SRv6 one, and every VRF the routes are in has routes
-    /// before and after (so the VRFs, and with them the interfaces' ids, stay the
-    /// same).
+    /// its routes is an SRv6 SID, every SR policy of its routes has routes before
+    /// and after, and every VRF the routes are in has routes before and after (so
+    /// the VRFs, and with them the interfaces' ids, stay the same).
     ///
     /// What a route comes to depends on the interfaces alone ([`forwarding`]):
     /// the interface table and the tunnel and bridge tables, which make
@@ -235,10 +243,8 @@ impl Routes {
         changed: Changed<'_>,
         store: &'s Store,
     ) -> Option<Vec<Option<&'s RouteAction>>> {
-        if self.srv6 {
-            return None;
-        }
         let mut growth: BTreeMap<&str, isize> = BTreeMap::new();
+        let mut policy_growth: BTreeMap<(&str, &table::Srv6Encap), isize> = BTreeMap::new();
         let mut afters = Vec::with_capacity(changed.len());
         for (key, before) in changed {
             let vrf = match key {
@@ -274,19 +280,34 @@ impl Routes {
                     | RouteAction::LookupVrf(_)
                     | RouteAction::Discard
                     | RouteAction::Reject
-                    | RouteAction::Local),
+                    | RouteAction::Local
+                    | RouteAction::Srv6Encap(_)),
                 )) => Some(action),
                 Some(_) => return None,
             };
+            match before {
+                Some(Value::Route(RouteAction::Srv6Local(_))) => return None,
+                Some(Value::Route(RouteAction::Srv6Encap(encap))) => {
+                    *policy_growth.entry((vrf.as_str(), encap)).or_default() -= 1;
+                }
+                _ => {}
+            }
+            if let Some(RouteAction::Srv6Encap(encap)) = after {
+                *policy_growth.entry((vrf.as_str(), encap)).or_default() += 1;
+            }
             *growth.entry(vrf.as_str()).or_default() +=
                 isize::from(after.is_some()) - isize::from(before.is_some());
             afters.push(after);
         }
-        let kept = growth.iter().all(|(vrf, by)| {
-            self.counts
-                .get(*vrf)
-                .is_some_and(|&had| had.checked_add_signed(*by).is_some_and(|has| has > 0))
-        });
+        let stays = |had: Option<&usize>, by: isize| {
+            had.is_some_and(|&had| had.checked_add_signed(by).is_some_and(|has| has > 0))
+        };
+        let kept = growth
+            .iter()
+            .all(|(vrf, by)| stays(self.counts.get(*vrf), *by))
+            && policy_growth.iter().all(|(&(vrf, encap), by)| {
+                stays(self.policies.get(vrf).and_then(|p| p.get(encap)), *by)
+            });
         kept.then_some(afters)
     }
 }
@@ -635,12 +656,16 @@ pub(crate) fn build(
     let mut kept_tables = None;
     let mut lookups = 0;
     let mut lookup_list = Vec::new();
+    let mut kept_srv6 = None;
+    let mut kept_sid_vrfs: Option<BTreeSet<String>> = None;
     let (kept_names, mut counts, kept_entries, changed, afters): (Vec<String>, _, _, _, _) =
         match kept {
             Some((routes, changed, afters)) => {
                 lookups = routes.lookups;
                 lookup_list = routes.lookup_list;
                 kept_tables = Some(routes.tables);
+                kept_srv6 = Some((routes.sids, routes.policies));
+                kept_sid_vrfs = Some(routes.sid_vrfs);
                 (
                     routes.counts.keys().cloned().collect(),
                     routes.counts,
@@ -984,9 +1009,10 @@ pub(crate) fn build(
         }
     }
     let mut names: BTreeSet<&str> = active.values().map(|&(_, vrf)| vrf).collect();
-    if kept_entries.is_some() {
+    if let Some(sid_vrfs) = &kept_sid_vrfs {
         // The VRFs the routes are in, as before: the change kept them.
         names.extend(kept_names.iter().map(String::as_str));
+        names.extend(sid_vrfs.iter().map(String::as_str));
     } else {
         for (key, value) in store.table(sid::ROUTE) {
             if let Key::Route { vrf, .. } = key {
@@ -1018,7 +1044,6 @@ pub(crate) fn build(
 
     // Without the kept routes every route is read below; with them, none.
     let all_routes = kept_entries.is_none();
-    let mut srv6_routes = false;
     let mut entries: Entries = kept_entries.unwrap_or_else(|| {
         order
             .iter()
@@ -1032,12 +1057,48 @@ pub(crate) fn build(
     let mut bindings: Vec<Vec<LocalIpv4Binding>> = vec![Vec::new(); order.len()];
     let mut local6: Vec<Vec<Ipv6Local>> = vec![Vec::new(); order.len()];
     let mut sids = Vec::new();
+    let mut sid_vrfs = BTreeSet::new();
     let mut policies = Vec::new();
     // Each SR policy's interface and the index of its VRF.
     let mut policy_vrfs: Vec<(IfId, usize)> = Vec::new();
     // The interface of each SR policy, by its VRF, source, segments and whether
-    // reduced: the routes with the same policy share one.
-    let mut policy_ids: BTreeMap<(&str, &table::Srv6Encap), IfId> = BTreeMap::new();
+    // reduced (the routes with the same policy share one), and how many routes
+    // leave through it.
+    let mut policy_ids: Policies<(IfId, usize)> = BTreeMap::new();
+    let mut add_policy = |vrf: &str,
+                          encap: &table::Srv6Encap,
+                          interfaces: &mut Vec<Interface>,
+                          ids: &mut Ids<'_>|
+     -> Result<IfId, String> {
+        let policy = ruster_core::Srv6Policy::new(
+            IfId(0),
+            encap.source.octets(),
+            encap.segments.iter().map(|s| s.octets()).collect(),
+            encap.reduced,
+        )
+        .map_err(|e| format!("SR policy {}: {e:?}", policy_name(vrf, encap)))?;
+        let id = ids.take(&policy_name(vrf, encap))?;
+        interfaces.push(Interface {
+            id,
+            mac: MacAddress([0x02, 0x73, 0x72, 0x76, 0x36, 0x00]),
+            mtu: u16::MAX,
+        });
+        policy_vrfs.push((id, index_of(vrf).expect("every route VRF is listed")));
+        policies.push(policy.on(id));
+        Ok(id)
+    };
+    if let Some((kept_sids, kept_policies)) = kept_srv6 {
+        sids = kept_sids;
+        sid_vrfs.clone_from(kept_sid_vrfs.as_ref().expect("kept with the SIDs"));
+        for (vrf, list) in kept_policies {
+            let mut ids_of = BTreeMap::new();
+            for (encap, routes) in list {
+                let id = add_policy(&vrf, &encap, &mut interfaces, &mut ids)?;
+                ids_of.insert(encap, (id, routes));
+            }
+            policy_ids.insert(vrf, ids_of);
+        }
+    }
     let mut firewall = Vec::new();
     let mut firewall_on = false;
     let mut firewall_filtering = table::NatFiltering::default();
@@ -1081,7 +1142,11 @@ pub(crate) fn build(
                 }
                 let entry = match action {
                     RouteAction::Srv6Local(local) => {
-                        srv6_routes = true;
+                        if let table::Srv6Local::EndDt4 { vrf } | table::Srv6Local::EndDt6 { vrf } =
+                            local
+                        {
+                            sid_vrfs.insert(vrf.clone());
+                        }
                         if let Some(sid) = srv6_sid(*prefix, *len, local, &active, index_of)? {
                             sids.push(sid);
                         }
@@ -1090,28 +1155,23 @@ pub(crate) fn build(
                     RouteAction::Srv6Encap(encap) => {
                         // An interface of the FE's own for the policy: the route
                         // leaves through it, and core wraps what it sends. The
-                        // routes of one VRF with the same policy share it.
-                        srv6_routes = true;
-                        let id = match policy_ids.get(&(vrf.as_str(), encap)) {
-                            Some(&id) => id,
+                        // routes of one VRF with the same policy share it. (Most
+                        // routes find theirs: only a new policy is copied.)
+                        let found = policy_ids
+                            .get_mut(vrf.as_str())
+                            .and_then(|p| p.get_mut(encap));
+                        let id = match found {
+                            Some((id, routes)) => {
+                                *routes += 1;
+                                *id
+                            }
                             None => {
-                                let policy = ruster_core::Srv6Policy::new(
-                                    IfId(0),
-                                    encap.source.octets(),
-                                    encap.segments.iter().map(|s| s.octets()).collect(),
-                                    encap.reduced,
-                                )
-                                .map_err(|e| format!("route {vrf} {prefix}/{len}: {e:?}"))?;
-                                let id = ids.take(&policy_name(vrf, encap))?;
-                                interfaces.push(Interface {
-                                    id,
-                                    mac: MacAddress([0x02, 0x73, 0x72, 0x76, 0x36, 0x00]),
-                                    mtu: u16::MAX,
-                                });
-                                policy_vrfs
-                                    .push((id, index_of(vrf).expect("every route VRF is listed")));
-                                policies.push(policy.on(id));
-                                policy_ids.insert((vrf.as_str(), encap), id);
+                                let id = add_policy(vrf, encap, &mut interfaces, &mut ids)
+                                    .map_err(|e| format!("route {vrf} {prefix}/{len}: {e}"))?;
+                                policy_ids
+                                    .entry(vrf.clone())
+                                    .or_default()
+                                    .insert(encap.clone(), (id, 1));
                                 id
                             }
                         };
@@ -1224,7 +1284,29 @@ pub(crate) fn build(
             continue;
         };
         let is_lookup = |entry: &Option<Entry>| matches!(entry, Some(Entry::Lookup { .. }));
-        let entry = after.and_then(|action| forwarding(*prefix, *len, action, &active));
+        // A route of an SR policy: the policy's interface, kept (`Routes::follows`).
+        let mut policy = |encap: &table::Srv6Encap, by: isize| {
+            let (id, routes) = policy_ids
+                .get_mut(vrf.as_str())
+                .and_then(|p| p.get_mut(encap))
+                .expect("the kept policies hold every one the change names");
+            *routes = routes
+                .checked_add_signed(by)
+                .expect("a policy keeps its routes");
+            *id
+        };
+        if let Some(Value::Route(RouteAction::Srv6Encap(encap))) = before {
+            policy(encap, -1);
+        }
+        let entry = match after {
+            Some(RouteAction::Srv6Encap(encap)) => Some(Entry::Forward(Forward {
+                prefix: *prefix,
+                len: *len,
+                egress: policy(encap, 1),
+                next_hop: None,
+            })),
+            _ => after.and_then(|action| forwarding(*prefix, *len, action, &active)),
+        };
         let had = match entry.clone() {
             Some(entry) => list.insert((*prefix, *len), entry),
             None => list.remove(&(*prefix, *len)),
@@ -1282,6 +1364,9 @@ pub(crate) fn build(
             tables
         }
     };
+    // In the order of their ids: the SR policies' come in another order when the
+    // kept routes give them.
+    interfaces.sort_unstable_by_key(|i| i.id);
     let mut vrfs = Vec::with_capacity(order.len());
     for (at, name) in order.iter().enumerate() {
         let table = tables.entry((*name).to_owned()).or_default().clone();
@@ -1327,6 +1412,7 @@ pub(crate) fn build(
         .map(|i| i.id)
         .filter(|id| !kernel.contains(id) && !policy_interfaces.contains(id))
         .collect();
+    let kept_sids = sids.clone();
     let srv6 = ruster_core::Srv6Table::new(sids)
         .and_then(|table| table.with_policies(policies))
         .map_err(|error| format!("srv6: {error:?}"))?;
@@ -1384,7 +1470,12 @@ pub(crate) fn build(
     let routes = Routes {
         counts,
         entries,
-        srv6: srv6_routes,
+        sids: kept_sids,
+        sid_vrfs,
+        policies: policy_ids
+            .into_iter()
+            .map(|(vrf, list)| (vrf, list.into_iter().map(|(e, (_, n))| (e, n)).collect()))
+            .collect(),
         lookups,
         lookup_list,
         tables,
@@ -1780,6 +1871,9 @@ mod tests {
         /// before through the lookups (an entry looked up in another VRF, and
         /// the change touched none of those).
         through_lookups: usize,
+        /// The builds that made the change to the kept routes, and the change
+        /// set a route of an SR policy.
+        policies_followed: usize,
     }
 
     impl Hook for BothWays {
@@ -1800,6 +1894,10 @@ mod tests {
                 .as_ref()
                 .is_some_and(|routes| routes.follows(changed, next).is_some());
             let no_lookup_before = self.kept.as_ref().is_some_and(|r| r.lookups == 0);
+            let policy = changed.iter().any(|(key, _)| {
+                matches!(next.get(key), Some(Value::Route(RouteAction::Srv6Encap(_))))
+            });
+            self.policies_followed += usize::from(follows && policy);
             let all = build(&self.ports, next, &self.names, None);
             let kept = self.kept.take().map(|routes| (routes, changed));
             let made = build(&self.ports, next, &self.names, kept);
@@ -1809,6 +1907,7 @@ mod tests {
                     assert_eq!(made.names, all.names);
                     assert_eq!(made.interface_names, all.interface_names);
                     assert_eq!(made.by_ingress, all.by_ingress);
+                    assert_eq!(made.srv6, all.srv6);
                     assert_eq!(made.vrfs.len(), all.vrfs.len());
                     // What a neighbor does change is the same both ways.
                     assert_eq!(made.unreachable, all.unreachable);
@@ -1939,7 +2038,7 @@ mod tests {
                 (_, true) => Some("fe80::1".parse().unwrap()),
             },
         };
-        let action = match rng.below(40) {
+        let action = match rng.below(44) {
             0..=7 => return Change::delete(key),
             8..=24 => RouteAction::Forward((0..1 + rng.below(2)).map(|_| hop(rng)).collect()),
             25..=27 => RouteAction::Discard,
@@ -1953,6 +2052,12 @@ mod tests {
             // The kinds the kept routes cannot follow.
             37 if v6 => RouteAction::Gateways(vec!["2001:db8::1".parse().unwrap()]),
             37 => RouteAction::Gateways(vec!["192.0.2.1".parse().unwrap()]),
+            // One of two SR policies: a route of a policy with others follows.
+            38..=42 => RouteAction::Srv6Encap(table::Srv6Encap {
+                source: "2001:db8::1".parse().unwrap(),
+                segments: vec![rng.pick(&["fc00:1::", "fc00:2::"]).parse().unwrap()],
+                reduced: false,
+            }),
             _ if v6 && default => RouteAction::Srv6Local(table::Srv6Local::End),
             _ => RouteAction::Discard,
         };
@@ -1965,7 +2070,9 @@ mod tests {
         let routes = Routes {
             counts: BTreeMap::from([(DEFAULT_VRF.to_owned(), 1)]),
             entries: Entries::new(),
-            srv6: false,
+            sids: Vec::new(),
+            sid_vrfs: BTreeSet::new(),
+            policies: BTreeMap::new(),
             lookups: 0,
             lookup_list: Vec::new(),
             tables: BTreeMap::new(),
@@ -2140,6 +2247,7 @@ mod tests {
         assert!(hook.refused > 5, "{}", hook.refused);
         assert!(hook.neighbors_only > 20, "{}", hook.neighbors_only);
         assert!(hook.addresses_only > 20, "{}", hook.addresses_only);
+        assert!(hook.policies_followed > 5, "{}", hook.policies_followed);
         hook
     }
 
